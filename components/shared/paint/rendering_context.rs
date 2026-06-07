@@ -777,16 +777,26 @@ impl OffscreenRenderingContext {
     }
 
     pub fn render_to_parent_callback(&self) -> Option<RenderToParentCallback> {
+        let size = self.size.get();
+        let size = Size2D::new(size.width as i32, size.height as i32);
+        self.render_to_parent_callback_for_source_rect(Rect::new(
+            Point2D::origin(),
+            size.to_i32(),
+        ))
+    }
+
+    pub fn render_to_parent_callback_for_source_rect(
+        &self,
+        source_rect: Rect<i32>,
+    ) -> Option<RenderToParentCallback> {
         // Don't accept a `None` context for the source framebuffer.
         let front_framebuffer_id =
             NonZeroU32::new(self.framebuffer.borrow().framebuffer_id).map(NativeFramebuffer)?;
         let parent_context_framebuffer_id = self.parent_context.surfman_context.framebuffer();
-        let size = self.size.get();
-        let size = Size2D::new(size.width as i32, size.height as i32);
         Some(Box::new(move |gl, target_rect| {
             Self::blit_framebuffer(
                 gl,
-                Rect::new(Point2D::origin(), size.to_i32()),
+                source_rect,
                 front_framebuffer_id,
                 target_rect,
                 parent_context_framebuffer_id,

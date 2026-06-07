@@ -89,6 +89,8 @@ pub(crate) struct WebViewRenderer {
     pub root_pipeline_id: Option<PipelineId>,
     /// The rectangle of the [`WebView`] in device pixels, which is the viewport.
     pub rect: DeviceRect,
+    /// The origin of the visible tile inside the virtual WebView viewport, in device pixels.
+    viewport_origin: DeviceVector2D,
     /// Tracks details about each active pipeline that `Paint` knows about.
     pub pipelines: FxHashMap<PipelineId, PipelineDetails>,
     /// Pending scroll/zoom events.
@@ -131,6 +133,7 @@ impl WebViewRenderer {
     pub(crate) fn new(
         renderer_webview: Box<dyn WebViewTrait>,
         viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
         embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
         refresh_driver: Rc<BaseRefreshDriver>,
         webrender_document: DocumentId,
@@ -144,6 +147,7 @@ impl WebViewRenderer {
             webview: renderer_webview,
             root_pipeline_id: None,
             rect,
+            viewport_origin,
             pipelines: Default::default(),
             touch_handler: TouchHandler::new(webview_id),
             pending_scroll_zoom_events: Default::default(),
@@ -160,7 +164,16 @@ impl WebViewRenderer {
         }
     }
 
+    pub(crate) fn viewport_origin(&self) -> DeviceVector2D {
+        self.viewport_origin
+    }
+
+    pub(crate) fn render_point_from_viewport_point(&self, point: DevicePoint) -> DevicePoint {
+        point - self.viewport_origin
+    }
+
     fn hit_test(&self, webrender_api: &RenderApi, point: DevicePoint) -> Vec<PaintHitTestResult> {
+        let point = self.render_point_from_viewport_point(point);
         Painter::hit_test_at_point_with_api_and_document(
             webrender_api,
             self.webrender_document,
@@ -1084,6 +1097,32 @@ impl WebViewRenderer {
             self.send_pinch_zoom_infos_to_script();
         }
         old_rect != self.rect
+    }
+
+    /// Set both the layout viewport and HiDPI scale for this renderer.
+    ///
+    /// This is used by embedders that keep the rendering surface sized to a local tile while
+    /// Servo layout and input operate against a larger virtual viewport.
+    pub(crate) fn set_viewport_details(&mut self, viewport_details: ViewportDetails) -> bool {
+        let new_hidpi_scale_factor = Scale::new(viewport_details.hidpi_scale_factor.get());
+        let new_rect = DeviceRect::from_origin_and_size(
+            DevicePoint::origin(),
+            viewport_details.size * viewport_details.hidpi_scale_factor,
+        );
+
+        let old_rect = self.rect;
+        let old_hidpi_scale_factor = self.hidpi_scale_factor;
+        self.rect = new_rect;
+        self.hidpi_scale_factor = new_hidpi_scale_factor;
+
+        if old_rect == self.rect && old_hidpi_scale_factor == self.hidpi_scale_factor {
+            return false;
+        }
+
+        self.send_window_size_message();
+        self.pinch_zoom.resize_unscaled_viewport(new_rect);
+        self.send_pinch_zoom_infos_to_script();
+        true
     }
 
     pub fn set_viewport_description(&mut self, viewport_description: ViewportDescription) {

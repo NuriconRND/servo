@@ -25,6 +25,7 @@ use servo::{
 use url::Url;
 
 use crate::VERSION;
+use crate::wall_layout::{WallLayout, WallLayoutError};
 
 /// Preferences enabled when servoshell is launched with the `--enable-experimental-web-platform-features` flag.
 ///
@@ -80,6 +81,13 @@ pub(crate) struct ServoShellPreferences {
     /// An override for the screen resolution. This is useful for testing behavior on different screen sizes,
     /// such as the screen of a mobile device.
     pub screen_size_override: Option<Size2D<u32, DeviceIndependentPixel>>,
+    /// Optional tiled wall layout. When set, top-level WebViews lay out against the
+    /// virtual viewport rather than the platform window size.
+    pub wall_layout: Option<WallLayout>,
+    /// The tile from [`Self::wall_layout`] represented by this servoshell window.
+    pub wall_tile_index: usize,
+    /// Open one headed servoshell window for every tile in [`Self::wall_layout`].
+    pub wall_all_tiles: bool,
     /// Whether or not to simulate touch events using mouse events.
     pub simulate_touch_events: bool,
     /// If not-None, the path to a file to output the default WebView's rendered output
@@ -116,6 +124,9 @@ impl Default for ServoShellPreferences {
             initial_window_size: Size2D::new(1024, 740),
             no_native_titlebar: true,
             screen_size_override: None,
+            wall_layout: None,
+            wall_tile_index: 0,
+            wall_all_tiles: false,
             simulate_touch_events: false,
             searchpage: "https://duckduckgo.com/html/?q=%s".into(),
             tracing_filter: None,
@@ -290,6 +301,17 @@ fn parse_user_stylesheets(string: String) -> Result<Vec<Rc<UserStyleSheet>>, std
         )));
     }
     Ok(results)
+}
+
+fn parse_wall_layout(
+    path: &Path,
+    wall_tile_index: Option<usize>,
+) -> Result<WallLayout, WallLayoutError> {
+    let layout = WallLayout::from_path(path)?;
+    if let Some(wall_tile_index) = wall_tile_index {
+        layout.validate_tile_index(wall_tile_index)?;
+    }
+    Ok(layout)
 }
 
 /// This is a helper function that fulfills the following parsing task
@@ -570,6 +592,18 @@ struct CmdArgs {
     #[bpaf(argument::<String>("1024x740"), parse(parse_resolution_string), fallback(None))]
     window_size: Option<Size2D<u32, DeviceIndependentPixel>>,
 
+    /// Path to a tiled wall layout JSON file.
+    #[bpaf(long("wall-layout"), argument("/path/to/wall_layout.json"))]
+    wall_layout: Option<PathBuf>,
+
+    /// Tile index from --wall-layout represented by this servoshell window.
+    #[bpaf(long("wall-tile-index"), argument("0"), fallback(0))]
+    wall_tile_index: usize,
+
+    /// Open one headed servoshell window for every tile in --wall-layout.
+    #[bpaf(long("wall-all-tiles"))]
+    wall_all_tiles: bool,
+
     /// The url we should load.
     #[bpaf(positional("URL"), fallback(String::from("https://www.servo.org")))]
     url: String,
@@ -675,6 +709,28 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
 
     update_preferences_from_command_line_arguemnts(&mut preferences, &cmd_args);
 
+    let wall_layout = match cmd_args.wall_layout.as_deref() {
+        Some(path) => match parse_wall_layout(
+            path,
+            (!cmd_args.wall_all_tiles).then_some(cmd_args.wall_tile_index),
+        ) {
+            Ok(layout) => Some(layout),
+            Err(error) => {
+                eprintln!("Could not parse wall layout {}: {error}", path.display());
+                return ArgumentParsingResult::ErrorParsing;
+            },
+        },
+        None => {
+            if cmd_args.wall_tile_index != 0 {
+                warn!("Ignoring --wall-tile-index because --wall-layout was not provided.");
+            }
+            if cmd_args.wall_all_tiles {
+                warn!("Ignoring --wall-all-tiles because --wall-layout was not provided.");
+            }
+            None
+        },
+    };
+
     // FIXME: enable JIT compilation on 32-bit Android after the startup crash issue (#31134) is fixed.
     if cfg!(target_os = "android") && cfg!(target_pointer_width = "32") {
         preferences.js_baseline_interpreter_enabled = false;
@@ -699,6 +755,9 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         tracing_filter: cmd_args.tracing_filter,
         initial_window_size: cmd_args.window_size.unwrap_or(default_window_size),
         screen_size_override: cmd_args.screen_size_override,
+        wall_layout,
+        wall_tile_index: cmd_args.wall_tile_index,
+        wall_all_tiles: cmd_args.wall_all_tiles,
         simulate_touch_events: cmd_args.simulate_touch_events,
         webdriver_port: Cell::new(cmd_args.webdriver_port),
         output_image_path: cmd_args.output.map(|p| p.to_string_lossy().into_owned()),

@@ -589,14 +589,18 @@ impl Gui {
                     });
                 }
             }
-            let size = Size2D::new(available_rect.width(), available_rect.height()) * scale;
+            let visible_size = Size2D::new(available_rect.width(), available_rect.height()) * scale;
+            let rendering_size = headed_window.webview_rendering_size(visible_size);
             if let Some(webview) = window.active_webview() &&
-                size != webview.size()
+                rendering_size != webview.size()
             {
-                // `rect` is sized to just the WebView viewport, which is required by
-                // `OffscreenRenderingContext` See:
+                // Wall-layout mode can render an overlap-expanded offscreen surface and blit
+                // only the visible tile region back into the platform window. See:
                 // <https://github.com/servo/servo/issues/38369#issuecomment-3138378527>
-                webview.resize(PhysicalSize::new(size.width as u32, size.height as u32))
+                webview.resize(PhysicalSize::new(
+                    rendering_size.width as u32,
+                    rendering_size.height as u32,
+                ))
             }
 
             if let Some(status_text) = &self.status_text {
@@ -611,7 +615,11 @@ impl Gui {
 
             window.repaint_webviews();
 
-            if let Some(render_to_parent) = rendering_context.render_to_parent_callback() {
+            let source_rect = headed_window.webview_visible_source_rect(visible_size.to_i32());
+            if let Some(render_to_parent) =
+                rendering_context
+                    .render_to_parent_callback_for_source_rect(source_rect.to_untyped())
+            {
                 ctx.layer_painter(LayerId::background()).add(PaintCallback {
                     rect: available_rect,
                     callback: Arc::new(CallbackFn::new(move |info, painter| {

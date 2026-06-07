@@ -13,9 +13,11 @@ use std::env;
 use std::rc::Rc;
 use std::time::Duration;
 
-use euclid::{Angle, Length, Point2D, Rect, Rotation3D, Scale, Size2D, UnknownUnit, Vector3D};
+use euclid::{
+    Angle, Length, Point2D, Rect, Rotation3D, Scale, Size2D, UnknownUnit, Vector2D, Vector3D,
+};
 use keyboard_types::ShortcutMatcher;
-use log::{debug, info};
+use log::{debug, info, warn};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, Cursor, DeviceIndependentIntRect,
@@ -53,6 +55,7 @@ use crate::desktop::gui::Gui;
 use crate::desktop::keyutils::CMD_OR_CONTROL;
 use crate::prefs::ServoShellPreferences;
 use crate::running_app_state::{RunningAppState, UserInterfaceCommand};
+use crate::wall_layout::WallLayout;
 use crate::window::{
     LINE_HEIGHT, LINE_WIDTH, MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow,
     ServoShellWindowId,
@@ -66,6 +69,9 @@ pub struct HeadedWindow {
     gui: RefCell<Gui>,
     screen_size: Size2D<u32, DeviceIndependentPixel>,
     monitor: winit::monitor::MonitorHandle,
+    /// The position of the cursor relative to the platform WebView tile in physical pixels.
+    webview_local_mouse_point: Cell<Point2D<f32, DevicePixel>>,
+    /// The position of the cursor in the virtual WebView viewport in physical pixels.
     webview_relative_mouse_point: Cell<Point2D<f32, DevicePixel>>,
     /// The inner size of the window in physical pixels which excludes OS decorations.
     /// It equals viewport size + (0, toolbar height).
@@ -102,6 +108,8 @@ pub struct HeadedWindow {
     visible_input_method: Cell<Option<EmbedderControlId>>,
     /// The position of the mouse cursor after the most recent `MouseMove` event.
     last_mouse_position: Cell<Option<Point2D<f32, DeviceIndependentPixel>>>,
+    wall_layout: Option<WallLayout>,
+    wall_tile_index: usize,
 }
 
 impl HeadedWindow {
@@ -140,6 +148,22 @@ impl HeadedWindow {
         {
             let icon_bytes = include_bytes!("../../../resources/servo_64.png");
             winit_window.set_window_icon(Some(load_icon(icon_bytes)));
+        }
+
+        if servoshell_preferences.wall_all_tiles &&
+            let Some(layout) = &servoshell_preferences.wall_layout &&
+            let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
+        {
+            if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
+                winit_window.set_outer_position(target_monitor.position());
+            } else {
+                warn!(
+                    "Wall tile {} requested monitor {}, but only {} monitor(s) are available.",
+                    servoshell_preferences.wall_tile_index,
+                    tile.monitor,
+                    winit_window.available_monitors().count()
+                );
+            }
         }
 
         let window_handle = winit_window
@@ -185,6 +209,21 @@ impl HeadedWindow {
             .expect("Could not make window RenderingContext current");
 
         let rendering_context = Rc::new(window_rendering_context.offscreen_context(inner_size));
+        if let Some(layout) = &servoshell_preferences.wall_layout {
+            let hidpi_factor = servoshell_preferences
+                .device_pixel_ratio_override
+                .map(Scale::new)
+                .unwrap_or_else(|| Scale::new(winit_window.scale_factor() as f32));
+            debug!(
+                "Wall tile {} visible rect {:?}, render rect {:?}",
+                servoshell_preferences.wall_tile_index,
+                layout.tile_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor),
+                layout.tile_render_device_rect(
+                    servoshell_preferences.wall_tile_index,
+                    hidpi_factor
+                ),
+            );
+        }
         let gui = RefCell::new(Gui::new(
             &winit_window,
             event_loop,
@@ -197,6 +236,7 @@ impl HeadedWindow {
         Rc::new(HeadedWindow {
             gui,
             winit_window,
+            webview_local_mouse_point: Cell::new(Point2D::zero()),
             webview_relative_mouse_point: Cell::new(Point2D::zero()),
             fullscreen: Cell::new(false),
             inner_size: Cell::new(inner_size),
@@ -215,6 +255,8 @@ impl HeadedWindow {
             dialogs: Default::default(),
             visible_input_method: Default::default(),
             last_mouse_position: Default::default(),
+            wall_layout: servoshell_preferences.wall_layout.clone(),
+            wall_tile_index: servoshell_preferences.wall_tile_index,
         })
     }
 
@@ -258,9 +300,9 @@ impl HeadedWindow {
         action: ElementState,
     ) {
         // `point` can be outside viewport, such as at toolbar with negative y-coordinate.
+        let local_point = self.webview_local_mouse_point.get();
         let point = self.webview_relative_mouse_point.get();
-        let webview_rect: Rect<_, _> = webview.size().into();
-        if !webview_rect.contains(point) {
+        if !self.webview_local_rect(webview).contains(local_point) {
             return;
         }
 
@@ -298,15 +340,16 @@ impl HeadedWindow {
 
     /// Helper function to handle mouse move events.
     fn handle_mouse_move_event(&self, webview: &WebView, position: PhysicalPosition<f64>) {
-        let mut point = winit_position_to_euclid_point(position).to_f32();
-        point.y -= (self.toolbar_height() * self.hidpi_scale_factor()).0;
+        let local_point = self.webview_local_point_from_window_position(position);
+        let point = self.webview_virtual_point_from_local_point(local_point);
 
-        let previous_point = self.webview_relative_mouse_point.get();
+        let previous_local_point = self.webview_local_mouse_point.get();
+        self.webview_local_mouse_point.set(local_point);
         self.webview_relative_mouse_point.set(point);
 
-        let webview_rect: Rect<_, _> = webview.size().into();
-        if !webview_rect.contains(point) {
-            if webview_rect.contains(previous_point) {
+        let webview_rect = self.webview_local_rect(webview);
+        if !webview_rect.contains(local_point) {
+            if webview_rect.contains(previous_local_point) {
                 webview.notify_input_event(InputEvent::MouseLeftViewport(
                     MouseLeftViewportEvent::default(),
                 ));
@@ -532,6 +575,71 @@ impl HeadedWindow {
         self.gui.borrow().toolbar_height()
     }
 
+    fn webview_local_rect(&self, webview: &WebView) -> Rect<f32, DevicePixel> {
+        webview.size().into()
+    }
+
+    fn webview_local_point_from_window_position(
+        &self,
+        position: PhysicalPosition<f64>,
+    ) -> Point2D<f32, DevicePixel> {
+        let mut point = winit_position_to_euclid_point(position).to_f32();
+        point.y -= (self.toolbar_height() * self.hidpi_scale_factor()).0;
+        point
+    }
+
+    fn webview_virtual_point_from_local_point(
+        &self,
+        point: Point2D<f32, DevicePixel>,
+    ) -> Point2D<f32, DevicePixel> {
+        point + self.virtual_viewport_tile_origin()
+    }
+
+    fn virtual_viewport_tile_origin(&self) -> Vector2D<f32, DevicePixel> {
+        self.wall_layout
+            .as_ref()
+            .map(|layout| {
+                layout.tile_origin_device_vector(self.wall_tile_index, self.hidpi_scale_factor())
+            })
+            .unwrap_or_else(Vector2D::zero)
+    }
+
+    fn wall_tile_render_insets(&self) -> Option<(i32, i32, i32, i32)> {
+        let layout = self.wall_layout.as_ref()?;
+        let hidpi_factor = self.hidpi_scale_factor();
+        let visible_rect = layout.tile_device_rect(self.wall_tile_index, hidpi_factor)?;
+        let render_rect = layout.tile_render_device_rect(self.wall_tile_index, hidpi_factor)?;
+        Some((
+            visible_rect.min.x - render_rect.min.x,
+            visible_rect.min.y - render_rect.min.y,
+            render_rect.max.x - visible_rect.max.x,
+            render_rect.max.y - visible_rect.max.y,
+        ))
+    }
+
+    pub(crate) fn webview_rendering_size(
+        &self,
+        visible_size: Size2D<f32, DevicePixel>,
+    ) -> Size2D<f32, DevicePixel> {
+        let Some((left, top, right, bottom)) = self.wall_tile_render_insets() else {
+            return visible_size;
+        };
+        Size2D::new(
+            visible_size.width + left.max(0) as f32 + right.max(0) as f32,
+            visible_size.height + top.max(0) as f32 + bottom.max(0) as f32,
+        )
+    }
+
+    pub(crate) fn webview_visible_source_rect(
+        &self,
+        visible_size: Size2D<i32, DevicePixel>,
+    ) -> Rect<i32, DevicePixel> {
+        let Some((left, top, _, _)) = self.wall_tile_render_insets() else {
+            return Rect::new(Point2D::origin(), visible_size);
+        };
+        Rect::new(Point2D::new(left.max(0), top.max(0)), visible_size)
+    }
+
     pub(crate) fn handle_winit_window_event(
         &self,
         state: Rc<RunningAppState>,
@@ -676,8 +784,8 @@ impl HeadedWindow {
                         self.handle_mouse_move_event(&webview, position);
                     },
                     WindowEvent::CursorLeft { .. } => {
-                        let webview_rect: Rect<_, _> = webview.size().into();
-                        if webview_rect.contains(self.webview_relative_mouse_point.get()) {
+                        let webview_rect = self.webview_local_rect(&webview);
+                        if webview_rect.contains(self.webview_local_mouse_point.get()) {
                             webview.notify_input_event(InputEvent::MouseLeftViewport(
                                 MouseLeftViewportEvent::default(),
                             ));
@@ -709,11 +817,13 @@ impl HeadedWindow {
                         )));
                     },
                     WindowEvent::Touch(touch) => {
+                        let local_point =
+                            self.webview_local_point_from_window_position(touch.location);
+                        let point = self.webview_virtual_point_from_local_point(local_point);
                         webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
                             winit_phase_to_touch_event_type(touch.phase),
                             TouchId(touch.id as i32),
-                            DevicePoint::new(touch.location.x as f32, touch.location.y as f32)
-                                .into(),
+                            point.into(),
                         )));
                     },
                     WindowEvent::PinchGesture { delta, .. } => {
@@ -812,6 +922,27 @@ impl PlatformWindow for HeadedWindow {
     fn screen_geometry(&self) -> ScreenGeometry {
         let hidpi_factor = self.hidpi_scale_factor();
         let toolbar_size = Size2D::new(0.0, (self.toolbar_height() * self.hidpi_scale_factor()).0);
+        if let Some(layout) = &self.wall_layout {
+            let screen_size = layout.virtual_viewport_device_size(hidpi_factor);
+            let available_screen_size = screen_size - toolbar_size.to_i32();
+            let window_rect = layout
+                .tile_device_rect(self.wall_tile_index, hidpi_factor)
+                .unwrap_or_else(|| {
+                    DeviceIntRect::from_origin_and_size(
+                        winit_position_to_euclid_point(
+                            self.winit_window.outer_position().unwrap_or_default(),
+                        ),
+                        winit_size_to_euclid_size(self.winit_window.outer_size()).to_i32(),
+                    )
+                });
+
+            return ScreenGeometry {
+                size: screen_size,
+                available_size: available_screen_size,
+                window_rect,
+            };
+        }
+
         let screen_size = self.screen_size.to_f32() * hidpi_factor;
 
         // FIXME: In reality, this should subtract screen space used by the system interface
@@ -829,6 +960,16 @@ impl PlatformWindow for HeadedWindow {
             available_size: available_screen_size.to_i32(),
             window_rect,
         }
+    }
+
+    fn webview_paint_origin(&self) -> Option<Vector2D<f32, DevicePixel>> {
+        let layout = self.wall_layout.as_ref()?;
+        let render_rect =
+            layout.tile_render_device_rect(self.wall_tile_index, self.hidpi_scale_factor())?;
+        Some(Vector2D::new(
+            render_rect.min.x as f32,
+            render_rect.min.y as f32,
+        ))
     }
 
     fn device_hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {

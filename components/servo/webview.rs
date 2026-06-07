@@ -31,7 +31,7 @@ use servo_geometry::DeviceIndependentPixel;
 use servo_url::ServoUrl;
 use style_traits::CSSPixel;
 use url::Url;
-use webrender_api::units::{DeviceIntRect, DevicePixel, DevicePoint, DeviceSize};
+use webrender_api::units::{DeviceIntRect, DevicePixel, DevicePoint, DeviceSize, DeviceVector2D};
 
 use crate::clipboard_delegate::{ClipboardDelegate, DefaultClipboardDelegate};
 #[cfg(feature = "gamepad")]
@@ -115,6 +115,8 @@ pub(crate) struct WebViewInner {
     rendering_context: Rc<dyn RenderingContext>,
     user_content_manager: Option<Rc<UserContentManager>>,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+    viewport_size_override: Option<Size2D<f32, CSSPixel>>,
+    viewport_origin_override: DeviceVector2D,
     load_status: LoadStatus,
     status_text: Option<String>,
     page_title: Option<String>,
@@ -163,6 +165,7 @@ impl WebView {
             grafted_accesskit_tree_id: None,
             grafted_accesskit_tree_epoch: None,
             hidpi_scale_factor: builder.hidpi_scale_factor,
+            viewport_size_override: builder.viewport_size_override,
             load_status: LoadStatus::Started,
             status_text: None,
             page_title: None,
@@ -173,6 +176,7 @@ impl WebView {
             back_forward_list: Default::default(),
             back_forward_list_index: 0,
             user_content_manager: builder.user_content_manager.clone(),
+            viewport_origin_override: builder.viewport_origin_override,
         })));
 
         let viewport_details = webview.viewport_details();
@@ -182,6 +186,7 @@ impl WebView {
                 id,
             }),
             viewport_details,
+            webview.viewport_origin_override(),
         );
 
         servo
@@ -246,15 +251,22 @@ impl WebView {
     }
 
     pub(crate) fn viewport_details(&self) -> ViewportDetails {
-        // The division by 1 represents the page's default zoom of 100%,
-        // and gives us the appropriate CSSPixel type for the viewport.
+        // The rendering context size is in device pixels. After removing the HiDPI scale,
+        // the numerical value is the layout viewport size in CSS pixels.
         let inner = self.inner();
-        let scaled_viewport_size =
-            inner.rendering_context.size2d().to_f32() / inner.hidpi_scale_factor;
+        let scaled_viewport_size = inner.viewport_size_override.unwrap_or_else(|| {
+            let viewport_size =
+                inner.rendering_context.size2d().to_f32() / inner.hidpi_scale_factor;
+            viewport_size.cast_unit()
+        });
         ViewportDetails {
-            size: scaled_viewport_size / Scale::new(1.0),
+            size: scaled_viewport_size,
             hidpi_scale_factor: Scale::new(inner.hidpi_scale_factor.0),
         }
+    }
+
+    pub(crate) fn viewport_origin_override(&self) -> DeviceVector2D {
+        self.inner().viewport_origin_override
     }
 
     pub(crate) fn from_weak_handle(inner: &Weak<RefCell<WebViewInner>>) -> Option<Self> {
@@ -410,6 +422,7 @@ impl WebView {
             .servo
             .paint()
             .resize_rendering_context(self.id(), new_size);
+        self.apply_viewport_details_override_to_paint_if_needed();
     }
 
     pub fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel> {
@@ -429,6 +442,26 @@ impl WebView {
             .servo
             .paint()
             .set_hidpi_scale_factor(self.id(), new_scale_factor);
+        self.apply_viewport_details_override_to_paint_if_needed();
+    }
+
+    fn apply_viewport_details_override_to_paint_if_needed(&self) {
+        let (servo, id, has_viewport_size_override) = {
+            let inner = self.inner();
+            (
+                inner.servo.clone(),
+                inner.id,
+                inner.viewport_size_override.is_some(),
+            )
+        };
+
+        if !has_viewport_size_override {
+            return;
+        }
+
+        servo
+            .paint()
+            .set_viewport_details(id, self.viewport_details());
     }
 
     pub fn show(&self) {
@@ -927,6 +960,8 @@ pub struct WebViewBuilder {
     delegate: Rc<dyn WebViewDelegate>,
     url: Option<Url>,
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+    viewport_size_override: Option<Size2D<f32, CSSPixel>>,
+    viewport_origin_override: DeviceVector2D,
     create_new_webview_responder: Option<IpcResponder<Option<NewWebViewDetails>>>,
     user_content_manager: Option<Rc<UserContentManager>>,
     clipboard_delegate: Option<Rc<dyn ClipboardDelegate>>,
@@ -941,6 +976,8 @@ impl WebViewBuilder {
             rendering_context,
             url: None,
             hidpi_scale_factor: Scale::new(1.0),
+            viewport_size_override: None,
+            viewport_origin_override: DeviceVector2D::zero(),
             delegate: Rc::new(DefaultWebViewDelegate),
             create_new_webview_responder: None,
             user_content_manager: None,
@@ -975,6 +1012,24 @@ impl WebViewBuilder {
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     ) -> Self {
         self.hidpi_scale_factor = hidpi_scale_factor;
+        self
+    }
+
+    /// Override the layout viewport size used for this `WebView`.
+    ///
+    /// The rendering context can remain sized to the platform window while layout, hit testing,
+    /// and input coordinates operate in a larger virtual viewport.
+    pub fn viewport_size_override(mut self, viewport_size_override: Size2D<f32, CSSPixel>) -> Self {
+        self.viewport_size_override = Some(viewport_size_override);
+        self
+    }
+
+    /// Offset the `WebView`'s virtual viewport before painting into the rendering context.
+    ///
+    /// This lets a local tile-sized rendering context show its assigned region of a larger
+    /// virtual viewport while script and layout still use global viewport coordinates.
+    pub fn viewport_origin_override(mut self, viewport_origin_override: DeviceVector2D) -> Self {
+        self.viewport_origin_override = viewport_origin_override;
         self
     }
 

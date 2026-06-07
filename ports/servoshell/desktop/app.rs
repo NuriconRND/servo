@@ -98,8 +98,18 @@ impl App {
             .protocol_registry(protocol_registry)
             .event_loop_waker(self.waker.clone());
 
+        let initial_tile_indices = self.initial_wall_tile_indices();
         let url = self.initial_url.as_url().clone();
-        let platform_window = self.create_platform_window(url, active_event_loop);
+        let first_tile_index = initial_tile_indices
+            .first()
+            .copied()
+            .unwrap_or(self.servoshell_preferences.wall_tile_index);
+        let first_window_preferences = self.preferences_for_wall_tile(first_tile_index);
+        let platform_window = self.create_platform_window_with_preferences(
+            &first_window_preferences,
+            url,
+            active_event_loop,
+        );
 
         #[cfg(feature = "webxr")]
         let servo_builder =
@@ -133,8 +143,41 @@ impl App {
             ServoshellGamepadDelegate::maybe_new().map(Rc::new),
         ));
         running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        for tile_index in initial_tile_indices.into_iter().skip(1) {
+            let tile_preferences = self.preferences_for_wall_tile(tile_index);
+            let platform_window = self.create_platform_window_with_preferences(
+                &tile_preferences,
+                self.initial_url.as_url().clone(),
+                active_event_loop,
+            );
+            running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        }
 
         self.state = AppState::Running(running_state);
+    }
+
+    fn initial_wall_tile_indices(&self) -> Vec<usize> {
+        if self.servoshell_preferences.headless || !self.servoshell_preferences.wall_all_tiles {
+            return vec![self.servoshell_preferences.wall_tile_index];
+        }
+
+        self.servoshell_preferences
+            .wall_layout
+            .as_ref()
+            .map(|layout| (0..layout.tiles.len()).collect())
+            .unwrap_or_else(|| vec![self.servoshell_preferences.wall_tile_index])
+    }
+
+    fn preferences_for_wall_tile(&self, tile_index: usize) -> ServoShellPreferences {
+        let mut preferences = self.servoshell_preferences.clone();
+        preferences.wall_tile_index = tile_index;
+        if preferences.wall_all_tiles &&
+            let Some(layout) = &preferences.wall_layout &&
+            let Some(tile) = layout.tiles.get(tile_index)
+        {
+            preferences.initial_window_size = tile.rect.size.to_u32();
+        }
+        preferences
     }
 
     #[servo::servo_tracing::instrument(level = "debug", skip_all)]
@@ -143,17 +186,31 @@ impl App {
         url: Url,
         active_event_loop: Option<&ActiveEventLoop>,
     ) -> Rc<dyn PlatformWindow> {
+        self.create_platform_window_with_preferences(
+            &self.servoshell_preferences,
+            url,
+            active_event_loop,
+        )
+    }
+
+    #[servo::servo_tracing::instrument(level = "debug", skip_all)]
+    fn create_platform_window_with_preferences(
+        &self,
+        servoshell_preferences: &ServoShellPreferences,
+        url: Url,
+        active_event_loop: Option<&ActiveEventLoop>,
+    ) -> Rc<dyn PlatformWindow> {
         assert_eq!(
-            self.servoshell_preferences.headless,
+            servoshell_preferences.headless,
             active_event_loop.is_none()
         );
 
         let Some(active_event_loop) = active_event_loop else {
-            return HeadlessWindow::new(&self.servoshell_preferences);
+            return HeadlessWindow::new(servoshell_preferences);
         };
 
         HeadedWindow::new(
-            &self.servoshell_preferences,
+            servoshell_preferences,
             active_event_loop,
             self.event_loop_proxy
                 .clone()

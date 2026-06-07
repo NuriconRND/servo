@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
-use euclid::Scale;
+use euclid::{Scale, Vector2D};
 use log::warn;
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel, Cursor,
@@ -105,6 +105,23 @@ impl ServoShellWindow {
                 .hidpi_scale_factor(self.platform_window.hidpi_scale_factor())
                 .user_content_manager(state.user_content_manager.clone())
                 .delegate(state.clone());
+
+        if let Some(wall_layout) = &state.servoshell_preferences.wall_layout {
+            let virtual_viewport_size = wall_layout.virtual_viewport_css_size();
+            let hidpi_factor = self.platform_window.hidpi_scale_factor();
+            let viewport_origin = self
+                .platform_window
+                .webview_paint_origin()
+                .unwrap_or_else(|| {
+                    wall_layout.tile_origin_device_vector(
+                        state.servoshell_preferences.wall_tile_index,
+                        hidpi_factor,
+                    )
+                });
+            webview_builder = webview_builder
+                .viewport_size_override(virtual_viewport_size)
+                .viewport_origin_override(viewport_origin);
+        }
 
         #[cfg(all(
             feature = "gamepad",
@@ -379,6 +396,9 @@ impl ServoShellWindow {
 pub(crate) trait PlatformWindow {
     fn id(&self) -> ServoShellWindowId;
     fn screen_geometry(&self) -> ScreenGeometry;
+    fn webview_paint_origin(&self) -> Option<Vector2D<f32, DevicePixel>> {
+        None
+    }
     #[cfg_attr(any(target_os = "android", target_env = "ohos"), expect(dead_code))]
     fn device_hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel>;
     fn hidpi_scale_factor(&self) -> Scale<f32, DeviceIndependentPixel, DevicePixel>;

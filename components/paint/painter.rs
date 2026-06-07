@@ -42,8 +42,8 @@ use webrender::{
     MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
 };
 use webrender_api::units::{
-    DevicePixel, DevicePoint, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform, LayoutVector2D,
-    WorldPoint,
+    DevicePixel, DevicePoint, DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize,
+    LayoutTransform, LayoutVector2D, WorldPoint,
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
@@ -636,8 +636,9 @@ impl Painter {
                 &pinch_zoom_transform.to_3d(),
             ));
 
+            let viewport_origin = webview_renderer.viewport_origin();
             let webview_reference_frame = builder.push_reference_frame(
-                LayoutPoint::zero(),
+                LayoutPoint::new(-viewport_origin.x, -viewport_origin.y),
                 root_reference_frame,
                 TransformStyle::Flat,
                 PropertyBinding::Value(transform),
@@ -1211,12 +1212,14 @@ impl Painter {
         &mut self,
         webview: Box<dyn WebViewTrait>,
         viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
     ) {
         self.webview_renderers
             .entry(webview.id())
             .or_insert(WebViewRenderer::new(
                 webview,
                 viewport_details,
+                viewport_origin,
                 self.embedder_to_constellation_sender.clone(),
                 self.refresh_driver.clone(),
                 self.webrender_document,
@@ -1262,6 +1265,22 @@ impl Painter {
             return;
         };
         if !webview_renderer.set_hidpi_scale_factor(new_scale_factor) {
+            return;
+        }
+
+        self.send_root_pipeline_display_list();
+        self.set_needs_repaint(RepaintReason::Resize);
+    }
+
+    pub(crate) fn set_viewport_details(
+        &mut self,
+        webview_id: WebViewId,
+        viewport_details: ViewportDetails,
+    ) {
+        let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
+            return;
+        };
+        if !webview_renderer.set_viewport_details(viewport_details) {
             return;
         }
 
@@ -1318,10 +1337,12 @@ impl Painter {
                     InputEvent::MouseMove(event) => {
                         // We only track the last mouse move position for non-touch events.
                         if !event.is_compatibility_event_for_touch {
-                            let event_point = event
+                            let viewport_point = event
                                 .point
                                 .as_device_point(webview_renderer.device_pixels_per_page_pixel());
-                            self.last_mouse_move_position = Some(event_point);
+                            self.last_mouse_move_position = Some(
+                                webview_renderer.render_point_from_viewport_point(viewport_point),
+                            );
                         }
                     },
                     InputEvent::MouseLeftViewport(_) => {

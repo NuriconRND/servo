@@ -44,7 +44,7 @@ use webgl::webgl_thread::WebGLContextBusyMap;
 #[cfg(feature = "webgpu")]
 use webgpu::canvas_context::WebGpuExternalImageMap;
 use webrender::{CaptureBits, MemoryReport};
-use webrender_api::units::{DevicePixel, DevicePoint};
+use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
 use webrender_api::{FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
@@ -644,9 +644,14 @@ impl Paint {
         }
     }
 
-    pub fn add_webview(&self, webview: Box<dyn WebViewTrait>, viewport_details: ViewportDetails) {
+    pub fn add_webview(
+        &self,
+        webview: Box<dyn WebViewTrait>,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) {
         self.painter_mut(webview.id().into())
-            .add_webview(webview, viewport_details);
+            .add_webview(webview, viewport_details, viewport_origin);
     }
 
     pub fn show_webview(&self, webview_id: WebViewId) -> Result<(), UnknownWebView> {
@@ -669,6 +674,14 @@ impl Paint {
         }
         self.painter_mut(webview_id.into())
             .set_hidpi_scale_factor(webview_id, new_scale_factor);
+    }
+
+    pub fn set_viewport_details(&self, webview_id: WebViewId, viewport_details: ViewportDetails) {
+        if self.shutdown_state() != ShutdownState::NotShuttingDown {
+            return;
+        }
+        self.painter_mut(webview_id.into())
+            .set_viewport_details(webview_id, viewport_details);
     }
 
     pub fn resize_rendering_context(&self, webview_id: WebViewId, new_size: PhysicalSize<u32>) {

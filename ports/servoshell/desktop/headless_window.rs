@@ -21,6 +21,7 @@ use servo::{
 use winit::dpi::PhysicalSize;
 
 use crate::prefs::ServoShellPreferences;
+use crate::wall_layout::WallLayout;
 use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
 
 pub struct HeadlessWindow {
@@ -32,6 +33,8 @@ pub struct HeadlessWindow {
     // virtual top-left position of the window in device pixels.
     window_position: Cell<Point2D<i32, DevicePixel>>,
     rendering_context: Rc<SoftwareRenderingContext>,
+    wall_layout: Option<WallLayout>,
+    wall_tile_index: usize,
 }
 
 impl HeadlessWindow {
@@ -66,6 +69,8 @@ impl HeadlessWindow {
             screen_size,
             window_position: Cell::new(Point2D::zero()),
             rendering_context: Rc::new(rendering_context),
+            wall_layout: servoshell_preferences.wall_layout.clone(),
+            wall_tile_index: servoshell_preferences.wall_tile_index,
         };
 
         Rc::new(window)
@@ -86,6 +91,24 @@ impl PlatformWindow for HeadlessWindow {
     }
 
     fn screen_geometry(&self) -> servo::ScreenGeometry {
+        if let Some(layout) = &self.wall_layout {
+            let hidpi_factor = self.hidpi_scale_factor();
+            let screen_size = layout.virtual_viewport_device_size(hidpi_factor);
+            let window_rect = layout
+                .tile_device_rect(self.wall_tile_index, hidpi_factor)
+                .unwrap_or_else(|| {
+                    DeviceIntRect::from_origin_and_size(
+                        self.window_position.get(),
+                        self.inner_size.get(),
+                    )
+                });
+            return ScreenGeometry {
+                size: screen_size,
+                available_size: screen_size,
+                window_rect,
+            };
+        }
+
         ScreenGeometry {
             size: self.screen_size,
             available_size: self.screen_size,
