@@ -20,17 +20,18 @@ use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use ipc_channel::ipc::{self};
 use log::{debug, warn};
+use paint_api::display_list::PaintDisplayListInfo;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::{
     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
-    WebRenderExternalImageIdManager, WebViewTrait,
+    SerializableDisplayListPayload, WebRenderExternalImageIdManager, WebViewTrait,
 };
 use profile_traits::mem::{
     ProcessReports, ProfilerRegistration, Report, ReportKind, perform_memory_report,
 };
 use profile_traits::path;
 use profile_traits::time::{self as profile_time};
-use servo_base::generic_channel::{self, GenericSender, RoutedReceiver};
+use servo_base::generic_channel::{self, GenericReceiver, GenericSender, RoutedReceiver};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_canvas_traits::webgl::{WebGLContextId, WebGLThreads};
 use servo_config::pref;
@@ -45,7 +46,7 @@ use webgl::webgl_thread::WebGLContextBusyMap;
 use webgpu::canvas_context::WebGpuExternalImageMap;
 use webrender::{CaptureBits, MemoryReport};
 use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
-use webrender_api::{FontInstanceKey, FontKey, ImageKey};
+use webrender_api::{BuiltDisplayListDescriptor, FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
 use crate::painter::Painter;
@@ -321,6 +322,44 @@ impl Paint {
             .unwrap_or_else(|| vec![webview_id.into()])
     }
 
+    fn target_painter_ids_for_source_painter(
+        &self,
+        source_painter_id: PainterId,
+    ) -> Vec<PainterId> {
+        self.webview_painter_targets
+            .borrow()
+            .values()
+            .find(|target_painter_ids| {
+                target_painter_ids.first().copied() == Some(source_painter_id)
+            })
+            .cloned()
+            .unwrap_or_else(|| vec![source_painter_id])
+    }
+
+    fn for_each_webview_painter_mut(
+        &self,
+        webview_id: WebViewId,
+        mut callback: impl FnMut(&mut Painter),
+    ) {
+        for painter_id in self.painter_targets_for_webview(webview_id) {
+            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+                callback(&mut painter);
+            }
+        }
+    }
+
+    fn for_each_source_painter_target_mut(
+        &self,
+        source_painter_id: PainterId,
+        mut callback: impl FnMut(&mut Painter),
+    ) {
+        for painter_id in self.target_painter_ids_for_source_painter(source_painter_id) {
+            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+                callback(&mut painter);
+            }
+        }
+    }
+
     fn primary_painter_id_for_webview(&self, webview_id: WebViewId) -> PainterId {
         self.painter_targets_for_webview(webview_id)
             .first()
@@ -438,36 +477,36 @@ impl Paint {
                 pipeline_id,
                 animation_state,
             ) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.change_running_animations_state(
                         webview_id,
                         pipeline_id,
                         animation_state,
                     );
-                }
+                });
             },
             PaintMessage::SetFrameTreeForWebView(webview_id, frame_tree) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.set_frame_tree_for_webview(&frame_tree);
-                }
+                });
             },
             PaintMessage::SetThrottled(webview_id, pipeline_id, throttled) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.set_throttled(webview_id, pipeline_id, throttled);
-                }
+                });
             },
             PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
-                }
+                });
             },
             PaintMessage::NewWebRenderFrameReady(..) => {
                 unreachable!("New WebRender frames should be handled in the caller.");
             },
             PaintMessage::SendInitialTransaction(webview_id, pipeline_id) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.send_initial_pipeline_transaction(webview_id, pipeline_id);
-                }
+                });
             },
             PaintMessage::ScrollNodeByDelta(
                 webview_id,
@@ -475,28 +514,28 @@ impl Paint {
                 offset,
                 external_scroll_id,
             ) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.scroll_node_by_delta(
                         webview_id,
                         pipeline_id,
                         offset,
                         external_scroll_id,
                     );
-                }
+                });
             },
             PaintMessage::ScrollViewportByDelta(webview_id, delta) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.scroll_viewport_by_delta(webview_id, delta);
-                }
+                });
             },
             PaintMessage::UpdateEpoch {
                 webview_id,
                 pipeline_id,
                 epoch,
             } => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.update_epoch(webview_id, pipeline_id, epoch);
-                }
+                });
             },
             PaintMessage::SendDisplayList {
                 webview_id,
@@ -504,17 +543,24 @@ impl Paint {
                 display_list_info_receiver,
                 display_list_data_receiver,
             } => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-                    painter.handle_new_display_list(
-                        webview_id,
-                        display_list_descriptor,
-                        display_list_info_receiver,
-                        display_list_data_receiver,
-                    );
-                }
+                self.handle_new_display_list(
+                    webview_id,
+                    display_list_descriptor,
+                    display_list_info_receiver,
+                    display_list_data_receiver,
+                );
             },
             PaintMessage::GenerateFrame(painter_ids) => {
+                let mut target_painter_ids = Vec::new();
                 for painter_id in painter_ids {
+                    for target_painter_id in self.target_painter_ids_for_source_painter(painter_id)
+                    {
+                        if !target_painter_ids.contains(&target_painter_id) {
+                            target_painter_ids.push(target_painter_id);
+                        }
+                    }
+                }
+                for painter_id in target_painter_ids {
                     if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
                         painter.generate_frame_for_script();
                     }
@@ -527,9 +573,9 @@ impl Paint {
                 self.handle_generate_image_keys_for_pipeline(webview_id, pipeline_id);
             },
             PaintMessage::UpdateImages(painter_id, updates) => {
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.update_images(updates);
-                }
+                self.for_each_source_painter_target_mut(painter_id, |painter| {
+                    painter.update_images(updates.clone());
+                });
             },
             PaintMessage::DelayNewFrameForCanvas(
                 webview_id,
@@ -537,23 +583,27 @@ impl Paint {
                 canvas_epoch,
                 image_keys,
             ) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-                    painter.delay_new_frames_for_canvas(pipeline_id, canvas_epoch, image_keys);
-                }
+                self.for_each_webview_painter_mut(webview_id, |painter| {
+                    painter.delay_new_frames_for_canvas(
+                        pipeline_id,
+                        canvas_epoch,
+                        image_keys.clone(),
+                    );
+                });
             },
             PaintMessage::AddFont(painter_id, font_key, data, index) => {
                 debug_assert!(painter_id == font_key.into());
 
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.add_font(font_key, data, index);
-                }
+                self.for_each_source_painter_target_mut(painter_id, |painter| {
+                    painter.add_font(font_key, data.clone(), index);
+                });
             },
             PaintMessage::AddSystemFont(painter_id, font_key, native_handle) => {
                 debug_assert!(painter_id == font_key.into());
 
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.add_system_font(font_key, native_handle);
-                }
+                self.for_each_source_painter_target_mut(painter_id, |painter| {
+                    painter.add_system_font(font_key, native_handle.clone());
+                });
             },
             PaintMessage::AddFontInstance(
                 painter_id,
@@ -566,14 +616,20 @@ impl Paint {
                 debug_assert!(painter_id == font_key.into());
                 debug_assert!(painter_id == font_instance_key.into());
 
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.add_font_instance(font_instance_key, font_key, size, flags, variations);
-                }
+                self.for_each_source_painter_target_mut(painter_id, |painter| {
+                    painter.add_font_instance(
+                        font_instance_key,
+                        font_key,
+                        size,
+                        flags,
+                        variations.clone(),
+                    );
+                });
             },
             PaintMessage::RemoveFonts(painter_id, keys, instance_keys) => {
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.remove_fonts(keys, instance_keys);
-                }
+                self.for_each_source_painter_target_mut(painter_id, |painter| {
+                    painter.remove_fonts(keys.clone(), instance_keys.clone());
+                });
             },
             PaintMessage::GenerateFontKeys(
                 number_of_font_keys,
@@ -589,9 +645,9 @@ impl Paint {
                 );
             },
             PaintMessage::Viewport(webview_id, viewport_description) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-                    painter.set_viewport_description(webview_id, viewport_description);
-                }
+                self.for_each_webview_painter_mut(webview_id, |painter| {
+                    painter.set_viewport_description(webview_id, viewport_description.clone());
+                });
             },
             PaintMessage::ScreenshotReadinessReponse(webview_id, pipelines_and_epochs) => {
                 if let Some(painter) = self.maybe_primary_painter(webview_id) {
@@ -599,14 +655,19 @@ impl Paint {
                 }
             },
             PaintMessage::SendLCPCandidate(lcp_candidate, webview_id, pipeline_id, epoch) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-                    painter.append_lcp_candidate(lcp_candidate, webview_id, pipeline_id, epoch);
-                }
+                self.for_each_webview_painter_mut(webview_id, |painter| {
+                    painter.append_lcp_candidate(
+                        lcp_candidate.clone(),
+                        webview_id,
+                        pipeline_id,
+                        epoch,
+                    );
+                });
             },
             PaintMessage::EnableLCPCalculation(webview_id) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
+                self.for_each_webview_painter_mut(webview_id, |painter| {
                     painter.enable_lcp_calculation(&webview_id);
-                }
+                });
             },
         }
     }
@@ -668,6 +729,32 @@ impl Paint {
         sender.send(ProcessReports::new(reports));
     }
 
+    fn handle_new_display_list(
+        &self,
+        webview_id: WebViewId,
+        display_list_descriptor: BuiltDisplayListDescriptor,
+        display_list_info_receiver: GenericReceiver<PaintDisplayListInfo>,
+        display_list_data_receiver: GenericReceiver<SerializableDisplayListPayload>,
+    ) {
+        let Ok(display_list_info) = display_list_info_receiver.recv() else {
+            return log::error!("Could not receive display list info");
+        };
+        let Ok(display_list_data) = display_list_data_receiver.recv() else {
+            return log::error!("Could not receive display list data");
+        };
+
+        for painter_id in self.painter_targets_for_webview(webview_id) {
+            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+                painter.handle_new_display_list(
+                    webview_id,
+                    display_list_descriptor.clone(),
+                    display_list_info.clone(),
+                    display_list_data.clone(),
+                );
+            }
+        }
+    }
+
     /// Handle messages sent to `Paint` during the shutdown process. In general,
     /// the things `Paint` can do in this state are limited. It's very important to
     /// answer any synchronous messages though as other threads might be waiting on the
@@ -722,14 +809,51 @@ impl Paint {
             .add_webview(webview, viewport_details, viewport_origin);
     }
 
+    pub fn add_webview_paint_target(
+        &mut self,
+        webview: Box<dyn WebViewTrait>,
+        rendering_context: Rc<dyn RenderingContext>,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) -> PainterId {
+        let webview_id = webview.id();
+        let painter_id = self.register_rendering_context(rendering_context);
+        self.register_webview_painter_target(webview_id, painter_id);
+        self.painter_mut(painter_id)
+            .add_webview(webview, viewport_details, viewport_origin);
+        painter_id
+    }
+
     pub fn show_webview(&self, webview_id: WebViewId) -> Result<(), UnknownWebView> {
-        self.primary_painter_mut(webview_id)
-            .set_webview_hidden(webview_id, false)
+        let mut result = Ok(());
+        let mut saw_painter = false;
+        self.for_each_webview_painter_mut(webview_id, |painter| {
+            saw_painter = true;
+            if result.is_ok() {
+                result = painter.set_webview_hidden(webview_id, false);
+            }
+        });
+        if saw_painter {
+            result
+        } else {
+            Err(UnknownWebView(webview_id))
+        }
     }
 
     pub fn hide_webview(&self, webview_id: WebViewId) -> Result<(), UnknownWebView> {
-        self.primary_painter_mut(webview_id)
-            .set_webview_hidden(webview_id, true)
+        let mut result = Ok(());
+        let mut saw_painter = false;
+        self.for_each_webview_painter_mut(webview_id, |painter| {
+            saw_painter = true;
+            if result.is_ok() {
+                result = painter.set_webview_hidden(webview_id, true);
+            }
+        });
+        if saw_painter {
+            result
+        } else {
+            Err(UnknownWebView(webview_id))
+        }
     }
 
     pub fn set_hidpi_scale_factor(
@@ -748,8 +872,9 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .set_viewport_details(webview_id, viewport_details);
+        self.for_each_webview_painter_mut(webview_id, |painter| {
+            painter.set_viewport_details(webview_id, viewport_details);
+        });
     }
 
     pub fn resize_rendering_context(&self, webview_id: WebViewId, new_size: PhysicalSize<u32>) {
@@ -764,8 +889,9 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .set_page_zoom(webview_id, new_zoom);
+        self.for_each_webview_painter_mut(webview_id, |painter| {
+            painter.set_page_zoom(webview_id, new_zoom);
+        });
     }
 
     pub fn page_zoom(&self, webview_id: WebViewId) -> f32 {
@@ -776,6 +902,21 @@ impl Paint {
     pub fn render(&self, webview_id: WebViewId) {
         self.primary_painter_mut(webview_id)
             .render(&self.time_profiler_chan);
+    }
+
+    /// Render one registered paint target for the given logical `WebView`.
+    pub fn render_paint_target(&self, webview_id: WebViewId, painter_id: PainterId) {
+        if !self
+            .painter_targets_for_webview(webview_id)
+            .contains(&painter_id)
+        {
+            warn!("Ignoring render for unregistered paint target {painter_id:?} of {webview_id:?}");
+            return;
+        }
+
+        if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+            painter.render(&self.time_profiler_chan);
+        }
     }
 
     /// Get the message receiver for this [`Paint`].
@@ -894,8 +1035,11 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .adjust_pinch_zoom(webview_id, pinch_zoom_delta, center);
+        self.primary_painter_mut(webview_id).adjust_pinch_zoom(
+            webview_id,
+            pinch_zoom_delta,
+            center,
+        );
     }
 
     pub fn pinch_zoom(&self, webview_id: WebViewId) -> f32 {

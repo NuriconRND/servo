@@ -198,7 +198,7 @@ impl Debug for PaintMessage {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SendableFrameTree {
     pub pipeline: CompositionPipeline,
     pub children: Vec<SendableFrameTree>,
@@ -212,7 +212,7 @@ pub struct CompositionPipeline {
 }
 
 /// A serializable version of `DisplayListPayload`.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SerializableDisplayListPayload {
     /// Serde encoded bytes of the display list' `DisplayItems` and their supporting data.
     #[serde(with = "serde_bytes")]
@@ -249,8 +249,8 @@ impl CrossProcessPaintApi {
         callback: Option<Box<dyn Fn(PaintMessage) + Send + 'static>>,
     ) -> Self {
         let callback = GenericCallback::new(move |msg| {
-            if let Some(ref handler) = callback &&
-                let Ok(paint_message) = msg
+            if let Some(ref handler) = callback
+                && let Ok(paint_message) = msg
             {
                 handler(paint_message);
             }
@@ -729,7 +729,7 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 /// Serializable image updates that must be performed by WebRender.
 pub enum ImageUpdate {
     /// Register a new image.
@@ -778,7 +778,7 @@ impl Debug for ImageUpdate {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Serialized `ImageData`.
 pub enum SerializableImageData {
     /// A simple series of bytes, provided by the embedding and owned by WebRender.

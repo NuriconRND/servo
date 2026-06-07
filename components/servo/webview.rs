@@ -24,7 +24,7 @@ use paint_api::WebViewTrait;
 use paint_api::rendering_context::RenderingContext;
 use servo_base::Epoch;
 use servo_base::generic_channel::GenericSender;
-use servo_base::id::WebViewId;
+use servo_base::id::{PainterId, WebViewId};
 use servo_config::pref;
 use servo_constellation_traits::{EmbedderToConstellationMessage, TraversalDirection};
 use servo_geometry::DeviceIndependentPixel;
@@ -79,6 +79,12 @@ pub(crate) const MINIMUM_WEBVIEW_SIZE: Size2D<i32, DevicePixel> = Size2D::new(1,
 /// [`WebViewDelegate::notify_new_frame_ready`] method.
 #[derive(Clone)]
 pub struct WebView(Rc<RefCell<WebViewInner>>);
+
+/// A handle to one paint target registered for a [`WebView`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WebViewPaintTarget {
+    painter_id: PainterId,
+}
 
 impl PartialEq for WebView {
     fn eq(&self, other: &Self) -> bool {
@@ -683,6 +689,45 @@ impl WebView {
     /// Paint the contents of this [`WebView`] into its `RenderingContext`.
     pub fn paint(&self) {
         self.inner().servo.paint().render(self.id());
+    }
+
+    /// Get the primary paint target for this [`WebView`].
+    pub fn primary_paint_target(&self) -> WebViewPaintTarget {
+        WebViewPaintTarget {
+            painter_id: self.id().into(),
+        }
+    }
+
+    /// Register an additional [`RenderingContext`] for this [`WebView`].
+    pub fn add_paint_target(
+        &self,
+        rendering_context: Rc<dyn RenderingContext>,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) -> WebViewPaintTarget {
+        let (servo, id) = {
+            let inner = self.inner();
+            (inner.servo.clone(), inner.id)
+        };
+
+        let painter_id = servo.paint_mut().add_webview_paint_target(
+            Box::new(ServoRendererWebView {
+                id,
+                weak_handle: self.weak_handle(),
+            }),
+            rendering_context,
+            viewport_details,
+            viewport_origin,
+        );
+        WebViewPaintTarget { painter_id }
+    }
+
+    /// Paint the contents of this [`WebView`] into one registered paint target.
+    pub fn paint_target(&self, target: WebViewPaintTarget) {
+        self.inner()
+            .servo
+            .paint()
+            .render_paint_target(self.id(), target.painter_id);
     }
 
     /// Get the [`UserContentManager`] associated with this [`WebView`].

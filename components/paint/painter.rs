@@ -31,7 +31,7 @@ use profile_traits::time_profile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
-use servo_base::generic_channel::{GenericReceiver, GenericSharedMemory};
+use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
@@ -42,8 +42,8 @@ use webrender::{
     MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
 };
 use webrender_api::units::{
-    DevicePixel, DevicePoint, DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize,
-    LayoutTransform, LayoutVector2D, WorldPoint,
+    DevicePixel, DevicePoint, DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform,
+    LayoutVector2D, WorldPoint,
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
@@ -650,8 +650,8 @@ impl Painter {
                 webview_renderer.id.into(),
             );
 
-            let scaled_webview_rect = webview_renderer.rect /
-                webview_renderer.device_pixels_per_page_pixel_not_including_pinch_zoom();
+            let scaled_webview_rect = webview_renderer.rect
+                / webview_renderer.device_pixels_per_page_pixel_not_including_pinch_zoom();
             builder.push_iframe(
                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
                 LayoutRect::from_untyped(&scaled_webview_rect.to_untyped()),
@@ -749,9 +749,9 @@ impl Painter {
         let mut flags = renderer.get_debug_flags();
         let flag = match option {
             WebRenderDebugOption::Profiler => {
-                webrender::DebugFlags::PROFILER_DBG |
-                    webrender::DebugFlags::GPU_TIME_QUERIES |
-                    webrender::DebugFlags::GPU_SAMPLE_QUERIES
+                webrender::DebugFlags::PROFILER_DBG
+                    | webrender::DebugFlags::GPU_TIME_QUERIES
+                    | webrender::DebugFlags::GPU_SAMPLE_QUERIES
             },
             WebRenderDebugOption::TextureCacheDebug => webrender::DebugFlags::TEXTURE_CACHE_DBG,
             WebRenderDebugOption::RenderTargetDebug => webrender::DebugFlags::RENDER_TARGET_DBG,
@@ -945,16 +945,9 @@ impl Painter {
         &mut self,
         webview_id: WebViewId,
         display_list_descriptor: BuiltDisplayListDescriptor,
-        display_list_info_receiver: GenericReceiver<PaintDisplayListInfo>,
-        display_list_data_receiver: GenericReceiver<SerializableDisplayListPayload>,
+        display_list_info: PaintDisplayListInfo,
+        display_list_data: SerializableDisplayListPayload,
     ) {
-        let Ok(display_list_info) = display_list_info_receiver.recv() else {
-            return log::error!("Could not receive display list info");
-        };
-        let Ok(display_list_data) = display_list_data_receiver.recv() else {
-            return log::error!("Could not receive display list data");
-        };
-
         let items_data = display_list_data.items_data;
         let cache_data = display_list_data.cache_data;
         let spatial_tree = display_list_data.spatial_tree;
@@ -981,17 +974,17 @@ impl Painter {
 
         let epoch = display_list_info.epoch.into();
         let first_reflow = display_list_info.first_reflow;
-        if details.first_paint_metric.get() == PaintMetricState::Waiting &&
-            display_list_info.is_paintable
+        if details.first_paint_metric.get() == PaintMetricState::Waiting
+            && display_list_info.is_paintable
         {
             details
                 .first_paint_metric
                 .set(PaintMetricState::Seen(epoch, first_reflow));
         }
 
-        if details.first_contentful_paint_metric.get() == PaintMetricState::Waiting &&
-            display_list_info.is_paintable &&
-            display_list_info.is_contentful
+        if details.first_contentful_paint_metric.get() == PaintMetricState::Waiting
+            && display_list_info.is_paintable
+            && display_list_info.is_contentful
         {
             details
                 .first_contentful_paint_metric

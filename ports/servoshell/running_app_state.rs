@@ -295,6 +295,25 @@ impl RunningAppState {
         window
     }
 
+    pub(crate) fn open_window_with_shared_webview(
+        self: &Rc<Self>,
+        platform_window: Rc<dyn PlatformWindow>,
+        webview: WebView,
+    ) -> Rc<ServoShellWindow> {
+        let window = Rc::new(ServoShellWindow::new(platform_window.clone()));
+        self.windows
+            .borrow_mut()
+            .insert(window.id(), window.clone());
+        window.add_shared_toplevel_webview(self.clone(), webview);
+
+        // If the window already has platform focus, mark it as focused in our application state.
+        if platform_window.has_platform_focus() {
+            self.focus_window(window.clone());
+        }
+
+        window
+    }
+
     pub(crate) fn windows<'a>(
         &'a self,
     ) -> Ref<'a, HashMap<ServoShellWindowId, Rc<ServoShellWindow>>> {
@@ -391,8 +410,8 @@ impl RunningAppState {
                 return true;
             }
 
-            if let Some(focused_window) = self.focused_window() &&
-                Rc::ptr_eq(window, &focused_window)
+            if let Some(focused_window) = self.focused_window()
+                && Rc::ptr_eq(window, &focused_window)
             {
                 *self.focused_window.borrow_mut() = None;
             }
@@ -441,8 +460,8 @@ impl RunningAppState {
 
         // When no more windows are open, exit the application. Do not do this when
         // running WebDriver, which expects to keep running with no WebView open.
-        if self.servoshell_preferences.webdriver_port.get().is_none() &&
-            self.windows.borrow().is_empty()
+        if self.servoshell_preferences.webdriver_port.get().is_none()
+            && self.windows.borrow().is_empty()
         {
             self.schedule_exit()
         }
@@ -454,12 +473,27 @@ impl RunningAppState {
         &self,
         webview_id: WebViewId,
     ) -> Option<Rc<ServoShellWindow>> {
+        if let Some(focused_window) = self.focused_window()
+            && focused_window.contains_webview(webview_id)
+        {
+            return Some(focused_window);
+        }
+
         for window in self.windows.borrow().values() {
             if window.contains_webview(webview_id) {
                 return Some(window.clone());
             }
         }
         None
+    }
+
+    fn windows_for_webview_id(&self, webview_id: WebViewId) -> Vec<Rc<ServoShellWindow>> {
+        self.windows
+            .borrow()
+            .values()
+            .filter(|window| window.contains_webview(webview_id))
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn window_for_webview_id(&self, webview_id: WebViewId) -> Rc<ServoShellWindow> {
@@ -701,15 +735,21 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_status_text_changed(&self, webview: WebView, _status: Option<String>) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_update();
+        }
     }
 
     fn notify_history_changed(&self, webview: WebView, _entries: Vec<Url>, _current: usize) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_update();
+        }
     }
 
     fn notify_page_title_changed(&self, webview: WebView, _: Option<String>) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_update();
+        }
     }
 
     fn notify_traversal_complete(&self, _webview: WebView, traversal_id: TraversalId) {
@@ -762,8 +802,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_closed(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id())
-            .close_webview(webview.id())
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.close_webview(webview.id());
+        }
     }
 
     fn notify_input_event_handled(
@@ -785,7 +826,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        self.window_for_webview_id(webview.id()).set_needs_update();
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_update();
+        }
 
         if status == LoadStatus::Complete {
             if let Some(sender) = self
@@ -820,7 +863,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_new_frame_ready(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id()).set_needs_repaint();
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_repaint();
+        }
     }
 
     fn show_embedder_control(&self, webview: WebView, embedder_control: EmbedderControl) {
@@ -860,8 +905,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {
-        self.window_for_webview_id(webview.id())
-            .notify_favicon_changed(webview);
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.notify_favicon_changed(webview.clone());
+        }
     }
 
     fn notify_media_session_event(&self, webview: WebView, event: MediaSessionEvent) {

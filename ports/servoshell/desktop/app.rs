@@ -145,7 +145,13 @@ impl App {
             #[cfg(feature = "gamepad")]
             ServoshellGamepadDelegate::maybe_new().map(Rc::new),
         ));
-        running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        let primary_window =
+            running_state.open_window(platform_window, self.initial_url.as_url().clone());
+        let shared_wall_webview = self
+            .servoshell_preferences
+            .wall_all_tiles
+            .then(|| primary_window.active_webview())
+            .flatten();
         for tile_index in initial_tile_indices.into_iter().skip(1) {
             info!("Opening wall tile window {tile_index}.");
             let tile_preferences = self.preferences_for_wall_tile(tile_index);
@@ -154,7 +160,12 @@ impl App {
                 self.initial_url.as_url().clone(),
                 active_event_loop,
             );
-            running_state.open_window(platform_window, self.initial_url.as_url().clone());
+            if let Some(shared_wall_webview) = &shared_wall_webview {
+                running_state
+                    .open_window_with_shared_webview(platform_window, shared_wall_webview.clone());
+            } else {
+                running_state.open_window(platform_window, self.initial_url.as_url().clone());
+            }
         }
 
         self.state = AppState::Running(running_state);
@@ -202,9 +213,9 @@ impl App {
     fn preferences_for_wall_tile(&self, tile_index: usize) -> ServoShellPreferences {
         let mut preferences = self.servoshell_preferences.clone();
         preferences.wall_tile_index = tile_index;
-        if preferences.wall_all_tiles &&
-            let Some(layout) = &preferences.wall_layout &&
-            let Some(tile) = layout.tiles.get(tile_index)
+        if preferences.wall_all_tiles
+            && let Some(layout) = &preferences.wall_layout
+            && let Some(tile) = layout.tiles.get(tile_index)
         {
             preferences.initial_window_size = tile.rect.size.to_u32();
         }
@@ -231,10 +242,7 @@ impl App {
         url: Url,
         active_event_loop: Option<&ActiveEventLoop>,
     ) -> Rc<dyn PlatformWindow> {
-        assert_eq!(
-            servoshell_preferences.headless,
-            active_event_loop.is_none()
-        );
+        assert_eq!(servoshell_preferences.headless, active_event_loop.is_none());
 
         let Some(active_event_loop) = active_event_loop else {
             return HeadlessWindow::new(servoshell_preferences);
@@ -288,8 +296,8 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         };
 
-        if let Some(window) = state.window(ServoShellWindowId::from(u64::from(window_id))) &&
-            let Some(headed_window) = window.platform_window().as_headed_window()
+        if let Some(window) = state.window(ServoShellWindowId::from(u64::from(window_id)))
+            && let Some(headed_window) = window.platform_window().as_headed_window()
         {
             headed_window.handle_winit_window_event(state.clone(), window, window_event);
         }
@@ -308,8 +316,8 @@ impl ApplicationHandler<AppEvent> for App {
 
         if let Some(window) = app_event
             .window_id()
-            .and_then(|window_id| state.window(ServoShellWindowId::from(u64::from(window_id)))) &&
-            let Some(headed_window) = window.platform_window().as_headed_window()
+            .and_then(|window_id| state.window(ServoShellWindowId::from(u64::from(window_id))))
+            && let Some(headed_window) = window.platform_window().as_headed_window()
         {
             headed_window.handle_winit_app_event(state.clone(), app_event);
         }

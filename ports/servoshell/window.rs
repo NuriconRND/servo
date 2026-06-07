@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 
@@ -11,8 +12,9 @@ use log::warn;
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel, Cursor,
     DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntSize, DevicePixel,
-    EmbedderControl, EmbedderControlId, InputEventId, InputEventResult, MediaSessionEvent,
-    PermissionRequest, RenderingContext, ScreenGeometry, WebView, WebViewBuilder, WebViewId,
+    DeviceVector2D, EmbedderControl, EmbedderControlId, InputEventId, InputEventResult,
+    MediaSessionEvent, PermissionRequest, RenderingContext, ScreenGeometry, ViewportDetails,
+    WebView, WebViewBuilder, WebViewId, WebViewPaintTarget,
 };
 use url::Url;
 
@@ -51,6 +53,8 @@ impl ServoShellWindowId {
 pub(crate) struct ServoShellWindow {
     /// The [`WebView`]s that have been added to this window.
     pub(crate) webview_collection: RefCell<WebViewCollection>,
+    /// Per-window paint targets for shared [`WebView`]s.
+    paint_target_overrides: RefCell<HashMap<WebViewId, WebViewPaintTarget>>,
     /// A handle to the [`PlatformWindow`] that servoshell is rendering in.
     platform_window: Rc<dyn PlatformWindow>,
     /// Whether or not this window should be closed at the end of the spin of the next event loop.
@@ -71,6 +75,7 @@ impl ServoShellWindow {
     pub(crate) fn new(platform_window: Rc<dyn PlatformWindow>) -> Self {
         Self {
             webview_collection: Default::default(),
+            paint_target_overrides: Default::default(),
             platform_window,
             close_scheduled: Default::default(),
             needs_update: Default::default(),
@@ -108,19 +113,9 @@ impl ServoShellWindow {
 
         if let Some(wall_layout) = &state.servoshell_preferences.wall_layout {
             let virtual_viewport_size = wall_layout.virtual_viewport_css_size();
-            let hidpi_factor = self.platform_window.hidpi_scale_factor();
-            let viewport_origin = self
-                .platform_window
-                .webview_paint_origin()
-                .unwrap_or_else(|| {
-                    wall_layout.tile_origin_device_vector(
-                        state.servoshell_preferences.wall_tile_index,
-                        hidpi_factor,
-                    )
-                });
             webview_builder = webview_builder
                 .viewport_size_override(virtual_viewport_size)
-                .viewport_origin_override(viewport_origin);
+                .viewport_origin_override(self.toplevel_viewport_origin(&state));
         }
 
         #[cfg(all(
@@ -143,6 +138,54 @@ impl ServoShellWindow {
         webview
     }
 
+    pub(crate) fn add_shared_toplevel_webview(&self, state: Rc<RunningAppState>, webview: WebView) {
+        let paint_target = webview.add_paint_target(
+            self.platform_window.rendering_context(),
+            self.toplevel_viewport_details(&state),
+            self.toplevel_viewport_origin(&state),
+        );
+
+        webview.notify_theme_change(self.platform_window.theme());
+        self.add_webview_with_paint_target(webview.clone(), paint_target);
+        self.activate_webview(webview.id());
+        if state.accessibility_active() {
+            webview.set_accessibility_active(true);
+        }
+    }
+
+    fn toplevel_viewport_details(&self, state: &RunningAppState) -> ViewportDetails {
+        let hidpi_scale_factor = self.platform_window.hidpi_scale_factor();
+        let size = state
+            .servoshell_preferences
+            .wall_layout
+            .as_ref()
+            .map(|layout| layout.virtual_viewport_css_size())
+            .unwrap_or_else(|| {
+                (self.platform_window.rendering_context().size2d().to_f32() / hidpi_scale_factor)
+                    .cast_unit()
+            });
+
+        ViewportDetails {
+            size,
+            hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
+        }
+    }
+
+    fn toplevel_viewport_origin(&self, state: &RunningAppState) -> DeviceVector2D {
+        let Some(wall_layout) = &state.servoshell_preferences.wall_layout else {
+            return DeviceVector2D::zero();
+        };
+
+        self.platform_window
+            .webview_paint_origin()
+            .unwrap_or_else(|| {
+                wall_layout.tile_origin_device_vector(
+                    state.servoshell_preferences.wall_tile_index,
+                    self.platform_window.hidpi_scale_factor(),
+                )
+            })
+    }
+
     /// Repaint the focused [`WebView`].
     pub(crate) fn repaint_webviews(&self) {
         let Some(webview) = self.active_webview() else {
@@ -153,7 +196,16 @@ impl ServoShellWindow {
             .rendering_context()
             .make_current()
             .expect("Could not make PlatformWindow RenderingContext current");
-        webview.paint();
+        if let Some(paint_target) = self
+            .paint_target_overrides
+            .borrow()
+            .get(&webview.id())
+            .copied()
+        {
+            webview.paint_target(paint_target);
+        } else {
+            webview.paint();
+        }
         self.platform_window().rendering_context().present();
     }
 
@@ -197,6 +249,25 @@ impl ServoShellWindow {
         self.set_needs_repaint();
     }
 
+    pub(crate) fn add_webview_with_paint_target(
+        &self,
+        webview: WebView,
+        paint_target: WebViewPaintTarget,
+    ) {
+        self.paint_target_overrides
+            .borrow_mut()
+            .insert(webview.id(), paint_target);
+        self.add_webview(webview);
+    }
+
+    pub(crate) fn active_webview_has_paint_target_override(&self) -> bool {
+        self.active_webview().is_some_and(|webview| {
+            self.paint_target_overrides
+                .borrow()
+                .contains_key(&webview.id())
+        })
+    }
+
     pub(crate) fn webview_ids(&self) -> Vec<WebViewId> {
         self.webview_collection.borrow().creation_order.clone()
     }
@@ -234,8 +305,9 @@ impl ServoShellWindow {
     }
 
     pub(crate) fn update_and_request_repaint_if_necessary(&self, state: &RunningAppState) {
-        let updated_user_interface = self.needs_update.take() &&
-            self.platform_window
+        let updated_user_interface = self.needs_update.take()
+            && self
+                .platform_window
                 .update_user_interface_state(state, self);
 
         // Delegate handlers may have asked us to present or update painted WebView contents.
@@ -255,6 +327,7 @@ impl ServoShellWindow {
         if webview_collection.remove(webview_id).is_none() {
             return;
         }
+        self.paint_target_overrides.borrow_mut().remove(&webview_id);
         self.platform_window
             .dismiss_embedder_controls_for_webview(webview_id);
 
@@ -271,6 +344,13 @@ impl ServoShellWindow {
     pub(crate) fn hidpi_scale_factor_changed(&self) {
         let new_scale_factor = self.platform_window.hidpi_scale_factor();
         for webview in self.webview_collection.borrow().values() {
+            if self
+                .paint_target_overrides
+                .borrow()
+                .contains_key(&webview.id())
+            {
+                continue;
+            }
             webview.set_hidpi_scale_factor(new_scale_factor);
         }
     }

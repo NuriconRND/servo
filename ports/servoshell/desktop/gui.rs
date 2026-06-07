@@ -494,16 +494,16 @@ impl Gui {
                                         if cfg!(target_os = "macos") {
                                             i.clone().consume_key(Modifiers::COMMAND, Key::L)
                                         } else {
-                                            i.clone().consume_key(Modifiers::COMMAND, Key::L) ||
-                                                i.clone().consume_key(Modifiers::ALT, Key::D)
+                                            i.clone().consume_key(Modifiers::COMMAND, Key::L)
+                                                || i.clone().consume_key(Modifiers::ALT, Key::D)
                                         }
                                     }) {
                                         // The focus request immediately makes gained_focus return true.
                                         location_field.request_focus();
                                     }
                                     // Select address bar text when it's focused (click or shortcut).
-                                    if location_field.gained_focus() &&
-                                        let Some(mut state) =
+                                    if location_field.gained_focus()
+                                        && let Some(mut state) =
                                             TextEditState::load(ui.ctx(), location_id)
                                     {
                                         // Select the whole input.
@@ -514,8 +514,8 @@ impl Gui {
                                         state.store(ui.ctx(), location_id);
                                     }
                                     // Navigate to address when enter is pressed in the address bar.
-                                    if location_field.lost_focus() &&
-                                        ui.input(|i| i.clone().key_pressed(Key::Enter))
+                                    if location_field.lost_focus()
+                                        && ui.input(|i| i.clone().key_pressed(Key::Enter))
                                     {
                                         window.queue_user_interface_command(
                                             UserInterfaceCommand::Go(location.clone()),
@@ -591,8 +591,9 @@ impl Gui {
             }
             let visible_size = Size2D::new(available_rect.width(), available_rect.height()) * scale;
             let rendering_size = headed_window.webview_rendering_size(visible_size);
-            if let Some(webview) = window.active_webview() &&
-                rendering_size != webview.size()
+            if let Some(webview) = window.active_webview()
+                && !window.active_webview_has_paint_target_override()
+                && rendering_size != webview.size()
             {
                 // Wall-layout mode can render an overlap-expanded offscreen surface and blit
                 // only the visible tile region back into the platform window. See:
@@ -616,9 +617,8 @@ impl Gui {
             window.repaint_webviews();
 
             let source_rect = headed_window.webview_visible_source_rect(visible_size.to_i32());
-            if let Some(render_to_parent) =
-                rendering_context
-                    .render_to_parent_callback_for_source_rect(source_rect.to_untyped())
+            if let Some(render_to_parent) = rendering_context
+                .render_to_parent_callback_for_source_rect(source_rect.to_untyped())
             {
                 ctx.layer_painter(LayerId::background()).add(PaintCallback {
                     rect: available_rect,
@@ -725,10 +725,10 @@ impl Gui {
         //       because logical OR would short-circuit if any of the functions return true.
         //       We want to ensure that all functions are called. The "bitwise OR" operator
         //       does not short-circuit.
-        self.update_load_status(window) |
-            self.update_location_in_toolbar(window) |
-            self.update_status_text(window) |
-            self.update_can_go_back_and_forward(window)
+        self.update_load_status(window)
+            | self.update_location_in_toolbar(window)
+            | self.update_status_text(window)
+            | self.update_can_go_back_and_forward(window)
     }
 
     /// Returns true if a redraw is required after handling the provided event.
