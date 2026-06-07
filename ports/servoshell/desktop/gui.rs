@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
@@ -591,17 +592,18 @@ impl Gui {
             }
             let visible_size = Size2D::new(available_rect.width(), available_rect.height()) * scale;
             let rendering_size = headed_window.webview_rendering_size(visible_size);
-            if let Some(webview) = window.active_webview()
-                && !window.active_webview_has_paint_target_override()
-                && rendering_size != webview.size()
-            {
-                // Wall-layout mode can render an overlap-expanded offscreen surface and blit
-                // only the visible tile region back into the platform window. See:
-                // <https://github.com/servo/servo/issues/38369#issuecomment-3138378527>
-                webview.resize(PhysicalSize::new(
-                    rendering_size.width as u32,
-                    rendering_size.height as u32,
-                ))
+            if let Some(webview) = window.active_webview() {
+                if window.active_webview_has_paint_target_override() {
+                    window.sync_active_paint_target_lifecycle(state, rendering_size);
+                } else if rendering_size != webview.size() {
+                    // Wall-layout mode can render an overlap-expanded offscreen surface and blit
+                    // only the visible tile region back into the platform window. See:
+                    // <https://github.com/servo/servo/issues/38369#issuecomment-3138378527>
+                    webview.resize(PhysicalSize::new(
+                        rendering_size.width as u32,
+                        rendering_size.height as u32,
+                    ))
+                }
             }
 
             if let Some(status_text) = &self.status_text {
@@ -652,7 +654,7 @@ impl Gui {
     }
 
     /// Paint the GUI, as of the last update.
-    pub(crate) fn paint(&mut self, window: &Window) {
+    pub(crate) fn paint(&mut self, window: &Window) -> Duration {
         self.rendering_context
             .make_current()
             .expect("Could not make RenderingContext current");
@@ -660,7 +662,9 @@ impl Gui {
             .parent_context()
             .prepare_for_rendering();
         self.context.paint(window);
+        let present_start = Instant::now();
         self.rendering_context.parent_context().present();
+        present_start.elapsed()
     }
 
     /// Updates the location field from the given [`RunningAppState`], unless the user has started

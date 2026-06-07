@@ -730,6 +730,28 @@ impl WebView {
             .render_paint_target(self.id(), target.painter_id);
     }
 
+    /// Update the rendering context and viewport metadata for one registered paint target.
+    pub fn update_paint_target(
+        &self,
+        target: WebViewPaintTarget,
+        new_size: PhysicalSize<u32>,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) {
+        let new_size = PhysicalSize {
+            width: new_size.width.max(MINIMUM_WEBVIEW_SIZE.width as u32),
+            height: new_size.height.max(MINIMUM_WEBVIEW_SIZE.height as u32),
+        };
+
+        self.inner().servo.paint().update_webview_paint_target(
+            self.id(),
+            target.painter_id,
+            new_size,
+            viewport_details,
+            viewport_origin,
+        );
+    }
+
     /// Get the [`UserContentManager`] associated with this [`WebView`].
     pub fn user_content_manager(&self) -> Option<Rc<UserContentManager>> {
         self.inner().user_content_manager.clone()

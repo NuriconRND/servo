@@ -6,9 +6,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 
-use euclid::{Scale, Vector2D};
-use log::warn;
+use dpi::PhysicalSize;
+use euclid::{Scale, Size2D, Vector2D};
+use log::{debug, info, warn};
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel, Cursor,
     DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntSize, DevicePixel,
@@ -192,21 +194,62 @@ impl ServoShellWindow {
             return;
         };
 
-        self.platform_window()
-            .rendering_context()
+        let rendering_context = self.platform_window().rendering_context();
+        let requested_gpu_index = rendering_context.requested_gpu_index();
+        let context_size = rendering_context.size();
+        rendering_context
             .make_current()
             .expect("Could not make PlatformWindow RenderingContext current");
-        if let Some(paint_target) = self
+
+        let paint_target = self
             .paint_target_overrides
             .borrow()
             .get(&webview.id())
-            .copied()
-        {
+            .copied();
+        let render_start = Instant::now();
+        if let Some(paint_target) = paint_target {
             webview.paint_target(paint_target);
         } else {
             webview.paint();
         }
-        self.platform_window().rendering_context().present();
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+
+        let present_start = Instant::now();
+        rendering_context.present();
+        let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
+
+        if requested_gpu_index.is_some() {
+            info!(
+                "Wall repaint target: window {:?} webview {:?} target={} requested_gpu={:?} \
+                 render_ms={:.3} target_present_ms={:.3} context_size={:?}",
+                self.id(),
+                webview.id(),
+                if paint_target.is_some() {
+                    "secondary"
+                } else {
+                    "primary"
+                },
+                requested_gpu_index,
+                render_ms,
+                present_ms,
+                context_size,
+            );
+        } else {
+            debug!(
+                "Repaint target: window {:?} webview {:?} target={} render_ms={:.3} \
+                 target_present_ms={:.3} context_size={:?}",
+                self.id(),
+                webview.id(),
+                if paint_target.is_some() {
+                    "secondary"
+                } else {
+                    "primary"
+                },
+                render_ms,
+                present_ms,
+                context_size,
+            );
+        }
     }
 
     /// Whether or not this [`ServoShellWindow`] has any [`WebView`]s.
@@ -268,6 +311,32 @@ impl ServoShellWindow {
         })
     }
 
+    pub(crate) fn sync_active_paint_target_lifecycle(
+        &self,
+        state: &RunningAppState,
+        rendering_size: Size2D<f32, DevicePixel>,
+    ) {
+        let Some(webview) = self.active_webview() else {
+            return;
+        };
+        let Some(paint_target) = self
+            .paint_target_overrides
+            .borrow()
+            .get(&webview.id())
+            .copied()
+        else {
+            return;
+        };
+
+        let rendering_size = rendering_size.to_u32();
+        webview.update_paint_target(
+            paint_target,
+            PhysicalSize::new(rendering_size.width, rendering_size.height),
+            self.toplevel_viewport_details(state),
+            self.toplevel_viewport_origin(state),
+        );
+    }
+
     pub(crate) fn webview_ids(&self) -> Vec<WebViewId> {
         self.webview_collection.borrow().creation_order.clone()
     }
@@ -304,7 +373,7 @@ impl ServoShellWindow {
             .position(|webview| webview.0 == active_id)
     }
 
-    pub(crate) fn update_and_request_repaint_if_necessary(&self, state: &RunningAppState) {
+    pub(crate) fn update_and_take_repaint_request(&self, state: &RunningAppState) -> bool {
         let updated_user_interface = self.needs_update.take()
             && self
                 .platform_window
@@ -313,9 +382,11 @@ impl ServoShellWindow {
         // Delegate handlers may have asked us to present or update painted WebView contents.
         // Currently, egui-file-dialog dialogs need to be constantly redrawn or animations aren't fluid.
         let needs_repaint = self.needs_repaint.take();
-        if updated_user_interface || needs_repaint {
-            self.platform_window.request_repaint(self);
-        }
+        updated_user_interface || needs_repaint
+    }
+
+    pub(crate) fn request_repaint(&self) {
+        self.platform_window.request_repaint(self);
     }
 
     /// Close the given [`WebView`] via its [`WebViewId`].

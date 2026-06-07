@@ -16,7 +16,7 @@ use euclid::{Point2D, Size2D};
 use gleam::gl::{self, Gl};
 use glow::{HasContext, NativeFramebuffer};
 use image::RgbaImage;
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use raw_window_handle::{DisplayHandle, WindowHandle};
 pub use surfman::Error;
 use surfman::chains::{PreserveBuffer, SwapChain};
@@ -25,6 +25,14 @@ use surfman::{
     GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
     SurfaceType,
 };
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+use winapi::Interface;
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIFactory1};
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+use winapi::shared::winerror;
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+use wio::com::ComPtr;
 use webrender_api::units::{DeviceIntRect, DevicePixel};
 
 /// The `RenderingContext` trait defines a set of methods for managing
@@ -84,6 +92,85 @@ pub trait RenderingContext {
     /// then the default timer-based [`RefreshDriver`] will be used.
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         None
+    }
+    /// The wall-layout GPU index requested by the embedder for this context, if any.
+    ///
+    /// This is currently diagnostic plumbing for ServoShell tiled-present work. Backends that can
+    /// bind a context to a specific adapter should use this value when creating the adapter/device.
+    fn requested_gpu_index(&self) -> Option<usize> {
+        None
+    }
+}
+
+pub fn create_adapter_for_requested_gpu(
+    connection: &Connection,
+    requested_gpu_index: Option<usize>,
+) -> Result<Adapter, Error> {
+    #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+    if let Some(gpu_index) = requested_gpu_index {
+        match create_dxgi_adapter_by_index(gpu_index) {
+            Ok(adapter) => {
+                info!("Selected DXGI adapter index {gpu_index} for requested target GPU");
+                return Ok(adapter);
+            },
+            Err(error) => {
+                warn!(
+                    "Could not select requested DXGI adapter index {gpu_index}: {error:?}; \
+                     falling back to surfman default adapter"
+                );
+            },
+        }
+    }
+
+    #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+    if let Some(gpu_index) = requested_gpu_index {
+        info!(
+            "Requested target GPU index {gpu_index}; current surfman backend exposes only the \
+             default adapter selection path"
+        );
+    }
+
+    connection.create_adapter()
+}
+
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+#[expect(unsafe_code)]
+fn create_dxgi_adapter_by_index(gpu_index: usize) -> Result<Adapter, Error> {
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    let gpu_index = u32::try_from(gpu_index).map_err(|_| Error::NoAdapterFound)?;
+    unsafe {
+        let mut dxgi_factory: *mut IDXGIFactory1 = ptr::null_mut();
+        let result = dxgi::CreateDXGIFactory1(
+            &IDXGIFactory1::uuidof(),
+            &mut dxgi_factory as *mut *mut IDXGIFactory1 as *mut *mut c_void,
+        );
+        if !winerror::SUCCEEDED(result) {
+            return Err(Error::Failed);
+        }
+        assert!(!dxgi_factory.is_null());
+        let dxgi_factory = ComPtr::from_raw(dxgi_factory);
+
+        let mut dxgi_adapter_1 = ptr::null_mut();
+        let result = (*dxgi_factory).EnumAdapters1(gpu_index, &mut dxgi_adapter_1);
+        if !winerror::SUCCEEDED(result) {
+            return Err(Error::NoAdapterFound);
+        }
+        assert!(!dxgi_adapter_1.is_null());
+        let dxgi_adapter_1 = ComPtr::from_raw(dxgi_adapter_1);
+
+        let mut dxgi_adapter: *mut IDXGIAdapter = ptr::null_mut();
+        let result = (*dxgi_adapter_1).QueryInterface(
+            &IDXGIAdapter::uuidof(),
+            &mut dxgi_adapter as *mut *mut IDXGIAdapter as *mut *mut c_void,
+        );
+        if !winerror::SUCCEEDED(result) {
+            return Err(Error::Failed);
+        }
+        assert!(!dxgi_adapter.is_null());
+
+        Ok(Adapter::from_dxgi_adapter(ComPtr::from_raw(dxgi_adapter)))
     }
 }
 
@@ -428,6 +515,7 @@ pub struct WindowRenderingContext {
     /// The inner size of the window in physical pixels which excludes OS decorations.
     size: Cell<PhysicalSize<u32>>,
     surfman_context: SurfmanRenderingContext,
+    requested_gpu_index: Option<usize>,
 }
 
 impl WindowRenderingContext {
@@ -437,6 +525,21 @@ impl WindowRenderingContext {
         size: PhysicalSize<u32>,
     ) -> Result<Self, Error> {
         Self::new_with_optional_refresh_driver(display_handle, window_handle, size, None)
+    }
+
+    pub fn new_with_target_gpu(
+        display_handle: DisplayHandle,
+        window_handle: WindowHandle,
+        size: PhysicalSize<u32>,
+        requested_gpu_index: Option<usize>,
+    ) -> Result<Self, Error> {
+        Self::new_with_optional_refresh_driver_and_target_gpu(
+            display_handle,
+            window_handle,
+            size,
+            None,
+            requested_gpu_index,
+        )
     }
 
     pub fn new_with_refresh_driver(
@@ -459,6 +562,22 @@ impl WindowRenderingContext {
         size: PhysicalSize<u32>,
         refresh_driver: Option<Rc<dyn RefreshDriver>>,
     ) -> Result<Self, Error> {
+        Self::new_with_optional_refresh_driver_and_target_gpu(
+            display_handle,
+            window_handle,
+            size,
+            refresh_driver,
+            None,
+        )
+    }
+
+    fn new_with_optional_refresh_driver_and_target_gpu(
+        display_handle: DisplayHandle,
+        window_handle: WindowHandle,
+        size: PhysicalSize<u32>,
+        refresh_driver: Option<Rc<dyn RefreshDriver>>,
+        requested_gpu_index: Option<usize>,
+    ) -> Result<Self, Error> {
         if size.width == 0 || size.height == 0 {
             log::error!(
                 "Unable to create WindowRenderingContext with size under 1x1 ({size:?} provided)"
@@ -467,7 +586,7 @@ impl WindowRenderingContext {
         }
 
         let connection = Connection::from_display_handle(display_handle)?;
-        let adapter = connection.create_adapter()?;
+        let adapter = create_adapter_for_requested_gpu(&connection, requested_gpu_index)?;
         let surfman_context = SurfmanRenderingContext::new(&connection, &adapter, refresh_driver)?;
 
         let native_widget = connection
@@ -484,6 +603,7 @@ impl WindowRenderingContext {
         Ok(Self {
             size: Cell::new(size),
             surfman_context,
+            requested_gpu_index,
         })
     }
 
@@ -546,6 +666,10 @@ impl WindowRenderingContext {
             self.surfman_context.context.borrow_mut(),
         )
     }
+
+    pub fn requested_gpu_index(&self) -> Option<usize> {
+        self.requested_gpu_index
+    }
 }
 
 impl RenderingContext for WindowRenderingContext {
@@ -604,6 +728,10 @@ impl RenderingContext for WindowRenderingContext {
 
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         self.surfman_context.refresh_driver()
+    }
+
+    fn requested_gpu_index(&self) -> Option<usize> {
+        self.requested_gpu_index
     }
 }
 
@@ -930,6 +1058,10 @@ impl RenderingContext for OffscreenRenderingContext {
 
     fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
         self.parent_context().refresh_driver()
+    }
+
+    fn requested_gpu_index(&self) -> Option<usize> {
+        self.parent_context().requested_gpu_index()
     }
 }
 

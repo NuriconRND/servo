@@ -448,8 +448,16 @@ impl RunningAppState {
 
         self.servo.spin_event_loop();
 
-        for window in self.windows.borrow().values() {
-            window.update_and_request_repaint_if_necessary(self);
+        let windows_to_update: Vec<_> = self.windows.borrow().values().cloned().collect();
+        let mut windows_to_repaint = Vec::new();
+        for window in windows_to_update {
+            if window.update_and_take_repaint_request(self) {
+                windows_to_repaint.push(window);
+            }
+        }
+        self.extend_wall_tile_repaint_requests(&mut windows_to_repaint);
+        for window in windows_to_repaint {
+            window.request_repaint();
         }
 
         if self.servoshell_preferences.exit_after_stable_image && self.achieved_stable_image.get() {
@@ -487,13 +495,41 @@ impl RunningAppState {
         None
     }
 
-    fn windows_for_webview_id(&self, webview_id: WebViewId) -> Vec<Rc<ServoShellWindow>> {
+    pub(crate) fn windows_for_webview_id(
+        &self,
+        webview_id: WebViewId,
+    ) -> Vec<Rc<ServoShellWindow>> {
         self.windows
             .borrow()
             .values()
             .filter(|window| window.contains_webview(webview_id))
             .cloned()
             .collect()
+    }
+
+    fn extend_wall_tile_repaint_requests(
+        &self,
+        windows_to_repaint: &mut Vec<Rc<ServoShellWindow>>,
+    ) {
+        if !self.servoshell_preferences.wall_all_tiles {
+            return;
+        }
+
+        let original_repaint_requests = windows_to_repaint.clone();
+        for window in original_repaint_requests {
+            let Some(webview) = window.active_webview() else {
+                continue;
+            };
+            for tile_window in self.windows_for_webview_id(webview.id()) {
+                if windows_to_repaint
+                    .iter()
+                    .any(|window| window.id() == tile_window.id())
+                {
+                    continue;
+                }
+                windows_to_repaint.push(tile_window);
+            }
+        }
     }
 
     pub(crate) fn window_for_webview_id(&self, webview_id: WebViewId) -> Rc<ServoShellWindow> {

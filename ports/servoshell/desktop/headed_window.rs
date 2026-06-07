@@ -150,9 +150,9 @@ impl HeadedWindow {
             winit_window.set_window_icon(Some(load_icon(icon_bytes)));
         }
 
-        if servoshell_preferences.wall_all_tiles &&
-            let Some(layout) = &servoshell_preferences.wall_layout &&
-            let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
+        if servoshell_preferences.wall_all_tiles
+            && let Some(layout) = &servoshell_preferences.wall_layout
+            && let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
             if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
                 info!(
@@ -197,9 +197,19 @@ impl HeadedWindow {
         let window_handle = winit_window
             .window_handle()
             .expect("could not get window handle from window");
+        let requested_gpu_index = servoshell_preferences
+            .wall_layout
+            .as_ref()
+            .and_then(|layout| layout.tiles.get(servoshell_preferences.wall_tile_index))
+            .map(|tile| tile.gpu);
         let window_rendering_context = Rc::new(
-            WindowRenderingContext::new(display_handle, window_handle, inner_size)
-                .expect("Could not create RenderingContext for Window"),
+            WindowRenderingContext::new_with_target_gpu(
+                display_handle,
+                window_handle,
+                inner_size,
+                requested_gpu_index,
+            )
+            .expect("Could not create RenderingContext for Window"),
         );
 
         // Setup for GL accelerated media handling. This is only active on certain Linux platforms
@@ -222,10 +232,8 @@ impl HeadedWindow {
                 .unwrap_or_else(|| Scale::new(winit_window.scale_factor() as f32));
             let visible_rect =
                 layout.tile_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
-            let render_rect = layout.tile_render_device_rect(
-                servoshell_preferences.wall_tile_index,
-                hidpi_factor,
-            );
+            let render_rect = layout
+                .tile_render_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
             info!(
                 "Wall tile {} monitor/gpu {}/{} visible rect {:?}, render rect {:?}",
                 servoshell_preferences.wall_tile_index,
@@ -651,6 +659,73 @@ impl HeadedWindow {
         Rect::new(Point2D::new(left.max(0), top.max(0)), visible_size)
     }
 
+    fn log_wall_present_timing(&self, present_duration: Duration) {
+        let Some(layout) = &self.wall_layout else {
+            debug!(
+                "Window present: window {:?} present_ms={:.3} requested_gpu={:?} size={:?}",
+                self.winit_window.id(),
+                present_duration.as_secs_f64() * 1000.0,
+                self.window_rendering_context.requested_gpu_index(),
+                self.window_rendering_context.size(),
+            );
+            return;
+        };
+
+        let Some(tile) = layout.tiles.get(self.wall_tile_index) else {
+            warn!(
+                "Wall present diagnostic skipped for missing tile {}.",
+                self.wall_tile_index
+            );
+            return;
+        };
+
+        info!(
+            "Wall window present: window {:?} tile={} monitor={} gpu={} requested_gpu={:?} \
+             present_ms={:.3} window_size={:?}",
+            self.winit_window.id(),
+            self.wall_tile_index,
+            tile.monitor,
+            tile.gpu,
+            self.window_rendering_context.requested_gpu_index(),
+            present_duration.as_secs_f64() * 1000.0,
+            self.window_rendering_context.size(),
+        );
+    }
+
+    fn paint_for_redraw(&self, state: &RunningAppState, window: &ServoShellWindow) {
+        let mut gui = self.gui.borrow_mut();
+        gui.update(state, window, self);
+        let present_duration = gui.paint(&self.winit_window);
+        self.log_wall_present_timing(present_duration);
+    }
+
+    fn paint_wall_tile_group_for_redraw(&self, state: &RunningAppState, window: &ServoShellWindow) {
+        if !state.servoshell_preferences.wall_all_tiles || self.wall_layout.is_none() {
+            self.paint_for_redraw(state, window);
+            return;
+        }
+
+        let Some(webview) = window.active_webview() else {
+            self.paint_for_redraw(state, window);
+            return;
+        };
+
+        let mut painted_current_window = false;
+        for tile_window in state.windows_for_webview_id(webview.id()) {
+            let platform_window = tile_window.platform_window();
+            let Some(headed_window) = platform_window.as_headed_window() else {
+                continue;
+            };
+
+            headed_window.paint_for_redraw(state, &tile_window);
+            painted_current_window |= tile_window.id() == window.id();
+        }
+
+        if !painted_current_window {
+            self.paint_for_redraw(state, window);
+        }
+    }
+
     pub(crate) fn handle_winit_window_event(
         &self,
         state: Rc<RunningAppState>,
@@ -658,11 +733,18 @@ impl HeadedWindow {
         event: WindowEvent,
     ) {
         if event == WindowEvent::RedrawRequested {
+            if self.wall_layout.is_some() {
+                debug!(
+                    "Wall redraw event: window {:?} tile={} visible={:?}",
+                    self.winit_window.id(),
+                    self.wall_tile_index,
+                    self.winit_window.is_visible(),
+                );
+            }
+
             // WARNING: do not defer painting or presenting to some later tick of the event
             // loop or servoshell may become unresponsive! (servo#30312)
-            let mut gui = self.gui.borrow_mut();
-            gui.update(&state, &window, self);
-            gui.paint(&self.winit_window);
+            self.paint_wall_tile_group_for_redraw(&state, &window);
         }
 
         if let WindowEvent::CursorMoved { position, .. } = event {
@@ -756,8 +838,8 @@ impl HeadedWindow {
                 // forwarded to Gui (above). This is because egui needs to know when
                 // the mouse is moving in other parts of the view in order to properly
                 // hide tooltips.
-                if let WindowEvent::CursorMoved { .. } = event &&
-                    !should_forward_mouse_event_to_egui()
+                if let WindowEvent::CursorMoved { .. } = event
+                    && !should_forward_mouse_event_to_egui()
                 {
                     consumed = false;
                 } else {
@@ -770,8 +852,8 @@ impl HeadedWindow {
 
         if !consumed {
             // Make sure to handle early resize events even when there are no webviews yet
-            if let WindowEvent::Resized(new_inner_size) = event &&
-                self.inner_size.get() != new_inner_size
+            if let WindowEvent::Resized(new_inner_size) = event
+                && self.inner_size.get() != new_inner_size
             {
                 self.inner_size.set(new_inner_size);
                 // This should always be set to inner size
@@ -1016,6 +1098,14 @@ impl PlatformWindow for HeadedWindow {
     }
 
     fn request_repaint(&self, _: &ServoShellWindow) {
+        if self.wall_layout.is_some() {
+            debug!(
+                "Wall redraw requested: window {:?} tile={} visible={:?}",
+                self.winit_window.id(),
+                self.wall_tile_index,
+                self.winit_window.is_visible(),
+            );
+        }
         self.winit_window.request_redraw();
     }
 
@@ -1034,8 +1124,8 @@ impl PlatformWindow for HeadedWindow {
         let new_outer_size =
             new_outer_size.clamp(MIN_WINDOW_INNER_SIZE + decoration_size, screen_size * 2);
 
-        if outer_size.width == new_outer_size.width as u32 &&
-            outer_size.height == new_outer_size.height as u32
+        if outer_size.width == new_outer_size.width as u32
+            && outer_size.height == new_outer_size.height as u32
         {
             return Some(new_outer_size);
         }

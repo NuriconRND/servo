@@ -8601,6 +8601,8 @@ dependencies = [
  "surfman",
  "tracing",
  "webrender_api",
+ "winapi",
+ "wio",
 ]
 
 [[package]]

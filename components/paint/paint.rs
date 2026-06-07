@@ -19,9 +19,9 @@ use embedder_traits::{
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use ipc_channel::ipc::{self};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use paint_api::display_list::PaintDisplayListInfo;
-use paint_api::rendering_context::RenderingContext;
+use paint_api::rendering_context::{RenderingContext, create_adapter_for_requested_gpu};
 use paint_api::{
     PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
     SerializableDisplayListPayload, WebRenderExternalImageIdManager, WebViewTrait,
@@ -92,6 +92,9 @@ pub struct Paint {
     /// [`WebViewId`]. Wall rendering will extend this table so one logical `WebView` can be
     /// rendered into multiple tile `RenderingContext`s.
     webview_painter_targets: RefCell<HashMap<WebViewId, Vec<PainterId>>>,
+
+    /// Logical frame id used to correlate one scene frame across multiple paint targets.
+    next_logical_frame_id: Cell<u64>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -223,6 +226,7 @@ impl Paint {
             #[cfg(feature = "webgpu")]
             webgpu_image_map: Default::default(),
             webview_painter_targets: Default::default(),
+            next_logical_frame_id: Default::default(),
         }))
     }
 
@@ -242,12 +246,18 @@ impl Paint {
         }
 
         let painter = Painter::new(rendering_context.clone(), self);
+        if let Some(gpu_index) = rendering_context.requested_gpu_index() {
+            debug!(
+                "Registering painter {:?} with requested target GPU index {gpu_index}",
+                painter.painter_id,
+            );
+        }
         let connection = rendering_context
             .connection()
             .expect("Failed to get connection");
-        let adapter = connection
-            .create_adapter()
-            .expect("Failed to create adapter");
+        let adapter =
+            create_adapter_for_requested_gpu(&connection, rendering_context.requested_gpu_index())
+                .expect("Failed to create adapter");
 
         let painter_surfman_details = PainterSurfmanDetails {
             connection,
@@ -322,6 +332,11 @@ impl Paint {
             .unwrap_or_else(|| vec![webview_id.into()])
     }
 
+    fn webview_has_painter_target(&self, webview_id: WebViewId, painter_id: PainterId) -> bool {
+        self.painter_targets_for_webview(webview_id)
+            .contains(&painter_id)
+    }
+
     fn target_painter_ids_for_source_painter(
         &self,
         source_painter_id: PainterId,
@@ -384,6 +399,12 @@ impl Paint {
 
     fn primary_painter_mut<'a>(&'a self, webview_id: WebViewId) -> RefMut<'a, Painter> {
         self.painter_mut(self.primary_painter_id_for_webview(webview_id))
+    }
+
+    fn next_logical_frame_id(&self) -> u64 {
+        let frame_id = self.next_logical_frame_id.get() + 1;
+        self.next_logical_frame_id.set(frame_id);
+        frame_id
     }
 
     pub fn painter_id(&self) -> PainterId {
@@ -560,9 +581,21 @@ impl Paint {
                         }
                     }
                 }
+                let logical_frame_id = self.next_logical_frame_id();
+                if target_painter_ids.len() > 1 {
+                    info!(
+                        "Wall logical frame {logical_frame_id} fan-out to paint targets \
+                         {target_painter_ids:?}"
+                    );
+                } else {
+                    debug!(
+                        "Logical frame {logical_frame_id} routed to paint targets \
+                         {target_painter_ids:?}"
+                    );
+                }
                 for painter_id in target_painter_ids {
                     if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                        painter.generate_frame_for_script();
+                        painter.generate_frame_for_script(logical_frame_id);
                     }
                 }
             },
@@ -885,6 +918,27 @@ impl Paint {
             .resize_rendering_context(new_size);
     }
 
+    pub fn update_webview_paint_target(
+        &self,
+        webview_id: WebViewId,
+        painter_id: PainterId,
+        new_size: PhysicalSize<u32>,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) {
+        if self.shutdown_state() != ShutdownState::NotShuttingDown {
+            return;
+        }
+        if !self.webview_has_painter_target(webview_id, painter_id) {
+            warn!("Ignoring update for unregistered paint target {painter_id:?} on {webview_id:?}");
+            return;
+        }
+
+        let mut painter = self.painter_mut(painter_id);
+        painter.resize_rendering_context(new_size);
+        painter.set_viewport_details_and_origin(webview_id, viewport_details, viewport_origin);
+    }
+
     pub fn set_page_zoom(&self, webview_id: WebViewId, new_zoom: f32) {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
@@ -934,7 +988,7 @@ impl Paint {
         messages.retain(|message| match message {
             PaintMessage::NewWebRenderFrameReady(painter_id, _document_id, need_repaint) => {
                 if let Some(painter) = self.maybe_painter(*painter_id) {
-                    painter.decrement_pending_frames();
+                    painter.note_webrender_frame_ready(*need_repaint);
                     *saw_webrender_frame_ready_for_painter
                         .entry(*painter_id)
                         .or_insert(*need_repaint) |= *need_repaint;

@@ -168,6 +168,11 @@ impl WebViewRenderer {
         self.viewport_origin
     }
 
+    pub(crate) fn set_viewport_origin(&mut self, viewport_origin: DeviceVector2D) -> bool {
+        let old_viewport_origin = std::mem::replace(&mut self.viewport_origin, viewport_origin);
+        old_viewport_origin != self.viewport_origin
+    }
+
     pub(crate) fn render_point_from_viewport_point(&self, point: DevicePoint) -> DevicePoint {
         point - self.viewport_origin
     }

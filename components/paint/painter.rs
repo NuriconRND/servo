@@ -2,10 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, LazyCell};
-use std::collections::hash_map::Entry;
+use std::cell::{Cell, LazyCell, RefCell};
+use std::collections::{VecDeque, hash_map::Entry};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -89,6 +90,27 @@ pub(crate) struct Painter {
     /// The number of frames pending to receive from WebRender.
     pub(crate) pending_frames: Cell<usize>,
 
+    /// Frame diagnostics waiting for the corresponding WebRender frame-ready notification.
+    pending_frame_diagnostics: RefCell<VecDeque<PendingFrameDiagnostic>>,
+
+    /// Local fallback frame counter used when a shared logical frame id is not provided.
+    next_diagnostic_frame_id: Cell<u64>,
+
+    /// The most recent local diagnostic frame id reported ready by WebRender.
+    last_ready_local_frame_id: Cell<Option<u64>>,
+
+    /// The most recent shared wall logical frame id reported ready by WebRender.
+    last_ready_wall_logical_frame_id: Cell<Option<u64>>,
+
+    /// Count of frames requested while this target still had older frames pending.
+    overlapping_frame_request_count: Cell<u64>,
+
+    /// Count of WebRender frame-ready notifications that arrived without a pending frame.
+    unexpected_frame_ready_count: Cell<u64>,
+
+    /// Count of render passes executed for this target.
+    render_count: Cell<u64>,
+
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
 
@@ -132,6 +154,13 @@ pub(crate) struct Painter {
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
     web_content_animator: WebContentAnimator,
+}
+
+struct PendingFrameDiagnostic {
+    local_frame_id: u64,
+    wall_logical_frame_id: Option<u64>,
+    requested_at: Instant,
+    reason: String,
 }
 
 impl Drop for Painter {
@@ -269,6 +298,13 @@ impl Painter {
             rendering_context,
             needs_repaint: Cell::default(),
             pending_frames: Default::default(),
+            pending_frame_diagnostics: Default::default(),
+            next_diagnostic_frame_id: Cell::new(0),
+            last_ready_local_frame_id: Default::default(),
+            last_ready_wall_logical_frame_id: Default::default(),
+            overlapping_frame_request_count: Default::default(),
+            unexpected_frame_ready_count: Default::default(),
+            render_count: Default::default(),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -401,6 +437,39 @@ impl Painter {
 
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        let render_count = self.render_count.get() + 1;
+        self.render_count.set(render_count);
+        let local_frame_id = self.last_ready_local_frame_id.get();
+        let wall_logical_frame_id = self.last_ready_wall_logical_frame_id.get();
+        let render_start = Instant::now();
+        if self.rendering_context.requested_gpu_index().is_some() {
+            info!(
+                "Wall render start: painter {:?} render_count={} local_frame_id={:?} \
+                 logical_frame_id={:?} pending={} overlapping_request_count={} \
+                 unexpected_ready_count={} requested_gpu={:?} size={:?}",
+                self.painter_id,
+                render_count,
+                local_frame_id,
+                wall_logical_frame_id,
+                self.pending_frames.get(),
+                self.overlapping_frame_request_count.get(),
+                self.unexpected_frame_ready_count.get(),
+                self.rendering_context.requested_gpu_index(),
+                self.rendering_context.size(),
+            );
+        } else {
+            debug!(
+                "Render start: painter {:?} render_count={} local_frame_id={:?} \
+                 logical_frame_id={:?} pending={} size={:?}",
+                self.painter_id,
+                render_count,
+                local_frame_id,
+                wall_logical_frame_id,
+                self.pending_frames.get(),
+                self.rendering_context.size(),
+            );
+        }
+
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -436,6 +505,36 @@ impl Painter {
 
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
+
+        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        if self.rendering_context.requested_gpu_index().is_some() {
+            info!(
+                "Wall render end: painter {:?} render_count={} local_frame_id={:?} \
+                 logical_frame_id={:?} render_ms={:.3} pending={} overlapping_request_count={} \
+                 unexpected_ready_count={} requested_gpu={:?} size={:?}",
+                self.painter_id,
+                render_count,
+                local_frame_id,
+                wall_logical_frame_id,
+                render_ms,
+                self.pending_frames.get(),
+                self.overlapping_frame_request_count.get(),
+                self.unexpected_frame_ready_count.get(),
+                self.rendering_context.requested_gpu_index(),
+                self.rendering_context.size(),
+            );
+        } else {
+            debug!(
+                "Render end: painter {:?} render_count={} local_frame_id={:?} \
+                 logical_frame_id={:?} render_ms={:.3} pending={}",
+                self.painter_id,
+                render_count,
+                local_frame_id,
+                wall_logical_frame_id,
+                render_ms,
+                self.pending_frames.get(),
+            );
+        }
     }
 
     fn clear_background(&self) {
@@ -555,10 +654,94 @@ impl Painter {
         }
     }
 
+    fn next_diagnostic_frame_id(&self) -> u64 {
+        let frame_id = self.next_diagnostic_frame_id.get() + 1;
+        self.next_diagnostic_frame_id.set(frame_id);
+        frame_id
+    }
+
+    fn record_frame_request(
+        &self,
+        local_frame_id: u64,
+        wall_logical_frame_id: Option<u64>,
+        reason: String,
+        pending_frames_before_request: usize,
+    ) {
+        if pending_frames_before_request > 0 {
+            let overlapping_frame_request_count = self.overlapping_frame_request_count.get() + 1;
+            self.overlapping_frame_request_count
+                .set(overlapping_frame_request_count);
+            info!(
+                "Wall frame overlap: painter {:?} local_frame_id={} logical_frame_id={:?} \
+                 requested while {} frame(s) were still pending; overlapping_request_count={} \
+                 requested_gpu={:?}",
+                self.painter_id,
+                local_frame_id,
+                wall_logical_frame_id,
+                pending_frames_before_request,
+                overlapping_frame_request_count,
+                self.rendering_context.requested_gpu_index(),
+            );
+        }
+
+        self.pending_frame_diagnostics
+            .borrow_mut()
+            .push_back(PendingFrameDiagnostic {
+                local_frame_id,
+                wall_logical_frame_id,
+                requested_at: Instant::now(),
+                reason: reason.clone(),
+            });
+
+        if self.rendering_context.requested_gpu_index().is_some() {
+            info!(
+                "Wall frame requested: painter {:?} local_frame_id={} logical_frame_id={:?} \
+                 reason={} pending_before={} requested_gpu={:?} size={:?}",
+                self.painter_id,
+                local_frame_id,
+                wall_logical_frame_id,
+                reason,
+                pending_frames_before_request,
+                self.rendering_context.requested_gpu_index(),
+                self.rendering_context.size(),
+            );
+        } else {
+            debug!(
+                "Frame requested: painter {:?} local_frame_id={} logical_frame_id={:?} \
+                 reason={} pending_before={} size={:?}",
+                self.painter_id,
+                local_frame_id,
+                wall_logical_frame_id,
+                reason,
+                pending_frames_before_request,
+                self.rendering_context.size(),
+            );
+        }
+    }
+
     /// Queue a new frame in the transaction and increase the pending frames count.
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
+        self.generate_frame_with_diagnostic_id(transaction, reason, None);
+    }
+
+    /// Queue a new frame using a shared logical diagnostic id supplied by `Paint`.
+    pub(crate) fn generate_frame_with_diagnostic_id(
+        &self,
+        transaction: &mut Transaction,
+        reason: RenderReasons,
+        wall_logical_frame_id: Option<u64>,
+    ) {
+        let reason_diagnostic = format!("{reason:?}");
         transaction.generate_frame(0, true /* present */, false /* tracked */, reason);
-        self.pending_frames.set(self.pending_frames.get() + 1);
+        let pending_frames_before_request = self.pending_frames.get();
+        let local_frame_id = self.next_diagnostic_frame_id();
+        self.record_frame_request(
+            local_frame_id,
+            wall_logical_frame_id,
+            reason_diagnostic,
+            pending_frames_before_request,
+        );
+        self.pending_frames.set(pending_frames_before_request + 1);
     }
 
     pub(crate) fn hit_test_at_point_with_api_and_document(
@@ -764,8 +947,74 @@ impl Painter {
         self.send_transaction(txn);
     }
 
-    pub(crate) fn decrement_pending_frames(&self) {
-        self.pending_frames.set(self.pending_frames.get() - 1);
+    pub(crate) fn note_webrender_frame_ready(&self, need_repaint: bool) {
+        let pending_frames = self.pending_frames.get();
+        if pending_frames == 0 {
+            let unexpected_frame_ready_count = self.unexpected_frame_ready_count.get() + 1;
+            self.unexpected_frame_ready_count
+                .set(unexpected_frame_ready_count);
+            warn!(
+                "Wall frame diagnostic: painter {:?} received a WebRender frame-ready \
+                 notification with no pending frame; need_repaint={} unexpected_ready_count={} \
+                 requested_gpu={:?}",
+                self.painter_id,
+                need_repaint,
+                unexpected_frame_ready_count,
+                self.rendering_context.requested_gpu_index(),
+            );
+            return;
+        }
+
+        self.pending_frames.set(pending_frames - 1);
+        let frame = self.pending_frame_diagnostics.borrow_mut().pop_front();
+        let Some(frame) = frame else {
+            warn!(
+                "Wall frame diagnostic: painter {:?} marked a frame ready but had no queued \
+                 diagnostic metadata; pending_after={} need_repaint={} requested_gpu={:?}",
+                self.painter_id,
+                pending_frames - 1,
+                need_repaint,
+                self.rendering_context.requested_gpu_index(),
+            );
+            return;
+        };
+
+        self.last_ready_local_frame_id
+            .set(Some(frame.local_frame_id));
+        if frame.wall_logical_frame_id.is_some() {
+            self.last_ready_wall_logical_frame_id
+                .set(frame.wall_logical_frame_id);
+        }
+        let wait_ms = frame.requested_at.elapsed().as_secs_f64() * 1000.0;
+        if self.rendering_context.requested_gpu_index().is_some() {
+            info!(
+                "Wall frame ready: painter {:?} local_frame_id={} logical_frame_id={:?} \
+                 reason={} wait_ms={:.3} pending_after={} need_repaint={} \
+                 overlapping_request_count={} unexpected_ready_count={} requested_gpu={:?}",
+                self.painter_id,
+                frame.local_frame_id,
+                frame.wall_logical_frame_id,
+                frame.reason,
+                wait_ms,
+                pending_frames - 1,
+                need_repaint,
+                self.overlapping_frame_request_count.get(),
+                self.unexpected_frame_ready_count.get(),
+                self.rendering_context.requested_gpu_index(),
+            );
+        } else {
+            debug!(
+                "Frame ready: painter {:?} local_frame_id={} logical_frame_id={:?} reason={} \
+                 wait_ms={:.3} pending_after={} need_repaint={}",
+                self.painter_id,
+                frame.local_frame_id,
+                frame.wall_logical_frame_id,
+                frame.reason,
+                wait_ms,
+                pending_frames - 1,
+                need_repaint,
+            );
+        }
     }
 
     pub(crate) fn report_memory(&self) -> MemoryReport {
@@ -1008,7 +1257,7 @@ impl Painter {
         self.send_transaction(transaction);
     }
 
-    pub(crate) fn generate_frame_for_script(&mut self) {
+    pub(crate) fn generate_frame_for_script(&mut self, diagnostic_frame_id: u64) {
         self.frame_delayer.set_pending_frame(true);
 
         if !self.frame_delayer.needs_new_frame() {
@@ -1016,7 +1265,11 @@ impl Painter {
         }
 
         let mut transaction = Transaction::new();
-        self.generate_frame(&mut transaction, RenderReasons::SCENE);
+        self.generate_frame_with_diagnostic_id(
+            &mut transaction,
+            RenderReasons::SCENE,
+            Some(diagnostic_frame_id),
+        );
         self.send_transaction(transaction);
 
         let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
@@ -1274,6 +1527,26 @@ impl Painter {
             return;
         };
         if !webview_renderer.set_viewport_details(viewport_details) {
+            return;
+        }
+
+        self.send_root_pipeline_display_list();
+        self.set_needs_repaint(RepaintReason::Resize);
+    }
+
+    pub(crate) fn set_viewport_details_and_origin(
+        &mut self,
+        webview_id: WebViewId,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) {
+        let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
+            return;
+        };
+
+        let viewport_details_changed = webview_renderer.set_viewport_details(viewport_details);
+        let viewport_origin_changed = webview_renderer.set_viewport_origin(viewport_origin);
+        if !viewport_details_changed && !viewport_origin_changed {
             return;
         }
 
