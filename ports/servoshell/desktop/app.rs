@@ -19,6 +19,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::WindowId;
 
+use log::info;
+
 use super::event_loop::AppEvent;
 use crate::desktop::event_loop::ServoShellEventLoop;
 use crate::desktop::headed_window::HeadedWindow;
@@ -121,6 +123,7 @@ impl App {
 
         let servo = servo_builder.build();
         servo.setup_logging();
+        self.log_initial_wall_tile_plan(&initial_tile_indices);
 
         let user_content_manager = Rc::new(UserContentManager::new(&servo));
         for script in load_userscripts(self.servoshell_preferences.userscripts_directory.as_deref())
@@ -144,6 +147,7 @@ impl App {
         ));
         running_state.open_window(platform_window, self.initial_url.as_url().clone());
         for tile_index in initial_tile_indices.into_iter().skip(1) {
+            info!("Opening wall tile window {tile_index}.");
             let tile_preferences = self.preferences_for_wall_tile(tile_index);
             let platform_window = self.create_platform_window_with_preferences(
                 &tile_preferences,
@@ -166,6 +170,33 @@ impl App {
             .as_ref()
             .map(|layout| (0..layout.tiles.len()).collect())
             .unwrap_or_else(|| vec![self.servoshell_preferences.wall_tile_index])
+    }
+
+    fn log_initial_wall_tile_plan(&self, tile_indices: &[usize]) {
+        if !self.servoshell_preferences.wall_all_tiles {
+            return;
+        }
+
+        info!(
+            "Wall-all-tiles startup requested: opening {} tile window(s).",
+            tile_indices.len()
+        );
+        let Some(layout) = &self.servoshell_preferences.wall_layout else {
+            return;
+        };
+        for tile_index in tile_indices {
+            let Some(tile) = layout.tiles.get(*tile_index) else {
+                continue;
+            };
+            info!(
+                "Wall tile {} plan: monitor {}, gpu {}, visible rect {:?}, render rect {:?}.",
+                tile_index,
+                tile.monitor,
+                tile.gpu,
+                tile.rect,
+                layout.tile_render_rect(*tile_index)
+            );
+        }
     }
 
     fn preferences_for_wall_tile(&self, tile_index: usize) -> ServoShellPreferences {

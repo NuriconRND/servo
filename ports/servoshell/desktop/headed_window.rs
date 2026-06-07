@@ -155,6 +155,12 @@ impl HeadedWindow {
             let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
             if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
+                info!(
+                    "Positioning wall tile {} on monitor {} at {:?}.",
+                    servoshell_preferences.wall_tile_index,
+                    tile.monitor,
+                    target_monitor.position()
+                );
                 winit_window.set_outer_position(target_monitor.position());
             } else {
                 warn!(
@@ -214,14 +220,19 @@ impl HeadedWindow {
                 .device_pixel_ratio_override
                 .map(Scale::new)
                 .unwrap_or_else(|| Scale::new(winit_window.scale_factor() as f32));
-            debug!(
-                "Wall tile {} visible rect {:?}, render rect {:?}",
+            let visible_rect =
+                layout.tile_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
+            let render_rect = layout.tile_render_device_rect(
                 servoshell_preferences.wall_tile_index,
-                layout.tile_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor),
-                layout.tile_render_device_rect(
-                    servoshell_preferences.wall_tile_index,
-                    hidpi_factor
-                ),
+                hidpi_factor,
+            );
+            info!(
+                "Wall tile {} monitor/gpu {}/{} visible rect {:?}, render rect {:?}",
+                servoshell_preferences.wall_tile_index,
+                layout.tiles[servoshell_preferences.wall_tile_index].monitor,
+                layout.tiles[servoshell_preferences.wall_tile_index].gpu,
+                visible_rect,
+                render_rect,
             );
         }
         let gui = RefCell::new(Gui::new(
