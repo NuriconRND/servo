@@ -197,15 +197,37 @@ impl ServoShellWindow {
         let rendering_context = self.platform_window().rendering_context();
         let requested_gpu_index = rendering_context.requested_gpu_index();
         let context_size = rendering_context.size();
-        rendering_context
-            .make_current()
-            .expect("Could not make PlatformWindow RenderingContext current");
-
         let paint_target = self
             .paint_target_overrides
             .borrow()
             .get(&webview.id())
             .copied();
+        let active_paint_target = paint_target.unwrap_or_else(|| webview.primary_paint_target());
+        if let Some(logical_frame_id) =
+            webview.paint_target_keep_previous_logical_frame(active_paint_target)
+        {
+            info!(
+                "Wall repaint target skipped: window {:?} webview {:?} target={} \
+                 logical_frame_id={} requested_gpu={:?} context_size={:?} \
+                 policy=keep-previous-frame",
+                self.id(),
+                webview.id(),
+                if paint_target.is_some() {
+                    "secondary"
+                } else {
+                    "primary"
+                },
+                logical_frame_id,
+                requested_gpu_index,
+                context_size,
+            );
+            return;
+        }
+
+        rendering_context
+            .make_current()
+            .expect("Could not make PlatformWindow RenderingContext current");
+
         let render_start = Instant::now();
         if let Some(paint_target) = paint_target {
             webview.paint_target(paint_target);
@@ -389,6 +411,10 @@ impl ServoShellWindow {
         self.platform_window.request_repaint(self);
     }
 
+    pub(crate) fn repaint_now(&self, state: &RunningAppState) {
+        self.platform_window.repaint_now(state, self);
+    }
+
     /// Close the given [`WebView`] via its [`WebViewId`].
     ///
     /// Note: This can happen because we can trigger a close with a UI action and then get
@@ -570,6 +596,10 @@ pub(crate) trait PlatformWindow {
     /// once the windowing system is ready. If this is a headless window, the redraw
     /// will happen immediately.
     fn request_repaint(&self, _: &ServoShellWindow);
+    /// Repaint immediately on the caller's thread when the platform can safely do so.
+    fn repaint_now(&self, _: &RunningAppState, window: &ServoShellWindow) {
+        self.request_repaint(window);
+    }
     /// Request a new outer size for the window, including external decorations.
     /// This should be the same as `window.outerWidth` and `window.outerHeight``
     fn request_resize(&self, webview: &WebView, outer_size: DeviceIntSize)

@@ -1,0 +1,647 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Stress Cases</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font: 14px/1.42 system-ui, sans-serif;
+    background: #0d1014;
+    color: #eef3f8;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    min-width: 7680px;
+    min-height: 4320px;
+    overflow: auto;
+    background:
+      linear-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.055) 1px, transparent 1px),
+      linear-gradient(90deg, #0d1014 0 25%, #111a15 25% 50%, #1a1511 50% 75%, #111725 75%);
+    background-size: 160px 160px, 160px 160px, 100% 100%;
+  }
+
+  header {
+    position: fixed;
+    z-index: 50;
+    inset: 0 0 auto 0;
+    display: grid;
+    grid-template-columns: 360px repeat(7, minmax(160px, 1fr));
+    gap: 8px;
+    min-width: 1280px;
+    padding: 10px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.24);
+    background: rgba(13, 16, 20, 0.96);
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 17px;
+    line-height: 1.2;
+  }
+
+  .metric,
+  .panel,
+  .overflow-box,
+  .media-card,
+  iframe {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.24);
+  }
+
+  .metric {
+    min-height: 46px;
+    padding: 6px 8px;
+  }
+
+  .label {
+    display: block;
+    color: #aab4bf;
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+
+  .value {
+    display: block;
+    overflow: hidden;
+    font: 700 14px/1.25 ui-monospace, SFMono-Regular, Consolas, monospace;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .boundary-x,
+  .boundary-y {
+    position: absolute;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  .boundary-x {
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: #f7d84c;
+    box-shadow: 0 0 0 1px rgba(247, 216, 76, 0.55);
+  }
+
+  .boundary-y {
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: #54d4ff;
+    box-shadow: 0 0 0 1px rgba(84, 212, 255, 0.5);
+  }
+
+  .boundary-x::before,
+  .boundary-y::before {
+    content: attr(data-label);
+    position: sticky;
+    display: block;
+    color: inherit;
+    font: 700 13px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: nowrap;
+  }
+
+  .boundary-x::before {
+    top: 86px;
+    margin-left: 9px;
+    color: #f7d84c;
+  }
+
+  .boundary-y::before {
+    left: 16px;
+    margin-top: 8px;
+    color: #54d4ff;
+  }
+
+  #x1920 {
+    left: 1920px;
+  }
+
+  #x3840 {
+    left: 3840px;
+  }
+
+  #x5760 {
+    left: 5760px;
+  }
+
+  #y1080 {
+    top: 1080px;
+  }
+
+  #y2160 {
+    top: 2160px;
+  }
+
+  #y3240 {
+    top: 3240px;
+  }
+
+  .dashboard {
+    position: absolute;
+    top: 126px;
+    left: 72px;
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 18px;
+    width: 7440px;
+  }
+
+  .panel {
+    min-height: 178px;
+    padding: 14px;
+  }
+
+  .panel h2 {
+    margin: 0 0 10px;
+    color: #dfe7ee;
+    font-size: 15px;
+  }
+
+  .panel p {
+    margin: 0;
+    color: #aeb8c4;
+  }
+
+  .span-3 {
+    grid-column: span 3;
+  }
+
+  .span-4 {
+    grid-column: span 4;
+  }
+
+  .span-5 {
+    grid-column: span 5;
+  }
+
+  .chart {
+    height: 92px;
+    margin-top: 18px;
+    background:
+      linear-gradient(180deg, transparent 0 25%, rgba(255, 255, 255, 0.12) 25% 26%, transparent 26% 50%, rgba(255, 255, 255, 0.12) 50% 51%, transparent 51% 75%, rgba(255, 255, 255, 0.12) 75% 76%, transparent 76%),
+      linear-gradient(90deg, #45a3ff 0 12%, #35d894 12% 34%, #f4d24f 34% 57%, #f27a54 57% 74%, #a57cff 74%);
+    clip-path: polygon(0 68%, 10% 36%, 20% 48%, 32% 18%, 45% 42%, 58% 24%, 72% 62%, 86% 30%, 100% 56%, 100% 100%, 0 100%);
+  }
+
+  .fixed-ribbon {
+    position: fixed;
+    z-index: 40;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 44px;
+    border-top: 1px solid rgba(255, 255, 255, 0.24);
+    background:
+      repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.16) 0 10px, transparent 10px 58px),
+      rgba(16, 18, 24, 0.94);
+  }
+
+  .sticky-strip {
+    position: sticky;
+    z-index: 25;
+    top: 78px;
+    margin-top: 820px;
+    width: 7680px;
+    height: 86px;
+    border-block: 2px solid rgba(255, 255, 255, 0.28);
+    background:
+      repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.16) 0 12px, transparent 12px 64px),
+      rgba(95, 133, 255, 0.22);
+  }
+
+  .transform-stage {
+    position: absolute;
+    top: 1180px;
+    left: 1370px;
+    width: 3020px;
+    height: 360px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(0, 0, 0, 0.2);
+    overflow: visible;
+  }
+
+  .moving-tile {
+    position: absolute;
+    top: 88px;
+    width: 560px;
+    height: 150px;
+    border: 2px solid rgba(255, 255, 255, 0.76);
+    background:
+      repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.18) 0 18px, transparent 18px 36px),
+      linear-gradient(135deg, rgba(63, 169, 245, 0.95), rgba(48, 217, 145, 0.9));
+    box-shadow: 0 22px 52px rgba(0, 0, 0, 0.4);
+    will-change: transform, opacity;
+  }
+
+  #moving-b {
+    top: 196px;
+    background:
+      repeating-linear-gradient(-45deg, rgba(255, 255, 255, 0.2) 0 16px, transparent 16px 32px),
+      linear-gradient(135deg, rgba(242, 122, 84, 0.95), rgba(247, 216, 76, 0.85));
+  }
+
+  .filter-card {
+    position: absolute;
+    top: 1600px;
+    left: 3660px;
+    width: 760px;
+    height: 300px;
+    border: 1px solid rgba(255, 255, 255, 0.34);
+    background: rgba(255, 255, 255, 0.13);
+    box-shadow: 0 0 110px rgba(247, 216, 76, 0.46), 0 18px 70px rgba(0, 0, 0, 0.46);
+    filter: blur(0.2px) saturate(1.2);
+  }
+
+  .filter-card::after {
+    content: "";
+    position: absolute;
+    inset: 48px 56px;
+    border: 20px solid rgba(255, 255, 255, 0.16);
+    opacity: 0.72;
+    transform: rotate(-7deg);
+  }
+
+  .overflow-box {
+    position: absolute;
+    top: 2030px;
+    left: 1710px;
+    width: 780px;
+    height: 360px;
+    overflow: auto;
+    padding: 14px;
+  }
+
+  .overflow-track {
+    width: 1260px;
+    height: 720px;
+    background:
+      linear-gradient(135deg, rgba(69, 163, 255, 0.32), rgba(53, 216, 148, 0.22)),
+      repeating-linear-gradient(90deg, transparent 0 38px, rgba(255, 255, 255, 0.14) 38px 40px);
+  }
+
+  iframe {
+    position: absolute;
+    top: 2030px;
+    left: 3650px;
+    width: 900px;
+    height: 360px;
+  }
+
+  .media-card {
+    position: absolute;
+    width: 900px;
+    height: 410px;
+    padding: 12px;
+  }
+
+  .media-card h2 {
+    margin: 0 0 10px;
+    font-size: 14px;
+  }
+
+  .media-card canvas,
+  .media-card video {
+    display: block;
+    width: 100%;
+    height: 330px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: #07090d;
+  }
+
+  #canvas-2d-card {
+    top: 2550px;
+    left: 3600px;
+  }
+
+  #webgl-card {
+    top: 2550px;
+    left: 1760px;
+  }
+
+  #webgpu-card {
+    top: 2550px;
+    left: 5520px;
+  }
+
+  #video-card {
+    top: 3260px;
+    left: 3650px;
+  }
+
+  .status-line {
+    color: #aab4bf;
+    font: 12px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+
+  .readout {
+    position: absolute;
+    top: 3810px;
+    left: 80px;
+    width: 1200px;
+    min-height: 180px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.28);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+
+<header>
+  <h1>Multi-GPU Wall Stress Cases</h1>
+  <div class="metric"><span class="label">frame</span><span class="value" id="frame-value">0</span></div>
+  <div class="metric"><span class="label">rAF timestamp</span><span class="value" id="time-value">0</span></div>
+  <div class="metric"><span class="label">scroll</span><span class="value" id="scroll-value">0, 0</span></div>
+  <div class="metric"><span class="label">viewport</span><span class="value" id="viewport-value">0 x 0</span></div>
+  <div class="metric"><span class="label">webgl</span><span class="value" id="webgl-value">pending</span></div>
+  <div class="metric"><span class="label">webgpu</span><span class="value" id="webgpu-value">pending</span></div>
+  <div class="metric"><span class="label">video</span><span class="value" id="video-value">pending</span></div>
+</header>
+
+<div class="boundary-x" id="x1920" data-label="x=1920 local 3x1"></div>
+<div class="boundary-x" id="x3840" data-label="x=3840 local 3x1 / 2x2"></div>
+<div class="boundary-x" id="x5760" data-label="x=5760 2x2"></div>
+<div class="boundary-y" id="y1080" data-label="y=1080 local tile height"></div>
+<div class="boundary-y" id="y2160" data-label="y=2160 2x2 boundary"></div>
+<div class="boundary-y" id="y3240" data-label="y=3240 deep scroll"></div>
+
+<main class="dashboard" aria-label="static dashboard stress grid">
+  <section class="panel span-3">
+    <h2>Global Tile Load</h2>
+    <p>Static dashboard panel spanning dense text, borders, and chart clipping.</p>
+    <div class="chart"></div>
+  </section>
+  <section class="panel span-4">
+    <h2>Boundary Crossing Chart</h2>
+    <p>This card is intentionally wide so the same display list content is split by tile clips.</p>
+    <div class="chart"></div>
+  </section>
+  <section class="panel span-5">
+    <h2>Wide Table Region</h2>
+    <p>Repeated visual structure stresses antialiasing, text, and background alignment.</p>
+    <div class="chart"></div>
+  </section>
+  <section class="panel span-5">
+    <h2>Fixed And Sticky Baseline</h2>
+    <p>The header and bottom ribbon should remain fixed while the sticky band tracks scroll.</p>
+    <div class="chart"></div>
+  </section>
+  <section class="panel span-3">
+    <h2>Opacity Stack</h2>
+    <p>Layered transparent fills check WebRender clips at the wall boundary.</p>
+    <div class="chart"></div>
+  </section>
+  <section class="panel span-4">
+    <h2>Shadow Baseline</h2>
+    <p>Soft edges should survive overlap-expanded tile rendering.</p>
+    <div class="chart"></div>
+  </section>
+</main>
+
+<div class="fixed-ribbon"></div>
+<div class="sticky-strip"></div>
+
+<section class="transform-stage" aria-label="transform and opacity stress region">
+  <div class="moving-tile" id="moving-a"></div>
+  <div class="moving-tile" id="moving-b"></div>
+</section>
+
+<div class="filter-card" aria-label="filter and shadow stress region"></div>
+
+<section class="overflow-box">
+  <div class="status-line">overflow scroller crossing x=1920</div>
+  <div class="overflow-track" id="overflow-track"></div>
+</section>
+
+<iframe id="stress-frame" title="iframe boundary stress"></iframe>
+
+<section class="media-card" id="webgl-card">
+  <h2>WebGL Boundary Canvas</h2>
+  <canvas id="webgl-canvas" width="876" height="330"></canvas>
+  <div class="status-line" id="webgl-status">pending</div>
+</section>
+
+<section class="media-card" id="canvas-2d-card">
+  <h2>2D Canvas Boundary Canvas</h2>
+  <canvas id="canvas-2d" width="876" height="330"></canvas>
+  <div class="status-line" id="canvas-status">pending</div>
+</section>
+
+<section class="media-card" id="webgpu-card">
+  <h2>WebGPU Availability Probe</h2>
+  <canvas id="webgpu-canvas" width="876" height="330"></canvas>
+  <div class="status-line" id="webgpu-status">pending</div>
+</section>
+
+<section class="media-card" id="video-card">
+  <h2>Video Boundary Element</h2>
+  <video id="video-probe" muted autoplay playsinline></video>
+  <div class="status-line" id="video-status">pending</div>
+</section>
+
+<pre class="readout" id="readout">waiting for stress loop...</pre>
+
+<script>
+  var frameValue = document.getElementById("frame-value");
+  var timeValue = document.getElementById("time-value");
+  var scrollValue = document.getElementById("scroll-value");
+  var viewportValue = document.getElementById("viewport-value");
+  var webglValue = document.getElementById("webgl-value");
+  var webgpuValue = document.getElementById("webgpu-value");
+  var videoValue = document.getElementById("video-value");
+  var webglStatus = document.getElementById("webgl-status");
+  var canvasStatus = document.getElementById("canvas-status");
+  var webgpuStatus = document.getElementById("webgpu-status");
+  var videoStatus = document.getElementById("video-status");
+  var readout = document.getElementById("readout");
+  var movingA = document.getElementById("moving-a");
+  var movingB = document.getElementById("moving-b");
+  var overflowBox = document.querySelector(".overflow-box");
+  var stressFrame = document.getElementById("stress-frame");
+  var startTimestamp = 0;
+  var frameCount = 0;
+
+  stressFrame.srcdoc = [
+    "<!doctype html><meta charset=\"utf-8\"><style>",
+    "body{margin:0;width:1200px;height:700px;color:#eef3f8;background:#10141c;font:14px system-ui,sans-serif;overflow:hidden}",
+    ".bar{position:absolute;left:0;right:0;height:80px;background:linear-gradient(90deg,#45a3ff,#35d894,#f7d84c,#f27a54);opacity:.72}",
+    ".a{top:80px;transform:rotate(-4deg)}.b{top:250px;filter:blur(.3px);box-shadow:0 0 90px rgba(247,216,76,.55)}",
+    "p{position:absolute;left:18px;top:18px;margin:0;font:700 22px ui-monospace,monospace}",
+    "</style><p>iframe srcdoc stress</p><div class=\"bar a\"></div><div class=\"bar b\"></div>"
+  ].join("");
+
+  function setStatus(element, metric, text) {
+    element.textContent = text;
+    if (metric) {
+      metric.textContent = text;
+    }
+  }
+
+  var canvas2d = document.getElementById("canvas-2d");
+  var canvas2dContext = canvas2d.getContext && canvas2d.getContext("2d");
+  setStatus(canvasStatus, null, canvas2dContext ? "2d canvas ready" : "2d canvas unavailable");
+
+  var webglCanvas = document.getElementById("webgl-canvas");
+  var webgl = null;
+  try {
+    webgl = webglCanvas.getContext("webgl") || webglCanvas.getContext("experimental-webgl");
+  } catch (error) {
+    webgl = null;
+  }
+  setStatus(webglStatus, webglValue, webgl ? "ready" : "unavailable");
+
+  var webgpuCanvas = document.getElementById("webgpu-canvas");
+  var webgpuContext = webgpuCanvas.getContext && webgpuCanvas.getContext("2d");
+  if ("gpu" in navigator) {
+    setStatus(webgpuStatus, webgpuValue, "navigator.gpu present");
+  } else {
+    setStatus(webgpuStatus, webgpuValue, "unavailable fallback");
+  }
+
+  var video = document.getElementById("video-probe");
+  var videoSourceCanvas = document.createElement("canvas");
+  videoSourceCanvas.width = 876;
+  videoSourceCanvas.height = 330;
+  var videoSourceContext = videoSourceCanvas.getContext && videoSourceCanvas.getContext("2d");
+  if (videoSourceCanvas.captureStream && videoSourceContext) {
+    try {
+      video.srcObject = videoSourceCanvas.captureStream(30);
+      var playResult = video.play();
+      if (playResult && playResult.catch) {
+        playResult.catch(function () {});
+      }
+      setStatus(videoStatus, videoValue, "captureStream");
+    } catch (error) {
+      setStatus(videoStatus, videoValue, "stream failed");
+    }
+  } else {
+    setStatus(videoStatus, videoValue, "fallback element");
+  }
+
+  function drawCanvas2d(timestamp) {
+    if (!canvas2dContext) {
+      return;
+    }
+    var w = canvas2d.width;
+    var h = canvas2d.height;
+    canvas2dContext.clearRect(0, 0, w, h);
+    canvas2dContext.fillStyle = "#07090d";
+    canvas2dContext.fillRect(0, 0, w, h);
+    for (var i = 0; i < 18; i += 1) {
+      var x = (i * 86 + timestamp * 0.18) % (w + 120) - 80;
+      canvas2dContext.fillStyle = i % 2 ? "rgba(53,216,148,.78)" : "rgba(69,163,255,.78)";
+      canvas2dContext.fillRect(x, 40 + (i % 6) * 42, 128, 30);
+    }
+    canvas2dContext.strokeStyle = "rgba(247,216,76,.9)";
+    canvas2dContext.lineWidth = 4;
+    canvas2dContext.strokeRect(24, 24, w - 48, h - 48);
+  }
+
+  function drawWebgl(timestamp) {
+    if (!webgl) {
+      return;
+    }
+    var r = (Math.sin(timestamp / 500) + 1) * 0.35;
+    var g = (Math.sin(timestamp / 700 + 1.4) + 1) * 0.35;
+    var b = (Math.sin(timestamp / 900 + 2.1) + 1) * 0.35;
+    webgl.viewport(0, 0, webglCanvas.width, webglCanvas.height);
+    webgl.clearColor(r, g, b, 1);
+    webgl.clear(webgl.COLOR_BUFFER_BIT);
+  }
+
+  function drawWebgpuFallback(timestamp) {
+    if (!webgpuContext) {
+      return;
+    }
+    var w = webgpuCanvas.width;
+    var h = webgpuCanvas.height;
+    webgpuContext.clearRect(0, 0, w, h);
+    webgpuContext.fillStyle = "#07090d";
+    webgpuContext.fillRect(0, 0, w, h);
+    webgpuContext.fillStyle = "rgba(165,124,255,.68)";
+    webgpuContext.fillRect(0, 0, w, h);
+    webgpuContext.fillStyle = "rgba(247,216,76,.9)";
+    webgpuContext.font = "700 26px ui-monospace, monospace";
+    webgpuContext.fillText("WebGPU probe fallback", 30, 62);
+    for (var i = 0; i < 12; i += 1) {
+      var y = 108 + i * 18;
+      var x = 40 + ((timestamp * 0.12 + i * 61) % 740);
+      webgpuContext.fillRect(x, y, 120, 8);
+    }
+  }
+
+  function drawVideoSource(timestamp) {
+    if (!videoSourceContext) {
+      return;
+    }
+    var w = videoSourceCanvas.width;
+    var h = videoSourceCanvas.height;
+    videoSourceContext.fillStyle = "#090c10";
+    videoSourceContext.fillRect(0, 0, w, h);
+    videoSourceContext.fillStyle = "rgba(69,163,255,.8)";
+    videoSourceContext.fillRect((timestamp * 0.16) % w, 46, 210, 90);
+    videoSourceContext.fillStyle = "rgba(242,122,84,.78)";
+    videoSourceContext.fillRect(w - ((timestamp * 0.12) % w) - 210, 176, 210, 90);
+    videoSourceContext.fillStyle = "#eef3f8";
+    videoSourceContext.font = "700 28px ui-monospace, monospace";
+    videoSourceContext.fillText("generated video frame", 28, 306);
+  }
+
+  function updateHeader(timestamp) {
+    frameValue.textContent = String(frameCount);
+    timeValue.textContent = String(Math.round(timestamp));
+    scrollValue.textContent = Math.round(scrollX) + ", " + Math.round(scrollY);
+    viewportValue.textContent = innerWidth + " x " + innerHeight;
+  }
+
+  function tick(timestamp) {
+    if (!startTimestamp) {
+      startTimestamp = timestamp;
+    }
+    frameCount += 1;
+
+    var elapsed = timestamp - startTimestamp;
+    var xA = 70 + (elapsed * 0.45) % 2300;
+    var xB = 2350 - (elapsed * 0.36) % 2300;
+    var opacity = 0.58 + (Math.sin(elapsed / 420) + 1) * 0.2;
+    var scrollTarget = 520 + (Math.sin(elapsed / 1200) + 1) * 1050;
+
+    movingA.style.transform = "translate3d(" + xA + "px,0,0) rotate(" + Math.sin(elapsed / 800) * 4 + "deg)";
+    movingA.style.opacity = String(opacity);
+    movingB.style.transform = "translate3d(" + xB + "px,0,0) rotate(" + Math.cos(elapsed / 900) * -5 + "deg)";
+    movingB.style.opacity = String(1.08 - opacity);
+    overflowBox.scrollLeft = (elapsed * 0.2) % 420;
+    overflowBox.scrollTop = (elapsed * 0.14) % 320;
+    scrollTo(0, scrollTarget);
+
+    drawCanvas2d(timestamp);
+    drawWebgl(timestamp);
+    drawWebgpuFallback(timestamp);
+    drawVideoSource(timestamp);
+    updateHeader(timestamp);
+
+    readout.textContent = [
+      "frame=" + frameCount,
+      "timestamp=" + timestamp.toFixed(3),
+      "scrollY=" + scrollY.toFixed(3),
+      "movingA=" + xA.toFixed(3),
+      "movingB=" + xB.toFixed(3),
+      "webgl=" + webglValue.textContent,
+      "webgpu=" + webgpuValue.textContent,
+      "video=" + videoValue.textContent
+    ].join("\n");
+
+    requestAnimationFrame(tick);
+  }
+
+  addEventListener("resize", function () {
+    updateHeader(performance.now());
+  });
+  requestAnimationFrame(tick);
+</script>

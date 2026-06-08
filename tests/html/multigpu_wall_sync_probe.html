@@ -1,0 +1,210 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Sync Probe</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font: 14px/1.45 system-ui, sans-serif;
+    background: #101216;
+    color: #eef3f8;
+  }
+
+  body {
+    margin: 0;
+    min-width: 5760px;
+    min-height: 2800px;
+    overflow: auto;
+    background:
+      linear-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.07) 1px, transparent 1px),
+      linear-gradient(90deg, #101216 0 33.333%, #151b15 33.333% 66.666%, #1d1715 66.666%);
+    background-size: 160px 160px, 160px 160px, 100% 100%;
+  }
+
+  header {
+    position: fixed;
+    z-index: 20;
+    inset: 0 0 auto 0;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(180px, 1fr));
+    gap: 8px;
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.24);
+    background: rgba(16, 18, 22, 0.95);
+  }
+
+  .metric {
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    padding: 7px 9px;
+    background: rgba(0, 0, 0, 0.26);
+  }
+
+  .label {
+    display: block;
+    color: #aab4bf;
+    font-size: 11px;
+    text-transform: uppercase;
+  }
+
+  .value {
+    display: block;
+    font: 700 15px/1.25 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+
+  .boundary {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: #f7d84c;
+    box-shadow: 0 0 0 1px rgba(247, 216, 76, 0.55);
+  }
+
+  .boundary::before {
+    content: attr(data-label);
+    position: sticky;
+    top: 88px;
+    display: block;
+    margin-left: 10px;
+    color: #f7d84c;
+    font: 700 13px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: nowrap;
+  }
+
+  #x1920 {
+    left: 1920px;
+  }
+
+  #x3840 {
+    left: 3840px;
+  }
+
+  .lane {
+    position: absolute;
+    left: 120px;
+    right: 120px;
+    height: 160px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(0, 0, 0, 0.18);
+  }
+
+  #lane-a {
+    top: 360px;
+  }
+
+  #lane-b {
+    top: 1220px;
+  }
+
+  .moving-block {
+    position: absolute;
+    top: 34px;
+    left: 0;
+    width: 520px;
+    height: 92px;
+    border: 2px solid rgba(255, 255, 255, 0.82);
+    background:
+      linear-gradient(135deg, rgba(68, 164, 255, 0.9), rgba(37, 210, 146, 0.86)),
+      repeating-linear-gradient(90deg, transparent 0 22px, rgba(255, 255, 255, 0.2) 22px 26px);
+    box-shadow: 0 18px 38px rgba(0, 0, 0, 0.35);
+    will-change: transform;
+  }
+
+  .sticky-strip {
+    position: sticky;
+    top: 90px;
+    margin-top: 760px;
+    width: 5760px;
+    height: 96px;
+    border-block: 2px solid rgba(255, 255, 255, 0.35);
+    background:
+      repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.18) 0 8px, transparent 8px 48px),
+      rgba(136, 88, 255, 0.22);
+  }
+
+  .shadow-card {
+    position: absolute;
+    top: 1780px;
+    left: 1770px;
+    width: 380px;
+    height: 220px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: 0 0 90px rgba(255, 226, 80, 0.45);
+    filter: blur(0.2px);
+  }
+
+  .readout {
+    position: absolute;
+    top: 2180px;
+    left: 160px;
+    width: 860px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.26);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+<header id="metrics"></header>
+<div class="boundary" id="x1920" data-label="tile boundary x=1920"></div>
+<div class="boundary" id="x3840" data-label="tile boundary x=3840"></div>
+<section class="lane" id="lane-a"><div class="moving-block" id="block-a"></div></section>
+<section class="lane" id="lane-b"><div class="moving-block" id="block-b"></div></section>
+<div class="sticky-strip"></div>
+<div class="shadow-card"></div>
+<pre class="readout" id="readout">waiting for animation frames...</pre>
+<script>
+  const metrics = document.getElementById("metrics");
+  const readout = document.getElementById("readout");
+  const blockA = document.getElementById("block-a");
+  const blockB = document.getElementById("block-b");
+  let startTimestamp = 0;
+  let frameCount = 0;
+
+  function metric(label, value) {
+    return `<div class="metric"><span class="label">${label}</span><span class="value">${value}</span></div>`;
+  }
+
+  function updateMetrics(timestamp, scrollTarget) {
+    metrics.innerHTML = [
+      metric("frame", frameCount),
+      metric("rAF timestamp", Math.round(timestamp)),
+      metric("scroll", `${Math.round(scrollX)}, ${Math.round(scrollY)}`),
+      metric("scroll target", Math.round(scrollTarget)),
+      metric("inner", `${innerWidth} x ${innerHeight}`),
+      metric("screen", `${screen.width} x ${screen.height}`),
+    ].join("");
+  }
+
+  function tick(timestamp) {
+    if (!startTimestamp) {
+      startTimestamp = timestamp;
+    }
+
+    frameCount += 1;
+    const elapsed = timestamp - startTimestamp;
+    const xA = 120 + (elapsed * 0.42) % 5100;
+    const xB = 5200 - (elapsed * 0.36) % 5100;
+    const scrollTarget = 260 + (Math.sin(elapsed / 900) + 1) * 720;
+
+    blockA.style.transform = `translate3d(${xA}px, 0, 0)`;
+    blockB.style.transform = `translate3d(${xB}px, 0, 0)`;
+    scrollTo(0, scrollTarget);
+    updateMetrics(timestamp, scrollTarget);
+
+    readout.textContent = [
+      `frame=${frameCount}`,
+      `timestamp=${timestamp.toFixed(3)}`,
+      `elapsed=${elapsed.toFixed(3)}`,
+      `scrollY=${scrollY.toFixed(3)}`,
+      `blockA=${xA.toFixed(3)}`,
+      `blockB=${xB.toFixed(3)}`,
+    ].join("\n");
+
+    requestAnimationFrame(tick);
+  }
+
+  addEventListener("resize", () => updateMetrics(performance.now(), scrollY));
+  requestAnimationFrame(tick);
+</script>

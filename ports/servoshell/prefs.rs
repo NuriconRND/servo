@@ -746,6 +746,14 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
             default_window_size.min(screen_size_override)
         });
 
+    let initial_window_size = cmd_args.window_size.unwrap_or_else(|| {
+        wall_layout
+            .as_ref()
+            .and_then(|layout| layout.tiles.get(cmd_args.wall_tile_index))
+            .map(|tile| tile.rect.size.to_u32())
+            .unwrap_or(default_window_size)
+    });
+
     let servoshell_preferences = ServoShellPreferences {
         url: Some(cmd_args.url),
         no_native_titlebar: cmd_args.no_native_titlebar,
@@ -753,7 +761,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         clean_shutdown: cmd_args.clean_shutdown,
         headless: cmd_args.headless,
         tracing_filter: cmd_args.tracing_filter,
-        initial_window_size: cmd_args.window_size.unwrap_or(default_window_size),
+        initial_window_size,
         screen_size_override: cmd_args.screen_size_override,
         wall_layout,
         wall_tile_index: cmd_args.wall_tile_index,

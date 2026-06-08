@@ -160,7 +160,17 @@ struct PendingFrameDiagnostic {
     local_frame_id: u64,
     wall_logical_frame_id: Option<u64>,
     requested_at: Instant,
+    wall_requested_at: Option<Instant>,
     reason: String,
+}
+
+pub(crate) struct FrameReadyDiagnostic {
+    pub(crate) painter_id: PainterId,
+    pub(crate) local_frame_id: u64,
+    pub(crate) wall_logical_frame_id: Option<u64>,
+    pub(crate) ready_at: Instant,
+    pub(crate) wait_ms: f64,
+    pub(crate) need_repaint: bool,
 }
 
 impl Drop for Painter {
@@ -664,9 +674,20 @@ impl Painter {
         &self,
         local_frame_id: u64,
         wall_logical_frame_id: Option<u64>,
+        wall_requested_at: Option<Instant>,
         reason: String,
         pending_frames_before_request: usize,
     ) {
+        let requested_at = Instant::now();
+        let wall_request_delay_ms = wall_requested_at
+            .map(|wall_requested_at| {
+                requested_at
+                    .saturating_duration_since(wall_requested_at)
+                    .as_secs_f64()
+                    * 1000.0
+            })
+            .unwrap_or_default();
+
         if pending_frames_before_request > 0 {
             let overlapping_frame_request_count = self.overlapping_frame_request_count.get() + 1;
             self.overlapping_frame_request_count
@@ -689,31 +710,35 @@ impl Painter {
             .push_back(PendingFrameDiagnostic {
                 local_frame_id,
                 wall_logical_frame_id,
-                requested_at: Instant::now(),
+                requested_at,
+                wall_requested_at,
                 reason: reason.clone(),
             });
 
         if self.rendering_context.requested_gpu_index().is_some() {
             info!(
                 "Wall frame requested: painter {:?} local_frame_id={} logical_frame_id={:?} \
-                 reason={} pending_before={} requested_gpu={:?} size={:?}",
+                 reason={} pending_before={} shared_request_delay_ms={:.3} \
+                 requested_gpu={:?} size={:?}",
                 self.painter_id,
                 local_frame_id,
                 wall_logical_frame_id,
                 reason,
                 pending_frames_before_request,
+                wall_request_delay_ms,
                 self.rendering_context.requested_gpu_index(),
                 self.rendering_context.size(),
             );
         } else {
             debug!(
-                "Frame requested: painter {:?} local_frame_id={} logical_frame_id={:?} \
-                 reason={} pending_before={} size={:?}",
+                "Frame requested: painter {:?} local_frame_id={} logical_frame_id={:?} reason={} \
+                 pending_before={} shared_request_delay_ms={:.3} size={:?}",
                 self.painter_id,
                 local_frame_id,
                 wall_logical_frame_id,
                 reason,
                 pending_frames_before_request,
+                wall_request_delay_ms,
                 self.rendering_context.size(),
             );
         }
@@ -721,7 +746,7 @@ impl Painter {
 
     /// Queue a new frame in the transaction and increase the pending frames count.
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
-        self.generate_frame_with_diagnostic_id(transaction, reason, None);
+        self.generate_frame_with_diagnostic_id(transaction, reason, None, None);
     }
 
     /// Queue a new frame using a shared logical diagnostic id supplied by `Paint`.
@@ -730,6 +755,7 @@ impl Painter {
         transaction: &mut Transaction,
         reason: RenderReasons,
         wall_logical_frame_id: Option<u64>,
+        wall_requested_at: Option<Instant>,
     ) {
         let reason_diagnostic = format!("{reason:?}");
         transaction.generate_frame(0, true /* present */, false /* tracked */, reason);
@@ -738,10 +764,30 @@ impl Painter {
         self.record_frame_request(
             local_frame_id,
             wall_logical_frame_id,
+            wall_requested_at,
             reason_diagnostic,
             pending_frames_before_request,
         );
         self.pending_frames.set(pending_frames_before_request + 1);
+    }
+
+    pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
+        let webview_renderer = self.webview_renderers.get(&webview_id)?;
+        let mut pipeline_signatures = Vec::new();
+        for (pipeline_id, details) in &webview_renderer.pipelines {
+            let mut scroll_offsets = details
+                .scroll_tree
+                .scroll_offsets()
+                .into_iter()
+                .map(|(external_id, offset)| {
+                    format!("{external_id:?}:{:.3},{:.3}", offset.x, offset.y)
+                })
+                .collect::<Vec<_>>();
+            scroll_offsets.sort();
+            pipeline_signatures.push(format!("{pipeline_id:?}[{}]", scroll_offsets.join(";")));
+        }
+        pipeline_signatures.sort();
+        Some(pipeline_signatures.join("|"))
     }
 
     pub(crate) fn hit_test_at_point_with_api_and_document(
@@ -947,7 +993,10 @@ impl Painter {
         self.send_transaction(txn);
     }
 
-    pub(crate) fn note_webrender_frame_ready(&self, need_repaint: bool) {
+    pub(crate) fn note_webrender_frame_ready(
+        &self,
+        need_repaint: bool,
+    ) -> Option<FrameReadyDiagnostic> {
         let pending_frames = self.pending_frames.get();
         if pending_frames == 0 {
             let unexpected_frame_ready_count = self.unexpected_frame_ready_count.get() + 1;
@@ -962,7 +1011,7 @@ impl Painter {
                 unexpected_frame_ready_count,
                 self.rendering_context.requested_gpu_index(),
             );
-            return;
+            return None;
         }
 
         self.pending_frames.set(pending_frames - 1);
@@ -976,7 +1025,7 @@ impl Painter {
                 need_repaint,
                 self.rendering_context.requested_gpu_index(),
             );
-            return;
+            return None;
         };
 
         self.last_ready_local_frame_id
@@ -985,17 +1034,29 @@ impl Painter {
             self.last_ready_wall_logical_frame_id
                 .set(frame.wall_logical_frame_id);
         }
-        let wait_ms = frame.requested_at.elapsed().as_secs_f64() * 1000.0;
+        let ready_at = Instant::now();
+        let wait_ms = ready_at.duration_since(frame.requested_at).as_secs_f64() * 1000.0;
+        let shared_request_to_ready_ms = frame
+            .wall_requested_at
+            .map(|wall_requested_at| {
+                ready_at
+                    .saturating_duration_since(wall_requested_at)
+                    .as_secs_f64()
+                    * 1000.0
+            })
+            .unwrap_or(wait_ms);
         if self.rendering_context.requested_gpu_index().is_some() {
             info!(
                 "Wall frame ready: painter {:?} local_frame_id={} logical_frame_id={:?} \
-                 reason={} wait_ms={:.3} pending_after={} need_repaint={} \
+                 reason={} wait_ms={:.3} shared_request_to_ready_ms={:.3} \
+                 pending_after={} need_repaint={} \
                  overlapping_request_count={} unexpected_ready_count={} requested_gpu={:?}",
                 self.painter_id,
                 frame.local_frame_id,
                 frame.wall_logical_frame_id,
                 frame.reason,
                 wait_ms,
+                shared_request_to_ready_ms,
                 pending_frames - 1,
                 need_repaint,
                 self.overlapping_frame_request_count.get(),
@@ -1005,16 +1066,27 @@ impl Painter {
         } else {
             debug!(
                 "Frame ready: painter {:?} local_frame_id={} logical_frame_id={:?} reason={} \
-                 wait_ms={:.3} pending_after={} need_repaint={}",
+                 wait_ms={:.3} shared_request_to_ready_ms={:.3} pending_after={} \
+                 need_repaint={}",
                 self.painter_id,
                 frame.local_frame_id,
                 frame.wall_logical_frame_id,
                 frame.reason,
                 wait_ms,
+                shared_request_to_ready_ms,
                 pending_frames - 1,
                 need_repaint,
             );
         }
+
+        Some(FrameReadyDiagnostic {
+            painter_id: self.painter_id,
+            local_frame_id: frame.local_frame_id,
+            wall_logical_frame_id: frame.wall_logical_frame_id,
+            ready_at,
+            wait_ms,
+            need_repaint,
+        })
     }
 
     pub(crate) fn report_memory(&self) -> MemoryReport {
@@ -1257,7 +1329,11 @@ impl Painter {
         self.send_transaction(transaction);
     }
 
-    pub(crate) fn generate_frame_for_script(&mut self, diagnostic_frame_id: u64) {
+    pub(crate) fn generate_frame_for_script(
+        &mut self,
+        diagnostic_frame_id: u64,
+        wall_requested_at: Instant,
+    ) {
         self.frame_delayer.set_pending_frame(true);
 
         if !self.frame_delayer.needs_new_frame() {
@@ -1269,6 +1345,7 @@ impl Painter {
             &mut transaction,
             RenderReasons::SCENE,
             Some(diagnostic_frame_id),
+            Some(wall_requested_at),
         );
         self.send_transaction(transaction);
 

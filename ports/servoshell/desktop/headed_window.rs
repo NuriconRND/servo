@@ -120,20 +120,32 @@ impl HeadedWindow {
         event_loop_proxy: EventLoopProxy<AppEvent>,
         initial_url: Url,
     ) -> Rc<Self> {
-        let no_native_titlebar = servoshell_preferences.no_native_titlebar;
+        let wall_tile_window = servoshell_preferences.wall_layout.is_some();
+        let no_native_titlebar = servoshell_preferences.no_native_titlebar || wall_tile_window;
         let inner_size = servoshell_preferences.initial_window_size;
+        let min_inner_size = if wall_tile_window {
+            LogicalSize::new(inner_size.width, inner_size.height)
+        } else {
+            LogicalSize::new(
+                MIN_WINDOW_INNER_SIZE.width as u32,
+                MIN_WINDOW_INNER_SIZE.height as u32,
+            )
+        };
         let window_attr = winit::window::Window::default_attributes()
             .with_title(INITIAL_WINDOW_TITLE.to_string())
             .with_decorations(!no_native_titlebar)
-            .with_transparent(no_native_titlebar)
+            .with_transparent(no_native_titlebar && !wall_tile_window)
             .with_inner_size(LogicalSize::new(inner_size.width, inner_size.height))
-            .with_min_inner_size(LogicalSize::new(
-                MIN_WINDOW_INNER_SIZE.width,
-                MIN_WINDOW_INNER_SIZE.height,
-            ))
+            .with_resizable(!wall_tile_window)
+            .with_min_inner_size(min_inner_size)
             // Must be invisible at startup; accesskit_winit setup needs to
             // happen before the window is shown for the first time.
             .with_visible(false);
+        let window_attr = if wall_tile_window {
+            window_attr.with_max_inner_size(LogicalSize::new(inner_size.width, inner_size.height))
+        } else {
+            window_attr
+        };
 
         // Set a name so it can be pinned to taskbars in Linux.
         #[cfg(target_os = "linux")]
@@ -150,13 +162,12 @@ impl HeadedWindow {
             winit_window.set_window_icon(Some(load_icon(icon_bytes)));
         }
 
-        if servoshell_preferences.wall_all_tiles
-            && let Some(layout) = &servoshell_preferences.wall_layout
+        if let Some(layout) = &servoshell_preferences.wall_layout
             && let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
             if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
                 info!(
-                    "Positioning wall tile {} on monitor {} at {:?}.",
+                    "Positioning fixed-size wall tile {} on monitor {} at {:?}.",
                     servoshell_preferences.wall_tile_index,
                     tile.monitor,
                     target_monitor.position()
@@ -1107,6 +1118,10 @@ impl PlatformWindow for HeadedWindow {
             );
         }
         self.winit_window.request_redraw();
+    }
+
+    fn repaint_now(&self, state: &RunningAppState, window: &ServoShellWindow) {
+        self.paint_wall_tile_group_for_redraw(state, window);
     }
 
     fn request_resize(&self, _: &WebView, new_outer_size: DeviceIntSize) -> Option<DeviceIntSize> {

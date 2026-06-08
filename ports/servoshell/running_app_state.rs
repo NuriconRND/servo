@@ -194,6 +194,12 @@ pub(crate) struct RunningAppState {
     /// A handle to the Servo instance.
     pub(crate) servo: Servo,
 
+    /// Wakes the platform event loop when Servo reports that a new frame can be presented.
+    event_loop_waker: Box<dyn EventLoopWaker>,
+
+    /// WebViews that currently need periodic embedder event-loop spins for animation.
+    animating_webviews: RefCell<HashMap<WebViewId, bool>>,
+
     /// Whether or not the application has achieved stable image output. This is used
     /// for the `exit_after_stable_image` option.
     pub(crate) achieved_stable_image: Rc<Cell<bool>>,
@@ -245,7 +251,7 @@ impl RunningAppState {
             webdriver_server::start_server(
                 port,
                 embedder_sender,
-                event_loop_waker,
+                event_loop_waker.clone(),
                 default_preferences,
             );
             embedder_receiver
@@ -268,6 +274,8 @@ impl RunningAppState {
             webdriver_receiver,
             servoshell_preferences,
             servo,
+            event_loop_waker,
+            animating_webviews: Default::default(),
             achieved_stable_image: Default::default(),
             exit_scheduled: Default::default(),
             user_content_manager,
@@ -322,6 +330,13 @@ impl RunningAppState {
 
     pub(crate) fn focused_window(&self) -> Option<Rc<ServoShellWindow>> {
         self.focused_window.borrow().clone()
+    }
+
+    pub(crate) fn is_animating(&self) -> bool {
+        self.animating_webviews
+            .borrow()
+            .values()
+            .any(|animating| *animating)
     }
 
     pub(crate) fn focus_window(&self, window: Rc<ServoShellWindow>) {
@@ -456,8 +471,23 @@ impl RunningAppState {
             }
         }
         self.extend_wall_tile_repaint_requests(&mut windows_to_repaint);
-        for window in windows_to_repaint {
-            window.request_repaint();
+        if self.servoshell_preferences.wall_all_tiles {
+            let mut repainted_webviews = Vec::new();
+            for window in windows_to_repaint {
+                let Some(webview) = window.active_webview() else {
+                    window.repaint_now(self);
+                    continue;
+                };
+                if repainted_webviews.contains(&webview.id()) {
+                    continue;
+                }
+                repainted_webviews.push(webview.id());
+                window.repaint_now(self);
+            }
+        } else {
+            for window in windows_to_repaint {
+                window.request_repaint();
+            }
         }
 
         if self.servoshell_preferences.exit_after_stable_image && self.achieved_stable_image.get() {
@@ -838,6 +868,7 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn notify_closed(&self, webview: WebView) {
+        self.animating_webviews.borrow_mut().remove(&webview.id());
         for window in self.windows_for_webview_id(webview.id()) {
             window.close_webview(webview.id());
         }
@@ -902,6 +933,22 @@ impl WebViewDelegate for RunningAppState {
         for window in self.windows_for_webview_id(webview.id()) {
             window.set_needs_repaint();
         }
+        self.event_loop_waker.wake();
+    }
+
+    fn notify_animating_changed(&self, webview: WebView, animating: bool) {
+        self.animating_webviews
+            .borrow_mut()
+            .insert(webview.id(), animating);
+
+        if !animating {
+            return;
+        }
+
+        for window in self.windows_for_webview_id(webview.id()) {
+            window.set_needs_repaint();
+        }
+        self.event_loop_waker.wake();
     }
 
     fn show_embedder_control(&self, webview: WebView, embedder_control: EmbedderControl) {

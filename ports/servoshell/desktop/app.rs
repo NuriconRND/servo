@@ -270,6 +270,18 @@ impl App {
         }
         true
     }
+
+    fn set_control_flow_for_state(&self, event_loop: &ActiveEventLoop) {
+        let is_animating = match &self.state {
+            AppState::Running(state) => state.is_animating(),
+            _ => false,
+        };
+        event_loop.set_control_flow(if is_animating {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
+    }
 }
 
 impl ApplicationHandler<AppEvent> for App {
@@ -305,8 +317,7 @@ impl ApplicationHandler<AppEvent> for App {
         if !self.pump_servo_event_loop(event_loop.into()) {
             event_loop.exit();
         }
-        // Block until the window gets an event
-        event_loop.set_control_flow(ControlFlow::Wait);
+        self.set_control_flow_for_state(event_loop);
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, app_event: AppEvent) {
@@ -326,8 +337,20 @@ impl ApplicationHandler<AppEvent> for App {
             event_loop.exit();
         }
 
-        // Block until the window gets an event
-        event_loop.set_control_flow(ControlFlow::Wait);
+        self.set_control_flow_for_state(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let should_pump = match &self.state {
+            AppState::Running(state) => state.is_animating(),
+            _ => false,
+        };
+        if should_pump && !self.pump_servo_event_loop(event_loop.into()) {
+            event_loop.exit();
+            return;
+        }
+
+        self.set_control_flow_for_state(event_loop);
     }
 }
 

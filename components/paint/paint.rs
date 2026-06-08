@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
 use crossbeam_channel::Sender;
@@ -49,8 +49,14 @@ use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
 use webrender_api::{BuiltDisplayListDescriptor, FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
-use crate::painter::Painter;
+use crate::painter::{FrameReadyDiagnostic, Painter};
 use crate::webview_renderer::UnknownWebView;
+
+const WALL_FRAME_BARRIER_DEADLINE: Duration = Duration::from_millis(16);
+const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
+const WALL_FRAME_DELAY_TARGET_INDEX_ENV: &str = "SERVO_WALL_FRAME_DELAY_TARGET_INDEX";
+const WALL_FRAME_DELAY_AFTER_ENV: &str = "SERVO_WALL_FRAME_DELAY_AFTER";
+const WALL_FRAME_DELAY_COUNT_ENV: &str = "SERVO_WALL_FRAME_DELAY_COUNT";
 
 /// An option to control what kind of WebRender debugging is enabled while Servo is running.
 #[derive(Copy, Clone)]
@@ -95,6 +101,9 @@ pub struct Paint {
 
     /// Logical frame id used to correlate one scene frame across multiple paint targets.
     next_logical_frame_id: Cell<u64>,
+
+    /// Software barrier diagnostics for wall frames that fan out to multiple paint targets.
+    wall_frame_coordinator: RefCell<WallFrameCoordinator>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -146,6 +155,515 @@ pub struct Paint {
     /// An map of external images shared between all `WebGpuExternalImages`.
     #[cfg(feature = "webgpu")]
     webgpu_image_map: std::cell::OnceCell<WebGpuExternalImageMap>,
+}
+
+#[derive(Default)]
+struct WallFrameCoordinator {
+    barriers: HashMap<u64, WallFrameBarrier>,
+    keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
+    delay_injection: Option<WallFrameDelayInjection>,
+}
+
+struct KeepPreviousFrame {
+    logical_frame_id: u64,
+    remove_after_skip_query: bool,
+}
+
+struct WallFrameDelayInjection {
+    target_index: usize,
+    after_logical_frame_id: u64,
+    remaining_frames: u64,
+}
+
+struct WallFrameBarrier {
+    expected_painter_ids: Vec<PainterId>,
+    ready_painter_ids: Vec<PainterId>,
+    requested_at: Instant,
+    first_ready_at: Option<Instant>,
+    completed_at: Option<Instant>,
+    missed_deadline: bool,
+    presentation_decision_made: bool,
+    need_repaint: bool,
+    injected_delayed_painter_id: Option<PainterId>,
+    injected_ready_suppressed: bool,
+}
+
+struct WallFrameRepaintDecision {
+    painter_id: PainterId,
+    repaint_needed: bool,
+}
+
+impl WallFrameBarrier {
+    fn new(
+        expected_painter_ids: Vec<PainterId>,
+        requested_at: Instant,
+        injected_delayed_painter_id: Option<PainterId>,
+    ) -> Self {
+        Self {
+            expected_painter_ids,
+            ready_painter_ids: Vec::new(),
+            requested_at,
+            first_ready_at: None,
+            completed_at: None,
+            missed_deadline: false,
+            presentation_decision_made: false,
+            need_repaint: false,
+            injected_delayed_painter_id,
+            injected_ready_suppressed: false,
+        }
+    }
+
+    fn deadline_at(&self) -> Option<Instant> {
+        self.first_ready_at
+            .map(|first_ready_at| first_ready_at + WALL_FRAME_BARRIER_DEADLINE)
+    }
+
+    fn missing_painter_ids(&self) -> Vec<PainterId> {
+        self.expected_painter_ids
+            .iter()
+            .copied()
+            .filter(|painter_id| !self.ready_painter_ids.contains(painter_id))
+            .collect()
+    }
+
+    fn missed_deadline_at(&self, now: Instant) -> bool {
+        self.deadline_at()
+            .is_some_and(|deadline_at| now >= deadline_at)
+    }
+}
+
+impl WallFrameDelayInjection {
+    fn from_environment() -> Option<Self> {
+        let Ok(target_index) = env::var(WALL_FRAME_DELAY_TARGET_INDEX_ENV) else {
+            return None;
+        };
+
+        let target_index = match target_index.parse::<usize>() {
+            Ok(target_index) => target_index,
+            Err(error) => {
+                warn!(
+                    "Ignoring wall frame delay injection: {WALL_FRAME_DELAY_TARGET_INDEX_ENV} \
+                     must be a zero-based target index ({error})"
+                );
+                return None;
+            },
+        };
+
+        let after_logical_frame_id =
+            Self::parse_optional_u64(WALL_FRAME_DELAY_AFTER_ENV).unwrap_or(1);
+        let remaining_frames = Self::parse_optional_u64(WALL_FRAME_DELAY_COUNT_ENV).unwrap_or(1);
+        if remaining_frames == 0 {
+            warn!("Ignoring wall frame delay injection: {WALL_FRAME_DELAY_COUNT_ENV} must be > 0");
+            return None;
+        }
+
+        warn!(
+            "Wall frame delay injection enabled: target_index={} after_logical_frame_id={} \
+             frame_count={}",
+            target_index, after_logical_frame_id, remaining_frames
+        );
+
+        Some(Self {
+            target_index,
+            after_logical_frame_id,
+            remaining_frames,
+        })
+    }
+
+    fn parse_optional_u64(env_name: &str) -> Option<u64> {
+        let value = env::var(env_name).ok()?;
+        match value.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!("Ignoring invalid {env_name}={value:?}: expected unsigned integer ({error})");
+                None
+            },
+        }
+    }
+
+    fn target_for_frame(
+        &mut self,
+        logical_frame_id: u64,
+        expected_painter_ids: &[PainterId],
+    ) -> Option<PainterId> {
+        if self.remaining_frames == 0 || logical_frame_id < self.after_logical_frame_id {
+            return None;
+        }
+
+        let Some(painter_id) = expected_painter_ids.get(self.target_index).copied() else {
+            warn!(
+                "Disabling wall frame delay injection: target_index={} is outside expected \
+                 paint targets {:?}",
+                self.target_index, expected_painter_ids
+            );
+            self.remaining_frames = 0;
+            return None;
+        };
+
+        self.remaining_frames -= 1;
+        Some(painter_id)
+    }
+}
+
+impl WallFrameCoordinator {
+    fn from_environment() -> Self {
+        Self {
+            delay_injection: WallFrameDelayInjection::from_environment(),
+            ..Default::default()
+        }
+    }
+
+    fn register_frame(
+        &mut self,
+        logical_frame_id: u64,
+        expected_painter_ids: Vec<PainterId>,
+        requested_at: Instant,
+    ) {
+        if expected_painter_ids.len() <= 1 {
+            return;
+        }
+
+        let injected_delayed_painter_id = self.delay_injection.as_mut().and_then(|injection| {
+            injection.target_for_frame(logical_frame_id, &expected_painter_ids)
+        });
+        if let Some(injected_delayed_painter_id) = injected_delayed_painter_id {
+            warn!(
+                "Wall frame delay injection scheduled: logical_frame_id={} delayed_painter={:?} \
+                 expected={:?}",
+                logical_frame_id, injected_delayed_painter_id, expected_painter_ids
+            );
+        }
+
+        if self
+            .barriers
+            .insert(
+                logical_frame_id,
+                WallFrameBarrier::new(
+                    expected_painter_ids.clone(),
+                    requested_at,
+                    injected_delayed_painter_id,
+                ),
+            )
+            .is_some()
+        {
+            warn!(
+                "Replacing existing wall frame barrier for logical_frame_id={logical_frame_id}; \
+                 expected={expected_painter_ids:?}"
+            );
+        }
+    }
+
+    fn note_frame_ready(
+        &mut self,
+        diagnostic: &FrameReadyDiagnostic,
+    ) -> Option<Vec<WallFrameRepaintDecision>> {
+        let Some(logical_frame_id) = diagnostic.wall_logical_frame_id else {
+            return None;
+        };
+
+        if !self.barriers.contains_key(&logical_frame_id) {
+            debug!(
+                "Ignoring wall frame barrier readiness for unregistered logical_frame_id={} \
+                 painter={:?} local_frame_id={}",
+                logical_frame_id, diagnostic.painter_id, diagnostic.local_frame_id
+            );
+            return None;
+        }
+
+        let mut repaint_decisions = Vec::new();
+        let missed_before_recording_ready =
+            self.barriers.get(&logical_frame_id).is_some_and(|barrier| {
+                !barrier.presentation_decision_made
+                    && barrier.missed_deadline_at(diagnostic.ready_at)
+            });
+        if missed_before_recording_ready {
+            repaint_decisions.extend(self.miss_barrier(logical_frame_id, diagnostic.ready_at));
+        }
+
+        let mut complete_before_deadline = false;
+        {
+            let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
+                return Some(repaint_decisions);
+            };
+
+            if !barrier
+                .expected_painter_ids
+                .contains(&diagnostic.painter_id)
+            {
+                warn!(
+                    "Ignoring wall frame barrier readiness for unexpected target: \
+                     logical_frame_id={} painter={:?} expected={:?}",
+                    logical_frame_id, diagnostic.painter_id, barrier.expected_painter_ids
+                );
+                return Some(repaint_decisions);
+            }
+
+            if barrier.injected_delayed_painter_id == Some(diagnostic.painter_id)
+                && !barrier.injected_ready_suppressed
+            {
+                barrier.injected_ready_suppressed = true;
+                warn!(
+                    "Wall frame delay injection: logical_frame_id={} painter={:?} \
+                     local_frame_id={} ready withheld from barrier \
+                     policy=simulate-delayed-renderer",
+                    logical_frame_id, diagnostic.painter_id, diagnostic.local_frame_id
+                );
+                return Some(repaint_decisions);
+            }
+
+            if !barrier.ready_painter_ids.contains(&diagnostic.painter_id) {
+                barrier.ready_painter_ids.push(diagnostic.painter_id);
+            }
+            barrier.need_repaint |= diagnostic.need_repaint;
+            if barrier.first_ready_at.is_none() {
+                barrier.first_ready_at = Some(diagnostic.ready_at);
+            }
+
+            if barrier.ready_painter_ids.len() == barrier.expected_painter_ids.len() {
+                barrier.completed_at = Some(diagnostic.ready_at);
+                if barrier.missed_deadline {
+                    let first_to_all_ready_ms = barrier
+                        .first_ready_at
+                        .map(|first_ready_at| {
+                            diagnostic
+                                .ready_at
+                                .saturating_duration_since(first_ready_at)
+                                .as_secs_f64()
+                                * 1000.0
+                        })
+                        .unwrap_or_default();
+                    let request_to_all_ready_ms = diagnostic
+                        .ready_at
+                        .saturating_duration_since(barrier.requested_at)
+                        .as_secs_f64()
+                        * 1000.0;
+
+                    info!(
+                        "Wall frame barrier complete: logical_frame_id={} \
+                         status=completed_after_deadline ready={}/{} \
+                         first_to_all_ready_ms={:.3} request_to_all_ready_ms={:.3} \
+                         final_painter={:?} final_local_frame_id={} final_wait_ms={:.3} \
+                         need_repaint={} policy=keep-previous-frame-for-delayed-targets",
+                        logical_frame_id,
+                        barrier.ready_painter_ids.len(),
+                        barrier.expected_painter_ids.len(),
+                        first_to_all_ready_ms,
+                        request_to_all_ready_ms,
+                        diagnostic.painter_id,
+                        diagnostic.local_frame_id,
+                        diagnostic.wait_ms,
+                        barrier.need_repaint,
+                    );
+                } else if !barrier.presentation_decision_made {
+                    complete_before_deadline = true;
+                }
+            } else if !barrier.presentation_decision_made {
+                debug!(
+                    "Wall frame barrier progress: logical_frame_id={} ready={}/{} \
+                     painter={:?} local_frame_id={} wait_ms={:.3} missing={:?}",
+                    logical_frame_id,
+                    barrier.ready_painter_ids.len(),
+                    barrier.expected_painter_ids.len(),
+                    diagnostic.painter_id,
+                    diagnostic.local_frame_id,
+                    diagnostic.wait_ms,
+                    barrier.missing_painter_ids(),
+                );
+            }
+        }
+
+        if complete_before_deadline {
+            repaint_decisions.extend(self.complete_barrier(logical_frame_id, diagnostic));
+        }
+
+        Some(repaint_decisions)
+    }
+
+    fn complete_barrier(
+        &mut self,
+        logical_frame_id: u64,
+        diagnostic: &FrameReadyDiagnostic,
+    ) -> Vec<WallFrameRepaintDecision> {
+        let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
+            return Vec::new();
+        };
+        if barrier.presentation_decision_made {
+            return Vec::new();
+        }
+
+        barrier.presentation_decision_made = true;
+        barrier.completed_at = Some(diagnostic.ready_at);
+        let painter_ids = barrier.expected_painter_ids.clone();
+        let repaint_needed = barrier.need_repaint;
+        let ready_len = barrier.ready_painter_ids.len();
+        let expected_len = barrier.expected_painter_ids.len();
+        let first_to_all_ready_ms = barrier
+            .first_ready_at
+            .map(|first_ready_at| {
+                diagnostic
+                    .ready_at
+                    .saturating_duration_since(first_ready_at)
+                    .as_secs_f64()
+                    * 1000.0
+            })
+            .unwrap_or_default();
+        let request_to_all_ready_ms = diagnostic
+            .ready_at
+            .saturating_duration_since(barrier.requested_at)
+            .as_secs_f64()
+            * 1000.0;
+
+        for painter_id in &painter_ids {
+            if self
+                .keep_previous_painters
+                .get(painter_id)
+                .is_some_and(|frame| frame.remove_after_skip_query)
+            {
+                continue;
+            }
+            self.keep_previous_painters.remove(painter_id);
+        }
+
+        info!(
+            "Wall frame barrier complete: logical_frame_id={} status=completed_before_deadline \
+             ready={}/{} first_to_all_ready_ms={:.3} request_to_all_ready_ms={:.3} \
+             final_painter={:?} final_local_frame_id={} final_wait_ms={:.3} \
+             need_repaint={} policy=present-current-frame",
+            logical_frame_id,
+            ready_len,
+            expected_len,
+            first_to_all_ready_ms,
+            request_to_all_ready_ms,
+            diagnostic.painter_id,
+            diagnostic.local_frame_id,
+            diagnostic.wait_ms,
+            repaint_needed,
+        );
+
+        painter_ids
+            .into_iter()
+            .map(|painter_id| WallFrameRepaintDecision {
+                painter_id,
+                repaint_needed,
+            })
+            .collect()
+    }
+
+    fn miss_barrier(
+        &mut self,
+        logical_frame_id: u64,
+        now: Instant,
+    ) -> Vec<WallFrameRepaintDecision> {
+        let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
+            return Vec::new();
+        };
+        if barrier.presentation_decision_made {
+            return Vec::new();
+        }
+
+        barrier.missed_deadline = true;
+        barrier.presentation_decision_made = true;
+        let ready_painter_ids = barrier.ready_painter_ids.clone();
+        let missing_painter_ids = barrier.missing_painter_ids();
+        let ready_len = barrier.ready_painter_ids.len();
+        let expected_len = barrier.expected_painter_ids.len();
+        let repaint_needed = barrier.need_repaint;
+        let first_ready_elapsed_ms = barrier
+            .first_ready_at
+            .map(|first_ready_at| {
+                now.saturating_duration_since(first_ready_at).as_secs_f64() * 1000.0
+            })
+            .unwrap_or_default();
+
+        for painter_id in &ready_painter_ids {
+            self.keep_previous_painters.remove(painter_id);
+        }
+        for painter_id in &missing_painter_ids {
+            let remove_after_skip_query = barrier.injected_delayed_painter_id == Some(*painter_id);
+            self.keep_previous_painters.insert(
+                *painter_id,
+                KeepPreviousFrame {
+                    logical_frame_id,
+                    remove_after_skip_query,
+                },
+            );
+            if remove_after_skip_query {
+                warn!(
+                    "Wall frame delay injection: armed keep-previous skip observation for \
+                     painter={:?} logical_frame_id={}",
+                    painter_id, logical_frame_id
+                );
+            }
+        }
+
+        warn!(
+            "Wall frame barrier missed: logical_frame_id={} ready={}/{} missing={:?} \
+             first_ready_elapsed_ms={:.3} deadline_ms={:.3} \
+             need_repaint={} policy=keep-previous-frame-for-delayed-targets",
+            logical_frame_id,
+            ready_len,
+            expected_len,
+            missing_painter_ids,
+            first_ready_elapsed_ms,
+            WALL_FRAME_BARRIER_DEADLINE.as_secs_f64() * 1000.0,
+            repaint_needed,
+        );
+
+        ready_painter_ids
+            .into_iter()
+            .map(|painter_id| WallFrameRepaintDecision {
+                painter_id,
+                repaint_needed,
+            })
+            .collect()
+    }
+
+    fn sweep_expired_barriers(&mut self, now: Instant) -> Vec<WallFrameRepaintDecision> {
+        let expired_logical_frame_ids: Vec<_> = self
+            .barriers
+            .iter()
+            .filter_map(|(logical_frame_id, barrier)| {
+                (!barrier.presentation_decision_made && barrier.missed_deadline_at(now))
+                    .then_some(*logical_frame_id)
+            })
+            .collect();
+
+        let mut repaint_decisions = Vec::new();
+        for logical_frame_id in expired_logical_frame_ids {
+            repaint_decisions.extend(self.miss_barrier(logical_frame_id, now));
+        }
+
+        self.barriers.retain(|_, barrier| {
+            if let Some(completed_at) = barrier.completed_at {
+                return now.saturating_duration_since(completed_at) <= WALL_FRAME_BARRIER_RETENTION;
+            }
+
+            if barrier.missed_deadline {
+                return barrier.first_ready_at.is_some_and(|first_ready_at| {
+                    now.saturating_duration_since(first_ready_at) <= WALL_FRAME_BARRIER_RETENTION
+                });
+            }
+
+            true
+        });
+
+        repaint_decisions
+    }
+
+    fn keep_previous_logical_frame(&mut self, painter_id: PainterId) -> Option<u64> {
+        let keep_previous_frame = self.keep_previous_painters.get(&painter_id)?;
+        let logical_frame_id = keep_previous_frame.logical_frame_id;
+        let remove_after_skip_query = keep_previous_frame.remove_after_skip_query;
+        if remove_after_skip_query {
+            self.keep_previous_painters.remove(&painter_id);
+            warn!(
+                "Wall frame delay injection: consumed keep-previous skip observation for \
+                 painter={:?} logical_frame_id={}",
+                painter_id, logical_frame_id
+            );
+        }
+        Some(logical_frame_id)
+    }
 }
 
 /// Why we need to be repainted. This is used for debugging.
@@ -227,6 +745,7 @@ impl Paint {
             webgpu_image_map: Default::default(),
             webview_painter_targets: Default::default(),
             next_logical_frame_id: Default::default(),
+            wall_frame_coordinator: RefCell::new(WallFrameCoordinator::from_environment()),
         }))
     }
 
@@ -351,6 +870,77 @@ impl Paint {
             .unwrap_or_else(|| vec![source_painter_id])
     }
 
+    fn source_webview_id_for_primary_painter(
+        &self,
+        source_painter_id: PainterId,
+    ) -> Option<WebViewId> {
+        self.webview_painter_targets
+            .borrow()
+            .iter()
+            .find_map(|(webview_id, target_painter_ids)| {
+                (target_painter_ids.first().copied() == Some(source_painter_id))
+                    .then_some(*webview_id)
+            })
+    }
+
+    fn log_wall_frame_metadata(
+        &self,
+        logical_frame_id: u64,
+        wall_webview_targets: &[(WebViewId, Vec<PainterId>)],
+    ) {
+        for (webview_id, target_painter_ids) in wall_webview_targets {
+            let mut snapshots = Vec::new();
+            let mut missing_targets = Vec::new();
+            for painter_id in target_painter_ids {
+                let Some(painter) = self.maybe_painter(*painter_id) else {
+                    missing_targets.push(format!("{painter_id:?}:missing-painter"));
+                    continue;
+                };
+
+                let Some(signature) = painter.wall_scroll_offsets_signature(*webview_id) else {
+                    missing_targets.push(format!("{painter_id:?}:missing-webview"));
+                    continue;
+                };
+                snapshots.push((*painter_id, signature));
+            }
+
+            let mut unique_signatures = Vec::new();
+            for (_, signature) in &snapshots {
+                if !unique_signatures.contains(signature) {
+                    unique_signatures.push(signature.clone());
+                }
+            }
+
+            if missing_targets.is_empty() && unique_signatures.len() <= 1 {
+                let scroll_signature = unique_signatures
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("<no-scroll-tree>");
+                info!(
+                    "Wall frame metadata: logical_frame_id={} webview={:?} target_count={} \
+                     scroll_offsets=matched scroll_signature=\"{}\" targets={:?} \
+                     timestamp_source=single-script-update",
+                    logical_frame_id,
+                    webview_id,
+                    target_painter_ids.len(),
+                    scroll_signature,
+                    target_painter_ids,
+                );
+            } else {
+                warn!(
+                    "Wall frame metadata mismatch: logical_frame_id={} webview={:?} \
+                     target_count={} scroll_offsets=mismatched snapshots={:?} \
+                     missing_targets={:?} timestamp_source=single-script-update",
+                    logical_frame_id,
+                    webview_id,
+                    target_painter_ids.len(),
+                    snapshots,
+                    missing_targets,
+                );
+            }
+        }
+    }
+
     fn for_each_webview_painter_mut(
         &self,
         webview_id: WebViewId,
@@ -449,6 +1039,55 @@ impl Paint {
             .iter()
             .flat_map(|painter| painter.borrow().webviews_needing_repaint())
             .collect()
+    }
+
+    fn record_painter_ready_for_repaint(
+        frame_ready_for_painter: &mut HashMap<PainterId, bool>,
+        painter_id: PainterId,
+        repaint_needed: bool,
+    ) {
+        *frame_ready_for_painter
+            .entry(painter_id)
+            .or_insert(repaint_needed) |= repaint_needed;
+    }
+
+    fn record_wall_frame_repaint_decisions(
+        frame_ready_for_painter: &mut HashMap<PainterId, bool>,
+        decisions: Vec<WallFrameRepaintDecision>,
+    ) {
+        for decision in decisions {
+            Self::record_painter_ready_for_repaint(
+                frame_ready_for_painter,
+                decision.painter_id,
+                decision.repaint_needed,
+            );
+        }
+    }
+
+    fn handle_painters_ready_for_repaint(&self, frame_ready_for_painter: HashMap<PainterId, bool>) {
+        for (painter_id, repaint_needed) in frame_ready_for_painter {
+            if let Some(painter) = self.maybe_painter(painter_id) {
+                painter.handle_new_webrender_frame_ready(repaint_needed);
+            }
+        }
+    }
+
+    pub fn paint_target_keep_previous_logical_frame(
+        &self,
+        webview_id: WebViewId,
+        painter_id: PainterId,
+    ) -> Option<u64> {
+        if !self.webview_has_painter_target(webview_id, painter_id) {
+            warn!(
+                "Ignoring keep-previous query for unregistered paint target {painter_id:?} \
+                 of {webview_id:?}"
+            );
+            return None;
+        }
+
+        self.wall_frame_coordinator
+            .borrow_mut()
+            .keep_previous_logical_frame(painter_id)
     }
 
     pub fn finish_shutting_down(&self) {
@@ -573,19 +1212,44 @@ impl Paint {
             },
             PaintMessage::GenerateFrame(painter_ids) => {
                 let mut target_painter_ids = Vec::new();
+                let mut wall_webview_targets = Vec::new();
                 for painter_id in painter_ids {
-                    for target_painter_id in self.target_painter_ids_for_source_painter(painter_id)
-                    {
+                    let targets_for_source = self.target_painter_ids_for_source_painter(painter_id);
+                    if targets_for_source.len() > 1 {
+                        if let Some(webview_id) =
+                            self.source_webview_id_for_primary_painter(painter_id)
+                        {
+                            if !wall_webview_targets
+                                .iter()
+                                .any(|(existing_webview_id, _)| *existing_webview_id == webview_id)
+                            {
+                                wall_webview_targets.push((webview_id, targets_for_source.clone()));
+                            }
+                        } else {
+                            warn!(
+                                "Could not resolve source WebViewId for wall frame source painter \
+                                 {painter_id:?}; scroll metadata comparison skipped"
+                            );
+                        }
+                    }
+                    for target_painter_id in targets_for_source {
                         if !target_painter_ids.contains(&target_painter_id) {
                             target_painter_ids.push(target_painter_id);
                         }
                     }
                 }
+                let wall_frame_requested_at = Instant::now();
                 let logical_frame_id = self.next_logical_frame_id();
                 if target_painter_ids.len() > 1 {
                     info!(
                         "Wall logical frame {logical_frame_id} fan-out to paint targets \
                          {target_painter_ids:?}"
+                    );
+                    self.log_wall_frame_metadata(logical_frame_id, &wall_webview_targets);
+                    self.wall_frame_coordinator.borrow_mut().register_frame(
+                        logical_frame_id,
+                        target_painter_ids.clone(),
+                        wall_frame_requested_at,
                     );
                 } else {
                     debug!(
@@ -595,7 +1259,8 @@ impl Paint {
                 }
                 for painter_id in target_painter_ids {
                     if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                        painter.generate_frame_for_script(logical_frame_id);
+                        painter
+                            .generate_frame_for_script(logical_frame_id, wall_frame_requested_at);
                     }
                 }
             },
@@ -984,14 +1649,20 @@ impl Paint {
         // at the end of this function. This prevents overdraw when more than a single message of
         // this type of received. In addition, if any of these frames need a repaint, that reflected
         // when calling `handle_new_webrender_frame_ready`.
-        let mut saw_webrender_frame_ready_for_painter = HashMap::new();
+        let mut frame_ready_for_painter = HashMap::new();
+        let mut frame_ready_diagnostics = Vec::new();
         messages.retain(|message| match message {
             PaintMessage::NewWebRenderFrameReady(painter_id, _document_id, need_repaint) => {
                 if let Some(painter) = self.maybe_painter(*painter_id) {
-                    painter.note_webrender_frame_ready(*need_repaint);
-                    *saw_webrender_frame_ready_for_painter
-                        .entry(*painter_id)
-                        .or_insert(*need_repaint) |= *need_repaint;
+                    if let Some(diagnostic) = painter.note_webrender_frame_ready(*need_repaint) {
+                        frame_ready_diagnostics.push(diagnostic);
+                    } else {
+                        Self::record_painter_ready_for_repaint(
+                            &mut frame_ready_for_painter,
+                            *painter_id,
+                            *need_repaint,
+                        );
+                    }
                 }
 
                 false
@@ -1006,11 +1677,28 @@ impl Paint {
             }
         }
 
-        for (painter_id, repaint_needed) in saw_webrender_frame_ready_for_painter.iter() {
-            if let Some(painter) = self.maybe_painter(*painter_id) {
-                painter.handle_new_webrender_frame_ready(*repaint_needed);
+        {
+            let mut wall_frame_coordinator = self.wall_frame_coordinator.borrow_mut();
+            for diagnostic in &frame_ready_diagnostics {
+                match wall_frame_coordinator.note_frame_ready(diagnostic) {
+                    Some(decisions) => Self::record_wall_frame_repaint_decisions(
+                        &mut frame_ready_for_painter,
+                        decisions,
+                    ),
+                    None => Self::record_painter_ready_for_repaint(
+                        &mut frame_ready_for_painter,
+                        diagnostic.painter_id,
+                        diagnostic.need_repaint,
+                    ),
+                }
             }
+            Self::record_wall_frame_repaint_decisions(
+                &mut frame_ready_for_painter,
+                wall_frame_coordinator.sweep_expired_barriers(Instant::now()),
+            );
         }
+
+        self.handle_painters_ready_for_repaint(frame_ready_for_painter);
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -1026,6 +1714,17 @@ impl Paint {
         for painter in &self.painters {
             painter.borrow_mut().perform_updates();
         }
+
+        let wall_frame_repaint_decisions = self
+            .wall_frame_coordinator
+            .borrow_mut()
+            .sweep_expired_barriers(Instant::now());
+        let mut frame_ready_for_painter = HashMap::new();
+        Self::record_wall_frame_repaint_decisions(
+            &mut frame_ready_for_painter,
+            wall_frame_repaint_decisions,
+        );
+        self.handle_painters_ready_for_repaint(frame_ready_for_painter);
 
         self.shutdown_state() != ShutdownState::FinishedShuttingDown
     }

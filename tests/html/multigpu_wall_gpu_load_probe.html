@@ -1,0 +1,285 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Motion Probe</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #080b12;
+    color: #eef4ff;
+    font-family: Arial, sans-serif;
+  }
+
+  .wall {
+    position: relative;
+    width: 3840px;
+    height: 1080px;
+    overflow: hidden;
+    background:
+      linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px) 0 0 / 120px 120px,
+      linear-gradient(0deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px) 0 0 / 120px 120px,
+      radial-gradient(circle at 25% 44%, #16406c 0, transparent 28%),
+      radial-gradient(circle at 75% 48%, #5b243f 0, transparent 28%),
+      #080b12;
+  }
+
+  .tile {
+    position: absolute;
+    top: 0;
+    width: 1920px;
+    height: 1080px;
+    overflow: hidden;
+  }
+
+  .tile.left {
+    left: 0;
+  }
+
+  .tile.right {
+    left: 1920px;
+  }
+
+  .motion-canvas {
+    position: absolute;
+    inset: 0;
+    width: 1920px;
+    height: 1080px;
+  }
+
+  .sweeper {
+    position: absolute;
+    left: -420px;
+    top: 430px;
+    width: 2760px;
+    height: 170px;
+    background: repeating-linear-gradient(
+      90deg,
+      rgba(84, 211, 255, 0.72) 0 90px,
+      rgba(255, 92, 140, 0.70) 90px 180px,
+      rgba(255, 222, 89, 0.70) 180px 270px
+    );
+    filter: saturate(1.3);
+    mix-blend-mode: screen;
+    transform-origin: center;
+    animation: sweep 1.15s linear infinite;
+  }
+
+  .sweeper.alt {
+    top: 210px;
+    height: 120px;
+    opacity: 0.7;
+    animation-duration: 0.88s;
+    animation-direction: reverse;
+  }
+
+  .sweeper.low {
+    top: 760px;
+    height: 115px;
+    opacity: 0.56;
+    animation-duration: 1.35s;
+  }
+
+  .panel {
+    position: absolute;
+    width: 440px;
+    height: 220px;
+    border: 2px solid rgba(255, 255, 255, 0.28);
+    background:
+      linear-gradient(135deg, rgba(84, 211, 255, 0.20), rgba(255, 92, 140, 0.10)),
+      repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.18) 0 4px, transparent 4px 22px);
+    box-shadow: 0 16px 46px rgba(0, 0, 0, 0.28);
+    mix-blend-mode: screen;
+    animation: panel-scan 1.8s ease-in-out infinite alternate;
+  }
+
+  .tile.right .panel {
+    animation-direction: alternate-reverse;
+  }
+
+  .marker {
+    position: absolute;
+    width: 150px;
+    height: 150px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 222, 89, 0.62);
+    background: radial-gradient(circle, rgba(255, 222, 89, 0.35), rgba(255, 92, 140, 0.04));
+    box-shadow: 0 0 34px rgba(255, 222, 89, 0.42);
+    animation: marker-run 1.2s linear infinite;
+  }
+
+  .tile.right .marker {
+    animation-direction: reverse;
+  }
+
+  .tile-label {
+    position: absolute;
+    top: 28px;
+    left: 28px;
+    padding: 14px 18px;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(0, 0, 0, 0.42);
+    font-size: 24px;
+    font-weight: 700;
+  }
+
+  .stats {
+    position: absolute;
+    left: 28px;
+    bottom: 28px;
+    min-width: 470px;
+    padding: 16px 18px;
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    background: rgba(0, 0, 0, 0.50);
+    font: 20px Consolas, monospace;
+  }
+
+  .divider {
+    position: absolute;
+    left: 1920px;
+    top: 0;
+    width: 4px;
+    height: 1080px;
+    background: #ffde59;
+    box-shadow: 0 0 30px #ffde59;
+  }
+
+  @keyframes sweep {
+    from {
+      transform: translateX(0) rotate(-3deg);
+    }
+
+    to {
+      transform: translateX(460px) rotate(3deg);
+    }
+  }
+
+  @keyframes panel-scan {
+    from {
+      transform: translate3d(-160px, -85px, 0) rotate(-8deg);
+    }
+
+    to {
+      transform: translate3d(160px, 85px, 0) rotate(8deg);
+    }
+  }
+
+  @keyframes marker-run {
+    from {
+      transform: translate3d(-260px, -120px, 0) scale(0.92);
+    }
+
+    to {
+      transform: translate3d(2040px, 120px, 0) scale(1.08);
+    }
+  }
+</style>
+<div class="wall">
+  <section class="tile left" data-tile="0">
+    <canvas class="motion-canvas" width="1920" height="1080"></canvas>
+    <div class="sweeper"></div>
+    <div class="sweeper alt"></div>
+    <div class="sweeper low"></div>
+    <div class="tile-label">TILE 0 / GPU 0 / DISPLAY1</div>
+    <div class="stats" id="stats-left">left frames=0</div>
+  </section>
+  <section class="tile right" data-tile="1">
+    <canvas class="motion-canvas" width="1920" height="1080"></canvas>
+    <div class="sweeper"></div>
+    <div class="sweeper alt"></div>
+    <div class="sweeper low"></div>
+    <div class="tile-label">TILE 1 / GPU 1 / DISPLAY9</div>
+    <div class="stats" id="stats-right">right frames=0</div>
+  </section>
+  <div class="divider"></div>
+</div>
+<script>
+  const tiles = [...document.querySelectorAll(".tile")].map((tile, tileIndex) => ({
+    tile,
+    tileIndex,
+    canvas: tile.querySelector("canvas"),
+    stats: tile.querySelector(".stats"),
+  }));
+
+  for (const { tile, tileIndex } of tiles) {
+    for (let i = 0; i < 12; i++) {
+      const panel = document.createElement("div");
+      panel.className = "panel";
+      panel.style.left = `${110 + (i % 4) * 440}px`;
+      panel.style.top = `${120 + Math.floor(i / 4) * 280}px`;
+      panel.style.animationDelay = `${(i % 7) * -0.13 - tileIndex * 0.09}s`;
+      tile.appendChild(panel);
+    }
+
+    for (let i = 0; i < 10; i++) {
+      const marker = document.createElement("div");
+      marker.className = "marker";
+      marker.style.left = `${-80 + i * 210}px`;
+      marker.style.top = `${120 + ((i * 97 + tileIndex * 180) % 760)}px`;
+      marker.style.animationDelay = `${i * -0.11 - tileIndex * 0.17}s`;
+      tile.appendChild(marker);
+    }
+  }
+
+  let frame = 0;
+
+  function drawTile(tileState, now) {
+    const { canvas, stats, tileIndex } = tileState;
+    const ctx = canvas.getContext("2d");
+    const phase = now * 0.001 + tileIndex * 1.3;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    for (let band = 0; band < 14; band++) {
+      const x = ((band * 220 + phase * (tileIndex ? -620 : 620)) % 2420) - 250;
+      const y = 70 + ((band * 103 + Math.sin(phase * 2.4 + band) * 90) % 920);
+      const grad = ctx.createLinearGradient(x, y, x + 620, y + 260);
+      grad.addColorStop(0, `hsla(${(band * 41 + frame * 4 + tileIndex * 70) % 360}, 86%, 62%, 0.64)`);
+      grad.addColorStop(1, `hsla(${(band * 41 + 150 + frame * 4) % 360}, 86%, 62%, 0.07)`);
+      ctx.fillStyle = grad;
+      ctx.save();
+      ctx.translate(x + 310, y + 130);
+      ctx.rotate(Math.sin(phase * 1.2 + band) * 0.55);
+      ctx.fillRect(-310, -130, 620, 260);
+      ctx.restore();
+    }
+
+    ctx.globalCompositeOperation = "lighter";
+    for (let i = 0; i < 70; i++) {
+      const dir = tileIndex ? -1 : 1;
+      const x = (i * 91 + Math.sin(phase * 3.7 + i) * 360 + phase * 520 * dir + 2300) % 1920;
+      const y = 45 + ((i * 71 + Math.cos(phase * 3.2 + i) * 250) % 1035);
+      ctx.fillStyle = `hsla(${(i * 11 + frame * 7 + tileIndex * 120) % 360}, 95%, 66%, 0.46)`;
+      ctx.beginPath();
+      ctx.arc(x, y, 18 + (i % 5) * 7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = "source-over";
+
+    for (let i = 0; i < 12; i++) {
+      const dir = tileIndex ? -1 : 1;
+      const x = (i * 170 + Math.cos(phase * 4.1 + i) * 300 + frame * 14 * dir + 2600) % 1920;
+      const y = 90 + ((i * 103 + Math.sin(phase * 3.5 + i) * 230) % 900);
+      ctx.strokeStyle = `hsla(${(i * 23 + frame * 8 + tileIndex * 90) % 360}, 90%, 72%, 0.62)`;
+      ctx.lineWidth = 6 + (i % 4);
+      ctx.beginPath();
+      ctx.moveTo(x - 210, y - 110);
+      ctx.bezierCurveTo(x - 55, y + 210, x + 90, y - 220, x + 240, y + 120);
+      ctx.stroke();
+    }
+
+    stats.textContent = `${tileIndex ? "right" : "left"} motion frames=${frame} time=${Math.round(now)}`;
+  }
+
+  function draw(now) {
+    frame += 1;
+    for (const tileState of tiles) {
+      drawTile(tileState, now);
+    }
+    requestAnimationFrame(draw);
+  }
+
+  requestAnimationFrame(draw);
+</script>

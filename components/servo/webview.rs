@@ -730,6 +730,17 @@ impl WebView {
             .render_paint_target(self.id(), target.painter_id);
     }
 
+    /// Returns the wall logical frame id for which this target should keep its previous frame.
+    pub fn paint_target_keep_previous_logical_frame(
+        &self,
+        target: WebViewPaintTarget,
+    ) -> Option<u64> {
+        self.inner()
+            .servo
+            .paint()
+            .paint_target_keep_previous_logical_frame(self.id(), target.painter_id)
+    }
+
     /// Update the rendering context and viewport metadata for one registered paint target.
     pub fn update_paint_target(
         &self,
