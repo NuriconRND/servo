@@ -19,6 +19,7 @@
 *.swp
 *.swo
 *.csv
+servoshell_wall_*.log
 *.rej
 *.orig
 .coverage
@@ -66,6 +67,10 @@ Sessionx.vim
 
 /unminified-js
 /unminified-css
+
+# Local multi-GPU wall tooling outputs
+/etc/multigpu/tools/topology_probe/target/
+/etc/multigpu/tools/wall_perf_analyzer/__pycache__/
 
 # Layout debugger trace files
 layout_trace*
