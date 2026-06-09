@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use glib::BoolError;
 use gstreamer;
 use gstreamer::prelude::*;
+use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
 use servo_media_streams::registry::{
     MediaStreamId, get_stream, register_stream, unregister_stream,
 };
@@ -28,6 +29,39 @@ pub static RTP_CAPS_VP8: LazyLock<gstreamer::Caps> = LazyLock::new(|| {
         .field("encoding-name", "VP8")
         .build()
 });
+
+const MOCK_VIDEO_WIDTH: i32 = 640;
+const MOCK_VIDEO_HEIGHT: i32 = 360;
+const MOCK_VIDEO_FPS: i32 = 30;
+const MOCK_VIDEO_FRAME_BYTES: usize =
+    (MOCK_VIDEO_WIDTH as usize) * (MOCK_VIDEO_HEIGHT as usize) * 4;
+
+fn fill_mock_video_frame(buffer: &mut gstreamer::BufferRef, frame_index: u64) {
+    let mut map = buffer.map_writable().unwrap();
+    let pixels = map.as_mut_slice();
+    let marker_x = (frame_index as usize * 7) % MOCK_VIDEO_WIDTH as usize;
+
+    for y in 0..MOCK_VIDEO_HEIGHT as usize {
+        for x in 0..MOCK_VIDEO_WIDTH as usize {
+            let offset = (y * MOCK_VIDEO_WIDTH as usize + x) * 4;
+            let band = ((x / 80) + (y / 60) + frame_index as usize / 8) % 3;
+            let marker = x.abs_diff(marker_x) < 8;
+            let (r, g, b) = if marker {
+                (255, 255, 255)
+            } else if band == 0 {
+                (32, 180, 255)
+            } else if band == 1 {
+                (255, 72, 112)
+            } else {
+                (78, 220, 140)
+            };
+            pixels[offset] = b;
+            pixels[offset + 1] = g;
+            pixels[offset + 2] = r;
+            pixels[offset + 3] = 255;
+        }
+    }
+}
 
 pub struct GStreamerMediaStream {
     id: Option<MediaStreamId>,
@@ -118,12 +152,46 @@ impl GStreamerMediaStream {
     }
 
     pub fn create_video() -> MediaStreamId {
-        let videotestsrc = gstreamer::ElementFactory::make("videotestsrc")
-            .property_from_str("pattern", "ball")
+        let appsrc = gstreamer::ElementFactory::make("appsrc")
             .property("is-live", true)
             .build()
+            .map(|element| element.downcast::<AppSrc>().unwrap())
             .unwrap();
-        Self::create_video_from(videotestsrc)
+        appsrc.set_format(gstreamer::Format::Time);
+        appsrc.set_stream_type(AppStreamType::Stream);
+        appsrc.set_max_bytes((MOCK_VIDEO_WIDTH * MOCK_VIDEO_HEIGHT * 4 * 4) as u64);
+
+        let caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "BGRA")
+            .field("width", MOCK_VIDEO_WIDTH)
+            .field("height", MOCK_VIDEO_HEIGHT)
+            .field("framerate", gstreamer::Fraction::new(MOCK_VIDEO_FPS, 1))
+            .build();
+        appsrc.set_caps(Some(&caps));
+
+        let frame_index = Arc::new(Mutex::new(0u64));
+        let frame_index_for_callback = frame_index.clone();
+        appsrc.set_callbacks(
+            AppSrcCallbacks::builder()
+                .need_data(move |appsrc, _| {
+                    let mut frame_index = frame_index_for_callback.lock().unwrap();
+                    let mut buffer = gstreamer::Buffer::with_size(MOCK_VIDEO_FRAME_BYTES).unwrap();
+                    let duration_ns =
+                        gstreamer::ClockTime::SECOND.nseconds() / MOCK_VIDEO_FPS as u64;
+                    let pts = gstreamer::ClockTime::from_nseconds(*frame_index * duration_ns);
+                    {
+                        let buffer = buffer.get_mut().unwrap();
+                        buffer.set_pts(Some(pts));
+                        buffer.set_duration(gstreamer::ClockTime::from_nseconds(duration_ns));
+                        fill_mock_video_frame(buffer, *frame_index);
+                    }
+                    *frame_index += 1;
+                    let _ = appsrc.push_buffer(buffer);
+                })
+                .build(),
+        );
+
+        Self::create_video_from(appsrc.upcast())
     }
 
     /// Attaches encoding adapters to the stream, returning the source element when successful.
@@ -141,13 +209,11 @@ impl GStreamerMediaStream {
             MediaStreamType::Video => {
                 let vp8enc = gstreamer::ElementFactory::make("vp8enc")
                     .property("deadline", 1i64)
-                    .property("error-resilient", "default")
                     .property("cpu-used", -16i32)
                     .property("lag-in-frames", 0i32)
                     .build()?;
 
                 let rtpvp8pay = gstreamer::ElementFactory::make("rtpvp8pay")
-                    .property("picture-id-mode", "15-bit")
                     .property("mtu", 1200u32)
                     .build()?;
                 let queue2 = gstreamer::ElementFactory::make("queue").build()?;

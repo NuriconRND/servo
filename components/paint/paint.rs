@@ -23,7 +23,7 @@ use log::{debug, info, warn};
 use paint_api::display_list::PaintDisplayListInfo;
 use paint_api::rendering_context::{RenderingContext, create_adapter_for_requested_gpu};
 use paint_api::{
-    PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+    ImageUpdate, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
     SerializableDisplayListPayload, WebRenderExternalImageIdManager, WebViewTrait,
 };
 use profile_traits::mem::{
@@ -1271,9 +1271,46 @@ impl Paint {
                 self.handle_generate_image_keys_for_pipeline(webview_id, pipeline_id);
             },
             PaintMessage::UpdateImages(painter_id, updates) => {
-                self.for_each_source_painter_target_mut(painter_id, |painter| {
-                    painter.update_images(updates.clone());
-                });
+                let target_painter_ids = self.target_painter_ids_for_source_painter(painter_id);
+                if target_painter_ids.len() > 1 {
+                    let requested_gpus: Vec<_> = target_painter_ids
+                        .iter()
+                        .map(|target_painter_id| {
+                            self.maybe_painter(*target_painter_id)
+                                .and_then(|painter| painter.rendering_context.requested_gpu_index())
+                        })
+                        .collect();
+                    let mut add_count = 0;
+                    let mut update_count = 0;
+                    let mut delete_count = 0;
+                    let mut animation_update_count = 0;
+                    for update in &updates {
+                        match update {
+                            ImageUpdate::AddImage(..) => add_count += 1,
+                            ImageUpdate::UpdateImage(..) => update_count += 1,
+                            ImageUpdate::DeleteImage(..) => delete_count += 1,
+                            ImageUpdate::UpdateImageForAnimation(..) => animation_update_count += 1,
+                        }
+                    }
+                    info!(
+                        "Wall media image fanout: source_painter={:?} target_painters={:?} \
+                         requested_gpus={:?} updates_total={} adds={} updates={} deletes={} \
+                         animation_updates={}",
+                        painter_id,
+                        target_painter_ids,
+                        requested_gpus,
+                        updates.len(),
+                        add_count,
+                        update_count,
+                        delete_count,
+                        animation_update_count,
+                    );
+                }
+                for target_painter_id in target_painter_ids {
+                    if let Some(mut painter) = self.maybe_painter_mut(target_painter_id) {
+                        painter.update_images(updates.clone());
+                    }
+                }
             },
             PaintMessage::DelayNewFrameForCanvas(
                 webview_id,

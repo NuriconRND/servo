@@ -184,6 +184,7 @@ pub(crate) struct MediaFrameRenderer {
     current_frame: Option<MediaFrame>,
     old_frame: Option<ImageKey>,
     very_old_frame: Option<ImageKey>,
+    rendered_frame_count: u64,
     current_frame_holder: Option<FrameHolder>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
@@ -204,6 +205,7 @@ impl MediaFrameRenderer {
             current_frame: None,
             old_frame: None,
             very_old_frame: None,
+            rendered_frame_count: 0,
             current_frame_holder: None,
             poster_frame: None,
         }
@@ -279,6 +281,7 @@ impl MediaFrameRenderer {
 
     fn reset(&mut self) {
         self.player_id = None;
+        self.rendered_frame_count = 0;
 
         if let Some(glplayer_id) = self.glplayer_id.take() {
             self.player_context
@@ -330,6 +333,22 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             return;
         }
 
+        self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
+        let rendered_frame_count = self.rendered_frame_count;
+        let frame_width = frame.get_width();
+        let frame_height = frame.get_height();
+        let frame_backend = if frame.is_gl_texture() {
+            if frame.is_external_oes() {
+                "external_oes"
+            } else {
+                "gl_texture"
+            }
+        } else {
+            "raw"
+        };
+        let mut image_update_for_log = "none";
+        let image_key_for_log;
+
         let mut updates = smallvec::smallvec![];
 
         if let Some(old_image_key) = mem::replace(&mut self.very_old_frame, self.old_frame.take()) {
@@ -337,17 +356,17 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
 
         let descriptor = ImageDescriptor::new(
-            frame.get_width(),
-            frame.get_height(),
+            frame_width,
+            frame_height,
             ImageFormat::BGRA8,
             ImageDescriptorFlags::empty(),
         );
 
         match &mut self.current_frame {
             Some(current_frame)
-                if current_frame.width == frame.get_width() &&
-                    current_frame.height == frame.get_height() =>
+                if current_frame.width == frame_width && current_frame.height == frame_height =>
             {
+                image_key_for_log = Some(current_frame.image_key);
                 if !frame.is_gl_texture() {
                     updates.push(ImageUpdate::UpdateImage(
                         current_frame.image_key,
@@ -357,6 +376,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                         )),
                         None,
                     ));
+                    image_update_for_log = "update";
                 }
 
                 self.current_frame_holder
@@ -380,6 +400,8 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 current_frame.image_key = new_image_key;
                 current_frame.width = frame.get_width();
                 current_frame.height = frame.get_height();
+                image_key_for_log = Some(new_image_key);
+                image_update_for_log = "add";
 
                 // FIXME: This code is duplicated below this branch
                 let image_data = self
@@ -422,10 +444,12 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     return;
                 };
 
+                image_key_for_log = Some(image_key);
+                image_update_for_log = "add";
                 self.current_frame = Some(MediaFrame {
                     image_key,
-                    width: frame.get_width(),
-                    height: frame.get_height(),
+                    width: frame_width,
+                    height: frame_height,
                 });
 
                 let image_data = self
@@ -458,6 +482,26 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 ));
             },
         }
+        let delete_update_count = updates
+            .iter()
+            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
+            .count();
+        info!(
+            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
+             frame_backend={} size={}x{} image_key={:?} image_update={} \
+             delete_updates={} updates_total={} glplayer_id={:?}",
+            self.webview_id,
+            self.player_id,
+            rendered_frame_count,
+            frame_backend,
+            frame_width,
+            frame_height,
+            image_key_for_log,
+            image_update_for_log,
+            delete_update_count,
+            updates.len(),
+            self.glplayer_id,
+        );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
     }

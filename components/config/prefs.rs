@@ -300,6 +300,8 @@ pub struct Preferences {
     pub layout_writing_mode_enabled: bool,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
+    /// Use generated media sources for getUserMedia() instead of host capture devices.
+    pub media_capture_mocking_enabled: bool,
     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
     pub media_testing_enabled: bool,
     /// The default timeout set for establishing a network connection in seconds. This amount
@@ -422,8 +424,8 @@ impl Preferences {
             dom_testutils_enabled: false,
             // Following Firefox and Chrome, we are enabling the touch events legacy APIs for android.
             // Additionally, enabling it in ohos for compatibility as well.
-            dom_touch_events_legacy_apis_enabled: cfg!(target_os = "android") |
-                cfg!(target_env = "ohos"),
+            dom_touch_events_legacy_apis_enabled: cfg!(target_os = "android")
+                | cfg!(target_env = "ohos"),
             dom_transient_activation_duration_ms: 5000,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
@@ -503,6 +505,7 @@ impl Preferences {
             layout_unimplemented: false,
             layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
+            media_capture_mocking_enabled: false,
             media_glvideo_enabled: false,
             media_testing_enabled: false,
             network_connection_timeout: 15,

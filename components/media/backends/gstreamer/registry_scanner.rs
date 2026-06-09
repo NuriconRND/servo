@@ -117,6 +117,12 @@ impl GStreamerRegistryScanner {
         let is_h264_decoder_available = has_element_for_media_type(
             &video_decoder_factories,
             "video/x-h264, profile=(string){ constrained-baseline, baseline, high }",
+        ) || has_element_for_media_type(
+            &video_decoder_factories,
+            "video/x-h264, alignment=(string)au, stream-format=(string)avc",
+        ) || has_element_for_media_type(
+            &video_decoder_factories,
+            "video/x-h264, alignment=(string)au, stream-format=(string)byte-stream",
         );
         if is_h264_decoder_available &&
             has_element_for_media_type(&video_parser_factories, "video/x-h264")

@@ -1,0 +1,238 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall WebRTC Video Probe</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: system-ui, sans-serif;
+    background: #101114;
+    color: #f4f4f4;
+  }
+
+  html,
+  body {
+    margin: 0;
+    min-width: 5760px;
+    min-height: 3240px;
+    overflow: hidden;
+    background:
+      linear-gradient(90deg, transparent 0 1918px, #ff4757 1918px 1922px, transparent 1922px 3838px, #ffa502 3838px 3842px, transparent 3842px),
+      linear-gradient(0deg, transparent 0 1078px, #2ed573 1078px 1082px, transparent 1082px 2158px, #1e90ff 2158px 2162px, transparent 2162px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.06) 0 1px, transparent 1px 240px),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.06) 0 1px, transparent 1px 180px),
+      #101114;
+  }
+
+  main {
+    position: relative;
+    width: 5760px;
+    height: 3240px;
+  }
+
+  .boundary-label {
+    position: absolute;
+    z-index: 3;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, .72);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .x1 { left: 1932px; top: 24px; }
+  .x2 { left: 3852px; top: 24px; }
+  .y1 { left: 24px; top: 1092px; }
+  .y2 { left: 24px; top: 2172px; }
+
+  .video-stage {
+    position: absolute;
+    left: 1440px;
+    top: 420px;
+    width: 2880px;
+    height: 1620px;
+    border: 6px solid #f4f4f4;
+    box-sizing: border-box;
+    background:
+      linear-gradient(135deg, rgba(255,255,255,.10) 25%, transparent 25% 50%, rgba(255,255,255,.10) 50% 75%, transparent 75%),
+      #050607;
+    background-size: 96px 96px;
+    box-shadow: 0 0 0 6px rgba(0, 0, 0, .38);
+  }
+
+  video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #000;
+  }
+
+  .stats {
+    position: absolute;
+    left: 96px;
+    top: 96px;
+    z-index: 4;
+    width: 980px;
+    padding: 22px 26px;
+    background: rgba(0, 0, 0, .78);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font: 28px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre;
+  }
+
+  .motion-strip {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 5760px;
+    height: 160px;
+    background: repeating-linear-gradient(90deg, #f4f4f4 0 96px, #101114 96px 192px);
+    opacity: .82;
+    animation: slide 2s linear infinite;
+  }
+
+  @keyframes slide {
+    from { background-position-x: 0; }
+    to { background-position-x: 192px; }
+  }
+</style>
+<main>
+  <div class="stats" id="stats">loading</div>
+  <div class="boundary-label x1">x=1920</div>
+  <div class="boundary-label x2">x=3840</div>
+  <div class="boundary-label y1">y=1080</div>
+  <div class="boundary-label y2">y=2160</div>
+  <section class="video-stage">
+    <video id="probeVideo" autoplay muted playsinline controls></video>
+  </section>
+  <div class="motion-strip"></div>
+</main>
+<script>
+  const video = document.getElementById("probeVideo");
+  const stats = document.getElementById("stats");
+  const constraints = {
+    audio: false,
+    video: {
+      width: { ideal: 640 },
+      height: { ideal: 360 },
+      frameRate: { ideal: 30 }
+    }
+  };
+
+  let rafCount = 0;
+  let statusText = "initializing";
+  let gumError = "";
+  let playError = "";
+  let deviceSummary = "not checked";
+  let stream = null;
+  let videoTracks = [];
+
+  function describeError(error) {
+    if (!error) {
+      return "unknown";
+    }
+    const name = error.name || "Error";
+    const message = error.message || String(error);
+    return `${name}: ${message}`;
+  }
+
+  function playbackFrames() {
+    if (typeof video.getVideoPlaybackQuality === "function") {
+      return video.getVideoPlaybackQuality().totalVideoFrames;
+    }
+    if ("webkitDecodedFrameCount" in video) {
+      return video.webkitDecodedFrameCount;
+    }
+    return "n/a";
+  }
+
+  function trackSummary() {
+    if (!videoTracks.length) {
+      return "0 video tracks";
+    }
+
+    return videoTracks.map(track => {
+      let settings = {};
+      if (typeof track.getSettings === "function") {
+        settings = track.getSettings();
+      }
+      const size = settings.width && settings.height ? `${settings.width}x${settings.height}` : "size n/a";
+      const rate = settings.frameRate ? `${settings.frameRate}fps` : "fps n/a";
+      return `${track.readyState || "state n/a"} enabled=${track.enabled} muted=${track.muted} ${size} ${rate}`;
+    }).join(" | ");
+  }
+
+  async function startProbe() {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      statusText = "navigator.mediaDevices.getUserMedia unavailable";
+      return;
+    }
+
+    try {
+      if (typeof navigator.mediaDevices.enumerateDevices === "function") {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = devices.filter(device => device.kind === "videoinput").length;
+        const audioInputs = devices.filter(device => device.kind === "audioinput").length;
+        deviceSummary = `${videoInputs} video inputs, ${audioInputs} audio inputs`;
+      }
+    } catch (error) {
+      deviceSummary = `enumerateDevices failed: ${describeError(error)}`;
+    }
+
+    try {
+      statusText = "requesting getUserMedia";
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      videoTracks = stream.getVideoTracks ? stream.getVideoTracks() : [];
+      video.srcObject = stream;
+      statusText = "stream attached";
+
+      if (!videoTracks.length) {
+        statusText = "stream attached with 0 video tracks";
+      }
+
+      try {
+        await video.play();
+      } catch (error) {
+        playError = describeError(error);
+      }
+    } catch (error) {
+      gumError = describeError(error);
+      statusText = "getUserMedia failed";
+    }
+  }
+
+  video.addEventListener("loadedmetadata", () => {
+    statusText = "loadedmetadata";
+  });
+
+  video.addEventListener("playing", () => {
+    statusText = "playing";
+  });
+
+  video.addEventListener("error", () => {
+    const error = video.error;
+    playError = error ? `media error code ${error.code}` : "media error";
+  });
+
+  function tick() {
+    rafCount += 1;
+    stats.textContent = [
+      "Multi-GPU WebRTC video probe",
+      `status: ${statusText}`,
+      `devices: ${deviceSummary}`,
+      `tracks: ${trackSummary()}`,
+      `time: ${video.currentTime.toFixed(3)}`,
+      `readyState: ${video.readyState}`,
+      `paused: ${video.paused}`,
+      `size: ${video.videoWidth}x${video.videoHeight}`,
+      `raf: ${rafCount}`,
+      `decoded: ${playbackFrames()}`,
+      `gumError: ${gumError || "none"}`,
+      `playError: ${playError || "none"}`
+    ].join("\n");
+    requestAnimationFrame(tick);
+  }
+
+  startProbe();
+  requestAnimationFrame(tick);
+</script>

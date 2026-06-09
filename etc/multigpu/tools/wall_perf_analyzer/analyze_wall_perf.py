@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,18 @@ BARRIER_MISSED_RE = re.compile(
 LOGICAL_FRAME_RE = re.compile(r"Wall logical frame (?P<logical>\d+) fan-out")
 METADATA_MATCH_RE = re.compile(r"Wall frame metadata: .*?scroll_offsets=matched")
 METADATA_MISMATCH_RE = re.compile(r"Wall frame metadata mismatch")
+MEDIA_FRAME_RE = re.compile(
+    r"Wall media frame: .*?frame_backend=(?P<backend>\w+) .*?"
+    r"image_update=(?P<image_update>\w+) .*?"
+    r"delete_updates=(?P<delete_updates>\d+) updates_total=(?P<updates_total>\d+)"
+)
+MEDIA_FANOUT_RE = re.compile(
+    r"Wall media image fanout: .*?target_painters=(?P<target_painters>\[.*?\]) "
+    r"requested_gpus=(?P<requested_gpus>\[.*?\]) "
+    r"updates_total=(?P<updates_total>\d+) adds=(?P<adds>\d+) "
+    r"updates=(?P<updates>\d+) deletes=(?P<deletes>\d+) "
+    r"animation_updates=(?P<animation_updates>\d+)"
+)
 
 
 @dataclass
@@ -105,6 +118,21 @@ class LogSummary:
     missed_frame_logs: int = 0
     pending_frame_warnings: int = 0
     unexpected_ready_logs: int = 0
+    media_frames: int = 0
+    media_raw_frames: int = 0
+    media_gl_texture_frames: int = 0
+    media_external_oes_frames: int = 0
+    media_image_adds: int = 0
+    media_image_updates: int = 0
+    media_image_noops: int = 0
+    media_image_deletes: int = 0
+    media_image_update_messages: int = 0
+    media_image_fanouts: int = 0
+    media_fanout_updates_total: int = 0
+    media_fanout_adds: int = 0
+    media_fanout_updates: int = 0
+    media_fanout_deletes: int = 0
+    media_fanout_animation_updates: int = 0
     render_ms: list[float] = field(default_factory=list)
     repaint_render_ms: list[float] = field(default_factory=list)
     target_present_ms: list[float] = field(default_factory=list)
@@ -119,6 +147,7 @@ class LogSummary:
     )
     requested_gpu_counts: Counter[str] = field(default_factory=Counter)
     tile_gpu_counts: Counter[str] = field(default_factory=Counter)
+    media_fanout_requested_gpu_counts: Counter[str] = field(default_factory=Counter)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -135,6 +164,21 @@ class LogSummary:
                 "missed_frame_logs": self.missed_frame_logs,
                 "pending_frame_warnings": self.pending_frame_warnings,
                 "unexpected_ready_logs": self.unexpected_ready_logs,
+                "media_frames": self.media_frames,
+                "media_raw_frames": self.media_raw_frames,
+                "media_gl_texture_frames": self.media_gl_texture_frames,
+                "media_external_oes_frames": self.media_external_oes_frames,
+                "media_image_adds": self.media_image_adds,
+                "media_image_updates": self.media_image_updates,
+                "media_image_noops": self.media_image_noops,
+                "media_image_deletes": self.media_image_deletes,
+                "media_image_update_messages": self.media_image_update_messages,
+                "media_image_fanouts": self.media_image_fanouts,
+                "media_fanout_updates_total": self.media_fanout_updates_total,
+                "media_fanout_adds": self.media_fanout_adds,
+                "media_fanout_updates": self.media_fanout_updates,
+                "media_fanout_deletes": self.media_fanout_deletes,
+                "media_fanout_animation_updates": self.media_fanout_animation_updates,
             },
             "series": {
                 "painter_render": SeriesSummary.from_values(self.render_ms).to_dict(),
@@ -162,6 +206,9 @@ class LogSummary:
             },
             "requested_gpu_counts": dict(sorted(self.requested_gpu_counts.items())),
             "tile_gpu_counts": dict(sorted(self.tile_gpu_counts.items())),
+            "media_fanout_requested_gpu_counts": dict(
+                sorted(self.media_fanout_requested_gpu_counts.items())
+            ),
             "present_balance": present_balance(self.window_present_ms_by_tile),
         }
 
@@ -220,6 +267,40 @@ def analyze_log(path: Path) -> LogSummary:
                 summary.pending_frame_warnings += 1
             if "frame-ready-without-pending" in line:
                 summary.unexpected_ready_logs += 1
+
+            if match := MEDIA_FRAME_RE.search(line):
+                backend = match.group("backend")
+                image_update = match.group("image_update")
+                summary.media_frames += 1
+                if backend == "raw":
+                    summary.media_raw_frames += 1
+                elif backend == "gl_texture":
+                    summary.media_gl_texture_frames += 1
+                elif backend == "external_oes":
+                    summary.media_external_oes_frames += 1
+
+                if image_update == "add":
+                    summary.media_image_adds += 1
+                elif image_update == "update":
+                    summary.media_image_updates += 1
+                elif image_update == "none":
+                    summary.media_image_noops += 1
+                summary.media_image_deletes += int(match.group("delete_updates"))
+                summary.media_image_update_messages += int(match.group("updates_total"))
+                continue
+
+            if match := MEDIA_FANOUT_RE.search(line):
+                summary.media_image_fanouts += 1
+                summary.media_fanout_updates_total += int(match.group("updates_total"))
+                summary.media_fanout_adds += int(match.group("adds"))
+                summary.media_fanout_updates += int(match.group("updates"))
+                summary.media_fanout_deletes += int(match.group("deletes"))
+                summary.media_fanout_animation_updates += int(match.group("animation_updates"))
+                for requested_gpu in re.findall(
+                    r"Some\(\d+\)|None", match.group("requested_gpus")
+                ):
+                    summary.media_fanout_requested_gpu_counts[requested_gpu] += 1
+                continue
 
             if match := RENDER_RE.search(line):
                 render_ms = float(match.group("render_ms"))
@@ -288,6 +369,19 @@ def to_markdown(results: list[dict[str, object]]) -> str:
                 f"- Skipped repaint targets: {counts['skipped_repaint_targets']}",
                 f"- Panic/error diagnostics: {counts['panics']} / {counts['errors']}",
                 f"- Present balance: {present['tile_present_counts']} spread={present['spread']}",
+                (
+                    f"- Media frames raw/gl/external_oes: {counts['media_raw_frames']} / "
+                    f"{counts['media_gl_texture_frames']} / {counts['media_external_oes_frames']}"
+                ),
+                (
+                    f"- Media image add/update/noop/delete messages: "
+                    f"{counts['media_image_adds']} / {counts['media_image_updates']} / "
+                    f"{counts['media_image_noops']} / {counts['media_image_deletes']}"
+                ),
+                (
+                    f"- Media fan-outs: {counts['media_image_fanouts']} "
+                    f"updates_total={counts['media_fanout_updates_total']}"
+                ),
                 "",
                 "| Series | Count | Avg ms | P50 ms | P95 ms | P99 ms | Max ms |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -312,10 +406,71 @@ def to_markdown(results: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def requested_gpu_ids(result: dict[str, object]) -> set[str]:
+    gpu_ids = set()
+    for counts_key in ("requested_gpu_counts", "media_fanout_requested_gpu_counts"):
+        for requested_gpu in result[counts_key]:
+            if match := re.fullmatch(r"Some\((\d+)\)", requested_gpu):
+                gpu_ids.add(match.group(1))
+    return gpu_ids
+
+
+def validate_media_wall_result(
+    result: dict[str, object],
+    expected_gpus: list[str],
+    max_present_spread: int,
+) -> list[str]:
+    counts = result["counts"]
+    present = result["present_balance"]
+    failures = []
+
+    if counts["panics"] > 0:
+        failures.append(f"panic diagnostics present: {counts['panics']}")
+    if counts["errors"] > 0:
+        failures.append(f"error diagnostics present: {counts['errors']}")
+    if counts["metadata_mismatched"] > 0:
+        failures.append(f"metadata mismatches present: {counts['metadata_mismatched']}")
+    if counts["media_frames"] == 0:
+        failures.append("no media frame diagnostics found")
+    if counts["media_image_fanouts"] == 0:
+        failures.append("no media image fan-out diagnostics found")
+    if present["spread"] > max_present_spread:
+        failures.append(
+            f"present count spread {present['spread']} exceeds {max_present_spread}"
+        )
+
+    if expected_gpus:
+        actual_gpus = requested_gpu_ids(result)
+        missing_gpus = sorted(set(expected_gpus) - actual_gpus)
+        if missing_gpus:
+            failures.append(
+                "missing expected requested GPU ids: " + ", ".join(missing_gpus)
+            )
+
+    return failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="+", type=Path, help="Servo wall-layout stderr logs")
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
+    parser.add_argument(
+        "--validate-media-wall",
+        action="store_true",
+        help="fail if media frame fan-out wall diagnostics do not satisfy the smoke gate",
+    )
+    parser.add_argument(
+        "--expected-gpu",
+        action="append",
+        default=[],
+        help="requested GPU id expected in the log; repeat for multiple ids",
+    )
+    parser.add_argument(
+        "--max-present-spread",
+        type=int,
+        default=2,
+        help="maximum allowed difference between per-tile present counts",
+    )
     args = parser.parse_args()
 
     results = [analyze_log(path).to_dict() for path in args.logs]
@@ -323,6 +478,25 @@ def main() -> int:
         print(json.dumps({"logs": results}, indent=2))
     else:
         print(to_markdown(results))
+
+    if args.validate_media_wall:
+        validation_failures = {
+            str(result["path"]): validate_media_wall_result(
+                result, args.expected_gpu, args.max_present_spread
+            )
+            for result in results
+        }
+        failed = False
+        for path, failures in validation_failures.items():
+            if not failures:
+                continue
+            failed = True
+            print(f"{path}: media wall validation failed", file=sys.stderr)
+            for failure in failures:
+                print(f"  - {failure}", file=sys.stderr)
+        if failed:
+            return 1
+
     return 0
 
 
