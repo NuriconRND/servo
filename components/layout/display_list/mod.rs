@@ -11,7 +11,7 @@ pub(crate) use clip::ClipId;
 use euclid::{Box2D, Point2D, Rect, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
-use layout_api::ReflowStatistics;
+use layout_api::{MediaFrameYuvFormat, ReflowStatistics};
 use net_traits::image_cache::Image as CachedImage;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
 use servo_arc::Arc as ServoArc;
@@ -421,12 +421,12 @@ impl DisplayListBuilder<'_> {
         let style = fragment.style();
         let effects = style.get_effects();
         let transform_style = style.get_used_transform_style();
-        if effects.filter.0.is_empty() &&
-            effects.opacity == 1.0 &&
-            effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
-            !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
-            style.get_svg().clip_path == ClipPath::None &&
-            transform_style == TransformStyle::Flat
+        if effects.filter.0.is_empty()
+            && effects.opacity == 1.0
+            && effects.mix_blend_mode == ComputedMixBlendMode::Normal
+            && !style.has_effective_transform_or_perspective(FragmentFlags::empty())
+            && style.get_svg().clip_path == ClipPath::None
+            && transform_style == TransformStyle::Flat
         {
             return false;
         }
@@ -696,8 +696,8 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
     fn visit_box(&mut self, state: &TraversalState, fragment: &Arc<BoxFragment>) {
         fragment.base.visit_fragment(self);
 
-        if let Some(mut inspector_highlight) = self.inspector_highlight.take() &&
-            fragment.base.tag == Some(inspector_highlight.tag)
+        if let Some(mut inspector_highlight) = self.inspector_highlight.take()
+            && fragment.base.tag == Some(inspector_highlight.tag)
         {
             inspector_highlight.register_fragment_of_highlighted_dom_node(self, state, fragment);
             self.inspector_highlight = Some(inspector_highlight);
@@ -762,7 +762,33 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             .to_webrender();
         let common = self.common_properties(state, clip, &style);
 
-        if let Some(image_key) = fragment.image_key {
+        if let Some(yuv_image) = fragment.yuv_image {
+            let yuv_data = match yuv_image.format {
+                MediaFrameYuvFormat::NV12 => {
+                    wr::YuvData::NV12(yuv_image.y_key, yuv_image.u_or_uv_key)
+                },
+                MediaFrameYuvFormat::PlanarYCbCr => wr::YuvData::PlanarYCbCr(
+                    yuv_image.y_key,
+                    yuv_image.u_or_uv_key,
+                    yuv_image
+                        .v_key
+                        .expect("Planar YCbCr media frame requires a Cr plane"),
+                ),
+            };
+            self.wr().push_yuv_image(
+                &common,
+                rect,
+                yuv_data,
+                yuv_image.color_depth,
+                yuv_image.color_space,
+                yuv_image.color_range,
+                image_rendering,
+            );
+
+            self.check_if_paintable(rect, common.clip_rect, style.clone_opacity());
+            self.mark_is_contentful();
+            self.check_for_lcp_candidate(state, common.clip_rect, rect, fragment.base.tag, None);
+        } else if let Some(image_key) = fragment.image_key {
             self.wr().push_image(
                 &common,
                 rect,
@@ -975,8 +1001,8 @@ impl Fragment {
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
 
-        let include_whitespace = fragment.offsets.is_some() ||
-            state
+        let include_whitespace = fragment.offsets.is_some()
+            || state
                 .text_decorations
                 .iter()
                 .any(|item| !item.line.is_empty());
@@ -1201,8 +1227,8 @@ impl Fragment {
             return;
         }
 
-        if offsets.character_range.start > shared_selection.character_range.end ||
-            offsets.character_range.end < shared_selection.character_range.start
+        if offsets.character_range.start > shared_selection.character_range.end
+            || offsets.character_range.end < shared_selection.character_range.start
         {
             return;
         }
@@ -1211,8 +1237,8 @@ impl Fragment {
         // layout will push an empty fragment in order to trigger painting of the cursor on an empty line.
         // This code ensure that it is only painted if the cursor is on the starting index of the empty
         // fragment.
-        if fragment.is_empty_for_text_cursor &&
-            !offsets
+        if fragment.is_empty_for_text_cursor
+            && !offsets
                 .character_range
                 .contains(&shared_selection.character_range.start)
         {
@@ -1225,11 +1251,11 @@ impl Fragment {
         let mut end_advance = None;
         for glyph_store in fragment.glyphs.iter() {
             let glyph_store_character_count = glyph_store.character_count();
-            if current_character_index + glyph_store_character_count <
-                shared_selection.character_range.start
+            if current_character_index + glyph_store_character_count
+                < shared_selection.character_range.start
             {
-                current_advance += glyph_store.total_advance() +
-                    (justification_adjustment * glyph_store.total_word_separators() as i32);
+                current_advance += glyph_store.total_advance()
+                    + (justification_adjustment * glyph_store.total_word_separators() as i32);
                 current_character_index += glyph_store_character_count;
                 continue;
             }
@@ -1261,8 +1287,8 @@ impl Fragment {
         let parent_style = fragment.base.style();
         if !shared_selection.range.is_empty() {
             let selection_rect = Rect::new(
-                containing_block_rect.origin +
-                    Vector2D::new(fragment_x_offset + start_x, Au::zero()),
+                containing_block_rect.origin
+                    + Vector2D::new(fragment_x_offset + start_x, Au::zero()),
                 Size2D::new(end_x - start_x, containing_block_rect.height()),
             )
             .to_webrender();
@@ -1464,9 +1490,9 @@ impl<'a> BuilderForBoxFragment<'a> {
             .effective_overflow(self.fragment.base.flags);
         let scrolls_via_user_input =
             |overflow| matches!(overflow, ComputedOverflow::Scroll | ComputedOverflow::Auto);
-        if (scrolls_via_user_input(overflow.x) || scrolls_via_user_input(overflow.y)) &&
-            self.fragment.style().get_inherited_ui().pointer_events !=
-                style::computed_values::pointer_events::T::None
+        if (scrolls_via_user_input(overflow.x) || scrolls_via_user_input(overflow.y))
+            && self.fragment.style().get_inherited_ui().pointer_events
+                != style::computed_values::pointer_events::T::None
         {
             let mut inner_state = state.clone();
             inner_state.spatial_id = self
@@ -1557,8 +1583,8 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         }
         // If the `<body>` background was inherited by the root element, don't paint it again here.
-        if !builder.paint_body_background &&
-            flags.intersects(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT)
+        if !builder.paint_body_background
+            && flags.intersects(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT)
         {
             return;
         }
@@ -2378,10 +2404,10 @@ impl BoxFragment {
     fn border_radius(&self) -> BorderRadius {
         let style = self.style();
         let border = style.get_border();
-        if border.border_top_left_radius.0.is_zero() &&
-            border.border_top_right_radius.0.is_zero() &&
-            border.border_bottom_right_radius.0.is_zero() &&
-            border.border_bottom_left_radius.0.is_zero()
+        if border.border_top_left_radius.0.is_zero()
+            && border.border_top_right_radius.0.is_zero()
+            && border.border_bottom_right_radius.0.is_zero()
+            && border.border_bottom_left_radius.0.is_zero()
         {
             return BorderRadius::zero();
         }

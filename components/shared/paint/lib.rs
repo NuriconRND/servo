@@ -693,13 +693,9 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
             },
             WebRenderImageHandlerType::Media => {
                 let (source, size) = self.media_handler.as_mut().unwrap().lock(key.0);
-                let texture_id = match source {
-                    ExternalImageSource::NativeTexture(b) => b,
-                    _ => panic!("Wrong type"),
-                };
                 ExternalImage {
                     uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
-                    source: ExternalImageSource::NativeTexture(texture_id),
+                    source,
                 }
             },
             WebRenderImageHandlerType::WebGpu => {

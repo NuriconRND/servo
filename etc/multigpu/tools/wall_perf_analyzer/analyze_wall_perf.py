@@ -64,6 +64,12 @@ MEDIA_FANOUT_RE = re.compile(
     r"updates=(?P<updates>\d+) deletes=(?P<deletes>\d+) "
     r"animation_updates=(?P<animation_updates>\d+)"
 )
+NONFATAL_ERROR_RE = re.compile(
+    r"audiosink .* error writing data|"
+    r"error writing data in gst_wasapi_sink_write|"
+    r"ERROR\s+libav .* co located POCs unavailable",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -115,6 +121,7 @@ class LogSummary:
     skipped_repaint_targets: int = 0
     panics: int = 0
     errors: int = 0
+    nonfatal_errors: int = 0
     missed_frame_logs: int = 0
     pending_frame_warnings: int = 0
     unexpected_ready_logs: int = 0
@@ -122,6 +129,8 @@ class LogSummary:
     media_raw_frames: int = 0
     media_gl_texture_frames: int = 0
     media_external_oes_frames: int = 0
+    media_yuv_i420_frames: int = 0
+    media_yuv_nv12_frames: int = 0
     media_image_adds: int = 0
     media_image_updates: int = 0
     media_image_noops: int = 0
@@ -161,6 +170,7 @@ class LogSummary:
                 "skipped_repaint_targets": self.skipped_repaint_targets,
                 "panics": self.panics,
                 "errors": self.errors,
+                "nonfatal_errors": self.nonfatal_errors,
                 "missed_frame_logs": self.missed_frame_logs,
                 "pending_frame_warnings": self.pending_frame_warnings,
                 "unexpected_ready_logs": self.unexpected_ready_logs,
@@ -168,6 +178,8 @@ class LogSummary:
                 "media_raw_frames": self.media_raw_frames,
                 "media_gl_texture_frames": self.media_gl_texture_frames,
                 "media_external_oes_frames": self.media_external_oes_frames,
+                "media_yuv_i420_frames": self.media_yuv_i420_frames,
+                "media_yuv_nv12_frames": self.media_yuv_nv12_frames,
                 "media_image_adds": self.media_image_adds,
                 "media_image_updates": self.media_image_updates,
                 "media_image_noops": self.media_image_noops,
@@ -259,7 +271,9 @@ def analyze_log(path: Path) -> LogSummary:
                 summary.skipped_repaint_targets += 1
             if "panic" in line:
                 summary.panics += 1
-            if re.search(r"\bERROR\b|\berror\b", line):
+            if NONFATAL_ERROR_RE.search(line):
+                summary.nonfatal_errors += 1
+            elif re.search(r"\bERROR\b|\berror\b", line):
                 summary.errors += 1
             if "missed_frame_count" in line:
                 summary.missed_frame_logs += 1
@@ -278,6 +292,10 @@ def analyze_log(path: Path) -> LogSummary:
                     summary.media_gl_texture_frames += 1
                 elif backend == "external_oes":
                     summary.media_external_oes_frames += 1
+                elif backend == "yuv_i420_external_raw":
+                    summary.media_yuv_i420_frames += 1
+                elif backend == "yuv_nv12_external_raw":
+                    summary.media_yuv_nv12_frames += 1
 
                 if image_update == "add":
                     summary.media_image_adds += 1
@@ -367,11 +385,18 @@ def to_markdown(results: list[dict[str, object]]) -> str:
                 f"- Metadata matched/mismatched: {counts['metadata_matched']} / {counts['metadata_mismatched']}",
                 f"- Barrier completed/missed: {counts['barrier_completed']} / {counts['barrier_missed']}",
                 f"- Skipped repaint targets: {counts['skipped_repaint_targets']}",
-                f"- Panic/error diagnostics: {counts['panics']} / {counts['errors']}",
+                (
+                    f"- Panic/error diagnostics: {counts['panics']} / {counts['errors']} "
+                    f"(nonfatal media warnings: {counts['nonfatal_errors']})"
+                ),
                 f"- Present balance: {present['tile_present_counts']} spread={present['spread']}",
                 (
                     f"- Media frames raw/gl/external_oes: {counts['media_raw_frames']} / "
                     f"{counts['media_gl_texture_frames']} / {counts['media_external_oes_frames']}"
+                ),
+                (
+                    f"- Media frames yuv_i420/yuv_nv12: {counts['media_yuv_i420_frames']} / "
+                    f"{counts['media_yuv_nv12_frames']}"
                 ),
                 (
                     f"- Media image add/update/noop/delete messages: "

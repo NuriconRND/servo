@@ -6,15 +6,73 @@ use std::sync::Arc;
 
 use malloc_size_of_derive::MallocSizeOf;
 
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub enum VideoFrameYuvFormat {
+    I420,
+    NV12,
+}
+
+impl VideoFrameYuvFormat {
+    pub fn plane_count(self) -> usize {
+        match self {
+            VideoFrameYuvFormat::I420 => 3,
+            VideoFrameYuvFormat::NV12 => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub enum VideoFrameYuvColorSpace {
+    Rec601,
+    Rec709,
+    Rec2020,
+}
+
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub enum VideoFrameYuvColorRange {
+    Limited,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub struct VideoFramePlane {
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+}
+
+#[derive(Clone, Debug, Eq, MallocSizeOf, PartialEq)]
+pub struct VideoFrameYuvData {
+    pub format: VideoFrameYuvFormat,
+    pub planes: [Option<VideoFramePlane>; 3],
+    pub color_space: VideoFrameYuvColorSpace,
+    pub color_range: VideoFrameYuvColorRange,
+}
+
+impl VideoFrameYuvData {
+    pub fn plane(&self, index: usize) -> Option<VideoFramePlane> {
+        self.planes.get(index).copied().flatten()
+    }
+
+    pub fn plane_count(&self) -> usize {
+        self.format.plane_count()
+    }
+}
+
 #[derive(Clone, MallocSizeOf)]
 pub enum VideoFrameData {
     Raw(#[conditional_malloc_size_of] Arc<Vec<u8>>),
+    Yuv(VideoFrameYuvData),
     Texture(u32),
     OESTexture(u32),
 }
 
 pub trait Buffer: Send + Sync {
     fn to_vec(&self) -> Option<VideoFrameData>;
+
+    fn plane_data(&self, _plane_index: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 #[derive(Clone, MallocSizeOf)]
@@ -52,6 +110,20 @@ impl VideoFrame {
         }
     }
 
+    pub fn get_yuv_data(&self) -> Option<&VideoFrameYuvData> {
+        match &self.data {
+            VideoFrameData::Yuv(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub fn get_plane_data(&self, plane_index: usize) -> Option<&[u8]> {
+        match self.data {
+            VideoFrameData::Yuv(_) => self._buffer.plane_data(plane_index),
+            _ => None,
+        }
+    }
+
     pub fn get_texture_id(&self) -> u32 {
         match self.data {
             VideoFrameData::Texture(data) | VideoFrameData::OESTexture(data) => data,
@@ -64,6 +136,10 @@ impl VideoFrame {
             self.data,
             VideoFrameData::Texture(_) | VideoFrameData::OESTexture(_)
         )
+    }
+
+    pub fn is_yuv(&self) -> bool {
+        matches!(self.data, VideoFrameData::Yuv(_))
     }
 
     pub fn is_external_oes(&self) -> bool {

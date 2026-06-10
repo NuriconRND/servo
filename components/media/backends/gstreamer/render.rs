@@ -5,10 +5,14 @@
 use std::sync::Arc;
 
 use glib::prelude::*;
+use gstreamer_video::prelude::*;
 use servo_media_gstreamer_render::Render;
 use servo_media_player::PlayerError;
 use servo_media_player::context::PlayerGLContext;
-use servo_media_player::video::{Buffer, VideoFrame, VideoFrameData};
+use servo_media_player::video::{
+    Buffer, VideoFrame, VideoFrameData, VideoFramePlane, VideoFrameYuvColorRange,
+    VideoFrameYuvColorSpace, VideoFrameYuvData, VideoFrameYuvFormat,
+};
 
 #[cfg(any(
     target_os = "linux",
@@ -86,8 +90,75 @@ struct GStreamerBuffer {
 
 impl Buffer for GStreamerBuffer {
     fn to_vec(&self) -> Option<VideoFrameData> {
-        let data = self.frame.plane_data(0).ok()?;
-        Some(VideoFrameData::Raw(Arc::new(data.to_vec())))
+        match self.frame.format() {
+            gstreamer_video::VideoFormat::I420 => Some(VideoFrameData::Yuv(
+                self.yuv_data(VideoFrameYuvFormat::I420)?,
+            )),
+            gstreamer_video::VideoFormat::Nv12 => Some(VideoFrameData::Yuv(
+                self.yuv_data(VideoFrameYuvFormat::NV12)?,
+            )),
+            _ => {
+                let data = self.frame.plane_data(0).ok()?;
+                Some(VideoFrameData::Raw(Arc::new(data.to_vec())))
+            },
+        }
+    }
+
+    fn plane_data(&self, plane_index: usize) -> Option<&[u8]> {
+        self.frame.plane_data(plane_index as u32).ok()
+    }
+}
+
+impl GStreamerBuffer {
+    fn yuv_data(&self, format: VideoFrameYuvFormat) -> Option<VideoFrameYuvData> {
+        let info = self.frame.info();
+        let mut planes = [None; 3];
+
+        match format {
+            VideoFrameYuvFormat::I420 => {
+                planes[0] = Some(VideoFramePlane {
+                    width: info.comp_width(0) as i32,
+                    height: info.comp_height(0) as i32,
+                    stride: info.comp_stride(0),
+                });
+                planes[1] = Some(VideoFramePlane {
+                    width: info.comp_width(1) as i32,
+                    height: info.comp_height(1) as i32,
+                    stride: info.comp_stride(1),
+                });
+                planes[2] = Some(VideoFramePlane {
+                    width: info.comp_width(2) as i32,
+                    height: info.comp_height(2) as i32,
+                    stride: info.comp_stride(2),
+                });
+            },
+            VideoFrameYuvFormat::NV12 => {
+                planes[0] = Some(VideoFramePlane {
+                    width: info.comp_width(0) as i32,
+                    height: info.comp_height(0) as i32,
+                    stride: info.comp_stride(0),
+                });
+                planes[1] = Some(VideoFramePlane {
+                    width: info.comp_width(1) as i32,
+                    height: info.comp_height(1) as i32,
+                    stride: info.comp_stride(1),
+                });
+            },
+        }
+
+        Some(VideoFrameYuvData {
+            format,
+            planes,
+            color_space: match info.colorimetry().matrix() {
+                gstreamer_video::VideoColorMatrix::Bt709 => VideoFrameYuvColorSpace::Rec709,
+                gstreamer_video::VideoColorMatrix::Bt2020 => VideoFrameYuvColorSpace::Rec2020,
+                _ => VideoFrameYuvColorSpace::Rec601,
+            },
+            color_range: match info.colorimetry().range() {
+                gstreamer_video::VideoColorRange::Range0_255 => VideoFrameYuvColorRange::Full,
+                _ => VideoFrameYuvColorRange::Limited,
+            },
+        })
     }
 }
 
@@ -140,10 +211,23 @@ impl GStreamerRender {
         if let Some(render) = self.render.as_ref() {
             render.build_video_sink(appsink.upcast_ref::<gstreamer::Element>(), pipeline)?
         } else {
-            let caps = gstreamer::Caps::builder("video/x-raw")
-                .field("format", gstreamer_video::VideoFormat::Bgra.to_str())
-                .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
-                .build();
+            let use_borrowed_yuv =
+                !servo_config::opts::get().multiprocess && !servo_config::opts::get().force_ipc;
+            let caps = if use_borrowed_yuv {
+                gstreamer_video::VideoCapsBuilder::new()
+                    .format_list([
+                        gstreamer_video::VideoFormat::I420,
+                        gstreamer_video::VideoFormat::Nv12,
+                        gstreamer_video::VideoFormat::Bgra,
+                    ])
+                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
+                    .build()
+            } else {
+                gstreamer_video::VideoCapsBuilder::new()
+                    .format(gstreamer_video::VideoFormat::Bgra)
+                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
+                    .build()
+            };
 
             appsink.set_caps(Some(&caps));
             pipeline.set_property("video-sink", &appsink);

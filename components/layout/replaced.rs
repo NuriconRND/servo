@@ -8,7 +8,9 @@ use app_units::{Au, MAX_AU};
 use data_url::DataUrl;
 use embedder_traits::ViewportDetails;
 use euclid::{Scale, Size2D};
-use layout_api::{IFrameSize, LayoutElement, LayoutImageDestination, LayoutNode, SVGElementData};
+use layout_api::{
+    IFrameSize, LayoutElement, LayoutImageDestination, LayoutNode, MediaFrame, SVGElementData,
+};
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::image_cache::{Image, ImageOrMetadataAvailable, VectorImage};
 use net_traits::request::InternalRequest;
@@ -134,7 +136,7 @@ pub(crate) struct ImageInfo {
 
 #[derive(Debug, MallocSizeOf)]
 pub(crate) struct VideoInfo {
-    pub image_key: Option<ImageKey>,
+    pub frame: Option<MediaFrame>,
 }
 
 #[derive(Debug, MallocSizeOf)]
@@ -152,8 +154,8 @@ pub(crate) enum ReplacedContentKind {
 
 impl ReplacedContents {
     pub fn for_element(node: ServoLayoutNode<'_>, context: &LayoutContext) -> Option<Self> {
-        if let Some(ref data_attribute_string) = node.as_typeless_object_with_data_attribute() &&
-            let Some(url) = try_to_parse_image_data_url(data_attribute_string)
+        if let Some(ref data_attribute_string) = node.as_typeless_object_with_data_attribute()
+            && let Some(url) = try_to_parse_image_data_url(data_attribute_string)
         {
             return Self::from_image_url(node, context, &ComputedUrl::Valid(ServoArc::new(url)));
         }
@@ -316,8 +318,8 @@ impl ReplacedContents {
         // If the `content` property is a single image URL, non-replaced boxes
         // and images get replaced with the given image.
         if let Content::Items(GenericContentItems { items, .. }) =
-            node.style(&context.style_context).clone_content() &&
-            let [GenericContentItem::Image(image)] = items.as_slice()
+            node.style(&context.style_context).clone_content()
+            && let [GenericContentItem::Image(image)] = items.as_slice()
         {
             // Invalid images are treated as zero-sized.
             return Some(
@@ -517,6 +519,7 @@ impl ReplacedContents {
                         base,
                         clip,
                         image_key: Some(image_key),
+                        yuv_image: None,
                         showing_broken_image_icon: image_info.showing_broken_image_icon,
                         url: image_info.url.clone(),
                     }))
@@ -527,7 +530,8 @@ impl ReplacedContents {
                 vec![Fragment::Image(Arc::new(ImageFragment {
                     base,
                     clip,
-                    image_key: video_info.image_key,
+                    image_key: video_info.frame.map(|frame| frame.image_key),
+                    yuv_image: video_info.frame.and_then(|frame| frame.yuv),
                     showing_broken_image_icon: false,
                     url: None,
                 }))]
@@ -553,8 +557,8 @@ impl ReplacedContents {
                 }))]
             },
             ReplacedContentKind::Canvas(canvas_info) => {
-                if self.natural_size.width == Some(Au::zero()) ||
-                    self.natural_size.height == Some(Au::zero())
+                if self.natural_size.width == Some(Au::zero())
+                    || self.natural_size.height == Some(Au::zero())
                 {
                     return vec![];
                 }
@@ -567,6 +571,7 @@ impl ReplacedContents {
                     base,
                     clip,
                     image_key: Some(image_key),
+                    yuv_image: None,
                     showing_broken_image_icon: false,
                     url: None,
                 }))]
@@ -619,6 +624,7 @@ impl ReplacedContents {
                             base,
                             clip,
                             image_key: Some(image_key),
+                            yuv_image: None,
                             showing_broken_image_icon: false,
                             url: None,
                         }))

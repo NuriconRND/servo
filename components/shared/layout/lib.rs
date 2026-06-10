@@ -74,7 +74,7 @@ use style::thread_state::{self, ThreadState};
 use style::values::computed::Overflow;
 use style_traits::CSSPixel;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
-use webrender_api::{ExternalScrollId, ImageKey};
+use webrender_api::{ColorDepth, ColorRange, ExternalScrollId, ImageKey, YuvColorSpace};
 
 pub trait GenericLayoutDataTrait: Any + MallocSizeOfTrait + Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
@@ -230,11 +230,53 @@ pub struct PendingRasterizationImage {
     pub size: DeviceIntSize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub enum MediaFrameYuvFormat {
+    NV12,
+    PlanarYCbCr,
+}
+
+#[derive(Clone, Copy, Debug, MallocSizeOf)]
+pub struct MediaFrameYuvImage {
+    pub format: MediaFrameYuvFormat,
+    pub y_key: webrender_api::ImageKey,
+    pub u_or_uv_key: webrender_api::ImageKey,
+    pub v_key: Option<webrender_api::ImageKey>,
+    #[ignore_malloc_size_of = "WebRender scalar enum"]
+    pub color_depth: ColorDepth,
+    #[ignore_malloc_size_of = "WebRender scalar enum"]
+    pub color_space: YuvColorSpace,
+    #[ignore_malloc_size_of = "WebRender scalar enum"]
+    pub color_range: ColorRange,
+}
+
 #[derive(Clone, Copy, Debug, MallocSizeOf)]
 pub struct MediaFrame {
     pub image_key: webrender_api::ImageKey,
+    pub yuv: Option<MediaFrameYuvImage>,
     pub width: i32,
     pub height: i32,
+}
+
+impl MediaFrame {
+    pub fn image_keys(self) -> [Option<webrender_api::ImageKey>; 3] {
+        match self.yuv {
+            Some(MediaFrameYuvImage {
+                format: MediaFrameYuvFormat::NV12,
+                y_key,
+                u_or_uv_key,
+                ..
+            }) => [Some(y_key), Some(u_or_uv_key), None],
+            Some(MediaFrameYuvImage {
+                format: MediaFrameYuvFormat::PlanarYCbCr,
+                y_key,
+                u_or_uv_key,
+                v_key,
+                ..
+            }) => [Some(y_key), Some(u_or_uv_key), v_key],
+            None => [Some(self.image_key), None, None],
+        }
+    }
 }
 
 pub struct MediaMetadata {
@@ -818,8 +860,9 @@ impl ImageAnimationState {
             return false;
         }
         let time_interval_since_last_update = now - self.frame_start_time;
-        let mut remain_time_interval = time_interval_since_last_update -
-            self.image
+        let mut remain_time_interval = time_interval_since_last_update
+            - self
+                .image
                 .frames
                 .get(self.active_frame)
                 .unwrap()

@@ -1,0 +1,164 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall 4K 3DMark Video Probe</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #f4f4f4;
+  }
+
+  html,
+  body {
+    margin: 0;
+    min-width: 5760px;
+    min-height: 3240px;
+    overflow: hidden;
+    background:
+      linear-gradient(90deg, transparent 0 1918px, #ff4757 1918px 1922px, transparent 1922px 3838px, #ffa502 3838px 3842px, transparent 3842px),
+      linear-gradient(0deg, transparent 0 1078px, #2ed573 1078px 1082px, transparent 1082px 2158px, #1e90ff 2158px 2162px, transparent 2162px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.06) 0 1px, transparent 1px 240px),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.06) 0 1px, transparent 1px 180px),
+      #111;
+  }
+
+  main {
+    position: relative;
+    width: 5760px;
+    height: 3240px;
+  }
+
+  .boundary-label {
+    position: absolute;
+    z-index: 3;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, .72);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .x1 { left: 1932px; top: 24px; }
+  .x2 { left: 3852px; top: 24px; }
+  .y1 { left: 24px; top: 1092px; }
+  .y2 { left: 24px; top: 2172px; }
+
+  .video-stage {
+    position: absolute;
+    left: 1440px;
+    top: 420px;
+    width: 2880px;
+    height: 1620px;
+    border: 6px solid #f4f4f4;
+    box-sizing: border-box;
+    background: #000;
+    box-shadow: 0 0 0 6px rgba(0, 0, 0, .38);
+  }
+
+  video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .stats {
+    position: absolute;
+    left: 96px;
+    top: 96px;
+    z-index: 4;
+    width: 820px;
+    padding: 22px 26px;
+    background: rgba(0, 0, 0, .76);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font: 30px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre;
+  }
+
+  .motion-strip {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 5760px;
+    height: 160px;
+    background: repeating-linear-gradient(90deg, #f4f4f4 0 96px, #111 96px 192px);
+    opacity: .82;
+    animation: slide 2s linear infinite;
+  }
+
+  @keyframes slide {
+    from { background-position-x: 0; }
+    to { background-position-x: 192px; }
+  }
+</style>
+<main>
+  <div class="stats" id="stats">loading</div>
+  <div class="boundary-label x1">x=1920</div>
+  <div class="boundary-label x2">x=3840</div>
+  <div class="boundary-label y1">y=1080</div>
+  <div class="boundary-label y2">y=2160</div>
+  <section class="video-stage">
+    <video id="probeVideo" autoplay muted loop playsinline controls>
+      <source src="../4k_3DMark.mp4" type="video/mp4">
+    </video>
+  </section>
+  <div class="motion-strip"></div>
+</main>
+<script>
+  const video = document.getElementById("probeVideo");
+  const stats = document.getElementById("stats");
+  const canPlayMp4 = video.canPlayType('video/mp4; codecs="avc1.64001e"') || video.canPlayType("video/mp4") || "no";
+  let rafCount = 0;
+  let playError = "";
+  let mediaStatus = "loading";
+
+  video.play().catch(error => {
+    playError = String(error && error.message || error);
+  });
+
+  video.addEventListener("loadedmetadata", () => {
+    mediaStatus = "loadedmetadata";
+  });
+
+  video.addEventListener("playing", () => {
+    mediaStatus = "playing";
+  });
+
+  video.addEventListener("error", () => {
+    const error = video.error;
+    mediaStatus = "error";
+    playError = error ? `media error code ${error.code}` : "media error";
+  });
+
+  function playbackFrames() {
+    if (typeof video.getVideoPlaybackQuality === "function") {
+      return video.getVideoPlaybackQuality().totalVideoFrames;
+    }
+    if ("webkitDecodedFrameCount" in video) {
+      return video.webkitDecodedFrameCount;
+    }
+    return "n/a";
+  }
+
+  function tick() {
+    rafCount += 1;
+    stats.textContent = [
+      "Multi-GPU 4K 3DMark probe",
+      "source: 4k_3DMark.mp4",
+      `canPlay mp4: ${canPlayMp4}`,
+      `currentSrc: ${video.currentSrc || "none"}`,
+      `status: ${mediaStatus}`,
+      `time: ${video.currentTime.toFixed(3)}`,
+      `readyState: ${video.readyState}`,
+      `paused: ${video.paused}`,
+      `size: ${video.videoWidth}x${video.videoHeight}`,
+      `raf: ${rafCount}`,
+      `decoded: ${playbackFrames()}`,
+      `playError: ${playError || "none"}`
+    ].join("\n");
+    requestAnimationFrame(tick);
+  }
+
+  requestAnimationFrame(tick);
+</script>

@@ -8276,6 +8276,7 @@ dependencies = [
  "ipc-channel",
  "log",
  "mime",
+ "servo-config",
  "servo-media",
  "servo-media-audio",
  "servo-media-gstreamer-render",

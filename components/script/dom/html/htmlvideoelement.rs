@@ -129,7 +129,9 @@ impl HTMLVideoElement {
         match self.last_frame.borrow().as_ref() {
             Some(frame) => {
                 let size = Size2D::new(frame.get_width() as u32, frame.get_height() as u32);
-                if !frame.is_gl_texture() {
+                if frame.is_yuv() {
+                    None
+                } else if !frame.is_gl_texture() {
                     let alpha_mode = SnapshotAlphaMode::Transparent {
                         premultiplied: false,
                     };

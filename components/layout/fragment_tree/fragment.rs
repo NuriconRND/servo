@@ -7,7 +7,7 @@ use std::sync::Arc;
 use app_units::Au;
 use euclid::{Point2D, Rect, Size2D};
 use fonts::{FontMetrics, ShapedTextSlice};
-use layout_api::BoxAreaType;
+use layout_api::{BoxAreaType, MediaFrameYuvImage};
 use malloc_size_of_derive::MallocSizeOf;
 use servo_base::id::PipelineId;
 use servo_base::print_tree::PrintTree;
@@ -87,6 +87,7 @@ pub(crate) struct ImageFragment {
     pub base: BaseFragment,
     pub clip: PhysicalRect<Au>,
     pub image_key: Option<ImageKey>,
+    pub yuv_image: Option<MediaFrameYuvImage>,
     pub showing_broken_image_icon: bool,
     pub url: Option<ServoUrl>,
 }
@@ -118,10 +119,10 @@ impl Fragment {
             Fragment::Positioning(positioning_fragment) => {
                 positioning_fragment.set_containing_block(containing_block)
             },
-            Fragment::AbsoluteOrFixedPositioned(..) |
-            Fragment::Text(..) |
-            Fragment::Image(..) |
-            Fragment::IFrame(..) => {},
+            Fragment::AbsoluteOrFixedPositioned(..)
+            | Fragment::Text(..)
+            | Fragment::Image(..)
+            | Fragment::IFrame(..) => {},
         }
     }
 
@@ -174,10 +175,10 @@ impl Fragment {
                 fragment.scrollable_overflow_for_parent()
             },
             Fragment::Positioning(fragment) => fragment.scrollable_overflow_for_parent(),
-            Fragment::AbsoluteOrFixedPositioned(_) |
-            Fragment::Text(..) |
-            Fragment::Image(..) |
-            Fragment::IFrame(..) => self.base().map(|base| base.rect()).unwrap_or_default(),
+            Fragment::AbsoluteOrFixedPositioned(_)
+            | Fragment::Text(..)
+            | Fragment::Image(..)
+            | Fragment::IFrame(..) => self.base().map(|base| base.rect()).unwrap_or_default(),
         }
     }
 
@@ -235,10 +236,10 @@ impl Fragment {
                     containing_block_computation,
                 ))
             },
-            Fragment::Text(_) |
-            Fragment::AbsoluteOrFixedPositioned(_) |
-            Fragment::Image(_) |
-            Fragment::IFrame(_) => None,
+            Fragment::Text(_)
+            | Fragment::AbsoluteOrFixedPositioned(_)
+            | Fragment::Image(_)
+            | Fragment::IFrame(_) => None,
         }
     }
 

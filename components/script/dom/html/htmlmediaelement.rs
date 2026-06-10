@@ -21,8 +21,8 @@ use ipc_channel::ipc::{self};
 use ipc_channel::router::ROUTER;
 use js::context::JSContext;
 use js::realm::{AutoRealm, CurrentRealm};
-use layout_api::MediaFrame;
-use media::{GLPlayerMsg, GLPlayerMsgForward, WindowGLContext};
+use layout_api::{MediaFrame, MediaFrameYuvFormat, MediaFrameYuvImage};
+use media::{GLPlayerMsg, GLPlayerMsgForward, RawVideoFrameExternalImages, WindowGLContext};
 use net_traits::request::{Destination, RequestId};
 use net_traits::{
     CoreResourceThread, FetchMetadata, FilteredMetadata, NetworkError, ResourceFetchTiming,
@@ -39,15 +39,18 @@ use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
-use servo_media::player::video::{VideoFrame, VideoFrameRenderer};
+use servo_media::player::video::{
+    VideoFrame, VideoFrameRenderer, VideoFrameYuvColorRange, VideoFrameYuvColorSpace,
+    VideoFrameYuvData, VideoFrameYuvFormat,
+};
 use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
 use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
 use servo_url::ServoUrl;
 use stylo_atoms::Atom;
 use uuid::Uuid;
 use webrender_api::{
-    ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
-    ImageDescriptorFlags, ImageFormat, ImageKey,
+    ColorDepth, ColorRange, ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind,
+    ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey, YuvColorSpace,
 };
 
 use crate::document_loader::{LoadBlocker, LoadType};
@@ -173,6 +176,77 @@ impl FrameHolder {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MediaYuvExternalIds {
+    format: VideoFrameYuvFormat,
+    y: ExternalImageId,
+    u_or_uv: ExternalImageId,
+    v: Option<ExternalImageId>,
+}
+
+impl MediaYuvExternalIds {
+    fn new(format: VideoFrameYuvFormat, ids: &[ExternalImageId]) -> Option<Self> {
+        Some(match format {
+            VideoFrameYuvFormat::I420 => Self {
+                format,
+                y: *ids.first()?,
+                u_or_uv: *ids.get(1)?,
+                v: Some(*ids.get(2)?),
+            },
+            VideoFrameYuvFormat::NV12 => Self {
+                format,
+                y: *ids.first()?,
+                u_or_uv: *ids.get(1)?,
+                v: None,
+            },
+        })
+    }
+
+    fn ids(self) -> [Option<ExternalImageId>; 3] {
+        [Some(self.y), Some(self.u_or_uv), self.v]
+    }
+}
+
+fn wr_yuv_color_space(color_space: VideoFrameYuvColorSpace) -> YuvColorSpace {
+    match color_space {
+        VideoFrameYuvColorSpace::Rec601 => YuvColorSpace::Rec601,
+        VideoFrameYuvColorSpace::Rec709 => YuvColorSpace::Rec709,
+        VideoFrameYuvColorSpace::Rec2020 => YuvColorSpace::Rec2020,
+    }
+}
+
+fn wr_yuv_color_range(color_range: VideoFrameYuvColorRange) -> ColorRange {
+    match color_range {
+        VideoFrameYuvColorRange::Limited => ColorRange::Limited,
+        VideoFrameYuvColorRange::Full => ColorRange::Full,
+    }
+}
+
+fn yuv_plane_descriptor(yuv: &VideoFrameYuvData, plane_index: usize) -> Option<ImageDescriptor> {
+    let plane = yuv.plane(plane_index)?;
+    let image_format = match (yuv.format, plane_index) {
+        (VideoFrameYuvFormat::NV12, 1) => ImageFormat::RG8,
+        _ => ImageFormat::R8,
+    };
+    let mut descriptor = ImageDescriptor::new(
+        plane.width,
+        plane.height,
+        image_format,
+        ImageDescriptorFlags::empty(),
+    );
+    descriptor.stride = Some(plane.stride);
+    Some(descriptor)
+}
+
+fn external_yuv_plane_data(id: ExternalImageId) -> SerializableImageData {
+    SerializableImageData::External(ExternalImageData {
+        id,
+        channel_index: 0,
+        image_type: ExternalImageType::Buffer,
+        normalized_uvs: false,
+    })
+}
+
 #[derive(MallocSizeOf)]
 pub(crate) struct MediaFrameRenderer {
     webview_id: WebViewId,
@@ -182,10 +256,12 @@ pub(crate) struct MediaFrameRenderer {
     #[ignore_malloc_size_of = "Defined in other crates"]
     player_context: WindowGLContext,
     current_frame: Option<MediaFrame>,
-    old_frame: Option<ImageKey>,
-    very_old_frame: Option<ImageKey>,
+    old_frame: Option<MediaFrame>,
+    very_old_frame: Option<MediaFrame>,
     rendered_frame_count: u64,
     current_frame_holder: Option<FrameHolder>,
+    #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
+    yuv_external_ids: Option<MediaYuvExternalIds>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
 }
@@ -207,6 +283,7 @@ impl MediaFrameRenderer {
             very_old_frame: None,
             rendered_frame_count: 0,
             current_frame_holder: None,
+            yuv_external_ids: None,
             poster_frame: None,
         }
     }
@@ -293,15 +370,21 @@ impl MediaFrameRenderer {
         let mut updates = smallvec::smallvec![];
 
         if let Some(current_frame) = self.current_frame.take() {
-            updates.push(ImageUpdate::DeleteImage(current_frame.image_key));
+            Self::push_delete_frame_images(&mut updates, current_frame);
         }
 
-        if let Some(old_image_key) = self.old_frame.take() {
-            updates.push(ImageUpdate::DeleteImage(old_image_key));
+        if let Some(old_frame) = self.old_frame.take() {
+            Self::push_delete_frame_images(&mut updates, old_frame);
         }
 
-        if let Some(very_old_image_key) = self.very_old_frame.take() {
-            updates.push(ImageUpdate::DeleteImage(very_old_image_key));
+        if let Some(very_old_frame) = self.very_old_frame.take() {
+            Self::push_delete_frame_images(&mut updates, very_old_frame);
+        }
+
+        if let Some(yuv_external_ids) = self.yuv_external_ids.take() {
+            for id in yuv_external_ids.ids().into_iter().flatten() {
+                RawVideoFrameExternalImages::remove_plane(id);
+            }
         }
 
         if !updates.is_empty() {
@@ -314,10 +397,227 @@ impl MediaFrameRenderer {
         self.poster_frame = image.and_then(|image| {
             image.id.map(|image_key| MediaFrame {
                 image_key,
+                yuv: None,
                 width: image.metadata.width as i32,
                 height: image.metadata.height as i32,
             })
         });
+    }
+
+    fn push_delete_frame_images(
+        updates: &mut smallvec::SmallVec<[ImageUpdate; 1]>,
+        frame: MediaFrame,
+    ) {
+        for image_key in frame.image_keys().into_iter().flatten() {
+            updates.push(ImageUpdate::DeleteImage(image_key));
+        }
+    }
+
+    fn ensure_yuv_external_ids(&mut self, yuv: &VideoFrameYuvData) -> Option<MediaYuvExternalIds> {
+        if let Some(existing) = self.yuv_external_ids {
+            if existing.format == yuv.format {
+                return Some(existing);
+            }
+
+            for id in existing.ids().into_iter().flatten() {
+                RawVideoFrameExternalImages::remove_plane(id);
+            }
+        }
+
+        let plane_ids = RawVideoFrameExternalImages::allocate_plane_ids(yuv.plane_count())?;
+        let external_ids = MediaYuvExternalIds::new(yuv.format, &plane_ids)?;
+        self.yuv_external_ids = Some(external_ids);
+        Some(external_ids)
+    }
+
+    fn generate_image_key(&self) -> Option<ImageKey> {
+        self.paint_api.generate_image_key_blocking(self.webview_id)
+    }
+
+    fn media_frame_yuv_image(
+        yuv: &VideoFrameYuvData,
+        y_key: ImageKey,
+        u_or_uv_key: ImageKey,
+        v_key: Option<ImageKey>,
+    ) -> MediaFrameYuvImage {
+        MediaFrameYuvImage {
+            format: match yuv.format {
+                VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
+                VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
+            },
+            y_key,
+            u_or_uv_key,
+            v_key,
+            color_depth: ColorDepth::Color8,
+            color_space: wr_yuv_color_space(yuv.color_space),
+            color_range: wr_yuv_color_range(yuv.color_range),
+        }
+    }
+
+    fn render_yuv_frame(
+        &mut self,
+        frame: VideoFrame,
+        yuv: VideoFrameYuvData,
+        rendered_frame_count: u64,
+        frame_backend: &'static str,
+        mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
+    ) {
+        let frame_width = frame.get_width();
+        let frame_height = frame.get_height();
+        let Some(external_ids) = self.ensure_yuv_external_ids(&yuv) else {
+            warn!("Dropping YUV media frame because raw external image IDs are unavailable");
+            if !updates.is_empty() {
+                self.paint_api
+                    .update_images(self.webview_id.into(), updates);
+            }
+            return;
+        };
+
+        for (plane_index, id) in external_ids.ids().into_iter().enumerate() {
+            if let Some(id) = id {
+                RawVideoFrameExternalImages::update_plane(id, frame.clone(), plane_index);
+            }
+        }
+
+        let yuv_format = match yuv.format {
+            VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
+            VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
+        };
+        let image_update_for_log;
+        let image_key_for_log;
+
+        let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
+            current_frame.width == frame_width
+                && current_frame.height == frame_height
+                && current_frame
+                    .yuv
+                    .is_some_and(|current_yuv| current_yuv.format == yuv_format)
+        });
+
+        if current_frame_is_compatible {
+            let current_frame = self
+                .current_frame
+                .as_mut()
+                .expect("Current frame should be present");
+            image_key_for_log = Some(current_frame.image_key);
+            if let Some(current_yuv) = current_frame.yuv {
+                current_frame.yuv = Some(Self::media_frame_yuv_image(
+                    &yuv,
+                    current_yuv.y_key,
+                    current_yuv.u_or_uv_key,
+                    current_yuv.v_key,
+                ));
+            }
+            for (plane_index, (image_key, external_id)) in current_frame
+                .image_keys()
+                .into_iter()
+                .zip(external_ids.ids())
+                .enumerate()
+            {
+                let Some(image_key) = image_key else {
+                    continue;
+                };
+                let Some(external_id) = external_id else {
+                    continue;
+                };
+                let Some(descriptor) = yuv_plane_descriptor(&yuv, plane_index) else {
+                    continue;
+                };
+                updates.push(ImageUpdate::UpdateImage(
+                    image_key,
+                    descriptor,
+                    external_yuv_plane_data(external_id),
+                    None,
+                ));
+            }
+            image_update_for_log = "update";
+
+            self.current_frame_holder
+                .get_or_insert_with(|| FrameHolder::new(frame.clone()))
+                .set(frame);
+
+            if let Some(old_frame) = self.old_frame.take() {
+                Self::push_delete_frame_images(&mut updates, old_frame);
+            }
+        } else {
+            if let Some(current_frame) = self.current_frame.take() {
+                self.old_frame = Some(current_frame);
+            }
+
+            let Some(y_key) = self.generate_image_key() else {
+                return;
+            };
+            let Some(u_or_uv_key) = self.generate_image_key() else {
+                return;
+            };
+            let v_key = if yuv.format == VideoFrameYuvFormat::I420 {
+                let Some(v_key) = self.generate_image_key() else {
+                    return;
+                };
+                Some(v_key)
+            } else {
+                None
+            };
+
+            let yuv_image = Self::media_frame_yuv_image(&yuv, y_key, u_or_uv_key, v_key);
+            let current_frame = MediaFrame {
+                image_key: y_key,
+                yuv: Some(yuv_image),
+                width: frame_width,
+                height: frame_height,
+            };
+            image_key_for_log = Some(current_frame.image_key);
+            image_update_for_log = "add";
+
+            for (plane_index, (image_key, external_id)) in current_frame
+                .image_keys()
+                .into_iter()
+                .zip(external_ids.ids())
+                .enumerate()
+            {
+                let Some(image_key) = image_key else {
+                    continue;
+                };
+                let Some(external_id) = external_id else {
+                    continue;
+                };
+                let Some(descriptor) = yuv_plane_descriptor(&yuv, plane_index) else {
+                    continue;
+                };
+                updates.push(ImageUpdate::AddImage(
+                    image_key,
+                    descriptor,
+                    external_yuv_plane_data(external_id),
+                    false,
+                ));
+            }
+
+            self.current_frame_holder = Some(FrameHolder::new(frame));
+            self.current_frame = Some(current_frame);
+        }
+
+        let delete_update_count = updates
+            .iter()
+            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
+            .count();
+        info!(
+            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
+             frame_backend={} size={}x{} image_key={:?} image_update={} \
+             delete_updates={} updates_total={} glplayer_id={:?}",
+            self.webview_id,
+            self.player_id,
+            rendered_frame_count,
+            frame_backend,
+            frame_width,
+            frame_height,
+            image_key_for_log,
+            image_update_for_log,
+            delete_update_count,
+            updates.len(),
+            self.glplayer_id,
+        );
+        self.paint_api
+            .update_images(self.webview_id.into(), updates);
     }
 }
 
@@ -337,7 +637,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         let rendered_frame_count = self.rendered_frame_count;
         let frame_width = frame.get_width();
         let frame_height = frame.get_height();
-        let frame_backend = if frame.is_gl_texture() {
+        let yuv_frame_data = frame.get_yuv_data().cloned();
+        let frame_backend = if let Some(yuv) = yuv_frame_data.as_ref() {
+            match yuv.format {
+                VideoFrameYuvFormat::I420 => "yuv_i420_external_raw",
+                VideoFrameYuvFormat::NV12 => "yuv_nv12_external_raw",
+            }
+        } else if frame.is_gl_texture() {
             if frame.is_external_oes() {
                 "external_oes"
             } else {
@@ -351,8 +657,14 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
         let mut updates = smallvec::smallvec![];
 
-        if let Some(old_image_key) = mem::replace(&mut self.very_old_frame, self.old_frame.take()) {
-            updates.push(ImageUpdate::DeleteImage(old_image_key));
+        if let Some(very_old_frame) = mem::replace(&mut self.very_old_frame, self.old_frame.take())
+        {
+            Self::push_delete_frame_images(&mut updates, very_old_frame);
+        }
+
+        if let Some(yuv) = yuv_frame_data {
+            self.render_yuv_frame(frame, yuv, rendered_frame_count, frame_backend, updates);
+            return;
         }
 
         let descriptor = ImageDescriptor::new(
@@ -364,7 +676,9 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
         match &mut self.current_frame {
             Some(current_frame)
-                if current_frame.width == frame_width && current_frame.height == frame_height =>
+                if current_frame.width == frame_width
+                    && current_frame.height == frame_height
+                    && current_frame.yuv.is_none() =>
             {
                 image_key_for_log = Some(current_frame.image_key);
                 if !frame.is_gl_texture() {
@@ -383,12 +697,12 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     .get_or_insert_with(|| FrameHolder::new(frame.clone()))
                     .set(frame);
 
-                if let Some(old_image_key) = self.old_frame.take() {
-                    updates.push(ImageUpdate::DeleteImage(old_image_key));
+                if let Some(old_frame) = self.old_frame.take() {
+                    Self::push_delete_frame_images(&mut updates, old_frame);
                 }
             },
             Some(current_frame) => {
-                self.old_frame = Some(current_frame.image_key);
+                self.old_frame = Some(*current_frame);
 
                 let Some(new_image_key) =
                     self.paint_api.generate_image_key_blocking(self.webview_id)
@@ -398,6 +712,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
                 /* update current_frame */
                 current_frame.image_key = new_image_key;
+                current_frame.yuv = None;
                 current_frame.width = frame.get_width();
                 current_frame.height = frame.get_height();
                 image_key_for_log = Some(new_image_key);
@@ -448,6 +763,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 image_update_for_log = "add";
                 self.current_frame = Some(MediaFrame {
                     image_key,
+                    yuv: None,
                     width: frame_width,
                     height: frame_height,
                 });
@@ -781,9 +1097,9 @@ impl HTMLMediaElement {
                     error!("Could not play media: {error:?}");
                 }
             }
-        } else if is_playing &&
-            let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().pause()
+        } else if is_playing
+            && let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().pause()
         {
             error!("Could not pause player: {error:?}");
         }
@@ -835,8 +1151,8 @@ impl HTMLMediaElement {
         // Generally "ended" and "looping" are exclusive. Here, the loop attribute is ignored to
         // seek back to start in case loop was set after playback ended.
         // <https://github.com/whatwg/html/issues/4487>
-        if self.ended_playback(LoopCondition::Ignored) &&
-            self.direction_of_playback() == PlaybackDirection::Forwards
+        if self.ended_playback(LoopCondition::Ignored)
+            && self.direction_of_playback() == PlaybackDirection::Forwards
         {
             self.seek(
                 self.earliest_possible_position(),
@@ -868,9 +1184,9 @@ impl HTMLMediaElement {
             // readyState attribute has the value HAVE_FUTURE_DATA or HAVE_ENOUGH_DATA: notify about
             // playing for the element.
             match state {
-                ReadyState::HaveNothing |
-                ReadyState::HaveMetadata |
-                ReadyState::HaveCurrentData => {
+                ReadyState::HaveNothing
+                | ReadyState::HaveMetadata
+                | ReadyState::HaveCurrentData => {
                     self.queue_media_element_task_to_fire_event(atom!("waiting"));
                 },
                 ReadyState::HaveFutureData | ReadyState::HaveEnoughData => {
@@ -1061,8 +1377,8 @@ impl HTMLMediaElement {
 
         // => "If the previous ready state was HAVE_CURRENT_DATA or less, and the new ready state is
         // HAVE_FUTURE_DATA or more"
-        if old_ready_state <= ReadyState::HaveCurrentData &&
-            ready_state >= ReadyState::HaveFutureData
+        if old_ready_state <= ReadyState::HaveCurrentData
+            && ready_state >= ReadyState::HaveFutureData
         {
             // The user agent must queue a media element task given the media element to fire an
             // event named canplay at the element.
@@ -1290,8 +1606,8 @@ impl HTMLMediaElement {
         // Step 9.children.3. If candidate has a media attribute whose value does not match the
         // environment, then end the synchronous section, and jump down to the failed with elements
         // step below.
-        if let Some(media) = element.get_attribute_string_value(&local_name!("media")) &&
-            !MediaList::matches_environment(&element.owner_document(), &media)
+        if let Some(media) = element.get_attribute_string_value(&local_name!("media"))
+            && !MediaList::matches_environment(&element.owner_document(), &media)
         {
             self.load_from_source_child_failure_steps(source);
             return;
@@ -1311,8 +1627,8 @@ impl HTMLMediaElement {
         // type (including any codecs described by the codecs parameter, for types that define that
         // parameter), represents a type that the user agent knows it cannot render, then end the
         // synchronous section, and jump down to the failed with elements step below.
-        if let Some(type_) = element.get_attribute_string_value(&local_name!("type")) &&
-            ServoMedia::get().can_play_type(&type_) == SupportsMediaType::No
+        if let Some(type_) = element.get_attribute_string_value(&local_name!("type"))
+            && ServoMedia::get().can_play_type(&type_) == SupportsMediaType::No
         {
             self.load_from_source_child_failure_steps(source);
             return;
@@ -1721,17 +2037,17 @@ impl HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#potentially-playing>
     fn is_potentially_playing(&self) -> bool {
-        !self.paused.get() &&
-            !self.ended_playback(LoopCondition::Included) &&
-            self.error.get().is_none() &&
-            !self.is_blocked_media_element()
+        !self.paused.get()
+            && !self.ended_playback(LoopCondition::Included)
+            && self.error.get().is_none()
+            && !self.is_blocked_media_element()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#blocked-media-element>
     fn is_blocked_media_element(&self) -> bool {
-        self.ready_state.get() <= ReadyState::HaveCurrentData ||
-            self.is_paused_for_user_interaction() ||
-            self.is_paused_for_in_band_content()
+        self.ready_state.get() <= ReadyState::HaveCurrentData
+            || self.is_paused_for_user_interaction()
+            || self.is_paused_for_in_band_content()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#paused-for-user-interaction>
@@ -2112,8 +2428,8 @@ impl HTMLMediaElement {
         // Step 11. Set the current playback position to the new playback position.
         self.current_playback_position.set(time);
 
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().seek(time)
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().seek(time)
         {
             error!("Could not seek player: {error:?}");
         }
@@ -2264,8 +2580,8 @@ impl HTMLMediaElement {
             return;
         }
 
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().stop()
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().stop()
         {
             error!("Could not stop player: {error:?}");
         }
@@ -2280,16 +2596,16 @@ impl HTMLMediaElement {
     }
 
     pub(crate) fn set_audio_track(&self, idx: usize, enabled: bool) {
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().set_audio_track(idx as i32, enabled)
         {
             warn!("Could not set audio track {error:?}");
         }
     }
 
     pub(crate) fn set_video_track(&self, idx: usize, enabled: bool) {
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().set_video_track(idx as i32, enabled)
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().set_video_track(idx as i32, enabled)
         {
             warn!("Could not set video track: {error:?}");
         }
@@ -2322,8 +2638,8 @@ impl HTMLMediaElement {
             // direction of playback is forwards, and the media element does not have a loop
             // attribute specified.
             PlaybackDirection::Forwards => {
-                playback_position >= self.Duration() &&
-                    (loop_condition == LoopCondition::Ignored || !self.Loop())
+                playback_position >= self.Duration()
+                    && (loop_condition == LoopCondition::Ignored || !self.Loop())
             },
             // Or: The current playback position is the earliest possible position, and the
             // direction of playback is backwards.
@@ -2478,8 +2794,8 @@ impl HTMLMediaElement {
             // enable, then set enable to true, otherwise, set enable to false.
             if let Some(servo_url) = self.resource_url.borrow().as_ref() {
                 let fragment = MediaFragmentParser::from(servo_url);
-                if let Some(id) = fragment.id() &&
-                    audio_track.id() == id
+                if let Some(id) = fragment.id()
+                    && audio_track.id() == id
                 {
                     audio_track_list.set_enabled(audio_track_list.len() - 1, true);
                 }
@@ -2543,8 +2859,8 @@ impl HTMLMediaElement {
             // information that would facilitate the selection of specific video tracks to
             // improve the user's experience, then: if this video track is the first such video
             // track, then set enable to true, otherwise, set enable to false.
-            if let Some(track) = video_track_list.item(0) &&
-                let Some(servo_url) = self.resource_url.borrow().as_ref()
+            if let Some(track) = video_track_list.item(0)
+                && let Some(servo_url) = self.resource_url.borrow().as_ref()
             {
                 let fragment = MediaFragmentParser::from(servo_url);
                 if let Some(id) = fragment.id() {
@@ -2644,10 +2960,10 @@ impl HTMLMediaElement {
         // is still false, seek to that time.
         if let Some(servo_url) = self.resource_url.borrow().as_ref() {
             let fragment = MediaFragmentParser::from(servo_url);
-            if let Some(initial_playback_position) = fragment.start() &&
-                initial_playback_position > 0. &&
-                initial_playback_position < self.duration.get() &&
-                !jumped
+            if let Some(initial_playback_position) = fragment.start()
+                && initial_playback_position > 0.
+                && initial_playback_position < self.duration.get()
+                && !jumped
             {
                 self.seek(
                     initial_playback_position,
@@ -2732,8 +3048,8 @@ impl HTMLMediaElement {
         // The media engine signals that the source needs more data. If we already have a valid
         // fetch request, we do nothing. Otherwise, if we have no request and the previous request
         // was cancelled because we got an EnoughData event, we restart fetching where we left.
-        if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow() &&
-            let Some(reason) = current_fetch_context.cancel_reason()
+        if let Some(ref current_fetch_context) = *self.current_fetch_context.borrow()
+            && let Some(reason) = current_fetch_context.cancel_reason()
         {
             // XXX(ferjm) Ideally we should just create a fetch request from
             // where we left. But keeping track of the exact next byte that the
@@ -2749,8 +3065,8 @@ impl HTMLMediaElement {
             return;
         }
 
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
-            let Err(e) = {
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut()
+            && let Err(e) = {
                 let mut data_source = current_fetch_context.data_source().borrow_mut();
                 data_source.set_locked(false);
                 data_source.process_into_player_from_queue(self.player.borrow().as_ref().unwrap())
@@ -2771,8 +3087,8 @@ impl HTMLMediaElement {
         // to avoid excessive buffer queueing, so we cancel the ongoing fetch request if we are able
         // to restart it from where we left. Otherwise, we continue the current fetch request,
         // assuming that some frames will be dropped.
-        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut() &&
-            current_fetch_context.is_seekable()
+        if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut()
+            && current_fetch_context.is_seekable()
         {
             current_fetch_context.cancel(CancelReason::Backoff);
         }
@@ -3083,8 +3399,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
 
         self.muted.set(value);
 
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().set_mute(value)
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().set_mute(value)
         {
             warn!("Could not set mute state: {error:?}");
         }
@@ -3255,9 +3571,9 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
         // change the playback speed.
         self.playback_rate.set(*value);
 
-        if self.is_potentially_playing() &&
-            let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().set_playback_rate(*value)
+        if self.is_potentially_playing()
+            && let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().set_playback_rate(*value)
         {
             warn!("Could not set the playback rate: {error:?}");
         }
@@ -3306,8 +3622,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-ended>
     fn Ended(&self) -> bool {
-        self.ended_playback(LoopCondition::Included) &&
-            self.direction_of_playback() == PlaybackDirection::Forwards
+        self.ended_playback(LoopCondition::Included)
+            && self.direction_of_playback() == PlaybackDirection::Forwards
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-media-fastseek>
@@ -3410,8 +3726,8 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
 
         self.volume.set(*value);
 
-        if let Some(ref player) = *self.player.borrow() &&
-            let Err(error) = player.lock().unwrap().set_volume(*value)
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().set_volume(*value)
         {
             warn!("Could not set the volume: {error:?}");
         }
@@ -3589,11 +3905,11 @@ impl MicrotaskRunnable for MediaElementMicrotask {
 
     fn enter_realm<'cx>(&self, cx: &'cx mut js::context::JSContext) -> AutoRealm<'cx> {
         match self {
-            &MediaElementMicrotask::ResourceSelection { ref elem, .. } |
-            &MediaElementMicrotask::PauseIfNotInDocument { ref elem } |
-            &MediaElementMicrotask::Seeked { ref elem, .. } |
-            &MediaElementMicrotask::SelectNextSourceChild { ref elem, .. } |
-            &MediaElementMicrotask::SelectNextSourceChildAfterWait { ref elem, .. } => {
+            &MediaElementMicrotask::ResourceSelection { ref elem, .. }
+            | &MediaElementMicrotask::PauseIfNotInDocument { ref elem }
+            | &MediaElementMicrotask::Seeked { ref elem, .. }
+            | &MediaElementMicrotask::SelectNextSourceChild { ref elem, .. }
+            | &MediaElementMicrotask::SelectNextSourceChildAfterWait { ref elem, .. } => {
                 enter_auto_realm(cx, &**elem)
             },
         }
@@ -3829,8 +4145,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
             current_fetch_context.set_origin_clean(origin_clean);
         }
 
-        if let Some(metadata) = metadata.as_ref() &&
-            let Some(headers) = metadata.headers.as_ref()
+        if let Some(metadata) = metadata.as_ref()
+            && let Some(headers) = metadata.headers.as_ref()
         {
             // For range requests we get the size of the media asset from the Content-Range
             // header. Otherwise, we get it from the Content-Length header.
@@ -3843,8 +4159,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
             };
 
             // We only set the expected input size if it changes.
-            if content_length != self.expected_content_length &&
-                let Some(content_length) = content_length
+            if content_length != self.expected_content_length
+                && let Some(content_length) = content_length
             {
                 self.expected_content_length = Some(content_length);
             }
@@ -3863,8 +4179,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
             warn!("Could not set player seekable {:?}", e);
         }
 
-        if let Some(expected_content_length) = self.expected_content_length &&
-            let Err(e) = element
+        if let Some(expected_content_length) = self.expected_content_length
+            && let Err(e) = element
                 .player
                 .borrow()
                 .as_ref()
@@ -3894,8 +4210,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
             }
 
             // Discard chunk of the response body if fetch context doesn't support range requests.
-            let payload = if !current_fetch_context.is_seekable() &&
-                self.content_length_to_discard != 0
+            let payload = if !current_fetch_context.is_seekable()
+                && self.content_length_to_discard != 0
             {
                 if chunk.len() as u64 > self.content_length_to_discard {
                     let shrink_chunk = chunk[self.content_length_to_discard as usize..].to_vec();
@@ -3960,8 +4276,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
                 // start and stop positions without the total size of the stream is not
                 // possible. As fallback the media player perform seek with BYTES format
                 // and initiate seek request via "seek-data" callback with required offset.
-                if self.expected_content_length.is_none() &&
-                    let Err(e) = element
+                if self.expected_content_length.is_none()
+                    && let Err(e) = element
                         .player
                         .borrow()
                         .as_ref()
@@ -4027,8 +4343,8 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
 
         // Whether the current fetch request was cancelled due to a network or decoding error, or
         // was aborted by the user.
-        if let Some(cancel_reason) = current_fetch_context.cancel_reason() &&
-            matches!(*cancel_reason, CancelReason::Error | CancelReason::Abort)
+        if let Some(cancel_reason) = current_fetch_context.cancel_reason()
+            && matches!(*cancel_reason, CancelReason::Error | CancelReason::Abort)
         {
             return false;
         }

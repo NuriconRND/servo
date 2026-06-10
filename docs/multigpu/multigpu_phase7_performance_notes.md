@@ -136,3 +136,54 @@ Remaining performance work:
 - Run a longer steady-state capture and exclude startup/shutdown samples.
 - Add automated p95/p99 reporting for the 2x1 target log.
 - Add ETW/GPUView or PresentMon capture to validate OS compositor behavior.
+
+## 2026-06-10 Release Generic Stress Page Smoke
+
+This pass reran the generic object stress page on the 2x1 dual-GPU target after
+the page exited immediately in release mode.
+
+Command shape:
+
+```powershell
+target\release\servoshell.exe --wall-layout etc\multigpu\config\wall_layout.example_2x1_dualgpu.json --wall-all-tiles tests\html\multigpu_wall_stress_cases.html
+```
+
+Observed failure before the fix:
+
+- The release process exited when the stress page reached its WebGL canvas path.
+- The stderr log showed `SurfaceImportFailed(BadParameter)` from surfman while
+  importing a WebGL front-buffer surface into WebRender.
+- The immediate crash path was an `unwrap()` in
+  `components/shared/paint/rendering_context.rs` during
+  `device.create_surface_texture(context, surface)`.
+- A first defensive path that tried to destroy the failed surface still tripped
+  surfman's Windows/ANGLE surface ownership check.
+
+Fix applied:
+
+- `RenderingContext::create_texture()` now returns the original `Surface` on
+  failure instead of panicking or destroying it locally.
+- `WebGLExternalImages::lock_swap_chain()` recycles the failed surface back into
+  the WebGL swap-chain, decrements the busy-context counter, and marks rendering
+  to that context as finished.
+- The repeated nonfatal surface import diagnostic was lowered to debug level to
+  avoid release log spam.
+
+Validation:
+
+- `.\mach.bat build --release --media-stack gstreamer -j 8` completed
+  successfully after the fix.
+- Relaunched log:
+  `target\multigpu_logs\wall_stress_objects_2x1_release_watch_stderr_20260610_201427.log`.
+- The process stayed alive past the immediate startup window; checked live as
+  PID `25496` after startup and again after an additional 10 seconds.
+- The new stderr did not contain `panic_hook`, `Surface drop`, or
+  `SurfaceImportFailed(BadParameter)` warnings at `RUST_LOG=warn`.
+
+Remaining risk:
+
+- This fix prevents the whole wall process from exiting when a WebGL external
+  image surface cannot be imported.
+- It does not prove that the WebGL canvas content itself is correctly visible on
+  every tile when surfman rejects the surface import. Visual inspection and a
+  specific WebGL fallback policy are still needed.
