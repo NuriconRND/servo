@@ -140,6 +140,8 @@ pub enum PaintMessage {
     /// Ask the renderer to generate a frame for the current set of display lists
     /// from the given `PainterId`s that have been sent to the renderer.
     GenerateFrame(Vec<PainterId>),
+    /// Query the paint targets currently registered for a logical `WebView`.
+    GetWebViewPainterTargets(WebViewId, GenericSender<Vec<PainterId>>),
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(WebViewId, GenericSender<ImageKey>),
@@ -395,6 +397,22 @@ impl CrossProcessPaintApi {
         if let Err(error) = self.0.send(PaintMessage::GenerateFrame(painter_ids)) {
             warn!("Error generating frame: {error}");
         }
+    }
+
+    /// Query registered paint targets for a logical `WebView`.
+    ///
+    /// Wall-all-tiles registers one target per tile; normal single-window
+    /// rendering falls back to the primary painter id derived from `webview_id`.
+    pub fn webview_painter_targets_blocking(&self, webview_id: WebViewId) -> Vec<PainterId> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        if self
+            .0
+            .send(PaintMessage::GetWebViewPainterTargets(webview_id, sender))
+            .is_err()
+        {
+            return vec![webview_id.into()];
+        }
+        receiver.recv().unwrap_or_else(|_| vec![webview_id.into()])
     }
 
     /// Create a new image key. Blocks until the key is available.

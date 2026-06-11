@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::env;
 use std::sync::Arc;
 
 use glib::prelude::*;
@@ -13,6 +14,76 @@ use servo_media_player::video::{
     Buffer, VideoFrame, VideoFrameData, VideoFramePlane, VideoFrameYuvColorRange,
     VideoFrameYuvColorSpace, VideoFrameYuvData, VideoFrameYuvFormat,
 };
+
+const VIDEO_SINK_POLICY_ENV: &str = "SERVO_VIDEO_SINK_POLICY";
+const LOW_LATENCY_VIDEO_MAX_BUFFERS: u32 = 1;
+const LOW_LATENCY_VIDEO_MAX_LATENESS_NS: i64 = 16_000_000;
+const SMOOTH_VIDEO_MAX_BUFFERS: u32 = 3;
+const DISABLED_VIDEO_MAX_LATENESS_NS: i64 = -1;
+const VIDEO_SINK_PROCESSING_DEADLINE_NS: u64 = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoSinkPolicy {
+    Smooth,
+    LowLatency,
+}
+
+impl VideoSinkPolicy {
+    fn from_environment() -> Self {
+        match env::var(VIDEO_SINK_POLICY_ENV) {
+            Ok(value)
+                if value.eq_ignore_ascii_case("low-latency")
+                    || value.eq_ignore_ascii_case("low_latency")
+                    || value.eq_ignore_ascii_case("latency") =>
+            {
+                Self::LowLatency
+            },
+            Ok(value)
+                if value.eq_ignore_ascii_case("smooth")
+                    || value.eq_ignore_ascii_case("complete") =>
+            {
+                Self::Smooth
+            },
+            Ok(value) => {
+                log::warn!(
+                    "Ignoring invalid {VIDEO_SINK_POLICY_ENV}={value:?}; \
+                     expected smooth or low-latency"
+                );
+                Self::Smooth
+            },
+            Err(_) => Self::Smooth,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::LowLatency => "low-latency",
+        }
+    }
+
+    fn max_buffers(self) -> u32 {
+        match self {
+            Self::Smooth => SMOOTH_VIDEO_MAX_BUFFERS,
+            Self::LowLatency => LOW_LATENCY_VIDEO_MAX_BUFFERS,
+        }
+    }
+
+    fn drop_late(self) -> bool {
+        self == Self::LowLatency
+    }
+
+    fn qos(self) -> bool {
+        self == Self::LowLatency
+    }
+
+    fn max_lateness_ns(self) -> i64 {
+        match self {
+            Self::Smooth => DISABLED_VIDEO_MAX_LATENESS_NS,
+            Self::LowLatency => LOW_LATENCY_VIDEO_MAX_LATENESS_NS,
+        }
+    }
+}
 
 #[cfg(any(
     target_os = "linux",
@@ -89,7 +160,7 @@ struct GStreamerBuffer {
 }
 
 impl Buffer for GStreamerBuffer {
-    fn to_vec(&self) -> Option<VideoFrameData> {
+    fn frame_data(&self) -> Option<VideoFrameData> {
         match self.frame.format() {
             gstreamer_video::VideoFormat::I420 => Some(VideoFrameData::Yuv(
                 self.yuv_data(VideoFrameYuvFormat::I420)?,
@@ -97,10 +168,7 @@ impl Buffer for GStreamerBuffer {
             gstreamer_video::VideoFormat::Nv12 => Some(VideoFrameData::Yuv(
                 self.yuv_data(VideoFrameYuvFormat::NV12)?,
             )),
-            _ => {
-                let data = self.frame.plane_data(0).ok()?;
-                Some(VideoFrameData::Raw(Arc::new(data.to_vec())))
-            },
+            _ => Some(VideoFrameData::Raw(self.raw_bgra_copy()?)),
         }
     }
 
@@ -110,6 +178,11 @@ impl Buffer for GStreamerBuffer {
 }
 
 impl GStreamerBuffer {
+    fn raw_bgra_copy(&self) -> Option<Arc<Vec<u8>>> {
+        let data = self.frame.plane_data(0).ok()?;
+        Some(Arc::new(data.to_vec()))
+    }
+
     fn yuv_data(&self, format: VideoFrameYuvFormat) -> Option<VideoFrameYuvData> {
         let info = self.frame.info();
         let mut planes = [None; 3];
@@ -207,6 +280,23 @@ impl GStreamerRender {
             .map_err(|error| PlayerError::Backend(format!("appsink creation failed: {error:?}")))?
             .downcast::<gstreamer_app::AppSink>()
             .unwrap();
+        let policy = VideoSinkPolicy::from_environment();
+        appsink.set_max_buffers(policy.max_buffers());
+        appsink.set_drop(policy.drop_late());
+        appsink.set_property("qos", policy.qos());
+        appsink.set_property("max-lateness", policy.max_lateness_ns());
+        appsink.set_property("processing-deadline", VIDEO_SINK_PROCESSING_DEADLINE_NS);
+        appsink.set_property("enable-last-sample", false);
+        log::info!(
+            "GStreamer video sink policy: policy={} max_buffers={} drop={} qos={} \
+             max_lateness_ns={} processing_deadline_ns={} enable_last_sample=false",
+            policy.as_str(),
+            policy.max_buffers(),
+            policy.drop_late(),
+            policy.qos(),
+            policy.max_lateness_ns(),
+            VIDEO_SINK_PROCESSING_DEADLINE_NS,
+        );
 
         if let Some(render) = self.render.as_ref() {
             render.build_video_sink(appsink.upcast_ref::<gstreamer::Element>(), pipeline)?
@@ -215,11 +305,7 @@ impl GStreamerRender {
                 !servo_config::opts::get().multiprocess && !servo_config::opts::get().force_ipc;
             let caps = if use_borrowed_yuv {
                 gstreamer_video::VideoCapsBuilder::new()
-                    .format_list([
-                        gstreamer_video::VideoFormat::I420,
-                        gstreamer_video::VideoFormat::Nv12,
-                        gstreamer_video::VideoFormat::Bgra,
-                    ])
+                    .format(gstreamer_video::VideoFormat::I420)
                     .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
                     .build()
             } else {

@@ -24,7 +24,7 @@ struct GStreamerBuffer {
 }
 
 impl Buffer for GStreamerBuffer {
-    fn to_vec(&self) -> Option<VideoFrameData> {
+    fn frame_data(&self) -> Option<VideoFrameData> {
         // packed formats are guaranteed to be in a single plane
         if self.frame.format() == gstreamer_video::VideoFormat::Rgba {
             let tex_id = self.frame.texture_id(0).ok()?;

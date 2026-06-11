@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 use std::{f64, mem};
 
@@ -123,6 +123,21 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../resources/media-controls.js"
 /// requested position (e.g. snapping to the nearest keyframe), so we use a threshold
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
+const MEDIA_FRAME_INFO_INTERVAL: u64 = 120;
+const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF";
+
+fn disable_enough_data_backoff() -> bool {
+    static DISABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var(DISABLE_ENOUGHDATA_BACKOFF_ENV).is_ok_and(|value| {
+            value == "1" ||
+                value.eq_ignore_ascii_case("true") ||
+                value.eq_ignore_ascii_case("yes") ||
+                value.eq_ignore_ascii_case("on")
+        })
+    });
+
+    *DISABLED
+}
 
 #[derive(MallocSizeOf, PartialEq)]
 enum FrameStatus {
@@ -259,6 +274,11 @@ pub(crate) struct MediaFrameRenderer {
     old_frame: Option<MediaFrame>,
     very_old_frame: Option<MediaFrame>,
     rendered_frame_count: u64,
+    #[ignore_malloc_size_of = "Diagnostic timestamp"]
+    last_rendered_frame_at: Option<Instant>,
+    #[ignore_malloc_size_of = "Diagnostic timestamp"]
+    media_frame_summary_at: Instant,
+    media_frame_summary_count: u64,
     current_frame_holder: Option<FrameHolder>,
     #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
     yuv_external_ids: Option<MediaYuvExternalIds>,
@@ -282,6 +302,9 @@ impl MediaFrameRenderer {
             old_frame: None,
             very_old_frame: None,
             rendered_frame_count: 0,
+            last_rendered_frame_at: None,
+            media_frame_summary_at: Instant::now(),
+            media_frame_summary_count: 0,
             current_frame_holder: None,
             yuv_external_ids: None,
             poster_frame: None,
@@ -359,6 +382,9 @@ impl MediaFrameRenderer {
     fn reset(&mut self) {
         self.player_id = None;
         self.rendered_frame_count = 0;
+        self.last_rendered_frame_at = None;
+        self.media_frame_summary_at = Instant::now();
+        self.media_frame_summary_count = 0;
 
         if let Some(glplayer_id) = self.glplayer_id.take() {
             self.player_context
@@ -434,6 +460,78 @@ impl MediaFrameRenderer {
         self.paint_api.generate_image_key_blocking(self.webview_id)
     }
 
+    fn note_media_frame_rendered(&mut self) -> Option<f64> {
+        let now = Instant::now();
+        let elapsed_ms = self.last_rendered_frame_at.map(|last_rendered_frame_at| {
+            now.saturating_duration_since(last_rendered_frame_at)
+                .as_secs_f64()
+                * 1000.0
+        });
+        self.last_rendered_frame_at = Some(now);
+        elapsed_ms
+    }
+
+    fn log_media_frame(
+        &mut self,
+        rendered_frame_count: u64,
+        frame_backend: &'static str,
+        frame_width: i32,
+        frame_height: i32,
+        image_key: Option<ImageKey>,
+        image_update: &'static str,
+        delete_update_count: usize,
+        update_count: usize,
+        inter_frame_ms: Option<f64>,
+    ) {
+        debug!(
+            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
+             frame_backend={} size={}x{} image_key={:?} image_update={} \
+             delete_updates={} updates_total={} inter_frame_ms={:?} glplayer_id={:?}",
+            self.webview_id,
+            self.player_id,
+            rendered_frame_count,
+            frame_backend,
+            frame_width,
+            frame_height,
+            image_key,
+            image_update,
+            delete_update_count,
+            update_count,
+            inter_frame_ms,
+            self.glplayer_id,
+        );
+
+        self.media_frame_summary_count = self.media_frame_summary_count.saturating_add(1);
+        if image_update != "update" || rendered_frame_count % MEDIA_FRAME_INFO_INTERVAL == 0 {
+            let now = Instant::now();
+            let summary_elapsed_ms = now
+                .saturating_duration_since(self.media_frame_summary_at)
+                .as_secs_f64()
+                * 1000.0;
+            info!(
+                "Wall media frame summary: webview={:?} player_id={:?} media_frame_id={} \
+                 frame_backend={} size={}x{} image_update={} frames_since_summary={} \
+                 summary_elapsed_ms={:.3} delete_updates={} updates_total={} \
+                 inter_frame_ms={:?} glplayer_id={:?}",
+                self.webview_id,
+                self.player_id,
+                rendered_frame_count,
+                frame_backend,
+                frame_width,
+                frame_height,
+                image_update,
+                self.media_frame_summary_count,
+                summary_elapsed_ms,
+                delete_update_count,
+                update_count,
+                inter_frame_ms,
+                self.glplayer_id,
+            );
+            self.media_frame_summary_count = 0;
+            self.media_frame_summary_at = now;
+        }
+    }
+
     fn media_frame_yuv_image(
         yuv: &VideoFrameYuvData,
         y_key: ImageKey,
@@ -460,6 +558,7 @@ impl MediaFrameRenderer {
         yuv: VideoFrameYuvData,
         rendered_frame_count: u64,
         frame_backend: &'static str,
+        inter_frame_ms: Option<f64>,
         mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
     ) {
         let frame_width = frame.get_width();
@@ -600,12 +699,7 @@ impl MediaFrameRenderer {
             .iter()
             .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
             .count();
-        info!(
-            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
-             frame_backend={} size={}x{} image_key={:?} image_update={} \
-             delete_updates={} updates_total={} glplayer_id={:?}",
-            self.webview_id,
-            self.player_id,
+        self.log_media_frame(
             rendered_frame_count,
             frame_backend,
             frame_width,
@@ -614,7 +708,7 @@ impl MediaFrameRenderer {
             image_update_for_log,
             delete_update_count,
             updates.len(),
-            self.glplayer_id,
+            inter_frame_ms,
         );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
@@ -635,6 +729,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
 
         self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
         let rendered_frame_count = self.rendered_frame_count;
+        let inter_frame_ms = self.note_media_frame_rendered();
         let frame_width = frame.get_width();
         let frame_height = frame.get_height();
         let yuv_frame_data = frame.get_yuv_data().cloned();
@@ -663,7 +758,14 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
 
         if let Some(yuv) = yuv_frame_data {
-            self.render_yuv_frame(frame, yuv, rendered_frame_count, frame_backend, updates);
+            self.render_yuv_frame(
+                frame,
+                yuv,
+                rendered_frame_count,
+                frame_backend,
+                inter_frame_ms,
+                updates,
+            );
             return;
         }
 
@@ -802,12 +904,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             .iter()
             .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
             .count();
-        info!(
-            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
-             frame_backend={} size={}x{} image_key={:?} image_update={} \
-             delete_updates={} updates_total={} glplayer_id={:?}",
-            self.webview_id,
-            self.player_id,
+        self.log_media_frame(
             rendered_frame_count,
             frame_backend,
             frame_width,
@@ -816,7 +913,7 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             image_update_for_log,
             delete_update_count,
             updates.len(),
-            self.glplayer_id,
+            inter_frame_ms,
         );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
@@ -3056,7 +3153,7 @@ impl HTMLMediaElement {
             // media backend expects is not the easiest task, so I'm simply
             // seeking to the current playback position for now which will create
             // a new fetch request for the last rendered frame.
-            if *reason == CancelReason::Backoff {
+            if *reason == CancelReason::Backoff && !disable_enough_data_backoff() {
                 self.seek(
                     self.current_playback_position.get(),
                     /* approximate_for_speed */ false,
@@ -3076,7 +3173,7 @@ impl HTMLMediaElement {
             // restart the download later from where we left, we cancel
             // the current request. Otherwise, we continue the request
             // assuming that we may drop some frames.
-            if e == PlayerError::EnoughData {
+            if e == PlayerError::EnoughData && !disable_enough_data_backoff() {
                 current_fetch_context.cancel(CancelReason::Backoff);
             }
         }
@@ -3089,6 +3186,7 @@ impl HTMLMediaElement {
         // assuming that some frames will be dropped.
         if let Some(ref mut current_fetch_context) = *self.current_fetch_context.borrow_mut()
             && current_fetch_context.is_seekable()
+            && !disable_enough_data_backoff()
         {
             current_fetch_context.cancel(CancelReason::Backoff);
         }
@@ -4236,7 +4334,7 @@ impl FetchResponseListener for HTMLMediaElementFetchListener {
                 // restart the download later from where we left, we cancel
                 // the current request. Otherwise, we continue the request
                 // assuming that we may drop some frames.
-                if e == PlayerError::EnoughData {
+                if e == PlayerError::EnoughData && !disable_enough_data_backoff() {
                     current_fetch_context.cancel(CancelReason::Backoff);
                 }
                 return;

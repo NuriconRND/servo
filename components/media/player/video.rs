@@ -68,7 +68,12 @@ pub enum VideoFrameData {
 }
 
 pub trait Buffer: Send + Sync {
-    fn to_vec(&self) -> Option<VideoFrameData>;
+    /// Return the renderable frame payload.
+    ///
+    /// Raw BGRA frames may return an owned byte buffer. YUV frames should return
+    /// only metadata here and expose decoded plane bytes through `plane_data()`
+    /// so callers do not accidentally copy the whole frame.
+    fn frame_data(&self) -> Option<VideoFrameData>;
 
     fn plane_data(&self, _plane_index: usize) -> Option<&[u8]> {
         None
@@ -86,7 +91,7 @@ pub struct VideoFrame {
 
 impl VideoFrame {
     pub fn new(width: i32, height: i32, buffer: Arc<dyn Buffer>) -> Option<Self> {
-        let data = buffer.to_vec()?;
+        let data = buffer.frame_data()?;
         Some(VideoFrame {
             width,
             height,

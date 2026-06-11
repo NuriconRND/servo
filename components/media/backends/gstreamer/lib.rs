@@ -17,6 +17,7 @@ mod source;
 pub mod webrtc;
 
 use std::collections::HashMap;
+use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -51,9 +52,98 @@ static BACKEND_BASE_TIME: LazyLock<gstreamer::ClockTime> =
     LazyLock::new(|| gstreamer::SystemClock::obtain().time());
 
 static BACKEND_THREAD: OnceLock<bool> = OnceLock::new();
+const VIDEO_DECODER_POLICY_ENV: &str = "SERVO_GSTREAMER_VIDEO_DECODER_POLICY";
+const SOFTWARE_VIDEO_DECODERS: &[&str] = &[
+    "avdec_h264",
+    "avdec_h265",
+    "avdec_mpeg2video",
+    "avdec_vp8",
+    "avdec_vp9",
+    "dav1ddec",
+    "vp8dec",
+    "vp9dec",
+];
 
 pub type WeakMediaInstance = Weak<Mutex<dyn MediaInstance>>;
 pub type WeakMediaInstanceHashMap = HashMap<ClientContextId, Vec<(usize, WeakMediaInstance)>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoDecoderPolicy {
+    Software,
+    Auto,
+}
+
+impl VideoDecoderPolicy {
+    fn from_environment() -> Self {
+        match env::var(VIDEO_DECODER_POLICY_ENV) {
+            Ok(value)
+                if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("default") =>
+            {
+                Self::Auto
+            },
+            Ok(value)
+                if value.eq_ignore_ascii_case("software")
+                    || value.eq_ignore_ascii_case("avdec") =>
+            {
+                Self::Software
+            },
+            Ok(value) => {
+                warn!(
+                    "Ignoring invalid {VIDEO_DECODER_POLICY_ENV}={value:?}; \
+                     expected software or auto"
+                );
+                Self::Software
+            },
+            Err(_) => Self::Software,
+        }
+    }
+}
+
+fn configure_video_decoder_policy() {
+    match VideoDecoderPolicy::from_environment() {
+        VideoDecoderPolicy::Auto => {
+            log::info!("GStreamer video decoder policy: auto");
+        },
+        VideoDecoderPolicy::Software => configure_software_video_decoders(),
+    }
+}
+
+fn configure_software_video_decoders() {
+    let decoder_factories = gstreamer::ElementFactory::factories_with_type(
+        gstreamer::ElementFactoryType::DECODER | gstreamer::ElementFactoryType::MEDIA_VIDEO,
+        gstreamer::Rank::NONE,
+    );
+
+    let mut demoted = Vec::new();
+    for factory in decoder_factories {
+        let name = factory.name();
+        let klass = factory.metadata("klass").unwrap_or_default();
+        let is_hardware = klass.contains("Hardware")
+            || name.starts_with("d3d11")
+            || name.starts_with("nv")
+            || name.starts_with("qsv")
+            || name.starts_with("mf");
+        if is_hardware && factory.rank() != gstreamer::Rank::NONE {
+            factory.set_rank(gstreamer::Rank::NONE);
+            demoted.push(name.to_string());
+        }
+    }
+
+    let mut promoted = Vec::new();
+    for decoder in SOFTWARE_VIDEO_DECODERS {
+        let Some(factory) = gstreamer::ElementFactory::find(decoder) else {
+            continue;
+        };
+        factory.set_rank(gstreamer::Rank::PRIMARY + 32);
+        promoted.push((*decoder).to_owned());
+    }
+
+    log::info!(
+        "GStreamer video decoder policy: software promoted={:?} demoted_hardware={:?}",
+        promoted,
+        demoted,
+    );
+}
 
 pub struct GStreamerBackend {
     capture_mocking: AtomicBool,
@@ -106,6 +196,7 @@ impl GStreamerBackend {
         if !errors.is_empty() {
             return Err(ErrorLoadingPlugins(errors));
         }
+        configure_video_decoder_policy();
 
         type MediaInstancesVec = Vec<(usize, Weak<Mutex<dyn MediaInstance>>)>;
         let instances: HashMap<ClientContextId, MediaInstancesVec> = Default::default();

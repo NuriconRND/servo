@@ -245,9 +245,14 @@ impl WebGLRenderingContext {
         };
 
         let (sender, receiver) = webgl_channel().unwrap();
+        let primary_painter_id = window.webview_id().into();
+        let target_painter_ids = window
+            .paint_api()
+            .webview_painter_targets_blocking(window.webview_id());
         webgl_chan
             .send(WebGLMsg::CreateContext(
-                window.webview_id().into(),
+                primary_painter_id,
+                target_painter_ids,
                 webgl_version,
                 size,
                 attrs,

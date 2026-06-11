@@ -198,11 +198,13 @@ impl Painter {
         }
         debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
 
+        let painter_id = PainterId::next();
         let id_manager = paint.webrender_external_image_id_manager();
         let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));
 
         // Set WebRender external image handler for WebGL textures.
         let image_handler = Box::new(WebGLExternalImages::new(
+            painter_id,
             paint.webgl_threads(),
             rendering_context.clone(),
             paint.swap_chains.clone(),
@@ -257,7 +259,6 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
-        let painter_id = PainterId::next();
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
@@ -769,6 +770,10 @@ impl Painter {
             pending_frames_before_request,
         );
         self.pending_frames.set(pending_frames_before_request + 1);
+    }
+
+    pub(crate) fn pending_frames(&self) -> usize {
+        self.pending_frames.get()
     }
 
     pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
@@ -1333,11 +1338,11 @@ impl Painter {
         &mut self,
         diagnostic_frame_id: u64,
         wall_requested_at: Instant,
-    ) {
+    ) -> bool {
         self.frame_delayer.set_pending_frame(true);
 
         if !self.frame_delayer.needs_new_frame() {
-            return;
+            return false;
         }
 
         let mut transaction = Transaction::new();
@@ -1359,7 +1364,8 @@ impl Painter {
 
         self.frame_delayer.set_pending_frame(false);
         self.screenshot_taker
-            .prepare_screenshot_requests_for_render(self)
+            .prepare_screenshot_requests_for_render(self);
+        true
     }
 
     fn serializable_image_data_to_image_data_maybe_caching(
