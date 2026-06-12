@@ -84,6 +84,7 @@ use crate::dom::html::htmltrackelement::HTMLTrackElement;
 use crate::dom::html::htmlulistelement::HTMLUListElement;
 use crate::dom::html::htmlunknownelement::HTMLUnknownElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::rtspstreamelement::RtspStreamElement;
 use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::htmlmarqueeelement::HTMLMarqueeElement;
 use crate::dom::svg::svgelement::SVGElement;
@@ -429,6 +430,11 @@ pub(crate) fn create_native_html_element(
         local_name!("video") => make!(HTMLVideoElement),
         local_name!("wbr") => make!(HTMLElement),
         local_name!("xmp") => make!(HTMLPreElement),
+        // Experimental non-standard element. `rtsp-stream` is not an interned
+        // atom (it has a hyphen), so it cannot be matched with `local_name!`;
+        // compare at runtime. This arm must precede the custom-element
+        // fallthrough below, which would otherwise claim any hyphenated name.
+        _ if &*name.local == "rtsp-stream" => make!(RtspStreamElement),
         _ if is_valid_custom_element_name(&name.local) => make!(HTMLElement),
         _ => make!(HTMLUnknownElement),
     }

@@ -94,6 +94,12 @@ pub enum StreamType {
     Stream,
     /// The stream is seekable.
     Seekable,
+    /// The backend owns the source via an auto-plugged network element (e.g.
+    /// `rtspsrc` for `rtsp://` URIs). Unlike `Stream`/`Seekable`, no AppSrc is
+    /// registered and no bytes are pushed through `push_data`; the backend pulls
+    /// directly from the network URI passed at player creation. Non-seekable,
+    /// typically a live stream with unknown duration.
+    NetworkUri,
 }
 
 pub trait Player: Send + MediaInstance {

@@ -267,7 +267,7 @@ pub(crate) struct MediaFrameRenderer {
 }
 
 impl MediaFrameRenderer {
-    fn new(
+    pub(crate) fn new(
         webview_id: WebViewId,
         paint_api: CrossProcessPaintApi,
         player_context: WindowGLContext,
@@ -288,7 +288,14 @@ impl MediaFrameRenderer {
         }
     }
 
-    fn setup(
+    /// The frame currently being presented, if any. Used by replaced-element
+    /// layout (both `<video>` and the experimental `<rtsp-stream>`) to read the
+    /// frame without reaching into private renderer state.
+    pub(crate) fn current_frame(&self) -> Option<MediaFrame> {
+        self.current_frame
+    }
+
+    pub(crate) fn setup(
         &mut self,
         player_id: usize,
         task_source: SendableTaskSource,
@@ -356,7 +363,7 @@ impl MediaFrameRenderer {
         );
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.player_id = None;
         self.rendered_frame_count = 0;
 
@@ -2520,6 +2527,9 @@ impl HTMLMediaElement {
             video_renderer,
             audio_renderer,
             Box::new(window.get_player_context()),
+            // The standard <video>/<audio> path always feeds bytes through an
+            // AppSrc, never a direct network URI.
+            None,
         );
         let player_id = {
             let player_guard = player.lock().unwrap();

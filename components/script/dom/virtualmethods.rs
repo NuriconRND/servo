@@ -58,6 +58,7 @@ use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::html::htmltitleelement::HTMLTitleElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::rtspstreamelement::RtspStreamElement;
 use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::htmlbuttonelement::CommandState;
 use crate::dom::htmldialogelement::HTMLDialogElement;
@@ -333,6 +334,9 @@ pub(crate) fn vtable_for(node: &Node) -> &dyn VirtualMethods {
         },
         NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLTitleElement)) => {
             node.downcast::<HTMLTitleElement>().unwrap() as &dyn VirtualMethods
+        },
+        NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::RtspStreamElement)) => {
+            node.downcast::<RtspStreamElement>().unwrap() as &dyn VirtualMethods
         },
         NodeTypeId::Element(ElementTypeId::SVGElement(SVGElementTypeId::SVGGraphicsElement(
             SVGGraphicsElementTypeId::SVGImageElement,

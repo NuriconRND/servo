@@ -448,6 +448,11 @@ pub struct GStreamerPlayer {
     is_ready: Arc<Once>,
     /// Indicates whether the type of media stream to be played is a live stream.
     stream_type: StreamType,
+    /// Network URI to play directly when `stream_type` is
+    /// [`StreamType::NetworkUri`] (e.g. an `rtsp://` URL). The backend lets
+    /// playbin3 auto-plug the source element (`rtspsrc`) for this URI instead of
+    /// registering an AppSrc.
+    network_uri: Option<String>,
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
 }
@@ -463,6 +468,7 @@ impl GStreamerPlayer {
         video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
         audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
         gl_context: Box<dyn PlayerGLContext>,
+        network_uri: Option<String>,
     ) -> GStreamerPlayer {
         let _ = gstreamer::DebugCategory::new(
             "servoplayer",
@@ -480,11 +486,18 @@ impl GStreamerPlayer {
             video_renderer,
             is_ready: Arc::new(Once::new()),
             stream_type,
+            network_uri,
             render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
         }
     }
 
     fn setup(&self) -> Result<(), PlayerError> {
+        eprintln!(
+            "[RTSP-DIAG] setup() entered: stream_type={:?} inner_is_some={} network_uri={:?}",
+            self.stream_type,
+            self.inner.borrow().is_some(),
+            self.network_uri,
+        );
         if self.inner.borrow().is_some() {
             return Ok(());
         }
@@ -497,6 +510,25 @@ impl GStreamerPlayer {
                     "Missing dependency: {}",
                     element
                 )));
+            }
+        }
+
+        // NetworkUri playback relies on playbin3 auto-plugging a network source
+        // element. For rtsp:// URIs this is `rtspsrc` (which itself depends on the
+        // `rtpmanager` plugin). Fail fast with a clear error if the RTSP plugins
+        // are not available in this GStreamer install.
+        if self.stream_type == StreamType::NetworkUri &&
+            self.network_uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("rtsp"))
+        {
+            for element in ["rtspsrc", "rtpbin"] {
+                if gstreamer::ElementFactory::find(element).is_none() {
+                    return Err(PlayerError::Backend(format!(
+                        "Missing dependency: {}",
+                        element
+                    )));
+                }
             }
         }
 
@@ -620,6 +652,17 @@ impl GStreamerPlayer {
                 })?;
                 "servosrc://".to_value()
             },
+            StreamType::NetworkUri => {
+                // Let playbin3 own the source: it auto-plugs the right element
+                // (e.g. rtspsrc) for the scheme. No servo AppSrc is registered.
+                let uri = self.network_uri.clone().ok_or_else(|| {
+                    PlayerError::Backend(
+                        "NetworkUri stream type requires a network_uri".to_owned(),
+                    )
+                })?;
+                eprintln!("[RTSP-DIAG] NetworkUri: playbin3 uri = {uri}");
+                uri.to_value()
+            },
         };
         player.set_property("uri", &uri);
 
@@ -658,6 +701,7 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `error` signal
         signal_adapter.connect_error(move |_self, error, _details| {
+            eprintln!("[RTSP-DIAG] gstreamer error signal: {error}");
             let _ = notify!(observer, PlayerEvent::Error(error.to_string()));
         });
 
@@ -665,6 +709,7 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
+            eprintln!("[RTSP-DIAG] gstreamer state-changed: {play_state:?}");
             inner_clone.lock().unwrap().play_state = play_state;
 
             let state = match play_state {
@@ -904,6 +949,19 @@ impl GStreamerPlayer {
                         });
                         PlayerSource::Stream(media_stream_src)
                     },
+                    StreamType::NetworkUri => {
+                        // The auto-plugged source (e.g. rtspsrc) is owned by
+                        // playbin3, so we must NOT dynamic_cast it to a servo
+                        // AppSrc here. There is also no `need-data` signal to wait
+                        // on, so unblock `setup()` immediately. No PlayerSource is
+                        // stored: data is pulled by the backend, never pushed.
+                        eprintln!("[RTSP-DIAG] source-setup NetworkUri arm fired, signaling ready");
+                        let sender_clone = sender.clone();
+                        is_ready_clone.call_once(|| {
+                            let _ = notify!(sender_clone, Ok(()));
+                        });
+                        return None;
+                    },
                 };
 
                 inner.set_src(source);
@@ -917,12 +975,14 @@ impl GStreamerPlayer {
                     signal_adapter.play().stop();
                 });
 
+            eprintln!("[RTSP-DIAG] setup: calling player.pause() to trigger source-setup");
             inner.player.pause();
 
             (receiver, error_handler_id)
         };
 
         let result = receiver.recv().unwrap();
+        eprintln!("[RTSP-DIAG] setup: recv() returned {result:?}");
         glib::signal::signal_handler_disconnect(&inner.lock().unwrap().player, error_handler_id);
         result
     }

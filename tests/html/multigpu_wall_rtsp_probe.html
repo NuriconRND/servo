@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<!-- Feasibility probe for the experimental <rtsp-stream> element (Stage 5).
+     Run with: servoshell.exe --pref dom_rtsp_stream_enabled=true tests/html/multigpu_wall_rtsp_probe.html
+     A local RTSP server must publish rtsp://127.0.0.1:8554/test (e.g. MediaMTX
+     or gst-rtsp-server videotestsrc). Redirect stderr to a log and look for
+     "MetadataUpdated", "Wall media frame", and the absence of panics. -->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>RTSP stream feasibility probe</title>
+  <style>
+    body { background: #111; color: #ddd; font-family: monospace; margin: 0; padding: 8px; }
+    rtsp-stream { display: block; background: #000; border: 2px solid #0a0; }
+    #log { white-space: pre-wrap; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <rtsp-stream id="s" src="rtsp://127.0.0.1:8554/test" width="640" height="360"></rtsp-stream>
+  <div id="log"></div>
+  <script>
+    const log = (m) => {
+      const line = `[${(performance.now() / 1000).toFixed(1)}s] ${m}`;
+      document.getElementById('log').textContent += line + "\n";
+      // Mirror to stderr-visible console for the smoke-run log.
+      console.log("RTSP_PROBE " + line);
+    };
+
+    const el = document.getElementById('s');
+
+    if (!(el instanceof RtspStreamElement)) {
+      log("FAIL: <rtsp-stream> is not an RtspStreamElement — is dom_rtsp_stream_enabled set?");
+    } else {
+      log("OK: RtspStreamElement interface present");
+      log("src=" + el.src);
+      el.play();
+      log("play() called; playing=" + el.playing);
+
+      let lastW = 0, lastH = 0, ticks = 0;
+      const timer = setInterval(() => {
+        ticks++;
+        if (el.videoWidth !== lastW || el.videoHeight !== lastH) {
+          lastW = el.videoWidth;
+          lastH = el.videoHeight;
+          log(`metadata: videoWidth=${lastW} videoHeight=${lastH} playing=${el.playing}`);
+        }
+        if (ticks % 10 === 0) {
+          log(`tick ${ticks}: videoWidth=${el.videoWidth} videoHeight=${el.videoHeight} playing=${el.playing}`);
+        }
+        if (ticks >= 40) {
+          clearInterval(timer);
+          log("probe finished");
+          // Exit cleanly so buffered stderr is flushed for the smoke log.
+          window.close();
+        }
+      }, 250);
+    }
+    // Hard safety stop in case the interval path is never reached.
+    setTimeout(() => { try { window.close(); } catch (e) {} }, 15000);
+  </script>
+</body>
+</html>

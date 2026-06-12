@@ -177,6 +177,9 @@ pub struct Preferences {
     pub dom_permissions_testing_allowed_in_nonsecure_contexts: bool,
     // feature: ResizeObserver | #39790 | Web/API/ResizeObserver
     pub dom_resize_observer_enabled: bool,
+    /// Enable the experimental, non-standard `<rtsp-stream>` element for RTSP
+    /// live-stream playback. Off by default; does not affect `<video>`.
+    pub dom_rtsp_stream_enabled: bool,
     // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
     pub dom_sanitizer_enabled: bool,
     pub dom_script_asynch: bool,
@@ -401,6 +404,7 @@ impl Preferences {
             dom_permissions_enabled: false,
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
             dom_resize_observer_enabled: true,
+            dom_rtsp_stream_enabled: false,
             dom_sanitizer_enabled: false,
             dom_script_asynch: true,
             dom_storage_manager_api_enabled: false,

@@ -145,6 +145,7 @@ use crate::dom::html::htmltablesectionelement::HTMLTableSectionElement;
 use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::rtspstreamelement::RtspStreamElement;
 use crate::dom::input_element::HTMLInputElement;
 use crate::dom::intersectionobserver::{IntersectionObserver, IntersectionObserverRegistration};
 use crate::dom::iterators::ShadowIncluding;
@@ -1275,6 +1276,8 @@ impl<'dom> LayoutDom<'dom, Element> {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLVideoElement>() {
             this.get_width()
+        } else if let Some(this) = self.downcast::<RtspStreamElement>() {
+            this.get_width()
         } else if let Some(this) = self.downcast::<HTMLTableElement>() {
             this.get_width()
         } else if let Some(this) = self.downcast::<HTMLTableCellElement>() {
@@ -1312,6 +1315,8 @@ impl<'dom> LayoutDom<'dom, Element> {
         } else if let Some(this) = self.downcast::<HTMLImageElement>() {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLVideoElement>() {
+            this.get_height()
+        } else if let Some(this) = self.downcast::<RtspStreamElement>() {
             this.get_height()
         } else if let Some(this) = self.downcast::<HTMLTableElement>() {
             this.get_height()
