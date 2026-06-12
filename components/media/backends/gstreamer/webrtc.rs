@@ -719,12 +719,18 @@ fn on_incoming_stream(
     let decodebin = gstreamer::ElementFactory::make("decodebin")
         .build()
         .unwrap();
-    let caps = pad.query_caps(None);
+    // Prefer the negotiated caps (application/x-rtp with a `media` field); the
+    // generic query_caps(None) may not carry `media` at pad-added time. Never
+    // panic here: this runs in a non-unwinding GStreamer callback, so a missing
+    // field would abort the whole process. Fall back to "video".
+    let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
     let name = caps
         .structure(0)
-        .unwrap()
-        .get::<String>("media")
-        .expect("Invalid 'media' field");
+        .and_then(|structure| structure.get::<String>("media").ok())
+        .unwrap_or_else(|| {
+            warn!("webrtc incoming pad caps missing 'media' field, defaulting to video: {caps:?}");
+            "video".to_string()
+        });
     let decodebin2 = decodebin.clone();
     decodebin.connect_pad_added({
         let pipeline_weak = pipe.downgrade();
