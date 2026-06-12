@@ -21,6 +21,8 @@
 *.csv
 servoshell_wall_*.log
 *.log
+*.err
+*.out
 *.rej
 *.orig
 .coverage
