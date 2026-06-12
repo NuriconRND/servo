@@ -20,6 +20,7 @@
 *.swo
 *.csv
 servoshell_wall_*.log
+*.log
 *.rej
 *.orig
 .coverage

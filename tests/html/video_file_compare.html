@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<!-- Isolation test: does the STANDARD <video> element display in a normal
+     servoshell window? Uses the untouched <video>/HTMLMediaElement path with a
+     local file. If this shows no video either, normal-window video display is a
+     fork-wide issue (not the <rtsp-stream> element). -->
+<html>
+<head><meta charset="utf-8"><title>standard &lt;video&gt; compare</title>
+<style>body{background:#222;margin:0;padding:8px} video{border:2px solid #0a0;background:#000}</style></head>
+<body>
+  <video id="v"
+         src="file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/rtsp_testsrc.mp4"
+         width="640" height="360" autoplay muted loop controls></video>
+  <script>
+    const v = document.getElementById('v');
+    const log = (m) => console.log("VIDEO_CMP " + m);
+    v.addEventListener('loadedmetadata', () => log(`loadedmetadata ${v.videoWidth}x${v.videoHeight}`));
+    v.addEventListener('playing', () => log('playing'));
+    v.addEventListener('error', () => log('error ' + (v.error && v.error.code)));
+    v.play().then(() => log('play() resolved')).catch(e => log('play() rejected: ' + e));
+    let t = 0;
+    setInterval(() => { t++; log(`tick ${t} t=${v.currentTime.toFixed(2)} paused=${v.paused} readyState=${v.readyState}`); }, 1000);
+  </script>
+</body>
+</html>

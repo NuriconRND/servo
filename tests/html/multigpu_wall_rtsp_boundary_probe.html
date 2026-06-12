@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<!--
+  RTSP tile-boundary probe (for config/wall_layout.local_2x1.json).
+
+  Virtual viewport 3840x1080, two tiles split at x=1920 (overlap 32px):
+    tile 0 = [0,0,1920,1080]   tile 1 = [1920,0,1920,1080]
+
+  A 640x360 <rtsp-stream> is centered on the seam (x 1600..2240), so its left
+  half lands on tile 0 and its right half on tile 1. Use this to check whether
+  the RTSP video renders continuously across the boundary.
+
+  Run (two terminals):
+    A) gst-validate-rtsp-server-1.0.exe "file:///.../servo/rtsp_testsrc.mp4"
+    B) target\debug\servoshell.exe --wall-layout ..\config\wall_layout.local_2x1.json \
+         --wall-all-tiles --pref dom_rtsp_stream_enabled=true \
+         tests\html\multigpu_wall_rtsp_boundary_probe.html
+
+  Expected per current engine state: the seam is at the right edge of tile-0's
+  window and the left edge of tile-1's window. (Cross-tile video distribution is
+  a v1 non-goal, so the right half on tile 1 may be blank — this page makes that
+  behavior directly observable.)
+-->
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>RTSP tile-boundary probe (2x1)</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #101015; }
+    /* Pin the document to the full virtual viewport so px == virtual coords. */
+    body { width: 3840px; height: 1080px; position: relative; overflow: hidden;
+           font-family: monospace; color: #cfcfd6; }
+
+    /* The tile seam at x=1920 (overlap band 1888..1952 shaded). */
+    #seam     { position: absolute; left: 1919px; top: 0; width: 2px; height: 1080px;
+                background: #ff3b3b; z-index: 5; }
+    #overlap  { position: absolute; left: 1888px; top: 0; width: 64px; height: 1080px;
+                background: rgba(255,59,59,0.12); z-index: 4; }
+
+    /* Tile labels. */
+    .label    { position: absolute; top: 24px; font-size: 40px; font-weight: bold;
+                color: #4aa3ff; z-index: 6; }
+    #l0 { left: 900px; }   #l1 { left: 2820px; }
+
+    /* The stream, straddling the seam: x 1600..2240, y 360..720. */
+    #s { position: absolute; left: 1600px; top: 360px; width: 640px; height: 360px;
+         background: #000; border: 2px solid #2ecc40; box-sizing: border-box; z-index: 3; }
+
+    #status { position: absolute; left: 24px; top: 24px; font-size: 28px; z-index: 6;
+              white-space: pre; }
+  </style>
+</head>
+<body>
+  <div id="overlap"></div>
+  <div id="seam"></div>
+  <div id="l0">TILE 0 (x 0..1920)</div>
+  <div id="l1">TILE 1 (x 1920..3840)</div>
+  <div id="status">starting…</div>
+
+  <rtsp-stream id="s" src="rtsp://127.0.0.1:8554/test" width="640" height="360"></rtsp-stream>
+
+  <script>
+    const el = document.getElementById('s');
+    const status = document.getElementById('status');
+    const log = (m) => { console.log("RTSP_BOUNDARY " + m); status.textContent = m; };
+
+    if (!(el instanceof RtspStreamElement)) {
+      log("FAIL: <rtsp-stream> not available — is dom_rtsp_stream_enabled set?");
+    } else {
+      const r = el.getBoundingClientRect();
+      log(`stream box x=${r.left}..${r.right} (seam at 1920); playing…`);
+      el.play();
+      let t = 0;
+      setInterval(() => {
+        t++;
+        log(`t=${t*2}s  videoWidth=${el.videoWidth} videoHeight=${el.videoHeight} `
+          + `playing=${el.playing}  box ${Math.round(el.getBoundingClientRect().left)}`
+          + `..${Math.round(el.getBoundingClientRect().right)} | seam=1920`);
+      }, 2000);
+      // No auto-close: observe the seam behavior, then close the window manually.
+    }
+  </script>
+</body>
+</html>

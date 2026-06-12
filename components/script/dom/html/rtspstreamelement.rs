@@ -194,9 +194,15 @@ impl RtspStreamElement {
     }
 
     fn handle_player_event(&self, event: PlayerEvent) {
-        // Diagnostic (experimental element): trace every backend event so the
-        // RTSP feasibility smoke can see how far the pipeline progresses.
-        eprintln!("[RTSP-DIAG] element received event: {event:?}");
+        // Diagnostic (experimental element): trace backend lifecycle events.
+        // Skip the high-frequency per-frame/position events (VideoFrameUpdated
+        // fires ~25fps and floods redirected stdout/stderr).
+        if !matches!(
+            event,
+            PlayerEvent::VideoFrameUpdated | PlayerEvent::PositionChanged(_)
+        ) {
+            eprintln!("[RTSP-DIAG] element received event: {event:?}");
+        }
         match event {
             PlayerEvent::MetadataUpdated(ref metadata) => {
                 let width = (metadata.width != 0).then_some(metadata.width);

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!-- Diagnostic variant: point <rtsp-stream> at a direct file:// URI to exercise
+     the NetworkUri playbin3 path WITHOUT rtspsrc/live, isolating whether the
+     no-frames issue is rtsp-specific or a NetworkUri-path bug. -->
+<html>
+<head><meta charset="utf-8"><title>rtsp-stream file:// probe</title>
+<style>rtsp-stream{display:block;background:#000;border:2px solid #0a0}</style></head>
+<body>
+  <rtsp-stream id="s" src="file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/rtsp_testsrc.mp4" width="640" height="360"></rtsp-stream>
+  <script>
+    const log = (m) => console.log("RTSP_PROBE [" + (performance.now()/1000).toFixed(1) + "s] " + m);
+    const el = document.getElementById('s');
+    if (!(el instanceof RtspStreamElement)) { log("FAIL: not RtspStreamElement"); }
+    else {
+      log("OK interface present; src=" + el.src);
+      el.play();
+      log("play() called; playing=" + el.playing);
+      let t=0, lw=0, lh=0;
+      const iv = setInterval(() => {
+        t++;
+        if (el.videoWidth!==lw||el.videoHeight!==lh){lw=el.videoWidth;lh=el.videoHeight;log("metadata videoWidth="+lw+" videoHeight="+lh);}
+        if (t%10===0) log("tick "+t+" videoWidth="+el.videoWidth+" videoHeight="+el.videoHeight+" playing="+el.playing);
+        if (t>=40){clearInterval(iv);log("probe finished");window.close();}
+      }, 250);
+      setTimeout(()=>{try{window.close();}catch(e){}}, 15000);
+    }
+  </script>
+</body>
+</html>
