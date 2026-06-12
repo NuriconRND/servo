@@ -111,6 +111,7 @@ use crate::dom::html::htmlstyleelement::HTMLStyleElement;
 use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::html::rtspstreamelement::RtspStreamElement;
+use crate::dom::html::ximageelement::XImageElement;
 use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::iterators::ShadowIncluding;
 use crate::dom::mutationobserver::{Mutation, MutationObserver, RegisteredObserver};
@@ -2351,9 +2352,13 @@ impl<'dom> LayoutDom<'dom, Node> {
         if let Some(media) = self.downcast::<HTMLVideoElement>() {
             return Some(media.data());
         }
-        // Experimental <rtsp-stream> reuses the replaced-video layout/paint path.
+        // Experimental <rtsp-stream>/<x-media> reuse the replaced-video path.
         if let Some(rtsp) = self.downcast::<RtspStreamElement>() {
             return Some(rtsp.data());
+        }
+        // Experimental <x-image> reuses the same MediaFrame display path.
+        if let Some(ximg) = self.downcast::<XImageElement>() {
+            return Some(ximg.data());
         }
         None
     }

@@ -61,6 +61,7 @@ pub(crate) mod htmlpreelement;
 pub(crate) mod htmlprogresselement;
 pub(crate) mod htmlquoteelement;
 pub(crate) mod rtspstreamelement;
+pub(crate) mod ximageelement;
 #[expect(dead_code)]
 pub(crate) mod htmlscriptelement;
 pub(crate) mod htmlselectelement;

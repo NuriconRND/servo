@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<!--
+  Non-standard IMAGE format probe via <x-image> (decodes formats <img> doesn't:
+  TIFF, OpenEXR, HDR/Radiance, TGA, QOI, PNM/PPM/PGM — via pixels::
+  load_extended_from_memory using the `image` crate's extended decoders).
+  <img> is unchanged.
+
+  Generate the test images (from a frame of the bundled rtsp_testsrc.mp4):
+    ffmpeg -y -i rtsp_testsrc.mp4 -frames:v 1 test_media/frame.png
+    ffmpeg -y -i test_media/frame.png test_media/test_image.tiff
+    ffmpeg -y -i test_media/frame.png test_media/test_image.tga
+    ffmpeg -y -i test_media/frame.png test_media/test_image.exr
+    ffmpeg -y -i test_media/frame.png test_media/test_image.ppm
+    ffmpeg -y -i test_media/frame.png test_media/test_image.pgm
+    ffmpeg -y -i test_media/frame.png test_media/test_image.qoi
+    ffmpeg -y -i test_media/frame.png test_media/test_image.hdr
+  (DDS has no ffmpeg encoder; use ImageMagick `magick frame.png test_image.dds` if needed.)
+
+  Run (release recommended; wall mode to see frames):
+    target\release\servoshell.exe --wall-layout ..\config\wall_layout.local_1x1.json \
+      --wall-all-tiles --pref dom_x_image_enabled=true \
+      tests\html\multigpu_x_image_formats_probe.html
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>x-image format probe</title>
+  <style>
+    html, body { margin:0; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    h1 { font-size:28px; margin:14px 18px; }
+    .grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:18px; padding:0 18px 18px; }
+    .cell { background:#14161d; border-radius:10px; padding:12px; }
+    .cell h2 { font-size:22px; margin:0 0 8px; color:#c56cf0; }
+    x-image { display:block; width:100%; height:220px; background:#000; border:2px solid #c56cf0; border-radius:6px; }
+    .status { font-family:monospace; font-size:14px; color:#e6c8ff; margin-top:8px; white-space:pre; }
+    .bad { color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <h1>&lt;x-image&gt; — non-standard image formats</h1>
+  <div class="grid" id="grid"></div>
+  <script>
+    const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_image.";
+    const formats = ["tiff","tga","exr","ppm","pgm","qoi","hdr"];
+    const grid = document.getElementById("grid");
+    const items = [];
+
+    for (const ext of formats) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const h = document.createElement("h2"); h.textContent = "." + ext;
+      const el = document.createElement("x-image");
+      el.setAttribute("src", BASE + ext);
+      el.setAttribute("width", "320"); el.setAttribute("height", "180");
+      const st = document.createElement("div"); st.className = "status"; st.textContent = "loading";
+      cell.appendChild(h); cell.appendChild(el); cell.appendChild(st);
+      grid.appendChild(cell);
+      items.push({ ext, el, st });
+    }
+
+    const apiOk = items.length && (typeof XImageElement !== "undefined") && (items[0].el instanceof XImageElement);
+    if (!apiOk) {
+      for (const it of items) { it.st.textContent = "x-image unavailable (dom_x_image_enabled?)"; it.st.className = "status bad"; }
+    } else {
+      let t = 0;
+      setInterval(() => {
+        t++;
+        for (const it of items) {
+          const w = it.el.naturalWidth, h = it.el.naturalHeight, done = it.el.complete;
+          it.st.textContent = `complete=${done} natural=${w}x${h}` + (done ? "  ✓ decoded" : "  (decoding…)");
+          it.st.className = done ? "status" : "status bad";
+          if (t % 3 === 0) console.log(`X_IMAGE ${it.ext}: complete=${done} ${w}x${h}`);
+        }
+      }, 1500);
+    }
+  </script>
+</body>
+</html>

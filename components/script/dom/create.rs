@@ -85,6 +85,7 @@ use crate::dom::html::htmlulistelement::HTMLUListElement;
 use crate::dom::html::htmlunknownelement::HTMLUnknownElement;
 use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::html::rtspstreamelement::RtspStreamElement;
+use crate::dom::html::ximageelement::XImageElement;
 use crate::dom::html::input_element::HTMLInputElement;
 use crate::dom::htmlmarqueeelement::HTMLMarqueeElement;
 use crate::dom::svg::svgelement::SVGElement;
@@ -441,6 +442,8 @@ pub(crate) fn create_native_html_element(
         _ if &*name.local == "rtsp-stream" || &*name.local == "x-media" => {
             make!(RtspStreamElement)
         },
+        // Experimental non-standard image element (TIFF/EXR/HDR/TGA/DDS/QOI/PNM/…).
+        _ if &*name.local == "x-image" => make!(XImageElement),
         _ if is_valid_custom_element_name(&name.local) => make!(HTMLElement),
         _ => make!(HTMLUnknownElement),
     }

@@ -582,6 +582,50 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Raster
     }
 }
 
+/// Like [`load_from_memory`] but accepts the full set of formats the bundled
+/// `image` crate is built with (TIFF, OpenEXR, HDR, TGA, DDS, QOI, PNM, ...),
+/// instead of the browser-standard allowlist in [`detect_image_format`] used by
+/// `<img>`. Intended for the experimental non-standard `<x-image>` element so it
+/// can display formats `<img>` does not, without changing `<img>` behavior.
+/// Decodes a single (first) frame; animation is not handled here.
+pub fn load_extended_from_memory(
+    buffer: &[u8],
+    extension: Option<&str>,
+    cors_status: CorsStatus,
+) -> Option<RasterImage> {
+    if buffer.is_empty() {
+        return None;
+    }
+
+    // Standard formats keep their existing (animation-aware) decode path.
+    if detect_image_format(buffer).is_ok() {
+        return load_from_memory(buffer, cors_status);
+    }
+
+    let mut reader = match image::ImageReader::new(Cursor::new(buffer)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(error) => {
+            debug!("x-image: could not guess image format: {error}");
+            return None;
+        },
+    };
+    // Some formats (notably TGA) have no magic bytes, so content guessing fails.
+    // Fall back to the file extension when the format is still unknown.
+    if reader.format().is_none() &&
+        let Some(format) = extension.and_then(ImageFormat::from_extension)
+    {
+        reader.set_format(format);
+    }
+    let decoder = match reader.into_decoder() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            debug!("x-image: could not create image decoder: {error}");
+            return None;
+        },
+    };
+    decode_static_image(cors_status, decoder)
+}
+
 // https://developer.mozilla.org/en-US/docs/Web/HTML/Element/img
 pub fn detect_image_format(buffer: &[u8]) -> Result<ImageFormat, &str> {
     if is_gif(buffer) {
