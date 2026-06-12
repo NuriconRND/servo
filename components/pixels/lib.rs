@@ -602,6 +602,11 @@ pub fn load_extended_from_memory(
         return load_from_memory(buffer, cors_status);
     }
 
+    // JPEG XL is not supported by the `image` crate; decode via jxl-oxide.
+    if is_jxl(buffer) {
+        return decode_jxl(buffer, cors_status);
+    }
+
     let mut reader = match image::ImageReader::new(Cursor::new(buffer)).with_guessed_format() {
         Ok(reader) => reader,
         Err(error) => {
@@ -824,6 +829,16 @@ fn decode_static_image(
         dynamic_image.apply_orientation(orientation);
     }
 
+    Some(raster_from_rgba8_dynamic_image(cors_status, dynamic_image))
+}
+
+/// Build a single-frame [`RasterImage`] from a decoded [`DynamicImage`], storing
+/// pre-multiplied RGBA8 (shared by the standard decoders and the `<x-image>`
+/// extended/JXL decoders).
+fn raster_from_rgba8_dynamic_image(
+    cors_status: CorsStatus,
+    dynamic_image: DynamicImage,
+) -> RasterImage {
     let mut rgba = dynamic_image.into_rgba8();
 
     // Store pre-multiplied data as that prevents having to do conversions of the data at later
@@ -837,7 +852,7 @@ fn decode_static_image(
         width: rgba.width(),
         height: rgba.height(),
     };
-    Some(RasterImage {
+    RasterImage {
         metadata: ImageMetadata {
             width: rgba.width(),
             height: rgba.height(),
@@ -849,7 +864,69 @@ fn decode_static_image(
         cors_status,
         is_opaque,
         loop_count: None,
-    })
+    }
+}
+
+fn is_jxl(buffer: &[u8]) -> bool {
+    // Raw JPEG XL codestream (FF 0A) or the ISOBMFF container signature box.
+    buffer.starts_with(&[0xFF, 0x0A]) ||
+        buffer.starts_with(&[
+            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+        ])
+}
+
+/// Decode a JPEG XL image (the `image` crate has no JXL support) via `jxl-oxide`,
+/// flattening the first frame to pre-multiplied RGBA8. Used only by `<x-image>`.
+fn decode_jxl(buffer: &[u8], cors_status: CorsStatus) -> Option<RasterImage> {
+    let image = match jxl_oxide::JxlImage::builder().read(Cursor::new(buffer)) {
+        Ok(image) => image,
+        Err(error) => {
+            debug!("x-image: jxl read error: {error}");
+            return None;
+        },
+    };
+    let render = match image.render_frame(0) {
+        Ok(render) => render,
+        Err(error) => {
+            debug!("x-image: jxl render error: {error}");
+            return None;
+        },
+    };
+
+    let framebuffer = render.image_all_channels();
+    let width = framebuffer.width() as u32;
+    let height = framebuffer.height() as u32;
+    let channels = framebuffer.channels();
+    let samples = framebuffer.buf();
+
+    let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for pixel in samples.chunks(channels) {
+        let (r, g, b, a) = match channels {
+            1 => {
+                let v = to_u8(pixel[0]);
+                (v, v, v, 255)
+            },
+            2 => {
+                let v = to_u8(pixel[0]);
+                (v, v, v, to_u8(pixel[1]))
+            },
+            3 => (to_u8(pixel[0]), to_u8(pixel[1]), to_u8(pixel[2]), 255),
+            _ => (
+                to_u8(pixel[0]),
+                to_u8(pixel[1]),
+                to_u8(pixel[2]),
+                to_u8(pixel[3]),
+            ),
+        };
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+
+    let rgba_image = image::RgbaImage::from_raw(width, height, rgba)?;
+    Some(raster_from_rgba8_dynamic_image(
+        cors_status,
+        DynamicImage::ImageRgba8(rgba_image),
+    ))
 }
 
 fn decode_animated_image<'a, T>(

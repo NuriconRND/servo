@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <!--
   Non-standard IMAGE format probe via <x-image> (decodes formats <img> doesn't:
-  TIFF, OpenEXR, HDR/Radiance, TGA, QOI, PNM/PPM/PGM — via pixels::
-  load_extended_from_memory using the `image` crate's extended decoders).
-  <img> is unchanged.
+  TIFF, OpenEXR, HDR/Radiance, TGA, QOI, PNM/PPM/PGM via the `image` crate's
+  extended decoders, and JPEG XL via jxl-oxide — all behind pixels::
+  load_extended_from_memory). <img> is unchanged.
 
   Generate the test images (from a frame of the bundled rtsp_testsrc.mp4):
     ffmpeg -y -i rtsp_testsrc.mp4 -frames:v 1 test_media/frame.png
@@ -14,6 +14,7 @@
     ffmpeg -y -i test_media/frame.png test_media/test_image.pgm
     ffmpeg -y -i test_media/frame.png test_media/test_image.qoi
     ffmpeg -y -i test_media/frame.png test_media/test_image.hdr
+    ffmpeg -y -i test_media/frame.png test_media/test_image.jxl   (needs ffmpeg --enable-libjxl)
   (DDS has no ffmpeg encoder; use ImageMagick `magick frame.png test_image.dds` if needed.)
 
   Run (release recommended; wall mode to see frames):
@@ -41,7 +42,7 @@
   <div class="grid" id="grid"></div>
   <script>
     const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_image.";
-    const formats = ["tiff","tga","exr","ppm","pgm","qoi","hdr"];
+    const formats = ["tiff","tga","exr","ppm","pgm","qoi","hdr","jxl"];
     const grid = document.getElementById("grid");
     const items = [];
 

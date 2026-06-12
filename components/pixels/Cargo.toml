@@ -16,6 +16,7 @@ path = "lib.rs"
 [dependencies]
 euclid = { workspace = true }
 image = { workspace = true }
+jxl-oxide = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
