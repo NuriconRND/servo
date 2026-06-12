@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<!--
+  Non-standard video CONTAINER probe via <x-media> (generic GStreamer URI media
+  element; same impl as <rtsp-stream>, plays any URI through playbin3).
+
+  Plays one local file per container so playbin3 auto-demuxes each:
+    mkv (matroska), mov (isomp4), ts (mpegts), avi, flv, wmv (asf).
+  Container support = the matching demux plugin being loaded
+  (components/servo/gstreamer_plugin_lists/common.rs.in); codecs via gstlibav.
+
+  Generate the test files (from the bundled rtsp_testsrc.mp4):
+    ffmpeg -y -i rtsp_testsrc.mp4 -c copy            test_media/test_media.mkv
+    ffmpeg -y -i rtsp_testsrc.mp4 -c copy            test_media/test_media.mov
+    ffmpeg -y -i rtsp_testsrc.mp4 -c copy -f mpegts  test_media/test_media.ts
+    ffmpeg -y -i rtsp_testsrc.mp4 -c:v mpeg4 -q:v 4  test_media/test_media.avi
+    ffmpeg -y -i rtsp_testsrc.mp4 -c:v libx264 -f flv test_media/test_media.flv
+    ffmpeg -y -i rtsp_testsrc.mp4 -c:v wmv2 -q:v 4   test_media/test_media.wmv
+
+  Run (release recommended; wall mode to see frames):
+    target\release\servoshell.exe --wall-layout ..\config\wall_layout.local_1x1.json \
+      --wall-all-tiles --pref dom_rtsp_stream_enabled=true \
+      tests\html\multigpu_x_media_containers_probe.html
+  (<x-media> shares the dom_rtsp_stream_enabled pref / RtspStreamElement interface.)
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>x-media container probe</title>
+  <style>
+    html, body { margin:0; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    h1 { font-size:28px; margin:14px 18px; }
+    .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px; padding:0 18px 18px; }
+    .cell { background:#14161d; border-radius:10px; padding:12px; }
+    .cell h2 { font-size:22px; margin:0 0 8px; color:#4aa3ff; }
+    x-media { display:block; width:100%; height:288px; background:#000; border:2px solid #2ecc40; border-radius:6px; }
+    .status { font-family:monospace; font-size:15px; color:#9fd; margin-top:8px; white-space:pre; }
+    .bad { color:#ff6b6b; }
+  </style>
+</head>
+<body>
+  <h1>&lt;x-media&gt; — non-standard video containers</h1>
+  <div class="grid" id="grid"></div>
+  <script>
+    const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_media.";
+    const containers = ["mkv","mov","ts","avi","flv","wmv"];
+    const grid = document.getElementById("grid");
+    const players = [];
+
+    for (const ext of containers) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const h = document.createElement("h2"); h.textContent = "." + ext;
+      const el = document.createElement("x-media");
+      el.setAttribute("src", BASE + ext);
+      el.setAttribute("width", "512"); el.setAttribute("height", "288");
+      const st = document.createElement("div"); st.className = "status"; st.textContent = "idle";
+      cell.appendChild(h); cell.appendChild(el); cell.appendChild(st);
+      grid.appendChild(cell);
+      players.push({ ext, el, st });
+    }
+
+    // <x-media> shares the RtspStreamElement interface; check the API is present.
+    const apiOk = players.length && (typeof players[0].el.play === "function") &&
+                  (typeof RtspStreamElement !== "undefined");
+    if (!apiOk) {
+      for (const p of players) { p.st.textContent = "x-media unavailable (dom_rtsp_stream_enabled?)"; p.st.className = "status bad"; }
+    } else {
+      for (const p of players) {
+        try { p.el.play(); p.st.textContent = "play() called"; }
+        catch (e) { p.st.textContent = "play() error: " + e; p.st.className = "status bad"; }
+      }
+      let t = 0;
+      setInterval(() => {
+        t++;
+        for (const p of players) {
+          const w = p.el.videoWidth, h = p.el.videoHeight, playing = p.el.playing;
+          const ok = w > 0 && h > 0;
+          p.st.textContent = `${w}x${h} playing=${playing}` + (ok ? "  ✓ decoding" : "  (no frame yet)");
+          p.st.className = ok ? "status" : "status bad";
+          if (t % 5 === 0) console.log(`X_MEDIA ${p.ext}: ${w}x${h} playing=${playing}`);
+        }
+      }, 2000);
+    }
+  </script>
+</body>
+</html>

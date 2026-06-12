@@ -28,6 +28,11 @@
 "gstinterleave",
 "gstisomp4",
 "gstmatroska",
+// Non-standard container demuxers (for <x-media>): AVI, FLV. Codecs come from
+// gstlibav/gstvpx/etc. (DLLs ship in the bundle; loaded here so playbin3 can
+// auto-plug them).
+"gstavi",
+"gstflv",
 "gstrtp",
 "gstrtpmanager",
 "gstrtsp",
@@ -37,8 +42,11 @@
 "gstwavparse",
 // gst-plugins-bad
 "gstaudiobuffersplit",
+"gstasf",
 "gstdtls",
 "gstid3tag",
+"gstmpegpsdemux",
+"gstmpegtsdemux",
 "gstproxy",
 "gstsrtp",
 "gstvideoparsersbad",

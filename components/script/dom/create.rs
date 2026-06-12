@@ -434,7 +434,13 @@ pub(crate) fn create_native_html_element(
         // atom (it has a hyphen), so it cannot be matched with `local_name!`;
         // compare at runtime. This arm must precede the custom-element
         // fallthrough below, which would otherwise claim any hyphenated name.
-        _ if &*name.local == "rtsp-stream" => make!(RtspStreamElement),
+        // `<rtsp-stream>` and `<x-media>` are the same generic GStreamer URI media
+        // element (RtspStreamElement plays any URI via playbin3 — rtsp://, file://
+        // with non-standard containers like avi/mkv/wmv/ts/flv, http://, ...).
+        // `<x-media>` is the general spelling; `<rtsp-stream>` is the original alias.
+        _ if &*name.local == "rtsp-stream" || &*name.local == "x-media" => {
+            make!(RtspStreamElement)
+        },
         _ if is_valid_custom_element_name(&name.local) => make!(HTMLElement),
         _ => make!(HTMLUnknownElement),
     }

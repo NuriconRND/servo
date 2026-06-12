@@ -86,3 +86,10 @@ support/macos/Brewfile.lock.json
 
 # Justfiles
 justfile
+test_media/
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.ts
+*.flv
