@@ -169,7 +169,7 @@ interface GPUDevice : EventTarget {
     GPUCommandEncoder createCommandEncoder(optional GPUCommandEncoderDescriptor descriptor = {});
     [Throws]
     GPURenderBundleEncoder createRenderBundleEncoder(GPURenderBundleEncoderDescriptor descriptor);
-    //GPUQuerySet createQuerySet(GPUQuerySetDescriptor descriptor);
+    GPUQuerySet createQuerySet(GPUQuerySetDescriptor descriptor);
 };
 GPUDevice includes GPUObjectBase;
 
@@ -957,6 +957,13 @@ interface GPUCommandEncoder {
         GPUExtent3D copySize);
     */
 
+    undefined resolveQuerySet(
+        GPUQuerySet querySet,
+        GPUSize32 firstQuery,
+        GPUSize32 queryCount,
+        GPUBuffer destination,
+        GPUSize64 destinationOffset);
+
     GPUCommandBuffer finish(optional GPUCommandBufferDescriptor descriptor = {});
 };
 GPUCommandEncoder includes GPUObjectBase;
@@ -1148,11 +1155,11 @@ interface GPUQueue {
       GPUTexelCopyBufferLayout dataLayout,
       GPUExtent3D size);
 
-    //[Throws]
-    //undefined copyExternalImageToTexture(
-    //  GPUImageCopyExternalImage source,
-    //  GPUCopyExternalImageDestInfo destination,
-    //  GPUExtent3D copySize);
+    [Throws]
+    undefined copyExternalImageToTexture(
+      GPUImageCopyExternalImage source,
+      GPUCopyExternalImageDestInfo destination,
+      GPUExtent3D copySize);
 };
 GPUQueue includes GPUObjectBase;
 

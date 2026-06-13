@@ -1,0 +1,419 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU Multi-GPU Fan-Out Retargeting</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font: 14px/1.4 system-ui, sans-serif;
+    background: #07090c;
+    color: #eef3f8;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    width: 3840px;
+    height: 1080px;
+    overflow: hidden;
+    background: #07090c;
+  }
+
+  canvas {
+    position: absolute;
+    inset: 0;
+    width: 3840px;
+    height: 1080px;
+  }
+
+  .hud {
+    position: fixed;
+    z-index: 10;
+    top: 18px;
+    left: 18px;
+    display: grid;
+    grid-template-columns: 300px repeat(5, 190px);
+    gap: 8px;
+    width: 1290px;
+    pointer-events: none;
+  }
+
+  .metric {
+    min-height: 58px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(4, 7, 10, 0.74);
+    padding: 8px 10px;
+  }
+
+  h1,
+  .label,
+  .value {
+    margin: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  h1 {
+    font-size: 17px;
+    line-height: 1.2;
+  }
+
+  .label {
+    display: block;
+    color: #9da7b3;
+    font: 700 10px/1.1 ui-monospace, SFMono-Regular, Consolas, monospace;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+
+  .value {
+    display: block;
+    margin-top: 7px;
+    color: #eef3f8;
+    font: 700 15px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+
+  .boundary {
+    position: absolute;
+    z-index: 8;
+    top: 0;
+    bottom: 0;
+    left: 1920px;
+    width: 4px;
+    background: #f7d84c;
+    box-shadow: 0 0 0 1px rgba(247, 216, 76, 0.52), 0 0 26px rgba(247, 216, 76, 0.46);
+    pointer-events: none;
+  }
+
+  .boundary::before {
+    content: "tile boundary x=1920 / gpu 0 -> gpu 1";
+    position: sticky;
+    top: 98px;
+    display: block;
+    margin-left: 12px;
+    color: #f7d84c;
+    font: 700 15px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: nowrap;
+  }
+
+  .fallback {
+    position: fixed;
+    z-index: 9;
+    right: 18px;
+    bottom: 18px;
+    width: 720px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(4, 7, 10, 0.78);
+    padding: 12px;
+    color: #aeb8c4;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+
+<canvas id="stage" width="3840" height="1080"></canvas>
+<div class="boundary"></div>
+
+<section class="hud" aria-label="runtime metrics">
+  <div class="metric">
+    <h1>WebGPU Multi-GPU Fan-Out</h1>
+    <span class="value">single WebView / tiled paint targets</span>
+  </div>
+  <div class="metric"><span class="label">frame</span><span class="value" id="frame">0</span></div>
+  <div class="metric"><span class="label">backend</span><span class="value" id="backend">initializing</span></div>
+  <div class="metric"><span class="label">adapter</span><span class="value" id="adapter">pending</span></div>
+  <div class="metric"><span class="label">viewport</span><span class="value" id="viewport">3840 x 1080</span></div>
+  <div class="metric"><span class="label">motion</span><span class="value" id="motion">retargeting loop</span></div>
+</section>
+
+<pre class="fallback" id="log">initializing WebGPU...</pre>
+
+<script>
+  const canvas = document.getElementById("stage");
+  const frameValue = document.getElementById("frame");
+  const backendValue = document.getElementById("backend");
+  const adapterValue = document.getElementById("adapter");
+  const viewportValue = document.getElementById("viewport");
+  const motionValue = document.getElementById("motion");
+  const log = document.getElementById("log");
+  let fallback2d = null;
+
+  let frame = 0;
+
+  function writeLog(lines) {
+    log.textContent = lines.join("\n");
+  }
+
+  function drawFallback(timeMs, reason) {
+    if (!fallback2d) {
+      fallback2d = canvas.getContext("2d");
+    }
+
+    if (!fallback2d) {
+      backendValue.textContent = "no canvas";
+      writeLog([
+        "No fallback canvas context is available.",
+        "reason=" + reason
+      ]);
+      return;
+    }
+
+    const t = timeMs * 0.001;
+    const w = canvas.width;
+    const h = canvas.height;
+    fallback2d.clearRect(0, 0, w, h);
+    fallback2d.fillStyle = "#07090c";
+    fallback2d.fillRect(0, 0, w, h);
+
+    for (let x = 0; x < w; x += 160) {
+      fallback2d.fillStyle = x % 320 === 0 ? "rgba(255,255,255,.07)" : "rgba(255,255,255,.035)";
+      fallback2d.fillRect(x, 0, 2, h);
+    }
+
+    fallback2d.fillStyle = "#f7d84c";
+    fallback2d.fillRect(1918, 0, 4, h);
+
+    for (let i = 0; i < 18; i += 1) {
+      const x = 160 + ((t * 260 + i * 210) % 3520);
+      const y = 230 + Math.sin(t * 2.0 + i) * 120 + (i % 3) * 150;
+      fallback2d.fillStyle = i % 2 ? "rgba(53,216,148,.88)" : "rgba(69,163,255,.88)";
+      fallback2d.fillRect(x - 32, y - 108, 64, 216);
+      fallback2d.beginPath();
+      fallback2d.arc(x, y - 150, 38, 0, Math.PI * 2);
+      fallback2d.fill();
+      fallback2d.strokeStyle = "rgba(247,216,76,.86)";
+      fallback2d.lineWidth = 12;
+      fallback2d.beginPath();
+      fallback2d.moveTo(x - 116, y - 40);
+      fallback2d.lineTo(x, y - 4);
+      fallback2d.lineTo(x + 124, y - 62);
+      fallback2d.moveTo(x - 44, y + 104);
+      fallback2d.lineTo(x - 92, y + 182);
+      fallback2d.moveTo(x + 42, y + 104);
+      fallback2d.lineTo(x + 108, y + 174);
+      fallback2d.stroke();
+    }
+
+    backendValue.textContent = "2d fallback";
+    adapterValue.textContent = "WebGPU unavailable";
+    motionValue.textContent = reason;
+    writeLog([
+      "WebGPU fallback path is drawing.",
+      "reason=" + reason,
+      "fanout validation still exercises Servo tiled paint with one wide canvas."
+    ]);
+  }
+
+  async function initWebGPU() {
+    if (!("gpu" in navigator)) {
+      throw new Error("navigator.gpu is not present");
+    }
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+      throw new Error("navigator.gpu.requestAdapter returned null");
+    }
+
+    const device = await adapter.requestDevice();
+    const context = canvas.getContext("webgpu");
+    if (!context) {
+      throw new Error("canvas.getContext('webgpu') returned null");
+    }
+
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+      device,
+      format,
+      alphaMode: "opaque"
+    });
+
+    const shader = device.createShaderModule({
+      label: "fanout retargeting shader",
+      code: `
+struct Uniforms {
+  resolution: vec2f,
+  time: f32,
+  frame: f32,
+};
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+
+struct VertexOut {
+  @builtin(position) position: vec4f,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+  var positions = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f(3.0, -1.0),
+    vec2f(-1.0, 3.0)
+  );
+  var out: VertexOut;
+  out.position = vec4f(positions[vertex_index], 0.0, 1.0);
+  return out;
+}
+
+fn sd_segment(p: vec2f, a: vec2f, b: vec2f) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+
+fn joint(p: vec2f, c: vec2f, r: f32) -> f32 {
+  return smoothstep(r + 2.0, r - 2.0, length(p - c));
+}
+
+fn limb(p: vec2f, a: vec2f, b: vec2f, r: f32) -> f32 {
+  return smoothstep(r + 2.0, r - 2.0, sd_segment(p, a, b));
+}
+
+fn figure_mask(p: vec2f, root: vec2f, phase: f32, scale: f32) -> f32 {
+  let sway = sin(uniforms.time * 2.1 + phase);
+  let step = sin(uniforms.time * 4.0 + phase);
+  let shoulder = root + vec2f(0.0, -155.0 * scale);
+  let neck = root + vec2f(0.0, -205.0 * scale);
+  let head = root + vec2f(0.0, -258.0 * scale);
+  let hip = root + vec2f(0.0, -30.0 * scale);
+  let left_hand = shoulder + vec2f((-128.0 - 26.0 * sway) * scale, (54.0 + 42.0 * step) * scale);
+  let right_hand = shoulder + vec2f((132.0 + 30.0 * sway) * scale, (-38.0 - 38.0 * step) * scale);
+  let left_foot = hip + vec2f((-72.0 + 34.0 * step) * scale, (164.0 - 16.0 * step) * scale);
+  let right_foot = hip + vec2f((86.0 - 34.0 * step) * scale, (166.0 + 14.0 * step) * scale);
+
+  var m = 0.0;
+  m = max(m, limb(p, shoulder, hip, 28.0 * scale));
+  m = max(m, limb(p, shoulder, left_hand, 17.0 * scale));
+  m = max(m, limb(p, shoulder, right_hand, 17.0 * scale));
+  m = max(m, limb(p, hip, left_foot, 18.0 * scale));
+  m = max(m, limb(p, hip, right_foot, 18.0 * scale));
+  m = max(m, limb(p, shoulder, neck, 20.0 * scale));
+  m = max(m, joint(p, head, 48.0 * scale));
+  return m;
+}
+
+fn target_skeleton(p: vec2f, root: vec2f, phase: f32, scale: f32) -> f32 {
+  let wave = sin(uniforms.time * 3.2 + phase);
+  let shoulder = root + vec2f(0.0, -150.0 * scale);
+  let hip = root + vec2f(0.0, -24.0 * scale);
+  var m = 0.0;
+  m = max(m, limb(p, shoulder, hip, 7.0 * scale));
+  m = max(m, limb(p, shoulder, shoulder + vec2f((-158.0 - 46.0 * wave) * scale, (-96.0 + 34.0 * wave) * scale), 7.0 * scale));
+  m = max(m, limb(p, shoulder, shoulder + vec2f((164.0 + 42.0 * wave) * scale, (88.0 - 36.0 * wave) * scale), 7.0 * scale));
+  m = max(m, limb(p, hip, hip + vec2f((-106.0 + 44.0 * wave) * scale, 174.0 * scale), 7.0 * scale));
+  m = max(m, limb(p, hip, hip + vec2f((104.0 - 44.0 * wave) * scale, 174.0 * scale), 7.0 * scale));
+  return m;
+}
+
+@fragment
+fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
+  let p = frag_coord.xy;
+  let uv = p / uniforms.resolution;
+  let grid_x = 1.0 - smoothstep(1.4, 2.0, abs(fract(p.x / 160.0) * 160.0 - 1.0));
+  let grid_y = 1.0 - smoothstep(1.4, 2.0, abs(fract(p.y / 160.0) * 160.0 - 1.0));
+  let seam = 1.0 - smoothstep(3.0, 7.0, abs(p.x - 1920.0));
+  var color = vec3f(0.026, 0.036, 0.050);
+  color += vec3f(0.035, 0.055, 0.070) * max(grid_x, grid_y);
+  color += vec3f(0.22, 0.18, 0.04) * seam;
+
+  for (var i = 0; i < 12; i = i + 1) {
+    let fi = f32(i);
+    let lane = f32(i % 3);
+    let x = 180.0 + fract(uniforms.time * (0.042 + fi * 0.0015) + fi * 0.083) * 3480.0;
+    let y = 335.0 + lane * 250.0 + sin(uniforms.time * 1.6 + fi) * 28.0;
+    let root = vec2f(x, y);
+    let source = figure_mask(p, root, fi * 0.7, 0.72);
+    let target = target_skeleton(p, root + vec2f(82.0, -10.0), fi * 0.53, 0.72);
+    let pulse = 0.55 + 0.45 * sin(uniforms.time * 5.0 + fi);
+    color = mix(color, vec3f(0.18, 0.72, 0.88), source);
+    color = mix(color, vec3f(0.96, 0.80, 0.20), target * (0.55 + 0.35 * pulse));
+  }
+
+  let retarget_line = smoothstep(12.0, 0.0, abs(p.y - (145.0 + sin(uv.x * 12.0 + uniforms.time * 3.0) * 22.0)));
+  color += vec3f(0.20, 0.85, 0.45) * retarget_line * 0.52;
+  return vec4f(color, 1.0);
+}`
+    });
+
+    const pipeline = device.createRenderPipeline({
+      label: "fanout retargeting pipeline",
+      layout: "auto",
+      vertex: {
+        module: shader,
+        entryPoint: "vs_main"
+      },
+      fragment: {
+        module: shader,
+        entryPoint: "fs_main",
+        targets: [{ format }]
+      },
+      primitive: {
+        topology: "triangle-list"
+      }
+    });
+
+    const uniformBuffer = device.createBuffer({
+      label: "fanout uniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    const bindGroup = device.createBindGroup({
+      label: "fanout bind group",
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+    });
+
+    const adapterInfo = adapter.info || {};
+    backendValue.textContent = "webgpu";
+    adapterValue.textContent = adapterInfo.description || adapterInfo.vendor || "adapter selected";
+    writeLog([
+      "WebGPU renderer active.",
+      "adapter=" + adapterValue.textContent,
+      "canvas=3840x1080",
+      "expected Servo run: --wall-layout etc/multigpu/config/wall_layout.example_2x1_dualgpu.json --wall-all-tiles"
+    ]);
+
+    function render(timeMs) {
+      frame += 1;
+      const data = new Float32Array([canvas.width, canvas.height, timeMs * 0.001, frame]);
+      device.queue.writeBuffer(uniformBuffer, 0, data);
+
+      const encoder = device.createCommandEncoder();
+      const textureView = context.getCurrentTexture().createView();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: textureView,
+          clearValue: { r: 0.02, g: 0.025, b: 0.03, a: 1 },
+          loadOp: "clear",
+          storeOp: "store"
+        }]
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(3, 1, 0, 0);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+
+      frameValue.textContent = String(frame);
+      viewportValue.textContent = canvas.width + " x " + canvas.height;
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  }
+
+  initWebGPU().catch((error) => {
+    let reason = error && error.message ? error.message : String(error);
+    function renderFallback(timeMs) {
+      frame += 1;
+      frameValue.textContent = String(frame);
+      drawFallback(timeMs, reason);
+      requestAnimationFrame(renderFallback);
+    }
+    requestAnimationFrame(renderFallback);
+  });
+</script>

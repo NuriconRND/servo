@@ -231,6 +231,26 @@ impl WGPU {
                         );
                         self.maybe_dispatch_wgpu_error(device_id, result.err());
                     },
+                    WebGPURequest::ResolveQuerySet {
+                        device_id,
+                        command_encoder_id,
+                        query_set_id,
+                        first_query,
+                        query_count,
+                        destination_id,
+                        destination_offset,
+                    } => {
+                        let global = &self.global;
+                        let result = global.command_encoder_resolve_query_set(
+                            command_encoder_id,
+                            query_set_id,
+                            first_query,
+                            query_count,
+                            destination_id,
+                            destination_offset,
+                        );
+                        self.maybe_dispatch_wgpu_error(device_id, result.err());
+                    },
                     WebGPURequest::CopyBufferToTexture {
                         device_id,
                         command_encoder_id,
@@ -411,6 +431,19 @@ impl WGPU {
                         let global = &self.global;
                         let (_, error) =
                             global.device_create_sampler(device_id, &descriptor, Some(sampler_id));
+                        self.maybe_dispatch_wgpu_error(device_id, error);
+                    },
+                    WebGPURequest::CreateQuerySet {
+                        device_id,
+                        query_set_id,
+                        descriptor,
+                    } => {
+                        let global = &self.global;
+                        let (_, error) = global.device_create_query_set(
+                            device_id,
+                            &descriptor,
+                            Some(query_set_id),
+                        );
                         self.maybe_dispatch_wgpu_error(device_id, error);
                     },
                     WebGPURequest::CreateShaderModule {

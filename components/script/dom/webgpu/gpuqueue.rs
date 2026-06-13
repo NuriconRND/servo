@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use pixels::{SnapshotAlphaMode, SnapshotPixelFormat};
 use script_bindings::cell::DomRefCell;
 use script_bindings::reflector::{Reflector, reflect_dom_object};
 use servo_base::generic_channel::GenericSharedMemory;
@@ -12,9 +13,11 @@ use webgpu_traits::{WebGPU, WebGPUQueue, WebGPURequest};
 
 use crate::conversions::{Convert, TryConvert};
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
-    GPUExtent3D, GPUQueueMethods, GPUSize64, GPUTexelCopyBufferLayout, GPUTexelCopyTextureInfo,
+    GPUCopyExternalImageDestInfo, GPUExtent3D, GPUImageCopyExternalImage, GPUQueueMethods, GPUSize64,
+    GPUTexelCopyBufferLayout, GPUTexelCopyTextureInfo,
 };
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer as BufferSource;
+use crate::dom::bindings::codegen::UnionTypes::ImageBitmapOrHTMLCanvasElementOrOffscreenCanvas;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot};
@@ -198,6 +201,86 @@ impl GPUQueueMethods<crate::DomTypeHolder> for GPUQueue {
             warn!(
                 "Failed to send WriteTexture({:?}) ({})",
                 destination.texture.id().0,
+                e
+            );
+            return Err(Error::Operation(None));
+        }
+
+        Ok(())
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpuqueue-copyexternalimagetotexture>
+    fn CopyExternalImageToTexture(
+        &self,
+        source: &GPUImageCopyExternalImage,
+        destination: &GPUCopyExternalImageDestInfo,
+        copy_size: GPUExtent3D,
+    ) -> Fallible<()> {
+        // Servo's WebGPU has no wgpu "copy external image to texture" path, but it
+        // can upload raw bytes via WriteTexture. So take a snapshot of the source
+        // image, normalize it to RGBA with the requested alpha, optionally flip it
+        // vertically, and reuse the WriteTexture path.
+        let snapshot = match &source.source {
+            ImageBitmapOrHTMLCanvasElementOrOffscreenCanvas::ImageBitmap(bitmap) => {
+                bitmap.bitmap_data().as_ref().cloned()
+            },
+            ImageBitmapOrHTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
+                canvas.get_image_data()
+            },
+            ImageBitmapOrHTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
+                canvas.get_image_data()
+            },
+        };
+        let mut snapshot = snapshot.ok_or(Error::Operation(None))?;
+
+        let size = snapshot.size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+
+        // Normalize to RGBA8 with the alpha mode the destination expects.
+        snapshot.transform(
+            SnapshotAlphaMode::Transparent {
+                premultiplied: destination.premultipliedAlpha,
+            },
+            SnapshotPixelFormat::RGBA,
+        );
+
+        let width = size.width;
+        let height = size.height;
+        let bytes_per_row = width * 4;
+        let mut bytes = snapshot.as_raw_bytes().to_vec();
+
+        if source.flipY {
+            let row = bytes_per_row as usize;
+            let h = height as usize;
+            let mut flipped = vec![0u8; bytes.len()];
+            for y in 0..h {
+                let src = &bytes[y * row..(y + 1) * row];
+                flipped[(h - 1 - y) * row..(h - y) * row].copy_from_slice(src);
+            }
+            bytes = flipped;
+        }
+
+        let texture_cv = (&destination.parent).try_convert()?;
+        let write_size = (&copy_size).try_convert()?;
+        let data_layout = wgpu_types::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        };
+        let final_data = GenericSharedMemory::from_bytes(&bytes);
+
+        if let Err(e) = self.channel.0.send(WebGPURequest::WriteTexture {
+            device_id: self.device.borrow().as_ref().unwrap().id().0,
+            queue_id: self.queue.0,
+            texture_cv,
+            data_layout,
+            size: write_size,
+            data: final_data,
+        }) {
+            warn!(
+                "Failed to send WriteTexture (copyExternalImageToTexture) ({})",
                 e
             );
             return Err(Error::Operation(None));

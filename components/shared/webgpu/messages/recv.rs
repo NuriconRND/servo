@@ -40,7 +40,7 @@ pub use wgpu_core::id::{
 use wgpu_core::instance::RequestAdapterOptions;
 use wgpu_core::pipeline::{ComputePipelineDescriptor, RenderPipelineDescriptor};
 use wgpu_core::resource::{
-    BufferAccessError, BufferDescriptor, SamplerDescriptor, TextureDescriptor,
+    BufferAccessError, BufferDescriptor, QuerySetDescriptor, SamplerDescriptor, TextureDescriptor,
     TextureViewDescriptor,
 };
 use wgpu_types::{
@@ -91,6 +91,15 @@ pub enum WebGPURequest {
         destination_id: BufferId,
         destination_offset: BufferAddress,
         size: BufferAddress,
+    },
+    ResolveQuerySet {
+        device_id: DeviceId,
+        command_encoder_id: CommandEncoderId,
+        query_set_id: QuerySetId,
+        first_query: u32,
+        query_count: u32,
+        destination_id: BufferId,
+        destination_offset: BufferAddress,
     },
     CopyBufferToTexture {
         device_id: DeviceId,
@@ -156,6 +165,11 @@ pub enum WebGPURequest {
         device_id: DeviceId,
         sampler_id: SamplerId,
         descriptor: SamplerDescriptor<'static>,
+    },
+    CreateQuerySet {
+        device_id: DeviceId,
+        query_set_id: QuerySetId,
+        descriptor: QuerySetDescriptor<'static>,
     },
     CreateShaderModule {
         device_id: DeviceId,

@@ -27,6 +27,7 @@ use crate::dom::webgpu::gpubuffer::GPUBuffer;
 use crate::dom::webgpu::gpucommandbuffer::GPUCommandBuffer;
 use crate::dom::webgpu::gpucomputepassencoder::GPUComputePassEncoder;
 use crate::dom::webgpu::gpudevice::GPUDevice;
+use crate::dom::webgpu::gpuqueryset::GPUQuerySet;
 use crate::dom::webgpu::gpurenderpassencoder::GPURenderPassEncoder;
 use crate::script_runtime::CanGc;
 
@@ -272,6 +273,30 @@ impl GPUCommandEncoderMethods<crate::DomTypeHolder> for GPUCommandEncoder {
                 device_id: self.device.id().0,
             })
             .expect("Failed to send CopyBufferToBuffer");
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-resolvequeryset>
+    fn ResolveQuerySet(
+        &self,
+        query_set: &GPUQuerySet,
+        first_query: u32,
+        query_count: u32,
+        destination: &GPUBuffer,
+        destination_offset: u64,
+    ) {
+        self.droppable
+            .channel
+            .0
+            .send(WebGPURequest::ResolveQuerySet {
+                device_id: self.device.id().0,
+                command_encoder_id: self.droppable.encoder.0,
+                query_set_id: query_set.id().0,
+                first_query,
+                query_count,
+                destination_id: destination.id().0,
+                destination_offset,
+            })
+            .expect("Failed to send ResolveQuerySet");
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpucommandencoder-copybuffertotexture>
