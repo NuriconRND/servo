@@ -15,17 +15,44 @@ use crate::platform::generic::egl::ffi::{
 };
 use crate::{Error, GLApi};
 
+use log::{info, warn};
 use std::cell::{RefCell, RefMut};
 use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
 use winapi::Interface;
 use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
-use winapi::shared::minwindef::UINT;
+use winapi::shared::guiddef::GUID;
+use winapi::shared::minwindef::{BOOL, TRUE, UINT};
 use winapi::shared::winerror::{self, S_OK};
-use winapi::um::d3d11::ID3D11Device;
+use winapi::um::d3d11::{ID3D11Device, ID3D11DeviceContext};
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
+use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
 use wio::com::ComPtr;
+
+const IID_ID3D11_MULTITHREAD: GUID = GUID {
+    Data1: 0x9b7e4e00,
+    Data2: 0x342c,
+    Data3: 0x4106,
+    Data4: [0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0],
+};
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct ID3D11Multithread {
+    lpVtbl: *const ID3D11MultithreadVtbl,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct ID3D11MultithreadVtbl {
+    parent: IUnknownVtbl,
+    Enter: unsafe extern "system" fn(this: *mut ID3D11Multithread),
+    Leave: unsafe extern "system" fn(this: *mut ID3D11Multithread),
+    SetMultithreadProtected:
+        unsafe extern "system" fn(this: *mut ID3D11Multithread, bMTProtect: BOOL) -> BOOL,
+    GetMultithreadProtected: unsafe extern "system" fn(this: *mut ID3D11Multithread) -> BOOL,
+}
 
 thread_local! {
     static DXGI_FACTORY: RefCell<Option<ComPtr<IDXGIFactory1>>> = RefCell::new(None);
@@ -210,6 +237,7 @@ impl Device {
                     return Err(Error::DeviceOpenFailed);
                 }
                 let d3d11_device = query_d3d11_device_for_egl_display(egl_display)?;
+                enable_d3d11_multithread_protection(&d3d11_device);
 
                 Ok(Device {
                     egl_display,
@@ -289,6 +317,45 @@ impl Device {
     #[inline]
     pub fn gl_api(&self) -> GLApi {
         GLApi::GLES
+    }
+}
+
+unsafe fn set_multithread_protected(unknown: *mut IUnknown, target: &str) {
+    let mut multithread: *mut ID3D11Multithread = ptr::null_mut();
+    let result = (*unknown).QueryInterface(
+        &IID_ID3D11_MULTITHREAD,
+        &mut multithread as *mut *mut ID3D11Multithread as *mut *mut c_void,
+    );
+    if !winerror::SUCCEEDED(result) || multithread.is_null() {
+        warn!(
+            "ANGLE D3D11 {target} does not expose ID3D11Multithread; \
+             multi-thread protection unavailable"
+        );
+        return;
+    }
+
+    let was_enabled = ((*(*multithread).lpVtbl).SetMultithreadProtected)(multithread, TRUE);
+    ((*(*multithread).lpVtbl).parent.Release)(multithread as *mut IUnknown);
+    info!(
+        "Enabled ANGLE D3D11 {target} multithread protection; previously_enabled={}",
+        was_enabled != 0
+    );
+}
+
+fn enable_d3d11_multithread_protection(d3d11_device: &ComPtr<ID3D11Device>) {
+    unsafe {
+        set_multithread_protected(d3d11_device.as_raw() as *mut IUnknown, "device");
+
+        let mut immediate_context: *mut ID3D11DeviceContext = ptr::null_mut();
+        d3d11_device.GetImmediateContext(&mut immediate_context);
+        if immediate_context.is_null() {
+            warn!("ANGLE D3D11 device returned a null immediate context");
+            return;
+        }
+        set_multithread_protected(immediate_context as *mut IUnknown, "immediate context");
+        ((*(*(immediate_context as *mut IUnknown)).lpVtbl).Release)(
+            immediate_context as *mut IUnknown,
+        );
     }
 }
 

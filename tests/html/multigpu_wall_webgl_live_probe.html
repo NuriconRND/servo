@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU WebGL Live Probe</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    width: 3840px;
+    height: 1080px;
+    overflow: hidden;
+    background: #07090d;
+    color: #eef3f8;
+    font: 14px/1.4 Consolas, monospace;
+  }
+
+  canvas {
+    position: absolute;
+    inset: 0;
+    width: 3840px;
+    height: 1080px;
+  }
+
+  .seam {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 1920px;
+    width: 4px;
+    background: #f7d84c;
+    box-shadow: 0 0 24px rgba(247, 216, 76, 0.9);
+  }
+
+  .hud {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    z-index: 2;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.26);
+    background: rgba(0, 0, 0, 0.62);
+  }
+</style>
+<canvas id="gl" width="3840" height="1080"></canvas>
+<div class="seam"></div>
+<pre class="hud" id="hud">starting</pre>
+<script>
+  var canvas = document.getElementById("gl");
+  var hud = document.getElementById("hud");
+  var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+  var start = performance.now();
+  var frame = 0;
+
+  function draw(now) {
+    frame += 1;
+    if (gl) {
+      var r = (Math.sin(now / 500) + 1) * 0.45;
+      var g = (Math.sin(now / 700 + 1.7) + 1) * 0.45;
+      var b = (Math.sin(now / 900 + 3.1) + 1) * 0.45;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(r, g, b, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+
+    hud.textContent = [
+      "Multi-GPU WebGL Live Probe",
+      "webgl=" + (gl ? "ready" : "unavailable"),
+      "frame=" + frame,
+      "elapsed_ms=" + Math.round(now - start),
+      "viewport=" + innerWidth + "x" + innerHeight,
+      "wall_seam_x=1920"
+    ].join("\n");
+
+    requestAnimationFrame(draw);
+  }
+
+  setInterval(function () {
+    document.title = "WebGL live " + frame;
+  }, 1000);
+
+  requestAnimationFrame(draw);
+</script>

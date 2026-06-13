@@ -110,18 +110,18 @@ pub struct GLState {
 impl GLState {
     // Are we faking having no alpha / depth / stencil?
     fn fake_no_alpha(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
     }
 
     fn fake_no_depth(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
     }
 
     fn fake_no_stencil(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self
+        self.drawing_to_default_framebuffer
+            & !self
                 .requested_flags
                 .contains(ContextAttributeFlags::STENCIL)
     }
@@ -544,11 +544,9 @@ impl WebGLThread {
                     return;
                 };
                 self.for_each_backend_context_mut(context_id, |_, context_data| unsafe {
-                    context_data.gl.buffer_sub_data_u8_slice(
-                        buffer_type,
-                        offset as i32,
-                        &data,
-                    );
+                    context_data
+                        .gl
+                        .buffer_sub_data_u8_slice(buffer_type, offset as i32, &data);
                 });
             },
             WebGLCommand::CreateBuffer(sender) => {
@@ -648,73 +646,73 @@ impl WebGLThread {
     fn command_uses_primary_response_only(command: &WebGLCommand) -> bool {
         matches!(
             command,
-            WebGLCommand::GetContextAttributes(..) |
-                WebGLCommand::GetBufferSubData(..) |
-                WebGLCommand::GetExtensions(..) |
-                WebGLCommand::GetShaderPrecisionFormat(..) |
-                WebGLCommand::GetFragDataLocation(..) |
-                WebGLCommand::GetUniformLocation(..) |
-                WebGLCommand::GetShaderInfoLog(..) |
-                WebGLCommand::GetProgramInfoLog(..) |
-                WebGLCommand::GetFramebufferAttachmentParameter(..) |
-                WebGLCommand::GetRenderbufferParameter(..) |
-                WebGLCommand::IsTransformFeedback(..) |
-                WebGLCommand::GetTransformFeedbackVarying(..) |
-                WebGLCommand::ReadPixels(..) |
-                WebGLCommand::FenceSync(..) |
-                WebGLCommand::IsSync(..) |
-                WebGLCommand::ClientWaitSync(..) |
-                WebGLCommand::GetSyncParameter(..) |
-                WebGLCommand::DrawingBufferWidth(..) |
-                WebGLCommand::DrawingBufferHeight(..) |
-                WebGLCommand::Finish(..) |
-                WebGLCommand::GetParameterBool(..) |
-                WebGLCommand::GetParameterBool4(..) |
-                WebGLCommand::GetParameterInt(..) |
-                WebGLCommand::GetParameterInt2(..) |
-                WebGLCommand::GetParameterInt4(..) |
-                WebGLCommand::GetParameterFloat(..) |
-                WebGLCommand::GetParameterFloat2(..) |
-                WebGLCommand::GetParameterFloat4(..) |
-                WebGLCommand::GetProgramValidateStatus(..) |
-                WebGLCommand::GetProgramActiveUniforms(..) |
-                WebGLCommand::GetCurrentVertexAttrib(..) |
-                WebGLCommand::GetTexParameterFloat(..) |
-                WebGLCommand::GetTexParameterInt(..) |
-                WebGLCommand::GetTexParameterBool(..) |
-                WebGLCommand::GetInternalFormatIntVec(..) |
-                WebGLCommand::GetUniformBool(..) |
-                WebGLCommand::GetUniformBool2(..) |
-                WebGLCommand::GetUniformBool3(..) |
-                WebGLCommand::GetUniformBool4(..) |
-                WebGLCommand::GetUniformInt(..) |
-                WebGLCommand::GetUniformInt2(..) |
-                WebGLCommand::GetUniformInt3(..) |
-                WebGLCommand::GetUniformInt4(..) |
-                WebGLCommand::GetUniformUint(..) |
-                WebGLCommand::GetUniformUint2(..) |
-                WebGLCommand::GetUniformUint3(..) |
-                WebGLCommand::GetUniformUint4(..) |
-                WebGLCommand::GetUniformFloat(..) |
-                WebGLCommand::GetUniformFloat2(..) |
-                WebGLCommand::GetUniformFloat3(..) |
-                WebGLCommand::GetUniformFloat4(..) |
-                WebGLCommand::GetUniformFloat9(..) |
-                WebGLCommand::GetUniformFloat16(..) |
-                WebGLCommand::GetUniformFloat2x3(..) |
-                WebGLCommand::GetUniformFloat2x4(..) |
-                WebGLCommand::GetUniformFloat3x2(..) |
-                WebGLCommand::GetUniformFloat3x4(..) |
-                WebGLCommand::GetUniformFloat4x2(..) |
-                WebGLCommand::GetUniformFloat4x3(..) |
-                WebGLCommand::GetUniformBlockIndex(..) |
-                WebGLCommand::GetUniformIndices(..) |
-                WebGLCommand::GetActiveUniforms(..) |
-                WebGLCommand::GetActiveUniformBlockName(..) |
-                WebGLCommand::GetActiveUniformBlockParameter(..) |
-                WebGLCommand::GetQueryState(..) |
-                WebGLCommand::GetSamplerParameterFloat(..) |
-                WebGLCommand::GetSamplerParameterInt(..)
+            WebGLCommand::GetContextAttributes(..)
+                | WebGLCommand::GetBufferSubData(..)
+                | WebGLCommand::GetExtensions(..)
+                | WebGLCommand::GetShaderPrecisionFormat(..)
+                | WebGLCommand::GetFragDataLocation(..)
+                | WebGLCommand::GetUniformLocation(..)
+                | WebGLCommand::GetShaderInfoLog(..)
+                | WebGLCommand::GetProgramInfoLog(..)
+                | WebGLCommand::GetFramebufferAttachmentParameter(..)
+                | WebGLCommand::GetRenderbufferParameter(..)
+                | WebGLCommand::IsTransformFeedback(..)
+                | WebGLCommand::GetTransformFeedbackVarying(..)
+                | WebGLCommand::ReadPixels(..)
+                | WebGLCommand::FenceSync(..)
+                | WebGLCommand::IsSync(..)
+                | WebGLCommand::ClientWaitSync(..)
+                | WebGLCommand::GetSyncParameter(..)
+                | WebGLCommand::DrawingBufferWidth(..)
+                | WebGLCommand::DrawingBufferHeight(..)
+                | WebGLCommand::Finish(..)
+                | WebGLCommand::GetParameterBool(..)
+                | WebGLCommand::GetParameterBool4(..)
+                | WebGLCommand::GetParameterInt(..)
+                | WebGLCommand::GetParameterInt2(..)
+                | WebGLCommand::GetParameterInt4(..)
+                | WebGLCommand::GetParameterFloat(..)
+                | WebGLCommand::GetParameterFloat2(..)
+                | WebGLCommand::GetParameterFloat4(..)
+                | WebGLCommand::GetProgramValidateStatus(..)
+                | WebGLCommand::GetProgramActiveUniforms(..)
+                | WebGLCommand::GetCurrentVertexAttrib(..)
+                | WebGLCommand::GetTexParameterFloat(..)
+                | WebGLCommand::GetTexParameterInt(..)
+                | WebGLCommand::GetTexParameterBool(..)
+                | WebGLCommand::GetInternalFormatIntVec(..)
+                | WebGLCommand::GetUniformBool(..)
+                | WebGLCommand::GetUniformBool2(..)
+                | WebGLCommand::GetUniformBool3(..)
+                | WebGLCommand::GetUniformBool4(..)
+                | WebGLCommand::GetUniformInt(..)
+                | WebGLCommand::GetUniformInt2(..)
+                | WebGLCommand::GetUniformInt3(..)
+                | WebGLCommand::GetUniformInt4(..)
+                | WebGLCommand::GetUniformUint(..)
+                | WebGLCommand::GetUniformUint2(..)
+                | WebGLCommand::GetUniformUint3(..)
+                | WebGLCommand::GetUniformUint4(..)
+                | WebGLCommand::GetUniformFloat(..)
+                | WebGLCommand::GetUniformFloat2(..)
+                | WebGLCommand::GetUniformFloat3(..)
+                | WebGLCommand::GetUniformFloat4(..)
+                | WebGLCommand::GetUniformFloat9(..)
+                | WebGLCommand::GetUniformFloat16(..)
+                | WebGLCommand::GetUniformFloat2x3(..)
+                | WebGLCommand::GetUniformFloat2x4(..)
+                | WebGLCommand::GetUniformFloat3x2(..)
+                | WebGLCommand::GetUniformFloat3x4(..)
+                | WebGLCommand::GetUniformFloat4x2(..)
+                | WebGLCommand::GetUniformFloat4x3(..)
+                | WebGLCommand::GetUniformBlockIndex(..)
+                | WebGLCommand::GetUniformIndices(..)
+                | WebGLCommand::GetActiveUniforms(..)
+                | WebGLCommand::GetActiveUniformBlockName(..)
+                | WebGLCommand::GetActiveUniformBlockParameter(..)
+                | WebGLCommand::GetQueryState(..)
+                | WebGLCommand::GetSamplerParameterFloat(..)
+                | WebGLCommand::GetSamplerParameterInt(..)
         )
     }
 
@@ -762,6 +760,7 @@ impl WebGLThread {
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
+        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
         let data = self.make_surface_current_if_needed_mut(surface_id);
         if let Some(data) = data {
             WebGLImpl::apply(
@@ -781,6 +780,7 @@ impl WebGLThread {
         F: FnMut(WebGLSurfaceId, &mut GLContextData),
     {
         for surface_id in self.backend_surface_ids(context_id) {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
             self.make_surface_current_if_needed(surface_id);
             if let Some(context_data) = self.contexts.get_mut(&surface_id) {
                 f(surface_id, context_data);
@@ -882,7 +882,8 @@ impl WebGLThread {
         }
         self.context_backends.insert(context_id, target_painter_ids);
 
-        primary_limits.ok_or_else(|| "Failed to create primary WebGL backend".to_string())
+        primary_limits
+            .ok_or_else(|| "Failed to create primary WebGL backend".to_string())
             .map(|limits| (context_id, limits))
     }
 
@@ -894,6 +895,7 @@ impl WebGLThread {
         requested_size: Size2D<u32>,
         attributes: GLContextAttributes,
     ) -> Result<(GLContextData, webgl::GLLimits, Size2D<i32>, bool), String> {
+        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
         let painter_surfman_details = self
             .painter_surfman_details_map
             .get(painter_id)
@@ -910,10 +912,10 @@ impl WebGLThread {
         // WebGL requires all contexts to be able to create framebuffers with
         // alpha, depth and stencil. So we always create a context with them,
         // and fake not having them if requested.
-        let flags = requested_flags |
-            ContextAttributeFlags::ALPHA |
-            ContextAttributeFlags::DEPTH |
-            ContextAttributeFlags::STENCIL;
+        let flags = requested_flags
+            | ContextAttributeFlags::ALPHA
+            | ContextAttributeFlags::DEPTH
+            | ContextAttributeFlags::STENCIL;
         let context_attributes = &ContextAttributes {
             version: webgl_version.to_surfman_version(api_type),
             flags,
@@ -1029,15 +1031,14 @@ impl WebGLThread {
         state.restore_invariant(&gl);
         debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
 
-        let context_data =
-            GLContextData {
-                ctx,
-                device,
-                gl,
-                state,
-                attributes,
-                marked_for_deletion: false,
-            };
+        let context_data = GLContextData {
+            ctx,
+            device,
+            gl,
+            state,
+            attributes,
+            marked_for_deletion: false,
+        };
 
         Ok((context_data, limits, size.to_i32(), has_alpha))
     }
@@ -1057,6 +1058,7 @@ impl WebGLThread {
         let mut primary_has_alpha = false;
 
         for surface_id in surface_ids {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
             self.make_surface_current_if_needed(surface_id)
                 .expect("Missing WebGL backend context!");
 
@@ -1123,11 +1125,13 @@ impl WebGLThread {
 
     fn context_has_busy_surfaces(&self, context_id: WebGLContextId) -> bool {
         let busy_webgl_context_map = self.busy_webgl_context_map.read();
-        self.backend_surface_ids(context_id).iter().any(|surface_id| {
-            busy_webgl_context_map
-                .get(surface_id)
-                .is_some_and(|busy_count| *busy_count > 0)
-        })
+        self.backend_surface_ids(context_id)
+            .iter()
+            .any(|surface_id| {
+                busy_webgl_context_map
+                    .get(surface_id)
+                    .is_some_and(|busy_count| *busy_count > 0)
+            })
     }
 
     /// Removes a WebGLContext and releases attached resources.
@@ -1177,6 +1181,7 @@ impl WebGLThread {
         }
 
         for surface_id in surface_ids {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
             // We need to make each backend context current so its resources can be disposed of.
             self.make_surface_current_if_needed(surface_id);
 
@@ -1210,6 +1215,7 @@ impl WebGLThread {
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
             for surface_id in self.backend_surface_ids(context_id) {
+                let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
                 self.make_surface_current_if_needed(surface_id)
                     .expect("Where's the GL data?");
 
@@ -1325,8 +1331,8 @@ impl WebGLThread {
         surface_id: WebGLSurfaceId,
     ) -> Option<&GLContextData> {
         let data = self.contexts.get(&surface_id);
-        if let Some(data) = data &&
-            Some(surface_id) != self.bound_context_id
+        if let Some(data) = data
+            && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
@@ -1340,8 +1346,8 @@ impl WebGLThread {
         surface_id: WebGLSurfaceId,
     ) -> Option<&mut GLContextData> {
         let data = self.contexts.get_mut(&surface_id);
-        if let Some(ref data) = data &&
-            Some(surface_id) != self.bound_context_id
+        if let Some(ref data) = data
+            && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
@@ -1654,9 +1660,9 @@ impl WebGLImpl {
                 gl.polygon_offset(factor, units)
             },
             WebGLCommand::ReadPixels(rect, format, pixel_type, ref sender) => {
-                let len = bytes_per_type(pixel_type) *
-                    components_per_format(format) *
-                    rect.size.area() as usize;
+                let len = bytes_per_type(pixel_type)
+                    * components_per_format(format)
+                    * rect.size.area() as usize;
                 let mut pixels = vec![0; len];
                 unsafe {
                     // We don't want any alignment padding on pixel rows.
@@ -3333,10 +3339,10 @@ fn image_to_tex_image_data(
     }
 
     match (format, data_type) {
-        (TexFormat::RGBA, TexDataType::UnsignedByte) |
-        (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
-        (TexFormat::RGB, TexDataType::UnsignedByte) |
-        (TexFormat::RGB8, TexDataType::UnsignedByte) => {
+        (TexFormat::RGBA, TexDataType::UnsignedByte)
+        | (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
+        (TexFormat::RGB, TexDataType::UnsignedByte)
+        | (TexFormat::RGB8, TexDataType::UnsignedByte) => {
             for i in 0..pixel_count {
                 let rgb = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
@@ -3379,10 +3385,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf0) << 8) |
-                        ((rgba[1] as u16 & 0xf0) << 4) |
-                        (rgba[2] as u16 & 0xf0) |
-                        ((rgba[3] as u16 & 0xf0) >> 4)
+                    ((rgba[0] as u16 & 0xf0) << 8)
+                        | ((rgba[1] as u16 & 0xf0) << 4)
+                        | (rgba[2] as u16 & 0xf0)
+                        | ((rgba[3] as u16 & 0xf0) >> 4)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -3393,10 +3399,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf8) << 8) |
-                        ((rgba[1] as u16 & 0xf8) << 3) |
-                        ((rgba[2] as u16 & 0xf8) >> 2) |
-                        ((rgba[3] as u16) >> 7)
+                    ((rgba[0] as u16 & 0xf8) << 8)
+                        | ((rgba[1] as u16 & 0xf8) << 3)
+                        | ((rgba[2] as u16 & 0xf8) >> 2)
+                        | ((rgba[3] as u16) >> 7)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -3407,9 +3413,9 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
-                    ((rgb[0] as u16 & 0xf8) << 8) |
-                        ((rgb[1] as u16 & 0xfc) << 3) |
-                        ((rgb[2] as u16 & 0xf8) >> 3)
+                    ((rgb[0] as u16 & 0xf8) << 8)
+                        | ((rgb[1] as u16 & 0xfc) << 3)
+                        | ((rgb[2] as u16 & 0xf8) >> 3)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -3445,8 +3451,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::Luminance, TexDataType::Float) |
-        (TexFormat::Luminance32f, TexDataType::Float) => {
+        (TexFormat::Luminance, TexDataType::Float)
+        | (TexFormat::Luminance32f, TexDataType::Float) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let p = rgba8[0] as f32;
                 NativeEndian::write_f32(rgba8, p);
@@ -3454,8 +3460,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::LuminanceAlpha, TexDataType::Float) |
-        (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
+        (TexFormat::LuminanceAlpha, TexDataType::Float)
+        | (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
             let mut data = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 data.write_f32::<NativeEndian>(rgba8[0] as f32).unwrap();
@@ -3464,8 +3470,8 @@ fn image_to_tex_image_data(
             data
         },
 
-        (TexFormat::RGBA, TexDataType::HalfFloat) |
-        (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
+        (TexFormat::RGBA, TexDataType::HalfFloat)
+        | (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
             let mut rgbaf16 = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 rgbaf16
@@ -3499,8 +3505,8 @@ fn image_to_tex_image_data(
             }
             rgbf16
         },
-        (TexFormat::Alpha, TexDataType::HalfFloat) |
-        (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::Alpha, TexDataType::HalfFloat)
+        | (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4 + 3] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3508,8 +3514,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::Luminance, TexDataType::HalfFloat) |
-        (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
+        (TexFormat::Luminance, TexDataType::HalfFloat)
+        | (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3517,8 +3523,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat) |
-        (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat)
+        | (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let lum = f16::from_f32(rgba8[0] as f32).to_bits();
                 let a = f16::from_f32(rgba8[3] as f32).to_bits();
@@ -3562,10 +3568,10 @@ fn premultiply_inplace(format: TexFormat, data_type: TexDataType, pixels: &mut [
                 let a = extend_to_8_bits(pix & 0x0f);
                 NativeEndian::write_u16(
                     rgba,
-                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8) |
-                        (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4) |
-                        ((pixels::multiply_u8_color(b, a) & 0xf0) as u16) |
-                        ((a & 0x0f) as u16),
+                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8)
+                        | (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4)
+                        | ((pixels::multiply_u8_color(b, a) & 0xf0) as u16)
+                        | ((a & 0x0f) as u16),
                 );
             }
         },
@@ -3583,8 +3589,8 @@ fn flip_pixels_y(
     unpacking_alignment: usize,
     pixels: Vec<u8>,
 ) -> Vec<u8> {
-    let cpp = (data_type.element_size() * internal_format.components() /
-        data_type.components_per_element()) as usize;
+    let cpp = (data_type.element_size() * internal_format.components()
+        / data_type.components_per_element()) as usize;
 
     let stride = (width * cpp + unpacking_alignment - 1) & !(unpacking_alignment - 1);
 

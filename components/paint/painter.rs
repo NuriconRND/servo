@@ -484,31 +484,35 @@ impl Painter {
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
-        if let Err(error) = self.rendering_context.make_current() {
-            error!("Failed to make the rendering context current: {error:?}");
-        }
-        self.assert_no_gl_error();
+        {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
-        self.rendering_context.prepare_for_rendering();
-
-        time_profile!(
-            ProfilerCategory::Painting,
-            None,
-            time_profiler_channel.clone(),
-            || {
-                if let Some(renderer) = self.webrender_renderer.as_mut() {
-                    renderer.update();
-                }
-
-                // Paint the scene.
-                // TODO(gw): Take notice of any errors the renderer returns!
-                self.clear_background();
-                if let Some(renderer) = self.webrender_renderer.as_mut() {
-                    let size = self.rendering_context.size2d().to_i32();
-                    renderer.render(size, 0 /* buffer_age */).ok();
-                }
+            if let Err(error) = self.rendering_context.make_current() {
+                error!("Failed to make the rendering context current: {error:?}");
             }
-        );
+            self.assert_no_gl_error();
+
+            self.rendering_context.prepare_for_rendering();
+
+            time_profile!(
+                ProfilerCategory::Painting,
+                None,
+                time_profiler_channel.clone(),
+                || {
+                    if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        renderer.update();
+                    }
+
+                    // Paint the scene.
+                    // TODO(gw): Take notice of any errors the renderer returns!
+                    self.clear_background();
+                    if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        let size = self.rendering_context.size2d().to_i32();
+                        renderer.render(size, 0 /* buffer_age */).ok();
+                    }
+                }
+            );
+        }
 
         // We've painted the default target, which means that from the embedder's perspective,
         // the scene no longer needs to be repainted.

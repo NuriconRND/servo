@@ -27,7 +27,7 @@ pub mod largest_contentful_paint_candidate;
 pub mod rendering_context;
 pub mod viewport_description;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bitflags::bitflags;
 use display_list::PaintDisplayListInfo;
@@ -49,6 +49,8 @@ use webrender_api::{
 
 use crate::largest_contentful_paint_candidate::LCPCandidate;
 use crate::viewport_description::ViewportDescription;
+
+pub static ANGLE_GL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Sends messages to `Paint`.
 #[derive(Clone)]

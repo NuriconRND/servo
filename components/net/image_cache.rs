@@ -48,6 +48,8 @@ const FALLBACK_RIPPY: &[u8] = include_bytes!("resources/rippy.png");
 /// test uses very large values for viewBox. Hence, we just clamp the maximum
 /// width/height of the pixmap allocated for rasterization.
 const MAX_SVG_PIXMAP_DIMENSION: u32 = 5000;
+const MAX_SVG_PIXMAP_BYTES: u64 = 64 * 1024 * 1024;
+const SVG_RGBA_BYTES_PER_PIXEL: u64 = 4;
 
 //
 // TODO(gw): Remaining work on image cache:
@@ -1056,28 +1058,58 @@ impl ImageCache for ImageCacheImpl {
         let store = self.store.clone();
         self.thread_pool.spawn(move || {
             let natural_size = vector_image.svg_tree.size().to_int_size();
-            let tinyskia_requested_size = {
-                let width = requested_size
+            let (requested_width, requested_height) = {
+                let mut width = requested_size
                     .width
                     .try_into()
                     .unwrap_or(0)
                     .min(MAX_SVG_PIXMAP_DIMENSION);
-                let height = requested_size
+                let mut height = requested_size
                     .height
                     .try_into()
                     .unwrap_or(0)
                     .min(MAX_SVG_PIXMAP_DIMENSION);
-                tiny_skia::IntSize::from_wh(width, height).unwrap_or(natural_size)
+
+                let requested_bytes =
+                    u64::from(width) * u64::from(height) * SVG_RGBA_BYTES_PER_PIXEL;
+                if requested_bytes > MAX_SVG_PIXMAP_BYTES {
+                    let scale = (MAX_SVG_PIXMAP_BYTES as f64 / requested_bytes as f64).sqrt();
+                    let clamped_width = ((width as f64 * scale).floor() as u32).max(1);
+                    let clamped_height = ((height as f64 * scale).floor() as u32).max(1);
+                    debug!(
+                        "Clamping SVG rasterization from {width}x{height} ({requested_bytes} bytes) \
+                         to {clamped_width}x{clamped_height}"
+                    );
+                    width = clamped_width;
+                    height = clamped_height;
+                }
+
+                (width, height)
+            };
+            let tinyskia_requested_size = tiny_skia::IntSize::from_wh(
+                requested_width,
+                requested_height,
+            )
+            .unwrap_or(natural_size);
+            let Some(mut pixmap) = tiny_skia::Pixmap::new(
+                tinyskia_requested_size.width(),
+                tinyskia_requested_size.height(),
+            ) else {
+                warn!(
+                    "Failed to allocate SVG pixmap {}x{} for rasterization",
+                    tinyskia_requested_size.width(),
+                    tinyskia_requested_size.height()
+                );
+                store
+                    .lock()
+                    .svg_rasterization_task_store
+                    .remove_being_rasterized(image_id, requested_size);
+                return;
             };
             let transform = tiny_skia::Transform::from_scale(
                 tinyskia_requested_size.width() as f32 / natural_size.width() as f32,
                 tinyskia_requested_size.height() as f32 / natural_size.height() as f32,
             );
-            let mut pixmap = tiny_skia::Pixmap::new(
-                tinyskia_requested_size.width(),
-                tinyskia_requested_size.height(),
-            )
-            .unwrap();
             resvg::render(&vector_image.svg_tree, transform, &mut pixmap.as_mut());
 
             let bytes = pixmap.take();

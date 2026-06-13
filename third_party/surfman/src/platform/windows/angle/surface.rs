@@ -458,17 +458,23 @@ impl Device {
     ) -> Result<SurfaceTexture, (Error, Surface)> {
         EGL_FUNCTIONS.with(|egl| {
             unsafe {
-                let _guard = self.temporarily_make_context_current(context);
+                let _guard = match self.temporarily_make_context_current(context) {
+                    Ok(guard) => guard,
+                    Err(error) => return Err((error, surface)),
+                };
 
                 let gl = &context.gl;
+                let previous_texture = gl.get_parameter_texture(gl::TEXTURE_BINDING_2D);
                 // Then bind that surface to the texture.
-                let mut texture = gl.create_texture().unwrap();
+                let texture = gl.create_texture().unwrap();
 
                 gl.bind_texture(gl::TEXTURE_2D, Some(texture));
                 if egl.BindTexImage(self.egl_display, local_egl_surface, egl::BACK_BUFFER as _)
                     == egl::FALSE
                 {
                     let windowing_api_error = egl.GetError().to_windowing_api_error();
+                    gl.bind_texture(gl::TEXTURE_2D, previous_texture);
+                    gl.delete_texture(texture);
                     return Err((
                         Error::SurfaceTextureCreationFailed(windowing_api_error),
                         surface,
@@ -481,7 +487,7 @@ impl Device {
                 gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
                 gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
 
-                gl.bind_texture(gl::TEXTURE_2D, None);
+                gl.bind_texture(gl::TEXTURE_2D, previous_texture);
                 debug_assert_eq!(gl.get_error(), gl::NO_ERROR);
 
                 Ok(SurfaceTexture {
@@ -564,18 +570,38 @@ impl Device {
         mut surface_texture: SurfaceTexture,
     ) -> Result<Surface, (Error, SurfaceTexture)> {
         unsafe {
-            if let Some(texture) = surface_texture.gl_texture.take() {
-                context.gl.delete_texture(texture);
-            }
+            let _guard = match self.temporarily_make_context_current(context) {
+                Ok(guard) => guard,
+                Err(error) => return Err((error, surface_texture)),
+            };
 
-            if let Some(ref local_keyed_mutex) = surface_texture.local_keyed_mutex {
-                let result = local_keyed_mutex.ReleaseSync(0);
-                assert_eq!(result, S_OK);
-            }
+            let result = EGL_FUNCTIONS.with(|egl| {
+                if egl.ReleaseTexImage(
+                    self.egl_display,
+                    surface_texture.local_egl_surface,
+                    egl::BACK_BUFFER as _,
+                ) == egl::FALSE
+                {
+                    return Err(Error::SurfaceTextureCreationFailed(
+                        egl.GetError().to_windowing_api_error(),
+                    ));
+                }
 
-            EGL_FUNCTIONS.with(|egl| {
+                if let Some(texture) = surface_texture.gl_texture.take() {
+                    context.gl.delete_texture(texture);
+                }
+
+                if let Some(ref local_keyed_mutex) = surface_texture.local_keyed_mutex {
+                    let result = local_keyed_mutex.ReleaseSync(0);
+                    assert_eq!(result, S_OK);
+                }
+
                 egl.DestroySurface(self.egl_display, surface_texture.local_egl_surface);
-            })
+                Ok(())
+            });
+            if let Err(error) = result {
+                return Err((error, surface_texture));
+            }
         }
 
         Ok(surface_texture.surface)
