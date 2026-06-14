@@ -801,6 +801,7 @@ impl crate::WGPU {
                 texture_id,
                 size.width,
                 size.height,
+                config.format,
             ) {
                 log::info!(
                     "GPU-direct: created shared present texture {}x{} for {context_id:?} on \

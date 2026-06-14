@@ -21,18 +21,31 @@
 // M1 scaffolding: created and exported here; wired into the present path in a later milestone.
 #![allow(dead_code)]
 
+use webrender_api::ImageFormat;
 use wgpu_core::global::Global;
 use wgpu_core::id::{CommandBufferId, CommandEncoderId, DeviceId, QueueId, TextureId};
 use wgpu_types as wgt;
-use windows::Win32::Foundation::{GENERIC_ALL, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES,
     D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN, D3D12_RESOURCE_DESC,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Device, ID3D12Resource,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+};
 use windows::core::PCWSTR;
+
+/// Map the canvas present format to the matching (D3D12, wgpu) texture formats for the shared
+/// texture. Returns `None` for formats GPU-direct doesn't handle (caller falls back to CPU).
+fn formats_for(image_format: ImageFormat) -> Option<(DXGI_FORMAT, wgt::TextureFormat)> {
+    match image_format {
+        ImageFormat::BGRA8 => Some((DXGI_FORMAT_B8G8R8A8_UNORM, wgt::TextureFormat::Bgra8Unorm)),
+        ImageFormat::RGBA8 => Some((DXGI_FORMAT_R8G8B8A8_UNORM, wgt::TextureFormat::Rgba8Unorm)),
+        _ => None,
+    }
+}
 
 /// A shared D3D12 present texture: registered as a wgpu texture (so the WebGPU thread can
 /// GPU-copy the canvas into it) and exported as an NT handle (so the compositor can import
@@ -50,6 +63,15 @@ pub(crate) struct SharedPresentTexture {
 // move between threads.
 unsafe impl Send for SharedPresentTexture {}
 
+impl Drop for SharedPresentTexture {
+    fn drop(&mut self) {
+        // Close the exported NT handle. The compositor's `OpenSharedResource`'d D3D11 texture
+        // holds its own reference to the underlying resource, so closing the handle here is
+        // safe. (The wgpu texture id is dropped separately by the owner.)
+        let _ = unsafe { CloseHandle(self.shared_handle) };
+    }
+}
+
 /// Create a DXGI-shareable D3D12 texture on `device_id`'s GPU within `global`, export an NT
 /// handle for cross-device import, and register it in wgpu-core under `texture_id`.
 ///
@@ -63,7 +85,9 @@ pub(crate) fn create_shared_present_texture(
     texture_id: TextureId,
     width: u32,
     height: u32,
+    image_format: ImageFormat,
 ) -> Option<SharedPresentTexture> {
+    let (dxgi_format, wgt_format) = formats_for(image_format)?;
     // SAFETY: we only read the raw device handle; it is owned by wgpu for the call's duration.
     let hal_device = unsafe { global.device_as_hal::<wgpu_core::api::Dx12>(device_id) }?;
     let raw_device: &ID3D12Device = hal_device.raw_device();
@@ -82,7 +106,7 @@ pub(crate) fn create_shared_present_texture(
         Height: height,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: dxgi_format,
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
             Quality: 0,
@@ -122,7 +146,7 @@ pub(crate) fn create_shared_present_texture(
     let hal_texture = unsafe {
         wgpu_hal::dx12::Device::texture_from_raw(
             resource,
-            wgt::TextureFormat::Bgra8Unorm,
+            wgt_format,
             wgt::TextureDimension::D2,
             extent,
             1,
@@ -135,7 +159,7 @@ pub(crate) fn create_shared_present_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgt::TextureDimension::D2,
-        format: wgt::TextureFormat::Bgra8Unorm,
+        format: wgt_format,
         usage: wgt::TextureUsages::COPY_DST |
             wgt::TextureUsages::RENDER_ATTACHMENT |
             wgt::TextureUsages::TEXTURE_BINDING,
