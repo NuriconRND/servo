@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>keyframes PMREM probe</title>
+<style>body{margin:0;background:#202428}</style>
+<script type="importmap">{ "imports": {
+  "three": "https://threejs.org/build/three.module.js",
+  "three/addons/": "https://threejs.org/examples/jsm/"
+}}</script>
+</head><body>
+<script type="module">
+// 실제 threejs webgl_animation_keyframes 예제와 동일한 조명: RoomEnvironment + PMREM(IBL), 명시 조명 없음.
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+function E(m){ try{console.error('[PMREMPROBE] '+m)}catch(e){} }
+
+const W=960, H=600;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(W, H);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xbfe3dd);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;  // PMREM IBL
+
+const camera = new THREE.PerspectiveCamera(40, W/H, 1, 100);
+camera.position.set(5, 2, 8); camera.lookAt(0, 0.5, 0);
+
+const gl = renderer.getContext();
+const draco = new DRACOLoader(); draco.setDecoderPath('https://threejs.org/examples/jsm/libs/draco/gltf/');
+const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
+let mixer = null;
+loader.load('https://threejs.org/examples/models/gltf/LittlestTokyo.glb', (gltf) => {
+  const model = gltf.scene; model.position.set(1,1,0); model.scale.set(0.01,0.01,0.01);
+  scene.add(model);
+  let nm=0; model.traverse(o=>{ if(o.isMesh) nm++; });
+  mixer = new THREE.AnimationMixer(model); mixer.clipAction(gltf.animations[0]).play();
+  E('model loaded; meshes='+nm);
+  setTimeout(()=>{ try{ report(); }catch(e){ E('REPORT ERROR: '+(e&&e.message||e)); } }, 8000);
+}, undefined, (e)=> E('LOAD ERROR: '+(e&&e.message||e)));
+
+function report(){
+  if (mixer) mixer.update(clock.getDelta());
+  renderer.render(scene, camera);
+  const gx=32, gy=16; const px=new Uint8Array(4);
+  let rows=[], mr=0,mg=0,mb=0, nonBg=0, total=0;
+  // 배경 0xbfe3dd ≈ [191,227,221]
+  for(let j=0;j<gy;j++){ let row='';
+    for(let i=0;i<gx;i++){
+      const x=Math.floor((i+0.5)*W/gx), y=Math.floor((j+0.5)*H/gy);
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      if(px[0]>mr)mr=px[0]; if(px[1]>mg)mg=px[1]; if(px[2]>mb)mb=px[2]; total++;
+      if(Math.abs(px[0]-191)+Math.abs(px[1]-227)+Math.abs(px[2]-221) > 50) nonBg++;
+      const l=(px[0]*0.3+px[1]*0.59+px[2]*0.11);
+      row += l<8?' ':l<64?'.':l<128?':':l<192?'o':'#';
+    }
+    rows.push(row);
+  }
+  E(`maxRGB=[${mr},${mg},${mb}] nonBgPixels=${nonBg}/${total}`);
+  rows.forEach(r=>E('|'+r+'|'));
+}
+const clock = new THREE.Clock();
+function animate(){ requestAnimationFrame(animate); if(mixer) mixer.update(clock.getDelta()); renderer.render(scene, camera); }
+animate();
+</script></body></html>

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>mouse latency probe</title>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101418}
+#hud{position:fixed;top:8px;left:8px;z-index:10;color:#0f0;font:18px monospace;background:rgba(0,0,0,.6);padding:6px 10px;white-space:pre}</style>
+<script type="importmap">{ "imports": { "three": "https://threejs.org/build/three.module.js" }}</script>
+</head><body>
+<div id="hud">init</div>
+<script type="module">
+import * as THREE from 'three';
+const hud = document.getElementById('hud');
+function E(m){ try{console.error('[MOUSEPROBE] '+m)}catch(e){} }
+
+// ?load=light|heavy 로 렌더 부하 선택. 기본 light(입력 격리용).
+const params = new URLSearchParams(location.search);
+const heavy = params.get('load') === 'heavy';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+E('init viewport=' + window.innerWidth + 'x' + window.innerHeight + ' load=' + (heavy?'heavy':'light'));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x101418);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x335577, 2.0));
+const dl = new THREE.DirectionalLight(0xffffff, 1.5); dl.position.set(3,5,4); scene.add(dl);
+
+// 회전하는 큐브 격자(움직임이 보여야 버벅임 인지 가능). heavy면 개수↑.
+const N = heavy ? 4000 : 300;
+const geo = new THREE.BoxGeometry(0.4,0.4,0.4);
+const mat = new THREE.MeshStandardMaterial({ color: 0x66ccff, metalness:0.3, roughness:0.4 });
+const mesh = new THREE.InstancedMesh(geo, mat, N);
+const dummy = new THREE.Object3D();
+for(let i=0;i<N;i++){ dummy.position.set((Math.random()-0.5)*40,(Math.random()-0.5)*20,(Math.random()-0.5)*40); dummy.updateMatrix(); mesh.setMatrixAt(i, dummy.matrix); }
+scene.add(mesh);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 200);
+camera.position.set(0,0,30);
+window.addEventListener('resize', ()=>{ camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth,window.innerHeight); });
+
+// 마우스 hover로 카메라 이동(anaglyph 예제와 동일 패턴)
+let mouseX=0, mouseY=0, halfX=window.innerWidth/2, halfY=window.innerHeight/2;
+let mmCount=0, lastMoveT=0, latSum=0, latN=0, latMax=0, pendingMove=false;
+function onMove(e){
+  mouseX = (e.clientX - halfX); mouseY = (e.clientY - halfY);
+  mmCount++; lastMoveT = performance.now(); pendingMove = true;
+}
+// Servo의 이벤트 디스패치 타깃이 불확실하므로 window/document/canvas + pointer까지 모두 청취
+window.addEventListener('mousemove', onMove, true);
+document.addEventListener('mousemove', onMove, true);
+document.addEventListener('pointermove', onMove, true);
+renderer.domElement.addEventListener('mousemove', onMove, true);
+
+let frames=0, lastT=performance.now(), prevFrame=performance.now(), maxGap=0;
+function animate(){
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const gap = now - prevFrame; prevFrame = now;
+  if (gap > maxGap) maxGap = gap;
+  // 마우스→렌더 반영 지연 측정
+  if (pendingMove){ const lat = now - lastMoveT; latSum += lat; latN++; if(lat>latMax) latMax=lat; pendingMove=false; }
+  // 카메라 lerp + 회전
+  camera.position.x += (mouseX*0.02 - camera.position.x) * 0.1;
+  camera.position.y += (-mouseY*0.02 - camera.position.y) * 0.1;
+  camera.lookAt(scene.position);
+  mesh.rotation.y += 0.01;
+  renderer.render(scene, camera);
+  frames++;
+  if (now - lastT >= 1000){
+    const fps = frames*1000/(now-lastT);
+    const avgLat = latN? (latSum/latN):0;
+    const line = 'fps='+fps.toFixed(1)+' mouseEv/s='+mmCount+' maxFrameGap='+maxGap.toFixed(0)+'ms moveLat avg='+avgLat.toFixed(0)+' max='+latMax.toFixed(0)+'ms';
+    hud.textContent = line; E(line);
+    frames=0; lastT=now; mmCount=0; maxGap=0; latSum=0; latN=0; latMax=0;
+  }
+}
+animate();
+</script></body></html>

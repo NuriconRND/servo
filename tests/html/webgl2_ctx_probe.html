@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>webgl2 ctx probe</title></head>
+<body><canvas id="c" width="640" height="480"></canvas>
+<script>
+// console.error로 로그 (RUST_LOG=warn에서 servoshell stderr에 ERROR로 잡힘)
+function E(m){ try{console.error('[CTXPROBE] '+m)}catch(e){} }
+function tryctx(type, attrs){
+  try{
+    const c = document.createElement('canvas'); c.width=320; c.height=240;
+    const gl = c.getContext(type, attrs);
+    if(!gl){ E(type+' '+JSON.stringify(attrs||{})+' => NULL'); return null; }
+    E(type+' '+JSON.stringify(attrs||{})+' => OK  ver='+gl.getParameter(gl.VERSION));
+    return gl;
+  }catch(ex){ E(type+' '+JSON.stringify(attrs||{})+' => THROW '+(ex&&ex.message||ex)); return null; }
+}
+E('start');
+tryctx('webgl2', undefined);
+tryctx('webgl2', {antialias:false});
+tryctx('webgl2', {antialias:true});
+tryctx('webgl2', {antialias:true, alpha:false, depth:true, stencil:false, powerPreference:'high-performance'});
+tryctx('webgl2', {antialias:true, premultipliedAlpha:true, preserveDrawingBuffer:false});
+tryctx('webgl', {antialias:true});
+// 실제 렌더로 한 컨텍스트 살아있는지 확인
+const gl = document.getElementById('c').getContext('webgl2', {antialias:true});
+if(gl){ gl.clearColor(0.1,0.5,0.2,1); gl.clear(gl.COLOR_BUFFER_BIT); E('main canvas cleared green'); }
+else { E('main canvas webgl2 antialias:true NULL'); }
+E('done');
+</script></body></html>

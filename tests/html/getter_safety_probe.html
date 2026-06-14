@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>getter safety probe</title></head>
+<body><canvas id="c" width="64" height="64"></canvas>
+<script>
+function E(m){ try{console.error('[GETTER] '+m)}catch(e){} }
+const gl = document.getElementById('c').getContext('webgl2');
+E('ctx='+(gl?'ok':'NULL'));
+if(gl){
+  // 실제 버퍼/attrib/program 셋업
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0,0, 1,0,0, 0,1,0]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  gl.vertexAttribDivisor(0, 0);
+  const eb = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, eb);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0,1,2]), gl.STATIC_DRAW);
+
+  E('step: getParameter(ELEMENT_ARRAY_BUFFER_BINDING)');
+  const eab = gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING); E('  eab='+(eab?'obj':'null'));
+  E('step: getParameter(ARRAY_BUFFER_BINDING)');
+  const ab = gl.getParameter(gl.ARRAY_BUFFER_BINDING); E('  ab='+(ab?'obj':'null'));
+  E('step: getParameter(VERTEX_ARRAY_BINDING)');
+  const v = gl.getParameter(gl.VERTEX_ARRAY_BINDING); E('  vao='+(v?'obj':'null'));
+  E('step: getParameter(CURRENT_PROGRAM)');
+  const p = gl.getParameter(gl.CURRENT_PROGRAM); E('  prog='+(p?'obj':'null'));
+  E('step: getParameter(MAX_VERTEX_ATTRIBS)');
+  const maxA = gl.getParameter(gl.MAX_VERTEX_ATTRIBS); E('  maxA='+maxA);
+  E('step: getBufferParameter(ELEMENT_ARRAY_BUFFER, BUFFER_SIZE)');
+  const sz = gl.getBufferParameter(gl.ELEMENT_ARRAY_BUFFER, gl.BUFFER_SIZE); E('  eabSize='+sz);
+  E('step: getVertexAttrib(0, ENABLED)');
+  const en = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_ENABLED); E('  enabled='+en);
+  E('step: getVertexAttrib(0, BUFFER_BINDING)');
+  const bb = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING); E('  buf='+(bb?'obj':'null'));
+  E('step: getVertexAttrib(0, DIVISOR)');
+  const dv = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_DIVISOR); E('  divisor='+dv);
+  E('step: getVertexAttrib(0, SIZE)');
+  const asz = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_SIZE); E('  size='+asz);
+  E('step: getVertexAttrib(0, TYPE)');
+  const ty = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_TYPE); E('  type=0x'+ty.toString(16));
+  E('step: getVertexAttrib(0, STRIDE)');
+  const st = gl.getVertexAttrib(0, gl.VERTEX_ATTRIB_ARRAY_STRIDE); E('  stride='+st);
+  E('ALL GETTERS OK');
+}
+</script></body></html>

@@ -45,29 +45,51 @@ three.js 예제를 멀티 GPU "월"(`--wall-layout <json> --wall-all-tiles`)에 
 검증 결과: nvidia-smi에서 servoshell이 **양 GPU에 등록**, 메모리/사용률 균형
 (WebGL +290/+248MiB, WebGPU +606/+166, 비디오 +182/+178). compute-apps에 GPU0·GPU1 모두.
 
-## ⏳ 미해결 — WebGL keyframes 모델이 검정/어둡게 렌더 (다음 세션 이어서)
-WebGL **API 에러는 0**이지만 모델이 검정. 분석 진행 상황:
-- 기본 텍스처 경로 전부 정상: `tests/html/webgl2_texture_probe.html`, `webgl2_imgtex_probe.html`
-  (texImage2D/texStorage2D/sRGB/canvas/HTMLImage/ImageBitmap 모두 샘플 정상). → 업로드는 정상.
-- render-to-RGBA16F/RGBA32F 정상: `webgl2_rtt_float_probe.html` (PMREM 렌더타깃 OK). R11F_G11F_B10F만 미지원.
-- keyframes는 명시적 조명이 없고 `scene.environment = pmremGenerator.fromScene(sky)`(PMREM IBL) +
-  ACESFilmicToneMapping으로만 조명. 처음엔 PMREM 의심했으나—
-- **결정적**: PMREM/Sky를 제거하고 단순 조명만 준 `tests/html/keyframes_simplelight.html`에서도
-  모델은 **여전히 어둡고**(centerPixel≈[21,16,13]) **InvalidOperation 다발**(약 프레임당 4회).
-  배경(단색)은 정상 렌더, 모델 71 meshes 로드 성공. → 원인은 PMREM이 아니라 **모델 draw/머티리얼**.
-- webgl_backtrace로 InvalidOperation 추적 결과: three.module.js의 `gl.drawElements`
-  (renderBufferDirect←renderObject). 즉 일부 mesh의 **drawElements가 InvalidOperation**.
-  Servo `draw_elements_instanced`의 후보 지점(webglrenderingcontext.rs):
-  버퍼 용량 검사(offset+count*type_size > capacity), `validate_for_draw`(attrib), `validate_framebuffer`.
-  71개 중 ~4개만 실패하므로 특정 geometry/attrib 조건으로 추정.
+## ✅ 해결 — WebGL keyframes 검정 (2026-06-14) + 성능/화면 이슈 규명
 
-**다음 단계 제안**:
-1. `--features webgl_backtrace` 빌드로 InvalidOperation 백트레이스 재확인(이미 로깅 추가됨).
-2. `draw_elements_instanced`의 각 InvalidOperation 분기에 임시 로깅을 넣어 어느 검사가 실패하는지 특정.
-   (버퍼 용량/attrib validate_for_draw가 유력 — draco 디코드 후 인덱스/속성 버퍼 추적 문제 가능.)
-3. 어둡게 렌더되는 mesh: drawElements는 성공하나 albedo가 어두운지 → 머티리얼/샘플러 바인딩,
-   또는 sRGB 디코드/톤매핑 경로 확인. `keyframes_simplelight.html`로 격리 디버깅.
-4. (참고) WebGPU 리타게팅은 cross-GPU 표출 정상, 비디오는 의도적으로 CPU 디코딩(NVDEC 미사용).
+### 근본 원인 = WebGL2 정점-속성 검증 버그 (검정의 진짜 원인)
+InvalidOperation은 `draw_elements_instanced`가 아니라 **그 전에** 실행되는
+`WebGL2RenderingContext::DrawElements` → `validate_vertex_attribs_for_draw`
+(components/script/dom/webgl/webgl2renderingcontext.rs)에서 발생.
+이 함수가 프로그램 속성의 base type을 정점 배열의 **스토리지** `type_`와 비교하는데 두 가지 버그:
+1. enabled array일 때 스토리지 enum을 그대로 base type으로 사용. 하지만 `vertexAttribPointer`는
+   스토리지가 normalized/정수여도 셰이더엔 **항상 FLOAT**로 공급(UNSIGNED_SHORT/BYTE 등). 스토리지
+   enum은 FLOAT/INT/UINT 그룹에 없어 → 오탐 INVALID_OPERATION → LittlestTokyo의 일부 mesh
+   (USHORT로 저장된 `vec4`) 약 4/71개가 조용히 드롭 → "검정".
+2. base-type 그룹표에 행렬 타입(FLOAT_MAT2/3/4 …)이 누락 → InstancedMesh의 `mat4` 속성
+   (PMREM의 RoomEnvironment 등, 4개 float vec4로 공급)도 거부.
+
+**수정**: 스토리지-타입-as-base-type 로직을 `candidate_base_types`로 교체
+(비활성→제너릭 속성 타입; 활성+normalized/float/half→FLOAT; 활성+비정규화 정수→[FLOAT, INT/UINT]
+permissive — Servo는 vertexAttribPointer/IPointer를 구분 저장 안 함, IPointer가 Pointer로 포워딩됨)
++ `glsl_attrib_scalar_base_type()` 헬퍼(FLOAT_VEC*/FLOAT_MAT*→FLOAT, INT_*→INT, UINT_*→UINT).
+검증: InvalidOperation 120→0, 단일창·듀얼GPU월 모두 모델 **밝게 정상 렌더**(maxRGB~247;
+centerPixel [21,16,13]은 모델 어두운 틈에 걸린 것일 뿐 — "어둡다"는 오판이었고 실제론 mesh가
+드롭돼 안 그려졌던 것). 단순조명/PMREM 양쪽 OK. **미커밋(사용자 hold).**
+
+### "월이 매우 느림" = `--features webgl_backtrace` 빌드 부작용 (월/cross-GPU 버그 아님)
+`send_with_fallibility`(모든 WebGL 명령, webglrenderingcontext.rs:~433)가 명령마다
+`capture_webgl_backtrace()` 호출 → feature ON이면 명령마다 `Backtrace::new()`+`format!`
+(전체 Rust 심볼화)+JS 스택 캡처. LittlestTokyo는 프레임당 수천 명령 → ~2.6s/frame(≈0.4fps).
+**해상도/타일수/GPU수와 무관**하게 동일(평범한 1920창, 1x1, same-GPU 2타일, dual-GPU 모두 2.6s)
+→ 월이 원인이 아님이 입증됨. **feature 없는 `mach build --release`는 빈 구조체 반환 →
+3840x1080 듀얼GPU월에서 60fps(vsync)**. 첫 프레임 ~1.3s는 일회성 ANGLE 셰이더 컴파일.
+**교훈: 성능 작업/데모는 webgl_backtrace 없이 빌드. webgl_backtrace는 InvalidOperation 디버깅 전용.**
+(프로브의 프레임별 `gl.finish()`도 파이프라인을 직렬화해 측정치를 부풀림 — 빼고 측정.)
+
+### "왼쪽 모니터 좌상단만 보임" = 테스트 페이지 버그 (Servo 아님)
+`--wall-all-tiles`는 가상 뷰포트(3840x1080) 전체를 보는 **공유 webview 1개**. 진단용 프로브가
+`renderer.setSize(960,600)` **고정** → 좌상단만 채움. `window.innerWidth/innerHeight`(+resize)로
+크기를 잡으면 월 전체를 채움(검증: window.innerWidth=3840). 데모 페이지: `tests/html/keyframes_wall.html`.
+
+### 참고: WebGL2 활성화 pref
+WebGL2는 기본 OFF — `--pref dom_webgl2_enabled=true` 없거나 host가 www.servoexperiments.com이
+아니면 `getContext('webgl2')`가 null → three.js(WebGL2 전용)가 "Error creating WebGL context".
+127.0.0.1/threejs.org는 pref 필요. 단일창 실행/캡처 헬퍼: `etc/multigpu/tools/run_single_capture.ps1`.
+
+### 남은(미수정) latent 버그
+`gl.getVertexAttrib/getBufferParameter/getProgramParameter`를 특정 상태에서 호출 시 Servo 패닉
+(`assertion failed: self.is_double()`, mozjs jsval.rs:503). `keyframes_drawprobe.html`로 재현.
 
 ## GPU 분산 관점 요약 (사용자 질의)
 - WebGL/WebGPU/비디오 모두 fan-out 표출은 정상.
