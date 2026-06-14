@@ -105,6 +105,18 @@ impl Connection {
         Device::new(adapter)
     }
 
+    /// Opens a device on the given adapter backed by a dedicated, isolated D3D11 device.
+    ///
+    /// Unlike `create_device`, which shares ANGLE's per-LUID cached `EGLDisplay` (and therefore a
+    /// single D3D11 device) among all devices opened for the same GPU, this creates a brand-new
+    /// D3D11 device and a private ANGLE display for it. Use it for contexts that must not share
+    /// ANGLE renderer state with the compositor -- e.g. a WebGL backend that renders on its own
+    /// thread while its surfaces are consumed on another. See `Device::new_isolated`.
+    #[inline]
+    pub fn create_isolated_device(&self, adapter: &Adapter) -> Result<Device, Error> {
+        Device::new_isolated(adapter)
+    }
+
     /// Wraps a `NativeDevice` in a `Device` and returns it.
     #[inline]
     pub unsafe fn create_device_from_native_device(

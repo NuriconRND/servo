@@ -8,10 +8,10 @@ use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint};
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::ffi::EGL_DEVICE_EXT;
 use crate::platform::generic::egl::ffi::{
-    EGL_D3D11_DEVICE_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_PLATFORM_ANGLE_ANGLE,
+    EGL_D3D11_DEVICE_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_NO_DEVICE_EXT, EGL_PLATFORM_ANGLE_ANGLE,
     EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE, EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE,
     EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE,
-    EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE,
+    EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, EGL_PLATFORM_DEVICE_EXT,
 };
 use crate::{Error, GLApi};
 
@@ -25,7 +25,7 @@ use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
 use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{BOOL, TRUE, UINT};
 use winapi::shared::winerror::{self, S_OK};
-use winapi::um::d3d11::{ID3D11Device, ID3D11DeviceContext};
+use winapi::um::d3d11::{D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_SDK_VERSION};
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
 use wio::com::ComPtr;
@@ -249,6 +249,153 @@ impl Device {
         }
     }
 
+    /// Like `new`, but creates a brand-new, dedicated D3D11 device for the adapter instead of
+    /// reusing ANGLE's per-LUID cached `EGLDisplay`.
+    ///
+    /// `new` selects the display with `EGL_PLATFORM_ANGLE_ANGLE` keyed by the adapter LUID, which
+    /// ANGLE caches: every `Device` opened for the same GPU then shares one `EGLDisplay` and one
+    /// underlying D3D11 device. That is fine for cooperating consumers, but a WebGL backend context
+    /// that renders on its own thread while the compositor reads its surfaces on another thread ends
+    /// up driving the same ANGLE renderer from two threads. The shared internal state gets corrupted
+    /// (StateManager11 dirty-bit invariant violation -> access violation in libGLESv2). Creating a
+    /// dedicated D3D11 device here, wrapped via `EGL_PLATFORM_DEVICE_EXT`, gives such a context a
+    /// fully isolated ANGLE display; surfaces are still shared with the compositor's device through
+    /// the usual DXGI shared-handle path.
+    pub(crate) fn new_isolated(adapter: &Adapter) -> Result<Device, Error> {
+        let d3d_driver_type = adapter.d3d_driver_type;
+        unsafe {
+            // Resolve which adapter ANGLE actually binds the requested LUID to. ANGLE may fall back
+            // to the default GPU for a non-default LUID, and the compositor (which opens this
+            // context's surface textures) uses that same LUID display. If we built our dedicated
+            // device on a different adapter than the compositor's, the compositor's
+            // OpenSharedResource would fail with E_INVALIDARG and the tile would render black. So
+            // mirror the compositor: open the LUID display exactly as `new` does, take the adapter
+            // of its D3D11 device, and build our dedicated device on that same adapter. (We do not
+            // terminate this display; ANGLE caches and shares it with the compositor.)
+            let resolved_dxgi_adapter: Option<ComPtr<IDXGIAdapter>> =
+                if d3d_driver_type == D3D_DRIVER_TYPE_WARP {
+                    None
+                } else {
+                    let mut adapter_desc = mem::zeroed();
+                    if !winerror::SUCCEEDED((*adapter.dxgi_adapter).GetDesc(&mut adapter_desc)) {
+                        return Err(Error::DeviceOpenFailed);
+                    }
+                    let luid_d3d11 =
+                        EGL_FUNCTIONS.with(|egl| -> Result<ComPtr<ID3D11Device>, Error> {
+                            let attribs = [
+                                EGL_PLATFORM_ANGLE_TYPE_ANGLE as EGLAttrib,
+                                EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE as EGLAttrib,
+                                EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib,
+                                adapter_desc.AdapterLuid.HighPart as EGLAttrib,
+                                EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE as EGLAttrib,
+                                adapter_desc.AdapterLuid.LowPart as EGLAttrib,
+                                egl::NONE as EGLAttrib,
+                            ];
+                            let display = egl.GetPlatformDisplay(
+                                EGL_PLATFORM_ANGLE_ANGLE,
+                                ptr::null_mut(),
+                                attribs.as_ptr(),
+                            );
+                            if display == egl::NO_DISPLAY {
+                                return Err(Error::DeviceOpenFailed);
+                            }
+                            let (mut maj, mut min) = (0, 0);
+                            if egl.Initialize(display, &mut maj, &mut min) == egl::FALSE {
+                                return Err(Error::DeviceOpenFailed);
+                            }
+                            query_d3d11_device_for_egl_display(display)
+                        })?;
+
+                    let mut dxgi_device: *mut IDXGIDevice = ptr::null_mut();
+                    if !winerror::SUCCEEDED((*luid_d3d11).QueryInterface(
+                        &IDXGIDevice::uuidof(),
+                        &mut dxgi_device as *mut *mut IDXGIDevice as *mut *mut c_void,
+                    )) {
+                        return Err(Error::DeviceOpenFailed);
+                    }
+                    let dxgi_device = ComPtr::from_raw(dxgi_device);
+                    let mut dxgi_adapter: *mut IDXGIAdapter = ptr::null_mut();
+                    if !winerror::SUCCEEDED((*dxgi_device).GetAdapter(&mut dxgi_adapter)) {
+                        return Err(Error::DeviceOpenFailed);
+                    }
+                    Some(ComPtr::from_raw(dxgi_adapter))
+                };
+
+            let (d3d11_adapter, create_driver_type) = match resolved_dxgi_adapter {
+                Some(ref a) => (a.as_raw(), D3D_DRIVER_TYPE_UNKNOWN),
+                None => (ptr::null_mut(), D3D_DRIVER_TYPE_WARP),
+            };
+
+            let mut d3d11_device = ptr::null_mut();
+            let mut d3d11_feature_level = 0;
+            let result = D3D11CreateDevice(
+                d3d11_adapter,
+                create_driver_type,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                D3D11_SDK_VERSION,
+                &mut d3d11_device,
+                &mut d3d11_feature_level,
+                ptr::null_mut(),
+            );
+            if !winerror::SUCCEEDED(result) {
+                return Err(Error::DeviceOpenFailed);
+            }
+            let d3d11_device = ComPtr::from_raw(d3d11_device);
+            if let Some(ref a) = resolved_dxgi_adapter {
+                let mut rdesc = mem::zeroed();
+                if winerror::SUCCEEDED((**a).GetDesc(&mut rdesc)) {
+                    info!(
+                        "Opened isolated ANGLE D3D11 device on resolved adapter LUID {}:{} \
+                         (feature_level={:#x})",
+                        rdesc.AdapterLuid.HighPart, rdesc.AdapterLuid.LowPart, d3d11_feature_level,
+                    );
+                }
+            }
+
+            let create_device_angle = EGL_EXTENSION_FUNCTIONS
+                .CreateDeviceANGLE
+                .expect("Where's the `EGL_ANGLE_device_creation` extension?");
+            let egl_device = create_device_angle(
+                EGL_D3D11_DEVICE_ANGLE as EGLint,
+                d3d11_device.as_raw() as *mut c_void,
+                ptr::null_mut(),
+            );
+            if egl_device == EGL_NO_DEVICE_EXT {
+                return Err(Error::DeviceOpenFailed);
+            }
+
+            EGL_FUNCTIONS.with(|egl| {
+                let attribs = [egl::NONE as EGLAttrib];
+                let egl_display = egl.GetPlatformDisplay(
+                    EGL_PLATFORM_DEVICE_EXT,
+                    egl_device as *mut c_void,
+                    attribs.as_ptr(),
+                );
+                if egl_display == egl::NO_DISPLAY {
+                    return Err(Error::DeviceOpenFailed);
+                }
+
+                let (mut major_version, mut minor_version) = (0, 0);
+                let result = egl.Initialize(egl_display, &mut major_version, &mut minor_version);
+                if result == egl::FALSE {
+                    return Err(Error::DeviceOpenFailed);
+                }
+
+                enable_d3d11_multithread_protection(&d3d11_device);
+
+                Ok(Device {
+                    egl_display,
+                    d3d11_device,
+                    d3d_driver_type,
+                    display_is_owned: true,
+                })
+            })
+        }
+    }
+
     pub(crate) fn from_native_device(native_device: NativeDevice) -> Result<Device, Error> {
         unsafe {
             (*native_device.d3d11_device).AddRef();
@@ -276,6 +423,30 @@ impl Device {
     #[inline]
     pub fn connection(&self) -> Connection {
         Connection
+    }
+
+    /// The adapter LUID (high, low) backing this device's D3D11 device. Diagnostic helper.
+    pub(crate) fn d3d11_adapter_luid(&self) -> (i32, u32) {
+        unsafe {
+            let mut dxgi_device: *mut IDXGIDevice = ptr::null_mut();
+            if !winerror::SUCCEEDED((*self.d3d11_device).QueryInterface(
+                &IDXGIDevice::uuidof(),
+                &mut dxgi_device as *mut *mut IDXGIDevice as *mut *mut c_void,
+            )) {
+                return (0, 0);
+            }
+            let dxgi_device = ComPtr::from_raw(dxgi_device);
+            let mut adapter: *mut IDXGIAdapter = ptr::null_mut();
+            if !winerror::SUCCEEDED((*dxgi_device).GetAdapter(&mut adapter)) {
+                return (0, 0);
+            }
+            let adapter = ComPtr::from_raw(adapter);
+            let mut desc = mem::zeroed();
+            if !winerror::SUCCEEDED((*adapter).GetDesc(&mut desc)) {
+                return (0, 0);
+            }
+            (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
+        }
     }
 
     /// Returns the adapter that this device was created with.

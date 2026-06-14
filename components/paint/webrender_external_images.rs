@@ -115,8 +115,6 @@ impl WebGLExternalImages {
         let surface_id = WebGLSurfaceId::new(id, self.painter_id);
         debug!("... unlocked chain {:?} for surface {:?}", id, surface_id);
 
-        self.mark_surface_not_busy(surface_id);
-
         let locked_front_buffer = match self.locked_front_buffers.get_mut(&surface_id) {
             Some(locked_buffers) => {
                 let locked_front_buffer = locked_buffers.pop();
@@ -128,9 +126,16 @@ impl WebGLExternalImages {
             None => None,
         };
         let Some(locked_front_buffer) = locked_front_buffer else {
-            warn!("WebGL external image unlock failed: no locked front buffer for {surface_id:?}");
+            // The matching lock did not acquire a front buffer (e.g. none was ready),
+            // and it already released the busy count on that failure path. There is
+            // nothing locked to release here, so return without decrementing the busy
+            // counter again (which would underflow).
             return None;
         };
+
+        // Only release the busy count once an actual locked buffer is being unlocked,
+        // keeping lock/unlock balanced.
+        self.mark_surface_not_busy(surface_id);
         let locked_front_buffer = self
             .rendering_context
             .destroy_texture(locked_front_buffer)?;

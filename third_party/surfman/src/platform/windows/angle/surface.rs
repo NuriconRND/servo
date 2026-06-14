@@ -28,8 +28,9 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::thread;
 use winapi::shared::dxgi::IDXGIKeyedMutex;
-use winapi::shared::winerror::S_OK;
+use winapi::shared::winerror::{self, S_OK};
 use winapi::um::d3d11;
+use winapi::Interface;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::libloaderapi::{GetModuleHandleW, LoadLibraryW};
 use winapi::um::winbase::INFINITE;
@@ -407,10 +408,34 @@ impl Device {
                     0,
                 ];
 
+                // Import the shared texture on THIS device explicitly. The
+                // EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE path resolves the share handle against
+                // ANGLE's process-default device (the primary GPU's). When the consumer device
+                // lives on a different GPU than the primary, that path returns EGL_BAD_PARAMETER and
+                // the tile renders black. Open the shared resource on `self.d3d11_device` (the
+                // consumer/compositor device) so it stays on the correct adapter, then wrap the
+                // resulting texture via EGL_D3D_TEXTURE_ANGLE.
+                let mut local_d3d11_texture: *mut c_void = ptr::null_mut();
+                let open_result = self.d3d11_device.OpenSharedResource(
+                    share_handle,
+                    &d3d11::ID3D11Texture2D::uuidof(),
+                    &mut local_d3d11_texture,
+                );
+                if !winerror::SUCCEEDED(open_result) || local_d3d11_texture.is_null() {
+                    let (lh, ll) = self.d3d11_adapter_luid();
+                    warn!(
+                        "WebGL surface import: OpenSharedResource failed hr={open_result:#x} \
+                         importer_adapter_luid={lh}:{ll}"
+                    );
+                    return Err((Error::Failed, surface));
+                }
+                let local_d3d11_texture =
+                    ComPtr::from_raw(local_d3d11_texture as *mut d3d11::ID3D11Texture2D);
+
                 let local_egl_surface = egl.CreatePbufferFromClientBuffer(
                     self.egl_display,
-                    EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE,
-                    share_handle,
+                    EGL_D3D_TEXTURE_ANGLE,
+                    local_d3d11_texture.as_raw() as *const c_void,
                     local_egl_config,
                     pbuffer_attributes.as_ptr(),
                 );

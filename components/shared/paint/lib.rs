@@ -702,13 +702,13 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
-                let texture_id = match source {
-                    ExternalImageSource::NativeTexture(b) => b,
-                    _ => panic!("Wrong type"),
-                };
+                // A WebGL context may not have a presentable front buffer yet (its first
+                // frame has not completed, or rendering failed). In that case lock()
+                // returns ExternalImageSource::Invalid; pass it through so WebRender skips
+                // compositing this frame instead of panicking.
                 ExternalImage {
                     uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
-                    source: ExternalImageSource::NativeTexture(texture_id),
+                    source,
                 }
             },
             WebRenderImageHandlerType::Media => {

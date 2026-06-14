@@ -436,9 +436,15 @@ impl WebGLThread {
                     .painter_surfman_details_map
                     .get(painter_id)
                     .expect("no surfman details found for painter");
+                // Open a dedicated, isolated D3D11 device for this WebGL backend instead of
+                // sharing the compositor's per-LUID cached ANGLE display. The WebGL thread drives
+                // this device while the compositor consumes its surfaces on another thread; sharing
+                // one ANGLE renderer across those threads corrupts internal D3D11 state and crashes
+                // (access violation in libGLESv2). Surfaces are still shared with the compositor via
+                // the usual DXGI shared-handle path.
                 let device = surfman_details
                     .connection
-                    .create_device(&surfman_details.adapter)
+                    .create_isolated_device(&surfman_details.adapter)
                     .expect("Couldn't open WebGL device!");
 
                 Rc::new(device)
