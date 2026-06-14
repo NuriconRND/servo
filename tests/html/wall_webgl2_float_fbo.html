@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>min webgl2 float fbo</title>
+<style>html,body{margin:0;height:100%;background:#222}canvas{width:100%;height:100%;display:block}</style></head>
+<body><canvas id="c"></canvas>
+<script>
+// 최소 WebGL2 + float 렌더타깃(RGBA16F FBO)에 그린 뒤 화면에 블릿한다.
+// PMREM 류가 쓰는 float color-attachment 경로를 fan-out 2nd 컨텍스트에서 재현.
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2');
+function log(m){ try{ console.log('[FLOATFBO] '+m); }catch(e){} }
+if(!gl){ log('NO webgl2'); throw 'no gl'; }
+gl.getExtension('EXT_color_buffer_float');
+log('webgl2 ok');
+function resize(){ cv.width=innerWidth; cv.height=innerHeight; }
+addEventListener('resize',resize); resize();
+const W=512,H=512;
+const tex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,tex);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,W,H,0,gl.RGBA,gl.HALF_FLOAT,null);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+const fbo=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+const st=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+log('fbo status 0x'+st.toString(16)+' complete='+(st===gl.FRAMEBUFFER_COMPLETE));
+gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+let f=0;
+function frame(){ f++;
+  // float FBO에 색을 그린다(여기선 clear로 충분)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fbo); gl.viewport(0,0,W,H);
+  const t=f*0.02; gl.clearColor(0.5+0.5*Math.sin(t),0.3,0.5+0.5*Math.cos(t),1); gl.clear(gl.COLOR_BUFFER_BIT);
+  // 기본 프레임버퍼로 블릿
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER,fbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,null);
+  gl.viewport(0,0,cv.width,cv.height);
+  gl.blitFramebuffer(0,0,W,H,0,0,cv.width,cv.height,gl.COLOR_BUFFER_BIT,gl.LINEAR);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  if(f===120) log('survived 120 frames'); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+</script></body></html>
