@@ -174,6 +174,52 @@ fn create_dxgi_adapter_by_index(gpu_index: usize) -> Result<Adapter, Error> {
     }
 }
 
+/// Read the DXGI adapter LUID `(HighPart, LowPart)` for a wall-layout GPU index.
+///
+/// This is the same per-physical-GPU key the WebGPU fan-out reads from wgpu's DX12
+/// adapters (`adapter_as_hal -> GetDesc1().AdapterLuid`), so it lets the compositor map a
+/// painter (which selects its GPU by DXGI `EnumAdapters1` index) to the matching per-GPU
+/// WebGPU device. Returns `None` off Windows or if the adapter can't be queried.
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+#[expect(unsafe_code)]
+pub fn dxgi_luid_for_gpu_index(gpu_index: usize) -> Option<(i32, u32)> {
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    use winapi::shared::dxgi::{DXGI_ADAPTER_DESC1, IDXGIAdapter1};
+
+    let gpu_index = u32::try_from(gpu_index).ok()?;
+    unsafe {
+        let mut dxgi_factory: *mut IDXGIFactory1 = ptr::null_mut();
+        let result = dxgi::CreateDXGIFactory1(
+            &IDXGIFactory1::uuidof(),
+            &mut dxgi_factory as *mut *mut IDXGIFactory1 as *mut *mut c_void,
+        );
+        if !winerror::SUCCEEDED(result) || dxgi_factory.is_null() {
+            return None;
+        }
+        let dxgi_factory = ComPtr::from_raw(dxgi_factory);
+
+        let mut adapter1: *mut IDXGIAdapter1 = ptr::null_mut();
+        let result = (*dxgi_factory).EnumAdapters1(gpu_index, &mut adapter1);
+        if !winerror::SUCCEEDED(result) || adapter1.is_null() {
+            return None;
+        }
+        let adapter1 = ComPtr::from_raw(adapter1);
+
+        let mut desc: DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+        if !winerror::SUCCEEDED((*adapter1).GetDesc1(&mut desc)) {
+            return None;
+        }
+        Some((desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart))
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+pub fn dxgi_luid_for_gpu_index(_gpu_index: usize) -> Option<(i32, u32)> {
+    None
+}
+
 /// A rendering context that uses the Surfman library to create and manage
 /// the OpenGL context and surface. This struct provides the default implementation
 /// of the `RenderingContext` trait, handling the creation, management, and destruction
