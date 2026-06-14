@@ -69,11 +69,11 @@ impl DeviceScope {
 ///
 /// Phase 1 only creates the per-GPU mirror device. Command replay (Phase 2) and per-tile
 /// present (Phase 3) build on this foundation.
-struct SecondaryGpu {
+pub(crate) struct SecondaryGpu {
     /// The dedicated wgpu instance/registries bound to one additional GPU.
-    global: Arc<wgc::global::Global>,
+    pub(crate) global: Arc<wgc::global::Global>,
     /// DXGI adapter LUID (HighPart, LowPart) of the physical GPU this global targets.
-    target_luid: (i32, u32),
+    pub(crate) target_luid: (i32, u32),
     /// Adapter id (internally allocated within `global`) for this GPU.
     adapter_id: id::AdapterId,
     /// Poller for this global's async work (buffer maps, submitted-work-done).
@@ -95,8 +95,11 @@ pub(crate) struct WGPU {
     pub(crate) gpu_direct_present: bool,
     /// Whether [`WGPU::ensure_secondary_gpus`] has already run.
     fanout_initialized: bool,
+    /// DXGI LUID of the page's primary adapter (set during fan-out init), used to key the
+    /// primary GPU's GPU-direct shared texture.
+    pub(crate) primary_luid: Option<(i32, u32)>,
     /// One [`SecondaryGpu`] per additional physical GPU (beyond the page's primary adapter).
-    secondary_gpus: Vec<SecondaryGpu>,
+    pub(crate) secondary_gpus: Vec<SecondaryGpu>,
     pub(crate) paint_api: CrossProcessPaintApi,
     pub(crate) webrender_external_image_id_manager: WebRenderExternalImageIdManager,
     pub(crate) wgpu_image_map: WebGpuExternalImageMap,
@@ -137,6 +140,7 @@ impl WGPU {
             multigpu_fanout: pref!(dom_webgpu_multigpu_fanout),
             gpu_direct_present: pref!(dom_webgpu_gpu_direct),
             fanout_initialized: false,
+            primary_luid: None,
             secondary_gpus: Vec::new(),
             paint_api,
             webrender_external_image_id_manager,
@@ -238,6 +242,7 @@ impl WGPU {
                 return;
             };
             info!("WebGPU multi-GPU fan-out: primary adapter LUID = {primary_luid:?}");
+            self.primary_luid = Some(primary_luid);
 
             // Discover the distinct non-primary GPU LUIDs using a throwaway global. Its
             // adapter registry is internal-allocation only, so probing it never mixes ids

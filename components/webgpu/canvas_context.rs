@@ -319,6 +319,11 @@ pub struct WebGpuExternalImages {
     /// The compositor rendering context for this painter, used to import a GPU-direct shared
     /// texture as a GL texture (the per-painter device, like `WebGLExternalImages`).
     rendering_context: Rc<dyn RenderingContext>,
+    /// This painter's GPU adapter LUID (from its wall-layout GPU index), used to pick the
+    /// shared present texture from ITS GPU so the tile samples its own GPU's copy. `None` for
+    /// non-wall painters → GPU-direct disabled, CPU readback used.
+    #[allow(dead_code)] // read only on Windows.
+    painter_luid: Option<(i32, u32)>,
     pub locked_ids: FxHashMap<WebGPUContextId, PresentationStagingBuffer>,
     /// GPU-direct: the imported GL surface textures currently locked, kept alive while the
     /// compositor samples them and destroyed on unlock.
@@ -330,10 +335,12 @@ impl WebGpuExternalImages {
     pub fn new(
         image_map: WebGpuExternalImageMap,
         rendering_context: Rc<dyn RenderingContext>,
+        painter_luid: Option<(i32, u32)>,
     ) -> Self {
         Self {
             image_map,
             rendering_context,
+            painter_luid,
             locked_ids: Default::default(),
             #[cfg(windows)]
             locked_textures: Default::default(),
@@ -354,7 +361,9 @@ impl WebRenderExternalImageApi for WebGpuExternalImages {
                 let webgpu_contexts = self.image_map.lock().unwrap();
                 webgpu_contexts
                     .get(&id)
-                    .and_then(|context_data| context_data.gpu_direct_handle_and_size())
+                    .and_then(|context_data| {
+                        context_data.gpu_direct_handle_and_size(self.painter_luid)
+                    })
             };
             if let Some((handle, size)) = handle_and_size &&
                 let Some((surface_texture, gl_texture, texture_size)) =
@@ -455,11 +464,12 @@ pub struct ContextData {
     presentation: Option<PresentationStagingBuffer>,
     /// Next epoch to be used
     next_epoch: Epoch,
-    /// GPU-direct present (Phase 3): a shared D3D12 texture on the primary GPU that the
-    /// canvas is GPU-copied into each frame, exported as a handle for the compositor to
-    /// sample directly (no CPU readback). `None` until first present with fan-out enabled.
+    /// GPU-direct present (Phase 3): one shared D3D12 texture PER physical GPU (keyed by
+    /// adapter LUID) that the canvas is GPU-copied into each frame, exported as a handle for
+    /// each tile's compositor to sample its own GPU's copy directly (no CPU readback). Empty
+    /// until first present with GPU-direct enabled.
     #[cfg(windows)]
-    gpu_direct: Option<crate::shared_present::SharedPresentTexture>,
+    gpu_direct: FxHashMap<(i32, u32), crate::shared_present::SharedPresentTexture>,
     /// Monotonic frame counter used to mint fresh copy command ids each frame.
     #[cfg(windows)]
     gpu_direct_frame: u32,
@@ -481,17 +491,22 @@ impl ContextData {
             presentation: None,
             next_epoch: Epoch(1),
             #[cfg(windows)]
-            gpu_direct: None,
+            gpu_direct: FxHashMap::default(),
             #[cfg(windows)]
             gpu_direct_frame: 0,
         }
     }
 
-    /// GPU-direct: the shared present texture's NT handle (as `u64`) and size, if one exists
-    /// for this context. The compositor imports this handle to sample the render directly.
+    /// GPU-direct: the shared present texture's NT handle (as `u64`) and size for the GPU with
+    /// the given adapter LUID, if one exists for this context. Each tile's compositor looks up
+    /// ITS GPU's handle so it samples its own GPU's copy (no cross-GPU transfer).
     #[cfg(windows)]
-    fn gpu_direct_handle_and_size(&self) -> Option<(u64, Size2D<i32>)> {
-        self.gpu_direct.as_ref().map(|shared| {
+    fn gpu_direct_handle_and_size(
+        &self,
+        painter_luid: Option<(i32, u32)>,
+    ) -> Option<(u64, Size2D<i32>)> {
+        let luid = painter_luid?;
+        self.gpu_direct.get(&luid).map(|shared| {
             (
                 shared.shared_handle.0 as u64,
                 Size2D::new(shared.width as i32, shared.height as i32),
@@ -707,13 +722,13 @@ impl crate::WGPU {
         }
     }
 
-    /// GPU-direct present (Phase 3, primary GPU): ensure a shared present texture exists for
-    /// this context (recreating it on size change) and GPU-copy the canvas into it. The
-    /// shared texture's NT handle can then be imported by the compositor to sample the render
-    /// directly, avoiding the CPU readback. Best-effort: failures leave `gpu_direct` `None` so
-    /// the CPU readback path keeps the display working.
+    /// GPU-direct present (Phase 3): for every physical GPU (the primary plus each secondary
+    /// fan-out global), ensure a shared present texture exists and GPU-copy the canvas into it.
+    /// Each tile's compositor then samples ITS GPU's copy directly (no cross-GPU transfer, no
+    /// CPU readback). Best-effort: a GPU that fails simply has no entry and falls back to the
+    /// CPU readback path for its tile.
     #[cfg(windows)]
-    fn gpu_direct_copy_primary(
+    fn gpu_direct_copy(
         &self,
         context_data: &mut ContextData,
         context_id: WebGPUContextId,
@@ -725,38 +740,81 @@ impl crate::WGPU {
             height: config.size.height,
             depth_or_array_layers: 1,
         };
+        let frame = context_data.gpu_direct_frame;
+        if let Some(primary_luid) = self.primary_luid {
+            self.gpu_direct_copy_one(
+                context_data,
+                context_id,
+                primary_luid,
+                &self.global,
+                canvas_texture_id,
+                config,
+                size,
+                frame,
+            );
+        }
+        for secondary in &self.secondary_gpus {
+            self.gpu_direct_copy_one(
+                context_data,
+                context_id,
+                secondary.target_luid,
+                &secondary.global,
+                canvas_texture_id,
+                config,
+                size,
+                frame,
+            );
+        }
+        context_data.gpu_direct_frame = frame.wrapping_add(1);
+    }
+
+    /// Ensure + copy the canvas into the shared present texture for ONE GPU global (keyed by
+    /// `luid`). The canvas texture exists on every global (mirrored by the command fan-out),
+    /// so the copy source id is the same on each; the destination is that GPU's own shared
+    /// texture.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_direct_copy_one(
+        &self,
+        context_data: &mut ContextData,
+        context_id: WebGPUContextId,
+        luid: (i32, u32),
+        global: &Arc<Global>,
+        canvas_texture_id: id::TextureId,
+        config: &ContextConfiguration,
+        size: Extent3d,
+        frame: u32,
+    ) {
         let needs_create = context_data
             .gpu_direct
-            .as_ref()
+            .get(&luid)
             .is_none_or(|shared| shared.width != size.width || shared.height != size.height);
         if needs_create {
-            // Drop the previous shared texture (on resize) to free its GPU memory before
-            // creating the new one. (The old NT handle is leaked until M2 manages handle
-            // lifetime; resizes are rare.)
-            if let Some(old) = context_data.gpu_direct.take() {
-                self.global.texture_drop(old.texture_id);
+            // Drop the previous shared texture (on resize) to free its GPU memory.
+            if let Some(old) = context_data.gpu_direct.remove(&luid) {
+                global.texture_drop(old.texture_id);
             }
             let texture_id = crate::shared_present::next_shared_texture_id();
-            context_data.gpu_direct = crate::shared_present::create_shared_present_texture(
-                &self.global,
+            if let Some(shared) = crate::shared_present::create_shared_present_texture(
+                global,
                 config.device_id,
                 texture_id,
                 size.width,
                 size.height,
-            );
-            if context_data.gpu_direct.is_some() {
+            ) {
                 log::info!(
-                    "GPU-direct: created shared present texture {}x{} for {context_id:?}",
+                    "GPU-direct: created shared present texture {}x{} for {context_id:?} on \
+                     GPU LUID {luid:?}",
                     size.width,
                     size.height
                 );
+                context_data.gpu_direct.insert(luid, shared);
             }
         }
-        if let Some(shared) = &context_data.gpu_direct {
+        if let Some(shared) = context_data.gpu_direct.get(&luid) {
             let shared_texture_id = shared.texture_id;
-            let frame = context_data.gpu_direct_frame;
             crate::shared_present::copy_canvas_to_shared(
-                &self.global,
+                global,
                 config.device_id,
                 config.queue_id,
                 canvas_texture_id,
@@ -764,7 +822,6 @@ impl crate::WGPU {
                 size,
                 frame,
             );
-            context_data.gpu_direct_frame = frame.wrapping_add(1);
         }
     }
 
@@ -823,7 +880,7 @@ impl crate::WGPU {
         // readback below, which still drives the display until the compositor side is wired.
         #[cfg(windows)]
         if self.multigpu_fanout && self.gpu_direct_present {
-            self.gpu_direct_copy_primary(context_data, context_id, texture_id, &configuration);
+            self.gpu_direct_copy(context_data, context_id, texture_id, &configuration);
         }
         let wgpu_image_map = self.wgpu_image_map.clone();
         let paint_api = self.paint_api.clone();

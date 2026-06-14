@@ -212,11 +212,18 @@ impl Painter {
         ));
         external_image_handlers.set_handler(image_handler, WebRenderImageHandlerType::WebGl);
 
+        // GPU-direct present: this painter's GPU LUID, so its WebGPU external-image handler
+        // samples the shared texture from its own GPU.
+        #[cfg(feature = "webgpu")]
+        let webgpu_painter_luid = rendering_context
+            .requested_gpu_index()
+            .and_then(paint_api::rendering_context::dxgi_luid_for_gpu_index);
         #[cfg(feature = "webgpu")]
         external_image_handlers.set_handler(
             Box::new(webgpu::WebGpuExternalImages::new(
                 paint.webgpu_image_map(),
                 rendering_context.clone(),
+                webgpu_painter_luid,
             )),
             WebRenderImageHandlerType::WebGpu,
         );
