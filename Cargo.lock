@@ -9019,6 +9019,7 @@ name = "servo-webgpu"
 version = "0.3.0"
 dependencies = [
  "arrayvec",
+ "bincode",
  "euclid",
  "log",
  "rustc-hash 2.1.2",

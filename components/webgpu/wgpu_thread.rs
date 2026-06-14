@@ -975,6 +975,27 @@ impl WGPU {
                         render_bundle_id,
                         device_id,
                     } => {
+                        // Mirror onto each secondary GPU. RenderBundleEncoder is not Clone, but
+                        // it is (de)serializable (it crosses IPC the same way), so serde-clone it
+                        // per secondary. Without this, a secondary render pass that executes this
+                        // bundle would reference a non-existent bundle and wgpu-core PANICS (not a
+                        // recoverable error), taking down the WGPU thread.
+                        if !self.secondary_gpus.is_empty() &&
+                            let Ok(encoded) = bincode::serialize(&render_bundle_encoder)
+                        {
+                            for secondary in &self.secondary_gpus {
+                                if let Ok(mirror_encoder) = bincode::deserialize::<
+                                    wgc::command::RenderBundleEncoder,
+                                >(&encoded)
+                                {
+                                    let _ = secondary.global.render_bundle_encoder_finish(
+                                        mirror_encoder,
+                                        &descriptor,
+                                        Some(render_bundle_id),
+                                    );
+                                }
+                            }
+                        }
                         let global = &self.global;
                         let (_, error) = global.render_bundle_encoder_finish(
                             render_bundle_encoder,

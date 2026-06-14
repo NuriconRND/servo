@@ -15,6 +15,9 @@ path = "lib.rs"
 
 [dependencies]
 arrayvec = { workspace = true, features = ["serde"] }
+# Used to serde-clone the non-Clone RenderBundleEncoder when mirroring it onto secondary
+# GPU globals for the multi-GPU fan-out (same round-trip as the IPC path).
+bincode = "1"
 euclid = { workspace = true }
 log = { workspace = true }
 paint_api = { workspace = true }
