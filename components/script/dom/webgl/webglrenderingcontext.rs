@@ -453,6 +453,23 @@ impl WebGLRenderingContext {
             self.last_error.get()
         );
 
+        // Diagnostic: when built with the `webgl_backtrace` feature, log the JS call
+        // site that produced an InvalidEnum so the failing WebGL2 entry point can be
+        // identified.
+        #[cfg(feature = "webgl_backtrace")]
+        if matches!(
+            err,
+            WebGLError::InvalidEnum | WebGLError::InvalidOperation | WebGLError::InvalidValue
+        ) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 6 {
+                if let Some(js) = capture_webgl_backtrace().js_backtrace {
+                    warn!("WebGL {:?} JS backtrace:\n{}", err, js);
+                }
+            }
+        }
+
         // If an error has been detected no further errors must be
         // recorded until `getError` has been called
         if self.last_error.get().is_none() {
@@ -4799,7 +4816,8 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
     ) -> ErrorResult {
         let validator = TexImage2DValidator::new(
             self, target, level, format, width, height, 0, format, data_type,
-        );
+        )
+        .for_sub_image();
         let TexImage2DValidatorResult {
             texture,
             target,
@@ -4898,7 +4916,8 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
             0,
             format,
             data_type,
-        );
+        )
+        .for_sub_image();
         let TexImage2DValidatorResult {
             texture,
             target,

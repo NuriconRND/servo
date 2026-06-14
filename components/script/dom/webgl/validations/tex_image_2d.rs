@@ -5,10 +5,12 @@
 use std::{self, cmp, fmt};
 
 use servo_canvas_traits::webgl::WebGLError::*;
-use servo_canvas_traits::webgl::{TexDataType, TexFormat};
+use servo_canvas_traits::webgl::{TexDataType, TexFormat, WebGLVersion};
 
 use super::WebGLValidator;
 use super::types::TexImageTarget;
+use crate::dom::bindings::codegen::Bindings::OESTextureHalfFloatBinding::OESTextureHalfFloatConstants;
+use crate::dom::bindings::codegen::Bindings::WebGL2RenderingContextBinding::WebGL2RenderingContextConstants;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
 use crate::dom::webgl::webgltexture::{
@@ -96,6 +98,18 @@ pub(crate) struct CommonTexImage2DValidator<'a> {
     width: i32,
     height: i32,
     border: i32,
+    /// True when this validator is used for a *SubImage call, where the
+    /// `internal_format` slot actually carries the transfer FORMAT (e.g. RG,
+    /// RED) rather than a texture internal format. Such formats are valid
+    /// transfer formats but are not valid *unsized internal* formats, so the
+    /// `usable_as_internal` requirement must be skipped for them.
+    is_sub_image: bool,
+    /// True when this validator is used for a TexStorage* call, where the
+    /// `level` slot actually carries the mip-level COUNT, and `width`/`height`
+    /// are the base (level 0) dimensions. The per-level size shift
+    /// (`max_size >> level`) and the "level > 0 must be power-of-two" rule are
+    /// only meaningful for TexImage* and must be skipped here.
+    is_tex_storage: bool,
 }
 
 pub(crate) struct CommonTexImage2DValidatorResult {
@@ -148,10 +162,13 @@ impl WebGLValidator for CommonTexImage2DValidator<'_> {
 
         // GL_INVALID_ENUM is generated if internal_format is not an accepted
         // format.
+        // For *SubImage calls the `internal_format` slot is really the transfer
+        // format (e.g. RG/RED), which is a valid format but not a valid unsized
+        // internal format, so skip the `usable_as_internal` requirement there.
         let internal_format = match TexFormat::from_gl_constant(self.internal_format) {
             Some(format)
                 if format.required_webgl_version() <= self.context.webgl_version() &&
-                    format.usable_as_internal() =>
+                    (self.is_sub_image || format.usable_as_internal()) =>
             {
                 format
             },
@@ -187,14 +204,21 @@ impl WebGLValidator for CommonTexImage2DValidator<'_> {
         // GL_INVALID_VALUE is generated if width or height is greater than
         // GL_MAX_TEXTURE_SIZE when target is GL_TEXTURE_2D or
         // GL_MAX_CUBE_MAP_TEXTURE_SIZE when target is not GL_TEXTURE_2D.
-        if width > max_size >> level || height > max_size >> level {
+        // For TexStorage*, `level` is the level COUNT and width/height are the
+        // base dimensions, so compare against the full max size (shift by 0).
+        let size_shift = if self.is_tex_storage { 0 } else { level };
+        if width > max_size >> size_shift || height > max_size >> size_shift {
             self.context.webgl_error(InvalidValue);
             return Err(TexImageValidationError::TextureTooBig);
         }
 
         // GL_INVALID_VALUE is generated if level is greater than zero and the
-        // texture is not power of two.
-        if level > 0 && (!width.is_power_of_two() || !height.is_power_of_two()) {
+        // texture is not power of two. (TexStorage* allows non-power-of-two
+        // textures with multiple levels in WebGL2, so this rule is skipped.)
+        if !self.is_tex_storage &&
+            level > 0 &&
+            (!width.is_power_of_two() || !height.is_power_of_two())
+        {
             self.context.webgl_error(InvalidValue);
             return Err(TexImageValidationError::NonPotTexture);
         }
@@ -244,7 +268,22 @@ impl<'a> CommonTexImage2DValidator<'a> {
             width,
             height,
             border,
+            is_sub_image: false,
+            is_tex_storage: false,
         }
+    }
+
+    /// Mark this as a *SubImage validation, where `internal_format` carries a
+    /// transfer format that need not be usable as an unsized internal format.
+    pub(crate) fn for_sub_image(mut self) -> Self {
+        self.is_sub_image = true;
+        self
+    }
+
+    /// Mark this as a TexStorage* validation (see [`Self::is_tex_storage`]).
+    pub(crate) fn for_tex_storage(mut self) -> Self {
+        self.is_tex_storage = true;
+        self
     }
 }
 
@@ -282,6 +321,13 @@ impl<'a> TexImage2DValidator<'a> {
             data_type,
         }
     }
+
+    /// Mark this as a *SubImage validation (see
+    /// [`CommonTexImage2DValidator::for_sub_image`]).
+    pub(crate) fn for_sub_image(mut self) -> Self {
+        self.common_validator = self.common_validator.for_sub_image();
+        self
+    }
 }
 
 /// The validated result of a TexImage2DValidator-validated call.
@@ -316,9 +362,22 @@ impl WebGLValidator for TexImage2DValidator<'_> {
             border,
         } = self.common_validator.validate()?;
 
+        // WebGL2 uses HALF_FLOAT (0x140B) for half-float texture data, but the
+        // TexDataType table only maps the WebGL1 OES value HALF_FLOAT_OES (0x8D61).
+        // Normalize so WebGL2 half-float textures (e.g. three.js PMREM render targets)
+        // are accepted; WebGLExtensions::effective_type maps the value sent to GL back
+        // to HALF_FLOAT when the OES extension is unavailable.
+        let raw_data_type = if context.webgl_version() == WebGLVersion::WebGL2 &&
+            self.data_type == WebGL2RenderingContextConstants::HALF_FLOAT
+        {
+            OESTextureHalfFloatConstants::HALF_FLOAT_OES
+        } else {
+            self.data_type
+        };
+
         // GL_INVALID_ENUM is generated if format or data_type is not an
         // accepted value.
-        let data_type = match TexDataType::from_gl_constant(self.data_type) {
+        let data_type = match TexDataType::from_gl_constant(raw_data_type) {
             Some(data_type) if data_type.required_webgl_version() <= context.webgl_version() => {
                 data_type
             },
@@ -727,7 +786,8 @@ impl<'a> TexStorageValidator<'a> {
                 width,
                 height,
                 0,
-            ),
+            )
+            .for_tex_storage(),
             dimensions,
             depth,
         }
