@@ -869,7 +869,21 @@ impl HeadedWindow {
                     state.handle_focused(window.clone());
                 }
 
-                if response.repaint && *event != WindowEvent::RedrawRequested {
+                // Don't force a repaint for cursor moves over the WebView content. egui
+                // returns `repaint = true` on essentially every mouse move, but the WebView
+                // already drives its own painting (rAF / content invalidation). Honoring
+                // egui here floods the present pipeline with a redundant, expensive repaint
+                // on every mouse event — on the multi-GPU wall each one re-composites every
+                // tile (`paint_wall_tile_group_for_redraw`) — which visibly drops the frame
+                // rate and spikes compositor render time while the mouse is moving. egui
+                // only needs to repaint when the cursor is over its own toolbar UI.
+                let is_webview_content_cursor_move =
+                    matches!(event, WindowEvent::CursorMoved { .. }) &&
+                        !should_forward_mouse_event_to_egui();
+                if response.repaint &&
+                    *event != WindowEvent::RedrawRequested &&
+                    !is_webview_content_cursor_move
+                {
                     self.winit_window.request_redraw();
                 }
 
