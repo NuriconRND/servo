@@ -214,7 +214,10 @@ impl Painter {
 
         #[cfg(feature = "webgpu")]
         external_image_handlers.set_handler(
-            Box::new(webgpu::WebGpuExternalImages::new(paint.webgpu_image_map())),
+            Box::new(webgpu::WebGpuExternalImages::new(
+                paint.webgpu_image_map(),
+                rendering_context.clone(),
+            )),
             WebRenderImageHandlerType::WebGpu,
         );
 

@@ -120,6 +120,10 @@ pub struct Preferences {
     /// dedicated wgpu device per additional physical GPU so each wall tile can
     /// eventually render/compute on its own GPU (DX12/Windows only). Off by default.
     pub dom_webgpu_multigpu_fanout: bool,
+    /// Multi-GPU GPU-direct present: copy each frame's WebGPU canvas into a shared D3D12
+    /// texture and let the tile compositor sample it directly (no CPU readback). Requires
+    /// `dom_webgpu_multigpu_fanout`. Experimental; off by default.
+    pub dom_webgpu_gpu_direct: bool,
     // feature: AbortController | #34866 | Web/API/AbortController
     pub dom_abort_controller_enabled: bool,
     // feature: Adopted Stylesheet | #38132 | Web/API/Document/adoptedStyleSheets
@@ -435,6 +439,7 @@ impl Preferences {
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
             dom_webgpu_multigpu_fanout: false,
+            dom_webgpu_gpu_direct: false,
             dom_webrtc_enabled: false,
             dom_webrtc_transceiver_enabled: false,
             dom_webvtt_enabled: false,

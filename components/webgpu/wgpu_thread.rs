@@ -90,6 +90,9 @@ pub(crate) struct WGPU {
     devices: Arc<Mutex<FxHashMap<DeviceId, DeviceScope>>>,
     /// Whether multi-GPU wall fan-out is enabled (pref `dom_webgpu_multigpu_fanout`).
     pub(crate) multigpu_fanout: bool,
+    /// Whether GPU-direct present is enabled (pref `dom_webgpu_gpu_direct`); copies the canvas
+    /// into a shared texture each frame for the compositor to sample without CPU readback.
+    pub(crate) gpu_direct_present: bool,
     /// Whether [`WGPU::ensure_secondary_gpus`] has already run.
     fanout_initialized: bool,
     /// One [`SecondaryGpu`] per additional physical GPU (beyond the page's primary adapter).
@@ -132,6 +135,7 @@ impl WGPU {
             global,
             devices: Arc::new(Mutex::new(FxHashMap::default())),
             multigpu_fanout: pref!(dom_webgpu_multigpu_fanout),
+            gpu_direct_present: pref!(dom_webgpu_gpu_direct),
             fanout_initialized: false,
             secondary_gpus: Vec::new(),
             paint_api,

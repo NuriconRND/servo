@@ -19,11 +19,14 @@ use image::RgbaImage;
 use log::{debug, info, trace, warn};
 use raw_window_handle::{DisplayHandle, WindowHandle};
 pub use surfman::Error;
+// Re-exported so external-image consumers (e.g. the WebGPU GPU-direct present path) can hold
+// the `SurfaceTexture` returned by `create_texture_from_shared_handle` without depending on
+// surfman directly.
+pub use surfman::SurfaceTexture;
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
-    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
-    SurfaceType,
+    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceType,
 };
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
 use winapi::Interface;
@@ -82,6 +85,17 @@ pub trait RenderingContext {
     }
     /// Destroys the texture and returns the surface. Default to `None`.
     fn destroy_texture(&self, _surface_texture: SurfaceTexture) -> Option<Surface> {
+        None
+    }
+    /// Wrap an external DXGI shared-resource handle (e.g. a D3D12 texture the WebGPU thread
+    /// shares for GPU-direct present) as a GL texture on this context's device. Returns the
+    /// [`SurfaceTexture`] (keep alive while sampling), the GL texture name, and the size.
+    /// Default `None`; only the surfman/ANGLE (Windows) backend implements it.
+    fn create_texture_from_shared_handle(
+        &self,
+        _handle: u64,
+        _size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         None
     }
     /// The connection to the display server for WebGL. Default to `None`.
@@ -432,6 +446,37 @@ impl SurfmanRenderingContext {
             .destroy_surface_texture(context, surface_texture)
             .map_err(|(error, _)| error)
             .ok()
+    }
+
+    fn create_texture_from_shared_handle(
+        &self,
+        handle: u64,
+        size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &mut self.context.borrow_mut();
+            let handle = handle as winapi::shared::ntdef::HANDLE;
+            let surface_texture =
+                match device.create_surface_texture_from_shared_handle(context, &size, handle) {
+                    Ok(surface_texture) => surface_texture,
+                    Err(error) => {
+                        warn!("GPU-direct: importing shared handle as texture failed: {error:?}");
+                        return None;
+                    },
+                };
+            let gl_texture = device
+                .surface_texture_object(&surface_texture)
+                .map(|tex| tex.0.get())
+                .unwrap_or(0);
+            Some((surface_texture, gl_texture, size))
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = (handle, size);
+            None
+        }
     }
 
     fn connection(&self) -> Option<Connection> {

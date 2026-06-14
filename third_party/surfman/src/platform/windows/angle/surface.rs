@@ -544,6 +544,41 @@ impl Device {
             })
     }
 
+    /// Import an external DXGI shared resource handle (e.g. a D3D12 texture shared by the
+    /// WebGPU thread for GPU-direct present) and wrap it as a [`SurfaceTexture`] (GL texture)
+    /// on this compositor device. The handle is opened on `self.d3d11_device` so it stays on
+    /// the consumer GPU, then wrapped via `EGL_D3D_TEXTURE_ANGLE` (same path the cross-GPU
+    /// WebGL surface import uses).
+    ///
+    /// Caller is responsible for synchronization (the producer must have finished writing the
+    /// shared texture before it is sampled) and for not freeing the source while live.
+    pub fn create_surface_texture_from_shared_handle(
+        &self,
+        context: &mut Context,
+        size: &Size2D<i32>,
+        handle: HANDLE,
+    ) -> Result<SurfaceTexture, Error> {
+        unsafe {
+            let mut local_d3d11_texture: *mut c_void = ptr::null_mut();
+            let open_result = self.d3d11_device.OpenSharedResource(
+                handle,
+                &d3d11::ID3D11Texture2D::uuidof(),
+                &mut local_d3d11_texture,
+            );
+            if !winerror::SUCCEEDED(open_result) || local_d3d11_texture.is_null() {
+                let (lh, ll) = self.d3d11_adapter_luid();
+                warn!(
+                    "WebGPU GPU-direct import: OpenSharedResource failed hr={open_result:#x} \
+                     importer_adapter_luid={lh}:{ll}"
+                );
+                return Err(Error::Failed);
+            }
+            let local_d3d11_texture =
+                ComPtr::from_raw(local_d3d11_texture as *mut d3d11::ID3D11Texture2D);
+            self.create_surface_texture_from_texture(context, size, local_d3d11_texture)
+        }
+    }
+
     /// Destroys a surface.
     ///
     /// The supplied context must be the context the surface is associated with, or this returns
