@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>mouse count probe</title>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#101418}
+#hud{position:fixed;top:8px;left:8px;color:#0f0;font:20px monospace;background:rgba(0,0,0,.6);padding:6px 10px;white-space:pre}</style>
+</head><body>
+<div id="hud">init</div>
+<canvas id="c"></canvas>
+<script>
+// 의존성 없는 입력 격리 프로브. rAF를 계속 돌려 애니메이션(=ControlFlow::Poll +
+// compositor waker) 상황을 만들고, 페이지가 받는 mousemove 수를 매초 stderr로 출력.
+// console.error 는 Servo stderr 로그(RUST_LOG)에 '[MOUSEPROBE] ...' 로 찍힘.
+var hud = document.getElementById('hud');
+function E(m){ try{ console.error('[MOUSEPROBE] '+m); }catch(e){} }
+var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+function resize(){ cv.width = window.innerWidth; cv.height = window.innerHeight; }
+resize(); window.addEventListener('resize', resize);
+E('init viewport=' + window.innerWidth + 'x' + window.innerHeight);
+
+var mmCount = 0, mx = 0, my = 0, lastMoveT = 0, latSum = 0, latN = 0, latMax = 0, pending = false;
+function onMove(e){ mx = e.clientX; my = e.clientY; mmCount++; lastMoveT = performance.now(); pending = true; }
+window.addEventListener('mousemove', onMove, true);
+document.addEventListener('mousemove', onMove, true);
+document.addEventListener('pointermove', onMove, true);
+
+var frames = 0, lastT = performance.now(), prev = performance.now(), maxGap = 0, ang = 0;
+function animate(){
+  requestAnimationFrame(animate);
+  var now = performance.now();
+  var gap = now - prev; prev = now; if (gap > maxGap) maxGap = gap;
+  if (pending){ var lat = now - lastMoveT; latSum += lat; latN++; if (lat > latMax) latMax = lat; pending = false; }
+  // 움직이는 그래픽 + 커서 추종 마커(육안 확인용)
+  ang += 0.03;
+  ctx.fillStyle = '#101418'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#66ccff';
+  var bx = cv.width/2 + Math.cos(ang)*120, by = cv.height/2 + Math.sin(ang)*120;
+  ctx.fillRect(bx-20, by-20, 40, 40);
+  ctx.fillStyle = '#ff5566';
+  ctx.beginPath(); ctx.arc(mx, my, 24, 0, Math.PI*2); ctx.fill();
+  frames++;
+  if (now - lastT >= 1000){
+    var fps = frames*1000/(now-lastT);
+    var avgLat = latN ? (latSum/latN) : 0;
+    var line = 'fps='+fps.toFixed(1)+' mouseEv/s='+mmCount+' lastXY=('+mx+','+my+') maxFrameGap='+maxGap.toFixed(0)+'ms moveLat avg='+avgLat.toFixed(0)+' max='+latMax.toFixed(0)+'ms';
+    hud.textContent = line; E(line);
+    frames = 0; lastT = now; mmCount = 0; maxGap = 0; latSum = 0; latN = 0; latMax = 0;
+  }
+}
+animate();
+</script></body></html>
