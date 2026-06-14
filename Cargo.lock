@@ -9029,7 +9029,9 @@ dependencies = [
  "servo-webgpu-traits",
  "webrender_api",
  "wgpu-core",
+ "wgpu-hal",
  "wgpu-types",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -89,7 +89,7 @@ pub(crate) struct WGPU {
     pub(crate) global: Arc<wgc::global::Global>,
     devices: Arc<Mutex<FxHashMap<DeviceId, DeviceScope>>>,
     /// Whether multi-GPU wall fan-out is enabled (pref `dom_webgpu_multigpu_fanout`).
-    multigpu_fanout: bool,
+    pub(crate) multigpu_fanout: bool,
     /// Whether [`WGPU::ensure_secondary_gpus`] has already run.
     fanout_initialized: bool,
     /// One [`SecondaryGpu`] per additional physical GPU (beyond the page's primary adapter).

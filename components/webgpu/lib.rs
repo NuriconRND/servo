@@ -12,6 +12,8 @@ use wgpu_thread::WGPU;
 pub use wgpu_types as wgt;
 
 mod poll_thread;
+#[cfg(windows)]
+mod shared_present;
 mod wgpu_thread;
 
 use std::borrow::Cow;

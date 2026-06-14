@@ -36,3 +36,13 @@ wgpu-core = { workspace = true, features = ["gles", "vulkan"] }
 
 [target.'cfg(windows)'.dependencies]
 wgpu-core = { workspace = true, features = ["dx12", "vulkan"] }
+# Multi-GPU wall GPU-direct present: create/share D3D12 textures so each tile can sample
+# its own GPU's render via a DXGI shared handle. `windows` must match wgpu-hal's version
+# (0.62) so the D3D12/DXGI types unify with wgpu-hal's raw_device()/texture_from_raw().
+wgpu-hal = { version = "29", features = ["dx12"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+] }

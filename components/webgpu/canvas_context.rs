@@ -409,6 +409,14 @@ pub struct ContextData {
     presentation: Option<PresentationStagingBuffer>,
     /// Next epoch to be used
     next_epoch: Epoch,
+    /// GPU-direct present (Phase 3): a shared D3D12 texture on the primary GPU that the
+    /// canvas is GPU-copied into each frame, exported as a handle for the compositor to
+    /// sample directly (no CPU readback). `None` until first present with fan-out enabled.
+    #[cfg(windows)]
+    gpu_direct: Option<crate::shared_present::SharedPresentTexture>,
+    /// Monotonic frame counter used to mint fresh copy command ids each frame.
+    #[cfg(windows)]
+    gpu_direct_frame: u32,
 }
 
 impl ContextData {
@@ -426,6 +434,10 @@ impl ContextData {
                 .collect(),
             presentation: None,
             next_epoch: Epoch(1),
+            #[cfg(windows)]
+            gpu_direct: None,
+            #[cfg(windows)]
+            gpu_direct_frame: 0,
         }
     }
 
@@ -637,6 +649,67 @@ impl crate::WGPU {
         }
     }
 
+    /// GPU-direct present (Phase 3, primary GPU): ensure a shared present texture exists for
+    /// this context (recreating it on size change) and GPU-copy the canvas into it. The
+    /// shared texture's NT handle can then be imported by the compositor to sample the render
+    /// directly, avoiding the CPU readback. Best-effort: failures leave `gpu_direct` `None` so
+    /// the CPU readback path keeps the display working.
+    #[cfg(windows)]
+    fn gpu_direct_copy_primary(
+        &self,
+        context_data: &mut ContextData,
+        context_id: WebGPUContextId,
+        canvas_texture_id: id::TextureId,
+        config: &ContextConfiguration,
+    ) {
+        let size = Extent3d {
+            width: config.size.width,
+            height: config.size.height,
+            depth_or_array_layers: 1,
+        };
+        let needs_create = context_data
+            .gpu_direct
+            .as_ref()
+            .is_none_or(|shared| shared.width != size.width || shared.height != size.height);
+        if needs_create {
+            // Drop the previous shared texture (on resize) to free its GPU memory before
+            // creating the new one. (The old NT handle is leaked until M2 manages handle
+            // lifetime; resizes are rare.)
+            if let Some(old) = context_data.gpu_direct.take() {
+                self.global.texture_drop(old.texture_id);
+            }
+            let texture_id = crate::shared_present::next_shared_texture_id();
+            context_data.gpu_direct = crate::shared_present::create_shared_present_texture(
+                &self.global,
+                config.device_id,
+                texture_id,
+                size.width,
+                size.height,
+            );
+            if context_data.gpu_direct.is_some() {
+                log::info!(
+                    "GPU-direct: created shared present texture {}x{} for {context_id:?}",
+                    size.width,
+                    size.height
+                );
+            }
+        }
+        if let Some(shared) = &context_data.gpu_direct {
+            let shared_texture_id = shared.texture_id;
+            let frame = context_data.gpu_direct_frame;
+            crate::shared_present::copy_canvas_to_shared(
+                &self.global,
+                config.device_id,
+                config.queue_id,
+                canvas_texture_id,
+                shared_texture_id,
+                size,
+                frame,
+            );
+            context_data.gpu_direct_frame = frame.wrapping_add(1);
+        }
+    }
+
     /// Read the texture to the staging buffer, map it to CPU memory, and update the
     /// image in WebRender when complete.
     pub(crate) fn present(
@@ -687,6 +760,13 @@ impl crate::WGPU {
             return;
         };
         let epoch = context_data.next_epoch();
+        // GPU-direct present (Phase 3): also GPU-copy the canvas into a shared texture on the
+        // primary GPU so the compositor can later sample it directly. Additive to the CPU
+        // readback below, which still drives the display until the compositor side is wired.
+        #[cfg(windows)]
+        if self.multigpu_fanout {
+            self.gpu_direct_copy_primary(context_data, context_id, texture_id, &configuration);
+        }
         let wgpu_image_map = self.wgpu_image_map.clone();
         let paint_api = self.paint_api.clone();
         drop(webgpu_contexts);
