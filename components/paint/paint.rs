@@ -2334,8 +2334,33 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return false;
         }
-        self.primary_painter_mut(webview_id)
+        // Route positional events (mouse/touch) to the painter whose tile viewport contains the
+        // point. On the multi-GPU wall a WebView is fanned out to one painter per tile, each with
+        // its own `viewport_origin`; without this all input went to the primary painter (tile 0),
+        // so points over a secondary tile missed that painter's hit-test region and were dropped.
+        let painter_id = event
+            .event
+            .point()
+            .and_then(|point| self.painter_id_containing_input_point(webview_id, point))
+            .unwrap_or_else(|| self.primary_painter_id_for_webview(webview_id));
+        self.painter_mut(painter_id)
             .notify_input_event(webview_id, event)
+    }
+
+    /// Finds the fanned-out painter whose tile viewport contains `point` (a positional input
+    /// point in the virtual WebView viewport). Returns `None` if no tile contains it.
+    fn painter_id_containing_input_point(
+        &self,
+        webview_id: WebViewId,
+        point: WebViewPoint,
+    ) -> Option<PainterId> {
+        self.painter_targets_for_webview(webview_id)
+            .into_iter()
+            .find(|&painter_id| {
+                self.maybe_painter(painter_id).is_some_and(|painter| {
+                    painter.rendered_tile_contains_input_point(webview_id, point)
+                })
+            })
     }
 
     pub fn notify_scroll_event(&self, webview_id: WebViewId, scroll: Scroll, point: WebViewPoint) {

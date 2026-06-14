@@ -401,6 +401,27 @@ impl Painter {
         self.webview_renderers.get(&webview_id)
     }
 
+    /// Whether the visible tile this painter actually renders (its rendering-context-sized
+    /// slice of the virtual WebView viewport, at the renderer's `viewport_origin`) contains
+    /// `point`. Used to route positional input to the correct tile painter on the multi-GPU
+    /// wall. Note the renderer's `rect` is the *virtual* viewport (shared by all tiles), so we
+    /// must test against the rendering-context size, not `rect`.
+    pub(crate) fn rendered_tile_contains_input_point(
+        &self,
+        webview_id: WebViewId,
+        point: WebViewPoint,
+    ) -> bool {
+        self.webview_renderer(webview_id).is_some_and(|renderer| {
+            let device_point = point.as_device_point(renderer.device_pixels_per_page_pixel());
+            let render_point = renderer.render_point_from_viewport_point(device_point);
+            let size = self.rendering_context.size2d();
+            render_point.x >= 0.0 &&
+                render_point.y >= 0.0 &&
+                render_point.x < size.width as f32 &&
+                render_point.y < size.height as f32
+        })
+    }
+
     pub(crate) fn webview_renderer_mut(
         &mut self,
         webview_id: WebViewId,
