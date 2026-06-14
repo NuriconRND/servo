@@ -220,6 +220,37 @@ impl WebGL2RenderingContext {
 /// of the status of the dom.webgl2.enabled preference.
 static WEBGL2_ORIGINS: &[&str] = &["www.servoexperiments.com"];
 
+/// Scalar base type (FLOAT / INT / UNSIGNED_INT) that a vertex array must supply for a
+/// given GLSL attribute type, as reported by ACTIVE_ATTRIBUTES. Vector and matrix float
+/// attributes are all FLOAT-based; matrix attributes matter for instancing, where e.g. a
+/// `mat4` instance attribute is fed by four float `vec4` arrays. Returns `None` for types
+/// we do not classify, so the caller leaves such attributes unchecked instead of failing.
+fn glsl_attrib_scalar_base_type(type_: u32) -> Option<u32> {
+    match type_ {
+        constants::FLOAT |
+        constants::FLOAT_VEC2 |
+        constants::FLOAT_VEC3 |
+        constants::FLOAT_VEC4 |
+        constants::FLOAT_MAT2 |
+        constants::FLOAT_MAT3 |
+        constants::FLOAT_MAT4 |
+        constants::FLOAT_MAT2x3 |
+        constants::FLOAT_MAT2x4 |
+        constants::FLOAT_MAT3x2 |
+        constants::FLOAT_MAT3x4 |
+        constants::FLOAT_MAT4x2 |
+        constants::FLOAT_MAT4x3 => Some(constants::FLOAT),
+        constants::INT | constants::INT_VEC2 | constants::INT_VEC3 | constants::INT_VEC4 => {
+            Some(constants::INT)
+        },
+        constants::UNSIGNED_INT |
+        constants::UNSIGNED_INT_VEC2 |
+        constants::UNSIGNED_INT_VEC3 |
+        constants::UNSIGNED_INT_VEC4 => Some(constants::UNSIGNED_INT),
+        _ => None,
+    }
+}
+
 impl WebGL2RenderingContext {
     pub(crate) fn current_vao(&self) -> DomRoot<WebGLVertexArrayObject> {
         self.base.current_vao_webgl2()
@@ -272,26 +303,6 @@ impl WebGL2RenderingContext {
             Some(program) => program,
             None => return,
         };
-        let groups = [
-            [
-                constants::INT,
-                constants::INT_VEC2,
-                constants::INT_VEC3,
-                constants::INT_VEC4,
-            ],
-            [
-                constants::UNSIGNED_INT,
-                constants::UNSIGNED_INT_VEC2,
-                constants::UNSIGNED_INT_VEC3,
-                constants::UNSIGNED_INT_VEC4,
-            ],
-            [
-                constants::FLOAT,
-                constants::FLOAT_VEC2,
-                constants::FLOAT_VEC3,
-                constants::FLOAT_VEC4,
-            ],
-        ];
         let vao = self.current_vao();
         for prog_attrib in program.active_attribs().iter() {
             let attrib = handle_potential_webgl_error!(
@@ -307,20 +318,53 @@ impl WebGL2RenderingContext {
                 .location
                 .map(|l| l as usize)
                 .unwrap_or(usize::MAX)];
-            let attrib_data_base_type = if !attrib.enabled_as_array {
+            // Determine the base type(s) the array actually feeds to the shader.
+            //
+            // A disabled (constant generic) attrib takes the generic vertex attrib's type.
+            // For an enabled array the rule is which entry point set the pointer, NOT the
+            // storage type: `vertexAttribPointer` (including normalized integer storage and
+            // half/float storage) always feeds FLOAT, while `vertexAttribIPointer` feeds
+            // INT / UNSIGNED_INT. Using the raw storage `type_` (the previous behaviour)
+            // wrongly rejected meshes whose float attributes are stored as normalized
+            // BYTE/SHORT/UNSIGNED_* (common in glTF), because those storage enums are in
+            // none of the base-type groups -> spurious INVALID_OPERATION -> black mesh.
+            //
+            // Servo does not record whether a pointer was set via the integer entry point,
+            // so for an UNNORMALIZED integer storage type we accept either interpretation
+            // (float via vertexAttribPointer, or int via vertexAttribIPointer) to avoid
+            // falsely rejecting valid draws.
+            let candidate_base_types: &[u32] = if !attrib.enabled_as_array {
                 match current_vertex_attrib {
-                    VertexAttrib::Int(_, _, _, _) => constants::INT,
-                    VertexAttrib::Uint(_, _, _, _) => constants::UNSIGNED_INT,
-                    VertexAttrib::Float(_, _, _, _) => constants::FLOAT,
+                    VertexAttrib::Int(_, _, _, _) => &[constants::INT],
+                    VertexAttrib::Uint(_, _, _, _) => &[constants::UNSIGNED_INT],
+                    VertexAttrib::Float(_, _, _, _) => &[constants::FLOAT],
                 }
+            } else if attrib.normalized ||
+                attrib.type_ == constants::FLOAT ||
+                attrib.type_ == constants::HALF_FLOAT
+            {
+                &[constants::FLOAT]
             } else {
-                attrib.type_
+                match attrib.type_ {
+                    constants::BYTE | constants::SHORT | constants::INT => {
+                        &[constants::FLOAT, constants::INT]
+                    },
+                    constants::UNSIGNED_BYTE |
+                    constants::UNSIGNED_SHORT |
+                    constants::UNSIGNED_INT => &[constants::FLOAT, constants::UNSIGNED_INT],
+                    _ => &[constants::FLOAT],
+                }
             };
 
-            let contains = groups
-                .iter()
-                .find(|g| g.contains(&attrib_data_base_type) && g.contains(&prog_attrib.type_));
-            if contains.is_none() {
+            // The shader attribute's required scalar base type. Matrix attributes are
+            // float-based and back instancing (e.g. InstancedMesh feeds a FLOAT_MAT4 via
+            // four float vec4 arrays), so they must be accepted here too. An unclassified
+            // program type is left unchecked rather than rejected.
+            let prog_base_type = match glsl_attrib_scalar_base_type(prog_attrib.type_) {
+                Some(base) => base,
+                None => continue,
+            };
+            if !candidate_base_types.contains(&prog_base_type) {
                 self.base.webgl_error(InvalidOperation);
                 return;
             }
