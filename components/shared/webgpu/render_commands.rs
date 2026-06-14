@@ -10,7 +10,9 @@ use wgpu_core::global::Global;
 use wgpu_core::id::{BindGroupId, BufferId, RenderBundleId, RenderPipelineId};
 
 /// <https://github.com/gfx-rs/wgpu/blob/f25e07b984ab391628d9568296d5970981d79d8b/wgpu-core/src/command/render_command.rs#L17>
-#[derive(Debug, Deserialize, Serialize)]
+// `Clone` is required so the multi-GPU wall fan-out can replay the same render command
+// onto each per-GPU secondary render pass (see `wgpu_thread`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum RenderCommand {
     SetPipeline(RenderPipelineId),
     SetBindGroup {

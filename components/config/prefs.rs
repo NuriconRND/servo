@@ -116,6 +116,10 @@ pub struct Preferences {
     pub dom_webgpu_enabled: bool,
     /// List of comma-separated backends to be used by wgpu.
     pub dom_webgpu_wgpu_backend: String,
+    /// Multi-GPU tiled-wall fan-out: mirror WebGPU device/command work onto a
+    /// dedicated wgpu device per additional physical GPU so each wall tile can
+    /// eventually render/compute on its own GPU (DX12/Windows only). Off by default.
+    pub dom_webgpu_multigpu_fanout: bool,
     // feature: AbortController | #34866 | Web/API/AbortController
     pub dom_abort_controller_enabled: bool,
     // feature: Adopted Stylesheet | #38132 | Web/API/Document/adoptedStyleSheets
@@ -430,6 +434,7 @@ impl Preferences {
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
+            dom_webgpu_multigpu_fanout: false,
             dom_webrtc_enabled: false,
             dom_webrtc_transceiver_enabled: false,
             dom_webvtt_enabled: false,
