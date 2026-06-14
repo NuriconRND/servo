@@ -1,0 +1,67 @@
+--- a/gfx/angle/checkout/src/libANGLE/Display.cpp
++++ b/gfx/angle/checkout/src/libANGLE/Display.cpp
+@@ -112,18 +112,26 @@
+                          EGLAttrib powerPreference,
+                          EGLAttrib platformANGLEType,
+                          EGLAttrib deviceIdHigh,
+-                         EGLAttrib deviceIdLow)
++                         EGLAttrib deviceIdLow,
++                         EGLAttrib luidHigh,
++                         EGLAttrib luidLow)
+         : nativeDisplayType(nativeDisplayType),
+           powerPreference(powerPreference),
+           platformANGLEType(platformANGLEType),
+           deviceIdHigh(deviceIdHigh),
+-          deviceIdLow(deviceIdLow)
++          deviceIdLow(deviceIdLow),
++          luidHigh(luidHigh),
++          luidLow(luidLow)
+     {}
+ 
+     auto tie() const
+     {
++        // luidHigh/luidLow are part of the key so that two displays requested with the same
++        // platform/device-id attributes but different D3D adapter LUIDs (e.g. two identical GPUs on
++        // a multi-GPU wall) are NOT collapsed into one cached display. Without this, the first
++        // display created is reused for every adapter and all rendering ends up on a single GPU.
+         return std::tie(nativeDisplayType, powerPreference, platformANGLEType, deviceIdHigh,
+-                        deviceIdLow);
++                        deviceIdLow, luidHigh, luidLow);
+     }
+ 
+     EGLNativeDisplayType nativeDisplayType{EGL_DEFAULT_DISPLAY};
+@@ -131,6 +139,8 @@
+     EGLAttrib platformANGLEType{EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE};
+     EGLAttrib deviceIdHigh{0};
+     EGLAttrib deviceIdLow{0};
++    EGLAttrib luidHigh{0};
++    EGLAttrib luidLow{0};
+ };
+ 
+ inline bool operator==(const ANGLEPlatformDisplay &a, const ANGLEPlatformDisplay &b)
+@@ -709,9 +719,13 @@
+         updatedAttribMap.get(EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE);
+     EGLAttrib deviceIdHigh = updatedAttribMap.get(EGL_PLATFORM_ANGLE_DEVICE_ID_HIGH_ANGLE, 0);
+     EGLAttrib deviceIdLow  = updatedAttribMap.get(EGL_PLATFORM_ANGLE_DEVICE_ID_LOW_ANGLE, 0);
++    // Include the requested D3D adapter LUID in the cache key. Otherwise displays opened for
++    // different GPUs by LUID (identical device-id attributes) collide and all share one GPU.
++    EGLAttrib luidHigh = updatedAttribMap.get(EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE, 0);
++    EGLAttrib luidLow  = updatedAttribMap.get(EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE, 0);
+     ANGLEPlatformDisplayMap *displays = GetANGLEPlatformDisplayMap();
+     ANGLEPlatformDisplay displayKey(nativeDisplay, powerPreference, platformANGLEType, deviceIdHigh,
+-                                    deviceIdLow);
++                                    deviceIdLow, luidHigh, luidLow);
+     const auto &iter = displays->find(displayKey);
+     if (iter != displays->end())
+     {
+@@ -892,7 +906,9 @@
+                 mAttributeMap.get(EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+                                   EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE),
+                 mAttributeMap.get(EGL_PLATFORM_ANGLE_DEVICE_ID_HIGH_ANGLE, 0),
+-                mAttributeMap.get(EGL_PLATFORM_ANGLE_DEVICE_ID_LOW_ANGLE, 0)));
++                mAttributeMap.get(EGL_PLATFORM_ANGLE_DEVICE_ID_LOW_ANGLE, 0),
++                mAttributeMap.get(EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE, 0),
++                mAttributeMap.get(EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE, 0)));
+             if (iter != displays->end())
+             {
+                 displays->erase(iter);

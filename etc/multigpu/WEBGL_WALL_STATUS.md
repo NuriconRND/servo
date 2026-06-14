@@ -37,6 +37,11 @@ three.js 예제를 멀티 GPU "월"(`--wall-layout <json> --wall-all-tiles`)에 
    `displayKey` 생성에 전달.
 4. `Display::~Display()`의 캐시 erase 키 생성에도 동일 LUID 2개 추가(삽입/삭제 키 일치 필수, 안 그러면 dangling).
 
+**패치/적용 자산** (레포에 커밋됨, `etc/multigpu/patches/`):
+- `mozangle-0.5.5-angle-luid-display-cache.patch` — 위 4곳의 정확한 unified diff(crate 원본 대비, `git apply -p1` 검증됨).
+- `apply_mozangle_angle_luid.ps1` — 빌드가 쓰는 mozangle 트리에 멱등 적용(+`-Rebuild` 시 ANGLE 강제 리빌드·DLL 복사).
+- `README.md` — 비커밋 이유 / 임시 적용 / 포크+`[patch.crates-io]`로 커밋 가능하게 만드는 법.
+
 검증 결과: nvidia-smi에서 servoshell이 **양 GPU에 등록**, 메모리/사용률 균형
 (WebGL +290/+248MiB, WebGPU +606/+166, 비디오 +182/+178). compute-apps에 GPU0·GPU1 모두.
 
