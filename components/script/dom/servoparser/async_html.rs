@@ -546,11 +546,14 @@ impl Tokenizer {
                     .downcast::<Element>()
                     .expect("tried to set attrs on non-Element in HTML parsing");
                 for attr in attrs {
+                    // Preserve the attribute's namespace prefix in its qualified name
+                    // (see create_element_for_token).
+                    let prefix = attr.name.prefix.clone();
                     elem.set_attribute_from_parser(
                         cx,
                         attr.name,
                         DOMString::from(attr.value),
-                        None,
+                        prefix,
                     );
                 }
             },
