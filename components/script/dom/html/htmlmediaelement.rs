@@ -1733,6 +1733,7 @@ impl HTMLMediaElement {
         // synchronous section, and jump down to the failed with elements step below.
         if let Some(type_) = element.get_attribute_string_value(&local_name!("type"))
             && ServoMedia::get().can_play_type(&type_) == SupportsMediaType::No
+            && !(pref!(dom_video_extended_containers_enabled) && is_extended_container_type(&type_))
         {
             self.load_from_source_child_failure_steps(source);
             return;
@@ -2045,10 +2046,17 @@ impl HTMLMediaElement {
                     return;
                 }
 
+                // Direct-URI schemes (rtsp://) are driven by the GStreamer
+                // `NetworkUri` player created in `create_media_player`; there is
+                // no resource for Servo's network stack to fetch and push.
+                let direct_uri = pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(&url);
+
                 *self.resource_url.borrow_mut() = Some(url);
 
-                // Steps 5.remote.2-5.remote.8
-                self.fetch_request(None, None);
+                if !direct_uri {
+                    // Steps 5.remote.2-5.remote.8
+                    self.fetch_request(None, None);
+                }
             },
             Resource::Object => {
                 if let Some(ref src_object) = *self.src_object.borrow() {
@@ -2590,18 +2598,27 @@ impl HTMLMediaElement {
     }
 
     fn create_media_player(&self, resource: &Resource) -> Result<(), ()> {
-        let stream_type = match *resource {
+        let (stream_type, network_uri) = match resource {
             Resource::Object => {
-                if let Some(ref src_object) = *self.src_object.borrow() {
+                let stream_type = if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::MediaStream(_) => StreamType::Stream,
                         _ => StreamType::Seekable,
                     }
                 } else {
                     return Err(());
+                };
+                (stream_type, None)
+            },
+            Resource::Url(url) => {
+                // Direct-URI schemes (rtsp://) are pulled by the GStreamer player
+                // itself instead of being fetched and pushed through AppSrc.
+                if pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(url) {
+                    (StreamType::NetworkUri, Some(url.as_str().to_owned()))
+                } else {
+                    (StreamType::Seekable, None)
                 }
             },
-            _ => StreamType::Seekable,
         };
 
         let window = self.owner_window();
@@ -2624,9 +2641,9 @@ impl HTMLMediaElement {
             video_renderer,
             audio_renderer,
             Box::new(window.get_player_context()),
-            // The standard <video>/<audio> path always feeds bytes through an
-            // AppSrc, never a direct network URI.
-            None,
+            // `Some(uri)` for direct-URI schemes (rtsp://) routed to a
+            // `NetworkUri` player; `None` for the AppSrc-fed Seekable/Stream path.
+            network_uri,
         );
         let player_id = {
             let player_guard = player.lock().unwrap();
@@ -3568,7 +3585,18 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-canplaytype>
     fn CanPlayType(&self, type_: DOMString) -> CanPlayTypeResult {
         match ServoMedia::get().can_play_type(&type_.str()) {
-            SupportsMediaType::No => CanPlayTypeResult::_empty,
+            SupportsMediaType::No => {
+                // Report non-standard containers as playable so feature-detecting
+                // pages can branch in the wall browser while still degrading in a
+                // standard browser (which returns "").
+                if pref!(dom_video_extended_containers_enabled) &&
+                    is_extended_container_type(&type_.str())
+                {
+                    CanPlayTypeResult::Maybe
+                } else {
+                    CanPlayTypeResult::_empty
+                }
+            },
             SupportsMediaType::Maybe => CanPlayTypeResult::Maybe,
             SupportsMediaType::Probably => CanPlayTypeResult::Probably,
         }
@@ -4027,6 +4055,41 @@ impl MicrotaskRunnable for MediaElementMicrotask {
 enum Resource {
     Object,
     Url(ServoUrl),
+}
+
+/// Non-standard container MIME types additionally treated as renderable by the
+/// standard `<video>` element when `dom_video_extended_containers_enabled` is on
+/// (for `<source type>` selection and `canPlayType()`). The bytes are still
+/// played through the normal GStreamer pipeline, which auto-plugs the matching
+/// demuxer from the loaded plugin set.
+const EXTENDED_CONTAINER_MIME_TYPES: &[&str] = &[
+    "video/x-matroska",
+    "video/x-msvideo",
+    "video/avi",
+    "video/x-ms-wmv",
+    "video/x-ms-asf",
+    "video/mp2t",
+    "video/x-flv",
+    "video/flv",
+    "video/quicktime",
+];
+
+/// Returns true if `type_`'s MIME essence is one of the non-standard containers
+/// the standard `<video>` element accepts under
+/// `dom_video_extended_containers_enabled`.
+fn is_extended_container_type(type_: &str) -> bool {
+    let essence = match type_.find(';') {
+        Some(semi) => type_[..semi].trim(),
+        None => type_.trim(),
+    };
+    EXTENDED_CONTAINER_MIME_TYPES.contains(&essence)
+}
+
+/// Returns true if `url` uses a scheme that must be handed directly to a
+/// GStreamer `NetworkUri` player (the engine pulls it itself) rather than fetched
+/// through Servo's network stack and pushed via AppSrc.
+fn is_direct_uri_scheme(url: &ServoUrl) -> bool {
+    matches!(url.scheme(), "rtsp" | "rtsps")
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]

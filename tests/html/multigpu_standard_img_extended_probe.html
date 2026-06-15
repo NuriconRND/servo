@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<!--
+  STANDARD <img> extended-format probe (no <x-image>).
+
+  This is the same page a normal-browser author would write: plain <img>, a
+  <picture> with a typed <source>, alt text, and onerror fallbacks. It branches
+  by ENVIRONMENT without any per-browser code:
+    - Standard browser: TIFF/EXR/QOI/JXL/... are unsupported -> the <img> fails
+      to decode -> onerror swaps in the descriptive fallback text (graceful
+      degradation). The <picture> falls back to its PNG <img>.
+    - Multi-GPU wall browser with --pref dom_image_extended_formats_enabled=true:
+      the standard <img> decode path routes through
+      pixels::load_extended_from_memory, so the same markup decodes and shows the
+      image. Standard formats (PNG/JPEG/WebP/GIF/BMP/ICO) are unaffected either
+      way.
+
+  Reuses the assets generated for the <x-image> probe at servo/test_media/
+  (see multigpu_x_image_formats_probe.html for the ffmpeg recipe).
+
+  Run:
+    # extended decode ON (wall browser behavior)
+    target\debug\servoshell.exe --pref dom_image_extended_formats_enabled=true ^
+      tests\html\multigpu_standard_img_extended_probe.html
+    # extended decode OFF (standard-browser fallback behavior) -- omit the pref
+    target\debug\servoshell.exe tests\html\multigpu_standard_img_extended_probe.html
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>standard &lt;img&gt; extended format probe</title>
+  <style>
+    html, body { margin:0; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    h1 { font-size:28px; margin:14px 18px; }
+    p.lead { margin:0 18px 14px; color:#9aa; font-size:15px; }
+    .grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:18px; padding:0 18px 18px; }
+    .cell { background:#14161d; border-radius:10px; padding:12px; }
+    .cell h2 { font-size:22px; margin:0 0 8px; color:#6cf0c5; }
+    img { display:block; width:100%; height:200px; object-fit:contain; background:#000; border:2px solid #6cf0c5; border-radius:6px; }
+    .fallback { display:flex; align-items:center; justify-content:center; width:100%; height:200px; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; color:#ffcf99; text-align:center; padding:8px; box-sizing:border-box; font-size:14px; }
+    .status { font-family:monospace; font-size:14px; color:#bfe; margin-top:8px; white-space:pre; }
+    .bad { color:#ff9f43; }
+  </style>
+</head>
+<body>
+  <h1>standard &lt;img&gt; — extended image formats</h1>
+  <p class="lead">Standard browser: each unsupported format shows the orange fallback note.
+     Wall browser (<code>dom_image_extended_formats_enabled=true</code>): the same &lt;img&gt; decodes.</p>
+  <div class="grid" id="grid"></div>
+  <script>
+    const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_image.";
+    // ext -> human description shown when the standard browser cannot decode it.
+    const formats = {
+      tiff: "TIFF (Tagged Image File Format) — print/scanning raster",
+      tga:  "TGA (Truevision Targa) — legacy game/texture format",
+      exr:  "OpenEXR — high-dynamic-range film/VFX image",
+      ppm:  "PPM (Portable Pixmap) — Netpbm raw color",
+      pgm:  "PGM (Portable Graymap) — Netpbm grayscale",
+      qoi:  "QOI (Quite OK Image) — fast lossless format",
+      hdr:  "Radiance HDR — high-dynamic-range environment map",
+      jxl:  "JPEG XL — next-gen still image codec",
+    };
+    const grid = document.getElementById("grid");
+    const items = [];
+
+    for (const [ext, desc] of Object.entries(formats)) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const h = document.createElement("h2"); h.textContent = "." + ext;
+
+      const img = document.createElement("img");
+      const fb = document.createElement("div");
+      fb.className = "fallback";
+      fb.textContent = "Unsupported here: " + desc;
+      fb.style.display = "none";
+
+      img.alt = desc;
+      img.addEventListener("error", () => {
+        img.style.display = "none";
+        fb.style.display = "flex";
+      });
+      img.src = BASE + ext;
+
+      const st = document.createElement("div"); st.className = "status"; st.textContent = "loading";
+      cell.appendChild(h); cell.appendChild(img); cell.appendChild(fb); cell.appendChild(st);
+      grid.appendChild(cell);
+      items.push({ ext, img, st });
+    }
+
+    // A <picture> negotiation case: a typed <source> for JPEG XL with a PNG
+    // <img> fallback. In a standard browser the typed source is skipped (PNG
+    // shows); in the wall browser the typed source is accepted and decoded.
+    {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const h = document.createElement("h2"); h.textContent = "<picture> jxl→png";
+      const pic = document.createElement("picture");
+      const src = document.createElement("source");
+      src.type = "image/jxl"; src.srcset = BASE + "jxl";
+      const img = document.createElement("img");
+      img.alt = "PNG fallback"; img.src = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/frame.png";
+      pic.appendChild(src); pic.appendChild(img);
+      const st = document.createElement("div"); st.className = "status"; st.textContent = "loading";
+      cell.appendChild(h); cell.appendChild(pic); cell.appendChild(st);
+      grid.appendChild(cell);
+      items.push({ ext: "picture", img, st });
+    }
+
+    let t = 0;
+    setInterval(() => {
+      t++;
+      for (const it of items) {
+        const w = it.img.naturalWidth, h = it.img.naturalHeight;
+        const decoded = it.img.complete && w > 0;
+        it.st.textContent = `complete=${it.img.complete} natural=${w}x${h}` +
+          (decoded ? "  ✓ decoded" : "  ✗ fallback");
+        it.st.className = decoded ? "status" : "status bad";
+        if (t % 3 === 0) console.error(`STD_IMG ${it.ext}: decoded=${decoded} ${w}x${h}`);
+      }
+    }, 1500);
+
+    // Headless verification helper: ?autoclose=MS exits cleanly so stderr flushes.
+    const _ac = new URLSearchParams(location.search).get("autoclose");
+    if (_ac) setTimeout(() => window.close(), parseInt(_ac, 10) || 8000);
+  </script>
+</body>
+</html>
