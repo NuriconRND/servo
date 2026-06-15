@@ -4,7 +4,6 @@
 #![expect(unsafe_code)]
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,7 +19,7 @@ use glow::{
 };
 use half::f16;
 use itertools::Itertools;
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use paint_api::{
     CrossProcessPaintApi, PainterSurfmanDetailsMap, SerializableImageData,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
@@ -42,8 +41,8 @@ use servo_canvas_traits::webgl::{
     TexFormat, WebGLBufferId, WebGLChan, WebGLCommand, WebGLCommandBacktrace, WebGLContextId,
     WebGLCreateContextResult, WebGLFramebufferBindingRequest, WebGLFramebufferId, WebGLMsg,
     WebGLMsgSender, WebGLProgramId, WebGLQueryId, WebGLRenderbufferId, WebGLSLVersion,
-    WebGLSamplerId, WebGLShaderId, WebGLSyncId, WebGLTextureId, WebGLVersion, WebGLVertexArrayId,
-    YAxisTreatment,
+    WebGLSamplerId, WebGLShaderId, WebGLSurfaceId, WebGLSyncId, WebGLTextureId, WebGLVersion,
+    WebGLVertexArrayId, YAxisTreatment,
 };
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
 use surfman::{
@@ -70,7 +69,7 @@ fn native_uniform_location(location: i32) -> Option<NativeUniformLocation> {
 /// currently taken a surface from its [`SwapChain`] for rendering purposes. Contexts will
 /// only be deleted once no WebRender instance is using it for rendering. This ensures
 /// that all Surfman `Surface`s can be released properly on the [`WebGLThread`].
-pub type WebGLContextBusyMap = Arc<RwLock<HashMap<WebGLContextId, usize>>>;
+pub type WebGLContextBusyMap = Arc<RwLock<HashMap<WebGLSurfaceId, usize>>>;
 
 pub(crate) struct GLContextData {
     pub(crate) ctx: Context,
@@ -111,18 +110,18 @@ pub struct GLState {
 impl GLState {
     // Are we faking having no alpha / depth / stencil?
     fn fake_no_alpha(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::ALPHA)
     }
 
     fn fake_no_depth(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
+        self.drawing_to_default_framebuffer
+            & !self.requested_flags.contains(ContextAttributeFlags::DEPTH)
     }
 
     fn fake_no_stencil(&self) -> bool {
-        self.drawing_to_default_framebuffer &
-            !self
+        self.drawing_to_default_framebuffer
+            & !self
                 .requested_flags
                 .contains(ContextAttributeFlags::STENCIL)
     }
@@ -223,11 +222,13 @@ pub(crate) struct WebGLThread {
     /// Channel used to generate/update or delete `ImageKey`s.
     paint_api: CrossProcessPaintApi,
     /// Map of live WebGLContexts.
-    contexts: FxHashMap<WebGLContextId, GLContextData>,
+    contexts: FxHashMap<WebGLSurfaceId, GLContextData>,
+    /// Backend painter ids for each logical WebGL context. The first entry is the primary backend.
+    context_backends: FxHashMap<WebGLContextId, Vec<PainterId>>,
     /// Cached information for WebGLContexts.
     cached_context_info: FxHashMap<WebGLContextId, WebGLContextInfo>,
     /// Current bound context.
-    bound_context_id: Option<WebGLContextId>,
+    bound_context_id: Option<WebGLSurfaceId>,
     /// A [`WebRenderExternalImageIdManager`] used to generate new [`ExternalImageId`]s for our
     /// WebGL contexts.
     external_image_id_manager: WebRenderExternalImageIdManager,
@@ -236,7 +237,7 @@ pub(crate) struct WebGLThread {
     /// The receiver that should be used to send WebGL messages for processing.
     sender: GenericSender<WebGLMsg>,
     /// The swap chains used by webrender
-    webrender_swap_chains: SwapChains<WebGLContextId, Device>,
+    webrender_swap_chains: SwapChains<WebGLSurfaceId, Device>,
     /// The per-painter details of the underlying surfman connection.
     painter_surfman_details_map: PainterSurfmanDetailsMap,
     /// A usage map used to delay the deletion of WebGL contexts until all WebRender
@@ -254,7 +255,7 @@ pub(crate) struct WebGLThreadInit {
     pub external_image_id_manager: WebRenderExternalImageIdManager,
     pub sender: GenericSender<WebGLMsg>,
     pub receiver: GenericReceiver<WebGLMsg>,
-    pub webrender_swap_chains: SwapChains<WebGLContextId, Device>,
+    pub webrender_swap_chains: SwapChains<WebGLSurfaceId, Device>,
     pub painter_surfman_details_map: PainterSurfmanDetailsMap,
     pub busy_webgl_context_map: WebGLContextBusyMap,
     #[cfg(feature = "webxr")]
@@ -283,6 +284,7 @@ impl WebGLThread {
             device_map: Default::default(),
             paint_api,
             contexts: Default::default(),
+            context_backends: Default::default(),
             cached_context_info: Default::default(),
             bound_context_id: None,
             external_image_id_manager: external_images,
@@ -322,8 +324,25 @@ impl WebGLThread {
     fn handle_msg(&mut self, msg: WebGLMsg, webgl_chan: &WebGLChan) -> bool {
         trace!("processing {:?}", msg);
         match msg {
-            WebGLMsg::CreateContext(painter_id, version, size, attributes, result_sender) => {
-                let result = self.create_webgl_context(painter_id, version, size, attributes);
+            WebGLMsg::CreateContext(
+                painter_id,
+                target_painter_ids,
+                version,
+                size,
+                attributes,
+                result_sender,
+            ) => {
+                debug!(
+                    "Creating WebGL context for primary painter {:?}; target painters {:?}",
+                    painter_id, target_painter_ids
+                );
+                let result = self.create_webgl_context(
+                    painter_id,
+                    target_painter_ids,
+                    version,
+                    size,
+                    attributes,
+                );
 
                 result_sender
                     .send(result.map(|(id, limits)| {
@@ -388,12 +407,13 @@ impl WebGLThread {
             WebGLMsg::SwapBuffers(swap_ids, canvas_epoch, sent_time) => {
                 self.handle_swap_buffers(canvas_epoch, swap_ids, sent_time);
             },
-            WebGLMsg::FinishedRenderingToContext(context_id) => {
-                self.handle_finished_rendering_to_context(context_id);
+            WebGLMsg::FinishedRenderingToContext(surface_id) => {
+                self.handle_finished_rendering_to_context(surface_id);
             },
             WebGLMsg::Exit(sender) => {
                 // Call remove_context functions in order to correctly delete WebRender image keys.
-                let context_ids: Vec<WebGLContextId> = self.contexts.keys().copied().collect();
+                let context_ids: Vec<WebGLContextId> =
+                    self.context_backends.keys().copied().collect();
                 for id in context_ids {
                     self.remove_webgl_context(id);
                 }
@@ -416,14 +436,39 @@ impl WebGLThread {
                     .painter_surfman_details_map
                     .get(painter_id)
                     .expect("no surfman details found for painter");
+                // Open a dedicated, isolated D3D11 device for this WebGL backend instead of
+                // sharing the compositor's per-LUID cached ANGLE display. The WebGL thread drives
+                // this device while the compositor consumes its surfaces on another thread; sharing
+                // one ANGLE renderer across those threads corrupts internal D3D11 state and crashes
+                // (access violation in libGLESv2). Surfaces are still shared with the compositor via
+                // the usual DXGI shared-handle path.
                 let device = surfman_details
                     .connection
-                    .create_device(&surfman_details.adapter)
+                    .create_isolated_device(&surfman_details.adapter)
                     .expect("Couldn't open WebGL device!");
 
                 Rc::new(device)
             })
             .clone()
+    }
+
+    fn backend_surface_ids(&self, context_id: WebGLContextId) -> Vec<WebGLSurfaceId> {
+        self.context_backends
+            .get(&context_id)
+            .map(|painter_ids| {
+                painter_ids
+                    .iter()
+                    .map(|painter_id| WebGLSurfaceId::new(context_id, *painter_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn primary_surface_id(&self, context_id: WebGLContextId) -> Option<WebGLSurfaceId> {
+        self.context_backends
+            .get(&context_id)
+            .and_then(|painter_ids| painter_ids.first().copied())
+            .map(|painter_id| WebGLSurfaceId::new(context_id, painter_id))
     }
 
     #[cfg(feature = "webxr")]
@@ -474,8 +519,8 @@ impl WebGLThread {
         &self,
         context_id: WebGLContextId,
     ) -> Option<Rc<Device>> {
-        self.contexts
-            .get(&context_id)
+        self.primary_surface_id(context_id)
+            .and_then(|surface_id| self.contexts.get(&surface_id))
             .map(|context| context.device.clone())
     }
 
@@ -489,7 +534,240 @@ impl WebGLThread {
         if self.cached_context_info.get_mut(&context_id).is_none() {
             return;
         }
-        let data = self.make_current_if_needed_mut(context_id);
+        match command {
+            WebGLCommand::BufferData(buffer_type, receiver, usage) => {
+                let Ok(data) = receiver.recv() else {
+                    return;
+                };
+                self.for_each_backend_context_mut(context_id, |_, context_data| unsafe {
+                    context_data
+                        .gl
+                        .buffer_data_u8_slice(buffer_type, &data, usage);
+                });
+            },
+            WebGLCommand::BufferSubData(buffer_type, offset, receiver) => {
+                let Ok(data) = receiver.recv() else {
+                    return;
+                };
+                self.for_each_backend_context_mut(context_id, |_, context_data| unsafe {
+                    context_data
+                        .gl
+                        .buffer_sub_data_u8_slice(buffer_type, offset as i32, &data);
+                });
+            },
+            WebGLCommand::CreateBuffer(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_buffer().ok().map(WebGLBufferId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateFramebuffer(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_framebuffer()
+                        .ok()
+                        .map(WebGLFramebufferId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateRenderbuffer(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_renderbuffer()
+                        .ok()
+                        .map(WebGLRenderbufferId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateTexture(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_texture().ok().map(WebGLTextureId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateProgram(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_program().ok().map(WebGLProgramId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateShader(shader_type, sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_shader(shader_type)
+                        .ok()
+                        .map(WebGLShaderId::from_glow)
+                });
+                sender.send(primary.flatten()).unwrap();
+            },
+            WebGLCommand::CreateVertexArray(sender) => {
+                let primary =
+                    self.create_backend_resource(context_id, WebGLImpl::create_vertex_array);
+                let _ = sender.send(primary.flatten());
+            },
+            WebGLCommand::CreateTransformFeedback(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_transform_feedback()
+                        .ok()
+                        .map(|ntf| ntf.0.get())
+                        .unwrap_or_default()
+                });
+                sender.send(primary.unwrap_or_default()).unwrap();
+            },
+            WebGLCommand::GenerateQuery(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_query().ok().map(WebGLQueryId::from_glow)
+                });
+                if let Some(Some(primary)) = primary {
+                    sender.send(primary).unwrap();
+                }
+            },
+            WebGLCommand::GenerateSampler(sender) => {
+                let primary = self.create_backend_resource(context_id, |gl| unsafe {
+                    gl.create_sampler().ok().map(WebGLSamplerId::from_glow)
+                });
+                if let Some(Some(primary)) = primary {
+                    sender.send(primary).unwrap();
+                }
+            },
+            WebGLCommand::LinkProgram(program_id, sender) => {
+                let primary_surface_id = self.primary_surface_id(context_id);
+                let mut primary_info = None;
+                self.for_each_backend_context_mut(context_id, |surface_id, context_data| {
+                    let link_info = WebGLImpl::link_program(&context_data.gl, program_id);
+                    if Some(surface_id) == primary_surface_id {
+                        primary_info = Some(link_info);
+                    }
+                });
+                if let Some(primary_info) = primary_info {
+                    sender.send(primary_info).unwrap();
+                }
+            },
+            command if Self::command_uses_primary_response_only(&command) => {
+                self.apply_webgl_command_to_primary(context_id, command, backtrace);
+            },
+            command => {
+                self.apply_webgl_command_to_all_backends(context_id, command, backtrace);
+            },
+        }
+    }
+
+    fn command_uses_primary_response_only(command: &WebGLCommand) -> bool {
+        matches!(
+            command,
+            WebGLCommand::GetContextAttributes(..)
+                | WebGLCommand::GetBufferSubData(..)
+                | WebGLCommand::GetExtensions(..)
+                | WebGLCommand::GetShaderPrecisionFormat(..)
+                | WebGLCommand::GetFragDataLocation(..)
+                | WebGLCommand::GetUniformLocation(..)
+                | WebGLCommand::GetShaderInfoLog(..)
+                | WebGLCommand::GetProgramInfoLog(..)
+                | WebGLCommand::GetFramebufferAttachmentParameter(..)
+                | WebGLCommand::GetRenderbufferParameter(..)
+                | WebGLCommand::IsTransformFeedback(..)
+                | WebGLCommand::GetTransformFeedbackVarying(..)
+                | WebGLCommand::ReadPixels(..)
+                | WebGLCommand::FenceSync(..)
+                | WebGLCommand::IsSync(..)
+                | WebGLCommand::ClientWaitSync(..)
+                | WebGLCommand::GetSyncParameter(..)
+                | WebGLCommand::DrawingBufferWidth(..)
+                | WebGLCommand::DrawingBufferHeight(..)
+                | WebGLCommand::Finish(..)
+                | WebGLCommand::GetParameterBool(..)
+                | WebGLCommand::GetParameterBool4(..)
+                | WebGLCommand::GetParameterInt(..)
+                | WebGLCommand::GetParameterInt2(..)
+                | WebGLCommand::GetParameterInt4(..)
+                | WebGLCommand::GetParameterFloat(..)
+                | WebGLCommand::GetParameterFloat2(..)
+                | WebGLCommand::GetParameterFloat4(..)
+                | WebGLCommand::GetProgramValidateStatus(..)
+                | WebGLCommand::GetProgramActiveUniforms(..)
+                | WebGLCommand::GetCurrentVertexAttrib(..)
+                | WebGLCommand::GetTexParameterFloat(..)
+                | WebGLCommand::GetTexParameterInt(..)
+                | WebGLCommand::GetTexParameterBool(..)
+                | WebGLCommand::GetInternalFormatIntVec(..)
+                | WebGLCommand::GetUniformBool(..)
+                | WebGLCommand::GetUniformBool2(..)
+                | WebGLCommand::GetUniformBool3(..)
+                | WebGLCommand::GetUniformBool4(..)
+                | WebGLCommand::GetUniformInt(..)
+                | WebGLCommand::GetUniformInt2(..)
+                | WebGLCommand::GetUniformInt3(..)
+                | WebGLCommand::GetUniformInt4(..)
+                | WebGLCommand::GetUniformUint(..)
+                | WebGLCommand::GetUniformUint2(..)
+                | WebGLCommand::GetUniformUint3(..)
+                | WebGLCommand::GetUniformUint4(..)
+                | WebGLCommand::GetUniformFloat(..)
+                | WebGLCommand::GetUniformFloat2(..)
+                | WebGLCommand::GetUniformFloat3(..)
+                | WebGLCommand::GetUniformFloat4(..)
+                | WebGLCommand::GetUniformFloat9(..)
+                | WebGLCommand::GetUniformFloat16(..)
+                | WebGLCommand::GetUniformFloat2x3(..)
+                | WebGLCommand::GetUniformFloat2x4(..)
+                | WebGLCommand::GetUniformFloat3x2(..)
+                | WebGLCommand::GetUniformFloat3x4(..)
+                | WebGLCommand::GetUniformFloat4x2(..)
+                | WebGLCommand::GetUniformFloat4x3(..)
+                | WebGLCommand::GetUniformBlockIndex(..)
+                | WebGLCommand::GetUniformIndices(..)
+                | WebGLCommand::GetActiveUniforms(..)
+                | WebGLCommand::GetActiveUniformBlockName(..)
+                | WebGLCommand::GetActiveUniformBlockParameter(..)
+                | WebGLCommand::GetQueryState(..)
+                | WebGLCommand::GetSamplerParameterFloat(..)
+                | WebGLCommand::GetSamplerParameterInt(..)
+        )
+    }
+
+    fn apply_webgl_command_to_primary(
+        &mut self,
+        context_id: WebGLContextId,
+        command: WebGLCommand,
+        backtrace: WebGLCommandBacktrace,
+    ) {
+        let Some(surface_id) = self.primary_surface_id(context_id) else {
+            return;
+        };
+        self.apply_webgl_command_to_surface(surface_id, command, backtrace);
+    }
+
+    fn apply_webgl_command_to_all_backends(
+        &mut self,
+        context_id: WebGLContextId,
+        command: WebGLCommand,
+        backtrace: WebGLCommandBacktrace,
+    ) {
+        let bytes = match postcard::to_stdvec(&command) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    "Could not clone WebGL command for multi-GPU fan-out; applying primary only: {error:?}"
+                );
+                self.apply_webgl_command_to_primary(context_id, command, backtrace);
+                return;
+            },
+        };
+
+        for surface_id in self.backend_surface_ids(context_id) {
+            let Ok(command) = postcard::from_bytes::<WebGLCommand>(&bytes) else {
+                warn!("Could not deserialize cloned WebGL command for {surface_id:?}");
+                continue;
+            };
+            self.apply_webgl_command_to_surface(surface_id, command, backtrace.clone());
+        }
+    }
+
+    fn apply_webgl_command_to_surface(
+        &mut self,
+        surface_id: WebGLSurfaceId,
+        command: WebGLCommand,
+        backtrace: WebGLCommandBacktrace,
+    ) {
+        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+        let data = self.make_surface_current_if_needed_mut(surface_id);
         if let Some(data) = data {
             WebGLImpl::apply(
                 &data.device,
@@ -503,22 +781,127 @@ impl WebGLThread {
         }
     }
 
+    fn for_each_backend_context_mut<F>(&mut self, context_id: WebGLContextId, mut f: F)
+    where
+        F: FnMut(WebGLSurfaceId, &mut GLContextData),
+    {
+        for surface_id in self.backend_surface_ids(context_id) {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            self.make_surface_current_if_needed(surface_id);
+            if let Some(context_data) = self.contexts.get_mut(&surface_id) {
+                f(surface_id, context_data);
+            }
+        }
+    }
+
+    fn create_backend_resource<T, F>(
+        &mut self,
+        context_id: WebGLContextId,
+        mut create: F,
+    ) -> Option<T>
+    where
+        T: Copy + Eq + std::fmt::Debug,
+        F: FnMut(&Gl) -> T,
+    {
+        let primary_surface_id = self.primary_surface_id(context_id);
+        let mut primary = None;
+        self.for_each_backend_context_mut(context_id, |surface_id, context_data| {
+            let resource = create(&context_data.gl);
+            if Some(surface_id) == primary_surface_id {
+                primary = Some(resource);
+            } else if primary.is_some_and(|primary| primary != resource) {
+                debug!(
+                    "WebGL backend resource id mismatch for {surface_id:?}: primary={:?} backend={:?}",
+                    primary, resource
+                );
+            }
+        });
+        primary
+    }
+
     /// Creates a new WebGLContext
     fn create_webgl_context(
         &mut self,
         painter_id: PainterId,
+        target_painter_ids: Vec<PainterId>,
         webgl_version: WebGLVersion,
         requested_size: Size2D<u32>,
         attributes: GLContextAttributes,
     ) -> Result<(WebGLContextId, webgl::GLLimits), String> {
         debug!(
-            "WebGLThread::create_webgl_context({:?}, {:?}, {:?})",
-            webgl_version, requested_size, attributes
+            "WebGLThread::create_webgl_context({:?}, {:?}, {:?}, targets={:?})",
+            webgl_version, requested_size, attributes, target_painter_ids
         );
 
         // Creating a new GLContext may make the current bound context_id dirty.
         // Clear it to ensure that  make_current() is called in subsequent commands.
         self.bound_context_id = None;
+        let context_id = WebGLContextId(
+            self.external_image_id_manager
+                .next_id(WebRenderImageHandlerType::WebGl)
+                .0,
+        );
+
+        let mut normalized_target_painter_ids = vec![painter_id];
+        normalized_target_painter_ids.extend(
+            target_painter_ids
+                .into_iter()
+                .filter(|target_painter_id| *target_painter_id != painter_id)
+                .filter(|target_painter_id| {
+                    self.painter_surfman_details_map
+                        .get(*target_painter_id)
+                        .is_some()
+                }),
+        );
+        let target_painter_ids: Vec<_> =
+            normalized_target_painter_ids.into_iter().unique().collect();
+        if target_painter_ids.len() > 1 {
+            info!(
+                "WebGL multi-GPU backend fan-out: logical_context={:?} primary_painter={:?} \
+                 target_painters={:?}",
+                context_id, painter_id, target_painter_ids
+            );
+        }
+
+        let mut primary_limits = None;
+        for target_painter_id in &target_painter_ids {
+            let surface_id = WebGLSurfaceId::new(context_id, *target_painter_id);
+            let (context_data, limits, size, has_alpha) = self.create_webgl_backend_context(
+                context_id,
+                *target_painter_id,
+                webgl_version,
+                requested_size,
+                attributes,
+            )?;
+            if *target_painter_id == painter_id {
+                primary_limits = Some(limits);
+                self.cached_context_info.insert(
+                    context_id,
+                    WebGLContextInfo {
+                        image_key: None,
+                        size,
+                        alpha: has_alpha,
+                    },
+                );
+            }
+            self.contexts.insert(surface_id, context_data);
+        }
+        self.context_backends.insert(context_id, target_painter_ids);
+
+        primary_limits
+            .ok_or_else(|| "Failed to create primary WebGL backend".to_string())
+            .map(|limits| (context_id, limits))
+    }
+
+    fn create_webgl_backend_context(
+        &mut self,
+        context_id: WebGLContextId,
+        painter_id: PainterId,
+        webgl_version: WebGLVersion,
+        requested_size: Size2D<u32>,
+        attributes: GLContextAttributes,
+    ) -> Result<(GLContextData, webgl::GLLimits, Size2D<i32>, bool), String> {
+        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
         let painter_surfman_details = self
             .painter_surfman_details_map
             .get(painter_id)
@@ -535,10 +918,10 @@ impl WebGLThread {
         // WebGL requires all contexts to be able to create framebuffers with
         // alpha, depth and stencil. So we always create a context with them,
         // and fake not having them if requested.
-        let flags = requested_flags |
-            ContextAttributeFlags::ALPHA |
-            ContextAttributeFlags::DEPTH |
-            ContextAttributeFlags::STENCIL;
+        let flags = requested_flags
+            | ContextAttributeFlags::ALPHA
+            | ContextAttributeFlags::DEPTH
+            | ContextAttributeFlags::STENCIL;
         let context_attributes = &ContextAttributes {
             version: webgl_version.to_surfman_version(api_type),
             flags,
@@ -572,25 +955,22 @@ impl WebGLThread {
             .make_context_current(&ctx)
             .map_err(|err| format!("Failed to make new context current: {:?}", err))?;
 
-        let context_id = WebGLContextId(
-            self.external_image_id_manager
-                .next_id(WebRenderImageHandlerType::WebGl)
-                .0,
-        );
+        let surface_id = WebGLSurfaceId::new(context_id, painter_id);
 
         self.webrender_swap_chains
-            .create_attached_swap_chain(context_id, &*device, &mut ctx, surface_access)
+            .create_attached_swap_chain(surface_id, &*device, &mut ctx, surface_access)
             .map_err(|err| format!("Failed to create swap chain: {:?}", err))?;
 
         let swap_chain = self
             .webrender_swap_chains
-            .get(context_id)
+            .get(surface_id)
             .expect("Failed to get the swap chain");
 
         debug!(
-            "Created webgl context {:?}/{:?}",
+            "Created webgl backend context {:?} for painter {:?}/{:?}",
             context_id,
-            device.context_id(&ctx),
+            painter_id,
+            device.context_id(&ctx)
         );
 
         let gl = unsafe {
@@ -657,28 +1037,16 @@ impl WebGLThread {
         state.restore_invariant(&gl);
         debug_assert_eq!(unsafe { gl.get_error() }, gl::NO_ERROR);
 
-        self.contexts.insert(
-            context_id,
-            GLContextData {
-                ctx,
-                device,
-                gl,
-                state,
-                attributes,
-                marked_for_deletion: false,
-            },
-        );
+        let context_data = GLContextData {
+            ctx,
+            device,
+            gl,
+            state,
+            attributes,
+            marked_for_deletion: false,
+        };
 
-        self.cached_context_info.insert(
-            context_id,
-            WebGLContextInfo {
-                image_key: None,
-                size: size.to_i32(),
-                alpha: has_alpha,
-            },
-        );
-
-        Ok((context_id, limits))
+        Ok((context_data, limits, size.to_i32(), has_alpha))
     }
 
     /// Resizes a WebGLContext
@@ -687,81 +1055,109 @@ impl WebGLThread {
         context_id: WebGLContextId,
         requested_size: Size2D<u32>,
     ) -> Result<(), String> {
-        self.make_current_if_needed(context_id)
-            .expect("Missing WebGL context!");
+        let surface_ids = self.backend_surface_ids(context_id);
+        if surface_ids.is_empty() {
+            return Err("Missing WebGL context!".to_string());
+        }
+        let primary_surface_id = self.primary_surface_id(context_id);
+        let mut primary_size = None;
+        let mut primary_has_alpha = false;
 
-        let data = self
-            .contexts
-            .get_mut(&context_id)
-            .expect("Missing WebGL context!");
+        for surface_id in surface_ids {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            self.make_surface_current_if_needed(surface_id)
+                .expect("Missing WebGL backend context!");
 
-        let size = clamp_viewport(&data.gl, requested_size);
+            let data = self
+                .contexts
+                .get_mut(&surface_id)
+                .expect("Missing WebGL backend context!");
 
-        // Check to see if any of the current framebuffer bindings are the surface we're about to
-        // throw out. If so, we'll have to reset them after destroying the surface.
-        let framebuffer_rebinding_info =
-            FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
+            let size = clamp_viewport(&data.gl, requested_size);
 
-        // Resize the swap chains
-        if let Some(swap_chain) = self.webrender_swap_chains.get(context_id) {
-            let alpha = data
-                .state
-                .requested_flags
-                .contains(ContextAttributeFlags::ALPHA);
-            let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
-            swap_chain
-                .resize(&data.device, &mut data.ctx, size.to_i32())
-                .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
-            swap_chain
-                .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
-                .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
-        } else {
-            error!("Failed to find swap chain");
+            // Check to see if any of the current framebuffer bindings are the surface we're about
+            // to throw out. If so, we'll have to reset them after destroying the surface.
+            let framebuffer_rebinding_info =
+                FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
+
+            // Resize the swap chains
+            if let Some(swap_chain) = self.webrender_swap_chains.get(surface_id) {
+                let alpha = data
+                    .state
+                    .requested_flags
+                    .contains(ContextAttributeFlags::ALPHA);
+                let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+                swap_chain
+                    .resize(&data.device, &mut data.ctx, size.to_i32())
+                    .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
+                swap_chain
+                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
+            } else {
+                error!("Failed to find swap chain");
+            }
+
+            // Reset framebuffer bindings as appropriate.
+            framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
+            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+
+            if Some(surface_id) == primary_surface_id {
+                primary_size = Some(size.to_i32());
+                primary_has_alpha = data
+                    .state
+                    .requested_flags
+                    .contains(ContextAttributeFlags::ALPHA);
+            }
         }
 
-        // Reset framebuffer bindings as appropriate.
-        framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
-        debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-
-        let has_alpha = data
-            .state
-            .requested_flags
-            .contains(ContextAttributeFlags::ALPHA);
-        self.update_webrender_image_for_context(context_id, size.to_i32(), has_alpha, None);
+        if let Some(size) = primary_size {
+            self.update_webrender_image_for_context(context_id, size, primary_has_alpha, None);
+        }
 
         Ok(())
     }
 
     /// Note that rendering has finished in WebRender for this context. If the context
     /// is marked for deletion, it will now be deleted.
-    fn handle_finished_rendering_to_context(&mut self, context_id: WebGLContextId) {
+    fn handle_finished_rendering_to_context(&mut self, surface_id: WebGLSurfaceId) {
         let marked_for_deletion = self
             .contexts
-            .get(&context_id)
+            .get(&surface_id)
             .is_some_and(|context_data| context_data.marked_for_deletion);
-        if marked_for_deletion {
-            self.remove_webgl_context(context_id);
+        if marked_for_deletion && !self.context_has_busy_surfaces(surface_id.context_id) {
+            self.remove_webgl_context(surface_id.context_id);
         }
+    }
+
+    fn context_has_busy_surfaces(&self, context_id: WebGLContextId) -> bool {
+        let busy_webgl_context_map = self.busy_webgl_context_map.read();
+        self.backend_surface_ids(context_id)
+            .iter()
+            .any(|surface_id| {
+                busy_webgl_context_map
+                    .get(surface_id)
+                    .is_some_and(|busy_count| *busy_count > 0)
+            })
     }
 
     /// Removes a WebGLContext and releases attached resources.
     fn remove_webgl_context(&mut self, context_id: WebGLContextId) {
+        let surface_ids = self.backend_surface_ids(context_id);
+        if self.context_has_busy_surfaces(context_id) {
+            // WebRender is in the process of rendering at least one backend surface, so wait until
+            // every surface has been returned before releasing the logical context.
+            for surface_id in surface_ids {
+                if let Some(context_data) = self.contexts.get_mut(&surface_id) {
+                    context_data.marked_for_deletion = true;
+                }
+            }
+            return;
+        }
+
         {
             let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            let entry = busy_webgl_context_map.entry(context_id);
-            match entry {
-                Entry::Vacant(..) => {},
-                Entry::Occupied(occupied_entry) if *occupied_entry.get() > 0 => {
-                    // WebRender is in the process of rendering this WebGL context, so wait until it
-                    // finishes in order to release it.
-                    if let Some(context_data) = self.contexts.get_mut(&context_id) {
-                        context_data.marked_for_deletion = true;
-                    }
-                    return;
-                },
-                Entry::Occupied(occupied_entry) => {
-                    occupied_entry.remove();
-                },
+            for surface_id in &surface_ids {
+                busy_webgl_context_map.remove(surface_id);
             }
         }
 
@@ -774,12 +1170,9 @@ impl WebGLThread {
             self.paint_api.delete_image(image_key);
         }
 
-        if !self.contexts.contains_key(&context_id) {
+        if surface_ids.is_empty() {
             return;
         };
-
-        // We need to make the context current so its resources can be disposed of.
-        self.make_current_if_needed(context_id);
 
         // Destroy WebXR layers associated with this context
         #[cfg(feature = "webxr")]
@@ -793,18 +1186,25 @@ impl WebGLThread {
             self.webxr_bridge = webxr_bridge;
         }
 
-        // Release GL context.
-        let Some(mut data) = self.contexts.remove(&context_id) else {
-            return;
-        };
+        for surface_id in surface_ids {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            // We need to make each backend context current so its resources can be disposed of.
+            self.make_surface_current_if_needed(surface_id);
 
-        // Destroy the swap chains
-        self.webrender_swap_chains
-            .destroy(context_id, &data.device, &mut data.ctx)
-            .unwrap();
+            // Release GL context.
+            let Some(mut data) = self.contexts.remove(&surface_id) else {
+                continue;
+            };
 
-        // Destroy the context
-        data.device.destroy_context(&mut data.ctx).unwrap();
+            // Destroy the swap chains
+            self.webrender_swap_chains
+                .destroy(surface_id, &data.device, &mut data.ctx)
+                .unwrap();
+
+            // Destroy the context
+            data.device.destroy_context(&mut data.ctx).unwrap();
+        }
+        self.context_backends.remove(&context_id);
 
         // Removing a GLContext may make the current bound context_id dirty.
         self.bound_context_id = None;
@@ -818,81 +1218,91 @@ impl WebGLThread {
     ) {
         debug!("handle_swap_buffers()");
         for context_id in context_ids {
-            self.make_current_if_needed(context_id)
-                .expect("Where's the GL data?");
+            let primary_surface_id = self.primary_surface_id(context_id);
+            let mut primary_update = None;
+            for surface_id in self.backend_surface_ids(context_id) {
+                let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+                self.make_surface_current_if_needed(surface_id)
+                    .expect("Where's the GL data?");
 
-            let data = self
-                .contexts
-                .get_mut(&context_id)
-                .expect("Missing WebGL context");
+                let data = self
+                    .contexts
+                    .get_mut(&surface_id)
+                    .expect("Missing WebGL backend context");
 
-            // Ensure there are no pending GL errors from other parts of the pipeline.
-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+                // Ensure there are no pending GL errors from other parts of the pipeline.
+                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
-            // Check to see if any of the current framebuffer bindings are the surface we're about
-            // to swap out. If so, we'll have to reset them after destroying the surface.
-            let framebuffer_rebinding_info =
-                FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+                // Check to see if any of the current framebuffer bindings are the surface we're
+                // about to swap out. If so, we'll have to reset them after destroying the surface.
+                let framebuffer_rebinding_info =
+                    FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
+                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
-            debug!("Getting swap chain for {:?}", context_id);
-            let swap_chain = self
-                .webrender_swap_chains
-                .get(context_id)
-                .expect("Where's the swap chain?");
+                debug!("Getting swap chain for {:?}", surface_id);
+                let swap_chain = self
+                    .webrender_swap_chains
+                    .get(surface_id)
+                    .expect("Where's the swap chain?");
 
-            debug!("Swapping {:?}", context_id);
-            swap_chain
-                .swap_buffers(
-                    &data.device,
-                    &mut data.ctx,
-                    if data.attributes.preserve_drawing_buffer {
-                        PreserveBuffer::Yes(&data.gl)
-                    } else {
-                        PreserveBuffer::No
-                    },
-                )
-                .unwrap();
-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-
-            if !data.attributes.preserve_drawing_buffer {
-                debug!("Clearing {:?}", context_id);
-                let alpha = data
-                    .state
-                    .requested_flags
-                    .contains(ContextAttributeFlags::ALPHA);
-                let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+                debug!("Swapping {:?}", surface_id);
                 swap_chain
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    .swap_buffers(
+                        &data.device,
+                        &mut data.ctx,
+                        if data.attributes.preserve_drawing_buffer {
+                            PreserveBuffer::Yes(&data.gl)
+                        } else {
+                            PreserveBuffer::No
+                        },
+                    )
                     .unwrap();
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+
+                if !data.attributes.preserve_drawing_buffer {
+                    debug!("Clearing {:?}", surface_id);
+                    let alpha = data
+                        .state
+                        .requested_flags
+                        .contains(ContextAttributeFlags::ALPHA);
+                    let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+                    swap_chain
+                        .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                        .unwrap();
+                    debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+                }
+
+                // Rebind framebuffers as appropriate.
+                debug!("Rebinding {:?}", surface_id);
+                framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
+                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
+
+                let SurfaceInfo {
+                    size,
+                    framebuffer_object,
+                    id,
+                    ..
+                } = data
+                    .device
+                    .context_surface_info(&data.ctx)
+                    .unwrap()
+                    .unwrap();
+                debug!(
+                    "... rebound framebuffer {:?}, new back buffer surface is {:?}",
+                    framebuffer_object, id
+                );
+
+                if Some(surface_id) == primary_surface_id {
+                    let has_alpha = data
+                        .state
+                        .requested_flags
+                        .contains(ContextAttributeFlags::ALPHA);
+                    primary_update = Some((size, has_alpha));
+                }
             }
-
-            // Rebind framebuffers as appropriate.
-            debug!("Rebinding {:?}", context_id);
-            framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-
-            let SurfaceInfo {
-                size,
-                framebuffer_object,
-                id,
-                ..
-            } = data
-                .device
-                .context_surface_info(&data.ctx)
-                .unwrap()
-                .unwrap();
-            debug!(
-                "... rebound framebuffer {:?}, new back buffer surface is {:?}",
-                framebuffer_object, id
-            );
-
-            let has_alpha = data
-                .state
-                .requested_flags
-                .contains(ContextAttributeFlags::ALPHA);
-            self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
+            if let Some((size, has_alpha)) = primary_update {
+                self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
+            }
         }
     }
 
@@ -906,29 +1316,47 @@ impl WebGLThread {
         &mut self,
         context_id: WebGLContextId,
     ) -> Option<&GLContextData> {
-        let data = self.contexts.get(&context_id);
+        let surface_id = self.primary_surface_id(context_id)?;
+        self.make_surface_current_if_needed(surface_id)
+    }
 
-        if let Some(data) = data &&
-            Some(context_id) != self.bound_context_id
+    /// Gets a mutable reference to the primary backend for a WebGLContextId and makes it current.
+    ///
+    /// WebXR currently addresses WebGL by logical context id, so it keeps using the primary
+    /// backend until WebXR is explicitly extended to multi-GPU wall backends.
+    pub(crate) fn make_current_if_needed_mut(
+        &mut self,
+        context_id: WebGLContextId,
+    ) -> Option<&mut GLContextData> {
+        let surface_id = self.primary_surface_id(context_id)?;
+        self.make_surface_current_if_needed_mut(surface_id)
+    }
+
+    fn make_surface_current_if_needed(
+        &mut self,
+        surface_id: WebGLSurfaceId,
+    ) -> Option<&GLContextData> {
+        let data = self.contexts.get(&surface_id);
+        if let Some(data) = data
+            && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
-            self.bound_context_id = Some(context_id);
+            self.bound_context_id = Some(surface_id);
         }
 
         data
     }
 
-    /// Gets a mutable reference to a GLContextWrapper for a WebGLContextId and makes it current if required.
-    pub(crate) fn make_current_if_needed_mut(
+    fn make_surface_current_if_needed_mut(
         &mut self,
-        context_id: WebGLContextId,
+        surface_id: WebGLSurfaceId,
     ) -> Option<&mut GLContextData> {
-        let data = self.contexts.get_mut(&context_id);
-        if let Some(ref data) = data &&
-            Some(context_id) != self.bound_context_id
+        let data = self.contexts.get_mut(&surface_id);
+        if let Some(ref data) = data
+            && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
-            self.bound_context_id = Some(context_id);
+            self.bound_context_id = Some(surface_id);
         }
 
         data
@@ -1238,9 +1666,9 @@ impl WebGLImpl {
                 gl.polygon_offset(factor, units)
             },
             WebGLCommand::ReadPixels(rect, format, pixel_type, ref sender) => {
-                let len = bytes_per_type(pixel_type) *
-                    components_per_format(format) *
-                    rect.size.area() as usize;
+                let len = bytes_per_type(pixel_type)
+                    * components_per_format(format)
+                    * rect.size.area() as usize;
                 let mut pixels = vec![0; len];
                 unsafe {
                     // We don't want any alignment padding on pixel rows.
@@ -2917,10 +3345,10 @@ fn image_to_tex_image_data(
     }
 
     match (format, data_type) {
-        (TexFormat::RGBA, TexDataType::UnsignedByte) |
-        (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
-        (TexFormat::RGB, TexDataType::UnsignedByte) |
-        (TexFormat::RGB8, TexDataType::UnsignedByte) => {
+        (TexFormat::RGBA, TexDataType::UnsignedByte)
+        | (TexFormat::RGBA8, TexDataType::UnsignedByte) => pixels,
+        (TexFormat::RGB, TexDataType::UnsignedByte)
+        | (TexFormat::RGB8, TexDataType::UnsignedByte) => {
             for i in 0..pixel_count {
                 let rgb = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
@@ -2963,10 +3391,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf0) << 8) |
-                        ((rgba[1] as u16 & 0xf0) << 4) |
-                        (rgba[2] as u16 & 0xf0) |
-                        ((rgba[3] as u16 & 0xf0) >> 4)
+                    ((rgba[0] as u16 & 0xf0) << 8)
+                        | ((rgba[1] as u16 & 0xf0) << 4)
+                        | (rgba[2] as u16 & 0xf0)
+                        | ((rgba[3] as u16 & 0xf0) >> 4)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -2977,10 +3405,10 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgba = &pixels[i * 4..i * 4 + 4];
-                    ((rgba[0] as u16 & 0xf8) << 8) |
-                        ((rgba[1] as u16 & 0xf8) << 3) |
-                        ((rgba[2] as u16 & 0xf8) >> 2) |
-                        ((rgba[3] as u16) >> 7)
+                    ((rgba[0] as u16 & 0xf8) << 8)
+                        | ((rgba[1] as u16 & 0xf8) << 3)
+                        | ((rgba[2] as u16 & 0xf8) >> 2)
+                        | ((rgba[3] as u16) >> 7)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -2991,9 +3419,9 @@ fn image_to_tex_image_data(
             for i in 0..pixel_count {
                 let p = {
                     let rgb = &pixels[i * 4..i * 4 + 3];
-                    ((rgb[0] as u16 & 0xf8) << 8) |
-                        ((rgb[1] as u16 & 0xfc) << 3) |
-                        ((rgb[2] as u16 & 0xf8) >> 3)
+                    ((rgb[0] as u16 & 0xf8) << 8)
+                        | ((rgb[1] as u16 & 0xfc) << 3)
+                        | ((rgb[2] as u16 & 0xf8) >> 3)
                 };
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
             }
@@ -3029,8 +3457,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::Luminance, TexDataType::Float) |
-        (TexFormat::Luminance32f, TexDataType::Float) => {
+        (TexFormat::Luminance, TexDataType::Float)
+        | (TexFormat::Luminance32f, TexDataType::Float) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let p = rgba8[0] as f32;
                 NativeEndian::write_f32(rgba8, p);
@@ -3038,8 +3466,8 @@ fn image_to_tex_image_data(
             pixels
         },
 
-        (TexFormat::LuminanceAlpha, TexDataType::Float) |
-        (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
+        (TexFormat::LuminanceAlpha, TexDataType::Float)
+        | (TexFormat::LuminanceAlpha32f, TexDataType::Float) => {
             let mut data = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 data.write_f32::<NativeEndian>(rgba8[0] as f32).unwrap();
@@ -3048,8 +3476,8 @@ fn image_to_tex_image_data(
             data
         },
 
-        (TexFormat::RGBA, TexDataType::HalfFloat) |
-        (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
+        (TexFormat::RGBA, TexDataType::HalfFloat)
+        | (TexFormat::RGBA16f, TexDataType::HalfFloat) => {
             let mut rgbaf16 = Vec::<u8>::with_capacity(pixel_count * 8);
             for rgba8 in pixels.chunks(4) {
                 rgbaf16
@@ -3083,8 +3511,8 @@ fn image_to_tex_image_data(
             }
             rgbf16
         },
-        (TexFormat::Alpha, TexDataType::HalfFloat) |
-        (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::Alpha, TexDataType::HalfFloat)
+        | (TexFormat::Alpha16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4 + 3] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3092,8 +3520,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::Luminance, TexDataType::HalfFloat) |
-        (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
+        (TexFormat::Luminance, TexDataType::HalfFloat)
+        | (TexFormat::Luminance16f, TexDataType::HalfFloat) => {
             for i in 0..pixel_count {
                 let p = f16::from_f32(pixels[i * 4] as f32).to_bits();
                 NativeEndian::write_u16(&mut pixels[i * 2..i * 2 + 2], p);
@@ -3101,8 +3529,8 @@ fn image_to_tex_image_data(
             pixels.truncate(pixel_count * 2);
             pixels
         },
-        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat) |
-        (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
+        (TexFormat::LuminanceAlpha, TexDataType::HalfFloat)
+        | (TexFormat::LuminanceAlpha16f, TexDataType::HalfFloat) => {
             for rgba8 in pixels.chunks_mut(4) {
                 let lum = f16::from_f32(rgba8[0] as f32).to_bits();
                 let a = f16::from_f32(rgba8[3] as f32).to_bits();
@@ -3146,10 +3574,10 @@ fn premultiply_inplace(format: TexFormat, data_type: TexDataType, pixels: &mut [
                 let a = extend_to_8_bits(pix & 0x0f);
                 NativeEndian::write_u16(
                     rgba,
-                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8) |
-                        (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4) |
-                        ((pixels::multiply_u8_color(b, a) & 0xf0) as u16) |
-                        ((a & 0x0f) as u16),
+                    (((pixels::multiply_u8_color(r, a) & 0xf0) as u16) << 8)
+                        | (((pixels::multiply_u8_color(g, a) & 0xf0) as u16) << 4)
+                        | ((pixels::multiply_u8_color(b, a) & 0xf0) as u16)
+                        | ((a & 0x0f) as u16),
                 );
             }
         },
@@ -3167,8 +3595,8 @@ fn flip_pixels_y(
     unpacking_alignment: usize,
     pixels: Vec<u8>,
 ) -> Vec<u8> {
-    let cpp = (data_type.element_size() * internal_format.components() /
-        data_type.components_per_element()) as usize;
+    let cpp = (data_type.element_size() * internal_format.components()
+        / data_type.components_per_element()) as usize;
 
     let stride = (width * cpp + unpacking_alignment - 1) & !(unpacking_alignment - 1);
 

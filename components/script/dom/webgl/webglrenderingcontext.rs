@@ -245,9 +245,14 @@ impl WebGLRenderingContext {
         };
 
         let (sender, receiver) = webgl_channel().unwrap();
+        let primary_painter_id = window.webview_id().into();
+        let target_painter_ids = window
+            .paint_api()
+            .webview_painter_targets_blocking(window.webview_id());
         webgl_chan
             .send(WebGLMsg::CreateContext(
-                window.webview_id().into(),
+                primary_painter_id,
+                target_painter_ids,
                 webgl_version,
                 size,
                 attrs,
@@ -447,6 +452,23 @@ impl WebGLRenderingContext {
             err,
             self.last_error.get()
         );
+
+        // Diagnostic: when built with the `webgl_backtrace` feature, log the JS call
+        // site that produced an InvalidEnum so the failing WebGL2 entry point can be
+        // identified.
+        #[cfg(feature = "webgl_backtrace")]
+        if matches!(
+            err,
+            WebGLError::InvalidEnum | WebGLError::InvalidOperation | WebGLError::InvalidValue
+        ) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static LOGGED: AtomicU32 = AtomicU32::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 6 {
+                if let Some(js) = capture_webgl_backtrace().js_backtrace {
+                    warn!("WebGL {:?} JS backtrace:\n{}", err, js);
+                }
+            }
+        }
 
         // If an error has been detected no further errors must be
         // recorded until `getError` has been called
@@ -4794,7 +4816,8 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
     ) -> ErrorResult {
         let validator = TexImage2DValidator::new(
             self, target, level, format, width, height, 0, format, data_type,
-        );
+        )
+        .for_sub_image();
         let TexImage2DValidatorResult {
             texture,
             target,
@@ -4893,7 +4916,8 @@ impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContex
             0,
             format,
             data_type,
-        );
+        )
+        .for_sub_image();
         let TexImage2DValidatorResult {
             texture,
             target,

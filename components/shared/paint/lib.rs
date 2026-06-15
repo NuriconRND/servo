@@ -27,7 +27,7 @@ pub mod largest_contentful_paint_candidate;
 pub mod rendering_context;
 pub mod viewport_description;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use bitflags::bitflags;
 use display_list::PaintDisplayListInfo;
@@ -49,6 +49,8 @@ use webrender_api::{
 
 use crate::largest_contentful_paint_candidate::LCPCandidate;
 use crate::viewport_description::ViewportDescription;
+
+pub static ANGLE_GL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Sends messages to `Paint`.
 #[derive(Clone)]
@@ -140,6 +142,8 @@ pub enum PaintMessage {
     /// Ask the renderer to generate a frame for the current set of display lists
     /// from the given `PainterId`s that have been sent to the renderer.
     GenerateFrame(Vec<PainterId>),
+    /// Query the paint targets currently registered for a logical `WebView`.
+    GetWebViewPainterTargets(WebViewId, GenericSender<Vec<PainterId>>),
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(WebViewId, GenericSender<ImageKey>),
@@ -395,6 +399,22 @@ impl CrossProcessPaintApi {
         if let Err(error) = self.0.send(PaintMessage::GenerateFrame(painter_ids)) {
             warn!("Error generating frame: {error}");
         }
+    }
+
+    /// Query registered paint targets for a logical `WebView`.
+    ///
+    /// Wall-all-tiles registers one target per tile; normal single-window
+    /// rendering falls back to the primary painter id derived from `webview_id`.
+    pub fn webview_painter_targets_blocking(&self, webview_id: WebViewId) -> Vec<PainterId> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        if self
+            .0
+            .send(PaintMessage::GetWebViewPainterTargets(webview_id, sender))
+            .is_err()
+        {
+            return vec![webview_id.into()];
+        }
+        receiver.recv().unwrap_or_else(|_| vec![webview_id.into()])
     }
 
     /// Create a new image key. Blocks until the key is available.
@@ -682,13 +702,13 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
-                let texture_id = match source {
-                    ExternalImageSource::NativeTexture(b) => b,
-                    _ => panic!("Wrong type"),
-                };
+                // A WebGL context may not have a presentable front buffer yet (its first
+                // frame has not completed, or rendering failed). In that case lock()
+                // returns ExternalImageSource::Invalid; pass it through so WebRender skips
+                // compositing this frame instead of panicking.
                 ExternalImage {
                     uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
-                    source: ExternalImageSource::NativeTexture(texture_id),
+                    source,
                 }
             },
             WebRenderImageHandlerType::Media => {

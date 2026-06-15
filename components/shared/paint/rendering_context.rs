@@ -19,11 +19,14 @@ use image::RgbaImage;
 use log::{debug, info, trace, warn};
 use raw_window_handle::{DisplayHandle, WindowHandle};
 pub use surfman::Error;
+// Re-exported so external-image consumers (e.g. the WebGPU GPU-direct present path) can hold
+// the `SurfaceTexture` returned by `create_texture_from_shared_handle` without depending on
+// surfman directly.
+pub use surfman::SurfaceTexture;
 use surfman::chains::{PreserveBuffer, SwapChain};
 use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
-    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceTexture,
-    SurfaceType,
+    GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceType,
 };
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
 use winapi::Interface;
@@ -82,6 +85,17 @@ pub trait RenderingContext {
     }
     /// Destroys the texture and returns the surface. Default to `None`.
     fn destroy_texture(&self, _surface_texture: SurfaceTexture) -> Option<Surface> {
+        None
+    }
+    /// Wrap an external DXGI shared-resource handle (e.g. a D3D12 texture the WebGPU thread
+    /// shares for GPU-direct present) as a GL texture on this context's device. Returns the
+    /// [`SurfaceTexture`] (keep alive while sampling), the GL texture name, and the size.
+    /// Default `None`; only the surfman/ANGLE (Windows) backend implements it.
+    fn create_texture_from_shared_handle(
+        &self,
+        _handle: u64,
+        _size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         None
     }
     /// The connection to the display server for WebGL. Default to `None`.
@@ -172,6 +186,52 @@ fn create_dxgi_adapter_by_index(gpu_index: usize) -> Result<Adapter, Error> {
 
         Ok(Adapter::from_dxgi_adapter(ComPtr::from_raw(dxgi_adapter)))
     }
+}
+
+/// Read the DXGI adapter LUID `(HighPart, LowPart)` for a wall-layout GPU index.
+///
+/// This is the same per-physical-GPU key the WebGPU fan-out reads from wgpu's DX12
+/// adapters (`adapter_as_hal -> GetDesc1().AdapterLuid`), so it lets the compositor map a
+/// painter (which selects its GPU by DXGI `EnumAdapters1` index) to the matching per-GPU
+/// WebGPU device. Returns `None` off Windows or if the adapter can't be queried.
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+#[expect(unsafe_code)]
+pub fn dxgi_luid_for_gpu_index(gpu_index: usize) -> Option<(i32, u32)> {
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    use winapi::shared::dxgi::{DXGI_ADAPTER_DESC1, IDXGIAdapter1};
+
+    let gpu_index = u32::try_from(gpu_index).ok()?;
+    unsafe {
+        let mut dxgi_factory: *mut IDXGIFactory1 = ptr::null_mut();
+        let result = dxgi::CreateDXGIFactory1(
+            &IDXGIFactory1::uuidof(),
+            &mut dxgi_factory as *mut *mut IDXGIFactory1 as *mut *mut c_void,
+        );
+        if !winerror::SUCCEEDED(result) || dxgi_factory.is_null() {
+            return None;
+        }
+        let dxgi_factory = ComPtr::from_raw(dxgi_factory);
+
+        let mut adapter1: *mut IDXGIAdapter1 = ptr::null_mut();
+        let result = (*dxgi_factory).EnumAdapters1(gpu_index, &mut adapter1);
+        if !winerror::SUCCEEDED(result) || adapter1.is_null() {
+            return None;
+        }
+        let adapter1 = ComPtr::from_raw(adapter1);
+
+        let mut desc: DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+        if !winerror::SUCCEEDED((*adapter1).GetDesc1(&mut desc)) {
+            return None;
+        }
+        Some((desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart))
+    }
+}
+
+#[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+pub fn dxgi_luid_for_gpu_index(_gpu_index: usize) -> Option<(i32, u32)> {
+    None
 }
 
 /// A rendering context that uses the Surfman library to create and manage
@@ -386,6 +446,37 @@ impl SurfmanRenderingContext {
             .destroy_surface_texture(context, surface_texture)
             .map_err(|(error, _)| error)
             .ok()
+    }
+
+    fn create_texture_from_shared_handle(
+        &self,
+        handle: u64,
+        size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &mut self.context.borrow_mut();
+            let handle = handle as winapi::shared::ntdef::HANDLE;
+            let surface_texture =
+                match device.create_surface_texture_from_shared_handle(context, &size, handle) {
+                    Ok(surface_texture) => surface_texture,
+                    Err(error) => {
+                        warn!("GPU-direct: importing shared handle as texture failed: {error:?}");
+                        return None;
+                    },
+                };
+            let gl_texture = device
+                .surface_texture_object(&surface_texture)
+                .map(|tex| tex.0.get())
+                .unwrap_or(0);
+            Some((surface_texture, gl_texture, size))
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = (handle, size);
+            None
+        }
     }
 
     fn connection(&self) -> Option<Connection> {

@@ -198,11 +198,13 @@ impl Painter {
         }
         debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
 
+        let painter_id = PainterId::next();
         let id_manager = paint.webrender_external_image_id_manager();
         let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));
 
         // Set WebRender external image handler for WebGL textures.
         let image_handler = Box::new(WebGLExternalImages::new(
+            painter_id,
             paint.webgl_threads(),
             rendering_context.clone(),
             paint.swap_chains.clone(),
@@ -210,9 +212,19 @@ impl Painter {
         ));
         external_image_handlers.set_handler(image_handler, WebRenderImageHandlerType::WebGl);
 
+        // GPU-direct present: this painter's GPU LUID, so its WebGPU external-image handler
+        // samples the shared texture from its own GPU.
+        #[cfg(feature = "webgpu")]
+        let webgpu_painter_luid = rendering_context
+            .requested_gpu_index()
+            .and_then(paint_api::rendering_context::dxgi_luid_for_gpu_index);
         #[cfg(feature = "webgpu")]
         external_image_handlers.set_handler(
-            Box::new(webgpu::WebGpuExternalImages::new(paint.webgpu_image_map())),
+            Box::new(webgpu::WebGpuExternalImages::new(
+                paint.webgpu_image_map(),
+                rendering_context.clone(),
+                webgpu_painter_luid,
+            )),
             WebRenderImageHandlerType::WebGpu,
         );
 
@@ -257,7 +269,6 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
-        let painter_id = PainterId::next();
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
@@ -390,6 +401,27 @@ impl Painter {
         self.webview_renderers.get(&webview_id)
     }
 
+    /// Whether the visible tile this painter actually renders (its rendering-context-sized
+    /// slice of the virtual WebView viewport, at the renderer's `viewport_origin`) contains
+    /// `point`. Used to route positional input to the correct tile painter on the multi-GPU
+    /// wall. Note the renderer's `rect` is the *virtual* viewport (shared by all tiles), so we
+    /// must test against the rendering-context size, not `rect`.
+    pub(crate) fn rendered_tile_contains_input_point(
+        &self,
+        webview_id: WebViewId,
+        point: WebViewPoint,
+    ) -> bool {
+        self.webview_renderer(webview_id).is_some_and(|renderer| {
+            let device_point = point.as_device_point(renderer.device_pixels_per_page_pixel());
+            let render_point = renderer.render_point_from_viewport_point(device_point);
+            let size = self.rendering_context.size2d();
+            render_point.x >= 0.0 &&
+                render_point.y >= 0.0 &&
+                render_point.x < size.width as f32 &&
+                render_point.y < size.height as f32
+        })
+    }
+
     pub(crate) fn webview_renderer_mut(
         &mut self,
         webview_id: WebViewId,
@@ -483,31 +515,35 @@ impl Painter {
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
-        if let Err(error) = self.rendering_context.make_current() {
-            error!("Failed to make the rendering context current: {error:?}");
-        }
-        self.assert_no_gl_error();
+        {
+            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
-        self.rendering_context.prepare_for_rendering();
-
-        time_profile!(
-            ProfilerCategory::Painting,
-            None,
-            time_profiler_channel.clone(),
-            || {
-                if let Some(renderer) = self.webrender_renderer.as_mut() {
-                    renderer.update();
-                }
-
-                // Paint the scene.
-                // TODO(gw): Take notice of any errors the renderer returns!
-                self.clear_background();
-                if let Some(renderer) = self.webrender_renderer.as_mut() {
-                    let size = self.rendering_context.size2d().to_i32();
-                    renderer.render(size, 0 /* buffer_age */).ok();
-                }
+            if let Err(error) = self.rendering_context.make_current() {
+                error!("Failed to make the rendering context current: {error:?}");
             }
-        );
+            self.assert_no_gl_error();
+
+            self.rendering_context.prepare_for_rendering();
+
+            time_profile!(
+                ProfilerCategory::Painting,
+                None,
+                time_profiler_channel.clone(),
+                || {
+                    if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        renderer.update();
+                    }
+
+                    // Paint the scene.
+                    // TODO(gw): Take notice of any errors the renderer returns!
+                    self.clear_background();
+                    if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        let size = self.rendering_context.size2d().to_i32();
+                        renderer.render(size, 0 /* buffer_age */).ok();
+                    }
+                }
+            );
+        }
 
         // We've painted the default target, which means that from the embedder's perspective,
         // the scene no longer needs to be repainted.
@@ -769,6 +805,10 @@ impl Painter {
             pending_frames_before_request,
         );
         self.pending_frames.set(pending_frames_before_request + 1);
+    }
+
+    pub(crate) fn pending_frames(&self) -> usize {
+        self.pending_frames.get()
     }
 
     pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
@@ -1333,11 +1373,11 @@ impl Painter {
         &mut self,
         diagnostic_frame_id: u64,
         wall_requested_at: Instant,
-    ) {
+    ) -> bool {
         self.frame_delayer.set_pending_frame(true);
 
         if !self.frame_delayer.needs_new_frame() {
-            return;
+            return false;
         }
 
         let mut transaction = Transaction::new();
@@ -1359,7 +1399,8 @@ impl Painter {
 
         self.frame_delayer.set_pending_frame(false);
         self.screenshot_taker
-            .prepare_screenshot_requests_for_render(self)
+            .prepare_screenshot_requests_for_render(self);
+        true
     }
 
     fn serializable_image_data_to_image_data_maybe_caching(
@@ -1382,6 +1423,10 @@ impl Painter {
 
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
         let mut txn = Transaction::new();
+        // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
+        // frames). These are not paced by the script rendering-opportunity, so they otherwise wait
+        // for the next GenerateFrame (~48fps) before being composited.
+        let mut immediate_image_update = false;
         for update in updates {
             match update {
                 ImageUpdate::AddImage(key, description, data, is_animated_image) => {
@@ -1404,6 +1449,8 @@ impl Painter {
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
+                    } else {
+                        immediate_image_update = true;
                     }
                     txn.update_image(key, desc, data.into(), &DirtyRect::All)
                 },
@@ -1422,9 +1469,11 @@ impl Painter {
             }
         }
 
+        let mut generated_frame = false;
         if self.frame_delayer.needs_new_frame() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            generated_frame = true;
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
 
             self.send_to_constellation(
@@ -1435,6 +1484,17 @@ impl Painter {
 
             self.screenshot_taker
                 .prepare_screenshot_requests_for_render(&*self);
+        }
+
+        // Present content image updates (notably video frames) at their arrival rate by
+        // re-compositing the current scene now, instead of waiting for the script's
+        // rendering-opportunity GenerateFrame (which paces well below the video frame rate).
+        // generate_frame re-renders the full current display list, so all other DOM composites
+        // together with the updated image (z-order/clip preserved). Only when no frame is already
+        // in flight, so we don't stack composites or double up with the script's own GenerateFrame
+        // (which also increments pending_frames); this self-limits to roughly the present rate.
+        if immediate_image_update && !generated_frame && self.pending_frames.get() == 0 {
+            self.generate_frame(&mut txn, RenderReasons::SCENE);
         }
 
         self.send_transaction(txn);

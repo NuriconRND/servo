@@ -2292,6 +2292,15 @@ impl Document {
                 // Step 9.10. Set the Document's page showing to true.
                 document.page_showing.set(true);
 
+                // Servo addition: a freshly loaded, fully active document shown in a
+                // window is visible. The visibility state otherwise keeps its default
+                // "hidden" value for the whole session (only the document-reactivation
+                // path updates it), so document.hidden stays true and libraries that
+                // gate on the Page Visibility API (e.g. THREE.Timer) stop advancing.
+                if document.is_fully_active() {
+                    document.update_visibility_state(cx, DocumentVisibilityState::Visible);
+                }
+
                 // Step 9.11. Fire a page transition event named pageshow at window with false.
                 let page_show_event = PageTransitionEvent::new(
                     window,

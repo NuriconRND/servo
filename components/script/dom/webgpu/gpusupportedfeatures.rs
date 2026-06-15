@@ -58,9 +58,17 @@ impl GPUSupportedFeatures {
         if features.contains(Features::TEXTURE_COMPRESSION_ASTC) {
             set.insert(GPUFeatureName::Texture_compression_astc);
         }
+        // Timestamp queries are reported by wgpu, but Servo does not yet implement
+        // the asynchronous timestamp readback (query-set resolve + buffer mapping)
+        // that the WebGPU timestamp API depends on. Advertising the feature makes
+        // libraries such as three.js enable GPU timing and then stall on the first
+        // frame waiting for a readback that never completes, so keep it hidden until
+        // the resolve path is fully supported.
+        /*
         if features.contains(Features::TIMESTAMP_QUERY) {
             set.insert(GPUFeatureName::Timestamp_query);
         }
+        */
         if features.contains(Features::INDIRECT_FIRST_INSTANCE) {
             set.insert(GPUFeatureName::Indirect_first_instance);
         }

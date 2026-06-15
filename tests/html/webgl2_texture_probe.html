@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>webgl2 texture probe</title>
+<style>html,body{margin:0;height:100%;background:#222;color:#eee;font:14px monospace}
+#c{width:100%;height:60%;display:block;background:#000}#log{padding:8px;white-space:pre}</style></head>
+<body><canvas id="c"></canvas><div id="log"></div>
+<script>
+// WebGL2 텍스처 경로 진단: (A) texImage2D from data, (B) texStorage2D + texSubImage2D (three.js 경로)
+const cv=document.getElementById('c'); const out=document.getElementById('log');
+const gl=cv.getContext('webgl2'); let lines=[];
+function L(m){ lines.push(m); out.textContent=lines.join('\n'); try{console.log('[TEXPROBE] '+m)}catch(e){} }
+function glErr(tag){ let e,errs=[]; while((e=gl.getError())!==gl.NO_ERROR){ errs.push('0x'+e.toString(16)); } if(errs.length) L(tag+' GL_ERROR: '+errs.join(',')); return errs.length; }
+if(!gl){ L('NO webgl2'); throw 'no'; }
+L('webgl2 ok. ext EXT_color_buffer_float='+!!gl.getExtension('EXT_color_buffer_float'));
+function resize(){ cv.width=innerWidth; cv.height=Math.floor(innerHeight*0.6); gl.viewport(0,0,cv.width,cv.height); }
+addEventListener('resize',resize); resize();
+// 4x4 체커 텍스처 데이터
+const N=4, data=new Uint8Array(N*N*4);
+for(let i=0;i<N*N;i++){ const x=i%N,y=(i/N)|0,c=((x+y)&1)?255:40; data[i*4]=c; data[i*4+1]=(x*60)&255; data[i*4+2]=(y*60)&255; data[i*4+3]=255; }
+// (A) 전통 texImage2D
+const texA=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texA);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,N,N,0,gl.RGBA,gl.UNSIGNED_BYTE,data);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+L('(A) texImage2D RGBA8 errs='+glErr('A'));
+// (B) texStorage2D + texSubImage2D (three.js WebGLRenderer 기본 경로)
+const texB=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texB);
+gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA8,N,N); const eStor=glErr('B-texStorage2D(RGBA8)');
+gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.UNSIGNED_BYTE,data); const eSub=glErr('B-texSubImage2D');
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+L('(B) texStorage2D path errs: storage='+eStor+' sub='+eSub);
+// (C) sRGB8_ALPHA8 (three.js color textures 자주 사용)
+const texC=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texC);
+gl.texStorage2D(gl.TEXTURE_2D,1,gl.SRGB8_ALPHA8,N,N); const eC1=glErr('C-texStorage2D(SRGB8_ALPHA8)');
+gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,N,N,gl.RGBA,gl.UNSIGNED_BYTE,data); const eC2=glErr('C-texSubImage2D');
+L('(C) SRGB8_ALPHA8 path errs: storage='+eC1+' sub='+eC2);
+// (D) 이미지 소스(2D canvas) 업로드 — three.js GLTF 텍스처 경로
+const ic=document.createElement('canvas'); ic.width=64; ic.height=64; const ictx=ic.getContext('2d');
+ictx.fillStyle='#3080ff'; ictx.fillRect(0,0,64,64); ictx.fillStyle='#ff8020'; ictx.fillRect(0,0,32,32); ictx.fillStyle='#20ff60'; ictx.fillRect(32,32,32,32);
+const texD=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texD);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true); const eFlip=glErr('D-pixelStorei(FLIP_Y)');
+gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);
+gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL,gl.NONE); const eCsc=glErr('D-pixelStorei(COLORSPACE)');
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,ic); const eImg=glErr('D-texImage2D(canvas)');
+gl.generateMipmap(gl.TEXTURE_2D); const eMip=glErr('D-generateMipmap');
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+L('(D) canvas img path errs: flip='+eFlip+' csc='+eCsc+' img='+eImg+' mipmap='+eMip);
+// (E) texStorage2D + texSubImage2D(canvas) + sRGB (three.js WebGL2 map 텍스처)
+const texE=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texE);
+const levels=Math.floor(Math.log2(64))+1;
+gl.texStorage2D(gl.TEXTURE_2D,levels,gl.SRGB8_ALPHA8,64,64); const eE1=glErr('E-texStorage2D(SRGB8,mips)');
+gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,gl.RGBA,gl.UNSIGNED_BYTE,ic); const eE2=glErr('E-texSubImage2D(canvas)');
+gl.generateMipmap(gl.TEXTURE_2D); const eE3=glErr('E-generateMipmap');
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+L('(E) SRGB storage+canvas+mip errs: storage='+eE1+' sub='+eE2+' mip='+eE3);
+// 렌더: 어떤 텍스처를 그릴지(빌드 시 B 사용)
+const vs=`#version 300 es
+in vec2 p; out vec2 uv; void main(){ uv=p*0.5+0.5; gl_Position=vec4(p,0.,1.); }`;
+const fs=`#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; out vec4 o; void main(){ o=texture(t,uv); }`;
+function sh(t,s){ const o=gl.createShader(t); gl.shaderSource(o,s); gl.compileShader(o); if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))L('shErr '+gl.getShaderInfoLog(o)); return o; }
+const pr=gl.createProgram(); gl.attachShader(pr,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(pr); gl.useProgram(pr);
+const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const loc=gl.getAttribLocation(pr,'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+gl.uniform1i(gl.getUniformLocation(pr,'t'),0);
+function draw(tex,label){
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES,0,3); glErr('draw-'+label);
+  const px=new Uint8Array(4); gl.readPixels((cv.width/2)|0,(cv.height/2)|0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  L('draw '+label+' centerPixel=['+px[0]+','+px[1]+','+px[2]+','+px[3]+']  (0,0,0 이면 텍스처 미표시)');
+}
+let f=0,which=[['A',texA],['B',texB],['C',texC],['D',texD],['E',texE]],idx=0;
+function frame(){ f++; const [lab,tx]=which[idx]; draw(tx,lab); if(f%90===0){ idx=(idx+1)%which.length; } requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+</script></body></html>

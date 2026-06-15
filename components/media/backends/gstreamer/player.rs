@@ -3,11 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
+use std::env;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Once};
-use std::time;
+use std::time::{self, Instant};
 
 use byte_slice_cast::AsSliceOf;
 use glib;
@@ -42,6 +43,254 @@ const DEFAULT_VOLUME: f64 = 1.0;
 const DEFAULT_TIME_RANGES: Vec<Range<f64>> = vec![];
 
 const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
+const DISABLE_AUDIO_ENV: &str = "SERVO_GSTREAMER_DISABLE_AUDIO";
+const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF";
+const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
+const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
+
+#[derive(Default)]
+struct VideoSampleDiagnostics {
+    sample_count: u64,
+    summary_frame_count: u64,
+    summary_started_at: Option<Instant>,
+    last_sample_at: Option<Instant>,
+    last_pts: Option<gstreamer::ClockTime>,
+    late_pts_gaps_since_summary: u64,
+    late_wall_gaps_since_summary: u64,
+}
+
+fn clock_time_ms(clock_time: Option<gstreamer::ClockTime>) -> Option<f64> {
+    clock_time.map(|clock_time| clock_time.nseconds() as f64 / 1_000_000.0)
+}
+
+fn clock_delta_ms(
+    previous: Option<gstreamer::ClockTime>,
+    current: Option<gstreamer::ClockTime>,
+) -> Option<f64> {
+    match (previous, current) {
+        (Some(previous), Some(current)) => {
+            Some((current.nseconds() as i128 - previous.nseconds() as i128) as f64 / 1_000_000.0)
+        },
+        _ => None,
+    }
+}
+
+fn format_optional_ms(value: Option<f64>) -> String {
+    match value {
+        Some(value) => format!("{value:.3}"),
+        None => "None".to_owned(),
+    }
+}
+
+fn should_log_pipeline_element(factory_name: &str, klass: &str) -> bool {
+    let factory_name = factory_name.to_ascii_lowercase();
+    klass.contains("Decoder") ||
+        klass.contains("Converter") ||
+        klass.contains("Sink") ||
+        factory_name.contains("dec") ||
+        factory_name.contains("convert") ||
+        factory_name.contains("scale") ||
+        factory_name.contains("balance") ||
+        factory_name.contains("deinterlace") ||
+        factory_name.contains("appsink")
+}
+
+fn log_pipeline_element_added(element: &gstreamer::Element) {
+    let Some(factory) = element.factory() else {
+        return;
+    };
+    let factory_name = factory.name();
+    let klass = factory.metadata("klass").unwrap_or_default();
+
+    if !should_log_pipeline_element(&factory_name, &klass) {
+        return;
+    }
+
+    log::info!(
+        "GStreamer pipeline element added: element={} factory={} klass={} rank={}",
+        element.name(),
+        factory_name,
+        klass,
+        factory.rank(),
+    );
+}
+
+fn configure_playbin_flags(
+    pipeline: &gstreamer::Element,
+    prefer_native_video: bool,
+) -> Result<(), PlayerError> {
+    let flags = pipeline.property_value("flags");
+    let flags_class = glib::FlagsClass::with_type(flags.type_()).ok_or_else(|| {
+        PlayerError::Backend("FlagsClass creation failed".to_owned())
+    })?;
+    let mut flags_builder = flags_class.builder_with_value(flags).ok_or_else(|| {
+        PlayerError::Backend("FlagsClass creation failed".to_owned())
+    })?;
+
+    if !cfg!(any(target_os = "windows", target_os = "android")) {
+        flags_builder = flags_builder.set_by_nick("download");
+    }
+
+    if prefer_native_video {
+        flags_builder = flags_builder
+            .set_by_nick("native-video")
+            .unset_by_nick("deinterlace")
+            .unset_by_nick("soft-colorbalance")
+            .unset_by_nick("text");
+    }
+
+    let disable_audio = env_flag_enabled(DISABLE_AUDIO_ENV);
+    if disable_audio {
+        flags_builder = flags_builder
+            .unset_by_nick("audio")
+            .unset_by_nick("soft-volume");
+    }
+
+    let flags = flags_builder
+        .build()
+        .ok_or_else(|| PlayerError::Backend("FlagsClass creation failed".to_owned()))?;
+    pipeline.set_property_from_value("flags", &flags);
+
+    log::info!(
+        "GStreamer playbin flags configured: prefer_native_video={} \
+         download={} disabled_video_filters={} disable_audio={}",
+        prefer_native_video,
+        !cfg!(any(target_os = "windows", target_os = "android")),
+        prefer_native_video,
+        disable_audio,
+    );
+    Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        value == "1" ||
+            value.eq_ignore_ascii_case("true") ||
+            value.eq_ignore_ascii_case("yes") ||
+            value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn create_disabled_audio_sink() -> Result<gstreamer::Element, PlayerError> {
+    let audio_sink = gstreamer::ElementFactory::make("fakesink")
+        .build()
+        .map_err(|error| PlayerError::Backend(format!("fakesink creation failed: {error:?}")))?;
+    audio_sink.set_property("sync", false);
+    audio_sink.set_property("async", false);
+    Ok(audio_sink)
+}
+
+fn disable_pipeline_audio_sink(
+    pipeline: &gstreamer::Element,
+    reason: &str,
+) -> Result<(), PlayerError> {
+    let audio_sink = create_disabled_audio_sink()?;
+    pipeline.set_property("audio-sink", &audio_sink);
+    log::info!(
+        "GStreamer audio sink disabled: reason={} sink=fakesink sync=false async=false",
+        reason,
+    );
+    Ok(())
+}
+
+fn restore_pipeline_audio_sink(
+    pipeline: &gstreamer::Element,
+    reason: &str,
+) -> Result<(), PlayerError> {
+    let audio_sink = gstreamer::ElementFactory::make("autoaudiosink")
+        .build()
+        .map_err(|error| {
+            PlayerError::Backend(format!("autoaudiosink creation failed: {error:?}"))
+        })?;
+    pipeline.set_property("audio-sink", &audio_sink);
+    log::info!(
+        "GStreamer audio sink restored: reason={} sink=autoaudiosink",
+        reason,
+    );
+    Ok(())
+}
+
+impl VideoSampleDiagnostics {
+    fn note_sample(&mut self, sample: &gstreamer::Sample) {
+        let now = Instant::now();
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.summary_frame_count = self.summary_frame_count.saturating_add(1);
+        if self.summary_started_at.is_none() {
+            self.summary_started_at = Some(now);
+        }
+
+        let buffer = sample.buffer();
+        let pts = buffer.and_then(|buffer| buffer.pts());
+        let duration = buffer.and_then(|buffer| buffer.duration());
+        let pts_ms = clock_time_ms(pts);
+        let duration_ms = clock_time_ms(duration);
+        let pts_delta_ms = clock_delta_ms(self.last_pts, pts);
+        let wall_delta_ms = self.last_sample_at.map(|last_sample_at| {
+            now.saturating_duration_since(last_sample_at).as_secs_f64() * 1000.0
+        });
+        let pts_gap_ms = match (pts_delta_ms, duration_ms) {
+            (Some(pts_delta_ms), Some(duration_ms)) => Some(pts_delta_ms - duration_ms),
+            _ => None,
+        };
+        let late_pts_gap = pts_delta_ms.is_some_and(|delta| delta > VIDEO_SAMPLE_LATE_GAP_MS);
+        let late_wall_gap = wall_delta_ms.is_some_and(|delta| delta > VIDEO_SAMPLE_LATE_GAP_MS);
+
+        if late_pts_gap {
+            self.late_pts_gaps_since_summary = self.late_pts_gaps_since_summary.saturating_add(1);
+        }
+        if late_wall_gap {
+            self.late_wall_gaps_since_summary = self.late_wall_gaps_since_summary.saturating_add(1);
+        }
+
+        log::debug!(
+            "GStreamer video sample: sample_id={} pts_ms={} duration_ms={} \
+             pts_delta_ms={} wall_delta_ms={} pts_gap_ms={} late_pts_gap={} \
+             late_wall_gap={}",
+            self.sample_count,
+            format_optional_ms(pts_ms),
+            format_optional_ms(duration_ms),
+            format_optional_ms(pts_delta_ms),
+            format_optional_ms(wall_delta_ms),
+            format_optional_ms(pts_gap_ms),
+            late_pts_gap,
+            late_wall_gap,
+        );
+
+        if self.summary_frame_count >= VIDEO_SAMPLE_INFO_INTERVAL || late_pts_gap || late_wall_gap {
+            let summary_wall_elapsed_ms = self
+                .summary_started_at
+                .map(|summary_started_at| {
+                    now.saturating_duration_since(summary_started_at)
+                        .as_secs_f64()
+                        * 1000.0
+                })
+                .unwrap_or_default();
+            log::info!(
+                "GStreamer video sample summary: sample_id={} frames_since_summary={} \
+                 summary_wall_elapsed_ms={:.3} pts_ms={} duration_ms={} \
+                 pts_delta_ms={} wall_delta_ms={} pts_gap_ms={} late_pts_gaps={} \
+                 late_wall_gaps={}",
+                self.sample_count,
+                self.summary_frame_count,
+                summary_wall_elapsed_ms,
+                format_optional_ms(pts_ms),
+                format_optional_ms(duration_ms),
+                format_optional_ms(pts_delta_ms),
+                format_optional_ms(wall_delta_ms),
+                format_optional_ms(pts_gap_ms),
+                self.late_pts_gaps_since_summary,
+                self.late_wall_gaps_since_summary,
+            );
+            self.summary_frame_count = 0;
+            self.summary_started_at = Some(now);
+            self.late_pts_gaps_since_summary = 0;
+            self.late_wall_gaps_since_summary = 0;
+        }
+
+        self.last_sample_at = Some(now);
+        self.last_pts = pts;
+    }
+}
 
 fn metadata_from_media_info(media_info: &gstreamer_play::PlayMediaInfo) -> Result<Metadata, ()> {
     let dur = media_info.duration();
@@ -134,6 +383,7 @@ struct PlayerInner {
     can_resume: Cell<bool>,
     playback_rate: Cell<f64>,
     muted: Cell<bool>,
+    custom_audio_renderer: bool,
     volume: Cell<f64>,
     stream_type: StreamType,
     last_metadata: Option<Metadata>,
@@ -171,6 +421,21 @@ impl PlayerInner {
 
         self.muted.set(muted);
         self.player.set_mute(muted);
+        let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
+        let audio_track_enabled = !muted && !env_audio_disabled;
+        self.player.set_audio_track_enabled(audio_track_enabled);
+        if !self.custom_audio_renderer {
+            if muted || env_audio_disabled {
+                disable_pipeline_audio_sink(&self.player.pipeline(), "muted")?;
+            } else {
+                restore_pipeline_audio_sink(&self.player.pipeline(), "unmuted")?;
+            }
+        }
+        log::info!(
+            "GStreamer mute state updated: muted={} audio_track_enabled={}",
+            muted,
+            audio_track_enabled,
+        );
         Ok(())
     }
 
@@ -262,9 +527,9 @@ impl PlayerInner {
         if self.stream_type != StreamType::Seekable {
             return Err(PlayerError::NonSeekableStream);
         }
-        if let Some(ref metadata) = self.last_metadata &&
-            let Some(ref duration) = metadata.duration &&
-            duration < &time::Duration::new(time as u64, 0)
+        if let Some(ref metadata) = self.last_metadata
+            && let Some(ref duration) = metadata.duration
+            && duration < &time::Duration::new(time as u64, 0)
         {
             gstreamer::warning!(self.cat, obj = &self.player, "Trying to seek out of range");
             return Err(PlayerError::SeekOutOfRange);
@@ -292,7 +557,9 @@ impl PlayerInner {
 
     pub fn push_data(&mut self, data: Vec<u8>) -> Result<(), PlayerError> {
         if let Some(PlayerSource::Seekable(ref mut source)) = self.source {
-            if self.enough_data.load(Ordering::Relaxed) {
+            if self.enough_data.load(Ordering::Relaxed) &&
+                !env_flag_enabled(DISABLE_ENOUGHDATA_BACKOFF_ENV)
+            {
                 return Err(PlayerError::EnoughData);
             }
             return source
@@ -327,14 +594,14 @@ impl PlayerInner {
                     start.unwrap()
                 } else {
                     gstreamer::format::Percent::from_percent(0)
-                } / gstreamer::format::Percent::MAX) as f64 *
-                    duration.as_secs_f64();
+                } / gstreamer::format::Percent::MAX) as f64
+                    * duration.as_secs_f64();
                 let end = (if let gstreamer::GenericFormattedValue::Percent(end) = end {
                     end.unwrap()
                 } else {
                     gstreamer::format::Percent::from_percent(0)
-                } / gstreamer::format::Percent::MAX) as f64 *
-                    duration.as_secs_f64();
+                } / gstreamer::format::Percent::MAX) as f64
+                    * duration.as_secs_f64();
                 buffered_ranges.push(Range { start, end });
             }
         }
@@ -344,9 +611,9 @@ impl PlayerInner {
 
     pub fn seekable(&self) -> Vec<Range<f64>> {
         // if the servosrc is seekable, we should return the duration of the media
-        if let Some(metadata) = self.last_metadata.as_ref() &&
-            metadata.is_seekable &&
-            let Some(duration) = metadata.duration
+        if let Some(metadata) = self.last_metadata.as_ref()
+            && metadata.is_seekable
+            && let Some(duration) = metadata.duration
         {
             return vec![Range {
                 start: 0.0,
@@ -535,36 +802,17 @@ impl GStreamerPlayer {
         let player = gstreamer_play::Play::default();
         let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
         let pipeline = player.pipeline();
+        pipeline.connect("deep-element-added", false, move |args| {
+            if let Ok(element) = args[2].get::<gstreamer::Element>() {
+                log_pipeline_element_added(&element);
+            }
+            None
+        });
 
-        // FIXME(#282): The progressive downloading breaks playback on Windows and Android.
-        if !cfg!(any(target_os = "windows", target_os = "android")) {
-            // Set player to perform progressive downloading. This will make the
-            // player store the downloaded media in a local temporary file for
-            // faster playback of already-downloaded chunks.
-            let flags = pipeline.property_value("flags");
-            let flags_class = match glib::FlagsClass::with_type(flags.type_()) {
-                Some(flags) => flags,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let flags_class = match flags_class.builder_with_value(flags) {
-                Some(class) => class,
-                None => {
-                    return Err(PlayerError::Backend(
-                        "FlagsClass creation failed".to_owned(),
-                    ));
-                },
-            };
-            let Some(flags) = flags_class.set_by_nick("download").build() else {
-                return Err(PlayerError::Backend(
-                    "FlagsClass creation failed".to_owned(),
-                ));
-            };
-            pipeline.set_property_from_value("flags", &flags);
-        }
+        let prefer_native_video = !self.render.lock().unwrap().is_gl() &&
+            !servo_config::opts::get().multiprocess &&
+            !servo_config::opts::get().force_ipc;
+        configure_playbin_flags(&pipeline, prefer_native_video)?;
 
         // Set max size for the player buffer.
         pipeline.set_property("buffer-size", MAX_BUFFER_SIZE);
@@ -626,6 +874,8 @@ impl GStreamerPlayer {
                     })
                     .build(),
             );
+        } else if env_flag_enabled(DISABLE_AUDIO_ENV) {
+            disable_pipeline_audio_sink(&pipeline, DISABLE_AUDIO_ENV)?;
         }
 
         let video_sink = self.render.lock().unwrap().setup_video_sink(&pipeline)?;
@@ -683,6 +933,7 @@ impl GStreamerPlayer {
             can_resume: Cell::new(DEFAULT_CAN_RESUME),
             playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
             muted: Cell::new(DEFAULT_MUTED),
+            custom_audio_renderer: self.audio_renderer.is_some(),
             volume: Cell::new(DEFAULT_VOLUME),
             stream_type: self.stream_type,
             last_metadata: None,
@@ -768,6 +1019,14 @@ impl GStreamerPlayer {
             }
 
             inner.last_metadata = Some(metadata.clone());
+            let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
+            let audio_track_enabled = !inner.muted.get() && !env_audio_disabled;
+            inner.player.set_audio_track_enabled(audio_track_enabled);
+            if !inner.custom_audio_renderer {
+                if inner.muted.get() || env_audio_disabled {
+                    let _ = disable_pipeline_audio_sink(&inner.player.pipeline(), "muted");
+                }
+            }
             gstreamer::info!(
                 inner.cat,
                 obj = &inner.player,
@@ -793,8 +1052,8 @@ impl GStreamerPlayer {
             });
 
             let mut inner = inner_clone.lock().unwrap();
-            if let Some(ref mut metadata) = inner.last_metadata &&
-                metadata.duration != duration
+            if let Some(ref mut metadata) = inner.last_metadata
+                && metadata.duration != duration
             {
                 metadata.duration = duration;
                 gstreamer::info!(
@@ -808,14 +1067,18 @@ impl GStreamerPlayer {
         });
 
         if let Some(video_renderer) = self.video_renderer.clone() {
+            let sample_diagnostics = Arc::new(Mutex::new(VideoSampleDiagnostics::default()));
             // Creates a closure that renders a frame using the video_renderer
             // Used in the preroll and sample callbacks
             let render_sample = {
                 let render = self.render.clone();
                 let observer = self.observer.clone();
+                let sample_diagnostics = sample_diagnostics.clone();
                 let weak_video_renderer = Arc::downgrade(&video_renderer);
 
                 move |sample: gstreamer::Sample| {
+                    sample_diagnostics.lock().unwrap().note_sample(&sample);
+
                     let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
                         return Err(gstreamer::FlowError::Error);
                     };

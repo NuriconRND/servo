@@ -239,7 +239,16 @@ impl WebGLRenderbuffer {
                     constants::RGB8
                 }
             },
-            EXTColorBufferHalfFloatConstants::RGBA16F_EXT |
+            // RGBA16F (== RGBA16F_EXT) is color-renderable via EXT_color_buffer_half_float
+            // or the WebGL2 EXT_color_buffer_float extension.
+            EXTColorBufferHalfFloatConstants::RGBA16F_EXT => {
+                if !context.extension_manager().is_half_float_buffer_renderable() &&
+                    !context.extension_manager().is_color_buffer_float_renderable()
+                {
+                    return Err(WebGLError::InvalidEnum);
+                }
+                internal_format
+            },
             EXTColorBufferHalfFloatConstants::RGB16F_EXT => {
                 if !context
                     .extension_manager()
@@ -249,8 +258,23 @@ impl WebGLRenderbuffer {
                 }
                 internal_format
             },
+            // RGBA32F (== RGBA32F_EXT) is color-renderable via WEBGL_color_buffer_float
+            // or the WebGL2 EXT_color_buffer_float extension.
             WEBGLColorBufferFloatConstants::RGBA32F_EXT => {
-                if !context.extension_manager().is_float_buffer_renderable() {
+                if !context.extension_manager().is_float_buffer_renderable() &&
+                    !context.extension_manager().is_color_buffer_float_renderable()
+                {
+                    return Err(WebGLError::InvalidEnum);
+                }
+                internal_format
+            },
+            // Remaining float formats made color-renderable by WebGL2 EXT_color_buffer_float.
+            constants::R16F |
+            constants::RG16F |
+            constants::R32F |
+            constants::RG32F |
+            constants::R11F_G11F_B10F => {
+                if !context.extension_manager().is_color_buffer_float_renderable() {
                     return Err(WebGLError::InvalidEnum);
                 }
                 internal_format

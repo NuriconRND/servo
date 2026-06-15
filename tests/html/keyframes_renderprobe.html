@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>keyframes render probe</title>
+<style>body{margin:0;background:#202428}</style>
+<script type="importmap">{ "imports": {
+  "three": "https://threejs.org/build/three.module.js",
+  "three/addons/": "https://threejs.org/examples/jsm/"
+}}</script>
+</head><body>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+function E(m){ try{console.error('[RENDERPROBE] '+m)}catch(e){} }
+
+const W=960, H=600;
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(W, H);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x335577);   // 청회색 배경(모델 식별용)
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 3.0));
+const dir = new THREE.DirectionalLight(0xffffff, 2.5); dir.position.set(5,10,7); scene.add(dir);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const camera = new THREE.PerspectiveCamera(40, W/H, 1, 100);
+camera.position.set(5, 2, 8); camera.lookAt(0, 0.7, 0);
+
+const gl = renderer.getContext();
+const draco = new DRACOLoader(); draco.setDecoderPath('https://threejs.org/examples/jsm/libs/draco/gltf/');
+const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
+let mixer = null, model = null;
+loader.load('https://threejs.org/examples/models/gltf/LittlestTokyo.glb', (gltf) => {
+  model = gltf.scene; model.position.set(1,1,0); model.scale.set(0.01,0.01,0.01);
+  scene.add(model);
+  let nm=0; model.traverse(o=>{ if(o.isMesh) nm++; });
+  mixer = new THREE.AnimationMixer(model); mixer.clipAction(gltf.animations[0]).play();
+  E('model loaded; meshes='+nm);
+  // rAF가 비포커스로 스로틀되므로 프레임 카운트 대신 벽시계로 리포트(로드 후 8초).
+  setTimeout(()=>{ try{ report(); }catch(e){ E('REPORT ERROR: '+(e&&e.message||e)); } }, 8000);
+}, undefined, (e)=> E('LOAD ERROR: '+(e&&e.message||e)));
+
+function lumaGrid(gx, gy){
+  const px = new Uint8Array(4);
+  let rows=[];
+  for(let j=0;j<gy;j++){ let row='';
+    for(let i=0;i<gx;i++){
+      const x=Math.floor((i+0.5)*W/gx), y=Math.floor((j+0.5)*H/gy);
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      const l=(px[0]*0.3+px[1]*0.59+px[2]*0.11);
+      row += l<8?' ':l<32?'.':l<80?':':l<160?'o':'#';
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+function maxColor(){
+  // 화면 전체에서 최대 채널값 샘플(모델이 조금이라도 밝게 그려지는지)
+  const px = new Uint8Array(4); let mr=0,mg=0,mb=0, samples=0, lit=0;
+  for(let y=20;y<H-20;y+=24) for(let x=20;x<W-20;x+=24){
+    gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px); samples++;
+    if(px[0]>mr)mr=px[0]; if(px[1]>mg)mg=px[1]; if(px[2]>mb)mb=px[2];
+    // 배경(0x335577≈[51,85,119])과 다른 픽셀 = 모델로 추정
+    if(Math.abs(px[0]-51)+Math.abs(px[1]-85)+Math.abs(px[2]-119) > 40) lit++;
+  }
+  return `maxRGB=[${mr},${mg},${mb}] nonBgPixels=${lit}/${samples}`;
+}
+
+function report(){
+  // 신선한 프레임 보장
+  if (mixer) mixer.update(clock.getDelta());
+  renderer.render(scene, camera);
+  const gx=32, gy=16;
+  const px = new Uint8Array(4);
+  let rows=[], mr=0,mg=0,mb=0, nonBg=0, total=0;
+  for(let j=0;j<gy;j++){ let row='';
+    for(let i=0;i<gx;i++){
+      const x=Math.floor((i+0.5)*W/gx), y=Math.floor((j+0.5)*H/gy);
+      gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      if(px[0]>mr)mr=px[0]; if(px[1]>mg)mg=px[1]; if(px[2]>mb)mb=px[2];
+      total++;
+      if(Math.abs(px[0]-51)+Math.abs(px[1]-85)+Math.abs(px[2]-119) > 40) nonBg++;
+      const l=(px[0]*0.3+px[1]*0.59+px[2]*0.11);
+      row += l<8?' ':l<32?'.':l<80?':':l<160?'o':'#';
+    }
+    rows.push(row);
+  }
+  E(`maxRGB=[${mr},${mg},${mb}] nonBgPixels=${nonBg}/${total}`);
+  rows.forEach(r=>E('|'+r+'|'));
+  gl.readPixels((W/2)|0,(H/2)|0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  E(`centerPixel=[${px[0]},${px[1]},${px[2]},${px[3]}]`);
+}
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  if (mixer) mixer.update(clock.getDelta());
+  renderer.render(scene, camera);
+}
+animate();
+</script></body></html>

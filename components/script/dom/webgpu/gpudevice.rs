@@ -31,9 +31,9 @@ use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
     GPUAdapterMethods, GPUBindGroupDescriptor, GPUBindGroupLayoutDescriptor, GPUBufferDescriptor,
     GPUCommandEncoderDescriptor, GPUComputePipelineDescriptor, GPUDeviceLostReason,
     GPUDeviceMethods, GPUErrorFilter, GPUPipelineErrorReason, GPUPipelineLayoutDescriptor,
-    GPURenderBundleEncoderDescriptor, GPURenderPipelineDescriptor, GPUSamplerDescriptor,
-    GPUShaderModuleDescriptor, GPUTextureDescriptor, GPUTextureFormat, GPUUncapturedErrorEventInit,
-    GPUVertexStepMode,
+    GPUQuerySetDescriptor, GPURenderBundleEncoderDescriptor, GPURenderPipelineDescriptor,
+    GPUSamplerDescriptor, GPUShaderModuleDescriptor, GPUTextureDescriptor, GPUTextureFormat,
+    GPUUncapturedErrorEventInit, GPUVertexStepMode,
 };
 use crate::dom::bindings::codegen::UnionTypes::GPUPipelineLayoutOrGPUAutoLayoutMode;
 use crate::dom::bindings::error::{Error, Fallible};
@@ -56,6 +56,7 @@ use crate::dom::webgpu::gpubuffer::GPUBuffer;
 use crate::dom::webgpu::gpucommandencoder::GPUCommandEncoder;
 use crate::dom::webgpu::gpucomputepipeline::GPUComputePipeline;
 use crate::dom::webgpu::gpupipelinelayout::GPUPipelineLayout;
+use crate::dom::webgpu::gpuqueryset::GPUQuerySet;
 use crate::dom::webgpu::gpuqueue::GPUQueue;
 use crate::dom::webgpu::gpurenderbundleencoder::GPURenderBundleEncoder;
 use crate::dom::webgpu::gpurenderpipeline::GPURenderPipeline;
@@ -525,6 +526,11 @@ impl GPUDeviceMethods<crate::DomTypeHolder> for GPUDevice {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createsampler>
     fn CreateSampler(&self, descriptor: &GPUSamplerDescriptor) -> DomRoot<GPUSampler> {
         GPUSampler::create(self, descriptor, CanGc::deprecated_note())
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createqueryset>
+    fn CreateQuerySet(&self, descriptor: &GPUQuerySetDescriptor) -> DomRoot<GPUQuerySet> {
+        GPUQuerySet::create(self, descriptor, CanGc::deprecated_note())
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-createrenderpipeline>

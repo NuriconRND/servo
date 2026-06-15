@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
@@ -33,7 +34,7 @@ use profile_traits::path;
 use profile_traits::time::{self as profile_time};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, RoutedReceiver};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
-use servo_canvas_traits::webgl::{WebGLContextId, WebGLThreads};
+use servo_canvas_traits::webgl::{WebGLSurfaceId, WebGLThreads};
 use servo_config::pref;
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use servo_geometry::DeviceIndependentPixel;
@@ -54,9 +55,16 @@ use crate::webview_renderer::UnknownWebView;
 
 const WALL_FRAME_BARRIER_DEADLINE: Duration = Duration::from_millis(16);
 const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
+const WALL_FRAME_PACING_ENV: &str = "SERVO_WALL_FRAME_PACING";
+const WALL_FRAME_MAX_PENDING_ENV: &str = "SERVO_WALL_FRAME_MAX_PENDING";
+const WALL_FRAME_MIN_INTERVAL_MS_ENV: &str = "SERVO_WALL_FRAME_MIN_INTERVAL_MS";
+const WALL_FRAME_PACING_INFO_INTERVAL: u64 = 120;
 const WALL_FRAME_DELAY_TARGET_INDEX_ENV: &str = "SERVO_WALL_FRAME_DELAY_TARGET_INDEX";
 const WALL_FRAME_DELAY_AFTER_ENV: &str = "SERVO_WALL_FRAME_DELAY_AFTER";
 const WALL_FRAME_DELAY_COUNT_ENV: &str = "SERVO_WALL_FRAME_DELAY_COUNT";
+const WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL: u64 = 120;
+
+static WALL_MEDIA_IMAGE_FANOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// An option to control what kind of WebRender debugging is enabled while Servo is running.
 #[derive(Copy, Clone)]
@@ -105,6 +113,25 @@ pub struct Paint {
     /// Software barrier diagnostics for wall frames that fan out to multiple paint targets.
     wall_frame_coordinator: RefCell<WallFrameCoordinator>,
 
+    /// Wall frame pacing policy used to avoid stacking stale logical frames while a
+    /// previous wall frame is still pending in WebRender.
+    wall_frame_pacing_config: WallFramePacingConfig,
+
+    /// Latest coalesced wall frame request per logical `WebView`.
+    coalesced_wall_frame_requests: RefCell<HashMap<WebViewId, CoalescedWallFrameRequest>>,
+
+    /// Last issued wall frame request per logical `WebView`, used to cap wall frame pacing.
+    last_wall_frame_issue_at: RefCell<HashMap<WebViewId, Instant>>,
+
+    /// Next scheduled wake for releasing a wall frame held only by the minimum pacing interval.
+    wall_frame_pacing_next_wake_at: Cell<Option<Instant>>,
+
+    /// Total wall frame requests coalesced by the latest-first pacer.
+    wall_frame_pacing_coalesced_count: Cell<u64>,
+
+    /// Total wall frame requests released by the latest-first pacer.
+    wall_frame_pacing_released_count: Cell<u64>,
+
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
     pub(crate) paint_proxy: PaintProxy,
@@ -139,7 +166,7 @@ pub struct Paint {
     webgl_threads: WebGLThreads,
 
     /// The shared [`SwapChains`] used by [`WebGLThreads`] for this renderer.
-    pub(crate) swap_chains: SwapChains<WebGLContextId, Device>,
+    pub(crate) swap_chains: SwapChains<WebGLSurfaceId, Device>,
 
     /// The channel on which messages can be sent to the time profiler.
     time_profiler_chan: profile_time::ProfilerChan,
@@ -160,8 +187,40 @@ pub struct Paint {
 #[derive(Default)]
 struct WallFrameCoordinator {
     barriers: HashMap<u64, WallFrameBarrier>,
+    active_webview_frames: HashMap<WebViewId, u64>,
     keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
     delay_injection: Option<WallFrameDelayInjection>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WallFramePacingMode {
+    Latest,
+    Legacy,
+}
+
+#[derive(Clone, Copy)]
+struct WallFramePacingConfig {
+    mode: WallFramePacingMode,
+    max_pending: usize,
+    min_interval: Duration,
+}
+
+#[derive(Clone)]
+struct WallFrameRequest {
+    target_painter_ids: Vec<PainterId>,
+    wall_webview_targets: Vec<(WebViewId, Vec<PainterId>)>,
+}
+
+struct CoalescedWallFrameRequest {
+    request: WallFrameRequest,
+    coalesced_count: u64,
+    max_pending_seen: usize,
+}
+
+enum WallFramePacingBlockReason {
+    Active(WebViewId),
+    Pending(usize),
+    TooSoon(WebViewId, f64),
 }
 
 struct KeepPreviousFrame {
@@ -176,6 +235,7 @@ struct WallFrameDelayInjection {
 }
 
 struct WallFrameBarrier {
+    webview_ids: Vec<WebViewId>,
     expected_painter_ids: Vec<PainterId>,
     ready_painter_ids: Vec<PainterId>,
     requested_at: Instant,
@@ -193,13 +253,118 @@ struct WallFrameRepaintDecision {
     repaint_needed: bool,
 }
 
+#[derive(Default)]
+struct WallFrameCoordinatorUpdate {
+    repaint_decisions: Vec<WallFrameRepaintDecision>,
+    released_webview_ids: Vec<WebViewId>,
+}
+
+impl WallFramePacingConfig {
+    fn from_environment() -> Self {
+        let mode = match env::var(WALL_FRAME_PACING_ENV) {
+            Ok(value) if value.eq_ignore_ascii_case("legacy") => WallFramePacingMode::Legacy,
+            Ok(value)
+                if value.eq_ignore_ascii_case("latest")
+                    || value.eq_ignore_ascii_case("latest-first") =>
+            {
+                WallFramePacingMode::Latest
+            },
+            Ok(value) => {
+                warn!(
+                    "Ignoring invalid {WALL_FRAME_PACING_ENV}={value:?}; \
+                     expected latest or legacy"
+                );
+                WallFramePacingMode::Latest
+            },
+            Err(_) => WallFramePacingMode::Latest,
+        };
+
+        let max_pending = match env::var(WALL_FRAME_MAX_PENDING_ENV) {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) => {
+                    warn!("Ignoring {WALL_FRAME_MAX_PENDING_ENV}=0; using default 1");
+                    1
+                },
+                Err(error) => {
+                    warn!(
+                        "Ignoring invalid {WALL_FRAME_MAX_PENDING_ENV}={value:?}: \
+                         expected positive integer ({error})"
+                    );
+                    1
+                },
+            },
+            Err(_) => 1,
+        };
+
+        let min_interval = match env::var(WALL_FRAME_MIN_INTERVAL_MS_ENV) {
+            Ok(value) => match value.parse::<f64>() {
+                Ok(value) if value > 0.0 => Duration::from_secs_f64(value / 1000.0),
+                Ok(_) => {
+                    warn!("Ignoring {WALL_FRAME_MIN_INTERVAL_MS_ENV}=0; using default 16");
+                    Duration::from_millis(16)
+                },
+                Err(error) => {
+                    warn!(
+                        "Ignoring invalid {WALL_FRAME_MIN_INTERVAL_MS_ENV}={value:?}: \
+                         expected positive milliseconds ({error})"
+                    );
+                    Duration::from_millis(16)
+                },
+            },
+            Err(_) => Duration::from_millis(16),
+        };
+
+        Self {
+            mode,
+            max_pending,
+            min_interval,
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.mode == WallFramePacingMode::Latest
+    }
+}
+
+impl WallFrameRequest {
+    fn wall_webview_ids(&self) -> Vec<WebViewId> {
+        let mut webview_ids = Vec::new();
+        for (webview_id, _) in &self.wall_webview_targets {
+            if !webview_ids.contains(webview_id) {
+                webview_ids.push(*webview_id);
+            }
+        }
+        webview_ids
+    }
+
+    fn pacing_key(&self) -> Option<WebViewId> {
+        self.wall_webview_targets
+            .first()
+            .map(|(webview_id, _)| *webview_id)
+    }
+}
+
+impl WallFrameCoordinatorUpdate {
+    fn extend(&mut self, other: Self) {
+        self.repaint_decisions.extend(other.repaint_decisions);
+        for webview_id in other.released_webview_ids {
+            if !self.released_webview_ids.contains(&webview_id) {
+                self.released_webview_ids.push(webview_id);
+            }
+        }
+    }
+}
+
 impl WallFrameBarrier {
     fn new(
+        webview_ids: Vec<WebViewId>,
         expected_painter_ids: Vec<PainterId>,
         requested_at: Instant,
         injected_delayed_painter_id: Option<PainterId>,
     ) -> Self {
         Self {
+            webview_ids,
             expected_painter_ids,
             ready_painter_ids: Vec::new(),
             requested_at,
@@ -316,6 +481,7 @@ impl WallFrameCoordinator {
     fn register_frame(
         &mut self,
         logical_frame_id: u64,
+        webview_ids: Vec<WebViewId>,
         expected_painter_ids: Vec<PainterId>,
         requested_at: Instant,
     ) {
@@ -339,6 +505,7 @@ impl WallFrameCoordinator {
             .insert(
                 logical_frame_id,
                 WallFrameBarrier::new(
+                    webview_ids.clone(),
                     expected_painter_ids.clone(),
                     requested_at,
                     injected_delayed_painter_id,
@@ -351,12 +518,46 @@ impl WallFrameCoordinator {
                  expected={expected_painter_ids:?}"
             );
         }
+
+        for webview_id in webview_ids {
+            self.active_webview_frames
+                .insert(webview_id, logical_frame_id);
+        }
+    }
+
+    fn webview_has_active_frame(&self, webview_id: WebViewId) -> bool {
+        self.active_webview_frames.contains_key(&webview_id)
+    }
+
+    fn remove_webview(&mut self, webview_id: WebViewId) {
+        self.active_webview_frames.remove(&webview_id);
+        self.barriers
+            .retain(|_, barrier| !barrier.webview_ids.contains(&webview_id));
+    }
+
+    fn release_active_webviews_for_barrier(
+        &mut self,
+        logical_frame_id: u64,
+        webview_ids: &[WebViewId],
+    ) -> Vec<WebViewId> {
+        let mut released_webview_ids = Vec::new();
+        for webview_id in webview_ids {
+            if self
+                .active_webview_frames
+                .get(webview_id)
+                .is_some_and(|active_logical_frame_id| *active_logical_frame_id == logical_frame_id)
+            {
+                self.active_webview_frames.remove(webview_id);
+                released_webview_ids.push(*webview_id);
+            }
+        }
+        released_webview_ids
     }
 
     fn note_frame_ready(
         &mut self,
         diagnostic: &FrameReadyDiagnostic,
-    ) -> Option<Vec<WallFrameRepaintDecision>> {
+    ) -> Option<WallFrameCoordinatorUpdate> {
         let Some(logical_frame_id) = diagnostic.wall_logical_frame_id else {
             return None;
         };
@@ -370,20 +571,20 @@ impl WallFrameCoordinator {
             return None;
         }
 
-        let mut repaint_decisions = Vec::new();
+        let mut update = WallFrameCoordinatorUpdate::default();
         let missed_before_recording_ready =
             self.barriers.get(&logical_frame_id).is_some_and(|barrier| {
                 !barrier.presentation_decision_made
                     && barrier.missed_deadline_at(diagnostic.ready_at)
             });
         if missed_before_recording_ready {
-            repaint_decisions.extend(self.miss_barrier(logical_frame_id, diagnostic.ready_at));
+            update.extend(self.miss_barrier(logical_frame_id, diagnostic.ready_at));
         }
 
         let mut complete_before_deadline = false;
         {
             let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
-                return Some(repaint_decisions);
+                return Some(update);
             };
 
             if !barrier
@@ -395,7 +596,7 @@ impl WallFrameCoordinator {
                      logical_frame_id={} painter={:?} expected={:?}",
                     logical_frame_id, diagnostic.painter_id, barrier.expected_painter_ids
                 );
-                return Some(repaint_decisions);
+                return Some(update);
             }
 
             if barrier.injected_delayed_painter_id == Some(diagnostic.painter_id)
@@ -408,7 +609,7 @@ impl WallFrameCoordinator {
                      policy=simulate-delayed-renderer",
                     logical_frame_id, diagnostic.painter_id, diagnostic.local_frame_id
                 );
-                return Some(repaint_decisions);
+                return Some(update);
             }
 
             if !barrier.ready_painter_ids.contains(&diagnostic.painter_id) {
@@ -473,26 +674,27 @@ impl WallFrameCoordinator {
         }
 
         if complete_before_deadline {
-            repaint_decisions.extend(self.complete_barrier(logical_frame_id, diagnostic));
+            update.extend(self.complete_barrier(logical_frame_id, diagnostic));
         }
 
-        Some(repaint_decisions)
+        Some(update)
     }
 
     fn complete_barrier(
         &mut self,
         logical_frame_id: u64,
         diagnostic: &FrameReadyDiagnostic,
-    ) -> Vec<WallFrameRepaintDecision> {
+    ) -> WallFrameCoordinatorUpdate {
         let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
-            return Vec::new();
+            return WallFrameCoordinatorUpdate::default();
         };
         if barrier.presentation_decision_made {
-            return Vec::new();
+            return WallFrameCoordinatorUpdate::default();
         }
 
         barrier.presentation_decision_made = true;
         barrier.completed_at = Some(diagnostic.ready_at);
+        let webview_ids = barrier.webview_ids.clone();
         let painter_ids = barrier.expected_painter_ids.clone();
         let repaint_needed = barrier.need_repaint;
         let ready_len = barrier.ready_painter_ids.len();
@@ -540,29 +742,31 @@ impl WallFrameCoordinator {
             repaint_needed,
         );
 
-        painter_ids
+        let repaint_decisions = painter_ids
             .into_iter()
             .map(|painter_id| WallFrameRepaintDecision {
                 painter_id,
                 repaint_needed,
             })
-            .collect()
+            .collect();
+        WallFrameCoordinatorUpdate {
+            repaint_decisions,
+            released_webview_ids: self
+                .release_active_webviews_for_barrier(logical_frame_id, &webview_ids),
+        }
     }
 
-    fn miss_barrier(
-        &mut self,
-        logical_frame_id: u64,
-        now: Instant,
-    ) -> Vec<WallFrameRepaintDecision> {
+    fn miss_barrier(&mut self, logical_frame_id: u64, now: Instant) -> WallFrameCoordinatorUpdate {
         let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
-            return Vec::new();
+            return WallFrameCoordinatorUpdate::default();
         };
         if barrier.presentation_decision_made {
-            return Vec::new();
+            return WallFrameCoordinatorUpdate::default();
         }
 
         barrier.missed_deadline = true;
         barrier.presentation_decision_made = true;
+        let webview_ids = barrier.webview_ids.clone();
         let ready_painter_ids = barrier.ready_painter_ids.clone();
         let missing_painter_ids = barrier.missing_painter_ids();
         let ready_len = barrier.ready_painter_ids.len();
@@ -609,16 +813,21 @@ impl WallFrameCoordinator {
             repaint_needed,
         );
 
-        ready_painter_ids
+        let repaint_decisions = ready_painter_ids
             .into_iter()
             .map(|painter_id| WallFrameRepaintDecision {
                 painter_id,
                 repaint_needed,
             })
-            .collect()
+            .collect();
+        WallFrameCoordinatorUpdate {
+            repaint_decisions,
+            released_webview_ids: self
+                .release_active_webviews_for_barrier(logical_frame_id, &webview_ids),
+        }
     }
 
-    fn sweep_expired_barriers(&mut self, now: Instant) -> Vec<WallFrameRepaintDecision> {
+    fn sweep_expired_barriers(&mut self, now: Instant) -> WallFrameCoordinatorUpdate {
         let expired_logical_frame_ids: Vec<_> = self
             .barriers
             .iter()
@@ -628,9 +837,9 @@ impl WallFrameCoordinator {
             })
             .collect();
 
-        let mut repaint_decisions = Vec::new();
+        let mut update = WallFrameCoordinatorUpdate::default();
         for logical_frame_id in expired_logical_frame_ids {
-            repaint_decisions.extend(self.miss_barrier(logical_frame_id, now));
+            update.extend(self.miss_barrier(logical_frame_id, now));
         }
 
         self.barriers.retain(|_, barrier| {
@@ -647,7 +856,7 @@ impl WallFrameCoordinator {
             true
         });
 
-        repaint_decisions
+        update
     }
 
     fn keep_previous_logical_frame(&mut self, painter_id: PainterId) -> Option<u64> {
@@ -746,6 +955,12 @@ impl Paint {
             webview_painter_targets: Default::default(),
             next_logical_frame_id: Default::default(),
             wall_frame_coordinator: RefCell::new(WallFrameCoordinator::from_environment()),
+            wall_frame_pacing_config: WallFramePacingConfig::from_environment(),
+            coalesced_wall_frame_requests: Default::default(),
+            last_wall_frame_issue_at: Default::default(),
+            wall_frame_pacing_next_wake_at: Default::default(),
+            wall_frame_pacing_coalesced_count: Default::default(),
+            wall_frame_pacing_released_count: Default::default(),
         }))
     }
 
@@ -997,6 +1212,329 @@ impl Paint {
         frame_id
     }
 
+    fn wall_frame_request_from_source_painters(
+        &self,
+        painter_ids: Vec<PainterId>,
+    ) -> WallFrameRequest {
+        let mut target_painter_ids = Vec::new();
+        let mut wall_webview_targets = Vec::new();
+        for painter_id in painter_ids {
+            let targets_for_source = self.target_painter_ids_for_source_painter(painter_id);
+            if targets_for_source.len() > 1 {
+                if let Some(webview_id) = self.source_webview_id_for_primary_painter(painter_id) {
+                    if !wall_webview_targets
+                        .iter()
+                        .any(|(existing_webview_id, _)| *existing_webview_id == webview_id)
+                    {
+                        wall_webview_targets.push((webview_id, targets_for_source.clone()));
+                    }
+                } else {
+                    warn!(
+                        "Could not resolve source WebViewId for wall frame source painter \
+                         {painter_id:?}; scroll metadata comparison skipped"
+                    );
+                }
+            }
+            for target_painter_id in targets_for_source {
+                if !target_painter_ids.contains(&target_painter_id) {
+                    target_painter_ids.push(target_painter_id);
+                }
+            }
+        }
+
+        WallFrameRequest {
+            target_painter_ids,
+            wall_webview_targets,
+        }
+    }
+
+    fn max_pending_frames_for_targets(&self, target_painter_ids: &[PainterId]) -> usize {
+        target_painter_ids
+            .iter()
+            .filter_map(|painter_id| {
+                self.maybe_painter(*painter_id)
+                    .map(|painter| painter.pending_frames())
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn wall_frame_request_pacing_block_reason(
+        &self,
+        request: &WallFrameRequest,
+    ) -> Option<WallFramePacingBlockReason> {
+        if !self.wall_frame_pacing_config.enabled()
+            || request.target_painter_ids.len() <= 1
+            || request.pacing_key().is_none()
+        {
+            return None;
+        }
+
+        {
+            let wall_frame_coordinator = self.wall_frame_coordinator.borrow();
+            for webview_id in request.wall_webview_ids() {
+                if wall_frame_coordinator.webview_has_active_frame(webview_id) {
+                    return Some(WallFramePacingBlockReason::Active(webview_id));
+                }
+            }
+        }
+
+        let pending_max = self.max_pending_frames_for_targets(&request.target_painter_ids);
+        if pending_max >= self.wall_frame_pacing_config.max_pending {
+            return Some(WallFramePacingBlockReason::Pending(pending_max));
+        }
+
+        let now = Instant::now();
+        let last_issue_at = self.last_wall_frame_issue_at.borrow();
+        for webview_id in request.wall_webview_ids() {
+            let Some(last_issue_at) = last_issue_at.get(&webview_id) else {
+                continue;
+            };
+            let elapsed = now.saturating_duration_since(*last_issue_at);
+            if elapsed < self.wall_frame_pacing_config.min_interval {
+                return Some(WallFramePacingBlockReason::TooSoon(
+                    webview_id,
+                    elapsed.as_secs_f64() * 1000.0,
+                ));
+            }
+        }
+
+        None
+    }
+
+    fn coalesce_wall_frame_request(
+        &self,
+        request: WallFrameRequest,
+        block_reason: WallFramePacingBlockReason,
+    ) {
+        let Some(webview_id) = request.pacing_key() else {
+            let _ = self.issue_wall_frame_request(request);
+            return;
+        };
+
+        let pending_max = match block_reason {
+            WallFramePacingBlockReason::Active(_) => {
+                self.max_pending_frames_for_targets(&request.target_painter_ids)
+            },
+            WallFramePacingBlockReason::Pending(pending_max) => pending_max,
+            WallFramePacingBlockReason::TooSoon(_, _) => {
+                self.max_pending_frames_for_targets(&request.target_painter_ids)
+            },
+        };
+        let reason = match block_reason {
+            WallFramePacingBlockReason::Active(active_webview_id) => {
+                format!("active_webview={active_webview_id:?}")
+            },
+            WallFramePacingBlockReason::Pending(pending_max) => {
+                format!("pending_max={pending_max}")
+            },
+            WallFramePacingBlockReason::TooSoon(webview_id, elapsed_ms) => {
+                let remaining = self
+                    .wall_frame_pacing_config
+                    .min_interval
+                    .saturating_sub(Duration::from_secs_f64(elapsed_ms / 1000.0));
+                self.schedule_wall_frame_pacing_wake(remaining);
+                format!("min_interval_webview={webview_id:?} elapsed_ms={elapsed_ms:.3}")
+            },
+        };
+
+        let total_coalesced = self.wall_frame_pacing_coalesced_count.get() + 1;
+        self.wall_frame_pacing_coalesced_count.set(total_coalesced);
+        let coalesced_for_webview = {
+            let mut coalesced_requests = self.coalesced_wall_frame_requests.borrow_mut();
+            let coalesced_request = coalesced_requests
+                .entry(webview_id)
+                .and_modify(|coalesced_request| {
+                    coalesced_request.request = request.clone();
+                    coalesced_request.coalesced_count += 1;
+                    coalesced_request.max_pending_seen =
+                        coalesced_request.max_pending_seen.max(pending_max);
+                })
+                .or_insert_with(|| CoalescedWallFrameRequest {
+                    request: request.clone(),
+                    coalesced_count: 1,
+                    max_pending_seen: pending_max,
+                });
+            coalesced_request.coalesced_count
+        };
+
+        debug!(
+            "Wall frame pacing coalesced: webview={:?} target_painters={:?} \
+             pending_max={} coalesced_for_webview={} total_coalesced={} reason={} \
+             policy=latest-first",
+            webview_id,
+            request.target_painter_ids,
+            pending_max,
+            coalesced_for_webview,
+            total_coalesced,
+            reason,
+        );
+        self.log_wall_frame_pacing_summary(
+            "coalesced",
+            webview_id,
+            &request,
+            pending_max,
+            coalesced_for_webview,
+            None,
+        );
+    }
+
+    fn schedule_wall_frame_pacing_wake(&self, delay: Duration) {
+        let wake_at = Instant::now() + delay;
+        if self
+            .wall_frame_pacing_next_wake_at
+            .get()
+            .is_some_and(|scheduled_wake_at| scheduled_wake_at <= wake_at)
+        {
+            return;
+        }
+
+        self.wall_frame_pacing_next_wake_at.set(Some(wake_at));
+        let event_loop_waker = self.event_loop_waker.clone_box();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            event_loop_waker.wake();
+        });
+    }
+
+    fn log_wall_frame_pacing_summary(
+        &self,
+        event: &str,
+        webview_id: WebViewId,
+        request: &WallFrameRequest,
+        pending_max: usize,
+        coalesced_for_webview: u64,
+        logical_frame_id: Option<u64>,
+    ) {
+        let total_coalesced = self.wall_frame_pacing_coalesced_count.get();
+        let total_released = self.wall_frame_pacing_released_count.get();
+        let event_total = match event {
+            "released" => total_released,
+            _ => total_coalesced,
+        };
+        if event_total > 3 && event_total % WALL_FRAME_PACING_INFO_INTERVAL != 0 {
+            return;
+        }
+
+        info!(
+            "Wall frame pacing summary: event={} webview={:?} logical_frame_id={:?} \
+             target_painters={:?} pending_max={} coalesced_for_webview={} \
+             total_coalesced={} total_released={} policy=latest-first",
+            event,
+            webview_id,
+            logical_frame_id,
+            request.target_painter_ids,
+            pending_max,
+            coalesced_for_webview,
+            total_coalesced,
+            total_released,
+        );
+    }
+
+    fn issue_wall_frame_request(&self, request: WallFrameRequest) -> Option<u64> {
+        let wall_frame_requested_at = Instant::now();
+        let logical_frame_id = self.next_logical_frame_id();
+        if request.target_painter_ids.len() > 1 {
+            info!(
+                "Wall logical frame {logical_frame_id} fan-out to paint targets \
+                 {:?}",
+                request.target_painter_ids
+            );
+            self.log_wall_frame_metadata(logical_frame_id, &request.wall_webview_targets);
+        } else {
+            debug!(
+                "Logical frame {logical_frame_id} routed to paint targets \
+                 {:?}",
+                request.target_painter_ids
+            );
+        }
+
+        let mut generated_painter_ids = Vec::new();
+        for painter_id in &request.target_painter_ids {
+            if let Some(mut painter) = self.maybe_painter_mut(*painter_id) {
+                if painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at) {
+                    generated_painter_ids.push(*painter_id);
+                }
+            }
+        }
+
+        if generated_painter_ids.len() > 1 {
+            let mut last_wall_frame_issue_at = self.last_wall_frame_issue_at.borrow_mut();
+            for webview_id in request.wall_webview_ids() {
+                last_wall_frame_issue_at.insert(webview_id, wall_frame_requested_at);
+            }
+            self.wall_frame_coordinator.borrow_mut().register_frame(
+                logical_frame_id,
+                request.wall_webview_ids(),
+                generated_painter_ids,
+                wall_frame_requested_at,
+            );
+        } else if request.target_painter_ids.len() > 1 {
+            debug!(
+                "Wall logical frame {logical_frame_id} barrier skipped: generated_targets={:?} \
+                 requested_targets={:?}",
+                generated_painter_ids, request.target_painter_ids
+            );
+        }
+
+        Some(logical_frame_id)
+    }
+
+    fn try_release_coalesced_wall_frame_requests(&self) {
+        if self
+            .wall_frame_pacing_next_wake_at
+            .get()
+            .is_some_and(|wake_at| Instant::now() >= wake_at)
+        {
+            self.wall_frame_pacing_next_wake_at.set(None);
+        }
+
+        loop {
+            let releasable_webview_id = {
+                let coalesced_requests = self.coalesced_wall_frame_requests.borrow();
+                coalesced_requests.iter().find_map(|(webview_id, request)| {
+                    self.wall_frame_request_pacing_block_reason(&request.request)
+                        .is_none()
+                        .then_some(*webview_id)
+                })
+            };
+            let Some(webview_id) = releasable_webview_id else {
+                return;
+            };
+
+            let Some(coalesced_request) = self
+                .coalesced_wall_frame_requests
+                .borrow_mut()
+                .remove(&webview_id)
+            else {
+                continue;
+            };
+
+            let total_released = self.wall_frame_pacing_released_count.get() + 1;
+            self.wall_frame_pacing_released_count.set(total_released);
+            let logical_frame_id = self.issue_wall_frame_request(coalesced_request.request.clone());
+            debug!(
+                "Wall frame pacing released: webview={:?} logical_frame_id={:?} \
+                 target_painters={:?} pending_max={} coalesced_for_webview={} \
+                 total_released={} policy=latest-first",
+                webview_id,
+                logical_frame_id,
+                coalesced_request.request.target_painter_ids,
+                coalesced_request.max_pending_seen,
+                coalesced_request.coalesced_count,
+                total_released,
+            );
+            self.log_wall_frame_pacing_summary(
+                "released",
+                webview_id,
+                &coalesced_request.request,
+                coalesced_request.max_pending_seen,
+                coalesced_request.coalesced_count,
+                logical_frame_id,
+            );
+        }
+    }
+
     pub fn painter_id(&self) -> PainterId {
         self.painters[0].borrow().painter_id
     }
@@ -1211,58 +1749,15 @@ impl Paint {
                 );
             },
             PaintMessage::GenerateFrame(painter_ids) => {
-                let mut target_painter_ids = Vec::new();
-                let mut wall_webview_targets = Vec::new();
-                for painter_id in painter_ids {
-                    let targets_for_source = self.target_painter_ids_for_source_painter(painter_id);
-                    if targets_for_source.len() > 1 {
-                        if let Some(webview_id) =
-                            self.source_webview_id_for_primary_painter(painter_id)
-                        {
-                            if !wall_webview_targets
-                                .iter()
-                                .any(|(existing_webview_id, _)| *existing_webview_id == webview_id)
-                            {
-                                wall_webview_targets.push((webview_id, targets_for_source.clone()));
-                            }
-                        } else {
-                            warn!(
-                                "Could not resolve source WebViewId for wall frame source painter \
-                                 {painter_id:?}; scroll metadata comparison skipped"
-                            );
-                        }
-                    }
-                    for target_painter_id in targets_for_source {
-                        if !target_painter_ids.contains(&target_painter_id) {
-                            target_painter_ids.push(target_painter_id);
-                        }
-                    }
-                }
-                let wall_frame_requested_at = Instant::now();
-                let logical_frame_id = self.next_logical_frame_id();
-                if target_painter_ids.len() > 1 {
-                    info!(
-                        "Wall logical frame {logical_frame_id} fan-out to paint targets \
-                         {target_painter_ids:?}"
-                    );
-                    self.log_wall_frame_metadata(logical_frame_id, &wall_webview_targets);
-                    self.wall_frame_coordinator.borrow_mut().register_frame(
-                        logical_frame_id,
-                        target_painter_ids.clone(),
-                        wall_frame_requested_at,
-                    );
+                let request = self.wall_frame_request_from_source_painters(painter_ids);
+                if let Some(block_reason) = self.wall_frame_request_pacing_block_reason(&request) {
+                    self.coalesce_wall_frame_request(request, block_reason);
                 } else {
-                    debug!(
-                        "Logical frame {logical_frame_id} routed to paint targets \
-                         {target_painter_ids:?}"
-                    );
+                    let _ = self.issue_wall_frame_request(request);
                 }
-                for painter_id in target_painter_ids {
-                    if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                        painter
-                            .generate_frame_for_script(logical_frame_id, wall_frame_requested_at);
-                    }
-                }
+            },
+            PaintMessage::GetWebViewPainterTargets(webview_id, sender) => {
+                let _ = sender.send(self.painter_targets_for_webview(webview_id));
             },
             PaintMessage::GenerateImageKey(webview_id, result_sender) => {
                 self.handle_generate_image_key(webview_id, result_sender);
@@ -1292,10 +1787,12 @@ impl Paint {
                             ImageUpdate::UpdateImageForAnimation(..) => animation_update_count += 1,
                         }
                     }
-                    info!(
+                    let fanout_id =
+                        WALL_MEDIA_IMAGE_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    debug!(
                         "Wall media image fanout: source_painter={:?} target_painters={:?} \
                          requested_gpus={:?} updates_total={} adds={} updates={} deletes={} \
-                         animation_updates={}",
+                         animation_updates={} fanout_id={}",
                         painter_id,
                         target_painter_ids,
                         requested_gpus,
@@ -1304,7 +1801,28 @@ impl Paint {
                         update_count,
                         delete_count,
                         animation_update_count,
+                        fanout_id,
                     );
+                    if add_count > 0
+                        || delete_count > 0
+                        || fanout_id <= 3
+                        || fanout_id % WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL == 0
+                    {
+                        info!(
+                            "Wall media image fanout summary: fanout_id={} source_painter={:?} \
+                             target_painters={:?} requested_gpus={:?} updates_total={} \
+                             adds={} updates={} deletes={} animation_updates={}",
+                            fanout_id,
+                            painter_id,
+                            target_painter_ids,
+                            requested_gpus,
+                            updates.len(),
+                            add_count,
+                            update_count,
+                            delete_count,
+                            animation_update_count,
+                        );
+                    }
                 }
                 for target_painter_id in target_painter_ids {
                     if let Some(mut painter) = self.maybe_painter_mut(target_painter_id) {
@@ -1408,6 +1926,15 @@ impl Paint {
     }
 
     pub fn remove_webview(&mut self, webview_id: WebViewId) {
+        self.coalesced_wall_frame_requests
+            .borrow_mut()
+            .remove(&webview_id);
+        self.last_wall_frame_issue_at
+            .borrow_mut()
+            .remove(&webview_id);
+        self.wall_frame_coordinator
+            .borrow_mut()
+            .remove_webview(webview_id);
         let painter_ids = self.remove_webview_painter_targets(webview_id);
 
         for painter_id in painter_ids {
@@ -1718,9 +2245,9 @@ impl Paint {
             let mut wall_frame_coordinator = self.wall_frame_coordinator.borrow_mut();
             for diagnostic in &frame_ready_diagnostics {
                 match wall_frame_coordinator.note_frame_ready(diagnostic) {
-                    Some(decisions) => Self::record_wall_frame_repaint_decisions(
+                    Some(update) => Self::record_wall_frame_repaint_decisions(
                         &mut frame_ready_for_painter,
-                        decisions,
+                        update.repaint_decisions,
                     ),
                     None => Self::record_painter_ready_for_repaint(
                         &mut frame_ready_for_painter,
@@ -1729,12 +2256,14 @@ impl Paint {
                     ),
                 }
             }
+            let update = wall_frame_coordinator.sweep_expired_barriers(Instant::now());
             Self::record_wall_frame_repaint_decisions(
                 &mut frame_ready_for_painter,
-                wall_frame_coordinator.sweep_expired_barriers(Instant::now()),
+                update.repaint_decisions,
             );
         }
 
+        self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
     }
 
@@ -1759,8 +2288,9 @@ impl Paint {
         let mut frame_ready_for_painter = HashMap::new();
         Self::record_wall_frame_repaint_decisions(
             &mut frame_ready_for_painter,
-            wall_frame_repaint_decisions,
+            wall_frame_repaint_decisions.repaint_decisions,
         );
+        self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
 
         self.shutdown_state() != ShutdownState::FinishedShuttingDown
@@ -1804,8 +2334,33 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return false;
         }
-        self.primary_painter_mut(webview_id)
+        // Route positional events (mouse/touch) to the painter whose tile viewport contains the
+        // point. On the multi-GPU wall a WebView is fanned out to one painter per tile, each with
+        // its own `viewport_origin`; without this all input went to the primary painter (tile 0),
+        // so points over a secondary tile missed that painter's hit-test region and were dropped.
+        let painter_id = event
+            .event
+            .point()
+            .and_then(|point| self.painter_id_containing_input_point(webview_id, point))
+            .unwrap_or_else(|| self.primary_painter_id_for_webview(webview_id));
+        self.painter_mut(painter_id)
             .notify_input_event(webview_id, event)
+    }
+
+    /// Finds the fanned-out painter whose tile viewport contains `point` (a positional input
+    /// point in the virtual WebView viewport). Returns `None` if no tile contains it.
+    fn painter_id_containing_input_point(
+        &self,
+        webview_id: WebViewId,
+        point: WebViewPoint,
+    ) -> Option<PainterId> {
+        self.painter_targets_for_webview(webview_id)
+            .into_iter()
+            .find(|&painter_id| {
+                self.maybe_painter(painter_id).is_some_and(|painter| {
+                    painter.rendered_tile_contains_input_point(webview_id, point)
+                })
+            })
     }
 
     pub fn notify_scroll_event(&self, webview_id: WebViewId, scroll: Scroll, point: WebViewPoint) {

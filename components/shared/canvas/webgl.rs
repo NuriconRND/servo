@@ -85,9 +85,9 @@ impl WebGLThreads {
 
     /// Inform the WebGLThreads that WebRender has finished rendering a particular WebGL context,
     /// and if it was marked for deletion, it can now be released.
-    pub fn finished_rendering_to_context(&self, context_id: WebGLContextId) -> WebGLSendResult {
+    pub fn finished_rendering_to_context(&self, surface_id: WebGLSurfaceId) -> WebGLSendResult {
         self.0
-            .send(WebGLMsg::FinishedRenderingToContext(context_id))
+            .send(WebGLMsg::FinishedRenderingToContext(surface_id))
     }
 }
 
@@ -97,6 +97,7 @@ pub enum WebGLMsg {
     /// Creates a new WebGLContext.
     CreateContext(
         PainterId,
+        Vec<PainterId>,
         WebGLVersion,
         Size2D<u32>,
         GLContextAttributes,
@@ -126,7 +127,7 @@ pub enum WebGLMsg {
     /// Called when a [`Surface`] is returned from being used in WebRender and isn't
     /// readily releaseable via the `SwapChain`. This can happen when the context is
     /// released in the WebGLThread while the contents are being rendered by WebRender.
-    FinishedRenderingToContext(WebGLContextId),
+    FinishedRenderingToContext(WebGLSurfaceId),
     /// Frees all resources and closes the thread.
     Exit(GenericSender<()>),
 }
@@ -717,6 +718,23 @@ define_resource_id!(WebXRLayerManagerId, u32);
     Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub struct WebGLContextId(pub u64);
+
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize,
+)]
+pub struct WebGLSurfaceId {
+    pub context_id: WebGLContextId,
+    pub painter_id: PainterId,
+}
+
+impl WebGLSurfaceId {
+    pub fn new(context_id: WebGLContextId, painter_id: PainterId) -> Self {
+        Self {
+            context_id,
+            painter_id,
+        }
+    }
+}
 
 impl From<WebXRContextId> for WebGLContextId {
     fn from(id: WebXRContextId) -> Self {

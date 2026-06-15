@@ -22,7 +22,7 @@ use winit::window::WindowId;
 use log::info;
 
 use super::event_loop::AppEvent;
-use crate::desktop::event_loop::ServoShellEventLoop;
+use crate::desktop::event_loop::{ServoShellEventLoop, WakeCoalescer};
 use crate::desktop::headed_window::HeadedWindow;
 use crate::desktop::headless_window::HeadlessWindow;
 use crate::desktop::protocols;
@@ -45,6 +45,9 @@ pub struct App {
     preferences: Preferences,
     servoshell_preferences: ServoShellPreferences,
     waker: Box<dyn EventLoopWaker>,
+    /// Shared with the headed waker so we can re-arm wake-ups after pumping a
+    /// [`AppEvent::Waker`]. `None` in headless mode. See [`WakeCoalescer`].
+    wake_coalescer: Option<WakeCoalescer>,
     event_loop_proxy: Option<EventLoopProxy<AppEvent>>,
     initial_url: ServoUrl,
     t_start: Instant,
@@ -67,11 +70,13 @@ impl App {
         );
 
         let t = Instant::now();
+        let (waker, wake_coalescer) = event_loop.create_event_loop_waker();
         App {
             opts,
             preferences,
             servoshell_preferences: servo_shell_preferences,
-            waker: event_loop.create_event_loop_waker(),
+            waker,
+            wake_coalescer,
             event_loop_proxy: event_loop.event_loop_proxy(),
             initial_url,
             t_start: t,
@@ -276,11 +281,23 @@ impl App {
             AppState::Running(state) => state.is_animating(),
             _ => false,
         };
-        event_loop.set_control_flow(if is_animating {
+        // Tell the waker our animating state FIRST, then read `requested`. This ordering is
+        // what makes `WakeCoalescer` lose no wake across the animating->idle transition.
+        let control_flow = if let Some(coalescer) = &self.wake_coalescer {
+            coalescer.set_animating(is_animating);
+            if is_animating || coalescer.requested() {
+                // When idle but a wake is owed (possibly one suppressed during animation),
+                // take one more Poll iteration so `about_to_wait` pumps it.
+                ControlFlow::Poll
+            } else {
+                ControlFlow::Wait
+            }
+        } else if is_animating {
             ControlFlow::Poll
         } else {
             ControlFlow::Wait
-        });
+        };
+        event_loop.set_control_flow(control_flow);
     }
 }
 
@@ -341,11 +358,18 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let should_pump = match &self.state {
+        let is_animating = match &self.state {
             AppState::Running(state) => state.is_animating(),
             _ => false,
         };
-        if should_pump && !self.pump_servo_event_loop(event_loop.into()) {
+        // Pump when animating (Poll) OR when a wake is owed. While animating the waker
+        // suppresses its posts (to avoid starving input), so the owed pump is performed
+        // here instead; this also pumps a wake that was suppressed right as animation ended.
+        let owed = self
+            .wake_coalescer
+            .as_ref()
+            .is_some_and(|coalescer| coalescer.take_requested());
+        if (is_animating || owed) && !self.pump_servo_event_loop(event_loop.into()) {
             event_loop.exit();
             return;
         }

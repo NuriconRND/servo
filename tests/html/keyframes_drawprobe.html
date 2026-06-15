@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>keyframes draw probe</title>
+<style>body{margin:0;background:#202428}</style>
+<script type="importmap">{ "imports": {
+  "three": "https://threejs.org/build/three.module.js",
+  "three/addons/": "https://threejs.org/examples/jsm/"
+}}</script>
+</head><body>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+function E(m){ try{console.error('[DRAWPROBE] '+m)}catch(e){} }
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(960, 600);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x335577);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 3.0));
+const dir = new THREE.DirectionalLight(0xffffff, 2.5); dir.position.set(5,10,7); scene.add(dir);
+scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+const camera = new THREE.PerspectiveCamera(40, 960/600, 1, 100);
+camera.position.set(5, 2, 8); camera.lookAt(0, 0.7, 0);
+
+// ---- gl.drawElements 래핑: 실패한 draw의 전체 VAO/버퍼/attrib 상태를 덤프 ----
+const gl = renderer.getContext();
+let dumpBudget = 6, okCount = 0, failCount = 0;
+function bufSize(target){ const b = gl.getParameter(target==='elem'?gl.ELEMENT_ARRAY_BUFFER_BINDING:gl.ARRAY_BUFFER_BINDING); return b; }
+function dumpState(tag, mode, count, type, offset, primcount){
+  const prog = gl.getParameter(gl.CURRENT_PROGRAM);
+  const vao  = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+  const eab  = gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING);
+  let eabSize = -1; if (eab){ eabSize = gl.getBufferParameter(gl.ELEMENT_ARRAY_BUFFER, gl.BUFFER_SIZE); }
+  const tsize = (type===gl.UNSIGNED_BYTE)?1:(type===gl.UNSIGNED_SHORT)?2:4;
+  const need = offset + count*tsize;
+  const offMis = (offset % tsize);
+  const maxA = gl.getParameter(gl.MAX_VERTEX_ATTRIBS);
+  let attrs = [];
+  for (let i=0;i<maxA;i++){
+    const en = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED);
+    const bb = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+    const dv = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_DIVISOR);
+    const sz = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_SIZE);
+    const ty = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_TYPE);
+    const st = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_STRIDE);
+    if (en || bb) attrs.push(`#${i}{en:${en?1:0},buf:${bb?1:0},div:${dv},sz:${sz},ty:0x${ty.toString(16)},st:${st}}`);
+  }
+  // JS측 분기 판정: B1=offset정렬, B2=EAB없음, B3=용량초과, B4=enabled&&buf없음, B5=active인데 divisor0 없음
+  const anyEnNoBuf = attrs.some(s=>/en:1,buf:0/.test(s));
+  E(`${tag} mode=0x${mode.toString(16)} count=${count} type=0x${type.toString(16)} off=${offset} primN=${primcount} | EAB=${eab?1:0} eabSize=${eabSize} need=${need} offMis=${offMis} overCap=${need>eabSize?1:0} enNoBuf=${anyEnNoBuf?1:0} vao=${vao?1:0} | ${attrs.join(' ')}`);
+}
+const _de = gl.drawElements.bind(gl);
+gl.drawElements = function(mode,count,type,offset){
+  while(gl.getError()!==gl.NO_ERROR){}
+  _de(mode,count,type,offset);
+  const err = gl.getError();
+  if (err!==gl.NO_ERROR){ failCount++; if(dumpBudget-->0) dumpState(`DE.FAIL(0x${err.toString(16)})`, mode,count,type,offset,1); }
+  else okCount++;
+};
+const _dei = gl.drawElementsInstanced ? gl.drawElementsInstanced.bind(gl) : null;
+if (_dei) gl.drawElementsInstanced = function(mode,count,type,offset,primcount){
+  while(gl.getError()!==gl.NO_ERROR){}
+  _dei(mode,count,type,offset,primcount);
+  const err = gl.getError();
+  if (err!==gl.NO_ERROR){ failCount++; if(dumpBudget-->0) dumpState(`DEI.FAIL(0x${err.toString(16)})`, mode,count,type,offset,primcount); }
+  else okCount++;
+};
+
+const draco = new DRACOLoader(); draco.setDecoderPath('https://threejs.org/examples/jsm/libs/draco/gltf/');
+const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
+let mixer = null;
+loader.load('https://threejs.org/examples/models/gltf/LittlestTokyo.glb', (gltf) => {
+  const model = gltf.scene; model.position.set(1,1,0); model.scale.set(0.01,0.01,0.01);
+  scene.add(model);
+  let nm=0; model.traverse(o=>{ if(o.isMesh) nm++; });
+  mixer = new THREE.AnimationMixer(model); mixer.clipAction(gltf.animations[0]).play();
+  E('model loaded; meshes='+nm);
+}, undefined, (e)=> E('LOAD ERROR: '+(e&&e.message||e)));
+
+let frame=0, reported=false;
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  if (mixer) mixer.update(clock.getDelta());
+  renderer.render(scene, camera);
+  frame++;
+  if (mixer && frame>=4 && !reported){
+    reported = true;
+    E(`draw summary: ok=${okCount} fail=${failCount}`);
+    // readPixels 휘도 그리드(12x8)로 실제 렌더 확인 (창 캡처 불가 대응)
+    const W=960,H=600, gx=12, gy=8;
+    const px = new Uint8Array(4);
+    let rows=[];
+    for(let j=0;j<gy;j++){ let row='';
+      for(let i=0;i<gx;i++){
+        const x=Math.floor((i+0.5)*W/gx), y=Math.floor((j+0.5)*H/gy);
+        gl.readPixels(x,y,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+        const l=(px[0]*0.3+px[1]*0.59+px[2]*0.11);
+        row += l<8?' ':l<32?'.':l<80?':':l<160?'o':'#';
+      }
+      rows.push(row);
+    }
+    E('LUMA GRID (space=black .:o#=brighter):'); rows.forEach(r=>E('|'+r+'|'));
+    // 중앙 픽셀 실제 값
+    gl.readPixels(480,300,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+    E(`centerPixel=[${px[0]},${px[1]},${px[2]},${px[3]}]`);
+  }
+}
+animate();
+</script></body></html>

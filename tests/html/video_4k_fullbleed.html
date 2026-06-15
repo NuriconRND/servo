@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>4K video full-bleed wall</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000}
+  /* 비디오를 가상 뷰포트(3840x1080) 전체에 꽉 채워 좌/우 모니터가 균형있게 절반씩 표출 */
+  #v{position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:cover;background:#000}
+  /* 정확히 중앙(두 모니터 경계) 표시용 가는 가이드 (원치 않으면 무시) */
+</style>
+</head><body>
+<video id="v" autoplay muted loop playsinline>
+  <source src="../4k_3DMark.mp4" type="video/mp4">
+</video>
+<script>
+  const v = document.getElementById('v');
+  function E(m){ try{console.error('[VIDEO4K] '+m)}catch(e){} }
+  E('viewport=' + window.innerWidth + 'x' + window.innerHeight);
+  E('canPlay mp4=' + (v.canPlayType('video/mp4; codecs="avc1.64001e"') || v.canPlayType('video/mp4') || 'no'));
+  v.addEventListener('loadedmetadata', ()=> E('video ' + v.videoWidth + 'x' + v.videoHeight));
+  v.addEventListener('playing', ()=> E('playing'));
+  v.addEventListener('error', ()=> E('VIDEO ERROR ' + (v.error && v.error.code)));
+  v.play().catch(err => E('play() rejected: ' + err));
+</script>
+</body></html>

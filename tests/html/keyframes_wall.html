@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>keyframes wall (full viewport)</title>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#202428}
+#hud{position:fixed;top:8px;left:8px;z-index:10;color:#fff;font:20px monospace;background:rgba(0,0,0,.5);padding:6px 10px}</style>
+<script type="importmap">{ "imports": {
+  "three": "https://threejs.org/build/three.module.js",
+  "three/addons/": "https://threejs.org/examples/jsm/"
+}}</script>
+</head><body>
+<div id="hud">loading…</div>
+<script type="module">
+// 실제 threejs webgl_animation_keyframes와 동일: RoomEnvironment+PMREM, 전체 뷰포트(window 크기)로 리사이즈.
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+const hud = document.getElementById('hud');
+function E(m){ try{console.error('[KFWALL] '+m)}catch(e){} }
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+E('init viewport=' + window.innerWidth + 'x' + window.innerHeight + ' dpr=' + window.devicePixelRatio);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xbfe3dd);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth/window.innerHeight, 1, 100);
+camera.position.set(5, 2, 8);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.5, 0); controls.enableDamping = true; controls.update();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  E('resize viewport=' + window.innerWidth + 'x' + window.innerHeight);
+});
+
+const draco = new DRACOLoader(); draco.setDecoderPath('https://threejs.org/examples/jsm/libs/draco/gltf/');
+const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
+let mixer = null;
+loader.load('https://threejs.org/examples/models/gltf/LittlestTokyo.glb', (gltf) => {
+  const model = gltf.scene; model.position.set(1,1,0); model.scale.set(0.01,0.01,0.01);
+  scene.add(model);
+  mixer = new THREE.AnimationMixer(model); mixer.clipAction(gltf.animations[0]).play();
+  E('model loaded');
+}, undefined, (e)=> E('LOAD ERROR: '+(e&&e.message||e)));
+
+// FPS 측정 + 프레임별 진단(rAF 간격 vs render 소요)으로 병목 특정.
+let frames=0, lastT=performance.now();
+let diagN=0, prevRaf=performance.now();
+const clock = new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const t0 = performance.now();
+  const rafGap = t0 - prevRaf; prevRaf = t0;
+  const dt = clock.getDelta();
+  if (mixer) mixer.update(dt);
+  controls.update();
+  renderer.render(scene, camera);
+  // 실제 사용 환경과 동일하게 gl.finish 없이 측정(파이프라인 유지)
+  const renderMs = performance.now() - t0;
+  frames++;
+  // 모델 로드 후 처음 20프레임의 rAF 간격/렌더 시간 로깅
+  if (mixer && diagN < 20){ diagN++; E('frame '+diagN+': rafGap='+rafGap.toFixed(1)+'ms render+finish='+renderMs.toFixed(1)+'ms'); }
+  const now = performance.now();
+  if (now - lastT >= 2000){
+    const fps = (frames * 1000 / (now - lastT));
+    hud.textContent = 'viewport ' + window.innerWidth + 'x' + window.innerHeight + '  fps ' + fps.toFixed(1);
+    E('fps=' + fps.toFixed(1) + ' viewport=' + window.innerWidth + 'x' + window.innerHeight);
+    frames=0; lastT=now;
+  }
+}
+animate();
+</script></body></html>

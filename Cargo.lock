@@ -9201,6 +9201,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "parking_lot",
+ "postcard",
  "rustc-hash 2.1.2",
  "servo-base",
  "servo-canvas-traits",
@@ -9217,6 +9218,7 @@ name = "servo-webgpu"
 version = "0.3.0"
 dependencies = [
  "arrayvec",
+ "bincode",
  "euclid",
  "log",
  "rustc-hash 2.1.2",
@@ -9227,7 +9229,9 @@ dependencies = [
  "servo-webgpu-traits",
  "webrender_api",
  "wgpu-core",
+ "wgpu-hal",
  "wgpu-types",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -9926,8 +9930,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surfman"
 version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2f5e8af3ca54762c5f3854f9fddc88134bc3e996c2938624a71e28ede83f218"
 dependencies = [
  "bitflags 2.11.1",
  "cfg_aliases",

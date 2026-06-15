@@ -162,17 +162,45 @@ impl HeadedWindow {
             winit_window.set_window_icon(Some(load_icon(icon_bytes)));
         }
 
+        let mut wall_tile_fullscreen = false;
+        let mut wall_tile_monitor = None;
         if let Some(layout) = &servoshell_preferences.wall_layout
             && let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
             if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
+                let target_monitor_size = target_monitor.size();
+                let requested_physical_size = PhysicalSize::new(
+                    (inner_size.width as f64 * target_monitor.scale_factor()).round() as u32,
+                    (inner_size.height as f64 * target_monitor.scale_factor()).round() as u32,
+                );
                 info!(
                     "Positioning fixed-size wall tile {} on monitor {} at {:?}.",
                     servoshell_preferences.wall_tile_index,
                     tile.monitor,
                     target_monitor.position()
                 );
-                winit_window.set_outer_position(target_monitor.position());
+                if requested_physical_size == target_monitor_size {
+                    info!(
+                        "Wall tile {} matches monitor {} size {:?}; using borderless fullscreen \
+                         for flip-model present eligibility.",
+                        servoshell_preferences.wall_tile_index, tile.monitor, target_monitor_size,
+                    );
+                    winit_window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
+                        target_monitor.clone(),
+                    ))));
+                    wall_tile_fullscreen = true;
+                } else {
+                    info!(
+                        "Wall tile {} requested physical size {:?}, monitor {} size {:?}; \
+                         keeping fixed-size windowed placement.",
+                        servoshell_preferences.wall_tile_index,
+                        requested_physical_size,
+                        tile.monitor,
+                        target_monitor_size,
+                    );
+                    winit_window.set_outer_position(target_monitor.position());
+                }
+                wall_tile_monitor = Some(target_monitor);
             } else {
                 warn!(
                     "Wall tile {} requested monitor {}, but only {} monitor(s) are available.",
@@ -188,8 +216,8 @@ impl HeadedWindow {
             .expect("winit window did not have a window handle");
         HeadedWindow::force_srgb_color_space(window_handle.as_raw());
 
-        let monitor = winit_window
-            .current_monitor()
+        let monitor = wall_tile_monitor
+            .or_else(|| winit_window.current_monitor())
             .or_else(|| winit_window.available_monitors().nth(0))
             .expect("No monitor detected");
 
@@ -268,7 +296,7 @@ impl HeadedWindow {
             winit_window,
             webview_local_mouse_point: Cell::new(Point2D::zero()),
             webview_relative_mouse_point: Cell::new(Point2D::zero()),
-            fullscreen: Cell::new(false),
+            fullscreen: Cell::new(wall_tile_fullscreen),
             inner_size: Cell::new(inner_size),
             monitor,
             screen_size,
@@ -841,7 +869,21 @@ impl HeadedWindow {
                     state.handle_focused(window.clone());
                 }
 
-                if response.repaint && *event != WindowEvent::RedrawRequested {
+                // Don't force a repaint for cursor moves over the WebView content. egui
+                // returns `repaint = true` on essentially every mouse move, but the WebView
+                // already drives its own painting (rAF / content invalidation). Honoring
+                // egui here floods the present pipeline with a redundant, expensive repaint
+                // on every mouse event — on the multi-GPU wall each one re-composites every
+                // tile (`paint_wall_tile_group_for_redraw`) — which visibly drops the frame
+                // rate and spikes compositor render time while the mouse is moving. egui
+                // only needs to repaint when the cursor is over its own toolbar UI.
+                let is_webview_content_cursor_move =
+                    matches!(event, WindowEvent::CursorMoved { .. }) &&
+                        !should_forward_mouse_event_to_egui();
+                if response.repaint &&
+                    *event != WindowEvent::RedrawRequested &&
+                    !is_webview_content_cursor_move
+                {
                     self.winit_window.request_redraw();
                 }
 

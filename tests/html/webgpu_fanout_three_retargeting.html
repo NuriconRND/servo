@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>three.js WebGPU Animation Retargeting - Multi-GPU Fan-Out</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.4 system-ui, sans-serif;
+      background: #04060a;
+      color: #eef3f8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 3840px;
+      height: 1080px;
+      overflow: hidden;
+      background: #04060a;
+    }
+
+    /* three.js renderer canvas fills the full virtual wall viewport */
+    canvas {
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 3840px;
+      height: 1080px;
+    }
+
+    /* Servo does not support CSS grid; use flex with per-item widths/margins. */
+    .hud {
+      position: fixed;
+      z-index: 10;
+      top: 18px;
+      left: 18px;
+      display: flex;
+      flex-wrap: wrap;
+      width: 1392px;
+      pointer-events: none;
+    }
+
+    .metric {
+      width: 200px;
+      min-height: 58px;
+      margin: 0 8px 8px 0;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(4, 7, 10, 0.74);
+      padding: 8px 10px;
+    }
+
+    .metric.title {
+      width: 320px;
+    }
+
+    h1,
+    .label,
+    .value {
+      margin: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    h1 {
+      font-size: 17px;
+      line-height: 1.2;
+    }
+
+    .label {
+      display: block;
+      color: #9da7b3;
+      font: 700 10px/1.1 ui-monospace, SFMono-Regular, Consolas, monospace;
+      text-transform: uppercase;
+    }
+
+    .value {
+      display: block;
+      margin-top: 7px;
+      color: #eef3f8;
+      font: 700 15px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+
+    /* seam marker at the tile boundary between gpu 0 and gpu 1 */
+    .boundary {
+      position: absolute;
+      z-index: 8;
+      top: 0;
+      bottom: 0;
+      left: 1920px;
+      width: 4px;
+      background: #f7d84c;
+      box-shadow: 0 0 0 1px rgba(247, 216, 76, 0.52), 0 0 26px rgba(247, 216, 76, 0.46);
+      pointer-events: none;
+    }
+
+    .boundary::before {
+      content: "tile boundary x=1920 / gpu 0 -> gpu 1";
+      position: sticky;
+      top: 120px;
+      display: block;
+      margin-left: 12px;
+      color: #f7d84c;
+      font: 700 15px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .fallback {
+      position: fixed;
+      z-index: 9;
+      right: 18px;
+      bottom: 18px;
+      width: 860px;
+      max-height: 360px;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(4, 7, 10, 0.8);
+      padding: 12px;
+      color: #aeb8c4;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <section class="hud" aria-label="runtime metrics">
+    <div class="metric title">
+      <h1>three.js Retargeting Fan-Out</h1>
+      <span class="value">Michelle &rarr; Soldier (WebGPU/TSL)</span>
+    </div>
+    <div class="metric"><span class="label">frame</span><span class="value" id="frame">0</span></div>
+    <div class="metric"><span class="label">backend</span><span class="value" id="backend">initializing</span></div>
+    <div class="metric"><span class="label">adapter</span><span class="value" id="adapter">pending</span></div>
+    <div class="metric"><span class="label">viewport</span><span class="value" id="viewport">3840 x 1080</span></div>
+    <div class="metric"><span class="label">retarget</span><span class="value" id="motion">loading models</span></div>
+  </section>
+
+  <div class="boundary"></div>
+  <pre class="fallback" id="log">booting three.js WebGPU retargeting...</pre>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./lib/three_retargeting/three.webgpu.js",
+        "three/webgpu": "./lib/three_retargeting/three.webgpu.js",
+        "three/tsl": "./lib/three_retargeting/three.tsl.js",
+        "three/addons/": "./lib/three_retargeting/jsm/"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three/webgpu';
+    import {
+      color, screenUV, hue, reflector, time, Fn, vec2, length, atan,
+      float, sin, cos, vec3, sub, mul, pow, blendDodge, normalWorldGeometry
+    } from 'three/tsl';
+
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+    const frameValue = document.getElementById('frame');
+    const backendValue = document.getElementById('backend');
+    const adapterValue = document.getElementById('adapter');
+    const viewportValue = document.getElementById('viewport');
+    const motionValue = document.getElementById('motion');
+    const logEl = document.getElementById('log');
+
+    const logLines = [];
+    function writeLog(line) {
+      logLines.push(line);
+      while (logLines.length > 12) logLines.shift();
+      logEl.textContent = logLines.join('\n');
+      // mirror to console so the Servo stderr log captures progress headlessly
+      console.log('[retarget] ' + line);
+    }
+
+    // Surface errors on the wall itself since the page console is not visible.
+    window.addEventListener('error', (e) => writeLog('error: ' + (e.message || e.error)));
+    window.addEventListener('unhandledrejection', (e) =>
+      writeLog('promise rejection: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+
+    const MODELS = './lib/three_retargeting/models/';
+
+    function loadGLTF(loader, url) {
+      return new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject));
+    }
+
+    function backendLabel(renderer) {
+      const b = renderer.backend;
+      if (!b) return 'unknown';
+      if (b.isWebGPUBackend) return 'WebGPU';
+      if (b.isWebGLBackend) return 'WebGL2';
+      return b.constructor ? b.constructor.name : 'unknown';
+    }
+
+    function adapterLabel(renderer) {
+      const b = renderer.backend;
+      try {
+        if (b && b.adapter && b.adapter.info) {
+          const info = b.adapter.info;
+          return info.description || info.device || info.vendor || 'webgpu adapter';
+        }
+        const gl = b && (b.gl || (b.getContext && b.getContext()));
+        if (gl) {
+          const ext = gl.getExtension('WEBGL_debug_renderer_info');
+          if (ext) return gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+          return gl.getParameter(gl.RENDERER);
+        }
+      } catch (e) { /* best effort */ }
+      return 'n/a';
+    }
+
+    // Re-upload an image-backed texture as a raw-byte DataTexture.
+    // Servo's WebGPU does not sample textures uploaded from an image source
+    // (copyExternalImageToTexture), but it does sample textures uploaded as raw
+    // bytes (writeTexture) - that is how the reflector floor works. So we decode the
+    // glTF texture image through a 2D canvas and hand three the raw RGBA bytes.
+    function recoverTexture(srcTex) {
+      if (!srcTex) return null;
+      const img = srcTex.image;
+      const w = img && (img.width || img.videoWidth);
+      const h = img && (img.height || img.videoHeight);
+      if (!w || !h) return null;
+      const cv = document.createElement('canvas');
+      cv.width = w;
+      cv.height = h;
+      const ctx = cv.getContext('2d');
+      if (!ctx) return null;
+      try {
+        ctx.drawImage(img, 0, 0, w, h);
+        const pixels = ctx.getImageData(0, 0, w, h);
+        const dt = new THREE.DataTexture(new Uint8Array(pixels.data.buffer), w, h, THREE.RGBAFormat);
+        dt.colorSpace = srcTex.colorSpace || THREE.SRGBColorSpace;
+        dt.wrapS = srcTex.wrapS;
+        dt.wrapT = srcTex.wrapT;
+        dt.flipY = false; // matches the glTF texture convention; getImageData is top-left origin
+        dt.magFilter = THREE.LinearFilter;
+        dt.minFilter = THREE.LinearFilter;
+        dt.generateMipmaps = false;
+        dt.needsUpdate = true;
+        return dt;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    async function createRenderer() {
+      const renderer = new THREE.WebGPURenderer({ antialias: true });
+      // Keep the wall framebuffer at the virtual viewport resolution (no DPR upscaling).
+      renderer.setPixelRatio(1);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.toneMapping = THREE.NeutralToneMapping;
+      await renderer.init();
+      return renderer;
+    }
+
+    async function main() {
+      writeLog('navigator.gpu present: ' + ('gpu' in navigator));
+
+      // --- load source/target models (Michelle drives, Soldier is retargeted) ---
+      const loader = new GLTFLoader();
+      const [sourceModel, targetModel] = await Promise.all([
+        loadGLTF(loader, MODELS + 'Michelle.glb'),
+        loadGLTF(loader, MODELS + 'Soldier.glb')
+      ]);
+      writeLog('models loaded: Michelle.glb + Soldier.glb');
+
+      // procedural "light speed" sky node (TSL), forked from the upstream example
+      const lightSpeed = Fn(([suv_immutable]) => {
+        const suv = vec2(suv_immutable);
+        const uv = vec2(length(suv), atan(suv.y, suv.x));
+        const offset = float(float(.1).mul(sin(uv.y.mul(10.).sub(time.mul(.6)))).mul(cos(uv.y.mul(48.).add(time.mul(.3)))).mul(cos(uv.y.mul(3.7).add(time))));
+        const rays = vec3(vec3(sin(uv.y.mul(150.).add(time)).mul(.5).add(.5)).mul(vec3(sin(uv.y.mul(80.).sub(time.mul(0.6))).mul(.5).add(.5))).mul(vec3(sin(uv.y.mul(45.).add(time.mul(0.8))).mul(.5).add(.5))).mul(vec3(sub(1., cos(uv.y.add(mul(22., time).sub(pow(uv.x.add(offset), .3).mul(60.))))))).mul(vec3(uv.x.mul(2.))));
+        return rays;
+      }).setLayout({ name: 'lightSpeed', type: 'vec3', inputs: [{ name: 'suv', type: 'vec2' }] });
+
+      const scene = new THREE.Scene();
+
+      const coloredVignette = screenUV.distance(.5).mix(hue(color(0x0175ad), time.mul(.1)), hue(color(0x02274f), time.mul(.5)));
+      const lightSpeedEffect = lightSpeed(normalWorldGeometry).clamp();
+      const lightSpeedSky = normalWorldGeometry.y.remapClamp(-.1, 1).mix(0, lightSpeedEffect);
+      scene.backgroundNode = blendDodge(coloredVignette, lightSpeedSky);
+
+      const helpers = new THREE.Group();
+      helpers.visible = false;
+      scene.add(helpers);
+
+      const light = new THREE.HemisphereLight(0xe9c0a5, 0x0175ad, 5);
+      scene.add(light);
+
+      const dirLight = new THREE.DirectionalLight(0xfff9ea, 4);
+      dirLight.position.set(2, 5, 2);
+      scene.add(dirLight);
+
+      // Wide aspect so the two figures fan across the full 3840 x 1080 wall.
+      const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, .25, 50);
+      camera.position.set(0, 1, 4);
+
+      scene.add(sourceModel.scene);
+      scene.add(targetModel.scene);
+
+      sourceModel.scene.position.x -= .8;
+      targetModel.scene.position.x += .7;
+      targetModel.scene.position.z -= .1;
+      targetModel.scene.scale.setScalar(.01);
+      sourceModel.scene.rotation.y = Math.PI / 2;
+      targetModel.scene.rotation.y = -Math.PI / 2;
+
+      const source = getSource(sourceModel);
+      const mixer = retargetModel(source, targetModel);
+
+      // --- Material adaptation for Servo's WebGPU backend ---
+      // Servo's WebGPU renders geometry, skinning, the retargeted animation, scene
+      // lighting and the reflector floor correctly, but it does not sample textures
+      // that were uploaded from an image source - so the glTF-embedded character
+      // textures read as black. We re-upload each character texture as a raw-byte
+      // DataTexture (the path Servo does sample) and keep the original PBR material,
+      // so the characters show their real textures, lit by the scene lights. If a
+      // texture cannot be recovered we fall back to a solid color so the mesh stays
+      // visible. Pass ?faithful=1 to keep the untouched upstream materials.
+      const params = new URLSearchParams(location.search);
+      const faithful = params.get('faithful') === '1';
+      if (!faithful) {
+        const fallbackColors = [0x9fd8ff, 0xffb066]; // source (Michelle), target (Soldier)
+        let idx = 0, meshCount = 0, recovered = 0, fellBack = 0;
+        for (const root of [sourceModel.scene, targetModel.scene]) {
+          const fc = fallbackColors[idx++ % fallbackColors.length];
+          root.traverse((o) => {
+            if (o.isMesh && o.material) {
+              meshCount += 1;
+              const dt = recoverTexture(o.material.map);
+              if (dt) {
+                o.material.map = dt;
+                recovered += 1;
+              } else {
+                o.material.map = null;
+                if (o.material.color) o.material.color.set(fc);
+                fellBack += 1;
+              }
+              if ('metalness' in o.material) o.material.metalness = 0.0;
+              if ('roughness' in o.material) o.material.roughness = 0.85;
+              o.material.needsUpdate = true;
+            }
+          });
+        }
+        writeLog('material: textures recovered=' + recovered + ' solidFallback=' + fellBack + ' of ' + meshCount);
+      } else {
+        writeLog('material: faithful textured PBR (textures read black under Servo WebGPU)');
+      }
+
+      // reflective floor
+      const reflection = reflector();
+      reflection.target.rotateX(-Math.PI / 2);
+      scene.add(reflection.target);
+
+      const floorMaterial = new THREE.NodeMaterial();
+      floorMaterial.colorNode = reflection;
+      floorMaterial.opacity = .2;
+      floorMaterial.transparent = true;
+
+      const floor = new THREE.Mesh(new THREE.BoxGeometry(50, .001, 50), floorMaterial);
+      floor.receiveShadow = true;
+      floor.position.set(0, 0, 0);
+      scene.add(floor);
+
+      // --- renderer (WebGPU) ---
+      // This example needs Servo's WebGPU backend. Under Servo the three.js WebGL2
+      // fallback backend fails to obtain a context, so require WebGPU explicitly and
+      // give a clear instruction instead of crashing deep inside three.js.
+      if (!('gpu' in navigator)) {
+        throw new Error('navigator.gpu is unavailable - launch servoshell with --pref dom_webgpu_enabled=true');
+      }
+      const renderer = await createRenderer();
+      writeLog('renderer initialized via WebGPU path');
+
+      document.body.appendChild(renderer.domElement);
+
+      const backend = backendLabel(renderer);
+      const adapter = adapterLabel(renderer);
+      backendValue.textContent = backend;
+      adapterValue.textContent = adapter;
+      motionValue.textContent = 'retargeting active';
+      writeLog('backend=' + backend + '  adapter=' + adapter);
+      writeLog('wall run: servoshell --wall-layout wall_layout.example_2x1_dualgpu.json --wall-all-tiles');
+
+      // No user input on the wall, so auto-orbit to keep both figures moving across the seam.
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.minDistance = 3;
+      controls.maxDistance = 12;
+      controls.target.set(0, 1, 0);
+      controls.maxPolarAngle = Math.PI / 2;
+      controls.enableDamping = true;
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 0.3;
+      controls.update();
+
+      let frame = 0;
+
+      function getSource(sourceModel) {
+        const clip = sourceModel.animations[0];
+        const helper = new THREE.SkeletonHelper(sourceModel.scene);
+        helpers.add(helper);
+        const skeleton = new THREE.Skeleton(helper.bones);
+        const srcMixer = new THREE.AnimationMixer(sourceModel.scene);
+        srcMixer.clipAction(sourceModel.animations[0]).play();
+        return { clip, skeleton, mixer: srcMixer };
+      }
+
+      function retargetModel(sourceModelObj, targetModel) {
+        const targetSkin = targetModel.scene.children[0].children[0];
+        const targetSkelHelper = new THREE.SkeletonHelper(targetModel.scene);
+        helpers.add(targetSkelHelper);
+
+        const rotateCW45 = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(45));
+        const rotateCCW180 = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(-180));
+        const rotateCW180 = new THREE.Matrix4().makeRotationY(THREE.MathUtils.degToRad(180));
+        const rotateFoot = new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(THREE.MathUtils.degToRad(45), THREE.MathUtils.degToRad(180), THREE.MathUtils.degToRad(0)));
+
+        const retargetOptions = {
+          hip: 'mixamorigHips',
+          scale: 1 / targetModel.scene.scale.y,
+          localOffsets: {
+            mixamorigLeftShoulder: rotateCW45,
+            mixamorigRightShoulder: rotateCCW180,
+            mixamorigLeftArm: rotateCW45,
+            mixamorigRightArm: rotateCCW180,
+            mixamorigLeftForeArm: rotateCW45,
+            mixamorigRightForeArm: rotateCCW180,
+            mixamorigLeftHand: rotateCW45,
+            mixamorigRightHand: rotateCCW180,
+            mixamorigLeftUpLeg: rotateCW180,
+            mixamorigRightUpLeg: rotateCW180,
+            mixamorigLeftLeg: rotateCW180,
+            mixamorigRightLeg: rotateCW180,
+            mixamorigLeftFoot: rotateFoot,
+            mixamorigRightFoot: rotateFoot,
+            mixamorigLeftToeBase: rotateCW180,
+            mixamorigRightToeBase: rotateCW180
+          },
+          names: {
+            mixamorigHips: 'mixamorigHips',
+            mixamorigSpine: 'mixamorigSpine',
+            mixamorigSpine2: 'mixamorigSpine2',
+            mixamorigHead: 'mixamorigHead',
+            mixamorigLeftShoulder: 'mixamorigLeftShoulder',
+            mixamorigRightShoulder: 'mixamorigRightShoulder',
+            mixamorigLeftArm: 'mixamorigLeftArm',
+            mixamorigRightArm: 'mixamorigRightArm',
+            mixamorigLeftForeArm: 'mixamorigLeftForeArm',
+            mixamorigRightForeArm: 'mixamorigRightForeArm',
+            mixamorigLeftHand: 'mixamorigLeftHand',
+            mixamorigRightHand: 'mixamorigRightHand',
+            mixamorigLeftUpLeg: 'mixamorigLeftUpLeg',
+            mixamorigRightUpLeg: 'mixamorigRightUpLeg',
+            mixamorigLeftLeg: 'mixamorigLeftLeg',
+            mixamorigRightLeg: 'mixamorigRightLeg',
+            mixamorigLeftFoot: 'mixamorigLeftFoot',
+            mixamorigRightFoot: 'mixamorigRightFoot',
+            mixamorigLeftToeBase: 'mixamorigLeftToeBase',
+            mixamorigRightToeBase: 'mixamorigRightToeBase'
+          }
+        };
+
+        const retargetedClip = SkeletonUtils.retargetClip(targetSkin, sourceModelObj.skeleton, sourceModelObj.clip, retargetOptions);
+        const tgtMixer = new THREE.AnimationMixer(targetSkin);
+        tgtMixer.clipAction(retargetedClip).play();
+        return tgtMixer;
+      }
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        viewportValue.textContent = window.innerWidth + ' x ' + window.innerHeight;
+      });
+
+      let prevTime = 0;
+      let lastReport = 0;
+      function animate(timeMs) {
+        // Drive deltas from performance.now() instead of THREE.Timer: on the wall the
+        // webview can report document.hidden, which makes THREE.Timer freeze its delta
+        // (and the retargeted animation with it). performance.now() always advances.
+        const now = (typeof timeMs === 'number') ? timeMs : performance.now();
+        const delta = prevTime ? Math.min((now - prevTime) / 1000, 0.1) : 0;
+        prevTime = now;
+
+        source.mixer.update(delta);
+        mixer.update(delta);
+        controls.update();
+
+        renderer.render(scene, camera);
+
+        frame += 1;
+        if ((frame & 7) === 0) {
+          frameValue.textContent = String(frame);
+          motionValue.textContent = 'clip t=' + source.mixer.time.toFixed(1) + 's';
+        }
+        if (now - lastReport > 2000) {
+          lastReport = now;
+          writeLog('anim t=' + source.mixer.time.toFixed(2) + 's fps~' + Math.round(1 / (delta || 1)) + ' visibility=' + document.visibilityState);
+        }
+      }
+
+      renderer.setAnimationLoop(animate);
+      writeLog('animation loop running');
+    }
+
+    main().catch((err) => {
+      backendValue.textContent = 'failed';
+      motionValue.textContent = 'init error';
+      writeLog('FATAL: ' + (err && err.stack ? err.stack : err));
+    });
+  </script>
+</body>
+</html>

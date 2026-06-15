@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>webgl2 image-source texture probe</title>
+<style>html,body{margin:0;background:#222;color:#eee;font:13px monospace}#log{padding:8px;white-space:pre}</style></head>
+<body><div id="log"></div>
+<script>
+// 모델 텍스처 경로 검증: 이미지(HTMLImageElement / ImageBitmap) 소스를 texImage2D/texSubImage2D로 올린 뒤
+// 샘플해서 색이 맞는지(검정이 아닌지) 확인.
+const gl=document.createElement('canvas').getContext('webgl2');
+const out=document.getElementById('log'); let L=[];
+function log(m){ L.push(m); out.textContent=L.join('\n'); try{console.log('[IMGTEX] '+m)}catch(e){} }
+if(!gl){ log('NO webgl2'); throw 'no'; }
+function glErr(t){ let e,a=[]; while((e=gl.getError())){ a.push('0x'+e.toString(16)); } if(a.length) log(t+' ERR '+a.join(',')); return a.length; }
+// 알려진 색의 PNG(주황 64x64) data URL을 캔버스로 생성 후 toDataURL
+const src=document.createElement('canvas'); src.width=64; src.height=64; const sc=src.getContext('2d');
+sc.fillStyle='#ff8000'; sc.fillRect(0,0,64,64); sc.fillStyle='#0080ff'; sc.fillRect(0,0,32,32);
+const dataUrl=src.toDataURL('image/png');
+
+// 샘플 셰이더
+const vs=`#version 300 es
+in vec2 p; out vec2 uv; void main(){ uv=p*0.5+0.5; gl_Position=vec4(p,0.,1.); }`;
+const fs=`#version 300 es
+precision highp float; in vec2 uv; uniform sampler2D t; out vec4 o; void main(){ o=vec4(texture(t,uv).rgb,1.0); }`;
+function sh(t,s){ const o=gl.createShader(t); gl.shaderSource(o,s); gl.compileShader(o); if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))log('shErr '+gl.getShaderInfoLog(o)); return o; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(prog); gl.useProgram(prog);
+const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+const lp=gl.getAttribLocation(prog,'p'); gl.enableVertexAttribArray(lp); gl.vertexAttribPointer(lp,2,gl.FLOAT,false,0,0);
+gl.uniform1i(gl.getUniformLocation(prog,'t'),0);
+
+function sampleTex(tex,label){
+  const W=gl.drawingBufferWidth,H=gl.drawingBufferHeight; gl.viewport(0,0,W,H);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES,0,3); glErr(label+' draw');
+  const px=new Uint8Array(4); gl.readPixels((W*0.75)|0,(H/2)|0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px); // 우측(주황 영역)
+  log(label+' centerR-pixel=['+px[0]+','+px[1]+','+px[2]+'] '+(px[0]>180?'(주황 OK)':'(검정/깨짐!)'));
+}
+
+async function run(){
+  // (1) HTMLImageElement
+  const img=new Image(); img.src=dataUrl;
+  await img.decode().catch(e=>log('img.decode err '+e));
+  log('img loaded '+img.width+'x'+img.height+' complete='+img.complete);
+  const t1=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t1);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,false);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img); glErr('(1)texImage2D(img)');
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  sampleTex(t1,'(1) texImage2D(HTMLImage)');
+  // (2) texStorage2D(SRGB8_ALPHA8)+texSubImage2D(img) — three.js GLTF 경로
+  const t2=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t2);
+  const levels=Math.floor(Math.log2(64))+1;
+  gl.texStorage2D(gl.TEXTURE_2D,levels,gl.SRGB8_ALPHA8,64,64); glErr('(2)texStorage2D');
+  gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,gl.RGBA,gl.UNSIGNED_BYTE,img); glErr('(2)texSubImage2D(img)');
+  gl.generateMipmap(gl.TEXTURE_2D); glErr('(2)genMipmap');
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  sampleTex(t2,'(2) texStorage+texSubImage(HTMLImage,SRGB)');
+  // (3) ImageBitmap
+  try{
+    const bmp=await createImageBitmap(src);
+    log('ImageBitmap ok '+bmp.width+'x'+bmp.height);
+    const t3=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t3);
+    gl.texStorage2D(gl.TEXTURE_2D,1,gl.SRGB8_ALPHA8,64,64); glErr('(3)texStorage2D');
+    gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,gl.RGBA,gl.UNSIGNED_BYTE,bmp); glErr('(3)texSubImage2D(bmp)');
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+    sampleTex(t3,'(3) texSubImage(ImageBitmap,SRGB)');
+  }catch(e){ log('createImageBitmap 미지원/오류: '+e); }
+  log('done');
+}
+run();
+</script></body></html>

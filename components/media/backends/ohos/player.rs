@@ -730,7 +730,7 @@ impl OhosBuffer {
 }
 
 impl Buffer for OhosBuffer {
-    fn to_vec(&self) -> Option<video::VideoFrameData> {
+    fn frame_data(&self) -> Option<video::VideoFrameData> {
         Some(VideoFrameData::Raw(Arc::new(self.data.to_owned())))
     }
 }

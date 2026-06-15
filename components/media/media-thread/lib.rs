@@ -7,11 +7,12 @@
 
 mod media_thread;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use euclid::default::Size2D;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
-use log::warn;
+use log::{debug, info, warn};
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::{
     ExternalImageSource, WebRenderExternalImageApi, WebRenderExternalImageHandlers,
@@ -28,6 +29,10 @@ use crate::media_thread::GLPlayerThread;
 
 static RAW_VIDEO_EXTERNAL_IMAGE_ID_MANAGER: OnceLock<WebRenderExternalImageIdManager> =
     OnceLock::new();
+static RAW_VIDEO_PLANE_LOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+static RAW_VIDEO_PLANE_UNLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+const RAW_VIDEO_PLANE_INFO_INTERVAL: u64 = 360;
 
 #[derive(Clone)]
 struct RawVideoPlane {
@@ -333,6 +338,29 @@ impl WebRenderExternalImageApi for MediaExternalImages {
             let Some(data) = raw_plane.frame.get_plane_data(raw_plane.plane_index) else {
                 return (ExternalImageSource::Invalid, Size2D::zero());
             };
+            let lock_count = RAW_VIDEO_PLANE_LOCK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            debug!(
+                "Wall raw video plane lock: external_id={} plane_index={} size={}x{} \
+                 bytes={} total_locks={}",
+                id,
+                raw_plane.plane_index,
+                plane.width,
+                plane.height,
+                data.len(),
+                lock_count,
+            );
+            if lock_count <= 6 || lock_count % RAW_VIDEO_PLANE_INFO_INTERVAL == 0 {
+                info!(
+                    "Wall raw video plane lock summary: total_locks={} external_id={} \
+                     plane_index={} size={}x{} bytes={}",
+                    lock_count,
+                    id,
+                    raw_plane.plane_index,
+                    plane.width,
+                    plane.height,
+                    data.len(),
+                );
+            }
             return (
                 ExternalImageSource::RawData(data),
                 Size2D::new(plane.width, plane.height),
@@ -346,7 +374,19 @@ impl WebRenderExternalImageApi for MediaExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
-        if self.locked_raw_planes.remove(&id).is_some() {
+        if let Some(raw_plane) = self.locked_raw_planes.remove(&id) {
+            let unlock_count = RAW_VIDEO_PLANE_UNLOCK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            debug!(
+                "Wall raw video plane unlock: external_id={} plane_index={} total_unlocks={}",
+                id, raw_plane.plane_index, unlock_count,
+            );
+            if unlock_count <= 6 || unlock_count % RAW_VIDEO_PLANE_INFO_INTERVAL == 0 {
+                info!(
+                    "Wall raw video plane unlock summary: total_unlocks={} external_id={} \
+                     plane_index={}",
+                    unlock_count, id, raw_plane.plane_index,
+                );
+            }
             return;
         }
 

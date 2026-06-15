@@ -41,6 +41,7 @@ mod from_constellation {
                 Self::UpdateEpoch { .. } => target!("UpdateEpoch"),
                 Self::SendDisplayList { .. } => target!("SendDisplayList"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
+                Self::GetWebViewPainterTargets(..) => target!("GetWebViewPainterTargets"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
                 Self::UpdateImages(..) => target!("UpdateImages"),
                 Self::GenerateFontKeys(..) => target!("GenerateFontKeys"),

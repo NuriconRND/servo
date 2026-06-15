@@ -2069,6 +2069,7 @@ impl ScriptThread {
             WebGPUMsg::FreeTextureView(id) => self.gpu_id_hub.free_texture_view_id(id),
             WebGPUMsg::FreeComputePass(id) => self.gpu_id_hub.free_compute_pass_id(id),
             WebGPUMsg::FreeRenderPass(id) => self.gpu_id_hub.free_render_pass_id(id),
+            WebGPUMsg::FreeQuerySet(id) => self.gpu_id_hub.free_query_set_id(id),
             WebGPUMsg::Exit => {
                 *self.receivers.webgpu_receiver.borrow_mut() = crossbeam_channel::never()
             },

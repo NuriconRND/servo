@@ -5,11 +5,15 @@
 //! Main process implementation of [GPUCanvasContext](https://www.w3.org/TR/webgpu/#canvas-context)
 
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use arrayvec::ArrayVec;
 use euclid::default::Size2D;
 use log::warn;
+use paint_api::rendering_context::RenderingContext;
+#[cfg(windows)]
+use paint_api::rendering_context::SurfaceTexture;
 use paint_api::{
     CrossProcessPaintApi, ExternalImageSource, SerializableImageData, WebRenderExternalImageApi,
 };
@@ -312,14 +316,34 @@ impl Drop for StagingBuffer {
 
 pub struct WebGpuExternalImages {
     pub image_map: WebGpuExternalImageMap,
+    /// The compositor rendering context for this painter, used to import a GPU-direct shared
+    /// texture as a GL texture (the per-painter device, like `WebGLExternalImages`).
+    rendering_context: Rc<dyn RenderingContext>,
+    /// This painter's GPU adapter LUID (from its wall-layout GPU index), used to pick the
+    /// shared present texture from ITS GPU so the tile samples its own GPU's copy. `None` for
+    /// non-wall painters → GPU-direct disabled, CPU readback used.
+    #[allow(dead_code)] // read only on Windows.
+    painter_luid: Option<(i32, u32)>,
     pub locked_ids: FxHashMap<WebGPUContextId, PresentationStagingBuffer>,
+    /// GPU-direct: the imported GL surface textures currently locked, kept alive while the
+    /// compositor samples them and destroyed on unlock.
+    #[cfg(windows)]
+    locked_textures: FxHashMap<WebGPUContextId, SurfaceTexture>,
 }
 
 impl WebGpuExternalImages {
-    pub fn new(image_map: WebGpuExternalImageMap) -> Self {
+    pub fn new(
+        image_map: WebGpuExternalImageMap,
+        rendering_context: Rc<dyn RenderingContext>,
+        painter_luid: Option<(i32, u32)>,
+    ) -> Self {
         Self {
             image_map,
+            rendering_context,
+            painter_luid,
             locked_ids: Default::default(),
+            #[cfg(windows)]
+            locked_textures: Default::default(),
         }
     }
 }
@@ -327,6 +351,29 @@ impl WebGpuExternalImages {
 impl WebRenderExternalImageApi for WebGpuExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         let id = WebGPUContextId(id);
+
+        // GPU-direct: if this context has a shared present texture, import it on this
+        // painter's device and sample it directly (no CPU readback). Falls back to the
+        // CPU `RawData` path below if unavailable or if the import fails.
+        #[cfg(windows)]
+        {
+            let handle_and_size = {
+                let webgpu_contexts = self.image_map.lock().unwrap();
+                webgpu_contexts
+                    .get(&id)
+                    .and_then(|context_data| {
+                        context_data.gpu_direct_handle_and_size(self.painter_luid)
+                    })
+            };
+            if let Some((handle, size)) = handle_and_size &&
+                let Some((surface_texture, gl_texture, texture_size)) =
+                    self.rendering_context.create_texture_from_shared_handle(handle, size)
+            {
+                self.locked_textures.insert(id, surface_texture);
+                return (ExternalImageSource::NativeTexture(gl_texture), texture_size);
+            }
+        }
+
         let presentation = {
             let mut webgpu_contexts = self.image_map.lock().unwrap();
             webgpu_contexts
@@ -350,6 +397,14 @@ impl WebRenderExternalImageApi for WebGpuExternalImages {
 
     fn unlock(&mut self, id: u64) {
         let id = WebGPUContextId(id);
+
+        // GPU-direct: release the imported GL texture for this context, if any.
+        #[cfg(windows)]
+        if let Some(surface_texture) = self.locked_textures.remove(&id) {
+            self.rendering_context.destroy_texture(surface_texture);
+            return;
+        }
+
         let Some(presentation) = self.locked_ids.remove(&id) else {
             return;
         };
@@ -409,6 +464,15 @@ pub struct ContextData {
     presentation: Option<PresentationStagingBuffer>,
     /// Next epoch to be used
     next_epoch: Epoch,
+    /// GPU-direct present (Phase 3): one shared D3D12 texture PER physical GPU (keyed by
+    /// adapter LUID) that the canvas is GPU-copied into each frame, exported as a handle for
+    /// each tile's compositor to sample its own GPU's copy directly (no CPU readback). Empty
+    /// until first present with GPU-direct enabled.
+    #[cfg(windows)]
+    gpu_direct: FxHashMap<(i32, u32), crate::shared_present::SharedPresentTexture>,
+    /// Monotonic frame counter used to mint fresh copy command ids each frame.
+    #[cfg(windows)]
+    gpu_direct_frame: u32,
 }
 
 impl ContextData {
@@ -426,7 +490,28 @@ impl ContextData {
                 .collect(),
             presentation: None,
             next_epoch: Epoch(1),
+            #[cfg(windows)]
+            gpu_direct: FxHashMap::default(),
+            #[cfg(windows)]
+            gpu_direct_frame: 0,
         }
+    }
+
+    /// GPU-direct: the shared present texture's NT handle (as `u64`) and size for the GPU with
+    /// the given adapter LUID, if one exists for this context. Each tile's compositor looks up
+    /// ITS GPU's handle so it samples its own GPU's copy (no cross-GPU transfer).
+    #[cfg(windows)]
+    fn gpu_direct_handle_and_size(
+        &self,
+        painter_luid: Option<(i32, u32)>,
+    ) -> Option<(u64, Size2D<i32>)> {
+        let luid = painter_luid?;
+        self.gpu_direct.get(&luid).map(|shared| {
+            (
+                shared.shared_handle.0 as u64,
+                Size2D::new(shared.width as i32, shared.height as i32),
+            )
+        })
     }
 
     /// Returns `None` if no staging buffer is unused or failure when making it available
@@ -637,6 +722,110 @@ impl crate::WGPU {
         }
     }
 
+    /// GPU-direct present (Phase 3): for every physical GPU (the primary plus each secondary
+    /// fan-out global), ensure a shared present texture exists and GPU-copy the canvas into it.
+    /// Each tile's compositor then samples ITS GPU's copy directly (no cross-GPU transfer, no
+    /// CPU readback). Best-effort: a GPU that fails simply has no entry and falls back to the
+    /// CPU readback path for its tile.
+    #[cfg(windows)]
+    fn gpu_direct_copy(
+        &self,
+        context_data: &mut ContextData,
+        context_id: WebGPUContextId,
+        canvas_texture_id: id::TextureId,
+        config: &ContextConfiguration,
+    ) {
+        let size = Extent3d {
+            width: config.size.width,
+            height: config.size.height,
+            depth_or_array_layers: 1,
+        };
+        let frame = context_data.gpu_direct_frame;
+        if let Some(primary_luid) = self.primary_luid {
+            self.gpu_direct_copy_one(
+                context_data,
+                context_id,
+                primary_luid,
+                &self.global,
+                canvas_texture_id,
+                config,
+                size,
+                frame,
+            );
+        }
+        for secondary in &self.secondary_gpus {
+            self.gpu_direct_copy_one(
+                context_data,
+                context_id,
+                secondary.target_luid,
+                &secondary.global,
+                canvas_texture_id,
+                config,
+                size,
+                frame,
+            );
+        }
+        context_data.gpu_direct_frame = frame.wrapping_add(1);
+    }
+
+    /// Ensure + copy the canvas into the shared present texture for ONE GPU global (keyed by
+    /// `luid`). The canvas texture exists on every global (mirrored by the command fan-out),
+    /// so the copy source id is the same on each; the destination is that GPU's own shared
+    /// texture.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_direct_copy_one(
+        &self,
+        context_data: &mut ContextData,
+        context_id: WebGPUContextId,
+        luid: (i32, u32),
+        global: &Arc<Global>,
+        canvas_texture_id: id::TextureId,
+        config: &ContextConfiguration,
+        size: Extent3d,
+        frame: u32,
+    ) {
+        let needs_create = context_data
+            .gpu_direct
+            .get(&luid)
+            .is_none_or(|shared| shared.width != size.width || shared.height != size.height);
+        if needs_create {
+            // Drop the previous shared texture (on resize) to free its GPU memory.
+            if let Some(old) = context_data.gpu_direct.remove(&luid) {
+                global.texture_drop(old.texture_id);
+            }
+            let texture_id = crate::shared_present::next_shared_texture_id();
+            if let Some(shared) = crate::shared_present::create_shared_present_texture(
+                global,
+                config.device_id,
+                texture_id,
+                size.width,
+                size.height,
+                config.format,
+            ) {
+                log::info!(
+                    "GPU-direct: created shared present texture {}x{} for {context_id:?} on \
+                     GPU LUID {luid:?}",
+                    size.width,
+                    size.height
+                );
+                context_data.gpu_direct.insert(luid, shared);
+            }
+        }
+        if let Some(shared) = context_data.gpu_direct.get(&luid) {
+            let shared_texture_id = shared.texture_id;
+            crate::shared_present::copy_canvas_to_shared(
+                global,
+                config.device_id,
+                config.queue_id,
+                canvas_texture_id,
+                shared_texture_id,
+                size,
+                frame,
+            );
+        }
+    }
+
     /// Read the texture to the staging buffer, map it to CPU memory, and update the
     /// image in WebRender when complete.
     pub(crate) fn present(
@@ -687,6 +876,13 @@ impl crate::WGPU {
             return;
         };
         let epoch = context_data.next_epoch();
+        // GPU-direct present (Phase 3): also GPU-copy the canvas into a shared texture on the
+        // primary GPU so the compositor can later sample it directly. Additive to the CPU
+        // readback below, which still drives the display until the compositor side is wired.
+        #[cfg(windows)]
+        if self.multigpu_fanout && self.gpu_direct_present {
+            self.gpu_direct_copy(context_data, context_id, texture_id, &configuration);
+        }
         let wgpu_image_map = self.wgpu_image_map.clone();
         let paint_api = self.paint_api.clone();
         drop(webgpu_contexts);
