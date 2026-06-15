@@ -759,12 +759,6 @@ impl GStreamerPlayer {
     }
 
     fn setup(&self) -> Result<(), PlayerError> {
-        eprintln!(
-            "[RTSP-DIAG] setup() entered: stream_type={:?} inner_is_some={} network_uri={:?}",
-            self.stream_type,
-            self.inner.borrow().is_some(),
-            self.network_uri,
-        );
         if self.inner.borrow().is_some() {
             return Ok(());
         }
@@ -910,7 +904,6 @@ impl GStreamerPlayer {
                         "NetworkUri stream type requires a network_uri".to_owned(),
                     )
                 })?;
-                eprintln!("[RTSP-DIAG] NetworkUri: playbin3 uri = {uri}");
                 uri.to_value()
             },
         };
@@ -952,7 +945,6 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `error` signal
         signal_adapter.connect_error(move |_self, error, _details| {
-            eprintln!("[RTSP-DIAG] gstreamer error signal: {error}");
             let _ = notify!(observer, PlayerEvent::Error(error.to_string()));
         });
 
@@ -960,7 +952,6 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
-            eprintln!("[RTSP-DIAG] gstreamer state-changed: {play_state:?}");
             inner_clone.lock().unwrap().play_state = play_state;
 
             let state = match play_state {
@@ -1218,7 +1209,6 @@ impl GStreamerPlayer {
                         // AppSrc here. There is also no `need-data` signal to wait
                         // on, so unblock `setup()` immediately. No PlayerSource is
                         // stored: data is pulled by the backend, never pushed.
-                        eprintln!("[RTSP-DIAG] source-setup NetworkUri arm fired, signaling ready");
                         let sender_clone = sender.clone();
                         is_ready_clone.call_once(|| {
                             let _ = notify!(sender_clone, Ok(()));
@@ -1238,14 +1228,12 @@ impl GStreamerPlayer {
                     signal_adapter.play().stop();
                 });
 
-            eprintln!("[RTSP-DIAG] setup: calling player.pause() to trigger source-setup");
             inner.player.pause();
 
             (receiver, error_handler_id)
         };
 
         let result = receiver.recv().unwrap();
-        eprintln!("[RTSP-DIAG] setup: recv() returned {result:?}");
         glib::signal::signal_handler_disconnect(&inner.lock().unwrap().player, error_handler_id);
         result
     }

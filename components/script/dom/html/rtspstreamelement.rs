@@ -166,14 +166,11 @@ impl RtspStreamElement {
 
         // play() lazily runs the GStreamer setup (which connects to the RTSP
         // server and checks for the rtspsrc plugin); surface failures softly.
-        eprintln!("[RTSP-DIAG] element: calling player.play() for {}", self.Src().0);
         if let Err(error) = player.lock().unwrap().play() {
-            eprintln!("[RTSP-DIAG] element: player.play() FAILED: {error:?}");
             warn!("rtsp-stream: could not start playback: {error:?}");
             self.stop_player();
             return;
         }
-        eprintln!("[RTSP-DIAG] element: player.play() returned Ok");
 
         self.playing.set(true);
     }
@@ -194,15 +191,6 @@ impl RtspStreamElement {
     }
 
     fn handle_player_event(&self, event: PlayerEvent) {
-        // Diagnostic (experimental element): trace backend lifecycle events.
-        // Skip the high-frequency per-frame/position events (VideoFrameUpdated
-        // fires ~25fps and floods redirected stdout/stderr).
-        if !matches!(
-            event,
-            PlayerEvent::VideoFrameUpdated | PlayerEvent::PositionChanged(_)
-        ) {
-            eprintln!("[RTSP-DIAG] element received event: {event:?}");
-        }
         match event {
             PlayerEvent::MetadataUpdated(ref metadata) => {
                 let width = (metadata.width != 0).then_some(metadata.width);
