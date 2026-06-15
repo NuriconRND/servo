@@ -1201,11 +1201,25 @@ impl HTMLMediaElement {
                     error!("Could not play media: {error:?}");
                 }
             }
-        } else if is_playing
-            && let Some(ref player) = *self.player.borrow()
-            && let Err(error) = player.lock().unwrap().pause()
-        {
-            error!("Could not pause player: {error:?}");
+        } else if !self.is_potentially_playing() && is_playing {
+            // The element is not "potentially playing" while the underlying
+            // player is still running. Only pause the player for genuine, durable
+            // reasons (the element/user paused, playback ended, or a fatal error).
+            //
+            // Pausing on a transient `is_blocked_media_element` (a readyState dip)
+            // deadlocks this backend: pausing the GStreamer pipeline halts frame
+            // production, so readyState never climbs back to HAVE_FUTURE_DATA and
+            // playback never resumes. GStreamer already buffers on its own, so we
+            // keep the pipeline running through transient underruns instead.
+            let genuinely_paused = self.paused.get()
+                || self.ended_playback(LoopCondition::Included)
+                || self.error.get().is_some();
+            if genuinely_paused
+                && let Some(ref player) = *self.player.borrow()
+                && let Err(error) = player.lock().unwrap().pause()
+            {
+                error!("Could not pause player: {error:?}");
+            }
         }
     }
 

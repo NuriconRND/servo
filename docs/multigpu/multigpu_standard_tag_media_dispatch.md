@@ -73,10 +73,12 @@ window starves timers). Diagnostics use `console.error` so they surface via
 - `<img>` pref ON → tiff/tga/exr/ppm/pgm/qoi/hdr/jxl all `decoded=true 640x360`,
   plus the `<picture>` JPEG-XL negotiation. pref OFF → all `decoded=false`
   (onerror fallback); `<picture>` falls back to its PNG `<img>`.
-- `<video>` containers pref ON → avi/wmv/ts/flv/mov are accepted
-  (`canPlay="maybe"`, `readyState=4`) and the first frame decodes. pref OFF →
-  `canPlay=""` → inline fallback. **See the limitation below: the standard
-  `<video>` element does not sustain playback past the first frame.**
+- `<video>` containers pref ON → avi/wmv/ts/flv/mov **play to completion**
+  (`adv=true`, `currentTime` advances; all 6 reach 240+ frames simultaneously in
+  a 2×1 wall). pref OFF → `canPlay=""` → inline fallback. Requires the playback
+  fix below.
+- standard `<video>` (mp4/webm, no pref) also **plays** (`currentTime` advances)
+  with the fix — previously it froze for every format.
 - rtsp pref ON → routed to a `NetworkUri`/playbin3 player; with a live rtsp
   server it plays end-to-end (verified: 240+ YUV frames at ~25fps via
   `gst-validate-rtsp-server-1.0`). pref OFF → `MEDIA_ERR_SRC_NOT_SUPPORTED` →
@@ -84,31 +86,25 @@ window starves timers). Diagnostics use `console.error` so they surface via
 - 3×1 wall regression (no new prefs): `scroll_offsets=matched`,
   `Wall frame barrier complete`, balanced presents, 0 panics.
 
-## Known limitation: standard `<video>` does not sustain playback
+## Fix: standard `<video>` sustained-playback regression
 
-The dispatch (type detection, `<source>` selection, first-frame decode) works,
-but the standard `<video>` element **freezes after the first frame** for
-`file://`/`http(s)` sources — `currentTime` stays at ~0 even though
-`readyState=4`/`!paused`. This is a pre-existing fork limitation in the
-`HTMLMediaElement` ↔ player ↔ wall-frame **frame-delivery loop**, not in this
-feature's dispatch logic and not caused by tile count or concurrent-video count:
+Originally the standard `<video>` element **froze after the first frame** for
+*every* source/format (mp4/webm/mkv/…), in both wall and normal mode, while the
+custom `<x-media>` element played fine. Root cause was in
+`HTMLMediaElement::update_media_state` (`htmlmediaelement.rs`): the pause branch
+guard was just `is_playing`, so once the element was potentially-playing **and**
+the player was running (both true), control fell through to that branch and
+called `player.pause()` on every invocation — pausing the GStreamer pipeline
+mid-playback. State logs showed `play() → Playing → pause() → Paused` then a
+permanent stall (the decoder produced ~3 preroll frames and halted).
 
-- The custom `<x-media>` element (same GStreamer `NetworkUri`/playbin3 player)
-  plays 6 containers in a 2×1 wall to 240+ frames, while a *single* standard
-  `<video>` stalls at frame 1.
-- Routing `file://` through the `NetworkUri` player (an attempted fix) does **not**
-  help — a single standard `<video>` still stalls — and additionally trips
-  `Could not set the playback rate: NonSeekableStream` (the `NetworkUri` player is
-  built for non-seekable live streams). That change was reverted.
-- The decoder *does* produce samples (GStreamer `appsink` sample_id 2,3…), but the
-  media element stops pulling after the first frame (`Wall media frame summary`
-  reports `frame=1` only).
-
-Practical guidance: for wall **video** content use `<x-media>` (which sidesteps
-this path). Fixing standard `<video>` sustained playback requires debugging why
-`HTMLMediaElement` stops pulling frames after the first in wall mode (the
-appsink-pull loop / wall frame coordinator), which is a separate task. The probe
-page tracks `currentTime` (`adv=`/`t=`) specifically to catch this freeze.
+The fix gates the branch on `!is_potentially_playing() && is_playing`, and only
+pauses for *genuine* reasons (`paused`/`ended`/`error`) — not a transient
+`is_blocked_media_element()` (a readyState dip), which would deadlock this
+backend (pausing halts frame production, so readyState never recovers). After the
+fix, standard `<video>` plays all formats; the probe tracks `currentTime`
+(`adv=`/`t=`) to confirm real frame advancement (`readyState`/`paused` alone do
+not catch a freeze).
 
 ## Build gotcha
 
