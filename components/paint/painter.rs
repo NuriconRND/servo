@@ -1423,6 +1423,10 @@ impl Painter {
 
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
         let mut txn = Transaction::new();
+        // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
+        // frames). These are not paced by the script rendering-opportunity, so they otherwise wait
+        // for the next GenerateFrame (~48fps) before being composited.
+        let mut immediate_image_update = false;
         for update in updates {
             match update {
                 ImageUpdate::AddImage(key, description, data, is_animated_image) => {
@@ -1445,6 +1449,8 @@ impl Painter {
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
+                    } else {
+                        immediate_image_update = true;
                     }
                     txn.update_image(key, desc, data.into(), &DirtyRect::All)
                 },
@@ -1463,9 +1469,11 @@ impl Painter {
             }
         }
 
+        let mut generated_frame = false;
         if self.frame_delayer.needs_new_frame() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            generated_frame = true;
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
 
             self.send_to_constellation(
@@ -1476,6 +1484,17 @@ impl Painter {
 
             self.screenshot_taker
                 .prepare_screenshot_requests_for_render(&*self);
+        }
+
+        // Present content image updates (notably video frames) at their arrival rate by
+        // re-compositing the current scene now, instead of waiting for the script's
+        // rendering-opportunity GenerateFrame (which paces well below the video frame rate).
+        // generate_frame re-renders the full current display list, so all other DOM composites
+        // together with the updated image (z-order/clip preserved). Only when no frame is already
+        // in flight, so we don't stack composites or double up with the script's own GenerateFrame
+        // (which also increments pending_frames); this self-limits to roughly the present rate.
+        if immediate_image_update && !generated_frame && self.pending_frames.get() == 0 {
+            self.generate_frame(&mut txn, RenderReasons::SCENE);
         }
 
         self.send_transaction(txn);
