@@ -119,15 +119,21 @@
       for (const it of items) {
         const v = it.status();
         const err = v.error ? `err=${v.error.code}` : "err=none";
-        const playing = v.readyState >= 2 && !v.paused && !v.ended;
+        const ct = v.currentTime;
+        // Frame-advancement check: currentTime must actually move forward.
+        // readyState/paused alone do not catch a video frozen after frame 1.
+        const advancing = it.lastT !== undefined && ct > it.lastT + 0.001;
+        it.lastT = ct;
         it.st.textContent =
           `canPlayType=${JSON.stringify(it.canPlay)}\n` +
-          `readyState=${v.readyState} ${err}\n` +
-          `size=${v.videoWidth}x${v.videoHeight} ` + (playing ? "▶ playing" : "■ stopped");
-        it.st.className = playing ? "status" : "status bad";
+          `readyState=${v.readyState} ${err} t=${ct.toFixed(2)}\n` +
+          `size=${v.videoWidth}x${v.videoHeight} ` +
+          (advancing ? "▶ advancing" : (v.readyState >= 2 && !v.paused ? "▮ stalled" : "■ stopped"));
+        it.st.className = advancing ? "status" : "status bad";
         if (t % 3 === 0) {
           console.error(`STD_VIDEO ${it.key}: canPlay=${JSON.stringify(it.canPlay)} ` +
-            `readyState=${v.readyState} ${err} ${v.videoWidth}x${v.videoHeight} playing=${playing}`);
+            `readyState=${v.readyState} ${err} t=${ct.toFixed(2)} adv=${advancing} ` +
+            `${v.videoWidth}x${v.videoHeight}`);
         }
       }
     }, 1500);
