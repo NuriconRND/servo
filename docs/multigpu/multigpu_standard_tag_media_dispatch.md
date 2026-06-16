@@ -106,6 +106,50 @@ fix, standard `<video>` plays all formats; the probe tracks `currentTime`
 (`adv=`/`t=`) to confirm real frame advancement (`readyState`/`paused` alone do
 not catch a freeze).
 
+## Status: non-standard `<video>` playback verified
+
+**Playback itself is verified working** for standard `<video>` across standard
+formats (mp4/webm) and the non-standard containers (mkv/avi/wmv/ts/flv/mov), in
+1×1/2×1/3×1 walls, plus `rtsp://` end-to-end. This closes the playback
+verification. One follow-up remains below: looping of some streaming containers.
+
+## Known limitation & proposals: looping of streaming containers
+
+`loop` is not reliable for every container. Verified behavior (long runs, >2
+loop cycles, via the `seeking`/`seeked`/`ended` events):
+
+| container | loop |
+|---|---|
+| mkv, avi, mov | loops reliably (∞) |
+| ts, flv | loops 0–1× then freezes at `t=0` |
+| wmv | never loops (freezes at `t=0` on the first loop) |
+
+Root cause (not intentional, not a Servo logic bug): HTML `loop` replays by
+`seek(0)` (`end_of_playback_in_forwards_direction` → `seek`,
+`htmlmediaelement.rs`). The failing containers fire the `seeking` event but never
+`seeked` — i.e. the **GStreamer seek-to-0 never completes (no SeekDone)** and the
+element is stuck in `seeking`/`t=0`. Seeking through the standard `<video>`
+**ServoSrc (appsrc *push* source)** is unreliable for streaming containers that
+lack a robust seek index: MPEG-TS/FLV complete the seek non-deterministically
+(hence "loops once then stops"); ASF/WMV effectively never complete it. Matroska/
+AVI/ISO-BMFF have seek indices, so they loop fine. (`<x-media>` uses filesrc,
+which seeks better, but it is a live-stream element with no loop.)
+
+Proposals to resolve (not yet implemented — playback works, only re-looping of
+these three containers is affected):
+
+1. **loop-via-reload** — on end of stream, re-run the resource load (re-create
+   the player) instead of `seek(0)`. Robust for every container, but adds a brief
+   gap (pipeline teardown+setup) and a re-fetch between loops, including for the
+   containers that currently loop seamlessly.
+2. **seek-timeout fallback** — keep `seek(0)` (no gap for mkv/avi/mov/mp4/webm),
+   but if `seeked` does not arrive within a short timeout, fall back to a reload
+   for that element. Surgical (only the failing containers reload), but more
+   complex to implement and tune.
+
+Until one is implemented, prefer mkv/avi/mov (or standard mp4/webm) for content
+that must loop on the wall.
+
 ## Build gotcha
 
 `cargo build -p servoshell --features media-gstreamer` does **not** copy the
