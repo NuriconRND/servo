@@ -15,6 +15,10 @@
         --pref dom_video_network_uri_enabled=true routes a <video src="rtsp://…">
           to a GStreamer NetworkUri player (rtspsrc), no AppSrc fetch.
 
+  Layout: a flexbox 4x2 grid sized in viewport units so all tiles stay inside the
+  wall resolution (no scrolling) — every video is visible at once. (Servo does
+  not support `display:grid`, so flexbox is used.)
+
   Reuses the assets generated for the <x-media> probe at servo/test_media/
   (see multigpu_x_media_containers_probe.html for the ffmpeg recipe).
   For the rtsp case start a local server first, e.g.:
@@ -23,6 +27,7 @@
 
   Run:
     target\debug\servoshell.exe ^
+      --wall-layout ..\config\wall_layout.local_2x1.json --wall-all-tiles ^
       --pref dom_video_extended_containers_enabled=true ^
       --pref dom_video_network_uri_enabled=true ^
       tests\html\multigpu_standard_video_extended_probe.html
@@ -33,22 +38,20 @@
   <meta charset="utf-8">
   <title>standard &lt;video&gt; extended dispatch probe</title>
   <style>
-    html, body { margin:0; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
-    h1 { font-size:28px; margin:14px 18px; }
-    p.lead { margin:0 18px 14px; color:#9aa; font-size:15px; }
-    .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px; padding:0 18px 18px; }
-    .cell { background:#14161d; border-radius:10px; padding:12px; }
-    .cell h2 { font-size:22px; margin:0 0 8px; color:#6cb4f0; }
-    video { display:block; width:100%; height:200px; background:#000; border:2px solid #6cb4f0; border-radius:6px; }
-    .fallback { color:#ffcf99; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; padding:10px; font-size:14px; }
-    .status { font-family:monospace; font-size:13px; color:#bcf; margin-top:8px; white-space:pre-wrap; }
-    .bad { color:#ff9f43; }
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    /* 4 columns x 2 rows fills the viewport; 7 cells used. Sizes are in % so the
+       grid always fits whatever wall resolution the virtual viewport has. */
+    .grid { display:flex; flex-wrap:wrap; align-content:flex-start; width:100vw; height:100vh; }
+    .cell { box-sizing:border-box; width:25%; height:50%; padding:5px; position:relative; }
+    video { display:block; width:100%; height:100%; background:#000; border:2px solid #6cb4f0; border-radius:6px; object-fit:contain; }
+    .tag { position:absolute; top:11px; left:11px; font:bold 18px system-ui; color:#6cb4f0; background:rgba(0,0,0,.6); padding:1px 8px; border-radius:5px; }
+    .status { position:absolute; left:11px; right:11px; bottom:11px; font:12px/1.35 monospace; color:#bcf; background:rgba(0,0,0,.6); padding:3px 7px; border-radius:5px; white-space:pre-wrap; }
+    .status.bad { color:#ff9f43; }
+    /* inline <video> fallback content (shown when the source cannot render) */
+    .fallback { position:absolute; inset:5px; display:flex; align-items:center; justify-content:center; text-align:center; color:#ffcf99; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; padding:10px; font-size:14px; }
   </style>
 </head>
 <body>
-  <h1>standard &lt;video&gt; — extended containers + rtsp</h1>
-  <p class="lead">Standard browser: unsupported sources show the orange inline fallback.
-     Wall browser (prefs on): the same &lt;video&gt; plays.</p>
   <div class="grid" id="grid"></div>
   <script>
     const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_media.";
@@ -64,60 +67,63 @@
     const grid = document.getElementById("grid");
     const items = [];
 
-    function makeCell(title, build) {
+    // Build a cell whose <video> fills it, with the label and status overlaid so
+    // the video itself uses the full tile area.
+    function makeCell(title, video) {
       const cell = document.createElement("div");
       cell.className = "cell";
-      const h = document.createElement("h2"); h.textContent = title;
-      cell.appendChild(h);
-      const { node, status } = build();
-      cell.appendChild(node);
-      const st = document.createElement("div"); st.className = "status"; st.textContent = "loading";
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = title;
+      const st = document.createElement("div");
+      st.className = "status";
+      st.textContent = "loading";
+      cell.appendChild(video);
+      cell.appendChild(tag);
       cell.appendChild(st);
       grid.appendChild(cell);
-      return { st, status };
+      return st;
+    }
+
+    function makeVideo(srcAttr, sourceType, fallbackText, useSrc) {
+      const v = document.createElement("video");
+      v.muted = true; v.autoplay = true; v.loop = true; v.setAttribute("playsinline", "");
+      if (useSrc) {
+        v.src = srcAttr;
+      } else {
+        const s = document.createElement("source");
+        s.src = srcAttr; s.type = sourceType;
+        v.appendChild(s);
+      }
+      const fb = document.createElement("p");
+      fb.className = "fallback";
+      fb.textContent = fallbackText;
+      v.appendChild(fb);
+      v.addEventListener("loadedmetadata", () => v.play().catch(() => {}));
+      return v;
     }
 
     for (const c of containers) {
-      const probe = document.createElement("video");
-      const cpt = probe.canPlayType(c.type);
-      const cell = makeCell("." + c.ext, () => {
-        const v = document.createElement("video");
-        v.muted = true; v.autoplay = true; v.loop = true; v.setAttribute("playsinline", "");
-        const s = document.createElement("source");
-        s.src = BASE + c.ext; s.type = c.type;
-        v.appendChild(s);
-        const fb = document.createElement("p");
-        fb.className = "fallback";
-        fb.textContent = `Cannot play ${c.ext.toUpperCase()} (${c.type}) in this browser.`;
-        v.appendChild(fb);
-        v.addEventListener("loadedmetadata", () => v.play().catch(() => {}));
-        return { node: v, status: () => v };
-      });
-      items.push({ key: c.ext, type: c.type, canPlay: cpt, ...cell });
+      const cpt = document.createElement("video").canPlayType(c.type);
+      const v = makeVideo(BASE + c.ext, c.type,
+        `Cannot play ${c.ext.toUpperCase()} (${c.type}) in this browser.`, false);
+      const st = makeCell("." + c.ext, v);
+      items.push({ key: c.ext, canPlay: cpt, v, st });
     }
 
     // rtsp:// via a bare <video src> + inline fallback.
     {
-      const cell = makeCell("rtsp://", () => {
-        const v = document.createElement("video");
-        v.muted = true; v.autoplay = true; v.setAttribute("playsinline", "");
-        v.src = "rtsp://127.0.0.1:8554/test";
-        const fb = document.createElement("p");
-        fb.className = "fallback";
-        fb.textContent = "Cannot play rtsp:// live stream in this browser.";
-        v.appendChild(fb);
-        v.addEventListener("loadedmetadata", () => v.play().catch(() => {}));
-        return { node: v, status: () => v };
-      });
-      const probe = document.createElement("video");
-      items.push({ key: "rtsp", type: "rtsp://", canPlay: "(scheme)", ...cell });
+      const v = makeVideo("rtsp://127.0.0.1:8554/test", null,
+        "Cannot play rtsp:// live stream in this browser.", true);
+      const st = makeCell("rtsp://", v);
+      items.push({ key: "rtsp", canPlay: "(scheme)", v, st });
     }
 
     let t = 0;
     setInterval(() => {
       t++;
       for (const it of items) {
-        const v = it.status();
+        const v = it.v;
         const err = v.error ? `err=${v.error.code}` : "err=none";
         const ct = v.currentTime;
         // Frame-advancement check: currentTime must actually move forward.
@@ -125,15 +131,13 @@
         const advancing = it.lastT !== undefined && ct > it.lastT + 0.001;
         it.lastT = ct;
         it.st.textContent =
-          `canPlayType=${JSON.stringify(it.canPlay)}\n` +
-          `readyState=${v.readyState} ${err} t=${ct.toFixed(2)}\n` +
-          `size=${v.videoWidth}x${v.videoHeight} ` +
+          `canPlayType=${JSON.stringify(it.canPlay)} ${err}\n` +
+          `t=${ct.toFixed(2)} ${v.videoWidth}x${v.videoHeight} ` +
           (advancing ? "▶ advancing" : (v.readyState >= 2 && !v.paused ? "▮ stalled" : "■ stopped"));
         it.st.className = advancing ? "status" : "status bad";
         if (t % 3 === 0) {
           console.error(`STD_VIDEO ${it.key}: canPlay=${JSON.stringify(it.canPlay)} ` +
-            `readyState=${v.readyState} ${err} t=${ct.toFixed(2)} adv=${advancing} ` +
-            `${v.videoWidth}x${v.videoHeight}`);
+            `${err} t=${ct.toFixed(2)} adv=${advancing} ${v.videoWidth}x${v.videoHeight}`);
         }
       }
     }, 1500);
