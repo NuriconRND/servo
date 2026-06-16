@@ -21,6 +21,11 @@
   Reuses the assets generated for the <x-image> probe at servo/test_media/
   (see multigpu_x_image_formats_probe.html for the ffmpeg recipe).
 
+  Thumbnails (standard-browser fallback): a 320x180 JPEG per image, used as the
+  <picture> <img> fallback. Generate with:
+    ffmpeg -y -i test_image.exr -vf scale=320:180 test_image.exr.thumb.jpg
+    (repeat for tiff/tga/ppm/pgm/qoi/hdr/jxl)
+
   Run:
     # extended decode ON (wall browser behavior)
     target\debug\servoshell.exe ^
@@ -52,15 +57,18 @@
   <script>
     const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/test_image.";
     // ext -> human description shown when the standard browser cannot decode it.
+    // ext -> { mime for the typed <picture> <source>, human description }.
+    // The mime values must match EXTENDED_IMAGE_MIME_TYPES in htmlimageelement.rs
+    // so the wall browser accepts the typed source under the pref.
     const formats = {
-      tiff: "TIFF — print/scanning raster",
-      tga:  "TGA — legacy game/texture format",
-      exr:  "OpenEXR — HDR film/VFX image",
-      ppm:  "PPM — Netpbm raw color",
-      pgm:  "PGM — Netpbm grayscale",
-      qoi:  "QOI — fast lossless format",
-      hdr:  "Radiance HDR — HDR environment map",
-      jxl:  "JPEG XL — next-gen still codec",
+      tiff: { mime: "image/tiff",                 desc: "TIFF — print/scanning raster" },
+      tga:  { mime: "image/x-tga",                desc: "TGA — legacy game/texture format" },
+      exr:  { mime: "image/x-exr",                desc: "OpenEXR — HDR film/VFX image" },
+      ppm:  { mime: "image/x-portable-pixmap",    desc: "PPM — Netpbm raw color" },
+      pgm:  { mime: "image/x-portable-graymap",   desc: "PGM — Netpbm grayscale" },
+      qoi:  { mime: "image/qoi",                  desc: "QOI — fast lossless format" },
+      hdr:  { mime: "image/vnd.radiance",         desc: "Radiance HDR — HDR environment map" },
+      jxl:  { mime: "image/jxl",                  desc: "JPEG XL — next-gen still codec" },
     };
     const grid = document.getElementById("grid");
     const items = [];
@@ -83,36 +91,24 @@
       return st;
     }
 
-    for (const [ext, desc] of Object.entries(formats)) {
-      const img = document.createElement("img");
-      const fb = document.createElement("div");
-      fb.className = "fallback";
-      fb.textContent = "Unsupported here: " + desc;
-      fb.style.display = "none";
-      img.alt = desc;
-      img.addEventListener("error", () => {
-        img.style.display = "none";
-        fb.style.display = "flex";
-      });
-      img.src = BASE + ext;
-      const st = makeCell("." + ext, img);
-      st.parentNode.appendChild(fb); // overlay fallback inside the cell
-      items.push({ ext, img, st });
-    }
-
-    // A <picture> negotiation case: a typed <source> for JPEG XL with a PNG
-    // <img> fallback. In a standard browser the typed source is skipped (PNG
-    // shows); in the wall browser the typed source is accepted and decoded.
-    {
+    // Each cell is a <picture>: a typed <source> for the non-standard format,
+    // plus an <img> whose own src is a STANDARD JPEG thumbnail.
+    //   - Standard browser: the typed <source> is an unknown type -> skipped ->
+    //     the <img> loads the thumbnail (graceful degradation = a thumbnail).
+    //   - Wall browser (pref on): the typed <source> is accepted -> the <img>
+    //     loads and decodes the real non-standard image.
+    // The real image is 640x360 and the thumbnail is 320x180, so naturalWidth
+    // tells which one was used.
+    for (const [ext, info] of Object.entries(formats)) {
       const pic = document.createElement("picture");
       const src = document.createElement("source");
-      src.type = "image/jxl"; src.srcset = BASE + "jxl";
+      src.type = info.mime; src.srcset = BASE + ext;
       const img = document.createElement("img");
-      img.alt = "PNG fallback";
-      img.src = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo/test_media/frame.png";
+      img.alt = info.desc;
+      img.src = BASE + ext + ".thumb.jpg";
       pic.appendChild(src); pic.appendChild(img);
-      const st = makeCell("<picture> jxl→png", pic);
-      items.push({ ext: "picture", img, st });
+      const st = makeCell("." + ext, pic);
+      items.push({ ext, img, st });
     }
 
     let t = 0;
@@ -120,11 +116,12 @@
       t++;
       for (const it of items) {
         const w = it.img.naturalWidth, h = it.img.naturalHeight;
-        const decoded = it.img.complete && w > 0;
-        it.st.textContent = `complete=${it.img.complete} natural=${w}x${h} ` +
-          (decoded ? "✓ decoded" : "✗ fallback");
-        it.st.className = decoded ? "status" : "status bad";
-        if (t % 3 === 0) console.error(`STD_IMG ${it.ext}: decoded=${decoded} ${w}x${h}`);
+        const loaded = it.img.complete && w > 0;
+        const real = w >= 640; // real image is 640x360; the thumbnail is 320x180
+        it.st.textContent = `${w}x${h} ` +
+          (loaded ? (real ? "✓ decoded (real)" : "▣ thumbnail (fallback)") : "✗ none");
+        it.st.className = real ? "status" : "status bad";
+        if (t % 3 === 0) console.error(`STD_IMG ${it.ext}: real=${real} ${w}x${h}`);
       }
     }, 1500);
 

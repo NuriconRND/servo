@@ -63,6 +63,28 @@ New prefs (`components/config/prefs.rs`, all default `false`):
 `tests/html/multigpu_standard_video_extended_probe.html` — standard markup with
 fallbacks, reusing the `servo/test_media/` assets generated for the `<x-image>` /
 `<x-media>` probes. Both support `?autoclose=MS` for headless/automated runs.
+Both use a flexbox grid sized in viewport units so every tile stays inside the
+wall resolution (Servo does not support `display:grid`).
+
+### Thumbnail fallback for standard browsers
+
+So a standard browser shows a **thumbnail** (not just text) for media it cannot
+decode, each non-standard asset has a pre-generated 320×180 JPEG thumbnail
+(`*.thumb.jpg` in `test_media/`; the standard browser can decode it, the
+non-standard original it cannot). Pure-authoring, no engine change:
+
+- **`<img>`**: `<picture><source type="image/x-exr" srcset="photo.exr"><img
+  src="photo.thumb.jpg"></picture>` — standard browser skips the unknown typed
+  source and loads the thumbnail `<img>`; the wall browser accepts the typed
+  source and decodes the real image. Verified in Servo both ways (real 640×360 vs
+  thumbnail 320×180).
+- **`<video>`**: `<video poster="clip.thumb.jpg">` — real standard browsers show
+  the poster when the source can't play; the wall browser hides it once playback
+  starts. Servo does **not** render `poster` on a source error (and does not fire
+  the `error` event for a rejected `<source type>`), so the probe also overlays
+  the thumbnail `<img>` by polling `readyState` — that covers Servo's pref-off
+  "standard" preview. Verified: failed clips show the 320×180 thumbnail overlay;
+  playing clips show none.
 
 ## Verification (2026-06-15, debug build, `--features media-gstreamer`)
 
