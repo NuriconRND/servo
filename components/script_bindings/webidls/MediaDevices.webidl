@@ -21,9 +21,20 @@ partial interface MediaDevices {
     Promise<MediaStream> getUserMedia(optional MediaStreamConstraints constraints = {});
 };
 
+// https://w3c.github.io/mediacapture-screen-share/#mediadevices-additions
+partial interface MediaDevices {
+    [Pref="dom_screen_capture_enabled"]
+    Promise<MediaStream> getDisplayMedia(optional DisplayMediaStreamConstraints constraints = {});
+};
+
 
 dictionary MediaStreamConstraints {
         (boolean or MediaTrackConstraints) video = false;
+        (boolean or MediaTrackConstraints) audio = false;
+};
+
+dictionary DisplayMediaStreamConstraints {
+        (boolean or MediaTrackConstraints) video = true;
         (boolean or MediaTrackConstraints) audio = false;
 };
 

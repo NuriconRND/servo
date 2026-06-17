@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!-- Copyright Servo. SPDX-License-Identifier: MPL-2.0 -->
+<!--
+  Phase: getDisplayMedia() screen-capture probe (multi-GPU wall).
+
+  Captures a screen/window via MediaDevices.getDisplayMedia() and presents it
+  full-bleed in a <video> element. On the wall this <video> fans out to every
+  tile through the existing media external-image broadcast (no extra wiring).
+
+  Run requires the screen-capture prefs (see CLAUDE.md / notes doc):
+    --pref dom_webrtc_enabled --pref dom_screen_capture_enabled
+    --pref media_screen_capture_monitor_index=<n>   (or)
+    --pref media_screen_capture_window_title=<substring>
+
+  NOTE: capturing the monitor that hosts the servoshell window causes an
+  infinite-mirror feedback loop. Capture a different monitor or a window.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>multigpu screen capture probe</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #stage { position: fixed; inset: 0; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    #hud {
+      position: fixed; left: 12px; top: 12px; z-index: 10;
+      font: 14px/1.4 monospace; color: #0f0; background: rgba(0,0,0,.55);
+      padding: 8px 10px; border: 1px solid #0f0; white-space: pre;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"><video id="v" autoplay playsinline muted></video></div>
+  <div id="hud">starting…</div>
+  <script>
+    const hud = document.getElementById("hud");
+    const v = document.getElementById("v");
+    let frames = 0;
+
+    function log(msg) {
+      hud.textContent = msg;
+      console.log("[screen-capture-probe] " + msg);
+    }
+
+    async function start() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        log("getDisplayMedia UNAVAILABLE\n(enable dom_webrtc_enabled + dom_screen_capture_enabled)");
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        const tracks = stream.getVideoTracks();
+        v.srcObject = stream;
+        log("capture started\nvideo tracks: " + tracks.length);
+
+        // Sample currentTime advancement to confirm live frames (no per-frame
+        // callback is guaranteed in this engine).
+        let last = -1;
+        setInterval(() => {
+          const t = v.currentTime.toFixed(2);
+          const advancing = v.currentTime !== last;
+          last = v.currentTime;
+          log("capture live\ntracks: " + tracks.length +
+              "\nvideoSize: " + v.videoWidth + "x" + v.videoHeight +
+              "\ncurrentTime: " + t + (advancing ? " (advancing)" : " (STALLED)"));
+        }, 1000);
+      } catch (e) {
+        log("getDisplayMedia FAILED:\n" + e);
+      }
+    }
+    start();
+  </script>
+</body>
+</html>

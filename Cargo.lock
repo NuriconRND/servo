@@ -8485,6 +8485,7 @@ dependencies = [
  "servo-media-traits",
  "servo-media-webrtc",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

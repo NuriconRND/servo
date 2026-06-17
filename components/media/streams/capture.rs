@@ -26,3 +26,25 @@ pub enum Constrain<T> {
     Value(T),
     Range(ConstrainRange<T>),
 }
+
+/// Describes the fixed source captured by `MediaDevices.getDisplayMedia()`.
+///
+/// This v1 source is selected from preferences rather than an interactive picker:
+/// a non-empty `window_title` captures the first matching top-level window,
+/// otherwise `monitor_index` selects a whole monitor (-1 = primary).
+#[derive(Clone, Debug)]
+pub struct DisplayCaptureSource {
+    pub monitor_index: i32,
+    pub window_title: Option<String>,
+    pub show_cursor: bool,
+}
+
+impl Default for DisplayCaptureSource {
+    fn default() -> Self {
+        Self {
+            monitor_index: -1,
+            window_title: None,
+            show_cursor: true,
+        }
+    }
+}

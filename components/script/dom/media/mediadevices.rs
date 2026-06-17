@@ -11,11 +11,13 @@ use script_bindings::reflector::reflect_dom_object;
 use servo_config::pref;
 use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
-use servo_media::streams::capture::{Constrain, ConstrainRange, MediaTrackConstraintSet};
+use servo_media::streams::capture::{
+    Constrain, ConstrainRange, DisplayCaptureSource, MediaTrackConstraintSet,
+};
 
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::MediaDevicesBinding::{
-    MediaDevicesMethods, MediaStreamConstraints,
+    DisplayMediaStreamConstraints, MediaDevicesMethods, MediaStreamConstraints,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     BooleanOrMediaTrackConstraints, ClampedUnsignedLongOrConstrainULongRange as ConstrainULong,
@@ -70,6 +72,36 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
         {
             let track = MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video);
             stream.add_track(&track);
+        }
+
+        p.resolve_native_with_cx(cx, &stream);
+        p
+    }
+
+    /// <https://w3c.github.io/mediacapture-screen-share/#dom-mediadevices-getdisplaymedia>
+    fn GetDisplayMedia(
+        &self,
+        cx: &mut CurrentRealm,
+        constraints: &DisplayMediaStreamConstraints,
+    ) -> Rc<Promise> {
+        let p = Promise::new_in_realm(cx);
+        let media = ServoMedia::get();
+        media.set_capture_mocking(pref!(media_capture_mocking_enabled));
+        let stream = MediaStream::new(cx, &self.global());
+        // v1: no source picker. The captured screen/window is selected from
+        // preferences and the same fixed source is returned every call.
+        if let Some(video_constraints) = convert_constraints(&constraints.video) {
+            let window_title = pref!(media_screen_capture_window_title);
+            let source = DisplayCaptureSource {
+                monitor_index: pref!(media_screen_capture_monitor_index) as i32,
+                window_title: (!window_title.is_empty()).then_some(window_title),
+                show_cursor: pref!(media_screen_capture_show_cursor),
+            };
+            if let Some(video) = media.create_display_stream(source, video_constraints) {
+                let track =
+                    MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video);
+                stream.add_track(&track);
+            }
         }
 
         p.resolve_native_with_cx(cx, &stream);
