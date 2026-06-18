@@ -73,3 +73,25 @@
 - 표출 경로는 getDisplayMedia와 동일 → raw passthrough(VP8 미경유) 그대로 적용.
 - `windows.py`의 `GSTREAMER_URL`(1.22.8)은 bootstrap 시에만 쓰이며 사내 셋업에선
   미사용 — 필요하면 커스텀 MSI로 갱신.
+
+## 표시 fps가 60에 못 미치는 이유 + GPU zero-copy 보류 (2026-06-18)
+
+캡처카드는 60fps인데 servoshell 표시는 그보다 낮음. **CPU 경로 바운드**가 원인:
+- 비디오 sink 정책 기본 **Smooth**(drop=false, qos=false, `render.rs` VideoSinkPolicy):
+  appsink가 프레임을 안 버리고 backpressure → 라이브 src(ksvideosrc/mfvideosrc)가
+  **캡처 단에서 프레임 드롭**. 즉 표시 fps = 소비자(렌더) 처리율.
+- Windows는 `platform::Render = RenderDummy`(render.rs)라 **GPU zero-copy 경로 부재** →
+  프레임마다 **YUY2→I420 CPU 변환**(videoconvert) + Y/U/V **3평면 CPU→GPU 업로드** + 씬 합성.
+- 대조군 `ksvideosrc ! autovideosink`는 d3d11videosink(GPU)로 네이티브 YUY2 직결이라 60fps.
+
+**GPU zero-copy(B1: RenderUnix 미러, Servo ANGLE EGL ↔ gstgl 공유) 보류.** 다운스트림
+(`VideoFrameData::Texture`→`NativeTexture`→webrender)과 Windows ANGLE EGL 컨텍스트는
+준비돼 있으나, **사내 커스텀 gstgl이 WGL 전용**(EGL/ANGLE 백엔드 없음: `gstgl-1.0-0.dll`이
+`OPENGL32`만 import, `libEGL`/`libGLESv2` 부재, `GST_GL_PLATFORM=egl` 컨텍스트 생성 실패)
+이라 ANGLE EGL 컨텍스트 공유가 불가 → B1 차단. 하려면 사내 GStreamer를 **gstgl
+EGL/ANGLE 포함으로 재빌드**해야 함. 대안 B2(`d3d11upload!d3d11convert` →
+`EGL_ANGLE_d3d_texture_client_buffer`로 D3D11 텍스처를 ANGLE GL로 import)는 신규 interop
+작업 + surfman DXGI 미비 리스크. 추가로 `media_glvideo_enabled` pref도 기본 off(prefs.rs:560).
+
+**보류 사유**: capture card 입력도 multi-GPU wall에선 어차피 **GPU간 분배**가 필요해
+단일 GPU zero-copy가 최종 아키텍처가 아니며, 월 구현의 다른 고려사항과 함께 다룰 사안.
