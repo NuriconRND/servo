@@ -314,25 +314,38 @@ raw가 아니다. (파일 `<video>`는 `StreamType::Seekable/NetworkUri`로 play
 `cpu-used=-16`(최저화질). 화면 콘텐츠가 매 프레임 독립 양자화로 뭉개져 압축 노이즈가
 계속 흔들린다. 파일 비디오가 깨끗한 건 위 경로를 안 타기 때문.
 
-### 8-3. 수정 (commit ecbe1f9048b)
+### 8-3. 최종 수정 — raw passthrough (commit c59488e3652)
 
-`encoded(&mut self, high_quality: bool)`로 분기:
-- **로컬 표출**(`set_stream` → `true`): `target-bitrate=80Mbps`, `min/max-quantizer=0/8`.
-  속도는 realtime 유지(`deadline=1`, `cpu-used=-16`)해서 인코더 스톨 없음.
-- **WebRTC 송신**(`webrtc.rs` ×2 → `false`): 대역폭 친화 기본값 유지.
+로컬 표출은 **인코드/디코드 자체가 불필요**하므로 VP8 왕복을 완전히 제거.
+playbin 구조(`ServoMediaStreamSrc → playbin → decodebin → appsink`)는 그대로 두고
+raw I420 프레임을 흘린다:
 
-검증: 1115×628 창 / 1920×1080 모니터 캡처 모두 노이즈 완전 제거, 프레임 정상 advancing.
+- `media_stream.rs`: `encoded()`는 원래대로(VP8/Opus RTP, **WebRTC 전용**) 복원.
+  새 `raw_passthrough()` — 비디오는 `videoconvert → capsfilter(video/x-raw,
+  format=I420)`, 오디오는 `audioconvert → capsfilter(audio/x-raw)`.
+- `media_stream_source.rs`: `set_stream`가 비디오는 `raw_passthrough()`, 오디오는
+  `encoded()`(opus). `VIDEO_SRC_PAD_TEMPLATE`을 `RTP_CAPS_VP8` →
+  `video/x-raw,format=I420`으로 변경.
+- `webrtc.rs`: `encoded()` 무인자 호출(기존 유지).
 
-### 8-4. 기각된 시도 / 후속
+**핵심**: pad template과 capsfilter를 **고정 포맷(`format=I420`)**으로 둬야
+playbin/decodebin이 I420 appsink로 passthrough(디코더 없이 최대 videoconvert만)
+협상을 한다. bare `video/x-raw`(포맷 미지정)는 metadata 0x0로 협상 실패 → 정지
+(naive 시도 실패의 진짜 원인). 검증: 1115×628 창 캡처 raw 프레임 정상 advancing,
+코덱 아티팩트 0(무손실).
+
+> 중간 단계였던 고품질 VP8(commit ecbe1f9048b, `encoded(high_quality)` 80Mbps)는
+> 이 raw passthrough로 **대체·복원**됨. 노이즈 원인이 VP8 양자화였음을 확인하는
+> 데 쓰였고, 근본 해결(인코드 제거)이 가능해져 더 이상 불필요.
+
+### 8-4. 기각된 시도
 
 - **framerate 고정**(videorate+capsfilter): proxysink↔proxysrc 경계에서 caps의
   framerate가 0/1로 리셋돼 sink까지 전달 안 됨 → 무효.
 - **외부이미지 plane 복사**(media-thread `MediaExternalImages::lock`): borrowed 버퍼
   recycle 경합 가설이었으나 무효(원인은 VP8).
-- **raw passthrough**(`encoded()` 대신 `src_element()` + pad template을 raw caps):
-  playbin/decodebin이 커스텀 소스의 raw `video/x-raw`를 받지 못해 프레임 정지
-  (`GST_PAD_IS_SINK` 경고). → **근본 해결(인코드 왕복 제거)은 playbin 우회가 필요**
-  하며 v1 범위 밖. 현재는 고품질 VP8로 둠.
+- **naive raw passthrough**(pad template을 bare `video/x-raw`로): 포맷 미지정이라
+  decodebin 협상 실패(0x0 정지). → 8-3에서 `format=I420` 고정으로 해결.
 
 교훈: 다운스케일 스크린샷만으로 노이즈 유무를 판정하지 말 것(실제로 여러 번 오판함).
 픽셀 품질 검증은 육안 확인에 의존.
