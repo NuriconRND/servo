@@ -19,14 +19,27 @@
 
 ## 적용한 변경
 
-1. **슬롯#1 비활성화 (필수)**: `target/dependencies/gstreamer`를 비워야(없어야)
-   해상도가 시스템 설치(슬롯#2)로 내려간다. 작업 시
-   `target/dependencies/gstreamer` → `gstreamer.1228bak`로 rename.
-   ⚠️ `mach bootstrap-gstreamer`(또는 force)는 슬롯#1에 1.22.8을 다시 깔아 시스템을
-   가린다 — 사내 셋업에선 **bootstrap 하지 말 것**(시스템 1.26.8 사용).
+1. **슬롯#1을 커스텀 설치로 향하는 정션(junction)으로 (권장·견고)**: 기존 1.22.8
+   `target/dependencies/gstreamer`를 치우고(rename/삭제), 그 자리에 시스템 설치를
+   가리키는 디렉터리 정션을 만든다(관리자 불필요):
+   ```
+   mklink /J "<repo>\servo\target\dependencies\gstreamer\1.0\msvc_x86_64" ^
+             "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+   ```
+   ⚠️ **rename만 하고 env(슬롯#2)에 의존하지 말 것** — release를 한 번이라도
+   1.22.8(슬롯#1)로 빌드했으면 cargo가 `-sys` 빌드스크립트의 link-search를
+   `target/dependencies/gstreamer/.../lib`로 **캐시**해 두는데, 슬롯#1을 그냥 지우면
+   그 경로가 사라져 release 링크가 `could not open 'gstplay-1.0.lib'`로 실패한다
+   (cargo는 외부 설치 변경으로 -sys 빌드스크립트를 자동 재실행하지 않음; debug는
+   캐시된 .exe라 안 걸려 보일 수 있음). 정션을 슬롯#1에 두면 캐시·신규 경로가 모두
+   1.26.8로 resolve돼 이 문제를 회피한다. (대안: 커스텀 MSI를 슬롯#1에 직접 `/a`
+   설치. 또는 깨끗이 하려면 `cargo clean` 후 재빌드.)
+   ⚠️ `mach bootstrap-gstreamer`(또는 force)는 슬롯#1에 1.22.8을 다시 깔아 정션/시스템을
+   덮어쓴다 — 사내 셋업에선 **bootstrap 하지 말 것**.
 2. **`GSTREAMER_1_0_ROOT_MSVC_X86_64`** = `C:\Program Files\gstreamer\1.0\msvc_x86_64\`
-   (시스템 설치가 보통 자동 설정. 빌드 env에 명시 권장.) 시스템 설치엔 devel(
-   pkg-config.exe / lib/pkgconfig/*.pc / include / *.lib)이 포함돼야 함.
+   (시스템 설치가 보통 자동 설정. 정션을 쓰면 슬롯#1이 우선이라 필수는 아니나 빌드
+   env에 명시 권장.) 시스템 설치엔 devel(pkg-config.exe / lib/pkgconfig/*.pc /
+   include / *.lib)이 포함돼야 함.
 3. **`python/servo/gstreamer.py` `GSTREAMER_WIN_DEPENDENCY_LIBS`**: 1.22.8 기준
    버전 스탬프 이름을 1.26.8 실제 DLL로 갱신(llvm-objdump로 확인):
    - FFmpeg 5→7: `avcodec-59→61`, `avformat-59→61`, `avfilter-8→10`,
@@ -49,6 +62,8 @@
 - `enumerateDevices`: 11 total, **4 videoinput** 열거, assert 크래시 없음.
 - `getUserMedia({video})`: tracks 1, **videoSize 1920x1080**, currentTime advancing.
 - 테스트: `tests/html/multigpu_capture_card_probe.html`.
+- **debug + release 둘 다** 빌드/실행 확인(release는 슬롯#1 정션으로 -sys
+  link-search 캐시 경로가 1.26.8로 resolve돼 링크 통과).
 
 ## 남은 한계 / 후속
 
