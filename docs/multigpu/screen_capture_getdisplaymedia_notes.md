@@ -285,6 +285,60 @@ package 단계가 없어 부적절).
 
 ---
 
+## 8. 표출 파이프라인 실태 + 캡처 노이즈 버그 (2026-06-18)
+
+### 8-1. MediaStream → `<video>` 표출은 VP8/RTP 왕복을 탄다 (raw 아님)
+
+캡처 트랙을 `<video>`로 표출할 때의 실제 GStreamer 경로(코드 추적 결과):
+
+```
+d3d11screencapturesrc → videoconvert → queue          (media_stream.rs create_video_from)
+  → vp8enc → rtpvp8pay → queue → capsfilter(RTP/VP8)   (media_stream.rs encoded())
+  → proxysink ⇒ proxysrc(ServoMediaStreamSrc)          (media_stream_source.rs set_stream)
+  → playbin → rtpvp8depay + vp8 디코드 → I420
+  → appsink (render.rs setup_video_sink, 단일프로세스=I420 borrowed)
+  → MediaFrameRenderer/외부이미지 (htmlmediaelement.rs) → webrender
+```
+
+핵심: `register_stream`은 스트림을 전역 레지스트리에 저장만 하고, **proxysink는
+나중에 player가 소비할 때 `ServoMediaStreamSrc::set_stream`(media_stream_source.rs)
+에서 붙는다.** 그리고 거기서 raw `queue`가 아니라 **`GStreamerMediaStream::encoded()`**
+(원래 WebRTC 송신용)를 호출 → **VP8 인코드/디코드 왕복**이 생긴다. 즉 로컬 표출은
+raw가 아니다. (파일 `<video>`는 `StreamType::Seekable/NetworkUri`로 playbin 직접
+디코드라 이 경로를 안 탄다.)
+
+### 8-2. 노이즈 증상과 원인
+
+캡처는 표출되는데 **작은 글자에 지글지글 노이즈**, 정지 화면에서도 프레임마다 변함.
+원인 = vp8enc **기본 설정**: `target-bitrate=256kbps`(1080p 화면엔 턱없이 부족),
+`cpu-used=-16`(최저화질). 화면 콘텐츠가 매 프레임 독립 양자화로 뭉개져 압축 노이즈가
+계속 흔들린다. 파일 비디오가 깨끗한 건 위 경로를 안 타기 때문.
+
+### 8-3. 수정 (commit ecbe1f9048b)
+
+`encoded(&mut self, high_quality: bool)`로 분기:
+- **로컬 표출**(`set_stream` → `true`): `target-bitrate=80Mbps`, `min/max-quantizer=0/8`.
+  속도는 realtime 유지(`deadline=1`, `cpu-used=-16`)해서 인코더 스톨 없음.
+- **WebRTC 송신**(`webrtc.rs` ×2 → `false`): 대역폭 친화 기본값 유지.
+
+검증: 1115×628 창 / 1920×1080 모니터 캡처 모두 노이즈 완전 제거, 프레임 정상 advancing.
+
+### 8-4. 기각된 시도 / 후속
+
+- **framerate 고정**(videorate+capsfilter): proxysink↔proxysrc 경계에서 caps의
+  framerate가 0/1로 리셋돼 sink까지 전달 안 됨 → 무효.
+- **외부이미지 plane 복사**(media-thread `MediaExternalImages::lock`): borrowed 버퍼
+  recycle 경합 가설이었으나 무효(원인은 VP8).
+- **raw passthrough**(`encoded()` 대신 `src_element()` + pad template을 raw caps):
+  playbin/decodebin이 커스텀 소스의 raw `video/x-raw`를 받지 못해 프레임 정지
+  (`GST_PAD_IS_SINK` 경고). → **근본 해결(인코드 왕복 제거)은 playbin 우회가 필요**
+  하며 v1 범위 밖. 현재는 고품질 VP8로 둠.
+
+교훈: 다운스케일 스크린샷만으로 노이즈 유무를 판정하지 말 것(실제로 여러 번 오판함).
+픽셀 품질 검증은 육안 확인에 의존.
+
+---
+
 ## 출처
 
 - Chromium Docs — Media Capture (README):
