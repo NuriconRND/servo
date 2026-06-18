@@ -51,10 +51,14 @@ may have shared object dependencies on them.
 """
 
 GSTREAMER_WIN_DEPENDENCY_LIBS = [
-    "avcodec-59.dll",
-    "avfilter-8.dll",
-    "avformat-59.dll",
-    "avutil-57.dll",
+    # FFmpeg 7 (gstlibav in the in-house GStreamer 1.26.8): avcodec-61 → avutil-59 +
+    # swresample-5; avfilter-10 → swscale-8.
+    "avcodec-61.dll",
+    "avfilter-10.dll",
+    "avformat-61.dll",
+    "avutil-59.dll",
+    "swresample-5.dll",
+    "swscale-8.dll",
     "bz2.dll",
     "ffi-7.dll",
     "gio-2.0-0.dll",
@@ -63,19 +67,20 @@ GSTREAMER_WIN_DEPENDENCY_LIBS = [
     "gobject-2.0-0.dll",
     "graphene-1.0-0.dll",
     "intl-8.dll",
-    "libcrypto-1_1-x64.dll",
-    "libjpeg-8.dll",
-    "libogg-0.dll",
-    "libpng16-16.dll",
-    "libssl-1_1-x64.dll",
-    "libvorbis-0.dll",
-    "libvorbisenc-2.dll",
+    # OpenSSL 3 (gstdtls).
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+    # 1.26.8 dropped the "lib" prefix on these codec deps.
+    "jpeg8.dll",
+    "ogg-0.dll",
+    "png16.dll",
+    "vorbis-0.dll",
+    "vorbisenc-2.dll",
     "libwinpthread-1.dll",
     "nice-10.dll",
     "opus-0.dll",
     "orc-0.4-0.dll",
     "pcre2-8-0.dll",
-    "swresample-4.dll",
     "theora-0.dll",
     "theoradec-1.dll",
     "theoraenc-1.dll",

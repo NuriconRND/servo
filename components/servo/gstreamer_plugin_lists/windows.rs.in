@@ -3,5 +3,13 @@
 [
 // gst-plugins-bad
 "gstd3d11",
-"gstwasapi"
+// Video capture device providers + sources for getUserMedia (capture cards / webcams).
+// gstwinks (ksvideosrc) is used despite not being GStreamer's recommended source,
+// due to the wall's capture hardware constraints. mediafoundation/directshow are
+// registered as alternatives. All depend only on base libs already in
+// GSTREAMER_BASE_LIBS (gstd3d11/gstvideo/gstaudio/gstpbutils/gstbase/gstreamer).
+"gstdirectshow",
+"gstmediafoundation",
+"gstwasapi",
+"gstwinks"
 ]
