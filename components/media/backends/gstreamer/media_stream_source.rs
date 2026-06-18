@@ -13,7 +13,7 @@ use servo_media_player::PlayerError;
 use servo_media_streams::{MediaStream, MediaStreamType};
 use url::Url;
 
-use crate::media_stream::{GStreamerMediaStream, RTP_CAPS_OPUS, RTP_CAPS_VP8};
+use crate::media_stream::{GStreamerMediaStream, RTP_CAPS_OPUS};
 
 // Implementation sub-module of the GObject
 mod imp {
@@ -30,12 +30,18 @@ mod imp {
         .expect("Could not create audio src pad template")
     });
 
+    // Local <video> playback delivers raw frames (see ServoMediaStreamSrc::set_stream).
+    // The template must advertise a *fully-fixed* format so playbin/decodebin can
+    // negotiate a passthrough to the I420 appsink; bare `video/x-raw` stalls at 0x0.
     static VIDEO_SRC_PAD_TEMPLATE: LazyLock<gstreamer::PadTemplate> = LazyLock::new(|| {
+        let caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .build();
         gstreamer::PadTemplate::new(
             "video_src",
             gstreamer::PadDirection::Src,
             gstreamer::PadPresence::Sometimes,
-            &RTP_CAPS_VP8,
+            &caps,
         )
         .expect("Could not create video src pad template")
     });
@@ -67,10 +73,15 @@ mod imp {
             gstreamer::log!(self.cat, "Setting stream");
 
             // Append a proxysink to the media stream pipeline.
+            // Local <video> playback shows the MediaStream directly, so use a raw
+            // (uncompressed) tail for video instead of the WebRTC VP8/RTP encode —
+            // no lossy codec roundtrip. Audio keeps the Opus path for now.
             let pipeline = stream.pipeline_or_new();
-            let last_element = stream
-                .encoded(true /* high_quality: local <video> playback */)
-                .map_err(|_| PlayerError::SetStreamFailed)?;
+            let last_element = match stream.ty() {
+                MediaStreamType::Video => stream.raw_passthrough(),
+                MediaStreamType::Audio => stream.encoded(),
+            }
+            .map_err(|_| PlayerError::SetStreamFailed)?;
             let sink = gstreamer::ElementFactory::make("proxysink")
                 .build()
                 .map_err(|_| PlayerError::SetStreamFailed)?;

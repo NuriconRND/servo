@@ -195,11 +195,7 @@ impl GStreamerMediaStream {
     }
 
     /// Attaches encoding adapters to the stream, returning the source element when successful.
-    /// Build the encoded (VP8/Opus over RTP) tail of the stream and return its last
-    /// element. `high_quality` selects near-lossless VP8 for *local* `<video>`
-    /// playback (the capture is shown directly); WebRTC senders pass `false` to keep
-    /// the bandwidth-friendly defaults.
-    pub fn encoded(&mut self, high_quality: bool) -> Result<gstreamer::Element, BoolError> {
+    pub fn encoded(&mut self) -> Result<gstreamer::Element, BoolError> {
         let pipeline = self
             .pipeline
             .as_ref()
@@ -211,21 +207,11 @@ impl GStreamerMediaStream {
             .build()?;
         match self.type_ {
             MediaStreamType::Video => {
-                let mut vp8enc_builder = gstreamer::ElementFactory::make("vp8enc")
+                let vp8enc = gstreamer::ElementFactory::make("vp8enc")
                     .property("deadline", 1i64)
                     .property("cpu-used", -16i32)
-                    .property("lag-in-frames", 0i32);
-                if high_quality {
-                    // Local playback shows the capture directly. The default
-                    // target-bitrate (256 kbps) crushes 1080p screen content into
-                    // blocky per-frame noise, so encode near-losslessly. Speed is kept
-                    // realtime (deadline/cpu-used above) to avoid encoder stalls.
-                    vp8enc_builder = vp8enc_builder
-                        .property("target-bitrate", 80_000_000i32)
-                        .property("min-quantizer", 0i32)
-                        .property("max-quantizer", 8i32);
-                }
-                let vp8enc = vp8enc_builder.build()?;
+                    .property("lag-in-frames", 0i32)
+                    .build()?;
 
                 let rtpvp8pay = gstreamer::ElementFactory::make("rtpvp8pay")
                     .property("mtu", 1200u32)
@@ -251,6 +237,51 @@ impl GStreamerMediaStream {
                 opusenc.sync_state_with_parent()?;
                 rtpopuspay.sync_state_with_parent()?;
                 queue3.sync_state_with_parent()?;
+                Ok(capsfilter)
+            },
+        }
+    }
+
+    /// Build a *raw* (uncompressed) tail for local `<video>` playback and return its
+    /// last element. Unlike [`encoded`] (VP8/Opus over RTP, for WebRTC) this avoids
+    /// any lossy codec roundtrip — appropriate when the MediaStream is shown directly
+    /// (e.g. getDisplayMedia capture on the multi-GPU wall).
+    ///
+    /// The output caps are pinned to a **fully-fixed** `video/x-raw, format=I420`
+    /// so the downstream playbin/decodebin can negotiate a no-op passthrough to the
+    /// I420 appsink. (Advertising bare `video/x-raw` without a concrete format breaks
+    /// negotiation — metadata reports 0x0 and the stream stalls.)
+    pub fn raw_passthrough(&mut self) -> Result<gstreamer::Element, BoolError> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .expect("GStreamerMediaStream::raw_passthrough() requires a pipeline");
+        let src = self.src_element();
+        match self.type_ {
+            MediaStreamType::Video => {
+                let videoconvert = gstreamer::ElementFactory::make("videoconvert").build()?;
+                let caps = gstreamer::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .build();
+                let capsfilter = gstreamer::ElementFactory::make("capsfilter")
+                    .property("caps", &caps)
+                    .build()?;
+                pipeline.add_many([&videoconvert, &capsfilter])?;
+                gstreamer::Element::link_many([&src, &videoconvert, &capsfilter])?;
+                videoconvert.sync_state_with_parent()?;
+                capsfilter.sync_state_with_parent()?;
+                Ok(capsfilter)
+            },
+            MediaStreamType::Audio => {
+                let audioconvert = gstreamer::ElementFactory::make("audioconvert").build()?;
+                let caps = gstreamer::Caps::builder("audio/x-raw").build();
+                let capsfilter = gstreamer::ElementFactory::make("capsfilter")
+                    .property("caps", &caps)
+                    .build()?;
+                pipeline.add_many([&audioconvert, &capsfilter])?;
+                gstreamer::Element::link_many([&src, &audioconvert, &capsfilter])?;
+                audioconvert.sync_state_with_parent()?;
+                capsfilter.sync_state_with_parent()?;
                 Ok(capsfilter)
             },
         }
