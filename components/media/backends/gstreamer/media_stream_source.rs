@@ -68,7 +68,9 @@ mod imp {
 
             // Append a proxysink to the media stream pipeline.
             let pipeline = stream.pipeline_or_new();
-            let last_element = stream.encoded().map_err(|_| PlayerError::SetStreamFailed)?;
+            let last_element = stream
+                .encoded(true /* high_quality: local <video> playback */)
+                .map_err(|_| PlayerError::SetStreamFailed)?;
             let sink = gstreamer::ElementFactory::make("proxysink")
                 .build()
                 .map_err(|_| PlayerError::SetStreamFailed)?;

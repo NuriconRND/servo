@@ -195,7 +195,11 @@ impl GStreamerMediaStream {
     }
 
     /// Attaches encoding adapters to the stream, returning the source element when successful.
-    pub fn encoded(&mut self) -> Result<gstreamer::Element, BoolError> {
+    /// Build the encoded (VP8/Opus over RTP) tail of the stream and return its last
+    /// element. `high_quality` selects near-lossless VP8 for *local* `<video>`
+    /// playback (the capture is shown directly); WebRTC senders pass `false` to keep
+    /// the bandwidth-friendly defaults.
+    pub fn encoded(&mut self, high_quality: bool) -> Result<gstreamer::Element, BoolError> {
         let pipeline = self
             .pipeline
             .as_ref()
@@ -207,11 +211,21 @@ impl GStreamerMediaStream {
             .build()?;
         match self.type_ {
             MediaStreamType::Video => {
-                let vp8enc = gstreamer::ElementFactory::make("vp8enc")
+                let mut vp8enc_builder = gstreamer::ElementFactory::make("vp8enc")
                     .property("deadline", 1i64)
                     .property("cpu-used", -16i32)
-                    .property("lag-in-frames", 0i32)
-                    .build()?;
+                    .property("lag-in-frames", 0i32);
+                if high_quality {
+                    // Local playback shows the capture directly. The default
+                    // target-bitrate (256 kbps) crushes 1080p screen content into
+                    // blocky per-frame noise, so encode near-losslessly. Speed is kept
+                    // realtime (deadline/cpu-used above) to avoid encoder stalls.
+                    vp8enc_builder = vp8enc_builder
+                        .property("target-bitrate", 80_000_000i32)
+                        .property("min-quantizer", 0i32)
+                        .property("max-quantizer", 8i32);
+                }
+                let vp8enc = vp8enc_builder.build()?;
 
                 let rtpvp8pay = gstreamer::ElementFactory::make("rtpvp8pay")
                     .property("mtu", 1200u32)
