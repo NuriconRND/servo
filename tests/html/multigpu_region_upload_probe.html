@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<!-- Copyright Servo. SPDX-License-Identifier: MPL-2.0 -->
+<!--
+  Multi-GPU wall region-upload validation probe.
+
+  A capture-card <video> stretched to EXACTLY fill the virtual viewport
+  (object-fit: fill, no letterbox), so the media image maps 1:1 onto the wall.
+  Used to validate `media_wall_region_upload`: each tile GPU should upload only
+  its half/quarter of the frame, yet the full video must appear correct and
+  seamless across tile boundaries.
+
+  Run (2x1 wall, region upload ON):
+    servoshell.exe --wall-layout ..\config\wall_layout.local_2x1.json --wall-all-tiles \
+      --pref dom_webrtc_enabled=true --pref media_wall_region_upload=true \
+      tests\html\multigpu_region_upload_probe.html
+  Compare visually with the same run WITHOUT media_wall_region_upload (baseline).
+  Both must look identical; region-upload reduces per-GPU upload/VRAM.
+
+  NOTE: this assumes a working capture device (getUserMedia). Swap srcObject for a
+  fullscreen <video src=...> file if no capture device is present.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>multigpu region-upload probe</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #stage { position: fixed; inset: 0; }
+    /* object-fit: fill — stretch to EXACTLY fill the viewport (no letterbox) so the
+       image maps linearly onto the wall, matching the region-upload assumption. */
+    video { width: 100%; height: 100%; object-fit: fill; background: #000; display: block; }
+    #hud {
+      position: fixed; left: 12px; top: 12px; z-index: 10;
+      font: 13px/1.45 monospace; color: #0f0; background: rgba(0,0,0,.6);
+      padding: 8px 10px; border: 1px solid #0f0; white-space: pre;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"><video id="v" autoplay playsinline muted></video></div>
+  <div id="hud">starting…</div>
+  <script>
+    const hud = document.getElementById("hud");
+    const v = document.getElementById("v");
+    function log(m){ hud.textContent = m; console.log("[region-upload-probe] " + m); }
+    let last = -1;
+    (async () => {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        log("getUserMedia UNAVAILABLE (enable dom_webrtc_enabled)"); return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        v.srcObject = stream;
+        const track = stream.getVideoTracks()[0];
+        setInterval(() => {
+          const t = v.currentTime, adv = t !== last; last = t;
+          log("region-upload probe (object-fit: fill)\n" +
+              "tracks: " + (track ? 1 : 0) +
+              "\nvideoSize: " + v.videoWidth + "x" + v.videoHeight +
+              "\ncurrentTime: " + t.toFixed(2) + (adv ? " (advancing)" : " (STALLED)"));
+        }, 1000);
+      } catch (e) { log("getUserMedia FAILED: " + e); }
+    })();
+  </script>
+</body>
+</html>

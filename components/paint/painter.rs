@@ -14,7 +14,7 @@ use embedder_traits::{
     InputEvent, InputEventAndId, InputEventId, InputEventResult, PaintHitTestResult,
     ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
 };
-use euclid::{Point2D, Rect, Scale, Size2D};
+use euclid::{Box2D, Point2D, Rect, Scale, Size2D};
 use gleam::gl::RENDERER;
 use image::RgbaImage;
 use log::{debug, error, info, warn};
@@ -415,10 +415,10 @@ impl Painter {
             let device_point = point.as_device_point(renderer.device_pixels_per_page_pixel());
             let render_point = renderer.render_point_from_viewport_point(device_point);
             let size = self.rendering_context.size2d();
-            render_point.x >= 0.0 &&
-                render_point.y >= 0.0 &&
-                render_point.x < size.width as f32 &&
-                render_point.y < size.height as f32
+            render_point.x >= 0.0
+                && render_point.y >= 0.0
+                && render_point.x < size.width as f32
+                && render_point.y < size.height as f32
         })
     }
 
@@ -1421,6 +1421,68 @@ impl Painter {
         }
     }
 
+    /// Multi-GPU wall: compute the sub-region of a media (external image) frame that this
+    /// tile actually displays, so WebRender uploads only that region to this tile's GPU
+    /// instead of the whole frame to every GPU. Returns `DirtyRect::All` (whole-frame
+    /// upload, unchanged behavior) unless `media_wall_region_upload` is enabled, the data
+    /// is an external image, and this painter renders a strict sub-rect of the virtual
+    /// viewport. ASSUMES the media element fills the virtual viewport (wall video/capture
+    /// use case) — for a media element occupying only part of the page this would compute
+    /// the wrong region, hence the pref gate (default off).
+    fn media_tile_dirty_rect(
+        &self,
+        desc: &webrender_api::ImageDescriptor,
+        data: &SerializableImageData,
+    ) -> DirtyRect<i32, DevicePixel> {
+        if !pref!(media_wall_region_upload) {
+            return DirtyRect::All;
+        }
+        // Only external (media) images flow through the per-GPU broadcast; raw <img> etc.
+        // are placement-dependent and must not be cropped here.
+        if !matches!(data, SerializableImageData::External(_)) {
+            return DirtyRect::All;
+        }
+        // A wall tile painter hosts exactly the one logical (virtual-viewport) WebView.
+        if self.webview_renderers.len() != 1 {
+            return DirtyRect::All;
+        }
+        let Some(renderer) = self.webview_renderers.values().next() else {
+            return DirtyRect::All;
+        };
+        let virtual_size = renderer.rect.size();
+        let (vw, vh) = (virtual_size.width, virtual_size.height);
+        if vw <= 0.0 || vh <= 0.0 {
+            return DirtyRect::All;
+        }
+        let origin = renderer.viewport_origin();
+        let ctx = self.rendering_context.size2d();
+        let (tile_w, tile_h) = (ctx.width as f32, ctx.height as f32);
+        // Full-viewport tile (or non-wall): nothing to crop.
+        if tile_w >= vw && tile_h >= vh {
+            return DirtyRect::All;
+        }
+        // Map the tile's virtual-viewport rect onto this plane's pixel space. Each YUV
+        // plane has its own dimensions (Y full, I420 chroma half), carried in `desc.size`.
+        let (pw, ph) = (desc.size.width as f32, desc.size.height as f32);
+        // A few guard pixels so bilinear sampling at the tile seam has valid texels.
+        const GUARD: f32 = 2.0;
+        let x0 = (((origin.x - GUARD) / vw) * pw).floor().clamp(0.0, pw);
+        let y0 = (((origin.y - GUARD) / vh) * ph).floor().clamp(0.0, ph);
+        let x1 = (((origin.x + tile_w + GUARD) / vw) * pw)
+            .ceil()
+            .clamp(0.0, pw);
+        let y1 = (((origin.y + tile_h + GUARD) / vh) * ph)
+            .ceil()
+            .clamp(0.0, ph);
+        if x1 <= x0 || y1 <= y0 {
+            return DirtyRect::All;
+        }
+        DirtyRect::Partial(Box2D::new(
+            Point2D::new(x0 as i32, y0 as i32),
+            Point2D::new(x1 as i32, y1 as i32),
+        ))
+    }
+
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
         let mut txn = Transaction::new();
         // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
@@ -1452,7 +1514,8 @@ impl Painter {
                     } else {
                         immediate_image_update = true;
                     }
-                    txn.update_image(key, desc, data.into(), &DirtyRect::All)
+                    let dirty_rect = self.media_tile_dirty_rect(&desc, &data);
+                    txn.update_image(key, desc, data.into(), &dirty_rect)
                 },
                 ImageUpdate::UpdateImageForAnimation(image_key, desc) => {
                     let Some(image) = self.animation_image_cache.get(&image_key) else {
