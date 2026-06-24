@@ -65,6 +65,67 @@
 - **debug + release 둘 다** 빌드/실행 확인(release는 슬롯#1 정션으로 -sys
   link-search 캐시 경로가 1.26.8로 resolve돼 링크 통과).
 
+## 슬롯#1 채우는 방법 변형 (정션 / MSI / Inno .exe / 직접 복사)
+
+위 "적용한 변경" 1번은 **정션**을 썼지만, 슬롯#1
+(`target/dependencies/gstreamer/1.0/msvc_x86_64`)을 채우는 방법은 여러 가지이며 결과는 동등하다.
+공통 전제: 어느 방법이든 끝에 (a) `bin/ffi-7.dll` + `bin/pkg-config.exe --modversion`으로 해상도
+확인, (b) `gstreamer.py` 의존 DLL 이름 버전 재확인, (c) `cargo clean` 후 `mach build`,
+(d) **`mach bootstrap-gstreamer` 금지**(슬롯#1에 1.22.8 재설치됨). 어느 방법이든 `cargo clean`이
+`target/`을 지우면 재구성 필요.
+
+### A. 정션 (현재 방식) — 시스템 설치를 가리킴
+디스크 중복 없음·즉시. 시스템 설치에 의존. 위 1번 참조:
+```
+rmdir "<repo>\servo\target\dependencies\gstreamer\1.0\msvc_x86_64"   # 기존 제거
+mklink /J "<repo>\servo\target\dependencies\gstreamer\1.0\msvc_x86_64" ^
+          "C:\Program Files\gstreamer\1.0\msvc_x86_64"
+```
+
+### B. MSI (런타임/devel 각 .msi) — administrative install
+1.22.8~1.26.x는 런타임·devel이 **별도 MSI 2개**. `/a`(administrative install = 파일 추출만,
+관리자/UAC 불필요)로 슬롯#1 상위(`target/dependencies`)에 추출하면 그 아래
+`gstreamer\1.0\msvc_x86_64`가 생긴다. ⚠️ `mach bootstrap-gstreamer`로 하지 말 것
+(UAC 승격으로 감싸 1603 실패 + 1.22.8 설치 — CLAUDE.md gotcha #3·#4). **비승격 직접 실행**:
+```
+$dep = "<repo>\servo\target\dependencies"
+msiexec /a "<gstreamer-1.0-msvc-x86_64-X.Y.Z.msi>"       /qn TARGETDIR="$dep"   # 런타임
+msiexec /a "<gstreamer-1.0-devel-msvc-x86_64-X.Y.Z.msi>" /qn TARGETDIR="$dep"   # devel
+```
+
+### C. Inno Setup .exe (GStreamer 1.28+, 단일 패키지)
+1.28부터는 runtime/devel/debug를 **하나의 Inno Setup 6 `.exe`** + 플래그로 선택. `.exe` 위치는
+설치 결과와 무관(어디서 실행하든 됨) — **`/DIR=`이 목적지**. `.exe`는 `target/` *밖*에 보관 권장
+(`cargo clean`이 안 지우게). 비승격 무인 설치:
+```
+& "<gstreamer-custom-1.28.x.exe>" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+    /DIR="<repo>\servo\target\dependencies\gstreamer" `
+    /COMPONENTS="runtime,devel" /LOG="$env:TEMP\gst_install.log"
+```
+확인사항(설치본 의존, gstreamer.freedesktop.org/download Windows 가이드 참조):
+- **`/DIR` nesting**: 설치 후 `...\gstreamer\1.0\msvc_x86_64\bin\ffi-7.dll`이 실제로 생기는지.
+  installer가 `/DIR` 아래 `gstreamer\`를 또 만들면 `/DIR`을 한 단계 위(`...\dependencies`)로.
+- **컴포넌트 ID**: `runtime`/`devel`/`debug`는 installer 작성 방식별로 다름(Inno엔 목록 출력
+  CLI 없음). 공식 가이드/사내 빌더/1회 대화형 실행으로 확인. **devel 필수**(pkg-config/.pc/.lib/
+  include). debug 심볼 필요 시 `,debug` 추가.
+- **권한**: `target/dependencies`는 사용자 쓰기 가능이라 보통 비승격 OK. installer가
+  `PrivilegesRequired=admin`이면 승격 또는 `/CURRENTUSER`(허용 시).
+- (대안) `innoextract`로 순수 추출(레지스트리/권한 없이, MSI `/a`에 가장 근접) 후 슬롯#1 배치.
+
+### D. 직접 복사 (이미 빌드/추출된 `msvc_x86_64` 트리가 있을 때) — 가장 단순
+MSI/Inno는 결국 `msvc_x86_64`(runtime+devel 합본) 트리를 까는 포장지일 뿐. **이미 그 트리가
+있으면 슬롯#1에 그대로 복사하면 동일 결과** (`mach bootstrap-gstreamer`만 안 하면 됨):
+```
+$slot1 = "<repo>\servo\target\dependencies\gstreamer\1.0\msvc_x86_64"
+rmdir "$slot1"                                          # 기존 정션/폴더 제거
+robocopy "<커스텀>\msvc_x86_64" "$slot1" /E /NFL /NDL /NJH /NJS
+```
+- **트리는 runtime+devel 합본**이어야 함(bin: DLL+ffi-7+pkg-config / lib: *.lib + pkgconfig/*.pc +
+  gstreamer-1.0 플러그인 / include). 따로면 한 `msvc_x86_64`로 합쳐(devel을 runtime 위에) 복사.
+- **`.pc` relocatable 확인**: `lib\pkgconfig\gstreamer-1.0.pc`의 `prefix=`가 `${pcfiledir}/../..`
+  (상대)이면 어디로 복사해도 OK. 현재 1.26.8 트리는 relocatable 확인됨. 절대경로로 하드코딩된
+  커스텀 빌드라면 그 경로로 깔거나 prefix를 고쳐야 pkg-config 링크가 됨(드묾).
+
 ## 남은 한계 / 후속
 
 - **deviceId 선택 불가**: 4개 입력이 전부 `id="MZ0380 PCI"`로 동일 라벨/ID. 현재
