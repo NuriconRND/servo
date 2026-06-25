@@ -126,6 +126,35 @@ robocopy "<커스텀>\msvc_x86_64" "$slot1" /E /NFL /NDL /NJH /NJS
   (상대)이면 어디로 복사해도 OK. 현재 1.26.8 트리는 relocatable 확인됨. 절대경로로 하드코딩된
   커스텀 빌드라면 그 경로로 깔거나 prefix를 고쳐야 pkg-config 링크가 됨(드묾).
 
+## 함정: 1.28.x 커스텀 번들 — pkg-config 백슬래시로 release 링크 실패 (2026-06-25)
+
+증상: 1.28.x 커스텀 트리로 교체 후 `mach build --release`가 마지막 `servoshell` 링크에서
+```
+lld-link: error: could not open 'gstreamer-1.0.lib': no such file or directory
+```
+로 실패. **`.lib`은 `...\msvc_x86_64\lib`에 분명히 존재.** 링크 커맨드의 gstreamer LIBPATH를 보면
+백슬래시가 전부 사라져 있음:
+`/LIBPATH:F:20260609_..._x86_64libpkgconfig/../../lib` (정상은 `F:\...\lib`).
+
+원인: 호스트 Windows 타깃엔 servo가 `PKG_CONFIG_PATH`를 설정하지 않으므로(OHOS만 설정,
+`build_target.py:433`), pkg-config가 **컴파일 내장 검색경로**로 폴백. 1.28.x 커스텀 번들의
+pkg-config(0.29.2)는 그 내장 경로(`--variable pc_path`)를 **백슬래시**로 들고 있어
+(`F:\...\lib\pkgconfig`), `.pc`의 relocatable `prefix=${pcfiledir}/../..`이 백슬래시 pcfiledir로
+전개됨 → 내보내는 `-L` 경로가 백슬래시 → cargo/rustc→lld-link로 전달되며 **백슬래시가 escape로
+소거**되어 경로 붕괴. (1.26.8 번들 pkg-config는 forward-slash/정규화를 해서 안 걸렸음.)
+
+해결: 빌드 env에 **`PKG_CONFIG_PATH`를 forward-slash로** 설정(pkg-config가 이걸 내장경로보다
+먼저 검색 → forward-slash pcfiledir → forward-slash `-L`, lld-link 통과). `scripts/servo_env.ps1`에
+반영함(gstreamer_root 해상도와 동일하게 슬롯#1→env→C:\gstreamer 도출 후
+`<root>/lib/pkgconfig;<root>/share/pkgconfig`를 `\`→`/` 치환해 설정):
+```powershell
+$env:PKG_CONFIG_PATH = "F:/.../msvc_x86_64/lib/pkgconfig;F:/.../msvc_x86_64/share/pkgconfig"
+```
+검증: 설정 후 `pkg-config --libs-only-L gstreamer-1.0 ...` 가 전부 forward-slash(백슬래시 0개).
+적용 절차: **servo_env.ps1 재소싱 후 재빌드**. pkg-config `-sys` 빌드스크립트는
+`rerun-if-env-changed=PKG_CONFIG_PATH`라 env 변경 시 재실행되어 링크캐시가 갱신됨(안 되면
+`cargo clean` 후 재빌드).
+
 ## 남은 한계 / 후속
 
 - **deviceId 선택 불가**: 4개 입력이 전부 `id="MZ0380 PCI"`로 동일 라벨/ID. 현재
