@@ -11,7 +11,8 @@
 //! plumbing — just the core paint-target fan-out, for rendering/perf testing.
 //!
 //! Usage:
-//!   winit_wall --wall-layout <layout.json> [--wall-all-tiles] [--wall-tile-index N] [URL]
+//!   winit_wall --wall-layout <layout.json> [--wall-all-tiles] [--wall-tile-index N]
+//!              [--pref name[=value]]... [URL]
 //!
 //! NOTE: input coordinate remapping is intentionally omitted (clicks won't land
 //! correctly); use servoshell for interactive testing. Real per-GPU placement needs a
@@ -25,8 +26,8 @@ use std::rc::Rc;
 
 use euclid::Scale;
 use servo::{
-    RenderingContext, Servo, ServoBuilder, ViewportDetails, WebView, WebViewBuilder,
-    WebViewPaintTarget, WindowRenderingContext,
+    PrefValue, Preferences, RenderingContext, Servo, ServoBuilder, ViewportDetails, WebView,
+    WebViewBuilder, WebViewPaintTarget, WindowRenderingContext,
 };
 use tracing::warn;
 use url::Url;
@@ -46,6 +47,7 @@ struct Config {
     layout: WallLayout,
     all_tiles: bool,
     tile_index: usize,
+    preferences: Preferences,
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -53,6 +55,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut layout_path: Option<String> = None;
     let mut all_tiles = false;
     let mut tile_index = 0usize;
+    let mut preferences = Preferences::default();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -66,6 +69,16 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .ok_or("--wall-tile-index requires an integer")?;
+            },
+            // `--pref name[=value]` overrides a Servo preference, exactly like servoshell:
+            // a bare name (or `name=true`) sets a bool, otherwise the value is parsed
+            // booleanish (bool / number / string). e.g. `--pref dom_webrtc_enabled=true`.
+            "--pref" => {
+                let spec = args.next().ok_or("--pref requires name[=value]")?;
+                let mut parts = spec.splitn(2, '=');
+                let name = parts.next().unwrap_or_default();
+                let value = parts.next().unwrap_or("true");
+                preferences.set_value(name, PrefValue::from_booleanish_str(value));
             },
             other if !other.starts_with("--") => url = Some(other.to_string()),
             other => return Err(format!("unknown argument: {other}").into()),
@@ -84,6 +97,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         layout,
         all_tiles,
         tile_index,
+        preferences,
     })
 }
 
@@ -224,6 +238,7 @@ impl ApplicationHandler<WakerEvent> for App {
         let _ = built[0].1.make_current();
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(waker.clone()))
+            .preferences(std::mem::take(&mut config.preferences))
             .build();
         servo.setup_logging();
 
