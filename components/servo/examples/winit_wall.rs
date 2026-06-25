@@ -90,7 +90,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     if !all_tiles {
         layout.validate_tile_index(tile_index)?;
     }
-    let url = Url::parse(url.as_deref().unwrap_or(DEFAULT_URL))?;
+    let url = parse_url_or_filename(url.as_deref().unwrap_or(DEFAULT_URL))?;
 
     Ok(Config {
         url,
@@ -99,6 +99,37 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         tile_index,
         preferences,
     })
+}
+
+/// Turn a command-line argument into a [`Url`]. A real URL (scheme longer than one
+/// character, so a Windows `C:\…` drive letter is not mistaken for a scheme) is parsed
+/// as-is; anything else is treated as a filesystem path (relative to the current
+/// directory) and converted to a `file://` URL. This lets the example accept
+/// `tests\html\foo.html` like servoshell does, instead of requiring a full `file://`.
+fn parse_url_or_filename(input: &str) -> Result<Url, Box<dyn Error>> {
+    if let Ok(url) = Url::parse(input) {
+        if url.scheme().len() > 1 {
+            return Ok(url);
+        }
+    }
+
+    let path = Path::new(input);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Resolve `..`/symlinks and verify existence when possible; fall back to the
+    // joined path otherwise. Strip Windows' `\\?\` verbatim prefix for a clean URL.
+    let absolute = std::fs::canonicalize(&absolute).unwrap_or(absolute);
+    let absolute = absolute
+        .to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or(absolute);
+
+    Url::from_file_path(&absolute)
+        .map_err(|_| format!("could not build a file URL from {}", absolute.display()).into())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
