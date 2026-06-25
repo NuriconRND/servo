@@ -10,6 +10,9 @@
 /tests/wpt/reftests-report/report.html
 /python/_virtualenv*
 /python/_venv*
+# uv (pyproject.toml/uv.lock) creates a virtualenv at the repo root; upstream's
+# ignore list still only covers the old python/_venv* location.
+/.venv/
 /python/tidy/servo_tidy.egg-info
 /tests/wpt/sync
 /tests/wpt/**/**/.cache/
