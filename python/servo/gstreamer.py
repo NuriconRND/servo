@@ -39,6 +39,12 @@ GSTREAMER_BASE_LIBS = [
     "gstcodecparsers",
     "gstcodecs",
     "gstd3d11",
+    # 1.26.8 split these out of gstd3d11/gstmediafoundation; they are runtime deps of
+    # the gstd3d11 / gstmediafoundation plugins. Without them those plugins fail to load
+    # on a machine that does not also have a system GStreamer on PATH (ErrorLoadingPlugins).
+    "gstd3dshader",
+    "gstdxva",
+    "gstwinrt",
     "gstmpegts",
     "gstplayer",
     "gstwebrtc",

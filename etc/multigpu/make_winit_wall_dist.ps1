@@ -71,7 +71,28 @@ Copy-Item $exeSrc (Join-Path $OutDir "winit_wall.exe")
 $dlls = Get-ChildItem (Join-Path $releaseDir "*.dll") -ErrorAction SilentlyContinue
 if (-not $dlls) { throw "No DLLs in $releaseDir — build/package the project first (mach build --release)." }
 $dlls | Copy-Item -Destination $OutDir
-Write-Host "  $($dlls.Count) DLLs"
+Write-Host "  $($dlls.Count) DLLs (from target\release)"
+
+# Copy the COMPLETE set of DLLs from the GStreamer root's bin/ (all base libraries +
+# all third-party dependencies). mach's curated GSTREAMER_*_LIBS lists can lag the
+# actual plugin dependency set — e.g. 1.26.8's gstd3d11/gstmediafoundation need the
+# split-out gst{d3dshader,dxva,winrt}-1.0-0, and gstsrtp needs srtp2-1.dll — and any
+# omission makes a plugin fail to load on a machine without a system GStreamer on PATH
+# ("ErrorLoadingPlugins"). Copying the whole bin/ is the simplest way to guarantee
+# every registered plugin's transitive deps travel with the kit. (ANGLE libEGL/
+# libGLESv2 come from target\release and are not in bin/, so they are untouched.)
+$gstRoot = @(
+    (Join-Path $servoRoot "target\dependencies\gstreamer\1.0\msvc_x86_64"),
+    $env:GSTREAMER_1_0_ROOT_MSVC_X86_64,
+    "C:\gstreamer\1.0\msvc_x86_64"
+) | Where-Object { $_ -and (Test-Path (Join-Path $_ "bin\ffi-7.dll")) } | Select-Object -First 1
+if ($gstRoot) {
+    $binDlls = Get-ChildItem (Join-Path $gstRoot "bin\*.dll") -ErrorAction SilentlyContinue
+    $binDlls | Copy-Item -Destination $OutDir -Force
+    Write-Host "  + $($binDlls.Count) GStreamer bin DLLs (complete base + third-party deps, from $gstRoot)"
+} else {
+    Write-Warning "GStreamer root not found; relying on target\release DLLs only (plugins may miss deps)."
+}
 
 if ($IncludeD3DCompiler) {
     $d3dc = "C:\Windows\System32\d3dcompiler_47.dll"
