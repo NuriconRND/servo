@@ -5,23 +5,19 @@
   },
   "tiles": [
     {
-      "monitor": 0,
-      "gpu": 0,
+      "display": 0,
       "rect": [0, 0, 3840, 2160]
     },
     {
-      "monitor": 1,
-      "gpu": 1,
+      "display": 1,
       "rect": [3840, 0, 3840, 2160]
     },
     {
-      "monitor": 2,
-      "gpu": 2,
+      "display": 2,
       "rect": [0, 2160, 3840, 2160]
     },
     {
-      "monitor": 3,
-      "gpu": 3,
+      "display": 3,
       "rect": [3840, 2160, 3840, 2160]
     }
   ],

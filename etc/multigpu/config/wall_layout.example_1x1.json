@@ -5,8 +5,7 @@
   },
   "tiles": [
     {
-      "monitor": 0,
-      "gpu": 0,
+      "display": 0,
       "rect": [0, 0, 1920, 1080]
     }
   ],

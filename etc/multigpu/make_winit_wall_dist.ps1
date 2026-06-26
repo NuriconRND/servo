@@ -169,7 +169,7 @@ Run (from this folder):
           --pref dom_webrtc_enabled=true pages\multigpu_wall_sync_probe.html
 
 Flags (same as servoshell):
-  --wall-layout <config\*.json>   wall layout (tile rects / monitor / gpu)
+  --wall-layout <config\*.json>   wall layout (tile rects + spatial `display` index)
   --wall-all-tiles                one window per tile sharing one WebView
   --wall-tile-index <n>           single-tile preview
   --pref name[=value]             Servo prefs (e.g. dom_webrtc_enabled=true,
@@ -181,7 +181,9 @@ Target prerequisites:
   - d3dcompiler_47.dll: bundled if found; otherwise in-box on Win10/11.
   - capture-card / camera probes need the capture HARDWARE + driver on the target.
   - screen / display capture needs a display.
-  - layout JSON monitor/gpu indices are machine-specific; edit config\*.json for the target.
+  - layout JSON tiles use a spatial `display` index (top-left = 0, left->right then
+    top->bottom); the GPU is auto-assigned from the adapter driving that display. Legacy
+    `monitor` is accepted as an alias and `gpu` is ignored (both warn).
 
 Notes:
   - Pure CSS/WebGL/WebGPU/video-file/image probes are self-contained.

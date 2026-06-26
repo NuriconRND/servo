@@ -27,12 +27,12 @@ use std::rc::Rc;
 use euclid::Scale;
 use servo::{
     PrefValue, Preferences, RenderingContext, Servo, ServoBuilder, ViewportDetails, WebView,
-    WebViewBuilder, WebViewPaintTarget, WindowRenderingContext,
+    WebViewBuilder, WebViewPaintTarget, WindowRenderingContext, dxgi_luid_for_gpu_index,
+    enumerate_display_topology, spatial_order,
 };
-use tracing::warn;
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -225,29 +225,109 @@ impl ApplicationHandler<WakerEvent> for App {
             vec![config.tile_index]
         };
 
-        // 1) Create one window + rendering context per tile (GPU affinity from layout).
+        // 1) Resolve the physical display topology once. Each tile's `display` is a spatial
+        //    index (top-left = 0, row-major); the GPU is the adapter that drives that display.
+        let spatial = spatial_order(&enumerate_display_topology());
+        let have_topology = !spatial.is_empty();
+        // These diagnostics are emitted on stderr (not the `log` crate) because the topology
+        // is resolved before `servo.setup_logging()` installs a logger.
+        if have_topology {
+            eprintln!(
+                "Wall display topology ({} desktop display(s)):",
+                spatial.len()
+            );
+            for (spatial_index, disp) in spatial.iter().enumerate() {
+                eprintln!(
+                    "  display {spatial_index}: {} rect[{},{} {}x{}] adapter {} luid {:08x}:{:08x}",
+                    disp.device_name,
+                    disp.left,
+                    disp.top,
+                    disp.width,
+                    disp.height,
+                    disp.adapter_index,
+                    disp.luid.0,
+                    disp.luid.1,
+                );
+            }
+        } else {
+            eprintln!(
+                "warning: no DXGI display topology (non-Windows / non-no-wgl build, or \
+                 enumeration failed); falling back to winit monitor index for placement and \
+                 the default GPU"
+            );
+        }
+
+        // Create one window + rendering context per tile.
         let mut built: Vec<(Window, Rc<WindowRenderingContext>)> = Vec::new();
         for &tile_index in &tile_indices {
             let tile = &config.layout.tiles[tile_index];
             let mut attributes = Window::default_attributes()
                 .with_title(format!("winit_wall tile {tile_index}"))
                 .with_decorations(false)
-                .with_resizable(false)
-                .with_inner_size(LogicalSize::new(
-                    tile.rect.size.width as f64,
-                    tile.rect.size.height as f64,
-                ));
-            if let Some(monitor) = event_loop.available_monitors().nth(tile.monitor) {
-                let position = monitor.position();
-                attributes =
-                    attributes.with_position(PhysicalPosition::new(position.x, position.y));
-            } else {
-                // No such monitor: lay tiles out side-by-side at their virtual origin.
-                attributes = attributes.with_position(LogicalPosition::new(
-                    tile.rect.origin.x as f64,
-                    tile.rect.origin.y as f64,
-                ));
-            }
+                .with_resizable(false);
+
+            let gpu_index = match spatial.get(tile.display) {
+                Some(disp) => {
+                    // Place the window on the real display by desktop coordinate, and bind its
+                    // rendering context to the adapter that drives that display.
+                    attributes = attributes
+                        .with_position(PhysicalPosition::new(disp.left, disp.top))
+                        .with_inner_size(PhysicalSize::new(
+                            disp.width.max(1) as u32,
+                            disp.height.max(1) as u32,
+                        ));
+                    if let Some(luid) = dxgi_luid_for_gpu_index(disp.adapter_index)
+                        && luid != disp.luid
+                    {
+                        eprintln!(
+                            "warning: tile {tile_index}: adapter {} LUID mismatch (topology \
+                             {:08x}:{:08x} vs rendering-context {:08x}:{:08x})",
+                            disp.adapter_index, disp.luid.0, disp.luid.1, luid.0, luid.1,
+                        );
+                    }
+                    eprintln!(
+                        "tile {tile_index}: display {} -> {} rect[{},{} {}x{}] adapter {} \
+                         luid {:08x}:{:08x}",
+                        tile.display,
+                        disp.device_name,
+                        disp.left,
+                        disp.top,
+                        disp.width,
+                        disp.height,
+                        disp.adapter_index,
+                        disp.luid.0,
+                        disp.luid.1,
+                    );
+                    Some(disp.adapter_index)
+                },
+                None => {
+                    // No topology, or the spatial index is out of range: keep the previous
+                    // winit-monitor-index placement and let surfman pick the default adapter.
+                    if have_topology {
+                        eprintln!(
+                            "warning: tile {tile_index}: display index {} out of range ({} \
+                             display(s)); using winit monitor fallback",
+                            tile.display,
+                            spatial.len()
+                        );
+                    }
+                    attributes = attributes.with_inner_size(LogicalSize::new(
+                        tile.rect.size.width as f64,
+                        tile.rect.size.height as f64,
+                    ));
+                    if let Some(monitor) = event_loop.available_monitors().nth(tile.display) {
+                        let position = monitor.position();
+                        attributes =
+                            attributes.with_position(PhysicalPosition::new(position.x, position.y));
+                    } else {
+                        attributes = attributes.with_position(LogicalPosition::new(
+                            tile.rect.origin.x as f64,
+                            tile.rect.origin.y as f64,
+                        ));
+                    }
+                    None
+                },
+            };
 
             let window = event_loop
                 .create_window(attributes)
@@ -258,7 +338,7 @@ impl ApplicationHandler<WakerEvent> for App {
                     display_handle,
                     window_handle,
                     window.inner_size(),
-                    Some(tile.gpu),
+                    gpu_index,
                 )
                 .expect("Could not create RenderingContext for tile window"),
             );
@@ -373,7 +453,7 @@ impl embedder_traits::EventLoopWaker for Waker {
 
     fn wake(&self) {
         if let Err(error) = self.0.send_event(WakerEvent) {
-            warn!(?error, "Failed to wake event loop");
+            eprintln!("warning: failed to wake event loop: {error:?}");
         }
     }
 }
@@ -397,8 +477,10 @@ mod wall {
 
     #[derive(Clone, Debug)]
     pub struct WallTile {
-        pub monitor: usize,
-        pub gpu: usize,
+        /// Spatial display index (top-left = 0, left→right then top→bottom). Resolved at
+        /// runtime against the DXGI display topology; the GPU that drives that display is
+        /// assigned automatically.
+        pub display: usize,
         pub rect: Rect<i32, DeviceIndependentPixel>,
     }
 
@@ -510,8 +592,30 @@ mod wall {
         }
         let mut parsed = Vec::with_capacity(tiles.len());
         for (index, tile) in tiles.iter().enumerate() {
-            let monitor = get_usize(tile, "monitor")?;
-            let gpu = get_usize(tile, "gpu")?;
+            // `display` is the spatial index; accept the legacy `monitor` name as an alias.
+            let display = match get_usize(tile, "display") {
+                Ok(value) => value,
+                Err(_) => match get_usize(tile, "monitor") {
+                    Ok(value) => {
+                        eprintln!(
+                            "warning: wall tile {index}: 'monitor' is deprecated; use 'display' \
+                             (spatial index, top-left = 0, left→right then top→bottom)"
+                        );
+                        value
+                    },
+                    Err(_) => {
+                        return Err(WallLayoutError::Invalid(format!(
+                            "tile {index} must have a 'display' (spatial index) field"
+                        )));
+                    },
+                },
+            };
+            if tile.get("gpu").is_some() {
+                eprintln!(
+                    "warning: wall tile {index}: 'gpu' is ignored; the GPU is auto-assigned from \
+                     the adapter that drives the chosen display"
+                );
+            }
             let rect = get_rect(tile, "rect")?;
             if rect.size.width <= 0 || rect.size.height <= 0 {
                 return Err(WallLayoutError::Invalid(format!(
@@ -527,7 +631,7 @@ mod wall {
                     "tile {index} rect exceeds virtualViewport"
                 )));
             }
-            parsed.push(WallTile { monitor, gpu, rect });
+            parsed.push(WallTile { display, rect });
         }
         Ok(parsed)
     }
