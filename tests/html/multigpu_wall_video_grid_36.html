@@ -21,7 +21,8 @@
     /* Servo does not support CSS Grid (display:grid); use flexbox wrapping instead. */
     #grid { display: flex; flex-wrap: wrap; align-content: flex-start; width: 100vw; height: 100vh; }
     .cell { flex: none; position: relative; overflow: hidden; box-sizing: border-box; border: 1px solid rgba(255,255,255,0.15); }
-    .cell video { width: 100%; height: 100%; object-fit: cover; display: block; background: #111; }
+    /* fill = stretch to the whole cell, ignore aspect ratio, show the entire frame. */
+    .cell video { width: 100%; height: 100%; object-fit: fill; display: block; background: #111; }
     .label { position: absolute; top: 2px; left: 2px; font: 14px/1.2 monospace; color: #0f0;
              background: rgba(0,0,0,0.55); padding: 1px 4px; pointer-events: none; }
   </style>
