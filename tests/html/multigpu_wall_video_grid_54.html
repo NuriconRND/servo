@@ -18,8 +18,9 @@
   <title>Wall video grid — 54 (6x9, fills 2-wide x 3-tall wall)</title>
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
-    #grid { display: grid; width: 100vw; height: 100vh; gap: 0; }
-    .cell { position: relative; overflow: hidden; box-sizing: border-box; border: 1px solid rgba(255,255,255,0.15); }
+    /* Servo does not support CSS Grid (display:grid); use flexbox wrapping instead. */
+    #grid { display: flex; flex-wrap: wrap; align-content: flex-start; width: 100vw; height: 100vh; }
+    .cell { flex: none; position: relative; overflow: hidden; box-sizing: border-box; border: 1px solid rgba(255,255,255,0.15); }
     .cell video { width: 100%; height: 100%; object-fit: cover; display: block; background: #111; }
     .label { position: absolute; top: 2px; left: 2px; font: 14px/1.2 monospace; color: #0f0;
              background: rgba(0,0,0,0.55); padding: 1px 4px; pointer-events: none; }
@@ -37,13 +38,17 @@
     const COLS = 6, ROWS = 9;
 
     const grid = document.getElementById("grid");
-    grid.style.gridTemplateColumns = `repeat(${COLS}, 1fr)`;
-    grid.style.gridTemplateRows = `repeat(${ROWS}, 1fr)`;
+    // Flexbox tiling: each cell is (100/COLS)% wide so COLS cells fill a row and wrap,
+    // and (100/ROWS)% tall so ROWS rows fill the height.
+    const cellWidth = 100 / COLS + "%";
+    const cellHeight = 100 / ROWS + "%";
 
     const total = COLS * ROWS;
     for (let i = 0; i < total; i++) {
       const cell = document.createElement("div");
       cell.className = "cell";
+      cell.style.width = cellWidth;
+      cell.style.height = cellHeight;
 
       const video = document.createElement("video");
       video.src = VIDEO_SRC;
