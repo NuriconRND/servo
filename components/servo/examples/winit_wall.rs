@@ -32,7 +32,7 @@ use servo::{
 };
 use url::Url;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -268,13 +268,16 @@ impl ApplicationHandler<WakerEvent> for App {
 
             let gpu_index = match spatial.get(tile.display) {
                 Some(disp) => {
-                    // Place the window on the real display by desktop coordinate, and bind its
-                    // rendering context to the adapter that drives that display.
+                    // Position the window at the real display's desktop origin, and bind its
+                    // rendering context to the adapter that drives that display. The window is
+                    // sized to the TILE RECT (not the display) so a tile larger than one display
+                    // — e.g. a single tile covering the whole virtual viewport — gets a window
+                    // big enough to show all of it.
                     attributes = attributes
                         .with_position(PhysicalPosition::new(disp.left, disp.top))
-                        .with_inner_size(PhysicalSize::new(
-                            disp.width.max(1) as u32,
-                            disp.height.max(1) as u32,
+                        .with_inner_size(LogicalSize::new(
+                            tile.rect.size.width as f64,
+                            tile.rect.size.height as f64,
                         ));
                     if let Some(luid) = dxgi_luid_for_gpu_index(disp.adapter_index)
                         && luid != disp.luid
