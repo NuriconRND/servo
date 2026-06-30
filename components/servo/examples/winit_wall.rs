@@ -160,9 +160,41 @@ struct AppState {
     // Filled in after the tiles exist (the WebView's delegate is `AppState` itself).
     webview: RefCell<Option<WebView>>,
     tiles: Vec<TileWindow>,
+    // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
+    // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
+    // whether a slow oversized present is the cause vs WebRender update/draw. Logged once/sec.
+    present_ms_sum: Cell<f64>,
+    present_count: Cell<u32>,
+    present_window_start: Cell<Option<std::time::Instant>>,
 }
 
 impl AppState {
+    fn note_present(&self, present_ms: f64) {
+        let now = std::time::Instant::now();
+        let start = match self.present_window_start.get() {
+            Some(start) => start,
+            None => {
+                self.present_window_start.set(Some(now));
+                now
+            },
+        };
+        self.present_ms_sum
+            .set(self.present_ms_sum.get() + present_ms);
+        self.present_count.set(self.present_count.get() + 1);
+        let elapsed = now.duration_since(start).as_secs_f64();
+        if elapsed >= 1.0 {
+            let count = self.present_count.get().max(1);
+            eprintln!(
+                "Present perf: presents_per_s={:.1} avg_present_ms={:.2}",
+                self.present_count.get() as f64 / elapsed,
+                self.present_ms_sum.get() / count as f64,
+            );
+            self.present_ms_sum.set(0.0);
+            self.present_count.set(0);
+            self.present_window_start.set(Some(now));
+        }
+    }
+
     fn render_all_tiles(&self) {
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
@@ -181,12 +213,16 @@ impl AppState {
                     }
                     let _ = tile.rendering_context.make_current();
                     webview.paint_target(target);
+                    let present_start = std::time::Instant::now();
                     tile.rendering_context.present();
+                    self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
                 },
                 None => {
                     let _ = tile.rendering_context.make_current();
                     webview.paint();
+                    let present_start = std::time::Instant::now();
                     tile.rendering_context.present();
+                    self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
                 },
             }
         }
@@ -372,6 +408,9 @@ impl ApplicationHandler<WakerEvent> for App {
             servo,
             webview: RefCell::new(None),
             tiles,
+            present_ms_sum: Cell::new(0.0),
+            present_count: Cell::new(0),
+            present_window_start: Cell::new(None),
         });
 
         // 3) One logical WebView whose layout viewport is the whole virtual viewport.

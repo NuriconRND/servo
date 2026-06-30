@@ -43,8 +43,8 @@ use webrender::{
     MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
 };
 use webrender_api::units::{
-    DevicePixel, DevicePoint, DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform,
-    LayoutVector2D, WorldPoint,
+    DeviceIntSize, DevicePixel, DevicePoint, DeviceVector2D, LayoutPoint, LayoutRect, LayoutSize,
+    LayoutTransform, LayoutVector2D, WorldPoint,
 };
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
@@ -64,6 +64,49 @@ use crate::screenshot::ScreenshotTaker;
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
+
+/// (video-grid perf investigation) When `SERVO_PERF_GLFINISH` is set, fence the GPU with
+/// `glFinish()` right after `renderer.render()` so `draw_ms` reflects the *actual* GPU
+/// rasterization time instead of just async command submission. This disambiguates whether
+/// the large-surface `update()` blow-up is genuine CPU work in `update()` or GPU raster
+/// backpressure absorbed by the next frame's first GL call.
+fn perf_glfinish_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SERVO_PERF_GLFINISH").is_ok())
+}
+
+/// (video-grid perf investigation) Override the WebRender picture-cache tile size via
+/// `SERVO_WR_PICTURE_TILE="WxH"` (clamped by WebRender to [128, 4096]). Used to test
+/// whether the large-surface `update()` blow-up tracks picture-cache tile count: smaller
+/// tiles => more tiles => slower if tiling is the culprit; larger tiles => fewer => faster.
+fn perf_picture_tile_size() -> Option<DeviceIntSize> {
+    static SIZE: std::sync::OnceLock<Option<DeviceIntSize>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let spec = std::env::var("SERVO_WR_PICTURE_TILE").ok()?;
+        let (w, h) = spec.split_once('x')?;
+        Some(DeviceIntSize::new(
+            w.trim().parse().ok()?,
+            h.trim().parse().ok()?,
+        ))
+    })
+}
+
+/// Per-second render-cost attribution accumulator (video-grid perf investigation).
+///
+/// Splits each composite into `renderer.update()` (texture upload + scene processing)
+/// vs `renderer.render()` (GPU raster/draw), and tracks how many epoch-less (video)
+/// image updates were uploaded and how often the immediate-composite trigger actually
+/// fired vs was coalesced by the `pending_frames == 0` guard. Logged once per second.
+#[derive(Default)]
+struct RenderPerf {
+    window_start: Option<Instant>,
+    renders: u32,
+    update_ms_sum: f64,
+    draw_ms_sum: f64,
+    video_uploads: u32,
+    generate_attempts: u32,
+    generate_emitted: u32,
+}
 
 /// A [`Painter`] is responsible for all of the painting to a particular [`RenderingContext`].
 /// This holds all of the WebRender specific data structures and state necessary for painting
@@ -110,6 +153,9 @@ pub(crate) struct Painter {
 
     /// Count of render passes executed for this target.
     render_count: Cell<u64>,
+
+    /// Per-second render-cost attribution (video-grid perf investigation).
+    render_perf: RefCell<RenderPerf>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -297,6 +343,7 @@ impl Painter {
                 // from `FontKey`, `FontInstanceKey`, and `ImageKey` back to `PainterId`.
                 namespace_alloc_by_client: true,
                 shared_font_namespace: Some(painter_id.into()),
+                picture_tile_size: perf_picture_tile_size(),
                 ..Default::default()
             },
             None,
@@ -326,6 +373,7 @@ impl Painter {
             overlapping_frame_request_count: Default::default(),
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
+            render_perf: Default::default(),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -515,6 +563,10 @@ impl Painter {
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
+        // Perf attribution (video-grid investigation): split the composite into texture
+        // upload/scene processing (`renderer.update()`) vs GPU raster (`renderer.render()`).
+        let mut update_ms = 0.0f64;
+        let mut draw_ms = 0.0f64;
         {
             let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
@@ -530,20 +582,29 @@ impl Painter {
                 None,
                 time_profiler_channel.clone(),
                 || {
+                    let update_start = Instant::now();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         renderer.update();
                     }
+                    update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
 
                     // Paint the scene.
                     // TODO(gw): Take notice of any errors the renderer returns!
                     self.clear_background();
+                    let draw_start = Instant::now();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
                         renderer.render(size, 0 /* buffer_age */).ok();
                     }
+                    // (investigation) optionally fence so draw_ms = real GPU raster time.
+                    if perf_glfinish_enabled() {
+                        self.webrender_gl.finish();
+                    }
+                    draw_ms = draw_start.elapsed().as_secs_f64() * 1000.0;
                 }
             );
         }
+        self.accumulate_render_perf(update_ms, draw_ms);
 
         // We've painted the default target, which means that from the embedder's perspective,
         // the scene no longer needs to be repainted.
@@ -581,6 +642,43 @@ impl Painter {
                 self.pending_frames.get(),
             );
         }
+    }
+
+    /// Accumulate per-composite timings (video-grid perf investigation) and emit a
+    /// one-line summary once per second: composite throughput (FPS), the upload vs draw
+    /// split, video plane-upload volume, and how often the immediate-composite trigger
+    /// fired vs was coalesced by the `pending_frames == 0` guard.
+    fn accumulate_render_perf(&self, update_ms: f64, draw_ms: f64) {
+        let now = Instant::now();
+        let mut perf = self.render_perf.borrow_mut();
+        let window_start = *perf.window_start.get_or_insert(now);
+        perf.renders += 1;
+        perf.update_ms_sum += update_ms;
+        perf.draw_ms_sum += draw_ms;
+
+        let elapsed = now.duration_since(window_start).as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        let renders = perf.renders.max(1) as f64;
+        info!(
+            "Render perf: painter {:?} composite_fps={:.1} avg_update_ms={:.2} \
+             avg_draw_ms={:.2} video_uploads_per_s={:.0} generate_attempts_per_s={:.0} \
+             generate_emitted_per_s={:.0} requested_gpu={:?} size={:?}",
+            self.painter_id,
+            perf.renders as f64 / elapsed,
+            perf.update_ms_sum / renders,
+            perf.draw_ms_sum / renders,
+            perf.video_uploads as f64 / elapsed,
+            perf.generate_attempts as f64 / elapsed,
+            perf.generate_emitted as f64 / elapsed,
+            self.rendering_context.requested_gpu_index(),
+            self.rendering_context.size(),
+        );
+        *perf = RenderPerf {
+            window_start: Some(now),
+            ..Default::default()
+        };
     }
 
     fn clear_background(&self) {
@@ -1513,6 +1611,7 @@ impl Painter {
                         self.frame_delayer.update_image(key, epoch);
                     } else {
                         immediate_image_update = true;
+                        self.render_perf.borrow_mut().video_uploads += 1;
                     }
                     let dirty_rect = self.media_tile_dirty_rect(&desc, &data);
                     txn.update_image(key, desc, data.into(), &dirty_rect)
@@ -1556,8 +1655,12 @@ impl Painter {
         // together with the updated image (z-order/clip preserved). Only when no frame is already
         // in flight, so we don't stack composites or double up with the script's own GenerateFrame
         // (which also increments pending_frames); this self-limits to roughly the present rate.
-        if immediate_image_update && !generated_frame && self.pending_frames.get() == 0 {
-            self.generate_frame(&mut txn, RenderReasons::SCENE);
+        if immediate_image_update && !generated_frame {
+            self.render_perf.borrow_mut().generate_attempts += 1;
+            if self.pending_frames.get() == 0 {
+                self.render_perf.borrow_mut().generate_emitted += 1;
+                self.generate_frame(&mut txn, RenderReasons::SCENE);
+            }
         }
 
         self.send_transaction(txn);
