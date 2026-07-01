@@ -1,0 +1,100 @@
+# webrender-0.68-disable-picture-caching.patch
+#
+# What it does:
+#   Adds an environment-gated bypass for WebRender picture caching.
+#   When WR_DISABLE_PICTURE_CACHING is set (any value), every call to
+#   create_tile_cache() emits a normal None-composite PicturePrimitive
+#   instead of a TileCache-composite one, so WebRender skips per-frame
+#   tile dirty/dependency tracking for all-dynamic content (e.g., video
+#   wall tiles where every primitive changes every frame).
+#
+# Applies to:
+#   webrender 0.68.0  —  src/tile_cache.rs
+#   (Servo fork, function create_tile_cache, ~line 640)
+#
+# Prerequisites:
+#   1. A local fork checkout at (e.g.):
+#        F:\...\webrender\webrender
+#   2. The [patch.crates-io] slot active in servo/Cargo.toml:
+#        [patch.crates-io]
+#        webrender = { path = "../webrender/webrender" }
+#   3. Apply with:
+#        patch -p1 < webrender-0.68-disable-picture-caching.patch
+#      from inside the fork root (F:\...\webrender\webrender), or apply
+#      the two hunks manually to src/tile_cache.rs.
+#
+# Usage:
+#   Set WR_DISABLE_PICTURE_CACHING=1 (or any value) before launching
+#   servoshell / winit_wall. Unset to restore normal tile-cache behaviour.
+#   Toggling requires a process restart (value is read once at scene-build
+#   time via OnceLock).
+#
+diff --git "a/C:\\Users\\nuricon\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\webrender-0.68.0\\src\\tile_cache.rs" "b/F:\\20260609_SDWall_BrowserTest\\20260606_multigpu_browser\\webrender\\webrender\\src\\tile_cache.rs"
+index c1cecc561cb..3a85d78743e 100644
+--- "a/C:\\Users\\nuricon\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\webrender-0.68.0\\src\\tile_cache.rs"
++++ "b/F:\\20260609_SDWall_BrowserTest\\20260606_multigpu_browser\\webrender\\webrender\\src\\tile_cache.rs"
+@@ -16,6 +16,14 @@ use crate::spatial_tree::{SpatialNodeIndex, SceneSpatialTree};
+ use crate::util::VecHelper;
+ use std::mem;
+ 
++/// Multi-GPU video-wall workaround: disable WebRender picture caching when
++/// `WR_DISABLE_PICTURE_CACHING` is set in the environment. Read once (scene
++/// build time), so toggling requires a restart.
++fn picture_caching_disabled() -> bool {
++    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *DISABLED.get_or_init(|| std::env::var("WR_DISABLE_PICTURE_CACHING").is_ok())
++}
++
+ /*
+  Types and functionality related to picture caching. In future, we'll
+  move more and more of the existing functionality out of picture.rs
+@@ -632,24 +640,33 @@ fn create_tile_cache(
+ 
+     let slice_id = SliceId::new(slice);
+ 
+-    // Store some information about the picture cache slice. This is used when we swap the
+-    // new scene into the frame builder to either reuse existing slices, or create new ones.
+-    tile_caches.insert(slice_id, TileCacheParams {
+-        debug_flags,
+-        slice,
+-        slice_flags,
+-        spatial_node_index: scroll_root,
+-        visibility_node_index: visibility_node,
+-        background_color,
+-        shared_clip_node_id,
+-        shared_clip_leaf_id,
+-        virtual_surface_size: frame_builder_config.compositor_kind.get_virtual_surface_size(),
+-        image_surface_count: prim_list.image_surface_count,
+-        yuv_image_surface_count: prim_list.yuv_image_surface_count,
+-    });
++    // Multi-GPU video-wall workaround: when picture caching is disabled, emit
++    // this slice as a normal (None composite) picture instead of a tile cache,
++    // so all-dynamic content (every primitive changing every frame) skips the
++    // per-frame tile dirty/dependency tracking, which provides no benefit here.
++    let composite_mode = if picture_caching_disabled() {
++        None
++    } else {
++        // Store some information about the picture cache slice. This is used when we swap the
++        // new scene into the frame builder to either reuse existing slices, or create new ones.
++        tile_caches.insert(slice_id, TileCacheParams {
++            debug_flags,
++            slice,
++            slice_flags,
++            spatial_node_index: scroll_root,
++            visibility_node_index: visibility_node,
++            background_color,
++            shared_clip_node_id,
++            shared_clip_leaf_id,
++            virtual_surface_size: frame_builder_config.compositor_kind.get_virtual_surface_size(),
++            image_surface_count: prim_list.image_surface_count,
++            yuv_image_surface_count: prim_list.yuv_image_surface_count,
++        });
++        Some(PictureCompositeMode::TileCache { slice_id })
++    };
+ 
+     let pic_index = prim_store.pictures.alloc().init(PicturePrimitive::new_image(
+-        Some(PictureCompositeMode::TileCache { slice_id }),
++        composite_mode,
+         Picture3DContext::Out,
+         PrimitiveFlags::IS_BACKFACE_VISIBLE,
+         prim_list,
