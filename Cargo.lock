@@ -11354,8 +11354,6 @@ dependencies = [
 [[package]]
 name = "webrender"
 version = "0.68.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a591c25221a9f8ac2ad7754659b283d912cee6c8424f0fa3777aabed3be91c16"
 dependencies = [
  "allocator-api2",
  "bincode",

@@ -438,7 +438,7 @@ surfman = { path = "third_party/surfman" }
 #
 # For WebRender:
 #
-# webrender = { path = "../webrender/webrender" }
+webrender = { path = "../webrender/webrender" }
 # webrender_api = { path = "../webrender/webrender_api" }
 # wr_malloc_size_of = { path = "../webrender/wr_malloc_size_of" }
 #
