@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Video Collapse Ceiling (WebGL)</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; background:#000;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color:#f4f4f4; }
+  #gl { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  /* DOM 오버레이(?dom=1): 각 타일 위에 테두리+라벨. 캔버스 위(z=5) 합성. */
+  #dom { position:fixed; inset:0; pointer-events:none; z-index:5; }
+  .cap { position:absolute; box-sizing:border-box; border:2px solid rgba(0,220,255,.9);
+    color:#eafcff; font-size:14px; padding:2px 4px; text-shadow:0 1px 2px #000; overflow:hidden; }
+  #stats { position:fixed; left:16px; top:16px; z-index:10; padding:12px 16px;
+    background:rgba(0,0,0,.78); border:1px solid rgba(255,255,255,.34);
+    font-size:20px; line-height:1.4; white-space:pre; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="dom"></div>
+<div id="stats">loading…</div>
+<script>
+"use strict";
+// 파라미터: ?grid=N | ?cols=C&rows=R, ?mode=v1|v2, ?dom=0|1, ?log=1
+const params = new URLSearchParams(location.search);
+const clampInt = (raw, fb) => { const n = parseInt(raw,10); return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fb; };
+const gridN = clampInt(params.get("grid"), 8);
+const COLS = clampInt(params.get("cols"), gridN);
+const ROWS = clampInt(params.get("rows"), gridN);
+const TILE_COUNT = COLS * ROWS;
+const MODE = params.get("mode") === "v2" ? "v2" : "v1";
+const DOM = params.get("dom") === "1";
+const LOG = params.get("log") === "1";
+const TEX_W = 1920, TEX_H = 1080; // 각 소스 텍스처를 실제 비디오 타일 해상도로 (업로드 비용 현실화)
+
+const canvas = document.getElementById("gl");
+const stats = document.getElementById("stats");
+const domLayer = document.getElementById("dom");
+
+// 캔버스 백버퍼를 창 픽셀(devicePixelRatio 반영)에 맞춤
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+}
+resize();
+window.addEventListener("resize", resize);
+
+const gl = canvas.getContext("webgl", { antialias:false, depth:false, alpha:false, premultipliedAlpha:false });
+if (!gl) {
+  const msg = "[CEILING] ERROR webgl context is null";
+  stats.textContent = msg; console.error(msg); throw new Error(msg);
+}
+console.error("[CEILING] init gl=ok mode=" + MODE + " tiles=" + TILE_COUNT + " dom=" + (DOM?1:0));
+
+// --- 셰이더: 단위 사각형을 (translate,scale)로 배치 후 텍스처 샘플 ---
+const VS = `
+attribute vec2 aPos;      // 0..1 unit quad
+uniform vec2 uTrans;      // clip-space translate (타일 좌하단)
+uniform vec2 uScale;      // clip-space scale (타일 크기)
+varying vec2 vUV;
+void main() {
+  vUV = vec2(aPos.x, 1.0 - aPos.y);
+  gl_Position = vec4(uTrans + aPos * uScale, 0.0, 1.0);
+}`;
+const FS = `
+precision mediump float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+uniform float uTint;      // 프레임마다 변해 드라이버 no-op 방지 + 타일 식별
+void main() {
+  vec4 c = texture2D(uTex, vUV);
+  gl_FragColor = vec4(c.rgb * (0.6 + 0.4 * uTint), 1.0);
+}`;
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const e = "[CEILING] ERROR shader: " + gl.getShaderInfoLog(s); console.error(e); throw new Error(e);
+  }
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  const e = "[CEILING] ERROR link: " + gl.getProgramInfoLog(prog); console.error(e); throw new Error(e);
+}
+gl.useProgram(prog);
+const aPos = gl.getAttribLocation(prog, "aPos");
+const uTrans = gl.getUniformLocation(prog, "uTrans");
+const uScale = gl.getUniformLocation(prog, "uScale");
+const uTint = gl.getUniformLocation(prog, "uTint");
+const uTex = gl.getUniformLocation(prog, "uTex");
+
+const quad = new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+gl.uniform1i(uTex, 0);
+gl.activeTexture(gl.TEXTURE0);
+
+// 소스 픽셀 버퍼 풀: 소수의 1080p RGBA 버퍼 재사용(JS 메모리 절약). 업로드 비용은
+// texImage2D 호출당 발생하므로 소스를 공유해도 병목 측정엔 무방.
+const POOL = 4;
+const srcBufs = [];
+for (let p = 0; p < POOL; p++) {
+  const buf = new Uint8Array(TEX_W * TEX_H * 4);
+  for (let i = 0; i < buf.length; i += 4) {
+    const px = i >> 2;
+    buf[i] = (px + p*60) & 255; buf[i+1] = (px >> 3) & 255; buf[i+2] = (p*63) & 255; buf[i+3] = 255;
+  }
+  srcBufs.push(buf);
+}
+
+function makeTex(buf) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, TEX_W, TEX_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+  return t;
+}
+// v1: 공유 텍스처 1개(업로드 0). v2: 타일별 텍스처 N개.
+let sharedTex = null, tileTex = [];
+if (MODE === "v1") sharedTex = makeTex(srcBufs[0]);
+else for (let i = 0; i < TILE_COUNT; i++) tileTex.push(makeTex(srcBufs[i % POOL]));
+
+// v2: 매 프레임 각 타일 텍스처를 소스 버퍼에서 재업로드(실제 비디오 프레임 도착 모사)
+function uploadFrame(frameIdx) {
+  for (let i = 0; i < TILE_COUNT; i++) {
+    gl.bindTexture(gl.TEXTURE_2D, tileTex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, TEX_W, TEX_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, srcBufs[(i+frameIdx) % POOL]);
+  }
+}
+
+// DOM 오버레이(?dom=1): 타일마다 테두리+라벨, 캔버스 위 합성
+const caps = [];
+if (DOM) {
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const c = document.createElement("div");
+    c.className = "cap";
+    const col = i % COLS, row = (i / COLS) | 0;
+    c.style.left = (col*100/COLS) + "vw"; c.style.top = (row*100/ROWS) + "vh";
+    c.style.width = (100/COLS) + "vw"; c.style.height = (100/ROWS) + "vh";
+    c.textContent = "TILE " + i;
+    domLayer.appendChild(c); caps.push(c);
+  }
+}
+
+// 타일 배치(clip space) 사전 계산
+const tiles = [];
+for (let i = 0; i < TILE_COUNT; i++) {
+  const col = i % COLS, row = (i / COLS) | 0;
+  const sx = 2/COLS, sy = 2/ROWS;
+  tiles.push({ tx: -1 + col*sx, ty: 1 - (row+1)*sy, sx, sy });
+}
+
+function draw(frameIdx) {
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(uScale, tiles[0].sx, tiles[0].sy);
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const t = tiles[i];
+    gl.bindTexture(gl.TEXTURE_2D, MODE === "v1" ? sharedTex : tileTex[i]);
+    gl.uniform2f(uTrans, t.tx, t.ty);
+    gl.uniform1f(uTint, ((i + frameIdx) % 30) / 30);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+}
+
+// fps/지터 측정 + ?log=1 로그 (video_grid_6x6_perf.html 패턴 재사용)
+const startTime = performance.now();
+let lastSample = startTime, rafSince = 0, lastFrameTs = startTime, maxGap = 0, jitter = 0, fps = 0, frameIdx = 0;
+function tick(now) {
+  rafSince++; frameIdx++;
+  const gap = now - lastFrameTs; if (gap > maxGap) maxGap = gap; lastFrameTs = now;
+
+  if (MODE === "v2") uploadFrame(frameIdx);
+  draw(frameIdx);
+  if (DOM) for (let i = 0; i < caps.length; i++)
+    caps[i].style.borderColor = ((frameIdx+i) & 16) ? "rgba(0,220,255,.9)" : "rgba(255,140,0,.9)";
+
+  const dt = now - lastSample;
+  if (dt >= 1000) {
+    fps = (rafSince*1000)/dt; jitter = maxGap;
+    if (LOG) console.error(`[CEILING] mode=${MODE} tiles=${TILE_COUNT} dom=${DOM?1:0} fps=${fps.toFixed(1)} maxGapMs=${jitter.toFixed(1)}`);
+    maxGap = 0; rafSince = 0; lastSample = now;
+  }
+  stats.textContent = [
+    `collapse ceiling (WebGL)`,
+    `mode  : ${MODE}  (${MODE==="v1"?"shared tex, no upload":"N tex, per-frame upload"})`,
+    `grid  : ${COLS}x${ROWS} = ${TILE_COUNT}`,
+    `dom   : ${DOM?"on":"off"}`,
+    `rAF FPS: ${fps.toFixed(1)}`,
+    `jitter(maxGap): ${jitter.toFixed(1)} ms`,
+  ].join("\n");
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
