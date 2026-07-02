@@ -241,45 +241,14 @@ impl HeadedWindow {
             .as_ref()
             .and_then(|layout| layout.tiles.get(servoshell_preferences.wall_tile_index))
             .map(|tile| tile.gpu);
-        // On Windows, optionally pace frame production to the DWM composition clock (display
-        // vsync) via DwmFlush instead of the default free-running paint timer. The timer
-        // overshoots the refresh rate (~65fps on a 60Hz display) and beats against vsync, causing
-        // periodic judder / non-uniform 60fps even for a single video; the vsync driver removes
-        // that beat. It is opt-in (SERVO_WIN_VSYNC=1) rather than default because under heavy
-        // compositor load (many videos) it degrades worse than the timer, which stays robust.
-        #[cfg(target_os = "windows")]
-        let win_vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
-            let enabled = std::env::var("SERVO_WIN_VSYNC").is_ok_and(|value| {
-                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
-            });
-            if enabled {
-                info!("SERVO_WIN_VSYNC=1: pacing frame production to DWM vsync (DwmFlush).");
-                Some(Rc::new(
-                    crate::desktop::vsync_refresh_driver::DwmVsyncRefreshDriver::new(),
-                ))
-            } else {
-                None
-            }
-        };
-
-        #[cfg(target_os = "windows")]
-        let window_rendering_context_result =
-            WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
+        let window_rendering_context = Rc::new(
+            WindowRenderingContext::new_with_target_gpu(
                 display_handle,
                 window_handle,
                 inner_size,
-                win_vsync_driver,
                 requested_gpu_index,
-            );
-        #[cfg(not(target_os = "windows"))]
-        let window_rendering_context_result = WindowRenderingContext::new_with_target_gpu(
-            display_handle,
-            window_handle,
-            inner_size,
-            requested_gpu_index,
-        );
-        let window_rendering_context = Rc::new(
-            window_rendering_context_result.expect("Could not create RenderingContext for Window"),
+            )
+            .expect("Could not create RenderingContext for Window"),
         );
 
         // Setup for GL accelerated media handling. This is only active on certain Linux platforms
