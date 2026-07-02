@@ -241,24 +241,24 @@ impl HeadedWindow {
             .as_ref()
             .and_then(|layout| layout.tiles.get(servoshell_preferences.wall_tile_index))
             .map(|tile| tile.gpu);
-        // On Windows, pace frame production to the DWM composition clock (display vsync) via
-        // DwmFlush instead of the default free-running paint timer. The timer overshoots the
-        // refresh rate (~65fps on a 60Hz display) and beats against vsync, causing periodic
-        // judder / non-uniform 60fps even for a single video. Enabled by default; opt out with
-        // SERVO_WIN_VSYNC=0 (e.g. to fall back to the timer if it regresses on a given setup).
+        // On Windows, optionally pace frame production to the DWM composition clock (display
+        // vsync) via DwmFlush instead of the default free-running paint timer. The timer
+        // overshoots the refresh rate (~65fps on a 60Hz display) and beats against vsync, causing
+        // periodic judder / non-uniform 60fps even for a single video; the vsync driver removes
+        // that beat. It is opt-in (SERVO_WIN_VSYNC=1) rather than default because under heavy
+        // compositor load (many videos) it degrades worse than the timer, which stays robust.
         #[cfg(target_os = "windows")]
         let win_vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
-            let disabled = std::env::var("SERVO_WIN_VSYNC").is_ok_and(|value| {
-                value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+            let enabled = std::env::var("SERVO_WIN_VSYNC").is_ok_and(|value| {
+                value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
             });
-            if disabled {
-                info!("SERVO_WIN_VSYNC=0: using the default free-running paint timer.");
-                None
-            } else {
-                info!("Pacing frame production to DWM vsync (DwmFlush); disable with SERVO_WIN_VSYNC=0.");
+            if enabled {
+                info!("SERVO_WIN_VSYNC=1: pacing frame production to DWM vsync (DwmFlush).");
                 Some(Rc::new(
                     crate::desktop::vsync_refresh_driver::DwmVsyncRefreshDriver::new(),
                 ))
+            } else {
+                None
             }
         };
 

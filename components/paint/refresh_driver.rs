@@ -152,6 +152,20 @@ impl AnimationRefreshDriverObserver {
     }
 }
 
+/// Backpressure threshold: if WebRender already has at least this many frames in flight, the
+/// animation driver skips requesting another frame for a cycle. Tunable via
+/// SERVO_ANIMATION_MAX_PENDING (default 2). Must be >= 1.
+fn animation_backpressure_max_pending() -> usize {
+    static MAX_PENDING: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("SERVO_ANIMATION_MAX_PENDING")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(2)
+    });
+    *MAX_PENDING
+}
+
 impl RefreshDriverObserver for AnimationRefreshDriverObserver {
     fn frame_started(&self, painter: &mut Painter) -> bool {
         // If any WebViews are animating ask them to paint again for another animation tick.
@@ -162,6 +176,16 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         if animating_webviews.is_empty() {
             self.animating.set(false);
             return false;
+        }
+
+        // Backpressure: if WebRender is already behind (several frames requested but not yet
+        // completed, e.g. while compositing many videos), skip requesting another animation frame
+        // this cycle and retry on the next one. Without this the driver keeps asking for frames
+        // faster than they complete, so `pending_frames` and latency grow without bound (runaway).
+        // Throttling production to match completion degrades gracefully to a steady lower fps.
+        if painter.pending_frames() >= animation_backpressure_max_pending() {
+            self.animating.set(true);
+            return true;
         }
 
         // Request new animation frames from all animating WebViews.

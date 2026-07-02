@@ -544,6 +544,12 @@ impl Painter {
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
+        // Diagnostic breakdown (env SERVO_LOG_PRESENT_CADENCE): WebRender update() applies
+        // pending resource updates (notably per-frame video texture uploads); render() draws
+        // and composites the scene. Splitting them tells whether an over-budget frame is
+        // upload-bound or draw/composite-bound.
+        let mut wr_update_ms = 0.0_f64;
+        let mut wr_render_ms = 0.0_f64;
         {
             let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
@@ -560,7 +566,9 @@ impl Painter {
                 time_profiler_channel.clone(),
                 || {
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        let update_start = Instant::now();
                         renderer.update();
+                        wr_update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
                     }
 
                     // Paint the scene.
@@ -568,7 +576,9 @@ impl Painter {
                     self.clear_background();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
+                        let draw_start = Instant::now();
                         renderer.render(size, 0 /* buffer_age */).ok();
+                        wr_render_ms = draw_start.elapsed().as_secs_f64() * 1000.0;
                     }
                 }
             );
@@ -582,6 +592,14 @@ impl Painter {
         self.send_pending_paint_metrics_messages_after_composite();
 
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        // Diagnostic: surface frames that blew the ~16.7ms vsync budget, with the WebRender
+        // upload-vs-draw split, to localize the bottleneck under heavy load (many videos).
+        if *LOG_PRESENT_CADENCE && render_ms > 16.0 {
+            info!(
+                "Slow paint frame: painter {:?} total_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2}",
+                self.painter_id, render_ms, wr_update_ms, wr_render_ms,
+            );
+        }
         if self.rendering_context.requested_gpu_index().is_some() {
             info!(
                 "Wall render end: painter {:?} render_count={} local_frame_id={:?} \
