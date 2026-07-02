@@ -1,0 +1,166 @@
+================================================================================
+ WebRender picture-caching 우회 — 수동 적용 & 테스트 가이드
+ (UTF-8. 에디터로 여세요. cmd에서 보려면 먼저: chcp 65001)
+================================================================================
+
+목적: 큰 단일 per-GPU surface(예 3840x3240)의 all-dynamic 비디오 월에서
+      WebRender picture caching 비용을 줄이는 실험 패치를, 개발/대화면 환경에서
+      직접 빌드·실행·토글·측정·되돌리기.
+
+현재 상태(중요): 아래 "attempt 3" 패치가 이미 로컬 webrender 포크에 적용되어 있음.
+  - 단일 모니터 개발 테스트에선 update_ms가 런어웨이(증가)로 목표 미달.
+  - 대화면/멀티모니터 실기에서 직접 검증해보시라는 취지로 그대로 둠.
+  - env OFF(기본값)에선 포크가 pristine과 동일하게 동작(정상).
+
+
+--------------------------------------------------------------------------------
+ 0. 구성 요약 (어떻게 연결되어 있나)
+--------------------------------------------------------------------------------
+- servo 리포:   F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\servo
+- webrender 포크: F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\webrender\webrender
+  (레지스트리 webrender-0.68.0 복사본. 여기 소스를 고침.)
+- 연결: servo\Cargo.toml 의 [patch.crates-io] 에 아래 한 줄이 활성화되어 있음:
+      webrender = { path = "../webrender/webrender" }
+  => servo 빌드가 이 로컬 포크를 사용.
+- 스위치: 환경변수 WR_DISABLE_PICTURE_CACHING=1 (아무 값). scene 빌드 시 1회 읽힘
+  => 켜고 끄려면 프로세스 재시작 필요.
+
+
+--------------------------------------------------------------------------------
+ 1. 빌드 (release)
+--------------------------------------------------------------------------------
+PowerShell에서, servo 디렉터리로 이동 후 (env 스크립트 dot-source가 필수):
+
+  cd F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\servo
+  . ..\scripts\servo_env.ps1
+  cargo build --release -p servo --example winit_wall --features media-gstreamer,no-wgl -j 8
+
+- 포크 소스를 고친 뒤엔 webrender만 재컴파일 + 링크(증분, 대략 15분 안팎).
+- 산출물: target\release\examples\winit_wall.exe
+
+
+--------------------------------------------------------------------------------
+ 2. 실행 전 준비 — DLL을 exe 옆에 복사 (필수)
+--------------------------------------------------------------------------------
+winit_wall.exe 는 ANGLE(libEGL/libGLESv2) + GStreamer DLL이 exe 옆에 있어야 함
+(없으면 egl 패닉). target\release\*.dll 을 examples\ 로 복사:
+
+  Get-ChildItem target\release\*.dll | ForEach-Object {
+    $d = Join-Path target\release\examples $_.Name
+    if (!(Test-Path $d) -or (Get-Item $d).Length -ne $_.Length) { Copy-Item $_.FullName $d -Force }
+  }
+
+(한 번 해두면 됨. 새로 빌드해 DLL이 갱신되면 다시 실행.)
+
+
+--------------------------------------------------------------------------------
+ 3. 대화면에서 인터랙티브 실행 (직접 눈으로 프레임레이트 확인)
+--------------------------------------------------------------------------------
+env를 켜고(=picture caching 우회), 로그를 파일로 받으며 실행. 창을 닫으면 종료
+(그래야 stderr가 flush됨). <layout.json> 은 실제 월 레이아웃으로 교체.
+
+  $env:WR_DISABLE_PICTURE_CACHING = "1"          # 끄고 싶으면 이 줄 대신:
+  # Remove-Item Env:\WR_DISABLE_PICTURE_CACHING  #   (기본=picture caching ON)
+  $env:RUST_LOG = "warn,paint=info"              # 초당 "Render perf" 로그
+  $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"   # 주기적 delivery 끊김 방지
+
+  target\release\examples\winit_wall.exe `
+    --wall-layout etc\multigpu\config\wall_layout.single_3840x3240.json `
+    --wall-all-tiles `
+    tests\html\perf_video_grid_4x4.html `
+    2> run_pc_off.err.log
+
+- 실제 대화면/멀티GPU면 --wall-layout 을 당신의 실제 레이아웃 JSON으로.
+- 페이지: tests\html\perf_video_grid_4x4.html (16x FHD30). 다른 배치는
+  tests\html\perf_video_grid_1x1.html 또는 COLS/ROWS 편집.
+- 종료: 창 닫기.
+
+
+--------------------------------------------------------------------------------
+ 4. 프레임레이트/비용 측정 (Render perf 로그 읽기)
+--------------------------------------------------------------------------------
+실행 후 로그에서 초당 라인 확인:
+
+  Select-String -Path run_pc_off.err.log -Pattern "Render perf"
+
+각 라인 필드:
+  composite_fps      = 초당 합성 프레임 수 (실효 프레임레이트 상한)
+  avg_update_ms      = renderer.update() (picture-cache 처리 = 병목)
+  avg_draw_ms        = GPU 래스터
+  video_uploads_per_s= 초당 YUV 플레인 업로드 (16x30x3 ~= 1440 이면 디코드 정상)
+
+비교: WR_DISABLE_PICTURE_CACHING 을 지우고(기본 ON) 같은 실행을 반복해 대조.
+영상 로딩에 수 초 걸리니 러닝은 20~30초 이상 두고 정상상태 라인들을 보라.
+
+편의 스크립트(자동 DLL 복사 + N초 실행 + Render perf 추출):
+  <세션 scratchpad>\run_perf_measure.ps1 -Label <name> -DurationSec 30 `
+     -Layout <layout.json> -Page <page.html>
+  (env는 호출 전에 $env:WR_DISABLE_PICTURE_CACHING="1" 로 설정하면 상속됨)
+
+
+--------------------------------------------------------------------------------
+ 5. 다른 진단 노브 (선택)
+--------------------------------------------------------------------------------
+- SERVO_PERF_GLFINISH=1   : render 직후 glFinish → avg_draw_ms가 실제 GPU 래스터 시간
+- SERVO_WR_PICTURE_TILE=WxH : picture-cache 타일 크기 오버라이드 (예 256x256, 4096x4096)
+  (둘 다 servo-paint 계측. 로그 타깃은 paint.)
+
+
+--------------------------------------------------------------------------------
+ 6. 패치 켜기/끄기 (env) & 완전 원복
+--------------------------------------------------------------------------------
+런타임 스위치(재빌드 불필요, 프로세스 재시작만):
+  켜기: $env:WR_DISABLE_PICTURE_CACHING = "1"   후 실행
+  끄기: Remove-Item Env:\WR_DISABLE_PICTURE_CACHING   후 실행 (기본 동작)
+
+포크 소스를 pristine(원본)으로 되돌리려면:
+  $src = "C:\Users\nuricon\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\webrender-0.68.0"
+  $dst = "F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\webrender\webrender"
+  Copy-Item -Recurse -Force "$src\src\tile_cache.rs" "$dst\src\tile_cache.rs"
+  Copy-Item -Recurse -Force "$src\src\picture.rs"    "$dst\src\picture.rs"
+  Get-ChildItem -Recurse $dst -File | ForEach-Object { $_.IsReadOnly = $false }
+  # 그 후 재빌드(1번)로 pristine 동작 복귀.
+
+패치를 다시 적용하려면(원복 후):
+  cd F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\webrender\webrender
+  git apply F:\...\servo\etc\multigpu\patches\webrender-0.68-disable-picture-caching.patch
+  (포크가 git이 아니면: 위 .patch 를 참고해 두 훅을 수동 편집. 아래 7 참고.)
+
+포크 자체를 완전히 안 쓰려면: servo\Cargo.toml 의
+  webrender = { path = "../webrender/webrender" }
+줄을 다시 주석 처리 → 레지스트리 webrender 사용(재빌드).
+
+
+--------------------------------------------------------------------------------
+ 7. 현재 패치의 정확한 위치 (수동 편집 시)
+--------------------------------------------------------------------------------
+파일: webrender\webrender\src\tile_cache.rs
+  - `use std::mem;` 아래에 헬퍼 추가:
+      pub(crate) fn picture_caching_disabled() -> bool {
+          static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+          *DISABLED.get_or_init(|| std::env::var("WR_DISABLE_PICTURE_CACHING").is_ok())
+      }
+
+파일: webrender\webrender\src\picture.rs
+  - fn update_content_validity(...) 본문 맨 앞(‘state.compare_cache.clear();’ 직전)에:
+      if crate::tile_cache::picture_caching_disabled() {
+          self.invalidate(None, InvalidationReason::ScaleChanged);
+          state.composite_state.dirty_rects_are_valid = false;
+          return;
+      }
+
+전체 diff: etc\multigpu\patches\webrender-0.68-disable-picture-caching.patch
+
+
+--------------------------------------------------------------------------------
+ 8. 배경 / 시도 이력 (왜 이 형태인가)
+--------------------------------------------------------------------------------
+- 루트 slice는 반드시 TileCache 여야 함(scene builder + frame builder가 강제).
+  => 루트 composite 모드를 None/Blit 로 바꾸면 패닉(각각 "bug: no parent",
+     "bug: not a tile cache"). 그래서 TileCache 는 유지.
+- 기존 force_invalidation 플래그는 비용을 안 줄임(비교를 다 돌린 뒤 무효화만 추가).
+- 그래서 현재 패치는 update_content_validity 에서 비교 자체를 스킵(현 상태).
+  단일 모니터에선 런어웨이 관찰됨 — 대화면 실기에서 재확인 필요.
+- 상세 측정/근거: servo\video_grid_perf_summary.txt,
+  메모리 video-grid-composite-bottleneck.md.
+================================================================================
