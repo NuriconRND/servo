@@ -42,10 +42,19 @@ foreach ($c in $configs) {
         $m = [regex]::Match($ln.Line, "wr_update_ms=([0-9.]+) wr_render_ms=([0-9.]+)")
         if ($m.Success) { $wu += [double]$m.Groups[1].Value; $wr += [double]$m.Groups[2].Value }
     }
-    # 워밍업 제거(초당 샘플 계열)
-    if ($fps.Count -gt $DropFirst) { $fps = $fps[$DropFirst..($fps.Count-1)] }
-    if ($gap.Count -gt $DropFirst) { $gap = $gap[$DropFirst..($gap.Count-1)] }
-    if ($pps.Count -gt $DropFirst) { $pps = $pps[$DropFirst..($pps.Count-1)] }
+    # 워밍업 제거(초당 샘플 계열) — Count가 DropFirst 이하여도 항상 min(DropFirst,Count)만큼 앞을 잘라낸다.
+    # (기존엔 Count -gt DropFirst 가드가 "Count <= DropFirst"인 경우 트림을 통째로 건너뛰어
+    #  워밍업이 섞인 배열을 그대로 steady-state처럼 Median/Pct에 흘려보내는 문제가 있었음)
+    $fpsSampleCount = $fps.Count
+    $dropN = [Math]::Min($DropFirst, $fps.Count)
+    if ($dropN -lt $fps.Count) { $fps = $fps[$dropN..($fps.Count-1)] } else { $fps = @() }
+    $dropN = [Math]::Min($DropFirst, $gap.Count)
+    if ($dropN -lt $gap.Count) { $gap = $gap[$dropN..($gap.Count-1)] } else { $gap = @() }
+    $dropN = [Math]::Min($DropFirst, $pps.Count)
+    if ($dropN -lt $pps.Count) { $pps = $pps[$dropN..($pps.Count-1)] } else { $pps = @() }
+    if ($fpsSampleCount -le $DropFirst) {
+        Write-Warning "config $($c.label) dom$($c.dom) n$($c.n): only $fpsSampleCount fps samples (<= DropFirst=$DropFirst) — row is unreliable"
+    }
 
     $row = "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |" -f `
         $c.label, $c.dom, $c.n,
