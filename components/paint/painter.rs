@@ -5,7 +5,7 @@
 use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::{VecDeque, hash_map::Entry};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use crossbeam_channel::Sender;
@@ -54,6 +54,22 @@ use webrender_api::{
     RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
+
+// A/B gate for the FPS-jitter investigation: when set, disable the per-video-arrival
+// immediate re-composite in `update_images` (falls back to script rendering-opportunity
+// pacing). Read once. Default = enabled (current behavior). Values "1"/"true" disable it.
+static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+// Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
+// once per second per painter. This is the ground-truth displayed cadence, independent of the
+// page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
+static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SERVO_LOG_PRESENT_CADENCE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
 
 use crate::Paint;
 use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator;
@@ -110,6 +126,15 @@ pub(crate) struct Painter {
 
     /// Count of render passes executed for this target.
     render_count: Cell<u64>,
+
+    /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
+    /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
+    /// page's requestAnimationFrame count. `_start` is the current 1s window start, `_last` the
+    /// previous frame-ready instant, `_count` frames this window, `_max_gap_ms` worst gap.
+    present_cadence_start: Cell<Option<Instant>>,
+    present_cadence_last: Cell<Option<Instant>>,
+    present_cadence_count: Cell<u32>,
+    present_cadence_max_gap_ms: Cell<f64>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -326,6 +351,10 @@ impl Painter {
             overlapping_frame_request_count: Default::default(),
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
+            present_cadence_start: Default::default(),
+            present_cadence_last: Default::default(),
+            present_cadence_count: Default::default(),
+            present_cadence_max_gap_ms: Default::default(),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -1055,6 +1084,37 @@ impl Painter {
         }
 
         self.pending_frames.set(pending_frames - 1);
+
+        // Diagnostic: accumulate the actual frame-ready cadence and log once per second.
+        if *LOG_PRESENT_CADENCE {
+            let now = Instant::now();
+            if let Some(last) = self.present_cadence_last.get() {
+                let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+                if gap_ms > self.present_cadence_max_gap_ms.get() {
+                    self.present_cadence_max_gap_ms.set(gap_ms);
+                }
+            }
+            self.present_cadence_last.set(Some(now));
+            self.present_cadence_count.set(self.present_cadence_count.get() + 1);
+            let start = self.present_cadence_start.get().unwrap_or_else(|| {
+                self.present_cadence_start.set(Some(now));
+                now
+            });
+            let elapsed = now.duration_since(start).as_secs_f64();
+            if elapsed >= 1.0 {
+                info!(
+                    "Present cadence: painter {:?} presents/s={:.1} max_gap_ms={:.2} pending={}",
+                    self.painter_id,
+                    self.present_cadence_count.get() as f64 / elapsed,
+                    self.present_cadence_max_gap_ms.get(),
+                    self.pending_frames.get(),
+                );
+                self.present_cadence_start.set(Some(now));
+                self.present_cadence_count.set(0);
+                self.present_cadence_max_gap_ms.set(0.0);
+            }
+        }
+
         let frame = self.pending_frame_diagnostics.borrow_mut().pop_front();
         let Some(frame) = frame else {
             warn!(
@@ -1493,7 +1553,23 @@ impl Painter {
         // together with the updated image (z-order/clip preserved). Only when no frame is already
         // in flight, so we don't stack composites or double up with the script's own GenerateFrame
         // (which also increments pending_frames); this self-limits to roughly the present rate.
-        if immediate_image_update && !generated_frame && self.pending_frames.get() == 0 {
+        // Only push a per-arrival immediate composite when no requestAnimationFrame loop is
+        // already driving a steady composite cadence for this painter. When rAF is active (an
+        // overlay, a three.js/WebGL render loop, ...) video image updates ride that regular
+        // cadence instead. Otherwise two composite sources (rAF-driven and video-arrival-driven)
+        // race through the `pending_frames` gate at irregular phase, making the rAF/compositor
+        // cadence jitter — worsening as the number of simultaneous videos grows (36 tiles =>
+        // ~1080 arrivals/s). With no rAF (a pure <video> page, e.g. a single 4K wall video) we
+        // still composite per arrival so it presents at full frame rate rather than the slower
+        // script rendering-opportunity rate. `animation_callbacks_running` tracks rAF only, so a
+        // plain playing <video> (which sets `animations_running`) does not suppress this path.
+        let raf_driving_composites = self.animation_callbacks_running();
+        if immediate_image_update &&
+            !generated_frame &&
+            self.pending_frames.get() == 0 &&
+            !raf_driving_composites &&
+            !*VIDEO_IMMEDIATE_COMPOSITE_DISABLED
+        {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
         }
 

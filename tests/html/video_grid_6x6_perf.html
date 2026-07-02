@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>6x6 Video Grid Perf</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    color: #f4f4f4;
+  }
+  /* 그리드가 창(모니터)을 꽉 채움. gap 1px = 타일 경계 시각 확인용 */
+  /* CSS Grid 대신 flex-wrap 사용: Servo의 grid 구현이 불완전해 트랙이 video
+     내재 크기(1920x1080)로 blowout 되어 1개만 보이는 문제 회피. 각 타일 크기는
+     JS에서 vw/vh로 명시 지정하므로 레이아웃이 내재 크기에 의존하지 않는다. */
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+  }
+  #grid video {
+    box-sizing: border-box;
+    border: 1px solid #222; /* 타일 경계 시각 확인용 (border-box라 크기 불변) */
+    flex: 0 0 auto;
+    object-fit: cover;
+    background: #000;
+  }
+  /* 좌상단 실시간 지표 오버레이 */
+  #stats {
+    position: fixed;
+    left: 16px;
+    top: 16px;
+    z-index: 10;
+    padding: 12px 16px;
+    background: rgba(0, 0, 0, .78);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font-size: 20px;
+    line-height: 1.4;
+    white-space: pre;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="grid"></div>
+<div id="stats">loading…</div>
+<script>
+  "use strict";
+
+  // 그리드 크기 파라미터:
+  //   ?grid=N       -> N x N (정사각, 기본 6 => 36 타일)
+  //   ?cols=C&rows=R -> C열 x R행 직사각 (예: cols=9&rows=6 => 54 타일)
+  // cols/rows 중 하나만 주면 나머지는 grid(없으면 6) 값을 사용.
+  const params = new URLSearchParams(location.search);
+  const clampInt = (raw, fallback) => {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fallback;
+  };
+  const gridN = clampInt(params.get("grid"), 6);
+  const COLS = clampInt(params.get("cols"), gridN);
+  const ROWS = clampInt(params.get("rows"), gridN);
+  const TILE_COUNT = COLS * ROWS;
+  const SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+
+  const grid = document.getElementById("grid");
+  const stats = document.getElementById("stats");
+  // 각 타일 크기를 뷰포트의 1/COLS x 1/ROWS 로 명시 (내재 크기 무시). flex-wrap 이 COLS개씩 줄바꿈.
+  const tileW = (100 / COLS) + "vw";
+  const tileH = (100 / ROWS) + "vh";
+
+  // ?stagger=1 이면 각 타일을 타임라인상 다른 위치에서 시작(loop 시점 분산). 기본은 OFF
+  // (동시 재생). 스태거는 40개 동시 loop로 인한 주기적 큰 스톨은 없애지만, 대신 프레임
+  // 도착이 상시 분산되어 초당 미세 지터를 늘리는 트레이드오프가 있어 기본 비활성.
+  const STAGGER = params.get("stagger") === "1";
+
+  // COLS x ROWS 개의 독립 <video> 디코더를 동적 생성. 각 엘리먼트가 동일 파일을 개별 디코딩.
+  const videos = [];
+  let playErrors = 0;
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const v = document.createElement("video");
+    v.muted = true;            // 자동재생 정책상 재생 전에 muted 설정 필요
+    v.autoplay = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.style.width = tileW;
+    v.style.height = tileH;
+    if (STAGGER) {
+      // 타일별로 타임라인 위치를 고르게 분산 (loop 동기화로 인한 주기적 스톨 방지)
+      const frac = i / TILE_COUNT;
+      v.addEventListener("loadedmetadata", () => {
+        if (isFinite(v.duration) && v.duration > 0) {
+          try { v.currentTime = frac * v.duration; } catch (e) { /* seek 실패 무시 */ }
+        }
+      }, { once: true });
+    }
+    v.src = SRC;
+    v.play().catch(() => { playErrors++; });
+    grid.appendChild(v);
+    videos.push(v);
+  }
+
+  // 브라우저별 디코드 프레임 카운터 추상화
+  function decodedFrames(v) {
+    if (typeof v.getVideoPlaybackQuality === "function") {
+      return v.getVideoPlaybackQuality().totalVideoFrames;
+    }
+    if ("webkitDecodedFrameCount" in v) {
+      return v.webkitDecodedFrameCount;
+    }
+    return null; // 미지원
+  }
+  function droppedFrames(v) {
+    if (typeof v.getVideoPlaybackQuality === "function") {
+      return v.getVideoPlaybackQuality().droppedVideoFrames;
+    }
+    if ("webkitDroppedFrameCount" in v) {
+      return v.webkitDroppedFrameCount;
+    }
+    return 0;
+  }
+
+  function sumDecoded() {
+    let s = 0, supported = false;
+    for (const v of videos) {
+      const d = decodedFrames(v);
+      if (d !== null) { s += d; supported = true; }
+    }
+    return supported ? s : null;
+  }
+  function sumDropped() {
+    let s = 0;
+    for (const v of videos) s += droppedFrames(v);
+    return s;
+  }
+  function countPlaying() {
+    let n = 0;
+    for (const v of videos) if (!v.paused && v.readyState >= 3) n++;
+    return n;
+  }
+
+  // ?log=1 이면 매 1초 지표를 console.error 로 출력 (servoshell stderr 로 캡처해 A/B 정량 비교)
+  const LOG = params.get("log") === "1";
+
+  // 1초 간격 샘플링 기준값
+  const startTime = performance.now();
+  let lastSample = startTime;
+  let rafSinceSample = 0;
+  let lastDecoded = sumDecoded();
+  let lastDropped = sumDropped();
+  let fps = 0, decPerSec = 0, dropPerSec = 0;
+  // 프레임 간격 지터: 1초 창 안에서 연속 rAF 사이 최대 간격(ms). 값이 크고 들쭉날쭉하면 지터.
+  let lastFrameTs = startTime;
+  let maxGapMs = 0;
+  let jitterMs = 0; // 직전 1초 창의 maxGap (표시/로그용)
+
+  function tick(now) {
+    rafSinceSample++;
+    const gap = now - lastFrameTs;
+    if (gap > maxGapMs) maxGapMs = gap;
+    lastFrameTs = now;
+
+    const dt = now - lastSample;
+    if (dt >= 1000) {
+      fps = (rafSinceSample * 1000) / dt;
+
+      const curDecoded = sumDecoded();
+      if (curDecoded !== null && lastDecoded !== null) {
+        decPerSec = ((curDecoded - lastDecoded) * 1000) / dt;
+      }
+      lastDecoded = curDecoded;
+
+      const curDropped = sumDropped();
+      dropPerSec = ((curDropped - lastDropped) * 1000) / dt;
+      lastDropped = curDropped;
+
+      jitterMs = maxGapMs;
+      if (LOG) {
+        console.error(
+          `[GRIDPERF] tiles=${TILE_COUNT} fps=${fps.toFixed(1)} ` +
+          `maxGapMs=${jitterMs.toFixed(1)} decoded/s=${lastDecoded === null ? "na" : decPerSec.toFixed(0)} ` +
+          `dropped/s=${dropPerSec.toFixed(0)} playing=${countPlaying()}/${TILE_COUNT}`
+        );
+      }
+
+      maxGapMs = 0;
+      rafSinceSample = 0;
+      lastSample = now;
+    }
+
+    const elapsed = (now - startTime) / 1000;
+    const decStr = lastDecoded === null ? "n/a" : decPerSec.toFixed(0);
+    stats.textContent = [
+      `video grid perf (${COLS}x${ROWS} = ${TILE_COUNT})`,
+      `source : Wildlife_FHD30fps_counter_10Mbitrate.mp4`,
+      `tiles  : ${TILE_COUNT}`,
+      `rAF FPS: ${fps.toFixed(1)}`,
+      `jitter(maxGap): ${jitterMs.toFixed(1)} ms`,
+      `decoded/s: ${decStr}   (ideal ${TILE_COUNT * 30})`,
+      `dropped/s: ${dropPerSec.toFixed(0)}`,
+      `playing: ${countPlaying()}/${TILE_COUNT}`,
+      `playErr: ${playErrors}`,
+      `elapsed: ${elapsed.toFixed(0)}s`,
+    ].join("\n");
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>
+</body>
+</html>

@@ -671,7 +671,7 @@ impl WindowRenderingContext {
         )
     }
 
-    fn new_with_optional_refresh_driver_and_target_gpu(
+    pub fn new_with_optional_refresh_driver_and_target_gpu(
         display_handle: DisplayHandle,
         window_handle: WindowHandle,
         size: PhysicalSize<u32>,

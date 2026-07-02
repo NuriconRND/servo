@@ -45,6 +45,11 @@ const DEFAULT_TIME_RANGES: Vec<Range<f64>> = vec![];
 const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
 const DISABLE_AUDIO_ENV: &str = "SERVO_GSTREAMER_DISABLE_AUDIO";
 const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF";
+// Caps the worker-thread count of software libav video decoders (avdec_*). Each avdec
+// otherwise auto-spawns ~CPU-count threads plus a proportional decoded-frame pool; with
+// many simultaneous <video> elements this explodes thread count and memory. Unset = leave
+// automatic (no change, e.g. for the single 4K wall video that needs multithreaded decode).
+const AVDEC_MAX_THREADS_ENV: &str = "SERVO_GSTREAMER_AVDEC_MAX_THREADS";
 const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
 const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 
@@ -113,6 +118,38 @@ fn log_pipeline_element_added(element: &gstreamer::Element) {
         klass,
         factory.rank(),
     );
+}
+
+// Apply SERVO_GSTREAMER_AVDEC_MAX_THREADS to software libav video decoders (avdec_*) as
+// they are auto-plugged into the pipeline. Capping to a small value (e.g. 1) collapses the
+// per-decoder worker-thread count and decoded-frame pool, which is what lets many <video>
+// tiles decode at once without saturating CPU scheduling (FPS jitter) or memory. Unset
+// leaves the decoder at its automatic thread count so single-video/4K playback is unchanged.
+fn configure_software_decoder_threads(element: &gstreamer::Element) {
+    let Some(factory) = element.factory() else {
+        return;
+    };
+    let factory_name = factory.name();
+    let klass = factory.metadata("klass").unwrap_or_default();
+    // All avdec video decoders share the GstFFMpegVidDec base, which exposes "max-threads".
+    if !factory_name.starts_with("avdec_") || !klass.contains("Video") {
+        return;
+    }
+    let Ok(raw) = env::var(AVDEC_MAX_THREADS_ENV) else {
+        return;
+    };
+    match raw.trim().parse::<i32>() {
+        Ok(max_threads) if max_threads >= 0 => {
+            element.set_property("max-threads", max_threads);
+            log::info!("Set {factory_name} max-threads={max_threads}");
+        },
+        _ => {
+            log::warn!(
+                "Ignoring invalid {AVDEC_MAX_THREADS_ENV}={raw:?}; \
+                 expected a non-negative integer"
+            );
+        },
+    }
 }
 
 fn configure_playbin_flags(
@@ -773,6 +810,7 @@ impl GStreamerPlayer {
         pipeline.connect("deep-element-added", false, move |args| {
             if let Ok(element) = args[2].get::<gstreamer::Element>() {
                 log_pipeline_element_added(&element);
+                configure_software_decoder_threads(&element);
             }
             None
         });

@@ -4,8 +4,8 @@
 
 use std::cell::{Cell, LazyCell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -244,8 +244,19 @@ impl TimerRefreshDriver {
 
 impl RefreshDriver for TimerRefreshDriver {
     fn observe_next_frame(&self, new_start_frame_callback: Box<dyn Fn() + Send + 'static>) {
-        const FRAME_DURATION: Duration = Duration::from_millis(1000 / 120);
-        self.queue_timer(FRAME_DURATION, new_start_frame_callback);
+        // Free-running paint-timer period. Default 120Hz. Override with SERVO_REFRESH_TIMER_HZ to
+        // match a specific display refresh (e.g. 60) so frame production does not run faster than
+        // the display and beat against its vsync (which shows up as periodic judder / non-uniform
+        // 60fps even with a single video). Read once; clamped to [1, 1000] Hz.
+        static FRAME_DURATION: LazyLock<Duration> = LazyLock::new(|| {
+            let hz = std::env::var("SERVO_REFRESH_TIMER_HZ")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|hz| (1..=1000).contains(hz))
+                .unwrap_or(120);
+            Duration::from_millis(1000 / hz)
+        });
+        self.queue_timer(*FRAME_DURATION, new_start_frame_callback);
     }
 }
 
