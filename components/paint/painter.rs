@@ -91,6 +91,26 @@ fn perf_picture_tile_size() -> Option<DeviceIntSize> {
     })
 }
 
+/// (video-wall) Pace video-driven recomposites. When `SERVO_WALL_VIDEO_PACE_HZ` is a
+/// positive integer N, epoch-less (video) image updates trigger at most one full-scene
+/// recomposite per 1/N second, coalescing all updates that arrive within that window.
+/// This replaces the default "recomposite immediately on every arriving video frame",
+/// which floods the compositor with many videos (e.g. 36 videos x 30fps ~= 1080
+/// full-scene recomposites/s) and starves the script/rAF and decode. Returns the target
+/// interval, or `None` (unset / 0 / invalid) meaning keep the immediate behavior.
+/// Read once at startup; changing it requires a restart.
+fn wall_video_pace_interval() -> Option<std::time::Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let hz: u32 = std::env::var("SERVO_WALL_VIDEO_PACE_HZ")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (hz > 0).then(|| std::time::Duration::from_secs_f64(1.0 / hz as f64))
+    })
+}
+
 /// Per-second render-cost attribution accumulator (video-grid perf investigation).
 ///
 /// Splits each composite into `renderer.update()` (texture upload + scene processing)
@@ -156,6 +176,9 @@ pub(crate) struct Painter {
 
     /// Per-second render-cost attribution (video-grid perf investigation).
     render_perf: RefCell<RenderPerf>,
+
+    /// Timestamp of the last video-driven recomposite, for `SERVO_WALL_VIDEO_PACE_HZ`.
+    last_paced_video_frame_at: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -374,6 +397,7 @@ impl Painter {
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
             render_perf: Default::default(),
+            last_paced_video_frame_at: Cell::new(None),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -1658,8 +1682,28 @@ impl Painter {
         if immediate_image_update && !generated_frame {
             self.render_perf.borrow_mut().generate_attempts += 1;
             if self.pending_frames.get() == 0 {
-                self.render_perf.borrow_mut().generate_emitted += 1;
-                self.generate_frame(&mut txn, RenderReasons::SCENE);
+                // Default: recomposite immediately (video arrival rate). With
+                // SERVO_WALL_VIDEO_PACE_HZ=N set, rate-limit to one recomposite per
+                // 1/N second, coalescing the video updates that arrived in between
+                // (their textures are already in this transaction) so many videos do
+                // not flood the compositor. Texture updates still flush via the
+                // transaction below even on a skipped (too-soon) frame.
+                let pace = wall_video_pace_interval();
+                let now = Instant::now();
+                let due = match pace {
+                    None => true,
+                    Some(interval) => self
+                        .last_paced_video_frame_at
+                        .get()
+                        .map_or(true, |last| now.duration_since(last) >= interval),
+                };
+                if due {
+                    if pace.is_some() {
+                        self.last_paced_video_frame_at.set(Some(now));
+                    }
+                    self.render_perf.borrow_mut().generate_emitted += 1;
+                    self.generate_frame(&mut txn, RenderReasons::SCENE);
+                }
             }
         }
 

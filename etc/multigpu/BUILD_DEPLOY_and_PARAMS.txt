@@ -1,0 +1,107 @@
+================================================================================
+ winit_wall 성능 실험 — 빌드/배포 절차 & 파라미터 정리
+ (UTF-8. cmd에서 보려면 먼저: chcp 65001)
+================================================================================
+
+이 문서가 다루는 두 개의 독립 실험 스위치 (둘 다 env, 기본 OFF, 조합 가능):
+  1) SERVO_WALL_VIDEO_PACE_HZ  = 비디오 재합성을 vsync 주기로 페이싱 (NEW, painter.rs)
+  2) WR_DISABLE_PICTURE_CACHING = picture caching dirty추적 우회 (webrender 포크)
+
+--------------------------------------------------------------------------------
+ A. 빌드 (개발 환경, servo 디렉터리에서)
+--------------------------------------------------------------------------------
+  cd F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\servo
+  . ..\scripts\servo_env.ps1
+  cargo build --release -p servo --example winit_wall --features media-gstreamer,no-wgl -j 8
+
+- (1) 페이싱 변경은 servo-paint(painter.rs) 수정 → servo-paint + example만 증분 재컴파일.
+- (2) picture-caching 패치는 이미 로컬 webrender 포크에 있고 [patch.crates-io]로 연결됨
+  (servo\Cargo.toml). 이 빌드에 함께 포함됨(단 env OFF면 비활성).
+- 산출물: target\release\examples\winit_wall.exe
+
+--------------------------------------------------------------------------------
+ B. 배포 (대화면/타 머신용 kit 패키징)
+--------------------------------------------------------------------------------
+개발기에서 자체 포함 kit 생성 (exe + 모든 DLL + pages + configs + test_media):
+
+  pwsh .\etc\multigpu\make_winit_wall_dist.ps1 -Build
+  # 결과: target\winit_wall_dist\  (run.bat 포함)
+
+- -Build 는 위 A의 cargo build를 먼저 수행 후 패키징. 이미 빌드했다면 -Build 생략 가능.
+- target\winit_wall_dist 폴더를 대화면 머신으로 복사 (기존 kit 위치 예:
+  C:\20260626_multigpu_browser_minimal\winit_wall_kit\). exe/DLL만 갱신하려면
+  winit_wall_dist 안의 *.exe 와 *.dll 을 기존 kit에 덮어써도 됨.
+- 주의: 페이지의 절대 file:// 경로는 make_winit_wall_dist.ps1 이 상대경로로 재작성함
+  (multigpu_*.html 만). 커스텀 페이지 쓰면 test_media 경로 확인.
+
+--------------------------------------------------------------------------------
+ C. 실행 & 파라미터
+--------------------------------------------------------------------------------
+개발기(직접 exe) 또는 대화면(kit\run.bat) 모두 env를 먼저 세팅한 뒤 실행.
+env는 프로세스 시작 시 1회 읽힘 → 값 바꾸려면 재실행.
+
+[ 환경변수 (실험 스위치) ]
+  SERVO_WALL_VIDEO_PACE_HZ = 60
+      비디오 프레임 도착마다 즉시 전체-씬 재합성하던 것을, 초당 최대 N회(=1/N초당 1회)로
+      제한하고 그 사이 도착한 모든 비디오 업데이트를 1회 합성으로 묶음. 미설정/0 = 기존
+      즉시-합성(도착률). 60 권장, 30/120 등도 테스트 가능. ★이번 핵심 실험★
+  WR_DISABLE_PICTURE_CACHING = 1
+      picture caching의 per-frame dirty 비교를 스킵(전체 타일 무효화). 미설정 = 기존 캐싱.
+  SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = 1
+      gstreamer 소스의 주기적 급식 중단(파일재생 ~400ms 끊김) 방지 → 부드러운 delivery.
+
+[ 계측 (선택, 콘솔/로그로 수치 확인) ]
+  RUST_LOG = warn,paint=info
+      초당 "Render perf" 1줄: composite_fps / avg_update_ms(업로드) / avg_draw_ms(래스터)
+      / video_uploads_per_s(~1440이면 16영상 디코드 정상) / generate_attempts vs emitted.
+      + winit_wall 자체 "Present perf": presents_per_s / avg_present_ms.
+      (로그 타깃은 servo_paint가 아니라 paint 임에 주의.)
+
+[ 실행 예 (개발기) ]
+  cd F:\...\servo
+  . ..\scripts\servo_env.ps1
+  $env:SERVO_WALL_VIDEO_PACE_HZ="60"
+  $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF="1"
+  $env:RUST_LOG="warn,paint=info"
+  target\release\examples\winit_wall.exe `
+    --wall-layout config\wall_layout.local_1x1.json --wall-all-tiles `
+    tests\html\perf_video_grid_4x4.html
+  # (exe 옆에 DLL 필요: kit로 실행하거나, target\release\*.dll 을 examples\ 로 복사)
+
+[ 실행 예 (대화면 kit) ]
+  cd C:\20260626_multigpu_browser_minimal\winit_wall_kit
+  $env:SERVO_WALL_VIDEO_PACE_HZ="60"
+  $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF="1"
+  $env:RUST_LOG="warn,paint=info"
+  .\run.bat --wall-layout config\wall_layout.local_3x2.json --wall-all-tiles `
+    --pref dom_webrtc_enabled=true --pref dom_video_extended_containers_enabled=true `
+    --pref dom_video_network_uri_enabled=true "pages\multigpu_wall_video_grid_36.html"
+
+[ CLI 플래그 (winit_wall / run.bat 공통) ]
+  --wall-layout <config\*.json>   월 레이아웃 (타일 rect + display 인덱스)
+  --wall-all-tiles                타일마다 창 1개, 하나의 논리 WebView 공유
+  --wall-tile-index <n>           단일 타일 미리보기
+  --pref name[=value]             Servo pref (예: dom_video_extended_containers_enabled=true)
+  <page>                          페이지 경로 (kit는 pages\..., 개발기는 tests\html\...)
+
+--------------------------------------------------------------------------------
+ D. 권장 테스트 매트릭스 (2x2, 각 환경/해상도에서)
+--------------------------------------------------------------------------------
+                       PACE_HZ 미설정        PACE_HZ=60
+  PICTURE_CACHING 기본   (baseline)           (페이싱 단독)
+  WR_DISABLE=1           (캐싱우회 단독)       (둘 다)
+
+  - 각 조합에서 Render perf 의 composite_fps 와 Present perf 의 presents_per_s 비교.
+  - 해상도 축: 1920x1080 vs 대화면 3840x2160/3240 (per-GPU 1타일).
+  - 영상 수 축: 9(3x3) / 16(4x4) / 36(6x6) — 페이지 COLS/ROWS 또는 grid_36 사용.
+  - 기대: PACE_HZ=60 이 즉시-합성 폭주(36영상 시 ~1080회/s)를 60회/s로 묶어 컴포지터
+    포화·rAF 지터 완화 → 저해상도 다수영상에서 60fps 안정화. 대화면 면적-병목엔
+    picture-caching 우회가 별도로 기여. 두 스위치 효과는 독립적이므로 조합 확인.
+
+--------------------------------------------------------------------------------
+ E. 되돌리기
+--------------------------------------------------------------------------------
+  - 페이싱: env만 빼면 기존 즉시-합성으로 복귀(코드 되돌릴 필요 없음).
+  - picture-caching: env 빼면 기존 캐싱. 포크 완전 원복은
+    etc\multigpu\MANUAL_TEST_webrender_picturecache.txt 6~7절 참고.
+================================================================================
