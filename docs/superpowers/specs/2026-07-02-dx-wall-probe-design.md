@@ -24,8 +24,10 @@ Windows 스왑체인 백버퍼에 **직접 렌더**한다. 이것이 vsync 60fps
   펌프. `--present-mode single`로 winit_wall식 단일-스레드 순차 present도 선택 가능(엄밀 대조용).
 - present는 vsync에 맞춤(`Present(1,0)`), **vsync 전에 준비 안 된 프레임은 무시**(최신-프레임-슬롯이
   오래된 것을 덮어써 자연 드롭).
-- 빌드: **CMake** (벤더드 VS2022 toolchain). GStreamer devel 링크는 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
-  (기본; 정확한 Servo 일치가 필요하면 번들 `servo/target/dependencies/.../msvc_x86_64` 1.26.8로 전환).
+- 빌드: **Visual Studio 2022 솔루션/프로젝트(.sln + .vcxproj, MSBuild)**. x64, C++17. GUI(F5)와
+  `msbuild` CLI 둘 다 빌드 가능. GStreamer devel 링크는 프로퍼티 시트(.props)에서 환경변수
+  `$(GSTREAMER_1_0_ROOT_MSVC_X86_64)` 로 include/lib 경로 참조(기본; 정확한 Servo 일치가 필요하면
+  번들 `servo/target/dependencies/.../msvc_x86_64` 1.26.8 경로로 전환).
 
 ## 3. 입력 (CLI)
 
@@ -88,6 +90,12 @@ Windows 스왑체인 백버퍼에 **직접 렌더**한다. 이것이 vsync 60fps
 
 ## 9. 빌드/배포 개요 (상세는 구현 계획에서)
 
-- `tools/dx_wall_probe/CMakeLists.txt` : Win32 + d3d11.lib/dxgi.lib/d3dcompiler.lib + GStreamer
-  (gstreamer-1.0, gstapp-1.0, gobject-2.0, glib-2.0) include/lib(pkgconfig 또는 GSTREAMER_1_0_ROOT).
+- `tools/dx_wall_probe/dx_wall_probe.sln` + `dx_wall_probe.vcxproj` (x64, C++17, 콘솔/Win32 앱).
+- `dx_wall_probe.props` (프로퍼티 시트): AdditionalIncludeDirectories +=
+  `$(GSTREAMER_1_0_ROOT_MSVC_X86_64)\include\gstreamer-1.0`, `...\include\glib-2.0`,
+  `...\lib\glib-2.0\include`; AdditionalLibraryDirectories += `$(GSTREAMER_1_0_ROOT_MSVC_X86_64)\lib`;
+  AdditionalDependencies += `d3d11.lib;dxgi.lib;d3dcompiler.lib;gstreamer-1.0.lib;gstapp-1.0.lib;
+  gstvideo-1.0.lib;gobject-2.0.lib;glib-2.0.lib`. (HLSL은 런타임 `D3DCompile` 또는 빌드 시 fxc; v1은
+  런타임 컴파일로 단순화.)
+- 빌드: VS2022에서 열어 F5, 또는 `msbuild dx_wall_probe.sln /p:Configuration=Release /p:Platform=x64`.
 - 실행: exe 옆(또는 PATH)에 GStreamer bin DLL 필요(플러그인 로드). 레이아웃/영상 경로는 CLI 인자.
