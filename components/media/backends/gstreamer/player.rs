@@ -84,15 +84,15 @@ fn format_optional_ms(value: Option<f64>) -> String {
 
 fn should_log_pipeline_element(factory_name: &str, klass: &str) -> bool {
     let factory_name = factory_name.to_ascii_lowercase();
-    klass.contains("Decoder") ||
-        klass.contains("Converter") ||
-        klass.contains("Sink") ||
-        factory_name.contains("dec") ||
-        factory_name.contains("convert") ||
-        factory_name.contains("scale") ||
-        factory_name.contains("balance") ||
-        factory_name.contains("deinterlace") ||
-        factory_name.contains("appsink")
+    klass.contains("Decoder")
+        || klass.contains("Converter")
+        || klass.contains("Sink")
+        || factory_name.contains("dec")
+        || factory_name.contains("convert")
+        || factory_name.contains("scale")
+        || factory_name.contains("balance")
+        || factory_name.contains("deinterlace")
+        || factory_name.contains("appsink")
 }
 
 fn log_pipeline_element_added(element: &gstreamer::Element) {
@@ -115,17 +115,48 @@ fn log_pipeline_element_added(element: &gstreamer::Element) {
     );
 }
 
+/// (video-wall) When `SERVO_VIDEO_DEC_MAX_THREADS=N` is set, force `max-threads=N`
+/// on any auto-plugged video decoder that exposes the property (libav `avdec_*`).
+/// With many parallel software decoders (e.g. a 36-video wall), libav's default
+/// auto-threading spawns many threads per decoder and oversubscribes the cores;
+/// N=1 gives one decode thread per stream. Unset/invalid = GStreamer default.
+/// Hardware decoders (nvh264dec/d3d11*) lack the property and are left untouched.
+fn video_decoder_max_threads() -> Option<i32> {
+    static N: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        env::var("SERVO_VIDEO_DEC_MAX_THREADS")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+fn maybe_set_decoder_max_threads(element: &gstreamer::Element) {
+    let Some(n) = video_decoder_max_threads() else {
+        return;
+    };
+    if element.find_property("max-threads").is_none() {
+        return;
+    }
+    element.set_property("max-threads", n);
+    log::info!(
+        "GStreamer decoder max-threads set: element={} max_threads={}",
+        element.name(),
+        n,
+    );
+}
+
 fn configure_playbin_flags(
     pipeline: &gstreamer::Element,
     prefer_native_video: bool,
 ) -> Result<(), PlayerError> {
     let flags = pipeline.property_value("flags");
-    let flags_class = glib::FlagsClass::with_type(flags.type_()).ok_or_else(|| {
-        PlayerError::Backend("FlagsClass creation failed".to_owned())
-    })?;
-    let mut flags_builder = flags_class.builder_with_value(flags).ok_or_else(|| {
-        PlayerError::Backend("FlagsClass creation failed".to_owned())
-    })?;
+    let flags_class = glib::FlagsClass::with_type(flags.type_())
+        .ok_or_else(|| PlayerError::Backend("FlagsClass creation failed".to_owned()))?;
+    let mut flags_builder = flags_class
+        .builder_with_value(flags)
+        .ok_or_else(|| PlayerError::Backend("FlagsClass creation failed".to_owned()))?;
 
     if !cfg!(any(target_os = "windows", target_os = "android")) {
         flags_builder = flags_builder.set_by_nick("download");
@@ -164,10 +195,10 @@ fn configure_playbin_flags(
 
 fn env_flag_enabled(name: &str) -> bool {
     env::var(name).is_ok_and(|value| {
-        value == "1" ||
-            value.eq_ignore_ascii_case("true") ||
-            value.eq_ignore_ascii_case("yes") ||
-            value.eq_ignore_ascii_case("on")
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
     })
 }
 
@@ -557,8 +588,8 @@ impl PlayerInner {
 
     pub fn push_data(&mut self, data: Vec<u8>) -> Result<(), PlayerError> {
         if let Some(PlayerSource::Seekable(ref mut source)) = self.source {
-            if self.enough_data.load(Ordering::Relaxed) &&
-                !env_flag_enabled(DISABLE_ENOUGHDATA_BACKOFF_ENV)
+            if self.enough_data.load(Ordering::Relaxed)
+                && !env_flag_enabled(DISABLE_ENOUGHDATA_BACKOFF_ENV)
             {
                 return Err(PlayerError::EnoughData);
             }
@@ -778,8 +809,9 @@ impl GStreamerPlayer {
         // element. For rtsp:// URIs this is `rtspsrc` (which itself depends on the
         // `rtpmanager` plugin). Fail fast with a clear error if the RTSP plugins
         // are not available in this GStreamer install.
-        if self.stream_type == StreamType::NetworkUri &&
-            self.network_uri
+        if self.stream_type == StreamType::NetworkUri
+            && self
+                .network_uri
                 .as_deref()
                 .is_some_and(|uri| uri.starts_with("rtsp"))
         {
@@ -799,13 +831,14 @@ impl GStreamerPlayer {
         pipeline.connect("deep-element-added", false, move |args| {
             if let Ok(element) = args[2].get::<gstreamer::Element>() {
                 log_pipeline_element_added(&element);
+                maybe_set_decoder_max_threads(&element);
             }
             None
         });
 
-        let prefer_native_video = !self.render.lock().unwrap().is_gl() &&
-            !servo_config::opts::get().multiprocess &&
-            !servo_config::opts::get().force_ipc;
+        let prefer_native_video = !self.render.lock().unwrap().is_gl()
+            && !servo_config::opts::get().multiprocess
+            && !servo_config::opts::get().force_ipc;
         configure_playbin_flags(&pipeline, prefer_native_video)?;
 
         // Set max size for the player buffer.
@@ -900,9 +933,7 @@ impl GStreamerPlayer {
                 // Let playbin3 own the source: it auto-plugs the right element
                 // (e.g. rtspsrc) for the scheme. No servo AppSrc is registered.
                 let uri = self.network_uri.clone().ok_or_else(|| {
-                    PlayerError::Backend(
-                        "NetworkUri stream type requires a network_uri".to_owned(),
-                    )
+                    PlayerError::Backend("NetworkUri stream type requires a network_uri".to_owned())
                 })?;
                 uri.to_value()
             },

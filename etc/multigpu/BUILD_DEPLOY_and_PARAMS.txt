@@ -49,6 +49,12 @@ env는 프로세스 시작 시 1회 읽힘 → 값 바꾸려면 재실행.
       picture caching의 per-frame dirty 비교를 스킵(전체 타일 무효화). 미설정 = 기존 캐싱.
   SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = 1
       gstreamer 소스의 주기적 급식 중단(파일재생 ~400ms 끊김) 방지 → 부드러운 delivery.
+  SERVO_VIDEO_DEC_MAX_THREADS = 1
+      auto-plug된 SW 비디오 디코더(libav avdec_*)에 max-threads=N 강제. 다수 SW 디코더의
+      auto-threading 과다구독 완화용(스트림당 1스레드). 미설정=GStreamer 기본. HW 디코더
+      (nvh264dec/d3d11*)엔 프로퍼티 없어 무영향. 적용되면 로그에
+      "GStreamer decoder max-threads set: ... max_threads=N" 가 찍힘(확인용).
+      ※ SW 디코드 경로에서만 의미. SERVO_GSTREAMER_VIDEO_DECODER_POLICY=auto(HW)면 no-op.
 
 [ 계측 (선택, 콘솔/로그로 수치 확인) ]
   RUST_LOG = warn,paint=info
