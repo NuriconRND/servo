@@ -242,6 +242,13 @@ impl GStreamerMediaStream {
         }
     }
 
+    /// 표시(display) 경로용 소스. MediaStream은 이미 raw(videoconvert 뒤 queue)이므로
+    /// 재인코딩 없이 그 tail 엘리먼트를 그대로 반환한다. `encoded()`(송출용)와 달리
+    /// 파이프라인에 새 엘리먼트를 추가하지 않는다. send 경로는 계속 `encoded()`를 쓴다.
+    pub fn raw(&mut self) -> gstreamer::Element {
+        self.src_element()
+    }
+
     pub fn create_video_from(source: gstreamer::Element) -> MediaStreamId {
         let videoconvert = gstreamer::ElementFactory::make("videoconvert")
             .build()

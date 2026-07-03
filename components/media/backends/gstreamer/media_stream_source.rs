@@ -13,7 +13,7 @@ use servo_media_player::PlayerError;
 use servo_media_streams::{MediaStream, MediaStreamType};
 use url::Url;
 
-use crate::media_stream::{GStreamerMediaStream, RTP_CAPS_OPUS, RTP_CAPS_VP8};
+use crate::media_stream::GStreamerMediaStream;
 
 // Implementation sub-module of the GObject
 mod imp {
@@ -21,21 +21,25 @@ mod imp {
     use super::*;
 
     static AUDIO_SRC_PAD_TEMPLATE: LazyLock<gstreamer::PadTemplate> = LazyLock::new(|| {
+        // raw 오디오를 그대로 흘려 playbin3/decodebin3가 디코더를 끼우지 않게 한다.
+        let caps = gstreamer::Caps::builder("audio/x-raw").build();
         gstreamer::PadTemplate::new(
             "audio_src",
             gstreamer::PadDirection::Src,
             gstreamer::PadPresence::Sometimes,
-            &RTP_CAPS_OPUS,
+            &caps,
         )
         .expect("Could not create audio src pad template")
     });
 
     static VIDEO_SRC_PAD_TEMPLATE: LazyLock<gstreamer::PadTemplate> = LazyLock::new(|| {
+        // raw 비디오를 그대로 흘려 playbin3/decodebin3가 디코더를 끼우지 않게 한다.
+        let caps = gstreamer::Caps::builder("video/x-raw").build();
         gstreamer::PadTemplate::new(
             "video_src",
             gstreamer::PadDirection::Src,
             gstreamer::PadPresence::Sometimes,
-            &RTP_CAPS_VP8,
+            &caps,
         )
         .expect("Could not create video src pad template")
     });
@@ -68,7 +72,13 @@ mod imp {
 
             // Append a proxysink to the media stream pipeline.
             let pipeline = stream.pipeline_or_new();
-            let last_element = stream.encoded().map_err(|_| PlayerError::SetStreamFailed)?;
+            // 표시 경로: 재인코딩(vp8enc/opusenc) 없이 raw tail을 그대로 proxysink로 흘린다.
+            // SERVO_MEDIASTREAM_ENCODE_DISPLAY 설정 시에만 옛 encoded() 경로(A/B·디버그용).
+            let last_element = if std::env::var("SERVO_MEDIASTREAM_ENCODE_DISPLAY").is_ok() {
+                stream.encoded().map_err(|_| PlayerError::SetStreamFailed)?
+            } else {
+                stream.raw()
+            };
             let sink = gstreamer::ElementFactory::make("proxysink")
                 .build()
                 .map_err(|_| PlayerError::SetStreamFailed)?;
