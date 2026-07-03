@@ -11,8 +11,8 @@
   ANGLE/surfman 경유 없이 `Gld3d11`(gleam `gl::Gl`의 D3D11 구현)이 WebRender의 GL 호출을 받는다.
 - ✅ 렌더 정확도: 색상(4색 사분면), 텍스트/폰트, 안티앨리어싱, 드롭섀도우, 반투명 원까지
   GL 백엔드와 동일하게 렌더된다. (`tests/html/dx_render_check.html` 기준 백버퍼 리드백 비교)
-- ✅ 상하 방향(Y 규약) 버그 수정 완료 — 아래 2-D 참조.
-- ✅ **비디오(YUV) + border-radius 렌더 수정 완료** — 아래 2-E 참조. 이전에 d3d11에서 `<video>`가
+- ✅ 상하 방향(Y 규약) 버그 수정 완료 — 아래 2-E 참조.
+- ✅ **비디오(YUV) + border-radius 렌더 수정 완료** — 아래 2-F 참조. 이전에 d3d11에서 `<video>`가
   균일 파란색으로, `border-radius:50%` 원이 사각형으로 렌더되던 문제. 둘 다 동일 근본 원인
   (VS→FS varying 시맨틱 불일치)이었고 한 방으로 해결. 비디오 그리드가 GL과 동일하게 실제 영상
   프레임을 표출, 원이 정상 원형으로 렌더됨을 백버퍼 리드백으로 확인.
@@ -40,17 +40,42 @@ cargo build --release -p servo --example winit_wall --features media-gstreamer,n
 `wr-d3d11`은 WebRender의 GLSL(ES300) 셰이더를 **런타임에** 변환한다:
 GLSL → SPIR-V(`glslangValidator`) → HLSL(`spirv-cross`) → DXBC(`D3DCompile`, Windows SDK 내장).
 
-- 툴 위치 기본값: `webrender_d3d11_native/tools/bin/{glslangValidator.exe, spirv-cross.exe}`
-- 환경변수 `WR_D3D11_TOOLS_DIR` 로 다른 경로 지정 가능(`shaders.rs::tools_dir`).
-- 툴이 없으면: 최초 셰이더 컴파일에서 `... 실행 실패 — tools/fetch-shader-tools.ps1 실행 여부 확인` 패닉.
-- 새 장비 세팅: `webrender_d3d11_native/tools/fetch-shader-tools.ps1` 실행해 두 exe를 받는다.
+- 툴 탐색 순서(`shaders.rs::support_dir`): ① 환경변수 `WR_D3D11_TOOLS_DIR` → ② exe 옆
+  `shader-tools/` 폴더(있으면) → ③ 빌드 머신의 `webrender_d3d11_native/tools/bin`(레포 소스가
+  있을 때만).
+- 빌드 머신: `webrender_d3d11_native/tools/fetch-shader-tools.ps1`(인터넷 필요)로 두 exe를 받는다.
+- 툴이 없으면 최초 셰이더 컴파일에서 명확한 에러를 반환한다(해석된 tools 경로 + `shader-tools` 번들
+  안내 포함).
+
+**오프라인 배포(인터넷 없는 대화면 장비) — 2-D 참조**: `fetch-shader-tools.ps1`을 못 돌리는 장비에는
+`tools/bundle-shader-kit.ps1`로 툴+워밍캐시를 배포 폴더에 넣는다. wr-d3d11이 exe 옆에서 자동으로
+찾으므로(위 ②) 환경변수도 인터넷도 불필요.
 
 ### 2-B. 셰이더 디스크 캐시 (최초 실행이 느린 이유)
-- 변환·컴파일된 DXBC는 `webrender_d3d11_native/shader-cache/<hash>.{dxbc,hlsl,json}` 에 캐시된다.
+- 변환·컴파일된 DXBC 캐시 위치 탐색 순서(툴과 동일 규칙): ① `WR_D3D11_CACHE_DIR` → ② exe 옆
+  `shader-cache/`(있으면) → ③ 빌드 머신 `webrender_d3d11_native/shader-cache/`(레포 있을 때) →
+  ④ 그 외엔 exe 옆 `shader-cache/`(없으면 새로 생성). 파일명 `<hash>.{dxbc,hlsl,json}`.
 - **최초 실행은 모든 셰이더를 변환/컴파일**하므로 첫 프레임까지 수백 ms~수 초 걸릴 수 있다.
-  두 번째 실행부터는 캐시 히트로 즉시 뜬다.
+  두 번째 실행부터는 캐시 히트로 즉시 뜬다. 워밍캐시를 배포에 번들하면 첫 실행도 빠르다(2-D).
 - 변환 실패 시 GLSL/HLSL 덤프가 `shader-cache/failed/<hash>.{glsl,hlsl}` 에 남는다(디버깅용).
-- 캐시 무효화가 필요하면(툴 인자/버전 변경 등) `shader-cache/` 를 지우고 재실행.
+- 캐시 무효화: 캐시 키에 `pipeline_flags_signature`(전처리 태그 `pre:vN` 포함)가 들어가므로,
+  wr-d3d11 셰이더/플래그를 바꾸면 키가 달라져 자연 무효화된다(수동 삭제 불필요). 워밍캐시는 그
+  빌드에 종속이므로 wr-d3d11 변경 후엔 재번들할 것.
+
+### 2-D. 오프라인 대화면 장비 배포 (인터넷 없이 self-contained)
+`fetch-shader-tools.ps1`이 인터넷을 요구하므로, 오프라인 타깃에는 **빌드 머신에서 미리 번들**한다:
+```powershell
+# 빌드 머신(인터넷 O)에서: 툴을 받고
+webrender_d3d11_native\tools\fetch-shader-tools.ps1
+# 배포 폴더(winit_wall.exe가 있는 곳)에 툴 + 워밍캐시를 넣는다
+webrender_d3d11_native\tools\bundle-shader-kit.ps1 -DeployDir <배포폴더>   # 툴만 원하면 -NoCache
+```
+그러면 배포 폴더에 `shader-tools\{glslangValidator.exe, spirv-cross.exe}` 와 `shader-cache\`(워밍)이
+생기고, wr-d3d11이 **exe 옆에서 자동 탐색**(2-A/2-B의 ②)하므로 타깃에선 환경변수·인터넷이 필요 없다.
+- 워밍캐시가 페이지의 모든 셰이더를 덮으면 타깃에서 **툴 호출조차 없이** 즉시 뜬다.
+- 캐시 미스가 나도 번들된 `shader-tools`로 그 자리에서 컴파일해 `shader-cache\`에 저장한다.
+- 검증됨(레포 tools/cache를 비활성화한 상태에서): 워밍캐시 경로·신규 컴파일 경로 모두 비디오 정상 렌더.
+- 대안(번들 없이): 타깃에서 `WR_D3D11_TOOLS_DIR`/`WR_D3D11_CACHE_DIR`를 수동 지정해도 된다.
 
 ### 2-C. GStreamer / ANGLE DLL
 - GL 백엔드(`--backend gl`)는 실행 파일 옆에 ANGLE(`libEGL.dll`/`libGLESv2.dll`) DLL이 필요하다.
@@ -88,7 +113,7 @@ stderr에 초당 `Present perf: presents_per_s=.. avg_present_ms=..` 이 찍힌�
 버퍼가 flush된다(강제 kill 시 로그 유실). 미디어 페이지(비디오 그리드)로 두 백엔드를 비교하면
 ANGLE 경로 대비 네이티브 D3D11의 present/합성 비용 차이를 볼 수 있다.
 
-### 2-D. Y 규약(상하 반전) 처리 — 참고
+### 2-E. Y 규약(상하 반전) 처리 — 참고
 초기 통합에서 D3D11 출력이 **상하 반전**됐다. 원인: `wr-d3d11`은 렌더 타깃을 내부적으로 GL
 물리 레이아웃(row 0 = 하단)으로 유지하는데, DXGI present는 백버퍼 row 0을 화면 상단에 놓는다.
 WebRender의 `WebRenderOptions::surface_origin_is_top_left` 가 기본 `false`(GL bottom-left)라 최종
@@ -97,7 +122,7 @@ WebRender의 `WebRenderOptions::surface_origin_is_top_left` 가 기본 `false`(G
   `true`를 반환, `painter.rs`가 이를 `WebRenderOptions` 에 전달(무비용 — 투영 방향 플래그일 뿐).
   `wr-d3d11-sample`의 D3D11 백엔드와 동일한 처리다.
 
-### 2-E. 비디오(YUV) 파란화면 / border-radius 사각형 — VS→FS varying 시맨틱 불일치 (수정 완료)
+### 2-F. 비디오(YUV) 파란화면 / border-radius 사각형 — VS→FS varying 시맨틱 불일치 (수정 완료)
 증상: d3d11에서 `<video>`가 균일 파란색, `border-radius:50%` 원이 사각형(색/텍스트/AA/섀도우는 정상).
 - **근본 원인**: WebRender는 VS/FS를 같은 소스로 컴파일하지만, `wr-d3d11`은 GLSL을 런타임에
   glslang(스테이지 독립 컴파일)→spirv-cross로 HLSL 변환한다. glslang이 각 스테이지가 **실제 쓰는
