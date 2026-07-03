@@ -902,10 +902,19 @@ impl WebGLThread {
         attributes: GLContextAttributes,
     ) -> Result<(GLContextData, webgl::GLLimits, Size2D<i32>, bool), String> {
         let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+        // A non-surfman rendering context (e.g. the native D3D11 backend) registers no
+        // `PainterSurfmanDetails`, because WebGL is implemented on surfman/ANGLE surfaces. Fail
+        // WebGL context creation gracefully instead of panicking (a panic here poisons
+        // `ANGLE_GL_LOCK` and cascades into the paint and script threads, crashing the process).
         let painter_surfman_details = self
             .painter_surfman_details_map
             .get(painter_id)
-            .expect("PainterSurfmanDetails not found for PainterId");
+            .ok_or_else(|| {
+                format!(
+                    "WebGL is unavailable for painter {painter_id:?}: its rendering context has \
+                     no surfman connection (e.g. the native D3D11 backend)"
+                )
+            })?;
         let api_type = match painter_surfman_details.connection.gl_api() {
             surfman::GLApi::GL => GlType::Gl,
             surfman::GLApi::GLES => GlType::Gles,

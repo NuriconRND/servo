@@ -12,18 +12,14 @@
 - ✅ 렌더 정확도: 색상(4색 사분면), 텍스트/폰트, 안티앨리어싱, 드롭섀도우, 반투명 원까지
   GL 백엔드와 동일하게 렌더된다. (`tests/html/dx_render_check.html` 기준 백버퍼 리드백 비교)
 - ✅ 상하 방향(Y 규약) 버그 수정 완료 — 아래 2-D 참조.
-- ⚠️ **알려진 충실도 갭 (근본 원인 규명 완료)**: `border-radius:50%` 원이 **사각형**으로 렌더된다
-  (색/텍스트/섀도우/AA/반투명은 정상). 원인 = `ps_quad_mask` 셰이더의 **VS→FS varying 시맨틱
-  불일치**. glslang이 VS/FS를 독립 컴파일하며 각 스테이지의 varying 집합대로 로케이션을 따로
-  배정 → spirv-cross가 그 로케이션으로 HLSL TEXCOORD 시맨틱을 굳힌다. VS는 FS가 안 쓰는 출력
-  (vTransformBounds/v_color/vLocalPos)을 앞쪽에 두어 `v_clip_radii`가 **VS out=TEXCOORD5**,
-  FS는 자기 입력만 촘촘히 배치해 **FS in=TEXCOORD2**가 된다. D3D11은 시맨틱 이름으로 링크하므로
-  FS의 `v_clip_radii`(TEXCOORD2)는 VS가 TEXCOORD2에 넣은 `v_flags`(작은 정수)를 받아 radii≈0 →
-  `sd_round_box`가 축정렬 박스(사각형)가 된다. (GL은 varying을 이름으로 링크해 정상.) 샘플러
-  바인딩은 정상(런타임 진단으로 `sGpuBufferF` VS unit=10/tex bound 확인 — 서브에이전트 초기 가설
-  반증). 수정 = `wr-d3d11` 셰이더 번역이 VS out/FS in varying을 **이름 기준 동일 시맨틱**으로 맞추기
-  (예: 공유 GLSL varying 선언에 소스 순서 기반 `layout(location=N)` 주입 → 두 스테이지 로케이션 일치).
-  전 셰이더 varying 처리에 영향 → 넓은 재검증 필요. 비디오 월(사각 타일·비디오)엔 무영향.
+- ✅ **비디오(YUV) + border-radius 렌더 수정 완료** — 아래 2-E 참조. 이전에 d3d11에서 `<video>`가
+  균일 파란색으로, `border-radius:50%` 원이 사각형으로 렌더되던 문제. 둘 다 동일 근본 원인
+  (VS→FS varying 시맨틱 불일치)이었고 한 방으로 해결. 비디오 그리드가 GL과 동일하게 실제 영상
+  프레임을 표출, 원이 정상 원형으로 렌더됨을 백버퍼 리드백으로 확인.
+- ⚠️ **WebGL 미지원(d3d11)**: 네이티브 D3D11 컨텍스트는 surfman connection이 없어 WebGL(surfman/
+  ANGLE 서피스 기반)을 쓸 수 없다. WebGL을 쓰는 페이지는 해당 캔버스만 실패하고 **앱은 계속
+  동작**한다(이전엔 `PainterSurfmanDetails not found` 패닉이 paint/script 스레드로 전파돼 프로세스가
+  죽었음 — graceful 실패로 변경). 비디오 월 워크로드(비디오/DOM)엔 무영향.
 - ✅ **멀티-GPU 어댑터 선택 배선 완료**(5절). `--wall-all-tiles`에서 각 타일이 자기 디스플레이를
   구동하는 어댑터에 D3D11 디바이스를 바인딩한다. dev 장비(디스플레이 2개 모두 adapter 0)에서
   2타일 팬아웃 검증: `tile 0/1 -> adapter 0`, `Wall frame barrier ... ready=2/2`. **서로 다른 GPU
@@ -100,6 +96,29 @@ WebRender의 `WebRenderOptions::surface_origin_is_top_left` 가 기본 `false`(G
 - 수정: `RenderingContext::surface_origin_is_top_left()` 트레잇 메서드를 추가하고 D3D11 컨텍스트는
   `true`를 반환, `painter.rs`가 이를 `WebRenderOptions` 에 전달(무비용 — 투영 방향 플래그일 뿐).
   `wr-d3d11-sample`의 D3D11 백엔드와 동일한 처리다.
+
+### 2-E. 비디오(YUV) 파란화면 / border-radius 사각형 — VS→FS varying 시맨틱 불일치 (수정 완료)
+증상: d3d11에서 `<video>`가 균일 파란색, `border-radius:50%` 원이 사각형(색/텍스트/AA/섀도우는 정상).
+- **근본 원인**: WebRender는 VS/FS를 같은 소스로 컴파일하지만, `wr-d3d11`은 GLSL을 런타임에
+  glslang(스테이지 독립 컴파일)→spirv-cross로 HLSL 변환한다. glslang이 각 스테이지가 **실제 쓰는
+  varying만 남기고 로케이션을 촘촘히 재배정**하는데(VS 전용 출력 `vTransformBounds` 등은 FS에서
+  제거되며 뒤 varying이 한 칸씩 밀림), spirv-cross가 그 로케이션을 HLSL `TEXCOORD<n>` 시맨틱으로
+  굳힌다. D3D11은 VS-out↔PS-in을 **시맨틱 이름으로 링크**하므로, FS가 엉뚱한 VS 출력을 읽는다:
+  - `brush_yuv_image`: FS의 `vUv_Y`/`vRgbFromDebiasedYcbcr`(YUV→RGB 행렬)/`vFormat`이 전부 밀려
+    UV 좌표·색변환 행렬이 뒤섞임 → 모든 픽셀이 같은 텍셀(영상 상단 파란 하늘)을 샘플 → 균일 파랑.
+  - `ps_quad_mask`: FS `v_clip_radii`가 `v_flags`(작은 정수)를 받아 radii≈0 → `sd_round_box`가 사각형.
+- **수정 2가지(둘 다 필요)**:
+  1. `RenderingContext::use_optimized_shaders()` 트레잇 메서드 추가(기본 `true`, D3D11은 `false`).
+     `painter.rs`가 `WebRenderOptions`에 전달. WebRender의 **비최적화 셰이더**는 varying을 하나의 공유
+     블록에서 `varying` 매크로로 선언하므로 VS/FS가 동일 선언열을 본다(최적화 셰이더는 glslopt이
+     스테이지별로 varying을 스트립·이름 변경해 위치 기반 정렬이 불가능).
+  2. `wr-d3d11`의 `preprocess_for_glslang`에 **`inject_varying_locations`** 추가: 소스의 각 `varying`
+     선언에 **선언 순서 기반 `layout(location=N)`**을 주입(mat3=3슬롯 등 다중 로케이션 예약).
+     glslang이 명시적 로케이션을 존중하므로 두 스테이지가 같은 이름=같은 로케이션 → 시맨틱 일치.
+     캐시 무효화 태그 `pre:v1`→`pre:v2`. (검증: glslangValidator+spirv-cross로 명시 로케이션 존중 확인,
+     비디오 그리드·dx_render_check 백버퍼 리드백으로 최종 확인, `shader-cache/failed/` 신규 실패 없음.)
+- 참고: 위 1(비최적화)만으로도 varying 선언은 공유되지만, glslang auto-map은 여전히 미사용 varying을
+  스트립·압축해 어긋난다 → 2(명시 로케이션)가 있어야 정렬이 고정된다.
 
 ## 4. 1920×1080을 넘어서 (대화면 단일 서피스)
 

@@ -299,6 +299,15 @@ impl RenderingContext for Dx11RenderingContext {
         true
     }
 
+    fn use_optimized_shaders(&self) -> bool {
+        // Use WebRender's unoptimized shaders. glslopt strips each stage's unused varyings
+        // independently, so the optimized VS/FS have different varying interfaces; `wr-d3d11`
+        // translates GLSL→HLSL per stage and D3D11 links by semantic, so that mismatch corrupts
+        // YUV video and rounded-rect clips (solid-colour output). The unoptimized shaders declare
+        // varyings in one shared block, which `wr-d3d11` pins to matching `layout(location=…)`.
+        false
+    }
+
     fn gleam_gl_api(&self) -> Rc<dyn gleam::gl::Gl> {
         self.gl.clone()
     }

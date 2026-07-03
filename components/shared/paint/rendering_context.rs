@@ -122,6 +122,16 @@ pub trait RenderingContext {
     fn surface_origin_is_top_left(&self) -> bool {
         false
     }
+    /// Whether WebRender should use its build-time-optimized (glslopt) shaders. Surfman/GL uses
+    /// them (`true`). The native D3D11 backend translates GLSL→HLSL at runtime and must return
+    /// `false`: glslopt strips each stage's unused varyings independently, so the vertex and
+    /// fragment stages end up with different varying interfaces, and D3D11 links VS-out↔PS-in by
+    /// HLSL semantic — the mismatch corrupts YUV video and rounded-rect clips. The unoptimized
+    /// shaders declare varyings in a single shared block, which `wr-d3d11` pins to consistent
+    /// `layout(location=…)` so both stages agree. See [`Dx11RenderingContext`].
+    fn use_optimized_shaders(&self) -> bool {
+        true
+    }
 }
 
 pub fn create_adapter_for_requested_gpu(

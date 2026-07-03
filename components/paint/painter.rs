@@ -346,7 +346,10 @@ impl Painter {
                 // on Android emulators with unoptimized shaders. This is due to a known
                 // issue in the emulator's OpenGL emulation layer.
                 // See: https://github.com/servo/servo/issues/31726
-                use_optimized_shaders: true,
+                // Exception: the native D3D11 backend (wr-d3d11) requires unoptimized shaders so
+                // its runtime GLSL→HLSL varying interfaces match between stages (glslopt strips
+                // per-stage varyings, which breaks D3D11's by-semantic VS↔PS linkage).
+                use_optimized_shaders: rendering_context.use_optimized_shaders(),
                 resource_override_path: opts::get().shaders_path.clone(),
                 debug_flags: webrender::DebugFlags::empty(),
                 precache_flags: if pref!(gfx_precache_shaders) {
