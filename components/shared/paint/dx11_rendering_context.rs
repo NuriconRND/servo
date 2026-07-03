@@ -13,8 +13,9 @@
 //! [`RenderingContext::gleam_gl_api`] then returns the [`wr_d3d11::Gld3d11`] so WebRender
 //! renders natively on D3D11.
 //!
-//! v1 scope: single tile / single GPU, no offscreen readback (`read_to_image` -> `None`),
-//! no `glow` (the `glow` API is only used inside surfman's own context, never here).
+//! v1 scope: single tile / single GPU, no `glow` (the `glow` API is only used inside surfman's
+//! own context, never here). `read_to_image` reads the backbuffer back via a STAGING texture for
+//! render validation.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -136,9 +137,69 @@ impl Dx11RenderingContext {
 }
 
 impl RenderingContext for Dx11RenderingContext {
-    fn read_to_image(&self, _source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
-        // v1 stub: offscreen readback / screenshots are not needed for the wall demo.
-        None
+    fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
+        // Read the swapchain backbuffer back to CPU for render validation (e.g. winit_wall's
+        // `--capture`). Called after WebRender has drawn into FBO 0 but *before* `present()`
+        // (FLIP_DISCARD discards the backbuffer on Present), matching the GL backend's
+        // read-then-present ordering. We copy the backbuffer into a STAGING texture, Map it, and
+        // convert BGRA8 -> RGBA8. The backbuffer is stored top-down (row 0 = top of screen), the
+        // same orientation the GL backend produces after its flip, so gl/d3d11 captures compare
+        // directly.
+        let device = self.gl.device();
+        let context = unsafe { device.GetImmediateContext() }.ok()?;
+
+        let backbuffer: ID3D11Texture2D = unsafe { self.swapchain.GetBuffer(0) }.ok()?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { backbuffer.GetDesc(&mut desc) };
+        let full_w = desc.Width;
+        let full_h = desc.Height;
+
+        // Clamp the requested rect to the backbuffer bounds.
+        let x0 = source_rectangle.min.x.max(0) as u32;
+        let y0 = source_rectangle.min.y.max(0) as u32;
+        if x0 >= full_w || y0 >= full_h {
+            return None;
+        }
+        let req_w = source_rectangle.width().max(0) as u32;
+        let req_h = source_rectangle.height().max(0) as u32;
+        let out_w = if req_w == 0 { full_w - x0 } else { req_w.min(full_w - x0) };
+        let out_h = if req_h == 0 { full_h - y0 } else { req_h.min(full_h - y0) };
+        if out_w == 0 || out_h == 0 {
+            return None;
+        }
+
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+            ..desc
+        };
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }.ok()?;
+        let staging = staging?;
+        unsafe { context.CopyResource(&staging, &backbuffer) };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.ok()?;
+
+        let row_pitch = mapped.RowPitch as usize;
+        let src = mapped.pData as *const u8;
+        let mut out = RgbaImage::new(out_w, out_h);
+        for row in 0..out_h {
+            let src_row = unsafe { src.add((y0 + row) as usize * row_pitch) };
+            for col in 0..out_w {
+                // Backbuffer is DXGI_FORMAT_B8G8R8A8_UNORM: bytes are B, G, R, A.
+                let px = unsafe { src_row.add((x0 + col) as usize * 4) };
+                let b = unsafe { *px };
+                let g = unsafe { *px.add(1) };
+                let r = unsafe { *px.add(2) };
+                // Force opaque: WebRender may leave alpha at 0 in the backbuffer.
+                out.put_pixel(col, row, image::Rgba([r, g, b, 255]));
+            }
+        }
+        unsafe { context.Unmap(&staging, 0) };
+        Some(out)
     }
 
     fn size(&self) -> PhysicalSize<u32> {
@@ -186,6 +247,15 @@ impl RenderingContext for Dx11RenderingContext {
     fn make_current(&self) -> Result<(), Error> {
         // The D3D11 immediate context is always current on its owning thread; nothing to do.
         Ok(())
+    }
+
+    fn surface_origin_is_top_left(&self) -> bool {
+        // The swapchain backbuffer is a top-down D3D texture (row 0 = top), unlike a GL window
+        // surface (bottom-left origin). WebRender must project FBO 0 accordingly, or the whole
+        // frame is presented upside down. `wr-d3d11` keeps the render target in GL physical
+        // layout internally, so this flag (passed to `WebRenderOptions`) is what makes the final
+        // present come out right way up — matching the `wr-d3d11-sample` D3D11 backend.
+        true
     }
 
     fn gleam_gl_api(&self) -> Rc<dyn gleam::gl::Gl> {

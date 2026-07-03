@@ -24,12 +24,12 @@ use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
 
-use euclid::Scale;
+use euclid::{Point2D, Scale, Size2D};
 #[cfg(target_os = "windows")]
 use servo::Dx11RenderingContext;
 use servo::{
-    PrefValue, Preferences, RenderingContext, Servo, ServoBuilder, ViewportDetails, WebView,
-    WebViewBuilder, WebViewPaintTarget, WindowRenderingContext, dxgi_luid_for_gpu_index,
+    DeviceIntRect, PrefValue, Preferences, RenderingContext, Servo, ServoBuilder, ViewportDetails,
+    WebView, WebViewBuilder, WebViewPaintTarget, WindowRenderingContext, dxgi_luid_for_gpu_index,
     enumerate_display_topology, spatial_order,
 };
 use url::Url;
@@ -61,6 +61,10 @@ struct Config {
     all_tiles: bool,
     tile_index: usize,
     backend: Backend,
+    /// `--capture <path>`: write the primary tile's rendered framebuffer to this PNG once,
+    /// `capture_sec` seconds after startup, then exit. Used to validate wr-d3d11 vs GL output.
+    capture: Option<String>,
+    capture_sec: f64,
     preferences: Preferences,
 }
 
@@ -70,6 +74,8 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut all_tiles = false;
     let mut tile_index = 0usize;
     let mut backend = Backend::Gl;
+    let mut capture: Option<String> = None;
+    let mut capture_sec = 3.0f64;
     let mut preferences = Preferences::default();
 
     let mut args = std::env::args().skip(1);
@@ -94,6 +100,17 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
                     "d3d11" => Backend::D3d11,
                     other => return Err(format!("unknown --backend value: {other}").into()),
                 };
+            },
+            // `--capture <path>` writes the primary tile's framebuffer to a PNG once (for
+            // render validation), `--capture-sec <n>` seconds after startup (default 3), then exits.
+            "--capture" => {
+                capture = Some(args.next().ok_or("--capture requires a path")?);
+            },
+            "--capture-sec" => {
+                capture_sec = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or("--capture-sec requires a number")?;
             },
             // `--pref name[=value]` overrides a Servo preference, exactly like servoshell:
             // a bare name (or `name=true`) sets a bool, otherwise the value is parsed
@@ -123,6 +140,8 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         all_tiles,
         tile_index,
         backend,
+        capture,
+        capture_sec,
         preferences,
     })
 }
@@ -192,6 +211,12 @@ struct AppState {
     present_ms_sum: Cell<f64>,
     present_count: Cell<u32>,
     present_window_start: Cell<Option<std::time::Instant>>,
+    // `--capture`: read the primary tile's framebuffer to PNG once, at `capture_deadline`,
+    // then request exit. Read happens before `present()` so the backbuffer still holds the frame.
+    capture_path: Option<String>,
+    capture_deadline: Option<std::time::Instant>,
+    captured: Cell<bool>,
+    should_exit: Cell<bool>,
 }
 
 impl AppState {
@@ -221,6 +246,37 @@ impl AppState {
         }
     }
 
+    /// If `--capture` is active and its deadline has passed, read the given (primary) tile's
+    /// framebuffer to a PNG and request exit. Called once, before `present()`.
+    fn maybe_capture(&self, tile: &TileWindow) {
+        let (Some(path), Some(deadline)) = (self.capture_path.as_ref(), self.capture_deadline)
+        else {
+            return;
+        };
+        if self.captured.get() || std::time::Instant::now() < deadline {
+            return;
+        }
+        self.captured.set(true);
+        self.should_exit.set(true);
+
+        let size = tile.rendering_context.size();
+        let rect = DeviceIntRect::from_origin_and_size(
+            Point2D::new(0, 0),
+            Size2D::new(size.width as i32, size.height as i32),
+        );
+        match tile.rendering_context.read_to_image(rect) {
+            Some(image) => match image.save(path) {
+                Ok(()) => eprintln!(
+                    "capture: wrote {}x{} framebuffer to {path}",
+                    image.width(),
+                    image.height()
+                ),
+                Err(error) => eprintln!("capture: failed to write {path}: {error}"),
+            },
+            None => eprintln!("capture: read_to_image returned None (no framebuffer readback)"),
+        }
+    }
+
     fn render_all_tiles(&self) {
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
@@ -246,6 +302,8 @@ impl AppState {
                 None => {
                     let _ = tile.rendering_context.make_current();
                     webview.paint();
+                    // Capture before present (FLIP_DISCARD discards the backbuffer on Present).
+                    self.maybe_capture(tile);
                     let present_start = std::time::Instant::now();
                     tile.rendering_context.present();
                     self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
@@ -473,6 +531,13 @@ impl ApplicationHandler<WakerEvent> for App {
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
             present_window_start: Cell::new(None),
+            capture_deadline: config
+                .capture
+                .as_ref()
+                .map(|_| std::time::Instant::now() + std::time::Duration::from_secs_f64(config.capture_sec)),
+            capture_path: config.capture.clone(),
+            captured: Cell::new(false),
+            should_exit: Cell::new(false),
         });
 
         // 3) One logical WebView whose layout viewport is the whole virtual viewport.
@@ -517,6 +582,24 @@ impl ApplicationHandler<WakerEvent> for App {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Self::Running(state) = self else {
+            return;
+        };
+        if state.should_exit.get() {
+            event_loop.exit();
+            return;
+        }
+        // While a `--capture` is pending, keep polling + redrawing so the capture deadline
+        // fires even on a static page that has otherwise gone idle (no new frame-ready events).
+        if state.capture_path.is_some() && !state.captured.get() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            if let Some(tile) = state.tiles.first() {
+                tile.window.request_redraw();
+            }
+        }
+    }
+
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
@@ -535,6 +618,13 @@ impl ApplicationHandler<WakerEvent> for App {
                 }
             },
             _ => (),
+        }
+
+        // `--capture` requests exit after writing its PNG.
+        if let Self::Running(state) = self
+            && state.should_exit.get()
+        {
+            event_loop.exit();
         }
     }
 }

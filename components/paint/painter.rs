@@ -367,6 +367,10 @@ impl Painter {
                 namespace_alloc_by_client: true,
                 shared_font_namespace: Some(painter_id.into()),
                 picture_tile_size: perf_picture_tile_size(),
+                // GL window surfaces are bottom-left origin (default false); a native D3D11
+                // swapchain backbuffer is top-down. The rendering context reports which, so
+                // WebRender projects FBO 0 the right way up instead of upside down.
+                surface_origin_is_top_left: rendering_context.surface_origin_is_top_left(),
                 ..Default::default()
             },
             None,

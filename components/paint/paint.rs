@@ -986,19 +986,25 @@ impl Paint {
                 painter.painter_id,
             );
         }
-        let connection = rendering_context
-            .connection()
-            .expect("Failed to get connection");
-        let adapter =
-            create_adapter_for_requested_gpu(&connection, rendering_context.requested_gpu_index())
-                .expect("Failed to create adapter");
+        // Surfman connection/adapter details are only consumed by the WebGL thread (to place
+        // WebGL surfaces on the requested GPU). A non-surfman rendering context — e.g. the native
+        // D3D11 backend (Dx11RenderingContext) — has no surfman connection; in that case we skip
+        // registering surfman details. WebGL is unavailable for such a painter, but the core
+        // WebRender + media/canvas paint path does not need it.
+        if let Some(connection) = rendering_context.connection() {
+            let adapter = create_adapter_for_requested_gpu(
+                &connection,
+                rendering_context.requested_gpu_index(),
+            )
+            .expect("Failed to create adapter");
 
-        let painter_surfman_details = PainterSurfmanDetails {
-            connection,
-            adapter,
-        };
-        self.painter_surfman_details_map
-            .insert(painter.painter_id, painter_surfman_details);
+            let painter_surfman_details = PainterSurfmanDetails {
+                connection,
+                adapter,
+            };
+            self.painter_surfman_details_map
+                .insert(painter.painter_id, painter_surfman_details);
+        }
 
         let painter_id = painter.painter_id;
         self.painters.push(Rc::new(RefCell::new(painter)));

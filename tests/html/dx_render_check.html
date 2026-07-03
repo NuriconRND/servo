@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<!-- Deterministic static page to validate WebRender rendering on the wr-d3d11 native
+     D3D11 backend vs the ANGLE GL backend. Distinct colored quadrants + border + text
+     make a screenshot unambiguous: correct = four colors + label; broken = black/garbled. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>dx_render_check</title>
+<style>
+  html,body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202020; }
+  #grid { display:flex; flex-wrap:wrap; width:100vw; height:100vh; box-sizing:border-box; border:8px solid #ffffff; }
+  .q { flex:none; width:50%; height:50%; box-sizing:border-box; display:flex; align-items:center; justify-content:center;
+       font:bold 48px/1 sans-serif; color:#ffffff; text-shadow:0 2px 4px rgba(0,0,0,.6); }
+  .tl{background:#c0392b} .tr{background:#27ae60} .bl{background:#2980b9} .br{background:#f1c40f; color:#202020}
+  #badge { position:absolute; top:24px; left:24px; background:rgba(0,0,0,.7); color:#fff; padding:10px 18px;
+           border-radius:10px; font:bold 28px/1 monospace; }
+  #circle { position:absolute; left:50%; top:50%; width:220px; height:220px; margin:-110px 0 0 -110px;
+            border-radius:50%; background:rgba(255,255,255,.85); box-shadow:0 8px 24px rgba(0,0,0,.5); }
+</style>
+</head>
+<body>
+  <div id="grid">
+    <div class="q tl">RED</div>
+    <div class="q tr">GREEN</div>
+    <div class="q bl">BLUE</div>
+    <div class="q br">YELLOW</div>
+  </div>
+  <div id="circle"></div>
+  <div id="badge">dx_render_check</div>
+</body>
+</html>

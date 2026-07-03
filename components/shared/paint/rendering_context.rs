@@ -114,6 +114,14 @@ pub trait RenderingContext {
     fn requested_gpu_index(&self) -> Option<usize> {
         None
     }
+    /// Whether this context's default framebuffer (WebRender's FBO 0) has its origin at the
+    /// top-left. Surfman/GL window surfaces use the GL bottom-left convention (`false`), and
+    /// WebRender flips its final pass accordingly. A native D3D11 swapchain backbuffer is
+    /// top-down (`true`); returning `true` here is passed to `WebRenderOptions` so WebRender
+    /// projects the default framebuffer the right way up. See [`Dx11RenderingContext`].
+    fn surface_origin_is_top_left(&self) -> bool {
+        false
+    }
 }
 
 pub fn create_adapter_for_requested_gpu(
