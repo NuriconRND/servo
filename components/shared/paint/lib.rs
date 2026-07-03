@@ -23,6 +23,8 @@ use surfman::{Adapter, Connection};
 use webrender_api::{DocumentId, FontVariation};
 
 pub mod display_list;
+#[cfg(target_os = "windows")]
+pub mod dx11_rendering_context;
 pub mod largest_contentful_paint_candidate;
 pub mod rendering_context;
 pub mod viewport_description;

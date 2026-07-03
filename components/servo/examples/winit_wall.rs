@@ -25,6 +25,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use euclid::Scale;
+#[cfg(target_os = "windows")]
+use servo::Dx11RenderingContext;
 use servo::{
     PrefValue, Preferences, RenderingContext, Servo, ServoBuilder, ViewportDetails, WebView,
     WebViewBuilder, WebViewPaintTarget, WindowRenderingContext, dxgi_luid_for_gpu_index,
@@ -35,6 +37,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
+#[cfg(target_os = "windows")]
+use winit::raw_window_handle::RawWindowHandle;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -42,11 +46,21 @@ use crate::wall::WallLayout;
 
 const DEFAULT_URL: &str = "https://demo.servo.org/experiments/twgl-tunnel/";
 
+/// Which [`RenderingContext`] backend each tile window uses.
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    /// surfman/ANGLE OpenGL (the default `WindowRenderingContext`).
+    Gl,
+    /// Native D3D11 via `wr-d3d11` (`Dx11RenderingContext`, Windows-only, single tile).
+    D3d11,
+}
+
 struct Config {
     url: Url,
     layout: WallLayout,
     all_tiles: bool,
     tile_index: usize,
+    backend: Backend,
     preferences: Preferences,
 }
 
@@ -55,6 +69,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut layout_path: Option<String> = None;
     let mut all_tiles = false;
     let mut tile_index = 0usize;
+    let mut backend = Backend::Gl;
     let mut preferences = Preferences::default();
 
     let mut args = std::env::args().skip(1);
@@ -69,6 +84,16 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .ok_or("--wall-tile-index requires an integer")?;
+            },
+            // `--backend gl|d3d11` selects the tile rendering-context backend. `gl` (default)
+            // is surfman/ANGLE; `d3d11` is the native wr-d3d11 backend (Windows, single tile).
+            "--backend" => {
+                let value = args.next().ok_or("--backend requires gl|d3d11")?;
+                backend = match value.as_str() {
+                    "gl" => Backend::Gl,
+                    "d3d11" => Backend::D3d11,
+                    other => return Err(format!("unknown --backend value: {other}").into()),
+                };
             },
             // `--pref name[=value]` overrides a Servo preference, exactly like servoshell:
             // a bare name (or `name=true`) sets a bool, otherwise the value is parsed
@@ -97,6 +122,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         layout,
         all_tiles,
         tile_index,
+        backend,
         preferences,
     })
 }
@@ -151,7 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// [`WebView::paint`] (the WebView's own rendering context).
 struct TileWindow {
     window: Window,
-    rendering_context: Rc<WindowRenderingContext>,
+    rendering_context: Rc<dyn RenderingContext>,
     paint_target: Cell<Option<WebViewPaintTarget>>,
 }
 
@@ -255,11 +281,22 @@ impl ApplicationHandler<WakerEvent> for App {
             .display_handle()
             .expect("Failed to get display handle");
 
-        let tile_indices: Vec<usize> = if config.all_tiles {
+        let mut tile_indices: Vec<usize> = if config.all_tiles {
             (0..config.layout.tiles.len()).collect()
         } else {
             vec![config.tile_index]
         };
+
+        // The native D3D11 backend only wires a single tile/GPU for now; per-adapter
+        // fan-out is a follow-up. Restrict to the first tile and warn.
+        if config.backend == Backend::D3d11 && tile_indices.len() > 1 {
+            eprintln!(
+                "warning: --backend d3d11 currently supports a single tile; rendering only \
+                 tile {} (multi-tile D3D11 fan-out is a follow-up)",
+                tile_indices[0]
+            );
+            tile_indices.truncate(1);
+        }
 
         // 1) Resolve the physical display topology once. Each tile's `display` is a spatial
         //    index (top-left = 0, row-major); the GPU is the adapter that drives that display.
@@ -294,7 +331,7 @@ impl ApplicationHandler<WakerEvent> for App {
         }
 
         // Create one window + rendering context per tile.
-        let mut built: Vec<(Window, Rc<WindowRenderingContext>)> = Vec::new();
+        let mut built: Vec<(Window, Rc<dyn RenderingContext>)> = Vec::new();
         for &tile_index in &tile_indices {
             let tile = &config.layout.tiles[tile_index];
             let mut attributes = Window::default_attributes()
@@ -372,15 +409,40 @@ impl ApplicationHandler<WakerEvent> for App {
                 .create_window(attributes)
                 .expect("Failed to create tile window");
             let window_handle = window.window_handle().expect("Failed to get window handle");
-            let rendering_context = Rc::new(
-                WindowRenderingContext::new_with_target_gpu(
-                    display_handle,
-                    window_handle,
-                    window.inner_size(),
-                    gpu_index,
-                )
-                .expect("Could not create RenderingContext for tile window"),
-            );
+            let rendering_context: Rc<dyn RenderingContext> = match config.backend {
+                Backend::Gl => Rc::new(
+                    WindowRenderingContext::new_with_target_gpu(
+                        display_handle,
+                        window_handle,
+                        window.inner_size(),
+                        gpu_index,
+                    )
+                    .expect("Could not create RenderingContext for tile window"),
+                ),
+                Backend::D3d11 => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        // Native D3D11 binds to the swapchain's default adapter for now;
+                        // `gpu_index` (per-display adapter selection) is a follow-up.
+                        let _ = gpu_index;
+                        let hwnd = match window_handle.as_raw() {
+                            RawWindowHandle::Win32(handle) => handle.hwnd.get(),
+                            other => panic!(
+                                "--backend d3d11 requires a Win32 window handle, got {other:?}"
+                            ),
+                        };
+                        Rc::new(
+                            Dx11RenderingContext::new(hwnd, window.inner_size())
+                                .expect("Could not create D3D11 RenderingContext for tile window"),
+                        )
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let _ = (window_handle, gpu_index);
+                        panic!("--backend d3d11 is only supported on Windows");
+                    }
+                },
+            };
             built.push((window, rendering_context));
         }
 

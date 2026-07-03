@@ -45,6 +45,8 @@ pub use net_traits::CookieSource;
 // fleshed out public domains API if we want to expose it.
 pub use net_traits::pub_domains::is_reg_domain;
 pub use paint::WebRenderDebugOption;
+#[cfg(target_os = "windows")]
+pub use paint_api::dx11_rendering_context::Dx11RenderingContext;
 pub use paint_api::rendering_context::{
     DisplayTopology, OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext,
     WindowRenderingContext, dxgi_luid_for_gpu_index, enumerate_display_topology, spatial_order,

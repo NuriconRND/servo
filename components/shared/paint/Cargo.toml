@@ -51,3 +51,10 @@ webrender_api = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { workspace = true, features = ["dxgi", "winerror"] }
 wio = { workspace = true }
+wr-d3d11 = { path = "../../../../webrender_d3d11_native/wr-d3d11" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
