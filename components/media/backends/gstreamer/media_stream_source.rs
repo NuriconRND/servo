@@ -73,12 +73,8 @@ mod imp {
             // Append a proxysink to the media stream pipeline.
             let pipeline = stream.pipeline_or_new();
             // 표시 경로: 재인코딩(vp8enc/opusenc) 없이 raw tail을 그대로 proxysink로 흘린다.
-            // SERVO_MEDIASTREAM_ENCODE_DISPLAY 설정 시에만 옛 encoded() 경로(A/B·디버그용).
-            let last_element = if std::env::var("SERVO_MEDIASTREAM_ENCODE_DISPLAY").is_ok() {
-                stream.encoded().map_err(|_| PlayerError::SetStreamFailed)?
-            } else {
-                stream.raw()
-            };
+            // (send 경로 webrtc.rs는 계속 encoded()를 사용 — 무관.)
+            let last_element = stream.raw();
             let sink = gstreamer::ElementFactory::make("proxysink")
                 .build()
                 .map_err(|_| PlayerError::SetStreamFailed)?;
