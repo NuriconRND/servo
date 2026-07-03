@@ -3,31 +3,39 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::rust::HandleObject;
+use js::rust::{HandleObject, MutableHandleValue};
 use script_bindings::reflector::reflect_dom_object_with_proto_and_cx;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::RTCTrackEventBinding::{self, RTCTrackEventMethods};
 use crate::dom::bindings::error::Fallible;
+use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
+use crate::dom::mediastream::MediaStream;
 use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::window::Window;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
 pub(crate) struct RTCTrackEvent {
     event: Event,
     track: Dom<MediaStreamTrack>,
+    streams: Vec<Dom<MediaStream>>,
+    #[ignore_malloc_size_of = "mozjs"]
+    cached_streams: CachedFrozenArray,
 }
 
 impl RTCTrackEvent {
-    fn new_inherited(track: &MediaStreamTrack) -> RTCTrackEvent {
+    fn new_inherited(track: &MediaStreamTrack, streams: &[DomRoot<MediaStream>]) -> RTCTrackEvent {
         RTCTrackEvent {
             event: Event::new_inherited(),
             track: Dom::from_ref(track),
+            streams: streams.iter().map(|stream| Dom::from_ref(&**stream)).collect(),
+            cached_streams: CachedFrozenArray::new(),
         }
     }
 
@@ -38,10 +46,12 @@ impl RTCTrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &MediaStreamTrack,
+        streams: &[DomRoot<MediaStream>],
     ) -> DomRoot<RTCTrackEvent> {
-        Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, track)
+        Self::new_with_proto(cx, window, None, type_, bubbles, cancelable, track, streams)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         cx: &mut js::context::JSContext,
         window: &Window,
@@ -50,9 +60,10 @@ impl RTCTrackEvent {
         bubbles: bool,
         cancelable: bool,
         track: &MediaStreamTrack,
+        streams: &[DomRoot<MediaStream>],
     ) -> DomRoot<RTCTrackEvent> {
         let trackevent = reflect_dom_object_with_proto_and_cx(
-            Box::new(RTCTrackEvent::new_inherited(track)),
+            Box::new(RTCTrackEvent::new_inherited(track, streams)),
             window,
             proto,
             cx,
@@ -82,12 +93,23 @@ impl RTCTrackEventMethods<crate::DomTypeHolder> for RTCTrackEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.track,
+            &init.streams,
         ))
     }
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtctrackevent-track>
     fn Track(&self) -> DomRoot<MediaStreamTrack> {
         DomRoot::from_ref(&*self.track)
+    }
+
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtctrackevent-streams>
+    fn Streams(&self, context: JSContext, can_gc: CanGc, retval: MutableHandleValue) {
+        self.cached_streams.get_or_init(
+            || self.streams.iter().map(|stream| stream.as_rooted()).collect(),
+            context,
+            retval,
+            can_gc,
+        );
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>

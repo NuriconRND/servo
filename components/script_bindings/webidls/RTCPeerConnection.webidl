@@ -21,7 +21,7 @@ interface RTCPeerConnection : EventTarget {
     readonly attribute RTCSignalingState      signalingState;
     readonly attribute RTCIceGatheringState   iceGatheringState;
     readonly attribute RTCIceConnectionState  iceConnectionState;
-    // readonly attribute RTCPeerConnectionState connectionState;
+    readonly attribute RTCPeerConnectionState connectionState;
     // readonly attribute boolean?               canTrickleIceCandidates;
     // static sequence<RTCIceServer>      getDefaultIceServers();
     // RTCConfiguration                   getConfiguration();
@@ -33,7 +33,7 @@ interface RTCPeerConnection : EventTarget {
              attribute EventHandler           onsignalingstatechange;
              attribute EventHandler           oniceconnectionstatechange;
              attribute EventHandler           onicegatheringstatechange;
-    //          attribute EventHandler           onconnectionstatechange;
+             attribute EventHandler           onconnectionstatechange;
 
     // removed from spec, but still shipped by browsers
     undefined addStream (MediaStream stream);
@@ -104,6 +104,15 @@ enum RTCIceConnectionState {
     "disconnected",
     "failed",
     "closed"
+};
+
+enum RTCPeerConnectionState {
+    "closed",
+    "failed",
+    "disconnected",
+    "new",
+    "connecting",
+    "connected"
 };
 
 enum RTCSignalingState {

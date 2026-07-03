@@ -20,14 +20,15 @@ use servo_media::webrtc::{
     IceConnectionState, SdpType, SessionDescription, SignalingState, WebRtcController,
     WebRtcSignaller,
 };
+use stylo_atoms::Atom;
 
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::RTCDataChannelBinding::RTCDataChannelInit;
 use crate::dom::bindings::codegen::Bindings::RTCIceCandidateBinding::RTCIceCandidateInit;
 use crate::dom::bindings::codegen::Bindings::RTCPeerConnectionBinding::{
     RTCAnswerOptions, RTCBundlePolicy, RTCConfiguration, RTCIceConnectionState,
-    RTCIceGatheringState, RTCOfferOptions, RTCPeerConnectionMethods, RTCRtpTransceiverInit,
-    RTCSignalingState,
+    RTCIceGatheringState, RTCOfferOptions, RTCPeerConnectionMethods, RTCPeerConnectionState,
+    RTCRtpTransceiverInit, RTCSignalingState,
 };
 use crate::dom::bindings::codegen::Bindings::RTCSessionDescriptionBinding::{
     RTCSdpType, RTCSessionDescriptionInit, RTCSessionDescriptionMethods,
@@ -269,6 +270,12 @@ impl RTCPeerConnection {
             return;
         }
         let track = MediaStreamTrack::new(cx, &self.global(), id, ty);
+        // Expose the track inside a MediaStream via `RTCTrackEvent.streams`. Pages commonly
+        // read `event.streams[0]` (e.g. `event.streams[0] ?? new MediaStream([event.track])`);
+        // without a `streams` array that destructuring throws and the `track` event handler
+        // never runs.
+        let stream = MediaStream::new(cx, &self.global());
+        stream.add_track(&track);
         let event = RTCTrackEvent::new(
             cx,
             self.global().as_window(),
@@ -276,6 +283,7 @@ impl RTCPeerConnection {
             false,
             false,
             &track,
+            &[stream],
         );
         event.upcast::<Event>().fire(cx, self.upcast());
     }
@@ -419,6 +427,21 @@ impl RTCPeerConnection {
             CanGc::from_cx(cx),
         );
         event.upcast::<Event>().fire(cx, self.upcast());
+
+        // We derive `connectionState` from the ICE connection state (Servo has no separate
+        // DTLS transport state), so a change here is also a `connectionState` change. Fire
+        // `connectionstatechange` so pages that gate on `connectionState === "connected"`
+        // (rather than the ICE state) observe the transition.
+        let connection_state_event = Event::new(
+            &self.global(),
+            Atom::from("connectionstatechange"),
+            EventBubbles::DoesNotBubble,
+            EventCancelable::NotCancelable,
+            CanGc::from_cx(cx),
+        );
+        connection_state_event
+            .upcast::<Event>()
+            .fire(cx, self.upcast());
     }
 
     fn update_signaling_state(&self, cx: &mut js::context::JSContext, state: SignalingState) {
@@ -525,6 +548,13 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
         iceconnectionstatechange,
         GetOniceconnectionstatechange,
         SetOniceconnectionstatechange
+    );
+
+    // https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-onconnectionstatechange
+    event_handler!(
+        connectionstatechange,
+        GetOnconnectionstatechange,
+        SetOnconnectionstatechange
     );
 
     // https://w3c.github.io/webrtc-pc/#dom-rtcpeerconnection-icegatheringstatechange
@@ -737,6 +767,24 @@ impl RTCPeerConnectionMethods<crate::DomTypeHolder> for RTCPeerConnection {
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-iceconnectionstate>
     fn IceConnectionState(&self) -> RTCIceConnectionState {
         self.ice_connection_state.get()
+    }
+
+    /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-connectionstate>
+    ///
+    /// Servo's backend does not expose a separate DTLS transport state, so we derive the
+    /// aggregate `connectionState` from the ICE connection state. This is enough for pages
+    /// that gate on `connectionState === "connected"` to make progress.
+    fn ConnectionState(&self) -> RTCPeerConnectionState {
+        match self.ice_connection_state.get() {
+            RTCIceConnectionState::New => RTCPeerConnectionState::New,
+            RTCIceConnectionState::Checking => RTCPeerConnectionState::Connecting,
+            RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
+                RTCPeerConnectionState::Connected
+            },
+            RTCIceConnectionState::Disconnected => RTCPeerConnectionState::Disconnected,
+            RTCIceConnectionState::Failed => RTCPeerConnectionState::Failed,
+            RTCIceConnectionState::Closed => RTCPeerConnectionState::Closed,
+        }
     }
 
     /// <https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-signalingstate>

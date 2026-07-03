@@ -36,6 +36,7 @@
 // gst-plugins-bad
 "gstaudiobuffersplit",
 "gstdtls",
+"gstsrtp",
 "gstid3tag",
 "gstproxy",
 "gstvideoparsersbad",

@@ -9,8 +9,8 @@ interface RTCTrackEvent : Event {
     [Throws] constructor(DOMString type, RTCTrackEventInit eventInitDict);
     // readonly attribute RTCRtpReceiver           receiver;
     readonly attribute MediaStreamTrack         track;
-    // [SameObject]
-    // readonly attribute FrozenArray<MediaStream> streams;
+    /* [SameObject] */
+    readonly attribute /* FrozenArray<MediaStream> */ any streams;
     // readonly attribute RTCRtpTransceiver        transceiver;
 };
 
@@ -18,6 +18,6 @@ interface RTCTrackEvent : Event {
 dictionary RTCTrackEventInit : EventInit {
     // required RTCRtpReceiver        receiver;
     required MediaStreamTrack      track;
-             // sequence<MediaStream> streams = [];
+             sequence<MediaStream> streams = [];
     // required RTCRtpTransceiver     transceiver;
 };

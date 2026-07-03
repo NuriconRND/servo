@@ -87,6 +87,13 @@ pub struct GStreamerWebRtcController {
     _main_loop: glib::MainLoop,
     data_channels: Arc<Mutex<HashMap<DataChannelId, DataChannelEventTarget>>>,
     next_data_channel_id: Arc<AtomicUsize>,
+    /// When we answer a remote offer as a pure receiver, webrtcbin does not reliably
+    /// build a receive chain for the offered m-lines on its own (it logs "did not find
+    /// compatible transceiver" and never exposes a src pad even though RTP arrives and
+    /// decrypts). Pre-adding a recvonly transceiver per offered m-line fixes this. This
+    /// flag ensures we only do it once per connection so renegotiation does not duplicate
+    /// transceivers.
+    recv_transceivers_added: bool,
 }
 
 impl WebRtcControllerBackend for GStreamerWebRtcController {
@@ -364,6 +371,9 @@ impl GStreamerWebRtcController {
         if description_type == DescriptionType::Remote {
             self.remote_offer_generation += 1;
             self.store_remote_mline_info(&sdp);
+            if desc.type_ == SdpType::Offer {
+                self.ensure_recv_transceivers(&sdp);
+            }
         }
         let answer = gstreamer_webrtc::WebRTCSessionDescription::new(ty, sdp);
         let thread = self.thread.clone();
@@ -426,6 +436,75 @@ impl GStreamerWebRtcController {
                     .expect("Gstreamer provided noninteger format"),
             });
         }
+    }
+
+    /// Pre-add a `recvonly` transceiver for every media line in a remote offer that the
+    /// remote intends to send, but only when we have no local streams to send (pure
+    /// receiver). Without this, webrtcbin accepts the offer in its answer yet never builds
+    /// a receive chain for it: incoming RTP is decrypted and demuxed by payload type, but
+    /// no src pad is ever exposed (webrtcbin logs "did not find compatible transceiver").
+    /// Pre-adding a matching recvonly transceiver makes webrtcbin associate the offered
+    /// m-line with it and build the depayloader/decode chain. Done at most once per
+    /// connection so renegotiation does not duplicate transceivers.
+    fn ensure_recv_transceivers(&mut self, sdp: &gstreamer_sdp::SDPMessage) {
+        if self.recv_transceivers_added {
+            return;
+        }
+        // The send path links local streams to sink pads itself; only act as a pure receiver.
+        if !self.streams.is_empty() || !self.pending_streams.is_empty() {
+            return;
+        }
+
+        for media in sdp.medias() {
+            // Data channels and media the remote will not send need no receive transceiver.
+            if media.media() == Some("application") {
+                continue;
+            }
+            if media.attribute_val("recvonly").is_some() ||
+                media.attribute_val("inactive").is_some()
+            {
+                continue;
+            }
+
+            let mut caps = gstreamer::Caps::new_empty();
+            let mut is_datachannel = false;
+            {
+                let Some(caps_mut) = caps.get_mut() else {
+                    continue;
+                };
+                for format in media.formats() {
+                    if format == "webrtc-datachannel" {
+                        is_datachannel = true;
+                        break;
+                    }
+                    let Ok(pt) = format.parse::<i32>() else {
+                        continue;
+                    };
+                    if let Some(format_caps) = media.caps_from_media(pt) {
+                        caps_mut.append(format_caps);
+                    }
+                }
+                for structure in caps_mut.iter_mut() {
+                    // webrtcbin needs application/x-rtp; caps_from_media yields
+                    // application/x-unknown which fails to intersect.
+                    structure.set_name("application/x-rtp");
+                }
+            }
+            if is_datachannel || caps.is_empty() {
+                continue;
+            }
+
+            self.webrtc
+                .emit_by_name::<gstreamer_webrtc::WebRTCRTPTransceiver>(
+                    "add-transceiver",
+                    &[
+                        &gstreamer_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
+                        &caps,
+                    ],
+                );
+        }
+
+        self.recv_transceivers_added = true;
     }
 
     /// Streams need to be linked to the correct pads, so we buffer them up until we know enough
@@ -658,8 +737,16 @@ pub fn construct(
     pipeline.set_start_time(gstreamer::ClockTime::NONE);
     pipeline.set_base_time(*BACKEND_BASE_TIME);
     pipeline.use_clock(Some(&gstreamer::SystemClock::obtain()));
+    // 지터버퍼 latency(ms). webrtcbin 기본은 200ms인데, 로컬/LAN 캡처에선 그 200ms가
+    // 그대로 고정 지연으로 얹힌다. 기본 0 = 무버퍼(최저 지연). 네트워크 지터로 프레임이
+    // 끊기면 SERVO_WEBRTC_JITTER_LATENCY_MS 로 올려서 튜닝.
+    let jitter_latency_ms: u32 = std::env::var("SERVO_WEBRTC_JITTER_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let webrtc = gstreamer::ElementFactory::make("webrtcbin")
         .name("sendrecv")
+        .property("latency", jitter_latency_ms)
         .build()
         .map_err(|error| format!("webrtcbin element not found: {error:?}"))?;
     let mut controller = GStreamerWebRtcController {
@@ -678,6 +765,7 @@ pub fn construct(
         _main_loop: main_loop,
         data_channels: Arc::new(Mutex::new(HashMap::new())),
         next_data_channel_id: Arc::new(AtomicUsize::new(0)),
+        recv_transceivers_added: false,
     };
     controller.start_pipeline()?;
     Ok(controller)
@@ -719,12 +807,32 @@ fn on_incoming_stream(
     let decodebin = gstreamer::ElementFactory::make("decodebin")
         .build()
         .unwrap();
-    let caps = pad.query_caps(None);
+    // The webrtcbin src pad may not expose a fixed "media" field in its caps at
+    // pad-added time (this varies between GStreamer versions). Prefer the negotiated
+    // caps, then search every structure for the field, and finally infer the media
+    // type from the RTP encoding-name so an unexpected caps shape never panics (which
+    // would otherwise tear down the whole browser process).
+    let caps = pad.current_caps().unwrap_or_else(|| pad.query_caps(None));
     let name = caps
-        .structure(0)
-        .unwrap()
-        .get::<String>("media")
-        .expect("Invalid 'media' field");
+        .iter()
+        .find_map(|structure| structure.get::<String>("media").ok())
+        .unwrap_or_else(|| {
+            let inferred = caps.iter().find_map(|structure| {
+                let encoding = structure.get::<String>("encoding-name").ok()?;
+                const AUDIO_ENCODINGS: &[&str] = &[
+                    "OPUS", "PCMA", "PCMU", "G722", "ISAC", "ILBC", "AMR", "AMR-WB", "SPEEX",
+                    "RED", "CN", "TELEPHONE-EVENT",
+                ];
+                let is_audio = AUDIO_ENCODINGS
+                    .iter()
+                    .any(|candidate| encoding.eq_ignore_ascii_case(candidate));
+                Some(if is_audio { "audio".to_owned() } else { "video".to_owned() })
+            });
+            inferred.unwrap_or_else(|| {
+                warn!("WebRTC incoming stream caps missing 'media' field: {caps:?}; defaulting to video");
+                "video".to_owned()
+            })
+        });
     let decodebin2 = decodebin.clone();
     decodebin.connect_pad_added({
         let pipeline_weak = pipe.downgrade();
