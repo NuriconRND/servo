@@ -20,6 +20,11 @@
   ANGLE 서피스 기반)을 쓸 수 없다. WebGL을 쓰는 페이지는 해당 캔버스만 실패하고 **앱은 계속
   동작**한다(이전엔 `PainterSurfmanDetails not found` 패닉이 paint/script 스레드로 전파돼 프로세스가
   죽었음 — graceful 실패로 변경). 비디오 월 워크로드(비디오/DOM)엔 무영향.
+- ✅ **비디오 성능 병목 수정** — 3-C 참조. 초기엔 d3d11이 GL보다 훨씬 느렸다(1080p 36비디오
+  ~5–8fps vs GL 60fps, 대화면 <0.5fps). 병목은 present가 아니라(present는 0.5ms로 빠름) **CPU 측
+  비디오 업로드**였고, `tex_sub_image_2d_pbo`의 프레임당 `.to_vec()` 이중 복사가 지배적이었다
+  (~340ms/s). 제거 후 1080p에서 수십 fps로 대폭 개선(해상도가 클수록 이득이 큼). 잔여 한계: 원본
+  프레임 업로드량 자체(~1GB/s)와 **36개 SW 디코드 CPU 경합**(별개 이슈). `WR_D3D11_PERF=1`로 진단.
 - ✅ **멀티-GPU 어댑터 선택 배선 완료**(5절). `--wall-all-tiles`에서 각 타일이 자기 디스플레이를
   구동하는 어댑터에 D3D11 디바이스를 바인딩한다. dev 장비(디스플레이 2개 모두 adapter 0)에서
   2타일 팬아웃 검증: `tile 0/1 -> adapter 0`, `Wall frame barrier ... ready=2/2`. **서로 다른 GPU
@@ -111,7 +116,26 @@ winit_wall.exe --backend gl    --wall-layout <1x1.json> --wall-all-tiles <page> 
 ```
 stderr에 초당 `Present perf: presents_per_s=.. avg_present_ms=..` 이 찍힌다. 창을 닫아 종료해야
 버퍼가 flush된다(강제 kill 시 로그 유실). 미디어 페이지(비디오 그리드)로 두 백엔드를 비교하면
-ANGLE 경로 대비 네이티브 D3D11의 present/합성 비용 차이를 볼 수 있다.
+ANGLE 경로 대비 네이티브 D3D11의 성능 차이를 볼 수 있다.
+
+### 3-C. 비디오 월 성능 병목 진단 (WR_D3D11_PERF) — 참고
+초기엔 d3d11이 GL보다 훨씬 느렸다. 핵심 관찰: **`presents_per_s`는 낮은데 `avg_present_ms`는 0.5ms로
+빠르다** → 병목은 `present()`(스왑체인)나 GPU가 아니라 그 앞의 `webview.paint_target()`(= WebRender가
+wr-d3d11 GL 에뮬레이션으로 드로우를 발행하는 **CPU 경로**)다. GPU가 노는데 CPU가 프레임당 ~120ms를
+쓴다는 뜻.
+- `WR_D3D11_PERF=1` 환경변수로 wr-d3d11이 초당 CPU 비용 분해를 stderr에 찍는다:
+  `wr-d3d11 PERF/s: uploads=N (MB, UpdateSubresource ms) tex_creates=N draws=N`. (기본 off, off일 땐
+  atomic 로드 1회라 사실상 무비용.)
+- 실측(1080p 36비디오, ~5fps): 비디오 업로드 ~1GB/s, 그중 `tex_sub_image_2d_pbo`의 프레임당
+  `.to_vec()` 이중 복사가 **~340ms/s**(UpdateSubresource ~150ms/s보다 큼). → 그 복사 제거(그림자
+  슬라이스를 한 borrow 안에서 UpdateSubresource로 직접 전달) 후 **수십 fps로 개선**. 해상도가 클수록
+  이득이 크다(제거한 복사가 업로드 바이트에 비례).
+- 잔여 한계: ①원본 프레임 업로드량 자체(~1GB/s, ANGLE도 하지만 async PBO로 더 효율적) ②36개 SW
+  H264 디코드의 CPU 경합(백엔드 무관, 별개 이슈 — video-grid 성능 메모 참조). 추가 개선 여지:
+  업로드량 감소(영역 업로드/미변경 프레임 재업로드 회피), UpdateSubresource 대신 dynamic+Map 링 등.
+- 결론(조사 목적): **ANGLE 오버헤드는 병목이 아니다.** 순진한 D3D11 GL-에뮬레이션(wr-d3d11)은 비디오
+  업로드에서 오히려 ANGLE보다 불리하며, 진짜 고성능 경로는 WebRender 업로드 모델을 우회하는
+  zero-copy/직접 D3D11(= dx_wall_probe가 이미 입증)이다.
 
 ### 2-E. Y 규약(상하 반전) 처리 — 참고
 초기 통합에서 D3D11 출력이 **상하 반전**됐다. 원인: `wr-d3d11`은 렌더 타깃을 내부적으로 GL
