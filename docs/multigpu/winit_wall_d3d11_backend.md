@@ -12,10 +12,18 @@
 - ✅ 렌더 정확도: 색상(4색 사분면), 텍스트/폰트, 안티앨리어싱, 드롭섀도우, 반투명 원까지
   GL 백엔드와 동일하게 렌더된다. (`tests/html/dx_render_check.html` 기준 백버퍼 리드백 비교)
 - ✅ 상하 방향(Y 규약) 버그 수정 완료 — 아래 2-D 참조.
-- ⚠️ **알려진 충실도 갭**: `border-radius:50%`(원형/둥근 모서리 클립)가 적용되지 않아 중앙 흰 원이
-  **사각형**으로 렌더된다(색/텍스트/섀도우/AA/반투명은 정상). 원인은 `wr-d3d11`의 클립/라운드
-  브러시 셰이더 번역(Servo 통합이 아님). 비디오 월 워크로드(사각 타일·비디오)에는 무영향이나,
-  둥근 UI 요소를 쓰는 페이지에선 추후 조사 필요. → `webrender_d3d11_native/wr-d3d11` 셰이더 경로.
+- ⚠️ **알려진 충실도 갭 (근본 원인 규명 완료)**: `border-radius:50%` 원이 **사각형**으로 렌더된다
+  (색/텍스트/섀도우/AA/반투명은 정상). 원인 = `ps_quad_mask` 셰이더의 **VS→FS varying 시맨틱
+  불일치**. glslang이 VS/FS를 독립 컴파일하며 각 스테이지의 varying 집합대로 로케이션을 따로
+  배정 → spirv-cross가 그 로케이션으로 HLSL TEXCOORD 시맨틱을 굳힌다. VS는 FS가 안 쓰는 출력
+  (vTransformBounds/v_color/vLocalPos)을 앞쪽에 두어 `v_clip_radii`가 **VS out=TEXCOORD5**,
+  FS는 자기 입력만 촘촘히 배치해 **FS in=TEXCOORD2**가 된다. D3D11은 시맨틱 이름으로 링크하므로
+  FS의 `v_clip_radii`(TEXCOORD2)는 VS가 TEXCOORD2에 넣은 `v_flags`(작은 정수)를 받아 radii≈0 →
+  `sd_round_box`가 축정렬 박스(사각형)가 된다. (GL은 varying을 이름으로 링크해 정상.) 샘플러
+  바인딩은 정상(런타임 진단으로 `sGpuBufferF` VS unit=10/tex bound 확인 — 서브에이전트 초기 가설
+  반증). 수정 = `wr-d3d11` 셰이더 번역이 VS out/FS in varying을 **이름 기준 동일 시맨틱**으로 맞추기
+  (예: 공유 GLSL varying 선언에 소스 순서 기반 `layout(location=N)` 주입 → 두 스테이지 로케이션 일치).
+  전 셰이더 varying 처리에 영향 → 넓은 재검증 필요. 비디오 월(사각 타일·비디오)엔 무영향.
 - ✅ **멀티-GPU 어댑터 선택 배선 완료**(5절). `--wall-all-tiles`에서 각 타일이 자기 디스플레이를
   구동하는 어댑터에 D3D11 디바이스를 바인딩한다. dev 장비(디스플레이 2개 모두 adapter 0)에서
   2타일 팬아웃 검증: `tile 0/1 -> adapter 0`, `Wall frame barrier ... ready=2/2`. **서로 다른 GPU
