@@ -51,7 +51,8 @@ const DEFAULT_URL: &str = "https://demo.servo.org/experiments/twgl-tunnel/";
 enum Backend {
     /// surfman/ANGLE OpenGL (the default `WindowRenderingContext`).
     Gl,
-    /// Native D3D11 via `wr-d3d11` (`Dx11RenderingContext`, Windows-only, single tile).
+    /// Native D3D11 via `wr-d3d11` (`Dx11RenderingContext`, Windows-only). Each tile binds its
+    /// device to the adapter that drives its display, so `--wall-all-tiles` fans out per GPU.
     D3d11,
 }
 
@@ -92,7 +93,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
                     .ok_or("--wall-tile-index requires an integer")?;
             },
             // `--backend gl|d3d11` selects the tile rendering-context backend. `gl` (default)
-            // is surfman/ANGLE; `d3d11` is the native wr-d3d11 backend (Windows, single tile).
+            // is surfman/ANGLE; `d3d11` is the native wr-d3d11 backend (Windows; per-tile GPU).
             "--backend" => {
                 let value = args.next().ok_or("--backend requires gl|d3d11")?;
                 backend = match value.as_str() {
@@ -345,17 +346,6 @@ impl ApplicationHandler<WakerEvent> for App {
             vec![config.tile_index]
         };
 
-        // The native D3D11 backend only wires a single tile/GPU for now; per-adapter
-        // fan-out is a follow-up. Restrict to the first tile and warn.
-        if config.backend == Backend::D3d11 && tile_indices.len() > 1 {
-            eprintln!(
-                "warning: --backend d3d11 currently supports a single tile; rendering only \
-                 tile {} (multi-tile D3D11 fan-out is a follow-up)",
-                tile_indices[0]
-            );
-            tile_indices.truncate(1);
-        }
-
         // 1) Resolve the physical display topology once. Each tile's `display` is a spatial
         //    index (top-left = 0, row-major); the GPU is the adapter that drives that display.
         let spatial = spatial_order(&enumerate_display_topology());
@@ -480,18 +470,27 @@ impl ApplicationHandler<WakerEvent> for App {
                 Backend::D3d11 => {
                     #[cfg(target_os = "windows")]
                     {
-                        // Native D3D11 binds to the swapchain's default adapter for now;
-                        // `gpu_index` (per-display adapter selection) is a follow-up.
-                        let _ = gpu_index;
                         let hwnd = match window_handle.as_raw() {
                             RawWindowHandle::Win32(handle) => handle.hwnd.get(),
                             other => panic!(
                                 "--backend d3d11 requires a Win32 window handle, got {other:?}"
                             ),
                         };
+                        // Bind this tile's D3D11 device to the adapter that drives its display
+                        // (multi-GPU: one device per driving GPU). Without topology, fall back to
+                        // the swapchain's default adapter.
+                        let context = match gpu_index {
+                            Some(adapter_index) => Dx11RenderingContext::new_on_adapter(
+                                hwnd,
+                                window.inner_size(),
+                                adapter_index,
+                            ),
+                            None => Dx11RenderingContext::new(hwnd, window.inner_size()),
+                        };
                         Rc::new(
-                            Dx11RenderingContext::new(hwnd, window.inner_size())
-                                .expect("Could not create D3D11 RenderingContext for tile window"),
+                            context.expect(
+                                "Could not create D3D11 RenderingContext for tile window",
+                            ),
                         )
                     }
                     #[cfg(not(target_os = "windows"))]

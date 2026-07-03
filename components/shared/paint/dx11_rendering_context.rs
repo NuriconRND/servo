@@ -47,19 +47,55 @@ pub struct Dx11RenderingContext {
     /// so we own the D24S8 texture and recreate it on every `resize`.
     depth: RefCell<Option<ID3D11Texture2D>>,
     size: Cell<PhysicalSize<u32>>,
+    /// The DXGI adapter index this context was bound to via [`Dx11RenderingContext::new_on_adapter`],
+    /// if any. Reported through [`RenderingContext::requested_gpu_index`] for diagnostics.
+    requested_gpu_index: Option<usize>,
 }
 
 impl Dx11RenderingContext {
-    /// Create a native D3D11 rendering context for a window.
+    /// Create a native D3D11 rendering context for a window on the default adapter.
     ///
     /// `hwnd` is the raw Win32 window handle (as an `isize`, e.g. from
     /// `RawWindowHandle::Win32`), so callers don't need to depend on the `windows` crate.
     pub fn new(hwnd: isize, size: PhysicalSize<u32>) -> Result<Self, String> {
+        let ctx = D3d11Context::new_hardware()
+            .map_err(|error| format!("D3D11 hardware device creation failed: {error:?}"))?;
+        Self::from_context(ctx, hwnd, size, None)
+    }
+
+    /// Create a native D3D11 rendering context bound to a specific DXGI adapter (multi-GPU:
+    /// one device per driving GPU). `adapter_index` is a `IDXGIFactory1::EnumAdapters1` index,
+    /// which matches the `adapter_index` resolved from the display topology in the embedder.
+    pub fn new_on_adapter(
+        hwnd: isize,
+        size: PhysicalSize<u32>,
+        adapter_index: usize,
+    ) -> Result<Self, String> {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+            .map_err(|error| format!("CreateDXGIFactory1 failed: {error:?}"))?;
+        let adapter: IDXGIAdapter1 = unsafe { factory.EnumAdapters1(adapter_index as u32) }
+            .map_err(|error| format!("EnumAdapters1({adapter_index}) failed: {error:?}"))?;
+        let adapter: IDXGIAdapter = adapter
+            .cast()
+            .map_err(|error| format!("IDXGIAdapter1 -> IDXGIAdapter cast failed: {error:?}"))?;
+        let ctx = D3d11Context::new_hardware_on_adapter(&adapter).map_err(|error| {
+            format!("D3D11 device creation on adapter {adapter_index} failed: {error:?}")
+        })?;
+        Self::from_context(ctx, hwnd, size, Some(adapter_index))
+    }
+
+    /// Build the swapchain + `Gld3d11` + default target for an already-created device. Shared by
+    /// [`Self::new`] and [`Self::new_on_adapter`]. The swapchain is created from the device's own
+    /// DXGI factory, so it presents on whichever adapter `ctx` was created on.
+    fn from_context(
+        ctx: D3d11Context,
+        hwnd: isize,
+        size: PhysicalSize<u32>,
+        requested_gpu_index: Option<usize>,
+    ) -> Result<Self, String> {
         let width = size.width.max(1);
         let height = size.height.max(1);
 
-        let ctx = D3d11Context::new_hardware()
-            .map_err(|error| format!("D3D11 hardware device creation failed: {error:?}"))?;
         let dxgi_device: IDXGIDevice = ctx
             .device
             .cast()
@@ -93,6 +129,7 @@ impl Dx11RenderingContext {
             swapchain,
             depth: RefCell::new(None),
             size: Cell::new(PhysicalSize::new(width, height)),
+            requested_gpu_index,
         };
         context.configure_target(width, height);
         Ok(context)
@@ -247,6 +284,10 @@ impl RenderingContext for Dx11RenderingContext {
     fn make_current(&self) -> Result<(), Error> {
         // The D3D11 immediate context is always current on its owning thread; nothing to do.
         Ok(())
+    }
+
+    fn requested_gpu_index(&self) -> Option<usize> {
+        self.requested_gpu_index
     }
 
     fn surface_origin_is_top_left(&self) -> bool {

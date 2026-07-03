@@ -16,7 +16,11 @@
   **사각형**으로 렌더된다(색/텍스트/섀도우/AA/반투명은 정상). 원인은 `wr-d3d11`의 클립/라운드
   브러시 셰이더 번역(Servo 통합이 아님). 비디오 월 워크로드(사각 타일·비디오)에는 무영향이나,
   둥근 UI 요소를 쓰는 페이지에선 추후 조사 필요. → `webrender_d3d11_native/wr-d3d11` 셰이더 경로.
-- 단일 타일 / 단일 GPU만 배선됨(멀티-GPU 어댑터 선택은 미배선 — 5절).
+- ✅ **멀티-GPU 어댑터 선택 배선 완료**(5절). `--wall-all-tiles`에서 각 타일이 자기 디스플레이를
+  구동하는 어댑터에 D3D11 디바이스를 바인딩한다. dev 장비(디스플레이 2개 모두 adapter 0)에서
+  2타일 팬아웃 검증: `tile 0/1 -> adapter 0`, `Wall frame barrier ... ready=2/2`. **서로 다른 GPU
+  (adapter 1+)로의 실제 cross-GPU 검증은 대상 하드웨어에서 사용자가 진행**(dev 장비엔 활성 출력이
+  GPU 0에만 있음 — 동일 코드 경로에 adapter_index만 다름).
 
 빌드 산출물: `servo/target/release/examples/winit_wall.exe`
 빌드 커맨드:
@@ -101,46 +105,37 @@ WebRender의 `WebRenderOptions::surface_origin_is_top_left` 가 기본 `false`(G
   gl/d3d11만 바꿔 present_ms 차이를 볼 것.
 - 검증은 사용자(대화면 장비)가 진행. 개발 장비에서는 1920×1080으로만 정합성 확인.
 
-## 5. 멀티-GPU / 멀티 타일로 확장 (현재 미배선 — 필요한 작업)
+## 5. 멀티-GPU / 멀티 타일 (구현 완료 — 사용법 & cross-GPU 검증)
 
-현재 D3D11 백엔드는 **스왑체인 기본 어댑터**에 바인딩되고 `--wall-all-tiles`에서 타일 0만 렌더한다
-(`winit_wall.rs`의 D3d11 분기가 `gpu_index`를 무시). 타일별 지정 GPU로 확장하려면:
+`--backend d3d11 --wall-all-tiles`가 이제 **각 타일을 자기 디스플레이 구동 어댑터에 바인딩**한다.
+사용법:
+```
+winit_wall.exe --backend d3d11 --wall-layout <2x1|2x2|3x1.json> --wall-all-tiles <page>
+```
+각 타일 창은 자기 디스플레이의 desktop 원점에 뜨고, 그 디스플레이를 구동하는 GPU에 D3D11 디바이스를
+만들어 그 어댑터의 스왑체인으로 direct present한다. 로그에 `tile N: display D -> ... adapter A` 와
+`Wall frame barrier ... ready=k/k` 가 찍히면 정상.
 
-1. **어댑터 지정 D3D11 디바이스 생성** — `webrender_d3d11_native/wr-d3d11/src/context.rs`:
-   현재 `D3d11Context::create()`는 `D3D11CreateDevice(None, HARDWARE, ...)`로 기본 어댑터를 쓴다.
-   지정 어댑터용 생성자 추가:
-   ```rust
-   pub fn new_hardware_on_adapter(adapter: &IDXGIAdapter) -> windows::core::Result<Self> {
-       // 어댑터를 명시하면 driver_type 은 반드시 UNKNOWN 이어야 함
-       Self::create_on(Some(adapter), D3D_DRIVER_TYPE_UNKNOWN)
-   }
-   ```
-   (`create`를 `create_on(adapter: Option<&IDXGIAdapter>, driver_type)`로 일반화하고 첫 인자에 전달.)
+배선 지점(참고):
+- `wr-d3d11/src/context.rs`: `D3d11Context::new_hardware_on_adapter(&IDXGIAdapter)` (driver_type =
+  UNKNOWN — 어댑터 명시 시 필수). `create(adapter: Option<&IDXGIAdapter>, driver_type)` 로 일반화됨.
+- `dx11_rendering_context.rs`: `Dx11RenderingContext::new_on_adapter(hwnd, size, adapter_index)` —
+  `CreateDXGIFactory1 → EnumAdapters1(adapter_index) → new_hardware_on_adapter`. 스왑체인은 그
+  디바이스의 DXGI 팩토리로 생성되므로 해당 어댑터로 present된다. `requested_gpu_index()`로 인덱스 보고.
+- `winit_wall.rs` D3d11 분기: 토폴로지가 준 `gpu_index(=disp.adapter_index)`가 `Some`이면
+  `new_on_adapter`, 없으면(토폴로지 부재) `new`(기본 어댑터)로 폴백.
 
-2. **LUID/인덱스로 어댑터 열거** — `winit_wall.rs`는 이미 타일→디스플레이→어댑터 인덱스/ LUID를
-   `spatial_order(enumerate_display_topology())` 로 구한다(`disp.adapter_index`, `disp.luid`).
-   `IDXGIFactory1::EnumAdapters1(adapter_index)` 또는 LUID 매칭으로 `IDXGIAdapter`를 얻어
-   위 생성자에 넘긴다.
-
-3. **Dx11RenderingContext::new 확장** — `dx11_rendering_context.rs`:
-   현재 `new(hwnd, size)`는 내부에서 `D3d11Context::new_hardware()`(기본 어댑터)를 호출한다.
-   `new_on_adapter(hwnd, size, adapter_index)` 를 추가해 2)의 어댑터로 디바이스를 만들고,
-   그 디바이스에서 `IDXGIFactory2`를 얻어(현재 코드가 이미 device→adapter→factory 캐스팅을 함)
-   스왑체인을 생성한다. **스왑체인은 백버퍼를 구동하는 그 어댑터의 팩토리로 만들어야** 해당
-   모니터로 direct present된다.
-
-4. **winit_wall D3d11 분기 배선** — `winit_wall.rs` 412-444 근처:
-   `let _ = gpu_index;` 를 지우고 `gpu_index`(= `disp.adapter_index`)를 `new_on_adapter`에 전달.
-   멀티 타일 경고(292 근처)와 tile 0 한정 로직을 제거해 모든 타일 창을 각자 어댑터로 생성.
-   각 타일은 자기 스레드/컨텍스트에서 make_current→paint→present (D3D11 immediate context는
-   디바이스별로 독립이므로 GL처럼 전역 current 충돌 없음).
-
-5. **RenderingContext::requested_gpu_index()** 는 이미 트레잇에 있으니, Dx11 컨텍스트가 이를
-   `Some(adapter_index)`로 반환하도록 오버라이드하면 진단 로그/일관성에 도움(선택).
+**cross-GPU 실검증(사용자 하드웨어 몫)**: dev 장비는 활성 출력이 GPU 0에만 있어 두 디스플레이가 모두
+adapter 0으로 잡힌다(2타일 팬아웃은 검증됨, but 동일 GPU). 서로 다른 물리 GPU가 각 모니터를 구동하는
+대상 장비에서 실행하면 `tile 0 -> adapter 0`, `tile 1 -> adapter 1` 처럼 서로 다른 어댑터가 찍혀야
+하고, 각 GPU가 자기 타일을 독립 렌더/present한다. LUID 불일치 경고가 뜨면 토폴로지의 어댑터 인덱스와
+`EnumAdapters1` 순서가 어긋난 것 — 그 경우 인덱스 대신 LUID 매칭으로 어댑터를 고르도록
+`new_on_adapter`를 확장(팩토리에서 EnumAdapters1을 돌며 `GetDesc1().AdapterLuid` 비교).
 
 주의:
 - 서로 다른 GPU의 D3D11 디바이스 간에는 텍스처를 직접 공유하지 않는다(v1 비목표: cross-GPU 복사).
   각 타일은 자기 GPU에서 전체 WebRender 인스턴스를 독립 구동한다(현 팬아웃 모델과 동일 철학).
+  D3D11 immediate context는 디바이스별로 독립이라 GL처럼 전역 current 충돌이 없다.
 - 미디어(비디오)를 여러 GPU 타일에 표출하려면 CPU 프레임을 각 GPU에 업로드해야 한다
   (멀티-GPU 프레임 분산 메모 참조). 이는 백엔드(GL/D3D11) 무관한 별도 경로.
 
