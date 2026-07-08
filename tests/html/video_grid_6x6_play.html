@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>6x6 Video Wall</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  /* CSS Grid 대신 flex-wrap 사용: Servo grid 구현이 video 내재 크기(1920x1080)로
+     트랙 blowout 되는 문제 회피 (video_grid_6x6_perf.html과 동일 기법).
+     타일 크기는 JS에서 vw/vh로 명시 지정. */
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+  }
+  #grid video {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    object-fit: cover;
+    background: #000;
+  }
+  /* rAF 하트비트용 (사실상 안 보이는 2px 점) — 아래 스크립트 주석 참조 */
+  #hb {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    width: 2px;
+    height: 2px;
+    background: #000;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<div id="grid"></div>
+<div id="hb"></div>
+<script>
+  "use strict";
+
+  // ?grid=N 으로 N x N 조절 가능 (기본 6x6 = 36 타일)
+  const params = new URLSearchParams(location.search);
+  const n = parseInt(params.get("grid"), 10);
+  const N = Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : 6;
+  const TILE_COUNT = N * N;
+  const SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+
+  const grid = document.getElementById("grid");
+  const tileW = (100 / N) + "vw";
+  const tileH = (100 / N) + "vh";
+
+  // N x N 개의 독립 <video> 생성. 각 엘리먼트가 동일 파일을 개별 디코딩/루프 재생.
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const v = document.createElement("video");
+    v.muted = true;         // 자동재생 정책상 muted 필수
+    v.autoplay = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.style.width = tileW;
+    v.style.height = tileH;
+    v.src = SRC;
+    v.play().catch(() => {});
+    grid.appendChild(v);
+  }
+
+  // rAF 하트비트: 매 프레임 최소 DOM 변경으로 페이지를 '애니메이션 중' 상태로 유지.
+  // rAF가 없으면 Servo는 36개 비디오의 프레임 도착(~1080건/s)마다 개별 즉시-합성
+  // 경로(painter.rs update_images)를 타는데, 이 이벤트 폭주가 winit 이벤트 루프를
+  // 압도해 창 이동/포커스 같은 OS 메시지가 몇 분씩 굶주린다(창이 안 움직임/전면으로
+  // 안 옴). rAF가 활성이면 그 경로가 억제되고 일정한 합성 주기를 타므로(검증된
+  // video_grid_6x6_perf.html과 동일 동작) 하트비트로 항상 rAF를 돌린다.
+  // 주의: 빈 rAF 콜백은 페인트를 보장하지 않으므로 2px 점의 색을 매 프레임
+  // 미세하게 바꿔 실제 페인트를 강제한다 (perf 페이지의 stats 텍스트 갱신과 동일 역할).
+  const hb = document.getElementById("hb");
+  let hbFrame = 0;
+  (function heartbeat() {
+    hbFrame++;
+    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>
