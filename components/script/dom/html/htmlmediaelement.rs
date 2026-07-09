@@ -22,7 +22,10 @@ use ipc_channel::router::ROUTER;
 use js::context::JSContext;
 use js::realm::{AutoRealm, CurrentRealm};
 use layout_api::{MediaFrame, MediaFrameYuvFormat, MediaFrameYuvImage};
-use media::{GLPlayerMsg, GLPlayerMsgForward, RawVideoFrameExternalImages, WindowGLContext};
+use media::{
+    D3d11VideoFrameExternalImages, D3d11VideoFrameInfo, GLPlayerMsg, GLPlayerMsgForward,
+    RawVideoFrameExternalImages, WindowGLContext,
+};
 use net_traits::request::{Destination, RequestId};
 use net_traits::{
     CoreResourceThread, FetchMetadata, FilteredMetadata, NetworkError, ResourceFetchTiming,
@@ -40,8 +43,8 @@ use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
 use servo_media::player::video::{
-    VideoFrame, VideoFrameRenderer, VideoFrameYuvColorRange, VideoFrameYuvColorSpace,
-    VideoFrameYuvData, VideoFrameYuvFormat,
+    VideoFrame, VideoFrameD3D11Data, VideoFrameRenderer, VideoFrameYuvColorRange,
+    VideoFrameYuvColorSpace, VideoFrameYuvData, VideoFrameYuvFormat,
 };
 use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
 use servo_media::{ClientContextId, ServoMedia, SupportsMediaType};
@@ -282,6 +285,8 @@ pub(crate) struct MediaFrameRenderer {
     current_frame_holder: Option<FrameHolder>,
     #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
     yuv_external_ids: Option<MediaYuvExternalIds>,
+    #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
+    d3d11_external_id: Option<ExternalImageId>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
 }
@@ -307,6 +312,7 @@ impl MediaFrameRenderer {
             media_frame_summary_count: 0,
             current_frame_holder: None,
             yuv_external_ids: None,
+            d3d11_external_id: None,
             poster_frame: None,
         }
     }
@@ -413,6 +419,10 @@ impl MediaFrameRenderer {
             }
         }
 
+        if let Some(external_id) = self.d3d11_external_id.take() {
+            D3d11VideoFrameExternalImages::remove(external_id);
+        }
+
         if !updates.is_empty() {
             self.paint_api
                 .update_images(self.webview_id.into(), updates);
@@ -454,6 +464,15 @@ impl MediaFrameRenderer {
         let external_ids = MediaYuvExternalIds::new(yuv.format, &plane_ids)?;
         self.yuv_external_ids = Some(external_ids);
         Some(external_ids)
+    }
+
+    fn ensure_d3d11_external_id(&mut self) -> Option<ExternalImageId> {
+        if let Some(id) = self.d3d11_external_id {
+            return Some(id);
+        }
+        let id = D3d11VideoFrameExternalImages::allocate_id()?;
+        self.d3d11_external_id = Some(id);
+        Some(id)
     }
 
     fn generate_image_key(&self) -> Option<ImageKey> {
@@ -713,6 +732,121 @@ impl MediaFrameRenderer {
         self.paint_api
             .update_images(self.webview_id.into(), updates);
     }
+
+    fn render_d3d11_frame(
+        &mut self,
+        frame: VideoFrame,
+        d3d11: VideoFrameD3D11Data,
+        rendered_frame_count: u64,
+        frame_backend: &'static str,
+        inter_frame_ms: Option<f64>,
+        mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
+    ) {
+        let frame_width = frame.get_width();
+        let frame_height = frame.get_height();
+        let Some(external_id) = self.ensure_d3d11_external_id() else {
+            warn!("Dropping D3D11 media frame because external image ID is unavailable");
+            if !updates.is_empty() {
+                self.paint_api
+                    .update_images(self.webview_id.into(), updates);
+            }
+            return;
+        };
+
+        D3d11VideoFrameExternalImages::update(
+            external_id,
+            D3d11VideoFrameInfo {
+                shared_handle: d3d11.shared_handle,
+                ring_epoch: d3d11.ring_epoch,
+                width: frame_width,
+                height: frame_height,
+            },
+        );
+
+        let descriptor = ImageDescriptor::new(
+            frame_width,
+            frame_height,
+            ImageFormat::RGBA8,
+            ImageDescriptorFlags::empty(),
+        );
+        let image_data = SerializableImageData::External(ExternalImageData {
+            id: external_id,
+            channel_index: 0,
+            image_type: ExternalImageType::TextureHandle(ImageBufferKind::Texture2D),
+            normalized_uvs: false,
+        });
+
+        let image_update_for_log;
+        let image_key_for_log;
+
+        let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
+            current_frame.width == frame_width
+                && current_frame.height == frame_height
+                && current_frame.yuv.is_none()
+        });
+
+        if current_frame_is_compatible {
+            let current_frame = self
+                .current_frame
+                .as_ref()
+                .expect("Current frame should be present");
+            image_key_for_log = Some(current_frame.image_key);
+            updates.push(ImageUpdate::UpdateImage(
+                current_frame.image_key,
+                descriptor,
+                image_data,
+                None,
+            ));
+            image_update_for_log = "update";
+
+            self.current_frame_holder
+                .get_or_insert_with(|| FrameHolder::new(frame.clone()))
+                .set(frame);
+
+            if let Some(old_frame) = self.old_frame.take() {
+                Self::push_delete_frame_images(&mut updates, old_frame);
+            }
+        } else {
+            if let Some(current_frame) = self.current_frame.take() {
+                self.old_frame = Some(current_frame);
+            }
+            let Some(image_key) = self.generate_image_key() else {
+                return;
+            };
+            image_key_for_log = Some(image_key);
+            image_update_for_log = "add";
+            self.current_frame = Some(MediaFrame {
+                image_key,
+                yuv: None,
+                width: frame_width,
+                height: frame_height,
+            });
+
+            self.current_frame_holder = Some(FrameHolder::new(frame));
+
+            updates.push(ImageUpdate::AddImage(
+                image_key, descriptor, image_data, false,
+            ));
+        }
+
+        let delete_update_count = updates
+            .iter()
+            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
+            .count();
+        self.log_media_frame(
+            rendered_frame_count,
+            frame_backend,
+            frame_width,
+            frame_height,
+            image_key_for_log,
+            image_update_for_log,
+            delete_update_count,
+            updates.len(),
+            inter_frame_ms,
+        );
+        self.paint_api
+            .update_images(self.webview_id.into(), updates);
+    }
 }
 
 impl Drop for MediaFrameRenderer {
@@ -738,6 +872,8 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 VideoFrameYuvFormat::I420 => "yuv_i420_external_raw",
                 VideoFrameYuvFormat::NV12 => "yuv_nv12_external_raw",
             }
+        } else if frame.is_d3d11() {
+            "d3d11_texture"
         } else if frame.is_gl_texture() {
             if frame.is_external_oes() {
                 "external_oes"
@@ -761,6 +897,18 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             self.render_yuv_frame(
                 frame,
                 yuv,
+                rendered_frame_count,
+                frame_backend,
+                inter_frame_ms,
+                updates,
+            );
+            return;
+        }
+
+        if let Some(d3d11) = frame.get_d3d11_data() {
+            self.render_d3d11_frame(
+                frame,
+                d3d11,
                 rendered_frame_count,
                 frame_backend,
                 inter_frame_ms,
