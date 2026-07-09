@@ -39,11 +39,26 @@
     background: #000;
     z-index: 10;
   }
+  /* 동기 시작 전까지 준비 과정(프리롤/웜업/정렬)을 가리는 커버.
+     전 타일의 동기 재생이 확인되는 순간 제거된다. */
+  #cover {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 24px;
+  }
 </style>
 </head>
 <body>
 <div id="grid"></div>
 <div id="hb"></div>
+<div id="cover">준비 중...</div>
 <script>
   "use strict";
 
@@ -66,19 +81,41 @@
   const tileW = (100 / COLS) + "vw";
   const tileH = (100 / ROWS) + "vh";
 
-  // N x N 개의 독립 <video> 생성. 각 엘리먼트가 동일 파일을 개별 디코딩/루프 재생.
+  // 독립 <video> 생성. 각 엘리먼트가 동일 파일을 개별 디코딩/루프 재생.
+  // 동기 시작: 즉시 재생하지 않고(autoplay 없음) 전 타일이 첫 프레임까지 프리롤된 뒤
+  // 한꺼번에 play한다. 수십 개 파이프라인이 기동 경쟁 중에 재생을 시작하면 타일마다
+  // 다른 시점에 멈칫거리며 출발해 영구적인 재생 시차(수십 프레임)가 생기기 때문.
+  const videos = [];
   for (let i = 0; i < TILE_COUNT; i++) {
     const v = document.createElement("video");
     v.muted = true;         // 자동재생 정책상 muted 필수
-    v.autoplay = true;
     v.loop = true;
     v.playsInline = true;
+    v.preload = "auto";
     v.style.width = tileW;
     v.style.height = tileH;
     v.src = SRC;
     v.play().catch(() => {});
     grid.appendChild(v);
+    videos.push(v);
   }
+
+  // 시작 동기화는 백엔드 동기 그룹(env SERVO_MEDIA_SYNC_GROUP=타일수)이 담당한다:
+  // 각 파이프라인은 프리롤 후 보류되고, 전원이 준비되면 공유 클럭 + 동일 base time으로
+  // 동시에 출발한다(프레임 단위 lockstep). gapless 루프(SERVO_MEDIA_GAPLESS_LOOP)가
+  // non-flush 되감기로 그 위상을 영구 보존한다. 페이지는 재생 요청만 하고, 전 타일의
+  // 동시 출발이 관측되면 준비 과정을 가리던 커버를 걷는다.
+  const cover = document.getElementById("cover");
+  const syncBegin = performance.now();
+  const revealPoll = setInterval(() => {
+    const moving = videos.filter((v) => v.currentTime > 0.15).length;
+    const elapsed = ((performance.now() - syncBegin) / 1000) | 0;
+    cover.textContent = "준비 중... " + moving + "/" + TILE_COUNT + " (" + elapsed + "s)";
+    if (moving >= TILE_COUNT || elapsed > 90) {
+      clearInterval(revealPoll);
+      if (cover.parentNode) cover.parentNode.removeChild(cover);
+    }
+  }, 250);
 
   // rAF 하트비트: 매 프레임 최소 DOM 변경으로 페이지를 '애니메이션 중' 상태로 유지.
   // rAF가 없으면 Servo는 36개 비디오의 프레임 도착(~1080건/s)마다 개별 즉시-합성
