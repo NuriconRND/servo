@@ -601,6 +601,12 @@ impl PainterSurfmanDetailsMap {
 pub trait WebRenderExternalImageApi {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, UntypedSize2D<i32>);
     fn unlock(&mut self, id: u64);
+    /// WR에 전달할 uv가 수직 플립되어야 하는지. 기존 미디어/GL 텍스처는
+    /// 하단-상단(GL 관례)이라 플립이 필요하고(기본값 true), GPU 상주 D3D11
+    /// 비디오 텍스처는 상단-하단이라 플립하지 않는다.
+    fn needs_vertical_flip(&mut self, _id: u64) -> bool {
+        true
+    }
 }
 
 /// Type of WebRender External Image Handler.
@@ -712,11 +718,15 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
                 }
             },
             WebRenderImageHandlerType::Media => {
-                let (source, size) = self.media_handler.as_mut().unwrap().lock(key.0);
-                ExternalImage {
-                    uv: TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0),
-                    source,
-                }
+                let media_handler = self.media_handler.as_mut().unwrap();
+                let needs_vertical_flip = media_handler.needs_vertical_flip(key.0);
+                let (source, size) = media_handler.lock(key.0);
+                let uv = if needs_vertical_flip {
+                    TexelRect::new(0.0, size.height as f32, size.width as f32, 0.0)
+                } else {
+                    TexelRect::new(0.0, 0.0, size.width as f32, size.height as f32)
+                };
+                ExternalImage { uv, source }
             },
             WebRenderImageHandlerType::WebGpu => {
                 let (source, size) = self.webgpu_handler.as_mut().unwrap().lock(key.0);

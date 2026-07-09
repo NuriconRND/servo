@@ -597,4 +597,11 @@ impl WebRenderExternalImageApi for MediaExternalImages {
             glplayer_images.unlock(id);
         }
     }
+
+    fn needs_vertical_flip(&mut self, id: u64) -> bool {
+        // GPU 상주 D3D11 프레임(상단-하단 텍스처)만 플립 제외.
+        // 첫 lock 전엔 래핑 캐시가 비어 있을 수 있으므로 레지스트리도 함께 확인한다.
+        !(self.d3d11_texture_cache.contains_key(&id)
+            || D3d11VideoFrameExternalImages::info_for(id).is_some())
+    }
 }
