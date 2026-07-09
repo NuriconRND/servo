@@ -24,6 +24,7 @@ pub use interop::{SharedGstD3D11Device, SharedTextureRing};
 #[cfg(windows)]
 mod render_d3d11 {
     use std::env;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gstreamer::glib::translate::ToGlibPtr;
@@ -38,6 +39,16 @@ mod render_d3d11 {
     use crate::ffi::GstD3D11Converter;
 
     const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
+
+    // D3D11PROF: 파이프라인(플레이어) 식별자 발급기 — 로그에서 타일 구분용 (임시 계측).
+    static PROFILE_ID_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    // D3D11PROF: 파이프라인별 하트비트 스로틀. 각 파이프라인의 build_frame은 전용
+    // 스트리밍 스레드에서 불리므로 thread_local이 자연스럽게 파이프라인당 1개다.
+    thread_local! {
+        static LAST_PROF_LOG: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
 
     fn env_flag_enabled(name: &str) -> bool {
         env::var(name).is_ok_and(|value| {
@@ -82,6 +93,8 @@ mod render_d3d11 {
         // 플레이어당 링+변환기. build_frame은 스트리밍 스레드 1개에서만 불리지만
         // Render는 &self라 내부 가변성 필요.
         state: Mutex<PlayerState>,
+        // D3D11PROF: 이 플레이어의 파이프라인 식별자 (임시 계측).
+        profile_id: u32,
     }
 
     impl RenderD3D11 {
@@ -103,7 +116,8 @@ mod render_d3d11 {
                 return None;
             }
             let device = SharedGstD3D11Device::get_or_create()?;
-            log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성");
+            let profile_id = PROFILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+            log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성 (profile_id={profile_id})");
             Some(RenderD3D11 {
                 device,
                 state: Mutex::new(PlayerState {
@@ -111,6 +125,7 @@ mod render_d3d11 {
                     converter: None,
                     in_caps: None,
                 }),
+                profile_id,
             })
         }
     }
@@ -121,6 +136,8 @@ mod render_d3d11 {
         }
 
         fn build_frame(&self, sample: gstreamer::Sample) -> Option<VideoFrame> {
+            let prof = crate::interop::profile_enabled(); // D3D11PROF
+            let bf_start = std::time::Instant::now(); // D3D11PROF
             let buffer = sample.buffer()?;
             if buffer.n_memory() == 0 {
                 return None;
@@ -147,7 +164,10 @@ mod render_d3d11 {
             let ring = state
                 .ring
                 .get_or_insert_with(|| SharedTextureRing::new(self.device.clone()));
+            ring.profile_id = self.profile_id; // D3D11PROF
+            let acq_start = std::time::Instant::now(); // D3D11PROF
             let (out_buffer, slot_index) = ring.acquire(width, height)?;
+            let t_acquire = acq_start.elapsed(); // D3D11PROF (recreate 포함)
 
             if state.converter.is_none() {
                 let out_info = gstreamer_video::VideoInfo::builder(
@@ -180,6 +200,7 @@ mod render_d3d11 {
             // gst_d3d11_converter_convert_buffer(일반 변형)는 내부적으로 디바이스 락을
             // 잡는다 — 짝 API `_unlocked`의 존재가 근거(gstd3d11converter.h:194). 그러므로
             // 여기서 device.lock()으로 감싸지 않는다(이중 락으로 인한 데드락 방지).
+            let conv_start = std::time::Instant::now(); // D3D11PROF
             let ok = unsafe {
                 (api.converter_convert_buffer)(
                     converter.0,
@@ -187,11 +208,47 @@ mod render_d3d11 {
                     out_buffer.as_mut_ptr(),
                 )
             };
+            let t_convert = conv_start.elapsed(); // D3D11PROF (convert 내부 디바이스 락 대기 포함)
             if ok == 0 {
                 log::warn!("D3D11 video: convert_buffer 실패 — 프레임 드롭");
                 return None;
             }
+            let fin_start = std::time::Instant::now(); // D3D11PROF
             let (shared_handle, ring_epoch) = ring.finish(slot_index)?;
+            let t_finish = fin_start.elapsed(); // D3D11PROF
+
+            // D3D11PROF: 임계 초과 프레임(=스톨 후보)은 항상 로깅 + 정착 베이스라인용
+            // 파이프라인당 ~1초 하트비트 1줄(정착 분포 확보). over=1 이면 임계 초과.
+            // 판정: convert/ef_lockwait/poll_lockwait 지배=H1 락 콘보이, poll_lockwait+
+            // polls 폭증=H2 스핀 폭풍, fence_loop 크고 lockwait 작음=H3 GPU 큐 포화.
+            if prof {
+                let total_ms = bf_start.elapsed().as_secs_f64() * 1000.0;
+                let over = total_ms >= crate::interop::profile_threshold_ms();
+                // 하트비트: 이 스트리밍 스레드(=파이프라인)에서 마지막 로그 후 1초 경과 시 1줄.
+                let heartbeat = LAST_PROF_LOG.with(|c| match c.get() {
+                    Some(t) if t.elapsed() < std::time::Duration::from_secs(1) => false,
+                    _ => true,
+                });
+                if over || heartbeat {
+                    LAST_PROF_LOG.with(|c| c.set(Some(std::time::Instant::now())));
+                    let st = ring.last_stats;
+                    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                    log::warn!(
+                        "D3D11PROF id={} over={} total={:.1} acquire={:.1} convert={:.1} \
+                         finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} fence_loop={:.1} polls={}",
+                        self.profile_id,
+                        if over { 1 } else { 0 },
+                        total_ms,
+                        t_acquire.as_secs_f64() * 1000.0,
+                        t_convert.as_secs_f64() * 1000.0,
+                        t_finish.as_secs_f64() * 1000.0,
+                        ms(st.endflush_lock_wait),
+                        ms(st.poll_lock_wait),
+                        ms(st.fence_loop),
+                        st.poll_count,
+                    );
+                }
+            }
             // gst 버퍼(sample)는 여기서 스코프를 벗어나며 즉시 풀로 반환된다 — 프레임
             // 수명이 렌더러와 분리되는 것이 링 설계의 핵심 이점.
             VideoFrame::new(

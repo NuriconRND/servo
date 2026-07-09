@@ -137,6 +137,47 @@ const RING_SLOTS: usize = 4;
 /// 영원히 스핀하지 않도록 초과 시 슬롯 발행을 포기한다(해당 프레임만 드롭).
 const FINISH_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+// ============================================================================
+// D3D11PROF: 임시 진단 계측 (loop-boundary stall 조사, env SERVO_D3D11_PROFILE=1
+// 게이트, 기본 off). 조사 종료 후 제거 예정. off일 때 오버헤드는 build_frame당
+// 정수 증가 + Instant::now 수회로 무시 가능; 폴 루프의 lock-wait 타이밍은 prof에서만
+// 켜져 스핀 루프 타이밍을 교란하지 않는다.
+// ============================================================================
+
+/// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다 (프로세스 1회 판정).
+pub fn profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SERVO_D3D11_PROFILE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+    })
+}
+
+/// build_frame 총시간이 이 임계(ms) 이상일 때만 로깅 (로그 폭주 방지).
+/// SERVO_D3D11_PROFILE_MS 로 조정, 기본 8ms.
+pub fn profile_threshold_ms() -> f64 {
+    static T: OnceLock<f64> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("SERVO_D3D11_PROFILE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8.0)
+    })
+}
+
+/// finish() 단계별 계측 결과. profile on일 때만 채워지며 build_frame이 판독해 로깅.
+/// - endflush_lock_wait: End+Flush 직전 디바이스 락 획득 대기 (H1 콘보이 신호)
+/// - poll_lock_wait: fence 폴 루프에서 디바이스 락 획득 대기 누계 (H1/H2 신호)
+/// - fence_loop: fence 폴 루프 전체 소요 (H3 GPU 큐 신호: 폴은 값싼데 완료가 늦음)
+/// - poll_count: GetData 폴 횟수 (스핀 폭풍 규모)
+#[derive(Clone, Copy, Default)]
+pub struct FinishStats {
+    pub endflush_lock_wait: std::time::Duration,
+    pub poll_lock_wait: std::time::Duration,
+    pub fence_loop: std::time::Duration,
+    pub poll_count: u32,
+}
+
 struct RingSlot {
     texture: ComPtr<ID3D11Texture2D>,
     shared_handle: u64,
@@ -169,6 +210,10 @@ pub struct SharedTextureRing {
     /// 교체됨) acquire 없이 finish가 불리면 엉뚱한 슬롯의 쿼리를 대기/발행하게
     /// 되므로 None으로 거절한다.
     pending: Option<(usize, u32)>,
+    /// D3D11PROF: 파이프라인 식별자 (lib.rs가 매 build_frame에서 설정, 기본 0).
+    pub profile_id: u32,
+    /// D3D11PROF: 직전 finish()의 단계별 계측 (profile on일 때만 갱신).
+    pub last_stats: FinishStats,
 }
 
 // 안전성: ComPtr 원시 포인터는 이 구조체가 단독 소유하며, 컨텍스트 작업은 전부
@@ -185,6 +230,8 @@ impl SharedTextureRing {
             width: 0,
             height: 0,
             pending: None,
+            profile_id: 0,
+            last_stats: FinishStats::default(),
         }
     }
 
@@ -217,8 +264,13 @@ impl SharedTextureRing {
             return None;
         }
         let slot = self.slots.get(slot_index)?;
+        let prof = profile_enabled(); // D3D11PROF
+        // D3D11PROF: End+Flush 직전 디바이스 락 획득 대기 측정 (콘보이 신호 H1).
+        let endflush_lock_wait;
         unsafe {
+            let lock_t = std::time::Instant::now();
             let _guard = self.device.lock();
+            endflush_lock_wait = lock_t.elapsed();
             let context = self.device.immediate_context();
             (*context).End(slot.query.as_raw() as *mut ID3D11Asynchronous);
             (*context).Flush();
@@ -227,9 +279,16 @@ impl SharedTextureRing {
         // 위에서 명시적으로 Flush했으므로 DONOTFLUSH로 폴링마다의 암묵적 flush를 막고,
         // GPU 행/TDR 대비 예산 초과 시 포기한다(무한 스핀 방지).
         let poll_start = std::time::Instant::now();
+        let mut poll_count: u32 = 0; // D3D11PROF
+        let mut poll_lock_wait = std::time::Duration::ZERO; // D3D11PROF
         loop {
             let hr = unsafe {
+                // D3D11PROF: 락 획득 대기는 prof에서만 측정(스핀 루프 교란 방지).
+                let lock_t = if prof { Some(std::time::Instant::now()) } else { None };
                 let _guard = self.device.lock();
+                if let Some(lock_t) = lock_t {
+                    poll_lock_wait += lock_t.elapsed();
+                }
                 let context = self.device.immediate_context();
                 (*context).GetData(
                     slot.query.as_raw() as *mut ID3D11Asynchronous,
@@ -238,6 +297,7 @@ impl SharedTextureRing {
                     D3D11_ASYNC_GETDATA_DONOTFLUSH,
                 )
             };
+            poll_count += 1; // D3D11PROF
             match hr {
                 S_OK => break,
                 S_FALSE => {
@@ -259,7 +319,17 @@ impl SharedTextureRing {
                 },
             }
         }
-        Some((slot.shared_handle, self.epoch))
+        let shared_handle = slot.shared_handle; // copy out → slot 차용 종료
+        // D3D11PROF: 단계별 계측 저장 (build_frame이 판독해 임계 초과 시 로깅).
+        if prof {
+            self.last_stats = FinishStats {
+                endflush_lock_wait,
+                poll_lock_wait,
+                fence_loop: poll_start.elapsed(),
+                poll_count,
+            };
+        }
+        Some((shared_handle, self.epoch))
     }
 
     /// 테스트·폴백용: 원본 D3D11 텍스처를 슬롯에 복사(변환 없음, 동일 포맷 전제).
