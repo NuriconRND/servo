@@ -165,6 +165,14 @@
     for (const v of videos) if (!v.paused && v.readyState >= 3) n++;
     return n;
   }
+  // 최근 1초 내 loop 재시작(currentTime이 앞부분)한 타일 수. 다수 타일이 같은 시점에
+  // 재시작하면 demux/디코더 flush가 몰려 주기적 스톨을 만들 수 있어, 스톨과의 상관
+  // 확인용으로 로그에 포함한다.
+  function countLooping() {
+    let n = 0;
+    for (const v of videos) if (v.currentTime < 1.0) n++;
+    return n;
+  }
 
   // ?log=1 이면 매 1초 지표를 console.error 로 출력 (servoshell stderr 로 캡처해 A/B 정량 비교)
   const LOG = params.get("log") === "1";
@@ -211,7 +219,8 @@
         console.error(
           `[GRIDPERF] tiles=${TILE_COUNT} fps=${fps.toFixed(1)} ` +
           `maxGapMs=${jitterMs.toFixed(1)} decoded/s=${lastDecoded === null ? "na" : decPerSec.toFixed(0)} ` +
-          `dropped/s=${dropPerSec.toFixed(0)} playing=${countPlaying()}/${TILE_COUNT}`
+          `dropped/s=${dropPerSec.toFixed(0)} playing=${countPlaying()}/${TILE_COUNT} ` +
+          `looping=${countLooping()}`
         );
       }
 

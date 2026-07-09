@@ -25,7 +25,8 @@
   #grid video {
     box-sizing: border-box;
     flex: 0 0 auto;
-    object-fit: cover;
+    /* fill: aspect ratio 무시하고 타일을 꽉 채움 (크롭 없이 프레임 전체 표시) */
+    object-fit: fill;
     background: #000;
   }
   /* rAF 하트비트용 (사실상 안 보이는 2px 점) — 아래 스크립트 주석 참조 */
@@ -46,16 +47,24 @@
 <script>
   "use strict";
 
-  // ?grid=N 으로 N x N 조절 가능 (기본 6x6 = 36 타일)
+  // 그리드 크기 파라미터 (perf 페이지와 동일):
+  //   ?grid=N        -> N x N (정사각, 기본 6 => 36 타일)
+  //   ?cols=C&rows=R -> C열 x R행 직사각 (예: cols=9&rows=5 => 45 타일)
   const params = new URLSearchParams(location.search);
-  const n = parseInt(params.get("grid"), 10);
-  const N = Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : 6;
-  const TILE_COUNT = N * N;
+  const clampInt = (raw, fallback) => {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fallback;
+  };
+  const gridN = clampInt(params.get("grid"), 6);
+  const COLS = clampInt(params.get("cols"), gridN);
+  const ROWS = clampInt(params.get("rows"), gridN);
+  const TILE_COUNT = COLS * ROWS;
   const SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  document.title = COLS + "x" + ROWS + " Video Wall";
 
   const grid = document.getElementById("grid");
-  const tileW = (100 / N) + "vw";
-  const tileH = (100 / N) + "vh";
+  const tileW = (100 / COLS) + "vw";
+  const tileH = (100 / ROWS) + "vh";
 
   // N x N 개의 독립 <video> 생성. 각 엘리먼트가 동일 파일을 개별 디코딩/루프 재생.
   for (let i = 0; i < TILE_COUNT; i++) {
