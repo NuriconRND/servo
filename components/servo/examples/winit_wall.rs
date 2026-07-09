@@ -47,7 +47,7 @@ use crate::wall::WallLayout;
 const DEFAULT_URL: &str = "https://demo.servo.org/experiments/twgl-tunnel/";
 
 /// Which [`RenderingContext`] backend each tile window uses.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Backend {
     /// surfman/ANGLE OpenGL (the default `WindowRenderingContext`).
     Gl,
@@ -500,6 +500,17 @@ impl ApplicationHandler<WakerEvent> for App {
                     }
                 },
             };
+            // Confirm which GPU backend WebRender is *actually* driven through for this tile, rather
+            // than trusting the requested `--backend`. `backend_diagnostics()` reads the same
+            // GL_RENDERER/GL_VERSION strings WebRender queries in `Device::new`, from the very gl
+            // object it is handed: `renderer="wr-d3d11 (Direct3D 11)"` proves the native D3D11 path
+            // is live, `renderer="ANGLE (...)"` proves surfman/ANGLE. Printed to stderr because this
+            // runs before `servo.setup_logging()`.
+            eprintln!(
+                "tile {tile_index}: requested backend={:?}, gpu_index={gpu_index:?} -> active {}",
+                config.backend,
+                rendering_context.backend_diagnostics(),
+            );
             built.push((window, rendering_context));
         }
 

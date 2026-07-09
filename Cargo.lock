@@ -6388,11 +6388,29 @@ checksum = "c5a797f0e07bdf071d15742978fc3128ec6c22891c31a3a931513263904c982a"
 [[package]]
 name = "peek-poke"
 version = "0.3.0"
+dependencies = [
+ "euclid",
+ "peek-poke-derive 0.3.0",
+]
+
+[[package]]
+name = "peek-poke"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef60922033e31835f6cf98b9b81b58368037b71d2a81928985cd9d0b3b3171fb"
 dependencies = [
  "euclid",
- "peek-poke-derive",
+ "peek-poke-derive 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "peek-poke-derive"
+version = "0.3.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
 
 [[package]]
@@ -7792,8 +7810,8 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "webrender",
- "webrender_api",
+ "webrender 0.68.0",
+ "webrender_api 0.68.0",
  "winit",
 ]
 
@@ -7855,7 +7873,7 @@ dependencies = [
  "servo-malloc-size-of",
  "time",
  "unicode-segmentation",
- "webrender_api",
+ "webrender_api 0.68.0",
  "windows-sys 0.61.2",
 ]
 
@@ -7912,7 +7930,7 @@ dependencies = [
  "tracing",
  "vello",
  "vello_cpu 0.0.9",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -7932,7 +7950,7 @@ dependencies = [
  "servo-webxr-api",
  "strum",
  "stylo",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8034,7 +8052,7 @@ dependencies = [
  "servo-webgpu-traits",
  "strum",
  "uuid",
- "webrender_api",
+ "webrender_api 0.68.0",
  "wgpu-core",
  "zeroize",
 ]
@@ -8140,7 +8158,7 @@ dependencies = [
  "url",
  "uuid",
  "webdriver",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8194,7 +8212,7 @@ dependencies = [
  "unicode-script",
  "url",
  "uuid",
- "webrender_api",
+ "webrender_api 0.68.0",
  "winapi",
  "xml",
  "yeslogic-fontconfig-sys",
@@ -8220,7 +8238,7 @@ dependencies = [
  "servo-url",
  "stylo",
  "uuid",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8231,8 +8249,8 @@ dependencies = [
  "euclid",
  "malloc_size_of_derive",
  "servo-malloc-size-of",
- "webrender",
- "webrender_api",
+ "webrender 0.68.0",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8315,7 +8333,7 @@ dependencies = [
  "unicode_categories",
  "url",
  "web_atoms",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8347,7 +8365,7 @@ dependencies = [
  "servo_arc",
  "stylo",
  "stylo_traits",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8386,9 +8404,9 @@ dependencies = [
  "url",
  "urlpattern",
  "uuid",
- "webrender",
- "webrender_api",
- "wr_malloc_size_of",
+ "webrender 0.68.0",
+ "webrender_api 0.68.0",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -8591,7 +8609,7 @@ dependencies = [
  "servo-malloc-size-of",
  "servo-media",
  "servo-paint-api",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8695,7 +8713,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8735,7 +8753,7 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -8773,9 +8791,9 @@ dependencies = [
  "stylo_traits",
  "surfman",
  "tracing",
- "webrender",
- "webrender_api",
- "wr_malloc_size_of",
+ "webrender 0.68.0",
+ "webrender_api 0.68.0",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -8810,7 +8828,7 @@ dependencies = [
  "stylo_traits",
  "surfman",
  "tracing",
- "webrender_api",
+ "webrender_api 0.68.0",
  "winapi",
  "windows 0.58.0",
  "wio",
@@ -8830,7 +8848,7 @@ dependencies = [
  "serde",
  "servo-base",
  "servo-malloc-size-of",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -9007,7 +9025,7 @@ dependencies = [
  "uuid",
  "web_atoms",
  "webdriver",
- "webrender_api",
+ "webrender_api 0.68.0",
  "wgpu-core",
  "wgpu-types",
  "x25519-dalek",
@@ -9087,7 +9105,7 @@ dependencies = [
  "strum",
  "stylo_atoms",
  "stylo_traits",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -9223,7 +9241,7 @@ dependencies = [
  "servo-webxr",
  "servo-webxr-api",
  "surfman",
- "webrender_api",
+ "webrender_api 0.68.0",
 ]
 
 [[package]]
@@ -9240,7 +9258,7 @@ dependencies = [
  "servo-paint-api",
  "servo-pixels",
  "servo-webgpu-traits",
- "webrender_api",
+ "webrender_api 0.68.0",
  "wgpu-core",
  "wgpu-hal",
  "wgpu-types",
@@ -9257,7 +9275,7 @@ dependencies = [
  "servo-base",
  "servo-malloc-size-of",
  "servo-pixels",
- "webrender_api",
+ "webrender_api 0.68.0",
  "wgpu-core",
  "wgpu-types",
 ]
@@ -11380,7 +11398,7 @@ dependencies = [
  "log",
  "malloc_size_of_derive",
  "num-traits",
- "peek-poke",
+ "peek-poke 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "plane-split",
  "rayon",
  "ron",
@@ -11390,11 +11408,44 @@ dependencies = [
  "svg_fmt",
  "topological-sort",
  "tracy-rs",
- "webrender_api",
- "webrender_build",
- "wr_glyph_rasterizer",
- "wr_malloc_size_of",
- "zeitstempel",
+ "webrender_api 0.68.0",
+ "webrender_build 0.68.0",
+ "wr_glyph_rasterizer 0.68.0",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeitstempel 0.1.2",
+]
+
+[[package]]
+name = "webrender"
+version = "0.69.0"
+dependencies = [
+ "allocator-api2",
+ "bincode",
+ "bitflags 2.11.1",
+ "build-parallel",
+ "byteorder",
+ "derive_more",
+ "etagere",
+ "euclid",
+ "gleam",
+ "glslopt",
+ "lazy_static",
+ "log",
+ "malloc_size_of_derive",
+ "num-traits",
+ "peek-poke 0.3.0",
+ "plane-split",
+ "rayon",
+ "rustc-hash 2.1.2",
+ "smallvec",
+ "svg_fmt",
+ "topological-sort",
+ "tracy-rs",
+ "webrender_api 0.69.0",
+ "webrender_build 0.69.0",
+ "wr_glyph_rasterizer 0.69.0",
+ "wr_malloc_size_of 0.2.2",
+ "zeitstempel 0.2.2",
 ]
 
 [[package]]
@@ -11409,12 +11460,30 @@ dependencies = [
  "crossbeam-channel",
  "euclid",
  "malloc_size_of_derive",
- "peek-poke",
+ "peek-poke 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_bytes",
  "serde_derive",
- "wr_malloc_size_of",
- "zeitstempel",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "zeitstempel 0.1.2",
+]
+
+[[package]]
+name = "webrender_api"
+version = "0.69.0"
+dependencies = [
+ "app_units",
+ "bitflags 2.11.1",
+ "byteorder",
+ "crossbeam-channel",
+ "euclid",
+ "malloc_size_of_derive",
+ "peek-poke 0.3.0",
+ "serde",
+ "serde_bytes",
+ "serde_derive",
+ "wr_malloc_size_of 0.2.2",
+ "zeitstempel 0.2.2",
 ]
 
 [[package]]
@@ -11422,6 +11491,14 @@ name = "webrender_build"
 version = "0.68.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e6165a81201892371061250bd6f08ede9ed7279842fedc4033f48582a789068"
+dependencies = [
+ "bitflags 2.11.1",
+ "lazy_static",
+]
+
+[[package]]
+name = "webrender_build"
+version = "0.69.0"
 dependencies = [
  "bitflags 2.11.1",
  "lazy_static",
@@ -12158,6 +12235,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "webrender 0.69.0",
  "windows 0.58.0",
 ]
 
@@ -12183,8 +12261,39 @@ dependencies = [
  "serde",
  "smallvec",
  "tracy-rs",
- "webrender_api",
- "wr_malloc_size_of",
+ "webrender_api 0.68.0",
+ "wr_malloc_size_of 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "wr_glyph_rasterizer"
+version = "0.69.0"
+dependencies = [
+ "core-foundation 0.9.4",
+ "core-graphics",
+ "core-text",
+ "dwrote",
+ "euclid",
+ "freetype",
+ "lazy_static",
+ "libc",
+ "log",
+ "malloc_size_of_derive",
+ "objc",
+ "rayon",
+ "rustc-hash 2.1.2",
+ "smallvec",
+ "tracy-rs",
+ "webrender_api 0.69.0",
+ "wr_malloc_size_of 0.2.2",
+]
+
+[[package]]
+name = "wr_malloc_size_of"
+version = "0.2.2"
+dependencies = [
+ "app_units",
+ "euclid",
 ]
 
 [[package]]
@@ -12483,6 +12592,18 @@ name = "zeitstempel"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94652f036694517fa67509942c3b60a51a19e1cd9cfd0f456eeb830ae8798d3d"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "once_cell",
+ "winapi",
+]
+
+[[package]]
+name = "zeitstempel"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7082d20989e6410d2d1c304c8b73fb66aa2c8f68a169b94bf31d340e85b3a4f"
 dependencies = [
  "cfg-if",
  "libc",

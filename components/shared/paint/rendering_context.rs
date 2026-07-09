@@ -132,6 +132,33 @@ pub trait RenderingContext {
     fn use_optimized_shaders(&self) -> bool {
         true
     }
+    /// A human-readable identification of the concrete GPU backend WebRender is *actually* driven
+    /// through, for startup/diagnostic logging.
+    ///
+    /// This queries the same `GL_RENDERER`/`GL_VERSION`/`GL_VENDOR`/`GL_SHADING_LANGUAGE_VERSION`
+    /// strings that WebRender itself reads in `Device::new`, from the very `gleam_gl_api()` object
+    /// handed to WebRender — so the reported renderer is ground truth for which path is live, not a
+    /// guess from the requested backend:
+    /// - native D3D11 ([`Dx11RenderingContext`]) reports `renderer="wr-d3d11 (Direct3D 11)"`,
+    ///   `version="OpenGL ES 3.0 (wr-d3d11)"`.
+    /// - surfman/ANGLE ([`WindowRenderingContext`]) reports `renderer="ANGLE (..., Direct3D11 ...)"`.
+    ///
+    /// The context is made current first so the query is valid on the surfman/GL backend.
+    fn backend_diagnostics(&self) -> String {
+        let _ = self.make_current();
+        let api = self.gleam_gl_api();
+        format!(
+            "renderer={:?}, version={:?}, vendor={:?}, glsl={:?}, origin_top_left={}, \
+             optimized_shaders={}, requested_gpu_index={:?}",
+            api.get_string(gl::RENDERER),
+            api.get_string(gl::VERSION),
+            api.get_string(gl::VENDOR),
+            api.get_string(gl::SHADING_LANGUAGE_VERSION),
+            self.surface_origin_is_top_left(),
+            self.use_optimized_shaders(),
+            self.requested_gpu_index(),
+        )
+    }
 }
 
 pub fn create_adapter_for_requested_gpu(
