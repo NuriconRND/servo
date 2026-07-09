@@ -115,7 +115,10 @@ mod render_d3d11 {
                 );
                 return None;
             }
-            let device = SharedGstD3D11Device::get_or_create()?;
+            // 파이프라인(플레이어)별 전용 디바이스 — 프로세스 전역 공유 디바이스는
+            // 45+ lockstep 루프 경계에서 단일 락 콘보이로 포화됨이 실측 확정
+            // (interop.rs 모듈 doc comment 참조). 플레이어 Drop 시 디바이스도 해제된다.
+            let device = SharedGstD3D11Device::create()?;
             let profile_id = PROFILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
             log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성 (profile_id={profile_id})");
             Some(RenderD3D11 {

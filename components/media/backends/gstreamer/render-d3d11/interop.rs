@@ -2,9 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! GstD3D11Device 공유 래퍼 + 공유 텍스처 링.
+//! GstD3D11Device 래퍼 + 공유 텍스처 링.
 //!
-//! 디바이스는 어댑터당 1개를 프로세스 전역으로 공유한다(gst 권장, 스펙 §7).
+//! 디바이스는 파이프라인(플레이어)별로 1개씩 생성한다 — 프로세스 전역 공유 디바이스는
+//! 45+ 파이프라인 동기그룹 lockstep의 루프 경계 버스트에서 단일 GRecMutex+커맨드 큐가
+//! 포화되어 락 콘보이(주기 스톨 + lockstep 붕괴)를 일으킴이 실측으로 확정됨
+//! (2026-07-10 조사, `.superpowers/sdd/investigation-loop-stall-report.md`). 렌더러(ANGLE)
+//! 와는 공유 텍스처 핸들로만 교차하므로 디바이스 자체를 나누는 것은 크로스 디바이스
+//! 안전성에 영향 없음(레거시 공유 핸들은 동일 어댑터의 다른 디바이스에서
+//! OpenSharedResource 가능 — PoC로 검증됨).
 //! immediate context 접근은 반드시 gst_d3d11_device_lock 하에서 수행
 //! (d3d11upload/convert가 같은 디바이스를 다른 스레드에서 사용).
 
@@ -44,40 +50,45 @@ impl Drop for DeviceLockGuard<'_> {
 }
 
 impl SharedGstD3D11Device {
+    /// 어댑터 0의 신규 디바이스 생성 (비캐시 — 호출마다 새 GstD3D11Device).
+    /// 파이프라인(플레이어)별로 이 함수를 호출해 전용 디바이스를 갖는다 — 근거는
+    /// 위 모듈 doc comment 참조.
+    pub fn create() -> Option<Arc<SharedGstD3D11Device>> {
+        let api = GstD3D11Api::load()?;
+        // 멀티GPU 후속: 어댑터 인덱스/LUID를 여기서 주입 (스펙 §4.5)
+        let device = unsafe { (api.device_new)(0, D3D11_DEVICE_FLAGS) };
+        if device.is_null() {
+            log::warn!("D3D11 video: gst_d3d11_device_new(adapter=0) 실패");
+            return None;
+        }
+        // 링 텍스처를 GstD3D11Memory로 래핑하기 위한 allocator.
+        // 등록된 기본 allocator를 우선 찾고, 미등록이면 새 인스턴스 생성
+        // (프로세스 수명 동안 보유 — 의도적 비해제).
+        let allocator = unsafe {
+            let name = c"D3D11Memory";
+            let mut allocator =
+                gstreamer::ffi::gst_allocator_find(name.as_ptr()) as *mut GstD3D11Allocator;
+            if allocator.is_null() {
+                allocator = gstreamer::glib::gobject_ffi::g_object_new(
+                    (api.allocator_get_type)(),
+                    std::ptr::null(),
+                ) as *mut GstD3D11Allocator;
+            }
+            allocator
+        };
+        if allocator.is_null() {
+            log::warn!("D3D11 video: GstD3D11Allocator 획득 실패");
+            return None;
+        }
+        Some(Arc::new(SharedGstD3D11Device { api, device, allocator }))
+    }
+
     /// 어댑터 0의 전역 공유 디바이스. 최초 호출에서 생성, 실패 시 None 고정.
+    /// 기존 유닛테스트·PoC 예제 호환용으로 유지 — 파이프라인 생산 경로는
+    /// [`Self::create`]를 직접 호출한다(위 모듈 doc comment 참조).
     pub fn get_or_create() -> Option<Arc<SharedGstD3D11Device>> {
         static DEVICE: OnceLock<Option<Arc<SharedGstD3D11Device>>> = OnceLock::new();
-        DEVICE
-            .get_or_init(|| {
-                let api = GstD3D11Api::load()?;
-                // 멀티GPU 후속: 어댑터 인덱스/LUID를 여기서 주입 (스펙 §4.5)
-                let device = unsafe { (api.device_new)(0, D3D11_DEVICE_FLAGS) };
-                if device.is_null() {
-                    log::warn!("D3D11 video: gst_d3d11_device_new(adapter=0) 실패");
-                    return None;
-                }
-                // 링 텍스처를 GstD3D11Memory로 래핑하기 위한 allocator.
-                // 등록된 기본 allocator를 우선 찾고, 미등록이면 새 인스턴스 생성
-                // (프로세스 수명 동안 보유 — 의도적 비해제).
-                let allocator = unsafe {
-                    let name = c"D3D11Memory";
-                    let mut allocator = gstreamer::ffi::gst_allocator_find(name.as_ptr())
-                        as *mut GstD3D11Allocator;
-                    if allocator.is_null() {
-                        allocator = gstreamer::glib::gobject_ffi::g_object_new(
-                            (api.allocator_get_type)(),
-                            std::ptr::null(),
-                        ) as *mut GstD3D11Allocator;
-                    }
-                    allocator
-                };
-                if allocator.is_null() {
-                    log::warn!("D3D11 video: GstD3D11Allocator 획득 실패");
-                    return None;
-                }
-                Some(Arc::new(SharedGstD3D11Device { api, device, allocator }))
-            })
-            .clone()
+        DEVICE.get_or_init(Self::create).clone()
     }
 
     pub fn api(&self) -> &'static GstD3D11Api {
@@ -114,6 +125,23 @@ impl SharedGstD3D11Device {
             return None;
         }
         Some(unsafe { from_glib_full(ptr) })
+    }
+}
+
+impl Drop for SharedGstD3D11Device {
+    fn drop(&mut self) {
+        // gst_d3d11_device_new와 gst_allocator_find/g_object_new는 모두 소유 참조를
+        // 반환한다(transfer full). 파이프라인별 디바이스는 플레이어 해체 시 해제.
+        // (전역 캐시본은 OnceLock의 Arc가 프로세스 종료까지 유지 — 사실상 불호출.)
+        // 해제 순서: allocator 먼저, device 나중.
+        // RenderD3D11.device와 PlayerState.ring.device는 같은 SharedGstD3D11Device를
+        // 가리키는 별개의 Arc 클론이지만, Arc 참조계수 덕분에 이 Drop::drop 본체는
+        // 마지막 강한 참조가 사라질 때 정확히 1번만 실행된다 — 두 소유자 중 어느 쪽이
+        // 먼저/나중에 해체되든 순서 무관하게 안전.
+        unsafe {
+            gstreamer::glib::gobject_ffi::g_object_unref(self.allocator as *mut _);
+            gstreamer::glib::gobject_ffi::g_object_unref(self.device as *mut _);
+        }
     }
 }
 
@@ -311,7 +339,16 @@ impl SharedTextureRing {
                         );
                         return None;
                     }
-                    std::thread::yield_now();
+                    // 정착 상태는 수십 폴 내 완료(µs 단위) — 처음엔 yield로 빠르게,
+                    // 이후엔 sleep으로 물러나 경계 버스트에서 N파이프라인 스핀 폭풍을
+                    // 방지한다. poll_count는 위(D3D11PROF)에서 루프당 1회 이미 증가하므로
+                    // 여기서 재증가하지 않고 그 값을 그대로 재사용 — 계측 카운트 의미를
+                    // 바꾸지 않는다(SERVO_D3D11_PROFILE 재측정 전제, 건드리지 말 것 지시).
+                    if poll_count < 64 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
                 },
                 _ => {
                     log::warn!("D3D11 video: 완료 쿼리 실패 hr={hr:#x}");
