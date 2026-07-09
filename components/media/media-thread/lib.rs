@@ -72,21 +72,45 @@ impl RawVideoFrameExternalImages {
     }
 
     pub fn update_plane(id: ExternalImageId, frame: VideoFrame, plane_index: usize) {
-        raw_video_planes()
-            .lock()
-            .unwrap()
-            .insert(id.0, RawVideoPlane { frame, plane_index });
+        // Take the old plane out of the map but DROP IT OUTSIDE the mutex. Dropping the
+        // previous VideoFrame unrefs a gst buffer, which can block on the decoder's buffer
+        // pool lock (notably during a flushing loop-restart seek). Doing that while holding
+        // this global map mutex stalls the renderer thread, which takes the same mutex in
+        // `frame_for_plane` for every plane upload (one flushing video would freeze the
+        // uploads of ALL videos for the duration of the flush).
+        let lock_start = std::time::Instant::now();
+        let mut planes = raw_video_planes().lock().unwrap();
+        let lock_wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
+        let old_plane = planes.insert(id.0, RawVideoPlane { frame, plane_index });
+        drop(planes);
+        let drop_start = std::time::Instant::now();
+        drop(old_plane);
+        let drop_ms = drop_start.elapsed().as_secs_f64() * 1000.0;
+        if lock_wait_ms > 10.0 || drop_ms > 10.0 {
+            warn!(
+                "Slow raw plane update: id={} lock_wait_ms={:.1} old_frame_drop_ms={:.1}",
+                id.0, lock_wait_ms, drop_ms,
+            );
+        }
     }
 
     pub fn remove_plane(id: ExternalImageId) {
-        raw_video_planes().lock().unwrap().remove(&id.0);
+        // As in `update_plane`, drop the removed plane outside the mutex.
+        let removed_plane = raw_video_planes().lock().unwrap().remove(&id.0);
+        drop(removed_plane);
         if let Some(mut id_manager) = raw_video_external_image_id_manager() {
             id_manager.remove(&id);
         }
     }
 
     fn frame_for_plane(id: u64) -> Option<RawVideoPlane> {
-        raw_video_planes().lock().unwrap().get(&id).cloned()
+        let lock_start = std::time::Instant::now();
+        let planes = raw_video_planes().lock().unwrap();
+        let lock_wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
+        if lock_wait_ms > 10.0 {
+            warn!("Slow raw plane read lock: id={} lock_wait_ms={:.1}", id, lock_wait_ms);
+        }
+        planes.get(&id).cloned()
     }
 }
 
@@ -323,7 +347,13 @@ impl MediaExternalImages {
 
 impl WebRenderExternalImageApi for MediaExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
+        // Diagnostic: this runs on the renderer thread once per plane per upload. Time the
+        // full body (map lookup + gst buffer map via get_yuv_data/get_plane_data) to catch
+        // stalls caused by gst-side locks (e.g. around a flushing loop-restart seek).
+        let lock_body_start = std::time::Instant::now();
         if let Some(raw_plane) = RawVideoFrameExternalImages::frame_for_plane(id) {
+            // Replacing a previously-locked plane drops its VideoFrame here on the renderer
+            // thread; time it together with the rest of the body.
             self.locked_raw_planes.insert(id, raw_plane);
             let raw_plane = self
                 .locked_raw_planes
@@ -361,6 +391,13 @@ impl WebRenderExternalImageApi for MediaExternalImages {
                     data.len(),
                 );
             }
+            let lock_body_ms = lock_body_start.elapsed().as_secs_f64() * 1000.0;
+            if lock_body_ms > 10.0 {
+                warn!(
+                    "Slow raw plane lock body: external_id={} plane_index={} ms={:.1}",
+                    id, raw_plane.plane_index, lock_body_ms,
+                );
+            }
             return (
                 ExternalImageSource::RawData(data),
                 Size2D::new(plane.width, plane.height),
@@ -374,17 +411,30 @@ impl WebRenderExternalImageApi for MediaExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
+        // Diagnostic: dropping the locked plane here unrefs a gst buffer ON THE RENDERER
+        // THREAD; if the frame was replaced meanwhile this may be the last ref and the
+        // buffer returns to the decoder's pool, which can block during a flushing seek.
+        let unlock_start = std::time::Instant::now();
         if let Some(raw_plane) = self.locked_raw_planes.remove(&id) {
+            let plane_index = raw_plane.plane_index;
+            drop(raw_plane);
+            let unlock_ms = unlock_start.elapsed().as_secs_f64() * 1000.0;
+            if unlock_ms > 10.0 {
+                warn!(
+                    "Slow raw plane unlock: external_id={} plane_index={} ms={:.1}",
+                    id, plane_index, unlock_ms,
+                );
+            }
             let unlock_count = RAW_VIDEO_PLANE_UNLOCK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             debug!(
                 "Wall raw video plane unlock: external_id={} plane_index={} total_unlocks={}",
-                id, raw_plane.plane_index, unlock_count,
+                id, plane_index, unlock_count,
             );
             if unlock_count <= 6 || unlock_count % RAW_VIDEO_PLANE_INFO_INTERVAL == 0 {
                 info!(
                     "Wall raw video plane unlock summary: total_unlocks={} external_id={} \
                      plane_index={}",
-                    unlock_count, id, raw_plane.plane_index,
+                    unlock_count, id, plane_index,
                 );
             }
             return;

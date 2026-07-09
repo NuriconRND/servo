@@ -49,7 +49,8 @@ use webrender_api::units::{
 use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
     DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
-    FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageKey,
+    FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageDescriptor,
+    ImageKey,
     NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
     RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
 };
@@ -60,6 +61,14 @@ use wr_malloc_size_of::MallocSizeOfOps;
 // pacing). Read once. Default = enabled (current behavior). Values "1"/"true" disable it.
 static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+// Kill switch for the latest-wins coalescing of immediate (epoch-less, i.e. video) image
+// updates in `update_images` (see `pending_video_frame_updates`). Read once. Default =
+// coalescing enabled. Values "1"/"true" restore the previous forward-every-arrival behavior.
+static VIDEO_UPDATE_COALESCE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SERVO_DISABLE_VIDEO_UPDATE_COALESCE")
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
@@ -127,6 +136,14 @@ pub(crate) struct Painter {
     /// Count of render passes executed for this target.
     render_count: Cell<u64>,
 
+    /// True while a display-paced composite (script rAF composite, per-video-arrival
+    /// composite, deferred frame-delayer composite) has been requested but its render pass
+    /// has not completed yet. While set, further display-paced composite requests are
+    /// skipped (see `renderer_behind`), which keeps WebRender's publish queue depth at <= 1
+    /// by construction. Reset when a render pass completes, or when a frame-ready arrives
+    /// that will not trigger a repaint.
+    display_composite_in_flight: Cell<bool>,
+
     /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
     /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
     /// page's requestAnimationFrame count. `_start` is the current 1s window start, `_last` the
@@ -135,6 +152,12 @@ pub(crate) struct Painter {
     present_cadence_last: Cell<Option<Instant>>,
     present_cadence_count: Cell<u32>,
     present_cadence_max_gap_ms: Cell<f64>,
+
+    /// Diagnostic (env `SERVO_LOG_PRESENT_CADENCE`): end instant of the previous render pass.
+    /// A large gap since this instant at the START of a render means the stall happened
+    /// upstream of the renderer (no render was requested at all), as opposed to a slow render
+    /// pass itself, which is logged separately as "Slow paint frame".
+    last_render_end: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -175,6 +198,18 @@ pub(crate) struct Painter {
     /// A cache that stores data for all animating images uploaded to WebRender. This is used
     /// for animated images, which only need to update their offset in the data.
     animation_image_cache: FxHashMap<ImageKey, Arc<Vec<u8>>>,
+
+    /// Latest-wins staging for immediate (epoch-less, i.e. video) image updates. Instead of
+    /// forwarding every arriving video frame to WebRender, the newest update per image key is
+    /// held here and flushed into the next composite (any `generate_frame_with_diagnostic_id`
+    /// call). Rationale: WebRender cannot skip a published-but-unrendered frame whose resource
+    /// updates touch the texture cache (`must_be_drawn` forces a full offscreen render+upload
+    /// per queued frame), and with many videos the upload demand sits at the renderer-thread
+    /// throughput limit, so any hiccup (e.g. a synchronized loop-restart burst) amplifies into
+    /// multi-second stalls unless stale frames are dropped here at the source. Only the newest
+    /// frame of each video has display value. Kill switch:
+    /// `SERVO_DISABLE_VIDEO_UPDATE_COALESCE`.
+    pending_video_frame_updates: RefCell<FxHashMap<ImageKey, (ImageDescriptor, SerializableImageData)>>,
 
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
@@ -351,10 +386,12 @@ impl Painter {
             overlapping_frame_request_count: Default::default(),
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
+            display_composite_in_flight: Default::default(),
             present_cadence_start: Default::default(),
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
             present_cadence_max_gap_ms: Default::default(),
+            last_render_end: Default::default(),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -366,6 +403,7 @@ impl Painter {
             frame_delayer: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
+            pending_video_frame_updates: RefCell::new(FxHashMap::default()),
             web_content_animator: WebContentAnimator::new(
                 paint.event_loop_waker.clone_box(),
                 (*timer_refresh_driver).clone(),
@@ -544,12 +582,29 @@ impl Painter {
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
+        // Diagnostic (SERVO_LOG_PRESENT_CADENCE): a large gap since the END of the previous
+        // render pass means the stall happened upstream of the renderer (no render was
+        // requested during the gap), as opposed to a slow render pass itself ("Slow paint
+        // frame" below).
+        if *LOG_PRESENT_CADENCE {
+            if let Some(last_end) = self.last_render_end.get() {
+                let gap_ms = last_end.elapsed().as_secs_f64() * 1000.0;
+                if gap_ms > 100.0 {
+                    info!(
+                        "Paint gap: painter {:?} gap_since_last_render_end_ms={:.1}",
+                        self.painter_id, gap_ms,
+                    );
+                }
+            }
+        }
+
         // Diagnostic breakdown (env SERVO_LOG_PRESENT_CADENCE): WebRender update() applies
         // pending resource updates (notably per-frame video texture uploads); render() draws
         // and composites the scene. Splitting them tells whether an over-budget frame is
         // upload-bound or draw/composite-bound.
         let mut wr_update_ms = 0.0_f64;
         let mut wr_render_ms = 0.0_f64;
+        let mut wr_stats: Option<webrender::RendererStats> = None;
         {
             let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
@@ -577,7 +632,10 @@ impl Painter {
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
                         let draw_start = Instant::now();
-                        renderer.render(size, 0 /* buffer_age */).ok();
+                        wr_stats = renderer
+                            .render(size, 0 /* buffer_age */)
+                            .ok()
+                            .map(|results| results.stats);
                         wr_render_ms = draw_start.elapsed().as_secs_f64() * 1000.0;
                     }
                 }
@@ -592,12 +650,32 @@ impl Painter {
         self.send_pending_paint_metrics_messages_after_composite();
 
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        // This render pass consumed every frame published so far (renderer.update() above
+        // drained the whole publish queue), so the in-flight display composite is done.
+        self.display_composite_in_flight.set(false);
+        if *LOG_PRESENT_CADENCE {
+            self.last_render_end.set(Some(Instant::now()));
+        }
         // Diagnostic: surface frames that blew the ~16.7ms vsync budget, with the WebRender
-        // upload-vs-draw split, to localize the bottleneck under heavy load (many videos).
+        // upload-vs-draw split plus renderer stats (video texture upload MB / texture cache
+        // update ms / draw calls), to localize the bottleneck under heavy load (many videos).
+        // A stall frame with normal upload_mb points at a driver/GPU sync or cache
+        // reallocation; one with a big upload_mb spike points at an upload burst.
         if *LOG_PRESENT_CADENCE && render_ms > 16.0 {
+            let (upload_mb, upload_ms, draw_calls) =
+                wr_stats.as_ref().map_or((0.0, 0.0, 0), |stats| {
+                    (
+                        stats.texture_upload_mb,
+                        stats.resource_upload_time,
+                        stats.total_draw_calls,
+                    )
+                });
             info!(
-                "Slow paint frame: painter {:?} total_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2}",
-                self.painter_id, render_ms, wr_update_ms, wr_render_ms,
+                "Slow paint frame: painter {:?} total_ms={:.2} wr_update_ms={:.2} \
+                 wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} \
+                 pending_frames={}",
+                self.painter_id, render_ms, wr_update_ms, wr_render_ms, upload_mb, upload_ms,
+                draw_calls, self.pending_frames.get(),
             );
         }
         if self.rendering_context.requested_gpu_index().is_some() {
@@ -840,6 +918,9 @@ impl Painter {
         wall_logical_frame_id: Option<u64>,
         wall_requested_at: Option<Instant>,
     ) {
+        // Every composite carries the newest coalesced video frames, so held updates wait at
+        // most until the next generated frame (see `pending_video_frame_updates`).
+        self.flush_pending_video_frame_updates(transaction);
         let reason_diagnostic = format!("{reason:?}");
         transaction.generate_frame(0, true /* present */, false /* tracked */, reason);
         let pending_frames_before_request = self.pending_frames.get();
@@ -856,6 +937,15 @@ impl Painter {
 
     pub(crate) fn pending_frames(&self) -> usize {
         self.pending_frames.get()
+    }
+
+    /// Move all held latest-wins video frame updates into `transaction`.
+    /// See `pending_video_frame_updates` for the rationale.
+    fn flush_pending_video_frame_updates(&self, transaction: &mut Transaction) {
+        let mut pending_updates = self.pending_video_frame_updates.borrow_mut();
+        for (key, (descriptor, data)) in pending_updates.drain() {
+            transaction.update_image(key, descriptor, data.into(), &DirtyRect::All);
+        }
     }
 
     pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
@@ -1080,10 +1170,27 @@ impl Painter {
         self.send_transaction(txn);
     }
 
+    /// True while a display-paced composite is in flight (requested but not yet rendered);
+    /// see `display_composite_in_flight`. Requesting more display composites in this state
+    /// makes things strictly worse: every publish queued behind the renderer whose resource
+    /// updates touch the texture cache `must_be_drawn`, so `Renderer::update()` fully
+    /// renders it offscreen (~60-100ms each with a 45-video grid), amplifying a small
+    /// hiccup into multi-second stalls. Skipped requests lose nothing: the next composite
+    /// carries the newest coalesced video frames. In the healthy steady state requests and
+    /// renders alternate 1:1 on this thread, so this gate never throttles.
+    fn renderer_behind(&self) -> bool {
+        self.display_composite_in_flight.get()
+    }
+
     pub(crate) fn note_webrender_frame_ready(
         &self,
         need_repaint: bool,
     ) -> Option<FrameReadyDiagnostic> {
+        if !need_repaint {
+            // No render pass will follow this frame-ready, so an in-flight display
+            // composite (if any) must be considered consumed here.
+            self.display_composite_in_flight.set(false);
+        }
         let pending_frames = self.pending_frames.get();
         if pending_frames == 0 {
             let unexpected_frame_ready_count = self.unexpected_frame_ready_count.get() + 1;
@@ -1458,6 +1565,13 @@ impl Painter {
             return false;
         }
 
+        // Skip requesting this composite while the renderer is still draining previously
+        // published frames (see `renderer_behind`). The pending-frame flag stays set, so a
+        // subsequent `update_images` call regenerates once the renderer has caught up.
+        if self.renderer_behind() {
+            return false;
+        }
+
         let mut transaction = Transaction::new();
         self.generate_frame_with_diagnostic_id(
             &mut transaction,
@@ -1465,6 +1579,7 @@ impl Painter {
             Some(diagnostic_frame_id),
             Some(wall_requested_at),
         );
+        self.display_composite_in_flight.set(true);
         self.send_transaction(transaction);
 
         let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
@@ -1523,14 +1638,28 @@ impl Painter {
                     txn.delete_image(key);
                     self.frame_delayer.delete_image(key);
                     self.animation_image_cache.remove(&key);
+                    // A held (not yet flushed) update for a deleted key must never reach
+                    // WebRender after the delete.
+                    self.pending_video_frame_updates.borrow_mut().remove(&key);
                 },
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
-                    } else {
+                        txn.update_image(key, desc, data.into(), &DirtyRect::All);
+                    } else if *VIDEO_UPDATE_COALESCE_DISABLED {
                         immediate_image_update = true;
+                        txn.update_image(key, desc, data.into(), &DirtyRect::All);
+                    } else {
+                        // Latest wins: overwrite any not-yet-composited frame for this key.
+                        // The stash is flushed into the next composite by
+                        // `generate_frame_with_diagnostic_id`, so stale video frames are
+                        // dropped here instead of piling up in WebRender's queues (which
+                        // cannot skip them; see `pending_video_frame_updates`).
+                        immediate_image_update = true;
+                        self.pending_video_frame_updates
+                            .borrow_mut()
+                            .insert(key, (desc, data));
                     }
-                    txn.update_image(key, desc, data.into(), &DirtyRect::All)
                 },
                 ImageUpdate::UpdateImageForAnimation(image_key, desc) => {
                     let Some(image) = self.animation_image_cache.get(&image_key) else {
@@ -1548,9 +1677,13 @@ impl Painter {
         }
 
         let mut generated_frame = false;
-        if self.frame_delayer.needs_new_frame() {
+        // `renderer_behind`: while the renderer is draining published frames, defer this
+        // composite; the pending-frame flag stays set and one of the frequent subsequent
+        // `update_images` calls regenerates once the renderer has caught up.
+        if self.frame_delayer.needs_new_frame() && !self.renderer_behind() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            self.display_composite_in_flight.set(true);
             generated_frame = true;
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
 
@@ -1586,12 +1719,19 @@ impl Painter {
             !generated_frame &&
             self.pending_frames.get() == 0 &&
             !raf_driving_composites &&
+            !self.renderer_behind() &&
             !*VIDEO_IMMEDIATE_COMPOSITE_DISABLED
         {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            self.display_composite_in_flight.set(true);
         }
 
-        self.send_transaction(txn);
+        // With coalescing, a call that only stashed video frames produces an empty
+        // transaction (the stash is flushed by the next composite); skip the send to avoid
+        // pushing hundreds of no-op transactions per second through the scene builder.
+        if !txn.is_empty() {
+            self.send_transaction(txn);
+        }
     }
 
     pub(crate) fn delay_new_frames_for_canvas(
