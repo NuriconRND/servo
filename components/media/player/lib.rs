@@ -103,6 +103,13 @@ pub trait Player: Send + MediaInstance {
     fn can_resume(&self) -> bool;
     fn stop(&self) -> Result<(), PlayerError>;
     fn seek(&self, time: f64) -> Result<(), PlayerError>;
+    /// Hint that playback should loop back to the start on reaching the end. Backends may
+    /// use this to loop seamlessly below the script layer (no EOS is emitted while
+    /// looping); the default does nothing, in which case the element loops through the
+    /// spec's EOS -> "ended" -> seek(0) path.
+    fn set_looping(&self, _looping: bool) -> Result<(), PlayerError> {
+        Ok(())
+    }
     fn seekable(&self) -> Vec<Range<f64>>;
     fn set_mute(&self, muted: bool) -> Result<(), PlayerError>;
     fn muted(&self) -> bool;

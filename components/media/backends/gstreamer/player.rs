@@ -50,6 +50,14 @@ const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BAC
 // many simultaneous <video> elements this explodes thread count and memory. Unset = leave
 // automatic (no change, e.g. for the single 4K wall video that needs multithreaded decode).
 const AVDEC_MAX_THREADS_ENV: &str = "SERVO_GSTREAMER_AVDEC_MAX_THREADS";
+// Opt-in seamless (gapless) looping for <video loop>. The spec path loops via
+// EOS -> script "ended" handling -> flushing seek(0), which stalls the decoder pipeline at
+// every loop boundary; with many simultaneous videos each boundary shows up as a visible
+// display hold (frames held 3+ refreshes). When enabled and the element has the loop
+// attribute, the pipeline instead runs in SEGMENT-seek mode and is rewound with a
+// NON-flushing SEGMENT seek on SEGMENT_DONE: decoders never flush and no EOS reaches the
+// script layer while looping.
+const GAPLESS_LOOP_ENV: &str = "SERVO_MEDIA_GAPLESS_LOOP";
 const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
 const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 
@@ -426,6 +434,131 @@ struct PlayerInner {
     last_metadata: Option<Metadata>,
     cat: gstreamer::DebugCategory,
     enough_data: Arc<AtomicBool>,
+    /// Whether the element wants looping playback (see `GAPLESS_LOOP_ENV`; always false
+    /// when the env knob is off, in which case looping stays on the spec's EOS path).
+    looping: Cell<bool>,
+    /// Whether the pipeline is currently in SEGMENT-seek mode for gapless looping.
+    segment_loop_active: Cell<bool>,
+    /// Channel to the gapless-loop worker thread (`None` when `GAPLESS_LOOP_ENV` is off).
+    gapless_loop_sender: Option<Sender<GaplessLoopMsg>>,
+    /// Sync-group start (see `SYNC_GROUP_ENV`): play() was requested but the pipeline is
+    /// held paused until the group releases.
+    sync_hold: Cell<bool>,
+    /// Whether this pipeline has been armed and registered with the sync group.
+    sync_armed: Cell<bool>,
+}
+
+/// Messages for the gapless-loop worker thread (see `GAPLESS_LOOP_ENV`).
+enum GaplessLoopMsg {
+    /// (Re-)evaluate whether the pipeline should enter SEGMENT-seek mode.
+    MaybeEnter,
+    /// The current segment finished; rewind with a non-flushing SEGMENT seek.
+    SegmentDone,
+    /// Arm this pipeline for a synchronized group start (see `SYNC_GROUP_ENV`).
+    ArmSyncGroup,
+}
+
+// Opt-in synchronized start for many simultaneous <video> pipelines (video wall).
+// SERVO_MEDIA_SYNC_GROUP=N holds each seekable pipeline paused-prerolled (armed at
+// position 0, in SEGMENT mode when gapless looping is also enabled) until N pipelines are
+// ready, then starts them all on a shared system clock with an identical base time so they
+// render in frame-level lockstep (the standard GStreamer multi-pipeline sync recipe).
+// Combined with gapless looping the lockstep persists across loop boundaries, because the
+// non-flushing SEGMENT rewinds preserve running-time continuity. A watchdog releases the
+// group after 30s even if fewer than N pipelines arrived.
+const SYNC_GROUP_ENV: &str = "SERVO_MEDIA_SYNC_GROUP";
+
+fn sync_group_target() -> Option<usize> {
+    static TARGET: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+        env::var(SYNC_GROUP_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|count| *count >= 2)
+    });
+    *TARGET
+}
+
+struct SyncGroupMember {
+    play: gstreamer_play::Play,
+    pipeline: gstreamer::Element,
+}
+
+struct SyncGroupState {
+    members: Vec<SyncGroupMember>,
+    released: bool,
+    watchdog_started: bool,
+}
+
+static SYNC_GROUP: std::sync::LazyLock<Mutex<SyncGroupState>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(SyncGroupState {
+            members: Vec::new(),
+            released: false,
+            watchdog_started: false,
+        })
+    });
+
+fn sync_group_released() -> bool {
+    SYNC_GROUP.lock().unwrap().released
+}
+
+/// Start every member pipeline in lockstep: shared clock, disabled automatic base-time
+/// adjustment, identical base time slightly in the future, then PLAYING for all.
+fn release_sync_group(members: &[SyncGroupMember]) {
+    let clock = gstreamer::SystemClock::obtain();
+    let base = clock.time() + gstreamer::ClockTime::from_mseconds(500);
+    for member in members {
+        if let Ok(pipeline) = member.pipeline.clone().downcast::<gstreamer::Pipeline>() {
+            pipeline.use_clock(Some(&clock));
+        }
+        member.pipeline.set_start_time(gstreamer::ClockTime::NONE);
+        member.pipeline.set_base_time(base);
+    }
+    for member in members {
+        member.play.play();
+    }
+    log::info!(
+        "Sync group released: {} pipelines starting at shared base time",
+        members.len()
+    );
+}
+
+/// Register an armed pipeline; releases the whole group when the target count is reached.
+fn register_sync_member(play: gstreamer_play::Play, pipeline: gstreamer::Element) {
+    let Some(target) = sync_group_target() else {
+        play.play();
+        return;
+    };
+    let mut state = SYNC_GROUP.lock().unwrap();
+    if state.released {
+        drop(state);
+        play.play();
+        return;
+    }
+    state.members.push(SyncGroupMember { play, pipeline });
+    log::info!("Sync group: {}/{} pipelines armed", state.members.len(), target);
+    if !state.watchdog_started {
+        state.watchdog_started = true;
+        let _ = std::thread::Builder::new()
+            .name(String::from("GstSyncGroupWatchdog"))
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let mut state = SYNC_GROUP.lock().unwrap();
+                if !state.released {
+                    state.released = true;
+                    log::warn!(
+                        "Sync group timeout: releasing {} of {} pipelines",
+                        state.members.len(),
+                        target
+                    );
+                    release_sync_group(&state.members);
+                }
+            });
+    }
+    if state.members.len() >= target {
+        state.released = true;
+        release_sync_group(&state.members);
+    }
 }
 
 impl PlayerInner {
@@ -512,8 +645,31 @@ impl PlayerInner {
 
         self.paused.set(false);
         self.can_resume.set(false);
+        // Synchronized group start (see `SYNC_GROUP_ENV`): hold the pipeline paused and
+        // prerolled; the sync group releases every member simultaneously on a shared
+        // clock. Arming happens once metadata is known (`request_sync_group_arm`).
+        if sync_group_target().is_some() &&
+            self.stream_type == StreamType::Seekable &&
+            !sync_group_released()
+        {
+            self.sync_hold.set(true);
+            self.player.pause();
+            self.request_sync_group_arm();
+            return Ok(());
+        }
         self.player.play();
         Ok(())
+    }
+
+    /// Ask the worker thread to arm this pipeline for the synchronized group start.
+    /// No-op until metadata is known (the pipeline must have prerolled real media).
+    fn request_sync_group_arm(&self) {
+        if !self.sync_hold.get() || self.sync_armed.get() || self.last_metadata.is_none() {
+            return;
+        }
+        if let Some(ref sender) = self.gapless_loop_sender {
+            let _ = sender.send(GaplessLoopMsg::ArmSyncGroup);
+        }
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
@@ -532,6 +688,8 @@ impl PlayerInner {
 
         self.paused.set(true);
         self.can_resume.set(true);
+        // A real pause request cancels a pending synchronized start hold.
+        self.sync_hold.set(false);
         self.player.pause();
         Ok(())
     }
@@ -573,9 +731,35 @@ impl PlayerInner {
         }
 
         let time = time * 1_000_000_000.;
+        // A regular (flushing, non-SEGMENT) seek takes the pipeline out of segment-loop
+        // mode; `connect_seek_done` re-enters it once the seek settles.
+        self.segment_loop_active.set(false);
         self.player
             .seek(gstreamer::ClockTime::from_nseconds(time as u64));
         Ok(())
+    }
+
+    pub fn set_looping(&mut self, looping: bool) -> Result<(), PlayerError> {
+        if !env_flag_enabled(GAPLESS_LOOP_ENV) {
+            return Ok(());
+        }
+        self.looping.set(looping);
+        self.request_segment_loop_entry();
+        Ok(())
+    }
+
+    /// Ask the gapless-loop worker thread to (re-)evaluate entering SEGMENT-seek mode.
+    /// This only posts a message: the actual pipeline seek MUST NOT run on GstPlay signal
+    /// dispatch threads or while the `PlayerInner` mutex is held (both can deadlock or
+    /// stall the pipeline), so all seeking happens on the dedicated worker (see `setup`).
+    fn request_segment_loop_entry(&self) {
+        // Cheap pre-filter: this is also called from the frequent position-updated signal.
+        if !self.looping.get() || self.segment_loop_active.get() {
+            return;
+        }
+        if let Some(ref sender) = self.gapless_loop_sender {
+            let _ = sender.send(GaplessLoopMsg::MaybeEnter);
+        }
     }
 
     pub fn set_volume(&mut self, volume: f64) -> Result<(), PlayerError> {
@@ -934,6 +1118,11 @@ impl GStreamerPlayer {
             last_metadata: None,
             cat: gstreamer::DebugCategory::get("servoplayer").unwrap(),
             enough_data: Arc::new(AtomicBool::new(false)),
+            looping: Cell::new(false),
+            segment_loop_active: Cell::new(false),
+            gapless_loop_sender: None,
+            sync_hold: Cell::new(false),
+            sync_armed: Cell::new(false),
         })));
 
         let inner = self.inner.borrow();
@@ -954,7 +1143,15 @@ impl GStreamerPlayer {
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
-            inner_clone.lock().unwrap().play_state = play_state;
+            {
+                let mut inner = inner_clone.lock().unwrap();
+                inner.play_state = play_state;
+                if play_state == gstreamer_play::PlayState::Playing {
+                    // Gapless looping arms itself once the pipeline is actually playing
+                    // (no-op unless `set_looping(true)` was requested).
+                    inner.request_segment_loop_entry();
+                }
+            }
 
             let state = match play_state {
                 gstreamer_play::PlayState::Buffering => Some(PlaybackState::Buffering),
@@ -970,17 +1167,208 @@ impl GStreamerPlayer {
 
         let observer = self.observer.clone();
         // Handle `position-update` signal.
+        let inner_clone = inner.clone();
         signal_adapter.connect_position_updated(move |_, position| {
+            // Gapless looping delays segment-mode entry until playback is well underway
+            // (see the worker's position gate); this periodic signal retries the entry.
+            inner_clone.lock().unwrap().request_segment_loop_entry();
             if let Some(seconds) = position.map(|p| p.seconds_f64()) {
                 let _ = notify!(observer, PlayerEvent::PositionChanged(seconds));
             }
         });
 
         let observer = self.observer.clone();
+        let inner_clone = inner.clone();
         // Handle `seek-done` signal.
         signal_adapter.connect_seek_done(move |_, position| {
+            // A regular seek (e.g. the user dragging the scrubber) cancels segment-loop
+            // mode; re-enter it once the seek has settled.
+            inner_clone.lock().unwrap().request_segment_loop_entry();
             let _ = notify!(observer, PlayerEvent::SeekDone(position.seconds_f64()));
         });
+
+        // Gapless looping (`GAPLESS_LOOP_ENV`) and synchronized group start
+        // (`SYNC_GROUP_ENV`): all pipeline seeking happens on this dedicated worker
+        // thread. Entering segment mode or rewinding from GstPlay signal threads / bus
+        // callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
+        // pipeline, so signal handlers only post messages here.
+        if env_flag_enabled(GAPLESS_LOOP_ENV) || sync_group_target().is_some() {
+            let pipeline = inner.lock().unwrap().player.pipeline();
+            if let Some(bus) = pipeline.bus() {
+                let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
+                inner.lock().unwrap().gapless_loop_sender = Some(loop_sender.clone());
+                let pipeline_weak = pipeline.downgrade();
+                let inner_for_loop = inner.clone();
+                std::thread::Builder::new()
+                    .name(String::from("GstGaplessLoop"))
+                    .spawn(move || {
+                        let mut last_rewind: Option<std::time::Instant> = None;
+                        while let Ok(message) = loop_receiver.recv() {
+                            let Some(pipeline) = pipeline_weak.upgrade() else {
+                                return;
+                            };
+                            match message {
+                                GaplessLoopMsg::MaybeEnter => {
+                                    {
+                                        let inner = inner_for_loop.lock().unwrap();
+                                        if !inner.looping.get() ||
+                                            inner.segment_loop_active.get() ||
+                                            inner.stream_type != StreamType::Seekable ||
+                                            inner.play_state !=
+                                                gstreamer_play::PlayState::Playing ||
+                                            inner.last_metadata.is_none()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    // Enter only once playback is well underway. A segment
+                                    // seek during startup (preroll still settling, e.g.
+                                    // dozens of pipelines starting at once) can wedge the
+                                    // pipeline before its first frame, leaving a dead
+                                    // tile. The position-updated signal retries this
+                                    // entry periodically, so skipping here is safe.
+                                    let Some(position) =
+                                        pipeline.query_position::<gstreamer::ClockTime>()
+                                    else {
+                                        continue;
+                                    };
+                                    if position < gstreamer::ClockTime::from_mseconds(500) {
+                                        continue;
+                                    }
+                                    {
+                                        // Re-check and claim the mode before seeking
+                                        // (reverted on failure) so racing MaybeEnter
+                                        // messages do not double-seek.
+                                        let inner = inner_for_loop.lock().unwrap();
+                                        if !inner.looping.get() || inner.segment_loop_active.get()
+                                        {
+                                            continue;
+                                        }
+                                        inner.segment_loop_active.set(true);
+                                    }
+                                    match pipeline.seek(
+                                        1.0,
+                                        gstreamer::SeekFlags::FLUSH |
+                                            gstreamer::SeekFlags::SEGMENT |
+                                            gstreamer::SeekFlags::ACCURATE,
+                                        gstreamer::SeekType::Set,
+                                        position,
+                                        gstreamer::SeekType::None,
+                                        gstreamer::ClockTime::NONE,
+                                    ) {
+                                        Ok(()) => {
+                                            log::info!(
+                                                "Gapless loop: entered segment mode at {position}"
+                                            );
+                                        },
+                                        Err(error) => {
+                                            log::warn!(
+                                                "Gapless loop: segment mode entry failed: {error:?}"
+                                            );
+                                            inner_for_loop
+                                                .lock()
+                                                .unwrap()
+                                                .segment_loop_active
+                                                .set(false);
+                                        },
+                                    }
+                                },
+                                GaplessLoopMsg::ArmSyncGroup => {
+                                    let play_handle = {
+                                        let inner = inner_for_loop.lock().unwrap();
+                                        if !inner.sync_hold.get() || inner.sync_armed.get() {
+                                            continue;
+                                        }
+                                        inner.sync_armed.set(true);
+                                        // When gapless looping is on, arm SEGMENT mode at
+                                        // position 0 while still paused: the pipeline
+                                        // re-prerolls at 0 in segment mode, so the
+                                        // synchronized start needs no later flushing seek
+                                        // (which would break lockstep).
+                                        if env_flag_enabled(GAPLESS_LOOP_ENV) {
+                                            inner.segment_loop_active.set(true);
+                                        }
+                                        inner.player.clone()
+                                    };
+                                    if env_flag_enabled(GAPLESS_LOOP_ENV) {
+                                        if let Err(error) = pipeline.seek(
+                                            1.0,
+                                            gstreamer::SeekFlags::FLUSH |
+                                                gstreamer::SeekFlags::SEGMENT |
+                                                gstreamer::SeekFlags::ACCURATE,
+                                            gstreamer::SeekType::Set,
+                                            gstreamer::ClockTime::ZERO,
+                                            gstreamer::SeekType::None,
+                                            gstreamer::ClockTime::NONE,
+                                        ) {
+                                            log::warn!(
+                                                "Sync group: segment arm seek failed: {error:?}"
+                                            );
+                                            inner_for_loop
+                                                .lock()
+                                                .unwrap()
+                                                .segment_loop_active
+                                                .set(false);
+                                        }
+                                    }
+                                    register_sync_member(play_handle, pipeline.clone());
+                                },
+                                GaplessLoopMsg::SegmentDone => {
+                                    let looping = {
+                                        let inner = inner_for_loop.lock().unwrap();
+                                        inner.looping.get() && inner.segment_loop_active.get()
+                                    };
+                                    if !looping {
+                                        continue;
+                                    }
+                                    // Storm guard: a SEGMENT_DONE right after the previous
+                                    // rewind means the segment finished without playing
+                                    // real data; leave segment mode instead of rewinding
+                                    // in a tight loop.
+                                    if let Some(previous) = last_rewind &&
+                                        previous.elapsed() <
+                                            std::time::Duration::from_millis(1000)
+                                    {
+                                        log::warn!(
+                                            "Gapless loop: rewind storm detected; leaving segment mode"
+                                        );
+                                        inner_for_loop
+                                            .lock()
+                                            .unwrap()
+                                            .segment_loop_active
+                                            .set(false);
+                                        continue;
+                                    }
+                                    last_rewind = Some(std::time::Instant::now());
+                                    // No FLUSH flag: decoders keep their state and the
+                                    // pipeline wraps to the start without a stall or EOS.
+                                    if let Err(error) = pipeline.seek(
+                                        1.0,
+                                        gstreamer::SeekFlags::SEGMENT,
+                                        gstreamer::SeekType::Set,
+                                        gstreamer::ClockTime::ZERO,
+                                        gstreamer::SeekType::None,
+                                        gstreamer::ClockTime::NONE,
+                                    ) {
+                                        log::warn!(
+                                            "Gapless loop: rewind seek failed: {error:?}"
+                                        );
+                                    }
+                                },
+                            }
+                        }
+                    })
+                    .expect("Could not create GstGaplessLoop thread.");
+                bus.enable_sync_message_emission();
+                // The callback must be Sync; mpsc senders are not, so guard with a mutex.
+                let loop_sender = Mutex::new(loop_sender);
+                bus.connect_sync_message(Some("segment-done"), move |_, _| {
+                    if let Ok(sender) = loop_sender.lock() {
+                        let _ = sender.send(GaplessLoopMsg::SegmentDone);
+                    }
+                });
+            }
+        }
 
         // Handle `media-info-updated` signal.
         let inner_clone = inner.clone();
@@ -1026,6 +1414,10 @@ impl GStreamerPlayer {
                 "Metadata updated: {:?}",
                 metadata
             );
+            // Gapless looping waits for prerolled media; metadata arrival may be the
+            // last missing condition. Same for arming a synchronized group start.
+            inner.request_segment_loop_entry();
+            inner.request_sync_group_arm();
             let _ = notify!(observer, PlayerEvent::MetadataUpdated(metadata));
 
             if send_pause_event {
@@ -1287,6 +1679,7 @@ impl Player for GStreamerPlayer {
     inner_player_proxy_getter!(playback_rate, f64, DEFAULT_PLAYBACK_RATE);
     inner_player_proxy!(push_data, data, Vec<u8>);
     inner_player_proxy!(seek, time, f64);
+    inner_player_proxy!(set_looping, looping, bool);
     inner_player_proxy!(set_volume, volume, f64);
     inner_player_proxy_getter!(volume, f64, DEFAULT_VOLUME);
     inner_player_proxy_getter!(buffered, Vec<Range<f64>>, DEFAULT_TIME_RANGES);

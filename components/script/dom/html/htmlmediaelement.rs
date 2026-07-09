@@ -1190,6 +1190,12 @@ impl HTMLMediaElement {
                 if let Err(error) = player.set_volume(self.volume.get()) {
                     warn!("Could not set the volume: {error:?}");
                 }
+                // Backends that support it loop seamlessly below the script layer (no EOS
+                // while looping); otherwise this is a no-op and looping uses the spec's
+                // EOS -> "ended" -> seek(0) path in end_of_playback_in_forwards_direction.
+                if let Err(error) = player.set_looping(self.Loop()) {
+                    warn!("Could not set player looping: {error:?}");
+                }
                 if let Err(error) = player.play() {
                     error!("Could not play media: {error:?}");
                 }
