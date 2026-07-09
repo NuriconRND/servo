@@ -2,5 +2,6 @@
 // and a valid python list[str] after stripping the `//` comments at the beginning of lines (from gstreamer.py).
 [
 // gst-plugins-bad
-"gstwasapi"
+"gstwasapi",
+"gstd3d11"
 ]
