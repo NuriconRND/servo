@@ -24,8 +24,12 @@ pub struct SharedGstD3D11Device {
     allocator: *mut GstD3D11Allocator,
 }
 
-// 안전성: GstD3D11Device는 스레드 안전(GObject + 내부 뮤텍스). immediate context는
-// lock()/DeviceLockGuard로 직렬화해서만 접근한다.
+// 안전성:
+// - `device`: GstD3D11Device는 스레드 안전(GObject + 내부 뮤텍스). immediate context는
+//   lock()/DeviceLockGuard로 직렬화해서만 접근한다.
+// - `allocator`: GstD3D11Allocator는 GstAllocator(GObject) 파생 — 참조계수와 alloc API가
+//   스레드 안전하다. 우리는 이 포인터를 gst_d3d11_allocator_alloc_wrapped 호출 인자로
+//   전달만 하고 내부 상태를 직접 건드리지 않는다.
 unsafe impl Send for SharedGstD3D11Device {}
 unsafe impl Sync for SharedGstD3D11Device {}
 

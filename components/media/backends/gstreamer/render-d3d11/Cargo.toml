@@ -21,6 +21,8 @@ log = { workspace = true }
 servo-config = { workspace = true }
 servo-media-gstreamer-render = { workspace = true }
 servo-media-player = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = [
     "d3d11",
     "dxgi",
@@ -31,5 +33,5 @@ winapi = { workspace = true, features = [
 ] }
 wio = { workspace = true }
 
-[dev-dependencies]
+[target.'cfg(windows)'.dev-dependencies]
 gstreamer-app = { workspace = true }
