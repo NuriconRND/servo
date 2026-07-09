@@ -18,5 +18,7 @@ mod headless_window;
 mod keyutils;
 mod protocols;
 mod tracing;
+#[cfg(target_os = "windows")]
+pub(crate) mod vsync_refresh_driver;
 #[cfg(feature = "webxr")]
 mod webxr;
