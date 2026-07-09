@@ -1,0 +1,169 @@
+================================================================================
+ 멀티-GPU 비디오 월: 비디오 그리드 성능 조사 요약
+ 브랜치: video-perf-investigation   /   커밋: 7831b1c1e4b
+ (UTF-8. 에디터(VS Code/메모장)에서 여세요. cmd에서 type 하면 한글이 깨질 수 있음)
+================================================================================
+
+두 개의 별개 질문이 있었고, 근본 원인이 서로 다릅니다.
+  - 1단계: Chrome 대비 CPU 폭증            (CPU 관점)
+  - 2단계: 16프로세스 분리 시엔 정상인 framerate 저하  (프레임레이트 관점)
+
+
+================================================================================
+ 1단계 — CPU 폭증 (Chrome/Edge 대비), CPU 관점
+================================================================================
+
+질문:
+  FHD30 mp4 그리드를 winit_wall로 열면 Chrome/Edge보다 CPU가 훨씬 많이 쓰인다.
+
+조사·확인한 원인 (servo-media GStreamer Windows 경로):
+
+  (1) 기본 SW 디코드 강제
+      - lib.rs 의 VideoDecoderPolicy 기본값이 Software.
+      - d3d11/nvcodec HW 디코더를 전부 Rank::NONE 으로 강등하고
+        avdec_h264(CPU)를 승격. 번들에 HW 디코더 DLL이 있는데도 차단.
+      - 복구: 환경변수 SERVO_GSTREAMER_VIDEO_DECODER_POLICY=auto
+
+  (2) <video> 마다 독립 playbin3 파이프라인
+      - 풀링 없이 N개 avdec 스레드 병렬.
+      - (1) x (2) 가 곱셈으로 CPU 포화.
+
+  (3) Windows zero-copy 부재
+      - render.rs 가 RenderDummy 라 appsink 를 I420 시스템메모리로 핀.
+      - HW 디코드 시에도 GPU->CPU download + NV12->I420 변환 발생.
+
+검증한 사실:
+  - WebRender 는 NV12 를 native 로 받음 (소스 확인).
+    * display_item.rs 의 YuvData::NV12 / PlanarYCbCr
+    * Servo htmlmediaelement.rs 에 NV12 경로가 완전 배선되어 있음
+  - 즉 I420 강요는 군더더기.
+  - YUV->RGB 색변환은 이미 GPU 셰이더에서 수행됨.
+    videoconvert 는 색변환이 아니라 NV12<->I420 레이아웃 repack 일 뿐.
+
+
+================================================================================
+ 2단계 — Framerate 저하 (16프로세스 분리 시엔 정상), 프레임레이트 관점
+================================================================================
+
+핵심 반증 (사용자 제공):
+  같은 16영상을 16개 OS 프로세스로 돌리면 정상 framerate.
+  1 프로세스 winit_wall 에서만 저하.
+  => 디코드는 무죄. 단일 composite 파이프라인이 병목.
+
+접근:
+  "측정 우선". painter.rs 에 계측 추가 (초당 1줄):
+    composite_fps / update_ms(업로드) / draw_ms(래스터) / uploads /
+    generate attempts vs emitted.
+  릴리스 winit_wall 빌드해 실측.
+
+가설을 하나씩 측정으로 배제:
+  ----------------------------------------------------------------------------
+  가설                          검증                  결과
+  ----------------------------------------------------------------------------
+  SW 디코드가 범인              video_uploads/s       1440 = 16x30x3, 완벽
+                                                      keep-up -> 배제
+  (a) 합성 트리거 과다          emitted vs attempts   40 vs 480, 이미
+      (coalesce 필요)                                 pending_frames 가드가
+                                                      합침 -> (a) no-op
+  (b) 부분 damage (draw 절감)   draw_ms               모든 해상도 6~15ms로
+                                                      작음 -> (b) 무효
+  present 백프레셔              glFinish 펜스 실험     update 여전히 ~600ms,
+                                                      draw만 17->40 ->
+                                                      GPU래스터/present 배제
+  프레임버퍼 면적 단독          1영상@3840x3240        2.9ms / 49fps ->
+                                                      순수 면적 아님
+  WebRender picture caching     picture_tile_size 스윕 256px->3366ms => 확정
+  ----------------------------------------------------------------------------
+
+해상도 스케일링 (16영상):
+  ----------------------------------------------------------------------------
+  surface          Mpx     update_ms     draw_ms   present_ms   composite_fps
+  ----------------------------------------------------------------------------
+  1920x1080        2.1     ~10           ~7        -            ~36
+  2560x1440        3.7     ~15           ~8        -            ~33
+  3840x2160        8.3     ~25           ~8        ~0.8         ~23
+  3840x2592       10.0     ~160~290      ~8        ~0.8         ~3~5   (폭발)
+  3840x3240       12.4     ~420~670      ~12       ~0.8         ~1~2   (폭발)
+  ----------------------------------------------------------------------------
+  * present 은 모든 해상도에서 ~0.8ms (swap/백프레셔 아님).
+  * 절벽은 면적 ~8 -> 10 Mpx 사이.
+
+타일 크기 스윕 (16영상 @ 3840x3240):
+  ----------------------------------------------------------------------------
+  picture_tile          타일 수      update_ms
+  ----------------------------------------------------------------------------
+  256x256               ~195         ~3366       (파국)
+  기본 1024x512         ~28          ~350~670
+  4096x4096             1            ~400~570    (회복 안 됨)
+  ----------------------------------------------------------------------------
+  => 타일 크기가 update_ms 를 극적으로 좌우 -> picture caching 확정.
+  => 단, 1타일로 줄여도 회복 안 됨 -> 단순 "타일 수" 문제가 아님.
+
+
+================================================================================
+ 확정된 근본 원인
+================================================================================
+
+renderer.update() 안에서 처리되는 WebRender picture caching 의
+dirty/타일 추적 비용.
+
+  - (매 프레임 변하는 독립 primitive 수) x (큰 뷰포트 면적) 으로 폭발.
+    => ~8~10 Mpx 절벽.
+  - all-dynamic 비디오 월에선 캐싱 이득이 0 (전부 dirty) 인데
+    추적 비용만 폭발.
+  - WebRender 0.68 엔 picture caching 런타임 비활성 토글 없음
+    (DebugFlags 에 DISABLE 없음, options 엔 picture_tile_size 만).
+
+모순까지 일관 설명:
+  - 1영상은 12.4Mpx 여도 빠름 (dirty primitive 1개).
+  - 16영상은 면적이 커질 때만 폭발.
+
+
+================================================================================
+ 산출물
+================================================================================
+
+커밋 7831b1c1e4b (브랜치 video-perf-investigation):
+  - 계측 코드 (전부 env 게이트, 평시 빌드/실행에 영향 없음)
+  - 프로브 페이지 2개
+  - rustfmt(edition 2024) + git diff --check 통과, 작업 트리 clean
+
+env 노브:
+  - RUST_LOG=warn,paint=info   : 상시 "Render perf" 라인
+                                 (로그 타깃은 servo_paint 가 아니라 paint)
+  - SERVO_PERF_GLFINISH=1       : render 직후 glFinish ->
+                                 draw_ms 가 실제 GPU 래스터 시간
+  - SERVO_WR_PICTURE_TILE=WxH   : WebRender picture-cache 타일 크기 오버라이드
+  - winit_wall 의 "Present perf" : 초당 present 횟수 + 평균 present ms
+
+파일:
+  - components/paint/painter.rs                 (Render perf + 노브)
+  - components/servo/examples/winit_wall.rs      (Present perf)
+  - tests/html/perf_video_grid_4x4.html          (16영상 프로브)
+  - tests/html/perf_video_grid_1x1.html          (1영상 프로브)
+
+실행 스크립트 (리포 밖, 임시 디렉터리):
+  scratchpad/run_perf_measure.ps1
+    -Label <name> -DurationSec <n> -Layout <json> -Page <html>
+
+메모리 노트:
+  - video-grid-perf-root-cause.md       (CPU 관점)
+  - video-grid-composite-bottleneck.md  (framerate 관점, 전체 측정 근거)
+
+
+================================================================================
+ 미결정 — 수정 방향 (셋 중 선택 대기)
+================================================================================
+
+  A. picture caching 우회/비활성 (all-dynamic 콘텐츠)
+     - WR 0.68 토글 없음 -> WebRender 패치([patch]/포크) 또는
+       Servo 씬구조 변경 필요. 최대 효과, 가장 어려움.
+
+  B. 타일 분할 (<= ~8Mpx 서브surface, 모니터당 1920x1080 painter)
+     - 절벽 아래 유지 (타일당 ~36fps).
+     - 프로젝트 멀티GPU 타일드 fan-out(Phase4)과 일치. WR 수정 불필요.
+
+  C. WebRender 업그레이드
+     - 신버전이 all-dirty picture cache 를 개선했을 수 있음. 대공사.
+
+================================================================================
