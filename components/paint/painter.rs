@@ -96,8 +96,10 @@ fn perf_picture_tile_size() -> Option<DeviceIntSize> {
 /// recomposite per 1/N second, coalescing all updates that arrive within that window.
 /// This replaces the default "recomposite immediately on every arriving video frame",
 /// which floods the compositor with many videos (e.g. 36 videos x 30fps ~= 1080
-/// full-scene recomposites/s) and starves the script/rAF and decode. Returns the target
-/// interval, or `None` (unset / 0 / invalid) meaning keep the immediate behavior.
+/// full-scene recomposites/s) and starves the script/rAF and decode. While video is active this
+/// same interval also paces the refresh-driver animation tick (`AnimationRefreshDriverObserver`),
+/// which otherwise keeps compositing at the display refresh rate no matter how the video path is
+/// throttled. Returns the target interval, or `None` (unset / 0 / invalid) for immediate behavior.
 /// Read once at startup; changing it requires a restart.
 fn wall_video_pace_interval() -> Option<std::time::Duration> {
     static INTERVAL: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
@@ -177,8 +179,17 @@ pub(crate) struct Painter {
     /// Per-second render-cost attribution (video-grid perf investigation).
     render_perf: RefCell<RenderPerf>,
 
-    /// Timestamp of the last video-driven recomposite, for `SERVO_WALL_VIDEO_PACE_HZ`.
-    last_paced_video_frame_at: Cell<Option<Instant>>,
+    /// Timestamp of the last paced frame produced under `SERVO_WALL_VIDEO_PACE_HZ`. Shared by the
+    /// epoch-less video image-update path (`update_images`) and the refresh-driver animation tick
+    /// (`AnimationRefreshDriverObserver`) so both throttle off one clock — at most one produced
+    /// frame per interval across the two sources.
+    last_paced_frame_at: Cell<Option<Instant>>,
+
+    /// Timestamp of the last epoch-less (video) image update. Tells whether video is actively
+    /// driving frames: only then does pacing throttle the refresh-driver animation tick, because
+    /// the steady per-frame video updates are the heartbeat that reissues a composite after a
+    /// skipped tick. A page animating *without* video is never paced/stalled here.
+    last_video_update_at: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -404,7 +415,8 @@ impl Painter {
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
             render_perf: Default::default(),
-            last_paced_video_frame_at: Cell::new(None),
+            last_paced_frame_at: Cell::new(None),
+            last_video_update_at: Cell::new(None),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -1612,6 +1624,39 @@ impl Painter {
         ))
     }
 
+    /// (video-wall) Whether a new paced frame is due under `SERVO_WALL_VIDEO_PACE_HZ`. Returns
+    /// `true` (no limit) when the env is unset. Shared by the epoch-less video image-update path
+    /// and the refresh-driver animation tick so both throttle off `last_paced_frame_at`.
+    pub(crate) fn pace_due(&self) -> bool {
+        match wall_video_pace_interval() {
+            None => true,
+            Some(interval) => self
+                .last_paced_frame_at
+                .get()
+                .map_or(true, |last| Instant::now().duration_since(last) >= interval),
+        }
+    }
+
+    /// (video-wall) Record that a paced frame was just produced, starting the next pace interval.
+    /// No-op when `SERVO_WALL_VIDEO_PACE_HZ` is unset.
+    pub(crate) fn mark_paced_frame(&self) {
+        if wall_video_pace_interval().is_some() {
+            self.last_paced_frame_at.set(Some(Instant::now()));
+        }
+    }
+
+    /// (video-wall) Whether an epoch-less (video) image update arrived recently enough that video
+    /// is considered to be actively driving frames. Only then does pacing throttle the
+    /// refresh-driver animation tick — the steady video updates are the heartbeat that reissues a
+    /// composite after a skipped tick, so a page animating *without* video is never stalled. The
+    /// window comfortably spans a dropped frame or two at low frame rates.
+    pub(crate) fn video_recently_active(&self) -> bool {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        self.last_video_update_at
+            .get()
+            .is_some_and(|last| Instant::now().duration_since(last) < WINDOW)
+    }
+
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
         let mut txn = Transaction::new();
         // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
@@ -1679,6 +1724,12 @@ impl Painter {
                 .prepare_screenshot_requests_for_render(&*self);
         }
 
+        // Mark video as actively driving frames so the refresh-driver animation tick knows it may
+        // pace itself against this same clock (see `video_recently_active`).
+        if immediate_image_update {
+            self.last_video_update_at.set(Some(Instant::now()));
+        }
+
         // Present content image updates (notably video frames) at their arrival rate by
         // re-compositing the current scene now, instead of waiting for the script's
         // rendering-opportunity GenerateFrame (which paces well below the video frame rate).
@@ -1688,29 +1739,17 @@ impl Painter {
         // (which also increments pending_frames); this self-limits to roughly the present rate.
         if immediate_image_update && !generated_frame {
             self.render_perf.borrow_mut().generate_attempts += 1;
-            if self.pending_frames.get() == 0 {
-                // Default: recomposite immediately (video arrival rate). With
-                // SERVO_WALL_VIDEO_PACE_HZ=N set, rate-limit to one recomposite per
-                // 1/N second, coalescing the video updates that arrived in between
-                // (their textures are already in this transaction) so many videos do
-                // not flood the compositor. Texture updates still flush via the
-                // transaction below even on a skipped (too-soon) frame.
-                let pace = wall_video_pace_interval();
-                let now = Instant::now();
-                let due = match pace {
-                    None => true,
-                    Some(interval) => self
-                        .last_paced_video_frame_at
-                        .get()
-                        .map_or(true, |last| now.duration_since(last) >= interval),
-                };
-                if due {
-                    if pace.is_some() {
-                        self.last_paced_video_frame_at.set(Some(now));
-                    }
-                    self.render_perf.borrow_mut().generate_emitted += 1;
-                    self.generate_frame(&mut txn, RenderReasons::SCENE);
-                }
+            // Default: recomposite immediately (video arrival rate). With SERVO_WALL_VIDEO_PACE_HZ=N
+            // set, rate-limit to one recomposite per 1/N second, coalescing the video updates that
+            // arrived in between (their textures are already in this transaction). Shares its pace
+            // clock with the refresh-driver animation tick (`AnimationRefreshDriverObserver`) via
+            // `pace_due`/`mark_paced_frame`, so at most one frame is produced per interval across
+            // both sources. Only when no frame is already in flight, so we don't stack composites.
+            // Texture updates still flush via the transaction below even on a skipped (too-soon) frame.
+            if self.pending_frames.get() == 0 && self.pace_due() {
+                self.mark_paced_frame();
+                self.render_perf.borrow_mut().generate_emitted += 1;
+                self.generate_frame(&mut txn, RenderReasons::SCENE);
             }
         }
 

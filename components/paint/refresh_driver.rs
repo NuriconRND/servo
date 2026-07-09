@@ -164,6 +164,22 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             return false;
         }
 
+        // (video-wall) When SERVO_WALL_VIDEO_PACE_HZ is set and video is actively driving frames,
+        // let the paced video image-update path own the frame cadence: skip this animation tick
+        // until the pace interval is due, so media playback does not drive a full-scene recomposite
+        // every refresh tick on top of the (already paced) video path. Shares the pace clock with
+        // `Painter::update_images`, and only kicks in while video is active — its steady per-frame
+        // image updates are the heartbeat that reissues a composite, so a page animating *without*
+        // video is never paced or stalled here. `pace_due` is always true when the env is unset, so
+        // this is a no-op by default. Keep observing (return true) so the next due tick still fires.
+        if painter.video_recently_active() {
+            if !painter.pace_due() {
+                self.animating.set(true);
+                return true;
+            }
+            painter.mark_paced_frame();
+        }
+
         // Request new animation frames from all animating WebViews.
         if let Err(error) =
             self.constellation_sender
