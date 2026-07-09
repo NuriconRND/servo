@@ -105,10 +105,12 @@
   // 동시에 출발한다(프레임 단위 lockstep). gapless 루프(SERVO_MEDIA_GAPLESS_LOOP)가
   // non-flush 되감기로 그 위상을 영구 보존한다. 페이지는 재생 요청만 하고, 전 타일의
   // 동시 출발이 관측되면 준비 과정을 가리던 커버를 걷는다.
+  // 공개 시점: 조건 기반 — 전 타일의 실제 재생 시작(currentTime 전진)이 관측되는
+  // 순간 커버를 걷는다. 임의의 지연/은폐 없음. 90초는 오류 시 안전장치일 뿐이다.
   const cover = document.getElementById("cover");
   const syncBegin = performance.now();
   const revealPoll = setInterval(() => {
-    const moving = videos.filter((v) => v.currentTime > 0.15).length;
+    const moving = videos.filter((v) => v.currentTime > 0).length;
     const elapsed = ((performance.now() - syncBegin) / 1000) | 0;
     cover.textContent = "준비 중... " + moving + "/" + TILE_COUNT + " (" + elapsed + "s)";
     if (moving >= TILE_COUNT || elapsed > 90) {
