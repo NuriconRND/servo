@@ -7,6 +7,7 @@
 
 mod media_thread;
 
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -14,6 +15,7 @@ use euclid::default::Size2D;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
 use log::{debug, info, warn};
 use malloc_size_of_derive::MallocSizeOf;
+use paint_api::rendering_context::{RenderingContext, SurfaceTexture};
 use paint_api::{
     ExternalImageSource, WebRenderExternalImageApi, WebRenderExternalImageHandlers,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
@@ -111,6 +113,61 @@ impl RawVideoFrameExternalImages {
             warn!("Slow raw plane read lock: id={} lock_wait_ms={:.1}", id, lock_wait_ms);
         }
         planes.get(&id).cloned()
+    }
+}
+
+/// D3D11 GPU 상주 비디오 프레임 레지스트리 (raw YUV 레지스트리의 대칭물).
+/// external image ID → 최신 프레임 (latest-wins). 값은 스칼라뿐이라 gst 참조 보유 없음
+/// — 프레임 수명은 render-d3d11의 공유 링이 소유한다.
+#[derive(Clone, Copy, Debug)]
+pub struct D3d11VideoFrameInfo {
+    pub shared_handle: u64,
+    pub ring_epoch: u32,
+    pub width: i32,
+    pub height: i32,
+}
+
+fn d3d11_video_frames() -> &'static Mutex<FxHashMap<u64, D3d11VideoFrameInfo>> {
+    static D3D11_VIDEO_FRAMES: OnceLock<Mutex<FxHashMap<u64, D3d11VideoFrameInfo>>> =
+        OnceLock::new();
+    D3D11_VIDEO_FRAMES.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn d3d11_removed_ids() -> &'static Mutex<Vec<u64>> {
+    static D3D11_REMOVED_IDS: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+    D3D11_REMOVED_IDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub struct D3d11VideoFrameExternalImages;
+
+impl D3d11VideoFrameExternalImages {
+    pub fn allocate_id() -> Option<ExternalImageId> {
+        if opts::get().multiprocess || opts::get().force_ipc {
+            return None;
+        }
+        let mut id_manager = raw_video_external_image_id_manager()?;
+        Some(id_manager.next_id(WebRenderImageHandlerType::Media))
+    }
+
+    pub fn update(id: ExternalImageId, info: D3d11VideoFrameInfo) {
+        d3d11_video_frames().lock().unwrap().insert(id.0, info);
+    }
+
+    pub fn remove(id: ExternalImageId) {
+        d3d11_video_frames().lock().unwrap().remove(&id.0);
+        // 렌더러 스레드의 래핑 캐시는 다음 lock 때 이 목록을 보고 정리한다.
+        d3d11_removed_ids().lock().unwrap().push(id.0);
+        if let Some(mut id_manager) = raw_video_external_image_id_manager() {
+            id_manager.remove(&id);
+        }
+    }
+
+    fn info_for(id: u64) -> Option<D3d11VideoFrameInfo> {
+        d3d11_video_frames().lock().unwrap().get(&id).copied()
+    }
+
+    fn take_removed_ids() -> Vec<u64> {
+        std::mem::take(&mut *d3d11_removed_ids().lock().unwrap())
     }
 }
 
@@ -234,7 +291,10 @@ impl WindowGLContext {
         window_gl_context.api = api;
     }
 
-    pub fn initialize_image_handler(external_image_handlers: &mut WebRenderExternalImageHandlers) {
+    pub fn initialize_image_handler(
+        external_image_handlers: &mut WebRenderExternalImageHandlers,
+        rendering_context: Rc<dyn RenderingContext>,
+    ) {
         RawVideoFrameExternalImages::initialize(external_image_handlers.id_manager());
 
         let mut window_gl_context = WINDOW_GL_CONTEXT.lock().unwrap();
@@ -255,7 +315,10 @@ impl WindowGLContext {
             None
         };
 
-        let image_handler = Box::new(MediaExternalImages::new(thread_sender));
+        let image_handler = Box::new(MediaExternalImages::new(
+            thread_sender,
+            Some(rendering_context),
+        ));
         external_image_handlers.set_handler(image_handler, WebRenderImageHandlerType::Media);
     }
 }
@@ -327,6 +390,14 @@ impl WebRenderExternalImageApi for GLPlayerExternalImages {
     }
 }
 
+#[derive(Default)]
+struct D3d11TextureCacheEntry {
+    ring_epoch: u32,
+    /// shared_handle → (SurfaceTexture 유지용, GL 텍스처 id). 링 슬롯이 안정적이라
+    /// 플레이어당 최대 4개 — 정상 상태에서 프레임당 재래핑 0.
+    textures: FxHashMap<u64, (SurfaceTexture, u32)>,
+}
+
 /// Bridge between WebRender external image callbacks and media-backed images.
 ///
 /// Raw YUV planes are handled in-process through [`RawVideoFrameExternalImages`].
@@ -334,19 +405,79 @@ impl WebRenderExternalImageApi for GLPlayerExternalImages {
 struct MediaExternalImages {
     glplayer_images: Option<GLPlayerExternalImages>,
     locked_raw_planes: FxHashMap<u64, RawVideoPlane>,
+    rendering_context: Option<Rc<dyn RenderingContext>>,
+    d3d11_texture_cache: FxHashMap<u64, D3d11TextureCacheEntry>,
 }
 
 impl MediaExternalImages {
-    fn new(glplayer_sender: Option<IpcSender<GLPlayerMsg>>) -> Self {
+    fn new(
+        glplayer_sender: Option<IpcSender<GLPlayerMsg>>,
+        rendering_context: Option<Rc<dyn RenderingContext>>,
+    ) -> Self {
         Self {
             glplayer_images: glplayer_sender.map(GLPlayerExternalImages::new),
             locked_raw_planes: Default::default(),
+            rendering_context,
+            d3d11_texture_cache: Default::default(),
         }
+    }
+
+    fn purge_removed_d3d11_entries(&mut self) {
+        for removed in D3d11VideoFrameExternalImages::take_removed_ids() {
+            if let Some(entry) = self.d3d11_texture_cache.remove(&removed) {
+                if let Some(rendering_context) = self.rendering_context.as_ref() {
+                    for (_, (surface_texture, _)) in entry.textures {
+                        rendering_context.destroy_texture(surface_texture);
+                    }
+                }
+            }
+        }
+    }
+
+    fn lock_d3d11(
+        &mut self,
+        id: u64,
+        info: D3d11VideoFrameInfo,
+    ) -> (ExternalImageSource<'_>, Size2D<i32>) {
+        let Some(rendering_context) = self.rendering_context.as_ref() else {
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        };
+        let entry = self.d3d11_texture_cache.entry(id).or_default();
+        if entry.ring_epoch != info.ring_epoch {
+            // 링 재생성(크기 변경) — 이전 세대 래핑 전부 폐기
+            for (_, (surface_texture, _)) in std::mem::take(&mut entry.textures) {
+                rendering_context.destroy_texture(surface_texture);
+            }
+            entry.ring_epoch = info.ring_epoch;
+        }
+        if !entry.textures.contains_key(&info.shared_handle) {
+            let size = Size2D::new(info.width, info.height);
+            match rendering_context.create_texture_from_shared_handle(info.shared_handle, size) {
+                Some((surface_texture, gl_texture, _)) => {
+                    entry.textures.insert(info.shared_handle, (surface_texture, gl_texture));
+                },
+                None => {
+                    warn!("D3D11 video: 공유 핸들 import 실패 (id={id})");
+                    return (ExternalImageSource::Invalid, Size2D::zero());
+                },
+            }
+        }
+        let (_, gl_texture) = entry.textures[&info.shared_handle];
+        (
+            ExternalImageSource::NativeTexture(gl_texture),
+            Size2D::new(info.width, info.height),
+        )
     }
 }
 
 impl WebRenderExternalImageApi for MediaExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
+        // GPU 상주 D3D11 프레임: 렌더러는 캐시된 GL 텍스처를 돌려줄 뿐 업로드하지 않는다.
+        if let Some(info) = D3d11VideoFrameExternalImages::info_for(id) {
+            self.purge_removed_d3d11_entries();
+            return self.lock_d3d11(id, info);
+        }
+
         // Diagnostic: this runs on the renderer thread once per plane per upload. Time the
         // full body (map lookup + gst buffer map via get_yuv_data/get_plane_data) to catch
         // stalls caused by gst-side locks (e.g. around a flushing loop-restart seek).
@@ -411,6 +542,11 @@ impl WebRenderExternalImageApi for MediaExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
+        // D3D11 캐시는 unlock에서 유지한다 (링 슬롯 재사용 — 폐기는 epoch 변경/제거 시).
+        if self.d3d11_texture_cache.contains_key(&id) {
+            return;
+        }
+
         // Diagnostic: dropping the locked plane here unrefs a gst buffer ON THE RENDERER
         // THREAD; if the frame was replaced meanwhile this may be the last ref and the
         // buffer returns to the decoder's pool, which can block during a flushing seek.

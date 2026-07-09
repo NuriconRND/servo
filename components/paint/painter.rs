@@ -288,7 +288,10 @@ impl Painter {
             WebRenderImageHandlerType::WebGpu,
         );
 
-        WindowGLContext::initialize_image_handler(&mut external_image_handlers);
+        WindowGLContext::initialize_image_handler(
+            &mut external_image_handlers,
+            rendering_context.clone(),
+        );
 
         let embedder_to_constellation_sender = paint.embedder_to_constellation_sender.clone();
         let timer_refresh_driver = LazyCell::default();
