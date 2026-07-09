@@ -4,9 +4,9 @@
 
 **Goal:** 렌더러 스레드의 비디오 업로드를 0으로 만든다 — 각 gst 파이프라인이 자기 스트리밍 스레드에서 D3D11 GPU 텍스처로 업로드/변환하고, WR에는 GPU 상주 텍스처 핸들만 전달한다 (스펙: `docs/superpowers/specs/2026-07-09-d3d11-per-pipeline-upload-design.md`).
 
-**Architecture:** playbin3의 video-sink를 `d3d11upload ! d3d11convert(RGBA) ! appsink(memory:D3D11Memory)` bin으로 교체(신규 `render-d3d11` 크레이트, 기존 render-unix 패턴의 Windows 대응물). appsink 콜백(스트리밍 스레드)에서 디코드된 D3D11 텍스처를 플레이어별 공유 텍스처 링(4슬롯, `D3D11_RESOURCE_MISC_SHARED`)에 GPU-GPU 복사 후 완료 대기, 공유 핸들(u64)을 `VideoFrameData::D3D11`로 전달. htmlmediaelement가 단일 ImageKey + `ExternalImageType::TextureHandle`로 발행, 렌더러 lock()에서 **기존 검증된** `RenderingContext::create_texture_from_shared_handle`(surfman ANGLE, WebGPU gpu-direct가 사용)로 1회 래핑 후 캐시 → 프레임당 렌더러 비용 ≈ 0.
+**Architecture:** playbin3의 video-sink를 `d3d11upload ! appsink(memory:D3D11Memory, 디코더 원 포맷)` bin으로 교체(신규 `render-d3d11` 크레이트, 기존 render-unix 패턴의 Windows 대응물). appsink 콜백(스트리밍 스레드)에서 gstd3d11 라이브러리의 공개 `GstD3D11Converter`로 YUV→RGBA 변환을 **플레이어별 공유 텍스처 링(4슬롯, `D3D11_RESOURCE_MISC_SHARED`) 슬롯에 직접 렌더**(추가 GPU 복사 0회 — d3d11convert 엘리먼트의 내부 엔진을 직접 사용), 완료 fence 후 공유 핸들(u64)을 `VideoFrameData::D3D11`로 전달. htmlmediaelement가 단일 ImageKey + `ExternalImageType::TextureHandle`로 발행, 렌더러 lock()에서 **기존 검증된** `RenderingContext::create_texture_from_shared_handle`(surfman ANGLE, WebGPU gpu-direct가 사용)로 1회 래핑 후 캐시 → 프레임당 렌더러 비용 ≈ 0.
 
-**Tech Stack:** Rust, GStreamer 0.25(gstreamer-rs) + gstd3d11-1.0-0.dll 공개 C API(libloading 동적 FFI — **Rust 바인딩 crates.io에 부재 확인됨**), winapi/wio(D3D11 COM), surfman ANGLE(`EGL_ANGLE_d3d_texture_client_buffer` 경유, 기존 구현 재사용), WebRender external image(TextureHandle).
+**Tech Stack:** Rust, GStreamer 0.25(gstreamer-rs) + gstd3d11-1.0-0.dll 공개 C API(`GstD3D11Converter`/`alloc_wrapped` 포함, libloading 동적 FFI — **Rust 바인딩 crates.io에 부재 확인됨**), winapi/wio(D3D11 COM), surfman ANGLE(`EGL_ANGLE_d3d_texture_client_buffer` 경유, 기존 구현 재사용), WebRender external image(TextureHandle).
 
 ## Global Constraints
 
@@ -24,8 +24,8 @@
 
 1. **ANGLE 래핑 = `EGL_ANGLE_d3d_texture_client_buffer` 경로 (스펙 §4.3의 "대안(폴백)")를 1순위로 채택.**
    근거: 트리에 이미 구현·**월에서 검증**된 `RenderingContext::create_texture_from_shared_handle`(`components/shared/paint/rendering_context.rs:451-480`, WebGPU gpu-direct가 사용)이 정확히 이 경로다. 스펙 1순위(`EGL_ANGLE_image_d3d11_texture`)는 vendored surfman 수정(EGL_D3D11_TEXTURE_ANGLE=0x3484 추가 + 신규 Device 메서드)이 필요하고 기능 이득이 없다. 성능 목표(렌더러 ≈0)는 래핑 캐시(아래 3)로 달성.
-2. **gst d3d11 버퍼 풀 공유 할당(스펙 §4.1) 대신 자체 공유 텍스처 링(4슬롯) + 동일 디바이스 GPU-GPU 복사 1회.**
-   근거: ① `gstreamer-d3d11` Rust 바인딩이 crates.io에 **존재하지 않음**(2026-07-09 API 조회 확정) — 풀 config FFI 표면이 큼. ② appsink는 allocation query에 풀을 제안하지 않아 d3d11convert 내부 풀에 파라미터를 넣으려면 쿼리 가로채기가 필요. ③ 링이면 gst 버퍼를 복사 직후 즉시 반환(디코더 풀 건강이 렌더러 지연과 분리)하고 **핸들이 플레이어 수명 동안 안정** → 렌더러 측 SurfaceTexture 캐시 가능(프레임당 재래핑 0 — 스펙 §4.3 캐시 요구를 더 강하게 충족). 복사는 스트리밍 스레드에서 GPU 비동기(스펙 리스크표가 승인한 "GPU-GPU 복사 1회 폴백"과 같은 형태이며 같은 디바이스라 더 저렴). 렌더러 비용은 여전히 0.
+2. **gst d3d11 버퍼 풀 공유 할당 + d3d11convert 엘리먼트(스펙 §4.1) 대신: 자체 공유 텍스처 링(4슬롯) + 라이브러리 `GstD3D11Converter`로 링 슬롯에 직접 변환-렌더 (추가 복사 0회).**
+   근거: ① `gstreamer-d3d11` Rust 바인딩이 crates.io에 **존재하지 않음**(2026-07-09 API 조회 확정)이고, appsink는 allocation query에 풀을 제안하지 않아 풀 공유 할당은 쿼리 가로채기가 필요. ② gstd3d11 라이브러리가 d3d11convert의 내부 엔진을 공개 API로 노출(`gst_d3d11_converter_new/convert_buffer`, 헤더 확정) — 어차피 필요한 YUV→RGBA 변환 패스의 **출력 대상을 링 슬롯으로 지정**하면 변환=핸드오프가 되어 별도 복사가 아예 없다(2026-07-09 사용자 지적으로 채택; 초안의 "복사 1회" 설계를 대체). ③ 링이면 gst 버퍼를 변환 직후 즉시 반환(디코더 풀 건강이 렌더러 지연과 분리)하고 **핸들이 플레이어 수명 동안 안정** → 렌더러 측 SurfaceTexture 캐시 가능(프레임당 재래핑 0 — 스펙 §4.3 캐시 요구를 더 강하게 충족). **폴백 사다리**(PoC 실패 시 순서대로): ⓐ 래핑 버퍼에 VideoMeta 추가 ⓑ out 포맷 BGRA 전환 ⓒ d3d11convert 엘리먼트 복귀 + 링으로 `CopySubresourceRegion` 1회(초안 A 방식 — 45타일 기준 VRAM 내부 11GB/s ≈ 대역폭 2~3%로 여전히 실용적).
 3. **keyed mutex(스펙 §4.4) 대신 producer 측 완료 대기(D3D11_QUERY_EVENT) 후 발행 + 4슬롯 라운드로빈 재사용 마진.**
    근거: 트리 내 검증 선례(WebGPU gpu-direct 공유 핸들 — keyed mutex 없음, 2×A4000 월 60fps 검증). 렌더러는 절대 대기하지 않음(스펙 §4.4의 목표 그대로). surfman의 기존 import 경로가 keyed mutex 텍스처에 `AcquireSync(0, INFINITE)`를 걸어 캐시와 충돌하는 문제도 회피. **폴백(문제 발생 시)**: 슬롯 텍스처를 `MISC_SHARED_KEYEDMUTEX`로 바꾸고 캐시 대신 매 lock마다 import/destroy(WebGPU 방식) — surfman이 acquire/release를 자동 처리, 코드 변경 국소적.
 
@@ -42,6 +42,11 @@
 - `ID3D11Resource * gst_d3d11_memory_get_resource_handle(GstD3D11Memory*)` (:201)
 - `guint gst_d3d11_memory_get_subresource_index(GstD3D11Memory*)` (:216)
 - caps feature `"memory:D3D11Memory"` (gstd3d11memory.h:67)
+- `GstD3D11Converter * gst_d3d11_converter_new(GstD3D11Device*, const GstVideoInfo* in, const GstVideoInfo* out, GstStructure* config /*NULL 허용*/)` (gstd3d11converter.h:183) — d3d11convert 엘리먼트의 내부 변환 엔진(공개 API)
+- `gboolean gst_d3d11_converter_convert_buffer(GstD3D11Converter*, GstBuffer* in, GstBuffer* out)` (:189; `_unlocked` 변형 :194. converter는 GstObject — 해제는 g_object_unref)
+- `GstMemory * gst_d3d11_allocator_alloc_wrapped(GstD3D11Allocator*, GstD3D11Device*, ID3D11Texture2D*, gsize, gpointer user_data, GDestroyNotify)` (gstd3d11memory.h:308) — 우리 링 텍스처를 GstD3D11Memory로 래핑
+- allocator 획득: `gst_allocator_find("D3D11Memory")`(gstreamer core FFI) → null이면 `g_object_new(gst_d3d11_allocator_get_type(), NULL)` 폴백 (`gst_d3d11_allocator_get_type` gstd3d11memory.h:295)
+- (참고: 풀 공유 할당용 `gst_d3d11_buffer_pool_new`(gstd3d11bufferpool.h:74)·`gst_d3d11_allocation_params_new(device, info, flags, bind_flags, misc_flags)`(gstd3d11memory.h:143)도 존재하나 직접 변환 채택으로 불사용)
 
 **servo-media (전부 in-tree vendored — `components/media/`):**
 - `Render` trait: `render/lib.rs:22-51` — `is_gl()`, `build_frame(sample) -> Option<VideoFrame>`, `build_video_sink(appsink: &Element, pipeline: &Element) -> Result<(), PlayerError>`
@@ -76,7 +81,7 @@
 **Interfaces:**
 - Produces: `ffi::GstD3D11Api::load() -> Option<&'static GstD3D11Api>` (libloading, 실패 시 warn 로그 + None);
   `interop::SharedGstD3D11Device::get_or_create() -> Option<Arc<SharedGstD3D11Device>>` (프로세스 전역 1개, 어댑터 0),
-  메서드 `d3d11_device() -> *mut ID3D11Device`, `immediate_context() -> *mut ID3D11DeviceContext`, `lock() -> DeviceLockGuard`, `gst_context() -> Option<gstreamer::Context>`, `api() -> &'static GstD3D11Api`.
+  메서드 `raw() -> *mut GstD3D11Device`, `d3d11_device() -> *mut ID3D11Device`, `immediate_context() -> *mut ID3D11DeviceContext`, `allocator() -> *mut GstD3D11Allocator`, `lock() -> DeviceLockGuard`, `gst_context() -> Option<gstreamer::Context>`, `api() -> &'static GstD3D11Api`.
 - Consumes: 없음 (신규 크레이트).
 
 - [ ] **Step 1: 워크스페이스 등록**
@@ -170,6 +175,7 @@ mod tests {
         let device = SharedGstD3D11Device::get_or_create().expect("GstD3D11Device 생성 실패");
         assert!(!device.d3d11_device().is_null());
         assert!(!device.immediate_context().is_null());
+        assert!(!device.allocator().is_null());
         let context = device.gst_context().expect("gst_d3d11_context_new 실패");
         assert_eq!(context.context_type(), "gst.d3d11.device.handle");
         // 전역 공유: 두 번째 호출은 같은 디바이스
@@ -195,7 +201,7 @@ mod tests {
 
 use std::sync::OnceLock;
 
-use winapi::um::d3d11::{ID3D11Device, ID3D11DeviceContext, ID3D11Resource};
+use winapi::um::d3d11::{ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D};
 
 /// GObject 기반 불투명 타입 (참조만 주고받음).
 #[repr(C)]
@@ -210,7 +216,21 @@ pub struct GstD3D11Memory {
     _private: [u8; 0],
 }
 
+/// YUV→RGBA 변환 엔진 (d3d11convert 엘리먼트 내부와 동일). GstObject 파생 —
+/// 해제는 g_object_unref.
+#[repr(C)]
+pub struct GstD3D11Converter {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct GstD3D11Allocator {
+    _private: [u8; 0],
+}
+
 type Gboolean = i32;
+// GType — glib ABI상 usize.
+type GType = usize;
 
 pub struct GstD3D11Api {
     // Library는 fn 포인터 수명 유지를 위해 보관 (drop 금지)
@@ -226,6 +246,26 @@ pub struct GstD3D11Api {
     pub memory_get_resource_handle:
         unsafe extern "C" fn(*mut GstD3D11Memory) -> *mut ID3D11Resource,
     pub memory_get_subresource_index: unsafe extern "C" fn(*mut GstD3D11Memory) -> u32,
+    pub converter_new: unsafe extern "C" fn(
+        *mut GstD3D11Device,
+        *const gstreamer_video::ffi::GstVideoInfo,
+        *const gstreamer_video::ffi::GstVideoInfo,
+        *mut gstreamer::ffi::GstStructure,
+    ) -> *mut GstD3D11Converter,
+    pub converter_convert_buffer: unsafe extern "C" fn(
+        *mut GstD3D11Converter,
+        *mut gstreamer::ffi::GstBuffer,
+        *mut gstreamer::ffi::GstBuffer,
+    ) -> Gboolean,
+    pub allocator_get_type: unsafe extern "C" fn() -> GType,
+    pub allocator_alloc_wrapped: unsafe extern "C" fn(
+        *mut GstD3D11Allocator,
+        *mut GstD3D11Device,
+        *mut ID3D11Texture2D,
+        usize,
+        *mut std::ffi::c_void,
+        gstreamer::glib::ffi::GDestroyNotify,
+    ) -> *mut gstreamer::ffi::GstMemory,
 }
 
 impl GstD3D11Api {
@@ -261,6 +301,10 @@ impl GstD3D11Api {
                 is_d3d11_memory: sym!(b"gst_is_d3d11_memory\0"),
                 memory_get_resource_handle: sym!(b"gst_d3d11_memory_get_resource_handle\0"),
                 memory_get_subresource_index: sym!(b"gst_d3d11_memory_get_subresource_index\0"),
+                converter_new: sym!(b"gst_d3d11_converter_new\0"),
+                converter_convert_buffer: sym!(b"gst_d3d11_converter_convert_buffer\0"),
+                allocator_get_type: sym!(b"gst_d3d11_allocator_get_type\0"),
+                allocator_alloc_wrapped: sym!(b"gst_d3d11_allocator_alloc_wrapped\0"),
                 _lib: lib,
             })
         }
@@ -288,7 +332,7 @@ use std::sync::{Arc, OnceLock};
 use gstreamer::glib::translate::from_glib_full;
 use winapi::um::d3d11::{ID3D11Device, ID3D11DeviceContext};
 
-use crate::ffi::{GstD3D11Api, GstD3D11Device};
+use crate::ffi::{GstD3D11Allocator, GstD3D11Api, GstD3D11Device};
 
 // D3D11_CREATE_DEVICE_BGRA_SUPPORT
 const D3D11_DEVICE_FLAGS: u32 = 0x20;
@@ -296,6 +340,7 @@ const D3D11_DEVICE_FLAGS: u32 = 0x20;
 pub struct SharedGstD3D11Device {
     api: &'static GstD3D11Api,
     device: *mut GstD3D11Device,
+    allocator: *mut GstD3D11Allocator,
 }
 
 // 안전성: GstD3D11Device는 스레드 안전(GObject + 내부 뮤텍스). immediate context는
@@ -326,13 +371,41 @@ impl SharedGstD3D11Device {
                     log::warn!("D3D11 video: gst_d3d11_device_new(adapter=0) 실패");
                     return None;
                 }
-                Some(Arc::new(SharedGstD3D11Device { api, device }))
+                // 링 텍스처를 GstD3D11Memory로 래핑하기 위한 allocator.
+                // 등록된 기본 allocator를 우선 찾고, 미등록이면 새 인스턴스 생성
+                // (프로세스 수명 동안 보유 — 의도적 비해제).
+                let allocator = unsafe {
+                    let name = c"D3D11Memory";
+                    let mut allocator = gstreamer::ffi::gst_allocator_find(name.as_ptr())
+                        as *mut GstD3D11Allocator;
+                    if allocator.is_null() {
+                        allocator = gstreamer::glib::gobject_ffi::g_object_new(
+                            (api.allocator_get_type)(),
+                            std::ptr::null(),
+                        ) as *mut GstD3D11Allocator;
+                    }
+                    allocator
+                };
+                if allocator.is_null() {
+                    log::warn!("D3D11 video: GstD3D11Allocator 획득 실패");
+                    return None;
+                }
+                Some(Arc::new(SharedGstD3D11Device { api, device, allocator }))
             })
             .clone()
     }
 
     pub fn api(&self) -> &'static GstD3D11Api {
         self.api
+    }
+
+    /// gstd3d11 FFI에 넘길 원시 디바이스 포인터.
+    pub fn raw(&self) -> *mut GstD3D11Device {
+        self.device
+    }
+
+    pub fn allocator(&self) -> *mut GstD3D11Allocator {
+        self.allocator
     }
 
     pub fn d3d11_device(&self) -> *mut ID3D11Device {
@@ -391,7 +464,9 @@ git commit -m 'render-d3d11 크레이트 신설: gstd3d11 동적 FFI + 공유 Gs
 **Interfaces:**
 - Consumes: Task 1의 `SharedGstD3D11Device`, `GstD3D11Api`.
 - Produces: `SharedTextureRing::new(device: Arc<SharedGstD3D11Device>) -> SharedTextureRing`;
-  `SharedTextureRing::write(&mut self, src: *mut ID3D11Resource, subresource: u32, width: i32, height: i32) -> Option<(u64 /*shared_handle*/, u32 /*ring_epoch*/)>` — 복사 완료 후에만 반환(발행 후 읽기 안전). 크기 변경 시 링 재생성 + epoch 증가.
+  `acquire(&mut self, width: i32, height: i32) -> Option<(gstreamer::Buffer /*슬롯 래핑 버퍼*/, usize /*slot_index*/)>` — GstD3D11Converter의 출력 대상 확보(크기 변경 시 링 재생성 + epoch 증가);
+  `finish(&mut self, slot_index: usize) -> Option<(u64 /*shared_handle*/, u32 /*ring_epoch*/)>` — GPU 작업 완료 fence 후에만 반환(발행 후 읽기 안전);
+  `write_from_resource(&mut self, src: *mut ID3D11Resource, subresource: u32, width: i32, height: i32) -> Option<(u64, u32)>` — 테스트·폴백용(acquire→CopySubresourceRegion→finish).
 
 - [ ] **Step 1: 실패하는 테스트 작성 (RED)**
 
@@ -418,7 +493,7 @@ git commit -m 'render-d3d11 크레이트 신설: gstd3d11 동적 FFI + 공유 Gs
 
         let mut ring = SharedTextureRing::new(device.clone());
         let (handle, epoch) = ring
-            .write(src.as_raw() as *mut _, 0, W as i32, H as i32)
+            .write_from_resource(src.as_raw() as *mut _, 0, W as i32, H as i32)
             .expect("ring write 실패");
         assert_eq!(epoch, 1);
         assert_ne!(handle, 0);
@@ -431,9 +506,13 @@ git commit -m 'render-d3d11 크레이트 신설: gstd3d11 동적 FFI + 공유 Gs
         // 크기 변경 → epoch 증가
         let src2 = create_test_source_texture(&device, 32, 32, &pixels[..32 * 32 * 4]);
         let (_h2, epoch2) = ring
-            .write(src2.as_raw() as *mut _, 0, 32, 32)
+            .write_from_resource(src2.as_raw() as *mut _, 0, 32, 32)
             .expect("ring write(2) 실패");
         assert_eq!(epoch2, 2);
+
+        // 변환기 출력 대상용 래핑 버퍼가 슬롯마다 존재
+        let (wrapped, _slot) = ring.acquire(32, 32).expect("acquire 실패");
+        assert_eq!(wrapped.n_memory(), 1);
     }
 ```
 
@@ -564,12 +643,18 @@ struct RingSlot {
     texture: ComPtr<ID3D11Texture2D>,
     shared_handle: u64,
     query: ComPtr<ID3D11Query>,
+    /// 링 텍스처를 GstD3D11Memory로 감싼 버퍼 — GstD3D11Converter의 출력 대상.
+    /// clone은 미니오브젝트 참조 증가일 뿐이라 저렴.
+    wrapped_buffer: gstreamer::Buffer,
 }
 
 /// 플레이어별 공유 텍스처 링.
 ///
+/// 사용 순서: acquire(슬롯 확보) → GstD3D11Converter가 슬롯 버퍼에 직접 변환-렌더
+/// (또는 폴백 write_from_resource의 복사) → finish(완료 fence 후 핸들 발행).
+///
 /// 동기화 설계(스펙 §4.4의 keyed mutex를 완료-대기+발행으로 대체, 계획 문서 "의도적
-/// 차이 3" 참조): write()는 GPU 복사 완료를 D3D11_QUERY_EVENT로 확인한 뒤에만 핸들을
+/// 차이 3" 참조): finish()는 GPU 작업 완료를 D3D11_QUERY_EVENT로 확인한 뒤에만 핸들을
 /// 반환하므로, 소비자(렌더러)는 발행된 슬롯을 동기화 없이 읽어도 완료된 내용을 본다.
 /// 4슬롯 라운드로빈이라 발행된 최신 슬롯이 다시 써지려면 3프레임(30fps 기준 100ms)의
 /// 마진이 있다 — 렌더러 lock 유지 시간(정상 <20ms, in-flight 게이트로 백로그 없음)
@@ -599,14 +684,9 @@ impl SharedTextureRing {
         }
     }
 
-    pub fn write(
-        &mut self,
-        src: *mut ID3D11Resource,
-        subresource: u32,
-        width: i32,
-        height: i32,
-    ) -> Option<(u64, u32)> {
-        if width <= 0 || height <= 0 || src.is_null() {
+    /// 다음 슬롯 확보. 반환: (변환 출력 대상으로 쓸 래핑 GstBuffer, 슬롯 인덱스).
+    pub fn acquire(&mut self, width: i32, height: i32) -> Option<(gstreamer::Buffer, usize)> {
+        if width <= 0 || height <= 0 {
             return None;
         }
         if self.slots.is_empty() || width != self.width || height != self.height {
@@ -614,30 +694,15 @@ impl SharedTextureRing {
         }
         let slot_index = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
-        let slot = &self.slots[slot_index];
+        Some((self.slots[slot_index].wrapped_buffer.clone(), slot_index))
+    }
 
-        let src_box = D3D11_BOX {
-            left: 0,
-            top: 0,
-            front: 0,
-            right: width as u32,
-            bottom: height as u32,
-            back: 1,
-        };
+    /// 슬롯에 대한 GPU 작업 제출 후 호출: 완료 fence 대기 → (공유 핸들, epoch) 발행.
+    pub fn finish(&mut self, slot_index: usize) -> Option<(u64, u32)> {
+        let slot = self.slots.get(slot_index)?;
         unsafe {
-            // 복사 + 쿼리 + Flush는 한 번의 디바이스 락으로 묶는다.
             let _guard = self.device.lock();
             let context = self.device.immediate_context();
-            (*context).CopySubresourceRegion(
-                slot.texture.as_raw() as *mut ID3D11Resource,
-                0,
-                0,
-                0,
-                0,
-                src,
-                subresource,
-                &src_box,
-            );
             (*context).End(slot.query.as_raw() as *mut ID3D11Asynchronous);
             (*context).Flush();
         }
@@ -657,12 +722,49 @@ impl SharedTextureRing {
                 S_OK => break,
                 S_FALSE => std::thread::yield_now(),
                 _ => {
-                    log::warn!("D3D11 video: 복사 완료 쿼리 실패 hr={hr:#x}");
+                    log::warn!("D3D11 video: 완료 쿼리 실패 hr={hr:#x}");
                     return None;
                 },
             }
         }
         Some((slot.shared_handle, self.epoch))
+    }
+
+    /// 테스트·폴백용: 원본 D3D11 텍스처를 슬롯에 복사(변환 없음, 동일 포맷 전제).
+    pub fn write_from_resource(
+        &mut self,
+        src: *mut ID3D11Resource,
+        subresource: u32,
+        width: i32,
+        height: i32,
+    ) -> Option<(u64, u32)> {
+        if src.is_null() {
+            return None;
+        }
+        let (_wrapped_buffer, slot_index) = self.acquire(width, height)?;
+        let src_box = D3D11_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: width as u32,
+            bottom: height as u32,
+            back: 1,
+        };
+        unsafe {
+            let _guard = self.device.lock();
+            let context = self.device.immediate_context();
+            (*context).CopySubresourceRegion(
+                self.slots[slot_index].texture.as_raw() as *mut ID3D11Resource,
+                0,
+                0,
+                0,
+                0,
+                src,
+                subresource,
+                &src_box,
+            );
+        }
+        self.finish(slot_index)
     }
 
     fn recreate(&mut self, width: i32, height: i32) -> Option<()> {
@@ -720,10 +822,32 @@ impl SharedTextureRing {
                     self.slots.clear();
                     return None;
                 }
+                // 슬롯 텍스처를 GstD3D11Memory로 래핑해 변환기 출력 버퍼로 준비.
+                let api = self.device.api();
+                let memory_ptr = (api.allocator_alloc_wrapped)(
+                    self.device.allocator(),
+                    self.device.raw(),
+                    texture.as_raw(),
+                    (width as usize) * (height as usize) * 4,
+                    std::ptr::null_mut(),
+                    None,
+                );
+                if memory_ptr.is_null() {
+                    log::warn!("D3D11 video: alloc_wrapped 실패");
+                    self.slots.clear();
+                    return None;
+                }
+                let memory: gstreamer::Memory = from_glib_full(memory_ptr);
+                let mut wrapped_buffer = gstreamer::Buffer::new();
+                wrapped_buffer
+                    .get_mut()
+                    .expect("새 버퍼는 유일 참조")
+                    .append_memory(memory);
                 self.slots.push(RingSlot {
                     texture,
                     shared_handle: handle as usize as u64,
                     query: ComPtr::from_raw(query),
+                    wrapped_buffer,
                 });
             }
         }
@@ -742,14 +866,14 @@ Task 1 Step 7과 같은 명령. Expected: 2 passed (`load_api_and_create_shared_
 - [ ] **Step 6: 커밋**
 ```bash
 git add components/media/backends/gstreamer/render-d3d11/interop.rs
-git commit -m '공유 텍스처 링 구현: GPU-GPU 복사 + 완료 대기 + 타 디바이스 판독 테스트'
+git commit -m '공유 텍스처 링 구현: 변환 출력 슬롯 + 완료 fence + 타 디바이스 판독 테스트'
 ```
 
 ---
 
 ### Task 3: PoC 예제 — 실제 mp4 → d3d11upload/convert → D3D11 appsink → 링 → 타 디바이스 판독
 
-스펙 §6-1의 핵심(상호운용 최대 리스크: caps 협상, 디바이스 주입 일치, GstD3D11Memory 추출)을 servoshell 없이 검증한다. "ANGLE 래핑·화면 표시"는 검증된 기존 경로(`create_texture_from_shared_handle` — WebGPU gpu-direct 선례)를 쓰므로 Task 8의 E2E에서 완결한다.
+스펙 §6-1의 핵심(상호운용 최대 리스크: caps 협상, 디바이스 주입 일치, **GstD3D11Converter의 래핑-버퍼 출력**)을 servoshell 없이 검증한다. "ANGLE 래핑·화면 표시"는 검증된 기존 경로(`create_texture_from_shared_handle` — WebGPU gpu-direct 선례)를 쓰므로 Task 8의 E2E에서 완결한다.
 
 **Files:**
 - Create: `components/media/backends/gstreamer/render-d3d11/examples/d3d11_upload_poc.rs`
@@ -773,16 +897,17 @@ Expected: 월 표출에 쓰는 mp4 상대경로가 나온다. `tests/html/` 기�
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! PoC: mp4 → decodebin → d3d11upload → d3d11convert(RGBA) → appsink(memory:D3D11Memory)
-//! → GstD3D11Memory에서 텍스처 추출 → 디바이스 일치 assert → 공유 링 복사 →
+//! PoC: mp4 → decodebin → d3d11upload → appsink(memory:D3D11Memory, 디코더 원 포맷)
+//! → 디바이스 일치 assert → GstD3D11Converter로 공유 링 슬롯에 직접 YUV→RGBA 렌더 →
 //! 별개 D3D11 디바이스에서 판독해 비검정 확인.
 //!
 //! 실행: cargo run -p servo-media-gstreamer-render-d3d11 --release --example d3d11_upload_poc -- <mp4 경로>
 
 use std::sync::Arc;
 
+use gstreamer::glib::translate::ToGlibPtr;
 use gstreamer::prelude::*;
-use servo_media_gstreamer_render_d3d11::ffi::{GstD3D11Api, GstD3D11Memory};
+use servo_media_gstreamer_render_d3d11::ffi::{GstD3D11Api, GstD3D11Converter, GstD3D11Memory};
 use servo_media_gstreamer_render_d3d11::{SharedGstD3D11Device, SharedTextureRing};
 use winapi::Interface;
 use winapi::shared::dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -800,9 +925,11 @@ fn main() {
     let api = GstD3D11Api::load().expect("gstd3d11-1.0-0.dll 로드 실패");
     let device = SharedGstD3D11Device::get_or_create().expect("GstD3D11Device 생성 실패");
 
+    // format 미지정: 디코더 원 포맷(I420/NV12)을 D3D11 메모리로 그대로 받고,
+    // RGBA 변환은 아래에서 GstD3D11Converter가 링 슬롯에 직접 수행한다.
     let desc = format!(
-        "filesrc location=\"{}\" ! decodebin ! d3d11upload ! d3d11convert ! \
-         video/x-raw(memory:D3D11Memory),format=RGBA,pixel-aspect-ratio=1/1 ! \
+        "filesrc location=\"{}\" ! decodebin ! d3d11upload ! \
+         video/x-raw(memory:D3D11Memory) ! \
          appsink name=sink sync=false max-buffers=4",
         path.replace('\\', "/")
     );
@@ -827,6 +954,7 @@ fn main() {
         .expect("PLAYING 전환 실패");
 
     let mut ring = SharedTextureRing::new(device.clone());
+    let mut converter: Option<*mut GstD3D11Converter> = None; // PoC라 해제 생략(프로세스 종료 회수)
     let mut last = None;
     for i in 0..FRAMES_TO_CHECK {
         let sample = appsink
@@ -835,21 +963,20 @@ fn main() {
         let caps = sample.caps().expect("caps 없음");
         let info = gstreamer_video::VideoInfo::from_caps(caps).expect("VideoInfo 실패");
         let buffer = sample.buffer().expect("버퍼 없음");
-        let memory = buffer.peek_memory(0);
+        let width = info.width() as i32;
+        let height = info.height() as i32;
 
         unsafe {
-            let mem_ptr = memory.as_mut_ptr();
+            let mem_ptr = buffer.peek_memory(0).as_mut_ptr();
             assert_ne!(
                 (api.is_d3d11_memory)(mem_ptr),
                 0,
                 "프레임 {i}: D3D11Memory가 아님 — caps 협상 확인 필요"
             );
-            let d3d11_mem = mem_ptr as *mut GstD3D11Memory;
-            let resource = (api.memory_get_resource_handle)(d3d11_mem);
-            assert!(!resource.is_null(), "프레임 {i}: resource 핸들 null");
-            let subresource = (api.memory_get_subresource_index)(d3d11_mem);
-
             // 디바이스 일치 확증: 디코드 텍스처의 디바이스 == 우리가 주입한 디바이스
+            let resource =
+                (api.memory_get_resource_handle)(mem_ptr as *mut GstD3D11Memory);
+            assert!(!resource.is_null(), "프레임 {i}: resource 핸들 null");
             let mut frame_device: *mut d3d::ID3D11Device = std::ptr::null_mut();
             (*resource).GetDevice(&mut frame_device);
             let frame_device = ComPtr::from_raw(frame_device);
@@ -859,9 +986,37 @@ fn main() {
                 "프레임 {i}: 파이프라인이 주입 디바이스를 쓰지 않음 (context 주입 실패)"
             );
 
-            let (handle, epoch) = ring
-                .write(resource, subresource, info.width() as i32, info.height() as i32)
-                .expect("링 복사 실패");
+            // 변환기 lazy 생성 (in = 디코더 원 포맷, out = RGBA 동일 크기)
+            if converter.is_none() {
+                let out_info = gstreamer_video::VideoInfo::builder(
+                    gstreamer_video::VideoFormat::Rgba,
+                    info.width(),
+                    info.height(),
+                )
+                .build()
+                .expect("out VideoInfo 실패");
+                // VideoInfo가 ToGlibPtr 미구현으로 컴파일 실패하면
+                // `&info as *const _ as *const gstreamer_video::ffi::GstVideoInfo`로 조정.
+                let conv = (api.converter_new)(
+                    device.raw(),
+                    info.to_glib_none().0,
+                    out_info.to_glib_none().0,
+                    std::ptr::null_mut(),
+                );
+                assert!(!conv.is_null(), "gst_d3d11_converter_new 실패");
+                converter = Some(conv);
+            }
+
+            // 링 슬롯 확보 → 변환 렌더(YUV→RGBA, 슬롯에 직접) → 완료 fence
+            let (out_buffer, slot_index) =
+                ring.acquire(width, height).expect("슬롯 확보 실패");
+            let ok = (api.converter_convert_buffer)(
+                converter.unwrap(),
+                buffer.as_mut_ptr(),
+                out_buffer.as_mut_ptr(),
+            );
+            assert_ne!(ok, 0, "프레임 {i}: convert_buffer 실패 (Step 3 실패 분기 참조)");
+            let (handle, epoch) = ring.finish(slot_index).expect("완료 fence 실패");
             last = Some((handle, epoch, info.width(), info.height()));
         }
     }
@@ -957,10 +1112,11 @@ cargo run -p servo-media-gstreamer-render-d3d11 --release --example d3d11_upload
 ```
 Expected: `POC OK: frames=60 size=1920x1080 epoch=1 nonblack=..%` (30% 초과).
 
-실패 분기(스펙 §7 리스크표 대응):
-- "샘플 획득 실패/협상 실패" → `$env:GST_DEBUG="3,d3d11*:5"`로 재실행해 협상 로그 확인. d3d11convert가 RGBA를 거부하면 caps를 `format=BGRA`로 바꿔 재시도(그 경우 이후 태스크의 `ImageFormat::RGBA8`→`BGRA8` 일괄 변경 노트 남길 것).
+실패 분기(스펙 §7 리스크표 + 폴백 사다리, "의도적 차이 2" 참조):
+- "샘플 획득 실패/협상 실패" → `$env:GST_DEBUG="3,d3d11*:5"`로 재실행해 협상 로그 확인 (d3d11upload가 디코더 포맷을 거부하는 경우 caps에 `format=(string){I420,NV12}` 명시 시도).
 - "디바이스 불일치 assert" → `pipeline.set_context` 시점 문제. 파이프라인 생성 직후·PLAYING 전에 호출하는지 확인, 필요시 bus의 NeedContext 메시지에 응답하는 sync 핸들러 추가로 전환.
-- "nonblack 실패" → 완료 대기 로직 재검토 (Task 2 테스트는 통과했으므로 gst 경로의 subresource/크기 문제 가능성 — `gst_d3d11_memory_get_texture_desc`로 실제 desc를 덤프해 비교).
+- "convert_buffer 실패" → ⓐ 래핑 버퍼에 VideoMeta 추가: `gstreamer_video::VideoMeta::add(out_buffer.get_mut().unwrap(), gstreamer_video::VideoFrameFlags::empty(), gstreamer_video::VideoFormat::Rgba, w, h)` (링 recreate에서 슬롯별 1회) ⓑ out_info를 `VideoFormat::Bgra`로 전환(이후 태스크 `ImageFormat::RGBA8`→`BGRA8` 일괄 변경 노트) ⓒ 최후: d3d11convert 엘리먼트 복귀 + `write_from_resource` 복사 1회(초안 A 방식 — 파이프라인 caps에 convert+RGBA 복원).
+- "nonblack 실패" → 완료 fence 로직 재검토 (Task 2 테스트는 통과했으므로 변환기 출력 대상/뷰 문제 가능성 — `gst_d3d11_memory_get_texture_desc`로 실제 desc를 덤프해 비교).
 
 - [ ] **Step 4: 커밋**
 ```bash
@@ -1027,12 +1183,13 @@ pub enum VideoFrameData {
 use std::env;
 use std::sync::{Arc, Mutex};
 
+use gstreamer::glib::translate::ToGlibPtr;
 use gstreamer::prelude::*;
 use servo_media_gstreamer_render::Render;
 use servo_media_player::PlayerError;
 use servo_media_player::video::{Buffer, VideoFrame, VideoFrameD3D11Data, VideoFrameData};
 
-use crate::ffi::GstD3D11Memory;
+use crate::ffi::GstD3D11Converter;
 
 const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
 
@@ -1055,11 +1212,30 @@ impl Buffer for D3D11FrameBuffer {
     }
 }
 
+/// GstD3D11Converter 소유 핸들. GstObject 파생이라 g_object_unref로 해제.
+struct ConverterHandle(*mut GstD3D11Converter);
+
+impl Drop for ConverterHandle {
+    fn drop(&mut self) {
+        unsafe { gstreamer::glib::gobject_ffi::g_object_unref(self.0 as *mut _) }
+    }
+}
+
+// 안전성: 변환기는 스트리밍 스레드 1개에서만 사용하며 PlayerState Mutex로 보호된다.
+unsafe impl Send for ConverterHandle {}
+
+struct PlayerState {
+    ring: Option<SharedTextureRing>,
+    converter: Option<ConverterHandle>,
+    /// 변환기 무효화 판정용 — 포맷/크기/colorimetry 변경 감지.
+    in_caps: Option<gstreamer::Caps>,
+}
+
 pub struct RenderD3D11 {
     device: Arc<SharedGstD3D11Device>,
-    // 플레이어당 1개 링. build_frame은 스트리밍 스레드 1개에서만 불리지만
+    // 플레이어당 링+변환기. build_frame은 스트리밍 스레드 1개에서만 불리지만
     // Render는 &self라 내부 가변성 필요.
-    ring: Mutex<Option<SharedTextureRing>>,
+    state: Mutex<PlayerState>,
 }
 
 impl RenderD3D11 {
@@ -1073,17 +1249,20 @@ impl RenderD3D11 {
             log::warn!("D3D11 video: 단일 프로세스 전용 — Raw 경로 폴백");
             return None;
         }
-        for factory in ["d3d11upload", "d3d11convert"] {
-            if gstreamer::ElementFactory::find(factory).is_none() {
-                log::warn!("D3D11 video: {factory} 플러그인 없음 (gstd3d11.dll 번들 확인) — Raw 경로 폴백");
-                return None;
-            }
+        // 변환은 라이브러리 GstD3D11Converter를 직접 쓰므로 엘리먼트는 d3d11upload만 필요.
+        if gstreamer::ElementFactory::find("d3d11upload").is_none() {
+            log::warn!("D3D11 video: d3d11upload 플러그인 없음 (gstd3d11.dll 번들 확인) — Raw 경로 폴백");
+            return None;
         }
         let device = SharedGstD3D11Device::get_or_create()?;
         log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성");
         Some(RenderD3D11 {
             device,
-            ring: Mutex::new(None),
+            state: Mutex::new(PlayerState {
+                ring: None,
+                converter: None,
+                in_caps: None,
+            }),
         })
     }
 }
@@ -1102,27 +1281,67 @@ impl Render for RenderD3D11 {
         let info = gstreamer_video::VideoInfo::from_caps(caps).ok()?;
         let width = info.width() as i32;
         let height = info.height() as i32;
-        let memory = buffer.peek_memory(0);
         let api = self.device.api();
 
-        let (shared_handle, ring_epoch) = unsafe {
-            let mem_ptr = memory.as_mut_ptr();
-            if (api.is_d3d11_memory)(mem_ptr) == 0 {
-                log::warn!("D3D11 video: 비 D3D11 메모리 샘플 — 프레임 드롭");
+        if unsafe { (api.is_d3d11_memory)(buffer.peek_memory(0).as_mut_ptr()) } == 0 {
+            log::warn!("D3D11 video: 비 D3D11 메모리 샘플 — 프레임 드롭");
+            return None;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        let state = &mut *state;
+
+        // caps 변경(포맷/크기/색상 정보) 시 변환기 재생성
+        if state.in_caps.as_deref() != Some(caps) {
+            state.converter = None;
+            state.in_caps = Some(caps.to_owned());
+        }
+        let ring = state
+            .ring
+            .get_or_insert_with(|| SharedTextureRing::new(self.device.clone()));
+        let (out_buffer, slot_index) = ring.acquire(width, height)?;
+
+        if state.converter.is_none() {
+            let out_info = gstreamer_video::VideoInfo::builder(
+                gstreamer_video::VideoFormat::Rgba,
+                info.width(),
+                info.height(),
+            )
+            .build()
+            .ok()?;
+            // VideoInfo가 ToGlibPtr 미구현으로 컴파일 실패하면
+            // `&info as *const _ as *const gstreamer_video::ffi::GstVideoInfo`로 조정.
+            let raw = unsafe {
+                (api.converter_new)(
+                    self.device.raw(),
+                    info.to_glib_none().0,
+                    out_info.to_glib_none().0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw.is_null() {
+                log::warn!("D3D11 video: converter 생성 실패 — 프레임 드롭");
                 return None;
             }
-            let d3d11_mem = mem_ptr as *mut GstD3D11Memory;
-            let resource = (api.memory_get_resource_handle)(d3d11_mem);
-            if resource.is_null() {
-                return None;
-            }
-            let subresource = (api.memory_get_subresource_index)(d3d11_mem);
-            let mut ring = self.ring.lock().unwrap();
-            let ring = ring.get_or_insert_with(|| SharedTextureRing::new(self.device.clone()));
-            ring.write(resource, subresource, width, height)?
+            state.converter = Some(ConverterHandle(raw));
+        }
+        let converter = state.converter.as_ref()?;
+
+        // YUV→RGBA 변환을 공유 링 슬롯에 직접 렌더 (추가 복사 없음)
+        let ok = unsafe {
+            (api.converter_convert_buffer)(
+                converter.0,
+                buffer.as_mut_ptr(),
+                out_buffer.as_mut_ptr(),
+            )
         };
-        // gst 버퍼는 여기서 스코프를 벗어나며 즉시 풀로 반환된다 — 프레임 수명이
-        // 렌더러와 분리되는 것이 링 설계의 핵심 이점.
+        if ok == 0 {
+            log::warn!("D3D11 video: convert_buffer 실패 — 프레임 드롭");
+            return None;
+        }
+        let (shared_handle, ring_epoch) = ring.finish(slot_index)?;
+        // gst 버퍼(sample)는 여기서 스코프를 벗어나며 즉시 풀로 반환된다 — 프레임
+        // 수명이 렌더러와 분리되는 것이 링 설계의 핵심 이점.
         VideoFrame::new(
             width,
             height,
@@ -1144,20 +1363,19 @@ impl Render for RenderD3D11 {
         let upload = gstreamer::ElementFactory::make("d3d11upload")
             .build()
             .map_err(|error| PlayerError::Backend(format!("d3d11upload 생성 실패: {error:?}")))?;
-        let convert = gstreamer::ElementFactory::make("d3d11convert")
-            .build()
-            .map_err(|error| PlayerError::Backend(format!("d3d11convert 생성 실패: {error:?}")))?;
 
+        // format 미지정: 디코더 원 포맷(I420/NV12 등)을 D3D11 메모리로 그대로 받는다.
+        // RGBA 변환은 build_frame의 GstD3D11Converter가 링 슬롯에 직접 수행.
         let caps = gstreamer::Caps::builder("video/x-raw")
             .features(["memory:D3D11Memory"])
-            .field("format", gstreamer_video::VideoFormat::Rgba.to_str())
             .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
             .build();
         appsink.set_property("caps", &caps);
 
-        bin.add_many([&upload, &convert, appsink])
+        bin.add_many([&upload, appsink])
             .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
-        gstreamer::Element::link_many([&upload, &convert, appsink])
+        upload
+            .link(appsink)
             .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
 
         let upload_sink = upload
@@ -1742,8 +1960,8 @@ Expected: 활성 로그 존재, `frame_backend=d3d11_texture` 존재, 실패/폴
 
 - blacktile_check.ps1가 있으면 1×1 대상으로 실행 → 비검정 확인.
 - **사용자 육안**: 영상이 정상 색(색 반전/틴트 없음), 정상 방향(상하 반전 없음), 정상 재생(멈춤 없음)인지 확인. 프레임카운터 내장 영상이면 카운터 진행 확인.
-- 상하 반전이면: 디스패치의 Media uv 플립(코드 앵커 참조)이 원인 — 1순위 수정 = `build_video_sink`의 d3d11convert에 `convert.set_property_from_str("video-direction", "vert");` 추가(Task 4 파일). WebGPU 선례상 발생 가능성 낮음.
-- 색이 틀리면(R/B 스왑): PoC 노트대로 caps `format`과 `ImageFormat`을 BGRA 계열로 일괄 전환.
+- 상하 반전이면: 디스패치의 Media uv 플립(코드 앵커 참조)이 원인 — 1순위 수정 = `gst_d3d11_converter_set_transform_matrix`(gstd3d11converter.h:199)로 변환 시 수직 플립 행렬 적용(Task 4 build_frame의 converter 생성 직후). WebGPU 선례상 발생 가능성 낮음.
+- 색이 틀리면(R/B 스왑): PoC 폴백 ⓑ대로 out_info `VideoFormat::Bgra` + `ImageFormat::BGRA8`로 일괄 전환.
 
 - [ ] **Step 5: A/B — env off 동일성**
 
@@ -1822,7 +2040,7 @@ Expected: Task 1-7 커밋 존재, 작업 트리 클린(계획 문서 자체는 �
 
 **Spec coverage (스펙 섹션 → 태스크):**
 - §2 성공 기준 5항목 → Task 9 Step 3(슬로우모드/lockstep/gapless/스톨/블랙), Step 4(Texture cache ≈0), Step 5(경계 확장), Step 6(env off 동일). ✓
-- §4.1 파이프라인 모양(d3d11upload→convert→appsink D3D11 caps) → Task 4 build_video_sink. 풀 공유 할당은 의도적 차이 2(자체 링)로 대체 — 문서 상단에 명시, 스펙 리스크표의 승인된 폴백과 동형. ✓
+- §4.1 파이프라인 모양 → Task 4 build_video_sink(d3d11upload→appsink D3D11 caps). d3d11convert 엘리먼트와 풀 공유 할당은 의도적 차이 2로 대체(라이브러리 GstD3D11Converter가 링 슬롯에 직접 변환-렌더, 복사 0회) — 문서 상단에 근거 명시, RGBA 1장 전달·WR YUV 셰이더 의존 제거라는 §4.1의 목적은 동일하게 달성. ✓
 - §4.1 명시적 GstD3D11Device 생성/주입 → Task 1(디바이스) + Task 4(set_context) + PoC 디바이스 일치 assert(Task 3). ✓
 - §4.2 핸드오프 표(레지스트리/단일 ImageKey/TextureHandle/lock→NativeTexture) → Task 5(레지스트리+lock)+Task 6(단일 키 발행). 코얼레싱·in-flight 게이트·gapless·동기그룹 직교 → 무변경(어느 태스크도 painter의 해당 로직을 건드리지 않음). ✓
 - §4.3 래핑+캐시 → 의도적 차이 1(검증된 클라이언트 버퍼 경로) + Task 5의 epoch 기반 캐시(재래핑 방지 — 스펙 §4.3의 캐시 무효화 요구는 ring_epoch+removed_ids로 충족). ✓
@@ -1832,10 +2050,11 @@ Expected: Task 1-7 커밋 존재, 작업 트리 클린(계획 문서 자체는 �
 - §6 검증 단계 1-4 → PoC(Task 3, ANGLE/표시 제외분은 Task 8로 완결 — §6-1의 "화면 표시까지"를 두 태스크로 분할, 근거: ANGLE 래핑이 이미 WebGPU로 검증된 기존 코드라 PoC 리스크가 아님), 스윕(Task 9 Step 1-3), 회귀(Step 6), 경계(Step 5). §6-5 멀티GPU는 후속. ✓
 - §7 리스크표 → 상호운용(Task 3 PoC 최우선 + 실패 분기 명시), 번들(Task 7, 의존 DLL 실측), VideoFrame 변형(Task 4, 기존 GL 변형 패턴 준수), 디바이스 공유(어댑터당 1개, Task 1), 렌더러 대기(발행-후-읽기로 원천 제거). ✓
 
-**Placeholder scan:** TBD/TODO/"적절히 처리" 없음. 모든 코드 스텝에 실제 코드. 미확정 지점 2곳은 명시적 검증 분기로 처리(winapi `dxgifmt` vs `dxgiformat` 모듈명, RGBA 협상 실패 시 BGRA 전환) — 실행 시 컴파일러/PoC가 판정. Task 10의 실측값 기입은 실행 시 채움을 명시. ✓
+**Placeholder scan:** TBD/TODO/"적절히 처리" 없음. 모든 코드 스텝에 실제 코드. 미확정 지점 4곳은 명시적 검증/폴백 분기로 처리(winapi `dxgifmt` vs `dxgiformat` 모듈명, `VideoInfo`의 ToGlibPtr 구현 여부 — 캐스트 대안 주석, allocator 획득 find→g_object_new 폴백, convert_buffer 실패 사다리 ⓐⓑⓒ) — 실행 시 컴파일러/PoC가 판정. Task 10의 실측값 기입은 실행 시 채움을 명시. ✓
 
 **Type consistency:**
-- `SharedTextureRing::write(&mut self, *mut ID3D11Resource, u32, i32, i32) -> Option<(u64, u32)>`: Task 2 정의 = Task 3 PoC 호출 = Task 4 build_frame 호출. ✓
+- `SharedTextureRing::acquire(i32, i32) -> Option<(gstreamer::Buffer, usize)>` / `finish(usize) -> Option<(u64, u32)>`: Task 2 정의 = Task 3 PoC 호출 = Task 4 build_frame 호출. `write_from_resource`: Task 2 정의 = Task 2 테스트 호출(폴백용). ✓
+- `GstD3D11Api::{converter_new, converter_convert_buffer, allocator_alloc_wrapped, allocator_get_type}`: Task 1 정의 = Task 2 recreate(alloc_wrapped) = Task 3/4 converter 호출. ✓
 - `VideoFrameD3D11Data { shared_handle: u64, ring_epoch: u32 }`: Task 4 정의 = Task 6 사용(`d3d11.shared_handle`, `d3d11.ring_epoch`). ✓
 - `D3d11VideoFrameInfo { shared_handle, ring_epoch, width, height }`: Task 5 정의 = Task 6 `update()` 호출 필드 일치. ✓
 - `initialize_image_handler(&mut ..., Rc<dyn RenderingContext>)`: Task 5 정의 = painter.rs 호출(유일 호출처 확인됨). ✓
@@ -1843,4 +2062,4 @@ Expected: Task 1-7 커밋 존재, 작업 트리 클린(계획 문서 자체는 �
 - env 이름 `SERVO_MEDIA_D3D11_VIDEO` 전 태스크 동일(스펙 §5와 일치). ✓
 - 크레이트/모듈명 `servo-media-gstreamer-render-d3d11` / `servo_media_gstreamer_render_d3d11`: Cargo.toml·render.rs extern·PoC use 일치. ✓
 
-**실행 시 최대 리스크 집중점:** Task 3 (gst d3d11 ↔ 자체 링 상호운용). 여기서 막히면 스펙 §7 1행의 대응(디바이스 불일치/포맷)을 PoC 실패 분기로 순차 판정 — Task 4 이후로 넘어가기 전에 반드시 통과할 것.
+**실행 시 최대 리스크 집중점:** Task 3 (gst d3d11 ↔ 자체 링 상호운용 + GstD3D11Converter의 래핑-버퍼 출력). 여기서 막히면 PoC 실패 분기(VideoMeta → BGRA → d3d11convert 엘리먼트+복사 1회 폴백)를 순차 판정 — Task 4 이후로 넘어가기 전에 반드시 통과할 것. 폴백 ⓒ로 확정될 경우 Task 4의 build_video_sink에 convert 엘리먼트를 복원하고 build_frame을 `write_from_resource` 경로로 바꾼다(링·레지스트리·핸들러·htmlmediaelement는 무변경).
