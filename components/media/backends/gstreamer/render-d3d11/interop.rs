@@ -124,13 +124,18 @@ use winapi::shared::dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM;
 use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
 use winapi::shared::winerror::{S_FALSE, S_OK};
 use winapi::um::d3d11::{
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_QUERY_DESC,
-    D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    ID3D11Asynchronous, ID3D11Query, ID3D11Resource, ID3D11Texture2D,
+    D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_BOX, D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_RESOURCE_MISC_SHARED,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Asynchronous, ID3D11Query, ID3D11Resource,
+    ID3D11Texture2D,
 };
 use wio::com::ComPtr;
 
 const RING_SLOTS: usize = 4;
+
+/// finish()의 GPU 완료 폴링 예산. GPU 행/TDR/디바이스 제거 시 스트리밍 스레드가
+/// 영원히 스핀하지 않도록 초과 시 슬롯 발행을 포기한다(해당 프레임만 드롭).
+const FINISH_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 struct RingSlot {
     texture: ComPtr<ID3D11Texture2D>,
@@ -159,6 +164,11 @@ pub struct SharedTextureRing {
     epoch: u32,
     width: i32,
     height: i32,
+    /// 직전 acquire()가 내준 (슬롯, epoch). finish()는 이와 일치할 때만 발행 —
+    /// acquire와 finish 사이에 recreate가 끼거나(epoch 변경으로 슬롯·쿼리가 전부
+    /// 교체됨) acquire 없이 finish가 불리면 엉뚱한 슬롯의 쿼리를 대기/발행하게
+    /// 되므로 None으로 거절한다.
+    pending: Option<(usize, u32)>,
 }
 
 // 안전성: ComPtr 원시 포인터는 이 구조체가 단독 소유하며, 컨텍스트 작업은 전부
@@ -174,6 +184,7 @@ impl SharedTextureRing {
             epoch: 0,
             width: 0,
             height: 0,
+            pending: None,
         }
     }
 
@@ -187,11 +198,24 @@ impl SharedTextureRing {
         }
         let slot_index = self.next_slot;
         self.next_slot = (self.next_slot + 1) % self.slots.len();
+        self.pending = Some((slot_index, self.epoch));
         Some((self.slots[slot_index].wrapped_buffer.clone(), slot_index))
     }
 
     /// 슬롯에 대한 GPU 작업 제출 후 호출: 완료 fence 대기 → (공유 핸들, epoch) 발행.
+    ///
+    /// 직전 acquire()가 내준 슬롯(같은 epoch)에 대해서만 유효 — 사이에 recreate가
+    /// 끼었거나 acquire 없이 불리면 None.
     pub fn finish(&mut self, slot_index: usize) -> Option<(u64, u32)> {
+        let pending = self.pending.take();
+        if pending != Some((slot_index, self.epoch)) {
+            log::warn!(
+                "D3D11 video: finish(slot={slot_index}) — 직전 acquire와 불일치 \
+                 (pending={pending:?}, epoch={}), 발행 거부",
+                self.epoch
+            );
+            return None;
+        }
         let slot = self.slots.get(slot_index)?;
         unsafe {
             let _guard = self.device.lock();
@@ -200,6 +224,9 @@ impl SharedTextureRing {
             (*context).Flush();
         }
         // GPU 완료 대기 — 폴마다 락을 짧게 잡아 다른 파이프라인을 막지 않는다.
+        // 위에서 명시적으로 Flush했으므로 DONOTFLUSH로 폴링마다의 암묵적 flush를 막고,
+        // GPU 행/TDR 대비 예산 초과 시 포기한다(무한 스핀 방지).
+        let poll_start = std::time::Instant::now();
         loop {
             let hr = unsafe {
                 let _guard = self.device.lock();
@@ -208,12 +235,24 @@ impl SharedTextureRing {
                     slot.query.as_raw() as *mut ID3D11Asynchronous,
                     std::ptr::null_mut(),
                     0,
-                    0,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH,
                 )
             };
             match hr {
                 S_OK => break,
-                S_FALSE => std::thread::yield_now(),
+                S_FALSE => {
+                    if poll_start.elapsed() >= FINISH_POLL_BUDGET {
+                        let removed_reason =
+                            unsafe { (*self.device.d3d11_device()).GetDeviceRemovedReason() };
+                        log::warn!(
+                            "D3D11 video: 완료 폴링 타임아웃 ({:?} 경과, hr={hr:#x}, \
+                             DeviceRemovedReason={removed_reason:#x}), 슬롯 발행 포기",
+                            poll_start.elapsed()
+                        );
+                        return None;
+                    }
+                    std::thread::yield_now();
+                },
                 _ => {
                     log::warn!("D3D11 video: 완료 쿼리 실패 hr={hr:#x}");
                     return None;
@@ -263,6 +302,7 @@ impl SharedTextureRing {
     fn recreate(&mut self, width: i32, height: i32) -> Option<()> {
         self.slots.clear();
         self.next_slot = 0;
+        self.pending = None;
         self.epoch = self.epoch.wrapping_add(1);
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width as u32,
@@ -510,5 +550,36 @@ mod tests {
         // 변환기 출력 대상용 래핑 버퍼가 슬롯마다 존재
         let (wrapped, _slot) = ring.acquire(32, 32).expect("acquire 실패");
         assert_eq!(wrapped.n_memory(), 1);
+    }
+
+    // finish()는 직전 acquire가 내준 (슬롯, epoch)에 대해서만 발행해야 한다 —
+    // acquire 없이 부르거나, acquire와 finish 사이에 recreate(크기 변경)가 끼면 거부.
+    #[test]
+    fn finish_requires_matching_acquire() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let mut ring = SharedTextureRing::new(device.clone());
+
+        // acquire 없이 finish → None
+        assert!(ring.finish(0).is_none(), "acquire 없는 finish는 거부돼야 함");
+
+        // slot 0, 1 순서로 확보 (pending은 마지막 acquire인 slot 1)
+        let (_b0, s0) = ring.acquire(64, 64).expect("acquire 실패");
+        let (_b1, s1) = ring.acquire(64, 64).expect("acquire(2) 실패");
+        assert_ne!(s0, s1);
+
+        // 크기 변경 acquire → recreate(슬롯 전부 교체 + epoch 증가, next_slot 리셋)
+        let (_b2, s2) = ring.acquire(32, 32).expect("acquire(3) 실패");
+        assert_ne!(s1, s2);
+
+        // recreate 이전에 확보한 슬롯으로 finish → 불일치 → None
+        assert!(
+            ring.finish(s1).is_none(),
+            "recreate 이전 슬롯의 finish는 거부돼야 함"
+        );
+
+        // 정상 경로는 여전히 동작: 새로 acquire한 슬롯은 finish 가능
+        let (_b3, s3) = ring.acquire(32, 32).expect("acquire(4) 실패");
+        assert!(ring.finish(s3).is_some(), "정상 acquire→finish는 성공해야 함");
     }
 }
