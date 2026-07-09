@@ -25,9 +25,13 @@ servo-media-player = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = [
     "d3d11",
+    "d3dcommon",
     "dxgi",
+    "dxgiformat",
+    "dxgitype",
     "guiddef",
     "handleapi",
+    "ntdef",
     "unknwnbase",
     "winerror",
 ] }

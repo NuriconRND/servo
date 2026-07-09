@@ -17,4 +17,4 @@ pub mod ffi;
 pub mod interop;
 
 #[cfg(windows)]
-pub use interop::SharedGstD3D11Device;
+pub use interop::{SharedGstD3D11Device, SharedTextureRing};
