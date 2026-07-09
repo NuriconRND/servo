@@ -113,6 +113,19 @@ mod platform {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod platform {
+    extern crate servo_media_gstreamer_render_d3d11;
+    pub use self::servo_media_gstreamer_render_d3d11::RenderD3D11 as Render;
+    use super::*;
+
+    // env SERVO_MEDIA_D3D11_VIDEO 게이트 + 사전 점검은 RenderD3D11::new 내부.
+    // None이면 기존 CPU(I420 borrowed) 경로가 그대로 쓰인다.
+    pub fn create_render(_gl_context: Box<dyn PlayerGLContext>) -> Option<Render> {
+        Render::new()
+    }
+}
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -120,6 +133,7 @@ mod platform {
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "android",
+    target_os = "windows",
 )))]
 mod platform {
     use servo_media_gstreamer_render::Render as RenderTrait;

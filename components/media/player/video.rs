@@ -59,12 +59,22 @@ impl VideoFrameYuvData {
     }
 }
 
+/// D3D11 공유 텍스처 프레임의 페이로드. shared_handle은 렌더러가
+/// OpenSharedResource로 열 수 있는 레거시 DXGI 공유 핸들, ring_epoch는
+/// 링 재생성(크기 변경) 세대 — 렌더러측 래핑 캐시 무효화에 쓴다.
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub struct VideoFrameD3D11Data {
+    pub shared_handle: u64,
+    pub ring_epoch: u32,
+}
+
 #[derive(Clone, MallocSizeOf)]
 pub enum VideoFrameData {
     Raw(#[conditional_malloc_size_of] Arc<Vec<u8>>),
     Yuv(VideoFrameYuvData),
     Texture(u32),
     OESTexture(u32),
+    D3D11(VideoFrameD3D11Data),
 }
 
 pub trait Buffer: Send + Sync {
@@ -145,6 +155,17 @@ impl VideoFrame {
 
     pub fn is_yuv(&self) -> bool {
         matches!(self.data, VideoFrameData::Yuv(_))
+    }
+
+    pub fn is_d3d11(&self) -> bool {
+        matches!(self.data, VideoFrameData::D3D11(_))
+    }
+
+    pub fn get_d3d11_data(&self) -> Option<VideoFrameD3D11Data> {
+        match self.data {
+            VideoFrameData::D3D11(data) => Some(data),
+            _ => None,
+        }
     }
 
     pub fn is_external_oes(&self) -> bool {

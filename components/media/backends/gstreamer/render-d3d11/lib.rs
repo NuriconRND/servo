@@ -18,3 +18,239 @@ pub mod interop;
 
 #[cfg(windows)]
 pub use interop::{SharedGstD3D11Device, SharedTextureRing};
+
+// RenderD3D11 본체 — interop/ffi와 마찬가지로 Windows 전용. 비Windows에서는 이 모듈
+// 자체가 컴파일되지 않아 크레이트가 계속 빈 크레이트로 유지된다.
+#[cfg(windows)]
+mod render_d3d11 {
+    use std::env;
+    use std::sync::{Arc, Mutex};
+
+    use gstreamer::glib::translate::ToGlibPtr;
+    use gstreamer::prelude::*;
+    use servo_media_gstreamer_render::Render;
+    use servo_media_player::PlayerError;
+    use servo_media_player::video::{Buffer, VideoFrame, VideoFrameD3D11Data, VideoFrameData};
+
+    // 부모 모듈(lib.rs)의 `pub use interop::{SharedGstD3D11Device, SharedTextureRing};`를
+    // 가져온다.
+    use super::*;
+    use crate::ffi::GstD3D11Converter;
+
+    const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
+
+    fn env_flag_enabled(name: &str) -> bool {
+        env::var(name).is_ok_and(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
+    }
+
+    struct D3D11FrameBuffer {
+        data: VideoFrameD3D11Data,
+    }
+
+    impl Buffer for D3D11FrameBuffer {
+        fn frame_data(&self) -> Option<VideoFrameData> {
+            Some(VideoFrameData::D3D11(self.data))
+        }
+    }
+
+    /// GstD3D11Converter 소유 핸들. GstObject 파생이라 g_object_unref로 해제.
+    struct ConverterHandle(*mut GstD3D11Converter);
+
+    impl Drop for ConverterHandle {
+        fn drop(&mut self) {
+            unsafe { gstreamer::glib::gobject_ffi::g_object_unref(self.0 as *mut _) }
+        }
+    }
+
+    // 안전성: 변환기는 스트리밍 스레드 1개에서만 사용하며 PlayerState Mutex로 보호된다.
+    unsafe impl Send for ConverterHandle {}
+
+    struct PlayerState {
+        ring: Option<SharedTextureRing>,
+        converter: Option<ConverterHandle>,
+        /// 변환기 무효화 판정용 — 포맷/크기/colorimetry 변경 감지.
+        in_caps: Option<gstreamer::Caps>,
+    }
+
+    pub struct RenderD3D11 {
+        device: Arc<SharedGstD3D11Device>,
+        // 플레이어당 링+변환기. build_frame은 스트리밍 스레드 1개에서만 불리지만
+        // Render는 &self라 내부 가변성 필요.
+        state: Mutex<PlayerState>,
+    }
+
+    impl RenderD3D11 {
+        /// env 게이트 + 사전 점검. 하나라도 실패하면 None → 기존 CPU(Raw) 경로 폴백.
+        pub fn new() -> Option<RenderD3D11> {
+            if !env_flag_enabled(D3D11_VIDEO_ENV) {
+                return None;
+            }
+            let options = servo_config::opts::get();
+            if options.multiprocess || options.force_ipc {
+                log::warn!("D3D11 video: 단일 프로세스 전용 — Raw 경로 폴백");
+                return None;
+            }
+            // 변환은 라이브러리 GstD3D11Converter를 직접 쓰므로 엘리먼트는 d3d11upload만 필요.
+            if gstreamer::ElementFactory::find("d3d11upload").is_none() {
+                log::warn!(
+                    "D3D11 video: d3d11upload 플러그인 없음 (gstd3d11.dll 번들 확인) — Raw 경로 폴백"
+                );
+                return None;
+            }
+            let device = SharedGstD3D11Device::get_or_create()?;
+            log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성");
+            Some(RenderD3D11 {
+                device,
+                state: Mutex::new(PlayerState {
+                    ring: None,
+                    converter: None,
+                    in_caps: None,
+                }),
+            })
+        }
+    }
+
+    impl Render for RenderD3D11 {
+        fn is_gl(&self) -> bool {
+            false
+        }
+
+        fn build_frame(&self, sample: gstreamer::Sample) -> Option<VideoFrame> {
+            let buffer = sample.buffer()?;
+            if buffer.n_memory() == 0 {
+                return None;
+            }
+            let caps = sample.caps()?;
+            let info = gstreamer_video::VideoInfo::from_caps(caps).ok()?;
+            let width = info.width() as i32;
+            let height = info.height() as i32;
+            let api = self.device.api();
+
+            if unsafe { (api.is_d3d11_memory)(buffer.peek_memory(0).as_mut_ptr()) } == 0 {
+                log::warn!("D3D11 video: 비 D3D11 메모리 샘플 — 프레임 드롭");
+                return None;
+            }
+
+            let mut state = self.state.lock().unwrap();
+            let state = &mut *state;
+
+            // caps 변경(포맷/크기/색상 정보) 시 변환기 재생성
+            if state.in_caps.as_deref() != Some(caps) {
+                state.converter = None;
+                state.in_caps = Some(caps.to_owned());
+            }
+            let ring = state
+                .ring
+                .get_or_insert_with(|| SharedTextureRing::new(self.device.clone()));
+            let (out_buffer, slot_index) = ring.acquire(width, height)?;
+
+            if state.converter.is_none() {
+                let out_info = gstreamer_video::VideoInfo::builder(
+                    gstreamer_video::VideoFormat::Rgba,
+                    info.width(),
+                    info.height(),
+                )
+                .build()
+                .ok()?;
+                // VideoInfo가 ToGlibPtr 미구현으로 컴파일 실패하면
+                // `&info as *const _ as *const gstreamer_video::ffi::GstVideoInfo`로 조정.
+                let raw = unsafe {
+                    (api.converter_new)(
+                        self.device.raw(),
+                        info.to_glib_none().0,
+                        out_info.to_glib_none().0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if raw.is_null() {
+                    log::warn!("D3D11 video: converter 생성 실패 — 프레임 드롭");
+                    return None;
+                }
+                state.converter = Some(ConverterHandle(raw));
+            }
+            let converter = state.converter.as_ref()?;
+
+            // YUV→RGBA 변환을 공유 링 슬롯에 직접 렌더 (추가 복사 없음).
+            //
+            // gst_d3d11_converter_convert_buffer(일반 변형)는 내부적으로 디바이스 락을
+            // 잡는다 — 짝 API `_unlocked`의 존재가 근거(gstd3d11converter.h:194). 그러므로
+            // 여기서 device.lock()으로 감싸지 않는다(이중 락으로 인한 데드락 방지).
+            let ok = unsafe {
+                (api.converter_convert_buffer)(
+                    converter.0,
+                    buffer.as_mut_ptr(),
+                    out_buffer.as_mut_ptr(),
+                )
+            };
+            if ok == 0 {
+                log::warn!("D3D11 video: convert_buffer 실패 — 프레임 드롭");
+                return None;
+            }
+            let (shared_handle, ring_epoch) = ring.finish(slot_index)?;
+            // gst 버퍼(sample)는 여기서 스코프를 벗어나며 즉시 풀로 반환된다 — 프레임
+            // 수명이 렌더러와 분리되는 것이 링 설계의 핵심 이점.
+            VideoFrame::new(
+                width,
+                height,
+                Arc::new(D3D11FrameBuffer {
+                    data: VideoFrameD3D11Data {
+                        shared_handle,
+                        ring_epoch,
+                    },
+                }),
+            )
+        }
+
+        fn build_video_sink(
+            &self,
+            appsink: &gstreamer::Element,
+            pipeline: &gstreamer::Element,
+        ) -> Result<(), PlayerError> {
+            let bin = gstreamer::Bin::builder()
+                .name("servo-d3d11-video-sink")
+                .build();
+            let upload = gstreamer::ElementFactory::make("d3d11upload")
+                .build()
+                .map_err(|error| PlayerError::Backend(format!("d3d11upload 생성 실패: {error:?}")))?;
+
+            // format 미지정: 디코더 원 포맷(I420/NV12 등)을 D3D11 메모리로 그대로 받는다.
+            // RGBA 변환은 build_frame의 GstD3D11Converter가 링 슬롯에 직접 수행.
+            let caps = gstreamer::Caps::builder("video/x-raw")
+                .features(["memory:D3D11Memory"])
+                .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
+                .build();
+            appsink.set_property("caps", &caps);
+
+            bin.add_many([&upload, appsink])
+                .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
+            upload
+                .link(appsink)
+                .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
+
+            let upload_sink = upload
+                .static_pad("sink")
+                .ok_or_else(|| PlayerError::Backend("d3d11upload sink pad 없음".to_owned()))?;
+            let ghost_pad = gstreamer::GhostPad::builder_with_target(&upload_sink)
+                .map_err(|error| PlayerError::Backend(format!("ghost pad 실패: {error:?}")))?
+                .name("sink")
+                .build();
+            bin.add_pad(&ghost_pad)
+                .map_err(|error| PlayerError::Backend(format!("ghost pad add 실패: {error:?}")))?;
+
+            // 우리 디바이스를 파이프라인 전체에 주입 — PoC(Task 3)에서 검증된 방식.
+            if let Some(context) = self.device.gst_context() {
+                pipeline.set_context(&context);
+            }
+            pipeline.set_property("video-sink", &bin);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use render_d3d11::RenderD3D11;

@@ -8281,6 +8281,7 @@ dependencies = [
  "servo-media-audio",
  "servo-media-gstreamer-render",
  "servo-media-gstreamer-render-android",
+ "servo-media-gstreamer-render-d3d11",
  "servo-media-gstreamer-render-unix",
  "servo-media-player",
  "servo-media-streams",
