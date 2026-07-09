@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "components/media/backends/gstreamer/render-d3d11",
     "components/media/examples",
     "components/xpath",
     "ports/servoshell",
@@ -141,6 +142,7 @@ js = { package = "mozjs", version = "=0.16.0", default-features = false, feature
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
 kurbo = { version = "0.13.1", features = ["euclid"] }
 libc = "0.2"
+libloading = "0.8"
 log = "0.4.30"
 mach2 = "0.6"
 malloc_size_of_derive = "0.1"
@@ -344,6 +346,7 @@ servo-media-derive = { version = "=0.3.0", path = "components/media/servo-media-
 servo-media-dummy = { version = "=0.3.0", path = "components/media/backends/dummy" }
 servo-media-gstreamer = { version = "=0.3.0", path = "components/media/backends/gstreamer" }
 servo-media-gstreamer-render = { version = "=0.3.0", path = "components/media/backends/gstreamer/render" }
+servo-media-gstreamer-render-d3d11 = { version = "=0.3.0", path = "components/media/backends/gstreamer/render-d3d11" }
 servo-media-gstreamer-render-android = { version = "=0.3.0", path = "components/media/backends/gstreamer/render-android" }
 servo-media-gstreamer-render-unix = { version = "=0.3.0", path = "components/media/backends/gstreamer/render-unix" }
 servo-media-ohos = { version = "=0.3.0", path = "components/media/backends/ohos" }

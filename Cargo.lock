@@ -8311,6 +8311,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "servo-media-gstreamer-render-d3d11"
+version = "0.3.0"
+dependencies = [
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "libloading 0.8.9",
+ "log",
+ "servo-config",
+ "servo-media-gstreamer-render",
+ "servo-media-player",
+ "winapi",
+ "wio",
+]
+
+[[package]]
 name = "servo-media-gstreamer-render-unix"
 version = "0.3.0"
 dependencies = [

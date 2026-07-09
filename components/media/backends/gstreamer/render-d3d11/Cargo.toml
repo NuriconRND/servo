@@ -1,0 +1,35 @@
+[package]
+name = "servo-media-gstreamer-render-d3d11"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lib]
+name = "servo_media_gstreamer_render_d3d11"
+path = "lib.rs"
+
+[dependencies]
+gstreamer = { workspace = true }
+gstreamer-video = { workspace = true }
+libloading = { workspace = true }
+log = { workspace = true }
+servo-config = { workspace = true }
+servo-media-gstreamer-render = { workspace = true }
+servo-media-player = { workspace = true }
+winapi = { workspace = true, features = [
+    "d3d11",
+    "dxgi",
+    "guiddef",
+    "handleapi",
+    "unknwnbase",
+    "winerror",
+] }
+wio = { workspace = true }
+
+[dev-dependencies]
+gstreamer-app = { workspace = true }
