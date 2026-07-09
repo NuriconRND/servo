@@ -598,6 +598,15 @@ impl RenderingContext for SoftwareRenderingContext {
         self.surfman_rendering_info.destroy_texture(surface_texture)
     }
 
+    fn create_texture_from_shared_handle(
+        &self,
+        handle: u64,
+        size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        self.surfman_rendering_info
+            .create_texture_from_shared_handle(handle, size)
+    }
+
     fn connection(&self) -> Option<Connection> {
         self.surfman_rendering_info.connection()
     }
@@ -820,6 +829,15 @@ impl RenderingContext for WindowRenderingContext {
 
     fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Option<Surface> {
         self.surfman_context.destroy_texture(surface_texture)
+    }
+
+    fn create_texture_from_shared_handle(
+        &self,
+        handle: u64,
+        size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        self.surfman_context
+            .create_texture_from_shared_handle(handle, size)
     }
 
     fn connection(&self) -> Option<Connection> {
@@ -1146,6 +1164,15 @@ impl RenderingContext for OffscreenRenderingContext {
 
     fn destroy_texture(&self, surface_texture: SurfaceTexture) -> Option<Surface> {
         self.parent_context.destroy_texture(surface_texture)
+    }
+
+    fn create_texture_from_shared_handle(
+        &self,
+        handle: u64,
+        size: UntypedSize2D<i32>,
+    ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
+        self.parent_context
+            .create_texture_from_shared_handle(handle, size)
     }
 
     fn connection(&self) -> Option<Connection> {
