@@ -629,6 +629,16 @@ impl Device {
         context: &mut Context,
         mut surface_texture: SurfaceTexture,
     ) -> Result<Surface, (Error, SurfaceTexture)> {
+        // The external-texture import path (`create_surface_texture_from_texture`, used by
+        // `create_surface_texture_from_shared_handle`) reuses the surface's own pbuffer as
+        // `local_egl_surface`, so the `DestroySurface` below also destroys the returned
+        // surface's EGL surface. Detect that aliasing up front (while both handles are still
+        // live; the regular `create_surface_texture` path allocates a distinct local pbuffer,
+        // so equality uniquely identifies the import path) and neuter the returned `Surface`
+        // afterwards, mirroring `destroy_surface`. Otherwise dropping the returned husk
+        // panics in `Surface::drop`.
+        let is_import_path =
+            surface_texture.surface.egl_surface == surface_texture.local_egl_surface;
         unsafe {
             let _guard = match self.temporarily_make_context_current(context) {
                 Ok(guard) => guard,
@@ -661,6 +671,21 @@ impl Device {
             });
             if let Err(error) = result {
                 return Err((error, surface_texture));
+            }
+        }
+
+        if is_import_path {
+            // Same cleanup `destroy_surface` performs: clearing `egl_surface` makes the
+            // returned husk drop-safe (its EGL surface was just destroyed above), and taking
+            // the wrapped D3D11 texture eagerly releases the COM reference now. The `ComPtr`
+            // would also be released by the struct's natural drop, so the `take()` is for
+            // symmetry with `destroy_surface` rather than for correctness.
+            surface_texture.surface.egl_surface = egl::NO_SURFACE;
+            if let Win32Objects::Pbuffer {
+                ref mut texture, ..
+            } = surface_texture.surface.win32_objects
+            {
+                texture.take();
             }
         }
 
