@@ -470,6 +470,23 @@ impl MediaExternalImages {
     }
 }
 
+impl Drop for MediaExternalImages {
+    fn drop(&mut self) {
+        // 캐시된 SurfaceTexture는 destroy_surface_texture 없이 drop되면 surfman이
+        // 패닉하므로(teardown 안전장치), 핸들러 해체 시 전부 명시 파기한다.
+        // rendering_context가 None이면 lock_d3d11이 항상 Invalid만 반환해 캐시가
+        // 늘 비어 있으므로 그냥 반환해도 안전하다.
+        let Some(rendering_context) = self.rendering_context.as_ref() else {
+            return;
+        };
+        for (_, entry) in self.d3d11_texture_cache.drain() {
+            for (_, (surface_texture, _)) in entry.textures {
+                rendering_context.destroy_texture(surface_texture);
+            }
+        }
+    }
+}
+
 impl WebRenderExternalImageApi for MediaExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         // GPU 상주 D3D11 프레임: 렌더러는 캐시된 GL 텍스처를 돌려줄 뿐 업로드하지 않는다.
