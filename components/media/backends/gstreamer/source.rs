@@ -13,46 +13,6 @@ use url::Url;
 
 const MAX_SRC_QUEUE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB.
 
-// Opt-in servosrc byte cache (SERVO_MEDIA_SOURCE_CACHE=1, default off). When a seekable
-// source of known size is played, the bytes the script pushes on the first (0..EOF
-// sequential) pass are copied into a per-source buffer. Once the buffer contiguously covers
-// the whole input the source becomes self-sufficient: every later seek-data (e.g. a gapless
-// loop rewind, which otherwise triggers a SeekData round-trip to the script thread) is served
-// locally from the cache instead. This removes the script-thread round-trip that, with many
-// simultaneous looping tiles, contends and produces the per-tile stalls at loop-wrap
-// boundaries (see investigation-loop-stall-report.md §14). Off => byte-for-byte unchanged.
-//
-// COUPLING (must-know): looping with the cache assumes SERVO_MEDIA_GAPLESS_LOOP=1 (SEGMENT
-// rewinds, no EOS needed). In self-sufficient mode the cache serves seeks locally and never
-// emits EOS itself, so the spec loop path (EOS -> 'ended' -> script seek(0)) would silently
-// stall on the second loop: no SeekData reaches the script, and no one pushes EOS again.
-// Single (non-looping) playback is fine either way: EOS still comes from the script's first
-// fetch pass. Also note the first pass must be sequential 0..EOF (faststart/moov-front mp4);
-// non-sequential demuxer reads leave the cache incomplete and safely degrade to the existing
-// script round-trip path.
-const SOURCE_CACHE_ENV: &str = "SERVO_MEDIA_SOURCE_CACHE";
-// Only cache sources at or below this size (a plain in-RAM copy per source). Larger sources
-// keep the existing script round-trip.
-const SOURCE_CACHE_CAP: u64 = 256 * 1024 * 1024; // 256 MB.
-// Bytes fed to appsrc per need-data while self-sufficient. Bounded so the streaming-thread
-// callback never does one large blocking copy; appsrc back-pressure (need-data/enough-data)
-// drives repeated chunks, mirroring the script's chunked push.
-const SOURCE_CACHE_SERVE_CHUNK: u64 = 8 * 1024 * 1024; // 8 MB.
-
-fn source_cache_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(SOURCE_CACHE_ENV).is_ok_and(|value| {
-            let value = value.trim();
-            value == "1" ||
-                value.eq_ignore_ascii_case("true") ||
-                value.eq_ignore_ascii_case("yes") ||
-                value.eq_ignore_ascii_case("on")
-        })
-    });
-    *ENABLED
-}
-
 // Implementation sub-module of the GObject
 mod imp {
     use std::sync::LazyLock;
@@ -79,25 +39,6 @@ mod imp {
         requested_offset: u64,
     }
 
-    // Byte cache state (see `SOURCE_CACHE_ENV`). Guarded by its own mutex; this mutex is
-    // only ever acquired on its own or while the `position` mutex is already held (recording
-    // path). It is never held while acquiring `position`, so there is no lock cycle.
-    #[derive(Default)]
-    struct SourceCache {
-        // True once the size is known, the env is on, and the size is within the cap.
-        eligible: bool,
-        // True once `covered == total`: the source now serves seeks/needs from `data`.
-        complete: bool,
-        // Total input size in bytes (set when eligibility is decided).
-        total: u64,
-        // Highest byte offset contiguously covered from 0 by recorded pushes.
-        covered: u64,
-        // Serving cursor while self-sufficient: next byte to feed appsrc.
-        read_offset: u64,
-        // The cached bytes (pre-allocated to `total` when eligible; empty otherwise).
-        data: Vec<u8>,
-    }
-
     // The actual data structure that stores our values. This is not accessible
     // directly from the outside.
     pub struct ServoSrc {
@@ -108,10 +49,6 @@ mod imp {
         seeking: AtomicBool,
         seekable: AtomicBool,
         size: Mutex<Option<i64>>,
-        cache: Mutex<SourceCache>,
-        // Fast-path mirror of `cache.complete` for the appsrc callbacks (no lock needed to
-        // decide whether the source is self-sufficient).
-        cache_complete: AtomicBool,
     }
 
     impl ServoSrc {
@@ -121,165 +58,11 @@ mod imp {
                 // The size value is temporarily stored so it
                 // is properly set once we are done seeking.
                 *self.size.lock().unwrap() = Some(size);
-            } else if self.appsrc.size() == -1 {
+                return;
+            }
+
+            if self.appsrc.size() == -1 {
                 self.appsrc.set_size(size);
-            }
-
-            self.maybe_init_cache(size);
-        }
-
-        // Decide byte-cache eligibility once the input size is known. Idempotent: only the
-        // first eligible call allocates the buffer. No-op unless the env knob is on and the
-        // size is positive and within the cap (see `SOURCE_CACHE_ENV`).
-        fn maybe_init_cache(&self, size: i64) {
-            if !source_cache_enabled() || size <= 0 {
-                return;
-            }
-            let total = size as u64;
-            if total > SOURCE_CACHE_CAP {
-                return;
-            }
-            let mut cache = self.cache.lock().unwrap();
-            if cache.eligible {
-                return;
-            }
-            cache.total = total;
-            cache.data = vec![0u8; total as usize];
-            cache.eligible = true;
-            log::info!(
-                "servosrc byte cache armed: size={}MB (cap {}MB)",
-                total / (1024 * 1024),
-                SOURCE_CACHE_CAP / (1024 * 1024),
-            );
-        }
-
-        // Record bytes pushed by the script into the cache during the first pass, advancing
-        // the contiguous coverage watermark. When coverage reaches the total the source
-        // switches to self-sufficient mode. Called while holding the `position` lock (lock
-        // order: position -> cache). No-op once complete or ineligible.
-        fn cache_record(&self, start: u64, data: &[u8]) {
-            let mut cache = self.cache.lock().unwrap();
-            if !cache.eligible || cache.complete {
-                return;
-            }
-            let total = cache.total;
-            if start >= total {
-                return;
-            }
-            let end = (start + data.len() as u64).min(total);
-            let copy_len = (end - start) as usize;
-            cache.data[start as usize..end as usize].copy_from_slice(&data[..copy_len]);
-            // First playback is a sequential 0..EOF push, so `start == covered` each time;
-            // only advance the watermark when this range extends the contiguous prefix.
-            if start <= cache.covered && end > cache.covered {
-                cache.covered = end;
-            }
-            if cache.covered >= total {
-                cache.complete = true;
-                self.cache_complete.store(true, Ordering::Relaxed);
-                log::info!(
-                    "servosrc source cache complete, size={}MB",
-                    total / (1024 * 1024),
-                );
-            }
-        }
-
-        // Self-sufficient seek: point the serving cursor at `offset` and report handled so the
-        // appsrc callback skips the SeekData script round-trip. Returns false when the cache
-        // is not complete (caller falls back to the existing round-trip path).
-        pub fn cache_serve_seek(&self, offset: u64) -> bool {
-            if !self.cache_complete.load(Ordering::Relaxed) {
-                return false;
-            }
-            let mut cache = self.cache.lock().unwrap();
-            cache.read_offset = offset.min(cache.total);
-            log::info!("servosrc serving seek to offset {offset} from cache");
-            true
-        }
-
-        // Self-sufficient need-data: feed the next bounded chunk from the cache directly into
-        // appsrc, without asking the script. Returns false when the cache is not complete
-        // (caller notifies the script as before). Returning true with nothing left to serve is
-        // intentional: the pipeline reaches segment end and rewinds via seek-data.
-        pub fn cache_serve_need<O: IsA<gstreamer::Object>>(&self, parent: &O) -> bool {
-            if !self.cache_complete.load(Ordering::Relaxed) {
-                return false;
-            }
-            // Grab a bounded chunk, release the cache lock, then push (never hold the lock
-            // across the appsrc push, which can re-enter enough-data).
-            let (start, chunk) = {
-                let mut cache = self.cache.lock().unwrap();
-                let remaining = cache.total - cache.read_offset;
-                if remaining == 0 {
-                    return true;
-                }
-                let len = remaining.min(SOURCE_CACHE_SERVE_CHUNK);
-                let start = cache.read_offset;
-                let chunk = cache.data[start as usize..(start + len) as usize].to_vec();
-                cache.read_offset += len;
-                (start, chunk)
-            };
-            let chunk_len = chunk.len();
-            self.push_bytes(parent, start, chunk);
-            gstreamer::debug!(
-                self.cat,
-                obj = parent,
-                "served {} bytes from cache at offset {}",
-                chunk_len,
-                start
-            );
-            true
-        }
-
-        // Split `data` into appsrc-friendly blocks tagged with absolute byte offsets and push
-        // them, growing the announced size if needed. Shared block-push core for the
-        // self-sufficient serving path; it touches neither the `position` nor `cache` mutex
-        // (the caller owns the offset), so it is safe to call with no lock held.
-        fn push_bytes<O: IsA<gstreamer::Object>>(
-            &self,
-            parent: &O,
-            starting_offset: u64,
-            data: Vec<u8>,
-        ) {
-            let length = data.len() as u64;
-            if let Ok(size) = u64::try_from(self.appsrc.size()) &&
-                starting_offset + length > size
-            {
-                let new_size = i64::try_from(starting_offset + length).unwrap();
-                self.appsrc.set_size(new_size);
-            }
-            let block_size = 4096u64;
-            let num_blocks = (length as f64 / block_size as f64).ceil() as u64;
-            for i in 0..num_blocks {
-                let start = (i * block_size) as usize;
-                let size = usize::try_from(block_size.min(length - start as u64)).unwrap();
-                let end = start + size;
-
-                let buffer_offset = starting_offset + start as u64;
-                let buffer_offset_end = buffer_offset + size as u64;
-
-                let subdata = Vec::from(&data[start..end]);
-                let mut buffer = gstreamer::Buffer::from_slice(subdata);
-                {
-                    let buffer = buffer.get_mut().unwrap();
-                    buffer.set_offset(buffer_offset);
-                    buffer.set_offset_end(buffer_offset_end);
-                }
-
-                match self.appsrc.push_buffer(buffer) {
-                    Ok(_) |
-                    Err(gstreamer::FlowError::Eos) |
-                    Err(gstreamer::FlowError::Flushing) => {},
-                    Err(error) => {
-                        gstreamer::warning!(
-                            self.cat,
-                            obj = parent,
-                            "cache serve push failed: {:?}",
-                            error
-                        );
-                        break;
-                    },
-                }
             }
         }
 
@@ -325,19 +108,6 @@ mod imp {
             parent: &O,
             data: Vec<u8>,
         ) -> Result<gstreamer::FlowSuccess, gstreamer::FlowError> {
-            // Self-sufficient mode: the cache now feeds appsrc, so a late script push (its
-            // fetch was still draining when the cache completed) is redundant. Ignore it so it
-            // cannot inject bytes at a stale offset and corrupt the stream. Harmless because
-            // the script stops receiving NeedData/SeekData once we serve locally.
-            if self.cache_complete.load(Ordering::Relaxed) {
-                gstreamer::debug!(
-                    self.cat,
-                    obj = parent,
-                    "cache complete, ignored late script push"
-                );
-                return Ok(gstreamer::FlowSuccess::Ok);
-            }
-
             if self.seeking.load(Ordering::Relaxed) {
                 gstreamer::debug!(self.cat, obj = parent, "seek in progress, ignored data");
                 return Ok(gstreamer::FlowSuccess::Ok);
@@ -354,10 +124,6 @@ mod imp {
             // X factor given current length
 
             pos.offset += length;
-
-            // Record the pushed bytes into the cache (no-op unless eligible). Done while the
-            // position lock is held (lock order position -> cache).
-            self.cache_record(buffer_starting_offset, &data);
 
             gstreamer::trace!(self.cat, obj = parent, "offset: {}", pos.offset);
 
@@ -516,8 +282,6 @@ mod imp {
                 seeking: AtomicBool::new(false),
                 seekable: AtomicBool::new(true),
                 size: Mutex::new(None),
-                cache: Mutex::new(SourceCache::default()),
-                cache_complete: AtomicBool::new(false),
             }
         }
     }
@@ -661,19 +425,6 @@ impl ServoSrc {
 
     pub fn set_callbacks(&self, callbacks: gstreamer_app::AppSrcCallbacks) {
         self.imp().set_callbacks(callbacks)
-    }
-
-    /// If the byte cache is complete, point its serving cursor at `offset` and return true so
-    /// the appsrc seek-data callback can skip the SeekData script round-trip. Returns false
-    /// otherwise (the caller keeps the existing behavior).
-    pub fn cache_serve_seek(&self, offset: u64) -> bool {
-        self.imp().cache_serve_seek(offset)
-    }
-
-    /// If the byte cache is complete, feed the next chunk from it into appsrc and return true
-    /// so the appsrc need-data callback can skip notifying the script. Returns false otherwise.
-    pub fn cache_serve_need(&self) -> bool {
-        self.imp().cache_serve_need(self)
     }
 }
 
