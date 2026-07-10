@@ -21,6 +21,15 @@ const MAX_SRC_QUEUE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB.
 // locally from the cache instead. This removes the script-thread round-trip that, with many
 // simultaneous looping tiles, contends and produces the per-tile stalls at loop-wrap
 // boundaries (see investigation-loop-stall-report.md §14). Off => byte-for-byte unchanged.
+//
+// COUPLING (must-know): looping with the cache assumes SERVO_MEDIA_GAPLESS_LOOP=1 (SEGMENT
+// rewinds, no EOS needed). In self-sufficient mode the cache serves seeks locally and never
+// emits EOS itself, so the spec loop path (EOS -> 'ended' -> script seek(0)) would silently
+// stall on the second loop: no SeekData reaches the script, and no one pushes EOS again.
+// Single (non-looping) playback is fine either way: EOS still comes from the script's first
+// fetch pass. Also note the first pass must be sequential 0..EOF (faststart/moov-front mp4);
+// non-sequential demuxer reads leave the cache incomplete and safely degrade to the existing
+// script round-trip path.
 const SOURCE_CACHE_ENV: &str = "SERVO_MEDIA_SOURCE_CACHE";
 // Only cache sources at or below this size (a plain in-RAM copy per source). Larger sources
 // keep the existing script round-trip.
