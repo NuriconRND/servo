@@ -2775,6 +2775,14 @@ impl HTMLMediaElement {
         let player_id = {
             let player_guard = player.lock().unwrap();
 
+            // Hint the resource URL to the backend before the first proxy call (set_mute
+            // below) triggers pipeline setup, so a local file:// resource can be read
+            // directly by GStreamer (see SERVO_MEDIA_DIRECT_FILE). No-op for non-URL
+            // resources; the backend ignores it unless the knob is on and the URL is a file.
+            if let Resource::Url(ref url) = *resource {
+                player_guard.set_resource_url(url.as_str());
+            }
+
             if let Err(error) = player_guard.set_mute(self.muted.get()) {
                 warn!("Could not set mute state: {error:?}");
             }

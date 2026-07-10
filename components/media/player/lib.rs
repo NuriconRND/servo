@@ -110,6 +110,11 @@ pub trait Player: Send + MediaInstance {
     fn set_looping(&self, _looping: bool) -> Result<(), PlayerError> {
         Ok(())
     }
+    /// Hint the media resource URL to the backend before the pipeline is set up, so a
+    /// backend may pick a source strategy from it (e.g. reading a local `file://` resource
+    /// directly instead of having the script layer push bytes). Must be called before the
+    /// first operation that starts the pipeline. The default does nothing.
+    fn set_resource_url(&self, _url: &str) {}
     fn seekable(&self) -> Vec<Range<f64>>;
     fn set_mute(&self, muted: bool) -> Result<(), PlayerError>;
     fn muted(&self) -> bool;

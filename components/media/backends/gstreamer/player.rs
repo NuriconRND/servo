@@ -58,6 +58,15 @@ const AVDEC_MAX_THREADS_ENV: &str = "SERVO_GSTREAMER_AVDEC_MAX_THREADS";
 // NON-flushing SEGMENT seek on SEGMENT_DONE: decoders never flush and no EOS reaches the
 // script layer while looping.
 const GAPLESS_LOOP_ENV: &str = "SERVO_MEDIA_GAPLESS_LOOP";
+// Opt-in direct local-file playback. When enabled and the media resource is a `file://` URL
+// pointing at an existing file, playbin is pointed straight at that file (its own filesrc)
+// instead of the servosrc byte-push path. GStreamer then reads the file itself, so loop
+// rewinds and seeks never round-trip through the script layer (the confirmed cause of the
+// intermittent per-tile stall at gapless loop-wrap boundaries — see §14 of the
+// investigation-loop-stall report). The OS page cache absorbs the reads, so this achieves the
+// servosrc byte-cache effect at effectively zero extra process RAM. Off, or a non-file URL, or
+// a missing file → the servosrc path is used unchanged (byte-identical).
+const DIRECT_FILE_ENV: &str = "SERVO_MEDIA_DIRECT_FILE";
 const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
 const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 
@@ -446,6 +455,10 @@ struct PlayerInner {
     sync_hold: Cell<bool>,
     /// Whether this pipeline has been armed and registered with the sync group.
     sync_armed: Cell<bool>,
+    /// Direct local-file playback (see `DIRECT_FILE_ENV`): playbin reads the file itself via
+    /// its own filesrc, so there is no servosrc. The element still fetches and pushes bytes,
+    /// which are dropped as harmless no-ops (`push_data`/`set_input_size`).
+    direct_file: Cell<bool>,
 }
 
 /// Messages for the gapless-loop worker thread (see `GAPLESS_LOOP_ENV`).
@@ -611,6 +624,11 @@ fn wait_for_lead_queue(pipeline: &gstreamer::Element) {
 
 impl PlayerInner {
     pub fn set_input_size(&mut self, size: u64) -> Result<(), PlayerError> {
+        // Direct file mode: GStreamer reads the file itself, so the servosrc input size is
+        // irrelevant. Accept and drop it so the element's flow is not disturbed.
+        if self.direct_file.get() {
+            return Ok(());
+        }
         // Set input_size to proxy its value, since it
         // could be set by the user before calling .setup().
         self.input_size = size;
@@ -825,6 +843,14 @@ impl PlayerInner {
     }
 
     pub fn push_data(&mut self, data: Vec<u8>) -> Result<(), PlayerError> {
+        // Direct file mode: there is no servosrc to feed; GStreamer reads the file itself.
+        // The element still fetches and pushes bytes, so drop them and report success — an
+        // error here would make the fetch listener treat the push as a failure and could
+        // stall or abort the element's load flow.
+        if self.direct_file.get() {
+            drop(data);
+            return Ok(());
+        }
         if let Some(PlayerSource::Seekable(ref mut source)) = self.source {
             if self.enough_data.load(Ordering::Relaxed) &&
                 !env_flag_enabled(DISABLE_ENOUGHDATA_BACKOFF_ENV)
@@ -986,6 +1012,10 @@ pub struct GStreamerPlayer {
     stream_type: StreamType,
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
+    /// Media resource URL hint (see `Player::set_resource_url`), captured before `setup()`
+    /// so the direct local-file path (see `DIRECT_FILE_ENV`) can be chosen. `None` unless the
+    /// element hinted a URL.
+    resource_url: RefCell<Option<String>>,
 }
 
 impl GStreamerPlayer {
@@ -1017,6 +1047,34 @@ impl GStreamerPlayer {
             is_ready: Arc::new(Once::new()),
             stream_type,
             render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
+            resource_url: RefCell::new(None),
+        }
+    }
+
+    /// If direct local-file playback applies, return the `file://` URI to hand to playbin.
+    /// Requires `DIRECT_FILE_ENV` on, a `Seekable` stream, a `file` scheme, and the target
+    /// file to exist; otherwise `None` (the servosrc path is used, byte-identical to before).
+    /// Logs the direct-mode entry, and a warning when a file:// resource is missing.
+    fn resolve_direct_file_url(&self) -> Option<String> {
+        if !env_flag_enabled(DIRECT_FILE_ENV) || self.stream_type != StreamType::Seekable {
+            return None;
+        }
+        let raw = self.resource_url.borrow().clone()?;
+        let parsed = url::Url::parse(&raw).ok()?;
+        if parsed.scheme() != "file" {
+            return None;
+        }
+        match parsed.to_file_path() {
+            Ok(path) if path.is_file() => {
+                log::info!("direct file playback: {}", path.display());
+                Some(raw)
+            },
+            _ => {
+                log::warn!(
+                    "{DIRECT_FILE_ENV}: file not found for {raw}; falling back to servosrc"
+                );
+                None
+            },
         }
     }
 
@@ -1125,6 +1183,10 @@ impl GStreamerPlayer {
         // fixed, make sure that state dependent code happens before this line.
         // The estimated version for the fix is 1.14.5 / 1.15.1.
         // https://github.com/servo/servo/issues/22010#issuecomment-432599657
+        // Direct local-file playback (see `DIRECT_FILE_ENV`): when applicable, point playbin
+        // at the file:// URL directly (its own filesrc) instead of servosrc. `None` keeps the
+        // existing servosrc byte-push path.
+        let direct_file_url = self.resolve_direct_file_url();
         let uri = match self.stream_type {
             StreamType::Stream => {
                 register_servo_media_stream_src().map_err(|error| {
@@ -1135,10 +1197,15 @@ impl GStreamerPlayer {
                 "mediastream://".to_value()
             },
             StreamType::Seekable => {
-                register_servo_src().map_err(|error| {
-                    PlayerError::Backend(format!("servosrc registration error: {error:?}"))
-                })?;
-                "servosrc://".to_value()
+                if let Some(ref file_url) = direct_file_url {
+                    // GStreamer reads the local file itself; no servosrc registration needed.
+                    file_url.to_value()
+                } else {
+                    register_servo_src().map_err(|error| {
+                        PlayerError::Backend(format!("servosrc registration error: {error:?}"))
+                    })?;
+                    "servosrc://".to_value()
+                }
             },
         };
         player.set_property("uri", &uri);
@@ -1171,6 +1238,7 @@ impl GStreamerPlayer {
             gapless_loop_sender: None,
             sync_hold: Cell::new(false),
             sync_armed: Cell::new(false),
+            direct_file: Cell::new(direct_file_url.is_some()),
         })));
 
         let inner = self.inner.borrow();
@@ -1575,6 +1643,19 @@ impl GStreamerPlayer {
                 let source = args[1].get::<gstreamer::Element>().unwrap();
 
                 let mut inner = inner_clone.lock().unwrap();
+
+                // Direct file mode: playbin instantiated its own filesrc, not a ServoSrc.
+                // There is nothing to wire up; just release setup()'s readiness gate (as the
+                // Stream branch does) and leave `inner.source` as None so push_data and
+                // set_input_size become harmless no-ops.
+                if inner.direct_file.get() {
+                    let sender_clone = sender.clone();
+                    is_ready_clone.call_once(|| {
+                        let _ = notify!(sender_clone, Ok(()));
+                    });
+                    return None;
+                }
+
                 let source = match inner.stream_type {
                     StreamType::Seekable => {
                         let servosrc = source
@@ -1757,6 +1838,12 @@ impl Player for GStreamerPlayer {
 
     fn render_use_gl(&self) -> bool {
         self.render.lock().unwrap().is_gl()
+    }
+
+    fn set_resource_url(&self, url: &str) {
+        // Store the hint for `setup()` to consider (see `resolve_direct_file_url`). Must be
+        // called before the first proxy call triggers `setup()`.
+        *self.resource_url.borrow_mut() = Some(url.to_owned());
     }
 }
 
