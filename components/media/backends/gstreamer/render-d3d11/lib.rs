@@ -40,13 +40,6 @@ mod render_d3d11 {
 
     const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
 
-    // 리드 큐 프레임 수 env. 파싱 실패/미설정 시 기본 15. 0이면 큐를 삽입하지 않는다.
-    const LEAD_FRAMES_ENV: &str = "SERVO_MEDIA_D3D11_LEAD_FRAMES";
-    const DEFAULT_LEAD_FRAMES: u32 = 15;
-    // 리드 큐 엘리먼트 이름 — 동기 그룹 arm 게이트(player.rs)가 by_name으로 이 큐를 찾는다.
-    // 이름이 어긋나면 게이트가 큐를 못 찾아 조용히 스킵되므로 player.rs와 정확히 일치해야 함.
-    const LEAD_QUEUE_NAME: &str = "servo-d3d11-lead-queue";
-
     // D3D11PROF: 파이프라인(플레이어) 식별자 발급기 — 로그에서 타일 구분용 (임시 계측).
     static PROFILE_ID_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -72,14 +65,6 @@ mod render_d3d11 {
                 || value.eq_ignore_ascii_case("yes")
                 || value.eq_ignore_ascii_case("on")
         })
-    }
-
-    // 리드 큐 max-size-buffers 값. 미설정/파싱 실패 시 기본 15, 0이면 큐 미삽입.
-    fn lead_frames() -> u32 {
-        env::var(LEAD_FRAMES_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .unwrap_or(DEFAULT_LEAD_FRAMES)
     }
 
     struct D3D11FrameBuffer {
@@ -343,45 +328,16 @@ mod render_d3d11 {
                 .build();
             appsink.set_property("caps", &caps);
 
-            // 리드 큐(옵션): bin을 queue ! d3d11upload ! appsink 로 확장한다. 이 큐는 디코더
-            // 출력(시스템 RAM, ~3.1MB/frame)을 N프레임 버퍼링한다 — PAUSED hold 중에 채워져
-            // 콜드스타트 디코드를 릴리즈 전에 치르게 하고(§12 investigation-loop-stall-report),
-            // 재생 중엔 지터를 흡수한다. 45타일×15 ≈ 2.1GB RAM 상수 비용.
-            // 동작 근거: PAUSED에서 appsink는 프리롤 1버퍼 후 스트리밍 스레드를 블록 → 버퍼는
-            // upstream queue에 축적 → 큐 full까지 디코더가 미리 디코드한다.
-            // LEAD_FRAMES=0이면 큐를 삽입하지 않는다(기존 d3d11upload ! appsink 동작 그대로).
-            let lead = lead_frames();
-            let ghost_target: gstreamer::Element = if lead > 0 {
-                let queue = gstreamer::ElementFactory::make("queue")
-                    .name(LEAD_QUEUE_NAME)
-                    // buffers로만 제한: bytes/time 무제한(0).
-                    .property("max-size-buffers", lead)
-                    .property("max-size-bytes", 0u32)
-                    .property("max-size-time", 0u64)
-                    .build()
-                    .map_err(|error| {
-                        PlayerError::Backend(format!("리드 큐 생성 실패: {error:?}"))
-                    })?;
-                bin.add_many([&queue, &upload, appsink])
-                    .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
-                gstreamer::Element::link_many([&queue, &upload, appsink])
-                    .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
-                log::info!("D3D11 video: 리드 큐 삽입 (max-size-buffers={lead})");
-                queue
-            } else {
-                bin.add_many([&upload, appsink])
-                    .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
-                upload
-                    .link(appsink)
-                    .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
-                upload.clone()
-            };
+            bin.add_many([&upload, appsink])
+                .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
+            upload
+                .link(appsink)
+                .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
 
-            // ghost pad 대상은 bin 헤드 엘리먼트의 sink pad (리드 큐 있으면 큐, 없으면 d3d11upload).
-            let head_sink = ghost_target
+            let upload_sink = upload
                 .static_pad("sink")
-                .ok_or_else(|| PlayerError::Backend("bin 헤드 sink pad 없음".to_owned()))?;
-            let ghost_pad = gstreamer::GhostPad::builder_with_target(&head_sink)
+                .ok_or_else(|| PlayerError::Backend("d3d11upload sink pad 없음".to_owned()))?;
+            let ghost_pad = gstreamer::GhostPad::builder_with_target(&upload_sink)
                 .map_err(|error| PlayerError::Backend(format!("ghost pad 실패: {error:?}")))?
                 .name("sink")
                 .build();

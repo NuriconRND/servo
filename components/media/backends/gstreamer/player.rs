@@ -574,54 +574,6 @@ fn register_sync_member(play: gstreamer_play::Play, pipeline: gstreamer::Element
     }
 }
 
-// 리드 큐 이름 — render-d3d11 lib.rs의 LEAD_QUEUE_NAME과 정확히 일치해야 한다.
-const LEAD_QUEUE_NAME: &str = "servo-d3d11-lead-queue";
-// 리드 게이트 파이프라인당 타임아웃. 그룹 워치독(30s)보다 먼저 풀려 한 타일이 그룹 시작을
-// 영구 블록하지 못하게 한다.
-const LEAD_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Poll the d3d11 lead queue until it fills (or a per-pipeline 10s timeout) before this
-/// pipeline registers with the sync group, so the cold-start decode is paid into the queue
-/// during the PAUSED hold instead of bursting as catch-up right after release (§12
-/// investigation-loop-stall-report). No-op when the queue is absent (non-d3d11 path or
-/// SERVO_MEDIA_D3D11_LEAD_FRAMES=0) — existing behavior is preserved. Reads queue properties
-/// only; it never seeks or changes pipeline state, so it cannot re-enter the GstPlay lock or
-/// deadlock the worker. Must be called after any gapless FLUSH re-preroll seek (the flush
-/// empties the queue), i.e. immediately before registration.
-fn wait_for_lead_queue(pipeline: &gstreamer::Element) {
-    let Ok(bin) = pipeline.clone().downcast::<gstreamer::Bin>() else {
-        return;
-    };
-    let Some(queue) = bin.by_name(LEAD_QUEUE_NAME) else {
-        return;
-    };
-    let target = queue.property::<u32>("max-size-buffers");
-    if target == 0 {
-        return;
-    }
-    let start = Instant::now();
-    let mut level = queue.property::<u32>("current-level-buffers");
-    let mut timed_out = false;
-    while level < target {
-        if start.elapsed() >= LEAD_GATE_TIMEOUT {
-            timed_out = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        level = queue.property::<u32>("current-level-buffers");
-    }
-    let waited = start.elapsed().as_secs_f64();
-    let id = pipeline.name();
-    if timed_out {
-        log::warn!(
-            "Sync group lead gate: id={id} level={level}/{target} waited={waited:.1}s TIMEOUT \
-             — proceeding to register under-filled"
-        );
-    } else {
-        log::info!("Sync group lead gate: id={id} level={level}/{target} waited={waited:.1}s");
-    }
-}
-
 impl PlayerInner {
     pub fn set_input_size(&mut self, size: u64) -> Result<(), PlayerError> {
         // Direct file mode: GStreamer reads the file itself, so the servosrc input size is
@@ -1427,12 +1379,6 @@ impl GStreamerPlayer {
                                                 .set(false);
                                         }
                                     }
-                                    // 리드 게이트 (§12): 릴리즈 전에 리드 큐가 채워질 때까지
-                                    // 대기 → 콜드스타트 디코드를 hold 구간에서 소진해 릴리즈
-                                    // 직후 catch-up 폭주를 없앤다. 큐가 없으면(비 d3d11/
-                                    // LEAD_FRAMES=0) 즉시 반환(기존 동작). gapless FLUSH
-                                    // 재프리롤(위 arm seek) 이후에 평가되도록 이 위치에 둔다.
-                                    wait_for_lead_queue(&pipeline);
                                     register_sync_member(play_handle, pipeline.clone());
                                 },
                                 GaplessLoopMsg::SegmentDone => {
