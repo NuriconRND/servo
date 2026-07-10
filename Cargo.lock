@@ -8583,6 +8583,7 @@ dependencies = [
  "tracing",
  "webrender",
  "webrender_api",
+ "winapi",
  "wr_malloc_size_of",
 ]
 

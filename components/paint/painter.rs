@@ -258,6 +258,32 @@ impl Painter {
         }
         debug_assert_eq!(webrender_gl.get_error(), gleam::gl::NO_ERROR,);
 
+        // D3D11 비디오 경로에서는 업로드/변환이 파이프라인 스트리밍 스레드로 분산되어,
+        // 시작 릴리즈·루프 경계에 N개 프로듀서 버스트가 CPU를 초과구독하면 이 스레드
+        // (합성·출력)가 굶어 화면이 수 초 정지한다(2026-07-10 조사 §10 실측). 출력은
+        // 지연 민감 경로이므로 프로듀서보다 높은 우선순위를 준다. 기존(Raw) 경로는
+        // 렌더러가 업로드 주체라 동작이 검증된 그대로 두기 위해 게이트로 한정.
+        #[cfg(windows)]
+        if std::env::var("SERVO_MEDIA_D3D11_VIDEO").is_ok_and(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        }) {
+            // SetThreadPriority는 FFI 호출 — 인자는 현재 스레드 핸들(GetCurrentThread)과
+            // 유효한 우선순위 상수뿐이라 안전성 불변식 위반 여지가 없다.
+            #[allow(unsafe_code)]
+            unsafe {
+                use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
+                use winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL;
+                if SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL as i32) == 0 {
+                    log::warn!("D3D11 video: 렌더러 스레드 우선순위 설정 실패");
+                } else {
+                    log::info!("D3D11 video: 렌더러 스레드 우선순위 ABOVE_NORMAL 적용");
+                }
+            }
+        }
+
         let painter_id = PainterId::next();
         let id_manager = paint.webrender_external_image_id_manager();
         let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));

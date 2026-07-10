@@ -347,7 +347,10 @@ impl SharedTextureRing {
                     if poll_count < 64 {
                         std::thread::yield_now();
                     } else {
-                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        // 200µs는 45스레드 기준 초당 ~22만 웨이크(컨텍스트 스위치 폭풍)를
+                        // 만들어 버스트 구간 기아를 악화시켰다(조사 §10). 1ms면 웨이크 5분의 1,
+                        // 프레임 예산(33ms) 대비 지연 영향은 무시 가능.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 },
                 _ => {

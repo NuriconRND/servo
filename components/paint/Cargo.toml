@@ -59,5 +59,11 @@ webxr = { workspace = true, optional = true }
 webxr-api = { workspace = true, optional = true }
 wr_malloc_size_of = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true, features = [
+    "processthreadsapi",
+    "winbase",
+] }
+
 [dev-dependencies]
 surfman = { workspace = true }
