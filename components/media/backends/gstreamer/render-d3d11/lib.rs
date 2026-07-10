@@ -58,6 +58,11 @@ mod render_d3d11 {
         // D3D11PROF: 직전 로그 이후 이 파이프라인이 완성한 프레임 수 — 로그 라인 끝
         // fr=N 필드로 실려 프로듀서 도착률(프레임/s) 복원용 (§12 Q1 판별, 임시 계측).
         static FRAMES_SINCE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        // D3D11PROF(§14): 직전 샘플 도착 시각/pts — 도착 갭(>200ms)과 루프 wrap(pts
+        // 역행) 감지용. 스트리밍 스레드=파이프라인 1:1이라 thread_local로 충분.
+        static LAST_ARRIVAL: std::cell::Cell<Option<std::time::Instant>> =
+            const { std::cell::Cell::new(None) };
+        static LAST_PTS_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
     }
 
     fn env_flag_enabled(name: &str) -> bool {
@@ -162,6 +167,31 @@ mod render_d3d11 {
             let buffer = sample.buffer()?;
             if buffer.n_memory() == 0 {
                 return None;
+            }
+            // D3D11PROF(§14): 도착 갭(>200ms) + 루프 wrap(pts 역행) 이벤트 로깅 —
+            // 개별 타일 간헐 멈춤과 gapless 되감기의 상관 판정용 (임시 계측).
+            if prof {
+                let pts_ms = buffer
+                    .pts()
+                    .map(|t| t.nseconds() as f64 / 1_000_000.0)
+                    .unwrap_or(-1.0);
+                let prev_pts = LAST_PTS_MS.with(|c| c.replace(pts_ms));
+                if pts_ms >= 0.0 && prev_pts >= 0.0 && pts_ms < prev_pts - 1000.0 {
+                    log::warn!(
+                        "D3D11PROF wrap id={} pts_ms={pts_ms:.0} prev_pts_ms={prev_pts:.0}",
+                        self.profile_id
+                    );
+                }
+                let prev_arrival = LAST_ARRIVAL.with(|c| c.replace(Some(bf_start)));
+                if let Some(prev) = prev_arrival {
+                    let gap_ms = (bf_start - prev).as_secs_f64() * 1000.0;
+                    if gap_ms > 200.0 {
+                        log::warn!(
+                            "D3D11PROF arrgap id={} gap_ms={gap_ms:.0} pts_ms={pts_ms:.0}",
+                            self.profile_id
+                        );
+                    }
+                }
             }
             let caps = sample.caps()?;
             let info = gstreamer_video::VideoInfo::from_caps(caps).ok()?;
