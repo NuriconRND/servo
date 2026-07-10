@@ -1592,6 +1592,7 @@ impl GStreamerPlayer {
                         let observer__ = observer.clone();
                         let observer___ = observer.clone();
                         let servosrc_ = servosrc.clone();
+                        let servosrc_need = servosrc.clone();
                         let enough_data_ = inner.enough_data.clone();
                         let enough_data__ = inner.enough_data.clone();
                         let seek_channel = Arc::new(Mutex::new(SeekChannel::new()));
@@ -1608,6 +1609,12 @@ impl GStreamerPlayer {
                                     });
 
                                     enough_data_.store(false, Ordering::Relaxed);
+                                    // Self-sufficient byte cache (see `SOURCE_CACHE_ENV` in
+                                    // source.rs): once the whole input is cached, feed appsrc
+                                    // directly and skip asking the script for bytes.
+                                    if servosrc_need.cache_serve_need() {
+                                        return;
+                                    }
                                     let _ = notify!(observer_, PlayerEvent::NeedData);
                                 })
                                 .enough_data(move |_| {
@@ -1615,6 +1622,12 @@ impl GStreamerPlayer {
                                     let _ = notify!(observer__, PlayerEvent::EnoughData);
                                 })
                                 .seek_data(move |_, offset| {
+                                    // Self-sufficient byte cache: serve the seek locally (no
+                                    // SeekData round-trip to the script thread), which is the
+                                    // contended step at gapless loop-wrap boundaries.
+                                    if servosrc_.cache_serve_seek(offset) {
+                                        return true;
+                                    }
                                     let (ret, ack_channel) = if servosrc_.set_seek_offset(offset) {
                                         let _ = notify!(
                                             observer___,
