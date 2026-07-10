@@ -48,6 +48,9 @@ mod render_d3d11 {
     thread_local! {
         static LAST_PROF_LOG: std::cell::Cell<Option<std::time::Instant>> =
             const { std::cell::Cell::new(None) };
+        // D3D11PROF: 직전 로그 이후 이 파이프라인이 완성한 프레임 수 — 로그 라인 끝
+        // fr=N 필드로 실려 프로듀서 도착률(프레임/s) 복원용 (§12 Q1 판별, 임시 계측).
+        static FRAMES_SINCE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     fn env_flag_enabled(name: &str) -> bool {
@@ -227,6 +230,12 @@ mod render_d3d11 {
             if prof {
                 let total_ms = bf_start.elapsed().as_secs_f64() * 1000.0;
                 let over = total_ms >= crate::interop::profile_threshold_ms();
+                // 프로듀서 도착률 복원용 프레임 카운트 (fr= 필드, §12 Q1).
+                let frames = FRAMES_SINCE_LOG.with(|c| {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    n
+                });
                 // 하트비트: 이 스트리밍 스레드(=파이프라인)에서 마지막 로그 후 1초 경과 시 1줄.
                 let heartbeat = LAST_PROF_LOG.with(|c| match c.get() {
                     Some(t) if t.elapsed() < std::time::Duration::from_secs(1) => false,
@@ -234,11 +243,13 @@ mod render_d3d11 {
                 });
                 if over || heartbeat {
                     LAST_PROF_LOG.with(|c| c.set(Some(std::time::Instant::now())));
+                    FRAMES_SINCE_LOG.with(|c| c.set(0));
                     let st = ring.last_stats;
                     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
                     log::warn!(
                         "D3D11PROF id={} over={} total={:.1} acquire={:.1} convert={:.1} \
-                         finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} fence_loop={:.1} polls={}",
+                         finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} fence_loop={:.1} \
+                         polls={} fr={}",
                         self.profile_id,
                         if over { 1 } else { 0 },
                         total_ms,
@@ -249,6 +260,7 @@ mod render_d3d11 {
                         ms(st.poll_lock_wait),
                         ms(st.fence_loop),
                         st.poll_count,
+                        frames,
                     );
                 }
             }

@@ -398,6 +398,23 @@ struct D3d11TextureCacheEntry {
     textures: FxHashMap<u64, (SurfaceTexture, u32)>,
 }
 
+// D3D11PROF: 임시 진단 계측 (시작 램프 조사 §12, env SERVO_D3D11_PROFILE=1 게이트,
+// 기본 off, 조사 종료 후 제거 예정). 렌더러 스레드의 공유 핸들 첫-lock 래핑
+// (OpenSharedResource+pbuffer)이 램프 구간 프레임 예산을 얼마나 먹는지 정량화한다.
+// 래핑은 타일당 링 슬롯 4개 = 45타일 기준 최대 180회의 일회성 이벤트라 매 건 로깅해도
+// 로그 폭주 없음.
+fn d3d11_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SERVO_D3D11_PROFILE").is_ok_and(|v| {
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+    })
+}
+// D3D11PROF: import(래핑) 누적 횟수/누적 소요(µs) — 로그에 running total로 포함.
+static D3D11_IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static D3D11_IMPORT_TOTAL_US: AtomicU64 = AtomicU64::new(0);
+
 /// Bridge between WebRender external image callbacks and media-backed images.
 ///
 /// Raw YUV planes are handled in-process through [`RawVideoFrameExternalImages`].
@@ -452,8 +469,21 @@ impl MediaExternalImages {
         }
         if !entry.textures.contains_key(&info.shared_handle) {
             let size = Size2D::new(info.width, info.height);
+            let import_start = std::time::Instant::now(); // D3D11PROF
             match rendering_context.create_texture_from_shared_handle(info.shared_handle, size) {
                 Some((surface_texture, gl_texture, _)) => {
+                    // D3D11PROF: 렌더러 스레드 첫-lock 래핑 소요 — 매 건 로깅 (일회성
+                    // 이벤트, 45타일 최대 180건). n/sum_ms는 프로세스 누계.
+                    if d3d11_profile_enabled() {
+                        let us = import_start.elapsed().as_micros() as u64;
+                        let n = D3D11_IMPORT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                        let total = D3D11_IMPORT_TOTAL_US.fetch_add(us, Ordering::Relaxed) + us;
+                        warn!(
+                            "D3D11PROF import id={id} took_ms={:.2} n={n} sum_ms={:.1}",
+                            us as f64 / 1000.0,
+                            total as f64 / 1000.0,
+                        );
+                    }
                     entry.textures.insert(info.shared_handle, (surface_texture, gl_texture));
                 },
                 None => {
