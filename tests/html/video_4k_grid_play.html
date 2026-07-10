@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>4K Video Wall</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+  /* CSS Grid 대신 flex-wrap 사용: Servo grid 구현이 video 내재 크기로
+     트랙 blowout 되는 문제 회피 (video_grid_6x6_play.html과 동일 기법). */
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+  }
+  #grid video {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    object-fit: fill;
+    background: #000;
+  }
+  /* 회전 모드(?rotate=0 으로 끔): 셀 래퍼가 클리핑을 담당하고, 비디오는
+     셀 대각선 크기의 정사각으로 만들어 중심 회전 — 어떤 각도에서도 셀이
+     빈틈 없이 채워진다. 크기/회전 변환은 JS(하트비트)에서 지정. */
+  .cell {
+    position: relative;
+    overflow: hidden;
+    flex: 0 0 auto;
+    background: #000;
+  }
+  .cell video {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    object-fit: cover;
+  }
+  #hb {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    width: 2px;
+    height: 2px;
+    background: #000;
+    z-index: 10;
+  }
+  #cover {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 24px;
+  }
+</style>
+</head>
+<body>
+<div id="grid"></div>
+<div id="hb"></div>
+<div id="cover">준비 중...</div>
+<script>
+  "use strict";
+
+  // 4K(3840x2160@60fps, H.264) 소스용 그리드. 디코드 부하가 1080p30 타일의 약 8배라
+  // 기본 그리드를 2x2(4타일)로 작게 잡는다. avdec_h264 스레드 수도 런처에서 상향 필요
+  // (예: 2x2에 SERVO_GSTREAMER_AVDEC_MAX_THREADS=6 — 20코어 기준).
+  //   ?grid=N        -> N x N (기본 2 => 4 타일)
+  //   ?cols=C&rows=R -> C열 x R행 직사각
+  //   ?rotate=0      -> 타일 회전 끔 (기본 on)
+  const params = new URLSearchParams(location.search);
+  const clampInt = (raw, fallback) => {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fallback;
+  };
+  const gridN = clampInt(params.get("grid"), 2);
+  const COLS = clampInt(params.get("cols"), gridN);
+  const ROWS = clampInt(params.get("rows"), gridN);
+  const TILE_COUNT = COLS * ROWS;
+  const SRC = "../4k_3DMark.mp4";
+  document.title = COLS + "x" + ROWS + " 4K Video Wall";
+
+  const grid = document.getElementById("grid");
+  const tileW = (100 / COLS) + "vw";
+  const tileH = (100 / ROWS) + "vh";
+
+  // 타일 회전: 기본 on, ?rotate=0 으로 끔. 방향은 타일별 랜덤(시계/반시계),
+  // 축도 타일별 랜덤 — Z(면내 회전) 50%, X(가로축 뒤집기) 25%, Y(세로축 뒤집기) 25%.
+  const ROTATE = params.get("rotate") !== "0";
+  const ROTATE_SPEED_DEG = 30; // 초당 회전 각도
+  const pickAxis = () => {
+    const r = Math.random();
+    return r < 0.5 ? "Z" : (r < 0.75 ? "X" : "Y");
+  };
+  const cellW = window.innerWidth / COLS;
+  const cellH = window.innerHeight / ROWS;
+  const diagPx = Math.ceil(Math.sqrt(cellW * cellW + cellH * cellH));
+
+  // 독립 <video> 생성 — 동기 시작/루프 상세는 video_grid_6x6_play.html 주석 참조.
+  const videos = [];
+  const spins = []; // 회전 대상: { v, dir(+1|-1), axis("Z"|"X"|"Y") }
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const v = document.createElement("video");
+    v.muted = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.preload = "auto";
+    v.src = SRC;
+    if (ROTATE) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      cell.style.width = tileW;
+      cell.style.height = tileH;
+      v.style.width = diagPx + "px";
+      v.style.height = diagPx + "px";
+      v.style.transform = "translate(-50%, -50%) rotate(0deg)";
+      cell.appendChild(v);
+      grid.appendChild(cell);
+      spins.push({
+        v,
+        dir: Math.random() < 0.5 ? 1 : -1,
+        axis: pickAxis(),
+      });
+    } else {
+      v.style.width = tileW;
+      v.style.height = tileH;
+      grid.appendChild(v);
+    }
+    v.play().catch(() => {});
+    videos.push(v);
+  }
+
+  // 커버: 전 타일의 실제 재생 시작이 관측되면 걷는다 (동기는 백엔드 sync group 담당).
+  const cover = document.getElementById("cover");
+  const syncBegin = performance.now();
+  const revealPoll = setInterval(() => {
+    const moving = videos.filter((v) => v.currentTime > 0).length;
+    const elapsed = ((performance.now() - syncBegin) / 1000) | 0;
+    cover.textContent = "준비 중... " + moving + "/" + TILE_COUNT + " (" + elapsed + "s)";
+    if (moving >= TILE_COUNT || elapsed > 90) {
+      clearInterval(revealPoll);
+      if (cover.parentNode) cover.parentNode.removeChild(cover);
+    }
+  }, 250);
+
+  // rAF 하트비트 (+ 회전 구동) — 근거는 video_grid_6x6_play.html 주석 참조.
+  const hb = document.getElementById("hb");
+  let hbFrame = 0;
+  (function heartbeat() {
+    hbFrame++;
+    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+    if (spins.length) {
+      const angle = (performance.now() / 1000) * ROTATE_SPEED_DEG;
+      for (const s of spins) {
+        const deg = (angle * s.dir) + "deg";
+        s.v.style.transform = s.axis === "Z"
+          ? "translate(-50%, -50%) rotate(" + deg + ")"
+          : "translate(-50%, -50%) perspective(900px) rotate" + s.axis + "(" + deg + ")";
+      }
+    }
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>

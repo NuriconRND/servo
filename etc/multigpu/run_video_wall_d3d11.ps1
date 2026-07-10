@@ -11,7 +11,12 @@ param(
     [int]    $MoveX = -1,
     [int]    $MoveY = -1,
     [switch] $Detach,
-    [string] $LogPrefix = "video_wall_d3d11"
+    [string] $LogPrefix = "video_wall_d3d11",
+    # Page under the repo root. Default = 1080p30 grid. For the 4K60 source use
+    # tests\html\video_4k_grid_play.html with a SMALL grid and MORE decoder threads,
+    # e.g.: -Page tests\html\video_4k_grid_play.html -Cols 2 -Rows 2 -DecoderThreads 6
+    # (4K60 decode is ~8x a 1080p30 tile; a 20-core box fits about 4 such tiles).
+    [string] $Page = "tests\html\video_grid_6x6_play.html"
 )
 
 # Launch the multi-<video> wall demo with the FINAL D3D11 per-pipeline upload recipe
@@ -40,7 +45,7 @@ $ErrorActionPreference = "Stop"
 
 $servoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $servoExe  = Join-Path $servoRoot "target\release\servoshell.exe"
-$pagePath  = Join-Path $servoRoot "tests\html\video_grid_6x6_play.html"
+$pagePath  = Join-Path $servoRoot $Page
 $logDir    = Join-Path $servoRoot "target\multigpu_logs"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath   = Join-Path $logDir "${LogPrefix}_${timestamp}_stderr.log"
