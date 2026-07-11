@@ -8,10 +8,12 @@ use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint};
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::ffi::EGL_DEVICE_EXT;
 use crate::platform::generic::egl::ffi::{
-    EGL_D3D11_DEVICE_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_NO_DEVICE_EXT, EGL_PLATFORM_ANGLE_ANGLE,
-    EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE, EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE,
-    EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE,
-    EGL_PLATFORM_ANGLE_TYPE_ANGLE, EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, EGL_PLATFORM_DEVICE_EXT,
+    EGL_D3D11_DEVICE_ANGLE, EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE,
+    EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_NO_DEVICE_EXT,
+    EGL_PLATFORM_ANGLE_ANGLE, EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE,
+    EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
+    EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE, EGL_PLATFORM_ANGLE_TYPE_ANGLE,
+    EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE, EGL_PLATFORM_DEVICE_EXT,
 };
 use crate::{Error, GLApi};
 
@@ -191,6 +193,45 @@ impl Adapter {
     }
 }
 
+// Build the EGL display attributes for an ANGLE D3D11 display keyed by adapter LUID
+// (or WARP). Both LUID-keyed GetPlatformDisplay call sites use this so ANGLE, which
+// caches displays by LUID, resolves them to the SAME cached display: mismatched
+// attributes would split the cache key and hand the isolated-WebGL probe a different
+// display than the compositor's, breaking cross-GPU shared-handle import (black tiles).
+//
+// The present-path-fast pair makes ANGLE render straight into the swapchain backbuffer
+// instead of an offscreen texture + a per-frame CopyResource on eglSwapBuffers
+// (see docs/superpowers/specs/2026-07-11-angle-present-path-fast-design.md).
+fn luid_display_attribs(
+    d3d_driver_type: D3D_DRIVER_TYPE,
+    luid_high: i32,
+    luid_low: u32,
+) -> Vec<EGLAttrib> {
+    let mut attribs = vec![
+        EGL_PLATFORM_ANGLE_TYPE_ANGLE as EGLAttrib,
+        EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE as EGLAttrib,
+    ];
+    if d3d_driver_type == D3D_DRIVER_TYPE_WARP {
+        attribs.extend_from_slice(&[
+            EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE as EGLAttrib,
+            EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib,
+        ]);
+    } else {
+        attribs.extend_from_slice(&[
+            EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib,
+            luid_high as EGLAttrib,
+            EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE as EGLAttrib,
+            luid_low as EGLAttrib,
+        ]);
+    }
+    attribs.extend_from_slice(&[
+        EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib,
+        EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib,
+    ]);
+    attribs.push(egl::NONE as EGLAttrib);
+    attribs
+}
+
 impl Device {
     #[allow(non_snake_case)]
     pub(crate) fn new(adapter: &Adapter) -> Result<Device, Error> {
@@ -203,24 +244,11 @@ impl Device {
             }
 
             EGL_FUNCTIONS.with(|egl| {
-                let mut attribs = vec![
-                    EGL_PLATFORM_ANGLE_TYPE_ANGLE as EGLAttrib,
-                    EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE as EGLAttrib,
-                ];
-                if d3d_driver_type == D3D_DRIVER_TYPE_WARP {
-                    attribs.extend_from_slice(&[
-                        EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE as EGLAttrib,
-                        EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib,
-                    ]);
-                } else {
-                    attribs.extend_from_slice(&[
-                        EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib,
-                        adapter_desc.AdapterLuid.HighPart as EGLAttrib,
-                        EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE as EGLAttrib,
-                        adapter_desc.AdapterLuid.LowPart as EGLAttrib,
-                    ]);
-                }
-                attribs.push(egl::NONE as EGLAttrib);
+                let attribs = luid_display_attribs(
+                    d3d_driver_type,
+                    adapter_desc.AdapterLuid.HighPart,
+                    adapter_desc.AdapterLuid.LowPart,
+                );
                 let egl_display = egl.GetPlatformDisplay(
                     EGL_PLATFORM_ANGLE_ANGLE,
                     ptr::null_mut(),
@@ -282,15 +310,11 @@ impl Device {
                     }
                     let luid_d3d11 =
                         EGL_FUNCTIONS.with(|egl| -> Result<ComPtr<ID3D11Device>, Error> {
-                            let attribs = [
-                                EGL_PLATFORM_ANGLE_TYPE_ANGLE as EGLAttrib,
-                                EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE as EGLAttrib,
-                                EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib,
-                                adapter_desc.AdapterLuid.HighPart as EGLAttrib,
-                                EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE as EGLAttrib,
-                                adapter_desc.AdapterLuid.LowPart as EGLAttrib,
-                                egl::NONE as EGLAttrib,
-                            ];
+                            let attribs = luid_display_attribs(
+                                d3d_driver_type,
+                                adapter_desc.AdapterLuid.HighPart,
+                                adapter_desc.AdapterLuid.LowPart,
+                            );
                             let display = egl.GetPlatformDisplay(
                                 EGL_PLATFORM_ANGLE_ANGLE,
                                 ptr::null_mut(),
@@ -576,5 +600,44 @@ impl Drop for Device {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod present_path_tests {
+    use super::*;
+
+    // Verify the helper places the present-path-fast pair right before the NONE
+    // terminator, and that the LUID/WARP branching is correct. ANGLE attribute
+    // arrays MUST be NONE-terminated (otherwise ANGLE reads past the end of the
+    // array), and a value typo (COPY instead of FAST) would be a silent regression,
+    // so the value itself is checked too.
+    #[test]
+    fn luid_branch_has_present_path_fast_and_luid() {
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_UNKNOWN, 0x1234, 0x5678);
+        // NONE terminated
+        assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
+        // present-path-fast pair (key followed by FAST value)
+        let key = EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib;
+        let pos = a.iter().position(|&x| x == key).expect("present-path key missing");
+        assert_eq!(a[pos + 1], EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib);
+        // LUID high/low present
+        let hk = EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib;
+        let hp = a.iter().position(|&x| x == hk).expect("LUID high key missing");
+        assert_eq!(a[hp + 1], 0x1234 as EGLAttrib);
+        // WARP device-type attribute must not appear on the LUID branch
+        assert!(!a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
+    }
+
+    #[test]
+    fn warp_branch_has_present_path_fast_and_warp() {
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_WARP, 0, 0);
+        assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
+        let key = EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib;
+        let pos = a.iter().position(|&x| x == key).expect("present-path key missing");
+        assert_eq!(a[pos + 1], EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib);
+        // WARP branch: device-type WARP present, LUID high absent
+        assert!(a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
+        assert!(!a.contains(&(EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib)));
     }
 }
