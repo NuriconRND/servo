@@ -4,10 +4,14 @@
 
 //! Windows용 D3D11 비디오 렌더 경로.
 //!
-//! 파이프라인의 스트리밍 스레드에서 d3d11upload/d3d11convert로 GPU 업로드·RGBA 변환을
-//! 수행하고, 공유 텍스처 링에 복사한 뒤 공유 핸들만 Servo로 전달한다. 렌더러 스레드의
-//! 비디오 업로드(glTexSubImage2D)를 제거하는 것이 목적. env `SERVO_MEDIA_D3D11_VIDEO=1`
-//! 게이트 (기본 off). 설계: docs/superpowers/specs/2026-07-09-d3d11-per-pipeline-upload-design.md
+//! 기본(dynamic): appsink가 sysmem 프레임을 받고, 파이프라인의 스트리밍 스레드에서
+//! DynamicUploadSet이 DYNAMIC 텍스처 Map(WRITE_DISCARD)+memcpy로 업로드한 뒤
+//! GstD3D11Converter로 RGBA 변환해 공유 텍스처 링에 렌더, 공유 핸들만 Servo로 전달한다.
+//! env `SERVO_MEDIA_D3D11_UPLOAD=legacy`면 기존 d3d11upload 엘리먼트 경로(staging+
+//! CopySubresourceRegion)로 복귀. 렌더러 스레드의 비디오 업로드(glTexSubImage2D) 제거가
+//! 목적. env `SERVO_MEDIA_D3D11_VIDEO=1` 게이트 (기본 off).
+//! 설계: docs/superpowers/specs/2026-07-09-d3d11-per-pipeline-upload-design.md (기반),
+//! docs/superpowers/specs/2026-07-11-d3d11-dynamic-upload-design.md (dynamic 업로드)
 
 // Windows 전용 — 다른 타겟에서는 빈 크레이트로 컴파일된다 (workspace member라
 // 비Windows `--workspace` 빌드에도 포함되므로 게이트 필수).
@@ -152,7 +156,10 @@ mod render_d3d11 {
             // (interop.rs 모듈 doc comment 참조). 플레이어 Drop 시 디바이스도 해제된다.
             let device = SharedGstD3D11Device::create()?;
             let profile_id = PROFILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-            log::info!("D3D11 video: 파이프라인별 GPU 업로드 경로 활성 (profile_id={profile_id})");
+            let mode = if upload_mode() == UploadMode::Legacy { "legacy" } else { "dynamic" };
+            log::info!(
+                "D3D11 video: 파이프라인별 GPU 업로드 경로 활성 (mode={mode}, profile_id={profile_id})"
+            );
             Some(RenderD3D11 {
                 device,
                 state: Mutex::new(PlayerState {
@@ -308,7 +315,8 @@ mod render_d3d11 {
 
             // 업로드 (dynamic 경로): sysmem plane들을 DYNAMIC 텍스처에
             // Map(WRITE_DISCARD)+memcpy. legacy 경로(D3D11 메모리)는 업로드가 이미
-            // 끝나 있으므로 샘플 버퍼를 그대로 변환기 입력으로 쓴다.
+            // 끝나 있으므로 샘플 버퍼를 그대로 변환기 입력으로 쓴다. 따라서 legacy에서는
+            // PROF upload= 필드가 ~0으로 찍힌다(실제 업로드는 d3d11upload 엘리먼트 내부).
             let up_start = std::time::Instant::now(); // D3D11PROF
             let in_buffer_ptr = if is_d3d11_mem {
                 buffer.as_mut_ptr()
