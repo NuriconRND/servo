@@ -135,3 +135,28 @@ ANGLE `StateManager11` viewScale(+1)로 내부 보정 → WR/surfman 코드 변�
 - env 게이트
 - AMD 실기 측정 (추후, 다른 장비)
 - dynamic 업로드 경로 (§3-n, 별개 완료 항목)
+
+## 9. 부기 (2026-07-11 구현·검증 후) — §7의 RenderDoc 기준은 무효
+
+§7-1의 "RenderDoc 재캡처로 복사 소멸 확인"은 **달성 불가능한 잘못된 기준**이었다.
+**RenderDoc은 캡처를 위해 ANGLE을 offscreen+CopyResource 경로로 강제**한다 —
+baseline / present-path-fast / present-path-fast+DComp-off 세 구성 캡처 모두 동일한
+매 프레임 CopyResource(Texture83→Backbuffer)를 보였다. 즉 RenderDoc(주입형 그래픽
+디버거)으로는 이 변경의 효과를 관측할 수 없다.
+
+**대체 검증법(실제 사용, 더 견고함):** present-path-fast가 켜지면 ANGLE이
+`EGL_ANGLE_surface_orientation` 확장을 **광고하지 않는다**
+(Renderer11.cpp:1337 `surfaceOrientation = !mPresentPathFastEnabled`).
+surfman `Device::new`에 임시 진단 `eprintln!`을 넣어
+`eglQueryString(display, EGL_EXTENSIONS)`에 해당 확장이 없음을 확인 →
+`present_path_fast_engaged=true` (진단은 검증 후 되돌림). 이는
+`NeedsOffscreenTexture`가 소비하는 바로 그 플래그의 직접 판독이며, HWND 윈도우
+서피스에서는 이 플래그가 참이면 복사 분기가 ANGLE 코드상 도달 불가다.
+
+**실제 수행한 검증(전부 PASS):** present-path-fast 활성(위 진단, 비디오월+WebGPU월);
+Y반전 없음/색 정상(2×2·45타일 비디오·WebGPU retargeting 월 스크린샷); 45타일 회귀
+(FAIL=0, 45/45 마커, import 0, lockstep ±1); 격리 디바이스/WebGPU 월(60fps, 블랙
+타일 0 = 캐시 일관성); 리사이즈(재배치 정상). AMD 창확대 fps 이득만 추후 실기.
+
+**후속 독립 확인 도구(원할 시):** RenderDoc 말고 ETW/GPUView 또는 D3D11 debug-layer
+트레이스 — 주입 없이 관측하는 도구를 쓸 것.
