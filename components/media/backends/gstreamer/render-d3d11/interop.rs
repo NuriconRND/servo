@@ -510,10 +510,11 @@ impl SharedTextureRing {
 // caps당 텍스처 1세트로 충분하다 (입력 링 불필요).
 // ============================================================================
 
+use gstreamer_video::VideoFrameExt;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
 };
-use winapi::um::d3d11::{D3D11_CPU_ACCESS_WRITE, D3D11_USAGE_DYNAMIC};
+use winapi::um::d3d11::{D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE_DISCARD, D3D11_USAGE_DYNAMIC};
 
 /// 지원 포맷의 plane → DXGI 텍스처 매핑 한 줄 (스펙 §4.3 표).
 struct PlaneSpec {
@@ -633,6 +634,66 @@ impl DynamicUploadSet {
             }
         }
         Some(DynamicUploadSet { device, textures, plane_dims, wrapped_buffer })
+    }
+
+    /// sysmem 프레임의 각 plane을 Map(WRITE_DISCARD)+행 단위 memcpy로 업로드.
+    /// 실패 시 false (호출측 프레임 드롭). memcpy는 디바이스 락 밖에서 수행한다 —
+    /// mapped 포인터는 CPU 메모리이고, 직렬화가 필요한 것은 컨텍스트 호출(Map/Unmap)
+    /// 뿐이다 (GStreamer 자신의 staging 경로와 동일한 락 프로토콜).
+    pub fn upload(
+        &mut self,
+        frame: &gstreamer_video::VideoFrameRef<&gstreamer::BufferRef>,
+    ) -> bool {
+        if frame.n_planes() as usize != self.textures.len() {
+            log::warn!(
+                "D3D11 video: plane 수 불일치 (frame={}, set={})",
+                frame.n_planes(),
+                self.textures.len()
+            );
+            return false;
+        }
+        let context = self.device.immediate_context();
+        for i in 0..self.textures.len() {
+            let (row_bytes, rows) = self.plane_dims[i];
+            let src = match frame.plane_data(i as u32) {
+                Ok(data) => data,
+                Err(_) => {
+                    log::warn!("D3D11 video: plane_data({i}) 실패");
+                    return false;
+                },
+            };
+            // VideoFrameRef의 info는 VideoMeta(디코더 패딩 stride)가 반영된 실제 레이아웃.
+            let src_stride = frame.info().stride()[i] as usize;
+            let copy_bytes = row_bytes.min(src_stride);
+            if src.len() < (rows - 1) * src_stride + copy_bytes {
+                log::warn!("D3D11 video: plane {i} 데이터 부족 — 프레임 드롭");
+                return false;
+            }
+            let resource = self.textures[i].as_raw() as *mut ID3D11Resource;
+            let mapped = unsafe {
+                let _guard = self.device.lock();
+                let mut mapped =
+                    std::mem::zeroed::<winapi::um::d3d11::D3D11_MAPPED_SUBRESOURCE>();
+                let hr = (*context).Map(resource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mut mapped);
+                if hr != S_OK {
+                    log::warn!("D3D11 video: Map(WRITE_DISCARD) 실패 hr={hr:#x} (plane {i})");
+                    return false;
+                }
+                mapped
+            };
+            unsafe {
+                for row in 0..rows {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(row * src_stride),
+                        (mapped.pData as *mut u8).add(row * mapped.RowPitch as usize),
+                        copy_bytes,
+                    );
+                }
+                let _guard = self.device.lock();
+                (*context).Unmap(resource, 0);
+            }
+        }
+        true
     }
 }
 
@@ -910,5 +971,144 @@ mod tests {
             DynamicUploadSet::new(device.clone(), &info).is_none(),
             "미지원 포맷은 None이어야 함"
         );
+    }
+
+    use gstreamer::glib::translate::ToGlibPtr;
+
+    /// info 레이아웃(offset/stride)대로 각 plane을 단일 텍셀 패턴으로 채운 sysmem 버퍼.
+    /// texels[i] = plane i의 텍셀 바이트열 (예: I420 Y=&[81], NV12 UV=&[90, 240]).
+    fn make_filled_buffer(
+        info: &gstreamer_video::VideoInfo,
+        texels: &[&[u8]],
+    ) -> gstreamer::Buffer {
+        let mut data = vec![0u8; info.size()];
+        for (i, t) in texels.iter().enumerate() {
+            let off = info.offset()[i];
+            let stride = info.stride()[i] as usize;
+            // plane 행 수: 지원 포맷 전부 plane0=H, 그 외=(H+1)/2 (I420/YV12/NV12/P010)
+            let rows = if i == 0 {
+                info.height() as usize
+            } else {
+                (info.height() as usize).div_ceil(2)
+            };
+            for row in 0..rows {
+                let row_start = off + row * stride;
+                for chunk in data[row_start..row_start + stride].chunks_exact_mut(t.len()) {
+                    chunk.copy_from_slice(t);
+                }
+            }
+        }
+        gstreamer::Buffer::from_mut_slice(data)
+    }
+
+    /// 공용 E2E (세트는 호출측 소유 — 같은 세트로 재호출하면 WRITE_DISCARD 재사용
+    /// 검증이 된다): 단색 plane 데이터 → upload → GstD3D11Converter → 링 → 두 번째
+    /// 디바이스 판독 → 중앙 픽셀 [R,G,B,A]. convert_buffer 실패는 스펙 리스크 1.
+    fn convert_and_read_center(
+        set: &mut DynamicUploadSet,
+        info: &gstreamer_video::VideoInfo,
+        texels: &[&[u8]],
+    ) -> [u8; 4] {
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let api = device.api();
+        let buffer = make_filled_buffer(info, texels);
+        let frame =
+            gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer.as_ref(), info)
+                .expect("frame map 실패");
+        assert!(set.upload(&frame), "upload 실패");
+
+        let out_info = gstreamer_video::VideoInfo::builder(
+            gstreamer_video::VideoFormat::Rgba,
+            info.width(),
+            info.height(),
+        )
+        .build()
+        .expect("out_info");
+        let conv = unsafe {
+            (api.converter_new)(
+                device.raw(),
+                info.to_glib_none().0,
+                out_info.to_glib_none().0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!conv.is_null(), "converter_new 실패");
+
+        let mut ring = SharedTextureRing::new(device.clone());
+        let (out_buf, slot) = ring
+            .acquire(info.width() as i32, info.height() as i32)
+            .expect("acquire 실패");
+        let ok = unsafe {
+            (api.converter_convert_buffer)(conv, set.wrapped_buffer.as_mut_ptr(), out_buf.as_mut_ptr())
+        };
+        unsafe { gstreamer::glib::gobject_ffi::g_object_unref(conv as *mut _) };
+        assert_eq!(ok, 1, "convert_buffer 실패 — 래핑 DYNAMIC 입력 미수용 (스펙 리스크 1)");
+        let (handle, _epoch) = ring.finish(slot).expect("finish 실패");
+        let rgba = open_and_read_on_second_device(handle, info.width(), info.height());
+        let w = info.width() as usize;
+        let mid = ((info.height() as usize / 2) * w + w / 2) * 4;
+        [rgba[mid], rgba[mid + 1], rgba[mid + 2], rgba[mid + 3]]
+    }
+
+    // I420 빨강(Y=81,U=90,V=240 bt601) → RGBA 판독이 빨강이어야 한다.
+    // 이어서 **같은 세트**에 파랑(Y=41,U=240,V=110) 재업로드 → 파랑 — WRITE_DISCARD
+    // renaming 하에서 세트 재사용(최신 내용 승리)을 검증한다.
+    #[test]
+    fn dynamic_upload_i420_convert_readback_and_discard_reuse() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, 64, 64)
+            .build()
+            .expect("info");
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+
+        let [r, g, b, a] = convert_and_read_center(&mut set, &info, &[&[81], &[90], &[240]]);
+        assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
+        assert_eq!(a, 255);
+
+        // 같은 세트 재사용 — 두 번째 업로드 내용이 변환에 반영돼야 한다.
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[41], &[240], &[110]]);
+        assert!(b > 200 && r < 70, "파랑 기대, 실제 ({r},{g},{b})");
+    }
+
+    // YV12: plane1=V, plane2=U (I420과 순서 반대). 같은 빨강이 나와야 U/V 대응이 옳다.
+    #[test]
+    fn dynamic_upload_yv12_convert_readback() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Yv12, 64, 64)
+            .build()
+            .expect("info");
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[81], &[240], &[90]]);
+        assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
+    }
+
+    // NV12: plane1은 UV 인터리브(R8G8) — 텍셀 [U,V].
+    #[test]
+    fn dynamic_upload_nv12_convert_readback() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, 64, 64)
+            .build()
+            .expect("info");
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[81], &[90, 240]]);
+        assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
+    }
+
+    // P010_10LE: 16비트 컨테이너의 상위 10비트 — 8비트값 v의 16비트 표현은 v<<8
+    // (LE 바이트 [0x00, v]). plane1은 U16/V16 인터리브.
+    #[test]
+    fn dynamic_upload_p010_convert_readback() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let info =
+            gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::P01010le, 64, 64)
+                .build()
+                .expect("info");
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[0, 81], &[0, 90, 0, 240]]);
+        assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
     }
 }
