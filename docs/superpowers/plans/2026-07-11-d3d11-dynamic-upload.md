@@ -353,15 +353,16 @@ git commit -m 'render-d3d11: DynamicUploadSet 신설 - 포맷별 DYNAMIC plane �
         gstreamer::Buffer::from_mut_slice(data)
     }
 
-    /// 공용 E2E: 단색 plane 데이터 → upload → GstD3D11Converter → 링 → 두 번째
+    /// 공용 E2E (세트는 호출측 소유 — 같은 세트로 재호출하면 WRITE_DISCARD 재사용
+    /// 검증이 된다): 단색 plane 데이터 → upload → GstD3D11Converter → 링 → 두 번째
     /// 디바이스 판독 → 중앙 픽셀 [R,G,B,A]. convert_buffer 실패는 스펙 리스크 1.
-    fn upload_convert_readback(
+    fn convert_and_read_center(
+        set: &mut DynamicUploadSet,
         info: &gstreamer_video::VideoInfo,
         texels: &[&[u8]],
     ) -> [u8; 4] {
         let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
         let api = device.api();
-        let mut set = DynamicUploadSet::new(device.clone(), info).expect("세트 생성 실패");
         let buffer = make_filled_buffer(info, texels);
         let frame =
             gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer.as_ref(), info)
@@ -402,23 +403,23 @@ git commit -m 'render-d3d11: DynamicUploadSet 신설 - 포맷별 DYNAMIC plane �
     }
 
     // I420 빨강(Y=81,U=90,V=240 bt601) → RGBA 판독이 빨강이어야 한다.
-    // 이어서 같은 세트에 파랑(Y=41,U=240,V=110) 재업로드 → 파랑 — WRITE_DISCARD
+    // 이어서 **같은 세트**에 파랑(Y=41,U=240,V=110) 재업로드 → 파랑 — WRITE_DISCARD
     // renaming 하에서 세트 재사용(최신 내용 승리)을 검증한다.
     #[test]
     fn dynamic_upload_i420_convert_readback_and_discard_reuse() {
         gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
         let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, 64, 64)
             .build()
             .expect("info");
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
 
-        let [r, g, b, a] = upload_convert_readback(&info, &[&[81], &[90], &[240]]);
+        let [r, g, b, a] = convert_and_read_center(&mut set, &info, &[&[81], &[90], &[240]]);
         assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
         assert_eq!(a, 255);
 
-        // 세트 재사용 검증은 upload_convert_readback를 다시 부르는 대신 동일 흐름을
-        // 새 색으로 반복해도 동등하다 — renaming은 프레임 단위 독립이므로 새 세트/링
-        // 여부와 무관하게 최신 업로드 내용이 변환에 반영되는지가 요점이다.
-        let [r, g, b, _] = upload_convert_readback(&info, &[&[41], &[240], &[110]]);
+        // 같은 세트 재사용 — 두 번째 업로드 내용이 변환에 반영돼야 한다.
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[41], &[240], &[110]]);
         assert!(b > 200 && r < 70, "파랑 기대, 실제 ({r},{g},{b})");
     }
 
@@ -426,10 +427,12 @@ git commit -m 'render-d3d11: DynamicUploadSet 신설 - 포맷별 DYNAMIC plane �
     #[test]
     fn dynamic_upload_yv12_convert_readback() {
         gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
         let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Yv12, 64, 64)
             .build()
             .expect("info");
-        let [r, g, b, _] = upload_convert_readback(&info, &[&[81], &[240], &[90]]);
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[81], &[240], &[90]]);
         assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
     }
 
@@ -437,10 +440,12 @@ git commit -m 'render-d3d11: DynamicUploadSet 신설 - 포맷별 DYNAMIC plane �
     #[test]
     fn dynamic_upload_nv12_convert_readback() {
         gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
         let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, 64, 64)
             .build()
             .expect("info");
-        let [r, g, b, _] = upload_convert_readback(&info, &[&[81], &[90, 240]]);
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[81], &[90, 240]]);
         assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
     }
 
@@ -449,11 +454,13 @@ git commit -m 'render-d3d11: DynamicUploadSet 신설 - 포맷별 DYNAMIC plane �
     #[test]
     fn dynamic_upload_p010_convert_readback() {
         gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
         let info =
             gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::P01010le, 64, 64)
                 .build()
                 .expect("info");
-        let [r, g, b, _] = upload_convert_readback(&info, &[&[0, 81], &[0, 90, 0, 240]]);
+        let mut set = DynamicUploadSet::new(device.clone(), &info).expect("세트 생성 실패");
+        let [r, g, b, _] = convert_and_read_center(&mut set, &info, &[&[0, 81], &[0, 90, 0, 240]]);
         assert!(r > 200 && g < 70 && b < 70, "빨강 기대, 실제 ({r},{g},{b})");
     }
 ```
