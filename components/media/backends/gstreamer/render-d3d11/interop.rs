@@ -500,6 +500,142 @@ impl SharedTextureRing {
     }
 }
 
+// ============================================================================
+// DynamicUploadSet — d3d11upload 대체 업로드 (스펙 2026-07-11)
+//
+// sysmem 프레임의 각 plane을 DYNAMIC 텍스처에 Map(WRITE_DISCARD)+memcpy로 올린다.
+// staging 경유 GPU 복사(CopySubresourceRegion)가 없어 구형 AMD GPU의 복사 병목을
+// 제거한다. WRITE_DISCARD는 드라이버 renaming이라 (1) 변환기 draw가 이전 프레임을
+// 아직 읽는 중이어도 블록되지 않고 (2) 큐에 남은 draw는 이전 버전을 계속 읽으므로
+// caps당 텍스처 1세트로 충분하다 (입력 링 불필요).
+// ============================================================================
+
+use winapi::shared::dxgiformat::{
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
+};
+use winapi::um::d3d11::{D3D11_CPU_ACCESS_WRITE, D3D11_USAGE_DYNAMIC};
+
+/// 지원 포맷의 plane → DXGI 텍스처 매핑 한 줄 (스펙 §4.3 표).
+struct PlaneSpec {
+    dxgi_format: u32,
+    /// 텍셀 치수 산출용 서브샘플링 시프트 — width_texels = (W + (1<<s) - 1) >> s.
+    w_shift: u32,
+    h_shift: u32,
+    bytes_per_texel: usize,
+}
+
+const fn spec(dxgi_format: u32, w_shift: u32, h_shift: u32, bytes_per_texel: usize) -> PlaneSpec {
+    PlaneSpec { dxgi_format, w_shift, h_shift, bytes_per_texel }
+}
+
+/// NV12/P010은 네이티브 DXGI NV12/P010 대신 plane별 2텍스처 — DYNAMIC usage의
+/// 네이티브 비디오 포맷 생성은 드라이버 의존이 커서(대상이 구형 AMD) 확실한 조합만 쓴다.
+fn plane_specs(format: gstreamer_video::VideoFormat) -> Option<&'static [PlaneSpec]> {
+    use gstreamer_video::VideoFormat;
+    static I420: [PlaneSpec; 3] = [
+        spec(DXGI_FORMAT_R8_UNORM, 0, 0, 1),
+        spec(DXGI_FORMAT_R8_UNORM, 1, 1, 1),
+        spec(DXGI_FORMAT_R8_UNORM, 1, 1, 1),
+    ];
+    static NV12: [PlaneSpec; 2] = [
+        spec(DXGI_FORMAT_R8_UNORM, 0, 0, 1),
+        spec(DXGI_FORMAT_R8G8_UNORM, 1, 1, 2),
+    ];
+    static P010: [PlaneSpec; 2] = [
+        spec(DXGI_FORMAT_R16_UNORM, 0, 0, 2),
+        spec(DXGI_FORMAT_R16G16_UNORM, 1, 1, 4),
+    ];
+    match format {
+        // YV12는 plane 순서만 다르고(Y,V,U) 치수·포맷 구조는 I420과 동일 —
+        // plane i ↔ 텍스처 i 대응이라 같은 스펙을 쓴다 (의미는 변환기가 in_info로 해석).
+        VideoFormat::I420 | VideoFormat::Yv12 => Some(&I420),
+        VideoFormat::Nv12 => Some(&NV12),
+        VideoFormat::P01010le => Some(&P010),
+        _ => None,
+    }
+}
+
+/// 플레이어별 DYNAMIC 업로드 세트. caps 변경 시 재생성 (lib.rs PlayerState 소유).
+pub struct DynamicUploadSet {
+    device: Arc<SharedGstD3D11Device>,
+    textures: Vec<ComPtr<ID3D11Texture2D>>,
+    /// plane별 (유효 행 바이트 = 텍셀폭×텍셀바이트, 행 수) — upload의 memcpy 범위.
+    plane_dims: Vec<(usize, usize)>,
+    /// plane 텍스처들을 GstD3D11Memory로 감싼 변환기 입력 버퍼 (매 프레임 재사용 —
+    /// 변환기가 메모리별 SRV를 내부 캐시하므로 SRV 생성도 1회).
+    pub wrapped_buffer: gstreamer::Buffer,
+}
+
+// 안전성: 링과 동일 — ComPtr 원시 포인터는 이 구조체가 단독 소유하고, 컨텍스트
+// 작업은 전부 디바이스 락 하에서 수행하며, 스트리밍 스레드 1개에서만 쓰인다.
+unsafe impl Send for DynamicUploadSet {}
+
+impl DynamicUploadSet {
+    /// info의 포맷/치수에 맞는 DYNAMIC plane 텍스처 세트 + 래핑 버퍼 생성.
+    /// 미지원 포맷·생성 실패 시 None (호출측이 프레임 드롭 처리).
+    pub fn new(
+        device: Arc<SharedGstD3D11Device>,
+        info: &gstreamer_video::VideoInfo,
+    ) -> Option<Self> {
+        let specs = plane_specs(info.format())?;
+        let mut textures = Vec::with_capacity(specs.len());
+        let mut plane_dims = Vec::with_capacity(specs.len());
+        let mut wrapped_buffer = gstreamer::Buffer::new();
+        let d3d = device.d3d11_device();
+        for s in specs {
+            let round = |v: u32, shift: u32| (v + ((1u32 << shift) - 1)) >> shift;
+            let w = round(info.width(), s.w_shift);
+            let h = round(info.height(), s.h_shift);
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: s.dxgi_format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DYNAMIC,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE,
+                CPUAccessFlags: D3D11_CPU_ACCESS_WRITE,
+                MiscFlags: 0,
+            };
+            unsafe {
+                let mut texture = std::ptr::null_mut();
+                let hr = (*d3d).CreateTexture2D(&desc, std::ptr::null(), &mut texture);
+                if hr != S_OK {
+                    log::warn!(
+                        "D3D11 video: DYNAMIC plane 텍스처 생성 실패 hr={hr:#x} \
+                         ({w}x{h} dxgi={})",
+                        s.dxgi_format
+                    );
+                    return None;
+                }
+                let texture = ComPtr::from_raw(texture);
+                let api = device.api();
+                let memory_ptr = (api.allocator_alloc_wrapped)(
+                    device.allocator(),
+                    device.raw(),
+                    texture.as_raw(),
+                    (w as usize) * s.bytes_per_texel * (h as usize),
+                    std::ptr::null_mut(),
+                    None,
+                );
+                if memory_ptr.is_null() {
+                    log::warn!("D3D11 video: 입력 plane alloc_wrapped 실패");
+                    return None;
+                }
+                let memory: gstreamer::Memory = from_glib_full(memory_ptr);
+                wrapped_buffer
+                    .get_mut()
+                    .expect("새 버퍼는 유일 참조")
+                    .append_memory(memory);
+                plane_dims.push(((w as usize) * s.bytes_per_texel, h as usize));
+                textures.push(texture);
+            }
+        }
+        Some(DynamicUploadSet { device, textures, plane_dims, wrapped_buffer })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +660,7 @@ mod tests {
     // 아래 dxgiformat 경로: winapi 0.3.9 실제 모듈명은 `dxgifmt`가 아니라 `dxgiformat`
     // (브리프 주석대로 컴파일러 에러에 맞춰 조정).
     use winapi::Interface;
+    use winapi::shared::dxgiformat as dxgifmt;
     use winapi::shared::dxgiformat::DXGI_FORMAT_R8G8B8A8_UNORM;
     use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
     use winapi::um::d3d11 as d3d;
@@ -691,5 +828,87 @@ mod tests {
         // 정상 경로는 여전히 동작: 새로 acquire한 슬롯은 finish 가능
         let (_b3, s3) = ring.acquire(32, 32).expect("acquire(4) 실패");
         assert!(ring.finish(s3).is_some(), "정상 acquire→finish는 성공해야 함");
+    }
+
+    // DynamicUploadSet 생성: 포맷별 plane 텍스처 수/치수/DXGI 포맷/usage 검증.
+    // 홀수 해상도 65x37 — 크로마 plane은 (65+1)/2=33 x (37+1)/2=19 로 반올림돼야 한다.
+    #[test]
+    fn dynamic_upload_set_creation() {
+        gstreamer::init().expect("gstreamer init 실패");
+        let device = SharedGstD3D11Device::get_or_create().expect("디바이스 없음");
+        let api = device.api();
+
+        let get_desc = |t: &ComPtr<d3d::ID3D11Texture2D>| unsafe {
+            let mut desc = std::mem::zeroed::<d3d::D3D11_TEXTURE2D_DESC>();
+            t.GetDesc(&mut desc);
+            desc
+        };
+
+        // I420: R8 3장
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::I420, 65, 37)
+            .build()
+            .expect("info");
+        let set = DynamicUploadSet::new(device.clone(), &info).expect("I420 세트 생성 실패");
+        assert_eq!(set.textures.len(), 3);
+        assert_eq!(set.wrapped_buffer.n_memory(), 3);
+        for i in 0..3u32 {
+            let mem = set.wrapped_buffer.peek_memory(i as usize);
+            assert_ne!(
+                unsafe { (api.is_d3d11_memory)(mem.as_mut_ptr()) },
+                0,
+                "plane {i}는 GstD3D11Memory여야 함"
+            );
+        }
+        let d0 = get_desc(&set.textures[0]);
+        assert_eq!(
+            (d0.Width, d0.Height, d0.Format),
+            (65, 37, dxgifmt::DXGI_FORMAT_R8_UNORM)
+        );
+        assert_eq!(d0.Usage, d3d::D3D11_USAGE_DYNAMIC);
+        assert_eq!(d0.CPUAccessFlags, d3d::D3D11_CPU_ACCESS_WRITE);
+        assert_eq!(d0.BindFlags, d3d::D3D11_BIND_SHADER_RESOURCE);
+        assert_eq!(d0.MiscFlags, 0);
+        let d1 = get_desc(&set.textures[1]);
+        assert_eq!(
+            (d1.Width, d1.Height, d1.Format),
+            (33, 19, dxgifmt::DXGI_FORMAT_R8_UNORM)
+        );
+
+        // NV12: R8 + R8G8 2장
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, 65, 37)
+            .build()
+            .expect("info");
+        let set = DynamicUploadSet::new(device.clone(), &info).expect("NV12 세트 생성 실패");
+        assert_eq!(set.textures.len(), 2);
+        assert_eq!(set.wrapped_buffer.n_memory(), 2);
+        let d1 = get_desc(&set.textures[1]);
+        assert_eq!(
+            (d1.Width, d1.Height, d1.Format),
+            (33, 19, dxgifmt::DXGI_FORMAT_R8G8_UNORM)
+        );
+
+        // P010_10LE: R16 + R16G16 2장
+        let info =
+            gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::P01010le, 65, 37)
+                .build()
+                .expect("info");
+        let set = DynamicUploadSet::new(device.clone(), &info).expect("P010 세트 생성 실패");
+        assert_eq!(set.textures.len(), 2);
+        let d0 = get_desc(&set.textures[0]);
+        assert_eq!(d0.Format, dxgifmt::DXGI_FORMAT_R16_UNORM);
+        let d1 = get_desc(&set.textures[1]);
+        assert_eq!(
+            (d1.Width, d1.Height, d1.Format),
+            (33, 19, dxgifmt::DXGI_FORMAT_R16G16_UNORM)
+        );
+
+        // 미지원 포맷은 None (협상 caps가 걸러주지만 방어선 확인)
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Rgba, 64, 64)
+            .build()
+            .expect("info");
+        assert!(
+            DynamicUploadSet::new(device.clone(), &info).is_none(),
+            "미지원 포맷은 None이어야 함"
+        );
     }
 }
