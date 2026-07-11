@@ -67,6 +67,23 @@ mod render_d3d11 {
         })
     }
 
+    /// 업로드 방식 (스펙 2026-07-11 §6): 기본 dynamic, env로 legacy 복귀.
+    #[derive(Clone, Copy, PartialEq)]
+    enum UploadMode {
+        /// DYNAMIC 텍스처 Map(WRITE_DISCARD) 직접 업로드 (기본).
+        Dynamic,
+        /// 기존 d3d11upload 엘리먼트 경로 (staging+CopySubresourceRegion) 복귀 스위치.
+        Legacy,
+    }
+
+    fn upload_mode() -> UploadMode {
+        static MODE: std::sync::OnceLock<UploadMode> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match env::var("SERVO_MEDIA_D3D11_UPLOAD") {
+            Ok(v) if v.eq_ignore_ascii_case("legacy") => UploadMode::Legacy,
+            _ => UploadMode::Dynamic,
+        })
+    }
+
     struct D3D11FrameBuffer {
         data: VideoFrameD3D11Data,
     }
@@ -92,6 +109,10 @@ mod render_d3d11 {
     struct PlayerState {
         ring: Option<SharedTextureRing>,
         converter: Option<ConverterHandle>,
+        /// dynamic 업로드 세트 (sysmem 협상 시에만 생성). caps 변경 시 converter와 함께 무효화.
+        upload: Option<crate::interop::DynamicUploadSet>,
+        /// 세트 생성 실패 마커 — 1회 warn 후 이후 프레임은 조용히 드롭 (스펙 §7).
+        upload_failed: bool,
         /// 변환기 무효화 판정용 — 포맷/크기/colorimetry 변경 감지.
         in_caps: Option<gstreamer::Caps>,
     }
@@ -116,8 +137,11 @@ mod render_d3d11 {
                 log::warn!("D3D11 video: 단일 프로세스 전용 — Raw 경로 폴백");
                 return None;
             }
-            // 변환은 라이브러리 GstD3D11Converter를 직접 쓰므로 엘리먼트는 d3d11upload만 필요.
-            if gstreamer::ElementFactory::find("d3d11upload").is_none() {
+            // legacy 모드만 d3d11upload 엘리먼트 필요 — dynamic(기본)은 라이브러리
+            // (gstd3d11-1.0-0.dll)만 쓴다 (플러그인 gstd3d11.dll 불필요).
+            if upload_mode() == UploadMode::Legacy
+                && gstreamer::ElementFactory::find("d3d11upload").is_none()
+            {
                 log::warn!(
                     "D3D11 video: d3d11upload 플러그인 없음 (gstd3d11.dll 번들 확인) — Raw 경로 폴백"
                 );
@@ -134,10 +158,56 @@ mod render_d3d11 {
                 state: Mutex::new(PlayerState {
                     ring: None,
                     converter: None,
+                    upload: None,
+                    upload_failed: false,
                     in_caps: None,
                 }),
                 profile_id,
             })
+        }
+
+        fn build_video_sink_legacy(
+            &self,
+            appsink: &gstreamer::Element,
+            pipeline: &gstreamer::Element,
+        ) -> Result<(), PlayerError> {
+            let bin = gstreamer::Bin::builder()
+                .name("servo-d3d11-video-sink")
+                .build();
+            let upload = gstreamer::ElementFactory::make("d3d11upload")
+                .build()
+                .map_err(|error| PlayerError::Backend(format!("d3d11upload 생성 실패: {error:?}")))?;
+
+            // format 미지정: 디코더 원 포맷(I420/NV12 등)을 D3D11 메모리로 그대로 받는다.
+            // RGBA 변환은 build_frame의 GstD3D11Converter가 링 슬롯에 직접 수행.
+            let caps = gstreamer::Caps::builder("video/x-raw")
+                .features(["memory:D3D11Memory"])
+                .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
+                .build();
+            appsink.set_property("caps", &caps);
+
+            bin.add_many([&upload, appsink])
+                .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
+            upload
+                .link(appsink)
+                .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
+
+            let upload_sink = upload
+                .static_pad("sink")
+                .ok_or_else(|| PlayerError::Backend("d3d11upload sink pad 없음".to_owned()))?;
+            let ghost_pad = gstreamer::GhostPad::builder_with_target(&upload_sink)
+                .map_err(|error| PlayerError::Backend(format!("ghost pad 실패: {error:?}")))?
+                .name("sink")
+                .build();
+            bin.add_pad(&ghost_pad)
+                .map_err(|error| PlayerError::Backend(format!("ghost pad add 실패: {error:?}")))?;
+
+            // 우리 디바이스를 파이프라인 전체에 주입 — PoC(Task 3)에서 검증된 방식.
+            if let Some(context) = self.device.gst_context() {
+                pipeline.set_context(&context);
+            }
+            pipeline.set_property("video-sink", &bin);
+            Ok(())
         }
     }
 
@@ -184,7 +254,10 @@ mod render_d3d11 {
             let height = info.height() as i32;
             let api = self.device.api();
 
-            if unsafe { (api.is_d3d11_memory)(buffer.peek_memory(0).as_mut_ptr()) } == 0 {
+            // 메모리 타입 판별: D3D11 메모리(legacy d3d11upload 협상) vs sysmem(dynamic).
+            let is_d3d11_mem =
+                unsafe { (api.is_d3d11_memory)(buffer.peek_memory(0).as_mut_ptr()) } != 0;
+            if upload_mode() == UploadMode::Legacy && !is_d3d11_mem {
                 log::warn!("D3D11 video: 비 D3D11 메모리 샘플 — 프레임 드롭");
                 return None;
             }
@@ -192,9 +265,11 @@ mod render_d3d11 {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
 
-            // caps 변경(포맷/크기/색상 정보) 시 변환기 재생성
+            // caps 변경(포맷/크기/색상 정보) 시 변환기·업로드 세트 재생성
             if state.in_caps.as_deref() != Some(caps) {
                 state.converter = None;
+                state.upload = None;
+                state.upload_failed = false;
                 state.in_caps = Some(caps.to_owned());
             }
             let ring = state
@@ -231,6 +306,45 @@ mod render_d3d11 {
             }
             let converter = state.converter.as_ref()?;
 
+            // 업로드 (dynamic 경로): sysmem plane들을 DYNAMIC 텍스처에
+            // Map(WRITE_DISCARD)+memcpy. legacy 경로(D3D11 메모리)는 업로드가 이미
+            // 끝나 있으므로 샘플 버퍼를 그대로 변환기 입력으로 쓴다.
+            let up_start = std::time::Instant::now(); // D3D11PROF
+            let in_buffer_ptr = if is_d3d11_mem {
+                buffer.as_mut_ptr()
+            } else {
+                if state.upload_failed {
+                    // 생성 실패 마커 — 최초 1회만 warn (스펙 §7).
+                    return None;
+                }
+                if state.upload.is_none() {
+                    match crate::interop::DynamicUploadSet::new(self.device.clone(), &info) {
+                        Some(set) => state.upload = Some(set),
+                        None => {
+                            // 원인은 new()가 warn으로 남김 — 여기선 마커와 요약만.
+                            log::warn!(
+                                "D3D11 video: dynamic 업로드 세트 생성 실패 — 이후 프레임 드롭 (id={})",
+                                self.profile_id
+                            );
+                            state.upload_failed = true;
+                            return None;
+                        },
+                    }
+                }
+                let upload = state.upload.as_mut().expect("직전에 보장");
+                let Ok(frame) =
+                    gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                else {
+                    log::warn!("D3D11 video: 프레임 map 실패 — 프레임 드롭");
+                    return None;
+                };
+                if !upload.upload(&frame) {
+                    return None; // upload()가 원인 warn 로깅
+                }
+                upload.wrapped_buffer.as_mut_ptr()
+            };
+            let t_upload = up_start.elapsed(); // D3D11PROF
+
             // YUV→RGBA 변환을 공유 링 슬롯에 직접 렌더 (추가 복사 없음).
             //
             // gst_d3d11_converter_convert_buffer(일반 변형)는 내부적으로 디바이스 락을
@@ -240,7 +354,7 @@ mod render_d3d11 {
             let ok = unsafe {
                 (api.converter_convert_buffer)(
                     converter.0,
-                    buffer.as_mut_ptr(),
+                    in_buffer_ptr,
                     out_buffer.as_mut_ptr(),
                 )
             };
@@ -277,12 +391,13 @@ mod render_d3d11 {
                     let st = ring.last_stats;
                     let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
                     log::warn!(
-                        "D3D11PROF id={} over={} total={:.1} acquire={:.1} convert={:.1} \
-                         finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} fence_loop={:.1} \
-                         polls={} fr={}",
+                        "D3D11PROF id={} over={} total={:.1} upload={:.2} acquire={:.1} \
+                         convert={:.1} finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} \
+                         fence_loop={:.1} polls={} fr={}",
                         self.profile_id,
                         if over { 1 } else { 0 },
                         total_ms,
+                        t_upload.as_secs_f64() * 1000.0,
                         t_acquire.as_secs_f64() * 1000.0,
                         t_convert.as_secs_f64() * 1000.0,
                         t_finish.as_secs_f64() * 1000.0,
@@ -313,42 +428,26 @@ mod render_d3d11 {
             appsink: &gstreamer::Element,
             pipeline: &gstreamer::Element,
         ) -> Result<(), PlayerError> {
-            let bin = gstreamer::Bin::builder()
-                .name("servo-d3d11-video-sink")
-                .build();
-            let upload = gstreamer::ElementFactory::make("d3d11upload")
-                .build()
-                .map_err(|error| PlayerError::Backend(format!("d3d11upload 생성 실패: {error:?}")))?;
-
-            // format 미지정: 디코더 원 포맷(I420/NV12 등)을 D3D11 메모리로 그대로 받는다.
-            // RGBA 변환은 build_frame의 GstD3D11Converter가 링 슬롯에 직접 수행.
+            if upload_mode() == UploadMode::Legacy {
+                return self.build_video_sink_legacy(appsink, pipeline);
+            }
+            // dynamic(기본): 엘리먼트 없이 appsink가 sysmem 프레임을 직접 받고
+            // build_frame이 DYNAMIC 텍스처로 업로드한다. 포맷 목록 밖 디코더 출력은
+            // playbin이 videoconvert를 자동 삽입해 목록 내 포맷으로 맞춘다 (스펙 §5.1).
             let caps = gstreamer::Caps::builder("video/x-raw")
-                .features(["memory:D3D11Memory"])
+                .field(
+                    "format",
+                    gstreamer::List::new(["I420", "YV12", "NV12", "P010_10LE"]),
+                )
                 .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
                 .build();
             appsink.set_property("caps", &caps);
-
-            bin.add_many([&upload, appsink])
-                .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
-            upload
-                .link(appsink)
-                .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
-
-            let upload_sink = upload
-                .static_pad("sink")
-                .ok_or_else(|| PlayerError::Backend("d3d11upload sink pad 없음".to_owned()))?;
-            let ghost_pad = gstreamer::GhostPad::builder_with_target(&upload_sink)
-                .map_err(|error| PlayerError::Backend(format!("ghost pad 실패: {error:?}")))?
-                .name("sink")
-                .build();
-            bin.add_pad(&ghost_pad)
-                .map_err(|error| PlayerError::Backend(format!("ghost pad add 실패: {error:?}")))?;
-
-            // 우리 디바이스를 파이프라인 전체에 주입 — PoC(Task 3)에서 검증된 방식.
+            // 디바이스 주입 유지 — 자동 플러깅으로 d3d11 엘리먼트가 끼어도 우리
+            // 디바이스를 쓰게 한다.
             if let Some(context) = self.device.gst_context() {
                 pipeline.set_context(&context);
             }
-            pipeline.set_property("video-sink", &bin);
+            pipeline.set_property("video-sink", appsink);
             Ok(())
         }
     }
