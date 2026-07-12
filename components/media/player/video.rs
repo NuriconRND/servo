@@ -68,6 +68,19 @@ pub struct VideoFrameD3D11Data {
     pub ring_epoch: u32,
 }
 
+/// A-dyn 경로: plane DYNAMIC 링(레지스트리 `d3d11_ring`) 참조 + 표시
+/// 메타데이터. 슬롯 인덱스는 싣지 않는다 — 렌더러가 레지스트리에서 최신
+/// Filled를 소비한다(latest-wins). `ring_epoch`는 링 재생성(크기 변경)
+/// 세대 — 렌더러측 래핑 캐시 무효화에 쓴다.
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
+pub struct VideoFrameD3D11YuvData {
+    pub ring_id: u64,
+    pub ring_epoch: u32,
+    pub format: VideoFrameYuvFormat,
+    pub color_space: VideoFrameYuvColorSpace,
+    pub color_range: VideoFrameYuvColorRange,
+}
+
 #[derive(Clone, MallocSizeOf)]
 pub enum VideoFrameData {
     Raw(#[conditional_malloc_size_of] Arc<Vec<u8>>),
@@ -75,6 +88,7 @@ pub enum VideoFrameData {
     Texture(u32),
     OESTexture(u32),
     D3D11(VideoFrameD3D11Data),
+    D3D11Yuv(VideoFrameD3D11YuvData),
 }
 
 pub trait Buffer: Send + Sync {
@@ -164,6 +178,17 @@ impl VideoFrame {
     pub fn get_d3d11_data(&self) -> Option<VideoFrameD3D11Data> {
         match self.data {
             VideoFrameData::D3D11(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub fn is_d3d11_yuv(&self) -> bool {
+        matches!(self.data, VideoFrameData::D3D11Yuv(_))
+    }
+
+    pub fn get_d3d11_yuv_data(&self) -> Option<VideoFrameD3D11YuvData> {
+        match self.data {
+            VideoFrameData::D3D11Yuv(data) => Some(data),
             _ => None,
         }
     }

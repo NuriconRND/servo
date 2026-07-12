@@ -874,6 +874,8 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             }
         } else if frame.is_d3d11() {
             "d3d11_texture"
+        } else if frame.is_d3d11_yuv() {
+            "d3d11_yuv_texture"
         } else if frame.is_gl_texture() {
             if frame.is_external_oes() {
                 "external_oes"
@@ -914,6 +916,13 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 inter_frame_ms,
                 updates,
             );
+            return;
+        }
+
+        if frame.is_d3d11_yuv() {
+            // Task 7 전까지는 소비자 미구현 — 링에서 최신 프레임을 참조만
+            // 하고 memcpy는 하지 않으므로 여기서 드롭해도 비용은 없다.
+            warn!("D3D11Yuv 프레임 수신 — 소비자 미구현(Task 7 전), 드롭");
             return;
         }
 

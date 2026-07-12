@@ -11,6 +11,7 @@ extern crate servo_media_traits;
 
 pub mod audio;
 pub mod context;
+pub mod d3d11_ring;
 pub mod metadata;
 pub mod video;
 
