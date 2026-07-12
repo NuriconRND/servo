@@ -319,7 +319,9 @@ impl VideoSampleDiagnostics {
                         * 1000.0
                 })
                 .unwrap_or_default();
-            log::info!(
+            // debug 레벨: late 갭 조건이 다중 타일 lockstep에서 사실상 매 프레임 참이 되어
+            // info로는 장시간 표출 시 로그가 GB급으로 폭증한다 (45타일 2.6h에 3.6GB 실측).
+            log::debug!(
                 "GStreamer video sample summary: sample_id={} frames_since_summary={} \
                  summary_wall_elapsed_ms={:.3} pts_ms={} duration_ms={} \
                  pts_delta_ms={} wall_delta_ms={} pts_gap_ms={} late_pts_gaps={} \
