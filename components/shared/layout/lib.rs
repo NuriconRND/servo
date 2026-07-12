@@ -234,6 +234,10 @@ pub struct PendingRasterizationImage {
 pub enum MediaFrameYuvFormat {
     NV12,
     PlanarYCbCr,
+    /// 10-bit semi-planar (Y + interleaved UV), MSB-aligned in 16-bit textures.
+    /// Distinct from NV12 so the display list emits `YuvData::P010`, which is the
+    /// only variant that selects the YUV shader's high-bits sampling branch.
+    P010,
 }
 
 #[derive(Clone, Copy, Debug, MallocSizeOf)]
@@ -261,8 +265,9 @@ pub struct MediaFrame {
 impl MediaFrame {
     pub fn image_keys(self) -> [Option<webrender_api::ImageKey>; 3] {
         match self.yuv {
+            // NV12 and P010 are both 2-plane semi-planar (Y + interleaved UV).
             Some(MediaFrameYuvImage {
-                format: MediaFrameYuvFormat::NV12,
+                format: MediaFrameYuvFormat::NV12 | MediaFrameYuvFormat::P010,
                 y_key,
                 u_or_uv_key,
                 ..

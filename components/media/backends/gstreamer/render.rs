@@ -231,6 +231,10 @@ impl GStreamerBuffer {
                     stride: info.comp_stride(1),
                 });
             },
+            // The raw CPU (Yuv) path only ever produces 8-bit I420/NV12 (see
+            // `frame_data` above); 10-bit formats flow exclusively through the
+            // D3D11 plane-ring path. Handle them gracefully rather than panic.
+            VideoFrameYuvFormat::I420_10 | VideoFrameYuvFormat::P010 => return None,
         }
 
         Some(VideoFrameYuvData {

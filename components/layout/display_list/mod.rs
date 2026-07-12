@@ -767,6 +767,9 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 MediaFrameYuvFormat::NV12 => {
                     wr::YuvData::NV12(yuv_image.y_key, yuv_image.u_or_uv_key)
                 },
+                MediaFrameYuvFormat::P010 => {
+                    wr::YuvData::P010(yuv_image.y_key, yuv_image.u_or_uv_key)
+                },
                 MediaFrameYuvFormat::PlanarYCbCr => wr::YuvData::PlanarYCbCr(
                     yuv_image.y_key,
                     yuv_image.u_or_uv_key,

@@ -204,19 +204,18 @@ struct MediaYuvExternalIds {
 
 impl MediaYuvExternalIds {
     fn new(format: VideoFrameYuvFormat, ids: &[ExternalImageId]) -> Option<Self> {
-        Some(match format {
-            VideoFrameYuvFormat::I420 => Self {
-                format,
-                y: *ids.first()?,
-                u_or_uv: *ids.get(1)?,
-                v: Some(*ids.get(2)?),
-            },
-            VideoFrameYuvFormat::NV12 => Self {
-                format,
-                y: *ids.first()?,
-                u_or_uv: *ids.get(1)?,
-                v: None,
-            },
+        // 3-plane (I420/I420_10) carries a separate V plane; 2-plane (NV12/P010)
+        // interleaves chroma into `u_or_uv` and has no V.
+        let v = if format.plane_count() == 3 {
+            Some(*ids.get(2)?)
+        } else {
+            None
+        };
+        Some(Self {
+            format,
+            y: *ids.first()?,
+            u_or_uv: *ids.get(1)?,
+            v,
         })
     }
 
@@ -237,6 +236,46 @@ fn wr_yuv_color_range(color_range: VideoFrameYuvColorRange) -> ColorRange {
     match color_range {
         VideoFrameYuvColorRange::Limited => ColorRange::Limited,
         VideoFrameYuvColorRange::Full => ColorRange::Full,
+    }
+}
+
+/// Maps a decoded YUV plane layout to the WebRender YUV primitive family.
+/// Planar (I420/I420_10) -> `PlanarYCbCr` (3 planes); semi-planar 8-bit NV12 ->
+/// `NV12`; semi-planar 10-bit P010 -> `P010`. NV12 and P010 are distinct WR
+/// formats: only `P010` selects the shader's MSB (high-bits) sampling branch.
+fn media_frame_yuv_format(format: VideoFrameYuvFormat) -> MediaFrameYuvFormat {
+    match format {
+        VideoFrameYuvFormat::I420 | VideoFrameYuvFormat::I420_10 => {
+            MediaFrameYuvFormat::PlanarYCbCr
+        },
+        VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
+        VideoFrameYuvFormat::P010 => MediaFrameYuvFormat::P010,
+    }
+}
+
+/// WebRender [`ColorDepth`] for a decoded YUV frame — the value drives the YUV
+/// shader's rescale of a 16-bit UNORM texture back to normalized luma/chroma.
+///
+/// Derived from `webrender-0.68.0/res/yuv.glsl::get_yuv_color_info` (verified
+/// 2026-07-13):
+/// - `I420_10LE` stores the 10-bit code in the LOW bits of the 16-bit word, so a
+///   R16_UNORM sample yields `code/65535`. The shader's non-P010 `>8bpc` branch
+///   uses `channel_max = 65535` with narrow endpoints `<< (bit_depth-8)`, and
+///   `Color10` (bit_depth 10, `<<2`) makes the sampled `code/65535` match the
+///   endpoint `code/65535` exactly (equivalently the documented `×64` rescale;
+///   `ColorDepth::rescaling_factor(Color10) == 64.0`).
+/// - `P010` stores the 10-bit code in the HIGH bits (`code<<6`), so a R16_UNORM
+///   sample yields `code*64/65535`. The shader's P010 (MSB) branch uses
+///   `channel_max = (1<<bit_depth)-1` with endpoints `<< (bit_depth-8)`, and
+///   only `Color16` (bit_depth 16 -> `channel_max = 65535`, endpoints `<<8`)
+///   makes `code*64/65535` match `(code<<8)/65535` exactly (no rescale — MSB is
+///   already ~normalized; `rescaling_factor(Color16) == 1.0`). `Color10` here
+///   would divide by 1023 instead of 65535 and be ~0.1% off.
+fn wr_color_depth(format: VideoFrameYuvFormat) -> ColorDepth {
+    match format {
+        VideoFrameYuvFormat::I420 | VideoFrameYuvFormat::NV12 => ColorDepth::Color8,
+        VideoFrameYuvFormat::I420_10 => ColorDepth::Color10,
+        VideoFrameYuvFormat::P010 => ColorDepth::Color16,
     }
 }
 
@@ -268,29 +307,35 @@ fn external_yuv_plane_data(id: ExternalImageId) -> SerializableImageData {
 /// Per-plane dimensions and WebRender pixel format for a D3D11 YUV frame.
 ///
 /// These MUST match the producer's DYNAMIC ring textures exactly (see
-/// `ring_producer::plane_geoms`): plane 0 (Y) is `width`×`height` R8; the
-/// chroma planes are ceil(w/2)×ceil(h/2); NV12's single interleaved UV plane
-/// is RG8 so WebRender samples both chroma channels from one texture. The
+/// `ring_producer::plane_geoms`): plane 0 (Y) is `width`×`height`; the chroma
+/// planes are ceil(w/2)×ceil(h/2); the semi-planar (NV12/P010) single UV plane
+/// is 2-channel so WebRender samples both chroma channels from one texture. The
+/// texel format is 8-bit (R8/RG8) for I420/NV12 and 16-bit (R16/RG16) for the
+/// 10-bit I420_10/P010 sources (the same texel WIDTH — a 16-bit container). The
 /// producer already reconciles YV12 sources to the I420 display order, so the
-/// format here is only ever I420 or NV12.
+/// format here is only ever I420(/_10) or NV12(/P010).
 fn d3d11_yuv_plane_dims(
     format: VideoFrameYuvFormat,
     plane_index: usize,
     frame_width: i32,
     frame_height: i32,
 ) -> Option<(i32, i32, ImageFormat)> {
+    let cw = (frame_width + 1) / 2;
+    let ch = (frame_height + 1) / 2;
     match (format, plane_index) {
-        (_, 0) => Some((frame_width, frame_height, ImageFormat::R8)),
-        (VideoFrameYuvFormat::I420, 1) | (VideoFrameYuvFormat::I420, 2) => Some((
-            (frame_width + 1) / 2,
-            (frame_height + 1) / 2,
-            ImageFormat::R8,
-        )),
-        (VideoFrameYuvFormat::NV12, 1) => Some((
-            (frame_width + 1) / 2,
-            (frame_height + 1) / 2,
-            ImageFormat::RG8,
-        )),
+        // Y plane: single channel, full frame size. 8-bit -> R8, 10-bit -> R16.
+        (VideoFrameYuvFormat::I420 | VideoFrameYuvFormat::NV12, 0) => {
+            Some((frame_width, frame_height, ImageFormat::R8))
+        },
+        (VideoFrameYuvFormat::I420_10 | VideoFrameYuvFormat::P010, 0) => {
+            Some((frame_width, frame_height, ImageFormat::R16))
+        },
+        // Planar chroma (U, V): single channel, half size.
+        (VideoFrameYuvFormat::I420, 1 | 2) => Some((cw, ch, ImageFormat::R8)),
+        (VideoFrameYuvFormat::I420_10, 1 | 2) => Some((cw, ch, ImageFormat::R16)),
+        // Semi-planar interleaved chroma (UV): two channels, half size.
+        (VideoFrameYuvFormat::NV12, 1) => Some((cw, ch, ImageFormat::RG8)),
+        (VideoFrameYuvFormat::P010, 1) => Some((cw, ch, ImageFormat::RG16)),
         _ => None,
     }
 }
@@ -640,14 +685,11 @@ impl MediaFrameRenderer {
         v_key: Option<ImageKey>,
     ) -> MediaFrameYuvImage {
         MediaFrameYuvImage {
-            format: match format {
-                VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
-                VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
-            },
+            format: media_frame_yuv_format(format),
             y_key,
             u_or_uv_key,
             v_key,
-            color_depth: ColorDepth::Color8,
+            color_depth: wr_color_depth(format),
             color_space: wr_yuv_color_space(color_space),
             color_range: wr_yuv_color_range(color_range),
         }
@@ -679,10 +721,7 @@ impl MediaFrameRenderer {
             }
         }
 
-        let yuv_format = match yuv.format {
-            VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
-            VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
-        };
+        let yuv_format = media_frame_yuv_format(yuv.format);
         let image_update_for_log;
         let image_key_for_log;
 
@@ -752,7 +791,7 @@ impl MediaFrameRenderer {
             let Some(u_or_uv_key) = self.generate_image_key() else {
                 return;
             };
-            let v_key = if yuv.format == VideoFrameYuvFormat::I420 {
+            let v_key = if yuv.format.plane_count() == 3 {
                 let Some(v_key) = self.generate_image_key() else {
                     return;
                 };
@@ -874,10 +913,7 @@ impl MediaFrameRenderer {
             );
         }
 
-        let yuv_format = match format {
-            VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
-            VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
-        };
+        let yuv_format = media_frame_yuv_format(format);
         let image_update_for_log;
         let image_key_for_log;
 
@@ -949,7 +985,7 @@ impl MediaFrameRenderer {
             let Some(u_or_uv_key) = self.generate_image_key() else {
                 return;
             };
-            let v_key = if format == VideoFrameYuvFormat::I420 {
+            let v_key = if format.plane_count() == 3 {
                 let Some(v_key) = self.generate_image_key() else {
                     return;
                 };
@@ -1046,6 +1082,11 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             match yuv.format {
                 VideoFrameYuvFormat::I420 => "yuv_i420_external_raw",
                 VideoFrameYuvFormat::NV12 => "yuv_nv12_external_raw",
+                // The raw (CPU) YUV path only emits 8-bit; 10-bit flows through
+                // the D3D11 path ("d3d11_yuv_texture"). Unreachable here but keeps
+                // the match exhaustive.
+                VideoFrameYuvFormat::I420_10 => "yuv_i420_10_external_raw",
+                VideoFrameYuvFormat::P010 => "yuv_p010_external_raw",
             }
         } else if frame.is_d3d11_yuv() {
             "d3d11_yuv_texture"

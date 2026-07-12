@@ -19,7 +19,9 @@
 use log::warn;
 use servo_media_player::d3d11_ring::{ClaimedSlot, MAX_PLANES, PlaneDesc, RingPlaneFormat, SLOT_COUNT};
 use servo_media_player::video::VideoFrameYuvFormat;
-use winapi::shared::dxgiformat::{DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM};
+use winapi::shared::dxgiformat::{
+    DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
+};
 use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
 use winapi::shared::winerror::S_OK;
 use winapi::um::d3d11::{
@@ -38,7 +40,9 @@ pub struct PlaneGeom {
 }
 
 /// Plane geometry for `format` at `width`×`height` (display/I420 contract).
-/// Chroma planes use ceil(w/2)×ceil(h/2); NV12's single UV plane is Rg8.
+/// Chroma planes use ceil(w/2)×ceil(h/2); NV12/P010's single UV plane is
+/// interleaved (Rg8/Rg16). 8-bit planes use 1 byte/texel (R8), 10-bit planes
+/// use a 16-bit container (2 bytes/texel: R16, or 4 bytes for the RG16 UV).
 pub fn plane_geoms(format: VideoFrameYuvFormat, width: i32, height: i32) -> Vec<PlaneGeom> {
     let w = width.max(0);
     let h = height.max(0);
@@ -57,6 +61,44 @@ pub fn plane_geoms(format: VideoFrameYuvFormat, width: i32, height: i32) -> Vec<
                 width: cw,
                 height: ch,
                 row_bytes: cw as usize * 2,
+            },
+        ],
+        // 10-bit planar: each sample occupies 2 bytes (16-bit container), so
+        // row_bytes doubles relative to the 8-bit I420 layout.
+        VideoFrameYuvFormat::I420_10 => vec![
+            PlaneGeom {
+                format: RingPlaneFormat::R16,
+                width: w,
+                height: h,
+                row_bytes: w as usize * 2,
+            },
+            PlaneGeom {
+                format: RingPlaneFormat::R16,
+                width: cw,
+                height: ch,
+                row_bytes: cw as usize * 2,
+            },
+            PlaneGeom {
+                format: RingPlaneFormat::R16,
+                width: cw,
+                height: ch,
+                row_bytes: cw as usize * 2,
+            },
+        ],
+        // P010: 16-bit Y plane + interleaved 16-bit UV plane (2 channels × 2
+        // bytes = 4 bytes/texel).
+        VideoFrameYuvFormat::P010 => vec![
+            PlaneGeom {
+                format: RingPlaneFormat::R16,
+                width: w,
+                height: h,
+                row_bytes: w as usize * 2,
+            },
+            PlaneGeom {
+                format: RingPlaneFormat::Rg16,
+                width: cw,
+                height: ch,
+                row_bytes: cw as usize * 4,
             },
         ],
     }
@@ -154,6 +196,8 @@ fn create_dynamic_texture(
     let dxgi_format = match g.format {
         RingPlaneFormat::R8 => DXGI_FORMAT_R8_UNORM,
         RingPlaneFormat::Rg8 => DXGI_FORMAT_R8G8_UNORM,
+        RingPlaneFormat::R16 => DXGI_FORMAT_R16_UNORM,
+        RingPlaneFormat::Rg16 => DXGI_FORMAT_R16G16_UNORM,
     };
     let desc = D3D11_TEXTURE2D_DESC {
         Width: g.width.max(1) as u32,
@@ -334,5 +378,56 @@ mod tests {
         // NV12 65x37 -> UV 33x19 row_bytes = 66.
         let g = super::plane_geoms(VideoFrameYuvFormat::NV12, 65, 37);
         assert_eq!((g[1].width, g[1].height, g[1].row_bytes), (33, 19, 66));
+    }
+
+    // (4) 10-bit plane dims / row_bytes (16-bit container) incl. odd sizes.
+    #[test]
+    fn plane_geoms_10bit_dims_and_row_bytes() {
+        // I420_10LE even 1920x1080: Y R16 row_bytes = 1920*2 = 3840; chroma
+        // 960x540 R16 row_bytes = 960*2 = 1920.
+        let g = super::plane_geoms(VideoFrameYuvFormat::I420_10, 1920, 1080);
+        assert_eq!(g.len(), 3);
+        assert_eq!(
+            (g[0].width, g[0].height, g[0].row_bytes, g[0].format),
+            (1920, 1080, 3840, RingPlaneFormat::R16)
+        );
+        assert_eq!(
+            (g[1].width, g[1].height, g[1].row_bytes, g[1].format),
+            (960, 540, 1920, RingPlaneFormat::R16)
+        );
+        assert_eq!(
+            (g[2].width, g[2].height, g[2].row_bytes, g[2].format),
+            (960, 540, 1920, RingPlaneFormat::R16)
+        );
+
+        // I420_10LE odd 5x3 -> chroma ceil = 3x2; row_bytes = texel_width*2.
+        let g = super::plane_geoms(VideoFrameYuvFormat::I420_10, 5, 3);
+        assert_eq!((g[0].width, g[0].height, g[0].row_bytes), (5, 3, 10));
+        assert_eq!((g[1].width, g[1].height, g[1].row_bytes), (3, 2, 6));
+        assert_eq!((g[2].width, g[2].height, g[2].row_bytes), (3, 2, 6));
+
+        // P010 even 1920x1080: Y R16 row_bytes = 3840; UV Rg16 960x540
+        // row_bytes = 960*4 = 3840.
+        let g = super::plane_geoms(VideoFrameYuvFormat::P010, 1920, 1080);
+        assert_eq!(g.len(), 2);
+        assert_eq!(
+            (g[0].width, g[0].height, g[0].row_bytes, g[0].format),
+            (1920, 1080, 3840, RingPlaneFormat::R16)
+        );
+        assert_eq!(
+            (g[1].width, g[1].height, g[1].row_bytes, g[1].format),
+            (960, 540, 3840, RingPlaneFormat::Rg16)
+        );
+
+        // P010 odd 5x3 -> UV Rg16 3x2 row_bytes = 3*4 = 12.
+        let g = super::plane_geoms(VideoFrameYuvFormat::P010, 5, 3);
+        assert_eq!(
+            (g[0].width, g[0].height, g[0].row_bytes, g[0].format),
+            (5, 3, 10, RingPlaneFormat::R16)
+        );
+        assert_eq!(
+            (g[1].width, g[1].height, g[1].row_bytes, g[1].format),
+            (3, 2, 12, RingPlaneFormat::Rg16)
+        );
     }
 }

@@ -8,15 +8,26 @@ use malloc_size_of_derive::MallocSizeOf;
 
 #[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
 pub enum VideoFrameYuvFormat {
+    /// 8-bit planar Y/U/V (3 planes, R8 each). YV12 is reconciled to this by the
+    /// producer (U/V swap), so this variant also covers YV12 sources.
     I420,
+    /// 8-bit semi-planar Y + interleaved UV (2 planes, R8 + RG8).
     NV12,
+    /// 10-bit planar Y/U/V with values in the LOW 10 bits of a 16-bit word
+    /// (3 planes, R16 each). Typical output of software decoders (`I420_10LE`).
+    /// Sampled as UNORM16 (v/65535); WR rescales via `ColorDepth::Color10`.
+    I420_10,
+    /// 10-bit semi-planar Y + interleaved UV with values in the HIGH bits
+    /// (2 planes, R16 + RG16). Microsoft `P010_10LE` layout (v<<6); sampled as
+    /// UNORM16 it is already ~normalized, so WR uses `ColorDepth::Color16`.
+    P010,
 }
 
 impl VideoFrameYuvFormat {
     pub fn plane_count(self) -> usize {
         match self {
-            VideoFrameYuvFormat::I420 => 3,
-            VideoFrameYuvFormat::NV12 => 2,
+            VideoFrameYuvFormat::I420 | VideoFrameYuvFormat::I420_10 => 3,
+            VideoFrameYuvFormat::NV12 | VideoFrameYuvFormat::P010 => 2,
         }
     }
 }

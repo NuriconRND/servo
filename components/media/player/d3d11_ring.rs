@@ -42,12 +42,16 @@ pub const SLOT_COUNT: usize = 4;
 /// 슬롯당 최대 plane 개수(I420=3, NV12=2).
 pub const MAX_PLANES: usize = 3;
 
-/// plane 텍스처의 DXGI 포맷. `R8` = `DXGI_FORMAT_R8_UNORM`(Y/단일 채널),
-/// `Rg8` = `DXGI_FORMAT_R8G8_UNORM`(교차 배치 UV, NV12).
+/// plane 텍스처의 DXGI 포맷. `R8` = `DXGI_FORMAT_R8_UNORM`(8-bit Y/단일 채널),
+/// `Rg8` = `DXGI_FORMAT_R8G8_UNORM`(8-bit 교차 배치 UV, NV12), `R16` =
+/// `DXGI_FORMAT_R16_UNORM`(10-bit Y/단일 채널, 16-bit 컨테이너), `Rg16` =
+/// `DXGI_FORMAT_R16G16_UNORM`(10-bit 교차 배치 UV, P010).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RingPlaneFormat {
     R8,
     Rg8,
+    R16,
+    Rg16,
 }
 
 /// 링 슬롯 하나의 plane 하나를 기술하는 정적 정보. `texture`를 제외한
