@@ -489,14 +489,14 @@ void main() {
         );
 
         let (pixels_a, gl_err_a) = draw_and_readback(gl, resources, wrap.gl_texture, TEX_SIZE);
+        let (gate1_pixels, diag1) = check_pixels(&pixels_a, TEX_SIZE, channels, pattern_a);
+        let gate1 = gate1_pixels && (gl_err_a == gl::NO_ERROR);
+        let gate1_verdict = if gate1 { "PASS" } else { "FAIL" };
         if gl_err_a != gl::NO_ERROR {
-            println!("  draw+readback(패턴 A) 후 GL 에러 {gl_err_a:#x}");
+            println!("GATE1({label})={gate1_verdict} gl_error={gl_err_a:#x} {diag1}");
+        } else {
+            println!("GATE1({label})={gate1_verdict} {diag1}");
         }
-        let (gate1, diag1) = check_pixels(&pixels_a, TEX_SIZE, channels, pattern_a);
-        println!(
-            "GATE1({label})={} {diag1}",
-            if gate1 { "PASS" } else { "FAIL" }
-        );
 
         // GATE2: 같은 wrap을 유지한 채 재-Map(DISCARD) → 새 패턴 → 재샘플.
         let gate2 = match write_pattern(context, texture_ptr, channels, pattern_b) {
@@ -506,14 +506,14 @@ void main() {
             },
             Ok(()) => {
                 let (pixels_b, gl_err_b) = draw_and_readback(gl, resources, wrap.gl_texture, TEX_SIZE);
+                let (gate2_pixels, diag2) = check_pixels(&pixels_b, TEX_SIZE, channels, pattern_b);
+                let gate2 = gate2_pixels && (gl_err_b == gl::NO_ERROR);
+                let gate2_verdict = if gate2 { "PASS" } else { "FAIL" };
                 if gl_err_b != gl::NO_ERROR {
-                    println!("  draw+readback(패턴 B) 후 GL 에러 {gl_err_b:#x}");
+                    println!("GATE2({label})={gate2_verdict} gl_error={gl_err_b:#x} {diag2}");
+                } else {
+                    println!("GATE2({label})={gate2_verdict} {diag2}");
                 }
-                let (gate2, diag2) = check_pixels(&pixels_b, TEX_SIZE, channels, pattern_b);
-                println!(
-                    "GATE2({label})={} {diag2}",
-                    if gate2 { "PASS" } else { "FAIL" }
-                );
                 gate2
             },
         };
