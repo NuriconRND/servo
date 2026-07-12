@@ -543,13 +543,15 @@ void main() {
             },
         };
 
-        // 참고(관찰된 무관 버그, 이 PoC 범위 밖): third_party/surfman의 ANGLE
-        // destroy_context가 egl.DestroyContext를 동일 핸들에 두 번 호출한다
-        // (context.rs:176-177, commit be2148a68에서 벤더링됨). WindowRenderingContext를
-        // 정상 Drop 경로로 내려보내면 그 이중 호출이 STATUS_ACCESS_VIOLATION을 낸다 —
-        // GATE 판정과는 무관(모든 판정 출력 이후 발생). 이 PoC가 그 버그를 유발/수정하는
-        // 게 아니라 그냥 안 밟도록, 판정을 다 출력한 뒤 Drop을 타지 않고
-        // `std::process::exit`로 즉시 종료한다.
+        // 과거 이 PoC는 정상 Drop 시 STATUS_ACCESS_VIOLATION(0xC0000005)을 냈고
+        // process::exit로 Drop을 우회했었다. 두 개의 서로 다른 벤더링 surfman 버그가
+        // 있었다: (1) angle/context.rs destroy_context의 이중 egl.DestroyContext(수정: 중복
+        // 호출 제거), (2) 진짜 원인 — angle/device.rs Device::drop이 egl.Terminate로 ANGLE
+        // 내부 ID3D11Device를 파괴한 "뒤" surfman이 보유한 ComPtr<ID3D11Device>의 Release가
+        // 실행되어 이미 해제된 COM 객체를 역참조(use-after-free). 수정: d3d11_device를
+        // ManuallyDrop으로 감싸 egl.Terminate "이전"에 Release. present-path-fast와는 무관
+        // (FAST off에서도 동일 AV 재현 확인). 이제 run()이 정상 반환해 Drop 경로를 그대로
+        // 타며, 이 PoC의 깨끗한(0) 종료가 위 두 수정의 회귀 검증이다.
         if let Err(error) = context.make_current() {
             eprintln!("make_current 실패: {error:?}");
             std::process::exit(1);
@@ -607,10 +609,10 @@ void main() {
         } else {
             1
         };
-        // 위 주석 참조: WindowRenderingContext(및 그 안의 D3D11 텍스처/GL 리소스는 이미
-        // cleanup_gl_resources로 해제됨)의 정상 Drop 경로가 무관한 벤더링 버그
-        // (surfman ANGLE 이중 DestroyContext)를 밟으므로, 판정 출력이 끝난 시점에
-        // Drop을 건너뛰고 즉시 프로세스를 종료한다.
-        std::process::exit(exit_code);
+        // 정상 반환 — WindowRenderingContext가 스코프 종료 시 Drop 경로
+        // (destroy_context → Device::drop의 egl.Terminate → d3d11_device Release)를
+        // 그대로 타며, 이 PoC의 깨끗한(0) 종료 자체가 해체 AV 수정의 회귀 검증이다
+        // (위 주석의 근본 원인 참조).
+        exit_code
     }
 }

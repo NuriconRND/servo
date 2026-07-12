@@ -20,6 +20,7 @@ use crate::{Error, GLApi};
 use log::{info, warn};
 use std::cell::{RefCell, RefMut};
 use std::mem;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::ptr;
 use winapi::Interface;
@@ -79,7 +80,12 @@ unsafe impl Send for Adapter {}
 /// Devices contain most of the relevant surface management methods.
 pub struct Device {
     pub(crate) egl_display: EGLDisplay,
-    pub(crate) d3d11_device: ComPtr<ID3D11Device>,
+    // Wrapped in `ManuallyDrop` so `Device::drop` can Release this reference to ANGLE's
+    // internal D3D11 device BEFORE calling `eglTerminate`. `eglTerminate` destroys ANGLE's
+    // D3D11 device even while external COM references remain, so letting this `ComPtr`'s
+    // implicit Release run after `eglTerminate` would dereference freed memory (use-after-free,
+    // STATUS_ACCESS_VIOLATION). See `Device::drop`.
+    pub(crate) d3d11_device: ManuallyDrop<ComPtr<ID3D11Device>>,
     pub(crate) d3d_driver_type: D3D_DRIVER_TYPE,
     pub(crate) display_is_owned: bool,
 }
@@ -272,7 +278,7 @@ impl Device {
 
                 Ok(Device {
                     egl_display,
-                    d3d11_device,
+                    d3d11_device: ManuallyDrop::new(d3d11_device),
                     d3d_driver_type,
                     display_is_owned: true,
                 })
@@ -415,7 +421,7 @@ impl Device {
 
                 Ok(Device {
                     egl_display,
-                    d3d11_device,
+                    d3d11_device: ManuallyDrop::new(d3d11_device),
                     d3d_driver_type,
                     display_is_owned: true,
                 })
@@ -428,7 +434,7 @@ impl Device {
             (*native_device.d3d11_device).AddRef();
             Ok(Device {
                 egl_display: native_device.egl_display,
-                d3d11_device: ComPtr::from_raw(native_device.d3d11_device),
+                d3d11_device: ManuallyDrop::new(ComPtr::from_raw(native_device.d3d11_device)),
                 d3d_driver_type: native_device.d3d_driver_type,
                 display_is_owned: false,
             })
@@ -440,7 +446,7 @@ impl Device {
         let d3d11_device = query_d3d11_device_for_egl_display(egl_display)?;
         Ok(Device {
             egl_display,
-            d3d11_device,
+            d3d11_device: ManuallyDrop::new(d3d11_device),
             d3d_driver_type: D3D_DRIVER_TYPE_UNKNOWN,
             display_is_owned: false,
         })
@@ -550,7 +556,7 @@ impl Device {
     pub fn native_device(&self) -> NativeDevice {
         NativeDevice {
             egl_display: self.egl_display,
-            d3d11_device: self.d3d11_device.clone().into_raw(),
+            d3d11_device: (*self.d3d11_device).clone().into_raw(),
             d3d_driver_type: self.d3d_driver_type,
         }
     }
@@ -639,6 +645,15 @@ fn query_d3d11_device_for_egl_display(
 impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
+            // Release our reference to ANGLE's internal D3D11 device FIRST, while it is
+            // still alive. `eglTerminate` below destroys ANGLE's D3D11 device even though
+            // external COM references (this one included) remain outstanding; if this
+            // `ComPtr`'s Release ran afterwards it would dereference the freed COM object
+            // and fault (STATUS_ACCESS_VIOLATION on teardown). `ManuallyDrop::drop` performs
+            // exactly that Release now — before termination — and the field is never touched
+            // again. For a non-owned display (`display_is_owned == false`) we only Release
+            // (balancing the AddRef taken when the device was adopted) and skip termination.
+            ManuallyDrop::drop(&mut self.d3d11_device);
             if self.display_is_owned {
                 EGL_FUNCTIONS.with(|egl| {
                     let result = egl.Terminate(self.egl_display);
