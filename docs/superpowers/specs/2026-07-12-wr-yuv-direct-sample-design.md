@@ -1,7 +1,7 @@
 # WR YUV 직접 샘플: 변환기 제거 + ANGLE 디바이스 DYNAMIC plane 링 (A-dyn)
 
 날짜: 2026-07-12
-상태: 설계 승인됨 (구현 전)
+상태: 구현 완료 (2026-07-12, 실기 검증 통과 — 상세 §10)
 대상: components/media/backends/gstreamer/render-d3d11, components/media/player/video.rs,
 components/media/media-thread, components/script/dom/html/htmlmediaelement.rs,
 third_party/surfman (EGLImage 래핑 헬퍼 소형 추가)
@@ -269,3 +269,48 @@ Unmap/re-Map만).
 - HW 디코드 (사용자 보류 선언)
 - probe A/B 실행 (사용자 판단, 구현 비차단)
 - raw Buffer 경로(`SERVO_MEDIA_D3D11_VIDEO` off) 개선
+
+## 10. 구현 결과와 스펙 이탈 (2026-07-12)
+
+### 10.1 PoC 게이트 결과
+
+§6 PoC 게이트 4/4 PASS (RTX A5000 실기). DYNAMIC R8/RG8 텍스처를 EGLImage로
+래핑해 WR이 직접 샘플했고, WRITE_DISCARD rename 후에도 SRV가 새 내용을
+투명하게 따라갔다 — 판정은 GL 에러 포함 여부로 3회 재현해 확인. 게이트
+1·2(texturable 판정, rename 투명성) 둘 다 실패 없이 통과해 §6의 중단 조건은
+발동하지 않았다.
+
+### 10.2 검증 요약
+
+| 항목 | 결과 |
+|---|---|
+| 2×2 스모크 | 색(BT.709 limited)·상하 방향·모션 PASS |
+| 45타일 회귀 | lockstep 유지 — 피크 부하 시 ≤3프레임 트레일(드롭이 아닌 우아한 지연), 메모리 플래토, 루프 경계(gapless) 무결 |
+| WebGPU 월 | 무회귀 — 공유 핸들 import 경로 보존 확인(§4.4대로 미삭제) |
+| PROF 계측 | plane 세트당 memcpy 0.22-0.42ms |
+| 증거 | `.superpowers/sdd/evidence/` |
+
+### 10.3 스펙 이탈 3건
+
+| # | 이탈 | 사유 |
+|---|---|---|
+| ① | 배압·프레임 map 실패 시 "드롭"(§7 슬롯 고갈 대응) 대신 **링 재제시** | 실측 근본원인 — appsink가 build_frame의 None 리턴을 치명적 FlowError로 변환해 파이프라인 전체가 죽었음(단순 프레임 드롭이 아니었음). 45타일 동결의 근본 수정. 커밋 bf70293c4, af522092d |
+| ② | ring_epoch(§4.3 "크기 변경 시 새 에폭 링")이 실질적으로 vestigial — 항상 1 | 무효화는 에폭 증가가 아니라 **ring_id 신규 발급**으로 처리 |
+| ③ | 워크스페이스 게이트를 `cargo check --workspace`에서 `mach build --release`로 대체 | 이 머신에서 mozjs_sys의 debug 빌드스크립트가 mach 환경 밖에서 행(hang) |
+
+### 10.4 잔여 공개 리스크 (수용)
+
+- 시작 창구간의 None 계열 teardown: 미발행 또는 첫 map 실패 시점 — 링 소비
+  전이라 §10.3-①의 재제시가 적용되지 않음
+- 만성 기아는 PROF 빌드에서만 상세 가시(카운터·로그) — 비PROF 빌드는 1회
+  warn만 남김
+- 멀티GPU 어댑터 정합(§4.5 부수 이득)은 이 세션이 단일 GPU 장비라 미검증
+
+### 10.5 Minor 백로그 (최종 리뷰 triage 대상)
+
+- `drop_count` 주석이 실제 동작(§10.3-① 재제시)과 드리프트 — 표현 정정 필요
+- Ctrl+F12 WR 수치는 이번에 미채집 — TextureHandle external이 텍스처 캐시를
+  경유하지 않는 것은 §5(resource_cache.rs:162-163,1451) 구조적 보장이라
+  실측 없이도 결론은 유효
+- vendored surfman의 `eglDestroyContext` 이중 호출은 기존 버그
+  (context.rs:176-177) — 본 기능과 무관, 별도 수정 후보로 남김

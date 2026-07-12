@@ -226,6 +226,18 @@ The current GStreamer dependency package contains `gstd3d11.dll`, so this is wor
 - Multi-GPU adapter compatibility.
 - Cross-adapter texture sharing or per-tile decode/upload policy.
 
+**Status update (2026-07-12):** this follow-up was carried out across three
+later specs (2026-07-09 per-pipeline upload, 2026-07-11 dynamic upload,
+2026-07-12 WR YUV direct sample) and is now implemented and verified on
+real hardware. The `gstd3d11.dll` dependency called out above is gone again
+in the final design: `docs/superpowers/specs/2026-07-12-wr-yuv-direct-sample-design.md`
+deletes the GstD3D11Converter path and its `gstd3d11.dll`/`gstd3d11-1.0-0.dll`
+bundling requirement entirely (plane textures are written directly into an
+ANGLE-owned DYNAMIC ring instead), and the intermediate `SERVO_MEDIA_D3D11_UPLOAD`
+env var / `-LegacyUpload` launcher switch (from the 2026-07-11 design) are
+dead code paths as of that change. See that spec's §10 for the implementation
+and verification record.
+
 ## Progress Log
 
 ### 2026-06-10
