@@ -257,6 +257,28 @@ mod render_d3d11 {
         }
     }
 
+    impl Drop for RenderD3D11 {
+        fn drop(&mut self) {
+            // 플레이어 해체(엘리먼트 제거 / 페이지 내비게이션): 활성 링을
+            // 레지스트리에 반납해 렌더러의 take_removed_rings 프롤로그가
+            // Unmap + 텍스처 Release를 수행하게 한다. remove_ring은 그 외에는
+            // caps 변경 시에만 불리므로, 이 Drop이 없으면 링(DYNAMIC 텍스처
+            // 8~12개 + 레지스트리 엔트리 + 살아있는 매핑)이 영구히 누수된다.
+            // Drop 안에서 unwrap하지 않고 포이즌을 복구한다 — 소멸자에서
+            // (특히 언와인딩 중) 패닉하면 프로세스가 abort되며, 그래도 링은
+            // 반드시 반납해야 하기 때문이다.
+            let ring_id = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .ring_id
+                .take();
+            if let Some(ring_id) = ring_id {
+                D3d11PlaneRings::remove_ring(ring_id);
+            }
+        }
+    }
+
     impl Render for RenderD3D11 {
         fn is_gl(&self) -> bool {
             false
