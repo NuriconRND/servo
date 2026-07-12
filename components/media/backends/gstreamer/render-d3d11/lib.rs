@@ -345,7 +345,16 @@ mod render_d3d11 {
                     D3d11PlaneRings::stage_first_frame(ring_id, vecs);
                 },
                 None => {
-                    // 배압 드롭 (memcpy 전 — 비용 없음).
+                    // 배압: 모든 슬롯이 아직 소비 대기(Published) 상태다. 이번 gst
+                    // 프레임 바이트는 버리되(memcpy 전 — 비용 없음) None을 반환하지
+                    // 않는다. appsink 콜백은 None(=get_frame_from_sample 실패)을 치명적
+                    // FlowError::Error로 바꾸고, 그 -5가 상류 qtdemux_loop를 중단시켜
+                    // 파이프라인 전체가 정지한다(45타일에서 렌더러가 못 따라오면 첫
+                    // 배압 드롭 한 번에 전 타일 정지 — 통합검증에서 관측·규명). 대신
+                    // 아래 링 기술자를 그대로 반환해 렌더러가 직전 Presenting 슬롯을
+                    // 재표시하게 한다(정상적 프레임 드롭). 재표시 합성이 슬롯 1개를
+                    // 소비하므로 배압도 자연히 완화된다. 이 arm은 ring_never_consumed
+                    // == false일 때만 도달하므로 Presenting 슬롯이 항상 존재한다.
                     state.drop_count += 1;
                     if prof {
                         log::warn!(
@@ -355,7 +364,7 @@ mod render_d3d11 {
                             D3d11PlaneRings::dropped_frames(ring_id),
                         );
                     }
-                    return None;
+                    // 아래 VideoFrame::new로 흘려보낸다 — 재표시로 스트림 유지.
                 },
             }
 
