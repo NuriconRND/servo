@@ -15,7 +15,7 @@ use euclid::default::Size2D;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
 use log::{debug, info, warn};
 use malloc_size_of_derive::MallocSizeOf;
-use paint_api::rendering_context::{RenderingContext, SurfaceTexture};
+use paint_api::rendering_context::{D3d11GlWrappedTexture, RenderingContext};
 use paint_api::{
     ExternalImageSource, WebRenderExternalImageApi, WebRenderExternalImageHandlers,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
@@ -24,6 +24,9 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_config::{opts, pref};
 pub use servo_media::player::context::{GlApi, GlContext, NativeDisplay, PlayerGLContext};
+use servo_media::player::d3d11_ring::{
+    ConsumeCommit, ConsumePlan, D3d11PlaneRings, MAX_PLANES, PlaneDesc, RemappedPlane,
+};
 use servo_media::player::video::VideoFrame;
 use webrender_api::ExternalImageId;
 
@@ -116,58 +119,63 @@ impl RawVideoFrameExternalImages {
     }
 }
 
-/// D3D11 GPU 상주 비디오 프레임 레지스트리 (raw YUV 레지스트리의 대칭물).
-/// external image ID → 최신 프레임 (latest-wins). 값은 스칼라뿐이라 gst 참조 보유 없음
-/// — 프레임 수명은 render-d3d11의 공유 링이 소유한다.
+/// D3D11 plane 바인딩 — external image ID 하나를 공유 plane 링의 한 plane에
+/// 연결한다(WR YUV 직접 샘플 경로). 값은 스칼라뿐이라 gst 참조를 보유하지
+/// 않는다 — plane 텍스처의 수명은 [`D3d11PlaneRings`] 레지스트리가 소유하고
+/// 렌더러 스레드가 링 제거 시 해제한다. 필드 이름/타입은 프로듀서(Task 7)가
+/// 그대로 작성하므로 고정이다.
 #[derive(Clone, Copy, Debug)]
-pub struct D3d11VideoFrameInfo {
-    pub shared_handle: u64,
+pub struct D3d11PlaneBinding {
+    pub ring_id: u64,
     pub ring_epoch: u32,
+    pub plane_index: usize,
     pub width: i32,
     pub height: i32,
 }
 
-fn d3d11_video_frames() -> &'static Mutex<FxHashMap<u64, D3d11VideoFrameInfo>> {
-    static D3D11_VIDEO_FRAMES: OnceLock<Mutex<FxHashMap<u64, D3d11VideoFrameInfo>>> =
+/// external image ID(u64) → 최신 plane 바인딩(latest-wins). 프로듀서가
+/// `update_plane`으로 쓰고, 렌더러 스레드의 `lock`/`unlock`이 읽는다.
+fn d3d11_plane_bindings() -> &'static Mutex<FxHashMap<u64, D3d11PlaneBinding>> {
+    static D3D11_PLANE_BINDINGS: OnceLock<Mutex<FxHashMap<u64, D3d11PlaneBinding>>> =
         OnceLock::new();
-    D3D11_VIDEO_FRAMES.get_or_init(|| Mutex::new(FxHashMap::default()))
-}
-
-fn d3d11_removed_ids() -> &'static Mutex<Vec<u64>> {
-    static D3D11_REMOVED_IDS: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
-    D3D11_REMOVED_IDS.get_or_init(|| Mutex::new(Vec::new()))
+    D3D11_PLANE_BINDINGS.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 pub struct D3d11VideoFrameExternalImages;
 
 impl D3d11VideoFrameExternalImages {
-    pub fn allocate_id() -> Option<ExternalImageId> {
+    /// plane 개수만큼 external image ID를 할당한다(raw YUV 경로의
+    /// `allocate_plane_ids` 미러). 멀티프로세스/강제 IPC에서는 in-process
+    /// 외부 이미지 경로가 없으므로 None.
+    pub fn allocate_plane_ids(plane_count: usize) -> Option<Vec<ExternalImageId>> {
         if opts::get().multiprocess || opts::get().force_ipc {
             return None;
         }
         let mut id_manager = raw_video_external_image_id_manager()?;
-        Some(id_manager.next_id(WebRenderImageHandlerType::Media))
+        Some(
+            (0..plane_count)
+                .map(|_| id_manager.next_id(WebRenderImageHandlerType::Media))
+                .collect(),
+        )
     }
 
-    pub fn update(id: ExternalImageId, info: D3d11VideoFrameInfo) {
-        d3d11_video_frames().lock().unwrap().insert(id.0, info);
+    /// plane 바인딩을 갱신한다(프레임마다 프로듀서가 호출).
+    pub fn update_plane(id: ExternalImageId, binding: D3d11PlaneBinding) {
+        d3d11_plane_bindings().lock().unwrap().insert(id.0, binding);
     }
 
-    pub fn remove(id: ExternalImageId) {
-        d3d11_video_frames().lock().unwrap().remove(&id.0);
-        // 렌더러 스레드의 래핑 캐시는 다음 lock 때 이 목록을 보고 정리한다.
-        d3d11_removed_ids().lock().unwrap().push(id.0);
+    /// plane 바인딩을 제거한다(플레이어 리셋/삭제 시). 텍스처/링 정리는
+    /// 레지스트리의 `take_removed_rings`가 담당하므로 여기서는 바인딩 맵과
+    /// id_manager 슬롯만 정리한다.
+    pub fn remove_plane(id: ExternalImageId) {
+        d3d11_plane_bindings().lock().unwrap().remove(&id.0);
         if let Some(mut id_manager) = raw_video_external_image_id_manager() {
             id_manager.remove(&id);
         }
     }
 
-    fn info_for(id: u64) -> Option<D3d11VideoFrameInfo> {
-        d3d11_video_frames().lock().unwrap().get(&id).copied()
-    }
-
-    fn take_removed_ids() -> Vec<u64> {
-        std::mem::take(&mut *d3d11_removed_ids().lock().unwrap())
+    fn binding_for(id: u64) -> Option<D3d11PlaneBinding> {
+        d3d11_plane_bindings().lock().unwrap().get(&id).copied()
     }
 }
 
@@ -390,19 +398,96 @@ impl WebRenderExternalImageApi for GLPlayerExternalImages {
     }
 }
 
-#[derive(Default)]
-struct D3d11TextureCacheEntry {
-    ring_epoch: u32,
-    /// shared_handle → (SurfaceTexture 유지용, GL 텍스처 id). 링 슬롯이 안정적이라
-    /// 플레이어당 최대 4개 — 정상 상태에서 프레임당 재래핑 0.
-    textures: FxHashMap<u64, (SurfaceTexture, u32)>,
+/// Execute a [`ConsumePlan`] on the renderer thread and commit the result.
+///
+/// Runs on the renderer (ANGLE GL) thread, keyed off the 0->1 plane-lock
+/// transition (so exactly once per composite per ring). Every path through
+/// this function ends in exactly one [`D3d11PlaneRings::commit_consume`],
+/// even when some or all D3D11 Map calls fail — an empty `mapped`/`remapped`
+/// vector is a valid commit and is what keeps the ring from wedging (see the
+/// never-skip contract on [`ConsumePlan`]).
+fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
+    match plan {
+        ConsumePlan::InitialMapAll { slots, staged } => {
+            // Map ALL slots' planes. Remember slot 0's successful maps so the
+            // staged first-frame bytes can be copied into them below.
+            let mut mapped: Vec<RemappedPlane> = Vec::new();
+            let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] = [None; MAX_PLANES];
+            for (slot_idx, slot) in slots.iter().enumerate() {
+                for (plane_idx, plane) in slot.iter().enumerate() {
+                    let Some(desc) = plane else {
+                        continue;
+                    };
+                    match rc.map_d3d11_dynamic_texture(desc.texture) {
+                        Some((data_ptr, row_pitch)) => {
+                            mapped.push(RemappedPlane {
+                                texture: desc.texture,
+                                data_ptr,
+                                row_pitch,
+                            });
+                            if slot_idx == 0 {
+                                slot0_mapped[plane_idx] = Some((data_ptr, row_pitch, *desc));
+                            }
+                        },
+                        None => {
+                            warn!(
+                                "D3D11 media: InitialMapAll map failed (ring={ring_id} \
+                                 texture={})",
+                                desc.texture
+                            );
+                        },
+                    }
+                }
+            }
+            // Copy staged first-frame bytes into slot 0. Staged vecs are tightly
+            // packed, so the source row stride equals `row_bytes`.
+            if let Some(staged) = staged {
+                for (plane_idx, src) in staged.iter().enumerate() {
+                    if plane_idx >= MAX_PLANES {
+                        break;
+                    }
+                    if let Some((data_ptr, row_pitch, desc)) = slot0_mapped[plane_idx] {
+                        let rows = desc.height.max(0) as usize;
+                        rc.copy_rows_to_mapped(data_ptr, row_pitch, src, desc.row_bytes, rows);
+                    }
+                }
+            }
+            D3d11PlaneRings::commit_consume(ring_id, ConsumeCommit::InitialMapAll { mapped });
+        },
+        ConsumePlan::Advance {
+            unmap,
+            map,
+            filled_slot,
+        } => {
+            for texture in unmap {
+                rc.unmap_d3d11_texture(texture);
+            }
+            let mut remapped: Vec<RemappedPlane> = Vec::new();
+            for texture in map {
+                match rc.map_d3d11_dynamic_texture(texture) {
+                    Some((data_ptr, row_pitch)) => remapped.push(RemappedPlane {
+                        texture,
+                        data_ptr,
+                        row_pitch,
+                    }),
+                    None => warn!("D3D11 media: Advance re-map failed (ring={ring_id} texture={texture})"),
+                }
+            }
+            D3d11PlaneRings::commit_consume(
+                ring_id,
+                ConsumeCommit::Advance {
+                    filled_slot,
+                    remapped,
+                },
+            );
+        },
+    }
 }
 
 // D3D11PROF: 임시 진단 계측 (시작 램프 조사 §12, env SERVO_D3D11_PROFILE=1 게이트,
-// 기본 off, 조사 종료 후 제거 예정). 렌더러 스레드의 공유 핸들 첫-lock 래핑
-// (OpenSharedResource+pbuffer)이 램프 구간 프레임 예산을 얼마나 먹는지 정량화한다.
-// 래핑은 타일당 링 슬롯 4개 = 45타일 기준 최대 180회의 일회성 이벤트라 매 건 로깅해도
-// 로그 폭주 없음.
+// 기본 off, 조사 종료 후 제거 예정). 렌더러 스레드의 plane 텍스처 첫-lock 래핑
+// (EGLImage 바인딩)이 램프 구간 프레임 예산을 얼마나 먹는지 정량화한다. 래핑은
+// 타일당 링 슬롯 4개 × plane 2~3개의 일회성 이벤트라 매 건 로깅해도 로그 폭주 없음.
 fn d3d11_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -423,7 +508,14 @@ struct MediaExternalImages {
     glplayer_images: Option<GLPlayerExternalImages>,
     locked_raw_planes: FxHashMap<u64, RawVideoPlane>,
     rendering_context: Option<Rc<dyn RenderingContext>>,
-    d3d11_texture_cache: FxHashMap<u64, D3d11TextureCacheEntry>,
+    /// EGLImage 래핑 캐시: plane 텍스처(usize) → GL 래핑. 링 슬롯 텍스처가
+    /// 안정적이라 링당 최대 SLOT_COUNT×MAX_PLANES개 — 정상 상태에서 프레임당
+    /// 재래핑 0. 링 제거 시 `take_removed_rings` 기반으로 파기한다.
+    d3d11_wrap_cache: FxHashMap<usize, D3d11GlWrappedTexture>,
+    /// 이번 합성에서 lock한 D3D11 plane external id → ring_id. `unlock`이
+    /// `note_plane_unlock`을 정확히 짝맞춰 호출하기 위한 로컬 추적(글로벌
+    /// 바인딩 맵이 lock~unlock 사이에 변경돼도 안전하도록 self에 보관).
+    locked_d3d11_planes: FxHashMap<u64, u64>,
 }
 
 impl MediaExternalImages {
@@ -431,22 +523,42 @@ impl MediaExternalImages {
         glplayer_sender: Option<IpcSender<GLPlayerMsg>>,
         rendering_context: Option<Rc<dyn RenderingContext>>,
     ) -> Self {
+        // 소비자(ANGLE) 디바이스를 레지스트리에 publish한다. 이 값이 있어야
+        // 프로듀서가 plane 링을 만들어 프레임을 채운다 — publish 전에는
+        // 프로듀서가 모든 프레임을 드롭한다(WR YUV 직접 샘플 경로의 on-switch).
+        if let Some(rc) = rendering_context.as_ref() {
+            if let Some(device) = rc.media_d3d11_device_handle() {
+                D3d11PlaneRings::set_consumer_device(device);
+            }
+        }
         Self {
             glplayer_images: glplayer_sender.map(GLPlayerExternalImages::new),
             locked_raw_planes: Default::default(),
             rendering_context,
-            d3d11_texture_cache: Default::default(),
+            d3d11_wrap_cache: Default::default(),
+            locked_d3d11_planes: Default::default(),
         }
     }
 
+    /// 제거된 링들을 정리한다: `mapped` 텍스처 Unmap(Presenting은 레지스트리가
+    /// 이미 제외) → 캐시된 GL 래핑 파기 → 텍스처 Release.
     fn purge_removed_d3d11_entries(&mut self) {
-        for removed in D3d11VideoFrameExternalImages::take_removed_ids() {
-            if let Some(entry) = self.d3d11_texture_cache.remove(&removed) {
-                if let Some(rendering_context) = self.rendering_context.as_ref() {
-                    for (_, (surface_texture, _)) in entry.textures {
-                        rendering_context.destroy_texture(surface_texture);
-                    }
+        let removed = D3d11PlaneRings::take_removed_rings();
+        if removed.is_empty() {
+            return;
+        }
+        let Some(rc) = self.rendering_context.clone() else {
+            return;
+        };
+        for ring in removed {
+            for texture in ring.mapped {
+                rc.unmap_d3d11_texture(texture);
+            }
+            for texture in ring.textures {
+                if let Some(wrap) = self.d3d11_wrap_cache.remove(&texture) {
+                    rc.destroy_d3d11_gl_wrap(wrap);
                 }
+                rc.release_d3d11_texture(texture);
             }
         }
     }
@@ -454,75 +566,104 @@ impl MediaExternalImages {
     fn lock_d3d11(
         &mut self,
         id: u64,
-        info: D3d11VideoFrameInfo,
+        binding: D3d11PlaneBinding,
     ) -> (ExternalImageSource<'_>, Size2D<i32>) {
-        let Some(rendering_context) = self.rendering_context.as_ref() else {
+        // rendering_context가 없으면 이 경로 전체가 꺼진 것 — 링을 전혀
+        // 건드리지 않고(lock_count 증가 없음) 즉시 Invalid를 반환한다. 로컬
+        // 추적에도 넣지 않으므로 unlock은 짝맞춰 no-op이 된다.
+        let Some(rc) = self.rendering_context.clone() else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
-        let entry = self.d3d11_texture_cache.entry(id).or_default();
-        if entry.ring_epoch != info.ring_epoch {
-            // 링 재생성(크기 변경) — 이전 세대 래핑 전부 폐기
-            for (_, (surface_texture, _)) in std::mem::take(&mut entry.textures) {
-                rendering_context.destroy_texture(surface_texture);
-            }
-            entry.ring_epoch = info.ring_epoch;
+
+        // 여기서부터는 note_plane_lock_and_plan을 호출해 lock_count를 올릴 수
+        // 있으므로, unlock이 반드시 note_plane_unlock으로 짝을 맞추도록 로컬에
+        // 기록해 둔다(글로벌 바인딩 맵이 lock~unlock 사이 변경돼도 안전).
+        self.locked_d3d11_planes.insert(id, binding.ring_id);
+
+        // 합성당 1회 소비: 링별 lock_count 0→1 전이에서만 plan이 나온다.
+        // Some(plan)은 반드시 정확히 한 번 commit_consume으로 끝나야 한다
+        // (consume_plan이 모든 실패 분기 포함 이를 보장한다).
+        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(binding.ring_id) {
+            consume_plan(&*rc, binding.ring_id, plan);
         }
-        if !entry.textures.contains_key(&info.shared_handle) {
-            let size = Size2D::new(info.width, info.height);
+
+        // lock 반환용 텍스처: 현재 Presenting 슬롯의 이 plane 기술자.
+        let Some(plane) = D3d11PlaneRings::presenting_plane(binding.ring_id, binding.plane_index)
+        else {
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        };
+
+        // EGLImage 래핑 캐시(텍스처 usize 키). 정상 상태에서 프레임당 재래핑 0.
+        let wrap = if let Some(cached) = self.d3d11_wrap_cache.get(&plane.texture) {
+            *cached
+        } else {
             let import_start = std::time::Instant::now(); // D3D11PROF
-            match rendering_context.create_texture_from_shared_handle(info.shared_handle, size) {
-                Some((surface_texture, gl_texture, _)) => {
-                    // D3D11PROF: 렌더러 스레드 첫-lock 래핑 소요 — 매 건 로깅 (일회성
-                    // 이벤트, 45타일 최대 180건). n/sum_ms는 프로세스 누계.
+            match rc.wrap_d3d11_texture_as_gl_texture(plane.texture) {
+                Some(wrap) => {
+                    // D3D11PROF: 렌더러 스레드 첫-lock 래핑 소요 — 매 건 로깅
+                    // (일회성 이벤트). n/sum_ms는 프로세스 누계.
                     if d3d11_profile_enabled() {
                         let us = import_start.elapsed().as_micros() as u64;
                         let n = D3D11_IMPORT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                         let total = D3D11_IMPORT_TOTAL_US.fetch_add(us, Ordering::Relaxed) + us;
                         warn!(
-                            "D3D11PROF import id={id} took_ms={:.2} n={n} sum_ms={:.1}",
+                            "D3D11PROF wrap texture={} took_ms={:.2} n={n} sum_ms={:.1}",
+                            plane.texture,
                             us as f64 / 1000.0,
                             total as f64 / 1000.0,
                         );
                     }
-                    entry.textures.insert(info.shared_handle, (surface_texture, gl_texture));
+                    self.d3d11_wrap_cache.insert(plane.texture, wrap);
+                    wrap
                 },
                 None => {
-                    warn!("D3D11 video: 공유 핸들 import 실패 (id={id})");
+                    warn!("D3D11 media: EGLImage 래핑 실패 (texture={})", plane.texture);
                     return (ExternalImageSource::Invalid, Size2D::zero());
                 },
             }
-        }
-        let (_, gl_texture) = entry.textures[&info.shared_handle];
+        };
         (
-            ExternalImageSource::NativeTexture(gl_texture),
-            Size2D::new(info.width, info.height),
+            ExternalImageSource::NativeTexture(wrap.gl_texture),
+            Size2D::new(plane.width, plane.height),
         )
     }
 }
 
 impl Drop for MediaExternalImages {
     fn drop(&mut self) {
-        // 캐시된 SurfaceTexture는 destroy_surface_texture 없이 drop되면 surfman이
-        // 패닉하므로(teardown 안전장치), 핸들러 해체 시 전부 명시 파기한다.
-        // rendering_context가 None이면 lock_d3d11이 항상 Invalid만 반환해 캐시가
-        // 늘 비어 있으므로 그냥 반환해도 안전하다.
-        let Some(rendering_context) = self.rendering_context.as_ref() else {
+        // rendering_context가 None이면 lock_d3d11이 항상 Invalid만 반환해
+        // 래핑 캐시가 늘 비어 있으므로 그냥 반환해도 안전하다.
+        let Some(rc) = self.rendering_context.clone() else {
             return;
         };
-        for (_, entry) in self.d3d11_texture_cache.drain() {
-            for (_, (surface_texture, _)) in entry.textures {
-                rendering_context.destroy_texture(surface_texture);
+        // 1) 이미 제거된 링: 전체 정리(Unmap + 래핑 파기 + Release).
+        for ring in D3d11PlaneRings::take_removed_rings() {
+            for texture in ring.mapped {
+                rc.unmap_d3d11_texture(texture);
             }
+            for texture in ring.textures {
+                if let Some(wrap) = self.d3d11_wrap_cache.remove(&texture) {
+                    rc.destroy_d3d11_gl_wrap(wrap);
+                }
+                rc.release_d3d11_texture(texture);
+            }
+        }
+        // 2) 아직 살아있는 링의 텍스처: 우리가 만든 GL 래핑(EGLImage)만
+        //    파기한다. 텍스처 자체의 Unmap/Release는 링(프로듀서)이 소유하므로
+        //    건드리지 않는다 — 살아있는 링의 텍스처를 Release하면 안 된다.
+        for (_texture, wrap) in self.d3d11_wrap_cache.drain() {
+            rc.destroy_d3d11_gl_wrap(wrap);
         }
     }
 }
 
 impl WebRenderExternalImageApi for MediaExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
-        // GPU 상주 D3D11 프레임: 렌더러는 캐시된 GL 텍스처를 돌려줄 뿐 업로드하지 않는다.
-        if let Some(info) = D3d11VideoFrameExternalImages::info_for(id) {
+        // GPU 상주 D3D11 plane: 렌더러는 링 슬롯을 소비(Map/Unmap)하고 EGLImage로
+        // 래핑한 GL 텍스처를 돌려줄 뿐 CPU 업로드하지 않는다.
+        if let Some(binding) = D3d11VideoFrameExternalImages::binding_for(id) {
             self.purge_removed_d3d11_entries();
-            return self.lock_d3d11(id, info);
+            return self.lock_d3d11(id, binding);
         }
 
         // Diagnostic: this runs on the renderer thread once per plane per upload. Time the
@@ -589,8 +730,10 @@ impl WebRenderExternalImageApi for MediaExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
-        // D3D11 캐시는 unlock에서 유지한다 (링 슬롯 재사용 — 폐기는 epoch 변경/제거 시).
-        if self.d3d11_texture_cache.contains_key(&id) {
+        // D3D11 plane: lock에서 로컬 추적한 것만 note_plane_unlock으로 짝을 맞춘다
+        // (lock_count 감소). 래핑 캐시는 unlock에서 유지한다 — 폐기는 링 제거 시.
+        if let Some(ring_id) = self.locked_d3d11_planes.remove(&id) {
+            D3d11PlaneRings::note_plane_unlock(ring_id);
             return;
         }
 
@@ -629,9 +772,8 @@ impl WebRenderExternalImageApi for MediaExternalImages {
     }
 
     fn needs_vertical_flip(&mut self, id: u64) -> bool {
-        // GPU 상주 D3D11 프레임(상단-하단 텍스처)만 플립 제외.
-        // 첫 lock 전엔 래핑 캐시가 비어 있을 수 있으므로 레지스트리도 함께 확인한다.
-        !(self.d3d11_texture_cache.contains_key(&id)
-            || D3d11VideoFrameExternalImages::info_for(id).is_some())
+        // GPU 상주 D3D11 plane(EGLImage 래핑, 상단-하단 텍스처)만 플립 제외.
+        // 바인딩 맵을 보면 첫 lock 전에도 판정할 수 있다.
+        D3d11VideoFrameExternalImages::binding_for(id).is_none()
     }
 }

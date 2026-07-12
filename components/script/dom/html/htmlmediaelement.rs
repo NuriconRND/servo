@@ -23,8 +23,7 @@ use js::context::JSContext;
 use js::realm::{AutoRealm, CurrentRealm};
 use layout_api::{MediaFrame, MediaFrameYuvFormat, MediaFrameYuvImage};
 use media::{
-    D3d11VideoFrameExternalImages, D3d11VideoFrameInfo, GLPlayerMsg, GLPlayerMsgForward,
-    RawVideoFrameExternalImages, WindowGLContext,
+    GLPlayerMsg, GLPlayerMsgForward, RawVideoFrameExternalImages, WindowGLContext,
 };
 use net_traits::request::{Destination, RequestId};
 use net_traits::{
@@ -285,8 +284,6 @@ pub(crate) struct MediaFrameRenderer {
     current_frame_holder: Option<FrameHolder>,
     #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
     yuv_external_ids: Option<MediaYuvExternalIds>,
-    #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
-    d3d11_external_id: Option<ExternalImageId>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
 }
@@ -312,7 +309,6 @@ impl MediaFrameRenderer {
             media_frame_summary_count: 0,
             current_frame_holder: None,
             yuv_external_ids: None,
-            d3d11_external_id: None,
             poster_frame: None,
         }
     }
@@ -419,10 +415,6 @@ impl MediaFrameRenderer {
             }
         }
 
-        if let Some(external_id) = self.d3d11_external_id.take() {
-            D3d11VideoFrameExternalImages::remove(external_id);
-        }
-
         if !updates.is_empty() {
             self.paint_api
                 .update_images(self.webview_id.into(), updates);
@@ -464,15 +456,6 @@ impl MediaFrameRenderer {
         let external_ids = MediaYuvExternalIds::new(yuv.format, &plane_ids)?;
         self.yuv_external_ids = Some(external_ids);
         Some(external_ids)
-    }
-
-    fn ensure_d3d11_external_id(&mut self) -> Option<ExternalImageId> {
-        if let Some(id) = self.d3d11_external_id {
-            return Some(id);
-        }
-        let id = D3d11VideoFrameExternalImages::allocate_id()?;
-        self.d3d11_external_id = Some(id);
-        Some(id)
     }
 
     fn generate_image_key(&self) -> Option<ImageKey> {
@@ -736,116 +719,23 @@ impl MediaFrameRenderer {
     fn render_d3d11_frame(
         &mut self,
         frame: VideoFrame,
-        d3d11: VideoFrameD3D11Data,
-        rendered_frame_count: u64,
-        frame_backend: &'static str,
-        inter_frame_ms: Option<f64>,
-        mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
+        _d3d11: VideoFrameD3D11Data,
+        _rendered_frame_count: u64,
+        _frame_backend: &'static str,
+        _inter_frame_ms: Option<f64>,
+        updates: smallvec::SmallVec<[ImageUpdate; 1]>,
     ) {
-        let frame_width = frame.get_width();
-        let frame_height = frame.get_height();
-        let Some(external_id) = self.ensure_d3d11_external_id() else {
-            warn!("Dropping D3D11 media frame because external image ID is unavailable");
-            if !updates.is_empty() {
-                self.paint_api
-                    .update_images(self.webview_id.into(), updates);
-            }
-            return;
-        };
-
-        D3d11VideoFrameExternalImages::update(
-            external_id,
-            D3d11VideoFrameInfo {
-                shared_handle: d3d11.shared_handle,
-                ring_epoch: d3d11.ring_epoch,
-                width: frame_width,
-                height: frame_height,
-            },
-        );
-
-        let descriptor = ImageDescriptor::new(
-            frame_width,
-            frame_height,
-            ImageFormat::RGBA8,
-            ImageDescriptorFlags::empty(),
-        );
-        let image_data = SerializableImageData::External(ExternalImageData {
-            id: external_id,
-            channel_index: 0,
-            image_type: ExternalImageType::TextureHandle(ImageBufferKind::Texture2D),
-            normalized_uvs: false,
-        });
-
-        let image_update_for_log;
-        let image_key_for_log;
-
-        let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
-            current_frame.width == frame_width
-                && current_frame.height == frame_height
-                && current_frame.yuv.is_none()
-        });
-
-        if current_frame_is_compatible {
-            let current_frame = self
-                .current_frame
-                .as_ref()
-                .expect("Current frame should be present");
-            image_key_for_log = Some(current_frame.image_key);
-            updates.push(ImageUpdate::UpdateImage(
-                current_frame.image_key,
-                descriptor,
-                image_data,
-                None,
-            ));
-            image_update_for_log = "update";
-
-            self.current_frame_holder
-                .get_or_insert_with(|| FrameHolder::new(frame.clone()))
-                .set(frame);
-
-            if let Some(old_frame) = self.old_frame.take() {
-                Self::push_delete_frame_images(&mut updates, old_frame);
-            }
-        } else {
-            if let Some(current_frame) = self.current_frame.take() {
-                self.old_frame = Some(current_frame);
-            }
-            let Some(image_key) = self.generate_image_key() else {
-                return;
-            };
-            image_key_for_log = Some(image_key);
-            image_update_for_log = "add";
-            self.current_frame = Some(MediaFrame {
-                image_key,
-                yuv: None,
-                width: frame_width,
-                height: frame_height,
-            });
-
-            self.current_frame_holder = Some(FrameHolder::new(frame));
-
-            updates.push(ImageUpdate::AddImage(
-                image_key, descriptor, image_data, false,
-            ));
+        // Task 5에서 D3D11 공유 핸들(단일 텍스처) 프로듀서가 제거되어 이 variant는
+        // 런타임에 더 이상 생성되지 않는다(dead path). WR YUV 직접 샘플 소비자는
+        // Task 7이 plane 링 바인딩(D3d11PlaneBinding)으로 정식 구현한다. 그 전까지는
+        // 프레임을 드롭하되, 이미 큐잉된 이미지 삭제 업데이트만 흘려보내 이미지 키
+        // 누수를 막는다.
+        warn!("D3D11 공유 핸들 프레임 수신 — 프로듀서 제거됨(dead path), 드롭");
+        drop(frame);
+        if !updates.is_empty() {
+            self.paint_api
+                .update_images(self.webview_id.into(), updates);
         }
-
-        let delete_update_count = updates
-            .iter()
-            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
-            .count();
-        self.log_media_frame(
-            rendered_frame_count,
-            frame_backend,
-            frame_width,
-            frame_height,
-            image_key_for_log,
-            image_update_for_log,
-            delete_update_count,
-            updates.len(),
-            inter_frame_ms,
-        );
-        self.paint_api
-            .update_images(self.webview_id.into(), updates);
     }
 }
 
