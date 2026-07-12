@@ -2,45 +2,40 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Windows용 D3D11 비디오 렌더 경로.
+//! Windows용 D3D11 비디오 렌더 경로 (WR YUV 직접 샘플).
 //!
-//! 기본(dynamic): appsink가 sysmem 프레임을 받고, 파이프라인의 스트리밍 스레드에서
-//! DynamicUploadSet이 DYNAMIC 텍스처 Map(WRITE_DISCARD)+memcpy로 업로드한 뒤
-//! GstD3D11Converter로 RGBA 변환해 공유 텍스처 링에 렌더, 공유 핸들만 Servo로 전달한다.
-//! env `SERVO_MEDIA_D3D11_UPLOAD=legacy`면 기존 d3d11upload 엘리먼트 경로(staging+
-//! CopySubresourceRegion)로 복귀. 렌더러 스레드의 비디오 업로드(glTexSubImage2D) 제거가
-//! 목적. env `SERVO_MEDIA_D3D11_VIDEO=1` 게이트 (기본 off).
-//! 설계: docs/superpowers/specs/2026-07-09-d3d11-per-pipeline-upload-design.md (기반),
-//! docs/superpowers/specs/2026-07-11-d3d11-dynamic-upload-design.md (dynamic 업로드)
+//! appsink가 sysmem 프레임을 받고, build_frame이 각 plane을 소비자(ANGLE)
+//! 디바이스 위의 DYNAMIC plane 텍스처에 CPU memcpy만 한다. 변환·fence·RGBA
+//! 공유 링은 없다 — WebRender가 이 plane 텍스처를 직접 YUV 샘플한다.
+//! 슬롯 상태기계와 Map/Unmap(소비자측)은 `servo_media_player::d3d11_ring`
+//! 레지스트리가 담당하며, 프로듀서는 D3D immediate context를 전혀 만지지
+//! 않는다(유일한 D3D 호출은 링 (재)생성 시의 free-threaded `CreateTexture2D`).
+//! env `SERVO_MEDIA_D3D11_VIDEO=1` 게이트 (기본 off).
+//! 설계: docs/superpowers/plans/2026-07-12-wr-yuv-direct-sample.md
 
 // Windows 전용 — 다른 타겟에서는 빈 크레이트로 컴파일된다 (workspace member라
 // 비Windows `--workspace` 빌드에도 포함되므로 게이트 필수).
 #[cfg(windows)]
-pub mod ffi;
-#[cfg(windows)]
-pub mod interop;
+mod ring_producer;
 
-#[cfg(windows)]
-pub use interop::{SharedGstD3D11Device, SharedTextureRing};
-
-// RenderD3D11 본체 — interop/ffi와 마찬가지로 Windows 전용. 비Windows에서는 이 모듈
-// 자체가 컴파일되지 않아 크레이트가 계속 빈 크레이트로 유지된다.
+// RenderD3D11 본체 — ring_producer와 마찬가지로 Windows 전용. 비Windows에서는
+// 이 모듈 자체가 컴파일되지 않아 크레이트가 계속 빈 크레이트로 유지된다.
 #[cfg(windows)]
 mod render_d3d11 {
     use std::env;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    use gstreamer::glib::translate::ToGlibPtr;
     use gstreamer::prelude::*;
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
-    use servo_media_player::video::{Buffer, VideoFrame, VideoFrameD3D11Data, VideoFrameData};
+    use servo_media_player::d3d11_ring::D3d11PlaneRings;
+    use servo_media_player::video::{
+        Buffer, VideoFrame, VideoFrameD3D11YuvData, VideoFrameData, VideoFrameYuvColorRange,
+        VideoFrameYuvColorSpace, VideoFrameYuvFormat,
+    };
 
-    // 부모 모듈(lib.rs)의 `pub use interop::{SharedGstD3D11Device, SharedTextureRing};`를
-    // 가져온다.
-    use super::*;
-    use crate::ffi::GstD3D11Converter;
+    use crate::ring_producer;
 
     const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
 
@@ -53,7 +48,7 @@ mod render_d3d11 {
         static LAST_PROF_LOG: std::cell::Cell<Option<std::time::Instant>> =
             const { std::cell::Cell::new(None) };
         // D3D11PROF: 직전 로그 이후 이 파이프라인이 완성한 프레임 수 — 로그 라인 끝
-        // fr=N 필드로 실려 프로듀서 도착률(프레임/s) 복원용 (§12 Q1 판별, 임시 계측).
+        // fr=N 필드로 실려 프로듀서 도착률(프레임/s) 복원용 (임시 계측).
         static FRAMES_SINCE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         // D3D11PROF(§14): 직전 샘플 도착 시각/pts — 도착 갭(>200ms)과 루프 wrap(pts
         // 역행) 감지용. 스트리밍 스레드=파이프라인 1:1이라 thread_local로 충분.
@@ -71,59 +66,71 @@ mod render_d3d11 {
         })
     }
 
-    /// 업로드 방식 (스펙 2026-07-11 §6): 기본 dynamic, env로 legacy 복귀.
-    #[derive(Clone, Copy, PartialEq)]
-    enum UploadMode {
-        /// DYNAMIC 텍스처 Map(WRITE_DISCARD) 직접 업로드 (기본).
-        Dynamic,
-        /// 기존 d3d11upload 엘리먼트 경로 (staging+CopySubresourceRegion) 복귀 스위치.
-        Legacy,
-    }
-
-    fn upload_mode() -> UploadMode {
-        static MODE: std::sync::OnceLock<UploadMode> = std::sync::OnceLock::new();
-        *MODE.get_or_init(|| match env::var("SERVO_MEDIA_D3D11_UPLOAD") {
-            Ok(v) if v.eq_ignore_ascii_case("legacy") => UploadMode::Legacy,
-            _ => UploadMode::Dynamic,
+    /// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다 (프로세스 1회 판정).
+    fn profile_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            env::var("SERVO_D3D11_PROFILE").is_ok_and(|v| {
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
         })
     }
 
-    struct D3D11FrameBuffer {
-        data: VideoFrameD3D11Data,
+    /// build_frame 총시간이 이 임계(ms) 이상일 때만 로깅 (로그 폭주 방지).
+    /// SERVO_D3D11_PROFILE_MS 로 조정, 기본 8ms.
+    fn profile_threshold_ms() -> f64 {
+        static T: OnceLock<f64> = OnceLock::new();
+        *T.get_or_init(|| {
+            env::var("SERVO_D3D11_PROFILE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8.0)
+        })
     }
 
-    impl Buffer for D3D11FrameBuffer {
+    /// colorimetry 매핑 (components/media/backends/gstreamer/render.rs:240-246과 동일).
+    fn colorimetry_from_info(
+        info: &gstreamer_video::VideoInfo,
+    ) -> (VideoFrameYuvColorSpace, VideoFrameYuvColorRange) {
+        let color_space = match info.colorimetry().matrix() {
+            gstreamer_video::VideoColorMatrix::Bt709 => VideoFrameYuvColorSpace::Rec709,
+            gstreamer_video::VideoColorMatrix::Bt2020 => VideoFrameYuvColorSpace::Rec2020,
+            _ => VideoFrameYuvColorSpace::Rec601,
+        };
+        let color_range = match info.colorimetry().range() {
+            gstreamer_video::VideoColorRange::Range0_255 => VideoFrameYuvColorRange::Full,
+            _ => VideoFrameYuvColorRange::Limited,
+        };
+        (color_space, color_range)
+    }
+
+    /// D3D11Yuv 프레임 페이로드 — 링 참조 + 표시 메타데이터만 싣는다(픽셀 없음).
+    struct D3D11YuvFrameBuffer {
+        data: VideoFrameD3D11YuvData,
+    }
+
+    impl Buffer for D3D11YuvFrameBuffer {
         fn frame_data(&self) -> Option<VideoFrameData> {
-            Some(VideoFrameData::D3D11(self.data))
+            Some(VideoFrameData::D3D11Yuv(self.data))
         }
     }
-
-    /// GstD3D11Converter 소유 핸들. GstObject 파생이라 g_object_unref로 해제.
-    struct ConverterHandle(*mut GstD3D11Converter);
-
-    impl Drop for ConverterHandle {
-        fn drop(&mut self) {
-            unsafe { gstreamer::glib::gobject_ffi::g_object_unref(self.0 as *mut _) }
-        }
-    }
-
-    // 안전성: 변환기는 스트리밍 스레드 1개에서만 사용하며 PlayerState Mutex로 보호된다.
-    unsafe impl Send for ConverterHandle {}
 
     struct PlayerState {
-        ring: Option<SharedTextureRing>,
-        converter: Option<ConverterHandle>,
-        /// dynamic 업로드 세트 (sysmem 협상 시에만 생성). caps 변경 시 converter와 함께 무효화.
-        upload: Option<crate::interop::DynamicUploadSet>,
-        /// 세트 생성 실패 마커 — 1회 warn 후 이후 프레임은 조용히 드롭 (스펙 §7).
-        upload_failed: bool,
-        /// 변환기 무효화 판정용 — 포맷/크기/colorimetry 변경 감지.
+        /// 현재 활성 plane 링(없으면 아직 미생성/디바이스 대기).
+        ring_id: Option<u64>,
+        /// 현재 링을 만든 caps(포맷/크기/색상). 변경되면 링 교체.
         in_caps: Option<gstreamer::Caps>,
+        /// 링이 아직 한 번도 소비되지 않음(전 슬롯 Unmapped, claim이 항상 None).
+        /// true인 동안은 드롭 대신 첫 프레임을 스테이징한다.
+        ring_never_consumed: bool,
+        /// 현재 링 생성 이후의 배압 드롭(Free 슬롯 없음) 누계.
+        drop_count: u64,
+        /// 소비자 디바이스 미발행 경고 1회 래치(파이프라인당).
+        warned_no_device: bool,
     }
 
     pub struct RenderD3D11 {
-        device: Arc<SharedGstD3D11Device>,
-        // 플레이어당 링+변환기. build_frame은 스트리밍 스레드 1개에서만 불리지만
+        // 플레이어당 링 상태. build_frame은 스트리밍 스레드 1개에서만 불리지만
         // Render는 &self라 내부 가변성 필요.
         state: Mutex<PlayerState>,
         // D3D11PROF: 이 플레이어의 파이프라인 식별자 (임시 계측).
@@ -141,80 +148,109 @@ mod render_d3d11 {
                 log::warn!("D3D11 video: 단일 프로세스 전용 — Raw 경로 폴백");
                 return None;
             }
-            // legacy 모드만 d3d11upload 엘리먼트 필요 — dynamic(기본)은 라이브러리
-            // (gstd3d11-1.0-0.dll)만 쓴다 (플러그인 gstd3d11.dll 불필요).
-            if upload_mode() == UploadMode::Legacy
-                && gstreamer::ElementFactory::find("d3d11upload").is_none()
-            {
-                log::warn!(
-                    "D3D11 video: d3d11upload 플러그인 없음 (gstd3d11.dll 번들 확인) — Raw 경로 폴백"
-                );
-                return None;
-            }
-            // 파이프라인(플레이어)별 전용 디바이스 — 프로세스 전역 공유 디바이스는
-            // 45+ lockstep 루프 경계에서 단일 락 콘보이로 포화됨이 실측 확정
-            // (interop.rs 모듈 doc comment 참조). 플레이어 Drop 시 디바이스도 해제된다.
-            let device = SharedGstD3D11Device::create()?;
             let profile_id = PROFILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-            let mode = if upload_mode() == UploadMode::Legacy { "legacy" } else { "dynamic" };
-            log::info!(
-                "D3D11 video: 파이프라인별 GPU 업로드 경로 활성 (mode={mode}, profile_id={profile_id})"
-            );
+            log::info!("D3D11 video: plane 링 프로듀서 경로 활성 (profile_id={profile_id})");
             Some(RenderD3D11 {
-                device,
                 state: Mutex::new(PlayerState {
-                    ring: None,
-                    converter: None,
-                    upload: None,
-                    upload_failed: false,
+                    ring_id: None,
                     in_caps: None,
+                    ring_never_consumed: true,
+                    drop_count: 0,
+                    warned_no_device: false,
                 }),
                 profile_id,
             })
         }
 
-        fn build_video_sink_legacy(
+        /// 현재 caps에 맞는 링을 보장한다(필요 시 (재)생성). 소비자(ANGLE)
+        /// 디바이스가 아직 발행되지 않았으면 실패를 캐시하지 않고 None을 반환해
+        /// 다음 프레임에서 재시도한다.
+        fn ensure_ring(
             &self,
-            appsink: &gstreamer::Element,
-            pipeline: &gstreamer::Element,
-        ) -> Result<(), PlayerError> {
-            let bin = gstreamer::Bin::builder()
-                .name("servo-d3d11-video-sink")
-                .build();
-            let upload = gstreamer::ElementFactory::make("d3d11upload")
-                .build()
-                .map_err(|error| PlayerError::Backend(format!("d3d11upload 생성 실패: {error:?}")))?;
-
-            // format 미지정: 디코더 원 포맷(I420/NV12 등)을 D3D11 메모리로 그대로 받는다.
-            // RGBA 변환은 build_frame의 GstD3D11Converter가 링 슬롯에 직접 수행.
-            let caps = gstreamer::Caps::builder("video/x-raw")
-                .features(["memory:D3D11Memory"])
-                .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
-                .build();
-            appsink.set_property("caps", &caps);
-
-            bin.add_many([&upload, appsink])
-                .map_err(|error| PlayerError::Backend(format!("bin add 실패: {error:?}")))?;
-            upload
-                .link(appsink)
-                .map_err(|error| PlayerError::Backend(format!("bin link 실패: {error:?}")))?;
-
-            let upload_sink = upload
-                .static_pad("sink")
-                .ok_or_else(|| PlayerError::Backend("d3d11upload sink pad 없음".to_owned()))?;
-            let ghost_pad = gstreamer::GhostPad::builder_with_target(&upload_sink)
-                .map_err(|error| PlayerError::Backend(format!("ghost pad 실패: {error:?}")))?
-                .name("sink")
-                .build();
-            bin.add_pad(&ghost_pad)
-                .map_err(|error| PlayerError::Backend(format!("ghost pad add 실패: {error:?}")))?;
-
-            // 우리 디바이스를 파이프라인 전체에 주입 — PoC(Task 3)에서 검증된 방식.
-            if let Some(context) = self.device.gst_context() {
-                pipeline.set_context(&context);
+            state: &mut PlayerState,
+            caps: &gstreamer::CapsRef,
+            format: VideoFrameYuvFormat,
+            width: i32,
+            height: i32,
+        ) -> Option<u64> {
+            // 기존 링이 현재 caps에 유효.
+            if state.ring_id.is_some() && state.in_caps.as_deref() == Some(caps) {
+                return state.ring_id;
             }
-            pipeline.set_property("video-sink", &bin);
-            Ok(())
+            // (재)생성 필요 — 소비자 디바이스가 먼저 발행돼 있어야 한다. 없으면
+            // 실패를 캐시하지 않고(in_caps 갱신 안 함) 드롭 후 다음 프레임 재시도.
+            let device = match D3d11PlaneRings::consumer_device() {
+                Some(device) => device,
+                None => {
+                    if !state.warned_no_device {
+                        log::warn!(
+                            "D3D11 video: 소비자(ANGLE) 디바이스 미발행 — 렌더러 준비 전까지 드롭 (id={})",
+                            self.profile_id
+                        );
+                        state.warned_no_device = true;
+                    }
+                    return None;
+                },
+            };
+            // 구 링 회수(실제 Unmap/Release는 렌더러가 take_removed_rings로 수행).
+            if let Some(old) = state.ring_id.take() {
+                D3d11PlaneRings::remove_ring(old);
+                state.in_caps = None;
+            }
+            let slots = ring_producer::create_plane_textures(device, format, width, height)?;
+            let ring_id = D3d11PlaneRings::create_ring(format.plane_count(), slots);
+            state.ring_id = Some(ring_id);
+            state.in_caps = Some(caps.to_owned());
+            state.ring_never_consumed = true;
+            state.drop_count = 0;
+            log::info!(
+                "D3D11 video: plane 링 생성 ring_id={ring_id} {width}x{height} {format:?} (id={})",
+                self.profile_id
+            );
+            Some(ring_id)
+        }
+
+        /// D3D11PROF: claim/copy/publish 타이밍 + 드롭 카운터 하트비트(1초 1줄 +
+        /// 임계 초과 프레임). profile on일 때만 호출.
+        #[allow(clippy::too_many_arguments)]
+        fn prof_log(
+            &self,
+            state: &PlayerState,
+            ring_id: u64,
+            bf_start: std::time::Instant,
+            t_claim: std::time::Duration,
+            t_copy: std::time::Duration,
+            t_publish: std::time::Duration,
+        ) {
+            let total_ms = bf_start.elapsed().as_secs_f64() * 1000.0;
+            let over = total_ms >= profile_threshold_ms();
+            let frames = FRAMES_SINCE_LOG.with(|c| {
+                let n = c.get() + 1;
+                c.set(n);
+                n
+            });
+            let heartbeat = LAST_PROF_LOG.with(|c| match c.get() {
+                Some(t) if t.elapsed() < std::time::Duration::from_secs(1) => false,
+                _ => true,
+            });
+            if over || heartbeat {
+                LAST_PROF_LOG.with(|c| c.set(Some(std::time::Instant::now())));
+                FRAMES_SINCE_LOG.with(|c| c.set(0));
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                log::warn!(
+                    "D3D11PROF id={} over={} total={:.2} claim={:.3} copy={:.2} \
+                     publish={:.3} drops={} regdrops={} fr={}",
+                    self.profile_id,
+                    if over { 1 } else { 0 },
+                    total_ms,
+                    ms(t_claim),
+                    ms(t_copy),
+                    ms(t_publish),
+                    state.drop_count,
+                    D3d11PlaneRings::dropped_frames(ring_id),
+                    frames,
+                );
+            }
         }
     }
 
@@ -224,7 +260,7 @@ mod render_d3d11 {
         }
 
         fn build_frame(&self, sample: gstreamer::Sample) -> Option<VideoFrame> {
-            let prof = crate::interop::profile_enabled(); // D3D11PROF
+            let prof = profile_enabled(); // D3D11PROF
             let bf_start = std::time::Instant::now(); // D3D11PROF
             let buffer = sample.buffer()?;
             if buffer.n_memory() == 0 {
@@ -255,177 +291,84 @@ mod render_d3d11 {
                     }
                 }
             }
+
             let caps = sample.caps()?;
             let info = gstreamer_video::VideoInfo::from_caps(caps).ok()?;
             let width = info.width() as i32;
             let height = info.height() as i32;
-            let api = self.device.api();
 
-            // 메모리 타입 판별: D3D11 메모리(legacy d3d11upload 협상) vs sysmem(dynamic).
-            let is_d3d11_mem =
-                unsafe { (api.is_d3d11_memory)(buffer.peek_memory(0).as_mut_ptr()) } != 0;
-            if upload_mode() == UploadMode::Legacy && !is_d3d11_mem {
-                log::warn!("D3D11 video: 비 D3D11 메모리 샘플 — 프레임 드롭");
-                return None;
-            }
+            // 표시 계약은 I420(Y,U,V)/NV12. YV12는 gst plane 순서가 Y,V,U이므로
+            // 복사 시 U/V를 스왑해 계약에 맞춘다(swap_uv).
+            let (format, swap_uv) = match info.format() {
+                gstreamer_video::VideoFormat::I420 => (VideoFrameYuvFormat::I420, false),
+                gstreamer_video::VideoFormat::Yv12 => (VideoFrameYuvFormat::I420, true),
+                gstreamer_video::VideoFormat::Nv12 => (VideoFrameYuvFormat::NV12, false),
+                other => {
+                    log::warn!("D3D11 video: 미지원 포맷 {other:?} — 드롭");
+                    return None;
+                },
+            };
+            let (color_space, color_range) = colorimetry_from_info(&info);
 
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
 
-            // caps 변경(포맷/크기/색상 정보) 시 변환기·업로드 세트 재생성
-            if state.in_caps.as_deref() != Some(caps) {
-                state.converter = None;
-                state.upload = None;
-                state.upload_failed = false;
-                state.in_caps = Some(caps.to_owned());
-            }
-            let ring = state
-                .ring
-                .get_or_insert_with(|| SharedTextureRing::new(self.device.clone()));
-            ring.profile_id = self.profile_id; // D3D11PROF
-            let acq_start = std::time::Instant::now(); // D3D11PROF
-            let (out_buffer, slot_index) = ring.acquire(width, height)?;
-            let t_acquire = acq_start.elapsed(); // D3D11PROF (recreate 포함)
+            let ring_id = self.ensure_ring(state, caps, format, width, height)?;
 
-            if state.converter.is_none() {
-                let out_info = gstreamer_video::VideoInfo::builder(
-                    gstreamer_video::VideoFormat::Rgba,
-                    info.width(),
-                    info.height(),
-                )
-                .build()
-                .ok()?;
-                // VideoInfo가 ToGlibPtr 미구현으로 컴파일 실패하면
-                // `&info as *const _ as *const gstreamer_video::ffi::GstVideoInfo`로 조정.
-                let raw = unsafe {
-                    (api.converter_new)(
-                        self.device.raw(),
-                        info.to_glib_none().0,
-                        out_info.to_glib_none().0,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if raw.is_null() {
-                    log::warn!("D3D11 video: converter 생성 실패 — 프레임 드롭");
-                    return None;
-                }
-                state.converter = Some(ConverterHandle(raw));
-            }
-            let converter = state.converter.as_ref()?;
+            // 여기서만 gst 버퍼를 readable로 map한다 — 바이트는 아래에서 즉시
+            // 슬롯으로 복사되고 build_frame 반환과 함께 샘플이 풀로 돌아간다.
+            let frame =
+                gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
 
-            // 업로드 (dynamic 경로): sysmem plane들을 DYNAMIC 텍스처에
-            // Map(WRITE_DISCARD)+memcpy. legacy 경로(D3D11 메모리)는 업로드가 이미
-            // 끝나 있으므로 샘플 버퍼를 그대로 변환기 입력으로 쓴다. 따라서 legacy에서는
-            // PROF upload= 필드가 ~0으로 찍힌다(실제 업로드는 d3d11upload 엘리먼트 내부).
-            let up_start = std::time::Instant::now(); // D3D11PROF
-            let in_buffer_ptr = if is_d3d11_mem {
-                buffer.as_mut_ptr()
-            } else {
-                if state.upload_failed {
-                    // 생성 실패 마커 — 최초 1회만 warn (스펙 §7).
-                    return None;
-                }
-                if state.upload.is_none() {
-                    match crate::interop::DynamicUploadSet::new(self.device.clone(), &info) {
-                        Some(set) => state.upload = Some(set),
-                        None => {
-                            // 원인은 new()가 warn으로 남김 — 여기선 마커와 요약만.
-                            log::warn!(
-                                "D3D11 video: dynamic 업로드 세트 생성 실패 — 이후 프레임 드롭 (id={})",
-                                self.profile_id
-                            );
-                            state.upload_failed = true;
-                            return None;
-                        },
+            let claim_start = std::time::Instant::now(); // D3D11PROF
+            match D3d11PlaneRings::claim_free_slot(ring_id) {
+                Some(claimed) => {
+                    let t_claim = claim_start.elapsed(); // D3D11PROF
+                    let slot = claimed.slot;
+                    let copy_start = std::time::Instant::now(); // D3D11PROF
+                    ring_producer::copy_planes(&frame, format, swap_uv, &claimed);
+                    let t_copy = copy_start.elapsed(); // D3D11PROF
+                    let pub_start = std::time::Instant::now(); // D3D11PROF
+                    D3d11PlaneRings::publish_slot(ring_id, slot);
+                    let t_publish = pub_start.elapsed(); // D3D11PROF
+                    // 첫 성공 claim = 링이 소비되기 시작했다는 신호.
+                    state.ring_never_consumed = false;
+                    if prof {
+                        self.prof_log(state, ring_id, bf_start, t_claim, t_copy, t_publish);
                     }
-                }
-                let upload = state.upload.as_mut().expect("직전에 보장");
-                let Ok(frame) =
-                    gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-                else {
-                    log::warn!("D3D11 video: 프레임 map 실패 — 프레임 드롭");
+                },
+                None if state.ring_never_consumed => {
+                    // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
+                    // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
+                    // 프레임 덮어쓴다.
+                    let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
+                    D3d11PlaneRings::stage_first_frame(ring_id, vecs);
+                },
+                None => {
+                    // 배압 드롭 (memcpy 전 — 비용 없음).
+                    state.drop_count += 1;
+                    if prof {
+                        log::warn!(
+                            "D3D11PROF drop id={} ring={ring_id} drops={} regdrops={}",
+                            self.profile_id,
+                            state.drop_count,
+                            D3d11PlaneRings::dropped_frames(ring_id),
+                        );
+                    }
                     return None;
-                };
-                if !upload.upload(&frame) {
-                    return None; // upload()가 원인 warn 로깅
-                }
-                upload.wrapped_buffer.as_mut_ptr()
-            };
-            let t_upload = up_start.elapsed(); // D3D11PROF
-
-            // YUV→RGBA 변환을 공유 링 슬롯에 직접 렌더 (추가 복사 없음).
-            //
-            // gst_d3d11_converter_convert_buffer(일반 변형)는 내부적으로 디바이스 락을
-            // 잡는다 — 짝 API `_unlocked`의 존재가 근거(gstd3d11converter.h:194). 그러므로
-            // 여기서 device.lock()으로 감싸지 않는다(이중 락으로 인한 데드락 방지).
-            let conv_start = std::time::Instant::now(); // D3D11PROF
-            let ok = unsafe {
-                (api.converter_convert_buffer)(
-                    converter.0,
-                    in_buffer_ptr,
-                    out_buffer.as_mut_ptr(),
-                )
-            };
-            let t_convert = conv_start.elapsed(); // D3D11PROF (convert 내부 디바이스 락 대기 포함)
-            if ok == 0 {
-                log::warn!("D3D11 video: convert_buffer 실패 — 프레임 드롭");
-                return None;
+                },
             }
-            let fin_start = std::time::Instant::now(); // D3D11PROF
-            let (shared_handle, ring_epoch) = ring.finish(slot_index)?;
-            let t_finish = fin_start.elapsed(); // D3D11PROF
 
-            // D3D11PROF: 임계 초과 프레임(=스톨 후보)은 항상 로깅 + 정착 베이스라인용
-            // 파이프라인당 ~1초 하트비트 1줄(정착 분포 확보). over=1 이면 임계 초과.
-            // 판정: convert/ef_lockwait/poll_lockwait 지배=H1 락 콘보이, poll_lockwait+
-            // polls 폭증=H2 스핀 폭풍, fence_loop 크고 lockwait 작음=H3 GPU 큐 포화.
-            if prof {
-                let total_ms = bf_start.elapsed().as_secs_f64() * 1000.0;
-                let over = total_ms >= crate::interop::profile_threshold_ms();
-                // 프로듀서 도착률 복원용 프레임 카운트 (fr= 필드, §12 Q1).
-                let frames = FRAMES_SINCE_LOG.with(|c| {
-                    let n = c.get() + 1;
-                    c.set(n);
-                    n
-                });
-                // 하트비트: 이 스트리밍 스레드(=파이프라인)에서 마지막 로그 후 1초 경과 시 1줄.
-                let heartbeat = LAST_PROF_LOG.with(|c| match c.get() {
-                    Some(t) if t.elapsed() < std::time::Duration::from_secs(1) => false,
-                    _ => true,
-                });
-                if over || heartbeat {
-                    LAST_PROF_LOG.with(|c| c.set(Some(std::time::Instant::now())));
-                    FRAMES_SINCE_LOG.with(|c| c.set(0));
-                    let st = ring.last_stats;
-                    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-                    log::warn!(
-                        "D3D11PROF id={} over={} total={:.1} upload={:.2} acquire={:.1} \
-                         convert={:.1} finish={:.1} ef_lockwait={:.2} poll_lockwait={:.2} \
-                         fence_loop={:.1} polls={} fr={}",
-                        self.profile_id,
-                        if over { 1 } else { 0 },
-                        total_ms,
-                        t_upload.as_secs_f64() * 1000.0,
-                        t_acquire.as_secs_f64() * 1000.0,
-                        t_convert.as_secs_f64() * 1000.0,
-                        t_finish.as_secs_f64() * 1000.0,
-                        ms(st.endflush_lock_wait),
-                        ms(st.poll_lock_wait),
-                        ms(st.fence_loop),
-                        st.poll_count,
-                        frames,
-                    );
-                }
-            }
-            // gst 버퍼(sample)는 여기서 스코프를 벗어나며 즉시 풀로 반환된다 — 프레임
-            // 수명이 렌더러와 분리되는 것이 링 설계의 핵심 이점.
             VideoFrame::new(
                 width,
                 height,
-                Arc::new(D3D11FrameBuffer {
-                    data: VideoFrameD3D11Data {
-                        shared_handle,
-                        ring_epoch,
+                Arc::new(D3D11YuvFrameBuffer {
+                    data: VideoFrameD3D11YuvData {
+                        ring_id,
+                        ring_epoch: 1,
+                        format,
+                        color_space,
+                        color_range,
                     },
                 }),
             )
@@ -436,25 +379,14 @@ mod render_d3d11 {
             appsink: &gstreamer::Element,
             pipeline: &gstreamer::Element,
         ) -> Result<(), PlayerError> {
-            if upload_mode() == UploadMode::Legacy {
-                return self.build_video_sink_legacy(appsink, pipeline);
-            }
-            // dynamic(기본): 엘리먼트 없이 appsink가 sysmem 프레임을 직접 받고
-            // build_frame이 DYNAMIC 텍스처로 업로드한다. 포맷 목록 밖 디코더 출력은
-            // playbin이 videoconvert를 자동 삽입해 목록 내 포맷으로 맞춘다 (스펙 §5.1).
+            // appsink가 sysmem 프레임을 직접 받고 build_frame이 DYNAMIC plane
+            // 텍스처로 memcpy한다. 포맷 목록 밖 디코더 출력은 playbin이 videoconvert를
+            // 자동 삽입해 목록 내 포맷으로 맞춘다.
             let caps = gstreamer::Caps::builder("video/x-raw")
-                .field(
-                    "format",
-                    gstreamer::List::new(["I420", "YV12", "NV12", "P010_10LE"]),
-                )
+                .field("format", gstreamer::List::new(["I420", "YV12", "NV12"]))
                 .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
                 .build();
             appsink.set_property("caps", &caps);
-            // 디바이스 주입 유지 — 자동 플러깅으로 d3d11 엘리먼트가 끼어도 우리
-            // 디바이스를 쓰게 한다.
-            if let Some(context) = self.device.gst_context() {
-                pipeline.set_context(&context);
-            }
             pipeline.set_property("video-sink", appsink);
             Ok(())
         }

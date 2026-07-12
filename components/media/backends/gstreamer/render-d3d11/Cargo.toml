@@ -16,7 +16,6 @@ path = "lib.rs"
 [dependencies]
 gstreamer = { workspace = true }
 gstreamer-video = { workspace = true }
-libloading = { workspace = true }
 log = { workspace = true }
 servo-config = { workspace = true }
 servo-media-gstreamer-render = { workspace = true }
@@ -25,17 +24,8 @@ servo-media-player = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = [
     "d3d11",
-    "d3dcommon",
-    "dxgi",
     "dxgiformat",
     "dxgitype",
-    "guiddef",
-    "handleapi",
-    "ntdef",
-    "unknwnbase",
     "winerror",
 ] }
 wio = { workspace = true }
-
-[target.'cfg(windows)'.dev-dependencies]
-gstreamer-app = { workspace = true }
