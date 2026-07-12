@@ -175,6 +175,7 @@ mod render_d3d11 {
             state: &mut PlayerState,
             caps: &gstreamer::CapsRef,
             format: VideoFrameYuvFormat,
+            gst_format: gstreamer_video::VideoFormat,
             width: i32,
             height: i32,
         ) -> Option<u64> {
@@ -208,8 +209,11 @@ mod render_d3d11 {
             state.in_caps = Some(caps.to_owned());
             state.ring_never_consumed = true;
             state.drop_count = 0;
+            // 협상된 실제 gst VideoFormat(gst_format)과 매핑된 표시 포맷(format)을
+            // 함께 남긴다 — 10-bit 협상(I42010le/P01010le vs 8-bit 강등) 확인용.
             log::info!(
-                "D3D11 video: plane 링 생성 ring_id={ring_id} {width}x{height} {format:?} (id={})",
+                "D3D11 video: plane 링 생성 ring_id={ring_id} {width}x{height} \
+                 gst={gst_format:?} -> {format:?} (id={})",
                 self.profile_id
             );
             Some(ring_id)
@@ -325,11 +329,14 @@ mod render_d3d11 {
             let height = info.height() as i32;
 
             // 표시 계약은 I420(Y,U,V)/NV12. YV12는 gst plane 순서가 Y,V,U이므로
-            // 복사 시 U/V를 스왑해 계약에 맞춘다(swap_uv).
+            // 복사 시 U/V를 스왑해 계약에 맞춘다(swap_uv). 10-bit은 I420_10LE(평면형
+            // R16×3, LSB) / P010_10LE(반평면형 R16+RG16, MSB) 두 계열을 직접 수용한다.
             let (format, swap_uv) = match info.format() {
                 gstreamer_video::VideoFormat::I420 => (VideoFrameYuvFormat::I420, false),
                 gstreamer_video::VideoFormat::Yv12 => (VideoFrameYuvFormat::I420, true),
                 gstreamer_video::VideoFormat::Nv12 => (VideoFrameYuvFormat::NV12, false),
+                gstreamer_video::VideoFormat::I42010le => (VideoFrameYuvFormat::I420_10, false),
+                gstreamer_video::VideoFormat::P01010le => (VideoFrameYuvFormat::P010, false),
                 other => {
                     log::warn!("D3D11 video: 미지원 포맷 {other:?} — 드롭");
                     return None;
@@ -340,7 +347,7 @@ mod render_d3d11 {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
 
-            let ring_id = self.ensure_ring(state, caps, format, width, height)?;
+            let ring_id = self.ensure_ring(state, caps, format, info.format(), width, height)?;
 
             // 여기서만 gst 버퍼를 readable로 map한다 — 바이트는 아래에서 즉시
             // 슬롯으로 복사되고 build_frame 반환과 함께 샘플이 풀로 돌아간다.
@@ -465,9 +472,15 @@ mod render_d3d11 {
         ) -> Result<(), PlayerError> {
             // appsink가 sysmem 프레임을 직접 받고 build_frame이 DYNAMIC plane
             // 텍스처로 memcpy한다. 포맷 목록 밖 디코더 출력은 playbin이 videoconvert를
-            // 자동 삽입해 목록 내 포맷으로 맞춘다.
+            // 자동 삽입해 목록 내 포맷으로 맞춘다. 8-bit(I420/YV12/NV12)에 더해
+            // 10-bit(I420_10LE 평면형, P010_10LE 반평면형)도 직접 수용한다 — 각각
+            // R16/RG16 DYNAMIC plane 텍스처로 memcpy되고 WR이 16-bit 컨테이너로
+            // 샘플한다(강등 videoconvert 회피).
             let caps = gstreamer::Caps::builder("video/x-raw")
-                .field("format", gstreamer::List::new(["I420", "YV12", "NV12"]))
+                .field(
+                    "format",
+                    gstreamer::List::new(["I420", "YV12", "NV12", "I420_10LE", "P010_10LE"]),
+                )
                 .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
                 .build();
             appsink.set_property("caps", &caps);

@@ -16,7 +16,11 @@ param(
     # tests\html\video_4k_grid_play.html with a SMALL grid and MORE decoder threads,
     # e.g.: -Page tests\html\video_4k_grid_play.html -Cols 2 -Rows 2 -DecoderThreads 6
     # (4K60 decode is ~8x a 1080p30 tile; a 20-core box fits about 4 such tiles).
-    [string] $Page = "tests\html\video_grid_6x6_play.html"
+    [string] $Page = "tests\html\video_grid_6x6_play.html",
+    # Optional video source (relative to the page, i.e. tests\html\). Appended as
+    # &src=<value> to the page URL. Empty = leave the page default unchanged. Used
+    # e.g. for 10-bit verification: -Src ../jellyfish-60-mbps-hd-hevc-10bit.mp4
+    [string] $Src = ""
 )
 
 # Launch the multi-<video> wall demo with the FINAL D3D11 per-pipeline upload recipe
@@ -74,6 +78,9 @@ if (-not $env:RUST_LOG) {
 }
 
 $url = "file:///" + ($pagePath -replace '\\', '/') + "?cols=$Cols&rows=$Rows"
+if ($Src -ne "") {
+    $url += "&src=" + [Uri]::EscapeDataString($Src)
+}
 
 Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads)"
 Write-Host "Log: $logPath"

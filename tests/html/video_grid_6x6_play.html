@@ -74,7 +74,11 @@
   const COLS = clampInt(params.get("cols"), gridN);
   const ROWS = clampInt(params.get("rows"), gridN);
   const TILE_COUNT = COLS * ROWS;
-  const SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  // 소스는 선택적으로 ?src=<상대경로>로 교체 가능(기본값 불변). 10-bit 검증 등
+  // 다른 파일을 붙일 때 쓴다. 경로는 이 페이지(tests/html/) 기준 상대 경로.
+  const DEFAULT_SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  const srcParam = params.get("src");
+  const SRC = (srcParam && srcParam.trim()) ? srcParam.trim() : DEFAULT_SRC;
   document.title = COLS + "x" + ROWS + " Video Wall";
 
   const grid = document.getElementById("grid");
