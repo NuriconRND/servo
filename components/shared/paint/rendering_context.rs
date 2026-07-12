@@ -38,6 +38,18 @@ use winapi::shared::winerror;
 use wio::com::ComPtr;
 use webrender_api::units::{DeviceIntRect, DevicePixel};
 
+/// A GL texture created by wrapping a D3D11 texture via `EGL_ANGLE_image_d3d11_texture`
+/// (media D3D11 interop for WR YUV direct sampling). Returned by
+/// [`RenderingContext::wrap_d3d11_texture_as_gl_texture`] and consumed by
+/// [`RenderingContext::destroy_d3d11_gl_wrap`] to tear the wrap down again.
+#[derive(Clone, Copy, Debug)]
+pub struct D3d11GlWrappedTexture {
+    /// The `EGLImage` backing `gl_texture`, encoded as `usize` (opaque handle).
+    pub egl_image: usize,
+    /// The GL texture name that samples the wrapped D3D11 texture.
+    pub gl_texture: u32,
+}
+
 /// The `RenderingContext` trait defines a set of methods for managing
 /// an OpenGL or GLES rendering context.
 /// Implementors of this trait are responsible for handling the creation,
@@ -97,6 +109,43 @@ pub trait RenderingContext {
         _size: UntypedSize2D<i32>,
     ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         None
+    }
+    /// AddRef된 프로세스 전역 `ID3D11Device` 포인터를 `usize`로 인코딩해 반환한다. 미디어
+    /// D3D11 인터롭(WR YUV 직접 샘플)이 이 값을 전역 레지스트리에 저장해 프로세스 수명
+    /// 동안 유지하므로, 호출자는 반환값을 Release하지 않는다(의도적인 프로세스 수명 누수).
+    /// Default `None`; only the surfman/ANGLE (Windows) backend implements it.
+    fn media_d3d11_device_handle(&self) -> Option<usize> {
+        None
+    }
+    /// DYNAMIC D3D11 텍스처를 `WRITE_DISCARD`로 매핑한다. 반환은 (데이터 포인터,
+    /// RowPitch). **렌더러(ANGLE GL 호출) 스레드에서만 호출.** Default `None`.
+    fn map_d3d11_dynamic_texture(&self, _texture: usize) -> Option<(usize, u32)> {
+        None
+    }
+    /// [`RenderingContext::map_d3d11_dynamic_texture`]의 짝. Default no-op.
+    fn unmap_d3d11_texture(&self, _texture: usize) {}
+    /// D3D11 텍스처(이 컨텍스트의 디바이스 소속)를 EGLImage로 GL 텍스처에 바인딩한다
+    /// (`EGL_ANGLE_image_d3d11_texture`). Default `None`.
+    fn wrap_d3d11_texture_as_gl_texture(&self, _texture: usize) -> Option<D3d11GlWrappedTexture> {
+        None
+    }
+    /// [`RenderingContext::wrap_d3d11_texture_as_gl_texture`]의 짝. Default no-op.
+    fn destroy_d3d11_gl_wrap(&self, _wrap: D3d11GlWrappedTexture) {}
+    /// D3D11 텍스처에 대해 `IUnknown::Release`를 호출한다(공유 텍스처 링 해체용).
+    /// Default no-op.
+    fn release_d3d11_texture(&self, _texture: usize) {}
+    /// Copy `rows` rows of `row_bytes` bytes each from `src` into a mapped D3D11
+    /// texture at `dst_ptr` honoring `dst_pitch`. Safe wrapper for callers that
+    /// forbid unsafe code; the caller guarantees dst is a live mapping from
+    /// map_d3d11_dynamic_texture with pitch `dst_pitch` and at least `rows` rows.
+    fn copy_rows_to_mapped(
+        &self,
+        _dst_ptr: usize,
+        _dst_pitch: u32,
+        _src: &[u8],
+        _row_bytes: usize,
+        _rows: usize,
+    ) {
     }
     /// The connection to the display server for WebGL. Default to `None`.
     fn connection(&self) -> Option<Connection> {
@@ -479,6 +528,163 @@ impl SurfmanRenderingContext {
         }
     }
 
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn media_d3d11_device_handle(&self) -> Option<usize> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let ptr = self.device.borrow().d3d11_device_ptr();
+            if ptr.is_null() {
+                return None;
+            }
+            // 전역 레지스트리에 저장되므로 AddRef (프로세스 수명 — Release 안 함).
+            unsafe {
+                (*(ptr as *mut winapi::um::unknwnbase::IUnknown)).AddRef();
+            }
+            Some(ptr as usize)
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        None
+    }
+
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = self.device.borrow();
+            match unsafe { device.map_d3d11_dynamic_texture(texture as *mut _) } {
+                Ok((ptr, pitch)) => Some((ptr as usize, pitch)),
+                Err(error) => {
+                    warn!("media D3D11 interop: map_d3d11_dynamic_texture failed: {error:?}");
+                    None
+                },
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = texture;
+            None
+        }
+    }
+
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn unmap_d3d11_texture(&self, texture: usize) {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = self.device.borrow();
+            unsafe {
+                device.unmap_d3d11_texture(texture as *mut _);
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = texture;
+        }
+    }
+
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn wrap_d3d11_texture_as_gl_texture(&self, texture: usize) -> Option<D3d11GlWrappedTexture> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &mut self.context.borrow_mut();
+            match unsafe { device.create_gl_texture_from_d3d11_texture(context, texture as *mut _) }
+            {
+                Ok((egl_image, gl_texture)) => Some(D3d11GlWrappedTexture {
+                    egl_image,
+                    gl_texture,
+                }),
+                Err(error) => {
+                    warn!(
+                        "media D3D11 interop: create_gl_texture_from_d3d11_texture failed: {error:?}"
+                    );
+                    None
+                },
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = texture;
+            None
+        }
+    }
+
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn destroy_d3d11_gl_wrap(&self, wrap: D3d11GlWrappedTexture) {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &mut self.context.borrow_mut();
+            unsafe {
+                device.destroy_gl_texture_and_egl_image(context, wrap.egl_image, wrap.gl_texture);
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = wrap;
+        }
+    }
+
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn release_d3d11_texture(&self, texture: usize) {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            if texture == 0 {
+                return;
+            }
+            unsafe {
+                (*(texture as *mut winapi::um::unknwnbase::IUnknown)).Release();
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = texture;
+        }
+    }
+
+    /// See [`RenderingContext::copy_rows_to_mapped`]. Does not need surfman: this is
+    /// plain pointer arithmetic over a caller-owned mapping.
+    #[expect(unsafe_code)]
+    fn copy_rows_to_mapped(
+        &self,
+        dst_ptr: usize,
+        dst_pitch: u32,
+        src: &[u8],
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        if dst_ptr == 0 {
+            warn!("copy_rows_to_mapped: null dst_ptr");
+            return;
+        }
+        if row_bytes > dst_pitch as usize {
+            warn!("copy_rows_to_mapped: row_bytes ({row_bytes}) exceeds dst_pitch ({dst_pitch})");
+            return;
+        }
+        let Some(required) = row_bytes.checked_mul(rows) else {
+            warn!("copy_rows_to_mapped: row_bytes * rows overflowed");
+            return;
+        };
+        if src.len() < required {
+            warn!(
+                "copy_rows_to_mapped: src too small ({} bytes < {required} required)",
+                src.len()
+            );
+            return;
+        }
+        let dst_pitch = dst_pitch as usize;
+        for row in 0..rows {
+            let src_start = row * row_bytes;
+            let src_row = &src[src_start..src_start + row_bytes];
+            // SAFETY: the caller guarantees `dst_ptr` is a live mapping returned by
+            // `map_d3d11_dynamic_texture` with pitch `dst_pitch`, valid for at least
+            // `rows` rows; `src_row` bounds were validated above.
+            unsafe {
+                let dst_row = (dst_ptr as *mut u8).add(row * dst_pitch);
+                std::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, row_bytes);
+            }
+        }
+    }
+
     fn connection(&self) -> Option<Connection> {
         Some(self.device.borrow().connection())
     }
@@ -605,6 +811,44 @@ impl RenderingContext for SoftwareRenderingContext {
     ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         self.surfman_rendering_info
             .create_texture_from_shared_handle(handle, size)
+    }
+
+    fn media_d3d11_device_handle(&self) -> Option<usize> {
+        self.surfman_rendering_info.media_d3d11_device_handle()
+    }
+
+    fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
+        self.surfman_rendering_info
+            .map_d3d11_dynamic_texture(texture)
+    }
+
+    fn unmap_d3d11_texture(&self, texture: usize) {
+        self.surfman_rendering_info.unmap_d3d11_texture(texture)
+    }
+
+    fn wrap_d3d11_texture_as_gl_texture(&self, texture: usize) -> Option<D3d11GlWrappedTexture> {
+        self.surfman_rendering_info
+            .wrap_d3d11_texture_as_gl_texture(texture)
+    }
+
+    fn destroy_d3d11_gl_wrap(&self, wrap: D3d11GlWrappedTexture) {
+        self.surfman_rendering_info.destroy_d3d11_gl_wrap(wrap)
+    }
+
+    fn release_d3d11_texture(&self, texture: usize) {
+        self.surfman_rendering_info.release_d3d11_texture(texture)
+    }
+
+    fn copy_rows_to_mapped(
+        &self,
+        dst_ptr: usize,
+        dst_pitch: u32,
+        src: &[u8],
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        self.surfman_rendering_info
+            .copy_rows_to_mapped(dst_ptr, dst_pitch, src, row_bytes, rows)
     }
 
     fn connection(&self) -> Option<Connection> {
@@ -838,6 +1082,43 @@ impl RenderingContext for WindowRenderingContext {
     ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         self.surfman_context
             .create_texture_from_shared_handle(handle, size)
+    }
+
+    fn media_d3d11_device_handle(&self) -> Option<usize> {
+        self.surfman_context.media_d3d11_device_handle()
+    }
+
+    fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
+        self.surfman_context.map_d3d11_dynamic_texture(texture)
+    }
+
+    fn unmap_d3d11_texture(&self, texture: usize) {
+        self.surfman_context.unmap_d3d11_texture(texture)
+    }
+
+    fn wrap_d3d11_texture_as_gl_texture(&self, texture: usize) -> Option<D3d11GlWrappedTexture> {
+        self.surfman_context
+            .wrap_d3d11_texture_as_gl_texture(texture)
+    }
+
+    fn destroy_d3d11_gl_wrap(&self, wrap: D3d11GlWrappedTexture) {
+        self.surfman_context.destroy_d3d11_gl_wrap(wrap)
+    }
+
+    fn release_d3d11_texture(&self, texture: usize) {
+        self.surfman_context.release_d3d11_texture(texture)
+    }
+
+    fn copy_rows_to_mapped(
+        &self,
+        dst_ptr: usize,
+        dst_pitch: u32,
+        src: &[u8],
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        self.surfman_context
+            .copy_rows_to_mapped(dst_ptr, dst_pitch, src, row_bytes, rows)
     }
 
     fn connection(&self) -> Option<Connection> {
@@ -1173,6 +1454,43 @@ impl RenderingContext for OffscreenRenderingContext {
     ) -> Option<(SurfaceTexture, u32, UntypedSize2D<i32>)> {
         self.parent_context
             .create_texture_from_shared_handle(handle, size)
+    }
+
+    fn media_d3d11_device_handle(&self) -> Option<usize> {
+        self.parent_context.media_d3d11_device_handle()
+    }
+
+    fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
+        self.parent_context.map_d3d11_dynamic_texture(texture)
+    }
+
+    fn unmap_d3d11_texture(&self, texture: usize) {
+        self.parent_context.unmap_d3d11_texture(texture)
+    }
+
+    fn wrap_d3d11_texture_as_gl_texture(&self, texture: usize) -> Option<D3d11GlWrappedTexture> {
+        self.parent_context
+            .wrap_d3d11_texture_as_gl_texture(texture)
+    }
+
+    fn destroy_d3d11_gl_wrap(&self, wrap: D3d11GlWrappedTexture) {
+        self.parent_context.destroy_d3d11_gl_wrap(wrap)
+    }
+
+    fn release_d3d11_texture(&self, texture: usize) {
+        self.parent_context.release_d3d11_texture(texture)
+    }
+
+    fn copy_rows_to_mapped(
+        &self,
+        dst_ptr: usize,
+        dst_pitch: u32,
+        src: &[u8],
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        self.parent_context
+            .copy_rows_to_mapped(dst_ptr, dst_pitch, src, row_bytes, rows)
     }
 
     fn connection(&self) -> Option<Connection> {

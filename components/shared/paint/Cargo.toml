@@ -49,5 +49,5 @@ tracing = { workspace = true, optional = true }
 webrender_api = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { workspace = true, features = ["dxgi", "winerror"] }
+winapi = { workspace = true, features = ["dxgi", "unknwnbase", "winerror"] }
 wio = { workspace = true }
