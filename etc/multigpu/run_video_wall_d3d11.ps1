@@ -120,7 +120,11 @@ public class ServoWallWnd {
 }
 
 # Sanity markers from the first seconds of the log.
-$d3d11  = (Select-String -Path $logPath -Pattern "GPU " -SimpleMatch -ErrorAction SilentlyContinue | Measure-Object).Count
+# Task 5 rewrote the producer: the per-tile activation line is now
+# "D3D11 video: plane 링 프로듀서 경로 활성 (profile_id=N)". Match the ASCII token
+# "profile_id=" (unique to that line, one per pipeline) so Select-String does not
+# depend on the log's UTF-8 Korean bytes decoding correctly under Windows PowerShell.
+$d3d11  = (Select-String -Path $logPath -Pattern "profile_id=" -SimpleMatch -ErrorAction SilentlyContinue | Measure-Object).Count
 $direct = (Select-String -Path $logPath -Pattern "direct file playback" -ErrorAction SilentlyContinue | Measure-Object).Count
 Write-Host "PID=$($proc.Id) d3d11_active_markers=$d3d11 direct_file=$direct (expect $tiles each)"
 if ($direct -lt $tiles) {
