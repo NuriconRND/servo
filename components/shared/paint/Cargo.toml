@@ -51,3 +51,25 @@ webrender_api = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { workspace = true, features = ["dxgi", "unknwnbase", "winerror"] }
 wio = { workspace = true }
+
+# d3d11_dyn_poc 예제(§6 PoC 게이트) 전용 — 창 생성(winuser 등)과 D3D11 텍스처 생성에
+# 필요한 winapi 기능을 추가한다. dev-dependency의 기능은 위 [dependencies] 항목과
+# 합쳐진다(같은 크레이트).
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+env_logger = { workspace = true }
+winapi = { workspace = true, features = [
+    "basetsd",
+    "d3d11",
+    "d3dcommon",
+    "dxgiformat",
+    "dxgitype",
+    "libloaderapi",
+    "limits",
+    "minwinbase",
+    "minwindef",
+    "vadefs",
+    "windef",
+    "wingdi",
+    "winnt",
+    "winuser",
+] }

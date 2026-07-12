@@ -8594,6 +8594,7 @@ dependencies = [
  "bitflags 2.11.1",
  "crossbeam-channel",
  "dpi",
+ "env_logger",
  "euclid",
  "gleam",
  "glow",
