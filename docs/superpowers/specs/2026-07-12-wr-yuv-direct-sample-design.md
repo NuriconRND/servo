@@ -155,10 +155,11 @@ Unmap/re-Map만).
 
 ### 4.5 포맷·컬러·방향
 
-- 지원: I420/YV12/NV12 (8-bit). appsink caps 목록에서 P010_10LE 제거 —
-  10-bit 소스는 playbin이 videoconvert로 8-bit 강등 (현 콘텐츠 전부 8-bit).
-  ANGLE은 R16/RG16도 검증 목록에 있어 후속 확장 길은 열려 있음
-  (Renderer11.cpp:1578-1579).
+- 지원: I420/YV12/NV12 (8-bit). **후속 확장(§11, 2026-07-13): I420_10LE(평면형)/
+  P010_10LE(반평면형) 10-bit도 직접 지원**. 이 절의 원래 서술("P010_10LE 제거,
+  videoconvert 8-bit 강등")은 8-bit 전용 결정 당시 기준이며 §11이 대체한다.
+  ANGLE이 R16/RG16을 client-buffer 검증 목록에 두어 열어 둔 그 문(Renderer11.cpp:
+  1576-1579)을 §11이 실제로 사용한다.
 - YV12: WR `YuvData::PlanarYCbCr`는 Y,Cb,Cr 순서 — external ID 매핑에서
   U/V plane 스왑 (§3-n 변환기가 하던 스왑의 이전).
 - Colorimetry: gst caps → `VideoFrameYuvColorSpace/Range` 매핑은 기존 raw
@@ -267,7 +268,8 @@ Unmap/re-Map만).
 
 ## 9. 비범위
 
-- P010/10-bit 표시 (videoconvert 강등으로 정확성은 유지)
+- ~~P010/10-bit 표시 (videoconvert 강등으로 정확성은 유지)~~ → **범위 편입,
+  §11에서 구현·검증 (2026-07-13). 이 항목은 더 이상 비범위가 아니다.**
 - HW 디코드 (사용자 보류 선언)
 - probe A/B 실행 (사용자 판단, 구현 비차단)
 - raw Buffer 경로(`SERVO_MEDIA_D3D11_VIDEO` off) 개선
@@ -332,3 +334,83 @@ Unmap/re-Map만).
 소비자가 스테이징 복사 후 슬롯0을 재-Unmap하고 커밋 `mapped`에서 제외(첫 Advance
 재-Map이 정상 성공). 부수로 재제시 의미론·`ring_epoch` vestigial·멀티GPU 단일
 디바이스 현실을 주석/스펙에 반영. d3d11_ring 회귀 테스트 포함(11개 green).
+
+## 11. 10-bit YUV 지원 (2026-07-13 후속)
+
+§4.5·§9가 비범위로 남겨 둔 10-bit 표시를 A-dyn 경로 위에 그대로 얹었다. 8-bit
+경로와 구조는 동일하고, plane 텍스처만 16-bit 컨테이너(R16/RG16)로 바뀌며 WR이
+`ColorDepth`로 재정규화한다. 두 계열을 모두 지원한다:
+
+- **I420_10LE** (평면형, SW 디코더 다수 출력): 10-bit 코드가 16-bit 워드의
+  **하위** 10비트. 3× R16 plane, row_bytes = texel_width × 2.
+- **P010_10LE** (반평면형, HW/videoconvert 계열): 10-bit 코드가 16-bit 워드의
+  **상위** 비트(v<<6). R16 Y + R16G16 UV, UV row_bytes = ceil(w/2) × 4.
+
+### 11.1 ★ColorDepth 결정 (WR 셰이더에서 유도)★
+
+10-bit-in-16-bit 텍스처는 UNORM16으로 샘플된다(GPU가 stored_u16/65535 반환).
+정규화를 되돌리는 값이 `ColorDepth`이며, 근거는 `webrender-0.68.0`의
+`res/yuv.glsl::get_yuv_color_info` + `webrender_api-0.68.0/src/image.rs`
+(`ColorDepth::rescaling_factor`)에서 직접 유도했다 (2026-07-13 소스 확인):
+
+| 셰이더 분기 | 조건 | channel_max | narrow 엔드포인트 |
+|---|---|---|---|
+| non-P010 >8bpc (LSB) | `bit_depth>8 && format!=P010` | `65535` | `(16,128,235,240)<<(bit_depth-8)` |
+| P010 (MSB) | `format==P010` | `(1<<bit_depth)-1` | 동상 |
+
+- **I420_10LE → `ColorDepth::Color10` + `YuvData::PlanarYCbCr`**. 샘플 = code/65535
+  (하위 비트). LSB 분기(channel_max=65535)에서 bit_depth=10이면 엔드포인트
+  one_y = 235<<2 / 65535 = 940/65535 = 샘플과 **정확히 일치**. (문서상 ×64 재정규화;
+  `rescaling_factor(Color10)=64.0`, SWGL `vRescaleFactor=16-10=6`과 정합.)
+- **P010_10LE → `ColorDepth::Color16` + `YuvData::P010`**. 샘플 = code*64/65535
+  (상위 비트). P010 MSB 분기에서 bit_depth=16이면 channel_max=(1<<16)-1=65535,
+  엔드포인트 one_y = 235<<8 / 65535 = 60160/65535 = 샘플과 **정확히 일치**
+  (`rescaling_factor(Color16)=1.0` — MSB는 이미 정규화, 셰이더 주석
+  "MSB HDR formats don't need renormalization"). Color10로 잘못 주면 채널맥스
+  1023으로 나눠 ~0.1% 편차. **오선택은 64×/무재정규화로 명확히 밝기 붕괴 →
+  실기 스크린샷으로 즉시 검출됨.**
+
+`P010`은 WR `YuvFormat`에서 NV12와 별도 값(1)이라 셰이더 MSB 분기 선택에 반드시
+필요 → `MediaFrameYuvFormat::P010` 변형을 신규 추가해 display list가
+`YuvData::P010`을 발행한다(NV12로 매핑하면 LSB 취급되어 어두워짐).
+
+### 11.2 변경 파일
+
+- `player/video.rs`: `VideoFrameYuvFormat`에 `I420_10`/`P010` 추가, `plane_count`.
+- `player/d3d11_ring.rs`: `RingPlaneFormat`에 `R16`/`Rg16` 추가(레지스트리는
+  포맷 불투명 — 그 외 무변경).
+- `render-d3d11/ring_producer.rs`: `plane_geoms`(16-bit row_bytes)+텍스처 DXGI
+  포맷(R16_UNORM/R16G16_UNORM). plane_geoms 단위 테스트에 두 10-bit 포맷 추가
+  (짝수/홀수 폭).
+- `render-d3d11/lib.rs`: appsink caps에 `I420_10LE`/`P010_10LE` 추가, build_frame
+  포맷 매치(`I42010le`/`P01010le`), 협상 포맷 info 로그(`gst=... -> ...`).
+- `htmlmediaelement.rs`: `d3d11_yuv_plane_dims`(R16/RG16), `media_frame_yuv_format`
+  /`wr_color_depth` 헬퍼(§11.1), 3-plane 판정을 `plane_count()==3`으로.
+- `shared/layout/lib.rs` + `layout/display_list/mod.rs`: `MediaFrameYuvFormat::P010`
+  → `wr::YuvData::P010`.
+- `render.rs`(raw 경로): 10-bit arm은 `return None`(도달 불가 — raw는 8-bit만).
+- 테스트 페이지 `video_grid_6x6_play.html`: 선택적 `?src=` 파라미터(기본값 불변).
+  런처 `run_video_wall_d3d11.ps1`: 선택적 `-Src`(빈 값이면 URL 무변경).
+
+### 11.3 미디어 스레드/EGLImage 무변경
+
+`create_gl_texture_from_d3d11_texture`(surfman ANGLE)는 `EGL_D3D11_TEXTURE_ANGLE`로
+D3D11 텍스처의 DXGI 포맷에서 GL 포맷을 자동 유도하므로 R8/R16 무관 — 미디어
+스레드 lock/wrap 경로는 손대지 않았다. WR은 external `TextureHandle`을 통해 GL
+텍스처를 직접 샘플하고, ImageFormat(R16/RG16)은 descriptor로만 전달된다.
+
+### 11.4 검증 결과 (2026-07-13, RTX A5000)
+
+| 항목 | 결과 |
+|---|---|
+| 크레이트 테스트 | `servo-media-gstreamer-render-d3d11` 4/4(신규 10-bit plane_geoms 포함), `servo-media-player d3d11_ring` 11/11 무회귀 |
+| 전체 빌드 | `mach build --release` EXIT 0 |
+| 라이브 10-bit(1×1) | jellyfish HEVC 10-bit 협상 = `gst=I42010le -> I420_10`(강등 없음). 선명한 주황/호박색 해파리 + 짙은 청색 물 — 워시아웃/암전(ColorDepth 오선택) 없음, 녹/보라 틴트(plane 스왑) 없음, 상하 정방향. missing-plugin 0 |
+| 8-bit 회귀(2×2) | 4/4 마커, 4링 전부 `gst=I420 -> I420`, lockstep(동일 프레임 578) 유지, 색 정확, 에러 0 |
+| 증거 | `.superpowers/sdd/evidence/10bit_i420_10le_1x1.png`, `8bit_regression_2x2.png` |
+
+**P010 경로 잔여**: 이번 실기의 SW HEVC 디코더는 I420_10LE(평면형)를 내보내
+P010(반평면형) 경로는 라이브로 트리거되지 않았다(HW 디코드/특정 videoconvert
+계열에서 등장). P010은 소스 유도 ColorDepth(§11.1) + plane_geoms 단위 테스트
+(짝수/홀수) + 컴파일/배선(YuvData::P010 발행)으로만 검증됨 — I420_10LE와 대칭
+구조라 정합성은 높으나 픽셀 레벨 실기 검증은 미완(수용 리스크).
