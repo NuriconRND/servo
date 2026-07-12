@@ -127,6 +127,8 @@ mod render_d3d11 {
         drop_count: u64,
         /// 소비자 디바이스 미발행 경고 1회 래치(파이프라인당).
         warned_no_device: bool,
+        /// gst 버퍼 map 실패 경고 1회 래치(파이프라인당) — 로그 폭주 방지.
+        warned_map_fail: bool,
     }
 
     pub struct RenderD3D11 {
@@ -157,6 +159,7 @@ mod render_d3d11 {
                     ring_never_consumed: true,
                     drop_count: 0,
                     warned_no_device: false,
+                    warned_map_fail: false,
                 }),
                 profile_id,
             })
@@ -317,8 +320,56 @@ mod render_d3d11 {
 
             // 여기서만 gst 버퍼를 readable로 map한다 — 바이트는 아래에서 즉시
             // 슬롯으로 복사되고 build_frame 반환과 함께 샘플이 풀로 돌아간다.
+            // map 실패(일시적 gst 버퍼 오류)는 배압 arm(위 None arm)과 동일한
+            // 위험을 가진다: 여기서 None을 반환하면 appsink 콜백(player.rs
+            // render_sample)이 치명적 FlowError::Error로 바꾸고 그 -5가 상류
+            // qtdemux_loop를 중단시켜 파이프라인 전체가 정지한다(bf70293c4와
+            // 같은 계열의 잔여 경로, Task8 리뷰에서 지목). 링이 이미 한 번
+            // 이상 소비돼 유효한 Presenting 슬롯이 있다면(ring_never_consumed
+            // == false) 새 프레임 복사를 생략하고 기존 슬롯을 그대로 재표시해
+            // 스트림을 유지한다. 아직 한 번도 소비되지 않았다면(startup) 재표시할
+            // 슬롯이 없으므로 기존 동작대로 None을 반환한다(startup-window
+            // 잔여 경로 — 의도적으로 미변경).
             let frame =
-                gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
+                match gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info) {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        if state.ring_never_consumed {
+                            return None;
+                        }
+                        state.drop_count += 1;
+                        if !state.warned_map_fail {
+                            log::warn!(
+                                "D3D11 video: gst 버퍼 map 실패 — 기존 Presenting 슬롯 재표시로 폴백 (id={})",
+                                self.profile_id
+                            );
+                            state.warned_map_fail = true;
+                        }
+                        if prof {
+                            log::warn!(
+                                "D3D11PROF mapfail id={} ring={ring_id} drops={} regdrops={}",
+                                self.profile_id,
+                                state.drop_count,
+                                D3d11PlaneRings::dropped_frames(ring_id),
+                            );
+                        }
+                        // 아래와 동일한 메타데이터 프레임을 즉시 반환 — 새 프레임
+                        // 복사 없이 재표시로 스트림 유지(배압 arm과 동형).
+                        return VideoFrame::new(
+                            width,
+                            height,
+                            Arc::new(D3D11YuvFrameBuffer {
+                                data: VideoFrameD3D11YuvData {
+                                    ring_id,
+                                    ring_epoch: 1,
+                                    format,
+                                    color_space,
+                                    color_range,
+                                },
+                            }),
+                        );
+                    },
+                };
 
             let claim_start = std::time::Instant::now(); // D3D11PROF
             match D3d11PlaneRings::claim_free_slot(ring_id) {
