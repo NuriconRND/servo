@@ -24,7 +24,8 @@
 //! - FREE 슬롯이 없는 프로듀서는 memcpy 전에 프레임을 드롭한다(카운터만 증가).
 //! - 최초 구간(전 슬롯 Unmapped)에는 프로듀서가 [`stage_first_frame`]으로
 //!   첫 프레임 바이트를 CPU에 스테이징해 두고, 첫 소비 시
-//!   [`ConsumePlan::InitialMapAll`]로 전 슬롯을 한 번에 Map한다.
+//!   [`ConsumePlan::InitialMapAll`]로 전 슬롯을 한 번에 Map한다(슬롯 0은
+//!   스테이징 복사 후 다시 Unmap해 Presenting=unmapped 불변식을 지킨다).
 //!
 //! [`stage_first_frame`]: D3d11PlaneRings::stage_first_frame
 
@@ -106,23 +107,26 @@ pub struct RemappedPlane {
 /// 영구히 사라짐).
 ///
 /// 실패 시 무엇을 커밋해야 하는지(`ConsumeCommit` 기준):
-/// - `InitialMapAll`: Map에 실패한 plane은 `mapped: Vec<RemappedPlane>`에서
-///   빼고, 성공한 plane만 담아 커밋한다. 심지어 전부 실패했다면
-///   `mapped: Vec::new()`로 커밋한다 — 그래도 슬롯 상태 전이(슬롯0→
-///   Presenting, 나머지→Free)는 일어나야 한다(그러지 않으면 링 전체가
-///   영원히 Unmapped로 wedge된다).
+/// - `InitialMapAll`: 슬롯 0의 plane은 스테이징 복사 후 다시 Unmap되므로
+///   설계상 `mapped`에서 제외한다(Presenting=unmapped 불변식). 슬롯 1..N에서
+///   Map에 실패한 plane도 `mapped: Vec<RemappedPlane>`에서 빼고, 성공한
+///   plane만 담아 커밋한다. 심지어 전부 실패했다면 `mapped: Vec::new()`로
+///   커밋한다 — 그래도 슬롯 상태 전이(슬롯0→Presenting, 나머지→Free)는
+///   일어나야 한다(그러지 않으면 링 전체가 영원히 Unmapped로 wedge된다).
 /// - `Advance`: 재-Map(WRITE_DISCARD)에 실패한 텍스처는 `remapped`에서
 ///   빼고 커밋한다(`remapped: Vec::new()`도 유효한 커밋이다). `filled_slot`
 ///   은 plan에서 받은 값을 그대로 되돌려주면 된다(성공/실패와 무관한
-///   검증용 필드). 재-Map 실패 슬롯도 Free로는 전이되지만 `mapped`
-///   포인터는 갱신되지 않은(낡은) 값으로 남으므로, 다음 claim 시 그
-///   포인터로 memcpy하면 이미 Unmap된 메모리에 쓰게 될 수 있다는 점에
-///   유의해 Task 6 쪽에서 재시도/스킵을 처리해야 한다.
+///   검증용 필드). 재-Map 실패 plane은 슬롯이 Free로 전이되기 전에
+///   레지스트리가 그 `mapped` 포인터를 None으로 무효화하므로(낡은 포인터가
+///   이미 Unmap된 메모리를 가리키는 것을 원천 차단), 다음 claim은 그 plane을
+///   건너뛰고 copy도 스킵한다 — 스테일-내용이지만 안전한 프레임이 된다.
 #[derive(Clone, Debug)]
 pub enum ConsumePlan {
     /// 최초 소비: 전 슬롯이 아직 Unmapped다. 소비자는 전 슬롯의 모든
-    /// plane을 Map하고, `staged`가 있으면 그 바이트를 슬롯 0에 복사한
-    /// 뒤 슬롯 0을 Presenting으로 커밋해야 한다.
+    /// plane을 Map하고, `staged`가 있으면 그 바이트를 슬롯 0에 복사한 뒤
+    /// 슬롯 0을 다시 Unmap하고(Presenting=unmapped 불변식) 슬롯 0의 plane을
+    /// 커밋 `mapped`에서 제외해야 한다 — 커밋 후 슬롯 0 = Presenting(unmapped),
+    /// 슬롯 1..N = Free(mapped)로 확정된다.
     InitialMapAll {
         slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT],
         staged: Option<Vec<Vec<u8>>>,
@@ -144,8 +148,9 @@ pub enum ConsumePlan {
 /// Map 호출들의 결과(텍스처→(ptr,pitch))를 담는다.
 #[derive(Clone, Debug)]
 pub enum ConsumeCommit {
-    /// `mapped`는 전 슬롯(SLOT_COUNT×MAX_PLANES 이하)의 Map 결과. 커밋 후
-    /// 슬롯 0 = Presenting, 나머지 = Free로 확정된다.
+    /// `mapped`는 슬롯 1..N의 Map 결과(슬롯 0은 스테이징 복사 후 다시 Unmap
+    /// 되므로 제외 — Presenting=unmapped 불변식). 커밋 후 슬롯 0 = Presenting,
+    /// 나머지 = Free로 확정된다.
     InitialMapAll { mapped: Vec<RemappedPlane> },
     /// `remapped`는 이전 Presenting 슬롯 plane들의 Map(DISCARD) 결과.
     /// `filled_slot`은 계획에서 받은 값을 그대로 되돌려주는 검증용 필드.
@@ -585,6 +590,10 @@ impl D3d11PlaneRings {
                     return;
                 }
 
+                // 재-Map(WRITE_DISCARD)에 성공한 텍스처 집합. 여기 없는 plane은
+                // 재-Map 실패라 낡은 mapped 포인터가 이미 Unmap된 메모리를 가리킨다.
+                let remapped_textures: Vec<usize> = remapped.iter().map(|r| r.texture).collect();
+
                 for RemappedPlane {
                     texture,
                     data_ptr,
@@ -601,6 +610,21 @@ impl D3d11PlaneRings {
                             .position(|p| p.map(|d| d.texture) == Some(texture))
                         {
                             ring.slots[idx].mapped[plane_idx] = Some((data_ptr, row_pitch));
+                        }
+                    }
+                }
+                // 재-Map 실패 plane의 스테일 포인터 무효화: remapped에 없는 Remapping
+                // 슬롯 plane의 mapped를 Free 전이 전에 None으로 지운다. 그러지 않으면
+                // claim_free_slot이 이미 Unmap된 VA를 가리키는 낡은 포인터를 프로듀서
+                // 에게 건네 그 위로 memcpy(UB)한다. claim_free_slot은 mapped=None인
+                // plane을 건너뛰고 copy_planes도 그 plane을 스킵하므로, 스테일-내용
+                // 이지만 안전한 프레임이 나간다.
+                for &idx in &remapping_slots {
+                    for plane_idx in 0..MAX_PLANES {
+                        if let Some(desc) = ring.slots[idx].planes[plane_idx] {
+                            if !remapped_textures.contains(&desc.texture) {
+                                ring.slots[idx].mapped[plane_idx] = None;
+                            }
                         }
                     }
                 }
@@ -668,9 +692,11 @@ mod tests {
         })
     }
 
-    /// 초기 InitialMapAll 컨슘을 흉내내 링을 "워밍업"한다: 전 슬롯 Map,
-    /// 슬롯0을 Presenting으로 커밋한다. 반환값은 각 (slot,plane) 텍스처에
-    /// 부여된 가짜 data_ptr 맵(검증용).
+    /// 초기 InitialMapAll 컨슘을 흉내내 링을 "워밍업"한다: 슬롯 1..N을 Map,
+    /// 슬롯0을 Presenting으로 커밋한다. 실제 consume_plan과 마찬가지로 슬롯0의
+    /// plane은 스테이징 복사 후 다시 Unmap되므로 `mapped`에서 제외한다
+    /// (Presenting=unmapped 불변식). 반환값은 매핑된 (slot,plane) 텍스처의 가짜
+    /// data_ptr 맵(검증용, 슬롯0 제외).
     fn warm_up(
         ring_id: u64,
         slots: &[[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT],
@@ -687,7 +713,11 @@ mod tests {
 
         let mut ptrs = std::collections::HashMap::new();
         let mut mapped = Vec::new();
-        for slot in plan_slots.iter() {
+        for (slot_idx, slot) in plan_slots.iter().enumerate() {
+            // 슬롯0은 unmapped로 커밋(Presenting=unmapped) — mapped에서 제외.
+            if slot_idx == 0 {
+                continue;
+            }
             for p in slot.iter().flatten() {
                 let ptr = p.texture * 100;
                 ptrs.insert(p.texture, ptr);
@@ -738,8 +768,13 @@ mod tests {
         assert_eq!(staged, Some(staged_bytes));
         assert_eq!(slots_texture_ids(&plan_slots), slots_texture_ids(&slots));
 
+        // 소비자(consume_plan)는 슬롯0을 스테이징 복사 후 다시 Unmap하고 커밋
+        // `mapped`에서 제외한다 — 슬롯0 = Presenting(unmapped), 슬롯1..N만 mapped.
         let mut mapped = Vec::new();
-        for slot in plan_slots.iter() {
+        for (slot_idx, slot) in plan_slots.iter().enumerate() {
+            if slot_idx == 0 {
+                continue;
+            }
             for p in slot.iter().flatten() {
                 mapped.push(RemappedPlane {
                     texture: p.texture,
@@ -751,13 +786,22 @@ mod tests {
         D3d11PlaneRings::commit_consume(ring_id, ConsumeCommit::InitialMapAll { mapped });
         D3d11PlaneRings::note_plane_unlock(ring_id);
 
+        // 슬롯0 = Presenting(unmapped): presenting_plane은 정적 텍스처 기술자를
+        // 반환하고(방향/크기용), 슬롯0은 절대 claim되지 않는다.
         let presenting = D3d11PlaneRings::presenting_plane(ring_id, 0).expect("slot0 plane0");
         assert_eq!(presenting.texture, slots[0][0].unwrap().texture);
 
-        // 나머지 슬롯들은 Free이므로 claim이 성공해야 하고, 슬롯0은 절대
-        // 반환되지 않는다(Presenting).
-        let claimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot available");
-        assert_ne!(claimed.slot, 0);
+        // 슬롯1..N = Free(mapped): 정확히 3개가 claim되고, 슬롯0은 절대 나오지
+        // 않으며, 각 슬롯의 plane은 커밋한 매핑 포인터(texture*100)를 싣는다.
+        let mut claimed_slots = Vec::new();
+        while let Some(c) = D3d11PlaneRings::claim_free_slot(ring_id) {
+            assert_ne!(c.slot, 0, "슬롯0(Presenting)은 claim되면 안 된다");
+            let p0 = c.planes[0].expect("claimed slot plane0 mapped");
+            assert_eq!(p0.data_ptr, slots[c.slot][0].unwrap().texture * 100);
+            claimed_slots.push(c.slot);
+        }
+        claimed_slots.sort();
+        assert_eq!(claimed_slots, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1251,5 +1295,100 @@ mod tests {
         let expected_texture = slots[0][0].unwrap().texture;
         assert_eq!(p0.data_ptr, expected_texture * 900);
         assert_ne!(p0.data_ptr, expected_texture * 12345);
+    }
+
+    /// Fix 2 회귀 테스트: 이미 Map된 적 있어 레지스트리에 낡은 mapped 포인터가
+    /// 남아 있는 Presenting 슬롯이 다음 Advance에서 Remapping이 됐다가 재-Map에
+    /// 실패하면(=해당 plane이 `remapped`에서 빠지면), Free로 전이하기 전에 그
+    /// plane의 mapped가 None으로 무효화돼야 한다. 그러지 않으면 claim이 이미
+    /// Unmap된 메모리를 가리키는 낡은 포인터를 프로듀서에게 건네 UB memcpy를
+    /// 유발한다. 재-Map에 성공한 plane은 새 포인터를 그대로 싣고, 실패한 plane은
+    /// claim에서 스킵(None)된다.
+    #[test]
+    fn advance_commit_with_missing_remapped_plane_clears_mapped_and_claim_skips_it() {
+        let slots = make_slots(12000);
+        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ptrs = warm_up(ring_id, &slots); // 슬롯0=Presenting(unmapped), 1~3=Free(mapped).
+
+        // --- Advance 1: 슬롯1을 소비해 Presenting으로 올린다. 소비자는 이때
+        // 슬롯1을 Unmap하지만 레지스트리는 워밍업 때의 낡은 mapped 포인터를 그대로
+        // 보유한다(다음 재-Map 실패 시 스테일이 될 값). ---
+        let c1 = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot1 free");
+        assert_eq!(c1.slot, 1);
+        D3d11PlaneRings::publish_slot(ring_id, 1);
+        let plan1 = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("advance1");
+        let ConsumePlan::Advance {
+            map: map1,
+            filled_slot: fs1,
+            ..
+        } = plan1
+        else {
+            panic!("expected Advance plan");
+        };
+        assert_eq!(fs1, 1);
+        let remapped1 = map1
+            .iter()
+            .map(|&t| RemappedPlane {
+                texture: t,
+                data_ptr: t * 200,
+                row_pitch: 256,
+            })
+            .collect();
+        D3d11PlaneRings::commit_consume(
+            ring_id,
+            ConsumeCommit::Advance {
+                filled_slot: fs1,
+                remapped: remapped1,
+            },
+        );
+        D3d11PlaneRings::note_plane_unlock(ring_id);
+        // 슬롯1은 지금 Presenting이고, 레지스트리 mapped는 워밍업 값(곧 스테일).
+        let stale_plane1_ptr = ptrs[&slots[1][1].unwrap().texture];
+
+        // --- Advance 2: 슬롯0을 소비해 Presenting으로 올리고 슬롯1을 Remapping
+        // 시킨다. 슬롯1 plane1의 재-Map은 실패했다고 가정해 remapped에서 뺀다. ---
+        let c2 = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot");
+        assert_eq!(c2.slot, 0); // Advance1로 Free가 된 old-presenting 슬롯0.
+        D3d11PlaneRings::publish_slot(ring_id, 0);
+        let plan2 = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("advance2");
+        let ConsumePlan::Advance {
+            map: map2,
+            filled_slot: fs2,
+            ..
+        } = plan2
+        else {
+            panic!("expected Advance plan");
+        };
+        assert_eq!(fs2, 0);
+        // map2 = 슬롯1의 두 plane 텍스처(이전 Presenting).
+        let good_texture = slots[1][0].unwrap().texture; // plane0: 재-Map 성공
+        let missing_texture = slots[1][1].unwrap().texture; // plane1: 재-Map 실패(누락)
+        assert!(map2.contains(&good_texture));
+        assert!(map2.contains(&missing_texture));
+        let remapped2 = vec![RemappedPlane {
+            texture: good_texture,
+            data_ptr: good_texture * 300,
+            row_pitch: 128,
+        }];
+        D3d11PlaneRings::commit_consume(
+            ring_id,
+            ConsumeCommit::Advance {
+                filled_slot: fs2,
+                remapped: remapped2,
+            },
+        );
+        D3d11PlaneRings::note_plane_unlock(ring_id);
+
+        // 슬롯1이 Free로 회귀 — claim이 슬롯1을 반환한다(슬롯0은 Presenting).
+        let reclaimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot1 freed");
+        assert_eq!(reclaimed.slot, 1);
+        // plane0: 재-Map 성공 → 새 포인터.
+        let p0 = reclaimed.planes[0].expect("plane0 remapped");
+        assert_eq!(p0.data_ptr, good_texture * 300);
+        // plane1: 재-Map 실패 → mapped=None으로 무효화(스테일 포인터 차단).
+        assert!(
+            reclaimed.planes[1].is_none(),
+            "재-Map 실패 plane은 None으로 무효화돼야 한다 (스테일 포인터 {stale_plane1_ptr}가 남으면 UB)"
+        );
     }
 }

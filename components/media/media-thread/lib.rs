@@ -409,8 +409,12 @@ impl WebRenderExternalImageApi for GLPlayerExternalImages {
 fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
     match plan {
         ConsumePlan::InitialMapAll { slots, staged } => {
-            // Map ALL slots' planes. Remember slot 0's successful maps so the
-            // staged first-frame bytes can be copied into them below.
+            // Map ALL slots' planes. Slot 0 is special: after copying the staged
+            // first-frame bytes into it we Unmap it again and EXCLUDE it from the
+            // commit's `mapped` vec, so slot 0 is committed as Presenting=unmapped
+            // (D3D11 leaves sampling of a still-mapped resource undefined). The
+            // first Advance then re-Maps slot 0 legitimately. Slots 1..N stay
+            // mapped and are committed Free.
             let mut mapped: Vec<RemappedPlane> = Vec::new();
             let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] = [None; MAX_PLANES];
             for (slot_idx, slot) in slots.iter().enumerate() {
@@ -420,13 +424,16 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
                     };
                     match rc.map_d3d11_dynamic_texture(desc.texture) {
                         Some((data_ptr, row_pitch)) => {
-                            mapped.push(RemappedPlane {
-                                texture: desc.texture,
-                                data_ptr,
-                                row_pitch,
-                            });
                             if slot_idx == 0 {
+                                // Remember for the staged copy + Unmap below; do NOT
+                                // publish slot 0's pointers to the registry.
                                 slot0_mapped[plane_idx] = Some((data_ptr, row_pitch, *desc));
+                            } else {
+                                mapped.push(RemappedPlane {
+                                    texture: desc.texture,
+                                    data_ptr,
+                                    row_pitch,
+                                });
                             }
                         },
                         None => {
@@ -451,6 +458,15 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
                         rc.copy_rows_to_mapped(data_ptr, row_pitch, src, desc.row_bytes, rows);
                     }
                 }
+            }
+            // Unmap slot 0 so it genuinely matches Presenting=unmapped. The commit
+            // below transitions slot 0 -> Presenting; sampling it while mapped is
+            // undefined, and the first Advance's re-Map of a still-mapped slot 0
+            // would fail (and ride the failed-remap path). Slot 0 is excluded from
+            // `mapped` above, so the registry records it unmapped too.
+            for slot0_plane in slot0_mapped.iter().flatten() {
+                let (_, _, desc) = slot0_plane;
+                rc.unmap_d3d11_texture(desc.texture);
             }
             D3d11PlaneRings::commit_consume(ring_id, ConsumeCommit::InitialMapAll { mapped });
         },
