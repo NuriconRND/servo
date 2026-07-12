@@ -61,8 +61,9 @@ impl VideoFrameYuvData {
 
 /// A-dyn 경로: plane DYNAMIC 링(레지스트리 `d3d11_ring`) 참조 + 표시
 /// 메타데이터. 슬롯 인덱스는 싣지 않는다 — 렌더러가 레지스트리에서 최신
-/// Filled를 소비한다(latest-wins). `ring_epoch`는 링 재생성(크기 변경)
-/// 세대 — 렌더러측 래핑 캐시 무효화에 쓴다.
+/// Filled를 소비한다(latest-wins). `ring_epoch`는 vestigial(항상 1) — 링
+/// 무효화(크기 변경 등)는 에폭 증가가 아니라 `ring_id` 신규 발급으로 처리한다
+/// (스펙 §10.3-②).
 #[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
 pub struct VideoFrameD3D11YuvData {
     pub ring_id: u64,

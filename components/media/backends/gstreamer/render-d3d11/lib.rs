@@ -123,7 +123,9 @@ mod render_d3d11 {
         /// 링이 아직 한 번도 소비되지 않음(전 슬롯 Unmapped, claim이 항상 None).
         /// true인 동안은 드롭 대신 첫 프레임을 스테이징한다.
         ring_never_consumed: bool,
-        /// 현재 링 생성 이후의 배압 드롭(Free 슬롯 없음) 누계.
+        /// 현재 링 생성 이후의 재제시 누계 — 배압(Free 슬롯 없음)뿐 아니라 gst
+        /// 버퍼 map 실패로 직전 Presenting 슬롯을 재표시한 횟수도 포함한다(단순
+        /// 드롭이 아니라 재제시; bf70293c4·af522092d 이후).
         drop_count: u64,
         /// 소비자 디바이스 미발행 경고 1회 래치(파이프라인당).
         warned_no_device: bool,

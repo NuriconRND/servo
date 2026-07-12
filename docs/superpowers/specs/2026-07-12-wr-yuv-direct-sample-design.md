@@ -201,8 +201,10 @@ Unmap/re-Map만).
 무관 존치. 패키징의 gstd3d11.dll 번들 의무(§3-n 함정 2)는 소멸 — 계획에서
 번들 목록 재검토.
 
-부수 이득: 멀티GPU 월(§4.5 스펙)에서 링이 창별 ANGLE 디바이스에 생기므로
-어댑터 정합이 자동이 된다 (프로듀서 디바이스 정합 문제 자체가 소멸).
+부수 이득(조건부): 멀티GPU 월(§4.5 스펙)에서 링이 창별 ANGLE 디바이스에 생기면
+어댑터 정합이 자동이 된다. **단 현 구현은 전역 단일 `CONSUMER_DEVICE`
+(last-writer-wins) 구조라 다중 창/painter에서는 이 이득이 성립하지 않는다** —
+§4.5 마일스톤에서 레지스트리를 per-device로 키잉해야 실현된다.
 
 ## 5. 검증된 근거 (2026-07-12 소스 확인)
 
@@ -302,6 +304,11 @@ Unmap/re-Map만).
 
 - 시작 창구간의 None 계열 teardown: 미발행 또는 첫 map 실패 시점 — 링 소비
   전이라 §10.3-①의 재제시가 적용되지 않음
+- mid-stream caps 변경 시 텍스처 생성 실패(`ensure_ring`→None)도 teardown 계열
+  리스크다 — 시작 창구간 None 경로의 상위집합(위 첫 항목 참조)
+- `CONSUMER_DEVICE`는 전역 단일 슬롯(last-writer-wins)이라 다중 창/painter가
+  서로 다른 ANGLE 디바이스를 쓰면 마지막 발행자 값으로 덮인다(§4.7 부수 이득
+  정정, §4.5 per-device 키잉 필요)
 - 만성 기아는 PROF 빌드에서만 상세 가시(카운터·로그) — 비PROF 빌드는 1회
   warn만 남김
 - 멀티GPU 어댑터 정합(§4.5 부수 이득)은 이 세션이 단일 GPU 장비라 미검증
@@ -314,3 +321,14 @@ Unmap/re-Map만).
   실측 없이도 결론은 유효
 - vendored surfman의 `eglDestroyContext` 이중 호출은 기존 버그
   (context.rs:176-177) — 본 기능과 무관, 별도 수정 후보로 남김
+
+### 10.6 최종 리뷰 픽스 웨이브 (2026-07-12)
+
+전체 브랜치 리뷰의 병합 전 지적 3건을 한 웨이브로 수정: (1) 플레이어 해체 시
+링 누수 — `RenderD3D11`에 `Drop`을 추가해 `remove_ring`을 호출(누수 소멸),
+(2) 재-Map 실패 plane의 스테일 mapped 포인터로 인한 UB memcpy —
+`commit_consume(Advance)`가 Free 전이 전 그 포인터를 None으로 무효화,
+(3) `InitialMapAll`이 슬롯0을 mapped 상태로 Presenting시키던 불변식 위반 —
+소비자가 스테이징 복사 후 슬롯0을 재-Unmap하고 커밋 `mapped`에서 제외(첫 Advance
+재-Map이 정상 성공). 부수로 재제시 의미론·`ring_epoch` vestigial·멀티GPU 단일
+디바이스 현실을 주석/스펙에 반영. d3d11_ring 회귀 테스트 포함(11개 green).

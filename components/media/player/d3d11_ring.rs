@@ -21,7 +21,9 @@
 //! - 소비(consume)는 합성(composite)당 한 번: WR이 2~3개 plane을 lock한 뒤
 //!   모두 unlock한다. [`D3d11PlaneRings::note_plane_lock_and_plan`]은 링별
 //!   lock 카운터가 0→1로 전이할 때만 계획을 반환한다(plane tearing 방지).
-//! - FREE 슬롯이 없는 프로듀서는 memcpy 전에 프레임을 드롭한다(카운터만 증가).
+//! - FREE 슬롯이 없으면 프로듀서는 프레임 바이트를 버리되(memcpy 전 — 카운터만
+//!   증가), 드롭 대신 직전 Presenting 슬롯을 그대로 재제시해 스트림을 유지한다
+//!   (bf70293c4 이후 — build_frame의 None 리턴이 파이프라인을 죽이던 문제 수정).
 //! - 최초 구간(전 슬롯 Unmapped)에는 프로듀서가 [`stage_first_frame`]으로
 //!   첫 프레임 바이트를 CPU에 스테이징해 두고, 첫 소비 시
 //!   [`ConsumePlan::InitialMapAll`]로 전 슬롯을 한 번에 Map한다(슬롯 0은
@@ -336,7 +338,8 @@ impl D3d11PlaneRings {
 
     /// mapped FREE 슬롯을 claim한다. 반환된 포인터에 plane별로 행 복사를
     /// 한 뒤 [`publish_slot`](Self::publish_slot)을 호출해야 한다. FREE가
-    /// 없으면 None(드롭 카운터만 증가 — memcpy 전 드롭이라 비용이 없다).
+    /// 없으면 None(카운터만 증가 — memcpy 전이라 비용 없음). 이때 프로듀서는
+    /// 프레임을 드롭하지 않고 직전 Presenting 슬롯을 재제시한다(bf70293c4 이후).
     pub fn claim_free_slot(ring_id: u64) -> Option<ClaimedSlot> {
         let mut reg = lock(registry());
         let ring = reg.rings.get_mut(&ring_id)?;
