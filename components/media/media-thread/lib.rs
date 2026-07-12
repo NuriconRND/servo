@@ -659,10 +659,15 @@ impl Drop for MediaExternalImages {
 
 impl WebRenderExternalImageApi for MediaExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
+        // 제거된 링의 GPU 텍스처를 공통 prologue에서 배출한다: 마지막 D3D11
+        // 비디오가 멈춰 더 이상 D3D11 plane을 lock하지 않게 된 뒤에도 다음
+        // 임의 미디어 lock(raw 포함)에서 배수되도록. take_removed_rings가 비면
+        // 즉시 반환하므로 비용은 uncontended mutex poll 1회.
+        self.purge_removed_d3d11_entries();
+
         // GPU 상주 D3D11 plane: 렌더러는 링 슬롯을 소비(Map/Unmap)하고 EGLImage로
         // 래핑한 GL 텍스처를 돌려줄 뿐 CPU 업로드하지 않는다.
         if let Some(binding) = D3d11VideoFrameExternalImages::binding_for(id) {
-            self.purge_removed_d3d11_entries();
             return self.lock_d3d11(id, binding);
         }
 

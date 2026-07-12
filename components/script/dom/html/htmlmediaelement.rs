@@ -23,7 +23,8 @@ use js::context::JSContext;
 use js::realm::{AutoRealm, CurrentRealm};
 use layout_api::{MediaFrame, MediaFrameYuvFormat, MediaFrameYuvImage};
 use media::{
-    GLPlayerMsg, GLPlayerMsgForward, RawVideoFrameExternalImages, WindowGLContext,
+    D3d11PlaneBinding, D3d11VideoFrameExternalImages, GLPlayerMsg, GLPlayerMsgForward,
+    RawVideoFrameExternalImages, WindowGLContext,
 };
 use net_traits::request::{Destination, RequestId};
 use net_traits::{
@@ -42,7 +43,7 @@ use servo_base::id::WebViewId;
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
 use servo_media::player::video::{
-    VideoFrame, VideoFrameD3D11Data, VideoFrameRenderer, VideoFrameYuvColorRange,
+    VideoFrame, VideoFrameD3D11YuvData, VideoFrameRenderer, VideoFrameYuvColorRange,
     VideoFrameYuvColorSpace, VideoFrameYuvData, VideoFrameYuvFormat,
 };
 use servo_media::player::{PlaybackState, Player, PlayerError, PlayerEvent, SeekLock, StreamType};
@@ -264,6 +265,67 @@ fn external_yuv_plane_data(id: ExternalImageId) -> SerializableImageData {
     })
 }
 
+/// Per-plane dimensions and WebRender pixel format for a D3D11 YUV frame.
+///
+/// These MUST match the producer's DYNAMIC ring textures exactly (see
+/// `ring_producer::plane_geoms`): plane 0 (Y) is `width`×`height` R8; the
+/// chroma planes are ceil(w/2)×ceil(h/2); NV12's single interleaved UV plane
+/// is RG8 so WebRender samples both chroma channels from one texture. The
+/// producer already reconciles YV12 sources to the I420 display order, so the
+/// format here is only ever I420 or NV12.
+fn d3d11_yuv_plane_dims(
+    format: VideoFrameYuvFormat,
+    plane_index: usize,
+    frame_width: i32,
+    frame_height: i32,
+) -> Option<(i32, i32, ImageFormat)> {
+    match (format, plane_index) {
+        (_, 0) => Some((frame_width, frame_height, ImageFormat::R8)),
+        (VideoFrameYuvFormat::I420, 1) | (VideoFrameYuvFormat::I420, 2) => Some((
+            (frame_width + 1) / 2,
+            (frame_height + 1) / 2,
+            ImageFormat::R8,
+        )),
+        (VideoFrameYuvFormat::NV12, 1) => Some((
+            (frame_width + 1) / 2,
+            (frame_height + 1) / 2,
+            ImageFormat::RG8,
+        )),
+        _ => None,
+    }
+}
+
+/// Per-plane [`ImageDescriptor`] for a D3D11 YUV frame. Unlike the raw-buffer
+/// path there is no linear stride to declare — the plane is a native texture
+/// sampled through the external `TextureHandle`, so only size and format matter.
+fn d3d11_yuv_plane_descriptor(
+    format: VideoFrameYuvFormat,
+    plane_index: usize,
+    frame_width: i32,
+    frame_height: i32,
+) -> Option<ImageDescriptor> {
+    let (plane_width, plane_height, image_format) =
+        d3d11_yuv_plane_dims(format, plane_index, frame_width, frame_height)?;
+    Some(ImageDescriptor::new(
+        plane_width,
+        plane_height,
+        image_format,
+        ImageDescriptorFlags::empty(),
+    ))
+}
+
+/// External image data referencing a D3D11 plane texture directly (the
+/// media-thread `lock` returns an EGLImage-wrapped GL texture for this id).
+/// Mirrors [`external_yuv_plane_data`] but for the GPU-resident path.
+fn external_d3d11_plane_data(id: ExternalImageId) -> SerializableImageData {
+    SerializableImageData::External(ExternalImageData {
+        id,
+        channel_index: 0,
+        image_type: ExternalImageType::TextureHandle(ImageBufferKind::Texture2D),
+        normalized_uvs: false,
+    })
+}
+
 #[derive(MallocSizeOf)]
 pub(crate) struct MediaFrameRenderer {
     webview_id: WebViewId,
@@ -284,6 +346,11 @@ pub(crate) struct MediaFrameRenderer {
     current_frame_holder: Option<FrameHolder>,
     #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
     yuv_external_ids: Option<MediaYuvExternalIds>,
+    /// Plane external image IDs for the GPU-resident D3D11 YUV path. Kept in a
+    /// separate field from `yuv_external_ids` so teardown removes each id from
+    /// the correct registry (`D3d11VideoFrameExternalImages` vs raw).
+    #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
+    d3d11_external_ids: Option<MediaYuvExternalIds>,
     /// <https://html.spec.whatwg.org/multipage/#poster-frame>
     poster_frame: Option<MediaFrame>,
 }
@@ -309,6 +376,7 @@ impl MediaFrameRenderer {
             media_frame_summary_count: 0,
             current_frame_holder: None,
             yuv_external_ids: None,
+            d3d11_external_ids: None,
             poster_frame: None,
         }
     }
@@ -415,6 +483,12 @@ impl MediaFrameRenderer {
             }
         }
 
+        if let Some(d3d11_external_ids) = self.d3d11_external_ids.take() {
+            for id in d3d11_external_ids.ids().into_iter().flatten() {
+                D3d11VideoFrameExternalImages::remove_plane(id);
+            }
+        }
+
         if !updates.is_empty() {
             self.paint_api
                 .update_images(self.webview_id.into(), updates);
@@ -455,6 +529,29 @@ impl MediaFrameRenderer {
         let plane_ids = RawVideoFrameExternalImages::allocate_plane_ids(yuv.plane_count())?;
         let external_ids = MediaYuvExternalIds::new(yuv.format, &plane_ids)?;
         self.yuv_external_ids = Some(external_ids);
+        Some(external_ids)
+    }
+
+    /// D3D11 YUV plane external image IDs, mirror of [`Self::ensure_yuv_external_ids`]
+    /// for the GPU-resident path. Reuses the existing ids while the format is
+    /// unchanged; a format change (I420<->NV12) releases the old ids first.
+    fn ensure_d3d11_plane_ids(
+        &mut self,
+        format: VideoFrameYuvFormat,
+    ) -> Option<MediaYuvExternalIds> {
+        if let Some(existing) = self.d3d11_external_ids {
+            if existing.format == format {
+                return Some(existing);
+            }
+
+            for id in existing.ids().into_iter().flatten() {
+                D3d11VideoFrameExternalImages::remove_plane(id);
+            }
+        }
+
+        let plane_ids = D3d11VideoFrameExternalImages::allocate_plane_ids(format.plane_count())?;
+        let external_ids = MediaYuvExternalIds::new(format, &plane_ids)?;
+        self.d3d11_external_ids = Some(external_ids);
         Some(external_ids)
     }
 
@@ -535,13 +632,15 @@ impl MediaFrameRenderer {
     }
 
     fn media_frame_yuv_image(
-        yuv: &VideoFrameYuvData,
+        format: VideoFrameYuvFormat,
+        color_space: VideoFrameYuvColorSpace,
+        color_range: VideoFrameYuvColorRange,
         y_key: ImageKey,
         u_or_uv_key: ImageKey,
         v_key: Option<ImageKey>,
     ) -> MediaFrameYuvImage {
         MediaFrameYuvImage {
-            format: match yuv.format {
+            format: match format {
                 VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
                 VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
             },
@@ -549,8 +648,8 @@ impl MediaFrameRenderer {
             u_or_uv_key,
             v_key,
             color_depth: ColorDepth::Color8,
-            color_space: wr_yuv_color_space(yuv.color_space),
-            color_range: wr_yuv_color_range(yuv.color_range),
+            color_space: wr_yuv_color_space(color_space),
+            color_range: wr_yuv_color_range(color_range),
         }
     }
 
@@ -603,7 +702,9 @@ impl MediaFrameRenderer {
             image_key_for_log = Some(current_frame.image_key);
             if let Some(current_yuv) = current_frame.yuv {
                 current_frame.yuv = Some(Self::media_frame_yuv_image(
-                    &yuv,
+                    yuv.format,
+                    yuv.color_space,
+                    yuv.color_range,
                     current_yuv.y_key,
                     current_yuv.u_or_uv_key,
                     current_yuv.v_key,
@@ -660,7 +761,14 @@ impl MediaFrameRenderer {
                 None
             };
 
-            let yuv_image = Self::media_frame_yuv_image(&yuv, y_key, u_or_uv_key, v_key);
+            let yuv_image = Self::media_frame_yuv_image(
+                yuv.format,
+                yuv.color_space,
+                yuv.color_range,
+                y_key,
+                u_or_uv_key,
+                v_key,
+            );
             let current_frame = MediaFrame {
                 image_key: y_key,
                 yuv: Some(yuv_image),
@@ -716,26 +824,203 @@ impl MediaFrameRenderer {
             .update_images(self.webview_id.into(), updates);
     }
 
-    fn render_d3d11_frame(
+    /// GPU-resident D3D11 YUV frame path (WR direct-sample). Mirror of
+    /// [`Self::render_yuv_frame`]: it publishes 2-3 plane ImageKeys backed by
+    /// `TextureHandle` external images so layout emits a WR YUV primitive. The
+    /// plane bytes are never copied here — the frame carries only ring metadata,
+    /// and the media thread hands WR the ring's plane textures on lock.
+    fn render_d3d11_yuv_frame(
         &mut self,
         frame: VideoFrame,
-        _d3d11: VideoFrameD3D11Data,
-        _rendered_frame_count: u64,
-        _frame_backend: &'static str,
-        _inter_frame_ms: Option<f64>,
-        updates: smallvec::SmallVec<[ImageUpdate; 1]>,
+        d3d11_yuv: VideoFrameD3D11YuvData,
+        rendered_frame_count: u64,
+        frame_backend: &'static str,
+        inter_frame_ms: Option<f64>,
+        mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
     ) {
-        // Task 5에서 D3D11 공유 핸들(단일 텍스처) 프로듀서가 제거되어 이 variant는
-        // 런타임에 더 이상 생성되지 않는다(dead path). WR YUV 직접 샘플 소비자는
-        // Task 7이 plane 링 바인딩(D3d11PlaneBinding)으로 정식 구현한다. 그 전까지는
-        // 프레임을 드롭하되, 이미 큐잉된 이미지 삭제 업데이트만 흘려보내 이미지 키
-        // 누수를 막는다.
-        warn!("D3D11 공유 핸들 프레임 수신 — 프로듀서 제거됨(dead path), 드롭");
-        drop(frame);
-        if !updates.is_empty() {
-            self.paint_api
-                .update_images(self.webview_id.into(), updates);
+        let frame_width = frame.get_width();
+        let frame_height = frame.get_height();
+        let format = d3d11_yuv.format;
+        let Some(external_ids) = self.ensure_d3d11_plane_ids(format) else {
+            warn!("Dropping D3D11 YUV media frame because plane external image IDs are unavailable");
+            if !updates.is_empty() {
+                self.paint_api
+                    .update_images(self.webview_id.into(), updates);
+            }
+            return;
+        };
+
+        // Register the plane bindings BEFORE the image update reaches WR: the
+        // media thread keys its D3D11 no-flip / lock path off `binding_for(id)`,
+        // so the binding must exist before the first composite touches the id.
+        for (plane_index, id) in external_ids.ids().into_iter().enumerate() {
+            let Some(id) = id else {
+                continue;
+            };
+            let Some((plane_width, plane_height, _)) =
+                d3d11_yuv_plane_dims(format, plane_index, frame_width, frame_height)
+            else {
+                continue;
+            };
+            D3d11VideoFrameExternalImages::update_plane(
+                id,
+                D3d11PlaneBinding {
+                    ring_id: d3d11_yuv.ring_id,
+                    ring_epoch: d3d11_yuv.ring_epoch,
+                    plane_index,
+                    width: plane_width,
+                    height: plane_height,
+                },
+            );
         }
+
+        let yuv_format = match format {
+            VideoFrameYuvFormat::I420 => MediaFrameYuvFormat::PlanarYCbCr,
+            VideoFrameYuvFormat::NV12 => MediaFrameYuvFormat::NV12,
+        };
+        let image_update_for_log;
+        let image_key_for_log;
+
+        let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
+            current_frame.width == frame_width
+                && current_frame.height == frame_height
+                && current_frame
+                    .yuv
+                    .is_some_and(|current_yuv| current_yuv.format == yuv_format)
+        });
+
+        if current_frame_is_compatible {
+            let current_frame = self
+                .current_frame
+                .as_mut()
+                .expect("Current frame should be present");
+            image_key_for_log = Some(current_frame.image_key);
+            if let Some(current_yuv) = current_frame.yuv {
+                current_frame.yuv = Some(Self::media_frame_yuv_image(
+                    format,
+                    d3d11_yuv.color_space,
+                    d3d11_yuv.color_range,
+                    current_yuv.y_key,
+                    current_yuv.u_or_uv_key,
+                    current_yuv.v_key,
+                ));
+            }
+            for (plane_index, (image_key, external_id)) in current_frame
+                .image_keys()
+                .into_iter()
+                .zip(external_ids.ids())
+                .enumerate()
+            {
+                let Some(image_key) = image_key else {
+                    continue;
+                };
+                let Some(external_id) = external_id else {
+                    continue;
+                };
+                let Some(descriptor) =
+                    d3d11_yuv_plane_descriptor(format, plane_index, frame_width, frame_height)
+                else {
+                    continue;
+                };
+                updates.push(ImageUpdate::UpdateImage(
+                    image_key,
+                    descriptor,
+                    external_d3d11_plane_data(external_id),
+                    None,
+                ));
+            }
+            image_update_for_log = "update";
+
+            self.current_frame_holder
+                .get_or_insert_with(|| FrameHolder::new(frame.clone()))
+                .set(frame);
+
+            if let Some(old_frame) = self.old_frame.take() {
+                Self::push_delete_frame_images(&mut updates, old_frame);
+            }
+        } else {
+            if let Some(current_frame) = self.current_frame.take() {
+                self.old_frame = Some(current_frame);
+            }
+
+            let Some(y_key) = self.generate_image_key() else {
+                return;
+            };
+            let Some(u_or_uv_key) = self.generate_image_key() else {
+                return;
+            };
+            let v_key = if format == VideoFrameYuvFormat::I420 {
+                let Some(v_key) = self.generate_image_key() else {
+                    return;
+                };
+                Some(v_key)
+            } else {
+                None
+            };
+
+            let yuv_image = Self::media_frame_yuv_image(
+                format,
+                d3d11_yuv.color_space,
+                d3d11_yuv.color_range,
+                y_key,
+                u_or_uv_key,
+                v_key,
+            );
+            let current_frame = MediaFrame {
+                image_key: y_key,
+                yuv: Some(yuv_image),
+                width: frame_width,
+                height: frame_height,
+            };
+            image_key_for_log = Some(current_frame.image_key);
+            image_update_for_log = "add";
+
+            for (plane_index, (image_key, external_id)) in current_frame
+                .image_keys()
+                .into_iter()
+                .zip(external_ids.ids())
+                .enumerate()
+            {
+                let Some(image_key) = image_key else {
+                    continue;
+                };
+                let Some(external_id) = external_id else {
+                    continue;
+                };
+                let Some(descriptor) =
+                    d3d11_yuv_plane_descriptor(format, plane_index, frame_width, frame_height)
+                else {
+                    continue;
+                };
+                updates.push(ImageUpdate::AddImage(
+                    image_key,
+                    descriptor,
+                    external_d3d11_plane_data(external_id),
+                    false,
+                ));
+            }
+
+            self.current_frame_holder = Some(FrameHolder::new(frame));
+            self.current_frame = Some(current_frame);
+        }
+
+        let delete_update_count = updates
+            .iter()
+            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
+            .count();
+        self.log_media_frame(
+            rendered_frame_count,
+            frame_backend,
+            frame_width,
+            frame_height,
+            image_key_for_log,
+            image_update_for_log,
+            delete_update_count,
+            updates.len(),
+            inter_frame_ms,
+        );
+        self.paint_api
+            .update_images(self.webview_id.into(), updates);
     }
 }
 
@@ -762,8 +1047,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 VideoFrameYuvFormat::I420 => "yuv_i420_external_raw",
                 VideoFrameYuvFormat::NV12 => "yuv_nv12_external_raw",
             }
-        } else if frame.is_d3d11() {
-            "d3d11_texture"
         } else if frame.is_d3d11_yuv() {
             "d3d11_yuv_texture"
         } else if frame.is_gl_texture() {
@@ -797,22 +1080,15 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             return;
         }
 
-        if let Some(d3d11) = frame.get_d3d11_data() {
-            self.render_d3d11_frame(
+        if let Some(d3d11_yuv) = frame.get_d3d11_yuv_data() {
+            self.render_d3d11_yuv_frame(
                 frame,
-                d3d11,
+                d3d11_yuv,
                 rendered_frame_count,
                 frame_backend,
                 inter_frame_ms,
                 updates,
             );
-            return;
-        }
-
-        if frame.is_d3d11_yuv() {
-            // Task 7 전까지는 소비자 미구현 — 링에서 최신 프레임을 참조만
-            // 하고 memcpy는 하지 않으므로 여기서 드롭해도 비용은 없다.
-            warn!("D3D11Yuv 프레임 수신 — 소비자 미구현(Task 7 전), 드롭");
             return;
         }
 

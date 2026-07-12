@@ -59,15 +59,6 @@ impl VideoFrameYuvData {
     }
 }
 
-/// D3D11 공유 텍스처 프레임의 페이로드. shared_handle은 렌더러가
-/// OpenSharedResource로 열 수 있는 레거시 DXGI 공유 핸들, ring_epoch는
-/// 링 재생성(크기 변경) 세대 — 렌더러측 래핑 캐시 무효화에 쓴다.
-#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
-pub struct VideoFrameD3D11Data {
-    pub shared_handle: u64,
-    pub ring_epoch: u32,
-}
-
 /// A-dyn 경로: plane DYNAMIC 링(레지스트리 `d3d11_ring`) 참조 + 표시
 /// 메타데이터. 슬롯 인덱스는 싣지 않는다 — 렌더러가 레지스트리에서 최신
 /// Filled를 소비한다(latest-wins). `ring_epoch`는 링 재생성(크기 변경)
@@ -87,7 +78,6 @@ pub enum VideoFrameData {
     Yuv(VideoFrameYuvData),
     Texture(u32),
     OESTexture(u32),
-    D3D11(VideoFrameD3D11Data),
     D3D11Yuv(VideoFrameD3D11YuvData),
 }
 
@@ -169,17 +159,6 @@ impl VideoFrame {
 
     pub fn is_yuv(&self) -> bool {
         matches!(self.data, VideoFrameData::Yuv(_))
-    }
-
-    pub fn is_d3d11(&self) -> bool {
-        matches!(self.data, VideoFrameData::D3D11(_))
-    }
-
-    pub fn get_d3d11_data(&self) -> Option<VideoFrameD3D11Data> {
-        match self.data {
-            VideoFrameData::D3D11(data) => Some(data),
-            _ => None,
-        }
     }
 
     pub fn is_d3d11_yuv(&self) -> bool {
