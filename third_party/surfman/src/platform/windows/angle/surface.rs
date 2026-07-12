@@ -11,11 +11,14 @@ use crate::egl::{self, EGLint};
 use crate::gl;
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::error::ToWindowingApiError;
+use crate::platform::generic::egl::ffi::EGL_D3D11_TEXTURE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_D3D_TEXTURE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_DIRECT_COMPOSITION_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_DXGI_KEYED_MUTEX_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_EXTENSION_FUNCTIONS;
+use crate::platform::generic::egl::ffi::EGL_NO_IMAGE_KHR;
+use crate::platform::generic::egl::ffi::{EGLClientBuffer, EGLImageKHR};
 use crate::{Error, SurfaceAccess, SurfaceID, SurfaceInfo, SurfaceType};
 
 use euclid::default::Size2D;
@@ -576,6 +579,71 @@ impl Device {
             let local_d3d11_texture =
                 ComPtr::from_raw(local_d3d11_texture as *mut d3d11::ID3D11Texture2D);
             self.create_surface_texture_from_texture(context, size, local_d3d11_texture)
+        }
+    }
+
+    /// D3D11 텍스처(이 디바이스 소속, BIND_SHADER_RESOURCE)를 EGLImage로 GL 텍스처에
+    /// 바인딩한다 (EGL_ANGLE_image_d3d11_texture). pbuffer 경로와 달리 RTV를 만들지
+    /// 않으므로 DYNAMIC(SRV-only) 텍스처를 수용한다. 반환된 (EGLImage, GL 텍스처)는
+    /// destroy_gl_texture_and_egl_image로 파기할 것. 텍스처 수명은 호출자 책임.
+    pub unsafe fn create_gl_texture_from_d3d11_texture(
+        &self,
+        context: &mut Context,
+        texture: *mut c_void,
+    ) -> Result<(usize, u32), Error> {
+        let _guard = self.temporarily_make_context_current(context)?;
+        let attribs = [egl::NONE as EGLint, 0];
+        let egl_image = (EGL_EXTENSION_FUNCTIONS.CreateImageKHR)(
+            self.egl_display,
+            egl::NO_CONTEXT,
+            EGL_D3D11_TEXTURE_ANGLE,
+            texture as EGLClientBuffer,
+            attribs.as_ptr(),
+        );
+        if egl_image == EGL_NO_IMAGE_KHR {
+            EGL_FUNCTIONS.with(|egl| {
+                warn!(
+                    "CreateImageKHR(EGL_D3D11_TEXTURE_ANGLE) 실패 err={:#x}",
+                    egl.GetError()
+                );
+            });
+            return Err(Error::Failed);
+        }
+        let gl = &context.gl;
+        let previous_texture = gl.get_parameter_texture(gl::TEXTURE_BINDING_2D);
+        let gl_texture = gl.create_texture().map_err(|_| Error::Failed)?;
+        gl.bind_texture(gl::TEXTURE_2D, Some(gl_texture));
+        (EGL_EXTENSION_FUNCTIONS.ImageTargetTexture2DOES)(gl::TEXTURE_2D, egl_image);
+        gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
+        gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as _);
+        gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as _);
+        gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as _);
+        let gl_err = gl.get_error();
+        gl.bind_texture(gl::TEXTURE_2D, previous_texture);
+        if gl_err != gl::NO_ERROR {
+            warn!("ImageTargetTexture2DOES 후 GL 에러 {gl_err:#x}");
+            (EGL_EXTENSION_FUNCTIONS.DestroyImageKHR)(self.egl_display, egl_image);
+            gl.delete_texture(gl_texture);
+            return Err(Error::Failed);
+        }
+        Ok((egl_image as usize, gl_texture.0.get()))
+    }
+
+    /// create_gl_texture_from_d3d11_texture의 짝. EGLImage와 GL 텍스처를 함께 파기한다.
+    pub unsafe fn destroy_gl_texture_and_egl_image(
+        &self,
+        context: &mut Context,
+        egl_image: usize,
+        gl_texture: u32,
+    ) {
+        if let Ok(_guard) = self.temporarily_make_context_current(context) {
+            let gl = &context.gl;
+            // glow 텍스처 타입 복원은 surface.rs의 기존 delete 경로 관례를 따른다
+            // (NativeTexture 재구성 — destroy_surface_texture의 gl.delete_texture 사용례 참조).
+            if let Some(tex) = std::num::NonZeroU32::new(gl_texture) {
+                gl.delete_texture(glow::NativeTexture(tex));
+            }
+            (EGL_EXTENSION_FUNCTIONS.DestroyImageKHR)(self.egl_display, egl_image as EGLImageKHR);
         }
     }
 

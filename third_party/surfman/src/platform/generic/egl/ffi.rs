@@ -31,6 +31,9 @@ pub const EGL_DEVICE_EXT: EGLenum = 0x322c;
 pub const EGL_D3D11_DEVICE_ANGLE: EGLenum = 0x33a1;
 pub const EGL_DXGI_KEYED_MUTEX_ANGLE: EGLenum = 0x33a2;
 pub const EGL_D3D_TEXTURE_ANGLE: EGLenum = 0x33a3;
+/// EGL_ANGLE_image_d3d11_texture의 eglCreateImageKHR 타깃 (eglext_angle.h:315).
+/// client-buffer 타깃 EGL_D3D_TEXTURE_ANGLE(0x33a3)과 다른 값이다.
+pub const EGL_D3D11_TEXTURE_ANGLE: EGLenum = 0x3484;
 pub const EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE: EGLenum = 0x33a4;
 pub const EGL_DIRECT_COMPOSITION_ANGLE: EGLenum = 0x33a5;
 pub const EGL_FIXED_SIZE_ANGLE: EGLenum = 0x3201;

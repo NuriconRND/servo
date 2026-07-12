@@ -27,7 +27,10 @@ use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
 use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{BOOL, TRUE, UINT};
 use winapi::shared::winerror::{self, S_OK};
-use winapi::um::d3d11::{D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_SDK_VERSION};
+use winapi::um::d3d11::{
+    D3D11CreateDevice, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_SDK_VERSION,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+};
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
 use wio::com::ComPtr;
@@ -471,6 +474,50 @@ impl Device {
             }
             (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
         }
+    }
+
+    /// ANGLE(D3D11) 디바이스 원시 포인터. AddRef하지 않는다 — 호출자가 저장 시 AddRef 책임.
+    pub fn d3d11_device_ptr(&self) -> *mut c_void {
+        self.d3d11_device.as_raw() as *mut c_void
+    }
+
+    /// DYNAMIC 텍스처를 WRITE_DISCARD로 Map. **렌더러(ANGLE GL 호출) 스레드에서만 호출**
+    /// — immediate context는 단일 스레드 규칙이며, 이 스레드에서는 ANGLE GL 호출과 자연
+    /// 직렬화된다. 반환: (데이터 포인터, RowPitch).
+    pub unsafe fn map_d3d11_dynamic_texture(
+        &self,
+        texture: *mut c_void,
+    ) -> Result<(*mut c_void, u32), Error> {
+        let mut ctx: *mut ID3D11DeviceContext = ptr::null_mut();
+        self.d3d11_device.GetImmediateContext(&mut ctx);
+        if ctx.is_null() {
+            return Err(Error::Failed);
+        }
+        let ctx = ComPtr::from_raw(ctx); // Drop에서 Release
+        let mut mapped: D3D11_MAPPED_SUBRESOURCE = mem::zeroed();
+        let hr = ctx.Map(
+            texture as *mut ID3D11Resource,
+            0,
+            D3D11_MAP_WRITE_DISCARD,
+            0,
+            &mut mapped,
+        );
+        if !winerror::SUCCEEDED(hr) {
+            warn!("map_d3d11_dynamic_texture: Map 실패 hr={hr:#x}");
+            return Err(Error::Failed);
+        }
+        Ok((mapped.pData, mapped.RowPitch))
+    }
+
+    /// Map의 짝. 렌더러 스레드 전용 (동일 근거).
+    pub unsafe fn unmap_d3d11_texture(&self, texture: *mut c_void) {
+        let mut ctx: *mut ID3D11DeviceContext = ptr::null_mut();
+        self.d3d11_device.GetImmediateContext(&mut ctx);
+        if ctx.is_null() {
+            return;
+        }
+        let ctx = ComPtr::from_raw(ctx);
+        ctx.Unmap(texture as *mut ID3D11Resource, 0);
     }
 
     /// Returns the adapter that this device was created with.
