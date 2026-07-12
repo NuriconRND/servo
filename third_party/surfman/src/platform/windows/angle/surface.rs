@@ -611,7 +611,13 @@ impl Device {
         }
         let gl = &context.gl;
         let previous_texture = gl.get_parameter_texture(gl::TEXTURE_BINDING_2D);
-        let gl_texture = gl.create_texture().map_err(|_| Error::Failed)?;
+        let gl_texture = match gl.create_texture() {
+            Ok(tex) => tex,
+            Err(_) => {
+                (EGL_EXTENSION_FUNCTIONS.DestroyImageKHR)(self.egl_display, egl_image);
+                return Err(Error::Failed);
+            }
+        };
         gl.bind_texture(gl::TEXTURE_2D, Some(gl_texture));
         (EGL_EXTENSION_FUNCTIONS.ImageTargetTexture2DOES)(gl::TEXTURE_2D, egl_image);
         gl.tex_parameter_i32(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as _);
