@@ -8369,6 +8369,7 @@ name = "servo-media-player"
 version = "0.3.0"
 dependencies = [
  "ipc-channel",
+ "log",
  "malloc_size_of_derive",
  "serde",
  "servo-malloc-size-of",

@@ -32,6 +32,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use log::warn;
+
 /// 링당 슬롯 개수(더블/트리플/쿼드 버퍼링 여유분).
 pub const SLOT_COUNT: usize = 4;
 /// 슬롯당 최대 plane 개수(I420=3, NV12=2).
@@ -90,6 +92,32 @@ pub struct RemappedPlane {
 /// [`D3d11PlaneRings::note_plane_lock_and_plan`]이 반환하는 소비 계획.
 /// 소비자는 이 계획대로 D3D11 호출(Unmap/Map[+DISCARD]/스테이징 복사)을
 /// 수행한 뒤 [`ConsumeCommit`]으로 결과를 커밋해야 한다.
+///
+/// # 커밋 계약(반드시 지켜야 함)
+/// `note_plane_lock_and_plan`이 `Some(plan)`을 반환하는 순간, 관련 슬롯은
+/// 이미 상태기계상 전이돼 있다(`Advance`라면 D3D 호출 전에 old-presenting
+/// 슬롯을 내부적으로 `Remapping` 상태로 옮겨둔다 — Task 6이 아직 아무
+/// D3D11 작업도 하지 않은 시점에!). 그러므로 **`Some`으로 받은 plan
+/// 하나당 정확히 한 번** [`D3d11PlaneRings::commit_consume`]을 호출할
+/// 의무가 있다. D3D 작업이 부분적으로(또는 전부) 실패해도 이 의무는
+/// 없어지지 않는다 — 커밋을 건너뛰면 전이된 슬롯이 영원히
+/// `Remapping`(또는 초기 구간에서는 미확정 상태)에 갇혀 claim 불가능해
+/// 지고, 그만큼 링이 실질적으로 줄어든다(더블/트리플 버퍼링 여유가
+/// 영구히 사라짐).
+///
+/// 실패 시 무엇을 커밋해야 하는지(`ConsumeCommit` 기준):
+/// - `InitialMapAll`: Map에 실패한 plane은 `mapped: Vec<RemappedPlane>`에서
+///   빼고, 성공한 plane만 담아 커밋한다. 심지어 전부 실패했다면
+///   `mapped: Vec::new()`로 커밋한다 — 그래도 슬롯 상태 전이(슬롯0→
+///   Presenting, 나머지→Free)는 일어나야 한다(그러지 않으면 링 전체가
+///   영원히 Unmapped로 wedge된다).
+/// - `Advance`: 재-Map(WRITE_DISCARD)에 실패한 텍스처는 `remapped`에서
+///   빼고 커밋한다(`remapped: Vec::new()`도 유효한 커밋이다). `filled_slot`
+///   은 plan에서 받은 값을 그대로 되돌려주면 된다(성공/실패와 무관한
+///   검증용 필드). 재-Map 실패 슬롯도 Free로는 전이되지만 `mapped`
+///   포인터는 갱신되지 않은(낡은) 값으로 남으므로, 다음 claim 시 그
+///   포인터로 memcpy하면 이미 Unmap된 메모리에 쓰게 될 수 있다는 점에
+///   유의해 Task 6 쪽에서 재시도/스킵을 처리해야 한다.
 #[derive(Clone, Debug)]
 pub enum ConsumePlan {
     /// 최초 소비: 전 슬롯이 아직 Unmapped다. 소비자는 전 슬롯의 모든
@@ -376,6 +404,15 @@ impl D3d11PlaneRings {
     /// plane lock 카운트가 0→1로 전이할 때만 소비 계획을 반환한다(합성당
     /// 한 번 — 나머지 plane lock들은 None을 받는다). 새 Filled 프레임이
     /// 없으면(첫 소비 이후) None.
+    ///
+    /// # 커밋 의무
+    /// `Some(plan)`을 반환하는 이 호출 자체가 이미 관련 슬롯 상태를
+    /// 전이시킨다 — `Advance`의 경우 old-presenting 슬롯을 D3D 작업 전에
+    /// `Remapping`으로 옮겨둔다(eager 전이; [`ConsumePlan`] 문서 참고).
+    /// 따라서 `Some`을 받은 호출자는 그 뒤의 D3D 작업 성공 여부와
+    /// 무관하게 [`commit_consume`](Self::commit_consume)을 정확히 한 번
+    /// 호출해야 한다 — 건너뛰면 그 슬롯이 영구히 claim 불가능해진다
+    /// (링이 실질적으로 축소됨, "wedge").
     pub fn note_plane_lock_and_plan(ring_id: u64) -> Option<ConsumePlan> {
         let mut reg = lock(registry());
         let ring = reg.rings.get_mut(&ring_id)?;
@@ -433,6 +470,30 @@ impl D3d11PlaneRings {
 
     /// [`ConsumePlan`]에 따른 D3D11 작업(Unmap/Map/스테이징 복사)을 마친
     /// 뒤 상태를 커밋한다.
+    ///
+    /// # 반드시 커밋해야 함(never-skip 계약)
+    /// [`note_plane_lock_and_plan`](Self::note_plane_lock_and_plan)이
+    /// `Some`을 반환하면 그 시점에 이미 슬롯 상태가 전이돼 있다 — 이
+    /// 함수를 호출하지 않으면 그 슬롯은 영원히 claim 불가능한 상태로
+    /// 링에 남는다(자세한 내용/실패 시 커밋 방법은 [`ConsumePlan`] 문서
+    /// 참고). D3D 작업이 실패해도 반드시 호출하되, 실패한 plane은 해당
+    /// `mapped`/`remapped` 벡터에서 제외해 부분 커밋하면 된다.
+    ///
+    /// # 상태 가드(오용/중복 커밋 방지)
+    /// - `InitialMapAll` 커밋은 링이 아직 초기 구간일 때만
+    ///   (`presenting_slot.is_none()`) 적용된다. 이미 최초 Advance를 거친
+    ///   뒤 뒤늦게 도착한 stale/중복 `InitialMapAll` 커밋은 경고 로그만
+    ///   남기고 상태를 전혀 바꾸지 않는다(no-op).
+    /// - `InitialMapAll` 커밋은 `Writing` 중인 슬롯을 절대 Free/Presenting
+    ///   으로 전이시키지 않는다(현재 구현상 초기 구간에는 Free 슬롯이
+    ///   없어 Writing 슬롯이 있을 수 없지만, 상태기계 변경에 대비한
+    ///   방어적 가드다). 그런 슬롯이 있으면 경고 후 그 슬롯만 제외한다.
+    /// - `Advance` 커밋은 실제로 `Remapping` 상태인 슬롯에 한해서만
+    ///   mapped 포인터를 반영하고 Free로 전이시킨다(텍스처 핸들이 다른
+    ///   상태의 슬롯과 우연히 일치해도 영향받지 않는다). `Remapping`
+    ///   슬롯이 하나도 없으면(이미 처리된 중복 Advance 커밋) 경고만
+    ///   남기고 no-op이다. 정상 경로에서는 `Remapping` 슬롯이 최대
+    ///   하나여야 한다는 불변조건을 `debug_assert`로 검증한다.
     pub fn commit_consume(ring_id: u64, commit: ConsumeCommit) {
         let mut reg = lock(registry());
         let Some(ring) = reg.rings.get_mut(&ring_id) else {
@@ -440,6 +501,36 @@ impl D3d11PlaneRings {
         };
         match commit {
             ConsumeCommit::InitialMapAll { mapped } => {
+                // stale/중복 가드: 이미 최초 Advance를 거쳐 초기 구간을
+                // 벗어난 링에는 적용하지 않는다 — 슬롯 0을 Presenting으로
+                // 강제하면 이미 진행 중인 링 상태를 덮어써 버린다.
+                if ring.presenting_slot.is_some() {
+                    warn!(
+                        "d3d11_ring: stale InitialMapAll commit for ring {ring_id} ignored \
+                         (presenting_slot={:?}, already past initial phase)",
+                        ring.presenting_slot
+                    );
+                    return;
+                }
+                // 방어적 가드: 초기 구간에는 이론상 Writing 슬롯이 있을 수
+                // 없다(Free 슬롯이 없으면 claim_free_slot이 항상 실패하기
+                // 때문). 그래도 프로듀서가 memcpy 중인 슬롯을 Free로
+                // 되돌려 재-claim 가능하게 만드는 사고를 막기 위해 명시
+                // 적으로 확인한다.
+                let writing: Vec<usize> = ring
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.state == SlotState::Writing)
+                    .map(|(i, _)| i)
+                    .collect();
+                if !writing.is_empty() {
+                    warn!(
+                        "d3d11_ring: InitialMapAll commit for ring {ring_id} found slot(s) \
+                         {writing:?} already Writing — leaving them untouched"
+                    );
+                }
+
                 for RemappedPlane {
                     texture,
                     data_ptr,
@@ -449,36 +540,85 @@ impl D3d11PlaneRings {
                     apply_mapped(ring, texture, data_ptr, row_pitch);
                 }
                 for i in 0..SLOT_COUNT {
+                    if writing.contains(&i) {
+                        continue;
+                    }
                     ring.slots[i].state = if i == 0 {
                         SlotState::Presenting
                     } else {
                         SlotState::Free
                     };
                 }
-                ring.presenting_slot = Some(0);
+                // 슬롯 0이 Writing이라 위에서 건너뛰었다면 아직 Presenting이
+                // 아니므로 presenting_slot을 확정하지 않는다(다음 정상
+                // InitialMapAll 커밋을 기다린다).
+                if !writing.contains(&0) {
+                    ring.presenting_slot = Some(0);
+                }
             },
             ConsumeCommit::Advance {
                 filled_slot: _,
                 remapped,
             } => {
+                let remapping_slots: Vec<usize> = ring
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.state == SlotState::Remapping)
+                    .map(|(i, _)| i)
+                    .collect();
+                debug_assert!(
+                    remapping_slots.len() <= 1,
+                    "d3d11_ring: at most one slot should be Remapping at a time, found {:?}",
+                    remapping_slots
+                );
+                if remapping_slots.is_empty() {
+                    // stale/중복 가드: Remapping 슬롯이 없다는 것은 이미
+                    // 처리된(또는 잘못된 시점에 도착한) Advance 커밋이란
+                    // 뜻이다. mapped 포인터를 엉뚱한 슬롯(텍스처 핸들이
+                    // 우연히 일치하는 Free/Filled/Writing 슬롯 등)에 잘못
+                    // 반영하지 않도록 아무 것도 건드리지 않는다.
+                    warn!(
+                        "d3d11_ring: stale/duplicate Advance commit for ring {ring_id} ignored \
+                         (no slot in Remapping state)"
+                    );
+                    return;
+                }
+
                 for RemappedPlane {
                     texture,
                     data_ptr,
                     row_pitch,
                 } in remapped
                 {
-                    apply_mapped(ring, texture, data_ptr, row_pitch);
-                }
-                for slot in ring.slots.iter_mut() {
-                    if slot.state == SlotState::Remapping {
-                        slot.state = SlotState::Free;
+                    // Remapping 슬롯의 plane에 한해서만 반영한다 — 텍스처
+                    // 핸들이 우연히 다른 상태의 슬롯과 겹치는 경우를
+                    // 원천 차단한다.
+                    for &idx in &remapping_slots {
+                        if let Some(plane_idx) = ring.slots[idx]
+                            .planes
+                            .iter()
+                            .position(|p| p.map(|d| d.texture) == Some(texture))
+                        {
+                            ring.slots[idx].mapped[plane_idx] = Some((data_ptr, row_pitch));
+                        }
                     }
+                }
+                for &idx in &remapping_slots {
+                    ring.slots[idx].state = SlotState::Free;
                 }
             },
         }
     }
 
     /// 현재 Presenting 슬롯의 plane 텍스처 기술자(정적 정보). lock 반환용.
+    ///
+    /// 주의(eager 상태 전이): `note_plane_lock_and_plan`의 `Advance` 분기는
+    /// D3D 작업 전에 이미 `presenting_slot`을 새 슬롯으로 옮겨둔다(plan
+    /// 발급 시점에 상태가 전이됨, [`ConsumePlan`] 문서 참고). 즉
+    /// `commit_consume`이 아직 호출되기 전(D3D11 Unmap이 실제로는 아직
+    /// 실행되지 않았을 수도 있는 시점)이라도 이 함수는 이미 새
+    /// Presenting 슬롯의 plane 기술자를 반환할 수 있다.
     pub fn presenting_plane(ring_id: u64, plane: usize) -> Option<PlaneDesc> {
         let reg = lock(registry());
         let ring = reg.rings.get(&ring_id)?;
@@ -876,5 +1016,240 @@ mod tests {
         let expected_map2: Vec<usize> = slots[c1.slot].iter().flatten().map(|d| d.texture).collect();
         assert_eq!(map2, expected_map2);
         D3d11PlaneRings::note_plane_unlock(ring_id);
+    }
+
+    /// Finding 2(문서화된 커밋 계약) 회귀 테스트: `note_plane_lock_and_plan`이
+    /// `Some(Advance)`를 반환하면 그 호출 자체가 이미 old-presenting 슬롯을
+    /// `Remapping`으로 옮겨 버린다(문서 참고) — 만약 소비자가
+    /// `commit_consume`을 호출하지 않으면 그 슬롯은 영원히 wedge된다.
+    /// 여기서는 "commit을 건너뛰면 실제로 어떻게 되는가"를 명시적으로
+    /// 검증해서, 앞으로 이 계약이 깨지면(예: guard가 실수로 wedge된
+    /// 슬롯을 재사용 가능하게 만들면) 테스트가 즉시 실패하게 한다.
+    #[test]
+    fn uncommitted_plan_wedges_remapping_slot_documented() {
+        let slots = make_slots(9000);
+        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        warm_up(ring_id, &slots); // 슬롯0 = Presenting, 1~3 = Free.
+
+        let claimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot");
+        let claimed_slot = claimed.slot;
+        assert_ne!(claimed_slot, 0);
+        D3d11PlaneRings::publish_slot(ring_id, claimed_slot);
+
+        // Advance plan을 발급만 하고 절대 commit_consume을 호출하지
+        // 않는다. 이 호출 자체가 이미 슬롯0을 Remapping으로,
+        // claimed_slot을 Presenting으로 옮겨 버린다(eager 전이) —
+        // 아직 D3D11 작업(Unmap/Map)은 전혀 일어나지 않았는데도.
+        let plan = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("advance plan issued");
+        let ConsumePlan::Advance {
+            filled_slot: planned_slot,
+            ..
+        } = plan
+        else {
+            panic!("expected Advance plan");
+        };
+        assert_eq!(planned_slot, claimed_slot);
+
+        // commit 없이 unlock만 호출(합성 종료를 흉내) — 실사용에서는
+        // 여기서 반드시 commit_consume을 호출해야 하지만, 이 테스트는
+        // "안 부르면 어떻게 되는가"를 검증하는 것이 목적이다.
+        D3d11PlaneRings::note_plane_unlock(ring_id);
+
+        // 다음 lock/plan 사이클: 게이트는 리셋됐지만 소비할 새 Filled
+        // 슬롯이 없다(claimed_slot은 이미 Presenting, 슬롯0은 Remapping
+        // 이라 Filled가 아니다) — None이어야 한다.
+        let second = D3d11PlaneRings::note_plane_lock_and_plan(ring_id);
+        assert!(
+            second.is_none(),
+            "no Filled slot exists after the uncommitted plan, so re-locking must yield None"
+        );
+
+        // 슬롯0(Remapping으로 wedge됨)은 claim_free_slot이 절대 반환하지
+        // 않는다 — 남은 Free 슬롯(2,3)을 모두 소진해도 마찬가지다.
+        let mut claimed_slots = Vec::new();
+        while let Some(c) = D3d11PlaneRings::claim_free_slot(ring_id) {
+            assert_ne!(c.slot, 0, "wedged Remapping slot must never be claimable");
+            claimed_slots.push(c.slot);
+        }
+        assert!(!claimed_slots.contains(&0));
+
+        // remove_ring은 wedge된 Remapping 슬롯을 "mapped"(Unmap 필요)에
+        // 보수적으로 포함해야 한다(:293-296 주석에 기술된 동작).
+        D3d11PlaneRings::remove_ring(ring_id);
+        let removed = D3d11PlaneRings::take_removed_rings();
+        let slot0_textures: Vec<usize> = slots[0].iter().flatten().map(|d| d.texture).collect();
+        let entry = removed
+            .iter()
+            .find(|r| r.textures.contains(&slot0_textures[0]))
+            .expect("ring cleanup entry");
+        for t in &slot0_textures {
+            assert!(
+                entry.mapped.contains(t),
+                "wedged Remapping slot must be conservatively reported as mapped"
+            );
+        }
+    }
+
+    /// Finding 1 회귀 테스트: 링이 이미 최초 Advance를 거친(초기 구간을
+    /// 벗어난) 뒤에 도착한 stale/오용 `InitialMapAll` 커밋은 아무 상태도
+    /// 바꾸지 않아야 한다 — 특히 마침 memcpy 중(Writing)인 슬롯을
+    /// Free로 스탬프해 재-claim 가능하게 만들면 안 된다.
+    #[test]
+    fn stale_initial_commit_after_advance_is_rejected() {
+        let slots = make_slots(10000);
+        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        warm_up(ring_id, &slots);
+
+        // 링을 초기 구간 너머로 정상적으로 한 번 Advance시킨다(커밋 포함).
+        let c1 = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot for advance");
+        D3d11PlaneRings::publish_slot(ring_id, c1.slot);
+        let plan = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("advance plan");
+        let ConsumePlan::Advance {
+            map, filled_slot, ..
+        } = plan
+        else {
+            panic!("expected Advance plan");
+        };
+        let remapped = map
+            .iter()
+            .map(|&texture| RemappedPlane {
+                texture,
+                data_ptr: texture * 700,
+                row_pitch: 256,
+            })
+            .collect();
+        D3d11PlaneRings::commit_consume(
+            ring_id,
+            ConsumeCommit::Advance {
+                filled_slot,
+                remapped,
+            },
+        );
+        D3d11PlaneRings::note_plane_unlock(ring_id);
+
+        let presenting_before =
+            D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting after advance");
+        assert_eq!(presenting_before.texture, slots[c1.slot][0].unwrap().texture);
+
+        // 프로듀서가 memcpy 중인(Writing) 슬롯을 하나 만들어 둔다.
+        let writing = D3d11PlaneRings::claim_free_slot(ring_id).expect("writing slot");
+        let writing_slot = writing.slot;
+        assert_ne!(writing_slot, c1.slot); // Presenting 슬롯은 claim 대상이 아님.
+
+        // stale InitialMapAll 커밋: 전 슬롯의 텍스처에 말도 안 되는
+        // data_ptr(0xdead)을 실어 보낸다. 링은 이미 초기 구간을 벗어났으
+        // 므로(presenting_slot.is_some()) 이 커밋은 경고만 남기고
+        // 완전히 no-op이어야 한다.
+        let bogus_mapped: Vec<RemappedPlane> = slots
+            .iter()
+            .flat_map(|s| {
+                s.iter().flatten().map(|d| RemappedPlane {
+                    texture: d.texture,
+                    data_ptr: 0xdead,
+                    row_pitch: 0,
+                })
+            })
+            .collect();
+        D3d11PlaneRings::commit_consume(ring_id, ConsumeCommit::InitialMapAll { mapped: bogus_mapped });
+
+        // Presenting 슬롯이 그대로다(슬롯0으로 강제되지 않았다).
+        let presenting_after =
+            D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting unaffected");
+        assert_eq!(presenting_after.texture, presenting_before.texture);
+
+        // Writing 슬롯은 여전히 claim 불가하다 — 만약 상태가 corrupt돼
+        // Free로 바뀌었다면 아래 루프가 그 슬롯을 반환했을 것이다. 아울러
+        // 반환되는 어떤 슬롯의 매핑 포인터도 0xdead가 아니어야 한다(=
+        // bogus 커밋이 적용되지 않았다는 증거).
+        let mut reclaimed = Vec::new();
+        while let Some(c) = D3d11PlaneRings::claim_free_slot(ring_id) {
+            if let Some(p0) = c.planes[0] {
+                assert_ne!(
+                    p0.data_ptr, 0xdead,
+                    "stale InitialMapAll commit must not have been applied"
+                );
+            }
+            reclaimed.push(c.slot);
+        }
+        assert!(
+            !reclaimed.contains(&writing_slot),
+            "stale InitialMapAll commit must not have freed the Writing slot"
+        );
+    }
+
+    /// Finding 1 회귀 테스트: 정상적으로 한 번 커밋된 `Advance`를 동일한
+    /// (또는 변조된) 내용으로 다시 커밋해도 두 번째 호출은 no-op이어야
+    /// 한다 — Remapping 슬롯이 이미 하나도 없으므로 아무 슬롯의 매핑
+    /// 포인터도 잘못 덮어써서는 안 되고 패닉도 없어야 한다.
+    #[test]
+    fn duplicate_advance_commit_is_noop() {
+        let slots = make_slots(11000);
+        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        warm_up(ring_id, &slots);
+
+        let c1 = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot for advance");
+        D3d11PlaneRings::publish_slot(ring_id, c1.slot);
+
+        let plan = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("advance plan");
+        let ConsumePlan::Advance {
+            map, filled_slot, ..
+        } = plan
+        else {
+            panic!("expected Advance plan");
+        };
+        let remapped: Vec<RemappedPlane> = map
+            .iter()
+            .map(|&texture| RemappedPlane {
+                texture,
+                data_ptr: texture * 900,
+                row_pitch: 512,
+            })
+            .collect();
+        // 첫 커밋(정상 경로).
+        D3d11PlaneRings::commit_consume(
+            ring_id,
+            ConsumeCommit::Advance {
+                filled_slot,
+                remapped,
+            },
+        );
+        D3d11PlaneRings::note_plane_unlock(ring_id);
+
+        let presenting_before =
+            D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting after first commit");
+        assert_eq!(presenting_before.texture, slots[c1.slot][0].unwrap().texture);
+
+        // 같은 filled_slot으로 다시 커밋(변조된 data_ptr로 재현) — 이제
+        // Remapping 슬롯이 하나도 없으므로 완전히 no-op이어야 한다.
+        let bogus_remapped: Vec<RemappedPlane> = map
+            .iter()
+            .map(|&texture| RemappedPlane {
+                texture,
+                data_ptr: texture * 12345,
+                row_pitch: 1,
+            })
+            .collect();
+        D3d11PlaneRings::commit_consume(
+            ring_id,
+            ConsumeCommit::Advance {
+                filled_slot,
+                remapped: bogus_remapped,
+            },
+        );
+
+        // presenting_slot이 그대로다.
+        let presenting_after =
+            D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting unaffected");
+        assert_eq!(presenting_after.texture, presenting_before.texture);
+
+        // 첫 커밋으로 Free가 된 old-presenting 슬롯(=슬롯0)을 다시
+        // claim해서, data_ptr이 중복 커밋의 bogus 값(texture*12345)이
+        // 아니라 첫 커밋 값(texture*900) 그대로인지 확인한다.
+        let reclaimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("old presenting slot free");
+        assert_eq!(reclaimed.slot, 0);
+        let p0 = reclaimed.planes[0].expect("plane0 mapped");
+        let expected_texture = slots[0][0].unwrap().texture;
+        assert_eq!(p0.data_ptr, expected_texture * 900);
+        assert_ne!(p0.data_ptr, expected_texture * 12345);
     }
 }
