@@ -44,8 +44,12 @@ use winapi::um::unknwnbase::IUnknown;
 const VIRTUAL_SURFACE_SIZE: i32 = 1024 * 32;
 
 /// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
+/// Cached behind a `OnceLock` — this is read from `bind`/`add_surface` per tile per frame
+/// (45-tile wall = thousands of calls/sec), and repeated `std::env::var` there would pollute
+/// the Task 6 performance gate. The diagnostic itself stays available for Task 6.
 fn dcomp_debug() -> bool {
-    std::env::var("SERVO_DCOMP_DEBUG").is_ok()
+    static DCOMP_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DCOMP_DEBUG.get_or_init(|| std::env::var("SERVO_DCOMP_DEBUG").is_ok())
 }
 
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.

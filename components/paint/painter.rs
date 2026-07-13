@@ -374,6 +374,10 @@ impl Painter {
             match crate::dcomp_compositor::maybe_create(&rendering_context) {
                 Some(compositor) => {
                     log::info!("[dcomp-native] engaged: WR native compositor (DirectComposition)");
+                    // 실제 발동을 rendering_context에 알린다 — present()의 스킵 판정은
+                    // env 게이트가 아닌 이 신호를 본다(리뷰 픽스: env on + 발동 실패로
+                    // Draw 폴백된 경우 present가 잘못 스킵되면 블랭크 윈도우가 된다).
+                    rendering_context.set_dcomp_native_active(true);
                     webrender::CompositorConfig::Native {
                         compositor: Box::new(compositor),
                     }

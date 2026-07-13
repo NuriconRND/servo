@@ -167,6 +167,12 @@ pub trait RenderingContext {
     fn window_hwnd(&self) -> Option<usize> {
         None
     }
+    /// Native compositor(DirectComposition)가 이 창에서 실제로 발동했는지를 painter가
+    /// 알려준다(`dcomp_compositor::maybe_create` 성공 시 `true`). env 게이트만으로
+    /// `present()`의 스킵 여부를 판단하면, env는 켜졌지만 발동에 실패해 Draw 컴포지터로
+    /// 폴백한 경우 present가 잘못 스킵돼 블랭크 윈도우가 된다 — 이 신호로 실제 상태를
+    /// 반영한다. Default no-op; `WindowRenderingContext`만 의미 있게 구현한다.
+    fn set_dcomp_native_active(&self, _active: bool) {}
     /// ANGLE의 D3D11 디바이스 raw 포인터. AddRef 하지 않는다 — 수명은 이
     /// 렌더링 컨텍스트가 보유하므로 컨텍스트보다 오래 들고 있으면 안 된다.
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
@@ -1003,6 +1009,11 @@ pub struct WindowRenderingContext {
     /// Native compositor(DirectComposition) 인터롭용 Win32 HWND. Windows에서만 보관.
     #[cfg(windows)]
     win32_hwnd: Option<usize>,
+    /// Native compositor(DirectComposition)가 이 창에서 실제로 발동했는지. painter가
+    /// `dcomp_compositor::maybe_create` 성공 시 `set_dcomp_native_active(true)`로 갱신한다.
+    /// `present()`의 스킵 판정은 env가 아닌 이 값을 본다(§`RenderingContext::set_dcomp_native_active`).
+    #[cfg(windows)]
+    dcomp_native_active: Cell<bool>,
 }
 
 impl WindowRenderingContext {
@@ -1101,6 +1112,8 @@ impl WindowRenderingContext {
             requested_gpu_index,
             #[cfg(windows)]
             win32_hwnd,
+            #[cfg(windows)]
+            dcomp_native_active: Cell::new(false),
         })
     }
 
@@ -1191,11 +1204,17 @@ impl RenderingContext for WindowRenderingContext {
 
     #[servo_tracing::instrument(skip_all, name = "WindowRenderingContext::present")]
     fn present(&self) {
-        // Native Compositor(DComp) 게이트 on이면 웹콘텐츠는 WR이 DComp 비주얼 트리에 직접
-        // 그려 DWM이 합성하고, 창 백버퍼에는 그 트리에 가려지는 egui 크롬뿐이다. 게이트
-        // on에선 ppf도 꺼져 있어(§surfman luid_display_attribs) 이 present는 표시에
+        // Native Compositor(DComp)가 실제로 발동 중이면(`set_dcomp_native_active(true)` —
+        // painter의 `maybe_create` 성공 분기에서만 호출됨) 웹콘텐츠는 WR이 DComp 비주얼
+        // 트리에 직접 그려 DWM이 합성하고, 창 백버퍼에는 그 트리에 가려지는 egui 크롬뿐이다.
+        // 이 경우 ppf도 꺼져 있어(§surfman luid_display_attribs) 이 present는 표시에
         // 기여하지 않는 offscreen→backbuffer 복사+스왑 비용만 남는다 → 스킵.
-        if dcomp_native_compositor_requested() {
+        //
+        // env 게이트(`SERVO_COMPOSITOR_DCOMP`)만으로 판단하면 안 된다: env는 켜졌지만
+        // `maybe_create`가 실패해 Draw 컴포지터로 폴백한 경우 present가 실제 표시 경로인데
+        // 잘못 스킵되어 블랭크 윈도우가 된다.
+        #[cfg(windows)]
+        if self.dcomp_native_active.get() {
             static PRESENT_SKIP_LOGGED: std::sync::Once = std::sync::Once::new();
             PRESENT_SKIP_LOGGED.call_once(|| {
                 info!("[dcomp-native] window present skipped (content composited via DComp)");
@@ -1205,6 +1224,11 @@ impl RenderingContext for WindowRenderingContext {
         if let Err(error) = self.surfman_context.present_bound_surface() {
             warn!("Error presenting surface: {error:?}");
         }
+    }
+
+    #[cfg(windows)]
+    fn set_dcomp_native_active(&self, active: bool) {
+        self.dcomp_native_active.set(active);
     }
 
     fn make_current(&self) -> Result<(), Error> {
@@ -1671,6 +1695,15 @@ impl RenderingContext for OffscreenRenderingContext {
     #[cfg(windows)]
     fn window_hwnd(&self) -> Option<usize> {
         self.parent_context.window_hwnd()
+    }
+
+    // servoshell이 Window를 Offscreen으로 감싸므로, 이 위임이 없으면 painter가 이
+    // OffscreenRenderingContext 위에서 `set_dcomp_native_active`를 호출해도 트레잇
+    // 기본(no-op)에 흡수되어 부모 WindowRenderingContext의 `present()` 스킵 판정에
+    // 절대 반영되지 않는다(다른 7종 인터롭 위임과 동일 패턴).
+    #[cfg(windows)]
+    fn set_dcomp_native_active(&self, active: bool) {
+        self.parent_context.set_dcomp_native_active(active);
     }
 
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
