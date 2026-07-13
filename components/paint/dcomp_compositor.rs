@@ -95,7 +95,6 @@ fn storage_mode() -> StorageMode {
 }
 
 /// 진단: 컬링만 끄는 스위치(요소 소실 의심 시 즉시 판별용).
-#[allow(dead_code)] // Task 4에서 결선 시 제거(컬링 배선이 이 스위치를 참조).
 fn cull_disabled() -> bool {
     static NO_CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NO_CULL.get_or_init(|| std::env::var("SERVO_DCOMP_NO_CULL").is_ok())
@@ -144,7 +143,6 @@ fn surface_extent(
 /// 알파(불투명 아님) 항목은 절대 숨겨지지 않는 것이 아니라 — 알파 항목도 "위의
 /// 불투명"에 완전히 덮이면 안 보이므로 숨김 대상이 될 수 있다. 숨기는 주체가
 /// 불투명이어야 한다는 것이 안전 조건이다.
-#[allow(dead_code)] // Task 4에서 결선 시 제거(AddVisual 이연 컬링에 사용).
 fn cull_covered(entries: &[(DeviceIntRect, bool)]) -> Vec<bool> {
     let mut visible = vec![true; entries.len()];
     for top in (0..entries.len()).rev() {
@@ -329,6 +327,10 @@ pub struct DCompNativeCompositor {
     root_visual: Option<ComOwned<IDCompositionVisual>>,
     surfaces: HashMap<NativeSurfaceId, SurfaceEntry>,
     bound: Option<BoundTile>,
+    /// 이번 프레임 add_surface가 기록한 (서피스, device 클립, 불투명 여부) — z-order대로
+    /// 누적(add_surface 호출 순 = 아래→위). AddVisual은 end_frame에서 컬링 후 일괄 수행한다.
+    /// begin_frame에서 clear.
+    frame_surfaces: Vec<(NativeSurfaceId, DeviceIntRect, bool)>,
     /// ANGLE D3D11 디바이스(비소유 — rendering_context가 수명 보유). 스왑체인 생성에 사용.
     d3d11_device: *mut ID3D11Device,
     /// 스왑체인 생성용 DXGI 팩토리. 확보 실패(None)면 하이브리드 승격 불가 — Virtual만 사용.
@@ -451,6 +453,7 @@ pub fn maybe_create(
             root_visual: Some(root_visual),
             surfaces: HashMap::new(),
             bound: None,
+            frame_surfaces: Vec::new(),
             d3d11_device: d3d,
             dxgi_factory,
             warned_scale: false,
@@ -891,6 +894,8 @@ impl Compositor for DCompNativeCompositor {
         if hr < 0 {
             warn!("[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})", hr as u32);
         }
+        // add_surface의 AddVisual은 end_frame으로 이연(Task 4 컬링) — 이번 프레임 기록 초기화.
+        self.frame_surfaces.clear();
     }
 
     fn add_surface(
@@ -923,9 +928,6 @@ impl Compositor for DCompNativeCompositor {
             }
         }
 
-        let Some(root) = self.root_visual_ptr() else {
-            return;
-        };
         let Some(entry) = self.surfaces.get_mut(&id) else {
             warn!("[dcomp-native] add_surface: unknown surface {:?}", id);
             return;
@@ -963,14 +965,9 @@ impl Compositor for DCompNativeCompositor {
             );
         }
 
-        // Safety: visual/root는 살아있는 IDCompositionVisual.
-        unsafe {
-            // insertAbove=TRUE, reference=null → 형제 최상단에 추가. 호출 순서 = z-order(아래→위).
-            let hr = (*root).AddVisual(entry.visual.as_ptr(), TRUE, ptr::null());
-            if hr < 0 {
-                warn!("[dcomp-native] AddVisual failed (hr=0x{:08x})", hr as u32);
-            }
-        }
+        // AddVisual은 end_frame으로 이연(컬링 후 일괄 조립) — 여기서는 z-order(호출 순서 =
+        // 아래→위)를 보존한 기록만 남긴다.
+        self.frame_surfaces.push((id, clip_rect, entry.is_opaque));
     }
 
     fn end_frame(&mut self, device: &mut Device) {
@@ -1171,7 +1168,34 @@ impl Compositor for DCompNativeCompositor {
             }
         }
 
-        // (Task 4가 여기에 컬링+AddVisual을 삽입)
+        // 레이어 컬링: 최상위 불투명 클립이 완전히 덮는 하위 visual을 트리에서 제외.
+        // 진단: SERVO_DCOMP_NO_CULL로 끌 수 있다(요소 소실 의심 시 즉시 판별).
+        let entries: Vec<(DeviceIntRect, bool)> = self
+            .frame_surfaces
+            .iter()
+            .map(|(_, clip, opaque)| (*clip, *opaque))
+            .collect();
+        let visible = if cull_disabled() {
+            vec![true; entries.len()]
+        } else {
+            cull_covered(&entries)
+        };
+        if let Some(root) = self.root_visual_ptr() {
+            for (i, (id, _, _)) in self.frame_surfaces.iter().enumerate() {
+                if !visible[i] {
+                    if dcomp_debug() {
+                        log::info!("[dcomp-dbg] cull id={:?} (covered by opaque above)", id);
+                    }
+                    continue;
+                }
+                let Some(entry) = self.surfaces.get(id) else { continue; };
+                // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
+                let hr = unsafe { (*root).AddVisual(entry.visual.as_ptr(), TRUE, ptr::null()) };
+                if hr < 0 {
+                    warn!("[dcomp-native] AddVisual failed (hr=0x{:08x})", hr as u32);
+                }
+            }
+        }
 
         let Some(dcomp_device) = self.dcomp_device_ptr() else {
             return;
