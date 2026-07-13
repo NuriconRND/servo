@@ -40,10 +40,13 @@ use winapi::um::winbase::INFINITE;
 use winapi::um::winnt::HANDLE;
 use wio::com::ComPtr;
 
-/// SERVO_COMPOSITOR_DCOMP 게이트. on이면 창 서피스는 DirectComposition 속성 없이
-/// 만들어 HWND의 DComp 타깃을 Native Compositor 전용으로 남긴다
-/// (CreateTargetForHwnd는 (hwnd, topmost)당 1개만 허용).
-pub(crate) fn dcomp_native_compositor_requested() -> bool {
+/// `SERVO_COMPOSITOR_DCOMP` 게이트 판정의 단일 정본(공개 API — paint_api/paint가 재사용).
+/// on이면 (1) 창 서피스는 DirectComposition 속성 없이 만들어 HWND의 DComp 타깃을
+/// Native Compositor 전용으로 남기고(CreateTargetForHwnd는 (hwnd, topmost)당 1개만 허용),
+/// (2) EGL 디스플레이의 present-path-fast를 끈다 — ppf는 pbuffer(GL_FRAMEBUFFER_DEFAULT)
+/// 렌더링에도 발동해(ANGLE UsePresentPathFast) 시저 y 자동 반전으로 WR NativeSurface의
+/// top-left 규약을 깨뜨린다.
+pub fn dcomp_native_compositor_requested() -> bool {
     std::env::var("SERVO_COMPOSITOR_DCOMP").is_ok_and(|v| {
         v == "1"
             || v.eq_ignore_ascii_case("true")

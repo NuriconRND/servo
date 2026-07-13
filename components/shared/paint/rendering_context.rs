@@ -40,6 +40,19 @@ use winapi::shared::winerror;
 use wio::com::ComPtr;
 use webrender_api::units::{DeviceIntRect, DevicePixel};
 
+/// Native Compositor(DirectComposition) 게이트(`SERVO_COMPOSITOR_DCOMP`) 판정의 단일
+/// 정본 — surfman의 공개 함수를 재수출한다(surfman은 같은 판정으로 창 서피스 DComp 속성
+/// 억제 + present-path-fast 비활성). 중복 env 파싱 금지.
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+pub use surfman::dcomp_native_compositor_requested;
+
+/// ANGLE(no-wgl) 밖에서는 DComp 네이티브 컴포지터가 성립하지 않으므로 항상 false
+/// (surfman의 angle 백엔드가 없어 정본 함수도 존재하지 않는다).
+#[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+pub fn dcomp_native_compositor_requested() -> bool {
+    false
+}
+
 /// A GL texture created by wrapping a D3D11 texture via `EGL_ANGLE_image_d3d11_texture`
 /// (media D3D11 interop for WR YUV direct sampling). Returned by
 /// [`RenderingContext::wrap_d3d11_texture_as_gl_texture`] and consumed by

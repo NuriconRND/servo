@@ -125,16 +125,13 @@ pub struct DCompNativeCompositor {
     warned_enable_native: bool,
 }
 
-/// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 이 env는 surfman이
-/// 창 서피스를 (자체 DComp 타깃 없이) 만들도록 하는 opt-out과 동일 키다(Task 1) — 따라서
-/// painter가 RenderingContext를 만들기 전에 켜져 있어야 우리 DComp 타깃이 성립한다.
+/// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
+/// 공개 함수(paint_api 경유 재수출) — surfman은 같은 판정으로 창 서피스를 DComp 속성 없이
+/// 만들고(Task 1) present-path-fast를 끈다(ppf는 pbuffer 렌더에도 발동해 타일 방향을
+/// 깨뜨림). 따라서 painter가 RenderingContext를 만들기 전에 켜져 있어야 전체 구성이
+/// 정합한다. (ANGLE이 아닌 빌드에서는 항상 false — 네이티브 컴포지터 불성립.)
 pub fn enabled() -> bool {
-    std::env::var("SERVO_COMPOSITOR_DCOMP").is_ok_and(|value| {
-        value == "1" ||
-            value.eq_ignore_ascii_case("true") ||
-            value.eq_ignore_ascii_case("yes") ||
-            value.eq_ignore_ascii_case("on")
-    })
+    paint_api::rendering_context::dcomp_native_compositor_requested()
 }
 
 /// 컴포지터를 생성한다. 실패(HWND/디바이스 없음, HRESULT 실패)면 warn 후 None을 돌려
@@ -435,18 +432,16 @@ impl Compositor for DCompNativeCompositor {
 
         // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
         //
-        // NOTE (Task 5 스모크 발견, 미해결 — Task 6 후속): DComp 표시가 발동하고 색/수평
-        // 방향은 정확하나(좌상 red·우상 lime) 수직 위치가 어긋나 타일이 조각남. WR은
-        // `DrawTarget::NativeSurface`를 top-left 원점으로 취급하는데(webrender device/gl.rs
-        // `surface_origin_is_top_left`가 NativeSurface에서 무조건 true), surfman이 감싼 EGL
-        // pbuffer는 표준 GL bottom-left라 DComp가 top-left로 읽는 D3D 아틀라스와 방향이
-        // 어긋난다는 가설이 유력하다(BeginDraw가 프레임마다 다른 update_offset·텍스처
-        // 높이로 재배치 → 불일치가 매 프레임 다른 양으로 흩어짐). PoC G4의 top-left 정합은
-        // render_quadrants가 자체 gl_y 반전을 넣어 WR 투영을 우회했으므로 이 경로를
-        // 검증하지 못했다. 시도한 수정: pbuffer 생성 시 EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE
-        // → ANGLE이 client-buffer pbuffer에 대해 EGL_BAD_ATTRIBUTE(0x3004)로 거부(무효).
-        // 올바른 수정 위치(WR native-surface Y 규약 vs ANGLE pbuffer 방향)는 RenderDoc급
-        // 검증과 함께 후속에서 확정 필요. ★임의 y-flip 핵 금지(스펙).
+        // 좌표 규약 전제(Task 5 스모크에서 규명·해결): WR은 `DrawTarget::NativeSurface`를
+        // top-left 원점으로 그리며(webrender device/gl.rs `surface_origin_is_top_left`=true,
+        // ortho bottom=0/top=h + 시저 무반전), 이는 **stock ANGLE**(viewScale −1) 전제에서만
+        // D3D row 0=top으로 정합한다. ANGLE의 present-path-fast는 디스플레이 전역이라
+        // pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동해(renderer11_utils.cpp UsePresentPathFast)
+        // viewScale +1 + 시저 y 자동 반전으로 이 정합을 깨뜨리고 타일을 수직으로 흩뜨렸다.
+        // 해결: 게이트 on이면 surfman이 EGL 디스플레이 속성에서 ppf 쌍을 제외한다
+        // (luid_display_attribs, 두 호출부 동일 판정 = LUID 디스플레이 캐시 일관).
+        // 시도했다 무효였던 것: EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE — ANGLE이
+        // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
         let origin = DeviceIntPoint::new(
             update_offset.x - dirty_rect.min.x,
             update_offset.y - dirty_rect.min.y,

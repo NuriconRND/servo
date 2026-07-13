@@ -22,6 +22,12 @@ pub use platform::default::context::{Context, ContextDescriptor, NativeContext};
 pub use platform::default::device::{Adapter, Device, NativeDevice};
 pub use platform::default::surface::{NativeWidget, Surface, SurfaceTexture};
 
+// SERVO_COMPOSITOR_DCOMP 게이트 판정의 단일 정본. surfman 내부(창 서피스 DComp 속성
+// 억제 + present-path-fast 비활성)와 상위(paint_api 창 present 스킵, paint 게이트 판정)가
+// 같은 함수를 쓴다(중복 env 파싱 금지).
+#[cfg(all(target_os = "windows", feature = "sm-angle"))]
+pub use platform::windows::angle::surface::dcomp_native_compositor_requested;
+
 // TODO(pcwalton): Fill this in with other OS's.
 #[cfg(target_os = "macos")]
 pub use platform::system::connection::Connection as SystemConnection;

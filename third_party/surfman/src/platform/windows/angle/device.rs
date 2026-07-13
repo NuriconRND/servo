@@ -4,6 +4,7 @@
 
 use super::connection::Connection;
 use super::context::Context;
+use super::surface::dcomp_native_compositor_requested;
 use crate::egl;
 use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint, EGLSurface};
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
@@ -213,10 +214,23 @@ impl Adapter {
 // The present-path-fast pair makes ANGLE render straight into the swapchain backbuffer
 // instead of an offscreen texture + a per-frame CopyResource on eglSwapBuffers
 // (see docs/superpowers/specs/2026-07-11-angle-present-path-fast-design.md).
+//
+// `enable_present_path_fast=false` omits that pair. Needed when the WR Native
+// Compositor (SERVO_COMPOSITOR_DCOMP) is on: ppf is display-wide and ANGLE's
+// UsePresentPathFast() also triggers for pbuffers (attachment type
+// GL_FRAMEBUFFER_DEFAULT, renderer11_utils.cpp:2677), where its viewScale=+1 +
+// automatic scissor y-inversion (StateManager11.cpp:535,1416) breaks WebRender's
+// NativeSurface top-left convention and scatters DComp tiles vertically. With the
+// native compositor the window present is skipped entirely, so ppf's benefit
+// (no present copy) is superseded rather than lost. Both GetPlatformDisplay call
+// sites must pass the same value (same env) — ANGLE caches displays by attribute
+// set, and a mismatch would split the per-LUID display cache (see block comment
+// above).
 fn luid_display_attribs(
     d3d_driver_type: D3D_DRIVER_TYPE,
     luid_high: i32,
     luid_low: u32,
+    enable_present_path_fast: bool,
 ) -> Vec<EGLAttrib> {
     let mut attribs = vec![
         EGL_PLATFORM_ANGLE_TYPE_ANGLE as EGLAttrib,
@@ -235,10 +249,12 @@ fn luid_display_attribs(
             luid_low as EGLAttrib,
         ]);
     }
-    attribs.extend_from_slice(&[
-        EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib,
-        EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib,
-    ]);
+    if enable_present_path_fast {
+        attribs.extend_from_slice(&[
+            EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib,
+            EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib,
+        ]);
+    }
     attribs.push(egl::NONE as EGLAttrib);
     attribs
 }
@@ -259,6 +275,7 @@ impl Device {
                     d3d_driver_type,
                     adapter_desc.AdapterLuid.HighPart,
                     adapter_desc.AdapterLuid.LowPart,
+                    !dcomp_native_compositor_requested(),
                 );
                 let egl_display = egl.GetPlatformDisplay(
                     EGL_PLATFORM_ANGLE_ANGLE,
@@ -325,6 +342,7 @@ impl Device {
                                 d3d_driver_type,
                                 adapter_desc.AdapterLuid.HighPart,
                                 adapter_desc.AdapterLuid.LowPart,
+                                !dcomp_native_compositor_requested(),
                             );
                             let display = egl.GetPlatformDisplay(
                                 EGL_PLATFORM_ANGLE_ANGLE,
@@ -745,7 +763,7 @@ mod present_path_tests {
     // so the value itself is checked too.
     #[test]
     fn luid_branch_has_present_path_fast_and_luid() {
-        let a = luid_display_attribs(D3D_DRIVER_TYPE_UNKNOWN, 0x1234, 0x5678);
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_UNKNOWN, 0x1234, 0x5678, true);
         // NONE terminated
         assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
         // present-path-fast pair (key followed by FAST value)
@@ -762,7 +780,7 @@ mod present_path_tests {
 
     #[test]
     fn warp_branch_has_present_path_fast_and_warp() {
-        let a = luid_display_attribs(D3D_DRIVER_TYPE_WARP, 0, 0);
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_WARP, 0, 0, true);
         assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
         let key = EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib;
         let pos = a.iter().position(|&x| x == key).expect("present-path key missing");
@@ -770,5 +788,28 @@ mod present_path_tests {
         // WARP branch: device-type WARP present, LUID high absent
         assert!(a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
         assert!(!a.contains(&(EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib)));
+    }
+
+    // Native Compositor(DComp) 게이트가 ppf를 끌 때: ppf 쌍 부재 + 나머지 구조(NONE 종결,
+    // LUID/WARP 분기)는 그대로여야 한다. env 의존 없이 파라미터로만 검증한다.
+    #[test]
+    fn present_path_fast_omitted_when_disabled_luid_branch() {
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_UNKNOWN, 0x1234, 0x5678, false);
+        assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
+        assert!(!a.contains(&(EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib)));
+        assert!(!a.contains(&(EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib)));
+        // LUID high/low still present with correct values
+        let hk = EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib;
+        let hp = a.iter().position(|&x| x == hk).expect("LUID high key missing");
+        assert_eq!(a[hp + 1], 0x1234 as EGLAttrib);
+    }
+
+    #[test]
+    fn present_path_fast_omitted_when_disabled_warp_branch() {
+        let a = luid_display_attribs(D3D_DRIVER_TYPE_WARP, 0, 0, false);
+        assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
+        assert!(!a.contains(&(EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib)));
+        assert!(!a.contains(&(EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib)));
+        assert!(a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
     }
 }
