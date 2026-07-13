@@ -993,7 +993,16 @@ impl Compositor for DCompNativeCompositor {
                     entry.frame_coverage.reset();
                     // 승격 상태머신: 연속 PROMOTE_STREAK회 전면 갱신이면 스왑체인 생성 요청.
                     entry.promote_streak = if frame_full { entry.promote_streak + 1 } else { 0 };
+                    // Only opaque slices are promoted to a flip swapchain. Per design
+                    // spec §5.3 (2026-07-14-dcomp-swapchain-content-design), a separate
+                    // alpha slice (e.g. a fixed caption overlay) must REMAIN a virtual
+                    // surface: its updates are partial/sparse, and a flip swapchain would
+                    // both defeat that (partial-dirty withhold pathology, Task 5-3) and
+                    // require premultiplied-alpha correctness the virtual path already
+                    // provides. Promotion targets the wall's full-repaint opaque video
+                    // slices only. `is_opaque` is WR's per-slice opacity classification.
                     if mode == StorageMode::Hybrid
+                        && entry.is_opaque
                         && !self.warned_promote_fail
                         && entry.promote_streak >= PROMOTE_STREAK
                         && self.dxgi_factory.is_some()
