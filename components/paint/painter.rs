@@ -384,6 +384,9 @@ impl Painter {
                 },
                 None => {
                     log::warn!("[dcomp-native] init failed; falling back to Draw compositor");
+                    // 초기값 false에 암묵 의존하지 않고 폴백임을 명시한다(§set_dcomp_native_active
+                    // 계약: true로의 전이는 발동 성공 시 1회뿐이고, 폴백은 항상 false를 유지).
+                    rendering_context.set_dcomp_native_active(false);
                     webrender::CompositorConfig::default()
                 },
             }

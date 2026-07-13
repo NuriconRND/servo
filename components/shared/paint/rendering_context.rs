@@ -172,6 +172,9 @@ pub trait RenderingContext {
     /// `present()`의 스킵 여부를 판단하면, env는 켜졌지만 발동에 실패해 Draw 컴포지터로
     /// 폴백한 경우 present가 잘못 스킵돼 블랭크 윈도우가 된다 — 이 신호로 실제 상태를
     /// 반영한다. Default no-op; `WindowRenderingContext`만 의미 있게 구현한다.
+    ///
+    /// 계약: `true`로의 전이는 발동 성공 시(`maybe_create` 성공) 단 1회뿐이며, 폴백
+    /// 경로는 초기값에 암묵 의존하지 않고 항상 명시적으로 `false`를 유지/설정한다.
     fn set_dcomp_native_active(&self, _active: bool) {}
     /// ANGLE의 D3D11 디바이스 raw 포인터. AddRef 하지 않는다 — 수명은 이
     /// 렌더링 컨텍스트가 보유하므로 컨텍스트보다 오래 들고 있으면 안 된다.

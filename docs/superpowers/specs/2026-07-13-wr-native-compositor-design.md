@@ -310,3 +310,15 @@ Task 1-6로 게이트(`SERVO_COMPOSITOR_DCOMP=1`) 구현·검증 완료(HEAD `2f
   코드 대부분이 `#[cfg(all(target_os = "windows", feature = "no-wgl"))]`로
   게이팅되는데, servoshell은 항상 두 피처를 함께 켜므로(Cargo.toml) 실질
   문제는 없으나 두 피처가 별도 크레이트에 선언돼 커플링이 암묵적이다.
+
+### 최종 리뷰 공시 (2건, 2026-07-13)
+
+- **잔여 egui blit** — 게이트 on에서도 servoshell egui `PaintCallback`이
+  오프스크린 프레임버퍼(콘텐츠 없음)를 창 백버퍼로 매 리페인트 blit —
+  창면적 ~1× 추가 트래픽이 잔존한다(합계 ~2×, probe 1× 대비). AMD A/B 해석
+  시 유의. blit 스킵은 "servoshell 무변경" 조항과 충돌해 사용자 결정
+  대기(`ports/servoshell/desktop/gui.rs:622-636`).
+- **스크린샷/리드백(§11-7 종결)** — 게이트 on에서 WR은 창 프레임버퍼에
+  콘텐츠를 그리지 않으므로 스크린샷 API류는 배경색만 캡처한다. §3 비범위
+  (스크린샷 API 호환) 그대로이며, 알려진 제한으로 명시한다. 외부 화면 캡처
+  (`CopyFromScreen`)는 정상.
