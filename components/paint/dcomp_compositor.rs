@@ -47,6 +47,11 @@ use winapi::um::unknwnbase::IUnknown;
 /// 가상공간 중심(vss/2) 부근에 배치한다(picture.rs:2477).
 const VIRTUAL_SURFACE_SIZE: i32 = 1024 * 32;
 
+/// 연속 이만큼의 프레임이 전면 갱신이면 Virtual -> SwapChain 승격(히스테리시스).
+const PROMOTE_STREAK: u32 = 3;
+/// 부분 dirty 누적으로 Present가 이만큼 보류되면 1회 warn(표시 지연 가시화).
+const WITHHOLD_WARN_FRAMES: u32 = 60;
+
 /// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
 /// Cached behind a `OnceLock` — this is read from `bind`/`add_surface` per tile per frame
 /// (45-tile wall = thousands of calls/sec), and repeated `std::env::var` there would pollute
@@ -73,14 +78,12 @@ fn tile_virtual_rect(
 
 /// SERVO_COMPOSITOR_DCOMP 값의 세부 모드. "surface"=가상 서피스 전용(구 경로 A/B),
 /// 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
-#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 승격 분기가 이 값을 사용).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StorageMode {
     Hybrid,
     SurfaceOnly,
 }
 
-#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 승격 분기가 이 값을 사용).
 fn storage_mode() -> StorageMode {
     static MODE: std::sync::OnceLock<StorageMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -102,13 +105,11 @@ fn cull_disabled() -> bool {
 /// Present를 안 하면 flip이라도 GetBuffer(0)가 같은 버퍼이므로 누적이 성립한다.
 /// 판정은 보수적: bind의 dirty가 그 타일의 valid_rect 전체를 덮을 때만 집계
 /// (부분 dirty 타일은 미피복 취급 — 잔상 불허, 지연 허용. 스펙 §7 정제).
-#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 Present 규칙의 근거).
 #[derive(Default)]
 struct FrameCoverage {
     covered_tiles: std::collections::HashSet<(i32, i32)>,
 }
 
-#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 Present 규칙의 근거).
 impl FrameCoverage {
     fn reset(&mut self) {
         self.covered_tiles.clear();
@@ -124,7 +125,6 @@ impl FrameCoverage {
 }
 
 /// 서피스의 타일 집합 → 가상공간 extent(스왑체인 크기·anchor의 근거).
-#[allow(dead_code)] // Task 3에서 결선 시 제거(스왑체인 크기·anchor 산출에 사용).
 fn surface_extent(
     tiles: &std::collections::HashSet<(i32, i32)>,
     virtual_offset: DeviceIntPoint,
@@ -184,17 +184,30 @@ impl<T> Drop for ComOwned<T> {
     }
 }
 
-/// BeginDraw로 얻은 스왑체인 백버퍼(GetBuffer가 AddRef해 돌려준 것). 파기 시 Release.
-/// Task 3에서 결선(bind가 스왑체인 백버퍼를 pbuffer로 감쌀 때 채운다) — 그 전까지 dead_code.
-#[allow(dead_code)] // Task 3에서 결선 시 제거.
+/// 스왑체인 백버퍼를 감싼 프레임 pbuffer. bind가 GetBuffer(0)로 백버퍼를 얻어 채우고,
+/// end_frame(또는 파기 경로)이 release_frame_pbuffer로 정리한다.
 struct FramePbuffer {
     pbuffer: usize,
-    /// GetBuffer가 AddRef해 돌려준 백버퍼 텍스처. 파기 시 Release.
+    /// GetBuffer(0)가 AddRef해 돌려준 백버퍼 텍스처. 파기 시 Release.
     texture: *mut ID3D11Texture2D,
 }
 
-/// 하이브리드 승격된 서피스의 스왑체인 저장소. Task 3에서 결선 — 그 전까지 dead_code.
-#[allow(dead_code)] // Task 3에서 결선 시 제거.
+/// 스왑체인의 프레임 pbuffer(있으면)를 파기하고 백버퍼 텍스처를 Release한다.
+/// end_frame·destroy_surface·release_all 공용 — 모든 정리 경로에서 pbuffer 1회,
+/// 텍스처 1회만 해제됨을 보장한다(take()로 재진입 안전).
+fn release_frame_pbuffer(rc: &Rc<dyn RenderingContext>, sc: &mut SwapChainStorage) {
+    if let Some(fp) = sc.frame_pbuffer.take() {
+        rc.destroy_render_pbuffer(fp.pbuffer);
+        if !fp.texture.is_null() {
+            // Safety: GetBuffer(0)가 AddRef한 백버퍼 텍스처를 한 번 반납.
+            unsafe {
+                (*(fp.texture as *mut IUnknown)).Release();
+            }
+        }
+    }
+}
+
+/// 하이브리드 승격된 서피스의 스왑체인 저장소(전면 갱신 서피스를 flip 스왑체인으로).
 struct SwapChainStorage {
     swapchain: ComOwned<IDXGISwapChain1>,
     /// 가상공간에서 백버퍼 (0,0)이 대응하는 지점(= 승격 시점 extent.min).
@@ -211,9 +224,8 @@ struct SwapChainStorage {
     fallback_virtual: Option<ComOwned<IDCompositionVirtualSurface>>,
 }
 
-/// 서피스 콘텐츠의 백엔드. 지금은 항상 `Virtual`(동작 불변 리팩터) — Task 3이
-/// 전면 갱신 서피스를 `SwapChain`으로 승격하는 분기를 결선한다.
-#[allow(dead_code)] // SwapChain variant: Task 3에서 결선 시 제거.
+/// 서피스 콘텐츠의 백엔드. 기본은 `Virtual`(가상 서피스), 연속 전면 갱신 서피스는
+/// end_frame에서 `SwapChain`(flip 스왑체인)으로 승격된다.
 enum SurfaceStorage {
     Virtual {
         virtual_surface: ComOwned<IDCompositionVirtualSurface>,
@@ -227,12 +239,13 @@ struct SurfaceEntry {
     visual: ComOwned<IDCompositionVisual>,
     virtual_offset: DeviceIntPoint,
     tile_size: DeviceIntSize,
-    #[allow(dead_code)]
     is_opaque: bool,
-    /// bind/unbind된 타일 좌표 부기(Task 3의 승격 판단·surface_extent 근거).
+    /// bind/unbind된 타일 좌표 부기(승격 판단·surface_extent 근거).
     tiles: std::collections::HashSet<(i32, i32)>,
-    /// 연속으로 승격 조건을 만족한 프레임 수(Task 3의 히스테리시스 근거).
-    #[allow(dead_code)] // Task 3에서 결선 시 제거.
+    /// 이번 프레임 Virtual bind가 note_tile한 타일 피복(전면 갱신 승격 판정용).
+    /// 매 end_frame 말미에 reset.
+    frame_coverage: FrameCoverage,
+    /// 연속으로 전면 갱신을 만족한 프레임 수(승격 히스테리시스).
     promote_streak: u32,
 }
 
@@ -259,15 +272,15 @@ pub struct DCompNativeCompositor {
     surfaces: HashMap<NativeSurfaceId, SurfaceEntry>,
     bound: Option<BoundTile>,
     /// ANGLE D3D11 디바이스(비소유 — rendering_context가 수명 보유). 스왑체인 생성에 사용.
-    #[allow(dead_code)] // Task 3에서 결선 시 제거(create_composition_swapchain 호출부가 사용).
     d3d11_device: *mut ID3D11Device,
     /// 스왑체인 생성용 DXGI 팩토리. 확보 실패(None)면 하이브리드 승격 불가 — Virtual만 사용.
-    #[allow(dead_code)] // Task 3에서 결선 시 제거(create_composition_swapchain이 사용).
     dxgi_factory: Option<ComOwned<IDXGIFactory2>>,
     warned_scale: bool,
     warned_rounded_clip: bool,
     warned_external_surface: bool,
     warned_enable_native: bool,
+    /// 스왑체인 생성이 한 번이라도 실패하면 이후 승격을 영구 중단(warn 1회, Virtual 유지).
+    warned_promote_fail: bool,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -383,6 +396,7 @@ pub fn maybe_create(
             warned_rounded_clip: false,
             warned_external_surface: false,
             warned_enable_native: false,
+            warned_promote_fail: false,
         })
     }
 }
@@ -399,8 +413,6 @@ impl DCompNativeCompositor {
     /// 컴포지션용 flip 스왑체인 생성. 실패 시 None(호출자는 Virtual 유지 폴백).
     /// FLIP_DISCARD + BufferCount 2: 이전 버퍼를 읽지 않는다 — 정확성은
     /// FrameCoverage의 full-coverage Present 규칙이 보장(계획 Global Constraints).
-    /// (현재 호출자 없음 — Task 3에서 결선하며 이 allow를 제거한다.)
-    #[allow(dead_code)]
     fn create_composition_swapchain(
         &self,
         size: DeviceIntSize,
@@ -471,7 +483,14 @@ impl DCompNativeCompositor {
     /// deinit이 egl.Terminate보다 먼저 이 경로를 호출하므로 EGL 자원이 아직 살아있다.
     fn release_all(&mut self) {
         self.drop_bound_without_enddraw();
-        // ComOwned Drop이 각 visual + virtual_surface를 Release.
+        // SwapChain storage의 frame_pbuffer는 RAII가 아니므로 clear 전에 명시 정리한다.
+        let rc = self.rendering_context.clone();
+        for entry in self.surfaces.values_mut() {
+            if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
+                release_frame_pbuffer(&rc, sc);
+            }
+        }
+        // ComOwned Drop이 각 visual + storage(virtual_surface 또는 swapchain/fallback)를 Release.
         self.surfaces.clear();
         self.root_visual = None;
         self._target = None;
@@ -545,6 +564,7 @@ impl Compositor for DCompNativeCompositor {
                 tile_size,
                 is_opaque,
                 tiles: std::collections::HashSet::new(),
+                frame_coverage: FrameCoverage::default(),
                 promote_streak: 0,
             }
         };
@@ -579,119 +599,184 @@ impl Compositor for DCompNativeCompositor {
         _device: &mut Device,
         id: NativeTileId,
         dirty_rect: DeviceIntRect,
-        _valid_rect: DeviceIntRect,
+        valid_rect: DeviceIntRect,
     ) -> NativeSurfaceInfo {
         let fail = NativeSurfaceInfo {
             origin: DeviceIntPoint::zero(),
             fbo_id: 0,
         };
+        // rendering_context 호출을 엔트리 borrow와 분리(같은 self의 다른 필드지만 명시
+        // clone으로 borrow 충돌 여지를 없앤다 — 엔트리는 get_mut로 지속 borrow된다).
+        let rc = self.rendering_context.clone();
 
-        // 서피스에서 필요한 Copy 값만 뽑아 borrow를 즉시 끝낸다(이후 self를 mutate하기 위함).
-        let Some(entry) = self.surfaces.get(&id.surface_id) else {
+        let Some(entry) = self.surfaces.get_mut(&id.surface_id) else {
             warn!("[dcomp-native] bind: unknown surface {:?}", id.surface_id);
             return fail;
         };
-        let vsurf = match &entry.storage {
-            SurfaceStorage::Virtual { virtual_surface } => virtual_surface.as_ptr(),
-            SurfaceStorage::SwapChain(_) => {
-                // Task 3까지 도달 불가(create_surface가 항상 Virtual만 만든다).
-                warn!("[dcomp-native] bind: SwapChain storage not yet wired (surface {:?})", id.surface_id);
-                return fail;
-            },
-        };
         let tile_rect = tile_virtual_rect(entry.virtual_offset, entry.tile_size, id.x, id.y);
 
-        // BeginDraw는 가상공간 절대좌표 RECT를 받는다: 타일 rect를 타일-로컬 dirty로 오프셋.
-        let update = RECT {
-            left: tile_rect.min.x + dirty_rect.min.x,
-            top: tile_rect.min.y + dirty_rect.min.y,
-            right: tile_rect.min.x + dirty_rect.max.x,
-            bottom: tile_rect.min.y + dirty_rect.max.y,
-        };
-
-        // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
-        // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
-        let (texture, update_offset, desc) = unsafe {
-            let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
-            let mut update_offset = POINT { x: 0, y: 0 };
-            let hr = (*vsurf).BeginDraw(
-                &update,
-                &ID3D11Texture2D::uuidof(),
-                &mut tex as *mut _ as *mut _,
-                &mut update_offset,
-            );
-            if hr < 0 || tex.is_null() {
-                warn!("[dcomp-native] BeginDraw failed (hr=0x{:08x}); giving up tile", hr as u32);
-                return fail;
-            }
-            // BeginDraw 텍스처의 실제 크기(아틀라스일 수 있음)로 pbuffer를 만든다.
-            let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
-            (*tex).GetDesc(&mut desc);
-            (tex, update_offset, desc)
-        };
-
-        let pbuffer = match self.rendering_context.create_render_pbuffer_from_d3d_texture(
-            texture as usize,
-            UntypedSize2D::new(desc.Width as i32, desc.Height as i32),
-        ) {
-            Some(pbuffer) => pbuffer,
-            None => {
-                warn!("[dcomp-native] pbuffer wrap failed; giving up tile");
-                // Safety: 실패 경로 정리 — 텍스처 Release + EndDraw로 서피스 상태 복구.
-                unsafe {
-                    (*(texture as *mut IUnknown)).Release();
-                    let _ = (*vsurf).EndDraw();
+        match &mut entry.storage {
+            SurfaceStorage::SwapChain(sc) => {
+                // 프레임 첫 bind에서 백버퍼 래핑(프레임 캐시). Present를 안 하면
+                // GetBuffer(0)가 같은 버퍼이므로 미프레젠트 프레임 간 누적도 정확.
+                if sc.frame_pbuffer.is_none() {
+                    // Safety: swapchain은 살아있는 IDXGISwapChain1. GetBuffer는 AddRef된
+                    // RENDER_TARGET 백버퍼를 돌려준다.
+                    let texture = unsafe {
+                        let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+                        let hr = (*sc.swapchain.as_ptr()).GetBuffer(
+                            0,
+                            &ID3D11Texture2D::uuidof(),
+                            &mut tex as *mut _ as *mut _,
+                        );
+                        if hr < 0 || tex.is_null() {
+                            warn!("[dcomp-native] GetBuffer(0) failed (hr=0x{:08x}); giving up tile", hr as u32);
+                            return fail;
+                        }
+                        tex
+                    };
+                    let pbuffer = match rc.create_render_pbuffer_from_d3d_texture(
+                        texture as usize,
+                        UntypedSize2D::new(sc.size.width, sc.size.height),
+                    ) {
+                        Some(p) => p,
+                        None => {
+                            warn!("[dcomp-native] swapchain pbuffer wrap failed; giving up tile");
+                            // Safety: GetBuffer가 AddRef한 텍스처 반납.
+                            unsafe {
+                                (*(texture as *mut IUnknown)).Release();
+                            }
+                            return fail;
+                        },
+                    };
+                    sc.frame_pbuffer = Some(FramePbuffer { pbuffer, texture });
                 }
-                return fail;
+                let Some(fp) = sc.frame_pbuffer.as_ref() else {
+                    return fail;
+                };
+                if !rc.make_render_pbuffer_current(fp.pbuffer) {
+                    warn!("[dcomp-native] make current (swapchain) failed; giving up tile");
+                    return fail;
+                }
+                sc.coverage.note_tile((id.x, id.y), dirty_rect, valid_rect);
+                sc.drawn_this_frame = true;
+                // 스왑체인 bind는 BoundTile을 만들지 않는다(EndDraw/파기 대상 없음 —
+                // unbind는 bound==None이라 자연히 no-op).
+                self.bound = None;
+                // 백버퍼는 0-기준 좌표: 타일의 가상공간 위치에서 anchor(백버퍼 (0,0)의
+                // 가상좌표)를 빼 백버퍼-로컬 origin을 만든다. 표시 측 오프셋은 add_surface가
+                // anchor를 더해 보정한다.
+                let origin = DeviceIntPoint::new(
+                    tile_rect.min.x - sc.anchor.x,
+                    tile_rect.min.y - sc.anchor.y,
+                );
+                if dcomp_debug() {
+                    log::info!(
+                        "[dcomp-dbg] bind(swapchain) surface={:?} tile=({},{}) anchor=({},{}) -> origin=({},{})",
+                        id.surface_id, id.x, id.y, sc.anchor.x, sc.anchor.y, origin.x, origin.y
+                    );
+                }
+                NativeSurfaceInfo { origin, fbo_id: 0 }
             },
-        };
+            SurfaceStorage::Virtual { virtual_surface } => {
+                let vsurf = virtual_surface.as_ptr();
 
-        if !self.rendering_context.make_render_pbuffer_current(pbuffer) {
-            warn!("[dcomp-native] make_render_pbuffer_current failed; giving up tile");
-            self.rendering_context.destroy_render_pbuffer(pbuffer);
-            // Safety: 위와 동일한 실패 경로 정리.
-            unsafe {
-                (*(texture as *mut IUnknown)).Release();
-                let _ = (*vsurf).EndDraw();
-            }
-            return fail;
+                // BeginDraw는 가상공간 절대좌표 RECT를 받는다: 타일 rect를 타일-로컬 dirty로 오프셋.
+                let update = RECT {
+                    left: tile_rect.min.x + dirty_rect.min.x,
+                    top: tile_rect.min.y + dirty_rect.min.y,
+                    right: tile_rect.min.x + dirty_rect.max.x,
+                    bottom: tile_rect.min.y + dirty_rect.max.y,
+                };
+
+                // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
+                // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
+                let (texture, update_offset, desc) = unsafe {
+                    let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+                    let mut update_offset = POINT { x: 0, y: 0 };
+                    let hr = (*vsurf).BeginDraw(
+                        &update,
+                        &ID3D11Texture2D::uuidof(),
+                        &mut tex as *mut _ as *mut _,
+                        &mut update_offset,
+                    );
+                    if hr < 0 || tex.is_null() {
+                        warn!("[dcomp-native] BeginDraw failed (hr=0x{:08x}); giving up tile", hr as u32);
+                        return fail;
+                    }
+                    // BeginDraw 텍스처의 실제 크기(아틀라스일 수 있음)로 pbuffer를 만든다.
+                    let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
+                    (*tex).GetDesc(&mut desc);
+                    (tex, update_offset, desc)
+                };
+
+                let pbuffer = match rc.create_render_pbuffer_from_d3d_texture(
+                    texture as usize,
+                    UntypedSize2D::new(desc.Width as i32, desc.Height as i32),
+                ) {
+                    Some(pbuffer) => pbuffer,
+                    None => {
+                        warn!("[dcomp-native] pbuffer wrap failed; giving up tile");
+                        // Safety: 실패 경로 정리 — 텍스처 Release + EndDraw로 서피스 상태 복구.
+                        unsafe {
+                            (*(texture as *mut IUnknown)).Release();
+                            let _ = (*vsurf).EndDraw();
+                        }
+                        return fail;
+                    },
+                };
+
+                if !rc.make_render_pbuffer_current(pbuffer) {
+                    warn!("[dcomp-native] make_render_pbuffer_current failed; giving up tile");
+                    rc.destroy_render_pbuffer(pbuffer);
+                    // Safety: 위와 동일한 실패 경로 정리.
+                    unsafe {
+                        (*(texture as *mut IUnknown)).Release();
+                        let _ = (*vsurf).EndDraw();
+                    }
+                    return fail;
+                }
+
+                // 텍스처는 WR의 GL draw 동안 살려두고 unbind의 EndDraw 이후 Release한다.
+                self.bound = Some(BoundTile {
+                    surface_id: id.surface_id,
+                    pbuffer,
+                    texture,
+                });
+
+                // 승격 판정용 프레임 피복 집계(dirty가 valid 전체를 덮는 전면 타일만).
+                entry.frame_coverage.note_tile((id.x, id.y), dirty_rect, valid_rect);
+
+                // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
+                //
+                // 좌표 규약 전제(Task 5 스모크에서 규명·해결): WR은 `DrawTarget::NativeSurface`를
+                // top-left 원점으로 그리며(webrender device/gl.rs `surface_origin_is_top_left`=true,
+                // ortho bottom=0/top=h + 시저 무반전), 이는 **stock ANGLE**(viewScale −1) 전제에서만
+                // D3D row 0=top으로 정합한다. ANGLE의 present-path-fast는 디스플레이 전역이라
+                // pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동해(renderer11_utils.cpp UsePresentPathFast)
+                // viewScale +1 + 시저 y 자동 반전으로 이 정합을 깨뜨리고 타일을 수직으로 흩뜨렸다.
+                // 해결: 게이트 on이면 surfman이 EGL 디스플레이 속성에서 ppf 쌍을 제외한다
+                // (luid_display_attribs, 두 호출부 동일 판정 = LUID 디스플레이 캐시 일관).
+                // 시도했다 무효였던 것: EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE — ANGLE이
+                // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
+                let origin = DeviceIntPoint::new(
+                    update_offset.x - dirty_rect.min.x,
+                    update_offset.y - dirty_rect.min.y,
+                );
+                if dcomp_debug() {
+                    log::info!(
+                        "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
+                         update_off=({},{}) tex={}x{} -> origin=({},{})",
+                        id.surface_id, id.x, id.y,
+                        dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
+                        tile_rect.min.x, tile_rect.min.y,
+                        update_offset.x, update_offset.y, desc.Width, desc.Height,
+                        origin.x, origin.y
+                    );
+                }
+                NativeSurfaceInfo { origin, fbo_id: 0 }
+            },
         }
-
-        // 텍스처는 WR의 GL draw 동안 살려두고 unbind의 EndDraw 이후 Release한다.
-        self.bound = Some(BoundTile {
-            surface_id: id.surface_id,
-            pbuffer,
-            texture,
-        });
-
-        // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
-        //
-        // 좌표 규약 전제(Task 5 스모크에서 규명·해결): WR은 `DrawTarget::NativeSurface`를
-        // top-left 원점으로 그리며(webrender device/gl.rs `surface_origin_is_top_left`=true,
-        // ortho bottom=0/top=h + 시저 무반전), 이는 **stock ANGLE**(viewScale −1) 전제에서만
-        // D3D row 0=top으로 정합한다. ANGLE의 present-path-fast는 디스플레이 전역이라
-        // pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동해(renderer11_utils.cpp UsePresentPathFast)
-        // viewScale +1 + 시저 y 자동 반전으로 이 정합을 깨뜨리고 타일을 수직으로 흩뜨렸다.
-        // 해결: 게이트 on이면 surfman이 EGL 디스플레이 속성에서 ppf 쌍을 제외한다
-        // (luid_display_attribs, 두 호출부 동일 판정 = LUID 디스플레이 캐시 일관).
-        // 시도했다 무효였던 것: EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE — ANGLE이
-        // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
-        let origin = DeviceIntPoint::new(
-            update_offset.x - dirty_rect.min.x,
-            update_offset.y - dirty_rect.min.y,
-        );
-        if dcomp_debug() {
-            log::info!(
-                "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
-                 update_off=({},{}) tex={}x{} -> origin=({},{})",
-                id.surface_id, id.x, id.y,
-                dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
-                tile_rect.min.x, tile_rect.min.y,
-                update_offset.x, update_offset.y, desc.Width, desc.Height,
-                origin.x, origin.y
-            );
-        }
-        NativeSurfaceInfo { origin, fbo_id: 0 }
     }
 
     fn unbind(&mut self, _device: &mut Device) {
@@ -709,9 +794,10 @@ impl Compositor for DCompNativeCompositor {
                     }
                 },
                 SurfaceStorage::SwapChain(_) => {
-                    // Task 3까지 도달 불가(bind가 SwapChain 진입 전에 이미 fail 반환).
+                    // 도달 불가: 스왑체인 bind는 BoundTile을 만들지 않으므로(self.bound=None)
+                    // 그 타일의 unbind는 위 self.bound.take()에서 이미 조기 반환한다.
                     warn!(
-                        "[dcomp-native] unbind: SwapChain storage not yet wired (surface {:?})",
+                        "[dcomp-native] unbind: unexpected bound tile on swapchain surface {:?}",
                         bound.surface_id
                     );
                 },
@@ -783,12 +869,20 @@ impl Compositor for DCompNativeCompositor {
         };
         let visual = entry.visual.as_ptr();
         let virtual_offset = entry.virtual_offset;
+        // 스왑체인 콘텐츠는 백버퍼 0-기준 좌표(백버퍼 (0,0) = 가상좌표 anchor)에 그려졌다.
+        // Virtual 콘텐츠는 가상 절대좌표에 그려졌다(anchor 없음 = 0). 아래 오프셋 식에서
+        // Virtual은 -virtual_offset이 ~16384 가상좌표를 상쇄하고, SwapChain은 anchor를
+        // 더해 0-기준 좌표를 같은 device 위치로 되돌린다(anchor≈virtual_offset이면 순수 transform).
+        let content_anchor = match &entry.storage {
+            SurfaceStorage::SwapChain(sc) => sc.anchor,
+            SurfaceStorage::Virtual { .. } => DeviceIntPoint::zero(),
+        };
 
         // 콘텐츠는 가상공간 절대좌표(virtual_offset + 타일격자)에 그려졌다. 비주얼 오프셋을
-        // (transform.offset - virtual_offset)으로 주면 콘텐츠가 창 device 좌표 transform.offset에
-        // 놓인다(Gecko DCLayerTree 동일 보정, scale=1 가정).
-        let offset_x = transform.offset.x - virtual_offset.x as f32;
-        let offset_y = transform.offset.y - virtual_offset.y as f32;
+        // (transform.offset - virtual_offset [+ anchor])으로 주면 콘텐츠가 창 device 좌표
+        // transform.offset에 놓인다(Gecko DCLayerTree 동일 보정, scale=1 가정).
+        let offset_x = transform.offset.x - virtual_offset.x as f32 + content_anchor.x as f32;
+        let offset_y = transform.offset.y - virtual_offset.y as f32 + content_anchor.y as f32;
 
         // DComp SetClip은 비주얼-로컬(오프셋 적용 전) 좌표를 받아 오프셋으로 변환되므로
         // (MS docs: "The clip is transformed by the OffsetX, OffsetY..."), device 클립에서
@@ -833,7 +927,178 @@ impl Compositor for DCompNativeCompositor {
         }
     }
 
-    fn end_frame(&mut self, _device: &mut Device) {
+    fn end_frame(&mut self, device: &mut Device) {
+        // GL 커맨드를 D3D 큐에 확실히 제출한 뒤 Present(순서 보장).
+        device.gl().flush();
+
+        let mode = storage_mode();
+        let rc = self.rendering_context.clone();
+        // borrow 사정(iter_mut 중 self 메서드 호출 불가)상 스왑체인 생성이 필요한 요청을
+        // 모아 루프 밖에서 처리한다.
+        //  - promote_requests: Virtual → SwapChain 신규 승격 (id, 승격 extent)
+        //  - regen_requests: 리사이즈 등으로 지오메트리가 바뀐 기존 SwapChain 재생성 (id, 새 extent)
+        let mut promote_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
+        let mut regen_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
+
+        for (id, entry) in self.surfaces.iter_mut() {
+            // 전면 갱신 = 이 프레임의 dirty가 전 타일의 valid를 덮음(Virtual bind 집계).
+            let frame_full = entry.frame_coverage.is_full(&entry.tiles);
+
+            match &mut entry.storage {
+                SurfaceStorage::Virtual { .. } => {
+                    // 승격 상태머신: 연속 PROMOTE_STREAK회 전면 갱신이면 스왑체인 생성 요청.
+                    entry.promote_streak = if frame_full { entry.promote_streak + 1 } else { 0 };
+                    if mode == StorageMode::Hybrid
+                        && !self.warned_promote_fail
+                        && entry.promote_streak >= PROMOTE_STREAK
+                        && self.dxgi_factory.is_some()
+                    {
+                        if let Some(extent) =
+                            surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size)
+                        {
+                            promote_requests.push((*id, extent));
+                        }
+                    }
+                },
+                SurfaceStorage::SwapChain(sc) => {
+                    // 리사이즈 등으로 서피스 extent가 바뀌면 스왑체인이 스테일 — 루프 밖에서
+                    // 새 크기로 재생성한다(옛 콘텐츠는 DComp가 SetContent 참조로 유지 → 무글리치).
+                    let cur_extent =
+                        surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size);
+                    let geometry_changed = cur_extent
+                        .is_some_and(|e| e.min != sc.anchor || e.size() != sc.size);
+
+                    if geometry_changed {
+                        if let Some(e) = cur_extent {
+                            regen_requests.push((*id, e));
+                        }
+                    } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
+                        // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
+                        let hr = unsafe { (*sc.swapchain.as_ptr()).Present(0, 0) };
+                        if hr < 0 {
+                            warn!("[dcomp-native] Present failed (hr=0x{:08x})", hr as u32);
+                        } else {
+                            sc.coverage.reset();
+                            sc.withheld_frames = 0;
+                            if !sc.content_attached {
+                                // 첫 완전 프레젠트 → visual 콘텐츠를 스왑체인으로 전환(무글리치).
+                                // Safety: visual/swapchain 살아있음.
+                                let hr = unsafe {
+                                    (*entry.visual.as_ptr())
+                                        .SetContent(sc.swapchain.as_ptr() as *const IUnknown)
+                                };
+                                if hr >= 0 {
+                                    sc.content_attached = true;
+                                    sc.fallback_virtual = None; // 구 가상 서피스 해제
+                                    if dcomp_debug() {
+                                        log::info!("[dcomp-dbg] content-swap id={:?} -> swapchain", id);
+                                    }
+                                } else {
+                                    warn!("[dcomp-native] SetContent(swapchain) failed (hr=0x{:08x})", hr as u32);
+                                }
+                            }
+                        }
+                    } else if sc.drawn_this_frame {
+                        // 부분 갱신 → Present 보류(마지막 완전 화면 유지, 다음 프레임 누적).
+                        sc.withheld_frames += 1;
+                        if sc.withheld_frames == WITHHOLD_WARN_FRAMES {
+                            warn!(
+                                "[dcomp-native] surface {:?}: swapchain present withheld for {} frames \
+                                 (partial dirty accumulating; display update delayed)",
+                                id, sc.withheld_frames
+                            );
+                        }
+                        if dcomp_debug() {
+                            log::info!("[dcomp-dbg] withhold id={:?} covered={}/{}",
+                                id, sc.coverage.covered_tiles.len(), entry.tiles.len());
+                        }
+                    }
+                    // 프레임 pbuffer 파기(미프레젠트여도 다음 프레임 GetBuffer(0)=같은 버퍼).
+                    release_frame_pbuffer(&rc, sc);
+                    sc.drawn_this_frame = false;
+                },
+            }
+            entry.frame_coverage.reset();
+        }
+
+        // 승격 실행(루프 밖): 스왑체인 생성 성공 시 storage 교체, visual 콘텐츠는
+        // fallback_virtual(구 가상 서피스)로 유지 — 첫 완전 Present에서 SetContent 전환.
+        for (surface_id, extent) in promote_requests {
+            let is_opaque = match self.surfaces.get(&surface_id) {
+                Some(e) => e.is_opaque,
+                None => continue,
+            };
+            let size = extent.size();
+            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque) else {
+                // 생성 실패 → 이후 승격 영구 중단(Virtual 유지). helper가 warn 1회를 남긴다.
+                self.warned_promote_fail = true;
+                continue;
+            };
+            let Some(entry) = self.surfaces.get_mut(&surface_id) else {
+                continue;
+            };
+            // 구 Virtual 서피스를 새 SwapChain storage로 교체하며 fallback으로 이동.
+            let old = std::mem::replace(
+                &mut entry.storage,
+                SurfaceStorage::SwapChain(SwapChainStorage {
+                    swapchain,
+                    anchor: extent.min,
+                    size,
+                    coverage: FrameCoverage::default(),
+                    frame_pbuffer: None,
+                    drawn_this_frame: false,
+                    content_attached: false,
+                    withheld_frames: 0,
+                    fallback_virtual: None,
+                }),
+            );
+            if let SurfaceStorage::Virtual { virtual_surface } = old {
+                if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
+                    sc.fallback_virtual = Some(virtual_surface);
+                }
+            }
+            if dcomp_debug() {
+                log::info!(
+                    "[dcomp-dbg] promote id={:?} extent={}x{} anchor=({},{})",
+                    surface_id, size.width, size.height, extent.min.x, extent.min.y
+                );
+            }
+        }
+
+        // 지오메트리 변화(리사이즈) 재생성(루프 밖): 스왑체인만 새 extent로 교체.
+        // 옛 스왑체인 ComOwned를 대체(Release)해도 visual의 SetContent 참조를 DComp가 유지하므로
+        // 다음 완전 Present에서 SetContent(new)까지 옛 콘텐츠가 계속 표시된다(무글리치).
+        for (surface_id, extent) in regen_requests {
+            let is_opaque = match self.surfaces.get(&surface_id) {
+                Some(e) => e.is_opaque,
+                None => continue,
+            };
+            let size = extent.size();
+            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque) else {
+                continue; // 재생성 실패 → 스테일 스왑체인 유지(helper warn 1회)
+            };
+            if let Some(entry) = self.surfaces.get_mut(&surface_id) {
+                if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
+                    release_frame_pbuffer(&rc, sc);
+                    sc.swapchain = swapchain; // 옛 스왑체인 Release(DComp 참조는 유지)
+                    sc.anchor = extent.min;
+                    sc.size = size;
+                    sc.coverage.reset();
+                    sc.content_attached = false; // 다음 완전 Present에서 새 스왑체인으로 SetContent
+                    sc.withheld_frames = 0;
+                    sc.drawn_this_frame = false;
+                    if dcomp_debug() {
+                        log::info!(
+                            "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
+                            surface_id, size.width, size.height, extent.min.x, extent.min.y
+                        );
+                    }
+                }
+            }
+        }
+
+        // (Task 4가 여기에 컬링+AddVisual을 삽입)
+
         let Some(dcomp_device) = self.dcomp_device_ptr() else {
             return;
         };
@@ -850,7 +1115,14 @@ impl Compositor for DCompNativeCompositor {
             warn!("[dcomp-native] destroy_surface on bound surface {:?}; dropping bound state", id);
             self.drop_bound_without_enddraw();
         }
-        // remove → ComOwned Drop이 visual + virtual_surface를 Release.
+        // SwapChain storage의 frame_pbuffer는 RAII가 아니므로 remove 전에 명시 정리한다.
+        let rc = self.rendering_context.clone();
+        if let Some(entry) = self.surfaces.get_mut(&id) {
+            if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
+                release_frame_pbuffer(&rc, sc);
+            }
+        }
+        // remove → ComOwned Drop이 visual + storage(virtual_surface 또는 swapchain/fallback)를 Release.
         self.surfaces.remove(&id);
     }
 
