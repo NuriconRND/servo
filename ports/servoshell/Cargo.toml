@@ -74,6 +74,9 @@ keyboard-types = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 mime_guess = { workspace = true }
+# For the DComp native-compositor gate check (`dcomp_native_compositor_requested`) used to
+# suppress egui chrome so the webview fills the client (no bottom black band under DComp).
+paint_api = { workspace = true }
 raw-window-handle = { workspace = true }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
 servo = { workspace = true, features = ["background_hang_monitor", "bluetooth", "testbinding"], default-features = false }

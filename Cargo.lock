@@ -9168,6 +9168,7 @@ dependencies = [
  "servo",
  "servo-allocator",
  "servo-base",
+ "servo-paint-api",
  "servo-webdriver-server",
  "signal-hook-registry",
  "surfman",

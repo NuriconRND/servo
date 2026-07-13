@@ -390,9 +390,26 @@ impl Gui {
         context.run(winit_window, |ctx| {
             load_pending_favicons(ctx, window, favicon_textures);
 
+            // DComp 네이티브 컴포지터 게이트(env `SERVO_COMPOSITOR_DCOMP`)가 요청되면 egui
+            // 크롬(툴바 + 탭 스트립, 둘 다 top 패널)을 아예 배치하지 않는다. 이 패널들은 웹뷰를
+            // toolbar_height만큼 아래로 밀어 웹뷰(= DComp가 덮는 영역)를 창보다 작게 만드는데,
+            // DComp 발동 시 창 백버퍼는 present되지 않으므로(WindowRenderingContext::present가
+            // 스킵) 그 남는 스트립이 검정 밴드로 남는다(실측 evidence/wall45_band_check.png,
+            // 클라이언트 하단 ~60px). 크롬을 빼면 아래 else가 toolbar_height=0으로 잡아 웹뷰가
+            // 클라이언트 전체를 차지 → DComp 콘텐츠가 전면을 덮어 밴드가 소멸한다.
+            //
+            // 판정을 실발동(dcomp_native_active)이 아니라 env(요청)로 하는 이유: 실발동 플래그는
+            // painter가 RenderingContext를 만든 뒤에야 true가 되므로 그걸로 판정하면 첫 프레임엔
+            // 크롬이 있다가 사라져 웹뷰 리사이즈 처너가 생긴다. env는 시작 프레임부터 안정적이고,
+            // env-on인데 발동 실패(폴백 Draw)해도 풀윈도우 웹뷰로 콘텐츠가 정상 표시돼 안전하다.
+            // (반면 아래 웹뷰 blit 스킵은 실발동 기준 — blit 낭비는 실제로 DComp에 present할 때만
+            // 생기기 때문.) 게이트 off는 항상 false라 기존 레이아웃과 바이트 동일.
+            let suppress_egui_chrome_for_dcomp =
+                paint_api::rendering_context::dcomp_native_compositor_requested();
+
             // TODO: While in fullscreen add some way to mitigate the increased phishing risk
             // when not displaying the URL bar: https://github.com/servo/servo/issues/32443
-            if winit_window.fullscreen().is_none() {
+            if winit_window.fullscreen().is_none() && !suppress_egui_chrome_for_dcomp {
                 let frame = egui::Frame::default()
                     .fill(ctx.style().visuals.window_fill)
                     .inner_margin(4.0);
