@@ -17,6 +17,15 @@ param(
     # this process only; the switch is re-evaluated every run (stale env from a prior
     # manual `$env:SERVO_COMPOSITOR_DCOMP` is cleared when omitted).
     [switch] $DComp,
+    # DComp storage-mode selector (spec docs/superpowers/specs/2026-07-14-dcomp-swapchain-
+    # content-design.md). Requires -DComp. Without -DCompSurface, -DComp alone selects the
+    # swap-chain HYBRID path (SERVO_COMPOSITOR_DCOMP=1): opaque surfaces with repeated
+    # full-repaint promote to a flip swapchain (probe-parity Present), everything else stays
+    # on the virtual-surface path. With -DCompSurface, -DComp -DCompSurface selects the
+    # VIRTUAL-SURFACE-ONLY legacy path (SERVO_COMPOSITOR_DCOMP=surface): no swapchain
+    # promotion ever happens -- kept for AMD A/B against the hybrid path. -DCompSurface
+    # without -DComp is a no-op (warns and is ignored; DComp stays off).
+    [switch] $DCompSurface,
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets
     # SERVO_WR_PICTURE_TILE_SIZE; cleared when omitted (stale-env convention). A/B knob
@@ -52,17 +61,23 @@ param(
 #                               inert while DIRECT_FILE is active; kept as a safety net
 #                               for any tile that falls back to the servosrc push path
 #
-# -DComp (optional, off by default): SERVO_COMPOSITOR_DCOMP=1 -- WR Native Compositor
-# (DirectComposition). WR draws picture-cache tiles directly into DComp surfaces and DWM
-# composites them, eliminating the per-frame tile->backbuffer draw pass (spec
-# docs/superpowers/specs/2026-07-13-wr-native-compositor-design.md). Aimed at the
-# window-enlarge GPU%/framerate falloff on bandwidth-limited GPUs (older AMD). On failure
-# it falls back to the current Draw compositor (screen still shows). AMD read-out
-# procedure: (1) run WITHOUT -DComp, grow the window from 1080p to full-monitor while
-# watching GPU% / perceived smoothness; (2) repeat WITH -DComp; (3) compare both against
-# the probe (decode-copy-dyn) baseline. Expect -DComp to flatten the GPU%
-# slope/falloff seen while enlarging in step (1). If it doesn't, attach the log's
-# [dcomp-native] lines to the report.
+# -DComp (optional, off by default): SERVO_COMPOSITOR_DCOMP=1|surface -- WR Native
+# Compositor (DirectComposition). WR draws picture-cache tiles directly into DComp surfaces
+# and DWM composites them, eliminating the per-frame tile->backbuffer draw pass (specs
+# docs/superpowers/specs/2026-07-13-wr-native-compositor-design.md and
+# 2026-07-14-dcomp-swapchain-content-design.md). Aimed at the window-enlarge GPU%/framerate
+# falloff on bandwidth-limited GPUs (older AMD). On failure it falls back to the current
+# Draw compositor (screen still shows). Two DComp modes (see -DCompSurface above):
+# HYBRID (-DComp alone) promotes repeatedly-full-repaint opaque surfaces to a flip
+# swapchain (probe-parity Present, no DComp virtual-surface lend/return per frame);
+# SURFACE (-DComp -DCompSurface) is the pre-promotion virtual-surface-only legacy path.
+# AMD read-out procedure (3-way A/B): (1) run WITHOUT -DComp (Draw + present-path-fast),
+# grow the window from 1080p to full-monitor while watching GPU% / perceived smoothness;
+# (2) repeat WITH -DComp -DCompSurface (virtual surface); (3) repeat WITH -DComp alone
+# (swapchain hybrid); (4) compare all three against the probe (decode-copy-dyn) baseline
+# and against each other's PresentMon PresentMode. If (3) improves on (2), the DComp virtual-
+# surface lend/return mechanism is the confirmed culprit; if (3) == (2), the falloff has a
+# different cause -- attach the log's [dcomp-native] lines and PresentMon CSVs to the report.
 #
 # Multi-GPU caveat: the gst D3D11 device is created on adapter 0 while the renderer
 # (ANGLE) picks its own adapter. On a multi-GPU box a mismatch makes shared-handle
@@ -96,10 +111,19 @@ $env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "$DecoderThreads"
 # WR Native Compositor gate: only set when requested, and explicitly cleared otherwise so
 # a stale value from a previous manual `$env:SERVO_COMPOSITOR_DCOMP` set in this shell
 # cannot silently leak into an -DComp-less run (same convention as -Sync/-DecoderThreads).
-if ($DComp) {
+# -DCompSurface without -DComp is a no-op (warn + ignore): DComp stays fully off.
+if ($DComp -and $DCompSurface) {
+    $env:SERVO_COMPOSITOR_DCOMP = "surface"
+    $dcompMode = "surface"
+} elseif ($DComp) {
     $env:SERVO_COMPOSITOR_DCOMP = "1"
+    $dcompMode = "hybrid"
 } else {
+    if ($DCompSurface) {
+        Write-Warning "-DCompSurface requires -DComp; ignoring -DCompSurface (DComp stays off)."
+    }
     Remove-Item Env:\SERVO_COMPOSITOR_DCOMP -ErrorAction SilentlyContinue
+    $dcompMode = "off"
 }
 # WR picture-cache tile size override: same set-or-clear convention as -DComp above.
 if ($TileSize -ne "") {
@@ -123,7 +147,7 @@ if ($Src -ne "") {
     $url += "&src=" + [Uri]::EscapeDataString($Src)
 }
 
-Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads, dcomp=$($DComp.IsPresent))"
+Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads, dcomp=$dcompMode)"
 Write-Host "Log: $logPath"
 
 $proc = Start-Process -FilePath $servoExe -ArgumentList @("--window-size", $WindowSize, $url) `
@@ -180,11 +204,18 @@ if ($direct -lt $tiles) {
 }
 
 # DComp gate marker: only meaningful when -DComp was requested; verified the same way as
-# the d3d11/direct-file markers above (count occurrences, WARN on mismatch).
+# the d3d11/direct-file markers above (count occurrences, WARN on mismatch). The "engaged"
+# marker fires identically for both DComp modes -- the gate is truthy for either env value
+# ("1" or "surface"); only the internal storage_mode() differs, so this check alone cannot
+# tell hybrid from surface apart. To confirm the mode actually taken, look for
+# "[dcomp-dbg] promote" in the log: hybrid should show promote>=1 on repeatedly-full-repaint
+# opaque surfaces, surface mode must show none (no swapchain promotion ever happens in that
+# mode). That line is gated behind SERVO_DCOMP_DEBUG=1, which is NOT part of this script's
+# default RUST_LOG -- set $env:SERVO_DCOMP_DEBUG="1" manually before running to check it.
 $dcompEngaged = (Select-String -Path $logPath -Pattern "[dcomp-native] engaged" -SimpleMatch -ErrorAction SilentlyContinue | Measure-Object).Count
 if ($DComp) {
     if ($dcompEngaged -ge 1) {
-        Write-Host "PASS: dcomp_engaged_markers=$dcompEngaged (WR Native Compositor active)"
+        Write-Host "PASS: dcomp_engaged_markers=$dcompEngaged (WR Native Compositor active, mode=$dcompMode)"
     } else {
         Write-Host "WARNING: -DComp was requested but no '[dcomp-native] engaged' marker was found -- check the log for a fallback to the Draw compositor."
     }
