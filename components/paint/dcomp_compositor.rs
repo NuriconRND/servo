@@ -26,9 +26,13 @@ use webrender::{
     NativeSurfaceId, NativeSurfaceInfo, NativeTileId, WindowVisibility,
 };
 use winapi::Interface;
-use winapi::shared::dxgi::IDXGIDevice;
-use winapi::shared::dxgi1_2::{DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED};
+use winapi::shared::dxgi::{DXGI_SWAP_EFFECT_FLIP_DISCARD, IDXGIAdapter, IDXGIDevice};
+use winapi::shared::dxgi1_2::{
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain1,
+};
 use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
+use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
 use winapi::shared::minwindef::TRUE;
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
@@ -180,14 +184,56 @@ impl<T> Drop for ComOwned<T> {
     }
 }
 
-/// 창당 하나의 picture cache 슬라이스에 대응하는 DComp 가상 서피스 + 비주얼.
+/// BeginDraw로 얻은 스왑체인 백버퍼(GetBuffer가 AddRef해 돌려준 것). 파기 시 Release.
+/// Task 3에서 결선(bind가 스왑체인 백버퍼를 pbuffer로 감쌀 때 채운다) — 그 전까지 dead_code.
+#[allow(dead_code)] // Task 3에서 결선 시 제거.
+struct FramePbuffer {
+    pbuffer: usize,
+    /// GetBuffer가 AddRef해 돌려준 백버퍼 텍스처. 파기 시 Release.
+    texture: *mut ID3D11Texture2D,
+}
+
+/// 하이브리드 승격된 서피스의 스왑체인 저장소. Task 3에서 결선 — 그 전까지 dead_code.
+#[allow(dead_code)] // Task 3에서 결선 시 제거.
+struct SwapChainStorage {
+    swapchain: ComOwned<IDXGISwapChain1>,
+    /// 가상공간에서 백버퍼 (0,0)이 대응하는 지점(= 승격 시점 extent.min).
+    anchor: DeviceIntPoint,
+    size: DeviceIntSize,
+    coverage: FrameCoverage,
+    frame_pbuffer: Option<FramePbuffer>,
+    drawn_this_frame: bool,
+    /// 첫 Present 후 visual.SetContent(swapchain)를 완료했는가.
+    /// false인 동안 visual은 fallback_virtual(마지막 완전 화면)을 계속 표시한다.
+    content_attached: bool,
+    withheld_frames: u32,
+    /// content_attached 전까지 유지되는 구 가상 서피스(글리치 없는 전환용).
+    fallback_virtual: Option<ComOwned<IDCompositionVirtualSurface>>,
+}
+
+/// 서피스 콘텐츠의 백엔드. 지금은 항상 `Virtual`(동작 불변 리팩터) — Task 3이
+/// 전면 갱신 서피스를 `SwapChain`으로 승격하는 분기를 결선한다.
+#[allow(dead_code)] // SwapChain variant: Task 3에서 결선 시 제거.
+enum SurfaceStorage {
+    Virtual {
+        virtual_surface: ComOwned<IDCompositionVirtualSurface>,
+    },
+    SwapChain(SwapChainStorage),
+}
+
+/// 창당 하나의 picture cache 슬라이스에 대응하는 DComp 서피스 저장소 + 비주얼.
 struct SurfaceEntry {
-    virtual_surface: ComOwned<IDCompositionVirtualSurface>,
+    storage: SurfaceStorage,
     visual: ComOwned<IDCompositionVisual>,
     virtual_offset: DeviceIntPoint,
     tile_size: DeviceIntSize,
     #[allow(dead_code)]
     is_opaque: bool,
+    /// bind/unbind된 타일 좌표 부기(Task 3의 승격 판단·surface_extent 근거).
+    tiles: std::collections::HashSet<(i32, i32)>,
+    /// 연속으로 승격 조건을 만족한 프레임 수(Task 3의 히스테리시스 근거).
+    #[allow(dead_code)] // Task 3에서 결선 시 제거.
+    promote_streak: u32,
 }
 
 /// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
@@ -212,6 +258,12 @@ pub struct DCompNativeCompositor {
     root_visual: Option<ComOwned<IDCompositionVisual>>,
     surfaces: HashMap<NativeSurfaceId, SurfaceEntry>,
     bound: Option<BoundTile>,
+    /// ANGLE D3D11 디바이스(비소유 — rendering_context가 수명 보유). 스왑체인 생성에 사용.
+    #[allow(dead_code)] // Task 3에서 결선 시 제거(create_composition_swapchain 호출부가 사용).
+    d3d11_device: *mut ID3D11Device,
+    /// 스왑체인 생성용 DXGI 팩토리. 확보 실패(None)면 하이브리드 승격 불가 — Virtual만 사용.
+    #[allow(dead_code)] // Task 3에서 결선 시 제거(create_composition_swapchain이 사용).
+    dxgi_factory: Option<ComOwned<IDXGIFactory2>>,
     warned_scale: bool,
     warned_rounded_clip: bool,
     warned_external_surface: bool,
@@ -255,8 +307,34 @@ pub fn maybe_create(
             warn!("[dcomp-native] QI IDXGIDevice failed (hr=0x{:08x}); falling back to Draw", hr as u32);
             return None;
         }
-        // dxgi는 dcomp 디바이스 생성에만 쓰고, 함수 종료 시 Drop으로 Release된다.
+        // dxgi는 dcomp 디바이스 생성 + 팩토리 확보(아래)에 쓰고, 함수 종료 시 Drop으로 Release된다.
         let dxgi = ComOwned::from_raw(dxgi_raw)?;
+
+        // 스왑체인 생성용 팩토리: dxgi 디바이스 → 어댑터 → 부모 팩토리(IDXGIFactory2).
+        // 실패해도 컴포지터는 성립(하이브리드 승격만 불가 → Virtual 유지) — None 허용.
+        let dxgi_factory = {
+            let mut adapter_raw: *mut IDXGIAdapter = ptr::null_mut();
+            let hr = (*dxgi.as_ptr()).GetAdapter(&mut adapter_raw);
+            if hr < 0 || adapter_raw.is_null() {
+                warn!("[dcomp-native] GetAdapter failed (hr=0x{:08x}); swapchain promotion disabled", hr as u32);
+                None
+            } else {
+                let adapter = ComOwned::from_raw(adapter_raw);
+                adapter.and_then(|adapter| {
+                    let mut factory_raw: *mut IDXGIFactory2 = ptr::null_mut();
+                    let hr = (*adapter.as_ptr()).GetParent(
+                        &IDXGIFactory2::uuidof(),
+                        &mut factory_raw as *mut _ as *mut _,
+                    );
+                    if hr < 0 || factory_raw.is_null() {
+                        warn!("[dcomp-native] GetParent(IDXGIFactory2) failed (hr=0x{:08x}); swapchain promotion disabled", hr as u32);
+                        None
+                    } else {
+                        ComOwned::from_raw(factory_raw)
+                    }
+                })
+            }
+        };
 
         let mut dcomp_raw: *mut IDCompositionDevice = ptr::null_mut();
         let hr = DCompositionCreateDevice(
@@ -299,6 +377,8 @@ pub fn maybe_create(
             root_visual: Some(root_visual),
             surfaces: HashMap::new(),
             bound: None,
+            d3d11_device: d3d,
+            dxgi_factory,
             warned_scale: false,
             warned_rounded_clip: false,
             warned_external_surface: false,
@@ -314,6 +394,51 @@ impl DCompNativeCompositor {
 
     fn root_visual_ptr(&self) -> Option<*mut IDCompositionVisual> {
         self.root_visual.as_ref().map(ComOwned::as_ptr)
+    }
+
+    /// 컴포지션용 flip 스왑체인 생성. 실패 시 None(호출자는 Virtual 유지 폴백).
+    /// FLIP_DISCARD + BufferCount 2: 이전 버퍼를 읽지 않는다 — 정확성은
+    /// FrameCoverage의 full-coverage Present 규칙이 보장(계획 Global Constraints).
+    /// (현재 호출자 없음 — Task 3에서 결선하며 이 allow를 제거한다.)
+    #[allow(dead_code)]
+    fn create_composition_swapchain(
+        &self,
+        size: DeviceIntSize,
+        is_opaque: bool,
+    ) -> Option<ComOwned<IDXGISwapChain1>> {
+        let factory = self.dxgi_factory.as_ref()?.as_ptr();
+        if size.width <= 0 || size.height <= 0 {
+            return None;
+        }
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: size.width as u32,
+            Height: size.height as u32,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: 0,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH, // CreateSwapChainForComposition 필수값
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: if is_opaque { DXGI_ALPHA_MODE_IGNORE } else { DXGI_ALPHA_MODE_PREMULTIPLIED },
+            Flags: 0,
+        };
+        // Safety: factory/디바이스는 살아있는 COM 포인터(생성 시 확보). out-param은 ComOwned로.
+        unsafe {
+            let mut sc_raw: *mut IDXGISwapChain1 = ptr::null_mut();
+            let hr = (*factory).CreateSwapChainForComposition(
+                self.d3d11_device as *mut IUnknown,
+                &desc,
+                ptr::null_mut(),
+                &mut sc_raw,
+            );
+            if hr < 0 || sc_raw.is_null() {
+                warn!("[dcomp-native] CreateSwapChainForComposition {}x{} failed (hr=0x{:08x})",
+                    size.width, size.height, hr as u32);
+                return None;
+            }
+            ComOwned::from_raw(sc_raw)
+        }
     }
 
     /// 외부/백드롭 서피스 요청에 대한 warn-once. Servo는 prefer_compositor_surface를
@@ -414,11 +539,13 @@ impl Compositor for DCompNativeCompositor {
             }
 
             SurfaceEntry {
-                virtual_surface,
+                storage: SurfaceStorage::Virtual { virtual_surface },
                 visual,
                 virtual_offset,
                 tile_size,
                 is_opaque,
+                tiles: std::collections::HashSet::new(),
+                promote_streak: 0,
             }
         };
 
@@ -432,12 +559,19 @@ impl Compositor for DCompNativeCompositor {
         self.surfaces.insert(id, entry);
     }
 
-    fn create_tile(&mut self, _device: &mut Device, _id: NativeTileId) {
-        // 가상 서피스는 BeginDraw 시 지연 할당 — 부기 불요, no-op.
+    fn create_tile(&mut self, _device: &mut Device, id: NativeTileId) {
+        // 가상 서피스는 BeginDraw 시 지연 할당 — 여기서는 Task 3 승격 판단(surface_extent)의
+        // 근거가 될 타일 집합만 부기한다.
+        if let Some(entry) = self.surfaces.get_mut(&id.surface_id) {
+            entry.tiles.insert((id.x, id.y));
+        }
     }
 
-    fn destroy_tile(&mut self, _device: &mut Device, _id: NativeTileId) {
-        // no-op (Trim 최적화는 후속: 고정 크기 월 창에서는 타일 집합이 안정적).
+    fn destroy_tile(&mut self, _device: &mut Device, id: NativeTileId) {
+        // Trim 최적화는 후속(고정 크기 월 창에서는 타일 집합이 안정적) — 여기서는 부기만 갱신.
+        if let Some(entry) = self.surfaces.get_mut(&id.surface_id) {
+            entry.tiles.remove(&(id.x, id.y));
+        }
     }
 
     fn bind(
@@ -457,7 +591,14 @@ impl Compositor for DCompNativeCompositor {
             warn!("[dcomp-native] bind: unknown surface {:?}", id.surface_id);
             return fail;
         };
-        let vsurf = entry.virtual_surface.as_ptr();
+        let vsurf = match &entry.storage {
+            SurfaceStorage::Virtual { virtual_surface } => virtual_surface.as_ptr(),
+            SurfaceStorage::SwapChain(_) => {
+                // Task 3까지 도달 불가(create_surface가 항상 Virtual만 만든다).
+                warn!("[dcomp-native] bind: SwapChain storage not yet wired (surface {:?})", id.surface_id);
+                return fail;
+            },
+        };
         let tile_rect = tile_virtual_rect(entry.virtual_offset, entry.tile_size, id.x, id.y);
 
         // BeginDraw는 가상공간 절대좌표 RECT를 받는다: 타일 rect를 타일-로컬 dirty로 오프셋.
@@ -559,10 +700,21 @@ impl Compositor for DCompNativeCompositor {
         };
         // 현재 bind 중이던 서피스에 EndDraw.
         if let Some(entry) = self.surfaces.get(&bound.surface_id) {
-            // Safety: 서피스는 bind~unbind 사이 파괴되지 않는다(WR 계약).
-            let hr = unsafe { (*entry.virtual_surface.as_ptr()).EndDraw() };
-            if hr < 0 {
-                warn!("[dcomp-native] EndDraw failed (hr=0x{:08x})", hr as u32);
+            match &entry.storage {
+                SurfaceStorage::Virtual { virtual_surface } => {
+                    // Safety: 서피스는 bind~unbind 사이 파괴되지 않는다(WR 계약).
+                    let hr = unsafe { (*virtual_surface.as_ptr()).EndDraw() };
+                    if hr < 0 {
+                        warn!("[dcomp-native] EndDraw failed (hr=0x{:08x})", hr as u32);
+                    }
+                },
+                SurfaceStorage::SwapChain(_) => {
+                    // Task 3까지 도달 불가(bind가 SwapChain 진입 전에 이미 fail 반환).
+                    warn!(
+                        "[dcomp-native] unbind: SwapChain storage not yet wired (surface {:?})",
+                        bound.surface_id
+                    );
+                },
             }
         } else {
             warn!(
