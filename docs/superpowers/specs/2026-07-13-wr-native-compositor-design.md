@@ -220,3 +220,93 @@ pbuffer는 BeginDraw마다 생성/EndDraw 시 해제부터 시작(Gecko 방식).
 7. WR renderer가 Native 모드에서 창 서피스에 접근하는 잔여 경로(스크린샷/
    readback/clear) 유무 확인 — present/이벤트 루프와의 상호작용 포함.
 8. `enable_native_compositor(false)` 런타임 토글이 호출되는 조건과 대응.
+
+## 12. 구현 결과와 이탈 (2026-07-13)
+
+Task 1-6로 게이트(`SERVO_COMPOSITOR_DCOMP=1`) 구현·검증 완료(HEAD `2f0f449d4`).
+아래는 완료 기준(§2) 대비 결과와, 계획에 없던 설계 이탈 3건이다.
+
+### 결과 요약
+
+- **개발기(NVIDIA A5000) 기능 무결** — 전부 PASS: 2×2 비디오(색/방향/lockstep
+  ±0), 45타일(45/45, lockstep ±0~1, 블랙타일 0, 루프 무결, 5분 메모리 플랫
+  ±2.3%), WebGPU 월(3D 캐릭터 2체, 70-116fps, 에러 0), 저더(64초, fps avg
+  61.5/min 57.5, maxGap avg 25ms, drop 0), 리사이즈/모니터 이동/급resize 6단
+  (무크래시), 정상 종료 3+회(좀비 0).
+- **②단(타일→백버퍼 draw) 소멸 — 존재 증명 완료.** `SERVO_DCOMP_DEBUG=1` 로그로
+  매 프레임 전 타일이 `create_surface`→`bind`(BeginDraw)→`add_surface`(AddVisual)
+  경로로 DComp에 합성되고(경고/실패 0), 동시에 `[dcomp-native] window present
+  skipped` — WR이 더 이상 타일→창 백버퍼 최종 합성 draw를 하지 않음이 구조적으로
+  확인됨. WR 프로파일러 수치 채집은 게이트 on에서 표시되지 않아(§9-2 이탈 3
+  참조) 불가했고, 대신 이 로그 기반 존재 증명으로 대체.
+- **게이트 off 무회귀 — PASS.** 마커 부재, d3d11 45/45, fps avg 62.4(on의
+  61.5와 동급). off는 현행과 바이트 동일 경로.
+- **AMD 실기 GPU% 실이득은 사용자 몫.** 개발기(A5000)의 GPU% A/B는 45타일
+  decode가 GPU 점유를 지배해(off avg 24-30% / on avg 24-32%, 표본 분산
+  17-71%) 창면적 계수의 깨끗한 신호를 얻지 못했다(다만 on/off 평균 동급 = 게이트로
+  인한 GPU 회귀는 없음). §1의 원 문제(구형 AMD 대역폭 병목)에 대한 실측은 패키지로
+  사용자가 진행(런처 AMD 판독 가이드 참조).
+- **패키징 완료.** `run_video_wall_d3d11.ps1` / `D:\ServoWallPackage\run_wall.ps1`
+  양쪽에 `-DComp` 스위치 + 마커 자동 검증(2종) 추가, `ServoWallPackage.zip`
+  재생성(exe만 교체 — DLL/리소스 무변경, surfman/paint는 정적 링크).
+
+### 설계 이탈 / 발견 3건
+
+1. **ANGLE present-path-fast(ppf)가 pbuffer에도 발동해 top-left 규약을 깨뜨림
+   (계획에 없던 상호작용, §5.2 갱신).** ANGLE의 `UsePresentPathFast()`는
+   `attachment->type() == GL_FRAMEBUFFER_DEFAULT`로 발동 여부를 판정하는데,
+   render-pbuffer를 current로 만들면 그것 자체가 `GL_FRAMEBUFFER_DEFAULT`가 되어
+   ppf가 타일 pbuffer 렌더링에도 발동했다. 발동 시 viewScale 수직 무반전 +
+   시저 y 자동 반전이 걸려 WR NativeSurface의 `ortho(bottom=0,top=h)` 투영
+   전제(stock ANGLE, viewScale −1)가 깨지며 타일이 수직으로 흩어졌다. 원래
+   §3-p present-path-fast는 "창 present의 offscreen→backbuffer 복사 제거"가
+   목적이었는데, 게이트 on에서는 창 present 자체를 스킵하므로 그 목적이
+   무의미해진다는 점에 착안해 해소: **게이트 on이면 surfman이 ppf 관련 EGL
+   디스플레이 속성(`EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE`/`FAST`)을 애초에
+   요청하지 않고, `WindowRenderingContext::present()`는 실제 컴포지터 발동
+   여부(env가 아님)를 기준으로 스킵한다.** 커밋 `d0486e4a3`(surfman ppf 게이트)
+   + `e87765943`(present 스킵) + `2f0f449d4`(스킵 판정을 env→실발동 기준으로
+   교정, 리뷰 픽스). PoC(Task 3)는 clear가 방향 무관 + 시저가 PoC 자체 flip과
+   ANGLE 재반전이 상쇄돼 이 버그를 못 잡았다 — Task 5 애니메이션 4분면 재검증에서
+   발견·수정.
+2. **ANGLE 창 서피스가 HWND의 DComp 타깃을 선점 — Task 1 opt-out이 있어야만
+   성립(계획에 이미 있었으나 PoC에서 필수 전제로 실증됨).** surfman의 기본
+   ANGLE 창 서피스 경로는 `EGL_DIRECT_COMPOSITION_ANGLE=TRUE`로 만들어져
+   HWND에 ANGLE 자신의 DComp 타깃을 붙인다. `IDCompositionDevice::
+   CreateTargetForHwnd`는 (hwnd, topmost)당 1개만 허용되므로, 그 위에 네이티브
+   컴포지터가 또 타깃을 만들면 `hr=0x88980800`
+   (`DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`)로 거부된다(Task 3 PoC 최초
+   실행에서 실제로 재현). 해법은 §6-4에 이미 설계돼 있던 opt-out
+   (`SERVO_COMPOSITOR_DCOMP=1`이면 창 서피스를 DirectComposition 속성 없이
+   "평범한 HWND 서피스"로 생성 — Task 1)이며, 이 게이트가 없으면 네이티브
+   컴포지터 자체가 초기화 단계에서 성립하지 않는다는 것이 PoC로 실증됐다(설계
+   변경이 아니라 "이미 있던 전제 조건의 필수성 확인" — 기록 목적으로 이탈에
+   포함).
+3. **게이트 on에서 Ctrl+F12 WR 프로파일러 오버레이가 표시되지 않음 —
+   미해결·이월(§9-2 검증 항목 결함, 사용자 결정 대기).** 근본원인은 규명됨:
+   콘텐츠 타일은 `is_opaque=true`(DXGI_ALPHA_MODE_IGNORE)라 정상 표시되지만,
+   `DEBUG_OVERLAY` 서피스(`NativeSurfaceId::u64::MAX`)만 `is_opaque=false`
+   (DXGI_ALPHA_MODE_PREMULTIPLIED)로 생성되어, WR 디버그 렌더러가 그 비불투명
+   서피스에 그린 결과가 premultiplied 합성에서 사실상 투명하게 합성된다
+   (`SERVO_DCOMP_DEBUG=1`으로 서피스 자체는 매 프레임 정상 처리됨을 확인 —
+   create_surface/bind/add_surface 경고 0). 정확한 GL 레벨 메커니즘(straight
+   vs premultiplied 알파 규약 차이)은 RenderDoc급 조사가 필요하나, RenderDoc은
+   §8-2/§3-p와 동일 계열 함정(ANGLE 동작을 바꿔 판독 불가)으로 이 프로젝트
+   범위에서 배제된 도구다. **진단 전용 결함이며 월 기능(비디오/WebGPU/저더/
+   리사이즈 전부 PASS)에는 무영향.** 수정은 통과 중인 합성/pbuffer 공유 경로를
+   건드려야 해 회귀 리스크가 있고 이득은 진단 전용이라, 이번 사이클에서는
+   수정하지 않고 원인 규명과 함께 후속(§10 "egui 크롬의 DComp 레이어化"와 동류
+   작업)으로 이월한다. **사용자 결정 대기.**
+
+### 잔여 Minor (이번 사이클 스코프 밖, 수정하지 않음)
+
+- 게이트 on 시 창 하단에 egui 툴바 높이만큼 흰 밴드(webview 뷰포트가 툴바
+  높이를 제외한 크기인데 DComp 트리는 창 원점부터 그림) — §3 "egui 크롬은
+  topmost 웹콘텐츠에 가려짐" 허용 범위의 코롤러리, 월 운용 무영향.
+- `set_dcomp_native_active(true)` 호출 지점이 코드베이스 전체에서 painter.rs
+  단 한 곳(성공 분기)이라는 불변조건은 주석으로만 남아 있고 타입 레벨 보장은
+  없음(그럴 만큼 코드가 아직 작아 과설계로 보류).
+- `no-wgl`(paint-api 피처) ↔ `sm-angle`(surfman 피처) 커플링 — 게이트 관련
+  코드 대부분이 `#[cfg(all(target_os = "windows", feature = "no-wgl"))]`로
+  게이팅되는데, servoshell은 항상 두 피처를 함께 켜므로(Cargo.toml) 실질
+  문제는 없으나 두 피처가 별도 크레이트에 선언돼 커플링이 암묵적이다.
