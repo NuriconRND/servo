@@ -300,9 +300,10 @@ Task 1-6로 게이트(`SERVO_COMPOSITOR_DCOMP=1`) 구현·검증 완료(HEAD `2f
 
 ### 잔여 Minor (이번 사이클 스코프 밖, 수정하지 않음)
 
-- 게이트 on 시 창 하단에 egui 툴바 높이만큼 흰 밴드(webview 뷰포트가 툴바
-  높이를 제외한 크기인데 DComp 트리는 창 원점부터 그림) — §3 "egui 크롬은
-  topmost 웹콘텐츠에 가려짐" 허용 범위의 코롤러리, 월 운용 무영향.
+- ~~게이트 on 시 창 하단에 egui 툴바 높이만큼 밴드(webview 뷰포트가 툴바
+  높이를 제외한 크기인데 DComp 트리는 창 원점부터 그림)~~ **→ 해소(사용자 승인,
+  아래 "최종 리뷰 공시" 하단 밴드 항목 참조).** 게이트 요청 시 egui 크롬을
+  아예 배치하지 않아 웹뷰가 클라이언트 전체를 차지하도록 했다.
 - `set_dcomp_native_active(true)` 호출 지점이 코드베이스 전체에서 painter.rs
   단 한 곳(성공 분기)이라는 불변조건은 주석으로만 남아 있고 타입 레벨 보장은
   없음(그럴 만큼 코드가 아직 작아 과설계로 보류).
@@ -330,3 +331,25 @@ Task 1-6로 게이트(`SERVO_COMPOSITOR_DCOMP=1`) 구현·검증 완료(HEAD `2f
   콘텐츠를 그리지 않으므로 스크린샷 API류는 배경색만 캡처한다. §3 비범위
   (스크린샷 API 호환) 그대로이며, 알려진 제한으로 명시한다. 외부 화면 캡처
   (`CopyFromScreen`)는 정상.
+- **하단 검정 밴드 — 해소(사용자 승인).** 게이트 on에서 클라이언트 하단에
+  egui 툴바 높이(§3-o RenderDoc 실측 ~54–60px)만큼 검정 밴드가 남았다. 원인:
+  servoshell egui가 top 패널(툴바 + 탭 스트립)로 `toolbar_height`만큼 세로를
+  예약해 웹뷰(= DComp가 덮는 영역)가 창보다 작은데, DComp 발동 시 창 백버퍼는
+  present되지 않아(`WindowRenderingContext::present` 스킵) 그 남는 스트립이
+  검정으로 남는다. **수정: 게이트가 env(`SERVO_COMPOSITOR_DCOMP`)로 요청되면
+  `ports/servoshell/desktop/gui.rs`에서 egui 크롬 패널을 아예 배치하지 않는다**
+  → `toolbar_height=0` → 웹뷰가 클라이언트 전체를 차지 → DComp 콘텐츠가 전면을
+  덮어 밴드 소멸. 판정 정본은 `paint_api::rendering_context::dcomp_native_compositor_requested()`
+  (servoshell에 `paint_api` 직접 의존 추가). **판정을 실발동(`dcomp_native_active`)이
+  아니라 env(요청)로 하는 이유**: 실발동 플래그는 painter가 RenderingContext를 만든
+  뒤에야 true라 그걸로 레이아웃을 판정하면 첫 프레임엔 크롬이 있다가 사라져 웹뷰
+  리사이즈 처너가 생긴다. env는 시작 프레임부터 안정적이고, env-on인데 발동 실패
+  (폴백 Draw)해도 풀윈도우 웹뷰로 콘텐츠가 정상 표시돼 안전하다. (같은 게이트의
+  웹뷰 blit 스킵은 실발동 기준 — blit 낭비는 실제로 DComp에 present할 때만 생기기
+  때문.) 게이트 off는 조건 항상 참이라 기존 레이아웃과 바이트 동일. 검증: 게이트 on
+  quad(1280×720 하단 BL=blue/BR=white, 검정밴드 0px, 리사이즈 grow/shrink 0px 유지)
+  / 게이트 on quad 1920×1080·2×2 비디오(창을 온스크린 배치 시 하단 밴드 0px, 전 타일
+  충전) / 게이트 off(툴바 유지, 마커 부재) 전부 PASS, 클린 종료. **주의(측정 함정):
+  1080p 모니터에서 타이틀바가 1920×1080 창의 클라이언트를 화면 아래로 ~109px 밀어내
+  `CopyFromScreen`이 그 부분을 검정으로 캡처한다 — 실제 DComp 렌더 밴드가 아니라
+  캡처 아티팩트이므로 검증 시 클라이언트를 완전히 온스크린에 놓고 측정해야 한다.**
