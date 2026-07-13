@@ -17,6 +17,12 @@ param(
     # this process only; the switch is re-evaluated every run (stale env from a prior
     # manual `$env:SERVO_COMPOSITOR_DCOMP` is cleared when omitted).
     [switch] $DComp,
+    # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
+    # tile per slice). Empty (default) = WR default 1024x512. Sets
+    # SERVO_WR_PICTURE_TILE_SIZE; cleared when omitted (stale-env convention). A/B knob
+    # for per-tile overhead / invalidation granularity -- total write bandwidth is
+    # unchanged by tile size.
+    [string] $TileSize = "",
     [string] $LogPrefix = "video_wall_d3d11",
     # Page under the repo root. Default = 1080p30 grid. For the 4K60 source use
     # tests\html\video_4k_grid_play.html with a SMALL grid and MORE decoder threads,
@@ -94,6 +100,12 @@ if ($DComp) {
     $env:SERVO_COMPOSITOR_DCOMP = "1"
 } else {
     Remove-Item Env:\SERVO_COMPOSITOR_DCOMP -ErrorAction SilentlyContinue
+}
+# WR picture-cache tile size override: same set-or-clear convention as -DComp above.
+if ($TileSize -ne "") {
+    $env:SERVO_WR_PICTURE_TILE_SIZE = $TileSize
+} else {
+    Remove-Item Env:\SERVO_WR_PICTURE_TILE_SIZE -ErrorAction SilentlyContinue
 }
 # Keep GStreamer env clean: the bundled 1.22.x runtime in target\release must not mix
 # with any system GStreamer plugins (ABI mismatch).

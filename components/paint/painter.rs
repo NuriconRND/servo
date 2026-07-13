@@ -439,6 +439,31 @@ impl Painter {
         let webrender_api = webrender_api_sender.create_api_by_client(painter_id.into());
         let webrender_document = webrender_api.add_document(rendering_context.size2d().to_i32());
 
+        // 실험 노브: WR picture cache 타일 크기 오버라이드 (SERVO_WR_PICTURE_TILE_SIZE=WxH,
+        // 예 1920x1080). 미설정이면 WR 기본 1024x512. 타일 수·무효화 입도·per-tile
+        // 오버헤드(DComp bind/unbind 횟수) A/B용 — 값이 창 이상이면 슬라이스당 타일 1장.
+        if let Ok(value) = std::env::var("SERVO_WR_PICTURE_TILE_SIZE") {
+            let lower = value.to_ascii_lowercase();
+            let mut split = lower.split('x');
+            let size = (
+                split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+                split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+            );
+            match size {
+                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    webrender_api.send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(
+                        Some(webrender_api::units::DeviceIntSize::new(w, h)),
+                    ));
+                    log::info!("[wr-tile-size] picture tile size override: {w}x{h}");
+                },
+                _ => {
+                    log::warn!(
+                        "[wr-tile-size] SERVO_WR_PICTURE_TILE_SIZE 형식 오류(WxH 기대): {value}"
+                    );
+                },
+            }
+        }
+
         let gl_renderer = webrender_gl.get_string(gleam::gl::RENDERER);
         let gl_version = webrender_gl.get_string(gleam::gl::VERSION);
         info!("Running on {gl_renderer} with OpenGL version {gl_version}");
