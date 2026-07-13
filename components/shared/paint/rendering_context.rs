@@ -17,7 +17,7 @@ use gleam::gl::{self, Gl};
 use glow::{HasContext, NativeFramebuffer};
 use image::RgbaImage;
 use log::{debug, info, trace, warn};
-use raw_window_handle::{DisplayHandle, WindowHandle};
+use raw_window_handle::{DisplayHandle, RawWindowHandle, WindowHandle};
 pub use surfman::Error;
 // Re-exported so external-image consumers (e.g. the WebGPU GPU-direct present path) can hold
 // the `SurfaceTexture` returned by `create_texture_from_shared_handle` without depending on
@@ -147,6 +147,30 @@ pub trait RenderingContext {
         _rows: usize,
     ) {
     }
+    /// Native compositor(DirectComposition) 인터롭: 이 컨텍스트가 붙은 창의 HWND.
+    /// Windows 창 컨텍스트에서만 Some.
+    fn window_hwnd(&self) -> Option<usize> {
+        None
+    }
+    /// ANGLE의 D3D11 디바이스 raw 포인터. AddRef 하지 않는다 — 수명은 이
+    /// 렌더링 컨텍스트가 보유하므로 컨텍스트보다 오래 들고 있으면 안 된다.
+    fn angle_d3d11_device_ptr(&self) -> Option<usize> {
+        None
+    }
+    /// RENDER_TARGET D3D 텍스처를 그리기용 EGL pbuffer로 래핑. 반환값=EGLSurface.
+    fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        _texture: usize,
+        _size: UntypedSize2D<i32>,
+    ) -> Option<usize> {
+        None
+    }
+    /// pbuffer를 현재 draw/read 서피스로 바인딩(컨텍스트 유지). 성공 여부 반환.
+    fn make_render_pbuffer_current(&self, _egl_surface: usize) -> bool {
+        false
+    }
+    /// [`RenderingContext::create_render_pbuffer_from_d3d_texture`]의 짝.
+    fn destroy_render_pbuffer(&self, _egl_surface: usize) {}
     /// The connection to the display server for WebGL. Default to `None`.
     fn connection(&self) -> Option<Connection> {
         None
@@ -641,6 +665,76 @@ impl SurfmanRenderingContext {
         }
     }
 
+    /// See [`RenderingContext::angle_d3d11_device_ptr`]. No AddRef — lifetime is owned by
+    /// this rendering context's device.
+    fn angle_d3d11_device_ptr(&self) -> Option<usize> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let ptr = device.d3d11_device_ptr();
+            if ptr.is_null() { None } else { Some(ptr as usize) }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        None
+    }
+
+    /// See [`RenderingContext::create_render_pbuffer_from_d3d_texture`].
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        texture: usize,
+        size: UntypedSize2D<i32>,
+    ) -> Option<usize> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &self.context.borrow();
+            // Safety: the caller guarantees `texture` is a live RENDER_TARGET
+            // ID3D11Texture2D (as returned by DComp BeginDraw). surfman does not retain
+            // the pointer.
+            unsafe {
+                device
+                    .create_render_pbuffer_from_d3d_texture(context, texture as *mut _, size)
+                    .map(|surface| surface as usize)
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = (texture, size);
+            None
+        }
+    }
+
+    /// See [`RenderingContext::make_render_pbuffer_current`].
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn make_render_pbuffer_current(&self, egl_surface: usize) -> bool {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            let context = &self.context.borrow();
+            unsafe { device.make_render_pbuffer_current(context, egl_surface as *const _) }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = egl_surface;
+            false
+        }
+    }
+
+    /// See [`RenderingContext::destroy_render_pbuffer`].
+    #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+    fn destroy_render_pbuffer(&self, egl_surface: usize) {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let device = &self.device.borrow();
+            unsafe { device.destroy_render_pbuffer(egl_surface as *const _) }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            let _ = egl_surface;
+        }
+    }
+
     /// See [`RenderingContext::copy_rows_to_mapped`]. Does not need surfman: this is
     /// plain pointer arithmetic over a caller-owned mapping.
     #[expect(unsafe_code)]
@@ -839,6 +933,28 @@ impl RenderingContext for SoftwareRenderingContext {
         self.surfman_rendering_info.release_d3d11_texture(texture)
     }
 
+    fn angle_d3d11_device_ptr(&self) -> Option<usize> {
+        self.surfman_rendering_info.angle_d3d11_device_ptr()
+    }
+
+    fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        texture: usize,
+        size: UntypedSize2D<i32>,
+    ) -> Option<usize> {
+        self.surfman_rendering_info
+            .create_render_pbuffer_from_d3d_texture(texture, size)
+    }
+
+    fn make_render_pbuffer_current(&self, egl_surface: usize) -> bool {
+        self.surfman_rendering_info
+            .make_render_pbuffer_current(egl_surface)
+    }
+
+    fn destroy_render_pbuffer(&self, egl_surface: usize) {
+        self.surfman_rendering_info.destroy_render_pbuffer(egl_surface)
+    }
+
     fn copy_rows_to_mapped(
         &self,
         dst_ptr: usize,
@@ -869,6 +985,9 @@ pub struct WindowRenderingContext {
     size: Cell<PhysicalSize<u32>>,
     surfman_context: SurfmanRenderingContext,
     requested_gpu_index: Option<usize>,
+    /// Native compositor(DirectComposition) 인터롭용 Win32 HWND. Windows에서만 보관.
+    #[cfg(windows)]
+    win32_hwnd: Option<usize>,
 }
 
 impl WindowRenderingContext {
@@ -942,6 +1061,14 @@ impl WindowRenderingContext {
         let adapter = create_adapter_for_requested_gpu(&connection, requested_gpu_index)?;
         let surfman_context = SurfmanRenderingContext::new(&connection, &adapter, refresh_driver)?;
 
+        // connection.rs:193과 동일 패턴으로 Win32 HWND를 추출해 보관한다. `window_handle`은
+        // 아래 `create_native_widget_from_window_handle`로 이동되므로 그 전에 추출한다.
+        #[cfg(windows)]
+        let win32_hwnd: Option<usize> = match window_handle.as_raw() {
+            RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as usize),
+            _ => None,
+        };
+
         let native_widget = connection
             .create_native_widget_from_window_handle(
                 window_handle,
@@ -957,6 +1084,8 @@ impl WindowRenderingContext {
             size: Cell::new(size),
             surfman_context,
             requested_gpu_index,
+            #[cfg(windows)]
+            win32_hwnd,
         })
     }
 
@@ -1107,6 +1236,32 @@ impl RenderingContext for WindowRenderingContext {
 
     fn release_d3d11_texture(&self, texture: usize) {
         self.surfman_context.release_d3d11_texture(texture)
+    }
+
+    #[cfg(windows)]
+    fn window_hwnd(&self) -> Option<usize> {
+        self.win32_hwnd
+    }
+
+    fn angle_d3d11_device_ptr(&self) -> Option<usize> {
+        self.surfman_context.angle_d3d11_device_ptr()
+    }
+
+    fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        texture: usize,
+        size: UntypedSize2D<i32>,
+    ) -> Option<usize> {
+        self.surfman_context
+            .create_render_pbuffer_from_d3d_texture(texture, size)
+    }
+
+    fn make_render_pbuffer_current(&self, egl_surface: usize) -> bool {
+        self.surfman_context.make_render_pbuffer_current(egl_surface)
+    }
+
+    fn destroy_render_pbuffer(&self, egl_surface: usize) {
+        self.surfman_context.destroy_render_pbuffer(egl_surface)
     }
 
     fn copy_rows_to_mapped(
@@ -1479,6 +1634,27 @@ impl RenderingContext for OffscreenRenderingContext {
 
     fn release_d3d11_texture(&self, texture: usize) {
         self.parent_context.release_d3d11_texture(texture)
+    }
+
+    fn angle_d3d11_device_ptr(&self) -> Option<usize> {
+        self.parent_context.angle_d3d11_device_ptr()
+    }
+
+    fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        texture: usize,
+        size: UntypedSize2D<i32>,
+    ) -> Option<usize> {
+        self.parent_context
+            .create_render_pbuffer_from_d3d_texture(texture, size)
+    }
+
+    fn make_render_pbuffer_current(&self, egl_surface: usize) -> bool {
+        self.parent_context.make_render_pbuffer_current(egl_surface)
+    }
+
+    fn destroy_render_pbuffer(&self, egl_surface: usize) {
+        self.parent_context.destroy_render_pbuffer(egl_surface)
     }
 
     fn copy_rows_to_mapped(
