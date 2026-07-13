@@ -1191,6 +1191,17 @@ impl RenderingContext for WindowRenderingContext {
 
     #[servo_tracing::instrument(skip_all, name = "WindowRenderingContext::present")]
     fn present(&self) {
+        // Native Compositor(DComp) 게이트 on이면 웹콘텐츠는 WR이 DComp 비주얼 트리에 직접
+        // 그려 DWM이 합성하고, 창 백버퍼에는 그 트리에 가려지는 egui 크롬뿐이다. 게이트
+        // on에선 ppf도 꺼져 있어(§surfman luid_display_attribs) 이 present는 표시에
+        // 기여하지 않는 offscreen→backbuffer 복사+스왑 비용만 남는다 → 스킵.
+        if dcomp_native_compositor_requested() {
+            static PRESENT_SKIP_LOGGED: std::sync::Once = std::sync::Once::new();
+            PRESENT_SKIP_LOGGED.call_once(|| {
+                info!("[dcomp-native] window present skipped (content composited via DComp)");
+            });
+            return;
+        }
         if let Err(error) = self.surfman_context.present_bound_surface() {
             warn!("Error presenting surface: {error:?}");
         }
