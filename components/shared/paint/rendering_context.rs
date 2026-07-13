@@ -17,7 +17,9 @@ use gleam::gl::{self, Gl};
 use glow::{HasContext, NativeFramebuffer};
 use image::RgbaImage;
 use log::{debug, info, trace, warn};
-use raw_window_handle::{DisplayHandle, RawWindowHandle, WindowHandle};
+use raw_window_handle::{DisplayHandle, WindowHandle};
+#[cfg(windows)]
+use raw_window_handle::RawWindowHandle;
 pub use surfman::Error;
 // Re-exported so external-image consumers (e.g. the WebGPU GPU-direct present path) can hold
 // the `SurfaceTexture` returned by `create_texture_from_shared_handle` without depending on
