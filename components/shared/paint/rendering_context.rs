@@ -1638,6 +1638,17 @@ impl RenderingContext for OffscreenRenderingContext {
         self.parent_context.release_d3d11_texture(texture)
     }
 
+    // Native compositor(DirectComposition) interop is delegated to the parent window
+    // context. The painter renders into this offscreen context, but the DComp target must
+    // be created on the parent window's HWND. Without this forward `window_hwnd()` returns
+    // the trait default `None`, so `dcomp_compositor::maybe_create` fails and the native
+    // compositor never engages (the pbuffer/device forwards below already delegate; this
+    // completes the 5-point Window/Offscreen delegation from the design).
+    #[cfg(windows)]
+    fn window_hwnd(&self) -> Option<usize> {
+        self.parent_context.window_hwnd()
+    }
+
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
         self.parent_context.angle_d3d11_device_ptr()
     }
