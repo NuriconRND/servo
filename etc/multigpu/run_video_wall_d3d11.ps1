@@ -23,8 +23,12 @@ param(
     # full-repaint promote to a flip swapchain (probe-parity Present), everything else stays
     # on the virtual-surface path. With -DCompSurface, -DComp -DCompSurface selects the
     # VIRTUAL-SURFACE-ONLY legacy path (SERVO_COMPOSITOR_DCOMP=surface): no swapchain
-    # promotion ever happens -- kept for AMD A/B against the hybrid path. -DCompSurface
-    # without -DComp is a no-op (warns and is ignored; DComp stays off).
+    # promotion ever happens -- kept for AMD A/B against the hybrid path. Only the
+    # *storage* backend is legacy here (virtual surface only, no swapchain); the deferred
+    # AddVisual (Task 4 layer culling) and the end_frame GL flush apply in BOTH modes --
+    # so "=surface" is NOT byte-identical to the pre-this-project baseline. Read AMD
+    # results with that in mind. -DCompSurface without -DComp is a no-op (warns and is
+    # ignored; DComp stays off).
     [switch] $DCompSurface,
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets

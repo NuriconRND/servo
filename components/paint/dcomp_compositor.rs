@@ -138,6 +138,16 @@ fn surface_extent(
     Some(rect)
 }
 
+/// 타일 집합이 extent(union)를 빈틈없이 채우는 조밀 사각형인지 판정.
+/// 스왑체인 크기는 extent(union)로 만들지만 coverage 판정은 존재하는 타일만 훑으므로,
+/// 타일 집합이 조밀 사각형이 아니면(구멍) union 내부 무타일 영역이 FLIP_DISCARD의
+/// 미정의 픽셀인 채 Present될 수 있다(현 워크로드에서는 발생하지 않는다는 가정을
+/// 여기서 강제한다). 오버플로 방지 위해 i64로 계산.
+fn tiles_are_dense(tile_count: usize, tile_size: DeviceIntSize, extent_size: DeviceIntSize) -> bool {
+    tile_count as i64 * tile_size.width as i64 * tile_size.height as i64
+        == extent_size.width as i64 * extent_size.height as i64
+}
+
 /// 레이어 컬링: entries는 add_surface 순서(z 아래→위)의 (device 클립, 불투명 여부).
 /// 최상위부터 훑어, 불투명 클립이 완전히 포함하는 하위 항목을 숨긴다.
 /// 알파(불투명 아님) 항목은 절대 숨겨지지 않는 것이 아니라 — 알파 항목도 "위의
@@ -483,8 +493,12 @@ impl DCompNativeCompositor {
         size: DeviceIntSize,
         is_opaque: bool,
     ) -> Option<ComOwned<IDXGISwapChain1>> {
-        let factory = self.dxgi_factory.as_ref()?.as_ptr();
+        let Some(factory) = self.dxgi_factory.as_ref().map(ComOwned::as_ptr) else {
+            warn!("[dcomp-native] create_composition_swapchain: no DXGI factory; giving up");
+            return None;
+        };
         if size.width <= 0 || size.height <= 0 {
+            warn!("[dcomp-native] create_composition_swapchain: invalid size {}x{}", size.width, size.height);
             return None;
         }
         let desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -1010,7 +1024,11 @@ impl Compositor for DCompNativeCompositor {
                         if let Some(extent) =
                             surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size)
                         {
-                            promote_requests.push((*id, extent));
+                            // 조밀성 가드: 타일 집합이 extent를 빈틈없이 채우지 않으면
+                            // 승격하지 않는다(스왑체인 구멍이 미정의 픽셀로 Present될 위험).
+                            if tiles_are_dense(entry.tiles.len(), entry.tile_size, extent.size()) {
+                                promote_requests.push((*id, extent));
+                            }
                         }
                     }
                 },
@@ -1026,7 +1044,13 @@ impl Compositor for DCompNativeCompositor {
                     if geometry_changed {
                         if !self.warned_regen_fail {
                             if let Some(e) = cur_extent {
-                                regen_requests.push((*id, e));
+                                // 조밀성 가드: 타일 집합이 e를 빈틈없이 채우지 않으면 regen을
+                                // 보류한다(과도기 구멍이 있는 채로 재생성하면 그 구멍이
+                                // FLIP_DISCARD 미정의 픽셀로 Present될 위험 — 다음 프레임에
+                                // 재판정).
+                                if tiles_are_dense(entry.tiles.len(), entry.tile_size, e.size()) {
+                                    regen_requests.push((*id, e));
+                                }
                             }
                         }
                     } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
