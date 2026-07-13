@@ -313,11 +313,19 @@ Task 1-6로 게이트(`SERVO_COMPOSITOR_DCOMP=1`) 구현·검증 완료(HEAD `2f
 
 ### 최종 리뷰 공시 (2건, 2026-07-13)
 
-- **잔여 egui blit** — 게이트 on에서도 servoshell egui `PaintCallback`이
-  오프스크린 프레임버퍼(콘텐츠 없음)를 창 백버퍼로 매 리페인트 blit —
-  창면적 ~1× 추가 트래픽이 잔존한다(합계 ~2×, probe 1× 대비). AMD A/B 해석
-  시 유의. blit 스킵은 "servoshell 무변경" 조항과 충돌해 사용자 결정
-  대기(`ports/servoshell/desktop/gui.rs:622-636`).
+- **잔여 egui blit — 해소(사용자 승인).** 최초 공시 당시 게이트 on에서도
+  servoshell egui `PaintCallback`이 오프스크린 프레임버퍼(콘텐츠 없음)를 창
+  백버퍼로 매 리페인트 blit해 창면적 ~1× 추가 트래픽이 잔존했다(합계 ~2×,
+  probe 1× 대비). 이 blit 스킵은 "servoshell 무변경" 조항과 충돌해 사용자 결정
+  대기였으나, **사용자가 이 변경에 한해 조항 해제를 승인**해 적용했다(커밋
+  `35fa1f7df`). `RenderingContext::dcomp_native_active()` getter를 추가하고
+  `ports/servoshell/desktop/gui.rs`의 웹뷰 콘텐츠 blit(`render_to_parent`
+  PaintCallback) 발행을 네이티브 컴포지터 실발동 시 스킵한다(egui 위젯 페인팅은
+  무변경, 게이트 off는 바이트 동일). 결과: **게이트 on 앱측 트래픽 = 콘텐츠
+  draw 1×로 probe 패리티 달성**(잔여 ②단·blit 모두 소멸). 검증: 게이트 on
+  quad(4분면 정위치+리사이즈, engaged+present-skip 마커) / 게이트 on 2×2 비디오
+  (d3d11·direct 4/4, 마커 2종, 비디오 정상, import 경고 0) / 게이트 off(마커 부재,
+  4분면 정상) 전부 PASS, 클린 종료.
 - **스크린샷/리드백(§11-7 종결)** — 게이트 on에서 WR은 창 프레임버퍼에
   콘텐츠를 그리지 않으므로 스크린샷 API류는 배경색만 캡처한다. §3 비범위
   (스크린샷 API 호환) 그대로이며, 알려진 제한으로 명시한다. 외부 화면 캡처
