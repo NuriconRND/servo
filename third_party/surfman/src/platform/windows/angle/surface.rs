@@ -52,6 +52,9 @@ pub fn dcomp_native_compositor_requested() -> bool {
             || v.eq_ignore_ascii_case("true")
             || v.eq_ignore_ascii_case("yes")
             || v.eq_ignore_ascii_case("on")
+            // "surface" = 네이티브 컴포지터 on + 가상 서피스 전용 모드(구 경로 A/B).
+            // 모드 세부는 paint::dcomp_compositor::storage_mode()가 판정한다.
+            || v.eq_ignore_ascii_case("surface")
     })
 }
 

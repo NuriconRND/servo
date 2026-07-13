@@ -67,6 +67,95 @@ fn tile_virtual_rect(
     DeviceIntRect::from_origin_and_size(origin, tile_size)
 }
 
+/// SERVO_COMPOSITOR_DCOMP 값의 세부 모드. "surface"=가상 서피스 전용(구 경로 A/B),
+/// 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
+#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 승격 분기가 이 값을 사용).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StorageMode {
+    Hybrid,
+    SurfaceOnly,
+}
+
+#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 승격 분기가 이 값을 사용).
+fn storage_mode() -> StorageMode {
+    static MODE: std::sync::OnceLock<StorageMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("SERVO_COMPOSITOR_DCOMP") {
+            Ok(v) if v.eq_ignore_ascii_case("surface") => StorageMode::SurfaceOnly,
+            _ => StorageMode::Hybrid,
+        }
+    })
+}
+
+/// 진단: 컬링만 끄는 스위치(요소 소실 의심 시 즉시 판별용).
+#[allow(dead_code)] // Task 4에서 결선 시 제거(컬링 배선이 이 스위치를 참조).
+fn cull_disabled() -> bool {
+    static NO_CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_CULL.get_or_init(|| std::env::var("SERVO_DCOMP_NO_CULL").is_ok())
+}
+
+/// 스왑체인 백버퍼의 유효 피복(타일 단위, Present까지 누적).
+/// Present를 안 하면 flip이라도 GetBuffer(0)가 같은 버퍼이므로 누적이 성립한다.
+/// 판정은 보수적: bind의 dirty가 그 타일의 valid_rect 전체를 덮을 때만 집계
+/// (부분 dirty 타일은 미피복 취급 — 잔상 불허, 지연 허용. 스펙 §7 정제).
+#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 Present 규칙의 근거).
+#[derive(Default)]
+struct FrameCoverage {
+    covered_tiles: std::collections::HashSet<(i32, i32)>,
+}
+
+#[allow(dead_code)] // Task 3에서 결선 시 제거(하이브리드 Present 규칙의 근거).
+impl FrameCoverage {
+    fn reset(&mut self) {
+        self.covered_tiles.clear();
+    }
+    fn note_tile(&mut self, tile: (i32, i32), dirty: DeviceIntRect, valid: DeviceIntRect) {
+        if dirty.contains_box(&valid) {
+            self.covered_tiles.insert(tile);
+        }
+    }
+    fn is_full(&self, tiles: &std::collections::HashSet<(i32, i32)>) -> bool {
+        !tiles.is_empty() && tiles.iter().all(|t| self.covered_tiles.contains(t))
+    }
+}
+
+/// 서피스의 타일 집합 → 가상공간 extent(스왑체인 크기·anchor의 근거).
+#[allow(dead_code)] // Task 3에서 결선 시 제거(스왑체인 크기·anchor 산출에 사용).
+fn surface_extent(
+    tiles: &std::collections::HashSet<(i32, i32)>,
+    virtual_offset: DeviceIntPoint,
+    tile_size: DeviceIntSize,
+) -> Option<DeviceIntRect> {
+    let mut it = tiles.iter();
+    let first = *it.next()?;
+    let mut rect = tile_virtual_rect(virtual_offset, tile_size, first.0, first.1);
+    for &(x, y) in it {
+        rect = rect.union(&tile_virtual_rect(virtual_offset, tile_size, x, y));
+    }
+    Some(rect)
+}
+
+/// 레이어 컬링: entries는 add_surface 순서(z 아래→위)의 (device 클립, 불투명 여부).
+/// 최상위부터 훑어, 불투명 클립이 완전히 포함하는 하위 항목을 숨긴다.
+/// 알파(불투명 아님) 항목은 절대 숨겨지지 않는 것이 아니라 — 알파 항목도 "위의
+/// 불투명"에 완전히 덮이면 안 보이므로 숨김 대상이 될 수 있다. 숨기는 주체가
+/// 불투명이어야 한다는 것이 안전 조건이다.
+#[allow(dead_code)] // Task 4에서 결선 시 제거(AddVisual 이연 컬링에 사용).
+fn cull_covered(entries: &[(DeviceIntRect, bool)]) -> Vec<bool> {
+    let mut visible = vec![true; entries.len()];
+    for top in (0..entries.len()).rev() {
+        if !entries[top].1 || !visible[top] {
+            continue;
+        }
+        for below in 0..top {
+            if visible[below] && entries[top].0.contains_box(&entries[below].0) {
+                visible[below] = false;
+            }
+        }
+    }
+    visible
+}
+
 /// 소유한 COM 포인터의 RAII 래퍼(Drop에서 Release). Send/Sync 아님 —
 /// 렌더러 스레드 전용(WR Compositor 계약과 일치).
 struct ComOwned<T>(ptr::NonNull<T>);
@@ -670,5 +759,54 @@ mod tests {
         let r = tile_virtual_rect(vo, ts, 2, -1);
         assert_eq!(r.min, DeviceIntPoint::new(16384 + 2048, 16384 - 512));
         assert_eq!(r.size(), ts);
+    }
+
+    fn r(x0: i32, y0: i32, x1: i32, y1: i32) -> DeviceIntRect {
+        DeviceIntRect::new(DeviceIntPoint::new(x0, y0), DeviceIntPoint::new(x1, y1))
+    }
+
+    #[test]
+    fn coverage_full_only_when_every_tile_fully_drawn() {
+        let tiles: std::collections::HashSet<_> = [(0, 0), (1, 0)].into_iter().collect();
+        let mut cov = FrameCoverage::default();
+        let valid = r(0, 0, 100, 100);
+        cov.note_tile((0, 0), r(0, 0, 100, 100), valid);
+        assert!(!cov.is_full(&tiles)); // 타일 하나 남음
+        cov.note_tile((1, 0), r(0, 0, 50, 100), valid); // 부분 dirty → 미집계
+        assert!(!cov.is_full(&tiles));
+        cov.note_tile((1, 0), r(0, 0, 100, 100), valid); // 누적 프레임에서 완전 갱신
+        assert!(cov.is_full(&tiles));
+        cov.reset();
+        assert!(!cov.is_full(&tiles));
+    }
+
+    #[test]
+    fn cull_hides_fully_covered_below_opaque_top() {
+        // 월 실측 구조: 전면 불투명 2장 → 하위 숨김
+        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 1920, 1080), true)]);
+        assert_eq!(v, vec![false, true]);
+        // 최상위가 알파면 아무도 못 숨김
+        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 1920, 1080), false)]);
+        assert_eq!(v, vec![true, true]);
+        // 부분 겹침은 유지
+        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 900, 1080), true)]);
+        assert_eq!(v, vec![true, true]);
+        // 3겹: 최상 불투명이 아래 둘 다 덮음
+        let v = cull_covered(&[
+            (r(0, 0, 100, 100), true),
+            (r(0, 0, 100, 100), false),
+            (r(0, 0, 100, 100), true),
+        ]);
+        assert_eq!(v, vec![false, false, true]);
+    }
+
+    #[test]
+    fn surface_extent_unions_tiles() {
+        let vo = DeviceIntPoint::new(16384, 16384);
+        let ts = DeviceIntSize::new(1024, 512);
+        let tiles: std::collections::HashSet<_> = [(0, 0), (1, 0), (0, 1)].into_iter().collect();
+        let e = surface_extent(&tiles, vo, ts).unwrap();
+        assert_eq!(e, r(16384, 16384, 16384 + 2048, 16384 + 1024));
+        assert!(surface_extent(&Default::default(), vo, ts).is_none());
     }
 }
