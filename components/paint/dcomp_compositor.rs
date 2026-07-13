@@ -43,6 +43,11 @@ use winapi::um::unknwnbase::IUnknown;
 /// 가상공간 중심(vss/2) 부근에 배치한다(picture.rs:2477).
 const VIRTUAL_SURFACE_SIZE: i32 = 1024 * 32;
 
+/// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
+fn dcomp_debug() -> bool {
+    std::env::var("SERVO_DCOMP_DEBUG").is_ok()
+}
+
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
 /// virtual_offset은 create_surface 때 WR이 준 이 서피스의 가상공간 원점.
 fn tile_virtual_rect(
@@ -328,6 +333,12 @@ impl Compositor for DCompNativeCompositor {
         };
 
         // 비주얼은 매 프레임 begin_frame(RemoveAllVisuals) 후 add_surface에서 트리에 추가한다.
+        if dcomp_debug() {
+            log::info!(
+                "[dcomp-dbg] create_surface id={:?} virtual_offset=({},{}) tile_size={}x{} opaque={}",
+                id, virtual_offset.x, virtual_offset.y, tile_size.width, tile_size.height, is_opaque
+            );
+        }
         self.surfaces.insert(id, entry);
     }
 
@@ -423,10 +434,34 @@ impl Compositor for DCompNativeCompositor {
         });
 
         // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
+        //
+        // NOTE (Task 5 스모크 발견, 미해결 — Task 6 후속): DComp 표시가 발동하고 색/수평
+        // 방향은 정확하나(좌상 red·우상 lime) 수직 위치가 어긋나 타일이 조각남. WR은
+        // `DrawTarget::NativeSurface`를 top-left 원점으로 취급하는데(webrender device/gl.rs
+        // `surface_origin_is_top_left`가 NativeSurface에서 무조건 true), surfman이 감싼 EGL
+        // pbuffer는 표준 GL bottom-left라 DComp가 top-left로 읽는 D3D 아틀라스와 방향이
+        // 어긋난다는 가설이 유력하다(BeginDraw가 프레임마다 다른 update_offset·텍스처
+        // 높이로 재배치 → 불일치가 매 프레임 다른 양으로 흩어짐). PoC G4의 top-left 정합은
+        // render_quadrants가 자체 gl_y 반전을 넣어 WR 투영을 우회했으므로 이 경로를
+        // 검증하지 못했다. 시도한 수정: pbuffer 생성 시 EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE
+        // → ANGLE이 client-buffer pbuffer에 대해 EGL_BAD_ATTRIBUTE(0x3004)로 거부(무효).
+        // 올바른 수정 위치(WR native-surface Y 규약 vs ANGLE pbuffer 방향)는 RenderDoc급
+        // 검증과 함께 후속에서 확정 필요. ★임의 y-flip 핵 금지(스펙).
         let origin = DeviceIntPoint::new(
             update_offset.x - dirty_rect.min.x,
             update_offset.y - dirty_rect.min.y,
         );
+        if dcomp_debug() {
+            log::info!(
+                "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
+                 update_off=({},{}) tex={}x{} -> origin=({},{})",
+                id.surface_id, id.x, id.y,
+                dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
+                tile_rect.min.x, tile_rect.min.y,
+                update_offset.x, update_offset.y, desc.Width, desc.Height,
+                origin.x, origin.y
+            );
+        }
         NativeSurfaceInfo { origin, fbo_id: 0 }
     }
 
@@ -524,6 +559,16 @@ impl Compositor for DCompNativeCompositor {
             right: clip_rect.max.x as f32 - offset_x,
             bottom: clip_rect.max.y as f32 - offset_y,
         };
+
+        if dcomp_debug() {
+            log::info!(
+                "[dcomp-dbg] add_surface id={:?} transform.offset=({},{}) scale=({},{}) \
+                 clip=({},{})-({},{}) virt_off=({},{}) -> visual_off=({},{})",
+                id, transform.offset.x, transform.offset.y, transform.scale.x, transform.scale.y,
+                clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y,
+                virtual_offset.x, virtual_offset.y, offset_x, offset_y
+            );
+        }
 
         // Safety: visual/root는 살아있는 IDCompositionVisual. SetOffsetX/Y·SetClip은 `_1`
         // (값) 오버로드를 쓴다(PoC winapi 대조).
