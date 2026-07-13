@@ -207,6 +207,46 @@ fn release_frame_pbuffer(rc: &Rc<dyn RenderingContext>, sc: &mut SwapChainStorag
     }
 }
 
+/// visual 오프셋·클립 적용(add_surface·content-swap 공용 산식).
+/// 콘텐츠는 가상공간 절대좌표(Virtual: content_anchor=0) 또는 스왑체인 0-기준 좌표
+/// (content_anchor=그 스왑체인의 anchor)에 그려져 있다. 비주얼 오프셋을
+/// (transform.offset - virtual_offset + content_anchor)로 주면 콘텐츠가 창 device 좌표
+/// transform.offset에 놓인다(Gecko DCLayerTree 동일 보정, scale=1 가정).
+/// DComp SetClip은 비주얼-로컬(오프셋 적용 전) 좌표를 받으므로(MS docs: "The clip is
+/// transformed by the OffsetX, OffsetY...") device 클립에서 오프셋을 빼 환산한다.
+/// SetOffsetX/Y·SetClip은 `_1`(값) 오버로드(PoC winapi 대조). 적용한 오프셋을 돌려준다.
+fn apply_visual_placement(
+    visual: &ComOwned<IDCompositionVisual>,
+    placement: LastPlacement,
+    virtual_offset: DeviceIntPoint,
+    content_anchor: DeviceIntPoint,
+) -> (f32, f32) {
+    let offset_x = placement.transform_offset.0 - virtual_offset.x as f32 + content_anchor.x as f32;
+    let offset_y = placement.transform_offset.1 - virtual_offset.y as f32 + content_anchor.y as f32;
+    let clip = D2D_RECT_F {
+        left: placement.clip_rect.min.x as f32 - offset_x,
+        top: placement.clip_rect.min.y as f32 - offset_y,
+        right: placement.clip_rect.max.x as f32 - offset_x,
+        bottom: placement.clip_rect.max.y as f32 - offset_y,
+    };
+    // Safety: visual은 ComOwned가 수명을 보장하는 살아있는 IDCompositionVisual.
+    unsafe {
+        let hr = (*visual.as_ptr()).SetOffsetX_1(offset_x);
+        if hr < 0 {
+            warn!("[dcomp-native] SetOffsetX failed (hr=0x{:08x})", hr as u32);
+        }
+        let hr = (*visual.as_ptr()).SetOffsetY_1(offset_y);
+        if hr < 0 {
+            warn!("[dcomp-native] SetOffsetY failed (hr=0x{:08x})", hr as u32);
+        }
+        let hr = (*visual.as_ptr()).SetClip_1(&clip);
+        if hr < 0 {
+            warn!("[dcomp-native] SetClip failed (hr=0x{:08x})", hr as u32);
+        }
+    }
+    (offset_x, offset_y)
+}
+
 /// 하이브리드 승격된 서피스의 스왑체인 저장소(전면 갱신 서피스를 flip 스왑체인으로).
 struct SwapChainStorage {
     swapchain: ComOwned<IDXGISwapChain1>,
@@ -222,6 +262,12 @@ struct SwapChainStorage {
     withheld_frames: u32,
     /// content_attached 전까지 유지되는 구 가상 서피스(글리치 없는 전환용).
     fallback_virtual: Option<ComOwned<IDCompositionVirtualSurface>>,
+    /// visual에 **현재 붙어 있는** 콘텐츠의 anchor(표시 오프셋 산식의 기준).
+    /// None = fallback_virtual(가상좌표 콘텐츠) 표시 중 → 가상 산식(-virtual_offset).
+    /// Some(a) = anchor a로 그려진 스왑체인 표시 중 → 0-기준 산식(+a).
+    /// regen 후에는 옛 스왑체인이 그대로 붙어 있으므로 옛 anchor가 유지된다 —
+    /// sc.anchor(현재 렌더 대상)와 다를 수 있다. content-swap에서만 갱신.
+    displayed_anchor: Option<DeviceIntPoint>,
 }
 
 /// 서피스 콘텐츠의 백엔드. 기본은 `Virtual`(가상 서피스), 연속 전면 갱신 서피스는
@@ -231,6 +277,16 @@ enum SurfaceStorage {
         virtual_surface: ComOwned<IDCompositionVirtualSurface>,
     },
     SwapChain(SwapChainStorage),
+}
+
+/// add_surface가 마지막으로 기록한 배치(WR device 좌표). content-swap 시 같은 Commit에서
+/// 오프셋·클립을 새 콘텐츠 산식으로 재적용하기 위해 보관한다(무글리치 원자 전환).
+#[derive(Clone, Copy)]
+struct LastPlacement {
+    /// transform.offset (scale=1 가정, add_surface와 동일).
+    transform_offset: (f32, f32),
+    /// device 좌표 클립 rect.
+    clip_rect: DeviceIntRect,
 }
 
 /// 창당 하나의 picture cache 슬라이스에 대응하는 DComp 서피스 저장소 + 비주얼.
@@ -243,10 +299,12 @@ struct SurfaceEntry {
     /// bind/unbind된 타일 좌표 부기(승격 판단·surface_extent 근거).
     tiles: std::collections::HashSet<(i32, i32)>,
     /// 이번 프레임 Virtual bind가 note_tile한 타일 피복(전면 갱신 승격 판정용).
-    /// 매 end_frame 말미에 reset.
+    /// Virtual 전용 부기 — 스왑체인은 sc.coverage를 쓴다. end_frame Virtual arm에서 reset.
     frame_coverage: FrameCoverage,
-    /// 연속으로 전면 갱신을 만족한 프레임 수(승격 히스테리시스).
+    /// 연속으로 전면 갱신을 만족한 프레임 수(승격 히스테리시스). 승격 시 0으로 리셋.
     promote_streak: u32,
+    /// 마지막 add_surface 배치(content-swap의 오프셋 재적용 근거). add_surface 전 None.
+    last_placement: Option<LastPlacement>,
 }
 
 /// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
@@ -281,6 +339,9 @@ pub struct DCompNativeCompositor {
     warned_enable_native: bool,
     /// 스왑체인 생성이 한 번이라도 실패하면 이후 승격을 영구 중단(warn 1회, Virtual 유지).
     warned_promote_fail: bool,
+    /// regen(리사이즈 재생성)용 스왑체인 생성이 실패하면 이후 regen을 영구 중단
+    /// (warn 1회, 옛 스왑체인 콘텐츠 유지 — 매 프레임 재시도 스팸 방지).
+    warned_regen_fail: bool,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -397,6 +458,7 @@ pub fn maybe_create(
             warned_external_surface: false,
             warned_enable_native: false,
             warned_promote_fail: false,
+            warned_regen_fail: false,
         })
     }
 }
@@ -566,6 +628,7 @@ impl Compositor for DCompNativeCompositor {
                 tiles: std::collections::HashSet::new(),
                 frame_coverage: FrameCoverage::default(),
                 promote_streak: 0,
+                last_placement: None,
             }
         };
 
@@ -863,64 +926,47 @@ impl Compositor for DCompNativeCompositor {
         let Some(root) = self.root_visual_ptr() else {
             return;
         };
-        let Some(entry) = self.surfaces.get(&id) else {
+        let Some(entry) = self.surfaces.get_mut(&id) else {
             warn!("[dcomp-native] add_surface: unknown surface {:?}", id);
             return;
         };
-        let visual = entry.visual.as_ptr();
         let virtual_offset = entry.virtual_offset;
-        // 스왑체인 콘텐츠는 백버퍼 0-기준 좌표(백버퍼 (0,0) = 가상좌표 anchor)에 그려졌다.
-        // Virtual 콘텐츠는 가상 절대좌표에 그려졌다(anchor 없음 = 0). 아래 오프셋 식에서
-        // Virtual은 -virtual_offset이 ~16384 가상좌표를 상쇄하고, SwapChain은 anchor를
-        // 더해 0-기준 좌표를 같은 device 위치로 되돌린다(anchor≈virtual_offset이면 순수 transform).
+        // 오프셋 산식의 anchor는 storage가 아니라 **visual에 지금 붙어 있는 콘텐츠**
+        // (displayed_anchor)를 따른다. 승격~첫 완전 Present 사이(및 regen 직후)에는
+        // storage=SwapChain이어도 visual은 아직 구 콘텐츠(fallback_virtual=가상좌표,
+        // 또는 옛 anchor의 스왑체인)를 표시하므로, sc.anchor(렌더 대상) 기준으로 계산하면
+        // 표시 중인 콘텐츠가 ~16384px 화면 밖으로 밀린다. content-swap 시 end_frame이
+        // displayed_anchor를 갱신하고 같은 Commit에서 오프셋을 재적용한다(무글리치).
         let content_anchor = match &entry.storage {
-            SurfaceStorage::SwapChain(sc) => sc.anchor,
+            SurfaceStorage::SwapChain(sc) => sc.displayed_anchor.unwrap_or(DeviceIntPoint::zero()),
             SurfaceStorage::Virtual { .. } => DeviceIntPoint::zero(),
         };
 
-        // 콘텐츠는 가상공간 절대좌표(virtual_offset + 타일격자)에 그려졌다. 비주얼 오프셋을
-        // (transform.offset - virtual_offset [+ anchor])으로 주면 콘텐츠가 창 device 좌표
-        // transform.offset에 놓인다(Gecko DCLayerTree 동일 보정, scale=1 가정).
-        let offset_x = transform.offset.x - virtual_offset.x as f32 + content_anchor.x as f32;
-        let offset_y = transform.offset.y - virtual_offset.y as f32 + content_anchor.y as f32;
-
-        // DComp SetClip은 비주얼-로컬(오프셋 적용 전) 좌표를 받아 오프셋으로 변환되므로
-        // (MS docs: "The clip is transformed by the OffsetX, OffsetY..."), device 클립에서
-        // 비주얼 오프셋을 빼 로컬로 환산한다.
-        let clip = D2D_RECT_F {
-            left: clip_rect.min.x as f32 - offset_x,
-            top: clip_rect.min.y as f32 - offset_y,
-            right: clip_rect.max.x as f32 - offset_x,
-            bottom: clip_rect.max.y as f32 - offset_y,
+        // content-swap 시 재적용할 수 있게 배치를 기록.
+        let placement = LastPlacement {
+            transform_offset: (transform.offset.x, transform.offset.y),
+            clip_rect,
         };
+        entry.last_placement = Some(placement);
+
+        let (offset_x, offset_y) =
+            apply_visual_placement(&entry.visual, placement, virtual_offset, content_anchor);
 
         if dcomp_debug() {
             log::info!(
                 "[dcomp-dbg] add_surface id={:?} transform.offset=({},{}) scale=({},{}) \
-                 clip=({},{})-({},{}) virt_off=({},{}) -> visual_off=({},{})",
+                 clip=({},{})-({},{}) virt_off=({},{}) anchor=({},{}) -> visual_off=({},{})",
                 id, transform.offset.x, transform.offset.y, transform.scale.x, transform.scale.y,
                 clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y,
-                virtual_offset.x, virtual_offset.y, offset_x, offset_y
+                virtual_offset.x, virtual_offset.y, content_anchor.x, content_anchor.y,
+                offset_x, offset_y
             );
         }
 
-        // Safety: visual/root는 살아있는 IDCompositionVisual. SetOffsetX/Y·SetClip은 `_1`
-        // (값) 오버로드를 쓴다(PoC winapi 대조).
+        // Safety: visual/root는 살아있는 IDCompositionVisual.
         unsafe {
-            let hr = (*visual).SetOffsetX_1(offset_x);
-            if hr < 0 {
-                warn!("[dcomp-native] SetOffsetX failed (hr=0x{:08x})", hr as u32);
-            }
-            let hr = (*visual).SetOffsetY_1(offset_y);
-            if hr < 0 {
-                warn!("[dcomp-native] SetOffsetY failed (hr=0x{:08x})", hr as u32);
-            }
-            let hr = (*visual).SetClip_1(&clip);
-            if hr < 0 {
-                warn!("[dcomp-native] SetClip failed (hr=0x{:08x})", hr as u32);
-            }
             // insertAbove=TRUE, reference=null → 형제 최상단에 추가. 호출 순서 = z-order(아래→위).
-            let hr = (*root).AddVisual(visual, TRUE, ptr::null());
+            let hr = (*root).AddVisual(entry.visual.as_ptr(), TRUE, ptr::null());
             if hr < 0 {
                 warn!("[dcomp-native] AddVisual failed (hr=0x{:08x})", hr as u32);
             }
@@ -941,11 +987,13 @@ impl Compositor for DCompNativeCompositor {
         let mut regen_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
 
         for (id, entry) in self.surfaces.iter_mut() {
-            // 전면 갱신 = 이 프레임의 dirty가 전 타일의 valid를 덮음(Virtual bind 집계).
-            let frame_full = entry.frame_coverage.is_full(&entry.tiles);
-
             match &mut entry.storage {
                 SurfaceStorage::Virtual { .. } => {
+                    // 전면 갱신 = 이 프레임의 dirty가 전 타일의 valid를 덮음(Virtual bind 집계).
+                    // frame_coverage는 Virtual 전용 부기(스왑체인은 sc.coverage 사용)라
+                    // 계산·리셋을 이 arm에서만 수행한다.
+                    let frame_full = entry.frame_coverage.is_full(&entry.tiles);
+                    entry.frame_coverage.reset();
                     // 승격 상태머신: 연속 PROMOTE_STREAK회 전면 갱신이면 스왑체인 생성 요청.
                     entry.promote_streak = if frame_full { entry.promote_streak + 1 } else { 0 };
                     if mode == StorageMode::Hybrid
@@ -963,14 +1011,17 @@ impl Compositor for DCompNativeCompositor {
                 SurfaceStorage::SwapChain(sc) => {
                     // 리사이즈 등으로 서피스 extent가 바뀌면 스왑체인이 스테일 — 루프 밖에서
                     // 새 크기로 재생성한다(옛 콘텐츠는 DComp가 SetContent 참조로 유지 → 무글리치).
+                    // regen 생성이 한 번 실패했으면 재시도하지 않는다(warn 스팸 방지, 콘텐츠 동결).
                     let cur_extent =
                         surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size);
                     let geometry_changed = cur_extent
                         .is_some_and(|e| e.min != sc.anchor || e.size() != sc.size);
 
                     if geometry_changed {
-                        if let Some(e) = cur_extent {
-                            regen_requests.push((*id, e));
+                        if !self.warned_regen_fail {
+                            if let Some(e) = cur_extent {
+                                regen_requests.push((*id, e));
+                            }
                         }
                     } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
                         // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
@@ -981,7 +1032,7 @@ impl Compositor for DCompNativeCompositor {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
                             if !sc.content_attached {
-                                // 첫 완전 프레젠트 → visual 콘텐츠를 스왑체인으로 전환(무글리치).
+                                // 첫 완전 프레젠트 → visual 콘텐츠를 스왑체인으로 전환.
                                 // Safety: visual/swapchain 살아있음.
                                 let hr = unsafe {
                                     (*entry.visual.as_ptr())
@@ -990,6 +1041,18 @@ impl Compositor for DCompNativeCompositor {
                                 if hr >= 0 {
                                     sc.content_attached = true;
                                     sc.fallback_virtual = None; // 구 가상 서피스 해제
+                                    // 표시 콘텐츠가 (가상좌표 또는 옛 anchor) → 새 anchor 스왑체인으로
+                                    // 바뀌었다. 오프셋 산식도 같은 Commit에서 새 anchor로 재적용해야
+                                    // 콘텐츠 전환과 오프셋 전환이 원자적으로 반영된다(무글리치).
+                                    sc.displayed_anchor = Some(sc.anchor);
+                                    if let Some(placement) = entry.last_placement {
+                                        apply_visual_placement(
+                                            &entry.visual,
+                                            placement,
+                                            entry.virtual_offset,
+                                            sc.anchor,
+                                        );
+                                    }
                                     if dcomp_debug() {
                                         log::info!("[dcomp-dbg] content-swap id={:?} -> swapchain", id);
                                     }
@@ -1018,7 +1081,6 @@ impl Compositor for DCompNativeCompositor {
                     sc.drawn_this_frame = false;
                 },
             }
-            entry.frame_coverage.reset();
         }
 
         // 승격 실행(루프 밖): 스왑체인 생성 성공 시 storage 교체, visual 콘텐츠는
@@ -1038,6 +1100,8 @@ impl Compositor for DCompNativeCompositor {
                 continue;
             };
             // 구 Virtual 서피스를 새 SwapChain storage로 교체하며 fallback으로 이동.
+            // displayed_anchor=None: visual에는 여전히 fallback(가상좌표 콘텐츠)이 붙어 있다 —
+            // 첫 완전 Present의 content-swap에서 Some(anchor)로 전환된다.
             let old = std::mem::replace(
                 &mut entry.storage,
                 SurfaceStorage::SwapChain(SwapChainStorage {
@@ -1050,6 +1114,7 @@ impl Compositor for DCompNativeCompositor {
                     content_attached: false,
                     withheld_frames: 0,
                     fallback_virtual: None,
+                    displayed_anchor: None,
                 }),
             );
             if let SurfaceStorage::Virtual { virtual_surface } = old {
@@ -1057,6 +1122,7 @@ impl Compositor for DCompNativeCompositor {
                     sc.fallback_virtual = Some(virtual_surface);
                 }
             }
+            entry.promote_streak = 0; // 승격 완료 — Virtual 전용 부기 정리
             if dcomp_debug() {
                 log::info!(
                     "[dcomp-dbg] promote id={:?} extent={}x{} anchor=({},{})",
@@ -1067,7 +1133,9 @@ impl Compositor for DCompNativeCompositor {
 
         // 지오메트리 변화(리사이즈) 재생성(루프 밖): 스왑체인만 새 extent로 교체.
         // 옛 스왑체인 ComOwned를 대체(Release)해도 visual의 SetContent 참조를 DComp가 유지하므로
-        // 다음 완전 Present에서 SetContent(new)까지 옛 콘텐츠가 계속 표시된다(무글리치).
+        // 다음 완전 Present에서 SetContent(new)까지 옛 콘텐츠가 계속 표시된다.
+        // displayed_anchor는 그대로 둔다 — 붙어 있는 옛 콘텐츠(옛 anchor 또는 fallback)의
+        // 표시 산식이 유지돼야 하며, content-swap에서 새 anchor로 함께 전환된다.
         for (surface_id, extent) in regen_requests {
             let is_opaque = match self.surfaces.get(&surface_id) {
                 Some(e) => e.is_opaque,
@@ -1075,7 +1143,13 @@ impl Compositor for DCompNativeCompositor {
             };
             let size = extent.size();
             let Some(swapchain) = self.create_composition_swapchain(size, is_opaque) else {
-                continue; // 재생성 실패 → 스테일 스왑체인 유지(helper warn 1회)
+                // 재생성 실패 → 이후 regen 영구 중단(옛 콘텐츠 동결 표시). warn 1회.
+                warn!(
+                    "[dcomp-native] swapchain regen failed; keeping stale swapchain and \
+                     disabling further regen"
+                );
+                self.warned_regen_fail = true;
+                continue;
             };
             if let Some(entry) = self.surfaces.get_mut(&surface_id) {
                 if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
