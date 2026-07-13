@@ -3,12 +3,13 @@
 //! A thread-local handle to the device.
 
 use super::connection::Connection;
+use super::context::Context;
 use crate::egl;
-use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint};
+use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint, EGLSurface};
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::ffi::EGL_DEVICE_EXT;
 use crate::platform::generic::egl::ffi::{
-    EGL_D3D11_DEVICE_ANGLE, EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE,
+    EGL_D3D11_DEVICE_ANGLE, EGL_D3D_TEXTURE_ANGLE, EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE,
     EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_NO_DEVICE_EXT,
     EGL_PLATFORM_ANGLE_ANGLE, EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE,
     EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
@@ -17,6 +18,7 @@ use crate::platform::generic::egl::ffi::{
 };
 use crate::{Error, GLApi};
 
+use euclid::default::Size2D;
 use log::{info, warn};
 use std::cell::{RefCell, RefMut};
 use std::mem;
@@ -524,6 +526,73 @@ impl Device {
         }
         let ctx = ComPtr::from_raw(ctx);
         ctx.Unmap(texture as *mut ID3D11Resource, 0);
+    }
+
+    /// DComp BeginDraw가 돌려준 RENDER_TARGET 텍스처를 WR이 그릴 EGL pbuffer로
+    /// 래핑한다. 공유 핸들 질의 없음(DComp 텍스처는 비공유). 실패 시 None + 로그.
+    pub unsafe fn create_render_pbuffer_from_d3d_texture(
+        &self,
+        context: &Context,
+        texture: *mut c_void,
+        size: Size2D<i32>,
+    ) -> Option<EGLSurface> {
+        let context_descriptor = self.context_descriptor(context);
+        let egl_config = self.context_descriptor_to_egl_config(&context_descriptor);
+        let attributes = [
+            egl::WIDTH as EGLint,
+            size.width as EGLint,
+            egl::HEIGHT as EGLint,
+            size.height as EGLint,
+            egl::TEXTURE_FORMAT as EGLint,
+            egl::TEXTURE_RGBA as EGLint,
+            egl::TEXTURE_TARGET as EGLint,
+            egl::TEXTURE_2D as EGLint,
+            egl::NONE as EGLint,
+        ];
+        EGL_FUNCTIONS.with(|egl_fns| {
+            let surface = egl_fns.CreatePbufferFromClientBuffer(
+                self.egl_display,
+                EGL_D3D_TEXTURE_ANGLE,
+                texture as *const _,
+                egl_config,
+                attributes.as_ptr(),
+            );
+            if surface == egl::NO_SURFACE {
+                let error = egl_fns.GetError();
+                warn!("create_render_pbuffer_from_d3d_texture failed (EGL 0x{error:x})");
+                return None;
+            }
+            Some(surface)
+        })
+    }
+
+    /// pbuffer를 현재 컨텍스트의 draw/read 서피스로 바인딩한다(컨텍스트는 유지).
+    pub unsafe fn make_render_pbuffer_current(
+        &self,
+        context: &Context,
+        egl_surface: EGLSurface,
+    ) -> bool {
+        EGL_FUNCTIONS.with(|egl_fns| {
+            let ok = egl_fns.MakeCurrent(
+                self.egl_display,
+                egl_surface,
+                egl_surface,
+                context.egl_context,
+            );
+            if ok == egl::FALSE {
+                let error = egl_fns.GetError();
+                warn!("make_render_pbuffer_current failed (EGL 0x{error:x})");
+            }
+            ok != egl::FALSE
+        })
+    }
+
+    /// render pbuffer 해제. EGL은 현재 바인딩 중이면 실제 파괴를 유예하므로
+    /// unbind 직후 호출해도 안전하다.
+    pub unsafe fn destroy_render_pbuffer(&self, egl_surface: EGLSurface) {
+        EGL_FUNCTIONS.with(|egl_fns| {
+            egl_fns.DestroySurface(self.egl_display, egl_surface);
+        });
     }
 
     /// Returns the adapter that this device was created with.

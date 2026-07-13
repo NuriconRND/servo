@@ -40,6 +40,18 @@ use winapi::um::winbase::INFINITE;
 use winapi::um::winnt::HANDLE;
 use wio::com::ComPtr;
 
+/// SERVO_COMPOSITOR_DCOMP 게이트. on이면 창 서피스는 DirectComposition 속성 없이
+/// 만들어 HWND의 DComp 타깃을 Native Compositor 전용으로 남긴다
+/// (CreateTargetForHwnd는 (hwnd, topmost)당 1개만 허용).
+pub(crate) fn dcomp_native_compositor_requested() -> bool {
+    std::env::var("SERVO_COMPOSITOR_DCOMP").is_ok_and(|v| {
+        v == "1"
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+    })
+}
+
 const SURFACE_GL_TEXTURE_TARGET: u32 = gl::TEXTURE_2D;
 const DCOMP_DLL: [u16; 10] = [
     b'd' as u16,
@@ -293,7 +305,7 @@ impl Device {
                     egl::NONE as EGLint,
                 ];
 
-                let egl_surface = if ensure_dcomp_loaded() {
+                let egl_surface = if ensure_dcomp_loaded() && !dcomp_native_compositor_requested() {
                     let surface = egl.CreateWindowSurface(
                         self.egl_display,
                         egl_config,
@@ -319,10 +331,17 @@ impl Device {
                         )
                     }
                 } else {
-                    warn!(
-                        "dcomp.dll is unavailable; creating default ANGLE HWND surface without \
-                         DirectComposition flip-model request"
-                    );
+                    if dcomp_native_compositor_requested() {
+                        info!(
+                            "SERVO_COMPOSITOR_DCOMP=1: creating plain HWND window surface \
+                             (window DComp target reserved for the native compositor)"
+                        );
+                    } else {
+                        warn!(
+                            "dcomp.dll is unavailable; creating default ANGLE HWND surface without \
+                             DirectComposition flip-model request"
+                        );
+                    }
                     egl.CreateWindowSurface(
                         self.egl_display,
                         egl_config,
