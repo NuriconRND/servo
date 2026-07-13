@@ -21,6 +21,9 @@ pub use crate::paint::{Paint, WebRenderDebugOption};
 #[macro_use]
 mod tracing;
 
+/// WR Native Compositor(DirectComposition) 구현. Windows 전용, painter(Task 5)가 결선한다.
+#[cfg(windows)]
+mod dcomp_compositor;
 mod largest_contentful_paint_calculator;
 mod paint;
 mod painter;

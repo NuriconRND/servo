@@ -59,10 +59,59 @@ webxr = { workspace = true, optional = true }
 webxr-api = { workspace = true, optional = true }
 wr_malloc_size_of = { workspace = true }
 
+# DirectComposition Native Compositor(dcomp_compositor.rs)에 필요한 winapi 기능.
+# winapi 0.3.9의 각 피처는 빈 배열이라 전이 의존을 자동으로 켜주지 않는데, `dcomp` 모듈은
+# d2d1/d2d1_1/dwrite/wincodec/dxgi1_2/dcompanimation/... 를 use하므로 그 전이 폐포까지 모두
+# 활성화해야 winapi가 컴파일된다. 아래 목록은 실기 4/4 PASS한 PoC(servo-paint-api dev-deps)에서
+# 검증된 dcomp 전이 폐포에 기존 processthreadsapi/winbase를 합친 것이다.
 [target.'cfg(windows)'.dependencies]
 winapi = { workspace = true, features = [
+    "basetsd",
+    "d2d1",
+    "d2d1_1",
+    "d2d1effectauthor",
+    "d2d1effects",
+    "d2dbasetypes",
+    "d3d11",
+    "d3d9types",
+    "d3dcommon",
+    "dcommon",
+    "dcomp",
+    "dcompanimation",
+    "dcomptypes",
+    "documenttarget",
+    "dwrite",
+    "dxgi",
+    "dxgi1_2",
+    "dxgiformat",
+    "dxgitype",
+    "excpt",
+    "guiddef",
+    "ktmtypes",
+    "libloaderapi",
+    "limits",
+    "minwinbase",
+    "minwindef",
+    "ntdef",
+    "ntstatus",
+    "oaidl",
+    "objidlbase",
+    "ocidl",
     "processthreadsapi",
+    "propidl",
+    "rpcndr",
+    "unknwnbase",
+    "vadefs",
+    "vcruntime",
+    "wincodec",
     "winbase",
+    "windef",
+    "winerror",
+    "wingdi",
+    "winnt",
+    "winuser",
+    "wtypes",
+    "wtypesbase",
 ] }
 
 [dev-dependencies]

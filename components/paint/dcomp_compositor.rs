@@ -1,0 +1,630 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+//! WR Native Compositor의 DirectComposition 구현 (스펙 2026-07-13).
+//! 창(painter)당 인스턴스 1개. WR이 picture cache 타일을 이 모듈이 만든
+//! DComp 가상 서피스에 직접 그리고, DWM이 화면에 합성한다(②단 draw 소멸).
+//!
+//! COM 호출 시퀀스·winapi 오버로드 이름(`_1` 접미사)·HRESULT 처리는 실기에서
+//! 4/4 PASS한 PoC(`components/shared/paint/examples/dcomp_native_poc.rs`)를 정본으로
+//! 이식했다. 좌표 규약: `DrawTarget::NativeSurface`는 WR 내부에서 무조건 top-left이므로
+//! 이 모듈에는 y-flip이 없다(PoC G4가 표시 측 정합을 증명).
+#![allow(unsafe_code)]
+
+use std::collections::HashMap;
+use std::ptr;
+use std::rc::Rc;
+
+use euclid::default::Size2D as UntypedSize2D;
+use log::warn;
+use paint_api::rendering_context::RenderingContext;
+use webrender::api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
+use webrender::api::{ColorF, ExternalImageId, ImageRendering};
+use webrender::{
+    ClipRadius, Compositor, CompositorCapabilities, CompositorSurfaceTransform, Device,
+    NativeSurfaceId, NativeSurfaceInfo, NativeTileId, WindowVisibility,
+};
+use winapi::Interface;
+use winapi::shared::dxgi::IDXGIDevice;
+use winapi::shared::dxgi1_2::{DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED};
+use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
+use winapi::shared::minwindef::TRUE;
+use winapi::shared::windef::{HWND, POINT, RECT};
+use winapi::um::d2dbasetypes::D2D_RECT_F;
+use winapi::um::d3d11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Texture2D};
+use winapi::um::dcomp::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
+    IDCompositionVirtualSurface, IDCompositionVisual,
+};
+use winapi::um::unknwnbase::IUnknown;
+
+/// Gecko DCLayerTree 관례와 동일한 가상 표면 크기. WR은 타일 그리드를 이
+/// 가상공간 중심(vss/2) 부근에 배치한다(picture.rs:2477).
+const VIRTUAL_SURFACE_SIZE: i32 = 1024 * 32;
+
+/// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
+/// virtual_offset은 create_surface 때 WR이 준 이 서피스의 가상공간 원점.
+fn tile_virtual_rect(
+    virtual_offset: DeviceIntPoint,
+    tile_size: DeviceIntSize,
+    tile_x: i32,
+    tile_y: i32,
+) -> DeviceIntRect {
+    let origin = DeviceIntPoint::new(
+        virtual_offset.x + tile_x * tile_size.width,
+        virtual_offset.y + tile_y * tile_size.height,
+    );
+    DeviceIntRect::from_origin_and_size(origin, tile_size)
+}
+
+/// 소유한 COM 포인터의 RAII 래퍼(Drop에서 Release). Send/Sync 아님 —
+/// 렌더러 스레드 전용(WR Compositor 계약과 일치).
+struct ComOwned<T>(ptr::NonNull<T>);
+
+impl<T> ComOwned<T> {
+    /// Safety: `ptr`은 소유권이 이전되는 유효한 COM 인터페이스 포인터여야 한다.
+    unsafe fn from_raw(raw: *mut T) -> Option<Self> {
+        ptr::NonNull::new(raw).map(Self)
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+}
+
+impl<T> Drop for ComOwned<T> {
+    fn drop(&mut self) {
+        // Safety: from_raw 계약에 의해 유효한 COM 포인터를 소유 중.
+        unsafe {
+            (*(self.0.as_ptr() as *mut IUnknown)).Release();
+        }
+    }
+}
+
+/// 창당 하나의 picture cache 슬라이스에 대응하는 DComp 가상 서피스 + 비주얼.
+struct SurfaceEntry {
+    virtual_surface: ComOwned<IDCompositionVirtualSurface>,
+    visual: ComOwned<IDCompositionVisual>,
+    virtual_offset: DeviceIntPoint,
+    tile_size: DeviceIntSize,
+    #[allow(dead_code)]
+    is_opaque: bool,
+}
+
+/// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
+/// (WR은 bind↔unbind를 1:1로 짝지어 호출하므로 동시에 하나만 존재.)
+struct BoundTile {
+    /// EndDraw를 걸 서피스를 다시 찾기 위한 키(bind~unbind 사이 서피스 파괴 없음).
+    surface_id: NativeSurfaceId,
+    /// bind가 만든 EGL pbuffer(EGLSurface as usize). unbind에서 destroy.
+    pbuffer: usize,
+    /// BeginDraw가 돌려준 텍스처(AddRef됨). WR의 GL draw 동안 살려두고 unbind에서 Release.
+    texture: *mut ID3D11Texture2D,
+}
+
+/// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
+/// DComp 가상 서피스에 직접 그리게 한다. 전역 상태 없음.
+pub struct DCompNativeCompositor {
+    rendering_context: Rc<dyn RenderingContext>,
+    dcomp_device: Option<ComOwned<IDCompositionDevice>>,
+    /// HWND에 귀속된 컴포지션 타깃. 생성 후 직접 호출은 없고 수명 유지 목적으로만 보관하며,
+    /// deinit/Drop에서 명시 Release한다.
+    _target: Option<ComOwned<IDCompositionTarget>>,
+    root_visual: Option<ComOwned<IDCompositionVisual>>,
+    surfaces: HashMap<NativeSurfaceId, SurfaceEntry>,
+    bound: Option<BoundTile>,
+    warned_scale: bool,
+    warned_rounded_clip: bool,
+    warned_external_surface: bool,
+    warned_enable_native: bool,
+}
+
+/// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 이 env는 surfman이
+/// 창 서피스를 (자체 DComp 타깃 없이) 만들도록 하는 opt-out과 동일 키다(Task 1) — 따라서
+/// painter가 RenderingContext를 만들기 전에 켜져 있어야 우리 DComp 타깃이 성립한다.
+pub fn enabled() -> bool {
+    std::env::var("SERVO_COMPOSITOR_DCOMP").is_ok_and(|value| {
+        value == "1" ||
+            value.eq_ignore_ascii_case("true") ||
+            value.eq_ignore_ascii_case("yes") ||
+            value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// 컴포지터를 생성한다. 실패(HWND/디바이스 없음, HRESULT 실패)면 warn 후 None을 돌려
+/// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
+pub fn maybe_create(
+    rendering_context: &Rc<dyn RenderingContext>,
+) -> Option<DCompNativeCompositor> {
+    let hwnd = rendering_context.window_hwnd().or_else(|| {
+        warn!("[dcomp-native] no HWND; falling back to Draw");
+        None
+    })?;
+    let d3d = rendering_context.angle_d3d11_device_ptr().or_else(|| {
+        warn!("[dcomp-native] no ANGLE D3D11 device; falling back to Draw");
+        None
+    })? as *mut ID3D11Device;
+
+    // Safety: d3d는 렌더링 컨텍스트가 보유한 살아있는 ANGLE D3D11 디바이스(Task 2 계약).
+    // AddRef하지 않으므로 여기서 Release하지 않는다.
+    unsafe {
+        // QI IDXGIDevice → DCompositionCreateDevice → CreateTargetForHwnd(topmost=TRUE)
+        // → CreateVisual(root) → SetRoot. 각 HRESULT 실패면 warn + None (PoC G1 시퀀스).
+        let mut dxgi_raw: *mut IDXGIDevice = ptr::null_mut();
+        let hr = (*d3d).QueryInterface(
+            &IDXGIDevice::uuidof(),
+            &mut dxgi_raw as *mut _ as *mut _,
+        );
+        if hr < 0 || dxgi_raw.is_null() {
+            warn!("[dcomp-native] QI IDXGIDevice failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            return None;
+        }
+        // dxgi는 dcomp 디바이스 생성에만 쓰고, 함수 종료 시 Drop으로 Release된다.
+        let dxgi = ComOwned::from_raw(dxgi_raw)?;
+
+        let mut dcomp_raw: *mut IDCompositionDevice = ptr::null_mut();
+        let hr = DCompositionCreateDevice(
+            dxgi.as_ptr(),
+            &IDCompositionDevice::uuidof(),
+            &mut dcomp_raw as *mut _ as *mut _,
+        );
+        if hr < 0 || dcomp_raw.is_null() {
+            warn!("[dcomp-native] DCompositionCreateDevice failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            return None;
+        }
+        let dcomp_device = ComOwned::from_raw(dcomp_raw)?;
+
+        let mut target_raw: *mut IDCompositionTarget = ptr::null_mut();
+        let hr = (*dcomp_device.as_ptr()).CreateTargetForHwnd(hwnd as HWND, TRUE, &mut target_raw);
+        if hr < 0 || target_raw.is_null() {
+            warn!("[dcomp-native] CreateTargetForHwnd failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            return None;
+        }
+        let target = ComOwned::from_raw(target_raw)?;
+
+        let mut root_raw: *mut IDCompositionVisual = ptr::null_mut();
+        let hr = (*dcomp_device.as_ptr()).CreateVisual(&mut root_raw);
+        if hr < 0 || root_raw.is_null() {
+            warn!("[dcomp-native] CreateVisual(root) failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            return None;
+        }
+        let root_visual = ComOwned::from_raw(root_raw)?;
+
+        let hr = (*target.as_ptr()).SetRoot(root_visual.as_ptr());
+        if hr < 0 {
+            warn!("[dcomp-native] SetRoot failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            return None;
+        }
+
+        Some(DCompNativeCompositor {
+            rendering_context: rendering_context.clone(),
+            dcomp_device: Some(dcomp_device),
+            _target: Some(target),
+            root_visual: Some(root_visual),
+            surfaces: HashMap::new(),
+            bound: None,
+            warned_scale: false,
+            warned_rounded_clip: false,
+            warned_external_surface: false,
+            warned_enable_native: false,
+        })
+    }
+}
+
+impl DCompNativeCompositor {
+    fn dcomp_device_ptr(&self) -> Option<*mut IDCompositionDevice> {
+        self.dcomp_device.as_ref().map(ComOwned::as_ptr)
+    }
+
+    fn root_visual_ptr(&self) -> Option<*mut IDCompositionVisual> {
+        self.root_visual.as_ref().map(ComOwned::as_ptr)
+    }
+
+    /// 외부/백드롭 서피스 요청에 대한 warn-once. Servo는 prefer_compositor_surface를
+    /// 설정하지 않으므로 이 경로는 도달하지 않는다(grep 확정).
+    fn warn_external_surface_once(&mut self) {
+        if !self.warned_external_surface {
+            warn!(
+                "[dcomp-native] external/backdrop compositor surface requested but not \
+                 implemented (unreachable in Servo); ignoring"
+            );
+            self.warned_external_surface = true;
+        }
+    }
+
+    /// mid-bind 상태였던 pbuffer/텍스처를 EndDraw 없이 정리한다(서피스가 사라지는 경로용).
+    fn drop_bound_without_enddraw(&mut self) {
+        if let Some(bound) = self.bound.take() {
+            self.rendering_context.destroy_render_pbuffer(bound.pbuffer);
+            if !bound.texture.is_null() {
+                // Safety: BeginDraw가 돌려준 AddRef된 텍스처를 한 번 Release.
+                unsafe {
+                    (*(bound.texture as *mut IUnknown)).Release();
+                }
+            }
+        }
+    }
+
+    /// 모든 COM/EGL 자원을 명시 해제한다(deinit·Drop 공용, 멱등).
+    /// §3-q UAF 교훈: 자식(pbuffer→서피스)부터 디바이스 순으로 해제한다. WR renderer
+    /// deinit이 egl.Terminate보다 먼저 이 경로를 호출하므로 EGL 자원이 아직 살아있다.
+    fn release_all(&mut self) {
+        self.drop_bound_without_enddraw();
+        // ComOwned Drop이 각 visual + virtual_surface를 Release.
+        self.surfaces.clear();
+        self.root_visual = None;
+        self._target = None;
+        self.dcomp_device = None;
+    }
+}
+
+impl Drop for DCompNativeCompositor {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+impl Compositor for DCompNativeCompositor {
+    fn create_surface(
+        &mut self,
+        _device: &mut Device,
+        id: NativeSurfaceId,
+        virtual_offset: DeviceIntPoint,
+        tile_size: DeviceIntSize,
+        is_opaque: bool,
+    ) {
+        let Some(dcomp_device) = self.dcomp_device_ptr() else {
+            return;
+        };
+        let alpha_mode = if is_opaque {
+            DXGI_ALPHA_MODE_IGNORE
+        } else {
+            DXGI_ALPHA_MODE_PREMULTIPLIED
+        };
+
+        // Safety: dcomp_device는 살아있는 IDCompositionDevice. 각 out-param을 ComOwned로
+        // 감싸 실패 시 조기 반환에서 자동 Release된다.
+        let entry = unsafe {
+            let mut vsurf_raw: *mut IDCompositionVirtualSurface = ptr::null_mut();
+            let hr = (*dcomp_device).CreateVirtualSurface(
+                VIRTUAL_SURFACE_SIZE as u32,
+                VIRTUAL_SURFACE_SIZE as u32,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                alpha_mode,
+                &mut vsurf_raw,
+            );
+            if hr < 0 || vsurf_raw.is_null() {
+                warn!("[dcomp-native] CreateVirtualSurface failed (hr=0x{:08x})", hr as u32);
+                return;
+            }
+            let Some(virtual_surface) = ComOwned::from_raw(vsurf_raw) else {
+                return;
+            };
+
+            let mut visual_raw: *mut IDCompositionVisual = ptr::null_mut();
+            let hr = (*dcomp_device).CreateVisual(&mut visual_raw);
+            if hr < 0 || visual_raw.is_null() {
+                warn!("[dcomp-native] CreateVisual(content) failed (hr=0x{:08x})", hr as u32);
+                return;
+            }
+            let Some(visual) = ComOwned::from_raw(visual_raw) else {
+                return;
+            };
+
+            let hr = (*visual.as_ptr()).SetContent(virtual_surface.as_ptr() as *const IUnknown);
+            if hr < 0 {
+                warn!("[dcomp-native] SetContent failed (hr=0x{:08x})", hr as u32);
+                return;
+            }
+
+            SurfaceEntry {
+                virtual_surface,
+                visual,
+                virtual_offset,
+                tile_size,
+                is_opaque,
+            }
+        };
+
+        // 비주얼은 매 프레임 begin_frame(RemoveAllVisuals) 후 add_surface에서 트리에 추가한다.
+        self.surfaces.insert(id, entry);
+    }
+
+    fn create_tile(&mut self, _device: &mut Device, _id: NativeTileId) {
+        // 가상 서피스는 BeginDraw 시 지연 할당 — 부기 불요, no-op.
+    }
+
+    fn destroy_tile(&mut self, _device: &mut Device, _id: NativeTileId) {
+        // no-op (Trim 최적화는 후속: 고정 크기 월 창에서는 타일 집합이 안정적).
+    }
+
+    fn bind(
+        &mut self,
+        _device: &mut Device,
+        id: NativeTileId,
+        dirty_rect: DeviceIntRect,
+        _valid_rect: DeviceIntRect,
+    ) -> NativeSurfaceInfo {
+        let fail = NativeSurfaceInfo {
+            origin: DeviceIntPoint::zero(),
+            fbo_id: 0,
+        };
+
+        // 서피스에서 필요한 Copy 값만 뽑아 borrow를 즉시 끝낸다(이후 self를 mutate하기 위함).
+        let Some(entry) = self.surfaces.get(&id.surface_id) else {
+            warn!("[dcomp-native] bind: unknown surface {:?}", id.surface_id);
+            return fail;
+        };
+        let vsurf = entry.virtual_surface.as_ptr();
+        let tile_rect = tile_virtual_rect(entry.virtual_offset, entry.tile_size, id.x, id.y);
+
+        // BeginDraw는 가상공간 절대좌표 RECT를 받는다: 타일 rect를 타일-로컬 dirty로 오프셋.
+        let update = RECT {
+            left: tile_rect.min.x + dirty_rect.min.x,
+            top: tile_rect.min.y + dirty_rect.min.y,
+            right: tile_rect.min.x + dirty_rect.max.x,
+            bottom: tile_rect.min.y + dirty_rect.max.y,
+        };
+
+        // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
+        // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
+        let (texture, update_offset, desc) = unsafe {
+            let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+            let mut update_offset = POINT { x: 0, y: 0 };
+            let hr = (*vsurf).BeginDraw(
+                &update,
+                &ID3D11Texture2D::uuidof(),
+                &mut tex as *mut _ as *mut _,
+                &mut update_offset,
+            );
+            if hr < 0 || tex.is_null() {
+                warn!("[dcomp-native] BeginDraw failed (hr=0x{:08x}); giving up tile", hr as u32);
+                return fail;
+            }
+            // BeginDraw 텍스처의 실제 크기(아틀라스일 수 있음)로 pbuffer를 만든다.
+            let mut desc: D3D11_TEXTURE2D_DESC = std::mem::zeroed();
+            (*tex).GetDesc(&mut desc);
+            (tex, update_offset, desc)
+        };
+
+        let pbuffer = match self.rendering_context.create_render_pbuffer_from_d3d_texture(
+            texture as usize,
+            UntypedSize2D::new(desc.Width as i32, desc.Height as i32),
+        ) {
+            Some(pbuffer) => pbuffer,
+            None => {
+                warn!("[dcomp-native] pbuffer wrap failed; giving up tile");
+                // Safety: 실패 경로 정리 — 텍스처 Release + EndDraw로 서피스 상태 복구.
+                unsafe {
+                    (*(texture as *mut IUnknown)).Release();
+                    let _ = (*vsurf).EndDraw();
+                }
+                return fail;
+            },
+        };
+
+        if !self.rendering_context.make_render_pbuffer_current(pbuffer) {
+            warn!("[dcomp-native] make_render_pbuffer_current failed; giving up tile");
+            self.rendering_context.destroy_render_pbuffer(pbuffer);
+            // Safety: 위와 동일한 실패 경로 정리.
+            unsafe {
+                (*(texture as *mut IUnknown)).Release();
+                let _ = (*vsurf).EndDraw();
+            }
+            return fail;
+        }
+
+        // 텍스처는 WR의 GL draw 동안 살려두고 unbind의 EndDraw 이후 Release한다.
+        self.bound = Some(BoundTile {
+            surface_id: id.surface_id,
+            pbuffer,
+            texture,
+        });
+
+        // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
+        let origin = DeviceIntPoint::new(
+            update_offset.x - dirty_rect.min.x,
+            update_offset.y - dirty_rect.min.y,
+        );
+        NativeSurfaceInfo { origin, fbo_id: 0 }
+    }
+
+    fn unbind(&mut self, _device: &mut Device) {
+        let Some(bound) = self.bound.take() else {
+            return;
+        };
+        // 현재 bind 중이던 서피스에 EndDraw.
+        if let Some(entry) = self.surfaces.get(&bound.surface_id) {
+            // Safety: 서피스는 bind~unbind 사이 파괴되지 않는다(WR 계약).
+            let hr = unsafe { (*entry.virtual_surface.as_ptr()).EndDraw() };
+            if hr < 0 {
+                warn!("[dcomp-native] EndDraw failed (hr=0x{:08x})", hr as u32);
+            }
+        } else {
+            warn!(
+                "[dcomp-native] unbind: bound surface {:?} gone before EndDraw",
+                bound.surface_id
+            );
+        }
+        // EGL은 현재 서피스 파괴를 유예하므로 unbind 직후 destroy가 안전(Task 1 주석).
+        self.rendering_context.destroy_render_pbuffer(bound.pbuffer);
+        if !bound.texture.is_null() {
+            // Safety: BeginDraw가 돌려준 AddRef된 텍스처를 EndDraw 이후 한 번 Release.
+            unsafe {
+                (*(bound.texture as *mut IUnknown)).Release();
+            }
+        }
+    }
+
+    fn begin_frame(&mut self, _device: &mut Device) {
+        let Some(root) = self.root_visual_ptr() else {
+            return;
+        };
+        // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
+        // Safety: root는 살아있는 IDCompositionVisual.
+        let hr = unsafe { (*root).RemoveAllVisuals() };
+        if hr < 0 {
+            warn!("[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})", hr as u32);
+        }
+    }
+
+    fn add_surface(
+        &mut self,
+        _device: &mut Device,
+        id: NativeSurfaceId,
+        transform: CompositorSurfaceTransform,
+        clip_rect: DeviceIntRect,
+        _image_rendering: ImageRendering,
+        _rounded_clip_rect: DeviceIntRect,
+        rounded_clip_radii: ClipRadius,
+    ) {
+        // 월 시나리오는 scale=1·직사각 클립만 발생 예상 — 벗어나면 1회만 warn(스펙 §비범위).
+        if (transform.scale.x - 1.0).abs() > f32::EPSILON ||
+            (transform.scale.y - 1.0).abs() > f32::EPSILON
+        {
+            if !self.warned_scale {
+                warn!(
+                    "[dcomp-native] surface transform scale {:?} != 1.0 unsupported; \
+                     applying offset only",
+                    transform.scale
+                );
+                self.warned_scale = true;
+            }
+        }
+        if rounded_clip_radii != ClipRadius::EMPTY {
+            if !self.warned_rounded_clip {
+                warn!("[dcomp-native] rounded clip radii unsupported; applying rectangular clip only");
+                self.warned_rounded_clip = true;
+            }
+        }
+
+        let Some(root) = self.root_visual_ptr() else {
+            return;
+        };
+        let Some(entry) = self.surfaces.get(&id) else {
+            warn!("[dcomp-native] add_surface: unknown surface {:?}", id);
+            return;
+        };
+        let visual = entry.visual.as_ptr();
+        let virtual_offset = entry.virtual_offset;
+
+        // 콘텐츠는 가상공간 절대좌표(virtual_offset + 타일격자)에 그려졌다. 비주얼 오프셋을
+        // (transform.offset - virtual_offset)으로 주면 콘텐츠가 창 device 좌표 transform.offset에
+        // 놓인다(Gecko DCLayerTree 동일 보정, scale=1 가정).
+        let offset_x = transform.offset.x - virtual_offset.x as f32;
+        let offset_y = transform.offset.y - virtual_offset.y as f32;
+
+        // DComp SetClip은 비주얼-로컬(오프셋 적용 전) 좌표를 받아 오프셋으로 변환되므로
+        // (MS docs: "The clip is transformed by the OffsetX, OffsetY..."), device 클립에서
+        // 비주얼 오프셋을 빼 로컬로 환산한다.
+        let clip = D2D_RECT_F {
+            left: clip_rect.min.x as f32 - offset_x,
+            top: clip_rect.min.y as f32 - offset_y,
+            right: clip_rect.max.x as f32 - offset_x,
+            bottom: clip_rect.max.y as f32 - offset_y,
+        };
+
+        // Safety: visual/root는 살아있는 IDCompositionVisual. SetOffsetX/Y·SetClip은 `_1`
+        // (값) 오버로드를 쓴다(PoC winapi 대조).
+        unsafe {
+            let hr = (*visual).SetOffsetX_1(offset_x);
+            if hr < 0 {
+                warn!("[dcomp-native] SetOffsetX failed (hr=0x{:08x})", hr as u32);
+            }
+            let hr = (*visual).SetOffsetY_1(offset_y);
+            if hr < 0 {
+                warn!("[dcomp-native] SetOffsetY failed (hr=0x{:08x})", hr as u32);
+            }
+            let hr = (*visual).SetClip_1(&clip);
+            if hr < 0 {
+                warn!("[dcomp-native] SetClip failed (hr=0x{:08x})", hr as u32);
+            }
+            // insertAbove=TRUE, reference=null → 형제 최상단에 추가. 호출 순서 = z-order(아래→위).
+            let hr = (*root).AddVisual(visual, TRUE, ptr::null());
+            if hr < 0 {
+                warn!("[dcomp-native] AddVisual failed (hr=0x{:08x})", hr as u32);
+            }
+        }
+    }
+
+    fn end_frame(&mut self, _device: &mut Device) {
+        let Some(dcomp_device) = self.dcomp_device_ptr() else {
+            return;
+        };
+        // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
+        let hr = unsafe { (*dcomp_device).Commit() };
+        if hr < 0 {
+            warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
+        }
+    }
+
+    fn destroy_surface(&mut self, _device: &mut Device, id: NativeSurfaceId) {
+        // 방어적: 이 서피스가 mid-bind면(정상 흐름에선 없음) EndDraw 없이 bound 상태를 정리.
+        if self.bound.as_ref().is_some_and(|bound| bound.surface_id == id) {
+            warn!("[dcomp-native] destroy_surface on bound surface {:?}; dropping bound state", id);
+            self.drop_bound_without_enddraw();
+        }
+        // remove → ComOwned Drop이 visual + virtual_surface를 Release.
+        self.surfaces.remove(&id);
+    }
+
+    fn create_external_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _is_opaque: bool) {
+        self.warn_external_surface_once();
+    }
+
+    fn attach_external_image(
+        &mut self,
+        _device: &mut Device,
+        _id: NativeSurfaceId,
+        _external_image: ExternalImageId,
+    ) {
+        self.warn_external_surface_once();
+    }
+
+    fn create_backdrop_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _color: ColorF) {
+        self.warn_external_surface_once();
+    }
+
+    fn enable_native_compositor(&mut self, _device: &mut Device, _enable: bool) {
+        // 디버그 커맨드 전용 경로(renderer mod.rs:1619) — Servo는 발행하지 않는다. warn-once.
+        if !self.warned_enable_native {
+            warn!("[dcomp-native] enable_native_compositor is a debug-only path unused by Servo; ignoring");
+            self.warned_enable_native = true;
+        }
+    }
+
+    fn get_capabilities(&self, _device: &mut Device) -> CompositorCapabilities {
+        CompositorCapabilities {
+            virtual_surface_size: VIRTUAL_SURFACE_SIZE,
+            // max_update_rects=1 등 나머지는 플랫폼 기본값 유지.
+            ..CompositorCapabilities::default()
+        }
+    }
+
+    fn get_window_visibility(&self, _device: &mut Device) -> WindowVisibility {
+        WindowVisibility::default()
+    }
+
+    fn deinit(&mut self, _device: &mut Device) {
+        // WR renderer deinit 내부(= egl.Terminate 이전)에 호출됨 — 여기서 전부 명시 해제한다.
+        // Drop도 같은 release_all을 부르지만, 명시 호출이 §3-q UAF 회귀 가드 역할을 겸한다.
+        self.release_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_virtual_rect_positions_tiles_on_grid() {
+        let vo = DeviceIntPoint::new(16384, 16384);
+        let ts = DeviceIntSize::new(1024, 512);
+        let r = tile_virtual_rect(vo, ts, 0, 0);
+        assert_eq!(r.min, vo);
+        let r = tile_virtual_rect(vo, ts, 2, -1);
+        assert_eq!(r.min, DeviceIntPoint::new(16384 + 2048, 16384 - 512));
+        assert_eq!(r.size(), ts);
+    }
+}
