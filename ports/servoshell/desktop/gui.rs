@@ -619,8 +619,16 @@ impl Gui {
             window.repaint_webviews();
 
             let source_rect = headed_window.webview_visible_source_rect(visible_size.to_i32());
-            if let Some(render_to_parent) = rendering_context
-                .render_to_parent_callback_for_source_rect(source_rect.to_untyped())
+            // Native Compositor(DComp)가 실제로 발동 중이면(painter의 maybe_create 성공 시
+            // set_dcomp_native_active(true)) WR이 웹콘텐츠를 DComp 비주얼 트리에 직접 그려
+            // DWM이 합성하고 창은 present되지 않는다(§WindowRenderingContext::present). 이
+            // 오프스크린 프레임버퍼에는 표시에 기여하지 않는 콘텐츠 없는 결과뿐이므로,
+            // 창 백버퍼로의 웹뷰 blit은 순수 낭비 트래픽(창면적 ~1×)이라 스킵한다. egui
+            // 자신의 위젯 페인팅(툴바 등)은 건드리지 않는다. 판정은 Cell read라 무비용이고,
+            // 게이트 off(발동 안 함)에서는 조건이 항상 참이라 기존 경로와 동일하다.
+            if !rendering_context.dcomp_native_active()
+                && let Some(render_to_parent) = rendering_context
+                    .render_to_parent_callback_for_source_rect(source_rect.to_untyped())
             {
                 ctx.layer_painter(LayerId::background()).add(PaintCallback {
                     rect: available_rect,

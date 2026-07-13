@@ -176,6 +176,14 @@ pub trait RenderingContext {
     /// 계약: `true`로의 전이는 발동 성공 시(`maybe_create` 성공) 단 1회뿐이며, 폴백
     /// 경로는 초기값에 암묵 의존하지 않고 항상 명시적으로 `false`를 유지/설정한다.
     fn set_dcomp_native_active(&self, _active: bool) {}
+    /// DComp 네이티브 컴포지터가 이 창에서 실제로 발동 중인지 — `set_dcomp_native_active`의
+    /// 짝(getter). servoshell egui 통합이 게이트 on에서 콘텐츠 없는 오프스크린 프레임버퍼를
+    /// 창 백버퍼로 매 리페인트 blit하는 잔여 트래픽을 스킵할지 판단할 때 읽는다. Default
+    /// `false`; `WindowRenderingContext`만 자신의 `Cell`을 읽어 의미 있게 구현하고,
+    /// `OffscreenRenderingContext`는 부모에 위임한다.
+    fn dcomp_native_active(&self) -> bool {
+        false
+    }
     /// ANGLE의 D3D11 디바이스 raw 포인터. AddRef 하지 않는다 — 수명은 이
     /// 렌더링 컨텍스트가 보유하므로 컨텍스트보다 오래 들고 있으면 안 된다.
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
@@ -1234,6 +1242,13 @@ impl RenderingContext for WindowRenderingContext {
         self.dcomp_native_active.set(active);
     }
 
+    // On non-Windows the `dcomp_native_active` field does not exist (cfg(windows)); the trait
+    // default `false` covers those targets safely.
+    #[cfg(windows)]
+    fn dcomp_native_active(&self) -> bool {
+        self.dcomp_native_active.get()
+    }
+
     fn make_current(&self) -> Result<(), Error> {
         self.surfman_context.make_current()
     }
@@ -1707,6 +1722,14 @@ impl RenderingContext for OffscreenRenderingContext {
     #[cfg(windows)]
     fn set_dcomp_native_active(&self, active: bool) {
         self.parent_context.set_dcomp_native_active(active);
+    }
+
+    // servoshell이 Window를 Offscreen으로 감싸므로, blit 스킵 판정(gui.rs)이 이
+    // OffscreenRenderingContext 위에서 `dcomp_native_active()`를 호출한다. 위임이 없으면
+    // 트레잇 기본(false)에 흡수돼 스킵이 절대 발동하지 않는다(setter와 동일 위임 패턴).
+    #[cfg(windows)]
+    fn dcomp_native_active(&self) -> bool {
+        self.parent_context.dcomp_native_active()
     }
 
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
