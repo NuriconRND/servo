@@ -214,6 +214,13 @@ pub(crate) struct Painter {
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
     web_content_animator: WebContentAnimator,
+
+    /// True when the WR Native Compositor (DirectComposition) is engaged for this window
+    /// (env `SERVO_COMPOSITOR_DCOMP` on and `maybe_create` succeeded). Off = current Draw path.
+    /// Used to restore the window surface as current after `renderer.render()`, because the
+    /// native compositor's `bind` leaves a pbuffer current.
+    #[cfg(windows)]
+    dcomp_native_active: bool,
 }
 
 struct PendingFrameDiagnostic {
@@ -358,10 +365,38 @@ impl Painter {
                 .expect("Unable to initialize WebRender worker pool."),
         ));
 
+        // Native Compositor(DComp) gate: when on, WR draws its picture-cache tiles directly
+        // into DComp surfaces and DWM composites them (eliminates the tile->backbuffer draw
+        // pass — spec 2026-07-13). On failure fall back to the Draw compositor (byte-identical
+        // to current behaviour). Off (default) leaves compositor_config at its Draw default.
+        #[cfg(windows)]
+        let compositor_config = if crate::dcomp_compositor::enabled() {
+            match crate::dcomp_compositor::maybe_create(&rendering_context) {
+                Some(compositor) => {
+                    log::info!("[dcomp-native] engaged: WR native compositor (DirectComposition)");
+                    webrender::CompositorConfig::Native {
+                        compositor: Box::new(compositor),
+                    }
+                },
+                None => {
+                    log::warn!("[dcomp-native] init failed; falling back to Draw compositor");
+                    webrender::CompositorConfig::default()
+                },
+            }
+        } else {
+            webrender::CompositorConfig::default()
+        };
+        #[cfg(not(windows))]
+        let compositor_config = webrender::CompositorConfig::default();
+        #[cfg(windows)]
+        let dcomp_native_active =
+            matches!(compositor_config, webrender::CompositorConfig::Native { .. });
+
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
             webrender::WebRenderOptions {
+                compositor_config,
                 // We force the use of optimized shaders here because rendering is broken
                 // on Android emulators with unoptimized shaders. This is due to a known
                 // issue in the emulator's OpenGL emulation layer.
@@ -437,6 +472,8 @@ impl Painter {
                 paint.event_loop_waker.clone_box(),
                 (*timer_refresh_driver).clone(),
             ),
+            #[cfg(windows)]
+            dcomp_native_active,
         };
         painter.assert_gl_framebuffer_complete();
         painter.clear_background();
@@ -666,6 +703,16 @@ impl Painter {
                             .ok()
                             .map(|results| results.stats);
                         wr_render_ms = draw_start.elapsed().as_secs_f64() * 1000.0;
+                    }
+
+                    // The native compositor's `bind` leaves an EGL pbuffer current. Restore the
+                    // window surface as current so the next GL user (clear_background, egui
+                    // overlay, screenshot readback) targets the window, not a stale tile pbuffer.
+                    #[cfg(windows)]
+                    if self.dcomp_native_active {
+                        if let Err(error) = self.rendering_context.make_current() {
+                            log::warn!("[dcomp-native] restore make_current failed: {error:?}");
+                        }
                     }
                 }
             );
