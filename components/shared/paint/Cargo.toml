@@ -52,24 +52,56 @@ webrender_api = { workspace = true }
 winapi = { workspace = true, features = ["dxgi", "unknwnbase", "winerror"] }
 wio = { workspace = true }
 
-# d3d11_dyn_poc 예제(§6 PoC 게이트) 전용 — 창 생성(winuser 등)과 D3D11 텍스처 생성에
-# 필요한 winapi 기능을 추가한다. dev-dependency의 기능은 위 [dependencies] 항목과
-# 합쳐진다(같은 크레이트).
+# d3d11_dyn_poc / dcomp_native_poc 예제(§6·§8-1 PoC 게이트) 전용 — 창 생성(winuser 등),
+# D3D11 텍스처 생성, DirectComposition(dcomp) 인터롭에 필요한 winapi 기능을 추가한다.
+# dev-dependency의 기능은 위 [dependencies] 항목과 합쳐진다(같은 크레이트).
+# dcomp 모듈은 d2d1/dwrite/wincodec 등 다수 모듈을 use 하므로 그 전이 폐포까지 모두
+# 활성화해야 winapi가 컴파일된다(로컬 winapi-0.3.9 소스의 use 그래프에서 산출).
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 env_logger = { workspace = true }
 winapi = { workspace = true, features = [
     "basetsd",
+    "d2d1",
+    "d2d1_1",
+    "d2d1effectauthor",
+    "d2d1effects",
+    "d2dbasetypes",
     "d3d11",
+    "d3d9types",
     "d3dcommon",
+    "dcommon",
+    "dcomp",
+    "dcompanimation",
+    "dcomptypes",
+    "documenttarget",
+    "dwrite",
+    "dxgi",
+    "dxgi1_2",
     "dxgiformat",
     "dxgitype",
+    "excpt",
+    "guiddef",
+    "ktmtypes",
     "libloaderapi",
     "limits",
     "minwinbase",
     "minwindef",
+    "ntdef",
+    "ntstatus",
+    "oaidl",
+    "objidlbase",
+    "ocidl",
+    "propidl",
+    "rpcndr",
+    "unknwnbase",
     "vadefs",
+    "vcruntime",
+    "wincodec",
     "windef",
+    "winerror",
     "wingdi",
     "winnt",
     "winuser",
+    "wtypes",
+    "wtypesbase",
 ] }
