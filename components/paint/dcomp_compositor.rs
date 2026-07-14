@@ -33,7 +33,7 @@ use winapi::shared::dxgi1_2::{
 };
 use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
 use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
-use winapi::shared::minwindef::TRUE;
+use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
 use winapi::um::d3d11::{
@@ -2052,7 +2052,15 @@ impl Compositor for DCompNativeCompositor {
                 }
                 let Some(entry) = self.surfaces.get(id) else { continue; };
                 // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
-                let hr = unsafe { (*root).AddVisual(entry.visual.as_ptr(), TRUE, ptr::null()) };
+                // insertAbove 인자는 MS 문서(IDCompositionVisual::AddVisual Remarks)의
+                // referenceVisual=NULL 특칙에서 직관과 반대로 동작한다: "If insertAbove is
+                // TRUE, the new child visual is above no sibling, therefore it is rendered
+                // BELOW all of its siblings." 즉 TRUE+NULL은 매번 최하단 삽입이라 add
+                // 순서를 그대로 뒤집는다(아래→위 add → 최종 z 전체 역전). FALSE+NULL은
+                // 반대로 "below no sibling → rendered ABOVE all siblings"이므로 아래→위
+                // add 순서가 그대로 올바른 최종 z가 된다 — 진단 보고서(alpha-slice-diagnosis
+                // §z-역전 증거) 확정.
+                let hr = unsafe { (*root).AddVisual(entry.visual.as_ptr(), FALSE, ptr::null()) };
                 if hr < 0 {
                     warn!("[dcomp-native] AddVisual failed (hr=0x{:08x})", hr as u32);
                 }
