@@ -26,6 +26,10 @@
 //!       기록만 한다(Task 4의 stale 부기 "반대 버퍼" 가정을 이 실측에 맞춘다). GetBuffer/Map
 //!       자체가 API 레벨에서 실패(읽기 불가/무의미)하는 경우만 진짜 FAIL로 취급한다.
 //!
+//! 구현 세부(브리프): 각 프레임 사이(A→B, B→C 전환) `sleep(200ms)` + DComp `Commit()`
+//! 케이던스. 화면/버퍼 샘플 직전에는 추가 300ms 대기(DWM 합성 반영 여유). 게이트 스코프
+//! 안의 모든 실패 분기는 "G{n} FAIL: <이유>"를 출력하고 반환한다.
+//!
 //! 실행 (PowerShell):
 //!   . .\etc\multigpu\servo_env.ps1; $ErrorActionPreference='Continue'
 //!   cargo run --release -p servo-paint-api --example dcomp_partial_present_poc --features no-wgl
@@ -367,6 +371,23 @@ mod poc {
         General(String),
     }
 
+    /// 게이트 스코프 내 실패 공통 처리(플랜 요구: 게이트 스코프 안의 **모든** 실패 분기는
+    /// "G{n} FAIL: <이유>" 라인을 찍고 반환한다). General 계열(G1/G3/G4 스코프)용.
+    fn gate_fail(gate: u32, msg: String) -> PocError {
+        println!("G{gate} FAIL: {msg}");
+        PocError::General(format!("G{gate} FAIL: {msg}"))
+    }
+
+    /// G2 스코프 내 실패 공통 처리: "G2 FAIL: <이유>" 출력 후 Halt2(브리프 규정: 즉시
+    /// 종료 코드 2). 프레임 A 준비(렌더/Present)도 브리프 G2 정의("프레임 A(빨강 전체
+    /// 클리어) Present 후…")의 스코프이므로 이 분류를 쓴다 — G1을 통과한 스왑체인에
+    /// 렌더/Present조차 안 되면 부분 Present 실현성 검증 자체가 불가능하므로 HALT
+    /// 의미론과도 부합한다.
+    fn g2_fail(msg: String) -> PocError {
+        println!("G2 FAIL: {msg}");
+        PocError::Halt2(msg)
+    }
+
     pub fn run() -> i32 {
         env_logger::init();
         unsafe {
@@ -520,44 +541,49 @@ mod poc {
         }
         let swapchain = ComPtr(swapchain_raw);
 
+        // 이하 DComp 타깃/비주얼/SetContent/Commit은 브리프가 G1 정의에 포함시킨
+        // 단계들("visual.SetContent(swapchain) + Commit") — 실패 시 전부 "G1 FAIL:" 출력.
         let mut target_raw: *mut IDCompositionTarget = ptr::null_mut();
         hr_check(
             unsafe { (*dcomp.as_raw()).CreateTargetForHwnd(hwnd, TRUE, &mut target_raw) },
             "CreateTargetForHwnd",
         )
-        .map_err(PocError::General)?;
+        .map_err(|m| gate_fail(1, m))?;
         let target = ComPtr(target_raw);
 
         let mut root_raw: *mut IDCompositionVisual = ptr::null_mut();
         hr_check(unsafe { (*dcomp.as_raw()).CreateVisual(&mut root_raw) }, "CreateVisual(root)")
-            .map_err(PocError::General)?;
+            .map_err(|m| gate_fail(1, m))?;
         let root = ComPtr(root_raw);
         hr_check(unsafe { (*target.as_raw()).SetRoot(root.as_raw()) }, "SetRoot")
-            .map_err(PocError::General)?;
+            .map_err(|m| gate_fail(1, m))?;
 
         let mut visual_raw: *mut IDCompositionVisual = ptr::null_mut();
         hr_check(unsafe { (*dcomp.as_raw()).CreateVisual(&mut visual_raw) }, "CreateVisual(content)")
-            .map_err(PocError::General)?;
+            .map_err(|m| gate_fail(1, m))?;
         let visual = ComPtr(visual_raw);
         hr_check(
             unsafe { (*visual.as_raw()).SetContent(swapchain.as_raw() as *mut IUnknown) },
             "SetContent(swapchain)",
         )
-        .map_err(PocError::General)?;
+        .map_err(|m| gate_fail(1, m))?;
         hr_check(
             unsafe { (*root.as_raw()).AddVisual(visual.as_raw(), TRUE, ptr::null_mut()) },
             "AddVisual",
         )
-        .map_err(PocError::General)?;
-        hr_check(unsafe { (*dcomp.as_raw()).Commit() }, "Commit(G1)").map_err(PocError::General)?;
+        .map_err(|m| gate_fail(1, m))?;
+        hr_check(unsafe { (*dcomp.as_raw()).Commit() }, "Commit(G1)")
+            .map_err(|m| gate_fail(1, m))?;
         println!(
             "G1 PASS: CreateSwapChainForComposition {WIN_W}x{WIN_H} BGRA8 BufferCount=2 \
              FLIP_SEQUENTIAL/SCALING_STRETCH/ALPHA_IGNORE + SetContent + Commit"
         );
 
-        // --- 프레임 A: 전체 빨강 → Present ---
+        // --- 프레임 A: 전체 빨강 → Present (브리프 G2 정의 "프레임 A Present 후…"의
+        //     준비 단계 = G2 스코프 — 실패 시 "G2 FAIL:" 출력 + Halt2) ---
         {
-            let buf0 = unsafe { get_buffer(swapchain.as_raw(), 0) }.map_err(PocError::General)?;
+            let buf0 = unsafe { get_buffer(swapchain.as_raw(), 0) }
+                .map_err(|m| g2_fail(format!("프레임 A 준비 — {m}")))?;
             let mut rtv_raw: *mut ID3D11RenderTargetView = ptr::null_mut();
             hr_check(
                 unsafe {
@@ -569,7 +595,7 @@ mod poc {
                 },
                 "CreateRenderTargetView(frameA)",
             )
-            .map_err(PocError::General)?;
+            .map_err(|m| g2_fail(format!("프레임 A 준비 — {m}")))?;
             let rtv = ComPtr(rtv_raw);
             unsafe {
                 (*context.as_raw()).ClearRenderTargetView(rtv.as_raw(), &RED_RGBA);
@@ -577,18 +603,24 @@ mod poc {
             }
             drop(rtv);
             hr_check(unsafe { (*swapchain.as_raw()).Present(1, 0) }, "Present(frameA)")
-                .map_err(PocError::General)?;
+                .map_err(|m| g2_fail(format!("프레임 A 준비 — {m}")))?;
             // `buf0`는 이 블록 종료로 자동 Drop.
         }
+
+        // 프레임 전환 케이던스(브리프 구현 세부: "각 프레임 사이 sleep(200ms) + Commit") —
+        // 프레임 A → 프레임 B(G2 작업) 전환. 이 Commit은 게이트 판정 대상이 아닌 케이던스
+        // 단계이므로(브리프의 게이트 정의 밖 구현 세부) 실패 시 게이트 접두사 없이 일반
+        // 실패로 보고한다.
+        std::thread::sleep(Duration::from_millis(200));
+        hr_check(unsafe { (*dcomp.as_raw()).Commit() }, "Commit(프레임 A→B 전환)")
+            .map_err(PocError::General)?;
+        pump_messages(hwnd);
 
         // --- G2: GetBuffer(1)(=프레임 A 이력) → CopySubresourceRegion 소스로 GetBuffer(0)에
         //     복사 → 스테이징 리드백으로 빨강 확인 ---
         let buf1 = match unsafe { get_buffer(swapchain.as_raw(), 1) } {
             Ok(t) => t,
-            Err(msg) => {
-                println!("G2 FAIL: GetBuffer(1) 실패 — {msg}");
-                return Err(PocError::Halt2(format!("GetBuffer(1) 실패 — {msg}")));
-            },
+            Err(msg) => return Err(g2_fail(format!("GetBuffer(1) 실패 — {msg}"))),
         };
         // 진단: GetBuffer(1) 자체가 프레임 A 내용을 갖고 있는지 직접 확인(복사 이전).
         let buf1_direct = unsafe {
@@ -603,10 +635,7 @@ mod poc {
 
         let buf0_epoch2 = match unsafe { get_buffer(swapchain.as_raw(), 0) } {
             Ok(t) => t,
-            Err(msg) => {
-                println!("G2 FAIL: GetBuffer(0) 실패(복사 대상) — {msg}");
-                return Err(PocError::Halt2(format!("GetBuffer(0) 실패(복사 대상) — {msg}")));
-            },
+            Err(msg) => return Err(g2_fail(format!("GetBuffer(0) 실패(복사 대상) — {msg}"))),
         };
         unsafe {
             (*context.as_raw()).CopySubresourceRegion(
@@ -634,9 +663,9 @@ mod poc {
             "  GetBuffer(0) post-copy readback: left={g2_left:02x?} right={g2_right:02x?} want~{RED_BGRA:02x?}"
         );
         if !g2_pass {
-            println!("G2 FAIL: CopySubresourceRegion(GetBuffer(1) -> GetBuffer(0)) 결과가 빨강이 아님");
-            return Err(PocError::Halt2(
-                "GetBuffer(1)을 CopySubresourceRegion 소스로 사용한 복사 결과가 기대와 다름"
+            return Err(g2_fail(
+                "CopySubresourceRegion(GetBuffer(1) -> GetBuffer(0)) 결과가 빨강이 아님 — \
+                 GetBuffer(1)을 복사 소스로 사용한 결과가 기대와 다름"
                     .to_string(),
             ));
         }
@@ -648,7 +677,7 @@ mod poc {
         } {
             Ok(t) => t,
             Err(msg) => {
-                return Err(PocError::General(format!("G3: 보조 텍스처 생성 실패 — {msg}")));
+                return Err(gate_fail(3, format!("보조 텍스처 생성 실패 — {msg}")));
             },
         };
         unsafe {
@@ -709,6 +738,13 @@ mod poc {
         }
         println!("G3 PASS: Present1(dirty rect 320x480) 부분 갱신이 화면에 반영됨(좌=파랑/우=빨강)");
 
+        // 프레임 전환 케이던스(브리프 구현 세부): 프레임 B → 프레임 C 전환.
+        // (G3 화면 판정은 위에서 이미 완료 — 여기는 다음 프레임으로 넘어가기 전 케이던스.)
+        std::thread::sleep(Duration::from_millis(200));
+        hr_check(unsafe { (*dcomp.as_raw()).Commit() }, "Commit(프레임 B→C 전환)")
+            .map_err(PocError::General)?;
+        pump_messages(hwnd);
+
         // --- 프레임 C: 전체 초록 → Present(로테이션 관찰용) ---
         let buf0_epoch3 = match unsafe { get_buffer(swapchain.as_raw(), 0) } {
             Ok(t) => t,
@@ -731,7 +767,7 @@ mod poc {
                 },
                 "CreateRenderTargetView(frameC)",
             )
-            .map_err(PocError::General)?;
+            .map_err(|m| gate_fail(4, format!("프레임 C 준비 — {m}")))?;
             let rtv = ComPtr(rtv_raw);
             unsafe {
                 (*context.as_raw()).ClearRenderTargetView(rtv.as_raw(), &GREEN_RGBA);
