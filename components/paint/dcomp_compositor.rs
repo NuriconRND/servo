@@ -26,17 +26,19 @@ use webrender::{
     NativeSurfaceId, NativeSurfaceInfo, NativeTileId, WindowVisibility,
 };
 use winapi::Interface;
-use winapi::shared::dxgi::{DXGI_SWAP_EFFECT_FLIP_DISCARD, IDXGIAdapter, IDXGIDevice};
+use winapi::shared::dxgi::{DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, IDXGIAdapter, IDXGIDevice};
 use winapi::shared::dxgi1_2::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain1,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_PRESENT_PARAMETERS,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain1,
 };
 use winapi::shared::dxgiformat::DXGI_FORMAT_B8G8R8A8_UNORM;
 use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
 use winapi::shared::minwindef::TRUE;
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
-use winapi::um::d3d11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Texture2D};
+use winapi::um::d3d11::{
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
 use winapi::um::dcomp::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
     IDCompositionVirtualSurface, IDCompositionVisual,
@@ -84,7 +86,6 @@ fn tile_virtual_rect(
 }
 
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
-#[allow(dead_code)] // Task 4가 소비
 const MAX_PRESENT_DIRTY_RECTS: usize = 16;
 const MAX_STALE_RECTS: usize = 32;
 
@@ -147,7 +148,6 @@ fn region_subtract(
 /// 버퍼에 D 누적, 쓰기 대상 교대. 과대(바운딩 붕괴)는 안전 — 이미 최신인 영역을
 /// 한 번 더 복사할 뿐. Task 1 G4 실측 로테이션이 다르면 이 모델을 그에 맞춘다.
 #[derive(Default)]
-#[allow(dead_code)] // Task 4가 소비
 struct StaleTracker {
     stale: [Vec<DeviceIntRect>; 2],
     cur: usize,
@@ -155,7 +155,6 @@ struct StaleTracker {
 
 impl StaleTracker {
     /// 이번 프레임(더티 frame_dirty)을 Present한 직후 호출.
-    #[allow(dead_code)] // Task 4가 소비
     fn on_present(&mut self, frame_dirty: &[DeviceIntRect], full: DeviceIntRect) {
         self.stale[self.cur].clear();
         let other = 1 - self.cur;
@@ -173,12 +172,10 @@ impl StaleTracker {
     }
 
     /// Present 직전 catch-up 복사 대상(= 현재 버퍼 stale − 이번 프레임 더티).
-    #[allow(dead_code)] // Task 4가 소비
     fn catchup_rects(&self, frame_dirty: &[DeviceIntRect]) -> Vec<DeviceIntRect> {
         region_subtract(&self.stale[self.cur], frame_dirty)
     }
 
-    #[allow(dead_code)] // Task 4가 소비
     fn reset(&mut self) {
         self.stale[0].clear();
         self.stale[1].clear();
@@ -208,6 +205,12 @@ fn storage_mode() -> StorageMode {
 fn cull_disabled() -> bool {
     static NO_CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NO_CULL.get_or_init(|| std::env::var("SERVO_DCOMP_NO_CULL").is_ok())
+}
+
+/// 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.
+fn partial_present_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("SERVO_DCOMP_NO_PARTIAL_PRESENT").is_ok())
 }
 
 /// 스왑체인 백버퍼의 유효 피복(타일 단위, Present까지 누적).
@@ -250,7 +253,7 @@ fn surface_extent(
 
 /// 타일 집합이 extent(union)를 빈틈없이 채우는 조밀 사각형인지 판정.
 /// 스왑체인 크기는 extent(union)로 만들지만 coverage 판정은 존재하는 타일만 훑으므로,
-/// 타일 집합이 조밀 사각형이 아니면(구멍) union 내부 무타일 영역이 FLIP_DISCARD의
+/// 타일 집합이 조밀 사각형이 아니면(구멍) union 내부 무타일 영역이 FLIP_SEQUENTIAL의
 /// 미정의 픽셀인 채 Present될 수 있다(현 워크로드에서는 발생하지 않는다는 가정을
 /// 여기서 강제한다). 오버플로 방지 위해 i64로 계산.
 fn tiles_are_dense(tile_count: usize, tile_size: DeviceIntSize, extent_size: DeviceIntSize) -> bool {
@@ -386,6 +389,106 @@ struct SwapChainStorage {
     /// regen 후에는 옛 스왑체인이 그대로 붙어 있으므로 옛 anchor가 유지된다 —
     /// sc.anchor(현재 렌더 대상)와 다를 수 있다. content-swap에서만 갱신.
     displayed_anchor: Option<DeviceIntPoint>,
+    /// 이번 프레임 bind가 쌓은 버퍼-로컬 더티 렉트(Present1 힌트 + stale 부기 재료).
+    frame_dirty: Vec<DeviceIntRect>,
+    /// 버퍼별 stale 부기(스펙 §5.2). content_attached 후 부분 Present에 사용.
+    stale: StaleTracker,
+    /// 이 스왑체인에서 부분 Present 사용 가능(GetBuffer(1) 프로브 성공 + env 미차단).
+    partial_present: bool,
+}
+
+/// content-swap 시 1회: GetBuffer(1)이 이 환경에서 열리는지 프로브(스펙 §3 '런타임 자격').
+fn probe_partial_present(swapchain: &ComOwned<IDXGISwapChain1>) -> bool {
+    // Safety: 살아있는 스왑체인. 성공 시 AddRef된 텍스처 즉시 Release.
+    unsafe {
+        let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+        let hr = (*swapchain.as_ptr()).GetBuffer(
+            1,
+            &ID3D11Texture2D::uuidof(),
+            &mut tex as *mut _ as *mut _,
+        );
+        if hr < 0 || tex.is_null() {
+            warn!("[dcomp-native] GetBuffer(1) probe failed (hr=0x{:08x}); partial present off", hr as u32);
+            return false;
+        }
+        (*(tex as *mut IUnknown)).Release();
+        true
+    }
+}
+
+/// catch-up 복사: GetBuffer(1)→frame_pbuffer.texture(=GetBuffer(0)) 렉트들.
+/// 전면 더티 프레임이면 rects가 공집합 → 복사 0(Global Constraints).
+fn self_copy_catchup(
+    ctx: &Option<ComOwned<ID3D11DeviceContext>>,
+    sc: &SwapChainStorage,
+    rects: &[DeviceIntRect],
+) -> bool {
+    if rects.is_empty() {
+        return true;
+    }
+    let Some(ctx) = ctx.as_ref() else { return false; };
+    let Some(fp) = sc.frame_pbuffer.as_ref() else { return false; };
+    // Safety: 살아있는 스왑체인/컨텍스트. src는 AddRef → 사용 후 Release.
+    unsafe {
+        let mut src: *mut ID3D11Texture2D = ptr::null_mut();
+        let hr = (*sc.swapchain.as_ptr()).GetBuffer(
+            1,
+            &ID3D11Texture2D::uuidof(),
+            &mut src as *mut _ as *mut _,
+        );
+        if hr < 0 || src.is_null() {
+            warn!("[dcomp-native] GetBuffer(1) failed at copy (hr=0x{:08x})", hr as u32);
+            return false;
+        }
+        for rc in rects {
+            // 버퍼 경계로 클램프(stale 바운딩 붕괴가 경계 밖을 물 수 있음).
+            let x0 = rc.min.x.max(0);
+            let y0 = rc.min.y.max(0);
+            let x1 = rc.max.x.min(sc.size.width);
+            let y1 = rc.max.y.min(sc.size.height);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let src_box = D3D11_BOX {
+                left: x0 as u32, top: y0 as u32, front: 0,
+                right: x1 as u32, bottom: y1 as u32, back: 1,
+            };
+            (*ctx.as_ptr()).CopySubresourceRegion(
+                fp.texture as *mut _, 0, x0 as u32, y0 as u32, 0,
+                src as *mut _, 0, &src_box,
+            );
+        }
+        (*(src as *mut IUnknown)).Release();
+        true
+    }
+}
+
+/// Present1 + DirtyRects 힌트(스펙 §5.2-3). 16 초과·공집합이면 힌트 없이 전체.
+fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
+    let rects: Vec<RECT> = dirty
+        .iter()
+        .filter(|r| r.max.x > r.min.x && r.max.y > r.min.y)
+        .map(|r| RECT {
+            left: r.min.x.max(0),
+            top: r.min.y.max(0),
+            right: r.max.x.min(sc.size.width),
+            bottom: r.max.y.min(sc.size.height),
+        })
+        .collect();
+    let use_hint = !rects.is_empty() && rects.len() <= MAX_PRESENT_DIRTY_RECTS;
+    let params = DXGI_PRESENT_PARAMETERS {
+        DirtyRectsCount: if use_hint { rects.len() as u32 } else { 0 },
+        pDirtyRects: if use_hint { rects.as_ptr() as *mut RECT } else { ptr::null_mut() },
+        pScrollRect: ptr::null_mut(),
+        pScrollOffset: ptr::null_mut(),
+    };
+    // Safety: 살아있는 스왑체인. SyncInterval 0 = 기존 Present와 동일 페이싱.
+    let hr = unsafe { (*sc.swapchain.as_ptr()).Present1(0, 0, &params) };
+    if hr < 0 {
+        warn!("[dcomp-native] Present1 failed (hr=0x{:08x})", hr as u32);
+        return false;
+    }
+    true
 }
 
 /// 서피스 콘텐츠의 백엔드. 기본은 `Virtual`(가상 서피스), 연속 전면 갱신 서피스는
@@ -461,6 +564,10 @@ pub struct DCompNativeCompositor {
     frame_surfaces: Vec<(NativeSurfaceId, DeviceIntRect, bool)>,
     /// ANGLE D3D11 디바이스(비소유 — rendering_context가 수명 보유). 스왑체인 생성에 사용.
     d3d11_device: *mut ID3D11Device,
+    /// d3d11_device의 즉시 컨텍스트(AddRef 소유). 부분 Present catch-up 복사
+    /// (CopySubresourceRegion)에 사용 — GetImmediateContext 실패는 없다고 간주되지만
+    /// (COM 계약상 실패하지 않음) 방어적으로 Option.
+    d3d11_context: Option<ComOwned<ID3D11DeviceContext>>,
     /// 스왑체인 생성용 DXGI 팩토리. 확보 실패(None)면 하이브리드 승격 불가 — Virtual만 사용.
     dxgi_factory: Option<ComOwned<IDXGIFactory2>>,
     warned_scale: bool,
@@ -502,6 +609,14 @@ pub fn maybe_create(
     // Safety: d3d는 렌더링 컨텍스트가 보유한 살아있는 ANGLE D3D11 디바이스(Task 2 계약).
     // AddRef하지 않으므로 여기서 Release하지 않는다.
     unsafe {
+        // 부분 Present catch-up 복사(CopySubresourceRegion)용 즉시 컨텍스트.
+        // GetImmediateContext는 HRESULT가 없고(COM 계약상 항상 성공) AddRef된 포인터를 돌려준다.
+        let d3d11_context = {
+            let mut ctx_raw: *mut ID3D11DeviceContext = ptr::null_mut();
+            (*d3d).GetImmediateContext(&mut ctx_raw);
+            ComOwned::from_raw(ctx_raw)
+        };
+
         // QI IDXGIDevice → DCompositionCreateDevice → CreateTargetForHwnd(topmost=TRUE)
         // → CreateVisual(root) → SetRoot. 각 HRESULT 실패면 warn + None (PoC G1 시퀀스).
         let mut dxgi_raw: *mut IDXGIDevice = ptr::null_mut();
@@ -585,6 +700,7 @@ pub fn maybe_create(
             bound: None,
             frame_surfaces: Vec::new(),
             d3d11_device: d3d,
+            d3d11_context,
             dxgi_factory,
             warned_scale: false,
             warned_rounded_clip: false,
@@ -607,8 +723,9 @@ impl DCompNativeCompositor {
     }
 
     /// 컴포지션용 flip 스왑체인 생성. 실패 시 None(호출자는 Virtual 유지 폴백).
-    /// FLIP_DISCARD + BufferCount 2: 이전 버퍼를 읽지 않는다 — 정확성은
-    /// FrameCoverage의 full-coverage Present 규칙이 보장(계획 Global Constraints).
+    /// FLIP_SEQUENTIAL + BufferCount 2: FLIP_DISCARD와 달리 Present 후에도 버퍼 콘텐츠가
+    /// 보존된다 — 부분 Present의 catch-up 복사(GetBuffer(1)에서 복사)가 이를 전제한다
+    /// (스펙 §5.1-1; PoC G4가 정확 2버퍼 핑퐁 로테이션을 실기 확인).
     fn create_composition_swapchain(
         &self,
         size: DeviceIntSize,
@@ -631,7 +748,7 @@ impl DCompNativeCompositor {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH, // CreateSwapChainForComposition 필수값
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: if is_opaque { DXGI_ALPHA_MODE_IGNORE } else { DXGI_ALPHA_MODE_PREMULTIPLIED },
             Flags: 0,
         };
@@ -864,6 +981,20 @@ impl Compositor for DCompNativeCompositor {
                     return fail;
                 }
                 sc.coverage.note_tile((id.x, id.y), dirty_rect, valid_rect);
+                // 이번 프레임 bind가 그린 버퍼-로컬 더티 렉트 누적(스펙 §5.2 — 부분 Present
+                // 힌트 + stale 부기 재료). dirty_rect는 타일-로컬이므로 타일 가상 rect를 더해
+                // 가상좌표로 만든 뒤, 백버퍼 (0,0)에 대응하는 anchor를 빼 버퍼-로컬로 환산한다.
+                let dirty_buf = DeviceIntRect::new(
+                    DeviceIntPoint::new(
+                        tile_rect.min.x + dirty_rect.min.x - sc.anchor.x,
+                        tile_rect.min.y + dirty_rect.min.y - sc.anchor.y,
+                    ),
+                    DeviceIntPoint::new(
+                        tile_rect.min.x + dirty_rect.max.x - sc.anchor.x,
+                        tile_rect.min.y + dirty_rect.max.y - sc.anchor.y,
+                    ),
+                );
+                sc.frame_dirty.push(dirty_buf);
                 sc.drawn_this_frame = true;
                 // 스왑체인 bind는 BoundTile을 만들지 않는다(EndDraw/파기 대상 없음 —
                 // unbind는 bound==None이라 자연히 no-op).
@@ -1122,8 +1253,11 @@ impl Compositor for DCompNativeCompositor {
         // 모아 루프 밖에서 처리한다.
         //  - promote_requests: Virtual → SwapChain 신규 승격 (id, 승격 extent)
         //  - regen_requests: 리사이즈 등으로 지오메트리가 바뀐 기존 SwapChain 재생성 (id, 새 extent)
+        //  - demote_requests: 부분 Present 런타임 실패 → 강등 대상(스펙 §5.3). 본처리는 Task 5;
+        //    이 태스크는 선언 + push + warn만(unused 방지, 의미론은 아직 미결).
         let mut promote_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
         let mut regen_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
+        let mut demote_requests: Vec<NativeSurfaceId> = Vec::new();
 
         for (id, entry) in self.surfaces.iter_mut() {
             match &mut entry.storage {
@@ -1188,7 +1322,7 @@ impl Compositor for DCompNativeCompositor {
                             if let Some(e) = cur_extent {
                                 // 조밀성 가드: 타일 집합이 e를 빈틈없이 채우지 않으면 regen을
                                 // 보류한다(과도기 구멍이 있는 채로 재생성하면 그 구멍이
-                                // FLIP_DISCARD 미정의 픽셀로 Present될 위험 — 다음 프레임에
+                                // FLIP_SEQUENTIAL 미정의 픽셀로 Present될 위험 — 다음 프레임에
                                 // 재판정).
                                 if tiles_are_dense(entry.tiles.len(), entry.tile_size, e.size()) {
                                     regen_requests.push((*id, e));
@@ -1203,6 +1337,15 @@ impl Compositor for DCompNativeCompositor {
                         } else {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
+                            // stale 부기(스펙 §5.2): 이번 프레임 전면 더티를 Present했으므로
+                            // 반대 버퍼가 이 전체를 놓친 것으로 기록(부분 Present 재개 시 catch-up
+                            // 재료). frame_dirty는 반드시 take — 다음 프레임 부기 오염 방지.
+                            let full = DeviceIntRect::new(
+                                DeviceIntPoint::zero(),
+                                DeviceIntPoint::new(sc.size.width, sc.size.height),
+                            );
+                            let dirty = std::mem::take(&mut sc.frame_dirty);
+                            sc.stale.on_present(&dirty, full);
                             if !sc.content_attached {
                                 // 첫 완전 프레젠트 → visual 콘텐츠를 스왑체인으로 전환.
                                 // Safety: visual/swapchain 살아있음.
@@ -1225,16 +1368,53 @@ impl Compositor for DCompNativeCompositor {
                                             sc.anchor,
                                         );
                                     }
+                                    // content-swap 시 1회: 이 스왑체인에서 부분 Present가 성립하는지
+                                    // 프로브(GetBuffer(1) 개방 여부, 스펙 §3 '런타임 자격'). regen은
+                                    // partial_present를 false로 되돌려 다음 content-swap에서 재프로브.
+                                    sc.partial_present = !partial_present_disabled()
+                                        && probe_partial_present(&sc.swapchain);
                                     if dcomp_debug() {
-                                        log::info!("[dcomp-dbg] content-swap id={:?} -> swapchain", id);
+                                        log::info!(
+                                            "[dcomp-dbg] content-swap id={:?} -> swapchain partial_present={}",
+                                            id, sc.partial_present
+                                        );
                                     }
                                 } else {
                                     warn!("[dcomp-native] SetContent(swapchain) failed (hr=0x{:08x})", hr as u32);
                                 }
                             }
                         }
+                    } else if sc.drawn_this_frame && sc.content_attached && sc.partial_present {
+                        // 부분 Present(스펙 §5.2): catch-up 복사(정확 차집합) 후 매 프레임 Present1.
+                        // self.d3d11_context는 self.surfaces와 별개 필드라 sc(=entry.storage 내부,
+                        // self.surfaces.iter_mut() 대여 중)와 동시 대여 가능(디스조인트 필드 대여).
+                        let full = DeviceIntRect::new(
+                            DeviceIntPoint::zero(),
+                            DeviceIntPoint::new(sc.size.width, sc.size.height),
+                        );
+                        let dirty = std::mem::take(&mut sc.frame_dirty);
+                        let catchup = sc.stale.catchup_rects(&dirty);
+                        let ok = self_copy_catchup(&self.d3d11_context, sc, &catchup)
+                            && present1_partial(sc, &dirty);
+                        if ok {
+                            sc.coverage.reset();
+                            sc.withheld_frames = 0;
+                            sc.stale.on_present(&dirty, full);
+                            if dcomp_debug() {
+                                log::info!(
+                                    "[dcomp-dbg] present-partial id={:?} dirty={} catchup={}",
+                                    id, dirty.len(), catchup.len()
+                                );
+                            }
+                        } else {
+                            // 스펙 §5.3: 런타임 실패 → 즉시 강등(warn-once는 강등부에서, Task 5).
+                            sc.partial_present = false;
+                            demote_requests.push(*id);
+                        }
                     } else if sc.drawn_this_frame {
-                        // 부분 갱신 → Present 보류(마지막 완전 화면 유지, 다음 프레임 누적).
+                        // 부분 갱신 + 부분 Present 불가 → 종전 withhold(강등 카운터, Task 5).
+                        // coverage는 비우지 않는다 — 누적 의미론 유지(스펙 §6.2-1 시딩 근거).
+                        sc.frame_dirty.clear();
                         sc.withheld_frames += 1;
                         if sc.withheld_frames == WITHHOLD_WARN_FRAMES {
                             warn!(
@@ -1287,6 +1467,9 @@ impl Compositor for DCompNativeCompositor {
                     withheld_frames: 0,
                     fallback_virtual: None,
                     displayed_anchor: None,
+                    frame_dirty: Vec::new(),
+                    stale: StaleTracker::default(),
+                    partial_present: false,
                 }),
             );
             if let SurfaceStorage::Virtual { virtual_surface } = old {
@@ -1333,6 +1516,9 @@ impl Compositor for DCompNativeCompositor {
                     sc.content_attached = false; // 다음 완전 Present에서 새 스왑체인으로 SetContent
                     sc.withheld_frames = 0;
                     sc.drawn_this_frame = false;
+                    sc.frame_dirty.clear();
+                    sc.stale.reset();
+                    sc.partial_present = false; // 재프로브(새 스왑체인의 GetBuffer(1) 자격 재확인)
                     if dcomp_debug() {
                         log::info!(
                             "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
@@ -1341,6 +1527,16 @@ impl Compositor for DCompNativeCompositor {
                     }
                 }
             }
+        }
+
+        // 강등 요청(루프 밖): 부분 Present 런타임 실패(스펙 §5.3) — 본처리(가상 서피스로
+        // 되돌리기 + 쿨다운)는 Task 5. 이 태스크는 가시화만(warn) 남긴다.
+        for id in demote_requests {
+            warn!(
+                "[dcomp-native] surface {:?}: partial present failed at runtime; \
+                 demotion requested (handling deferred to Task 5)",
+                id
+            );
         }
 
         // 레이어 컬링: 최상위 불투명 클립이 완전히 덮는 하위 visual을 트리에서 제외.
