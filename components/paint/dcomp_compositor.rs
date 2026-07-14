@@ -210,12 +210,6 @@ fn storage_mode() -> StorageMode {
     })
 }
 
-/// 진단: 컬링만 끄는 스위치(요소 소실 의심 시 즉시 판별용).
-fn cull_disabled() -> bool {
-    static NO_CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NO_CULL.get_or_init(|| std::env::var("SERVO_DCOMP_NO_CULL").is_ok())
-}
-
 /// 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.
 fn partial_present_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -289,33 +283,6 @@ fn collapse_dirty_if_oversized(mut rects: Vec<DeviceIntRect>, limit: usize) -> V
         .drain(..)
         .fold(None::<DeviceIntRect>, |acc, r| Some(acc.map_or(r, |a| a.union(&r))));
     union.into_iter().collect()
-}
-
-/// 레이어 컬링(A-2, 건전화 — alpha-slice-diagnosis.md): entries는 add_surface 순서
-/// (z 아래→위)의 (device 클립, 컬 자격 extent). 컬 자격 extent는 그 서피스가 "실제로
-/// 생성한 타일 집합"이 조밀 사각형(구멍 없음)을 이룰 때만 `Some(그 union extent)` —
-/// 호출부(end_frame)에서 `is_opaque=false`거나 타일이 조밀하지 않으면 `None`으로 넘긴다.
-/// v1(WR이 준 clip을 그대로 컬 판정에 쓰던 버전)은 clip이 "이 슬라이스의 backdrop이
-/// 불투명"이라는 힌트일 뿐 clip 전체가 painted되었다는 보장이 아니어서 결함②(희소
-/// painted "above" 슬라이스가 전면 클립으로 하위 비디오/오버레이를 삼킴)를 냈다 —
-/// 그래서 선언된 clip이 아니라 실측 타일 피복(extent)을 컬 판정 기준으로 쓴다.
-/// extent가 하위 항목의 클립을 완전히 포함할 때만 그 하위 항목을 숨긴다. 최상위부터
-/// 훑는다. 알파(컬 자격 없는) 항목도 하위 항목으로는 숨겨질 수 있다 — 숨기는 "주체"만
-/// 컬 자격(Some extent)이 있으면 된다.
-fn cull_covered(entries: &[(DeviceIntRect, Option<DeviceIntRect>)]) -> Vec<bool> {
-    let mut visible = vec![true; entries.len()];
-    for top in (0..entries.len()).rev() {
-        if !visible[top] {
-            continue;
-        }
-        let Some(extent) = entries[top].1 else { continue };
-        for below in 0..top {
-            if visible[below] && extent.contains_box(&entries[below].0) {
-                visible[below] = false;
-            }
-        }
-    }
-    visible
 }
 
 /// 소유한 COM 포인터의 RAII 래퍼(Drop에서 Release). Send/Sync 아님 —
@@ -936,10 +903,10 @@ pub struct DCompNativeCompositor {
     root_visual: Option<ComOwned<IDCompositionVisual>>,
     surfaces: HashMap<NativeSurfaceId, SurfaceEntry>,
     bound: Option<BoundTile>,
-    /// 이번 프레임 add_surface가 기록한 (서피스, device 클립, 불투명 여부) — z-order대로
-    /// 누적(add_surface 호출 순 = 아래→위). AddVisual은 end_frame에서 컬링 후 일괄 수행한다.
-    /// begin_frame에서 clear.
-    frame_surfaces: Vec<(NativeSurfaceId, DeviceIntRect, bool)>,
+    /// 이번 프레임 add_surface가 기록한 서피스 id — z-order대로 누적(add_surface 호출 순 =
+    /// 아래→위). AddVisual은 end_frame에서 이 순서 그대로 일괄 수행한다(컬링 없음 — A-1,
+    /// 아래 end_frame 주석 참조). begin_frame에서 clear.
+    frame_surfaces: Vec<NativeSurfaceId>,
     /// ANGLE D3D11 디바이스(비소유 — rendering_context가 수명 보유). 스왑체인 생성에 사용.
     d3d11_device: *mut ID3D11Device,
     /// d3d11_device의 즉시 컨텍스트(AddRef 소유). 부분 Present catch-up 복사
@@ -1561,7 +1528,7 @@ impl Compositor for DCompNativeCompositor {
         if hr < 0 {
             warn!("[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})", hr as u32);
         }
-        // add_surface의 AddVisual은 end_frame으로 이연(Task 4 컬링) — 이번 프레임 기록 초기화.
+        // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
         self.frame_surfaces.clear();
     }
 
@@ -1632,9 +1599,9 @@ impl Compositor for DCompNativeCompositor {
             );
         }
 
-        // AddVisual은 end_frame으로 이연(컬링 후 일괄 조립) — 여기서는 z-order(호출 순서 =
-        // 아래→위)를 보존한 기록만 남긴다.
-        self.frame_surfaces.push((id, clip_rect, entry.is_opaque));
+        // AddVisual은 end_frame으로 이연 — 여기서는 z-order(호출 순서 = 아래→위)를 보존한
+        // 기록만 남긴다(컬링 없음 — A-1).
+        self.frame_surfaces.push(id);
     }
 
     fn end_frame(&mut self, device: &mut Device) {
@@ -2037,45 +2004,22 @@ impl Compositor for DCompNativeCompositor {
             }
         }
 
-        // 레이어 컬링(A-2 건전화, alpha-slice-diagnosis.md): 최상위 불투명 서피스가
-        // "실제로 생성한 타일 집합"이 조밀 사각형으로 하위 클립을 완전히 덮을 때만
-        // 하위 visual을 트리에서 제외한다. 월 실측(9x5=45타일, (B) z-fix 적용 후):
-        // cull 발동 42건 — 전부 최초 ~1초 레이아웃 확정 전 구간에 NativeSurfaceId(0)
-        // 하나에서만 발생하고 이후 정상상태(약 29초) 0건이었다(task-6b-report.md).
-        // v1(WR이 준 clip만 보는 컬링)은 그 짧은 창에서도 결함②처럼 clip만 보고
-        // 희소 painted 슬라이스를 잘못 컬할 수 있음이 확정됐으므로, clip 대신 실측
-        // 타일 extent(+조밀성)를 컬 판정 기준으로 쓴다. 진단: SERVO_DCOMP_NO_CULL로
-        // 끌 수 있다(요소 소실 의심 시 즉시 판별).
-        let entries: Vec<(DeviceIntRect, Option<DeviceIntRect>)> = self
-            .frame_surfaces
-            .iter()
-            .map(|(id, clip, opaque)| {
-                let cull_extent = if *opaque {
-                    self.surfaces.get(id).and_then(|entry| {
-                        let extent =
-                            surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size)?;
-                        tiles_are_dense(entry.tiles.len(), entry.tile_size, extent.size())
-                            .then_some(extent)
-                    })
-                } else {
-                    None
-                };
-                (*clip, cull_extent)
-            })
-            .collect();
-        let visible = if cull_disabled() {
-            vec![true; entries.len()]
-        } else {
-            cull_covered(&entries)
-        };
+        // 레이어 컬링 없음(A-1 결정, task-6b-report.md 수정 웨이브): A-2("실측 타일
+        // extent가 조밀할 때만 컬" — b4ea92c18)는 그 extent가 WR의 VIRTUAL 좌표계
+        // (virtual_offset ~16384 가산, tile_virtual_rect)이고 비교 대상인 clip_rect는
+        // WR이 준 DEVICE 좌표계(0..~1920)라서 contains_box가 항상 false — 즉 이
+        // 서브시스템은 처음부터 한 번도 발동한 적이 없었다(월 실측 정상상태 cull=0건은
+        // 좌표계 불일치로 인한 원천 비활성이었지, 표본 편향이 아니었다). 애초에 컬을
+        // 되살리지 않는 이유는 좌표계 버그를 고쳐도 마찬가지다:
+        //  (1) WR의 is_opaque는 "이 슬라이스의 backdrop이 불투명하다"는 힌트일 뿐 클립
+        //      영역 전체가 실제로 painted됐다는 보장이 아니다 — 진단에서 확정(결함②:
+        //      하트비트 점 2x2만 그리는 전면 클립 슬라이스가 하위 비디오를 컬).
+        //  (2) 월 실측(정상상태) 편익이 애초에 0건 — 시작 ~1초 과도기의 42건뿐이라
+        //      지속 편익이 없다.
+        //  (3) virtual/device 좌표 이중성이 만드는 결함 표면적을 통째로 제거한다.
+        // 따라서 add_surface가 기록한 z-order(아래→위) 그대로, 컬 없이 전부 합성한다.
         if let Some(root) = self.root_visual_ptr() {
-            for (i, (id, _, _)) in self.frame_surfaces.iter().enumerate() {
-                if !visible[i] {
-                    if dcomp_debug() {
-                        log::info!("[dcomp-dbg] cull id={:?} (covered by opaque above)", id);
-                    }
-                    continue;
-                }
+            for id in self.frame_surfaces.iter() {
                 let Some(entry) = self.surfaces.get(id) else { continue; };
                 // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
                 // insertAbove 인자는 MS 문서(IDCompositionVisual::AddVisual Remarks)의
@@ -2247,53 +2191,6 @@ mod tests {
         assert!(cov.is_full(&tiles));
         cov.reset();
         assert!(!cov.is_full(&tiles));
-    }
-
-    #[test]
-    fn cull_hides_fully_covered_below_opaque_top() {
-        // 월 실측 구조: 전면 불투명 2장(둘 다 조밀 타일로 clip 전체를 실제로 피복) → 하위 숨김
-        let v = cull_covered(&[
-            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
-            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
-        ]);
-        assert_eq!(v, vec![false, true]);
-        // 최상위가 컬 자격 없음(알파이거나 타일이 조밀하지 않아 호출부가 None을 넘김)
-        // → 아무도 못 숨김
-        let v = cull_covered(&[
-            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
-            (r(0, 0, 1920, 1080), None),
-        ]);
-        assert_eq!(v, vec![true, true]);
-        // extent가 하위 클립을 완전히 못 덮는 부분 겹침은 유지
-        let v = cull_covered(&[
-            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
-            (r(0, 0, 900, 1080), Some(r(0, 0, 900, 1080))),
-        ]);
-        assert_eq!(v, vec![true, true]);
-        // 3겹: 최상(조밀 extent)이 아래 둘 다 덮음
-        let v = cull_covered(&[
-            (r(0, 0, 100, 100), Some(r(0, 0, 100, 100))),
-            (r(0, 0, 100, 100), None),
-            (r(0, 0, 100, 100), Some(r(0, 0, 100, 100))),
-        ]);
-        assert_eq!(v, vec![false, false, true]);
-    }
-
-    #[test]
-    fn cull_rejects_sparse_extent_despite_full_opaque_clip() {
-        // alpha-slice-diagnosis.md 결함② 재현: WR이 전면 클립(0,0)-(1920,1080)·
-        // is_opaque=true로 "above" 슬라이스를 add하지만 실제 생성 타일은 1장(1024x512)
-        // 뿐인 경우(probe surf4 실측: promote extent=1024x512, 전면 클립과 괴리).
-        // 호출부(end_frame)가 surface_extent+tiles_are_dense로 계산해 넘기는 실측
-        // extent는 1024x512뿐이라 하위(배경 비디오)의 클립(1920x1080)을 포함하지
-        // 못한다 — v1(clip을 그대로 쓰던 버전)이었다면 여기서 false가 나와 검정
-        // 화면(결함②)을 재현했을 것.
-        let sparse_extent = Some(r(0, 0, 1024, 512));
-        let v = cull_covered(&[
-            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))), // 배경 비디오(하위, 조밀)
-            (r(0, 0, 1920, 1080), sparse_extent),              // above 슬라이스(희소 타일)
-        ]);
-        assert_eq!(v, vec![true, true]); // 둘 다 유지 — 검정 재현 방지
     }
 
     #[test]
