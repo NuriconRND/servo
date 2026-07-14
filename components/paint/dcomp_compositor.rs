@@ -291,19 +291,26 @@ fn collapse_dirty_if_oversized(mut rects: Vec<DeviceIntRect>, limit: usize) -> V
     union.into_iter().collect()
 }
 
-/// 레이어 컬링: entries는 add_surface 순서(z 아래→위)의 (device 클립, 불투명 여부).
-/// 최상위부터 훑어, 불투명 클립이 완전히 포함하는 하위 항목을 숨긴다.
-/// 알파(불투명 아님) 항목은 절대 숨겨지지 않는 것이 아니라 — 알파 항목도 "위의
-/// 불투명"에 완전히 덮이면 안 보이므로 숨김 대상이 될 수 있다. 숨기는 주체가
-/// 불투명이어야 한다는 것이 안전 조건이다.
-fn cull_covered(entries: &[(DeviceIntRect, bool)]) -> Vec<bool> {
+/// 레이어 컬링(A-2, 건전화 — alpha-slice-diagnosis.md): entries는 add_surface 순서
+/// (z 아래→위)의 (device 클립, 컬 자격 extent). 컬 자격 extent는 그 서피스가 "실제로
+/// 생성한 타일 집합"이 조밀 사각형(구멍 없음)을 이룰 때만 `Some(그 union extent)` —
+/// 호출부(end_frame)에서 `is_opaque=false`거나 타일이 조밀하지 않으면 `None`으로 넘긴다.
+/// v1(WR이 준 clip을 그대로 컬 판정에 쓰던 버전)은 clip이 "이 슬라이스의 backdrop이
+/// 불투명"이라는 힌트일 뿐 clip 전체가 painted되었다는 보장이 아니어서 결함②(희소
+/// painted "above" 슬라이스가 전면 클립으로 하위 비디오/오버레이를 삼킴)를 냈다 —
+/// 그래서 선언된 clip이 아니라 실측 타일 피복(extent)을 컬 판정 기준으로 쓴다.
+/// extent가 하위 항목의 클립을 완전히 포함할 때만 그 하위 항목을 숨긴다. 최상위부터
+/// 훑는다. 알파(컬 자격 없는) 항목도 하위 항목으로는 숨겨질 수 있다 — 숨기는 "주체"만
+/// 컬 자격(Some extent)이 있으면 된다.
+fn cull_covered(entries: &[(DeviceIntRect, Option<DeviceIntRect>)]) -> Vec<bool> {
     let mut visible = vec![true; entries.len()];
     for top in (0..entries.len()).rev() {
-        if !entries[top].1 || !visible[top] {
+        if !visible[top] {
             continue;
         }
+        let Some(extent) = entries[top].1 else { continue };
         for below in 0..top {
-            if visible[below] && entries[top].0.contains_box(&entries[below].0) {
+            if visible[below] && extent.contains_box(&entries[below].0) {
                 visible[below] = false;
             }
         }
@@ -2030,12 +2037,31 @@ impl Compositor for DCompNativeCompositor {
             }
         }
 
-        // 레이어 컬링: 최상위 불투명 클립이 완전히 덮는 하위 visual을 트리에서 제외.
-        // 진단: SERVO_DCOMP_NO_CULL로 끌 수 있다(요소 소실 의심 시 즉시 판별).
-        let entries: Vec<(DeviceIntRect, bool)> = self
+        // 레이어 컬링(A-2 건전화, alpha-slice-diagnosis.md): 최상위 불투명 서피스가
+        // "실제로 생성한 타일 집합"이 조밀 사각형으로 하위 클립을 완전히 덮을 때만
+        // 하위 visual을 트리에서 제외한다. 월 실측(9x5=45타일, (B) z-fix 적용 후):
+        // cull 발동 42건 — 전부 최초 ~1초 레이아웃 확정 전 구간에 NativeSurfaceId(0)
+        // 하나에서만 발생하고 이후 정상상태(약 29초) 0건이었다(task-6b-report.md).
+        // v1(WR이 준 clip만 보는 컬링)은 그 짧은 창에서도 결함②처럼 clip만 보고
+        // 희소 painted 슬라이스를 잘못 컬할 수 있음이 확정됐으므로, clip 대신 실측
+        // 타일 extent(+조밀성)를 컬 판정 기준으로 쓴다. 진단: SERVO_DCOMP_NO_CULL로
+        // 끌 수 있다(요소 소실 의심 시 즉시 판별).
+        let entries: Vec<(DeviceIntRect, Option<DeviceIntRect>)> = self
             .frame_surfaces
             .iter()
-            .map(|(_, clip, opaque)| (*clip, *opaque))
+            .map(|(id, clip, opaque)| {
+                let cull_extent = if *opaque {
+                    self.surfaces.get(id).and_then(|entry| {
+                        let extent =
+                            surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size)?;
+                        tiles_are_dense(entry.tiles.len(), entry.tile_size, extent.size())
+                            .then_some(extent)
+                    })
+                } else {
+                    None
+                };
+                (*clip, cull_extent)
+            })
             .collect();
         let visible = if cull_disabled() {
             vec![true; entries.len()]
@@ -2225,22 +2251,49 @@ mod tests {
 
     #[test]
     fn cull_hides_fully_covered_below_opaque_top() {
-        // 월 실측 구조: 전면 불투명 2장 → 하위 숨김
-        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 1920, 1080), true)]);
-        assert_eq!(v, vec![false, true]);
-        // 최상위가 알파면 아무도 못 숨김
-        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 1920, 1080), false)]);
-        assert_eq!(v, vec![true, true]);
-        // 부분 겹침은 유지
-        let v = cull_covered(&[(r(0, 0, 1920, 1080), true), (r(0, 0, 900, 1080), true)]);
-        assert_eq!(v, vec![true, true]);
-        // 3겹: 최상 불투명이 아래 둘 다 덮음
+        // 월 실측 구조: 전면 불투명 2장(둘 다 조밀 타일로 clip 전체를 실제로 피복) → 하위 숨김
         let v = cull_covered(&[
-            (r(0, 0, 100, 100), true),
-            (r(0, 0, 100, 100), false),
-            (r(0, 0, 100, 100), true),
+            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
+            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
+        ]);
+        assert_eq!(v, vec![false, true]);
+        // 최상위가 컬 자격 없음(알파이거나 타일이 조밀하지 않아 호출부가 None을 넘김)
+        // → 아무도 못 숨김
+        let v = cull_covered(&[
+            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
+            (r(0, 0, 1920, 1080), None),
+        ]);
+        assert_eq!(v, vec![true, true]);
+        // extent가 하위 클립을 완전히 못 덮는 부분 겹침은 유지
+        let v = cull_covered(&[
+            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))),
+            (r(0, 0, 900, 1080), Some(r(0, 0, 900, 1080))),
+        ]);
+        assert_eq!(v, vec![true, true]);
+        // 3겹: 최상(조밀 extent)이 아래 둘 다 덮음
+        let v = cull_covered(&[
+            (r(0, 0, 100, 100), Some(r(0, 0, 100, 100))),
+            (r(0, 0, 100, 100), None),
+            (r(0, 0, 100, 100), Some(r(0, 0, 100, 100))),
         ]);
         assert_eq!(v, vec![false, false, true]);
+    }
+
+    #[test]
+    fn cull_rejects_sparse_extent_despite_full_opaque_clip() {
+        // alpha-slice-diagnosis.md 결함② 재현: WR이 전면 클립(0,0)-(1920,1080)·
+        // is_opaque=true로 "above" 슬라이스를 add하지만 실제 생성 타일은 1장(1024x512)
+        // 뿐인 경우(probe surf4 실측: promote extent=1024x512, 전면 클립과 괴리).
+        // 호출부(end_frame)가 surface_extent+tiles_are_dense로 계산해 넘기는 실측
+        // extent는 1024x512뿐이라 하위(배경 비디오)의 클립(1920x1080)을 포함하지
+        // 못한다 — v1(clip을 그대로 쓰던 버전)이었다면 여기서 false가 나와 검정
+        // 화면(결함②)을 재현했을 것.
+        let sparse_extent = Some(r(0, 0, 1024, 512));
+        let v = cull_covered(&[
+            (r(0, 0, 1920, 1080), Some(r(0, 0, 1920, 1080))), // 배경 비디오(하위, 조밀)
+            (r(0, 0, 1920, 1080), sparse_extent),              // above 슬라이스(희소 타일)
+        ]);
+        assert_eq!(v, vec![true, true]); // 둘 다 유지 — 검정 재현 방지
     }
 
     #[test]
