@@ -51,6 +51,13 @@ const VIRTUAL_SURFACE_SIZE: i32 = 1024 * 32;
 const PROMOTE_STREAK: u32 = 3;
 /// 부분 dirty 누적으로 Present가 이만큼 보류되면 1회 warn(표시 지연 가시화).
 const WITHHOLD_WARN_FRAMES: u32 = 60;
+/// 스펙 §4: 그려진 지 이만큼의 프레임이 지나야 승격 streak을 인정(시작 과도기 배제).
+const PROMOTE_MIN_AGE_FRAMES: u32 = 30;
+/// 스펙 §6.1: withhold가 이만큼 연속되면 가상 서피스로 강등.
+const DEMOTE_AFTER_WITHHOLD: u32 = 30;
+/// 스펙 §6.3: 강등 n회째 재승격 쿨다운 = BASE × 2^(n−1), 상한 CAP (프레임).
+const DEMOTE_COOLDOWN_BASE: u64 = 300;
+const DEMOTE_COOLDOWN_CAP: u64 = 3600;
 
 /// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
 /// Cached behind a `OnceLock` — this is read from `bind`/`add_surface` per tile per frame
@@ -416,6 +423,14 @@ struct SurfaceEntry {
     promote_streak: u32,
     /// 마지막 add_surface 배치(content-swap의 오프셋 재적용 근거). add_surface 전 None.
     last_placement: Option<LastPlacement>,
+    /// 이 서피스가 그려진(bind된) 프레임의 누적 수 — PROMOTE_MIN_AGE_FRAMES 게이트.
+    drawn_frames: u32,
+    /// 강등 누적 횟수(쿨다운 지수의 n).
+    demote_count: u32,
+    /// 이 프레임 번호 전까지 승격 금지(재승격 쿨다운). 0 = 제한 없음.
+    promote_blocked_until: u64,
+    /// Virtual bind 프레임에서 부분 더티는 frame_coverage 집계에 미등록 — 별도 플래그로 "그려짐" 추적.
+    frame_drawn_partial: bool,
 }
 
 /// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
@@ -457,6 +472,8 @@ pub struct DCompNativeCompositor {
     /// regen(리사이즈 재생성)용 스왑체인 생성이 실패하면 이후 regen을 영구 중단
     /// (warn 1회, 옛 스왑체인 콘텐츠 유지 — 매 프레임 재시도 스팸 방지).
     warned_regen_fail: bool,
+    /// 누적된 프레임 번호 — begin_frame에서 증가. 쿨다운 만료 시점(frame_counter >= promote_blocked_until).
+    frame_counter: u64,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -575,6 +592,7 @@ pub fn maybe_create(
             warned_enable_native: false,
             warned_promote_fail: false,
             warned_regen_fail: false,
+            frame_counter: 0,
         })
     }
 }
@@ -749,6 +767,10 @@ impl Compositor for DCompNativeCompositor {
                 frame_coverage: FrameCoverage::default(),
                 promote_streak: 0,
                 last_placement: None,
+                drawn_frames: 0,
+                demote_count: 0,
+                promote_blocked_until: 0,
+                frame_drawn_partial: false,
             }
         };
 
@@ -929,6 +951,8 @@ impl Compositor for DCompNativeCompositor {
 
                 // 승격 판정용 프레임 피복 집계(dirty가 valid 전체를 덮는 전면 타일만).
                 entry.frame_coverage.note_tile((id.x, id.y), dirty_rect, valid_rect);
+                // 부분 더티 프레임도 "그려짐"으로 세기(나이 카운터에 포함).
+                entry.frame_drawn_partial = true;
 
                 // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
                 //
@@ -1005,6 +1029,7 @@ impl Compositor for DCompNativeCompositor {
         let Some(root) = self.root_visual_ptr() else {
             return;
         };
+        self.frame_counter += 1;
         // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
         // Safety: root는 살아있는 IDCompositionVisual.
         let hr = unsafe { (*root).RemoveAllVisuals() };
@@ -1106,10 +1131,22 @@ impl Compositor for DCompNativeCompositor {
                     // 전면 갱신 = 이 프레임의 dirty가 전 타일의 valid를 덮음(Virtual bind 집계).
                     // frame_coverage는 Virtual 전용 부기(스왑체인은 sc.coverage 사용)라
                     // 계산·리셋을 이 arm에서만 수행한다.
+                    let frame_drawn = !entry.frame_coverage.covered_tiles.is_empty()
+                        || entry.frame_drawn_partial;
                     let frame_full = entry.frame_coverage.is_full(&entry.tiles);
                     entry.frame_coverage.reset();
-                    // 승격 상태머신: 연속 PROMOTE_STREAK회 전면 갱신이면 스왑체인 생성 요청.
-                    entry.promote_streak = if frame_full { entry.promote_streak + 1 } else { 0 };
+                    entry.frame_drawn_partial = false;
+                    if frame_drawn {
+                        entry.drawn_frames = entry.drawn_frames.saturating_add(1);
+                    }
+                    // 승격 상태머신(스펙 §4): streak은 MIN_AGE 경과 후부터만 누적.
+                    entry.promote_streak = if frame_full
+                        && entry.drawn_frames > PROMOTE_MIN_AGE_FRAMES
+                    {
+                        entry.promote_streak + 1
+                    } else {
+                        0
+                    };
                     // Only opaque slices are promoted to a flip swapchain. Per design
                     // spec §5.3 (2026-07-14-dcomp-swapchain-content-design), a separate
                     // alpha slice (e.g. a fixed caption overlay) must REMAIN a virtual
@@ -1118,10 +1155,12 @@ impl Compositor for DCompNativeCompositor {
                     // require premultiplied-alpha correctness the virtual path already
                     // provides. Promotion targets the wall's full-repaint opaque video
                     // slices only. `is_opaque` is WR's per-slice opacity classification.
+                    // MIN_AGE gate added: streak must accumulate only after sufficient draw history.
                     if mode == StorageMode::Hybrid
                         && entry.is_opaque
                         && !self.warned_promote_fail
                         && entry.promote_streak >= PROMOTE_STREAK
+                        && self.frame_counter >= entry.promote_blocked_until
                         && self.dxgi_factory.is_some()
                     {
                         if let Some(extent) =
