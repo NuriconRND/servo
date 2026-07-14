@@ -244,8 +244,12 @@ G1~G4 전부 PASS. `CreateSwapChainForComposition` + `FLIP_SEQUENTIAL` 생성 �
 
 승격 스왑체인을 FLIP_SEQUENTIAL로 전환, catch-up = `stale[버퍼] − 이번 프레임
 더티`(정확한 렉트 차집합, 겹치는 부분은 복사 제외) 복사 후 `Present1` 더티렉트
-힌트(`MAX_PRESENT_DIRTY_RECTS`/`MAX_STALE_RECTS=16` 초과 시 서피스 전체 1렉트로
-붕괴). 45타일 월 실측: 초기 검증 present-partial **478회**(withhold 0, 실패 0,
+힌트 적용. 두 상한은 서로 다르게 동작한다: `MAX_PRESENT_DIRTY_RECTS=16` 초과 시
+그 프레임의 Present1 더티렉트 **힌트를 생략**(`DirtyRectsCount=0`, 즉 전체
+프레젠트 — 붕괴가 아니다); `MAX_STALE_RECTS=32` 초과 시 stale 목록을 바운딩
+유니온 **1렉트로 붕괴**하지만(`collapse_dirty_if_oversized`/`StaleTracker::
+on_present`), 그 유니온은 stale 렉트들의 경계일 뿐 반드시 서피스 전체는 아니다.
+45타일 월 실측: 초기 검증 present-partial **478회**(withhold 0, 실패 0,
 2.5분 재생) + Task 7 5분 소크 재확인 **596건** 중 **catchup=0(완전 더티 프레임,
 복사 0바이트) 41건(6.9%)**, 나머지 555건(93%)은 catchup 1~16 렉트(30fps 콘텐츠의
 정상적 부분 갱신 케이던스) — "전면 더티 프레임은 복사 0" 요구를 실측으로 확인.
@@ -331,3 +335,11 @@ dense-tile 술어로 컬링을 건전화)는 리뷰에서 Critical로 적발 —
 계획 문서 커밋 `3a8d6b9bf`/`b31327a45` 별도), 선행 스왑체인 콘텐츠 사이클
 10커밋(`03946de91..21f6dab41`) 위 로컬. HEAD `c09817cc8`, 전부 미푸시 — 푸시는
 AMD 실측 후 사용자 결정 대기(선행 사이클과 동일 정책).
+
+### 11.8 최종 리뷰 픽스 (2026-07-15)
+
+- Important #1(리젠 후 강등 데드엔드) 해결: regen 후 pre-attach(`content_attached
+  =false`)인데 `fallback_virtual`이 `None`인 상태(regen이 fallback을 복원하지
+  않음 — 첫 content-swap에서 이미 소모됨)를 별도 제3상태로 명시 식별 — 시딩
+  불가로 판정해 단발 로그(영어) 후 해당 서피스의 강등 처리 자체를 보류
+  (`demote_blocked`), content-swap 성공 또는 regen에서 재판정.

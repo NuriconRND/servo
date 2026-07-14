@@ -408,6 +408,18 @@ struct SwapChainStorage {
     /// 시딩이 지속 실패하면(예: 디바이스 로스트) 강등 자체가 매 프레임 재시도되므로
     /// 무가드면 동일하게 로그 폭주한다.
     warned_demote_seed_fail: bool,
+    /// 최종 리뷰 Important #1: "제3상태"(regen 후 pre-attach인데 fallback_virtual이
+    /// None — regen은 fallback을 복원하지 않는다, 첫 content-swap에서 이미 소모됨)를
+    /// 만나면 시딩이 구조적으로 불가능하다. 단발 경고 후 이 스왑체인의 강등 처리
+    /// 자체를 억제해 매 프레임 재시도(=warn 폭주 은폐된 재시도 루프)를 막는다.
+    /// content-swap 성공(content_attached=true) 또는 regen에서 리셋 — 그 시점에
+    /// 상태가 바뀌어 재판정이 의미 있어지기 때문("자연 회복" 조건).
+    demote_blocked: bool,
+    /// 최종 리뷰 Minor #4: content-swap 시 SetContent(swapchain) 실패 warn을 이
+    /// 스왑체인 인스턴스당 1회로 제한한다. 실패해도 content_attached는 그대로
+    /// false라 이 분기가 coverage 전면인 매 프레임 재진입되므로, 무가드면 다른
+    /// warned_* 필드들과 동일한 로그 폭주가 재발한다. regen에서 재무장.
+    warned_setcontent_fail: bool,
 }
 
 /// content-swap 시 1회: GetBuffer(1)이 이 환경에서 열리는지 프로브(스펙 §3 '런타임 자격').
@@ -1694,6 +1706,13 @@ impl Compositor for DCompNativeCompositor {
                                 }
                             }
                         }
+                        // 최종 리뷰 Important #2: geometry_changed가 여러 프레임 지속되면(조밀성
+                        // 가드 미충족 또는 warned_regen_fail로 regen 영구 중단) bind()가 매 프레임
+                        // frame_dirty를 계속 push해 무한 성장할 수 있다. 규정 위 안전 방향으로
+                        // 상한 초과분을 붕괴 — stale은 regen에서 리셋되고 다음 content-swap이
+                        // 항상 전면 시딩하므로 정보 손실 없음.
+                        sc.frame_dirty =
+                            collapse_dirty_if_oversized(std::mem::take(&mut sc.frame_dirty), MAX_STALE_RECTS);
                     } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
                         // 첫 콘텐츠 Present 여부는 성공 처리 전에 계산(성공 시 content_attached가
                         // 바뀌므로 stale 시딩 판정에 원본 값이 필요).
@@ -1752,6 +1771,9 @@ impl Compositor for DCompNativeCompositor {
                                 if hr >= 0 {
                                     sc.content_attached = true;
                                     sc.fallback_virtual = None; // 구 가상 서피스 해제
+                                    // 제3상태(리뷰 Important #1) 해제 조건 도달: content_attached가
+                                    // true가 됐으니 다음에 강등이 필요해지면 재판정할 가치가 있다.
+                                    sc.demote_blocked = false;
                                     // 표시 콘텐츠가 (가상좌표 또는 옛 anchor) → 새 anchor 스왑체인으로
                                     // 바뀌었다. 오프셋 산식도 같은 Commit에서 새 anchor로 재적용해야
                                     // 콘텐츠 전환과 오프셋 전환이 원자적으로 반영된다(무글리치).
@@ -1776,7 +1798,16 @@ impl Compositor for DCompNativeCompositor {
                                         );
                                     }
                                 } else {
-                                    warn!("[dcomp-native] SetContent(swapchain) failed (hr=0x{:08x})", hr as u32);
+                                    // 최종 리뷰 Minor #4: content_attached가 false로 남아 이
+                                    // 분기가(coverage 전면인 한) 매 프레임 재진입한다 — warn-once로
+                                    // 로그 폭주를 막는다(regen에서 재무장).
+                                    if !sc.warned_setcontent_fail {
+                                        warn!(
+                                            "[dcomp-native] SetContent(swapchain) failed (hr=0x{:08x})",
+                                            hr as u32
+                                        );
+                                        sc.warned_setcontent_fail = true;
+                                    }
                                 }
                             }
                         }
@@ -1804,6 +1835,14 @@ impl Compositor for DCompNativeCompositor {
                             }
                         } else {
                             // 스펙 §5.3: 런타임 실패 → 즉시 강등(warn-once는 강등부에서, Task 5).
+                            // 최종 리뷰 Minor #3: 위 full-Present 실패 분기와 달리 여기서는 take된
+                            // `dirty`를 sc.frame_dirty로 복원하지 않고 그냥 버린다 — 비대칭이지만
+                            // 안전하다: partial_present=false가 됐으니 다음 Present는 (withhold
+                            // 경로를 거치든 곧장 강등되든) 반드시 누적 전면 커버리지를 요구하게
+                            // 되고, 그 경로는 buffer 0의 전 픽셀을 다시 채우는 것을 전제한다 —
+                            // 이번에 버린 dirty 정보가 없어도 최종적으로 픽셀 손실이 없다.
+                            // partial_present가 재활성화되는 유일한 경로는 regen 재프로브뿐이고,
+                            // regen은 stale까지 리셋하므로 그 시점에도 stale 부기와 어긋나지 않는다.
                             sc.partial_present = false;
                             demote_requests.push(*id);
                         }
@@ -1873,6 +1912,8 @@ impl Compositor for DCompNativeCompositor {
                     partial_present: false,
                     warned_present_fail: false,
                     warned_demote_seed_fail: false,
+                    demote_blocked: false,
+                    warned_setcontent_fail: false,
                 }),
             );
             if let SurfaceStorage::Virtual { virtual_surface } = old {
@@ -1925,6 +1966,11 @@ impl Compositor for DCompNativeCompositor {
                     // 새 스왑체인 인스턴스 — 보강 항목 2의 per-swapchain warn 가드도 재무장.
                     sc.warned_present_fail = false;
                     sc.warned_demote_seed_fail = false;
+                    sc.warned_setcontent_fail = false; // 최종 리뷰 Minor #4 재무장
+                    // 최종 리뷰 Important #1: regen 시점에 제3상태 판정을 다시 할 기회를
+                    // 준다(fallback_virtual은 여전히 None일 수 있으므로 즉시 재검출·재차단될
+                    // 수 있으나, 그 경우도 새 경고 1건 + 재차단으로 계약을 satisfy한다).
+                    sc.demote_blocked = false;
                     if dcomp_debug() {
                         log::info!(
                             "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
@@ -1951,6 +1997,29 @@ impl Compositor for DCompNativeCompositor {
             let last_placement = entry.last_placement;
             let SurfaceStorage::SwapChain(sc) = &mut entry.storage else { continue };
             release_frame_pbuffer(&rc, sc);
+
+            // 최종 리뷰 Important #1: 이미 제3상태로 판정·경고된 서피스는 매 프레임
+            // 재시도하지 않는다(state change — content-swap 또는 regen — 까지 억제).
+            if sc.demote_blocked {
+                continue;
+            }
+            // 제3상태 판정: regen 후 pre-attach(content_attached=false)인데
+            // fallback_virtual이 None이면 §6.2-1 시딩(demote_seed_into_fallback)이
+            // take()?에서 구조적으로 실패한다 — regen이 fallback_virtual을 복원하지
+            // 않기 때문(첫 content-swap에서 이미 소모됨). 이는 "시딩이 지속 실패"하는
+            // warned_demote_seed_fail 케이스와 달리 재시도해도 절대 성공할 수 없는
+            // 별개 상태이므로, 여기서 명시적으로 분리해 단발 경고만 남기고 더 이상
+            // 시딩을 시도하지 않는다. 자연 회복 조건 = 다음 full-coverage Present가
+            // 성공해 content_attached=true가 되는 것(그 즉시 위 §6.2-2 경로로 전환).
+            if !sc.content_attached && sc.fallback_virtual.is_none() {
+                warn!(
+                    "[dcomp-native] demote skipped: regen'd surface {:?} has no fallback; \
+                     will recover at next full-coverage present",
+                    surface_id
+                );
+                sc.demote_blocked = true;
+                continue;
+            }
 
             let Some(ctx) = ctx else {
                 // GetImmediateContext는 COM 계약상 실패하지 않는다고 간주되지만(구조체
