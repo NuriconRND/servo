@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>복합 미디어 데모 — 영상+텍스트+애니메이션</title>
+<style>
+  /* 전면 불투명 배경 + 정상 플로우 레이아웃: 비디오가 불투명 슬라이스에 남는
+     검증된 구조(video_grid_6x6_play.html의 flex-wrap 패턴)를 그대로 따른다.
+     ※ float 레이아웃은 비디오를 비불투명 슬라이스로 밀어 DComp에서 검정이 되는
+     이월 결함(스펙 2026-07-14 §10)이 있으므로 금지. */
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Malgun Gothic", ui-sans-serif, sans-serif;
+  }
+
+  /* ── 상단 정보 바 (fixed 오버레이, 8vh) ─────────────────────────
+     ※ 바를 일반 플로우 블록으로 두고 그리드를 82vh로 줄이면 WR이 비디오
+     슬라이스를 비불투명으로 분류해 DComp에서 검정이 된다(이월 결함 재현
+     레이아웃 2호, 2026-07-14 실측). 검증된 구조 = 그리드 100vh 단일 블록
+     (video_grid_6x6_play.html 동일) + 바/자막은 전부 fixed 오버레이
+     (비디오 없는 오버레이 슬라이스는 정상 표시가 실증됨). */
+  #topbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 8vh;
+    z-index: 4;
+    background: #101820;
+    color: #e8edf2;
+    display: flex;
+    align-items: center;
+    gap: 2vw;
+    padding: 0 1.5vw;
+    box-sizing: border-box;
+    border-bottom: 2px solid #2a3b4d;
+  }
+  #logo {
+    width: 4.4vh;
+    height: 4.4vh;
+    background: linear-gradient(135deg, #ff6a00, #ffc400);
+    animation: spin 6s linear infinite;
+  }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  #title { font-size: 3.2vh; font-weight: 700; letter-spacing: 0.05em; }
+  #live {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.6vw;
+    font-size: 2.6vh;
+    font-weight: 700;
+    color: #ff4545;
+  }
+  #live .dot {
+    width: 1.6vh;
+    height: 1.6vh;
+    border-radius: 50%;
+    background: #ff4545;
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { transform: scale(1);   opacity: 1; }
+    50%      { transform: scale(1.6); opacity: 0.4; }
+  }
+  #clock { font-size: 3.2vh; font-variant-numeric: tabular-nums; color: #9fd4ff; }
+
+  /* ── 비디오 그리드 (검증된 100vh 단일 블록 — 불투명 슬라이스 유지) ── */
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+  }
+  #grid video {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    object-fit: fill;
+    background: #000;
+  }
+
+  /* ── 반투명 자막 오버레이 (fixed = 알파 콘텐츠; 텍스트 전용이라 안전) ── */
+  #caption {
+    position: fixed;
+    left: 50%;
+    bottom: 14vh;
+    transform: translateX(-50%);
+    background: rgba(10, 20, 35, 0.55);
+    color: #fff;
+    font-size: 3.4vh;
+    font-weight: 600;
+    padding: 1.2vh 2.4vw;
+    border-radius: 1.2vh;
+    text-shadow: 0 0 10px rgba(0, 0, 0, 0.9);
+    animation: captionSlide 9s ease-in-out infinite;
+    white-space: nowrap;
+    z-index: 5;
+  }
+  @keyframes captionSlide {
+    0%, 12%   { opacity: 0; transform: translateX(-50%) translateY(2vh); }
+    20%, 80%  { opacity: 1; transform: translateX(-50%) translateY(0); }
+    88%, 100% { opacity: 0; transform: translateX(-50%) translateY(-1vh); }
+  }
+
+  /* ── 하단 뉴스 티커 (fixed 오버레이, 10vh) ──────────────────────── */
+  #tickerbar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 10vh;
+    z-index: 4;
+    background: #0b1220;
+    border-top: 2px solid #2a3b4d;
+    display: flex;
+    align-items: center;
+    overflow: hidden;
+  }
+  #tickerlabel {
+    flex: 0 0 auto;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    padding: 0 1.5vw;
+    background: #c8102e;
+    color: #fff;
+    font-size: 3vh;
+    font-weight: 700;
+    z-index: 2;
+  }
+  #ticker {
+    position: absolute;
+    left: 0;
+    white-space: nowrap;
+    color: #dfe8f2;
+    font-size: 3.4vh;
+    will-change: transform;
+    animation: tick 28s linear infinite;
+  }
+  @keyframes tick {
+    from { transform: translateX(100vw); }
+    to   { transform: translateX(-100%); }
+  }
+
+  /* rAF 하트비트 (video_grid_6x6_play.html과 동일 — 필수) */
+  #hb { position: fixed; right: 0; bottom: 0; width: 2px; height: 2px; background: #000; z-index: 10; }
+
+  /* 동기 시작 커버 (관례 동일) */
+  #cover {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #555;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 24px;
+  }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <div id="logo"></div>
+  <div id="title">멀티GPU 미디어 월 — 복합 표출 데모</div>
+  <div id="live"><span class="dot"></span>LIVE</div>
+  <div id="clock">--:--:--</div>
+</div>
+<div id="grid"></div>
+<div id="caption">영상 위 반투명 자막 — 텍스트·애니메이션·비디오 동시 합성</div>
+<div id="tickerbar">
+  <div id="tickerlabel">속보</div>
+  <div id="ticker">멀티GPU 비디오 월 데모 · WebRender Native Compositor(DirectComposition) 스왑체인 하이브리드 경로로 표출 중 · 텍스트 티커는 CSS 애니메이션, 시계는 JS, 자막은 반투명 오버레이 · 영상 타일은 D3D11 제로카피 + gapless 루프 + 프레임 단위 lockstep · 이 문장이 끊김 없이 흐르면 합성 파이프라인이 정상입니다 ·&nbsp;</div>
+</div>
+<div id="hb"></div>
+<div id="cover">준비 중...</div>
+<script>
+  "use strict";
+
+  // 그리드 크기: 런처가 ?cols=&rows=로 전달 (기본 3x2 = 6타일, 데모 용도).
+  const params = new URLSearchParams(location.search);
+  const clampInt = (raw, fallback) => {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fallback;
+  };
+  const COLS = clampInt(params.get("cols"), 3);
+  const ROWS = clampInt(params.get("rows"), 2);
+  const TILE_COUNT = COLS * ROWS;
+  const DEFAULT_SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  const srcParam = params.get("src");
+  const SRC = (srcParam && srcParam.trim()) ? srcParam.trim() : DEFAULT_SRC;
+
+  const grid = document.getElementById("grid");
+  const tileW = (100 / COLS) + "vw";
+  const tileH = (100 / ROWS) + "vh";
+  const videos = [];
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const v = document.createElement("video");
+    v.muted = true;
+    v.loop = true;
+    v.playsInline = true;
+    v.preload = "auto";
+    v.style.width = tileW;
+    v.style.height = tileH;
+    v.src = SRC;
+    v.play().catch(() => {});
+    grid.appendChild(v);
+    videos.push(v);
+  }
+
+  // 시계 (JS 텍스트 갱신 — 비디오와 다른 주기의 콘텐츠 변경원)
+  const clock = document.getElementById("clock");
+  const two = (n) => String(n).padStart(2, "0");
+  setInterval(() => {
+    const d = new Date();
+    clock.textContent = two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+  }, 1000);
+
+  // 동기 시작 커버 (video_grid_6x6_play.html과 동일 관례)
+  const cover = document.getElementById("cover");
+  const syncBegin = performance.now();
+  const revealPoll = setInterval(() => {
+    const moving = videos.filter((v) => v.currentTime > 0).length;
+    const elapsed = ((performance.now() - syncBegin) / 1000) | 0;
+    cover.textContent = "준비 중... " + moving + "/" + TILE_COUNT + " (" + elapsed + "s)";
+    if (moving >= TILE_COUNT || elapsed > 90) {
+      clearInterval(revealPoll);
+      if (cover.parentNode) cover.parentNode.removeChild(cover);
+    }
+  }, 250);
+
+  // rAF 하트비트 (필수 — 없으면 다중 비디오 즉시합성 경로가 이벤트 루프를 압도)
+  const hb = document.getElementById("hb");
+  let hbFrame = 0;
+  (function heartbeat() {
+    hbFrame++;
+    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>

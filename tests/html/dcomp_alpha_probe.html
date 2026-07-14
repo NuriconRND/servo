@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>DComp Alpha Slice Probe</title>
+<style>
+  /* 불투명 body(#000): 대조군 배경 비디오는 여기 정상 플로우에 놓여 WR이 불투명
+     슬라이스로 분류한다(video_grid_6x6_play.html 검증 구조). 오버레이만 알파 슬라이스. */
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Malgun Gothic", ui-sans-serif, sans-serif;
+  }
+
+  /* ── 대조군: 전면 배경 비디오(불투명 슬라이스) ─────────────────────
+     100vw x 100vh 단일 블록 = 불투명. 이게 정상 표출되면 비디오 draw 자체는
+     정상이고, 문제는 알파 슬라이스에 국한됨을 의미한다. */
+  #base {
+    position: fixed;
+    inset: 0;
+    background: #000;
+    z-index: 0;
+  }
+  #bg {
+    width: 100vw;
+    height: 100vh;
+    object-fit: fill;
+    background: #000;
+  }
+
+  /* ── 진단 대상: position:fixed + will-change:transform 오버레이 ──────
+     will-change:transform가 이 요소를 자기 own picture-cache 슬라이스로 강제하고,
+     반투명/텍스트/비디오 콘텐츠가 그 슬라이스를 NON-OPAQUE(알파)로 분류시킨다.
+     40vw x 30vh 중앙 배치. case별로 내부 콘텐츠가 바뀐다(아래 스크립트). */
+  #overlay {
+    position: fixed;
+    left: 30vw;
+    top: 35vh;
+    width: 40vw;
+    height: 30vh;
+    will-change: transform;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  #overlay .txt { color: #fff; font-size: 3vh; font-weight: 700; text-align: center; line-height: 1.5; }
+  #overlay video { width: 100%; height: 100%; object-fit: fill; background: #000; }
+
+  /* rAF 하트비트(2px 점, video_grid_6x6_play.html과 동일 — 필수). */
+  #hb { position: fixed; right: 0; bottom: 0; width: 2px; height: 2px; background: #000; z-index: 10; }
+
+  /* 진단용 case 라벨(좌상단, 스크린 판독 시 어떤 케이스인지 로그와 대조). */
+  #label {
+    position: fixed;
+    left: 0; top: 0;
+    padding: 0.4vh 0.8vw;
+    background: #003;
+    color: #6cf;
+    font: 700 2vh ui-monospace, Consolas, monospace;
+    z-index: 11;
+  }
+</style>
+</head>
+<body>
+<div id="base"><video id="bg" muted loop autoplay playsinline preload="auto"></video></div>
+<div id="overlay"></div>
+<div id="hb"></div>
+<div id="label"></div>
+<script>
+  "use strict";
+
+  const params = new URLSearchParams(location.search);
+  const CASE = (params.get("case") || "solid").trim();
+  const DEFAULT_SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  const srcParam = params.get("src");
+  const SRC = (srcParam && srcParam.trim()) ? srcParam.trim() : DEFAULT_SRC;
+
+  document.title = "DComp Alpha Probe — " + CASE;
+  document.getElementById("label").textContent = "case=" + CASE;
+
+  // 대조군 배경 비디오(불투명 슬라이스).
+  const bg = document.getElementById("bg");
+  bg.src = SRC;
+  bg.play().catch(() => {});
+
+  // 진단 오버레이(알파 슬라이스) 콘텐츠를 case별로 구성.
+  const ov = document.getElementById("overlay");
+  if (CASE === "solid") {
+    // 대조군: 반투명 솔리드 — 표시돼야 정상(알파 합성 자체는 동작 실증).
+    ov.style.background = "rgba(200,40,60,0.55)";
+  } else if (CASE === "text") {
+    // 알파 슬라이스 텍스트(배경 없음 = 완전 투명 슬라이스에 흰 글자).
+    ov.innerHTML = "<div class='txt'>알파 슬라이스 텍스트 진단<br>ALPHA SLICE TEXT<br>0123456789</div>";
+  } else if (CASE === "video") {
+    // 결함 재현 핵심: 알파 슬라이스 내부의 비디오(YUV 제로카피 external image).
+    const v = document.createElement("video");
+    v.muted = true;
+    v.loop = true;
+    v.autoplay = true;
+    v.playsInline = true;
+    v.preload = "auto";
+    v.src = SRC;
+    ov.appendChild(v);
+    v.play().catch(() => {});
+  }
+
+  // rAF 하트비트: 매 프레임 2px 점 색 토글로 실제 페인트를 강제(video_grid_6x6_play.html 관례).
+  const hb = document.getElementById("hb");
+  let hbFrame = 0;
+  (function heartbeat() {
+    hbFrame++;
+    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>

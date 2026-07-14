@@ -70,6 +70,15 @@ fn dcomp_debug() -> bool {
     *DCOMP_DEBUG.get_or_init(|| std::env::var("SERVO_DCOMP_DEBUG").is_ok())
 }
 
+/// Task 6 defect-2 diagnosis (spec 2026-07-15): env-gated per-tile pixel readback in
+/// `unbind` (pbuffer still current). Cached behind a `OnceLock` — read once per unbind
+/// while active; zero overhead when the env var is unset (never does glReadPixels, which
+/// stalls the pipeline). Frame-limited to <=120 by the caller (spec §7.1 stall amplification).
+fn readback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SERVO_DCOMP_READBACK").is_ok())
+}
+
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
 /// virtual_offset은 create_surface 때 WR이 준 이 서피스의 가상공간 원점.
 fn tile_virtual_rect(
@@ -825,6 +834,88 @@ struct BoundTile {
     pbuffer: usize,
     /// BeginDraw가 돌려준 텍스처(AddRef됨). WR의 GL draw 동안 살려두고 unbind에서 Release.
     texture: *mut ID3D11Texture2D,
+    /// Task 6 diagnosis only (cheap ints, always populated). Tile grid coords, the atlas
+    /// offset BeginDraw returned, the dirty-rect size, and the returned texture size — the
+    /// coordinates the readback needs to sample the drawn sub-region. Unused when
+    /// SERVO_DCOMP_READBACK is off (readback_log_bound is called only under the gate).
+    tile: (i32, i32),
+    update_offset: (i32, i32),
+    dirty_size: (i32, i32),
+    tex_size: (i32, i32),
+}
+
+/// Task 6 defect-2 diagnosis: read the just-drawn tile pixels from the pbuffer (still
+/// current at `unbind`, before EndDraw) and log per-tile alpha/RGB statistics. glReadPixels
+/// stalls the pipeline (spec §7.1) so the caller gates this on `readback_enabled()` AND
+/// `frame_counter <= 120`. One whole-texture read per bound tile, then two sample passes:
+///  (a) an 8x8 grid over the drawn dirty sub-region [update_offset .. +dirty_size], reported
+///      as alpha_min/max + rgb_nonzero/64 — the primary "is the video/text black?" signal;
+///  (b) a coarse 32x32 scan over the ENTIRE returned texture — cancels flip/atlas ambiguity
+///      (if content exists anywhere in the allocation the whole-scan catches it even if the
+///      sub-region indexing is mirrored or the tile sits at a non-zero atlas offset).
+/// GL error is sampled before/after the read for the decision tree (draw-layer GL failure).
+fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool>) {
+    use gleam::gl;
+    let (tw, th) = bound.tex_size;
+    if tw <= 0 || th <= 0 {
+        return;
+    }
+    let g = device.gl();
+    let err_before = g.get_error();
+    // Read the pbuffer's default framebuffer (bind returned fbo_id 0 => WR drew the tile
+    // there). Bind READ_FRAMEBUFFER 0 explicitly so a leftover WR FBO can't be sampled.
+    g.bind_framebuffer(gl::READ_FRAMEBUFFER, 0);
+    let pixels = g.read_pixels(0, 0, tw, th, gl::RGBA, gl::UNSIGNED_BYTE);
+    let err_after = g.get_error();
+    let need = (tw as usize) * (th as usize) * 4;
+    if pixels.len() < need {
+        warn!(
+            "[dcomp-readback] short read {} < {}x{}x4 for surface {:?}",
+            pixels.len(), tw, th, bound.surface_id
+        );
+        return;
+    }
+    let sample = |sx: i32, sy: i32| -> (u8, u8, u8, u8) {
+        let x = sx.clamp(0, tw - 1) as usize;
+        let y = sy.clamp(0, th - 1) as usize;
+        let idx = (y * tw as usize + x) * 4;
+        (pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3])
+    };
+    // (a) 8x8 grid over the drawn dirty sub-region.
+    let (ox, oy) = bound.update_offset;
+    let dw = bound.dirty_size.0.max(1);
+    let dh = bound.dirty_size.1.max(1);
+    let (mut a_min, mut a_max, mut rgb_nz) = (255u8, 0u8, 0u32);
+    for j in 0..8 {
+        for i in 0..8 {
+            let (r, gc, b, a) = sample(ox + (i * dw) / 8, oy + (j * dh) / 8);
+            a_min = a_min.min(a);
+            a_max = a_max.max(a);
+            if r != 0 || gc != 0 || b != 0 {
+                rgb_nz += 1;
+            }
+        }
+    }
+    // (b) coarse 32x32 whole-texture scan (flip/atlas ambiguity guard).
+    const SCAN: i32 = 32;
+    let (mut whole_nz, mut whole_a_max) = (0u32, 0u8);
+    for j in 0..SCAN {
+        for i in 0..SCAN {
+            let (r, gc, b, a) = sample((i * (tw - 1)) / (SCAN - 1), (j * (th - 1)) / (SCAN - 1));
+            whole_a_max = whole_a_max.max(a);
+            if r != 0 || gc != 0 || b != 0 {
+                whole_nz += 1;
+            }
+        }
+    }
+    log::info!(
+        "[dcomp-readback] surface={:?} tile=({},{}) opaque={:?} tex={}x{} update_off=({},{}) \
+         dirty={}x{} alpha_min={} alpha_max={} rgb_nonzero={}/64 whole_rgb_nonzero={}/{} \
+         whole_alpha_max={} gl_err=0x{:04x}->0x{:04x}",
+        bound.surface_id, bound.tile.0, bound.tile.1, is_opaque, tw, th, ox, oy,
+        bound.dirty_size.0, bound.dirty_size.1, a_min, a_max, rgb_nz, whole_nz,
+        SCAN * SCAN, whole_a_max, err_before, err_after
+    );
 }
 
 /// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
@@ -1358,6 +1449,14 @@ impl Compositor for DCompNativeCompositor {
                     surface_id: id.surface_id,
                     pbuffer,
                     texture,
+                    // Task 6 diagnosis: sampling coordinates for the unbind readback.
+                    tile: (id.x, id.y),
+                    update_offset: (update_offset.x, update_offset.y),
+                    dirty_size: (
+                        dirty_rect.max.x - dirty_rect.min.x,
+                        dirty_rect.max.y - dirty_rect.min.y,
+                    ),
+                    tex_size: (desc.Width as i32, desc.Height as i32),
                 });
 
                 // 승격 판정용 프레임 피복 집계(dirty가 valid 전체를 덮는 전면 타일만).
@@ -1397,10 +1496,18 @@ impl Compositor for DCompNativeCompositor {
         }
     }
 
-    fn unbind(&mut self, _device: &mut Device) {
+    fn unbind(&mut self, device: &mut Device) {
         let Some(bound) = self.bound.take() else {
             return;
         };
+        // Task 6 defect-2 diagnosis: read the tile pixels BEFORE EndDraw/destroy while the
+        // pbuffer is still current. Gated (env off => no glReadPixels) and frame-limited to
+        // <=120 (spec §7.1 stall amplification). Only the Virtual arm sets `bound`, which is
+        // exactly the alpha-slice path under scrutiny.
+        if readback_enabled() && self.frame_counter <= 120 {
+            let is_opaque = self.surfaces.get(&bound.surface_id).map(|e| e.is_opaque);
+            readback_log_bound(device, &bound, is_opaque);
+        }
         // 현재 bind 중이던 서피스에 EndDraw.
         if let Some(entry) = self.surfaces.get(&bound.surface_id) {
             match &entry.storage {
