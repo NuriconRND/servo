@@ -77,6 +77,7 @@ fn tile_virtual_rect(
 }
 
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
+#[allow(dead_code)] // Task 4가 소비
 const MAX_PRESENT_DIRTY_RECTS: usize = 16;
 const MAX_STALE_RECTS: usize = 32;
 
@@ -1463,12 +1464,14 @@ mod tests {
         assert_eq!(area, 50*100);
         // 전면 더티 프레임의 catch-up은 공집합 (Global Constraints: 순수 월 0바이트)
         assert!(st.catchup_rects(&[full]).is_empty());
-        // stale 32개 초과 → 바운딩 유니온 붕괴 (과대 안전)
+        // 단일 프레임 더티가 32개 초과 → 반대 버퍼 stale이 바운딩 유니온 1개로 붕괴(과대=안전)
         let mut st = StaleTracker::default();
-        for i in 0..40 {
-            st.on_present(&[r(i*2, 0, i*2+1, 1)], full);
-        }
-        assert!(st.stale[st.cur].len() <= 32 + 1);
+        let many: Vec<DeviceIntRect> = (0..40).map(|i| r(i * 2, 0, i * 2 + 1, 1)).collect();
+        st.on_present(&many, full);
+        assert_eq!(st.stale[st.cur].len(), 1);
+        assert_eq!(st.stale[st.cur][0], r(0, 0, 79, 1)); // 40개 렉트의 바운딩 유니온
+        // 붕괴된 stale은 catch-up에서 과대(안전) 복사 대상으로 그대로 나온다
+        assert_eq!(st.catchup_rects(&[]), vec![r(0, 0, 79, 1)]);
     }
 
     #[test]
