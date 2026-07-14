@@ -110,13 +110,22 @@
   }
 
   // rAF 하트비트: 매 프레임 2px 점 색 토글로 실제 페인트를 강제(video_grid_6x6_play.html 관례).
-  const hb = document.getElementById("hb");
-  let hbFrame = 0;
-  (function heartbeat() {
-    hbFrame++;
-    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
-    requestAnimationFrame(heartbeat);
-  })();
+  // ?hb=0 = 하트비트 비활성(진단용): 결함②가 하트비트 점(2x2 dirty "above" 슬라이스의
+  // 유발원) 자체의 아티팩트가 아님을 분리 검증하는 스위치. 끄면 다중 비디오 즉시합성
+  // 경로가 이벤트 루프를 압도해 페이지가 둔해질 수 있음(알려진 이슈) — 로그 판정용
+  // 짧은 실행 전제.
+  if (params.get("hb") !== "0") {
+    const hb = document.getElementById("hb");
+    let hbFrame = 0;
+    (function heartbeat() {
+      hbFrame++;
+      hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+      requestAnimationFrame(heartbeat);
+    })();
+  } else {
+    // 점 요소 자체도 제거 — "hb 점이 결함의 유발원인가"를 요소 단위로 분리.
+    document.getElementById("hb").remove();
+  }
 </script>
 </body>
 </html>
