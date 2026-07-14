@@ -76,6 +76,108 @@ fn tile_virtual_rect(
     DeviceIntRect::from_origin_and_size(origin, tile_size)
 }
 
+/// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
+const MAX_PRESENT_DIRTY_RECTS: usize = 16;
+const MAX_STALE_RECTS: usize = 32;
+
+/// minuend − sub: 겹치면 최대 4조각(상/하/좌/우 밴드)으로 분해. 정확 연산(근사 금지 —
+/// 차집합이 넓으면 stale 픽셀 잔존, 좁으면 신규 콘텐츠를 구본으로 덮어씀. 스펙 §5.2-2).
+fn subtract_rect(minuend: DeviceIntRect, sub: DeviceIntRect) -> Vec<DeviceIntRect> {
+    let Some(ix) = minuend.intersection(&sub) else {
+        return vec![minuend];
+    };
+    let mut out = Vec::with_capacity(4);
+    // 상단 밴드
+    if minuend.min.y < ix.min.y {
+        out.push(DeviceIntRect::new(
+            DeviceIntPoint::new(minuend.min.x, minuend.min.y),
+            DeviceIntPoint::new(minuend.max.x, ix.min.y),
+        ));
+    }
+    // 하단 밴드
+    if ix.max.y < minuend.max.y {
+        out.push(DeviceIntRect::new(
+            DeviceIntPoint::new(minuend.min.x, ix.max.y),
+            DeviceIntPoint::new(minuend.max.x, minuend.max.y),
+        ));
+    }
+    // 좌측 밴드(교차 세로 구간만)
+    if minuend.min.x < ix.min.x {
+        out.push(DeviceIntRect::new(
+            DeviceIntPoint::new(minuend.min.x, ix.min.y),
+            DeviceIntPoint::new(ix.min.x, ix.max.y),
+        ));
+    }
+    // 우측 밴드(교차 세로 구간만)
+    if ix.max.x < minuend.max.x {
+        out.push(DeviceIntRect::new(
+            DeviceIntPoint::new(ix.max.x, ix.min.y),
+            DeviceIntPoint::new(minuend.max.x, ix.max.y),
+        ));
+    }
+    out
+}
+
+/// 감수 목록 전체를 순차 차감. 빈/역전 렉트는 자연 소거(밴드 조건이 걸러냄).
+fn region_subtract(
+    minuend: &[DeviceIntRect],
+    subtrahend: &[DeviceIntRect],
+) -> Vec<DeviceIntRect> {
+    let mut acc: Vec<DeviceIntRect> = minuend.to_vec();
+    for sub in subtrahend {
+        let mut next = Vec::with_capacity(acc.len());
+        for m in acc {
+            next.extend(subtract_rect(m, *sub));
+        }
+        acc = next;
+    }
+    acc
+}
+
+/// 버퍼 2개(FLIP_SEQUENTIAL) 기준 stale 영역 부기(버퍼-로컬 좌표, 스펙 §5.2).
+/// stale[i] = 버퍼 i가 놓친 갱신 영역. Present(D) 시 현재 버퍼는 완성(∅), 반대
+/// 버퍼에 D 누적, 쓰기 대상 교대. 과대(바운딩 붕괴)는 안전 — 이미 최신인 영역을
+/// 한 번 더 복사할 뿐. Task 1 G4 실측 로테이션이 다르면 이 모델을 그에 맞춘다.
+#[derive(Default)]
+#[allow(dead_code)] // Task 4가 소비
+struct StaleTracker {
+    stale: [Vec<DeviceIntRect>; 2],
+    cur: usize,
+}
+
+impl StaleTracker {
+    /// 이번 프레임(더티 frame_dirty)을 Present한 직후 호출.
+    #[allow(dead_code)] // Task 4가 소비
+    fn on_present(&mut self, frame_dirty: &[DeviceIntRect], full: DeviceIntRect) {
+        self.stale[self.cur].clear();
+        let other = 1 - self.cur;
+        self.stale[other].extend_from_slice(frame_dirty);
+        if self.stale[other].len() > MAX_STALE_RECTS {
+            let union = self.stale[other]
+                .iter()
+                .fold(None::<DeviceIntRect>, |acc, r| {
+                    Some(acc.map_or(*r, |a| a.union(r)))
+                })
+                .unwrap_or(full);
+            self.stale[other] = vec![union];
+        }
+        self.cur = other;
+    }
+
+    /// Present 직전 catch-up 복사 대상(= 현재 버퍼 stale − 이번 프레임 더티).
+    #[allow(dead_code)] // Task 4가 소비
+    fn catchup_rects(&self, frame_dirty: &[DeviceIntRect]) -> Vec<DeviceIntRect> {
+        region_subtract(&self.stale[self.cur], frame_dirty)
+    }
+
+    #[allow(dead_code)] // Task 4가 소비
+    fn reset(&mut self) {
+        self.stale[0].clear();
+        self.stale[1].clear();
+        self.cur = 0;
+    }
+}
+
 /// SERVO_COMPOSITOR_DCOMP 값의 세부 모드. "surface"=가상 서피스 전용(구 경로 A/B),
 /// 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1318,6 +1420,55 @@ mod tests {
 
     fn r(x0: i32, y0: i32, x1: i32, y1: i32) -> DeviceIntRect {
         DeviceIntRect::new(DeviceIntPoint::new(x0, y0), DeviceIntPoint::new(x1, y1))
+    }
+
+    #[test]
+    fn region_subtract_cases() {
+        // 비겹침: 그대로
+        assert_eq!(region_subtract(&[r(0,0,10,10)], &[r(20,20,30,30)]), vec![r(0,0,10,10)]);
+        // 완전 포함: 공집합
+        assert!(region_subtract(&[r(0,0,10,10)], &[r(0,0,10,10)]).is_empty());
+        assert!(region_subtract(&[r(2,2,8,8)], &[r(0,0,10,10)]).is_empty());
+        // 부분 겹침(우하단 조각): 면적 보존 검증 — 결과 면적 = 10*10 - 5*5
+        let out = region_subtract(&[r(0,0,10,10)], &[r(5,5,15,15)]);
+        let area: i32 = out.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        assert_eq!(area, 100 - 25);
+        // 결과 조각이 서로 겹치지 않고 subtrahend와도 겹치지 않는다
+        for (i, a) in out.iter().enumerate() {
+            assert!(a.intersection(&r(5,5,15,15)).is_none());
+            for b in out.iter().skip(i + 1) {
+                assert!(a.intersection(b).is_none());
+            }
+        }
+        // 여러 감수 렉트 순차 차감
+        let out = region_subtract(&[r(0,0,100,10)], &[r(10,0,20,10), r(30,0,40,10)]);
+        let area: i32 = out.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        assert_eq!(area, 1000 - 100 - 100);
+    }
+
+    #[test]
+    fn stale_tracker_bookkeeping() {
+        let full = r(0, 0, 100, 100);
+        let mut st = StaleTracker::default();
+        // 첫 전면 Present: 반대 버퍼가 전면 stale
+        st.on_present(&[full], full);
+        // 이번 프레임 좌반만 갱신 → catch-up = 전면 − 좌반 = 우반
+        let catchup = st.catchup_rects(&[r(0,0,50,100)]);
+        let area: i32 = catchup.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        assert_eq!(area, 100*100 - 50*100);
+        // 그 부분 프레임 Present 후: 반대 버퍼(방금 전면이었던 쪽)의 stale = 좌반
+        st.on_present(&[r(0,0,50,100)], full);
+        let catchup = st.catchup_rects(&[]);
+        let area: i32 = catchup.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        assert_eq!(area, 50*100);
+        // 전면 더티 프레임의 catch-up은 공집합 (Global Constraints: 순수 월 0바이트)
+        assert!(st.catchup_rects(&[full]).is_empty());
+        // stale 32개 초과 → 바운딩 유니온 붕괴 (과대 안전)
+        let mut st = StaleTracker::default();
+        for i in 0..40 {
+            st.on_present(&[r(i*2, 0, i*2+1, 1)], full);
+        }
+        assert!(st.stale[st.cur].len() <= 32 + 1);
     }
 
     #[test]
