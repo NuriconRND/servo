@@ -121,6 +121,8 @@ end_frame:
 컬링으로 하위 슬라이스 제거 → **DWM 1레이어 + flip = probe 동형**.
 MPO/DirectFlip 승격 자격 발생(보너스).
 
+(2026-07-15 후속: 레이어 컬링은 결함으로 판명되어 제거됨 — 2026-07-14-dcomp-mixed-content-design.md §11 참조)
+
 ### 5.3 혼합 콘텐츠 (동영상+텍스트+도형)
 
 - 같은 슬라이스 내: WR 콘텐츠 패스가 z-순서 배칭으로 합성(불투명 front-to-back

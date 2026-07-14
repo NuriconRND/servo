@@ -229,3 +229,105 @@ readback(알파 타일 draw 결과)
 - 결함② WR급 판정 시의 본수정(게이트 결과에 따름).
 - Ctrl+F12 오버레이, 디바이스 로스트 로그 폭주 본수정, §4.5 다중 창.
 - AMD 3중 A/B 실측·해석, 10+α 커밋 푸시 결정(사용자).
+
+## 11. 구현 결과 (사후 기록, 2026-07-15)
+
+### 11.1 PoC 게이트 (Task 1)
+
+G1~G4 전부 PASS. `CreateSwapChainForComposition` + `FLIP_SEQUENTIAL` 생성 확인(G1),
+**`GetBuffer(1)` 읽기가 `CopySubresourceRegion` 소스로 성립**(G2 — §5.1의 HALT
+미지수 해소, 부분 Present 채택 확정), `Present1` DirtyRects 화면 정확(G3), 버퍼
+로테이션 실측 = **2버퍼 핑퐁**(G4 — Present 후 `GetBuffer(0)`은 그 Present 직전
+내용, 스펙 §5.1-4 예상 그대로).
+
+### 11.2 부분 Present 채택 (기본 on)
+
+승격 스왑체인을 FLIP_SEQUENTIAL로 전환, catch-up = `stale[버퍼] − 이번 프레임
+더티`(정확한 렉트 차집합, 겹치는 부분은 복사 제외) 복사 후 `Present1` 더티렉트
+힌트(`MAX_PRESENT_DIRTY_RECTS`/`MAX_STALE_RECTS=16` 초과 시 서피스 전체 1렉트로
+붕괴). 45타일 월 실측: 초기 검증 present-partial **478회**(withhold 0, 실패 0,
+2.5분 재생) + Task 7 5분 소크 재확인 **596건** 중 **catchup=0(완전 더티 프레임,
+복사 0바이트) 41건(6.9%)**, 나머지 555건(93%)은 catchup 1~16 렉트(30fps 콘텐츠의
+정상적 부분 갱신 케이던스) — "전면 더티 프레임은 복사 0" 요구를 실측으로 확인.
+
+### 11.3 강등 폴백 (실측)
+
+승격 위생(`PROMOTE_MIN_AGE_FRAMES=30`, 쿨다운 중 streak 누적 중단)과 강등 3조건
+(첫 Present 전 withhold 30 연속 / 첫 Present 후 부분 Present 불가 상태 withhold
+30 연속 / catch-up·Present1 즉시 DXGI 오류) 전부 실기 확인. **타입1**(부분
+Present 강제 비활성, `full=33`)·**타입2**(withhold 장기화, `full=120`) 둘 다
+재현, **지수 쿨다운 300→600→1200 프레임을 벽시계로 실측 일치**(재승격 간격은
+근사 일치 — 원 5s/9s 대비 실측 4s/10s, 에스컬레이션 공식·카운트·픽셀 정확성은
+정확히 일치). 쿨다운 중 streak 누적 중단은 §6.3 정합대로 리뷰 픽스에서 반영·
+재검증됨.
+
+### 11.4 결함② 판정 — 스펙의 가설과 실제 원인이 달랐음
+
+스펙 §1/§7이 세운 가설("비불투명 슬라이스의 비디오·텍스트 합성 경로 결함", WR
+draw 층 용의)은 **기각됨**. `SERVO_DCOMP_READBACK` 계측 + `dcomp_alpha_probe.html`
+재현으로 확정한 실제 원인은 우리 층의 결함 2건:
+
+- **(a)** 선행 사이클(`2026-07-14-dcomp-swapchain-content-design.md` §5.3 레이어
+  컬링)이 WR `is_opaque`를 "클립 완전 피복 보장" 힌트로 오용 — 실제로는 backdrop
+  힌트일 뿐이라, 클립은 완전 피복이지만 내부적으로 작게만 그리는 슬라이스(하트비트
+  점 2×2, 상단 스트립만 페인트)가 하위의 실콘텐츠(비디오·티커)를 컬링(surf0
+  1012회 등).
+- **(b)** `AddVisual(TRUE, NULL)` 호출이 MS 문서상 NULL 레퍼런스 특례로 형제
+  visual들 "아래"에 삽입되어 **z-순서 전체가 역전**(:2055) — 월/probe는 유효
+  visual이 1개뿐이라 무증상이었고, 그래서 선행 사이클 검증을 통과했었음.
+
+수정: (b) `AddVisual` `insertAbove` TRUE→FALSE(1플래그, NULL 레퍼런스 의미론
+주석 보존) + (a) **컬링 전면 제거(A-1)**. 중간 시도 A-2(실측 타일 extent 기준
+dense-tile 술어로 컬링을 건전화)는 리뷰에서 Critical로 적발 — 가상공간 extent
+(~16384px) 대 디바이스공간 clip의 좌표계 이중성으로 영구 미발동(단일 좌표계
+테스트가 이를 못 잡는 맹점) — 폐기하고 최종적으로 A-1(제거)만 채택.
+
+**이는 선행 스펙 `2026-07-14-dcomp-swapchain-content-design.md` §5.3(레이어
+컬링)의 기능 반전이다.** 근거: `is_opaque`가 클립 피복을 보장하지 않음(실측
+확정), 월 정상상태에서 컬링이 실제로 발동한 사례가 0(시작 과도기 42건뿐 — 편익
+자체가 실측상 없음), A-2 시도가 드러낸 좌표계 이중성. `cull_covered`/
+`cull_disabled`/`SERVO_DCOMP_NO_CULL` 게이트는 코드와 함께 완전 소멸(+23/-126).
+
+### 11.5 수용 기준 결과 (§9 대조)
+
+1. **mixed_media_demo(=1) 45초**: 영상 6개·시계 1초 갱신·티커 스크롤·자막 애니
+   전부 정상, 동결 0, withhold 무한 부재, panic 0 — **PASS**.
+2. **quad_promote_partial 회귀 + 강등/재승격**: 기본(부분 Present, 강등 0)·
+   `NO_PARTIAL_PRESENT`(강등 3회+쿨다운 300/600/1200) 양팔 픽셀 정확 — **PASS**.
+3. **45타일 순수 월 무회귀(=1)**: lockstep 45/45(5분 후 완전 일치, 시작 시
+   ±1 이내), 메모리 플랫(~4.7GB, ±150MB 진동, 누수 없음), PresentMon
+   `Composed: Flip` 2575/2575(100%), catch-up 복사 0(완전 더티 프레임) 41건 실측
+   — **PASS**. (부기: 초기 관측된 fps 절대치 "0.33/0.26" 소동은 측정
+   앨리어싱으로 판명·정정됨 — 샘플 간격 30.37초가 소스 루프 주기와 우연히
+   일치해 프레임 카운터가 정확히 1랩 돌아 보임. 랩 보정 및 클린 재측정 결과
+   on≈29.96~30.0fps / off≈29.9~30.05fps로 **콘텐츠 정격 30fps 그대로 정상** —
+   무회귀 판정에 영향 없음, 후속 조사 불요로 종결.)
+4. **=surface/off 무회귀**: 전 요소 표시(=surface는 기지 backdrop 아티팩트만
+   재확인 — 범위가 티커바까지 확장 관찰됐으나 hybrid·프로덕션 무영향; off는
+   기준선과 바이트 등가 경로) — **PASS**.
+5. **부분 Present 단위검증**: `cargo test -p servo-paint --lib --features
+   paint_api/no-wgl dcomp` **7/7 PASS**(region_subtract/StaleTracker/승격 위생/
+   강등 쿨다운/붕괴 포함, Task 6b에서 컬링 전용 테스트 2개 삭제로 9→7).
+6. **패키징**: ServoWallPackage.zip 재생성 완료 — servoshell.exe 최신 빌드
+   교체, `mixed_media_demo.html` + `dcomp_alpha_probe.html` 추가, `run_wall.ps1`
+   AMD 판독 가이드에 "성능 A/B는 순수 비디오 월 페이지로, mixed_media_demo는
+   정확성 확인 전용" 주의 명기.
+
+### 11.6 이월
+
+- `=surface` 전용 캡션/티커 backdrop 검정(반투명 자막·티커 배경이 순수 검정 —
+  hybrid(=1)·프로덕션 경로 무영향, 진단 모드 한정 기지 결함 재확인만, 본수정
+  범위 밖).
+- 지속 Present 실패 시 `frame_dirty` 무한 성장(Task 4 Minor — MAX_STALE_RECTS
+  붕괴로 상한은 적용됐으나 근본 정리는 미해결) + regen 영구 차단 시
+  `frame_dirty` 누적(서피스 자체가 동결 상태라 외견상 무해).
+- Ctrl+F12 오버레이 미표시, 디바이스 로스트 로그 폭주 본수정, §4.5 다중 창
+  레지스트리 — 기존 이월 그대로 유지.
+- AMD 3중 A/B 실측·해석은 사용자 몫(패키지 판독 가이드 갱신 완료, §11.5-6 참조).
+
+### 11.7 커밋 범위
+
+`d8b1c57cb..c09817cc8`(15커밋 — Task 1 PoC부터 Task 6b A-1 컬링 제거까지, 스펙·
+계획 문서 커밋 `3a8d6b9bf`/`b31327a45` 별도), 선행 스왑체인 콘텐츠 사이클
+10커밋(`03946de91..21f6dab41`) 위 로컬. HEAD `c09817cc8`, 전부 미푸시 — 푸시는
+AMD 실측 후 사용자 결정 대기(선행 사이클과 동일 정책).
