@@ -465,14 +465,19 @@ fn self_copy_catchup(
 
 /// Present1 + DirtyRects 힌트(스펙 §5.2-3). 16 초과·공집합이면 힌트 없이 전체.
 fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
+    // 클램프 먼저, 그 결과가 퇴화(폭/높이 0 이하)면 스킵 — self_copy_catchup과 동일 순서.
+    // (완전히 버퍼 밖인 렉트가 클램프 후 퇴화 RECT로 Present1에 전달되는 것을 방지.)
     let rects: Vec<RECT> = dirty
         .iter()
-        .filter(|r| r.max.x > r.min.x && r.max.y > r.min.y)
-        .map(|r| RECT {
-            left: r.min.x.max(0),
-            top: r.min.y.max(0),
-            right: r.max.x.min(sc.size.width),
-            bottom: r.max.y.min(sc.size.height),
+        .filter_map(|r| {
+            let left = r.min.x.max(0);
+            let top = r.min.y.max(0);
+            let right = r.max.x.min(sc.size.width);
+            let bottom = r.max.y.min(sc.size.height);
+            if right <= left || bottom <= top {
+                return None;
+            }
+            Some(RECT { left, top, right, bottom })
         })
         .collect();
     let use_hint = !rects.is_empty() && rects.len() <= MAX_PRESENT_DIRTY_RECTS;
@@ -1330,22 +1335,40 @@ impl Compositor for DCompNativeCompositor {
                             }
                         }
                     } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
+                        // 첫 콘텐츠 Present 여부는 성공 처리 전에 계산(성공 시 content_attached가
+                        // 바뀌므로 stale 시딩 판정에 원본 값이 필요).
+                        let first_content_present = !sc.content_attached;
+                        // frame_dirty는 hr 판정 전에 take — Present 실패 시 복원한다(버퍼가
+                        // 로테이트되지 않았으므로 이 더티 영역은 이후 성공하는 Present의 부기에
+                        // 반드시 합류해야 함 — 드롭하면 stale 과소 기록으로 잔상 결함).
+                        let dirty = std::mem::take(&mut sc.frame_dirty);
                         // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
                         let hr = unsafe { (*sc.swapchain.as_ptr()).Present(0, 0) };
                         if hr < 0 {
                             warn!("[dcomp-native] Present failed (hr=0x{:08x})", hr as u32);
+                            // 실패 → 미로테이트. 누적 더티를 복원해 다음 프레임 push와 병합.
+                            sc.frame_dirty = dirty;
                         } else {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
-                            // stale 부기(스펙 §5.2): 이번 프레임 전면 더티를 Present했으므로
-                            // 반대 버퍼가 이 전체를 놓친 것으로 기록(부분 Present 재개 시 catch-up
-                            // 재료). frame_dirty는 반드시 take — 다음 프레임 부기 오염 방지.
+                            // stale 부기(스펙 §5.2): Present한 갱신 영역을 반대 버퍼가 놓친
+                            // 것으로 기록(부분 Present 재개 시 catch-up 재료).
                             let full = DeviceIntRect::new(
                                 DeviceIntPoint::zero(),
                                 DeviceIntPoint::new(sc.size.width, sc.size.height),
                             );
-                            let dirty = std::mem::take(&mut sc.frame_dirty);
-                            sc.stale.on_present(&dirty, full);
+                            // 첫 콘텐츠 Present는 반대 버퍼가 한 번도 백버퍼였던 적이 없어
+                            // 전면 stale로 시딩한다. coverage는 withhold 누적으로도 full에
+                            // 도달할 수 있어(withhold는 frame_dirty를 비우고 coverage만 유지)
+                            // 이번 프레임 더티가 extent의 진부분집합일 수 있기 때문. 매 전면
+                            // Present마다 full 시딩하면 과복사(효율 목표 훼손)라 이 프레임에만 한정.
+                            let full_seed = [full];
+                            let seed: &[DeviceIntRect] = if first_content_present {
+                                &full_seed
+                            } else {
+                                &dirty
+                            };
+                            sc.stale.on_present(seed, full);
                             if !sc.content_attached {
                                 // 첫 완전 프레젠트 → visual 콘텐츠를 스왑체인으로 전환.
                                 // Safety: visual/swapchain 살아있음.
