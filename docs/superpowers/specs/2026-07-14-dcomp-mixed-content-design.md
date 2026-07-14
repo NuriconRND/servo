@@ -322,9 +322,12 @@ dense-tile 술어로 컬링을 건전화)는 리뷰에서 Critical로 적발 —
 - `=surface` 전용 캡션/티커 backdrop 검정(반투명 자막·티커 배경이 순수 검정 —
   hybrid(=1)·프로덕션 경로 무영향, 진단 모드 한정 기지 결함 재확인만, 본수정
   범위 밖).
-- 지속 Present 실패 시 `frame_dirty` 무한 성장(Task 4 Minor — MAX_STALE_RECTS
-  붕괴로 상한은 적용됐으나 근본 정리는 미해결) + regen 영구 차단 시
-  `frame_dirty` 누적(서피스 자체가 동결 상태라 외견상 무해).
+- ~~regen 영구 차단 시 `frame_dirty` 누적~~ → **최종 리뷰 픽스로 해소**(§11.8-2,
+  geometry_changed 분기 클램프). 잔여 미세 한계 1건(최종 리뷰 판정 Minor·작위적):
+  regen 차단 중 32렉트 초과 붕괴가 발생한 뒤 지오메트리가 regen 없이 옛 extent로
+  정확히 복귀하는 경우, 과대 붕괴된 frame_dirty가 catch-up 차집합의 감수로 쓰여
+  유니온 틈에서 1프레임급 일시 stale 가능(자가 치유). 향후 강화 옵션: 이 분기
+  붕괴 발동 시 `partial_present=false` 2줄.
 - Ctrl+F12 오버레이 미표시, 디바이스 로스트 로그 폭주 본수정, §4.5 다중 창
   레지스트리 — 기존 이월 그대로 유지.
 - AMD 3중 A/B 실측·해석은 사용자 몫(패키지 판독 가이드 갱신 완료, §11.5-6 참조).
@@ -343,3 +346,10 @@ AMD 실측 후 사용자 결정 대기(선행 사이클과 동일 정책).
   않음 — 첫 content-swap에서 이미 소모됨)를 별도 제3상태로 명시 식별 — 시딩
   불가로 판정해 단발 로그(영어) 후 해당 서피스의 강등 처리 자체를 보류
   (`demote_blocked`), content-swap 성공 또는 regen에서 재판정.
+- Important #2(geometry_changed 지속 시 `frame_dirty` 무한 성장) 해결: 해당
+  분기에서 `collapse_dirty_if_oversized(take, MAX_STALE_RECTS)` 클램프 —
+  성장 상한 = 32렉트 + 1프레임 분. 잔여 미세 한계는 §11.6 참조.
+- Minor 반영: 부분 Present 실패 시 dirty 드롭의 안전 근거 주석화,
+  SetContent(swapchain) 실패 warn을 스왑체인당 1회로 게이트(regen 재장전).
+- 확인 재리뷰 판정: **Ready to merge YES** (2026-07-15, fable 최종 리뷰어 —
+  healthy 서피스 wedge 불가·상태 수명주기 정합 재추적 검증).
