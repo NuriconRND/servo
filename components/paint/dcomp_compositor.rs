@@ -261,6 +261,27 @@ fn tiles_are_dense(tile_count: usize, tile_size: DeviceIntSize, extent_size: Dev
         == extent_size.width as i64 * extent_size.height as i64
 }
 
+/// 스펙 §6.3: 강등 n회째(1부터 시작, `entry.demote_count`를 saturating_add한 이후 값)의
+/// 재승격 쿨다운(프레임) = BASE × 2^min(n−1,4), 상한 CAP. n=0은 saturating_add 이후
+/// 정상 경로로는 도달하지 않지만(항상 ≥1) 방어적으로 시프트 0(BASE)으로 처리한다.
+fn demote_cooldown(demote_count: u32) -> u64 {
+    let shift = demote_count.saturating_sub(1).min(4);
+    (DEMOTE_COOLDOWN_BASE << shift).min(DEMOTE_COOLDOWN_CAP)
+}
+
+/// 보강 항목 1: 렉트 벡터가 상한을 넘으면 바운딩 유니온 1개로 붕괴(과대=안전).
+/// 전면 Present 실패로 인한 frame_dirty 복원이 지속 실패 하에서 무한정 커지는 것을
+/// 막는다(StaleTracker::on_present와 동일 원칙 — 근사 아님, 손상 없음).
+fn collapse_dirty_if_oversized(mut rects: Vec<DeviceIntRect>, limit: usize) -> Vec<DeviceIntRect> {
+    if rects.len() <= limit {
+        return rects;
+    }
+    let union = rects
+        .drain(..)
+        .fold(None::<DeviceIntRect>, |acc, r| Some(acc.map_or(r, |a| a.union(&r))));
+    union.into_iter().collect()
+}
+
 /// 레이어 컬링: entries는 add_surface 순서(z 아래→위)의 (device 클립, 불투명 여부).
 /// 최상위부터 훑어, 불투명 클립이 완전히 포함하는 하위 항목을 숨긴다.
 /// 알파(불투명 아님) 항목은 절대 숨겨지지 않는 것이 아니라 — 알파 항목도 "위의
@@ -395,6 +416,15 @@ struct SwapChainStorage {
     stale: StaleTracker,
     /// 이 스왑체인에서 부분 Present 사용 가능(GetBuffer(1) 프로브 성공 + env 미차단).
     partial_present: bool,
+    /// 스펙 §8/보강 항목 2: 전면 Present(Present(0,0)) 실패 warn을 이 스왑체인 인스턴스당
+    /// 1회로 제한한다. 지속 실패(예: 디바이스 로스트) 시 coverage가 계속 "전면"으로 남아
+    /// 이 분기가 매 프레임 재진입되므로, 무가드면 기존에 기록된 로그 폭주 함정이 재발한다.
+    /// 강등 성공(storage 교체) 또는 재승격(새 인스턴스)에서 자연 리셋된다.
+    warned_present_fail: bool,
+    /// 보강 항목 2: 강등 시딩(§6.2) 실패 warn을 이 스왑체인 인스턴스당 1회로 제한한다.
+    /// 시딩이 지속 실패하면(예: 디바이스 로스트) 강등 자체가 매 프레임 재시도되므로
+    /// 무가드면 동일하게 로그 폭주한다.
+    warned_demote_seed_fail: bool,
 }
 
 /// content-swap 시 1회: GetBuffer(1)이 이 환경에서 열리는지 프로브(스펙 §3 '런타임 자격').
@@ -494,6 +524,239 @@ fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
         return false;
     }
     true
+}
+
+/// §6.2-1: 승격 후 스왑체인 buffer 0에 그려진 적 있는 영역을 fallback_virtual로 복사해
+/// 최신화한다(첫 콘텐츠 Present 전 강등 — visual은 계속 fallback을 표시하므로 끊김 없음).
+/// 시딩 대상 타일 = coverage.covered_tiles(전면 갱신 누적) ∪ frame_dirty(전면 Present
+/// 실패 복원분)가 겹치는 타일 — 둘 다 `tiles`(entry의 현재 유효 타일)로 필터링한다.
+/// 타일 단위 과대 복사는 안전(그 안의 미갱신 픽셀도 함께 복사될 뿐 — 승격 후 한 번도
+/// 그려진 적 없는 타일은 애초에 이 목록에 없다). 반환: 실패 시 fallback을 sc에 되돌리고
+/// None(스왑체인 유지) — 어느 경우든 EndDraw는 매 BeginDraw 성공 이후 반드시 호출한다.
+fn demote_seed_into_fallback(
+    ctx: *mut ID3D11DeviceContext,
+    sc: &mut SwapChainStorage,
+    tiles: &std::collections::HashSet<(i32, i32)>,
+    virtual_offset: DeviceIntPoint,
+    tile_size: DeviceIntSize,
+) -> Option<ComOwned<IDCompositionVirtualSurface>> {
+    let fallback = sc.fallback_virtual.take()?;
+
+    let mut seed_tiles: std::collections::HashSet<(i32, i32)> = sc
+        .coverage
+        .covered_tiles
+        .iter()
+        .copied()
+        .filter(|t| tiles.contains(t))
+        .collect();
+    for buf_rect in &sc.frame_dirty {
+        // 버퍼-로컬(가상 − anchor) → 가상좌표로 되돌려 겹치는 타일을 시딩 대상에 합류.
+        let virt = DeviceIntRect::new(
+            DeviceIntPoint::new(buf_rect.min.x + sc.anchor.x, buf_rect.min.y + sc.anchor.y),
+            DeviceIntPoint::new(buf_rect.max.x + sc.anchor.x, buf_rect.max.y + sc.anchor.y),
+        );
+        for &t in tiles {
+            if seed_tiles.contains(&t) {
+                continue;
+            }
+            let tr = tile_virtual_rect(virtual_offset, tile_size, t.0, t.1);
+            if tr.intersection(&virt).is_some() {
+                seed_tiles.insert(t);
+            }
+        }
+    }
+
+    if seed_tiles.is_empty() {
+        // 승격 후 전면 타일이 한 번도 기록되지 않았고 실패-복원 잔여도 없음 → fallback이
+        // 이미 최신(승격 시점 콘텐츠 그대로) — 복사 없이 성공 처리.
+        return Some(fallback);
+    }
+
+    // buffer 0(승격 이후 Present가 한 번도 성공하지 않아 로테이션 0 = 모든 부분 draw 누적).
+    let buffer0 = unsafe {
+        let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+        let hr = (*sc.swapchain.as_ptr()).GetBuffer(
+            0,
+            &ID3D11Texture2D::uuidof(),
+            &mut tex as *mut _ as *mut _,
+        );
+        if hr < 0 || tex.is_null() {
+            warn!("[dcomp-native] demote fallback seed: GetBuffer(0) failed (hr=0x{:08x})", hr as u32);
+            sc.fallback_virtual = Some(fallback);
+            return None;
+        }
+        tex
+    };
+
+    let vsurf = fallback.as_ptr();
+    let mut ok = true;
+    for &(tx, ty) in &seed_tiles {
+        let tile_rect = tile_virtual_rect(virtual_offset, tile_size, tx, ty);
+        // BeginDraw는 가상공간 절대좌표 RECT(기존 bind Virtual arm과 동일 규약).
+        let update = RECT {
+            left: tile_rect.min.x,
+            top: tile_rect.min.y,
+            right: tile_rect.max.x,
+            bottom: tile_rect.max.y,
+        };
+        // Safety: fallback은 살아있는 IDCompositionVirtualSurface(위에서 take한 소유물).
+        let (dst_tex, update_offset) = unsafe {
+            let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+            let mut off = POINT { x: 0, y: 0 };
+            let hr = (*vsurf).BeginDraw(&update, &ID3D11Texture2D::uuidof(), &mut tex as *mut _ as *mut _, &mut off);
+            if hr < 0 || tex.is_null() {
+                warn!("[dcomp-native] demote fallback seed: BeginDraw failed (hr=0x{:08x})", hr as u32);
+                ok = false;
+                break;
+            }
+            (tex, off)
+        };
+        // 소스 박스 = 버퍼-로컬(가상 − anchor). 타일은 항상 스왑체인 extent(=coverage 판정
+        // 근거인 entry.tiles의 union) 내부이므로 클램프 없이 그대로 사용한다.
+        let src_box = D3D11_BOX {
+            left: (tile_rect.min.x - sc.anchor.x) as u32,
+            top: (tile_rect.min.y - sc.anchor.y) as u32,
+            front: 0,
+            right: (tile_rect.max.x - sc.anchor.x) as u32,
+            bottom: (tile_rect.max.y - sc.anchor.y) as u32,
+            back: 1,
+        };
+        // Safety: ctx/buffer0/dst_tex 모두 살아있음. dst_tex는 BeginDraw가 AddRef했으므로
+        // 사용 후 Release. target rect == BeginDraw rect라 dest 좌표는 update_offset 그대로
+        // (target − BeginDraw origin = 0).
+        unsafe {
+            (*ctx).CopySubresourceRegion(
+                dst_tex as *mut _, 0, update_offset.x as u32, update_offset.y as u32, 0,
+                buffer0 as *mut _, 0, &src_box,
+            );
+            (*(dst_tex as *mut IUnknown)).Release();
+            let hr = (*vsurf).EndDraw();
+            if hr < 0 {
+                warn!("[dcomp-native] demote fallback seed: EndDraw failed (hr=0x{:08x})", hr as u32);
+                ok = false;
+            }
+        }
+        if !ok {
+            break;
+        }
+    }
+    // Safety: GetBuffer(0)가 AddRef한 버퍼를 한 번 반납.
+    unsafe {
+        (*(buffer0 as *mut IUnknown)).Release();
+    }
+
+    if !ok {
+        sc.fallback_virtual = Some(fallback);
+        return None;
+    }
+    Some(fallback)
+}
+
+/// §6.2-2: 새 가상 서피스를 만들어 buffer 0 전체를 복사하고, visual.SetContent(virtual) +
+/// 오프셋/클립 재적용까지 같은 Commit에서 원자적으로 전환한다(content-swap과 동일 정본).
+/// 반환: 실패 시 각 단계에서 확보한 자원을 정리(ComOwned Drop) 후 None(스왑체인 유지).
+fn demote_seed_new_virtual(
+    dcomp_device: *mut IDCompositionDevice,
+    ctx: *mut ID3D11DeviceContext,
+    sc: &SwapChainStorage,
+    visual: &ComOwned<IDCompositionVisual>,
+    last_placement: Option<LastPlacement>,
+    is_opaque: bool,
+    virtual_offset: DeviceIntPoint,
+) -> Option<ComOwned<IDCompositionVirtualSurface>> {
+    let alpha_mode = if is_opaque {
+        DXGI_ALPHA_MODE_IGNORE
+    } else {
+        DXGI_ALPHA_MODE_PREMULTIPLIED
+    };
+    // Safety: dcomp_device는 살아있는 IDCompositionDevice(호출자가 확보).
+    let vsurf = unsafe {
+        let mut raw: *mut IDCompositionVirtualSurface = ptr::null_mut();
+        let hr = (*dcomp_device).CreateVirtualSurface(
+            VIRTUAL_SURFACE_SIZE as u32,
+            VIRTUAL_SURFACE_SIZE as u32,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            alpha_mode,
+            &mut raw,
+        );
+        if hr < 0 || raw.is_null() {
+            warn!("[dcomp-native] demote new-virtual seed: CreateVirtualSurface failed (hr=0x{:08x})", hr as u32);
+            return None;
+        }
+        ComOwned::from_raw(raw)?
+    };
+
+    // buffer 0(강등 직전 스왑체인의 최신 콘텐츠 — coverage.is_full 분기에서만 도달하므로
+    // 완전하거나, withhold/부분-Present-실패 경로에서도 §6.2-2 진입 시점엔 이미
+    // content_attached=true라 buffer 0은 마지막 전면 Present + 이후 누적 부분 draw = 완전).
+    let buffer0 = unsafe {
+        let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+        let hr = (*sc.swapchain.as_ptr()).GetBuffer(
+            0,
+            &ID3D11Texture2D::uuidof(),
+            &mut tex as *mut _ as *mut _,
+        );
+        if hr < 0 || tex.is_null() {
+            warn!("[dcomp-native] demote new-virtual seed: GetBuffer(0) failed (hr=0x{:08x})", hr as u32);
+            return None; // vsurf(ComOwned) Drop이 Release
+        }
+        tex
+    };
+
+    // BeginDraw는 가상공간 절대좌표: 스왑체인 extent(anchor..anchor+size)를 그대로 이식.
+    let update = RECT {
+        left: sc.anchor.x,
+        top: sc.anchor.y,
+        right: sc.anchor.x + sc.size.width,
+        bottom: sc.anchor.y + sc.size.height,
+    };
+    // Safety: vsurf/ctx/buffer0 모두 살아있음.
+    let drew = unsafe {
+        let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
+        let mut off = POINT { x: 0, y: 0 };
+        let hr = (*vsurf.as_ptr()).BeginDraw(&update, &ID3D11Texture2D::uuidof(), &mut tex as *mut _ as *mut _, &mut off);
+        if hr < 0 || tex.is_null() {
+            warn!("[dcomp-native] demote new-virtual seed: BeginDraw failed (hr=0x{:08x})", hr as u32);
+            false
+        } else {
+            let src_box = D3D11_BOX {
+                left: 0, top: 0, front: 0,
+                right: sc.size.width as u32, bottom: sc.size.height as u32, back: 1,
+            };
+            (*ctx).CopySubresourceRegion(
+                tex as *mut _, 0, off.x as u32, off.y as u32, 0,
+                buffer0 as *mut _, 0, &src_box,
+            );
+            (*(tex as *mut IUnknown)).Release();
+            let hr = (*vsurf.as_ptr()).EndDraw();
+            if hr < 0 {
+                warn!("[dcomp-native] demote new-virtual seed: EndDraw failed (hr=0x{:08x})", hr as u32);
+                false
+            } else {
+                true
+            }
+        }
+    };
+    // Safety: GetBuffer(0)가 AddRef한 버퍼를 한 번 반납.
+    unsafe {
+        (*(buffer0 as *mut IUnknown)).Release();
+    }
+    if !drew {
+        return None; // vsurf(ComOwned) Drop이 Release
+    }
+
+    // SetContent + 오프셋/클립 재적용(같은 Commit에서 원자 전환 — content-swap :1370-1393 정본).
+    // Safety: visual/vsurf 살아있음.
+    let hr = unsafe { (*visual.as_ptr()).SetContent(vsurf.as_ptr() as *const IUnknown) };
+    if hr < 0 {
+        warn!("[dcomp-native] demote new-virtual seed: SetContent failed (hr=0x{:08x})", hr as u32);
+        return None;
+    }
+    if let Some(placement) = last_placement {
+        // 강등 후 표시는 가상좌표 콘텐츠(content_anchor=zero) — Virtual arm과 동일 산식.
+        apply_visual_placement(visual, placement, virtual_offset, DeviceIntPoint::zero());
+    }
+    Some(vsurf)
 }
 
 /// 서피스 콘텐츠의 백엔드. 기본은 `Virtual`(가상 서피스), 연속 전면 갱신 서피스는
@@ -1258,8 +1521,8 @@ impl Compositor for DCompNativeCompositor {
         // 모아 루프 밖에서 처리한다.
         //  - promote_requests: Virtual → SwapChain 신규 승격 (id, 승격 extent)
         //  - regen_requests: 리사이즈 등으로 지오메트리가 바뀐 기존 SwapChain 재생성 (id, 새 extent)
-        //  - demote_requests: 부분 Present 런타임 실패 → 강등 대상(스펙 §5.3). 본처리는 Task 5;
-        //    이 태스크는 선언 + push + warn만(unused 방지, 의미론은 아직 미결).
+        //  - demote_requests: withhold 임계·전면/부분 Present 런타임 실패 → 강등 대상
+        //    (스펙 §6.1). 처리(가상 서피스 시딩 + 쿨다운)는 이 함수 뒤쪽 강등 루프.
         let mut promote_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
         let mut regen_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
         let mut demote_requests: Vec<NativeSurfaceId> = Vec::new();
@@ -1345,12 +1608,25 @@ impl Compositor for DCompNativeCompositor {
                         // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
                         let hr = unsafe { (*sc.swapchain.as_ptr()).Present(0, 0) };
                         if hr < 0 {
-                            warn!("[dcomp-native] Present failed (hr=0x{:08x})", hr as u32);
+                            if !sc.warned_present_fail {
+                                warn!("[dcomp-native] Present failed (hr=0x{:08x})", hr as u32);
+                                sc.warned_present_fail = true;
+                            }
                             // 실패 → 미로테이트. 누적 더티를 복원해 다음 프레임 push와 병합.
-                            sc.frame_dirty = dirty;
+                            // 보강 항목 1: coverage가 계속 "전면"으로 남아 지속 실패 시 이 분기가
+                            // 매 프레임 재진입 → frame_dirty가 매 프레임 누적되어 무한정 커질 수
+                            // 있다. 상한 초과분은 바운딩 유니온 1개로 붕괴(과대 복사는 안전).
+                            sc.frame_dirty = collapse_dirty_if_oversized(dirty, MAX_STALE_RECTS);
+                            // 스펙 §8: DXGI 호출 실패는 per-surface warn-once + 즉시 강등 대상
+                            // (§6.1 표에 이 Present(0,0) 실패가 명시 나열되진 않았지만, §8의
+                            // 일반 정책이 모든 DXGI/DComp 호출 실패에 적용된다 — 보강 항목 2).
+                            // 강등 시딩이 실패해도(스왑체인 유지) coverage.is_full은 그대로라
+                            // 다음 프레임 이 분기가 재시도한다 — warn은 위에서 이미 1회로 제한.
+                            demote_requests.push(*id);
                         } else {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
+                            sc.warned_present_fail = false;
                             // stale 부기(스펙 §5.2): Present한 갱신 영역을 반대 버퍼가 놓친
                             // 것으로 기록(부분 Present 재개 시 catch-up 재료).
                             let full = DeviceIntRect::new(
@@ -1439,6 +1715,11 @@ impl Compositor for DCompNativeCompositor {
                         // coverage는 비우지 않는다 — 누적 의미론 유지(스펙 §6.2-1 시딩 근거).
                         sc.frame_dirty.clear();
                         sc.withheld_frames += 1;
+                        if sc.withheld_frames >= DEMOTE_AFTER_WITHHOLD {
+                            // 스펙 §6.1: 첫 Present 전이면 무조건, 후면 부분 Present 불가
+                            // 상태에서만 이 분기에 도달한다(가능 상태는 위 분기가 소비).
+                            demote_requests.push(*id);
+                        }
                         if sc.withheld_frames == WITHHOLD_WARN_FRAMES {
                             warn!(
                                 "[dcomp-native] surface {:?}: swapchain present withheld for {} frames \
@@ -1493,6 +1774,8 @@ impl Compositor for DCompNativeCompositor {
                     frame_dirty: Vec::new(),
                     stale: StaleTracker::default(),
                     partial_present: false,
+                    warned_present_fail: false,
+                    warned_demote_seed_fail: false,
                 }),
             );
             if let SurfaceStorage::Virtual { virtual_surface } = old {
@@ -1542,6 +1825,9 @@ impl Compositor for DCompNativeCompositor {
                     sc.frame_dirty.clear();
                     sc.stale.reset();
                     sc.partial_present = false; // 재프로브(새 스왑체인의 GetBuffer(1) 자격 재확인)
+                    // 새 스왑체인 인스턴스 — 보강 항목 2의 per-swapchain warn 가드도 재무장.
+                    sc.warned_present_fail = false;
+                    sc.warned_demote_seed_fail = false;
                     if dcomp_debug() {
                         log::info!(
                             "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
@@ -1552,14 +1838,73 @@ impl Compositor for DCompNativeCompositor {
             }
         }
 
-        // 강등 요청(루프 밖): 부분 Present 런타임 실패(스펙 §5.3) — 본처리(가상 서피스로
-        // 되돌리기 + 쿨다운)는 Task 5. 이 태스크는 가시화만(warn) 남긴다.
-        for id in demote_requests {
-            warn!(
-                "[dcomp-native] surface {:?}: partial present failed at runtime; \
-                 demotion requested (handling deferred to Task 5)",
-                id
-            );
+        // 강등(스펙 §6, 루프 밖): 스왑체인 → 가상 서피스 복귀. 시딩으로 표시 최신성을
+        // 보장한 뒤에만 storage를 교체한다(시딩 실패 시 스왑체인 동결 유지 — 화면에
+        // 나타나는 콘텐츠는 항상 완전·최신이어야 한다는 불변조건).
+        // 발동원(§6.1): (a) 첫 콘텐츠 Present 전 withhold 30 (b) Present 후 부분 Present
+        // 불가 상태의 withhold 30 (c) 부분 Present 런타임 실패(즉시, Task 4) (d) 전면
+        // Present DXGI 실패(즉시, 보강 항목 2 — §8 일반 정책).
+        for surface_id in demote_requests {
+            let Some(dcomp_device) = self.dcomp_device_ptr() else { break };
+            let ctx = self.d3d11_context.as_ref().map(ComOwned::as_ptr);
+            let Some(entry) = self.surfaces.get_mut(&surface_id) else { continue };
+            let is_opaque = entry.is_opaque;
+            let virtual_offset = entry.virtual_offset;
+            let tile_size = entry.tile_size;
+            let last_placement = entry.last_placement;
+            let SurfaceStorage::SwapChain(sc) = &mut entry.storage else { continue };
+            release_frame_pbuffer(&rc, sc);
+
+            let Some(ctx) = ctx else {
+                // GetImmediateContext는 COM 계약상 실패하지 않는다고 간주되지만(구조체
+                // 필드 주석 참조) 방어적으로 처리 — 시딩 불가, 스왑체인 동결 유지.
+                if !sc.warned_demote_seed_fail {
+                    warn!(
+                        "[dcomp-native] demote {:?}: no D3D11 context; keeping swapchain (frozen)",
+                        surface_id
+                    );
+                    sc.warned_demote_seed_fail = true;
+                }
+                continue;
+            };
+
+            let seeded = if !sc.content_attached {
+                // §6.2-1: fallback_virtual 생존 — 누적 더티 영역(타일 단위, 과대 안전)만
+                // buffer 0에서 복사해 최신화. visual은 계속 fallback을 표시하므로 끊김 없음.
+                demote_seed_into_fallback(ctx, sc, &entry.tiles, virtual_offset, tile_size)
+            } else {
+                // §6.2-2: 새 가상 서피스 생성 + buffer 0 전체 복사 + SetContent 원자 전환.
+                demote_seed_new_virtual(
+                    dcomp_device, ctx, sc, &entry.visual, last_placement, is_opaque, virtual_offset,
+                )
+            };
+            let Some(new_virtual) = seeded else {
+                if !sc.warned_demote_seed_fail {
+                    warn!(
+                        "[dcomp-native] demote seeding failed for {:?}; keeping swapchain (frozen)",
+                        surface_id
+                    );
+                    sc.warned_demote_seed_fail = true;
+                }
+                continue;
+            };
+
+            // storage 교체(스펙 §6.4): ComOwned Drop이 옛 스왑체인을 Release한다 — visual에는
+            // 이미 fallback(케이스 1, 승격 후 한 번도 SetContent 안 됨) 또는 새 virtual
+            // (케이스 2, 방금 SetContent 완료)이 붙어 있으므로 안전. displayed_anchor는
+            // storage와 함께 소멸하고 Virtual arm의 content_anchor=zero 산식이 자동 적용된다.
+            entry.storage = SurfaceStorage::Virtual { virtual_surface: new_virtual };
+            entry.demote_count = entry.demote_count.saturating_add(1);
+            let cooldown = demote_cooldown(entry.demote_count);
+            entry.promote_blocked_until = self.frame_counter + cooldown;
+            entry.promote_streak = 0;
+            entry.frame_coverage.reset();
+            if dcomp_debug() {
+                log::info!(
+                    "[dcomp-dbg] demote id={:?} count={} cooldown={}",
+                    surface_id, entry.demote_count, cooldown
+                );
+            }
         }
 
         // 레이어 컬링: 최상위 불투명 클립이 완전히 덮는 하위 visual을 트리에서 제외.
@@ -1775,5 +2120,29 @@ mod tests {
         let e = surface_extent(&tiles, vo, ts).unwrap();
         assert_eq!(e, r(16384, 16384, 16384 + 2048, 16384 + 1024));
         assert!(surface_extent(&Default::default(), vo, ts).is_none());
+    }
+
+    #[test]
+    fn demote_cooldown_exponential_with_cap() {
+        // 스펙 §6.3: BASE × 2^min(n-1,4), 상한 CAP.
+        assert_eq!(demote_cooldown(1), 300);
+        assert_eq!(demote_cooldown(2), 600);
+        assert_eq!(demote_cooldown(3), 1200);
+        assert_eq!(demote_cooldown(4), 2400);
+        assert_eq!(demote_cooldown(5), 3600); // 4800 -> 3600으로 상한 클램프
+        assert_eq!(demote_cooldown(10), 3600); // 시프트가 4에서 더 안 자람 -> 동일 클램프
+        // 방어적 경로(정상 흐름에선 도달 안 함): n=0도 시프트 0(BASE)으로 처리.
+        assert_eq!(demote_cooldown(0), 300);
+    }
+
+    #[test]
+    fn collapse_dirty_if_oversized_bounds_growth() {
+        // 상한 이하면 그대로 통과.
+        let small = vec![r(0, 0, 10, 10), r(20, 20, 30, 30)];
+        assert_eq!(collapse_dirty_if_oversized(small.clone(), 32), small);
+        // 상한 초과면 바운딩 유니온 1개로 붕괴(과대=안전).
+        let many: Vec<DeviceIntRect> = (0..40).map(|i| r(i * 2, 0, i * 2 + 1, 1)).collect();
+        let out = collapse_dirty_if_oversized(many, 32);
+        assert_eq!(out, vec![r(0, 0, 79, 1)]);
     }
 }
