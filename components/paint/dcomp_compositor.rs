@@ -551,6 +551,14 @@ fn demote_seed_into_fallback(
         .collect();
     for buf_rect in &sc.frame_dirty {
         // 버퍼-로컬(가상 − anchor) → 가상좌표로 되돌려 겹치는 타일을 시딩 대상에 합류.
+        //
+        // 불변량(리뷰 Minor #2): 이 "겹치는 타일 전체" 복사가 안전한 것은 현재의 모든
+        // 타입-1 도달 경로에서 frame_dirty가 (a) 빈 상태(withhold 분기가 push 전에
+        // clear)이거나 (b) 전면 커버(전면 Present 실패 복원 = coverage.is_full 프레임의
+        // 더티)이기 때문이다 — 즉 frame_dirty가 걸치는 타일은 buffer 0에 그 타일 전체가
+        // 기록돼 있다. 부분 frame_dirty를 가진 신규 타입-1 트리거를 추가할 경우 이
+        // 전체-타일 복사는 buffer 0의 미기록 영역(쓰레기)을 fallback에 시딩할 수 있다 —
+        // 그때는 복사 범위를 frame_dirty 교집합으로 제한하거나 이 불변량을 유지할 것.
         let virt = DeviceIntRect::new(
             DeviceIntPoint::new(buf_rect.min.x + sc.anchor.x, buf_rect.min.y + sc.anchor.y),
             DeviceIntPoint::new(buf_rect.max.x + sc.anchor.x, buf_rect.max.y + sc.anchor.y),
@@ -686,9 +694,13 @@ fn demote_seed_new_virtual(
         ComOwned::from_raw(raw)?
     };
 
-    // buffer 0(강등 직전 스왑체인의 최신 콘텐츠 — coverage.is_full 분기에서만 도달하므로
-    // 완전하거나, withhold/부분-Present-실패 경로에서도 §6.2-2 진입 시점엔 이미
-    // content_attached=true라 buffer 0은 마지막 전면 Present + 이후 누적 부분 draw = 완전).
+    // buffer 0의 완전성은 강등 트리거별로 다르다(리뷰 Important #1):
+    //  - withhold 임계·Present1 실패·전면 Present 실패 경로: 마지막 성공 Present 이후
+    //    버퍼 미로테이트 — buffer 0 = 마지막 전면 상태 + 이후 누적 부분 draw = 완전.
+    //  - catch-up 복사 실패 후 즉시 강등 경로만 예외: 직전 Present1로 로테이트된
+    //    buffer 0의 미catch-up 영역(직전 프레임 더티)이 1프레임 구본이다. 스펙 §6.2
+    //    수용 사항("직전 프레임 더티 영역이 1프레임 구본으로 시딩될 수 있음") — 해당
+    //    영역은 직전에 갱신되던 콘텐츠라 재갱신 시 자가 치유되는 알려진 미세 한계.
     let buffer0 = unsafe {
         let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
         let hr = (*sc.swapchain.as_ptr()).GetBuffer(
@@ -1542,8 +1554,12 @@ impl Compositor for DCompNativeCompositor {
                         entry.drawn_frames = entry.drawn_frames.saturating_add(1);
                     }
                     // 승격 상태머신(스펙 §4): streak은 MIN_AGE 경과 후부터만 누적.
+                    // 스펙 §6.3 "쿨다운 중에는 streak 누적 자체를 중단" — 강등 쿨다운이
+                    // 남아 있으면 누적하지 않는다(만료 시점에 즉시 재승격하지 않고, 만료
+                    // 후 새로 PROMOTE_STREAK 프레임의 전면 갱신을 다시 채워야 승격).
                     entry.promote_streak = if frame_full
                         && entry.drawn_frames > PROMOTE_MIN_AGE_FRAMES
+                        && self.frame_counter >= entry.promote_blocked_until
                     {
                         entry.promote_streak + 1
                     } else {
