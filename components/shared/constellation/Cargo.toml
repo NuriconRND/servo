@@ -47,4 +47,6 @@ uuid = { workspace = true }
 webgpu_traits = { workspace = true, optional = true }
 webrender_api = { workspace = true }
 wgpu-core = { workspace = true, optional = true }
-zeroize = { workspace = true }
+# zeroize_derive: this crate derives ZeroizeOnDrop itself; do not rely on
+# feature unification from sibling crates (breaks leaf-package cargo test).
+zeroize = { workspace = true, features = ["zeroize_derive"] }
