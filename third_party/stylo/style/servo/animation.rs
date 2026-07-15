@@ -30,7 +30,8 @@ use crate::values::computed::TimingFunction;
 use crate::values::generics::easing::BeforeFlag;
 use crate::values::specified::TransitionBehavior;
 use crate::Atom;
-use debug_unreachable::debug_unreachable;
+// [수정] debug_unreachable 은 경계 패닉 근본원인이던 None-arm 을 안전 폴백으로 교체하면서
+// 더 이상 사용하지 않는다(자세한 내용은 get_property_declaration_at_time 참조).
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use servo_arc::Arc;
@@ -853,8 +854,23 @@ impl Animation {
         // Progress clamped to the current iteration [0.0, 1.0].
         let total_progress = progress.min(self.current_iteration_end_progress()).max(0.0);
 
-        // At 1.0 there is nothing left to interpolate. Return end keyframe.
-        if total_progress == 1.0 {
+        // At/near 1.0 there is nothing left to interpolate. Return end keyframe.
+        //
+        // [수정 - 경계 패닉 근본원인] 아래 position() 탐색(:876/:886)은 total_progress 를
+        // f32 로 캐스팅해 start_percentage(f32)와 비교한다. total_progress 가 f64 로는
+        // 1.0 미만이지만 (1 - 2^-25, 1.0) 구간에 있으면 (total_progress as f32) 가 정확히
+        // 1.0f32 로 반올림된다. 그러면 Normal 방향에서 마지막 키프레임의 start_percentage
+        // 도 1.0f32 이므로 `(tp as f32) < 1.0` 가 모든 스텝에서 거짓 -> position()==None ->
+        // 아래 debug_unreachable(release=UB) -> computed_steps[len] out-of-bounds 패닉.
+        // (무한 애니메이션이 여러 시간 반복하면 (now-started_at)/duration 의 부동소수 위상이
+        // 언젠가 이 폭 2^-25 창을 샘플한다. 실측: complex_media_stress.html 의 6-키프레임
+        // capSlide 가 ~3.5h 후 animation.rs:359 에서 index 6/len 6 패닉.)
+        //
+        // 따라서 기존의 f64 `== 1.0` 정확 비교로는 이 창을 놓친다. position() 이 쓰는 것과
+        // 동일한 f32 캐스팅 기준으로 경계를 판정해, (tp as f32) >= 1.0 이면 보간을 건너뛰고
+        // 종단 키프레임을 그대로 적용한다. 이 가드 이후로는 (tp as f32) 가 항상 1.0 미만이라
+        // position() 은 언제나 Some 를 돌려준다(아래 None-arm 은 심층 방어로만 남음).
+        if (total_progress as f32) >= 1.0 {
             let keyframe = match self.current_direction {
                 AnimationDirection::Normal => self.computed_steps.last().unwrap(),
                 AnimationDirection::Reverse => self.computed_steps.first().unwrap(),
@@ -905,14 +921,22 @@ impl Animation {
 
         let prev_keyframe = &self.computed_steps[prev_keyframe_index];
         let Some(next_keyframe_index) = next_keyframe_index else {
-            unsafe {
-                debug_unreachable!(
-                    "next_keyframe_index should always be Some: \
-                     total_progress is in [0, 1) at this point. \
-                     Normal direction: keyframe with start_percentage 1.0 always satisfies. \
-                     Reverse direction: keyframe with start_percentage 0.0 always satisfies."
-                );
-            }
+            // [수정 - 심층 방어] 원래 이 자리는 `unsafe { debug_unreachable!(...) }` 로,
+            // release 빌드에서는 unreachable_unchecked (= 정의되지 않은 동작/UB) 였다.
+            // next_keyframe_index 가 실제로 None 이 되면(위 f32 캐스팅 경계 누수) 최적화기가
+            // Some 를 가정한 채 poison 된 usize(실측 6 == len)로 진행 -> computed_steps 인덱스
+            // 초과 패닉으로 Script 스레드가 죽었다(animation.rs:359).
+            // Fix A(:857 f32 경계 가드)로 근본원인을 이미 막았으므로 정상 경로에서는 도달 불가
+            // 하지만, 어떤 부동소수 경계에서도 UB 대신 안전하게 종단 키프레임을 적용하고 반환한다.
+            // (:857 조기 반환과 동일한 CSS 의미: progress 1.0 은 종단 키프레임 값. Normal=마지막,
+            // Reverse=첫 키프레임.)
+            let keyframe = match self.current_direction {
+                AnimationDirection::Normal => self.computed_steps.last().unwrap(),
+                AnimationDirection::Reverse => self.computed_steps.first().unwrap(),
+                _ => unreachable!("Current animation direction can only be `normal` or `reverse`."),
+            };
+            add_declarations_to_map(keyframe);
+            return;
         };
 
         // Prevent division by zero from percentage_between_keyframes.
