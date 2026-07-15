@@ -151,10 +151,50 @@ if ($Src -ne "") {
     $url += "&src=" + [Uri]::EscapeDataString($Src)
 }
 
+# Task 10c: when -MoveX/-MoveY position the window onto a target monitor, $WindowSize is
+# meant as that monitor/tile's footprint (the OUTER window rect should end up matching
+# it, e.g. "1920x1080" for a 1080p tile) -- NOT the CLIENT size servoshell's
+# --window-size argument actually requests (winit's with_inner_size(), i.e. servoshell
+# always creates the window at exactly the requested CLIENT size, chrome added on top).
+# Compute the OS title-bar/border delta via AdjustWindowRectEx (no throwaway window
+# needed -- decorations are a fixed style, not content-dependent) and subtract it BEFORE
+# the process is created, so the window is born at its final client size and never
+# resizes afterward. This replaces the old approach of creating at $WindowSize and then
+# shrinking the client with a post-creation SetWindowPos resize, which is what produced
+# the runtime client-size change these Task 10 fixes eliminate (frozen DComp virtual-
+# surface stale content -- .superpowers/sdd/task-10-report.md section 5,
+# task-10b-report.md). Without a move (leave-where-it-opens case) $WindowSize is used
+# as-is, unchanged from before.
+$requestedWindowSize = $WindowSize
+if ($MoveX -ge 0 -and $MoveY -ge 0) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class ServoWallDeco {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] public static extern bool AdjustWindowRectEx(ref RECT lpRect, uint dwStyle, bool bMenu, uint dwExStyle);
+}
+'@
+    $WS_OVERLAPPEDWINDOW = 0x00CF0000
+    $rect = New-Object ServoWallDeco+RECT
+    $rect.Left = 0; $rect.Top = 0
+    $targetParts = $WindowSize -split 'x'
+    $targetW = [int]$targetParts[0]
+    $targetH = [int]$targetParts[1]
+    $rect.Right = $targetW; $rect.Bottom = $targetH
+    [ServoWallDeco]::AdjustWindowRectEx([ref]$rect, $WS_OVERLAPPEDWINDOW, $false, 0) | Out-Null
+    $deltaW = ($rect.Right - $rect.Left) - $targetW
+    $deltaH = ($rect.Bottom - $rect.Top) - $targetH
+    $innerW = $targetW - $deltaW
+    $innerH = $targetH - $deltaH
+    $requestedWindowSize = "${innerW}x${innerH}"
+    Write-Host "Decoration delta = ${deltaW}x${deltaH}; requesting client size $requestedWindowSize so outer window fits target $WindowSize at ($MoveX,$MoveY)"
+}
+
 Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads, dcomp=$dcompMode)"
 Write-Host "Log: $logPath"
 
-$proc = Start-Process -FilePath $servoExe -ArgumentList @("--window-size", $WindowSize, $url) `
+$proc = Start-Process -FilePath $servoExe -ArgumentList @("--window-size", $requestedWindowSize, $url) `
     -RedirectStandardError $logPath -PassThru
 
 Start-Sleep -Seconds 10
@@ -162,8 +202,22 @@ Start-Sleep -Seconds 10
 # Optionally move the REAL window (class 'Window Class'; winit also creates a helper
 # window that must not be targeted) and bring it to the foreground. An occluded window
 # gets render-throttled, so foregrounding matters for a valid display.
+#
+# IMPORTANT (Task 10c): this must be a PURE MOVE -- position only, SWP_NOSIZE set --
+# and must NOT pass a width/height to resize the window. servoshell creates the window
+# with winit's with_inner_size(), i.e. $WindowSize is already the CLIENT (inner) size;
+# the OS then adds title bar/border chrome on top, so the window's OUTER rect is larger
+# than $WindowSize from the very first frame (e.g. requested client 1920x1080 => outer
+# ~1936x1119). A prior version of this script re-issued SetWindowPos with cx/cy =
+# $WindowSize (1920x1080) as the new OUTER size, which shrank the CLIENT area to
+# ~1904x1041 (outer minus chrome) a few hundred ms after window creation. On the
+# DComp virtual-surface compositor path that post-creation client-size change leaves
+# stale/frozen content in the region the old layout painted but the new layout no
+# longer covers (see .superpowers/sdd/task-10-report.md section 5, task-10b-report.md).
+# Wall deployments never resize at runtime, so a size-changing move here was the ONLY
+# source of a runtime client-size change -- removing it makes the client size constant
+# for the lifetime of the process, which eliminates that stale-content class entirely.
 if ($MoveX -ge 0 -and $MoveY -ge 0) {
-    $sizeParts = $WindowSize -split 'x'
     Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -176,13 +230,17 @@ public class ServoWallWnd {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hgt, uint flags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    public static void Move(uint targetPid, int x, int y, int w, int hgt) {
+    public static void Move(uint targetPid, int x, int y) {
         EnumWindows((h, l) => {
             uint pid; GetWindowThreadProcessId(h, out pid);
             if (pid == targetPid && IsWindowVisible(h)) {
                 var sb = new StringBuilder(256); GetClassName(h, sb, 256);
                 if (sb.ToString() == "Window Class") {
-                    SetWindowPos(h, IntPtr.Zero, x, y, w, hgt, 0x0040);
+                    // SWP_NOSIZE (0x0001): position only, w/h args are ignored by the
+                    // API when this flag is set -- the window's size (client + chrome)
+                    // as established at creation time is left untouched.
+                    // SWP_SHOWWINDOW (0x0040): unchanged from before.
+                    SetWindowPos(h, IntPtr.Zero, x, y, 0, 0, 0x0001 | 0x0040);
                     SetForegroundWindow(h);
                     return false;
                 }
@@ -192,7 +250,7 @@ public class ServoWallWnd {
     }
 }
 '@
-    [ServoWallWnd]::Move($proc.Id, $MoveX, $MoveY, [int]$sizeParts[0], [int]$sizeParts[1])
+    [ServoWallWnd]::Move($proc.Id, $MoveX, $MoveY)
 }
 
 # Sanity markers from the first seconds of the log.
