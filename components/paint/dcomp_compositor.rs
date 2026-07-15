@@ -131,6 +131,23 @@ fn tile_visible_virtual_rect(
     tile_rect.intersection(&clip_v).unwrap_or(tile_rect)
 }
 
+/// Task 10: 불투명 서피스의 visual 클립을 이 서피스가 실제 그린 영역(content_valid_union,
+/// device 좌표)으로 좁힌다. 비불투명이거나 유니온 미집계(None)면 원 클립 그대로. 유니온과의
+/// 교차가 비면(정상 워크로드에선 발생 안 함) 원 클립으로 폴백해 과소 클립(콘텐츠 소멸)을 피한다.
+fn refine_opaque_clip(
+    clip_rect: DeviceIntRect,
+    is_opaque: bool,
+    content_valid_union: Option<DeviceIntRect>,
+) -> DeviceIntRect {
+    if !is_opaque {
+        return clip_rect;
+    }
+    match content_valid_union {
+        Some(u) => clip_rect.intersection(&u).unwrap_or(clip_rect),
+        None => clip_rect,
+    }
+}
+
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
 const MAX_PRESENT_DIRTY_RECTS: usize = 16;
 const MAX_STALE_RECTS: usize = 32;
@@ -846,6 +863,10 @@ struct SurfaceEntry {
     promote_blocked_until: u64,
     /// Virtual bind 프레임에서 부분 더티는 frame_coverage 집계에 미등록 — 별도 플래그로 "그려짐" 추적.
     frame_drawn_partial: bool,
+    /// Task 10: 이 서피스가 실제로 bind한 타일 valid 영역(device 좌표)의 바운딩 유니온(누적).
+    /// 불투명 phantom 서피스의 그려지지 않은 영역 합성을 억제하기 위한 clip 좁힘 근거
+    /// (add_surface의 refine_opaque_clip). None=아직 미집계. destroy_tile(지오메트리 변경)에서 리셋.
+    content_valid_union: Option<DeviceIntRect>,
 }
 
 /// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
@@ -1282,6 +1303,7 @@ impl Compositor for DCompNativeCompositor {
                 demote_count: 0,
                 promote_blocked_until: 0,
                 frame_drawn_partial: false,
+                content_valid_union: None,
             }
         };
 
@@ -1307,6 +1329,8 @@ impl Compositor for DCompNativeCompositor {
         // Trim 최적화는 후속(고정 크기 월 창에서는 타일 집합이 안정적) — 여기서는 부기만 갱신.
         if let Some(entry) = self.surfaces.get_mut(&id.surface_id) {
             entry.tiles.remove(&(id.x, id.y));
+            // Task 10: 타일 집합(지오메트리) 변경 → 누적 valid 유니온 무효화 후 재집계.
+            entry.content_valid_union = None;
         }
     }
 
@@ -1340,6 +1364,22 @@ impl Compositor for DCompNativeCompositor {
             Some(p) => (Some(p.clip_rect), p.transform_offset),
             None => (None, (0.0, 0.0)),
         };
+
+        // Task 10: 이 bind의 device valid 영역을 서피스 누적 유니온에 합류(스케일=1).
+        // device 타일 원점 = (id.x*tile_w, id.y*tile_h) (virtual_offset은 device 변환에서 상쇄),
+        // valid_rect는 타일-로컬. 퇴화(빈) valid는 무시. 불투명 phantom clip 좁힘의 근거.
+        if valid_rect.max.x > valid_rect.min.x && valid_rect.max.y > valid_rect.min.y {
+            let dev_ox = id.x * entry.tile_size.width;
+            let dev_oy = id.y * entry.tile_size.height;
+            let dvalid = DeviceIntRect::new(
+                DeviceIntPoint::new(dev_ox + valid_rect.min.x, dev_oy + valid_rect.min.y),
+                DeviceIntPoint::new(dev_ox + valid_rect.max.x, dev_oy + valid_rect.max.y),
+            );
+            entry.content_valid_union = Some(match entry.content_valid_union {
+                Some(u) => u.union(&dvalid),
+                None => dvalid,
+            });
+        }
 
         match &mut entry.storage {
             SurfaceStorage::SwapChain(sc) => {
@@ -1733,6 +1773,21 @@ impl Compositor for DCompNativeCompositor {
             SurfaceStorage::SwapChain(sc) => sc.displayed_anchor.unwrap_or(DeviceIntPoint::zero()),
             SurfaceStorage::Virtual { .. } => DeviceIntPoint::zero(),
         };
+
+        // Task 10 근본원인(스펙 2026-07-15 실측): 티커 바의 불투명 슬라이스(바 배경 + 속보
+        // 라벨)는 "phantom"이다 — 스크롤 텍스트가 타일에 겹쳐 WR이 그 타일들을 알파로 분류하고
+        // 콘텐츠 대부분을 알파 동반 서피스로 보내므로, 불투명 서피스는 타일 1개 남짓만 bind되는데
+        // 그 DXGI_ALPHA_MODE_IGNORE visual은 WR 슬라이스 클립(= device_clip ∩ 슬라이스 전체 타일
+        // valid의 유니온, composite.rs:1043)으로 바 전체를 덮는다. 결과: 그려지지 않은 영역이
+        // DComp 가상 서피스의 미초기화/재활용 pool 메모리를 불투명하게 노출(검정·이전 텍스트 잔상).
+        //
+        // 수정: 불투명 서피스는 visual 클립을 WR 슬라이스 클립 대신 "이 서피스가 실제로 bind한
+        // 타일 valid 영역의 device 바운딩 유니온"(content_valid_union)으로 교차해 좁힌다. 이는 Draw
+        // 경로가 타일별 device_valid_rect로 per-tile 클립하는 것(renderer/mod.rs:3737)과 등가 근사이며,
+        // phantom(미도색) 영역이 합성되지 않게 한다. 전면 피복 불투명 서피스(비디오 그리드 등)는
+        // 유니온 == 전체 클립이라 무변화(순수 월 무회귀). 비불투명 서피스는 알파 블렌딩으로 미도색
+        // 영역이 자연 투명(Task 9 처리)이라 대상 아님.
+        let clip_rect = refine_opaque_clip(clip_rect, entry.is_opaque, entry.content_valid_union);
 
         // content-swap 시 재적용할 수 있게 배치를 기록.
         let placement = LastPlacement {
@@ -2364,6 +2419,24 @@ mod tests {
         // 가시 우변이 18304에서 18204로 100 줄어든다(좌변은 타일 좌변 17408이 지배).
         let vis2 = tile_visible_virtual_rect(tile, Some(clip), (100.0, 0.0), vo);
         assert_eq!(vis2, r(17408, 17408, 18204, 17464));
+    }
+
+    #[test]
+    fn refine_opaque_clip_clips_phantom_to_drawn_region() {
+        // Task 10: 티커 불투명 phantom 재현. WR 슬라이스 클립 = 바 전체(0,937)-(1904,1041),
+        // 이 서피스가 실제 그린 영역(라벨 바닥 슬라이버) = (0,1024)-(121,1041).
+        let wr_clip = r(0, 937, 1904, 1041);
+        let drawn = r(0, 1024, 121, 1041);
+        // 불투명 + 유니온 있음 → 그린 영역으로 좁힘(phantom 미도색 영역 합성 방지).
+        assert_eq!(refine_opaque_clip(wr_clip, true, Some(drawn)), r(0, 1024, 121, 1041));
+        // 비불투명 → 원 클립 유지(알파는 Task 9 투명 처리 담당).
+        assert_eq!(refine_opaque_clip(wr_clip, false, Some(drawn)), wr_clip);
+        // 유니온 미집계(None, add_surface 이전 첫 프레임) → 원 클립 폴백.
+        assert_eq!(refine_opaque_clip(wr_clip, true, None), wr_clip);
+        // 전면 피복 불투명(비디오 그리드: 유니온 == 클립) → 무변화(순수 월 무회귀 보장).
+        assert_eq!(refine_opaque_clip(wr_clip, true, Some(wr_clip)), wr_clip);
+        // 교차 비면(비정상) → 원 클립 폴백(콘텐츠 소멸 방지).
+        assert_eq!(refine_opaque_clip(wr_clip, true, Some(r(5000, 5000, 5100, 5100))), wr_clip);
     }
 
     #[test]
