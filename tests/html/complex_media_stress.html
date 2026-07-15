@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>복합 미디어 스트레스 — 12영상+이중티커+PiP+통계+스크롤러</title>
+<style>
+  /* 관례: 불투명 배경, 비디오 그리드는 100vh 단일 플로우 블록(flex-wrap),
+     오버레이는 전부 fixed. float 금지, rAF 하트비트 필수. */
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Malgun Gothic", ui-sans-serif, sans-serif;
+  }
+
+  /* ── 비디오 그리드 (베이스, 불투명 슬라이스) ── */
+  #grid {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: #000;
+  }
+  #grid video {
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    object-fit: fill;
+    background: #000;
+  }
+
+  /* ── 상단 정보 바 (fixed 오버레이) ── */
+  #topbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 7vh;
+    z-index: 6;
+    background: #101820;
+    color: #e8edf2;
+    display: flex;
+    align-items: center;
+    gap: 1.6vw;
+    padding: 0 1.2vw;
+    box-sizing: border-box;
+    border-bottom: 2px solid #2a3b4d;
+  }
+  #logo {
+    width: 4vh; height: 4vh;
+    background: linear-gradient(135deg, #ff6a00, #ffc400);
+    animation: spin 5s linear infinite;
+  }
+  @keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+  #title { font-size: 2.8vh; font-weight: 700; }
+  #live {
+    margin-left: auto;
+    display: flex; align-items: center; gap: 0.5vw;
+    font-size: 2.4vh; font-weight: 700; color: #ff4545;
+  }
+  #live .dot {
+    width: 1.5vh; height: 1.5vh; border-radius: 50%;
+    background: #ff4545;
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.6); opacity: 0.35; } }
+  #clock { font-size: 2.8vh; font-variant-numeric: tabular-nums; color: #9fd4ff; }
+
+  /* ── 상단 서브 티커 (topbar 바로 아래, 좌→우 역방향, 36s) ── */
+  #subticker {
+    position: fixed;
+    top: 7vh; left: 0; right: 0;
+    height: 4.5vh;
+    z-index: 5;
+    background: rgba(16, 24, 32, 0.85);
+    overflow: hidden;
+    border-bottom: 1px solid #22303f;
+  }
+  #subticker .track {
+    position: absolute;
+    top: 50%; transform: translateY(-50%);
+    white-space: nowrap;
+    color: #ffd479;
+    font-size: 2.6vh;
+    will-change: transform;
+    animation: tickRev 36s linear infinite;
+  }
+  @keyframes tickRev {
+    from { transform: translate(-100%, -50%); }
+    to   { transform: translate(100vw, -50%); }
+  }
+
+  /* ── 하단 메인 티커 (우→좌, 24s) ── */
+  #tickerbar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 9vh;
+    z-index: 6;
+    background: #0b1220;
+    border-top: 2px solid #2a3b4d;
+    display: flex; align-items: center;
+    overflow: hidden;
+  }
+  #tickerlabel {
+    flex: 0 0 auto;
+    height: 100%;
+    display: flex; align-items: center;
+    padding: 0 1.4vw;
+    background: #c8102e;
+    color: #fff;
+    font-size: 2.8vh; font-weight: 700;
+    z-index: 2;
+  }
+  #ticker {
+    position: absolute;
+    left: 0;
+    white-space: nowrap;
+    color: #dfe8f2;
+    font-size: 3vh;
+    will-change: transform;
+    animation: tick 24s linear infinite;
+  }
+  @keyframes tick { from { transform: translateX(100vw); } to { transform: translateX(-100%); } }
+
+  /* ── PiP 오버레이 영상 (좌하단, 알파 패널 위 비디오 — 구 결함 경로) ── */
+  #pip {
+    position: fixed;
+    left: 1.2vw; bottom: 11vh;
+    width: 20vw;
+    z-index: 7;
+    background: rgba(8, 14, 24, 0.72);
+    border: 2px solid #3a516b;
+    border-radius: 0.8vh;
+    padding: 0.5vw;
+    box-sizing: border-box;
+    will-change: transform;
+  }
+  #pip .caption { color: #9fd4ff; font-size: 1.9vh; padding-bottom: 0.3vh; }
+  #pip video { width: 100%; display: block; }
+
+  /* ── 통계 패널 (우상단, 4Hz JS 갱신 — 고빈도 부분 갱신) ── */
+  #stats {
+    position: fixed;
+    right: 1.2vw; top: 13vh;
+    width: 17vw;
+    z-index: 7;
+    background: rgba(10, 20, 35, 0.68);
+    border: 1px solid #2a3b4d;
+    border-radius: 0.8vh;
+    color: #cfe3f5;
+    font-size: 2vh;
+    padding: 1vh 1vw;
+    font-variant-numeric: tabular-nums;
+  }
+  #stats .row { display: flex; justify-content: space-between; padding: 0.3vh 0; }
+  #stats .val { color: #7dffb2; }
+  #statbar {
+    height: 1.2vh;
+    background: #16324a;
+    border-radius: 0.6vh;
+    overflow: hidden;
+    margin-top: 0.6vh;
+  }
+  #statbar .fill {
+    height: 100%;
+    background: linear-gradient(90deg, #2ea8ff, #7dffb2);
+    animation: grow 7s ease-in-out infinite alternate;
+  }
+  @keyframes grow { from { width: 12%; } to { width: 96%; } }
+
+  /* ── 세로 뉴스 스크롤러 (우하단, translateY 무한 스크롤) ── */
+  #newslist {
+    position: fixed;
+    right: 1.2vw; bottom: 11vh;
+    width: 17vw; height: 24vh;
+    z-index: 7;
+    background: rgba(10, 20, 35, 0.68);
+    border: 1px solid #2a3b4d;
+    border-radius: 0.8vh;
+    overflow: hidden;
+  }
+  #newslist .scroll {
+    position: absolute;
+    left: 0; right: 0;
+    will-change: transform;
+    animation: up 18s linear infinite;
+  }
+  @keyframes up { from { transform: translateY(24vh); } to { transform: translateY(-100%); } }
+  #newslist .item {
+    color: #e6eef7;
+    font-size: 1.9vh;
+    padding: 0.7vh 0.9vw;
+    border-bottom: 1px dashed #24384c;
+  }
+  #newslist .item b { color: #ffd479; }
+
+  /* ── 중앙 하단 자막 (반투명, 9s 슬라이드 페이드) ── */
+  #caption {
+    position: fixed;
+    left: 50%;
+    bottom: 12vh;
+    transform: translateX(-50%);
+    background: rgba(10, 20, 35, 0.55);
+    color: #fff;
+    font-size: 3vh; font-weight: 600;
+    padding: 1vh 2vw;
+    border-radius: 1vh;
+    text-shadow: 0 0 10px rgba(0,0,0,0.9);
+    animation: capSlide 9s ease-in-out infinite;
+    white-space: nowrap;
+    z-index: 8;
+  }
+  @keyframes capSlide {
+    0%, 12%   { opacity: 0; transform: translateX(-50%) translateY(2vh); }
+    20%, 80%  { opacity: 1; transform: translateX(-50%) translateY(0); }
+    88%, 100% { opacity: 0; transform: translateX(-50%) translateY(-1vh); }
+  }
+
+  /* rAF 하트비트 (필수) */
+  #hb { position: fixed; right: 0; bottom: 0; width: 2px; height: 2px; background: #000; z-index: 20; }
+
+  /* 동기 시작 커버 */
+  #cover {
+    position: fixed; inset: 0;
+    background: #000; z-index: 30;
+    display: flex; align-items: center; justify-content: center;
+    color: #555;
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 24px;
+  }
+</style>
+</head>
+<body>
+<div id="grid"></div>
+
+<div id="topbar">
+  <div id="logo"></div>
+  <div id="title">복합 스트레스 — 12영상 · 이중 티커 · PiP · 통계 · 스크롤러</div>
+  <div id="live"><span class="dot"></span>LIVE</div>
+  <div id="clock">--:--:--</div>
+</div>
+
+<div id="subticker"><div class="track">◆ 상단 서브 티커(역방향 36s) — DComp 부분 Present · 강등 폴백 · 승격 위생 경로 점검용 보조 흐름 텍스트 ◆ 알파 슬라이스 이중 스크롤 스트레스 ◆&nbsp;</div></div>
+
+<div id="pip">
+  <div class="caption">PiP 오버레이(알파 패널 위 비디오)</div>
+  <video id="pipv" muted loop playsinline preload="auto"></video>
+</div>
+
+<div id="stats">
+  <div class="row"><span>디코드 fps</span><span class="val" id="s1">--</span></div>
+  <div class="row"><span>큐 깊이</span><span class="val" id="s2">--</span></div>
+  <div class="row"><span>대역폭(MB/s)</span><span class="val" id="s3">--</span></div>
+  <div class="row"><span>드롭</span><span class="val" id="s4">--</span></div>
+  <div id="statbar"><div class="fill"></div></div>
+</div>
+
+<div id="newslist"><div class="scroll" id="newsscroll"></div></div>
+
+<div id="caption">복합 스트레스 자막 — 12영상 위 다중 알파 오버레이 동시 합성</div>
+
+<div id="tickerbar">
+  <div id="tickerlabel">속보</div>
+  <div id="ticker">멀티GPU 복합 스트레스 페이지 · 12개 영상 lockstep + 이중 티커(정/역방향) + PiP 알파 오버레이 영상 + 4Hz 통계 갱신 + 세로 스크롤러 + 시계/로고/자막 애니메이션 동시 구동 · 이 문장이 끊김·잔상 없이 흐르면 DComp 복합 합성 파이프라인 정상 ·&nbsp;</div>
+</div>
+
+<div id="hb"></div>
+<div id="cover">준비 중...</div>
+
+<script>
+  "use strict";
+
+  const params = new URLSearchParams(location.search);
+  const clampInt = (raw, fb) => {
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? Math.max(1, Math.min(16, n)) : fb;
+  };
+  const COLS = clampInt(params.get("cols"), 4);
+  const ROWS = clampInt(params.get("rows"), 3);
+  const TILE_COUNT = COLS * ROWS;
+  const DEFAULT_SRC = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  const srcParam = params.get("src");
+  const SRC = (srcParam && srcParam.trim()) ? srcParam.trim() : DEFAULT_SRC;
+
+  // 비디오 그리드
+  const grid = document.getElementById("grid");
+  const tileW = (100 / COLS) + "vw";
+  const tileH = (100 / ROWS) + "vh";
+  const videos = [];
+  for (let i = 0; i < TILE_COUNT; i++) {
+    const v = document.createElement("video");
+    v.muted = true; v.loop = true; v.playsInline = true; v.preload = "auto";
+    v.style.width = tileW; v.style.height = tileH;
+    v.src = SRC;
+    v.play().catch(() => {});
+    grid.appendChild(v);
+    videos.push(v);
+  }
+
+  // PiP 영상 (그리드와 별도 — 알파 패널 위)
+  const pipv = document.getElementById("pipv");
+  pipv.src = SRC;
+  pipv.play().catch(() => {});
+
+  // 시계 (1Hz)
+  const clock = document.getElementById("clock");
+  const two = (n) => String(n).padStart(2, "0");
+  setInterval(() => {
+    const d = new Date();
+    clock.textContent = two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+  }, 1000);
+
+  // 통계 패널 (4Hz — 고빈도 부분 갱신 스트레스; 값은 결정적 파형으로 생성)
+  let tick4 = 0;
+  setInterval(() => {
+    tick4++;
+    document.getElementById("s1").textContent = (29.2 + 1.6 * Math.sin(tick4 / 7)).toFixed(1);
+    document.getElementById("s2").textContent = String(8 + Math.round(6 * Math.abs(Math.sin(tick4 / 11))));
+    document.getElementById("s3").textContent = (38 + 20 * Math.abs(Math.sin(tick4 / 5))).toFixed(1);
+    document.getElementById("s4").textContent = String(Math.round(tick4 / 40));
+  }, 250);
+
+  // 세로 뉴스 스크롤러 아이템
+  const news = [
+    "12개 영상 타일 프레임 단위 lockstep 유지",
+    "부분 Present: 그려진 모든 프레임 즉시 표시",
+    "승격 위생: 시작 과도기 자명 승격 차단",
+    "강등 폴백: 지속 억류 시 가상 서피스 복귀",
+    "유령 불투명 슬라이스 클립 정제 적용",
+    "알파 미기록 밴드 투명 클리어 적용",
+    "런처 클라이언트 크기 불변 보장",
+    "AddVisual z-order 정방향 합성",
+  ];
+  const scroll = document.getElementById("newsscroll");
+  scroll.innerHTML = news.map((t, i) => `<div class="item"><b>${String(i + 1).padStart(2, "0")}</b> ${t}</div>`).join("");
+
+  // 동기 시작 커버 (PiP 포함 전체 재생 관측 시 해제)
+  const cover = document.getElementById("cover");
+  const allVideos = videos.concat([pipv]);
+  const syncBegin = performance.now();
+  const revealPoll = setInterval(() => {
+    const moving = allVideos.filter((v) => v.currentTime > 0).length;
+    const elapsed = ((performance.now() - syncBegin) / 1000) | 0;
+    cover.textContent = "준비 중... " + moving + "/" + allVideos.length + " (" + elapsed + "s)";
+    if (moving >= allVideos.length || elapsed > 90) {
+      clearInterval(revealPoll);
+      if (cover.parentNode) cover.parentNode.removeChild(cover);
+    }
+  }, 250);
+
+  // rAF 하트비트 (필수)
+  const hb = document.getElementById("hb");
+  let hbFrame = 0;
+  (function heartbeat() {
+    hbFrame++;
+    hb.style.background = (hbFrame & 1) ? "#000001" : "#000000";
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>
