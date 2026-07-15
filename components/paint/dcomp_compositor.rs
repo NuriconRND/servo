@@ -1514,19 +1514,36 @@ impl Compositor for DCompNativeCompositor {
                     return fail;
                 }
 
-                // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 아틀라스) 전체를
-                // 투명으로 클리어한다. 순차 bind/unbind(self.bound 단일) + 직전 타일 EndDraw 커밋
-                // 완료 → 이 아틀라스는 이 BeginDraw 전용 scratch이므로 전체 클리어가 안전하다.
-                // 시저 해제 후 전체 클리어(현재 시저 상태 무관) → WR draw_picture_cache_target이
-                // 이후 clear_target/set_blend/scissor를 매번 새로 세팅하므로 상태 desync 없음
-                // (WR device gl.rs: 시저·clear color·color write 모두 캐시 없는 &self 직접 호출).
+                // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 영역)를
+                // 투명으로 클리어한다. WR draw_picture_cache_target이 이후 clear_target/
+                // set_blend/scissor를 매번 새로 세팅하므로 상태 desync 없음(WR device gl.rs:
+                // 시저·clear color·color write 모두 캐시 없는 &self 직접 호출).
+                //
+                // 리뷰 하드닝(1) — 아틀라스 공유 위험: BeginDraw 텍스처는 DComp 아틀라스일 수
+                // 있어(다른 타일의 커밋된 영역이 다른 오프셋에 함께 들어있을 수 있음) 텍스처
+                // 전체 클리어는 미검증 구성에서 이웃 타일의 이미 커밋된 픽셀을 파괴할 위험이
+                // 있다. 이 BeginDraw가 실제로 소유한 영역만 [update_offset ..
+                // update_offset+update_rect_v.size()]으로 시저를 제한해 클리어하고, 클리어 후
+                // 시저를 다시 비활성화해 기존 앰비언트 상태(WR이 draw마다 자체 시저를 세팅)를
+                // 보존한다. 텍스처는 wrap 1:1이라 update_offset을 시저 y에 그대로 써도
+                // top-left 규약과 정합한다(unbind readback도 update_offset을 텍스처 좌표로
+                // 그대로 샘플링 — 위 주석 참조).
                 if expand_transparent {
                     use gleam::gl;
                     let g = device.gl();
-                    g.disable(gl::SCISSOR_TEST);
+                    // 리뷰 하드닝(2) — 잔류 FBO 바인딩 함정: make_render_pbuffer_current는
+                    // 단순 eglMakeCurrent라 GL 프레임버퍼 바인딩을 리셋하지 않는다. WR의 직전
+                    // 패스(텍스처 캐시 렌더 타깃)가 FBO를 바인딩한 채 남아있으면 클리어가 그
+                    // FBO를 때릴 수 있으므로 pbuffer의 기본 프레임버퍼(0)로 명시 바인딩한다.
+                    g.bind_framebuffer(gl::FRAMEBUFFER, 0);
+                    let sw = update_rect_v.max.x - update_rect_v.min.x;
+                    let sh = update_rect_v.max.y - update_rect_v.min.y;
+                    g.enable(gl::SCISSOR_TEST);
+                    g.scissor(update_offset.x, update_offset.y, sw, sh);
                     g.color_mask(true, true, true, true);
                     g.clear_color(0.0, 0.0, 0.0, 0.0);
                     g.clear(gl::COLOR_BUFFER_BIT);
+                    g.disable(gl::SCISSOR_TEST);
                 }
 
                 // 업데이트 렉트의 타일-로컬 top-left(확장 시 클립이 타일 좌상단을 잘라내면 >0).
