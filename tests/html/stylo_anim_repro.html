@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>stylo capSlide 경계 패닉 재현기</title>
+<style>
+  /* 불투명 배경 (월/DComp 경로에서도 안정) */
+  html, body { margin: 0; height: 100%; background: #0a1424; overflow: hidden; }
+
+  /*
+   * complex_media_stress.html 의 .caption 과 "정확히 동일한" 6-키프레임 캡션 애니메이션.
+   * 퍼센트 스톱 0/12/20/80/88/100 -> ComputedKeyframe 6개 -> start_percentage 마지막이 1.0f32.
+   * 이 애니메이션을 무한 반복하면 total_progress 가 1.0 바로 아래(f64 [1-2^-25, 1.0)) 구간을
+   * 샘플하는 순간 (total_progress as f32) == 1.0 -> position()==None -> release 에서
+   * debug_unreachable(=UB) -> computed_steps[6] out-of-bounds 패닉 (Script#1 사망).
+   * duration 을 0.08s 로 가속하고 divN 개를 조금씩 다른 duration/delay 로 병렬 배치해
+   * 부동소수 위상 공간을 병렬 스캔한다.
+   */
+  @keyframes capSlide {
+    0%, 12%   { opacity: 0; transform: translateX(-50%) translateY(2vh); }
+    20%, 80%  { opacity: 1; transform: translateX(-50%) translateY(0); }
+    88%, 100% { opacity: 0; transform: translateX(-50%) translateY(-1vh); }
+  }
+
+  .cap {
+    position: absolute;
+    left: 50%;
+    color: #fff;
+    font: 600 14px/1.2 ui-monospace, Consolas, monospace;
+    background: rgba(10, 20, 35, 0.55);
+    padding: 2px 8px;
+    border-radius: 6px;
+    white-space: nowrap;
+    /* animation 속성은 JS 에서 개별 duration/delay 로 설정 */
+  }
+
+  /* rAF 하트비트 (필수): 매 프레임 #000001 <-> #000000 토글 */
+  #hb {
+    position: fixed; right: 0; bottom: 0;
+    width: 2px; height: 2px; background: #000000; z-index: 20;
+  }
+
+  /* JS uptime 카운터 (setInterval 1s) */
+  #uptime {
+    position: fixed; left: 8px; top: 8px;
+    color: #7fd4ff; font: 700 20px/1.2 ui-monospace, Consolas, monospace;
+    z-index: 21; text-shadow: 0 0 6px #000;
+  }
+  #info {
+    position: fixed; left: 8px; top: 40px;
+    color: #9fb4c8; font: 400 13px/1.4 ui-monospace, Consolas, monospace;
+    z-index: 21;
+  }
+</style>
+</head>
+<body>
+  <div id="uptime">uptime 0s</div>
+  <div id="info"></div>
+  <div id="hb"></div>
+
+<script>
+  // 스폰 개수: ?n= 우선, 없으면 런처가 붙이는 cols*rows, 그것도 없으면 200.
+  const q = new URLSearchParams(location.search);
+  const nParam = q.get('n');
+  const cols = parseInt(q.get('cols') || '0', 10);
+  const rows = parseInt(q.get('rows') || '0', 10);
+  let N = nParam ? parseInt(nParam, 10) : (cols * rows);
+  if (!Number.isFinite(N) || N <= 0) N = 200;
+
+  // 기준 duration 0.08s. div 마다 아주 작게 흔들어 duration 의 f64 표현/프레임 위상을
+  // 서로 다르게 만들어 경계 구간을 병렬 스캔한다.
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < N; i++) {
+    const d = document.createElement('div');
+    d.className = 'cap';
+    d.textContent = 'CAP ' + i;
+    // 0.070s ~ 0.096s 사이를 잘게 분포, delay 도 각기 다르게(음수 delay 로 즉시 여러 위상 시작).
+    const durMs = 70 + (i % 27);           // 70..96 ms
+    const durFine = (i % 7) * 0.137;       // 서브-ms 미세 변동
+    const dur = (durMs + durFine) / 1000;  // seconds
+    const delay = -((i * 0.0131) % 0.1);   // 음수 delay 로 다양한 시작 위상
+    d.style.top = (10 + (i % 40) * 2) + 'vh';
+    d.style.animation = `capSlide ${dur.toFixed(4)}s ease-in-out ${delay.toFixed(4)}s infinite`;
+    frag.appendChild(d);
+  }
+  document.body.appendChild(frag);
+  document.getElementById('info').textContent =
+    N + ' caps @~0.08s (each varied). Waiting for stylo boundary panic...';
+
+  // rAF 하트비트: 화면이 살아있는지(스크립트 스레드 생존) 픽셀로 증명.
+  const hb = document.getElementById('hb');
+  let on = false, rafCount = 0;
+  function tick() {
+    on = !on;
+    hb.style.background = on ? '#000001' : '#000000';
+    rafCount++;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // uptime 카운터: 초 단위. 패닉 후 스크립트 스레드가 죽으면 여기서 멈춘다.
+  const t0 = Date.now();
+  const upEl = document.getElementById('uptime');
+  setInterval(() => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    upEl.textContent = 'uptime ' + s + 's  raf ' + rafCount;
+  }, 1000);
+</script>
+</body>
+</html>
