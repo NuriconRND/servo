@@ -79,6 +79,18 @@ fn readback_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("SERVO_DCOMP_READBACK").is_ok())
 }
 
+/// Task 9 defect diagnosis (spec 2026-07-15): env-gated (`SERVO_DCOMP_VALIDPROBE`) per-Virtual-bind
+/// coverage log for NON-OPAQUE surfaces only. Logs the raw WR dirty_rect (min AND max), the
+/// valid_rect (min AND max), the computed BeginDraw update RECT (virtual coords), the atlas
+/// update_offset and the returned origin — one line per bind, frame-bounded by the caller (<=300).
+/// Purpose: determine whether WR ever dirties the ticker-bar region below the scrolling text
+/// (tile-local y beyond the text sliver) and what valid_rect WR assigns it — the two candidate
+/// mechanisms for the never-redrawn strip showing uninitialised virtual-surface memory.
+fn valid_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SERVO_DCOMP_VALIDPROBE").is_ok())
+}
+
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
 /// virtual_offset은 create_surface 때 WR이 준 이 서피스의 가상공간 원점.
 fn tile_virtual_rect(
@@ -92,6 +104,31 @@ fn tile_virtual_rect(
         virtual_offset.y + tile_y * tile_size.height,
     );
     DeviceIntRect::from_origin_and_size(origin, tile_size)
+}
+
+/// Task 9: 타일의 "가시" 가상 rect = 타일 가상 rect ∩ (서피스 클립을 가상좌표로 환산).
+/// 비불투명 valid==dirty 타일에서 BeginDraw 업데이트 렉트를 이 영역으로 확장해, WR가 그리지
+/// 않는 [타일 ∩ 클립 − dirty] 밴드까지 투명 클리어를 커밋하기 위한 것이다(bind Virtual arm).
+/// 클립이 없거나(add_surface 이전 첫 프레임) 교차가 비면 전체 타일로 폴백한다 — 과대 확장은
+/// off-screen 내부 타일 낭비뿐, 정확성엔 안전(합성되지 않는 영역까지 투명으로 커밋할 뿐).
+/// scale=1 가정(add_surface와 동일): device 좌표 D → 가상좌표 D − transform_offset + virtual_offset
+/// (visual offset = transform_offset − virtual_offset의 역변환). transform_offset은 반올림.
+fn tile_visible_virtual_rect(
+    tile_rect: DeviceIntRect,
+    clip_device: Option<DeviceIntRect>,
+    transform_offset: (f32, f32),
+    virtual_offset: DeviceIntPoint,
+) -> DeviceIntRect {
+    let Some(clip) = clip_device else {
+        return tile_rect;
+    };
+    let dx = virtual_offset.x - transform_offset.0.round() as i32;
+    let dy = virtual_offset.y - transform_offset.1.round() as i32;
+    let clip_v = DeviceIntRect::new(
+        DeviceIntPoint::new(clip.min.x + dx, clip.min.y + dy),
+        DeviceIntPoint::new(clip.max.x + dx, clip.max.y + dy),
+    );
+    tile_rect.intersection(&clip_v).unwrap_or(tile_rect)
 }
 
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
@@ -1275,7 +1312,7 @@ impl Compositor for DCompNativeCompositor {
 
     fn bind(
         &mut self,
-        _device: &mut Device,
+        device: &mut Device,
         id: NativeTileId,
         dirty_rect: DeviceIntRect,
         valid_rect: DeviceIntRect,
@@ -1293,6 +1330,16 @@ impl Compositor for DCompNativeCompositor {
             return fail;
         };
         let tile_rect = tile_virtual_rect(entry.virtual_offset, entry.tile_size, id.x, id.y);
+        // Captured before the &mut entry.storage borrow. `is_opaque` gates the Task 9 fix
+        // (transparent-fill of the never-drawn band) and the env-gated valid_probe log; the
+        // last add_surface placement (clip + transform offset) drives the visible-region
+        // expansion of the BeginDraw update rect (Task 9 fix, Virtual arm).
+        let entry_is_opaque = entry.is_opaque;
+        let entry_virtual_offset = entry.virtual_offset;
+        let (entry_clip, entry_transform_offset) = match entry.last_placement {
+            Some(p) => (Some(p.clip_rect), p.transform_offset),
+            None => (None, (0.0, 0.0)),
+        };
 
         match &mut entry.storage {
             SurfaceStorage::SwapChain(sc) => {
@@ -1374,12 +1421,49 @@ impl Compositor for DCompNativeCompositor {
             SurfaceStorage::Virtual { virtual_surface } => {
                 let vsurf = virtual_surface.as_ptr();
 
-                // BeginDraw는 가상공간 절대좌표 RECT를 받는다: 타일 rect를 타일-로컬 dirty로 오프셋.
+                // Task 9 근본원인(스펙 2026-07-15 실측): WR은 비불투명 티커 슬라이스에서 매 프레임
+                // valid_rect == dirty_rect == "움직이는 텍스트 밴드"만 넘긴다(스크롤 텍스트 = 전체
+                // 재도색). 그런데 이 서피스 visual의 클립은 티커 바 전체다(WR composite.rs:1043 —
+                // native 경로 클립 = device_clip ∩ 모든 타일 valid_rect의 바운딩 유니온 = 바 전체;
+                // Draw 경로는 renderer/mod.rs:3739에서 타일별로 device_valid_rect까지 클립하므로
+                // 결함이 없다). 따라서 DWM은 가상 서피스의 [타일 ∩ 클립] 전체를 합성하지만 우리는
+                // 텍스트 밴드만 그리므로, 텍스트 아래 띠(그려진 적 없는 영역)가 DComp 가상 서피스의
+                // 미초기화/스테일 메모리(검정·이전 텍스트 잔상·청색 밴드)를 노출한다.
+                //
+                // 수정: valid==dirty 인 비불투명 타일은 BeginDraw 업데이트 렉트를 "가시 타일 영역"
+                // (타일 ∩ 서피스 클립)으로 확장하고, WR draw 전에 pbuffer 전체를 투명으로 클리어
+                // 한다(아래 make_current 직후). WR은 Windows/ANGLE에서 clear를 dirty로 시저링하므로
+                // (device/gl.rs: prefers_clear_scissor=true) 스스로는 밴드를 지우지 않는다 — 우리가
+                // 투명 클리어 후 EndDraw가 확장 렉트를 커밋하면, 텍스트 밖 밴드가 투명이 되어 뒤
+                // 서피스(불투명 바 배경)가 비친다. valid==dirty 가드로 지속(valid−dirty) 콘텐츠는
+                // 절대 지우지 않는다(전체 재도색 슬라이스에만 적용). 불투명/스왑체인 경로 무영향.
+                let expand_transparent = !entry_is_opaque && dirty_rect == valid_rect;
+                let update_rect_v = if expand_transparent {
+                    tile_visible_virtual_rect(
+                        tile_rect,
+                        entry_clip,
+                        entry_transform_offset,
+                        entry_virtual_offset,
+                    )
+                } else {
+                    // 기존: 타일 rect를 타일-로컬 dirty로 오프셋한 가상 절대좌표 렉트.
+                    DeviceIntRect::new(
+                        DeviceIntPoint::new(
+                            tile_rect.min.x + dirty_rect.min.x,
+                            tile_rect.min.y + dirty_rect.min.y,
+                        ),
+                        DeviceIntPoint::new(
+                            tile_rect.min.x + dirty_rect.max.x,
+                            tile_rect.min.y + dirty_rect.max.y,
+                        ),
+                    )
+                };
+                // BeginDraw는 가상공간 절대좌표 RECT를 받는다.
                 let update = RECT {
-                    left: tile_rect.min.x + dirty_rect.min.x,
-                    top: tile_rect.min.y + dirty_rect.min.y,
-                    right: tile_rect.min.x + dirty_rect.max.x,
-                    bottom: tile_rect.min.y + dirty_rect.max.y,
+                    left: update_rect_v.min.x,
+                    top: update_rect_v.min.y,
+                    right: update_rect_v.max.x,
+                    bottom: update_rect_v.max.y,
                 };
 
                 // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
@@ -1430,14 +1514,39 @@ impl Compositor for DCompNativeCompositor {
                     return fail;
                 }
 
+                // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 아틀라스) 전체를
+                // 투명으로 클리어한다. 순차 bind/unbind(self.bound 단일) + 직전 타일 EndDraw 커밋
+                // 완료 → 이 아틀라스는 이 BeginDraw 전용 scratch이므로 전체 클리어가 안전하다.
+                // 시저 해제 후 전체 클리어(현재 시저 상태 무관) → WR draw_picture_cache_target이
+                // 이후 clear_target/set_blend/scissor를 매번 새로 세팅하므로 상태 desync 없음
+                // (WR device gl.rs: 시저·clear color·color write 모두 캐시 없는 &self 직접 호출).
+                if expand_transparent {
+                    use gleam::gl;
+                    let g = device.gl();
+                    g.disable(gl::SCISSOR_TEST);
+                    g.color_mask(true, true, true, true);
+                    g.clear_color(0.0, 0.0, 0.0, 0.0);
+                    g.clear(gl::COLOR_BUFFER_BIT);
+                }
+
+                // 업데이트 렉트의 타일-로컬 top-left(확장 시 클립이 타일 좌상단을 잘라내면 >0).
+                // 비확장 시엔 (dirty.min)과 동일 → 원래 origin·readback 좌표를 그대로 보존한다.
+                let r_min_x = update_rect_v.min.x - tile_rect.min.x;
+                let r_min_y = update_rect_v.min.y - tile_rect.min.y;
+
                 // 텍스처는 WR의 GL draw 동안 살려두고 unbind의 EndDraw 이후 Release한다.
                 self.bound = Some(BoundTile {
                     surface_id: id.surface_id,
                     pbuffer,
                     texture,
                     // Task 6 diagnosis: sampling coordinates for the unbind readback.
+                    // dirty의 scratch 내 위치 = update_off + (dirty.min - r_min). 비확장 시
+                    // r_min==dirty.min이라 update_off 그대로(기존 readback 좌표 불변).
                     tile: (id.x, id.y),
-                    update_offset: (update_offset.x, update_offset.y),
+                    update_offset: (
+                        update_offset.x + dirty_rect.min.x - r_min_x,
+                        update_offset.y + dirty_rect.min.y - r_min_y,
+                    ),
                     dirty_size: (
                         dirty_rect.max.x - dirty_rect.min.x,
                         dirty_rect.max.y - dirty_rect.min.y,
@@ -1450,7 +1559,11 @@ impl Compositor for DCompNativeCompositor {
                 // 부분 더티 프레임도 "그려짐"으로 세기(나이 카운터에 포함).
                 entry.frame_drawn_partial = true;
 
-                // WR 타일-로컬 좌표계 성립: origin = update_offset - dirty_rect.min (Gecko DCLayerTree 동일).
+                // WR 타일-로컬 좌표계 성립: origin = update_offset - r_min (Gecko DCLayerTree 동일).
+                // r_min = 업데이트 렉트의 타일-로컬 top-left. 비확장 경로에선 r_min == dirty_rect.min
+                // 이라 기존 산식(update_offset - dirty.min)과 바이트 동일하다. WR은 타일-로컬 좌표 C를
+                // scratch 위치 update_offset + (C - r_min)에 그리므로, 이 origin으로 dirty가 정위치에
+                // 놓이고 EndDraw가 확장 렉트를 커밋한다.
                 //
                 // 좌표 규약 전제(Task 5 스모크에서 규명·해결): WR은 `DrawTarget::NativeSurface`를
                 // top-left 원점으로 그리며(webrender device/gl.rs `surface_origin_is_top_left`=true,
@@ -1463,9 +1576,23 @@ impl Compositor for DCompNativeCompositor {
                 // 시도했다 무효였던 것: EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE — ANGLE이
                 // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
                 let origin = DeviceIntPoint::new(
-                    update_offset.x - dirty_rect.min.x,
-                    update_offset.y - dirty_rect.min.y,
+                    update_offset.x - r_min_x,
+                    update_offset.y - r_min_y,
                 );
+                // Task 9 diagnosis: per-bind coverage for non-opaque surfaces (first 300 frames).
+                if valid_probe_enabled() && !entry_is_opaque && self.frame_counter <= 300 {
+                    log::info!(
+                        "[dcomp-validprobe] surface={:?} tile=({},{}) dirty=({},{})-({},{}) \
+                         valid=({},{})-({},{}) update_rect=({},{})-({},{}) update_off=({},{}) \
+                         tex={}x{} origin=({},{})",
+                        id.surface_id, id.x, id.y,
+                        dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
+                        valid_rect.min.x, valid_rect.min.y, valid_rect.max.x, valid_rect.max.y,
+                        update.left, update.top, update.right, update.bottom,
+                        update_offset.x, update_offset.y, desc.Width, desc.Height,
+                        origin.x, origin.y,
+                    );
+                }
                 if dcomp_debug() {
                     log::info!(
                         "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
@@ -2194,6 +2321,32 @@ mod tests {
 
     fn r(x0: i32, y0: i32, x1: i32, y1: i32) -> DeviceIntRect {
         DeviceIntRect::new(DeviceIntPoint::new(x0, y0), DeviceIntPoint::new(x1, y1))
+    }
+
+    #[test]
+    fn tile_visible_virtual_rect_clips_to_surface_clip() {
+        // Task 9: 티커 실측 지오메트리 재현. virtual_offset=(16384,16384), tile_size=1024x512,
+        // transform_offset=(0,0). 바닥 행(y=2) 오른쪽(x=1) 타일 = 가상 (17408,17408)-(18432,17920).
+        let vo = DeviceIntPoint::new(16384, 16384);
+        let ts = DeviceIntSize::new(1024, 512);
+        let tile = tile_virtual_rect(vo, ts, 1, 2);
+        // 티커 바 클립(device) = (0,972)-(1920,1080). 가상으로는 +virtual_offset.
+        let clip = r(0, 972, 1920, 1080);
+        let vis = tile_visible_virtual_rect(tile, Some(clip), (0.0, 0.0), vo);
+        // 가시 영역 = 타일 ∩ 클립_virtual: x[17408,18304], y[17408,17464].
+        assert_eq!(vis, r(17408, 17408, 18304, 17464));
+        // 확장이 dirty(텍스트 밴드 y[0,27] = 가상 y[17408,17435])를 세로로 포함해야
+        // 텍스트가 잘리지 않는다.
+        assert!(vis.min.y <= 17408 && vis.max.y >= 17435);
+        // 클립 없음(첫 프레임) → 전체 타일 폴백.
+        assert_eq!(tile_visible_virtual_rect(tile, None, (0.0, 0.0), vo), tile);
+        // 타일이 클립 밖 → 교차 비면 전체 타일 폴백(정확성 안전).
+        let far = r(0, 0, 10, 10);
+        assert_eq!(tile_visible_virtual_rect(tile, Some(far), (0.0, 0.0), vo), tile);
+        // transform_offset 반영: transform_offset=(100,0)이면 가상 클립이 −100 이동 →
+        // 가시 우변이 18304에서 18204로 100 줄어든다(좌변은 타일 좌변 17408이 지배).
+        let vis2 = tile_visible_virtual_rect(tile, Some(clip), (100.0, 0.0), vo);
+        assert_eq!(vis2, r(17408, 17408, 18204, 17464));
     }
 
     #[test]
