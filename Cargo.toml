@@ -8,7 +8,7 @@ members = [
     "tests/unit/*",
 ]
 default-members = ["ports/servoshell"]
-exclude = [".cargo", "support/crown"]
+exclude = [".cargo", "support/crown", "third_party/stylo"]
 
 [workspace.package]
 version = "0.3.0"
@@ -467,3 +467,26 @@ surfman = { path = "third_party/surfman" }
 #
 # [patch."https://github.com/servo/<repository>"]
 # <crate> = { path = "/path/to/local/checkout" }
+
+# Task 11: locally vendored Stylo (git rev 2453c41...) under third_party/stylo, carrying a
+# root-fix for the CSS-animation boundary panic in style/servo/animation.rs
+# (get_property_declaration_at_time: a total_progress that is < 1.0 in f64 but rounds up to
+# 1.0f32 made keyframe position() return None -> release UB -> computed_steps out-of-bounds).
+# EVERY package the workspace graph pulls from the stylo git source is patched to its path in
+# the copied tree, so all consumers see a single, consistent source (patching only some would
+# split the type universe and cause cross-crate type mismatches). Dir names differ from crate
+# names for a few packages (stylo=style, stylo_derive=style_derive, stylo_malloc_size_of=
+# malloc_size_of, stylo_traits=style_traits); intra-tree sibling deps are relative paths so the
+# vendored tree stays self-consistent.
+[patch."https://github.com/servo/stylo"]
+selectors = { path = "third_party/stylo/selectors" }
+servo_arc = { path = "third_party/stylo/servo_arc" }
+stylo = { path = "third_party/stylo/style" }
+stylo_atoms = { path = "third_party/stylo/stylo_atoms" }
+stylo_derive = { path = "third_party/stylo/style_derive" }
+stylo_dom = { path = "third_party/stylo/stylo_dom" }
+stylo_malloc_size_of = { path = "third_party/stylo/malloc_size_of" }
+stylo_static_prefs = { path = "third_party/stylo/stylo_static_prefs" }
+stylo_traits = { path = "third_party/stylo/style_traits" }
+to_shmem = { path = "third_party/stylo/to_shmem" }
+to_shmem_derive = { path = "third_party/stylo/to_shmem_derive" }
