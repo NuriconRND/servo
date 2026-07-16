@@ -1821,6 +1821,10 @@ impl Compositor for DCompNativeCompositor {
 
         let mode = storage_mode();
         let rc = self.rendering_context.clone();
+        // task-12b: painter가 세운 드래그-리사이즈 활성 신호(공유 RenderingContext Cell).
+        // true인 동안: 스왑체인을 즉시 가상으로 강등 + 승격/regen 억제(가상 서피스가 드래그
+        // 운반). 프레임 내내 불변이므로 여기서 1회 읽어 아래 게이트에 사용한다.
+        let resize_active = rc.dcomp_resize_active();
         // borrow 사정(iter_mut 중 self 메서드 호출 불가)상 스왑체인 생성이 필요한 요청을
         // 모아 루프 밖에서 처리한다.
         //  - promote_requests: Virtual → SwapChain 신규 승격 (id, 승격 extent)
@@ -1866,7 +1870,11 @@ impl Compositor for DCompNativeCompositor {
                     // provides. Promotion targets the wall's full-repaint opaque video
                     // slices only. `is_opaque` is WR's per-slice opacity classification.
                     // MIN_AGE gate added: streak must accumulate only after sufficient draw history.
-                    if mode == StorageMode::Hybrid
+                    // task-12b: 리사이즈 중에는 승격을 억제한다 — 드래그 중 스왑체인으로
+                    // 올리면 매 틱 extent 변경 → regen 처닝(content_attached 리셋 → Present
+                    // 보류 → 비디오 블랙)이 재발한다. 정착(resize_active=false) 후 자연 재승격.
+                    if !resize_active
+                        && mode == StorageMode::Hybrid
                         && entry.is_opaque
                         && !self.warned_promote_fail
                         && entry.promote_streak >= PROMOTE_STREAK
@@ -1893,7 +1901,16 @@ impl Compositor for DCompNativeCompositor {
                     let geometry_changed = cur_extent
                         .is_some_and(|e| e.min != sc.anchor || e.size() != sc.size);
 
-                    if geometry_changed {
+                    if resize_active {
+                        // task-12b: 리사이즈 중(드래그) — regen/present/withhold 정상 로직을
+                        // 전부 건너뛰고 스왑체인을 즉시 강등 큐에 넣는다. regen은 매 틱
+                        // 스왑체인을 재생성하며 content_attached를 리셋 → 새 full-coverage
+                        // Present까지 Present 보류 = 비디오 블랙의 근본원인. 드래그 동안에는
+                        // 승격 상태를 버리고 가상 서피스(BeginDraw가 임의 지오메트리를 매 프레임
+                        // 처리 = 블랙 없음)로 운반한다. 아래 강등 루프가 buffer 0을 시딩해
+                        // 현재 픽셀을 가상으로 이관하므로 표시 연속성도 유지된다.
+                        demote_requests.push(*id);
+                    } else if geometry_changed {
                         if !self.warned_regen_fail {
                             if let Some(e) = cur_extent {
                                 // 조밀성 가드: 타일 집합이 e를 빈틈없이 채우지 않으면 regen을
@@ -2211,13 +2228,20 @@ impl Compositor for DCompNativeCompositor {
             // 시딩을 시도하지 않는다. 자연 회복 조건 = 다음 full-coverage Present가
             // 성공해 content_attached=true가 되는 것(그 즉시 위 §6.2-2 경로로 전환).
             if !sc.content_attached && sc.fallback_virtual.is_none() {
-                warn!(
-                    "[dcomp-native] demote skipped: regen'd surface {:?} has no fallback; \
-                     will recover at next full-coverage present",
-                    surface_id
-                );
-                sc.demote_blocked = true;
-                continue;
+                // task-12b: 리사이즈 강등은 예외. 제3상태(regen 후 fallback 없음)여도
+                // buffer 0에서 새 가상 서피스로 시딩해 진행한다(드래그 표시 우선 — 완벽한
+                // 연속성보다 "무언가 현재 픽셀"을 가상으로 이관해 드래그를 이어가는 게 낫다;
+                // 최종 연속성은 정착 시 재구축이 보장). 아래 시딩 결정이 fallback 부재를
+                // 감지해 demote_seed_new_virtual(buffer 0 복사) 경로를 택한다.
+                if !resize_active {
+                    warn!(
+                        "[dcomp-native] demote skipped: regen'd surface {:?} has no fallback; \
+                         will recover at next full-coverage present",
+                        surface_id
+                    );
+                    sc.demote_blocked = true;
+                    continue;
+                }
             }
 
             let Some(ctx) = ctx else {
@@ -2233,9 +2257,11 @@ impl Compositor for DCompNativeCompositor {
                 continue;
             };
 
-            let seeded = if !sc.content_attached {
+            let seeded = if !sc.content_attached && sc.fallback_virtual.is_some() {
                 // §6.2-1: fallback_virtual 생존 — 누적 더티 영역(타일 단위, 과대 안전)만
                 // buffer 0에서 복사해 최신화. visual은 계속 fallback을 표시하므로 끊김 없음.
+                // (task-12b: fallback 부재 제3상태는 위 가드가 비-리사이즈에서 이미 걸러냈고,
+                // 리사이즈에서는 이 조건이 false가 되어 아래 new_virtual 경로로 간다.)
                 demote_seed_into_fallback(ctx, sc, &entry.tiles, virtual_offset, tile_size)
             } else {
                 // §6.2-2: 새 가상 서피스 생성 + buffer 0 전체 복사 + SetContent 원자 전환.
@@ -2259,17 +2285,30 @@ impl Compositor for DCompNativeCompositor {
             // (케이스 2, 방금 SetContent 완료)이 붙어 있으므로 안전. displayed_anchor는
             // storage와 함께 소멸하고 Virtual arm의 content_anchor=zero 산식이 자동 적용된다.
             entry.storage = SurfaceStorage::Virtual { virtual_surface: new_virtual };
-            entry.demote_count = entry.demote_count.saturating_add(1);
-            let cooldown = demote_cooldown(entry.demote_count);
-            entry.promote_blocked_until = self.frame_counter + cooldown;
+            if resize_active {
+                // task-12b (C): 리사이즈 강등은 병리(withhold/present 실패)가 아니라 의도된
+                // 모드 전환이다. 지수 쿨다운/demote_count 증가를 적용하면 정착 후 재승격이
+                // 수 초 지연되므로(§6.3), demote_count는 건드리지 않고 promote_blocked_until을
+                // 리셋해 정착(resize_active=false) 즉시 자연 재승격(MIN_AGE/streak)이 가능하게
+                // 한다. (정착 시 Task 12 재구축이 서피스를 새로 만들면 MIN_AGE는 재적용된다 —
+                // 이는 쿨다운 페널티가 아니라 신규 서피스의 정상 히스테리시스.)
+                entry.promote_blocked_until = 0;
+                if dcomp_debug() {
+                    log::info!("[dcomp-dbg] resize-demote id={:?} (no cooldown)", surface_id);
+                }
+            } else {
+                entry.demote_count = entry.demote_count.saturating_add(1);
+                let cooldown = demote_cooldown(entry.demote_count);
+                entry.promote_blocked_until = self.frame_counter + cooldown;
+                if dcomp_debug() {
+                    log::info!(
+                        "[dcomp-dbg] demote id={:?} count={} cooldown={}",
+                        surface_id, entry.demote_count, cooldown
+                    );
+                }
+            }
             entry.promote_streak = 0;
             entry.frame_coverage.reset();
-            if dcomp_debug() {
-                log::info!(
-                    "[dcomp-dbg] demote id={:?} count={} cooldown={}",
-                    surface_id, entry.demote_count, cooldown
-                );
-            }
         }
 
         // 레이어 컬링 없음(A-1 결정, task-6b-report.md 수정 웨이브): A-2("실측 타일

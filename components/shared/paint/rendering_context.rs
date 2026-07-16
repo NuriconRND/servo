@@ -184,6 +184,20 @@ pub trait RenderingContext {
     fn dcomp_native_active(&self) -> bool {
         false
     }
+    /// task-12b: DComp 네이티브 경로에서 사용자가 창을 드래그-리사이즈 중인지 painter가
+    /// 컴포지터에 알린다. painter가 드래그 첫 크기 변경에서 `true`, Task 12 디바운스가
+    /// 정착할 때 `false`로 설정한다. 컴포지터(`DCompNativeCompositor::end_frame`)는 이 값이
+    /// `true`인 동안 (1) 모든 승격 스왑체인을 즉시 가상 서피스로 강등하고 (2) 승격·regen을
+    /// 억제한다 — 드래그마다 스왑체인이 재생성되며 content_attached가 리셋돼 새 full-coverage
+    /// Present까지 표시가 보류되는(=비디오 블랙) 병리를 회피하고, 임의 지오메트리를 매 프레임
+    /// 처리하는 가상 서피스(BeginDraw)가 드래그를 운반하게 한다. Default no-op;
+    /// `WindowRenderingContext`만 자신의 `Cell`을 읽고, `OffscreenRenderingContext`는 위임한다.
+    fn set_dcomp_resize_active(&self, _active: bool) {}
+    /// `set_dcomp_resize_active`의 짝(getter). 컴포지터가 매 end_frame에서 읽어 리사이즈
+    /// 중 강등/억제 게이트를 판단한다. Default `false`.
+    fn dcomp_resize_active(&self) -> bool {
+        false
+    }
     /// ANGLE의 D3D11 디바이스 raw 포인터. AddRef 하지 않는다 — 수명은 이
     /// 렌더링 컨텍스트가 보유하므로 컨텍스트보다 오래 들고 있으면 안 된다.
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {
@@ -1025,6 +1039,10 @@ pub struct WindowRenderingContext {
     /// `present()`의 스킵 판정은 env가 아닌 이 값을 본다(§`RenderingContext::set_dcomp_native_active`).
     #[cfg(windows)]
     dcomp_native_active: Cell<bool>,
+    /// task-12b: 사용자가 창을 드래그-리사이즈 중인지(painter가 설정). 컴포지터가 매
+    /// end_frame에서 읽어 리사이즈 중 스왑체인 강등·승격/regen 억제를 판단한다.
+    #[cfg(windows)]
+    dcomp_resize_active: Cell<bool>,
 }
 
 impl WindowRenderingContext {
@@ -1125,6 +1143,8 @@ impl WindowRenderingContext {
             win32_hwnd,
             #[cfg(windows)]
             dcomp_native_active: Cell::new(false),
+            #[cfg(windows)]
+            dcomp_resize_active: Cell::new(false),
         })
     }
 
@@ -1247,6 +1267,17 @@ impl RenderingContext for WindowRenderingContext {
     #[cfg(windows)]
     fn dcomp_native_active(&self) -> bool {
         self.dcomp_native_active.get()
+    }
+
+    // task-12b: 드래그-리사이즈 활성 신호(painter → 컴포지터 공유 채널).
+    #[cfg(windows)]
+    fn set_dcomp_resize_active(&self, active: bool) {
+        self.dcomp_resize_active.set(active);
+    }
+
+    #[cfg(windows)]
+    fn dcomp_resize_active(&self) -> bool {
+        self.dcomp_resize_active.get()
     }
 
     fn make_current(&self) -> Result<(), Error> {
@@ -1730,6 +1761,18 @@ impl RenderingContext for OffscreenRenderingContext {
     #[cfg(windows)]
     fn dcomp_native_active(&self) -> bool {
         self.parent_context.dcomp_native_active()
+    }
+
+    // task-12b: painter가 이 Offscreen 래퍼 위에서 리사이즈 활성 신호를 설정/조회하므로,
+    // 부모 WindowRenderingContext의 `Cell`로 위임한다(dcomp_native_active와 동일 패턴).
+    #[cfg(windows)]
+    fn set_dcomp_resize_active(&self, active: bool) {
+        self.parent_context.set_dcomp_resize_active(active);
+    }
+
+    #[cfg(windows)]
+    fn dcomp_resize_active(&self) -> bool {
+        self.parent_context.dcomp_resize_active()
     }
 
     fn angle_d3d11_device_ptr(&self) -> Option<usize> {

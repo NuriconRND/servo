@@ -89,9 +89,19 @@ const DCOMP_RESIZE_DEBOUNCE_FRAMES: u32 = 10;
 
 // 킬 스위치(기본 = 활성). "1"/"true"이면 런타임 리사이즈 시 picture-cache 재구축을 끈다.
 // A/B 검증(잔상 재현) 및 회귀 시 안전 밸브. 기본값에서는 재구축이 동작해 잔상을 제거한다.
+// 이 마스터 스위치는 Task 12(정착 재구축)와 12b(드래그 중 가상 모드+시작 재구축)를 모두 끈다.
 #[cfg(windows)]
 static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("SERVO_DCOMP_DISABLE_RESIZE_REBUILD")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+// task-12b 전용 킬 스위치(기본 = 활성). "1"/"true"이면 "드래그 중 가상 서피스 모드(A) +
+// 드래그 시작 재구축(B)"만 끄고, Task 12의 정착 재구축은 그대로 유지한다. RED(12b off,
+// Task 12 on) ↔ GREEN(둘 다 on) A/B를 같은 바이너리에서 재현하기 위한 스위치.
+#[cfg(windows)]
+static DCOMP_RESIZE_VIRTUAL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL")
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
@@ -1398,16 +1408,12 @@ impl Painter {
             return;
         }
 
-        // 크기가 멎었다. primary ↔ alternate 교대 전송으로 반드시 크기 변경을 만든다(같은 값
-        // 재전송은 picture.rs:2320에서 no-op이므로 서로 다른 두 값을 번갈아야 파괴가 발생).
-        let next = if self.dcomp_tile_toggle.get() {
-            self.dcomp_tile_size_primary
-        } else {
-            self.dcomp_tile_size_alternate
-        };
-        self.dcomp_tile_toggle.set(!self.dcomp_tile_toggle.get());
-        self.webrender_api
-            .send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(next)));
+        // 크기가 멎었다(정착). task-12b (C): 리사이즈 활성 신호를 해제해 컴포지터의 승격
+        // 억제를 풀고, 강등됐던 서피스가 MIN_AGE/streak 규칙으로 자연 재승격되게 한다
+        // (리사이즈 강등은 지수 쿨다운을 적용하지 않으므로 수 초 지연 없음 — dcomp_compositor
+        // 강등 루프 참조). 그런 다음 Task 12 재구축(교대 SetPictureTileSize)으로 잔상을 소멸.
+        self.rendering_context.set_dcomp_resize_active(false);
+        let next = self.fire_dcomp_tile_rebuild();
         self.dcomp_resize_pending.set(false);
         self.dcomp_resize_stable_frames.set(0);
         // 드문 이벤트(정착 리사이즈당 1회)라 info로 남겨 런처 기본 RUST_LOG(paint=info)에서
@@ -1418,6 +1424,23 @@ impl Painter {
              stale virtual-surface ghosts; task-10b: FORCE_PICTURE_INVALIDATION could not)",
             DCOMP_RESIZE_DEBOUNCE_FRAMES, next.width, next.height,
         );
+    }
+
+    /// task-12b: picture-cache 재구축 1회 발동 — primary↔alternate 타일 크기를 교대로 보내
+    /// 반드시 desired != current 를 만든다(같은 값 재전송은 picture.rs:2320에서 no-op이라
+    /// 서로 다른 두 값을 번갈아야 서피스 파괴/재생성이 일어난다). 드래그 시작(잔상 선제거)과
+    /// 정착(최종 잔상 제거) 두 시점에서 공유 호출한다. 보낸 크기를 반환(호출자 로깅용).
+    #[cfg(windows)]
+    fn fire_dcomp_tile_rebuild(&self) -> webrender_api::units::DeviceIntSize {
+        let next = if self.dcomp_tile_toggle.get() {
+            self.dcomp_tile_size_primary
+        } else {
+            self.dcomp_tile_size_alternate
+        };
+        self.dcomp_tile_toggle.set(!self.dcomp_tile_toggle.get());
+        self.webrender_api
+            .send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(next)));
+        next
     }
 
     pub(crate) fn note_webrender_frame_ready(
@@ -2179,8 +2202,29 @@ impl Painter {
         // 자신의 버퍼를 자연스럽게 재생성하므로 이 비용을 지불하지 않는다.
         #[cfg(windows)]
         if self.dcomp_native_active {
+            // 드래그의 "첫" 크기 변경(pending false→true 전이) 감지. 연속 드래그는 pending을
+            // true로 유지하므로 아래 12b 처리는 드래그당 정확히 1회만 발동한다.
+            let first_change = !self.dcomp_resize_pending.get();
             self.dcomp_resize_pending.set(true);
             self.dcomp_resize_stable_frames.set(0);
+            // task-12b: 드래그 시작 시 (A) 리사이즈 활성 신호 → 컴포지터가 다음 end_frame부터
+            // 전 스왑체인을 가상으로 강등하고 승격/regen을 억제(드래그 중 비디오 블랙 방지),
+            // (B) 재구축 1회 선발동 → 드래그 이전 가상 서피스에 남은 스테일 잔상을 즉시 제거
+            // (정착 시 Task 12 재구축과 합쳐 드래그당 총 2회). 마스터 스위치는 12/12b 전부
+            // 비활성; 12b 전용 스위치는 이 블록만 비활성(Task 12 정착 재구축은 유지 = RED).
+            if first_change &&
+                !*DCOMP_RESIZE_REBUILD_DISABLED &&
+                !*DCOMP_RESIZE_VIRTUAL_DISABLED
+            {
+                self.rendering_context.set_dcomp_resize_active(true);
+                let next = self.fire_dcomp_tile_rebuild();
+                info!(
+                    "[dcomp-native] runtime resize started; virtual-only mode ON + start-rebuild \
+                     via SetPictureTileSize={}x{} (demotes swapchains, suppresses promotion/regen, \
+                     purges pre-drag ghosts) — task-12b",
+                    next.width, next.height,
+                );
+            }
         }
 
         if let Err(error) = self.rendering_context.make_current() {
