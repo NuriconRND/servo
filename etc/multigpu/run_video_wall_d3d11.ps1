@@ -71,14 +71,36 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$servoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$servoExe  = Join-Path $servoRoot "target\release\servoshell.exe"
+# This one file serves both trees, so the exported package and the repo can never drift
+# apart (they used to be separate scripts and every switch had to be added twice).
+# Exported package = flat: the launcher sits next to servoshell.exe. Repo = the launcher
+# lives in etc\multigpu\ and the exe is under target\release\. $Page stays relative to the
+# root in both, so only these three values differ.
+$packaged = Test-Path (Join-Path $PSScriptRoot "servoshell.exe")
+if ($packaged) {
+    $servoRoot = $PSScriptRoot
+    $servoExe  = Join-Path $servoRoot "servoshell.exe"
+    $logDir    = Join-Path $servoRoot "logs"
+} else {
+    $servoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+    $servoExe  = Join-Path $servoRoot "target\release\servoshell.exe"
+    $logDir    = Join-Path $servoRoot "target\multigpu_logs"
+}
 $pagePath  = Join-Path $servoRoot $Page
-$logDir    = Join-Path $servoRoot "target\multigpu_logs"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath   = Join-Path $logDir "${LogPrefix}_${timestamp}_stderr.log"
 
-if (!(Test-Path $servoExe)) { throw "servoshell.exe not found (build first: .\mach build --release): $servoExe" }
+if (!(Test-Path $servoExe)) {
+    if ($packaged) { throw "servoshell.exe not found next to this script -- the package is incomplete: $servoExe" }
+    throw "servoshell.exe not found (build first: .\mach build --release): $servoExe"
+}
+
+# Only worth checking on a packaged copy: a machine with the repo has MSVC anyway, whereas
+# a bare target PC without the redistributable fails with an opaque loader error.
+if ($packaged -and !(Test-Path "$env:SystemRoot\System32\vcruntime140.dll")) {
+    throw ("Missing the Microsoft Visual C++ x64 redistributable (vcruntime140.dll). " +
+           "Install it from https://aka.ms/vs/17/release/vc_redist.x64.exe and re-run.")
+}
 if (!(Test-Path $pagePath)) { throw "Page not found: $pagePath" }
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
