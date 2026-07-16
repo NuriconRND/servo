@@ -115,6 +115,23 @@ use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
 
+/// `SERVO_WR_PICTURE_TILE_SIZE=WxH`(예 "1920x1080") 형식을 파싱한다. 기동 시 정상상태 오버라이드
+/// 적용부와 DComp 리사이즈 재구축의 steady/alternate 계산부가 이 파서를 공유한다(리뷰 Minor:
+/// 이전에는 두 곳에 동일 로직이 중복돼 있었다).
+fn parse_wr_tile_size_env(value: &str) -> Option<webrender_api::units::DeviceIntSize> {
+    let lower = value.to_ascii_lowercase();
+    let mut split = lower.split('x');
+    match (
+        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+    ) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            Some(webrender_api::units::DeviceIntSize::new(w, h))
+        },
+        _ => None,
+    }
+}
+
 /// A [`Painter`] is responsible for all of the painting to a particular [`RenderingContext`].
 /// This holds all of the WebRender specific data structures and state necessary for painting
 /// and handling events that happen to `WebView`s that use a particular [`RenderingContext`].
@@ -262,16 +279,15 @@ pub(crate) struct Painter {
     /// 마지막 크기 변경 이후 흐른 프레임 수(안정화 카운터).
     #[cfg(windows)]
     dcomp_resize_stable_frames: Cell<u32>,
-    /// 교대 상태: picture.rs:2320은 desired != current 일 때만 서피스를 파괴하므로 같은 값을
-    /// 재전송하면 no-op이다. 그래서 재구축을 발동할 때마다 primary ↔ alternate 두 서로 다른
-    /// 크기를 번갈아 보내 반드시 크기 변경(=파괴/재생성)을 만든다.
+    /// 기동 시 정상상태(steady-state) picture 타일 크기 오버라이드. `SERVO_WR_PICTURE_TILE_SIZE`가
+    /// 설정돼 있으면 그 파싱값(Some), 아니면 None(= WR 기본값 사용 — 콘텐츠는 TILE_SIZE_DEFAULT
+    /// 1024x512, 스크롤바는 TILE_SIZE_SCROLLBAR_*로 WR이 자체 분기). 재구축이 항상 이 값으로
+    /// 수렴해야 `-TileSize` A/B 실험과 스크롤바 특수 타일 크기가 훼손되지 않는다(리뷰 지적).
     #[cfg(windows)]
-    dcomp_tile_toggle: Cell<bool>,
-    /// 정상상태 picture 타일 크기(env SERVO_WR_PICTURE_TILE_SIZE 또는 WR 기본 1024x512).
-    #[cfg(windows)]
-    dcomp_tile_size_primary: webrender_api::units::DeviceIntSize,
-    /// primary와 반드시 다른 유효 타일 크기. 첫 발동 시 이 값을 먼저 보내 desired != current를
-    /// 보장한다(정상상태 = primary 이므로).
+    dcomp_tile_size_steady: Option<webrender_api::units::DeviceIntSize>,
+    /// steady와 반드시 다른 유효 타일 크기(내부 크기 기준). 드래그 시작 때 이 값을 먼저 보내
+    /// desired != current를 보장해 파괴/재생성을 강제한다. steady가 None이면 WR 기본
+    /// 1024x512와 비교해 다른 값을 고른다(picture.rs:2306-2311의 default_tile_size와 충돌 방지).
     #[cfg(windows)]
     dcomp_tile_size_alternate: webrender_api::units::DeviceIntSize,
 }
@@ -493,61 +509,51 @@ impl Painter {
         let webrender_document = webrender_api.add_document(rendering_context.size2d().to_i32());
 
         // 실험 노브: WR picture cache 타일 크기 오버라이드 (SERVO_WR_PICTURE_TILE_SIZE=WxH,
-        // 예 1920x1080). 미설정이면 WR 기본 1024x512. 타일 수·무효화 입도·per-tile
-        // 오버헤드(DComp bind/unbind 횟수) A/B용 — 값이 창 이상이면 슬라이스당 타일 1장.
-        if let Ok(value) = std::env::var("SERVO_WR_PICTURE_TILE_SIZE") {
-            let lower = value.to_ascii_lowercase();
-            let mut split = lower.split('x');
-            let size = (
-                split.next().and_then(|v| v.trim().parse::<i32>().ok()),
-                split.next().and_then(|v| v.trim().parse::<i32>().ok()),
-            );
-            match size {
-                (Some(w), Some(h)) if w > 0 && h > 0 => {
-                    webrender_api.send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(
-                        Some(webrender_api::units::DeviceIntSize::new(w, h)),
-                    ));
-                    log::info!("[wr-tile-size] picture tile size override: {w}x{h}");
-                },
-                _ => {
+        // 예 1920x1080). 미설정이면 WR 기본(콘텐츠 1024x512, 스크롤바는 WR이 자체 특수 크기
+        // 분기 — picture.rs:2306-2311)을 그대로 쓴다. 타일 수·무효화 입도·per-tile 오버헤드
+        // (DComp bind/unbind 횟수) A/B용 — 값이 창 이상이면 슬라이스당 타일 1장.
+        let steady_tile_size_override = std::env::var("SERVO_WR_PICTURE_TILE_SIZE")
+            .ok()
+            .and_then(|value| match parse_wr_tile_size_env(&value) {
+                Some(size) => Some(size),
+                None => {
                     log::warn!(
                         "[wr-tile-size] SERVO_WR_PICTURE_TILE_SIZE 형식 오류(WxH 기대): {value}"
                     );
+                    None
                 },
-            }
+            });
+        if let Some(size) = steady_tile_size_override {
+            webrender_api.send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(size)));
+            log::info!(
+                "[wr-tile-size] picture tile size override: {}x{}",
+                size.width,
+                size.height
+            );
         }
 
         let gl_renderer = webrender_gl.get_string(gleam::gl::RENDERER);
         let gl_version = webrender_gl.get_string(gleam::gl::VERSION);
         info!("Running on {gl_renderer} with OpenGL version {gl_version}");
 
-        // Runtime-resize 재구축용 primary/alternate picture 타일 크기 계산.
-        // primary = env 오버라이드(설정 시) 또는 WR 기본 1024x512(TILE_SIZE_DEFAULT) — 정상상태
-        // 타일 크기와 동일. alternate = primary와 반드시 다른 유효 크기(WR 클램프 128..=4096 내).
-        // 첫 발동은 alternate를 먼저 보내 desired != current(=primary)를 보장한다.
+        // Runtime-resize 재구축용 steady/alternate picture 타일 크기 계산.
+        // steady = 기동 시 결정된 정상상태(위 steady_tile_size_override 그대로) — 재구축은
+        // 항상 이 값으로 수렴해야 한다(리뷰 지적: 하드코딩된 512x512에 눌러앉으면 env 노브가
+        // 무력화되고 WR 스크롤바 특수 타일 크기도 깨진다). steady가 None이면 SetPictureTileSize
+        // 자체를 None으로 되돌려 WR 기본 분기(TILE_SIZE_DEFAULT/스크롤바)를 복원한다.
+        // alternate = steady의 실제 크기와 반드시 다른 유효 크기(WR 클램프 128..=4096 내) —
+        // steady가 None이면 WR 기본 콘텐츠 크기 1024x512와 비교해 고른다. 드래그 시작 발동은
+        // 항상 alternate를 먼저 보내 desired != current(=steady)를 보장한다.
         #[cfg(windows)]
-        let (dcomp_tile_size_primary, dcomp_tile_size_alternate) = {
+        let (dcomp_tile_size_steady, dcomp_tile_size_alternate) = {
             use webrender_api::units::DeviceIntSize;
-            let primary = std::env::var("SERVO_WR_PICTURE_TILE_SIZE")
-                .ok()
-                .and_then(|value| {
-                    let lower = value.to_ascii_lowercase();
-                    let mut split = lower.split('x');
-                    match (
-                        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
-                        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
-                    ) {
-                        (Some(w), Some(h)) if w > 0 && h > 0 => Some(DeviceIntSize::new(w, h)),
-                        _ => None,
-                    }
-                })
-                .unwrap_or_else(|| DeviceIntSize::new(1024, 512));
-            let alternate = if primary.width == 512 && primary.height == 512 {
+            let steady_effective_default = steady_tile_size_override.unwrap_or(DeviceIntSize::new(1024, 512));
+            let alternate = if steady_effective_default.width == 512 && steady_effective_default.height == 512 {
                 DeviceIntSize::new(1024, 512)
             } else {
                 DeviceIntSize::new(512, 512)
             };
-            (primary, alternate)
+            (steady_tile_size_override, alternate)
         };
 
         let painter = Painter {
@@ -593,9 +599,7 @@ impl Painter {
             #[cfg(windows)]
             dcomp_resize_stable_frames: Cell::new(0),
             #[cfg(windows)]
-            dcomp_tile_toggle: Cell::new(false),
-            #[cfg(windows)]
-            dcomp_tile_size_primary,
+            dcomp_tile_size_steady,
             #[cfg(windows)]
             dcomp_tile_size_alternate,
         };
@@ -1384,12 +1388,19 @@ impl Painter {
 
     /// DComp Native 경로에서 런타임 리사이즈 후 picture-cache를 물리적으로 재구축한다.
     /// 프레임 준비마다 호출되어 마지막 크기 변경 이후 안정 프레임 수를 세고, 임계값에 도달하면
-    /// SetPictureTileSize를 primary↔alternate로 교대 전송한다. 이는 WR이 desired != current
-    /// 타일 크기를 감지해 모든 picture-cache 슬라이스의 네이티브 서피스를 destroy_surface하고
-    /// 타일을 비운 뒤 재생성하게 만들어(webrender-0.68 picture.rs:2320-2332 →
-    /// resource_cache::destroy_compositor_surface → renderer/mod.rs:5163 compositor.destroy_surface),
-    /// 리사이즈 이전 가상 서피스에 남은 옛 픽셀(잔상)을 물리적으로 소멸시킨다. task-10b가 증명한
-    /// FORCE_PICTURE_INVALIDATION의 한계(재계산만 강제, vacated 영역 미재도색)를 이 방식이 우회한다.
+    /// SetPictureTileSize를 기동 시 정상상태(steady)로 되돌려 보낸다. 드래그 시작에서 이미
+    /// alternate로 보내둔 상태이므로(resize_rendering_context 참조) steady로의 이 전환은
+    /// desired != current를 다시 만들어(steady==alternate가 되도록 계산해 두었으므로 항상
+    /// 참 — 아래 fire_dcomp_tile_rebuild_settle 문서 참조) WR이 모든 picture-cache 슬라이스의
+    /// 네이티브 서피스를 destroy_surface하고 타일을 비운 뒤 재생성하게 만들어(webrender-0.68
+    /// picture.rs:2297-2332 → resource_cache::destroy_compositor_surface → renderer/mod.rs:5163
+    /// compositor.destroy_surface), 리사이즈 이전 가상 서피스에 남은 옛 픽셀(잔상)을 물리적으로
+    /// 소멸시킨다. task-10b가 증명한 FORCE_PICTURE_INVALIDATION의 한계(재계산만 강제, vacated
+    /// 영역 미재도색)를 이 방식이 우회한다.
+    ///
+    /// 옛 픽셀이 이 정착 재구축까지(~170ms, DCOMP_RESIZE_DEBOUNCE_FRAMES@60fps) 화면에 남는
+    /// 것은 의도된 트레이드오프다(매 프레임 재구축은 리사이즈 중 지속적인 서피스 파괴/재생성
+    /// 비용이 너무 크다).
     #[cfg(windows)]
     fn tick_dcomp_resize_rebuild(&self) {
         if !self.dcomp_native_active ||
@@ -1411,36 +1422,64 @@ impl Painter {
         // 크기가 멎었다(정착). task-12b (C): 리사이즈 활성 신호를 해제해 컴포지터의 승격
         // 억제를 풀고, 강등됐던 서피스가 MIN_AGE/streak 규칙으로 자연 재승격되게 한다
         // (리사이즈 강등은 지수 쿨다운을 적용하지 않으므로 수 초 지연 없음 — dcomp_compositor
-        // 강등 루프 참조). 그런 다음 Task 12 재구축(교대 SetPictureTileSize)으로 잔상을 소멸.
+        // 강등 루프 참조). 그런 다음 Task 12 재구축(steady로 수렴, alternate→steady)으로
+        // 잔상을 소멸.
         self.rendering_context.set_dcomp_resize_active(false);
-        let next = self.fire_dcomp_tile_rebuild();
+        let next = self.fire_dcomp_tile_rebuild_settle();
         self.dcomp_resize_pending.set(false);
         self.dcomp_resize_stable_frames.set(0);
         // 드문 이벤트(정착 리사이즈당 1회)라 info로 남겨 런처 기본 RUST_LOG(paint=info)에서
         // 보이게 한다 — 매 프레임 debug 스팸과 달리 로그 부하가 없다.
-        info!(
-            "[dcomp-native] runtime resize settled after {} stable frames; forcing picture-cache \
-             rebuild via SetPictureTileSize={}x{} (destroys/recreates native surfaces to purge \
-             stale virtual-surface ghosts; task-10b: FORCE_PICTURE_INVALIDATION could not)",
-            DCOMP_RESIZE_DEBOUNCE_FRAMES, next.width, next.height,
-        );
+        match next {
+            Some(size) => info!(
+                "[dcomp-native] runtime resize settled after {} stable frames; forcing \
+                 picture-cache rebuild via SetPictureTileSize={}x{} (converges to startup \
+                 steady state; destroys/recreates native surfaces to purge stale \
+                 virtual-surface ghosts; task-10b: FORCE_PICTURE_INVALIDATION could not)",
+                DCOMP_RESIZE_DEBOUNCE_FRAMES, size.width, size.height,
+            ),
+            None => info!(
+                "[dcomp-native] runtime resize settled after {} stable frames; forcing \
+                 picture-cache rebuild via SetPictureTileSize=None (converges to startup \
+                 steady state = WR default tile size, restores scrollbar special sizing; \
+                 destroys/recreates native surfaces to purge stale virtual-surface ghosts; \
+                 task-10b: FORCE_PICTURE_INVALIDATION could not)",
+                DCOMP_RESIZE_DEBOUNCE_FRAMES,
+            ),
+        }
     }
 
-    /// task-12b: picture-cache 재구축 1회 발동 — primary↔alternate 타일 크기를 교대로 보내
-    /// 반드시 desired != current 를 만든다(같은 값 재전송은 picture.rs:2320에서 no-op이라
-    /// 서로 다른 두 값을 번갈아야 서피스 파괴/재생성이 일어난다). 드래그 시작(잔상 선제거)과
-    /// 정착(최종 잔상 제거) 두 시점에서 공유 호출한다. 보낸 크기를 반환(호출자 로깅용).
+    /// task-12b: 드래그 "시작" 재구축 1회 발동 — 항상 alternate 타일 크기를 보낸다. 정상상태는
+    /// 항상 steady이므로(정착 시 fire_dcomp_tile_rebuild_settle이 되돌린다) desired(alternate)
+    /// != current(steady)가 보장되어 picture.rs:2320의 파괴/재생성 조건이 반드시 참이 된다.
+    /// 이전의 primary↔alternate "교대" 방식은 시작/정착 호출이 짝을 이루지 못하면(예: 12b
+    /// 전용 킬 스위치로 시작 발동만 스킵된 경우) 정상상태가 하드코딩된 대체값 512x512에
+    /// 눌러앉을 수 있었다(리뷰 지적) — 이 함수는 그 회귀를 구조적으로 없앤다: 시작은 항상
+    /// alternate, 정착은 항상 steady로 결정론적으로 수렴한다.
     #[cfg(windows)]
-    fn fire_dcomp_tile_rebuild(&self) -> webrender_api::units::DeviceIntSize {
-        let next = if self.dcomp_tile_toggle.get() {
-            self.dcomp_tile_size_primary
-        } else {
-            self.dcomp_tile_size_alternate
-        };
-        self.dcomp_tile_toggle.set(!self.dcomp_tile_toggle.get());
+    fn fire_dcomp_tile_rebuild_start(&self) -> webrender_api::units::DeviceIntSize {
+        let next = self.dcomp_tile_size_alternate;
         self.webrender_api
             .send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(next)));
         next
+    }
+
+    /// task-12b: "정착" 재구축 1회 발동 — 항상 기동 시 정상상태(steady)로 되돌린다. steady가
+    /// None이면 SetPictureTileSize(None)을 보내 WR 기본 분기(콘텐츠는 TILE_SIZE_DEFAULT
+    /// 1024x512, 스크롤바는 TILE_SIZE_SCROLLBAR_*)를 복원한다 — 이는 override를
+    /// `Some(alternate)`에 영구 고정해두던 이전 구현이 깨뜨리던 WR 스크롤바 특수 타일 크기를
+    /// 되살린다(리뷰 지적). 재구축이 실제로 발동함은 render_backend.rs:1139-1141
+    /// (SetPictureTileSize → frame_config.tile_size_override 갱신)과 picture.rs:2297-2332
+    /// (override 변경 시 즉시 재평가 → desired_tile_size != current_tile_size 이면 서피스
+    /// destroy/재생성)로 확인된다: 시작 발동 직후 current_tile_size == alternate이고, 이 함수가
+    /// override를 steady(대개 alternate와 다른 값, None 포함)로 바꾸므로 desired != current가
+    /// 성립해 반드시 재구축이 실행된다. 보낸 크기를 반환(호출자 로깅용, None이면 WR 기본).
+    #[cfg(windows)]
+    fn fire_dcomp_tile_rebuild_settle(&self) -> Option<webrender_api::units::DeviceIntSize> {
+        let steady = self.dcomp_tile_size_steady;
+        self.webrender_api
+            .send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(steady));
+        steady
     }
 
     pub(crate) fn note_webrender_frame_ready(
@@ -2209,15 +2248,17 @@ impl Painter {
             self.dcomp_resize_stable_frames.set(0);
             // task-12b: 드래그 시작 시 (A) 리사이즈 활성 신호 → 컴포지터가 다음 end_frame부터
             // 전 스왑체인을 가상으로 강등하고 승격/regen을 억제(드래그 중 비디오 블랙 방지),
-            // (B) 재구축 1회 선발동 → 드래그 이전 가상 서피스에 남은 스테일 잔상을 즉시 제거
-            // (정착 시 Task 12 재구축과 합쳐 드래그당 총 2회). 마스터 스위치는 12/12b 전부
-            // 비활성; 12b 전용 스위치는 이 블록만 비활성(Task 12 정착 재구축은 유지 = RED).
+            // (B) 재구축 1회 선발동(항상 alternate) → 드래그 이전 가상 서피스에 남은 스테일
+            // 잔상을 즉시 제거(정착 시 Task 12 재구축이 항상 steady로 되돌려 드래그당 총 2회,
+            // alternate→steady 순서 고정). first_change 래치가 드래그당 시작-발동을 정확히
+            // 1회로 제한한다. 마스터 스위치는 12/12b 전부 비활성; 12b 전용 스위치는 이 블록만
+            // 비활성(Task 12 정착 재구축은 유지 = RED).
             if first_change &&
                 !*DCOMP_RESIZE_REBUILD_DISABLED &&
                 !*DCOMP_RESIZE_VIRTUAL_DISABLED
             {
                 self.rendering_context.set_dcomp_resize_active(true);
-                let next = self.fire_dcomp_tile_rebuild();
+                let next = self.fire_dcomp_tile_rebuild_start();
                 info!(
                     "[dcomp-native] runtime resize started; virtual-only mode ON + start-rebuild \
                      via SetPictureTileSize={}x{} (demotes swapchains, suppresses promotion/regen, \
