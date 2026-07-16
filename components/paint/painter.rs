@@ -80,6 +80,21 @@ static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
+// DComp Native 경로에서 런타임 리사이즈(사용자 드래그/최대화) 후 picture-cache를 재구축하기
+// 전에 크기가 안정되어야 하는 연속 프레임 수. 드래그는 매 프레임 resize 이벤트를 쏟아내므로
+// 마지막 크기 변경 이후 이만큼 프레임이 흐른 뒤에 단 한 번만 재구축을 발동한다(≈170ms@60fps).
+// 타이머 없이 프레임 카운터만으로 디바운스한다.
+#[cfg(windows)]
+const DCOMP_RESIZE_DEBOUNCE_FRAMES: u32 = 10;
+
+// 킬 스위치(기본 = 활성). "1"/"true"이면 런타임 리사이즈 시 picture-cache 재구축을 끈다.
+// A/B 검증(잔상 재현) 및 회귀 시 안전 밸브. 기본값에서는 재구축이 동작해 잔상을 제거한다.
+#[cfg(windows)]
+static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("SERVO_DCOMP_DISABLE_RESIZE_REBUILD")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
 use crate::Paint;
 use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator;
 use crate::paint::{RepaintReason, WebRenderDebugOption};
@@ -221,6 +236,34 @@ pub(crate) struct Painter {
     /// native compositor's `bind` leaves a pbuffer current.
     #[cfg(windows)]
     dcomp_native_active: bool,
+
+    // --- Runtime-resize stale-content 방지 상태 (DComp Native 경로 전용) ---
+    // 근본원인(task-10/10b): 리사이즈 이전에 DComp 가상 서피스에 그려진 콘텐츠는, 재레이아웃
+    // 후 그 타일 영역에 프리미티브가 사라지면 WR(webrender-0.68 native path)이 valid로 간주해
+    // 재-bind하지 않아 옛 픽셀이 영원히 남는다(시계/패널 테두리 잔상). task-10b는 이를
+    // FORCE_PICTURE_INVALIDATION으로 못 고침을 증명했다(그 플래그는 "재계산"만 강제할 뿐
+    // vacated 영역을 재도색하지 않음). 해법: SetPictureTileSize로 타일 크기를 실제로 바꿔
+    // picture-cache 슬라이스를 통째로 destroy_surface/재생성(picture.rs:2320-2332)시켜 옛
+    // 콘텐츠를 물리적으로 소멸시킨다.
+
+    /// 리사이즈가 발생해 재구축을 기다리는 중(디바운스 진행 중).
+    #[cfg(windows)]
+    dcomp_resize_pending: Cell<bool>,
+    /// 마지막 크기 변경 이후 흐른 프레임 수(안정화 카운터).
+    #[cfg(windows)]
+    dcomp_resize_stable_frames: Cell<u32>,
+    /// 교대 상태: picture.rs:2320은 desired != current 일 때만 서피스를 파괴하므로 같은 값을
+    /// 재전송하면 no-op이다. 그래서 재구축을 발동할 때마다 primary ↔ alternate 두 서로 다른
+    /// 크기를 번갈아 보내 반드시 크기 변경(=파괴/재생성)을 만든다.
+    #[cfg(windows)]
+    dcomp_tile_toggle: Cell<bool>,
+    /// 정상상태 picture 타일 크기(env SERVO_WR_PICTURE_TILE_SIZE 또는 WR 기본 1024x512).
+    #[cfg(windows)]
+    dcomp_tile_size_primary: webrender_api::units::DeviceIntSize,
+    /// primary와 반드시 다른 유효 타일 크기. 첫 발동 시 이 값을 먼저 보내 desired != current를
+    /// 보장한다(정상상태 = primary 이므로).
+    #[cfg(windows)]
+    dcomp_tile_size_alternate: webrender_api::units::DeviceIntSize,
 }
 
 struct PendingFrameDiagnostic {
@@ -468,6 +511,35 @@ impl Painter {
         let gl_version = webrender_gl.get_string(gleam::gl::VERSION);
         info!("Running on {gl_renderer} with OpenGL version {gl_version}");
 
+        // Runtime-resize 재구축용 primary/alternate picture 타일 크기 계산.
+        // primary = env 오버라이드(설정 시) 또는 WR 기본 1024x512(TILE_SIZE_DEFAULT) — 정상상태
+        // 타일 크기와 동일. alternate = primary와 반드시 다른 유효 크기(WR 클램프 128..=4096 내).
+        // 첫 발동은 alternate를 먼저 보내 desired != current(=primary)를 보장한다.
+        #[cfg(windows)]
+        let (dcomp_tile_size_primary, dcomp_tile_size_alternate) = {
+            use webrender_api::units::DeviceIntSize;
+            let primary = std::env::var("SERVO_WR_PICTURE_TILE_SIZE")
+                .ok()
+                .and_then(|value| {
+                    let lower = value.to_ascii_lowercase();
+                    let mut split = lower.split('x');
+                    match (
+                        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+                        split.next().and_then(|v| v.trim().parse::<i32>().ok()),
+                    ) {
+                        (Some(w), Some(h)) if w > 0 && h > 0 => Some(DeviceIntSize::new(w, h)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| DeviceIntSize::new(1024, 512));
+            let alternate = if primary.width == 512 && primary.height == 512 {
+                DeviceIntSize::new(1024, 512)
+            } else {
+                DeviceIntSize::new(512, 512)
+            };
+            (primary, alternate)
+        };
+
         let painter = Painter {
             painter_id,
             embedder_to_constellation_sender,
@@ -506,6 +578,16 @@ impl Painter {
             ),
             #[cfg(windows)]
             dcomp_native_active,
+            #[cfg(windows)]
+            dcomp_resize_pending: Cell::new(false),
+            #[cfg(windows)]
+            dcomp_resize_stable_frames: Cell::new(0),
+            #[cfg(windows)]
+            dcomp_tile_toggle: Cell::new(false),
+            #[cfg(windows)]
+            dcomp_tile_size_primary,
+            #[cfg(windows)]
+            dcomp_tile_size_alternate,
         };
         painter.assert_gl_framebuffer_complete();
         painter.clear_background();
@@ -1290,10 +1372,62 @@ impl Painter {
         self.display_composite_in_flight.get()
     }
 
+    /// DComp Native 경로에서 런타임 리사이즈 후 picture-cache를 물리적으로 재구축한다.
+    /// 프레임 준비마다 호출되어 마지막 크기 변경 이후 안정 프레임 수를 세고, 임계값에 도달하면
+    /// SetPictureTileSize를 primary↔alternate로 교대 전송한다. 이는 WR이 desired != current
+    /// 타일 크기를 감지해 모든 picture-cache 슬라이스의 네이티브 서피스를 destroy_surface하고
+    /// 타일을 비운 뒤 재생성하게 만들어(webrender-0.68 picture.rs:2320-2332 →
+    /// resource_cache::destroy_compositor_surface → renderer/mod.rs:5163 compositor.destroy_surface),
+    /// 리사이즈 이전 가상 서피스에 남은 옛 픽셀(잔상)을 물리적으로 소멸시킨다. task-10b가 증명한
+    /// FORCE_PICTURE_INVALIDATION의 한계(재계산만 강제, vacated 영역 미재도색)를 이 방식이 우회한다.
+    #[cfg(windows)]
+    fn tick_dcomp_resize_rebuild(&self) {
+        if !self.dcomp_native_active ||
+            !self.dcomp_resize_pending.get() ||
+            *DCOMP_RESIZE_REBUILD_DISABLED
+        {
+            return;
+        }
+
+        let stable = self.dcomp_resize_stable_frames.get() + 1;
+        if stable < DCOMP_RESIZE_DEBOUNCE_FRAMES {
+            self.dcomp_resize_stable_frames.set(stable);
+            // 디바운스 창이 끝날 때까지 프레임이 계속 흐르도록 재도색을 요청한다(애니메이션이
+            // 없는 페이지에서도 카운터가 확정적으로 임계값에 도달하게 보장).
+            self.set_needs_repaint(RepaintReason::Resize);
+            return;
+        }
+
+        // 크기가 멎었다. primary ↔ alternate 교대 전송으로 반드시 크기 변경을 만든다(같은 값
+        // 재전송은 picture.rs:2320에서 no-op이므로 서로 다른 두 값을 번갈아야 파괴가 발생).
+        let next = if self.dcomp_tile_toggle.get() {
+            self.dcomp_tile_size_primary
+        } else {
+            self.dcomp_tile_size_alternate
+        };
+        self.dcomp_tile_toggle.set(!self.dcomp_tile_toggle.get());
+        self.webrender_api
+            .send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(next)));
+        self.dcomp_resize_pending.set(false);
+        self.dcomp_resize_stable_frames.set(0);
+        // 드문 이벤트(정착 리사이즈당 1회)라 info로 남겨 런처 기본 RUST_LOG(paint=info)에서
+        // 보이게 한다 — 매 프레임 debug 스팸과 달리 로그 부하가 없다.
+        info!(
+            "[dcomp-native] runtime resize settled after {} stable frames; forcing picture-cache \
+             rebuild via SetPictureTileSize={}x{} (destroys/recreates native surfaces to purge \
+             stale virtual-surface ghosts; task-10b: FORCE_PICTURE_INVALIDATION could not)",
+            DCOMP_RESIZE_DEBOUNCE_FRAMES, next.width, next.height,
+        );
+    }
+
     pub(crate) fn note_webrender_frame_ready(
         &self,
         need_repaint: bool,
     ) -> Option<FrameReadyDiagnostic> {
+        // 프레임 준비마다 리사이즈 재구축 디바운스를 진행한다(DComp Native 경로 전용).
+        #[cfg(windows)]
+        self.tick_dcomp_resize_rebuild();
+
         if !need_repaint {
             // No render pass will follow this frame-ready, so an in-flight display
             // composite (if any) must be considered consumed here.
@@ -2036,6 +2170,17 @@ impl Painter {
     pub(crate) fn resize_rendering_context(&mut self, new_size: PhysicalSize<u32>) {
         if self.rendering_context.size() == new_size {
             return;
+        }
+
+        // 여기 도달 = 실제 client 크기 변경(위 early-return이 무변화를 걸러냄). DComp Native
+        // 경로에서만, 리사이즈 재구축 디바운스를 시작/리셋한다. 드래그는 매 프레임 이 경로를
+        // 여러 번 호출하므로 pending을 세우고 안정화 카운터를 0으로 되돌려, 크기가 멎은 뒤
+        // (DCOMP_RESIZE_DEBOUNCE_FRAMES 프레임) 단 한 번만 재구축이 발동하게 한다. Draw 경로는
+        // 자신의 버퍼를 자연스럽게 재생성하므로 이 비용을 지불하지 않는다.
+        #[cfg(windows)]
+        if self.dcomp_native_active {
+            self.dcomp_resize_pending.set(true);
+            self.dcomp_resize_stable_frames.set(0);
         }
 
         if let Err(error) = self.rendering_context.make_current() {
