@@ -96,9 +96,12 @@ static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
-// task-12b 전용 킬 스위치(기본 = 활성). "1"/"true"이면 "드래그 중 가상 서피스 모드(A) +
-// 드래그 시작 재구축(B)"만 끄고, Task 12의 정착 재구축은 그대로 유지한다. RED(12b off,
-// Task 12 on) ↔ GREEN(둘 다 on) A/B를 같은 바이너리에서 재현하기 위한 스위치.
+// task-12b 전용 킬 스위치(기본 = 활성). "1"/"true"이면 "드래그 중 가상 서피스 모드(A:
+// 강등/승격·regen 억제)"만 끄고, Task 12의 정착 재구축은 그대로 유지한다. 드래그 시작
+// 재구축(B)은 이 스위치와 무관하게 마스터 스위치에만 걸린다 — 결정론 수렴 방식에서 정착
+// 재구축은 current(=alternate) != steady 전이에 의존하므로, 시작-발동까지 끄면 정착이
+// desired==current no-op이 되어 Task 12마저 무력화되기 때문(리뷰 수정; picture.rs:2320).
+// RED(12b off, Task 12 on) ↔ GREEN(둘 다 on) A/B를 같은 바이너리에서 재현하기 위한 스위치.
 #[cfg(windows)]
 static DCOMP_RESIZE_VIRTUAL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL")
@@ -1390,7 +1393,7 @@ impl Painter {
     /// 프레임 준비마다 호출되어 마지막 크기 변경 이후 안정 프레임 수를 세고, 임계값에 도달하면
     /// SetPictureTileSize를 기동 시 정상상태(steady)로 되돌려 보낸다. 드래그 시작에서 이미
     /// alternate로 보내둔 상태이므로(resize_rendering_context 참조) steady로의 이 전환은
-    /// desired != current를 다시 만들어(steady==alternate가 되도록 계산해 두었으므로 항상
+    /// desired != current를 다시 만들어(steady != alternate가 되도록 계산해 두었으므로 항상
     /// 참 — 아래 fire_dcomp_tile_rebuild_settle 문서 참조) WR이 모든 picture-cache 슬라이스의
     /// 네이티브 서피스를 destroy_surface하고 타일을 비운 뒤 재생성하게 만들어(webrender-0.68
     /// picture.rs:2297-2332 → resource_cache::destroy_compositor_surface → renderer/mod.rs:5163
@@ -1455,7 +1458,9 @@ impl Painter {
     /// 이전의 primary↔alternate "교대" 방식은 시작/정착 호출이 짝을 이루지 못하면(예: 12b
     /// 전용 킬 스위치로 시작 발동만 스킵된 경우) 정상상태가 하드코딩된 대체값 512x512에
     /// 눌러앉을 수 있었다(리뷰 지적) — 이 함수는 그 회귀를 구조적으로 없앤다: 시작은 항상
-    /// alternate, 정착은 항상 steady로 결정론적으로 수렴한다.
+    /// alternate, 정착은 항상 steady로 결정론적으로 수렴한다. 같은 이유로 이 시작-발동은
+    /// 마스터 스위치에만 걸려 RED(RESIZE_VIRTUAL disabled) 모드에서도 발동한다 — 정착
+    /// 재구축이 current(=alternate) != steady 전이를 전제하기 때문(호출부 게이트 주석 참조).
     #[cfg(windows)]
     fn fire_dcomp_tile_rebuild_start(&self) -> webrender_api::units::DeviceIntSize {
         let next = self.dcomp_tile_size_alternate;
@@ -2251,19 +2256,32 @@ impl Painter {
             // (B) 재구축 1회 선발동(항상 alternate) → 드래그 이전 가상 서피스에 남은 스테일
             // 잔상을 즉시 제거(정착 시 Task 12 재구축이 항상 steady로 되돌려 드래그당 총 2회,
             // alternate→steady 순서 고정). first_change 래치가 드래그당 시작-발동을 정확히
-            // 1회로 제한한다. 마스터 스위치는 12/12b 전부 비활성; 12b 전용 스위치는 이 블록만
-            // 비활성(Task 12 정착 재구축은 유지 = RED).
-            if first_change &&
-                !*DCOMP_RESIZE_REBUILD_DISABLED &&
-                !*DCOMP_RESIZE_VIRTUAL_DISABLED
-            {
-                self.rendering_context.set_dcomp_resize_active(true);
+            // 1회로 제한한다.
+            //
+            // 게이트 구조(리뷰 수정): (B) 시작-발동은 마스터 스위치에만 걸린다 — 결정론 수렴
+            // 방식에서 정착 재구축(Task 12)은 current(=alternate) != steady 전이에 의존하므로,
+            // 시작-발동이 빠지면 정착 시 desired==current가 되어 picture.rs:2320이 no-op =
+            // Task 12까지 무력화된다. (A) 가상 모드(강등/억제)만 12b 전용 스위치로 추가
+            // 게이트한다. 따라서 RED(SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL=1) = 정확히 Task 12
+            // 동작(시작 alternate → 정착 steady 재구축, 강등/억제 없음), 기본 = 12b 전체 동작,
+            // 마스터 스위치 = 12/12b 전부 비활성.
+            if first_change && !*DCOMP_RESIZE_REBUILD_DISABLED {
+                let virtual_mode = !*DCOMP_RESIZE_VIRTUAL_DISABLED;
+                if virtual_mode {
+                    self.rendering_context.set_dcomp_resize_active(true);
+                }
                 let next = self.fire_dcomp_tile_rebuild_start();
                 info!(
-                    "[dcomp-native] runtime resize started; virtual-only mode ON + start-rebuild \
-                     via SetPictureTileSize={}x{} (demotes swapchains, suppresses promotion/regen, \
-                     purges pre-drag ghosts) — task-12b",
-                    next.width, next.height,
+                    "[dcomp-native] runtime resize started; virtual-only mode {} + start-rebuild \
+                     via SetPictureTileSize={}x{} (purges pre-drag ghosts{}) — task-12b",
+                    if virtual_mode { "ON" } else { "OFF (RESIZE_VIRTUAL disabled)" },
+                    next.width,
+                    next.height,
+                    if virtual_mode {
+                        "; demotes swapchains, suppresses promotion/regen"
+                    } else {
+                        ""
+                    },
                 );
             }
         }
