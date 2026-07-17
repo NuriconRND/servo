@@ -14,7 +14,6 @@
 // (dcomp_compositor.rs의 `#![allow(unsafe_code)]`와 같은 취지).
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
 use std::ffi::CString;
 use std::ptr;
 
@@ -41,10 +40,6 @@ use winapi::um::d3dcompiler::D3DCompile;
 use winapi::um::unknwnbase::IUnknown;
 
 use crate::dcomp_compositor::ComOwned;
-
-/// plane 텍스처(usize)→SRV 캐시 상한. 초과 시 전체 clear(별도 evict API 없음 — Task 4
-/// 브리프의 결정. 과대 clear는 안전: 다음 프레임들에서 필요한 만큼 다시 채워진다).
-const SRV_CACHE_LIMIT: usize = 128;
 
 // Fullscreen-triangle YUV -> RGBA conversion shader (Task 4 design table). Comments in
 // English per project convention for HLSL sources. Compiled twice at runtime (vs_5_0 /
@@ -132,10 +127,28 @@ unsafe fn compile_shader(source: &str, entry: &str, target: &str) -> Option<*mut
     Some(code)
 }
 
+/// draw 직후 per-convert SRV들을 Release한다(null은 건너뜀). Safety: 각 non-null 포인터는
+/// `create_srv`가 돌려준, 아직 Release되지 않은 SRV여야 한다.
+unsafe fn release_srvs(srvs: &[*mut ID3D11ShaderResourceView; 3]) {
+    for &s in srvs {
+        if !s.is_null() {
+            (*(s as *mut IUnknown)).Release();
+        }
+    }
+}
+
 /// 비디오별 DComp 스왑체인 백버퍼로 YUV plane을 스케일+색변환하는 1-draw 패스.
-/// `device`는 ANGLE 하부 D3D11 디바이스(비소유 — 호출자가 수명 보장; SRV 지연 생성에
+/// `device`는 ANGLE 하부 D3D11 디바이스(비소유 — 호출자가 수명 보장; plane SRV 생성에
 /// 쓰인다). 나머지 필드는 전부 `new()` 1회 생성 후 재사용되는 파이프라인 자원.
 /// `ComOwned`(Send/Sync 아님)를 담고 있으므로 이 구조체도 렌더러 스레드 전용이다.
+///
+/// plane SRV는 캐시하지 않고 convert()마다 새로 만들고 draw 직후 Release한다. 링 plane
+/// 텍스처는 `D3D11_USAGE_DYNAMIC`이라 소비 슬롯이 다시 present될 때마다 그 사이의
+/// `Map(WRITE_DISCARD)`로 백킹 할당이 rename(교체)된다 — 이전 백킹에 대해 만든 SRV를
+/// 캐시해 재사용하면 rename 뒤 그 SRV가 이미 해제된 rename 버퍼를 가리켜(dangling), NVIDIA
+/// D3D11 드라이버가 커맨드 제출 시 그 메모리를 역참조해 AV로 죽는다(규모=동시 비디오 수에
+/// 비례해 빨리 발현). ANGLE의 native 경로가 안정적인 이유도 매 draw 뷰를 다시 유도하기
+/// 때문 — fresh-per-convert가 그와 동치다.
 pub(crate) struct VideoConvertPass {
     device: *mut ID3D11Device,
     vs: ComOwned<ID3D11VertexShader>,
@@ -147,8 +160,6 @@ pub(crate) struct VideoConvertPass {
     /// SwapDeviceContextState로 활성화할 격리 상태(FeatureLevel 11_0,
     /// EmulatedInterface=ID3D11Device — ANGLE의 D3D10 비호환은 우리와 무관).
     context_state: ComOwned<ID3DDeviceContextState>,
-    /// plane 텍스처(usize) -> SRV. SRV_CACHE_LIMIT 초과 시 전체 clear.
-    srv_cache: HashMap<usize, ComOwned<ID3D11ShaderResourceView>>,
 }
 
 impl VideoConvertPass {
@@ -317,21 +328,13 @@ impl VideoConvertPass {
             blend_state,
             raster_state,
             context_state,
-            srv_cache: HashMap::new(),
         })
     }
 
-    /// texture(usize, AddRef 유지 중인 ID3D11Texture2D 핸들)의 SRV를 캐시에서 찾거나
-    /// 새로 만든다. Safety: texture는 살아있는 ID3D11Texture2D를 가리켜야 한다(lease 계약).
-    unsafe fn get_or_create_srv(&mut self, texture: usize) -> Option<*mut ID3D11ShaderResourceView> {
-        if let Some(srv) = self.srv_cache.get(&texture) {
-            return Some(srv.as_ptr());
-        }
-        if self.srv_cache.len() >= SRV_CACHE_LIMIT {
-            // 상한 초과: 전체 clear 후 재생성. 과대(다음 프레임에 다시 채움)는 안전 —
-            // 별도 evict API 없이 이 자기 제한만으로 충분(Task 4 브리프 결정).
-            self.srv_cache.clear();
-        }
+    /// texture(usize, AddRef 유지 중인 ID3D11Texture2D 핸들)의 SRV를 새로 만든다(캐시 금지 —
+    /// 위 구조체 주석 참고: DYNAMIC rename으로 캐시 SRV가 dangling→드라이버 AV). 호출자가
+    /// draw 직후 Release한다. Safety: texture는 살아있는 ID3D11Texture2D를 가리켜야 한다(lease 계약).
+    unsafe fn create_srv(&self, texture: usize) -> Option<*mut ID3D11ShaderResourceView> {
         let mut raw: *mut ID3D11ShaderResourceView = ptr::null_mut();
         let hr = (*self.device).CreateShaderResourceView(
             texture as *mut ID3D11Texture2D as *mut ID3D11Resource,
@@ -342,10 +345,7 @@ impl VideoConvertPass {
             warn!("[video-convert] CreateShaderResourceView failed (hr=0x{:08x})", hr as u32);
             return None;
         }
-        let owned = ComOwned::from_raw(raw)?;
-        let ptr = owned.as_ptr();
-        self.srv_cache.insert(texture, owned);
-        Some(ptr)
+        Some(raw)
     }
 
     /// lease의 plane들을 rtv(dst_size)로 스케일+색변환 1-draw. 내부에서
@@ -414,6 +414,8 @@ impl VideoConvertPass {
         );
         (*context).Unmap(self.cbuffer.as_ptr() as *mut ID3D11Resource, 0);
 
+        // plane SRV는 이 draw 전용으로 새로 만들고(캐시 금지 — 구조체 주석의 DYNAMIC rename
+        // dangling 참고) draw 뒤 unbind + Release한다. 실패 시 그때까지 만든 것만 정리한다.
         let plane_count = lease.plane_count.min(3);
         let mut srvs: [*mut ID3D11ShaderResourceView; 3] = [ptr::null_mut(); 3];
         for (i, slot) in srvs.iter_mut().enumerate().take(plane_count) {
@@ -422,9 +424,11 @@ impl VideoConvertPass {
                     "[video-convert] plane {} missing (plane_count={})",
                     i, lease.plane_count
                 );
+                release_srvs(&srvs);
                 return false;
             };
-            let Some(srv) = self.get_or_create_srv(plane.texture) else {
+            let Some(srv) = self.create_srv(plane.texture) else {
+                release_srvs(&srvs);
                 return false;
             };
             *slot = srv;
@@ -452,6 +456,12 @@ impl VideoConvertPass {
         (*context).OMSetRenderTargets(1, &rtv, ptr::null_mut());
         (*context).OMSetBlendState(self.blend_state.as_ptr(), &[1.0, 1.0, 1.0, 1.0], 0xffff_ffff);
         (*context).Draw(3, 0);
+
+        // draw 제출 후 SRV를 unbind하고 Release한다. Draw가 참조한 SRV는 D3D11 런타임이
+        // GPU 완료까지 실제 파기를 지연하므로(deferred destruction) 즉시 Release가 안전하다.
+        let nulls: [*mut ID3D11ShaderResourceView; 3] = [ptr::null_mut(); 3];
+        (*context).PSSetShaderResources(0, srvs.len() as u32, nulls.as_ptr());
+        release_srvs(&srvs);
         true
     }
 }
