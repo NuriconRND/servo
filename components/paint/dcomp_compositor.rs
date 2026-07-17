@@ -340,16 +340,17 @@ fn collapse_dirty_if_oversized(mut rects: Vec<DeviceIntRect>, limit: usize) -> V
 }
 
 /// 소유한 COM 포인터의 RAII 래퍼(Drop에서 Release). Send/Sync 아님 —
-/// 렌더러 스레드 전용(WR Compositor 계약과 일치).
-struct ComOwned<T>(ptr::NonNull<T>);
+/// 렌더러 스레드 전용(WR Compositor 계약과 일치). Task 4(dcomp_video_convert)가
+/// 재사용하므로 `pub(crate)`(가시성만 승격 — 정의 위치와 Drop 구현은 이동하지 않는다).
+pub(crate) struct ComOwned<T>(ptr::NonNull<T>);
 
 impl<T> ComOwned<T> {
     /// Safety: `ptr`은 소유권이 이전되는 유효한 COM 인터페이스 포인터여야 한다.
-    unsafe fn from_raw(raw: *mut T) -> Option<Self> {
+    pub(crate) unsafe fn from_raw(raw: *mut T) -> Option<Self> {
         ptr::NonNull::new(raw).map(Self)
     }
 
-    fn as_ptr(&self) -> *mut T {
+    pub(crate) fn as_ptr(&self) -> *mut T {
         self.0.as_ptr()
     }
 }
