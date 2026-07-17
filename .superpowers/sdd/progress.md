@@ -99,3 +99,30 @@
 ## 2026-07-17 비디오 WR 탈출 사이클 (plan 2026-07-17-video-wr-escape.md)
 - Escape Task 1: complete (commit b8515b129, review Approved 1차, Critical/Important 0). 게이트 video_escape_mode(OnceLock)+파서 테스트, 레이아웃 yuv 플래그(off시 바이트동일), 런처 -VideoEscape. Minor(이월): 소비 경로는 paint_api::rendering_context:: 정규화 경로 사용(크레이트 루트 re-export 없음 — Task 5 주의), 레이아웃 주석 한국어 1줄(허용). 함정 재확인: 서브에이전트 백그라운드 빌드 고아 종료 → 컨트롤러 Start-Process detached 필수 + 잔존 servoshell.exe가 링크 잠금(os error 5) → kill 후 재링크.
 - Escape Task 2: DONE_WITH_CONCERNS(코드 변경 없음, 검증 전용, RTX A5000 실기). 상세 escape-task-2-report.md. ★Step1(월45타일 native 승격): PASS — create_surface off=4→native=49(**+45**, 정확히 그리드 1칸 크기 213x216/214x216·전부 opaque=true), promote 46(비디오45+콘텐츠1). Step2(콘텐츠 타일 무효화 정지): PASS(강한 정량) — 하트비트 없는 콘텐츠 서피스 bind 총량 off 23,519회→native 2회(★약 11,760배 감소★), 하트비트 보유 서피스도 off 6,555→native 1,756(약 3.7배, 하트비트 잔존분만 남음 = 브리프 예측과 정확히 일치). Step4(off 무회귀+=surface 호환): 둘 다 PASS — off는 45타일 카운터 전원 일치(lockstep 픽셀 확인), =surface(-DComp -DCompSurface, 브리프 원문에 -DComp 누락되어 있어 보정 실행) create_surface=40(비디오36+콘텐츠4), **promote=0**(설계대로 스왑체인 승격 없음), WARN 0 — 프로모션이 스토리지 모드 무관 공통 경로임을 실측 재확인.★ ★Step3(mixed_media_demo/complex_media_stress): 시계·티커·로고·자막 등 비디오 외 전 요소 정상(2초 간격 스크린샷으로 진행 확인) — 단 **CONCERN 발견**: complex_media_stress.html의 PiP(알파 패널 위 오버레이 비디오, `#pipv`)가 native 모드에서 시작 직후(프레임 약 2)에 내장 카운터가 멈춤(60s/62s 캡처 동일값), 반면 동일 페이지를 -VideoEscape 없이(off) 재실행하면 PiP 포함 13영상 전부 완벽 lockstep 진행(269→332/2s) — **원인이 -VideoEscape native로 명확히 격리됨**. 로그 추적: PiP 전용 서피스(tile_size=358x201로 그리드 비디오들과 구분됨)는 정상 생성·스왑체인 승격·끝까지 bind(swapchain) 5,721회 반복(정상 그리드 비디오 5,722회와 동일 빈도, withhold 0, WARN 0) — 즉 프레젠트 파이프라인은 계속 정상 작동하는데 그 안의 픽셀(디코드 프레임)만 갱신이 멎음. 페이지 자체 주석이 이 경로를 "구 결함 경로"로 표시해둔 자리(§3-w/x/y 비불투명 슬라이스 비디오 계열)와 같은 취약점 재발로 보임 — 프로모션 실패는 아니므로 브리프의 BLOCKED 기준 미해당, 그러나 Task 3(interop) 착수 전 별도 트리아지 권고.★ 부수발견(결함 아님, 진단 주의사항): 프로젝트 표준 스크린샷 기법(.NET CopyFromScreen)이 **native로 승격된 비디오 화면을 항상 검정으로 캡처**함(swapchain/virtual surface 모두 동일 — off 대조군·비디오 아닌 오버레이는 정상 캡처되므로 결함이 아니라 DirectComposition 네이티브 서피스가 BitBlt 합성 표면과 별도 경로라는 방증) — Task 6(A단계 통합 검증)도 동일 기법 사용 시 똑같이 검정만 보게 되므로 로그/내장 카운터 기반 검증 또는 대체 캡처 API(PrintWindow PW_RENDERFULLCONTENT 등) 전환 필요. 함정 재확인: 런처가 -Page 무관하게 항상 ?cols=&rows=를 URL에 붙이므로 mixed_media_demo/complex_media_stress처럼 그 값을 읽는 커스텀 페이지는 -Cols/-Rows 명시 필수(안 하면 런처 기본 8x6=48이 페이지 그리드 수를 바꿔버림 — 최초 시도에서 실제로 발생, 폐기 후 재실행).
+- Escape Task 2: complete-with-findings (commit 4e2784432, 검증 전용). PASS: 45타일 +45 create_surface(213x216 opaque)/콘텐츠 타일 bind 23519→2/mixed demo 전요소/off·=surface 무회귀. ★결함 발견: stress 페이지 PiP(알파패널 위 비디오) native 모드 프레임 동결(서피스 present 지속·콘텐츠 스테일, off 정상) — 트리아지 진행. ★방법론: BitBlt/CopyFromScreen은 승격 비디오 픽셀 못 봄(검정) — Task 6 검증은 대체 캡처(PrintWindow PW_RENDERFULLCONTENT 후보) 필수.
+- PiP 트리아지 확정: (b) WR native-경로(PREFER만, WR이 그리는 모드)의 갱신 층 결함 — off 정상/hybrid 동결/=surface 동결 3중 대조, 우리 컴포지터는 전면더티 4372회 무결 제공. READBACK 진단은 스왑체인 승격 후 관측 불가(설계 한계) 기록. ★함의: external 모드는 WR draw 우회라 이 층 안 탐 — Task 6에서 stress PiP 라이브니스 명시 검증 필수, Task 7 AMD 가이드에 native=진단용+PiP류 캐비앳 문서화★. 이월: WR report_promotion_failure는 DebugFlags 미설정으로 dead code(경고 0이 무의미).
+- Escape Task 3: complete (commit 91813794c, review Approved 1차, Critical/Important 0). 리뷰어가 mach build --release 완주(성공 2:28)로 script 크레이트 검증 해소. Minor(이월): d3d11_ring 테스트 take_removed_rings 전역 드레인 병렬 플레이크(선재, --test-threads=1 100%) — 후속 티켓 후보. 게이트 off 스모크는 Task 6 회귀 항목으로 이월(등록 코드 inert).
+- Escape Task 4: complete (commit 9784eaf37, review Approved 1차, Critical/Important 0). VideoConvertPass: HLSL 1-draw+상수표 수치검증, SwapDeviceContextState 격리 전경로 확인, WARP 5/5+dcomp 14/14. Minor(이월): 테스트 코드 COM 미해제(프로세스 수명 무해), D3DCompile blob 이론적 누수, painter.rs 선재 clippy 에러(:806 unwrap — 이 사이클 무관).
+- Escape Task 5: complete (commit 206067629, review Approved 1차(opus), Critical/Important 0, mach build 3m43s 성공). External storage+stub 3종+add_surface 분기+세대 dedup — 리스 짝맞춤/COM 수명/Commit 원자성/하이브리드 격리 전 항목 소스 검증 통과. Minor(이월): warned_fail 공유 플래그로 실패 유형별 진단 입도 저하, 브링업 로그는 리스 성공 후에만 발화(Task 6 판독 시 유의). 이월 확인 항목(Task 6): ANGLE 상태 격리 실기(SwapDeviceContextState가 composite 중간 실행), 프로모션 실발화.
+- ★Escape Task 6: BLOCKED(FAIL) — Gate 1(월 45타일 external)에서 재현 가능한 크래시 발견,
+  브리프 STOP 규칙에 따라 중단(코드 변경 0, 상세 escape-task-6-report.md). 머신: RTX A5000,
+  빌드 servoshell.exe 2026-07-18 01:40(HEAD 206067629). ★핵심 발견: `-VideoEscape external`이
+  규모에 비례해 servoshell.exe를 크래시시킴 — Windows Application 이벤트 로그에 4회 독립
+  기록, 전부 `nvwgf2umx.dll`(NVIDIA D3D11 드라이버) 안의 `0xc0000005`(access violation),
+  두 fault offset(0x2c778b/0x583728)만 반복 재현(랜덤 손상이 아니라 결정적 경로 시사).
+  사다리 재현: 1x1/2x2/3x3 생존(2x2는 SERVO_DCOMP_DEBUG=1 병행 5분+ 무크래시 확인),
+  4x4는 지연 크래시(~32초), 5x5/6x6은 즉각 크래시(~2초), 9x5(45타일, Gate 1 본 시나리오)는
+  ~7초. **격리 대조군**: 동일 25타일을 `-VideoEscape native`로 실행 시 50초 관측 무크래시,
+  게이트 off 45타일도 60초+ 무크래시(WS~5.0GB, 기존 기준치 부합) — 크래시가 서피스/비디오
+  개수 자체가 아니라 external 경로(raw D3D11 변환+SwapDeviceContextState+비디오별 flip
+  스왑체인) 고유임을 확정. Step 2(브링업 계약 로그)는 안정 규모(2x2)에서 별도 PASS —
+  `[dcomp-dbg] external add` 라인의 scale=(1,1)/clip=타일 rect 정확/src=1920x1080 전부
+  기대와 일치. 게이트 off 무회귀도 별도 PASS. **Gate 1 FAIL로 Step 3(mixed/stress+PiP
+  라이브니스 결정 게이트)/Step 4(10bit/리사이즈/WebGPU/=surface)/Step 5(PresentMon/TileSize)는
+  미실시(BLOCKED) — PiP가 external에서 되살아나는지는 이번 세션에서 검증되지 않음.**
+  원인 가설(코드 리뷰 기반, 수정은 범위 밖): 락 규율·디바이스 리매핑은 native와 공유돼
+  건전(배제됨) — 차이는 external이 비디오마다 프레임당 raw D3D11
+  Draw+Present+SetContent 시퀀스를 반복한다는 점, 비디오 수 증가에 따라 크래시가 빨라지는
+  패턴은 경합(race) 가설과 정합. **Task 7(패키징) 진행 불가 — A 단계 게이트 전제 미충족.
+  근본 수정 후 재검증 필요(최소 재현 커맨드: `-Cols 5 -Rows 5 -Sync -1 -DComp -VideoEscape
+  external`, ~2초 내 크래시).**
