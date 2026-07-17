@@ -126,3 +126,31 @@
   패턴은 경합(race) 가설과 정합. **Task 7(패키징) 진행 불가 — A 단계 게이트 전제 미충족.
   근본 수정 후 재검증 필요(최소 재현 커맨드: `-Cols 5 -Rows 5 -Sync -1 -DComp -VideoEscape
   external`, ~2초 내 크래시).**
+- external 크래시 디버깅: RESOLVED (commit 061c7f5d0). 근본원인 = VideoConvertPass SRV 캐시가 DYNAMIC plane의 WRITE_DISCARD rename 후 댕글링(드라이버가 해제된 rename 버퍼 참조 → nvwgf2umx AV, 비디오 수에 비례해 가속). 수정 = SRV 캐시 제거, 매 변환 신선 생성+draw 직후 unbind+Release(D3D11 지연 파괴 안전). 검증: 5x5/45타일 각 5.5분 소크 0크래시+lockstep, 15/15, off/native 스모크. ★재발방지: DYNAMIC(WRITE_DISCARD) 텍스처에 뷰 캐싱 절대 금지 — rename마다 뷰가 낡음(ANGLE은 draw마다 뷰 재파생이라 무사고였음). 실험 사다리 11모드 기록 escape-crash-debug-report.md★
+- 크래시 픽스 리뷰: Approved(무수정). 부분실패 경로 SRV 정리/unbind-before-release/진단 게이트 완전 원복/실험 매트릭스 판별력(freshsrv vs nosrv 결정쌍) 전부 확인. 관찰: cbuffer 캐시는 뷰 간접 없음이라 동버그 클래스 비해당.
+- ★Escape Task 6 재개(2026-07-18): DONE — 근본수정(061c7f5d0) 후 Gate 1~5 + PiP 결정 게이트
+  전부 PASS(코드 변경 0, 상세 escape-task-6-report.md "재개(RESUMED)" 섹션). Gate 1(45타일
+  external 30분 소크): 인라인 폴링(하네스가 백그라운드 Monitor/Start-Sleep을 차단·고아화할
+  가능성 지적받아 `ping -n 300`으로 5분 단위 인라인 대기 반복 — 백그라운드 Monitor도 병행
+  가동했는데 이번엔 끝까지 살아남아 교차검증됨)으로 32.3분 관찰: WS 4651~4720MB **플랫**,
+  크래시 0, 신규 WARN/ERROR 0. Gate 3(mixed_media_demo 6/6 + complex_media_stress 13/13
+  external 승격, PiP 포함 opaque=true): ★PiP 라이브니스 결정 게이트 PASS★ — PiP 영역 정밀
+  크롭 비교(t=0/+62초)로 장면 전환+카운터 증가(27st→28st) 직접 확인, native 동결 결함
+  재현 안 됨(사이클 요구 충족). 드래그 테스트 predrag 샷에서 그리드 12+PiP **전부**
+  동일 카운터로 완전 lockstep도 별도 확인. 4K 회전 페이지는 create_external_surface
+  0건으로 의도대로 레거시 폴백. ★부수 발견(방법론 갱신): external 스왑체인은 BitBlt/
+  CopyFromScreen으로 실제 캡처됨(native/hybrid와 달리 검정 아님) — 선행 세션의 "BitBlt
+  무효" 결론은 native 한정으로 정정, Task 7 이후 스크린샷 1차 수단 재채택 가능.★ Gate 4:
+  10bit 색 정상(경로 오타 자가정정: `-Src tests/...`→`-Src ../jellyfish...`), 리사이즈/
+  드래그(§3-y, 신규 스크립트 drag_capture_external.ps1) 40스텝 연속 리사이즈 전 구간
+  크래시·잔상 0(mid-drag 흰색 과도상태는 정상 catch-up, 정착 후 lockstep 완전 회복) +
+  13개 external 스왑체인은 리사이즈 구간 재생성 0건(고정 픽셀 레이아웃이라 창 크기 무관 —
+  최상의 억제 결과), WebGPU 월 무회귀(게이트 off/on 둘 다 backend=WebGPU 정상), =surface+
+  external 호환(4/4 승격 + 일반 promote=0 설계대로), 게이트 off 45타일 무회귀 전부 PASS.
+  Gate 5: PresentMon(관리자, 전면, `--no_track_gpu --no_track_input`로 ETW 유실 회피 —
+  최초 시도 421,933건 유실) 46개 스왑체인(비디오45+콘텐츠1) 100% Composed:Flip 확인,
+  TileSize 유무 A/B 29.09fps↔30.39fps로 **사실상 무차이**(비디오가 이미 WR 콘텐츠 패스를
+  완전히 벗어나 있어 픽처캐시 타일 크기가 관여하지 않음 — TileSize 레시피는 native/hybrid
+  전용, external 채택 시 불필요라는 운영 결론). 이월: PiP `border-radius`가 external 사각
+  클립으로 대체됨(`rounded clip radii unsupported` warn, 시각적 사소 저하·기능 무관).
+  **Task 7(패키징/최종 리뷰) 착수 가능 — A 단계 게이트 전제 충족.**
