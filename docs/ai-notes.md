@@ -1,30 +1,28 @@
 # AI 프로젝트 노트 (Claude Code 메모리 정본)
 
-이 문서는 멀티GPU 비디오 월 프로젝트를 진행해온 Claude Code 세션의 **영속 메모리 스냅샷**이다
-(정본화 시점: 2026-07-13, WR Native Compositor(DComp) 완료·푸시 직후).
+이 문서는 멀티GPU 비디오 월 프로젝트를 진행해온 Claude Code 세션의 **영속 메모리 스냅샷**이다.
+(정본화 시점: 2026-07-17 — DComp 복합 콘텐츠 지원 사이클 + 애드온(티커 3원인/stylo 크래시/런타임 리사이즈) 전체 완료 시점.
+초판: 2026-07-13, WR Native Compositor(DComp) 완료·푸시 직후. 이번 판은 그 이후 42커밋 분량의 여정을 포함한다.)
 프로젝트의 전체 여정 — 근본원인 조사, 채택/기각된 설계, 실패 실험(재시도 금지 목록),
-운영 함정, 검증 레시피 — 가 담겨 있다.
+운영 함정, 검증 레시피 — 이 담겨 있다.
 
 ## 읽는 법
-
-- 각 절은 메모리 파일 1개이며 `<!-- memory/<파일명> -->` 주석으로 시작한다.
-- 첫 절(MEMORY.md)이 전체 인덱스다. 본문 중 `[[이름]]`은 같은 문서 안의 다른 절(해당
+- 가장 작은 단위는 메모리 파일 1개이며 `<!-- memory/<파일명> -->` 주석으로 시작한다.
+- 첫 파일(MEMORY.md)은 전체 인덱스다. 본문 중 `[[이름]]` 같은 표기는 같은 문서 안의 다른 절(해당
   이름의 메모리 파일)을 가리키는 상호참조다.
 - 각 파일 상단의 YAML frontmatter(name/description/type)는 메모리 시스템용 메타데이터다.
-- 절 안의 `§3-a` ~ `§3-t` 등은 시간순 작업 로그다. ★ 표시는 함정/재발방지 지식.
+- 절 안의 `§3-a` ~ `§3-y` 등은 시간순 작업 로그다. ★ 표시는 함정/재발방지 지식.
 
 ## 주의
-
 - 로컬 경로(`D:\...`, `C:\Users\ilwoonam75\...`)와 장비 정보(RTX A5000, 20코어 등)는
   **작성 머신 기준**이다. 다른 환경에서는 경로를 자신의 것으로 치환해 읽을 것.
 - 내용은 작성 시점의 사실이다. 파일/함수/플래그를 인용하는 부분은 현재 코드와 대조 후
   사용할 것.
 
 ## 다른 Claude Code 세션에서 이어받는 법
-
-1. 그대로 읽기: 이 문서를 읽히면 배경지식으로 충분하다.
-2. 메모리로 이식: 절 단위로 잘라 각 파일명대로
-   `~\.claude\projects\<프로젝트-슬러그>\memory\`에 저장하면 자동 메모리로 동작한다
+1. 그대로 읽기: 이 문서를 훑히면 배경지식으로 충분하다.
+2. 메모리로 이식: 절 단위로 나눠 각 파일명대로
+   `~\.claude\projects\<프로젝트-슬러그>\memory\` 에 저장하면 자동 메모리로 동작한다
    (슬러그는 자신의 프로젝트 폴더 경로에서 생성됨).
 
 ---
@@ -36,12 +34,12 @@
 
 # Project Memory Index
 
-- [다중 비디오 월 전체 여정 + ★현재 상태★](video-grid-play-heartbeat.md) — **★현재 상태(§3-t): WR Native Compositor(DComp) 전체 완료·PUSHED (17커밋 → nuriconrnd/multigpu-tiled-wall, HEAD cc170b23e, 최종 리뷰 Ready to merge YES). SERVO_COMPOSITOR_DCOMP=1(기본off): WR 타일→DComp 직접 draw+DWM 합성=②단 소멸 + egui 잔여 blit 스킵(사용자 승인 servoshell 수정)으로 게이트on 앱측 트래픽=콘텐츠 draw 1× = probe 패리티. A5000 전 검증 PASS(45타일 lockstep/메모리플랫/저더0/off 무회귀), 하단 흰 밴드도 소멸(DComp 전체커버). ★다음: AMD 실기 A/B(사용자 몫 — ServoWallPackage.zip 최종본에 -DComp 스위치+판독가이드; 스펙 §12에 해석 주의사항)★. 이월: Ctrl+F12 오버레이 게이트on 미표시(DEBUG_OVERLAY premultiplied 알파, 진단전용), 디바이스로스트 로그 폭주, §4.5 per-device 레지스트리(다중창). ★최대 함정: ppf(§3-p)가 pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동해 WR NativeSurface top-left 규약 파괴(타일 수직 조각남) → 게이트on이면 ppf 디스플레이 속성 제외+창 present 스킵(실발동 플래그 기준, env 기준이면 폴백 블랭크)으로 해결 — Gecko는 ppf 자체를 안 씀. ANGLE 창서피스의 HWND DComp 타깃 선점(0x88980800)도 게이트 opt-out 필수★.** — §3-r에서 AMD 창확대 급락 근본원인 확정: WR picture caching이 매 프레임 콘텐츠→타일(6장/1080p창, 창면적 비례)+타일→백버퍼 2단 재실행 = 창면적 ~3× vs probe 1× (판정: WR 프로파일러 Rendered picture tiles 6 고정, Alpha 0; 경로·프레젠트 가설은 실기 로그/PresentMon으로 기각 — AMD=HD 7800M GCN1 ~70GB/s). 해법=WR Compositor trait(0.68에 존재 확인, composite.rs:314/:1446 — 07-02 'API 없음' 판단은 오류) DirectComposition 구현으로 타일→백버퍼 draw 소멸 → probe 패리티. 규모 A-dyn급, 관례대로 brainstorm→스펙 승인→계획→SDD. || 완료·PUSHED(NuriconRND/servo, HEAD 11d2a274d): §3-q A-dyn 제로카피 전체(19커밋, Ready to merge, 45타일+2.6h소크 검증) + 10-bit(I420_10LE=Color10 실기검증/P010=Color16 라이브미검증) + surfman 해체 UAF 근본수정 + 로그 debug강등. ServoWallPackage.zip 1143MB(진단 exe+jellyfish 포함, run_wall -Src). 잔여: §4.5 per-device 레지스트리(CONSUMER_DEVICE 전역 단일 — 다중창 불성립), 비PROF 기아 warn, 8↔10bit 전환 키 재사용. 이전 §3-p(2026-07-11): ANGLE present-path-fast 적용 완료 — 매 프레임 offscreen→backbuffer present 복사 제거(창 확대 시 구형 AMD 병목, §3-o RenderDoc 규명). surfman device.rs에 EGL 디스플레이 속성 FAST 추가(luid_display_attribs 헬퍼), 커밋 bde39ef8f, COMMITTED+PUSHED(2026-07-12), 무게이트 기본 on. ★함정: RenderDoc 검증 불가(캡처 위해 copy 강제) → surface_orientation 확장 부재로 판정. 검증 전부 PASS(활성/Y반전없음/45타일회귀/WebGPU월/리사이즈), AMD fps 이득 추후. §3-n(2026-07-11): d3d11upload 대체 DynamicUploadSet(WRITE_DISCARD 직접 업로드, `SERVO_MEDIA_D3D11_UPLOAD=legacy` 복귀). de76fc519..b5bd0de95 7커밋 COMMITTED+PUSHED, ServoWallPackage.zip 재패키징(-LegacyUpload A/B).** 이전: D3D11 파이프라인별 업로드 완료(§3-k: 렌더러 업로드 27ms→0.01ms, 45타일 lockstep ±1) + 시작·멈춤 3연속 근본수정 완료(§3-l: 렌더러 우선순위/리드 큐/file 직접 재생 — 되감기 스크립트 왕복이 개별 멈춤·동기 경계의 원인이었음). 표출 레시피 최종 확정(§3-l) + 표준 런처·포터블 패키지·4K 회전 페이지(§3-m). §3-m까지 COMMITTED+PUSHED(~8ba3ee95d, 28커밋, 2026-07-10). 표출은 `etc/multigpu/run_video_wall_d3d11.ps1`로(구 런처는 D3D11 미적용 — not-responding); 무개발환경 PC는 `D:\ServoWallPackage.zip`(928MB). 함정 기록: §3-k 6종(번들=GStreamer 1.22.8, trait dead code, surfman 좀비 Surface, 디바이스 락 콘보이, uv 플립, FFI) + §3-l(소스 캐시는 gapless 전제, 리드 큐 기본 15=사실상 기본 ON +2.1GB, 진단 로깅이 스톨 7-10× 증폭). 다음 후보: 멀티GPU 어댑터 정합(스펙 §4.5); HW 디코드는 사용자 보류. 이전 완료: 스톨 수정, gapless, 동기그룹, vsync 드라이버. 실패실험/재시도 금지 목록 포함
+- [다중 비디오 월 전체 여정 + ★현재 상태★](video-grid-play-heartbeat.md) — **★현재 상태(§3-x, 2026-07-15 오후): 티커 밴드 이상 완결 — 근본원인 3건(알파 미기록 밴드/유령 불투명 슬라이스 클립 과대/★런처 SetWindowPos발 시작 리사이즈 스테일★) 전부 해소, 잔상 9404→0, mixed demo 완전 클린. 커밋 908b99a94+49bd70b37+0de120e0b+d9bce0072, 패키지 재생성(1146MB 07-15 12:58). ★재시도 금지: FORCE_PICTURE_INVALIDATION은 스테일 재도색 못 강제(WR 소스 실증)★. 이후 애드온: stylo 3.5h 크래시 근본수정(f64/f32 경계 불일치→UB, third_party/stylo 벤더링 [patch] 11크레이트, RED 129s→GREEN 30분 소크) + 복합 스트레스 페이지(complex_media_stress.html, 13영상 -Sync 13 필수) + ★런타임 리사이즈 잔상/드래그 블랙 해소 — 전부 리뷰 승인 완결(§3-y: 리사이즈 감지→SetPictureTileSize 픽처캐시 전량 재구축 + 드래그 중 가상 서피스 모드, 킬스위치 2단)★. **미푸시 총 42커밋**(git log nuriconrnd/multigpu-tiled-wall..HEAD 실측: 사이클2 10 + 사이클3 스펙·계획·구현 20 + 애드온 12 — 티커 3원인/stylo/리사이즈/테스트페이지). 패키지 최신(07-16 13:33, 1146MB — 전 픽스 exe+mixed/stress/repro 페이지+AMD 가이드). ★다음 세션: AMD 3중 A/B(없이/-DComp -DCompSurface/-DComp, 반드시 순수 비디오 월 페이지로) 결과 받으면 푸시 여부부터★. 전환(승격/강등) 화면 보장: 원자 교체+시딩으로 깨짐 구조적 불가, 동결 창구간만 극소(월 ~1프레임/병리 최대 0.5s 자동회복).★** 이전(§3-w): DComp 복합 콘텐츠 지원 사이클 완료 — 최종 리뷰 Ready to merge YES, 18커밋 로컬(총 28커밋 미푸시, 다음 세션: AMD 실측 결과 받으면 푸시 여부부터). mixed_media_demo가 =1/=surface 전 요소 정상(영상·시계·티커·자막). 구현: 부분 Present 기본 on(FLIP_SEQUENTIAL+GetBuffer(1) catch-up 차집합 복사+Present1, withhold 동결 소멸, 월 전면더티 복사 0)+강등 폴백(시딩 2케이스+제3상태+지수 쿨다운)+승격 위생(MIN_AGE 30)+★결함②의 진짜 원인은 우리 버그 2건: 사이클2 컬링의 is_opaque 오용→컬링 전면 제거(A-1, NO_CULL 소멸), AddVisual(TRUE,NULL)=형제 아래 렌더 z-역전→FALSE★. 패키지 1,201MB 재생성(mixed demo+alpha probe+AMD 가이드). ★AMD 3중 A/B: 성능은 순수 월 페이지로, =1 판독 시 컬링 전제 무효(부분 Present 포함)★. 함정: A-2 좌표계 혼용 실패, fps 앨리어싱(루프 주기 배수 샘플 금지), cargo test는 --features paint_api/no-wgl, mach build는 .venv activate 필요 — §3-w 참조.** 이전(§3-v): 결함 2건 실측 확정(해결됨). 이전(§3-u): DComp 스왑체인 하이브리드+레이어 컬링 완료 — 10커밋(03946de91..21f6dab41) 로컬 유지(사용자 결정: AMD 실측 확인 후 푸시 — 다음 세션에서 실측 결과 받으면 푸시 여부부터). SERVO_COMPOSITOR_DCOMP=1=하이브리드(전면갱신 불투명 서피스→flip 스왑체인 승격+full-coverage Present+컬링 = 월에서 DWM 1레이어·probe 동형), =surface=가상서피스 전용(AMD 3중 A/B용). 검증: 45타일 lockstep±0/fps 60.97/PresentMon 1545 Present(Composed:Flip). 다음: 푸시 결정 → AMD 3중 A/B(패키지 1.2GB 준비: 없이/-DComp -DCompSurface/-DComp). 이월: 비불투명 슬라이스 비디오 검정(=surface 베이스 공유, 프로덕션 무영향), Ctrl+F12(egui/present-skip 계열). 함정 다수 §3-u 참조(displayed_anchor 3상태, WR 리사이즈 서피스 미재생성 등).** 이전(§3-t): WR Native Compositor(DComp) 전체 완료·PUSHED (17커밋 → nuriconrnd/multigpu-tiled-wall, HEAD cc170b23e, 최종 리뷰 Ready to merge YES). SERVO_COMPOSITOR_DCOMP=1(기본off): WR 타일→DComp 직접 draw+DWM 합성=②단 소멸 + egui 잔여 blit 스킵(사용자 승인 servoshell 수정)으로 게이트on 앱측 트래픽=콘텐츠 draw 1× = probe 패리티. A5000 전 검증 PASS(45타일 lockstep/메모리플랫/저더0/off 무회귀), 하단 흰 밴드도 소멸(DComp 전체커버). ★다음: AMD 실기 A/B(사용자 몫 — ServoWallPackage.zip 최종본에 -DComp 스위치+판독가이드; 스펙 §12에 해석 주의사항)★. 이월: Ctrl+F12 오버레이 게이트on 미표시(DEBUG_OVERLAY premultiplied 알파, 진단전용), 디바이스로스트 로그 폭주, §4.5 per-device 레지스트리(다중창). ★최대 함정: ppf(§3-p)가 pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동해 WR NativeSurface top-left 규약 파괴(타일 수직 조각남) → 게이트on이면 ppf 디스플레이 속성 제외+창 present 스킵(실발동 플래그 기준, env 기준이면 폴백 블랭크)으로 해결 — Gecko는 ppf 자체를 안 씀. ANGLE 창서피스의 HWND DComp 타깃 선점(0x88980800)도 게이트 opt-out 필수★.** — §3-r에서 AMD 창확대 급락 근본원인 확정: WR picture caching이 매 프레임 콘텐츠→타일(6장/1080p창, 창면적 비례)+타일→백버퍼 2단 재실행 = 창면적 ~3× vs probe 1× (판정: WR 프로파일러 Rendered picture tiles 6 고정, Alpha 0; 경로·프레젠트 가설은 실기 로그/PresentMon으로 기각 — AMD=HD 7800M GCN1 ~70GB/s). 해법=WR Compositor trait(0.68에 존재 확인, composite.rs:314/:1446 — 07-02 'API 없음' 판단은 오류) DirectComposition 구현으로 타일→백버퍼 draw 소멸 → probe 패리티. 규모 A-dyn급, 관례대로 brainstorm→스펙 승인→계획→SDD. || 완료·PUSHED(NuriconRND/servo, HEAD 11d2a274d): §3-q A-dyn 제로카피 전체(19커밋, Ready to merge, 45타일+2.6h소크 검증) + 10-bit(I420_10LE=Color10 실기검증/P010=Color16 라이브미검증) + surfman 해체 UAF 근본수정 + 로그 debug강등. ServoWallPackage.zip 1143MB(진단 exe+jellyfish 포함, run_wall -Src). 잔여: §4.5 per-device 레지스트리(CONSUMER_DEVICE 전역 단일 — 다중창 불성립), 비PROF 기아 warn, 8↔10bit 전환 키 재사용. 이전 §3-p(2026-07-11): ANGLE present-path-fast 적용 완료 — 매 프레임 offscreen→backbuffer present 복사 제거(창 확대 시 구형 AMD 병목, §3-o RenderDoc 규명). surfman device.rs에 EGL 디스플레이 속성 FAST 추가(luid_display_attribs 헬퍼), 커밋 bde39ef8f, COMMITTED+PUSHED(2026-07-12), 무게이트 기본 on. ★함정: RenderDoc 검증 불가(캡처 위해 copy 강제) → surface_orientation 확장 부재로 판정. 검증 전부 PASS(활성/Y반전없음/45타일회귀/WebGPU월/리사이즈), AMD fps 이득 추후. §3-n(2026-07-11): d3d11upload 대체 DynamicUploadSet(WRITE_DISCARD 직접 업로드, `SERVO_MEDIA_D3D11_UPLOAD=legacy` 복귀). de76fc519..b5bd0de95 7커밋 COMMITTED+PUSHED, ServoWallPackage.zip 재패키징(-LegacyUpload A/B).** 이전: D3D11 파이프라인별 업로드 완료(§3-k: 렌더러 업로드 27ms→0.01ms, 45타일 lockstep ±1) + 시작·멈춤 3연속 근본수정 완료(§3-l: 렌더러 우선순위/리드 큐/file 직접 재생 — 되감기 스크립트 왕복이 개별 멈춤·동기 경계의 원인이었음). 표출 레시피 최종 확정(§3-l) + 표준 런처·포터블 패키지·4K 회전 페이지(§3-m). §3-m까지 COMMITTED+PUSHED(~8ba3ee95d, 28커밋, 2026-07-10). 표출은 `etc/multigpu/run_video_wall_d3d11.ps1`로(구 런처는 D3D11 미적용 — not-responding); 무개발환경 PC는 `D:\ServoWallPackage.zip`(928MB). 함정 기록: §3-k 6종(번들=GStreamer 1.22.8, trait dead code, surfman 좀비 Surface, 디바이스 락 콘보이, uv 플립, FFI) + §3-l(소스 캐시는 gapless 전제, 리드 큐 기본 15=사실상 기본 ON +2.1GB, 진단 로깅이 스톨 7-10× 증폭). 다음 후보: 멀티GPU 어댑터 정합(스펙 §4.5); HW 디코드는 사용자 보류. 이전 완료: 스톨 수정, gapless, 동기그룹, vsync 드라이버. 실패실험/재시도 금지 목록 포함
 
 - [Folder won't rename — zombie monitors](folder-lock-zombie-monitors.md) — orphaned background `tail -f`/`grep` from servo builds (parent dead) keep CWD inside the folder → Windows blocks rename; kill grep.exe/tail.exe with dead parents; remaining holders = live Claude session + MCP + open terminals
 
 - [Servo wall + WebGPU constraints & source patches](servo-wall-webgpu-constraints.md) — HTTP-only ES modules, WebGPU-only; local Servo source patched to add createQuerySet/resolveQuerySet, hide timestamp-query (Inspector hang), and implement copyExternalImageToTexture (was black textures)
-- [Servo build & run commands](servo-build-run-commands.md) — mach build needs `$ErrorActionPreference='Continue'` after sourcing servo_env.ps1 (else cargo stderr aborts build); project-local CARGO_HOME; wall launch command + monitor layout
+- [Servo build & run commands](servo-build-run-commands.md) — mach build = servo_env.ps1 + `$ErrorActionPreference='Continue'` + **`.venv` activate**(python toml); paint 유닛테스트 = `cargo test -p servo-paint --lib --features paint_api/no-wgl dcomp`; 표출 = run_video_wall_d3d11.ps1(-DComp/-Sync 총비디오수/-Page 쿼리 함정); DComp 진단 env 5종; fps 측정 앨리어싱 함정; cargo git checkout 직접 수정 무효([patch] 필수)
 - [mozangle build path gotcha](servo-mozangle-build-path.md) — build compiles GLOBAL ~/.cargo mozangle (not .servo) unless CARGO_HOME set; ANGLE .cpp edits need hard-clean to rebuild
 - [Servo WebGL2 wall findings](servo-wall-webgl2-findings.md) — WebGL2 keyframes on wall: fixed single-window floats + multi-context crash + cross-GPU black tile; **keyframes-black RESOLVED** (validate_vertex_attribs_for_draw used vertex storage type as shader base type & omitted matrix types → dropped meshes); **"wall slow" was a `--features webgl_backtrace` build artifact** (per-command backtrace symbolication; normal release = 60fps@3840); "top-left only" = fixed-size probe canvas vs 3840 virtual viewport; **mouse-move FPS drop FIXED** (egui forced full-tile redraw per CursorMoved)
 - [Wall mouse ROOT CAUSE + FIX](wall-mouse-rootcause.md) — Task 2 SOLVED+VERIFIED: compositor EventLoopWaker floods winit ~540/s via PostMessage user-events that outrank WM_MOUSEMOVE in Win32 PeekMessage priority → input starved at 60fps. FIX = suppress waker posts while animating (WakeCoalescer). Verified 0→138 mouseEv/s. PITFALL: drive synthetic cursor with SetCursorPos (distinct points), NOT relative SendInput (didn't move cursor → false 0s). Diagnostics to strip before commit. Tools: wall_synth_mouse_wiggle.ps1, wall_mouse_hittest_probe.ps1, tests/html/mouse_count_probe.html
@@ -155,52 +153,21 @@ metadata:
 
 §3-q (2026-07-12 오전, ★세션 강제 중단 — 브레인스토밍/코드탐색 도중 10:44 끊김, 코드 변경 0★): **구형 AMD 잔여 격차 조사 착수 + A안 확정.** present 복사 제거(§3-p) 후에도 남을 probe 대비 구조 격차 분석(superpowers:brainstorming 진행 중이었음): probe=**1패스**(Y/U/V plane 텍스처를 렌더 패스에서 직접 샘플→셰이더 BT.709 변환→백버퍼, 타일·프레임당 draw 1회 ~11MB), Servo=**2패스**(GstD3D11Converter가 YUV→RGBA 링 텍스처 draw 1회 + WR 합성이 그 RGBA를 다시 샘플 draw 1회, ~28MB — RGBA 중간 텍스처 +16MB RW/타일, 45타일 60fps ≈ +43GB/s). 사용자 확인 2건: (1) AMD 실기에서 **GPU 사용률이 먼저 포화**(fill/대역폭 병목 정합), (2) 개선 방향 = **A안 채택: GstD3D11Converter 제거 + WR가 YUV plane 직접 샘플(1패스화)**. GPU 트레이스 선행(권장안)과 DirectComposition(B)은 보류. 중단 시점 진행: 코드 탐색 초입 — media 추상화에 `VideoFrameYuvData`(I420/NV12+colorimetry, 구 raw 경로가 WR YUV 합성에 쓰던 것) 이미 존재 확인. **미확인 과제**: D3D11 공유핸들 프레임을 WR YUV 외부 이미지로 넣을 수 있는지(현 TextureHandle=RGBA 1장 전제), 비디오가 picture-cache 패스를 추가로 타는지, WR YUV 외부 텍스처 경로 실 비용. 관련 파일: layout/display_list/mod.rs, components/script/dom/**html/**htmlmediaelement.rs(dom/ 바로 아래 아님 주의), media/backends/gstreamer/render.rs, media-thread/lib.rs. 참고: 이 분석의 probe 셰이더 근거 = D:\2_TechReview\20260703_dx_wall_probe\src\dx11_tile_renderer.cpp.
 
+§3-y (2026-07-16, Task 12/12b — 런타임 리사이즈 완결): **★창 드래그/리사이즈 시 잔상·영상 블랙 해소, 리뷰 승인 완결(커밋 5abf14c6f/51db7c2fe/cfa25648c/fb2b15ecb)★.** 구조: ①리사이즈 감지(디바이스 픽셀 비교, painter resize 경로)+10프레임 안정화 디바운스 → **SetPictureTileSize로 픽처 캐시 전량 재구축**(WR render_backend.rs:1139→picture.rs:2297-2332 destroy_compositor_surface+tiles.clear — 서피스가 새로 만들어져 스테일이 물리 소멸; FORCE_PICTURE_INVALIDATION은 프리미티브 없는 구역을 재-bind 못 시켜 무효였음) ②드래그 중 = resize_active: 전 스왑체인 즉시 강등(쿨다운 무페널티)+승격/리젠 억제 = 가상 서피스 모드(드래그 중 영상 연속 재생; regen 51→2, withhold 44→0) + 드래그 시작 시에도 재구축 1회 ③타일 크기 결정론 수렴: 시작 발사=대체값(512x512), 안정화 발사=**기동 정상상태(env Some 또는 None — None이면 스크롤바 특수 타일 크기 복원)** → -TileSize A/B 실험 보존 실증 ④킬스위치 2단: RESIZE_VIRTUAL(강등만 끔 — 재구축은 보존되게 시작-발사를 마스터 게이트로 분리, RED 모드 검증됨)/RESIZE_REBUILD(전체 끔). 무리사이즈 실행 비용 0(발사 0 검증). ★함정: 시작 잔상 사건의 원인은 런처 자신의 SetWindowPos(크기를 외곽 rect로 재적용)이었음 — 런처가 클라이언트 크기 불변을 보장하는 한 시작 잔상 없음★. 이월: resize_active latch가 디바이스로스트 중 걸릴 수 있는 엣지, 리사이즈 시딩 실패 시 프레임당 재시도.
+
+§3-x (2026-07-15 오후, Task 9~10c 애드온): **★티커 밴드 이상 완결 — 근본원인 3건 전부 해소, 화면 완전 클린(잔상 9404→0), 패키지 재생성(1146MB, 07-15 12:58, 티커 픽스 exe+런처)★.** 원인 분해: ①알파 미기록 밴드(Task 9: tile∩clip 확장+시저 투명 클리어+FBO0 바인딩, 908b99a94+49bd70b37) ②검정 = 유령 불투명 슬라이스(텍스트 겹침으로 콘텐츠는 알파 동반으로 가고 불투명 서피스는 타일 1개만 bind인데 클립은 슬라이스 전체 valid 유니온 → 미도색 영역이 DComp 풀 메모리를 불투명 노출·풀 재활용=간헐) → 클립을 실제 bind 타일 유니온으로 정제(0de120e0b) ③프로즌 잔상 = ★런처 자체가 원인★ — 실행 후 SetWindowPos가 크기를 외곽 rect로 재적용해 클라이언트 1080→1041 중도 축소 → WR-valid 스테일, 새 레이아웃에 프리미티브 없는 구역은 영원히 재bind 안 됨 → 런처가 AdjustWindowRectEx로 클라이언트 최종 크기 생성(d9bce0072+패키지 run_wall.ps1 미러). ★재시도 금지: FORCE_PICTURE_INVALIDATION로 스테일 재도색 강제 — 무효(WR picture.rs:2375-81, 더티 재계산만 강제; Task 10b 실증)★. 알려진 한계: 런타임 리사이즈 시 가상 서피스 스테일 이론상 잔존(월 무관), 런처 DPI 미인식(단일 스케일 무관). 후속 스트레스 검증(110fa1e70): tests/html/complex_media_stress.html — 12영상 그리드+PiP 알파 패널 위 비디오+이중 티커(정/역방향)+4Hz 통계 패널+세로 스크롤러+시계/로고/자막, =1에서 전 요소 정상·잔상 0·13-way lockstep(Total# 전 타일 동일). ★함정: 페이지에 그리드 외 비디오(PiP 등)가 있으면 런처 -Sync를 총 비디오 수로 명시해야 함(기본 Cols*Rows라 초과분 1개가 동기 그룹서 밀려 solo 시작 = 비동기 타일)★. **Task 11(07-16): 3.5h 소크 크래시 근본수정 — stylo CSS 애니메이션 경계 패닉(f64 종단가드 `==1.0` vs f32 키프레임 탐색 반올림 불일치 → release unreachable_unchecked UB → OOB; capSlide류 6키프레임 무한 반복 시 발생). 수정 = third_party/stylo 벤더링([patch] 11크레이트, 커밋 de1b323b9)+가드 f32 통일+안전 폴백(6a1846fb7). RED 129초 재현(tests/html/stylo_anim_repro.html) → GREEN 30분+ 소크 0패닉. ★stylo rev 갱신 시 재복사+재적용 필수; git checkout 직접 수정은 rebuild 안 됨★. 크래시 후 crash page도 crash하는 이중 결함은 미조사 이월.** 미푸시 총 36커밋.** (이전 기록:) 근본원인 = 알파 슬라이스의 미기록 밴드 노출: WR 네이티브 경로의 서피스 클립 = 타일 valid **합집합 사각형**(Draw 경로는 타일별 클립)이라, 스크롤 텍스트처럼 좁은 밴드만 그리는 알파 슬라이스는 클립 내 미기록 구역의 **미초기화 가상 서피스 메모리**(실행마다 검정/이전 콘텐츠 조각/파랑)가 그대로 합성됨. 수정 = `!is_opaque && valid==dirty` 타일에서 BeginDraw를 tile∩clip로 확장+투명 클리어(시저를 소유 영역으로 제한+FBO 0 명시 바인딩 — 아틀라스 이웃/잔류 FBO 함정). ★잔여 미해결(사용자 결정 대기): 우측 하단 ~17px 검정 스트립 — 별개 원인, 불투명 티커바-배경 슬라이스의 하단 타일을 WR이 bind 자체를 안 함(구멍). 알파 픽스가 노출한 것. 조사 vs 수용 미정.★ 진단 신무기: SERVO_DCOMP_VALIDPROBE(valid/dirty 로깅). 총 미푸시 = 선행 10 + 이번 사이클 18 + Task 9 계열 2 = 30커밋.
+
+§3-w (2026-07-15): **★DComp 복합 콘텐츠 지원 사이클 전체 완료 — 최종 리뷰 Ready to merge YES, 18커밋(b31327a45..2c3732dde) 로컬(선행 10커밋 위, 총 28커밋 미푸시 — AMD 실측 후 푸시 결정)★.** §3-v의 결함 2건 전부 해결: mixed_media_demo가 =1/=surface 양쪽에서 전 요소 정상(영상 그리드·JS시계·티커·자막). 구현: ①**부분 Present(기본 on)** — 승격 스왑체인 FLIP_SEQUENTIAL 전환, catch-up = stale−더티 정확 차집합을 GetBuffer(1)→(0) 복사 후 매 그려진 프레임 Present1(더티 힌트 ≤16) → withhold 동결 소멸; PoC 4게이트 PASS(GetBuffer(1) 복사소스 가능, 로테이션=2버퍼 핑퐁), 45타일 전면더티 프레임 복사 0 실측. kill switch SERVO_DCOMP_NO_PARTIAL_PRESENT ②**강등 폴백** — withhold 30 또는 DXGI 오류 시 가상서피스 복귀(시딩: pre-attach=fallback에 누적더티만 / post-attach=신규 가상+buffer0 전체; 리젠 후 제3상태=fallback 없음 → 강등 보류+단발 로그), 재승격 지수 쿨다운 300×2^n cap3600(쿨다운 중 streak 중단) ③**승격 위생** MIN_AGE 30프레임 ④**결함② 진짜 원인은 스펙 가설(알파 슬라이스)이 아니라 우리 버그 2건**: (a) 사이클2 레이어 컬링이 WR is_opaque(=backdrop 힌트, 클립 피복 비보장)를 오클루전 근거로 오용 — 하트비트 점 2x2만 그리는 전면클립 슬라이스가 진짜 비디오를 컬링 → **컬링 전면 제거(A-1), SERVO_DCOMP_NO_CULL 게이트 소멸**(월 실측: 정상상태 컬링 발동 0 — 사이클2의 'DWM 1레이어' 검증은 컬링 덕이 아니었음) (b) **★AddVisual(TRUE, NULL)은 MS 문서상 형제들 '아래' 렌더 = z 전체 역전★** → FALSE로 수정(월은 유효 visual 1개라 잠복). ★재발방지 함정: A-2 dense-tile 컬링 술어는 가상공간 extent(+16384) vs 디바이스 clip 비교로 영원 미발동이라 폐기 — 두 좌표계 혼용 주의; 버닝 카운터 fps 측정 시 샘플 간격이 소스 루프 주기(900프레임≈30s) 배수면 앨리어싱(0.33fps 오판 소동); cargo test -p servo-paint는 `--features paint_api/no-wgl` 필수 + zeroize derive 매니페스트 픽스(f0267e34e); mach build에 servo_env 소싱 후 `. .\.venv\Scripts\Activate.ps1`도 필요★. 패키지 ServoWallPackage.zip 1,201MB(07-15 03:51): HEAD exe + mixed_media_demo.html + dcomp_alpha_probe.html(?case=solid|text|video&hb=) + run_wall.ps1 AMD 가이드(성능 3중 A/B는 순수 월 페이지, mixed는 정확성 확인용). ★AMD 해석 주의: =1은 이제 부분 Present 포함·컬링 없음 — 사이클2 판독 가이드의 컬링 전제 무효.★ 이월: =surface 전용 캡션/티커 backdrop 검정(진단 모드 한정, hybrid 무영향), Ctrl+F12, 디바이스로스트 로그 폭주, §4.5 다중창, 스펙 §11.6 미세 한계. 진단 자산: SERVO_DCOMP_READBACK=1(unbind readback, 프레임 120 상한). 스펙 §11=구현 결과 정본.
+
+§3-v (2026-07-14 오후): **★복합 미디어(영상+텍스트+애니메이션) 페이지에서 DComp 게이트 결함 2건 실측 확정 — 데모는 Draw(-DComp 없음)로 표출 중, DComp 복합 콘텐츠 지원은 후속 수정 사이클 필요★.** 페이지 `tests/html/mixed_media_demo.html`(3x2 비디오 그리드 100vh + fixed 상단바(회전로고/LIVE펄스/JS시계)+반투명 자막 슬라이드+하단 뉴스티커, ?cols=&rows=&src=). 결함①(하이브리드 =1, **신규**): 시작 직후 초기 페인트 3프레임이 전면 더티라 PROMOTE_STREAK=3을 자명하게 충족 → 상단바 슬라이스까지 스왑체인 승격 → 이후 시계 1초 텍스트/로고 애니 등 **부분 갱신만 발생 → full-coverage Present 규칙을 영원히 못 채워 withhold 무한**(실측 상단바 id6 20,655회 covered=0/2 — 단 1회도 Present 안 됨=시계 정지, 비디오 id0도 341회 covered=3/6 — 30fps 콘텐츠라 매 프레임 전면 더티 아님). §3-u의 "withhold≈절반은 정상 케이던스" 판정은 순수 비디오 월 한정이었음. 수정 방향 후보 = 부분 더티 지속 시 가상서피스로 자동 강등(demote; fallback_virtual 이미 보유) 또는 승격 게이트를 시작 과도기 이후로. 결함②(=surface에서 재확인, 이월 결함 ④의 확장): 비디오 검정 + 티커 텍스트 미표시 — 그리드를 100vh 단일 블록(검증 구조)으로 재구성해도 =surface에서 비디오 영역 검정(상·하단 바는 정색 표출). **레이아웃 함정: 바를 일반 플로우 블록으로 두고 그리드 82vh로 줄이면 =1에서도 전면 알파 슬라이스에 비디오가 들어가 전화면 검정**(재현 레이아웃 2호). 판정 도구: SERVO_DCOMP_DEBUG=1 로그의 create_surface opaque= + add_surface clip + withhold covered=N/M, CopyFromScreen 픽셀 샘플(2초 간격 2회 비교로 재생/시계 동작 판정). **함의: AMD 3중 A/B는 반드시 순수 비디오 월 페이지(video_grid_6x6_play.html)로 측정할 것 — 복합 페이지는 결함이 성능 판독을 오염.** Draw 경로는 동일 페이지 완전 정상(비디오 재생·티커·자막·시계 전부, egui 툴바 흰 밴드만 상단 노출=게이트 off 정상 동작).
+
+§3-u (2026-07-14): **★DComp 스왑체인 하이브리드 + 레이어 컬링 완료 — 최종 리뷰 픽스까지 완료, 10커밋(03946de91..21f6dab41) 로컬 미푸시(사용자 결정 대기)★.** 배경: AMD 실측에서 DComp로 GPU% 개선됐으나 대형창+다수 비디오에서 프레임 드랍 잔존 — 판별 체인(probe 유지·Servo만 드랍 / -TileSize 무관 / 전면 레이어 2장 실측)으로 용의자 = ①가상 서피스 대여/반납 기구 ②DWM 2레이어. 해법(A안, B=백버퍼 직행·C=vendored WR 기각): `=1`에서 **연속 3프레임 전면 갱신 불투명 서피스를 flip 스왑체인으로 승격**(BeginDraw/EndDraw 소멸) + **full-coverage Present**(타일 단위 valid 피복 판정, 부분 dirty는 같은 백버퍼 누적+보류 — 잔상 불허·지연 허용) + **가려진 불투명 레이어 컬링**(AddVisual 이연) → 월에서 DWM 1레이어+flip=probe 동형. `=surface`=가상서피스 전용(AMD 3중 A/B: 없이/surface/hybrid — ③>②면 대여/반납 기구가 진범). 검증: 45타일 lockstep±0/메모리플랫/fps 60.97/PresentMon =1 1545 Present(Composed:Flip) vs =surface 0. ★핵심 함정/발견: ①승격~첫Present 창구간에 fallback이 표시되는데 오프셋 산식이 storage 타입 기준이면 ~16384px 밖 소실 → `displayed_anchor` 3상태(fallback/구스왑체인/현스왑체인)로 표시측·렌더측 anchor 분리(재현: quad_promote_partial.html?full=N) ②★WR은 창 리사이즈에서 서피스를 재생성하지 않음★ → extent 변화 감지 스왑체인 재생성 필수 ③요소 첫 transform 부여가 슬라이스 전면 무효화 1프레임 유발 ④★비불투명 슬라이스의 비디오(D3D11/YUV external)는 DComp에서 검정 — =surface 베이스 공유 결함(이월, 프로덕션 flex-wrap 월은 불투명 슬라이스라 무영향; 비디오 없는 알파 솔리드는 정상=알파 자체 문제 아님, config alpha=8 확인) ⑤Ctrl+F12는 다른 계열 재판명(프로파일러 메인 프레임버퍼 드로우가 present 스킵으로 미표시) ⑥30fps 콘텐츠 60Hz 합성 시 부분 dirty 프레임 Present 보류 = 정상 케이던스(withhold≈절반) ⑦알파 컬링 규칙 = 주체만 불투명 조건(완전 피복 알파 제외는 시각 등가). ServoWallPackage.zip 최종(1.2GB, -DComp/-DCompSurface/-TileSize). AMD 3중 A/B = 사용자 몫.
+
 §3-t (2026-07-13): **★WR Native Compositor(DComp) 전체 완료·PUSHED — 최종 리뷰 Ready to merge YES, 20커밋(2b67c743f..36a972a4b) → nuriconrnd/multigpu-tiled-wall.★** +타일 크기 실험 노브(36a972a4b): `SERVO_WR_PICTURE_TILE_SIZE=WxH`(painter가 DebugCommand::SetPictureTileSize 송신, WR 공식 API·vendoring 불요) + 런처 `-TileSize` 스위치(set-or-clear 관례). 창 이상이면 슬라이스당 타일 1장(45타일 실기 검증: create_surface tile_size=1920x1080, 표시 무결). 총 쓰기 대역폭은 타일 크기 무관 — per-tile bind/unbind·무효화 입도 A/B용. ServoWallPackage.zip 최종(22:16, 1146MB, -TileSize 포함). 후속 2건 포함: 하단 검정 밴드 제거(원인=egui **top 패널**이 웹뷰를 밀고 DComp는 창 원점부터 그려 하단 미커버 → 게이트 요청 시 크롬 패널 미배치=웹뷰 풀윈도우, ec399ddab; 45타일 실기 밴드 0px 확인; ★검증 함정: 타이틀바로 클라이언트가 화면 밖이면 CopyFromScreen이 가짜 검정 밴드 캡처 — 온스크린 배치 후 판정★). 사용자 결정 처리: 푸시 진행 / egui 잔여 blit 지금 수정(servoshell 무변경 조항 사용자 승인 해제 — dcomp_native_active getter+gui.rs 웹뷰 blit 가드 35fa1f7df, 게이트 on 앱측 트래픽=콘텐츠 draw 1× **probe 패리티 달성**, 부수효과로 하단 흰 밴드 소멸·DComp 전체커버) / Ctrl+F12 후속 이월. ServoWallPackage.zip 최종본(blit 스킵 exe, ~1143MB). `SERVO_COMPOSITOR_DCOMP=1`(기본 off): WR 타일→DComp 가상서피스 직접 draw + DWM 합성 = ②단 소멸. 검증(A5000 실기): PoC 4/4, 4분면 픽셀정확+리사이즈, 45타일 lockstep±0~1/블랙0/5분 메모리플랫/fps 61.5 drop0, WebGPU 월 무회귀, off 완전 무회귀, 런처 -DComp(run_video_wall_d3d11.ps1+run_wall.ps1), ServoWallPackage.zip 재패키징(1143MB, AMD 판독가이드 포함). ★핵심 함정/발견(재발방지): ①**ppf(§3-p)가 pbuffer(GL_FRAMEBUFFER_DEFAULT)에도 발동**(UsePresentPathFast renderer11_utils.cpp:2677; viewScale+1+시저 y반전 StateManager11.cpp:535/1416) → WR NativeSurface top-left 규약(stock ANGLE 전제) 파괴 = 타일 수직 조각남. 해결=게이트 on이면 ppf 디스플레이 속성 제외+창 present 스킵(실발동 Cell 플래그 기준 — env 기준이면 폴백 블랭크). Gecko가 되는 이유=ppf 자체를 안 씀 ②**ANGLE 창 서피스가 HWND DComp 타깃 선점**(0x88980800) → 게이트 on이면 EGL_DIRECT_COMPOSITION_ANGLE 없이 창 서피스 생성 필수 ③PoC는 clear+자체 시저 flip이라 ppf 방향 문제 검증 불가(상쇄) — 방향 검증은 실 WR draw로만 ④surfman은 workspace 비멤버(패치 크레이트) — -p 피처 지정 불가, 테스트는 크레이트 디렉터리/스탠드얼론 사본에서. **잔여(사용자 결정/후속)**: (1)★잔여 egui blit — 게이트 on에서도 콘텐츠 없는 오프스크린→백버퍼 blit이 창면적 ~1× 잔존(AMD 합계 ~2× vs probe 1×; gui.rs:622-636 스킵은 'servoshell 무변경' 조항 충돌로 사용자 결정 대기 — AMD A/B 해석 시 유의) (2)Ctrl+F12 오버레이 게이트 on 미표시(DEBUG_OVERLAY premultiplied 알파, 진단전용, 원인규명됨) (3)하단 egui 툴바높이 흰 밴드(스코프 허용) (4)디바이스 로스트 시 per-tile 로그 폭주. AMD 실기 A/B = 사용자 몫(패키지 준비됨). 문서: 스펙 §12(구현결과/이탈), 원장 .superpowers/sdd/progress.md, evidence/.
 
 §3-s (2026-07-13): **WR Native Compositor(DComp) 브레인스토밍+스펙+계획 완료 — SDD 실행 대기.** 스펙 `docs/superpowers/specs/2026-07-13-wr-native-compositor-design.md`(커밋 2b67c343f, 사용자 승인) + 계획 `docs/superpowers/plans/2026-07-13-wr-native-compositor.md`(커밋 011621190, 7태스크). 사용자 결정: 범위=월 표출 전용 최소(단일 창, `SERVO_COMPOSITOR_DCOMP` 게이트 기본 off, egui 툴바 가려짐 허용, 창 단위 인스턴스로 다중창 확장성 확보), 완료 기준=개발기 검증+ServoWallPackage 재패키징(AMD 실측은 사용자). 접근=A안 `CompositorConfig::Native`+DComp(WR 무수정), B안 vendored 핵/C안 운용제한 기각. ★계획 단계 실측 앵커(재조사 불요): ①`DrawTarget::NativeSurface`는 WR이 **무조건 top-left** 취급(webrender-0.68 device/gl.rs:1296, flip 없음 :1288) → 전역 surface_origin_is_top_left 변경 불필요(그 옵션 자동set은 Layer 모드만, init.rs:336-341) ②surfman 창 서피스가 `EGL_DIRECT_COMPOSITION_ANGLE` 요청(angle/surface.rs:296) → **게이트 on이면 opt-out 필수**(CreateTargetForHwnd는 (hwnd,topmost)당 1개; ppf는 디스플레이 속성이라 무영향) ③winapi 0.3.9 um/dcomp.rs에 필요 인터페이스 완비(VirtualSurface 포함), paint 크레이트 winapi features에 dcomp 계열 추가 필요 ④pbuffer 래핑은 기존 `create_pbuffer_surface`(angle/surface.rs:202) 변형으로 — 단 share-handle/keyed-mutex assert 제거 필수(DComp BeginDraw 텍스처는 비공유) ⑤`prefer_compositor_surface` Servo 전체 grep 0건 → 외부서피스 3종 stub 안전 ⑥`enable_native_compositor`는 디버그 토글시만 호출(mod.rs:1619) → warn no-op 안전 ⑦WR 프로파일러에 composite 전용 카운터 없음 → 판정=Renderer time+GPU% 창크기 스윕 A/B+PresentMon ⑧렌더러 호출순서: update_native_surfaces(1670)→begin_frame(1687)→타일 bind/unbind(3187/3308)→composite_native(6656: add_surface들+start_compositing)→end_frame(1913) ⑨virtual_surface_size=1024*32(Gecko 관례; WR이 타일을 vss/2 중심 배치, picture.rs:2477) ⑩bind 원점 보정 = BeginDraw update_offset − dirty_rect.min(Gecko 동일). PoC 선례 실행법: `cargo run --release -p servo-paint-api --example d3d11_dyn_poc --features no-wgl`(우리 PoC는 dcomp_native_poc, 게이트 4종 FAIL시 HALT).
 
 §3-p (2026-07-11): **ANGLE present-path-fast 적용 완료 — 매 프레임 present 복사 제거.** §3-o에서 규명한 ANGLE offscreen→backbuffer CopyResource(창 확대 시 구형 AMD 병목)를, surfman `device.rs`에 EGL 디스플레이 속성 `EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE=FAST`를 추가해 제거(ANGLE이 백버퍼 직접 렌더, NeedsOffscreenTexture=false). 구현: `luid_display_attribs` 헬퍼로 두 LUID 경로(Device::new + new_isolated 프로브) 동일 속성 통일(ANGLE LUID 디스플레이 캐시 일관성 = 격리 WebGL/WebGPU 블랙타일 방지). 커밋 bde39ef8f(device.rs 단독) + 스펙/계획/부기 문서 33ca76af6. **COMMITTED+PUSHED(2026-07-12, b5bd0de95..33ca76af6 → nuriconrnd/multigpu-tiled-wall).** 무게이트(기본 on, 사용자 결정). **★핵심 함정: RenderDoc으로 검증 불가 — RenderDoc이 캡처 위해 ANGLE을 offscreen+copy로 강제(baseline/ppf/ppf+dcomp-off 3구성 전부 copy 동일). 대체 검증 = present-path-fast 켜지면 ANGLE이 EGL_ANGLE_surface_orientation 확장 미광고(Renderer11.cpp:1337) → surfman에 임시 eprintln으로 eglQueryString(EXTENSIONS) 확인 = `present_path_fast_engaged=true`.** 검증 전부 PASS: 활성 확인(비디오+WebGPU월), Y반전 없음/색정상(2x2·45타일·WebGPU 스크린샷; ANGLE viewScale 내부보정으로 WR 투명), 45타일 회귀 FAIL=0/45마커/import0/lockstep±1, 격리디바이스 WebGPU월 60fps 블랙0, 리사이즈 정상. AMD 창확대 fps 이득만 추후 실기(dynamic과 동일 패턴). 독립확인 원하면 ETW/GPUView·D3D11 debug-layer(주입 없는 도구). 실패 실험(재시도 금지): DComp off해도 RenderDoc copy 그대로(DComp 원인 아님). 최종리뷰 merge YES(Critical/Important 0). 도구: 창 스크린샷=Win32 CopyFromScreen(class "Window Class"), WebGPU월 hidden-powershell로는 안 뜸(직접 실행은 정상).
-
-
----
-
-<!-- memory/webrender-video-offload.md -->
-
----
-name: webrender-video-offload
-description: 다음 작업 = 비디오 합성을 WebRender 밖으로 빼기. 다중 비디오 처리량 병목의 근본원인·막다른길·계획·커밋 상태·측정도구
-metadata: 
-  node_type: memory
-  type: project
-  originSessionId: 33abf5d6-db91-49c4-94db-3a5a7dc160fa
----
-
-**목표 (2026-07-02 설정):** 다중 비디오 컴포지터 처리량 상향. 현재 이 머신(1920×1080, FHD30 H.264 타일)에서 **클린 60fps 실용 한계 ≈ 24~30 타일**; 40=marginal, 45=~30fps로 저하. 목표는 45~64 타일 60fps.
-
-**근본 원인 (이번 세션에 확정 — 재조사 불필요):** WebRender가 각 `<video>`를 **제각각인 큰(1080p) 업로드 텍스처**로 그림 → **배칭 불가** → 레이어당 draw call(텍스처 바인드+유니폼), 이걸 **ANGLE가 GL→D3D11로 단일 컴포지터 스레드에서 번역** → CPU 커맨드 제출이 O(N). 측정: 40타일 `renderer.render()`≈17~20ms CPU(wr_render)인데 **A5000 GPU는 ~26%만**(GPU 바운드 아님), **업로드 <1ms**(I420 borrowed/zero-copy, 업로드 바운드 아님), 디코드는 별도 SW CPU. WebRender의 배칭+타일캐시 강점이 "매 프레임 바뀌는 제각각 텍스처 N개"라 완전 무력화됨. (대조: 복잡 CSS/DOM 애니메이션은 훨씬 잘 확장·우아하게 저하 — anim_stress.html로 2000개 ~58fps, 5000개 ~22fps 확인.)
-
-**막다른 길 (측정 완료, 재시도 금지):**
-- NV12/BGRA로 YUV plane 바인드 감소 시도 → I420 borrowed/zero-copy 경로가 깨짐(videoconvert 필요, native-video 플래그가 협상 차단) → 업로드 350~700ms 폭발 → 훨씬 나쁨. **I420 borrowed가 최적.**
-- HW 디코딩 → 사용자가 36+ 타일에선 배제.
-- DwmFlush vsync RefreshDriver → ≤40에서 65↔60 beat는 잡았으나 과부하에서 폭주(pending→105) → 제거함.
-- 애니메이션 backpressure(pending 높으면 TickAnimation 스킵) → refresh 루프 자기-재개를 끊어 stall 유발 → 제거함.
-
-**계획 — 비디오를 WebRender 밖으로:**
-- 접근 A (정답, 초대형): OS 네이티브 컴포지터 서피스 = 각 비디오를 자기 DirectComposition visual/하드웨어 오버레이에 올려 DWM이 합성, WebRender는 DOM만. **이 WebRender엔 `Compositor`/`CompositeSurface` API가 아예 없음(확인함)** — Gecko 규모 신규 기능.
-- 접근 C (실용): 페이지 또는 Servo 내 fast-path가 **단일 WebGL/canvas 레이어**로 N개 비디오를 직접 그림 → Servo는 레이어 1개만 합성. 레이어당 오버헤드 우회, 노력 작음.
-- 참고: surfman은 이미 **창(window) 서피스**에 DirectComposition(flip present) 사용 — 단 레이어별은 아님.
-
-**커밋된 기준선 (branch nuriconrnd/multigpu-tiled-wall, HEAD `66d93ac44`, 2026-07-02 push):** 타이머 프레임 페이싱(기본, robust); `SERVO_GSTREAMER_AVDEC_MAX_THREADS`(런처 =1 → 메모리 36타일 11GB→2.8GB); painter.rs update_images의 rAF-합성 가드(`!animation_callbacks_running()` → rAF 지터 제거, 순수 비디오 60fps 보존); env-gated 진단 유지. vsync/backpressure는 제거됨.
-
-**측정 도구:** `SERVO_LOG_PRESENT_CADENCE=1` + `RUST_LOG=warn,paint=info` → 초당 present cadence(presents/s, max_gap, pending) + ">16ms 프레임의 wr_update(업로드)/wr_render(그리기) 분해" 로그(painter.rs note_webrender_frame_ready + render()). 테스트: `tests/html/video_grid_6x6_perf.html`(?cols=&rows= / ?grid=N, ?log=1), `tests/html/anim_stress.html`(?n=, ?js=1). 런처 `etc/multigpu/run_video_grid_6x6.ps1`. 머신: 디스플레이는 Intel iGPU @60Hz, servoshell 합성은 NVIDIA A5000(→Intel 디스플레이로 cross-adapter present).
-
-**핵심 파일:** components/paint/painter.rs(update_images=비디오 이미지→합성; render()=renderer.update()+render(); present cadence 계측), components/paint/refresh_driver.rs(TimerRefreshDriver 120Hz), components/shared/paint/rendering_context.rs(surfman→ANGLE window surface, eglSwapBuffers), components/media/backends/gstreamer/render.rs(I420 borrowed YUV sink), player.rs(SW 디코더 정책 + avdec max-threads).
-
-**천장 검증 완료 (2026-07-02, 커밋 331610dd까지):** 합성 WebGL 하네스로 "N개 비디오를 1레이어로 접으면 45~64@60fps 되는가"를 측정. 결과 = **GO for C2.** 스윕(30/40/45/64 × dom0/1): **V1(공유텍스처 N quad, 업로드0, 1 WebRender 레이어) = 전 구간 clean 60fps.** Baseline(N개 진짜 비디오 = N 레이어) = 30:65 / 40:60 / 45:40 / 64:34fps로 ~40타일 넘어가면 붕괴(레이어당 O(N) 재확인). **V2(N텍스처 매프레임 RGBA 재업로드) = 30:14 / 64:5fps로 baseline보다도 나쁨** → naive 재업로드 치명적. **판정: 접기론 검증됨(V1 60fps@64) + C2 핵심제약 = zero-copy I420 borrowed 평면 재사용 필수(재업로드/CPU왕복 금지). 평면은 이미 컴포지터 상주 → C2 할 일은 draw-call 접기뿐 → V1 성능 근접 기대.** dom0≈dom1(오버레이 비용 무시가능). 접근 A(DComp 오버레이) 불필요. wr_render/wr_update 열은 >16ms 프레임만 로깅이라 60fps config에선 무의미(fps/present로만 판단). 결과 상세표: `etc/multigpu/WEBRENDER_VIDEO_OFFLOAD_STATUS.md`. 스펙/계획: `docs/superpowers/specs|plans/2026-07-02-webrender-video-offload-ceiling-*`. 도구 커밋: video_collapse_ceiling.html(V1/V2/DOM), video_grid_6x6_perf.html?dom=1, run_video_collapse_ceiling.ps1, run_video_ceiling_sweep.ps1, tools/parse_ceiling_logs.ps1. **다음 = C2 구현 세션**: painter가 z-연속·비occlusion 비디오 런의 borrowed YUV 평면을 자체 YUV→RGB 셰이더+quad로 1패스 합성→WebRender 이미지 1개. DOM 끼면 병합 쪼갬. 디코드 천장(64 distinct SW decode CPU)은 C2 세션에서 별도 측정.
-
-**C2 Phase 1 구현 완료 (2026-07-03, branch multigpu-tiled-wall, 12커밋 f89573be..653238180, 최종 리뷰 opus=READY TO MERGE default-off):** Servo 내부 비디오 레이어 병합 fast-path 구현·검증. pref `media_video_layer_collapse_enabled`(기본 off). 파이프라인: layout display-list 빌더가 인접·비겹침·동일-clip·비-overflow(object-fit) 순수 `<video>` 런 감지→`push_image(merged_key)` 1개+VideoGroupDescriptor 방출, 개별 push_yuv_image 억제 → paint의 신규 `VideoGroupCompositor`가 GL FBO pre-pass(글로벌 레지스트리서 borrowed I420/NV12 평면 읽어 WR 계수 일치 YUV→RGB, N quad→FBO 1개) → 신규 `VideoGroup` external-image 핸들러가 FBO 텍스처를 WR에 이미지 1개로 서빙. **WR 무패치.** **결과(정직): 메커니즘 확정** — draw-call 64타일 off~85-105→**on=11**(groups=1, WR RenderResults.stats), 색 I420 exact(ffmpeg 0/255)+전 색공간×레인지 계수 res/yuv.glsl 일치, pref-off 바이트 동일, 크래시 0. **그러나 단일 1080p 창 fps는 순(net) 회귀 −30~43%**(present 65→40): 병합 pre-pass가 **매프레임 텍스처 churn(gen+tex_image_2d+delete/평면) + media-thread to_vec 복사** = O(N) per-frame 비용을 도입(캡은 collapse가 만든 것, 선재 천장 아님; generate_image_key는 캐시되어 무관). ceiling 검증의 V1(합성, 실비디오 present·pre-pass 비용 없음)이 60@64를 과예측했음이 드러남. **예측 on≈60@64 미확인. 월 페이오프는 조건부**(draw-call 절감이 pre-pass present 비용을 넘는 draw-call-bound 영역=3840 월/다레이어에서만, 미측정). 병합-차단 must-fix 0(전부 follow-up, 기본-off라 격리). **핵심 follow-up(월 페이오프 전제조건): pre-pass를 지속 텍스처+tex_sub_image_2d+borrow로 바꿔 매프레임 재할당·복사 제거.** 기타 follow-up: teardown 순서(현재 방어적 lock→Invalid+self-heal; proper compositor-acked 미구현), multiprocess merged-key alloc-order 누수, group_id 충돌가드, block-level 2-phase 테스트, eprintln→log. 결과 상세: `etc/multigpu/WEBRENDER_VIDEO_COLLAPSE_STATUS.md`. **사용자 결정(2026-07-03): C2 미적용.** 12커밋을 **로컬 브랜치 `c2-video-collapse-phase1`(@653238180)**에 보존하고, 작업 브랜치 `multigpu-tiled-wall`은 `f89573bee`(이미 푸시된 원격 상태)로 되돌림. C2 재개하려면 그 브랜치 체크아웃. 결과 문서·스펙·계획도 그 브랜치에만 있음(작업 브랜치엔 없음). WebRTC presenter 미커밋 변경은 작업 브랜치에 그대로 보존. 스펙/계획 `docs/superpowers/{specs,plans}/2026-07-02-webrender-video-collapse-c2*`. 도구: pref `media_video_layer_collapse_enabled`, `tests/html/video_grid_collapse.html`(?kicks=3로 그룹 형성), env `SERVO_LOG_VIDEO_COLLAPSE`(groups/members/total_draw_calls)·`SERVO_VIDEO_COLLAPSE_READBACK`(색 검증), 스윕 `run_video_ceiling_sweep.ps1 -Series collapse_off,collapse_on`. **주의: 그룹은 display-list 재빌드 시에만 형성(정적 페이지 미형성 가능); occlusion-throttle 세션은 render() ~0.2/s → 유효 fps는 foreground 필요.** NOT pushed yet.
-
-관련: [[multigpu-next-session-tasks]]
 
 
 ---
@@ -282,6 +249,200 @@ Next steps: confirm the source frame rate (is it 60fps? use ffprobe) — if 30fp
 - **#1 EnoughData backoff root fix (source.rs appsrc):** tried `appsrc.set_property("min-percent", 80u32)` (request refill at 80% instead of default 0/empty) so the env wouldn't be needed. **REGRESSED badly** — media delivery dropped to ~14fps with thrashing (68 EnoughData/30s vs 2 normally), confirmed WITH foreground (not occlusion). Root reason: appsrc `min-percent` need-data + Servo's separate enough_data fetch-pause backoff + the 4 KB block-split push (source.rs:150) interact pathologically — rapid need/enough cycling stalls the refill. REVERTED. **Conclusion: the env (`SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF=1`, applied by run_video_4k_wall.ps1) stays as the working solution.** A real code fix needs reworking the fetch/push flow-control (don't fully stop on enough_data; maintain a steady top-up; possibly larger block size) — a bigger media-pipeline task, deferred. min-percent is the WRONG knob here.
 - **#2 over-present (~68 vs 60/tile):** measured 1×1 = clean 60 (NO over-present), only 2×1 over-presents → it's NOT the fix's double-generate (frame-ready is a clean 60/tile via the `pending_frames==0` guard). It's `paint_wall_tile_group_for_redraw` (headed_window.rs:741) painting ALL tiles whenever ANY tile window gets a RedrawRequested → when both windows fire it in a frame the group paints twice (~13% extra presents). Harmless: vsync-capped to 60 on screen, ~1% GPU, no visual artifact. A dedup (paint the group once per logical frame) touches the working wall barrier/present path (0 barrier misses, locked 60) for ~1% gain → **recommend leaving as-is.** If pursued later: guard paint_wall_tile_group_for_redraw against re-painting the same logical frame, validated against barrier-miss count.
 **NET: no further code changes; 6694c14ea + the run-script env is the final Task 3 state — COMMITTED AND PUSHED to nuriconrnd/multigpu-tiled-wall 2026-06-15 (13b3f21d0..6694c14ea; origin/servo untouched). Working tree clean. Both follow-ups documented as deferred with their findings.** (Note: the throwaway `docs/multigpu/multigpu_parallel_present_plan.md` design doc — which chased the superseded "parallel present" approach — was DELETED at the user's request; all findings are retained inline in this memory, so ignore any earlier reference to that file path.)
+
+
+---
+
+<!-- memory/webrender-video-offload.md -->
+
+---
+name: webrender-video-offload
+description: 다음 작업 = 비디오 합성을 WebRender 밖으로 빼기. 다중 비디오 처리량 병목의 근본원인·막다른길·계획·커밋 상태·측정도구
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 33abf5d6-db91-49c4-94db-3a5a7dc160fa
+---
+
+**목표 (2026-07-02 설정):** 다중 비디오 컴포지터 처리량 상향. 현재 이 머신(1920×1080, FHD30 H.264 타일)에서 **클린 60fps 실용 한계 ≈ 24~30 타일**; 40=marginal, 45=~30fps로 저하. 목표는 45~64 타일 60fps.
+
+**근본 원인 (이번 세션에 확정 — 재조사 불필요):** WebRender가 각 `<video>`를 **제각각인 큰(1080p) 업로드 텍스처**로 그림 → **배칭 불가** → 레이어당 draw call(텍스처 바인드+유니폼), 이걸 **ANGLE가 GL→D3D11로 단일 컴포지터 스레드에서 번역** → CPU 커맨드 제출이 O(N). 측정: 40타일 `renderer.render()`≈17~20ms CPU(wr_render)인데 **A5000 GPU는 ~26%만**(GPU 바운드 아님), **업로드 <1ms**(I420 borrowed/zero-copy, 업로드 바운드 아님), 디코드는 별도 SW CPU. WebRender의 배칭+타일캐시 강점이 "매 프레임 바뀌는 제각각 텍스처 N개"라 완전 무력화됨. (대조: 복잡 CSS/DOM 애니메이션은 훨씬 잘 확장·우아하게 저하 — anim_stress.html로 2000개 ~58fps, 5000개 ~22fps 확인.)
+
+**막다른 길 (측정 완료, 재시도 금지):**
+- NV12/BGRA로 YUV plane 바인드 감소 시도 → I420 borrowed/zero-copy 경로가 깨짐(videoconvert 필요, native-video 플래그가 협상 차단) → 업로드 350~700ms 폭발 → 훨씬 나쁨. **I420 borrowed가 최적.**
+- HW 디코딩 → 사용자가 36+ 타일에선 배제.
+- DwmFlush vsync RefreshDriver → ≤40에서 65↔60 beat는 잡았으나 과부하에서 폭주(pending→105) → 제거함.
+- 애니메이션 backpressure(pending 높으면 TickAnimation 스킵) → refresh 루프 자기-재개를 끊어 stall 유발 → 제거함.
+
+**계획 — 비디오를 WebRender 밖으로:**
+- 접근 A (정답, 초대형): OS 네이티브 컴포지터 서피스 = 각 비디오를 자기 DirectComposition visual/하드웨어 오버레이에 올려 DWM이 합성, WebRender는 DOM만. **이 WebRender엔 `Compositor`/`CompositeSurface` API가 아예 없음(확인함)** — Gecko 규모 신규 기능.
+- 접근 C (실용): 페이지 또는 Servo 내 fast-path가 **단일 WebGL/canvas 레이어**로 N개 비디오를 직접 그림 → Servo는 레이어 1개만 합성. 레이어당 오버헤드 우회, 노력 작음.
+- 참고: surfman은 이미 **창(window) 서피스**에 DirectComposition(flip present) 사용 — 단 레이어별은 아님.
+
+**커밋된 기준선 (branch nuriconrnd/multigpu-tiled-wall, HEAD `66d93ac44`, 2026-07-02 push):** 타이머 프레임 페이싱(기본, robust); `SERVO_GSTREAMER_AVDEC_MAX_THREADS`(런처 =1 → 메모리 36타일 11GB→2.8GB); painter.rs update_images의 rAF-합성 가드(`!animation_callbacks_running()` → rAF 지터 제거, 순수 비디오 60fps 보존); env-gated 진단 유지. vsync/backpressure는 제거됨.
+
+**측정 도구:** `SERVO_LOG_PRESENT_CADENCE=1` + `RUST_LOG=warn,paint=info` → 초당 present cadence(presents/s, max_gap, pending) + ">16ms 프레임의 wr_update(업로드)/wr_render(그리기) 분해" 로그(painter.rs note_webrender_frame_ready + render()). 테스트: `tests/html/video_grid_6x6_perf.html`(?cols=&rows= / ?grid=N, ?log=1), `tests/html/anim_stress.html`(?n=, ?js=1). 런처 `etc/multigpu/run_video_grid_6x6.ps1`. 머신: 디스플레이는 Intel iGPU @60Hz, servoshell 합성은 NVIDIA A5000(→Intel 디스플레이로 cross-adapter present).
+
+**핵심 파일:** components/paint/painter.rs(update_images=비디오 이미지→합성; render()=renderer.update()+render(); present cadence 계측), components/paint/refresh_driver.rs(TimerRefreshDriver 120Hz), components/shared/paint/rendering_context.rs(surfman→ANGLE window surface, eglSwapBuffers), components/media/backends/gstreamer/render.rs(I420 borrowed YUV sink), player.rs(SW 디코더 정책 + avdec max-threads).
+
+**천장 검증 완료 (2026-07-02, 커밋 331610dd까지):** 합성 WebGL 하네스로 "N개 비디오를 1레이어로 접으면 45~64@60fps 되는가"를 측정. 결과 = **GO for C2.** 스윕(30/40/45/64 × dom0/1): **V1(공유텍스처 N quad, 업로드0, 1 WebRender 레이어) = 전 구간 clean 60fps.** Baseline(N개 진짜 비디오 = N 레이어) = 30:65 / 40:60 / 45:40 / 64:34fps로 ~40타일 넘어가면 붕괴(레이어당 O(N) 재확인). **V2(N텍스처 매프레임 RGBA 재업로드) = 30:14 / 64:5fps로 baseline보다도 나쁨** → naive 재업로드 치명적. **판정: 접기론 검증됨(V1 60fps@64) + C2 핵심제약 = zero-copy I420 borrowed 평면 재사용 필수(재업로드/CPU왕복 금지). 평면은 이미 컴포지터 상주 → C2 할 일은 draw-call 접기뿐 → V1 성능 근접 기대.** dom0≈dom1(오버레이 비용 무시가능). 접근 A(DComp 오버레이) 불필요. wr_render/wr_update 열은 >16ms 프레임만 로깅이라 60fps config에선 무의미(fps/present로만 판단). 결과 상세표: `etc/multigpu/WEBRENDER_VIDEO_OFFLOAD_STATUS.md`. 스펙/계획: `docs/superpowers/specs|plans/2026-07-02-webrender-video-offload-ceiling-*`. 도구 커밋: video_collapse_ceiling.html(V1/V2/DOM), video_grid_6x6_perf.html?dom=1, run_video_collapse_ceiling.ps1, run_video_ceiling_sweep.ps1, tools/parse_ceiling_logs.ps1. **다음 = C2 구현 세션**: painter가 z-연속·비occlusion 비디오 런의 borrowed YUV 평면을 자체 YUV→RGB 셰이더+quad로 1패스 합성→WebRender 이미지 1개. DOM 끼면 병합 쪼갬. 디코드 천장(64 distinct SW decode CPU)은 C2 세션에서 별도 측정.
+
+**C2 Phase 1 구현 완료 (2026-07-03, branch multigpu-tiled-wall, 12커밋 f89573be..653238180, 최종 리뷰 opus=READY TO MERGE default-off):** Servo 내부 비디오 레이어 병합 fast-path 구현·검증. pref `media_video_layer_collapse_enabled`(기본 off). 파이프라인: layout display-list 빌더가 인접·비겹침·동일-clip·비-overflow(object-fit) 순수 `<video>` 런 감지→`push_image(merged_key)` 1개+VideoGroupDescriptor 방출, 개별 push_yuv_image 억제 → paint의 신규 `VideoGroupCompositor`가 GL FBO pre-pass(글로벌 레지스트리서 borrowed I420/NV12 평면 읽어 WR 계수 일치 YUV→RGB, N quad→FBO 1개) → 신규 `VideoGroup` external-image 핸들러가 FBO 텍스처를 WR에 이미지 1개로 서빙. **WR 무패치.** **결과(정직): 메커니즘 확정** — draw-call 64타일 off~85-105→**on=11**(groups=1, WR RenderResults.stats), 색 I420 exact(ffmpeg 0/255)+전 색공간×레인지 계수 res/yuv.glsl 일치, pref-off 바이트 동일, 크래시 0. **그러나 단일 1080p 창 fps는 순(net) 회귀 −30~43%**(present 65→40): 병합 pre-pass가 **매프레임 텍스처 churn(gen+tex_image_2d+delete/평면) + media-thread to_vec 복사** = O(N) per-frame 비용을 도입(캡은 collapse가 만든 것, 선재 천장 아님; generate_image_key는 캐시되어 무관). ceiling 검증의 V1(합성, 실비디오 present·pre-pass 비용 없음)이 60@64를 과예측했음이 드러남. **예측 on≈60@64 미확인. 월 페이오프는 조건부**(draw-call 절감이 pre-pass present 비용을 넘는 draw-call-bound 영역=3840 월/다레이어에서만, 미측정). 병합-차단 must-fix 0(전부 follow-up, 기본-off라 격리). **핵심 follow-up(월 페이오프 전제조건): pre-pass를 지속 텍스처+tex_sub_image_2d+borrow로 바꿔 매프레임 재할당·복사 제거.** 기타 follow-up: teardown 순서(현재 방어적 lock→Invalid+self-heal; proper compositor-acked 미구현), multiprocess merged-key alloc-order 누수, group_id 충돌가드, block-level 2-phase 테스트, eprintln→log. 결과 상세: `etc/multigpu/WEBRENDER_VIDEO_COLLAPSE_STATUS.md`. **사용자 결정(2026-07-03): C2 미적용.** 12커밋을 **로컬 브랜치 `c2-video-collapse-phase1`(@653238180)**에 보존하고, 작업 브랜치 `multigpu-tiled-wall`은 `f89573bee`(이미 푸시된 원격 상태)로 되돌림. C2 재개하려면 그 브랜치 체크아웃. 결과 문서·스펙·계획도 그 브랜치에만 있음(작업 브랜치엔 없음). WebRTC presenter 미커밋 변경은 작업 브랜치에 그대로 보존. 스펙/계획 `docs/superpowers/{specs,plans}/2026-07-02-webrender-video-collapse-c2*`. 도구: pref `media_video_layer_collapse_enabled`, `tests/html/video_grid_collapse.html`(?kicks=3로 그룹 형성), env `SERVO_LOG_VIDEO_COLLAPSE`(groups/members/total_draw_calls)·`SERVO_VIDEO_COLLAPSE_READBACK`(색 검증), 스윕 `run_video_ceiling_sweep.ps1 -Series collapse_off,collapse_on`. **주의: 그룹은 display-list 재빌드 시에만 형성(정적 페이지 미형성 가능); occlusion-throttle 세션은 render() ~0.2/s → 유효 fps는 foreground 필요.** NOT pushed yet.
+
+관련: [[multigpu-next-session-tasks]]
+
+
+---
+
+<!-- memory/servo-build-run-commands.md -->
+
+---
+name: servo-build-run-commands
+description: "How to build and run the Servo multi-GPU wall on this machine: mach build invocation (PowerShell ErrorActionPreference gotcha), project-local CARGO_HOME, and the wall launch command."
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: fdf094f3-11cb-4be6-a49d-755527bf994b
+---
+
+Operational commands for the Servo wall project at `D:\2_TechReview\20260606_multigpu_browser\servo` (branch `multigpu-tiled-wall`). See also [[servo-mozangle-build-path]].
+
+**BUILD (release, incremental):** source the env then run mach with `ErrorActionPreference='Continue'`:
+```powershell
+cd D:\2_TechReview\20260606_multigpu_browser\servo
+. .\etc\multigpu\servo_env.ps1            # sets project-local CARGO_HOME/.servo, RUSTUP_HOME/.rustup, toolchain 1.95.0
+$ErrorActionPreference = 'Continue'        # CRITICAL
+& .\mach.ps1 build --release
+```
+**GOTCHA (cost a wasted build this session):** `servo_env.ps1` sets `$ErrorActionPreference='Stop'`. With Stop, the FIRST line cargo writes to stderr ("Compiling proc-macro2 …") becomes a terminating NativeCommandError and aborts the whole build immediately (looks like a build failure but isn't). ALWAYS set `$ErrorActionPreference='Continue'` after sourcing servo_env.ps1 before `mach build`. An incremental servoshell/paint change builds in ~1–3 min. Binary: `target\release\servoshell.exe`. Editing `components/paint/*` or `third_party/surfman/*` rebuilds those crates + servoshell (a bit longer).
+
+**RUN the wall (2×A4000, monitor0 + monitor1):**
+```powershell
+$root="D:\2_TechReview\20260606_multigpu_browser\servo"
+& "$root\target\release\servoshell.exe" --wall-layout "$root\etc\multigpu\config\wall_layout.example_2x1_dualgpu.json" --wall-all-tiles `
+  --pref dom_webgpu_enabled=true --pref dom_webgpu_multigpu_fanout=true --pref dom_webgpu_gpu_direct=true `
+  https://threejs.org/examples/webgpu_compute_birds.html
+```
+Layout: monitor0 (0,0)-(1920,1080) primary, monitor1 (1920,0)-(3840,1080). file:// works for plain HTML pages (ES-module pages need HTTP — see the run_*.ps1 scripts which start a python http.server). Stop with `Stop-Process -Name servoshell -Force`.
+
+**RESUME a session:** just say e.g. "멀티 GPU 월 Task 3 진행해줘" — MEMORY.md auto-loads the index. Open tasks tracked in [[multigpu-next-session-tasks]].
+
+**추가 ops (2026-07-15~17 확립):**
+- **mach build에 .venv 필요**: `servo_env.ps1` 소싱 + `$ErrorActionPreference='Continue'` 뒤에 `. .\.venv\Scripts\Activate.ps1`도 실행할 것 (시스템 python에 toml 없음 → mach 즉사). 그 다음 `python mach build --release`.
+- **paint 유닛테스트 정확 명령**: `cargo test -p servo-paint --lib --features paint_api/no-wgl dcomp` — feature 없으면 surfman이 ANGLE 없이 빌드돼 의존 크레이트(servo-webgl) 컴파일 실패. (전제: zeroize derive 자체선언 커밋 f0267e34e 포함.) cargo git checkout(stylo 등) 직접 수정은 rebuild 안 됨 — [patch] 필수.
+- **표출은 `etc\multigpu\run_video_wall_d3d11.ps1`**: `-Cols/-Rows -DComp(-DCompSurface) -Page -Src -Sync -TileSize -MoveX/-MoveY -Detach`. 런처가 AdjustWindowRectEx로 장식 델타를 계산해 **클라이언트를 처음부터 최종 크기로 생성**(시작 리사이즈 스테일 방지 — 이 보장 깨면 잔상 재발). ★페이지에 그리드 외 비디오(PiP 등)가 있으면 `-Sync <총 비디오 수>` 명시★ (기본 Cols*Rows). `-Page`의 `?` 쿼리는 런처가 와일드카드로 오해 — 쿼리 필요 시 scratchpad run_probe.ps1 패턴.
+- **DComp 진단 env**: `SERVO_DCOMP_DEBUG=1`(create/add/bind/promote/demote 로그 — 승격 로그는 이 게이트 뒤라 없으면 promote=0으로 보임), `SERVO_DCOMP_READBACK=1`(unbind 픽셀 통계, ~120프레임), `SERVO_DCOMP_VALIDPROBE=1`(dirty/valid 원시값), `SERVO_DCOMP_NO_PARTIAL_PRESENT=1`(강등 경로 강제), `SERVO_DCOMP_DISABLE_RESIZE_REBUILD/RESIZE_VIRTUAL`(리사이즈 처리 2단 킬스위치).
+- 버닝 카운터로 fps 측정 시 **샘플 간격이 소스 루프 주기(~900프레임=30s)의 배수면 앨리어싱** — 15~20s 간격 사용.
+
+
+---
+
+<!-- memory/servo-mozangle-build-path.md -->
+
+---
+name: servo-mozangle-build-path
+description: "Which mozangle (ANGLE) source dir Servo actually compiles, and how to force a rebuild after editing ANGLE C++"
+metadata: 
+  node_type: memory
+  type: reference
+  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
+---
+
+CRITICAL build gotcha for the local Servo at D:\2_TechReview\20260606_multigpu_browser\servo:
+
+There are TWO mozangle-0.5.5 source trees on this machine:
+- `.servo\cargo-home\registry\src\index.crates.io-...\mozangle-0.5.5`  (project-local; used ONLY when CARGO_HOME is set to .servo\cargo-home, e.g. via etc\multigpu\servo_env.ps1)
+- `C:\Users\ilwoonam75\.cargo\registry\src\index.crates.io-...\mozangle-0.5.5`  (global; the DEFAULT)
+
+Building via `cmd /c ".\mach.bat build --release"` WITHOUT sourcing servo_env.ps1 leaves CARGO_HOME unset, so cargo compiles the GLOBAL `~/.cargo` copy. Confirmed via the `.d` file in target/release/build/mozangle-*/. So edits to ANGLE C++ (Display.cpp, Renderer11.cpp) or build.rs (NDEBUG) must be made in the SAME tree the build uses — match them, or set `$env:CARGO_HOME='...\.servo\cargo-home'` before building so the .servo edits apply.
+
+cc does NOT emit rerun-if-changed for the bundled ANGLE .cpp files, so editing an ANGLE source does NOT trigger a rebuild on its own. Force it: remove `target/release/build/mozangle-*`, `target/release/.fingerprint/mozangle-*`, `target/release/deps/*mozangle*`, then `touch` the mozangle build.rs, then rebuild. The ANGLE recompile is ~2.5 min.
+
+mach builds the DLLs (libGLESv2.dll/libEGL.dll, Servo's `no-wgl` feature) under `target/release/build/mozangle-*/out/` but does NOT always re-copy them next to servoshell.exe — copy them to `target/release/` manually after the build.
+
+NDEBUG (disabling ANGLE asserts) turned out to be UNnecessary once the multi-context crash was fixed at the source (isolated D3D11 device, see [[servo-wall-webgl2-findings]]); the earlier "NDEBUG fixed it" was a misattribution (the edit was in the unused .servo tree).
+
+
+---
+
+<!-- memory/servo-wall-webgl2-findings.md -->
+
+---
+name: servo-wall-webgl2-findings
+description: "Servo WebGL2 multi-GPU wall — fixes for assert, multi-context crash, single-window WebGL2, cross-GPU black tile, keyframes-black (vertex-attrib validation), and the webgl_backtrace-build perf trap"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
+---
+
+WebGL2 example (threejs.org webgl_animation_keyframes, LittlestTokyo) on the multi-GPU wall in local Servo. Status as of 2026-06-14:
+
+**Committable Servo source fixes (verified, NOT yet committed — user said hold):**
+- WebGL2 single-window now renders: `EXTColorBufferFloat` extension (new webidl + ext rs), float/half-float texture formats in webglrenderbuffer.rs + tex_image_2d.rs, compositor panic fix (components/shared/paint/lib.rs WebGl arm passes Invalid through), busy-counter underflow fix (components/paint/webrender_external_images.rs).
+- **Multi-context wall CRASH fix**: `third_party/surfman/.../angle/{device.rs,connection.rs}` adds `Device::new_isolated`/`create_isolated_device` (explicit `D3D11CreateDevice` + `EGL_PLATFORM_DEVICE_EXT`, bypassing ANGLE's per-LUID cached display). `components/webgl/webgl_thread.rs` `get_or_create_device_for_painter` now calls `create_isolated_device`. Root cause: vendored surfman `Device::new` opens the display via `EGL_PLATFORM_ANGLE_ANGLE`+LUID, which ANGLE caches per-GPU, so the WebGL backend context and the compositor shared one D3D11 device/ANGLE renderer driven from two threads → state corruption → `libGLESv2.dll` access violation (0xc0000005). The `StateManager11.cpp:2384` debug assert was the canary, not benign.
+
+**mozangle NDEBUG — UNNECESSARY, abandoned.** Earlier I added `build.define("NDEBUG", None)` to mozangle build.rs to silence ANGLE asserts. It turned out (a) unnecessary once the multi-context crash was fixed at the source, and (b) it was edited in the UNUSED `.servo` tree anyway (build compiles `~/.cargo`, see [[servo-mozangle-build-path]]). Do not pursue NDEBUG.
+
+**GPU-DISTRIBUTION fix (the big one — each tile now computes on ITS monitor's physical GPU).** Symptom: even though both wall tiles rendered, ALL rendering/compositing ran on GPU0 (nvidia-smi: servoshell compute-app only on GPU0; GPU1 just scanned out its monitor). Root cause: ANGLE's display cache key `ANGLEPlatformDisplay` (gfx/angle/checkout/src/libANGLE/Display.cpp) keys on nativeDisplay/powerPref/platformType/deviceId but NOT the D3D adapter LUID. surfman selects the GPU by LUID, so every per-GPU display request collided on the same key → the first (GPU0) cached Display was reused for all adapters → callD3D11CreateDevice only ran once (GPU0). (Two identical RTX A4000s also can't be told apart by deviceId.) Fix: add `luidHigh`/`luidLow` to the `ANGLEPlatformDisplay` struct, its 7-arg ctor, `tie()`, `GetDisplayFromNativeDisplay` (read `EGL_PLATFORM_ANGLE_D3D_LUID_HIGH/LOW_ANGLE`), AND the `~Display` destructor's erase key. After this, GetDisplay makes a NEW display per LUID and callD3D11CreateDevice matches each LUID to the right adapter. Verified: servoshell compute-app on BOTH GPUs; balanced memory deltas for WebGL (+290/+248 MiB), WebGPU (+606/+166), 4K video (+182/+178). This mozangle edit is in BOTH `~/.cargo` (compiled) and `.servo` trees; the registry source itself is NON-committable, BUT the change is now preserved in-repo as a reproducible asset (commit 4f7ec023c): `etc/multigpu/patches/mozangle-0.5.5-angle-luid-display-cache.patch` (git-apply-verified unified diff vs crate original) + `apply_mozangle_angle_luid.ps1` (idempotent; `-Rebuild` forces ANGLE rebuild + copies DLLs) + README (fork + `[patch.crates-io]` = the committable form). To restore on a fresh checkout/machine: run the apply script with `-Rebuild`.
+
+**Cross-GPU fix (task #16, DONE):** dual-GPU wall secondary tile was BLACK because the surface import failed. Root cause: ANGLE's per-LUID display falls back to the DEFAULT GPU (gpu0) for a non-default LUID, so the compositor for the gpu1 tile actually lives on gpu0, while `new_isolated` built its dedicated device on the EXPLICIT painter adapter (real gpu1) -> cross-adapter -> compositor's `OpenSharedResource(EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE)` fails E_INVALIDARG/EGL_BAD_PARAMETER -> black. Two-part fix (both in third_party/surfman): (1) `device.rs new_isolated` now opens the LUID display the way `new` does, queries the adapter ANGLE actually bound, and builds the dedicated device on THAT resolved adapter (matches the compositor). (2) `surface.rs create_surface_texture` imports the shared texture by `self.d3d11_device.OpenSharedResource(...)` on the consumer device + `EGL_D3D_TEXTURE_ANGLE`, instead of the default-device-tied share-handle path.
+
+**Verified working (2026-06-14):** single-window WebGL2 (float FBO), same-GPU 2x1 wall (both tiles), dual-GPU 2x1 wall (both tiles render, stable, no crash, importFail=0), AND GPU-distributed compute across both physical GPUs (WebGL/WebGPU/video). See [[servo-wall-webgpu-constraints]].
+
+**WebGL texture (user req #3) — 3 Servo WebGL2 bugs FIXED (committable), model now error-free but renders BLACK due to PMREM-IBL.** Diagnosis via `webgl_backtrace` feature (logs JS stack on InvalidEnum at webglrenderingcontext.rs webgl_error) pinpointed three.js `texSubImage2D`→`uploadTexture`. Root causes + fixes (all in components/script/dom/webgl/):
+  1. `texSubImage2D(...,RG,...)` (0x8227, normal/2-ch maps) → InvalidEnum. Base `TexSubImage2D`/`TexSubImage2D_` pass the transfer FORMAT as `internal_format` to `TexImage2DValidator`, which required `usable_as_internal()` (false for RG/RED). FIX: added `is_sub_image` flag + `for_sub_image()` builder on the validators; skips the `usable_as_internal` requirement for *SubImage (validations/tex_image_2d.rs + the two base callers).
+  2. `texStorage2D` of normal-size color textures (SRGB8_ALPHA8/RGBA8) → `TextureTooBig`. `TexStorageValidator` passes the mip-level COUNT as `level` to the common validator, whose size check does `width > max_size >> level` — shifting by the level count made the effective max tiny. FIX: `is_tex_storage` flag + `for_tex_storage()`; size check uses shift 0 for storage.
+  3. Same path: non-power-of-two textures with levels>1 → `NonPotTexture` (the `level>0 && !pot` rule). FIX: skip that rule when `is_tex_storage`.
+  Result: ALL WebGL errors gone (InvalidEnum 4109→0). Committed: ef7b9c6aa (texture/format), 35b4c2ed7 (isolated device + cross-GPU surface), b33a009f9 (test pages), 4f824aeac (handoff doc etc/multigpu/WEBGL_WALL_STATUS.md). NOT committed: the mozangle ANGLE LUID display-cache fix (GPU distribution) — registry edit, needs a mozangle fork.
+
+**RESOLVED (2026-06-14) — keyframes model BLACK was a WebGL2 vertex-attrib validation bug.** The InvalidOperation was NOT in `draw_elements_instanced` (those branches never fired) — it was raised BEFORE the draw, in `WebGL2RenderingContext::DrawElements`→`validate_vertex_attribs_for_draw` (components/script/dom/webgl/webgl2renderingcontext.rs). That function compared the program attribute's base type against the vertex array's *storage* `type_`. Two bugs: (1) for an enabled array it used the raw storage enum as the base type, but `vertexAttribPointer` always feeds FLOAT regardless of storage (normalized/integer storage like UNSIGNED_SHORT/BYTE → FLOAT in shader); storage enums aren't in the FLOAT/INT/UINT groups → spurious INVALID_OPERATION → ~4/71 LittlestTokyo meshes (a `vec4` fed by unnormalized USHORT) silently dropped → "black". (2) the base-type group table omitted matrix types (FLOAT_MAT2/3/4 …), so InstancedMesh `mat4` attributes (e.g. RoomEnvironment under PMREM, fed by four float vec4 arrays) were rejected too. FIX: replaced the storage-type-as-base-type logic with `candidate_base_types` (disabled→generic attrib type; enabled+normalized/float/half→FLOAT; enabled+unnormalized-int→permissive [FLOAT, INT/UINT] since Servo doesn't track vertexAttribPointer vs vertexAttribIPointer — `VertexAttribIPointer` just forwards to `VertexAttribPointer(normalized=false)`), plus a `glsl_attrib_scalar_base_type()` helper that maps FLOAT_VEC*/FLOAT_MAT*→FLOAT, INT_*→INT, UINT_*→UINT. Verified: InvalidOperation 120→0, LittlestTokyo renders bright (maxRGB~247, not [21,16,13] — that center pixel just lands on a dark crevice) in single-window AND dual-GPU wall, with both plain HemisphereLight and PMREM/RoomEnvironment. The earlier "dark" read was a misread center pixel; the model was never actually rendering (meshes dropped). NOT yet committed (user holds commits).
+
+Diagnosis method (one rebuild): built `--features webgl_backtrace`, the existing webgl_error JS-backtrace log showed the failing call was `renderBufferDirect@three:17270`→`render@4419`=`gl.drawElements`, but temp logging in `draw_elements_instanced` never fired → the error was in the WebGL2 pre-draw validation wrapper instead. A JS `gl.drawElements` wrapper that dumped attrib state via `getVertexAttrib/getBufferParameter/getProgramParameter` CRASHED Servo (`assertion failed: self.is_double()`, mozjs jsval.rs:503) — a separate latent Servo WebGL2 getter bug, not yet fixed.
+
+**PERF — "wall is very slow" was a `--features webgl_backtrace` build artifact, NOT a wall/cross-GPU bug.** `send_with_fallibility` (every WebGL command, webglrenderingcontext.rs:~433) calls `capture_webgl_backtrace()`, which with the feature ON does `Backtrace::new()` + `format!("{:?}",bt)` (full Rust symbolication) + JS stack capture PER COMMAND. LittlestTokyo ≈ thousands of commands/frame → ~2.6 s/frame (≈0.4 fps), and it was resolution/tile/GPU-INDEPENDENT (plain 1920 window, 1x1, same-GPU 2-tile, dual-GPU all identical) which is what ruled out the wall. A normal `mach build --release` (NO webgl_backtrace) returns an empty struct → keyframes runs **60 fps vsync-locked at 3840x1080 across the dual-GPU wall** (first frame ~1.3 s is one-time ANGLE shader compile). Lesson: build release WITHOUT webgl_backtrace for any perf work / demos; only add it for InvalidOperation debugging. (Also: per-frame `gl.finish()` in a probe serializes the pipeline and inflates measured frame time — measure without it.)
+
+**"Only top-left of left monitor visible" was a TEST-PAGE bug, not Servo.** `--wall-all-tiles` shares ONE webview that sees the full virtual viewport (e.g. 3840x1080, confirmed via `window.innerWidth`); diagnostic probe pages used a FIXED `renderer.setSize(960,600)` → filled only the top-left corner. A page that sizes to `window.innerWidth/innerHeight` (+resize handler) fills the whole wall. Demo page: `tests/html/keyframes_wall.html` (full-viewport + FPS HUD). Other probes added this session: keyframes_renderprobe/keyframes_pmrem_probe (readPixels luma-grid render check, immune to window-capture grabbing the wrong window), webgl2_ctx_probe (WebGL2-enable check), keyframes_drawprobe (the getter-panic repro). Reliable single-window capture+log helper: etc/multigpu/tools/run_single_capture.ps1 (auto-starts http.server, passes `--pref dom_webgl2_enabled=true`).
+
+Note: WebGL2 is OFF by default — `getContext('webgl2')` returns null unless `--pref dom_webgl2_enabled=true` or host is www.servoexperiments.com (WEBGL2_ORIGINS). three.js (WebGL2-only) then throws "Error creating WebGL context". 127.0.0.1/threejs.org need the pref.
+
+**FIXED (2026-06-14) — "FPS drops / stutters while moving the mouse" on the wall.** Symptom: on a mouse-interactive page (e.g. threejs `webgl_effects_anaglyph`, camera follows cursor) the displayed FPS visibly dropped while the mouse moved. Measured on the live page (RUST_LOG=info, per-second "Wall render end" count = compositor present rate, user did still-then-move): idle steady 60fps/tile @ render_ms~2ms; during mouse movement present fell to **42–56fps with render_ms spiking to ~27ms**. Root cause (`ports/servoshell/desktop/headed_window.rs` window-event handler): every winit event is fed to egui via `gui.on_window_event`, egui returns `repaint=true` on essentially every `CursorMoved`, and the code then calls `winit_window.request_redraw()` → `RedrawRequested` → `paint_wall_tile_group_for_redraw` (a full, synchronized re-composite of ALL wall tiles). Rapid mouse motion = a flood of expensive forced wall repaints competing with the rAF render loop. FIX: skip that `request_redraw()` for `CursorMoved` when the cursor is over WebView content (`!should_forward_mouse_event_to_egui()`); egui still repaints when the cursor is over its own toolbar. Safe because the WebView repaints itself via `notify_new_frame_ready → window.set_needs_repaint()` (running_app_state.rs), independent of egui. Verified: after the fix, present holds **steady 60fps with render_ms ~2ms throughout mouse movement** (no spikes). servoshell-only change → ~7s incremental rebuild. NOT committed (user holds commits).
+
+Diagnosis gotchas worth remembering: (1) Synthetic mouse injection (SetCursorPos AND SendInput abs/virtualdesk) does NOT reach the Servo page on the wall — the page's mousemove listeners stay at ~0 events; you must have the USER move a real mouse (the wall tile window also must be topmost/unoccluded). (2) A page's own rAF `fps` counter stays ~60 even when the *displayed* rate drops, because the compositor re-presents; measure the server-side "Wall render end" present rate, not the page rAF, to see the real display FPS. (3) anaglyph (and any camera-follows-mouse page) is essentially STATIC without mouse input (logical_frame_id stays 1) — needs real mouse to exercise. Test pages added: tests/html/mouse_latency_probe.html (?load=light|heavy, HUD with fps/mouseEv-s/frameGap/moveLat), keyframes_wall.html.
+
+User's 3 requirements (2026-06-14): #1 per-tile-GPU compute = DONE (ANGLE LUID cache-key); #2 video CPU-decode = leave as-is (intentional); #3 WebGL textures/keyframes = DONE (vertex-attrib validation fix above; renders + 60fps on dual-GPU wall).
+
+Note: a Korean (cp949) Windows console makes `mach build` throw a harmless UnicodeEncodeError on the post-build summary's '•' char AFTER cargo prints "Finished `release`" — the binary is fine.
+
+Build: `cmd /c ".\mach.bat build --release > log 2>&1"` with `C:\Program Files\LLVM\bin` (lld-link) on PATH. Wall test layouts in etc/multigpu/config/ (example_2x1_dualgpu, test_2x1_samegpu, test_2x1_gpu1).
+
+
+---
+
+<!-- memory/servo-wall-webgpu-constraints.md -->
+
+---
+name: servo-wall-webgpu-constraints
+description: Servo multi-GPU wall behavior and the local WebGPU source patches that make three.js/Inspector pages work
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
+---
+
+Running three.js (WebGPU) pages on the Servo multi-GPU wall (`servoshell.exe --wall-layout <json> --wall-all-tiles --pref dom_webgpu_enabled=true <url>`). Discovered/patched while making `tests/html/webgpu_fanout_three_retargeting.html` and the live `https://threejs.org/examples/webgpu_animation_retargeting.html` render. Use the runner `etc/multigpu/run_three_retargeting_wall.ps1` (auto-starts python http.server on :8753, enables WebGPU). Capture: bring both tile windows to front via Win32 EnumWindows+SetForegroundWindow, then GDI CopyFromScreen over the virtual screen (DISPLAY1 at 0,0 + DISPLAY9 at 1920,0 = 3840x1080).
+
+Standing Servo behaviors (NOT patched):
+- **ES modules don't load over `file://`** — module loader errors "Fetching module script failed Unsupported scheme". Serve over HTTP. Classic inline `<script>` pages are unaffected.
+- **WebGPU is off by default** (`dom_webgpu_enabled` pref false). three.js's WebGL2 fallback backend also fails under Servo (`this.gl is null`), so WebGPU must be enabled — there is no usable WebGL fallback.
+
+WebGPU source patches made IN THIS REPO's Servo (`D:\2_TechReview\20260606_multigpu_browser\servo`) — rebuild with `mach build --release`:
+- **GPU query sets** (`createQuerySet` was commented out in `components/script_bindings/webidls/WebGPU.webidl`). Implemented `GPUDevice.createQuerySet` + `GPUCommandEncoder.resolveQuerySet` end-to-end: webidl, `shared/webgpu/ids.rs` (WebGPUQuerySet), `script/dom/webgpu/identityhub.rs`, `shared/webgpu/messages/recv.rs` (CreateQuerySet/ResolveQuerySet), `webgpu/wgpu_thread.rs` handlers, `script/dom/webgpu/gpuqueryset.rs` (real impl), `gpudevice.rs`, `gpucommandencoder.rs`.
+- **timestamp-query feature hidden** (`script/dom/webgpu/gpusupportedfeatures.rs`): Servo advertised `timestamp-query` but its async timestamp readback hangs, so three.js's Inspector enabled GPU timing and the renderer stalled on the first frame (render loop never started → blank page). Commenting out the advertisement makes the Inspector skip timestamps → page renders. (Root cause of the "blank live page" — NOT the `uncaught exception: undefined`, which is non-fatal.)
+- **`copyExternalImageToTexture` implemented** (`script/dom/webgpu/gpuqueue.rs`): was commented out in the webidl, so glTF textures uploaded via it silently failed (three wraps the call in try/catch) → black characters. Implemented by taking a `pixels::Snapshot` of the source (ImageBitmap/canvas `get_image_data()`), `transform()` to RGBA, optional flipY, then reusing the working WriteTexture path. Servo samples raw-byte/writeTexture and render-target (reflector) textures fine — only the image-source upload path was missing.
+- **document.visibilityState fixed** (`script/dom/document/document.rs`, in `maybe_queue_document_completion`): Servo left every document's visibility at its default `Hidden` for the whole session (general bug, NOT wall-specific — normal windows too; only the document-reactivation path ever set Visible, never the initial-load path). So `document.hidden === true` always, which made `THREE.Timer.update()` set delta=0 (its tab-hidden guard) → character mixers/retargeting froze while the TSL background kept animating via three's internal `time` node (looked like "everything moves but the characters"). Fix: when a freshly loaded document is fully active, call `update_visibility_state(Visible)`. Now `document.hidden === false` and Timer-driven animation runs.
+
+Net: after these patches the live threejs.org retargeting page renders textured, ANIMATED characters across both GPUs (balanced ~50/50, no panics). `webgpu_fanout_three_retargeting.html` still carries page-level workarounds (DataTexture texture recovery, performance.now instead of THREE.Timer) that are now redundant given the source fixes but remain harmless.
 
 
 ---
@@ -379,152 +540,6 @@ If the user only needs slide/image/text output (no live camera): the minimal cha
 **8c. 상태 정정 — 이제 커밋+푸시됨 (2026-07-03).** 위 line 35/39의 "NOT committed"는 **더 이상 사실 아님**. 사용자 지시로 이번 세션에 전부 커밋+푸시: WebRTC 수신 체인(fix 2~6) + webrtcbin latency = `1db812cd9`, presenter 런처+우측모니터 레이아웃 = `df02ced57`, raw passthrough 코드 = `f99f22fad`+`9d5370f7e`, 문서 = `1cf162f4a`. 전부 `nuriconrnd/multigpu-tiled-wall`에 push(`f89573bee..1cf162f4a`). 제외: 783MB `tests/4k_3DMark.mp4`·.venv·.omc 등 스크래치(미커밋 유지).
 
 Trace tips: `GST_DEBUG=2,srtpdec:5,rtpbin:4,rtpptdemux:5,webrtcbin:4` + `RUST_LOG=info,servo_media_gstreamer=warn`. Logs in `servo/target/multigpu_logs/presenter_*`. webidl change forces a script-bindings+script recompile (minutes); media-only changes are ~15-50s. Build per [[servo-build-run-commands]]. See also [[multigpu-next-session-tasks]].
-
-
----
-
-<!-- memory/servo-wall-webgl2-findings.md -->
-
----
-name: servo-wall-webgl2-findings
-description: "Servo WebGL2 multi-GPU wall — fixes for assert, multi-context crash, single-window WebGL2, cross-GPU black tile, keyframes-black (vertex-attrib validation), and the webgl_backtrace-build perf trap"
-metadata: 
-  node_type: memory
-  type: project
-  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
----
-
-WebGL2 example (threejs.org webgl_animation_keyframes, LittlestTokyo) on the multi-GPU wall in local Servo. Status as of 2026-06-14:
-
-**Committable Servo source fixes (verified, NOT yet committed — user said hold):**
-- WebGL2 single-window now renders: `EXTColorBufferFloat` extension (new webidl + ext rs), float/half-float texture formats in webglrenderbuffer.rs + tex_image_2d.rs, compositor panic fix (components/shared/paint/lib.rs WebGl arm passes Invalid through), busy-counter underflow fix (components/paint/webrender_external_images.rs).
-- **Multi-context wall CRASH fix**: `third_party/surfman/.../angle/{device.rs,connection.rs}` adds `Device::new_isolated`/`create_isolated_device` (explicit `D3D11CreateDevice` + `EGL_PLATFORM_DEVICE_EXT`, bypassing ANGLE's per-LUID cached display). `components/webgl/webgl_thread.rs` `get_or_create_device_for_painter` now calls `create_isolated_device`. Root cause: vendored surfman `Device::new` opens the display via `EGL_PLATFORM_ANGLE_ANGLE`+LUID, which ANGLE caches per-GPU, so the WebGL backend context and the compositor shared one D3D11 device/ANGLE renderer driven from two threads → state corruption → `libGLESv2.dll` access violation (0xc0000005). The `StateManager11.cpp:2384` debug assert was the canary, not benign.
-
-**mozangle NDEBUG — UNNECESSARY, abandoned.** Earlier I added `build.define("NDEBUG", None)` to mozangle build.rs to silence ANGLE asserts. It turned out (a) unnecessary once the multi-context crash was fixed at the source, and (b) it was edited in the UNUSED `.servo` tree anyway (build compiles `~/.cargo`, see [[servo-mozangle-build-path]]). Do not pursue NDEBUG.
-
-**GPU-DISTRIBUTION fix (the big one — each tile now computes on ITS monitor's physical GPU).** Symptom: even though both wall tiles rendered, ALL rendering/compositing ran on GPU0 (nvidia-smi: servoshell compute-app only on GPU0; GPU1 just scanned out its monitor). Root cause: ANGLE's display cache key `ANGLEPlatformDisplay` (gfx/angle/checkout/src/libANGLE/Display.cpp) keys on nativeDisplay/powerPref/platformType/deviceId but NOT the D3D adapter LUID. surfman selects the GPU by LUID, so every per-GPU display request collided on the same key → the first (GPU0) cached Display was reused for all adapters → callD3D11CreateDevice only ran once (GPU0). (Two identical RTX A4000s also can't be told apart by deviceId.) Fix: add `luidHigh`/`luidLow` to the `ANGLEPlatformDisplay` struct, its 7-arg ctor, `tie()`, `GetDisplayFromNativeDisplay` (read `EGL_PLATFORM_ANGLE_D3D_LUID_HIGH/LOW_ANGLE`), AND the `~Display` destructor's erase key. After this, GetDisplay makes a NEW display per LUID and callD3D11CreateDevice matches each LUID to the right adapter. Verified: servoshell compute-app on BOTH GPUs; balanced memory deltas for WebGL (+290/+248 MiB), WebGPU (+606/+166), 4K video (+182/+178). This mozangle edit is in BOTH `~/.cargo` (compiled) and `.servo` trees; the registry source itself is NON-committable, BUT the change is now preserved in-repo as a reproducible asset (commit 4f7ec023c): `etc/multigpu/patches/mozangle-0.5.5-angle-luid-display-cache.patch` (git-apply-verified unified diff vs crate original) + `apply_mozangle_angle_luid.ps1` (idempotent; `-Rebuild` forces ANGLE rebuild + copies DLLs) + README (fork + `[patch.crates-io]` = the committable form). To restore on a fresh checkout/machine: run the apply script with `-Rebuild`.
-
-**Cross-GPU fix (task #16, DONE):** dual-GPU wall secondary tile was BLACK because the surface import failed. Root cause: ANGLE's per-LUID display falls back to the DEFAULT GPU (gpu0) for a non-default LUID, so the compositor for the gpu1 tile actually lives on gpu0, while `new_isolated` built its dedicated device on the EXPLICIT painter adapter (real gpu1) -> cross-adapter -> compositor's `OpenSharedResource(EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE)` fails E_INVALIDARG/EGL_BAD_PARAMETER -> black. Two-part fix (both in third_party/surfman): (1) `device.rs new_isolated` now opens the LUID display the way `new` does, queries the adapter ANGLE actually bound, and builds the dedicated device on THAT resolved adapter (matches the compositor). (2) `surface.rs create_surface_texture` imports the shared texture by `self.d3d11_device.OpenSharedResource(...)` on the consumer device + `EGL_D3D_TEXTURE_ANGLE`, instead of the default-device-tied share-handle path.
-
-**Verified working (2026-06-14):** single-window WebGL2 (float FBO), same-GPU 2x1 wall (both tiles), dual-GPU 2x1 wall (both tiles render, stable, no crash, importFail=0), AND GPU-distributed compute across both physical GPUs (WebGL/WebGPU/video). See [[servo-wall-webgpu-constraints]].
-
-**WebGL texture (user req #3) — 3 Servo WebGL2 bugs FIXED (committable), model now error-free but renders BLACK due to PMREM-IBL.** Diagnosis via `webgl_backtrace` feature (logs JS stack on InvalidEnum at webglrenderingcontext.rs webgl_error) pinpointed three.js `texSubImage2D`→`uploadTexture`. Root causes + fixes (all in components/script/dom/webgl/):
-  1. `texSubImage2D(...,RG,...)` (0x8227, normal/2-ch maps) → InvalidEnum. Base `TexSubImage2D`/`TexSubImage2D_` pass the transfer FORMAT as `internal_format` to `TexImage2DValidator`, which required `usable_as_internal()` (false for RG/RED). FIX: added `is_sub_image` flag + `for_sub_image()` builder on the validators; skips the `usable_as_internal` requirement for *SubImage (validations/tex_image_2d.rs + the two base callers).
-  2. `texStorage2D` of normal-size color textures (SRGB8_ALPHA8/RGBA8) → `TextureTooBig`. `TexStorageValidator` passes the mip-level COUNT as `level` to the common validator, whose size check does `width > max_size >> level` — shifting by the level count made the effective max tiny. FIX: `is_tex_storage` flag + `for_tex_storage()`; size check uses shift 0 for storage.
-  3. Same path: non-power-of-two textures with levels>1 → `NonPotTexture` (the `level>0 && !pot` rule). FIX: skip that rule when `is_tex_storage`.
-  Result: ALL WebGL errors gone (InvalidEnum 4109→0). Committed: ef7b9c6aa (texture/format), 35b4c2ed7 (isolated device + cross-GPU surface), b33a009f9 (test pages), 4f824aeac (handoff doc etc/multigpu/WEBGL_WALL_STATUS.md). NOT committed: the mozangle ANGLE LUID display-cache fix (GPU distribution) — registry edit, needs a mozangle fork.
-
-**RESOLVED (2026-06-14) — keyframes model BLACK was a WebGL2 vertex-attrib validation bug.** The InvalidOperation was NOT in `draw_elements_instanced` (those branches never fired) — it was raised BEFORE the draw, in `WebGL2RenderingContext::DrawElements`→`validate_vertex_attribs_for_draw` (components/script/dom/webgl/webgl2renderingcontext.rs). That function compared the program attribute's base type against the vertex array's *storage* `type_`. Two bugs: (1) for an enabled array it used the raw storage enum as the base type, but `vertexAttribPointer` always feeds FLOAT regardless of storage (normalized/integer storage like UNSIGNED_SHORT/BYTE → FLOAT in shader); storage enums aren't in the FLOAT/INT/UINT groups → spurious INVALID_OPERATION → ~4/71 LittlestTokyo meshes (a `vec4` fed by unnormalized USHORT) silently dropped → "black". (2) the base-type group table omitted matrix types (FLOAT_MAT2/3/4 …), so InstancedMesh `mat4` attributes (e.g. RoomEnvironment under PMREM, fed by four float vec4 arrays) were rejected too. FIX: replaced the storage-type-as-base-type logic with `candidate_base_types` (disabled→generic attrib type; enabled+normalized/float/half→FLOAT; enabled+unnormalized-int→permissive [FLOAT, INT/UINT] since Servo doesn't track vertexAttribPointer vs vertexAttribIPointer — `VertexAttribIPointer` just forwards to `VertexAttribPointer(normalized=false)`), plus a `glsl_attrib_scalar_base_type()` helper that maps FLOAT_VEC*/FLOAT_MAT*→FLOAT, INT_*→INT, UINT_*→UINT. Verified: InvalidOperation 120→0, LittlestTokyo renders bright (maxRGB~247, not [21,16,13] — that center pixel just lands on a dark crevice) in single-window AND dual-GPU wall, with both plain HemisphereLight and PMREM/RoomEnvironment. The earlier "dark" read was a misread center pixel; the model was never actually rendering (meshes dropped). NOT yet committed (user holds commits).
-
-Diagnosis method (one rebuild): built `--features webgl_backtrace`, the existing webgl_error JS-backtrace log showed the failing call was `renderBufferDirect@three:17270`→`render@4419`=`gl.drawElements`, but temp logging in `draw_elements_instanced` never fired → the error was in the WebGL2 pre-draw validation wrapper instead. A JS `gl.drawElements` wrapper that dumped attrib state via `getVertexAttrib/getBufferParameter/getProgramParameter` CRASHED Servo (`assertion failed: self.is_double()`, mozjs jsval.rs:503) — a separate latent Servo WebGL2 getter bug, not yet fixed.
-
-**PERF — "wall is very slow" was a `--features webgl_backtrace` build artifact, NOT a wall/cross-GPU bug.** `send_with_fallibility` (every WebGL command, webglrenderingcontext.rs:~433) calls `capture_webgl_backtrace()`, which with the feature ON does `Backtrace::new()` + `format!("{:?}",bt)` (full Rust symbolication) + JS stack capture PER COMMAND. LittlestTokyo ≈ thousands of commands/frame → ~2.6 s/frame (≈0.4 fps), and it was resolution/tile/GPU-INDEPENDENT (plain 1920 window, 1x1, same-GPU 2-tile, dual-GPU all identical) which is what ruled out the wall. A normal `mach build --release` (NO webgl_backtrace) returns an empty struct → keyframes runs **60 fps vsync-locked at 3840x1080 across the dual-GPU wall** (first frame ~1.3 s is one-time ANGLE shader compile). Lesson: build release WITHOUT webgl_backtrace for any perf work / demos; only add it for InvalidOperation debugging. (Also: per-frame `gl.finish()` in a probe serializes the pipeline and inflates measured frame time — measure without it.)
-
-**"Only top-left of left monitor visible" was a TEST-PAGE bug, not Servo.** `--wall-all-tiles` shares ONE webview that sees the full virtual viewport (e.g. 3840x1080, confirmed via `window.innerWidth`); diagnostic probe pages used a FIXED `renderer.setSize(960,600)` → filled only the top-left corner. A page that sizes to `window.innerWidth/innerHeight` (+resize handler) fills the whole wall. Demo page: `tests/html/keyframes_wall.html` (full-viewport + FPS HUD). Other probes added this session: keyframes_renderprobe/keyframes_pmrem_probe (readPixels luma-grid render check, immune to window-capture grabbing the wrong window), webgl2_ctx_probe (WebGL2-enable check), keyframes_drawprobe (the getter-panic repro). Reliable single-window capture+log helper: etc/multigpu/tools/run_single_capture.ps1 (auto-starts http.server, passes `--pref dom_webgl2_enabled=true`).
-
-Note: WebGL2 is OFF by default — `getContext('webgl2')` returns null unless `--pref dom_webgl2_enabled=true` or host is www.servoexperiments.com (WEBGL2_ORIGINS). three.js (WebGL2-only) then throws "Error creating WebGL context". 127.0.0.1/threejs.org need the pref.
-
-**FIXED (2026-06-14) — "FPS drops / stutters while moving the mouse" on the wall.** Symptom: on a mouse-interactive page (e.g. threejs `webgl_effects_anaglyph`, camera follows cursor) the displayed FPS visibly dropped while the mouse moved. Measured on the live page (RUST_LOG=info, per-second "Wall render end" count = compositor present rate, user did still-then-move): idle steady 60fps/tile @ render_ms~2ms; during mouse movement present fell to **42–56fps with render_ms spiking to ~27ms**. Root cause (`ports/servoshell/desktop/headed_window.rs` window-event handler): every winit event is fed to egui via `gui.on_window_event`, egui returns `repaint=true` on essentially every `CursorMoved`, and the code then calls `winit_window.request_redraw()` → `RedrawRequested` → `paint_wall_tile_group_for_redraw` (a full, synchronized re-composite of ALL wall tiles). Rapid mouse motion = a flood of expensive forced wall repaints competing with the rAF render loop. FIX: skip that `request_redraw()` for `CursorMoved` when the cursor is over WebView content (`!should_forward_mouse_event_to_egui()`); egui still repaints when the cursor is over its own toolbar. Safe because the WebView repaints itself via `notify_new_frame_ready → window.set_needs_repaint()` (running_app_state.rs), independent of egui. Verified: after the fix, present holds **steady 60fps with render_ms ~2ms throughout mouse movement** (no spikes). servoshell-only change → ~7s incremental rebuild. NOT committed (user holds commits).
-
-Diagnosis gotchas worth remembering: (1) Synthetic mouse injection (SetCursorPos AND SendInput abs/virtualdesk) does NOT reach the Servo page on the wall — the page's mousemove listeners stay at ~0 events; you must have the USER move a real mouse (the wall tile window also must be topmost/unoccluded). (2) A page's own rAF `fps` counter stays ~60 even when the *displayed* rate drops, because the compositor re-presents; measure the server-side "Wall render end" present rate, not the page rAF, to see the real display FPS. (3) anaglyph (and any camera-follows-mouse page) is essentially STATIC without mouse input (logical_frame_id stays 1) — needs real mouse to exercise. Test pages added: tests/html/mouse_latency_probe.html (?load=light|heavy, HUD with fps/mouseEv-s/frameGap/moveLat), keyframes_wall.html.
-
-User's 3 requirements (2026-06-14): #1 per-tile-GPU compute = DONE (ANGLE LUID cache-key); #2 video CPU-decode = leave as-is (intentional); #3 WebGL textures/keyframes = DONE (vertex-attrib validation fix above; renders + 60fps on dual-GPU wall).
-
-Note: a Korean (cp949) Windows console makes `mach build` throw a harmless UnicodeEncodeError on the post-build summary's '•' char AFTER cargo prints "Finished `release`" — the binary is fine.
-
-Build: `cmd /c ".\mach.bat build --release > log 2>&1"` with `C:\Program Files\LLVM\bin` (lld-link) on PATH. Wall test layouts in etc/multigpu/config/ (example_2x1_dualgpu, test_2x1_samegpu, test_2x1_gpu1).
-
-
----
-
-<!-- memory/servo-wall-webgpu-constraints.md -->
-
----
-name: servo-wall-webgpu-constraints
-description: Servo multi-GPU wall behavior and the local WebGPU source patches that make three.js/Inspector pages work
-metadata: 
-  node_type: memory
-  type: project
-  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
----
-
-Running three.js (WebGPU) pages on the Servo multi-GPU wall (`servoshell.exe --wall-layout <json> --wall-all-tiles --pref dom_webgpu_enabled=true <url>`). Discovered/patched while making `tests/html/webgpu_fanout_three_retargeting.html` and the live `https://threejs.org/examples/webgpu_animation_retargeting.html` render. Use the runner `etc/multigpu/run_three_retargeting_wall.ps1` (auto-starts python http.server on :8753, enables WebGPU). Capture: bring both tile windows to front via Win32 EnumWindows+SetForegroundWindow, then GDI CopyFromScreen over the virtual screen (DISPLAY1 at 0,0 + DISPLAY9 at 1920,0 = 3840x1080).
-
-Standing Servo behaviors (NOT patched):
-- **ES modules don't load over `file://`** — module loader errors "Fetching module script failed Unsupported scheme". Serve over HTTP. Classic inline `<script>` pages are unaffected.
-- **WebGPU is off by default** (`dom_webgpu_enabled` pref false). three.js's WebGL2 fallback backend also fails under Servo (`this.gl is null`), so WebGPU must be enabled — there is no usable WebGL fallback.
-
-WebGPU source patches made IN THIS REPO's Servo (`D:\2_TechReview\20260606_multigpu_browser\servo`) — rebuild with `mach build --release`:
-- **GPU query sets** (`createQuerySet` was commented out in `components/script_bindings/webidls/WebGPU.webidl`). Implemented `GPUDevice.createQuerySet` + `GPUCommandEncoder.resolveQuerySet` end-to-end: webidl, `shared/webgpu/ids.rs` (WebGPUQuerySet), `script/dom/webgpu/identityhub.rs`, `shared/webgpu/messages/recv.rs` (CreateQuerySet/ResolveQuerySet), `webgpu/wgpu_thread.rs` handlers, `script/dom/webgpu/gpuqueryset.rs` (real impl), `gpudevice.rs`, `gpucommandencoder.rs`.
-- **timestamp-query feature hidden** (`script/dom/webgpu/gpusupportedfeatures.rs`): Servo advertised `timestamp-query` but its async timestamp readback hangs, so three.js's Inspector enabled GPU timing and the renderer stalled on the first frame (render loop never started → blank page). Commenting out the advertisement makes the Inspector skip timestamps → page renders. (Root cause of the "blank live page" — NOT the `uncaught exception: undefined`, which is non-fatal.)
-- **`copyExternalImageToTexture` implemented** (`script/dom/webgpu/gpuqueue.rs`): was commented out in the webidl, so glTF textures uploaded via it silently failed (three wraps the call in try/catch) → black characters. Implemented by taking a `pixels::Snapshot` of the source (ImageBitmap/canvas `get_image_data()`), `transform()` to RGBA, optional flipY, then reusing the working WriteTexture path. Servo samples raw-byte/writeTexture and render-target (reflector) textures fine — only the image-source upload path was missing.
-- **document.visibilityState fixed** (`script/dom/document/document.rs`, in `maybe_queue_document_completion`): Servo left every document's visibility at its default `Hidden` for the whole session (general bug, NOT wall-specific — normal windows too; only the document-reactivation path ever set Visible, never the initial-load path). So `document.hidden === true` always, which made `THREE.Timer.update()` set delta=0 (its tab-hidden guard) → character mixers/retargeting froze while the TSL background kept animating via three's internal `time` node (looked like "everything moves but the characters"). Fix: when a freshly loaded document is fully active, call `update_visibility_state(Visible)`. Now `document.hidden === false` and Timer-driven animation runs.
-
-Net: after these patches the live threejs.org retargeting page renders textured, ANIMATED characters across both GPUs (balanced ~50/50, no panics). `webgpu_fanout_three_retargeting.html` still carries page-level workarounds (DataTexture texture recovery, performance.now instead of THREE.Timer) that are now redundant given the source fixes but remain harmless.
-
-
----
-
-<!-- memory/servo-build-run-commands.md -->
-
----
-name: servo-build-run-commands
-description: "How to build and run the Servo multi-GPU wall on this machine: mach build invocation (PowerShell ErrorActionPreference gotcha), project-local CARGO_HOME, and the wall launch command."
-metadata: 
-  node_type: memory
-  type: reference
-  originSessionId: fdf094f3-11cb-4be6-a49d-755527bf994b
----
-
-Operational commands for the Servo wall project at `D:\2_TechReview\20260606_multigpu_browser\servo` (branch `multigpu-tiled-wall`). See also [[servo-mozangle-build-path]].
-
-**BUILD (release, incremental):** source the env then run mach with `ErrorActionPreference='Continue'`:
-```powershell
-cd D:\2_TechReview\20260606_multigpu_browser\servo
-. .\etc\multigpu\servo_env.ps1            # sets project-local CARGO_HOME/.servo, RUSTUP_HOME/.rustup, toolchain 1.95.0
-$ErrorActionPreference = 'Continue'        # CRITICAL
-& .\mach.ps1 build --release
-```
-**GOTCHA (cost a wasted build this session):** `servo_env.ps1` sets `$ErrorActionPreference='Stop'`. With Stop, the FIRST line cargo writes to stderr ("Compiling proc-macro2 …") becomes a terminating NativeCommandError and aborts the whole build immediately (looks like a build failure but isn't). ALWAYS set `$ErrorActionPreference='Continue'` after sourcing servo_env.ps1 before `mach build`. An incremental servoshell/paint change builds in ~1–3 min. Binary: `target\release\servoshell.exe`. Editing `components/paint/*` or `third_party/surfman/*` rebuilds those crates + servoshell (a bit longer).
-
-**RUN the wall (2×A4000, monitor0 + monitor1):**
-```powershell
-$root="D:\2_TechReview\20260606_multigpu_browser\servo"
-& "$root\target\release\servoshell.exe" --wall-layout "$root\etc\multigpu\config\wall_layout.example_2x1_dualgpu.json" --wall-all-tiles `
-  --pref dom_webgpu_enabled=true --pref dom_webgpu_multigpu_fanout=true --pref dom_webgpu_gpu_direct=true `
-  https://threejs.org/examples/webgpu_compute_birds.html
-```
-Layout: monitor0 (0,0)-(1920,1080) primary, monitor1 (1920,0)-(3840,1080). file:// works for plain HTML pages (ES-module pages need HTTP — see the run_*.ps1 scripts which start a python http.server). Stop with `Stop-Process -Name servoshell -Force`.
-
-**RESUME a session:** just say e.g. "멀티 GPU 월 Task 3 진행해줘" — MEMORY.md auto-loads the index. Open tasks tracked in [[multigpu-next-session-tasks]].
-
-
----
-
-<!-- memory/servo-mozangle-build-path.md -->
-
----
-name: servo-mozangle-build-path
-description: "Which mozangle (ANGLE) source dir Servo actually compiles, and how to force a rebuild after editing ANGLE C++"
-metadata: 
-  node_type: memory
-  type: reference
-  originSessionId: 14312b32-9ff1-47be-890f-d2c1a9a450f9
----
-
-CRITICAL build gotcha for the local Servo at D:\2_TechReview\20260606_multigpu_browser\servo:
-
-There are TWO mozangle-0.5.5 source trees on this machine:
-- `.servo\cargo-home\registry\src\index.crates.io-...\mozangle-0.5.5`  (project-local; used ONLY when CARGO_HOME is set to .servo\cargo-home, e.g. via etc\multigpu\servo_env.ps1)
-- `C:\Users\ilwoonam75\.cargo\registry\src\index.crates.io-...\mozangle-0.5.5`  (global; the DEFAULT)
-
-Building via `cmd /c ".\mach.bat build --release"` WITHOUT sourcing servo_env.ps1 leaves CARGO_HOME unset, so cargo compiles the GLOBAL `~/.cargo` copy. Confirmed via the `.d` file in target/release/build/mozangle-*/. So edits to ANGLE C++ (Display.cpp, Renderer11.cpp) or build.rs (NDEBUG) must be made in the SAME tree the build uses — match them, or set `$env:CARGO_HOME='...\.servo\cargo-home'` before building so the .servo edits apply.
-
-cc does NOT emit rerun-if-changed for the bundled ANGLE .cpp files, so editing an ANGLE source does NOT trigger a rebuild on its own. Force it: remove `target/release/build/mozangle-*`, `target/release/.fingerprint/mozangle-*`, `target/release/deps/*mozangle*`, then `touch` the mozangle build.rs, then rebuild. The ANGLE recompile is ~2.5 min.
-
-mach builds the DLLs (libGLESv2.dll/libEGL.dll, Servo's `no-wgl` feature) under `target/release/build/mozangle-*/out/` but does NOT always re-copy them next to servoshell.exe — copy them to `target/release/` manually after the build.
-
-NDEBUG (disabling ANGLE asserts) turned out to be UNnecessary once the multi-context crash was fixed at the source (isolated D3D11 device, see [[servo-wall-webgl2-findings]]); the earlier "NDEBUG fixed it" was a misattribution (the edit was in the unused .servo tree).
 
 
 ---
