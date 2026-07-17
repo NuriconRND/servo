@@ -433,8 +433,7 @@ impl VideoConvertPass {
     pub(crate) unsafe fn convert(&mut self, context: *mut ID3D11DeviceContext1,
         lease: &VideoFrameLease, rtv: *mut ID3D11RenderTargetView,
         dst_width: u32, dst_height: u32) -> bool;
-    /// 링 제거 등으로 사라진 텍스처의 SRV 캐시 정리.
-    pub(crate) fn evict_srvs_not_in(&mut self, live_textures: &FxHashSet<usize>);
+    // SRV 캐시 정리는 Task 5의 결정(상한 128 초과 시 전체 clear)을 따름 — 별도 evict API 없음.
 }
 /// cbuffer 파라미터 (Step 3 상수표 기반). to_cbuffer()가 HLSL 레이아웃(5×float4)으로 패킹.
 pub(crate) struct ConvertParams {
