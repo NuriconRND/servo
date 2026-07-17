@@ -164,6 +164,8 @@ release(lease)
 
 ## 11. 알려진 리스크 (실측 전 미지수)
 
+- **v1 표시 계약 한계 (계획 수립 중 확정)**: WR은 external surface의 원본(비클립) 표시 크기를 컴포지터에 전달하지 않음(add_surface는 transform+clip_rect만). v1은 dest=clip_rect·UV 0..1 계약 — 비디오가 **부분 클립**(overflow 크롭/스크롤 반노출)되는 페이지에선 크롭 대신 압착으로 표시될 수 있음. 월·mixed·stress 검증 페이지는 전부 무클립이라 무영향. 발현 시 후속(프리미티브 rect 전달 채널) 이월.
+
 - DWM 46개 비주얼 합성 비용 (AMD GCN1 구형) — 스위치 3종(off/native/external)이 판별 레버.
 - 렌더러 스레드 45 draw+Present/프레임 비용 — 개발기 선측정.
 - C 단계 자체는 일시적 fps 하락 가능 (비디오별 서피스 패스 45개) — 검증 정거장이며 게이트 뒤라 표출 레시피 무영향.
