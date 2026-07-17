@@ -131,6 +131,12 @@ pub struct D3d11PlaneBinding {
     pub plane_index: usize,
     pub width: i32,
     pub height: i32,
+    /// DComp external surface interop(Task 5)이 lease를 통해 소비하는
+    /// 색정보 — WR YUV 직접 샘플 경로가 쓰는 것과 동일한 원천에서 채워진다
+    /// (htmlmediaelement.rs `render_d3d11_yuv_frame`의 `VideoFrameD3D11YuvData`).
+    pub yuv_format: paint_api::VideoLeaseFormat,
+    pub color_space: paint_api::VideoLeaseColorSpace,
+    pub color_range: paint_api::VideoLeaseColorRange,
 }
 
 /// external image ID(u64) → 최신 plane 바인딩(latest-wins). 프로듀서가
@@ -328,6 +334,10 @@ impl WindowGLContext {
             Some(rendering_context),
         ));
         external_image_handlers.set_handler(image_handler, WebRenderImageHandlerType::Media);
+
+        paint_api::set_video_external_surface_provider(std::sync::Arc::new(
+            MediaVideoExternalSurfaceProvider,
+        ));
     }
 }
 
@@ -497,6 +507,75 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
                 },
             );
         },
+    }
+}
+
+/// DComp external surface 경로가 렌더러 스레드에서 plane 링을 직접 소비하기
+/// 위한 provider. `lock_d3d11`(위 `MediaExternalImages::lock_d3d11`)과 동일한
+/// 링 잠금 규율(0→1 소비 계획, 짝맞춤 unlock)을 그대로 쓴다 — `consume_plan`을
+/// 직접 재사용하므로 두 소비 경로가 상태기계 규약을 벗어나지 않는다.
+pub struct MediaVideoExternalSurfaceProvider;
+
+impl paint_api::VideoExternalSurfaceProvider for MediaVideoExternalSurfaceProvider {
+    fn acquire(
+        &self,
+        rc: &dyn RenderingContext,
+        external_id: u64,
+    ) -> Option<paint_api::VideoFrameLease> {
+        let binding = D3d11VideoFrameExternalImages::binding_for(external_id)?;
+
+        // 합성당 1회 소비: lock_d3d11과 동일하게 링별 lock_count 0→1 전이에서만
+        // plan이 나오고, Some(plan)은 반드시 consume_plan이 commit까지 끝낸다.
+        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(binding.ring_id) {
+            consume_plan(rc, binding.ring_id, plan);
+        }
+
+        let plane_count = match D3d11PlaneRings::plane_count(binding.ring_id) {
+            Some(n) => n,
+            None => {
+                D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                return None;
+            },
+        };
+
+        let mut planes: [Option<paint_api::VideoLeasePlane>; 3] = [None; 3];
+        for i in 0..plane_count {
+            match D3d11PlaneRings::presenting_plane(binding.ring_id, i) {
+                Some(p) => {
+                    planes[i] = Some(paint_api::VideoLeasePlane {
+                        texture: p.texture,
+                        width: p.width,
+                        height: p.height,
+                    })
+                },
+                None => {
+                    D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                    return None;
+                },
+            }
+        }
+
+        let frame_seq = match D3d11PlaneRings::presenting_filled_seq(binding.ring_id) {
+            Some(s) => s,
+            None => {
+                D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                return None;
+            },
+        };
+
+        Some(paint_api::VideoFrameLease {
+            ring_id: binding.ring_id,
+            planes,
+            plane_count,
+            format: binding.yuv_format,
+            color_space: binding.color_space,
+            color_range: binding.color_range,
+            frame_seq,
+        })
+    }
+
+    fn release(&self, _rc: &dyn RenderingContext, ring_id: u64) {
+        D3d11PlaneRings::note_plane_unlock(ring_id);
     }
 }
 

@@ -889,6 +889,26 @@ impl MediaFrameRenderer {
             return;
         };
 
+        // DComp external surface interop(Task 5)이 소비하는 색정보 —
+        // `wr_yuv_color_space`/`wr_yuv_color_range`/`media_frame_yuv_format`과
+        // 동일한 원천(`VideoFrameYuvFormat`/`VideoFrameYuvColorSpace`/
+        // `VideoFrameYuvColorRange`)에서 매핑한다.
+        let lease_format = match format {
+            VideoFrameYuvFormat::I420 => paint_api::VideoLeaseFormat::I420,
+            VideoFrameYuvFormat::I420_10 => paint_api::VideoLeaseFormat::I420_10,
+            VideoFrameYuvFormat::NV12 => paint_api::VideoLeaseFormat::Nv12,
+            VideoFrameYuvFormat::P010 => paint_api::VideoLeaseFormat::P010,
+        };
+        let lease_color_space = match d3d11_yuv.color_space {
+            VideoFrameYuvColorSpace::Rec601 => paint_api::VideoLeaseColorSpace::Rec601,
+            VideoFrameYuvColorSpace::Rec709 => paint_api::VideoLeaseColorSpace::Rec709,
+            VideoFrameYuvColorSpace::Rec2020 => paint_api::VideoLeaseColorSpace::Rec2020,
+        };
+        let lease_color_range = match d3d11_yuv.color_range {
+            VideoFrameYuvColorRange::Limited => paint_api::VideoLeaseColorRange::Limited,
+            VideoFrameYuvColorRange::Full => paint_api::VideoLeaseColorRange::Full,
+        };
+
         // Register the plane bindings BEFORE the image update reaches WR: the
         // media thread keys its D3D11 no-flip / lock path off `binding_for(id)`,
         // so the binding must exist before the first composite touches the id.
@@ -909,6 +929,9 @@ impl MediaFrameRenderer {
                     plane_index,
                     width: plane_width,
                     height: plane_height,
+                    yuv_format: lease_format,
+                    color_space: lease_color_space,
+                    color_range: lease_color_range,
                 },
             );
         }

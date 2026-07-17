@@ -657,6 +657,24 @@ impl D3d11PlaneRings {
         ring.slots[idx].planes.get(plane).copied().flatten()
     }
 
+    /// 링당 plane 개수(생성 시 고정, `create_ring`의 `planes_per_slot` 그대로).
+    /// 존재하지 않는 ring_id면 None.
+    pub fn plane_count(ring_id: u64) -> Option<usize> {
+        let reg = lock(registry());
+        reg.rings.get(&ring_id).map(|r| r.planes_per_slot)
+    }
+
+    /// 현재 Presenting 슬롯의 `filled_seq`(최신 프레임 판별용 — 변화 없으면
+    /// 재변환 스킵). 아직 최초 소비 전(Presenting 슬롯 없음)이면 None.
+    /// [`presenting_plane`](Self::presenting_plane)과 동일하게
+    /// `presenting_slot` 술어를 그대로 재사용한다.
+    pub fn presenting_filled_seq(ring_id: u64) -> Option<u64> {
+        let reg = lock(registry());
+        let ring = reg.rings.get(&ring_id)?;
+        let idx = ring.presenting_slot?;
+        Some(ring.slots[idx].filled_seq)
+    }
+
     /// [`remove_ring`](Self::remove_ring)으로 제거된 링들을 모아 반환한다
     /// (호출 시점에 비운다). 렌더러가 주기적으로 폴링해 정리한다.
     pub fn take_removed_rings() -> Vec<RemovedRing> {
@@ -957,6 +975,25 @@ mod tests {
         // 두 lock 모두 unlock (합성 종료).
         D3d11PlaneRings::note_plane_unlock(ring_id);
         D3d11PlaneRings::note_plane_unlock(ring_id);
+    }
+
+    #[test]
+    fn plane_count_and_presenting_seq_accessors() {
+        let slots = make_slots(6000);
+        let ring = D3d11PlaneRings::create_ring(3, slots);
+
+        assert_eq!(D3d11PlaneRings::plane_count(ring), Some(3));
+        assert_eq!(D3d11PlaneRings::plane_count(ring + 999), None);
+
+        // 초기엔 Presenting 슬롯 없음.
+        assert_eq!(D3d11PlaneRings::presenting_filled_seq(ring), None);
+
+        // 기존 warm_up 헬퍼(InitialMapAll consume)로 슬롯0을 Presenting까지 전이.
+        warm_up(ring, &slots);
+        assert!(D3d11PlaneRings::presenting_filled_seq(ring).is_some());
+
+        D3d11PlaneRings::remove_ring(ring);
+        let _ = D3d11PlaneRings::take_removed_rings();
     }
 
     #[test]

@@ -48,6 +48,7 @@ use webrender_api::{
 };
 
 use crate::largest_contentful_paint_candidate::LCPCandidate;
+use crate::rendering_context::RenderingContext;
 use crate::viewport_description::ViewportDescription;
 
 pub static ANGLE_GL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -607,6 +608,74 @@ pub trait WebRenderExternalImageApi {
     fn needs_vertical_flip(&mut self, _id: u64) -> bool {
         true
     }
+}
+
+/// D3D11 plane 텍스처의 데이터 레이아웃(WR YUV 직접 샘플 경로와 동일한
+/// 4종). DComp external surface interop(Task 5)이 이 값으로 변환 셰이더/
+/// 서피스 포맷을 고른다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoLeaseFormat {
+    I420,
+    I420_10,
+    Nv12,
+    P010,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoLeaseColorSpace {
+    Rec601,
+    Rec709,
+    Rec2020,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoLeaseColorRange {
+    Limited,
+    Full,
+}
+
+/// plane 하나(텍스처+크기). `texture`는 AddRef 유지 중인 `ID3D11Texture2D`
+/// (DYNAMIC, ANGLE 디바이스 소속)의 불투명 핸들이다.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoLeasePlane {
+    pub texture: usize,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// [`VideoExternalSurfaceProvider::acquire`]가 반환하는, 렌더러 스레드가
+/// 링에서 대여한 프레임 하나. `release`와 반드시 짝을 맞춰야 한다.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoFrameLease {
+    pub ring_id: u64,
+    pub planes: [Option<VideoLeasePlane>; 3],
+    pub plane_count: usize,
+    pub format: VideoLeaseFormat,
+    pub color_space: VideoLeaseColorSpace,
+    pub color_range: VideoLeaseColorRange,
+    /// presenting 슬롯의 filled_seq — 변화 없으면 재변환 스킵.
+    pub frame_seq: u64,
+}
+
+/// 렌더러 스레드 전용. acquire는 링 잠금(0→1)+소비 계획 실행까지 수행 —
+/// release와 반드시 짝맞춤.
+pub trait VideoExternalSurfaceProvider: Send + Sync {
+    fn acquire(&self, rc: &dyn RenderingContext, external_id: u64) -> Option<VideoFrameLease>;
+    fn release(&self, rc: &dyn RenderingContext, ring_id: u64);
+}
+
+static VIDEO_EXTERNAL_PROVIDER: std::sync::OnceLock<
+    std::sync::Arc<dyn VideoExternalSurfaceProvider>,
+> = std::sync::OnceLock::new();
+
+pub fn set_video_external_surface_provider(p: std::sync::Arc<dyn VideoExternalSurfaceProvider>) {
+    // 단일 프로세스/단일 등록 전제 (CONSUMER_DEVICE와 동일 한계 — §4.5 다중창 이월과 정합)
+    let _ = VIDEO_EXTERNAL_PROVIDER.set(p);
+}
+
+pub fn video_external_surface_provider()
+-> Option<&'static std::sync::Arc<dyn VideoExternalSurfaceProvider>> {
+    VIDEO_EXTERNAL_PROVIDER.get()
 }
 
 /// Type of WebRender External Image Handler.
