@@ -53,6 +53,33 @@ pub fn dcomp_native_compositor_requested() -> bool {
     false
 }
 
+/// `SERVO_VIDEO_ESCAPE` 게이트 모드. Native=PREFER만(C 단계), External=PREFER|SUPPORTS(최종).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoEscapeMode {
+    Off,
+    Native,
+    External,
+}
+
+pub fn parse_video_escape_token(value: Option<&str>) -> VideoEscapeMode {
+    match value {
+        Some("native") => VideoEscapeMode::Native,
+        Some("external") => VideoEscapeMode::External,
+        _ => VideoEscapeMode::Off,
+    }
+}
+
+/// DComp 네이티브 컴포지터 게이트가 켜져 있을 때만 발효. 프로세스당 1회 캐시.
+pub fn video_escape_mode() -> VideoEscapeMode {
+    static MODE: std::sync::OnceLock<VideoEscapeMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if !dcomp_native_compositor_requested() {
+            return VideoEscapeMode::Off;
+        }
+        parse_video_escape_token(std::env::var("SERVO_VIDEO_ESCAPE").ok().as_deref())
+    })
+}
+
 /// A GL texture created by wrapping a D3D11 texture via `EGL_ANGLE_image_d3d11_texture`
 /// (media D3D11 interop for WR YUV direct sampling). Returned by
 /// [`RenderingContext::wrap_d3d11_texture_as_gl_texture`] and consumed by
@@ -1936,5 +1963,21 @@ mod test {
             Err(surfman::Error::Failed) => (),
             _ => panic!("Expected {:?}", surfman::Error::Failed),
         }
+    }
+
+    #[test]
+    fn video_escape_token_parses_native_external_only() {
+        use super::{VideoEscapeMode, parse_video_escape_token};
+        assert_eq!(
+            parse_video_escape_token(Some("native")),
+            VideoEscapeMode::Native
+        );
+        assert_eq!(
+            parse_video_escape_token(Some("external")),
+            VideoEscapeMode::External
+        );
+        assert_eq!(parse_video_escape_token(Some("1")), VideoEscapeMode::Off); // 미정의 값은 off
+        assert_eq!(parse_video_escape_token(Some("")), VideoEscapeMode::Off);
+        assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);
     }
 }
