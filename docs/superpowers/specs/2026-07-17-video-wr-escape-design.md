@@ -170,3 +170,54 @@ release(lease)
 - 렌더러 스레드 45 draw+Present/프레임 비용 — 개발기 선측정.
 - C 단계 자체는 일시적 fps 하락 가능 (비디오별 서피스 패스 45개) — 검증 정거장이며 게이트 뒤라 표출 레시피 무영향.
 - 페이싱 잔존 고정비(WR 프레임빌드)가 AMD에서 여전히 지배적이면 → 후속 증분(media 직접 Present, §3 비범위)의 판단 근거가 된다.
+
+## 12. 구현 결과 (2026-07-18)
+
+전 태스크 완료 — 월+복합 완료 기준(§2) 전부 충족. 개발기 RTX A5000 실기 검증.
+
+### 12.1 커밋 체인
+
+| 커밋 | 내용 |
+|---|---|
+| `b8515b129` | Task 1 — 게이트 `SERVO_VIDEO_ESCAPE`(OnceLock 파서) + 레이아웃 YuvImage 프로모션 플래그 + 런처 `-VideoEscape` |
+| `91813794c` | Task 3 — `VideoExternalSurfaceProvider` interop trait(paint_api) + 전역 슬롯 + d3d11_ring 접근자 + media-thread provider 구현/등록 |
+| `9784eaf37` | Task 4 — `VideoConvertPass`(raw D3D11 YUV→RGBA 1-draw, HLSL, `SwapDeviceContextState` 격리) + WARP E2E 테스트 5종 |
+| `206067629` | Task 5 — DComp external compositor surface 실구현: 비디오별 스왑체인 비주얼 직결, 변환 1-draw 연결, attach 세대 dedup, 드래그 중 재생성 억제 |
+| `061c7f5d0` | 크래시 근본수정 — plane SRV 캐시 제거(아래 12.2 ①) |
+
+검증 전용 기록 커밋(코드 변경 0): `4e2784432`(Task 2, C단계 native 실기 검증), `1a87b4eb0`(Task 6 최초 실행, A단계 크래시로 BLOCKED), `ab6a784d7`(Task 6 재개, 크래시 수정 후 A단계 전 게이트 PASS).
+
+### 12.2 스펙 대비 이탈
+
+① **SRV 캐시 절대 금지 — 매 변환 신선 생성** (§8.2에 캐시 방침 명시 없었음, 구현 중 발견된 근본 제약). `VideoConvertPass`가 plane 텍스처(`D3D11_USAGE_DYNAMIC`)의 `ID3D11ShaderResourceView`를 프레임 간 캐시·재사용하면, 그 슬롯이 다음 present 전 `Map(WRITE_DISCARD)`로 rename(백킹 버퍼 교체)될 때 캐시 SRV가 이미 해제된 rename 버퍼를 가리키는 dangling 상태가 되어 NVIDIA 드라이버(`nvwgf2umx.dll`)가 커맨드 제출 시 역참조하다 `0xc0000005` AV로 죽는다(동시 비디오 수에 비례해 발현 가속 — 5x5 ≈2초, 4x4 ≈32초, 3x3 이하는 관측창 내 생존). 수정 = SRV를 `convert()`마다 새로 생성하고 draw 직후 unbind+즉시 Release(D3D11 지연 파기로 안전). **재발방지 원칙: `D3D11_USAGE_DYNAMIC`(WRITE_DISCARD) 텍스처에 대한 뷰(SRV/RTV/UAV) 캐싱은 절대 금지 — rename마다 뷰가 낡는다.** native(C단계) 경로가 무사한 이유는 ANGLE이 매 draw 자신의 상태관리자로 뷰를 다시 유도하기 때문(=fresh view와 동치, 실험으로 확인). 상세: `.superpowers/sdd/escape-crash-debug-report.md`(11모드 실험 사다리).
+
+② `frames_logged`(External 서피스별 진단 로그 상한 카운터)·`convert_pass_init_failed`(변환 패스 최초 생성 실패 래치, 매 프레임 재시도 방지) 필드 추가 — §8.1의 `External { swapchain, attached, last_presented_generation, srv_cache }` 스케치에 없던 구현 세부(SRV 캐시 필드 자체는 ①로 인해 제거됨). `dcomp_compositor.rs`.
+
+③ **v1 표시 계약(§11 리스크) 실기 검증 완료, 한정 그대로 확인됨**: `SERVO_DCOMP_DEBUG=1` 브링업 로그에서 `scale=(1,1)`, `clip`=정확히 타일 rect(예: 2x2 그리드 960x540씩 4모서리), `src=1920x1080`(소스 원본 해상도) 전부 계약과 일치 확인 — v1의 dest=clip_rect·UV 0..1 전제가 무클립 페이지(월·mixed·stress)에서는 위배되지 않는다. §11이 지적한 **부분 클립 페이지에서의 크롭-대신-압착 리스크는 검증 페이지 전부가 무클립이라 이번 사이클에서 미발현·미검증 상태로 남는다** — 이월(12.4).
+
+④ PiP류(`complex_media_stress.html`의 `#pipv`) 둥근 모서리(`border-radius`)가 external 경로에서 **사각 클립으로 대체**됨(`[dcomp-native] rounded clip radii unsupported; applying rectangular clip only` warn). v1은 rect 클립만 표현 — 기능 결함 아님, 시각적 사소 저하로 판정.
+
+⑤ **native 모드는 진단 전용 — 복합 페이지 PiP 캐비앗**: `-VideoEscape native`에서 알파 패널 위 오버레이 비디오(PiP)가 시작 직후(프레임 약 2) 내장 카운터가 멈추는 프레임 동결 결함 발견(Task 2, `escape-task-2-pip-triage.md`) — WR 자체의 콘텐츠 갱신 계층 결함(§3-w/x/y 비불투명 슬라이스 비디오 계열과 동일 취약점 재발로 추정, 우리 층 버그 아님)으로 트리아지. 순수 비디오 월은 이 결함의 영향을 받지 않는다(PiP류 알파 오버레이가 없음). **`-VideoEscape external`은 동일 시나리오(62초 관측, 장면 전환+카운터 진행 직접 확인)에서 이 동결이 재현되지 않는다** — external이 WR draw 자체를 우회하므로 이 결함 층을 타지 않는 것으로 해석. AMD 가이드(패키지 `run_wall.ps1` 헤더)에 "native는 A/B 진단 전용, PiP류 복합 페이지 프로덕션에는 external 사용" 캐비앗을 명문화했다(12.5 참조).
+
+### 12.3 검증 수치
+
+- **C 단계(native, Task 2)**: 45타일 create_surface +45(비디오 전용 서피스, 213x216 opaque=true). **콘텐츠 타일 무효화 정지**: 하트비트 없는 콘텐츠 서피스 bind 총량 off 23,519회 → native **2회**(약 11,760배 감소).
+- **A 단계(external, Task 6 재개) 30분 소크**: 45타일(9x5), Working Set **4651~4720MB로 플랫**(변동 ~1.5%), 32.3분간 크래시 0, 신규 WARN/ERROR 0.
+- **복합 승격**: mixed_media_demo 6/6, complex_media_stress **13/13**(PiP 포함) 전부 `create_external_surface opaque=true` 승격. PiP 라이브니스 결정 게이트 **PASS**(위 ⑤).
+- **PresentMon**: 46개 스왑체인(비디오45+콘텐츠1) **100% Composed: Flip**.
+- **★TileSize A/B 무차이(운영 레시피 변경)★**: `-VideoEscape external` 상태에서 `-TileSize 3840x3240` 유/무 = **29.09fps ↔ 30.39fps**(잡음 수준 차이). 비디오가 이미 WR 콘텐츠 패스(픽처캐시)를 완전히 벗어나 있어 WR 타일 크기가 비디오 프레젠트 비용에 관여하지 않기 때문 — **external 채택 시 `-TileSize` 튜닝은 불요**. `-TileSize` 확대 레시피는 `-DComp` 단독(hybrid) 또는 `-VideoEscape native`에서만 유의미.
+- 그 외 전 항목 PASS(10bit 색 정상, 리사이즈/드래그 40스텝 잔상 0, WebGPU 월 무회귀, `=surface` 호환, 게이트 off 무회귀). 상세: `.superpowers/sdd/escape-task-6-report.md`.
+
+### 12.4 이월 사항
+
+- v1 부분 클립 표시 리스크(§11, 12.2③) — 검증 페이지가 전부 무클립이라 미발현. 부분 클립 비디오를 갖는 페이지가 실제 배포에 등장하면 재검증 필요(발현 시 프리미티브 rect 전달 채널 후속).
+- PiP `border-radius` 사각 클립 대체(12.2④) — 시각적 사소 저하, 기능 무관. 필요 시 후속 스펙 항목화.
+- native 모드 PiP 동결 결함(12.2⑤) 자체의 근본수정 — external로 이미 우회되므로 비긴급, WR 콘텐츠 갱신 계층 문제로 범위 밖 유지.
+- 페이싱 우회(media 스레드 직접 Present, §3 비범위) — AMD 실측에서 WR 프레임빌드 잔존 고정비가 여전히 지배적으로 확인되면 후속 증분 착수 근거.
+- DWM 46개 비주얼 합성 비용의 실제 AMD 영향 — 개발기(A5000)에서는 무회귀 확인, 구형/저대역폭 GPU에서의 실측은 사용자 몫(AMD 3중 A/B).
+
+### 12.5 인계물
+
+- `D:\ServoWallPackage\run_wall.ps1`: `-VideoEscape native|external` 스위치(런처 관례와 동일한 set-or-clear) + 헤더에 AMD 3중 A/B 판독 절차(영어) — `(1) -DComp` 기준 / `(2) -DComp -VideoEscape native`(콘텐츠 패스 소멸 이득) / `(3) -DComp -VideoEscape external`(ANGLE 제출세까지 소멸), 판독 기준(3>2>1 = 제출 오버헤드 가설 확증, 1↔3 GPU% 비교 필수), TileSize 무요 결론, native 진단 전용 캐비앗 포함.
+- `D:\ServoWallPackage.zip` 재생성(servoshell.exe 교체, 나머지 리소스/테스트 페이지 무변경 — `complex_media_stress.html` 기존 포함 확인됨).
+- **방법론 노트**: external 스왑체인은 BitBlt/CopyFromScreen으로 실제 캡처 가능(native/hybrid 서피스는 검정 캡처됨, 기존 세션 결론이 native/hybrid 한정으로 정정됨) — 향후 검증의 1차 캡처 수단으로 재채택 가능.

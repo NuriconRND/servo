@@ -154,3 +154,4 @@
   전용, external 채택 시 불필요라는 운영 결론). 이월: PiP `border-radius`가 external 사각
   클립으로 대체됨(`rounded clip radii unsupported` warn, 시각적 사소 저하·기능 무관).
   **Task 7(패키징/최종 리뷰) 착수 가능 — A 단계 게이트 전제 충족.**
+- Escape Task 6: complete (commit ab6a784d7, 전 게이트 PASS). 30분 소크 WS 4651-4720MB 플랫/크래시 0, mixed 6/6+stress 13/13 external 승격, ★PiP PASS(62s 카운터 진행+lockstep — native 동결은 external에서 비재현 = 복합 무결 충족)★, 4K 회전 폴백 정상, 10bit/리사이즈40스텝(잔상0, 드래그 중 일시 흰 catch-up만)/WebGPU/=surface/off 전부 PASS, PresentMon 46 스왑체인 100% Composed:Flip. ★운영: external이면 TileSize A/B 무차이(29.09/30.39fps) — 티어링 튜닝 불요★. 방법론: external 스왑체인은 BitBlt 캡처 가능. Minor(이월): PiP 둥근모서리 사각클립(rounded clip 미지원, 외관만).
