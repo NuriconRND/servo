@@ -197,6 +197,8 @@ release(lease)
 
 ④ PiP류(`complex_media_stress.html`의 `#pipv`) 둥근 모서리(`border-radius`)가 external 경로에서 **사각 클립으로 대체**됨(`[dcomp-native] rounded clip radii unsupported; applying rectangular clip only` warn). v1은 rect 클립만 표현 — 기능 결함 아님, 시각적 사소 저하로 판정.
 
+④-b (최종 리뷰에서 추가 식별된 이탈 2건) §8.4의 "드래그 중 비주얼 transform 스케일 임시 표시"는 **미구현** — 구현은 스왑체인 재생성 억제만 수행하므로, 표시 크기가 창 크기에 연동되는 페이지에선 드래그 중 구크기 콘텐츠가 새 클립 아래 크롭/미충전으로 보일 수 있음(안정화 후 자가 치유; 검증 페이지 전부 고정 픽셀 레이아웃이라 미발현 — Task 6 리사이즈 40스텝에서 재생성 0회). 또한 §8.2의 "flip discard"는 기존 `create_composition_swapchain` 재사용으로 **FLIP_SEQUENTIAL**로 구현됨(매 프레임 전면 재드로우라 기능 등가).
+
 ⑤ **native 모드는 진단 전용 — 복합 페이지 PiP 캐비앗**: `-VideoEscape native`에서 알파 패널 위 오버레이 비디오(PiP)가 시작 직후(프레임 약 2) 내장 카운터가 멈추는 프레임 동결 결함 발견(Task 2, `escape-task-2-pip-triage.md`) — WR 자체의 콘텐츠 갱신 계층 결함(§3-w/x/y 비불투명 슬라이스 비디오 계열과 동일 취약점 재발로 추정, 우리 층 버그 아님)으로 트리아지. 순수 비디오 월은 이 결함의 영향을 받지 않는다(PiP류 알파 오버레이가 없음). **`-VideoEscape external`은 동일 시나리오(62초 관측, 장면 전환+카운터 진행 직접 확인)에서 이 동결이 재현되지 않는다** — external이 WR draw 자체를 우회하므로 이 결함 층을 타지 않는 것으로 해석. AMD 가이드(패키지 `run_wall.ps1` 헤더)에 "native는 A/B 진단 전용, PiP류 복합 페이지 프로덕션에는 external 사용" 캐비앗을 명문화했다(12.5 참조).
 
 ### 12.3 검증 수치
