@@ -84,7 +84,7 @@
 - external 경로 조건: picture.rs:2898 — `SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE` + `image_rendering == Auto` + resource cache에 external image 존재(A-dyn plane 발행이 충족) → Y plane(api_keys[0])의 ExternalImageId 사용.
 - external surface 수명: :2958 `create_compositor_external_surface(is_opaque)` (크기 무관 키), 매 프레임 :2997 `attach_compositor_external_image`. update_params=None — WR은 그리지 않음.
 - 프로모션된 비디오의 image key는 타일 의존성에서 제외(:3484 주석 — 갱신에도 타일 비무효화). 컷아웃 = "transparent z-write"(:3522 주석).
-- 컴포지터 인터페이스: dcomp_compositor.rs:2374 `create_external_surface` / :2378 `attach_external_image` — 현재 warn-once stub. `add_surface`(:1731)는 z 순서(underlay→콘텐츠→overlay)로 호출됨.
+- 컴포지터 인터페이스: dcomp_compositor.rs:2374 `create_external_surface` / :2378 `attach_external_image` — 현재 warn-once stub. `add_surface`(:1731)는 z 순서(underlay→콘텐츠→overlay)로 호출됨 — WR renderer mod.rs:6663 "z-order is implicit based on order added" (external surface도 동일 add_surface 경로, descriptor.surfaces 순회).
 - CompositorCapabilities(composite.rs:1373): 기존 값 유지 (`supports_external_compositor_surface_negative_scaling` 기본 true — 음수 스케일 미사용이므로 무관).
 
 ## 7. Servo 측 변경 (레이아웃)
@@ -114,7 +114,7 @@
 
 ### 8.3 plane 접근 interop
 
-`components/shared/paint`에 신규 trait (이름 예: `VideoExternalSurfaceProvider`):
+`components/shared/paint`에 신규 trait `VideoExternalSurfaceProvider`:
 
 ```
 acquire(ExternalImageId) → Option<VideoFrameLease {
