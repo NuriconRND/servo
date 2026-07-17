@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use euclid::default::Size2D as UntypedSize2D;
 use log::warn;
+use paint_api::VideoFrameLease;
 use paint_api::rendering_context::RenderingContext;
 use webrender::api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 use webrender::api::{ColorF, ExternalImageId, ImageRendering};
@@ -37,8 +38,10 @@ use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
 use winapi::um::d3d11::{
-    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+    ID3D11Resource, ID3D11Texture2D,
 };
+use winapi::um::d3d11_1::ID3D11DeviceContext1;
 use winapi::um::dcomp::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
     IDCompositionVirtualSurface, IDCompositionVisual,
@@ -828,6 +831,38 @@ enum SurfaceStorage {
         virtual_surface: ComOwned<IDCompositionVirtualSurface>,
     },
     SwapChain(SwapChainStorage),
+    /// 비디오 external compositor surface(비디오 WR 탈출, Task 5). WR가 이 서피스에
+    /// 타일을 그리지 않는다 — 대신 add_surface에서 provider 링을 대여해 raw D3D11
+    /// 변환 1-draw로 비디오별 flip 스왑체인 백버퍼를 직접 채우고 Present한다.
+    External(ExternalStorage),
+}
+
+/// External compositor surface의 저장소. 스왑체인은 클립 크기 확정 시 지연 생성하며,
+/// 첫 성공 Present 후에만 visual.SetContent(스왑체인)한다(그 전까지 visual은 콘텐츠
+/// 없음). last_presented로 (ring_id, frame_seq) 세대 dedup — 같은 프레임 재변환 스킵.
+struct ExternalStorage {
+    /// 크기 확정 시 지연 생성되는 비디오별 flip 스왑체인. None = 미생성/생성 실패.
+    swapchain: Option<ComOwned<IDXGISwapChain1>>,
+    /// 현재 스왑체인의 백버퍼 크기(= 마지막 생성 시 clip.size()). 클립이 바뀌면 재생성.
+    swapchain_size: DeviceIntSize,
+    /// 첫 성공 Present 후 visual.SetContent(스왑체인)를 완료했는가(1회).
+    content_attached: bool,
+    /// attach_external_image가 기록한 이번 서피스의 ExternalImageId(.0). provider.acquire 인자.
+    attached_external_id: Option<u64>,
+    /// 마지막으로 Present한 (ring_id, frame_seq). external_needs_present 세대 dedup 근거.
+    last_presented: Option<(u64, u64)>,
+    /// 스왑체인 생성/GetBuffer/RTV/Present/SetContent 실패 warn-once(로그 폭주 방지).
+    /// 성공적인 스왑체인 재생성 시 재무장(false).
+    warned_fail: bool,
+    /// 브링업 계약 로그(서피스당 최초 5프레임)용 카운터(진단 전용, dcomp_debug 게이트).
+    frames_logged: u32,
+}
+
+/// external surface의 이번 프레임 lease가 지난 Present와 다른 세대인가(재변환/재Present
+/// 필요 판정). ring_id 변화 = 소스 전환(다른 비디오), frame_seq 변화 = 새 프레임.
+/// 순수 함수 — TDD 대상(tests::external_needs_present_dedups_by_ring_and_seq).
+fn external_needs_present(last: Option<(u64, u64)>, ring_id: u64, seq: u64) -> bool {
+    last != Some((ring_id, seq))
 }
 
 /// add_surface가 마지막으로 기록한 배치(WR device 좌표). content-swap 시 같은 Commit에서
@@ -997,6 +1032,17 @@ pub struct DCompNativeCompositor {
     warned_regen_fail: bool,
     /// 누적된 프레임 번호 — begin_frame에서 증가. 쿨다운 만료 시점(frame_counter >= promote_blocked_until).
     frame_counter: u64,
+    /// 비디오 external surface 변환 패스(Task 4). 최초 external present 시 지연 생성 —
+    /// 비-비디오 월은 셰이더 컴파일 비용을 아예 안 낸다. None + init_failed=false = 미시도.
+    convert_pass: Option<crate::dcomp_video_convert::VideoConvertPass>,
+    /// convert_pass 지연 생성이 실패했으면 재시도하지 않는다(new()가 이미 warn — 매 프레임
+    /// 재컴파일/재warn 스팸 방지). "warn-once 후 skip"(브리프 Step 4)의 구현 기제.
+    convert_pass_init_failed: bool,
+    /// convert()에 넘길 ID3D11DeviceContext1(즉시 컨텍스트 QI, AddRef 소유). maybe_create에서
+    /// 확보 실패 시 None — external present 스킵(비주얼만).
+    d3d11_context1: Option<ComOwned<ID3D11DeviceContext1>>,
+    /// external surface 요청 시 provider 미등록 warn-once(비주얼만 배치, 마지막 프레임 유지).
+    warned_no_provider: bool,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1032,6 +1078,23 @@ pub fn maybe_create(
             (*d3d).GetImmediateContext(&mut ctx_raw);
             ComOwned::from_raw(ctx_raw)
         };
+
+        // external surface 변환 패스(Task 4)가 요구하는 ID3D11DeviceContext1. 즉시 컨텍스트를
+        // QI한다 — 실패해도 컴포지터는 성립(external 경로만 불가 → 비주얼만). None 허용.
+        let d3d11_context1 = d3d11_context.as_ref().and_then(|ctx| {
+            let mut raw: *mut ID3D11DeviceContext1 = ptr::null_mut();
+            let hr = (*ctx.as_ptr())
+                .QueryInterface(&ID3D11DeviceContext1::uuidof(), &mut raw as *mut _ as *mut _);
+            if hr < 0 || raw.is_null() {
+                warn!(
+                    "[dcomp-native] QI ID3D11DeviceContext1 failed (hr=0x{:08x}); video escape unavailable",
+                    hr as u32
+                );
+                None
+            } else {
+                ComOwned::from_raw(raw)
+            }
+        });
 
         // QI IDXGIDevice → DCompositionCreateDevice → CreateTargetForHwnd(topmost=TRUE)
         // → CreateVisual(root) → SetRoot. 각 HRESULT 실패면 warn + None (PoC G1 시퀀스).
@@ -1125,6 +1188,10 @@ pub fn maybe_create(
             warned_promote_fail: false,
             warned_regen_fail: false,
             frame_counter: 0,
+            convert_pass: None,
+            convert_pass_init_failed: false,
+            d3d11_context1,
+            warned_no_provider: false,
         })
     }
 }
@@ -1186,15 +1253,299 @@ impl DCompNativeCompositor {
         }
     }
 
-    /// 외부/백드롭 서피스 요청에 대한 warn-once. Servo는 prefer_compositor_surface를
-    /// 설정하지 않으므로 이 경로는 도달하지 않는다(grep 확정).
+    /// 백드롭 서피스 요청에 대한 warn-once(external은 Task 5에서 실구현 — 아래 별도 경로).
+    /// Servo는 backdrop을 요청하지 않으므로 이 경로는 도달하지 않는다(grep 확정).
     fn warn_external_surface_once(&mut self) {
         if !self.warned_external_surface {
             warn!(
-                "[dcomp-native] external/backdrop compositor surface requested but not \
+                "[dcomp-native] backdrop compositor surface requested but not \
                  implemented (unreachable in Servo); ignoring"
             );
             self.warned_external_surface = true;
+        }
+    }
+
+    /// external surface(비디오)의 비주얼 배치. Virtual/SwapChain의 apply_visual_placement와
+    /// 산식이 다르다: 스왑체인 백버퍼는 이미 clip 크기로 비디오를 담고 있으므로 비주얼
+    /// 오프셋 = clip.min(device 좌표), 클립 = 비주얼-로컬 (0,0)-(w,h). scale은 무시한다
+    /// (dest=clip에 스케일이 이미 반영 — 브리프 계약). provider 유무와 무관하게 매 프레임
+    /// 호출해 마지막 프레임을 유지한다.
+    fn place_external_visual(&self, id: NativeSurfaceId, clip_rect: DeviceIntRect) {
+        let Some(entry) = self.surfaces.get(&id) else {
+            return;
+        };
+        let offset_x = clip_rect.min.x as f32;
+        let offset_y = clip_rect.min.y as f32;
+        // 비주얼-로컬 클립(SetClip은 오프셋 적용 전 좌표) = clip − offset = (0,0)-(w,h).
+        let local_clip = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: (clip_rect.max.x - clip_rect.min.x) as f32,
+            bottom: (clip_rect.max.y - clip_rect.min.y) as f32,
+        };
+        // Safety: visual은 ComOwned가 수명을 보장하는 살아있는 IDCompositionVisual.
+        unsafe {
+            let hr = (*entry.visual.as_ptr()).SetOffsetX_1(offset_x);
+            if hr < 0 {
+                warn!("[dcomp-native] external SetOffsetX failed (hr=0x{:08x})", hr as u32);
+            }
+            let hr = (*entry.visual.as_ptr()).SetOffsetY_1(offset_y);
+            if hr < 0 {
+                warn!("[dcomp-native] external SetOffsetY failed (hr=0x{:08x})", hr as u32);
+            }
+            let hr = (*entry.visual.as_ptr()).SetClip_1(&local_clip);
+            if hr < 0 {
+                warn!("[dcomp-native] external SetClip failed (hr=0x{:08x})", hr as u32);
+            }
+        }
+    }
+
+    /// external surface(비디오)의 add_surface 전용 경로(브리프 Step 4). 비주얼을 항상
+    /// 배치(마지막 프레임 유지)하고 z-order에 기록한 뒤, provider 링을 대여해
+    /// present_external로 이번 프레임을 변환+Present한다. lease는 acquire↔release를 반드시
+    /// 짝맞춘다 — present_external은 release 책임을 지지 않으므로(정상 반환만) 아래 단일
+    /// release가 모든 경로를 커버한다.
+    fn add_external_surface(
+        &mut self,
+        id: NativeSurfaceId,
+        transform: CompositorSurfaceTransform,
+        clip_rect: DeviceIntRect,
+        rounded_clip_radii: ClipRadius,
+    ) {
+        if rounded_clip_radii != ClipRadius::EMPTY && !self.warned_rounded_clip {
+            warn!("[dcomp-native] rounded clip radii unsupported; applying rectangular clip only");
+            self.warned_rounded_clip = true;
+        }
+        // Step 4-1: 빈 클립이면 skip(frame_surfaces 미기록 — 이 프레임 비합성).
+        if clip_rect.is_empty() {
+            return;
+        }
+        let size = clip_rect.size();
+
+        // Step 4-7/8(앞당김): 비주얼 배치 + z-order 기록은 provider 유무와 무관하게 항상.
+        self.place_external_visual(id, clip_rect);
+        self.frame_surfaces.push(id);
+
+        let rc = self.rendering_context.clone();
+        let resize_active = rc.dcomp_resize_active();
+
+        // is_opaque + 이번 서피스에 attach된 ExternalImageId 조회(짧은 borrow).
+        let (is_opaque, attached) = match self.surfaces.get(&id).map(|e| (e.is_opaque, &e.storage)) {
+            Some((op, SurfaceStorage::External(ext))) => (op, ext.attached_external_id),
+            // 도달 불가(호출 전 External 판정) — 방어적.
+            _ => return,
+        };
+
+        // Step 4-3: provider 획득. 미등록/미attach/lease 실패는 모두 비주얼만(마지막 프레임 유지).
+        let Some(provider) = paint_api::video_external_surface_provider() else {
+            if !self.warned_no_provider {
+                warn!(
+                    "[dcomp-native] external surface: no VideoExternalSurfaceProvider registered; \
+                     placing visual only (last frame retained)"
+                );
+                self.warned_no_provider = true;
+            }
+            return;
+        };
+        let Some(external_id) = attached else {
+            // attach_external_image 전 — 표시할 프레임 없음(비주얼만).
+            return;
+        };
+        // acquire는 링을 잠그고 소비계획을 실행한다 — Some이면 반드시 release로 짝맞춘다.
+        // None(대여 실패)이면 아무것도 안 잠겼으므로 release 불필요(브리프 계약).
+        let Some(lease) = provider.acquire(&*rc, external_id) else {
+            return;
+        };
+        let ring_id = lease.ring_id;
+
+        // Step 4-4/5: 스왑체인 보장 + 변환 + Present. 어떤 경로로 끝나도(정상 반환) 아래
+        // release가 lease를 반납한다(present_external은 release를 호출하지 않는다).
+        self.present_external(id, &lease, size, is_opaque, resize_active, transform, clip_rect);
+
+        // Step 4-6: release 짝맞춤(Present 성공/실패/스킵 무관).
+        provider.release(&*rc, ring_id);
+    }
+
+    /// external surface의 스왑체인 보장 + YUV 변환 1-draw + Present(브리프 Step 4-4/5).
+    /// lease의 release는 호출측(add_external_surface)이 책임진다 — 이 메서드는 정상 반환만
+    /// 하며 release를 호출하지 않는다(어떤 조기 반환도 release 짝맞춤을 깨지 않는다).
+    fn present_external(
+        &mut self,
+        id: NativeSurfaceId,
+        lease: &VideoFrameLease,
+        size: DeviceIntSize,
+        is_opaque: bool,
+        resize_active: bool,
+        transform: CompositorSurfaceTransform,
+        clip_rect: DeviceIntRect,
+    ) {
+        // convert_pass 지연 초기화(최초 external present 시). 실패하면 재시도하지 않는다
+        // (new()가 이미 warn — 재컴파일/재warn 스팸 방지). 비-비디오 월은 여기 도달 안 함.
+        if self.convert_pass.is_none() && !self.convert_pass_init_failed {
+            // Safety: d3d11_device는 rendering_context가 수명을 보장하는 살아있는 ANGLE 디바이스.
+            self.convert_pass =
+                unsafe { crate::dcomp_video_convert::VideoConvertPass::new(self.d3d11_device) };
+            if self.convert_pass.is_none() {
+                self.convert_pass_init_failed = true;
+                warn!(
+                    "[dcomp-native] external surface: VideoConvertPass unavailable; placing visual only"
+                );
+            }
+        }
+        let d3d11_device = self.d3d11_device;
+
+        // Step 4-4: 스왑체인 필요 판정(없거나 클립 크기 변화). create_composition_swapchain은
+        // &self라 entry borrow 밖에서 호출한다. 드래그 중(resize_active)엔 재생성 억제 —
+        // 매 틱 재생성은 content_attached 리셋→Present 보류→블랙(§3-y 정합). 기존 스왑체인 유지.
+        let need_new = match self.surfaces.get(&id).map(|e| &e.storage) {
+            Some(SurfaceStorage::External(ext)) => {
+                ext.swapchain.is_none() || ext.swapchain_size != size
+            },
+            _ => return,
+        };
+        let created: Option<Option<ComOwned<IDXGISwapChain1>>> = if need_new && !resize_active {
+            Some(self.create_composition_swapchain(size, is_opaque))
+        } else {
+            None
+        };
+
+        // entry 재-borrow: 스왑체인 설치 + 브링업 로그 + 세대 dedup + 변환/Present.
+        let Some(entry) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        let SurfaceStorage::External(ext) = &mut entry.storage else {
+            return;
+        };
+
+        if let Some(created) = created {
+            match created {
+                Some(sc) => {
+                    ext.swapchain = Some(sc);
+                    ext.swapchain_size = size;
+                    ext.content_attached = false;
+                    ext.last_presented = None;
+                    ext.warned_fail = false; // 재생성 성공 → 실패 warn 재무장
+                    if dcomp_debug() {
+                        log::info!(
+                            "[dcomp-dbg] external swapchain (re)create id={:?} {}x{}",
+                            id, size.width, size.height
+                        );
+                    }
+                },
+                None => {
+                    // 생성 실패(OOM급): swapchain=None 유지 → 다음 프레임 자연 재시도(스펙 §9).
+                    ext.swapchain = None;
+                    ext.swapchain_size = DeviceIntSize::zero();
+                    ext.content_attached = false;
+                    ext.last_presented = None;
+                    if !ext.warned_fail {
+                        warn!(
+                            "[dcomp-native] external surface {:?}: swapchain {}x{} create failed; \
+                             retrying next frame",
+                            id, size.width, size.height
+                        );
+                        ext.warned_fail = true;
+                    }
+                },
+            }
+        }
+
+        // Step 4-2: 브링업 계약 로그(서피스당 최초 5프레임, dcomp_debug 게이트). src=Y plane 크기.
+        // 기대(월): scale=(1,1), clip≈타일 rect, src=1920x1080.
+        if dcomp_debug() && ext.frames_logged < 5 {
+            ext.frames_logged += 1;
+            let (sw, sh) = lease.planes[0].map(|p| (p.width, p.height)).unwrap_or((0, 0));
+            log::info!(
+                "[dcomp-dbg] external add id={:?} scale=({},{}) offset=({},{}) \
+                 clip=({},{})-({},{}) src={}x{}",
+                id, transform.scale.x, transform.scale.y, transform.offset.x, transform.offset.y,
+                clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y, sw, sh
+            );
+        }
+
+        // Step 4-5: 세대 dedup — 같은 (ring_id, frame_seq)면 재변환/재Present 스킵.
+        if !external_needs_present(ext.last_presented, lease.ring_id, lease.frame_seq) {
+            return;
+        }
+        // dst는 스왑체인 백버퍼 크기(= swapchain_size)를 쓴다. 드래그 중엔 기존(옛 크기)
+        // 스왑체인을 유지하므로 clip(새 크기)이 아닌 실제 버퍼 크기로 변환해야 뷰포트가
+        // 버퍼를 넘지 않는다(정착 후 재생성으로 정확 크기 복원).
+        let dst = ext.swapchain_size;
+        if dst.width <= 0 || dst.height <= 0 {
+            return;
+        }
+        let (Some(swapchain), Some(convert_pass), Some(ctx1)) = (
+            ext.swapchain.as_ref(),
+            self.convert_pass.as_mut(),
+            self.d3d11_context1.as_ref(),
+        ) else {
+            // 스왑체인/변환패스/컨텍스트 중 하나라도 없으면 present 스킵(비주얼만).
+            return;
+        };
+
+        // flip 스왑체인: 매 present마다 GetBuffer(0)로 새 백버퍼를 얻어 RTV 생성 후 변환한다
+        // (RTV 캐시 금지 — 버퍼가 로테이트되므로). Safety: 살아있는 스왑체인/디바이스/컨텍스트.
+        unsafe {
+            let mut back: *mut ID3D11Texture2D = ptr::null_mut();
+            let hr = (*swapchain.as_ptr()).GetBuffer(
+                0,
+                &ID3D11Texture2D::uuidof(),
+                &mut back as *mut _ as *mut _,
+            );
+            if hr < 0 || back.is_null() {
+                if !ext.warned_fail {
+                    warn!("[dcomp-native] external {:?}: GetBuffer(0) failed (hr=0x{:08x})", id, hr as u32);
+                    ext.warned_fail = true;
+                }
+                return;
+            }
+            let mut rtv: *mut ID3D11RenderTargetView = ptr::null_mut();
+            let hr = (*d3d11_device).CreateRenderTargetView(
+                back as *mut ID3D11Resource,
+                ptr::null(),
+                &mut rtv,
+            );
+            if hr < 0 || rtv.is_null() {
+                if !ext.warned_fail {
+                    warn!("[dcomp-native] external {:?}: CreateRenderTargetView failed (hr=0x{:08x})", id, hr as u32);
+                    ext.warned_fail = true;
+                }
+                (*(back as *mut IUnknown)).Release();
+                return;
+            }
+            // convert 내부에서 SwapDeviceContextState로 ANGLE 상태 격리(호출측 상태 무영향).
+            let converted =
+                convert_pass.convert(ctx1.as_ptr(), lease, rtv, dst.width as u32, dst.height as u32);
+            // RTV는 매 present 재생성 — 즉시 Release(캐시 금지). 백버퍼도 아래에서 Release.
+            (*(rtv as *mut IUnknown)).Release();
+            if converted {
+                let hr = (*swapchain.as_ptr()).Present(0, 0);
+                if hr < 0 {
+                    if !ext.warned_fail {
+                        warn!("[dcomp-native] external {:?}: Present failed (hr=0x{:08x})", id, hr as u32);
+                        ext.warned_fail = true;
+                    }
+                } else {
+                    ext.last_presented = Some((lease.ring_id, lease.frame_seq));
+                    // 첫 성공 Present 후 visual 콘텐츠를 스왑체인으로 전환(1회). 같은
+                    // add_surface 안에서 convert+present+SetContent가 end_frame Commit 전
+                    // 완결되므로 플래시 없음(Commit 원자성).
+                    if !ext.content_attached {
+                        let hr = (*entry.visual.as_ptr())
+                            .SetContent(swapchain.as_ptr() as *const IUnknown);
+                        if hr >= 0 {
+                            ext.content_attached = true;
+                            if dcomp_debug() {
+                                log::info!("[dcomp-dbg] external content-attach id={:?}", id);
+                            }
+                        } else if !ext.warned_fail {
+                            warn!("[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})", id, hr as u32);
+                            ext.warned_fail = true;
+                        }
+                    }
+                }
+            }
+            (*(back as *mut IUnknown)).Release();
         }
     }
 
@@ -1664,6 +2015,11 @@ impl Compositor for DCompNativeCompositor {
                 }
                 NativeSurfaceInfo { origin, fbo_id: 0 }
             },
+            SurfaceStorage::External(_) => {
+                // WR은 external surface에 타일을 그리지 않는다(create_tile/bind 미호출) — 도달 불가.
+                warn!("[dcomp-native] bind on external surface {:?}; ignoring", id.surface_id);
+                NativeSurfaceInfo { origin: DeviceIntPoint::zero(), fbo_id: 0 }
+            },
         }
     }
 
@@ -1694,6 +2050,13 @@ impl Compositor for DCompNativeCompositor {
                     // 그 타일의 unbind는 위 self.bound.take()에서 이미 조기 반환한다.
                     warn!(
                         "[dcomp-native] unbind: unexpected bound tile on swapchain surface {:?}",
+                        bound.surface_id
+                    );
+                },
+                SurfaceStorage::External(_) => {
+                    // 도달 불가: external도 bind되지 않는다(self.bound 미설정 → 위 take()가 조기 반환).
+                    warn!(
+                        "[dcomp-native] unbind: unexpected bound tile on external surface {:?}",
                         bound.surface_id
                     );
                 },
@@ -1739,6 +2102,16 @@ impl Compositor for DCompNativeCompositor {
         _rounded_clip_rect: DeviceIntRect,
         rounded_clip_radii: ClipRadius,
     ) {
+        // 비디오 external surface(Task 5)는 전용 경로 — 기존 Virtual/SwapChain 경로 위 조기
+        // 분기. scale 경고는 external에 미적용(브리프 계약: external은 dest=clip, scale 무시).
+        if matches!(
+            self.surfaces.get(&id).map(|e| &e.storage),
+            Some(SurfaceStorage::External(_))
+        ) {
+            self.add_external_surface(id, transform, clip_rect, rounded_clip_radii);
+            return;
+        }
+
         // 월 시나리오는 scale=1·직사각 클립만 발생 예상 — 벗어나면 1회만 warn(스펙 §비범위).
         if (transform.scale.x - 1.0).abs() > f32::EPSILON ||
             (transform.scale.y - 1.0).abs() > f32::EPSILON
@@ -1773,6 +2146,8 @@ impl Compositor for DCompNativeCompositor {
         let content_anchor = match &entry.storage {
             SurfaceStorage::SwapChain(sc) => sc.displayed_anchor.unwrap_or(DeviceIntPoint::zero()),
             SurfaceStorage::Virtual { .. } => DeviceIntPoint::zero(),
+            // external은 add_surface 진입부에서 이미 add_external_surface로 분기·반환 — 도달 불가.
+            SurfaceStorage::External(_) => DeviceIntPoint::zero(),
         };
 
         // Task 10 근본원인(스펙 2026-07-15 실측): 티커 바의 불투명 슬라이스(바 배경 + 속보
@@ -2089,6 +2464,11 @@ impl Compositor for DCompNativeCompositor {
                     release_frame_pbuffer(&rc, sc);
                     sc.drawn_this_frame = false;
                 },
+                SurfaceStorage::External(_) => {
+                    // Present는 add_surface(present_external)에서 이미 완결됐다. external은
+                    // 승격/강등/withhold/regen 상태머신 대상이 아니므로 여기서 할 일 없음
+                    // (컴파일러가 이 arm을 강제 — 전 지점 커버리지 확인).
+                },
             }
         }
 
@@ -2372,17 +2752,76 @@ impl Compositor for DCompNativeCompositor {
         self.surfaces.remove(&id);
     }
 
-    fn create_external_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _is_opaque: bool) {
-        self.warn_external_surface_once();
+    fn create_external_surface(&mut self, _device: &mut Device, id: NativeSurfaceId, is_opaque: bool) {
+        let Some(dcomp_device) = self.dcomp_device_ptr() else {
+            return;
+        };
+        // create_surface(:1277) 패턴과 동일하되 가상 서피스/SetContent는 만들지 않는다 —
+        // 콘텐츠(스왑체인)는 첫 성공 Present 후 add_surface(present_external)에서 붙인다.
+        // Safety: dcomp_device는 살아있는 IDCompositionDevice.
+        let entry = unsafe {
+            let mut visual_raw: *mut IDCompositionVisual = ptr::null_mut();
+            let hr = (*dcomp_device).CreateVisual(&mut visual_raw);
+            if hr < 0 || visual_raw.is_null() {
+                warn!("[dcomp-native] create_external_surface: CreateVisual failed (hr=0x{:08x})", hr as u32);
+                return;
+            }
+            let Some(visual) = ComOwned::from_raw(visual_raw) else {
+                return;
+            };
+            SurfaceEntry {
+                storage: SurfaceStorage::External(ExternalStorage {
+                    swapchain: None,
+                    swapchain_size: DeviceIntSize::zero(),
+                    content_attached: false,
+                    attached_external_id: None,
+                    last_presented: None,
+                    warned_fail: false,
+                    frames_logged: 0,
+                }),
+                visual,
+                virtual_offset: DeviceIntPoint::zero(),
+                tile_size: DeviceIntSize::zero(),
+                is_opaque,
+                tiles: std::collections::HashSet::new(),
+                frame_coverage: FrameCoverage::default(),
+                promote_streak: 0,
+                last_placement: None,
+                drawn_frames: 0,
+                demote_count: 0,
+                promote_blocked_until: 0,
+                frame_drawn_partial: false,
+                content_valid_union: None,
+            }
+        };
+        if dcomp_debug() {
+            log::info!("[dcomp-dbg] create_external_surface id={:?} opaque={}", id, is_opaque);
+        }
+        self.surfaces.insert(id, entry);
     }
 
     fn attach_external_image(
         &mut self,
         _device: &mut Device,
-        _id: NativeSurfaceId,
-        _external_image: ExternalImageId,
+        id: NativeSurfaceId,
+        external_image: ExternalImageId,
     ) {
-        self.warn_external_surface_once();
+        let Some(entry) = self.surfaces.get_mut(&id) else {
+            warn!("[dcomp-native] attach_external_image: unknown surface {:?}", id);
+            return;
+        };
+        let SurfaceStorage::External(ext) = &mut entry.storage else {
+            warn!("[dcomp-native] attach_external_image: surface {:?} is not external", id);
+            return;
+        };
+        let first = ext.attached_external_id != Some(external_image.0);
+        ext.attached_external_id = Some(external_image.0);
+        if first && dcomp_debug() {
+            log::info!(
+                "[dcomp-dbg] attach_external_image id={:?} external_id={}",
+                id, external_image.0
+            );
+        }
     }
 
     fn create_backdrop_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _color: ColorF) {
@@ -2419,6 +2858,14 @@ impl Compositor for DCompNativeCompositor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_needs_present_dedups_by_ring_and_seq() {
+        assert!(external_needs_present(None, 1, 5));
+        assert!(!external_needs_present(Some((1, 5)), 1, 5));
+        assert!(external_needs_present(Some((1, 5)), 1, 6));   // 새 프레임
+        assert!(external_needs_present(Some((1, 5)), 2, 5));   // 링 교체(소스 전환)
+    }
 
     #[test]
     fn tile_virtual_rect_positions_tiles_on_grid() {
