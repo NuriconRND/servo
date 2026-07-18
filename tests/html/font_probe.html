@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>폰트 프로브 v4 — 단일 시트·이종 패밀리</title>
+<style>
+  /* v4: 단일 <style> 안에 서로 다른 패밀리 2개.
+     x1(풀 CJK Bold, 1번째 규칙) / x2(서브셋 Regular, 2번째 규칙) / x3(폴백 대조군).
+     판독: x1 굵음+x2 얇음 = 두 규칙 다 로드(최선 — 이 구조로 페이지 적용).
+           x1 굵음+x2 폴백 = 시트당 첫 규칙만 로드.
+           x1 폴백 = 풀 CJK Bold도 파싱 실패. */
+  @font-face {
+    font-family: "ProbeBoldCJK";
+    src: url("../fonts/NotoSansCJKkr-Bold.otf") format("opentype");
+  }
+  @font-face {
+    font-family: "ProbeRegSub";
+    src: url("../fonts/NotoSansKR-Regular.otf") format("opentype");
+  }
+  html, body { margin: 0; background: #fff; color: #000; }
+  div { font-size: 44px; padding: 6px 16px; white-space: nowrap; }
+  #x1 { font-family: "Noto Sans CJK KR"; }   /* 방금 사용자 단위로 설치한 Bold OTF — 굵게 나오면 설치 경로 실증 */
+  #x2 { font-family: "Noto Sans KR"; }        /* 기존 시스템 설치(VF) — 매칭 재확인 */
+  #x3 { font-family: "NoSuchFontXYZ"; }
+  #hb { position: fixed; right: 0; bottom: 0; width: 2px; height: 2px; background: #000; }
+</style>
+</head>
+<body>
+<div id="x1">가나다라 한글 확인 0123 설치된 CJK KR Bold</div>
+<div id="x2">가나다라 한글 확인 0123 시스템 Noto Sans KR</div>
+<div id="x3">가나다라 한글 확인 0123 Fallback</div>
+<div id="hb"></div>
+<script>
+  "use strict";
+  const hb = document.getElementById("hb");
+  let f = 0;
+  (function heartbeat() {
+    f++;
+    hb.style.background = (f & 1) ? "#000001" : "#000000";
+    requestAnimationFrame(heartbeat);
+  })();
+</script>
+</body>
+</html>

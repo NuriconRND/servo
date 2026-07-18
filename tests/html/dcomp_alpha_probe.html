@@ -12,7 +12,7 @@
     height: 100%;
     overflow: hidden;
     background: #000;
-    font-family: "Malgun Gothic", ui-sans-serif, sans-serif;
+    font-family: "Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", ui-sans-serif, sans-serif;
   }
 
   /* ── 대조군: 전면 배경 비디오(불투명 슬라이스) ─────────────────────
@@ -64,6 +64,8 @@
     font: 700 2vh ui-monospace, Consolas, monospace;
     z-index: 11;
   }
+  /* 한글 굵은 요소: Bold 전용 패밀리 직접 지정 (Servo weight 선택 미동작 실측) */
+  #overlay .txt { font-family: "Noto Sans CJK KR", "Noto Sans KR", "Malgun Gothic", sans-serif; }
 </style>
 </head>
 <body>

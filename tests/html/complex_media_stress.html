@@ -12,7 +12,7 @@
     height: 100%;
     overflow: hidden;
     background: #000;
-    font-family: "Malgun Gothic", ui-sans-serif, sans-serif;
+    font-family: "Noto Sans KR", "Noto Sans CJK KR", "Malgun Gothic", ui-sans-serif, sans-serif;
   }
 
   /* ── 비디오 그리드 (베이스, 불투명 슬라이스) ── */
@@ -227,6 +227,11 @@
     color: #555;
     font-family: ui-monospace, Consolas, monospace;
     font-size: 24px;
+  }
+  /* 한글 굵은 요소: Servo가 패밀리 내 weight 선택을 못 해(실측) Bold 전용 패밀리로 직접 지정.
+     폰트 없는 장비는 install_fonts.ps1 실행(오프라인 사용자 단위 설치). */
+  #title, #live, #tickerlabel, #caption, #newslist .item b {
+    font-family: "Noto Sans CJK KR", "Noto Sans KR", "Malgun Gothic", sans-serif;
   }
 </style>
 </head>
