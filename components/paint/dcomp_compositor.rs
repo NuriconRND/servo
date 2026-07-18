@@ -20,6 +20,7 @@ use euclid::default::Size2D as UntypedSize2D;
 use log::warn;
 use paint_api::VideoFrameLease;
 use paint_api::rendering_context::RenderingContext;
+use rustc_hash::FxHashMap;
 use webrender::api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 use webrender::api::{ColorF, ExternalImageId, ImageRendering};
 use webrender::{
@@ -92,6 +93,71 @@ fn readback_enabled() -> bool {
 fn valid_probe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SERVO_DCOMP_VALIDPROBE").is_ok())
+}
+
+/// external 비디오 present 파이프라인 프로파일러 게이트(env `SERVO_VIDEO_ESCAPE_PROF`,
+/// OnceLock 캐시, dcomp_debug와 별개). 켜지면 렌더러 스레드가 초당 1회 `[vesc-prof]` 집계
+/// 라인(info)을 낸다 — AMD 실기에서 어느 단계(acquire/convert/present)가 프레임 예산을 먹는지
+/// 판독용. 꺼지면 비용 0(단일 bool 체크 — 타이밍/카운터 자체를 만지지 않음).
+fn video_escape_prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_PROF").is_ok())
+}
+
+/// external present 파이프라인의 초당 집계 카운터(video_escape_prof 게이트에서만 갱신).
+/// 렌더러 스레드 단일 인스턴스(DCompNativeCompositor 소유). end_frame이 매 프레임 frames++
+/// 후 maybe_flush로 1초 경과 시 라인 출력 + 리셋한다. 게이트 off면 전 필드가 0으로 유휴.
+struct EscProf {
+    last_flush: std::time::Instant,
+    frames: u64,
+    converts: u64,
+    presents: u64,
+    srv_creates: u64,
+    acquires: u64,
+    batch_swaps: u64,
+    acquire_dur: std::time::Duration,
+    convert_dur: std::time::Duration,
+    present_dur: std::time::Duration,
+}
+
+impl EscProf {
+    fn new() -> Self {
+        EscProf {
+            last_flush: std::time::Instant::now(),
+            frames: 0,
+            converts: 0,
+            presents: 0,
+            srv_creates: 0,
+            acquires: 0,
+            batch_swaps: 0,
+            acquire_dur: std::time::Duration::ZERO,
+            convert_dur: std::time::Duration::ZERO,
+            present_dur: std::time::Duration::ZERO,
+        }
+    }
+
+    /// 1초 경과 시 집계 라인을 info로 출력하고 리셋한다. 시간 필드는 창(1초) 동안 누적된
+    /// 총 ms(단계별 비교용). 호출측(end_frame)이 video_escape_prof 게이트 안에서만 부른다.
+    fn maybe_flush(&mut self) {
+        if self.last_flush.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        log::info!(
+            "[vesc-prof] frames={} converts={} presents={} srv_creates={} acquires={} \
+             acquire_ms={:.1} convert_ms={:.1} present_ms={:.1} batch_swaps={}",
+            self.frames,
+            self.converts,
+            self.presents,
+            self.srv_creates,
+            self.acquires,
+            ms(self.acquire_dur),
+            ms(self.convert_dur),
+            ms(self.present_dur),
+            self.batch_swaps,
+        );
+        *self = EscProf::new();
+    }
 }
 
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
@@ -856,6 +922,16 @@ struct ExternalStorage {
     warned_fail: bool,
     /// 브링업 계약 로그(서피스당 최초 5프레임)용 카운터(진단 전용, dcomp_debug 게이트).
     frames_logged: u32,
+    /// flip 스왑체인 백버퍼별 RTV 캐시(키 = GetBuffer(0)가 준 백버퍼 텍스처 포인터 usize).
+    /// FLIP_SEQUENTIAL 2버퍼가 번갈아 반환되므로 엔트리 ≤2. 매 present GetBuffer(0)→조회/생성으로
+    /// per-present CreateRenderTargetView(GCN1 등 구형 AMD에서 프레임 예산 비용)를 제거한다.
+    ///
+    /// ★SAFETY: 스왑체인 백버퍼는 CPU-Map(WRITE_DISCARD) 대상이 절대 아니므로(DYNAMIC이 아님)
+    /// rename이 없다 — 캐시된 RTV가 무효화되지 않는다. 이는 DYNAMIC plane 텍스처 SRV 캐시가
+    /// 금지인 것(rename→dangling SRV→드라이버 AV, 크래시 061c7f5d0/재발방지 원칙; 위
+    /// VideoConvertPass 주석)과 정반대 상황이라 안전하다. 스왑체인 (재)생성/파기 시 clear해
+    /// 옛(해제된) 버퍼 포인터의 스테일 RTV 재사용을 막는다.
+    rtv_cache: FxHashMap<usize, ComOwned<ID3D11RenderTargetView>>,
 }
 
 /// external surface의 이번 프레임 lease가 지난 Present와 다른 세대인가(재변환/재Present
@@ -1043,6 +1119,13 @@ pub struct DCompNativeCompositor {
     d3d11_context1: Option<ComOwned<ID3D11DeviceContext1>>,
     /// external surface 요청 시 provider 미등록 warn-once(비주얼만 배치, 마지막 프레임 유지).
     warned_no_provider: bool,
+    /// 이번 프레임에 external convert 배치가 열려 있는가. present_external의 첫 external convert에서
+    /// convert_pass.begin_batch로 열고(1회), start_compositing에서 close_external_batch로 닫는다
+    /// (WR passes-루프 타일 GL 전 — 아래 close_external_batch/start_compositing 주석의 렌더러 앵커
+    /// 참조). begin_frame/end_frame이 방어적으로 닫아 잔류를 막는다.
+    external_batch_active: bool,
+    /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
+    esc_prof: EscProf,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1192,6 +1275,8 @@ pub fn maybe_create(
             convert_pass_init_failed: false,
             d3d11_context1,
             warned_no_provider: false,
+            external_batch_active: false,
+            esc_prof: EscProf::new(),
         })
     }
 }
@@ -1353,7 +1438,13 @@ impl DCompNativeCompositor {
         };
         // acquire는 링을 잠그고 소비계획을 실행한다 — Some이면 반드시 release로 짝맞춘다.
         // None(대여 실패)이면 아무것도 안 잠겼으므로 release 불필요(브리프 계약).
-        let Some(lease) = provider.acquire(&*rc, external_id) else {
+        let acq_start = if video_escape_prof() { Some(std::time::Instant::now()) } else { None };
+        let maybe_lease = provider.acquire(&*rc, external_id);
+        if let Some(start) = acq_start {
+            self.esc_prof.acquires += 1;
+            self.esc_prof.acquire_dur += start.elapsed();
+        }
+        let Some(lease) = maybe_lease else {
             return;
         };
         let ring_id = lease.ring_id;
@@ -1418,6 +1509,9 @@ impl DCompNativeCompositor {
         };
 
         if let Some(created) = created {
+            // 스왑체인 교체 → 옛 백버퍼 무효. 캐시된 RTV를 버려 스테일 포인터 재사용을 막는다
+            // (새 버퍼가 옛 주소를 재활용해도 오조회 없음).
+            ext.rtv_cache.clear();
             match created {
                 Some(sc) => {
                     ext.swapchain = Some(sc);
@@ -1483,8 +1577,17 @@ impl DCompNativeCompositor {
             return;
         };
 
-        // flip 스왑체인: 매 present마다 GetBuffer(0)로 새 백버퍼를 얻어 RTV 생성 후 변환한다
-        // (RTV 캐시 금지 — 버퍼가 로테이트되므로). Safety: 살아있는 스왑체인/디바이스/컨텍스트.
+        // flip 스왑체인 present: GetBuffer(0)로 이번 백버퍼를 얻고, RTV는 백버퍼 포인터로 캐시
+        // 조회(FLIP 2버퍼 → 엔트리 ≤2)해 per-present CreateRenderTargetView를 없앤다. 이번 프레임
+        // 첫 external convert면 begin_batch로 컨텍스트-상태 배치를 연다(프레임당 스왑 2N→2).
+        // Safety: 살아있는 스왑체인/디바이스/컨텍스트/백버퍼.
+        let prof_on = video_escape_prof();
+        let mut d_converts = 0u64;
+        let mut d_convert_dur = std::time::Duration::ZERO;
+        let mut d_srv = 0u64;
+        let mut d_presents = 0u64;
+        let mut d_present_dur = std::time::Duration::ZERO;
+        let mut d_batch_swaps = 0u64;
         unsafe {
             let mut back: *mut ID3D11Texture2D = ptr::null_mut();
             let hr = (*swapchain.as_ptr()).GetBuffer(
@@ -1499,27 +1602,57 @@ impl DCompNativeCompositor {
                 }
                 return;
             }
-            let mut rtv: *mut ID3D11RenderTargetView = ptr::null_mut();
-            let hr = (*d3d11_device).CreateRenderTargetView(
-                back as *mut ID3D11Resource,
-                ptr::null(),
-                &mut rtv,
-            );
-            if hr < 0 || rtv.is_null() {
-                if !ext.warned_fail {
-                    warn!("[dcomp-native] external {:?}: CreateRenderTargetView failed (hr=0x{:08x})", id, hr as u32);
-                    ext.warned_fail = true;
+            // RTV 캐시 조회(키 = 백버퍼 텍스처 포인터). 미스면 생성해 소유권을 캐시로 이전한다.
+            // 스왑체인 백버퍼는 Map rename이 없어 캐시 RTV가 유효 유지(rtv_cache 필드 주석).
+            let back_key = back as usize;
+            if !ext.rtv_cache.contains_key(&back_key) {
+                let mut raw: *mut ID3D11RenderTargetView = ptr::null_mut();
+                let hr = (*d3d11_device).CreateRenderTargetView(
+                    back as *mut ID3D11Resource,
+                    ptr::null(),
+                    &mut raw,
+                );
+                if hr < 0 || raw.is_null() {
+                    if !ext.warned_fail {
+                        warn!("[dcomp-native] external {:?}: CreateRenderTargetView failed (hr=0x{:08x})", id, hr as u32);
+                        ext.warned_fail = true;
+                    }
+                    (*(back as *mut IUnknown)).Release();
+                    return;
                 }
-                (*(back as *mut IUnknown)).Release();
-                return;
+                // Safety: raw는 방금 만든 유효한 RTV — 소유권을 캐시로 이전.
+                let Some(owned) = ComOwned::from_raw(raw) else {
+                    (*(back as *mut IUnknown)).Release();
+                    return;
+                };
+                ext.rtv_cache.insert(back_key, owned);
             }
-            // convert 내부에서 SwapDeviceContextState로 ANGLE 상태 격리(호출측 상태 무영향).
+            // 캐시된(또는 방금 생성한) RTV. as_ptr는 비소유 포인터 — Release 금지(캐시가 소유).
+            let rtv = ext.rtv_cache.get(&back_key).map(|c| c.as_ptr()).unwrap();
+
+            // 이번 프레임 첫 external convert에서 배치 오픈(스왑 1회). 이후 convert는 스왑 생략.
+            if !self.external_batch_active {
+                convert_pass.begin_batch(ctx1.as_ptr());
+                self.external_batch_active = true;
+                d_batch_swaps += 1;
+            }
+            // convert: 배치 활성이면 스왑 없이 per-draw 자원만 바인딩+draw(begin_batch 주석).
+            let c_start = if prof_on { Some(std::time::Instant::now()) } else { None };
             let converted =
                 convert_pass.convert(ctx1.as_ptr(), lease, rtv, dst.width as u32, dst.height as u32);
-            // RTV는 매 present 재생성 — 즉시 Release(캐시 금지). 백버퍼도 아래에서 Release.
-            (*(rtv as *mut IUnknown)).Release();
+            if let Some(s) = c_start {
+                d_convert_dur += s.elapsed();
+                d_converts += 1;
+                d_srv += lease.plane_count.min(3) as u64;
+            }
+            // RTV는 캐시가 소유 — 여기서 Release하지 않는다(백버퍼는 아래에서 Release).
             if converted {
+                let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
                 let hr = (*swapchain.as_ptr()).Present(0, 0);
+                if let Some(s) = p_start {
+                    d_present_dur += s.elapsed();
+                    d_presents += 1;
+                }
                 if hr < 0 {
                     if !ext.warned_fail {
                         warn!("[dcomp-native] external {:?}: Present failed (hr=0x{:08x})", id, hr as u32);
@@ -1547,6 +1680,41 @@ impl DCompNativeCompositor {
             }
             (*(back as *mut IUnknown)).Release();
         }
+
+        // 프로파일 누산(게이트 on일 때만). 여기선 ext/entry/convert_pass/ctx1 borrow가 끝나
+        // self.esc_prof 갱신이 안전하다. batch_swaps의 end 쪽은 close_external_batch에서 카운트.
+        if prof_on {
+            self.esc_prof.converts += d_converts;
+            self.esc_prof.convert_dur += d_convert_dur;
+            self.esc_prof.srv_creates += d_srv;
+            self.esc_prof.presents += d_presents;
+            self.esc_prof.present_dur += d_present_dur;
+            self.esc_prof.batch_swaps += d_batch_swaps;
+        }
+    }
+
+    /// external convert 배치가 열려 있으면 닫는다(멱등). ★반드시 이 스레드의 다음 ANGLE/GL
+    /// 호출 전에 불려야 한다 — 배치가 열린 동안 우리 ID3DDeviceContextState가 활성이라 ANGLE의
+    /// GL→D3D11 상태 설정이 어긋난다(begin_batch 주석). 정본 호출 지점은 start_compositing:
+    /// webrender 0.68 renderer/mod.rs에서 composite_native(:5329)가 add_surface 루프(:6667) 직후
+    /// start_compositing(:6677)을 부르고, 그 다음 draw_frame의 passes 루프가 picture-cache 타일을
+    /// compositor.bind(:5380)로 GL 렌더한다 — 즉 start_compositing은 add_surface 루프의 모든
+    /// external convert '뒤', 타일 GL '앞'이라 배치를 닫을 정확한 위치다. begin_frame/end_frame은
+    /// 방어적 멱등 넷(정상 경로에선 이미 닫혀 no-op).
+    fn close_external_batch(&mut self) {
+        if !self.external_batch_active {
+            return;
+        }
+        if let (Some(cp), Some(ctx1)) = (self.convert_pass.as_mut(), self.d3d11_context1.as_ref()) {
+            // Safety: cp/ctx1은 begin_batch를 연 바로 그 패스/컨텍스트(프레임 중 교체 없음).
+            unsafe {
+                cp.end_batch(ctx1.as_ptr());
+            }
+            if video_escape_prof() {
+                self.esc_prof.batch_swaps += 1;
+            }
+        }
+        self.external_batch_active = false;
     }
 
     /// mid-bind 상태였던 pbuffer/텍스처를 EndDraw 없이 정리한다(서피스가 사라지는 경로용).
@@ -2078,6 +2246,10 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn begin_frame(&mut self, _device: &mut Device) {
+        // external 배치는 정상적으로 직전 프레임 start_compositing에서 닫힌다. 만약 어떤 이유로
+        // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
+        // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
+        self.close_external_batch();
         let Some(root) = self.root_visual_ptr() else {
             return;
         };
@@ -2191,7 +2363,27 @@ impl Compositor for DCompNativeCompositor {
         self.frame_surfaces.push(id);
     }
 
+    fn start_compositing(
+        &mut self,
+        _device: &mut Device,
+        _clear_color: ColorF,
+        _dirty_rects: &[DeviceIntRect],
+        _opaque_rects: &[DeviceIntRect],
+    ) {
+        // ★external convert 배치를 닫는 정본 위치. WR 렌더러는 composite_native(add_surface 루프)
+        // 직후 start_compositing을 부르고, 그 '뒤'에 draw_frame의 passes 루프가 picture-cache 타일을
+        // compositor.bind로 GL 렌더한다(webrender 0.68 renderer/mod.rs: :6667 루프 → :6677 이 콜 →
+        // :5380 타일 bind). 즉 여기가 이 프레임 모든 external convert '뒤', 타일 GL '앞'이라 배치를
+        // 닫아 우리 ID3DDeviceContextState를 ANGLE 상태로 되돌릴 정확한 지점이다. end_frame(:1913)은
+        // passes 루프 '뒤'라 너무 늦다(그래서 end_frame의 닫기는 방어 넷일 뿐).
+        self.close_external_batch();
+    }
+
     fn end_frame(&mut self, device: &mut Device) {
+        // 방어: 정상 경로는 start_compositing이 이미 배치를 닫았다(no-op). 혹시 열려 있으면
+        // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
+        // 돌면 ANGLE 상태가 어긋난다(close_external_batch/begin_batch 주석).
+        self.close_external_batch();
         // GL 커맨드를 D3D 큐에 확실히 제출한 뒤 Present(순서 보장).
         device.gl().flush();
 
@@ -2733,6 +2925,12 @@ impl Compositor for DCompNativeCompositor {
         if hr < 0 {
             warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
         }
+
+        // external present 프로파일: 프레임 카운트 후 1초 경과 시 [vesc-prof] 집계 라인 출력.
+        if video_escape_prof() {
+            self.esc_prof.frames += 1;
+            self.esc_prof.maybe_flush();
+        }
     }
 
     fn destroy_surface(&mut self, _device: &mut Device, id: NativeSurfaceId) {
@@ -2778,6 +2976,7 @@ impl Compositor for DCompNativeCompositor {
                     last_presented: None,
                     warned_fail: false,
                     frames_logged: 0,
+                    rtv_cache: FxHashMap::default(),
                 }),
                 visual,
                 virtual_offset: DeviceIntPoint::zero(),

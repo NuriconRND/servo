@@ -160,6 +160,12 @@ pub(crate) struct VideoConvertPass {
     /// SwapDeviceContextState로 활성화할 격리 상태(FeatureLevel 11_0,
     /// EmulatedInterface=ID3D11Device — ANGLE의 D3D10 비호환은 우리와 무관).
     context_state: ComOwned<ID3DDeviceContextState>,
+    /// begin_batch가 연 배치 상태. `Some(prev)` = 배치 활성(prev = begin_batch의
+    /// SwapDeviceContextState가 AddRef해 돌려준 직전 ANGLE 상태 — end_batch에서 복원 후
+    /// Release). 활성인 동안 convert()는 상태 스왑을 생략하고 per-draw 자원만 재바인딩한다
+    /// (정적 파이프라인 상태는 begin_batch에서 1회 바인딩). 렌더러 스레드 전용이라 raw 포인터
+    /// 보관 OK. `None` = 비활성(유닛 테스트/단독 호출은 항상 이 상태 — convert가 자체 스왑).
+    batch: Option<*mut ID3DDeviceContextState>,
 }
 
 impl VideoConvertPass {
@@ -328,6 +334,7 @@ impl VideoConvertPass {
             blend_state,
             raster_state,
             context_state,
+            batch: None,
         })
     }
 
@@ -348,9 +355,69 @@ impl VideoConvertPass {
         Some(raw)
     }
 
-    /// lease의 plane들을 rtv(dst_size)로 스케일+색변환 1-draw. 내부에서
-    /// SwapDeviceContextState로 ANGLE 상태와 완전 격리(draw 전 스왑, 후 복원) —
-    /// 호출 전후로 ANGLE/WR의 파이프라인 상태는 변하지 않는다.
+    /// 배치를 연다(Task: external present 컨텍스트-상태 스왑 배칭). 우리 격리 상태로 1회
+    /// 스왑하고 직전 ANGLE 상태를 보관한 뒤, 배치 동안 변하지 않는 정적 파이프라인 상태
+    /// (셰이더/샘플러/블렌드/래스터/토폴로지)를 1회 바인딩한다. 이후 같은 프레임의 convert()
+    /// 들은 스왑·정적 바인딩을 생략하고 per-draw 자원(RTV/뷰포트/SRV/cbuffer)만 재바인딩한다
+    /// → 프레임당 스왑 2N회(convert마다 in/out)가 2회(begin/end)로 준다.
+    ///
+    /// ★SAFETY(치명): 배치가 열린 동안 이 스레드에서 ANGLE/GL 호출이 절대 돌면 안 된다 —
+    /// 우리 ID3DDeviceContextState가 활성이라 ANGLE의 GL→D3D11 상태 설정이 우리 상태 객체를
+    /// 오염시키고 ANGLE 상태 캐시가 어긋난다. 호출측(dcomp_compositor)이 이 불변식을 보장한다
+    /// (WR passes-루프 타일 GL '전'에 end_batch — start_compositing에서 닫음).
+    ///
+    /// Safety: `context`는 이 패스를 생성한 디바이스의 살아있는 즉시 컨텍스트(1)여야 한다.
+    pub(crate) unsafe fn begin_batch(&mut self, context: *mut ID3D11DeviceContext1) {
+        if self.batch.is_some() {
+            // 이미 활성 — 이중 스왑 금지(방어적).
+            return;
+        }
+        // prev_state는 SwapDeviceContextState가 AddRef해 돌려준 직전(ANGLE) 상태.
+        // end_batch에서 복원 후 Release한다.
+        let mut prev_state: *mut ID3DDeviceContextState = ptr::null_mut();
+        (*context).SwapDeviceContextState(self.context_state.as_ptr(), &mut prev_state);
+        self.bind_static(context);
+        self.batch = Some(prev_state);
+    }
+
+    /// 배치를 닫는다(begin_batch와 짝). 직전 ANGLE 상태로 복원하고 참조를 정리한다. 배치가
+    /// 열려 있지 않으면 no-op(멱등). ★이 호출 이후 비로소 ANGLE/GL 호출이 안전하다.
+    ///
+    /// Safety: `context`는 begin_batch에 넘긴 바로 그 즉시 컨텍스트(1)여야 한다.
+    pub(crate) unsafe fn end_batch(&mut self, context: *mut ID3D11DeviceContext1) {
+        let Some(prev_state) = self.batch.take() else {
+            return;
+        };
+        // discarded는 우리 context_state를 다시 AddRef해 돌려준 것 — 마스터 참조는
+        // self.context_state가 이미 갖고 있으므로 이 추가 참조를 Release한다.
+        let mut discarded: *mut ID3DDeviceContextState = ptr::null_mut();
+        (*context).SwapDeviceContextState(prev_state, &mut discarded);
+        if !discarded.is_null() {
+            (*(discarded as *mut IUnknown)).Release();
+        }
+        if !prev_state.is_null() {
+            (*(prev_state as *mut IUnknown)).Release();
+        }
+    }
+
+    /// 배치 동안 불변인 정적 파이프라인 상태(토폴로지/VS/PS/샘플러/래스터/블렌드)를 바인딩한다.
+    /// begin_batch(배치 1회) 또는 비배치 convert(draw마다)에서 호출. per-draw 자원(SRV/cbuffer/
+    /// 뷰포트/RTV)은 여기 없다 — draw_locked가 매 draw 바인딩한다.
+    unsafe fn bind_static(&self, context: *mut ID3D11DeviceContext1) {
+        let sampler_ptr = self.sampler.as_ptr();
+        (*context).IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        (*context).VSSetShader(self.vs.as_ptr(), ptr::null(), 0);
+        (*context).PSSetShader(self.ps.as_ptr(), ptr::null(), 0);
+        (*context).PSSetSamplers(0, 1, &sampler_ptr);
+        (*context).RSSetState(self.raster_state.as_ptr());
+        (*context).OMSetBlendState(self.blend_state.as_ptr(), &[1.0, 1.0, 1.0, 1.0], 0xffff_ffff);
+    }
+
+    /// lease의 plane들을 rtv(dst_size)로 스케일+색변환 1-draw.
+    ///
+    /// 배치 활성(begin_batch 후)이면 상태 스왑을 생략하고 per-draw 자원만 재바인딩한다.
+    /// 비활성(유닛 테스트/단독 호출)이면 오늘과 동일하게 자체적으로 SwapDeviceContextState로
+    /// ANGLE 상태를 격리(draw 전 스왑, 후 복원)한다 — 호출 전후 ANGLE/WR 상태 불변.
     ///
     /// Safety: `context`는 이 패스를 생성한 디바이스의 살아있는 즉시 컨텍스트(1)여야
     /// 하고, `rtv`는 dst_width x dst_height 크기의 살아있는 렌더 타겟 뷰여야 한다.
@@ -362,12 +429,18 @@ impl VideoConvertPass {
         dst_width: u32,
         dst_height: u32,
     ) -> bool {
-        // 우리 격리 상태로 스왑 — prev_state는 SwapDeviceContextState가 AddRef해 돌려준
-        // ANGLE(또는 기본) 상태. 참조 카운트 계약: 아래에서 반드시 한 번 Release한다.
+        if self.batch.is_some() {
+            // 배치 활성: begin_batch가 이미 우리 상태 활성화 + 정적 상태 바인딩을 마쳤다.
+            // 스왑·정적 바인딩 생략, per-draw 자원만.
+            return self.draw_locked(context, lease, rtv, dst_width, dst_height, false);
+        }
+
+        // 비배치: 우리 격리 상태로 스왑 — prev_state는 SwapDeviceContextState가 AddRef해
+        // 돌려준 ANGLE(또는 기본) 상태. 참조 카운트 계약: 아래에서 반드시 한 번 Release한다.
         let mut prev_state: *mut ID3DDeviceContextState = ptr::null_mut();
         (*context).SwapDeviceContextState(self.context_state.as_ptr(), &mut prev_state);
 
-        let ok = self.draw_locked(context, lease, rtv, dst_width, dst_height);
+        let ok = self.draw_locked(context, lease, rtv, dst_width, dst_height, true);
 
         // ANGLE 상태로 복원. discarded는 우리가 방금까지 쓰던 context_state를 다시
         // AddRef해 돌려준 것 — self.context_state가 이미 마스터 참조를 갖고 있으므로
@@ -384,6 +457,8 @@ impl VideoConvertPass {
     }
 
     /// convert()의 실제 draw 본문(우리 컨텍스트 상태가 활성인 동안에만 호출되어야 함).
+    /// `bind_static_state`=true면 정적 파이프라인 상태도 바인딩한다(비배치 경로 — 매 draw).
+    /// false면 정적 상태는 begin_batch가 이미 바인딩했다고 가정하고 per-draw 자원만 바인딩한다.
     unsafe fn draw_locked(
         &mut self,
         context: *mut ID3D11DeviceContext1,
@@ -391,6 +466,7 @@ impl VideoConvertPass {
         rtv: *mut ID3D11RenderTargetView,
         dst_width: u32,
         dst_height: u32,
+        bind_static_state: bool,
     ) -> bool {
         let params = yuv_rgb_params(lease.format, lease.color_space, lease.color_range);
         let cbuf_data = params.to_cbuffer();
@@ -435,15 +511,15 @@ impl VideoConvertPass {
         }
 
         let cbuf_ptr = self.cbuffer.as_ptr();
-        let sampler_ptr = self.sampler.as_ptr();
 
-        (*context).IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        (*context).VSSetShader(self.vs.as_ptr(), ptr::null(), 0);
-        (*context).PSSetShader(self.ps.as_ptr(), ptr::null(), 0);
+        // 정적 파이프라인 상태(토폴로지/셰이더/샘플러/래스터/블렌드)는 비배치 경로에서만 매 draw
+        // 바인딩한다. 배치 경로는 begin_batch가 1회 바인딩했으므로 생략(never varies).
+        if bind_static_state {
+            self.bind_static(context);
+        }
+        // per-draw 자원(SRV/cbuffer/뷰포트/RTV)은 배치·비배치 공통으로 매 convert 재바인딩한다.
         (*context).PSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
-        (*context).PSSetSamplers(0, 1, &sampler_ptr);
         (*context).PSSetConstantBuffers(0, 1, &cbuf_ptr);
-        (*context).RSSetState(self.raster_state.as_ptr());
         let viewport = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -454,7 +530,6 @@ impl VideoConvertPass {
         };
         (*context).RSSetViewports(1, &viewport);
         (*context).OMSetRenderTargets(1, &rtv, ptr::null_mut());
-        (*context).OMSetBlendState(self.blend_state.as_ptr(), &[1.0, 1.0, 1.0, 1.0], 0xffff_ffff);
         (*context).Draw(3, 0);
 
         // draw 제출 후 SRV를 unbind하고 Release한다. Draw가 참조한 SRV는 D3D11 런타임이
@@ -856,5 +931,43 @@ mod tests {
         assert!((p.rescale - 1.0).abs() < 1e-6);
         let p10 = yuv_rgb_params(VideoLeaseFormat::I420_10, VideoLeaseColorSpace::Rec709, VideoLeaseColorRange::Limited);
         assert!((p10.rescale - 64.0616).abs() < 1e-3);
+    }
+
+    // 배치 경로(begin_batch → convert×N → end_batch)의 결과 픽셀이 비배치 경로와 동일한지,
+    // 그리고 end_batch가 상태를 복원해 이후 비배치 convert가 여전히 정상인지 검증한다.
+    #[test]
+    fn convert_batched_matches_unbatched() {
+        let (dev, ctx1) = warp_device();
+        let mut pass = unsafe { VideoConvertPass::new(dev) }.expect("VideoConvertPass::new failed on WARP");
+        let (rtv, rtv_tex) = make_render_target(dev, 8, 8);
+
+        // White(BT.709 limited): Y=235, U=V=128.
+        let yw = make_plane_r8(dev, 4, 4, 235);
+        let uw = make_plane_r8(dev, 4, 4, 128);
+        let vw = make_plane_r8(dev, 4, 4, 128);
+        let white = lease3(yw, uw, vw, VideoLeaseFormat::I420, VideoLeaseColorSpace::Rec709, VideoLeaseColorRange::Limited);
+        // Red(BT.601 limited): Y=81, U=90, V=240.
+        let yr = make_plane_r8(dev, 4, 4, 81);
+        let ur = make_plane_r8(dev, 4, 4, 90);
+        let vr = make_plane_r8(dev, 4, 4, 240);
+        let red = lease3(yr, ur, vr, VideoLeaseFormat::I420, VideoLeaseColorSpace::Rec601, VideoLeaseColorRange::Limited);
+
+        // 배치 오픈 후 같은 배치에서 두 번 convert(두 번째는 정적 상태 재바인딩 없이).
+        unsafe { pass.begin_batch(ctx1) };
+
+        let ok = unsafe { pass.convert(ctx1, &white, rtv, 8, 8) };
+        assert!(ok);
+        assert_close(readback_center(dev, ctx1, rtv_tex, 8, 8), [255, 255, 255], 3);
+
+        let ok = unsafe { pass.convert(ctx1, &red, rtv, 8, 8) };
+        assert!(ok);
+        assert_close(readback_center(dev, ctx1, rtv_tex, 8, 8), [255, 0, 0], 3);
+
+        unsafe { pass.end_batch(ctx1) };
+
+        // 배치 종료 후 비배치 convert도 정상(상태 복원 확인).
+        let ok = unsafe { pass.convert(ctx1, &white, rtv, 8, 8) };
+        assert!(ok);
+        assert_close(readback_center(dev, ctx1, rtv_tex, 8, 8), [255, 255, 255], 3);
     }
 }
