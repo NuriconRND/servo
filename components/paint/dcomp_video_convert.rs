@@ -429,10 +429,26 @@ impl VideoConvertPass {
         dst_width: u32,
         dst_height: u32,
     ) -> bool {
+        self.convert_to_rect(context, lease, rtv, 0, 0, dst_width, dst_height)
+    }
+
+    /// convert의 dest-rect 변형(공유 캔버스용, 스펙 2026-07-18 §5.4): rtv의
+    /// (dst_left,dst_top)-(+dst_width,+dst_height) 영역에만 draw한다. 뷰포트 오프셋 외
+    /// 의미론(색변환/배치/상태 격리)은 convert와 동일.
+    pub(crate) unsafe fn convert_to_rect(
+        &mut self,
+        context: *mut ID3D11DeviceContext1,
+        lease: &VideoFrameLease,
+        rtv: *mut ID3D11RenderTargetView,
+        dst_left: i32,
+        dst_top: i32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> bool {
         if self.batch.is_some() {
             // 배치 활성: begin_batch가 이미 우리 상태 활성화 + 정적 상태 바인딩을 마쳤다.
             // 스왑·정적 바인딩 생략, per-draw 자원만.
-            return self.draw_locked(context, lease, rtv, dst_width, dst_height, false);
+            return self.draw_locked(context, lease, rtv, dst_left, dst_top, dst_width, dst_height, false);
         }
 
         // 비배치: 우리 격리 상태로 스왑 — prev_state는 SwapDeviceContextState가 AddRef해
@@ -440,7 +456,7 @@ impl VideoConvertPass {
         let mut prev_state: *mut ID3DDeviceContextState = ptr::null_mut();
         (*context).SwapDeviceContextState(self.context_state.as_ptr(), &mut prev_state);
 
-        let ok = self.draw_locked(context, lease, rtv, dst_width, dst_height, true);
+        let ok = self.draw_locked(context, lease, rtv, dst_left, dst_top, dst_width, dst_height, true);
 
         // ANGLE 상태로 복원. discarded는 우리가 방금까지 쓰던 context_state를 다시
         // AddRef해 돌려준 것 — self.context_state가 이미 마스터 참조를 갖고 있으므로
@@ -464,6 +480,8 @@ impl VideoConvertPass {
         context: *mut ID3D11DeviceContext1,
         lease: &VideoFrameLease,
         rtv: *mut ID3D11RenderTargetView,
+        dst_left: i32,
+        dst_top: i32,
         dst_width: u32,
         dst_height: u32,
         bind_static_state: bool,
@@ -521,8 +539,8 @@ impl VideoConvertPass {
         (*context).PSSetShaderResources(0, srvs.len() as u32, srvs.as_ptr());
         (*context).PSSetConstantBuffers(0, 1, &cbuf_ptr);
         let viewport = D3D11_VIEWPORT {
-            TopLeftX: 0.0,
-            TopLeftY: 0.0,
+            TopLeftX: dst_left as f32,
+            TopLeftY: dst_top as f32,
             Width: dst_width as f32,
             Height: dst_height as f32,
             MinDepth: 0.0,
@@ -761,14 +779,15 @@ mod tests {
         }
     }
 
-    /// rtv_tex의 중앙 픽셀을 STAGING readback으로 읽어 (R,G,B,A) 순서로 반환한다
-    /// (백킹 포맷은 BGRA이므로 내부에서 스위즐한다).
-    fn readback_center(
+    /// rtv_tex의 (x,y) 픽셀을 STAGING readback으로 읽어 (R,G,B,A)로 반환(BGRA 스위즐).
+    fn readback_px(
         dev: *mut ID3D11Device,
         ctx: *mut ID3D11DeviceContext1,
         rtv_tex: *mut ID3D11Texture2D,
         w: u32,
         h: u32,
+        x: u32,
+        y: u32,
     ) -> [u8; 4] {
         unsafe {
             let desc = D3D11_TEXTURE2D_DESC {
@@ -790,15 +809,25 @@ mod tests {
             let mut mapped: D3D11_MAPPED_SUBRESOURCE = std::mem::zeroed();
             let hr = (*ctx).Map(staging as *mut ID3D11Resource, 0, D3D11_MAP_READ, 0, &mut mapped);
             assert!(hr >= 0, "Map(staging) failed (hr=0x{:08x})", hr as u32);
-            let cx = (w / 2) as usize;
-            let cy = (h / 2) as usize;
-            let row = (mapped.pData as *const u8).add(cy * mapped.RowPitch as usize);
-            let px = row.add(cx * 4);
+            let row = (mapped.pData as *const u8).add(y as usize * mapped.RowPitch as usize);
+            let px = row.add(x as usize * 4);
             let (b, g, r, a) = (*px, *px.add(1), *px.add(2), *px.add(3));
             (*ctx).Unmap(staging as *mut ID3D11Resource, 0);
             (*(staging as *mut IUnknown)).Release();
             [r, g, b, a]
         }
+    }
+
+    /// rtv_tex의 중앙 픽셀을 STAGING readback으로 읽어 (R,G,B,A) 순서로 반환한다
+    /// (백킹 포맷은 BGRA이므로 내부에서 스위즐한다).
+    fn readback_center(
+        dev: *mut ID3D11Device,
+        ctx: *mut ID3D11DeviceContext1,
+        rtv_tex: *mut ID3D11Texture2D,
+        w: u32,
+        h: u32,
+    ) -> [u8; 4] {
+        readback_px(dev, ctx, rtv_tex, w, h, w / 2, h / 2)
     }
 
     fn assert_close(actual: [u8; 4], expected_rgb: [u8; 3], tol: i32) {
@@ -969,5 +998,36 @@ mod tests {
         let ok = unsafe { pass.convert(ctx1, &white, rtv, 8, 8) };
         assert!(ok);
         assert_close(readback_center(dev, ctx1, rtv_tex, 8, 8), [255, 255, 255], 3);
+    }
+
+    #[test]
+    fn convert_to_rect_draws_two_videos_side_by_side_and_preserves_clear() {
+        let (dev, ctx1) = warp_device();
+        let mut pass = unsafe { VideoConvertPass::new(dev) }.expect("VideoConvertPass::new failed on WARP");
+        // 16x16 캔버스형 타깃: 상단에 좌(흰)/우(검) 두 비디오, 하반부는 클리어(투명) 유지.
+        let (rtv, rtv_tex) = make_render_target(dev, 16, 16);
+        unsafe { (*ctx1).ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]) };
+
+        // 좌상 (0,0)-(8,8): 흰색 (Y=235,U=V=128, BT.709 limited)
+        let yw = make_plane_r8(dev, 4, 4, 235);
+        let u = make_plane_r8(dev, 4, 4, 128);
+        let v = make_plane_r8(dev, 4, 4, 128);
+        let lease_w = lease3(yw, u, v, VideoLeaseFormat::I420, VideoLeaseColorSpace::Rec709, VideoLeaseColorRange::Limited);
+        let ok = unsafe { pass.convert_to_rect(ctx1, &lease_w, rtv, 0, 0, 8, 8) };
+        assert!(ok);
+
+        // 우상 (8,0)-(16,8): 검정 (Y=16)
+        let yb = make_plane_r8(dev, 4, 4, 16);
+        let lease_b = lease3(yb, u, v, VideoLeaseFormat::I420, VideoLeaseColorSpace::Rec709, VideoLeaseColorRange::Limited);
+        let ok = unsafe { pass.convert_to_rect(ctx1, &lease_b, rtv, 8, 0, 8, 8) };
+        assert!(ok);
+
+        // 좌상 중앙 = 흰색, 우상 중앙 = 검정 (draw 위치·독립성 검증)
+        assert_close(readback_px(dev, ctx1, rtv_tex, 16, 16, 4, 4), [255, 255, 255], 3);
+        assert_close(readback_px(dev, ctx1, rtv_tex, 16, 16, 12, 4), [0, 0, 0], 3);
+        // 우상 draw가 좌상을 덮지 않았는가(뷰포트 격리) — 좌상 재확인은 위와 동일 픽셀로 이미 커버.
+        // 하반부는 클리어 그대로 투명(A=0) — 전량 재드로우 캔버스의 빈 영역 계약.
+        let below = readback_px(dev, ctx1, rtv_tex, 16, 16, 8, 12);
+        assert_eq!(below[3], 0, "cleared area must stay transparent, got {:?}", below);
     }
 }
