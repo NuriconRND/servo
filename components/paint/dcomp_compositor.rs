@@ -906,6 +906,26 @@ struct ExternalStorage {
     rtv_cache: FxHashMap<usize, ComOwned<ID3D11RenderTargetView>>,
 }
 
+/// 공유 비디오 캔버스(SERVO_VIDEO_ESCAPE=canvas, 스펙 2026-07-18) 저장소 — 컴포지터당 1개.
+/// underlay external 전체를 창 크기 스왑체인 하나에 전량 재드로우하고 Present1 1회/프레임.
+/// visual은 최초 1회 생성해 유지하고, 트리 추가는 end_frame이 프레임별로(최초 underlay
+/// 위치=최하단) 수행한다. 스왑체인은 premultiplied(비디오 없는 영역 투명).
+struct CanvasStorage {
+    visual: ComOwned<IDCompositionVisual>,
+    /// None = 미생성/생성 실패(다음 프레임 재시도) — external과 동일 정책.
+    swapchain: Option<ComOwned<IDXGISwapChain1>>,
+    /// 현재 스왑체인 크기(= 생성 시 창 크기). 창 크기 변경 시 재생성(드래그 중 억제).
+    size: DeviceIntSize,
+    /// 첫 성공 Present 후 visual.SetContent 완료 여부(1회). 재생성 시 false로 리셋 —
+    /// canvas_flush가 이 플래그로 '전체 강제(full)' Present를 판정한다.
+    content_attached: bool,
+    /// 백버퍼별 RTV 캐시(키=GetBuffer(0) 포인터, FLIP 2버퍼 → 엔트리 ≤2). 스왑체인
+    /// 백버퍼는 rename이 없어 안전(ExternalStorage.rtv_cache와 동일 근거). (재)생성 시 clear.
+    rtv_cache: FxHashMap<usize, ComOwned<ID3D11RenderTargetView>>,
+    /// 브링업 계약 로그(최초 5프레임)용 카운터(dcomp_debug 게이트).
+    frames_logged: u32,
+}
+
 /// external surface의 이번 프레임 lease가 지난 Present와 다른 세대인가(재변환/재Present
 /// 필요 판정). ring_id 변화 = 소스 전환(다른 비디오), frame_seq 변화 = 새 프레임.
 /// 순수 함수 — TDD 대상(tests::external_needs_present_dedups_by_ring_and_seq).
@@ -914,7 +934,6 @@ fn external_needs_present(last: Option<(u64, u64)>, ring_id: u64, seq: u64) -> b
 }
 
 /// 공유 캔버스(스펙 2026-07-18 §5.3)의 이번 프레임 underlay 항목. add 순서 = draw 순서 = z.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct CanvasFrameItem {
     id: NativeSurfaceId,
@@ -930,7 +949,6 @@ struct CanvasFrameItem {
 /// ③draw 성공↔실패 전이(구멍 생성/복구) ④신규 등장 ⑤소멸(옛 자리 투명 전환).
 /// 공집합 = 캔버스 무접촉(Present 스킵). 전량 재드로우 전제라 이 힌트가 정합하다:
 /// 무갱신 비디오는 같은 소스 프레임을 재드로우해 픽셀 동일이 보장된다.
-#[allow(dead_code)]
 fn canvas_dirty_rects(
     prev: &FxHashMap<NativeSurfaceId, (DeviceIntRect, bool)>,
     current: &[CanvasFrameItem],
@@ -958,7 +976,6 @@ fn canvas_dirty_rects(
 
 /// Present1 + DirtyRects 힌트(스펙 §5.2-3). 16 초과·공집합이면 힌트 없이 전체.
 /// 콘텐츠 스왑체인(present1_partial)과 공유 캔버스(canvas_flush)가 공용.
-#[allow(dead_code)]
 fn present1_with_dirty(
     swapchain: *mut IDXGISwapChain1,
     size: DeviceIntSize,
@@ -967,6 +984,8 @@ fn present1_with_dirty(
     let rects: Vec<RECT> = dirty
         .iter()
         .filter_map(|r| {
+            // 클램프 먼저, 그 결과가 퇴화(폭/높이 0 이하)면 스킵 — self_copy_catchup과 동일 순서.
+            // (완전히 버퍼 밖인 렉트가 클램프 후 퇴화 RECT로 Present1에 전달되는 것을 방지.)
             let left = r.min.x.max(0);
             let top = r.min.y.max(0);
             let right = r.max.x.min(size.width);
@@ -1178,6 +1197,19 @@ pub struct DCompNativeCompositor {
     external_batch_active: bool,
     /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
     esc_prof: EscProf,
+    /// SERVO_VIDEO_ESCAPE=canvas 여부(프로세스 불변 — 생성 시 1회 캐시).
+    canvas_mode: bool,
+    /// 공유 비디오 캔버스(지연 생성, canvas_mode에서만 사용).
+    canvas: Option<CanvasStorage>,
+    /// 이번 프레임 underlay external 기록(add 순서 = draw 순서 = z). begin_frame에서 clear.
+    frame_canvas_items: Vec<(NativeSurfaceId, DeviceIntRect)>,
+    /// 지난 '표시된' 캔버스 프레임의 id → (rect, draw 성공). canvas_dirty_rects의 prev.
+    canvas_prev_rects: FxHashMap<NativeSurfaceId, (DeviceIntRect, bool)>,
+    /// 이번 프레임 add_surface에서 비-external(콘텐츠) 서피스를 봤는가 —
+    /// false에 온 external = underlay(캔버스), true에 온 external = overlay(per-video 유지).
+    content_seen: bool,
+    /// 캔버스 생성 실패 warn-once.
+    warned_canvas_fail: bool,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1329,6 +1361,13 @@ pub fn maybe_create(
             warned_no_provider: false,
             external_batch_active: false,
             esc_prof: EscProf::new(),
+            canvas_mode: paint_api::rendering_context::video_escape_mode()
+                == paint_api::rendering_context::VideoEscapeMode::Canvas,
+            canvas: None,
+            frame_canvas_items: Vec::new(),
+            canvas_prev_rects: FxHashMap::default(),
+            content_seen: false,
+            warned_canvas_fail: false,
         })
     }
 }
@@ -1457,6 +1496,17 @@ impl DCompNativeCompositor {
         if clip_rect.is_empty() {
             return;
         }
+
+        // 공유 캔버스(스펙 2026-07-18 §5.3 1단계): underlay external은 기록만 하고
+        // start_compositing의 canvas_flush가 일괄 draw+Present1한다. per-video
+        // 스왑체인/비주얼/Present 미사용(Present×N 직렬화 소멸 — §3-ac).
+        // overlay(content_seen=true, PiP류 ≤4)는 아래 기존 per-video 경로 유지.
+        if self.canvas_mode && !self.content_seen {
+            self.frame_canvas_items.push((id, clip_rect));
+            self.frame_surfaces.push(id); // z-order 기록 — end_frame이 캔버스 비주얼로 치환
+            return;
+        }
+
         let size = clip_rect.size();
 
         // Step 4-7/8(앞당김): 비주얼 배치 + z-order 기록은 provider 유무와 무관하게 항상.
@@ -1742,6 +1792,283 @@ impl DCompNativeCompositor {
             self.esc_prof.presents += d_presents;
             self.esc_prof.present_dur += d_present_dur;
             self.esc_prof.batch_swaps += d_batch_swaps;
+        }
+    }
+
+    /// 캔버스 visual(1회)+스왑체인(창 크기, premultiplied)을 (재)생성한다. 실패 시 None 유지
+    /// → 다음 프레임 자연 재시도(스펙 §6). 재생성 시 rtv_cache clear + content_attached 리셋.
+    fn ensure_canvas(&mut self, size: DeviceIntSize) {
+        if self.canvas.is_none() {
+            let Some(dcomp_device) = self.dcomp_device_ptr() else {
+                return;
+            };
+            // Safety: dcomp_device는 살아있는 IDCompositionDevice.
+            let visual = unsafe {
+                let mut raw: *mut IDCompositionVisual = ptr::null_mut();
+                let hr = (*dcomp_device).CreateVisual(&mut raw);
+                if hr < 0 || raw.is_null() {
+                    if !self.warned_canvas_fail {
+                        warn!("[dcomp-native] canvas: CreateVisual failed (hr=0x{:08x})", hr as u32);
+                        self.warned_canvas_fail = true;
+                    }
+                    return;
+                }
+                match ComOwned::from_raw(raw) {
+                    Some(v) => v,
+                    None => return,
+                }
+            };
+            self.canvas = Some(CanvasStorage {
+                visual,
+                swapchain: None,
+                size: DeviceIntSize::zero(),
+                content_attached: false,
+                rtv_cache: FxHashMap::default(),
+                frames_logged: 0,
+            });
+        }
+        // 스왑체인 (재)생성. premultiplied(is_opaque=false) — 비디오 없는 영역 투명(스펙 §5.2).
+        let created = self.create_composition_swapchain(size, false);
+        let Some(canvas) = self.canvas.as_mut() else {
+            return;
+        };
+        canvas.rtv_cache.clear();
+        canvas.content_attached = false;
+        match created {
+            Some(sc) => {
+                canvas.swapchain = Some(sc);
+                canvas.size = size;
+                self.warned_canvas_fail = false; // 성공 → 실패 warn 재무장
+                if dcomp_debug() {
+                    log::info!("[dcomp-dbg] canvas swapchain (re)create {}x{}", size.width, size.height);
+                }
+            },
+            None => {
+                canvas.swapchain = None;
+                canvas.size = DeviceIntSize::zero();
+                if !self.warned_canvas_fail {
+                    warn!(
+                        "[dcomp-native] canvas swapchain {}x{} create failed; retrying next frame",
+                        size.width, size.height
+                    );
+                    self.warned_canvas_fail = true;
+                }
+            },
+        }
+    }
+
+    /// 공유 캔버스 2단계(스펙 §5.3): 전 underlay lease acquire → 더티 판정 → (더티 시)
+    /// 전체 투명 클리어 + add 순서 전량 draw + Present1 1회. 더티 공집합이면 캔버스 무접촉.
+    /// lease는 이 함수 안에서 acquire↔release 짝맞춤(모든 반환 경로에서 release).
+    fn canvas_flush(&mut self) {
+        if !self.canvas_mode {
+            return;
+        }
+        if self.frame_canvas_items.is_empty() {
+            // underlay 없음(비디오 페이지 이탈 등). 캔버스 비주얼은 이번 프레임 트리에
+            // 추가되지 않으므로 표시 없음 — 지난 rect 부기만 비운다.
+            self.canvas_prev_rects.clear();
+            return;
+        }
+        let rc = self.rendering_context.clone();
+        let Some(provider) = paint_api::video_external_surface_provider() else {
+            return; // 미등록 — 기존 경로가 warn-once를 이미 냄(add_external_surface와 동일 수용)
+        };
+        // convert_pass 지연 초기화(present_external과 동일 래치·실패 시 재시도 안 함).
+        if self.convert_pass.is_none() && !self.convert_pass_init_failed {
+            self.convert_pass =
+                unsafe { crate::dcomp_video_convert::VideoConvertPass::new(self.d3d11_device) };
+            if self.convert_pass.is_none() {
+                self.convert_pass_init_failed = true;
+                warn!("[dcomp-native] canvas: VideoConvertPass unavailable; skipping");
+            }
+        }
+        if self.convert_pass.is_none() || self.d3d11_context1.is_none() {
+            return;
+        }
+
+        let prof_on = video_escape_prof();
+        let items: Vec<(NativeSurfaceId, DeviceIntRect)> = self.frame_canvas_items.clone();
+
+        // ── 1) acquire 패스: 항목별 lease + 세대 판정(짧은 surfaces borrow) ──
+        let acq_start = if prof_on { Some(std::time::Instant::now()) } else { None };
+        let mut leases: Vec<Option<paint_api::VideoFrameLease>> = Vec::with_capacity(items.len());
+        let mut frame_items: Vec<CanvasFrameItem> = Vec::with_capacity(items.len());
+        for (id, rect) in items.iter() {
+            let (attached, last) = match self.surfaces.get(id).map(|e| &e.storage) {
+                Some(SurfaceStorage::External(ext)) => (ext.attached_external_id, ext.last_presented),
+                _ => (None, None),
+            };
+            let lease = attached.and_then(|eid| provider.acquire(&*rc, eid));
+            let updated = lease
+                .as_ref()
+                .is_some_and(|l| external_needs_present(last, l.ring_id, l.frame_seq));
+            frame_items.push(CanvasFrameItem {
+                id: *id,
+                rect: *rect,
+                updated,
+                drawable: lease.is_some(),
+            });
+            leases.push(lease);
+        }
+        if let Some(s) = acq_start {
+            self.esc_prof.acquires += leases.iter().flatten().count() as u64;
+            self.esc_prof.acquire_dur += s.elapsed();
+        }
+        // 이후 어느 경로로 빠져도 전 lease를 반납한다(짝맞춤). 매크로 대신 클로저 불가
+        // (borrow) — 반환 직전마다 아래 블록을 복붙하지 말고 flow를 단일 출구로 유지한다.
+
+        // ── 2) 더티 판정(순수 함수) + Present 스킵 ──
+        let mut force_full = self.canvas.as_ref().map_or(true, |c| !c.content_attached);
+        let any_lease = leases.iter().any(Option::is_some);
+        let dirty = canvas_dirty_rects(&self.canvas_prev_rects, &frame_items);
+        let mut proceed = !dirty.is_empty() || (force_full && any_lease);
+
+        // ── 3) 캔버스 보장(창 크기·드래그 중 재생성 억제 — §3-y 정합) ──
+        if proceed {
+            let s = rc.size2d();
+            let target = DeviceIntSize::new(s.width as i32, s.height as i32);
+            let resize_active = rc.dcomp_resize_active();
+            // 드래그 중(resize_active)엔 크기 불일치여도 기존 캔버스 유지(재생성 억제,
+            // §3-y 정합). 스왑체인이 아예 없으면(최초/생성 실패) 드래그 중이라도 생성 시도.
+            let have_usable = self
+                .canvas
+                .as_ref()
+                .is_some_and(|c| c.swapchain.is_some() && (c.size == target || resize_active));
+            if !have_usable {
+                self.ensure_canvas(target);
+            }
+            force_full = force_full
+                || self.canvas.as_ref().map_or(true, |c| !c.content_attached);
+            proceed = self
+                .canvas
+                .as_ref()
+                .is_some_and(|c| c.swapchain.is_some());
+        }
+
+        // ── 4) 클리어 + 전량 draw + Present1 (proceed일 때만) ──
+        let mut drawn_ok: Vec<bool> = vec![false; frame_items.len()];
+        let mut presented = false;
+        if proceed {
+            // begin_batch: 이번 프레임 overlay가 이미 열었을 수 있음(재사용). convert_pass /
+            // ctx1은 위에서 존재 확인 완료.
+            let ctx1_ptr = self.d3d11_context1.as_ref().unwrap().as_ptr();
+            if !self.external_batch_active {
+                // Safety: 살아있는 컨텍스트/패스.
+                unsafe { self.convert_pass.as_mut().unwrap().begin_batch(ctx1_ptr) };
+                self.external_batch_active = true;
+                if prof_on {
+                    self.esc_prof.batch_swaps += 1;
+                }
+            }
+            let canvas = self.canvas.as_mut().unwrap();
+            let swapchain_ptr = canvas.swapchain.as_ref().unwrap().as_ptr();
+            let canvas_size = canvas.size;
+            // Safety: 살아있는 스왑체인. GetBuffer(0) → RTV 캐시(백버퍼 포인터 키).
+            unsafe {
+                let mut back: *mut ID3D11Texture2D = ptr::null_mut();
+                let hr = (*swapchain_ptr).GetBuffer(
+                    0,
+                    &ID3D11Texture2D::uuidof(),
+                    &mut back as *mut _ as *mut _,
+                );
+                if hr >= 0 && !back.is_null() {
+                    let back_key = back as usize;
+                    if !canvas.rtv_cache.contains_key(&back_key) {
+                        let mut raw: *mut ID3D11RenderTargetView = ptr::null_mut();
+                        let hr = (*self.d3d11_device).CreateRenderTargetView(
+                            back as *mut ID3D11Resource,
+                            ptr::null(),
+                            &mut raw,
+                        );
+                        if hr >= 0 && !raw.is_null() {
+                            if let Some(owned) = ComOwned::from_raw(raw) {
+                                canvas.rtv_cache.insert(back_key, owned);
+                            }
+                        }
+                    }
+                    if let Some(rtv) = canvas.rtv_cache.get(&back_key).map(|c| c.as_ptr()) {
+                        // 전체 투명 클리어(전량 재드로우 전제 — catch-up 불요 근거, 스펙 §5.3).
+                        (*ctx1_ptr).ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
+                        let c_start = if prof_on { Some(std::time::Instant::now()) } else { None };
+                        let cp = self.convert_pass.as_mut().unwrap();
+                        for (i, it) in frame_items.iter().enumerate() {
+                            let Some(lease) = leases[i].as_ref() else { continue };
+                            let w = (it.rect.max.x - it.rect.min.x).max(0) as u32;
+                            let h = (it.rect.max.y - it.rect.min.y).max(0) as u32;
+                            if w == 0 || h == 0 {
+                                continue;
+                            }
+                            drawn_ok[i] =
+                                cp.convert_to_rect(ctx1_ptr, lease, rtv, it.rect.min.x, it.rect.min.y, w, h);
+                        }
+                        if let Some(s) = c_start {
+                            self.esc_prof.converts += frame_items.len() as u64;
+                            self.esc_prof.convert_dur += s.elapsed();
+                            self.esc_prof.srv_creates +=
+                                leases.iter().flatten().map(|l| l.plane_count.min(3) as u64).sum::<u64>();
+                        }
+                        // Present1: 재생성 직후(force_full)는 힌트 없이 전체(빈 슬라이스 → 헬퍼가 전체 처리).
+                        let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
+                        presented = if force_full {
+                            present1_with_dirty(swapchain_ptr, canvas_size, &[])
+                        } else {
+                            present1_with_dirty(swapchain_ptr, canvas_size, &dirty)
+                        };
+                        if let Some(s) = p_start {
+                            self.esc_prof.presents += 1;
+                            self.esc_prof.present_dur += s.elapsed();
+                        }
+                        if presented && !canvas.content_attached {
+                            // 첫 성공 Present 후 SetContent 1회 — end_frame Commit 전 완결(원자성).
+                            let hr = (*canvas.visual.as_ptr())
+                                .SetContent(swapchain_ptr as *const IUnknown);
+                            if hr >= 0 {
+                                canvas.content_attached = true;
+                                if dcomp_debug() {
+                                    log::info!("[dcomp-dbg] canvas content-attach");
+                                }
+                            } else if !self.warned_canvas_fail {
+                                warn!("[dcomp-native] canvas SetContent failed (hr=0x{:08x})", hr as u32);
+                                self.warned_canvas_fail = true;
+                            }
+                        }
+                        if dcomp_debug() && canvas.frames_logged < 5 {
+                            canvas.frames_logged += 1;
+                            log::info!(
+                                "[dcomp-dbg] canvas present items={} dirty={} full={} size={}x{}",
+                                frame_items.len(), dirty.len(), force_full,
+                                canvas_size.width, canvas_size.height
+                            );
+                        }
+                    }
+                    (*(back as *mut IUnknown)).Release();
+                }
+            }
+        }
+
+        // ── 5) 성공 시 부기 갱신: last_presented(세대 dedup) + prev_rects ──
+        if presented {
+            for (i, it) in frame_items.iter().enumerate() {
+                if drawn_ok[i] {
+                    if let Some(lease) = leases[i].as_ref() {
+                        if let Some(SurfaceStorage::External(ext)) =
+                            self.surfaces.get_mut(&it.id).map(|e| &mut e.storage)
+                        {
+                            ext.last_presented = Some((lease.ring_id, lease.frame_seq));
+                        }
+                    }
+                }
+            }
+            self.canvas_prev_rects.clear();
+            for (i, it) in frame_items.iter().enumerate() {
+                self.canvas_prev_rects.insert(it.id, (it.rect, drawn_ok[i]));
+            }
+        }
+
+        // ── 6) release 짝맞춤(모든 경로 공통 단일 출구) ──
+        for lease in leases.iter().flatten() {
+            provider.release(&*rc, lease.ring_id);
         }
     }
 
@@ -2314,6 +2641,9 @@ impl Compositor for DCompNativeCompositor {
         }
         // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
         self.frame_surfaces.clear();
+        // 공유 캔버스: 이번 프레임 기록 초기화(underlay/overlay 판정 포함).
+        self.content_seen = false;
+        self.frame_canvas_items.clear();
     }
 
     fn add_surface(
@@ -2335,6 +2665,10 @@ impl Compositor for DCompNativeCompositor {
             self.add_external_surface(id, transform, clip_rect, rounded_clip_radii);
             return;
         }
+
+        // 공유 캔버스 underlay/overlay 판정: 콘텐츠(비-external) 서피스가 등장한 뒤에 오는
+        // external은 overlay다(WR add_surface는 underlay→콘텐츠→overlay z순, 스펙 §5.1).
+        self.content_seen = true;
 
         // 월 시나리오는 scale=1·직사각 클립만 발생 예상 — 벗어나면 1회만 warn(스펙 §비범위).
         if (transform.scale.x - 1.0).abs() > f32::EPSILON ||
@@ -2422,6 +2756,10 @@ impl Compositor for DCompNativeCompositor {
         _dirty_rects: &[DeviceIntRect],
         _opaque_rects: &[DeviceIntRect],
     ) {
+        // 공유 캔버스 플러시: add_surface 루프의 모든 underlay 기록 뒤·타일 GL 앞인 여기가
+        // 정확한 지점이다(close_external_batch 주석의 근거와 동일). 배치를 쓸 수 있게
+        // close보다 먼저 호출한다.
+        self.canvas_flush();
         // ★external convert 배치를 닫는 정본 위치. WR 렌더러는 composite_native(add_surface 루프)
         // 직후 start_compositing을 부르고, 그 '뒤'에 draw_frame의 passes 루프가 picture-cache 타일을
         // compositor.bind로 GL 렌더한다(webrender 0.68 renderer/mod.rs: :6667 루프 → :6677 이 콜 →
@@ -2951,7 +3289,27 @@ impl Compositor for DCompNativeCompositor {
         //  (3) virtual/device 좌표 이중성이 만드는 결함 표면적을 통째로 제거한다.
         // 따라서 add_surface가 기록한 z-order(아래→위) 그대로, 컬 없이 전부 합성한다.
         if let Some(root) = self.root_visual_ptr() {
+            let mut canvas_added = false;
             for id in self.frame_surfaces.iter() {
+                // 공유 캔버스 underlay id → per-video 비주얼 대신 캔버스 비주얼을 최초
+                // 1회(=최하단 위치)만 추가한다. add 순서가 z이므로 최초 underlay 위치 삽입이
+                // 전체 순서를 보존한다(스펙 §5.2).
+                if self.canvas_mode && self.frame_canvas_items.iter().any(|(cid, _)| cid == id) {
+                    if !canvas_added {
+                        canvas_added = true;
+                        if let Some(canvas) = self.canvas.as_ref() {
+                            if canvas.content_attached {
+                                let hr = unsafe {
+                                    (*root).AddVisual(canvas.visual.as_ptr(), FALSE, ptr::null())
+                                };
+                                if hr < 0 {
+                                    warn!("[dcomp-native] canvas AddVisual failed (hr=0x{:08x})", hr as u32);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let Some(entry) = self.surfaces.get(id) else { continue; };
                 // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
                 // insertAbove 인자는 MS 문서(IDCompositionVisual::AddVisual Remarks)의
