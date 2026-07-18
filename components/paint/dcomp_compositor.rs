@@ -614,35 +614,7 @@ fn self_copy_catchup(
 
 /// Present1 + DirtyRects 힌트(스펙 §5.2-3). 16 초과·공집합이면 힌트 없이 전체.
 fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
-    // 클램프 먼저, 그 결과가 퇴화(폭/높이 0 이하)면 스킵 — self_copy_catchup과 동일 순서.
-    // (완전히 버퍼 밖인 렉트가 클램프 후 퇴화 RECT로 Present1에 전달되는 것을 방지.)
-    let rects: Vec<RECT> = dirty
-        .iter()
-        .filter_map(|r| {
-            let left = r.min.x.max(0);
-            let top = r.min.y.max(0);
-            let right = r.max.x.min(sc.size.width);
-            let bottom = r.max.y.min(sc.size.height);
-            if right <= left || bottom <= top {
-                return None;
-            }
-            Some(RECT { left, top, right, bottom })
-        })
-        .collect();
-    let use_hint = !rects.is_empty() && rects.len() <= MAX_PRESENT_DIRTY_RECTS;
-    let params = DXGI_PRESENT_PARAMETERS {
-        DirtyRectsCount: if use_hint { rects.len() as u32 } else { 0 },
-        pDirtyRects: if use_hint { rects.as_ptr() as *mut RECT } else { ptr::null_mut() },
-        pScrollRect: ptr::null_mut(),
-        pScrollOffset: ptr::null_mut(),
-    };
-    // Safety: 살아있는 스왑체인. SyncInterval 0 = 기존 Present와 동일 페이싱.
-    let hr = unsafe { (*sc.swapchain.as_ptr()).Present1(0, 0, &params) };
-    if hr < 0 {
-        warn!("[dcomp-native] Present1 failed (hr=0x{:08x})", hr as u32);
-        return false;
-    }
-    true
+    present1_with_dirty(sc.swapchain.as_ptr(), sc.size, dirty)
 }
 
 /// §6.2-1: 승격 후 스왑체인 buffer 0에 그려진 적 있는 영역을 fallback_virtual로 복사해
@@ -939,6 +911,86 @@ struct ExternalStorage {
 /// 순수 함수 — TDD 대상(tests::external_needs_present_dedups_by_ring_and_seq).
 fn external_needs_present(last: Option<(u64, u64)>, ring_id: u64, seq: u64) -> bool {
     last != Some((ring_id, seq))
+}
+
+/// 공유 캔버스(스펙 2026-07-18 §5.3)의 이번 프레임 underlay 항목. add 순서 = draw 순서 = z.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct CanvasFrameItem {
+    id: NativeSurfaceId,
+    rect: DeviceIntRect,
+    /// 이번 lease가 지난 Present와 다른 세대인가(external_needs_present 판정 결과).
+    updated: bool,
+    /// lease 확보 성공 여부. false = 이번 프레임 이 자리는 투명 구멍(해체 경합 등).
+    drawable: bool,
+}
+
+/// 공유 캔버스 Present1 더티 렉트 계산(순수 함수 — TDD 대상). prev = 지난 '표시된' 프레임의
+/// id → (rect, draw 성공 여부). 규칙(스펙 §5.3): ①세대 갱신 ②rect 이동/크기 변경(옛+새)
+/// ③draw 성공↔실패 전이(구멍 생성/복구) ④신규 등장 ⑤소멸(옛 자리 투명 전환).
+/// 공집합 = 캔버스 무접촉(Present 스킵). 전량 재드로우 전제라 이 힌트가 정합하다:
+/// 무갱신 비디오는 같은 소스 프레임을 재드로우해 픽셀 동일이 보장된다.
+#[allow(dead_code)]
+fn canvas_dirty_rects(
+    prev: &FxHashMap<NativeSurfaceId, (DeviceIntRect, bool)>,
+    current: &[CanvasFrameItem],
+) -> Vec<DeviceIntRect> {
+    let mut dirty = Vec::new();
+    for it in current {
+        match prev.get(&it.id) {
+            None => dirty.push(it.rect),
+            Some((old, _)) if *old != it.rect => {
+                dirty.push(*old);
+                dirty.push(it.rect);
+            },
+            Some((_, was_drawn)) if *was_drawn != it.drawable => dirty.push(it.rect),
+            Some(_) if it.updated => dirty.push(it.rect),
+            Some(_) => {},
+        }
+    }
+    for (id, (old, _)) in prev.iter() {
+        if !current.iter().any(|it| it.id == *id) {
+            dirty.push(*old);
+        }
+    }
+    dirty
+}
+
+/// Present1 + DirtyRects 힌트(스펙 §5.2-3). 16 초과·공집합이면 힌트 없이 전체.
+/// 콘텐츠 스왑체인(present1_partial)과 공유 캔버스(canvas_flush)가 공용.
+#[allow(dead_code)]
+fn present1_with_dirty(
+    swapchain: *mut IDXGISwapChain1,
+    size: DeviceIntSize,
+    dirty: &[DeviceIntRect],
+) -> bool {
+    let rects: Vec<RECT> = dirty
+        .iter()
+        .filter_map(|r| {
+            let left = r.min.x.max(0);
+            let top = r.min.y.max(0);
+            let right = r.max.x.min(size.width);
+            let bottom = r.max.y.min(size.height);
+            if right <= left || bottom <= top {
+                return None;
+            }
+            Some(RECT { left, top, right, bottom })
+        })
+        .collect();
+    let use_hint = !rects.is_empty() && rects.len() <= MAX_PRESENT_DIRTY_RECTS;
+    let params = DXGI_PRESENT_PARAMETERS {
+        DirtyRectsCount: if use_hint { rects.len() as u32 } else { 0 },
+        pDirtyRects: if use_hint { rects.as_ptr() as *mut RECT } else { ptr::null_mut() },
+        pScrollRect: ptr::null_mut(),
+        pScrollOffset: ptr::null_mut(),
+    };
+    // Safety: 살아있는 스왑체인. SyncInterval 0 = 기존 Present와 동일 페이싱.
+    let hr = unsafe { (*swapchain).Present1(0, 0, &params) };
+    if hr < 0 {
+        warn!("[dcomp-native] Present1 failed (hr=0x{:08x})", hr as u32);
+        return false;
+    }
+    true
 }
 
 /// add_surface가 마지막으로 기록한 배치(WR device 좌표). content-swap 시 같은 Commit에서
@@ -3234,5 +3286,61 @@ mod tests {
         let many: Vec<DeviceIntRect> = (0..40).map(|i| r(i * 2, 0, i * 2 + 1, 1)).collect();
         let out = collapse_dirty_if_oversized(many, 32);
         assert_eq!(out, vec![r(0, 0, 79, 1)]);
+    }
+
+    #[test]
+    fn canvas_dirty_updated_and_new_items() {
+        let r = |x: i32| DeviceIntRect::from_origin_and_size(
+            DeviceIntPoint::new(x, 0), DeviceIntSize::new(10, 10));
+        let mut prev = FxHashMap::default();
+        prev.insert(NativeSurfaceId(1), (r(0), true));
+        let current = vec![
+            // id1: 자리·draw상태 동일, 세대 갱신 → rect 1건
+            CanvasFrameItem { id: NativeSurfaceId(1), rect: r(0), updated: true, drawable: true },
+            // id2: 신규 등장 → rect 1건
+            CanvasFrameItem { id: NativeSurfaceId(2), rect: r(20), updated: false, drawable: true },
+        ];
+        let dirty = canvas_dirty_rects(&prev, &current);
+        assert_eq!(dirty, vec![r(0), r(20)]);
+    }
+
+    #[test]
+    fn canvas_dirty_moved_rect_includes_old_and_new() {
+        let r = |x: i32| DeviceIntRect::from_origin_and_size(
+            DeviceIntPoint::new(x, 0), DeviceIntSize::new(10, 10));
+        let mut prev = FxHashMap::default();
+        prev.insert(NativeSurfaceId(1), (r(0), true));
+        let current = vec![
+            // 이동(스케일/이동 애니): 세대 무갱신이어도 옛 자리+새 자리 둘 다 더티
+            CanvasFrameItem { id: NativeSurfaceId(1), rect: r(5), updated: false, drawable: true },
+        ];
+        assert_eq!(canvas_dirty_rects(&prev, &current), vec![r(0), r(5)]);
+    }
+
+    #[test]
+    fn canvas_dirty_vacated_and_draw_state_transition() {
+        let r = |x: i32| DeviceIntRect::from_origin_and_size(
+            DeviceIntPoint::new(x, 0), DeviceIntSize::new(10, 10));
+        let mut prev = FxHashMap::default();
+        prev.insert(NativeSurfaceId(1), (r(0), true));  // 소멸 예정
+        prev.insert(NativeSurfaceId(2), (r(20), false)); // 지난 프레임 draw 실패(구멍)
+        let current = vec![
+            // id2: 같은 자리·세대 무갱신이지만 draw 가능 전이 → 구멍 복구 위해 더티
+            CanvasFrameItem { id: NativeSurfaceId(2), rect: r(20), updated: false, drawable: true },
+        ];
+        // id1 소멸 → 옛 자리(투명 전환) 더티. 순서: current 규칙들 먼저, 소멸분 나중.
+        assert_eq!(canvas_dirty_rects(&prev, &current), vec![r(20), r(0)]);
+    }
+
+    #[test]
+    fn canvas_dirty_empty_when_nothing_changed() {
+        let r = DeviceIntRect::from_origin_and_size(
+            DeviceIntPoint::new(0, 0), DeviceIntSize::new(10, 10));
+        let mut prev = FxHashMap::default();
+        prev.insert(NativeSurfaceId(1), (r, true));
+        let current = vec![
+            CanvasFrameItem { id: NativeSurfaceId(1), rect: r, updated: false, drawable: true },
+        ];
+        assert!(canvas_dirty_rects(&prev, &current).is_empty());
     }
 }
