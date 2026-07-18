@@ -3067,6 +3067,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_video_escape_token_accepts_canvas() {
+        use paint_api::rendering_context::{parse_video_escape_token, VideoEscapeMode};
+        assert_eq!(parse_video_escape_token(Some("canvas")), VideoEscapeMode::Canvas);
+        // 기존 값 무변경 보증
+        assert_eq!(parse_video_escape_token(Some("native")), VideoEscapeMode::Native);
+        assert_eq!(parse_video_escape_token(Some("external")), VideoEscapeMode::External);
+        assert_eq!(parse_video_escape_token(Some("bogus")), VideoEscapeMode::Off);
+        assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);
+    }
+
+    #[test]
     fn tile_virtual_rect_positions_tiles_on_grid() {
         let vo = DeviceIntPoint::new(16384, 16384);
         let ts = DeviceIntSize::new(1024, 512);

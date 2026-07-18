@@ -769,7 +769,8 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
                 paint_api::rendering_context::VideoEscapeMode::Native => {
                     common.flags |= PrimitiveFlags::PREFER_COMPOSITOR_SURFACE;
                 },
-                paint_api::rendering_context::VideoEscapeMode::External => {
+                paint_api::rendering_context::VideoEscapeMode::External |
+                paint_api::rendering_context::VideoEscapeMode::Canvas => {
                     common.flags |= PrimitiveFlags::PREFER_COMPOSITOR_SURFACE |
                         PrimitiveFlags::SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE;
                 },

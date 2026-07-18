@@ -53,18 +53,22 @@ pub fn dcomp_native_compositor_requested() -> bool {
     false
 }
 
-/// `SERVO_VIDEO_ESCAPE` 게이트 모드. Native=PREFER만(C 단계), External=PREFER|SUPPORTS(최종).
+/// `SERVO_VIDEO_ESCAPE` 게이트 모드. Native=PREFER만(C 단계), External=PREFER|SUPPORTS(최종),
+/// Canvas=External과 동일 플래그 + 컴포지터가 underlay를 공유 캔버스 1스왑체인으로 합침
+/// (스펙 2026-07-18-shared-video-canvas-design.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoEscapeMode {
     Off,
     Native,
     External,
+    Canvas,
 }
 
 pub fn parse_video_escape_token(value: Option<&str>) -> VideoEscapeMode {
     match value {
         Some("native") => VideoEscapeMode::Native,
         Some("external") => VideoEscapeMode::External,
+        Some("canvas") => VideoEscapeMode::Canvas,
         _ => VideoEscapeMode::Off,
     }
 }
