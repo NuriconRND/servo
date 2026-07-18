@@ -10,20 +10,27 @@
 # (Servo does not load @font-face web fonts, cannot select weights within a family,
 #  and fails to name-match the installed "Malgun Gothic" — measured 2026-07-18.)
 #
-# AMD 3-way A/B (performance read-out; use the PURE wall page, complex pages are for
-# correctness only — native mode has a known PiP/alpha-overlay freeze, diagnostic only):
-#   1) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp                        (baseline hybrid)
-#   2) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape native    (content-pass win only)
-#   3) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape external  (full WR escape)
-# Read-out: 3>2>1 confirms the per-tile submission-overhead hypothesis. Compare GPU%
-# of 1 vs 3 (DWM visual-count cost). external does NOT need -TileSize (A/B showed no
-# difference once video leaves the WR content pass).
+# AMD 4-way A/B (performance read-out; use the PURE wall page, complex pages are for
+# correctness only — native mode has a known PiP/alpha-overlay freeze, diagnostic ONLY,
+# never for production/complex pages):
+#   1) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp                           (baseline)
+#   2) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape native       (diagnostic ONLY - do not use for PiP/complex pages)
+#   3) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape external     (per-video swapchains - N Presents/frame)
+#   4) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape canvas       (shared canvas - 1 Present/frame, RECOMMENDED)
 #
-# fps-cliff investigation (external, tile-count sweep): set $env:SERVO_VIDEO_ESCAPE_PROF='1'
-# before the run; the log then carries 1 Hz lines like
-#   [vesc-prof] frames=.. converts=.. presents=.. acquire_ms=.. convert_ms=.. present_ms=..
-# Collect 3-4 lines per tile count (e.g. 30 vs 36). If present_ms explodes with count,
-# the per-swapchain Present serialization is the cliff (next step: shared video canvas).
+# Readout (set $env:SERVO_VIDEO_ESCAPE_PROF='1' for 1 Hz [vesc-prof] lines: frames=..
+# converts=.. presents=.. acquire_ms=.. convert_ms=.. present_ms=..):
+#   - Key A/B is (3) vs (4): if (4) recovers fps at 36+ tiles while (3) collapses,
+#     the Present-per-swapchain serialization diagnosis (confirmed on A5000: AMD Present
+#     cost is superlinear in swapchain count, 0.67ms->1.0ms/Present from 30->36 tiles,
+#     renderer thread up to 75% inside Present = GPU starvation) is reproduced on AMD too;
+#     present_ms should drop to near zero in (4) — compare GPU% too.
+#   - (4) uses ONE window-size swapchain for all underlay videos: PresentMon should show
+#     2 unique swapchains total (canvas + content) instead of N+1 in (3).
+#   - -TileSize tuning is NOT needed for external/canvas modes (video already left the WR
+#     content/picture-cache pass).
+#   - Recommended operating recipe once (4) is confirmed on AMD: -DComp -VideoEscape canvas
+#     (external stays available as a diagnostic/fallback lever).
 
 param(
     [int]    $Cols = 8,

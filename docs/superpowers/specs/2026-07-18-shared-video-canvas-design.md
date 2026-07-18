@@ -114,3 +114,60 @@ VideoConvertPass에 dest-rect 변형 추가: RSSetViewports(+scissor)를 dest re
 - Present1 더티 힌트는 월에서 사실상 항상 전체(45>16) — 월의 이득은 힌트가 아니라 Present 횟수 소멸에서 나온다(설계 의도와 일치). 힌트 이득은 복합 페이지 한정.
 - 전체 클리어 1회/프레임(4K RGBA) — GPU 클리어 고속 경로라 사소 예상. AMD 실측에서 유의미하면 "불투명 월 감지 시 클리어 생략" 후속 레버.
 - 렌더러 스레드의 2단계 acquire 45회/프레임 — 현행과 동수(위치만 add_surface→end_frame 이동), 신규 비용 아님.
+
+## 11. 구현 결과 (2026-07-18)
+
+전 태스크 완료 — 완료 기준(§2) 개발기(A5000) 몫 전부 충족. AMD 실측(4자 A/B)은 사용자 몫으로 이월(설계 의도).
+
+### 11.1 커밋 체인
+
+| 커밋 | 내용 |
+|---|---|
+| `0cd50e631` | 계획 정리 — `canvas_flush` 도달 불가 방어 분기 제거(드래그 중 무스왑체인이면 생성 허용으로 단순화) |
+| `a87059126` | Task 1 — 게이트 `VideoEscapeMode::Canvas`(`SERVO_VIDEO_ESCAPE=canvas`, 레이아웃 프로모션 플래그는 external과 동일) |
+| `82ed73cb4` | Task 2 — `VideoConvertPass::convert_to_rect`(dest-rect 부분 뷰포트 draw, RSSetViewports+scissor) + WARP E2E, 기존 `convert()`를 신규 경로로 위임하는 리팩토링 포함 |
+| `9e0588b97` | Task 3 — `canvas_dirty_rects` 순수 함수(더티 판정 ①~④) + `present1_with_dirty` Present1 헬퍼 일반화 |
+| `a38b6a44a` | Task 4 — `canvas_flush` 본체: underlay external 일괄 draw + Present1 1회, 캔버스 비주얼 트리 최하단 z 치환, 드래그 중(`resize_active`) 재생성 억제 |
+| `58822215f` | Task 5 — A5000 런타임 검증 배터리 기록(6 스텝 전부 PASS) |
+
+선행(이번 사이클 착수 전, 참고): `f7423143c`(AMD vesc-prof 판독 — Present×N 직렬화 확정, 본 설계의 착수 근거) → `9b96a8cab`(스펙 승인) → `542db02b0`(계획 승인).
+
+### 11.2 스펙 대비 이탈
+
+① **Task 5 결과 기록물의 리포 편입 방식 이탈**: 계획 문면은 "리포트 커밋"을 전제했으나, 이번 사이클은 리포 관례(전 사이클 이후 확립)에 따라 `.superpowers/sdd/canvas-task-5-report.md`를 비추적 스크래치로 남기고, 기록 자체는 원장 커밋(`58822215f`, progress.md 갱신)으로 갈음했다. 검증 내용·판정에는 영향 없음 — 커밋 대상 산출물의 형태만 계획 문면과 다르다.
+
+② **검증 커맨드 결함 2건 발견(계획/브리프 문서 결함, 코드 무관, Task 5에서 실측 확인)**:
+  - `complex_media_stress.html`/`complex_media_transforms.html`을 `-Cols 3 -Rows 3`으로 축소 실행하면 실제 비디오 수는 9그리드+PiP=10개다(브리프의 `-Sync 13`은 미지정 시 기본 `COLS=4` 그리드 12+PiP=13 기준). `-Sync 13`으로 그대로 실행하면 t+31s경 `Sync group timeout: releasing 10 of 13 pipelines` WARN이 1회 발생하지만 자기 복구형이며 이후 재생·lockstep에 부작용은 없다. 축소 그리드 재현 시 `-Sync 10` 권장.
+  - `=surface` 진단 조합의 정확한 커맨드는 `-DComp -DCompSurface -VideoEscape canvas`이다(브리프 원문은 `-DCompSurface -VideoEscape canvas`로 `-DComp`가 누락). 누락된 채 실행하면 런처 내장 경고(`-DCompSurface requires -DComp; ignoring -DCompSurface (DComp stays off)`)와 함께 DComp 자체가 꺼진 채 실행되어 의도한 조합을 전혀 검증하지 못한다(Task 5에서 1차 시도로 실측 확인). `etc/multigpu/package_run_wall.ps1`/`run_video_wall_d3d11.ps1` 자체의 AMD A/B 헤더·`-VideoEscape` 주석에는 이 두 결함이 있는 커맨드가 애초에 실려 있지 않음을 확인했다(§11.5의 헤더 갱신은 처음부터 정확한 순수 월 커맨드만 사용).
+
+③ **Task 4 리뷰 Minor 인지 항목(코드 수정 없음, 실측으로 무영향 확인)**:
+  - 페이지 이탈→복귀 시 더티 힌트 규칙 ⑤(§5.3 ③ "등장/소멸")이 문면상 명시적으로 발동하지 않는 엣지가 있으나, 캔버스 비주얼이 트리에서 빠졌다 재추가되는 DComp Commit 자체가 전체 재합성을 유발해 실질적으로 커버됨 — Task 5 실측(45타일 lockstep, 복합 3종, 리사이즈/드래그)에서 이상 없음.
+  - `vesc-prof`의 `converts`/`srv_creates` 카운터는 스킵·실패한 항목도 계상해 실제 유효 변환보다 과대 표시될 수 있음(진단 전용 카운터, 계획 정본 코드 그대로 — 판정 로직에는 영향 없음, `converts = presents × N` 정합성 확인에는 지장 없음).
+
+④ 이번 사이클 자체에서 추가로 식별된 코드 결함·설계 이탈은 없음(①~③ 전부 문서/계획 결함이며 컴포지터 구현 코드는 스펙 §5 그대로). 아직 예정된 "최종 whole-branch 리뷰"(브랜치 전체 대상, Task 6 범위 밖)에서 추가 발견 시 후속 기록.
+
+### 11.3 검증 수치 (A5000, 전거: `.superpowers/sdd/canvas-task-5-report.md`)
+
+- **45타일 월**: `converts = presents × 45` 전 표본(6개) 정확 일치 — 프레임당 45비디오 전량 변환 후 캔버스 Present 1회라는 설계와 정합. `presents/frames` 비율 0.62~0.87(38~53 / 59~61, 더티 스킵으로 external의 프레임당 N Present 대비 극적 감소), `frames` 59~61(≈60fps 유지). 스크린샷 2매(5초 간격)에서 45/45 타일 카운터 완전 동일(±0) + 캡처 사이 재생 진행 확인.
+- **PresentMon**: 20초 캡처(1951행), 고유 `SwapChainAddress` **2개**(캔버스+콘텐츠, 설계 목표 46→2 실측 확인), `PresentMode` = `Composed: Flip` **1951/1951(100%)**.
+- **복합 3종 전부 PASS**: mixed_media_demo(6/6, `presents < frames` 재현) / complex_media_stress(9그리드+PiP, `canvas swapchain (re)create`=1, `external (re)create`=1 — PiP 오버레이 1개는 overlay 경로 그대로, sync-timeout WARN 1건은 §11.2②의 문서 결함) / complex_media_transforms(`canvas (re)create`=1 — **스케일 애니 구동 전 구간 포함 추가 재생성 0회**, 캔버스 스왑체인 처닝 소멸 확인; `external (re)create`=98은 overlay/이동·스케일 비디오의 기존 이월 결함으로 캔버스와 무관, 아래 §11.4 참조).
+- **리사이즈/드래그**: 편측 성장 40스텝(1100×620→1900×1420)에서 `canvas swapchain (re)create` 정확히 2회(①최초 생성 ②정착 후 1회), **드래그 구간(40스텝) 중 추가 재생성 0회**(억제 확인). winshot 클린 캡처로 정착 후 잔상/검정 밴드 0, lockstep 정확 확인.
+- **무회귀 4종 + WebGPU 월**: off / native(로그 기반 PASS, winshot 검정은 기지 사양) / external / `=surface`+canvas(§11.2②의 정정된 커맨드로 재실행 후 `dcomp=surface` 정상 진입) 전부 dcomp engaged=1, WARN 베이스라인 3종만, panic 0. WebGPU 다중 GPU 월(fanout+gpu-direct) 생존 확인, panic 0.
+- **30분 소크**: 45타일 유지, WS 4,980MB(0min)→5,158MB(20min, +3.6%, 단조 증가 아님)→3,264MB(25min, 로그 이벤트 0건의 OS working-set 트림으로 판정)→3,247MB(30min, 트림 후 안정). 소크 전 구간 **신규 WARN/ERROR 0건**, panic 0. 종료 시 실화면 캡처: 45타일 30fps lockstep **±0** 유지.
+
+### 11.4 이월 사항
+
+- **AMD 실기 4자 A/B(핵심 이월, 설계 의도대로 사용자 몫)**: `-DComp` / `-VideoEscape native`(진단 전용) / `-VideoEscape external` / `-VideoEscape canvas` — §11.5 인계 패키지의 헤더 가이드가 판독 절차 정본. 핵심 판독은 ③↔④(present_ms 소멸·GPU%·36+타일 fps 회복 여부)이며, 이것이 본 사이클의 존재 이유(§1 Present×N 직렬화 가설의 AMD 확증)다.
+- **overlay(PiP류) 비디오의 스왑체인 재생성 처닝** — 전 스펙(§12.4)에서 이미 이월된 결함이 이번 사이클에서도 재현 확인됨(complex_media_transforms, `external (re)create`=98/~30s). 캔버스는 underlay 전용이라 이 결함의 대상(overlay per-video 경로)을 건드리지 않음 — 범위 밖 유지, 근본수정은 별도 후속 과제.
+- **v1 부분 클립 압착 리스크**(전 스펙 §11/12.2③) — canvas도 external과 동일한 WR 프로모션·컷아웃 계약을 쓰므로 리스크 성격 무변경, 검증 페이지 전부 무클립이라 이번 사이클에서도 미발현.
+- **PiP `border-radius` 사각 클립 대체**(전 스펙 §12.2④) — overlay 경로 무변경이라 그대로 존속, 시각적 사소 저하.
+- **native 모드 PiP 동결 결함**(전 스펙 §12.2⑤) — 근본수정 미착수, "진단 전용" 캐비앗으로 계속 우회. canvas는 external과 마찬가지로 이 결함 층(WR draw)을 타지 않음(설계상 자연 우회, 별도 검증 없음 — native만의 결함이므로).
+- **페이싱 우회(media 스레드 직접 Present)**(§3 비범위) — 이번 사이클로 Present×N 자체가 소멸했으므로, AMD 실측에서 canvas 채택 후에도 페이싱 잔존 고정비가 지배적이면 그때 재평가(§9 C안 기각 사유와 별개로, WR 프레임빌드 고정비 자체는 canvas로 해소되지 않음).
+- **불투명 월 감지 시 전체 클리어 생략 레버**(§10 리스크 3번째 항목) — A5000에서 클리어 비용이 관측 가능한 병목으로 드러나지 않아 착수 보류, AMD 실측에서 유의미하면 후속.
+
+### 11.5 인계물
+
+- `D:\ServoWallPackage\run_wall.ps1`(`etc/multigpu/package_run_wall.ps1`에서 재복사): `-VideoEscape canvas` 스위치 지원 + 헤더가 AMD **4자** A/B 절차(영어)로 갱신 — `(1) -DComp` 기준 / `(2) native`(진단 전용 캐비앗 명문화) / `(3) external`(N Presents/frame) / `(4) canvas`(1 Present/frame, RECOMMENDED), 핵심 판독 ③↔④(present_ms·GPU%·36+타일 fps), PresentMon 2 스왑체인 기대치, TileSize 불요 결론 포함.
+- `etc/multigpu/run_video_wall_d3d11.ps1`의 `-VideoEscape` 파라미터 주석에 `canvas` 값 설명 추가(개발환경 런처도 패키지와 동일 스위치 사용 가능).
+- `D:\ServoWallPackage.zip` 재생성(servoshell.exe + run_wall.ps1 교체, 나머지 리소스/테스트 페이지 무변경) — 크기/스모크 결과는 `.superpowers/sdd/task-6-report.md` 참조.
+- **방법론 노트**: 캔버스 스왑체인도 flip 스왑체인이라 BitBlt/winshot 캡처 가능(external과 동일 특성 유지 — native/hybrid 서피스만 검정 캡처).

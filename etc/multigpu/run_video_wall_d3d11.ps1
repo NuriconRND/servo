@@ -30,16 +30,22 @@ param(
     # results with that in mind. -DCompSurface without -DComp is a no-op (warns and is
     # ignored; DComp stays off).
     [switch] $DCompSurface,
-    # Video WR-escape gate (spec docs/superpowers/specs/2026-07-17-video-wr-escape-design.md).
+    # Video WR-escape gate (spec docs/superpowers/specs/2026-07-17-video-wr-escape-design.md,
+    # canvas mode: docs/superpowers/specs/2026-07-18-shared-video-canvas-design.md).
     # Only takes effect when -DComp is also set (SERVO_COMPOSITOR_DCOMP=1|surface); layout
     # reads this only after confirming the DComp gate itself is on. "native" = C-stage:
     # sets PREFER_COMPOSITOR_SURFACE only (WR still draws the video, but to its own
     # dedicated surface -- promotion-behavior/AMD diagnostic lever, no compositor change
-    # yet). "external" = final A-stage: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE
-    # (video escapes the WR content pass to a compositor-owned external surface). Empty
-    # (default) = off, no flags set, display list byte-identical to pre-this-project.
-    # Same set-or-clear convention as -DComp/-TileSize above (stale env cleared when
-    # omitted).
+    # yet; diagnostic ONLY, has a known PiP/alpha-overlay freeze on complex pages).
+    # "external" = A-stage: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE (video escapes
+    # the WR content pass to a compositor-owned external surface, one flip swapchain per
+    # video -- N Presents/frame). "canvas" = final stage: same layout flags as external, but
+    # all underlay (opaque, unmasked) external videos share ONE window-size compositor
+    # swapchain with a single Present/frame (overlay videos, e.g. PiP, keep their own
+    # per-video swapchain unchanged) -- fixes the AMD Present-per-swapchain serialization
+    # cliff at high tile counts; RECOMMENDED operating mode. Empty (default) = off, no flags
+    # set, display list byte-identical to pre-this-project. Same set-or-clear convention as
+    # -DComp/-TileSize above (stale env cleared when omitted).
     [string] $VideoEscape = "",
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets
