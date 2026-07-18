@@ -770,17 +770,14 @@ Run: `cargo check -p servo-paint --features paint_api/no-wgl` → 필드 미사�
             let s = rc.size2d();
             let target = DeviceIntSize::new(s.width as i32, s.height as i32);
             let resize_active = rc.dcomp_resize_active();
+            // 드래그 중(resize_active)엔 크기 불일치여도 기존 캔버스 유지(재생성 억제,
+            // §3-y 정합). 스왑체인이 아예 없으면(최초/생성 실패) 드래그 중이라도 생성 시도.
             let have_usable = self
                 .canvas
                 .as_ref()
                 .is_some_and(|c| c.swapchain.is_some() && (c.size == target || resize_active));
             if !have_usable {
-                if resize_active && self.canvas.as_ref().is_some_and(|c| c.swapchain.is_some()) {
-                    // 드래그 중 + 크기 불일치: 기존 캔버스 유지(위 have_usable=true라 도달 불가,
-                    // 방어적 분기 — 삭제하지 말 것).
-                } else {
-                    self.ensure_canvas(target);
-                }
+                self.ensure_canvas(target);
             }
             force_full = force_full
                 || self.canvas.as_ref().map_or(true, |c| !c.content_attached);
