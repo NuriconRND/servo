@@ -1970,7 +1970,7 @@ mod test {
     }
 
     #[test]
-    fn video_escape_token_parses_native_external_only() {
+    fn video_escape_token_parses_known_modes() {
         use super::{VideoEscapeMode, parse_video_escape_token};
         assert_eq!(
             parse_video_escape_token(Some("native")),
@@ -1979,6 +1979,10 @@ mod test {
         assert_eq!(
             parse_video_escape_token(Some("external")),
             VideoEscapeMode::External
+        );
+        assert_eq!(
+            parse_video_escape_token(Some("canvas")),
+            VideoEscapeMode::Canvas
         );
         assert_eq!(parse_video_escape_token(Some("1")), VideoEscapeMode::Off); // 미정의 값은 off
         assert_eq!(parse_video_escape_token(Some("")), VideoEscapeMode::Off);

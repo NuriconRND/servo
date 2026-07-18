@@ -146,6 +146,11 @@ VideoConvertPass에 dest-rect 변형 추가: RSSetViewports(+scissor)를 dest re
 
 ④ 이번 사이클 자체에서 추가로 식별된 코드 결함·설계 이탈은 없음(①~③ 전부 문서/계획 결함이며 컴포지터 구현 코드는 스펙 §5 그대로). 아직 예정된 "최종 whole-branch 리뷰"(브랜치 전체 대상, Task 6 범위 밖)에서 추가 발견 시 후속 기록.
 
+문면 이탈 3건(최종 whole-branch 리뷰에서 식별, 전부 타당한 방향 — 구현이 정본):
+⑤ 캔버스 플러시 지점은 §5.3 문면(end_frame)이 아닌 **start_compositing**(close_external_batch 직전) — external 배치가 타일 GL 전에 닫혀야 하는 ANGLE 상태 규율(close_external_batch 앵커)과 동일 근거로 이쪽이 정확한 자리다.
+⑥ lease 보유는 "draw 루프 동안만"이 아니라 **Present1 완료까지**(per-video external 경로 선례와 동일, 링은 latest-wins라 writer 무간섭).
+⑦ §5.4의 "(+scissor)"와 달리 구현은 **viewport 전용**(래스터라이저 ScissorEnable FALSE — 풀스크린 삼각형은 뷰포트로 사상·클립되어 dest rect 밖 픽셀 무접촉, WARP E2E가 격리를 검증).
+
 ### 11.3 검증 수치 (A5000, 전거: `.superpowers/sdd/canvas-task-5-report.md`)
 
 - **45타일 월**: `converts = presents × 45` 전 표본(6개) 정확 일치 — 프레임당 45비디오 전량 변환 후 캔버스 Present 1회라는 설계와 정합. `presents/frames` 비율 0.62~0.87(38~53 / 59~61, 더티 스킵으로 external의 프레임당 N Present 대비 극적 감소), `frames` 59~61(≈60fps 유지). 스크린샷 2매(5초 간격)에서 45/45 타일 카운터 완전 동일(±0) + 캡처 사이 재생 진행 확인.
