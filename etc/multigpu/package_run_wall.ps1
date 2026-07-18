@@ -20,11 +20,12 @@
 #
 # Readout (set $env:SERVO_VIDEO_ESCAPE_PROF='1' for 1 Hz [vesc-prof] lines: frames=..
 # converts=.. presents=.. acquire_ms=.. convert_ms=.. present_ms=..):
-#   - Key A/B is (3) vs (4): if (4) recovers fps at 36+ tiles while (3) collapses,
-#     the Present-per-swapchain serialization diagnosis (confirmed on A5000: AMD Present
-#     cost is superlinear in swapchain count, 0.67ms->1.0ms/Present from 30->36 tiles,
-#     renderer thread up to 75% inside Present = GPU starvation) is reproduced on AMD too;
-#     present_ms should drop to near zero in (4) — compare GPU% too.
+#   - (3) vs (4) is the key A/B: the Present-per-swapchain serialization was measured on
+#     AMD hardware (Present cost superlinear 0.67ms->1.0ms from 30->36 tiles, renderer
+#     thread up to 75% inside Present = GPU starvation; A5000 shows ~0.17ms/Present and
+#     no symptom).
+#   - If (4) recovers fps at 36+ tiles while (3) collapses, canvas resolves it:
+#     present_ms should drop to near zero in (4); compare GPU% too.
 #   - (4) uses ONE window-size swapchain for all underlay videos: PresentMon should show
 #     2 unique swapchains total (canvas + content) instead of N+1 in (3).
 #   - -TileSize tuning is NOT needed for external/canvas modes (video already left the WR
