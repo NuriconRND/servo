@@ -5,7 +5,7 @@
 //! An event loop implementation that works in headless mode.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time;
 
 use log::warn;
@@ -153,6 +153,99 @@ impl WakeCoalescer {
     /// Whether a wake is currently owed a pump (read without clearing).
     pub(crate) fn requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
+    }
+}
+
+/// Runtime override that restores the pre-`WakeEdge` behavior of posting a `Waker` on every
+/// call, in case edge-triggering ever needs to be ruled out as a cause. Only the literal
+/// value `"1"` disables the gate; anything else (unset, `"0"`, `"true"`, ...) leaves it
+/// enabled. See [`WakeEdge`].
+pub(crate) const WAKE_EDGE_KILLSWITCH_ENV: &str = "SERVO_DISABLE_WAKE_EDGE";
+
+/// Pure killswitch predicate for [`WAKE_EDGE_KILLSWITCH_ENV`]. `token` is typically
+/// `std::env::var(WAKE_EDGE_KILLSWITCH_ENV).ok()`. Factored out from the env read so the
+/// "only literal 1" rule is unit-testable without touching process environment.
+pub(crate) fn wake_edge_suppressed(token: Option<&str>) -> bool {
+    token == Some("1")
+}
+
+/// Cached (read-once) killswitch state. `notify_new_frame_ready` is on the hottest path in
+/// the bug this exists to fix (up to ~20k calls/s during the storm described in
+/// pacing-investigation-report.md), so re-reading the environment on every call would be
+/// wasteful; the env var is a startup-time debug toggle and is not expected to change while
+/// the process is running.
+static WAKE_EDGE_KILLSWITCH: LazyLock<bool> =
+    LazyLock::new(|| wake_edge_suppressed(std::env::var(WAKE_EDGE_KILLSWITCH_ENV).ok().as_deref()));
+
+/// Edge-triggers the `event_loop_waker.wake()` posted from `notify_new_frame_ready` on a new
+/// frame-ready notification, instead of posting unconditionally on every notification.
+///
+/// This targets a different failure mode than [`WakeCoalescer`]: `WakeCoalescer` suppresses
+/// posts only while `is_animating()`; without an active `requestAnimationFrame` loop (e.g. a
+/// plain `<video>` grid) the webview never becomes "animating", so `WakeCoalescer` is a
+/// no-op and every `notify_new_frame_ready` posts a `Waker`. On Windows, posted messages
+/// outrank queued `WM_PAINT` in `PeekMessage` priority order, so a frame-ready notification
+/// arriving faster than the paint that would clear it (every `spin_event_loop` iteration, in
+/// the observed case) creates a self-sustaining posted-message flood that starves
+/// `RedrawRequested` indefinitely and freezes the page. See
+/// `.superpowers/sdd/pacing-investigation-report.md` chain stages F (this gate) and H (where
+/// [`Self::clear`] must be called).
+///
+/// `outstanding` latches "a wake has been posted for a repaint that has not yet happened":
+/// [`Self::should_post`] returns `true` only on the false→true transition and `false` while
+/// already latched, so repeated notifications while a repaint is pending post at most once.
+/// [`Self::clear`] must be called only when the embedder has *actually painted* (report's H
+/// point, e.g. after `window.repaint_webviews()` runs) -- clearing when a `Waker` event is
+/// merely dequeued from the event loop would re-open the same self-sustaining flood, since
+/// nothing would then stop the next spin from posting again before the paint happens.
+///
+/// `AtomicBool`/`SeqCst`: `should_post()` is called from the embedder-delegate thread and
+/// `clear()` from the winit event-loop thread (same cross-thread shape as [`WakeCoalescer`]
+/// above; see its doc comment for the ordering argument). `SeqCst` keeps the same
+/// conservative guarantee here rather than reasoning about a weaker ordering for a latch that
+/// is not on a tight hot loop once the fix is working (post-fix, `should_post`/`clear` each
+/// fire at most once per repaint, not once per spin).
+#[derive(Default)]
+pub(crate) struct WakeEdge {
+    outstanding: AtomicBool,
+}
+
+impl WakeEdge {
+    /// Returns `true` on the false→true transition of the latch (post a wake now); `false`
+    /// while a wake is already outstanding (suppress -- a paint is already pending that will
+    /// eventually call [`Self::clear`]). The killswitch bypasses the latch entirely and
+    /// always returns `true`, restoring the unconditional-post behavior.
+    pub(crate) fn should_post(&self) -> bool {
+        *WAKE_EDGE_KILLSWITCH || !self.outstanding.swap(true, Ordering::SeqCst)
+    }
+
+    /// Re-arms the latch for the next transition. Must only be called once the embedder has
+    /// actually painted (report's H point), not when a `Waker` event is dequeued.
+    pub(crate) fn clear(&self) {
+        self.outstanding.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WakeEdge, wake_edge_suppressed};
+
+    #[test]
+    fn wake_edge_posts_only_on_transition() {
+        let edge = WakeEdge::default();
+        assert!(edge.should_post()); // first latch → post
+        assert!(!edge.should_post()); // outstanding held → suppress
+        assert!(!edge.should_post());
+        edge.clear(); // paint completed
+        assert!(edge.should_post()); // new transition → post again (no lost wake)
+    }
+
+    #[test]
+    fn wake_edge_killswitch_literal_one_only() {
+        assert!(!wake_edge_suppressed(None));
+        assert!(wake_edge_suppressed(Some("1")));
+        assert!(!wake_edge_suppressed(Some("0")));
+        assert!(!wake_edge_suppressed(Some("true")));
     }
 }
 

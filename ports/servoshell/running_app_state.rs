@@ -34,6 +34,8 @@ use url::Url;
     not(any(target_os = "android", target_env = "ohos"))
 ))]
 pub(crate) use crate::desktop::gamepad::ServoshellGamepadDelegate;
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+use crate::desktop::event_loop::WakeEdge;
 use crate::prefs::{EXPERIMENTAL_PREFS, ServoShellPreferences};
 use crate::webdriver::WebDriverEmbedderControls;
 use crate::window::{PlatformWindow, ServoShellWindow, ServoShellWindowId};
@@ -197,6 +199,17 @@ pub(crate) struct RunningAppState {
     /// Wakes the platform event loop when Servo reports that a new frame can be presented.
     event_loop_waker: Box<dyn EventLoopWaker>,
 
+    /// Edge-triggers the `wake()` posted from `notify_new_frame_ready` so it fires only on
+    /// the false→true "repaint outstanding" transition, not on every notification while a
+    /// repaint is already pending -- see [`WakeEdge`] for why (self-sustaining posted-`Waker`
+    /// storm that starves `WM_PAINT` on Windows when `!is_animating()`, e.g. rAF-less video).
+    /// Desktop-only: this targets the winit/Win32 message-priority starvation described in
+    /// `pacing-investigation-report.md`, which is specific to the desktop headed event loop;
+    /// EGL/Android platforms keep the original unconditional-wake behavior (see
+    /// `notify_new_frame_ready`).
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    wake_edge: WakeEdge,
+
     /// WebViews that currently need periodic embedder event-loop spins for animation.
     animating_webviews: RefCell<HashMap<WebViewId, bool>>,
 
@@ -275,6 +288,8 @@ impl RunningAppState {
             servoshell_preferences,
             servo,
             event_loop_waker,
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+            wake_edge: Default::default(),
             animating_webviews: Default::default(),
             achieved_stable_image: Default::default(),
             exit_scheduled: Default::default(),
@@ -282,6 +297,16 @@ impl RunningAppState {
             experimental_preferences_enabled,
             accessibility_active: Cell::new(false),
         }
+    }
+
+    /// Re-arms the `wake_edge` latch. Must be called only once the embedder has actually
+    /// painted (pacing-investigation-report.md chain stage H) -- see the `wake_edge` field
+    /// doc for why clearing any earlier (e.g. when a `Waker` event is merely dequeued rather
+    /// than after the paint it triggered has run) would let the self-sustaining wake storm
+    /// (chain stage F) return.
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    pub(crate) fn clear_wake_edge(&self) {
+        self.wake_edge.clear();
     }
 
     pub(crate) fn open_window(
@@ -933,7 +958,18 @@ impl WebViewDelegate for RunningAppState {
         for window in self.windows_for_webview_id(webview.id()) {
             window.set_needs_repaint();
         }
-        self.event_loop_waker.wake();
+        // Chain stage F (pacing-investigation-report.md): edge-trigger the wake so it posts
+        // only on the false→true "repaint outstanding" transition, not on every notification
+        // while a repaint is already pending. Desktop-only -- see the `wake_edge` field doc.
+        // The matching clear (stage H) is `Self::clear_wake_edge`, called once the embedder
+        // has actually painted.
+        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+        let should_wake = self.wake_edge.should_post();
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        let should_wake = true;
+        if should_wake {
+            self.event_loop_waker.wake();
+        }
     }
 
     fn notify_animating_changed(&self, webview: WebView, animating: bool) {

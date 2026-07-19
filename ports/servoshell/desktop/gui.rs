@@ -634,6 +634,12 @@ impl Gui {
             }
 
             window.repaint_webviews();
+            // Chain stage H (pacing-investigation-report.md): the embedder has now actually
+            // painted, so re-arm the wake_edge latch (chain stage F, `notify_new_frame_ready`)
+            // for the next repaint request. This must stay right after the paint call above,
+            // not e.g. where the `Waker` AppEvent was dequeued -- clearing earlier would let
+            // the self-sustaining wake storm (spec 14 v2 ②) return.
+            state.clear_wake_edge();
 
             let source_rect = headed_window.webview_visible_source_rect(visible_size.to_i32());
             // Native Compositor(DComp)가 실제로 발동 중이면(painter의 maybe_create 성공 시
