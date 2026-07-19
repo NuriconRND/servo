@@ -924,7 +924,7 @@ struct ExternalStorage {
 /// 공유 비디오 캔버스(SERVO_VIDEO_ESCAPE=canvas, 스펙 2026-07-18) 저장소 — 컴포지터당 1개.
 /// underlay external 전체를 창 크기 스왑체인 하나에 전량 재드로우하고 Present1 1회/프레임.
 /// visual은 최초 1회 생성해 유지하고, 트리 추가는 end_frame이 프레임별로(최초 underlay
-/// 위치=최하단) 수행한다. 스왑체인은 premultiplied(비디오 없는 영역 투명).
+/// 위치=최하단) 수행한다. 스왑체인 알파 모드는 기본 opaque(IGNORE) — SERVO_VIDEO_CANVAS_PREMUL=1이면 premultiplied(스펙 §12).
 struct CanvasStorage {
     visual: ComOwned<IDCompositionVisual>,
     /// None = 미생성/생성 실패(다음 프레임 재시도) — external과 동일 정책.
@@ -955,13 +955,13 @@ struct CanvasFrameItem {
     rect: DeviceIntRect,
     /// 이번 lease가 지난 Present와 다른 세대인가(external_needs_present 판정 결과).
     updated: bool,
-    /// lease 확보 성공 여부. false = 이번 프레임 이 자리는 투명 구멍(해체 경합 등).
+    /// lease 확보 성공 여부. false = 이번 프레임 이 자리는 빈 구멍(opaque 모드에선 검정, premul 모드에선 투명).
     drawable: bool,
 }
 
 /// 공유 캔버스 Present1 더티 렉트 계산(순수 함수 — TDD 대상). prev = 지난 '표시된' 프레임의
 /// id → (rect, draw 성공 여부). 규칙(스펙 §5.3): ①세대 갱신 ②rect 이동/크기 변경(옛+새)
-/// ③draw 성공↔실패 전이(구멍 생성/복구) ④신규 등장 ⑤소멸(옛 자리 투명 전환).
+/// ③draw 성공↔실패 전이(구멍 생성/복구) ④신규 등장 ⑤소멸(옛 자리가 클리어 색으로 전환 — opaque 모드 검정/premul 모드 투명).
 /// 공집합 = 캔버스 무접촉(Present 스킵). 전량 재드로우 전제라 이 힌트가 정합하다:
 /// 무갱신 비디오는 같은 소스 프레임을 재드로우해 픽셀 동일이 보장된다.
 fn canvas_dirty_rects(
@@ -2010,7 +2010,7 @@ impl DCompNativeCompositor {
                         }
                     }
                     if let Some(rtv) = canvas.rtv_cache.get(&back_key).map(|c| c.as_ptr()) {
-                        // 전체 투명 클리어(전량 재드로우 전제 — catch-up 불요 근거, 스펙 §5.3).
+                        // 전체 클리어 (0,0,0,0) — opaque(기본) 모드에선 불투명 검정으로 표시, premul 모드에선 투명(전량 재드로우 전제 — catch-up 불요 근거, 스펙 §5.3/§12.2).
                         (*ctx1_ptr).ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 0.0]);
                         let c_start = if prof_on { Some(std::time::Instant::now()) } else { None };
                         let cp = self.convert_pass.as_mut().unwrap();

@@ -260,3 +260,5 @@ Task 1 커밋 `53dd20d8b`(`components/paint/dcomp_compositor.rs`, +38/-4) — `c
 **zip 증가분 귀속 정정** (Minor): §12.6 "패키지 재생성" 문단의 "이전 1,216,854,445B/07-18 20:04 대비 헤더 2행분만 증가"는 부정확하다. 07-18 20:04 zip의 `servoshell.exe`는 opaque 전환(Task 1, 커밋 `53dd20d8b`) **이전** 빌드였고, 이번 zip의 `servoshell.exe`(150,895,104B, 2026-07-19 09:37)는 그 이후 빌드다 — 즉 두 zip은 서로 다른 컴파일 바이너리를 담고 있다. zip 크기 차 1,786B(1,216,856,231 − 1,216,854,445)의 주성분은 **exe 바이너리 차이**(재컴파일로 코드 레이아웃이 바뀌면 DEFLATE 압축 후 크기도 바뀐다 — 원본 exe 바이트 수 자체가 거의 같더라도 압축 결과가 같으리라는 보장은 없다)이지, `run_wall.ps1`에 추가한 주석 2행(수십~백여 바이트, 텍스트라 압축률도 높음)이 아니다. 두 exe를 직접 비교할 이전 바이너리가 남아있지 않아 exe 기여분을 정량화할 수는 없지만, "헤더 2행분만 증가"라는 단정은 근거가 없다. 크기 수치(1,216,856,231B) 자체는 유효하며 재압축은 불요.
 
 **증거 파일 추가** (`scratchpad\canvas_alpha\`): `fix_mixed_opaque.log`/`fix_mixed_opaque.png`, `fix_mixed_premul.log`/`fix_mixed_premul.png` — 위 §12.6.1 신규 반투명 프로브(mixed_media_demo `#caption`) 재현 자료. complex_media_stress `#subticker`는 기존 `stress_opaque.png`/`stress_premul.png` 재사용(신규 파일 없음).
+
+후속 실증 경로(미래 세션용): 그리드 1칸을 정적 단색 테스트 클립으로 교체한 페이지를 쓰면 반투명 오버레이 아래가 시간 불변이 되어 opaque↔premul 픽셀 비교가 가능해진다 — 두 데모 페이지 재시도는 불필요(구조적 부적합 확인 완료).
