@@ -48,7 +48,7 @@ WR은 add_surface를 z 순서(underlay들 → 콘텐츠 → overlay들)로 호�
 
 ### 5.2 캔버스
 
-- 스왑체인 1개: 창(백버퍼) 크기, FLIP 2버퍼, 기존 `create_composition_swapchain` 재사용, **premultiplied alpha**(비디오 없는 영역 투명 — 복합 페이지 반투명 패널의 배경 규약이 현행과 동일 유지). sync interval 0.
+- 스왑체인 1개: 창(백버퍼) 크기, FLIP 2버퍼, 기존 `create_composition_swapchain` 재사용, **premultiplied alpha**(비디오 없는 영역 투명 — 복합 페이지 반투명 패널의 배경 규약이 현행과 동일 유지). sync interval 0. **(정정 2026-07-19: §12 애드온으로 기본이 opaque(IGNORE)로 전환됨 — premultiplied는 `SERVO_VIDEO_CANVAS_PREMUL=1` 진단 레버로만 유지. 시각 등가 논증은 §12.1.)**
 - 비주얼 1개: 최초 underlay external의 add_surface 시점에 트리 맨 아래로 삽입(이후 콘텐츠/overlay 비주얼이 기존 AddVisual(FALSE) 흐름으로 위에 쌓임). 클립 없음(창 전체).
 - 생성: 최초 underlay external 등장 시 지연 생성. 포맷은 현행 external 스왑체인과 동일(8bit — 10bit 소스는 셰이더 변환 후 8bit 출력, external과 동일 계약).
 
@@ -176,3 +176,39 @@ VideoConvertPass에 dest-rect 변형 추가: RSSetViewports(+scissor)를 dest re
 - `etc/multigpu/run_video_wall_d3d11.ps1`의 `-VideoEscape` 파라미터 주석에 `canvas` 값 설명 추가(개발환경 런처도 패키지와 동일 스위치 사용 가능).
 - `D:\ServoWallPackage.zip` 재생성(servoshell.exe + run_wall.ps1 교체, 나머지 리소스/테스트 페이지 무변경) — 크기/스모크 결과는 `.superpowers/sdd/task-6-report.md` 참조.
 - **방법론 노트**: 캔버스 스왑체인도 flip 스왑체인이라 BitBlt/winshot 캡처 가능(external과 동일 특성 유지 — native/hybrid 서피스만 검정 캡처).
+
+## 12. 애드온: 캔버스 알파 모드 opaque 전환 (2026-07-19, 승인됨)
+
+**동기**: §5.2는 캔버스를 premultiplied로 확정했으나, §10 첫 리스크(구형 AMD GCN1에서 DWM의 premultiplied 전창 레이어 블렌딩 비용)를 사용자가 선제 회피하기로 결정. premultiplied→opaque는 DWM 합성을 블렌딩→불투명 합성으로 바꿔 어느 GPU에서든 같거나 싸진다.
+
+### 12.1 시각 등가 논증 (설계 근거)
+
+캔버스는 비주얼 트리 최하단이므로 알파 모드가 화면에 관여하는 영역은 "캔버스가 비쳐 보이는 곳"뿐이다:
+- **비디오 rect**: 변환 셰이더가 알파=1 불투명 픽셀을 쓰므로 두 모드 결과 동일.
+- **비디오 밖**: 위층 콘텐츠 레이어가 불투명(페이지 배경)이라 캔버스 비가시 — 검정이든 투명이든 무관.
+- **반투명 패널/티커(알파 슬라이스)**: 자기 아래의 불투명 콘텐츠 슬라이스와 블렌딩되며 캔버스와 직접 만나지 않음.
+- **과도기 구멍(lease 실패·시작 직후)**: premultiplied면 창 배경 브러시(§3-t '하단 흰 밴드'의 흰색)가 노출될 수 있으나 opaque면 검정 — 오히려 개선.
+
+**유일한 이론적 예외 = 루트 배경이 반투명인 페이지**(html/body 알파<1). 브라우저 기본·표출 페이지 전부 불투명 배경이라 실존하지 않음 — 수용 제약으로 명시(그런 페이지가 등장하면 §12.3 복귀 레버 사용).
+
+### 12.2 설계 (접근 A: 항상 opaque — B안 전면 피복 자동 감지는 실익 없는 복잡도로 기각)
+
+- `ensure_canvas`의 스왑체인 생성: `create_composition_swapchain(size, opaque)`의 opaque를 **기본 true**(`DXGI_ALPHA_MODE_IGNORE`)로.
+- 결정은 순수 함수(진단 env 판독 포함, OnceLock 캐시)로 분리 — 유닛테스트 대상.
+- 전체 클리어는 (0,0,0,0) 그대로 — IGNORE 모드에서 알파가 무시되어 불투명 검정으로 표시됨(주석으로 의도 명시).
+- `SERVO_DCOMP_DEBUG=1` 캔버스 생성 로그에 `alpha=opaque|premul` 표기.
+- 그 외 로직(재생성/드래그/더티/Present/z) 전부 무변경. canvas 모드 밖 경로 접촉 0.
+
+### 12.3 복귀 레버
+
+`SERVO_VIDEO_CANVAS_PREMUL=1` = premultiplied 복귀(진단·AMD A/B 전용, 기본 미설정=opaque). 런처 스위치는 두지 않음(env 직접 설정) — AMD 가이드에 1줄 기재.
+
+### 12.4 검증 계획
+
+1. 유닛: 알파 모드 결정 함수(기본 opaque / env "1"이면 premul / 기타 값 opaque).
+2. 실기(A5000): ①45타일 무회귀(lockstep·fps) ②**mixed/stress에서 premul↔opaque winshot 픽셀 비교로 §12.1 시각 등가 실증**(반투명 패널·티커 영역 포함) ③transforms 스케일 애니 정상 ④PresentMon 스왑체인 여전히 2개.
+3. AMD 이득 실측은 관례대로 사용자 몫(§12.3 레버로 A/B).
+
+### 12.5 완료 기준
+
+A5000 검증 + AMD 가이드에 레버 기재 + 패키지 재생성. 푸시는 기존 보류 유지.
