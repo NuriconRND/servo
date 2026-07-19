@@ -333,37 +333,34 @@ promote/content-swap 이벤트는 3단 전부(①포함) 0건이었다. 원인: 
 
 **후속 티켓(백로그, 비차단)**: 이탈1의 근본 구조 — escape 모드 비디오는 프레임 도착이 컴포짓을 직접 구동하지 못해 페이지 rAF에 페이싱을 의존(painter.rs update_images의 즉시 재컴포짓 훅이 WR 이미지 트랜잭션 경유 비디오만 커버) — 는 페이지 규약(빈 rAF)이 아닌 엔진 수정으로 닫는 것이 정본: escape 모드 활성 시 컴포지터 자체 페이싱(ring publish→generate_frame 훅 확장 또는 self-paced tick) 검토. 프로덕션 페이지들은 현재 전부 자체 rAF/애니를 가져 즉시 위험 없음.
 
-## 14. 애드온: escape 비디오 자체 페이싱 (2026-07-19, 승인됨)
+## 14. 애드온: 비디오 자체 페이싱 — v2 임베더 wake 수정 (2026-07-19, v2 개정 승인됨)
 
-**동기**: §13.4 후속 티켓의 정식 착수. escape(canvas/external) 비디오는 링이 WR 리소스 업데이트 없이 전진하므로(plane external image id 고정, frame_seq는 링 내부) `update_images`의 §3-m 즉시 컴포짓 훅이 발동하지 않는다 → 컴포짓 페이싱이 페이지 rAF에 의존. 결과 두 가지가 실측됨: ①무애니 페이지 재생 동결(§13.4 이탈1) ②AMD 6x6 실측(PresentMon, 2026-07-19)에서 rAF 자체 클록(~47.4/s, §3-m의 ~48Hz 시그니처)이 비디오 30fps와 어긋나 잉여 컴포짓 ~17회/s = GPU 89.1%(프레임당 GPU 18.79ms — probe 24.42ms보다 효율적임에도 총량이 높음). 비디오 카데이던스(30Hz) 페이싱 시 예측 ~56%(probe 73.3% 이하).
+**동기**: §13.4 후속 티켓의 정식 착수. 무애니 페이지 재생 동결(§13.4 이탈1)과 AMD 잉여 컴포짓(6x6 실측: rAF 자체 클록 ~47.4/s가 비디오 30fps와 어긋나 GPU 89.1% — 프레임당 GPU 18.79ms로 probe 24.42ms보다 효율적임에도 총량 초과. 30Hz 수렴 시 예측 ~56%, probe 73.3% 이하)을 함께 해소한다.
 
-### 14.1 설계 (접근 A: 도착 신호 + 기존 가드 — 사용자 확정)
+**★v1 기각 기록(2026-07-19, Task 1 스모크 게이트에서 실증)★**: v1의 "도착 신호 추가" 접근은 전제가 틀렸다 — `render_d3d11_yuv_frame`(htmlmediaelement.rs:984)는 escape 모드에서도 **매 프레임 `UpdateImage(epoch=None)`을 이미 송신**하며 §3-m 즉시 컴포짓 훅도 발동을 시도한다(신호 추가 = 중복, ON≈OFF 실증). §13.4 이탈1의 "escape가 update_images를 우회한다" 트리아지도 오류였음을 함께 정정한다.
 
-```
-gst 스레드: 링 슬롯 기록+frame_seq 전진 → (게이트 on) 경량 "비디오 도착" 신호 송신
-    (기존 media→paint 배관 재사용 — UpdateImage가 다니던 채널의 페이로드 없는 변형)
-painter 수신: §3-m 즉시 컴포짓과 동일 가드(display_composite_in_flight/renderer_behind)
-    통과 시에만 컴포짓-온리 generate_frame — 밀리면 신호 소멸(pending 플래그만 유지)
-컴포지터: 기존 canvas_flush 무변경 — 더티 판정이 draw/Present 여부 결정
-```
+### 14.1 실측 근본원인 (계측 확정 — pacing-investigation-report.md)
 
-- **폭주 차단 근거(재시도 금지 "vsync 드라이버"와의 차이)**: 주기 틱이 아니라 도착 이벤트이고, 가드가 병합하며(§3-m 전례 — WR 경로 비디오는 오늘도 이 구조로 45타일 소화, 그땐 텍스처 데이터까지 실어 날랐음), in-flight 게이트(§3-d)가 누적을 차단. lockstep 월 = 동시 도착 36건 → 컴포짓 1회 → 자연 ~30Hz. 비동기 소스 최악 = in-flight 상한(~55-60Hz).
-- **기각 대안**: B(렌더러 자체 틱=probe 직역 — 타이머 수명/유휴 감지/WakeCoalescer 계열 재검증 부담), C(A+vsync 양자화 — lockstep 월에 이득 0, YAGNI, 비동기 혼합 실측 문제 시 후속).
+rAF 없는 페이지는 `is_animating=false` → §3-2 WakeCoalescer의 wake 억제가 비활성 → `spin_event_loop`마다 frame-ready가 무조건 `wake()`를 post → Win32에서 posted 메시지가 WM_PAINT보다 우선 → **wake 폭풍이 RedrawRequested를 영구 기아**(실측: wake/request_redraw ~2만 회 vs RedrawRequested 기동 후 5회 정지) → 페인트 부재 → `display_composite_in_flight` 영구 true → `renderer_behind()` 가드가 §3-m 즉시 컴포짓 전량 차단 → 동결. **자기지속 wake 폭풍이 자기가 필요로 하는 페인트를 굶기는 §3-2(마우스 기아) 동류 결함.** rAF가 가리는 이유 = animating=true 시 WakeCoalescer가 wake를 전량 억제해 큐가 안 막힘(페인트 ~100회/s 정상 순환 실측). 부수 발견: **재생 중 `<video>`가 servoshell animating 판정에 반영되지 않음** — 같은 비디오가 rAF 유무만으로 갈리는 이유이자 수정 지렛대.
 
-### 14.2 게이트
+### 14.2 설계 (v2: ①+② 병용 — 사용자 확정)
 
-기본 **ON**(external/canvas — escape 링 publish 시에만 신호가 존재하므로 자연 한정). 킬스위치 `SERVO_VIDEO_SELF_PACING=0`(리터럴 "0"만 off, 순수 함수+OnceLock 관례). native는 WR이 그리는 진단 모드라 신호 무의미 — 제외(리소스 업데이트 부재로 WR 재드로우가 어차피 안 일어남, 진단 전용 유지).
+- **① 미디어 재생 → animating 반영 (주 수정)**: 재생 중 비디오의 animations_running을 servoshell의 animating 판정에 전파 — rAF가 우연히 제공하던 마스킹(WakeCoalescer 억제 + Poll)을 정식 경로로. 검증된 §3-2 기전 재사용이라 위험 최소, Poll CPU 비용은 rAF 페이지들이 이미 내는 것과 동일. 킬스위치 `SERVO_DISABLE_MEDIA_ANIMATING=1`(진단 복귀).
+- **② frame-ready wake 전이 억제 (보강)**: `notify_new_frame_ready`의 wake를 상태 false→true 전이 시에만 post — 자기지속 폭풍 자체를 차단(비미디어 frame-ready 소스 포함 일반 방어). 킬스위치 `SERVO_DISABLE_WAKE_EDGE=1`. 마지막 wake 유실 없게 전이 부기 정확성 필수.
+- **성능 수렴**: ① 적용 시 무애니 페이지에서 §3-m 훅이 비디오 도착률로 컴포짓 구동(rAF 콜백 부재라 억제 미발동) → lockstep 월 ~30Hz 수렴 = 동결 수정과 AMD GPU 감소가 동시 달성. §3-2 제약(입력 보호) 준수: post 총량은 증가하지 않고 감소 방향만.
+- 기각: v1 신호 배관(중복), ③ 동기 repaint_now(변경 폭 대비 과잉).
 
 ### 14.3 페이지 규약 되돌림
 
 이 수정으로 §13.4 이탈1의 "빈 rAF load-bearing"이 해제된다: `video_grid_wall_clean.html`에서 빈 rAF 루프 제거(주석도 교체 — 자체 페이싱이 담당), `package_run_wall.ps1`의 rAF caution을 자체 페이싱 안내로 교체. **rAF 없는 페이지에서의 정상 재생이 곧 동결 근본수정의 검증 수단.**
 
-### 14.4 검증 계획
+### 14.4 검증 계획 (v2)
 
-1. 유닛: 킬스위치 순수 함수 + (배관 형태에 따라) 신호 병합 가드 로직 테스트.
-2. 클린 페이지(rAF 제거판) 45타일: 재생 정상(동결 소멸) + `[vesc-prof] frames/presents ≈ 30/s`(비디오 카데이던스 수렴).
-3. 무회귀: 기존 월(perf/play, rAF 있는 페이지 — 컴포짓률 이상 상승 없음), 복합 3종, off/native 무변경, 킬스위치=0 시 현행 거동 복원.
-4. AMD 실측(사용자): 6x6에서 GPU 89%→~56% 예측 검증(probe 73% 대비), 가이드에 판독 항목 추가.
+1. 유닛: 킬스위치 순수 함수 2종(①②) + 전이 부기 로직(②)이 순수 함수로 분리되면 그것도.
+2. 클린 페이지(rAF 제거판) 45타일: 재생 정상(동결 소멸) + `[vesc-prof] frames/presents ≈ 30/s`(비디오 카데이던스 수렴) + 킬스위치(①=1 그리고/또는 ②=1)로 동결 재현(인과 증명).
+3. 무회귀: 기존 월(perf/play, rAF 페이지 — 컴포짓률 이상 상승 없음), 복합 3종, off/native 무변경.
+4. **★입력 무회귀(§3-2 재발 방지 필수)★**: 마우스 이벤트 전달률 — 기존 도구 재사용(`tests/html/mouse_count_probe.html` + `scratchpad`의 synth wiggle 계열) — ①로 animating 구간이 늘어나는 만큼 wake 억제 구간도 늘어나므로 입력 기아가 재발하지 않는지 실측.
+5. AMD 실측(사용자): 6x6에서 GPU 89%→~56% 예측 검증(probe 73.3% 대비), 가이드에 판독 항목 추가.
 
 ### 14.5 완료 기준
 
