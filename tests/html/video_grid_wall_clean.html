@@ -115,20 +115,10 @@
     videos.push(v);
   }
 
-  // 실측으로 발견된 사실(§13.4 이탈로 기록): -VideoEscape 하에서는 비디오가 WR의
-  // 이미지/텍스처 파이프라인을 완전히 벗어나므로(그것이 이 기능의 목적), 비디오
-  // 프레임 도착 자체가 재합성을 일으키지 못한다(painter.rs의 update_images
-  // 즉시-재합성 경로는 WR 이미지 갱신에 물려 있어 탈출 비디오엔 적용되지 않음).
-  // rAF를 전부 제거하면(브리프 원문) 페이지가 완전 정적이 되어 재합성 자체가
-  // 거의 발생하지 않아 45타일이 사실상 정지·불균일해진다(로그로 확인:
-  // vesc-prof가 러닝윈도우 내내 1회만 찍힘). 그래서 DOM/스타일을 전혀 건드리지
-  // 않는 빈 rAF만 유지한다 — 이건 재합성을 계속 촉발하는 스케줄링 핑일 뿐이라
-  // WR이 다시 그릴 더티 영역이 없고(①래스터 비용 불변 0), 콘텐츠가 안 바뀌니
-  // Present도 늘지 않는다(②비용 불변 0) — #stats처럼 매프레임 DOM을 갱신하는
-  // "하트비트 콘텐츠"와는 다른 층이다.
-  requestAnimationFrame(function tick() {
-    requestAnimationFrame(tick);
-  });
+  // 스펙 §14 v2: 재생 중 미디어가 animating으로 반영되고 frame-ready wake가 전이
+  // 억제되어, 이 페이지는 rAF 없이 임베더가 페인트를 정상 순환한다. 킬스위치
+  // SERVO_DISABLE_MEDIA_ANIMATING=1 + SERVO_DISABLE_WAKE_EDGE=1 동시 설정 시에만
+  // 동결 재현(진단).
 </script>
 </body>
 </html>

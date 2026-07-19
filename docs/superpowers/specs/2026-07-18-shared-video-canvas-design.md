@@ -365,3 +365,51 @@ rAF 없는 페이지는 `is_animating=false` → §3-2 WakeCoalescer의 wake 억
 ### 14.5 완료 기준
 
 A5000 검증 + 클린 페이지/가이드 되돌림 + 패키지 재생성. 푸시 보류 유지.
+
+### 14.6 구현 결과 (2026-07-19, v2)
+
+**Status: DONE.** 커밋 체인: `e4eee315f`(계획 v2 재작성) → `b543c30df`(Task 1, ② wake 전이 억제) → `313d6fdaa`(Task 2, ① 미디어 animating 전파) → 본 커밋(Task 3, 마감 — 자기참조라 SHA는 `git log` 참조, `e069f2c7f` 선례와 동일 사유). Rust 코드 변경 0(문서/페이지/패키지만), 로컬 커밋만·푸시 없음(기존 방침 유지).
+
+**② 단독 / ①+② 스모크 수치 (2x2, `zz_noraf_smoke.html`, 재확인 없이 Task 1/2 원 수치 인용)**:
+
+| 구성 | frames (mean/std) | presents (mean/std) |
+|---|---|---|
+| ② 단독 (Task 1, `edge_on_*`) | 46-53/s | 30-32/s |
+| ② 단독 (Task 2 §5.3 재확인, 킬스위치 ①=1) | 47.1 / 4.3 | 29.5 / 2.5 |
+| ①+② (Task 2 §5.1) | 56.0 / 7.6 | 28.3 / 3.7 |
+
+**45타일 핵심 게이트 (Step 2, `video_grid_wall_clean.html` — 본 태스크에서 rAF 완전 제거 후)**: `-Cols 9 -Rows 5 -DComp -VideoEscape canvas -Sync 45`, 60초 관측.
+
+- 재생 정상: winshot 2매(`gate2_45tile_a.png` t=55s, `gate2_45tile_b.png` t=60s) — 45타일 전체 lockstep(타일 간 프레임 카운터 편차 최대 ±1, 예: b 샷 000317/000318), a→b 사이 비디오 자체 프레임 카운터 128→317/318 전진(정지 없음).
+- `[vesc-prof]`(전체 71라인, 시작/끝 각 1개 제외 n=69): **frames mean=59.5 std=5.4 min=16 max=61**, **presents mean=53.3 std=5.7 min=12 max=60**, converts mean=2400.4 std=257.2.
+- canvas swapchain (re)create = **1회**(`[dcomp-dbg] canvas swapchain (re)create 1920x1080 alpha=opaque` — 러닝윈도우 내 정확히 1줄, 재생성 없음). `dcomp_engaged_markers=1`(mode=hybrid).
+- **이탈 1(경미, 기록)**: presents 평균 53.3/s는 §14.2/14.4가 목표한 "~30/s 수렴"에 못 미치지 못한 게 아니라 오히려 **크게 상회**한다(45타일 규모에서). Task 2 §5.1이 4타일 규모에서 이미 관측한 "① 활성 시 frames 상승·표준편차 증가" 경향이 타일 수가 늘수록 presents까지 함께 상승하는 방향으로 확대된 것으로 보인다(가설, 미확정: WakeCoalescer가 media-animating 유래 Poll과 배칭 간섭). **동결/정지가 아님**(위 lockstep 실증) — 순수 성능 특성이며 브리프 지시대로 "있는 그대로" 기록. `package_run_wall.ps1` 가이드에 A5000 실측치를 병기해 AMD 판독 시 대조 기준으로 남김(§14.4 Step 5 참조).
+
+**입력 무회귀 (Step 3, §3-2 재발 방지 필수 게이트)**: `tests/html/mouse_count_probe.html`은 자체 rAF를 돌려(구 "rAF가 마스킹" 경로를 다시 타 버려) 본 태스크가 검증해야 할 "미디어 animating뿐, 페이지 rAF 0" 경로를 실측하지 못하는 구조임을 확인 — 브리프의 대체 조항에 따라 임시 페이지 `tests/html/zz_input_video_probe.html`(2x2 비디오 그리드 + `setInterval` 기반 mousemove 카운트 로깅, rAF 미사용, Step 3 종료 후 삭제)을 신설해 `etc/multigpu/tools/wall_synth_mouse_wiggle.ps1`(SetCursorPos 방식)와 병행 구동했다.
+
+- **방법론 함정(기록)**: 최초 실행에서 마우스 이벤트가 10초 내내 0으로 관측됐다 — Servo 결함이 아니라 이 자동화 환경에서 `run_video_wall_d3d11.ps1`의 `SetForegroundWindow` 호출이 Windows 포그라운드 잠금(호출 프로세스가 이미 활성 앱이 아니면 무시됨 — 당시 실제 활성 창은 파일 탐색기였음, `GetForegroundWindow` 확인)에 막혀 조용히 실패해 커서 좌표가 다른 창에 가려진 servoshell 창 위를 지나가고 있었기 때문. Alt 키 탭(`keybd_event`) 우회 후 `GetForegroundWindow() == servoshell 핸들` 일치를 확인하고 재실행.
+- **판독**: 포그라운드 확정 후 wiggle 10초(SetCursorPos 100Hz) 동안 `mouseEv/s` **114~126**(§3-2 수정 후 정상 수준, 0 아님) — 좌표도 원형 wiggle 궤적을 그대로 추종(예: (412,314)→(396,319)→…→(404,241)). 재생 중(media-animating=true, 페이지 rAF 0) 마우스 전달 정상, §3-2 재발 없음.
+
+**무회귀 배터리 (Step 4, 5종)**:
+
+| 구성 | 커맨드 요지 | 판정 |
+|---|---|---|
+| perf 페이지(자체 rAF 월) | `-Cols 3 -Rows 3 -DComp -VideoEscape canvas -Page video_grid_6x6_perf.html -Sync 9` | PASS — `[vesc-prof]` frames≈60-61/s presents≈30-32/s(기존 기준과 일치, 이상 상승 없음), 재생 정상 |
+| mixed_media_demo | `-Cols 3 -Rows 2 -DComp -VideoEscape canvas -Sync 6` | PASS — 헤더/시계/자막/속보 티커/6타일 비디오(lockstep Total# 000875) 전 요소 정상, 에러 없음(GLib-GObject-WARNING만 — 기존에 알려진 무해한 GStreamer 종료 잡음) |
+| play 페이지 escape off(WR 경로) | `-Cols 3 -Rows 3 -DComp -Page video_grid_6x6_play.html`(VideoEscape 없음) | PASS — 9/9 lockstep(Total# 000875), 에러 없음 |
+| off(비DComp, 소프트웨어 Draw 컴포지터) | `-Cols 2 -Rows 2 -Page video_grid_6x6_play.html`(DComp 없음) | PASS — `dcomp_engaged_markers=0`(gate off 확인), 4/4 lockstep(Total# 000876), 브라우저 크롬 정상 표시 |
+| 킬스위치 2종 동시=1(신규, 인과 증명) | `SERVO_DISABLE_WAKE_EDGE=1` + `SERVO_DISABLE_MEDIA_ANIMATING=1`, `video_grid_wall_clean.html`(본 태스크로 rAF 완전 제거된 페이지) `-Cols 2 -Rows 2 -DComp -VideoEscape canvas` | **동결 재현 확인** — 40초간 `[vesc-prof]` 단 2줄(frames=1 고정, 나머지 필드 대부분 0 — Task 1 BROKEN 시그니처와 동일), winshot t=30s 완전 블랙(20,145B, 압축률로도 정지 방증), t=40s에 단 한 번 진행(Total# 000592/593) 후 재정지 — H지점 "초기 5회뿐 이후 영구 0" 패턴 재현. 킬스위치 개별(② 또는 ① 단독)은 Task 1/2가 이미 실측 완료(각 문서 §6/§5.3 인용) — 정상 거동 유지, 재실행 생략. |
+
+**대칭성 3경로 (누수=영구 Poll=CPU 회귀 실기 검증, Task 2 리뷰 편입 사항)**: 전부 1x1 타일, `SERVO_VIDEO_ESCAPE_PROF=1`, `Get-Process servoshell | .CPU`(누적 CPU-초) 다중 샘플.
+
+| 시나리오 | 임시 페이지 | vesc-prof 판독 | CPU 판독 |
+|---|---|---|---|
+| ① 재생 중 src 리셋(5초 재생 후 `src=''; load()`) | `zz_sym_srcreset.html`(삭제됨) | 재생 중 presents 20-31/s → 리셋 직후(~5.6s)부터 35초 관측 종료까지 **추가 로그 0줄**(완전 정지 = animating 해제) | t=0→35s(대부분 리셋 후 유휴) **+0.094 CPU-초**(8.7656→8.8594) |
+| ② 미부착 play 후 드랍(10초 후 `v=null`+GC 유도 청크) | `zz_sym_unattached.html`(삭제됨) | 재생 중(미부착이라 화면엔 없음) frames만 30-31/s 틱(presents=0 — 비가시라 컴포짓 대상 아님, 정상), 드랍 시점(~t14s) 이후 **frames 틱 자체가 완전 정지**, 32초 관측 종료까지 재개 없음 | 활성구간(t0→5s) +3.203(14.5625→17.7656), 드랍 후 유휴구간(t10→45s, 35초) **+0.094 CPU-초**(17.7813→17.875) — ①과 사실상 동일한 유휴율 |
+| ③ 일시정지 방치(60초+, `zz_pause_smoke.html` 재사용, Task 2 산출물) | 기존 파일 유지 | 재생 중(8초) presents 26-31/s → pause 직후부터 62초+ 관측 종료까지 **추가 로그 0줄**(Task 2 §5.2와 동일 시그니처 재확인) | 유휴구간(t10→70s, 60초) **+0.203 CPU-초**(12.7656→12.9688) |
+
+3경로 모두 presents/frames가 리소스 해제 즉시 0으로 떨어져 관측 종료까지 유지되고(영구 Poll 없음), CPU 델타도 노이즈 수준(0.094~0.203 CPU-초, 35-60초 창 대비 <0.5% 평균 사용률)에서 서로 근접 — Task 2 §5.2가 이미 지적한 "CPU 샘플링 해상도로는 차이가 미세함, vesc-prof가 결정적 신호"와 일치. 대칭성 보증(재계산-후-diff + `PlayingVideoCountGuard` RAII, Task 2 §1) 실기 확인 완료, 누수 미관측.
+
+**가이드/패키지 (Step 5)**: `etc/multigpu/package_run_wall.ps1`의 구 "빈 rAF 유지 필수" CAUTION 블록을 브리프 지정 v2 NOTE로 교체 + A5000 45타일 실측치(frames/presents mean, 이탈 1) 병기, PowerShell 파서 검증(`[System.Management.Automation.Language.Parser]::ParseFile` → `PARSE_OK`). 패키지: `servoshell.exe`(150,893,568B/07-19 12:44 → **151,193,088B/07-19 18:45**, 커밋 313d6fdaa 반영분), `run_wall.ps1`(package_run_wall.ps1 재복사, 14,127B), `tests/html/video_grid_wall_clean.html`(rAF 제거판, 5,215B) 갱신 → `Compress-Archive -Force`(zip 보호 플래그로 사전 삭제 불가, `-Force`로 우회) → `D:\ServoWallPackage.zip` **1,216,942,137B**(2026-07-19 18:46). 패키지 스모크(`run_wall.ps1 -Cols 2 -Rows 2 -DComp -VideoEscape canvas -Page tests\html\video_grid_wall_clean.html -Sync 4`): 4/4 lockstep(Total# 000873), 에러 없음 — 포터블 빌드에서도 무rAF 클린 페이지 정상 재생 확인. `tests\html\zz_noraf_smoke.html` 삭제(패키지엔 애초 미포함이라 별도 조치 불요), `zz_sym_*`/`zz_input_video_probe.html` 전부 삭제 완료.
+
+**이탈**: 위 "이탈 1"(45타일 presents 평균이 목표 ~30/s를 상회, 성능 특성으로 기록, 재발/회귀 아님) 외에 코드/스펙 결함 이탈 없음. Step 3의 포그라운드 방법론 함정은 테스트 하네스 특성이며 Servo 결함이 아님(위에 기록, 향후 세션 참고용).

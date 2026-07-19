@@ -40,16 +40,19 @@
 #       (c) + canvas-only      : also set SERVO_DCOMP_CANVAS_ONLY=1  (drops ALL non-video layers -> DWM composes 1 layer, probe-identical)
 #     Read fps/GPU%% deltas: (a)->(b) = content raster+present cost, (b)->(c) = DWM extra-layer cost.
 #     CAUTION: SERVO_DCOMP_CANVAS_ONLY is DIAGNOSTIC ONLY - page UI (tickers, clocks, PiP) disappears while set.
-#     CAUTION (measured on A5000, 2026-07-19): under any -VideoEscape mode, video frames
-#     bypass WebRender's own image-update pipeline, so frame arrival alone no longer
-#     triggers a recomposite (that immediate-recomposite fast path only covers non-escaped
-#     video). A page with ZERO requestAnimationFrame activity therefore composites only
-#     sporadically and 45-tile playback stalls/desyncs badly (measured: [vesc-prof] samples
-#     dropped from ~1/second to a single sample for the whole 60s run). video_grid_wall_
-#     clean.html keeps a requestAnimationFrame loop that touches no DOM/style (a pure
-#     scheduling ping) to keep composites flowing at full rate while remaining
-#     heartbeat-free for raster/Present accounting -- do not strip that loop when adapting
-#     this page or authoring another "clean" page for escape-mode readouts.
+#   NOTE (self-pacing v2, 2026-07-19): playing media now counts as "animating" and
+#   frame-ready wakes are edge-triggered, so wall pages need NO rAF/heartbeat and
+#   composites converge to the video cadence (~30/s on the wall). Diagnosis levers:
+#   SERVO_DISABLE_MEDIA_ANIMATING=1 / SERVO_DISABLE_WAKE_EDGE=1 (set both to reproduce
+#   the old rAF-dependent freeze). Expected on AMD at 6x6: canvas GPU% ~90% -> ~56%.
+#     (superseded the prior "keep an empty rAF loop or escape-mode pages stall" caution --
+#     video_grid_wall_clean.html now has ZERO page-level rAF; playback stays live because
+#     the playing <video> elements themselves drive animating/composite scheduling.)
+#     A5000 measurement (2026-07-19, Task 3 spec 14.6): 45-tile clean page, [vesc-prof]
+#     mean frames=59.5/s presents=53.3/s (std 5.4/5.7, n=69, 1 canvas-swapchain (re)create
+#     total) -- higher than the ~30/s design target, recorded as-is (over-composite, not a
+#     stall/freeze; screenshots show clean 45-tile lockstep progression). AMD read-out
+#     should note whether presents/s tracks this A5000 pattern or the ~30/s target.
 #     NOTE: for these pure grid pages PresentMon shows 1 swapchain across all 3 stages - the "2 swapchains" health check above applies to pages with an opaque promotable heartbeat region (e.g. mixed_media_demo), not this page family.
 
 param(
