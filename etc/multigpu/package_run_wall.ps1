@@ -50,6 +50,7 @@
 #     scheduling ping) to keep composites flowing at full rate while remaining
 #     heartbeat-free for raster/Present accounting -- do not strip that loop when adapting
 #     this page or authoring another "clean" page for escape-mode readouts.
+#     NOTE: for these pure grid pages PresentMon shows 1 swapchain across all 3 stages - the "2 swapchains" health check above applies to pages with an opaque promotable heartbeat region (e.g. mixed_media_demo), not this page family.
 
 param(
     [int]    $Cols = 8,
