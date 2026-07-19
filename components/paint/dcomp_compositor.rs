@@ -119,6 +119,20 @@ fn canvas_swapchain_opaque() -> bool {
     })
 }
 
+/// canvas-only 진단 게이트 판정(스펙 §13). "1"일 때만 발동 — 캔버스 외 비주얼을
+/// 트리에서 생략해 DWM 1레이어(probe 동형)로 만든다. 진단 전용(복합 페이지 UI 미표시).
+fn canvas_only_requested(token: Option<&str>) -> bool {
+    matches!(token, Some("1"))
+}
+
+/// canvas_only_requested의 env 바인딩(프로세스당 1회 캐시).
+fn dcomp_canvas_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        canvas_only_requested(std::env::var("SERVO_DCOMP_CANVAS_ONLY").ok().as_deref())
+    })
+}
+
 /// external present 파이프라인의 초당 집계 카운터(video_escape_prof 게이트에서만 갱신).
 /// 렌더러 스레드 단일 인스턴스(DCompNativeCompositor 소유). end_frame이 매 프레임 frames++
 /// 후 maybe_flush로 1초 경과 시 라인 출력 + 리셋한다. 게이트 off면 전 필드가 0으로 유휴.
@@ -1225,6 +1239,8 @@ pub struct DCompNativeCompositor {
     content_seen: bool,
     /// 캔버스 생성 실패 warn-once.
     warned_canvas_fail: bool,
+    /// canvas-only 진단 활성화 warn-once.
+    warned_canvas_only: bool,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1383,6 +1399,7 @@ pub fn maybe_create(
             canvas_prev_rects: FxHashMap::default(),
             content_seen: false,
             warned_canvas_fail: false,
+            warned_canvas_only: false,
         })
     }
 }
@@ -3311,6 +3328,20 @@ impl Compositor for DCompNativeCompositor {
         //  (3) virtual/device 좌표 이중성이 만드는 결함 표면적을 통째로 제거한다.
         // 따라서 add_surface가 기록한 z-order(아래→위) 그대로, 컬 없이 전부 합성한다.
         if let Some(root) = self.root_visual_ptr() {
+            // §13 canvas-only 진단: 이번 프레임 캔버스 비주얼이 실제로 추가될 때만
+            // 그 외 비주얼 전부 생략(DWM 1레이어 — 콘텐츠층 잔여 비용 분리 측정).
+            // 캔버스 미존재/미부착 프레임은 정상 합성(블랙아웃 방지). 상태머신·Present
+            // 무접촉 — 표시 트리만 줄인다.
+            let canvas_only = self.canvas_mode
+                && dcomp_canvas_only()
+                && !self.frame_canvas_items.is_empty()
+                && self.canvas.as_ref().is_some_and(|c| c.content_attached);
+            if canvas_only && !self.warned_canvas_only {
+                self.warned_canvas_only = true;
+                log::info!(
+                    "[dcomp-native] canvas-only diagnostic active: suppressing non-canvas visuals"
+                );
+            }
             let mut canvas_added = false;
             for id in self.frame_surfaces.iter() {
                 // 공유 캔버스 underlay id → per-video 비주얼 대신 캔버스 비주얼을 최초
@@ -3331,6 +3362,9 @@ impl Compositor for DCompNativeCompositor {
                         }
                     }
                     continue;
+                }
+                if canvas_only {
+                    continue; // §13: 콘텐츠/overlay 비주얼 생략
                 }
                 let Some(entry) = self.surfaces.get(id) else { continue; };
                 // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
@@ -3519,6 +3553,15 @@ mod tests {
         assert!(canvas_alpha_opaque(Some("0")));
         assert!(canvas_alpha_opaque(Some("true")));
         assert!(canvas_alpha_opaque(Some("")));
+    }
+
+    #[test]
+    fn canvas_only_requested_only_on_literal_one() {
+        assert!(!canvas_only_requested(None));
+        assert!(canvas_only_requested(Some("1")));
+        assert!(!canvas_only_requested(Some("0")));
+        assert!(!canvas_only_requested(Some("true")));
+        assert!(!canvas_only_requested(Some("")));
     }
 
     #[test]
