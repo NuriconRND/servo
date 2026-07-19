@@ -104,6 +104,21 @@ fn video_escape_prof() -> bool {
     *ON.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_PROF").is_ok())
 }
 
+/// 공유 캔버스 스왑체인 알파 모드 판정(스펙 §12). 기본 opaque(IGNORE) — 구형 AMD의
+/// DWM premultiplied 전창 블렌딩 비용 회피. `SERVO_VIDEO_CANVAS_PREMUL=1`일 때만
+/// premultiplied 복귀(진단·A/B 레버, §12.3). 시각 등가 논증은 스펙 §12.1.
+fn canvas_alpha_opaque(token: Option<&str>) -> bool {
+    !matches!(token, Some("1"))
+}
+
+/// canvas_alpha_opaque의 env 바인딩(프로세스당 1회 캐시 — 기존 진단 env 게이트 관례).
+fn canvas_swapchain_opaque() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        canvas_alpha_opaque(std::env::var("SERVO_VIDEO_CANVAS_PREMUL").ok().as_deref())
+    })
+}
+
 /// external present 파이프라인의 초당 집계 카운터(video_escape_prof 게이트에서만 갱신).
 /// 렌더러 스레드 단일 인스턴스(DCompNativeCompositor 소유). end_frame이 매 프레임 frames++
 /// 후 maybe_flush로 1초 경과 시 라인 출력 + 리셋한다. 게이트 off면 전 필드가 0으로 유휴.
@@ -1795,7 +1810,7 @@ impl DCompNativeCompositor {
         }
     }
 
-    /// 캔버스 visual(1회)+스왑체인(창 크기, premultiplied)을 (재)생성한다. 실패 시 None 유지
+    /// 캔버스 visual(1회)+스왑체인(창 크기, 기본 opaque — §12)을 (재)생성한다. 실패 시 None 유지
     /// → 다음 프레임 자연 재시도(스펙 §6). 재생성 시 rtv_cache clear + content_attached 리셋.
     fn ensure_canvas(&mut self, size: DeviceIntSize) {
         if self.canvas.is_none() {
@@ -1827,8 +1842,11 @@ impl DCompNativeCompositor {
                 frames_logged: 0,
             });
         }
-        // 스왑체인 (재)생성. premultiplied(is_opaque=false) — 비디오 없는 영역 투명(스펙 §5.2).
-        let created = self.create_composition_swapchain(size, false);
+        // 스왑체인 (재)생성. 기본 opaque(IGNORE) — 클리어 (0,0,0,0)은 알파가 무시되어
+        // 불투명 검정으로 표시된다(스펙 §12.2; 빈 영역이 비가시임은 §12.1 등가 논증).
+        // SERVO_VIDEO_CANVAS_PREMUL=1이면 premultiplied 복귀(§12.3 진단 레버).
+        let opaque = canvas_swapchain_opaque();
+        let created = self.create_composition_swapchain(size, opaque);
         let Some(canvas) = self.canvas.as_mut() else {
             return;
         };
@@ -1840,7 +1858,11 @@ impl DCompNativeCompositor {
                 canvas.size = size;
                 self.warned_canvas_fail = false; // 성공 → 실패 warn 재무장
                 if dcomp_debug() {
-                    log::info!("[dcomp-dbg] canvas swapchain (re)create {}x{}", size.width, size.height);
+                    log::info!(
+                        "[dcomp-dbg] canvas swapchain (re)create {}x{} alpha={}",
+                        size.width, size.height,
+                        if opaque { "opaque" } else { "premul" }
+                    );
                 }
             },
             None => {
@@ -3485,6 +3507,18 @@ mod tests {
         assert_eq!(parse_video_escape_token(Some("external")), VideoEscapeMode::External);
         assert_eq!(parse_video_escape_token(Some("bogus")), VideoEscapeMode::Off);
         assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);
+    }
+
+    #[test]
+    fn canvas_alpha_opaque_defaults_and_premul_lever() {
+        // 기본(미설정) = opaque
+        assert!(canvas_alpha_opaque(None));
+        // 레버 "1"만 premultiplied 복귀 (스펙 §12.3)
+        assert!(!canvas_alpha_opaque(Some("1")));
+        // 그 외 값은 전부 opaque (오타/미지 토큰 안전 방향)
+        assert!(canvas_alpha_opaque(Some("0")));
+        assert!(canvas_alpha_opaque(Some("true")));
+        assert!(canvas_alpha_opaque(Some("")));
     }
 
     #[test]
