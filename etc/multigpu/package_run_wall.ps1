@@ -32,6 +32,8 @@
 #     content/picture-cache pass).
 #   - Recommended operating recipe once (4) is confirmed on AMD: -DComp -VideoEscape canvas
 #     (external stays available as a diagnostic/fallback lever).
+#   - Diagnostic: set SERVO_VIDEO_CANVAS_PREMUL=1 to revert the canvas to premultiplied
+#     alpha (A/B lever for DWM blend cost on old GPUs; default is opaque = cheaper).
 
 param(
     [int]    $Cols = 8,

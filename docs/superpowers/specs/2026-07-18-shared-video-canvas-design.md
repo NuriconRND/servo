@@ -212,3 +212,30 @@ VideoConvertPass에 dest-rect 변형 추가: RSSetViewports(+scissor)를 dest re
 ### 12.5 완료 기준
 
 A5000 검증 + AMD 가이드에 레버 기재 + 패키지 재생성. 푸시는 기존 보류 유지.
+
+### 12.6 구현 결과 (2026-07-19)
+
+Task 1 커밋 `53dd20d8b`(`components/paint/dcomp_compositor.rs`, +38/-4) — `canvas_alpha_opaque(Option<&str>) -> bool`(기본 opaque, `Some("1")`만 premul) + `canvas_swapchain_opaque()`(OnceLock env 바인딩) + `ensure_canvas`가 `create_composition_swapchain(size, opaque)`로 전환 + 로그 `alpha=opaque|premul` 표기. 전 태스크 완료, A5000 검증 전부 PASS.
+
+**유닛**: `cargo test -p servo-paint --lib --features paint_api/no-wgl dcomp` → **23 passed, 0 failed**(`canvas_alpha_opaque_defaults_and_premul_lever` 포함, 기본 opaque/레버 "1"만 premul/기타 토큰 전부 opaque 확인).
+
+**45타일 무회귀**(`-Cols 9 -Rows 5 -DComp -VideoEscape canvas -Sync 45`): `alpha=opaque` 마커 정확히 1회, `d3d11_active_markers=45/45`, `direct_file=45/45`, `dcomp_engaged_markers=1`(mode=hybrid). winshot 2매(5초 간격): 1차 44/45타일 000344·1타일 000343(±1 lockstep), 2차 45/45타일 000788 균일 — 정상 진행 확인.
+
+**픽셀 프로브 표**(캡처 1936×1119, OS 창 크롬 포함 좌표): 정적 비-동적 지점(topbar 배경 간극, tickerbar 배경) 각 페이지 3곳, 전 프로브 채널 차 **0** (기준 ≤1 대비 여유 통과).
+
+| 페이지 | 프로브 | 좌표 | opaque RGB | premul RGB | diff |
+|---|---|---|---|---|---|
+| mixed_media_demo (`-Cols 3 -Rows 2 -Sync 6`) | topbar 간극 | (1000,75) | (16,24,32) | (16,24,32) | (0,0,0) |
+| mixed_media_demo | tickerbar 상단 | (1000,1005) | (11,18,32) | (11,18,32) | (0,0,0) |
+| mixed_media_demo | tickerbar 우측 | (1850,1050) | (11,18,32) | (11,18,32) | (0,0,0) |
+| complex_media_stress (`-Cols 3 -Rows 3 -Sync 10`) | topbar 간극 | (1150,75) | (16,24,32) | (16,24,32) | (0,0,0) |
+| complex_media_stress | tickerbar 배경 | (1000,1095) | (11,18,32) | (11,18,32) | (0,0,0) |
+| complex_media_stress | tickerbar 배경 우측 | (1900,1095) | (11,18,32) | (11,18,32) | (0,0,0) |
+
+두 페이지 모두 반투명 패널(통계/스크롤러/자막)은 그리드 비디오 위에 직접 얹혀 있어(레이아웃상 그리드가 뷰포트 전체를 덮고 그 위에 fixed 오버레이) 프로브로 삼으면 캔버스 알파 모드가 아니라 촬영 시점 비디오 프레임 차이가 섞여 판독을 오염시킨다 — 브리프의 "패널 내부" 예시 대신 topbar/tickerbar의 완전 불투명 솔리드 배경(CSS 헥스와 정확히 일치, `#101820`/`#0b1220`)을 정적 프로브로 채택했다(브리프 "예: 배경 여백/패널 내부/티커 배경" 중 배경·티커 배경 옵션). premul 런 로그에서 `alpha=premul` 확인: mixed(`video_wall_d3d11_20260719_095003_stderr.log:200`), stress(`video_wall_d3d11_20260719_095358_stderr.log:331`). 두 opaque 런 로그도 `alpha=opaque` 1회씩 확인. stress 런(오프/온 양쪽)에서 sync-timeout WARN 없음(§11.2②의 이월 결함 이번 사이클엔 비재현).
+
+**transforms 스케일 애니 무회귀**(`-Cols 3 -Rows 3 -DComp -VideoEscape canvas -Page tests\html\complex_media_transforms.html -Sync 10`): `canvas swapchain (re)create` 로그 **정확히 1회**(`alpha=opaque`), 관측 52초(스케일 애니 구동 구간 포함) 동안 추가 재생성 **0회**, panic 0건.
+
+**패키지 재생성**: `D:\ServoWallPackage\servoshell.exe`(Task 1 빌드, 150,895,104B) + `D:\ServoWallPackage\run_wall.ps1`(`etc/multigpu/package_run_wall.ps1`에서 재복사, AMD 4자 가이드 끝에 `SERVO_VIDEO_CANVAS_PREMUL=1` 진단 레버 2행 추가) 반영 → `D:\ServoWallPackage.zip` **1,216,856,231B**(2026-07-19 09:57:55, 이전 1,216,854,445B/07-18 20:04 대비 헤더 2행분만 증가). 스모크(`-Cols 2 -Rows 2 -DComp -VideoEscape canvas`): `d3d11_active_markers=4/4`, `direct_file=4/4`, `dcomp_engaged_markers=1`(mode=hybrid) — 기동 마커 PASS.
+
+**스펙 대비 이탈**: 문서 결함 1건 — 브리프(Step 2/3) 커맨드의 `-Page mixed_media_demo.html` / `-Page complex_media_stress.html` / `-Page complex_media_transforms.html`(파일명만)은 런처의 `$Page` 파라미터가 리포 루트 기준 상대 경로(`Join-Path $servoRoot $Page`)를 요구해 그대로 실행하면 파일을 찾지 못한다 — `tests\html\<name>.html`로 실행해 해소(§11.2②에 이미 기록된 동일 범주의 문서 결함 재발, 코드 무관). 그 외 이탈 없음 — 6/6 프로브 diff 0(기준 ≤1), 45타일·transforms 판정 전부 브리프 기준 그대로 충족.
