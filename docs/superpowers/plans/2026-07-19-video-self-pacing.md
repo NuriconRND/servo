@@ -1,256 +1,163 @@
-# escape 비디오 자체 페이싱 Implementation Plan
+# 비디오 자체 페이싱 v2 (임베더 wake 수정) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **v1 기각됨(2026-07-19)**: "도착 신호 추가" 접근은 전제 오류로 스모크 게이트에서 기각(스펙 §14 v1 기각 기록). 본 문서는 v2 전면 재작성본.
 
-**Goal:** D3D11 링 경로 비디오의 프레임 도착이 컴포짓을 직접 구동하게 해(rAF/하트비트 의존 제거) 무애니 페이지 동결을 근본수정하고 AMD 잉여 컴포짓을 제거한다 (스펙 §14, 승인됨).
+**Goal:** 무rAF 페이지의 비디오 재생 동결을 근본수정하고(임베더 wake 폭풍 → RedrawRequested 기아 해소) 무애니 월에서 컴포짓을 비디오 카데이던스(~30Hz)로 수렴시킨다 (스펙 §14 v2, 승인됨).
 
-**Architecture:** script 측 프레임 렌더러 `render_d3d11_yuv_frame`(htmlmediaelement.rs — 링 경로에서 매 프레임 도착마다 실행되지만 첫 프레임 이후 보낼 ImageUpdate가 없어 §3-m 훅이 침묵)에서 신규 `PaintMessage::VideoFrameArrived(PainterId)`를 송신 → paint.rs 핸들러 → painter의 신규 `composite_for_video_arrival()`이 **§3-m 즉시 컴포짓과 동일한 가드**(rAF 활성 시 억제 / pending_frames==0 / renderer_behind 아님)를 통과할 때만 컴포짓-온리 프레임 생성. 컴포지터(canvas_flush) 무변경.
+**Architecture:** 실측 근본원인(§14.1, pacing-investigation-report.md): rAF 없으면 `is_animating=false` → WakeCoalescer 억제 비활성 → frame-ready마다 무조건 wake post → Win32 posted 메시지가 WM_PAINT에 우선 → RedrawRequested 영구 기아 → 페인트 부재 → `display_composite_in_flight` 웨지 → §3-m 즉시 컴포짓 전량 차단. 수정 2본: **② frame-ready wake를 상태 전이 시에만 post**(자기지속 폭풍 차단, 일반 방어) + **① 재생 중 미디어를 animating 판정에 반영**(script 원천 → constellation → Paint → 임베더의 기성 사슬 재사용 — rAF가 우연히 제공하던 마스킹의 정식화).
 
-**정밀화(스펙 §14.1 대비, 마감 시 §14에 기록)**: 신호 지점은 "gst 링 publish"가 아니라 script 측 렌더러다 — 같은 도착 케이던스이며 paint_api 핸들·painter 라우팅이 기성이라 더 단순. 또한 이 지점은 escape 전용이 아니라 **A-dyn 링 경로 공통**(WR direct-sample 포함)이라, 링 경로 전체의 하트비트 의존이 함께 해소된다(off 모드의 소프트웨어 YUV 경로는 기존 per-frame UpdateImage로 이미 커버 — 무접촉).
-
-**Tech Stack:** Rust (paint_api / servo-paint / script), PowerShell 검증.
+**Tech Stack:** Rust (servoshell / servo-paint / script / constellation 기성 사슬), PowerShell 검증.
 
 ## Global Constraints
 
 - 리포 `D:\2_TechReview\20260606_multigpu_browser\servo`, 브랜치 `multigpu-tiled-wall`. **푸시 금지.** 커밋 한국어, Claude 서명 금지.
-- 킬스위치 `SERVO_VIDEO_SELF_PACING` — 리터럴 "0"만 off, 그 외/미설정 = on (스펙 §14.2).
-- painter의 신규 경로는 §3-m 가드 전 항목을 반드시 유지: `animation_callbacks_running()`(rAF 주도 시 억제 — 이중 페이싱/지터 방지의 기존 설계), `pending_frames.get()==0`, `!renderer_behind()`. 컴포짓 폭주 금지(재시도 금지 목록 "vsync 드라이버"와의 차별점).
-- canvas_flush/dcomp_compositor 무접촉. off 모드(비DComp) 소프트웨어 경로 무접촉.
-- 셸 포그라운드만(백그라운드 대기 금지 — Start-Sleep은 같은 호출 안에서), 타임아웃 600000ms, 실행 후 servoshell kill+env 정리.
-- **빌드**: `Stop-Process servoshell` → `. .\etc\multigpu\servo_env.ps1` → `$ErrorActionPreference='Continue'` → `. .\.venv\Scripts\Activate.ps1` → `python mach build --release`.
-- 유닛테스트: `cargo test -p servo-paint --lib --features paint_api/no-wgl <필터>`.
+- **§3-2 제약(절대)**: wake post 총량은 증가 금지 — 감소 방향만. 입력 처리 경로(WakeCoalescer의 억제 로직 자체, PeekMessage 순서 대응) 무접촉. 입력 무회귀는 Task 3에서 실측 필수.
+- 킬스위치 2종(각 리터럴 "1"만 발동, 순수 함수+OnceLock 관례): `SERVO_DISABLE_WAKE_EDGE=1`(② 복귀), `SERVO_DISABLE_MEDIA_ANIMATING=1`(① 복귀).
+- 근거 문서: `docs/superpowers/specs/2026-07-18-shared-video-canvas-design.md` §14 v2, `.superpowers/sdd/pacing-investigation-report.md`(체인 표 file:line·계측 수치 — **구현 전 필독, 정확 지점의 정본**).
+- 셸 포그라운드만(백그라운드 대기 금지 — 대기는 같은 호출 안 Start-Sleep), 타임아웃 600000ms, 실행 후 servoshell kill+env 정리.
+- **빌드**: `Stop-Process servoshell` → `. .\etc\multigpu\servo_env.ps1` → `$ErrorActionPreference='Continue'` → `. .\.venv\Scripts\Activate.ps1` → `python mach build --release` (script/constellation 변경 시 오래 걸림 — 10분 타임아웃).
+- 유닛: `cargo test -p servo-paint --lib --features paint_api/no-wgl <필터>` (paint 크레이트 대상일 때). servoshell 순수 함수는 `cargo test -p servoshell <필터>` — 실패 시 해당 크레이트 테스트 관례를 확인해 맞출 것.
 - 런처 `-Page`는 리포 루트 상대경로. winshot은 `scratchpad\shot.png` 고정 → 복사.
+- **무rAF 스모크 페이지**: `tests\html\video_grid_wall_clean.html`에서 rAF 블록만 제거한 사본을 `tests\html\zz_noraf_smoke.html`로 생성해 사용(각 태스크에서 생성/삭제 반복 대신 Task 1이 만들고 Task 3 마지막에 삭제).
 
 ---
 
-### Task 1: 도착 신호 배관 (PaintMessage → painter 가드 컴포짓)
+### Task 1: ② frame-ready wake 전이 억제 (edge-trigger)
 
 **Files:**
-- Modify: `components/shared/paint/lib.rs` (`PaintMessage` enum :92 부근에 variant, `update_images` 송신 함수(:479) 옆에 sender)
-- Modify: `components/paint/paint.rs` (`PaintMessage::UpdateImages` 핸들러(:1829 부근) 옆에 새 arm)
-- Modify: `components/paint/painter.rs` (env static(:60-68 기존 비디오 게이트들 옆) + 순수 함수 + `composite_for_video_arrival` + tests)
-- Modify: `components/script/dom/html/htmlmediaelement.rs` (`render_d3d11_yuv_frame` 말미에 송신 1줄)
+- Modify: 조사 보고서 체인 표의 **F 지점**(frame-ready → 무조건 `event_loop_waker.wake()` post 위치 — components/servo 또는 components/paint 쪽, 보고서 file:line이 정본) — wake를 "미결(outstanding) 상태 false→true 전이"에서만 post하도록.
+- Modify: 같은 보고서의 **H 지점**(임베더 페인트/RedrawRequested 처리 완료 지점)에서 미결 상태 리셋 — 전이 부기의 해제 짝.
+- Test: 전이 판정을 순수 함수/작은 타입으로 분리해 유닛(해당 크레이트 tests 모듈).
 
 **Interfaces:**
-- Consumes: 기존 `CrossProcessPaintApi(self.0: IpcSender<PaintMessage>)` 패턴, painter의 `generate_frame(&self, &mut Transaction, RenderReasons)` / `pending_frames` / `renderer_behind()` / `animation_callbacks_running()` / `display_composite_in_flight`, htmlmediaelement의 `self.paint_api`+`self.webview_id`.
-- Produces: `PaintMessage::VideoFrameArrived(PainterId)`; `CrossProcessPaintApi::notify_video_frame_arrived(&self, painter_id: PainterId)`; `Painter::composite_for_video_arrival(&mut self)`(pub(crate)); 순수 함수 `video_self_pacing_enabled(token: Option<&str>) -> bool` — Task 2 검증이 킬스위치 거동에 의존.
+- Consumes: pacing-investigation-report.md의 F/H 지점 file:line, 기존 wake 경로.
+- Produces: `fn wake_edge_suppressed(token: Option<&str>) -> bool`(킬스위치 순수 판정 — "1"만 true=복귀) + 전이 부기 타입(예: `WakeEdge { outstanding: AtomicBool }` — set-if-clear가 post 허용을 반환, 페인트 시 clear). Task 2·3이 킬스위치 이름에 의존: `SERVO_DISABLE_WAKE_EDGE`.
 
-- [ ] **Step 1: 실패하는 테스트 작성**
+- [ ] **Step 1: 조사 보고서 정독** — `.superpowers/sdd/pacing-investigation-report.md`의 체인 표(A~I 지점 file:line)와 WORKING/BROKEN 로그 대비를 읽고 F/H의 정확 위치·주변 코드를 파악한다.
 
-`components/paint/painter.rs`에 tests 모듈이 없으면 파일 말미에 추가:
+- [ ] **Step 2: 실패하는 유닛테스트 작성** — 전이 부기 의미론(핵심 계약: 연속 set은 첫 번째만 post 허용, clear 후 set은 다시 허용 — "마지막 wake 유실 없음"):
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::video_self_pacing_enabled;
+    #[test]
+    fn wake_edge_posts_only_on_transition() {
+        let edge = WakeEdge::default();
+        assert!(edge.should_post());   // 첫 래치 → post
+        assert!(!edge.should_post());  // 미결 유지 중 → 억제
+        assert!(!edge.should_post());
+        edge.clear();                  // 페인트 완료
+        assert!(edge.should_post());   // 새 전이 → 다시 post (유실 없음)
+    }
 
     #[test]
-    fn video_self_pacing_enabled_default_on_literal_zero_off() {
-        // 기본(미설정) = on (스펙 §14.2)
-        assert!(video_self_pacing_enabled(None));
-        // 리터럴 "0"만 off
-        assert!(!video_self_pacing_enabled(Some("0")));
-        // 그 외 값은 전부 on (오타 안전 방향)
-        assert!(video_self_pacing_enabled(Some("1")));
-        assert!(video_self_pacing_enabled(Some("off")));
-        assert!(video_self_pacing_enabled(Some("")));
-    }
-}
-```
-
-- [ ] **Step 2: 실패 확인**
-
-Run: `cargo test -p servo-paint --lib --features paint_api/no-wgl self_pacing`
-Expected: 컴파일 실패 — `cannot find function video_self_pacing_enabled`
-
-- [ ] **Step 3: painter 구현**
-
-`components/paint/painter.rs` — 기존 비디오 게이트 statics(:60-68, `VIDEO_UPDATE_COALESCE_DISABLED` 등) 옆에 (해당 파일의 static 선언 관례를 그대로 따라 — LazyLock/Lazy 형태 확인 후 동일하게):
-
-```rust
-/// escape/링 경로 비디오 자체 페이싱 킬스위치(스펙 §14.2). 기본 on —
-/// `SERVO_VIDEO_SELF_PACING=0`(리터럴)일 때만 off. 순수 판정은
-/// `video_self_pacing_enabled` (TDD 대상).
-fn video_self_pacing_enabled(token: Option<&str>) -> bool {
-    !matches!(token, Some("0"))
-}
-
-static VIDEO_SELF_PACING: LazyLock<bool> = LazyLock::new(|| {
-    video_self_pacing_enabled(std::env::var("SERVO_VIDEO_SELF_PACING").ok().as_deref())
-});
-```
-
-(파일이 `once_cell::sync::Lazy`를 쓰면 그 형태로 — 주변 static과 동일 idiom 필수.)
-
-`update_images` 근처에 신규 메서드 — **가드 구성은 update_images 말미의 즉시 컴포짓 블록(:2027-2036)과 정확히 동일한 항목**(그 블록의 장문 주석이 각 가드의 존재 이유 — 특히 rAF 억제):
-
-```rust
-    /// D3D11 링 경로 비디오의 프레임 도착 신호(스펙 §14). 링 경로는 첫 프레임 이후
-    /// ImageUpdate가 없어 update_images의 즉시 컴포짓 훅이 침묵한다 — 이 메서드가
-    /// 같은 가드로 그 빈자리를 채운다(리소스 업데이트 없는 컴포짓-온리 프레임).
-    /// 가드 의미론은 update_images 말미 블록과 동일: rAF가 케이던스를 주도 중이면
-    /// 양보(이중 페이싱 지터 방지), in-flight/백로그 시 신호 소멸(폭주 불가).
-    pub(crate) fn composite_for_video_arrival(&mut self) {
-        if !*VIDEO_SELF_PACING {
-            return;
-        }
-        if self.animation_callbacks_running() ||
-            self.pending_frames.get() != 0 ||
-            self.renderer_behind()
-        {
-            return;
-        }
-        let mut txn = Transaction::new();
-        self.generate_frame(&mut txn, RenderReasons::SCENE);
-        self.display_composite_in_flight.set(true);
-        self.send_transaction(txn);
+    fn wake_edge_killswitch_literal_one_only() {
+        assert!(!wake_edge_suppressed(None));
+        assert!(wake_edge_suppressed(Some("1")));
+        assert!(!wake_edge_suppressed(Some("0")));
+        assert!(!wake_edge_suppressed(Some("true")));
     }
 ```
 
-- [ ] **Step 4: 메시지/핸들러/송신 구현**
+(타입/함수 배치는 F 지점이 속한 크레이트의 관례를 따르되 이름은 위와 동일하게. 킬스위치=1이면 `should_post()`를 항상 true로 우회 — 현행 무조건 post 복귀.)
 
-`components/shared/paint/lib.rs` — `PaintMessage` enum의 `UpdateImages`(:155) 옆:
+- [ ] **Step 3: 실패 확인** — 해당 크레이트 test 명령으로 컴파일 실패 확인.
 
-```rust
-    /// D3D11 링 경로 비디오 프레임 도착 알림(스펙 §14) — 리소스 업데이트 없이
-    /// painter의 도착 구동 컴포짓만 요청. UpdateImages와 동일한 painter 라우팅.
-    VideoFrameArrived(PainterId),
-```
+- [ ] **Step 4: 구현** — F 지점: `if edge.should_post() { waker.wake() }` (킬스위치 우회 포함). H 지점: 페인트 완료 시 `edge.clear()`. ★주의: clear는 "페인트가 실제로 일어난" 지점이어야 함 — 큐에서 Waker 이벤트를 꺼낸 시점이 아님(그러면 폭풍이 재발). 조사 보고서 H(=RedrawRequested→repaint 처리) 기준.★ 부기 접근이 스레드 경계를 넘으면 AtomicBool(SeqCst — WakeCoalescer 주석의 순서 논증 참조) 사용.
 
-같은 파일 `update_images` 송신 함수(:479) 옆:
+- [ ] **Step 5: 유닛 PASS + 빌드** — 신규 2테스트 PASS, `cargo test -p servo-paint --lib --features paint_api/no-wgl dcomp` 무회귀, 릴리스 빌드 성공.
 
-```rust
-    /// 링 경로 비디오의 프레임 도착 신호(스펙 §14). 페이로드 없음 — painter가
-    /// 자체 가드로 병합/폐기한다.
-    pub fn notify_video_frame_arrived(&self, painter_id: PainterId) {
-        if let Err(e) = self.0.send(PaintMessage::VideoFrameArrived(painter_id)) {
-            warn!("Could not send video frame arrival to Paint {}", e);
-        }
-    }
-```
-
-`components/paint/paint.rs` — `PaintMessage::UpdateImages` arm(:1829 부근) 옆에 새 arm. **painter 라우팅은 UpdateImages arm과 동일 방식**(그 arm이 wall fanout으로 target_painter_ids를 계산하면 같은 대상 집합에, 아니면 `maybe_painter_mut(painter_id)` 단일 대상에 — 실제 UpdateImages arm의 라우팅 코드를 읽고 그대로 미러링하되 이미지 데이터 관련 부분만 제외):
-
-```rust
-            PaintMessage::VideoFrameArrived(painter_id) => {
-                // UpdateImages와 동일한 대상 painter(들)에 도착 컴포짓을 요청한다.
-                // (wall fanout 구성이면 동일 target 집합 — UpdateImages arm의 라우팅 미러.)
-                if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                    painter.composite_for_video_arrival();
-                }
-            },
-```
-
-(UpdateImages arm에 fanout 분기가 있으면 — :1810 부근 `target_painter_ids` — 그 로직을 이 arm에도 적용해 각 target painter에 `composite_for_video_arrival()` 호출. 이미지 벡터 복제는 불필요.)
-
-`components/script/dom/html/htmlmediaelement.rs` — `render_d3d11_yuv_frame`의 정상 경로 말미(기존 `self.paint_api.update_images(...)` 호출 뒤 또는 updates가 비어 보내지 않는 경로 포함 — **매 프레임 반드시 1회** 실행되는 위치에):
-
-```rust
-        // 스펙 §14: 링 경로는 첫 프레임 이후 ImageUpdate가 없어 도착 신호를 별도로
-        // 보낸다 — painter가 rAF 부재 시 이 신호로 컴포짓을 페이싱한다(가드/병합은
-        // painter 몫, 여기선 무조건 1회 송신).
-        self.paint_api
-            .notify_video_frame_arrived(self.webview_id.into());
-```
-
-- [ ] **Step 5: 유닛 + 스위트 + 빌드**
-
-Run: `cargo test -p servo-paint --lib --features paint_api/no-wgl self_pacing` → PASS
-Run: `cargo test -p servo-paint --lib --features paint_api/no-wgl dcomp` → 전부 PASS
-릴리스 빌드(Global Constraints 순서) → 성공.
-
-- [ ] **Step 6: 2×2 동결 수정 스모크 (결정 게이트)**
-
-빈 rAF가 **없는** 임시 페이지로 확인 — `tests\html\video_grid_wall_clean.html`을 임시 복사해 rAF 블록만 삭제한 `scratchpad\clean_noraf.html`을 만들고 `tests\html\zz_tmp_noraf.html`로 복사(검증 후 삭제):
-
+- [ ] **Step 6: 무rAF 스모크 (② 단독 효과 판독)** — `tests\html\zz_noraf_smoke.html` 생성(위 Global Constraints), 실행:
 ```powershell
-$env:SERVO_DCOMP_DEBUG = "1"; $env:SERVO_VIDEO_ESCAPE_PROF = "1"
-.\etc\multigpu\run_video_wall_d3d11.ps1 -Cols 2 -Rows 2 -DComp -VideoEscape canvas -Page tests\html\zz_tmp_noraf.html -Sync 4
-# (같은 호출에서 Start-Sleep 40 → winshot 2매(5초 간격) → Stop-Process)
+$env:SERVO_DCOMP_DEBUG="1"; $env:SERVO_VIDEO_ESCAPE_PROF="1"
+.\etc\multigpu\run_video_wall_d3d11.ps1 -Cols 2 -Rows 2 -DComp -VideoEscape canvas -Page tests\html\zz_noraf_smoke.html -Sync 4
+# 같은 호출: Start-Sleep 40 → winshot → 복사(edge_on_a.png) → Start-Sleep 5 → winshot → 복사(edge_on_b.png) → Stop-Process
 ```
-판독: **rAF 없이 재생 진행**(두 캡처 카운터 전진 = 동결 소멸 — 이전엔 동결이 실증된 조건), vesc-prof `frames/presents ≈ 30/s`(비디오 카데이던스). 이어 `$env:SERVO_VIDEO_SELF_PACING="0"`으로 재실행 → **동결 재현**(킬스위치 실효 + 수정 인과 증명). env 정리, zz_tmp 파일 삭제.
+판독: 카운터 전진 여부(② 단독으로 동결이 풀리는지 — 예상: 풀림) + vesc-prof frames/presents(수치 기록 — ~30/s 수렴 여부는 ① 이후 최종 판정). `$env:SERVO_DISABLE_WAKE_EDGE="1"` 재실행 → 동결 재현(킬스위치 실효). env 정리. **어느 쪽이든 관측 결과를 있는 그대로 리포트에** — ②로 안 풀리면 DONE_WITH_CONCERNS로 보고(①이 주 수정).
 
 - [ ] **Step 7: 커밋**
-
 ```powershell
-git add components/shared/paint/lib.rs components/paint/paint.rs components/paint/painter.rs components/script/dom/html/htmlmediaelement.rs
-git commit -m "링 경로 비디오 자체 페이싱: 프레임 도착 신호(VideoFrameArrived)로 컴포짓 구동, rAF/하트비트 의존 해제(스펙 14, 킬스위치 SERVO_VIDEO_SELF_PACING=0)"
+git commit -m "frame-ready wake 전이 억제: 자기지속 wake 폭풍 차단(RedrawRequested 기아 해소 1/2, 스펙 14 v2 ②, 킬스위치 SERVO_DISABLE_WAKE_EDGE)"
+```
+(git add 대상은 실제 수정 파일 — F/H 지점 크레이트에 따름.)
+
+---
+
+### Task 2: ① 미디어 재생 → animating 전파
+
+**Files:**
+- Modify: `components/script/dom/html/htmlmediaelement.rs` — 재생 상태 전이(재생 시작/일시정지/종료/제거) 지점에서 문서 단위 재생 카운터 증감. 전이 지점은 요소의 기존 상태 머신에서 "실제 프레임을 렌더하기 시작/중단"에 해당하는 대칭쌍을 찾아 사용(예: playing 전이와 pause/ended/teardown — 파일 내 기존 상태 전이 메서드 정독 후 대칭 보장).
+- Modify: `components/script/animations.rs:192-205` `handle_animation_presence_or_pending_events_change` — 상태 계산에 재생 중 미디어 반영.
+- Modify: 카운터 보관처 — `Document`(또는 Window) 필드 + 증감 메서드 + 증감 시 상태 재전송 트리거.
+- Test: 상태 판정 순수 함수 유닛(가능한 형태로) + 킬스위치 순수 함수.
+
+**Interfaces:**
+- Consumes: 기성 사슬 — script `ChangeRunningAnimationsState`(animations.rs:202) → constellation(:1817→:3737 `PaintMessage::ChangeRunningAnimationsState`) → Paint → 임베더 `WebView::set_animating` → servoshell `animating_webviews`/`is_animating`(running_app_state.rs:335) → WakeCoalescer(app.rs:280-295). **이 사슬은 전부 무수정** — 원천(script 상태 계산)에만 미디어를 더한다.
+- Produces: `fn media_animating_disabled(token: Option<&str>) -> bool`("1"만 true) — env `SERVO_DISABLE_MEDIA_ANIMATING`; Document의 `note_playing_video_delta(i32)`(이름 재량, 카운터 0↔양수 전이 시 `handle_animation_presence_or_pending_events_change` 재평가 트리거 필수).
+
+- [ ] **Step 1: 실패하는 테스트** — 상태 계산 순수화가 가능하면:
+```rust
+    #[test]
+    fn animations_present_includes_playing_media() {
+        // (기존 계산이 순수 함수로 분리 가능한 형태일 때 — 아니면 킬스위치 함수만 유닛하고
+        //  상태 반영은 Task 3 실기 배터리에서 검증한다고 리포트에 명시)
+        assert!(animations_present_state(false, false, 1));  // 미디어만 재생 → Present
+        assert!(!animations_present_state(false, false, 0)); // 전부 없음 → NoAnimations
+        assert!(animations_present_state(true, false, 0));   // 기존 애니 경로 보존
+    }
+```
++ 킬스위치 리터럴 테스트(Task 1 Step 2와 동형, 이름만 `media_animating_disabled`).
+
+- [ ] **Step 2: 실패 확인 → 구현** — 계산부(:198-201)를 `has_running_animations || has_pending_events || (media_animating_enabled && playing_video_count > 0)`로. 카운터 증감의 대칭성(누수 시 영구 animating = Poll 상시 = CPU 회귀)을 요소 해체 경로까지 포함해 보장. 킬스위치는 env 1회 읽기.
+
+- [ ] **Step 3: 유닛 PASS + 빌드** (script 변경 — 풀빌드 김).
+
+- [ ] **Step 4: 스모크 (①+② 합산 최종 판독)** — Task 1과 동일 무rAF 페이지:
+판독 3종: (a) 카운터 전진(동결 소멸) (b) **vesc-prof frames/presents ≈ 30/s 수렴**(§14.2 성능 목표 — ①로 §3-m 훅이 도착률 구동) (c) `SERVO_DISABLE_MEDIA_ANIMATING="1"` 시 ② 단독 거동으로 복귀(Task 1 Step 6 관측과 일치). 재생 종료/일시정지 후 animating 해제 확인(로그 또는 창 유휴 CPU — Poll 잔류 없음).
+
+- [ ] **Step 5: 커밋**
+```powershell
+git commit -m "재생 중 미디어를 animating 판정에 반영: WakeCoalescer 억제 정식화(동결 근본수정 2/2, 스펙 14 v2 ①, 킬스위치 SERVO_DISABLE_MEDIA_ANIMATING)"
 ```
 
 ---
 
-### Task 2: 페이지/가이드 되돌림 + 검증 배터리 + 패키지 + 스펙 기록
+### Task 3: 검증 배터리(입력 무회귀 포함) + 페이지/가이드 되돌림 + 패키지 + 스펙 기록
 
 **Files:**
-- Modify: `tests/html/video_grid_wall_clean.html` (빈 rAF 루프+load-bearing 주석 제거 → "자체 페이싱이 담당(스펙 §14)" 주석으로 교체)
-- Modify: `etc/multigpu/package_run_wall.ps1` (rAF caution 블록을 자체 페이싱 안내로 교체 + AMD 판독 항목 1줄: 자체 페이싱 후 GPU% 하락 예측 ~56%)
-- Modify: `docs/superpowers/specs/2026-07-18-shared-video-canvas-design.md` (`### 14.6 구현 결과` + §14.1 정밀화 기록: 신호 지점=script 렌더러, 적용 범위=링 경로 공통)
-- 패키지: exe/런처/페이지 재복사 + zip 재생성
+- Modify: `tests/html/video_grid_wall_clean.html`(빈 rAF 제거 → "자체 페이싱(스펙 §14 v2)" 주석), `etc/multigpu/package_run_wall.ps1`(rAF caution → v2 안내+AMD 판독 항목), 스펙 `§14.6 구현 결과`.
+- 패키지: exe/런처/페이지 재복사+zip. 삭제: `tests\html\zz_noraf_smoke.html`.
 
 **Interfaces:**
-- Consumes: Task 1의 신호 경로·킬스위치, 기존 검증 도구(winshot/vesc-prof/런처).
-- Produces: 검증 기록. Rust 변경 0(Task 1 빌드 그대로).
+- Consumes: Task 1·2의 킬스위치 2종, 기존 도구(winshot/vesc-prof/`tests/html/mouse_count_probe.html`/scratchpad의 synth mouse wiggle 스크립트 — §3-2 검증에 쓰였던 것들).
 
-- [ ] **Step 1: 클린 페이지 rAF 제거**
+- [ ] **Step 1: 클린 페이지 rAF 제거** — 빈 rAF 블록+주석 삭제, 교체 주석: `<!-- 스펙 §14 v2: 재생 중 미디어가 animating으로 반영되고 frame-ready wake가 전이 억제되어, 이 페이지는 rAF 없이 임베더가 페인트를 정상 순환한다. 킬스위치 SERVO_DISABLE_MEDIA_ANIMATING=1 + SERVO_DISABLE_WAKE_EDGE=1 동시 설정 시에만 동결 재현(진단). -->`
 
-`video_grid_wall_clean.html`에서 빈 rAF 루프와 그 위 load-bearing 사유 주석 블록을 제거하고 교체:
+- [ ] **Step 2: 45타일 핵심 게이트** — `-Cols 9 -Rows 5 -DComp -VideoEscape canvas -Page tests\html\video_grid_wall_clean.html -Sync 45`, PROF on, 60초: 재생 정상(winshot 2매 lockstep·전진) + **frames/presents ≈ 30/s** + canvas 재생성 1회.
 
-```html
-<!-- 스펙 §14(2026-07-19): 링 경로 비디오는 프레임 도착 신호가 컴포짓을 자체
-     페이싱하므로 이 페이지에 rAF/하트비트가 필요 없다(§13.4 이탈1의 빈 rAF
-     load-bearing 해제). 킬스위치 SERVO_VIDEO_SELF_PACING=0 시에만 동결됨(진단). -->
-```
+- [ ] **Step 3: ★입력 무회귀 (§3-2 재발 방지 — 필수 게이트)★** — ①로 비디오 재생 중 animating=true가 되어 wake 억제 구간이 넓어졌으므로, §3-2 당시 도구로 마우스 전달률 재확인: 2×2 canvas + `tests/html/mouse_count_probe.html`(비디오 없는 프로브 페이지라면 비디오 페이지에서 synth wiggle과 함께 — scratchpad의 `wall_synth_mouse_wiggle.ps1` 계열 존재, ★SetCursorPos 방식이어야 함: 상대 SendInput은 가짜 0 함정(§3-2 기록)★). 판독: 재생 중 마우스 이벤트 전달률이 §3-2 수정 후 수준(0이 아닌 정상 카운트)인지. 프로브 페이지가 비디오와 동시 로드 불가 구조면 비디오 월 위에서 wiggle→로그의 입력 이벤트 카운트로 대체하고 방법을 리포트에 명시.
 
-- [ ] **Step 2: 45타일 검증 (핵심 게이트)**
+- [ ] **Step 4: 무회귀 배터리** — perf 페이지(rAF 월: 컴포짓률 이상 상승 없음·재생 정상), mixed_media_demo(-Sync 6: 전 요소 정상), play 페이지 escape off(`-Cols 3 -Rows 3 -DComp`: WR 경로 정상), off(비DComp 2×2: 소프트웨어 경로 정상), 킬스위치 2종 각각=1 조합 스모크(각 복귀 거동 — Task 1/2 관측 인용 가능).
 
+- [ ] **Step 5: 가이드/패키지** — package_run_wall.ps1의 rAF caution 블록 교체(영어):
 ```powershell
-$env:SERVO_DCOMP_DEBUG = "1"; $env:SERVO_VIDEO_ESCAPE_PROF = "1"
-.\etc\multigpu\run_video_wall_d3d11.ps1 -Cols 9 -Rows 5 -DComp -VideoEscape canvas -Page tests\html\video_grid_wall_clean.html -Sync 45
+#   NOTE (self-pacing v2, 2026-07-19): playing media now counts as "animating" and
+#   frame-ready wakes are edge-triggered, so wall pages need NO rAF/heartbeat and
+#   composites converge to the video cadence (~30/s on the wall). Diagnosis levers:
+#   SERVO_DISABLE_MEDIA_ANIMATING=1 / SERVO_DISABLE_WAKE_EDGE=1 (set both to reproduce
+#   the old rAF-dependent freeze). Expected on AMD at 6x6: canvas GPU% ~90% -> ~56%.
 ```
-60초 관측(포그라운드 Start-Sleep 분할): ①재생 정상(winshot 2매 카운터 전진+lockstep) ②vesc-prof **frames/presents ≈ 30/s 수렴**(§14.4 — 기존 빈 rAF 시절 36-47/s에서 하락) ③`canvas swapchain (re)create` 1회. 종료.
+패키지: exe+run_wall.ps1+클린 페이지 복사 → zip 재생성 → 패키지 스모크(2×2 클린 페이지 재생). `zz_noraf_smoke.html` 삭제.
 
-- [ ] **Step 3: 무회귀 배터리**
-
-각 60초 내외, 판독 기준 포함:
-1. **perf 페이지(rAF 있는 월)**: `-Cols 9 -Rows 5 -DComp -VideoEscape canvas -Sync 45` — rAF 활성 페이지에서 컴포짓률이 기존(~60/s)에서 이상 상승하지 않는지(vesc-prof — `animation_callbacks_running` 억제 가드 실효 증거), 재생 정상.
-2. **mixed_media_demo**: `-Cols 3 -Rows 2 ... -Page tests\html\mixed_media_demo.html -Sync 6` — 전 요소 정상(시계/티커/자막), presents<frames 유지.
-3. **WR direct-sample 경로(escape off + DComp)**: `-Cols 3 -Rows 3 -DComp` (play 페이지 기본) — 링 경로 공통 신호가 WR 모드에서도 무해(재생 정상, 하트비트 dot 페이지라 rAF... play 페이지는 rAF 하트비트가 있으므로 억제 가드 경로 — 정상 재생만 확인).
-4. **off(비DComp)**: `-Cols 2 -Rows 2` (DComp 스위치 없이) — 소프트웨어 경로 무접촉 확인(재생 정상).
-5. **킬스위치**: Task 1 Step 6에서 이미 동결 재현으로 검증 — 결과만 인용.
-
-- [ ] **Step 4: 가이드/패키지**
-
-`package_run_wall.ps1`: 기존 "empty rAF 유지" caution 블록을 교체(영어):
-
+- [ ] **Step 6: 스펙 §14.6 결과 + 커밋** — `### 14.6 구현 결과 (2026-07-19, v2)`: 커밋 체인, ②단독/①+② 스모크 수치, 45타일 30/s, 입력 무회귀 수치, 무회귀 4종, 이탈(없으면 "이탈 없음").
 ```powershell
-#   NOTE (self-pacing, 2026-07-19): ring-path video now drives composites from frame
-#   arrival (SERVO_VIDEO_SELF_PACING=0 reverts to page-rAF pacing for diagnosis).
-#   Wall pages no longer need a rAF/heartbeat. Expected on AMD: canvas GPU% drops
-#   (~90% -> ~56% at 6x6) as composites converge to the 30fps video cadence.
-```
-
-패키지 재생성:
-```powershell
-Copy-Item target\release\servoshell.exe D:\ServoWallPackage\ -Force
-Copy-Item etc\multigpu\package_run_wall.ps1 D:\ServoWallPackage\run_wall.ps1 -Force
-Copy-Item tests\html\video_grid_wall_clean.html D:\ServoWallPackage\tests\html\ -Force
-Compress-Archive -Path D:\ServoWallPackage\* -DestinationPath D:\ServoWallPackage.zip -Force
-```
-패키지 스모크: `-Cols 2 -Rows 2 -DComp -VideoEscape canvas -Page tests\html\video_grid_wall_clean.html -Sync 4` 기동 마커+재생.
-
-- [ ] **Step 5: 스펙 §14.6 결과 + 커밋**
-
-`### 14.6 구현 결과 (2026-07-19)`: 커밋 SHA, §14.1 정밀화(신호 지점=script 렌더러 `render_d3d11_yuv_frame`, 적용 범위=A-dyn 링 경로 공통 — escape 한정 아님·off 소프트웨어 경로 무접촉), 검증 수치(동결 소멸/presents≈30/무회귀 4종/킬스위치 동결 재현), 이탈(없으면 "이탈 없음").
-
-```powershell
-git add tests/html/video_grid_wall_clean.html etc/multigpu/package_run_wall.ps1 docs/superpowers/specs/2026-07-18-shared-video-canvas-design.md
-git commit -m "자체 페이싱 마감: 클린 페이지 rAF 제거(동결 수정 실증), 무회귀 배터리, AMD 가이드 갱신, 패키지 재생성(스펙 14.6)"
+git commit -m "자체 페이싱 v2 마감: 클린 페이지 rAF 제거(동결 수정 실증), 입력 무회귀 실측, AMD 가이드 갱신, 패키지 재생성(스펙 14.6)"
 ```
 
 ---
 
 ## Self-Review 결과
 
-1. **스펙 커버리지**: §14.1 신호+가드→Task 1(가드 4종 명시), §14.2 게이트/킬스위치→Task 1(순수 함수 TDD), §14.3 페이지 되돌림→Task 2 Step 1(+검증 수단으로 Step 2), §14.4 검증 4항→Task 1 Step 6+Task 2 Step 2-3, §14.5 완료 기준→Task 2 Step 4-5. 갭 없음. §14.1의 "gst publish 지점" 문면과 실제 신호 지점(script 렌더러)의 차이는 계획 헤더+Task 2 Step 5에서 스펙 정밀화로 기록하도록 명시.
-2. **플레이스홀더**: 없음 — 라우팅 미러("UpdateImages arm과 동일")는 대상 코드 위치(:1810-1830)와 방법을 명시한 지시이며 구현 코드도 기본형 제공.
-3. **타입 일관성**: `PaintMessage::VideoFrameArrived(PainterId)` / `notify_video_frame_arrived(&self, painter_id: PainterId)` / `composite_for_video_arrival(&mut self)` / `video_self_pacing_enabled(Option<&str>) -> bool` — 정의·사용 전 태스크 일치.
+1. **스펙 커버리지(v2)**: §14.1 근본원인→계획 전제(조사 보고서 필독 지시), §14.2 ②→Task 1, ①→Task 2, 킬스위치 2종→각 태스크, §14.3 페이지 되돌림→Task 3 Step 1, §14.4 검증 1~4→Task 1/2 유닛+Task 3 Step 2-4(입력 무회귀 Step 3 명시), §14.4-5 AMD 가이드→Task 3 Step 5. 갭 없음.
+2. **플레이스홀더**: F/H 지점 file:line은 pacing-investigation-report.md(실존 증거 문서, 체인 표 보유)를 정본으로 지정 — 계획 내 재전사 대신 참조(구현자 필독 Step 1). Task 2 Step 1 테스트에 "순수화 불가 시 대체 검증 명시" 분기 포함 — 조건부이지 공백 아님.
+3. **타입 일관성**: `WakeEdge{should_post/clear}`, `wake_edge_suppressed`/`media_animating_disabled`(둘 다 Some("1")만 true), env 2종 이름 — 태스크 간 일치.
