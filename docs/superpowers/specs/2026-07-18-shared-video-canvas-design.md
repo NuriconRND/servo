@@ -289,7 +289,7 @@ Task 1 커밋 `53dd20d8b`(`components/paint/dcomp_compositor.rs`, +38/-4) — `c
 
 ### 13.4 구현 결과 (2026-07-19)
 
-커밋 `<PENDING-SELF-SHA>`(`tests/html/video_grid_wall_clean.html` 신규 + `etc/multigpu/package_run_wall.ps1`/본 스펙 파일 갱신, Rust 코드 변경 0 — 이 파일 자신이 포함된 커밋이라 SHA를 사전 기입할 수 없어, 커밋 직후 별도 1줄 정정 커밋으로 채운다). Task 1 게이트 커밋 `ca781526f` 위에서 실행(A5000, `target\release\servoshell.exe` 2026-07-19 12:44 빌드 — Task 1 빌드 그대로, 재빌드 없음).
+커밋 `58b49e96e`(`tests/html/video_grid_wall_clean.html` 신규 + `etc/multigpu/package_run_wall.ps1`/본 스펙 파일 갱신, Rust 코드 변경 0). Task 1 게이트 커밋 `ca781526f` 위에서 실행(A5000, `target\release\servoshell.exe` 2026-07-19 12:44 빌드 — Task 1 빌드 그대로, 재빌드 없음).
 
 **페이지 사본**: `tests/html/video_grid_wall_clean.html` — `video_grid_6x6_perf.html`(원본 무변경 확인됨) 사본에서 `#stats` CSS 블록(구 :41-53)·`<div id="stats">`(구 :59)·JS 진단 심볼(`stats`, `LOG`, `startTime`/`lastSample`/`rafSinceSample`/`lastDecoded`/`lastDropped`/`fps`/`decPerSec`/`dropPerSec`/`lastFrameTs`/`maxGapMs`/`jitterMs`, `decodedFrames`/`droppedFrames`/`sumDecoded`/`sumDropped`/`countPlaying`/`countLooping` — 전부 tick() 전용 심볼로 확인 후 제거)와 rAF `tick()` 함수 정의·최초 호출을 제거. 그리드 생성(COLS/ROWS/TILE_COUNT/tileW/tileH/STAGGER/DOM 오버레이)과 재생(`v.play()`/`playErrors`) 로직은 원본 그대로 유지. UTF-8 저장(BOM 없음, `xxd` 첫 바이트 `3c21`=`<!`로 확인), 한글 주석 인코딩 손상 없음. Step 1 확인 실행(`-Cols 3 -Rows 3 -DComp -VideoEscape canvas -Sync 9`): 9타일 재생 정상, HUD 없음(winshot `scratchpad\canvas_only_step1_confirm2.png`).
 
