@@ -37,6 +37,7 @@ use script_bindings::cell::DomRefCell;
 use script_bindings::codegen::InheritTypes::{
     ElementTypeId, HTMLElementTypeId, HTMLMediaElementTypeId, NodeTypeId,
 };
+use script_bindings::script_runtime::runtime_is_alive;
 use script_bindings::weakref::WeakRef;
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::WebViewId;
@@ -1360,6 +1361,46 @@ enum LoopCondition {
     Ignored,
 }
 
+/// RAII guard mirroring `LoadBlocker` (`document_loader.rs`): while held, this element
+/// counts as one playing `<video>` in the owning document's animating-presence tally
+/// (`Document::note_playing_video_delta`, self-pacing v2 spec §14 v2 task ①). Constructing
+/// the guard increments the tally; dropping it (explicitly, by clearing the `Option` that
+/// holds it, or implicitly when the element itself is garbage-collected while still
+/// "counted" -- e.g. a `<video>` created and abandoned by script while playing without ever
+/// being attached to a document, so `unbind_from_tree`'s pause path never runs) always
+/// decrements it exactly once. This is what makes the +-1 pairing self-balancing instead of
+/// relying on every playback state-machine transition remembering to call a matching
+/// decrement.
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+#[derive(JSTraceable, MallocSizeOf)]
+struct PlayingVideoCountGuard {
+    /// The document whose playing-video tally is incremented by this guard existing.
+    doc: Dom<Document>,
+}
+
+impl PlayingVideoCountGuard {
+    fn new(doc: &Document) -> Self {
+        doc.note_playing_video_delta(1);
+        PlayingVideoCountGuard {
+            doc: Dom::from_ref(doc),
+        }
+    }
+}
+
+impl Drop for PlayingVideoCountGuard {
+    fn drop(&mut self) {
+        // See `LoadBlocker::drop` for why this guard is necessary: during whole-runtime
+        // teardown the `Document` may be collected in the same GC pass as this element, so
+        // touching it here could interact with an object that is also being dropped. Skip
+        // the decrement in that case -- the whole per-document counter (and the
+        // `Animations`/`Window` it feeds) is being destroyed together, so no permanent leak
+        // results from skipping it.
+        if runtime_is_alive() {
+            self.doc.note_playing_video_delta(-1);
+        }
+    }
+}
+
 #[dom_struct]
 pub(crate) struct HTMLMediaElement {
     htmlelement: HTMLElement,
@@ -1457,6 +1498,10 @@ pub(crate) struct HTMLMediaElement {
     /// the access to the "privileged" document.servoGetMediaControls(id) API by
     /// keeping a whitelist of media controls identifiers.
     media_controls_id: DomRefCell<Option<String>>,
+    /// Present (`Some`) exactly while this element is counted in the owning document's
+    /// playing-video tally for animating-presence purposes (self-pacing v2 spec §14 v2 task
+    /// ①). See [`PlayingVideoCountGuard`] and `sync_playing_video_animation_state`.
+    counted_as_playing_video: DomRefCell<Option<PlayingVideoCountGuard>>,
 }
 
 /// <https://html.spec.whatwg.org/multipage/#dom-media-networkstate>
@@ -1540,6 +1585,7 @@ impl HTMLMediaElement {
             next_timeupdate_event: Cell::new(Instant::now() + Duration::from_millis(250)),
             current_fetch_context: RefCell::new(None),
             media_controls_id: DomRefCell::new(None),
+            counted_as_playing_video: DomRefCell::new(None),
         }
     }
 
@@ -1593,6 +1639,12 @@ impl HTMLMediaElement {
         {
             error!("Could not pause player: {error:?}");
         }
+
+        // `update_media_state` is the choke point for every spec-defined transition that can
+        // start or stop actual playback (internal play/pause steps, ready-state changes that
+        // unblock/reblock a potentially-playing element) -- see task-2-report.md §1 for the
+        // full survey of call sites. Self-pacing v2 spec §14 v2 task ①.
+        self.sync_playing_video_animation_state();
     }
 
     /// Marks that element as delaying the load event or not.
@@ -2533,6 +2585,38 @@ impl HTMLMediaElement {
             && !self.is_blocked_media_element()
     }
 
+    /// Whether this element is currently [`Self::is_potentially_playing`] *and* a `<video>`
+    /// element producing on-screen frames (self-pacing v2 spec §14 v2, task ①). `<audio>`
+    /// elements are deliberately excluded: they never repaint the webview, so counting them
+    /// toward animating presence would suppress `WakeCoalescer`'s frame-ready gate for a
+    /// webview with no corresponding visual update to pace against (see task-2-brief.md).
+    fn is_potentially_playing_video(&self) -> bool {
+        match self.media_type_id() {
+            HTMLMediaElementTypeId::HTMLVideoElement => self.is_potentially_playing(),
+            HTMLMediaElementTypeId::HTMLAudioElement => false,
+        }
+    }
+
+    /// Reconciles [`Self::counted_as_playing_video`] against the current
+    /// [`Self::is_potentially_playing_video`] and adjusts the owning document's tally via
+    /// [`PlayingVideoCountGuard`] accordingly. Idempotent: calling this repeatedly while the
+    /// computed state hasn't changed is a no-op. Every call site that can affect any input to
+    /// `is_potentially_playing()` (`paused`, `ended_playback`, `error`, `ready_state`) should
+    /// call this unconditionally at the end of the transition -- symmetry is guaranteed by
+    /// construction (diffing against the last-reported state) rather than by having to pair
+    /// increment/decrement calls by hand at each call site.
+    fn sync_playing_video_animation_state(&self) {
+        let should_count = self.is_potentially_playing_video();
+        let mut guard = self.counted_as_playing_video.borrow_mut();
+        if should_count {
+            if guard.is_none() {
+                *guard = Some(PlayingVideoCountGuard::new(&self.owner_document()));
+            }
+        } else if guard.is_some() {
+            *guard = None;
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#blocked-media-element>
     fn is_blocked_media_element(&self) -> bool {
         self.ready_state.get() <= ReadyState::HaveCurrentData
@@ -2818,6 +2902,13 @@ impl HTMLMediaElement {
             error,
             CanGc::from_cx(cx),
         )));
+
+        // A fatal mid-playback error (unlike the play/pause/ready-state paths) does not
+        // otherwise route through `update_media_state`, so without this call a video that
+        // hits this path while actively playing would stay counted as playing forever --
+        // `is_potentially_playing()` reads `self.error` freshly, so this is already correct
+        // as of the `error.set` above. Self-pacing v2 spec §14 v2 task ①.
+        self.sync_playing_video_animation_state();
 
         // Step 3. Set the element's networkState attribute to the NETWORK_IDLE value.
         self.network_state.set(NetworkState::Idle);

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Pause smoke (self-pacing v2 Task 2 Step 4c)</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  video { width: 100vw; height: 100vh; object-fit: cover; display: block; }
+  #status {
+    position: fixed; top: 8px; left: 8px; z-index: 5;
+    font: 20px ui-monospace, SFMono-Regular, Consolas, monospace;
+    color: #0f0; text-shadow: 0 1px 3px #000;
+  }
+</style>
+</head>
+<body>
+<!--
+  Task 2 (self-pacing v2 spec §14 v2, ①) Step 4(c) helper: zz_noraf_smoke.html has no
+  in-page pause control, so this single-video page exists purely to observe the
+  play -> pause transition (indirect evidence that animating-presence clears): plays
+  muted+looping for PLAY_MS, then calls video.pause() once and flips the on-screen
+  marker so a screenshot/CPU sample taken after the mark can be compared against one
+  taken while still playing. Not wired into any other task; safe to keep or delete.
+-->
+<div id="status">loading</div>
+<video id="v" muted autoplay loop playsinline></video>
+<script>
+  "use strict";
+  const PLAY_MS = 8000;
+  const v = document.getElementById("v");
+  const status = document.getElementById("status");
+  v.src = "../Wildlife_FHD30fps_counter_10Mbitrate.mp4";
+  v.play().catch(() => { status.textContent = "play() rejected"; });
+  status.textContent = "PLAYING";
+  setTimeout(() => {
+    v.pause();
+    status.textContent = "PAUSED";
+    document.body.style.outline = "12px solid #f00"; // 스크린샷으로도 전이 확인 가능하게
+  }, PLAY_MS);
+</script>
+</body>
+</html>

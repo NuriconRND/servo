@@ -5,6 +5,7 @@
 //! The set of animations for a document.
 
 use std::cell::Cell;
+use std::sync::LazyLock;
 
 use cssparser::ToCss;
 use embedder_traits::{AnimationState as AnimationsPresentState, UntrustedNodeAddress};
@@ -57,6 +58,16 @@ pub(crate) struct Animations {
     /// This is used to prevent marking animations dirty when the timeline
     /// has not changed.
     timeline_value_at_last_dirty: Cell<f64>,
+
+    /// Count of `<video>` elements in this document that are currently "potentially
+    /// playing" (<https://html.spec.whatwg.org/multipage/#potentially-playing>). Fed by
+    /// `note_playing_video_delta` from `HTMLMediaElement`'s playback state machine and
+    /// consumed by `handle_animation_presence_or_pending_events_change` so that a plain
+    /// `<video>` grid with no `requestAnimationFrame` loop still registers as "animating"
+    /// for the constellation/embedder (self-pacing v2 spec §14 v2, task ①). Without this,
+    /// `WakeCoalescer` (a servoshell embedder mechanism gated on `is_animating()`) never
+    /// engages for such a page and every frame-ready notification posts a wake unmasked.
+    playing_video_count: Cell<u32>,
 }
 
 impl Animations {
@@ -67,6 +78,7 @@ impl Animations {
             rooted_nodes: Default::default(),
             pending_events: Default::default(),
             timeline_value_at_last_dirty: Cell::new(0.0),
+            playing_video_count: Cell::new(0),
         }
     }
 
@@ -189,13 +201,54 @@ impl Animations {
         self.handle_animation_presence_or_pending_events_change(window);
     }
 
+    /// Adjusts [`Self::playing_video_count`] by `delta` (expected to be `+1`/`-1`, one call
+    /// per playing-video edge transition -- see `HTMLMediaElement::sync_playing_video_animation_state`
+    /// and `PlayingVideoCountGuard` for how callers guarantee the pairing is balanced,
+    /// including on element teardown). Only re-evaluates
+    /// [`Self::handle_animation_presence_or_pending_events_change`] when the count crosses
+    /// zero in either direction, mirroring [`Self::update_running_animations_presence`]
+    /// above: unless the presence of *any* playing video changed, the constellation does not
+    /// need to be told anything.
+    pub(crate) fn note_playing_video_delta(&self, window: &Window, delta: i32) {
+        debug_assert!(
+            delta == 1 || delta == -1,
+            "note_playing_video_delta expects a +-1 edge transition, got {delta}",
+        );
+        let old_count = self.playing_video_count.get();
+        let new_count = old_count.saturating_add_signed(delta);
+        debug_assert!(
+            delta > 0 || new_count < old_count,
+            "note_playing_video_delta: decrement without a matching prior increment \
+             (playing_video_count would underflow -- counter symmetry is broken)",
+        );
+        self.playing_video_count.set(new_count);
+
+        let had_playing_video = old_count > 0;
+        let has_playing_video = new_count > 0;
+        if had_playing_video != has_playing_video {
+            self.handle_animation_presence_or_pending_events_change(window);
+        }
+    }
+
     fn handle_animation_presence_or_pending_events_change(&self, window: &Window) {
         let has_running_animations = self.has_running_animations.get();
         let has_pending_events = !self.pending_events.borrow().is_empty();
+        // `SERVO_DISABLE_MEDIA_ANIMATING=1` restores the pre-task-① behavior of ignoring
+        // playing `<video>` elements entirely for animating-presence purposes (see
+        // `media_animating_disabled` below).
+        let playing_video_count = if *MEDIA_ANIMATING_KILLSWITCH {
+            0
+        } else {
+            self.playing_video_count.get()
+        };
 
         // Do not send the NoAnimationCallbacksPresent state until all pending
         // animation events are delivered.
-        let state = match has_running_animations || has_pending_events {
+        let state = match animations_present_state(
+            has_running_animations,
+            has_pending_events,
+            playing_video_count,
+        ) {
             true => AnimationsPresentState::AnimationsPresent,
             false => AnimationsPresentState::NoAnimationsPresent,
         };
@@ -561,6 +614,63 @@ impl Animations {
         if self.pending_events.borrow().is_empty() {
             self.handle_animation_presence_or_pending_events_change(window);
         }
+    }
+}
+
+/// Pure computation of whether a document should be considered to have animations present
+/// for the purposes of `ChangeRunningAnimationsState` (self-pacing v2 spec §14 v2, task ①).
+/// `playing_video_count` should already reflect [`MEDIA_ANIMATING_KILLSWITCH`] -- callers
+/// pass `0` when media-driven animating presence is disabled -- so that this function stays
+/// a plain OR of its three inputs and is trivially unit-testable without touching the
+/// process environment.
+pub(crate) fn animations_present_state(
+    has_running_animations: bool,
+    has_pending_events: bool,
+    playing_video_count: u32,
+) -> bool {
+    has_running_animations || has_pending_events || playing_video_count > 0
+}
+
+/// Runtime override that restores the pre-task-① behavior of never counting playing
+/// `<video>` elements toward animating presence, in case task ① ever needs to be ruled out
+/// as a cause of a regression. Only the literal value `"1"` disables the gate; anything else
+/// (unset, `"0"`, `"true"`, ...) leaves it enabled. Mirrors
+/// `ports/servoshell/desktop/event_loop.rs`'s `WAKE_EDGE_KILLSWITCH_ENV` convention (task ②).
+pub(crate) const MEDIA_ANIMATING_KILLSWITCH_ENV: &str = "SERVO_DISABLE_MEDIA_ANIMATING";
+
+/// Pure killswitch predicate for [`MEDIA_ANIMATING_KILLSWITCH_ENV`]. `token` is typically
+/// `std::env::var(MEDIA_ANIMATING_KILLSWITCH_ENV).ok()`. Factored out from the env read so
+/// the "only literal 1" rule is unit-testable without touching process environment.
+pub(crate) fn media_animating_disabled(token: Option<&str>) -> bool {
+    token == Some("1")
+}
+
+/// Cached (read-once) killswitch state. `handle_animation_presence_or_pending_events_change`
+/// runs on every animation-presence-relevant reflow, so re-reading the environment on every
+/// call would be wasteful; the env var is a startup-time debug toggle and is not expected to
+/// change while the process is running.
+static MEDIA_ANIMATING_KILLSWITCH: LazyLock<bool> = LazyLock::new(|| {
+    media_animating_disabled(std::env::var(MEDIA_ANIMATING_KILLSWITCH_ENV).ok().as_deref())
+});
+
+#[cfg(test)]
+mod tests {
+    use super::{animations_present_state, media_animating_disabled};
+
+    #[test]
+    fn animations_present_includes_playing_media() {
+        assert!(animations_present_state(false, false, 1)); // 미디어만 재생 → Present
+        assert!(!animations_present_state(false, false, 0)); // 전부 없음 → NoAnimations
+        assert!(animations_present_state(true, false, 0)); // 기존 애니 경로 보존
+        assert!(animations_present_state(false, true, 0)); // pending events 경로 보존
+    }
+
+    #[test]
+    fn media_animating_killswitch_literal_one_only() {
+        assert!(!media_animating_disabled(None));
+        assert!(media_animating_disabled(Some("1")));
+        assert!(!media_animating_disabled(Some("0")));
+        assert!(!media_animating_disabled(Some("true")));
     }
 }
 

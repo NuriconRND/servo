@@ -4480,6 +4480,15 @@ impl Document {
         &self.animations
     }
 
+    /// Adjusts the count of `<video>` elements in this document that are currently
+    /// "potentially playing", for animating-presence purposes (self-pacing v2 spec §14 v2,
+    /// task ①). `delta` is expected to be `+1`/`-1` -- see
+    /// `HTMLMediaElement::sync_playing_video_animation_state` and `PlayingVideoCountGuard`
+    /// for how callers keep the pairing balanced across play/pause/error/teardown.
+    pub(crate) fn note_playing_video_delta(&self, delta: i32) {
+        self.animations.note_playing_video_delta(&self.window, delta);
+    }
+
     pub(crate) fn update_animations_post_reflow(&self) {
         let current_timeline_value = self.current_animation_timeline_value();
         self.animations
