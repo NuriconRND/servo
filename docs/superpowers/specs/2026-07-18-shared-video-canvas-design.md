@@ -286,3 +286,47 @@ Task 1 커밋 `53dd20d8b`(`components/paint/dcomp_compositor.rs`, +38/-4) — `c
 **증거 파일 추가** (`scratchpad\canvas_alpha\`): `fix_mixed_opaque.log`/`fix_mixed_opaque.png`, `fix_mixed_premul.log`/`fix_mixed_premul.png` — 위 §12.6.1 신규 반투명 프로브(mixed_media_demo `#caption`) 재현 자료. complex_media_stress `#subticker`는 기존 `stress_opaque.png`/`stress_premul.png` 재사용(신규 파일 없음).
 
 후속 실증 경로(미래 세션용): 그리드 1칸을 정적 단색 테스트 클립으로 교체한 페이지를 쓰면 반투명 오버레이 아래가 시간 불변이 되어 opaque↔premul 픽셀 비교가 가능해진다 — 두 데모 페이지 재시도는 불필요(구조적 부적합 확인 완료).
+
+### 13.4 구현 결과 (2026-07-19)
+
+커밋 `<PENDING-SELF-SHA>`(`tests/html/video_grid_wall_clean.html` 신규 + `etc/multigpu/package_run_wall.ps1`/본 스펙 파일 갱신, Rust 코드 변경 0 — 이 파일 자신이 포함된 커밋이라 SHA를 사전 기입할 수 없어, 커밋 직후 별도 1줄 정정 커밋으로 채운다). Task 1 게이트 커밋 `ca781526f` 위에서 실행(A5000, `target\release\servoshell.exe` 2026-07-19 12:44 빌드 — Task 1 빌드 그대로, 재빌드 없음).
+
+**페이지 사본**: `tests/html/video_grid_wall_clean.html` — `video_grid_6x6_perf.html`(원본 무변경 확인됨) 사본에서 `#stats` CSS 블록(구 :41-53)·`<div id="stats">`(구 :59)·JS 진단 심볼(`stats`, `LOG`, `startTime`/`lastSample`/`rafSinceSample`/`lastDecoded`/`lastDropped`/`fps`/`decPerSec`/`dropPerSec`/`lastFrameTs`/`maxGapMs`/`jitterMs`, `decodedFrames`/`droppedFrames`/`sumDecoded`/`sumDropped`/`countPlaying`/`countLooping` — 전부 tick() 전용 심볼로 확인 후 제거)와 rAF `tick()` 함수 정의·최초 호출을 제거. 그리드 생성(COLS/ROWS/TILE_COUNT/tileW/tileH/STAGGER/DOM 오버레이)과 재생(`v.play()`/`playErrors`) 로직은 원본 그대로 유지. UTF-8 저장(BOM 없음, `xxd` 첫 바이트 `3c21`=`<!`로 확인), 한글 주석 인코딩 손상 없음. Step 1 확인 실행(`-Cols 3 -Rows 3 -DComp -VideoEscape canvas -Sync 9`): 9타일 재생 정상, HUD 없음(winshot `scratchpad\canvas_only_step1_confirm2.png`).
+
+**★이탈 1(중요 — 실측으로 발견하고 현장에서 해소): 브리프 원문대로 rAF를 전부 제거하면 45타일 재생이 사실상 정지한다★**
+
+최초 시도(브리프 문면 그대로 rAF 완전 제거)로 Step 2 ②단을 실행한 결과: 60초 러닝윈도우 내내 `[vesc-prof]`가 **딱 1줄만** 찍혔다(정상 상태는 초당 1줄 — ①/③에서 각 63~69줄 확인). winshot(`scratchpad\canvas_only_m2.png`의 최초 버전, 현재는 수정본으로 덮어씀)에서는 45타일의 프레임 카운터가 637~706까지 들쭉날쭉하고 검정 타일이 다수 섞여 있었다 — 합성이 아예 멈춘 게 아니라 극히 sporadic하게만 일어난다는 뜻이다.
+
+원인을 코드로 추적: `components/paint/painter.rs:1926` `update_images`의 "video 프레임 도착마다 즉시 재합성"(`immediate_image_update`, 주석 원문 "Present content image updates ... at their arrival rate")은 WR **이미지 갱신 트랜잭션**(`ImageUpdate::UpdateImage`)에 올라탄 프레임에만 적용된다. `-VideoEscape`(canvas/native/external 공통, 스펙 §1 설계 자체가 "비디오가 WR 콘텐츠/이미지 파이프라인을 벗어난다")는 비디오를 이 트랜잭션에서 완전히 제외하므로 이 즉시-재합성 경로가 탈출 비디오에는 원천적으로 적용되지 않는다. `dcomp_compositor.rs`의 캔버스 convert+present 파이프라인(`end_frame`, vesc-prof 계측 지점)은 WR가 **어떤 이유로든** 합성(`generate_frame`)을 실행할 때 곁다리로 함께 도는 수동적 부속물일 뿐이다 — 페이지에 rAF가 전혀 없고 다른 리플로 트리거도 없으면 그 합성 자체가 (외부 자극 — 예: winshot의 PrintWindow 호출 — 이 있을 때만) 극히 드물게만 일어난다.
+
+이는 `video_grid_6x6_play.html`(런처 기본 페이지)이 왜 자체 rAF 하트비트(2×2px 점 색 토글)를 두고 있는지의 설명(그 파일 주석, :126-133)과는 **다른** 문제다 — 그 주석은 "rAF 없으면 개별 즉시-합성 폭주로 winit이 굶는다"(구 non-escape 비디오 경로의 사례)를 말하는데, escape 모드에서는 정반대로 "비디오 도착이 아예 재합성을 못 일으켜 멈춘다"가 실제로 관측된 현상이다 — 두 문제 모두 결론은 "rAF는 유지해야 한다"로 같지만 근본 메커니즘은 다르다.
+
+**수정**(Step 1의 페이지 저작 권한 범위 내 — Rust 변경 0): 사본에 DOM/스타일을 전혀 건드리지 않는 빈 rAF 루프 한 줄만 남겼다 — `requestAnimationFrame(function tick(){ requestAnimationFrame(tick); })`. 이건 재합성을 계속 촉발하는 순수 스케줄링 핑이라 WR이 다시 그릴 더티 영역이 전혀 없다(①WR 래스터 비용 불변 — 0으로 유지)+콘텐츠가 안 바뀌니 콘텐츠 Present도 늘지 않는다(②비용 불변 — 0으로 유지), `#stats`처럼 매프레임 텍스트/스타일을 갱신하는 "하트비트 콘텐츠"와는 다른 층이라는 논거다. 재적용 후 재실측(아래 Step 2 표의 ②③): vesc-prof 연속 63줄/60초, 45/45 타일 완전 lockstep(winshot 최종본), promote/content-swap 여전히 0건 — 정상화 확인됨.
+
+브리프 원문 "`const stats = ...`부터 rAF tick 정의·호출까지의 진단 스크립트... 제거"에서 이 빈 rAF 한 줄만 예외로 남긴 것이 스펙/브리프 문면 대비 이탈이다. 상위 지시("Any FAIL: stop that step, evidence, DONE_WITH_CONCERNS")에 따라 원인 조사·전후 로그·스크린샷 전부 본 절에 기록한다(전후 비교: 이전 시도 로그는 `target/multigpu_logs/matrix_s2_20260719_131004_stderr.log`+`matrix_s2b_20260719_131214_stderr.log`, 수정 후 검증 로그는 `matrix_s2c_20260719_131752_stderr.log`+최종 `matrix_s2_final_20260719_131918_stderr.log`).
+
+**Step 2 매트릭스 실측**(전 단 공통 `-Cols 9 -Rows 5 -DComp -VideoEscape canvas -Sync 45`, `SERVO_DCOMP_DEBUG=1`+`SERVO_VIDEO_ESCAPE_PROF=1`, 각 약 60초):
+
+| 단 | 페이지 | 게이트 | vesc-prof frames/s(평균) | converts/s(평균) | presents/s(평균) | present_ms(평균) | promote | content-swap | PresentMon 스왑체인 수 | PresentMon Presents(10s) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ① 기준 | `video_grid_6x6_perf.html`(HUD 있음) | off | 60.1 | 1842 | 40.9 | 9.62ms | 0 | 0 | 1 | 380 |
+| ② 무하트비트 | `video_grid_wall_clean.html`(이탈1 수정본) | off | 36.2 | 1219 | 27.1 | 5.66ms | 0 | 0 | 1 | 295 |
+| ③ +canvas-only | `video_grid_wall_clean.html` | on(`SERVO_DCOMP_CANVAS_ONLY=1`) | 38.9 | 1363 | 30.3 | 7.13ms | 0 | 0 | 1 | 348 |
+
+(평균은 기동 램프업 첫 2줄 제외 전 구간; 개별 5표본 발췌 — ①: T+2/17/32/47/62s frames=61/60/60/61/61, ②: T+2/17/32/47/62s frames=45/34/43/39/45, ③: T+2/18/33/48/63s frames=61/30/50/35/42 — 15~20s 간격, 30s 루프 주기 배수 회피.)
+
+로그: `target/multigpu_logs/matrix_s1_20260719_130649_stderr.log` / `matrix_s2_final_20260719_131918_stderr.log` / `matrix_s3_final_20260719_132144_stderr.log`(45/45 `direct_file`, `dcomp_engaged_markers=1`=hybrid, panic/ERROR/sync-timeout 전부 0, `canvas swapchain (re)create` 각 1회). PresentMon CSV: `scratchpad/presentmon_m1.csv`(380행)/`_m2.csv`(295행)/`_m3.csv`(348행) — 전부 단일 스왑체인 주소, `PresentMode=Composed: Flip` 100%. winshot: `scratchpad/canvas_only_m1.png`(HUD 있음, 45/45 재생)/`_m2.png`(HUD 없음, 45/45 lockstep 동일 프레임 카운터)/`_m3.png`(HUD 없음, 45/45 lockstep, 타일 경계 갭 없음 — canvas-only 3단 표시 정상). ③ 로그에 `canvas-only diagnostic active` 정확히 1회.
+
+**★이탈 2(경미 — 사전 가설과 실측 불일치, 그대로 기록): PresentMon 스왑체인 수는 ①②③ 전부 1개로 동일했다 — 브리프/가이드가 예상한 "①2개 → ②1개"는 관측되지 않음★**
+
+promote/content-swap 이벤트는 3단 전부(①포함) 0건이었다. 원인: `dcomp_compositor.rs`의 콘텐츠 승격 로직(코드 주석 "Only opaque slices are promoted to a flip swapchain")은 **완전 불투명 슬라이스만** 플립 스왑체인으로 승격한다. perf 페이지의 `#stats` 패널은 `background: rgba(0, 0, 0, .78)`(반투명)이라 애초에 승격 후보가 아니다 — 하트비트가 있어도(①) 콘텐츠 스왑체인은 생기지 않는다. 스펙 §13 동기 문단이 인용한 "승격 스왑체인 1024×512(하트비트) 1장"은 §12 계열 다른 페이지(불투명 하트비트 영역을 가진 mixed_media_demo 등)에서의 관측이며, 이 순수 그리드 페이지에는 적용되지 않는다.
+
+즉 ①→②에서 실제로 소멸하는 것은 (승격 스왑체인이 애초에 없었으므로) 승격 스왑체인이 아니라 **WR이 `#stats` 영역을 매프레임 다시 그리는 래스터 자체(①)**이며, 이 소멸은 PresentMon(DXGI Present만 관측)이나 vesc-prof(비디오 파이프라인 전용 계측)로는 직접 카운트되지 않는다 — 두 도구 모두 애초에 이 층을 보지 못하는 구조다. §13.1의 "콘텐츠 완전 정적 → ①② 자동 0" 논증 자체는(코드 diff 0, 정적 페이지엔 WR이 다시 그릴 더티 영역이 없다는 구조적 사실) 여전히 유효하지만, 이번에 준비된 3종 계측(vesc-prof/promote 로그/PresentMon)으로는 그 소멸을 **직접 실증하지 못했다** — 실증하려면 GPU/CPU 사용률 또는 WR 자체 프로파일러(picture-cache rasterize 타일 카운터, Ctrl+F12 계열)의 별도 계측이 필요하다(이번 태스크 범위 밖, 이월).
+
+**vesc-prof frames/s 관찰(부기)**: ①(60.1/s)이 ②③(36.2/38.9/s)보다 뚜렷이 높다 — "A5000 대역폭 여유로 3단 차이 없음" 사전 예상과 다르다. 원인은 이번 세션에서 규명하지 못했다 — perf 페이지의 실 rAF(텍스트 갱신 포함)가 왜 빈 rAF보다 더 높은 합성 빈도로 이어지는지 불명, 3단이 동일 세션에서 순차 실행되었고 병행 PowerShell/Bash 도구 호출이 배경 부하로 섞였을 가능성도 배제하지 못한다(런투런 변동 후보). A5000 기준선으로 있는 그대로 기록 — AMD 실측 시 이 ①>②③ 패턴의 재현 여부도 함께 판독 대상으로 권고(절대 fps 자체는 AMD 몫, §13.2 원 방침 그대로).
+
+**Step 3 가이드**: `etc/multigpu/package_run_wall.ps1` 헤더의 canvas readout 블록 끝에 브리프 지정 영어 3단 매트릭스 안내 + 이탈1에서 확인된 "escape 모드는 빈 rAF라도 유지해야 한다" caution을 영어로 추가(파싱 검증: `[System.Management.Automation.Language.Parser]::ParseFile` PARSE_OK).
+
+**Step 4 패키지**: `D:\ServoWallPackage\servoshell.exe`(Task 1 빌드 그대로, 150,893,568B, 2026-07-19 12:44) + `run_wall.ps1`(`package_run_wall.ps1`에서 재복사, 신규 가이드 반영, 13,631B) + `tests\html\video_grid_wall_clean.html`(이탈1 수정본 포함, 6,074B) 반영 → `D:\ServoWallPackage.zip` **1,216,860,655B**(2026-07-19 13:27:43, `Compress-Archive` 44.7초; 이전 1,216,856,231B/07-19 09:57 대비 +4,424B — 신규 html+가이드 증분 우세, exe는 이전 대비 1,536B 감소). 스모크(`-Cols 2 -Rows 2 -DComp -VideoEscape canvas -Page tests\html\video_grid_wall_clean.html -Sync 4`): `d3d11_active_markers=4/4`, `direct_file=4/4`, `dcomp_engaged_markers=1`(mode=hybrid), winshot 4/4 lockstep 확인(`scratchpad/canvas_only_package_smoke.png`) — 패키지 내 사본도 정상 재생(빈 rAF 포함 버전).
+
+**최종 판정**: **DONE_WITH_CONCERNS.** Step 1~5 전부 실행·데이터 확보했으나 이탈 2건 모두 위에 상세 기록: 이탈1(중요, 해소됨 — "무하트비트 페이지"는 escape 모드 아키텍처상 진짜로 rAF 자체를 0으로 만들 수는 없고 "DOM 비접촉 rAF"까지만 가능하다는 한계 발견 및 수정)과 이탈2(경미, 미해소 — 사전 가설과 다른 실측을 그대로 기록, 별도 계측으로 후속 검증 필요). 둘 다 코드/스펙 결함이 아니라 각각 escape 아키텍처의 구조적 성질(전자)과 이 특정 페이지의 콘텐츠 구성(후자)에서 비롯. 코드(Rust) 변경 0, 커밋 로컬만·푸시 없음(기존 방침 유지).

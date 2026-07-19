@@ -34,6 +34,22 @@
 #     (external stays available as a diagnostic/fallback lever).
 #   - Diagnostic: set SERVO_VIDEO_CANVAS_PREMUL=1 to revert the canvas to premultiplied
 #     alpha (A/B lever for DWM blend cost on old GPUs; default is opaque = cheaper).
+#   - Content-layer cost isolation (3-step matrix, wall only):
+#       (a) canvas baseline    : .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape canvas
+#       (b) + clean page       : add -Page tests\html\video_grid_wall_clean.html  (no HUD -> content raster/present drop to zero)
+#       (c) + canvas-only      : also set SERVO_DCOMP_CANVAS_ONLY=1  (drops ALL non-video layers -> DWM composes 1 layer, probe-identical)
+#     Read fps/GPU%% deltas: (a)->(b) = content raster+present cost, (b)->(c) = DWM extra-layer cost.
+#     CAUTION: SERVO_DCOMP_CANVAS_ONLY is DIAGNOSTIC ONLY - page UI (tickers, clocks, PiP) disappears while set.
+#     CAUTION (measured on A5000, 2026-07-19): under any -VideoEscape mode, video frames
+#     bypass WebRender's own image-update pipeline, so frame arrival alone no longer
+#     triggers a recomposite (that immediate-recomposite fast path only covers non-escaped
+#     video). A page with ZERO requestAnimationFrame activity therefore composites only
+#     sporadically and 45-tile playback stalls/desyncs badly (measured: [vesc-prof] samples
+#     dropped from ~1/second to a single sample for the whole 60s run). video_grid_wall_
+#     clean.html keeps a requestAnimationFrame loop that touches no DOM/style (a pure
+#     scheduling ping) to keep composites flowing at full rate while remaining
+#     heartbeat-free for raster/Present accounting -- do not strip that loop when adapting
+#     this page or authoring another "clean" page for escape-mode readouts.
 
 param(
     [int]    $Cols = 8,
