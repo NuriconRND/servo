@@ -213,6 +213,30 @@ VideoConvertPass에 dest-rect 변형 추가: RSSetViewports(+scissor)를 dest re
 
 A5000 검증 + AMD 가이드에 레버 기재 + 패키지 재생성. 푸시는 기존 보류 유지.
 
+## 13. 애드온: canvas-only 진단 레버 + 무하트비트 월 페이지 (2026-07-19, 승인됨)
+
+**동기**: 순수 월에서 콘텐츠층의 잔여 비용 3종 — ①WR 래스터(하트비트 슬라이스) ②콘텐츠 Present ③DWM 레이어 합성(컷아웃 가상 서피스들의 premultiplied 블렌딩 포함 — §12 이후에도 구조적으로 잔존, 실측 확인: 월 콘텐츠 = 승격 스왑체인 1024×512(하트비트) 1장 + 가상 서피스 3장(컷아웃/알파)) — 을 구형 AMD에서 분리 측정한다. ①②는 코드 없이 무하트비트 페이지로 소멸시키고, ③만 진단 게이트로 제거한다(probe 완전 동형 = DWM 1레이어 도달).
+
+### 13.1 설계
+
+- **게이트**: env `SERVO_DCOMP_CANVAS_ONLY` = "1"(기본 미설정=off, 진단 전용). end_frame의 AddVisual 루프에서 **이번 프레임 캔버스 비주얼이 추가된 경우에 한해** 캔버스 외 모든 비주얼(콘텐츠 가상 서피스/승격 스왑체인/overlay external)을 트리에 추가하지 않는다. 캔버스 없는 프레임(비디오 없는 페이지)은 정상 합성 — 블랙아웃 방지.
+- **무변경 보장**: WR 래스터/Present/Commit/상태머신(승격·강등·부분 Present 부기) 전부 무접촉 — 보이지 않는 스왑체인·서피스는 평소대로 갱신된다(의도: ③만 분리). 게이트 off = 코드 경로 무변경.
+- 판정은 순수 함수(+OnceLock env 바인딩, §12.2와 동일 관례) — 유닛테스트 대상. `SERVO_DCOMP_DEBUG=1`에 발동 warn-once 로그.
+- **무하트비트 월 페이지**: `video_grid_6x6_perf.html` 사본에서 하트비트/매프레임 DOM 갱신 요소만 제거한 `tests/html/video_grid_wall_clean.html` (쿼리 파라미터 방식은 런처 -Page 쿼리 함정 때문에 배제). 콘텐츠 완전 정적 → ①② 자동 0.
+- **수용 제약(명시)**: 게이트 on + 복합 페이지 = 페이지 UI 전체 미표시(당연 — 진단 전용). AMD 가이드에 캐비앗 명기.
+
+### 13.2 실험 매트릭스 (AMD 판독용, 가이드 기재)
+
+1. 현행 월(perf 페이지, 게이트 off) — 기준
+2. \+ 무하트비트 페이지 — ①래스터+②Present 소멸분
+3. \+ `SERVO_DCOMP_CANVAS_ONLY=1` — ③DWM 레이어 소멸분 (probe 동형)
+
+각 단 fps/GPU%/vesc-prof 비교. A5000 검증은 무회귀(월 육안 동일 — 타일 갭은 캔버스 클리어 검정으로 동일)와 게이트 off 무변경, 복합 페이지 캐비앗 확인까지.
+
+### 13.3 완료 기준
+
+A5000 검증 + 페이지/게이트/가이드 패키지 반영. 푸시 보류 유지.
+
 ### 12.6 구현 결과 (2026-07-19)
 
 Task 1 커밋 `53dd20d8b`(`components/paint/dcomp_compositor.rs`, +38/-4) — `canvas_alpha_opaque(Option<&str>) -> bool`(기본 opaque, `Some("1")`만 premul) + `canvas_swapchain_opaque()`(OnceLock env 바인딩) + `ensure_canvas`가 `create_composition_swapchain(size, opaque)`로 전환 + 로그 `alpha=opaque|premul` 표기. 전 태스크 완료, A5000 검증 전부 PASS.
