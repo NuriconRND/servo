@@ -54,6 +54,10 @@
 #     stall/freeze; screenshots show clean 45-tile lockstep progression). AMD read-out
 #     should note whether presents/s tracks this A5000 pattern or the ~30/s target.
 #     NOTE: for these pure grid pages PresentMon shows 1 swapchain across all 3 stages - the "2 swapchains" health check above applies to pages with an opaque promotable heartbeat region (e.g. mixed_media_demo), not this page family.
+#   CAVEAT: the ~56% figure assumed composites converge to the 30fps video cadence;
+#   A5000 measurement shows presents tracking ~53/s at 45 tiles instead. Judge AMD GPU%
+#   against the measured cadence (present rate x per-frame GPU ms), not the 56% bar -
+#   any GPU% drop vs the pre-self-pacing ~89% baseline at equal cadence is the real signal.
 
 param(
     [int]    $Cols = 8,
