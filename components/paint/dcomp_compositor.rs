@@ -38,7 +38,6 @@ use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
-use winapi::um::dcommon::D2D_MATRIX_3X2_F;
 use winapi::um::d3d11::{
     D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11Texture2D,
@@ -260,15 +259,6 @@ fn external_swapchain_needs_recreate(
     !has_swapchain
         || (current_ref.width - new_ref.width).abs() > tol
         || (current_ref.height - new_ref.height).abs() > tol
-}
-
-/// D2D_MATRIX_3X2_F contents (`[[m11,m12],[m21,m22],[dx,dy]]`) scaling a reference-sized
-/// backbuffer to the on-screen display size, about the visual origin. Translation stays
-/// in SetOffset, so dx=dy=0. Identity for static (display==ref) surfaces.
-fn external_visual_scale_matrix(ref_size: DeviceIntSize, display_size: DeviceIntSize) -> [[f32; 2]; 3] {
-    let sx = display_size.width as f32 / ref_size.width.max(1) as f32;
-    let sy = display_size.height as f32 / ref_size.height.max(1) as f32;
-    [[sx, 0.0], [0.0, sy], [0.0, 0.0]]
 }
 
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
@@ -1416,12 +1406,14 @@ impl DCompNativeCompositor {
         let offset_x = clip_rect.min.x as f32;
         let offset_y = clip_rect.min.y as f32;
         let stable = stable_swapchain();
-        // Stable gate on: backbuffer == ref_size, on-screen scale via SetTransform. Off:
-        // backbuffer == clip size (legacy, scale baked into clip -> per-frame recreate).
-        // Local clip (SetClip takes pre-offset coords) = backbuffer rect (0,0)-(w,h); under
-        // the scale transform it maps to the display footprint (scale<=1 -> no crop).
+        // Stable gate on: the video is rendered at the on-screen display resolution into the
+        // top-left of the ref-sized backbuffer (see present_external), so NO DComp scaling is
+        // applied here -- placement is pixel-exact, avoiding the fractional-scale right/bottom
+        // edge seam. Clip to the display footprint, clamped to the backbuffer so a frozen
+        // (drag-time) swap-chain viewport is never exceeded. Legacy off: backbuffer == clip.
+        let display = clip_rect.size();
         let (clip_w, clip_h) = if stable {
-            (ref_size.width as f32, ref_size.height as f32)
+            (display.width.min(ref_size.width) as f32, display.height.min(ref_size.height) as f32)
         } else {
             ((clip_rect.max.x - clip_rect.min.x) as f32, (clip_rect.max.y - clip_rect.min.y) as f32)
         };
@@ -1435,16 +1427,6 @@ impl DCompNativeCompositor {
             let hr = (*entry.visual.as_ptr()).SetOffsetY_1(offset_y);
             if hr < 0 {
                 warn!("[dcomp-native] external SetOffsetY failed (hr=0x{:08x})", hr as u32);
-            }
-            if stable {
-                // Scale ref-sized backbuffer to the on-screen display size (identity for
-                // static scale=1 surfaces). Translation stays in SetOffset (dx=dy=0).
-                let m = external_visual_scale_matrix(ref_size, clip_rect.size());
-                let matrix = D2D_MATRIX_3X2_F { matrix: m };
-                let hr = (*entry.visual.as_ptr()).SetTransform_1(&matrix);
-                if hr < 0 {
-                    warn!("[dcomp-native] external SetTransform failed (hr=0x{:08x})", hr as u32);
-                }
             }
             let hr = (*entry.visual.as_ptr()).SetClip_1(&local_clip);
             if hr < 0 {
@@ -1649,10 +1631,20 @@ impl DCompNativeCompositor {
         if !external_needs_present(ext.last_presented, lease.ring_id, lease.frame_seq) {
             return;
         }
-        // dst는 스왑체인 백버퍼 크기(= swapchain_size)를 쓴다. 드래그 중엔 기존(옛 크기)
-        // 스왑체인을 유지하므로 clip(새 크기)이 아닌 실제 버퍼 크기로 변환해야 뷰포트가
-        // 버퍼를 넘지 않는다(정착 후 재생성으로 정확 크기 복원).
-        let dst = ext.swapchain_size;
+        // Stable gate on: render at the on-screen display size into the top-left sub-rect of
+        // the ref-sized backbuffer (pixel-exact, no DComp scaling; the visual clip shows
+        // exactly this region -- see place_external_visual). Clamp to the backbuffer so a
+        // frozen (drag-time / oversized) swap-chain viewport never exceeds the buffer. Legacy
+        // off: full backbuffer (= clip-sized swap-chain, recreated per frame under scale).
+        let dst = if stable_swapchain() {
+            let d = clip_rect.size();
+            DeviceIntSize::new(
+                d.width.min(ext.swapchain_size.width),
+                d.height.min(ext.swapchain_size.height),
+            )
+        } else {
+            ext.swapchain_size
+        };
         if dst.width <= 0 || dst.height <= 0 {
             return;
         }
@@ -3187,22 +3179,6 @@ mod tests {
         assert!(external_swapchain_needs_recreate(true, a, DeviceIntSize::new(600, 347), 4));
     }
 
-    #[test]
-    fn scale_matrix_maps_ref_to_display() {
-        // ref 476x347 shown at 390x285 -> sx=390/476, sy=285/347, no translate
-        let m = external_visual_scale_matrix(DeviceIntSize::new(476, 347), DeviceIntSize::new(390, 285));
-        assert!((m[0][0] - 390.0 / 476.0).abs() < 1e-6);
-        assert!((m[1][1] - 285.0 / 347.0).abs() < 1e-6);
-        assert_eq!(m[0][1], 0.0);
-        assert_eq!(m[1][0], 0.0);
-        assert_eq!(m[2], [0.0, 0.0]);
-    }
-
-    #[test]
-    fn scale_matrix_identity_for_equal_sizes() {
-        let m = external_visual_scale_matrix(DeviceIntSize::new(476, 347), DeviceIntSize::new(476, 347));
-        assert_eq!(m, [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
-    }
 
     #[test]
     fn tile_virtual_rect_positions_tiles_on_grid() {
