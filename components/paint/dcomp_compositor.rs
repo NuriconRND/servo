@@ -1500,6 +1500,15 @@ impl DCompNativeCompositor {
         self.place_external_visual(id, clip_rect, ref_size);
         self.frame_surfaces.push(id);
 
+        // fast-path(present_external_only)이 실합성 사이에 재사용할 placement 캐시.
+        // 비-external add_surface 분기(:2549)와 달리 external은 여기서 채운다.
+        if let Some(entry) = self.surfaces.get_mut(&id) {
+            entry.last_placement = Some(LastPlacement {
+                transform_offset: (transform.offset.x, transform.offset.y),
+                clip_rect,
+            });
+        }
+
         let rc = self.rendering_context.clone();
         let resize_active = rc.dcomp_resize_active();
 
@@ -1826,6 +1835,11 @@ impl DCompNativeCompositor {
         if resize_active {
             return; // 방어: 게이트가 이미 걸러야 하나, 이중 안전.
         }
+
+        // 정상 경로(render())와 동일하게 ANGLE 공유 D3D11 즉시 컨텍스트 접근을 직렬화.
+        // 이 fast-path는 update_images 게이트에서만 호출되고 render()(락 보유)와 중첩되지 않으므로
+        // 재획득 데드락 없음.
+        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
 
         // borrow 사정: External 서피스의 present 입력을 먼저 스냅샷으로 수집한 뒤 present.
         // (present_external은 &mut self라 surfaces iter 중 호출 불가.)
