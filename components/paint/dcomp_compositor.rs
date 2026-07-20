@@ -112,6 +112,35 @@ fn video_escape_prof() -> bool {
     *ON.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_PROF").is_ok())
 }
 
+/// external 비디오 갱신 분리 킬스위치. 기본 on; "0"이면 현재(비디오당 generate_frame) 복귀.
+fn decouple_enabled() -> bool {
+    std::env::var("SERVO_VIDEO_DECOUPLE").map(|v| v != "0").unwrap_or(true)
+}
+
+/// 즉시-합성 게이트에서 fast-path(present_external_only)를 택할지의 순수 판정.
+/// 기존 generate_frame 게이트(painter.rs:2027)와 같은 전제(비디오 도착·미생성·pending 0·
+/// rAF 없음·렌더러 안 밀림)에, 승격 external 존재 + 리사이즈 아님 + 기능 on을 더한다.
+#[allow(clippy::too_many_arguments)]
+fn should_fast_present(
+    immediate_image_update: bool,
+    generated_frame: bool,
+    pending_zero: bool,
+    renderer_behind: bool,
+    raf_driving: bool,
+    escaped_count: usize,
+    resize_active: bool,
+    decouple_enabled: bool,
+) -> bool {
+    immediate_image_update
+        && !generated_frame
+        && pending_zero
+        && !renderer_behind
+        && !raf_driving
+        && escaped_count > 0
+        && !resize_active
+        && decouple_enabled
+}
+
 /// external present 파이프라인의 초당 집계 카운터(video_escape_prof 게이트에서만 갱신).
 /// 렌더러 스레드 단일 인스턴스(DCompNativeCompositor 소유). end_frame이 매 프레임 frames++
 /// 후 maybe_flush로 1초 경과 시 라인 출력 + 리셋한다. 게이트 off면 전 필드가 0으로 유휴.
@@ -3337,5 +3366,28 @@ mod tests {
         let many: Vec<DeviceIntRect> = (0..40).map(|i| r(i * 2, 0, i * 2 + 1, 1)).collect();
         let out = collapse_dirty_if_oversized(many, 32);
         assert_eq!(out, vec![r(0, 0, 79, 1)]);
+    }
+
+    #[test]
+    fn fast_present_gated_on_escaped_and_flags() {
+        // 표준 fast-path 케이스: 비디오 도착 + 프레임 미생성 + pending 0 + rAF 없음 +
+        // 렌더러 안 밀림 + 승격 external 있음 + 리사이즈 아님 + 기능 on.
+        assert!(should_fast_present(true, false, true, false, false, 36, false, true));
+        // 승격 external 0 → fast-path 불가(기존 generate_frame로).
+        assert!(!should_fast_present(true, false, true, false, false, 0, false, true));
+        // 기능 off(킬스위치) → 불가.
+        assert!(!should_fast_present(true, false, true, false, false, 36, false, false));
+        // 리사이즈 중 → 불가(빌드 경로에 양보).
+        assert!(!should_fast_present(true, false, true, false, false, 36, true, true));
+        // 이미 프레임 생성됨 → 불가.
+        assert!(!should_fast_present(true, true, true, false, false, 36, false, true));
+        // rAF가 합성 구동 중 → 불가(기존 게이트 규약과 동일).
+        assert!(!should_fast_present(true, false, true, false, true, 36, false, true));
+        // 비디오 도착 아님 → 불가.
+        assert!(!should_fast_present(false, false, true, false, false, 36, false, true));
+        // pending != 0 → 불가.
+        assert!(!should_fast_present(true, false, false, false, false, 36, false, true));
+        // 렌더러 밀림 → 불가.
+        assert!(!should_fast_present(true, false, true, true, false, 36, false, true));
     }
 }
