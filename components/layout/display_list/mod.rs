@@ -13,7 +13,7 @@ use fonts::ShapedTextSlice;
 use gradient::WebRenderGradient;
 use layout_api::{MediaFrameYuvFormat, ReflowStatistics};
 use net_traits::image_cache::Image as CachedImage;
-use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
+use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo, is_2d_scale_translation};
 use servo_arc::Arc as ServoArc;
 use servo_base::id::{PipelineId, ScrollTreeNodeId};
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
@@ -85,6 +85,36 @@ pub(crate) use stacking_context::*;
 
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
 
+/// Promotion hysteresis (spec 2026-07-20-video-promote-hysteresis): a video is offered for
+/// external compositor-surface promotion only after its transform has been 2D scale/translation
+/// for this many consecutive frames. Prevents rotating tiles (momentarily 2D at 0/180 deg) from
+/// flapping between the content pass and an external surface. env
+/// `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS`: unset = 10; 0 = immediate promotion (legacy).
+fn promote_hysteresis_frames() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(10)
+    })
+}
+
+struct PromoteHystEntry {
+    /// Consecutive frames the video's transform has been 2D scale/translation.
+    streak: u32,
+    /// Last build stamp this entry was touched (for pruning).
+    last_frame: u64,
+}
+/// Per-video promotion-hysteresis streak, keyed by `tag.to_display_list_fragment_id()`.
+static PROMOTE_HYSTERESIS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, PromoteHystEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+/// Monotonic display-list-build stamp; +1 per build.
+static PROMOTE_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Entries whose `last_frame` lags the current build by more than this are pruned (a video that
+/// left the tree, e.g. page navigation), preventing unbounded growth.
+const PROMOTE_PRUNE_AGE: u64 = 300;
+
 pub(crate) struct DisplayListBuilder<'a> {
     /// The [`FragmentTree`] that we are building a display list for.
     fragment_tree: &'a FragmentTree,
@@ -127,6 +157,15 @@ pub(crate) struct DisplayListBuilder<'a> {
 
     /// Statistics collected about the reflow, in order to write tests for incremental layout.
     reflow_statistics: &'a mut ReflowStatistics,
+
+    /// Per spatial-tree-node "has a non-2D-scale-translation ancestor" taint (promotion
+    /// hysteresis). Populated in `add_all_spatial_nodes`, read in `visit_image` to decide
+    /// whether a video's accumulated transform is currently 2D scale/translation.
+    reference_frame_non_2d: Vec<bool>,
+
+    /// This build's monotonic stamp (`PROMOTE_FRAME`), used to update/prune the promotion
+    /// hysteresis map consistently within one display-list build.
+    promote_frame: u64,
 }
 
 struct InspectorHighlight {
@@ -207,6 +246,15 @@ impl DisplayListBuilder<'_> {
             device_pixel_ratio,
             paint_timing_handler,
             reflow_statistics,
+            reference_frame_non_2d: Vec::new(),
+            promote_frame: {
+                // New build stamp; prune hysteresis entries for videos gone from the tree.
+                let f = PROMOTE_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Ok(mut map) = PROMOTE_HYSTERESIS.lock() {
+                    map.retain(|_, e| e.last_frame + PROMOTE_PRUNE_AGE >= f);
+                }
+                f
+            },
         };
 
         // Clear any caret color from previous display list constructions.
@@ -281,13 +329,28 @@ impl DisplayListBuilder<'_> {
         let pipeline_id = self.pipeline_id();
         let pipeline_tag = ((pipeline_id.0 as u64) << 32) | pipeline_id.1 as u64;
 
-        for node in scroll_tree.nodes.iter().skip(2) {
+        // Promotion hysteresis: per-node "under a non-2D-scale-translation transform" taint.
+        // Nodes are visited parent-before-child, so a single forward pass propagates it.
+        let mut non_2d = vec![false; scroll_tree.nodes.len()];
+
+        for (node_index, node) in scroll_tree.nodes.iter().enumerate().skip(2) {
             let parent_scroll_node_id = node
                 .parent
                 .expect("Should have already added root reference frame");
             let parent_spatial_node_id = mapping
                 .get(parent_scroll_node_id.index)
                 .expect("Should add spatial nodes to display list in order");
+
+            let parent_tainted = non_2d
+                .get(parent_scroll_node_id.index)
+                .copied()
+                .unwrap_or(false);
+            let self_non_2d = matches!(
+                &node.info,
+                SpatialTreeNodeInfo::ReferenceFrame(info)
+                    if !is_2d_scale_translation(&info.transform.to_transform())
+            );
+            non_2d[node_index] = parent_tainted || self_non_2d;
 
             // Produce a new SpatialTreeItemKey. This is currently unused by WebRender,
             // but has to be unique to the entire scene.
@@ -336,6 +399,7 @@ impl DisplayListBuilder<'_> {
 
         scroll_tree.update_mapping(mapping);
         self.paint_info.scroll_tree = scroll_tree;
+        self.reference_frame_non_2d = non_2d;
     }
 
     /// Add the given [`Clip`] to the WebRender display list and create a mapping from
@@ -767,8 +831,34 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
             let mut common = common;
             match paint_api::rendering_context::video_escape_mode() {
                 paint_api::rendering_context::VideoEscapeMode::External => {
-                    common.flags |= PrimitiveFlags::PREFER_COMPOSITOR_SURFACE |
-                        PrimitiveFlags::SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE;
+                    // Promotion hysteresis: offer for external compositor-surface promotion only
+                    // after the video's accumulated transform has been 2D scale/translation for
+                    // N consecutive frames. A rotating tile is only momentarily 2D (near 0/180
+                    // deg) -> never reaches N -> stays on the content pass, so it never flaps
+                    // between the content pass and an external surface (the flicker).
+                    let is_2d = self
+                        .reference_frame_non_2d
+                        .get(self.current_reference_frame_scroll_node_id.index)
+                        .map_or(true, |tainted| !*tainted);
+                    let promote = match fragment.base.tag {
+                        Some(tag) => {
+                            let key = tag.to_display_list_fragment_id();
+                            let frame = self.promote_frame;
+                            let mut map = PROMOTE_HYSTERESIS.lock().unwrap();
+                            let entry = map
+                                .entry(key)
+                                .or_insert(PromoteHystEntry { streak: 0, last_frame: frame });
+                            entry.streak = if is_2d { entry.streak.saturating_add(1) } else { 0 };
+                            entry.last_frame = frame;
+                            entry.streak >= promote_hysteresis_frames()
+                        },
+                        // Anonymous video (no DOM tag): no hysteresis key -> promote if 2D now.
+                        None => is_2d,
+                    };
+                    if promote {
+                        common.flags |= PrimitiveFlags::PREFER_COMPOSITOR_SURFACE |
+                            PrimitiveFlags::SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE;
+                    }
                 },
                 paint_api::rendering_context::VideoEscapeMode::Off => {},
             }
