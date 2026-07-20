@@ -217,6 +217,51 @@ fn refine_opaque_clip(
     }
 }
 
+// External video surface swap-chain stabilization (spec 2026-07-20). Decouples the
+// swap-chain backbuffer size from the per-frame (scale-animated) clip so a CSS scale
+// animation no longer forces a per-frame swap-chain recreate.
+
+/// External video surface swap-chain recreate tolerance (px, per axis). Scale-animation
+/// jitter (~1px) does not recreate; only a genuine layout resize does.
+const SWAPCHAIN_REF_TOLERANCE_PX: i32 = 4;
+
+/// Unscaled layout footprint of an external video surface: the on-screen clip size
+/// divided by the compositor-surface scale. Stable across a pure CSS scale animation (a
+/// scale transform does not change the layout box), so a swap-chain sized to it is not
+/// recreated on scale changes. Degenerate scale (~0) is treated as 1.0; result clamped
+/// to at least 1x1 to keep swap-chain creation valid.
+fn external_swapchain_ref_size(clip_size: DeviceIntSize, scale_x: f32, scale_y: f32) -> DeviceIntSize {
+    let sx = if scale_x.abs() > 1e-4 { scale_x.abs() } else { 1.0 };
+    let sy = if scale_y.abs() > 1e-4 { scale_y.abs() } else { 1.0 };
+    let w = (clip_size.width as f32 / sx).round() as i32;
+    let h = (clip_size.height as f32 / sy).round() as i32;
+    DeviceIntSize::new(w.max(1), h.max(1))
+}
+
+/// Whether the external swap-chain must be (re)created. With a fixed reference size a
+/// scale animation no longer triggers recreation; only swap-chain absence or a
+/// reference-size change beyond `tol` px (a layout resize that bypassed the destroy
+/// path) does.
+fn external_swapchain_needs_recreate(
+    has_swapchain: bool,
+    current_ref: DeviceIntSize,
+    new_ref: DeviceIntSize,
+    tol: i32,
+) -> bool {
+    !has_swapchain
+        || (current_ref.width - new_ref.width).abs() > tol
+        || (current_ref.height - new_ref.height).abs() > tol
+}
+
+/// D2D_MATRIX_3X2_F contents (`[[m11,m12],[m21,m22],[dx,dy]]`) scaling a reference-sized
+/// backbuffer to the on-screen display size, about the visual origin. Translation stays
+/// in SetOffset, so dx=dy=0. Identity for static (display==ref) surfaces.
+fn external_visual_scale_matrix(ref_size: DeviceIntSize, display_size: DeviceIntSize) -> [[f32; 2]; 3] {
+    let sx = display_size.width as f32 / ref_size.width.max(1) as f32;
+    let sy = display_size.height as f32 / ref_size.height.max(1) as f32;
+    [[sx, 0.0], [0.0, sy], [0.0, 0.0]]
+}
+
 /// 부분 Present catch-up용 상수(스펙 §5.2). 힌트 렉트 상한 / stale 목록 붕괴 상한.
 const MAX_PRESENT_DIRTY_RECTS: usize = 16;
 const MAX_STALE_RECTS: usize = 32;
@@ -3064,6 +3109,56 @@ mod tests {
         assert!(!external_needs_present(Some((1, 5)), 1, 5));
         assert!(external_needs_present(Some((1, 5)), 1, 6));   // 새 프레임
         assert!(external_needs_present(Some((1, 5)), 2, 5));   // 링 교체(소스 전환)
+    }
+
+    #[test]
+    fn ref_size_divides_out_scale() {
+        // clip 473x345 at scale 0.993 -> unscaled footprint ~476x347
+        let r = external_swapchain_ref_size(DeviceIntSize::new(473, 345), 0.993, 0.993);
+        assert_eq!(r, DeviceIntSize::new(476, 347));
+    }
+
+    #[test]
+    fn ref_size_scale_one_is_identity() {
+        let r = external_swapchain_ref_size(DeviceIntSize::new(476, 347), 1.0, 1.0);
+        assert_eq!(r, DeviceIntSize::new(476, 347));
+    }
+
+    #[test]
+    fn ref_size_degenerate_scale_clamped() {
+        // scale ~0 must not divide-by-zero; ref clamped to >=1
+        let r = external_swapchain_ref_size(DeviceIntSize::new(10, 10), 0.0, 0.0);
+        assert_eq!(r, DeviceIntSize::new(10, 10)); // scale treated as 1.0
+        let r2 = external_swapchain_ref_size(DeviceIntSize::new(0, 0), 1.0, 1.0);
+        assert_eq!(r2, DeviceIntSize::new(1, 1));
+    }
+
+    #[test]
+    fn recreate_only_on_absence_or_large_change() {
+        let a = DeviceIntSize::new(476, 347);
+        // no swapchain -> must create
+        assert!(external_swapchain_needs_recreate(false, a, a, 4));
+        // jitter within tolerance -> no recreate
+        assert!(!external_swapchain_needs_recreate(true, a, DeviceIntSize::new(478, 349), 4));
+        // change beyond tolerance -> recreate
+        assert!(external_swapchain_needs_recreate(true, a, DeviceIntSize::new(600, 347), 4));
+    }
+
+    #[test]
+    fn scale_matrix_maps_ref_to_display() {
+        // ref 476x347 shown at 390x285 -> sx=390/476, sy=285/347, no translate
+        let m = external_visual_scale_matrix(DeviceIntSize::new(476, 347), DeviceIntSize::new(390, 285));
+        assert!((m[0][0] - 390.0 / 476.0).abs() < 1e-6);
+        assert!((m[1][1] - 285.0 / 347.0).abs() < 1e-6);
+        assert_eq!(m[0][1], 0.0);
+        assert_eq!(m[1][0], 0.0);
+        assert_eq!(m[2], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn scale_matrix_identity_for_equal_sizes() {
+        let m = external_visual_scale_matrix(DeviceIntSize::new(476, 347), DeviceIntSize::new(476, 347));
+        assert_eq!(m, [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
     }
 
     #[test]
