@@ -226,6 +226,11 @@ pub(crate) struct Painter {
     #[cfg(windows)]
     pub(crate) dcomp_shared: Option<Rc<RefCell<crate::dcomp_compositor::DCompNativeCompositor>>>,
 
+    /// external fast-present 마지막 시각(refresh 페이싱: ~60/s로 coalesce, 도착률 ~1080/s
+    /// 방지). `dcomp_shared`의 fast-path에서만 읽으므로 같이 `#[cfg(windows)]`로 게이트한다.
+    #[cfg(windows)]
+    last_external_present: Cell<Option<Instant>>,
+
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
 
@@ -599,6 +604,8 @@ impl Painter {
             webrender_renderer: Some(webrender_renderer),
             #[cfg(windows)]
             dcomp_shared,
+            #[cfg(windows)]
+            last_external_present: Cell::new(None),
             webrender_api,
             webrender_document,
             webrender_gl,
@@ -2040,7 +2047,70 @@ impl Painter {
         // script rendering-opportunity rate. `animation_callbacks_running` tracks rAF only, so a
         // plain playing <video> (which sets `animations_running`) does not suppress this path.
         let raf_driving_composites = self.animation_callbacks_running();
-        if immediate_image_update &&
+
+        // external 갱신 분리(Task 1-4, 설계 §4): 승격된 external 비디오만 도착했다면
+        // WR 프레임 빌드(generate_frame, 씬 트리 재구성)를 완전히 건너뛰고 DComp 레벨의
+        // 값싼 present만 낸다. `took_fast_path`는 아래 기존 generate_frame 분기가 이
+        // 프레임을 이중으로 처리하지 않도록 하는 스위치이며, non-Windows 빌드/기능
+        // off/승격 external 없음에서는 항상 false로 남아 기존 동작이 그대로 유지된다.
+        //
+        // 주의(설계 필수 준수): 이 fast-path는 여기(update_images의 즉시-합성 게이트)에서만
+        // 호출한다. WR `render()` 안에서는 절대 부르지 않는다 — WR이 `SharedDComp`
+        // (동일 `Rc<RefCell<DCompNativeCompositor>>`의 트레이트 위임 래퍼)를 통해 이미
+        // 컴포지터를 대여 중일 때 여기서도 `dcomp_shared.borrow_mut()`를 걸면 이중 대여로
+        // 패닉한다. `update_images`는 WR `render()` 호출 경로 밖이므로 겹치지 않는다.
+        // non-Windows에서는 이 아래 `#[cfg(windows)]` 블록 전체가 통째로 잘려나가
+        // `took_fast_path`가 재대입되지 않으므로, `mut` 여부도 cfg로 나눠 unused_mut
+        // 경고를 피한다(플랫폼별 `mut` 필요성이 다름 — 동작은 항상 false로 동일).
+        #[cfg(windows)]
+        let mut took_fast_path = false;
+        #[cfg(not(windows))]
+        let took_fast_path = false;
+        #[cfg(windows)]
+        {
+            let escaped_count = self
+                .dcomp_shared
+                .as_ref()
+                .map(|c| crate::dcomp_compositor::SharedDComp(c.clone()).escaped_external_count())
+                .unwrap_or(0);
+            let resize_active = self.rendering_context.dcomp_resize_active();
+            if crate::dcomp_compositor::should_fast_present(
+                immediate_image_update,
+                generated_frame,
+                self.pending_frames.get() == 0,
+                self.renderer_behind(),
+                raf_driving_composites,
+                escaped_count,
+                resize_active,
+                crate::dcomp_compositor::decouple_enabled(),
+            ) {
+                // refresh 페이싱: 직전 fast-present 후 ~14ms(≈60/s) 경과 시에만 실제
+                // present를 낸다. 도착마다 present하면 36타일에서 ~1080 Commit/s가 되므로
+                // coalesce한다. dedup(external_needs_present)이 프레임이 안 바뀐 비디오는
+                // 이미 걸러주므로, due한 이 present가 그 시점의 최신 프레임을 반영한다.
+                let now = std::time::Instant::now();
+                let due = self
+                    .last_external_present
+                    .get()
+                    .map(|t| now.duration_since(t) >= std::time::Duration::from_millis(14))
+                    .unwrap_or(true);
+                if due {
+                    if let Some(shared) = self.dcomp_shared.as_ref() {
+                        crate::dcomp_compositor::SharedDComp(shared.clone())
+                            .present_external_only();
+                        self.last_external_present.set(Some(now));
+                    }
+                }
+                // 스로틀에 막혀 이번 호출에서 실제 present를 안 냈어도, 판정 자체는
+                // 성립했으므로 fast-path를 택한 것으로 취급한다 — 값비싼 generate_frame을
+                // 이 external-전용 프레임에는 절대 내지 않는다(다음 due 틱이 최신 프레임을
+                // present한다).
+                took_fast_path = true;
+            }
+        }
+
+        if !took_fast_path &&
+            immediate_image_update &&
             !generated_frame &&
             self.pending_frames.get() == 0 &&
             !raf_driving_composites &&

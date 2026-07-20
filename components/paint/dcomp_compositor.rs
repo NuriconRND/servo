@@ -114,15 +114,17 @@ fn video_escape_prof() -> bool {
 }
 
 /// external 비디오 갱신 분리 킬스위치. 기본 on; "0"이면 현재(비디오당 generate_frame) 복귀.
-fn decouple_enabled() -> bool {
+/// painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate).
+pub(crate) fn decouple_enabled() -> bool {
     std::env::var("SERVO_VIDEO_DECOUPLE").map(|v| v != "0").unwrap_or(true)
 }
 
 /// 즉시-합성 게이트에서 fast-path(present_external_only)를 택할지의 순수 판정.
 /// 기존 generate_frame 게이트(painter.rs:2027)와 같은 전제(비디오 도착·미생성·pending 0·
 /// rAF 없음·렌더러 안 밀림)에, 승격 external 존재 + 리사이즈 아님 + 기능 on을 더한다.
+/// painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate).
 #[allow(clippy::too_many_arguments)]
-fn should_fast_present(
+pub(crate) fn should_fast_present(
     immediate_image_update: bool,
     generated_frame: bool,
     pending_zero: bool,
