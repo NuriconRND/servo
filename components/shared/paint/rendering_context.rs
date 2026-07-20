@@ -53,17 +53,16 @@ pub fn dcomp_native_compositor_requested() -> bool {
     false
 }
 
-/// `SERVO_VIDEO_ESCAPE` 게이트 모드. Native=PREFER만(C 단계), External=PREFER|SUPPORTS(최종).
+/// `SERVO_VIDEO_ESCAPE` 게이트 모드. `external`만 유효(PREFER|SUPPORTS) — 그 외 토큰은
+/// 전부 Off로 취급한다(과거 `native` 진단 모드는 미표출 결함 확정으로 제거됨).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoEscapeMode {
     Off,
-    Native,
     External,
 }
 
 pub fn parse_video_escape_token(value: Option<&str>) -> VideoEscapeMode {
     match value {
-        Some("native") => VideoEscapeMode::Native,
         Some("external") => VideoEscapeMode::External,
         _ => VideoEscapeMode::Off,
     }
@@ -1966,16 +1965,14 @@ mod test {
     }
 
     #[test]
-    fn video_escape_token_parses_native_external_only() {
+    fn video_escape_token_parses_external_only() {
         use super::{VideoEscapeMode, parse_video_escape_token};
-        assert_eq!(
-            parse_video_escape_token(Some("native")),
-            VideoEscapeMode::Native
-        );
         assert_eq!(
             parse_video_escape_token(Some("external")),
             VideoEscapeMode::External
         );
+        // 제거된 토큰(native)은 안전하게 no-op(off)으로 폴백한다.
+        assert_eq!(parse_video_escape_token(Some("native")), VideoEscapeMode::Off);
         assert_eq!(parse_video_escape_token(Some("1")), VideoEscapeMode::Off); // 미정의 값은 off
         assert_eq!(parse_video_escape_token(Some("")), VideoEscapeMode::Off);
         assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);

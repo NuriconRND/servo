@@ -10,13 +10,11 @@
 # (Servo does not load @font-face web fonts, cannot select weights within a family,
 #  and fails to name-match the installed "Malgun Gothic" — measured 2026-07-18.)
 #
-# AMD 3-way A/B (performance read-out; use the PURE wall page, complex pages are for
-# correctness only — native mode has a known PiP/alpha-overlay freeze, diagnostic only):
+# AMD 2-way A/B (performance read-out; use the PURE wall page):
 #   1) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp                        (baseline hybrid)
-#   2) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape native    (content-pass win only)
-#   3) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape external  (full WR escape)
-# Read-out: 3>2>1 confirms the per-tile submission-overhead hypothesis. Compare GPU%
-# of 1 vs 3 (DWM visual-count cost). external does NOT need -TileSize (A/B showed no
+#   2) .\run_wall.ps1 -Cols 9 -Rows 5 -Sync -1 -DComp -VideoEscape external  (full WR escape)
+# Read-out: 2>1 confirms the per-tile submission-overhead hypothesis. Compare GPU%
+# of 1 vs 2 (DWM visual-count cost). external does NOT need -TileSize (A/B showed no
 # difference once video leaves the WR content pass).
 #
 # fps-cliff investigation (external, tile-count sweep): set $env:SERVO_VIDEO_ESCAPE_PROF='1'
@@ -44,8 +42,7 @@ param(
     [switch] $DComp,
     # With -DComp: virtual-surface-only legacy storage (AMD A/B); without it, hybrid.
     [switch] $DCompSurface,
-    # Video WR-escape gate (requires -DComp): "native" = diagnostic (WR still draws the
-    # video into its own surface; PiP/alpha-overlay freeze caveat), "external" = final
+    # Video WR-escape gate (requires -DComp): "external" is the only valid token — final
     # path (per-video DComp swapchain, video leaves the WR content pass entirely).
     [string] $VideoEscape = "",
     # WR picture-cache tile size override "WxH" (baseline recipe: 3840x3240; NOT needed

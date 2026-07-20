@@ -32,14 +32,11 @@ param(
     [switch] $DCompSurface,
     # Video WR-escape gate (spec docs/superpowers/specs/2026-07-17-video-wr-escape-design.md).
     # Only takes effect when -DComp is also set (SERVO_COMPOSITOR_DCOMP=1|surface); layout
-    # reads this only after confirming the DComp gate itself is on. "native" = C-stage:
-    # sets PREFER_COMPOSITOR_SURFACE only (WR still draws the video, but to its own
-    # dedicated surface -- promotion-behavior/AMD diagnostic lever, no compositor change
-    # yet). "external" = final A-stage: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE
-    # (video escapes the WR content pass to a compositor-owned external surface). Empty
-    # (default) = off, no flags set, display list byte-identical to pre-this-project.
-    # Same set-or-clear convention as -DComp/-TileSize above (stale env cleared when
-    # omitted).
+    # reads this only after confirming the DComp gate itself is on. "external" is the only
+    # valid token: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE (video escapes the WR
+    # content pass to a compositor-owned external surface). Empty (default) or any other
+    # token = off, no flags set, display list byte-identical to pre-this-project. Same
+    # set-or-clear convention as -DComp/-TileSize above (stale env cleared when omitted).
     [string] $VideoEscape = "",
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets

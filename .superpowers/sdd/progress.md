@@ -167,3 +167,6 @@
 - 캔버스 계열 전체(캔버스 사이클/opaque/canvas-only/자체 페이싱 v2, 36커밋)를 원복 — external 작업(f7423143c)까지만 유지. 방식: `archive/canvas-selfpacing-20260720` 브랜치에 전체 보존 후 reset --hard. 리빌드+패키지 재생성(1,216,854,960B, 07-20 09:43) 완료.
 - 보존된 지식(코드는 원복됐지만 사실은 유효 — 메모리 정본): Present×N 직렬화(§3-ac), wake 폭풍→WM_PAINT 기아(§3-2 동류, rAF무 페이지 동결 원인), 링 경로도 매 프레임 UpdateImage 송신, flipY 승격 플래핑, probe 대비 케이던스 판독법.
 - 재검토 시: `git log archive/canvas-selfpacing-20260720` 로 전체 이력·스펙(§12-14) 열람 가능.
+
+## native 모드 제거 (2026-07-20, 사용자 승인 — 미표출 결함 확정에 따른 정리)
+- 근거: native 비디오 미표출 근본원인 확정(불투명 콘텐츠 슬라이스가 전창 클립으로 최상단 — external은 동일 내용이 알파 슬라이스로 분류돼 정상. WR 슬라이스 분류 차이. 서피스 자체는 승격·draw 정상이었음 — bind(swapchain) 2,014회/30s 실측). 7/18 "native 육안 PASS" 기록은 부정확(캡처 불가 특성상 실육안 아니었음). 진단 가치도 왜곡(DWM 합성 비용 누락)이라 제거 결정. A/B는 ①hybrid↔③external 2자로.
