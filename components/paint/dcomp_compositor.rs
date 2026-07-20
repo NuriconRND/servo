@@ -1802,6 +1802,98 @@ impl DCompNativeCompositor {
         }
     }
 
+    /// 현재 승격되어 있는(External storage) 서피스 수. painter의 fast-path 게이트가
+    /// "present할 external이 있는가"를 질의하는 데 쓴다.
+    pub(crate) fn escaped_external_count(&self) -> usize {
+        self.surfaces
+            .values()
+            .filter(|e| matches!(e.storage, SurfaceStorage::External(_)))
+            .count()
+    }
+
+    /// external 갱신 분리 fast-path(설계 §4.2): WR 프레임 빌드/트리 재구성 없이, 승격된
+    /// external 서피스만 캐시된 placement로 present하고 Commit 1회. painter의 즉시-합성
+    /// 게이트가 refresh 케이던스로 호출한다. 리사이즈 중엔 호출측이 억제한다(설계 §4.5).
+    pub(crate) fn present_external_only(&mut self) {
+        let rc = self.rendering_context.clone();
+        let Some(provider) = paint_api::video_external_surface_provider() else {
+            return;
+        };
+        let resize_active = rc.dcomp_resize_active();
+        if resize_active {
+            return; // 방어: 게이트가 이미 걸러야 하나, 이중 안전.
+        }
+
+        // borrow 사정: External 서피스의 present 입력을 먼저 스냅샷으로 수집한 뒤 present.
+        // (present_external은 &mut self라 surfaces iter 중 호출 불가.)
+        struct PendingExt {
+            id: NativeSurfaceId,
+            external_id: u64,
+            is_opaque: bool,
+            ref_size: DeviceIntSize,
+            clip_rect: DeviceIntRect,
+            transform_offset: (f32, f32),
+        }
+        let mut pending: Vec<PendingExt> = Vec::new();
+        for (id, entry) in self.surfaces.iter() {
+            let SurfaceStorage::External(ext) = &entry.storage else {
+                continue;
+            };
+            let (Some(external_id), Some(placement)) =
+                (ext.attached_external_id, entry.last_placement)
+            else {
+                continue; // attach 전 / placement 없음 → 표시할 프레임 없음.
+            };
+            pending.push(PendingExt {
+                id: *id,
+                external_id,
+                is_opaque: entry.is_opaque,
+                ref_size: ext.swapchain_size,
+                clip_rect: placement.clip_rect,
+                transform_offset: placement.transform_offset,
+            });
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        for p in pending {
+            // acquire↔release 짝맞춤(add_external_surface와 동일 계약).
+            let Some(lease) = provider.acquire(&*rc, p.external_id) else {
+                continue;
+            };
+            let ring_id = lease.ring_id;
+            // transform 복원: present_external 내부에서는 디버그 로그에만 쓰인다(placement는
+            // 직전 실합성의 place_external_visual이 이미 적용) — scale=1 + 캐시 offset으로
+            // 무해하게 복원한다. CompositorSurfaceTransform = webrender::util::ScaleOffset이며
+            // 여기 필요한 것은 `new(sx, sy, tx, ty)` 생성자뿐(add_surface/place_external_visual과
+            // 동일하게 transform.offset.{x,y}만 참조).
+            let transform = CompositorSurfaceTransform::new(
+                1.0,
+                1.0,
+                p.transform_offset.0,
+                p.transform_offset.1,
+            );
+            self.present_external(
+                p.id, &lease, p.ref_size, p.is_opaque, false, transform, p.clip_rect,
+            );
+            provider.release(&*rc, ring_id);
+        }
+
+        // external convert 배치 닫기(정확성 필수, 설계 §4.2): begin_batch로 활성화된
+        // ID3DDeviceContextState를 반드시 닫아 다음 프레임/경로 GL 안전성 보장.
+        self.close_external_batch();
+
+        // Commit 1회.
+        if let Some(dcomp_device) = self.dcomp_device_ptr() {
+            // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
+            let hr = unsafe { (*dcomp_device).Commit() };
+            if hr < 0 {
+                warn!("[dcomp-native] present_external_only Commit failed (hr=0x{:08x})", hr as u32);
+            }
+        }
+    }
+
     /// external convert 배치가 열려 있으면 닫는다(멱등). ★반드시 이 스레드의 다음 ANGLE/GL
     /// 호출 전에 불려야 한다 — 배치가 열린 동안 우리 ID3DDeviceContextState가 활성이라 ANGLE의
     /// GL→D3D11 상태 설정이 어긋난다(begin_batch 주석). 정본 호출 지점은 start_compositing:
