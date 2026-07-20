@@ -219,6 +219,13 @@ pub(crate) struct Painter {
     /// The webrender renderer.
     pub(crate) webrender_renderer: Option<webrender::Renderer>,
 
+    /// external fast-path(Task 4)용 DComp 컴포지터 공유 핸들. WR은 같은 인스턴스를
+    /// `Box<SharedDComp>`(`CompositorConfig::Native`)로 소유하고, painter는 이 `Rc` 클론으로
+    /// `present_external_only()`를 직접 호출한다(WR 프레임 빌드를 거치지 않는 경로).
+    /// Native 컴포지터 미발동(Draw 폴백 포함)이면 `None`.
+    #[cfg(windows)]
+    pub(crate) dcomp_shared: Option<Rc<RefCell<crate::dcomp_compositor::DCompNativeCompositor>>>,
+
     /// The GL bindings for webrender
     webrender_gl: Rc<dyn gleam::gl::Gl>,
 
@@ -442,28 +449,35 @@ impl Painter {
         // pass — spec 2026-07-13). On failure fall back to the Draw compositor (byte-identical
         // to current behaviour). Off (default) leaves compositor_config at its Draw default.
         #[cfg(windows)]
-        let compositor_config = if crate::dcomp_compositor::enabled() {
+        let (compositor_config, dcomp_shared) = if crate::dcomp_compositor::enabled() {
             match crate::dcomp_compositor::maybe_create(&rendering_context) {
-                Some(compositor) => {
+                Some(shared) => {
                     log::info!("[dcomp-native] engaged: WR native compositor (DirectComposition)");
                     // 실제 발동을 rendering_context에 알린다 — present()의 스킵 판정은
                     // env 게이트가 아닌 이 신호를 본다(리뷰 픽스: env on + 발동 실패로
                     // Draw 폴백된 경우 present가 잘못 스킵되면 블랭크 윈도우가 된다).
                     rendering_context.set_dcomp_native_active(true);
-                    webrender::CompositorConfig::Native {
-                        compositor: Box::new(compositor),
-                    }
+                    // WR엔 얇은 위임 래퍼(SharedDComp)를 넘기고, painter는 같은 인스턴스의
+                    // Rc를 보관해 external fast-path(Task 4)에서 직접 접근한다.
+                    (
+                        webrender::CompositorConfig::Native {
+                            compositor: Box::new(crate::dcomp_compositor::SharedDComp(
+                                shared.clone(),
+                            )),
+                        },
+                        Some(shared),
+                    )
                 },
                 None => {
                     log::warn!("[dcomp-native] init failed; falling back to Draw compositor");
                     // 초기값 false에 암묵 의존하지 않고 폴백임을 명시한다(§set_dcomp_native_active
                     // 계약: true로의 전이는 발동 성공 시 1회뿐이고, 폴백은 항상 false를 유지).
                     rendering_context.set_dcomp_native_active(false);
-                    webrender::CompositorConfig::default()
+                    (webrender::CompositorConfig::default(), None)
                 },
             }
         } else {
-            webrender::CompositorConfig::default()
+            (webrender::CompositorConfig::default(), None)
         };
         #[cfg(not(windows))]
         let compositor_config = webrender::CompositorConfig::default();
@@ -583,6 +597,8 @@ impl Painter {
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
+            #[cfg(windows)]
+            dcomp_shared,
             webrender_api,
             webrender_document,
             webrender_gl,

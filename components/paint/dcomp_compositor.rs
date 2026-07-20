@@ -12,6 +12,7 @@
 //! 이 모듈에는 y-flip이 없다(PoC G4가 표시 측 정합을 증명).
 #![allow(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
 use std::rc::Rc;
@@ -1214,7 +1215,7 @@ pub fn enabled() -> bool {
 /// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
 pub fn maybe_create(
     rendering_context: &Rc<dyn RenderingContext>,
-) -> Option<DCompNativeCompositor> {
+) -> Option<Rc<RefCell<DCompNativeCompositor>>> {
     let hwnd = rendering_context.window_hwnd().or_else(|| {
         warn!("[dcomp-native] no HWND; falling back to Draw");
         None
@@ -1326,7 +1327,7 @@ pub fn maybe_create(
             return None;
         }
 
-        Some(DCompNativeCompositor {
+        Some(Rc::new(RefCell::new(DCompNativeCompositor {
             rendering_context: rendering_context.clone(),
             dcomp_device: Some(dcomp_device),
             _target: Some(target),
@@ -1350,7 +1351,7 @@ pub fn maybe_create(
             warned_no_provider: false,
             external_batch_active: false,
             esc_prof: EscProf::new(),
-        })
+        })))
     }
 }
 
@@ -3252,6 +3253,144 @@ impl Compositor for DCompNativeCompositor {
         // WR renderer deinit 내부(= egl.Terminate 이전)에 호출됨 — 여기서 전부 명시 해제한다.
         // Drop도 같은 release_all을 부르지만, 명시 호출이 §3-q UAF 회귀 가드 역할을 겸한다.
         self.release_all();
+    }
+}
+
+/// WR은 `Box<dyn Compositor>`로 컴포지터를 소유한다. painter도 external fast-path
+/// (Task 4)를 위해 같은 인스턴스에 접근해야 하므로, 실상태를 `Rc<RefCell>`에 두고 WR엔
+/// 이 얇은 위임 래퍼를 넘긴다. 전부 단일 렌더러 스레드에서 돌아 `Rc<RefCell>` 안전하다
+/// (WR `render()`의 트레이트 대여와 painter의 fast-path 대여는 동일 스레드·프레임당
+/// 단일 경로라 비중첩).
+pub struct SharedDComp(pub Rc<RefCell<DCompNativeCompositor>>);
+
+impl SharedDComp {
+    pub(crate) fn present_external_only(&self) {
+        self.0.borrow_mut().present_external_only();
+    }
+
+    pub(crate) fn escaped_external_count(&self) -> usize {
+        self.0.borrow().escaped_external_count()
+    }
+}
+
+impl Compositor for SharedDComp {
+    fn create_surface(
+        &mut self,
+        device: &mut Device,
+        id: NativeSurfaceId,
+        virtual_offset: DeviceIntPoint,
+        tile_size: DeviceIntSize,
+        is_opaque: bool,
+    ) {
+        self.0
+            .borrow_mut()
+            .create_surface(device, id, virtual_offset, tile_size, is_opaque)
+    }
+
+    fn create_tile(&mut self, device: &mut Device, id: NativeTileId) {
+        self.0.borrow_mut().create_tile(device, id)
+    }
+
+    fn destroy_tile(&mut self, device: &mut Device, id: NativeTileId) {
+        self.0.borrow_mut().destroy_tile(device, id)
+    }
+
+    fn bind(
+        &mut self,
+        device: &mut Device,
+        id: NativeTileId,
+        dirty_rect: DeviceIntRect,
+        valid_rect: DeviceIntRect,
+    ) -> NativeSurfaceInfo {
+        self.0.borrow_mut().bind(device, id, dirty_rect, valid_rect)
+    }
+
+    fn unbind(&mut self, device: &mut Device) {
+        self.0.borrow_mut().unbind(device)
+    }
+
+    fn begin_frame(&mut self, device: &mut Device) {
+        self.0.borrow_mut().begin_frame(device)
+    }
+
+    fn add_surface(
+        &mut self,
+        device: &mut Device,
+        id: NativeSurfaceId,
+        transform: CompositorSurfaceTransform,
+        clip_rect: DeviceIntRect,
+        image_rendering: ImageRendering,
+        rounded_clip_rect: DeviceIntRect,
+        rounded_clip_radii: ClipRadius,
+    ) {
+        self.0.borrow_mut().add_surface(
+            device,
+            id,
+            transform,
+            clip_rect,
+            image_rendering,
+            rounded_clip_rect,
+            rounded_clip_radii,
+        )
+    }
+
+    fn start_compositing(
+        &mut self,
+        device: &mut Device,
+        clear_color: ColorF,
+        dirty_rects: &[DeviceIntRect],
+        opaque_rects: &[DeviceIntRect],
+    ) {
+        self.0
+            .borrow_mut()
+            .start_compositing(device, clear_color, dirty_rects, opaque_rects)
+    }
+
+    fn end_frame(&mut self, device: &mut Device) {
+        self.0.borrow_mut().end_frame(device)
+    }
+
+    fn destroy_surface(&mut self, device: &mut Device, id: NativeSurfaceId) {
+        self.0.borrow_mut().destroy_surface(device, id)
+    }
+
+    fn create_external_surface(&mut self, device: &mut Device, id: NativeSurfaceId, is_opaque: bool) {
+        self.0
+            .borrow_mut()
+            .create_external_surface(device, id, is_opaque)
+    }
+
+    fn attach_external_image(
+        &mut self,
+        device: &mut Device,
+        id: NativeSurfaceId,
+        external_image: ExternalImageId,
+    ) {
+        self.0
+            .borrow_mut()
+            .attach_external_image(device, id, external_image)
+    }
+
+    fn create_backdrop_surface(&mut self, device: &mut Device, id: NativeSurfaceId, color: ColorF) {
+        self.0
+            .borrow_mut()
+            .create_backdrop_surface(device, id, color)
+    }
+
+    fn enable_native_compositor(&mut self, device: &mut Device, enable: bool) {
+        self.0.borrow_mut().enable_native_compositor(device, enable)
+    }
+
+    fn get_capabilities(&self, device: &mut Device) -> CompositorCapabilities {
+        self.0.borrow().get_capabilities(device)
+    }
+
+    fn get_window_visibility(&self, device: &mut Device) -> WindowVisibility {
+        self.0.borrow().get_window_visibility(device)
+    }
+
+    fn deinit(&mut self, device: &mut Device) {
+        self.0.borrow_mut().deinit(device)
     }
 }
 
