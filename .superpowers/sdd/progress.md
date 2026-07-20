@@ -170,3 +170,4 @@
 
 ## native 모드 제거 (2026-07-20, 사용자 승인 — 미표출 결함 확정에 따른 정리)
 - 근거: native 비디오 미표출 근본원인 확정(불투명 콘텐츠 슬라이스가 전창 클립으로 최상단 — external은 동일 내용이 알파 슬라이스로 분류돼 정상. WR 슬라이스 분류 차이. 서피스 자체는 승격·draw 정상이었음 — bind(swapchain) 2,014회/30s 실측). 7/18 "native 육안 PASS" 기록은 부정확(캡처 불가 특성상 실육안 아니었음). 진단 가치도 왜곡(DWM 합성 비용 누락)이라 제거 결정. A/B는 ①hybrid↔③external 2자로.
+- native 제거: complete (commit c57327cb5, review Approved 결함0). enum/파서/레이아웃 arm/테스트/런처 2종 가이드(2자 A/B) 정리, external·off 바이트 등가 검증, 스모크 (a)external 4비디오 표시 (b)native 토큰→무음 off. 패키지 재생성 완료.
