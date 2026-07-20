@@ -38,6 +38,7 @@ use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
+use winapi::um::dcommon::D2D_MATRIX_3X2_F;
 use winapi::um::d3d11::{
     D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11Texture2D,
@@ -72,6 +73,14 @@ const DEMOTE_COOLDOWN_CAP: u64 = 3600;
 fn dcomp_debug() -> bool {
     static DCOMP_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DCOMP_DEBUG.get_or_init(|| std::env::var("SERVO_DCOMP_DEBUG").is_ok())
+}
+
+/// External swap-chain stabilization gate (env `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`).
+/// Default on; "0" reverts to the old behavior (swap-chain sized to the clip, recreated
+/// every frame under a scale animation) for AMD A/B and rollback. Read once per process.
+fn stable_swapchain() -> bool {
+    static STABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STABLE.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN").as_deref() != Ok("0"))
 }
 
 /// Task 6 defect-2 diagnosis (spec 2026-07-15): env-gated per-tile pixel readback in
@@ -1400,19 +1409,23 @@ impl DCompNativeCompositor {
     /// 오프셋 = clip.min(device 좌표), 클립 = 비주얼-로컬 (0,0)-(w,h). scale은 무시한다
     /// (dest=clip에 스케일이 이미 반영 — 브리프 계약). provider 유무와 무관하게 매 프레임
     /// 호출해 마지막 프레임을 유지한다.
-    fn place_external_visual(&self, id: NativeSurfaceId, clip_rect: DeviceIntRect) {
+    fn place_external_visual(&self, id: NativeSurfaceId, clip_rect: DeviceIntRect, ref_size: DeviceIntSize) {
         let Some(entry) = self.surfaces.get(&id) else {
             return;
         };
         let offset_x = clip_rect.min.x as f32;
         let offset_y = clip_rect.min.y as f32;
-        // 비주얼-로컬 클립(SetClip은 오프셋 적용 전 좌표) = clip − offset = (0,0)-(w,h).
-        let local_clip = D2D_RECT_F {
-            left: 0.0,
-            top: 0.0,
-            right: (clip_rect.max.x - clip_rect.min.x) as f32,
-            bottom: (clip_rect.max.y - clip_rect.min.y) as f32,
+        let stable = stable_swapchain();
+        // Stable gate on: backbuffer == ref_size, on-screen scale via SetTransform. Off:
+        // backbuffer == clip size (legacy, scale baked into clip -> per-frame recreate).
+        // Local clip (SetClip takes pre-offset coords) = backbuffer rect (0,0)-(w,h); under
+        // the scale transform it maps to the display footprint (scale<=1 -> no crop).
+        let (clip_w, clip_h) = if stable {
+            (ref_size.width as f32, ref_size.height as f32)
+        } else {
+            ((clip_rect.max.x - clip_rect.min.x) as f32, (clip_rect.max.y - clip_rect.min.y) as f32)
         };
+        let local_clip = D2D_RECT_F { left: 0.0, top: 0.0, right: clip_w, bottom: clip_h };
         // Safety: visual은 ComOwned가 수명을 보장하는 살아있는 IDCompositionVisual.
         unsafe {
             let hr = (*entry.visual.as_ptr()).SetOffsetX_1(offset_x);
@@ -1422,6 +1435,16 @@ impl DCompNativeCompositor {
             let hr = (*entry.visual.as_ptr()).SetOffsetY_1(offset_y);
             if hr < 0 {
                 warn!("[dcomp-native] external SetOffsetY failed (hr=0x{:08x})", hr as u32);
+            }
+            if stable {
+                // Scale ref-sized backbuffer to the on-screen display size (identity for
+                // static scale=1 surfaces). Translation stays in SetOffset (dx=dy=0).
+                let m = external_visual_scale_matrix(ref_size, clip_rect.size());
+                let matrix = D2D_MATRIX_3X2_F { matrix: m };
+                let hr = (*entry.visual.as_ptr()).SetTransform_1(&matrix);
+                if hr < 0 {
+                    warn!("[dcomp-native] external SetTransform failed (hr=0x{:08x})", hr as u32);
+                }
             }
             let hr = (*entry.visual.as_ptr()).SetClip_1(&local_clip);
             if hr < 0 {
@@ -1451,9 +1474,16 @@ impl DCompNativeCompositor {
             return;
         }
         let size = clip_rect.size();
+        // Stable gate on: swap-chain fixed to the unscaled footprint (stable across a
+        // scale animation). Off: legacy clip-sized swap-chain.
+        let ref_size = if stable_swapchain() {
+            external_swapchain_ref_size(size, transform.scale.x, transform.scale.y)
+        } else {
+            size
+        };
 
         // Step 4-7/8(앞당김): 비주얼 배치 + z-order 기록은 provider 유무와 무관하게 항상.
-        self.place_external_visual(id, clip_rect);
+        self.place_external_visual(id, clip_rect, ref_size);
         self.frame_surfaces.push(id);
 
         let rc = self.rendering_context.clone();
@@ -1496,7 +1526,7 @@ impl DCompNativeCompositor {
 
         // Step 4-4/5: 스왑체인 보장 + 변환 + Present. 어떤 경로로 끝나도(정상 반환) 아래
         // release가 lease를 반납한다(present_external은 release를 호출하지 않는다).
-        self.present_external(id, &lease, size, is_opaque, resize_active, transform, clip_rect);
+        self.present_external(id, &lease, ref_size, is_opaque, resize_active, transform, clip_rect);
 
         // Step 4-6: release 짝맞춤(Present 성공/실패/스킵 무관).
         provider.release(&*rc, ring_id);
@@ -1533,9 +1563,22 @@ impl DCompNativeCompositor {
         // Step 4-4: 스왑체인 필요 판정(없거나 클립 크기 변화). create_composition_swapchain은
         // &self라 entry borrow 밖에서 호출한다. 드래그 중(resize_active)엔 재생성 억제 —
         // 매 틱 재생성은 content_attached 리셋→Present 보류→블랙(§3-y 정합). 기존 스왑체인 유지.
+        // `size` is the reference (unscaled-footprint) size when the stable gate is on, else
+        // the legacy clip size. Stable: recreate only on absence or a ref change beyond the
+        // tolerance (a scale animation keeps the ref stable). Legacy: recreate on any size
+        // change. resize_active suppression below is unchanged.
         let need_new = match self.surfaces.get(&id).map(|e| &e.storage) {
             Some(SurfaceStorage::External(ext)) => {
-                ext.swapchain.is_none() || ext.swapchain_size != size
+                if stable_swapchain() {
+                    external_swapchain_needs_recreate(
+                        ext.swapchain.is_some(),
+                        ext.swapchain_size,
+                        size,
+                        SWAPCHAIN_REF_TOLERANCE_PX,
+                    )
+                } else {
+                    ext.swapchain.is_none() || ext.swapchain_size != size
+                }
             },
             _ => return,
         };
