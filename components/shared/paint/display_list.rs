@@ -18,11 +18,35 @@ use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
 use servo_geometry::FastLayoutTransform;
 use style::values::specified::Overflow;
-use webrender_api::units::{LayoutPixel, LayoutPoint, LayoutRect, LayoutSize, LayoutVector2D};
+use webrender_api::units::{
+    LayoutPixel, LayoutPoint, LayoutRect, LayoutSize, LayoutTransform, LayoutVector2D,
+};
 use webrender_api::{
     ColorF, ExternalScrollId, PipelineId, PropertyBindingKey, ReferenceFrameKind, ScrollLocation,
     SpatialId, StickyOffsetBounds, TransformStyle,
 };
+
+/// Matches WebRender's `is_2d_scale_translation` (webrender/src/util.rs:539), whose trait is
+/// crate-internal and cannot be imported. Returns true iff the matrix is a pure 2D scale plus
+/// translation (no rotation, skew, or z coupling). A `rotateZ(theta)` matrix is `is_2d()` yet
+/// NOT scale/translation for theta != 0/180 -- exactly what excludes rotating video tiles from
+/// compositor-surface promotion. `NEARLY_ZERO` is kept identical to WebRender's value.
+const PROMOTE_NEARLY_ZERO: f32 = 1.0 / 4096.0;
+pub fn is_2d_scale_translation(t: &LayoutTransform) -> bool {
+    let z = PROMOTE_NEARLY_ZERO;
+    (t.m33 - 1.0).abs() < z &&
+        (t.m44 - 1.0).abs() < z &&
+        t.m12.abs() < z &&
+        t.m13.abs() < z &&
+        t.m14.abs() < z &&
+        t.m21.abs() < z &&
+        t.m23.abs() < z &&
+        t.m24.abs() < z &&
+        t.m31.abs() < z &&
+        t.m32.abs() < z &&
+        t.m34.abs() < z &&
+        t.m43.abs() < z
+}
 
 /// A scroll type, describing whether what kind of action originated this scroll request.
 /// This is a bitflag as it is also used to track what kinds of [`ScrollType`]s scroll
@@ -919,5 +943,47 @@ impl PaintDisplayListInfo {
         self.scroll_tree
             .external_scroll_id_for_scroll_tree_node(id)
             .unwrap_or(ExternalScrollId(0, self.pipeline_id))
+    }
+}
+
+#[cfg(test)]
+mod promote_tests {
+    use euclid::Angle;
+    use webrender_api::units::LayoutTransform;
+
+    use super::is_2d_scale_translation;
+
+    #[test]
+    fn identity_and_scale_translate_are_2d() {
+        assert!(is_2d_scale_translation(&LayoutTransform::identity()));
+        assert!(is_2d_scale_translation(&LayoutTransform::scale(0.78, 0.78, 1.0)));
+        assert!(is_2d_scale_translation(&LayoutTransform::translation(30.0, -12.0, 0.0)));
+        let m = LayoutTransform::scale(0.9, 0.9, 1.0).then_translate(euclid::vec3(5.0, 5.0, 0.0));
+        assert!(is_2d_scale_translation(&m));
+    }
+
+    #[test]
+    fn rotatez_nonzero_is_not_2d_scale_translation() {
+        // rotateZ(45deg): is_2d()엔 true지만 scale/translation은 아님 -> false.
+        let m = LayoutTransform::rotation(0.0, 0.0, 1.0, Angle::degrees(45.0));
+        assert!(!is_2d_scale_translation(&m));
+        let m90 = LayoutTransform::rotation(0.0, 0.0, 1.0, Angle::degrees(90.0));
+        assert!(!is_2d_scale_translation(&m90));
+    }
+
+    #[test]
+    fn rotatez_0_and_180_degenerate_to_2d() {
+        let m0 = LayoutTransform::rotation(0.0, 0.0, 1.0, Angle::degrees(0.0));
+        assert!(is_2d_scale_translation(&m0));
+        // 180deg = scale(-1,-1): 회전 항 0 -> 2D (플래핑의 승격 순간).
+        let m180 = LayoutTransform::rotation(0.0, 0.0, 1.0, Angle::degrees(180.0));
+        assert!(is_2d_scale_translation(&m180));
+    }
+
+    #[test]
+    fn rotatey_is_not_2d_scale_translation() {
+        // 3D Y-플립: z 결합 -> false.
+        let m = LayoutTransform::rotation(0.0, 1.0, 0.0, Angle::degrees(45.0));
+        assert!(!is_2d_scale_translation(&m));
     }
 }
