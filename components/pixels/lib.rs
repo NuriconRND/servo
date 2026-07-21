@@ -585,8 +585,10 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Raster
 /// Like [`load_from_memory`] but accepts the full set of formats the bundled
 /// `image` crate is built with (TIFF, OpenEXR, HDR, TGA, DDS, QOI, PNM, ...),
 /// instead of the browser-standard allowlist in [`detect_image_format`] used by
-/// `<img>`. Intended for the experimental non-standard `<x-image>` element so it
-/// can display formats `<img>` does not, without changing `<img>` behavior.
+/// `<img>`. This is the extended-format decode path for the standard `<img>`
+/// element (gated behind the `dom_image_extended_formats_enabled` pref), so it
+/// can display formats `<img>` does not decode by default, without changing
+/// `<img>`'s behavior when the pref is off.
 /// Decodes a single (first) frame; animation is not handled here.
 pub fn load_extended_from_memory(
     buffer: &[u8],
@@ -610,7 +612,7 @@ pub fn load_extended_from_memory(
     let mut reader = match image::ImageReader::new(Cursor::new(buffer)).with_guessed_format() {
         Ok(reader) => reader,
         Err(error) => {
-            debug!("x-image: could not guess image format: {error}");
+            debug!("extended-image: could not guess image format: {error}");
             return None;
         },
     };
@@ -624,7 +626,7 @@ pub fn load_extended_from_memory(
     let decoder = match reader.into_decoder() {
         Ok(decoder) => decoder,
         Err(error) => {
-            debug!("x-image: could not create image decoder: {error}");
+            debug!("extended-image: could not create image decoder: {error}");
             return None;
         },
     };
@@ -833,8 +835,8 @@ fn decode_static_image(
 }
 
 /// Build a single-frame [`RasterImage`] from a decoded [`DynamicImage`], storing
-/// pre-multiplied RGBA8 (shared by the standard decoders and the `<x-image>`
-/// extended/JXL decoders).
+/// pre-multiplied RGBA8 (shared by the standard decoders and the standard
+/// `<img>` extended/JXL decode path).
 fn raster_from_rgba8_dynamic_image(
     cors_status: CorsStatus,
     dynamic_image: DynamicImage,
@@ -876,19 +878,20 @@ fn is_jxl(buffer: &[u8]) -> bool {
 }
 
 /// Decode a JPEG XL image (the `image` crate has no JXL support) via `jxl-oxide`,
-/// flattening the first frame to pre-multiplied RGBA8. Used only by `<x-image>`.
+/// flattening the first frame to pre-multiplied RGBA8. Used only by the standard
+/// `<img>` extended-format decode path.
 fn decode_jxl(buffer: &[u8], cors_status: CorsStatus) -> Option<RasterImage> {
     let image = match jxl_oxide::JxlImage::builder().read(Cursor::new(buffer)) {
         Ok(image) => image,
         Err(error) => {
-            debug!("x-image: jxl read error: {error}");
+            debug!("extended-image: jxl read error: {error}");
             return None;
         },
     };
     let render = match image.render_frame(0) {
         Ok(render) => render,
         Err(error) => {
-            debug!("x-image: jxl render error: {error}");
+            debug!("extended-image: jxl render error: {error}");
             return None;
         },
     };
@@ -897,6 +900,9 @@ fn decode_jxl(buffer: &[u8], cors_status: CorsStatus) -> Option<RasterImage> {
     let width = framebuffer.width() as u32;
     let height = framebuffer.height() as u32;
     let channels = framebuffer.channels();
+    if channels == 0 {
+        return None;
+    }
     let samples = framebuffer.buf();
 
     let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -1058,5 +1064,25 @@ mod test {
         ));
         let raster = load_extended_from_memory(jxl, Some("jxl"), CorsStatus::Unsafe);
         assert!(raster.is_some(), "jxl decode should succeed via jxl-oxide");
+    }
+
+    #[test]
+    fn extended_decode_delegates_standard_formats() {
+        use super::CorsStatus;
+        use super::load_extended_from_memory;
+
+        // A standard PNG should be recognized by `detect_image_format` and decoded
+        // via the existing standard (animation-aware) path, not the extended-format
+        // fallback. This covers `load_extended_from_memory`'s standard-format
+        // delegation branch directly.
+        let png = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/wpt/tests/jpegxl/resources/basic.png"
+        ));
+        let raster = load_extended_from_memory(png, None, CorsStatus::Unsafe);
+        assert!(
+            raster.is_some(),
+            "standard PNG should decode via the standard delegation path"
+        );
     }
 }

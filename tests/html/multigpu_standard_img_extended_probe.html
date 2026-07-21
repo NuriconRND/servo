@@ -18,13 +18,13 @@
   the wall resolution (no scrolling) — every image is visible at once. (Servo
   does not support `display:grid`, so flexbox is used.)
 
-  Reuses the assets generated for the <x-image> probe at servo/test_media/
-  (see multigpu_x_image_formats_probe.html for the ffmpeg recipe).
+  Test assets live at tests/html/test_media/test_image.<ext>, generated with
+  ffmpeg from a common source frame (one real image per extended format).
 
   Thumbnails (standard-browser fallback): a 320x180 JPEG per image, used as the
   <picture> <img> fallback. Generate with:
     ffmpeg -y -i test_image.exr -vf scale=320:180 test_image.exr.thumb.jpg
-    (repeat for tiff/tga/ppm/pgm/qoi/hdr/jxl)
+    (repeat for tiff/tga/ppm/pgm/qoi/hdr/jxl/dds)
 
   Run:
     # extended decode ON (wall browser behavior)
@@ -55,7 +55,7 @@
 <body>
   <div class="grid" id="grid"></div>
   <script>
-    const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo_multigpu-tiled-wall/tests/html/test_media/test_image.";
+    const BASE = "test_media/test_image.";
     // ext -> human description shown when the standard browser cannot decode it.
     // ext -> { mime for the typed <picture> <source>, human description }.
     // The mime values must match EXTENDED_IMAGE_MIME_TYPES in htmlimageelement.rs
@@ -69,6 +69,7 @@
       qoi:  { mime: "image/qoi",                  desc: "QOI — fast lossless format" },
       hdr:  { mime: "image/vnd.radiance",         desc: "Radiance HDR — HDR environment map" },
       jxl:  { mime: "image/jxl",                  desc: "JPEG XL — next-gen still codec" },
+      dds:  { mime: "image/vnd-ms.dds",           desc: "DDS — DirectDraw Surface texture" },
     };
     const grid = document.getElementById("grid");
     const items = [];

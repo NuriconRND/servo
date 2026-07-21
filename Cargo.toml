@@ -134,12 +134,12 @@ icu_segmenter = "1.5.0"
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
 imsz = "0.4"
 indexmap = { version = "2.14.0", features = ["std"] }
-jxl-oxide = "0.11"
 inventory = "0.3.24"
 ipc-channel = "0.22"
 itertools = "0.14"
 jni = "0.22"
 js = { package = "mozjs", version = "=0.16.0", default-features = false, features = ["intl", "libz-sys"] }
+jxl-oxide = "0.11"
 keyboard-types = { version = "0.8.3", features = ["serde", "webdriver"] }
 kurbo = { version = "0.13.1", features = ["euclid"] }
 libc = "0.2"
