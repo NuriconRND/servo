@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<!--
+  STANDARD <video> extended-dispatch probe (no <x-media>/<rtsp-stream>).
+
+  Same markup a normal-browser author would write: plain <video> with typed
+  <source> children and inline fallback content. It branches by ENVIRONMENT:
+    - Standard browser: the non-standard container / rtsp source is rejected
+      (canPlayType=="" ) -> all sources fail -> the element's inline fallback
+      content (the descriptive <p>) is shown and MediaError is
+      MEDIA_ERR_SRC_NOT_SUPPORTED (graceful degradation).
+    - Multi-GPU wall browser:
+        --pref dom_video_extended_containers_enabled=true accepts the typed
+          <source> for mkv/avi/wmv/ts/flv/mov and plays it via the normal
+          GStreamer pipeline (playbin3 auto-demux).
+        --pref dom_video_network_uri_enabled=true routes a <video src="rtsp://…">
+          to a GStreamer NetworkUri player (rtspsrc), no AppSrc fetch.
+
+  Layout: a flexbox 4x2 grid sized in viewport units so all tiles stay inside the
+  wall resolution (no scrolling) — every video is visible at once. (Servo does
+  not support `display:grid`, so flexbox is used.)
+
+  Reuses the assets generated for the <x-media> probe at servo/test_media/
+  (see multigpu_x_media_containers_probe.html for the ffmpeg recipe).
+
+  Thumbnails (standard-browser fallback): a 320x180 JPEG per clip, used as the
+  <video poster> and as the JS overlay below. Generate with:
+    ffmpeg -y -i test_media.mkv -frames:v 1 -vf scale=320:180 test_media.mkv.thumb.jpg
+    (repeat for avi/wmv/ts/flv/mov)
+  For the rtsp case start a local server first, e.g.:
+    gst-validate-rtsp-server-1.0 file:///F:/…/servo/test_media/test_media.mov
+    (serves rtsp://127.0.0.1:8554/test)
+
+  Run:
+    target\debug\servoshell.exe ^
+      --wall-layout ..\config\wall_layout.local_2x1.json --wall-all-tiles ^
+      --pref dom_video_extended_containers_enabled=true ^
+      --pref dom_video_network_uri_enabled=true ^
+      tests\html\multigpu_standard_video_extended_probe.html
+    # Omit the prefs to observe the standard-browser fallback behavior.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>standard &lt;video&gt; extended dispatch probe</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    /* 4 columns x 2 rows fills the viewport; 7 cells used. Sizes are in % so the
+       grid always fits whatever wall resolution the virtual viewport has. */
+    .grid { display:flex; flex-wrap:wrap; align-content:flex-start; width:100vw; height:100vh; }
+    .cell { box-sizing:border-box; width:25%; height:50%; padding:5px; position:relative; }
+    video { display:block; width:100%; height:100%; background:#000; border:2px solid #6cb4f0; border-radius:6px; object-fit:contain; }
+    .tag { position:absolute; top:11px; left:11px; font:bold 18px system-ui; color:#6cb4f0; background:rgba(0,0,0,.6); padding:1px 8px; border-radius:5px; }
+    .status { position:absolute; left:11px; right:11px; bottom:11px; font:12px/1.35 monospace; color:#bcf; background:rgba(0,0,0,.6); padding:3px 7px; border-radius:5px; white-space:pre-wrap; }
+    .status.bad { color:#ff9f43; }
+    /* inline <video> fallback content (shown when the source cannot render) */
+    .fallback { position:absolute; inset:5px; display:flex; align-items:center; justify-content:center; text-align:center; color:#ffcf99; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; padding:10px; font-size:14px; }
+    /* thumbnail shown on a <video> error (graceful degradation = a thumbnail) */
+    .thumb-overlay { position:absolute; inset:5px; object-fit:contain; background:#000; border:2px solid #6cb4f0; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="grid" id="grid"></div>
+  <script>
+    const BASE = "test_media/test_media.";
+    // label, src, MIME type for the typed <source>.
+    const containers = [
+      { ext: "mkv", type: "video/x-matroska" },
+      { ext: "avi", type: "video/x-msvideo" },
+      { ext: "wmv", type: "video/x-ms-wmv" },
+      { ext: "ts",  type: "video/mp2t" },
+      { ext: "flv", type: "video/x-flv" },
+      { ext: "mov", type: "video/quicktime" },
+    ];
+    const grid = document.getElementById("grid");
+    const items = [];
+
+    // Build a cell whose <video> fills it, with the label and status overlaid so
+    // the video itself uses the full tile area.
+    function makeCell(title, video) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = title;
+      const st = document.createElement("div");
+      st.className = "status";
+      st.textContent = "loading";
+      cell.appendChild(video);
+      cell.appendChild(tag);
+      cell.appendChild(st);
+      grid.appendChild(cell);
+      return st;
+    }
+
+    function makeVideo(srcAttr, sourceType, fallbackText, useSrc, poster) {
+      const v = document.createElement("video");
+      v.muted = true; v.autoplay = true; v.loop = true; v.setAttribute("playsinline", "");
+      // The poster is a standard JPEG thumbnail. A standard browser that cannot
+      // play the source keeps showing it (graceful degradation = a thumbnail,
+      // not text); the wall browser hides it as soon as playback produces frames.
+      // Real standard browsers show `poster` directly when the source cannot
+      // play. Servo does not render poster on a source error and does not even
+      // fire the `error` event for a rejected `<source type>`, so the thumbnail
+      // overlay is driven by polling readyState in the status loop below — that
+      // works in both environments.
+      if (poster) v.poster = poster;
+      if (useSrc) {
+        v.src = srcAttr;
+      } else {
+        const s = document.createElement("source");
+        s.src = srcAttr; s.type = sourceType;
+        v.appendChild(s);
+      }
+      // Deepest fallback: only rendered by browsers that do not support <video>.
+      const fb = document.createElement("p");
+      fb.className = "fallback";
+      fb.textContent = fallbackText;
+      v.appendChild(fb);
+      v.addEventListener("loadedmetadata", () => v.play().catch(() => {}));
+      return v;
+    }
+
+    for (const c of containers) {
+      const cpt = document.createElement("video").canPlayType(c.type);
+      const v = makeVideo(BASE + c.ext, c.type,
+        `Cannot play ${c.ext.toUpperCase()} (${c.type}) in this browser.`, false,
+        BASE + c.ext + ".thumb.jpg");
+      const st = makeCell("." + c.ext, v);
+      items.push({ key: c.ext, canPlay: cpt, v, st, thumb: BASE + c.ext + ".thumb.jpg" });
+    }
+
+    // rtsp:// via a bare <video src> + inline fallback.
+    {
+      const v = makeVideo("rtsp://127.0.0.1:8554/test", null,
+        "Cannot play rtsp:// live stream in this browser.", true,
+        BASE + "mov.thumb.jpg");
+      const st = makeCell("rtsp://", v);
+      items.push({ key: "rtsp", canPlay: "(scheme)", v, st, thumb: BASE + "mov.thumb.jpg" });
+    }
+
+    let t = 0;
+    setInterval(() => {
+      t++;
+      for (const it of items) {
+        const v = it.v;
+        const err = v.error ? `err=${v.error.code}` : "err=none";
+        const ct = v.currentTime;
+        // Frame-advancement check: currentTime must actually move forward.
+        // readyState/paused alone do not catch a video frozen after frame 1.
+        const advancing = it.lastT !== undefined && ct > it.lastT + 0.001;
+        it.lastT = ct;
+        // Thumbnail fallback: if the source clearly failed to start (errored, or
+        // still HAVE_NOTHING after a grace period), overlay the thumbnail so the
+        // cell shows an image rather than nothing. Removed if it later plays.
+        const failed = v.error !== null || (t > 2 && v.readyState === 0);
+        const overlay = it.st.parentNode.querySelector(".thumb-overlay");
+        if (advancing || v.readyState >= 2) {
+          if (overlay) overlay.remove();
+        } else if (failed && it.thumb && !overlay) {
+          const im = document.createElement("img");
+          im.className = "thumb-overlay"; im.src = it.thumb; im.alt = "thumbnail";
+          it.st.parentNode.appendChild(im);
+        }
+        it.st.textContent =
+          `canPlayType=${JSON.stringify(it.canPlay)} ${err}\n` +
+          `t=${ct.toFixed(2)} ${v.videoWidth}x${v.videoHeight} ` +
+          (advancing ? "▶ advancing" : (v.readyState >= 2 && !v.paused ? "▮ stalled" : "■ stopped"));
+        it.st.className = advancing ? "status" : "status bad";
+        if (t % 3 === 0) {
+          const ov = it.st.parentNode.querySelector(".thumb-overlay");
+          console.error(`STD_VIDEO ${it.key}: canPlay=${JSON.stringify(it.canPlay)} ` +
+            `${err} t=${ct.toFixed(2)} adv=${advancing} ${v.videoWidth}x${v.videoHeight} ` +
+            `rs=${v.readyState} thumb=${ov ? ov.naturalWidth + "x" + ov.naturalHeight : "none"}`);
+        }
+      }
+    }, 1500);
+
+    // Headless verification helper: ?autoclose=MS exits cleanly so stderr flushes.
+    const _ac = new URLSearchParams(location.search).get("autoclose");
+    if (_ac) setTimeout(() => window.close(), parseInt(_ac, 10) || 8000);
+  </script>
+</body>
+</html>

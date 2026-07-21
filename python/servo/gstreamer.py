@@ -37,6 +37,7 @@ GSTREAMER_BASE_LIBS = [
     "gstvideo",
     # gst-plugins-bad
     "gstcodecparsers",
+    "gstmpegts",
     "gstplayer",
     "gstwebrtc",
     "gstwebrtcnice",

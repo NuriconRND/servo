@@ -2119,6 +2119,7 @@ impl HTMLMediaElement {
         // synchronous section, and jump down to the failed with elements step below.
         if let Some(type_) = element.get_attribute_string_value(&local_name!("type"))
             && ServoMedia::get().can_play_type(&type_) == SupportsMediaType::No
+            && !(pref!(dom_video_extended_containers_enabled) && is_extended_container_type(&type_))
         {
             self.load_from_source_child_failure_steps(source);
             return;
@@ -3959,7 +3960,18 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
     /// <https://html.spec.whatwg.org/multipage/#dom-navigator-canplaytype>
     fn CanPlayType(&self, type_: DOMString) -> CanPlayTypeResult {
         match ServoMedia::get().can_play_type(&type_.str()) {
-            SupportsMediaType::No => CanPlayTypeResult::_empty,
+            SupportsMediaType::No => {
+                // Report non-standard containers as playable so feature-detecting
+                // pages can branch in the wall browser while still degrading in a
+                // standard browser (which returns "").
+                if pref!(dom_video_extended_containers_enabled)
+                    && is_extended_container_type(&type_.str())
+                {
+                    CanPlayTypeResult::Maybe
+                } else {
+                    CanPlayTypeResult::_empty
+                }
+            },
             SupportsMediaType::Maybe => CanPlayTypeResult::Maybe,
             SupportsMediaType::Probably => CanPlayTypeResult::Probably,
         }
@@ -4418,6 +4430,34 @@ impl MicrotaskRunnable for MediaElementMicrotask {
 enum Resource {
     Object,
     Url(ServoUrl),
+}
+
+/// Non-standard container MIME types additionally treated as renderable by the
+/// standard `<video>` element when `dom_video_extended_containers_enabled` is on
+/// (for `<source type>` selection and `canPlayType()`). The bytes are still
+/// played through the normal GStreamer pipeline, which auto-plugs the matching
+/// demuxer from the loaded plugin set.
+const EXTENDED_CONTAINER_MIME_TYPES: &[&str] = &[
+    "video/x-matroska",
+    "video/x-msvideo",
+    "video/avi",
+    "video/x-ms-wmv",
+    "video/x-ms-asf",
+    "video/mp2t",
+    "video/x-flv",
+    "video/flv",
+    "video/quicktime",
+];
+
+/// Returns true if `type_`'s MIME essence is one of the non-standard containers
+/// the standard `<video>` element accepts under
+/// `dom_video_extended_containers_enabled`.
+fn is_extended_container_type(type_: &str) -> bool {
+    let essence = match type_.find(';') {
+        Some(semi) => type_[..semi].trim(),
+        None => type_.trim(),
+    };
+    EXTENDED_CONTAINER_MIME_TYPES.contains(&essence)
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]

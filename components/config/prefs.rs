@@ -191,6 +191,10 @@ pub struct Preferences {
     /// still falls back to the standard broken-image/`error` path. Off by
     /// default; standard formats are unaffected.
     pub dom_image_extended_formats_enabled: bool,
+    /// Let the STANDARD `<video>` element report non-standard containers
+    /// (Matroska/AVI/WMV/MPEG-TS/FLV/…) as playable for `<source type>`
+    /// selection and `canPlayType()`. Off by default.
+    pub dom_video_extended_containers_enabled: bool,
     // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
     pub dom_sanitizer_enabled: bool,
     pub dom_script_asynch: bool,
@@ -416,6 +420,7 @@ impl Preferences {
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
             dom_resize_observer_enabled: true,
             dom_image_extended_formats_enabled: false,
+            dom_video_extended_containers_enabled: false,
             dom_sanitizer_enabled: false,
             dom_script_asynch: true,
             dom_storage_manager_api_enabled: false,
