@@ -185,6 +185,12 @@ pub struct Preferences {
     pub dom_permissions_testing_allowed_in_nonsecure_contexts: bool,
     // feature: ResizeObserver | #39790 | Web/API/ResizeObserver
     pub dom_resize_observer_enabled: bool,
+    /// Let the STANDARD `<img>` element transparently decode image formats
+    /// beyond the browser-standard allowlist (TIFF/EXR/HDR/TGA/DDS/QOI/PNM/JPEG
+    /// XL/…) via `pixels::load_extended_from_memory`. Truly undecodable data
+    /// still falls back to the standard broken-image/`error` path. Off by
+    /// default; standard formats are unaffected.
+    pub dom_image_extended_formats_enabled: bool,
     // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
     pub dom_sanitizer_enabled: bool,
     pub dom_script_asynch: bool,
@@ -409,6 +415,7 @@ impl Preferences {
             dom_permissions_enabled: false,
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
             dom_resize_observer_enabled: true,
+            dom_image_extended_formats_enabled: false,
             dom_sanitizer_enabled: false,
             dom_script_asynch: true,
             dom_storage_manager_api_enabled: false,
