@@ -25,6 +25,7 @@
 "gstautodetect",
 "gstavi",
 "gstdeinterlace",
+"gstflv",
 "gstid3demux",
 "gstinterleave",
 "gstisomp4",
@@ -36,6 +37,7 @@
 "gstwavparse",
 // gst-plugins-bad
 "gstasf",
+"gstmpegtsdemux",
 "gstaudiobuffersplit",
 "gstdtls",
 "gstsrtp",

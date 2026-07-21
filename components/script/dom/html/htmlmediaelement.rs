@@ -2119,7 +2119,7 @@ impl HTMLMediaElement {
         // synchronous section, and jump down to the failed with elements step below.
         if let Some(type_) = element.get_attribute_string_value(&local_name!("type"))
             && ServoMedia::get().can_play_type(&type_) == SupportsMediaType::No
-            && !(pref!(dom_video_extended_containers_enabled) && is_extended_container_type(&type_))
+            && !extended_container_allowed(&type_)
         {
             self.load_from_source_child_failure_steps(source);
             return;
@@ -3964,9 +3964,7 @@ impl HTMLMediaElementMethods<crate::DomTypeHolder> for HTMLMediaElement {
                 // Report non-standard containers as playable so feature-detecting
                 // pages can branch in the wall browser while still degrading in a
                 // standard browser (which returns "").
-                if pref!(dom_video_extended_containers_enabled)
-                    && is_extended_container_type(&type_.str())
-                {
+                if extended_container_allowed(&type_.str()) {
                     CanPlayTypeResult::Maybe
                 } else {
                     CanPlayTypeResult::_empty
@@ -4458,6 +4456,12 @@ fn is_extended_container_type(type_: &str) -> bool {
         None => type_.trim(),
     };
     EXTENDED_CONTAINER_MIME_TYPES.contains(&essence)
+}
+
+/// True when the extended-container pref is on AND `type_` is a non-standard
+/// container the standard `<video>` element should accept.
+fn extended_container_allowed(type_: &str) -> bool {
+    pref!(dom_video_extended_containers_enabled) && is_extended_container_type(type_)
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]
