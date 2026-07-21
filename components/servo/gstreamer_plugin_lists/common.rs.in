@@ -32,6 +32,8 @@
 "gstmatroska",
 "gstrtp",
 "gstrtpmanager",
+"gstrtsp",
+"gstudp",
 "gstvideofilter",
 "gstvpx",
 "gstwavparse",

@@ -47,6 +47,11 @@ pub trait Backend: Send + Sync {
         video_renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
         audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
         gl_context: Box<dyn PlayerGLContext>,
+        // Network URI to pull from directly when `stream_type` is
+        // `StreamType::NetworkUri` (e.g. an `rtsp://` URL). Ignored for the
+        // AppSrc-based `Stream`/`Seekable` types, which receive data via
+        // `push_data` instead.
+        network_uri: Option<String>,
     ) -> Arc<Mutex<dyn Player>>;
     fn create_audiostream(&self) -> MediaStreamId;
     fn create_videostream(&self) -> MediaStreamId;

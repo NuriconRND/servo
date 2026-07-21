@@ -106,11 +106,15 @@ impl Backend for OhosBackend {
             std::sync::Arc<std::sync::Mutex<dyn servo_media_player::audio::AudioRenderer>>,
         >,
         _gl_context: Box<dyn servo_media_player::context::PlayerGLContext>,
+        _network_uri: Option<String>,
     ) -> std::sync::Arc<std::sync::Mutex<dyn servo_media_player::Player>> {
         // TODO: Choose different Player Impl depends on stream_type
         match stream_type {
             StreamType::Stream => {
                 todo!("Stream Type currently not supported!")
+            },
+            StreamType::NetworkUri => {
+                todo!("NetworkUri Type currently not supported!")
             },
             StreamType::Seekable => (),
         }

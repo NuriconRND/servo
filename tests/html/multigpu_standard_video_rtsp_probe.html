@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<!--
+  STANDARD <video src="rtsp://…"> direct-URI probe (no custom <rtsp-stream>
+  element — that experimental element lives on the separate
+  `rtsp-custom-element` branch and is out of scope here).
+
+  Same markup a normal-browser author would write: a plain <video> with a bare
+  `src` attribute. It branches by ENVIRONMENT:
+    - Standard browser: `rtsp:` is not a supported scheme, so the resource
+      fetch fails -> the element's inline fallback content (the descriptive
+      <p>) is shown and MediaError is MEDIA_ERR_SRC_NOT_SUPPORTED (graceful
+      degradation, no special-casing needed by the page author).
+    - Multi-GPU wall browser with `--pref dom_video_network_uri_enabled=true`:
+      `is_direct_uri_scheme()` recognizes the rtsp/rtsps scheme and routes the
+      element to a GStreamer `NetworkUri` player (playbin3 auto-plugs
+      rtspsrc); no AppSrc fetch is attempted, no bytes flow through Servo's
+      network stack.
+
+  Requires a local RTSP server publishing rtsp://127.0.0.1:8554/test, e.g.:
+    target\dependencies\gstreamer\1.0\msvc_x86_64\bin\gst-validate-rtsp-server-1.0.exe ^
+      --port=8554 file:///F:/…/servo_multigpu-tiled-wall/rtsp_testsrc.mp4
+    (serves the 314998-byte rtsp_testsrc.mp4 restored at the repo root)
+
+  Run (pref ON — expect playback, first-frame log line):
+    target\debug\servoshell.exe --pref dom_video_network_uri_enabled=true ^
+      tests\html\multigpu_standard_video_rtsp_probe.html 2> rtsp_on.err.log
+
+  Run (pref OFF — control/regression; expect no playback, byte-identical to
+  before this feature landed):
+    target\debug\servoshell.exe tests\html\multigpu_standard_video_rtsp_probe.html 2> rtsp_off.err.log
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>standard &lt;video src=rtsp://&gt; probe</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    .wrap { box-sizing:border-box; width:100vw; height:100vh; padding:16px; }
+    video { display:block; width:640px; height:360px; background:#000; border:2px solid #6cb4f0; border-radius:6px; }
+    .fallback { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; color:#ffcf99; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; padding:10px; font-size:14px; }
+    #log { white-space:pre-wrap; font-size:13px; margin-top:12px; }
+    .bad { color:#ff9f43; }
+    .good { color:#7be08c; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <video id="v" width="640" height="360" muted autoplay playsinline
+           src="rtsp://127.0.0.1:8554/test">
+      <p class="fallback">Cannot play rtsp:// live stream in this browser.</p>
+    </video>
+    <div id="log"></div>
+  </div>
+  <script>
+    const v = document.getElementById("v");
+    const logEl = document.getElementById("log");
+    const log = (m, cls) => {
+      const line = `[${(performance.now() / 1000).toFixed(1)}s] ${m}`;
+      const div = document.createElement("div");
+      if (cls) div.className = cls;
+      div.textContent = line;
+      logEl.appendChild(div);
+      // Mirror to stderr so the smoke-run .err.log captures it.
+      console.error("RTSP_PROBE " + line);
+    };
+
+    log("canPlayType(rtsp n/a; scheme-based, not MIME) — dispatch is via src scheme, not <source type>");
+    log("src=" + v.src);
+
+    let firstFrameLogged = false;
+    let lastMetaW = 0, lastMetaH = 0;
+
+    v.addEventListener("loadedmetadata", () => {
+      lastMetaW = v.videoWidth; lastMetaH = v.videoHeight;
+      log(`loadedmetadata: videoWidth=${v.videoWidth} videoHeight=${v.videoHeight}`, "good");
+    });
+    v.addEventListener("playing", () => {
+      log("playing event fired", "good");
+    });
+    v.addEventListener("error", () => {
+      const code = v.error ? v.error.code : "?";
+      log(`error event: MediaError.code=${code}`, "bad");
+    });
+    v.addEventListener("stalled", () => log("stalled event fired", "bad"));
+
+    let ticks = 0;
+    let lastT = -1;
+    const timer = setInterval(() => {
+      ticks++;
+      const ct = v.currentTime;
+      const advancing = lastT >= 0 && ct > lastT + 0.001;
+      lastT = ct;
+      if (advancing && !firstFrameLogged) {
+        firstFrameLogged = true;
+        log(`FIRST FRAME REACHED: t=${ct.toFixed(2)} ${v.videoWidth}x${v.videoHeight}`, "good");
+      }
+      const err = v.error ? `err=${v.error.code}` : "err=none";
+      log(
+        `tick ${ticks}: readyState=${v.readyState} paused=${v.paused} ${err} ` +
+        `t=${ct.toFixed(2)} ${v.videoWidth}x${v.videoHeight} ` +
+        (advancing ? "advancing" : "not-advancing"),
+        advancing ? "good" : undefined
+      );
+      if (ticks >= 24) {
+        clearInterval(timer);
+        log("probe finished");
+        // Exit cleanly so buffered stderr is flushed for the smoke log.
+        try { window.close(); } catch (e) {}
+      }
+    }, 500);
+
+    // Hard safety stop in case the interval path is never reached.
+    setTimeout(() => { try { window.close(); } catch (e) {} }, 16000);
+
+    // Headless verification helper: ?autoclose=MS exits cleanly so stderr flushes.
+    const _ac = new URLSearchParams(location.search).get("autoclose");
+    if (_ac) setTimeout(() => { try { window.close(); } catch (e) {} }, parseInt(_ac, 10) || 8000);
+  </script>
+</body>
+</html>

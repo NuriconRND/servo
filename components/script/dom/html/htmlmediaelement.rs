@@ -2432,10 +2432,17 @@ impl HTMLMediaElement {
                     return;
                 }
 
+                // Direct-URI schemes (rtsp://) are driven by the GStreamer
+                // `NetworkUri` player created in `create_media_player`; there is
+                // no resource for Servo's network stack to fetch and push.
+                let direct_uri = pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(&url);
+
                 *self.resource_url.borrow_mut() = Some(url);
 
-                // Steps 5.remote.2-5.remote.8
-                self.fetch_request(None, None);
+                if !direct_uri {
+                    // Steps 5.remote.2-5.remote.8
+                    self.fetch_request(None, None);
+                }
             },
             Resource::Object => {
                 if let Some(ref src_object) = *self.src_object.borrow() {
@@ -2977,18 +2984,27 @@ impl HTMLMediaElement {
     }
 
     fn create_media_player(&self, resource: &Resource) -> Result<(), ()> {
-        let stream_type = match *resource {
+        let (stream_type, network_uri) = match resource {
             Resource::Object => {
-                if let Some(ref src_object) = *self.src_object.borrow() {
+                let stream_type = if let Some(ref src_object) = *self.src_object.borrow() {
                     match src_object {
                         SrcObject::MediaStream(_) => StreamType::Stream,
                         _ => StreamType::Seekable,
                     }
                 } else {
                     return Err(());
+                };
+                (stream_type, None)
+            },
+            Resource::Url(url) => {
+                // Direct-URI schemes (rtsp://) are pulled by the GStreamer player
+                // itself instead of being fetched and pushed through AppSrc.
+                if pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(url) {
+                    (StreamType::NetworkUri, Some(url.as_str().to_owned()))
+                } else {
+                    (StreamType::Seekable, None)
                 }
             },
-            _ => StreamType::Seekable,
         };
 
         let window = self.owner_window();
@@ -3011,6 +3027,9 @@ impl HTMLMediaElement {
             video_renderer,
             audio_renderer,
             Box::new(window.get_player_context()),
+            // `Some(uri)` for direct-URI schemes (rtsp://) routed to a
+            // `NetworkUri` player; `None` for the AppSrc-fed Seekable/Stream path.
+            network_uri,
         );
         let player_id = {
             let player_guard = player.lock().unwrap();
@@ -4462,6 +4481,13 @@ fn is_extended_container_type(type_: &str) -> bool {
 /// container the standard `<video>` element should accept.
 fn extended_container_allowed(type_: &str) -> bool {
     pref!(dom_video_extended_containers_enabled) && is_extended_container_type(type_)
+}
+
+/// Returns true if `url` uses a scheme that must be handed directly to a
+/// GStreamer `NetworkUri` player (the engine pulls it itself) rather than fetched
+/// through Servo's network stack and pushed via AppSrc.
+fn is_direct_uri_scheme(url: &ServoUrl) -> bool {
+    matches!(url.scheme(), "rtsp" | "rtsps")
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]

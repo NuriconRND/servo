@@ -268,6 +268,7 @@ impl Backend for GStreamerBackend {
         renderer: Option<Arc<Mutex<dyn VideoFrameRenderer>>>,
         audio_renderer: Option<Arc<Mutex<dyn AudioRenderer>>>,
         gl_context: Box<dyn PlayerGLContext>,
+        network_uri: Option<String>,
     ) -> Arc<Mutex<dyn Player>> {
         let id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
         let player = Arc::new(Mutex::new(player::GStreamerPlayer::new(
@@ -279,6 +280,7 @@ impl Backend for GStreamerBackend {
             renderer,
             audio_renderer,
             gl_context,
+            network_uri,
         )));
         let mut instances = self.instances.lock().unwrap();
         let entry = instances.entry(*context_id).or_default();
