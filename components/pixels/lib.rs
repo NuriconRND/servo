@@ -582,6 +582,55 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Raster
     }
 }
 
+/// Like [`load_from_memory`] but accepts the full set of formats the bundled
+/// `image` crate is built with (TIFF, OpenEXR, HDR, TGA, DDS, QOI, PNM, ...),
+/// instead of the browser-standard allowlist in [`detect_image_format`] used by
+/// `<img>`. Intended for the experimental non-standard `<x-image>` element so it
+/// can display formats `<img>` does not, without changing `<img>` behavior.
+/// Decodes a single (first) frame; animation is not handled here.
+pub fn load_extended_from_memory(
+    buffer: &[u8],
+    extension: Option<&str>,
+    cors_status: CorsStatus,
+) -> Option<RasterImage> {
+    if buffer.is_empty() {
+        return None;
+    }
+
+    // Standard formats keep their existing (animation-aware) decode path.
+    if detect_image_format(buffer).is_ok() {
+        return load_from_memory(buffer, cors_status);
+    }
+
+    // JPEG XL is not supported by the `image` crate; decode via jxl-oxide.
+    if is_jxl(buffer) {
+        return decode_jxl(buffer, cors_status);
+    }
+
+    let mut reader = match image::ImageReader::new(Cursor::new(buffer)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(error) => {
+            debug!("x-image: could not guess image format: {error}");
+            return None;
+        },
+    };
+    // Some formats (notably TGA) have no magic bytes, so content guessing fails.
+    // Fall back to the file extension when the format is still unknown.
+    if reader.format().is_none() &&
+        let Some(format) = extension.and_then(ImageFormat::from_extension)
+    {
+        reader.set_format(format);
+    }
+    let decoder = match reader.into_decoder() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            debug!("x-image: could not create image decoder: {error}");
+            return None;
+        },
+    };
+    decode_static_image(cors_status, decoder)
+}
+
 // https://developer.mozilla.org/en-US/docs/Web/HTML/Element/img
 pub fn detect_image_format(buffer: &[u8]) -> Result<ImageFormat, &str> {
     if is_gif(buffer) {
@@ -780,6 +829,16 @@ fn decode_static_image(
         dynamic_image.apply_orientation(orientation);
     }
 
+    Some(raster_from_rgba8_dynamic_image(cors_status, dynamic_image))
+}
+
+/// Build a single-frame [`RasterImage`] from a decoded [`DynamicImage`], storing
+/// pre-multiplied RGBA8 (shared by the standard decoders and the `<x-image>`
+/// extended/JXL decoders).
+fn raster_from_rgba8_dynamic_image(
+    cors_status: CorsStatus,
+    dynamic_image: DynamicImage,
+) -> RasterImage {
     let mut rgba = dynamic_image.into_rgba8();
 
     // Store pre-multiplied data as that prevents having to do conversions of the data at later
@@ -793,7 +852,7 @@ fn decode_static_image(
         width: rgba.width(),
         height: rgba.height(),
     };
-    Some(RasterImage {
+    RasterImage {
         metadata: ImageMetadata {
             width: rgba.width(),
             height: rgba.height(),
@@ -805,7 +864,69 @@ fn decode_static_image(
         cors_status,
         is_opaque,
         loop_count: None,
-    })
+    }
+}
+
+fn is_jxl(buffer: &[u8]) -> bool {
+    // Raw JPEG XL codestream (FF 0A) or the ISOBMFF container signature box.
+    buffer.starts_with(&[0xFF, 0x0A]) ||
+        buffer.starts_with(&[
+            0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+        ])
+}
+
+/// Decode a JPEG XL image (the `image` crate has no JXL support) via `jxl-oxide`,
+/// flattening the first frame to pre-multiplied RGBA8. Used only by `<x-image>`.
+fn decode_jxl(buffer: &[u8], cors_status: CorsStatus) -> Option<RasterImage> {
+    let image = match jxl_oxide::JxlImage::builder().read(Cursor::new(buffer)) {
+        Ok(image) => image,
+        Err(error) => {
+            debug!("x-image: jxl read error: {error}");
+            return None;
+        },
+    };
+    let render = match image.render_frame(0) {
+        Ok(render) => render,
+        Err(error) => {
+            debug!("x-image: jxl render error: {error}");
+            return None;
+        },
+    };
+
+    let framebuffer = render.image_all_channels();
+    let width = framebuffer.width() as u32;
+    let height = framebuffer.height() as u32;
+    let channels = framebuffer.channels();
+    let samples = framebuffer.buf();
+
+    let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    for pixel in samples.chunks(channels) {
+        let (r, g, b, a) = match channels {
+            1 => {
+                let v = to_u8(pixel[0]);
+                (v, v, v, 255)
+            },
+            2 => {
+                let v = to_u8(pixel[0]);
+                (v, v, v, to_u8(pixel[1]))
+            },
+            3 => (to_u8(pixel[0]), to_u8(pixel[1]), to_u8(pixel[2]), 255),
+            _ => (
+                to_u8(pixel[0]),
+                to_u8(pixel[1]),
+                to_u8(pixel[2]),
+                to_u8(pixel[3]),
+            ),
+        };
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+
+    let rgba_image = image::RgbaImage::from_raw(width, height, rgba)?;
+    Some(raster_from_rgba8_dynamic_image(
+        cors_status,
+        DynamicImage::ImageRgba8(rgba_image),
+    ))
 }
 
 fn decode_animated_image<'a, T>(
@@ -914,5 +1035,28 @@ mod test {
         assert!(detect_image_format(&bmp).is_ok());
         assert!(detect_image_format(&ico).is_ok());
         assert!(detect_image_format(&junk_format).is_err());
+    }
+
+    #[test]
+    fn extended_decode_rejects_empty() {
+        use super::CorsStatus;
+        use super::load_extended_from_memory;
+
+        assert!(load_extended_from_memory(&[], None, CorsStatus::Unsafe).is_none());
+    }
+
+    #[test]
+    fn extended_decode_handles_jpeg_xl() {
+        use super::CorsStatus;
+        use super::load_extended_from_memory;
+
+        // JPEG XL is not supported by the standard `image` crate, so this exercises
+        // the new jxl-oxide decode path.
+        let jxl = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/wpt/tests/jpegxl/resources/basic.jxl"
+        ));
+        let raster = load_extended_from_memory(jxl, Some("jxl"), CorsStatus::Unsafe);
+        assert!(raster.is_some(), "jxl decode should succeed via jxl-oxide");
     }
 }
