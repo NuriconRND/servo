@@ -201,6 +201,9 @@ pub struct Preferences {
     pub dom_video_network_uri_enabled: bool,
     // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
     pub dom_sanitizer_enabled: bool,
+    /// Enable the screen-capture API (`MediaDevices.getDisplayMedia()`).
+    // feature: Screen Capture | Web/API/Screen_Capture_API
+    pub dom_screen_capture_enabled: bool,
     pub dom_script_asynch: bool,
     // feature: Storage API | #43976 | Web/API/Storage_API
     pub dom_storage_manager_api_enabled: bool,
@@ -324,6 +327,14 @@ pub struct Preferences {
     pub media_glvideo_enabled: bool,
     /// Use generated media sources for getUserMedia() instead of host capture devices.
     pub media_capture_mocking_enabled: bool,
+    /// Zero-based monitor index captured by `getDisplayMedia()` (-1 = primary monitor).
+    /// Ignored when `media_screen_capture_window_title` is non-empty.
+    pub media_screen_capture_monitor_index: i64,
+    /// Whether `getDisplayMedia()` shows the mouse cursor in the captured stream.
+    pub media_screen_capture_show_cursor: bool,
+    /// If non-empty, `getDisplayMedia()` captures the first top-level window whose title
+    /// contains this string (window capture) instead of a whole monitor.
+    pub media_screen_capture_window_title: String,
     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
     pub media_testing_enabled: bool,
     /// The default timeout set for establishing a network connection in seconds. This amount
@@ -427,6 +438,7 @@ impl Preferences {
             dom_video_extended_containers_enabled: false,
             dom_video_network_uri_enabled: false,
             dom_sanitizer_enabled: false,
+            dom_screen_capture_enabled: false,
             dom_script_asynch: true,
             dom_storage_manager_api_enabled: false,
             dom_serviceworker_enabled: false,
@@ -533,6 +545,9 @@ impl Preferences {
             layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
             media_capture_mocking_enabled: false,
+            media_screen_capture_monitor_index: -1,
+            media_screen_capture_show_cursor: true,
+            media_screen_capture_window_title: String::new(),
             media_glvideo_enabled: false,
             media_testing_enabled: false,
             network_connection_timeout: 15,

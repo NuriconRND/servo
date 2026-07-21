@@ -19,7 +19,7 @@ use player::context::PlayerGLContext;
 use player::ipc_channel::ipc::IpcSender;
 use player::video::VideoFrameRenderer;
 use player::{Player, PlayerEvent, StreamType};
-use streams::capture::MediaTrackConstraintSet;
+use streams::capture::{DisplayCaptureSource, MediaTrackConstraintSet};
 use streams::device_monitor::MediaDeviceMonitor;
 use streams::registry::MediaStreamId;
 use streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -62,6 +62,15 @@ pub trait Backend: Send + Sync {
     ) -> (Box<dyn MediaSocket>, MediaStreamId);
     fn create_audioinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId>;
     fn create_videoinput_stream(&self, set: MediaTrackConstraintSet) -> Option<MediaStreamId>;
+    /// Create a screen/window capture stream for `MediaDevices.getDisplayMedia()`.
+    /// Backends that do not implement display capture return `None`.
+    fn create_display_stream(
+        &self,
+        _source: DisplayCaptureSource,
+        _set: MediaTrackConstraintSet,
+    ) -> Option<MediaStreamId> {
+        None
+    }
     fn create_audio_context(
         &self,
         id: &ClientContextId,

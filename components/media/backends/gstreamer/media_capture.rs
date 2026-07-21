@@ -170,3 +170,127 @@ pub fn create_audioinput_stream(constraint_set: MediaTrackConstraintSet) -> Opti
 pub fn create_videoinput_stream(constraint_set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
     create_input_stream(MediaStreamType::Video, constraint_set)
 }
+
+/// Create a screen/window capture video stream for `getDisplayMedia()`.
+///
+/// Uses the GStreamer `d3d11screencapturesrc` element (Windows Graphics Capture /
+/// DXGI desktop duplication). A non-empty `window_title` captures the matching
+/// top-level window by `HWND`; otherwise `monitor_index` captures a whole monitor.
+#[cfg(target_os = "windows")]
+pub fn create_display_stream(
+    source: DisplayCaptureSource,
+    _constraint_set: MediaTrackConstraintSet,
+) -> Option<MediaStreamId> {
+    let src = match gstreamer::ElementFactory::make("d3d11screencapturesrc").build() {
+        Ok(src) => src,
+        Err(e) => {
+            log::warn!("getDisplayMedia: failed to create d3d11screencapturesrc: {e}");
+            return None;
+        },
+    };
+    src.set_property("show-cursor", source.show_cursor);
+    match source.window_title.as_deref().filter(|t| !t.is_empty()) {
+        Some(title) => match find_window_by_title(title) {
+            Some(hwnd) => {
+                // The default DXGI Desktop Duplication backend can only capture
+                // whole monitors; per-window capture requires Windows Graphics
+                // Capture (WGC), which also gates the `window-handle` property
+                // (`conditionally available`). Select WGC *before* setting the
+                // handle, otherwise the property is absent and `set_property`
+                // panics. WGC draws a yellow capture border around the window.
+                src.set_property_from_str("capture-api", "wgc");
+                src.set_property("window-handle", hwnd);
+            },
+            None => {
+                log::warn!("getDisplayMedia: no visible window title contains {title:?}");
+                return None;
+            },
+        },
+        None => src.set_property("monitor-index", source.monitor_index),
+    }
+
+    // `d3d11screencapturesrc` produces GPU-resident `video/x-raw(memory:D3D11Memory)`
+    // buffers. The downstream `videoconvert` (added by `create_video_from`) is a
+    // plain CPU converter that cannot map D3D11 textures directly, so route through
+    // `d3d11download` first to read the frames back into system memory.
+    let Ok(d3d11download) = gstreamer::ElementFactory::make("d3d11download").build() else {
+        log::warn!("getDisplayMedia: failed to create d3d11download");
+        return None;
+    };
+    let bin = gstreamer::Bin::new();
+    if bin.add_many([&src, &d3d11download]).is_err() || src.link(&d3d11download).is_err() {
+        log::warn!("getDisplayMedia: failed to assemble capture bin");
+        return None;
+    }
+    let Some(src_pad) = d3d11download.static_pad("src") else {
+        log::warn!("getDisplayMedia: d3d11download has no src pad");
+        return None;
+    };
+    let Ok(ghost_pad) = gstreamer::GhostPad::with_target(&src_pad) else {
+        log::warn!("getDisplayMedia: failed to create ghost pad for capture bin");
+        return None;
+    };
+    if bin.add_pad(&ghost_pad).is_err() {
+        log::warn!("getDisplayMedia: failed to add ghost pad to capture bin");
+        return None;
+    }
+
+    Some(GStreamerMediaStream::create_video_from(bin.upcast()))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn create_display_stream(
+    _source: DisplayCaptureSource,
+    _constraint_set: MediaTrackConstraintSet,
+) -> Option<MediaStreamId> {
+    // Screen capture is currently only wired for the Windows (d3d11screencapturesrc)
+    // path. Other platforms (ximagesrc/pipewiresrc) are future work.
+    log::warn!("getDisplayMedia: screen capture is not implemented on this platform");
+    None
+}
+
+/// Find the first visible top-level window whose title contains `needle`
+/// (case-insensitive), returning its `HWND` as a `u64` for `window-handle`.
+#[cfg(target_os = "windows")]
+fn find_window_by_title(needle: &str) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{FALSE, HWND, LPARAM, TRUE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    };
+
+    struct Ctx {
+        needle_lower: String,
+        found: u64,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let ctx = unsafe { &mut *(lparam as *mut Ctx) };
+        if unsafe { IsWindowVisible(hwnd) } == 0 {
+            return TRUE;
+        }
+        let len = unsafe { GetWindowTextLengthW(hwnd) };
+        if len <= 0 {
+            return TRUE;
+        }
+        let mut buf = vec![0u16; (len + 1) as usize];
+        let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            return TRUE;
+        }
+        let title = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        if title.contains(&ctx.needle_lower) {
+            ctx.found = hwnd as u64;
+            return FALSE; // stop enumeration
+        }
+        TRUE
+    }
+
+    let mut ctx = Ctx {
+        needle_lower: needle.to_lowercase(),
+        found: 0,
+    };
+    unsafe {
+        EnumWindows(Some(enum_proc), &mut ctx as *mut Ctx as LPARAM);
+    }
+    (ctx.found != 0).then_some(ctx.found)
+}

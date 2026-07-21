@@ -54,3 +54,7 @@ servo-media-gstreamer-render-android = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 servo-media-gstreamer-render-d3d11 = { workspace = true }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

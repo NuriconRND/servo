@@ -41,7 +41,7 @@ use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{Player, PlayerEvent, StreamType};
-use servo_media_streams::capture::MediaTrackConstraintSet;
+use servo_media_streams::capture::{DisplayCaptureSource, MediaTrackConstraintSet};
 use servo_media_streams::device_monitor::MediaDeviceMonitor;
 use servo_media_streams::registry::MediaStreamId;
 use servo_media_streams::{MediaOutput, MediaSocket, MediaStreamType};
@@ -345,6 +345,17 @@ impl Backend for GStreamerBackend {
             return Some(self.create_videostream());
         }
         media_capture::create_videoinput_stream(set)
+    }
+
+    fn create_display_stream(
+        &self,
+        source: DisplayCaptureSource,
+        set: MediaTrackConstraintSet,
+    ) -> Option<MediaStreamId> {
+        if self.capture_mocking.load(Ordering::Acquire) {
+            return Some(self.create_videostream());
+        }
+        media_capture::create_display_stream(source, set)
     }
 
     fn can_play_type(&self, media_type: &str) -> SupportsMediaType {
