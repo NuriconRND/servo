@@ -19,8 +19,9 @@
   - 표준 태그 분기: `standard-tag-media-dispatch`
   - getDisplayMedia: `screen-capture-getdisplaymedia`
 - **엔진 검증 관례(모든 코드 태스크의 종료 게이트):** `cargo check -p servoshell` → `cargo build -p servoshell`(또는 신규 플러그인/DLL 배선 시 `.\mach build -j 8`) → 관련 `cargo test` → `rustfmt --edition 2024 --check <touched .rs>` → `git diff --check`.
-- **빌드 전 반드시** `. .\scripts\servo_env.ps1` 소싱(MSVC/툴체인/GStreamer PATH). 엔진 명령은 `servo/`가 아니라 이 워크트리 루트에서 실행하되 경로는 워크트리 기준.
-- **새 GStreamer element는 `ports/servo/gstreamer_plugin_lists/windows.rs.in`(plugin_lists)와 `python/servo/gstreamer.py`의 `GSTREAMER_BASE_LIBS` 둘 다 갱신**해야 등록된다. 한쪽만 하면 트랙 0/미등록. 이 경우 `cargo build`가 아니라 `mach build` 필수.
+- **빌드 전 반드시** `. ..\scripts\servo_env.ps1` 소싱(이 워크트리는 repo 루트이고 `scripts/`는 워크트리 상위에 있음 — P0 확인). 엔진 명령은 이 워크트리 루트에서 실행.
+- **경로 정정(P0):** 이 워크트리가 곧 servo repo 루트다. plugin_lists = `components/servo/gstreamer_plugin_lists/{common,windows,macos}.rs.in` (`ports/servo/...` 아님). 번들 GStreamer = `target/dependencies/gstreamer/1.0/msvc_x86_64/`(슬롯#1, 최우선 로드).
+- **새 GStreamer 플러그인(element)은 `components/servo/gstreamer_plugin_lists/*.rs.in`의 로드 목록에 추가**해야 등록된다. `python/servo/gstreamer.py`의 `GSTREAMER_BASE_LIBS`는 플러그인이 링크하는 베이스 SO 목록으로, 새 플러그인이 이미 목록에 있는 base lib(gstrtsp/gstrtp 등)에만 의존하면 손댈 필요 없다. 플러그인 목록이 바뀌면 `cargo build`가 아니라 `mach build`로 DLL 복사 스텝을 재실행해야 한다.
 
 ---
 
@@ -35,7 +36,7 @@
 
 Run:
 ```powershell
-. .\scripts\servo_env.ps1
+. ..\scripts\servo_env.ps1
 $gst = "$PWD\servo\target\dependencies\gstreamer\1.0\msvc_x86_64\lib\gstreamer-1.0"
 Get-ChildItem $gst -Filter '*.dll' | Where-Object { $_.Name -match 'rtsp|rtpmanager|gstrtp|udp|libav' } | Select-Object Name
 ```
@@ -123,7 +124,7 @@ jxl-oxide = { workspace = true }
 
 - [ ] **Step 4: 의존성 해소 확인**
 
-Run: `. .\scripts\servo_env.ps1; cargo check -p pixels`
+Run: `. ..\scripts\servo_env.ps1; cargo check -p pixels`
 Expected: 컴파일 성공(신규 `image` features/jxl-oxide 링크). 실패 시 `cargo update -p jxl-oxide` 후 재시도.
 
 - [ ] **Step 5: 커밋**
@@ -145,7 +146,7 @@ git commit -m "feat(pixels): 확장 이미지 디코드용 image features·jxl-o
 
 - [ ] **Step 1: 실패 테스트 작성**
 
-`components/pixels/lib.rs` 하단 테스트 모듈에 추가(없으면 `#[cfg(test)] mod tests { use super::*; ... }` 생성). 실제 QOI 바이트 픽스처는 `git show nonstandard-media-formats:tests/...` 또는 P0에서 확보한 샘플을 `include_bytes!`로 사용:
+`components/pixels/lib.rs` 하단 테스트 모듈에 추가(없으면 `#[cfg(test)] mod tests { use super::*; ... }` 생성). pixels 크레이트는 mozjs를 링크하지 않으므로 `cargo test -p pixels`가 정상 동작한다. 픽스처는 P0가 확인한 실경로의 JPEG XL 파일(`tests/wpt/tests/jpegxl/resources/*.jxl` 중 하나 — 구체 파일명은 구현 시 `ls`로 확정) 사용:
 ```rust
 #[test]
 fn extended_decode_rejects_empty() {
@@ -153,17 +154,20 @@ fn extended_decode_rejects_empty() {
 }
 
 #[test]
-fn extended_decode_falls_back_to_standard_png() {
-    // 표준 포맷은 기존 경로로 그대로 디코드되어야 한다.
-    let png = include_bytes!("../../tests/wpt/... /1x1.png"); // P0에서 확정한 실경로
-    let raster = load_extended_from_memory(png, Some("png"), CorsStatus::Unsafe);
-    assert!(raster.is_some());
+fn extended_decode_handles_jpeg_xl() {
+    // JPEG XL은 표준 `image` 크레이트가 지원하지 않으므로 신규 jxl-oxide 경로를 탄다.
+    let jxl = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/wpt/tests/jpegxl/resources/<확정파일명>.jxl"
+    ));
+    let raster = load_extended_from_memory(jxl, Some("jxl"), CorsStatus::Unsafe);
+    assert!(raster.is_some(), "jxl decode should succeed via jxl-oxide");
 }
 ```
 
 - [ ] **Step 2: 테스트 실패 확인**
 
-Run: `. .\scripts\servo_env.ps1; cargo test -p pixels extended_decode -- --nocapture`
+Run: `. ..\scripts\servo_env.ps1; cargo test -p pixels extended_decode -- --nocapture`
 Expected: FAIL — `load_extended_from_memory` 미정의.
 
 - [ ] **Step 3: 소스에서 디코드 함수 이식**
@@ -197,7 +201,7 @@ pub fn load_extended_from_memory(
 
 - [ ] **Step 4: 테스트 통과 확인**
 
-Run: `. .\scripts\servo_env.ps1; cargo test -p pixels extended_decode -- --nocapture`
+Run: `. ..\scripts\servo_env.ps1; cargo test -p pixels extended_decode -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: rustfmt + 커밋**
@@ -236,7 +240,7 @@ git show standard-tag-media-dispatch:tests/html/multigpu_standard_img_extended_p
 
 Run:
 ```powershell
-. .\scripts\servo_env.ps1; cargo build -p servoshell
+. ..\scripts\servo_env.ps1; cargo build -p servoshell
 target\debug\servoshell.exe tests\html\multigpu_standard_img_extended_probe.html 2> img_off.err.log
 ```
 Expected: pref off 기본값에서 확장 이미지는 broken-image, 표준 이미지는 정상. 패닉 없음.
@@ -282,22 +286,9 @@ git commit -m "feat(img): 표준 <img> 확장 포맷 디코드 분기(pref 게�
 ```
 기본값: `dom_video_extended_containers_enabled: false,`
 
-- [ ] **Step 2: 순수 헬퍼 실패 테스트 작성**
+- [ ] **Step 2~3: (단위 테스트 생략 — P0 확정)**
 
-`components/script/dom/html/htmlmediaelement.rs` 테스트 모듈에:
-```rust
-#[test]
-fn extended_container_matches_known_and_strips_params() {
-    assert!(is_extended_container_type("video/x-matroska"));
-    assert!(is_extended_container_type("video/x-msvideo; codecs=\"...\""));
-    assert!(!is_extended_container_type("video/mp4"));
-}
-```
-
-- [ ] **Step 3: 테스트 실패 확인**
-
-Run: `. .\scripts\servo_env.ps1; cargo test -p script is_extended_container -- --nocapture` (script 크레이트가 mozjs로 유닛 불가하면, 헬퍼를 순수 함수로 유지하되 검증은 Step 6 런타임 probe로 대체하고 이 스텝을 건너뛴다 — P0/기존 관례 확인).
-Expected: FAIL — 미정의.
+P0 결과: `components/script` 크레이트는 mozjs 전체를 링크해 `cargo test -p script` unit test가 비현실적이고 기존 전례도 0건. 따라서 `is_extended_container_type` 등 순수 헬퍼는 **런타임 probe(Step 6)로 검증**한다. `htmlmediaelement.rs`에 `#[test]`를 추가하지 말 것. (헬퍼 로직의 정확성은 소스 브랜치에서 verbatim 이식하므로 이미 검증된 코드다.)
 
 - [ ] **Step 4: 헬퍼 + 분기 이식**
 
@@ -305,13 +296,13 @@ Expected: FAIL — 미정의.
 
 - [ ] **Step 5: gstmpegts 플러그인 등록**
 
-`python/servo/gstreamer.py`의 `GSTREAMER_BASE_LIBS`에서 `gstcodecparsers` 다음에 `"gstmpegts",` 추가. plugin_lists(`windows.rs.in`)에도 대응 항목이 필요한지 P0 방식으로 확인 후 추가.
+`python/servo/gstreamer.py`의 `GSTREAMER_BASE_LIBS`에서 `gstcodecparsers` 다음에 `"gstmpegts",` 추가. plugin_lists는 `components/servo/gstreamer_plugin_lists/common.rs.in`(P0 정정 경로)에 컨테이너 demuxer 플러그인이 이미 있는지 확인(mkv=`gstmatroska`, avi=`gstavi`, asf/wmv=`gstasf`) 후 없는 것만 추가.
 
 - [ ] **Step 6: probe 복사 + 빌드(mach) + 스모크**
 
 ```powershell
 git show standard-tag-media-dispatch:tests/html/multigpu_standard_video_extended_probe.html > tests\html\multigpu_standard_video_extended_probe.html
-. .\scripts\servo_env.ps1; .\mach build -j 8    # 플러그인 배선 반영을 위해 mach 사용
+. ..\scripts\servo_env.ps1; .\mach build -j 8    # 플러그인 배선 반영을 위해 mach 사용
 target\debug\servoshell.exe --pref dom_video_extended_containers_enabled=true tests\html\multigpu_standard_video_extended_probe.html 2> vid_on.err.log
 ```
 Expected: mkv/avi/wmv가 canPlayType/재생에서 인식. pref off 대조군(`vid_off.err.log`)에서 무변화.
@@ -334,11 +325,13 @@ git commit -m "feat(video): 표준 <video> 확장 컨테이너 인식(pref 게�
 - Modify: `components/config/prefs.rs`
 - Modify: `components/media/backends/gstreamer/player.rs`(+ `lib.rs` 필요 시)
 - Modify: `components/script/dom/html/htmlmediaelement.rs`
-- Modify: `ports/servo/gstreamer_plugin_lists/windows.rs.in`, `python/servo/gstreamer.py`
+- Modify: `components/servo/gstreamer_plugin_lists/common.rs.in`(P0 정정 경로)
 - Create: RTSP `<video>` probe(소스의 RTSP probe에서 표준 태그 변형)
 
 **Interfaces:**
 - Produces: `fn is_direct_uri_scheme(url: &ServoUrl) -> bool`; NetworkUri 플레이어 경로; pref `dom_video_network_uri_enabled`.
+
+**P0 병합 충돌 지점(반드시 수동 확인):** htmlmediaelement.rs의 `update_media_state`(set_looping 호출 vs pause 가드 순서)와 `create_media_player`(set_resource_url 힌트 vs network_uri 파라미터)가 현재 브랜치 DComp 변경과 인접 블록. 라인은 안 겹쳐 3-way merge는 통과하겠으나 두 로직이 함께 옳게 동작하는지 검증.
 
 - [ ] **Step 1: pref 추가**
 
@@ -350,17 +343,9 @@ git commit -m "feat(video): 표준 <video> 확장 컨테이너 인식(pref 게�
 ```
 기본값 `dom_video_network_uri_enabled: false,`.
 
-- [ ] **Step 2: 순수 헬퍼 실패 테스트**
+- [ ] **Step 2: (단위 테스트 생략 — P0 확정)**
 
-```rust
-#[test]
-fn direct_uri_scheme_matches_rtsp_only() {
-    assert!(is_direct_uri_scheme(&ServoUrl::parse("rtsp://h/s").unwrap()));
-    assert!(is_direct_uri_scheme(&ServoUrl::parse("rtsps://h/s").unwrap()));
-    assert!(!is_direct_uri_scheme(&ServoUrl::parse("https://h/s").unwrap()));
-}
-```
-Run → FAIL(미정의) 확인(script 유닛 제약 시 Task 2 Step 3과 동일 처리).
+Task 2와 동일: script 크레이트 mozjs 링크로 unit test 비현실적. `is_direct_uri_scheme`는 소스에서 verbatim 이식하고 런타임 RTSP probe(Step 6)로 검증. `#[test]` 추가하지 말 것.
 
 - [ ] **Step 3: NetworkUri 플레이어 경로 이식**
 
@@ -370,15 +355,15 @@ Run → FAIL(미정의) 확인(script 유닛 제약 시 Task 2 Step 3과 동일 
 
 `is_direct_uri_scheme` 정의를 하단에 이식하고, resource fetch 알고리즘에서 `pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(&url)`일 때 AppSrc fetch 대신 NetworkUri 플레이어로 라우팅(소스 hunk 적용). P0 노트의 병합 지점 반영.
 
-- [ ] **Step 5: RTSP 플러그인 등록**
+- [ ] **Step 5: RTSP 플러그인 등록 (P0로 범위 축소)**
 
-P0 Step 1의 DLL 목록에 따라 `windows.rs.in` plugin_lists와 `gstreamer.py` `GSTREAMER_BASE_LIBS`에 `gstrtsp`/`gstrtpmanager`/`gstrtp`/`gstudp`(및 depay가 속한 플러그인) 추가. **양쪽 모두** 갱신.
+P0 확정 결과: 필요한 플러그인 DLL은 번들 1.22.8에 전부 존재하고, `gstrtp`/`gstrtpmanager`는 이미 등록됨. **`components/servo/gstreamer_plugin_lists/common.rs.in`에 `"gstrtsp"`, `"gstudp"` 두 줄만 추가**(기존 `"gstrtp"`/`"gstrtpmanager"` 옆). `gstreamer.py`는 **변경 불필요**(gstrtsp base lib이 이미 `GSTREAMER_BASE_LIBS`에 있고 자동 계산됨).
 
 - [ ] **Step 6: probe + mach build + 라이브 스모크**
 
 ```powershell
 git show nonstandard-media-formats:rtsp_testsrc.mp4 > rtsp_testsrc.mp4   # 필요 시 로컬 RTSP 소스로 서빙
-. .\scripts\servo_env.ps1; .\mach build -j 8
+. ..\scripts\servo_env.ps1; .\mach build -j 8
 target\debug\servoshell.exe --pref dom_video_network_uri_enabled=true "tests\html\<rtsp_probe>.html" 2> rtsp_on.err.log
 ```
 Expected: `rtsp://` 소스가 재생(첫 프레임 도달 로그). pref off 대조군에서 무변화. RTSP 엔드포인트 미확보 시 "자산 대기"로 표시하고 사용자 보고.
@@ -401,7 +386,7 @@ git commit -m "feat(video): 표준 <video>의 rtsp:// NetworkUri 재생(pref 게
 - Modify: `components/media/servo-media/lib.rs`, `components/media/streams/capture.rs`
 - Modify: `components/script/dom/media/mediadevices.rs`
 - Modify: `components/script_bindings/webidls/MediaDevices.webidl`, `components/script_bindings/codegen/Bindings.conf`
-- Modify: `ports/servo/gstreamer_plugin_lists/windows.rs.in`, `python/servo/gstreamer.py`(`gstcodecs`, `gstd3d11`)
+- Modify: `components/servo/gstreamer_plugin_lists/*.rs.in`(P0 정정 경로: `gstcodecs`, `gstd3d11` 추가), `python/servo/gstreamer.py`(필요 시 base lib)
 
 **Interfaces:**
 - Produces: `MediaDevices.getDisplayMedia()`; `servo_media::streams::capture::{DisplayCaptureSource, ...}`; `media.create_display_stream(source, constraints)`; prefs `dom_screen_capture_enabled`, `media_screen_capture_{monitor_index,show_cursor,window_title}`.
@@ -420,12 +405,12 @@ git commit -m "feat(video): 표준 <video>의 rtsp:// NetworkUri 재생(pref 게
 
 - [ ] **Step 4: 플러그인 등록**
 
-`windows.rs.in` plugin_lists와 `gstreamer.py` `GSTREAMER_BASE_LIBS`에 `gstcodecs`, `gstd3d11` 추가(양쪽).
+`components/servo/gstreamer_plugin_lists/*.rs.in`(P0 정정 경로)에 `gstcodecs`, `gstd3d11` 추가. `gstreamer.py`는 이들이 새 base lib에 의존할 때만 갱신(P0 방식으로 확인).
 
 - [ ] **Step 5: mach build + 스모크**
 
 ```powershell
-. .\scripts\servo_env.ps1; .\mach build -j 8
+. ..\scripts\servo_env.ps1; .\mach build -j 8
 git show screen-capture-getdisplaymedia:tests/html/<getdisplaymedia_probe>.html > tests\html\getdisplaymedia_probe.html
 target\debug\servoshell.exe --pref dom_screen_capture_enabled=true tests\html\getdisplaymedia_probe.html 2> gdm_on.err.log
 ```
@@ -449,7 +434,7 @@ git commit -m "feat(mediadevices): getDisplayMedia() 화면 캡처(d3d11screenca
 
 Run:
 ```powershell
-. .\scripts\servo_env.ps1
+. ..\scripts\servo_env.ps1
 target\debug\servoshell.exe --wall-layout ..\config\wall_layout.local_3x1.json --wall-all-tiles tests\html\multigpu_wall_sync_probe.html 2> wall_regress.err.log
 ```
 Expected: 모든 신규 pref off 기본값에서 월 파이프라인 정상(scroll matched, barrier complete, 패닉 0). `tools/wall_perf_analyzer/analyze_wall_perf.py`로 확인.
