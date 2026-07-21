@@ -31,6 +31,7 @@ use pixels::{CorsStatus, ImageMetadata, Snapshot};
 use regex::Regex;
 use rustc_hash::FxHashSet;
 use script_bindings::cell::{DomRefCell, RefMut};
+use servo_config::pref;
 use servo_url::ServoUrl;
 use servo_url::origin::MutableOrigin;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto, parse_unsigned_integer};
@@ -102,6 +103,28 @@ const SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &[
     "image/vnd.microsoft.icon",
     "image/x-icon",
     "image/webp",
+];
+
+/// Non-standard image MIME types additionally accepted for `<picture><source
+/// type>` selection when `dom_image_extended_formats_enabled` is on. These map
+/// to the extended decoders reachable through `pixels::load_extended_from_memory`
+/// (TIFF/EXR/HDR/TGA/DDS/QOI/PNM/JPEG XL). Keep in sync with that function.
+const EXTENDED_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/tiff",
+    "image/x-exr",
+    "image/aces",
+    "image/vnd.radiance",
+    "image/x-hdr",
+    "image/x-tga",
+    "image/x-targa",
+    "image/vnd-ms.dds",
+    "image/x-qoi",
+    "image/qoi",
+    "image/x-portable-anymap",
+    "image/x-portable-bitmap",
+    "image/x-portable-graymap",
+    "image/x-portable-pixmap",
+    "image/jxl",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -2498,5 +2521,13 @@ fn is_supported_image_mime_type(input: &str) -> bool {
         return true;
     }
 
-    SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type_essence)
+    if SUPPORTED_IMAGE_MIME_TYPES.contains(&mime_type_essence) {
+        return true;
+    }
+
+    // When standard `<img>` extended decoding is enabled, also accept the
+    // non-standard formats `pixels::load_extended_from_memory` can decode so a
+    // `<picture><source type>` can negotiate them.
+    pref!(dom_image_extended_formats_enabled) &&
+        EXTENDED_IMAGE_MIME_TYPES.contains(&mime_type_essence)
 }

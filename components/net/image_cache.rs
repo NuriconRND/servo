@@ -23,7 +23,10 @@ use net_traits::request::CorsSettings;
 use net_traits::{FetchMetadata, FetchResponseMsg, FilteredMetadata, NetworkError};
 use paint_api::{CrossProcessPaintApi, ImageUpdate, SerializableImageData};
 use parking_lot::Mutex;
-use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_from_memory};
+use pixels::{
+    CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage, load_extended_from_memory,
+    load_from_memory,
+};
 use profile_traits::mem::{Report, ReportKind};
 use profile_traits::path;
 use resvg::tiny_skia;
@@ -31,6 +34,7 @@ use resvg::usvg::{self, fontdb};
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{PipelineId, WebViewId};
 use servo_base::threadpool::ThreadPool;
+use servo_config::pref;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use webrender_api::ImageKey as WebRenderImageKey;
 use webrender_api::units::DeviceIntSize;
@@ -90,12 +94,23 @@ fn parse_svg_document_in_memory(
         .map_err(|_| "Not a valid SVG document")
 }
 
+/// Extract a lowercase file extension from a URL path (e.g. `…/a.TIFF?x` →
+/// `tiff`). Used as a decode hint for extension-only formats such as TGA.
+fn url_file_extension(url: &ServoUrl) -> Option<String> {
+    url.path()
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+}
+
 fn decode_bytes_sync(
     key: LoadKey,
     bytes: &[u8],
     cors: CorsStatus,
     content_type: Option<Mime>,
     fontdb: Arc<fontdb::Database>,
+    extension: Option<String>,
 ) -> DecoderMsg {
     let is_svg_document = content_type.is_some_and(|content_type| {
         (
@@ -114,6 +129,11 @@ fn decode_bytes_sync(
                     cors_status: cors,
                 })
             })
+    } else if pref!(dom_image_extended_formats_enabled) {
+        // Standard `<img>` opts into the extended decoder set (TIFF/EXR/QOI/JXL/
+        // …). `load_extended_from_memory` delegates the browser-standard formats
+        // to `load_from_memory`, so PNG/JPEG/WebP/GIF/BMP/ICO are unaffected.
+        load_extended_from_memory(bytes, extension.as_deref(), cors).map(DecodedImage::Raster)
     } else {
         load_from_memory(bytes, cors).map(DecodedImage::Raster)
     };
@@ -933,6 +953,7 @@ impl ImageCache for ImageCacheImpl {
                                 pl.cors_status,
                                 pl.content_type.clone(),
                                 self.fontdb.clone(),
+                                url_file_extension(&url),
                             ),
                         )
                     },
@@ -1242,7 +1263,7 @@ impl ImageCache for ImageCacheImpl {
                 debug!("Received EOF for {:?}", key);
                 match result {
                     Ok(_) => {
-                        let (bytes, cors_status, content_type) = {
+                        let (bytes, cors_status, content_type, extension) = {
                             let mut store = self.store.lock();
                             if let Some(pending_load) = store.pending_loads.get_by_key_mut(&id) {
                                 pending_load.result = Some(Ok(()));
@@ -1251,6 +1272,7 @@ impl ImageCache for ImageCacheImpl {
                                     pending_load.bytes.mark_complete(),
                                     pending_load.cors_status,
                                     pending_load.content_type.clone(),
+                                    url_file_extension(&pending_load.url),
                                 )
                             } else {
                                 debug!("Pending load for id {:?} already evicted from cache", id);
@@ -1261,8 +1283,14 @@ impl ImageCache for ImageCacheImpl {
                         let local_store = self.store.clone();
                         let fontdb = self.fontdb.clone();
                         self.thread_pool.spawn(move || {
-                            let msg =
-                                decode_bytes_sync(key, &bytes, cors_status, content_type, fontdb);
+                            let msg = decode_bytes_sync(
+                                key,
+                                &bytes,
+                                cors_status,
+                                content_type,
+                                fontdb,
+                                extension,
+                            );
                             local_store.lock().handle_decoder(msg);
                         });
                     },

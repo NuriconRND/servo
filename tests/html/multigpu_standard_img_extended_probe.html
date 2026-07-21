@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<!--
+  STANDARD <img> extended-format probe (no <x-image>).
+
+  This is the same page a normal-browser author would write: plain <img>, a
+  <picture> with a typed <source>, alt text, and onerror fallbacks. It branches
+  by ENVIRONMENT without any per-browser code:
+    - Standard browser: TIFF/EXR/QOI/JXL/... are unsupported -> the <img> fails
+      to decode -> onerror swaps in the descriptive fallback text (graceful
+      degradation). The <picture> falls back to its PNG <img>.
+    - Multi-GPU wall browser with --pref dom_image_extended_formats_enabled=true:
+      the standard <img> decode path routes through
+      pixels::load_extended_from_memory, so the same markup decodes and shows the
+      image. Standard formats (PNG/JPEG/WebP/GIF/BMP/ICO) are unaffected either
+      way.
+
+  Layout: a flexbox 3x3 grid sized in viewport units so all 9 tiles stay inside
+  the wall resolution (no scrolling) — every image is visible at once. (Servo
+  does not support `display:grid`, so flexbox is used.)
+
+  Reuses the assets generated for the <x-image> probe at servo/test_media/
+  (see multigpu_x_image_formats_probe.html for the ffmpeg recipe).
+
+  Thumbnails (standard-browser fallback): a 320x180 JPEG per image, used as the
+  <picture> <img> fallback. Generate with:
+    ffmpeg -y -i test_image.exr -vf scale=320:180 test_image.exr.thumb.jpg
+    (repeat for tiff/tga/ppm/pgm/qoi/hdr/jxl)
+
+  Run:
+    # extended decode ON (wall browser behavior)
+    target\debug\servoshell.exe ^
+      --wall-layout ..\config\wall_layout.local_2x1.json --wall-all-tiles ^
+      --pref dom_image_extended_formats_enabled=true ^
+      tests\html\multigpu_standard_img_extended_probe.html
+    # extended decode OFF (standard-browser fallback behavior) -- omit the pref
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>standard &lt;img&gt; extended format probe</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0b0d12; color:#e8e8f0; font-family:system-ui,sans-serif; }
+    /* 3 columns x 3 rows fills the viewport; all 9 cells used. Sizes are in % so
+       the grid always fits whatever wall resolution the virtual viewport has. */
+    .grid { display:flex; flex-wrap:wrap; align-content:flex-start; width:100vw; height:100vh; }
+    .cell { box-sizing:border-box; width:33.333%; height:33.333%; padding:5px; position:relative; }
+    img, picture { display:block; width:100%; height:100%; }
+    img { object-fit:contain; background:#000; border:2px solid #6cf0c5; border-radius:6px; }
+    .tag { position:absolute; top:11px; left:11px; font:bold 18px system-ui; color:#6cf0c5; background:rgba(0,0,0,.6); padding:1px 8px; border-radius:5px; }
+    .status { position:absolute; left:11px; right:11px; bottom:11px; font:12px/1.35 monospace; color:#bfe; background:rgba(0,0,0,.6); padding:3px 7px; border-radius:5px; }
+    .status.bad { color:#ff9f43; }
+    .fallback { position:absolute; inset:5px; display:flex; align-items:center; justify-content:center; text-align:center; color:#ffcf99; background:#1c1410; border:2px dashed #ff9f43; border-radius:6px; padding:10px; font-size:14px; }
+  </style>
+</head>
+<body>
+  <div class="grid" id="grid"></div>
+  <script>
+    const BASE = "file:///F:/20260609_SDWall_BrowserTest/20260606_multigpu_browser/servo_multigpu-tiled-wall/tests/html/test_media/test_image.";
+    // ext -> human description shown when the standard browser cannot decode it.
+    // ext -> { mime for the typed <picture> <source>, human description }.
+    // The mime values must match EXTENDED_IMAGE_MIME_TYPES in htmlimageelement.rs
+    // so the wall browser accepts the typed source under the pref.
+    const formats = {
+      tiff: { mime: "image/tiff",                 desc: "TIFF — print/scanning raster" },
+      tga:  { mime: "image/x-tga",                desc: "TGA — legacy game/texture format" },
+      exr:  { mime: "image/x-exr",                desc: "OpenEXR — HDR film/VFX image" },
+      ppm:  { mime: "image/x-portable-pixmap",    desc: "PPM — Netpbm raw color" },
+      pgm:  { mime: "image/x-portable-graymap",   desc: "PGM — Netpbm grayscale" },
+      qoi:  { mime: "image/qoi",                  desc: "QOI — fast lossless format" },
+      hdr:  { mime: "image/vnd.radiance",         desc: "Radiance HDR — HDR environment map" },
+      jxl:  { mime: "image/jxl",                  desc: "JPEG XL — next-gen still codec" },
+    };
+    const grid = document.getElementById("grid");
+    const items = [];
+
+    // Build a cell whose content (img/picture) fills it, with the label and
+    // status overlaid so the image itself uses the full tile area.
+    function makeCell(title, content) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = title;
+      const st = document.createElement("div");
+      st.className = "status";
+      st.textContent = "loading";
+      cell.appendChild(content);
+      cell.appendChild(tag);
+      cell.appendChild(st);
+      grid.appendChild(cell);
+      return st;
+    }
+
+    // Each cell is a <picture>: a typed <source> for the non-standard format,
+    // plus an <img> whose own src is a STANDARD JPEG thumbnail.
+    //   - Standard browser: the typed <source> is an unknown type -> skipped ->
+    //     the <img> loads the thumbnail (graceful degradation = a thumbnail).
+    //   - Wall browser (pref on): the typed <source> is accepted -> the <img>
+    //     loads and decodes the real non-standard image.
+    // The real image is 640x360 and the thumbnail is 320x180, so naturalWidth
+    // tells which one was used.
+    for (const [ext, info] of Object.entries(formats)) {
+      const pic = document.createElement("picture");
+      const src = document.createElement("source");
+      src.type = info.mime; src.srcset = BASE + ext;
+      const img = document.createElement("img");
+      img.alt = info.desc;
+      img.src = BASE + ext + ".thumb.jpg";
+      pic.appendChild(src); pic.appendChild(img);
+      const st = makeCell("." + ext, pic);
+      items.push({ ext, img, st });
+    }
+
+    let t = 0;
+    setInterval(() => {
+      t++;
+      for (const it of items) {
+        const w = it.img.naturalWidth, h = it.img.naturalHeight;
+        const loaded = it.img.complete && w > 0;
+        const real = w >= 640; // real image is 640x360; the thumbnail is 320x180
+        it.st.textContent = `${w}x${h} ` +
+          (loaded ? (real ? "✓ decoded (real)" : "▣ thumbnail (fallback)") : "✗ none");
+        it.st.className = real ? "status" : "status bad";
+        if (t % 3 === 0) console.error(`STD_IMG ${it.ext}: real=${real} ${w}x${h}`);
+      }
+    }, 1500);
+
+    // Headless verification helper: ?autoclose=MS exits cleanly so stderr flushes.
+    const _ac = new URLSearchParams(location.search).get("autoclose");
+    if (_ac) setTimeout(() => window.close(), parseInt(_ac, 10) || 8000);
+  </script>
+</body>
+</html>
