@@ -120,15 +120,15 @@ pub(crate) fn decouple_enabled() -> bool {
 }
 
 /// 즉시-합성 게이트에서 fast-path(present_external_only)를 택할지의 순수 판정.
-/// 기존 generate_frame 게이트(painter.rs:2027)와 같은 전제(비디오 도착·미생성·pending 0·
-/// rAF 없음·렌더러 안 밀림)에, 승격 external 존재 + 리사이즈 아님 + 기능 on을 더한다.
-/// painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate).
-#[allow(clippy::too_many_arguments)]
+/// 비디오 도착·미생성·rAF 없음 + 승격 external 존재 + 리사이즈 아님 + 기능 on.
+/// ★pending_frames==0 / renderer_behind은 의도적으로 제외★: fast-path는 WR 빌드
+/// 파이프라인과 무관한 DComp 직접 present이고(painter 스레드에서 render()와 순차 실행,
+/// 중첩 불가), WR이 바쁠 때(pending>0 = 절벽 상황)를 우회하는 것이 목적이라 WR 유휴를
+/// 요구하면 정작 필요한 순간에 발동하지 못한다(A5000 batch_swaps 실측으로 휴면 확인 →
+/// 두 조건 제거). painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate).
 pub(crate) fn should_fast_present(
     immediate_image_update: bool,
     generated_frame: bool,
-    pending_zero: bool,
-    renderer_behind: bool,
     raf_driving: bool,
     escaped_count: usize,
     resize_active: bool,
@@ -136,8 +136,6 @@ pub(crate) fn should_fast_present(
 ) -> bool {
     immediate_image_update
         && !generated_frame
-        && pending_zero
-        && !renderer_behind
         && !raf_driving
         && escaped_count > 0
         && !resize_active
@@ -3617,24 +3615,27 @@ mod tests {
 
     #[test]
     fn fast_present_gated_on_escaped_and_flags() {
-        // 표준 fast-path 케이스: 비디오 도착 + 프레임 미생성 + pending 0 + rAF 없음 +
-        // 렌더러 안 밀림 + 승격 external 있음 + 리사이즈 아님 + 기능 on.
-        assert!(should_fast_present(true, false, true, false, false, 36, false, true));
+        // 인자: (immediate_image_update, generated_frame, raf_driving, escaped_count,
+        //        resize_active, decouple_enabled). pending_frames==0/renderer_behind은
+        //        의도적으로 게이트에서 제거됨(WR 유휴 무관하게 발동 — should_fast_present 주석).
+        // 표준 fast-path 케이스: 비디오 도착 + 프레임 미생성 + rAF 없음 + 승격 external 있음 +
+        // 리사이즈 아님 + 기능 on.
+        assert!(should_fast_present(true, false, false, 36, false, true));
         // 승격 external 0 → fast-path 불가(기존 generate_frame로).
-        assert!(!should_fast_present(true, false, true, false, false, 0, false, true));
+        assert!(!should_fast_present(true, false, false, 0, false, true));
         // 기능 off(킬스위치) → 불가.
-        assert!(!should_fast_present(true, false, true, false, false, 36, false, false));
+        assert!(!should_fast_present(true, false, false, 36, false, false));
         // 리사이즈 중 → 불가(빌드 경로에 양보).
-        assert!(!should_fast_present(true, false, true, false, false, 36, true, true));
+        assert!(!should_fast_present(true, false, false, 36, true, true));
         // 이미 프레임 생성됨 → 불가.
-        assert!(!should_fast_present(true, true, true, false, false, 36, false, true));
+        assert!(!should_fast_present(true, true, false, 36, false, true));
         // rAF가 합성 구동 중 → 불가(기존 게이트 규약과 동일).
-        assert!(!should_fast_present(true, false, true, false, true, 36, false, true));
+        assert!(!should_fast_present(true, false, true, 36, false, true));
         // 비디오 도착 아님 → 불가.
-        assert!(!should_fast_present(false, false, true, false, false, 36, false, true));
-        // pending != 0 → 불가.
-        assert!(!should_fast_present(true, false, false, false, false, 36, false, true));
-        // 렌더러 밀림 → 불가.
-        assert!(!should_fast_present(true, false, true, true, false, 36, false, true));
+        assert!(!should_fast_present(false, false, false, 36, false, true));
+        // ★핵심 회귀 가드: WR이 바쁠 때(pending>0, 절벽 상황)에도 fast-path는 발동한다.
+        //   pending/renderer_behind는 이제 인자가 아니므로 표준 케이스가 곧 그 증명이다
+        //   (제거 전에는 이 조건들이 발동을 막아 A5000에서 휴면했다).
+        assert!(should_fast_present(true, false, false, 45, false, true));
     }
 }

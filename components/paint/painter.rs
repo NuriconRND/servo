@@ -2074,11 +2074,11 @@ impl Painter {
                 .map(|c| crate::dcomp_compositor::SharedDComp(c.clone()).escaped_external_count())
                 .unwrap_or(0);
             let resize_active = self.rendering_context.dcomp_resize_active();
+            // ★pending_frames==0 / renderer_behind을 넘기지 않는다: fast-path는 WR 빌드와
+            // 무관하므로 WR이 바쁠 때(절벽)에도 발동해야 한다(should_fast_present 주석).
             if crate::dcomp_compositor::should_fast_present(
                 immediate_image_update,
                 generated_frame,
-                self.pending_frames.get() == 0,
-                self.renderer_behind(),
                 raf_driving_composites,
                 escaped_count,
                 resize_active,
