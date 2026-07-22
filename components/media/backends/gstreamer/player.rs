@@ -148,7 +148,9 @@ fn configure_software_decoder_threads(element: &gstreamer::Element) {
     };
     let factory_name = factory.name();
     let klass = factory.metadata("klass").unwrap_or_default();
-    // All avdec video decoders share the GstFFMpegVidDec base, which exposes "max-threads".
+    // Most avdec video decoders share the GstFFMpegVidDec base which exposes
+    // "max-threads", but single-threaded codecs (e.g. avdec_wmv2, avdec_flv) do NOT —
+    // this holds on both GStreamer 1.22.8 and 1.28.4.100 (verified via gst-inspect).
     if !factory_name.starts_with("avdec_") || !klass.contains("Video") {
         return;
     }
@@ -157,6 +159,12 @@ fn configure_software_decoder_threads(element: &gstreamer::Element) {
     };
     match raw.trim().parse::<i32>() {
         Ok(max_threads) if max_threads >= 0 => {
+            // Setting an absent GObject property panics (and, occurring inside a
+            // non-unwinding GStreamer callback, aborts the process). Gate on presence.
+            if element.find_property("max-threads").is_none() {
+                log::debug!("{factory_name} has no max-threads property; skipping");
+                return;
+            }
             element.set_property("max-threads", max_threads);
             log::info!("Set {factory_name} max-threads={max_threads}");
         },
