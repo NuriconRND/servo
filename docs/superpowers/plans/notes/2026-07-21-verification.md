@@ -2,7 +2,7 @@
 
 날짜: 2026-07-21 (실행 2026-07-22 새벽)
 브랜치: `nonstandard-media-display-port`
-전제: P1~P4의 신규 pref(`dom_x_image_enabled` 등 확장 이미지, 확장 컨테이너 게이트, `dom_rtsp_stream_enabled`류, `dom_screen_capture_enabled`)는 전부 기본값(off) 그대로 — 이번 검증은 **아무 pref도 넘기지 않은 상태**로 실행했다.
+전제: P1~P4의 신규 pref(`dom_image_extended_formats_enabled`[P1 확장 이미지], `dom_video_extended_containers_enabled`[P2 확장 컨테이너], `dom_video_network_uri_enabled`[P3 RTSP], `dom_screen_capture_enabled`[P4 화면캡처])는 전부 기본값(off) 그대로 — 이번 검증은 **아무 pref도 넘기지 않은 상태**로 실행했다. (주의: `dom_x_image_enabled`/`dom_rtsp_stream_enabled`는 이 브랜치에서 의도적으로 제외한 커스텀 엘리먼트용 pref로, 실제 신규 pref가 아니다.)
 
 ---
 
