@@ -380,6 +380,8 @@ git commit -m "feat(video): 표준 <video>의 rtsp:// NetworkUri 재생(pref 게
 
 ## Task 4 (P4): getDisplayMedia (화면 캡처)
 
+> **상태: RESOLVED (2026-07-22).** 최초 이식은 `DONE_WITH_CONCERNS`(프레임 전달 `videoSize 0x0`)였으나, GStreamer 1.26.x 3겹 근본원인(빌드 피처 / `d3d11download` 리드백 / 캡처 bin 내 I420 변환)을 확정·수정해 `videoSize 1920x1080` advancing을 debug·release / 단일창·월(3타일 barrier ready=3/3)에서 검증 완료. 상세는 `notes/2026-07-21-verification.md`의 "P4 getDisplayMedia — RESOLVED" 절.
+
 **Files:**
 - Modify: `components/config/prefs.rs`
 - Create/Modify: `components/media/backends/gstreamer/media_capture.rs`, `media_stream.rs`, `media_stream_source.rs`, `lib.rs`, `Cargo.toml`

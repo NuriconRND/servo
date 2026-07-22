@@ -46,3 +46,32 @@ target\debug\servoshell.exe --wall-layout <3-tile layout> --wall-all-tiles tests
 ## 종합 결론
 
 `nonstandard-media-display-port` 브랜치는 P1(확장 이미지 디코드)~P4(getDisplayMedia) 신규 기능을 전부 pref 기본값 off로 유지한 채 기존 월(wall) 렌더 파이프라인과 공존하며, 이번 검증에서 스크롤 동기화 100% 매칭·프레임 배리어 정상 완료·패닉 0건·기존 게이트(단위 테스트 2종, `cargo check`, `git diff --check`) 전부 통과를 확인했다. 관측된 barrier-miss 경고 및 tile 3(2-모니터 환경) 프레젠트 불균형은 이 브랜치 도입 전부터 있던 실행 환경 특성이며 baseline 로그와 같은 패턴으로 재현되어 회귀가 아니다. 별도로, P4 `getDisplayMedia`는 이미 `DONE_WITH_CONCERNS`로 기록된 알려진 프레임 전달 갭(트랙/게이팅은 동작하되 실제 프레임 전달 경로가 미해결)을 갖고 있으나, 이는 `dom_screen_capture_enabled=true`로 명시적으로 켰을 때만 드러나는 그 기능 자체의 기존 이슈이지 이번 무회귀 검증(모든 pref off) 범위의 회귀가 아니다.
+
+---
+
+## P4 getDisplayMedia 프레임 전달 — **RESOLVED** (2026-07-22)
+
+Task 5 시점 `DONE_WITH_CONCERNS`였던 P4 프레임 전달 갭(`videoSize 0x0` STALLED)을 근본 해결했다. 근본원인은 **세 겹**이었고 각각 `GST_DEBUG`로 확정:
+
+1. **`tracks:0`** — 검증 빌드가 `cargo build -p servoshell`(default 피처, `media-gstreamer` 누락 → servo-media-dummy 백엔드, `create_display_stream` 기본구현 None). full `mach build`(no `-p`)만 `media-gstreamer`를 붙인다(`command_base.py:792-795`). → 미디어 검증은 `mach build` 필수.
+2. **업스트림 `0x0`** — **시스템 GStreamer 1.26.x**의 `d3d11screencapturesrc`가 `video/x-raw(memory:D3D11Memory),format=BGRA`(GPU)만 내보내 CPU `videoconvert`가 매핑 불가 → caps 협상 무한 reconfigure 루프. `d3d11download`로 시스템 메모리 리드백 필요(1.22.8은 sysmem caps 직접 제공해 불필요했음 — 버전 차이).
+3. **다운스트림 `0x0`** — 리드백 후 프레임이 **BGRA**로 decodebin 도달하지만 servo appsink는 `video/x-raw,format=I420` 요구(`render.rs:326-336`)+표시 playbin이 `disabled_video_filters=true`라 변환기 자동삽입 안 함 → BGRA 미수용. `VIDEO_SRC_PAD_TEMPLATE`의 `format=I420`은 프록시 경계 너머로 역전파 안 됨(1.26.x).
+
+**수정(2파일):**
+- `components/media/backends/gstreamer/media_capture.rs::create_display_stream` — 캡처 bin을 `[d3d11screencapturesrc → d3d11download → videoconvert → capsfilter(video/x-raw,format=I420)]`로 구성해 **MediaStream이 I420를 결정적으로 배출**(템플릿 역전파 의존 제거).
+- `components/media/backends/gstreamer/media_stream_source.rs::VIDEO_SRC_PAD_TEMPLATE` — 재이식이 떨어뜨린 `.field("format","I420")` 복원(bare `video/x-raw`=검증된 0x0 함정; 원조 `screen-capture-getdisplaymedia`/`capture-card-getusermedia` 브랜치와 동일).
+
+**검증 (`--pref dom_webrtc_enabled --pref dom_screen_capture_enabled --pref media_screen_capture_monitor_index=0`, 절대 `file:///` URL):**
+| 구성 | 결과 |
+|---|---|
+| debug, 단일창 | `tracks:1`, **`videoSize 1920x1080` advancing** |
+| debug, `--wall-all-tiles` | 프레임 도달(캡처 동작) — 종료 시 기존 월 teardown 패닉(무관) |
+| release, `--wall-all-tiles` + DComp(`SERVO_COMPOSITOR_DCOMP=1`) | **`videoSize 1920x1080` advancing + `Wall frame barrier complete ready=3/3` + 3타일 렌더**(GL500 패닉 없음) |
+
+**게이트:** `rustfmt --edition 2024 --check`(수정 2파일 중 `media_capture.rs` PASS; `media_stream_source.rs`의 rustfmt 지적 라인은 **본 수정과 무관한 사전 존재 비준수** — 커밋 HEAD 원본에서도 동일 지적, 내 추가 라인은 clean이라 surgical diff 유지), `git diff --check` PASS, full `mach build`(debug/release) exit 0.
+
+**이월(별개 이슈, 본 수정 무관):**
+- debug 빌드 월 실행 시 `Caught GL error 500 at invalidate_framebuffer` 패닉 = **webrender의 debug 전용 GL 에러체크**(`device/gl.rs:1493` `cfg!(debug_assertions)`)가 구형 AMD(HD 7800M)+DComp의 무해한 `glInvalidateFramebuffer` 에러를 패닉 승격. **release는 이 체크가 없어 패닉 없음**(코드 주석: 동기 검사가 파이프라인 stall). 월 표출은 release 필수.
+- 월 종료(close) 시 surfman `MakeCurrentFailed`/`context.rs:177` teardown 크래시(0xC0000005/exit 101)는 더미 백엔드 월런에서도 재현되는 **기존 월 종료 레이스**로 런타임 표출과 무관.
+
+세부 함정·재현법은 메모리 [[screen-capture-getdisplaymedia-branch]], [[build-use-mach-not-cargo-for-media]]에 기록.
