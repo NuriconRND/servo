@@ -209,21 +209,56 @@ pub fn create_display_stream(
         None => src.set_property("monitor-index", source.monitor_index),
     }
 
-    // `d3d11screencapturesrc` produces GPU-resident `video/x-raw(memory:D3D11Memory)`
-    // buffers. The downstream `videoconvert` (added by `create_video_from`) is a
-    // plain CPU converter that cannot map D3D11 textures directly, so route through
-    // `d3d11download` first to read the frames back into system memory.
+    // On GStreamer 1.26.x, `d3d11screencapturesrc` negotiates
+    // `video/x-raw(memory:D3D11Memory),format=BGRA` — GPU-resident buffers. The
+    // downstream CPU `videoconvert` (added by `create_video_from`) cannot map
+    // D3D11 textures, so without an explicit readback the caps negotiation loops
+    // forever and no frame ever reaches the <video> element (videoSize 0x0). Route
+    // through `d3d11download` to read the frames back into system memory. (Older
+    // 1.22.8 offered a system-memory caps variant directly and did not need this;
+    // the runtime here is the system 1.26.x install.)
     let Ok(d3d11download) = gstreamer::ElementFactory::make("d3d11download").build() else {
         log::warn!("getDisplayMedia: failed to create d3d11download");
         return None;
     };
+    // Servo's video appsink demands `video/x-raw,format=I420` (render.rs), and the
+    // display playbin runs with video filters disabled, so it will NOT auto-insert
+    // a converter. The capture frames are BGRA, so convert to I420 *inside this bin*
+    // and pin it with a capsfilter — this makes the MediaStream deliver I420
+    // deterministically (the `format=I420` src pad template alone does not
+    // back-propagate the demand across the proxy boundary on GStreamer 1.26.x).
+    let Ok(convert) = gstreamer::ElementFactory::make("videoconvert").build() else {
+        log::warn!("getDisplayMedia: failed to create videoconvert");
+        return None;
+    };
+    let i420_filter = match gstreamer::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gstreamer::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .build(),
+        )
+        .build()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("getDisplayMedia: failed to create I420 capsfilter: {e}");
+            return None;
+        },
+    };
     let bin = gstreamer::Bin::new();
-    if bin.add_many([&src, &d3d11download]).is_err() || src.link(&d3d11download).is_err() {
+    if bin
+        .add_many([&src, &d3d11download, &convert, &i420_filter])
+        .is_err()
+        || src.link(&d3d11download).is_err()
+        || d3d11download.link(&convert).is_err()
+        || convert.link(&i420_filter).is_err()
+    {
         log::warn!("getDisplayMedia: failed to assemble capture bin");
         return None;
     }
-    let Some(src_pad) = d3d11download.static_pad("src") else {
-        log::warn!("getDisplayMedia: d3d11download has no src pad");
+    let Some(src_pad) = i420_filter.static_pad("src") else {
+        log::warn!("getDisplayMedia: capsfilter has no src pad");
         return None;
     };
     let Ok(ghost_pad) = gstreamer::GhostPad::with_target(&src_pad) else {

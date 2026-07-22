@@ -34,7 +34,11 @@ mod imp {
 
     static VIDEO_SRC_PAD_TEMPLATE: LazyLock<gstreamer::PadTemplate> = LazyLock::new(|| {
         // raw 비디오를 그대로 흘려 playbin3/decodebin3가 디코더를 끼우지 않게 한다.
-        let caps = gstreamer::Caps::builder("video/x-raw").build();
+        // 포맷을 I420으로 고정해야 프록시 경계 너머로 caps가 협상된다 — bare
+        // `video/x-raw`(포맷 미지정)는 metadata 0x0로 실패한다(검증된 함정).
+        let caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .build();
         gstreamer::PadTemplate::new(
             "video_src",
             gstreamer::PadDirection::Src,
