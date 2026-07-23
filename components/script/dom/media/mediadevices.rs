@@ -158,6 +158,7 @@ fn convert_constraints(js: &BooleanOrMediaTrackConstraints) -> Option<MediaTrack
             aspect: c.parent.aspectRatio.as_ref().and_then(convert_cdouble),
             frame_rate: c.parent.frameRate.as_ref().and_then(convert_cdouble),
             sample_rate: c.parent.sampleRate.as_ref().and_then(convert_culong),
+            device_id: None,
         }),
     }
 }

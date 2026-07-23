@@ -20,6 +20,17 @@ pub struct MediaTrackConstraintSet {
     pub aspect: Option<Constrain<f64>>,
     pub frame_rate: Option<Constrain<f64>>,
     pub sample_rate: Option<Constrain<u32>>,
+    pub device_id: Option<ConstrainString>,
+}
+
+/// A DOMString-valued constraint (`deviceId` 등).
+///
+/// 스펙과 달리 이 프로젝트에선 Exact/Ideal 모두 "일치 없으면 실패"로 다룬다
+/// (월 디버깅 시 잘못된 포트가 조용히 열리는 것 방지 — 설계 스펙 참조).
+#[derive(Clone, Debug)]
+pub enum ConstrainString {
+    Exact(String),
+    Ideal(String),
 }
 
 pub enum Constrain<T> {
