@@ -3,10 +3,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use gstreamer::DeviceMonitor as GstDeviceMonitor;
 use gstreamer::prelude::*;
 use servo_media_streams::device_monitor::{MediaDeviceInfo, MediaDeviceKind, MediaDeviceMonitor};
+
+use crate::device_id::{classify_device_class, device_api, device_path, normalized_port_key};
 
 pub struct GStreamerDeviceMonitor {
     devices: RefCell<Option<Vec<MediaDeviceInfo>>>,
@@ -29,24 +32,56 @@ impl GStreamerDeviceMonitor {
         device_monitor.add_filter(Some(AUDIO_SINK), Some(&audio_caps));
         let video_caps = gstreamer_video::VideoCapsBuilder::new().build();
         device_monitor.add_filter(Some(VIDEO_SOURCE), Some(&video_caps));
-        let devices = device_monitor
+
+        struct Candidate {
+            info: MediaDeviceInfo,
+            port_key: Option<String>,
+            is_mediafoundation: bool,
+        }
+        let candidates: Vec<Candidate> = device_monitor
             .devices()
             .iter()
             .filter_map(|device| {
-                let display_name = device.display_name().as_str().to_owned();
-                Some(MediaDeviceInfo {
-                    device_id: display_name.clone(),
-                    kind: match device.device_class().as_str() {
-                        AUDIO_SOURCE => MediaDeviceKind::AudioInput,
-                        AUDIO_SINK => MediaDeviceKind::AudioOutput,
-                        VIDEO_SOURCE => MediaDeviceKind::VideoInput,
-                        _ => return None,
+                let kind = classify_device_class(device.device_class().as_str())?;
+                let label = device.display_name().as_str().to_owned();
+                let path = device_path(device);
+                // The id must be unique per physical port: capture cards expose
+                // several ports under one display name, so prefer the device
+                // path over the (possibly duplicated) display name.
+                let device_id = path.clone().unwrap_or_else(|| label.clone());
+                Some(Candidate {
+                    info: MediaDeviceInfo {
+                        device_id,
+                        kind,
+                        label,
                     },
-                    label: display_name,
+                    port_key: path.as_deref().map(normalized_port_key),
+                    is_mediafoundation: device_api(device).as_deref() == Some("mediafoundation"),
                 })
             })
             .collect();
-        Ok(devices)
+
+        // The same physical capture port shows up once per provider API
+        // (winks + mediafoundation). Expose the mediafoundation entry — it has
+        // a distinguishable display name and a `device.path` — and hide
+        // provider twins of ports it already covers. Opening still prefers the
+        // ksvideosrc twin (see media_capture.rs::select_device_by_id).
+        let mf_video_keys: HashSet<String> = candidates
+            .iter()
+            .filter(|c| matches!(c.info.kind, MediaDeviceKind::VideoInput) && c.is_mediafoundation)
+            .filter_map(|c| c.port_key.clone())
+            .collect();
+        Ok(candidates
+            .into_iter()
+            .filter(|c| {
+                c.is_mediafoundation
+                    || !matches!(c.info.kind, MediaDeviceKind::VideoInput)
+                    || c.port_key
+                        .as_deref()
+                        .is_none_or(|key| !mf_video_keys.contains(key))
+            })
+            .map(|c| c.info)
+            .collect())
     }
 }
 
