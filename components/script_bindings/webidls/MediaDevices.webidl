@@ -63,10 +63,10 @@ dictionary ConstrainULongRange : ULongRange {
 //              boolean ideal;
 // };
 
-// dictionary ConstrainDOMStringParameters {
-//              (DOMString or sequence<DOMString>) exact;
-//              (DOMString or sequence<DOMString>) ideal;
-// };
+dictionary ConstrainDOMStringParameters {
+             (DOMString or sequence<DOMString>) exact;
+             (DOMString or sequence<DOMString>) ideal;
+};
 
 dictionary MediaTrackConstraints : MediaTrackConstraintSet {
              sequence<MediaTrackConstraintSet> advanced;
@@ -75,7 +75,7 @@ dictionary MediaTrackConstraints : MediaTrackConstraintSet {
 typedef ([Clamp] unsigned long or ConstrainULongRange) ConstrainULong;
 typedef (double or ConstrainDoubleRange) ConstrainDouble;
 // typedef (boolean or ConstrainBooleanParameters) ConstrainBoolean;
-// typedef (DOMString or sequence<DOMString> or ConstrainDOMStringParameters) ConstrainDOMString;
+typedef (DOMString or sequence<DOMString> or ConstrainDOMStringParameters) ConstrainDOMString;
 
 dictionary MediaTrackConstraintSet {
              ConstrainULong width;
@@ -92,6 +92,6 @@ dictionary MediaTrackConstraintSet {
              // ConstrainBoolean noiseSuppression;
              // ConstrainDouble latency;
              // ConstrainULong channelCount;
-             // ConstrainDOMString deviceId;
+             ConstrainDOMString deviceId;
              // ConstrainDOMString groupId;
 };

@@ -12,7 +12,7 @@ use servo_config::pref;
 use servo_media::ServoMedia;
 use servo_media::streams::MediaStreamType;
 use servo_media::streams::capture::{
-    Constrain, ConstrainRange, DisplayCaptureSource, MediaTrackConstraintSet,
+    Constrain, ConstrainRange, ConstrainString, DisplayCaptureSource, MediaTrackConstraintSet,
 };
 
 use crate::conversions::Convert;
@@ -21,7 +21,8 @@ use crate::dom::bindings::codegen::Bindings::MediaDevicesBinding::{
 };
 use crate::dom::bindings::codegen::UnionTypes::{
     BooleanOrMediaTrackConstraints, ClampedUnsignedLongOrConstrainULongRange as ConstrainULong,
-    DoubleOrConstrainDoubleRange as ConstrainDouble,
+    DoubleOrConstrainDoubleRange as ConstrainDouble, StringOrStringSequence,
+    StringOrStringSequenceOrConstrainDOMStringParameters as ConstrainDOMString,
 };
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
@@ -158,7 +159,11 @@ fn convert_constraints(js: &BooleanOrMediaTrackConstraints) -> Option<MediaTrack
             aspect: c.parent.aspectRatio.as_ref().and_then(convert_cdouble),
             frame_rate: c.parent.frameRate.as_ref().and_then(convert_cdouble),
             sample_rate: c.parent.sampleRate.as_ref().and_then(convert_culong),
-            device_id: None,
+            device_id: c
+                .parent
+                .deviceId
+                .as_ref()
+                .and_then(convert_string_constraint),
         }),
     }
 }
@@ -192,6 +197,32 @@ fn convert_cdouble(js: &ConstrainDouble) -> Option<Constrain<f64>> {
                 }))
             } else {
                 range.exact.map(|exact| Constrain::Value(*exact))
+            }
+        },
+    }
+}
+
+fn convert_string_constraint(js: &ConstrainDOMString) -> Option<ConstrainString> {
+    fn first(value: &StringOrStringSequence) -> Option<String> {
+        match value {
+            StringOrStringSequence::String(s) => Some(s.to_string()),
+            StringOrStringSequence::StringSequence(seq) => seq.first().map(|s| s.to_string()),
+        }
+    }
+    match js {
+        ConstrainDOMString::String(s) => Some(ConstrainString::Ideal(s.to_string())),
+        ConstrainDOMString::StringSequence(seq) => {
+            seq.first().map(|s| ConstrainString::Ideal(s.to_string()))
+        },
+        ConstrainDOMString::ConstrainDOMStringParameters(params) => {
+            if let Some(exact) = params.exact.as_ref().and_then(first) {
+                Some(ConstrainString::Exact(exact))
+            } else {
+                params
+                    .ideal
+                    .as_ref()
+                    .and_then(first)
+                    .map(ConstrainString::Ideal)
             }
         },
     }
