@@ -80,3 +80,12 @@ MZ0380 4포트 캡처카드는 GstDeviceMonitor에 **총 8개 장치**로 잡힌
 
 - 오디오 입력 deviceId 정밀화(wasapi id), groupId, OverconstrainedError 예외 타입, ondevicechange 이벤트.
 - getDisplayMedia 경로는 무변경.
+
+## 검증 결과 (2026-07-23, Task 7)
+
+- 정적: rustfmt --edition 2024 --check(5개 파일) 무출력, `git diff --check` 무출력, `cargo test -p servo-media-gstreamer device_id` 6 passed.
+- `.\mach build --release -j 8` exit 0 (2m35s, 증분).
+- 실기(MZ0380 4포트) 4포트 전부 개별 실행 검증: `?device=analog 01/02/03/04` 모두 `selected device` 라벨·id가 서로 상이하게 매칭되고, 백엔드 로그 `getUserMedia: deviceId "..." -> "MZ0380 PCI" (api "winks/other")`로 ksvideosrc(비-mediafoundation) 경로 사용을 확인. 4포트 전부 `videoSize=1920x1080 ... advancing`(라이브 신호 있음).
+- 네거티브: `?device=nonexistent-port` → `NO videoinput matches`, 백엔드 `getUserMedia` 호출 자체가 없음(로그 부재로 확인) — 페이지 단 선차단 정상.
+- 실행 조건: 이 브랜치 `config/wall_layout.local_1x1.json`의 `monitor` 스키마가 파싱 실패("monitor must be a non-negative integer") → `wall_layout.local_3x1.branchschema.json` 사용(3타일, 로그 목적상 문제없음). 콘솔 `console.log`는 stdout에 출력됨(`println!` 경로, headed_window.rs) — 백엔드 확인 로그(`getUserMedia: deviceId ...`)를 보려면 `RUST_LOG=warn,script=info,servo_media_gstreamer=info` 필요(그냥 `script=info`만으로는 media_capture.rs의 info! 로그가 안 잡힘).
+- 알려진 이슈(이번 변경과 무관): wall-all-tiles 모드에서 캡처카드 스트림이 열린 상태로 창을 닫으면(WM_CLOSE/CloseMainWindow) GStreamer 파이프라인 teardown이 12초+ 안 끝나 프로세스가 종료되지 않음(기존 메모리에 기록된 "teardown" 이슈와 일치). 매 실행마다 필요한 로그 라인을 프로세스가 살아있는 동안 파일에서 먼저 확인한 뒤 `Stop-Process -Force`로 회수함(데이터 손실 없음, 정상 종료 자체는 blocked).
