@@ -6,6 +6,7 @@ pub mod audio_decoder;
 pub mod audio_sink;
 pub mod audio_stream_reader;
 mod datachannel;
+mod device_id;
 mod device_monitor;
 pub mod media_capture;
 pub mod media_stream;
