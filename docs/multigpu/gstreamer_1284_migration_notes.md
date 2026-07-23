@@ -51,12 +51,35 @@
 | 2 | 확장 컨테이너 | **PASS** (mkv/avi/wmv/ts/flv/mov err=none rs=4 320x240; ts t=0.75 advancing) |
 | 3 | RTSP | **보류** (RTSP 소스 부재; rtsp err=4 = 소스 미제공 예상 동작) |
 | 4 | getDisplayMedia | **PASS** (release 월, videoSize 1920x1080 advancing) |
-| 5 | 캡처카드(getUserMedia) | **연기** (하드웨어 미설치; 소스 플러그인 등록 완료) |
+| 5 | 캡처카드(getUserMedia) | **PASS** (2026-07-23, MZ0380 설치 후: 4 videoinput, 라이브 1920x1080 advancing, g_assert 0 — 단 I420 고정 수정 필요했음, 아래 (d)) |
 | 6 | 코어 비디오 월(DComp/D3D11) | **PASS** (barrier ready=3/3, 패닉0) |
 | 7 | 월 stress | **PASS** (클린 렌더; 종료 teardown만) |
 | 8 | 월 스크롤·배리어 무회귀 | **PASS** (scroll matched 332, barrier complete 331) |
 
 **신규 회귀 0.** 관측된 패닉은 전부 **월 종료(close) teardown 레이스**(`MakeCurrentFailed` gui.rs:183 + surfman `context.rs:177` assertion) — 정상 렌더 **후 종료 시각에만** 발생, 1.22.8·더미 백엔드에서도 재현되는 사전 존재 이슈로 이번 전환과 무관. (별개 이슈: debug 전용 webrender `GL error 500 at invalidate_framebuffer` 패닉은 release에 **0건** 재확인 — release는 `cfg!(debug_assertions)` GL 에러체크 미실행.)
+
+## (d) 캡처카드 회귀 결과 (2026-07-23, 계획 Task 8)
+
+MZ0380 PCI 캡처카드(4입력) 설치 후 재개. 프로브 `tests/html/multigpu_capture_card_probe.html`을
+capture-card-getusermedia 브랜치에서 복원, `--wall-all-tiles` + `--pref dom_webrtc_enabled=true`로 실행.
+
+- **enumerateDevices**: 4 videoinput("MZ0380 PCI"), **g_assert/abort 없음** — 1.28.4.100 커스텀
+  winks가 1.22.8 `ks_video_probe_filter_for_caps` abort를 회피함을 실기 확인(전환의 원 동기 해소).
+- **getUserMedia 초기 결과 = 스톨**(트랙은 열리나 videoSize 0x0): GST_DEBUG로 규명 —
+  `<video_0:proxypad10> caps ... format=YUY2 not accepted`. 카메라 스트림 체인
+  (`create_video_from`: device element → videoconvert → queue → proxysink)에 I420 고정이 없어
+  videoconvert가 YUY2 passthrough로 협상 → `servomediastreamsrc`의 I420 전용 src pad 템플릿이
+  proxy 경계에서 거부(NOT_NEGOTIATED). **getDisplayMedia에서 이미 기록된 함정**("I420 템플릿
+  요구는 proxy 경계를 역전파하지 않음")의 카메라 경로 누락분.
+- **수정**: `media_stream.rs::create_video_from`에 `capsfilter(video/x-raw,format=I420)`를
+  videoconvert 뒤에 삽입(디스플레이 캡처 빈과 동일 패턴). 전 사용처(카메라/디스플레이 빈/mock/
+  WebRTC proxy) 안전 — Servo appsink는 어차피 I420만 수용.
+- **수정 후**: 라이브 트랙 **1920x1080 advancing**(currentTime 초당 전진, 월 3타일 팬아웃 표출) → **PASS**.
+- 잔여(비차단, 사전 존재): `GStreamer-CRITICAL gst_pad_set_chain_function_full: GST_PAD_IS_SINK`
+  ×2 — `media_stream_source.rs`가 ghost **src** pad에 `chain_function`을 설정(체인 함수는 sink 전용,
+  업스트림 원형은 `proxy_pad_chain_function`이었을 것으로 추정). 데이터 흐름 무영향, 후속 정리 후보.
+- 알려진 한계(이월): 4입력이 전부 동일 deviceId("MZ0380 PCI")로 노출, `get_track`은
+  `devices.front()`만 사용 → 특정 입력 선택 불가(webidl deviceId 배선 필요, 별도 과제).
 
 ## 롤백 (비파괴)
 
@@ -67,6 +90,7 @@
 
 ## 미결
 
-- **#5 캡처카드**: 하드웨어(MZ0380/웹캠) 설치 후 재개 — enumerateDevices videoinput + getUserMedia 라이브 트랙 + g_assert 없음. 프로브는 `git show capture-card-getusermedia:tests/html/multigpu_capture_card_probe.html`로 복원. (계획 Task 8.)
+- ~~**#5 캡처카드**~~ → **완료(2026-07-23, (d) 참조)**. 이월 과제: deviceId 선택 배선(4입력 동일 id).
 - **#3 RTSP**: 로컬 RTSP 소스(mediamtx 등) 준비 후 실측.
 - **월 종료 teardown 크래시(②)**: 별개 사전 존재 이슈로 후속 검토 대상.
+- **GST_PAD_IS_SINK CRITICAL ×2**: ghost src pad chain_function 오설정((d) 참조), cosmetic 정리 후보.
