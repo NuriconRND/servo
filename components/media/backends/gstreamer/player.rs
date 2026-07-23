@@ -983,6 +983,9 @@ pub struct GStreamerPlayer {
     /// so the direct local-file path (see `DIRECT_FILE_ENV`) can be chosen. `None` unless the
     /// element hinted a URL.
     resource_url: RefCell<Option<String>>,
+    /// Script-set hint (see `Player::set_direct_file`) that direct local-file playback should be
+    /// used regardless of `DIRECT_FILE_ENV`. `resolve_direct_file_url` honors either signal.
+    force_direct_file: Cell<bool>,
 }
 
 impl GStreamerPlayer {
@@ -1017,15 +1020,19 @@ impl GStreamerPlayer {
             network_uri,
             render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
             resource_url: RefCell::new(None),
+            force_direct_file: Cell::new(false),
         }
     }
 
     /// If direct local-file playback applies, return the `file://` URI to hand to playbin.
-    /// Requires `DIRECT_FILE_ENV` on, a `Seekable` stream, a `file` scheme, and the target
-    /// file to exist; otherwise `None` (the servosrc path is used, byte-identical to before).
+    /// Requires a `Seekable` stream, a `file` scheme, an existing target file, and EITHER the
+    /// `DIRECT_FILE_ENV` knob OR the script-set `force_direct_file` hint (see `set_direct_file`,
+    /// used for non-standard containers). Otherwise `None` (the servosrc path is used).
     /// Logs the direct-mode entry, and a warning when a file:// resource is missing.
     fn resolve_direct_file_url(&self) -> Option<String> {
-        if !env_flag_enabled(DIRECT_FILE_ENV) || self.stream_type != StreamType::Seekable {
+        if !(env_flag_enabled(DIRECT_FILE_ENV) || self.force_direct_file.get())
+            || self.stream_type != StreamType::Seekable
+        {
             return None;
         }
         let raw = self.resource_url.borrow().clone()?;
@@ -1835,6 +1842,12 @@ impl Player for GStreamerPlayer {
         // Store the hint for `setup()` to consider (see `resolve_direct_file_url`). Must be
         // called before the first proxy call triggers `setup()`.
         *self.resource_url.borrow_mut() = Some(url.to_owned());
+    }
+
+    fn set_direct_file(&self, direct: bool) {
+        // Script-set preference for direct local-file playback (see `resolve_direct_file_url`).
+        // Must be set before the first proxy call triggers `setup()`.
+        self.force_direct_file.set(direct);
     }
 }
 

@@ -2450,10 +2450,15 @@ impl HTMLMediaElement {
                 // `NetworkUri` player created in `create_media_player`; there is
                 // no resource for Servo's network stack to fetch and push.
                 let direct_uri = pref!(dom_video_network_uri_enabled) && is_direct_uri_scheme(&url);
+                // Local file:// resources use direct playback (see `create_media_player`);
+                // GStreamer reads the file itself, so there is no need to fetch and push its
+                // bytes through Servo's network stack. readyState, metadata and events are
+                // driven by the GStreamer player, not the fetch.
+                let direct_local = is_direct_local(&url);
 
                 *self.resource_url.borrow_mut() = Some(url);
 
-                if !direct_uri {
+                if !direct_uri && !direct_local {
                     // Steps 5.remote.2-5.remote.8
                     self.fetch_request(None, None);
                 }
@@ -3054,6 +3059,12 @@ impl HTMLMediaElement {
             // resources; the backend ignores it unless the knob is on and the URL is a file.
             if let Resource::Url(ref url) = *resource {
                 player_guard.set_resource_url(url.as_str());
+                // Local file:// resources default to direct playback (see `is_direct_local`):
+                // the engine reads the file itself, far more robust seek/loop than the servosrc
+                // byte-push path. Gated by `media_local_direct_file` (on by default).
+                if is_direct_local(url) {
+                    player_guard.set_direct_file(true);
+                }
             }
 
             if let Err(error) = player_guard.set_mute(self.muted.get()) {
@@ -4502,6 +4513,16 @@ fn extended_container_allowed(type_: &str) -> bool {
 /// through Servo's network stack and pushed via AppSrc.
 fn is_direct_uri_scheme(url: &ServoUrl) -> bool {
     matches!(url.scheme(), "rtsp" | "rtsps")
+}
+
+/// True when the resource is a LOCAL `file://` and `media_local_direct_file` is on: such
+/// videos default to GStreamer direct local-file playback (the engine reads the file itself
+/// via `filesrc`) instead of the servosrc byte-push path. Seek/loop are far more robust when
+/// the engine owns the file source, no bytes round-trip through the script layer, and the file
+/// is read once. Applies to all containers (standard mp4/webm and non-standard alike); remote,
+/// blob and MediaSource resources are never local files and always use the servosrc path.
+fn is_direct_local(url: &ServoUrl) -> bool {
+    pref!(media_local_direct_file) && url.scheme() == "file"
 }
 
 #[derive(Debug, MallocSizeOf, PartialEq)]

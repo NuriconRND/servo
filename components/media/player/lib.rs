@@ -122,6 +122,12 @@ pub trait Player: Send + MediaInstance {
     /// directly instead of having the script layer push bytes). Must be called before the
     /// first operation that starts the pipeline. The default does nothing.
     fn set_resource_url(&self, _url: &str) {}
+    /// Hint that this resource should use direct local-file playback (the engine reads the
+    /// `file://` resource itself) regardless of any environment knob. Set by the script layer
+    /// for cases where the direct path is preferable (e.g. non-standard containers, whose seek
+    /// and loop behavior is more robust when the engine owns the file source). Must be called
+    /// before the first operation that starts the pipeline. The default does nothing.
+    fn set_direct_file(&self, _direct: bool) {}
     fn seekable(&self) -> Vec<Range<f64>>;
     fn set_mute(&self, muted: bool) -> Result<(), PlayerError>;
     fn muted(&self) -> bool;

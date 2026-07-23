@@ -325,6 +325,12 @@ pub struct Preferences {
     pub layout_writing_mode_enabled: bool,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
+    /// For a local `file://` `<video>`/`<audio>`, let the media engine read the file directly
+    /// (GStreamer `filesrc`) instead of fetching and pushing its bytes through Servo's network
+    /// stack. More robust seek/loop and no double disk read; bypasses the resource loader (no
+    /// CSP/`buffered`/progress integration), so it applies to local files only. On by default;
+    /// turn off to force the servosrc byte-push path (e.g. web-compat debugging).
+    pub media_local_direct_file: bool,
     /// Use generated media sources for getUserMedia() instead of host capture devices.
     pub media_capture_mocking_enabled: bool,
     /// Zero-based monitor index captured by `getDisplayMedia()` (-1 = primary monitor).
@@ -549,6 +555,7 @@ impl Preferences {
             media_screen_capture_show_cursor: true,
             media_screen_capture_window_title: String::new(),
             media_glvideo_enabled: false,
+            media_local_direct_file: true,
             media_testing_enabled: false,
             network_connection_timeout: 15,
             network_enforce_tls_enabled: false,
