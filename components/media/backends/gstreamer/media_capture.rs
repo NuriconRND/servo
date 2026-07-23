@@ -9,6 +9,7 @@ use servo_media_streams::MediaStreamType;
 use servo_media_streams::capture::*;
 use servo_media_streams::registry::MediaStreamId;
 
+use crate::device_id::{device_api, device_path, normalized_port_key};
 use crate::media_stream::GStreamerMediaStream;
 
 trait AddToCaps {
@@ -120,8 +121,9 @@ impl GstMediaDevices {
     pub fn get_track(
         &self,
         video: bool,
-        constraints: MediaTrackConstraintSet,
+        mut constraints: MediaTrackConstraintSet,
     ) -> Option<GstMediaTrack> {
+        let device_id = constraints.device_id.take();
         let (format, filter) = if video {
             ("video/x-raw", "Video/Source")
         } else {
@@ -133,14 +135,70 @@ impl GstMediaDevices {
         if let Some(f) = f {
             let _ = self.monitor.remove_filter(f);
         }
-        match devices.front() {
-            Some(d) => {
-                let element = d.create_element(None).ok()?;
-                Some(GstMediaTrack { element })
+        let device = match &device_id {
+            Some(requested) => {
+                let (ConstrainString::Exact(requested_id) | ConstrainString::Ideal(requested_id)) =
+                    requested;
+                select_device_by_id(devices.iter(), requested_id)?
             },
-            _ => None,
+            None => devices.front()?.clone(),
+        };
+        let element = device.create_element(None).ok()?;
+        Some(GstMediaTrack { element })
+    }
+}
+
+/// Resolve a requested deviceId (as returned by `enumerateDevices` — a
+/// mediafoundation `device.path`) to the `GstDevice` to open.
+///
+/// The same physical port is matched across provider APIs via
+/// `normalized_port_key`. When both providers expose it, prefer the winks
+/// (`ksvideosrc`) twin for the actual capture element (project decision:
+/// display = mediafoundation, capture = ksvideosrc), falling back to the
+/// mediafoundation device itself. No match at all fails the track — both
+/// Exact and Ideal — so a wrong port never opens silently (see design spec).
+fn select_device_by_id<'a>(
+    devices: impl Iterator<Item = &'a gstreamer::Device>,
+    requested_id: &str,
+) -> Option<gstreamer::Device> {
+    let requested_key = normalized_port_key(requested_id);
+    let mut mediafoundation_match = None;
+    let mut other_match = None;
+    let mut available = Vec::new();
+    for device in devices {
+        let Some(path) = device_path(device) else {
+            continue;
+        };
+        if normalized_port_key(&path) != requested_key {
+            available.push(path);
+            continue;
+        }
+        if device_api(device).as_deref() == Some("mediafoundation") {
+            mediafoundation_match = Some(device.clone());
+        } else {
+            other_match = Some(device.clone());
         }
     }
+    if other_match.is_none() && mediafoundation_match.is_some() {
+        log::warn!(
+            "getUserMedia: no ksvideosrc twin for deviceId {requested_id:?}; \
+             falling back to the mediafoundation device"
+        );
+    }
+    let selected = other_match.or(mediafoundation_match);
+    match &selected {
+        Some(device) => log::info!(
+            "getUserMedia: deviceId {:?} -> {:?} (api {:?})",
+            requested_id,
+            device.display_name().as_str(),
+            device_api(device).as_deref().unwrap_or("winks/other"),
+        ),
+        None => log::warn!(
+            "getUserMedia: no device matches deviceId {requested_id:?}; \
+             available device paths: {available:?}"
+        ),
+    }
+    selected
 }
 
 pub struct GstMediaTrack {
