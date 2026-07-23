@@ -19,9 +19,12 @@
   one. With no capture device: 0 videoinput + getUserMedia 0 tracks, but NO
   crash/abort (that alone confirms the capture plugins loaded).
 
-  NOTE: capture cards often expose several inputs with the same deviceId/label;
-  selecting a specific one needs deviceId constraint wiring (future work) — this
-  probe opens the first matching device ({ video: true }).
+  Select a specific port with ?device=<N|substring>: a decimal N opens the
+  N-th (0-based) videoinput from enumerateDevices(); anything else matches
+  case-insensitively against device labels. Selection opens with
+  { video: { deviceId: { exact: id } } }; no ?device keeps the legacy
+  { video: true } first-device behavior. A selector that matches nothing
+  fails loudly (no track) instead of silently opening another port.
 -->
 <html>
 <head>
@@ -62,8 +65,9 @@
       }
 
       // 1) enumerate
+      let devs = [];
       try {
-        const devs = (await navigator.mediaDevices.enumerateDevices())
+        devs = (await navigator.mediaDevices.enumerateDevices())
           .filter(d => d.kind === "videoinput");
         clog("enumerateDevices: " + devs.length + " videoinput");
         deviceLines = "videoinput devices: " + devs.length;
@@ -75,9 +79,26 @@
       } catch (e) { deviceLines = "enumerateDevices FAILED: " + e; }
       render();
 
-      // 2) open first videoinput
+      // 2) pick the port: ?device=<N|substring> (default: first device)
+      const sel = new URLSearchParams(location.search).get("device");
+      let constraints = { video: true };
+      if (sel !== null) {
+        const chosen = /^\d+$/.test(sel)
+          ? devs[Number(sel)]
+          : devs.find(d => (d.label || "").toLowerCase().includes(sel.toLowerCase()));
+        if (!chosen) {
+          liveLines = `NO videoinput matches ?device=${JSON.stringify(sel)}`;
+          clog(liveLines); render(); return;
+        }
+        constraints = { video: { deviceId: { exact: chosen.deviceId } } };
+        deviceLines += `\nselected: "${chosen.label}"\n  id=${chosen.deviceId}`;
+        clog(`selected device: label="${chosen.label}" id=${chosen.deviceId}`);
+        render();
+      }
+
+      // 3) open
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
         v.srcObject = stream;
         const track = stream.getVideoTracks()[0];
         let settings = {};
