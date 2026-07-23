@@ -253,11 +253,25 @@ impl GStreamerMediaStream {
         let videoconvert = gstreamer::ElementFactory::make("videoconvert")
             .build()
             .unwrap();
+        // Servo의 비디오 appsink는 I420만 받고(render.rs), servomediastreamsrc의
+        // I420 src pad 템플릿 요구는 proxysink/proxysrc 경계를 역전파하지 않는다
+        // (getDisplayMedia 캡처 빈에서 검증된 함정 — media_capture.rs 참조). 여기서
+        // I420을 고정하지 않으면 videoconvert가 passthrough로 협상해 카메라(YUY2 등)
+        // 스트림이 proxy 경계에서 "caps not accepted" → not-negotiated 스톨한다.
+        let i420_filter = gstreamer::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gstreamer::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .build(),
+            )
+            .build()
+            .unwrap();
         let queue = gstreamer::ElementFactory::make("queue").build().unwrap();
 
         register_stream(Arc::new(Mutex::new(GStreamerMediaStream::new(
             MediaStreamType::Video,
-            vec![source, videoconvert, queue],
+            vec![source, videoconvert, i420_filter, queue],
         ))))
     }
 
