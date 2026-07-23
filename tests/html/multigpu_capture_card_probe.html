@@ -14,6 +14,10 @@
   Run (wall fan-out):
     servoshell.exe --wall-layout ..\config\wall_layout.local_1x1.json --wall-all-tiles \
       --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_probe.html
+  NOTE: the layout JSON must match this branch's wall_layout schema —
+  config/wall_layout.local_1x1.json predates that schema and currently fails
+  to parse on this branch; use a branch-schema layout such as
+  wall_layout.local_3x1.branchschema.json instead.
 
   The HUD (top-left) lists every videoinput device and live stats for the opened
   one. With no capture device: 0 videoinput + getUserMedia 0 tracks, but NO

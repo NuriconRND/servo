@@ -89,3 +89,10 @@ MZ0380 4포트 캡처카드는 GstDeviceMonitor에 **총 8개 장치**로 잡힌
 - 네거티브: `?device=nonexistent-port` → `NO videoinput matches`, 백엔드 `getUserMedia` 호출 자체가 없음(로그 부재로 확인) — 페이지 단 선차단 정상.
 - 실행 조건: 이 브랜치 `config/wall_layout.local_1x1.json`의 `monitor` 스키마가 파싱 실패("monitor must be a non-negative integer") → `wall_layout.local_3x1.branchschema.json` 사용(3타일, 로그 목적상 문제없음). 콘솔 `console.log`는 stdout에 출력됨(`println!` 경로, headed_window.rs) — 백엔드 확인 로그(`getUserMedia: deviceId ...`)를 보려면 `RUST_LOG=warn,script=info,servo_media_gstreamer=info` 필요(그냥 `script=info`만으로는 media_capture.rs의 info! 로그가 안 잡힘).
 - 알려진 이슈(이번 변경과 무관): wall-all-tiles 모드에서 캡처카드 스트림이 열린 상태로 창을 닫으면(WM_CLOSE/CloseMainWindow) GStreamer 파이프라인 teardown이 12초+ 안 끝나 프로세스가 종료되지 않음(기존 메모리에 기록된 "teardown" 이슈와 일치). 매 실행마다 필요한 로그 라인을 프로세스가 살아있는 동안 파일에서 먼저 확인한 뒤 `Stop-Process -Force`로 회수함(데이터 손실 없음, 정상 종료 자체는 blocked).
+
+## 최종 리뷰 반영 (2026-07-23)
+
+- `select_device_by_id`에 display_name 폴백 티어 추가: `device.path`가 없는 장치(실측상 wasapi2 오디오 전부)는 enumerateDevices가 id로 label을 그대로 내보내므로, 그 id로 다시 열 수 있도록 label 완전일치 매칭 티어를 신설(경로 키 매칭이 항상 우선, id 왕복 보장). 이전에는 이 경로가 아예 스킵되어 오디오 deviceId 지정이 항상 트랙 0개였음(회귀).
+- `deviceId: ""`(빈 문자열)은 미지정으로 처리 — `deviceId: saved || ""` 같은 흔한 페이지 패턴이 fail-closed 되지 않도록 `convert_string_constraint`의 모든 추출 경로에서 빈 문자열을 필터링.
+- no-match `warn!` 로그에 폭/높이/프레임레이트 제약이 deviceId 매칭 전에 장치 목록을 사전필터한다는 주석을 추가(타이트한 caps + deviceId 조합이 대상 장치를 제외했을 가능성을 명시).
+- probe 러너 문서(`multigpu_capture_card_probe.html` 헤더)에 `wall_layout.local_1x1.json` 스키마 파싱 실패 및 브랜치 스키마 레이아웃 사용법 주석 보강.

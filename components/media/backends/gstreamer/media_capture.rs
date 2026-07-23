@@ -149,14 +149,27 @@ impl GstMediaDevices {
 }
 
 /// Resolve a requested deviceId (as returned by `enumerateDevices` — a
-/// mediafoundation `device.path`) to the `GstDevice` to open.
+/// mediafoundation `device.path`, or, for devices with no path at all, the
+/// verbatim `display_name` — see `device_monitor.rs::get_devices`) to the
+/// `GstDevice` to open.
 ///
-/// The same physical port is matched across provider APIs via
-/// `normalized_port_key`. When both providers expose it, prefer the winks
-/// (`ksvideosrc`) twin for the actual capture element (project decision:
-/// display = mediafoundation, capture = ksvideosrc), falling back to the
-/// mediafoundation device itself. No match at all fails the track — both
-/// Exact and Ideal — so a wrong port never opens silently (see design spec).
+/// Three tiers, tried in priority order:
+///   1. `other_match` — same physical port (via `normalized_port_key`),
+///      non-mediafoundation API (the winks/`ksvideosrc` twin, preferred for
+///      the actual capture element: project decision is display =
+///      mediafoundation, capture = ksvideosrc).
+///   2. `mediafoundation_match` — same port, mediafoundation API, used when
+///      no ksvideosrc twin exists for that port.
+///   3. `name_match` — the device exposes no `device.path` at all
+///      (empirically: every wasapi2 audio device on this machine), so
+///      enumeration handed out `display_name` as the id instead of a path;
+///      match that label verbatim (exact, case-sensitive) to preserve the
+///      id round-trip invariant from `device_id.rs`. `device_api()` is
+///      typically `None` for these devices.
+/// Path-key matches (tiers 1-2) always outrank a name match, since a path is
+/// a stronger identity than a display label. No match at all fails the
+/// track — both Exact and Ideal — so a wrong id never opens silently (see
+/// design spec).
 fn select_device_by_id<'a>(
     devices: impl Iterator<Item = &'a gstreamer::Device>,
     requested_id: &str,
@@ -164,9 +177,13 @@ fn select_device_by_id<'a>(
     let requested_key = normalized_port_key(requested_id);
     let mut mediafoundation_match = None;
     let mut other_match = None;
+    let mut name_match = None;
     let mut available = Vec::new();
     for device in devices {
         let Some(path) = device_path(device) else {
+            if name_match.is_none() && device.display_name().as_str() == requested_id {
+                name_match = Some(device.clone());
+            }
             continue;
         };
         if normalized_port_key(&path) != requested_key {
@@ -185,17 +202,19 @@ fn select_device_by_id<'a>(
              falling back to the mediafoundation device"
         );
     }
-    let selected = other_match.or(mediafoundation_match);
+    let selected = other_match.or(mediafoundation_match).or(name_match);
     match &selected {
         Some(device) => log::info!(
             "getUserMedia: deviceId {:?} -> {:?} (api {:?})",
             requested_id,
             device.display_name().as_str(),
-            device_api(device).as_deref().unwrap_or("winks/other"),
+            device_api(device).as_deref().unwrap_or("unknown"),
         ),
         None => log::warn!(
             "getUserMedia: no device matches deviceId {requested_id:?}; \
-             available device paths: {available:?}"
+             available device paths: {available:?} \
+             (width/height/framerate constraints pre-filter the device list; \
+             a matching device may have been excluded by caps)"
         ),
     }
     selected

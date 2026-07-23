@@ -202,18 +202,33 @@ fn convert_cdouble(js: &ConstrainDouble) -> Option<Constrain<f64>> {
     }
 }
 
+/// Web pages commonly pass `deviceId: saved || ""` to mean "no preference",
+/// so an empty string must behave like an absent deviceId (legacy
+/// first-device selection) rather than a literal id that fails to match any
+/// device. Every extraction path below filters out empty strings before
+/// they become a `Constrain::Value`/`ConstrainString`.
 fn convert_string_constraint(js: &ConstrainDOMString) -> Option<ConstrainString> {
     fn first(value: &StringOrStringSequence) -> Option<String> {
         match value {
-            StringOrStringSequence::String(s) => Some(s.to_string()),
-            StringOrStringSequence::StringSequence(seq) => seq.first().map(|s| s.to_string()),
+            StringOrStringSequence::String(s) => {
+                let s = s.to_string();
+                (!s.is_empty()).then_some(s)
+            },
+            StringOrStringSequence::StringSequence(seq) => {
+                seq.first().map(|s| s.to_string()).filter(|s| !s.is_empty())
+            },
         }
     }
     match js {
-        ConstrainDOMString::String(s) => Some(ConstrainString::Ideal(s.to_string())),
-        ConstrainDOMString::StringSequence(seq) => {
-            seq.first().map(|s| ConstrainString::Ideal(s.to_string()))
+        ConstrainDOMString::String(s) => {
+            let s = s.to_string();
+            (!s.is_empty()).then_some(ConstrainString::Ideal(s))
         },
+        ConstrainDOMString::StringSequence(seq) => seq
+            .first()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .map(ConstrainString::Ideal),
         ConstrainDOMString::ConstrainDOMStringParameters(params) => {
             if let Some(exact) = params.exact.as_ref().and_then(first) {
                 Some(ConstrainString::Exact(exact))
