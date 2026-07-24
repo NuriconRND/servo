@@ -19,8 +19,10 @@ pub(crate) struct WallLayout {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WallTile {
-    pub(crate) monitor: usize,
-    pub(crate) gpu: usize,
+    /// Spatial display index (top-left = 0, left→right then top→bottom). Resolved at
+    /// window-creation time against the DXGI display topology; the GPU that drives that
+    /// display is auto-assigned. The legacy `monitor` field is accepted as an alias.
+    pub(crate) display: usize,
     pub(crate) rect: Rect<i32, DeviceIndependentPixel>,
 }
 
@@ -179,11 +181,30 @@ fn parse_tiles(
 
     let mut parsed_tiles = Vec::with_capacity(tiles.len());
     for (index, tile) in tiles.iter().enumerate() {
-        let monitor = get_usize(tile, "monitor")?;
-        let gpu = get_usize(tile, "gpu")?;
+        let display = match get_usize(tile, "display") {
+            Ok(display) => display,
+            Err(_) => {
+                let monitor = get_usize(tile, "monitor").map_err(|_| {
+                    WallLayoutError::Invalid(format!(
+                        "tile {index} must have a 'display' (spatial index) field"
+                    ))
+                })?;
+                log::warn!(
+                    "wall tile {index}: 'monitor' is deprecated; use 'display' (spatial index, \
+                     top-left = 0)"
+                );
+                monitor
+            },
+        };
+        if tile.get("gpu").is_some() {
+            log::warn!(
+                "wall tile {index}: 'gpu' is ignored; the GPU is auto-assigned from the adapter \
+                 that drives the chosen display"
+            );
+        }
         let rect = get_rect(tile, "rect")?;
         validate_tile_rect(index, rect, virtual_viewport)?;
-        parsed_tiles.push(WallTile { monitor, gpu, rect });
+        parsed_tiles.push(WallTile { display, rect });
     }
     Ok(parsed_tiles)
 }
@@ -306,8 +327,8 @@ mod tests {
             r#"{
                 "virtualViewport": { "width": 7680, "height": 4320 },
                 "tiles": [
-                    { "monitor": 0, "gpu": 0, "rect": [0, 0, 3840, 2160] },
-                    { "monitor": 1, "gpu": 1, "rect": [3840, 0, 3840, 2160] }
+                    { "display": 0, "rect": [0, 0, 3840, 2160] },
+                    { "display": 1, "rect": [3840, 0, 3840, 2160] }
                 ],
                 "overlapPx": 32
             }"#,
@@ -316,6 +337,8 @@ mod tests {
 
         assert_eq!(layout.virtual_viewport, Size2D::new(7680, 4320));
         assert_eq!(layout.tiles.len(), 2);
+        assert_eq!(layout.tiles[0].display, 0);
+        assert_eq!(layout.tiles[1].display, 1);
         assert_eq!(layout.tiles[1].rect.origin, Point2D::new(3840, 0));
         assert_eq!(layout.overlap_px, 32);
     }
@@ -326,7 +349,7 @@ mod tests {
             r#"{
                 "virtualViewport": { "width": 100, "height": 100 },
                 "tiles": [
-                    { "monitor": 0, "gpu": 0, "rect": [90, 0, 20, 20] }
+                    { "display": 0, "rect": [90, 0, 20, 20] }
                 ]
             }"#,
         )
@@ -341,9 +364,9 @@ mod tests {
             r#"{
                 "virtualViewport": { "width": 5760, "height": 1080 },
                 "tiles": [
-                    { "monitor": 0, "gpu": 0, "rect": [0, 0, 1920, 1080] },
-                    { "monitor": 1, "gpu": 0, "rect": [1920, 0, 1920, 1080] },
-                    { "monitor": 2, "gpu": 0, "rect": [3840, 0, 1920, 1080] }
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [1920, 0, 1920, 1080] },
+                    { "display": 2, "rect": [3840, 0, 1920, 1080] }
                 ],
                 "overlapPx": 32
             }"#,
@@ -362,5 +385,34 @@ mod tests {
             layout.tile_render_rect(2).unwrap(),
             Rect::new(Point2D::new(3808, 0), Size2D::new(1952, 1080))
         );
+    }
+
+    #[test]
+    fn accepts_legacy_monitor_alias_and_ignores_gpu() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 1080 },
+                "tiles": [
+                    { "monitor": 2, "gpu": 7, "rect": [0, 0, 1920, 1080] },
+                    { "monitor": 0, "gpu": 3, "rect": [1920, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect("legacy monitor+gpu layout should still parse");
+
+        assert_eq!(layout.tiles[0].display, 2);
+        assert_eq!(layout.tiles[1].display, 0);
+    }
+
+    #[test]
+    fn rejects_tile_without_display_or_monitor() {
+        let error = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 1080 },
+                "tiles": [ { "rect": [0, 0, 1920, 1080] } ]
+            }"#,
+        )
+        .expect_err("tile without display/monitor should fail");
+        assert!(error.to_string().contains("display"));
     }
 }

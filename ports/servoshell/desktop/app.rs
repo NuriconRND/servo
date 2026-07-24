@@ -205,10 +205,9 @@ impl App {
                 continue;
             };
             info!(
-                "Wall tile {} plan: monitor {}, gpu {}, visible rect {:?}, render rect {:?}.",
+                "Wall tile {} plan: display {} (auto-GPU), visible rect {:?}, render rect {:?}.",
                 tile_index,
-                tile.monitor,
-                tile.gpu,
+                tile.display,
                 tile.rect,
                 layout.tile_render_rect(*tile_index)
             );

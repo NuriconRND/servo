@@ -22,12 +22,13 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, Cursor, DeviceIndependentIntRect,
     DeviceIndependentPixel, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint,
-    EmbedderControl, EmbedderControlId, ImeEvent, InputEvent, InputEventId, InputEventResult,
-    InputMethodControl, Key, KeyState, KeyboardEvent, Modifiers, MouseButton as ServoMouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NamedKey,
-    OffscreenRenderingContext, PermissionRequest, RenderingContext, ScreenGeometry, Theme,
-    TouchEvent, TouchEventType, TouchId, WebRenderDebugOption, WebView, WebViewId, WheelDelta,
-    WheelEvent, WheelMode, WindowRenderingContext, convert_rect_to_css_pixel,
+    DisplayTopology, EmbedderControl, EmbedderControlId, ImeEvent, InputEvent, InputEventId,
+    InputEventResult, InputMethodControl, Key, KeyState, KeyboardEvent, Modifiers,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
+    MouseMoveEvent, NamedKey, OffscreenRenderingContext, PermissionRequest, RenderingContext,
+    ScreenGeometry, Theme, TouchEvent, TouchEventType, TouchId, WebRenderDebugOption, WebView,
+    WebViewId, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
+    convert_rect_to_css_pixel, enumerate_display_topology, spatial_order,
 };
 use url::Url;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -164,50 +165,102 @@ impl HeadedWindow {
 
         let mut wall_tile_fullscreen = false;
         let mut wall_tile_monitor = None;
+        let mut wall_auto_gpu_index: Option<usize> = None;
         if let Some(layout) = &servoshell_preferences.wall_layout
             && let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
-            if let Some(target_monitor) = winit_window.available_monitors().nth(tile.monitor) {
-                let target_monitor_size = target_monitor.size();
-                let requested_physical_size = PhysicalSize::new(
-                    (inner_size.width as f64 * target_monitor.scale_factor()).round() as u32,
-                    (inner_size.height as f64 * target_monitor.scale_factor()).round() as u32,
-                );
-                info!(
-                    "Positioning fixed-size wall tile {} on monitor {} at {:?}.",
-                    servoshell_preferences.wall_tile_index,
-                    tile.monitor,
-                    target_monitor.position()
-                );
-                if requested_physical_size == target_monitor_size {
-                    info!(
-                        "Wall tile {} matches monitor {} size {:?}; using borderless fullscreen \
-                         for flip-model present eligibility.",
-                        servoshell_preferences.wall_tile_index, tile.monitor, target_monitor_size,
+            // Resolve the physical display topology once. `tile.display` is a spatial index
+            // (top-left = 0, row-major); place the window at that display's real desktop origin
+            // and bind its rendering context to the adapter that drives it. Fall back to the
+            // winit monitor index when topology is unavailable (non-no-wgl build / enumeration
+            // failed / index out of range).
+            let spatial: Vec<DisplayTopology> = spatial_order(&enumerate_display_topology());
+            let requested_physical_size = |scale: f64| {
+                PhysicalSize::new(
+                    (inner_size.width as f64 * scale).round() as u32,
+                    (inner_size.height as f64 * scale).round() as u32,
+                )
+            };
+            match spatial.get(tile.display) {
+                Some(disp) => {
+                    // Find the winit monitor whose desktop position matches this display's
+                    // origin, so the borderless-fullscreen path (which needs a winit monitor
+                    // handle) can still engage; fall back to positioning by raw coordinates.
+                    let matching_monitor = winit_window.available_monitors().find(|monitor| {
+                        let position = monitor.position();
+                        position.x == disp.left && position.y == disp.top
+                    });
+                    let scale = matching_monitor.as_ref().map_or_else(
+                        || winit_window.scale_factor(),
+                        |monitor| monitor.scale_factor(),
                     );
-                    winit_window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
-                        target_monitor.clone(),
-                    ))));
-                    wall_tile_fullscreen = true;
-                } else {
+                    let display_physical =
+                        PhysicalSize::new(disp.width.max(0) as u32, disp.height.max(0) as u32);
                     info!(
-                        "Wall tile {} requested physical size {:?}, monitor {} size {:?}; \
-                         keeping fixed-size windowed placement.",
+                        "Positioning wall tile {} on spatial display {} (desktop [{},{} {}x{}], \
+                         adapter {}).",
                         servoshell_preferences.wall_tile_index,
-                        requested_physical_size,
-                        tile.monitor,
-                        target_monitor_size,
+                        tile.display,
+                        disp.left,
+                        disp.top,
+                        disp.width,
+                        disp.height,
+                        disp.adapter_index,
                     );
-                    winit_window.set_outer_position(target_monitor.position());
-                }
-                wall_tile_monitor = Some(target_monitor);
-            } else {
-                warn!(
-                    "Wall tile {} requested monitor {}, but only {} monitor(s) are available.",
-                    servoshell_preferences.wall_tile_index,
-                    tile.monitor,
-                    winit_window.available_monitors().count()
-                );
+                    if let Some(monitor) = &matching_monitor
+                        && requested_physical_size(scale) == display_physical
+                    {
+                        info!(
+                            "Wall tile {} matches display {} size {:?}; using borderless \
+                             fullscreen for flip-model present eligibility.",
+                            servoshell_preferences.wall_tile_index, tile.display, display_physical,
+                        );
+                        winit_window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(
+                            Some(monitor.clone()),
+                        )));
+                        wall_tile_fullscreen = true;
+                    } else {
+                        winit_window.set_outer_position(PhysicalPosition::new(disp.left, disp.top));
+                    }
+                    wall_tile_monitor = matching_monitor;
+                    wall_auto_gpu_index = Some(disp.adapter_index);
+                },
+                None => {
+                    // Topology unavailable or display index out of range: fall back to the
+                    // legacy winit-monitor-nth placement and let surfman pick the default
+                    // adapter.
+                    if let Some(target_monitor) =
+                        winit_window.available_monitors().nth(tile.display)
+                    {
+                        let target_monitor_size = target_monitor.size();
+                        info!(
+                            "No DXGI topology for wall tile {}; falling back to winit monitor {} \
+                             at {:?}.",
+                            servoshell_preferences.wall_tile_index,
+                            tile.display,
+                            target_monitor.position(),
+                        );
+                        if requested_physical_size(target_monitor.scale_factor())
+                            == target_monitor_size
+                        {
+                            winit_window.set_fullscreen(Some(
+                                winit::window::Fullscreen::Borderless(Some(target_monitor.clone())),
+                            ));
+                            wall_tile_fullscreen = true;
+                        } else {
+                            winit_window.set_outer_position(target_monitor.position());
+                        }
+                        wall_tile_monitor = Some(target_monitor);
+                    } else {
+                        warn!(
+                            "Wall tile {} requested display {}, but only {} monitor(s) are \
+                             available and no DXGI topology was found.",
+                            servoshell_preferences.wall_tile_index,
+                            tile.display,
+                            winit_window.available_monitors().count(),
+                        );
+                    }
+                },
             }
         }
 
@@ -236,11 +289,9 @@ impl HeadedWindow {
         let window_handle = winit_window
             .window_handle()
             .expect("could not get window handle from window");
-        let requested_gpu_index = servoshell_preferences
-            .wall_layout
-            .as_ref()
-            .and_then(|layout| layout.tiles.get(servoshell_preferences.wall_tile_index))
-            .map(|tile| tile.gpu);
+        // The GPU is the adapter that drives the tile's spatial display (auto-assigned above);
+        // `None` when topology was unavailable, letting surfman pick the default adapter.
+        let requested_gpu_index = wall_auto_gpu_index;
         // On Windows, optionally pace frame production to the DWM composition clock (display
         // vsync) via DwmFlush instead of the default free-running paint timer. The timer
         // overshoots the refresh rate (~65fps on a 60Hz display) and beats against vsync, causing
@@ -307,10 +358,9 @@ impl HeadedWindow {
             let render_rect = layout
                 .tile_render_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
             info!(
-                "Wall tile {} monitor/gpu {}/{} visible rect {:?}, render rect {:?}",
+                "Wall tile {} display {} (auto-GPU) visible rect {:?}, render rect {:?}",
                 servoshell_preferences.wall_tile_index,
-                layout.tiles[servoshell_preferences.wall_tile_index].monitor,
-                layout.tiles[servoshell_preferences.wall_tile_index].gpu,
+                layout.tiles[servoshell_preferences.wall_tile_index].display,
                 visible_rect,
                 render_rect,
             );
@@ -752,12 +802,11 @@ impl HeadedWindow {
         };
 
         info!(
-            "Wall window present: window {:?} tile={} monitor={} gpu={} requested_gpu={:?} \
+            "Wall window present: window {:?} tile={} display={} requested_gpu={:?} \
              present_ms={:.3} window_size={:?}",
             self.winit_window.id(),
             self.wall_tile_index,
-            tile.monitor,
-            tile.gpu,
+            tile.display,
             self.window_rendering_context.requested_gpu_index(),
             present_duration.as_secs_f64() * 1000.0,
             self.window_rendering_context.size(),
