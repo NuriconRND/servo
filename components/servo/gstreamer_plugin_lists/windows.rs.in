@@ -3,6 +3,8 @@
 [
 // gst-plugins-bad
 "gstwasapi",
+// 오디오 입력 장치 열거(wasapi2 device provider) + 오디오 입출력 — 캡처카드 "Analog 0N Audio"
+"gstwasapi2",
 "gstd3d11",
 // 카메라/캡처카드 소스(getUserMedia) — 1.28.4.100 커스텀 winks가 1.22.8 ks_video assert 회피
 "gstmediafoundation",
