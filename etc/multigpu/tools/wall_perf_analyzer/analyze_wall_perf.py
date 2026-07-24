@@ -33,8 +33,9 @@ REPAINT_RE = re.compile(
     r"target_present_ms=(?P<target_present_ms>[0-9.]+)"
 )
 PRESENT_RE = re.compile(
-    r"Wall window present: .*? tile=(?P<tile>\d+) monitor=(?P<monitor>\d+) "
-    r"gpu=(?P<gpu>\d+) requested_gpu=(?P<requested_gpu>None|Some\((?P<requested_gpu_id>\d+)\)) "
+    r"Wall window present: .*? tile=(?P<tile>\d+) "
+    r"(?:display=(?P<display>\d+)|monitor=(?P<monitor>\d+) gpu=(?P<gpu>\d+)) "
+    r"requested_gpu=(?P<requested_gpu>None|Some\((?P<requested_gpu_id>\d+)\)) "
     r"present_ms=(?P<present_ms>[0-9.]+)"
 )
 FRAME_REQUEST_RE = re.compile(
@@ -735,11 +736,19 @@ def analyze_log(path: Path) -> LogSummary:
 
             if match := PRESENT_RE.search(line):
                 tile = match.group("tile")
-                gpu = match.group("gpu")
+                # New-format logs carry `display=N` (spatial display index); archived
+                # old-format logs carry `monitor=N gpu=N` instead. Prefer `display` when
+                # present, and fall back to the legacy `gpu` group so `tile_gpu_counts`
+                # aggregation keeps working against archived logs.
+                display = match.group("display")
+                if display is not None:
+                    tile_gpu_label = f"tile={tile},display={display}"
+                else:
+                    tile_gpu_label = f"tile={tile},gpu={match.group('gpu')}"
                 present_ms = float(match.group("present_ms"))
                 summary.window_present_ms.append(present_ms)
                 summary.window_present_ms_by_tile[tile].append(present_ms)
-                summary.tile_gpu_counts[f"tile={tile},gpu={gpu}"] += 1
+                summary.tile_gpu_counts[tile_gpu_label] += 1
                 summary.requested_gpu_counts[match.group("requested_gpu")] += 1
                 continue
 

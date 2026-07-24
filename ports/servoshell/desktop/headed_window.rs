@@ -28,7 +28,7 @@ use servo::{
     MouseMoveEvent, NamedKey, OffscreenRenderingContext, PermissionRequest, RenderingContext,
     ScreenGeometry, Theme, TouchEvent, TouchEventType, TouchId, WebRenderDebugOption, WebView,
     WebViewId, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
-    convert_rect_to_css_pixel, enumerate_display_topology, spatial_order,
+    convert_rect_to_css_pixel, dxgi_luid_for_gpu_index, enumerate_display_topology, spatial_order,
 };
 use url::Url;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
@@ -166,6 +166,7 @@ impl HeadedWindow {
         let mut wall_tile_fullscreen = false;
         let mut wall_tile_monitor = None;
         let mut wall_auto_gpu_index: Option<usize> = None;
+        let mut wall_requested_gpu_index: Option<usize> = None;
         if let Some(layout) = &servoshell_preferences.wall_layout
             && let Some(tile) = layout.tiles.get(servoshell_preferences.wall_tile_index)
         {
@@ -175,6 +176,44 @@ impl HeadedWindow {
             // winit monitor index when topology is unavailable (non-no-wgl build / enumeration
             // failed / index out of range).
             let spatial: Vec<DisplayTopology> = spatial_order(&enumerate_display_topology());
+            let have_topology = !spatial.is_empty();
+            // NOTE: window construction for the primary (tile 0) window happens before
+            // `servo.setup_logging()` runs in app.rs, so `log::` macros here are silently
+            // dropped for that tile. Use `eprintln!` so wall placement diagnostics are visible
+            // for every tile, not just tiles 1..N.
+            //
+            // Only tile 0 dumps the topology table: in `--wall-all-tiles` mode tile windows are
+            // always created in tile-index order (see `App::wall_tile_indices`), so tile 0 is
+            // reliably the first window; gating on the tile index avoids any cross-window shared
+            // state.
+            if servoshell_preferences.wall_tile_index == 0 {
+                if have_topology {
+                    eprintln!(
+                        "wall: Wall display topology ({} desktop display(s)):",
+                        spatial.len()
+                    );
+                    for (spatial_index, disp) in spatial.iter().enumerate() {
+                        eprintln!(
+                            "wall:   display {spatial_index}: {} rect[{},{} {}x{}] adapter {} \
+                             luid {:08x}:{:08x}",
+                            disp.device_name,
+                            disp.left,
+                            disp.top,
+                            disp.width,
+                            disp.height,
+                            disp.adapter_index,
+                            disp.luid.0,
+                            disp.luid.1,
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "wall: no DXGI display topology (non-Windows / non-no-wgl build, or \
+                         enumeration failed); falling back to winit monitor index for placement \
+                         and the default GPU"
+                    );
+                }
+            }
             let requested_physical_size = |scale: f64| {
                 PhysicalSize::new(
                     (inner_size.width as f64 * scale).round() as u32,
@@ -196,10 +235,6 @@ impl HeadedWindow {
                     );
                     let display_physical =
                         PhysicalSize::new(disp.width.max(0) as u32, disp.height.max(0) as u32);
-                    // NOTE: window construction for the primary (tile 0) window happens before
-                    // `servo.setup_logging()` runs in app.rs, so `log::` macros here are
-                    // silently dropped for that tile. Use `eprintln!` so wall placement
-                    // diagnostics are visible for every tile, not just tiles 1..N.
                     eprintln!(
                         "wall: Positioning wall tile {} on spatial display {} (desktop [{},{} \
                          {}x{}], adapter {}).",
@@ -211,11 +246,27 @@ impl HeadedWindow {
                         disp.height,
                         disp.adapter_index,
                     );
+                    // Cross-check that the adapter DXGI enumerated as driving this display is
+                    // still the same physical adapter surfman/ANGLE will bind to by index; a
+                    // mismatch means the adapter list shifted between topology enumeration and
+                    // rendering-context creation (e.g. a hot-plug or driver reorder).
+                    if let Some(luid) = dxgi_luid_for_gpu_index(disp.adapter_index)
+                        && luid != disp.luid
+                    {
+                        eprintln!(
+                            "wall: warning: tile {}: adapter {} LUID mismatch (topology \
+                             {:08x}:{:08x} vs rendering-context {:08x}:{:08x})",
+                            servoshell_preferences.wall_tile_index,
+                            disp.adapter_index,
+                            disp.luid.0,
+                            disp.luid.1,
+                            luid.0,
+                            luid.1,
+                        );
+                    }
                     if let Some(monitor) = &matching_monitor
                         && requested_physical_size(scale) == display_physical
                     {
-                        // See NOTE above: `eprintln!` because logging isn't initialized yet
-                        // when the primary (tile 0) window is constructed.
                         eprintln!(
                             "wall: Wall tile {} matches display {} size {:?}; using borderless \
                              fullscreen for flip-model present eligibility.",
@@ -234,16 +285,24 @@ impl HeadedWindow {
                 None => {
                     // Topology unavailable or display index out of range: fall back to the
                     // legacy winit-monitor-nth placement and let surfman pick the default
-                    // adapter.
+                    // adapter. `tile.display` here is being consumed as a winit MONITOR index
+                    // (not a spatial index) purely because that's the best fallback available.
+                    if have_topology {
+                        eprintln!(
+                            "wall: warning: tile {}: display index {} out of range ({} \
+                             display(s)); using winit monitor fallback",
+                            servoshell_preferences.wall_tile_index,
+                            tile.display,
+                            spatial.len(),
+                        );
+                    }
                     if let Some(target_monitor) =
                         winit_window.available_monitors().nth(tile.display)
                     {
                         let target_monitor_size = target_monitor.size();
-                        // See NOTE above: `eprintln!` because logging isn't initialized yet
-                        // when the primary (tile 0) window is constructed.
                         eprintln!(
-                            "wall: No DXGI topology for wall tile {}; falling back to winit \
-                             monitor {} at {:?}.",
+                            "wall: Positioning wall tile {} on winit monitor index {} at {:?} \
+                             (not a spatial index).",
                             servoshell_preferences.wall_tile_index,
                             tile.display,
                             target_monitor.position(),
@@ -260,17 +319,24 @@ impl HeadedWindow {
                         }
                         wall_tile_monitor = Some(target_monitor);
                     } else {
-                        // See NOTE above: `eprintln!` because logging isn't initialized yet
-                        // when the primary (tile 0) window is constructed.
                         eprintln!(
-                            "wall: Wall tile {} requested display {}, but only {} monitor(s) \
-                             are available and no DXGI topology was found.",
+                            "wall: Wall tile {} requested winit monitor index {}, but only {} \
+                             monitor(s) are available.",
                             servoshell_preferences.wall_tile_index,
                             tile.display,
                             winit_window.available_monitors().count(),
                         );
                     }
                 },
+            }
+            // An explicit `gpu` in the layout JSON always wins over the auto-assigned adapter,
+            // in both the topology-hit and fallback paths above.
+            wall_requested_gpu_index = tile.gpu_override.or(wall_auto_gpu_index);
+            if let Some(gpu_override) = tile.gpu_override {
+                eprintln!(
+                    "wall: tile {}: 'gpu' override -> adapter {} (auto-GPU would have used {:?})",
+                    servoshell_preferences.wall_tile_index, gpu_override, wall_auto_gpu_index,
+                );
             }
         }
 
@@ -299,9 +365,10 @@ impl HeadedWindow {
         let window_handle = winit_window
             .window_handle()
             .expect("could not get window handle from window");
-        // The GPU is the adapter that drives the tile's spatial display (auto-assigned above);
-        // `None` when topology was unavailable, letting surfman pick the default adapter.
-        let requested_gpu_index = wall_auto_gpu_index;
+        // The GPU is the adapter that drives the tile's spatial display (auto-assigned above),
+        // unless the layout's `gpu` explicitly overrides it; `None` when topology was
+        // unavailable and no override was given, letting surfman pick the default adapter.
+        let requested_gpu_index = wall_requested_gpu_index;
         // On Windows, optionally pace frame production to the DWM composition clock (display
         // vsync) via DwmFlush instead of the default free-running paint timer. The timer
         // overshoots the refresh rate (~65fps on a 60Hz display) and beats against vsync, causing

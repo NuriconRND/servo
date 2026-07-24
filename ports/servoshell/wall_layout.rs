@@ -24,6 +24,10 @@ pub(crate) struct WallTile {
     /// display is auto-assigned. The legacy `monitor` field is accepted as an alias.
     pub(crate) display: usize,
     pub(crate) rect: Rect<i32, DeviceIndependentPixel>,
+    /// Explicit GPU adapter override. When present, this wins over the auto-assigned adapter
+    /// that drives `display` (e.g. to deliberately render a tile on a GPU that does NOT drive
+    /// its display, for cross-GPU testing). `None` keeps the default auto-GPU behavior.
+    pub(crate) gpu_override: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -199,16 +203,24 @@ fn parse_tiles(
                 monitor
             },
         };
-        if tile.get("gpu").is_some() {
+        let gpu_override = if tile.get("gpu").is_some() {
+            let gpu = get_usize(tile, "gpu")?;
             // See NOTE above: `eprintln!` because logging isn't initialized yet at parse time.
             eprintln!(
-                "wall layout: wall tile {index}: 'gpu' is ignored; the GPU is auto-assigned \
-                 from the adapter that drives the chosen display"
+                "wall layout: wall tile {index}: 'gpu' overrides the auto-assigned adapter \
+                 (auto-GPU picks the adapter that drives display {display})"
             );
-        }
+            Some(gpu)
+        } else {
+            None
+        };
         let rect = get_rect(tile, "rect")?;
         validate_tile_rect(index, rect, virtual_viewport)?;
-        parsed_tiles.push(WallTile { display, rect });
+        parsed_tiles.push(WallTile {
+            display,
+            rect,
+            gpu_override,
+        });
     }
     Ok(parsed_tiles)
 }
@@ -392,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_monitor_alias_and_ignores_gpu() {
+    fn accepts_legacy_monitor_alias_and_honors_gpu_override() {
         let layout = WallLayout::from_json_str(
             r#"{
                 "virtualViewport": { "width": 3840, "height": 1080 },
@@ -405,7 +417,26 @@ mod tests {
         .expect("legacy monitor+gpu layout should still parse");
 
         assert_eq!(layout.tiles[0].display, 2);
+        assert_eq!(layout.tiles[0].gpu_override, Some(7));
         assert_eq!(layout.tiles[1].display, 0);
+        assert_eq!(layout.tiles[1].gpu_override, Some(3));
+    }
+
+    #[test]
+    fn display_schema_tile_without_gpu_has_no_override() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 1080 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [1920, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect("display-schema layout should parse");
+
+        assert_eq!(layout.tiles[0].gpu_override, None);
+        assert_eq!(layout.tiles[1].gpu_override, None);
     }
 
     #[test]

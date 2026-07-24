@@ -47,7 +47,7 @@ pub use net_traits::pub_domains::is_reg_domain;
 pub use paint::WebRenderDebugOption;
 pub use paint_api::rendering_context::{
     DisplayTopology, OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext,
-    WindowRenderingContext, enumerate_display_topology, spatial_order,
+    WindowRenderingContext, dxgi_luid_for_gpu_index, enumerate_display_topology, spatial_order,
 };
 // Expose our profile traits for servoshell, so we can instrument code there, but don't
 // add it as an official API.
