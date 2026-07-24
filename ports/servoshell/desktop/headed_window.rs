@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::env;
 use std::rc::Rc;
+use std::sync::Once;
 use std::time::Duration;
 
 use euclid::{
@@ -63,6 +64,13 @@ use crate::window::{
 };
 
 pub(crate) const INITIAL_WINDOW_TITLE: &str = "Servo";
+
+/// Ensures the one-time DXGI wall display topology dump (and its "no topology" fallback
+/// message) prints exactly once per process, regardless of which wall tile window is created
+/// first. `--wall-all-tiles` creates tile 0 first, but single-tile preview mode
+/// (`--wall-tile-index N` without `--wall-all-tiles`) creates only the requested tile, which may
+/// be non-zero -- a `wall_tile_index == 0` gate would never fire in that mode.
+static WALL_TOPOLOGY_DUMP_ONCE: Once = Once::new();
 
 pub struct HeadedWindow {
     /// The egui interface that is responsible for showing the user interface elements of
@@ -182,11 +190,14 @@ impl HeadedWindow {
             // dropped for that tile. Use `eprintln!` so wall placement diagnostics are visible
             // for every tile, not just tiles 1..N.
             //
-            // Only tile 0 dumps the topology table: in `--wall-all-tiles` mode tile windows are
-            // always created in tile-index order (see `App::wall_tile_indices`), so tile 0 is
-            // reliably the first window; gating on the tile index avoids any cross-window shared
-            // state.
-            if servoshell_preferences.wall_tile_index == 0 {
+            // The topology table (and its "no topology" fallback message) should print exactly
+            // once per process, not once per tile window. It used to be gated on
+            // `wall_tile_index == 0` on the assumption that `--wall-all-tiles` always creates
+            // tile 0 first, but single-tile preview mode (`--wall-tile-index N` without
+            // `--wall-all-tiles`) creates exactly one window at the requested (possibly
+            // non-zero) index, so that gate silently never fired. A process-level `Once` prints
+            // it exactly once regardless of which tile index is created first, in both modes.
+            WALL_TOPOLOGY_DUMP_ONCE.call_once(|| {
                 if have_topology {
                     eprintln!(
                         "wall: Wall display topology ({} desktop display(s)):",
@@ -213,7 +224,7 @@ impl HeadedWindow {
                          and the default GPU"
                     );
                 }
-            }
+            });
             let requested_physical_size = |scale: f64| {
                 PhysicalSize::new(
                     (inner_size.width as f64 * scale).round() as u32,
@@ -434,10 +445,21 @@ impl HeadedWindow {
                 layout.tile_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
             let render_rect = layout
                 .tile_render_device_rect(servoshell_preferences.wall_tile_index, hidpi_factor);
+            // Report the actually-resolved GPU (already computed above into
+            // `requested_gpu_index`) and whether it came from an explicit `gpu` override in the
+            // layout JSON or from the spatial-display auto-assignment, instead of unconditionally
+            // claiming "(auto-GPU)" -- which lies whenever `gpu_override` is set.
+            let tile = &layout.tiles[servoshell_preferences.wall_tile_index];
+            let gpu_label = match (requested_gpu_index, tile.gpu_override) {
+                (Some(gpu), Some(_)) => format!("gpu=Some({gpu}) (override)"),
+                (Some(gpu), None) => format!("gpu=Some({gpu}) (auto)"),
+                (None, _) => "gpu=None (default adapter)".to_string(),
+            };
             info!(
-                "Wall tile {} display {} (auto-GPU) visible rect {:?}, render rect {:?}",
+                "Wall tile {} display {} {} visible rect {:?}, render rect {:?}",
                 servoshell_preferences.wall_tile_index,
-                layout.tiles[servoshell_preferences.wall_tile_index].display,
+                tile.display,
+                gpu_label,
                 visible_rect,
                 render_rect,
             );
