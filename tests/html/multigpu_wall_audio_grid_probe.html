@@ -1,0 +1,107 @@
+<!doctype html>
+<!--
+  IP-wall 스타일 타일별 오디오 선택 probe (2x2 그리드).
+  4소스: 파일(?file=URL) / RTSP(?rtsp=URL) / 캡처(?capvid=<deviceId>&capaud=<deviceId>) /
+  WebRTC(?signaling=ws://host:port). 각 타일에 체크박스 "🔊 audio" — 체크 시 그 <video>.muted=false.
+  가산(독립): 여러 타일 동시 언뮤트 가능(OS 믹싱). 초기 전부 muted.
+  Servo는 autoplay-with-sound를 강제하지 않으므로 script muted=false가 제스처 없이 동작.
+
+  Run (wall):
+    servoshell.exe --wall-layout <layout> --wall-all-tiles --pref dom_webrtc_enabled=true \
+      --pref dom_webrtc_transceiver_enabled=true \
+      "file:///W:/.../tests/html/multigpu_wall_audio_grid_probe.html?file=file:///W:/.../clip.mp4&rtsp=rtsp://127.0.0.1:8554/test"
+-->
+<html lang="en"><head><meta charset="utf-8"><title>Wall audio grid probe</title>
+<style>
+  html,body{margin:0;background:#0b0d12;color:#e8e8f0;font-family:system-ui,sans-serif}
+  #grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;
+        width:100vw;height:100vh;box-sizing:border-box;padding:8px}
+  .tile{position:relative;background:#111;border:2px solid #2a3350;border-radius:8px;overflow:hidden;
+        display:flex;align-items:center;justify-content:center}
+  .tile video{width:100%;height:100%;object-fit:contain;background:#000}
+  .bar{position:absolute;left:0;top:0;right:0;display:flex;justify-content:space-between;
+       align-items:center;padding:6px 10px;background:rgba(0,0,0,.6);font:14px/1.2 monospace;z-index:2}
+  .bar b{color:#6cf}
+  label.aud{cursor:pointer;user-select:none;padding:3px 8px;border-radius:6px;background:#233;color:#9fd}
+  label.aud input{vertical-align:middle}
+  .st{position:absolute;left:0;bottom:0;right:0;padding:4px 10px;background:rgba(0,0,0,.55);
+      font:12px/1.3 monospace;color:#9aa;z-index:2;white-space:pre}
+</style></head>
+<body>
+<div id="grid">
+  <div class="tile" id="t-file">
+    <div class="bar"><b>FILE</b><label class="aud"><input type="checkbox" data-for="file"> 🔊 audio</label></div>
+    <video id="v-file" autoplay muted playsinline loop></video>
+    <div class="st" id="s-file">file: idle</div>
+  </div>
+  <div class="tile" id="t-rtsp">
+    <div class="bar"><b>RTSP</b><label class="aud"><input type="checkbox" data-for="rtsp"> 🔊 audio</label></div>
+    <video id="v-rtsp" autoplay muted playsinline></video>
+    <div class="st" id="s-rtsp">rtsp: idle</div>
+  </div>
+  <div class="tile" id="t-cap">
+    <div class="bar"><b>CAPTURE</b><label class="aud"><input type="checkbox" data-for="cap"> 🔊 audio</label></div>
+    <video id="v-cap" autoplay muted playsinline></video>
+    <div class="st" id="s-cap">capture: idle</div>
+  </div>
+  <div class="tile" id="t-wrtc">
+    <div class="bar"><b>WEBRTC</b><label class="aud"><input type="checkbox" data-for="wrtc"> 🔊 audio</label></div>
+    <video id="v-wrtc" autoplay muted playsinline></video>
+    <div class="st" id="s-wrtc">webrtc: idle</div>
+  </div>
+</div>
+<script>
+  const P = new URLSearchParams(location.search);
+  const setStatus = (id,msg) => { const e=document.getElementById("s-"+id); if(e) e.textContent = id+": "+msg; };
+  const clog = (id,msg) => console.log(`[audio-grid][${id}] ${msg}`);
+
+  // --- per-tile additive audio toggle (the selection model) ---
+  document.querySelectorAll("label.aud input").forEach(cb => {
+    cb.addEventListener("change", () => {
+      const id = cb.getAttribute("data-for");
+      const v = document.getElementById("v-"+id);
+      if (!v) return;
+      v.muted = !cb.checked;               // checked = audible
+      clog(id, "audio " + (cb.checked ? "ON (muted=false)" : "OFF (muted=true)"));
+    });
+  });
+
+  // --- FILE tile: <video src> ---
+  (function(){
+    const url = P.get("file");
+    const v = document.getElementById("v-file");
+    if (!url) { setStatus("file","(no ?file= param)"); return; }
+    v.src = url;
+    v.addEventListener("loadedmetadata", () => setStatus("file", v.videoWidth+"x"+v.videoHeight));
+    v.addEventListener("playing", () => clog("file","playing t="+v.currentTime.toFixed(2)));
+    v.addEventListener("error", () => { setStatus("file","error"); clog("file","error"); });
+    setInterval(()=>setStatus("file", `${v.videoWidth}x${v.videoHeight} t=${v.currentTime.toFixed(1)} muted=${v.muted}`), 1000);
+  })();
+
+  // --- RTSP tile: <video src=rtsp://> ---
+  (function(){
+    const url = P.get("rtsp");
+    const v = document.getElementById("v-rtsp");
+    if (!url) { setStatus("rtsp","(no ?rtsp= param)"); return; }
+    v.src = url;
+    v.addEventListener("loadedmetadata", () => setStatus("rtsp", v.videoWidth+"x"+v.videoHeight));
+    v.addEventListener("playing", () => clog("rtsp","playing t="+v.currentTime.toFixed(2)));
+    v.addEventListener("error", () => { setStatus("rtsp","error"); clog("rtsp","error"); });
+    setInterval(()=>setStatus("rtsp", `${v.videoWidth}x${v.videoHeight} t=${v.currentTime.toFixed(1)} muted=${v.muted}`), 1000);
+  })();
+
+  // --- CAPTURE tile: filled in Task 3 ---
+  window.__startCapture = null;
+  if (P.get("capvid") || P.get("capaud")) {
+    if (window.__startCapture) window.__startCapture(P);
+    else setStatus("cap","(capture wiring pending — Task 3)");
+  } else setStatus("cap","(no ?capvid=/?capaud= param)");
+
+  // --- WEBRTC tile: filled in Task 4 ---
+  window.__startWebrtc = null;
+  if (P.get("signaling")) {
+    if (window.__startWebrtc) window.__startWebrtc(P);
+    else setStatus("wrtc","(webrtc wiring pending — Task 4)");
+  } else setStatus("wrtc","(no ?signaling= param)");
+</script>
+</body></html>
