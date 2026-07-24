@@ -255,23 +255,6 @@ fn disable_pipeline_audio_sink(
     Ok(())
 }
 
-fn restore_pipeline_audio_sink(
-    pipeline: &gstreamer::Element,
-    reason: &str,
-) -> Result<(), PlayerError> {
-    let audio_sink = gstreamer::ElementFactory::make("autoaudiosink")
-        .build()
-        .map_err(|error| {
-            PlayerError::Backend(format!("autoaudiosink creation failed: {error:?}"))
-        })?;
-    pipeline.set_property("audio-sink", &audio_sink);
-    log::info!(
-        "GStreamer audio sink restored: reason={} sink=autoaudiosink",
-        reason,
-    );
-    Ok(())
-}
-
 impl VideoSampleDiagnostics {
     fn note_sample(&mut self, sample: &gstreamer::Sample) {
         let now = Instant::now();
@@ -447,7 +430,6 @@ struct PlayerInner {
     can_resume: Cell<bool>,
     playback_rate: Cell<f64>,
     muted: Cell<bool>,
-    custom_audio_renderer: bool,
     volume: Cell<f64>,
     stream_type: StreamType,
     last_metadata: Option<Metadata>,
@@ -621,14 +603,12 @@ impl PlayerInner {
         self.player.set_mute(muted);
         let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
         let audio_track_enabled = !muted && !env_audio_disabled;
+        // Mute via GstPlay's reversible controls only: the `mute` property plus audio-track
+        // (de)selection. Do NOT swap the `audio-sink` element at runtime — playbin3 links
+        // `audio-sink` at preroll, so a live restore->autoaudiosink swap fails to re-link the
+        // audio branch, leaving audio dead after an unmute (mute becomes irreversible). The
+        // construction-time DISABLE_AUDIO_ENV fakesink (set before PLAYING) is unaffected.
         self.player.set_audio_track_enabled(audio_track_enabled);
-        if !self.custom_audio_renderer {
-            if muted || env_audio_disabled {
-                disable_pipeline_audio_sink(&self.player.pipeline(), "muted")?;
-            } else {
-                restore_pipeline_audio_sink(&self.player.pipeline(), "unmuted")?;
-            }
-        }
         log::info!(
             "GStreamer mute state updated: muted={} audio_track_enabled={}",
             muted,
@@ -1232,7 +1212,6 @@ impl GStreamerPlayer {
             can_resume: Cell::new(DEFAULT_CAN_RESUME),
             playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
             muted: Cell::new(DEFAULT_MUTED),
-            custom_audio_renderer: self.audio_renderer.is_some(),
             volume: Cell::new(DEFAULT_VOLUME),
             stream_type: self.stream_type,
             last_metadata: None,
@@ -1523,12 +1502,9 @@ impl GStreamerPlayer {
             inner.last_metadata = Some(metadata.clone());
             let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
             let audio_track_enabled = !inner.muted.get() && !env_audio_disabled;
+            // Apply the initial mute state via audio-track selection only — no runtime
+            // audio-sink swap (see set_mute: a live sink swap is irreversible on playbin3).
             inner.player.set_audio_track_enabled(audio_track_enabled);
-            if !inner.custom_audio_renderer {
-                if inner.muted.get() || env_audio_disabled {
-                    let _ = disable_pipeline_audio_sink(&inner.player.pipeline(), "muted");
-                }
-            }
             gstreamer::info!(
                 inner.cat,
                 obj = &inner.player,
