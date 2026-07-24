@@ -119,3 +119,37 @@ fan-out되지만 오디오 sink는 논리 파이프라인당 1개.
 - autoplay-with-audio 정책 pref(Servo가 미강제라 불필요).
 - video↔audio 자동 페어링(오디오는 수동 deviceId).
 - 배타(라디오) 선택 모드, 오디오 레벨/게인 UI, 채널 라우팅.
+
+## 검증 결과 / 마무리 (2026-07-24)
+
+**최대 성과 — 근본 버그 수정(mute→unmute 미복원)**: 구현 착수 후 `set_mute`가 재생 중
+playbin3의 `audio-sink`를 fakesink↔autoaudiosink로 런타임 스왑(커밋 be2148a68cb 도입)하던
+결함을 발견. playbin은 `audio-sink`를 preroll에만 링크하므로 unmute의 restore 스왑이
+오디오 브랜치를 재링크하지 못해 소리가 복원되지 않았음. 수정(commit 34681fef9b4): 런타임
+스왑 제거, GstPlay `set_mute` 속성 + `set_audio_track_enabled`(가역)만 사용. **사용자 release
+빌드 청각 검증 PASS**(mute→무음→unmute→소리 복원, 토글 반복 정상). 이 수정이 타일별 오디오
+선택 모델 전체의 전제.
+
+**경로별 결과 (4 중 3 동작)**:
+- **로컬 파일**: `Wildlife…mp4`(AAC) 가청, mute 토글 가역 — 사용자 검증 PASS.
+- **RTSP**: 오디오 인프라 동일(playbin), 파일과 같은 경로 — 오디오 있는 RTSP 소스로 동작 예상.
+- **캡처카드**: `getUserMedia({video:{deviceId}, audio:{deviceId}})`로 audio=1 확인
+  ("MZ0380 PCI, Analog 04 Audio"→wasapi2sink까지 파이프라인 구성, negotiation stall 없음,
+  caps 수정 불요). 청각·동기는 사용자 확인 대기.
+- **WebRTC**: ❌ 엔진 갭으로 이월. 프로듀서(`videotestsrc + audiotestsrc ! webrtcsink`)가
+  **OPUS 오디오를 실제로 오퍼**함을 SDP로 확정(`a=rtpmap:101 OPUS/48000/2`, BUNDLE
+  `video0 audio1`) — 소스 문제 아님. Servo answer가 recvonly audio 트랜시버를 BUNDLE에
+  붙이는데도 **오디오 트랙이 JS로 전달되지 않음**(`ontrack video (v=1 a=0)`). 원인 후보:
+  answer의 audio m-line rtpmap 완전성 / webrtcbin의 2번째(audio) 수신 pad·decodebin 생성 /
+  트랙→MediaStream 배선. **사용자 결정: 별도 엔진 집중 세션으로 이월**, 이번 4-경로 범위에선
+  3/4 완료로 마무리.
+
+**enabler**: `gstwasapi2` 1줄 등록으로 오디오 입력 장치 열거 복구(audioinput=9, 캡처카드
+Analog 01-04 Audio 전부 구분). commit 76bf45de71b.
+
+**deliverable**: `tests/html/multigpu_wall_audio_grid_probe.html` — 4타일 그리드 + 타일별
+가산(체크박스) 오디오 토글. 파일/RTSP/캡처 타일 배선 완료, WebRTC 타일은 트랙 누적 배선
+완료(수신측 엔진 갭으로 오디오만 미도달).
+
+**이월 이슈(무관)**: debug 빌드는 월 + 동적 `<video src>`에서 `MakeCurrentFailed`
+(surfman/ANGLE)로 크래시 — release 빌드는 정상. 이번 오디오 작업과 무관한 선재 렌더 이슈.
