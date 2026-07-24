@@ -83,14 +83,25 @@ Phase 0 寃利???ぉ??紐⑤몢 ?듦낵?댁빞 Phase 1濡?吏꾪뻾?쒕떎.
 {
   "virtualViewport": { "width": 7680, "height": 4320 },
   "tiles": [
-    { "monitor": 0, "gpu": 0, "rect": [0, 0, 3840, 2160] },
-    { "monitor": 1, "gpu": 1, "rect": [3840, 0, 3840, 2160] },
-    { "monitor": 2, "gpu": 2, "rect": [0, 2160, 3840, 2160] },
-    { "monitor": 3, "gpu": 3, "rect": [3840, 2160, 3840, 2160] }
+    { "display": 0, "rect": [0, 0, 3840, 2160] },
+    { "display": 1, "rect": [3840, 0, 3840, 2160] },
+    { "display": 2, "rect": [0, 2160, 3840, 2160] },
+    { "display": 3, "rect": [3840, 2160, 3840, 2160] }
   ],
   "overlapPx": 32
 }
 ```
+
+(2026-07-24 update) `display` is a **spatial** display index (top-left = 0, left→right then
+top→bottom), resolved at window-creation time against the DXGI display topology; the GPU that
+drives that display is auto-assigned automatically — there is normally no need to name a GPU at
+all. The old `monitor` field name (a non-spatial, platform-dependent `winit`
+`available_monitors().nth()` index) is still accepted as a **deprecated alias** for `display`.
+`gpu` is now an **optional explicit override**: when present it wins over the auto-assigned
+adapter, e.g. to deliberately render a tile on a GPU that does not drive its own display (useful
+for cross-GPU testing, see `etc/multigpu/config/wall_layout.test_2x1_gpu1.json`). The default
+(recommended) path omits `gpu` entirely and lets auto-GPU pick the adapter that drives each
+tile's `display`.
 
 ### Verification
 

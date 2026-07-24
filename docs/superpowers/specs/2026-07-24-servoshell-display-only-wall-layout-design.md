@@ -166,3 +166,67 @@ config `display` → `WallTile.display` → `HeadedWindow::new`가 토폴로지 
   확인 — §"알려진 로깅 갭"에서 "간접 확인"에 그쳤던 tile 0 진단이 이제 직접 관측됨.
   `cargo test -p servoshell wall_layout --lib` 5/5 유지, `cargo build -p servoshell`
   exit 0.
+
+## 전체 브랜치 최종 리뷰 후속 수정 (2026-07-24, 5건)
+
+최종 리뷰(HEAD `283af6d5141`)에서 지적된 5개 이슈를 모두 수정.
+
+- **I2 — `gpu` 명시 override 부활**: 이전 수정에서 `gpu` 필드를 "무시하고 경고만" 했던
+  것을 사용자 결정에 따라 뒤집었다 — **기본은 여전히 auto-GPU**(display가 구동하는
+  adapter 자동 선택)이지만, layout JSON에 `gpu`가 있으면 그 값이 auto-GPU보다 **우선**한다.
+  `WallTile`에 `gpu_override: Option<usize>` 필드 추가, `headed_window.rs`의
+  `requested_gpu_index`는 `tile.gpu_override.or(wall_auto_gpu_index)`로 계산되며 topology
+  hit/fallback 두 경로 모두에서 적용된다. 이걸 되살린 이유: `etc/multigpu/config/
+  wall_layout.test_2x1_gpu1.json` + `etc/multigpu/tools/verify_gpu_fanout.ps1`가 "타일의
+  display를 구동하지 않는 GPU에 일부러 렌더링"하는 교차-GPU 테스트 용도라 auto-GPU만으로는
+  이 시나리오를 표현할 수 없었음(이전 수정이 이 config를 조용히 무효화시켰던 것이 I2 지적
+  사항). 런타임 검증: 레거시 `test_2x1_gpu1.json`(2타일, `gpu:1`) 스모크에서
+  `wall: tile N: 'gpu' override -> adapter 1 (auto-GPU would have used Some(0))` 및 모든
+  `Wall window present` 라인의 `requested_gpu=Some(1)`을 확인 — 이 개발 머신의 2번째
+  GPU(출력 없는 A4000)에서도 실제로 렌더+present가 성공함(present_ms 정상값, panic 0).
+- **I1 — perf 분석기 present 정규식 복구**: `analyze_wall_perf.py`의 `PRESENT_RE`가
+  옛 포맷(`monitor=N gpu=N`)만 인식해 새 포맷(`display=N`) 로그에서 매치 0건이었던 문제.
+  `(?:display=(?P<display>\d+)|monitor=(?P<monitor>\d+) gpu=(?P<gpu>\d+))`로 두 포맷 모두
+  선택적으로 매치하도록 수정, `tile_gpu_counts` 집계는 `display` 우선·`gpu` 폴백으로
+  키를 구성해 아카이브 로그 호환을 유지. 새 포맷 스모크 로그(2038건)와 레거시 아카이브
+  로그(`video6x6.release.long.err.log`, 3037건) 양쪽 모두 0건이 아닌 파싱 결과로 검증.
+- **I3 — LUID 교차검증 + 토폴로지 덤프 이식**: `wall-spatial-display-autogpu` 브랜치의
+  `winit_wall.rs` 레퍼런스에만 있던 두 진단을 `headed_window.rs`로 이식. (1) 창 생성 시
+  1회, tile 0에서만(교차-윈도우 공유 상태 없이 `wall_tile_index == 0`로 게이팅) 공간순
+  디스플레이 토폴로지 표를 `eprintln!`으로 덤프(`wall: Wall display topology (N desktop
+  display(s)):` + 디바이스명/rect/adapter/LUID). (2) topology-hit 경로에서
+  `dxgi_luid_for_gpu_index(disp.adapter_index)`와 `disp.luid`를 비교해 불일치 시 경고.
+  이를 위해 `components/servo/lib.rs`의 재노출 목록에 `dxgi_luid_for_gpu_index`를 추가(이전
+  포트에서 누락돼 있었음). 런타임 검증: 두 스모크 모두에서 토폴로지 표가 출력되고 LUID
+  불일치 경고는 0건.
+- **I4 — 폴백 원인 구분 + 인덱스 공간 명시**: 기존 `headed_window.rs` 폴백 경로는
+  "토폴로지가 아예 비어있음"과 "spatial index가 범위를 벗어남"을 동일한 메시지("No DXGI
+  topology for wall tile N")로 뭉뚱그렸고, 인덱스 부족 시의 마지막 메시지는 토폴로지가
+  실제로 존재했던 경우에도 "no DXGI topology was found"라고 잘못 주장했다. `have_topology
+  = !spatial.is_empty()`로 원인을 분리해 (a) 토폴로지 자체가 없을 때 "no DXGI display
+  topology; using winit monitor fallback", (b) 토폴로지는 있지만 index가 범위 밖일 때
+  "display index N out of range (M display(s)); using winit monitor fallback"을 각각
+  출력하도록 수정. 두 경우 모두 폴백에 쓰이는 인덱스가 spatial index가 아니라 **winit
+  monitor index**임을 메시지에 명시.
+- **I5 — 사용자 문서 스키마 갱신 + display 스키마 예제 config 추가**:
+  `docs/multigpu/multigpu_tiled_present_implementation_plan.md`의 레이아웃 스키마 예시
+  JSON(구 `{ "monitor": N, "gpu": N, "rect": ... }`)을 `{ "display": N, "rect": ... }`로
+  교체하고, `monitor`는 폐지 예정 별칭·`gpu`는 선택적 override라는 설명을 프로즈에 추가.
+  `etc/multigpu/config/wall_layout.example_2x1_display.json`(3840x1080, 2타일, 순수
+  display 스키마)을 신규 추가 — 기존 예제 config들은 의도적으로 마이그레이션하지 않음
+  (레거시 별칭 경로도 계속 테스트되도록 유지).
+
+### 검증 요약
+
+- `cargo test -p servoshell wall_layout --lib`: 6개 전부 통과(기존 5개 중 1개는 override
+  시맨틱을 반영해 이름 변경(`accepts_legacy_monitor_alias_and_honors_gpu_override`),
+  1개 신규 추가(`display_schema_tile_without_gpu_has_no_override`)).
+- `cargo build -p servoshell`: exit 0.
+- `rustfmt --edition 2024 --check` (수정한 3개 파일: `wall_layout.rs`, `headed_window.rs`,
+  `components/servo/lib.rs`) + `git diff --check`: 모두 통과 — `headed_window.rs`에서
+  보고된 2건의 diff는 이번 수정이 건드리지 않은 기존 라인(§SERVO_WIN_VSYNC 파싱,
+  마우스오버 repaint 가드)이라 기존 drift로 확인, 재포맷하지 않음.
+- 런타임 스모크 2건(각 ~18초, 패닉/에러 0건): (a) 신규 display 스키마 예제 config —
+  토폴로지 표 + 양 타일 배치 라인 + LUID 불일치 0 확인. (b) 레거시 `test_2x1_gpu1.json`
+  — deprecation 라인 + override 적용 라인 + 모든 present 라인의 `requested_gpu=Some(1)`
+  확인(어댑터 1 실제 렌더+present 성공).
