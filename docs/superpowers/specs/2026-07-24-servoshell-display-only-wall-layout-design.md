@@ -117,3 +117,31 @@ config `display` → `WallTile.display` → `HeadedWindow::new`가 토폴로지 
 - winit_wall(이미 구현됨).
 - 좌표/페인트/입력 모델 변경.
 - 설정 JSON 재마이그레이션(레거시 경로로 계속 지원하므로 불필요).
+
+## 검증 결과 (2026-07-24, Task 3)
+
+- 정적 검증: `rustfmt --edition 2024 --check`(5개 대상 파일)에서 나온 diff는 전부 이 브랜치 커밋
+  (`cf8469df8ea`, `e8bcab00397`)이 건드리지 않은 기존 라인(사전 drift)이었음을 hunk 범위 대조로
+  확인 — `wall_layout.rs`/`app.rs`는 diff 0. `git diff --check` 무출력. `cargo test -p
+  servo-paint-api display_topology_tests`(brief의 리터럴 필터 `spatial_order`는 테스트 경로
+  문자열에 없어 0건 매치 — 실제 5개 테스트는 `display_topology_tests` 모듈에 있음) 5 passed.
+  `cargo test -p servoshell wall_layout --lib` 5 passed.
+- 빌드: `cargo build -p servoshell` — `Finished dev profile ... in 2m 12s`, exit 0.
+- 스모크(display 스키마, 2타일): 좌측 물리 디스플레이(x=0)가 spatial display 0으로 정렬됨을
+  간접 확인 — tile 1의 `Positioning wall tile 1 on spatial display 1 (desktop [1920,0
+  1920x1080], adapter 0).` 직접 로그 확보, tile 0(=primary 창)은 `requested_gpu=Some(0)`
+  readback(토폴로지 매칭 분기에서만 설정됨) + `window_size` 1920x1080 수렴으로 동일 경로 진입을
+  방증. 배리어 `ready=2/2` 지속, panic 0.
+- **알려진 로깅 갭(이 브랜치 무관, 사전 존재)**: primary 창은 `app.rs:115`에서 `servo.
+  setup_logging()`(`app.rs:130`) 호출 **이전**에 생성되므로, 그 창 생성 중 발생하는 `info!`/
+  `warn!` 호출(토폴로지 `Positioning ...` 로그 포함)이 로거 미설치로 소실됨. 동일한 이유로
+  `wall_layout.rs`의 legacy `monitor`/`gpu` deprecation 경고도 `main()`의 인자 파싱 단계
+  (`prefs.rs::parse_wall_layout`, `setup_logging`보다 훨씬 이전)에서 호출되어 stderr에 나타나지
+  않음. `e8bcab00397`의 diff는 이 초기화 순서를 건드리지 않았으므로 Task 1/2가 만든 회귀가
+  아님(수정하지 않고 사실만 기록).
+- 레거시 config(`etc/multigpu/config/wall_layout.test_2x1_samegpu.json`, monitor+gpu 스키마)
+  스모크: 위 로깅 갭으로 deprecation/`gpu` ignored 경고 텍스트는 stderr에서 관측 불가했으나,
+  `Wall tile 0 plan: display 0`/`Wall tile 1 plan: display 1` 로그가 `monitor:0`/`monitor:1`을
+  정확히 `display`로 별칭 치환했음을 구조적으로 증명(단위테스트
+  `accepts_legacy_monitor_alias_and_ignores_gpu`가 검증하는 것과 동일 분기). 배치·렌더·배리어
+  `ready=2/2` 정상, panic 0.
