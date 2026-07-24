@@ -379,6 +379,244 @@ pub fn dxgi_luid_for_gpu_index(_gpu_index: usize) -> Option<(i32, u32)> {
     None
 }
 
+/// A physical display (DXGI output) paired with the GPU adapter that drives it.
+///
+/// `adapter_index` is the DXGI `EnumAdapters1` order — the same value
+/// `create_dxgi_adapter_by_index` / a `requested_gpu_index` consume — so a tile shown on
+/// this display can bind to the GPU that drives it by passing `adapter_index` straight
+/// through. `luid` is the matching `AdapterLuid` (see [`dxgi_luid_for_gpu_index`]);
+/// `left/top/width/height` are the output's desktop virtual coordinates in physical pixels.
+#[derive(Clone, Debug)]
+pub struct DisplayTopology {
+    pub left: i32,
+    pub top: i32,
+    pub width: i32,
+    pub height: i32,
+    pub adapter_index: usize,
+    pub luid: (i32, u32),
+    pub device_name: String,
+    pub attached_to_desktop: bool,
+}
+
+/// Enumerate every DXGI output (physical display) together with the adapter that drives it.
+///
+/// Returns the displays in raw enumeration order (adapter-major); call [`spatial_order`]
+/// to turn this into a row-major spatial index. Returns an empty vector off Windows, on
+/// non-`no-wgl` builds, or if DXGI enumeration fails — callers should then fall back to
+/// their previous (winit monitor index) behaviour.
+#[cfg(all(target_os = "windows", feature = "no-wgl"))]
+#[expect(unsafe_code)]
+pub fn enumerate_display_topology() -> Vec<DisplayTopology> {
+    use std::os::raw::c_void;
+    use std::ptr;
+
+    use winapi::shared::dxgi::{DXGI_ADAPTER_DESC1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIOutput};
+
+    fn utf16_z_to_string(buffer: &[u16]) -> String {
+        let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..len])
+    }
+
+    let mut displays = Vec::new();
+    // SAFETY: standard DXGI COM enumeration; every returned pointer is checked non-null and
+    // wrapped in a `ComPtr` that releases it, mirroring `create_dxgi_adapter_by_index`.
+    unsafe {
+        let mut dxgi_factory: *mut IDXGIFactory1 = ptr::null_mut();
+        let result = dxgi::CreateDXGIFactory1(
+            &IDXGIFactory1::uuidof(),
+            &mut dxgi_factory as *mut *mut IDXGIFactory1 as *mut *mut c_void,
+        );
+        if !winerror::SUCCEEDED(result) || dxgi_factory.is_null() {
+            return displays;
+        }
+        let dxgi_factory = ComPtr::from_raw(dxgi_factory);
+
+        let mut adapter_index: u32 = 0;
+        loop {
+            let mut adapter1: *mut IDXGIAdapter1 = ptr::null_mut();
+            if !winerror::SUCCEEDED((*dxgi_factory).EnumAdapters1(adapter_index, &mut adapter1))
+                || adapter1.is_null()
+            {
+                break;
+            }
+            let adapter1 = ComPtr::from_raw(adapter1);
+
+            let mut desc: DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+            let luid = if winerror::SUCCEEDED((*adapter1).GetDesc1(&mut desc)) {
+                (desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart)
+            } else {
+                (0, 0)
+            };
+
+            let mut output_index: u32 = 0;
+            loop {
+                let mut output: *mut IDXGIOutput = ptr::null_mut();
+                if !winerror::SUCCEEDED((*adapter1).EnumOutputs(output_index, &mut output))
+                    || output.is_null()
+                {
+                    break;
+                }
+                let output = ComPtr::from_raw(output);
+
+                let mut output_desc: DXGI_OUTPUT_DESC = std::mem::zeroed();
+                if winerror::SUCCEEDED((*output).GetDesc(&mut output_desc)) {
+                    let rect = output_desc.DesktopCoordinates;
+                    displays.push(DisplayTopology {
+                        left: rect.left,
+                        top: rect.top,
+                        width: rect.right - rect.left,
+                        height: rect.bottom - rect.top,
+                        adapter_index: adapter_index as usize,
+                        luid,
+                        device_name: utf16_z_to_string(&output_desc.DeviceName),
+                        attached_to_desktop: output_desc.AttachedToDesktop != 0,
+                    });
+                }
+                output_index += 1;
+            }
+            adapter_index += 1;
+        }
+    }
+    displays
+}
+
+#[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+pub fn enumerate_display_topology() -> Vec<DisplayTopology> {
+    Vec::new()
+}
+
+/// Order displays spatially: top-left first, left→right within a row, then top→bottom.
+///
+/// The returned vector's position is the spatial index a wall layout references as
+/// `display`. Only desktop-attached displays are included. Displays are grouped into rows
+/// by vertical overlap (≥50% of the shorter height, with a median-height tolerance) so
+/// mixed-resolution rows still band together.
+pub fn spatial_order(topology: &[DisplayTopology]) -> Vec<DisplayTopology> {
+    let mut displays: Vec<DisplayTopology> = topology
+        .iter()
+        .filter(|display| display.attached_to_desktop)
+        .cloned()
+        .collect();
+    if displays.is_empty() {
+        return displays;
+    }
+
+    let mut heights: Vec<i32> = displays
+        .iter()
+        .map(|display| display.height.max(1))
+        .collect();
+    heights.sort_unstable();
+    let median_height = heights[heights.len() / 2];
+    let tolerance = (median_height / 2).max(1);
+
+    // Pre-sort by (top, left) so each new row's first member is its topmost-leftmost.
+    displays.sort_by(|a, b| a.top.cmp(&b.top).then(a.left.cmp(&b.left)));
+
+    let mut rows: Vec<Vec<DisplayTopology>> = Vec::new();
+    for display in displays {
+        let mut placed = None;
+        for (row_index, row) in rows.iter().enumerate() {
+            let representative = &row[0];
+            let overlap_top = display.top.max(representative.top);
+            let overlap_bottom =
+                (display.top + display.height).min(representative.top + representative.height);
+            let overlap = (overlap_bottom - overlap_top).max(0);
+            let shorter = display.height.min(representative.height).max(1);
+            if overlap * 2 >= shorter || (display.top - representative.top).abs() <= tolerance {
+                placed = Some(row_index);
+                break;
+            }
+        }
+        match placed {
+            Some(row_index) => rows[row_index].push(display),
+            None => rows.push(vec![display]),
+        }
+    }
+
+    rows.sort_by_key(|row| row.iter().map(|display| display.top).min().unwrap_or(0));
+    let mut ordered = Vec::new();
+    for mut row in rows {
+        row.sort_by_key(|display| display.left);
+        ordered.append(&mut row);
+    }
+    ordered
+}
+
+#[cfg(test)]
+mod display_topology_tests {
+    use super::{DisplayTopology, spatial_order};
+
+    fn display(left: i32, top: i32, width: i32, height: i32, adapter: usize) -> DisplayTopology {
+        DisplayTopology {
+            left,
+            top,
+            width,
+            height,
+            adapter_index: adapter,
+            luid: (0, adapter as u32),
+            device_name: format!("\\\\.\\DISPLAY{adapter}"),
+            attached_to_desktop: true,
+        }
+    }
+
+    fn order(displays: &[DisplayTopology]) -> Vec<(i32, i32)> {
+        spatial_order(displays)
+            .iter()
+            .map(|display| (display.left, display.top))
+            .collect()
+    }
+
+    #[test]
+    fn row_major_2x1() {
+        let displays = vec![
+            display(1920, 0, 1920, 1080, 1),
+            display(0, 0, 1920, 1080, 0),
+        ];
+        assert_eq!(order(&displays), vec![(0, 0), (1920, 0)]);
+    }
+
+    #[test]
+    fn row_major_2x2() {
+        let displays = vec![
+            display(1920, 1080, 1920, 1080, 3),
+            display(0, 1080, 1920, 1080, 2),
+            display(1920, 0, 1920, 1080, 1),
+            display(0, 0, 1920, 1080, 0),
+        ];
+        assert_eq!(
+            order(&displays),
+            vec![(0, 0), (1920, 0), (0, 1080), (1920, 1080)]
+        );
+    }
+
+    #[test]
+    fn three_in_a_row() {
+        let displays = vec![
+            display(3840, 0, 1920, 1080, 2),
+            display(0, 0, 1920, 1080, 0),
+            display(1920, 0, 1920, 1080, 1),
+        ];
+        assert_eq!(order(&displays), vec![(0, 0), (1920, 0), (3840, 0)]);
+    }
+
+    #[test]
+    fn mixed_resolution_row_bands_together() {
+        let displays = vec![
+            display(3840, 0, 1920, 1080, 1),
+            display(0, 0, 3840, 2160, 0),
+        ];
+        assert_eq!(order(&displays), vec![(0, 0), (3840, 0)]);
+    }
+
+    #[test]
+    fn skips_unattached_displays() {
+        let mut detached = display(9999, 9999, 1920, 1080, 5);
+        detached.attached_to_desktop = false;
+        let displays = vec![display(0, 0, 1920, 1080, 0), detached];
+        assert_eq!(order(&displays), vec![(0, 0)]);
+    }
+}
+
 /// A rendering context that uses the Surfman library to create and manage
 /// the OpenGL context and surface. This struct provides the default implementation
 /// of the `RenderingContext` trait, handling the creation, management, and destruction
