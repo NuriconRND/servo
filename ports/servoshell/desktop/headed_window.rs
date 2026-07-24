@@ -196,9 +196,13 @@ impl HeadedWindow {
                     );
                     let display_physical =
                         PhysicalSize::new(disp.width.max(0) as u32, disp.height.max(0) as u32);
-                    info!(
-                        "Positioning wall tile {} on spatial display {} (desktop [{},{} {}x{}], \
-                         adapter {}).",
+                    // NOTE: window construction for the primary (tile 0) window happens before
+                    // `servo.setup_logging()` runs in app.rs, so `log::` macros here are
+                    // silently dropped for that tile. Use `eprintln!` so wall placement
+                    // diagnostics are visible for every tile, not just tiles 1..N.
+                    eprintln!(
+                        "wall: Positioning wall tile {} on spatial display {} (desktop [{},{} \
+                         {}x{}], adapter {}).",
                         servoshell_preferences.wall_tile_index,
                         tile.display,
                         disp.left,
@@ -210,8 +214,10 @@ impl HeadedWindow {
                     if let Some(monitor) = &matching_monitor
                         && requested_physical_size(scale) == display_physical
                     {
-                        info!(
-                            "Wall tile {} matches display {} size {:?}; using borderless \
+                        // See NOTE above: `eprintln!` because logging isn't initialized yet
+                        // when the primary (tile 0) window is constructed.
+                        eprintln!(
+                            "wall: Wall tile {} matches display {} size {:?}; using borderless \
                              fullscreen for flip-model present eligibility.",
                             servoshell_preferences.wall_tile_index, tile.display, display_physical,
                         );
@@ -233,9 +239,11 @@ impl HeadedWindow {
                         winit_window.available_monitors().nth(tile.display)
                     {
                         let target_monitor_size = target_monitor.size();
-                        info!(
-                            "No DXGI topology for wall tile {}; falling back to winit monitor {} \
-                             at {:?}.",
+                        // See NOTE above: `eprintln!` because logging isn't initialized yet
+                        // when the primary (tile 0) window is constructed.
+                        eprintln!(
+                            "wall: No DXGI topology for wall tile {}; falling back to winit \
+                             monitor {} at {:?}.",
                             servoshell_preferences.wall_tile_index,
                             tile.display,
                             target_monitor.position(),
@@ -252,9 +260,11 @@ impl HeadedWindow {
                         }
                         wall_tile_monitor = Some(target_monitor);
                     } else {
-                        warn!(
-                            "Wall tile {} requested display {}, but only {} monitor(s) are \
-                             available and no DXGI topology was found.",
+                        // See NOTE above: `eprintln!` because logging isn't initialized yet
+                        // when the primary (tile 0) window is constructed.
+                        eprintln!(
+                            "wall: Wall tile {} requested display {}, but only {} monitor(s) \
+                             are available and no DXGI topology was found.",
                             servoshell_preferences.wall_tile_index,
                             tile.display,
                             winit_window.available_monitors().count(),

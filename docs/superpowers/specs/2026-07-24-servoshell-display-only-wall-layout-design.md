@@ -145,3 +145,24 @@ config `display` → `WallTile.display` → `HeadedWindow::new`가 토폴로지 
   정확히 `display`로 별칭 치환했음을 구조적으로 증명(단위테스트
   `accepts_legacy_monitor_alias_and_ignores_gpu`가 검증하는 것과 동일 분기). 배치·렌더·배리어
   `ready=2/2` 정상, panic 0.
+
+## 진단 로그 가시화 (2026-07-24, 최종 리뷰 반영)
+
+- 위 §"알려진 로깅 갭"으로 지적된 두 항목(legacy `monitor`/`gpu` 경고, tile 0 배치 진단)을
+  최종 리뷰(2인)가 기능적 결함으로 재분류: `log::` 매크로가 `setup_logging()`
+  (`app.rs:130`) 이전에 호출되면 조용히 버려지므로, 실제로는 사용자에게 "설정이
+  구식이다"라는 UX가 전혀 전달되지 않았고 2x2 월에서는 타일 하나(primary 창)의 배치
+  진단이 항상 누락됐다.
+- 수정: 동일 트랩을 이미 해결한 winit_wall(브랜치 wall-spatial-display-autogpu) 레퍼런스
+  구현을 따라, `wall_layout.rs`의 두 deprecation 경고(`log::warn!` → `eprintln!`,
+  접두어 `wall layout: `)와 `headed_window.rs`의 타일 배치 진단 4곳(spatial 배치,
+  borderless-fullscreen, DXGI 폴백, 모니터 부족 경고; `log::` → `eprintln!`, 접두어
+  `wall: `)을 로거 초기화 순서와 무관하게 항상 stderr로 출력하도록 전환. 로직/메시지
+  내용은 변경 없음(전송 계층만 교체).
+- 런타임 재검증(2026-07-24): 레거시 config(monitor+gpu 스키마) 스모크에서
+  `wall layout: wall tile 0/1: 'monitor' is deprecated...`와 `...'gpu' is ignored...`
+  4줄이 실제로 stderr에 출력됨을 확인. display 스키마(2타일) 스모크에서 tile 0과 tile 1
+  둘 다의 `wall: Positioning wall tile N on spatial display N ...` 라인이 출력됨을
+  확인 — §"알려진 로깅 갭"에서 "간접 확인"에 그쳤던 tile 0 진단이 이제 직접 관측됨.
+  `cargo test -p servoshell wall_layout --lib` 5/5 유지, `cargo build -p servoshell`
+  exit 0.

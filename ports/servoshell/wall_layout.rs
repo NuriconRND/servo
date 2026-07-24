@@ -189,17 +189,21 @@ fn parse_tiles(
                         "tile {index} must have a 'display' (spatial index) field"
                     ))
                 })?;
-                log::warn!(
-                    "wall tile {index}: 'monitor' is deprecated; use 'display' (spatial index, \
-                     top-left = 0)"
+                // NOTE: layout parsing runs during CLI argument parsing, before
+                // `servo.setup_logging()` is called (see app.rs); any `log::` call here is
+                // silently dropped. Use `eprintln!` so this warning is actually visible.
+                eprintln!(
+                    "wall layout: wall tile {index}: 'monitor' is deprecated; use 'display' \
+                     (spatial index, top-left = 0)"
                 );
                 monitor
             },
         };
         if tile.get("gpu").is_some() {
-            log::warn!(
-                "wall tile {index}: 'gpu' is ignored; the GPU is auto-assigned from the adapter \
-                 that drives the chosen display"
+            // See NOTE above: `eprintln!` because logging isn't initialized yet at parse time.
+            eprintln!(
+                "wall layout: wall tile {index}: 'gpu' is ignored; the GPU is auto-assigned \
+                 from the adapter that drives the chosen display"
             );
         }
         let rect = get_rect(tile, "rect")?;
