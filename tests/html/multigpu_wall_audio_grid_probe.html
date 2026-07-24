@@ -111,8 +111,51 @@
     else setStatus("cap","(capture wiring pending — Task 3)");
   } else setStatus("cap","(no ?capvid=/?capaud= param)");
 
-  // --- WEBRTC tile: filled in Task 4 ---
-  window.__startWebrtc = null;
+  // --- WEBRTC tile: gst-plugins-rs default signalling, audio+video ---
+  window.__startWebrtc = function(P){
+    const v = document.getElementById("v-wrtc");
+    const SIGNALING = P.get("signaling") || "ws://127.0.0.1:8443";
+    let ws, pc, sessionId=null, consuming=false;
+    const inbound = new MediaStream();     // accumulate audio+video tracks here
+    const wlog = (m)=>{ clog("wrtc", m); setStatus("wrtc", m); };
+    const send = (o)=>{ try{ ws.send(JSON.stringify(o)); }catch(e){ wlog("send fail "+e); } };
+    ws = new WebSocket(SIGNALING);
+    ws.onopen = ()=> wlog("ws open");
+    ws.onerror = ()=> wlog("ws error");
+    ws.onmessage = async (ev)=>{
+      let m; try{ m=JSON.parse(ev.data); }catch(e){ return; }
+      switch(m.type){
+        case "welcome": send({type:"setPeerStatus",roles:["Listener"]}); send({type:"list"}); break;
+        case "list": if(!consuming && m.producers && m.producers.length) start(m.producers[0].id); break;
+        case "peerStatusChanged": if(!consuming && m.roles && m.roles.includes("Producer")) start(m.peerId); break;
+        case "sessionStarted": sessionId=m.sessionId; break;
+        case "startSession": sessionId=m.sessionId||sessionId; if(m.offer) await offer(m.offer); break;
+        case "peer":
+          if(m.sdp) await offer(m.sdp);
+          else if(m.ice && pc){ try{ await pc.addIceCandidate({candidate:m.ice.candidate,sdpMLineIndex:m.ice.sdpMLineIndex}); }catch(e){} }
+          break;
+      }
+    };
+    function start(pid){ consuming=true; wlog("startSession -> "+pid); mkpc(); send({type:"startSession",peerId:pid}); }
+    function mkpc(){
+      pc = new RTCPeerConnection();
+      pc.ontrack = (e)=>{
+        inbound.addTrack(e.track);          // accumulate: audio AND video land in one stream
+        v.srcObject = inbound;
+        const a=inbound.getAudioTracks().length, vt=inbound.getVideoTracks().length;
+        wlog(`ontrack ${e.track.kind} (v=${vt} a=${a})`);
+      };
+      pc.onicecandidate = (e)=>{ if(e.candidate && sessionId) send({type:"peer",sessionId,ice:{candidate:e.candidate.candidate,sdpMLineIndex:e.candidate.sdpMLineIndex}}); };
+    }
+    async function offer(sdp){
+      try{ if(!pc) mkpc();
+        await pc.setRemoteDescription({type:sdp.type||"offer",sdp:sdp.sdp});
+        const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
+        send({type:"peer",sessionId,sdp:{type:"answer",sdp:pc.localDescription.sdp}});
+        wlog("sent answer");
+      }catch(e){ wlog("offer/answer fail "+e); }
+    }
+  };
   if (P.get("signaling")) {
     if (window.__startWebrtc) window.__startWebrtc(P);
     else setStatus("wrtc","(webrtc wiring pending — Task 4)");
