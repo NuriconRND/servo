@@ -90,8 +90,22 @@
     setInterval(()=>setStatus("rtsp", `${v.videoWidth}x${v.videoHeight} t=${v.currentTime.toFixed(1)} muted=${v.muted}`), 1000);
   })();
 
-  // --- CAPTURE tile: filled in Task 3 ---
-  window.__startCapture = null;
+  // --- CAPTURE tile: getUserMedia({video:{deviceId}, audio:{deviceId}}) ---
+  window.__startCapture = async function(P){
+    const v = document.getElementById("v-cap");
+    const constraints = { video: true, audio: true };
+    const capvid = P.get("capvid"), capaud = P.get("capaud");
+    if (capvid) constraints.video = { deviceId: { exact: capvid } };
+    if (capaud) constraints.audio = { deviceId: { exact: capaud } };
+    else if (P.get("capaud") === "") constraints.audio = true;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      v.srcObject = stream;
+      const at = stream.getAudioTracks(), vt = stream.getVideoTracks();
+      setStatus("cap", `v=${vt.length} a=${at.length}` + (at[0]?` "${at[0].label}"`:""));
+      clog("cap", `tracks video=${vt.length} audio=${at.length} audioLabel=${at[0]&&at[0].label}`);
+    } catch(e){ setStatus("cap","getUserMedia FAILED"); clog("cap","getUserMedia FAILED "+e); }
+  };
   if (P.get("capvid") || P.get("capaud")) {
     if (window.__startCapture) window.__startCapture(P);
     else setStatus("cap","(capture wiring pending — Task 3)");
