@@ -185,14 +185,20 @@ if offset != self.last_root_offset {
 상태 필드:
 
 ```rust
-/// 마지막으로 root visual에 적용한 오프셋. `None` = 미적용(생성 직후/재구축 직후).
+/// 마지막으로 root visual에 적용한 오프셋. `None` = 미적용(생성 직후).
 last_root_offset: Option<(f32, f32)>,
 ```
 
-`root_visual`이 재생성되는 경로(리사이즈 디바운스 재구축 — `painter.rs:2323-2339` →
-`dcomp_compositor.rs:1963`에서 `root_visual = None`)에서 **`last_root_offset`도 `None`으로
-리셋**해 다음 `begin_frame`에 재적용되게 한다. 이 리셋 누락이 이 설계의 유일한 상태 함정이므로
-해당 지점에 주석을 남긴다.
+**root visual의 수명 확인(중요):** `root_visual`은 `maybe_create`에서 1회 생성되고
+(`:1322-1334`), 버려지는 곳은 `release_all`(`:1963`) 단 한 곳이며 이는 `deinit`/`Drop`
+= 컴포지터 **teardown** 전용이다(`:3266-3270`, `:1969-1973`). 리사이즈 디바운스 재구축
+(task-12/12b, `painter.rs:2354-2372`)은 `SetPictureTileSize`로 **WR picture 타일/서피스**를
+재생성할 뿐 root visual은 건드리지 않는다. 따라서 **런타임 중 재적용이 필요한 경로는 없고**,
+teardown 후에는 새 컴포지터 객체가 `last_root_offset: None`으로 시작한다.
+
+그래도 `release_all`에 `self.last_root_offset = None;` 한 줄을 함께 넣는다 — root visual을
+버리는 유일한 지점에서 상태를 정합하게 유지하는 무비용 가드다(현재는 도달 후 객체가 죽으므로
+동작 차이 없음).
 
 ### 5. blit 경로 — 세로 inset 수정
 
@@ -272,8 +278,9 @@ git diff --check
   틀리면 부호만 뒤집으면 된다(구조 변경 없음).
 - **root 오프셋이 external 비디오 비주얼에도 적용**되는 것은 의도다(`:1499`/`:3117-3133`로 확인).
   비디오만 어긋나는 경우는 구조상 생길 수 없다.
-- **재구축 후 재적용 누락**: §4의 `last_root_offset` 리셋이 유일한 상태 함정. 리사이즈 디바운스
-  경로에 주석 + 리셋을 함께 넣는다.
+- **root visual 수명 가정**: §4에서 확인했듯 root visual은 teardown 외에 재생성되지 않으므로
+  "변화 시에만 적용" 캐시가 안전하다. 만약 향후 in-place 재구축 경로가 생기면 그 지점에서
+  `last_root_offset`을 `None`으로 리셋해야 한다 — §4의 가드 한 줄이 그 자리를 표시한다.
 - **DComp off 무회귀**: x 경로 무변경, y만 수정. 상하 오버랩이 0인 현행 구성에서는 바이트 동일한
   동작이어야 한다(런타임 B로 확인).
 
