@@ -2490,22 +2490,37 @@ impl Compositor for DCompNativeCompositor {
         let offset = (-inset.left as f32, -inset.top as f32);
         if self.last_root_offset != Some(offset) {
             // Safety: root는 살아있는 IDCompositionVisual.
-            unsafe {
-                let hr = (*root).SetOffsetX_1(offset.0);
-                if hr < 0 {
-                    warn!("[dcomp-native] root SetOffsetX failed (hr=0x{:08x})", hr as u32);
+            let (hr_x, hr_y) = unsafe {
+                let hr_x = (*root).SetOffsetX_1(offset.0);
+                if hr_x < 0 {
+                    warn!(
+                        "[dcomp-native] root SetOffsetX failed (hr=0x{:08x})",
+                        hr_x as u32
+                    );
                 }
-                let hr = (*root).SetOffsetY_1(offset.1);
-                if hr < 0 {
-                    warn!("[dcomp-native] root SetOffsetY failed (hr=0x{:08x})", hr as u32);
+                let hr_y = (*root).SetOffsetY_1(offset.1);
+                if hr_y < 0 {
+                    warn!(
+                        "[dcomp-native] root SetOffsetY failed (hr=0x{:08x})",
+                        hr_y as u32
+                    );
                 }
+                (hr_x, hr_y)
+            };
+            // present_inset은 타일 창 수명 내내 고정값이라 캐시가 "값 변화"로 무효화될 일이 없다.
+            // 따라서 SetOffsetX/Y 중 하나라도 실패했는데 캐시를 기록해버리면 그 프레임이 "이미
+            // 적용됨"으로 오인되어 이후 어떤 프레임에서도 재시도되지 않는다 — 두 HRESULT가
+            // 모두 성공했을 때만 캐시를 기록한다.
+            if hr_x >= 0 && hr_y >= 0 {
+                // 이 파일은 `use log::warn;`만 import하고 info는 항상 경로 한정으로 쓴다(:184 등).
+                log::info!(
+                    "[dcomp-native] root guard-band offset ({}, {}) applied from present_inset {:?}",
+                    offset.0,
+                    offset.1,
+                    inset
+                );
+                self.last_root_offset = Some(offset);
             }
-            // 이 파일은 `use log::warn;`만 import하고 info는 항상 경로 한정으로 쓴다(:184 등).
-            log::info!(
-                "[dcomp-native] root guard-band offset ({}, {}) applied from present_inset {:?}",
-                offset.0, offset.1, inset
-            );
-            self.last_root_offset = Some(offset);
         }
         self.frame_counter += 1;
         // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
