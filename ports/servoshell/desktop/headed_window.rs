@@ -462,8 +462,10 @@ impl HeadedWindow {
                 .tile_render_insets(servoshell_preferences.wall_tile_index, hidpi_factor)
                 .unwrap_or_else(SideOffsets2D::zero);
             rendering_context.set_present_inset(inset);
-            info!(
-                "Wall tile {} display {} {} visible rect {:?}, render rect {:?}, inset {:?}",
+            // tile 0 창은 setup_logging() 이전에 생성되어 log:: 출력이 버려진다(위 189-192
+            // 주석 참조). 배치 진단과 동일하게 eprintln!으로 두 타일 모두에서 보이게 한다.
+            eprintln!(
+                "wall: Wall tile {} display {} {} visible rect {:?}, render rect {:?}, inset {:?}",
                 servoshell_preferences.wall_tile_index,
                 tile.display,
                 gpu_label,
