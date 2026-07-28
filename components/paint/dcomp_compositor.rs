@@ -1201,8 +1201,10 @@ pub struct DCompNativeCompositor {
     /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
     esc_prof: EscProf,
     /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
-    /// root visual은 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop = teardown
-    /// 전용)에서만 버려지므로, 런타임 중 재적용이 필요한 경로는 없다. 값은 항상 device px
+    /// root visual 자체는 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop =
+    /// teardown 전용)에서만 버려진다. 다만 **값은 런타임에 바뀔 수 있다** — DPI 변경 시
+    /// servoshell이 `set_present_inset`으로 재주입하므로, 캐시 판정은 "한 번 적용했는지"가
+    /// 아니라 **값 비교**여야 한다(그렇게 구현돼 있다). 값은 항상 device px
     /// 정수(가드밴드 폭)이므로 `f32` 대신 `i32`로 저장하고 캐시 비교는 정수로 한다 — 캐스팅은
     /// `SetOffsetX_1`/`SetOffsetY_1` 호출 시점에만 한다(`clippy::float_cmp` 회피, 눈으로
     /// 봐도 안전함이 보장되도록).
@@ -1834,7 +1836,9 @@ impl DCompNativeCompositor {
     /// 게이트가 refresh 케이던스로 호출한다. 리사이즈 중엔 호출측이 억제한다(설계 §4.5).
     /// `begin_frame`을 거치지 않으므로 root 가드밴드 오프셋을 여기서 새로 적용하지는
     /// 않는다 — 오프셋은 visual에 한 번 세팅되면 유지되므로, 가장 최근 `begin_frame`이
-    /// 지연 적용해 둔 값을 그대로 물려받아 무해하다.
+    /// 지연 적용해 둔 값을 그대로 물려받아 무해하다. 단 하나의 예외: DPI 변경으로
+    /// `present_inset`이 갱신된 직후 다음 `begin_frame` 전에 이 경로가 먼저 돌면 그 1회는
+    /// 갱신 전 오프셋으로 present된다. 후속 프레임이 `begin_frame`에 도달하면 자동 교정된다.
     pub(crate) fn present_external_only(&mut self) {
         let rc = self.rendering_context.clone();
         let Some(provider) = paint_api::video_external_surface_provider() else {

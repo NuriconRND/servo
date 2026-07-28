@@ -139,8 +139,10 @@ pub trait RenderingContext {
     fn present_inset(&self) -> DeviceIntSideOffsets {
         DeviceIntSideOffsets::zero()
     }
-    /// [`RenderingContext::present_inset`]을 설정한다. 월 타일 창은 non-resizable이므로
-    /// servoshell이 창 생성 시 1회만 호출한다.
+    /// [`RenderingContext::present_inset`]을 설정한다. 호출 지점은 둘이다 — 창 생성 시 최초
+    /// 주입, 그리고 `WindowEvent::ScaleFactorChanged` 시 재주입. 월 타일 창은 non-resizable
+    /// 이지만 hidpi 배율은 바뀔 수 있고(창이 다른 배율의 모니터로 이동/승격), inset은 배율에서
+    /// 유도되므로 재주입이 없으면 생성 시 스냅샷이 창 수명 내내 stale하게 남는다.
     fn set_present_inset(&self, _inset: DeviceIntSideOffsets) {}
     /// Makes the context the current OpenGL context for this thread.
     /// After calling this function, it is valid to use OpenGL rendering
