@@ -38,7 +38,7 @@ use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIFactory1};
 use winapi::shared::winerror;
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
 use wio::com::ComPtr;
-use webrender_api::units::{DeviceIntRect, DevicePixel};
+use webrender_api::units::{DeviceIntRect, DeviceIntSideOffsets, DevicePixel};
 
 /// Native Compositor(DirectComposition) 게이트(`SERVO_COMPOSITOR_DCOMP`) 판정의 단일
 /// 정본 — surfman의 공개 함수를 재수출한다(surfman은 같은 판정으로 창 서피스 DComp 속성
@@ -120,6 +120,20 @@ pub trait RenderingContext {
     /// Presents the rendered frame to the screen. In a double-buffered context, this would
     /// swap buffers.
     fn present(&self);
+    /// 이 컨텍스트가 렌더한 서피스 중 실제로 화면에 표출되는 sub-rect를 정의하는 가드밴드
+    /// 여백. device px, **top-left 기준**. 월 타일에서 `overlapPx`로 확장한 render rect와
+    /// visible rect의 차이이며, 비월 모드는 zero(트레잇 기본값).
+    ///
+    /// 소비자는 둘이고 y 규약이 서로 다르다:
+    /// - 오프스크린→창 blit(servoshell `gui.rs`): GL 프레임버퍼는 bottom-left 원점이라
+    ///   source rect y 원점에 `bottom`을 쓴다.
+    /// - DComp 네이티브 컴포지터: top-left 원점이라 root visual 오프셋에 `-top`을 쓴다.
+    fn present_inset(&self) -> DeviceIntSideOffsets {
+        DeviceIntSideOffsets::zero()
+    }
+    /// [`RenderingContext::present_inset`]을 설정한다. 월 타일 창은 non-resizable이므로
+    /// servoshell이 창 생성 시 1회만 호출한다.
+    fn set_present_inset(&self, _inset: DeviceIntSideOffsets) {}
     /// Makes the context the current OpenGL context for this thread.
     /// After calling this function, it is valid to use OpenGL rendering
     /// commands.
@@ -1307,6 +1321,9 @@ pub struct WindowRenderingContext {
     /// end_frame에서 읽어 리사이즈 중 스왑체인 강등·승격/regen 억제를 판단한다.
     #[cfg(windows)]
     dcomp_resize_active: Cell<bool>,
+    /// 월 타일 가드밴드 여백 — §`RenderingContext::present_inset`. servoshell이 창 생성 시
+    /// 1회 설정하고, DComp 경로(root visual 오프셋)와 blit 경로(source rect)가 함께 읽는다.
+    present_inset: Cell<DeviceIntSideOffsets>,
 }
 
 impl WindowRenderingContext {
@@ -1409,6 +1426,7 @@ impl WindowRenderingContext {
             dcomp_native_active: Cell::new(false),
             #[cfg(windows)]
             dcomp_resize_active: Cell::new(false),
+            present_inset: Cell::new(DeviceIntSideOffsets::zero()),
         })
     }
 
@@ -1484,6 +1502,14 @@ impl RenderingContext for WindowRenderingContext {
 
     fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
         self.surfman_context.read_to_image(source_rectangle)
+    }
+
+    fn present_inset(&self) -> DeviceIntSideOffsets {
+        self.present_inset.get()
+    }
+
+    fn set_present_inset(&self, inset: DeviceIntSideOffsets) {
+        self.present_inset.set(inset);
     }
 
     fn size(&self) -> PhysicalSize<u32> {
@@ -2025,6 +2051,17 @@ impl RenderingContext for OffscreenRenderingContext {
     #[cfg(windows)]
     fn dcomp_native_active(&self) -> bool {
         self.parent_context.dcomp_native_active()
+    }
+
+    // servoshell이 Window를 Offscreen으로 감싸므로 painter/DComp 컴포지터/gui가 모두 이
+    // Offscreen 래퍼 위에서 present_inset을 읽고 쓴다. 위임이 없으면 트레잇 기본값(zero)에
+    // 흡수돼 가드밴드 크롭이 통째로 사라진다(dcomp_native_active와 동일 위임 패턴).
+    fn present_inset(&self) -> DeviceIntSideOffsets {
+        self.parent_context.present_inset()
+    }
+
+    fn set_present_inset(&self, inset: DeviceIntSideOffsets) {
+        self.parent_context.set_present_inset(inset)
     }
 
     // task-12b: painter가 이 Offscreen 래퍼 위에서 리사이즈 활성 신호를 설정/조회하므로,

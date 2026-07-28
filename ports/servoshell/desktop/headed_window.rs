@@ -456,13 +456,20 @@ impl HeadedWindow {
                 (Some(gpu), None) => format!("gpu=Some({gpu}) (auto)"),
                 (None, _) => "gpu=None (default adapter)".to_string(),
             };
+            // 가드밴드 크롭의 정본. DComp 경로(root visual 오프셋)와 blit 경로(source rect)가
+            // 모두 이 값을 읽는다. 월 타일 창은 non-resizable이므로 1회 설정으로 충분하다.
+            let inset = layout
+                .tile_render_insets(servoshell_preferences.wall_tile_index, hidpi_factor)
+                .unwrap_or_else(SideOffsets2D::zero);
+            rendering_context.set_present_inset(inset);
             info!(
-                "Wall tile {} display {} {} visible rect {:?}, render rect {:?}",
+                "Wall tile {} display {} {} visible rect {:?}, render rect {:?}, inset {:?}",
                 servoshell_preferences.wall_tile_index,
                 tile.display,
                 gpu_label,
                 visible_rect,
                 render_rect,
+                inset,
             );
         }
         let gui = RefCell::new(Gui::new(
