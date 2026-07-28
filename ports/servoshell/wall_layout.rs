@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use euclid::{Point2D, Rect, Scale, SideOffsets2D, Size2D, Vector2D};
 use serde_json::Value;
 use servo::{CSSPixel, DeviceIndependentPixel, DeviceIntRect, DevicePixel};
 
@@ -135,6 +135,27 @@ impl WallLayout {
     ) -> Option<DeviceIntRect> {
         self.tile_render_rect(tile_index)
             .map(|rect| rect_to_device_rect(rect, hidpi_scale_factor))
+    }
+
+    /// 이 타일의 가드밴드 여백 — 오버랩 확장된 render rect 대비 visible rect의 각 변 간격.
+    /// device px, **top-left 기준**. 표출 경로가 렌더 서피스에서 잘라내야 할 양이다.
+    ///
+    /// 소비자마다 y 규약이 다르다: GL blit(프레임버퍼 bottom-left 원점)은 src y 원점에
+    /// `bottom`을, DComp(top-left 원점)는 root visual 오프셋에 `-top`을 쓴다
+    /// (§`RenderingContext::present_inset`).
+    pub(crate) fn tile_render_insets(
+        &self,
+        tile_index: usize,
+        hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+    ) -> Option<SideOffsets2D<i32, DevicePixel>> {
+        let visible = self.tile_device_rect(tile_index, hidpi_scale_factor)?;
+        let render = self.tile_render_device_rect(tile_index, hidpi_scale_factor)?;
+        Some(SideOffsets2D::new(
+            (visible.min.y - render.min.y).max(0),
+            (render.max.x - visible.max.x).max(0),
+            (render.max.y - visible.max.y).max(0),
+            (visible.min.x - render.min.x).max(0),
+        ))
     }
 }
 
@@ -449,5 +470,103 @@ mod tests {
         )
         .expect_err("tile without display/monitor should fail");
         assert!(error.to_string().contains("display"));
+    }
+
+    /// 스케일 1.0에서 타일의 가드밴드 여백을 뽑는 테스트 헬퍼.
+    fn insets(layout: &WallLayout, tile_index: usize) -> SideOffsets2D<i32, DevicePixel> {
+        layout
+            .tile_render_insets(tile_index, Scale::new(1.0))
+            .expect("tile index should be valid")
+    }
+
+    #[test]
+    fn tile_render_insets_2x2() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 2160 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [1920, 0, 1920, 1080] },
+                    { "display": 2, "rect": [0, 1080, 1920, 1080] },
+                    { "display": 3, "rect": [1920, 1080, 1920, 1080] }
+                ],
+                "overlapPx": 32
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        // SideOffsets2D::new(top, right, bottom, left).
+        // 가드밴드는 항상 가상 뷰포트 '안쪽' 변에만 붙는다(바깥 변은 클램프).
+        assert_eq!(insets(&layout, 0), SideOffsets2D::new(0, 32, 32, 0));
+        assert_eq!(insets(&layout, 1), SideOffsets2D::new(0, 0, 32, 32));
+        assert_eq!(insets(&layout, 2), SideOffsets2D::new(32, 32, 0, 0));
+        assert_eq!(insets(&layout, 3), SideOffsets2D::new(32, 0, 0, 32));
+    }
+
+    #[test]
+    fn tile_render_insets_1x2_vertical() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 1920, "height": 2160 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [0, 1080, 1920, 1080] }
+                ],
+                "overlapPx": 32
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        assert_eq!(insets(&layout, 0), SideOffsets2D::new(0, 0, 32, 0));
+        assert_eq!(insets(&layout, 1), SideOffsets2D::new(32, 0, 0, 0));
+    }
+
+    #[test]
+    fn tile_render_insets_zero_without_overlap() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 1080 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [1920, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        assert_eq!(insets(&layout, 0), SideOffsets2D::zero());
+        assert_eq!(insets(&layout, 1), SideOffsets2D::zero());
+    }
+
+    #[test]
+    fn tile_render_insets_clamped_when_overlap_exceeds_viewport() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 200, "height": 100 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 100, 100] },
+                    { "display": 1, "rect": [100, 0, 100, 100] }
+                ],
+                "overlapPx": 500
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        // 오버랩이 뷰포트를 넘으면 render rect가 뷰포트 전체로 클램프된다.
+        assert_eq!(insets(&layout, 0), SideOffsets2D::new(0, 100, 0, 0));
+        assert_eq!(insets(&layout, 1), SideOffsets2D::new(0, 0, 0, 100));
+    }
+
+    #[test]
+    fn tile_render_insets_none_for_out_of_range_tile() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 1920, "height": 1080 },
+                "tiles": [ { "display": 0, "rect": [0, 0, 1920, 1080] } ]
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        assert!(layout.tile_render_insets(1, Scale::new(1.0)).is_none());
     }
 }

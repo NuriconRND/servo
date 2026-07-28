@@ -15,7 +15,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use euclid::{
-    Angle, Length, Point2D, Rect, Rotation3D, Scale, Size2D, UnknownUnit, Vector2D, Vector3D,
+    Angle, Length, Point2D, Rect, Rotation3D, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D,
+    Vector3D,
 };
 use keyboard_types::ShortcutMatcher;
 use log::{debug, info, warn};
@@ -844,29 +845,22 @@ impl HeadedWindow {
             .unwrap_or_else(Vector2D::zero)
     }
 
-    fn wall_tile_render_insets(&self) -> Option<(i32, i32, i32, i32)> {
-        let layout = self.wall_layout.as_ref()?;
-        let hidpi_factor = self.hidpi_scale_factor();
-        let visible_rect = layout.tile_device_rect(self.wall_tile_index, hidpi_factor)?;
-        let render_rect = layout.tile_render_device_rect(self.wall_tile_index, hidpi_factor)?;
-        Some((
-            visible_rect.min.x - render_rect.min.x,
-            visible_rect.min.y - render_rect.min.y,
-            render_rect.max.x - visible_rect.max.x,
-            render_rect.max.y - visible_rect.max.y,
-        ))
+    fn wall_tile_render_insets(&self) -> Option<SideOffsets2D<i32, DevicePixel>> {
+        self.wall_layout
+            .as_ref()?
+            .tile_render_insets(self.wall_tile_index, self.hidpi_scale_factor())
     }
 
     pub(crate) fn webview_rendering_size(
         &self,
         visible_size: Size2D<f32, DevicePixel>,
     ) -> Size2D<f32, DevicePixel> {
-        let Some((left, top, right, bottom)) = self.wall_tile_render_insets() else {
+        let Some(inset) = self.wall_tile_render_insets() else {
             return visible_size;
         };
         Size2D::new(
-            visible_size.width + left.max(0) as f32 + right.max(0) as f32,
-            visible_size.height + top.max(0) as f32 + bottom.max(0) as f32,
+            visible_size.width + inset.left as f32 + inset.right as f32,
+            visible_size.height + inset.top as f32 + inset.bottom as f32,
         )
     }
 
@@ -874,10 +868,10 @@ impl HeadedWindow {
         &self,
         visible_size: Size2D<i32, DevicePixel>,
     ) -> Rect<i32, DevicePixel> {
-        let Some((left, top, _, _)) = self.wall_tile_render_insets() else {
+        let Some(inset) = self.wall_tile_render_insets() else {
             return Rect::new(Point2D::origin(), visible_size);
         };
-        Rect::new(Point2D::new(left.max(0), top.max(0)), visible_size)
+        Rect::new(Point2D::new(inset.left, inset.top), visible_size)
     }
 
     fn log_wall_present_timing(&self, present_duration: Duration) {
