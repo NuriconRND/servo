@@ -390,6 +390,12 @@ cargo check -p servo-paint-api
 
 이 줄은 `tools/wall_perf_analyzer/analyze_wall_perf.py`의 파싱 대상이 아니므로(그쪽은 `Wall repaint target:` / `Wall window present:` 두 줄만 본다) 확장해도 안전하다.
 
+> **실행 중 정정(2026-07-28, 리뷰 지적 → 사용자 결정):** 이 진단은 `info!`가 아니라
+> **`eprintln!("wall: Wall tile {} display {} ...")`** 로 쓴다. `--wall-all-tiles`에서
+> primary(tile 0) 창은 `servo.setup_logging()` 이전에 생성되어 `log::` 매크로가 조용히
+> 버려지므로(`headed_window.rs:189-192`에 기록된 선재 문제), `info!`로 두면 tile 0의 inset이
+> 영영 안 보인다. 같은 파일의 배치 진단이 이미 쓰는 패턴에 맞춘다. 커밋 `98913ee7852`.
+
 - [ ] **Step 7: 빌드하고 값이 실제로 실린 것을 로그로 확인한다**
 
 ```powershell
@@ -521,7 +527,7 @@ $env:SERVO_COMPOSITOR_DCOMP=0
   tests\html\multigpu_wall_ruler_probe.html
 ```
 
-기대: 창 좌상단 구석에 노란 `0,0` 라벨, 8px/64px 격자, 오른쪽으로 갈수록 `128,0` `256,0` … 증가. 1x1 layout은 `overlapPx: 32`지만 타일이 뷰포트 전체라 inset이 전부 0이므로 **크롭 없이 정확히 `0,0`에서 시작해야 한다.**
+기대: 창 좌상단 구석에 `0,0` 라벨, 8px/120px 격자, 오른쪽으로 갈수록 `120,0` `240,0` … 증가. 1x1 layout은 `overlapPx: 32`지만 타일이 뷰포트 전체라 inset이 전부 0이므로 **크롭 없이 정확히 `0,0`에서 시작해야 한다.**
 
 이 단계에서 라벨이 안 보이면 프로브 페이지 문제이지 크롭 문제가 아니다 — 여기서 잡고 간다.
 
@@ -620,6 +626,12 @@ git commit -m "test(wall): 절대 가상좌표 눈금 프로브 + 세로 2타일
         }
 ```
 
+> **실행 중 정정(2026-07-28, 리뷰 지적):** 위 코드의 `self.last_root_offset = Some(offset);`을
+> **무조건** 실행하면 안 된다. `present_inset`은 창 수명 내내 고정이라 캐시가 값 변화로
+> 무효화되는 일이 없으므로, `SetOffsetX/Y`가 실패한 프레임에서 캐시를 기록하면 그 타일은
+> **재시도 없이 잘못된 오프셋으로 영구히 남는다**. 두 HRESULT가 모두 성공했을 때만 기록할 것.
+> 커밋은 아래 Step 7의 것 다음에 이어지는 후속 fix 커밋 참조.
+
 - [ ] **Step 4: 빌드한다**
 
 ```powershell
@@ -644,8 +656,12 @@ $env:SERVO_COMPOSITOR_DCOMP=1
 ```
 
 판정:
-- display 0(왼쪽) 좌상단 = 노란 `0,0` — 창 구석에 정확히 붙어야 한다
-- **display 1(오른쪽) 좌상단 = 노란 `1920,0`** — 창 구석에 정확히 붙어야 한다
+- display 0(왼쪽) 좌상단 = `0,0` — 창 구석에 정확히 붙어야 한다
+- **display 1(오른쪽) 좌상단 = `1920,0`** — 창 구석에 정확히 붙어야 한다
+
+> **정정:** 초안은 이 라벨이 "노란(major)"일 것을 전제했으나, 라벨 간격이 120으로 바뀌면서
+> major 강조 주기(600)는 1920·1080 어느 쪽도 나누지 못한다. 즉 타일 원점 라벨은 major가 아니다.
+> 판정 기준은 **색이 아니라 구석에 놓인 라벨의 값**이다(프로브 주석도 같은 취지로 수정됨).
 - 수정 전에는 여기에 `1888` 근방 라벨이 32px 안쪽으로 들어와 보였다
 
 창을 닫고 로그 확인:
@@ -862,11 +878,13 @@ git commit -m "docs: CLAUDE.md의 wall_layout 단위 테스트 개수 갱신 (3 
 
 ## 완료 기준
 
-1. `cargo test -p servoshell wall_layout --lib` — 11 passed
+1. `cargo test -p servoshell wall_layout --lib` — 전부 통과 (실행 시점 개수를 그대로 기록할 것)
 2. 2×1 + DComp **on/off 양쪽**에서 display 1 좌상단 라벨이 `1920,0`
 3. 1×2 세로 + DComp **on/off 양쪽**에서 display 1 좌상단 라벨이 `0,1080`
 4. 비디오/동기화/스트레스 회귀에서 패닉·미스프레임 0, `scroll_offsets=matched` 유지
-5. `rustfmt --check` / `git diff --check` 클린
+5. `git diff --check` 클린 / **rustfmt는 "신규 drift 0"** — 이 계획이 건드리는 파일들은
+   선재 drift가 상당해(`dcomp_compositor.rs` 100+ hunk) 파일 전체 클린은 성립하지 않는다.
+   기준 커밋 대비 hunk 수·위치를 비교해 추가된 줄이 drift를 만들지 않았음을 보인다.
 
 ## 알려진 별개 이슈 (이 계획의 범위 밖)
 
