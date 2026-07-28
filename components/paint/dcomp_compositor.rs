@@ -1202,8 +1202,11 @@ pub struct DCompNativeCompositor {
     esc_prof: EscProf,
     /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
     /// root visual은 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop = teardown
-    /// 전용)에서만 버려지므로, 런타임 중 재적용이 필요한 경로는 없다.
-    last_root_offset: Option<(f32, f32)>,
+    /// 전용)에서만 버려지므로, 런타임 중 재적용이 필요한 경로는 없다. 값은 항상 device px
+    /// 정수(가드밴드 폭)이므로 `f32` 대신 `i32`로 저장하고 캐시 비교는 정수로 한다 — 캐스팅은
+    /// `SetOffsetX_1`/`SetOffsetY_1` 호출 시점에만 한다(`clippy::float_cmp` 회피, 눈으로
+    /// 봐도 안전함이 보장되도록).
+    last_root_offset: Option<(i32, i32)>,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1829,6 +1832,9 @@ impl DCompNativeCompositor {
     /// external 갱신 분리 fast-path(설계 §4.2): WR 프레임 빌드/트리 재구성 없이, 승격된
     /// external 서피스만 캐시된 placement로 present하고 Commit 1회. painter의 즉시-합성
     /// 게이트가 refresh 케이던스로 호출한다. 리사이즈 중엔 호출측이 억제한다(설계 §4.5).
+    /// `begin_frame`을 거치지 않으므로 root 가드밴드 오프셋을 여기서 새로 적용하지는
+    /// 않는다 — 오프셋은 visual에 한 번 세팅되면 유지되므로, 가장 최근 `begin_frame`이
+    /// 지연 적용해 둔 값을 그대로 물려받아 무해하다.
     pub(crate) fn present_external_only(&mut self) {
         let rc = self.rendering_context.clone();
         let Some(provider) = paint_api::video_external_surface_provider() else {
@@ -2481,24 +2487,26 @@ impl Compositor for DCompNativeCompositor {
         // 월 가드밴드 크롭: 렌더 서피스는 render rect(오버랩 확장) 크기인데 창은 visible rect
         // 크기다. root visual을 -inset만큼 밀어 visible 영역이 창 원점에 오게 한다. 전 비주얼이
         // root의 직속 자식이므로(end_frame의 AddVisual) WR 타일과 external 비디오에 균일하게
-        // 적용되고, 자식 SetClip은 비주얼-로컬 좌표라 영향을 받지 않는다. 창 밖으로 밀려난
-        // 가드밴드는 HWND 경계에서 DWM이 클립하므로 root 클립은 불필요하다.
+        // 적용된다. root의 오프셋은 자식들에게는 부모 변환이라, 각 자식의 offset과 clip
+        // 모두에 동일하게(uniformly) 걸린다 — 그래서 둘 사이의 상대 관계가 그대로 보존되고
+        // `apply_visual_placement`(자식 offset/clip 산식)는 수정할 필요가 없다. 창 밖으로
+        // 밀려난 가드밴드는 HWND 경계에서 DWM이 클립하므로 root 클립은 불필요하다.
         //
         // DComp는 top-left 원점이라 y에 `-top`을 쓴다 — GL blit 경로가 `bottom`을 쓰는 것과
         // 규약이 반대다(§`RenderingContext::present_inset`).
         let inset = self.rendering_context.present_inset();
-        let offset = (-inset.left as f32, -inset.top as f32);
+        let offset = (-inset.left, -inset.top);
         if self.last_root_offset != Some(offset) {
             // Safety: root는 살아있는 IDCompositionVisual.
             let (hr_x, hr_y) = unsafe {
-                let hr_x = (*root).SetOffsetX_1(offset.0);
+                let hr_x = (*root).SetOffsetX_1(offset.0 as f32);
                 if hr_x < 0 {
                     warn!(
                         "[dcomp-native] root SetOffsetX failed (hr=0x{:08x})",
                         hr_x as u32
                     );
                 }
-                let hr_y = (*root).SetOffsetY_1(offset.1);
+                let hr_y = (*root).SetOffsetY_1(offset.1 as f32);
                 if hr_y < 0 {
                     warn!(
                         "[dcomp-native] root SetOffsetY failed (hr=0x{:08x})",

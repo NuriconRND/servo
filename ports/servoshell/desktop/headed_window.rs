@@ -854,19 +854,19 @@ impl HeadedWindow {
             .unwrap_or_else(Vector2D::zero)
     }
 
-    fn wall_tile_render_insets(&self) -> Option<SideOffsets2D<i32, DevicePixel>> {
-        self.wall_layout
-            .as_ref()?
-            .tile_render_insets(self.wall_tile_index, self.hidpi_scale_factor())
+    /// `RenderingContext::present_inset`의 리더. 값을 재계산하지 않는다 — 정본은
+    /// servoshell이 창 생성 시(및 DPI 변경 시) `set_present_inset`으로 주입한 스냅샷이며,
+    /// DComp 경로(`dcomp_compositor.rs`)도 같은 값을 읽는다. 비월 창의 `present_inset`은
+    /// `zero()`이므로 아래 두 소비자의 동작은 이전 `Option` 분기와 동일하다.
+    fn wall_tile_render_insets(&self) -> SideOffsets2D<i32, DevicePixel> {
+        self.rendering_context.present_inset()
     }
 
     pub(crate) fn webview_rendering_size(
         &self,
         visible_size: Size2D<f32, DevicePixel>,
     ) -> Size2D<f32, DevicePixel> {
-        let Some(inset) = self.wall_tile_render_insets() else {
-            return visible_size;
-        };
+        let inset = self.wall_tile_render_insets();
         Size2D::new(
             visible_size.width + inset.left as f32 + inset.right as f32,
             visible_size.height + inset.top as f32 + inset.bottom as f32,
@@ -877,9 +877,7 @@ impl HeadedWindow {
         &self,
         visible_size: Size2D<i32, DevicePixel>,
     ) -> Rect<i32, DevicePixel> {
-        let Some(inset) = self.wall_tile_render_insets() else {
-            return Rect::new(Point2D::origin(), visible_size);
-        };
+        let inset = self.wall_tile_render_insets();
         // GL 프레임버퍼는 bottom-left 원점이므로 source rect의 y 원점은 "아래쪽에서부터의
         // 거리" = `bottom`이다(`top`이 아니다 — glBlitFramebuffer, rendering_context.rs).
         // `bottom`은 정의상 render rect 아래변에서 visible rect 아래변까지의 거리이므로,
@@ -1015,6 +1013,17 @@ impl HeadedWindow {
                     .set_zoom_factor(effective_egui_zoom_factor);
 
                 window.hidpi_scale_factor_changed();
+
+                // 생성자의 present_inset은 창 생성 시 1회 스냅샷이라(§`HeadedWindow::new`),
+                // 창이 다른 DPI의 모니터로 옮겨진 뒤 WM_DPICHANGED가 뒤늦게 도착하는 경우처럼
+                // 실제 DPI가 바뀌어도 그대로 굳어 stale해질 수 있다 — 여기서 최신 스케일로
+                // 재계산해 재주입한다.
+                if let Some(layout) = &self.wall_layout {
+                    let inset = layout
+                        .tile_render_insets(self.wall_tile_index, self.hidpi_scale_factor())
+                        .unwrap_or_else(SideOffsets2D::zero);
+                    self.rendering_context.set_present_inset(inset);
+                }
 
                 // Request a winit redraw event, so we can recomposite, update and paint
                 // the GUI, and present the new frame.

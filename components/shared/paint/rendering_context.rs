@@ -122,12 +122,20 @@ pub trait RenderingContext {
     fn present(&self);
     /// 이 컨텍스트가 렌더한 서피스 중 실제로 화면에 표출되는 sub-rect를 정의하는 가드밴드
     /// 여백. device px, **top-left 기준**. 월 타일에서 `overlapPx`로 확장한 render rect와
-    /// visible rect의 차이이며, 비월 모드는 zero(트레잇 기본값).
+    /// visible rect의 차이이며, 비월 모드는 zero(트레잇 기본값). 공식은
+    /// `WallLayout::tile_render_insets`(servoshell)가 정본이고, 값은 servoshell이 창 생성
+    /// 시 1회 주입하며 DPI 변경(`WindowEvent::ScaleFactorChanged`) 시 재주입해 갱신한다.
     ///
-    /// 소비자는 둘이고 y 규약이 서로 다르다:
-    /// - 오프스크린→창 blit(servoshell `gui.rs`): GL 프레임버퍼는 bottom-left 원점이라
-    ///   source rect y 원점에 `bottom`을 쓴다.
-    /// - DComp 네이티브 컴포지터: top-left 원점이라 root visual 오프셋에 `-top`을 쓴다.
+    /// 소비자는 둘이고 **둘 다 이 값을 읽는다**(재계산하지 않는다) — y 규약만 서로 다르다:
+    /// - 오프스크린→창 blit(servoshell `headed_window.rs::webview_visible_source_rect`,
+    ///   `gui.rs`): GL 프레임버퍼는 bottom-left 원점이라 source rect y 원점에 `bottom`을
+    ///   쓴다.
+    /// - DComp 네이티브 컴포지터(`dcomp_compositor.rs`): top-left 원점이라 root visual
+    ///   오프셋에 `-top`을 쓴다.
+    ///
+    /// **범위 밖:** 스크린샷/readback(`components/paint/screenshot.rs`)은 이 값을 따르지
+    /// 않는다 — `webview_renderer.rect`(월 모드에서는 오버랩 확장된 render rect 그대로)를
+    /// 읽으므로 출력에 가드밴드가 그대로 포함된다(기존 동작, 별도 이슈).
     fn present_inset(&self) -> DeviceIntSideOffsets {
         DeviceIntSideOffsets::zero()
     }

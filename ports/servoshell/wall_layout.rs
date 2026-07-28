@@ -501,6 +501,9 @@ mod tests {
         assert_eq!(insets(&layout, 1), SideOffsets2D::new(0, 0, 32, 32));
         assert_eq!(insets(&layout, 2), SideOffsets2D::new(32, 32, 0, 0));
         assert_eq!(insets(&layout, 3), SideOffsets2D::new(32, 0, 0, 32));
+        // 필드명 assert: SideOffsets2D::new(top, right, bottom, left) 인자 순서가 뒤바뀌어도
+        // 대칭 케이스에서는 전체 비교가 우연히 통과할 수 있으므로, 필드를 직접 짚어 확인한다.
+        assert_eq!(insets(&layout, 1).left, 32);
     }
 
     #[test]
@@ -519,6 +522,8 @@ mod tests {
 
         assert_eq!(insets(&layout, 0), SideOffsets2D::new(0, 0, 32, 0));
         assert_eq!(insets(&layout, 1), SideOffsets2D::new(32, 0, 0, 0));
+        // 필드명 assert(위 2x2 테스트와 동일한 이유).
+        assert_eq!(insets(&layout, 0).bottom, 32);
     }
 
     #[test]
@@ -568,5 +573,89 @@ mod tests {
         .expect("valid layout should parse");
 
         assert!(layout.tile_render_insets(1, Scale::new(1.0)).is_none());
+    }
+
+    #[test]
+    fn tile_render_insets_3x1_middle_tile_has_guard_bands_on_both_sides() {
+        // 개발 머신의 `local_3x1` 실제 지오메트리(가로 3분할, 5760x1080). 기존 2x2/1x2
+        // 테스트는 타일마다 가로·세로 각 한쪽 변에만 가드밴드가 붙는 형태만 다뤘는데,
+        // 가운데 타일은 좌우 양쪽 모두에 가드밴드가 붙는 모양이라 별도로 검증한다
+        // (이 layout의 tile_render_rect 값은 `calculates_overlap_render_rect_clamped_to_virtual_viewport`
+        // 에서 이미 검증됨).
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 5760, "height": 1080 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 1920, 1080] },
+                    { "display": 1, "rect": [1920, 0, 1920, 1080] },
+                    { "display": 2, "rect": [3840, 0, 1920, 1080] }
+                ],
+                "overlapPx": 32
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        assert_eq!(insets(&layout, 0), SideOffsets2D::new(0, 32, 0, 0));
+        // 가운데 타일: 좌우 양쪽 모두 가드밴드(overlapPx만큼), 위아래는 0.
+        assert_eq!(insets(&layout, 1), SideOffsets2D::new(0, 32, 0, 32));
+        assert_eq!(insets(&layout, 2), SideOffsets2D::new(0, 0, 0, 32));
+        // 필드명 assert.
+        assert_eq!(insets(&layout, 1).left, 32);
+        assert_eq!(insets(&layout, 1).right, 32);
+    }
+
+    #[test]
+    fn tile_render_insets_fractional_dpi_pins_current_rounding_behavior() {
+        // `rect_to_device_rect`는 origin은 반올림(`.round()`)하고 size는 절삭(`as i32`
+        // truncation)한다. scale=1.0에서는 두 연산이 정수 입력에 대해 항상 일치하지만,
+        // 분수 DPI(예: 1.5)에서는 visible rect와 render rect가 *서로 다른 DIP 좌표*에서
+        // 독립적으로 반올림/절삭되므로 어긋날 수 있다 — 이 테스트는 그 실제 동작을
+        // 손으로 계산해 고정(pin)한다. 그린으로 만들려는 목적이 아니라 현재 동작을
+        // 있는 그대로 박제하는 목적이다.
+        //
+        // 레이아웃: 가로 1923(=641*3, 홀수 폭) 3분할, overlapPx=11, scale=1.5.
+        //
+        // 손계산(모든 곱이 f32에서 정확히 표현되는 값들이라 반올림 오차 없음):
+        //   tile0 visible DIP=[0,641]   -> device origin=round(0)=0,   width=trunc(961.5)=961 -> [0,961]
+        //   tile0 render  DIP=[0,652]   -> device origin=round(0)=0,   width=trunc(978.0)=978 -> [0,978]
+        //     => left=0-0=0, right=978-961=17
+        //   tile1 visible DIP=[641,1282]-> device origin=round(961.5)=962, width=trunc(961.5)=961 -> [962,1923]
+        //   tile1 render  DIP=[630,1293]-> device origin=round(945.0)=945, width=trunc(994.5)=994 -> [945,1939]
+        //     => left=962-945=17, right=1939-1923=16
+        //   tile2 visible DIP=[1282,1923]->device origin=round(1923.0)=1923, width=trunc(961.5)=961 -> [1923,2884]
+        //   tile2 render  DIP=[1271,1923]->device origin=round(1906.5)=1907, width=trunc(978.0)=978 -> [1907,2885]
+        //     => left=1923-1907=16, right=2885-2884=1
+        //
+        // 주목할 점(비일관성): tile2는 뷰포트 오른쪽 끝 타일이라 visible과 render 양쪽 모두
+        // DIP 상에서 우측 경계가 뷰포트 끝(1923)에 정확히 클램프되어 "논리적으로는" 우측
+        // 가드밴드가 0이어야 할 것 같지만, 각 rect가 origin+size를 독립적으로
+        // 반올림/절삭하기 때문에 실제로는 `right=1`이 나온다(1923*1.5=2884.5라는 반쪽
+        // 픽셀이 visible 쪽에서는 내림, render 쪽에서는 origin 반올림 때문에 다르게
+        // 흡수됨). `webview_rendering_size`가 이 insets를 별도로 계산된 visible_size에
+        // 더해 오프스크린 서피스 크기를 정하므로(gui.rs), 분수 DPI 월 타일에서는 실제로
+        // 1px 단위의 크기 불일치가 생길 수 있다는 뜻이다.
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 1923, "height": 100 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 641, 100] },
+                    { "display": 1, "rect": [641, 0, 641, 100] },
+                    { "display": 2, "rect": [1282, 0, 641, 100] }
+                ],
+                "overlapPx": 11
+            }"#,
+        )
+        .expect("valid layout should parse");
+
+        let scale = Scale::new(1.5);
+        let insets_at = |tile_index: usize| {
+            layout
+                .tile_render_insets(tile_index, scale)
+                .expect("tile index should be valid")
+        };
+
+        assert_eq!(insets_at(0), SideOffsets2D::new(0, 17, 0, 0));
+        assert_eq!(insets_at(1), SideOffsets2D::new(0, 16, 0, 17));
+        assert_eq!(insets_at(2), SideOffsets2D::new(0, 1, 0, 16));
     }
 }
