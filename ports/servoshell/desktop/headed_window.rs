@@ -880,7 +880,12 @@ impl HeadedWindow {
         let Some(inset) = self.wall_tile_render_insets() else {
             return Rect::new(Point2D::origin(), visible_size);
         };
-        Rect::new(Point2D::new(inset.left, inset.top), visible_size)
+        // GL 프레임버퍼는 bottom-left 원점이므로 source rect의 y 원점은 "아래쪽에서부터의
+        // 거리" = `bottom`이다(`top`이 아니다 — glBlitFramebuffer, rendering_context.rs).
+        // visible 영역은 render rect의 위쪽에 붙어 있다.
+        // DComp 경로는 top-left 원점이라 root visual에 `-top`을 쓴다 — 규약이 반대다
+        // (§`RenderingContext::present_inset`).
+        Rect::new(Point2D::new(inset.left, inset.bottom), visible_size)
     }
 
     fn log_wall_present_timing(&self, present_duration: Duration) {
