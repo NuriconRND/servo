@@ -882,7 +882,8 @@ impl HeadedWindow {
         };
         // GL 프레임버퍼는 bottom-left 원점이므로 source rect의 y 원점은 "아래쪽에서부터의
         // 거리" = `bottom`이다(`top`이 아니다 — glBlitFramebuffer, rendering_context.rs).
-        // visible 영역은 render rect의 위쪽에 붙어 있다.
+        // `bottom`은 정의상 render rect 아래변에서 visible rect 아래변까지의 거리이므로,
+        // 가드밴드가 어느 쪽에 붙은 타일이든(2x2 위/아래 행 모두) 무조건 성립한다.
         // DComp 경로는 top-left 원점이라 root visual에 `-top`을 쓴다 — 규약이 반대다
         // (§`RenderingContext::present_inset`).
         Rect::new(Point2D::new(inset.left, inset.bottom), visible_size)
