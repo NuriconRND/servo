@@ -1200,6 +1200,10 @@ pub struct DCompNativeCompositor {
     external_batch_active: bool,
     /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
     esc_prof: EscProf,
+    /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
+    /// root visual은 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop = teardown
+    /// 전용)에서만 버려지므로, 런타임 중 재적용이 필요한 경로는 없다.
+    last_root_offset: Option<(f32, f32)>,
 }
 
 /// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
@@ -1351,6 +1355,7 @@ pub fn maybe_create(
             warned_no_provider: false,
             external_batch_active: false,
             esc_prof: EscProf::new(),
+            last_root_offset: None,
         })))
     }
 }
@@ -1961,6 +1966,10 @@ impl DCompNativeCompositor {
         // ComOwned Drop이 각 visual + storage(virtual_surface 또는 swapchain/fallback)를 Release.
         self.surfaces.clear();
         self.root_visual = None;
+        // root visual을 버리는 유일한 지점 — 상태 정합을 위해 함께 리셋한다. 현재 이 경로는
+        // teardown 전용이라 도달 후 객체가 죽지만, in-place 재구축 경로가 생기면 여기가
+        // 재적용 지점이 된다.
+        self.last_root_offset = None;
         self._target = None;
         self.dcomp_device = None;
     }
@@ -2469,6 +2478,35 @@ impl Compositor for DCompNativeCompositor {
         let Some(root) = self.root_visual_ptr() else {
             return;
         };
+        // 월 가드밴드 크롭: 렌더 서피스는 render rect(오버랩 확장) 크기인데 창은 visible rect
+        // 크기다. root visual을 -inset만큼 밀어 visible 영역이 창 원점에 오게 한다. 전 비주얼이
+        // root의 직속 자식이므로(end_frame의 AddVisual) WR 타일과 external 비디오에 균일하게
+        // 적용되고, 자식 SetClip은 비주얼-로컬 좌표라 영향을 받지 않는다. 창 밖으로 밀려난
+        // 가드밴드는 HWND 경계에서 DWM이 클립하므로 root 클립은 불필요하다.
+        //
+        // DComp는 top-left 원점이라 y에 `-top`을 쓴다 — GL blit 경로가 `bottom`을 쓰는 것과
+        // 규약이 반대다(§`RenderingContext::present_inset`).
+        let inset = self.rendering_context.present_inset();
+        let offset = (-inset.left as f32, -inset.top as f32);
+        if self.last_root_offset != Some(offset) {
+            // Safety: root는 살아있는 IDCompositionVisual.
+            unsafe {
+                let hr = (*root).SetOffsetX_1(offset.0);
+                if hr < 0 {
+                    warn!("[dcomp-native] root SetOffsetX failed (hr=0x{:08x})", hr as u32);
+                }
+                let hr = (*root).SetOffsetY_1(offset.1);
+                if hr < 0 {
+                    warn!("[dcomp-native] root SetOffsetY failed (hr=0x{:08x})", hr as u32);
+                }
+            }
+            // 이 파일은 `use log::warn;`만 import하고 info는 항상 경로 한정으로 쓴다(:184 등).
+            log::info!(
+                "[dcomp-native] root guard-band offset ({}, {}) applied from present_inset {:?}",
+                offset.0, offset.1, inset
+            );
+            self.last_root_offset = Some(offset);
+        }
         self.frame_counter += 1;
         // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
         // Safety: root는 살아있는 IDCompositionVisual.
