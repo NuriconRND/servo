@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>multigpu wall ruler probe</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #101014; }
+  /* 8px 미세 눈금 + 64px 주눈금. 가드밴드 32px = 미세 4칸 = 주눈금 반칸이라
+     한 칸만 어긋나도 즉시 보인다. */
+  #ruler {
+    position: absolute; inset: 0;
+    background-image:
+      repeating-linear-gradient(to right,  #26263a 0 1px, transparent 1px 8px),
+      repeating-linear-gradient(to bottom, #26263a 0 1px, transparent 1px 8px),
+      repeating-linear-gradient(to right,  #5a5ab4 0 1px, transparent 1px 64px),
+      repeating-linear-gradient(to bottom, #5a5ab4 0 1px, transparent 1px 64px);
+  }
+  .lbl {
+    position: absolute; font: 11px/1 monospace; color: #7fb2d9;
+    white-space: nowrap; pointer-events: none;
+  }
+  /* 640px 격자는 강조 — 타일 경계(보통 1920/1080의 배수)가 여기에 걸린다. */
+  .lbl.major { color: #ffd75f; font-weight: bold; }
+</style>
+<div id="ruler"></div>
+<script>
+  // 가상 뷰포트 전체에 절대 좌표 라벨을 128px 간격으로 깐다. 라벨이 모든 타일에
+  // 나타나야 하므로 한 축 가장자리가 아니라 격자 교차점마다 찍는다.
+  const STEP = 128, MAJOR = 640;
+  const w = document.documentElement.clientWidth;
+  const h = document.documentElement.clientHeight;
+  let html = '';
+  for (let y = 0; y < h; y += STEP) {
+    for (let x = 0; x < w; x += STEP) {
+      const major = (x % MAJOR === 0) && (y % MAJOR === 0);
+      html += `<span class="lbl${major ? ' major' : ''}" style="left:${x + 3}px;top:${y + 3}px">${x},${y}</span>`;
+    }
+  }
+  document.getElementById('ruler').insertAdjacentHTML('beforeend', html);
+  document.title = `ruler ${w}x${h}`;
+</script>
