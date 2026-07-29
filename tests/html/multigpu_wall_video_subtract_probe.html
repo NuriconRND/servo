@@ -1,0 +1,186 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Video Subtractive Bisect Probe</title>
+<!--
+  DComp 투명 구멍 이분 탐색 — **재현되는 원본에서 빼는** 방식.
+
+  ★ 기준점(파라미터 없음)은 multigpu_wall_video_file_probe.html 과 마크업·CSS가 동일하다.
+    장식은 전부 처음부터 마크업/CSS에 있고, `?no=` 가 '제거'만 한다. (이전 판은 JS로
+    '추가'하는 구조라 기준점이 원본과 달랐다 — html+body 이중 배경 누락, border-box
+    기하 차이, controls 생성 시점 차이.)
+
+    ?no=main      <main position:relative> 래퍼 제거(자식을 body로 승격)
+    ?no=controls  <video controls> 제거
+    ?no=bg        html+body 4중 그라디언트 배경 제거
+    ?no=stage     .video-stage 의 border/box-shadow/background 제거
+    ?no=strip     .motion-strip 제거
+    ?no=labels    경계 라벨 4개 제거
+  여러 개 동시: ?no=main,controls
+
+  ★ 적용된 제거 목록이 좌상단 stats 패널(tile 0)에 **항상 표시**된다. 파라미터가 실제로
+    먹었는지 매번 화면에서 확인할 것 — 안 먹은 채 판정하면 전부 무의미하다.
+  ★ 쿼리스트링은 절대 file:/// URL 로만 동작한다. 상대경로+?query 는 servoshell이 파일명으로
+    취급해 로드에 실패한다(오류 페이지).
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: system-ui, sans-serif;
+    background: #111;
+    color: #f4f4f4;
+  }
+
+  /* 원본과 동일: 그라디언트가 html·body 둘 다에 걸린다(= 문서 전체 그라디언트가 두 번 그려짐) */
+  html, body {
+    margin: 0;
+    min-width: 5760px;
+    min-height: 3240px;
+    overflow: hidden;
+    background:
+      linear-gradient(90deg, transparent 0 1918px, #ff4757 1918px 1922px, transparent 1922px 3838px, #ffa502 3838px 3842px, transparent 3842px),
+      linear-gradient(0deg, transparent 0 1078px, #2ed573 1078px 1082px, transparent 1082px 2158px, #1e90ff 2158px 2162px, transparent 2162px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.06) 0 1px, transparent 1px 240px),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.06) 0 1px, transparent 1px 180px),
+      #111;
+  }
+  html.no-bg, body.no-bg { background: #111; }
+
+  main {
+    position: relative;
+    width: 5760px;
+    height: 3240px;
+  }
+
+  .boundary-label {
+    position: absolute;
+    z-index: 3;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, .72);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font-size: 28px;
+    line-height: 1.1;
+  }
+
+  .x1 { left: 1932px; top: 24px; }
+  .x2 { left: 3852px; top: 24px; }
+  .y1 { left: 24px; top: 1092px; }
+  .y2 { left: 24px; top: 2172px; }
+
+  .video-stage {
+    position: absolute;
+    left: 1440px;
+    top: 420px;
+    width: 2880px;
+    height: 1620px;
+    border: 6px solid #f4f4f4;
+    box-sizing: border-box;
+    background: #000;
+    box-shadow: 0 0 0 6px rgba(0, 0, 0, .38);
+  }
+  .video-stage.no-stage { border: 0; background: none; box-shadow: none; }
+
+  video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .stats {
+    position: absolute;
+    left: 96px;
+    top: 96px;
+    z-index: 4;
+    width: 760px;
+    padding: 22px 26px;
+    background: rgba(0, 0, 0, .76);
+    border: 1px solid rgba(255, 255, 255, .34);
+    font: 30px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre;
+  }
+
+  .motion-strip {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 5760px;
+    height: 160px;
+    background: repeating-linear-gradient(90deg, #f4f4f4 0 96px, #111 96px 192px);
+    opacity: .82;
+    animation: slide 2s linear infinite;
+  }
+
+  @keyframes slide {
+    from { background-position-x: 0; }
+    to { background-position-x: 192px; }
+  }
+</style>
+<main id="main">
+  <div class="stats" id="stats">loading</div>
+  <div class="boundary-label x1">x=1920</div>
+  <div class="boundary-label x2">x=3840</div>
+  <div class="boundary-label y1">y=1080</div>
+  <div class="boundary-label y2">y=2160</div>
+  <section class="video-stage" id="stage">
+    <video id="probeVideo" autoplay muted loop playsinline controls>
+      <source src="../Wildlife_FHD30fps_counter_10Mbitrate.mp4" type="video/mp4">
+    </video>
+  </section>
+  <div class="motion-strip" id="strip"></div>
+</main>
+<script>
+  // 제거만 한다. 기준점(파라미터 없음)은 위 마크업/CSS 그대로 = file_probe 원본.
+  const removed = new Set(
+    (new URLSearchParams(location.search).get("no") || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+  );
+
+  if (removed.has("bg")) {
+    document.documentElement.classList.add("no-bg");
+    document.body.classList.add("no-bg");
+  }
+  if (removed.has("stage")) document.getElementById("stage").classList.add("no-stage");
+  if (removed.has("controls")) document.getElementById("probeVideo").removeAttribute("controls");
+  if (removed.has("strip")) document.getElementById("strip").remove();
+  if (removed.has("labels")) {
+    document.querySelectorAll(".boundary-label").forEach(el => el.remove());
+  }
+  if (removed.has("main")) {
+    const main = document.getElementById("main");
+    while (main.firstChild) document.body.appendChild(main.firstChild);
+    main.remove();
+  }
+
+  // `?no=main`이 구멍을 없앤 뒤, 원인 속성을 더 좁히는 변형들.
+  //   ?main=static — 래퍼는 그대로 두고 position: relative 만 해제
+  //                  (main은 문서 원점에 있으므로 절대배치 자식의 화면 위치는 동일)
+  //   ?main=small  — relative 유지, 크기만 뷰포트와 동일하게(3840x1080)
+  // static에서 구멍이 사라지면 원인은 `position: relative` 자체,
+  // small에서 사라지면 원인은 "뷰포트보다 훨씬 큰 위치지정 박스".
+  const mainMode = new URLSearchParams(location.search).get("main") || "";
+  const mainEl = document.getElementById("main");
+  if (mainEl && mainMode === "static") mainEl.style.position = "static";
+  if (mainEl && mainMode === "small") {
+    mainEl.style.width = "3840px";
+    mainEl.style.height = "1080px";
+  }
+
+  const video = document.getElementById("probeVideo");
+  const stats = document.getElementById("stats");
+  let rafCount = 0;
+  video.play().catch(() => {});
+
+  function tick() {
+    rafCount += 1;
+    stats.textContent = [
+      "subtractive bisect probe",
+      `REMOVED: ${removed.size ? [...removed].join(", ") : "(none = file_probe 원본)"}`,
+      `MAIN: ${mainMode || "relative 5760x3240 (원본)"}`,
+      `viewport: ${document.documentElement.clientWidth}x${document.documentElement.clientHeight}`,
+      `time: ${video.currentTime.toFixed(3)}  readyState: ${video.readyState}`,
+      `raf: ${rafCount}`
+    ].join("\n");
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+</script>

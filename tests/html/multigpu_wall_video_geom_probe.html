@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Video Geometry Probe</title>
+<!--
+  DComp 투명 구멍 이분 탐색 — file_probe에서 **빼면서** 좁힌다.
+
+  유지한 것 (file_probe와 동일):
+    - 문서 5760x3240 (뷰포트 3840x1080을 크게 넘침)
+    - 비디오 박스 left:1440 top:420 2880x1620  ← 뷰포트를 오른쪽·아래로 넘어감
+    - video { width:100%; height:100%; object-fit:cover }
+
+  제거한 것:
+    - body 배경 4중 그라디언트(문서 전체를 덮는 거대 backdrop 프리미티브)
+    - .stats 패널, 경계 라벨 4개, .motion-strip(애니메이션)
+    - .video-stage의 border 6px / box-shadow / background
+    - <video controls>
+
+  관측 매트릭스:
+    minimal      (비디오 O 소형·뷰포트 내, 넘침 X) -> 구멍 없음
+    overflow     (비디오 X,               넘침 O) -> 구멍 없음
+    video+overflow(비디오 O 소형·뷰포트 내, 넘침 O) -> 구멍 없음
+    file_probe   (전부)                            -> 구멍 남
+    이 페이지    (비디오 기하만 file_probe와 동일) -> ?
+
+  구멍 O -> 트리거는 비디오 자체의 기하/스케일(뷰포트 밖으로 넘는 대형 비디오 + object-fit).
+  구멍 X -> 트리거는 제거한 장식 중 하나. 유력 후보는 body 배경 그라디언트
+           (문서 전체 5760x3240을 덮는 단일 backdrop — 슬라이싱 판단을 바꿀 수 있다).
+-->
+<style>
+  html, body { margin: 0; overflow: hidden; background: #111; }
+  body { min-width: 5760px; min-height: 3240px; }
+
+  /* y=512 = WR 기본 픽처 타일 행 경계. 구멍 상변 확인용 기준선 */
+  .row512 { position: absolute; left: 0; top: 510px; width: 3840px; height: 4px;
+            background: #2ed573; z-index: 5; }
+  .seam   { position: absolute; left: 1918px; top: 0; width: 4px; height: 1080px;
+            background: #ff4757; z-index: 5; }
+
+  /* file_probe와 동일한 비디오 기하 — 뷰포트를 오른쪽·아래로 넘어간다 */
+  .video-stage { position: absolute; left: 1440px; top: 420px;
+                 width: 2880px; height: 1620px; }
+  video { display: block; width: 100%; height: 100%; object-fit: cover; }
+</style>
+<div class="row512"></div>
+<div class="seam"></div>
+<section class="video-stage">
+  <video id="v" autoplay muted loop playsinline>
+    <source src="../Wildlife_FHD30fps_counter_10Mbitrate.mp4" type="video/mp4">
+  </video>
+</section>
+<script>
+  document.getElementById("v").play().catch(() => {});
+</script>

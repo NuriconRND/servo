@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Video Bisect Probe</title>
+<!--
+  DComp 투명 구멍 이분 탐색 도구.
+
+  기반(파라미터 없음) = multigpu_wall_video_geom_probe.html 과 동일하며 **구멍이 나지 않는다**:
+    문서 5760x3240 / 비디오 박스 left1440 top420 2880x1620 (뷰포트 밖으로 넘침) / object-fit:cover
+
+  여기에 file_probe가 가지고 있던 장식을 쿼리스트링으로 하나씩 되살린다.
+  한 번에 **하나만** 켜서 어느 것이 트리거인지 가른다.
+
+    ?controls=1  <video controls>            — 비디오 '위에' 그려지는 유일한 요소
+    ?bg=1        body 4중 그라디언트 배경     — 문서 전체(5760x3240) 덮는 backdrop
+    ?stage=1     스테이지 border/box-shadow/background:#000
+    ?strip=1     .motion-strip (문서 하단, 무한 애니메이션)
+    ?panel=1     .stats 패널 + 경계 라벨 4개 (반투명 배경 박스)
+
+  예: ...multigpu_wall_video_bisect_probe.html?controls=1
+-->
+<style>
+  html, body { margin: 0; overflow: hidden; background: #111; color: #f4f4f4; }
+  body { min-width: 5760px; min-height: 3240px; }
+
+  .row512 { position: absolute; left: 0; top: 510px; width: 3840px; height: 4px;
+            background: #2ed573; z-index: 5; }
+  .seam   { position: absolute; left: 1918px; top: 0; width: 4px; height: 1080px;
+            background: #ff4757; z-index: 5; }
+
+  .video-stage { position: absolute; left: 1440px; top: 420px;
+                 width: 2880px; height: 1620px; box-sizing: border-box; }
+  video { display: block; width: 100%; height: 100%; object-fit: cover; }
+
+  /* --- 토글로만 적용되는 장식들 (file_probe에서 그대로 가져옴) --- */
+  body.opt-bg {
+    background:
+      linear-gradient(90deg, transparent 0 1918px, #ff4757 1918px 1922px, transparent 1922px 3838px, #ffa502 3838px 3842px, transparent 3842px),
+      linear-gradient(0deg, transparent 0 1078px, #2ed573 1078px 1082px, transparent 1082px 2158px, #1e90ff 2158px 2162px, transparent 2162px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.06) 0 1px, transparent 1px 240px),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.06) 0 1px, transparent 1px 180px),
+      #111;
+  }
+  .video-stage.opt-stage { border: 6px solid #f4f4f4; background: #000;
+                           box-shadow: 0 0 0 6px rgba(0,0,0,.38); }
+  .motion-strip { position: absolute; left: 0; bottom: 0; width: 5760px; height: 160px;
+                  background: repeating-linear-gradient(90deg, #f4f4f4 0 96px, #111 96px 192px);
+                  opacity: .82; animation: slide 2s linear infinite; }
+  @keyframes slide { from { background-position-x: 0; } to { background-position-x: 192px; } }
+  .boundary-label { position: absolute; z-index: 3; padding: 8px 12px;
+                    background: rgba(0,0,0,.72); border: 1px solid rgba(255,255,255,.34);
+                    font: 28px/1.1 sans-serif; }
+  .stats { position: absolute; left: 96px; top: 96px; z-index: 4; width: 760px;
+           padding: 22px 26px; background: rgba(0,0,0,.76);
+           border: 1px solid rgba(255,255,255,.34);
+           font: 30px/1.35 ui-monospace, Consolas, monospace; white-space: pre; }
+</style>
+<div class="row512"></div>
+<div class="seam"></div>
+<section class="video-stage" id="stage">
+  <video id="v" autoplay muted loop playsinline>
+    <source src="../Wildlife_FHD30fps_counter_10Mbitrate.mp4" type="video/mp4">
+  </video>
+</section>
+<script>
+  const q = new URLSearchParams(location.search);
+  const on = name => q.get(name) === "1";
+
+  if (on("bg")) document.body.classList.add("opt-bg");
+  if (on("stage")) document.getElementById("stage").classList.add("opt-stage");
+  if (on("controls")) document.getElementById("v").setAttribute("controls", "");
+
+  if (on("strip")) {
+    const d = document.createElement("div");
+    d.className = "motion-strip";
+    document.body.appendChild(d);
+  }
+
+  if (on("panel")) {
+    const mk = (cls, css, text) => {
+      const d = document.createElement("div");
+      d.className = cls;
+      d.style.cssText = css;
+      d.textContent = text;
+      document.body.appendChild(d);
+      return d;
+    };
+    mk("boundary-label", "left:1932px;top:24px", "x=1920");
+    mk("boundary-label", "left:3852px;top:24px", "x=3840");
+    mk("boundary-label", "left:24px;top:1092px", "y=1080");
+    mk("boundary-label", "left:24px;top:2172px", "y=2160");
+    const stats = mk("stats", "", "loading");
+    const v = document.getElementById("v");
+    let raf = 0;
+    (function tick() {
+      raf += 1;
+      stats.textContent = `bisect probe\nactive: ${[...q].map(([k, v2]) => k + "=" + v2).join(" ") || "(none)"}\ntime: ${v.currentTime.toFixed(3)}  raf: ${raf}`;
+      requestAnimationFrame(tick);
+    })();
+  }
+
+  document.getElementById("v").play().catch(() => {});
+</script>

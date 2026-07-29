@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Multi-GPU Wall Overflow Probe (no video)</title>
+<!--
+  DComp 투명 구멍 진단 3단계 대조군.
+
+  지금까지의 관측:
+  - video_file_probe (비디오 O, 문서 넘침 O) -> 구멍 남
+  - video_minimal_probe (비디오 O, 문서 넘침 X) -> 구멍 없음
+  - 이 페이지        (비디오 X, 문서 넘침 O) -> ?
+
+  즉 "비디오"와 "문서가 뷰포트를 넘침(=픽처 캐시 2행 이상 요구)" 두 변수를 분리한다.
+  구멍이 나면 비디오는 무관하고 트리거는 문서 넘침이다.
+
+  문서를 세로로 뷰포트(1080)의 2배 이상으로 만들고, y=512 아래에도 계속 콘텐츠가
+  있도록 눈금을 전 영역에 깐다. 좌표 라벨은 가상좌표 절대값이라 어긋남도 같이 읽힌다.
+-->
+<style>
+  html, body { margin: 0; background: #111; }
+  /* 문서를 뷰포트보다 크게 만든다 — 이것이 이 대조군의 유일한 조작 변인 */
+  body { min-width: 3840px; min-height: 2400px; overflow: hidden; }
+  #sheet {
+    position: absolute; left: 0; top: 0; width: 3840px; height: 2400px;
+    background-image:
+      repeating-linear-gradient(to right,  #26263a 0 1px, transparent 1px 8px),
+      repeating-linear-gradient(to bottom, #26263a 0 1px, transparent 1px 8px),
+      repeating-linear-gradient(to right,  #5a5ab4 0 1px, transparent 1px 120px),
+      repeating-linear-gradient(to bottom, #5a5ab4 0 1px, transparent 1px 120px);
+  }
+  /* y=512는 WR 기본 픽처 타일 행 경계(1024x512). 구멍의 상변이 여기 걸리는지 보기 위한 기준선 */
+  .row512 {
+    position: absolute; left: 0; top: 510px; width: 3840px; height: 4px;
+    background: #2ed573; z-index: 2;
+  }
+  .seam {
+    position: absolute; left: 1918px; top: 0; width: 4px; height: 2400px;
+    background: #ff4757; z-index: 2;
+  }
+  .lbl {
+    position: absolute; font: 11px/1 monospace; color: #7fb2d9;
+    white-space: nowrap; pointer-events: none;
+  }
+  #note {
+    position: absolute; left: 48px; top: 600px; z-index: 3;
+    font: 28px/1.4 ui-monospace, Consolas, monospace; color: #ffd75f; white-space: pre;
+  }
+</style>
+<div id="sheet"></div>
+<div class="row512"></div>
+<div class="seam"></div>
+<div id="note">overflow probe (no video)
+document 3840x2400 &gt; viewport
+green line = y 512 (WR tile row boundary)</div>
+<script>
+  // 라벨 간격 120 = gcd(1920, 1080): 모든 타일 원점에 라벨이 놓인다.
+  const STEP = 120;
+  const W = 3840, H = 2400;
+  let html = '';
+  for (let y = 0; y < H; y += STEP) {
+    for (let x = 0; x < W; x += STEP) {
+      html += `<span class="lbl" style="left:${x + 3}px;top:${y + 3}px">${x},${y}</span>`;
+    }
+  }
+  document.getElementById('sheet').insertAdjacentHTML('beforeend', html);
+</script>
