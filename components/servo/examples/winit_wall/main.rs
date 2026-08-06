@@ -175,6 +175,8 @@ struct AppState {
     // Filled in after the tiles exist (the WebView's delegate is `AppState` itself).
     webview: RefCell<Option<WebView>>,
     tiles: Vec<TileWindow>,
+    // DPI 변경 시 가드밴드 여백을 다시 계산하려면 레이아웃이 필요하다.
+    layout: WallLayout,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
     // whether a slow oversized present is the cause vs WebRender update/draw. Logged once/sec.
@@ -244,6 +246,18 @@ impl AppState {
                 Err(error) => eprintln!("capture: failed to write {path}: {error}"),
             },
             None => eprintln!("capture: read_to_image returned None (no framebuffer readback)"),
+        }
+    }
+
+    /// DPI가 바뀌면 가드밴드 여백을 다시 계산해 주입한다. 창 생성 시의 스냅샷을
+    /// 그대로 두면 혼합 DPI 환경에서 blit 경로와 값이 갈린다.
+    ///
+    /// 이벤트는 창 하나에 대해 오지만 전 타일을 각자의 scale factor로 다시
+    /// 계산한다 — 타일마다 DPI가 다를 수 있기 때문이다.
+    fn reapply_present_insets(&self) {
+        for (tile_index, tile) in self.tiles.iter().enumerate() {
+            let hidpi = Scale::new(tile.window.scale_factor() as f32);
+            tile::apply_present_inset(&self.layout, tile_index, hidpi, &tile.rendering_context);
         }
     }
 
@@ -372,6 +386,7 @@ impl ApplicationHandler<WakerEvent> for App {
             servo,
             webview: RefCell::new(None),
             tiles,
+            layout: config.layout.clone(),
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
             present_window_start: Cell::new(None),
@@ -455,6 +470,11 @@ impl ApplicationHandler<WakerEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                if let Self::Running(state) = self {
+                    state.reapply_present_insets();
+                }
+            },
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
                     state.render_all_tiles();

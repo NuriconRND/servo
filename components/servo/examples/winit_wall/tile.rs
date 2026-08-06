@@ -9,14 +9,37 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use euclid::Scale;
 use servo::wall_layout::WallLayout;
 use servo::{
-    DisplayTopology, RenderingContext, WebViewPaintTarget, WindowRenderingContext,
-    dxgi_luid_for_gpu_index,
+    DeviceIndependentPixel, DevicePixel, DisplayTopology, RenderingContext, WebViewPaintTarget,
+    WindowRenderingContext, dxgi_luid_for_gpu_index,
 };
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::raw_window_handle::{DisplayHandle, HasWindowHandle};
 use winit::window::Window;
+
+/// 타일의 가드밴드 여백을 렌더링 컨텍스트에 주입한다.
+///
+/// 값의 산출처는 `WallLayout::tile_render_insets` 하나뿐이다 — winit_wall은
+/// 어떤 경로에서도 inset을 자체 계산하지 않는다. (servoshell 최종 리뷰가
+/// "공유된 건 산식이고 값이 아니었다"로 지적한 발산의 재연 방지.)
+pub(crate) fn apply_present_inset(
+    layout: &WallLayout,
+    tile_index: usize,
+    hidpi: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+    rendering_context: &Rc<dyn RenderingContext>,
+) {
+    let Some(inset) = layout.tile_render_insets(tile_index, hidpi) else {
+        return;
+    };
+    rendering_context.set_present_inset(inset);
+    // 로거 초기화 이전에 창이 생성될 수 있어 info!는 유실된다 — servoshell 관례대로 eprintln.
+    eprintln!(
+        "wall: tile {tile_index} present_inset (top {}, right {}, bottom {}, left {})",
+        inset.top, inset.right, inset.bottom, inset.left,
+    );
+}
 
 /// One wall tile: its own window, rendering context (GPU), and paint target.
 /// `paint_target == None` marks the primary tile, which is painted via
@@ -127,6 +150,9 @@ pub(crate) fn create_tile_windows(
             )
             .expect("Could not create RenderingContext for tile window"),
         );
+
+        let hidpi = Scale::new(window.scale_factor() as f32);
+        apply_present_inset(layout, tile_index, hidpi, &rendering_context);
 
         tiles.push(TileWindow {
             window,
