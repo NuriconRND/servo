@@ -92,15 +92,25 @@ DComp 네이티브 컴포지터는 ANGLE 빌드에서만 성립하고, 제로카
 - 인라인 `mod wall`(667행~)을 삭제하고 `servo::wall_layout`을 쓴다
 - `--capture` 경로는 유지한다(리드백 검증에 유용, d3d11 비의존)
 
-### 3. 가드밴드 — `present_inset` 주입
+### 3. 가드밴드 — `present_inset` 주입 (★2026-08-06 이후 최종 리뷰로 철회 — 아래 §가드밴드는 winit_wall에서 지원되지 않는다 참조)
 
 타일 창 생성 시 `WallLayout::tile_render_insets(tile_index, hidpi)`의 결과를 그 타일의 `RenderingContext::set_present_inset`으로 주입한다. **이 함수가 가드밴드 값의 유일한 산출처**이며, winit_wall은 어떤 경로에서도 inset을 자체 계산하지 않는다 — 이 브랜치 최종 리뷰가 "공유된 건 산식이고 값이 아니었다"로 지적한 발산을 그대로 재연하지 않기 위함이다.
 
 진단 로그는 servoshell 관례대로 `eprintln!("wall: ...")`로 낸다 — 로거 초기화 이전에 창이 생성될 수 있어 `info!`는 유실된다.
 
-### 4. DPI 변경 시 재주입
+**이 설계는 Critical 결함이었다.** `present_inset` 주입은 servoshell에서 세 가지(오프스크린 확장 서피스 / render-rect 원점 씬 / present 크롭)가 세트로 성립할 때만 옳다. winit_wall은 셋 중 present 크롭 하나만 흉내냈다 — 창 서피스에 직접 렌더하고(오프스크린 확장 없음) 씬 원점이 `tile_origin_device_vector`(=visible 원점, render-rect 원점 아님)였다. 그 결과 DComp off(기본)에서는 소비자가 없어 주입이 무효였고, DComp on에서는 root visual을 `-inset`만큼 미는데 상쇄할 확장이 없어 **콘텐츠가 `overlapPx`만큼 어긋났다**(실제 오작동). 최종 리뷰 대응으로 이 절의 주입 자체를 제거했다(`tile.rs`에서 `set_present_inset` 호출 삭제) — 상세는 아래 §가드밴드는 winit_wall에서 지원되지 않는다.
 
-`WindowEvent::ScaleFactorChanged`에서 해당 타일의 inset을 재계산해 다시 주입한다. 이 핸들러는 현재 winit_wall에 없다.
+### 4. DPI 변경 시 재주입 (★위와 같은 이유로 철회)
+
+`WindowEvent::ScaleFactorChanged`에서 해당 타일의 inset을 재계산해 다시 주입한다. 이 핸들러는 구현 당시 winit_wall에 추가됐으나(`AppState::reapply_present_insets`), §3의 주입 자체가 철회되면서 존재 이유가 사라져 최종 리뷰 대응에서 함께 제거했다(죽은 코드를 남기지 않기 위해 `WindowEvent::ScaleFactorChanged` 매치 arm도 함께 삭제).
+
+### 가드밴드는 winit_wall에서 지원되지 않는다 (후속 과제)
+
+`overlapPx` 가드밴드 크롭은 현재 winit_wall이 **지원하지 않는다.** `overlapPx: 0`인 레이아웃(타일 경계가 정확히 맞물리는 표준 배치)은 영향이 없다 — 문제는 오직 `overlapPx > 0`(그림자/블러/AA가 타일 경계를 넘나드는 콘텐츠를 위한 가드밴드) 레이아웃에서만 나타난다.
+
+**왜인지.** 좌표/서피스 모델이 servoshell과 다르다. servoshell은 render-rect(visible보다 `overlapPx`만큼 확장) 크기의 오프스크린 서피스에 렌더한 뒤, 씬 원점을 render-rect 원점에 두고, present 시 visible sub-rect만 크롭해 창에 보여준다(blit source rect 또는 DComp root-visual 오프셋). winit_wall은 창 서피스에 직접 렌더하고(오프스크린 확장 없음) 씬 원점이 visible 원점이다 — 셋 중 하나만 있는 상태로는 크롭이 성립하지 않는다(위 §3 참조).
+
+**지원하려면 무엇이 필요한지.** servoshell `gui.rs`의 `webview_rendering_size`(오프스크린을 render-rect 크기로 확장) + `webview_paint_origin()`(씬 원점을 render-rect 원점으로) + `webview_visible_source_rect`(present 시 visible sub-rect blit) 세 가지에 상당하는 구현을 winit_wall에 추가해야 한다. winit_wall은 오프스크린 래퍼가 없는 `WindowRenderingContext` 직결 구조이므로, 이는 단순 이식이 아니라 별도 설계가 필요한 과제다 — 이번 최종 수정 라운드의 범위 밖으로 명시적으로 미룬다.
 
 ### 5. borderless fullscreen
 
@@ -135,6 +145,7 @@ Cargo가 지원하는 표준 형태이며, 타일 수명 관리가 이 파일에
 - `scroll_offsets=mismatched` 발생 (barrier missed와 무관하게 별도 카운트되는 진짜 동기화 실패)
 - barrier missed에 panic이 동반됨(정책이 깨져 크래시로 전이됨)
 - 특정 타깃이 아니라 다수 타깃이 동시다발로 missing되는 패턴(단일 타깃의 산발적 지연이 아니라 배리어 메커니즘 자체의 이상)
+- **(2026-08-06 최종 리뷰로 좁힘)** 데드라인 초과폭이 리프레시 주기 이내(≤약 17ms)인 미스는 회귀 신호가 아니다 — `components/paint/paint.rs:56`의 `WALL_FRAME_BARRIER_DEADLINE = 16ms`가 60Hz vsync 주기(16.667ms)보다 짧아, vsync에 페이싱된 2번째 이후 타깃이 한 vsync 뒤에 도착하면 **구조적으로 항상 데드라인을 넘는다**(설계상 예견된 오검출 여지이지 결함이 아니다). 실측에서도 미스의 58%가 16.0~17.0ms 구간에 몰렸고, 48건이 전부 `PainterId(2)`에 쏠린 것도 "그 타일이 느려서"가 아니라 팬아웃 순서상 2번째 타깃이 항상 마지막에 준비되기 때문이었다. 반면 **초과폭이 큰 미스(>20ms)의 건수 추이**는 신호로 유지한다 — 이런 미스는 vsync 1주기 지연으로는 설명되지 않으므로 실제 지연/이상을 가리킬 가능성이 높다.
 
 ### winit_wall 기능
 
@@ -206,15 +217,22 @@ b02ec108ce2 fix(winit_wall): rustfmt drift on set_fullscreen call
 
   **결론(주장 완화)**: 세 실행 모두 로그 말미가 온전한 레코드로 끝나 있어 실제 데이터 유실의 물증은 없다. 그러나 재실행 1·2가 보여주듯 `CloseMainWindow` 이후 프로세스가 스스로 정상 종료한다는 보장이 없고(때로는 teardown 크래시로, 때로는 20초 넘게 무응답으로 이어져 강제종료가 필요했다), 원 실행(Run A)의 강제종료 자체도 재현 가능한 정상 경로임이 확인됐다. 따라서 원 실행 로그의 카운트(326/2/150)에 대해 **"유실 없음"이라고 단정하지 않는다** — CLAUDE.md가 경고하는 강제종료發 유실 가능성은 완전히 배제할 수 없고, 다만 관측된 로그가 온전한 레코드로 끝나 있다는 정황과, 재실행들의 카운트가 (실행 길이가 다름을 감안하면) 같은 자릿수 범위로 일관됐다는 점이 신뢰도를 뒷받침하는 보강 증거다. `present_inset` 값은 세 실행 모두 동일해 그 자체는 강한 신뢰도를 갖는다(강제종료와 무관하게 창 생성 직후 1회 기록되는 값이라 종료 타이밍의 영향을 받지 않음).
 
-- **winit_wall 기능**: 2x1 `ready=2/2` 배리어 149/149(missed 0). DComp A/B — `SERVO_COMPOSITOR_DCOMP=1`에서 `[dcomp-native] engaged` 2회 + 타일별 guard-band offset 로그(`(0,0)`/`(-32,0)`, servoshell과 동일 inset에서 산출), off에서는 `dcomp-native` 로그 0회. 미디어(`video_grid_6x6_play.html?grid=2`, `SERVO_MEDIA_SYNC_GROUP=4`) — `Sync group: 4/4 pipelines armed` + `released: 4 pipelines starting at shared base time`, 배리어 474/475, **missed 1**(`first_ready_elapsed_ms=28.036ms`, deadline 16.000ms 대비 **+12.036ms/+75%**), panic 0. 이 미스도 위와 동일하게 `keep-previous-frame` 정책 범위(panic 미동반, scroll mismatch 미동반)이지만 초과폭 자체는 절대 크다는 점을 그대로 기록한다.
+- **winit_wall 기능**: 2x1 `ready=2/2` 배리어 149/149(missed 0). DComp A/B — `SERVO_COMPOSITOR_DCOMP=1`에서 `[dcomp-native] engaged` 2회 + 타일별 guard-band offset 로그(`(0,0)`/`(-32,0)`), off에서는 `dcomp-native` 로그 0회. 미디어(`video_grid_6x6_play.html?grid=2`, `SERVO_MEDIA_SYNC_GROUP=4`) — `Sync group: 4/4 pipelines armed` + `released: 4 pipelines starting at shared base time`, 배리어 474/475, **missed 1**(`first_ready_elapsed_ms=28.036ms`, deadline 16.000ms 대비 **+12.036ms/+75%**), panic 0. 이 미스도 위와 동일하게 `keep-previous-frame` 정책 범위(panic 미동반, scroll mismatch 미동반)이지만 초과폭 자체는 절대 크다는 점을 그대로 기록한다.
+
+  **정정(2026-08-06 최종 리뷰 대응).** 위 `(-32,0)` guard-band offset 로그를 "servoshell과 동일한 inset에서 산출"이라고 적어 **정합성 근거처럼** 서술했으나, 이는 사실을 뒤집은 서술이었다 — 값이 같다는 것 자체가 문제였다. winit_wall은 오프스크린 확장 서피스도 render-rect 원점 씬도 없이 `present_inset`만 servoshell과 동일하게 주입했으므로, DComp 경로가 이 값만큼 root visual을 밀면 상쇄되지 않은 채 콘텐츠가 `overlapPx`(32px)만큼 어긋난다(Critical, 위 §3 참조). 최종 리뷰 대응으로 `present_inset` 주입을 제거했으므로, 이후 이 로그는 오프/온 모두 `(0,0)`(트레잇 기본값)으로 나오는 것이 맞는 동작이다.
 - **GUI 육안 판정**(이음매 라벨 120px 간격, DComp 하단 밴드/blit 부재, lockstep 실화면 확인)은 로그로 판정 불가능한 항목이라 서브에이전트가 수행하지 않았다 — 사용자 이월(보고서의 "사용자 육안 판정용 명령" 참조, `task-6-report.md`).
 
 ### 이월 항목 (설계 문서 §설계 시 주의 + 코드 인라인 주석과 대응)
 
-1. `servo::wall_layout::WallLayoutError`가 `std::error::Error` 미구현 — winit_wall `parse_args()`가 `.map_err(|error| error.to_string())`로 우회 (코드에 인라인 주석으로 명시).
+1. ~~`servo::wall_layout::WallLayoutError`가 `std::error::Error` 미구현~~ — **2026-08-06 최종 리뷰 대응에서 해소.** `impl std::error::Error for WallLayoutError`(`source()`는 `Io`/`Json` variant에서 내부 에러 반환)를 추가하고, winit_wall `parse_args()`의 `.map_err(|error| error.to_string())` 우회를 제거했다(`?`가 바로 `Box<dyn Error>`로 크로스한다).
 2. 토폴로지 완전 미탐지(`!have_topology`) 분기에서 타일당 stderr 진단 한 줄이 servoshell 대비 누락(`tile.rs:112-138`) — 토폴로지 out-of-range 경고는 있으나 완전 부재 시 무음.
 3. `spatial.get(tile.display)`를 `tile.rs`에서 2회(라인 75, 148) 중복 조회 — 기능상 문제는 없으나 정리 여지.
 4. 비Windows 빌드에서 `vsync_driver` 파라미터가 미사용 경고를 낼 수 있음(`create_tile_windows`가 `#[cfg(not(target_os = "windows"))]` 분기에서 그 인자를 안 씀) — 비Windows에서 실컴파일 검증하지 않아 미확정.
 5. 비Windows 경로 컴파일은 이번 Task 6에서도 검증하지 않았다(개발/실행 환경이 Windows 전용).
 
 이 5건 중 설계를 바꿔야 할 만한 것은 없다 — 전부 후속 정리 과제로 이월한다.
+
+### 후속 과제 (2026-08-06 최종 리뷰 대응에서 추가)
+
+6. **가드밴드(오프스크린 확장 + render-rect 원점 씬 + visible-rect 크롭) 미지원.** §가드밴드는 winit_wall에서 지원되지 않는다 참조. `present_inset` 주입만으로는 성립하지 않음이 Critical로 확인되어 제거했다 — 지원하려면 별도 설계가 필요하다.
+7. **`WALL_FRAME_BARRIER_DEADLINE`(16ms, `components/paint/paint.rs:56`)이 60Hz vsync 주기(16.667ms)보다 짧다.** vsync 페이싱된 팬아웃의 2번째 이후 타깃이 구조적으로 데드라인을 넘기는 원인. 데드라인을 리프레시 주기 위(예: 17ms 또는 20ms)로 올리거나, 고정 ms 대신 vsync 배수(예: "1.5 vsync 주기")로 표현하도록 재설계하는 것을 후속 과제로 남긴다. §테스트 절의 회귀 신호 기준을 참조.

@@ -180,6 +180,16 @@ impl fmt::Display for WallLayoutError {
     }
 }
 
+impl std::error::Error for WallLayoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WallLayoutError::Io(error) => Some(error),
+            WallLayoutError::Json(error) => Some(error),
+            WallLayoutError::Invalid(_) => None,
+        }
+    }
+}
+
 fn parse_virtual_viewport(
     value: &Value,
 ) -> Result<Size2D<u32, DeviceIndependentPixel>, WallLayoutError> {

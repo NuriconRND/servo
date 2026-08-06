@@ -21,6 +21,7 @@ use euclid::{
 use keyboard_types::ShortcutMatcher;
 use log::{debug, info, warn};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
+use servo::wall_layout::WallLayout;
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, Cursor, DeviceIndependentIntRect,
     DeviceIndependentPixel, DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint,
@@ -62,7 +63,6 @@ use crate::window::{
     LINE_HEIGHT, LINE_WIDTH, MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow,
     ServoShellWindowId,
 };
-use servo::wall_layout::WallLayout;
 
 pub(crate) const INITIAL_WINDOW_TITLE: &str = "Servo";
 

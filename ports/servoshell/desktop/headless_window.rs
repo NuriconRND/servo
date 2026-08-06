@@ -13,6 +13,7 @@ use std::sync::atomic::AtomicU64;
 
 use euclid::{Point2D, Scale, Size2D};
 use log::error;
+use servo::wall_layout::WallLayout;
 use servo::{
     DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntRect, DeviceIntSize,
     DevicePixel, RenderingContext, ScreenGeometry, SoftwareRenderingContext, WebView,
@@ -22,7 +23,6 @@ use winit::dpi::PhysicalSize;
 
 use crate::prefs::ServoShellPreferences;
 use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
-use servo::wall_layout::WallLayout;
 
 pub struct HeadlessWindow {
     id: ServoShellWindowId,

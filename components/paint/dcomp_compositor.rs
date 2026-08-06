@@ -1203,8 +1203,9 @@ pub struct DCompNativeCompositor {
     /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
     /// root visual 자체는 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop =
     /// teardown 전용)에서만 버려진다. 다만 **값은 런타임에 바뀔 수 있다** — DPI 변경 시
-    /// servoshell이 `set_present_inset`으로 재주입하므로, 캐시 판정은 "한 번 적용했는지"가
-    /// 아니라 **값 비교**여야 한다(그렇게 구현돼 있다). 값은 항상 device px
+    /// servoshell이 `set_present_inset`으로 재주입하므로(월 임베더 중 servoshell만 이 값을
+    /// 주입한다 — `RenderingContext::present_inset` 문서 참조), 캐시 판정은 "한 번
+    /// 적용했는지"가 아니라 **값 비교**여야 한다(그렇게 구현돼 있다). 값은 항상 device px
     /// 정수(가드밴드 폭)이므로 `f32` 대신 `i32`로 저장하고 캐시 비교는 정수로 한다 — 캐스팅은
     /// `SetOffsetX_1`/`SetOffsetY_1` 호출 시점에만 한다(`clippy::float_cmp` 회피, 눈으로
     /// 봐도 안전함이 보장되도록).

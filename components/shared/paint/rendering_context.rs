@@ -123,8 +123,12 @@ pub trait RenderingContext {
     /// 이 컨텍스트가 렌더한 서피스 중 실제로 화면에 표출되는 sub-rect를 정의하는 가드밴드
     /// 여백. device px, **top-left 기준**. 월 타일에서 `overlapPx`로 확장한 render rect와
     /// visible rect의 차이이며, 비월 모드는 zero(트레잇 기본값). 공식은
-    /// `WallLayout::tile_render_insets`(servoshell)가 정본이고, 값은 servoshell이 창 생성
-    /// 시 1회 주입하며 DPI 변경(`WindowEvent::ScaleFactorChanged`) 시 재주입해 갱신한다.
+    /// `WallLayout::tile_render_insets`가 산식의 정본이다. 값은 **servoshell만** 창 생성 시
+    /// 1회 주입하며 DPI 변경(`WindowEvent::ScaleFactorChanged`) 시 재주입해 갱신한다 —
+    /// servoshell은 오프스크린 확장 서피스 + render rect 원점 씬 + 이 크롭을 세트로 갖추고
+    /// 있기 때문이다. `winit_wall`(`components/servo/examples/winit_wall`)은 창 서피스에
+    /// 직접 렌더하고 씬 원점이 visible 원점이라 이 세트를 이루지 못하므로 이 값을 주입하지
+    /// 않는다(`tile.rs::create_tile_windows`의 주석 참조) — 트레잇 기본값(zero)에 머문다.
     ///
     /// 소비자는 둘이고 **둘 다 이 값을 읽는다**(재계산하지 않는다) — y 규약만 서로 다르다:
     /// - 오프스크린→창 blit(servoshell `headed_window.rs::webview_visible_source_rect`,
@@ -139,10 +143,12 @@ pub trait RenderingContext {
     fn present_inset(&self) -> DeviceIntSideOffsets {
         DeviceIntSideOffsets::zero()
     }
-    /// [`RenderingContext::present_inset`]을 설정한다. 호출 지점은 둘이다 — 창 생성 시 최초
-    /// 주입, 그리고 `WindowEvent::ScaleFactorChanged` 시 재주입. 월 타일 창은 non-resizable
-    /// 이지만 hidpi 배율은 바뀔 수 있고(창이 다른 배율의 모니터로 이동/승격), inset은 배율에서
-    /// 유도되므로 재주입이 없으면 생성 시 스냅샷이 창 수명 내내 stale하게 남는다.
+    /// [`RenderingContext::present_inset`]을 설정한다. servoshell의 호출 지점은 둘이다 —
+    /// 창 생성 시 최초 주입, 그리고 `WindowEvent::ScaleFactorChanged` 시 재주입. 월 타일
+    /// 창은 non-resizable이지만 hidpi 배율은 바뀔 수 있고(창이 다른 배율의 모니터로
+    /// 이동/승격), inset은 배율에서 유도되므로 재주입이 없으면 생성 시 스냅샷이 창 수명
+    /// 내내 stale하게 남는다. `winit_wall`은 이 setter를 호출하지 않는다(위 `present_inset`
+    /// 문서 참조).
     fn set_present_inset(&self, _inset: DeviceIntSideOffsets) {}
     /// Makes the context the current OpenGL context for this thread.
     /// After calling this function, it is valid to use OpenGL rendering

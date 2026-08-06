@@ -18,6 +18,7 @@ use euclid::Size2D;
 use log::warn;
 use serde_json::Value;
 use servo::user_contents::UserStyleSheet;
+use servo::wall_layout::{WallLayout, WallLayoutError};
 use servo::{
     DeviceIndependentPixel, DiagnosticsLogging, DiagnosticsLoggingOption, Opts, OutputOptions,
     PrefValue, Preferences,
@@ -25,7 +26,6 @@ use servo::{
 use url::Url;
 
 use crate::VERSION;
-use servo::wall_layout::{WallLayout, WallLayoutError};
 
 /// Preferences enabled when servoshell is launched with the `--enable-experimental-web-platform-features` flag.
 ///

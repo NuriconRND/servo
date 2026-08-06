@@ -9,37 +9,14 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use euclid::Scale;
 use servo::wall_layout::WallLayout;
 use servo::{
-    DeviceIndependentPixel, DevicePixel, DisplayTopology, RenderingContext, WebViewPaintTarget,
-    WindowRenderingContext, dxgi_luid_for_gpu_index,
+    DisplayTopology, RenderingContext, WebViewPaintTarget, WindowRenderingContext,
+    dxgi_luid_for_gpu_index,
 };
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
 use winit::raw_window_handle::{DisplayHandle, HasWindowHandle};
 use winit::window::Window;
-
-/// 타일의 가드밴드 여백을 렌더링 컨텍스트에 주입한다.
-///
-/// 값의 산출처는 `WallLayout::tile_render_insets` 하나뿐이다 — winit_wall은
-/// 어떤 경로에서도 inset을 자체 계산하지 않는다. (servoshell 최종 리뷰가
-/// "공유된 건 산식이고 값이 아니었다"로 지적한 발산의 재연 방지.)
-pub(crate) fn apply_present_inset(
-    layout: &WallLayout,
-    tile_index: usize,
-    hidpi: Scale<f32, DeviceIndependentPixel, DevicePixel>,
-    rendering_context: &Rc<dyn RenderingContext>,
-) {
-    let Some(inset) = layout.tile_render_insets(tile_index, hidpi) else {
-        return;
-    };
-    rendering_context.set_present_inset(inset);
-    // 로거 초기화 이전에 창이 생성될 수 있어 info!는 유실된다 — servoshell 관례대로 eprintln.
-    eprintln!(
-        "wall: tile {tile_index} present_inset (top {}, right {}, bottom {}, left {})",
-        inset.top, inset.right, inset.bottom, inset.left,
-    );
-}
 
 /// One wall tile: its own window, rendering context (GPU), and paint target.
 /// `paint_target == None` marks the primary tile, which is painted via
@@ -55,6 +32,21 @@ pub(crate) struct TileWindow {
 /// once by the caller (top-left = spatial index 0, left→right then top→bottom);
 /// `have_topology` distinguishes "no topology available at all" from "topology available
 /// but this tile's display index is out of range" for the fallback diagnostics.
+///
+/// NOTE: this does **not** inject `overlapPx` guard-band `present_inset`, unlike
+/// servoshell (`headed_window.rs` around `tile_render_insets`/`set_present_inset`). In
+/// servoshell the guard band is a three-piece deal: an offscreen surface expanded by the
+/// inset, a scene origin at the *render rect* origin (visible − overlap), and a present-time
+/// crop back down to the visible rect (blit source rect or DComp root-visual offset).
+/// winit_wall only ever built the third piece — it renders directly into the window
+/// surface (no offscreen expansion) and its scene origin is
+/// [`WallLayout::tile_origin_device_vector`], which is the *visible* origin, not the render
+/// rect origin. Injecting `present_inset` alone was therefore either inert (default/blit-less
+/// path: nothing consumes it) or actively wrong (DComp path: it shifted the root visual by
+/// `inset` against a scene that was never expanded to compensate, offsetting content by
+/// `overlapPx`). Supporting the guard band here needs the offscreen-expansion + render-rect
+/// origin + visible-rect blit equivalent of servoshell's `gui.rs`; that's tracked as
+/// follow-up work, not done in this shell. Layouts with `overlapPx: 0` are unaffected.
 pub(crate) fn create_tile_windows(
     event_loop: &winit::event_loop::ActiveEventLoop,
     display_handle: DisplayHandle,
@@ -72,7 +64,7 @@ pub(crate) fn create_tile_windows(
             .with_decorations(false)
             .with_resizable(false);
 
-        let gpu_index = match spatial.get(tile.display) {
+        let auto_gpu_index = match spatial.get(tile.display) {
             Some(disp) => {
                 // Position the window at the real display's desktop origin, and bind its
                 // rendering context to the adapter that drives that display. The window is
@@ -137,6 +129,17 @@ pub(crate) fn create_tile_windows(
                 None
             },
         };
+        // An explicit `gpu` in the layout JSON always wins over the auto-assigned adapter, in
+        // both the topology-hit and fallback paths above -- matches servoshell's
+        // `tile.gpu_override.or(wall_auto_gpu_index)` (`headed_window.rs`), so the same layout
+        // JSON behaves the same way in both shells.
+        let gpu_index = tile.gpu_override.or(auto_gpu_index);
+        if let Some(gpu_override) = tile.gpu_override {
+            eprintln!(
+                "tile {tile_index}: 'gpu' override -> adapter {gpu_override} (auto-GPU would \
+                 have used {auto_gpu_index:?})",
+            );
+        }
 
         let window = event_loop
             .create_window(attributes)
@@ -180,9 +183,6 @@ pub(crate) fn create_tile_windows(
         let rendering_context: Rc<dyn RenderingContext> = Rc::new(
             rendering_context_result.expect("Could not create RenderingContext for tile window"),
         );
-
-        let hidpi = Scale::new(window.scale_factor() as f32);
-        apply_present_inset(layout, tile_index, hidpi, &rendering_context);
 
         tiles.push(TileWindow {
             window,
