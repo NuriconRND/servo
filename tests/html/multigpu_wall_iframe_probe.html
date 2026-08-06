@@ -1,0 +1,145 @@
+<!doctype html>
+<!--
+  Wall iframe presentation probe (2x1, virtual viewport 3840x1080, seam at x=1920).
+
+  A single <iframe> is centered on the tile seam (x=1920) so its content is split
+  across tile 0 (left) and tile 1 (right). Standard CSS/JS content flanks it so each
+  tile's liveness is visible independently. Use this to visually verify that iframe
+  content clips/continues correctly across the wall tile boundary.
+
+  Source of the iframe:
+    (default)          -> iframe.srcdoc with a striped test pattern (step 1: inline).
+                          The pattern has vertical stripes every 80px and a bold
+                          center line; if clipping is correct, the stripes continue
+                          seamlessly across the wall seam.
+    ?url=<URL>         -> iframe.src = URL (step 2: load a real standard web page).
+                          e.g. ?url=https://example.com  or  ?url=http://127.0.0.1:8000/
+  Optional: ?w=<px>&h=<px> to resize the iframe (default 1120x800, straddling x=1920).
+
+  Run (2x1 wall, release build — the debug build crashes on wall + dynamic content):
+    target\release\servoshell.exe --wall-all-tiles \
+      --wall-layout etc\multigpu\config\wall_layout.example_2x1_display.json \
+      "file:///W:/servo_multigpu-tiled-wall/tests/html/multigpu_wall_iframe_probe.html"
+    (append ?url=https://example.com to the file URL for the real-page test.)
+
+  Console (stderr/stdout) logs "[iframe-probe] ..." for load/error and status.
+-->
+<html lang="en"><head><meta charset="utf-8"><title>Wall iframe probe (2x1)</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #0b0d12; }
+  body { width: 3840px; height: 1080px; position: relative; overflow: hidden;
+         font-family: system-ui, "Segoe UI", sans-serif; color: #e8e8f0; }
+
+  /* overlap guard band + seam marker at x=1920 */
+  #overlap { position: absolute; left: 1888px; top: 0; width: 64px; height: 1080px;
+             background: rgba(255,59,59,.10); z-index: 4; }
+  #seam    { position: absolute; left: 1919px; top: 0; width: 2px; height: 1080px;
+             background: #ff3b3b; z-index: 5; }
+
+  /* flanking standard content */
+  .pane { position: absolute; top: 0; height: 1080px; padding: 40px; }
+  #left  { left: 0;    width: 1360px; background: linear-gradient(135deg,#10131c,#1a2030); }
+  #right { left: 2480px; width: 1360px; background: linear-gradient(225deg,#10131c,#2a1a26); }
+  .pane h2 { font-size: 34px; margin: 0 0 20px; }
+  .clock { font-variant-numeric: tabular-nums; font-size: 60px; font-weight: 800; color: #4aa3ff; }
+  .sub { font-size: 22px; color: #9aa; margin-top: 8px; }
+  .sq { width: 72px; height: 72px; border-radius: 12px; background: #ff8c42; margin-top: 28px;
+        animation: spin 2.4s ease-in-out infinite; }
+  @keyframes spin { 0%,100%{transform:rotate(0) scale(1)} 50%{transform:rotate(180deg) scale(1.25)} }
+
+  /* the iframe under test — centered on the seam (x=1920) */
+  /* NOTE: keep this background LIGHT. Servo's built-in error page (neterror.html) has no
+     CSS at all, so its canvas stays transparent — layout/display_list/mod.rs:979-981 returns
+     early for a transparent root background and pushes no background rect. The default text
+     colour is black, and the window's white clear colour (shell_background_color_rgba,
+     painter.rs:425) applies to the window, NOT to a nested document. With background:#000
+     here, a blocked load (X-Frame-Options / mixed content) rendered black-on-black and looked
+     like "nothing painted at all". */
+  #frame { position: absolute; left: 1360px; top: 140px; width: 1120px; height: 800px;
+           border: 3px solid #c56cf0; border-radius: 8px; background: #f4f4f8; z-index: 6;
+           box-shadow: 0 0 40px rgba(197,108,240,.4); }
+  #flabel { position: absolute; left: 1360px; top: 96px; width: 1120px; text-align: center;
+            font-size: 22px; font-weight: 700; color: #c56cf0; z-index: 6; }
+  #status { position: absolute; left: 1360px; top: 952px; width: 1120px; text-align: center;
+            font-family: monospace; font-size: 16px; color: #e6c8ff; z-index: 6; white-space: pre; }
+</style></head>
+<body>
+  <div id="overlap"></div>
+  <div id="seam"></div>
+
+  <section class="pane" id="left">
+    <h2>tile 0 (left)</h2>
+    <div class="clock" id="clock">--:--:--</div>
+    <div class="sub">rAF: <span id="raf">0</span></div>
+    <div class="sq"></div>
+  </section>
+
+  <div id="flabel">&lt;iframe&gt; straddling seam (x=1920)</div>
+  <iframe id="frame" title="wall iframe under test"></iframe>
+  <div id="status">iframe: starting…</div>
+
+  <section class="pane" id="right">
+    <h2 style="text-align:right">tile 1 (right)</h2>
+    <div class="sub" style="text-align:right">setInterval: <span id="counter">0</span></div>
+  </section>
+
+  <script>
+    const P = new URLSearchParams(location.search);
+    const frame = document.getElementById("frame");
+    const statusEl = document.getElementById("status");
+    const flabel = document.getElementById("flabel");
+    const clog = (m) => console.log("[iframe-probe] " + m);
+    const setStatus = (m) => { statusEl.textContent = "iframe: " + m; };
+
+    // standard flanking content (proves each tile is live independently)
+    const clock = document.getElementById("clock");
+    setInterval(() => { const d = new Date();
+      clock.textContent = [d.getHours(), d.getMinutes(), d.getSeconds()]
+        .map(n => String(n).padStart(2, "0")).join(":"); }, 250);
+    let cN = 0; const counter = document.getElementById("counter");
+    setInterval(() => counter.textContent = ++cN, 250);
+    let raf = 0; const rafEl = document.getElementById("raf");
+    (function t(){ raf++; if (raf % 10 === 0) rafEl.textContent = raf; requestAnimationFrame(t); })();
+
+    // optional resize
+    const w = parseInt(P.get("w") || "", 10), h = parseInt(P.get("h") || "", 10);
+    if (w > 0) { frame.style.width = w + "px"; frame.style.left = (1920 - w / 2) + "px";
+      flabel.style.left = frame.style.left; flabel.style.width = frame.style.width;
+      statusEl.style.left = frame.style.left; statusEl.style.width = frame.style.width; }
+    if (h > 0) { frame.style.height = h + "px"; }
+
+    frame.addEventListener("load", () => { setStatus("loaded"); clog("iframe load event"); });
+    frame.addEventListener("error", () => { setStatus("error"); clog("iframe error event"); });
+
+    const url = P.get("url");
+    if (url) {
+      // step 2: load a real standard web page
+      flabel.innerHTML = "&lt;iframe src&gt; " + url + " — straddling seam (x=1920)";
+      setStatus("loading src=" + url);
+      clog("setting iframe.src = " + url);
+      frame.src = url;
+    } else {
+      // step 1: inline srcdoc striped test pattern (80px stripes + bold center line)
+      flabel.innerHTML = "&lt;iframe srcdoc&gt; test pattern — straddling seam (x=1920)";
+      frame.srcdoc = [
+        "<!doctype html><meta charset=utf-8><style>",
+        "html,body{margin:0;height:100%;font-family:system-ui,sans-serif;color:#fff;",
+        "  background:repeating-linear-gradient(90deg,#2a3350 0 80px,#3a2a55 80px 160px);}",
+        ".mid{position:fixed;left:50%;top:0;width:4px;height:100%;background:#ffd93b;transform:translateX(-2px)}",
+        ".label{position:fixed;left:0;right:0;top:40%;text-align:center;font-size:64px;font-weight:800;",
+        "  text-shadow:0 2px 12px #000}",
+        ".dot{position:fixed;left:0;top:50%;width:40px;height:40px;border-radius:50%;background:#2ecc40;",
+        "  animation:mv 3s linear infinite}",
+        "@keyframes mv{from{left:0}to{left:calc(100% - 40px)}}",
+        "</style><div class=mid></div><div class=label>IFRAME srcdoc</div><div class=dot></div>"
+      ].join("");
+      setStatus("srcdoc set (striped pattern)");
+      clog("iframe srcdoc set (test pattern)");
+    }
+
+    // periodic status heartbeat (visible in logs)
+    let n = 0;
+    setInterval(() => { clog("heartbeat " + (++n) + " status=" + statusEl.textContent); }, 2000);
+  </script>
+</body></html>
