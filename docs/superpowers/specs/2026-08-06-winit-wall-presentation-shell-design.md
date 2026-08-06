@@ -165,3 +165,42 @@ Cargo가 지원하는 표준 형태이며, 타일 수명 관리가 이 파일에
 - servoshell 폐기 — UI/UX 전용으로 계속 유지
 - 포터블 패키지(ServoWallPackage 상당)의 winit_wall 판 재구성
 - 멀티GPU 간 vsync 동기화 알고리즘 자체 (이번엔 driver 배선까지만; 동기화는 후속 과제)
+
+## 구현 결과 (2026-08-06, Task 6 통합 검증)
+
+### 커밋 범위
+
+`76b088a7d18` (계획 보정, Task 6 시작점) `..` `5b863fa35fb` (T5 vsync driver 완료) — 7개 구현 커밋:
+
+```
+c8404d48f6d refactor(paint): wall_layout을 servo-paint-api로 승격 - 임베더 간 공유
+b47f978d928 chore(paint): Cargo.lock를 wall_layout 이관의 serde_json 의존성과 동기화
+fbfb2c41ae9 feat(winit_wall): 표출 셸 기반 이식 - 공유 wall_layout 사용, d3d11 백엔드 제거
+8b1ea453be3 feat(winit_wall): 가드밴드 크롭 present_inset 주입 + DPI 변경 재주입
+ddd799ef34c feat(winit_wall): 타일이 디스플레이를 채울 때 borderless fullscreen
+b02ec108ce2 fix(winit_wall): rustfmt drift on set_fullscreen call
+5b863fa35fb feat(winit_wall): DWM vsync refresh driver (SERVO_WIN_VSYNC opt-in)
+```
+
+`.rs` diffstat: 10 files changed, 877 insertions(+), 27 deletions(-) — 대부분 신규(`winit_wall/{main,tile,vsync_refresh_driver}.rs` 850행), servoshell 쪽은 파일 삭제(`ports/servoshell/wall_layout.rs`) + import 갱신 4곳뿐(`crate::wall_layout::` → `servo::wall_layout::`).
+
+### 설계 대비 결과 — 이탈 없음
+
+설계 문서의 7개 결정 사항(§사용자 결정 사항) 모두 그대로 구현됐다. `wall_layout` 승격 위치, `paint_api`의 `serde_json` 편입, 디렉터리형 예제 분할, `present_inset`을 유일한 산출처로 삼는 정책, borderless fullscreen 조건, vsync opt-in 기본값 — 설계에서 이탈한 항목은 없다.
+
+### 검증 결과 요약 (Task 6)
+
+- **정적 검사**: `cargo test -p servo-paint-api wall_layout --lib` 13/13 통과, `cargo check -p servoshell` / `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl` 둘 다 exit 0, `git diff --check` 무출력. `rustfmt --edition 2024 --check`는 브랜치가 건드리지 않은 파일(`display_list.rs`, `rendering_context.rs`, `dialog.rs`, `parser.rs`, `webdriver.rs` 등, crate-root `lib.rs` 재귀 확장으로 딸려 들어옴)에서 let-chain 포맷팅 드리프트를 보고했으나, 이 브랜치가 실제로 변경한 라인(커밋 diff와 대조 확인)에는 diff가 전혀 없다 — 기존부터 있던 rustfmt 버전 스큐이며 이 작업의 회귀 아님.
+- **servoshell 무회귀 (release 빌드, `wall_layout.example_2x1_display.json`)**: `scroll_offsets=matched` 326/326(mismatched 0), panic 0, `Wall frame barrier complete` 150(missed 2, 설계된 `keep-previous-frame` 정책 범위 내), `present_inset` 2줄 — tile 0 `(top 0, right 32, bottom 0, left 0)`, tile 1 `(top 0, right 0, bottom 0, left 32)`. 눈금 프로브(`multigpu_wall_ruler_probe.html`)에서도 동일 inset 값 재확인.
+- **winit_wall 기능**: 2x1 `ready=2/2` 배리어 149/149(missed 0). DComp A/B — `SERVO_COMPOSITOR_DCOMP=1`에서 `[dcomp-native] engaged` 2회 + 타일별 guard-band offset 로그(`(0,0)`/`(-32,0)`, servoshell과 동일 inset에서 산출), off에서는 `dcomp-native` 로그 0회. 미디어(`video_grid_6x6_play.html?grid=2`, `SERVO_MEDIA_SYNC_GROUP=4`) — `Sync group: 4/4 pipelines armed` + `released: 4 pipelines starting at shared base time`, 배리어 474/475(missed 1), panic 0.
+- **GUI 육안 판정**(이음매 라벨 120px 간격, DComp 하단 밴드/blit 부재, lockstep 실화면 확인)은 로그로 판정 불가능한 항목이라 서브에이전트가 수행하지 않았다 — 사용자 이월(보고서의 "사용자 육안 판정용 명령" 참조, `task-6-report.md`).
+
+### 이월 항목 (설계 문서 §설계 시 주의 + 코드 인라인 주석과 대응)
+
+1. `servo::wall_layout::WallLayoutError`가 `std::error::Error` 미구현 — winit_wall `parse_args()`가 `.map_err(|error| error.to_string())`로 우회 (코드에 인라인 주석으로 명시).
+2. 토폴로지 완전 미탐지(`!have_topology`) 분기에서 타일당 stderr 진단 한 줄이 servoshell 대비 누락(`tile.rs:112-138`) — 토폴로지 out-of-range 경고는 있으나 완전 부재 시 무음.
+3. `spatial.get(tile.display)`를 `tile.rs`에서 2회(라인 75, 148) 중복 조회 — 기능상 문제는 없으나 정리 여지.
+4. 비Windows 빌드에서 `vsync_driver` 파라미터가 미사용 경고를 낼 수 있음(`create_tile_windows`가 `#[cfg(not(target_os = "windows"))]` 분기에서 그 인자를 안 씀) — 비Windows에서 실컴파일 검증하지 않아 미확정.
+5. 비Windows 경로 컴파일은 이번 Task 6에서도 검증하지 않았다(개발/실행 환경이 Windows 전용).
+
+이 5건 중 설계를 바꿔야 할 만한 것은 없다 — 전부 후속 정리 과제로 이월한다.
