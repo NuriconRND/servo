@@ -12,8 +12,21 @@
 
 - 스펙: `docs/superpowers/specs/2026-08-06-winit-wall-presentation-shell-design.md`
 - 브랜치: `nonstandard-media-display-port` (정본). `video-perf-investigation`은 읽기 전용 소스로만 참조
-- **빌드는 반드시 짧은 경로에서** — `subst W: F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser` 후 `W:\servo_multigpu-tiled-wall`에서. (mozangle `build.rs:155`가 Os error 206으로 실패)
-- 빌드 전 `. ..\scripts\servo_env.ps1` 소싱 (dot-source)
+- **★모든 cargo/빌드 명령은 아래 형태로만 실행한다★** — 계획 본문에 `cargo ...`로 적힌 것은 전부 이 껍데기 안에서 돌린다는 뜻이다. PowerShell 도구를 쓰고, **매번 env를 소싱**한다(서브에이전트는 새 셸에서 시작하므로 이전 소싱이 남아 있지 않다):
+
+  ```powershell
+  cd W:\servo_multigpu-tiled-wall
+  . ..\scripts\servo_env.ps1
+  $ErrorActionPreference = 'Continue'
+  <cargo 명령>
+  ```
+
+  - `W:` 매핑이 없으면 먼저 `subst W: F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser`. 긴 경로에서 빌드하면 mozangle `build.rs:155`가 Os error 206으로 실패한다
+  - `. ..\scripts\servo_env.ps1`은 **점 소싱**이다(앞의 `.`가 없으면 자식 프로세스에만 적용되어 무효)
+  - `$ErrorActionPreference='Continue'`가 없으면 cargo의 stderr 출력이 빌드를 중단시킨다
+  - **bash에서 bare `cargo`를 돌리지 말 것** — env 밖에서는 mozjs_sys 빌드 스크립트가 에러가 아니라 **행**에 걸린 전례가 있다. 실패보다 나쁘다
+  - **`cargo check --workspace`나 워크스페이스 전체 대상 명령 금지** — 같은 이유. 반드시 `-p <크레이트>`로 한정한다
+  - 같은 target 디렉터리에 cargo를 둘 이상 동시에 돌리지 말 것 (락 경합으로 정지)
 - 예제 빌드 명령: `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl` — `-p servo`와 `no-wgl` 둘 다 필수
 - 런타임 검증은 **release 빌드로만** — debug는 월 + 동적 video src에서 `MakeCurrentFailed` 크래시
 - 실행 전 ANGLE/gstreamer DLL을 exe 옆에 복사 (아니면 egl 패닉)
@@ -414,9 +427,9 @@ wall: tile 0 present_inset (top 0, right 32, bottom 0, left 0)
 wall: tile 1 present_inset (top 0, right 0, bottom 0, left 32)
 ```
 
-- [ ] **Step 6: 사용자 육안 판정 요청**
+- [ ] **Step 6: 육안 판정은 Task 6로 이월 (여기서 멈추지 않는다)**
 
-눈금 프로브로 크롭 정확성을 확인한다. **판정은 사용자가 한다** — 다음을 요청하고 응답을 기다린다:
+사용자 결정에 따라 GUI 육안 판정은 Task 6에 모아서 한다. 이 태스크의 게이트는 Step 5의 **로그 값 일치**까지다. 아래 명령은 Task 6에서 쓸 것이므로 그대로 남겨 둔다:
 
 ```powershell
 .\target\release\examples\winit_wall.exe --wall-all-tiles `
