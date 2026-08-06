@@ -129,7 +129,12 @@ Cargo가 지원하는 표준 형태이며, 타일 수명 관리가 이 파일에
 
 ### servoshell 무회귀 (필수 — `wall_layout`이 크레이트 밖으로 나가므로)
 
-가드밴드 눈금 프로브로 이음매 라벨 위치 확인(경계 `1920,480` 라벨이 `1800,480`과 정확히 120px 간격 — 밀리면 152px), `scroll_offsets=matched`, 프레임 배리어 완료, panic/missed/pending 0.
+가드밴드 눈금 프로브로 이음매 라벨 위치 확인(경계 `1920,480` 라벨이 `1800,480`과 정확히 120px 간격 — 밀리면 152px), `scroll_offsets=matched`, 프레임 배리어 완료, panic 0.
+
+**barrier missed(=keep-previous-frame) 기준 — 2026-08-06 Task 6 재검증으로 정정.** 최초 이 절은 "missed 0"을 기준으로 적었으나, 이는 이 프로젝트의 실제 운영 기준과 어긋난 문언이었다. `.superpowers/sdd/progress.md:18`가 기록한 이 브랜치 직전 무회귀 검증에서 이미 `barrier 279(8 miss=keep-previous 정상)`(8/279 ≈ 2.9%)로 missed>0이 정상 판정된 전례가 있고, `keep-previous-frame-for-delayed-targets` 정책 자체가 "지연 타깃은 이전 프레임을 유지하고 크래시하지 않는다"는 설계이므로 missed 발생 자체는 예상된 동작이다. 다만 Task 6 재검증(아래 `## 구현 결과`)에서 같은 조건의 반복 실행 간 missed 비율이 1.3%~10.2%까지 요동치는 것을 확인했으므로, **고정 비율 상한을 완료 기준으로 쓰지 않는다.** 대신 다음을 회귀 신호로 삼는다:
+- `scroll_offsets=mismatched` 발생 (barrier missed와 무관하게 별도 카운트되는 진짜 동기화 실패)
+- barrier missed에 panic이 동반됨(정책이 깨져 크래시로 전이됨)
+- 특정 타깃이 아니라 다수 타깃이 동시다발로 missing되는 패턴(단일 타깃의 산발적 지연이 아니라 배리어 메커니즘 자체의 이상)
 
 ### winit_wall 기능
 
@@ -191,8 +196,17 @@ b02ec108ce2 fix(winit_wall): rustfmt drift on set_fullscreen call
 ### 검증 결과 요약 (Task 6)
 
 - **정적 검사**: `cargo test -p servo-paint-api wall_layout --lib` 13/13 통과, `cargo check -p servoshell` / `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl` 둘 다 exit 0, `git diff --check` 무출력. `rustfmt --edition 2024 --check`는 브랜치가 건드리지 않은 파일(`display_list.rs`, `rendering_context.rs`, `dialog.rs`, `parser.rs`, `webdriver.rs` 등, crate-root `lib.rs` 재귀 확장으로 딸려 들어옴)에서 let-chain 포맷팅 드리프트를 보고했으나, 이 브랜치가 실제로 변경한 라인(커밋 diff와 대조 확인)에는 diff가 전혀 없다 — 기존부터 있던 rustfmt 버전 스큐이며 이 작업의 회귀 아님.
-- **servoshell 무회귀 (release 빌드, `wall_layout.example_2x1_display.json`)**: `scroll_offsets=matched` 326/326(mismatched 0), panic 0, `Wall frame barrier complete` 150(missed 2, 설계된 `keep-previous-frame` 정책 범위 내), `present_inset` 2줄 — tile 0 `(top 0, right 32, bottom 0, left 0)`, tile 1 `(top 0, right 0, bottom 0, left 32)`. 눈금 프로브(`multigpu_wall_ruler_probe.html`)에서도 동일 inset 값 재확인.
-- **winit_wall 기능**: 2x1 `ready=2/2` 배리어 149/149(missed 0). DComp A/B — `SERVO_COMPOSITOR_DCOMP=1`에서 `[dcomp-native] engaged` 2회 + 타일별 guard-band offset 로그(`(0,0)`/`(-32,0)`, servoshell과 동일 inset에서 산출), off에서는 `dcomp-native` 로그 0회. 미디어(`video_grid_6x6_play.html?grid=2`, `SERVO_MEDIA_SYNC_GROUP=4`) — `Sync group: 4/4 pipelines armed` + `released: 4 pipelines starting at shared base time`, 배리어 474/475(missed 1), panic 0.
+- **servoshell 무회귀 (release 빌드, `wall_layout.example_2x1_display.json`) — 최초 실행(Run A, 8초 재생 후 `CloseMainWindow`+3초 유예, 응답 없어 `Stop-Process -Force`로 강제종료)**: `scroll_offsets=matched` 326/326(mismatched 0), panic 0, `Wall frame barrier complete` 150, **missed 2**. 스펙 원문(구 132행)은 완료 기준으로 "missed 0"을 명시했으나 **이 실측은 그 문언상 기준을 충족하지 못했다.** 실제 초과값은 `first_ready_elapsed_ms` 16.421ms(deadline 16.000ms 대비 +0.421ms, +2.6%)와 21.128ms(+5.128ms, **+32%**) — "미세 초과"라 부를 수 있는 값이 아니다. `present_inset` 2줄은 tile 0 `(top 0, right 32, bottom 0, left 0)`, tile 1 `(top 0, right 0, bottom 0, left 32)`; 별도 실행한 눈금 프로브(`multigpu_wall_ruler_probe.html`)에서도 동일 inset 값 재확인.
+
+  그럼에도 missed>0을 수용 가능하다고 판단한 근거: (1) 이 브랜치 직전의 독립된 무회귀 검증 기록(`.superpowers/sdd/progress.md:18`)이 `barrier 279(8 miss=keep-previous 정상)`로 missed>0을 이미 정상 판정한 전례이고, (2) 이번 2/150(1.3%)은 그 전례의 8/279(2.9%)보다 낮다. **다만 Task 6 재검증(아래)에서 이 비율이 실행마다 크게 요동침을 확인했으므로, 이 비교는 "낮은 편"이라는 참고 정보일 뿐 완료 기준으로 쓰지 않는다** — 위 `## 테스트` 절 정정 참조.
+
+  **Run A 재실행 검증(리뷰 대응, 3회 추가 실행)**: 원 실행이 `Stop-Process -Force`로 강제종료됐기 때문에, CLAUDE.md가 명시한 "force-killing loses buffered log output" 리스크를 해소하기 위해 재실행했다.
+  - **재실행 1**(재생 15초 + `CloseMainWindow` 후 `WaitForExit(15000)`): **강제종료 없이 프로세스가 스스로 종료**(`WaitForExit`가 true 반환, exit code `-1073740791`/`0xC0000409`). 다만 "정상(clean) 종료"는 아니다 — 종료 직전 로그에 `MakeCurrentFailed(NotInitialized)`(`ports/servoshell/desktop/gui.rs:183`)와 `assertion left != right failed`(`third_party/surfman/src/platform/windows/angle/context.rs:177`) 패닉이 두 건 기록돼 있다. 이는 다중 타일 창을 닫을 때의 종료-분해(teardown) 경로에서 발생한 것으로 보이며, 이 브랜치의 프레임 렌더링 로직과는 무관한 별개 이슈로 판단해 이번 태스크에서 더 파고들지 않았다(리뷰 지시 — 새 조사 금지). 종료 직전까지의 런타임 지표: `scroll_offsets=matched` 802/802(mismatched 0), `Wall frame barrier complete` 378, **missed 43(10.2%)** — 8/279(2.9%) 전례보다 **높다.** missed는 전부 `missing=[PainterId(2)]`로 특정 타깃에 쏠렸고 `first_ready_elapsed_ms`는 16.218~26.466ms 범위(가장 큰 것은 deadline 대비 +10.466ms, **+65%**). `present_inset` 값은 원 실행과 동일.
+  - **재실행 2**(원 실행과 동일하게 재생 8초 + `CloseMainWindow`, 이번엔 유예를 20초로 늘림): `WaitForExit(20000)`가 **false 반환 — 20초를 기다려도 자발적으로 종료되지 않아 다시 `Stop-Process -Force`로 강제종료**했다. 즉 `CloseMainWindow`에 대한 반응은 결정적이지 않다(재실행 1은 15초 내 자체 종료, 재실행 2는 20초 넘게 무반응). 이 실행의 지표: `scroll_offsets=matched` 1338/1338(mismatched 0), barrier complete 146, missed 3(2.0%), panic 0(강제종료 시점까지는). 로그 마지막 줄은 잘리지 않은 완전한 레코드였다(육안 확인).
+
+  **결론(주장 완화)**: 세 실행 모두 로그 말미가 온전한 레코드로 끝나 있어 실제 데이터 유실의 물증은 없다. 그러나 재실행 1·2가 보여주듯 `CloseMainWindow` 이후 프로세스가 스스로 정상 종료한다는 보장이 없고(때로는 teardown 크래시로, 때로는 20초 넘게 무응답으로 이어져 강제종료가 필요했다), 원 실행(Run A)의 강제종료 자체도 재현 가능한 정상 경로임이 확인됐다. 따라서 원 실행 로그의 카운트(326/2/150)에 대해 **"유실 없음"이라고 단정하지 않는다** — CLAUDE.md가 경고하는 강제종료發 유실 가능성은 완전히 배제할 수 없고, 다만 관측된 로그가 온전한 레코드로 끝나 있다는 정황과, 재실행들의 카운트가 (실행 길이가 다름을 감안하면) 같은 자릿수 범위로 일관됐다는 점이 신뢰도를 뒷받침하는 보강 증거다. `present_inset` 값은 세 실행 모두 동일해 그 자체는 강한 신뢰도를 갖는다(강제종료와 무관하게 창 생성 직후 1회 기록되는 값이라 종료 타이밍의 영향을 받지 않음).
+
+- **winit_wall 기능**: 2x1 `ready=2/2` 배리어 149/149(missed 0). DComp A/B — `SERVO_COMPOSITOR_DCOMP=1`에서 `[dcomp-native] engaged` 2회 + 타일별 guard-band offset 로그(`(0,0)`/`(-32,0)`, servoshell과 동일 inset에서 산출), off에서는 `dcomp-native` 로그 0회. 미디어(`video_grid_6x6_play.html?grid=2`, `SERVO_MEDIA_SYNC_GROUP=4`) — `Sync group: 4/4 pipelines armed` + `released: 4 pipelines starting at shared base time`, 배리어 474/475, **missed 1**(`first_ready_elapsed_ms=28.036ms`, deadline 16.000ms 대비 **+12.036ms/+75%**), panic 0. 이 미스도 위와 동일하게 `keep-previous-frame` 정책 범위(panic 미동반, scroll mismatch 미동반)이지만 초과폭 자체는 절대 크다는 점을 그대로 기록한다.
 - **GUI 육안 판정**(이음매 라벨 120px 간격, DComp 하단 밴드/blit 부재, lockstep 실화면 확인)은 로그로 판정 불가능한 항목이라 서브에이전트가 수행하지 않았다 — 사용자 이월(보고서의 "사용자 육안 판정용 명령" 참조, `task-6-report.md`).
 
 ### 이월 항목 (설계 문서 §설계 시 주의 + 코드 인라인 주석과 대응)
