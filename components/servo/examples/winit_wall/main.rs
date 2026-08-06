@@ -37,6 +37,8 @@ use winit::event_loop::EventLoop;
 use winit::raw_window_handle::HasDisplayHandle;
 
 mod tile;
+#[cfg(target_os = "windows")]
+mod vsync_refresh_driver;
 
 use tile::TileWindow;
 
@@ -361,6 +363,31 @@ impl ApplicationHandler<WakerEvent> for App {
             );
         }
 
+        // SERVO_WIN_VSYNC=1일 때만 DWM 합성 클럭에 프레임 생산을 페이싱한다.
+        // 기본 off인 이유: 이 환경에서 DwmFlush가 스핀-웨이트로 동작해 코어 1개를
+        // 상시 소모한다. 멀티GPU 간 vsync 동기화 작업의 기반으로 두되 표출 기본값은 아니다.
+        //
+        // 드라이버는 콜백을 누적하므로 전 타일이 하나를 공유한다 — 타일마다 만들면
+        // DwmFlush 스레드가 타일 수만큼 뜬다.
+        #[cfg(target_os = "windows")]
+        let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
+            let enabled = std::env::var("SERVO_WIN_VSYNC").is_ok_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("on")
+            });
+            if enabled {
+                eprintln!(
+                    "wall: SERVO_WIN_VSYNC=1: pacing frame production to DWM vsync (DwmFlush)."
+                );
+                Some(Rc::new(vsync_refresh_driver::DwmVsyncRefreshDriver::new()))
+            } else {
+                None
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = None;
+
         // Create one window + rendering context per tile.
         let tiles = tile::create_tile_windows(
             event_loop,
@@ -369,6 +396,7 @@ impl ApplicationHandler<WakerEvent> for App {
             &tile_indices,
             &spatial,
             have_topology,
+            vsync_driver,
         );
 
         // 2) Build the shared Servo instance against tile 0's (primary) context.

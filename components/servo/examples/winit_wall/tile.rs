@@ -62,6 +62,7 @@ pub(crate) fn create_tile_windows(
     tile_indices: &[usize],
     spatial: &[DisplayTopology],
     have_topology: bool,
+    vsync_driver: Option<Rc<dyn servo::RefreshDriver>>,
 ) -> Vec<TileWindow> {
     let mut tiles = Vec::new();
     for &tile_index in tile_indices {
@@ -160,14 +161,24 @@ pub(crate) fn create_tile_windows(
         }
 
         let window_handle = window.window_handle().expect("Failed to get window handle");
-        let rendering_context: Rc<dyn RenderingContext> = Rc::new(
-            WindowRenderingContext::new_with_target_gpu(
+        #[cfg(target_os = "windows")]
+        let rendering_context_result =
+            WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
                 display_handle,
                 window_handle,
                 window.inner_size(),
+                vsync_driver.clone(),
                 gpu_index,
-            )
-            .expect("Could not create RenderingContext for tile window"),
+            );
+        #[cfg(not(target_os = "windows"))]
+        let rendering_context_result = WindowRenderingContext::new_with_target_gpu(
+            display_handle,
+            window_handle,
+            window.inner_size(),
+            gpu_index,
+        );
+        let rendering_context: Rc<dyn RenderingContext> = Rc::new(
+            rendering_context_result.expect("Could not create RenderingContext for tile window"),
         );
 
         let hidpi = Scale::new(window.scale_factor() as f32);
