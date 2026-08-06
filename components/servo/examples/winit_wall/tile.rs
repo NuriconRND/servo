@@ -155,9 +155,7 @@ pub(crate) fn create_tile_windows(
                      fullscreen for flip-model present eligibility.",
                     tile.display, tile_size.width, tile_size.height,
                 );
-                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
-                    monitor,
-                ))));
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(monitor))));
             }
         }
 
