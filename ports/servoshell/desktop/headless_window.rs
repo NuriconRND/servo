@@ -21,8 +21,8 @@ use servo::{
 use winit::dpi::PhysicalSize;
 
 use crate::prefs::ServoShellPreferences;
-use crate::wall_layout::WallLayout;
 use crate::window::{MIN_WINDOW_INNER_SIZE, PlatformWindow, ServoShellWindow, ServoShellWindowId};
+use servo::wall_layout::WallLayout;
 
 pub struct HeadlessWindow {
     id: ServoShellWindowId,

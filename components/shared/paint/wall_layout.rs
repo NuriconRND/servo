@@ -8,42 +8,44 @@ use std::path::Path;
 
 use euclid::{Point2D, Rect, Scale, SideOffsets2D, Size2D, Vector2D};
 use serde_json::Value;
-use servo::{CSSPixel, DeviceIndependentPixel, DeviceIntRect, DevicePixel};
+use servo_geometry::DeviceIndependentPixel;
+use style_traits::CSSPixel;
+use webrender_api::units::{DeviceIntRect, DevicePixel};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct WallLayout {
-    pub(crate) virtual_viewport: Size2D<u32, DeviceIndependentPixel>,
-    pub(crate) tiles: Vec<WallTile>,
-    pub(crate) overlap_px: u32,
+pub struct WallLayout {
+    pub virtual_viewport: Size2D<u32, DeviceIndependentPixel>,
+    pub tiles: Vec<WallTile>,
+    pub overlap_px: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct WallTile {
+pub struct WallTile {
     /// Spatial display index (top-left = 0, left→right then top→bottom). Resolved at
     /// window-creation time against the DXGI display topology; the GPU that drives that
     /// display is auto-assigned. The legacy `monitor` field is accepted as an alias.
-    pub(crate) display: usize,
-    pub(crate) rect: Rect<i32, DeviceIndependentPixel>,
+    pub display: usize,
+    pub rect: Rect<i32, DeviceIndependentPixel>,
     /// Explicit GPU adapter override. When present, this wins over the auto-assigned adapter
     /// that drives `display` (e.g. to deliberately render a tile on a GPU that does NOT drive
     /// its display, for cross-GPU testing). `None` keeps the default auto-GPU behavior.
-    pub(crate) gpu_override: Option<usize>,
+    pub gpu_override: Option<usize>,
 }
 
 #[derive(Debug)]
-pub(crate) enum WallLayoutError {
+pub enum WallLayoutError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Invalid(String),
 }
 
 impl WallLayout {
-    pub(crate) fn from_path(path: &Path) -> Result<Self, WallLayoutError> {
+    pub fn from_path(path: &Path) -> Result<Self, WallLayoutError> {
         let text = fs::read_to_string(path).map_err(WallLayoutError::Io)?;
         Self::from_json_str(&text)
     }
 
-    pub(crate) fn from_json_str(text: &str) -> Result<Self, WallLayoutError> {
+    pub fn from_json_str(text: &str) -> Result<Self, WallLayoutError> {
         let value: Value = serde_json::from_str(text).map_err(WallLayoutError::Json)?;
         let virtual_viewport = parse_virtual_viewport(&value)?;
         let tiles = parse_tiles(&value, virtual_viewport)?;
@@ -56,7 +58,7 @@ impl WallLayout {
         })
     }
 
-    pub(crate) fn validate_tile_index(&self, tile_index: usize) -> Result<(), WallLayoutError> {
+    pub fn validate_tile_index(&self, tile_index: usize) -> Result<(), WallLayoutError> {
         if tile_index >= self.tiles.len() {
             return Err(WallLayoutError::Invalid(format!(
                 "wall tile index {tile_index} is out of range; layout has {} tile(s)",
@@ -66,14 +68,14 @@ impl WallLayout {
         Ok(())
     }
 
-    pub(crate) fn virtual_viewport_css_size(&self) -> Size2D<f32, CSSPixel> {
+    pub fn virtual_viewport_css_size(&self) -> Size2D<f32, CSSPixel> {
         Size2D::new(
             self.virtual_viewport.width as f32,
             self.virtual_viewport.height as f32,
         )
     }
 
-    pub(crate) fn tile_origin_device_vector(
+    pub fn tile_origin_device_vector(
         &self,
         tile_index: usize,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
@@ -87,14 +89,14 @@ impl WallLayout {
         )
     }
 
-    pub(crate) fn virtual_viewport_device_size(
+    pub fn virtual_viewport_device_size(
         &self,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     ) -> Size2D<i32, DevicePixel> {
         (self.virtual_viewport.to_f32() * hidpi_scale_factor).to_i32()
     }
 
-    pub(crate) fn tile_device_rect(
+    pub fn tile_device_rect(
         &self,
         tile_index: usize,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
@@ -103,10 +105,7 @@ impl WallLayout {
         Some(rect_to_device_rect(tile.rect, hidpi_scale_factor))
     }
 
-    pub(crate) fn tile_render_rect(
-        &self,
-        tile_index: usize,
-    ) -> Option<Rect<i32, DeviceIndependentPixel>> {
+    pub fn tile_render_rect(&self, tile_index: usize) -> Option<Rect<i32, DeviceIndependentPixel>> {
         let tile = self.tiles.get(tile_index)?;
         let overlap = i32::try_from(self.overlap_px).unwrap_or(i32::MAX);
         let min_x = tile.rect.origin.x.saturating_sub(overlap).max(0);
@@ -128,7 +127,7 @@ impl WallLayout {
         ))
     }
 
-    pub(crate) fn tile_render_device_rect(
+    pub fn tile_render_device_rect(
         &self,
         tile_index: usize,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
@@ -143,7 +142,7 @@ impl WallLayout {
     /// 소비자마다 y 규약이 다르다: GL blit(프레임버퍼 bottom-left 원점)은 src y 원점에
     /// `bottom`을, DComp(top-left 원점)는 root visual 오프셋에 `-top`을 쓴다
     /// (§`RenderingContext::present_inset`).
-    pub(crate) fn tile_render_insets(
+    pub fn tile_render_insets(
         &self,
         tile_index: usize,
         hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,

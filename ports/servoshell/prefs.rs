@@ -25,7 +25,7 @@ use servo::{
 use url::Url;
 
 use crate::VERSION;
-use crate::wall_layout::{WallLayout, WallLayoutError};
+use servo::wall_layout::{WallLayout, WallLayoutError};
 
 /// Preferences enabled when servoshell is launched with the `--enable-experimental-web-platform-features` flag.
 ///
