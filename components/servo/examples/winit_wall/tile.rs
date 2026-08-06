@@ -140,6 +140,27 @@ pub(crate) fn create_tile_windows(
         let window = event_loop
             .create_window(attributes)
             .expect("Failed to create tile window");
+
+        // 타일이 디스플레이를 정확히 채울 때만 borderless fullscreen으로 만든다.
+        // flip-model present 자격을 얻기 위한 것으로, 크기가 다르면 일반 창으로 둔다.
+        // 토폴로지 폴백 경로에서는 winit 모니터 핸들이 없을 수 있으므로 그때도 일반 창.
+        if let Some(disp) = spatial.get(tile.display) {
+            let tile_size = window.inner_size();
+            // DisplayTopology의 width/height는 i32, winit inner_size는 u32라 캐스팅한다.
+            let fills_display =
+                tile_size.width as i32 == disp.width && tile_size.height as i32 == disp.height;
+            if fills_display && let Some(monitor) = window.current_monitor() {
+                eprintln!(
+                    "wall: tile {tile_index} matches display {} size {}x{}; using borderless \
+                     fullscreen for flip-model present eligibility.",
+                    tile.display, tile_size.width, tile_size.height,
+                );
+                window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(Some(
+                    monitor,
+                ))));
+            }
+        }
+
         let window_handle = window.window_handle().expect("Failed to get window handle");
         let rendering_context: Rc<dyn RenderingContext> = Rc::new(
             WindowRenderingContext::new_with_target_gpu(
