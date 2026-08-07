@@ -1,5 +1,12 @@
 # wall_view 스트리밍 구현 계획
 
+> **이 프로젝트는 별도 저장소로 이관됐다 (2026-08-07).**
+> 구현체와 최신 계획은 `F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\wall_view\`
+> (독립 git 저장소)에 있다. 이 문서의 경로는 **이관 전 기준**이라 그대로 따라가면 맞지 않는다 —
+> 실행은 이관된 저장소의 `docs/2026-08-07-wall-view-streaming.md`를 볼 것.
+>
+> Task 1은 이 저장소에서 구현·리뷰까지 마친 뒤 이관됐다(폐기 커밋 `b484692bb6e`).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 월 표출 영역 전체를 캡처·합성·H.264 인코딩해 WebSocket으로 송출하고, 브라우저가 WebCodecs로 디코드해 보는 독립 프로세스 `wall_view`를 만든다.
