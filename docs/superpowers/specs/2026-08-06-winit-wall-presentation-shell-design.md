@@ -236,3 +236,26 @@ b02ec108ce2 fix(winit_wall): rustfmt drift on set_fullscreen call
 
 6. **가드밴드(오프스크린 확장 + render-rect 원점 씬 + visible-rect 크롭) 미지원.** §가드밴드는 winit_wall에서 지원되지 않는다 참조. `present_inset` 주입만으로는 성립하지 않음이 Critical로 확인되어 제거했다 — 지원하려면 별도 설계가 필요하다.
 7. **`WALL_FRAME_BARRIER_DEADLINE`(16ms, `components/paint/paint.rs:56`)이 60Hz vsync 주기(16.667ms)보다 짧다.** vsync 페이싱된 팬아웃의 2번째 이후 타깃이 구조적으로 데드라인을 넘기는 원인. 데드라인을 리프레시 주기 위(예: 17ms 또는 20ms)로 올리거나, 고정 ms 대신 vsync 배수(예: "1.5 vsync 주기")로 표현하도록 재설계하는 것을 후속 과제로 남긴다. §테스트 절의 회귀 신호 기준을 참조.
+
+## 사용자 육안 검증 결과 (2026-08-07)
+
+계획대로 GUI 육안 판정은 사용자가 수행했다. **4건 전부 정상.**
+
+| # | 항목 | 결과 |
+|---|---|---|
+| 1 | servoshell 이음매 라벨 120px 간격 (가드밴드 무회귀) | 정상 |
+| 2 | winit_wall 타일 구석 라벨 = 타일 `rect` 원점 | 정상 |
+| 3 | DComp on 표출 (최종 수정으로 32px 이탈이 해소됐는지) | 정상 |
+| 4 | 비디오 그리드 lockstep 동시 출발 | 정상 |
+
+3번은 최종 리뷰가 잡은 Critical(`present_inset` 주입이 DComp 경로에서 콘텐츠를 inset만큼 밀던 문제)의 수정을 실화면에서 확인한 것이다.
+
+### ★함정 — 프로브 페이지에 쿼리스트링을 줄 때는 `file:///` 전체 경로가 필요하다★
+
+4번 검증에서 사용자가 실제로 밟았다. `tests\html\video_grid_6x6_play.html?grid=2` 처럼 **상대 경로 + `?query`** 를 주면 servoshell/winit_wall이 전체를 파일명으로 취급해 로드에 실패한다(네트워크 URL로 재해석되며 로그에 `dns error`). 반드시 이렇게 준다:
+
+```powershell
+"file:///W:/servo_multigpu-tiled-wall/tests/html/video_grid_6x6_play.html?grid=2"
+```
+
+이 저장소에 이미 기록돼 있던 함정인데(`docs/multigpu/dcomp_transparent_hole_investigation.md` §실행 방법과 함정) Task 6 검증 명령 목록이 상대 경로로 적혀 있어 재발했다. 쿼리스트링이 필요한 프로브 명령은 항상 `file:///` 절대 URL로 적을 것.
