@@ -20,7 +20,8 @@
 - **추측 금지**: 기본값·문법을 코드에서 읽지 않고 적으면 안 된다. 설계 문서 §4 에 반례가 있다 — `SERVO_VIDEO_DECOUPLE` 과 `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` 은 **기본 on 인 킬스위치**다.
 - **기대값과 계산이 맞지 않으면 데이터나 테스트를 고치지 말고 모순을 보고하라.**
 - 주석은 **한국어**로 **왜**를 설명한다(기존 파일 어투를 맞춘다).
-- 커밋 메시지에 큰따옴표(`"`)를 넣지 않는다. 각 커밋 끝에 두 줄:
+- ★**커밋 메시지에 큰따옴표(`"`)를 넣지 않는다.**★ Task 1 과 Task 2 가 **연속으로** 여기서 걸렸다 — 코드 조각(`String::from("off")`, `"1"/"true"`)을 인용하려다 딸려 들어간다. 인용은 **백틱이나 홑따옴표**로 하고, 커밋 직후 `git log -1 --format=%B | grep -c '"'` 로 **0 임을 직접 확인**한 뒤 다음으로 넘어가라.
+- 각 커밋 끝에 두 줄:
   ```
   Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
   Claude-Session: https://claude.ai/code/session_01GHG3p4nt6sHudkycas4R8E
