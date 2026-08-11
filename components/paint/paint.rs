@@ -274,7 +274,7 @@ impl WallFramePacingConfig {
         let max_pending = if raw_max_pending > 0 {
             raw_max_pending as usize
         } else {
-            warn!("Ignoring gfx.wall.frame.max.pending={raw_max_pending}; using default 1");
+            warn!("Ignoring gfx_wall_frame_max_pending={raw_max_pending}; using default 1");
             1
         };
 
@@ -283,7 +283,7 @@ impl WallFramePacingConfig {
             Duration::from_millis(raw_min_interval_ms as u64)
         } else {
             warn!(
-                "Ignoring gfx.wall.frame.min.interval.ms={raw_min_interval_ms}; \
+                "Ignoring gfx_wall_frame_min_interval_ms={raw_min_interval_ms}; \
                  using default 16"
             );
             Duration::from_millis(16)

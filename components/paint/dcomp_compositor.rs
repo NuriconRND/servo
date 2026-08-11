@@ -386,7 +386,7 @@ impl StaleTracker {
     }
 }
 
-/// `gfx.dcomp.mode`(구 SERVO_COMPOSITOR_DCOMP)의 세부 모드. "surface"=가상 서피스 전용
+/// `gfx_dcomp_mode`(구 SERVO_COMPOSITOR_DCOMP)의 세부 모드. "surface"=가상 서피스 전용
 /// (구 경로 A/B), 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StorageMode {
@@ -1215,11 +1215,13 @@ pub struct DCompNativeCompositor {
     last_root_offset: Option<(i32, i32)>,
 }
 
-/// `SERVO_COMPOSITOR_DCOMP`가 truthy면 네이티브 컴포지터 사용 요청. 판정 정본은 surfman
-/// 공개 함수(paint_api 경유 재수출) — surfman은 같은 판정으로 창 서피스를 DComp 속성 없이
-/// 만들고(Task 1) present-path-fast를 끈다(ppf는 pbuffer 렌더에도 발동해 타일 방향을
-/// 깨뜨림). 따라서 painter가 RenderingContext를 만들기 전에 켜져 있어야 전체 구성이
-/// 정합한다. (ANGLE이 아닌 빌드에서는 항상 false — 네이티브 컴포지터 불성립.)
+/// `gfx_dcomp_mode`(구 `SERVO_COMPOSITOR_DCOMP`)가 truthy면 네이티브 컴포지터 사용 요청.
+/// 판정 정본은 `paint_api::rendering_context`(components/shared/paint)다 — surfman
+/// 재수출이 아니다. surfman은 paint_api가 정규화해 내려보낸 불리언만 받아
+/// (`set_dcomp_native_compositor`) 같은 판정으로 창 서피스를 DComp 속성 없이 만들고
+/// (Task 1) present-path-fast를 끈다(ppf는 pbuffer 렌더에도 발동해 타일 방향을 깨뜨림).
+/// 따라서 painter가 RenderingContext를 만들기 전에 켜져 있어야 전체 구성이 정합한다.
+/// (ANGLE이 아닌 빌드에서는 항상 false — 네이티브 컴포지터 불성립.)
 pub fn enabled() -> bool {
     paint_api::rendering_context::dcomp_native_compositor_requested()
 }

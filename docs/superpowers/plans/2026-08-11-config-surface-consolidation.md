@@ -316,11 +316,11 @@ OnceLock 캐싱도 그 안으로 옮겼다 - 같은 패턴이 17 번 복제돼 �
 
 | pref | 기본값 | 근거 |
 |---|---|---|
-| `gfx.refresh.hz` | `120` | `refresh_driver.rs` 의 `unwrap_or(120)`, `[1,1000]` 필터 |
-| `gfx.vsync.enabled` | `false` | `is_ok_and(1\|true\|on)` |
-| `gfx.dcomp.mode` | `"off"` | env 미설정 시 `dcomp_native_compositor_requested()==false` |
+| `gfx_refresh_hz` | `120` | `refresh_driver.rs` 의 `unwrap_or(120)`, `[1,1000]` 필터 |
+| `gfx_vsync_enabled` | `false` | `is_ok_and(1\|true\|on)` |
+| `gfx_dcomp_mode` | `"off"` | env 미설정 시 `dcomp_native_compositor_requested()==false` |
 
-`gfx.wall.frame.*` 3 개는 `components/paint/paint.rs` 의 해당 상수/판정을 읽어 확정한다. **추측 금지.**
+`gfx_wall_frame.*` 3 개는 `components/paint/paint.rs` 의 해당 상수/판정을 읽어 확정한다. **추측 금지.**
 
 - [ ] **Step 2: 실패하는 테스트를 쓴다**
 
@@ -363,9 +363,9 @@ cargo test -p servo-config --test config_surface
 
 `paint.rs` 의 `WALL_FRAME_*_ENV` 상수와 그 판정, `refresh_driver.rs` 의 `SERVO_REFRESH_TIMER_HZ` 읽기, 두 셸의 `SERVO_WIN_VSYNC` 읽기를 `prefs::get().gfx_*` 로 교체한다.
 
-`gfx.refresh.hz` 의 `[1,1000]` 클램프는 **유지한다** — pref 로 옮긴다고 검증이 사라지면 안 된다. 범위를 벗어나면 경고 후 기본값을 쓴다.
+`gfx_refresh_hz` 의 `[1,1000]` 클램프는 **유지한다** — pref 로 옮긴다고 검증이 사라지면 안 된다. 범위를 벗어나면 경고 후 기본값을 쓴다.
 
-`gfx.dcomp.mode` 는 **Task 3 에서** 배선한다. 여기서는 필드만 추가한다.
+`gfx_dcomp_mode` 는 **Task 3 에서** 배선한다. 여기서는 필드만 추가한다.
 
 - [ ] **Step 6: 기동 덤프를 만든다**
 
@@ -530,7 +530,7 @@ dcomp_native_compositor_requested 의 공개 시그니처는 그대로 두어 �
 
 ---
 
-### Task 4: `gfx.video.*` 4 개
+### Task 4: `gfx_video.*` 4 개
 
 **Files:**
 - Modify: `components/config/prefs.rs`
@@ -627,7 +627,7 @@ fn disable_audio_is_inverted_into_a_positive_pref() {
 ```
 feat(config): 미디어 운용 노브 9 개를 pref 로
 
-SERVO_GSTREAMER_DISABLE_AUDIO 는 media.audio.enabled 로 뒤집었다. servo 관례가
+SERVO_GSTREAMER_DISABLE_AUDIO 는 media_audio_enabled 로 뒤집었다. servo 관례가
 긍정형이고 이중부정은 실수의 단골 자리다 - 의미가 뒤집히는 변경이라 마이그레이션
 표에 별도로 적었다.
 
@@ -653,7 +653,7 @@ SERVO_MEDIA_D3D11_VIDEO 는 media 와 paint 두 크레이트가 각자 읽고 �
 #[test]
 fn a_removed_env_name_names_its_replacement() {
     let entry = removed_env::lookup("SERVO_COMPOSITOR_DCOMP").expect("등록돼 있어야 한다");
-    assert!(entry.message.contains("gfx.dcomp.mode"), "무엇으로 바꿀지 알려줘야 한다: {}", entry.message);
+    assert!(entry.message.contains("gfx_dcomp_mode"), "무엇으로 바꿀지 알려줘야 한다: {}", entry.message);
 }
 
 #[test]
@@ -682,7 +682,7 @@ pub struct RemovedEnv { pub name: &'static str, pub message: &'static str }
 pub const REMOVED: &[RemovedEnv] = &[
     RemovedEnv {
         name: "SERVO_COMPOSITOR_DCOMP",
-        message: "use --pref gfx.dcomp.mode=surface (or gfx.dcomp.mode=on); \
+        message: "use --pref gfx_dcomp_mode=surface (or gfx_dcomp_mode=on); \
                   see docs/multigpu/configuration.md",
     },
     // … 19 개 …
@@ -701,7 +701,7 @@ pub fn check() -> Result<(), Vec<String>> { /* 설정된 것들을 모아 Err */
 $env:SERVO_COMPOSITOR_DCOMP="1"
 target\debug\servoshell.exe --help
 ```
-기대: 기동이 막히고 `gfx.dcomp.mode` 를 안내하는 메시지. 확인 후 `Remove-Item Env:SERVO_COMPOSITOR_DCOMP`.
+기대: 기동이 막히고 `gfx_dcomp_mode` 를 안내하는 메시지. 확인 후 `Remove-Item Env:SERVO_COMPOSITOR_DCOMP`.
 
 - [ ] **Step 6: 커밋**
 
@@ -803,7 +803,7 @@ fn the_doc_check_actually_catches_a_missing_entry() {
 
 - [ ] **Step 3: 문서를 쓴다**
 
-pref 19 개(이름·타입·기본값·설명)와 조사 노브 17 개(이름·종류·설명) 표. `debug_env` 의 `doc` 필드를 그대로 옮긴다. 마이그레이션 표(옛 env → 새 pref)도 포함하고, **의미가 뒤집힌 `media.audio.enabled`** 와 **`=0` 이 이제 진짜 off 로 동작**하는 두 가지를 눈에 띄게 적는다.
+pref 19 개(이름·타입·기본값·설명)와 조사 노브 17 개(이름·종류·설명) 표. `debug_env` 의 `doc` 필드를 그대로 옮긴다. 마이그레이션 표(옛 env → 새 pref)도 포함하고, **의미가 뒤집힌 `media_audio_enabled`** 와 **`=0` 이 이제 진짜 off 로 동작**하는 두 가지를 눈에 띄게 적는다.
 
 - [ ] **Step 4: 통과 확인과 커밋**
 
@@ -856,6 +856,6 @@ refactor(config): 조사가 끝난 노브를 걷어낸다
 - `cargo check -p servoshell`
 - `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl --release`
 - **미디어 변경이 포함되면 `.\mach build -j 8`** (cargo `-p` 로는 더미 백엔드로 빠진다)
-- 옮긴 pref 중 최소 다음 둘은 **옛 env 와 새 pref 의 동작이 같은지** 스모크 1 회씩: `gfx.dcomp.mode=surface`, `media.d3d11.enabled=true`
+- 옮긴 pref 중 최소 다음 둘은 **옛 env 와 새 pref 의 동작이 같은지** 스모크 1 회씩: `gfx_dcomp_mode=surface`, `media_d3d11_enabled=true`
 - 제거된 env 를 설정한 상태에서 기동이 실제로 막히는지
 - `rustfmt --edition 2024 --check <손댄 .rs>`, `git diff --check`

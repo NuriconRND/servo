@@ -40,7 +40,7 @@ use winapi::shared::winerror;
 use wio::com::ComPtr;
 use webrender_api::units::{DeviceIntRect, DeviceIntSideOffsets, DevicePixel};
 
-/// `SERVO_COMPOSITOR_DCOMP`/`gfx.dcomp.mode` 게이트 값의 3 상태. 파싱은 이 타입 하나뿐이다
+/// `SERVO_COMPOSITOR_DCOMP`/`gfx_dcomp_mode` 게이트 값의 3 상태. 파싱은 이 타입 하나뿐이다
 /// — 예전에는 surfman의 truthy 판정과 paint의 "surface" 판정이 같은 값을 서로 다른 문법으로
 /// 나눠 읽어서, 새 모드를 추가하면 두 곳을 다 고쳐야 했고 한쪽을 잊으면 조용히 하이브리드로
 /// 떨어졌다. 순수 문자열 로직이라 플랫폼 게이트 없이 여기(paint_api) 한 곳에 둔다 —
@@ -92,7 +92,7 @@ impl DcompMode {
 static DCOMP_MODE: OnceLock<DcompMode> = OnceLock::new();
 static DCOMP_MODE_INVALID_WARNED: Once = Once::new();
 
-/// 기동 시 embedder(servoshell/winit_wall)가 `gfx.dcomp.mode` pref 값을 파싱해 한 번
+/// 기동 시 embedder(servoshell/winit_wall)가 `gfx_dcomp_mode` pref 값을 파싱해 한 번
 /// 호출한다. **`RenderingContext` 생성 전에** 불러야 한다 — 창 서피스 생성이 이미 이 값을
 /// 본다. 두 번째 호출은 무시된다(`OnceLock`) — 프로세스 수명 동안 모드는 한 번만 확정된다.
 ///
@@ -101,12 +101,18 @@ static DCOMP_MODE_INVALID_WARNED: Once = Once::new();
 /// (`ports/servoshell/desktop/gui.rs`) 불리므로, 여기서 정규화하지 않고 매 호출마다
 /// `Invalid`를 재판정/재경고하면 3타일 기준 초당 수백 줄이 stderr(=성능 로그가 파싱하는
 /// 바로 그 스트림)로 쏟아진다.
+///
+/// `warn!`이 아니라 `eprintln!`을 쓴다 — 이 함수는 두 셸 모두 `ServoBuilder::build()`
+/// (`log::set_logger`가 설치되는 지점, `components/servo/servo.rs`) **이전에** 호출된다
+/// (`RenderingContext` 생성보다 앞이어야 하므로). 그 시점의 `warn!`은 로거가 없어 그냥
+/// 버려진다 — 같은 단계에서 도는 `config_dump::log_effective_config()`가 정확히 같은
+/// 이유로 `eprintln!`을 쓰는 것과 같은 관례(`components/config/config_dump.rs`).
 pub fn set_dcomp_mode(mode: DcompMode) {
     let normalized = if mode == DcompMode::Invalid {
         DCOMP_MODE_INVALID_WARNED.call_once(|| {
-            warn!(
-                "gfx.dcomp.mode(구 SERVO_COMPOSITOR_DCOMP) 값을 알 수 없다 - off 로 처리한다 \
-                 (아는 값: off, on/1/true/yes, surface)"
+            eprintln!(
+                "servo: warning: gfx_dcomp_mode(구 SERVO_COMPOSITOR_DCOMP) 값을 알 수 없다 - \
+                 off 로 처리한다 (아는 값: off, on/1/true/yes, surface)"
             );
         });
         DcompMode::Off

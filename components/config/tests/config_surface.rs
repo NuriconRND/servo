@@ -31,12 +31,12 @@ const UPSTREAM_OWNED: &[&str] = &[
 /// in_sources_is_registered`가 그 시점부터 다시 해당 이름들의 표류를 잡아준다(이관 후에도
 /// 옛 이름으로 읽는 코드가 남아 있으면 실패해야 하므로).
 const PENDING_PREF_MIGRATION: &[&str] = &[
-    // Task 2: gfx.* 6개는 전부 옮겨서 지웠다(env 읽기 자체를 pref 로 교체). SERVO_COMPOSITOR_DCOMP는
+    // Task 2: gfx_* 6개는 전부 옮겨서 지웠다(env 읽기 자체를 pref 로 교체). SERVO_COMPOSITOR_DCOMP는
     // Task 3이 배선을 끝내면서 지웠다 — 3 상태 파싱이 paint_api::rendering_context::DcompMode::parse
     // 한 곳으로 모였고, surfman(third_party/surfman/.../surface.rs)은 더 이상 그 이름을 env로
     // 읽지 않는다(paint_api가 정규화한 불리언만 주입받는다). PoC(dcomp_native_poc.rs)도 pref
     // 파싱 없이 surfman의 불리언 API를 직접 부르므로 이 이름을 읽지 않는다.
-    // Task 4: gfx.video.* 4개
+    // Task 4: gfx_video_* 4개
     "SERVO_VIDEO_ESCAPE",
     "SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN",
     "SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS",

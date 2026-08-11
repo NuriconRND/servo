@@ -92,29 +92,35 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 
 포크가 이미 추가한 pref(`dom_webgpu_multigpu_fanout`, `media_wall_region_upload`, `media_screen_capture_*`)가 **servo 기존 네임스페이스에 그대로 끼어 있다.** 그 선례를 따라 별도 포크 전용 최상위 네임스페이스를 만들지 않는다.
 
-`gfx.*`(컴포지터/표출)와 `media.*`(미디어) 둘을 쓴다. 파생 매크로가 필드명의 `_` 를 `.` 으로 바꾸므로 한 구획 안에 밑줄을 쓸 수 없다 — servo 자신도 `session_history_max_length` → `session.history.max.length` 이므로 이름이 길어지는 것은 기존 스타일이다.
+`gfx_*`(컴포지터/표출)와 `media_*`(미디어) 둘을 쓴다.
+
+★**pref 이름은 러스트 필드명 그대로, 밑줄 표기다.**★ 2026-08-11 실측 확인 — `ServoPreferences` 파생 매크로가 `stringify!(#name)` 으로 필드 식별자를 그대로 이름으로 쓴다(`components/config/macro/lib.rs:28-59`). 즉 CLI 는 `--pref gfx_dcomp_mode=on` 이고 **`--pref gfx.dcomp.mode=on` 은 통하지 않는다.** 저장소의 기존 용례도 같다(`--pref dom_webgpu_enabled=true`, `etc/multigpu/run_three_retargeting_wall.ps1:7`).
+
+이 문서는 처음에 **점 표기로 잘못 적혀 있었다.** servo upstream 문서의 `layout.threads` 식 표기를 보고 그렇게 가정했는데 이 코드베이스에서는 성립하지 않는다. 로그·문서·스크립트가 점 표기를 쓰면 운영자가 그대로 따라 하다 실패한다.
+
+**모르는 pref 이름은 조용히 무시되지 않고 즉시 패닉한다**(`Unknown preference: …`, `prefs.rs` 의 `set_value`). 오타가 조용히 넘어가지 않는다는 뜻이라 이 프로젝트가 경계하는 실패 유형은 아니다 — 다만 스크립트가 틀린 이름을 넘기면 **실행 자체가 죽는다.**
 
 | 현재 env | pref | 타입 | 기본값 |
 |---|---|---|---|
-| `SERVO_COMPOSITOR_DCOMP` | `gfx.dcomp.mode` | String `off\|on\|surface` | `off` |
-| `SERVO_WIN_VSYNC` | `gfx.vsync.enabled` | bool | `false` |
-| `SERVO_REFRESH_TIMER_HZ` | `gfx.refresh.hz` | i64 | **`120`** (`[1,1000]` 클램프) |
-| `SERVO_WALL_FRAME_PACING` | `gfx.wall.frame.pacing.enabled` | bool | 현행 |
-| `SERVO_WALL_FRAME_MAX_PENDING` | `gfx.wall.frame.max.pending` | i64 | 현행 |
-| `SERVO_WALL_FRAME_MIN_INTERVAL_MS` | `gfx.wall.frame.min.interval.ms` | i64 | 현행 |
-| `SERVO_VIDEO_ESCAPE` | `gfx.video.escape.mode` | **String** (모드) | 현행 |
-| `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx.video.escape.stable.swapchain` | bool | **`true`** |
-| `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx.video.escape.promote.hysteresis` | i64 | **`10`** |
-| `SERVO_VIDEO_DECOUPLE` | `gfx.video.decouple.enabled` | bool | **`true`** |
-| `SERVO_MEDIA_D3D11_VIDEO` | `media.d3d11.enabled` | bool | 현행 |
-| `SERVO_MEDIA_SYNC_GROUP` | `media.sync.group.enabled` | bool | 현행 |
-| `SERVO_MEDIA_GAPLESS_LOOP` | `media.gapless.loop.enabled` | bool | 현행 |
-| `SERVO_MEDIA_DIRECT_FILE` | `media.direct.file.enabled` | bool | 현행 |
-| `SERVO_GSTREAMER_AVDEC_MAX_THREADS` | `media.avdec.max.threads` | i64 | 현행 |
-| `SERVO_GSTREAMER_DISABLE_AUDIO` | `media.audio.enabled` | bool **(반전)** | `true` |
-| `SERVO_GSTREAMER_VIDEO_DECODER_POLICY` | `media.video.decoder.policy` | String | 현행 |
-| `SERVO_VIDEO_SINK_POLICY` | `media.video.sink.policy` | String | 현행 |
-| `SERVO_WEBRTC_JITTER_LATENCY_MS` | `media.webrtc.jitter.latency.ms` | i64 | 현행 |
+| `SERVO_COMPOSITOR_DCOMP` | `gfx_dcomp_mode` | String `off\|on\|surface` | `off` |
+| `SERVO_WIN_VSYNC` | `gfx_vsync_enabled` | bool | `false` |
+| `SERVO_REFRESH_TIMER_HZ` | `gfx_refresh_hz` | i64 | **`120`** (`[1,1000]` 클램프) |
+| `SERVO_WALL_FRAME_PACING` | `gfx_wall_frame_pacing_enabled` | bool | 현행 |
+| `SERVO_WALL_FRAME_MAX_PENDING` | `gfx_wall_frame_max_pending` | i64 | 현행 |
+| `SERVO_WALL_FRAME_MIN_INTERVAL_MS` | `gfx_wall_frame_min_interval_ms` | i64 | 현행 |
+| `SERVO_VIDEO_ESCAPE` | `gfx_video_escape_mode` | **String** (모드) | 현행 |
+| `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx_video_escape_stable_swapchain` | bool | **`true`** |
+| `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx_video_escape_promote_hysteresis` | i64 | **`10`** |
+| `SERVO_VIDEO_DECOUPLE` | `gfx_video_decouple_enabled` | bool | **`true`** |
+| `SERVO_MEDIA_D3D11_VIDEO` | `media_d3d11_enabled` | bool | 현행 |
+| `SERVO_MEDIA_SYNC_GROUP` | `media_sync_group_enabled` | bool | 현행 |
+| `SERVO_MEDIA_GAPLESS_LOOP` | `media_gapless_loop_enabled` | bool | 현행 |
+| `SERVO_MEDIA_DIRECT_FILE` | `media_direct_file_enabled` | bool | 현행 |
+| `SERVO_GSTREAMER_AVDEC_MAX_THREADS` | `media_avdec_max_threads` | i64 | 현행 |
+| `SERVO_GSTREAMER_DISABLE_AUDIO` | `media_audio_enabled` | bool **(반전)** | `true` |
+| `SERVO_GSTREAMER_VIDEO_DECODER_POLICY` | `media_video_decoder_policy` | String | 현행 |
+| `SERVO_VIDEO_SINK_POLICY` | `media_video_sink_policy` | String | 현행 |
+| `SERVO_WEBRTC_JITTER_LATENCY_MS` | `media_webrtc_jitter_latency_ms` | i64 | 현행 |
 
 "현행"은 지금 코드가 env 미설정 시 쓰는 값이다. **추측하지 말고** 구현 시 각 호출부에서 실제 값을 읽어 `const_default()` 에 명시한다.
 
@@ -129,24 +135,24 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 
 앞의 둘은 **기본 on 인 킬스위치**다. off 로 추측했으면 기능 두 개를 꺼뜨렸을 것이다.
 
-★**`SERVO_VIDEO_ESCAPE` 는 bool 이 아니다.** `paint_api::rendering_context::video_escape_mode() -> VideoEscapeMode` 열거형(`External` 등)을 판정한다 — `gfx.dcomp.mode` 와 같은 다상태 노브다. 구현 시 실제 variant 를 전부 열거해 String 문법을 확정한다.
+★**`SERVO_VIDEO_ESCAPE` 는 bool 이 아니다.** `paint_api::rendering_context::video_escape_mode() -> VideoEscapeMode` 열거형(`External` 등)을 판정한다 — `gfx_dcomp_mode` 와 같은 다상태 노브다. 구현 시 실제 variant 를 전부 열거해 String 문법을 확정한다.
 
 ### 옮기면서 달라지는 세 가지
 
-**1. `DISABLE_*` 를 긍정형으로 뒤집는다.** `SERVO_GSTREAMER_DISABLE_AUDIO` → `media.audio.enabled`(기본 `true`). servo pref 관례가 `*_enabled` 긍정형이고, 이중부정은 실수의 단골 자리다. **의미가 뒤집히는 변경**이므로 마이그레이션 표에 별도로 적는다.
+**1. `DISABLE_*` 를 긍정형으로 뒤집는다.** `SERVO_GSTREAMER_DISABLE_AUDIO` → `media_audio_enabled`(기본 `true`). servo pref 관례가 `*_enabled` 긍정형이고, 이중부정은 실수의 단골 자리다. **의미가 뒤집히는 변경**이므로 마이그레이션 표에 별도로 적는다.
 
 **2. "존재하면 켜짐" 이 사라진다.** `.is_ok()` 로 읽던 것들은 진짜 bool 이 되어 `=false` 가 통한다. 직관과 맞는 방향이지만, 기존 스크립트에서 `=0` 으로 껐다고 믿던 것이 있으면 **동작이 달라진다.**
 
 **3. 기본값을 명시하게 된다.** 지금은 "설정 안 하면 off" 가 암묵적이라, 배포 시 무엇이 켜져 있어야 하는지가 코드 어디에도 없고 실행 명령에만 있다.
 
-`gfx.dcomp.mode` 만 String 인 이유는 3상태이기 때문이다. bool 두 개로 쪼개면 `on` 과 `surface` 가 배타적이라는 것을 타입이 막지 못한다.
+`gfx_dcomp_mode` 만 String 인 이유는 3상태이기 때문이다. bool 두 개로 쪼개면 `on` 과 `surface` 가 배타적이라는 것을 타입이 막지 못한다.
 
 ## 5. DComp 게이트 — 파싱을 한 곳으로
 
 제약은 소유권이 아니라 **의존 방향**이다. surfman 은 저수준 그래픽 크레이트라 `servo_config` 에 의존시키면 의존이 역류한다. 그래서 읽기를 없애는 대신 **값을 주입**한다.
 
 ```
-pref  gfx.dcomp.mode = "off" | "on" | "surface"      ← 정본, 한 번만 파싱
+pref  gfx_dcomp_mode = "off" | "on" | "surface"      ← 정본, 한 번만 파싱
         ↓ 기동 시 주입 (embedder/paint → surfman 의 OnceLock setter)
 surfman: dcomp_native_compositor_requested()          ← 공개 시그니처 유지, 본문만 교체
 paint:   storage_mode()                               ← 같은 주입값에서 유도
@@ -220,8 +226,8 @@ debug_env::enabled(&debug_env::DCOMP_NO_PARTIAL_PRESENT)
 **기본값과 다른 것만** 한 줄씩 찍는다. 39 개를 매번 전부 찍으면 아무도 읽지 않는다.
 
 ```
-servo: config: gfx.dcomp.mode=surface (default off)
-servo: config: media.d3d11.enabled=true (default false)
+servo: config: gfx_dcomp_mode=surface (default off)
+servo: config: media_d3d11_enabled=true (default false)
 servo: config: debug env: SERVO_DCOMP_READBACK, SERVO_D3D11_PROFILE_MS=250
 ```
 
@@ -270,7 +276,7 @@ impl WallArgs {
 
 ```
 error: SERVO_COMPOSITOR_DCOMP is no longer read.
-       use --pref gfx.dcomp.mode=surface  (or gfx.dcomp.mode=on)
+       use --pref gfx_dcomp_mode=surface  (or gfx_dcomp_mode=on)
        see docs/multigpu/configuration.md
 ```
 
@@ -288,13 +294,13 @@ error: SERVO_COMPOSITOR_DCOMP is no longer read.
 
 - `cargo test -p servo_config` — 표류 테스트 양방향, 문서 테스트, 그 검사들이 무엇을 잡는지 고정하는 테스트
 - `cargo check -p servoshell`, `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl --release`
-- 옮긴 pref 각각에 대해 **기존 env 로 켰을 때와 새 pref 로 켰을 때 동작이 같은지** 스모크 1 회씩(특히 `gfx.dcomp.mode=surface`, `media.d3d11.enabled`)
+- 옮긴 pref 각각에 대해 **기존 env 로 켰을 때와 새 pref 로 켰을 때 동작이 같은지** 스모크 1 회씩(특히 `gfx_dcomp_mode=surface`, `media_d3d11_enabled`)
 - 제거된 env 를 설정한 상태에서 기동이 실제로 막히는지
 - `rustfmt --edition 2024 --check`, `git diff --check`
 
 ## 12. 리스크와 미결
 
 - **upstream servo 를 당길 때 `components/config/prefs.rs` 충돌이 늘어난다.** 이미 두 번 감수한 비용이며, 포크 전용 네임스페이스를 만들지 않기로 한 선례를 따른 결과다.
-- **`media.audio.enabled` 반전**과 **`=0` 이 이제 진짜 off 로 동작**하는 것은 기존 스크립트의 동작을 바꾼다. 마이그레이션 표에 별도 표시.
+- **`media_audio_enabled` 반전**과 **`=0` 이 이제 진짜 off 로 동작**하는 것은 기존 스크립트의 동작을 바꾼다. 마이그레이션 표에 별도 표시.
 - 다른 브랜치(`video-perf-investigation` 등)에는 여기 없는 노브(`SERVO_WALL_VIDEO_PACE_HZ`, `SERVO_PERF_GLFINISH`)가 있다. 그 브랜치를 병합할 때 표류 테스트가 실패하며 드러나므로, **병합자가 그 시점에 분류를 정해 테이블에 넣는다.** 이것이 의도된 동작이다.
 - 기본값을 "현행" 으로 적은 항목은 구현 시 실제 코드에서 읽어 확정해야 한다. 잘못 적으면 조용히 동작이 바뀐다.

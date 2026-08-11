@@ -244,7 +244,7 @@ impl TimerRefreshDriver {
 
 impl RefreshDriver for TimerRefreshDriver {
     fn observe_next_frame(&self, new_start_frame_callback: Box<dyn Fn() + Send + 'static>) {
-        // Free-running paint-timer period. Default 120Hz. Override with the `gfx.refresh.hz`
+        // Free-running paint-timer period. Default 120Hz. Override with the `gfx_refresh_hz`
         // pref (formerly the `SERVO_REFRESH_TIMER_HZ` env var) to match a specific display
         // refresh (e.g. 60) so frame production does not run faster than the display and beat
         // against its vsync (which shows up as periodic judder / non-uniform 60fps even with a
@@ -256,7 +256,7 @@ impl RefreshDriver for TimerRefreshDriver {
             let hz = if (1..=1000).contains(&raw_hz) {
                 raw_hz as u64
             } else {
-                warn!("Ignoring gfx.refresh.hz={raw_hz} (must be in [1, 1000]); using default 120");
+                warn!("Ignoring gfx_refresh_hz={raw_hz} (must be in [1, 1000]); using default 120");
                 120
             };
             Duration::from_millis(1000 / hz)

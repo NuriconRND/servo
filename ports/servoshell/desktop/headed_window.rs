@@ -384,7 +384,7 @@ impl HeadedWindow {
         // On Windows, optionally pace frame production to the DWM composition clock (display
         // vsync) via DwmFlush instead of the default free-running paint timer. The timer
         // overshoots the refresh rate (~65fps on a 60Hz display) and beats against vsync, causing
-        // periodic judder / non-uniform 60fps. Opt-in via the `gfx.vsync.enabled` pref (formerly
+        // periodic judder / non-uniform 60fps. Opt-in via the `gfx_vsync_enabled` pref (formerly
         // the `SERVO_WIN_VSYNC` env var). Historical note: this driver was removed on 2026-07-02
         // because under heavy multi-video load it degraded worse than the timer; that failure
         // mode was the composite-request runaway that the painter's display-composite in-flight
@@ -397,7 +397,7 @@ impl HeadedWindow {
         let win_vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
             let enabled = servo::prefs::get().gfx_vsync_enabled;
             if enabled {
-                info!("gfx.vsync.enabled=true: pacing frame production to DWM vsync (DwmFlush).");
+                info!("gfx_vsync_enabled=true: pacing frame production to DWM vsync (DwmFlush).");
                 Some(Rc::new(
                     crate::desktop::vsync_refresh_driver::DwmVsyncRefreshDriver::new(),
                 ))

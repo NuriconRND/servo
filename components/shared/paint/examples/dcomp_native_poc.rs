@@ -196,7 +196,7 @@ mod poc {
         // opt-out을 켜서 surfman이 평범한 HWND 서피스를 만들게 한다. 반드시
         // WindowRenderingContext 생성(=surfman create_window_surface가 이 값을 봄) 전에
         // 주입해야 한다. 이 PoC는 servo_config/paint_api의 pref 파싱 계층 없이 도는 유일한
-        // 경로라, `gfx.dcomp.mode` 문자열이 아니라 surfman의 저수준 불리언 게이트를 직접
+        // 경로라, `gfx_dcomp_mode` 문자열이 아니라 surfman의 저수준 불리언 게이트를 직접
         // 켠다(리뷰 결과 — 3 상태 파싱은 paint_api로 옮겼고, surfman은 더 이상 그 파싱을
         // 모른다. 이 PoC는 애초에 Hybrid/SurfaceOnly 구분과 무관하므로 그 구분 없이 곧장
         // true를 주입한다. 옛 SERVO_COMPOSITOR_DCOMP=1과 동일한 효과).

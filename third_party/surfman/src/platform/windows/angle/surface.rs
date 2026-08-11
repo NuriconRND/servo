@@ -40,7 +40,7 @@ use winapi::um::winbase::INFINITE;
 use winapi::um::winnt::HANDLE;
 use wio::com::ComPtr;
 
-/// `SERVO_COMPOSITOR_DCOMP`/`gfx.dcomp.mode` 게이트가 요청된 상태(불리언)의 단일 저장소.
+/// `SERVO_COMPOSITOR_DCOMP`/`gfx_dcomp_mode` 게이트가 요청된 상태(불리언)의 단일 저장소.
 /// surfman은 저수준 크레이트라 `servo_config`에 의존시키면 의존이 역류하므로, pref
 /// 문자열/3 상태(off/hybrid/surface) 파싱은 하지 않는다 — 그건
 /// `paint_api::rendering_context::DcompMode::parse` 한 곳뿐이고, surfman은 그 결과인
@@ -67,7 +67,10 @@ pub fn set_dcomp_native_compositor(requested: bool) {
 /// pbuffer(GL_FRAMEBUFFER_DEFAULT) 렌더링에도 발동해(ANGLE UsePresentPathFast) 시저 y
 /// 자동 반전으로 WR NativeSurface의 top-left 규약을 깨뜨린다.
 pub fn dcomp_native_compositor_requested() -> bool {
-    DCOMP_NATIVE_COMPOSITOR_REQUESTED.get().copied().unwrap_or(false)
+    DCOMP_NATIVE_COMPOSITOR_REQUESTED
+        .get()
+        .copied()
+        .unwrap_or(false)
 }
 
 const SURFACE_GL_TEXTURE_TARGET: u32 = gl::TEXTURE_2D;
@@ -351,7 +354,7 @@ impl Device {
                 } else {
                     if dcomp_native_compositor_requested() {
                         info!(
-                            "dcomp native compositor requested (gfx.dcomp.mode): creating plain \
+                            "dcomp native compositor requested (gfx_dcomp_mode): creating plain \
                              HWND window surface (window DComp target reserved for the native \
                              compositor)"
                         );
