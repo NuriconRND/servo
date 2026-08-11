@@ -14,8 +14,9 @@
 
 - **작업 위치**: 워크트리 `F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser\servo_multigpu-tiled-wall`, 브랜치 `nonstandard-media-display-port`. 다른 워크트리(`servo`, `servo_study`)를 건드리지 않는다.
 - **워크트리에 이미 미커밋 변경이 있다** (`etc/multigpu/config/wall_layout.example_1x1.json`, `tests/html/multigpu_standard_video_extended_probe.html`, `tests/html/multigpu_standard_video_rtsp_probe.html`). **절대 커밋하지 마라** — 마지막 파일에는 하드코딩된 RTSP 자격증명이 들어 있다. `git add <경로>` 로 자기 파일만 담고 `git add -A` 를 쓰지 마라.
-- **빌드 전 환경 설정 필수**: `. .\scripts\servo_env.ps1` (앞의 점이 중요하다 — 없으면 자식 프로세스에만 적용된다). MSVC 개발자 환경까지 불러온다.
-- 빌드 명령은 저장소 루트가 아니라 **`servo/` 안에서** 돈다는 CLAUDE.md 서술은 이 워크트리에서는 워크트리 루트를 의미한다.
+- ★**빌드는 반드시 `W:\servo_multigpu-tiled-wall` 에서 한다.**★ `F:\…` 원경로(82 자)로 빌드하면 **mozangle 이 긴 경로 때문에 실패**한다. `W:` 는 프로젝트 루트로 이미 `subst` 매핑돼 있다(`subst` 로 확인 가능). 실측: `W:` 경유 `cargo check -p servoshell` → 3 분 32 초, exit 0.
+- **환경 설정은 워크트리가 아니라 프로젝트 루트에 있다**: `. W:\scripts\servo_env.ps1` (앞의 점이 중요하다 — 없으면 자식 프로세스에만 적용된다). MSVC 개발자 환경까지 불러온다. `.\scripts\servo_env.ps1` 는 **없다.**
+- ★**개별 크레이트 `cargo check -p <crate>` 로 검증하지 마라.**★ Windows 에서 surfman 백엔드가 WGL 로 선택돼 `create_isolated_device` 미존재로 깨진다. `servoshell` 은 `Cargo.toml:138` 에서 `servo` 를 `features = ["no-wgl"]` 로 당기므로 ANGLE 백엔드가 선택된다 — **검증은 `cargo check -p servoshell` 로 한다.** `servo-config` 처럼 그래픽에 의존하지 않는 크레이트만 단독 check 가 가능하다.
 - **추측 금지**: 기본값·문법을 코드에서 읽지 않고 적으면 안 된다. 설계 문서 §4 에 반례가 있다 — `SERVO_VIDEO_DECOUPLE` 과 `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` 은 **기본 on 인 킬스위치**다.
 - **기대값과 계산이 맞지 않으면 데이터나 테스트를 고치지 말고 모순을 보고하라.**
 - 주석은 **한국어**로 **왜**를 설명한다(기존 파일 어투를 맞춘다).
