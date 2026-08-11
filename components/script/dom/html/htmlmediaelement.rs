@@ -40,6 +40,7 @@ use script_bindings::codegen::InheritTypes::{
 use script_bindings::weakref::WeakRef;
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::WebViewId;
+use servo_config::debug_env;
 use servo_config::pref;
 use servo_media::player::audio::AudioRenderer;
 use servo_media::player::video::{
@@ -127,15 +128,17 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../resources/media-controls.js"
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
 const MEDIA_FRAME_INFO_INTERVAL: u64 = 120;
-const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF";
 
+/// `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF`(servo_config::debug_env 등록)의 truthy 판정.
+/// gstreamer player 백엔드의 `enoughdata_backoff_disabled()`와 동일한 판정식이다
+/// (2026-08-11 조사로 확인함).
 fn disable_enough_data_backoff() -> bool {
     static DISABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var(DISABLE_ENOUGHDATA_BACKOFF_ENV).is_ok_and(|value| {
-            value == "1" ||
-                value.eq_ignore_ascii_case("true") ||
-                value.eq_ignore_ascii_case("yes") ||
-                value.eq_ignore_ascii_case("on")
+        debug_env::string(&debug_env::MEDIA_DISABLE_ENOUGHDATA_BACKOFF).is_some_and(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
         })
     });
 

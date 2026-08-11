@@ -18,6 +18,7 @@ use gstreamer_app;
 use gstreamer_play;
 use gstreamer_play::prelude::*;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
+use servo_config::debug_env;
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
@@ -44,7 +45,6 @@ const DEFAULT_TIME_RANGES: Vec<Range<f64>> = vec![];
 
 const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
 const DISABLE_AUDIO_ENV: &str = "SERVO_GSTREAMER_DISABLE_AUDIO";
-const DISABLE_ENOUGHDATA_BACKOFF_ENV: &str = "SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF";
 // Caps the worker-thread count of software libav video decoders (avdec_*). Each avdec
 // otherwise auto-spawns ~CPU-count threads plus a proportional decoded-frame pool; with
 // many simultaneous <video> elements this explodes thread count and memory. Unset = leave
@@ -230,6 +230,19 @@ fn env_flag_enabled(name: &str) -> bool {
             value.eq_ignore_ascii_case("true") ||
             value.eq_ignore_ascii_case("yes") ||
             value.eq_ignore_ascii_case("on")
+    })
+}
+
+/// `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF`(servo_config::debug_env 등록)의 truthy 판정.
+/// `htmlmediaelement.rs`의 `disable_enough_data_backoff()`와 동일한 판정식이다(2026-08-11
+/// 조사로 확인함) — `env_flag_enabled`와 문자 그대로 같은 truthy 집합이지만, 이 노브는
+/// 이름 문자열 없이 debug_env 상수로 읽어야 해서 별도 함수로 둔다.
+fn enoughdata_backoff_disabled() -> bool {
+    debug_env::string(&debug_env::MEDIA_DISABLE_ENOUGHDATA_BACKOFF).is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
     })
 }
 
@@ -794,9 +807,7 @@ impl PlayerInner {
             return Ok(());
         }
         if let Some(PlayerSource::Seekable(ref mut source)) = self.source {
-            if self.enough_data.load(Ordering::Relaxed) &&
-                !env_flag_enabled(DISABLE_ENOUGHDATA_BACKOFF_ENV)
-            {
+            if self.enough_data.load(Ordering::Relaxed) && !enoughdata_backoff_disabled() {
                 return Err(PlayerError::EnoughData);
             }
             return source

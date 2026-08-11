@@ -34,6 +34,7 @@ use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_config::debug_env;
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
 use servo_geometry::DeviceIndependentPixel;
@@ -58,26 +59,28 @@ use wr_malloc_size_of::MallocSizeOfOps;
 
 // A/B gate for the FPS-jitter investigation: when set, disable the per-video-arrival
 // immediate re-composite in `update_images` (falls back to script rendering-opportunity
-// pacing). Read once. Default = enabled (current behavior). Values "1"/"true" disable it.
+// pacing). Read once (cached inside `debug_env`). Default = enabled (current behavior).
+// Values "1"/"true" disable it.
 static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    debug_env::string(&debug_env::DISABLE_VIDEO_IMMEDIATE_COMPOSITE)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 // Kill switch for the latest-wins coalescing of immediate (epoch-less, i.e. video) image
-// updates in `update_images` (see `pending_video_frame_updates`). Read once. Default =
-// coalescing enabled. Values "1"/"true" restore the previous forward-every-arrival behavior.
+// updates in `update_images` (see `pending_video_frame_updates`). Read once (cached inside
+// `debug_env`). Default = coalescing enabled. Values "1"/"true" restore the previous
+// forward-every-arrival behavior.
 static VIDEO_UPDATE_COALESCE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SERVO_DISABLE_VIDEO_UPDATE_COALESCE")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    debug_env::string(&debug_env::DISABLE_VIDEO_UPDATE_COALESCE)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 // Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
 // once per second per painter. This is the ground-truth displayed cadence, independent of the
 // page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
 static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SERVO_LOG_PRESENT_CADENCE")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    debug_env::string(&debug_env::LOG_PRESENT_CADENCE)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 // DComp Native 경로에서 런타임 리사이즈(사용자 드래그/최대화) 후 picture-cache를 재구축하기
@@ -92,8 +95,8 @@ const DCOMP_RESIZE_DEBOUNCE_FRAMES: u32 = 10;
 // 이 마스터 스위치는 Task 12(정착 재구축)와 12b(드래그 중 가상 모드+시작 재구축)를 모두 끈다.
 #[cfg(windows)]
 static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SERVO_DCOMP_DISABLE_RESIZE_REBUILD")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    debug_env::string(&debug_env::DCOMP_DISABLE_RESIZE_REBUILD)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 // task-12b 전용 킬 스위치(기본 = 활성). "1"/"true"이면 "드래그 중 가상 서피스 모드(A:
@@ -104,8 +107,8 @@ static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 // RED(12b off, Task 12 on) ↔ GREEN(둘 다 on) A/B를 같은 바이너리에서 재현하기 위한 스위치.
 #[cfg(windows)]
 static DCOMP_RESIZE_VIRTUAL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL")
-        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    debug_env::string(&debug_env::DCOMP_DISABLE_RESIZE_VIRTUAL)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 use crate::Paint;
@@ -534,8 +537,7 @@ impl Painter {
         // 예 1920x1080). 미설정이면 WR 기본(콘텐츠 1024x512, 스크롤바는 WR이 자체 특수 크기
         // 분기 — picture.rs:2306-2311)을 그대로 쓴다. 타일 수·무효화 입도·per-tile 오버헤드
         // (DComp bind/unbind 횟수) A/B용 — 값이 창 이상이면 슬라이스당 타일 1장.
-        let steady_tile_size_override = std::env::var("SERVO_WR_PICTURE_TILE_SIZE")
-            .ok()
+        let steady_tile_size_override = debug_env::string(&debug_env::WR_PICTURE_TILE_SIZE)
             .and_then(|value| match parse_wr_tile_size_env(&value) {
                 Some(size) => Some(size),
                 None => {

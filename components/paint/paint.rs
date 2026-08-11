@@ -35,6 +35,7 @@ use profile_traits::time::{self as profile_time};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, RoutedReceiver};
 use servo_base::id::{PainterId, PipelineId, WebViewId};
 use servo_canvas_traits::webgl::{WebGLSurfaceId, WebGLThreads};
+use servo_config::debug_env;
 use servo_config::pref;
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use servo_geometry::DeviceIndependentPixel;
@@ -59,9 +60,6 @@ const WALL_FRAME_PACING_ENV: &str = "SERVO_WALL_FRAME_PACING";
 const WALL_FRAME_MAX_PENDING_ENV: &str = "SERVO_WALL_FRAME_MAX_PENDING";
 const WALL_FRAME_MIN_INTERVAL_MS_ENV: &str = "SERVO_WALL_FRAME_MIN_INTERVAL_MS";
 const WALL_FRAME_PACING_INFO_INTERVAL: u64 = 120;
-const WALL_FRAME_DELAY_TARGET_INDEX_ENV: &str = "SERVO_WALL_FRAME_DELAY_TARGET_INDEX";
-const WALL_FRAME_DELAY_AFTER_ENV: &str = "SERVO_WALL_FRAME_DELAY_AFTER";
-const WALL_FRAME_DELAY_COUNT_ENV: &str = "SERVO_WALL_FRAME_DELAY_COUNT";
 const WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL: u64 = 120;
 
 static WALL_MEDIA_IMAGE_FANOUT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -398,27 +396,47 @@ impl WallFrameBarrier {
 }
 
 impl WallFrameDelayInjection {
-    fn from_environment() -> Option<Self> {
-        let Ok(target_index) = env::var(WALL_FRAME_DELAY_TARGET_INDEX_ENV) else {
-            return None;
-        };
-
-        let target_index = match target_index.parse::<usize>() {
-            Ok(target_index) => target_index,
-            Err(error) => {
+    /// `debug_env::int()`가 돌려준 원시 값을 음수가 아닌 값으로 검증한다. `debug_env::int()`
+    /// 자체는 정수로 파싱되지 않는 값만 진단하고(모듈 doc 참고) 부호는 보지 않으므로, 세
+    /// 노브(target_index/after/count) 모두 이 함수로 감싸 음수를 놓치지 않게 한다 — 그렇지
+    /// 않으면 `SERVO_WALL_FRAME_DELAY_AFTER=-5` 같은 오타가 아무 경고 없이 기본값으로
+    /// 접혀, 배리어 실패 주입 도구가 조용히 무력화된다.
+    fn require_non_negative(flag: &'static debug_env::DebugFlag, raw: i64) -> Option<u64> {
+        match u64::try_from(raw) {
+            Ok(value) => Some(value),
+            Err(_) => {
                 warn!(
-                    "Ignoring wall frame delay injection: {WALL_FRAME_DELAY_TARGET_INDEX_ENV} \
-                     must be a zero-based target index ({error})"
+                    "Ignoring wall frame delay injection: {}={raw} must not be negative",
+                    flag.name
                 );
-                return None;
+                None
             },
-        };
+        }
+    }
 
-        let after_logical_frame_id =
-            Self::parse_optional_u64(WALL_FRAME_DELAY_AFTER_ENV).unwrap_or(1);
-        let remaining_frames = Self::parse_optional_u64(WALL_FRAME_DELAY_COUNT_ENV).unwrap_or(1);
+    fn from_environment() -> Option<Self> {
+        // 미설정 또는 정수로 파싱 안 됨(debug_env::int() 가 둘을 구분하지 않는다) -> 주입
+        // 전체 비활성. 음수는 require_non_negative 가 별도로 경고한다.
+        let raw_target_index = debug_env::int(&debug_env::WALL_FRAME_DELAY_TARGET_INDEX)?;
+        let target_index = usize::try_from(Self::require_non_negative(
+            &debug_env::WALL_FRAME_DELAY_TARGET_INDEX,
+            raw_target_index,
+        )?)
+        .ok()?;
+
+        // 미설정/비정수는 조용히 기본값 1(이전 parse_optional_u64 와 동일하게 미설정은
+        // 무경고). 음수는 require_non_negative 가 경고한 뒤 기본값 1로 접힌다.
+        let after_logical_frame_id = debug_env::int(&debug_env::WALL_FRAME_DELAY_AFTER)
+            .and_then(|raw| Self::require_non_negative(&debug_env::WALL_FRAME_DELAY_AFTER, raw))
+            .unwrap_or(1);
+        let remaining_frames = debug_env::int(&debug_env::WALL_FRAME_DELAY_COUNT)
+            .and_then(|raw| Self::require_non_negative(&debug_env::WALL_FRAME_DELAY_COUNT, raw))
+            .unwrap_or(1);
         if remaining_frames == 0 {
-            warn!("Ignoring wall frame delay injection: {WALL_FRAME_DELAY_COUNT_ENV} must be > 0");
+            warn!(
+                "Ignoring wall frame delay injection: {} must be > 0",
+                debug_env::WALL_FRAME_DELAY_COUNT.name
+            );
             return None;
         }
 
@@ -433,17 +451,6 @@ impl WallFrameDelayInjection {
             after_logical_frame_id,
             remaining_frames,
         })
-    }
-
-    fn parse_optional_u64(env_name: &str) -> Option<u64> {
-        let value = env::var(env_name).ok()?;
-        match value.parse::<u64>() {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warn!("Ignoring invalid {env_name}={value:?}: expected unsigned integer ({error})");
-                None
-            },
-        }
     }
 
     fn target_for_frame(

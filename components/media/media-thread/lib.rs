@@ -22,6 +22,7 @@ use paint_api::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use servo_config::debug_env;
 use servo_config::{opts, pref};
 pub use servo_media::player::context::{GlApi, GlContext, NativeDisplay, PlayerGLContext};
 use servo_media::player::d3d11_ring::{
@@ -584,12 +585,11 @@ impl paint_api::VideoExternalSurfaceProvider for MediaVideoExternalSurfaceProvid
 // (EGLImage 바인딩)이 램프 구간 프레임 예산을 얼마나 먹는지 정량화한다. 래핑은
 // 타일당 링 슬롯 4개 × plane 2~3개의 일회성 이벤트라 매 건 로깅해도 로그 폭주 없음.
 fn d3d11_profile_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SERVO_D3D11_PROFILE").is_ok_and(|v| {
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        })
-    })
+    // servo_config::debug_env가 프로세스 1회 판정을 캐시한다. 이 판정식은
+    // render-d3d11/lib.rs의 profile_enabled()에도 동일하게 존재하며, 2026-08-11
+    // 조사로 두 판정식이 문자 그대로 같음을 확인했다("1"/"true"/"on", 대소문자 무시).
+    debug_env::string(&debug_env::D3D11_PROFILE)
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
 }
 // D3D11PROF: import(래핑) 누적 횟수/누적 소요(µs) — 로그에 running total로 포함.
 static D3D11_IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);

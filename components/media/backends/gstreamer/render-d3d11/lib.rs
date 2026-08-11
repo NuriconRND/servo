@@ -24,9 +24,10 @@ mod ring_producer;
 mod render_d3d11 {
     use std::env;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     use gstreamer::prelude::*;
+    use servo_config::debug_env;
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
     use servo_media_player::d3d11_ring::D3d11PlaneRings;
@@ -66,26 +67,22 @@ mod render_d3d11 {
         })
     }
 
-    /// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다 (프로세스 1회 판정).
+    /// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다. `servo_config::debug_env`가
+    /// 프로세스 1회 판정을 캐시한다 — 이 판정식은 `servo-media-thread`(media-thread/lib.rs
+    /// 의 `d3d11_profile_enabled`)에도 동일하게 존재하며, 2026-08-11 조사로 두 판정식이
+    /// 문자 그대로 같음을 확인했다("1"/"true"/"on", 대소문자 무시).
     fn profile_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            env::var("SERVO_D3D11_PROFILE").is_ok_and(|v| {
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-            })
+        debug_env::string(&debug_env::D3D11_PROFILE).is_some_and(|v| {
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
         })
     }
 
     /// build_frame 총시간이 이 임계(ms) 이상일 때만 로깅 (로그 폭주 방지).
     /// SERVO_D3D11_PROFILE_MS 로 조정, 기본 8ms.
     fn profile_threshold_ms() -> f64 {
-        static T: OnceLock<f64> = OnceLock::new();
-        *T.get_or_init(|| {
-            env::var("SERVO_D3D11_PROFILE_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8.0)
-        })
+        debug_env::string(&debug_env::D3D11_PROFILE_MS)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8.0)
     }
 
     /// colorimetry 매핑 (components/media/backends/gstreamer/render.rs:240-246과 동일).

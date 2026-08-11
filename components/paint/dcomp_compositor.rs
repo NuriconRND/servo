@@ -22,6 +22,7 @@ use log::warn;
 use paint_api::VideoFrameLease;
 use paint_api::rendering_context::RenderingContext;
 use rustc_hash::FxHashMap;
+use servo_config::debug_env;
 use webrender::api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 use webrender::api::{ColorF, ExternalImageId, ImageRendering};
 use webrender::{
@@ -67,12 +68,11 @@ const DEMOTE_COOLDOWN_BASE: u64 = 300;
 const DEMOTE_COOLDOWN_CAP: u64 = 3600;
 
 /// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
-/// Cached behind a `OnceLock` — this is read from `bind`/`add_surface` per tile per frame
+/// Cached inside `debug_env` — this is read from `bind`/`add_surface` per tile per frame
 /// (45-tile wall = thousands of calls/sec), and repeated `std::env::var` there would pollute
 /// the Task 6 performance gate. The diagnostic itself stays available for Task 6.
 fn dcomp_debug() -> bool {
-    static DCOMP_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DCOMP_DEBUG.get_or_init(|| std::env::var("SERVO_DCOMP_DEBUG").is_ok())
+    debug_env::enabled(&debug_env::DCOMP_DEBUG)
 }
 
 /// External swap-chain stabilization gate (env `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`).
@@ -88,8 +88,7 @@ fn stable_swapchain() -> bool {
 /// while active; zero overhead when the env var is unset (never does glReadPixels, which
 /// stalls the pipeline). Frame-limited to <=120 by the caller (spec §7.1 stall amplification).
 fn readback_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SERVO_DCOMP_READBACK").is_ok())
+    debug_env::enabled(&debug_env::DCOMP_READBACK)
 }
 
 /// Task 9 defect diagnosis (spec 2026-07-15): env-gated (`SERVO_DCOMP_VALIDPROBE`) per-Virtual-bind
@@ -100,8 +99,7 @@ fn readback_enabled() -> bool {
 /// (tile-local y beyond the text sliver) and what valid_rect WR assigns it — the two candidate
 /// mechanisms for the never-redrawn strip showing uninitialised virtual-surface memory.
 fn valid_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SERVO_DCOMP_VALIDPROBE").is_ok())
+    debug_env::enabled(&debug_env::DCOMP_VALIDPROBE)
 }
 
 /// external 비디오 present 파이프라인 프로파일러 게이트(env `SERVO_VIDEO_ESCAPE_PROF`,
@@ -109,8 +107,7 @@ fn valid_probe_enabled() -> bool {
 /// 라인(info)을 낸다 — AMD 실기에서 어느 단계(acquire/convert/present)가 프레임 예산을 먹는지
 /// 판독용. 꺼지면 비용 0(단일 bool 체크 — 타이밍/카운터 자체를 만지지 않음).
 fn video_escape_prof() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_PROF").is_ok())
+    debug_env::enabled(&debug_env::VIDEO_ESCAPE_PROF)
 }
 
 /// external 비디오 갱신 분리 킬스위치. 기본 on; "0"이면 현재(비디오당 generate_frame) 복귀.
@@ -409,8 +406,7 @@ fn storage_mode() -> StorageMode {
 
 /// 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.
 fn partial_present_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("SERVO_DCOMP_NO_PARTIAL_PRESENT").is_ok())
+    debug_env::enabled(&debug_env::DCOMP_NO_PARTIAL_PRESENT)
 }
 
 /// 스왑체인 백버퍼의 유효 피복(타일 단위, Present까지 누적).
