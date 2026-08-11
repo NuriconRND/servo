@@ -7,7 +7,7 @@
 use std::cell::{Cell, RefCell, RefMut};
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Once, OnceLock};
 
 use dpi::PhysicalSize;
 use embedder_traits::RefreshDriver;
@@ -40,17 +40,102 @@ use winapi::shared::winerror;
 use wio::com::ComPtr;
 use webrender_api::units::{DeviceIntRect, DeviceIntSideOffsets, DevicePixel};
 
-/// Native Compositor(DirectComposition) 게이트(`SERVO_COMPOSITOR_DCOMP`) 판정의 단일
-/// 정본 — surfman의 공개 함수를 재수출한다(surfman은 같은 판정으로 창 서피스 DComp 속성
-/// 억제 + present-path-fast 비활성). 중복 env 파싱 금지.
-#[cfg(all(target_os = "windows", feature = "no-wgl"))]
-pub use surfman::dcomp_native_compositor_requested;
+/// `SERVO_COMPOSITOR_DCOMP`/`gfx.dcomp.mode` 게이트 값의 3 상태. 파싱은 이 타입 하나뿐이다
+/// — 예전에는 surfman의 truthy 판정과 paint의 "surface" 판정이 같은 값을 서로 다른 문법으로
+/// 나눠 읽어서, 새 모드를 추가하면 두 곳을 다 고쳐야 했고 한쪽을 잊으면 조용히 하이브리드로
+/// 떨어졌다. 순수 문자열 로직이라 플랫폼 게이트 없이 여기(paint_api) 한 곳에 둔다 —
+/// surfman은 저수준 크레이트라 pref 문법을 몰라야 하고(의존 역류 방지), `set_dcomp_mode`가
+/// 정규화를 끝낸 불리언만 넘긴다(아래).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DcompMode {
+    /// 네이티브 컴포지터 미사용 — 기존 창 서피스 경로 그대로.
+    Off,
+    /// 네이티브 컴포지터 on, 전면 갱신 서피스는 스왑체인으로 승격(구 경로 A/B 혼합).
+    Hybrid,
+    /// 네이티브 컴포지터 on, 가상 서피스 전용(구 경로 A/B).
+    SurfaceOnly,
+    /// 알 수 없는 값 — `set_dcomp_mode()`가 경고를 찍고 `Off`로 정규화한다. 정규화 이후
+    /// 상태(`effective_dcomp_mode()`)에는 절대 나타나지 않는다 — `parse()`의 반환값에만
+    /// 잠깐 존재하는 표현이다.
+    Invalid,
+}
 
-/// ANGLE(no-wgl) 밖에서는 DComp 네이티브 컴포지터가 성립하지 않으므로 항상 false
-/// (surfman의 angle 백엔드가 없어 정본 함수도 존재하지 않는다).
-#[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+impl DcompMode {
+    /// 옛 env 문법을 그대로 받는다 — 옛 스크립트가 `1`/`true`/`yes`를 쓴다. 빈 문자열은
+    /// off(미설정 pref의 기본값과 정확히 대응). `surface`=네이티브 컴포지터 on + 가상
+    /// 서피스 전용 모드(구 경로 A/B) — 모드 세부는 `paint::dcomp_compositor::storage_mode()`가
+    /// 이 값에서 유도한다.
+    pub fn parse(value: &str) -> DcompMode {
+        if value.is_empty() || value.eq_ignore_ascii_case("off") {
+            DcompMode::Off
+        } else if value.eq_ignore_ascii_case("surface") {
+            DcompMode::SurfaceOnly
+        } else if value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+        {
+            DcompMode::Hybrid
+        } else {
+            DcompMode::Invalid
+        }
+    }
+
+    /// `dcomp_native_compositor_requested()`의 기존 의미를 그대로 유지한다 — `surface`도
+    /// truthy였다. `Invalid`는 `set_dcomp_mode()`가 저장 전에 `Off`로 정규화하므로 이
+    /// 값으로는 절대 들어오지 않지만, 방어적으로도 false(=off 취급)다.
+    pub fn native_compositor_requested(self) -> bool {
+        matches!(self, DcompMode::Hybrid | DcompMode::SurfaceOnly)
+    }
+}
+
+static DCOMP_MODE: OnceLock<DcompMode> = OnceLock::new();
+static DCOMP_MODE_INVALID_WARNED: Once = Once::new();
+
+/// 기동 시 embedder(servoshell/winit_wall)가 `gfx.dcomp.mode` pref 값을 파싱해 한 번
+/// 호출한다. **`RenderingContext` 생성 전에** 불러야 한다 — 창 서피스 생성이 이미 이 값을
+/// 본다. 두 번째 호출은 무시된다(`OnceLock`) — 프로세스 수명 동안 모드는 한 번만 확정된다.
+///
+/// `Invalid`는 여기서 `Off`로 정규화하고 경고를 **한 번만** 찍는다(`Once`). 이 정규화가
+/// 중요한 이유: `dcomp_native_compositor_requested()`(아래)는 egui 프레임마다
+/// (`ports/servoshell/desktop/gui.rs`) 불리므로, 여기서 정규화하지 않고 매 호출마다
+/// `Invalid`를 재판정/재경고하면 3타일 기준 초당 수백 줄이 stderr(=성능 로그가 파싱하는
+/// 바로 그 스트림)로 쏟아진다.
+pub fn set_dcomp_mode(mode: DcompMode) {
+    let normalized = if mode == DcompMode::Invalid {
+        DCOMP_MODE_INVALID_WARNED.call_once(|| {
+            warn!(
+                "gfx.dcomp.mode(구 SERVO_COMPOSITOR_DCOMP) 값을 알 수 없다 - off 로 처리한다 \
+                 (아는 값: off, on/1/true/yes, surface)"
+            );
+        });
+        DcompMode::Off
+    } else {
+        mode
+    };
+    let _ = DCOMP_MODE.set(normalized);
+    // surfman은 파싱을 모른다 — 여기서 정규화가 끝난 불리언만 내려보낸다(단일 정본은
+    // 이 파일의 DcompMode::parse뿐).
+    #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+    surfman::set_dcomp_native_compositor(normalized.native_compositor_requested());
+}
+
+/// 현재 프로세스에 확정된 DComp 모드. paint 쪽(`dcomp_compositor::storage_mode`)이 이
+/// 함수에서 `Hybrid`/`SurfaceOnly`를 유도한다. 주입 전 기본값은 `Off`(미설정 pref의
+/// 기본값과 대응) — env 폴백은 없다: 이 게이트를 읽는 모든 소비자(servoshell, winit_wall,
+/// `dcomp_native_poc`)가 기동 즉시 `set_dcomp_mode`/`surfman::set_dcomp_native_compositor`로
+/// 명시 주입하므로 더 이상 필요 없다(예전 env 폴백은 그 유일한 소비자였던 PoC가 이제
+/// 직접 주입하면서 사라졌다).
+pub fn effective_dcomp_mode() -> DcompMode {
+    DCOMP_MODE.get().copied().unwrap_or(DcompMode::Off)
+}
+
+/// Native Compositor(DirectComposition) 게이트 판정의 단일 정본. 공개 시그니처는 그대로
+/// 둔다 — 기존 호출부(`dcomp_compositor::enabled`, `ports/servoshell/desktop/gui.rs`, 매
+/// 프레임)를 건드리지 않는다. 캐시된 상태만 읽는다 — env 재평가도 문자열 파싱도 없다(둘
+/// 다 `set_dcomp_mode` 시점에 이미 끝나 있다).
 pub fn dcomp_native_compositor_requested() -> bool {
-    false
+    effective_dcomp_mode().native_compositor_requested()
 }
 
 /// `SERVO_VIDEO_ESCAPE` 게이트 모드. `external`만 유효(PREFER|SUPPORTS) — 그 외 토큰은
@@ -2267,5 +2352,29 @@ mod test {
         assert_eq!(parse_video_escape_token(Some("1")), VideoEscapeMode::Off); // 미정의 값은 off
         assert_eq!(parse_video_escape_token(Some("")), VideoEscapeMode::Off);
         assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);
+    }
+
+    #[test]
+    fn dcomp_mode_parsing_lives_in_one_place() {
+        use super::DcompMode;
+        assert_eq!(DcompMode::parse("off"), DcompMode::Off);
+        assert_eq!(DcompMode::parse(""), DcompMode::Off);
+        assert_eq!(DcompMode::parse("on"), DcompMode::Hybrid);
+        assert_eq!(DcompMode::parse("surface"), DcompMode::SurfaceOnly);
+        // 기존 env 문법을 그대로 받아야 한다 - 옛 스크립트가 1/true/yes 를 쓴다.
+        for truthy in ["1", "true", "TRUE", "yes", "on"] {
+            assert_eq!(DcompMode::parse(truthy), DcompMode::Hybrid, "{truthy}");
+        }
+        // 모르는 값은 Off 로 떨어지지 않는다 - 조용히 꺼지면 켰다고 믿게 된다.
+        assert_eq!(DcompMode::parse("bogus"), DcompMode::Invalid);
+    }
+
+    #[test]
+    fn hybrid_and_surface_are_both_native_compositor() {
+        use super::DcompMode;
+        // dcomp_native_compositor_requested() 의 기존 의미: surface 도 truthy 였다.
+        assert!(DcompMode::Hybrid.native_compositor_requested());
+        assert!(DcompMode::SurfaceOnly.native_compositor_requested());
+        assert!(!DcompMode::Off.native_compositor_requested());
     }
 }

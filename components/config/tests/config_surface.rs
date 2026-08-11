@@ -31,11 +31,11 @@ const UPSTREAM_OWNED: &[&str] = &[
 /// in_sources_is_registered`가 그 시점부터 다시 해당 이름들의 표류를 잡아준다(이관 후에도
 /// 옛 이름으로 읽는 코드가 남아 있으면 실패해야 하므로).
 const PENDING_PREF_MIGRATION: &[&str] = &[
-    // Task 2: gfx.* 6개 중 5개는 이번에 옮겨서 지웠다(env 읽기 자체를 pref 로 교체).
-    // SERVO_COMPOSITOR_DCOMP 는 남긴다 — gfx.dcomp.mode 필드는 추가했지만 배선(surfman
-    // storage_mode() 유도)은 Task 3 소관이라 옛 env 읽기(third_party/surfman/.../surface.rs)가
-    // 그대로 남아 있다(task-2-brief 모호함 해소 절 참고).
-    "SERVO_COMPOSITOR_DCOMP",
+    // Task 2: gfx.* 6개는 전부 옮겨서 지웠다(env 읽기 자체를 pref 로 교체). SERVO_COMPOSITOR_DCOMP는
+    // Task 3이 배선을 끝내면서 지웠다 — 3 상태 파싱이 paint_api::rendering_context::DcompMode::parse
+    // 한 곳으로 모였고, surfman(third_party/surfman/.../surface.rs)은 더 이상 그 이름을 env로
+    // 읽지 않는다(paint_api가 정규화한 불리언만 주입받는다). PoC(dcomp_native_poc.rs)도 pref
+    // 파싱 없이 surfman의 불리언 API를 직접 부르므로 이 이름을 읽지 않는다.
     // Task 4: gfx.video.* 4개
     "SERVO_VIDEO_ESCAPE",
     "SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN",
@@ -235,7 +235,8 @@ fn gfx_defaults_match_the_behaviour_before_the_migration() {
     // String pref 는 예외 없이 `const_default()`에서 빈 문자열이고 실제 기본 동작은
     // "미설정"으로 해석된다(옛 SERVO_COMPOSITOR_DCOMP env 도 미설정=off였다). 그 관례를
     // 깨는 대신(그러려면 const fn 을 포기해야 했다 - 코디네이터 지시로 되돌림), 빈
-    // 문자열을 off 와 동일시한다. "빈 문자열 -> off" 해석 자체는 Task 3 이 배선한다.
+    // 문자열을 off 와 동일시한다. "빈 문자열 -> off" 해석은 Task 3 이 배선을 끝냈다
+    // (`paint_api::rendering_context::DcompMode::parse("")` == `DcompMode::Off`).
     assert!(
         defaults.gfx_dcomp_mode.is_empty(),
         "빈 문자열 = off (이 파일의 다른 String pref 와 같은 관례)"

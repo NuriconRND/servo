@@ -279,9 +279,10 @@ pub struct Preferences {
     /// String pref 와 같은 관례(`const_default()`는 항상 빈 문자열, 실제 기본 동작은
     /// 소비하는 쪽이 "미설정"으로 해석)를 따른다. 옛 `SERVO_COMPOSITOR_DCOMP` env 가
     /// 마찬가지로 미설정=off 였으니 빈 문자열이 그 상태와 정확히 대응한다.
-    /// 필드만 여기 있다 — surfman 에 실제로 주입해 `storage_mode()` 를 유도하는 배선과
-    /// "빈 문자열 -> off"를 실제로 해석하는 코드는 Task 3 소관이다(옛
-    /// `SERVO_COMPOSITOR_DCOMP` env 가 그때까지 계속 그 역할을 한다).
+    /// 파싱은 `paint_api::rendering_context::DcompMode::parse` 한 곳뿐이다(Task 3 완료) —
+    /// 두 셸(servoshell/winit_wall)의 기동 경로가 이 필드를 파싱해 `set_dcomp_mode()`로
+    /// `RenderingContext` 생성 전에 주입하고, surfman은 그 결과 불리언만 받는다. 옛
+    /// `SERVO_COMPOSITOR_DCOMP` env는 더 이상 읽히지 않는다.
     pub gfx_dcomp_mode: String,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
@@ -539,7 +540,7 @@ impl Preferences {
             gfx_text_antialiasing_enabled: true,
             gfx_subpixel_text_antialiasing_enabled: true,
             gfx_texture_swizzling_enabled: true,
-            // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; gfx_dcomp_mode 는 Task 3 이 배선).
+            // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; 배선은 Task 3 이 완료).
             gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,

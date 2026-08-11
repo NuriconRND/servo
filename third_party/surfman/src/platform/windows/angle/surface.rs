@@ -40,22 +40,34 @@ use winapi::um::winbase::INFINITE;
 use winapi::um::winnt::HANDLE;
 use wio::com::ComPtr;
 
+/// `SERVO_COMPOSITOR_DCOMP`/`gfx.dcomp.mode` 게이트가 요청된 상태(불리언)의 단일 저장소.
+/// surfman은 저수준 크레이트라 `servo_config`에 의존시키면 의존이 역류하므로, pref
+/// 문자열/3 상태(off/hybrid/surface) 파싱은 하지 않는다 — 그건
+/// `paint_api::rendering_context::DcompMode::parse` 한 곳뿐이고, surfman은 그 결과인
+/// 불리언만 주입받는다(리뷰 결과 이관 — 예전엔 이 파일이 3 상태 enum까지 들고 있었으나,
+/// 파싱은 플랫폼 무관 순수 로직이라 paint_api로 올리고 저수준 크레이트는 최종 결과만
+/// 받게 했다).
+static DCOMP_NATIVE_COMPOSITOR_REQUESTED: OnceLock<bool> = OnceLock::new();
+
+/// 기동 시 `paint_api::rendering_context::set_dcomp_mode()`(정상 경로) 또는 surfman
+/// 단독 예제(`dcomp_native_poc`)가 직접 한 번 호출한다. **`RenderingContext` 생성 전에**
+/// 불러야 한다 — 창 서피스 생성이 이미 이 값을 본다(아래 `dcomp_native_compositor_requested()`
+/// 호출부 참고). 두 번째 호출은 무시된다(`OnceLock`) — 프로세스 수명 동안 한 번만
+/// 확정된다.
+pub fn set_dcomp_native_compositor(requested: bool) {
+    let _ = DCOMP_NATIVE_COMPOSITOR_REQUESTED.set(requested);
+}
+
 /// `SERVO_COMPOSITOR_DCOMP` 게이트 판정의 단일 정본(공개 API — paint_api/paint가 재사용).
-/// on이면 (1) 창 서피스는 DirectComposition 속성 없이 만들어 HWND의 DComp 타깃을
-/// Native Compositor 전용으로 남기고(CreateTargetForHwnd는 (hwnd, topmost)당 1개만 허용),
-/// (2) EGL 디스플레이의 present-path-fast를 끈다 — ppf는 pbuffer(GL_FRAMEBUFFER_DEFAULT)
-/// 렌더링에도 발동해(ANGLE UsePresentPathFast) 시저 y 자동 반전으로 WR NativeSurface의
-/// top-left 규약을 깨뜨린다.
+/// 공개 시그니처는 그대로 둔다 — 기존 호출부(device.rs 등)를 건드리지 않는다. 주입되지
+/// 않았으면 기본 false(미구성 = off, env 폴백 없음 — 모든 소비자가 기동 시 명시
+/// 주입한다). on이면 (1) 창 서피스는 DirectComposition 속성 없이 만들어 HWND의 DComp
+/// 타깃을 Native Compositor 전용으로 남기고(CreateTargetForHwnd는 (hwnd, topmost)당 1개만
+/// 허용), (2) EGL 디스플레이의 present-path-fast를 끈다 — ppf는
+/// pbuffer(GL_FRAMEBUFFER_DEFAULT) 렌더링에도 발동해(ANGLE UsePresentPathFast) 시저 y
+/// 자동 반전으로 WR NativeSurface의 top-left 규약을 깨뜨린다.
 pub fn dcomp_native_compositor_requested() -> bool {
-    std::env::var("SERVO_COMPOSITOR_DCOMP").is_ok_and(|v| {
-        v == "1"
-            || v.eq_ignore_ascii_case("true")
-            || v.eq_ignore_ascii_case("yes")
-            || v.eq_ignore_ascii_case("on")
-            // "surface" = 네이티브 컴포지터 on + 가상 서피스 전용 모드(구 경로 A/B).
-            // 모드 세부는 paint::dcomp_compositor::storage_mode()가 판정한다.
-            || v.eq_ignore_ascii_case("surface")
-    })
+    DCOMP_NATIVE_COMPOSITOR_REQUESTED.get().copied().unwrap_or(false)
 }
 
 const SURFACE_GL_TEXTURE_TARGET: u32 = gl::TEXTURE_2D;
@@ -339,8 +351,9 @@ impl Device {
                 } else {
                     if dcomp_native_compositor_requested() {
                         info!(
-                            "SERVO_COMPOSITOR_DCOMP=1: creating plain HWND window surface \
-                             (window DComp target reserved for the native compositor)"
+                            "dcomp native compositor requested (gfx.dcomp.mode): creating plain \
+                             HWND window surface (window DComp target reserved for the native \
+                             compositor)"
                         );
                     } else {
                         warn!(

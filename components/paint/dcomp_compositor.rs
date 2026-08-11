@@ -386,22 +386,29 @@ impl StaleTracker {
     }
 }
 
-/// SERVO_COMPOSITOR_DCOMP 값의 세부 모드. "surface"=가상 서피스 전용(구 경로 A/B),
-/// 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
+/// `gfx.dcomp.mode`(구 SERVO_COMPOSITOR_DCOMP)의 세부 모드. "surface"=가상 서피스 전용
+/// (구 경로 A/B), 그 외 truthy=하이브리드(전면 갱신 서피스를 스왑체인으로 승격).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum StorageMode {
     Hybrid,
     SurfaceOnly,
 }
 
+/// 더 이상 env를 직접 읽지 않는다 — `paint_api::rendering_context::effective_dcomp_mode()`
+/// (파싱·정규화까지 paint_api가 전담, surfman은 결과 불리언만 받는다)가 유일한 판정
+/// 정본이고, 이 함수는 그 3 상태(Off/Hybrid/SurfaceOnly — `Invalid`는 paint_api의
+/// `set_dcomp_mode()`가 저장 전에 이미 `Off`로 정규화해 절대 관측되지 않는다)를
+/// StorageMode 2 상태로 매핑만 한다. Off도 여기 도달하지 않는다 — 호출측
+/// `enabled()`(= `dcomp_native_compositor_requested()`)가 이미 false를 걸러낸 뒤에만
+/// storage_mode()가 불린다.
 fn storage_mode() -> StorageMode {
     static MODE: std::sync::OnceLock<StorageMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("SERVO_COMPOSITOR_DCOMP") {
-            Ok(v) if v.eq_ignore_ascii_case("surface") => StorageMode::SurfaceOnly,
+    *MODE.get_or_init(
+        || match paint_api::rendering_context::effective_dcomp_mode() {
+            paint_api::rendering_context::DcompMode::SurfaceOnly => StorageMode::SurfaceOnly,
             _ => StorageMode::Hybrid,
-        }
-    })
+        },
+    )
 }
 
 /// 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.

@@ -85,21 +85,24 @@ $env:SERVO_MEDIA_D3D11_VIDEO = "1"
 $env:SERVO_MEDIA_DIRECT_FILE = "1"
 $env:SERVO_MEDIA_GAPLESS_LOOP = "1"
 $env:SERVO_MEDIA_SYNC_GROUP = "$Sync"
-$env:SERVO_WIN_VSYNC = "1"
 $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
 $env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "$DecoderThreads"
-# Set-or-clear convention: switches omitted this run must also clear stale env values.
+# gfx_vsync_enabled / gfx_dcomp_mode are prefs, not env vars (config-surface-consolidation
+# Task 2/3) -- servoshell reads its pref set unconditionally at startup, so setting
+# `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP` here would silently do nothing. Pass
+# `--pref` CLI args instead, appended to $prefArgs below and spliced into the Start-Process
+# -ArgumentList.
+$prefArgs = @("--pref", "gfx_vsync_enabled=true")
 if ($DComp -and $DCompSurface) {
-    $env:SERVO_COMPOSITOR_DCOMP = "surface"
+    $prefArgs += @("--pref", "gfx_dcomp_mode=surface")
     $dcompMode = "surface"
 } elseif ($DComp) {
-    $env:SERVO_COMPOSITOR_DCOMP = "1"
+    $prefArgs += @("--pref", "gfx_dcomp_mode=on")
     $dcompMode = "hybrid"
 } else {
     if ($DCompSurface) {
         Write-Warning "-DCompSurface requires -DComp; ignoring (DComp stays off)."
     }
-    Remove-Item Env:\SERVO_COMPOSITOR_DCOMP -ErrorAction SilentlyContinue
     $dcompMode = "off"
 }
 if ($VideoEscape -ne "") {
@@ -159,7 +162,8 @@ public class ServoWallDeco {
 Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads, dcomp=$dcompMode)"
 Write-Host "Log: $logPath"
 
-$proc = Start-Process -FilePath $servoExe -ArgumentList @("--window-size", $requestedWindowSize, $url) `
+$argumentList = @("--window-size", $requestedWindowSize) + $prefArgs + @($url)
+$proc = Start-Process -FilePath $servoExe -ArgumentList $argumentList `
     -RedirectStandardError $logPath -PassThru
 
 Start-Sleep -Seconds 10
@@ -216,7 +220,7 @@ if ($DComp) {
     }
 } else {
     if ($dcompEngaged -ge 1) {
-        Write-Host "WARNING: dcomp_engaged_markers=$dcompEngaged but -DComp was NOT requested -- stale SERVO_COMPOSITOR_DCOMP env?"
+        Write-Host "WARNING: dcomp_engaged_markers=$dcompEngaged but -DComp was NOT requested -- unexpected (the gate is CLI-only now, no env to leak in)."
     } else {
         Write-Host "PASS: dcomp_engaged_markers=0 (gate off, as expected)"
     }

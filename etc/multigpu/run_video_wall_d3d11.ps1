@@ -13,16 +13,18 @@ param(
     [switch] $Detach,
     # WR Native Compositor (DirectComposition) gate -- spec
     # docs/superpowers/specs/2026-07-13-wr-native-compositor-design.md. Off (default) =
-    # current Draw-compositor path, byte-identical. On sets SERVO_COMPOSITOR_DCOMP=1 for
-    # this process only; the switch is re-evaluated every run (stale env from a prior
-    # manual `$env:SERVO_COMPOSITOR_DCOMP` is cleared when omitted).
+    # current Draw-compositor path, byte-identical. On passes `--pref gfx_dcomp_mode=on`
+    # to this process only; the switch is re-evaluated every run (config-surface-consolidation
+    # Task 3: the gate is a `gfx_dcomp_mode` pref now, not an env var -- servoshell reads it
+    # unconditionally at startup, so a stale `$env:SERVO_COMPOSITOR_DCOMP` in this shell can
+    # no longer leak in or be needed to clear).
     [switch] $DComp,
     # DComp storage-mode selector (spec docs/superpowers/specs/2026-07-14-dcomp-swapchain-
     # content-design.md). Requires -DComp. Without -DCompSurface, -DComp alone selects the
-    # swap-chain HYBRID path (SERVO_COMPOSITOR_DCOMP=1): opaque surfaces with repeated
+    # swap-chain HYBRID path (`--pref gfx_dcomp_mode=on`): opaque surfaces with repeated
     # full-repaint promote to a flip swapchain (probe-parity Present), everything else stays
     # on the virtual-surface path. With -DCompSurface, -DComp -DCompSurface selects the
-    # VIRTUAL-SURFACE-ONLY legacy path (SERVO_COMPOSITOR_DCOMP=surface): no swapchain
+    # VIRTUAL-SURFACE-ONLY legacy path (`--pref gfx_dcomp_mode=surface`): no swapchain
     # promotion ever happens -- kept for AMD A/B against the hybrid path. Only the
     # *storage* backend is legacy here (virtual surface only, no swapchain); the deferred
     # AddVisual (Task 4 layer culling) and the end_frame GL flush apply in BOTH modes --
@@ -31,7 +33,7 @@ param(
     # ignored; DComp stays off).
     [switch] $DCompSurface,
     # Video WR-escape gate (spec docs/superpowers/specs/2026-07-17-video-wr-escape-design.md).
-    # Only takes effect when -DComp is also set (SERVO_COMPOSITOR_DCOMP=1|surface); layout
+    # Only takes effect when -DComp is also set (`gfx_dcomp_mode=on|surface`); layout
     # reads this only after confirming the DComp gate itself is on. "external" is the only
     # valid token: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE (video escapes the WR
     # content pass to a compositor-owned external surface). Empty (default) or any other
@@ -68,13 +70,16 @@ param(
 #   SERVO_MEDIA_GAPLESS_LOOP=1  SEGMENT rewind looping (no EOS/flush); pristine loop
 #                               boundaries and lockstep survives across loops
 #   SERVO_MEDIA_SYNC_GROUP=N    all N tiles start on a shared clock (+-1 frame lockstep)
-#   SERVO_WIN_VSYNC=1           DWM vsync pacing driver
+#   --pref gfx_vsync_enabled=true (CLI, not env -- config-surface-consolidation Task 2/3
+#                               moved this off SERVO_WIN_VSYNC, which servoshell no longer
+#                               reads at all) DWM vsync pacing driver
 #   SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF=1
 #                               inert while DIRECT_FILE is active; kept as a safety net
 #                               for any tile that falls back to the servosrc push path
 #
-# -DComp (optional, off by default): SERVO_COMPOSITOR_DCOMP=1|surface -- WR Native
-# Compositor (DirectComposition). WR draws picture-cache tiles directly into DComp surfaces
+# -DComp (optional, off by default): `--pref gfx_dcomp_mode=on|surface` (CLI, not env --
+# Task 3 moved this off SERVO_COMPOSITOR_DCOMP, which servoshell no longer reads at all) --
+# WR Native Compositor (DirectComposition). WR draws picture-cache tiles directly into DComp surfaces
 # and DWM composites them, eliminating the per-frame tile->backbuffer draw pass (specs
 # docs/superpowers/specs/2026-07-13-wr-native-compositor-design.md and
 # 2026-07-14-dcomp-swapchain-content-design.md). Aimed at the window-enlarge GPU%/framerate
@@ -117,24 +122,28 @@ $env:SERVO_MEDIA_D3D11_VIDEO = "1"
 $env:SERVO_MEDIA_DIRECT_FILE = "1"
 $env:SERVO_MEDIA_GAPLESS_LOOP = "1"
 $env:SERVO_MEDIA_SYNC_GROUP = "$Sync"
-$env:SERVO_WIN_VSYNC = "1"
 $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
 $env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "$DecoderThreads"
-# WR Native Compositor gate: only set when requested, and explicitly cleared otherwise so
-# a stale value from a previous manual `$env:SERVO_COMPOSITOR_DCOMP` set in this shell
-# cannot silently leak into an -DComp-less run (same convention as -Sync/-DecoderThreads).
+# gfx_vsync_enabled / gfx_dcomp_mode are prefs, not env vars (config-surface-consolidation
+# Task 2/3) -- servoshell reads its pref set unconditionally at startup, so setting
+# `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP` here would silently do nothing
+# (servoshell never reads those names anymore). Pass `--pref` CLI args instead, appended to
+# $prefArgs below and spliced into the Start-Process -ArgumentList.
+$prefArgs = @("--pref", "gfx_vsync_enabled=true")
+# WR Native Compositor gate: only added when requested (same convention as -Sync/
+# -DecoderThreads above -- this process's args are the single source of truth, so there is
+# no stale-env risk to guard against anymore).
 # -DCompSurface without -DComp is a no-op (warn + ignore): DComp stays fully off.
 if ($DComp -and $DCompSurface) {
-    $env:SERVO_COMPOSITOR_DCOMP = "surface"
+    $prefArgs += @("--pref", "gfx_dcomp_mode=surface")
     $dcompMode = "surface"
 } elseif ($DComp) {
-    $env:SERVO_COMPOSITOR_DCOMP = "1"
+    $prefArgs += @("--pref", "gfx_dcomp_mode=on")
     $dcompMode = "hybrid"
 } else {
     if ($DCompSurface) {
         Write-Warning "-DCompSurface requires -DComp; ignoring -DCompSurface (DComp stays off)."
     }
-    Remove-Item Env:\SERVO_COMPOSITOR_DCOMP -ErrorAction SilentlyContinue
     $dcompMode = "off"
 }
 # Video WR-escape gate: same set-or-clear convention as -DComp above. Layout only honors
@@ -210,7 +219,8 @@ public class ServoWallDeco {
 Write-Host "Launching $Cols x $Rows = $tiles tiles (sync=$Sync, decoder_threads=$DecoderThreads, dcomp=$dcompMode)"
 Write-Host "Log: $logPath"
 
-$proc = Start-Process -FilePath $servoExe -ArgumentList @("--window-size", $requestedWindowSize, $url) `
+$argumentList = @("--window-size", $requestedWindowSize) + $prefArgs + @($url)
+$proc = Start-Process -FilePath $servoExe -ArgumentList $argumentList `
     -RedirectStandardError $logPath -PassThru
 
 Start-Sleep -Seconds 10
@@ -299,7 +309,7 @@ if ($DComp) {
     }
 } else {
     if ($dcompEngaged -ge 1) {
-        Write-Host "WARNING: dcomp_engaged_markers=$dcompEngaged but -DComp was NOT requested -- stale SERVO_COMPOSITOR_DCOMP env in this shell?"
+        Write-Host "WARNING: dcomp_engaged_markers=$dcompEngaged but -DComp was NOT requested -- unexpected (the gate is CLI-only now, no env to leak in)."
     } else {
         Write-Host "PASS: dcomp_engaged_markers=0 (gate off, as expected)"
     }

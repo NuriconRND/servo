@@ -26,8 +26,11 @@
 //! ANGLE이 HWND에 자체 DComp 타깃을 붙인다. 그 상태로 우리가 `CreateTargetForHwnd`를
 //! 호출하면 `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED(0x88980800)`로 실패한다
 //! (타깃은 (hwnd, topmost)당 1개). 그래서 이 PoC는 surfman 창 서피스를 "평범한 HWND
-//! 서피스"로 만들도록 `SERVO_COMPOSITOR_DCOMP=1`(Task 1 opt-out)을 run() 진입 즉시,
-//! WindowRenderingContext 생성 전에 프로세스 env로 설정한다. 이는 실제 WR 네이티브
+//! 서피스"로 만들도록 `surfman::set_dcomp_native_compositor(true)`(구
+//! `SERVO_COMPOSITOR_DCOMP=1`, Task 1 opt-out — 3 상태 문자열 파싱은
+//! `paint_api::rendering_context::DcompMode::parse` 한 곳으로 모였고, surfman은 그 결과인
+//! 불리언만 받는다. 이 PoC는 pref 계층을 거치지 않으므로 그 불리언을 직접 주입한다)를
+//! run() 진입 즉시, WindowRenderingContext 생성 전에 호출한다. 이는 실제 WR 네이티브
 //! 컴포지터가 쓰는 구성과 동일하다(우회가 아니라 설계된 경로).
 //!
 //! 무결성 규칙(★HALT★): 게이트를 통과시키기 위한 임의 우회 금지. 특히 진짜 플랫폼/API
@@ -191,11 +194,13 @@ mod poc {
 
         // ★ANGLE 기본 창 서피스는 자체 DComp 타깃을 HWND에 붙이므로(§헤더 주석), Task 1
         // opt-out을 켜서 surfman이 평범한 HWND 서피스를 만들게 한다. 반드시
-        // WindowRenderingContext 생성(=surfman create_window_surface가 이 env를 읽음) 전에
-        // 설정해야 한다. (edition 2024에서 set_var는 unsafe — 아직 스레드 스폰 전이라 안전.)
-        unsafe {
-            std::env::set_var("SERVO_COMPOSITOR_DCOMP", "1");
-        }
+        // WindowRenderingContext 생성(=surfman create_window_surface가 이 값을 봄) 전에
+        // 주입해야 한다. 이 PoC는 servo_config/paint_api의 pref 파싱 계층 없이 도는 유일한
+        // 경로라, `gfx.dcomp.mode` 문자열이 아니라 surfman의 저수준 불리언 게이트를 직접
+        // 켠다(리뷰 결과 — 3 상태 파싱은 paint_api로 옮겼고, surfman은 더 이상 그 파싱을
+        // 모른다. 이 PoC는 애초에 Hybrid/SurfaceOnly 구분과 무관하므로 그 구분 없이 곧장
+        // true를 주입한다. 옛 SERVO_COMPOSITOR_DCOMP=1과 동일한 효과).
+        surfman::set_dcomp_native_compositor(true);
 
         // DPI 가상화로 client 픽셀 좌표가 스케일되지 않도록 프로세스를 DPI-aware로.
         unsafe {

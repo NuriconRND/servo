@@ -311,6 +311,14 @@ impl ApplicationHandler<WakerEvent> for App {
         servo::prefs::set(config.preferences.clone());
         servo::config_dump::log_effective_config();
 
+        // DComp 게이트(`gfx.dcomp.mode`) 주입 — 위 prefs::set()과 같은 이유로 창 생성보다
+        // 먼저 해야 한다: 아래 `tile::create_tile_windows()`가 이미 이 값을 보는
+        // `RenderingContext`(창 서피스)를 타일마다 만든다. 파싱은 surfman 한 곳
+        // (`DcompMode::parse`)뿐 — 여기서 다시 문자열을 판정하지 않는다.
+        paint_api::rendering_context::set_dcomp_mode(
+            paint_api::rendering_context::DcompMode::parse(&config.preferences.gfx_dcomp_mode),
+        );
+
         let display_handle = event_loop
             .display_handle()
             .expect("Failed to get display handle");

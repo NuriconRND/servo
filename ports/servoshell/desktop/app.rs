@@ -97,6 +97,16 @@ impl App {
         servo::prefs::set(self.preferences.clone());
         servo::config_dump::log_effective_config();
 
+        // DComp 게이트(`gfx.dcomp.mode`) 주입 — 위 prefs::set()과 같은 이유로 여기서
+        // 해야 한다: 아래 `create_platform_window_with_preferences()`(HeadedWindow::new)가
+        // 이미 이 값을 보는 `RenderingContext`(창 서피스)를 만든다. env 시절엔 프로세스
+        // 시작부터 늘 정해져 있었으므로 암묵적으로 이 시점보다 앞이었지만, pref로 옮긴
+        // 지금은 명시적으로 순서를 맞춰야 한다. 파싱은 surfman 한 곳
+        // (`DcompMode::parse`)뿐 — 여기서 다시 문자열을 판정하지 않는다.
+        paint_api::rendering_context::set_dcomp_mode(
+            paint_api::rendering_context::DcompMode::parse(&self.preferences.gfx_dcomp_mode),
+        );
+
         let mut protocol_registry = ProtocolRegistry::default();
         let _ = protocol_registry.register(
             "urlinfo",
