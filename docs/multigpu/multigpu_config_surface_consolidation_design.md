@@ -98,14 +98,14 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 |---|---|---|---|
 | `SERVO_COMPOSITOR_DCOMP` | `gfx.dcomp.mode` | String `off\|on\|surface` | `off` |
 | `SERVO_WIN_VSYNC` | `gfx.vsync.enabled` | bool | `false` |
-| `SERVO_REFRESH_TIMER_HZ` | `gfx.refresh.hz` | i64 | 현행 기본값 |
+| `SERVO_REFRESH_TIMER_HZ` | `gfx.refresh.hz` | i64 | **`120`** (`[1,1000]` 클램프) |
 | `SERVO_WALL_FRAME_PACING` | `gfx.wall.frame.pacing.enabled` | bool | 현행 |
 | `SERVO_WALL_FRAME_MAX_PENDING` | `gfx.wall.frame.max.pending` | i64 | 현행 |
 | `SERVO_WALL_FRAME_MIN_INTERVAL_MS` | `gfx.wall.frame.min.interval.ms` | i64 | 현행 |
-| `SERVO_VIDEO_ESCAPE` | `gfx.video.escape.enabled` | bool | 현행 |
-| `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx.video.escape.stable.swapchain` | bool | 현행 |
-| `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx.video.escape.promote.hysteresis` | i64 | 현행 |
-| `SERVO_VIDEO_DECOUPLE` | `gfx.video.decouple.enabled` | bool | 현행 |
+| `SERVO_VIDEO_ESCAPE` | `gfx.video.escape.mode` | **String** (모드) | 현행 |
+| `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx.video.escape.stable.swapchain` | bool | **`true`** |
+| `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx.video.escape.promote.hysteresis` | i64 | **`10`** |
+| `SERVO_VIDEO_DECOUPLE` | `gfx.video.decouple.enabled` | bool | **`true`** |
 | `SERVO_MEDIA_D3D11_VIDEO` | `media.d3d11.enabled` | bool | 현행 |
 | `SERVO_MEDIA_SYNC_GROUP` | `media.sync.group.enabled` | bool | 현행 |
 | `SERVO_MEDIA_GAPLESS_LOOP` | `media.gapless.loop.enabled` | bool | 현행 |
@@ -116,7 +116,20 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 | `SERVO_VIDEO_SINK_POLICY` | `media.video.sink.policy` | String | 현행 |
 | `SERVO_WEBRTC_JITTER_LATENCY_MS` | `media.webrtc.jitter.latency.ms` | i64 | 현행 |
 
-"현행"은 지금 코드가 env 미설정 시 쓰는 값이다. 구현 시 각 호출부에서 실제 값을 읽어 `const_default()` 에 명시한다.
+"현행"은 지금 코드가 env 미설정 시 쓰는 값이다. **추측하지 말고** 구현 시 각 호출부에서 실제 값을 읽어 `const_default()` 에 명시한다.
+
+★**"env 미설정 = off" 로 추측하면 안 된다.** 실측에서 반례가 나왔다:
+
+| 노브 | 실제 판정 | 기본값 |
+|---|---|---|
+| `SERVO_VIDEO_DECOUPLE` | `map(\|v\| v != "0").unwrap_or(true)` | **on** (킬스위치) |
+| `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `as_deref() != Ok("0")` | **on** (킬스위치) |
+| `SERVO_REFRESH_TIMER_HZ` | `unwrap_or(120)`, `[1,1000]` 필터 | 120 |
+| `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `unwrap_or(10)` | 10 |
+
+앞의 둘은 **기본 on 인 킬스위치**다. off 로 추측했으면 기능 두 개를 꺼뜨렸을 것이다.
+
+★**`SERVO_VIDEO_ESCAPE` 는 bool 이 아니다.** `paint_api::rendering_context::video_escape_mode() -> VideoEscapeMode` 열거형(`External` 등)을 판정한다 — `gfx.dcomp.mode` 와 같은 다상태 노브다. 구현 시 실제 variant 를 전부 열거해 String 문법을 확정한다.
 
 ### 옮기면서 달라지는 세 가지
 
