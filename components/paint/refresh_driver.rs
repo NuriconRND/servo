@@ -244,16 +244,21 @@ impl TimerRefreshDriver {
 
 impl RefreshDriver for TimerRefreshDriver {
     fn observe_next_frame(&self, new_start_frame_callback: Box<dyn Fn() + Send + 'static>) {
-        // Free-running paint-timer period. Default 120Hz. Override with SERVO_REFRESH_TIMER_HZ to
-        // match a specific display refresh (e.g. 60) so frame production does not run faster than
-        // the display and beat against its vsync (which shows up as periodic judder / non-uniform
-        // 60fps even with a single video). Read once; clamped to [1, 1000] Hz.
+        // Free-running paint-timer period. Default 120Hz. Override with the `gfx.refresh.hz`
+        // pref (formerly the `SERVO_REFRESH_TIMER_HZ` env var) to match a specific display
+        // refresh (e.g. 60) so frame production does not run faster than the display and beat
+        // against its vsync (which shows up as periodic judder / non-uniform 60fps even with a
+        // single video). Read once; clamped to [1, 1000] Hz — task-2: the clamp is preserved
+        // across the env->pref migration, but now warns instead of silently falling back, since
+        // a pref typo is easier to make (and harder to notice) than a one-off env var.
         static FRAME_DURATION: LazyLock<Duration> = LazyLock::new(|| {
-            let hz = std::env::var("SERVO_REFRESH_TIMER_HZ")
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .filter(|hz| (1..=1000).contains(hz))
-                .unwrap_or(120);
+            let raw_hz = servo_config::pref!(gfx_refresh_hz);
+            let hz = if (1..=1000).contains(&raw_hz) {
+                raw_hz as u64
+            } else {
+                warn!("Ignoring gfx.refresh.hz={raw_hz} (must be in [1, 1000]); using default 120");
+                120
+            };
             Duration::from_millis(1000 / hz)
         });
         self.queue_timer(*FRAME_DURATION, new_start_frame_callback);

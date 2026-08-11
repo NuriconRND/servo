@@ -11,8 +11,9 @@
 //! which returns at the next DWM composition (the display's vsync), so frame production is
 //! phase-locked to the display and runs at exactly the refresh rate.
 //!
-//! Opt-in on Windows desktop via `SERVO_WIN_VSYNC=1`. It is not the default because under heavy
-//! compositor load (many simultaneous videos) it degrades worse than the free-running timer.
+//! Opt-in on Windows desktop via the `gfx.vsync.enabled` pref. It is not the default because
+//! under heavy compositor load (many simultaneous videos) it degrades worse than the
+//! free-running timer.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};

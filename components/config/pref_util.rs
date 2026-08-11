@@ -32,6 +32,31 @@ impl PrefValue {
     }
 }
 
+// 기동 덤프(`config_dump::log_effective_config`)가 `Bool(false)` 같은 Debug 포맷 대신
+// 사람이 읽는 `false`를 찍을 수 있도록. Array 는 그런 덤프 대상 pref 가 아직 없지만
+// (shell_background_color_rgba 류) 재귀적으로 같은 포맷을 쓴다.
+impl std::fmt::Display for PrefValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrefValue::Float(value) => write!(f, "{value}"),
+            PrefValue::Int(value) => write!(f, "{value}"),
+            PrefValue::UInt(value) => write!(f, "{value}"),
+            PrefValue::Str(value) => write!(f, "{value}"),
+            PrefValue::Bool(value) => write!(f, "{value}"),
+            PrefValue::Array(values) => {
+                write!(f, "[")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                write!(f, "]")
+            },
+        }
+    }
+}
+
 impl TryFrom<&Value> for PrefValue {
     type Error = String;
 

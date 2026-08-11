@@ -87,6 +87,16 @@ impl App {
 
     /// Initialize Application once event loop start running.
     pub fn init(&mut self, active_event_loop: Option<&ActiveEventLoop>) {
+        // pref 를 여기서 전역으로 확정해 둔다. 원래는 `ServoBuilder::build()`(Servo::new())
+        // 안에서만 `prefs::set()`이 불렸는데, 그건 이 함수 안의
+        // `create_platform_window_with_preferences()`(HeadedWindow::new, 아래)보다 늦다 —
+        // 그 창 생성 코드가 `gfx.vsync.enabled` pref 를 읽어야 해서 닭이 먼저냐 문제가
+        // 생긴다. `self.preferences`는 이미 CLI/설정 파일 파싱으로 확정된 값이라 그대로
+        // 재사용한다. 아래 `servo_builder.build()`가 같은 값으로 다시 `prefs::set()`을
+        // 불러도 diff 가 비어 있어 조용히 반환된다(멱등).
+        servo::prefs::set(self.preferences.clone());
+        servo::config_dump::log_effective_config();
+
         let mut protocol_registry = ProtocolRegistry::default();
         let _ = protocol_registry.register(
             "urlinfo",

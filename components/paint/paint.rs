@@ -56,9 +56,8 @@ use crate::webview_renderer::UnknownWebView;
 
 const WALL_FRAME_BARRIER_DEADLINE: Duration = Duration::from_millis(16);
 const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
-const WALL_FRAME_PACING_ENV: &str = "SERVO_WALL_FRAME_PACING";
-const WALL_FRAME_MAX_PENDING_ENV: &str = "SERVO_WALL_FRAME_MAX_PENDING";
-const WALL_FRAME_MIN_INTERVAL_MS_ENV: &str = "SERVO_WALL_FRAME_MIN_INTERVAL_MS";
+// task-2: SERVO_WALL_FRAME_PACING/_MAX_PENDING/_MIN_INTERVAL_MS 는 pref 로 옮겼다
+// (gfx_wall_frame_pacing_enabled/_max_pending/_min_interval_ms, WallFramePacingConfig::from_prefs).
 const WALL_FRAME_PACING_INFO_INTERVAL: u64 = 120;
 const WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL: u64 = 120;
 
@@ -258,59 +257,36 @@ struct WallFrameCoordinatorUpdate {
 }
 
 impl WallFramePacingConfig {
-    fn from_environment() -> Self {
-        let mode = match env::var(WALL_FRAME_PACING_ENV) {
-            Ok(value) if value.eq_ignore_ascii_case("legacy") => WallFramePacingMode::Legacy,
-            Ok(value)
-                if value.eq_ignore_ascii_case("latest")
-                    || value.eq_ignore_ascii_case("latest-first") =>
-            {
-                WallFramePacingMode::Latest
-            },
-            Ok(value) => {
-                warn!(
-                    "Ignoring invalid {WALL_FRAME_PACING_ENV}={value:?}; \
-                     expected latest or legacy"
-                );
-                WallFramePacingMode::Latest
-            },
-            Err(_) => WallFramePacingMode::Latest,
+    /// 예전엔 `SERVO_WALL_FRAME_PACING`/`_MAX_PENDING`/`_MIN_INTERVAL_MS` 를 프로세스 시작 시
+    /// 한 번 env 로 읽었다. 이제 pref 다 - `gfx_wall_frame_pacing_enabled` 는 bool 이라
+    /// 예전의 "legacy/latest/그 외 문자열은 경고 후 latest" 3갈래 판정이 "켜짐=Latest,
+    /// 꺼짐=Legacy" 2갈래로 바뀐다(잘못된 문자열이라는 상태 자체가 pref 시스템에서는
+    /// 사라진다). max_pending/min_interval_ms 의 "0 이하면 경고 후 기본값" 클램프는 그대로
+    /// 유지한다 - pref 로 옮긴다고 검증이 사라지면 안 된다.
+    fn from_prefs() -> Self {
+        let mode = if pref!(gfx_wall_frame_pacing_enabled) {
+            WallFramePacingMode::Latest
+        } else {
+            WallFramePacingMode::Legacy
         };
 
-        let max_pending = match env::var(WALL_FRAME_MAX_PENDING_ENV) {
-            Ok(value) => match value.parse::<usize>() {
-                Ok(value) if value > 0 => value,
-                Ok(_) => {
-                    warn!("Ignoring {WALL_FRAME_MAX_PENDING_ENV}=0; using default 1");
-                    1
-                },
-                Err(error) => {
-                    warn!(
-                        "Ignoring invalid {WALL_FRAME_MAX_PENDING_ENV}={value:?}: \
-                         expected positive integer ({error})"
-                    );
-                    1
-                },
-            },
-            Err(_) => 1,
+        let raw_max_pending = pref!(gfx_wall_frame_max_pending);
+        let max_pending = if raw_max_pending > 0 {
+            raw_max_pending as usize
+        } else {
+            warn!("Ignoring gfx.wall.frame.max.pending={raw_max_pending}; using default 1");
+            1
         };
 
-        let min_interval = match env::var(WALL_FRAME_MIN_INTERVAL_MS_ENV) {
-            Ok(value) => match value.parse::<f64>() {
-                Ok(value) if value > 0.0 => Duration::from_secs_f64(value / 1000.0),
-                Ok(_) => {
-                    warn!("Ignoring {WALL_FRAME_MIN_INTERVAL_MS_ENV}=0; using default 16");
-                    Duration::from_millis(16)
-                },
-                Err(error) => {
-                    warn!(
-                        "Ignoring invalid {WALL_FRAME_MIN_INTERVAL_MS_ENV}={value:?}: \
-                         expected positive milliseconds ({error})"
-                    );
-                    Duration::from_millis(16)
-                },
-            },
-            Err(_) => Duration::from_millis(16),
+        let raw_min_interval_ms = pref!(gfx_wall_frame_min_interval_ms);
+        let min_interval = if raw_min_interval_ms > 0 {
+            Duration::from_millis(raw_min_interval_ms as u64)
+        } else {
+            warn!(
+                "Ignoring gfx.wall.frame.min.interval.ms={raw_min_interval_ms}; \
+                 using default 16"
+            );
+            Duration::from_millis(16)
         };
 
         Self {
@@ -962,7 +938,7 @@ impl Paint {
             webview_painter_targets: Default::default(),
             next_logical_frame_id: Default::default(),
             wall_frame_coordinator: RefCell::new(WallFrameCoordinator::from_environment()),
-            wall_frame_pacing_config: WallFramePacingConfig::from_environment(),
+            wall_frame_pacing_config: WallFramePacingConfig::from_prefs(),
             coalesced_wall_frame_requests: Default::default(),
             last_wall_frame_issue_at: Default::default(),
             wall_frame_pacing_next_wake_at: Default::default(),

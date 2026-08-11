@@ -302,6 +302,15 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         };
 
+        // pref 를 여기서 전역으로 확정해 둔다. 원래는 `ServoBuilder::build()`(Servo::new())
+        // 안에서만 `prefs::set()`이 불렸는데, 그건 타일 창(과 그 win-vsync 드라이버 선택)이
+        // 이미 다 만들어진 *뒤*다 — 창을 만들기 전에 gfx.vsync.enabled 같은 pref 를 읽어야
+        // 해서 닭이 먼저냐 문제가 생긴다. `config.preferences`는 이미 CLI 파싱으로 확정된
+        // 값이라 그대로 재사용한다. 아래 `ServoBuilder::build()`가 같은 값으로 다시
+        // `prefs::set()`을 불러도 diff 가 비어 있어 조용히 반환된다(멱등).
+        servo::prefs::set(config.preferences.clone());
+        servo::config_dump::log_effective_config();
+
         let display_handle = event_loop
             .display_handle()
             .expect("Failed to get display handle");
@@ -344,22 +353,22 @@ impl ApplicationHandler<WakerEvent> for App {
             );
         }
 
-        // SERVO_WIN_VSYNC=1일 때만 DWM 합성 클럭에 프레임 생산을 페이싱한다.
-        // 기본 off인 이유: 이 환경에서 DwmFlush가 스핀-웨이트로 동작해 코어 1개를
-        // 상시 소모한다. 멀티GPU 간 vsync 동기화 작업의 기반으로 두되 표출 기본값은 아니다.
+        // `gfx.vsync.enabled` pref(구 SERVO_WIN_VSYNC env)가 켜졌을 때만 DWM 합성 클럭에
+        // 프레임 생산을 페이싱한다. 기본 off인 이유: 이 환경에서 DwmFlush가 스핀-웨이트로
+        // 동작해 코어 1개를 상시 소모한다. 멀티GPU 간 vsync 동기화 작업의 기반으로 두되
+        // 표출 기본값은 아니다.
         //
         // 드라이버는 콜백을 누적하므로 전 타일이 하나를 공유한다 — 타일마다 만들면
         // DwmFlush 스레드가 타일 수만큼 뜬다.
+        //
+        // pref 는 전역 싱글턴을 읽는다 — 아래에서 `servo_config::prefs::set()`을 창 생성보다
+        // 먼저 명시적으로 호출해 뒀으므로(이 함수 최상단) 여기서 이미 확정된 값이 보인다.
         #[cfg(target_os = "windows")]
         let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
-            let enabled = std::env::var("SERVO_WIN_VSYNC").is_ok_and(|value| {
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            });
+            let enabled = servo::prefs::get().gfx_vsync_enabled;
             if enabled {
                 eprintln!(
-                    "wall: SERVO_WIN_VSYNC=1: pacing frame production to DWM vsync (DwmFlush)."
+                    "wall: gfx.vsync.enabled=true: pacing frame production to DWM vsync (DwmFlush)."
                 );
                 Some(Rc::new(vsync_refresh_driver::DwmVsyncRefreshDriver::new()))
             } else {

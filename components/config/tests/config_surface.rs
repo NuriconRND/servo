@@ -31,13 +31,11 @@ const UPSTREAM_OWNED: &[&str] = &[
 /// in_sources_is_registered`가 그 시점부터 다시 해당 이름들의 표류를 잡아준다(이관 후에도
 /// 옛 이름으로 읽는 코드가 남아 있으면 실패해야 하므로).
 const PENDING_PREF_MIGRATION: &[&str] = &[
-    // Task 2: gfx.* 6개
+    // Task 2: gfx.* 6개 중 5개는 이번에 옮겨서 지웠다(env 읽기 자체를 pref 로 교체).
+    // SERVO_COMPOSITOR_DCOMP 는 남긴다 — gfx.dcomp.mode 필드는 추가했지만 배선(surfman
+    // storage_mode() 유도)은 Task 3 소관이라 옛 env 읽기(third_party/surfman/.../surface.rs)가
+    // 그대로 남아 있다(task-2-brief 모호함 해소 절 참고).
     "SERVO_COMPOSITOR_DCOMP",
-    "SERVO_WIN_VSYNC",
-    "SERVO_REFRESH_TIMER_HZ",
-    "SERVO_WALL_FRAME_PACING",
-    "SERVO_WALL_FRAME_MAX_PENDING",
-    "SERVO_WALL_FRAME_MIN_INTERVAL_MS",
     // Task 4: gfx.video.* 4개
     "SERVO_VIDEO_ESCAPE",
     "SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN",
@@ -218,4 +216,37 @@ fn the_drift_check_actually_catches_an_unregistered_name() {
     // 리터럴이 아닌 조립 형태는 못 잡는다는 것도 함께 고정한다(알려진 한계).
     let assembled = r#" let n = format!("SERVO_{}", suffix); std::env::var(n) "#;
     assert!(extract_env_names(assembled).is_empty());
+}
+
+#[test]
+fn gfx_defaults_match_the_behaviour_before_the_migration() {
+    // Preferences 는 prefs 모듈에 있다(pref_util 이 아니다 - 거기에는 PrefValue 만 있다).
+    let defaults = servo_config::prefs::Preferences::const_default();
+    // 이전 동작을 그대로 유지해야 한다 - 기본값이 바뀌면 조용히 화면이 달라진다.
+    assert_eq!(
+        defaults.gfx_refresh_hz, 120,
+        "refresh_driver.rs 의 unwrap_or(120)"
+    );
+    assert!(
+        !defaults.gfx_vsync_enabled,
+        "DwmFlush 가 코어를 상시 소모해 기본 off 다"
+    );
+    // 브리프 원안은 `assert_eq!(defaults.gfx_dcomp_mode, "off")`였지만, 이 파일의 다른
+    // String pref 는 예외 없이 `const_default()`에서 빈 문자열이고 실제 기본 동작은
+    // "미설정"으로 해석된다(옛 SERVO_COMPOSITOR_DCOMP env 도 미설정=off였다). 그 관례를
+    // 깨는 대신(그러려면 const fn 을 포기해야 했다 - 코디네이터 지시로 되돌림), 빈
+    // 문자열을 off 와 동일시한다. "빈 문자열 -> off" 해석 자체는 Task 3 이 배선한다.
+    assert!(
+        defaults.gfx_dcomp_mode.is_empty(),
+        "빈 문자열 = off (이 파일의 다른 String pref 와 같은 관례)"
+    );
+    // 아래 세 개는 브리프에 값이 안 나와 있어 paint.rs 의 실제 판정을 읽어 확정했다
+    // (WallFramePacingConfig::from_environment, 옮기기 전 코드): 환경변수 미설정이면
+    // mode 는 Latest 가 되고 enabled() 는 `mode == Latest`이므로 페이싱은 기본 켜짐이다.
+    assert!(
+        defaults.gfx_wall_frame_pacing_enabled,
+        "WALL_FRAME_PACING_ENV 미설정 시 WallFramePacingMode::Latest -> enabled()==true"
+    );
+    assert_eq!(defaults.gfx_wall_frame_max_pending, 1);
+    assert_eq!(defaults.gfx_wall_frame_min_interval_ms, 16);
 }

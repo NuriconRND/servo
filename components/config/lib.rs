@@ -10,6 +10,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod config_dump;
 pub mod debug_env;
 pub mod opts;
 pub mod pref_util;

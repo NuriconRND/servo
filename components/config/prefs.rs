@@ -271,6 +271,33 @@ pub struct Preferences {
     /// Whether or not subpixel antialiasing is enabled for text rendering.
     pub gfx_subpixel_text_antialiasing_enabled: bool,
     pub gfx_texture_swizzling_enabled: bool,
+    /// DirectComposition 네이티브 컴포지터 모드.
+    /// `off` = 기존 Draw 경로, `on` = 하이브리드(전면 갱신 서피스를 스왑체인으로 승격),
+    /// `surface` = 가상 서피스 전용. 3 상태이므로 bool 두 개로 쪼개지 않는다
+    /// (on 과 surface 가 배타적이라는 것을 타입이 막아야 한다).
+    /// **빈 문자열(`""`)이 기본값이고 `"off"`와 같은 뜻이다** — 이 파일의 다른 모든
+    /// String pref 와 같은 관례(`const_default()`는 항상 빈 문자열, 실제 기본 동작은
+    /// 소비하는 쪽이 "미설정"으로 해석)를 따른다. 옛 `SERVO_COMPOSITOR_DCOMP` env 가
+    /// 마찬가지로 미설정=off 였으니 빈 문자열이 그 상태와 정확히 대응한다.
+    /// 필드만 여기 있다 — surfman 에 실제로 주입해 `storage_mode()` 를 유도하는 배선과
+    /// "빈 문자열 -> off"를 실제로 해석하는 코드는 Task 3 소관이다(옛
+    /// `SERVO_COMPOSITOR_DCOMP` env 가 그때까지 계속 그 역할을 한다).
+    pub gfx_dcomp_mode: String,
+    /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
+    /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
+    pub gfx_vsync_enabled: bool,
+    /// 프리-vsync 페이싱용 자유 실행 페인트 타이머 주기(Hz). 특정 디스플레이 주사율(예 60)에
+    /// 맞춰 프레임 생산이 vsync 를 앞질러 저더가 생기는 것을 줄인다. `[1, 1000]` 범위를
+    /// 벗어나면 경고 후 기본값(120)을 쓴다.
+    pub gfx_refresh_hz: i64,
+    /// wall frame barrier 의 프레임 페이싱(최신-프레임-우선 코얼레싱)을 켤지 여부. 기본
+    /// 켜짐 — 꺼지면 도착한 프레임을 전부 순서대로 페인트하는 이전(legacy) 동작으로 되돌아간다.
+    pub gfx_wall_frame_pacing_enabled: bool,
+    /// wall frame 코얼레싱이 쌓아 둘 수 있는 최대 보류 프레임 수. 0 이하면 경고 후
+    /// 기본값(1)을 쓴다.
+    pub gfx_wall_frame_max_pending: i64,
+    /// wall frame 코얼레싱 간 최소 간격(ms). 0 이하면 경고 후 기본값(16)을 쓴다.
+    pub gfx_wall_frame_min_interval_ms: i64,
     /// The amount of image keys we request per batch for the image cache.
     pub image_key_batch_size: i64,
     /// Whether or not the DOM inspector should show shadow roots of user-agent shadow trees
@@ -399,7 +426,11 @@ pub struct Preferences {
 }
 
 impl Preferences {
-    const fn const_default() -> Self {
+    // `pub`로 올렸다(원래는 비공개) — Task 2 브리프의 필수 테스트(config_surface.rs, 별도
+    // 크레이트로 컴파일되는 통합 테스트)와 이 크레이트 안의 `config_dump` 모듈 양쪽에서
+    // 불러야 한다. `const fn`은 그대로 유지한다 — 모든 String pref 가 빈 문자열
+    // 기본값이라 const 컨텍스트 제약을 벗어나는 필드가 없다(gfx_dcomp_mode 도 포함).
+    pub const fn const_default() -> Self {
         Self {
             css_animations_testing_enabled: false,
             editing_caret_blink_time: 600,
@@ -508,6 +539,13 @@ impl Preferences {
             gfx_text_antialiasing_enabled: true,
             gfx_subpixel_text_antialiasing_enabled: true,
             gfx_texture_swizzling_enabled: true,
+            // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; gfx_dcomp_mode 는 Task 3 이 배선).
+            gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
+            gfx_vsync_enabled: false,
+            gfx_refresh_hz: 120,
+            gfx_wall_frame_pacing_enabled: true,
+            gfx_wall_frame_max_pending: 1,
+            gfx_wall_frame_min_interval_ms: 16,
             image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,
             intl_locale_override: String::new(),
@@ -589,6 +627,20 @@ impl Preferences {
         } else {
             None
         }
+    }
+
+    /// `self`(현재 값)과 `other`(가령 기본값) 사이에서 서로 다른 pref 만 (이름, 현재값,
+    /// 비교값) 3튜플로 돌려준다. 매크로가 만드는 `diff()`는 (이름, 현재값) 2튜플뿐이라 —
+    /// 기동 덤프(`config_dump::log_effective_config`)는 "기본값이 무엇이었는지"도 같이
+    /// 찍어야 하므로, `diff()`가 고른 이름들에 대해 `other.get_value()`로 비교값을 채운다.
+    pub fn diff_from(&self, other: &Self) -> Vec<(&'static str, PrefValue, PrefValue)> {
+        self.diff(other)
+            .into_iter()
+            .map(|(name, current_value)| {
+                let other_value = other.get_value(name);
+                (name, current_value, other_value)
+            })
+            .collect()
     }
 }
 
