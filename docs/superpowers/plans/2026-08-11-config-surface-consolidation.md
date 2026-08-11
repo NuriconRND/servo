@@ -25,7 +25,7 @@
   Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
   Claude-Session: https://claude.ai/code/session_01GHG3p4nt6sHudkycas4R8E
   ```
-- 각 태스크 종료 시: `cargo test -p servo_config`, `cargo check -p servoshell`, `rustfmt --edition 2024 --check <손댄 .rs>`, `git diff --check`.
+- 각 태스크 종료 시: `cargo test -p servo-config`, `cargo check -p servoshell`, `rustfmt --edition 2024 --check <손댄 .rs>`, `git diff --check`.
 - **GUI 육안 판정은 사용자 몫**이다. 서브에이전트가 판정하지 않는다.
 - 실행 프로세스를 남기지 않는다. 빌드는 포그라운드로 돌리고 `Finished`/`error` 를 실제로 본 뒤 진행한다.
 
@@ -165,7 +165,7 @@ fn every_registered_flag_is_actually_read_somewhere() {
 - [ ] **Step 3: 테스트가 실패하는지 확인한다**
 
 ```powershell
-cargo test -p servo_config --test config_surface
+cargo test -p servo-config --test config_surface
 ```
 기대: 컴파일 실패(`debug_env` 미정의).
 
@@ -254,7 +254,7 @@ debug_env::enabled(&debug_env::DCOMP_NO_PARTIAL_PRESENT)
 - [ ] **Step 6: 테스트가 통과하는지 확인한다**
 
 ```powershell
-cargo test -p servo_config --test config_surface
+cargo test -p servo-config --test config_surface
 cargo check -p servoshell
 ```
 기대: 두 테스트 통과. 실패하면 메시지가 지목하는 이름을 등록하거나 pref 대상으로 분류한다.
@@ -339,7 +339,7 @@ fn gfx_defaults_match_the_behaviour_before_the_migration() {
 - [ ] **Step 3: 테스트가 실패하는지 확인한다**
 
 ```powershell
-cargo test -p servo_config --test config_surface
+cargo test -p servo-config --test config_surface
 ```
 기대: 컴파일 실패(필드 미정의).
 
@@ -397,7 +397,7 @@ pub fn log_effective_config() {
 - [ ] **Step 7: 통과 확인과 커밋**
 
 ```powershell
-cargo test -p servo_config --test config_surface
+cargo test -p servo-config --test config_surface
 cargo check -p servoshell
 cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl --release
 ```
@@ -556,7 +556,7 @@ fn video_defaults_preserve_the_kill_switches() {
 }
 ```
 
-- [ ] **Step 3: 실패 확인** — `cargo test -p servo_config --test config_surface`
+- [ ] **Step 3: 실패 확인** — `cargo test -p servo-config --test config_surface`
 
 - [ ] **Step 4: pref 추가와 호출부 교체**
 
@@ -605,7 +605,7 @@ fn disable_audio_is_inverted_into_a_positive_pref() {
 }
 ```
 
-- [ ] **Step 3: 실패 확인** — `cargo test -p servo_config --test config_surface`
+- [ ] **Step 3: 실패 확인** — `cargo test -p servo-config --test config_surface`
 
 - [ ] **Step 4: pref 추가와 호출부 교체**
 
@@ -666,7 +666,7 @@ fn every_migrated_env_is_listed_as_removed() {
 
 `MIGRATED_19` 는 테스트 파일에 명시적으로 적는다(설계 문서 §4 표 그대로).
 
-- [ ] **Step 2: 실패 확인** — `cargo test -p servo_config --test config_surface`
+- [ ] **Step 2: 실패 확인** — `cargo test -p servo-config --test config_surface`
 
 - [ ] **Step 3: 구현한다**
 
@@ -797,7 +797,7 @@ fn the_doc_check_actually_catches_a_missing_entry() {
 
 `names_missing_from(doc: &str, flags: &[&DebugFlag]) -> Vec<&'static str>` 은 앞 테스트의 필터를 순수 함수로 분리한 것이다. 같은 파일에 정의하고 두 테스트가 공유한다 — 검사 본체와 "검사가 무엇을 잡는지" 를 같은 코드로 확인해야 의미가 있다.
 
-- [ ] **Step 2: 실패 확인** — `cargo test -p servo_config --test config_surface`
+- [ ] **Step 2: 실패 확인** — `cargo test -p servo-config --test config_surface`
 
 - [ ] **Step 3: 문서를 쓴다**
 
@@ -850,7 +850,7 @@ refactor(config): 조사가 끝난 노브를 걷어낸다
 
 ## 검증 (전체)
 
-- `cargo test -p servo_config`, `cargo test -p servo-paint-api`, `cargo test -p surfman dcomp_mode`
+- `cargo test -p servo-config`, `cargo test -p servo-paint-api`, `cargo test -p surfman dcomp_mode`
 - `cargo check -p servoshell`
 - `cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl --release`
 - **미디어 변경이 포함되면 `.\mach build -j 8`** (cargo `-p` 로는 더미 백엔드로 빠진다)
