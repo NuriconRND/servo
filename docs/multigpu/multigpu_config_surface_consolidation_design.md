@@ -102,7 +102,7 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 
 | 현재 env | pref | 타입 | 기본값 |
 |---|---|---|---|
-| `SERVO_COMPOSITOR_DCOMP` | `gfx_dcomp_mode` | String `off\|on\|surface` | `off` |
+| `SERVO_COMPOSITOR_DCOMP` | `gfx_dcomp_mode` | String `off\|on\|surface` | `""` (구현 시 확정: 이 파일의 String pref 관례가 예외 없이 `String::new()` 라 **빈 문자열 = off**) |
 | `SERVO_WIN_VSYNC` | `gfx_vsync_enabled` | bool | `false` |
 | `SERVO_REFRESH_TIMER_HZ` | `gfx_refresh_hz` | i64 | **`120`** (`[1,1000]` 클램프) |
 | `SERVO_WALL_FRAME_PACING` | `gfx_wall_frame_pacing_enabled` | bool | 현행 |
@@ -113,7 +113,7 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 | `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx_video_escape_promote_hysteresis` | i64 | **`10`** |
 | `SERVO_VIDEO_DECOUPLE` | `gfx_video_decouple_enabled` | bool | **`true`** |
 | `SERVO_MEDIA_D3D11_VIDEO` | `media_d3d11_enabled` | bool | 현행 |
-| `SERVO_MEDIA_SYNC_GROUP` | `media_sync_group_enabled` | bool | 현행 |
+| `SERVO_MEDIA_SYNC_GROUP` | ~~`media_sync_group_enabled`~~ → **`media_sync_group_target`** | ~~bool~~ → **i64** | `0` |
 | `SERVO_MEDIA_GAPLESS_LOOP` | `media_gapless_loop_enabled` | bool | 현행 |
 | `SERVO_MEDIA_DIRECT_FILE` | `media_direct_file_enabled` | bool | 현행 |
 | `SERVO_GSTREAMER_AVDEC_MAX_THREADS` | `media_avdec_max_threads` | i64 | 현행 |
@@ -123,6 +123,8 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 | `SERVO_WEBRTC_JITTER_LATENCY_MS` | `media_webrtc_jitter_latency_ms` | i64 | 현행 |
 
 "현행"은 지금 코드가 env 미설정 시 쓰는 값이다. **추측하지 말고** 구현 시 각 호출부에서 실제 값을 읽어 `const_default()` 에 명시한다.
+
+> **구현 후 정정(2026-08-12).** 위 표에서 취소선으로 표시한 두 칸은 구현 중 실제 코드를 읽어 바로잡은 것이다. `SERVO_MEDIA_SYNC_GROUP` 은 온오프가 아니라 **함께 출발할 파이프라인 개수**였고(`filter(|c| *c >= 2)`), `_enabled` 접미사가 이 저장소에서 예외 없이 bool 을 뜻하므로 이름과 타입을 함께 고쳤다. **확정된 전량 표는 `docs/multigpu/configuration.md` 가 정본이고, 그 문서와 코드의 일치는 테스트가 강제한다**(`config_surface.rs` 의 `every_migrated_pref_appears_in_the_configuration_doc` / `the_doc_repeats_the_knob_descriptions_verbatim`). 이 설계 문서는 결정 근거의 기록으로 남긴다.
 
 ★**"env 미설정 = off" 로 추측하면 안 된다.** 실측에서 반례가 나왔다:
 

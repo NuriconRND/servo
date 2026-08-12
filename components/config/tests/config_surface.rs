@@ -541,3 +541,88 @@ fn check_blocks_only_the_names_that_are_actually_set() {
     let all = removed_env::blocked_by(|_| true);
     assert_eq!(all.len(), MIGRATED_19.len());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 8: 문서 표류 방지.
+// ---------------------------------------------------------------------------------------------
+
+fn configuration_doc() -> String {
+    let path = repo_root().join("docs/multigpu/configuration.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} 를 읽지 못했다: {error}", path.display()))
+}
+
+/// 공백을 하나로 접는다. 마크다운은 줄바꿈으로 자유롭게 감쌀 수 있으므로, 원문과
+/// 문서를 같은 규칙으로 정규화한 뒤에 비교해야 한다.
+fn squeeze(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `flags` 중 `doc` 에 이름이 없는 것. 검사 본체와 "검사가 무엇을 잡는지" 가 같은 코드를
+/// 써야 의미가 있다.
+fn names_missing_from<'a>(
+    doc: &str,
+    flags: &[&'a servo_config::debug_env::DebugFlag],
+) -> Vec<&'a str> {
+    flags
+        .iter()
+        .map(|flag| flag.name)
+        .filter(|name| !doc.contains(*name))
+        .collect()
+}
+
+#[test]
+fn every_knob_appears_in_the_configuration_doc() {
+    let doc = configuration_doc();
+    let missing = names_missing_from(&doc, servo_config::debug_env::ALL);
+    assert!(missing.is_empty(), "문서에 없는 조사용 노브: {missing:?}");
+}
+
+#[test]
+fn every_migrated_pref_appears_in_the_configuration_doc() {
+    // 옮긴 19 개의 **새 pref 이름**과 **옛 env 이름**이 둘 다 문서에 있어야 한다. 옛 이름이
+    // 없으면 그것을 기억하는 사람이 문서에서 검색해도 못 찾는다 - 마이그레이션 표는 옛
+    // 이름으로 찾아 들어오는 사람을 위한 것이다.
+    let doc = configuration_doc();
+    let missing: Vec<String> = removed_env::REMOVED
+        .iter()
+        .flat_map(|entry| [entry.pref, entry.name])
+        .filter(|needle| !doc.contains(*needle))
+        .map(str::to_string)
+        .collect();
+    assert!(missing.is_empty(), "문서에 없는 이름: {missing:?}");
+}
+
+#[test]
+fn the_doc_repeats_the_knob_descriptions_verbatim() {
+    // 이름만 검사하면 설명이 낡아도 통과한다 - 이름은 잘 안 바뀌고 설명은 자주 바뀐다.
+    // debug_env 의 doc 필드를 정본으로 삼고 문서가 그것을 그대로 담고 있는지 본다.
+    let doc = squeeze(&configuration_doc());
+    let drifted: Vec<&str> = servo_config::debug_env::ALL
+        .iter()
+        .filter(|flag| !doc.contains(&squeeze(flag.doc)))
+        .map(|flag| flag.name)
+        .collect();
+    assert!(
+        drifted.is_empty(),
+        "설명이 debug_env 의 doc 과 다르다: {drifted:?}\n\
+         configuration.md 의 해당 항목을 debug_env.rs 의 doc 문자열로 맞춰라."
+    );
+}
+
+#[test]
+fn the_doc_check_actually_catches_a_missing_entry() {
+    // 검사가 느슨해져 통과만 하는 것을 막는다 - wall_view 에서 자체완결성 검사가
+    // 두 번 그렇게 무너졌고, 이 저장소에서도 2026-08-12 에 표류 테스트 하나가 무효인
+    // 채로 발견됐다(the_dead_knob_check_actually_catches_an_unread_flag 참고).
+    let synthetic = "SERVO_DCOMP_READBACK 만 적힌 문서";
+    let missing = names_missing_from(synthetic, servo_config::debug_env::ALL);
+    assert!(!missing.is_empty());
+    assert!(
+        !missing.contains(&"SERVO_DCOMP_READBACK"),
+        "적혀 있는 것은 빠진 것으로 세면 안 된다"
+    );
+    // 정규화가 줄바꿈을 흡수하는지도 함께 고정한다 - 이것이 없으면 문서를 감쌀 때마다
+    // 설명 검사가 거짓으로 실패한다.
+    assert_eq!(squeeze("a\n  b\tc"), "a b c");
+}
