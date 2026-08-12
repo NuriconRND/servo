@@ -160,8 +160,16 @@ fn configure_software_decoder_threads(element: &gstreamer::Element) {
         return;
     }
     let max_threads = pref!(media_avdec_max_threads);
-    // 음수(기본 -1) = 미설정 보초값 — 구 env 부재와 동일하게 자동 스레드 수를 그대로 둔다.
+    // `-1` = 미설정 보초값 — 구 env 부재와 동일하게 자동 스레드 수를 그대로 둔다. 그보다
+    // 작은 음수는 오타다. 구 env 경로가 그런 값에 warn 을 찍었으므로 그대로 유지한다 —
+    // 조용히 무시하면 캡을 걸었다고 믿는데 안 걸린 상태가 된다.
     if max_threads < 0 {
+        if max_threads < -1 {
+            log::warn!(
+                "Ignoring invalid media_avdec_max_threads={max_threads}; \
+                 expected -1 (automatic) or a non-negative thread cap"
+            );
+        }
         return;
     }
     // Setting an absent GObject property panics (and, occurring inside a non-unwinding
@@ -170,7 +178,10 @@ fn configure_software_decoder_threads(element: &gstreamer::Element) {
         log::debug!("{factory_name} has no max-threads property; skipping");
         return;
     }
-    element.set_property("max-threads", max_threads as i32);
+    // GObject 프로퍼티는 gint(i32) — pref 는 i64 라 그대로 캐스팅하면 랩어라운드한다.
+    // 스레드 캡이라 상한을 넘는 값은 i32::MAX 로 포화시키는 편이 뒤집히는 것보다 낫다.
+    let max_threads = max_threads.min(i32::MAX as i64) as i32;
+    element.set_property("max-threads", max_threads);
     log::info!("Set {factory_name} max-threads={max_threads}");
 }
 
@@ -447,7 +458,7 @@ struct PlayerInner {
     /// Channel to the gapless-loop worker thread (`None` when `media_gapless_loop_enabled`
     /// is off).
     gapless_loop_sender: Option<Sender<GaplessLoopMsg>>,
-    /// Sync-group start (see `media_sync_group_enabled`): play() was requested but the
+    /// Sync-group start (see `media_sync_group_target`): play() was requested but the
     /// pipeline is held paused until the group releases.
     sync_hold: Cell<bool>,
     /// Whether this pipeline has been armed and registered with the sync group.
@@ -464,13 +475,14 @@ enum GaplessLoopMsg {
     MaybeEnter,
     /// The current segment finished; rewind with a non-flushing SEGMENT seek.
     SegmentDone,
-    /// Arm this pipeline for a synchronized group start (see `media_sync_group_enabled`).
+    /// Arm this pipeline for a synchronized group start (see `media_sync_group_target`).
     ArmSyncGroup,
 }
 
 // Opt-in synchronized start for many simultaneous <video> pipelines (video wall).
-// `media_sync_group_enabled=N`(config-surface-consolidation Task 5, 구 env
-// SERVO_MEDIA_SYNC_GROUP=N — 타입은 브리프 표기와 달리 i64 다, prefs.rs 필드 doc 참고)
+// `media_sync_group_target=N`(config-surface-consolidation Task 5, 구 env
+// SERVO_MEDIA_SYNC_GROUP=N — 온오프가 아니라 목표 파이프라인 수 정수다, prefs.rs 필드 doc
+// 참고)
 // holds each seekable pipeline paused-prerolled (armed at position 0, in SEGMENT mode when
 // gapless looping is also enabled) until N pipelines are ready, then starts them all on a
 // shared system clock with an identical base time so they render in frame-level lockstep
@@ -482,7 +494,7 @@ fn sync_group_target() -> Option<usize> {
     // 옛 env 는 문자열 파싱 후 LazyLock 으로 프로세스 수명 캐시했다 — pref 읽기는 이미
     // 가벼운 RwLock 클론이고 이 함수는 프레임 핫패스가 아니라(play()/arm 시점에만 호출)
     // 캐시를 유지할 이유가 없다.
-    let target = pref!(media_sync_group_enabled);
+    let target = pref!(media_sync_group_target);
     (target >= 2).then_some(target as usize)
 }
 
@@ -657,7 +669,7 @@ impl PlayerInner {
 
         self.paused.set(false);
         self.can_resume.set(false);
-        // Synchronized group start (see `media_sync_group_enabled`): hold the pipeline
+        // Synchronized group start (see `media_sync_group_target`): hold the pipeline
         // paused and prerolled; the sync group releases every member simultaneously on a
         // shared clock. Arming happens once metadata is known (`request_sync_group_arm`).
         if sync_group_target().is_some() &&
@@ -1150,7 +1162,9 @@ impl GStreamerPlayer {
                     .build(),
             );
         } else if !pref!(media_audio_enabled) {
-            disable_pipeline_audio_sink(&pipeline, "media_audio_enabled")?;
+            // reason 은 로그에 그대로 찍힌다 — pref 이름만 넘기면 `reason=media_audio_enabled`
+            // 가 되어 오디오가 켜져서 sink 를 껐다는 뜻으로 읽힌다. 값까지 적는다.
+            disable_pipeline_audio_sink(&pipeline, "media_audio_enabled=false")?;
         }
 
         let video_sink = self.render.lock().unwrap().setup_video_sink(&pipeline)?;
@@ -1292,7 +1306,7 @@ impl GStreamerPlayer {
         });
 
         // Gapless looping (`media_gapless_loop_enabled`) and synchronized group start
-        // (`media_sync_group_enabled`): all pipeline seeking happens on this dedicated
+        // (`media_sync_group_target`): all pipeline seeking happens on this dedicated
         // worker thread. Entering segment mode or rewinding from GstPlay signal threads /
         // bus callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
         // pipeline, so signal handlers only post messages here.

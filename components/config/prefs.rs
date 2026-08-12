@@ -403,13 +403,16 @@ pub struct Preferences {
     /// 두 판정식이 문자 그대로 동일함을 확인했다(둘 다 `1`/`true`/`yes`/`on`, 대소문자
     /// 무시) — Task 5 로 pref 하나로 합쳐 두 크레이트가 같은 값을 본다.
     pub media_d3d11_enabled: bool,
-    /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모). **타입이 브리프의 암묵적
-    /// bool 표기와 다르다** — 구 env `SERVO_MEDIA_SYNC_GROUP=N`은 온오프가 아니라
-    /// "동기화를 기다릴 파이프라인 목표 수"였다(`player.rs::sync_group_target`: usize
-    /// 파싱 후 `filter(|count| *count >= 2)` — N이 2 미만이면 사실상 off). 필드 이름은
-    /// 브리프/설계문서 그대로 두고 타입만 i64 로 고쳤다(config_surface.rs 주석과
-    /// task-5-report.md 에 근거 기록). 0 이하 = 비활성(구 env 미설정과 동일).
-    pub media_sync_group_enabled: i64,
+    /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모)에서 **함께 출발하기를 기다릴
+    /// 파이프라인 목표 수**. 온오프 스위치가 아니다 — 구 env `SERVO_MEDIA_SYNC_GROUP=N`이
+    /// 그랬듯 타일 수를 그대로 받는다(`player.rs::sync_group_target`: 구코드는 usize 파싱
+    /// 후 `filter(|count| *count >= 2)`). `2` 미만(기본 `0` 포함) = 비활성이고, 이는 구 env
+    /// 미설정과 같은 동작이다.
+    ///
+    /// 브리프/설계문서는 이 노브를 `media_sync_group_enabled`(bool)로 적었으나 실제 판정이
+    /// 정수라 이름과 타입을 함께 고쳤다 — `_enabled` 접미사는 이 파일의 다른 모든 pref 에서
+    /// bool 을 뜻하므로 `--pref media_sync_group_enabled=45` 는 읽는 사람을 속인다.
+    pub media_sync_group_target: i64,
     /// `<video loop>` 무결절(gapless) SEGMENT 재탐색 루프(구 env
     /// `SERVO_MEDIA_GAPLESS_LOOP`). 기본 꺼짐 — 꺼지면 스펙대로 EOS -> flushing seek(0)
     /// 경로를 쓴다.
@@ -676,9 +679,10 @@ impl Preferences {
             media_local_direct_file: true,
             media_testing_enabled: false,
             // 근거는 위 필드 doc 주석 참고 (task-5 브리프의 반례: DISABLE_AUDIO 반전은 기본
-            // true, SYNC_GROUP 은 브리프 표기와 달리 i64, 나머지는 구 env 미설정 동작 보존).
+            // true, SYNC_GROUP 은 브리프 표기와 달리 목표 수 정수, 나머지는 구 env 미설정
+            // 동작 보존).
             media_d3d11_enabled: false,
-            media_sync_group_enabled: 0,
+            media_sync_group_target: 0,
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,
             media_avdec_max_threads: -1,

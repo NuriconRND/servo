@@ -742,7 +742,9 @@ pub fn construct(
     // 그대로 고정 지연으로 얹힌다. 기본 0 = 무버퍼(최저 지연). 네트워크 지터로 프레임이
     // 끊기면 `media_webrtc_jitter_latency_ms` pref 로 올려서 튜닝(구 env
     // SERVO_WEBRTC_JITTER_LATENCY_MS, 옛 `unwrap_or(0)` 그대로).
-    let jitter_latency_ms = pref!(media_webrtc_jitter_latency_ms).max(0) as u32;
+    // 구 env 는 u32 로 파싱해 음수/범위 초과가 파싱 실패 → 0 이었다. pref 는 i64 라 그대로
+    // 캐스팅하면 범위 초과가 랩어라운드한다 — 양끝을 클램프한다.
+    let jitter_latency_ms = pref!(media_webrtc_jitter_latency_ms).clamp(0, u32::MAX as i64) as u32;
     let webrtc = gstreamer::ElementFactory::make("webrtcbin")
         .name("sendrecv")
         .property("latency", jitter_latency_ms)

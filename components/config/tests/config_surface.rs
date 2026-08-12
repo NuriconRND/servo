@@ -48,8 +48,8 @@ const PENDING_PREF_MIGRATION: &[&str] = &[
     // 크레이트가 동일한 판정식(1/true/yes/on, 대소문자 무시)으로 각자 읽던 것을
     // pref!(media_d3d11_enabled) 하나로 합쳤다. SERVO_MEDIA_SYNC_GROUP 은 브리프/설계
     // 문서가 media_sync_group_enabled 를 bool 로 표기했지만 실제 판정(player.rs
-    // sync_group_target)은 파이프라인 목표 수(N>=2)를 받는 정수라 타입을 i64 로 고쳤다
-    // (필드 이름은 브리프대로 유지, 근거는 task-5-report.md). 나머지 6개(GAPLESS_LOOP/
+    // sync_group_target)은 파이프라인 목표 수(N>=2)를 받는 정수라 media_sync_group_target:
+    // i64 로 이름과 타입을 함께 고쳤다(근거는 task-5-report.md). 나머지 6개(GAPLESS_LOOP/
     // DIRECT_FILE/AVDEC_MAX_THREADS/VIDEO_DECODER_POLICY/VIDEO_SINK_POLICY/
     // WEBRTC_JITTER_LATENCY_MS)는 구 env 미설정 시의 실제 동작을 그대로 기본값으로 옮겼다.
 ];
@@ -292,10 +292,10 @@ fn media_defaults_preserve_the_old_env_unset_behaviour() {
         !defaults.media_d3d11_enabled,
         "env_flag_enabled(SERVO_MEDIA_D3D11_VIDEO) 는 env 미설정 시 false"
     );
-    // media_sync_group_enabled 는 브리프 표기(bool)와 달리 i64 다 — 구
-    // sync_group_target() 이 usize 파싱 + filter(>=2) 라 미설정은 None(=off)이었고, 0 이
-    // 그 상태를 대표한다(0 은 filter 조건을 만족 못 해 사실상 off).
-    assert_eq!(defaults.media_sync_group_enabled, 0);
+    // media_sync_group_target 은 브리프 표기(media_sync_group_enabled: bool)와 달리 목표
+    // 파이프라인 수 i64 다 — 구 sync_group_target() 이 usize 파싱 + filter(>=2) 라 미설정은
+    // None(=off)이었고, 0 이 그 상태를 대표한다(0 은 filter 조건을 만족 못 해 사실상 off).
+    assert_eq!(defaults.media_sync_group_target, 0);
     assert!(!defaults.media_gapless_loop_enabled);
     assert!(!defaults.media_direct_file_enabled);
     // -1 = "미설정, 자동" 의 보초값 — 0 이상은 실제 스레드 캡이라 0 을 기본값으로 쓰면

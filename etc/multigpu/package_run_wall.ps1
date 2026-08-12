@@ -93,7 +93,7 @@ $prefArgs = @(
     "--pref", "media_d3d11_enabled=true",
     "--pref", "media_direct_file_enabled=true",
     "--pref", "media_gapless_loop_enabled=true",
-    "--pref", "media_sync_group_enabled=$Sync",
+    "--pref", "media_sync_group_target=$Sync",
     "--pref", "media_avdec_max_threads=$DecoderThreads"
 )
 if ($DComp -and $DCompSurface) {

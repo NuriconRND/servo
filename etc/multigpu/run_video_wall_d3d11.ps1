@@ -71,7 +71,7 @@ param(
 #                               round-trip that caused per-tile freezes / sync boundary stalls
 #   --pref media_gapless_loop_enabled=true  SEGMENT rewind looping (no EOS/flush); pristine
 #                               loop boundaries and lockstep survives across loops
-#   --pref media_sync_group_enabled=N       all N tiles start on a shared clock (+-1 frame
+#   --pref media_sync_group_target=N       all N tiles start on a shared clock (+-1 frame
 #                               lockstep) -- N is a pipeline-count target, not a boolean
 #   --pref gfx_vsync_enabled=true (config-surface-consolidation Task 2/3 moved this off
 #                               SERVO_WIN_VSYNC, which servoshell no longer reads at all)
@@ -135,7 +135,7 @@ $prefArgs = @(
     "--pref", "media_d3d11_enabled=true",
     "--pref", "media_direct_file_enabled=true",
     "--pref", "media_gapless_loop_enabled=true",
-    "--pref", "media_sync_group_enabled=$Sync",
+    "--pref", "media_sync_group_target=$Sync",
     "--pref", "media_avdec_max_threads=$DecoderThreads"
 )
 # WR Native Compositor gate: only added when requested (same convention as -Sync/
