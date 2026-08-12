@@ -32,6 +32,15 @@ pub fn main() {
         },
     };
 
+    // pref 로 옮긴 env 가 아직 설정돼 있으면 여기서 멈춘다(config-surface-consolidation
+    // Task 6). 자리는 인자 파싱 **직후**, 이벤트 루프·창·파이프라인 생성 전이다 — 그
+    // 뒤로 미루면 창이 잠깐 떴다 사라져 무엇이 잘못됐는지 로그를 놓친다.
+    //
+    // `ContentProcess`(위에서 이미 반환)와 `Exit`(--help/--version)는 여기 오지 않는다.
+    // 자식 프로세스는 부모가 이미 막았으므로 중복으로 보고할 필요가 없고, --help 는
+    // 설정이 틀려도 볼 수 있어야 한다.
+    servo::removed_env::check_or_exit();
+
     crate::init_tracing(servoshell_preferences.tracing_filter.as_deref());
 
     let clean_shutdown = servoshell_preferences.clean_shutdown;

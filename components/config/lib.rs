@@ -15,3 +15,4 @@ pub mod debug_env;
 pub mod opts;
 pub mod pref_util;
 pub mod prefs;
+pub mod removed_env;

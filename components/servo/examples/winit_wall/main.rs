@@ -160,6 +160,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = parse_args()?;
 
+    // pref 로 옮긴 env 가 아직 설정돼 있으면 여기서 멈춘다(config-surface-consolidation
+    // Task 6). 인자 파싱 직후, 이벤트 루프·타일 창 생성 전이다 — servoshell 의 cli.rs 와
+    // 같은 자리다. 이 셸도 같은 `etc/multigpu/*.ps1` 로 띄우므로 같은 함정에 걸린다.
+    servo::removed_env::check_or_exit();
+
     let event_loop = EventLoop::with_user_event()
         .build()
         .expect("Failed to create EventLoop");
