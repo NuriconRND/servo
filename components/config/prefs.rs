@@ -299,6 +299,24 @@ pub struct Preferences {
     pub gfx_wall_frame_max_pending: i64,
     /// wall frame 코얼레싱 간 최소 간격(ms). 0 이하면 경고 후 기본값(16)을 쓴다.
     pub gfx_wall_frame_min_interval_ms: i64,
+    /// WebRender picture cache 의 타일 크기 오버라이드(구 env `SERVO_WR_PICTURE_TILE_SIZE`).
+    ///
+    /// 인정하는 값 셋:
+    /// - `""`(기본) — 오버라이드하지 않는다. WR 기본 분기를 그대로 쓴다(콘텐츠 1024x512,
+    ///   스크롤바는 WR 이 자체 특수 크기를 고른다).
+    /// - `WxH`(예 `1920x1080`) — 모든 painter 가 같은 크기를 쓴다.
+    /// - `display` — **painter 마다 자기 창의 실제 크기**로 정한다. 타일 해상도가 섞인
+    ///   월에서도 각 타일이 자기 해상도에 맞고, 레이아웃을 바꿔도 값을 다시 적을 필요가 없다.
+    ///
+    /// 타일 크기가 창 이상이면 슬라이스당 타일이 1 장이 된다 — 타일 수·무효화 입도·타일당
+    /// DComp bind/unbind 오버헤드가 함께 달라지므로 A/B 축이자 운용 노브다. DComp 투명 구멍의
+    /// 현행 회피책이 이 값을 디스플레이 해상도에 맞추는 것이라 조사용 env 가 아니라 pref 다.
+    ///
+    /// ★값을 크게 잡을 때 주의★: **WebRender 는 이 값을 클램프하지 않는다**(2026-08-12 확인 —
+    /// `render_backend.rs` 가 `frame_config.tile_size_override` 에 그대로 넣고 `picture.rs` 가
+    /// 그대로 `desired_tile_size` 로 쓴다). 실질 상한은 GPU 텍스처 크기이고, 넘으면 타일
+    /// 텍스처 할당이 실패한다.
+    pub gfx_wr_picture_tile_size: String,
     /// 비디오 프레임을 WebRender 콘텐츠 패스에서 분리해 DirectComposition 외부 서피스로
     /// "탈출"시킬지의 게이트 모드. `external` = 탈출 on(스왑체인/가상 서피스 프로모션
     /// 후보), 그 외(빈 문자열 포함) = off. **`off`/`on`/`true` 류 3-상태 truthy 표기가
@@ -623,6 +641,8 @@ impl Preferences {
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,
             gfx_wall_frame_min_interval_ms: 16,
+            // 빈 문자열 = 오버라이드 없음(WR 기본). 위 필드 doc 주석 참고.
+            gfx_wr_picture_tile_size: String::new(),
             // 근거는 위 필드 doc 주석 참고 (task-4 브리프의 반례 표: 킬스위치 둘은 기본
             // on, promote_hysteresis 는 옛 unwrap_or(10) 그대로).
             gfx_video_escape_mode: String::new(), // 빈 문자열 = off (external 만 유효)

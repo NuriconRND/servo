@@ -220,19 +220,6 @@ pub const MEDIA_DISABLE_ENOUGHDATA_BACKOFF: DebugFlag = DebugFlag {
     cache_index: 14,
 };
 
-// ---------------------------------------------------------------------------------------------
-// components/paint/painter.rs 의 WebRender picture-cache 타일 크기 오버라이드.
-// ---------------------------------------------------------------------------------------------
-
-pub const WR_PICTURE_TILE_SIZE: DebugFlag = DebugFlag {
-    name: "SERVO_WR_PICTURE_TILE_SIZE",
-    kind: Kind::Str,
-    doc: "실험 노브: WR picture cache 타일 크기 오버라이드, \"WxH\" 형식(예 \"1920x1080\"). \
-          미설정이면 WR 기본(1024x512)을 그대로 쓴다. 타일 수/무효화 입도/타일당 \
-          DComp bind-unbind 오버헤드 A/B용.",
-    cache_index: 15,
-};
-
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -251,7 +238,6 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_DISABLE_RESIZE_VIRTUAL,
     &VIDEO_ESCAPE_PROF,
     &MEDIA_DISABLE_ENOUGHDATA_BACKOFF,
-    &WR_PICTURE_TILE_SIZE,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

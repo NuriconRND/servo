@@ -45,8 +45,8 @@ param(
     # Video WR-escape gate (requires -DComp): "external" is the only valid token — final
     # path (per-video DComp swapchain, video leaves the WR content pass entirely).
     [string] $VideoEscape = "",
-    # WR picture-cache tile size override "WxH" (baseline recipe: 3840x3240; NOT needed
-    # for external).
+    # WR picture-cache tile size override: "WxH" (baseline recipe: 3840x3240) or the token
+    # `display` to match each tile window's own size. NOT needed for external.
     [string] $TileSize = "",
     [string] $LogPrefix = "wall",
     # Page under this package. IMPORTANT: this launcher always appends ?cols=&rows= to the
@@ -116,10 +116,12 @@ if ($DComp -and $DCompSurface) {
 if ($VideoEscape -ne "") {
     $prefArgs += @("--pref", "gfx_video_escape_mode=$VideoEscape")
 }
+# WR picture-cache tile size is a pref now (config-surface-consolidation, was env
+# SERVO_WR_PICTURE_TILE_SIZE) -- servoshell reads its pref set unconditionally at startup, so
+# setting the old env var here would be blocked at startup. Accepts WxH or the token
+# `display` (each tile window uses its own size). Omitted = no override (WR default).
 if ($TileSize -ne "") {
-    $env:SERVO_WR_PICTURE_TILE_SIZE = $TileSize
-} else {
-    Remove-Item Env:\SERVO_WR_PICTURE_TILE_SIZE -ErrorAction SilentlyContinue
+    $prefArgs += @("--pref", "gfx_wr_picture_tile_size=$TileSize")
 }
 # Keep GStreamer env clean: the bundled 1.22.x runtime (DLLs next to the exe) must not
 # mix with any system GStreamer plugins (ABI mismatch).

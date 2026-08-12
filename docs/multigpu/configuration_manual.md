@@ -74,7 +74,7 @@ target\debug\servoshell.exe --wall-layout <layout.json> --wall-all-tiles <URL> 2
 
 ## 3. 옛 환경변수를 쓰고 있었다면
 
-옛 이름 19 개는 **더 이상 읽지 않고, 설정돼 있으면 기동을 막는다.**
+옛 이름 20 개는 **더 이상 읽지 않고, 설정돼 있으면 기동을 막는다.**
 
 ```
 servo: error: 2 environment variable(s) moved to prefs are still set.
@@ -103,6 +103,7 @@ servo: error: see docs/multigpu/configuration.md
 | `SERVO_VIDEO_DECOUPLE=0` | `gfx_video_decouple_enabled=false` | 기본 on 킬스위치 |
 | `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN=0` | `gfx_video_escape_stable_swapchain=false` | 기본 on 킬스위치 |
 | `SERVO_GSTREAMER_AVDEC_MAX_THREADS` 미설정 | `media_avdec_max_threads=-1` | 미설정은 `0` 이 아니라 **`-1`** |
+| `SERVO_WR_PICTURE_TILE_SIZE=1920x1080` | `gfx_wr_picture_tile_size=1920x1080` | 문법 동일. 추가로 **`=display`** 토큰이 생겼다 |
 
 ---
 
@@ -220,6 +221,38 @@ WebRTC 를 쓰면 지터버퍼도 함께 본다. 기본 `0`(무버퍼, 최저 �
 --pref media_webrtc_jitter_latency_ms=50
 ```
 
+### 4.8 picture cache 타일 크기를 디스플레이에 맞추기
+
+```powershell
+--pref gfx_wr_picture_tile_size=display      # 타일마다 자기 창 크기
+--pref gfx_wr_picture_tile_size=1920x1080    # 전부 같은 크기
+                                             # 생략 = WR 기본(콘텐츠 1024x512)
+```
+
+`display` 는 **painter 마다 자기 창의 실제 크기**로 정한다. 타일 해상도가 섞인 월에서도 각
+타일이 자기 해상도에 맞고, 레이아웃을 바꿔도 값을 다시 적을 필요가 없다.
+
+타일 크기가 창 이상이면 **슬라이스당 타일이 1 장**이 된다. 타일 수·무효화 입도·타일당 DComp
+bind/unbind 오버헤드가 함께 달라지므로 A/B 축이자, DComp 투명 구멍의 현행 회피책이기도 하다.
+
+★**WebRender 는 이 값을 검사도 클램프도 하지 않는다.**★ (2026-08-12 확인 —
+`render_backend.rs` 가 `frame_config.tile_size_override` 에 그대로 넣고 `picture.rs` 가 그대로
+`desired_tile_size` 로 쓴다.) 실질 상한은 GPU 텍스처 크기이고, 넘으면 타일 텍스처 할당이
+실패한다. 8K 급 값을 넣을 생각이면 이 점을 먼저 확인하라.
+
+런처는 `-TileSize` 스위치로 받는다(`-TileSize display` 도 그대로 통한다).
+
+**실제로 몇으로 정해졌는지 확인하려면** `RUST_LOG` 를 걸어야 한다 — 기동 덤프(§2)는 pref 로
+넘긴 **원문**(`display`)만 보여 주고, 해석된 픽셀 크기는 `paint` 크레이트의 info 로그다.
+
+```powershell
+$env:RUST_LOG = "warn,paint=info"
+servoshell.exe --pref gfx_wr_picture_tile_size=display <URL> 2> tile.err.log
+# [wr-tile-size] picture tile size override: 1600x900
+```
+
+형식이 틀리면 같은 태그로 경고가 뜨고 오버라이드 없이 진행한다(WR 기본을 그대로 쓴다).
+
 ---
 
 ## 5. 노브를 언제 만지나 — 그룹별
@@ -234,6 +267,7 @@ WebRTC 를 쓰면 지터버퍼도 함께 본다. 기본 `0`(무버퍼, 최저 �
 | `gfx_wall_frame_pacing_enabled` | **기본 on.** 페이싱을 빼고 재보고 싶을 때만 `false` |
 | `gfx_wall_frame_max_pending` | 배리어가 허용하는 미완료 프레임 수. 기본 1 |
 | `gfx_wall_frame_min_interval_ms` | 프레임 사이 최소 간격. 기본 16 |
+| `gfx_wr_picture_tile_size` | WR picture cache 타일 크기. 아래 4.8 |
 
 ### `media_*` — 미디어
 
@@ -266,7 +300,7 @@ servoshell 은 `--wall-layout` 이 없으면 평범한 브라우저 창으로 �
 
 ---
 
-## 6. 조사용 환경변수 (16 개)
+## 6. 조사용 환경변수 (15 개)
 
 pref 가 아니다. **실패 주입 · 프로파일링 · 이분탐색용**이고 조사가 끝나면 지운다. 그래서
 CLI 가 아니라 환경변수로 남겼다 — 운용 설정과 섞이지 않게 하려는 것이다.

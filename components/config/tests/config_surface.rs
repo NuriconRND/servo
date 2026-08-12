@@ -380,6 +380,16 @@ fn video_defaults_preserve_the_kill_switches() {
 }
 
 #[test]
+fn wr_picture_tile_size_defaults_to_no_override() {
+    // 빈 문자열 = 오버라이드 없음. 이 노브는 Task 1 이 조사용 env 로 등록했다가 나중에
+    // pref 로 옮긴 것이라(런처 -TileSize 로 출하된 운용 노브였다) 기본값이 옛 env 미설정과
+    // 같은 "손대지 않음" 이어야 한다 - WR 기본 분기(콘텐츠 1024x512, 스크롤바 특수 크기)가
+    // 그대로 살아야 한다.
+    let defaults = servo_config::prefs::Preferences::const_default();
+    assert!(defaults.gfx_wr_picture_tile_size.is_empty());
+}
+
+#[test]
 fn disable_audio_is_inverted_into_a_positive_pref() {
     let defaults = servo_config::prefs::Preferences::const_default();
     // SERVO_GSTREAMER_DISABLE_AUDIO 는 부정형이었다. servo 관례가 *_enabled
@@ -420,9 +430,10 @@ fn media_defaults_preserve_the_old_env_unset_behaviour() {
 // Task 6: pref 로 옮긴 env 가 설정돼 있으면 기동을 막는다.
 // ---------------------------------------------------------------------------------------------
 
-/// pref 로 옮긴 19 개(설계 문서 §4 표 그대로). 여기에 **명시적으로** 적는다 — 차단 목록
-/// 자신에서 유도하면 "목록에 있는 것이 목록에 있다" 는 동어반복이 되어 누락을 못 잡는다.
-const MIGRATED_19: &[&str] = &[
+/// pref 로 옮긴 20 개(설계 문서 §4 표 + 나중에 합류한 WR_PICTURE_TILE_SIZE). 여기에
+/// **명시적으로** 적는다 — 차단 목록 자신에서 유도하면 "목록에 있는 것이 목록에 있다" 는
+/// 동어반복이 되어 누락을 못 잡는다.
+const MIGRATED_ENV: &[&str] = &[
     // Task 2/3: gfx_* 6
     "SERVO_COMPOSITOR_DCOMP",
     "SERVO_WIN_VSYNC",
@@ -445,6 +456,9 @@ const MIGRATED_19: &[&str] = &[
     "SERVO_GSTREAMER_VIDEO_DECODER_POLICY",
     "SERVO_VIDEO_SINK_POLICY",
     "SERVO_WEBRTC_JITTER_LATENCY_MS",
+    // 추가 이관: Task 1 이 조사용으로 분류했으나 실제로는 운용 노브였다(런처 -TileSize 로
+    // 출하되고 DComp 투명 구멍의 회피책으로 쓰인다).
+    "SERVO_WR_PICTURE_TILE_SIZE",
 ];
 
 #[test]
@@ -459,17 +473,17 @@ fn a_removed_env_name_names_its_replacement() {
 
 #[test]
 fn every_migrated_env_is_listed_as_removed() {
-    // pref 로 옮긴 19 개가 전부 차단 목록에 있어야 한다. 하나라도 빠지면
+    // pref 로 옮긴 것이 전부 차단 목록에 있어야 한다. 하나라도 빠지면
     // 그 스크립트는 조용히 옛 설정을 잃는다.
-    for name in MIGRATED_19 {
+    for name in MIGRATED_ENV {
         assert!(
             removed_env::lookup(name).is_some(),
             "{name} 이 차단 목록에 없다"
         );
     }
-    // 반대 방향 — 차단 목록에 19 개 말고 다른 것이 끼어들지 않았는가. 목록은 한시적이라
+    // 반대 방향 — 차단 목록에 이관한 것 말고 다른 게 끼어들지 않았는가. 목록은 한시적이라
     // (설계 문서 §9) 무엇이 왜 들어 있는지가 흐려지면 걷어낼 시점을 판단할 수 없다.
-    let expected: BTreeSet<&str> = MIGRATED_19.iter().copied().collect();
+    let expected: BTreeSet<&str> = MIGRATED_ENV.iter().copied().collect();
     let extra: Vec<&str> = removed_env::REMOVED
         .iter()
         .map(|entry| entry.name)
@@ -477,7 +491,7 @@ fn every_migrated_env_is_listed_as_removed() {
         .collect();
     assert!(
         extra.is_empty(),
-        "차단 목록에 19 개 밖의 이름이 있다: {extra:?}"
+        "차단 목록에 이관 목록 밖의 이름이 있다: {extra:?}"
     );
 }
 
@@ -539,7 +553,7 @@ fn check_blocks_only_the_names_that_are_actually_set() {
 
     // 여러 개가 설정돼 있으면 전량을 보고한다 - 하나씩 고치며 재기동하게 만들면 안 된다.
     let all = removed_env::blocked_by(|_| true);
-    assert_eq!(all.len(), MIGRATED_19.len());
+    assert_eq!(all.len(), MIGRATED_ENV.len());
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -21,7 +21,7 @@ param(
     [switch] $DComp,
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets
-    # SERVO_WR_PICTURE_TILE_SIZE; cleared when omitted (stale-env convention). A/B knob
+    # `--pref gfx_wr_picture_tile_size` (WxH, or `display` for the tile window size). A/B knob
     # for per-tile overhead / invalidation granularity -- total write bandwidth is
     # unchanged by tile size.
     [string] $TileSize = "",
@@ -114,11 +114,12 @@ $prefArgs = @(
 if ($DComp) {
     $prefArgs += @("--pref", "gfx_dcomp_mode=on")
 }
-# WR picture-cache tile size override: same set-or-clear convention as -DComp above.
+# WR picture-cache tile size is a pref now (config-surface-consolidation, was env
+# SERVO_WR_PICTURE_TILE_SIZE) -- servoshell reads its pref set unconditionally at startup, so
+# setting the old env var here would be blocked at startup. Accepts WxH or the token
+# `display` (each tile window uses its own size). Omitted = no override (WR default).
 if ($TileSize -ne "") {
-    $env:SERVO_WR_PICTURE_TILE_SIZE = $TileSize
-} else {
-    Remove-Item Env:\SERVO_WR_PICTURE_TILE_SIZE -ErrorAction SilentlyContinue
+    $prefArgs += @("--pref", "gfx_wr_picture_tile_size=$TileSize")
 }
 # Keep GStreamer env clean: the bundled 1.22.x runtime in target\release must not mix
 # with any system GStreamer plugins (ABI mismatch).

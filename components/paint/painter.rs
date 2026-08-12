@@ -112,11 +112,40 @@ use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
 
-/// `SERVO_WR_PICTURE_TILE_SIZE=WxH`(예 "1920x1080") 형식을 파싱한다. 기동 시 정상상태 오버라이드
-/// 적용부와 DComp 리사이즈 재구축의 steady/alternate 계산부가 이 파서를 공유한다(리뷰 Minor:
-/// 이전에는 두 곳에 동일 로직이 중복돼 있었다).
-fn parse_wr_tile_size_env(value: &str) -> Option<webrender_api::units::DeviceIntSize> {
-    let lower = value.to_ascii_lowercase();
+/// `gfx_wr_picture_tile_size` pref(구 env `SERVO_WR_PICTURE_TILE_SIZE`)를 해석한다.
+///
+/// 인정하는 값 셋: 빈 문자열 = 오버라이드 없음(`None`), `display` = `surface`(이 painter 창의
+/// 실제 크기), 그 외는 `WxH` 리터럴(예 `1920x1080`).
+///
+/// `display` 가 있는 이유는 이 노브의 주 용도가 **타일 크기를 그 타일 창 해상도에 맞추는
+/// 것**이기 때문이다(그러면 슬라이스당 타일이 1 장이 된다). 리터럴만 있으면 타일 해상도가
+/// 섞인 월에서 한 값으로 표현이 안 되고, 레이아웃을 바꿀 때마다 손으로 다시 적어야 한다.
+///
+/// 기동 시 정상상태 오버라이드 적용부와 DComp 리사이즈 재구축의 steady/alternate 계산부가
+/// 이 해석 결과를 공유한다 — 해석은 여기 한 번뿐이다.
+fn resolve_wr_tile_size(
+    value: &str,
+    surface: webrender_api::units::DeviceIntSize,
+) -> Option<webrender_api::units::DeviceIntSize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("display") {
+        // 창 크기를 아직 모르는(0 인) 시점이면 오버라이드하지 않는다 — 0 짜리 타일 크기는
+        // WR 에 그대로 전달되면 안 된다(WR 은 이 값을 검사하지 않는다, 아래 주석 참고).
+        if surface.width <= 0 || surface.height <= 0 {
+            log::warn!(
+                "[wr-tile-size] gfx_wr_picture_tile_size=display 인데 창 크기가 {}x{} 다 - \
+                 오버라이드하지 않는다",
+                surface.width,
+                surface.height
+            );
+            return None;
+        }
+        return Some(surface);
+    }
+    let lower = trimmed.to_ascii_lowercase();
     let mut split = lower.split('x');
     match (
         split.next().and_then(|v| v.trim().parse::<i32>().ok()),
@@ -524,22 +553,34 @@ impl Painter {
         webrender_renderer.set_external_image_handler(external_image_handlers);
 
         let webrender_api = webrender_api_sender.create_api_by_client(painter_id.into());
-        let webrender_document = webrender_api.add_document(rendering_context.size2d().to_i32());
+        let surface_size = rendering_context.size2d().to_i32();
+        let webrender_document = webrender_api.add_document(surface_size);
 
-        // 실험 노브: WR picture cache 타일 크기 오버라이드 (SERVO_WR_PICTURE_TILE_SIZE=WxH,
-        // 예 1920x1080). 미설정이면 WR 기본(콘텐츠 1024x512, 스크롤바는 WR이 자체 특수 크기
-        // 분기 — picture.rs:2306-2311)을 그대로 쓴다. 타일 수·무효화 입도·per-tile 오버헤드
-        // (DComp bind/unbind 횟수) A/B용 — 값이 창 이상이면 슬라이스당 타일 1장.
-        let steady_tile_size_override = debug_env::string(&debug_env::WR_PICTURE_TILE_SIZE)
-            .and_then(|value| match parse_wr_tile_size_env(&value) {
-                Some(size) => Some(size),
-                None => {
-                    log::warn!(
-                        "[wr-tile-size] SERVO_WR_PICTURE_TILE_SIZE 형식 오류(WxH 기대): {value}"
-                    );
-                    None
-                },
-            });
+        // WR picture cache 타일 크기 오버라이드 (`gfx_wr_picture_tile_size` pref, 구 env
+        // SERVO_WR_PICTURE_TILE_SIZE). 빈 문자열이면 WR 기본(콘텐츠 1024x512, 스크롤바는 WR이
+        // 자체 특수 크기 분기 — picture.rs:2306-2311)을 그대로 쓴다. 타일 수·무효화 입도·
+        // per-tile 오버헤드(DComp bind/unbind 횟수)가 함께 달라진다 — 값이 창 이상이면
+        // 슬라이스당 타일 1장이고, `display` 가 정확히 그 상태를 노린다.
+        //
+        // ★WR 은 이 값을 검사하지도 클램프하지도 않는다★(2026-08-12 확인: render_backend.rs 가
+        // frame_config.tile_size_override 에 그대로 넣고 picture.rs:2302 가 그대로
+        // desired_tile_size 로 쓴다). 실질 상한은 GPU 텍스처 크기다.
+        let steady_tile_size_override = {
+            let value = pref!(gfx_wr_picture_tile_size);
+            let trimmed = value.trim();
+            let resolved = resolve_wr_tile_size(trimmed, surface_size);
+            // `display` 가 None 으로 떨어지는 경우는 창 크기가 0 일 때뿐이고 그때는
+            // resolve_wr_tile_size 가 자체 경고를 찍는다 — 여기서는 형식 오류만 보고한다.
+            let unparsed = resolved.is_none()
+                && !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("display");
+            if unparsed {
+                log::warn!(
+                    "[wr-tile-size] gfx_wr_picture_tile_size 형식 오류(WxH 또는 display 기대): {value}"
+                );
+            }
+            resolved
+        };
         if let Some(size) = steady_tile_size_override {
             webrender_api.send_debug_cmd(webrender::DebugCommand::SetPictureTileSize(Some(size)));
             log::info!(
@@ -555,12 +596,14 @@ impl Painter {
 
         // Runtime-resize 재구축용 steady/alternate picture 타일 크기 계산.
         // steady = 기동 시 결정된 정상상태(위 steady_tile_size_override 그대로) — 재구축은
-        // 항상 이 값으로 수렴해야 한다(리뷰 지적: 하드코딩된 512x512에 눌러앉으면 env 노브가
+        // 항상 이 값으로 수렴해야 한다(리뷰 지적: 하드코딩된 512x512에 눌러앉으면 이 노브가
         // 무력화되고 WR 스크롤바 특수 타일 크기도 깨진다). steady가 None이면 SetPictureTileSize
         // 자체를 None으로 되돌려 WR 기본 분기(TILE_SIZE_DEFAULT/스크롤바)를 복원한다.
-        // alternate = steady의 실제 크기와 반드시 다른 유효 크기(WR 클램프 128..=4096 내) —
+        // alternate = steady의 실제 크기와 **반드시 달라야** 한다(그것이 재구축의 트리거다) —
         // steady가 None이면 WR 기본 콘텐츠 크기 1024x512와 비교해 고른다. 드래그 시작 발동은
         // 항상 alternate를 먼저 보내 desired != current(=steady)를 보장한다.
+        // (이 주석은 예전에 "WR 클램프 128..=4096 내"라고 적고 있었으나 근거가 없다 —
+        // 2026-08-12 확인: WR 은 tile_size_override 를 검사도 클램프도 하지 않는다.)
         #[cfg(windows)]
         let (dcomp_tile_size_steady, dcomp_tile_size_alternate) = {
             use webrender_api::units::DeviceIntSize;

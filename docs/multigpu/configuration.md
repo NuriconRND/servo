@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 19 + 조사용 env 16)
+# 설정 노브 전량 (pref 20 + 조사용 env 15)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -17,7 +17,7 @@
 무시되지 않고 `Unknown preference` 로 즉시 패닉한다** — 점 표기로 쓴 스크립트는 실행 자체가
 죽는다.
 
-**2. 옛 환경변수는 이제 기동을 막는다.** 아래 19 개 중 하나라도 설정된 채로 servoshell 이나
+**2. 옛 환경변수는 이제 기동을 막는다.** 아래 20 개 중 하나라도 설정된 채로 servoshell 이나
 winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 종료한다. 그냥 무시했다면 스크립트가
 **조용히** 옛 설정을 잃었을 것이다 — 실제로 이 저장소에서 `-DComp` 스위치가 그렇게 죽어 있던
 적이 있다(엔진은 아무 경고도 찍지 않았다).
@@ -52,6 +52,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `SERVO_GSTREAMER_VIDEO_DECODER_POLICY` | `media_video_decoder_policy` | `--pref media_video_decoder_policy=auto` (또는 `=software`) |
 | `SERVO_VIDEO_SINK_POLICY` | `media_video_sink_policy` | `--pref media_video_sink_policy=low-latency` (또는 `=smooth`) |
 | `SERVO_WEBRTC_JITTER_LATENCY_MS` | `media_webrtc_jitter_latency_ms` | `--pref media_webrtc_jitter_latency_ms=N` |
+| `SERVO_WR_PICTURE_TILE_SIZE` | `gfx_wr_picture_tile_size` | `--pref gfx_wr_picture_tile_size=WxH`, 또는 **`=display`** 로 타일 창 크기에 맞춤 |
 
 ### 옮기면서 달라진 두 가지
 
@@ -63,7 +64,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 19 개
+## pref 20 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
 
@@ -77,6 +78,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_wall_frame_pacing_enabled` | bool | **`true`** | wall 프레임 페이싱(latest-wins). 이름과 달리 **기본 on** 이다 — 옛 판정이 `mode == Latest` 였다. |
 | `gfx_wall_frame_max_pending` | i64 | `1` | wall 프레임 배리어가 허용하는 미완료 프레임 수. |
 | `gfx_wall_frame_min_interval_ms` | i64 | `16` | wall 프레임 사이 최소 간격(ms). |
+| `gfx_wr_picture_tile_size` | String | `""` (= 오버라이드 없음) | WebRender picture cache 타일 크기. `""` = WR 기본 분기(콘텐츠 1024x512, 스크롤바는 WR 이 자체 특수 크기), `WxH`(예 `1920x1080`) = 모든 painter 동일, **`display`** = painter 마다 자기 창 크기. 타일이 창 이상이면 슬라이스당 타일 1 장이 된다. ★**WR 은 이 값을 검사도 클램프도 하지 않는다**(2026-08-12 확인) — 실질 상한은 GPU 텍스처 크기다.★ |
 
 ### `gfx_video_*` — 비디오 WR 탈출 / 분리
 
@@ -101,7 +103,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
-## 조사용 환경변수 16 개
+## 조사용 환경변수 15 개
 
 **이것들은 pref 가 아니다.** 실패 주입·프로파일링·이분탐색용이고, 조사가 끝나면 지운다.
 등록처는 `components/config/debug_env.rs` 한 곳이며 호출부는 이름 문자열을 갖지 않는다.
@@ -172,10 +174,6 @@ external 비디오 present 파이프라인 프로파일러 게이트. 켜지면 
 ### `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF` — `Str`
 
 킬 스위치: PlayerError::EnoughData 백오프(요청 취소/재탐색)를 끈다. truthy: "1"/"true"/"yes"/"on"(대소문자 무시). gstreamer player 백엔드와 HTMLMediaElement 두 곳에서 각자 같은 판정으로 게이트한다.
-
-### `SERVO_WR_PICTURE_TILE_SIZE` — `Str`
-
-실험 노브: WR picture cache 타일 크기 오버라이드, "WxH" 형식(예 "1920x1080"). 미설정이면 WR 기본(1024x512)을 그대로 쓴다. 타일 수/무효화 입도/타일당 DComp bind-unbind 오버헤드 A/B용.
 
 ## wall CLI 플래그
 

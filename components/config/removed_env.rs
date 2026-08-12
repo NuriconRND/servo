@@ -20,10 +20,14 @@
 //!
 //! ## 이 목록은 한시적이다
 //!
-//! 옮긴 19 개에 대해서만 두고, 정리가 안정되면 걷어낸다(설계 문서 §9). 그래서
-//! `every_migrated_env_is_listed_as_removed` 가 **양방향**으로 건다 — 19 개가 다 있어야
-//! 하고, 19 개 밖의 이름이 끼어들어도 실패한다. 무엇이 왜 들어 있는지가 흐려지면 걷어낼
+//! 옮긴 20 개에 대해서만 두고, 정리가 안정되면 걷어낸다(설계 문서 §9). 그래서
+//! `every_migrated_env_is_listed_as_removed` 가 **양방향**으로 건다 — 20 개가 다 있어야
+//! 하고, 20 개 밖의 이름이 끼어들어도 실패한다. 무엇이 왜 들어 있는지가 흐려지면 걷어낼
 //! 시점을 판단할 수 없다.
+//!
+//! 원래 19 개였고 `SERVO_WR_PICTURE_TILE_SIZE` 가 나중에 합류했다 — Task 1 이 조사용으로
+//! 분류했는데 실제로는 런처 `-TileSize` 로 출하되고 DComp 투명 구멍의 회피책으로 쓰이는
+//! **운용 노브**였다. 분류 기준(설계 문서 §3)대로라면 처음부터 pref 였어야 한다.
 //!
 //! ## `pref` 필드가 따로 있는 이유
 //!
@@ -150,6 +154,13 @@ pub const REMOVED: &[RemovedEnv] = &[
         name: "SERVO_WEBRTC_JITTER_LATENCY_MS",
         pref: "media_webrtc_jitter_latency_ms",
         message: "use --pref media_webrtc_jitter_latency_ms=N (default 0)",
+    },
+    // ---- 추가 이관: 조사용으로 등록돼 있었으나 실제로는 운용 노브였다 ----
+    RemovedEnv {
+        name: "SERVO_WR_PICTURE_TILE_SIZE",
+        pref: "gfx_wr_picture_tile_size",
+        message: "use --pref gfx_wr_picture_tile_size=WxH (e.g. 1920x1080), or \
+                  --pref gfx_wr_picture_tile_size=display to match each tile window's own size",
     },
 ];
 

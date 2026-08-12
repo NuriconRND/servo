@@ -79,6 +79,13 @@ DComp 만 그런 것이 아니다. **서로 다른 크레이트에서 같은 변
 
 `WALL_FRAME_DELAY_{TARGET_INDEX,AFTER,COUNT}`, `D3D11_PROFILE{,_MS}`, `DCOMP_{DEBUG,READBACK,VALIDPROBE,NO_PARTIAL_PRESENT,DISABLE_RESIZE_REBUILD,DISABLE_RESIZE_VIRTUAL}`, `DISABLE_VIDEO_{IMMEDIATE_COMPOSITE,UPDATE_COALESCE}`, `LOG_PRESENT_CADENCE`, `VIDEO_ESCAPE_PROF`, `MEDIA_DISABLE_ENOUGHDATA_BACKOFF`, `WR_PICTURE_TILE_SIZE`
 
+> **구현 후 정정(2026-08-12): 19/17 이 아니라 20/15 로 끝났다.**
+>
+> - `WR_PICTURE_TILE_SIZE` 를 **조사 → 운용으로 재분류**했다. 판정 기준 1번(다른 장비에 배포할 때 값을 바꿔야 하는가)에 정면으로 해당한다 — 런처 `-TileSize` 로 이미 출하돼 있었고, DComp 투명 구멍의 현행 회피책이 이 값을 디스플레이 해상도에 맞추는 것이다. 기준 2번(이름에 `DEBUG`/`PROF` 류가 붙었나)만 보고 조사용으로 분류한 것이 잘못이었다. `gfx_wr_picture_tile_size` 로 옮기면서 `display` 토큰을 추가했다(타일마다 자기 창 크기).
+> - `DISABLE_VIDEO_UPDATE_COALESCE` 를 Task 9 에서 **삭제**했다(조사 종결, 근거는 커밋 메시지).
+>
+> 즉 운용 19+1=20, 조사 17-1-1=15. 전량 표의 정본은 `configuration.md` 다.
+
 ### upstream 3 → 손대지 않음
 
 `SERVO_TRACING`, `SERVO_DIAGNOSTICS`, `SERVO_STYLE_THREAD_STACK_SIZE_KB`
