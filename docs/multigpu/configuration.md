@@ -203,8 +203,13 @@ GUI 실행에서 `warn!` 은 stderr 를 파일로 돌려야만 보이므로 사�
 
 | 플래그 | 셸 | 뜻 |
 |---|---|---|
-| `--wall-gpu-direct-present` | servoshell | 타일별 직접 present 경로 |
 | `--capture <path.png>` / `--capture-sec <n>` | winit_wall | 주 타일 프레임버퍼를 PNG 로 덤프하고 종료(기본 3 초 후). winit_wall 은 캡처 하니스다 |
+
+> **설계 문서의 오기 정정(2026-08-12).** 설계 문서 §8·§12 는 `--wall-gpu-direct-present`(servoshell)
+> 와 `--backend`(winit_wall)를 셸별 고유 플래그로 적었지만, **둘 다 실제로는 존재하지 않는다**
+> (`ports/` 와 `winit_wall/main.rs` 전량 검색으로 확인). WebGPU 직접 present 는 CLI 플래그가
+> 아니라 **pref `dom_webgpu_gpu_direct`**(기본 false, `dom_webgpu_multigpu_fanout` 필요)이며
+> 이 정리 작업의 19 개에는 포함되지 않는 기존 pref 다.
 
 ## 알려진 함정
 
