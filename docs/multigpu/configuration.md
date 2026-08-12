@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 19 + 조사용 env 17)
+# 설정 노브 전량 (pref 19 + 조사용 env 16)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -101,7 +101,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
-## 조사용 환경변수 17 개
+## 조사용 환경변수 16 개
 
 **이것들은 pref 가 아니다.** 실패 주입·프로파일링·이분탐색용이고, 조사가 끝나면 지운다.
 등록처는 `components/config/debug_env.rs` 한 곳이며 호출부는 이름 문자열을 갖지 않는다.
@@ -152,10 +152,6 @@ Task 9 결함 진단: non-opaque 서피스의 per-Virtual-bind valid_rect/dirty_
 ### `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` — `Str`
 
 FPS-jitter 조사 A/B 게이트: update_images의 비디오-도착당 즉시 재합성을 끄고 스크립트 렌더링-기회 페이싱으로 대체. 기본 = 즉시 재합성 활성.
-
-### `SERVO_DISABLE_VIDEO_UPDATE_COALESCE` — `Str`
-
-킬 스위치: pending_video_frame_updates의 latest-wins 병합을 끄고 도착마다 전달하는 이전 동작으로 되돌린다. 기본 = 병합 활성.
 
 ### `SERVO_LOG_PRESENT_CADENCE` — `Str`
 

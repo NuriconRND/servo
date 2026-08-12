@@ -154,7 +154,7 @@ pub const DCOMP_NO_PARTIAL_PRESENT: DebugFlag = DebugFlag {
 };
 
 // ---------------------------------------------------------------------------------------------
-// components/paint/painter.rs 킬 스위치/진단. 다섯 다 `"1"`/`"true"` truthy 판정
+// components/paint/painter.rs 킬 스위치/진단. 넷 다 `"1"`/`"true"` truthy 판정
 // (대소문자 무시, `"on"`/`"yes"`는 포함하지 않음 — D3D11_PROFILE 계열과 다른 변종).
 // ---------------------------------------------------------------------------------------------
 
@@ -166,21 +166,13 @@ pub const DISABLE_VIDEO_IMMEDIATE_COMPOSITE: DebugFlag = DebugFlag {
     cache_index: 9,
 };
 
-pub const DISABLE_VIDEO_UPDATE_COALESCE: DebugFlag = DebugFlag {
-    name: "SERVO_DISABLE_VIDEO_UPDATE_COALESCE",
-    kind: Kind::Str,
-    doc: "킬 스위치: pending_video_frame_updates의 latest-wins 병합을 끄고 도착마다 전달하는 \
-          이전 동작으로 되돌린다. 기본 = 병합 활성.",
-    cache_index: 10,
-};
-
 pub const LOG_PRESENT_CADENCE: DebugFlag = DebugFlag {
     name: "SERVO_LOG_PRESENT_CADENCE",
     kind: Kind::Str,
     doc: "진단: 초당 1회, 실제 엔진 present 빈도(frame-ready rate)와 프레임 간 최악 간격을 \
           로깅한다 — 페이지의 requestAnimationFrame 카운트나 외부 캡처 도구와 무관한 \
           그라운드트루스.",
-    cache_index: 11,
+    cache_index: 10,
 };
 
 pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
@@ -189,7 +181,7 @@ pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
     doc: "킬 스위치(기본 = 활성). 런타임 리사이즈(드래그/최대화) 정착 후 picture-cache \
           재구축을 끈다 — Task 12/12b 마스터 스위치, A/B 검증 및 회귀 시 안전 밸브. Windows \
           전용.",
-    cache_index: 12,
+    cache_index: 11,
 };
 
 pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
@@ -197,7 +189,7 @@ pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
     kind: Kind::Str,
     doc: "task-12b 전용 킬 스위치(기본 = 활성). \"드래그 중 가상 서피스 모드\"만 끄고 Task 12의 \
           정착 재구축은 유지한다. Windows 전용.",
-    cache_index: 13,
+    cache_index: 12,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -210,7 +202,7 @@ pub const VIDEO_ESCAPE_PROF: DebugFlag = DebugFlag {
     doc: "external 비디오 present 파이프라인 프로파일러 게이트. 켜지면 렌더러 스레드가 초당 \
           1회 [vesc-prof] 집계 라인(info)을 낸다 — acquire/convert/present 중 어느 단계가 \
           프레임 예산을 먹는지 판독용.",
-    cache_index: 14,
+    cache_index: 13,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -225,7 +217,7 @@ pub const MEDIA_DISABLE_ENOUGHDATA_BACKOFF: DebugFlag = DebugFlag {
     doc: "킬 스위치: PlayerError::EnoughData 백오프(요청 취소/재탐색)를 끈다. truthy: \
           \"1\"/\"true\"/\"yes\"/\"on\"(대소문자 무시). gstreamer player 백엔드와 \
           HTMLMediaElement 두 곳에서 각자 같은 판정으로 게이트한다.",
-    cache_index: 15,
+    cache_index: 14,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -238,7 +230,7 @@ pub const WR_PICTURE_TILE_SIZE: DebugFlag = DebugFlag {
     doc: "실험 노브: WR picture cache 타일 크기 오버라이드, \"WxH\" 형식(예 \"1920x1080\"). \
           미설정이면 WR 기본(1024x512)을 그대로 쓴다. 타일 수/무효화 입도/타일당 \
           DComp bind-unbind 오버헤드 A/B용.",
-    cache_index: 16,
+    cache_index: 15,
 };
 
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
@@ -254,7 +246,6 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_VALIDPROBE,
     &DCOMP_NO_PARTIAL_PRESENT,
     &DISABLE_VIDEO_IMMEDIATE_COMPOSITE,
-    &DISABLE_VIDEO_UPDATE_COALESCE,
     &LOG_PRESENT_CADENCE,
     &DCOMP_DISABLE_RESIZE_REBUILD,
     &DCOMP_DISABLE_RESIZE_VIRTUAL,

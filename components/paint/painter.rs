@@ -66,15 +66,6 @@ static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
-// Kill switch for the latest-wins coalescing of immediate (epoch-less, i.e. video) image
-// updates in `update_images` (see `pending_video_frame_updates`). Read once (cached inside
-// `debug_env`). Default = coalescing enabled. Values "1"/"true" restore the previous
-// forward-every-arrival behavior.
-static VIDEO_UPDATE_COALESCE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::DISABLE_VIDEO_UPDATE_COALESCE)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
 // Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
 // once per second per painter. This is the ground-truth displayed cadence, independent of the
 // page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
@@ -267,8 +258,12 @@ pub(crate) struct Painter {
     /// per queued frame), and with many videos the upload demand sits at the renderer-thread
     /// throughput limit, so any hiccup (e.g. a synchronized loop-restart burst) amplifies into
     /// multi-second stalls unless stale frames are dropped here at the source. Only the newest
-    /// frame of each video has display value. Kill switch:
-    /// `SERVO_DISABLE_VIDEO_UPDATE_COALESCE`.
+    /// frame of each video has display value.
+    ///
+    /// 킬 스위치(`SERVO_DISABLE_VIDEO_UPDATE_COALESCE`)가 있었지만 걷어냈다 — 병합은
+    /// 확정 동작이다. 이 조사의 **최종 fix 는 병합이 아니라 in-flight 합성 게이트**였고
+    /// (2026-07-09 검증 완료, 45타일 63.7fps/스톨 0), 병합은 백로그 드레인을 빠르게 하는
+    /// 보조로 남아 상시 켜져 있다. A/B 가 끝난 게이트를 남기면 죽은 분기가 쌓인다.
     pending_video_frame_updates: RefCell<FxHashMap<ImageKey, (ImageDescriptor, SerializableImageData)>>,
 
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
@@ -1977,9 +1972,6 @@ impl Painter {
                 ImageUpdate::UpdateImage(key, desc, data, epoch) => {
                     if let Some(epoch) = epoch {
                         self.frame_delayer.update_image(key, epoch);
-                        txn.update_image(key, desc, data.into(), &DirtyRect::All);
-                    } else if *VIDEO_UPDATE_COALESCE_DISABLED {
-                        immediate_image_update = true;
                         txn.update_image(key, desc, data.into(), &DirtyRect::All);
                     } else {
                         // Latest wins: overwrite any not-yet-composited frame for this key.
