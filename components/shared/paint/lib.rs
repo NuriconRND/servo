@@ -26,6 +26,7 @@ pub mod display_list;
 pub mod largest_contentful_paint_candidate;
 pub mod rendering_context;
 pub mod viewport_description;
+pub mod wall_args;
 pub mod wall_layout;
 
 use std::sync::{Arc, LazyLock, Mutex};

@@ -18,7 +18,8 @@ use euclid::Size2D;
 use log::warn;
 use serde_json::Value;
 use servo::user_contents::UserStyleSheet;
-use servo::wall_layout::{WallLayout, WallLayoutError};
+use servo::wall_args::WallArgs;
+use servo::wall_layout::WallLayout;
 use servo::{
     DeviceIndependentPixel, DiagnosticsLogging, DiagnosticsLoggingOption, Opts, OutputOptions,
     PrefValue, Preferences,
@@ -301,17 +302,6 @@ fn parse_user_stylesheets(string: String) -> Result<Vec<Rc<UserStyleSheet>>, std
         )));
     }
     Ok(results)
-}
-
-fn parse_wall_layout(
-    path: &Path,
-    wall_tile_index: Option<usize>,
-) -> Result<WallLayout, WallLayoutError> {
-    let layout = WallLayout::from_path(path)?;
-    if let Some(wall_tile_index) = wall_tile_index {
-        layout.validate_tile_index(wall_tile_index)?;
-    }
-    Ok(layout)
 }
 
 /// This is a helper function that fulfills the following parsing task
@@ -597,8 +587,12 @@ struct CmdArgs {
     wall_layout: Option<PathBuf>,
 
     /// Tile index from --wall-layout represented by this servoshell window.
-    #[bpaf(long("wall-tile-index"), argument("0"), fallback(0))]
-    wall_tile_index: usize,
+    ///
+    /// `Option` 인 이유는 `paint_api::wall_args` 의 모듈 doc 에 있다 — 기본값 0 으로 받으면
+    /// "주지 않았다" 와 "0 을 줬다" 를 구분할 수 없어, `--wall-all-tiles` 와의 충돌 검사가
+    /// 단독 실행까지 오류로 만든다.
+    #[bpaf(long("wall-tile-index"), argument("0"), optional)]
+    wall_tile_index: Option<usize>,
 
     /// Open one headed servoshell window for every tile in --wall-layout.
     #[bpaf(long("wall-all-tiles"))]
@@ -709,27 +703,24 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
 
     update_preferences_from_command_line_arguemnts(&mut preferences, &cmd_args);
 
-    let wall_layout = match cmd_args.wall_layout.as_deref() {
-        Some(path) => match parse_wall_layout(
-            path,
-            (!cmd_args.wall_all_tiles).then_some(cmd_args.wall_tile_index),
-        ) {
-            Ok(layout) => Some(layout),
-            Err(error) => {
-                eprintln!("Could not parse wall layout {}: {error}", path.display());
-                return ArgumentParsingResult::ErrorParsing;
-            },
-        },
-        None => {
-            if cmd_args.wall_tile_index != 0 {
-                warn!("Ignoring --wall-tile-index because --wall-layout was not provided.");
-            }
-            if cmd_args.wall_all_tiles {
-                warn!("Ignoring --wall-all-tiles because --wall-layout was not provided.");
-            }
-            None
+    // wall 플래그의 검증·해석은 `paint_api::wall_args` 한 곳이다(Task 7) — winit_wall 도
+    // 같은 코드를 쓴다. 옛 코드는 여기서 자체 검증을 했고 winit_wall 은 아예 하지 않아
+    // 규칙이 갈라져 있었다. 옛 `warn!` 두 개는 **오류로 올렸다**(동작 변경, 근거는
+    // wall_args 모듈 doc): 요청한 것이 조용히 무시되는 것이 이 프로젝트가 반복해서 데인
+    // 실패 형태이고, GUI 실행에서 warn! 은 stderr 를 리다이렉트해야만 보인다.
+    let wall_args = WallArgs::new(
+        cmd_args.wall_layout.as_deref(),
+        cmd_args.wall_tile_index,
+        cmd_args.wall_all_tiles,
+    );
+    let wall_layout = match wall_args.resolve() {
+        Ok(layout) => layout,
+        Err(error) => {
+            eprintln!("servo: error: {error}");
+            return ArgumentParsingResult::ErrorParsing;
         },
     };
+    let wall_tile_index = wall_args.effective_tile_index();
 
     // FIXME: enable JIT compilation on 32-bit Android after the startup crash issue (#31134) is fixed.
     if cfg!(target_os = "android") && cfg!(target_pointer_width = "32") {
@@ -749,7 +740,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
     let initial_window_size = cmd_args.window_size.unwrap_or_else(|| {
         wall_layout
             .as_ref()
-            .and_then(|layout| layout.tiles.get(cmd_args.wall_tile_index))
+            .and_then(|layout| layout.tiles.get(wall_tile_index))
             .map(|tile| tile.rect.size.to_u32())
             .unwrap_or(default_window_size)
     });
@@ -764,7 +755,7 @@ fn parse_arguments_helper(args_without_binary: Args) -> ArgumentParsingResult {
         initial_window_size,
         screen_size_override: cmd_args.screen_size_override,
         wall_layout,
-        wall_tile_index: cmd_args.wall_tile_index,
+        wall_tile_index,
         wall_all_tiles: cmd_args.wall_all_tiles,
         simulate_touch_events: cmd_args.simulate_touch_events,
         webdriver_port: Cell::new(cmd_args.webdriver_port),

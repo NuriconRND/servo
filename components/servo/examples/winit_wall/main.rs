@@ -25,6 +25,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use euclid::{Point2D, Scale, Size2D};
+use servo::wall_args::WallArgs;
 use servo::wall_layout::WallLayout;
 use servo::{
     DeviceIntRect, PrefValue, Preferences, Servo, ServoBuilder, ViewportDetails, WebView,
@@ -60,7 +61,9 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut url: Option<String> = None;
     let mut layout_path: Option<String> = None;
     let mut all_tiles = false;
-    let mut tile_index = 0usize;
+    // `Option` 인 이유는 `paint_api::wall_args` 모듈 doc 참고 — 기본값 0 으로 받으면
+    // `--wall-all-tiles` 단독 실행이 "인덱스 0 을 줬다" 로 읽혀 충돌 검사에 걸린다.
+    let mut tile_index: Option<usize> = None;
     let mut capture: Option<String> = None;
     let mut capture_sec = 3.0f64;
     let mut preferences = Preferences::default();
@@ -73,10 +76,11 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             },
             "--wall-all-tiles" => all_tiles = true,
             "--wall-tile-index" => {
-                tile_index = args
-                    .next()
-                    .and_then(|value| value.parse().ok())
-                    .ok_or("--wall-tile-index requires an integer")?;
+                tile_index = Some(
+                    args.next()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or("--wall-tile-index requires an integer")?,
+                );
             },
             // `--capture <path>` writes the primary tile's framebuffer to a PNG once (for
             // render validation), `--capture-sec <n>` seconds after startup (default 3), then exits.
@@ -104,18 +108,22 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         }
     }
 
-    let layout_path = layout_path.ok_or("--wall-layout <path> is required")?;
-    let layout = WallLayout::from_path(Path::new(&layout_path))?;
-    if !all_tiles {
-        layout.validate_tile_index(tile_index)?;
-    }
+    // 검증·해석은 servoshell 과 같은 코드다(`paint_api::wall_args`, Task 7). 예전에는 이
+    // 셸이 조합 검사를 아예 하지 않아 `--wall-all-tiles --wall-tile-index 3` 이 조용히
+    // 무시됐다 — 이제 servoshell 과 동일하게 오류다.
+    let wall_args = WallArgs::new(layout_path.as_deref().map(Path::new), tile_index, all_tiles);
+    // 이 셸은 표출 전용이라 레이아웃이 필수다(servoshell 은 없으면 평범한 창으로 뜬다).
+    // 그 차이만 여기서 판정하고 나머지는 공유 코드가 한다.
+    let layout = wall_args
+        .resolve()?
+        .ok_or("--wall-layout <path> is required")?;
     let url = parse_url_or_filename(url.as_deref().unwrap_or(DEFAULT_URL))?;
 
     Ok(Config {
         url,
         layout,
         all_tiles,
-        tile_index,
+        tile_index: wall_args.effective_tile_index(),
         capture,
         capture_sec,
         preferences,

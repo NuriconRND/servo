@@ -49,7 +49,7 @@ pub use paint_api::rendering_context::{
     DisplayTopology, OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext,
     WindowRenderingContext, dxgi_luid_for_gpu_index, enumerate_display_topology, spatial_order,
 };
-pub use paint_api::wall_layout;
+pub use paint_api::{wall_args, wall_layout};
 // Expose our profile traits for servoshell, so we can instrument code there, but don't
 // add it as an official API.
 #[doc(hidden)]
