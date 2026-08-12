@@ -321,6 +321,15 @@ impl ApplicationHandler<WakerEvent> for App {
             paint_api::rendering_context::DcompMode::parse(&config.preferences.gfx_dcomp_mode),
         );
 
+        // 비디오 WR 탈출 게이트(`gfx_video_escape_mode`) 주입 — 위 DComp 게이트와 같은
+        // 이유·같은 시점(Task 4). 파싱 정본은
+        // `paint_api::rendering_context::parse_video_escape_token` 한 곳뿐이다.
+        paint_api::rendering_context::set_video_escape_mode(
+            paint_api::rendering_context::parse_video_escape_token(Some(
+                &config.preferences.gfx_video_escape_mode,
+            )),
+        );
+
         let display_handle = event_loop
             .display_handle()
             .expect("Failed to get display handle");

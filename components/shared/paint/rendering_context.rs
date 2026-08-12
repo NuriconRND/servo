@@ -144,8 +144,9 @@ pub fn dcomp_native_compositor_requested() -> bool {
     effective_dcomp_mode().native_compositor_requested()
 }
 
-/// `SERVO_VIDEO_ESCAPE` 게이트 모드. `external`만 유효(PREFER|SUPPORTS) — 그 외 토큰은
-/// 전부 Off로 취급한다(과거 `native` 진단 모드는 미표출 결함 확정으로 제거됨).
+/// `gfx_video_escape_mode`(구 `SERVO_VIDEO_ESCAPE`) 게이트 모드. `external`만 유효
+/// (PREFER|SUPPORTS) — 그 외 토큰은 전부 Off로 취급한다(과거 `native` 진단 모드는
+/// 미표출 결함 확정으로 제거됨).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VideoEscapeMode {
     Off,
@@ -159,15 +160,28 @@ pub fn parse_video_escape_token(value: Option<&str>) -> VideoEscapeMode {
     }
 }
 
-/// DComp 네이티브 컴포지터 게이트가 켜져 있을 때만 발효. 프로세스당 1회 캐시.
+static VIDEO_ESCAPE_MODE: OnceLock<VideoEscapeMode> = OnceLock::new();
+
+/// 기동 시 embedder(servoshell/winit_wall)가 `gfx_video_escape_mode` pref 문자열을
+/// `parse_video_escape_token()`으로 파싱해 한 번 호출한다 — `set_dcomp_mode`와 정확히 같은
+/// 패턴이다(파싱 정본은 이 파일 한 곳뿐, `dcomp_compositor.rs`/layout 등 나머지 소비자는
+/// `video_escape_mode()`가 반환하는 결과값만 쓴다). 두 번째 호출은 무시된다(`OnceLock`).
+pub fn set_video_escape_mode(mode: VideoEscapeMode) {
+    let _ = VIDEO_ESCAPE_MODE.set(mode);
+}
+
+/// DComp 네이티브 컴포지터 게이트가 켜져 있을 때만 발효한다. 매 호출 재판정이지만 문자열
+/// 파싱이 아니라 캐시된 두 `OnceLock` 을 읽는 것뿐이다(`dcomp_native_compositor_requested()`
+/// 자체도 매 프레임 호출되는 캐시 읽기 — `gui.rs` 참고) — 비용은 무시할 만하다.
+/// `set_video_escape_mode()`가 아직 호출되지 않았으면(예: 단위 테스트) `Off`.
 pub fn video_escape_mode() -> VideoEscapeMode {
-    static MODE: std::sync::OnceLock<VideoEscapeMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        if !dcomp_native_compositor_requested() {
-            return VideoEscapeMode::Off;
-        }
-        parse_video_escape_token(std::env::var("SERVO_VIDEO_ESCAPE").ok().as_deref())
-    })
+    if !dcomp_native_compositor_requested() {
+        return VideoEscapeMode::Off;
+    }
+    VIDEO_ESCAPE_MODE
+        .get()
+        .copied()
+        .unwrap_or(VideoEscapeMode::Off)
 }
 
 /// A GL texture created by wrapping a D3D11 texture via `EGL_ANGLE_image_d3d11_texture`

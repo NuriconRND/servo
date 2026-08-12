@@ -299,6 +299,32 @@ pub struct Preferences {
     pub gfx_wall_frame_max_pending: i64,
     /// wall frame 코얼레싱 간 최소 간격(ms). 0 이하면 경고 후 기본값(16)을 쓴다.
     pub gfx_wall_frame_min_interval_ms: i64,
+    /// 비디오 프레임을 WebRender 콘텐츠 패스에서 분리해 DirectComposition 외부 서피스로
+    /// "탈출"시킬지의 게이트 모드. `external` = 탈출 on(스왑체인/가상 서피스 프로모션
+    /// 후보), 그 외(빈 문자열 포함) = off. **`off`/`on`/`true` 류 3-상태 truthy 표기가
+    /// 아니다** — 유효 토큰은 `external` 단 하나뿐이고, 그 정본은
+    /// `paint_api::rendering_context::VideoEscapeMode`/`parse_video_escape_token`이다(옛
+    /// `native` 진단 모드는 미표출 결함 확정으로 제거됨 — 그 흔적이 남아 있으면 오해하기
+    /// 쉽다). 파싱은 그 한 곳뿐이고, 두 셸(servoshell/winit_wall)의 기동 경로가
+    /// `set_video_escape_mode()`로 주입한다 — `gfx_dcomp_mode`/`DcompMode::parse`와 같은
+    /// 패턴(Task 3). DComp 네이티브 컴포지터 게이트가 꺼져 있으면 이 값과 무관하게 항상
+    /// Off 로 취급된다(`video_escape_mode()`가 매 호출 재확인).
+    pub gfx_video_escape_mode: String,
+    /// 외부 탈출 스왑체인 안정화 킬스위치. 기본 켜짐 — 끄면(false) 스왑체인을 매 프레임
+    /// clip 크기로 재생성하는 옛 동작(AMD A/B, 롤백용)으로 되돌아간다. 옛 env
+    /// `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`은 `as_deref() != Ok("0")` 판정이라 미설정이
+    /// 곧 on 이었다 — 이 bool pref 의 기본값 `true`가 그 상태를 그대로 보존한다.
+    pub gfx_video_escape_stable_swapchain: bool,
+    /// 비디오를 외부 컴포지터 서피스로 프로모션하기 전 요구하는 연속 2D
+    /// scale/translation 프레임 수(히스테리시스). 0 이면 즉시 프로모션(레거시 동작).
+    /// 옛 env `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS`의 `unwrap_or(10)`을 그대로
+    /// 기본값 10 으로 보존한다.
+    pub gfx_video_escape_promote_hysteresis: i64,
+    /// 외부 비디오 갱신을 콘텐츠 프레임 생성(`generate_frame`)에서 분리할지의 킬스위치.
+    /// 기본 켜짐 — 옛 env `SERVO_VIDEO_DECOUPLE`은 `map(|v| v != "0").unwrap_or(true)`
+    /// 판정이라 미설정이 곧 on 이었다. 끄면(false) 비디오 프레임마다 generate_frame 을
+    /// 부르는 이전 동작으로 되돌아간다.
+    pub gfx_video_decouple_enabled: bool,
     /// The amount of image keys we request per batch for the image cache.
     pub image_key_batch_size: i64,
     /// Whether or not the DOM inspector should show shadow roots of user-agent shadow trees
@@ -547,6 +573,12 @@ impl Preferences {
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,
             gfx_wall_frame_min_interval_ms: 16,
+            // 근거는 위 필드 doc 주석 참고 (task-4 브리프의 반례 표: 킬스위치 둘은 기본
+            // on, promote_hysteresis 는 옛 unwrap_or(10) 그대로).
+            gfx_video_escape_mode: String::new(), // 빈 문자열 = off (external 만 유효)
+            gfx_video_escape_stable_swapchain: true,
+            gfx_video_escape_promote_hysteresis: 10,
+            gfx_video_decouple_enabled: true,
             image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,
             intl_locale_override: String::new(),

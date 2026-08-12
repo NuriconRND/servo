@@ -108,6 +108,16 @@ impl App {
             paint_api::rendering_context::DcompMode::parse(&self.preferences.gfx_dcomp_mode),
         );
 
+        // 비디오 WR 탈출 게이트(`gfx_video_escape_mode`) 주입 — 위 DComp 게이트와 같은
+        // 이유·같은 시점이다: `video_escape_mode()`(display_list/dcomp_compositor 소비)가
+        // 첫 프레임부터 최종값을 봐야 하고, 파싱 정본은
+        // `paint_api::rendering_context::parse_video_escape_token` 한 곳뿐이다(Task 4).
+        paint_api::rendering_context::set_video_escape_mode(
+            paint_api::rendering_context::parse_video_escape_token(Some(
+                &self.preferences.gfx_video_escape_mode,
+            )),
+        );
+
         let mut protocol_registry = ProtocolRegistry::default();
         let _ = protocol_registry.register(
             "urlinfo",

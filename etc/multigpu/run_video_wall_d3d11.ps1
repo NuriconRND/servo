@@ -37,8 +37,9 @@ param(
     # reads this only after confirming the DComp gate itself is on. "external" is the only
     # valid token: sets PREFER|SUPPORTS_EXTERNAL_COMPOSITOR_SURFACE (video escapes the WR
     # content pass to a compositor-owned external surface). Empty (default) or any other
-    # token = off, no flags set, display list byte-identical to pre-this-project. Same
-    # set-or-clear convention as -DComp/-TileSize above (stale env cleared when omitted).
+    # token = off, no flags set, display list byte-identical to pre-this-project. Now a
+    # pref (`gfx_video_escape_mode`, config-surface-consolidation Task 4) passed via
+    # --pref like -DComp above -- no env var, so nothing to clear when omitted.
     [string] $VideoEscape = "",
     # WR picture-cache tile size override, "WxH" (e.g. "1920x1080" = one window-sized
     # tile per slice). Empty (default) = WR default 1024x512. Sets
@@ -146,13 +147,14 @@ if ($DComp -and $DCompSurface) {
     }
     $dcompMode = "off"
 }
-# Video WR-escape gate: same set-or-clear convention as -DComp above. Layout only honors
-# this once the DComp gate itself is confirmed on, so setting it without -DComp is inert
-# (harmless) rather than a hard error.
+# Video WR-escape gate is a pref now too (config-surface-consolidation Task 4:
+# gfx_video_escape_mode, formerly SERVO_VIDEO_ESCAPE) -- servoshell reads its pref set
+# unconditionally at startup, so setting `$env:SERVO_VIDEO_ESCAPE` here would now silently
+# do nothing (the same trap Task 3 hit for gfx_dcomp_mode). Appended to $prefArgs like
+# -DComp above; layout only honors it once the DComp gate itself is confirmed on, so
+# passing it without -DComp is inert (harmless) rather than a hard error.
 if ($VideoEscape -ne "") {
-    $env:SERVO_VIDEO_ESCAPE = $VideoEscape
-} else {
-    Remove-Item Env:\SERVO_VIDEO_ESCAPE -ErrorAction SilentlyContinue
+    $prefArgs += @("--pref", "gfx_video_escape_mode=$VideoEscape")
 }
 # WR picture-cache tile size override: same set-or-clear convention as -DComp above.
 if ($TileSize -ne "") {

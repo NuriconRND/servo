@@ -88,15 +88,22 @@ const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
 /// Promotion hysteresis (spec 2026-07-20-video-promote-hysteresis): a video is offered for
 /// external compositor-surface promotion only after its transform has been 2D scale/translation
 /// for this many consecutive frames. Prevents rotating tiles (momentarily 2D at 0/180 deg) from
-/// flapping between the content pass and an external surface. env
-/// `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS`: unset = 10; 0 = immediate promotion (legacy).
+/// flapping between the content pass and an external surface.
+/// `gfx_video_escape_promote_hysteresis` pref(구 env `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS`):
+/// 기본 10; 0 이면 즉시 프로모션(레거시). `OnceLock` 캐시로 프로세스당 1회만 읽는다 —
+/// `visit_image`의 비디오마다·프레임마다 핫패스이므로 매번 pref RwLock 을 잡지 않는다
+/// (`dcomp_compositor.rs`의 같은 근거의 캐시들과 동일 관례).
 fn promote_hysteresis_frames() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10)
+        let raw = pref!(gfx_video_escape_promote_hysteresis);
+        u32::try_from(raw).unwrap_or_else(|_| {
+            log::warn!(
+                "Ignoring gfx_video_escape_promote_hysteresis={raw} (out of u32 range); \
+                 using default 10"
+            );
+            10
+        })
     })
 }
 

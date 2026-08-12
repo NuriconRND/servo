@@ -22,7 +22,7 @@ use log::warn;
 use paint_api::VideoFrameLease;
 use paint_api::rendering_context::RenderingContext;
 use rustc_hash::FxHashMap;
-use servo_config::debug_env;
+use servo_config::{debug_env, pref};
 use webrender::api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 use webrender::api::{ColorF, ExternalImageId, ImageRendering};
 use webrender::{
@@ -75,12 +75,15 @@ fn dcomp_debug() -> bool {
     debug_env::enabled(&debug_env::DCOMP_DEBUG)
 }
 
-/// External swap-chain stabilization gate (env `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`).
-/// Default on; "0" reverts to the old behavior (swap-chain sized to the clip, recreated
-/// every frame under a scale animation) for AMD A/B and rollback. Read once per process.
+/// External swap-chain stabilization gate (`gfx_video_escape_stable_swapchain` pref, 구
+/// env `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`). Default on; false reverts to the old
+/// behavior (swap-chain sized to the clip, recreated every frame under a scale animation)
+/// for AMD A/B and rollback. `OnceLock` 캐시로 프로세스당 1회만 읽는다 — 옛 env 판정과
+/// 같은 "프로세스 수명 고정" 의미를 보존한다(`bind`/`add_surface` 핫패스에서 매 타일·매
+/// 프레임 불리므로 매번 pref RwLock 을 잡지 않는다).
 fn stable_swapchain() -> bool {
     static STABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *STABLE.get_or_init(|| std::env::var("SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN").as_deref() != Ok("0"))
+    *STABLE.get_or_init(|| pref!(gfx_video_escape_stable_swapchain))
 }
 
 /// Task 6 defect-2 diagnosis (spec 2026-07-15): env-gated per-tile pixel readback in
@@ -110,10 +113,13 @@ fn video_escape_prof() -> bool {
     debug_env::enabled(&debug_env::VIDEO_ESCAPE_PROF)
 }
 
-/// external 비디오 갱신 분리 킬스위치. 기본 on; "0"이면 현재(비디오당 generate_frame) 복귀.
-/// painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate).
+/// external 비디오 갱신 분리 킬스위치(`gfx_video_decouple_enabled` pref, 구 env
+/// `SERVO_VIDEO_DECOUPLE`). 기본 on; false 면 현재(비디오당 generate_frame) 복귀.
+/// painter.rs(형제 모듈, Task 4 게이트)가 부르므로 pub(crate). `OnceLock` 캐시 근거는
+/// `stable_swapchain()`과 동일(핫패스, 프로세스 수명 고정 의미 보존).
 pub(crate) fn decouple_enabled() -> bool {
-    std::env::var("SERVO_VIDEO_DECOUPLE").map(|v| v != "0").unwrap_or(true)
+    static DECOUPLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DECOUPLE.get_or_init(|| pref!(gfx_video_decouple_enabled))
 }
 
 /// 즉시-합성 게이트에서 fast-path(present_external_only)를 택할지의 순수 판정.

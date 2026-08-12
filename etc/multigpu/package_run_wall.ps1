@@ -105,10 +105,13 @@ if ($DComp -and $DCompSurface) {
     }
     $dcompMode = "off"
 }
+# 비디오 WR 탈출 게이트도 이제 pref 다(config-surface-consolidation Task 4:
+# gfx_video_escape_mode, 구 SERVO_VIDEO_ESCAPE) -- servoshell 은 자신의 pref 세트를
+# 기동 시 무조건 읽으므로 `$env:SERVO_VIDEO_ESCAPE` 를 여기서 설정해도 이제 조용히
+# 무시된다(Task 3 의 gfx_dcomp_mode 와 같은 함정). 위 DComp 블록과 같은 방식으로
+# $prefArgs 에 추가한다.
 if ($VideoEscape -ne "") {
-    $env:SERVO_VIDEO_ESCAPE = $VideoEscape
-} else {
-    Remove-Item Env:\SERVO_VIDEO_ESCAPE -ErrorAction SilentlyContinue
+    $prefArgs += @("--pref", "gfx_video_escape_mode=$VideoEscape")
 }
 if ($TileSize -ne "") {
     $env:SERVO_WR_PICTURE_TILE_SIZE = $TileSize

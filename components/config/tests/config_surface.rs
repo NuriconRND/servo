@@ -36,11 +36,12 @@ const PENDING_PREF_MIGRATION: &[&str] = &[
     // 한 곳으로 모였고, surfman(third_party/surfman/.../surface.rs)은 더 이상 그 이름을 env로
     // 읽지 않는다(paint_api가 정규화한 불리언만 주입받는다). PoC(dcomp_native_poc.rs)도 pref
     // 파싱 없이 surfman의 불리언 API를 직접 부르므로 이 이름을 읽지 않는다.
-    // Task 4: gfx_video_* 4개
-    "SERVO_VIDEO_ESCAPE",
-    "SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN",
-    "SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS",
-    "SERVO_VIDEO_DECOUPLE",
+    // Task 4: gfx_video_* 4개는 전부 옮겨서 지웠다(env 읽기 자체를 pref 로 교체) —
+    // SERVO_VIDEO_ESCAPE 는 gfx_video_escape_mode(String, 파싱은
+    // paint_api::rendering_context::parse_video_escape_token 한 곳), 나머지 셋은 단순
+    // bool/i64 pref(gfx_video_escape_stable_swapchain/gfx_video_decouple_enabled/
+    // gfx_video_escape_promote_hysteresis)로 옮겨 dcomp_compositor.rs/display_list/mod.rs
+    // 가 pref! 로 직접 읽는다.
     // Task 5: media.* 9개
     "SERVO_MEDIA_D3D11_VIDEO",
     "SERVO_MEDIA_SYNC_GROUP",
@@ -250,4 +251,26 @@ fn gfx_defaults_match_the_behaviour_before_the_migration() {
     );
     assert_eq!(defaults.gfx_wall_frame_max_pending, 1);
     assert_eq!(defaults.gfx_wall_frame_min_interval_ms, 16);
+}
+
+#[test]
+fn video_defaults_preserve_the_kill_switches() {
+    // Task 4: gfx_video_* 4개. 아래 둘은 기본 on 인 킬스위치다 — env 미설정 = off 로
+    // 추측하면 기능이 꺼진다(task-4-brief.md §"기본값을 추측하지 마라"):
+    //   SERVO_VIDEO_DECOUPLE: map(|v| v != "0").unwrap_or(true) -> 기본 on
+    //   SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN: as_deref() != Ok("0") -> 기본 on
+    // SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS 는 unwrap_or(10) 이 기본값이다.
+    let defaults = servo_config::prefs::Preferences::const_default();
+    assert!(
+        defaults.gfx_video_decouple_enabled,
+        "SERVO_VIDEO_DECOUPLE 은 != 0 판정이라 기본 on"
+    );
+    assert!(
+        defaults.gfx_video_escape_stable_swapchain,
+        "as_deref() != Ok(\"0\") 이라 기본 on"
+    );
+    assert_eq!(defaults.gfx_video_escape_promote_hysteresis, 10);
+    // gfx_video_escape_mode 는 이 파일의 다른 String pref 와 같은 관례 — 빈 문자열 = off
+    // (external 만 유효 토큰).
+    assert!(defaults.gfx_video_escape_mode.is_empty());
 }
