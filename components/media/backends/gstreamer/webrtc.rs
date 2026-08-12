@@ -14,6 +14,7 @@ use gstreamer::prelude::*;
 use gstreamer_sdp;
 use gstreamer_webrtc;
 use log::warn;
+use servo_config::pref;
 use servo_media_streams::MediaStreamType;
 use servo_media_streams::registry::{MediaStreamId, get_stream};
 use servo_media_webrtc::datachannel::DataChannelId;
@@ -739,11 +740,9 @@ pub fn construct(
     pipeline.use_clock(Some(&gstreamer::SystemClock::obtain()));
     // 지터버퍼 latency(ms). webrtcbin 기본은 200ms인데, 로컬/LAN 캡처에선 그 200ms가
     // 그대로 고정 지연으로 얹힌다. 기본 0 = 무버퍼(최저 지연). 네트워크 지터로 프레임이
-    // 끊기면 SERVO_WEBRTC_JITTER_LATENCY_MS 로 올려서 튜닝.
-    let jitter_latency_ms: u32 = std::env::var("SERVO_WEBRTC_JITTER_LATENCY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // 끊기면 `media_webrtc_jitter_latency_ms` pref 로 올려서 튜닝(구 env
+    // SERVO_WEBRTC_JITTER_LATENCY_MS, 옛 `unwrap_or(0)` 그대로).
+    let jitter_latency_ms = pref!(media_webrtc_jitter_latency_ms).max(0) as u32;
     let webrtc = gstreamer::ElementFactory::make("webrtcbin")
         .name("sendrecv")
         .property("latency", jitter_latency_ms)

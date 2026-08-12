@@ -357,13 +357,11 @@ impl Painter {
         // (합성·출력)가 굶어 화면이 수 초 정지한다(2026-07-10 조사 §10 실측). 출력은
         // 지연 민감 경로이므로 프로듀서보다 높은 우선순위를 준다. 기존(Raw) 경로는
         // 렌더러가 업로드 주체라 동작이 검증된 그대로 두기 위해 게이트로 한정.
+        // media_d3d11_enabled pref(config-surface-consolidation Task 5, 구 env
+        // SERVO_MEDIA_D3D11_VIDEO) — media(render-d3d11)와 이 크레이트가 각자 읽던 것을
+        // 하나의 pref 로 합쳤다. 두 판정식이 문자 그대로 동일함을 확인했다(2026-08-12).
         #[cfg(windows)]
-        if std::env::var("SERVO_MEDIA_D3D11_VIDEO").is_ok_and(|value| {
-            value == "1"
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-                || value.eq_ignore_ascii_case("on")
-        }) {
+        if pref!(media_d3d11_enabled) {
             // SetThreadPriority는 FFI 호출 — 인자는 현재 스레드 핸들(GetCurrentThread)과
             // 유효한 우선순위 상수뿐이라 안전성 불변식 위반 여지가 없다.
             #[allow(unsafe_code)]

@@ -18,7 +18,6 @@ mod source;
 pub mod webrtc;
 
 use std::collections::HashMap;
-use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -33,6 +32,7 @@ use log::warn;
 use media_stream::GStreamerMediaStream;
 use mime::Mime;
 use registry_scanner::GSTREAMER_REGISTRY_SCANNER;
+use servo_config::pref;
 use servo_media::{Backend, BackendDeInit, BackendInit, MediaInstanceError, SupportsMediaType};
 use servo_media_audio::context::{AudioContext, AudioContextOptions};
 use servo_media_audio::decoder::AudioDecoder;
@@ -53,7 +53,6 @@ static BACKEND_BASE_TIME: LazyLock<gstreamer::ClockTime> =
     LazyLock::new(|| gstreamer::SystemClock::obtain().time());
 
 static BACKEND_THREAD: OnceLock<bool> = OnceLock::new();
-const VIDEO_DECODER_POLICY_ENV: &str = "SERVO_GSTREAMER_VIDEO_DECODER_POLICY";
 const SOFTWARE_VIDEO_DECODERS: &[&str] = &[
     "avdec_h264",
     "avdec_h265",
@@ -75,33 +74,31 @@ enum VideoDecoderPolicy {
 }
 
 impl VideoDecoderPolicy {
-    fn from_environment() -> Self {
-        match env::var(VIDEO_DECODER_POLICY_ENV) {
-            Ok(value)
-                if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("default") =>
-            {
-                Self::Auto
-            },
-            Ok(value)
-                if value.eq_ignore_ascii_case("software")
-                    || value.eq_ignore_ascii_case("avdec") =>
-            {
-                Self::Software
-            },
-            Ok(value) => {
-                warn!(
-                    "Ignoring invalid {VIDEO_DECODER_POLICY_ENV}={value:?}; \
-                     expected software or auto"
-                );
-                Self::Software
-            },
-            Err(_) => Self::Software,
+    /// `media_video_decoder_policy` pref(구 env `SERVO_GSTREAMER_VIDEO_DECODER_POLICY`)를
+    /// 판정한다. **빈 문자열 = Software** — 이 파일의 다른 String pref 와 같은 "빈 문자열 =
+    /// 관례상 기본값" 규약이고, 구 env 의 `Err(_) => Software` 와 동일한 동작이다(경고
+    /// 없음). 비어있지 않은데 인정 토큰이 아니면 옛 동작처럼 경고 후 Software 로 폴백한다.
+    fn from_pref() -> Self {
+        let value = pref!(media_video_decoder_policy);
+        if value.is_empty() {
+            return Self::Software;
+        }
+        if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("default") {
+            Self::Auto
+        } else if value.eq_ignore_ascii_case("software") || value.eq_ignore_ascii_case("avdec") {
+            Self::Software
+        } else {
+            warn!(
+                "Ignoring invalid media_video_decoder_policy={value:?}; \
+                 expected software or auto"
+            );
+            Self::Software
         }
     }
 }
 
 fn configure_video_decoder_policy() {
-    match VideoDecoderPolicy::from_environment() {
+    match VideoDecoderPolicy::from_pref() {
         VideoDecoderPolicy::Auto => {
             log::info!("GStreamer video decoder policy: auto");
         },

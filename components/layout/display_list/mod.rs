@@ -834,7 +834,8 @@ impl PaintTraversalHandler for DisplayListBuilder<'_> {
         let common = self.common_properties(state, clip, &style);
 
         if let Some(yuv_image) = fragment.yuv_image {
-            // 비디오 WR 탈출 게이트: DComp on + SERVO_VIDEO_ESCAPE 설정 시에만 프로모션 힌트 부여.
+            // 비디오 WR 탈출 게이트: DComp on + gfx_video_escape_mode pref(구 env
+            // SERVO_VIDEO_ESCAPE) 설정 시에만 프로모션 힌트 부여.
             let mut common = common;
             match paint_api::rendering_context::video_escape_mode() {
                 paint_api::rendering_context::VideoEscapeMode::External => {

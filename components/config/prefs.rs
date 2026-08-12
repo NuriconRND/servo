@@ -397,6 +397,53 @@ pub struct Preferences {
     pub media_screen_capture_window_title: String,
     /// Enable a non-standard event handler for verifying behavior of media elements during tests.
     pub media_testing_enabled: bool,
+    /// GStreamer D3D11 per-pipeline GPU 업로드/YUV 직접 샘플 경로(구 env
+    /// `SERVO_MEDIA_D3D11_VIDEO`). 기본 꺼짐 — 꺼지면 기존 CPU(I420 borrowed) 경로가
+    /// 쓰인다. `media(render-d3d11)`와 `paint(painter)` 두 크레이트가 각자 읽던 노브인데,
+    /// 두 판정식이 문자 그대로 동일함을 확인했다(둘 다 `1`/`true`/`yes`/`on`, 대소문자
+    /// 무시) — Task 5 로 pref 하나로 합쳐 두 크레이트가 같은 값을 본다.
+    pub media_d3d11_enabled: bool,
+    /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모). **타입이 브리프의 암묵적
+    /// bool 표기와 다르다** — 구 env `SERVO_MEDIA_SYNC_GROUP=N`은 온오프가 아니라
+    /// "동기화를 기다릴 파이프라인 목표 수"였다(`player.rs::sync_group_target`: usize
+    /// 파싱 후 `filter(|count| *count >= 2)` — N이 2 미만이면 사실상 off). 필드 이름은
+    /// 브리프/설계문서 그대로 두고 타입만 i64 로 고쳤다(config_surface.rs 주석과
+    /// task-5-report.md 에 근거 기록). 0 이하 = 비활성(구 env 미설정과 동일).
+    pub media_sync_group_enabled: i64,
+    /// `<video loop>` 무결절(gapless) SEGMENT 재탐색 루프(구 env
+    /// `SERVO_MEDIA_GAPLESS_LOOP`). 기본 꺼짐 — 꺼지면 스펙대로 EOS -> flushing seek(0)
+    /// 경로를 쓴다.
+    pub media_gapless_loop_enabled: bool,
+    /// 백엔드 전역 직접 로컬 파일 재생 오버라이드(구 env `SERVO_MEDIA_DIRECT_FILE`).
+    /// `media_local_direct_file`(기본 켜짐, 스크립트 단 `is_direct_local` 힌트)과는 별개의
+    /// 신호이고 `resolve_direct_file_url`에서 OR 로 합쳐진다 — 혼동하지 말 것. 기본 꺼짐.
+    pub media_direct_file_enabled: bool,
+    /// 소프트웨어 `avdec_*` 비디오 디코더의 워커 스레드 상한(구 env
+    /// `SERVO_GSTREAMER_AVDEC_MAX_THREADS`). `-1` = 미설정(자동 스레드 수, 구 env 부재와
+    /// 동일 — 디코더를 건드리지 않는다). `0` 이상이면 그 값으로 캡한다(구
+    /// `parse::<i32>() >= 0` 검증 그대로).
+    pub media_avdec_max_threads: i64,
+    /// GStreamer 오디오 트랙 활성화. **의미가 뒤집힌 pref다** — 구 env는
+    /// `SERVO_GSTREAMER_DISABLE_AUDIO`(끄는 스위치, truthy 판정)였고 이 pref는 켜는
+    /// 스위치다. servo 관례가 `*_enabled` 긍정형이고 이중부정은 실수의 단골 자리라
+    /// Task 5 에서 뒤집었다. 기본 `true`(오디오 켜짐) = 구 env 미설정과 동일한 동작.
+    pub media_audio_enabled: bool,
+    /// 소프트웨어 비디오 디코더 선택 정책(구 env
+    /// `SERVO_GSTREAMER_VIDEO_DECODER_POLICY`). 인정 토큰(대소문자 무시):
+    /// `auto`/`default` = Auto(자동 선택 유지), `software`/`avdec` = Software(avdec_*
+    /// 소프트웨어 디코더로 랭크 강제). 그 외 값은 경고 후 Software 로 폴백. **빈 문자열 =
+    /// Software** — 구 env 미설정 시의 `Err(_) => Software` 그대로이고, 이 파일의 다른
+    /// String pref 와 같은 "빈 문자열 = 관례상 기본값" 규약을 따른다.
+    pub media_video_decoder_policy: String,
+    /// 비디오 sink(appsink) 버퍼링/지연 정책(구 env `SERVO_VIDEO_SINK_POLICY`). 인정
+    /// 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency` = LowLatency,
+    /// `smooth`/`complete` = Smooth. 그 외 값은 경고 후 Smooth 로 폴백. **빈 문자열 =
+    /// Smooth** — 구 env 미설정 시의 `Err(_) => Smooth` 그대로.
+    pub media_video_sink_policy: String,
+    /// WebRTC `webrtcbin`의 지터버퍼 latency(ms, 구 env
+    /// `SERVO_WEBRTC_JITTER_LATENCY_MS`). 기본 `0` = 무버퍼(최저 지연) — 구
+    /// `unwrap_or(0)` 그대로.
+    pub media_webrtc_jitter_latency_ms: i64,
     /// The default timeout set for establishing a network connection in seconds. This amount
     /// if for the entire process of connecting to an address. For instance, if a particular host is
     /// associated with multiple IP addresses, this timeout will be divided equally among
@@ -628,6 +675,17 @@ impl Preferences {
             media_glvideo_enabled: false,
             media_local_direct_file: true,
             media_testing_enabled: false,
+            // 근거는 위 필드 doc 주석 참고 (task-5 브리프의 반례: DISABLE_AUDIO 반전은 기본
+            // true, SYNC_GROUP 은 브리프 표기와 달리 i64, 나머지는 구 env 미설정 동작 보존).
+            media_d3d11_enabled: false,
+            media_sync_group_enabled: 0,
+            media_gapless_loop_enabled: false,
+            media_direct_file_enabled: false,
+            media_avdec_max_threads: -1,
+            media_audio_enabled: true,
+            media_video_decoder_policy: String::new(),
+            media_video_sink_policy: String::new(),
+            media_webrtc_jitter_latency_ms: 0,
             network_connection_timeout: 15,
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,

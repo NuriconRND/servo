@@ -10,7 +10,7 @@
 //! 슬롯 상태기계와 Map/Unmap(소비자측)은 `servo_media_player::d3d11_ring`
 //! 레지스트리가 담당하며, 프로듀서는 D3D immediate context를 전혀 만지지
 //! 않는다(유일한 D3D 호출은 링 (재)생성 시의 free-threaded `CreateTexture2D`).
-//! env `SERVO_MEDIA_D3D11_VIDEO=1` 게이트 (기본 off).
+//! pref `media_d3d11_enabled=true` 게이트 (기본 off, 구 env `SERVO_MEDIA_D3D11_VIDEO`).
 //! 설계: docs/superpowers/plans/2026-07-12-wr-yuv-direct-sample.md
 
 // Windows 전용 — 다른 타겟에서는 빈 크레이트로 컴파일된다 (workspace member라
@@ -22,12 +22,11 @@ mod ring_producer;
 // 이 모듈 자체가 컴파일되지 않아 크레이트가 계속 빈 크레이트로 유지된다.
 #[cfg(windows)]
 mod render_d3d11 {
-    use std::env;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gstreamer::prelude::*;
-    use servo_config::debug_env;
+    use servo_config::{debug_env, pref};
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
     use servo_media_player::d3d11_ring::D3d11PlaneRings;
@@ -37,8 +36,6 @@ mod render_d3d11 {
     };
 
     use crate::ring_producer;
-
-    const D3D11_VIDEO_ENV: &str = "SERVO_MEDIA_D3D11_VIDEO";
 
     // D3D11PROF: 파이프라인(플레이어) 식별자 발급기 — 로그에서 타일 구분용 (임시 계측).
     static PROFILE_ID_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -56,15 +53,6 @@ mod render_d3d11 {
         static LAST_ARRIVAL: std::cell::Cell<Option<std::time::Instant>> =
             const { std::cell::Cell::new(None) };
         static LAST_PTS_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
-    }
-
-    fn env_flag_enabled(name: &str) -> bool {
-        env::var(name).is_ok_and(|value| {
-            value == "1"
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-                || value.eq_ignore_ascii_case("on")
-        })
     }
 
     /// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다. `servo_config::debug_env`가
@@ -139,9 +127,9 @@ mod render_d3d11 {
     }
 
     impl RenderD3D11 {
-        /// env 게이트 + 사전 점검. 하나라도 실패하면 None → 기존 CPU(Raw) 경로 폴백.
+        /// pref 게이트 + 사전 점검. 하나라도 실패하면 None → 기존 CPU(Raw) 경로 폴백.
         pub fn new() -> Option<RenderD3D11> {
-            if !env_flag_enabled(D3D11_VIDEO_ENV) {
+            if !pref!(media_d3d11_enabled) {
                 return None;
             }
             let options = servo_config::opts::get();

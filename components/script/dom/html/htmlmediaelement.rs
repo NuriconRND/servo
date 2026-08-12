@@ -3058,7 +3058,8 @@ impl HTMLMediaElement {
 
             // Hint the resource URL to the backend before the first proxy call (set_mute
             // below) triggers pipeline setup, so a local file:// resource can be read
-            // directly by GStreamer (see SERVO_MEDIA_DIRECT_FILE). No-op for non-URL
+            // directly by GStreamer (see `media_direct_file_enabled` pref, config-surface-
+            // consolidation Task 5 — 구 env SERVO_MEDIA_DIRECT_FILE). No-op for non-URL
             // resources; the backend ignores it unless the knob is on and the URL is a file.
             if let Resource::Url(ref url) = *resource {
                 player_guard.set_resource_url(url.as_str());

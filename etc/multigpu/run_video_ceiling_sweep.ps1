@@ -42,21 +42,24 @@ foreach ($n in $nSel) {
             if ($series -eq "baseline") {
                 $page = $gridPage
                 $url  = "file:///" + ($page -replace '\\','/') + "?cols=$cols&rows=$rowsN&dom=$dom&log=1"
-                # baseline 만 실제 비디오 → 디코드 정책 env 필요
-                $env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "1"
+                # baseline 만 실제 비디오 → 디코드 정책 필요. media_avdec_max_threads 는
+                # pref 다(config-surface-consolidation Task 5, 구 env
+                # SERVO_GSTREAMER_AVDEC_MAX_THREADS) -- env 로 설정해도 이제 조용히
+                # 무시되므로 --pref 로 넘긴다.
+                $prefArgs = @("--pref", "media_avdec_max_threads=1")
                 $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
                 $mode = "-"
             } else {
                 $page = $ceilPage
                 $url  = "file:///" + ($page -replace '\\','/') + "?cols=$cols&rows=$rowsN&mode=$series&dom=$dom&log=1"
-                Remove-Item Env:\SERVO_GSTREAMER_AVDEC_MAX_THREADS -ErrorAction SilentlyContinue
+                $prefArgs = @()
                 Remove-Item Env:\SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF -ErrorAction SilentlyContinue
                 $mode = $series
             }
             $stderr = Join-Path $sweepDir "${series}_dom${dom}_n${n}.stderr.log"
             $stdout = Join-Path $sweepDir "${series}_dom${dom}_n${n}.stdout.log"
             Write-Host "[sweep] series=$series dom=$dom n=$n ($cols x $rowsN)  -> $stderr"
-            $p = Start-Process -FilePath $servoExe -ArgumentList @("--window-size",$WindowSize,$url) `
+            $p = Start-Process -FilePath $servoExe -ArgumentList (@("--window-size",$WindowSize) + $prefArgs + @($url)) `
                  -WorkingDirectory $servoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
             Start-Sleep -Seconds ($WarmupSec + $SteadySec)
             if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }

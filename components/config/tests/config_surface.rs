@@ -42,16 +42,16 @@ const PENDING_PREF_MIGRATION: &[&str] = &[
     // bool/i64 pref(gfx_video_escape_stable_swapchain/gfx_video_decouple_enabled/
     // gfx_video_escape_promote_hysteresis)로 옮겨 dcomp_compositor.rs/display_list/mod.rs
     // 가 pref! 로 직접 읽는다.
-    // Task 5: media.* 9개
-    "SERVO_MEDIA_D3D11_VIDEO",
-    "SERVO_MEDIA_SYNC_GROUP",
-    "SERVO_MEDIA_GAPLESS_LOOP",
-    "SERVO_MEDIA_DIRECT_FILE",
-    "SERVO_GSTREAMER_AVDEC_MAX_THREADS",
-    "SERVO_GSTREAMER_DISABLE_AUDIO",
-    "SERVO_GSTREAMER_VIDEO_DECODER_POLICY",
-    "SERVO_VIDEO_SINK_POLICY",
-    "SERVO_WEBRTC_JITTER_LATENCY_MS",
+    // Task 5: media_* 9개는 전부 옮겨서 지웠다(env 읽기 자체를 pref 로 교체) —
+    // SERVO_GSTREAMER_DISABLE_AUDIO 는 media_audio_enabled 로 의미가 뒤집혔다(긍정형,
+    // 기본 true). SERVO_MEDIA_D3D11_VIDEO 는 media(render-d3d11)/paint(painter) 두
+    // 크레이트가 동일한 판정식(1/true/yes/on, 대소문자 무시)으로 각자 읽던 것을
+    // pref!(media_d3d11_enabled) 하나로 합쳤다. SERVO_MEDIA_SYNC_GROUP 은 브리프/설계
+    // 문서가 media_sync_group_enabled 를 bool 로 표기했지만 실제 판정(player.rs
+    // sync_group_target)은 파이프라인 목표 수(N>=2)를 받는 정수라 타입을 i64 로 고쳤다
+    // (필드 이름은 브리프대로 유지, 근거는 task-5-report.md). 나머지 6개(GAPLESS_LOOP/
+    // DIRECT_FILE/AVDEC_MAX_THREADS/VIDEO_DECODER_POLICY/VIDEO_SINK_POLICY/
+    // WEBRTC_JITTER_LATENCY_MS)는 구 env 미설정 시의 실제 동작을 그대로 기본값으로 옮겼다.
 ];
 
 fn repo_root() -> PathBuf {
@@ -273,4 +273,41 @@ fn video_defaults_preserve_the_kill_switches() {
     // gfx_video_escape_mode 는 이 파일의 다른 String pref 와 같은 관례 — 빈 문자열 = off
     // (external 만 유효 토큰).
     assert!(defaults.gfx_video_escape_mode.is_empty());
+}
+
+#[test]
+fn disable_audio_is_inverted_into_a_positive_pref() {
+    let defaults = servo_config::prefs::Preferences::const_default();
+    // SERVO_GSTREAMER_DISABLE_AUDIO 는 부정형이었다. servo 관례가 *_enabled
+    // 긍정형이고 이중부정은 실수의 단골이라 뒤집는다. 기본은 오디오 켜짐.
+    assert!(defaults.media_audio_enabled);
+}
+
+#[test]
+fn media_defaults_preserve_the_old_env_unset_behaviour() {
+    // Task 5: media_* 9개. media_audio_enabled 를 제외한 나머지는 구 env 가 미설정일
+    // 때의 실제 판정을 그대로 기본값으로 옮긴 것이다(추측 금지 — 각 호출부를 읽어 확정).
+    let defaults = servo_config::prefs::Preferences::const_default();
+    assert!(
+        !defaults.media_d3d11_enabled,
+        "env_flag_enabled(SERVO_MEDIA_D3D11_VIDEO) 는 env 미설정 시 false"
+    );
+    // media_sync_group_enabled 는 브리프 표기(bool)와 달리 i64 다 — 구
+    // sync_group_target() 이 usize 파싱 + filter(>=2) 라 미설정은 None(=off)이었고, 0 이
+    // 그 상태를 대표한다(0 은 filter 조건을 만족 못 해 사실상 off).
+    assert_eq!(defaults.media_sync_group_enabled, 0);
+    assert!(!defaults.media_gapless_loop_enabled);
+    assert!(!defaults.media_direct_file_enabled);
+    // -1 = "미설정, 자동" 의 보초값 — 0 이상은 실제 스레드 캡이라 0 을 기본값으로 쓰면
+    // 안 된다(구 env 부재 = 디코더를 건드리지 않음, 0 = 1스레드로 강제하는 것과 다르다).
+    assert_eq!(defaults.media_avdec_max_threads, -1);
+    assert!(
+        defaults.media_video_decoder_policy.is_empty(),
+        "빈 문자열 = Software"
+    );
+    assert!(
+        defaults.media_video_sink_policy.is_empty(),
+        "빈 문자열 = Smooth"
+    );
+    assert_eq!(defaults.media_webrtc_jitter_latency_ms, 0);
 }

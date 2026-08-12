@@ -39,22 +39,25 @@ param(
 
 # Launch the multi-<video> wall demo with the FINAL D3D11 per-pipeline upload recipe
 # (2026-07-10). One servoshell window, N independent <video> tiles, all on the D3D11
-# path:
+# path. Since config-surface-consolidation Task 5 all five media knobs below are prefs
+# (`--pref`), not env vars -- see $prefArgs further down:
 #
-#   SERVO_MEDIA_D3D11_VIDEO=1   per-pipeline GPU upload/convert; renderer only binds
-#                               GPU-resident shared textures (upload 27ms -> 0.01ms/frame)
-#   SERVO_MEDIA_DIRECT_FILE=1   file:// media is read by GStreamer directly (filesrc);
-#                               removes the per-rewind script-thread byte round-trip that
-#                               caused per-tile freezes / sync boundary stalls
-#   SERVO_MEDIA_GAPLESS_LOOP=1  SEGMENT rewind looping (no EOS/flush); pristine loop
-#                               boundaries and lockstep survives across loops
-#   SERVO_MEDIA_SYNC_GROUP=N    all N tiles start on a shared clock (+-1 frame lockstep)
-#   --pref gfx_vsync_enabled=true (CLI, not env -- config-surface-consolidation Task 2/3
-#                               moved this off SERVO_WIN_VSYNC, which servoshell no longer
-#                               reads at all) DWM vsync pacing driver
-#   SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF=1
-#                               inert while DIRECT_FILE is active; kept as a safety net
-#                               for any tile that falls back to the servosrc push path
+#   --pref media_d3d11_enabled=true         per-pipeline GPU upload/convert; renderer only
+#                               binds GPU-resident shared textures (upload 27ms -> 0.01ms/frame)
+#   --pref media_direct_file_enabled=true    file:// media is read by GStreamer directly
+#                               (filesrc); removes the per-rewind script-thread byte
+#                               round-trip that caused per-tile freezes / sync boundary stalls
+#   --pref media_gapless_loop_enabled=true  SEGMENT rewind looping (no EOS/flush); pristine
+#                               loop boundaries and lockstep survives across loops
+#   --pref media_sync_group_enabled=N       all N tiles start on a shared clock (+-1 frame
+#                               lockstep) -- N is a pipeline-count target, not a boolean
+#   --pref gfx_vsync_enabled=true (config-surface-consolidation Task 2/3 moved this off
+#                               SERVO_WIN_VSYNC, which servoshell no longer reads at all)
+#                               DWM vsync pacing driver
+#   SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF=1 (still an env var -- debug_env investigation
+#                               knob, out of Task 5's scope) inert while direct-file is
+#                               active; kept as a safety net for any tile that falls back
+#                               to the servosrc push path
 #
 # -DComp (optional, off by default): `--pref gfx_dcomp_mode=on` (CLI, not env -- Task 3
 # moved this off SERVO_COMPOSITOR_DCOMP, which servoshell no longer reads at all) -- WR
@@ -90,19 +93,22 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $tiles = $Cols * $Rows
 if ($Sync -lt 0) { $Sync = $tiles }
 
-# Final recipe (see header). Values live only in this process environment.
-$env:SERVO_MEDIA_D3D11_VIDEO = "1"
-$env:SERVO_MEDIA_DIRECT_FILE = "1"
-$env:SERVO_MEDIA_GAPLESS_LOOP = "1"
-$env:SERVO_MEDIA_SYNC_GROUP = "$Sync"
+# Final recipe (see header). SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF stays an env var -- it's
+# a debug_env investigation knob, not part of config-surface-consolidation Task 5.
 $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
-$env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "$DecoderThreads"
-# gfx_vsync_enabled / gfx_dcomp_mode are prefs, not env vars (config-surface-consolidation
-# Task 2/3) -- servoshell reads its pref set unconditionally at startup, so setting
-# `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP` here would silently do nothing. Pass
-# `--pref` CLI args instead, appended to $prefArgs below and spliced into the Start-Process
-# -ArgumentList.
-$prefArgs = @("--pref", "gfx_vsync_enabled=true")
+# gfx_vsync_enabled / gfx_dcomp_mode / the five media_* knobs below are ALL prefs now, not
+# env vars (config-surface-consolidation Task 2/3/5) -- servoshell reads its pref set
+# unconditionally at startup, so setting `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP`/
+# `$env:SERVO_MEDIA_D3D11_VIDEO` etc. here would silently do nothing. Pass `--pref` CLI args
+# instead, appended to $prefArgs below and spliced into the Start-Process -ArgumentList.
+$prefArgs = @(
+    "--pref", "gfx_vsync_enabled=true",
+    "--pref", "media_d3d11_enabled=true",
+    "--pref", "media_direct_file_enabled=true",
+    "--pref", "media_gapless_loop_enabled=true",
+    "--pref", "media_sync_group_enabled=$Sync",
+    "--pref", "media_avdec_max_threads=$DecoderThreads"
+)
 # WR Native Compositor gate: only added when requested (this process's args are the single
 # source of truth now, so there is no stale-env risk to guard against).
 if ($DComp) {

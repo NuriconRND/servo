@@ -54,10 +54,12 @@ $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
 # default auto-threading spawns ~CPU-count threads PER decoder (~700+ total on a 20-core
 # box), thrashing the scheduler so the compositor/rAF misses its 60fps deadline (FPS
 # jitter) and inflating decoded-frame-pool memory. =1 collapses this to ~1 thread/decoder.
-$env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "1"
+# `media_avdec_max_threads` is a pref now (config-surface-consolidation Task 5, 구 env
+# SERVO_GSTREAMER_AVDEC_MAX_THREADS) -- servoshell reads its pref set unconditionally at
+# startup, so setting the old env var here would silently do nothing.
 $env:RUST_LOG = if ($env:RUST_LOG) { $env:RUST_LOG } else { "warn" }
 
-$arguments = @("--window-size", $WindowSize, $url)
+$arguments = @("--window-size", $WindowSize, "--pref", "media_avdec_max_threads=1", $url)
 
 $stdoutLog = Join-Path $logDir "${LogPrefix}_${Profile}_stdout_${timestamp}.log"
 $stderrLog = Join-Path $logDir "${LogPrefix}_${Profile}_stderr_${timestamp}.log"

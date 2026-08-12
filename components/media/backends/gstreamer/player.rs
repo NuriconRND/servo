@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::env;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -18,7 +17,7 @@ use gstreamer_app;
 use gstreamer_play;
 use gstreamer_play::prelude::*;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
-use servo_config::debug_env;
+use servo_config::{debug_env, pref};
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
 use servo_media_player::context::PlayerGLContext;
@@ -44,29 +43,34 @@ const DEFAULT_VOLUME: f64 = 1.0;
 const DEFAULT_TIME_RANGES: Vec<Range<f64>> = vec![];
 
 const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
-const DISABLE_AUDIO_ENV: &str = "SERVO_GSTREAMER_DISABLE_AUDIO";
-// Caps the worker-thread count of software libav video decoders (avdec_*). Each avdec
-// otherwise auto-spawns ~CPU-count threads plus a proportional decoded-frame pool; with
-// many simultaneous <video> elements this explodes thread count and memory. Unset = leave
-// automatic (no change, e.g. for the single 4K wall video that needs multithreaded decode).
-const AVDEC_MAX_THREADS_ENV: &str = "SERVO_GSTREAMER_AVDEC_MAX_THREADS";
-// Opt-in seamless (gapless) looping for <video loop>. The spec path loops via
-// EOS -> script "ended" handling -> flushing seek(0), which stalls the decoder pipeline at
-// every loop boundary; with many simultaneous videos each boundary shows up as a visible
-// display hold (frames held 3+ refreshes). When enabled and the element has the loop
-// attribute, the pipeline instead runs in SEGMENT-seek mode and is rewound with a
-// NON-flushing SEGMENT seek on SEGMENT_DONE: decoders never flush and no EOS reaches the
-// script layer while looping.
-const GAPLESS_LOOP_ENV: &str = "SERVO_MEDIA_GAPLESS_LOOP";
-// Opt-in direct local-file playback. When enabled and the media resource is a `file://` URL
-// pointing at an existing file, playbin is pointed straight at that file (its own filesrc)
-// instead of the servosrc byte-push path. GStreamer then reads the file itself, so loop
-// rewinds and seeks never round-trip through the script layer (the confirmed cause of the
-// intermittent per-tile stall at gapless loop-wrap boundaries — see §14 of the
-// investigation-loop-stall report). The OS page cache absorbs the reads, so this achieves the
-// servosrc byte-cache effect at effectively zero extra process RAM. Off, or a non-file URL, or
-// a missing file → the servosrc path is used unchanged (byte-identical).
-const DIRECT_FILE_ENV: &str = "SERVO_MEDIA_DIRECT_FILE";
+// 오디오 켜짐/꺼짐(config-surface-consolidation Task 5: `media_audio_enabled` pref, 구 env
+// `SERVO_GSTREAMER_DISABLE_AUDIO`). pref 는 긍정형(켜는 스위치)이라 옛 이름과 의미가
+// 뒤집혔다 — 아래 호출부는 `!pref!(media_audio_enabled)` 로 옛 `disable_audio` truthy 판정을
+// 재현한다.
+//
+// Caps the worker-thread count of software libav video decoders (avdec_*, `media_
+// avdec_max_threads` pref, 구 env `SERVO_GSTREAMER_AVDEC_MAX_THREADS`). Each avdec otherwise
+// auto-spawns ~CPU-count threads plus a proportional decoded-frame pool; with many
+// simultaneous <video> elements this explodes thread count and memory. `-1` = leave automatic
+// (no change, e.g. for the single 4K wall video that needs multithreaded decode).
+//
+// Opt-in seamless (gapless) looping for <video loop> (`media_gapless_loop_enabled` pref, 구 env
+// `SERVO_MEDIA_GAPLESS_LOOP`). The spec path loops via EOS -> script "ended" handling ->
+// flushing seek(0), which stalls the decoder pipeline at every loop boundary; with many
+// simultaneous videos each boundary shows up as a visible display hold (frames held 3+
+// refreshes). When enabled and the element has the loop attribute, the pipeline instead runs
+// in SEGMENT-seek mode and is rewound with a NON-flushing SEGMENT seek on SEGMENT_DONE:
+// decoders never flush and no EOS reaches the script layer while looping.
+//
+// Opt-in direct local-file playback (`media_direct_file_enabled` pref, 구 env
+// `SERVO_MEDIA_DIRECT_FILE`). When enabled and the media resource is a `file://` URL pointing
+// at an existing file, playbin is pointed straight at that file (its own filesrc) instead of
+// the servosrc byte-push path. GStreamer then reads the file itself, so loop rewinds and
+// seeks never round-trip through the script layer (the confirmed cause of the intermittent
+// per-tile stall at gapless loop-wrap boundaries — see §14 of the investigation-loop-stall
+// report). The OS page cache absorbs the reads, so this achieves the servosrc byte-cache
+// effect at effectively zero extra process RAM. Off, or a non-file URL, or a missing file →
+// the servosrc path is used unchanged (byte-identical).
 const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
 const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 
@@ -137,11 +141,12 @@ fn log_pipeline_element_added(element: &gstreamer::Element) {
     );
 }
 
-// Apply SERVO_GSTREAMER_AVDEC_MAX_THREADS to software libav video decoders (avdec_*) as
-// they are auto-plugged into the pipeline. Capping to a small value (e.g. 1) collapses the
-// per-decoder worker-thread count and decoded-frame pool, which is what lets many <video>
-// tiles decode at once without saturating CPU scheduling (FPS jitter) or memory. Unset
-// leaves the decoder at its automatic thread count so single-video/4K playback is unchanged.
+// Apply the `media_avdec_max_threads` pref (구 env SERVO_GSTREAMER_AVDEC_MAX_THREADS) to
+// software libav video decoders (avdec_*) as they are auto-plugged into the pipeline. Capping
+// to a small value (e.g. 1) collapses the per-decoder worker-thread count and decoded-frame
+// pool, which is what lets many <video> tiles decode at once without saturating CPU
+// scheduling (FPS jitter) or memory. `-1`(기본값) leaves the decoder at its automatic thread
+// count so single-video/4K playback is unchanged.
 fn configure_software_decoder_threads(element: &gstreamer::Element) {
     let Some(factory) = element.factory() else {
         return;
@@ -154,27 +159,19 @@ fn configure_software_decoder_threads(element: &gstreamer::Element) {
     if !factory_name.starts_with("avdec_") || !klass.contains("Video") {
         return;
     }
-    let Ok(raw) = env::var(AVDEC_MAX_THREADS_ENV) else {
+    let max_threads = pref!(media_avdec_max_threads);
+    // 음수(기본 -1) = 미설정 보초값 — 구 env 부재와 동일하게 자동 스레드 수를 그대로 둔다.
+    if max_threads < 0 {
         return;
-    };
-    match raw.trim().parse::<i32>() {
-        Ok(max_threads) if max_threads >= 0 => {
-            // Setting an absent GObject property panics (and, occurring inside a
-            // non-unwinding GStreamer callback, aborts the process). Gate on presence.
-            if element.find_property("max-threads").is_none() {
-                log::debug!("{factory_name} has no max-threads property; skipping");
-                return;
-            }
-            element.set_property("max-threads", max_threads);
-            log::info!("Set {factory_name} max-threads={max_threads}");
-        },
-        _ => {
-            log::warn!(
-                "Ignoring invalid {AVDEC_MAX_THREADS_ENV}={raw:?}; \
-                 expected a non-negative integer"
-            );
-        },
     }
+    // Setting an absent GObject property panics (and, occurring inside a non-unwinding
+    // GStreamer callback, aborts the process). Gate on presence.
+    if element.find_property("max-threads").is_none() {
+        log::debug!("{factory_name} has no max-threads property; skipping");
+        return;
+    }
+    element.set_property("max-threads", max_threads as i32);
+    log::info!("Set {factory_name} max-threads={max_threads}");
 }
 
 fn configure_playbin_flags(
@@ -201,7 +198,9 @@ fn configure_playbin_flags(
             .unset_by_nick("text");
     }
 
-    let disable_audio = env_flag_enabled(DISABLE_AUDIO_ENV);
+    // media_audio_enabled 는 긍정형 pref 다(구 env DISABLE_AUDIO_ENV 는 부정형이었다) —
+    // 단항 부정 한 번으로 옛 disable_audio truthy 판정을 재현한다.
+    let disable_audio = !pref!(media_audio_enabled);
     if disable_audio {
         flags_builder = flags_builder
             .unset_by_nick("audio")
@@ -224,18 +223,10 @@ fn configure_playbin_flags(
     Ok(())
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        value == "1" ||
-            value.eq_ignore_ascii_case("true") ||
-            value.eq_ignore_ascii_case("yes") ||
-            value.eq_ignore_ascii_case("on")
-    })
-}
-
 /// `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF`(servo_config::debug_env 등록)의 truthy 판정.
 /// `htmlmediaelement.rs`의 `disable_enough_data_backoff()`와 동일한 판정식이다(2026-08-11
-/// 조사로 확인함) — `env_flag_enabled`와 문자 그대로 같은 truthy 집합이지만, 이 노브는
+/// 조사로 확인함) — Task 5 로 pref 가 된 media_* 노브들과 문자 그대로 같은 truthy
+/// 집합(1/true/yes/on, 대소문자 무시)이지만, 이 노브는 조사용이라 이관 대상이 아니고
 /// 이름 문자열 없이 debug_env 상수로 읽어야 해서 별도 함수로 둔다.
 fn enoughdata_backoff_disabled() -> bool {
     debug_env::string(&debug_env::MEDIA_DISABLE_ENOUGHDATA_BACKOFF).is_some_and(|value| {
@@ -448,52 +439,51 @@ struct PlayerInner {
     last_metadata: Option<Metadata>,
     cat: gstreamer::DebugCategory,
     enough_data: Arc<AtomicBool>,
-    /// Whether the element wants looping playback (see `GAPLESS_LOOP_ENV`; always false
-    /// when the env knob is off, in which case looping stays on the spec's EOS path).
+    /// Whether the element wants looping playback (see `media_gapless_loop_enabled`; always
+    /// false when the pref is off, in which case looping stays on the spec's EOS path).
     looping: Cell<bool>,
     /// Whether the pipeline is currently in SEGMENT-seek mode for gapless looping.
     segment_loop_active: Cell<bool>,
-    /// Channel to the gapless-loop worker thread (`None` when `GAPLESS_LOOP_ENV` is off).
+    /// Channel to the gapless-loop worker thread (`None` when `media_gapless_loop_enabled`
+    /// is off).
     gapless_loop_sender: Option<Sender<GaplessLoopMsg>>,
-    /// Sync-group start (see `SYNC_GROUP_ENV`): play() was requested but the pipeline is
-    /// held paused until the group releases.
+    /// Sync-group start (see `media_sync_group_enabled`): play() was requested but the
+    /// pipeline is held paused until the group releases.
     sync_hold: Cell<bool>,
     /// Whether this pipeline has been armed and registered with the sync group.
     sync_armed: Cell<bool>,
-    /// Direct local-file playback (see `DIRECT_FILE_ENV`): playbin reads the file itself via
-    /// its own filesrc, so there is no servosrc. The element still fetches and pushes bytes,
-    /// which are dropped as harmless no-ops (`push_data`/`set_input_size`).
+    /// Direct local-file playback (see `media_direct_file_enabled`): playbin reads the file
+    /// itself via its own filesrc, so there is no servosrc. The element still fetches and
+    /// pushes bytes, which are dropped as harmless no-ops (`push_data`/`set_input_size`).
     direct_file: Cell<bool>,
 }
 
-/// Messages for the gapless-loop worker thread (see `GAPLESS_LOOP_ENV`).
+/// Messages for the gapless-loop worker thread (see `media_gapless_loop_enabled`).
 enum GaplessLoopMsg {
     /// (Re-)evaluate whether the pipeline should enter SEGMENT-seek mode.
     MaybeEnter,
     /// The current segment finished; rewind with a non-flushing SEGMENT seek.
     SegmentDone,
-    /// Arm this pipeline for a synchronized group start (see `SYNC_GROUP_ENV`).
+    /// Arm this pipeline for a synchronized group start (see `media_sync_group_enabled`).
     ArmSyncGroup,
 }
 
 // Opt-in synchronized start for many simultaneous <video> pipelines (video wall).
-// SERVO_MEDIA_SYNC_GROUP=N holds each seekable pipeline paused-prerolled (armed at
-// position 0, in SEGMENT mode when gapless looping is also enabled) until N pipelines are
-// ready, then starts them all on a shared system clock with an identical base time so they
-// render in frame-level lockstep (the standard GStreamer multi-pipeline sync recipe).
-// Combined with gapless looping the lockstep persists across loop boundaries, because the
-// non-flushing SEGMENT rewinds preserve running-time continuity. A watchdog releases the
-// group after 30s even if fewer than N pipelines arrived.
-const SYNC_GROUP_ENV: &str = "SERVO_MEDIA_SYNC_GROUP";
-
+// `media_sync_group_enabled=N`(config-surface-consolidation Task 5, 구 env
+// SERVO_MEDIA_SYNC_GROUP=N — 타입은 브리프 표기와 달리 i64 다, prefs.rs 필드 doc 참고)
+// holds each seekable pipeline paused-prerolled (armed at position 0, in SEGMENT mode when
+// gapless looping is also enabled) until N pipelines are ready, then starts them all on a
+// shared system clock with an identical base time so they render in frame-level lockstep
+// (the standard GStreamer multi-pipeline sync recipe). Combined with gapless looping the
+// lockstep persists across loop boundaries, because the non-flushing SEGMENT rewinds
+// preserve running-time continuity. A watchdog releases the group after 30s even if fewer
+// than N pipelines arrived.
 fn sync_group_target() -> Option<usize> {
-    static TARGET: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
-        env::var(SYNC_GROUP_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|count| *count >= 2)
-    });
-    *TARGET
+    // 옛 env 는 문자열 파싱 후 LazyLock 으로 프로세스 수명 캐시했다 — pref 읽기는 이미
+    // 가벼운 RwLock 클론이고 이 함수는 프레임 핫패스가 아니라(play()/arm 시점에만 호출)
+    // 캐시를 유지할 이유가 없다.
+    let target = pref!(media_sync_group_enabled);
+    (target >= 2).then_some(target as usize)
 }
 
 struct SyncGroupMember {
@@ -614,13 +604,14 @@ impl PlayerInner {
 
         self.muted.set(muted);
         self.player.set_mute(muted);
-        let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
-        let audio_track_enabled = !muted && !env_audio_disabled;
+        let audio_disabled = !pref!(media_audio_enabled);
+        let audio_track_enabled = !muted && !audio_disabled;
         // Mute via GstPlay's reversible controls only: the `mute` property plus audio-track
         // (de)selection. Do NOT swap the `audio-sink` element at runtime — playbin3 links
         // `audio-sink` at preroll, so a live restore->autoaudiosink swap fails to re-link the
         // audio branch, leaving audio dead after an unmute (mute becomes irreversible). The
-        // construction-time DISABLE_AUDIO_ENV fakesink (set before PLAYING) is unaffected.
+        // construction-time media_audio_enabled=false fakesink (set before PLAYING) is
+        // unaffected.
         self.player.set_audio_track_enabled(audio_track_enabled);
         log::info!(
             "GStreamer mute state updated: muted={} audio_track_enabled={}",
@@ -666,9 +657,9 @@ impl PlayerInner {
 
         self.paused.set(false);
         self.can_resume.set(false);
-        // Synchronized group start (see `SYNC_GROUP_ENV`): hold the pipeline paused and
-        // prerolled; the sync group releases every member simultaneously on a shared
-        // clock. Arming happens once metadata is known (`request_sync_group_arm`).
+        // Synchronized group start (see `media_sync_group_enabled`): hold the pipeline
+        // paused and prerolled; the sync group releases every member simultaneously on a
+        // shared clock. Arming happens once metadata is known (`request_sync_group_arm`).
         if sync_group_target().is_some() &&
             self.stream_type == StreamType::Seekable &&
             !sync_group_released()
@@ -761,7 +752,7 @@ impl PlayerInner {
     }
 
     pub fn set_looping(&mut self, looping: bool) -> Result<(), PlayerError> {
-        if !env_flag_enabled(GAPLESS_LOOP_ENV) {
+        if !pref!(media_gapless_loop_enabled) {
             return Ok(());
         }
         self.looping.set(looping);
@@ -971,11 +962,12 @@ pub struct GStreamerPlayer {
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
     /// Media resource URL hint (see `Player::set_resource_url`), captured before `setup()`
-    /// so the direct local-file path (see `DIRECT_FILE_ENV`) can be chosen. `None` unless the
-    /// element hinted a URL.
+    /// so the direct local-file path (see `media_direct_file_enabled`) can be chosen. `None`
+    /// unless the element hinted a URL.
     resource_url: RefCell<Option<String>>,
-    /// Script-set hint (see `Player::set_direct_file`) that direct local-file playback should be
-    /// used regardless of `DIRECT_FILE_ENV`. `resolve_direct_file_url` honors either signal.
+    /// Script-set hint (see `Player::set_direct_file`) that direct local-file playback should
+    /// be used regardless of `media_direct_file_enabled`. `resolve_direct_file_url` honors
+    /// either signal.
     force_direct_file: Cell<bool>,
 }
 
@@ -1017,11 +1009,12 @@ impl GStreamerPlayer {
 
     /// If direct local-file playback applies, return the `file://` URI to hand to playbin.
     /// Requires a `Seekable` stream, a `file` scheme, an existing target file, and EITHER the
-    /// `DIRECT_FILE_ENV` knob OR the script-set `force_direct_file` hint (see `set_direct_file`,
-    /// used for non-standard containers). Otherwise `None` (the servosrc path is used).
-    /// Logs the direct-mode entry, and a warning when a file:// resource is missing.
+    /// `media_direct_file_enabled` pref OR the script-set `force_direct_file` hint (see
+    /// `set_direct_file`, used for non-standard containers). Otherwise `None` (the servosrc
+    /// path is used). Logs the direct-mode entry, and a warning when a file:// resource is
+    /// missing.
     fn resolve_direct_file_url(&self) -> Option<String> {
-        if !(env_flag_enabled(DIRECT_FILE_ENV) || self.force_direct_file.get())
+        if !(pref!(media_direct_file_enabled) || self.force_direct_file.get())
             || self.stream_type != StreamType::Seekable
         {
             return None;
@@ -1038,7 +1031,7 @@ impl GStreamerPlayer {
             },
             _ => {
                 log::warn!(
-                    "{DIRECT_FILE_ENV}: file not found for {raw}; falling back to servosrc"
+                    "media_direct_file_enabled: file not found for {raw}; falling back to servosrc"
                 );
                 None
             },
@@ -1156,8 +1149,8 @@ impl GStreamerPlayer {
                     })
                     .build(),
             );
-        } else if env_flag_enabled(DISABLE_AUDIO_ENV) {
-            disable_pipeline_audio_sink(&pipeline, DISABLE_AUDIO_ENV)?;
+        } else if !pref!(media_audio_enabled) {
+            disable_pipeline_audio_sink(&pipeline, "media_audio_enabled")?;
         }
 
         let video_sink = self.render.lock().unwrap().setup_video_sink(&pipeline)?;
@@ -1169,9 +1162,9 @@ impl GStreamerPlayer {
         // fixed, make sure that state dependent code happens before this line.
         // The estimated version for the fix is 1.14.5 / 1.15.1.
         // https://github.com/servo/servo/issues/22010#issuecomment-432599657
-        // Direct local-file playback (see `DIRECT_FILE_ENV`): when applicable, point playbin
-        // at the file:// URL directly (its own filesrc) instead of servosrc. `None` keeps the
-        // existing servosrc byte-push path.
+        // Direct local-file playback (see `media_direct_file_enabled`): when applicable,
+        // point playbin at the file:// URL directly (its own filesrc) instead of servosrc.
+        // `None` keeps the existing servosrc byte-push path.
         let direct_file_url = self.resolve_direct_file_url();
         let uri = match self.stream_type {
             StreamType::Stream => {
@@ -1298,12 +1291,12 @@ impl GStreamerPlayer {
             let _ = notify!(observer, PlayerEvent::SeekDone(position.seconds_f64()));
         });
 
-        // Gapless looping (`GAPLESS_LOOP_ENV`) and synchronized group start
-        // (`SYNC_GROUP_ENV`): all pipeline seeking happens on this dedicated worker
-        // thread. Entering segment mode or rewinding from GstPlay signal threads / bus
-        // callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
+        // Gapless looping (`media_gapless_loop_enabled`) and synchronized group start
+        // (`media_sync_group_enabled`): all pipeline seeking happens on this dedicated
+        // worker thread. Entering segment mode or rewinding from GstPlay signal threads /
+        // bus callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
         // pipeline, so signal handlers only post messages here.
-        if env_flag_enabled(GAPLESS_LOOP_ENV) || sync_group_target().is_some() {
+        if pref!(media_gapless_loop_enabled) || sync_group_target().is_some() {
             let pipeline = inner.lock().unwrap().player.pipeline();
             if let Some(bus) = pipeline.bus() {
                 let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
@@ -1396,12 +1389,12 @@ impl GStreamerPlayer {
                                         // re-prerolls at 0 in segment mode, so the
                                         // synchronized start needs no later flushing seek
                                         // (which would break lockstep).
-                                        if env_flag_enabled(GAPLESS_LOOP_ENV) {
+                                        if pref!(media_gapless_loop_enabled) {
                                             inner.segment_loop_active.set(true);
                                         }
                                         inner.player.clone()
                                     };
-                                    if env_flag_enabled(GAPLESS_LOOP_ENV) {
+                                    if pref!(media_gapless_loop_enabled) {
                                         if let Err(error) = pipeline.seek(
                                             1.0,
                                             gstreamer::SeekFlags::FLUSH |
@@ -1511,8 +1504,8 @@ impl GStreamerPlayer {
             }
 
             inner.last_metadata = Some(metadata.clone());
-            let env_audio_disabled = env_flag_enabled(DISABLE_AUDIO_ENV);
-            let audio_track_enabled = !inner.muted.get() && !env_audio_disabled;
+            let audio_disabled = !pref!(media_audio_enabled);
+            let audio_track_enabled = !inner.muted.get() && !audio_disabled;
             // Apply the initial mute state via audio-track selection only — no runtime
             // audio-sink swap (see set_mute: a live sink swap is irreversible on playbin3).
             inner.player.set_audio_track_enabled(audio_track_enabled);

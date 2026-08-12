@@ -2,11 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::env;
 use std::sync::Arc;
 
 use glib::prelude::*;
 use gstreamer_video::prelude::*;
+use servo_config::pref;
 use servo_media_gstreamer_render::Render;
 use servo_media_player::PlayerError;
 use servo_media_player::context::PlayerGLContext;
@@ -15,7 +15,6 @@ use servo_media_player::video::{
     VideoFrameYuvColorSpace, VideoFrameYuvData, VideoFrameYuvFormat,
 };
 
-const VIDEO_SINK_POLICY_ENV: &str = "SERVO_VIDEO_SINK_POLICY";
 const LOW_LATENCY_VIDEO_MAX_BUFFERS: u32 = 1;
 const LOW_LATENCY_VIDEO_MAX_LATENESS_NS: i64 = 16_000_000;
 const SMOOTH_VIDEO_MAX_BUFFERS: u32 = 3;
@@ -29,29 +28,28 @@ enum VideoSinkPolicy {
 }
 
 impl VideoSinkPolicy {
-    fn from_environment() -> Self {
-        match env::var(VIDEO_SINK_POLICY_ENV) {
-            Ok(value)
-                if value.eq_ignore_ascii_case("low-latency")
-                    || value.eq_ignore_ascii_case("low_latency")
-                    || value.eq_ignore_ascii_case("latency") =>
-            {
-                Self::LowLatency
-            },
-            Ok(value)
-                if value.eq_ignore_ascii_case("smooth")
-                    || value.eq_ignore_ascii_case("complete") =>
-            {
-                Self::Smooth
-            },
-            Ok(value) => {
-                log::warn!(
-                    "Ignoring invalid {VIDEO_SINK_POLICY_ENV}={value:?}; \
-                     expected smooth or low-latency"
-                );
-                Self::Smooth
-            },
-            Err(_) => Self::Smooth,
+    /// `media_video_sink_policy` pref(구 env `SERVO_VIDEO_SINK_POLICY`)를 판정한다. **빈
+    /// 문자열 = Smooth** — 이 파일의 다른 String pref 와 같은 "빈 문자열 = 관례상 기본값"
+    /// 규약이고, 구 env 의 `Err(_) => Smooth` 와 동일한 동작이다(경고 없음). 비어있지
+    /// 않은데 인정 토큰이 아니면 옛 동작처럼 경고 후 Smooth 로 폴백한다.
+    fn from_pref() -> Self {
+        let value = pref!(media_video_sink_policy);
+        if value.is_empty() {
+            return Self::Smooth;
+        }
+        if value.eq_ignore_ascii_case("low-latency")
+            || value.eq_ignore_ascii_case("low_latency")
+            || value.eq_ignore_ascii_case("latency")
+        {
+            Self::LowLatency
+        } else if value.eq_ignore_ascii_case("smooth") || value.eq_ignore_ascii_case("complete") {
+            Self::Smooth
+        } else {
+            log::warn!(
+                "Ignoring invalid media_video_sink_policy={value:?}; \
+                 expected smooth or low-latency"
+            );
+            Self::Smooth
         }
     }
 
@@ -298,7 +296,7 @@ impl GStreamerRender {
             .map_err(|error| PlayerError::Backend(format!("appsink creation failed: {error:?}")))?
             .downcast::<gstreamer_app::AppSink>()
             .unwrap();
-        let policy = VideoSinkPolicy::from_environment();
+        let policy = VideoSinkPolicy::from_pref();
         appsink.set_max_buffers(policy.max_buffers());
         appsink.set_drop(policy.drop_late());
         appsink.set_property("qos", policy.qos());

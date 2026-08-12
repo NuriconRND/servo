@@ -80,19 +80,22 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $tiles = $Cols * $Rows
 if ($Sync -lt 0) { $Sync = $tiles }
 
-# Final display recipe (values live only in this process environment).
-$env:SERVO_MEDIA_D3D11_VIDEO = "1"
-$env:SERVO_MEDIA_DIRECT_FILE = "1"
-$env:SERVO_MEDIA_GAPLESS_LOOP = "1"
-$env:SERVO_MEDIA_SYNC_GROUP = "$Sync"
+# Final display recipe. SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF stays an env var -- it's a
+# debug_env investigation knob, not part of config-surface-consolidation Task 5.
 $env:SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF = "1"
-$env:SERVO_GSTREAMER_AVDEC_MAX_THREADS = "$DecoderThreads"
-# gfx_vsync_enabled / gfx_dcomp_mode are prefs, not env vars (config-surface-consolidation
-# Task 2/3) -- servoshell reads its pref set unconditionally at startup, so setting
-# `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP` here would silently do nothing. Pass
-# `--pref` CLI args instead, appended to $prefArgs below and spliced into the Start-Process
-# -ArgumentList.
-$prefArgs = @("--pref", "gfx_vsync_enabled=true")
+# gfx_vsync_enabled / gfx_dcomp_mode / the five media_* knobs below are ALL prefs now, not
+# env vars (config-surface-consolidation Task 2/3/5) -- servoshell reads its pref set
+# unconditionally at startup, so setting `$env:SERVO_WIN_VSYNC`/`$env:SERVO_COMPOSITOR_DCOMP`/
+# `$env:SERVO_MEDIA_D3D11_VIDEO` etc. here would silently do nothing. Pass `--pref` CLI args
+# instead, appended to $prefArgs below and spliced into the Start-Process -ArgumentList.
+$prefArgs = @(
+    "--pref", "gfx_vsync_enabled=true",
+    "--pref", "media_d3d11_enabled=true",
+    "--pref", "media_direct_file_enabled=true",
+    "--pref", "media_gapless_loop_enabled=true",
+    "--pref", "media_sync_group_enabled=$Sync",
+    "--pref", "media_avdec_max_threads=$DecoderThreads"
+)
 if ($DComp -and $DCompSurface) {
     $prefArgs += @("--pref", "gfx_dcomp_mode=surface")
     $dcompMode = "surface"
