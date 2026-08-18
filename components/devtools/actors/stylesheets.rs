@@ -155,13 +155,29 @@ impl StyleSheetsActor {
         browsing_context_actor: &BrowsingContextActor,
     ) -> Vec<StyleSheetData> {
         let (tx, rx) = generic_channel::channel().unwrap();
-        let _ = self
+        // 이 액터는 자기가 가리키는 파이프라인보다 오래 살 수 있다(페이지 새로고침이 대표적
+        // 이다 - 새 파이프라인이 생겨도 액터는 옛 id 를 들고 있다). 그러면 send 가 실패하고
+        // tx 가 그대로 떨어져 recv 는 **반드시** Disconnected 다.
+        //
+        // 예전에는 그 자리에서 unwrap 해 DevtoolsClientHandler 스레드가 죽었고, 브라우저는
+        // 살아남지만 devtools 연결이 끊겨 재접속해야 했다. 스타일 편집기가 비어 보이는 편이
+        // 낫다 - 스크립트 쪽 핸들러도 문서를 못 찾으면 빈 목록을 회신한다(devtools.rs 의
+        // handle_get_stylesheets). 즉 빈 결과는 이미 정상 경로에 있는 값이다.
+        if self
             .script_sender
             .send(DevtoolScriptControlMsg::GetStyleSheets(
                 browsing_context_actor.pipeline_id(),
                 tx,
-            ));
-        let style_sheets = rx.recv().unwrap();
+            ))
+            .is_err()
+        {
+            warn!("stylesheets: script thread is gone; returning an empty list");
+            return vec![];
+        }
+        let Ok(style_sheets) = rx.recv() else {
+            warn!("stylesheets: no reply from the script thread; returning an empty list");
+            return vec![];
+        };
         let url = browsing_context_actor.url();
         let browsing_context_id = browsing_context_actor.browsing_context_id.value();
         style_sheets

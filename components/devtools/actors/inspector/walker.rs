@@ -9,6 +9,7 @@ use std::sync::Arc;
 use atomic_refcell::AtomicRefCell;
 use devtools_traits::DevtoolScriptControlMsg::{GetChildren, GetDocumentElement, GetRootNode};
 use devtools_traits::DomMutation;
+use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::Serialize;
 use serde_json::{self, Map, Value};
@@ -384,14 +385,26 @@ pub fn find_child(
     let pipeline = browsing_context.pipeline_id();
 
     let (tx, rx) = generic_channel::channel().unwrap();
-    script_chan
+    // 파이프라인이 이미 사라졌으면(새로고침 등) send 가 실패하고 recv 는 Disconnected 다.
+    // 둘 다 unwrap 이라 예전에는 DevtoolsClientHandler 스레드가 죽었다 - stylesheets 액터와
+    // 같은 형태다. 자식을 못 찾은 것으로 보고 함수 끝의 Err(hierarchy) 와 같은 값을 돌려
+    // 준다(누적된 hierarchy 를 버리지 않는다).
+    if script_chan
         .send(GetChildren(
             pipeline,
             registry.actor_to_script(node_name.into()),
             tx,
         ))
-        .unwrap();
-    let children = rx.recv().unwrap().ok_or(vec![])?;
+        .is_err()
+    {
+        warn!("walker: script thread is gone; treating the node as having no children");
+        return Err(hierarchy);
+    }
+    let Ok(reply) = rx.recv() else {
+        warn!("walker: no reply from the script thread; treating the node as having no children");
+        return Err(hierarchy);
+    };
+    let children = reply.ok_or(vec![])?;
 
     for child in children {
         let node_actor = NodeActor::register_or_update(registry, walker_name, child);
