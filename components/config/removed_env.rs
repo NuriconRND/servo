@@ -207,7 +207,11 @@ pub fn check_or_exit() {
         for message in &messages {
             eprintln!("servo: error:   {message}");
         }
-        eprintln!("servo: error: see docs/multigpu/configuration.md");
+        // 마지막 줄은 **자기완결적**이어야 한다 — 배포본(ServoWallPackage)에는 docs/ 가
+        // 들어가지 않으므로 저장소 경로를 가리키면 현장 운영자가 없는 파일을 찾게 된다.
+        // 위 줄들이 이미 `--pref <이름>=<값>` 실행 예시를 담고 있으니, 여기서는 그 예시를
+        // 그대로 따라 할 때 걸리는 마지막 함정(점 표기)만 짚는다.
+        eprintln!("servo: error: use --pref instead; names use underscores, not dots.");
         std::process::exit(1);
     }
 }
