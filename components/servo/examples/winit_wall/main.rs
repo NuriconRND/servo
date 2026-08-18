@@ -12,7 +12,7 @@
 //!
 //! Usage:
 //!   winit_wall --wall-layout <layout.json> [--wall-all-tiles] [--wall-tile-index N]
-//!              [--capture <path.png>] [URL]
+//!              [--capture <path.png>] [--ignore-certificate-errors] [URL]
 //!
 //! NOTE: input coordinate remapping is intentionally omitted (clicks won't land
 //! correctly); use servoshell for interactive testing. Real per-GPU placement needs a
@@ -28,8 +28,9 @@ use euclid::{Point2D, Scale, Size2D};
 use servo::wall_args::WallArgs;
 use servo::wall_layout::WallLayout;
 use servo::{
-    AllowOrDenyRequest, DeviceIntRect, PrefValue, Preferences, Servo, ServoBuilder, ServoDelegate,
-    ViewportDetails, WebView, WebViewBuilder, enumerate_display_topology, spatial_order,
+    AllowOrDenyRequest, DeviceIntRect, Opts, PrefValue, Preferences, Servo, ServoBuilder,
+    ServoDelegate, ViewportDetails, WebView, WebViewBuilder, enumerate_display_topology,
+    spatial_order,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -55,6 +56,14 @@ struct Config {
     capture: Option<String>,
     capture_sec: f64,
     preferences: Preferences,
+    /// `--ignore-certificate-errors`: TLS 검증 실패를 전부 수락한다.
+    ///
+    /// 켜지 않으면 Servo 는 Chrome 과 같이 인터스티셜(`badcert.html`)을 띄우고 운영자가
+    /// `Allow certificate temporarily` 를 눌러야 진행한다. ★이 셸에서는 그 통과가 성립하지
+    /// 않는다★ — 입력 좌표 리맵이 없어(파일 머리말 참고) 버튼을 정확히 누를 수 없고, 무인
+    /// 표출 장비에는 누를 사람도 없다. 그래서 servoshell 과 달리 이 셸에서는 이 플래그가
+    /// 사실상 유일한 우회로다.
+    ignore_certificate_errors: bool,
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -67,6 +76,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut capture: Option<String> = None;
     let mut capture_sec = 3.0f64;
     let mut preferences = Preferences::default();
+    let mut ignore_certificate_errors = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -87,6 +97,9 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--capture" => {
                 capture = Some(args.next().ok_or("--capture requires a path")?);
             },
+            // servoshell 과 같은 이름/의미다(ports/servoshell/prefs.rs). 인자를 받지 않는
+            // 순수 스위치다.
+            "--ignore-certificate-errors" => ignore_certificate_errors = true,
             "--capture-sec" => {
                 capture_sec = args
                     .next()
@@ -127,6 +140,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         capture,
         capture_sec,
         preferences,
+        ignore_certificate_errors,
     })
 }
 
@@ -441,7 +455,18 @@ impl ApplicationHandler<WakerEvent> for App {
 
         // 2) Build the shared Servo instance against tile 0's (primary) context.
         let _ = tiles[0].rendering_context.make_current();
+        // 이 셸은 지금까지 Opts 를 넘기지 않아 항상 기본값이 쓰였다. 바꾸는 것은
+        // `--ignore-certificate-errors` 하나뿐이고 나머지는 그대로 기본값이다
+        // (`ServoBuilder` 가 opts 미지정 시 쓰던 값과 동일하다).
+        let opts = Opts {
+            ignore_certificate_errors: config.ignore_certificate_errors,
+            ..Default::default()
+        };
+        if opts.ignore_certificate_errors {
+            log::warn!("--ignore-certificate-errors: accepting ALL TLS certificate errors");
+        }
         let servo = ServoBuilder::default()
+            .opts(opts)
             .event_loop_waker(Box::new(waker.clone()))
             .preferences(std::mem::take(&mut config.preferences))
             .build();
