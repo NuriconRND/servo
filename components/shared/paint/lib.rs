@@ -761,6 +761,31 @@ impl WebRenderExternalImageHandlers {
     }
 }
 
+/// 회수된 외부 이미지 ID 로 들어온 lock/unlock 을 보고한다.
+///
+/// 타일당 프레임당 불릴 수 있는 자리라 무제한으로 찍으면 로그가 무너진다. 앞의 몇 건만
+/// 남기고 침묵하되, **누적 횟수를 함께 찍어** 한 번 스친 것인지 계속 새는 것인지 구분되게
+/// 한다(마지막 한 줄이 총계 역할을 한다).
+fn report_unknown_external_image(phase: &str, key: ExternalImageId) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const REPORT_LIMIT: u32 = 8;
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if seen > REPORT_LIMIT {
+        return;
+    }
+    let tail = if seen == REPORT_LIMIT {
+        " (further reports suppressed)"
+    } else {
+        ""
+    };
+    log::warn!(
+        "[external-image] {phase}: id {} unregistered; skipping frame ({seen}{tail})",
+        key.0,
+    );
+}
+
 impl ExternalImageHandler for WebRenderExternalImageHandlers {
     /// Lock the external image. Then, WR could start to read the
     /// image content.
@@ -772,10 +797,25 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
         _channel_index: u8,
         _is_composited: bool,
     ) -> ExternalImage<'_> {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let Some(handler_type) = self.id_manager().get(&key) else {
+            // ★외부 이미지 ID 가 이미 회수됐는데 WR 이 아직 그 ImageKey 를 참조하는 창★
+            //
+            // 정리 경로가 두 채널로 갈라져 있어서 생긴다(htmlmediaelement 의
+            // MediaFrameRenderer::reset): `remove_plane` 은 전역 맵을 **즉시** 지우는데
+            // `DeleteImage` 는 paint 채널로 **큐잉**된다. 그 사이에 합성이 한 번 끼면
+            // 여기로 들어온다 — 페이지 새로고침으로 재생 중이던 <video> 가 헐릴 때가
+            // 대표적이고, devtools 를 붙이면 스크립트 스레드가 느려져 창이 넓어진다.
+            //
+            // 예전에는 여기서 패닉해 **메인 스레드가 죽고 표출 전체가 멈췄다.** 한 프레임을
+            // 건너뛰는 편이 낫다 — 바로 아래 WebGL 분기가 같은 이유로 이미 그렇게 한다.
+            // 근본 수정은 회수를 DeleteImage 와 같은 채널로 보내 순서를 구조적으로
+            // 보장하는 것이고, 이 강등은 그때까지의 안전망이다.
+            report_unknown_external_image("lock", key);
+            return ExternalImage {
+                uv: TexelRect::new(0.0, 0.0, 0.0, 0.0),
+                source: ExternalImageSource::Invalid,
+            };
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
@@ -812,10 +852,12 @@ impl ExternalImageHandler for WebRenderExternalImageHandlers {
     /// Unlock the external image. The WR should not read the image
     /// content after this call.
     fn unlock(&mut self, key: ExternalImageId, _channel_index: u8) {
-        let handler_type = self
-            .id_manager()
-            .get(&key)
-            .expect("Tried to get unknown external image");
+        let Some(handler_type) = self.id_manager().get(&key) else {
+            // lock() 이 위에서 Invalid 를 돌려준 그 키다. 잠근 것이 없으니 풀 것도 없다.
+            // 여기서도 패닉하면 강등이 무의미해진다(같은 프레임에서 바로 이어 불린다).
+            report_unknown_external_image("unlock", key);
+            return;
+        };
         match handler_type {
             WebRenderImageHandlerType::WebGl => self.webgl_handler.as_mut().unwrap().unlock(key.0),
             WebRenderImageHandlerType::Media => self.media_handler.as_mut().unwrap().unlock(key.0),
