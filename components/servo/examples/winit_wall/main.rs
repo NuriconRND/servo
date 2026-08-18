@@ -28,8 +28,8 @@ use euclid::{Point2D, Scale, Size2D};
 use servo::wall_args::WallArgs;
 use servo::wall_layout::WallLayout;
 use servo::{
-    DeviceIntRect, PrefValue, Preferences, Servo, ServoBuilder, ViewportDetails, WebView,
-    WebViewBuilder, enumerate_display_topology, spatial_order,
+    AllowOrDenyRequest, DeviceIntRect, PrefValue, Preferences, Servo, ServoBuilder, ServoDelegate,
+    ViewportDetails, WebView, WebViewBuilder, enumerate_display_topology, spatial_order,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -128,6 +128,24 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         capture_sec,
         preferences,
     })
+}
+
+/// Servo 레벨 델리게이트. 이 셸이 필요로 하는 것은 devtools 배선 두 개뿐이다.
+///
+/// 표출 전용 셸이라 UI 가 없다 — 승인 프롬프트를 띄울 자리가 없으므로 servoshell 과 같이
+/// 즉시 허용한다. 서버 자체가 `devtools_server_enabled` pref 로만 뜨므로(기본 꺼짐) 이
+/// 허용은 운영자가 명시적으로 켰을 때만 의미를 갖는다. 노출 범위는
+/// `devtools_server_listen_address` 로 조인다(예: 127.0.0.1 바인딩).
+struct WallServoDelegate;
+
+impl ServoDelegate for WallServoDelegate {
+    fn notify_devtools_server_started(&self, port: u16, _token: String) {
+        log::info!("Devtools server running on port {port}");
+    }
+
+    fn request_devtools_connection(&self, request: AllowOrDenyRequest) {
+        request.allow();
+    }
 }
 
 /// Turn a command-line argument into a [`Url`]. A real URL (scheme longer than one
@@ -428,6 +446,12 @@ impl ApplicationHandler<WakerEvent> for App {
             .preferences(std::mem::take(&mut config.preferences))
             .build();
         servo.setup_logging();
+        // Servo 레벨 델리게이트. WebView 델리게이트(`AppState`)와는 별개다 — 이걸 설정하지
+        // 않으면 `DefaultServoDelegate` 의 빈 구현이 쓰이고, devtools 연결 요청 객체가 그대로
+        // drop 되면서 기본값 Deny 가 회신된다(responders.rs 의 IpcResponder::drop). 그러면
+        // `devtools_server_enabled` 로 서버는 떠서 포트까지 바인딩되는데 클라이언트는 붙지
+        // 못하는, 원인을 짐작하기 어려운 상태가 된다.
+        servo.set_delegate(Rc::new(WallServoDelegate));
 
         let primary_scale = tiles[0].window.scale_factor() as f32;
         let virtual_viewport_css = config.layout.virtual_viewport_css_size();
