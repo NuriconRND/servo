@@ -850,3 +850,72 @@ pub enum RemoteFocusOperation {
     /// [`BrowsingContextId`] as the starting point and in the given direction.
     Sequential(SequentialFocusDirection, Option<BrowsingContextId>),
 }
+
+/// `<iframe>` 이 겸하던 두 축 중 *context 중첩* 쪽을 고르는 값.
+///
+/// 렌더링 중첩(layout 이 자식 파이프라인을 부모의 디스플레이 리스트에 꽂는 것)은 이
+/// 값과 무관하게 언제나 그대로다 — 그래서 `transform`, `border-radius`, `opacity`,
+/// 클립, 스태킹, 타일 경계 걸침이 모드와 상관없이 똑같이 적용된다.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EmbeddingMode {
+    /// 표준 `<iframe>`. 내용이 child navigable 이 된다.
+    Nested,
+    /// `<iframe toplevel>`. 부모의 박스 안에서 렌더되지만 내용은 top-level browsing
+    /// context 다. ★설계상 스푸핑을 허용하는 모드이므로 pref 로 잠근다★ —
+    /// `dom_iframe_toplevel_embed_enabled`.
+    TopLevelEmbed,
+}
+
+/// 이 문서에게 알려줄 *navigable* 부모. `NewPipelineInfo::parent_info` 는 오직 이
+/// 함수로만 채운다.
+///
+/// `presentation_parent` 는 *표출* 부모다 — 누가 나를 레이아웃하고 크기를 정하고
+/// 렌더하고 정리하는가. 그 값은 `TopLevelEmbed` 에서도 그대로 살아 있어야 한다.
+/// ★그것까지 끊으면 부모 element 가 `UpdatePipelineId` 를 못 받아 초기 about:blank 를
+/// 계속 렌더한다 — 상자에는 CSS 가 전부 먹히는데 내용만 흰색으로 나온다.★
+pub fn navigable_parent(
+    mode: EmbeddingMode,
+    presentation_parent: Option<PipelineId>,
+) -> Option<PipelineId> {
+    match mode {
+        EmbeddingMode::Nested => presentation_parent,
+        EmbeddingMode::TopLevelEmbed => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_base::id::{PipelineId, PipelineNamespace, PipelineNamespaceId};
+
+    use super::{EmbeddingMode, navigable_parent};
+
+    /// 평범한 iframe 은 표출 부모가 곧 navigable 부모다.
+    #[test]
+    fn nested_keeps_the_presentation_parent() {
+        PipelineNamespace::install(PipelineNamespaceId(1));
+        let parent = PipelineId::new();
+
+        assert_eq!(
+            navigable_parent(EmbeddingMode::Nested, Some(parent)),
+            Some(parent)
+        );
+    }
+
+    /// `<iframe toplevel>` 은 표출 부모가 있어도 navigable 부모가 없다. 이 한 값이
+    /// `WindowProxy` 의 부모를 정하고, 그래서 X-Frame-Options / frame-ancestors /
+    /// `top !== self` 프레임버스팅이 전부 성립하지 않게 된다.
+    #[test]
+    fn toplevel_embed_has_no_navigable_parent() {
+        PipelineNamespace::install(PipelineNamespaceId(2));
+        let parent = PipelineId::new();
+
+        assert_eq!(navigable_parent(EmbeddingMode::TopLevelEmbed, Some(parent)), None);
+    }
+
+    /// 진짜 최상위 문서는 어느 모드에서도 부모가 없다.
+    #[test]
+    fn a_real_top_level_document_has_no_parent_either_way() {
+        assert_eq!(navigable_parent(EmbeddingMode::Nested, None), None);
+        assert_eq!(navigable_parent(EmbeddingMode::TopLevelEmbed, None), None);
+    }
+}
