@@ -1288,7 +1288,51 @@ impl Painter {
 
         let root_clip_id = builder.define_clip_rect(root_reference_frame, viewport_rect);
         let clip_chain_id = builder.define_clip_chain(None, [root_clip_id]);
-        for webview_renderer in self.webview_renderers.values() {
+
+        // ★Paint order must be deterministic★ `webview_renderers` is an `FxHashMap`, so
+        // `.values()` yields an arbitrary, hash-dependent order — and that order *is* the
+        // paint order, because later display-list items draw over earlier ones.
+        //
+        // With one WebView per painter this never mattered, and with servoshell's tabs it is
+        // masked because every inactive tab is hidden. It bites as soon as two WebViews are
+        // visible at once: a full-viewport opaque WebView that happens to be iterated last
+        // covers everything pushed before it, so the other WebView loads, animates and shows
+        // up in devtools while painting nothing on screen.
+        //
+        // Order by `WebViewId`, which is allocated in creation order, so a WebView added
+        // later paints on top — the same rule window stacking uses.
+        let mut ordered_renderers: Vec<&WebViewRenderer> =
+            self.webview_renderers.values().collect();
+        ordered_renderers.sort_by_key(|renderer| renderer.id);
+
+        // ★SPIKE — THROWAWAY DIAGNOSTIC★ `winit_wall --spike-overlay` registers a second
+        // top-level WebView into this painter to test approach B (a site placed on the wall
+        // as its own WebView instead of an iframe). A renderer with no `root_pipeline_id`, or
+        // a hidden one, is skipped by the loop below, and neither that nor the paint order is
+        // observable from outside — so print the scene as actually built. Silent in normal
+        // runs: winit_wall only ever has one WebView per painter without the spike flag.
+        if ordered_renderers.len() > 1 {
+            eprintln!(
+                "[spike-overlay] painter {:?}: root display list, {} webviews in paint order \
+                 (last = on top):",
+                self.painter_id,
+                ordered_renderers.len(),
+            );
+            for (index, renderer) in ordered_renderers.iter().enumerate() {
+                eprintln!(
+                    "[spike-overlay]   {index}: {:?} rect={:?} viewport_origin=({},{}) \
+                     has_root_pipeline={} hidden={}",
+                    renderer.id,
+                    renderer.rect,
+                    renderer.viewport_origin().x,
+                    renderer.viewport_origin().y,
+                    renderer.root_pipeline_id.is_some(),
+                    renderer.hidden(),
+                );
+            }
+        }
+
+        for webview_renderer in ordered_renderers {
             if webview_renderer.hidden() {
                 continue;
             }

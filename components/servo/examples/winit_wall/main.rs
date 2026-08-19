@@ -12,7 +12,13 @@
 //!
 //! Usage:
 //!   winit_wall --wall-layout <layout.json> [--wall-all-tiles] [--wall-tile-index N]
-//!              [--capture <path.png>] [--ignore-certificate-errors] [URL]
+//!              [--capture <path.png>] [--ignore-certificate-errors]
+//!              [--spike-overlay <URL> [--spike-overlay-rect x,y,w,h]] [URL]
+//!
+//! ★`--spike-overlay` is a THROWAWAY spike★ — it puts a second, independent top-level
+//! `WebView` on the wall at a rect, to find out whether the paint layer already supports
+//! placing a site as its own WebView instead of framing it in an `iframe` (which most
+//! commercial sites refuse). Delete it and everything tagged SPIKE once answered.
 //!
 //! NOTE: input coordinate remapping is intentionally omitted (clicks won't land
 //! correctly); use servoshell for interactive testing. Real per-GPU placement needs a
@@ -24,7 +30,7 @@ use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
 
-use euclid::{Point2D, Scale, Size2D};
+use euclid::{Point2D, Scale, Size2D, Vector2D};
 use servo::wall_args::WallArgs;
 use servo::wall_layout::WallLayout;
 use servo::{
@@ -64,6 +70,21 @@ struct Config {
     /// 표출 장비에는 누를 사람도 없다. 그래서 servoshell 과 달리 이 셸에서는 이 플래그가
     /// 사실상 유일한 우회로다.
     ignore_certificate_errors: bool,
+    /// ★SPIKE — THROWAWAY★ `--spike-overlay <URL>`: register a SECOND, independent
+    /// top-level `WebView` into the *same* tile rendering contexts as the base page, at
+    /// `--spike-overlay-rect`, and see whether both composite at once.
+    ///
+    /// The question this answers: is approach B (a site placed on the wall as its own
+    /// top-level `WebView` instead of an `iframe`, so `X-Frame-Options` and JS
+    /// frame-busting never apply) supported by the paint layer as it stands? Delete this
+    /// flag and everything tagged SPIKE once that is answered — the real feature needs a
+    /// placement source of truth and deterministic z-order, neither of which is here.
+    spike_overlay: Option<Url>,
+    /// ★SPIKE — THROWAWAY★ `--spike-overlay-rect <x,y,w,h>` in **virtual-viewport device
+    /// pixels**. Defaults to a 1000x600 box centred on the virtual viewport, which on a
+    /// horizontally split wall straddles the seam — that is the interesting case, because
+    /// it also tells us whether per-tile clipping of an overlay works for free.
+    spike_overlay_rect: Option<(f32, f32, f32, f32)>,
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -77,6 +98,9 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut capture_sec = 3.0f64;
     let mut preferences = Preferences::default();
     let mut ignore_certificate_errors = false;
+    // ★SPIKE — THROWAWAY★ see the `Config` fields of the same name.
+    let mut spike_overlay: Option<String> = None;
+    let mut spike_overlay_rect: Option<(f32, f32, f32, f32)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -100,6 +124,25 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             // servoshell 과 같은 이름/의미다(ports/servoshell/prefs.rs). 인자를 받지 않는
             // 순수 스위치다.
             "--ignore-certificate-errors" => ignore_certificate_errors = true,
+            // ★SPIKE — THROWAWAY★
+            "--spike-overlay" => {
+                spike_overlay = Some(args.next().ok_or("--spike-overlay requires a URL")?);
+            },
+            "--spike-overlay-rect" => {
+                let spec = args.next().ok_or("--spike-overlay-rect requires x,y,w,h")?;
+                let parts: Vec<f32> = spec
+                    .split(',')
+                    .map(|part| part.trim().parse::<f32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "--spike-overlay-rect wants four numbers: x,y,w,h")?;
+                let [x, y, w, h] = parts[..] else {
+                    return Err("--spike-overlay-rect wants exactly four numbers: x,y,w,h".into());
+                };
+                if w <= 0.0 || h <= 0.0 {
+                    return Err("--spike-overlay-rect needs a positive width and height".into());
+                }
+                spike_overlay_rect = Some((x, y, w, h));
+            },
             "--capture-sec" => {
                 capture_sec = args
                     .next()
@@ -141,6 +184,12 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         capture_sec,
         preferences,
         ignore_certificate_errors,
+        // ★SPIKE — THROWAWAY★
+        spike_overlay: spike_overlay
+            .as_deref()
+            .map(parse_url_or_filename)
+            .transpose()?,
+        spike_overlay_rect,
     })
 }
 
@@ -216,6 +265,11 @@ struct AppState {
     servo: Servo,
     // Filled in after the tiles exist (the WebView's delegate is `AppState` itself).
     webview: RefCell<Option<WebView>>,
+    /// ★SPIKE — THROWAWAY★ The second top-level `WebView` from `--spike-overlay`. Held
+    /// only to keep it alive; `render_all_tiles` needs no changes because
+    /// `Paint::render_paint_target` renders the whole painter, and a painter draws every
+    /// `WebView` registered against its rendering context.
+    spike_overlay: RefCell<Option<WebView>>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -484,6 +538,7 @@ impl ApplicationHandler<WakerEvent> for App {
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
+            spike_overlay: RefCell::new(None),
             tiles,
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
@@ -526,6 +581,103 @@ impl ApplicationHandler<WakerEvent> for App {
             let target =
                 webview.add_paint_target(tile.rendering_context.clone(), viewport_details, origin);
             tile.paint_target.set(Some(target));
+        }
+
+        // ★SPIKE — THROWAWAY★ 5) A second, independent top-level WebView placed at a rect.
+        //
+        // Nothing in the engine is changed to make this work, and that is the whole point of
+        // the spike. Three facts already in the paint layer carry it:
+        //
+        //  - `Paint::register_rendering_context` de-duplicates by `Rc::ptr_eq`, so handing it
+        //    a tile's existing `RenderingContext` returns that tile's *existing* painter and
+        //    merely adds this WebView to it. No second window, no second surface, no second
+        //    present.
+        //  - `Painter::send_root_pipeline_display_list` walks every `webview_renderer` and
+        //    pushes each as its own WebRender iframe into one root display list, so they
+        //    composite in a single scene and a single frame.
+        //  - `WebViewRenderer::new` starts a WebView `hidden: false` with its rect derived
+        //    from `viewport_details.size`, so a smaller viewport size *is* the placement box.
+        //
+        // Placement therefore needs no new API: the content sits at rect (0,0,w,h) inside a
+        // reference frame translated by `-viewport_origin`, so
+        //
+        //     viewport_origin = <this tile's origin> - <where we want the box to land>
+        //
+        // puts the box at that virtual-viewport position on every tile at once, and the
+        // painter's clip to its own rendering-context rect crops it per tile for free — a box
+        // straddling a seam should appear split across two monitors with no extra work.
+        if let Some(overlay_url) = config.spike_overlay.clone() {
+            let virtual_device = config
+                .layout
+                .virtual_viewport_device_size(Scale::new(primary_scale))
+                .to_f32();
+            let (x, y, w, h) = config.spike_overlay_rect.unwrap_or_else(|| {
+                let (w, h) = (1000.0f32, 600.0f32);
+                (
+                    (virtual_device.width - w) / 2.0,
+                    (virtual_device.height - h) / 2.0,
+                    w,
+                    h,
+                )
+            });
+            let placement = Vector2D::new(x, y);
+            let overlay_css = Size2D::new(w / primary_scale, h / primary_scale);
+            // `eprintln!`, not `log::info!` — the wall's other startup diagnostics
+            // (`tile N: display ...`) print this way for a reason: the default log filter
+            // swallows `info!`, so the first run of this spike produced no evidence line
+            // at all.
+            eprintln!(
+                "[spike-overlay] second WebView at virtual device rect \
+                 [{x},{y} {w}x{h}] ({}x{} css) -> {overlay_url}",
+                overlay_css.width, overlay_css.height,
+            );
+
+            let overlay = WebViewBuilder::new(
+                &app_state.servo,
+                app_state.tiles[0].rendering_context.clone(),
+            )
+            .url(overlay_url)
+            .hidpi_scale_factor(Scale::new(primary_scale))
+            .viewport_size_override(overlay_css)
+            .viewport_origin_override(
+                config
+                    .layout
+                    .tile_origin_device_vector(tile_indices[0], Scale::new(primary_scale))
+                    - placement,
+            )
+            .delegate(app_state.clone())
+            .build();
+
+            for (slot, &tile_index) in tile_indices.iter().enumerate().skip(1) {
+                let tile = &app_state.tiles[slot];
+                let scale = tile.window.scale_factor() as f32;
+                let viewport_details = ViewportDetails {
+                    size: overlay_css,
+                    hidpi_scale_factor: Scale::new(scale),
+                };
+                let origin = config
+                    .layout
+                    .tile_origin_device_vector(tile_index, Scale::new(scale))
+                    - placement;
+                // The returned target is deliberately dropped: `render_all_tiles` paints each
+                // tile through the *base* WebView's target, and that renders the whole
+                // painter — this overlay included.
+                let _ = overlay.add_paint_target(
+                    tile.rendering_context.clone(),
+                    viewport_details,
+                    origin,
+                );
+                // The placement maths is the whole claim of this spike, so print it: a box
+                // straddling a seam must get a *different* origin per tile, and the part of
+                // it each tile shows follows from that origin plus the tile's own clip.
+                eprintln!(
+                    "[spike-overlay] tile {tile_index}: viewport_origin=({},{}) \
+                     (tile origin - placement)",
+                    origin.x, origin.y,
+                );
+            }
+
+            *app_state.spike_overlay.borrow_mut() = Some(overlay);
         }
 
         *app_state.webview.borrow_mut() = Some(webview);
