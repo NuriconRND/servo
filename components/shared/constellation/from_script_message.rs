@@ -485,6 +485,12 @@ pub struct IFrameLoadInfo {
     /// A snapshot of the navigation-related parameters of the target
     /// of this navigation.
     pub target_snapshot_params: TargetSnapshotParams,
+    /// ★SPIKE — THROWAWAY★ `<iframe toplevel>`: render this content where the element is,
+    /// but do NOT make it a child navigable. See `is_toplevel_embed_spike` in
+    /// `htmliframeelement.rs`; the constellation uses this to hand the new pipeline a
+    /// `parent_info` of `None`, which is what decides the `WindowProxy`'s parent and hence
+    /// whether `X-Frame-Options` / `frame-ancestors` / `top !== self` apply at all.
+    pub toplevel_embed_spike: bool,
 }
 
 /// Specifies the information required to load a URL in an iframe.

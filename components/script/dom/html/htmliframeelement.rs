@@ -240,6 +240,33 @@ impl HTMLIFrameElement {
             }));
     }
 
+    /// ★SPIKE — THROWAWAY★ Is this `<iframe toplevel>`, the video-wall experiment?
+    ///
+    /// The question the spike answers: an `<iframe>` couples two *independent* things —
+    /// how the content is **rendered** (layout emits the child pipeline inside the parent's
+    /// display list, so every ancestor transform, clip and stacking context applies to it),
+    /// and what the content **is** in the browsing-context tree (a child navigable, which is
+    /// what `X-Frame-Options`, CSP `frame-ancestors` and `top !== self` frame-busting all key
+    /// off). A video wall wants the first without the second.
+    ///
+    /// This attribute unpicks them at the one value that decides it. `NewPipelineInfo`'s
+    /// `parent_info` is what `script_window_proxies` turns into the `WindowProxy`'s parent,
+    /// so `None` makes the document top-level: `xframeoptions.rs` returns at its first step
+    /// ("not a child navigable"), `frame-ancestors` gets an empty parent chain, and
+    /// `window.top === window` inside the site. Layout is untouched, so it still paints
+    /// exactly where an `<iframe>` would.
+    ///
+    /// ★Only the script side is flipped★ — the constellation still records the browsing
+    /// context as nested. That inconsistency is deliberate: it keeps the blast radius to one
+    /// value so a failure is attributable. A real feature has to make both agree.
+    ///
+    /// This is clickjacking-by-design and must never ship unguarded; the wall is a
+    /// display-only kiosk on a private network. See `tests/html/toplevel_embed_spike.html`.
+    fn is_toplevel_embed_spike(&self) -> bool {
+        self.upcast::<Element>()
+            .has_attribute(&LocalName::from("toplevel"))
+    }
+
     fn continue_navigation(
         &self,
         cx: &mut JSContext,
@@ -272,6 +299,8 @@ impl HTMLIFrameElement {
             inherited_secure_context: load_data.inherited_secure_context,
             history_handling,
             target_snapshot_params,
+            // ★SPIKE — THROWAWAY★ see `is_toplevel_embed_spike`.
+            toplevel_embed_spike: self.is_toplevel_embed_spike(),
         };
 
         let viewport_details = window
@@ -299,7 +328,12 @@ impl HTMLIFrameElement {
                     .unwrap();
 
                 let new_pipeline_info = NewPipelineInfo {
-                    parent_info: Some(window.pipeline_id()),
+                    // ★SPIKE — THROWAWAY★ see `is_toplevel_embed_spike`.
+                    parent_info: if self.is_toplevel_embed_spike() {
+                        None
+                    } else {
+                        Some(window.pipeline_id())
+                    },
                     new_pipeline_id,
                     browsing_context_id,
                     webview_id,
@@ -310,6 +344,15 @@ impl HTMLIFrameElement {
                     theme: window.theme(),
                     target_snapshot_params,
                 };
+
+                // ★SPIKE — THROWAWAY★ `eprintln!`, not `debug!`: the default log filter
+                // swallows anything below warn, and this line is the whole evidence trail.
+                if self.is_toplevel_embed_spike() {
+                    eprintln!(
+                        "[toplevel-embed] {new_pipeline_id:?} in {browsing_context_id:?}: \
+                         parent_info=None (top-level), rendered by the parent display list"
+                    );
+                }
 
                 self.pipeline_id.set(Some(new_pipeline_id));
                 with_script_thread(|script_thread| {

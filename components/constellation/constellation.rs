@@ -3449,6 +3449,7 @@ where
             is_private,
             mut history_handling,
             target_snapshot_params,
+            toplevel_embed_spike,
             ..
         } = load_info.info;
 
@@ -3518,11 +3519,27 @@ where
         }
 
         // Create the new pipeline, attached to the parent and push to pending changes
+        //
+        // ★SPIKE — THROWAWAY★ This argument becomes `NewPipelineInfo::parent_info`, which
+        // `script_window_proxies` turns into the `WindowProxy`'s parent — so it, and not the
+        // about:blank pipeline the element spawns first, is what decides whether the site
+        // that actually loads here is a child navigable. The first attempt at this spike
+        // flipped only the element side and the site was still blocked, because this is a
+        // different pipeline (usually in a different script thread, since a cross-origin
+        // site does not reuse the parent's event loop).
         self.new_pipeline(
             new_pipeline_id,
             browsing_context_id,
             webview_id,
-            Some(parent_pipeline_id),
+            if toplevel_embed_spike {
+                eprintln!(
+                    "[toplevel-embed] {new_pipeline_id:?}: parent_info=None for the navigated \
+                     document (was {parent_pipeline_id:?})"
+                );
+                None
+            } else {
+                Some(parent_pipeline_id)
+            },
             None,
             browsing_context_size,
             load_info.load_data,
@@ -3593,6 +3610,19 @@ where
             replace: None,
             // Browsing context for iframe doesn't exist yet.
             new_browsing_context_info: Some(NewBrowsingContextInfo {
+                // ★SPIKE — THROWAWAY★ ★This stays `Some` even for `<iframe toplevel>`★, and
+                // the cut is made one level lower, at the pipeline's `parent_info`.
+                //
+                // The first attempt severed it here too, and the site went white: the
+                // "notify the parent" step of a pending session-history change only fires
+                // when the browsing context has a parent, so the parent element never got
+                // `UpdatePipelineId` and kept pointing `push_iframe` at the initial
+                // about:blank pipeline. The element box still drew with all its CSS — which
+                // is what made the failure look like "CSS works, content doesn't".
+                //
+                // So: the browsing-context tree keeps its shape (sizing, activity, teardown,
+                // the iframe load event), and only what the *document* is told about its
+                // parent changes — which is precisely what the framing checks read.
                 parent_pipeline_id: Some(parent_pipeline_id),
                 is_private,
                 inherited_secure_context: is_parent_secure,
