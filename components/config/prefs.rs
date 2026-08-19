@@ -164,6 +164,15 @@ pub struct Preferences {
     /// headers provide buys nothing. It does not affect top-level navigation, which
     /// these checks never blocked in the first place.
     pub dom_enforce_framing_policy: bool,
+    /// `<iframe toplevel>` 을 인정한다. 켜면 그 속성이 붙은 iframe 의 내용이 부모의
+    /// 박스 안에서 그대로 렌더되면서(모든 CSS 적용) browsing context 만 top-level 이
+    /// 되어, `X-Frame-Options` / CSP `frame-ancestors` / `top !== self` 프레임버스팅이
+    /// 성립하지 않는다. 꺼져 있으면 그 속성은 완전히 무시되고 평범한 iframe 이다.
+    ///
+    /// ★설계상 스푸핑을 허용한다★ — 우리 UI 안에 남의 사이트를 진짜처럼 배치할 수
+    /// 있다. 사설망 표출 전용 키오스크라는 전제에서만 켠다. v1 은 입력 라우팅이 없어
+    /// 클릭재킹은 성립하지 않지만, 입력을 얹으면 그 항목은 되살아난다.
+    pub dom_iframe_toplevel_embed_enabled: bool,
     // feature: Document.execCommand | #25005 | Web/API/Document/execCommand
     pub dom_exec_command_enabled: bool,
     // feature: CSS Font Loading API | #29376 | Web/API/CSS_Font_Loading_API
@@ -567,6 +576,7 @@ impl Preferences {
             dom_document_dblclick_dist: 1,
             dom_document_dblclick_timeout: 300,
             dom_enforce_framing_policy: true,
+            dom_iframe_toplevel_embed_enabled: false,
             dom_exec_command_enabled: false,
             dom_fontface_enabled: false,
             dom_fullscreen_test: false,
