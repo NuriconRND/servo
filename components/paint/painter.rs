@@ -1288,7 +1288,24 @@ impl Painter {
 
         let root_clip_id = builder.define_clip_rect(root_reference_frame, viewport_rect);
         let clip_chain_id = builder.define_clip_chain(None, [root_clip_id]);
-        for webview_renderer in self.webview_renderers.values() {
+
+        // ★Paint order must be deterministic★ `webview_renderers` is an `FxHashMap`, so
+        // `.values()` yields an arbitrary, hash-dependent order — and that order *is* the
+        // paint order, because later display-list items draw over earlier ones.
+        //
+        // With one `WebView` per painter this never mattered, and with servoshell's tabs it
+        // is masked because every inactive tab is hidden. It bites as soon as two are visible
+        // at once: a full-viewport opaque `WebView` that happens to be iterated last covers
+        // everything pushed before it, so the other one loads, animates and shows up in
+        // devtools while painting nothing on screen.
+        //
+        // Order by `WebViewId`, which is allocated in creation order, so a `WebView` added
+        // later paints on top — the same rule window stacking uses.
+        let mut ordered_renderers: Vec<&WebViewRenderer> =
+            self.webview_renderers.values().collect();
+        ordered_renderers.sort_by_key(|renderer| renderer.id);
+
+        for webview_renderer in ordered_renderers {
             if webview_renderer.hidden() {
                 continue;
             }
