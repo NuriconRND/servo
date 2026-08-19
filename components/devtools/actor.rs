@@ -344,13 +344,23 @@ impl ActorRegistry {
             .unwrap_or_default()
     }
 
+    /// Record the source text of the document currently loaded in `pipeline_id`, so that source
+    /// actors created after parsing finishes still have something to serve.
+    ///
+    /// ★A pipeline can be parsed more than once, so this replaces rather than asserts★ —
+    /// `document.open()` creates a *second*, script-created parser for the **same** document
+    /// (HTML spec step 16, `document.rs`), and when that parser finishes, `ServoParser::finish`
+    /// sends another `UpdateSourceContent` carrying the same pipeline id. This used to trip an
+    /// `assert!(… .is_none())` here and take the whole Devtools thread down with it, which then
+    /// flooded the log with `DevTools send failed: sending on a disconnected channel`. Any page
+    /// whose frames build themselves with `document.write` reproduces it.
+    ///
+    /// Last write wins, and that is the correct source: `document.open()` erases the previous
+    /// DOM, so the text delivered over the network is no longer this document's source.
     pub(crate) fn set_inline_source_content(&self, pipeline_id: PipelineId, content: String) {
-        assert!(
-            self.write()
-                .inline_source_content
-                .insert(pipeline_id, content)
-                .is_none()
-        );
+        self.write()
+            .inline_source_content
+            .insert(pipeline_id, content);
     }
 
     pub(crate) fn inline_source_content(&self, pipeline_id: PipelineId) -> Option<String> {
@@ -365,5 +375,34 @@ impl ActorRegistry {
         for actor in actors {
             actor.0.cleanup(stream_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_base::id::{PipelineId, PipelineNamespace, PipelineNamespaceId};
+
+    use super::ActorRegistry;
+
+    /// A pipeline can hand us source content twice, and the second one must win.
+    ///
+    /// `document.open()` associates a *second*, script-created parser with the **same**
+    /// document (HTML spec step 16), so `ServoParser::finish` sends `UpdateSourceContent`
+    /// again for a pipeline id we have already seen. Asserting the entry was vacant panicked
+    /// the Devtools thread on any page whose frames build themselves with `document.write`.
+    #[test]
+    fn inline_source_content_is_replaced_when_a_pipeline_is_parsed_again() {
+        PipelineNamespace::install(PipelineNamespaceId(1));
+        let pipeline_id = PipelineId::new();
+        let registry = ActorRegistry::default();
+
+        registry.set_inline_source_content(pipeline_id, "<html>from the network</html>".into());
+        registry.set_inline_source_content(pipeline_id, "<html>document.write</html>".into());
+
+        // The network text is no longer this document's source — `document.open()` erased it.
+        assert_eq!(
+            registry.inline_source_content(pipeline_id).as_deref(),
+            Some("<html>document.write</html>")
+        );
     }
 }
