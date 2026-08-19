@@ -41,6 +41,7 @@ use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::CallbackSetter;
 use servo_base::id::PipelineId;
+use servo_config::pref;
 use servo_url::{Host, ServoUrl};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
@@ -493,7 +494,12 @@ pub async fn main_fetch(
     if should_request_be_blocked_due_to_a_bad_port(&request.current_url()) {
         response = Some(Response::network_error(NetworkError::InvalidPort));
     }
-    if should_request_be_blocked_as_mixed_content(request, &context.protocols) {
+    // `network_enforce_mixed_content` 는 월 표출용 탈출구다 — `file://` 부모는 스펙상
+    // secure context 라 그 안의 iframe 이 `http://` 대상을 못 연다(loopback 으로 서빙해도
+    // 마찬가지다). `dom_enforce_framing_policy` 와 짝이다.
+    if pref!(network_enforce_mixed_content) &&
+        should_request_be_blocked_as_mixed_content(request, &context.protocols)
+    {
         response = Some(Response::network_error(NetworkError::MixedContent));
     }
 

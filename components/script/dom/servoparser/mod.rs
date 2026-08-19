@@ -1377,7 +1377,13 @@ impl FetchResponseListener for ParserContext {
 
         // https://html.spec.whatwg.org/multipage/#attempt-to-populate-the-history-entry%27s-document
         // Step 4. Otherwise, if any of the following are true:
-        if
+        // ★`dom_enforce_framing_policy` 는 이 블록 전체를 게이트한다★ — 두 검사(CSP
+        // frame-ancestors, X-Frame-Options)는 **자식 navigable 에만** 적용되고
+        // (`xframeoptions.rs` Step 1 이 최상위면 그대로 통과시킨다), 이 포크의 월은
+        // 사설망 표출 전용 키오스크라 이 헤더가 지키는 클릭재킹 방어가 사 줄 것이 없다.
+        // 끄면 "우리 레이아웃 HTML 안의 iframe 으로 외부 사이트" 가 열린다.
+        if pref!(dom_enforce_framing_policy) &&
+        (
         // navigationParams is null;
         // TODO
         // the result of should navigation response to navigation request of
@@ -1403,6 +1409,7 @@ impl FetchResponseListener for ParserContext {
             metadata
                 .as_ref()
                 .and_then(|metadata| metadata.headers.as_ref()),
+        )
         ) {
             // Step 4.1. Set entry's document state's document to the result of creating a document for inline content
             // that doesn't have a DOM, given navigable, null, navTimingType, and userInvolvement.

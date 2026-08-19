@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 20 + 조사용 env 15)
+# 설정 노브 전량 (pref 22 + 조사용 env 15)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -64,9 +64,13 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 20 개
+## pref 22 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
+
+앞의 20 개는 옛 환경변수를 옮겨 온 것이고(위 마이그레이션 표), 마지막
+`### 표출용 웹 보안 완화` 두 개는 옮겨 온 것이 아니라 **새로 추가한 것**이라 옛 이름이
+없다.
 
 ### `gfx_*` — 컴포지터 / 표출
 
@@ -102,6 +106,38 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_decoder_policy` | String | `""` (= software) | 비디오 디코더 선택 정책. 인정 토큰(대소문자 무시): `auto`/`default` = 자동 선택 유지, `software`/`avdec` = 소프트웨어 디코더 강제. 그 외 값은 경고 후 software. |
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
+
+### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content`
+
+**둘 다 기본이 `true`(= 표준 동작)** 이다. 끄는 것은 월 표출 전용 탈출구이고, 일반
+브라우징용으로 끄면 안 된다.
+
+| pref | 타입 | 기본값 | 설명 |
+|---|---|---|---|
+| `dom_enforce_framing_policy` | bool | **`true`** | 사이트가 선언한 프레이밍 정책(`X-Frame-Options`, CSP `frame-ancestors`)을 **자식 navigable(iframe)** 내비게이션에서 강제한다. `=false` 면 두 검사를 건너뛴다. 최상위 내비게이션은 원래 이 경로로 막히지 않으므로(`xframeoptions.rs` Step 1) 영향이 없다. |
+| `network_enforce_mixed_content` | bool | **`true`** | secure context 에서 비-secure 하위 리소스(mixed content)를 차단한다. `=false` 면 `file://` 부모 페이지의 iframe 이 `http://` 대상을 열 수 있다. |
+
+**왜 필요한가.** 월에 "우리 레이아웃 HTML + 그 안의 iframe 으로 외부 사이트" 를 띄우려는
+시도는 상용 사이트 대부분이 `XFO: DENY` 라 성립하지 않는다(naver.com·iana.org 실측; Chrome
+도 동일하게 막힌다). 월은 사설망 표출 전용 키오스크라 이 헤더가 지키는 클릭재킹 방어가 사
+줄 것이 없으므로, 셸 수준에서 명시적으로 끌 수 있게 했다 — `--ignore-certificate-errors`
+와 같은 성격의 노브다.
+
+**끄고도 안 되는 것 세 가지** (이 pref 로는 풀리지 않는다):
+
+1. **JS frame-busting** — `if (top !== self) top.location = self.location` 은 헤더가 아니라
+   스크립트다. iframe 에 `sandbox="allow-scripts allow-same-origin"`(top-navigation 토큰
+   제외)을 주어 봉쇄한다.
+2. **로그인 세션** — 쿠키가 `SameSite=Lax` 면 서드파티 프레임에 안 붙는다. 로그인이 필요한
+   대시보드는 이 경로로 못 띄운다.
+3. **반응형 붕괴 / Servo 웹호환성** — 정책이 아니라 별개 문제로 그대로 남는다.
+
+**차단 사유가 안 보이는 함정.** Servo 내장 에러 페이지(`neterror.html`)는 CSS 가 한 줄도
+없어 캔버스가 transparent 로 남고(`layout/display_list/mod.rs` 가 투명 루트 배경에서 조기
+리턴), 흰 배경의 출처인 `shell_background_color_rgba` 는 painter 의 **창** clear color 라
+nested document 에 적용되지 않는다. **진단용 iframe 의 배경은 반드시 밝게 둘 것** — 어둡게
+두면 차단된 로드가 검정 위 검정으로 그려져 "아무것도 안 그려짐" 으로 오진한다(실제로 3 회
+연속 오진했다).
 
 ## 조사용 환경변수 15 개
 

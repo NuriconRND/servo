@@ -154,6 +154,16 @@ pub struct Preferences {
     pub dom_crypto_subtle_enabled: bool,
     pub dom_document_dblclick_timeout: i64,
     pub dom_document_dblclick_dist: i64,
+    /// Enforce the framing policy a site declares — `X-Frame-Options` and the CSP
+    /// `frame-ancestors` directive — when a **child** navigable (an `iframe`) is
+    /// navigated. On by default; this is the standard behaviour.
+    ///
+    /// Turning it off is a video-wall escape hatch: a wall page that embeds outside
+    /// sites in `iframe`s is blocked by nearly every commercial site, and the wall is
+    /// a display-only kiosk on a private network, so the clickjacking defence these
+    /// headers provide buys nothing. It does not affect top-level navigation, which
+    /// these checks never blocked in the first place.
+    pub dom_enforce_framing_policy: bool,
     // feature: Document.execCommand | #25005 | Web/API/Document/execCommand
     pub dom_exec_command_enabled: bool,
     // feature: CSS Font Loading API | #29376 | Web/API/CSS_Font_Loading_API
@@ -470,6 +480,14 @@ pub struct Preferences {
     /// associated with multiple IP addresses, this timeout will be divided equally among
     /// each IP address.
     pub network_connection_timeout: u64,
+    /// Block a non-secure subresource fetched from a secure context (mixed content).
+    /// On by default; this is the standard behaviour.
+    ///
+    /// The companion of `dom_enforce_framing_policy` for the video wall. A wall page
+    /// served from `file://` is a secure context by spec (`url/origin.rs`), so every
+    /// `http://` target it embeds is blocked — and serving the page from `localhost`
+    /// does not help, because loopback is potentially trustworthy too.
+    pub network_enforce_mixed_content: bool,
     pub network_enforce_tls_enabled: bool,
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
@@ -548,6 +566,7 @@ impl Preferences {
             dom_crypto_subtle_enabled: true,
             dom_document_dblclick_dist: 1,
             dom_document_dblclick_timeout: 300,
+            dom_enforce_framing_policy: true,
             dom_exec_command_enabled: false,
             dom_fontface_enabled: false,
             dom_fullscreen_test: false,
@@ -711,6 +730,7 @@ impl Preferences {
             media_video_sink_policy: String::new(),
             media_webrtc_jitter_latency_ms: 0,
             network_connection_timeout: 15,
+            network_enforce_mixed_content: true,
             network_enforce_tls_enabled: false,
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,
