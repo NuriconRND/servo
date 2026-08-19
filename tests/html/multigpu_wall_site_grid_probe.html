@@ -1,0 +1,224 @@
+<!doctype html>
+<!--
+  Wall site-grid probe — put N outside sites on the wall at once and see which ones
+  actually survive being framed.
+
+  ★TO CHANGE THE SITES, EDIT THE `SITES` LIST BELOW — it is the first thing in the
+   first <script>, right under a banner comment. Nothing else needs touching.★
+
+  This is the measuring instrument for the framing-policy escape hatch:
+
+      --pref dom_enforce_framing_policy=false
+      --pref network_enforce_mixed_content=false
+
+  With the prefs left at their defaults every commercial site renders Servo's error
+  page instead; with them off, the sites load and you find out what ELSE breaks
+  (frame-busting scripts, responsive collapse, Servo web-compat). See
+  `docs/multigpu/configuration.md` -> `표출용 웹 보안 완화`.
+
+  Query parameters (all optional — the file works with none):
+
+    ?urls=<a,b,c>   Replace the built-in SITES list for this run. Comma-separated.
+                    A URL containing a literal comma cannot be passed this way; edit
+                    the SITES list instead.
+    ?sandbox=1      Sandbox every frame with `allow-scripts allow-same-origin`.
+                    The point is what is NOT in that list: no `allow-top-navigation`,
+                    which is what stops a frame-busting script (`if (top !== self)
+                    top.location = ...`) from stealing the whole wall. Default off.
+    ?sandbox=<toks> Same, but with your own space-separated token list, e.g.
+                    `?sandbox=allow-scripts` to also cut the frame off from storage.
+    ?cols=<n>       Grid columns. Default is ceil(sqrt(N)), which is square-ish.
+
+  ★HOW TO READ THE RESULT — the `load` event does NOT mean success.★ When a load is
+  blocked, Servo synthesizes an error document and parses it, so `load` fires exactly
+  as it would for a real page. Worse, that error page has no CSS of its own, so it
+  paints black text on a transparent canvas. Every frame below therefore gets a LIGHT
+  background on purpose — with a dark one a blocked load draws black-on-black and
+  reads as `nothing rendered at all` (this cost three misdiagnoses in a row). The
+  verdict is visual: read the frame, not the status line.
+
+  Run (release; a debug build is known to crash on the wall with dynamic content):
+
+    target\release\examples\winit_wall.exe --wall-all-tiles ^
+      --wall-layout ..\config\wall_layout.local_2x1.json ^
+      --pref dom_enforce_framing_policy=false ^
+      --pref network_enforce_mixed_content=false ^
+      "file:///W:/servo_multigpu-tiled-wall/tests/html/multigpu_wall_site_grid_probe.html"
+
+  Add `?sandbox=1` to the URL for the frame-busting-defence pass. Progress is also
+  logged to stderr as `[site-grid] ...`, so a timed run can be graded from the log.
+-->
+<html lang="en"><head><meta charset="utf-8"><title>Wall site grid probe</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0d12;
+               font-family: system-ui, "Segoe UI", sans-serif; color: #e8e8f0; }
+  body { display: flex; flex-direction: column; }
+
+  header { flex: 0 0 auto; padding: 10px 14px; display: flex; align-items: baseline;
+           gap: 18px; border-bottom: 1px solid #262b3a; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+  header .meta { font-family: monospace; font-size: 14px; color: #9aa; }
+  header .meta b { color: #c56cf0; font-weight: 700; }
+
+  /* ★flex wrap, not CSS Grid★ — Servo gates Grid behind `layout_grid_enabled`, which
+     defaults to false (`components/config/prefs.rs`), so `display: grid` silently falls
+     back to block layout and every cell stacks vertically. Rows are built with wrapping
+     flex instead; script sets each cell's width from the column count. */
+  #grid { flex: 1 1 auto; display: flex; flex-wrap: wrap; align-content: stretch;
+          gap: 8px; padding: 8px; min-height: 0; }
+
+  .cell { margin: 0; display: flex; flex-direction: column; min-width: 0; min-height: 0;
+          border: 2px solid #3a4157; border-radius: 6px; overflow: hidden; }
+  .cell.pending { border-color: #6b5a2a; }
+  .cell.loaded  { border-color: #c56cf0; }
+  .cell.stalled { border-color: #a33; }
+
+  .bar { flex: 0 0 auto; display: flex; gap: 10px; align-items: baseline;
+         padding: 4px 8px; background: #161a26; font-size: 13px; }
+  .bar .idx  { font-family: monospace; color: #6f7690; }
+  .bar .host { font-weight: 700; color: #e8e8f0; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
+  .bar .state { margin-left: auto; font-family: monospace; color: #9aa;
+                white-space: nowrap; }
+
+  /* ★Keep this background LIGHT — see the header comment.★ Servo's built-in error page
+     (neterror.html) ships no CSS, so its canvas stays transparent and its default text
+     colour is black. The window's white clear colour (shell_background_color_rgba) is
+     painted by the window, not by a nested document, so it never reaches an iframe. */
+  iframe { flex: 1 1 auto; width: 100%; border: 0; background: #f4f4f8; min-height: 0; }
+</style></head>
+<body>
+
+<script>
+/* ===========================================================================
+ * ★★★  EDIT HERE — one URL per line. This is the only line you need to change. ★★★
+ * =========================================================================== */
+
+const SITES = [
+  "https://example.com",
+  "https://www.naver.com",
+  "https://www.iana.org",
+  "https://www.wikipedia.org",
+];
+
+/* ===========================================================================
+ * ★★★  END OF THE EDITABLE PART — everything below is plumbing.  ★★★
+ * =========================================================================== */
+</script>
+
+<header>
+  <h1>wall site grid</h1>
+  <div class="meta" id="meta">starting…</div>
+</header>
+<div id="grid"></div>
+
+<script>
+  const P = new URLSearchParams(location.search);
+  const clog = (m) => console.log("[site-grid] " + m);
+
+  // `?urls=` overrides the SITES list for one run without editing the file.
+  const urls = (P.get("urls") || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const sites = urls.length ? urls : SITES;
+
+  // `?sandbox=1` is shorthand for the token list that keeps a site usable while denying
+  // it the top-level navigation a frame-busting script needs. Note the classic
+  // `allow-scripts allow-same-origin` warning (a frame could drop its own sandbox) does
+  // not apply here: these frames are cross-origin, so they cannot reach our DOM.
+  const sandboxRaw = P.get("sandbox");
+  const sandbox =
+    sandboxRaw === null || sandboxRaw === "0" || sandboxRaw === "" ? null :
+    sandboxRaw === "1" ? "allow-scripts allow-same-origin" :
+    sandboxRaw;
+
+  const cols = Math.max(1, parseInt(P.get("cols") || "", 10) ||
+                           Math.ceil(Math.sqrt(sites.length)));
+  const grid = document.getElementById("grid");
+  // Wrapping flex needs an explicit per-cell width to form columns (no Grid in Servo, see
+  // the note on #grid). `calc` subtracts each cell's share of the 8px gaps.
+  const rows = Math.ceil(sites.length / cols);
+  const cellWidth = "calc((100% - " + (cols - 1) * 8 + "px) / " + cols + ")";
+  const cellHeight = "calc((100% - " + (rows - 1) * 8 + "px) / " + rows + ")";
+
+  // A frame that never fires `load` is stuck; flag it so a long run is still readable.
+  const STALL_MS = 20000;
+
+  const hostOf = (u) => { try { return new URL(u).host; } catch { return u; } };
+
+  let loaded = 0;
+  const cells = sites.map((url, i) => {
+    const cell = document.createElement("figure");
+    cell.className = "cell pending";
+    cell.style.width = cellWidth;
+    cell.style.height = cellHeight;
+
+    const bar = document.createElement("figcaption");
+    bar.className = "bar";
+    const idx = document.createElement("span");
+    idx.className = "idx";
+    idx.textContent = "#" + i;
+    const host = document.createElement("span");
+    host.className = "host";
+    host.textContent = hostOf(url);
+    host.title = url;
+    const state = document.createElement("span");
+    state.className = "state";
+    state.textContent = "loading…";
+    bar.append(idx, host, state);
+
+    const frame = document.createElement("iframe");
+    frame.title = "site " + i + ": " + url;
+    if (sandbox !== null) frame.setAttribute("sandbox", sandbox);
+
+    const started = performance.now();
+    let settled = false;
+
+    frame.addEventListener("load", () => {
+      if (settled) return;           // a frame may re-navigate itself; keep the first
+      settled = true;
+      loaded++;
+      const ms = Math.round(performance.now() - started);
+      cell.className = "cell loaded";
+      // Deliberately not called `ok` — a blocked load fires `load` too (error document).
+      state.textContent = "load fired " + ms + "ms";
+      clog("#" + i + " load fired after " + ms + "ms — " + url);
+      updateMeta();
+    });
+
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cell.className = "cell stalled";
+      state.textContent = "no load in " + (STALL_MS / 1000) + "s";
+      clog("#" + i + " NO load event after " + STALL_MS + "ms — " + url);
+      updateMeta();
+    }, STALL_MS);
+
+    cell.append(bar, frame);
+    grid.append(cell);
+    frame.src = url;                 // set last, so the listener is already attached
+    return { url, state };
+  });
+
+  const meta = document.getElementById("meta");
+  function updateMeta() {
+    meta.innerHTML =
+      "sites <b>" + sites.length + "</b> · cols <b>" + cols + "</b> · sandbox <b>" +
+      (sandbox === null ? "off" : sandbox) + "</b> · load fired <b>" + loaded + "/" +
+      sites.length + "</b> — verdict is visual, not this line";
+  }
+  updateMeta();
+
+  clog("sites=" + sites.length + " cols=" + cols +
+       " sandbox=" + (sandbox === null ? "off" : sandbox) +
+       " source=" + (urls.length ? "?urls=" : "SITES list"));
+  sites.forEach((u, i) => clog("#" + i + " -> " + u));
+
+  // Heartbeat so a timed run can be graded from the stderr log alone.
+  let n = 0;
+  setInterval(() => clog("heartbeat " + (++n) + " loadFired=" + loaded + "/" + sites.length), 5000);
+</script>
+</body></html>
