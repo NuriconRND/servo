@@ -167,7 +167,7 @@ use servo_constellation_traits::{
     ScreenshotReadinessResponse, ScriptToConstellationMessage, ScrollStateUpdate,
     ServiceWorkerAlgorithm, ServiceWorkerManagerFactory, ServiceWorkerMsg,
     StructuredSerializedData, TargetSnapshotParams, TraversalDirection, UserContentManagerAction,
-    WindowSizeType,
+    WindowSizeType, navigable_parent,
 };
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
@@ -3513,6 +3513,7 @@ where
 
         let browsing_context_size = browsing_context.viewport_details;
         let browsing_context_throttled = browsing_context.throttled;
+        let embedding_mode = browsing_context.embedding_mode;
         // TODO(servo#30571) revert to debug_assert_eq!() once underlying bug is fixed
         #[cfg(debug_assertions)]
         if !(browsing_context_size == load_info.viewport_details) {
@@ -3526,7 +3527,13 @@ where
             new_pipeline_id,
             browsing_context_id,
             webview_id,
-            Some(parent_pipeline_id),
+            // ★이 인자가 NewPipelineInfo::parent_info 가 되고, script 가 그것으로
+            // WindowProxy 의 부모를 정한다 — 즉 X-Frame-Options / frame-ancestors /
+            // `top !== self` 가 성립할지를 여기서 가른다.★ 실제 사이트가 로드되는
+            // 파이프라인은 element 가 만드는 초기 about:blank 가 아니라 이것이고,
+            // 교차 출처면 부모의 script thread 도 재사용하지 않으므로, 여기를 빠뜨리면
+            // 아무리 element 쪽을 고쳐도 사이트는 계속 차단된다.
+            navigable_parent(embedding_mode, Some(parent_pipeline_id)),
             None,
             browsing_context_size,
             load_info.load_data,
