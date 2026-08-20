@@ -3122,6 +3122,44 @@ impl HTMLMediaElement {
         Ok(())
     }
 
+    /// Stop the pipeline when a **live network stream** is removed from the document.
+    ///
+    /// The spec's "remove an element from a document" steps only pause, because a detached
+    /// element can be re-inserted and resume where it left off. For a file that costs
+    /// nothing — a paused pipeline just holds a file handle. For `rtsp://` it costs a
+    /// camera session: pausing leaves the pipeline in `PAUSED`, and RTSP only sends
+    /// TEARDOWN on the transition to `NULL`, so the server keeps the session ESTABLISHED
+    /// until the process exits. Cameras allow a small number of concurrent sessions, and a
+    /// video wall creates and drops these elements all day.
+    ///
+    /// ★This stops the player but does NOT drop it★ (unlike `reset_media_player`), so
+    /// re-inserting the element and calling `play()` still works: `stop()` leaves the
+    /// player paused, and `play()` brings the pipeline back up. For a live stream that
+    /// means reconnecting, which is what resuming a live stream means anyway — there is no
+    /// position to resume from.
+    ///
+    /// Deliberately narrow: only direct-URI schemes, and only when the element is actually
+    /// disconnected. Everything else keeps the spec's pause-only behaviour.
+    fn stop_live_stream_on_removal(&self) {
+        if !pref!(dom_video_network_uri_enabled) {
+            return;
+        }
+        let is_live_stream = self
+            .resource_url
+            .borrow()
+            .as_ref()
+            .is_some_and(is_direct_uri_scheme);
+        if !is_live_stream {
+            return;
+        }
+
+        if let Some(ref player) = *self.player.borrow()
+            && let Err(error) = player.lock().unwrap().stop()
+        {
+            warn!("Could not stop live stream player on removal: {error:?}");
+        }
+    }
+
     fn reset_media_player(&self) {
         if self.player.borrow().is_none() {
             return;
@@ -4432,6 +4470,7 @@ impl MicrotaskRunnable for MediaElementMicrotask {
                 }
                 // Step 3. ⌛ Run the internal pause steps for the media element.
                 elem.internal_pause_steps();
+                elem.stop_live_stream_on_removal();
             },
             &MediaElementMicrotask::Seeked {
                 ref elem,
