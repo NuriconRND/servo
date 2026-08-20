@@ -119,6 +119,19 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `network_enforce_mixed_content` | bool | **`true`** | secure context 에서 비-secure 하위 리소스(mixed content)를 차단한다. `=false` 면 `file://` 부모 페이지의 iframe 이 `http://` 대상을 열 수 있다. |
 | `dom_iframe_toplevel_embed_enabled` | bool | `false` | `<iframe toplevel>` 을 인정한다. 그 속성이 붙은 iframe 은 부모의 박스 안에서 그대로 렌더되면서(모든 CSS 적용) 내용만 top-level browsing context 가 되어, `X-Frame-Options`/`frame-ancestors`/frame-busting 이 **성립하지 않는다**. 꺼져 있으면 속성은 완전히 무시된다. |
 
+**★위험★**
+
+- 설계상 **스푸핑을 허용**한다. 사설망 표출 전용 키오스크 전제에서만 켠다.
+- v1 은 입력 라우팅이 없어 클릭재킹은 성립하지 않지만, **입력을 얹으면 되살아난다.**
+- **게이트가 문서 단위가 아니라 프로세스 전역**이다. `toplevel` 로 띄운 외부 사이트가 자기
+  안에 또 `<iframe toplevel>` 을 쓸 수 있다. "운용자가 작성한 월 레이아웃 HTML만 이 속성을
+  쓴다"는 전제는 코드에 없다.
+- **임베드된 사이트가 월 창의 제목과 로드 상태를 가져간다.** 임베드 문서는 `is_top_level()`
+  이 true 가 되어 `ChangePageTitle` / `NotifyLoadStatusChanged` 를 **월 WebView 의 id 로**
+  보낸다(`components/script/dom/document/document.rs` 의 세 지점). servoshell 에서는 창
+  제목이 외부 사이트 제목으로 바뀐다. 즉 스푸핑 표면이 *우리 UI 안의 남의 사이트* 를 넘어
+  **브라우저 크롬 자체** 까지 닿는다.
+
 **앞의 두 pref 와의 관계.** `<iframe toplevel>` 을 쓰면 `dom_enforce_framing_policy` 와
 `network_enforce_mixed_content` 는 **필요 없다.** 앞의 둘은 검사를 *끄는* 것이고,
 `toplevel` 은 애초에 그 검사에 *도달하지 않는* 것이다. 평범한 iframe 을 그대로 쓰면서
@@ -146,8 +159,13 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 임베드된 문서에서 `top === self` 라 그 스크립트 자체가 발동하지 않는다 — 항목 1 은
 `toplevel` 에는 해당하지 않는다. 로그인 세션(항목 2)은 임베드된 문서가 스스로 top-level
 이므로 서드파티 프레임이라는 전제가 사라진다. ★다만 이 포크에서 실측하지 않았다★ —
-쿠키가 실제로 붙는지는 확인이 필요하다. 반응형 붕괴 / Servo 웹호환성(항목 3)은
-`toplevel` 로도 그대로 남는다.
+쿠키가 실제로 붙는지는 확인이 필요하다. 게다가 **이 엔진은 SameSite 쿠키 속성을 애초에
+구현하지 않는다**(쿠키 저장소 `components/net/cookie.rs` / `cookie_storage.rs` 어디에도
+`same_site`/`SameSite` 가 없다 — `components/net` 전체의 다른 매치는 무관한 Fetch
+`Sec-Fetch-Site` 헤더 판정이다) — 즉 `toplevel` 이 서드파티 전제를 없앤 것이 아니라, 그
+전제를 지키던 검사가 이 포크에는 처음부터 없었다. 실측 헤지는 그대로 유효하지만, 운용자가
+"SameSite 가 막아 줄 것" 이라는 헛검증을 하지 않도록 적어 둔다. 반응형 붕괴 / Servo
+웹호환성(항목 3)은 `toplevel` 로도 그대로 남는다.
 
 **차단 사유가 안 보이는 함정.** Servo 내장 에러 페이지(`neterror.html`)는 CSS 가 한 줄도
 없어 캔버스가 transparent 로 남고(`layout/display_list/mod.rs` 가 투명 루트 배경에서 조기

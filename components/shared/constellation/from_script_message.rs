@@ -889,11 +889,22 @@ pub fn navigable_parent(
     }
 }
 
+/// `<iframe toplevel>` 의 게이트. 속성과 pref 가 **둘 다** 있어야 top-level 임베드다.
+/// ★이 함수가 `TopLevelEmbed` 의 유일한 생산자다★ — 순수함수로 둔 이유는 보안상
+/// 가장 중요한 이 술어를 DOM 없이 테스트하기 위해서다.
+pub fn embedding_mode_for(has_toplevel_attribute: bool, pref_enabled: bool) -> EmbeddingMode {
+    if has_toplevel_attribute && pref_enabled {
+        EmbeddingMode::TopLevelEmbed
+    } else {
+        EmbeddingMode::Nested
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use servo_base::id::{PipelineId, PipelineNamespace, PipelineNamespaceId};
 
-    use super::{EmbeddingMode, navigable_parent};
+    use super::{EmbeddingMode, embedding_mode_for, navigable_parent};
 
     /// 평범한 iframe 은 표출 부모가 곧 navigable 부모다.
     #[test]
@@ -923,5 +934,18 @@ mod tests {
     fn a_real_top_level_document_has_no_parent_either_way() {
         assert_eq!(navigable_parent(EmbeddingMode::Nested, None), None);
         assert_eq!(navigable_parent(EmbeddingMode::TopLevelEmbed, None), None);
+    }
+
+    /// `embedding_mode_for` 의 진짜 술어 — 속성과 pref 가 **둘 다** 있어야 top-level
+    /// 임베드다. 네 조합 전부를 고정한다.
+    #[test]
+    fn embedding_mode_for_requires_both_attribute_and_pref() {
+        assert_eq!(
+            embedding_mode_for(true, true),
+            EmbeddingMode::TopLevelEmbed
+        );
+        assert_eq!(embedding_mode_for(true, false), EmbeddingMode::Nested);
+        assert_eq!(embedding_mode_for(false, true), EmbeddingMode::Nested);
+        assert_eq!(embedding_mode_for(false, false), EmbeddingMode::Nested);
     }
 }

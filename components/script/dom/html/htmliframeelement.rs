@@ -22,8 +22,8 @@ use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_config::pref;
 use servo_constellation_traits::{
     EmbeddingMode, IFrameLoadInfo, IFrameLoadInfoWithData, LoadData, LoadOrigin,
-    navigable_parent, NavigationHistoryBehavior, ScriptToConstellationMessage,
-    TargetSnapshotParams,
+    NavigationHistoryBehavior, ScriptToConstellationMessage, TargetSnapshotParams,
+    embedding_mode_for, navigable_parent,
 };
 use servo_url::ServoUrl;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
@@ -254,11 +254,7 @@ impl HTMLIFrameElement {
         let has_attribute = self
             .upcast::<Element>()
             .has_attribute(&LocalName::from("toplevel"));
-        if has_attribute && pref!(dom_iframe_toplevel_embed_enabled) {
-            EmbeddingMode::TopLevelEmbed
-        } else {
-            EmbeddingMode::Nested
-        }
+        embedding_mode_for(has_attribute, pref!(dom_iframe_toplevel_embed_enabled))
     }
 
     fn continue_navigation(

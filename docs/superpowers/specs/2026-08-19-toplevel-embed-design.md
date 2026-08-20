@@ -136,7 +136,9 @@ script 쪽은 아직 BC 가 없으므로 자기 판정을 쓰고, constellation 
 ### 4. 게이트와 보안
 
 - pref `dom_iframe_toplevel_embed_enabled`, **기본 `false`**.
-- 켜진 채로 기동하면 경고 한 줄을 남긴다(`--ignore-certificate-errors` 선례와 동일한 성격).
+- 켜진 채로 기동하면 범용 `servo: config:` 덤프(`components/config/config_dump.rs`)에
+  `dom_iframe_toplevel_embed_enabled=true` 가 찍힌다. 이 pref 만을 위한 별도 경고는 두지
+  않는다 — 덤프가 이미 그 역할을 하고, 진단 문서도 그것을 판정 근거로 쓴다.
 - pref 가 꺼져 있으면 `toplevel` 속성은 **완전히 무시**되고 평범한 iframe 으로 동작한다.
 
 **위험의 성격을 정확히 적는다.** 뭉뚱그리면 나중에 입력을 얹을 때 판단을 그르친다.
