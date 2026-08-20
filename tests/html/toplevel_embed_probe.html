@@ -26,7 +26,11 @@
       --pref dom_iframe_toplevel_embed_enabled=true ^
       "file:///W:/servo_multigpu-tiled-wall/tests/html/toplevel_embed_probe.html"
 
-  Stderr should carry one `[toplevel-embed] ...` line per treatment frame.
+  Stderr carries no per-frame line for this feature — the engine change adds no logging.
+  What stderr DOES prove is that the pref took effect: with the pref passed, startup prints
+  `servo: config: dom_iframe_toplevel_embed_enabled=true (default false)`. If that line is
+  absent, the pref never reached the engine and the run is invalid. The pass/fail judgement
+  itself is visual, per the criteria below.
 
   HOW TO READ IT — the two columns load the SAME url with the SAME CSS on the box:
 
@@ -46,7 +50,7 @@
   canvas stays transparent and its text is black; on a dark box a blocked load draws
   black-on-black and reads as "nothing rendered at all".
 -->
-<html lang="en"><head><meta charset="utf-8"><title>toplevel embed spike</title>
+<html lang="en"><head><meta charset="utf-8"><title>toplevel embed probe</title>
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; min-height: 100%; background: #0b0d12;
@@ -85,7 +89,7 @@
   .tick { font-family: monospace; color: #e6c8ff; }
 </style></head>
 <body>
-  <h1>top-level embed spike</h1>
+  <h1>top-level embed probe</h1>
   <p class="sub">Same URL, same CSS on the box. The only difference is the
      <code>toplevel</code> attribute.</p>
 
