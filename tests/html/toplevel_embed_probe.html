@@ -1,0 +1,138 @@
+<!doctype html>
+<!--
+  Can an embedded site be a TOP-LEVEL browsing context while still being rendered by the
+  parent's display list?
+
+  An <iframe> couples two independent things:
+
+    rendering nesting  - layout emits the child pipeline inside the parent's display list
+                         (`layout/display_list/mod.rs` visit_iframe -> push_iframe with the
+                         ancestors' spatial_id + clip_chain), which is exactly WHY every CSS
+                         property applies to it: transform, border-radius, opacity, filters,
+                         scrolling, per-tile clipping on the wall.
+    context nesting    - the content becomes a *child navigable*, which is what
+                         X-Frame-Options, CSP frame-ancestors and `top !== self`
+                         frame-busting all key off.
+
+  A video wall wants the first and not the second. `<iframe toplevel>` unpicks them by
+  setting `NewPipelineInfo.parent_info = None` (see `embedding_mode` in
+  `htmliframeelement.rs`) — nothing in layout changes.
+
+  ★Do NOT pass the framing prefs★ dom_enforce_framing_policy / network_enforce_mixed_content.
+  The point is that a top-level context never reaches those checks in the first place:
+
+    target\release\examples\winit_wall.exe --wall-all-tiles ^
+      --wall-layout ..\config\wall_layout.local_2x1.json ^
+      --pref dom_iframe_toplevel_embed_enabled=true ^
+      "file:///W:/servo_multigpu-tiled-wall/tests/html/toplevel_embed_probe.html"
+
+  Stderr should carry one `[toplevel-embed] ...` line per treatment frame.
+
+  HOW TO READ IT — the two columns load the SAME url with the SAME CSS on the box:
+
+    LEFT  (control)   plain <iframe>          expected: BLOCKED (Servo error page)
+    RIGHT (treatment) <iframe toplevel>       expected: the site renders
+
+  and both boxes carry rotate + border-radius + opacity, so the treatment column also
+  answers the question that motivated the spike: does a top-level embed still get the
+  full CSS treatment, or does it come out a plain upright rectangle?
+
+    PASS = right column shows the site, rotated, with rounded corners, semi-transparent,
+           and clipped to the rounded box. Wall: it also splits correctly across the seam.
+    FAIL = right column blank/error (context change broke rendering), or it renders but
+           upright / square-cornered / fully opaque (CSS did not follow).
+
+  ★Backgrounds are LIGHT on purpose.★ Servo's built-in error page ships no CSS, so its
+  canvas stays transparent and its text is black; on a dark box a blocked load draws
+  black-on-black and reads as "nothing rendered at all".
+-->
+<html lang="en"><head><meta charset="utf-8"><title>toplevel embed spike</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; min-height: 100%; background: #0b0d12;
+               font-family: system-ui, "Segoe UI", sans-serif; color: #e8e8f0; }
+  body { padding: 28px 40px 60px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { font-size: 15px; color: #9aa; margin: 0 0 28px; }
+  .sub code { color: #c56cf0; }
+
+  /* ★flex, not grid★ — Servo gates CSS Grid behind `layout_grid_enabled`, which defaults
+     to false (`components/config/prefs.rs`). A `display: grid` here silently falls back to
+     block layout and the two columns stack vertically instead of sitting side by side. */
+  .cols { display: flex; gap: 90px; align-items: flex-start; }
+  .col { flex: 1 1 0; min-width: 0; }
+  .col > h2 { font-size: 19px; margin: 0 0 2px; }
+  .col > .what { font-size: 14px; color: #9aa; margin: 0 0 34px; min-height: 40px; }
+  .col.control > h2 { color: #ff9f45; }
+  .col.treatment > h2 { color: #2ecc71; }
+
+  /* The CSS under test. Identical on both columns — the only difference between them is
+     the `toplevel` attribute, so anything that differs visually is caused by that alone. */
+  /* 중첩 클립까지 확인한다 — 조상의 overflow 클립이 임베드된 사이트에도 걸려야
+     한다. 걸리지 않으면 사이트가 이 상자 밖으로 삐져나온다. */
+  .stage { display: flex; justify-content: center; padding: 60px 0;
+           overflow: hidden; border: 1px dashed #444a5e; border-radius: 12px; }
+  iframe.under-test {
+    width: 620px; height: 420px; border: 3px solid #c56cf0; background: #f4f4f8;
+    transform: rotate(-6deg) scale(0.96);
+    border-radius: 28px;
+    opacity: 0.85;
+    box-shadow: 0 18px 60px rgba(0,0,0,.55);
+  }
+
+  .legend { margin-top: 40px; font-size: 14px; color: #9aa; line-height: 1.7; }
+  .legend b { color: #e8e8f0; }
+  .tick { font-family: monospace; color: #e6c8ff; }
+</style></head>
+<body>
+  <h1>top-level embed spike</h1>
+  <p class="sub">Same URL, same CSS on the box. The only difference is the
+     <code>toplevel</code> attribute.</p>
+
+  <div class="cols">
+    <section class="col control">
+      <h2>control — plain &lt;iframe&gt;</h2>
+      <p class="what">A child navigable. X-Frame-Options applies, so a site that sends
+         <code>DENY</code> is expected to be blocked.</p>
+      <div class="stage">
+        <iframe class="under-test" id="control" title="control frame"></iframe>
+      </div>
+    </section>
+
+    <section class="col treatment">
+      <h2>treatment — &lt;iframe toplevel&gt;</h2>
+      <p class="what">Rendered identically, but the content is a top-level browsing
+         context, so those checks are never reached.</p>
+      <div class="stage">
+        <iframe class="under-test" id="treatment" toplevel title="treatment frame"></iframe>
+      </div>
+    </section>
+  </div>
+
+  <p class="legend">
+    <b>PASS</b> = right shows the site, <b>rotated</b>, <b>round-cornered</b> and
+    <b>semi-transparent</b> — i.e. the CSS followed it.<br>
+    <b>FAIL (rendering)</b> = right is blank or an error page.<br>
+    <b>FAIL (CSS)</b> = right shows the site but upright / square / fully opaque.<br>
+    live: <span class="tick" id="tick">0</span>s
+  </p>
+
+  <script>
+    // The URL under test. Both columns get the same one; naver.com sends X-Frame-Options
+    // DENY, so the control column is the proof that the policy is genuinely in force.
+    const URL_UNDER_TEST = "https://www.naver.com";
+
+    const clog = (m) => console.log("[toplevel-embed-page] " + m);
+    for (const id of ["control", "treatment"]) {
+      const frame = document.getElementById(id);
+      frame.addEventListener("load", () => clog(id + ": load event fired"));
+      frame.src = URL_UNDER_TEST;
+    }
+    clog("both frames pointed at " + URL_UNDER_TEST);
+
+    // Liveness, so a frozen wall is distinguishable from a slow load.
+    let t = 0;
+    const tick = document.getElementById("tick");
+    setInterval(() => { tick.textContent = ++t; }, 1000);
+  </script>
+</body></html>
