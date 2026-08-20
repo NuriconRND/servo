@@ -485,6 +485,12 @@ pub struct IFrameLoadInfo {
     /// A snapshot of the navigation-related parameters of the target
     /// of this navigation.
     pub target_snapshot_params: TargetSnapshotParams,
+    /// 이 iframe 의 내용을 child navigable 로 만들 것인가. `<iframe toplevel>` 이고
+    /// `dom_iframe_toplevel_embed_enabled` 가 켜져 있을 때만 `TopLevelEmbed` 다.
+    /// constellation 은 이 값을 **browsing context 생성 시 1회** 읽어
+    /// `BrowsingContext::embedding_mode` 에 저장하고, 이후 내비게이션은 그 저장값을
+    /// 쓴다 — 재로드처럼 이 메시지를 싣지 않는 경로에서도 일관되게 하려는 것이다.
+    pub embedding_mode: EmbeddingMode,
 }
 
 /// Specifies the information required to load a URL in an iframe.
