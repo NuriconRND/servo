@@ -1,0 +1,208 @@
+<!doctype html>
+<!--
+  RTSP move-residual probe — does a *moving* video element leave its old frame behind?
+
+  Reported: on an output page whose layout is driven live from elsewhere, dragging an
+  rtsp:// <video> around leaves a ghost that appears and disappears repeatedly. Chrome does
+  not do this; winit_wall does.
+
+  ★The reporter's setup is NOT driven by mouse input into winit_wall★ — the output page's
+  layout is updated from outside. So this probe does not need (and must not rely on) input:
+  `winit_wall` has no input coordinate remapping at all, and clicks never land where you
+  think. The element is moved from script on a timer, which reproduces what the real output
+  page does when its layout is pushed to it.
+
+  ★MEASURED, so do not re-derive it: the video is NOT promoted to its own DirectComposition
+  surface under the project's standard flag set.★ A `SERVO_DCOMP_DEBUG=1` run (which needs
+  `RUST_LOG=paint=info` — the lines are `log::info!` and the crate's lib name is `paint`)
+  shows two surfaces created and only the opaque full-viewport one ever composited; no
+  `add_external_surface` line at all. So "the video overlay lags the page by a frame" is
+  ruled out, and the remaining place a stale frame can survive is the page content
+  swap-chain's partial present. See
+  `docs/multigpu/rtsp_live_stream_teardown_and_move_residual.md`.
+
+  The motion is deliberately shaped to make that visible:
+    phase 1 (0-15s)   lissajous sweep across the   — a lagging surface smears; crossing the
+                      middle of the viewport         middle is what exercises a picture-cache
+                                                     tile boundary (see phase 1 comment)
+    phase 2 (15-20s)  large jumps every 500ms      — a lagging surface shows a full copy
+                                                     at the previous position
+    phase 3 (20-30s)  small 1px-per-frame nudges   — worst case for snapping logic
+
+  ★TRAIL MARKERS★ Each position the video has occupied leaves a thin outlined box behind.
+  A ghost lands inside one of those outlines, which tells you *which* previous position it
+  came from — a screenshot alone cannot tell you that.
+
+  Observe with a desktop screenshot, NOT `--capture`: with `gfx_dcomp_mode=surface` the
+  framebuffer readback comes back solid white (measured: mean 255, sd 0), because WebRender
+  is drawing into DComp surfaces rather than the default framebuffer. That white PNG is a
+  useful signal in its own right — it confirms the DComp path is actually engaged.
+
+  Run with the project's standard flag set plus:
+      --wall-layout ..\config\wall_layout.local_1x1.json
+      "file:///W:/servo_multigpu-tiled-wall/tests/html/rtsp_move_residual_probe.html?src=rtsp://user:pass@host:port"
+-->
+<html lang="en"><head><meta charset="utf-8"><title>rtsp move residual probe</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden;
+               background: #0b0d12; font-family: system-ui, "Segoe UI", sans-serif;
+               color: #e8e8f0; }
+
+  /* A flat, very dark field. Any leftover video frame is high-contrast against it, which
+     is what makes an automated brightness check able to spot a ghost. */
+  #field { position: absolute; inset: 0; background: #0b0d12; }
+
+  /* The moving video. `position: absolute` + left/top is what the real output page does
+     when its layout is pushed from outside. */
+  #vid { position: absolute; width: 480px; height: 270px; background: #f4f4f8;
+         border: 2px solid #c56cf0; }
+
+  /* Where the video has already been. Outline only, so it never adds brightness itself. */
+  .trail { position: absolute; width: 480px; height: 270px; border: 1px solid #2a3350;
+           pointer-events: none; }
+
+  header { position: absolute; left: 20px; top: 14px; z-index: 5; }
+  header h1 { font-size: 20px; margin: 0 0 2px; }
+  header .phase { font-family: monospace; font-size: 16px; color: #ffd93b; }
+  header .hint { font-size: 13px; color: #6f7690; margin-top: 2px; }
+</style></head>
+<body>
+  <div id="field"></div>
+  <header>
+    <h1>rtsp move residual probe</h1>
+    <div class="phase" id="phase">starting…</div>
+    <div class="hint">thin outlines mark previous positions — a ghost lands inside one</div>
+  </header>
+
+  <script>
+    // ★No camera URL is committed here★ — the real ones carry credentials. Pass the
+    // stream as `?src=rtsp://user:pass@host:port`. Any playable src works; a live stream
+    // is preferred because a still frame cannot show whether a ghost is stale or current.
+    const RTSP_URL = new URLSearchParams(location.search).get("src");
+
+    const field = document.getElementById("field");
+    const phaseEl = document.getElementById("phase");
+
+    const W = 480, H = 270;
+    const MIN_X = 40, MAX_X = () => Math.max(MIN_X, window.innerWidth - W - 40);
+    const MIN_Y = 120, MAX_Y = () => Math.max(MIN_Y, window.innerHeight - H - 40);
+
+    if (!RTSP_URL) {
+      phaseEl.textContent = "no ?src= given — append ?src=rtsp://user:pass@host:port";
+      throw new Error("rtsp_move_residual_probe: missing ?src=");
+    }
+
+    const t0 = performance.now();
+    const secs = () => (performance.now() - t0) / 1000;
+
+    const video = document.createElement("video");
+    video.id = "vid";
+    video.autoplay = true;
+    video.muted = true;
+    video.setAttribute("playsinline", "");
+    video.src = RTSP_URL;
+    field.append(video);
+
+    // ★How the element is moved changes which engine path is exercised.★ `left/top` is a
+    // layout change; `transform: translate()` is a transform change that WebRender can
+    // treat as an animated property and hand to the compositor differently — and a real
+    // output page whose layout is pushed from a control page may well use either. Pick
+    // with `?move=transform` (default `left`).
+    const MOVE_MODE = new URLSearchParams(location.search).get("move") || "left";
+
+    // `?resize=1` also breathes the element's size while it moves. A swap-chain is
+    // recreated when its surface footprint changes enough, and the compositor deliberately
+    // keeps showing the OLD content until the next full present after such a recreate
+    // (see the regen comment in `dcomp_compositor.rs`) — a recreate mid-motion is
+    // therefore a plausible way to show a stale frame for a moment, and a control page
+    // that offers resize handles alongside drag would hit it.
+    const RESIZE = new URLSearchParams(location.search).get("resize") === "1";
+
+    // ★`?quiet=1` is not cosmetic — it changes which compositor path runs.★ WebRender gives
+    // the compositor ONE dirty rect per picture-cache tile: the union of that tile's
+    // invalidations. With the phase readout repainting every frame in the top-left corner,
+    // that union is (corner ∪ old video ∪ new video) ≈ the whole tile, and a full-tile
+    // dirty means partial present has nothing to leave behind. Measured: every bind on
+    // this machine reported a full-tile dirty. Quiet mode stops the per-frame text so the
+    // union collapses to (old ∪ new video) — the only shape under which a partial present
+    // can strand old pixels.
+    const QUIET = new URLSearchParams(location.search).get("quiet") === "1";
+    const setPhase = (text) => { if (!QUIET) phaseEl.textContent = text; };
+    if (QUIET) phaseEl.textContent = "quiet mode — no per-frame repaint outside the video";
+
+    let x = MIN_X, y = MIN_Y;
+    const place = (nx, ny) => {
+      x = nx; y = ny;
+      if (RESIZE) {
+        const k = 0.65 + 0.35 * Math.abs(Math.sin(secs() * 0.9));
+        video.style.width = Math.round(W * k) + "px";
+        video.style.height = Math.round(H * k) + "px";
+      }
+      if (MOVE_MODE === "transform") {
+        video.style.transform = "translate(" + x + "px," + y + "px)";
+      } else {
+        video.style.left = x + "px";
+        video.style.top = y + "px";
+      }
+    };
+    place(MIN_X, MIN_Y);
+
+    // Leave an outline at a position we are leaving, so a ghost can be attributed to it.
+    let trailCount = 0;
+    function markTrail(px, py) {
+      if (trailCount > 60) return;   // keep the field from filling up with outlines
+      trailCount++;
+      const d = document.createElement("div");
+      d.className = "trail";
+      d.style.left = px + "px";
+      d.style.top = py + "px";
+      field.append(d);
+    }
+
+    let lastJump = 0, dir = 1;
+
+    function frame() {
+      const t = secs();
+
+      if (t < 15) {
+        // Phase 1: a Lissajous sweep, NOT a horizontal one. The two frequencies are
+        // deliberately incommensurate so the box keeps re-crossing the middle of the
+        // viewport from different angles.
+        //
+        // ★Crossing the middle is the point.★ A picture-cache tile boundary sits every
+        // `gfx_wr_picture_tile_size` pixels, so on the reporter's 3840x2160 tile with the
+        // standard 1920x1080 setting the boundary runs straight through the centre of the
+        // screen — right where a user drags. A sweep that stays inside one tile (the
+        // earlier horizontal version did) can never exercise the boundary case.
+        setPhase("t=" + t.toFixed(1) + "s  phase 1: lissajous sweep");
+        const cx = (MIN_X + MAX_X()) / 2, cy = (MIN_Y + MAX_Y()) / 2;
+        const ax = (MAX_X() - MIN_X) / 2, ay = (MAX_Y() - MIN_Y) / 2;
+        place(cx + ax * Math.sin(t * 1.7), cy + ay * Math.sin(t * 1.1 + 0.7));
+      } else if (t < 20) {
+        // Phase 2: big jumps. A lagging surface paints a whole copy at the old spot.
+        setPhase("t=" + t.toFixed(1) + "s  phase 2: 500ms jumps");
+        if (t - lastJump >= 0.5) {
+          lastJump = t;
+          markTrail(x, y);
+          const nx = MIN_X + Math.random() * (MAX_X() - MIN_X);
+          const ny = MIN_Y + Math.random() * (MAX_Y() - MIN_Y);
+          place(nx, ny);
+        }
+      } else if (t < 30) {
+        // Phase 3: 1px nudges. Worst case for any snap-to-integer or damage-rect logic.
+        setPhase("t=" + t.toFixed(1) + "s  phase 3: 1px nudges");
+        if (x >= MAX_X()) dir = -1;
+        if (x <= MIN_X) dir = 1;
+        place(x + dir, MIN_Y + 400);
+      } else {
+        // Park it, so a late screenshot separates a *moving* ghost from a stuck one.
+        setPhase("t=" + t.toFixed(1) + "s  parked (bottom-right)");
+        place(MAX_X(), MAX_Y());
+      }
+
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body></html>
