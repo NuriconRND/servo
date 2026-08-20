@@ -1756,7 +1756,20 @@ impl GStreamerPlayer {
         };
 
         let result = receiver.recv().unwrap();
-        glib::signal::signal_handler_disconnect(&inner.lock().unwrap().player, error_handler_id);
+        // ★Disconnect from the object the handler was connected to★ — `error_handler_id`
+        // came from `signal_adapter.connect_error(...)`, and a `PlaySignalAdapter` is a
+        // different GObject from the `Play` it adapts. Disconnecting it from `player` did
+        // nothing but emit
+        //     GLib-GObject-CRITICAL: instance '0x...' has no handler with id 'N'
+        // once per player created, and left this setup-time handler connected for the life
+        // of the pipeline. That matters: its closure calls `signal_adapter.play().stop()`,
+        // so every later error permanently stopped playback instead of letting the element
+        // recover — turning any transient error (an RTSP stream is full of them) into a
+        // dead video.
+        glib::signal::signal_handler_disconnect(
+            &inner.lock().unwrap()._signal_adapter,
+            error_handler_id,
+        );
         result
     }
 }
