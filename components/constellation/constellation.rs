@@ -160,7 +160,8 @@ use servo_canvas_traits::webgl::WebGLThreads;
 use servo_config::{opts, pref};
 use servo_constellation_traits::{
     AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse, ConstellationInterest,
-    DocumentState, EmbedderToConstellationMessage, IFrameLoadInfo, IFrameLoadInfoWithData,
+    DocumentState, EmbeddingMode, EmbedderToConstellationMessage, IFrameLoadInfo,
+    IFrameLoadInfoWithData,
     IFrameSizeMsg, LoadData, LogEntry, MessagePortMsg, NavigationHistoryBehavior, PaintMetricEvent,
     PortMessageTask, PortTransferInfo, RemoteFocusOperation, SWManagerSenders,
     ScreenshotReadinessResponse, ScriptToConstellationMessage, ScrollStateUpdate,
@@ -1152,6 +1153,7 @@ where
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         parent_pipeline_id: Option<PipelineId>,
+        embedding_mode: EmbeddingMode,
         viewport_details: ViewportDetails,
         is_private: bool,
         inherited_secure_context: Option<bool>,
@@ -1191,6 +1193,7 @@ where
             webview_id,
             pipeline_id,
             parent_pipeline_id,
+            embedding_mode,
             viewport_details,
             is_private,
             inherited_secure_context,
@@ -3317,6 +3320,7 @@ where
             replace: None,
             new_browsing_context_info: Some(NewBrowsingContextInfo {
                 parent_pipeline_id: None,
+                embedding_mode: EmbeddingMode::Nested,
                 is_private,
                 inherited_secure_context: None,
                 throttled,
@@ -3549,6 +3553,7 @@ where
             browsing_context_id,
             webview_id,
             is_private,
+            embedding_mode,
             ..
         } = load_info.info;
 
@@ -3594,6 +3599,7 @@ where
             // Browsing context for iframe doesn't exist yet.
             new_browsing_context_info: Some(NewBrowsingContextInfo {
                 parent_pipeline_id: Some(parent_pipeline_id),
+                embedding_mode,
                 is_private,
                 inherited_secure_context: is_parent_secure,
                 throttled: is_parent_throttled,
@@ -3701,6 +3707,7 @@ where
             new_browsing_context_info: Some(NewBrowsingContextInfo {
                 // Auxiliary browsing contexts are always top-level.
                 parent_pipeline_id: None,
+                embedding_mode: EmbeddingMode::Nested,
                 is_private: is_opener_private,
                 inherited_secure_context: is_opener_secure,
                 throttled: is_opener_throttled,
@@ -5001,6 +5008,7 @@ where
                     change.webview_id,
                     change.new_pipeline_id,
                     new_context_info.parent_pipeline_id,
+                    new_context_info.embedding_mode,
                     change.viewport_details,
                     new_context_info.is_private,
                     new_context_info.inherited_secure_context,
