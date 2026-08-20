@@ -133,7 +133,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 줄 것이 없으므로, 셸 수준에서 명시적으로 끌 수 있게 했다 — `--ignore-certificate-errors`
 와 같은 성격의 노브다.
 
-**끄고도 안 되는 것 세 가지** (이 pref 로는 풀리지 않는다):
+**앞의 두 pref 로 끄고도 안 되는 것 세 가지**:
 
 1. **JS frame-busting** — `if (top !== self) top.location = self.location` 은 헤더가 아니라
    스크립트다. iframe 에 `sandbox="allow-scripts allow-same-origin"`(top-navigation 토큰
@@ -141,6 +141,13 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 2. **로그인 세션** — 쿠키가 `SameSite=Lax` 면 서드파티 프레임에 안 붙는다. 로그인이 필요한
    대시보드는 이 경로로 못 띄운다.
 3. **반응형 붕괴 / Servo 웹호환성** — 정책이 아니라 별개 문제로 그대로 남는다.
+
+**`toplevel` 은 이 셋을 어떻게 바꾸는가.** frame-busting(항목 1)은 `toplevel` 을 쓰면
+임베드된 문서에서 `top === self` 라 그 스크립트 자체가 발동하지 않는다 — 항목 1 은
+`toplevel` 에는 해당하지 않는다. 로그인 세션(항목 2)은 임베드된 문서가 스스로 top-level
+이므로 서드파티 프레임이라는 전제가 사라진다. ★다만 이 포크에서 실측하지 않았다★ —
+쿠키가 실제로 붙는지는 확인이 필요하다. 반응형 붕괴 / Servo 웹호환성(항목 3)은
+`toplevel` 로도 그대로 남는다.
 
 **차단 사유가 안 보이는 함정.** Servo 내장 에러 페이지(`neterror.html`)는 CSS 가 한 줄도
 없어 캔버스가 transparent 로 남고(`layout/display_list/mod.rs` 가 투명 루트 배경에서 조기
