@@ -147,6 +147,54 @@ fn log_pipeline_element_added(element: &gstreamer::Element) {
 // pool, which is what lets many <video> tiles decode at once without saturating CPU
 // scheduling (FPS jitter) or memory. `-1`(기본값) leaves the decoder at its automatic thread
 // count so single-video/4K playback is unchanged.
+/// Tune the RTSP elements that playbin3 auto-plugs for an `rtsp://` URI.
+///
+/// We hand playbin3 nothing but the URI, so every RTSP element arrives with GStreamer's
+/// defaults. Two of those defaults matter enough to expose:
+///
+///   - `rtspsrc latency` defaults to **2000 ms**, and that jitter buffer is what dominates
+///     time-to-first-frame. Measured against the in-house camera with `gst-launch`: 2.02s at
+///     the default, 0.76s at `latency=0`, 0.73s at `latency=200`. Hand-assembling the whole
+///     pipeline instead of using playbin3 was worth only 0.24s by comparison — the lever is
+///     this property, not the pipeline's shape.
+///   - `rtph264depay wait-for-keyframe` defaults to **false**, so the depayloader will emit
+///     slices from mid-GOP. When those reach `h264parse` before the parameter sets do, it
+///     fails with `Could not decode stream. No caps set` and the element stalls for good
+///     (there is no retry path). That is the intermittent RTSP failure.
+///
+/// ★These two pull in opposite directions★ — shrinking the jitter buffer makes it *more*
+/// likely that slices outrun the parameter sets. Both are therefore off by default (`-1` /
+/// `false` = leave GStreamer's value alone), so this function is a no-op unless an operator
+/// opts in, and the two are meant to be evaluated together rather than one at a time.
+///
+/// `eprintln!` rather than `log::debug!` on purpose: the in-house GStreamer build caps its
+/// own debug output at WARNING, so `GST_DEBUG=rtspsrc:5` yields nothing and our own stderr is
+/// the only way to see what was applied.
+fn configure_rtsp_elements(element: &gstreamer::Element) {
+    let Some(factory) = element.factory() else {
+        return;
+    };
+    match factory.name().as_str() {
+        "rtspsrc" => {
+            let latency_ms = pref!(media_rtsp_latency_ms);
+            if latency_ms < 0 {
+                return;
+            }
+            let latency_ms = u32::try_from(latency_ms).unwrap_or(u32::MAX);
+            element.set_property("latency", latency_ms);
+            eprintln!("[RTSP-DIAG] rtspsrc: latency set to {latency_ms}ms");
+        },
+        "rtph264depay" => {
+            if !pref!(media_rtsp_wait_for_keyframe) {
+                return;
+            }
+            element.set_property("wait-for-keyframe", true);
+            eprintln!("[RTSP-DIAG] rtph264depay: wait-for-keyframe set to true");
+        },
+        _ => {},
+    }
+}
+
 fn configure_software_decoder_threads(element: &gstreamer::Element) {
     let Some(factory) = element.factory() else {
         return;
@@ -1092,6 +1140,7 @@ impl GStreamerPlayer {
             if let Ok(element) = args[2].get::<gstreamer::Element>() {
                 log_pipeline_element_added(&element);
                 configure_software_decoder_threads(&element);
+                configure_rtsp_elements(&element);
             }
             None
         });

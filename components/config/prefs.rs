@@ -454,6 +454,25 @@ pub struct Preferences {
     /// 동일 — 디코더를 건드리지 않는다). `0` 이상이면 그 값으로 캡한다(구
     /// `parse::<i32>() >= 0` 검증 그대로).
     pub media_avdec_max_threads: i64,
+    /// `rtspsrc` 지터버퍼 크기(ms). `-1` = 미설정 — GStreamer 기본값 **2000ms** 를 그대로
+    /// 둔다(현행 동작).
+    ///
+    /// ★첫 프레임까지의 지연을 지배하는 값이다★ — 실측(`gst-launch`, 사내 카메라):
+    /// 기본값 2000 에서 첫 디코드 프레임까지 2.02s, `latency=0` 에서 0.76s, `latency=200`
+    /// 에서 0.73s 였다. 파이프라인을 손으로 조립해 얻는 이득은 0.24s 에 불과했으므로,
+    /// 지연 문제의 지렛대는 구조가 아니라 이 값이다.
+    ///
+    /// 공짜가 아니다: 줄일수록 지터 흡수를 포기하는 것이라 네트워크가 흔들리면 끊김으로
+    /// 나타나고, 파라미터 세트(SPS/PPS)보다 슬라이스가 먼저 파서에 닿을 여지도 커진다
+    /// (`media_rtsp_wait_for_keyframe` 참고).
+    pub media_rtsp_latency_ms: i64,
+    /// `rtph264depay` 의 `wait-for-keyframe`. 기본 `false` = 미설정(GStreamer 기본값과
+    /// 동일, 현행 동작).
+    ///
+    /// 켜면 깨진 지점 이후 다음 키프레임까지 출력을 미룬다. RTSP 를 스트림 중간(mid-GOP)에
+    /// 붙었을 때 `h264parse` 가 파라미터 세트 없이 슬라이스를 받아
+    /// `Could not decode stream. No caps set` 로 죽는 간헐 실패를 겨냥한 노브다.
+    pub media_rtsp_wait_for_keyframe: bool,
     /// GStreamer 오디오 트랙 활성화. **의미가 뒤집힌 pref다** — 구 env는
     /// `SERVO_GSTREAMER_DISABLE_AUDIO`(끄는 스위치, truthy 판정)였고 이 pref는 켜는
     /// 스위치다. servo 관례가 `*_enabled` 긍정형이고 이중부정은 실수의 단골 자리라
@@ -725,6 +744,8 @@ impl Preferences {
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,
             media_avdec_max_threads: -1,
+            media_rtsp_latency_ms: -1,
+            media_rtsp_wait_for_keyframe: false,
             media_audio_enabled: true,
             media_video_decoder_policy: String::new(),
             media_video_sink_policy: String::new(),
