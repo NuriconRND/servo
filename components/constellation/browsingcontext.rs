@@ -6,6 +6,7 @@ use embedder_traits::ViewportDetails;
 use log::warn;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::{BrowsingContextGroupId, BrowsingContextId, PipelineId, WebViewId};
+use servo_constellation_traits::EmbeddingMode;
 
 use crate::pipeline::Pipeline;
 
@@ -17,9 +18,15 @@ use crate::pipeline::Pipeline;
 /// context are stored here so that they may be available later.
 #[derive(Debug)]
 pub struct NewBrowsingContextInfo {
-    /// The parent pipeline that contains this browsing context. `None` if this
-    /// is a top level browsing context.
+    /// 이 browsing context 를 담고 있는 **표출** 부모 파이프라인 — 누가 나를
+    /// 레이아웃하고 크기를 정하고 렌더하고 정리하는가. 진짜 최상위면 `None`.
+    ///
+    /// ★`<iframe toplevel>` 에서도 이 값은 `Some` 이다.★ 문서에게 알려줄 *navigable*
+    /// 부모는 `embedding_mode` 와 함께 `navigable_parent()` 로 따로 구한다.
     pub parent_pipeline_id: Option<PipelineId>,
+
+    /// 이 browsing context 의 내용이 child navigable 인지 여부.
+    pub embedding_mode: EmbeddingMode,
 
     /// Whether this browsing context is in private browsing mode.
     pub is_private: bool,
@@ -64,9 +71,15 @@ pub struct BrowsingContext {
     /// The pipeline for the current session history entry.
     pub pipeline_id: PipelineId,
 
-    /// The parent pipeline that contains this browsing context. `None` if this
-    /// is a top level browsing context.
+    /// 이 browsing context 를 담고 있는 **표출** 부모 파이프라인. 진짜 최상위면 `None`.
+    ///
+    /// ★`<iframe toplevel>` 에서도 `Some` 이다★ — navigable 부모는
+    /// `navigable_parent(self.embedding_mode, self.parent_pipeline_id)` 로 구한다.
     pub parent_pipeline_id: Option<PipelineId>,
+
+    /// 이 browsing context 의 내용이 child navigable 인지 여부. 생성 시 확정되고
+    /// 이후 바뀌지 않는다.
+    pub embedding_mode: EmbeddingMode,
 
     /// All the pipelines that have been presented or will be presented in
     /// this browsing context.
@@ -83,6 +96,7 @@ impl BrowsingContext {
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         parent_pipeline_id: Option<PipelineId>,
+        embedding_mode: EmbeddingMode,
         viewport_details: ViewportDetails,
         is_private: bool,
         inherited_secure_context: Option<bool>,
@@ -100,6 +114,7 @@ impl BrowsingContext {
             throttled,
             pipeline_id,
             parent_pipeline_id,
+            embedding_mode,
             pipelines,
         }
     }

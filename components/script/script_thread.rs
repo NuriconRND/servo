@@ -3071,6 +3071,11 @@ impl ScriptThread {
             &window,
             browsing_context_id,
             webview_id,
+            // Not consumed today: `local_window_proxy`'s first line early-returns
+            // whenever a proxy already exists for `browsing_context_id`, which it
+            // always does here (see the opener comment below). If that ever
+            // changes, this needs to go through `navigable_parent` first, the same
+            // way every other producer of `parent_info` does.
             Some(parent_pipeline_id),
             // Any local window proxy has already been created, so there
             // is no need to pass along existing opener information that

@@ -390,6 +390,12 @@ fn wr_picture_tile_size_defaults_to_no_override() {
 }
 
 #[test]
+fn toplevel_embed_defaults_to_off() {
+    // 이 기능의 유일한 방어선이 기본값이다. 지금 그것을 지키는 것이 아무것도 없다.
+    assert!(!servo_config::prefs::Preferences::const_default().dom_iframe_toplevel_embed_enabled);
+}
+
+#[test]
 fn disable_audio_is_inverted_into_a_positive_pref() {
     let defaults = servo_config::prefs::Preferences::const_default();
     // SERVO_GSTREAMER_DISABLE_AUDIO 는 부정형이었다. servo 관례가 *_enabled

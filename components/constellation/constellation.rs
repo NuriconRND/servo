@@ -160,13 +160,14 @@ use servo_canvas_traits::webgl::WebGLThreads;
 use servo_config::{opts, pref};
 use servo_constellation_traits::{
     AuxiliaryWebViewCreationRequest, AuxiliaryWebViewCreationResponse, ConstellationInterest,
-    DocumentState, EmbedderToConstellationMessage, IFrameLoadInfo, IFrameLoadInfoWithData,
+    DocumentState, EmbedderToConstellationMessage, EmbeddingMode, IFrameLoadInfo,
+    IFrameLoadInfoWithData,
     IFrameSizeMsg, LoadData, LogEntry, MessagePortMsg, NavigationHistoryBehavior, PaintMetricEvent,
     PortMessageTask, PortTransferInfo, RemoteFocusOperation, SWManagerSenders,
     ScreenshotReadinessResponse, ScriptToConstellationMessage, ScrollStateUpdate,
     ServiceWorkerAlgorithm, ServiceWorkerManagerFactory, ServiceWorkerMsg,
     StructuredSerializedData, TargetSnapshotParams, TraversalDirection, UserContentManagerAction,
-    WindowSizeType,
+    WindowSizeType, navigable_parent,
 };
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
@@ -1152,6 +1153,7 @@ where
         webview_id: WebViewId,
         pipeline_id: PipelineId,
         parent_pipeline_id: Option<PipelineId>,
+        embedding_mode: EmbeddingMode,
         viewport_details: ViewportDetails,
         is_private: bool,
         inherited_secure_context: Option<bool>,
@@ -1191,6 +1193,7 @@ where
             webview_id,
             pipeline_id,
             parent_pipeline_id,
+            embedding_mode,
             viewport_details,
             is_private,
             inherited_secure_context,
@@ -1927,7 +1930,10 @@ where
                     .pipelines
                     .get(&pipeline_id)
                     .and_then(|pipeline| self.browsing_contexts.get(&pipeline.browsing_context_id))
-                    .map(|ctx| (ctx.id, ctx.parent_pipeline_id));
+                    // 표출 부모가 아니라 navigable 부모를 돌려준다 — 그렇지 않으면
+                    // `remote_window_proxy` 가 재귀 구성하는 부모 체인과 이 문서 자신이
+                    // 보는 부모가 TopLevelEmbed 에서 서로 어긋난다.
+                    .map(|ctx| (ctx.id, navigable_parent(ctx.embedding_mode, ctx.parent_pipeline_id)));
                 if let Err(e) = response_sender.send(result) {
                     warn!(
                         "Sending reply to get browsing context info failed ({:?}).",
@@ -3316,7 +3322,10 @@ where
             new_pipeline_id: pipeline_id,
             replace: None,
             new_browsing_context_info: Some(NewBrowsingContextInfo {
+                // 진짜 최상위 BC. `Nested` 로 적지만 `parent_pipeline_id` 가 이미
+                // `None` 이라 `navigable_parent(Nested, None) == None` 이라서 무해하다.
                 parent_pipeline_id: None,
+                embedding_mode: EmbeddingMode::Nested,
                 is_private,
                 inherited_secure_context: None,
                 throttled,
@@ -3509,6 +3518,7 @@ where
 
         let browsing_context_size = browsing_context.viewport_details;
         let browsing_context_throttled = browsing_context.throttled;
+        let embedding_mode = browsing_context.embedding_mode;
         // TODO(servo#30571) revert to debug_assert_eq!() once underlying bug is fixed
         #[cfg(debug_assertions)]
         if !(browsing_context_size == load_info.viewport_details) {
@@ -3522,7 +3532,17 @@ where
             new_pipeline_id,
             browsing_context_id,
             webview_id,
-            Some(parent_pipeline_id),
+            // ★이 인자가 NewPipelineInfo::parent_info 가 되고, script 가 그것으로
+            // WindowProxy 의 부모를 정한다 — 즉 X-Frame-Options / frame-ancestors /
+            // `top !== self` 가 성립할지를 여기서 가른다.★ 실제 사이트가 로드되는
+            // 파이프라인은 element 가 만드는 초기 about:blank 가 아니라 이것이고,
+            // 교차 출처면 부모의 script thread 도 재사용하지 않으므로, 여기를 빠뜨리면
+            // 아무리 element 쪽을 고쳐도 사이트는 계속 차단된다.
+            // 같은 값이 `new_pipeline` 안에서 `get_or_create_event_loop_for_new_pipeline`
+            // 에도 그대로 들어가 about:blank/about:srcdoc 로드의 event loop 선택까지
+            // 바뀐다. `Nested` 에서는 항등(navigable_parent(Nested, p) == p)이라 무해하지만
+            // `<iframe toplevel srcdoc>` 조합은 이 갈래를 아직 검증하지 않았다.
+            navigable_parent(embedding_mode, Some(parent_pipeline_id)),
             None,
             browsing_context_size,
             load_info.load_data,
@@ -3549,6 +3569,7 @@ where
             browsing_context_id,
             webview_id,
             is_private,
+            embedding_mode,
             ..
         } = load_info.info;
 
@@ -3586,6 +3607,15 @@ where
 
         assert!(!self.pipelines.contains_key(&new_pipeline_id));
         self.pipelines.insert(new_pipeline_id, pipeline);
+        // 심층방어: IPC 로 받은 embedding_mode 를 그대로 믿지 않는다. pref 가 꺼져
+        // 있으면 손상된 content process 가 TopLevelEmbed 를 주장해도 클램프한다 —
+        // 그러면 게이트가 유일한 생산자라는 성질이 이 크레이트 안에서 국소적으로
+        // 검증 가능해진다.
+        let embedding_mode = if pref!(dom_iframe_toplevel_embed_enabled) {
+            embedding_mode
+        } else {
+            EmbeddingMode::Nested
+        };
         self.add_pending_change(SessionHistoryChange {
             webview_id,
             browsing_context_id,
@@ -3594,6 +3624,7 @@ where
             // Browsing context for iframe doesn't exist yet.
             new_browsing_context_info: Some(NewBrowsingContextInfo {
                 parent_pipeline_id: Some(parent_pipeline_id),
+                embedding_mode,
                 is_private,
                 inherited_secure_context: is_parent_secure,
                 throttled: is_parent_throttled,
@@ -3699,8 +3730,11 @@ where
             new_pipeline_id,
             replace: None,
             new_browsing_context_info: Some(NewBrowsingContextInfo {
-                // Auxiliary browsing contexts are always top-level.
+                // Auxiliary browsing contexts are always top-level. `Nested` here is
+                // harmless: `parent_pipeline_id` is already `None`, so
+                // `navigable_parent(Nested, None) == None`.
                 parent_pipeline_id: None,
+                embedding_mode: EmbeddingMode::Nested,
                 is_private: is_opener_private,
                 inherited_secure_context: is_opener_secure,
                 throttled: is_opener_throttled,
@@ -4211,6 +4245,7 @@ where
                     webview_id,
                     old_pipeline_id,
                     parent_pipeline_id,
+                    embedding_mode,
                     viewport_details,
                     is_private,
                     throttled,
@@ -4219,6 +4254,7 @@ where
                         ctx.webview_id,
                         ctx.pipeline_id,
                         ctx.parent_pipeline_id,
+                        ctx.embedding_mode,
                         ctx.viewport_details,
                         ctx.is_private,
                         ctx.throttled,
@@ -4234,7 +4270,11 @@ where
                     new_pipeline_id,
                     browsing_context_id,
                     webview_id,
-                    parent_pipeline_id,
+                    // 재로드 경로도 navigable_parent 를 거친다 — 그렇지 않으면 이 경로만
+                    // TopLevelEmbed 문서에 표출 부모를 navigable 부모로 흘려보내
+                    // X-Frame-Options / frame-ancestors / `top !== self` 가 재로드 후
+                    // 조용히 되살아난다.
+                    navigable_parent(embedding_mode, parent_pipeline_id),
                     opener,
                     viewport_details,
                     load_data.clone(),
@@ -5001,6 +5041,7 @@ where
                     change.webview_id,
                     change.new_pipeline_id,
                     new_context_info.parent_pipeline_id,
+                    new_context_info.embedding_mode,
                     change.viewport_details,
                     new_context_info.is_private,
                     new_context_info.inherited_secure_context,

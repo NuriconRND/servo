@@ -19,9 +19,11 @@ use profile_traits::ipc as ProfiledIpc;
 use script_bindings::cell::DomRefCell;
 use script_traits::{NewPipelineInfo, UpdatePipelineIdReason};
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
+use servo_config::pref;
 use servo_constellation_traits::{
-    IFrameLoadInfo, IFrameLoadInfoWithData, LoadData, LoadOrigin, NavigationHistoryBehavior,
-    ScriptToConstellationMessage, TargetSnapshotParams,
+    EmbeddingMode, IFrameLoadInfo, IFrameLoadInfoWithData, LoadData, LoadOrigin,
+    NavigationHistoryBehavior, ScriptToConstellationMessage, TargetSnapshotParams,
+    embedding_mode_for, navigable_parent,
 };
 use servo_url::ServoUrl;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
@@ -240,6 +242,21 @@ impl HTMLIFrameElement {
             }));
     }
 
+    /// 이 iframe 이 `<iframe toplevel>` 인가 — 속성이 있고 pref 도 켜져 있는가.
+    ///
+    /// `toplevel` 은 비표준 속성이라 `local_name!` 로 못 쓰고 `LocalName::from` 을
+    /// 쓴다(같은 방식이 `servoparser/html.rs` 의 `is` 속성에도 있다).
+    ///
+    /// ★browsing context 생성 시 1회만 평가된다★ — 속성을 나중에 붙이거나 떼도
+    /// 요소가 다시 만들어질 때까지 반영되지 않는다. 살아 있는 browsing context 를
+    /// re-parent 하지 않기 위한 v1 의 의도적 제약이다.
+    fn embedding_mode(&self) -> EmbeddingMode {
+        let has_attribute = self
+            .upcast::<Element>()
+            .has_attribute(&LocalName::from("toplevel"));
+        embedding_mode_for(has_attribute, pref!(dom_iframe_toplevel_embed_enabled))
+    }
+
     fn continue_navigation(
         &self,
         cx: &mut JSContext,
@@ -272,6 +289,7 @@ impl HTMLIFrameElement {
             inherited_secure_context: load_data.inherited_secure_context,
             history_handling,
             target_snapshot_params,
+            embedding_mode: self.embedding_mode(),
         };
 
         let viewport_details = window
@@ -299,7 +317,14 @@ impl HTMLIFrameElement {
                     .unwrap();
 
                 let new_pipeline_info = NewPipelineInfo {
-                    parent_info: Some(window.pipeline_id()),
+                    // 이 파이프라인은 constellation 이 아니라 여기서 만들므로, 아직
+                    // BrowsingContext 가 없어 자기 판정을 쓴다. 실제 사이트가 로드되는
+                    // 두 번째 파이프라인은 constellation 이 만들고 저장된
+                    // `embedding_mode` 를 쓴다 — 둘 다 `navigable_parent` 를 거친다.
+                    parent_info: navigable_parent(
+                        self.embedding_mode(),
+                        Some(window.pipeline_id()),
+                    ),
                     new_pipeline_id,
                     browsing_context_id,
                     webview_id,

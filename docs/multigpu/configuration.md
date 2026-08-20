@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 22 + 조사용 env 15)
+# 설정 노브 전량 (pref 23 + 조사용 env 15)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -64,12 +64,12 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 22 개
+## pref 23 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
 
 앞의 20 개는 옛 환경변수를 옮겨 온 것이고(위 마이그레이션 표), 마지막
-`### 표출용 웹 보안 완화` 두 개는 옮겨 온 것이 아니라 **새로 추가한 것**이라 옛 이름이
+`### 표출용 웹 보안 완화` 세 개는 옮겨 온 것이 아니라 **새로 추가한 것**이라 옛 이름이
 없다.
 
 ### `gfx_*` — 컴포지터 / 표출
@@ -107,15 +107,38 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
-### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content`
+### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content` / `dom_iframe_toplevel_embed_enabled`
 
-**둘 다 기본이 `true`(= 표준 동작)** 이다. 끄는 것은 월 표출 전용 탈출구이고, 일반
-브라우징용으로 끄면 안 된다.
+**앞의 둘은 기본이 `true`(= 표준 동작)** 이다. 끄는 것은 월 표출 전용 탈출구이고, 일반
+브라우징용으로 끄면 안 된다. 세 번째(`dom_iframe_toplevel_embed_enabled`)는 기본이
+`false` 다.
 
 | pref | 타입 | 기본값 | 설명 |
 |---|---|---|---|
 | `dom_enforce_framing_policy` | bool | **`true`** | 사이트가 선언한 프레이밍 정책(`X-Frame-Options`, CSP `frame-ancestors`)을 **자식 navigable(iframe)** 내비게이션에서 강제한다. `=false` 면 두 검사를 건너뛴다. 최상위 내비게이션은 원래 이 경로로 막히지 않으므로(`xframeoptions.rs` Step 1) 영향이 없다. |
 | `network_enforce_mixed_content` | bool | **`true`** | secure context 에서 비-secure 하위 리소스(mixed content)를 차단한다. `=false` 면 `file://` 부모 페이지의 iframe 이 `http://` 대상을 열 수 있다. |
+| `dom_iframe_toplevel_embed_enabled` | bool | `false` | `<iframe toplevel>` 을 인정한다. 그 속성이 붙은 iframe 은 부모의 박스 안에서 그대로 렌더되면서(모든 CSS 적용) 내용만 top-level browsing context 가 되어, `X-Frame-Options`/`frame-ancestors`/frame-busting 이 **성립하지 않는다**. 꺼져 있으면 속성은 완전히 무시된다. |
+
+**★위험★**
+
+- 설계상 **스푸핑을 허용**한다. 사설망 표출 전용 키오스크 전제에서만 켠다.
+- v1 은 입력 라우팅이 없어 클릭재킹은 성립하지 않지만, **입력을 얹으면 되살아난다.**
+- **게이트가 문서 단위가 아니라 프로세스 전역**이다. `toplevel` 로 띄운 외부 사이트가 자기
+  안에 또 `<iframe toplevel>` 을 쓸 수 있다. "운용자가 작성한 월 레이아웃 HTML만 이 속성을
+  쓴다"는 전제는 코드에 없다.
+- **임베드된 사이트가 월 창의 제목과 로드 상태를 가져간다.** 임베드 문서는 `is_top_level()`
+  이 true 가 되어 `ChangePageTitle` / `NotifyLoadStatusChanged` 를 **월 WebView 의 id 로**
+  보낸다(`components/script/dom/document/document.rs` 의 세 지점). servoshell 에서는 창
+  제목이 외부 사이트 제목으로 바뀐다. 즉 스푸핑 표면이 *우리 UI 안의 남의 사이트* 를 넘어
+  **브라우저 크롬 자체** 까지 닿는다.
+
+**앞의 두 pref 와의 관계.** `<iframe toplevel>` 을 쓰면 `dom_enforce_framing_policy` 와
+`network_enforce_mixed_content` 는 **필요 없다.** 앞의 둘은 검사를 *끄는* 것이고,
+`toplevel` 은 애초에 그 검사에 *도달하지 않는* 것이다. 평범한 iframe 을 그대로 쓰면서
+정책만 무르게 하고 싶을 때 앞의 둘을 쓴다.
+
+**★`toplevel` 이 풀어주지 않는 것★** — 부모 페이지와 임베드된 사이트는 **서로 통신할 수
+없다**(부모가 없으므로 `postMessage` 상대가 없다). 입력·포커스·history 는 v1 비범위다.
 
 **왜 필요한가.** 월에 "우리 레이아웃 HTML + 그 안의 iframe 으로 외부 사이트" 를 띄우려는
 시도는 상용 사이트 대부분이 `XFO: DENY` 라 성립하지 않는다(naver.com·iana.org 실측; Chrome
@@ -123,7 +146,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 줄 것이 없으므로, 셸 수준에서 명시적으로 끌 수 있게 했다 — `--ignore-certificate-errors`
 와 같은 성격의 노브다.
 
-**끄고도 안 되는 것 세 가지** (이 pref 로는 풀리지 않는다):
+**앞의 두 pref 로 끄고도 안 되는 것 세 가지**:
 
 1. **JS frame-busting** — `if (top !== self) top.location = self.location` 은 헤더가 아니라
    스크립트다. iframe 에 `sandbox="allow-scripts allow-same-origin"`(top-navigation 토큰
@@ -131,6 +154,18 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 2. **로그인 세션** — 쿠키가 `SameSite=Lax` 면 서드파티 프레임에 안 붙는다. 로그인이 필요한
    대시보드는 이 경로로 못 띄운다.
 3. **반응형 붕괴 / Servo 웹호환성** — 정책이 아니라 별개 문제로 그대로 남는다.
+
+**`toplevel` 은 이 셋을 어떻게 바꾸는가.** frame-busting(항목 1)은 `toplevel` 을 쓰면
+임베드된 문서에서 `top === self` 라 그 스크립트 자체가 발동하지 않는다 — 항목 1 은
+`toplevel` 에는 해당하지 않는다. 로그인 세션(항목 2)은 임베드된 문서가 스스로 top-level
+이므로 서드파티 프레임이라는 전제가 사라진다. ★다만 이 포크에서 실측하지 않았다★ —
+쿠키가 실제로 붙는지는 확인이 필요하다. 게다가 **이 엔진은 SameSite 쿠키 속성을 애초에
+구현하지 않는다**(쿠키 저장소 `components/net/cookie.rs` / `cookie_storage.rs` 어디에도
+`same_site`/`SameSite` 가 없다 — `components/net` 전체의 다른 매치는 무관한 Fetch
+`Sec-Fetch-Site` 헤더 판정이다) — 즉 `toplevel` 이 서드파티 전제를 없앤 것이 아니라, 그
+전제를 지키던 검사가 이 포크에는 처음부터 없었다. 실측 헤지는 그대로 유효하지만, 운용자가
+"SameSite 가 막아 줄 것" 이라는 헛검증을 하지 않도록 적어 둔다. 반응형 붕괴 / Servo
+웹호환성(항목 3)은 `toplevel` 로도 그대로 남는다.
 
 **차단 사유가 안 보이는 함정.** Servo 내장 에러 페이지(`neterror.html`)는 CSS 가 한 줄도
 없어 캔버스가 transparent 로 남고(`layout/display_list/mod.rs` 가 투명 루트 배경에서 조기

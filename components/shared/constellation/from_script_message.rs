@@ -485,6 +485,12 @@ pub struct IFrameLoadInfo {
     /// A snapshot of the navigation-related parameters of the target
     /// of this navigation.
     pub target_snapshot_params: TargetSnapshotParams,
+    /// 이 iframe 의 내용을 child navigable 로 만들 것인가. `<iframe toplevel>` 이고
+    /// `dom_iframe_toplevel_embed_enabled` 가 켜져 있을 때만 `TopLevelEmbed` 다.
+    /// constellation 은 이 값을 **browsing context 생성 시 1회** 읽어
+    /// `BrowsingContext::embedding_mode` 에 저장하고, 이후 내비게이션은 그 저장값을
+    /// 쓴다 — 재로드처럼 이 메시지를 싣지 않는 경로에서도 일관되게 하려는 것이다.
+    pub embedding_mode: EmbeddingMode,
 }
 
 /// Specifies the information required to load a URL in an iframe.
@@ -849,4 +855,97 @@ pub enum RemoteFocusOperation {
     /// Do sequential focus navigation using the `<iframe>` element with the given
     /// [`BrowsingContextId`] as the starting point and in the given direction.
     Sequential(SequentialFocusDirection, Option<BrowsingContextId>),
+}
+
+/// `<iframe>` 이 겸하던 두 축 중 *context 중첩* 쪽을 고르는 값.
+///
+/// 렌더링 중첩(layout 이 자식 파이프라인을 부모의 디스플레이 리스트에 꽂는 것)은 이
+/// 값과 무관하게 언제나 그대로다 — 그래서 `transform`, `border-radius`, `opacity`,
+/// 클립, 스태킹, 타일 경계 걸침이 모드와 상관없이 똑같이 적용된다.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum EmbeddingMode {
+    /// 표준 `<iframe>`. 내용이 child navigable 이 된다.
+    Nested,
+    /// `<iframe toplevel>`. 부모의 박스 안에서 렌더되지만 내용은 top-level browsing
+    /// context 다. ★설계상 스푸핑을 허용하는 모드이므로 pref 로 잠근다★ —
+    /// `dom_iframe_toplevel_embed_enabled`.
+    TopLevelEmbed,
+}
+
+/// 이 문서에게 알려줄 *navigable* 부모. `NewPipelineInfo::parent_info` 는 오직 이
+/// 함수로만 채운다.
+///
+/// `presentation_parent` 는 *표출* 부모다 — 누가 나를 레이아웃하고 크기를 정하고
+/// 렌더하고 정리하는가. 그 값은 `TopLevelEmbed` 에서도 그대로 살아 있어야 한다.
+/// ★그것까지 끊으면 부모 element 가 `UpdatePipelineId` 를 못 받아 초기 about:blank 를
+/// 계속 렌더한다 — 상자에는 CSS 가 전부 먹히는데 내용만 흰색으로 나온다.★
+pub fn navigable_parent(
+    mode: EmbeddingMode,
+    presentation_parent: Option<PipelineId>,
+) -> Option<PipelineId> {
+    match mode {
+        EmbeddingMode::Nested => presentation_parent,
+        EmbeddingMode::TopLevelEmbed => None,
+    }
+}
+
+/// `<iframe toplevel>` 의 게이트. 속성과 pref 가 **둘 다** 있어야 top-level 임베드다.
+/// ★이 함수가 `TopLevelEmbed` 의 유일한 생산자다★ — 순수함수로 둔 이유는 보안상
+/// 가장 중요한 이 술어를 DOM 없이 테스트하기 위해서다.
+pub fn embedding_mode_for(has_toplevel_attribute: bool, pref_enabled: bool) -> EmbeddingMode {
+    if has_toplevel_attribute && pref_enabled {
+        EmbeddingMode::TopLevelEmbed
+    } else {
+        EmbeddingMode::Nested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_base::id::{PipelineId, PipelineNamespace, PipelineNamespaceId};
+
+    use super::{EmbeddingMode, embedding_mode_for, navigable_parent};
+
+    /// 평범한 iframe 은 표출 부모가 곧 navigable 부모다.
+    #[test]
+    fn nested_keeps_the_presentation_parent() {
+        PipelineNamespace::install(PipelineNamespaceId(1));
+        let parent = PipelineId::new();
+
+        assert_eq!(
+            navigable_parent(EmbeddingMode::Nested, Some(parent)),
+            Some(parent)
+        );
+    }
+
+    /// `<iframe toplevel>` 은 표출 부모가 있어도 navigable 부모가 없다. 이 한 값이
+    /// `WindowProxy` 의 부모를 정하고, 그래서 X-Frame-Options / frame-ancestors /
+    /// `top !== self` 프레임버스팅이 전부 성립하지 않게 된다.
+    #[test]
+    fn toplevel_embed_has_no_navigable_parent() {
+        PipelineNamespace::install(PipelineNamespaceId(2));
+        let parent = PipelineId::new();
+
+        assert_eq!(navigable_parent(EmbeddingMode::TopLevelEmbed, Some(parent)), None);
+    }
+
+    /// 진짜 최상위 문서는 어느 모드에서도 부모가 없다.
+    #[test]
+    fn a_real_top_level_document_has_no_parent_either_way() {
+        assert_eq!(navigable_parent(EmbeddingMode::Nested, None), None);
+        assert_eq!(navigable_parent(EmbeddingMode::TopLevelEmbed, None), None);
+    }
+
+    /// `embedding_mode_for` 의 진짜 술어 — 속성과 pref 가 **둘 다** 있어야 top-level
+    /// 임베드다. 네 조합 전부를 고정한다.
+    #[test]
+    fn embedding_mode_for_requires_both_attribute_and_pref() {
+        assert_eq!(
+            embedding_mode_for(true, true),
+            EmbeddingMode::TopLevelEmbed
+        );
+        assert_eq!(embedding_mode_for(true, false), EmbeddingMode::Nested);
+        assert_eq!(embedding_mode_for(false, true), EmbeddingMode::Nested);
+        assert_eq!(embedding_mode_for(false, false), EmbeddingMode::Nested);
+    }
 }
