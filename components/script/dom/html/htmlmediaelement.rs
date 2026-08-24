@@ -927,7 +927,7 @@ impl MediaFrameRenderer {
             D3d11VideoFrameExternalImages::update_plane(
                 id,
                 D3d11PlaneBinding {
-                    ring_id: d3d11_yuv.ring_id,
+                    group_id: d3d11_yuv.group_id,
                     ring_epoch: d3d11_yuv.ring_epoch,
                     plane_index,
                     width: plane_width,

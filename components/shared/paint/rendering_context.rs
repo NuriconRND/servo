@@ -293,6 +293,16 @@ pub trait RenderingContext {
     fn media_d3d11_device_handle(&self) -> Option<usize> {
         None
     }
+    /// [`media_d3d11_device_handle`](Self::media_d3d11_device_handle) 과 같은 포인터를
+    /// **AddRef 없이** 돌려준다 — 소유하지 않고 **식별자로만** 쓸 때를 위한 것이다
+    /// (예: "이 painter 의 디바이스" 를 키로 링을 찾기).
+    ///
+    /// ★프레임마다 부르는 자리에서는 반드시 이쪽을 쓸 것★ — AddRef 판을 매 프레임 부르면
+    /// refcount 가 계속 증가한다(4 타일 36 영상 30fps 이면 초당 ~4,300 회). 반환값을
+    /// Release 해서도 안 된다(소유권이 없다).
+    fn media_d3d11_device_handle_borrowed(&self) -> Option<usize> {
+        None
+    }
     /// DYNAMIC D3D11 텍스처를 `WRITE_DISCARD`로 매핑한다. 반환은 (데이터 포인터,
     /// RowPitch). **렌더러(ANGLE GL 호출) 스레드에서만 호출.** Default `None`.
     fn map_d3d11_dynamic_texture(&self, _texture: usize) -> Option<(usize, u32)> {
@@ -997,6 +1007,22 @@ impl SurfmanRenderingContext {
         }
     }
 
+    fn media_d3d11_device_handle_borrowed(&self) -> Option<usize> {
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let ptr = self.device.borrow().d3d11_device_ptr();
+            if ptr.is_null() {
+                None
+            } else {
+                Some(ptr as usize)
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        {
+            None
+        }
+    }
+
     #[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
     fn media_d3d11_device_handle(&self) -> Option<usize> {
         #[cfg(all(target_os = "windows", feature = "no-wgl"))]
@@ -1354,6 +1380,11 @@ impl RenderingContext for SoftwareRenderingContext {
 
     fn media_d3d11_device_handle(&self) -> Option<usize> {
         self.surfman_rendering_info.media_d3d11_device_handle()
+    }
+
+    fn media_d3d11_device_handle_borrowed(&self) -> Option<usize> {
+        self.surfman_rendering_info
+            .media_d3d11_device_handle_borrowed()
     }
 
     fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
@@ -1725,6 +1756,10 @@ impl RenderingContext for WindowRenderingContext {
 
     fn media_d3d11_device_handle(&self) -> Option<usize> {
         self.surfman_context.media_d3d11_device_handle()
+    }
+
+    fn media_d3d11_device_handle_borrowed(&self) -> Option<usize> {
+        self.surfman_context.media_d3d11_device_handle_borrowed()
     }
 
     fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {
@@ -2123,6 +2158,10 @@ impl RenderingContext for OffscreenRenderingContext {
 
     fn media_d3d11_device_handle(&self) -> Option<usize> {
         self.parent_context.media_d3d11_device_handle()
+    }
+
+    fn media_d3d11_device_handle_borrowed(&self) -> Option<usize> {
+        self.parent_context.media_d3d11_device_handle_borrowed()
     }
 
     fn map_d3d11_dynamic_texture(&self, texture: usize) -> Option<(usize, u32)> {

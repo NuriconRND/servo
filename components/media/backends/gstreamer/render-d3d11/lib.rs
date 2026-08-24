@@ -29,7 +29,7 @@ mod render_d3d11 {
     use servo_config::{debug_env, pref};
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
-    use servo_media_player::d3d11_ring::D3d11PlaneRings;
+    use servo_media_player::d3d11_ring::{D3d11PlaneRings, RING_DEMAND_TTL};
     use servo_media_player::video::{
         Buffer, VideoFrame, VideoFrameD3D11YuvData, VideoFrameData, VideoFrameYuvColorRange,
         VideoFrameYuvColorSpace, VideoFrameYuvFormat,
@@ -102,7 +102,7 @@ mod render_d3d11 {
 
     struct PlayerState {
         /// 현재 활성 plane 링(없으면 아직 미생성/디바이스 대기).
-        ring_id: Option<u64>,
+        group_id: Option<u64>,
         /// 현재 링을 만든 caps(포맷/크기/색상). 변경되면 링 교체.
         in_caps: Option<gstreamer::Caps>,
         /// 링이 아직 한 번도 소비되지 않음(전 슬롯 Unmapped, claim이 항상 None).
@@ -141,7 +141,7 @@ mod render_d3d11 {
             log::info!("D3D11 video: plane 링 프로듀서 경로 활성 (profile_id={profile_id})");
             Some(RenderD3D11 {
                 state: Mutex::new(PlayerState {
-                    ring_id: None,
+                    group_id: None,
                     in_caps: None,
                     ring_never_consumed: true,
                     drop_count: 0,
@@ -152,53 +152,56 @@ mod render_d3d11 {
             })
         }
 
-        /// 현재 caps에 맞는 링을 보장한다(필요 시 (재)생성). 소비자(ANGLE)
-        /// 디바이스가 아직 발행되지 않았으면 실패를 캐시하지 않고 None을 반환해
-        /// 다음 프레임에서 재시도한다.
-        fn ensure_ring(
+        /// 현재 caps 에 맞는 **그룹**을 보장한다(필요 시 (재)생성). 그룹은
+        /// 디바이스를 모른다 — 실제 링은 소비자가 수요를 등록한 디바이스마다
+        /// [`ensure_device_ring`](Self::ensure_device_ring) 이 만든다.
+        fn ensure_group(
             &self,
             state: &mut PlayerState,
             caps: &gstreamer::CapsRef,
+        ) -> Option<u64> {
+            if state.group_id.is_some() && state.in_caps.as_deref() == Some(caps) {
+                return state.group_id;
+            }
+            // caps 가 바뀌었으면 옛 그룹과 그에 딸린 **모든 디바이스 링**을 회수한다
+            // (실제 Unmap/Release 는 각 소비자가 자기 디바이스 것만 가져가 수행).
+            if let Some(old) = state.group_id.take() {
+                D3d11PlaneRings::remove_group(old);
+                state.in_caps = None;
+            }
+            let group_id = D3d11PlaneRings::create_group();
+            state.group_id = Some(group_id);
+            state.in_caps = Some(caps.to_owned());
+            state.ring_never_consumed = true;
+            state.drop_count = 0;
+            Some(group_id)
+        }
+
+        /// `device` 에 이 그룹의 링이 없으면 그 디바이스 위에 plane 텍스처를 만들어
+        /// 붙인다. 이미 있으면 그대로 돌려준다.
+        ///
+        /// ★여기가 "타일에 보이는 것만 그 GPU 로" 의 실행 지점이다★ — 호출은
+        /// [`D3d11PlaneRings::demanded_devices`] 가 돌려준 디바이스에 대해서만 일어난다.
+        fn ensure_device_ring(
+            &self,
+            group_id: u64,
+            device: usize,
             format: VideoFrameYuvFormat,
             gst_format: gstreamer_video::VideoFormat,
             width: i32,
             height: i32,
         ) -> Option<u64> {
-            // 기존 링이 현재 caps에 유효.
-            if state.ring_id.is_some() && state.in_caps.as_deref() == Some(caps) {
-                return state.ring_id;
-            }
-            // (재)생성 필요 — 소비자 디바이스가 먼저 발행돼 있어야 한다. 없으면
-            // 실패를 캐시하지 않고(in_caps 갱신 안 함) 드롭 후 다음 프레임 재시도.
-            let device = match D3d11PlaneRings::consumer_device() {
-                Some(device) => device,
-                None => {
-                    if !state.warned_no_device {
-                        log::warn!(
-                            "D3D11 video: 소비자(ANGLE) 디바이스 미발행 — 렌더러 준비 전까지 드롭 (id={})",
-                            self.profile_id
-                        );
-                        state.warned_no_device = true;
-                    }
-                    return None;
-                },
-            };
-            // 구 링 회수(실제 Unmap/Release는 렌더러가 take_removed_rings로 수행).
-            if let Some(old) = state.ring_id.take() {
-                D3d11PlaneRings::remove_ring(old);
-                state.in_caps = None;
+            if let Some(ring_id) = D3d11PlaneRings::ring_for(group_id, device) {
+                return Some(ring_id);
             }
             let slots = ring_producer::create_plane_textures(device, format, width, height)?;
-            let ring_id = D3d11PlaneRings::create_ring(format.plane_count(), slots);
-            state.ring_id = Some(ring_id);
-            state.in_caps = Some(caps.to_owned());
-            state.ring_never_consumed = true;
-            state.drop_count = 0;
+            let ring_id = D3d11PlaneRings::create_ring(device, format.plane_count(), slots);
+            D3d11PlaneRings::attach_ring(group_id, device, ring_id);
             // 협상된 실제 gst VideoFormat(gst_format)과 매핑된 표시 포맷(format)을
             // 함께 남긴다 — 10-bit 협상(I42010le/P01010le vs 8-bit 강등) 확인용.
+            // device 를 함께 남겨 어느 GPU 에 올라갔는지 로그로 확인할 수 있게 한다.
             log::info!(
-                "D3D11 video: plane 링 생성 ring_id={ring_id} {width}x{height} \
-                 gst={gst_format:?} -> {format:?} (id={})",
+                "D3D11 video: plane 링 생성 group_id={group_id} ring_id={ring_id}                  {width}x{height} gst={gst_format:?} -> {format:?} (id={}) device=0x{device:x}",
                 self.profile_id
             );
             Some(ring_id)
@@ -258,14 +261,14 @@ mod render_d3d11 {
             // Drop 안에서 unwrap하지 않고 포이즌을 복구한다 — 소멸자에서
             // (특히 언와인딩 중) 패닉하면 프로세스가 abort되며, 그래도 링은
             // 반드시 반납해야 하기 때문이다.
-            let ring_id = self
+            let group_id = self
                 .state
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .ring_id
+                .group_id
                 .take();
-            if let Some(ring_id) = ring_id {
-                D3d11PlaneRings::remove_ring(ring_id);
+            if let Some(group_id) = group_id {
+                D3d11PlaneRings::remove_group(group_id);
             }
         }
     }
@@ -332,7 +335,39 @@ mod render_d3d11 {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
 
-            let ring_id = self.ensure_ring(state, caps, format, info.format(), width, height)?;
+            let group_id = self.ensure_group(state, caps)?;
+
+            // 수요가 끊긴 디바이스의 링을 먼저 회수한다(타일이 이 영상을 더 이상
+            // 보여주지 않게 된 경우). 그다음 **수요가 살아 있는 디바이스만** 업로드
+            // 대상이 된다 — 이것이 "타일에 보이는 것만 그 GPU 로" 의 실체다.
+            D3d11PlaneRings::expire_stale_demand(group_id, RING_DEMAND_TTL);
+            let target_devices = D3d11PlaneRings::demanded_devices(group_id, RING_DEMAND_TTL);
+            if target_devices.is_empty() {
+                // 아직 아무 타일도 이 영상을 합성하지 않았다(렌더러 준비 전이거나
+                // 화면 밖). 업로드는 건너뛰되 프레임은 정상 반환해야 한다 — 여기서
+                // None 을 돌려주면 appsink 가 FlowError::Error 로 바꿔 파이프라인이
+                // 통째로 정지한다(bf70293c4 계열).
+                if !state.warned_no_device {
+                    log::info!(
+                        "D3D11 video: 아직 이 영상을 합성하는 타일이 없다 — 업로드 보류 (id={})",
+                        self.profile_id
+                    );
+                    state.warned_no_device = true;
+                }
+                return VideoFrame::new(
+                    width,
+                    height,
+                    Arc::new(D3D11YuvFrameBuffer {
+                        data: VideoFrameD3D11YuvData {
+                            group_id,
+                            ring_epoch: 1,
+                            format,
+                            color_space,
+                            color_range,
+                        },
+                    }),
+                );
+            }
 
             // 여기서만 gst 버퍼를 readable로 map한다 — 바이트는 아래에서 즉시
             // 슬롯으로 복사되고 build_frame 반환과 함께 샘플이 풀로 돌아간다.
@@ -363,10 +398,9 @@ mod render_d3d11 {
                         }
                         if prof {
                             log::warn!(
-                                "D3D11PROF mapfail id={} ring={ring_id} drops={} regdrops={}",
+                                "D3D11PROF mapfail id={} group={group_id} drops={}",
                                 self.profile_id,
                                 state.drop_count,
-                                D3d11PlaneRings::dropped_frames(ring_id),
                             );
                         }
                         // 아래와 동일한 메타데이터 프레임을 즉시 반환 — 새 프레임
@@ -376,7 +410,7 @@ mod render_d3d11 {
                             height,
                             Arc::new(D3D11YuvFrameBuffer {
                                 data: VideoFrameD3D11YuvData {
-                                    ring_id,
+                                    group_id,
                                     ring_epoch: 1,
                                     format,
                                     color_space,
@@ -387,52 +421,66 @@ mod render_d3d11 {
                     },
                 };
 
-            let claim_start = std::time::Instant::now(); // D3D11PROF
-            match D3d11PlaneRings::claim_free_slot(ring_id) {
-                Some(claimed) => {
-                    let t_claim = claim_start.elapsed(); // D3D11PROF
-                    let slot = claimed.slot;
-                    let copy_start = std::time::Instant::now(); // D3D11PROF
-                    ring_producer::copy_planes(&frame, format, swap_uv, &claimed);
-                    let t_copy = copy_start.elapsed(); // D3D11PROF
-                    let pub_start = std::time::Instant::now(); // D3D11PROF
-                    D3d11PlaneRings::publish_slot(ring_id, slot);
-                    let t_publish = pub_start.elapsed(); // D3D11PROF
-                    // 첫 성공 claim = 링이 소비되기 시작했다는 신호.
-                    state.ring_never_consumed = false;
-                    if prof {
-                        self.prof_log(state, ring_id, bf_start, t_claim, t_copy, t_publish);
-                    }
-                },
-                None if state.ring_never_consumed => {
-                    // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
-                    // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
-                    // 프레임 덮어쓴다.
-                    let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
-                    D3d11PlaneRings::stage_first_frame(ring_id, vecs);
-                },
-                None => {
-                    // 배압: 모든 슬롯이 아직 소비 대기(Published) 상태다. 이번 gst
-                    // 프레임 바이트는 버리되(memcpy 전 — 비용 없음) None을 반환하지
-                    // 않는다. appsink 콜백은 None(=get_frame_from_sample 실패)을 치명적
-                    // FlowError::Error로 바꾸고, 그 -5가 상류 qtdemux_loop를 중단시켜
-                    // 파이프라인 전체가 정지한다(45타일에서 렌더러가 못 따라오면 첫
-                    // 배압 드롭 한 번에 전 타일 정지 — 통합검증에서 관측·규명). 대신
-                    // 아래 링 기술자를 그대로 반환해 렌더러가 직전 Presenting 슬롯을
-                    // 재표시하게 한다(정상적 프레임 드롭). 재표시 합성이 슬롯 1개를
-                    // 소비하므로 배압도 자연히 완화된다. 이 arm은 ring_never_consumed
-                    // == false일 때만 도달하므로 Presenting 슬롯이 항상 존재한다.
-                    state.drop_count += 1;
-                    if prof {
-                        log::warn!(
-                            "D3D11PROF drop id={} ring={ring_id} drops={} regdrops={}",
-                            self.profile_id,
-                            state.drop_count,
-                            D3d11PlaneRings::dropped_frames(ring_id),
-                        );
-                    }
-                    // 아래 VideoFrame::new로 흘려보낸다 — 재표시로 스트림 유지.
-                },
+            // ★디바이스별 업로드★ — 수요가 있는 디바이스마다 그 GPU 위의 링에
+            // 복사한다. 6x6 그리드를 4 타일이 나눠 보면 각 영상은 보통 한 타일에만
+            // 보이므로 **총 업로드 횟수는 단일 GPU 때와 같다**(타일 경계에 걸친
+            // 영상만 두 번 올라간다).
+            for device in target_devices {
+                let Some(ring_id) = self.ensure_device_ring(
+                    group_id,
+                    device,
+                    format,
+                    info.format(),
+                    width,
+                    height,
+                ) else {
+                    // 텍스처 생성 실패(디바이스 상실 등) — 이 디바이스만 건너뛴다.
+                    // 다른 타일은 계속 정상 재생돼야 한다.
+                    continue;
+                };
+
+                let claim_start = std::time::Instant::now(); // D3D11PROF
+                match D3d11PlaneRings::claim_free_slot(ring_id) {
+                    Some(claimed) => {
+                        let t_claim = claim_start.elapsed(); // D3D11PROF
+                        let slot = claimed.slot;
+                        let copy_start = std::time::Instant::now(); // D3D11PROF
+                        ring_producer::copy_planes(&frame, format, swap_uv, &claimed);
+                        let t_copy = copy_start.elapsed(); // D3D11PROF
+                        let pub_start = std::time::Instant::now(); // D3D11PROF
+                        D3d11PlaneRings::publish_slot(ring_id, slot);
+                        let t_publish = pub_start.elapsed(); // D3D11PROF
+                        // 첫 성공 claim = 어느 링이든 소비되기 시작했다는 신호.
+                        state.ring_never_consumed = false;
+                        if prof {
+                            self.prof_log(state, ring_id, bf_start, t_claim, t_copy, t_publish);
+                        }
+                    },
+                    None if state.ring_never_consumed => {
+                        // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
+                        // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
+                        // 프레임 덮어쓴다. 스테이징은 링별이므로 디바이스마다 따로 둔다.
+                        let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
+                        D3d11PlaneRings::stage_first_frame(ring_id, vecs);
+                    },
+                    None => {
+                        // 배압: 이 디바이스의 모든 슬롯이 아직 소비 대기다. 이번 gst
+                        // 프레임 바이트는 이 디바이스에 대해서만 버리고(memcpy 전 —
+                        // 비용 없음) 다른 디바이스는 계속 진행한다. None 을 반환하지
+                        // 않는 이유는 종전과 같다: appsink 가 None 을 치명적
+                        // FlowError::Error 로 바꿔 파이프라인 전체를 정지시킨다.
+                        // 렌더러는 직전 Presenting 슬롯을 재표시한다(정상적 드롭).
+                        state.drop_count += 1;
+                        if prof {
+                            log::warn!(
+                                "D3D11PROF drop id={} ring={ring_id} dev=0x{device:x} drops={} regdrops={}",
+                                self.profile_id,
+                                state.drop_count,
+                                D3d11PlaneRings::dropped_frames(ring_id),
+                            );
+                        }
+                    },
+                }
             }
 
             VideoFrame::new(
@@ -440,7 +488,7 @@ mod render_d3d11 {
                 height,
                 Arc::new(D3D11YuvFrameBuffer {
                     data: VideoFrameD3D11YuvData {
-                        ring_id,
+                        group_id,
                         ring_epoch: 1,
                         format,
                         color_space,

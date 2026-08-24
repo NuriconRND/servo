@@ -34,8 +34,16 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use log::warn;
+
+/// 수요가 끊긴 (그룹, 디바이스) 링을 회수하기까지 기다리는 시간.
+///
+/// 짧으면 타일 경계에 걸친 영상이 깜빡일 때마다 링을 재생성하고(= 텍스처 재할당 +
+/// 첫 프레임 공백), 길면 메모리가 오래 잡힌다. 스크롤/레이아웃 변경을 따라가면서도
+/// 경계 깜빡임은 흡수하는 값으로 2초를 쓴다.
+pub const RING_DEMAND_TTL: Duration = Duration::from_secs(2);
 
 /// 링당 슬롯 개수(더블/트리플/쿼드 버퍼링 여유분).
 pub const SLOT_COUNT: usize = 4;
@@ -172,6 +180,11 @@ pub enum ConsumeCommit {
 pub struct RemovedRing {
     pub textures: Vec<usize>,
     pub mapped: Vec<usize>,
+    /// 이 링의 텍스처를 만든 D3D11 디바이스. ★그 디바이스를 소유한 소비자만
+    /// Unmap/Release 해야 한다★ — 멀티 GPU 월에서는 painter 마다 디바이스가
+    /// 다르므로, 전역으로 드레인하면 남의 디바이스 텍스처를 해제하게 된다.
+    /// [`D3d11PlaneRings::take_removed_rings_for_device`] 가 이 필드로 거른다.
+    pub device: usize,
 }
 
 /// 슬롯 하나의 내부 상태. 공개 API가 아니다.
@@ -220,8 +233,27 @@ struct RingState {
 /// 링별 상태를 담는 전역 레지스트리. 포이즌된 뮤텍스는 복구해서 계속
 /// 쓴다(단일 스레드 패닉이 나머지 스레드의 비디오 파이프라인을 죽이지
 /// 않도록 — "poisoned-free").
+/// 비디오 하나(정확히는 caps 세대 하나)에 대응하는 **그룹**. 멀티 GPU 월에서는
+/// 같은 영상이 여러 타일에 보일 수 있고 타일마다 D3D11 디바이스가 다르므로,
+/// 그룹 아래에 **디바이스별 링**을 둔다.
+///
+/// `demand` 는 소비자가 그 디바이스에서 이 영상을 실제로 합성하려 했다는 기록이다
+/// (= 그 타일에 보인다). WebRender 가 타일 밖 external image 를 lock 하지 않으므로
+/// 이 기록이 곧 가시성 신호이고, 프로듀서는 **수요가 있는 디바이스에만** 업로드한다.
+#[derive(Default)]
+struct GroupState {
+    /// device -> ring_id
+    rings: HashMap<usize, u64>,
+    /// device -> 마지막으로 소비자가 요구한 시각
+    demand: HashMap<usize, Instant>,
+}
+
 struct Registry {
     rings: HashMap<u64, RingState>,
+    groups: HashMap<u64, GroupState>,
+    /// ring_id -> 그 링의 텍스처를 만든 디바이스. `remove_ring` 이
+    /// [`RemovedRing::device`] 를 채우는 데 쓴다.
+    ring_device: HashMap<u64, usize>,
 }
 
 fn registry() -> &'static Mutex<Registry> {
@@ -229,6 +261,8 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| {
         Mutex::new(Registry {
             rings: HashMap::new(),
+            groups: HashMap::new(),
+            ring_device: HashMap::new(),
         })
     })
 }
@@ -288,6 +322,7 @@ impl D3d11PlaneRings {
     /// 때는 새 ring_id를 받게 되므로 세대 추적(ring_epoch)은 프로듀서
     /// 쪽(`VideoFrameD3D11YuvData::ring_epoch`)의 책임이다.
     pub fn create_ring(
+        device: usize,
         planes_per_slot: usize,
         slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT],
     ) -> u64 {
@@ -307,16 +342,24 @@ impl D3d11PlaneRings {
             next_filled_seq: 0,
             staged_first_frame: None,
         };
-        lock(registry()).rings.insert(ring_id, ring);
+        let mut reg = lock(registry());
+        reg.rings.insert(ring_id, ring);
+        reg.ring_device.insert(ring_id, device);
         ring_id
     }
 
     /// 링을 제거한다. 정리에 필요한 텍스처 목록은
     /// [`take_removed_rings`](Self::take_removed_rings)로 나중에 가져간다.
     pub fn remove_ring(ring_id: u64) {
-        let removed = {
+        let (removed, device) = {
             let mut reg = lock(registry());
-            reg.rings.remove(&ring_id)
+            let ring = reg.rings.remove(&ring_id);
+            let device = reg.ring_device.remove(&ring_id).unwrap_or(0);
+            // 이 링을 참조하던 그룹 항목도 함께 끊는다(고아 참조 방지).
+            for group in reg.groups.values_mut() {
+                group.rings.retain(|_, id| *id != ring_id);
+            }
+            (ring, device)
         };
         let Some(ring) = removed else {
             return;
@@ -337,7 +380,11 @@ impl D3d11PlaneRings {
                 }
             }
         }
-        lock(removed_rings()).push(RemovedRing { textures, mapped });
+        lock(removed_rings()).push(RemovedRing {
+            textures,
+            mapped,
+            device,
+        });
     }
 
     /// mapped FREE 슬롯을 claim한다. 반환된 포인터에 plane별로 행 복사를
@@ -677,8 +724,134 @@ impl D3d11PlaneRings {
 
     /// [`remove_ring`](Self::remove_ring)으로 제거된 링들을 모아 반환한다
     /// (호출 시점에 비운다). 렌더러가 주기적으로 폴링해 정리한다.
+    ///
+    /// ★멀티 GPU 월에서는 쓰지 말 것★ — 소비자가 여럿이면 남의 디바이스 텍스처까지
+    /// 가져가게 된다. [`take_removed_rings_for_device`](Self::take_removed_rings_for_device)
+    /// 를 쓴다. 이 함수는 단일 소비자 경로와 테스트용으로 남긴다.
     pub fn take_removed_rings() -> Vec<RemovedRing> {
         std::mem::take(&mut *lock(removed_rings()))
+    }
+
+    /// 제거된 링 중 **`device` 가 만든 것만** 가져간다(나머지는 큐에 남겨 둔다).
+    ///
+    /// 소비자마다 D3D11 디바이스가 다르므로 Unmap/Release 는 반드시 소유
+    /// 디바이스에서 해야 한다. 전역 드레인을 쓰면 painter A 가 painter B 의
+    /// 텍스처를 해제한다.
+    pub fn take_removed_rings_for_device(device: usize) -> Vec<RemovedRing> {
+        let mut queue = lock(removed_rings());
+        let mut mine = Vec::new();
+        let mut rest = Vec::with_capacity(queue.len());
+        for ring in std::mem::take(&mut *queue) {
+            if ring.device == device {
+                mine.push(ring);
+            } else {
+                rest.push(ring);
+            }
+        }
+        *queue = rest;
+        mine
+    }
+
+    // ---------------------------------------------------------------------
+    // 그룹(비디오) ↔ 디바이스별 링
+    // ---------------------------------------------------------------------
+
+    /// 새 그룹(= 비디오의 한 caps 세대)을 만든다. 링은 아직 없다 — 소비자가
+    /// 수요를 등록하면 프로듀서가 그 디바이스에 만든다.
+    pub fn create_group() -> u64 {
+        let group_id = NEXT_RING_ID.fetch_add(1, Ordering::Relaxed);
+        lock(registry())
+            .groups
+            .insert(group_id, GroupState::default());
+        group_id
+    }
+
+    /// 그룹과 그에 딸린 **모든 디바이스의 링**을 제거한다(caps 변경/플레이어 종료).
+    pub fn remove_group(group_id: u64) {
+        let ring_ids: Vec<u64> = {
+            let mut reg = lock(registry());
+            match reg.groups.remove(&group_id) {
+                Some(group) => group.rings.into_values().collect(),
+                None => Vec::new(),
+            }
+        };
+        for ring_id in ring_ids {
+            Self::remove_ring(ring_id);
+        }
+    }
+
+    /// ★가시성 신호★ — 소비자가 `device` 에서 이 그룹을 합성하려 한다는 기록.
+    /// 프레임마다 호출해도 싸다(HashMap 갱신 1회).
+    pub fn note_demand(group_id: u64, device: usize) {
+        let mut reg = lock(registry());
+        if let Some(group) = reg.groups.get_mut(&group_id) {
+            group.demand.insert(device, Instant::now());
+        }
+    }
+
+    /// `device` 에서 이 그룹이 쓰는 링. 아직 없으면 None(프로듀서가 다음
+    /// 프레임에 만든다).
+    pub fn ring_for(group_id: u64, device: usize) -> Option<u64> {
+        lock(registry())
+            .groups
+            .get(&group_id)
+            .and_then(|group| group.rings.get(&device).copied())
+    }
+
+    /// 프로듀서가 `device` 에 텍스처를 만든 뒤 그 링을 그룹에 등록한다.
+    pub fn attach_ring(group_id: u64, device: usize, ring_id: u64) {
+        let mut reg = lock(registry());
+        if let Some(group) = reg.groups.get_mut(&group_id) {
+            group.rings.insert(device, ring_id);
+        }
+    }
+
+    /// 지금 수요가 살아 있는(= TTL 안에 요구된) 디바이스 목록. 프로듀서는
+    /// **이 목록에만** 업로드한다 — 이것이 "타일에 보이는 것만 올린다" 의 실체다.
+    pub fn demanded_devices(group_id: u64, ttl: Duration) -> Vec<usize> {
+        let now = Instant::now();
+        lock(registry())
+            .groups
+            .get(&group_id)
+            .map(|group| {
+                group
+                    .demand
+                    .iter()
+                    .filter(|(_, seen)| now.duration_since(**seen) <= ttl)
+                    .map(|(device, _)| *device)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// TTL 이 지난 수요를 걷어내고, 그 디바이스의 링을 제거한다. 제거된
+    /// ring_id 를 돌려준다(테스트/로깅용). 프로듀서가 주기적으로 부른다.
+    pub fn expire_stale_demand(group_id: u64, ttl: Duration) -> Vec<u64> {
+        let now = Instant::now();
+        let stale_rings: Vec<u64> = {
+            let mut reg = lock(registry());
+            let Some(group) = reg.groups.get_mut(&group_id) else {
+                return Vec::new();
+            };
+            let stale: Vec<usize> = group
+                .demand
+                .iter()
+                .filter(|(_, seen)| now.duration_since(**seen) > ttl)
+                .map(|(device, _)| *device)
+                .collect();
+            let mut rings = Vec::new();
+            for device in stale {
+                group.demand.remove(&device);
+                if let Some(ring_id) = group.rings.remove(&device) {
+                    rings.push(ring_id);
+                }
+            }
+            rings
+        };
+        for ring_id in &stale_rings {
+            Self::remove_ring(*ring_id);
+        }
+        stale_rings
     }
 }
 
@@ -694,6 +867,147 @@ mod tests {
             format: RingPlaneFormat::R8,
             row_bytes: 64,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 그룹 ↔ 디바이스별 링 (멀티 GPU 월: 타일에 보이는 것만 그 GPU 로)
+    //
+    // ★테스트 격리★ `removed_rings()` 큐는 전역이고 테스트는 병렬 실행된다.
+    // 그래서 이 아래 테스트들은 **전역 `take_removed_rings()` 를 절대 부르지
+    // 않고**(다른 테스트 항목을 훔치게 된다) 테스트마다 고유한 디바이스 id 로
+    // `take_removed_rings_for_device` 만 쓴다. 처음에 전역 드레인을 썼다가
+    // 기존 테스트 3 개를 깨뜨렸다.
+    // ------------------------------------------------------------------
+
+    fn slots_of(base: usize) -> [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT] {
+        std::array::from_fn(|i| {
+            [
+                Some(desc(base + i * 10)),
+                Some(desc(base + i * 10 + 1)),
+                None,
+            ]
+        })
+    }
+
+    /// 두 디바이스가 같은 그룹을 요구하면 링이 **각각** 생기고 서로 독립이다.
+    #[test]
+    fn group_gives_each_device_its_own_ring() {
+        const DEV_A: usize = 0x1A_0000;
+        const DEV_B: usize = 0x1B_0000;
+        let group = D3d11PlaneRings::create_group();
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_A), None);
+
+        let ring_a = D3d11PlaneRings::create_ring(DEV_A, 2, slots_of(0x11_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_A, ring_a);
+        let ring_b = D3d11PlaneRings::create_ring(DEV_B, 2, slots_of(0x12_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_B, ring_b);
+
+        assert_ne!(ring_a, ring_b);
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_A), Some(ring_a));
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_B), Some(ring_b));
+
+        D3d11PlaneRings::remove_group(group);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV_A);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV_B);
+    }
+
+    /// 수요가 있는 디바이스만 프로듀서 대상이 된다(= 그 타일에 보이는 것만 업로드).
+    #[test]
+    fn only_demanded_devices_are_upload_targets() {
+        const DEV_A: usize = 0x2A_0000;
+        const DEV_B: usize = 0x2B_0000;
+        let ttl = Duration::from_secs(60);
+        let group = D3d11PlaneRings::create_group();
+        assert!(D3d11PlaneRings::demanded_devices(group, ttl).is_empty());
+
+        D3d11PlaneRings::note_demand(group, DEV_A);
+        assert_eq!(D3d11PlaneRings::demanded_devices(group, ttl), vec![DEV_A]);
+
+        D3d11PlaneRings::note_demand(group, DEV_B);
+        let mut demanded = D3d11PlaneRings::demanded_devices(group, ttl);
+        demanded.sort();
+        assert_eq!(demanded, vec![DEV_A, DEV_B]);
+
+        D3d11PlaneRings::remove_group(group);
+    }
+
+    /// TTL 이 지나면 그 디바이스의 링만 회수되고 **다른 디바이스는 무영향**이다.
+    #[test]
+    fn stale_demand_reclaims_only_that_device_ring() {
+        const DEV_A: usize = 0x3A_0000;
+        const DEV_B: usize = 0x3B_0000;
+        let group = D3d11PlaneRings::create_group();
+        let ring_a = D3d11PlaneRings::create_ring(DEV_A, 2, slots_of(0x31_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_A, ring_a);
+        D3d11PlaneRings::note_demand(group, DEV_A);
+        let ring_b = D3d11PlaneRings::create_ring(DEV_B, 2, slots_of(0x32_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_B, ring_b);
+        D3d11PlaneRings::note_demand(group, DEV_B);
+
+        // B 의 수요만 최신으로 갱신해 A 만 만료 대상이 되게 한다.
+        std::thread::sleep(Duration::from_millis(20));
+        D3d11PlaneRings::note_demand(group, DEV_B);
+        let expired = D3d11PlaneRings::expire_stale_demand(group, Duration::from_millis(10));
+
+        assert_eq!(expired, vec![ring_a]);
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_A), None);
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_B), Some(ring_b));
+
+        D3d11PlaneRings::remove_group(group);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV_A);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV_B);
+    }
+
+    /// ★소비자는 자기 디바이스가 만든 링만 회수해야 한다★ — 전역 드레인을 쓰면
+    /// painter A 가 painter B 의 텍스처를 Release 하게 된다.
+    #[test]
+    fn removed_rings_are_drained_per_device() {
+        const DEV_A: usize = 0x4A_0000;
+        const DEV_B: usize = 0x4B_0000;
+        let ring_a = D3d11PlaneRings::create_ring(DEV_A, 2, slots_of(0x41_0000));
+        let ring_b = D3d11PlaneRings::create_ring(DEV_B, 2, slots_of(0x42_0000));
+        D3d11PlaneRings::remove_ring(ring_a);
+        D3d11PlaneRings::remove_ring(ring_b);
+
+        let mine = D3d11PlaneRings::take_removed_rings_for_device(DEV_A);
+        assert_eq!(mine.len(), 1);
+        assert!(
+            mine[0]
+                .textures
+                .iter()
+                .all(|t| (0x41_0000..0x42_0000).contains(t))
+        );
+
+        // 같은 디바이스를 다시 드레인하면 비어 있고, B 는 그대로 남아 있어야 한다.
+        assert!(D3d11PlaneRings::take_removed_rings_for_device(DEV_A).is_empty());
+        let theirs = D3d11PlaneRings::take_removed_rings_for_device(DEV_B);
+        assert_eq!(theirs.len(), 1);
+        assert!(theirs[0].textures.iter().all(|t| *t >= 0x42_0000));
+    }
+
+    /// 그룹을 지우면 모든 디바이스의 링이 함께 사라진다(caps 변경/종료 경로).
+    #[test]
+    fn removing_group_removes_every_device_ring() {
+        const DEV_A: usize = 0x5A_0000;
+        const DEV_B: usize = 0x5B_0000;
+        let group = D3d11PlaneRings::create_group();
+        let ring_a = D3d11PlaneRings::create_ring(DEV_A, 2, slots_of(0x51_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_A, ring_a);
+        let ring_b = D3d11PlaneRings::create_ring(DEV_B, 2, slots_of(0x52_0000));
+        D3d11PlaneRings::attach_ring(group, DEV_B, ring_b);
+
+        D3d11PlaneRings::remove_group(group);
+
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_A), None);
+        assert_eq!(D3d11PlaneRings::ring_for(group, DEV_B), None);
+        assert_eq!(
+            D3d11PlaneRings::take_removed_rings_for_device(DEV_A).len(),
+            1
+        );
+        assert_eq!(
+            D3d11PlaneRings::take_removed_rings_for_device(DEV_B).len(),
+            1
+        );
     }
 
     /// PlaneDesc는 브리프 고정 derive 목록(PartialEq 없음)을 그대로 두므로,
@@ -761,7 +1075,7 @@ mod tests {
     #[test]
     fn claim_when_all_unmapped_returns_none_and_stage_accepts() {
         let slots = make_slots(1000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
 
         // 전 슬롯 Unmapped 상태이므로 claim은 항상 None + 드롭 카운트 증가.
         assert!(D3d11PlaneRings::claim_free_slot(ring_id).is_none());
@@ -777,7 +1091,7 @@ mod tests {
     #[test]
     fn initial_map_all_then_presenting_slot0() {
         let slots = make_slots(2000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
 
         let staged_bytes = vec![vec![9u8, 9, 9], vec![8u8, 8]];
         D3d11PlaneRings::stage_first_frame(ring_id, staged_bytes.clone());
@@ -832,7 +1146,7 @@ mod tests {
     #[test]
     fn claim_fill_publish_then_first_lock_advances() {
         let slots = make_slots(3000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         warm_up(ring_id, &slots);
 
         let claimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot");
@@ -884,7 +1198,7 @@ mod tests {
     #[test]
     fn two_filled_latest_wins_older_returns_free_without_d3d() {
         let slots = make_slots(4000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         let ptrs = warm_up(ring_id, &slots);
 
         // 슬롯0=Presenting. 나머지 1,2,3을 모두 claim해서 Free 슬롯을
@@ -938,7 +1252,7 @@ mod tests {
     #[test]
     fn second_plane_lock_same_composite_no_advance() {
         let slots = make_slots(5000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         warm_up(ring_id, &slots);
 
         let claimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot");
@@ -979,8 +1293,9 @@ mod tests {
 
     #[test]
     fn plane_count_and_presenting_seq_accessors() {
+        const DEV: usize = 0x62_0000;
         let slots = make_slots(6000);
-        let ring = D3d11PlaneRings::create_ring(3, slots);
+        let ring = D3d11PlaneRings::create_ring(DEV, 3, slots);
 
         assert_eq!(D3d11PlaneRings::plane_count(ring), Some(3));
         assert_eq!(D3d11PlaneRings::plane_count(ring + 999), None);
@@ -993,19 +1308,20 @@ mod tests {
         assert!(D3d11PlaneRings::presenting_filled_seq(ring).is_some());
 
         D3d11PlaneRings::remove_ring(ring);
-        let _ = D3d11PlaneRings::take_removed_rings();
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
     }
 
     #[test]
     fn remove_ring_reports_textures_and_mapped_for_cleanup() {
         // 케이스 1: 전 슬롯 Unmapped인 링 제거 — mapped는 비어야 한다.
+        const DEV: usize = 0x61_0000;
         let slots_a = make_slots(7000);
-        let ring_a = D3d11PlaneRings::create_ring(2, slots_a);
+        let ring_a = D3d11PlaneRings::create_ring(DEV, 2, slots_a);
         D3d11PlaneRings::remove_ring(ring_a);
 
         // 케이스 2: 워밍업된 링(슬롯0 Presenting=이미 Unmap됨, 나머지 Free).
         let slots_b = make_slots(8000);
-        let ring_b = D3d11PlaneRings::create_ring(2, slots_b);
+        let ring_b = D3d11PlaneRings::create_ring(DEV, 2, slots_b);
         warm_up(ring_b, &slots_b);
         D3d11PlaneRings::remove_ring(ring_b);
 
@@ -1013,8 +1329,9 @@ mod tests {
         assert!(D3d11PlaneRings::claim_free_slot(ring_b).is_none());
         assert!(D3d11PlaneRings::note_plane_lock_and_plan(ring_b).is_none());
 
-        let removed = D3d11PlaneRings::take_removed_rings();
-        // 다른 테스트와 병렬 실행될 수 있으므로 개수 대신 내용으로 찾는다.
+        // ★디바이스 한정 드레인★ — 전역 드레인은 병렬 테스트끼리 서로의 항목을
+        // 훔친다(내용 검색으로도 못 막는다: 큐가 통째로 비워지면 그만이다).
+        let removed = D3d11PlaneRings::take_removed_rings_for_device(DEV);
         let all_b: Vec<usize> = slots_b
             .iter()
             .flat_map(|s| s.iter().flatten().map(|d| d.texture))
@@ -1039,7 +1356,7 @@ mod tests {
         }
 
         // take는 소진형 — 두 번째 호출엔 방금 항목들이 없어야 한다.
-        let again = D3d11PlaneRings::take_removed_rings();
+        let again = D3d11PlaneRings::take_removed_rings_for_device(DEV);
         assert!(
             !again
                 .iter()
@@ -1051,7 +1368,7 @@ mod tests {
     #[test]
     fn unlock_resets_gate_next_lock_advances() {
         let slots = make_slots(6000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         warm_up(ring_id, &slots);
 
         let c1 = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot for gen1");
@@ -1115,8 +1432,9 @@ mod tests {
     /// 슬롯을 재사용 가능하게 만들면) 테스트가 즉시 실패하게 한다.
     #[test]
     fn uncommitted_plan_wedges_remapping_slot_documented() {
+        const DEV: usize = 0x63_0000;
         let slots = make_slots(9000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(DEV, 2, slots);
         warm_up(ring_id, &slots); // 슬롯0 = Presenting, 1~3 = Free.
 
         let claimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("free slot");
@@ -1164,7 +1482,7 @@ mod tests {
         // remove_ring은 wedge된 Remapping 슬롯을 "mapped"(Unmap 필요)에
         // 보수적으로 포함해야 한다(:293-296 주석에 기술된 동작).
         D3d11PlaneRings::remove_ring(ring_id);
-        let removed = D3d11PlaneRings::take_removed_rings();
+        let removed = D3d11PlaneRings::take_removed_rings_for_device(DEV);
         let slot0_textures: Vec<usize> = slots[0].iter().flatten().map(|d| d.texture).collect();
         let entry = removed
             .iter()
@@ -1185,7 +1503,7 @@ mod tests {
     #[test]
     fn stale_initial_commit_after_advance_is_rejected() {
         let slots = make_slots(10000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         warm_up(ring_id, &slots);
 
         // 링을 초기 구간 너머로 정상적으로 한 번 Advance시킨다(커밋 포함).
@@ -1272,7 +1590,7 @@ mod tests {
     #[test]
     fn duplicate_advance_commit_is_noop() {
         let slots = make_slots(11000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         warm_up(ring_id, &slots);
 
         let c1 = D3d11PlaneRings::claim_free_slot(ring_id).expect("slot for advance");
@@ -1351,7 +1669,7 @@ mod tests {
     #[test]
     fn advance_commit_with_missing_remapped_plane_clears_mapped_and_claim_skips_it() {
         let slots = make_slots(12000);
-        let ring_id = D3d11PlaneRings::create_ring(2, slots);
+        let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
         let ptrs = warm_up(ring_id, &slots); // 슬롯0=Presenting(unmapped), 1~3=Free(mapped).
 
         // --- Advance 1: 슬롯1을 소비해 Presenting으로 올린다. 소비자는 이때

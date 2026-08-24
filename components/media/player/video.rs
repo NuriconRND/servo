@@ -73,11 +73,18 @@ impl VideoFrameYuvData {
 /// A-dyn 경로: plane DYNAMIC 링(레지스트리 `d3d11_ring`) 참조 + 표시
 /// 메타데이터. 슬롯 인덱스는 싣지 않는다 — 렌더러가 레지스트리에서 최신
 /// Filled를 소비한다(latest-wins). `ring_epoch`는 vestigial(항상 1) — 링
-/// 무효화(크기 변경 등)는 에폭 증가가 아니라 `ring_id` 신규 발급으로 처리한다
+/// 무효화(크기 변경 등)는 에폭 증가가 아니라 새 그룹 발급으로 처리한다
 /// (스펙 §10.3-②).
+///
+/// ★`group_id` 이지 `ring_id` 가 아니다★ — 멀티 GPU 월에서는 같은 영상이 여러
+/// 타일에 보일 수 있고 타일마다 D3D11 디바이스가 다르므로, 실제 링은
+/// **(그룹 × 디바이스)** 당 하나다. 소비자가 자기 디바이스로
+/// [`D3d11PlaneRings::ring_for`] 해석한다. 프레임 페이로드는 디바이스를 모른다.
+///
+/// [`D3d11PlaneRings::ring_for`]: crate::d3d11_ring::D3d11PlaneRings::ring_for
 #[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
 pub struct VideoFrameD3D11YuvData {
-    pub ring_id: u64,
+    pub group_id: u64,
     pub ring_epoch: u32,
     pub format: VideoFrameYuvFormat,
     pub color_space: VideoFrameYuvColorSpace,

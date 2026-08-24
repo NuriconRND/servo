@@ -127,7 +127,10 @@ impl RawVideoFrameExternalImages {
 /// 그대로 작성하므로 고정이다.
 #[derive(Clone, Copy, Debug)]
 pub struct D3d11PlaneBinding {
-    pub ring_id: u64,
+    /// ★링이 아니라 **그룹**이다★ — 실제 링은 (그룹 x 디바이스) 당 하나이고,
+    /// 소비자가 자기 렌더링 컨텍스트의 디바이스로 `D3d11PlaneRings::ring_for`
+    /// 해석한다. 프로듀서는 디바이스를 모른 채 그룹만 싣는다.
+    pub group_id: u64,
     pub ring_epoch: u32,
     pub plane_index: usize,
     pub width: i32,
@@ -525,23 +528,35 @@ impl paint_api::VideoExternalSurfaceProvider for MediaVideoExternalSurfaceProvid
     ) -> Option<paint_api::VideoFrameLease> {
         let binding = D3d11VideoFrameExternalImages::binding_for(external_id)?;
 
+        // ★가시성 신호★(lock_d3d11 과 동일) — 이 타일이 이 영상을 합성한다.
+        // ★rc 에서 직접, AddRef 없이 구한다★ — 이전에는 스레드 로컬로 한 번만 구해
+        // 메모했는데, "acquire 는 그 painter 의 렌더러 스레드에서만 불린다" 는 전제가
+        // **실기에서 성립하지 않았다**(2026-08-24): escape 를 켜면 모든 타일의 수요가
+        // painter 1 의 디바이스로 몰려 그 GPU 에 링이 360 개(36 영상 x 재생성) 만들어지고
+        // 재생이 1.5fps 로 무너졌다. 식별자로만 쓰므로 borrowed 판이 맞다.
+        let device = rc.media_d3d11_device_handle_borrowed()?;
+        D3d11PlaneRings::note_demand(binding.group_id, device);
+        // 이 디바이스에 아직 링이 없으면 이번 프레임은 건너뛴다(프로듀서가 다음
+        // 프레임에 만든다). lock_count 를 올리기 전이라 unlock 짝맞춤도 불필요하다.
+        let ring_id = D3d11PlaneRings::ring_for(binding.group_id, device)?;
+
         // 합성당 1회 소비: lock_d3d11과 동일하게 링별 lock_count 0→1 전이에서만
         // plan이 나오고, Some(plan)은 반드시 consume_plan이 commit까지 끝낸다.
-        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(binding.ring_id) {
-            consume_plan(rc, binding.ring_id, plan);
+        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(ring_id) {
+            consume_plan(rc, ring_id, plan);
         }
 
-        let plane_count = match D3d11PlaneRings::plane_count(binding.ring_id) {
+        let plane_count = match D3d11PlaneRings::plane_count(ring_id) {
             Some(n) => n,
             None => {
-                D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                D3d11PlaneRings::note_plane_unlock(ring_id);
                 return None;
             },
         };
 
         let mut planes: [Option<paint_api::VideoLeasePlane>; 3] = [None; 3];
         for i in 0..plane_count {
-            match D3d11PlaneRings::presenting_plane(binding.ring_id, i) {
+            match D3d11PlaneRings::presenting_plane(ring_id, i) {
                 Some(p) => {
                     planes[i] = Some(paint_api::VideoLeasePlane {
                         texture: p.texture,
@@ -550,22 +565,22 @@ impl paint_api::VideoExternalSurfaceProvider for MediaVideoExternalSurfaceProvid
                     })
                 },
                 None => {
-                    D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                    D3d11PlaneRings::note_plane_unlock(ring_id);
                     return None;
                 },
             }
         }
 
-        let frame_seq = match D3d11PlaneRings::presenting_filled_seq(binding.ring_id) {
+        let frame_seq = match D3d11PlaneRings::presenting_filled_seq(ring_id) {
             Some(s) => s,
             None => {
-                D3d11PlaneRings::note_plane_unlock(binding.ring_id);
+                D3d11PlaneRings::note_plane_unlock(ring_id);
                 return None;
             },
         };
 
         Some(paint_api::VideoFrameLease {
-            ring_id: binding.ring_id,
+            ring_id: ring_id,
             planes,
             plane_count,
             format: binding.yuv_format,
@@ -611,6 +626,117 @@ struct MediaExternalImages {
     /// `note_plane_unlock`을 정확히 짝맞춰 호출하기 위한 로컬 추적(글로벌
     /// 바인딩 맵이 lock~unlock 사이에 변경돼도 안전하도록 self에 보관).
     locked_d3d11_planes: FxHashMap<u64, u64>,
+    /// WALLDIAG(임시 진단): 이 painter 의 첫 wrap 결과를 성공/실패 각 한 번만 남기기
+    /// 위한 플래그. 프레임마다 찍으면 로그 자체가 부하가 된다(36 비디오 x 3 plane).
+    diag_logged_wrap_ok: bool,
+    diag_logged_wrap_fail: bool,
+    /// 이 소비자(= 이 painter)의 D3D11 디바이스. 그룹에서 자기 링을 찾고,
+    /// 회수 큐에서 **자기 디바이스 것만** 가져오는 데 쓴다.
+    device: Option<usize>,
+}
+
+/// 월 GPU 팬아웃 불변식 감시용 기록: `(D3D11 디바이스 포인터, 그 디바이스를 받은 첫
+/// requested_gpu)`. paint target 은 프로세스당 많아야 타일 수만큼이므로 Vec 으로 충분하다.
+static MEDIA_D3D11_DEVICE_OWNERS: Mutex<Vec<(usize, Option<usize>)>> = Mutex::new(Vec::new());
+
+/// ★월 불변식★: 타일마다 **자기 GPU 의** D3D11 디바이스를 받아야 한다.
+///
+/// 같은 `ID3D11Device` 가 **서로 다른 `requested_gpu`** 로 두 번 나타나면 ANGLE 의 EGL
+/// display 캐시가 어댑터 LUID 를 무시하고 하나를 재사용했다는 뜻이고, 그러면 타일이 몇 개든
+/// **전부 GPU 한 장에서 렌더된다**.
+///
+/// 이 검사가 있는 이유: 2026-08-24 에 4-GPU 실기가 실제로 그 상태로 돌고 있었다. 그런데
+/// `Selected DXGI adapter index 0/1/2/3` 은 정상으로 찍히고 경고도 폴백 로그도 없어서
+/// **어떤 지표로도 드러나지 않았고**, 엉뚱한 가설을 여러 번 세운 뒤에야 임시 진단 로그를
+/// 넣어서야 잡혔다. 조용한 실패를 시끄러운 실패로 바꾸는 것이 이 함수의 목적이다.
+///
+/// 단일 GPU 월(모든 타일이 같은 `requested_gpu`)에서는 디바이스 공유가 정상이므로 조용하다.
+fn note_media_d3d11_device(device: usize, requested_gpu: Option<usize>) {
+    let mut owners = match MEDIA_D3D11_DEVICE_OWNERS.lock() {
+        Ok(owners) => owners,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let already_seen = owners.iter().any(|(seen, _)| *seen == device);
+    if let Some(first_gpu) = conflicting_device_owner(&owners, device, requested_gpu) {
+        {
+            warn!(
+                "Wall GPU fan-out is BROKEN: paint targets for requested_gpu={:?} and {:?} were \
+                 handed the SAME D3D11 device (0x{device:x}) - every tile will render on one GPU. \
+                 Cause: the ANGLE EGL-display cache keys on deviceId but not on the adapter LUID, \
+                 so same-model GPUs collide. Fix: run \
+                 etc/multigpu/patches/apply_mozangle_angle_luid.ps1, delete the mozangle \
+                 build/.fingerprint/deps artifacts to force an ANGLE rebuild, then copy the fresh \
+                 libGLESv2.dll/libEGL.dll from target/<profile>/build/mozangle-*/out next to the \
+                 executable.",
+                first_gpu, requested_gpu,
+            );
+        }
+    }
+    if !already_seen {
+        owners.push((device, requested_gpu));
+    }
+}
+
+/// [`note_media_d3d11_device`] 의 **순수 판정부**. 반환 `Some(first_gpu)` = "같은 디바이스를
+/// **다른** GPU 요청이 이미 가져갔다"(= 팬아웃이 깨졌다).
+///
+/// 경고 자체는 전역 상태·실제 GPU 위에서만 재현되므로, 이 함수를 떼어 내 합성 입력으로
+/// 발화 조건을 고정한다. 2026-08-24 에 실기 합성 시도(타일마다 다른 `gpu` 요청)가 **서로 다른
+/// 디바이스를 받아 양성 케이스가 되지 못했고**, 그대로 뒀으면 "통과만 하는 검사" 가 됐다.
+fn conflicting_device_owner(
+    owners: &[(usize, Option<usize>)],
+    device: usize,
+    requested_gpu: Option<usize>,
+) -> Option<Option<usize>> {
+    owners
+        .iter()
+        .find(|(seen, _)| *seen == device)
+        .and_then(|(_, first_gpu)| (*first_gpu != requested_gpu).then_some(*first_gpu))
+}
+
+#[cfg(test)]
+mod wall_gpu_fanout_tests {
+    use super::conflicting_device_owner;
+
+    /// 잡아야 하는 것: 서로 다른 GPU 를 요청한 타일들이 같은 D3D11 디바이스를 받은 상태.
+    /// 2026-08-24 4-GPU 실기가 실제로 이랬다(네 painter 전부 같은 포인터).
+    #[test]
+    fn same_device_for_two_different_gpus_is_a_conflict() {
+        let owners = [(0xAB_usize, Some(0_usize))];
+        assert_eq!(
+            conflicting_device_owner(&owners, 0xAB, Some(2)),
+            Some(Some(0))
+        );
+    }
+
+    /// 잡으면 안 되는 것 1: 단일 GPU 월. 타일이 여럿이어도 `requested_gpu` 가 같으면
+    /// 디바이스 공유가 정상이다. 여기서 경고하면 오탐이라 아무도 안 보게 된다.
+    #[test]
+    fn same_device_for_the_same_gpu_is_normal() {
+        let owners = [(0xAB_usize, Some(0_usize))];
+        assert_eq!(conflicting_device_owner(&owners, 0xAB, Some(0)), None);
+    }
+
+    /// 잡으면 안 되는 것 2: 디바이스가 실제로 갈린 정상 팬아웃.
+    #[test]
+    fn distinct_devices_are_normal() {
+        let owners = [(0xAB_usize, Some(0_usize))];
+        assert_eq!(conflicting_device_owner(&owners, 0xCD, Some(1)), None);
+    }
+
+    /// 잡으면 안 되는 것 3: GPU 를 지정하지 않은 경우(월이 아닌 일반 실행).
+    #[test]
+    fn unspecified_gpu_does_not_conflict_with_itself() {
+        let owners = [(0xAB_usize, None)];
+        assert_eq!(conflicting_device_owner(&owners, 0xAB, None), None);
+    }
+
+    /// 지정/미지정이 섞이면 그것도 팬아웃이 깨진 상태다.
+    #[test]
+    fn specified_and_unspecified_gpu_conflict() {
+        let owners = [(0xAB_usize, None)];
+        assert_eq!(conflicting_device_owner(&owners, 0xAB, Some(1)), Some(None));
+    }
 }
 
 impl MediaExternalImages {
@@ -621,9 +747,23 @@ impl MediaExternalImages {
         // 소비자(ANGLE) 디바이스를 레지스트리에 publish한다. 이 값이 있어야
         // 프로듀서가 plane 링을 만들어 프레임을 채운다 — publish 전에는
         // 프로듀서가 모든 프레임을 드롭한다(WR YUV 직접 샘플 경로의 on-switch).
+        let mut own_device: Option<usize> = None;
         if let Some(rc) = rendering_context.as_ref() {
             if let Some(device) = rc.media_d3d11_device_handle() {
+                // WALLDIAG(임시 진단): 이 호출은 프로세스 전역 CONSUMER_DEVICE 를
+                // **덮어쓴다**(1회 가드가 없다). painter 마다 한 번씩 찍히므로
+                // **마지막 줄이 최종 소유자**이고, 36 개 비디오의 plane 텍스처는 전부
+                // 그 디바이스에 생성된다(render-d3d11 ensure_ring).
+                let requested_gpu = rc.requested_gpu_index();
+                info!(
+                    "WALLDIAG consumer-device publish: device=0x{device:x} \
+                     requested_gpu={requested_gpu:?} (overwrites previous publisher; last one wins)"
+                );
+                // 조용한 실패 방지: 서로 다른 GPU 를 요청한 타일들이 같은 디바이스를 받으면
+                // 여기서 크게 경고한다(위 doc 주석 참고).
+                note_media_d3d11_device(device, requested_gpu);
                 D3d11PlaneRings::set_consumer_device(device);
+                own_device = Some(device);
             }
         }
         Self {
@@ -632,13 +772,21 @@ impl MediaExternalImages {
             rendering_context,
             d3d11_wrap_cache: Default::default(),
             locked_d3d11_planes: Default::default(),
+            diag_logged_wrap_ok: false,
+            diag_logged_wrap_fail: false,
+            device: own_device,
         }
     }
 
     /// 제거된 링들을 정리한다: `mapped` 텍스처 Unmap(Presenting은 레지스트리가
     /// 이미 제외) → 캐시된 GL 래핑 파기 → 텍스처 Release.
     fn purge_removed_d3d11_entries(&mut self) {
-        let removed = D3d11PlaneRings::take_removed_rings();
+        // ★디바이스 한정★ 전역 드레인은 남의 painter 디바이스 텍스처까지 가져가
+        // Release 하게 된다(멀티 GPU 월).
+        let Some(device) = self.device else {
+            return;
+        };
+        let removed = D3d11PlaneRings::take_removed_rings_for_device(device);
         if removed.is_empty() {
             return;
         }
@@ -670,20 +818,32 @@ impl MediaExternalImages {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
 
-        // 여기서부터는 note_plane_lock_and_plan을 호출해 lock_count를 올릴 수
-        // 있으므로, unlock이 반드시 note_plane_unlock으로 짝을 맞추도록 로컬에
-        // 기록해 둔다(글로벌 바인딩 맵이 lock~unlock 사이 변경돼도 안전).
-        self.locked_d3d11_planes.insert(id, binding.ring_id);
+        // ★가시성 신호★ — WR 은 이 타일에서 실제로 합성하는 external image 만
+        // lock 한다. 따라서 이 호출이 곧 "이 영상이 이 타일에 보인다" 이고,
+        // 프로듀서는 여기에 기록된 디바이스에만 업로드한다.
+        let Some(device) = self.device else {
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        };
+        D3d11PlaneRings::note_demand(binding.group_id, device);
+
+        // 이 디바이스에 아직 링이 없다(첫 수요). 프로듀서가 다음 프레임에 만든다 —
+        // 이번 프레임만 비운다. lock_count 를 올리지 않았으므로 unlock 도 no-op 이다.
+        let Some(ring_id) = D3d11PlaneRings::ring_for(binding.group_id, device) else {
+            return (ExternalImageSource::Invalid, Size2D::zero());
+        };
+
+        // 여기서부터 lock_count 를 올리므로 unlock 이 짝을 맞추도록 기록한다.
+        self.locked_d3d11_planes.insert(id, ring_id);
 
         // 합성당 1회 소비: 링별 lock_count 0→1 전이에서만 plan이 나온다.
         // Some(plan)은 반드시 정확히 한 번 commit_consume으로 끝나야 한다
         // (consume_plan이 모든 실패 분기 포함 이를 보장한다).
-        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(binding.ring_id) {
-            consume_plan(&*rc, binding.ring_id, plan);
+        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(ring_id) {
+            consume_plan(&*rc, ring_id, plan);
         }
 
         // lock 반환용 텍스처: 현재 Presenting 슬롯의 이 plane 기술자.
-        let Some(plane) = D3d11PlaneRings::presenting_plane(binding.ring_id, binding.plane_index)
+        let Some(plane) = D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index)
         else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
@@ -695,6 +855,17 @@ impl MediaExternalImages {
             let import_start = std::time::Instant::now(); // D3D11PROF
             match rc.wrap_d3d11_texture_as_gl_texture(plane.texture) {
                 Some(wrap) => {
+                    // WALLDIAG(임시 진단): 이 painter 가 **자기 디바이스가 아닌** 곳에
+                    // 만들어진 plane 텍스처를 실제로 래핑할 수 있는지. painter 당 1회.
+                    if !self.diag_logged_wrap_ok {
+                        self.diag_logged_wrap_ok = true;
+                        info!(
+                            "WALLDIAG wrap OK: requested_gpu={:?} texture=0x{:x} ring_id={}",
+                            rc.requested_gpu_index(),
+                            plane.texture,
+                            ring_id,
+                        );
+                    }
                     // D3D11PROF: 렌더러 스레드 첫-lock 래핑 소요 — 매 건 로깅
                     // (일회성 이벤트). n/sum_ms는 프로세스 누계.
                     if d3d11_profile_enabled() {
@@ -712,6 +883,17 @@ impl MediaExternalImages {
                     wrap
                 },
                 None => {
+                    // WALLDIAG(임시 진단): 실패도 painter 당 1회만 요약해 남긴다.
+                    // 아래 warn! 은 매 건 나오므로 홍수가 되면 이 줄로 판정할 것.
+                    if !self.diag_logged_wrap_fail {
+                        self.diag_logged_wrap_fail = true;
+                        info!(
+                            "WALLDIAG wrap FAIL: requested_gpu={:?} texture=0x{:x} ring_id={}",
+                            rc.requested_gpu_index(),
+                            plane.texture,
+                            ring_id,
+                        );
+                    }
                     warn!("D3D11 media: EGLImage 래핑 실패 (texture={})", plane.texture);
                     return (ExternalImageSource::Invalid, Size2D::zero());
                 },
@@ -732,7 +914,10 @@ impl Drop for MediaExternalImages {
             return;
         };
         // 1) 이미 제거된 링: 전체 정리(Unmap + 래핑 파기 + Release).
-        for ring in D3d11PlaneRings::take_removed_rings() {
+        let Some(device) = self.device else {
+            return;
+        };
+        for ring in D3d11PlaneRings::take_removed_rings_for_device(device) {
             for texture in ring.mapped {
                 rc.unmap_d3d11_texture(texture);
             }
