@@ -1,0 +1,11 @@
+{
+  "virtualViewport": {
+    "width": 3840,
+    "height": 1080
+  },
+  "tiles": [
+    { "display": 0, "gpu": 0, "rect": [0, 0, 1920, 1080] },
+    { "display": 1, "gpu": 1, "rect": [1920, 0, 1920, 1080] }
+  ],
+  "overlapPx": 0
+}
