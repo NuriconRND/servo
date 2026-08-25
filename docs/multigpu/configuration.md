@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 24 + 조사용 env 15)
+# 설정 노브 전량 (pref 25 + 조사용 env 17)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -64,7 +64,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 24 개
+## pref 25 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
 
@@ -106,6 +106,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_decoder_policy` | String | `""` (= software) | 비디오 디코더 선택 정책. 인정 토큰(대소문자 무시): `auto`/`default` = 자동 선택 유지, `software`/`avdec` = 소프트웨어 디코더 강제. 그 외 값은 경고 후 software. |
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_video_sink_qos` | String | `""` (= 정책값) | appsink 의 `qos` 만 정책과 **독립적으로** 덮어쓴다. 토큰: `on`/`true`/`1`, `off`/`false`/`0`. 그 외는 경고 후 정책값. ★`media_video_sink_policy` 는 qos/drop/max-lateness/max-buffers 를 **한 묶음**으로 바꾸므로 qos 만 재려면 이쪽을 쓴다.★ 기본(Smooth)은 `qos=false` 이고 이는 GStreamer 기본이 아니라 **이 포크가 명시적으로 끄는 값**이다 — 꺼져 있으면 QoS 이벤트가 상류로 가지 않아 **avdec 이 부하 시 프레임을 건너뛰지 못한다**(과부하에서 완만한 열화 대신 절벽). |
+| `media_video_sink_pacing` | String | `""` (= clock) | 비디오 싱크의 **페이싱 방식**. `clock` = 현행(appsink `sync=true`, 파이프라인 클럭 대기). `thread` = appsink `sync=false` + 스트리밍 스레드가 PTS 앵커에 맞춰 직접 잠. ★`GstSystemClock::obtain()` 은 프로세스당 싱글턴이라 파이프라인 45 개의 싱크가 프레임마다 **같은 객체**에서 대기한다★ — 실측(80 논리코어, 45xFHD30, Servo 없이 디코드만): 45 프로세스 0.399 코어/영상, 1 프로세스 0.795, 1 프로세스 + 클럭 없이 sleep 0.284. 공유 클럭 대기가 디코딩만큼을 더 쓴다. **비범위**: `thread` 는 파이프라인마다 독립 앵커라 영상 간 동기를 보장하지 않는다(`media_sync_group_target` 과 양립 불가) — 별도 과제 Video Sync Group. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
 ### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content` / `dom_iframe_toplevel_embed_enabled`
@@ -246,6 +247,31 @@ external 비디오 present 파이프라인 프로파일러 게이트. 켜지면 
 ### `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF` — `Str`
 
 킬 스위치: PlayerError::EnoughData 백오프(요청 취소/재탐색)를 끈다. truthy: "1"/"true"/"yes"/"on"(대소문자 무시). gstreamer player 백엔드와 HTMLMediaElement 두 곳에서 각자 같은 판정으로 게이트한다.
+
+### `SERVO_MEDIA_VIDEO_RATE` — `Str`
+
+파이프라인별 VIDEORATE 요약을 1초에 한 줄씩 info로 찍는다. truthy: "1"/"true"/"on"(대소문자 무시). fps는 appsink가 실제로 받은 프레임 수, pts_rate는 pts가 벽시계 대비 몇 배로 진행하는지다 — 1.0이면 정상 재생, 2.7이면 디코더가 그만큼 앞질러 돌고 있다는 뜻. 기본 off인 이유는 45타일 장시간 운용에서 초당 45줄이 쌓이기 때문이다(같은 이유로 기존 sample summary는 debug에 있다).
+
+```
+VIDEORATE id=12 fps=82.3 pts_rate=2.74x frames=247 window_ms=1002
+```
+
+★CPU 수치만으로는 "디코더가 2.7배 빠르게 앞질러 돈다"와 "1배로 도는데 프레임당
+비용이 2.7배다"가 구분되지 않는다★ — 이 줄이 그 둘을 가른다. gapless 루프가 pts 를
+되감은 창은 비율 대신 `wrapped` 로 표시하고 집계에서 뺀다. 런처는 `-VideoRate` 로
+켜고 종료 후 min/median/max 를 요약한다.
+
+### `SERVO_FRAME_REASON_PROF` — `Str`
+
+generate_frame 을 부른 호출 지점과 RenderReasons 를 1초에 한 줄로 집계한다. truthy: "1"/"true"/"on"(대소문자 무시). 합성 요청 경로가 9 곳이라 어느 것이 초당 200 회를 만드는지 로그만 보고는 가를 수 없다. 호출 지점은 #[track_caller] 로 얻으므로 호출부는 손대지 않는다. 프레임마다 불리는 핫패스라 기본 off 다.
+
+```
+FRAMEREASON total=217 window_ms=1001 painter.rs:2030/SCENE=198 painter.rs:2136/SCENE=1
+```
+
+실측(2026-08-25, 20 영상 단일 타일): 합성의 99% 가 `generate_frame_for_script`
+한 지점에서 나왔고 영상 도착 경로는 무시할 수준이었다. 런처는 `-FrameReason` 으로
+켜고 종료 후 호출 지점별 초당 횟수를 요약한다.
 
 ## wall CLI 플래그
 

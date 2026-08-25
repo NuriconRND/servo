@@ -37,6 +37,17 @@ param(
     # once -- use -SinkQos when you want to move only qos.
     [ValidateSet("", "smooth", "low-latency")]
     [string] $SinkPolicy = "",
+    # media_video_sink_pacing. "thread" turns the sink's clock wait off and paces in the
+    # streaming thread instead.
+    #
+    # GstSystemClock::obtain() is a per-PROCESS singleton, so 45 pipelines' sinks all wait on
+    # the same object every frame. Measured on 80 logical cores with 45 x FHD30, decode only,
+    # no Servo: 45 separate processes 0.399 cores/video, one process 0.795, one process with
+    # the clock replaced by a plain sleep 0.284. The shared clock costs as much as the
+    # decoding does. NOTE: "thread" gives each pipeline its own anchor, so videos are NOT
+    # synchronised with each other -- that is a separate task (Video Sync Group).
+    [ValidateSet("", "clock", "thread")]
+    [string] $SinkPacing = "",
     [int]    $MaxPending = 0,            # 0 = leave default (1)
     [int]    $MinIntervalMs = 0,         # 0 = leave default (16)
     [int]    $DurationSec = 0,
@@ -47,8 +58,35 @@ param(
     # decoded planes into GPU-mapped memory -- the thing to look at when decode is cheap
     # but the wall still saturates CPU.
     [switch] $D3d11Profile,
-    # SERVO_D3D11_PROFILE_MS threshold (default 8). Lower it to see more frames.
-    [int]    $D3d11ProfileMs = 0,
+    # SERVO_D3D11_PROFILE_MS threshold in ms (engine default 8). The engine logs a frame
+    # when total >= threshold, so 0 means EVERY frame -- which is why this must be
+    # distinguishable from "not supplied". A `-gt 0` guard used to swallow `0` and
+    # silently leave the engine default in place, so a run asked for full logging and
+    # quietly measured something else.
+    [int]    $D3d11ProfileMs = -1,
+    # SERVO_MEDIA_VIDEO_RATE=1: one VIDEORATE line per second per video.
+    #   fps      = frames the appsink actually received
+    #   pts_rate = how fast pts advances against the wall clock
+    # 1.00x means the pipeline plays at normal speed; 2.7x means the decoder is
+    # running that far ahead, which is the difference between a throttling bug and
+    # a machine that is simply contended. Off by default: 45 lines a second.
+    [switch] $VideoRate,
+    # SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE=1: stop re-compositing the whole scene
+    # every time a video frame arrives.
+    #
+    # By default painter.rs::update_images calls generate_frame(SCENE) on each video
+    # arrival -- its own comment says it 're-renders the full current display list'
+    # and warns it worsens 'as the number of simultaneous videos grows'. The only
+    # brake is pending_frames == 0, so the rate is set by how fast a composite
+    # completes, NOT by the display refresh: 20 videos measured 236 presents/s on a
+    # 60Hz wall. With this set, video frames ride the script rendering-opportunity
+    # cadence instead.
+    [switch] $NoImmediateComposite,
+    # SERVO_FRAME_REASON_PROF=1: one line per second naming WHICH call site asked for each
+    # composite. There are nine generate_frame call sites; gfx_refresh_hz only paces the
+    # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
+    # around 110/s -- yet a single painter was measured at 200+/s. This says who.
+    [switch] $FrameReason,
     # Attribute the wall's CPU to its individual threads while it plays. Answers the
     # question D3D11PROF cannot: decode and upload run on ~N parallel streaming
     # threads, so if one of the FEW single-threaded stages (Compositor, Renderer,
@@ -85,7 +123,13 @@ Get-ChildItem Env: | Where-Object { $_.Name -like "SERVO_*" } |
 
 # Set AFTER the SERVO_* wipe above, or it gets cleared.
 if ($D3d11Profile)        { $env:SERVO_D3D11_PROFILE = "1" }
-if ($D3d11ProfileMs -gt 0) { $env:SERVO_D3D11_PROFILE_MS = "$D3d11ProfileMs" }
+if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
+    if ($D3d11ProfileMs -lt 0) { throw "-D3d11ProfileMs must be 0 or greater (0 = log every frame)" }
+    $env:SERVO_D3D11_PROFILE_MS = "$D3d11ProfileMs"
+}
+if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
+if ($NoImmediateComposite) { $env:SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE = "1" }
+if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
 
 $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
@@ -114,6 +158,7 @@ $argList = @(
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
+if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$SinkPacing") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
 $argList += $Url
@@ -121,8 +166,8 @@ $argList += $Url
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy})"
-Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent)$(if($D3d11ProfileMs -gt 0){" threshold=${D3d11ProfileMs}ms"})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing})"
+Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
 
@@ -235,6 +280,68 @@ if ($prof.Count -gt 0) {
     $copyShare = 100 * (($cop | Measure-Object -Sum).Sum) / [math]::Max((($tot | Measure-Object -Sum).Sum), 0.001)
     Write-Host ("  copy is {0:N0}% of total media stage time" -f $copyShare)
     Write-Host "  (copy = CPU memcpy of decoded planes into GPU-mapped memory)"
+}
+
+# --- VIDEORATE: is the decoder running at playback speed? (only with -VideoRate) ---
+# The whole point of this block: CPU numbers cannot tell "decoding 2.7x too fast" apart
+# from "decoding at 1x but each frame costs 2.7x under contention". pts_rate can.
+$rate = Select-String -Path $LogPath -Pattern "VIDEORATE id=(\d+) fps=([\d.]+) pts_rate=([\d.]+)x" -EA SilentlyContinue
+$wrapped = (Select-String -Path $LogPath -Pattern "pts_rate=wrapped" -EA SilentlyContinue | Measure-Object).Count
+if ($rate) {
+    # NOT $rows: PowerShell variable names are case-insensitive, so $rows IS the
+    # [int] $Rows parameter above and assigning an array to it fails at runtime.
+    $rateRows = foreach ($m in $rate) {
+        [pscustomobject]@{
+            Id   = [int]$m.Matches[0].Groups[1].Value
+            Fps  = [double]$m.Matches[0].Groups[2].Value
+            Rate = [double]$m.Matches[0].Groups[3].Value
+        }
+    }
+    # Drop each pipeline's FIRST window: it starts at the first sample, which lands
+    # mid-preroll, so it reads far low (measured: 0.30x while the rest sat at 1.00x).
+    $kept = foreach ($g in ($rateRows | Group-Object Id)) {
+        if ($g.Count -gt 1) { $g.Group | Select-Object -Skip 1 }
+    }
+    if ($kept) {
+        $fpsSorted  = @($kept.Fps)  | Sort-Object
+        $rateSorted = @($kept.Rate) | Sort-Object
+        $medRate = $rateSorted[[int][math]::Floor($rateSorted.Count / 2)]
+        $medFps  = $fpsSorted[[int][math]::Floor($fpsSorted.Count / 2)]
+        Write-Host ""
+        Write-Host "VIDEORATE -- delivered frames per pipeline ($(($rateRows | Group-Object Id).Count) pipelines, $($fpsSorted.Count) windows):"
+        Write-Host ("  fps       min={0:N1}  median={1:N1}  max={2:N1}" -f $fpsSorted[0], $medFps, $fpsSorted[-1])
+        Write-Host ("  pts_rate  min={0:N2}x median={1:N2}x max={2:N2}x" -f $rateSorted[0], $medRate, $rateSorted[-1])
+        if ($wrapped -gt 0) { Write-Host "  ($wrapped window(s) skipped: gapless loop wrapped pts backwards)" }
+        if ($medRate -gt 1.25) {
+            Write-Warning ("decoders run {0:N2}x faster than playback -- the sink is NOT throttling. That is where the CPU goes, not contention." -f $medRate)
+        } elseif ($medRate -lt 0.85) {
+            Write-Host "  -> pipelines are BEHIND playback speed: frames are not being produced fast enough."
+        } else {
+            Write-Host "  -> playback speed is normal. High per-video CPU is then per-frame cost (contention), not extra frames."
+        }
+    }
+}
+
+# --- FRAMEREASON: which call site is producing the composites (only with -FrameReason) ---
+$fr = Select-String -Path $LogPath -Pattern "FRAMEREASON total=(\d+) window_ms=[\d.]+ (.*)$" -EA SilentlyContinue
+if ($fr) {
+    $tally = @{}
+    $totals = @()
+    foreach ($m in $fr) {
+        $totals += [int]$m.Matches[0].Groups[1].Value
+        foreach ($part in ($m.Matches[0].Groups[2].Value -split ' ')) {
+            if ($part -match "^(painter\.rs:\d+/\S+)=(\d+)$") {
+                $tally[$Matches[1]] = [int]$Matches[2] + $tally[$Matches[1]]
+            }
+        }
+    }
+    $windows = $fr.Count
+    Write-Host ""
+    Write-Host "FRAMEREASON -- who asked for the composites ($windows one-second windows):"
+    Write-Host ("  composites/s  avg={0:N1}  max={1}" -f (($totals | Measure-Object -Average).Average, ($totals | Measure-Object -Maximum).Maximum))
+    foreach ($k in ($tally.Keys | Sort-Object { -$tally[$_] })) {
+        Write-Host ("    {0,8:N1}/s  {1}" -f ($tally[$k] / [math]::Max($windows, 1)), $k)
+    }
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }

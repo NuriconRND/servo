@@ -40,10 +40,12 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
     TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
+use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
 use windows_sys::Win32::System::Threading::{
-    ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetProcessTimes, GetThreadDescription,
-    GetThreadTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-    THREAD_QUERY_LIMITED_INFORMATION,
+    ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetActiveProcessorGroupCount,
+    GetNumaHighestNodeNumber, GetProcessTimes, GetSystemTimes, GetThreadDescription,
+    GetThreadGroupAffinity, GetThreadTimes, OpenProcess, OpenThread,
+    PROCESS_QUERY_LIMITED_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::core::PWSTR;
 
@@ -140,6 +142,7 @@ struct ThreadSample {
     cpu: u64,
     created: u64,
     name: Option<String>,
+    group: Option<u16>,
 }
 
 /// Reading the name costs an extra call per thread, so it is only done on the
@@ -171,12 +174,33 @@ fn sample_threads(pid: u32, with_names: bool) -> HashMap<u32, ThreadSample> {
                     } else {
                         None
                     },
+                    group: if with_names {
+                        thread_group(handle)
+                    } else {
+                        None
+                    },
                 },
             );
         }
         unsafe { CloseHandle(handle) };
     }
     out
+}
+
+/// Which processor group this thread is scheduled in.
+///
+/// Above 64 logical processors Windows splits the machine into processor groups, and a
+/// thread only ever runs inside one of them. On a wall run that matters: whether the 45
+/// decode threads all landed in one group or got split across two decides how much of
+/// their memory traffic crosses the interconnect -- and that is a startup placement
+/// decision that persists for the life of the process. Two runs of the SAME command
+/// measured 0.96x and 0.60x playback with identical CPU consumption, and the split was
+/// set within the first second, so placement is the first thing to rule in or out.
+fn thread_group(handle: HANDLE) -> Option<u16> {
+    let mut affinity: GROUP_AFFINITY = unsafe { std::mem::zeroed() };
+    // SAFETY: `affinity` is a zeroed out-parameter; the call only writes to it.
+    let ok = unsafe { GetThreadGroupAffinity(handle, &mut affinity) != 0 };
+    ok.then_some(affinity.Group)
 }
 
 fn thread_name(handle: HANDLE) -> Option<String> {
@@ -193,6 +217,22 @@ fn thread_name(handle: HANDLE) -> Option<String> {
     let name = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
     unsafe { LocalFree(wide as *mut c_void as HLOCAL) };
     if name.is_empty() { None } else { Some(name) }
+}
+
+/// Busy CPU ticks for the WHOLE machine, so the report can say whether the process
+/// accounts for what the box is actually doing.
+///
+/// This exists because a 45-video wall run showed 68% for the process while the machine
+/// was observed at 100%. A per-process tool cannot tell whether the missing quarter is
+/// another process, the GPU driver, or kernel work outside this process -- and that gap
+/// changes what the whole measurement means. GetSystemTimes counts idle inside kernel
+/// time, so busy = kernel + user - idle.
+fn machine_cpu() -> Option<u64> {
+    let mut idle: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) != 0 };
+    ok.then(|| (ticks(kernel) + ticks(user)).saturating_sub(ticks(idle)))
 }
 
 fn process_cpu(pid: u32) -> Option<u64> {
@@ -295,14 +335,30 @@ fn main() {
             .unwrap_or(1),
         n => n as usize,
     };
+    // SAFETY: both calls are plain reads of static system topology.
+    // NOT `groups`: that name already holds the thread-name HashMap below.
+    let group_count = unsafe { GetActiveProcessorGroupCount() }.max(1);
+    let per_group: Vec<u32> = (0..group_count)
+        .map(|g| unsafe { GetActiveProcessorCount(g) })
+        .collect();
+    let mut highest_numa: u32 = 0;
+    let numa_nodes = unsafe { GetNumaHighestNodeNumber(&mut highest_numa) != 0 }
+        .then(|| highest_numa + 1)
+        .unwrap_or(1);
+    println!("thread_cpu_probe: {label}  sampling {:.0}s", args.duration);
     println!(
-        "thread_cpu_probe: {label}  sampling {:.0}s  logical cpus={cpus}",
-        args.duration
+        "  topology: {cpus} logical cpus in {group_count} processor group(s) [{}], {numa_nodes} NUMA node(s)",
+        per_group
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("+")
     );
 
     let start = Instant::now();
     let before = sample_threads(pid, false);
     let process_before = process_cpu(pid);
+    let machine_before = machine_cpu();
     if before.is_empty() {
         eprintln!("no threads readable for pid {pid} (is it running? try an elevated shell)");
         std::process::exit(1);
@@ -310,6 +366,7 @@ fn main() {
     sleep(Duration::from_secs_f64(args.duration));
     let after = sample_threads(pid, true);
     let process_after = process_cpu(pid);
+    let machine_after = machine_cpu();
     let elapsed = start.elapsed().as_secs_f64();
 
     if after.is_empty() {
@@ -398,6 +455,16 @@ fn main() {
             process_cores,
             100.0 * process_cores / cpus as f64
         );
+        if let (Some(before_all), Some(after_all)) = (machine_before, machine_after) {
+            let machine_cores =
+                after_all.saturating_sub(before_all) as f64 / TICKS_PER_SEC / elapsed;
+            println!(
+                "  {:6.2}  {:4.1}%               WHOLE MACHINE (this process is {:.0}% of it)",
+                machine_cores,
+                100.0 * machine_cores / cpus as f64,
+                100.0 * process_cores / machine_cores.max(0.01)
+            );
+        }
         // The two should agree closely. A gap means threads came and went inside
         // the window, and their time is only in the process figure.
         let gap = process_cores - total;
@@ -406,6 +473,36 @@ fn main() {
                 "  note: {gap:+.2} cores unattributed -- {exited} thread(s) exited and \
                  {started_during} started during the window"
             );
+        }
+    }
+
+    // Where the threads actually landed. Only meaningful above one group, and it is
+    // exactly what separates two runs of the same command that consume the same CPU
+    // but deliver different throughput.
+    if group_count > 1 {
+        let mut group_cores: HashMap<u16, (f64, usize)> = HashMap::new();
+        for (tid, now) in &after {
+            let delta = match before.get(tid) {
+                Some(then) if then.created == now.created => now.cpu.saturating_sub(then.cpu),
+                _ => now.cpu,
+            };
+            let entry = group_cores
+                .entry(now.group.unwrap_or(u16::MAX))
+                .or_default();
+            entry.0 += delta as f64 / TICKS_PER_SEC / elapsed;
+            entry.1 += 1;
+        }
+        let mut ranked: Vec<_> = group_cores.into_iter().collect();
+        ranked.sort_by_key(|(group, _)| *group);
+        println!();
+        println!(
+            "  processor group placement (a split process pays for cross-group memory traffic):"
+        );
+        for (group, (cores, threads)) in ranked {
+            match group {
+                u16::MAX => println!("    unknown : {threads:3} threads  {cores:6.2} cores"),
+                g => println!("    group {g:<2}: {threads:3} threads  {cores:6.2} cores"),
+            }
         }
     }
 

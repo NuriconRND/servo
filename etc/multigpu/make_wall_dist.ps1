@@ -92,6 +92,9 @@ Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pa
 
 # --- 5. launcher ---
 Copy-Item (Join-Path $PSScriptRoot "run_wall_dist.ps1") $Out -Force
+# The decode baseline tool ships too: the wall's cores-per-video number is only
+# readable next to this machine's single-thread decode ceiling.
+Copy-Item (Join-Path $PSScriptRoot "tools\measure_decode_only.ps1") $Out -Force
 
 $dll = (Get-ChildItem (Join-Path $engine "*.dll") | Measure-Object).Count
 $size = [math]::Round(((Get-ChildItem $Out -Recurse -Force | Measure-Object -Property Length -Sum).Sum / 1GB), 2)
