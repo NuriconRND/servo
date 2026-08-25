@@ -1753,3 +1753,362 @@ panic 0, 38.8fps. ★분산 자체는 4-GPU 실기에서만 확인 가능하다.
 
 escape 를 켜면 **두 가지를 함께** 봐야 한다: (1) 링이 9/9/9/9 로 분산되는지, (2) 앞서 미해결로
 남은 **external 승격 158ms 이상치**가 재현되는지(당시는 1-GPU 상태의 관측이라 재확인 필요).
+
+---
+
+# 2026-08-25 — 디코더 CPU: `media_video_sink_qos` 신설
+
+## 관측
+
+같은 장비에서 운영 월 솔루션은 같은 영상 54 개를 CPU 여유를 남기고 재생하는데, 이 빌드는
+**42 개까지만 정상이고 45 개부터 CPU 100% 로 무너진다.**
+
+★두 가지를 먼저 정정한다★:
+
+1. **팬아웃 가설 반증.** 1 타일과 4 타일이 **둘 다** 45 개에서 포화된다. 타일 수만큼
+   곱해지는 페인트 비용(`update_images` x painter 수)은 원인이 아니다. 그리고 앞선 4 타일
+   조사와 달리 **총 CPU 가 100% 에 도달**한다 — 단일 스레드 병목이 아니라 전 코어 포화다.
+2. **운영 월 솔루션은 Servo 기반이 아니다**(사용자 확인). 공통점은 GStreamer 파이프라인 +
+   ffmpeg 계열 element 뿐이다. 따라서 "대조군 A(b0a7ce85) vs 운영 월" 로 코드/런타임을
+   가르려던 앞 절의 제안은 **성립하지 않는다 — 폐기한다.** 54 vs 42 는 서로 다른 두
+   애플리케이션의 차이라, 디코더가 아니라 Servo 의 프레임당 작업 어디든 원인일 수 있다.
+
+## avdec 에 지금 설정하는 것
+
+`max-threads` **하나뿐**이다(`configure_software_decoder_threads`). 그리고 싱크는:
+
+```
+policy=smooth max_buffers=3 drop=false qos=false max_lateness_ns=-1 processing_deadline_ns=0
+```
+
+★`qos=false` 는 GStreamer 요소 기본값이 아니라 **이 포크가 명시적으로 끄는 값**이다★
+(`render.rs` 의 `appsink.set_property("qos", ...)`). qos 가 꺼져 있으면 QoS 이벤트가 상류로
+가지 않아 **avdec 이 부하 상황에서 프레임을 건너뛰지 못한다** — 한계를 넘는 순간 완만한
+열화가 아니라 절벽으로 무너진다(42 -> 45 거동과 일치).
+
+`max-threads` 는 **올리면 안 된다** — 원장 §3-a: 자동 스레딩은 디코더당 코어 수만큼 스레드를
+만들어 36 타일에서 700+ 스레드로 스케줄러를 무너뜨렸다.
+
+## `media_video_sink_qos` (신설)
+
+기존 `media_video_sink_policy` 로도 qos 를 켤 수 있지만 **네 값이 한꺼번에 바뀐다**:
+
+| 정책 | qos | drop | max-lateness | max-buffers |
+|---|---|---|---|---|
+| Smooth(기본) | false | false | -1 | 3 |
+| LowLatency | true | **true** | **16ms** | **1** |
+
+qos 만 재려면 변수 넷이 섞이므로 독립 노브를 만들었다.
+
+```
+--pref media_video_sink_qos=on    # qos 만 on (drop/lateness/buffers 는 Smooth 그대로)
+--pref media_video_sink_qos=off   # 강제 off
+(빈 값)                            # 정책값 따름 = 종전 동작
+```
+
+런처: `run_wall_dist.ps1 -SinkQos on` (그리고 정책 자체는 `-SinkPolicy low-latency`).
+
+**검증**(개발기, 9 개 비포화): 나머지 값 고정된 채 `qos=false` -> `qos=true` 만 바뀜을 로그로
+확인. fps 는 74.7 vs 72.2 로 차이 없음 — **부하가 걸려야 개입하므로 당연하다.**
+
+## 실기 판정
+
+```powershell
+.\run_wall_dist.ps1 -Layout wall_layout.singlegpu.json -Rows 9 -Cols 5 -MinIntervalMs 1 -DurationSec 30
+.\run_wall_dist.ps1 -Layout wall_layout.singlegpu.json -Rows 9 -Cols 5 -MinIntervalMs 1 -DurationSec 30 -SinkQos on
+```
+
+| 결과 | 뜻 | 다음 |
+|---|---|---|
+| CPU 내려가고 재생 유지 | 디코더가 스킵으로 부하를 던다 | 54 개까지 밀어붙일 여지 |
+| CPU 그대로, 프레임만 드롭 | 디코드가 이미 최대치 | 절감이 아니라 열화 완화 |
+| 차이 없음 | **QoS 가 avdec 까지 전달되지 않는다** | `skip-frame` 직접 설정 / 파이프라인 구조 확인 |
+
+세 번째가 실재한다 — QoS 이벤트는 싱크에서 상류로 전파되는데 중간 요소나 `sync=false` 가
+끊을 수 있다. 그때는 avdec 의 `skip-frame`(AVDISCARD)을 직접 거는 쪽으로 가야 한다.
+
+★qos 실험이 무효로 나오면 다음은 디코드 CPU 자체를 분리 측정하는 것이다★ — 같은 45 개를
+렌더 경로 없이 디코드만 돌려(예: fakesink) Servo 의 프레임당 작업과 디코드를 갈라야 한다.
+지금은 둘이 섞여 있어 "디코더가 비싼지" 자체가 미확정이다.
+
+---
+
+# 2026-08-25 (2) — 디코드/렌더 분리 측정 도구
+
+## 관측이 가리키는 방향
+
+- qos=on 이면 CPU 는 확실히 내려가지만, **운영 월 대비 여전히 높고** qos 가 개입하는 영상은
+  정의상 fps 가 정상일 수 없다. **근본 해결책이 아니다**(사용자 판단, 동의).
+- ★**영상 수가 늘면 CPU 는 한계까지 오르는데 GPU 점유율은 오히려 크게 떨어진다.**★
+  렌더할 내용이 도착하지 않는 것처럼 보인다.
+
+→ 병목은 **GPU 상류**(디코드 + CPU 측 프레임 작업)다. GPU 는 굶고 있다.
+
+문제는 월 안에서는 **디코드 비용과 Servo 의 프레임당 작업이 섞여** 측정된다는 것이다.
+"디코더가 비싼가" 자체가 아직 미확정이다.
+
+## `etc/multigpu/tools/measure_decode_only.ps1`
+
+Servo 를 완전히 배제하고 **순수 디코드 비용의 바닥값**을 잰다.
+
+```
+filesrc ! qtdemux ! h264parse ! avdec_h264 max-threads=N ! fakesink sync=true
+```
+
+업로드도 합성도 표시도 없다. 월과 같은 개수로 돌리면 뺄셈이 성립한다:
+
+```
+바닥값            = N 개 디코드 자체 비용 (이 도구)
+월 총량 - 바닥값  = Servo 가 프레임당 추가하는 비용 (업로드/이미지 팬아웃/씬/present)
+```
+
+`sync=true` 가 기본이다 — 월은 30fps 로 재생하므로 최대속도 디코드는 비교 대상이 아니다.
+`-MaxThreads` 로 avdec 스레드 수를, `-GstRoot` 로 **다른 GStreamer 런타임**(1.22.8 vs
+1.28.4.100)을 지정해 런타임 축도 같은 방법으로 가를 수 있다.
+
+## 개발기 참고값 (24 논리코어, RX 580 x1)
+
+```
+9 개 디코드 = 1.86 코어 (영상당 0.206 코어), 머신 전체 9.2%
+-> 45 개 외삽 약 9.3 코어 = 24 코어의 약 40%
+```
+
+즉 이 하드웨어에서는 **디코드만으로 45 개가 CPU 를 채우지 못한다.** 그쪽 장비에서 같은 수를
+재야 확정이지만, 사실이라면 **나머지가 Servo 의 프레임당 작업**이고 avdec 튜닝은 표적이 아니다.
+
+## 실기 측정 순서
+
+```powershell
+# 1) 바닥값 - Servo 없이 45 개 디코드만
+etc\multigpu\tools\measure_decode_only.ps1 -Count 45
+
+# 2) 같은 45 개를 월에서 (단일 타일, qos 기본)
+.\run_wall_dist.ps1 -Layout wall_layout.singlegpu.json -Rows 9 -Cols 5 -MinIntervalMs 1 -DurationSec 30
+```
+
+| 1 번 결과 | 뜻 | 다음 표적 |
+|---|---|---|
+| 코어 대부분을 이미 소모 | 디코드가 진짜 벽 | avdec/런타임(1.22.8 비교), 하드웨어 디코드 |
+| 여유가 크다(예: 40%) | ★**Servo 의 프레임당 작업이 나머지를 먹는다**★ | 업로드(memcpy) / 이미지 팬아웃 / 씬 빌드 |
+
+2 번이 1 번보다 크게 높다면 그 차이가 곧 Servo 오버헤드다. 그때 후보는 순서대로:
+CPU memcpy 업로드(영상당 프레임당 FHD I420 약 3.1MB), `update_images` 팬아웃,
+painter 별 씬 빌드. `media_d3d11_enabled=false` 로 업로드 경로를 바꿔 보는 것이
+그중 업로드 축을 가르는 가장 값싼 A/B 다.
+
+
+## 2026-08-25 — 업로드 memcpy 반증, 그리고 스레드별 CPU 계측
+
+### 실기 결과: 디코드는 45 개에서 30%
+
+위 "실기 측정 순서" 의 1 번이 그쪽 장비에서 나왔다.
+
+```
+measure_decode_only.ps1 -Count 45  ->  CPU 약 30%
+```
+
+표의 **"여유가 크다"** 분기다. 디코드는 벽이 아니고, 나머지 약 70% 가 Servo 의 프레임당
+작업이다. avdec 튜닝은 표적이 아니므로 종결한다.
+
+### 반증: 업로드 memcpy 도 벽이 아니다
+
+표에서 첫 후보로 적어 둔 "업로드(memcpy)" 는 두 근거로 탈락한다. ★이 절은 그날 잘못
+세웠던 가설("copy 가 media stage 의 98% 이니 복사를 GPU 카피 엔진으로 옮기자")의
+정정이다.★
+
+**(1) 대조군이 같은 방식을 쓴다.** 같은 장비에서 같은 영상을 54 개 여유롭게 재생하는
+운영 월 솔루션(`D:\Project\ViewFlex30\Channel\Common\Common.RendererY\RendererImpl`,
+Servo 기반이 아니고 gstreamer + ffmpeg 계열 디코드만 공통)의 `D3D11YV12TextureWorker` 는
+이 포크와 사실상 같은 코드다.
+
+| | 대조군 | 이 포크 (`ring_producer::copy_planes`) |
+|---|---|---|
+| plane 텍스처 | Y/U/V 3 장 | 같음(슬롯당) |
+| 포맷 | `A8_UNORM` | `R8_UNORM` |
+| Usage / CPUAccess / Misc | `DYNAMIC` / `WRITE` / `0` | 같음 |
+| Map 플래그 | `WRITE_DISCARD` | 같음 |
+| 복사 | 행 단위 memcpy, RowPitch 보정 | 같음 |
+| 프레임당 Map/Unmap | 3 + 3 | 3 + 3 |
+
+Servo 는 링 슬롯이 4 개라 텍스처 수는 더 많지만, free 슬롯을 계속 map 상태로 두므로
+프로듀서는 Map 호출이 없고 소비자가 `ConsumePlan::Advance` 에서 3 Unmap + 3 Map 을 한다.
+**프레임당 D3D11 호출 수와 복사 바이트 수가 대조군과 같다.**
+
+주의: 대조군이 `_marginedWidth/_marginedHeight` 만 복사하는 것은 다운스케일이 아니라
+**영상 표출 영역이 GPU 경계에 걸칠 때의 분할 업로드용 사전 계산값**이다. 한 GPU 영역에
+온전히 표출되는 통상 케이스에서는 전체 프레임을 복사한다 — 복사량 이점이 아니다.
+
+**(2) 산술이 안 맞는다.** 개발기 D3D11PROF(9 개 재생) 기준 `copy` p50 = 2.33ms/영상/프레임.
+
+```
+45 영상 x 30fps x 2.33ms  =  약 3.1 코어-초/초
+```
+
+게다가 이 복사는 **파이프라인별 GStreamer 스트리밍 스레드에서 병렬로** 일어난다
+(`render-d3d11/lib.rs` — "build_frame 은 스트리밍 스레드 1 개에서만"). 디코드 30% 와
+합쳐도 포화에 한참 못 미친다. `copy` 가 media stage 의 98% 인 것은 사실이지만,
+**media stage 자체가 전체 CPU 의 작은 조각**이다.
+
+### 남은 표적
+
+대조군은 "쿼드 N 개에 SRV 3 장씩 물려 그리는 D3D11 렌더러"라 프레임당 비용이
+memcpy + SRV 바인딩 + draw 로 끝난다. 이 포크는 프레임마다 external image 갱신 ->
+더티 -> 디스플레이 리스트/씬 재구성 -> 합성을 돈다. 45 영상 x 30fps = **초당 1350 회**가
+소수의 단일 스레드에 직렬로 몰린다. 관측된 "video 수가 늘어 fps 가 떨어지면 GPU 점유율이
+오히려 감소한다(렌더링할 내용이 안 오는 것처럼)"가 정확히 이 모양이다.
+
+다만 이것도 아직 **가설**이다. 이 조사에서 추론만으로 좁혔다가 오귀인한 전례가 여럿이므로
+(위 반증 목록 참조) 다음은 계측이다.
+
+### 계측: `thread_cpu_probe`
+
+프로세스의 CPU 를 **스레드 이름별로 귀속**시킨다. 45 개 디코드 스레드(병렬, 정상)인지,
+Compositor/Renderer/Script 같은 **소수 단일 스레드가 1.0 코어에 붙어 천장**인지를 바로
+가른다. 후자가 곧 "GPU 가 굶는다"의 실체다.
+
+- 도구: `etc/multigpu/tools/thread_cpu_probe` (독립 크레이트, 엔진 변경 없이 외부 관측)
+- 스레드 이름: Rust std 가 Windows 에서 `SetThreadDescription` 을 설정하므로 엔진
+  스레드는 그대로 읽힌다. GStreamer 스트리밍 스레드는 GLib/C 스레드라 이름이 없어서
+  엔진이 첫 appsink 콜백에서 스스로 태깅한다
+  (`components/media/backends/gstreamer/thread_name.rs`, `ServoGstVideo-N` /
+  `ServoGstAudio-N`). 같은 지점에서 `THREADMAP tid=<n> name=<n>` 도 남기므로 로그만으로도
+  대조가 된다.
+- 검증(2026-08-25): 의도적으로 2 스레드를 돌린 테스트 프로그램에서 스레드 합계 1.99 코어 =
+  `GetProcessTimes` 1.99 코어로 일치, 이름·SATURATED 표시 정상.
+
+```powershell
+# 월 실행에 붙여서 (dist 런처)
+.
+un_wall_dist.ps1 -Layout wall_layout.singlegpu.json -Rows 9 -Cols 5 -MinIntervalMs 1 `
+    -DurationSec 40 -ThreadCpu
+
+# 이미 떠 있는 프로세스에 수동으로
+engine	hread_cpu_probe.exe --duration 20 --top 20
+```
+
+읽는 법:
+
+| 나온 그림 | 뜻 | 다음 표적 |
+|---|---|---|
+| `ServoGstVideo` 가 코어 대부분, hottest 낮음 | 디코드/업로드가 병렬로 다 먹는 중 | 업로드 축(`media_d3d11_enabled=false` A/B), 하드웨어 디코드 |
+| 단일 스레드 하나가 `SATURATED` | ★그 스레드가 천장★ — GPU 가 그 뒤에서 굶는다 | 그 스테이지의 프레임당 작업(씬 재구성/`update_images` 팬아웃/합성) |
+| 어느 것도 아니고 총합이 낮다 | 프로세스 밖(드라이버/커널)에 비용 | ETW, GPU 드라이버 스레드 |
+
+
+## 2026-08-25 실측 — ★천장은 디코드 스레드다. 합성 가설 반증★
+
+`wall_20260825_142322` (테스트 장비, 45 영상, 단일 타일, 30s 샘플).
+
+```
+  cores   %cpu    n  hottest  thread group
+   44.67  ...    180     0.99  multiqueue:src   <-- SATURATED
+    5.66  ...     45     0.14  ServoGstVideo
+    0.89  ...     45     0.03  qtdemux:sink
+    0.77  ...      1     0.77  main
+    0.30  ...      1     0.30  Script
+    0.07  ...      1     0.07  WRRenderBackend
+    0.03  ...      1     0.03  WRSceneBuilder
+    0.01  ...      1     0.01  Constellation
+   52.69                       TOTAL = process total (일치)
+```
+
+읽는 법대로 읽으면 결론은 하나다.
+
+- **디코드가 전체 CPU 의 85%** (`multiqueue:src` = decodebin3 에서 `avdec_h264` 의 chain 이
+  도는 스레드). 개별 스레드 20 개 이상이 정확히 **0.99 코어에 붙어 있다**.
+- **업로드(이 포크의 D3D11 memcpy)는 5.66 코어 = 11%.** 앞 절의 산술 추정(약 3.1 코어)과
+  같은 자릿수이고, 벽이 아니다.
+- ★**브라우저/렌더 측 전체가 1.2 코어 미만(약 2%)이다.**★ WebRender 는 사실상 놀고 있다.
+  앞 절에서 세운 "프레임마다 씬 전체 재합성이 병목" 가설은 **반증됐다.**
+- 벽은 45 fps 로 present 중인데 소스는 30fps 다. **렌더가 밀리는 상황이 아니다.**
+
+파이프라인은 `h264parse -> avdec_h264 -> appsink` 뿐이고 `videoconvert`/`videoscale` 은
+없다(로그의 element added 45/45/45). `max-threads=1` 도 45 개 전부 적용됐다.
+
+### 확인: `multiqueue:src` 가 정말 디코드 스레드인가
+
+"영상 하나당 파이프라인 하나인데 multiqueue 가 들어갈 구석이 있는가" 는 당연한 의문이라
+따로 확인했다. **파이프라인은 영상당 하나가 맞다. 그 하나의 playbin3 안에 multiqueue 가
+2 개 들어 있다.** 같은 클립을 `playbin3` 로 재생하며 `GST_DEBUG_DUMP_DOT_DIR` 로 그래프를
+받아 확인한 결과(2026-08-25, 개발기):
+
+```
+playbin3
++-- urisourcebin0 ---- multiqueue0
++-- decodebin3 --- parsebin0 --- multiqueue1 -+- src_0  video/x-h264 1920x1080 30000/1001  [T]
+                                              +- src_1  audio/mpeg                        [T]
+```
+
+`multiqueue1` 은 parsebin 바로 뒤, **디코더 바로 앞**이고 src 패드마다 태스크(`[T]`)를 갖는다.
+GStreamer 에서 디코더는 자기 스레드가 없고 **업스트림 src 패드 태스크 위에서 chain 함수가
+돈다.** 즉 `video/x-h264` 를 나르는 `multiqueueN:src_M` 이 곧 `avdec_h264` 가 도는 스레드다.
+
+수치도 맞아떨어진다.
+
+| | |
+|---|---|
+| 영상당 multiqueue | 2 개 (urisourcebin + decodebin3) |
+| multiqueue 당 src 패드 | 2 개 (video, audio) |
+| 영상당 패드 태스크 | 4 개 |
+| **45 영상 x 4** | **180** = 프로브가 센 스레드 수 |
+| 그중 video 를 나르는 것 | 영상당 1 개 = 45 개 |
+| 44.67 코어 / 0.99 | **약 45** = 포화된 스레드 수 |
+
+현장 로그의 element 인덱스가 `multiqueue84` 까지 올라간 것도 90 개(45x2) 인스턴스와 맞는다.
+(패드 번호는 파일마다 스트림 순서가 달라 video 가 `src_0` 일 때도 `src_1` 일 때도 있다.)
+
+★함정: 위 "element added" 목록은 전체 목록이 아니다.★ `should_log_pipeline_element` 는
+factory 에 `dec`/`convert`/`scale` 등이 들어가거나 klass 가 Decoder/Converter/Sink 인 것만
+찍는데 `multiqueue` 는 klass 가 Generic 이라 **애초에 로그에 나오지 않는다.** 다만
+`videoconvert`(->`convert`)와 `videoscale`(->`scale`)은 그 필터에 걸리므로,
+"변환/스케일 요소는 없다" 는 결론 자체는 유효하다.
+
+### 진짜 이상한 점: 디코드 단가가 부하에 따라 변한다
+
+| 조건 | `multiqueue:src` 영상당 |
+|---|---|
+| 개발기, 9 영상 | **0.23 코어** (포화 아님) |
+| 테스트 장비, 45 영상 | **0.99 코어** (포화) |
+
+같은 빌드, 같은 페이지, 같은 pref 다. 디코드가 원래 1 코어씩 먹는 게 아니라
+**밀리기 시작하면 무제한으로 먹는다**. 42 개까지 정상이고 45 개부터 절벽으로 무너지는
+거동, qos=true 로 내려가는 거동, fps 가 떨어질 때 GPU 점유율이 **오히려** 떨어지는 거동이
+전부 여기서 설명된다.
+
+### 가설 (아직 검증 전): 되돌아올 길이 없는 설정
+
+```
+sink   : policy=smooth  qos=false  drop=false  max-lateness=-1  (release valve 없음)
+clock  : release_sync_group() 가 set_start_time(NONE) + 공유 base_time + 공유 SystemClock
+```
+
+`start_time = NONE` 이면 running time 이 벽시계에 고정되고 **다시 base 를 잡지 않는다.**
+거기에 qos/drop 이 꺼져 있고 max-lateness 가 무제한이면, 한 번 밀린 파이프라인은
+밀린 만큼을 **전속력으로 디코드해서 따라잡으려 한다.** 9 개면 순식간에 따라잡고 0.23 으로
+돌아오지만, 45 개면 따라잡는 데 필요한 총량이 장비를 넘어서므로 **영원히 못 따라잡고
+전부 1 코어에 붙는다.** 양의 되먹임이라 점진적 열화가 아니라 절벽이 된다.
+
+★이건 추론이다. 이 조사에서 추론만으로 좁혔다가 틀린 게 이번이 세 번째이므로 계측으로
+확인한 뒤에만 손댄다.★
+
+### 다음 실험 (순서대로)
+
+1. **램프 — 가장 결정적.** 같은 장비에서 20 / 30 / 36 / 42 / 45 개를 `-ThreadCpu` 로.
+   영상당 디코드 단가가 0.25 근처를 유지하다 어느 지점에서 튀면 부하 의존성이 확정된다.
+   (새 스위치 필요 없음.)
+2. **`-NoSyncGroup`** 45 개. 공유 base time 을 빼면 단가가 내려가는가.
+   주의: 개발기 A/B 에서 `ServoGstVideo` 가 0.43 -> 0.02 로 떨어지는 미확인 현상이 있었다.
+   렌더/present 는 양쪽 다 정상이었으나, 이 실험 결과를 읽을 때 업로드 열도 같이 볼 것.
+3. `measure_decode_only.ps1 -Count 45` 를 다시 돌려 **"cores busy" 줄**을 확보한다.
+   (앞서 받은 값은 "30%" 뿐이었다. 이게 throttle 된 바닥값이고, 위 0.99 와의 비가 곧
+   "얼마나 폭주하고 있는가"다.)
+
+### 도구 결함 정정 (2026-08-25)
+
+- `thread_cpu_probe` 의 `%cpu` 가 **131.7%** 로 찍혔다. `available_parallelism()` 이 Windows
+  에서 **현재 프로세서 그룹만** 세기 때문이다(40 이라고 보고했으나 프로세스는 실제로 52.69
+  코어를 씀 = 멀티 그룹 장비). `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)` 로 교체했다.
+  **`cores` 열은 처음부터 옳았고, 위 표의 결론은 영향받지 않는다.**
+- `Tee-Object` 가 PowerShell 5.1 에서 UTF-16 으로 저장해 `.threads.txt` 가 grep 에서 깨졌다.
+  ASCII 로 명시 저장하도록 변경.
+

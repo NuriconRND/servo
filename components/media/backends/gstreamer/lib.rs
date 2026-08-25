@@ -15,6 +15,7 @@ pub mod player;
 mod registry_scanner;
 mod render;
 mod source;
+mod thread_name;
 pub mod webrtc;
 
 use std::collections::HashMap;

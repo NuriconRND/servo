@@ -70,6 +70,7 @@ Sessionx.vim
 
 # Local multi-GPU wall tooling outputs
 /etc/multigpu/tools/topology_probe/target/
+/etc/multigpu/tools/thread_cpu_probe/target/
 /etc/multigpu/tools/wall_perf_analyzer/__pycache__/
 
 # Layout debugger trace files

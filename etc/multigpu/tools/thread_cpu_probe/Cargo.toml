@@ -1,0 +1,19 @@
+[package]
+name = "thread_cpu_probe"
+version = "0.1.0"
+edition = "2021"
+
+# Its own workspace root on purpose. This package sits inside the servo
+# worktree but is not a member of that workspace, and cargo refuses to build a
+# package that is neither a member nor excluded.
+[workspace]
+
+[dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2

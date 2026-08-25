@@ -63,6 +63,21 @@ foreach ($n in @('libGLESv2.dll', 'libEGL.dll')) {
     if (Test-Path $src) { Copy-Item $src (Join-Path $engine $n) -Force }
 }
 
+# --- 2b. thread_cpu_probe: attributes the running wall's CPU to named threads ---
+# Its own tiny crate with its own target dir, so it is built on demand rather than
+# assumed present. Without it, run_wall_dist.ps1 -ThreadCpu has nothing to run.
+$probeManifest = Join-Path $repo "etc\multigpu\tools\thread_cpu_probe\Cargo.toml"
+$probeExe = Join-Path $repo "etc\multigpu\tools\thread_cpu_probe\target\release\thread_cpu_probe.exe"
+if (!(Test-Path $probeExe)) {
+    Write-Host "Building thread_cpu_probe..."
+    & cargo build --release --manifest-path $probeManifest
+}
+if (Test-Path $probeExe) {
+    Copy-Item $probeExe $engine -Force
+} else {
+    Write-Warning "thread_cpu_probe.exe could not be built -- run_wall_dist.ps1 -ThreadCpu will not work."
+}
+
 # --- 3. config\ : wall layouts ---
 $cfg = Join-Path $Out "config"
 New-Item -ItemType Directory -Path $cfg -Force | Out-Null
@@ -88,3 +103,4 @@ Write-Host ""
 Write-Host "Copy the folder to the test machine and run:"
 Write-Host "  .\run_wall_dist.ps1 -DurationSec 30"
 Write-Host "  .\run_wall_dist.ps1 -Layout wall_layout.multigpu.reversed.json -DurationSec 30"
+Write-Host "  .\run_wall_dist.ps1 -DurationSec 40 -ThreadCpu      # where the CPU actually goes"

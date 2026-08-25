@@ -1178,6 +1178,7 @@ impl GStreamerPlayer {
                 gstreamer_app::AppSinkCallbacks::builder()
                     .new_preroll(|_| Ok(gstreamer::FlowSuccess::Ok))
                     .new_sample(move |audio_sink| {
+                        crate::thread_name::tag_audio_streaming_thread();
                         let sample = audio_sink
                             .pull_sample()
                             .map_err(|_| gstreamer::FlowError::Eos)?;
@@ -1626,6 +1627,9 @@ impl GStreamerPlayer {
                 let weak_video_renderer = Arc::downgrade(&video_renderer);
 
                 move |sample: gstreamer::Sample| {
+                    // This closure runs on the video sink's streaming thread --
+                    // a GLib thread with no OS name of its own. Latched inside.
+                    crate::thread_name::tag_video_streaming_thread();
                     sample_diagnostics.lock().unwrap().note_sample(&sample);
 
                     let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
