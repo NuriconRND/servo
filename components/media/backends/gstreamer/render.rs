@@ -21,6 +21,41 @@ const SMOOTH_VIDEO_MAX_BUFFERS: u32 = 3;
 const DISABLED_VIDEO_MAX_LATENESS_NS: i64 = -1;
 const VIDEO_SINK_PROCESSING_DEADLINE_NS: u64 = 0;
 
+/// 비디오 싱크의 페이싱 방식(`media_video_sink_pacing`).
+///
+/// `Clock` 은 GstBaseSink 기본 동작(`sync=true`)이고, `Thread` 는 싱크의 클럭 대기를
+/// 끄고 스트리밍 스레드가 PTS 앵커로 직접 잔다. 후자가 존재하는 이유는
+/// `GstSystemClock` 이 프로세스당 싱글턴이라 파이프라인 45 개가 프레임마다 같은 객체에서
+/// 대기하기 때문이다 — 실측치는 `media_video_sink_pacing` 문서 참조.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoSinkPacing {
+    Clock,
+    Thread,
+}
+
+impl VideoSinkPacing {
+    pub fn from_pref() -> Self {
+        let value = pref!(media_video_sink_pacing);
+        if value.eq_ignore_ascii_case("thread") {
+            Self::Thread
+        } else {
+            if !value.is_empty() && !value.eq_ignore_ascii_case("clock") {
+                log::warn!(
+                    "Ignoring invalid media_video_sink_pacing={value:?}; expected clock or thread"
+                );
+            }
+            Self::Clock
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::Thread => "thread",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VideoSinkPolicy {
     Smooth,
@@ -325,15 +360,31 @@ impl GStreamerRender {
         appsink.set_property("max-lateness", policy.max_lateness_ns());
         appsink.set_property("processing-deadline", VIDEO_SINK_PROCESSING_DEADLINE_NS);
         appsink.set_property("enable-last-sample", false);
+        // sync/async 는 이 포크가 건드리지 않으므로 GstBaseSink 기본값(둘 다 true)이어야
+        // 한다. 굳이 읽어서 찍는 이유: sync 가 꺼지면 싱크가 클럭을 기다리지 않고,
+        // 디코더가 재생 속도와 무관하게 전속력으로 돌아 영상당 CPU 가 몇 배로 뛴다.
+        // 그게 실제로 일어나고 있는지 로그만으로 판정할 수 있어야 한다 — 세팅한 값이
+        // 아니라 읽어 온 값을 찍는 것이 요점이다.
+        // `thread` 페이싱에서는 싱크가 클럭을 기다리지 않는다. 대신 스트리밍
+        // 스레드가 PTS 앵커에 맞춰 직접 자므로(player.rs 의 SinkPacer) 재생 속도는
+        // 그대로이고, 프로세스당 싱글턴인 GstSystemClock 에서의 경합만 사라진다.
+        let pacing = VideoSinkPacing::from_pref();
+        if pacing == VideoSinkPacing::Thread {
+            appsink.set_property("sync", false);
+        }
+        let sink_sync = appsink.property::<bool>("sync");
+        let sink_async = appsink.property::<bool>("async");
         log::info!(
             "GStreamer video sink policy: policy={} max_buffers={} drop={} qos={} \
-             max_lateness_ns={} processing_deadline_ns={} enable_last_sample=false",
+             max_lateness_ns={} processing_deadline_ns={} enable_last_sample=false \
+             sync={sink_sync} async={sink_async} pacing={}",
             policy.as_str(),
             policy.max_buffers(),
             policy.drop_late(),
             policy.effective_qos(),
             policy.max_lateness_ns(),
             VIDEO_SINK_PROCESSING_DEADLINE_NS,
+            pacing.as_str(),
         );
 
         if let Some(render) = self.render.as_ref() {

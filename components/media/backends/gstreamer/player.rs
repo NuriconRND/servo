@@ -4,10 +4,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Once};
-use std::time::{self, Instant};
+use std::time::{self, Duration, Instant};
 
 use byte_slice_cast::AsSliceOf;
 use glib;
@@ -74,8 +74,64 @@ const MAX_BUFFER_SIZE: i32 = 500 * 1024 * 1024;
 const VIDEO_SAMPLE_INFO_INTERVAL: u64 = 120;
 const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 
+/// 재앵커 문턱. 이만큼 넘게 밀렸으면 따라잡기를 포기하고 현재 시점을 새 기준으로 삼는다.
+///
+/// 따라잡지 않는 쪽을 택한 이유: 밀린 만큼을 전속력으로 디코드하면 부하가 더 늘어 더
+/// 밀리는 양의 되먹임이 된다. 늦은 프레임을 버리지 않고 그 지점부터 정상 속도로 잇는 편이
+/// 벽에서는 낫다(영상 간 위상은 어차피 `thread` 페이싱의 비범위다).
+const SINK_PACER_RESYNC_AFTER: Duration = Duration::from_secs(1);
+
+/// `media_video_sink_pacing=thread` 일 때 비디오 스트리밍 스레드를 PTS 에 맞춰 재운다.
+///
+/// GstBaseSink 의 `sync=true` 와 같은 일을 하되 **파이프라인마다 자기 앵커**를 쓴다.
+/// `GstSystemClock::obtain()` 이 프로세스당 싱글턴이라, 45 개 싱크가 프레임마다 같은
+/// 객체에서 대기하는 것이 디코딩만큼의 CPU 를 더 쓰는 것이 실측됐다(0.795 vs 0.284
+/// 코어/영상). 공유 객체를 없애면 그 몫이 사라진다.
+///
+/// ★비범위★ — 앵커가 파이프라인마다 독립이므로 영상 간 동기는 보장되지 않는다.
+/// 그건 별도 과제(Video Sync Group)다.
 #[derive(Default)]
+struct SinkPacer {
+    /// (기준 시각, 그 시각에 해당하는 PTS).
+    anchor: Option<(Instant, gstreamer::ClockTime)>,
+}
+
+impl SinkPacer {
+    /// 이 버퍼를 내보내기 전에 얼마나 자야 하는지. 잘 필요가 없으면 `None`.
+    ///
+    /// 잠은 호출자가 잔다 — 뮤텍스를 쥔 채로 자지 않기 위함이다.
+    fn sleep_before(&mut self, pts: Option<gstreamer::ClockTime>) -> Option<Duration> {
+        let pts = pts?;
+        let now = Instant::now();
+        // 첫 버퍼이거나 PTS 가 뒤로 감겼으면(gapless 루프/seek) 여기서 다시 기준을 잡는다.
+        let (anchor_at, anchor_pts) = match self.anchor {
+            Some(anchor) if pts >= anchor.1 => anchor,
+            _ => {
+                self.anchor = Some((now, pts));
+                return None;
+            },
+        };
+        let target = anchor_at + Duration::from_nanos((pts - anchor_pts).nseconds());
+        if target > now {
+            return Some(target - now);
+        }
+        if now.duration_since(target) > SINK_PACER_RESYNC_AFTER {
+            self.anchor = Some((now, pts));
+        }
+        None
+    }
+}
+
+/// VIDEORATE 요약 주기. 초당 한 줄이면 45타일에서도 읽을 만하고, 재생 속도가 1.0배인지
+/// 아닌지는 1초 창이면 충분히 갈린다.
+const VIDEO_RATE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 파이프라인마다 안정적인 번호를 붙인다. 45개가 동시에 찍으므로 어느 줄이 어느
+/// 파이프라인 것인지 구분되지 않으면 요약을 읽을 수 없다.
+static NEXT_VIDEO_DIAGNOSTICS_ID: AtomicU64 = AtomicU64::new(0);
+
 struct VideoSampleDiagnostics {
+    id: u64,
     sample_count: u64,
     summary_frame_count: u64,
     summary_started_at: Option<Instant>,
@@ -83,6 +139,29 @@ struct VideoSampleDiagnostics {
     last_pts: Option<gstreamer::ClockTime>,
     late_pts_gaps_since_summary: u64,
     late_wall_gaps_since_summary: u64,
+    /// VIDEORATE 창. 위의 summary 카운터와 분리해 둔다 — 저쪽은 프레임 수 기준이고
+    /// late 갭에도 리셋되므로 벽시계 기준 비율을 낼 수 없다.
+    rate_started_at: Option<Instant>,
+    rate_frames: u64,
+    rate_pts_start: Option<gstreamer::ClockTime>,
+}
+
+impl Default for VideoSampleDiagnostics {
+    fn default() -> Self {
+        Self {
+            id: NEXT_VIDEO_DIAGNOSTICS_ID.fetch_add(1, Ordering::Relaxed),
+            sample_count: 0,
+            summary_frame_count: 0,
+            summary_started_at: None,
+            last_sample_at: None,
+            last_pts: None,
+            late_pts_gaps_since_summary: 0,
+            late_wall_gaps_since_summary: 0,
+            rate_started_at: None,
+            rate_frames: 0,
+            rate_pts_start: None,
+        }
+    }
 }
 
 fn clock_time_ms(clock_time: Option<gstreamer::ClockTime>) -> Option<f64> {
@@ -296,6 +375,20 @@ fn enoughdata_backoff_disabled() -> bool {
     })
 }
 
+/// `SERVO_MEDIA_VIDEO_RATE`(servo_config::debug_env 등록)의 truthy 판정.
+/// 위 `enoughdata_backoff_disabled()` 와 같은 집합을 쓴다.
+///
+/// 프레임마다 불리는 자리라 debug_env 의 OnceLock 캐시에 의존한다 — 매번 환경변수를
+/// 읽으면 이 진단이 측정하려는 비용에 자기 자신이 섞인다.
+fn video_rate_logging_enabled() -> bool {
+    debug_env::string(&debug_env::MEDIA_VIDEO_RATE).is_some_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
 fn create_disabled_audio_sink() -> Result<gstreamer::Element, PlayerError> {
     let audio_sink = gstreamer::ElementFactory::make("fakesink")
         .build()
@@ -319,6 +412,58 @@ fn disable_pipeline_audio_sink(
 }
 
 impl VideoSampleDiagnostics {
+    /// 이 파이프라인이 실제로 초당 몇 프레임을 내보내고 있는지, 그리고 pts 가 벽시계
+    /// 대비 몇 배로 진행하는지를 1초에 한 줄로 남긴다.
+    ///
+    /// ★왜 필요한가★ — 45영상 월에서 디코드 스레드가 영상당 0.98코어에 붙는데, 이 장비의
+    /// 단일 스레드 디코드 상한이 재생속도의 2.8배다. 그러면 원인이 둘로 갈린다: 디코더가
+    /// 1x보다 빠르게 앞질러 도는 것인가(=싱크가 throttle 을 못 함), 아니면 1x로 도는데
+    /// 프레임당 비용이 경합으로 부풀어 오른 것인가. CPU 수치만으로는 두 경우가 구분되지
+    /// 않는다 — 초당 전달 프레임 수를 직접 세는 수밖에 없다.
+    ///
+    /// `pts_rate` 가 1.0 이면 정상 재생, 2.7 이면 그만큼 앞질러 도는 것이다.
+    ///
+    /// gapless 루프가 돌면 pts 가 뒤로 감기므로 그 창은 비율을 내지 않고 버린다(`wrapped`).
+    /// 기본은 off — `SERVO_MEDIA_VIDEO_RATE` 로 켠다. 45타일 장시간 운용에서 초당 45줄이
+    /// 쌓이기 때문이고, 이는 기존 sample summary 가 debug 에 머무는 이유와 같다.
+    fn note_rate(&mut self, now: Instant, pts: Option<gstreamer::ClockTime>) {
+        if !video_rate_logging_enabled() {
+            return;
+        }
+        self.rate_frames = self.rate_frames.saturating_add(1);
+        let Some(started_at) = self.rate_started_at else {
+            self.rate_started_at = Some(now);
+            self.rate_pts_start = pts;
+            return;
+        };
+        let elapsed = now.saturating_duration_since(started_at);
+        if elapsed < VIDEO_RATE_REPORT_INTERVAL {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let pts_rate = match (self.rate_pts_start, pts) {
+            (Some(start), Some(end)) if end >= start => {
+                Some((end - start).nseconds() as f64 / 1_000_000_000.0 / seconds)
+            },
+            _ => None,
+        };
+        log::info!(
+            target: "media",
+            "VIDEORATE id={} fps={:.1} pts_rate={} frames={} window_ms={:.0}",
+            self.id,
+            self.rate_frames as f64 / seconds,
+            match pts_rate {
+                Some(rate) => format!("{rate:.2}x"),
+                None => "wrapped".to_string(),
+            },
+            self.rate_frames,
+            seconds * 1000.0,
+        );
+        self.rate_started_at = Some(now);
+        self.rate_pts_start = pts;
+        self.rate_frames = 0;
+    }
+
     fn note_sample(&mut self, sample: &gstreamer::Sample) {
         let now = Instant::now();
         self.sample_count = self.sample_count.saturating_add(1);
@@ -332,6 +477,8 @@ impl VideoSampleDiagnostics {
         let duration = buffer.and_then(|buffer| buffer.duration());
         let pts_ms = clock_time_ms(pts);
         let duration_ms = clock_time_ms(duration);
+        self.note_rate(now, pts);
+
         let pts_delta_ms = clock_delta_ms(self.last_pts, pts);
         let wall_delta_ms = self.last_sample_at.map(|last_sample_at| {
             now.saturating_duration_since(last_sample_at).as_secs_f64() * 1000.0
@@ -1618,18 +1765,34 @@ impl GStreamerPlayer {
 
         if let Some(video_renderer) = self.video_renderer.clone() {
             let sample_diagnostics = Arc::new(Mutex::new(VideoSampleDiagnostics::default()));
+            // `media_video_sink_pacing=thread` 에서만 쓴다. 모드는 한 번만 읽는다 —
+            // 프레임마다 pref 를 읽으면 이 경로가 줄이려는 비용에 자기 자신이 섞인다.
+            let sink_pacing = crate::render::VideoSinkPacing::from_pref();
+            let sink_pacer = Arc::new(Mutex::new(SinkPacer::default()));
             // Creates a closure that renders a frame using the video_renderer
             // Used in the preroll and sample callbacks
             let render_sample = {
                 let render = self.render.clone();
                 let observer = self.observer.clone();
                 let sample_diagnostics = sample_diagnostics.clone();
+                let sink_pacer = sink_pacer.clone();
                 let weak_video_renderer = Arc::downgrade(&video_renderer);
 
                 move |sample: gstreamer::Sample| {
                     // This closure runs on the video sink's streaming thread --
                     // a GLib thread with no OS name of its own. Latched inside.
                     crate::thread_name::tag_video_streaming_thread();
+                    // 싱크가 클럭을 기다리지 않으므로 재생 속도를 여기서 지킨다.
+                    // 잠은 락 밖에서 잔다.
+                    if sink_pacing == crate::render::VideoSinkPacing::Thread {
+                        let sleep = sink_pacer
+                            .lock()
+                            .unwrap()
+                            .sleep_before(sample.buffer().and_then(|buffer| buffer.pts()));
+                        if let Some(sleep) = sleep {
+                            std::thread::sleep(sleep);
+                        }
+                    }
                     sample_diagnostics.lock().unwrap().note_sample(&sample);
 
                     let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {

@@ -429,6 +429,10 @@ fn media_defaults_preserve_the_old_env_unset_behaviour() {
         defaults.media_video_sink_policy.is_empty(),
         "빈 문자열 = Smooth"
     );
+    assert!(
+        defaults.media_video_sink_pacing.is_empty(),
+        "빈 문자열 = clock. thread 로 바꾸면 영상 간 동기가 비범위가 된다"
+    );
     assert_eq!(defaults.media_webrtc_jitter_latency_ms, 0);
 }
 

@@ -6,7 +6,8 @@ use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::{VecDeque, hash_map::Entry};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use std::time::Instant;
+use std::panic::Location;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
@@ -69,6 +70,11 @@ static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 // Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
 // once per second per painter. This is the ground-truth displayed cadence, independent of the
 // page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
+static FRAME_REASON_PROF: LazyLock<bool> = LazyLock::new(|| {
+    debug_env::string(&debug_env::FRAME_REASON_PROF)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
 static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
     debug_env::string(&debug_env::LOG_PRESENT_CADENCE)
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -226,6 +232,12 @@ pub(crate) struct Painter {
     /// upstream of the renderer (no render was requested at all), as opposed to a slow render
     /// pass itself, which is logged separately as "Slow paint frame".
     last_render_end: Cell<Option<Instant>>,
+
+    /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
+    /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
+    /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
+    frame_reason_counts: RefCell<FxHashMap<(u32, String), u64>>,
+    frame_reason_window_start: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -636,6 +648,8 @@ impl Painter {
             present_cadence_count: Default::default(),
             present_cadence_max_gap_ms: Default::default(),
             last_render_end: Default::default(),
+            frame_reason_counts: Default::default(),
+            frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -1173,12 +1187,65 @@ impl Painter {
         }
     }
 
+    /// Tally one composite request against the source line that asked for it, and dump the
+    /// tally once a second.
+    ///
+    /// ★왜★ — 20 영상 월에서 단일 painter 가 초당 200 회 이상 합성했는데,
+    /// `gfx_refresh_hz` 는 렌더러 틱(60Hz)만 페이싱하고 script 는 자체 20/30ms 타이머를
+    /// 따로 돌린다. 둘을 합쳐도 상한이 ~110 이라 남은 몫이 어디서 오는지 총합만으로는
+    /// 알 수 없다. `generate_frame` 호출 지점이 9 곳이므로 출처를 줄 번호로 가른다.
+    ///
+    /// 기본 off(`SERVO_FRAME_REASON_PROF`). 프레임마다 불리는 자리라 켜져 있을 때만
+    /// 해시맵을 건드린다.
+    fn note_frame_reason(&self, caller: &'static Location<'static>, reason: RenderReasons) {
+        if !*FRAME_REASON_PROF {
+            return;
+        }
+        let now = Instant::now();
+        let start = match self.frame_reason_window_start.get() {
+            Some(start) => start,
+            None => {
+                self.frame_reason_window_start.set(Some(now));
+                now
+            },
+        };
+        *self
+            .frame_reason_counts
+            .borrow_mut()
+            .entry((caller.line(), format!("{reason:?}")))
+            .or_insert(0) += 1;
+
+        let elapsed = now.duration_since(start);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let mut counts: Vec<((u32, String), u64)> =
+            self.frame_reason_counts.borrow_mut().drain().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = counts.iter().map(|(_, n)| n).sum();
+        let breakdown = counts
+            .iter()
+            .map(|((line, reason), n)| format!("painter.rs:{line}/{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!(
+            "FRAMEREASON total={total} window_ms={:.0} {breakdown}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+        self.frame_reason_window_start.set(Some(now));
+    }
+
     /// Queue a new frame in the transaction and increase the pending frames count.
+    ///
+    /// `#[track_caller]`: so `note_frame_reason` can name the call site without every one of
+    /// the nine callers having to pass a label.
+    #[track_caller]
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
         self.generate_frame_with_diagnostic_id(transaction, reason, None, None);
     }
 
     /// Queue a new frame using a shared logical diagnostic id supplied by `Paint`.
+    #[track_caller]
     pub(crate) fn generate_frame_with_diagnostic_id(
         &self,
         transaction: &mut Transaction,
@@ -1186,6 +1253,7 @@ impl Painter {
         wall_logical_frame_id: Option<u64>,
         wall_requested_at: Option<Instant>,
     ) {
+        self.note_frame_reason(Location::caller(), reason);
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);

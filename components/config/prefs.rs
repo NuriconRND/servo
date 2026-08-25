@@ -512,6 +512,29 @@ pub struct Preferences {
     /// 않아 **avdec 이 부하 상황에서 프레임을 건너뛰지 못한다** — 한계를 넘는 순간
     /// 완만한 열화가 아니라 절벽으로 무너진다(45 타일 CPU 100% 관측, 2026-08-25).
     pub media_video_sink_qos: String,
+    /// 비디오 싱크의 **페이싱 방식**. `clock`(기본) 또는 `thread`.
+    ///
+    /// `clock` = 현행. appsink 가 `sync=true` 로 파이프라인 클럭을 기다린다.
+    ///
+    /// `thread` = appsink `sync=false` + 스트리밍 스레드가 PTS 앵커에 맞춰 직접 잔다.
+    ///
+    /// ★왜 필요한가★ — `GstSystemClock::obtain()` 은 프로세스당 싱글턴이라 45 개
+    /// 파이프라인의 싱크가 프레임마다 **같은 클럭 객체**에서 대기한다. 실측(2026-08-25,
+    /// 80 논리코어, 45 x FHD30):
+    ///
+    /// ```text
+    /// 45 프로세스, 클럭 각자      0.399 코어/영상   머신 30%
+    /// 1 프로세스, 클럭 공유       0.795 코어/영상   머신 81%
+    /// 1 프로세스, 클럭 없이 sleep 0.284 코어/영상   머신 33%
+    /// ```
+    ///
+    /// 디코딩 자체는 배치와 무관하게 0.39 코어인데, **공유 클럭 대기가 디코딩만큼을 더
+    /// 쓴다.** Servo 코드 밖에서 재현되므로 GStreamer 배치 문제다.
+    ///
+    /// ★비범위★ — `thread` 는 파이프라인마다 독립 앵커라 **영상 간 동기가 보장되지
+    /// 않는다**(공유 base time 을 쓰는 `media_sync_group_target` 과 양립 불가). 다중
+    /// 영상 동기는 별도 과제 "Video Sync Group" 으로 분리했다.
+    pub media_video_sink_pacing: String,
     /// WebRTC `webrtcbin`의 지터버퍼 latency(ms, 구 env
     /// `SERVO_WEBRTC_JITTER_LATENCY_MS`). 기본 `0` = 무버퍼(최저 지연) — 구
     /// `unwrap_or(0)` 그대로.
@@ -773,6 +796,7 @@ impl Preferences {
             media_video_decoder_policy: String::new(),
             media_video_sink_policy: String::new(),
             media_video_sink_qos: String::new(),
+            media_video_sink_pacing: String::new(),
             media_webrtc_jitter_latency_ms: 0,
             network_connection_timeout: 15,
             network_enforce_mixed_content: true,

@@ -220,6 +220,37 @@ pub const MEDIA_DISABLE_ENOUGHDATA_BACKOFF: DebugFlag = DebugFlag {
     cache_index: 14,
 };
 
+// ---------------------------------------------------------------------------------------------
+// 비디오 파이프라인 전달률 계측 (components/media/backends/gstreamer/player.rs).
+// ---------------------------------------------------------------------------------------------
+
+pub const MEDIA_VIDEO_RATE: DebugFlag = DebugFlag {
+    name: "SERVO_MEDIA_VIDEO_RATE",
+    kind: Kind::Str,
+    doc: "파이프라인별 VIDEORATE 요약을 1초에 한 줄씩 info로 찍는다. truthy: \
+          \"1\"/\"true\"/\"on\"(대소문자 무시). fps는 appsink가 실제로 받은 프레임 수, \
+          pts_rate는 pts가 벽시계 대비 몇 배로 진행하는지다 — 1.0이면 정상 재생, \
+          2.7이면 디코더가 그만큼 앞질러 돌고 있다는 뜻. 기본 off인 이유는 45타일 \
+          장시간 운용에서 초당 45줄이 쌓이기 때문이다(같은 이유로 기존 sample \
+          summary는 debug에 있다).",
+    cache_index: 15,
+};
+
+// ---------------------------------------------------------------------------------------------
+// 합성 요청 출처 계측 (components/paint/painter.rs).
+// ---------------------------------------------------------------------------------------------
+
+pub const FRAME_REASON_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_FRAME_REASON_PROF",
+    kind: Kind::Str,
+    doc: "generate_frame 을 부른 호출 지점과 RenderReasons 를 1초에 한 줄로 집계한다. \
+          truthy: \"1\"/\"true\"/\"on\"(대소문자 무시). 합성 요청 경로가 9 곳이라 \
+          어느 것이 초당 200 회를 만드는지 로그만 보고는 가를 수 없다. 호출 지점은 \
+          #[track_caller] 로 얻으므로 호출부는 손대지 않는다. 프레임마다 불리는 \
+          핫패스라 기본 off 다.",
+    cache_index: 16,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -238,6 +269,8 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_DISABLE_RESIZE_VIRTUAL,
     &VIDEO_ESCAPE_PROF,
     &MEDIA_DISABLE_ENOUGHDATA_BACKOFF,
+    &MEDIA_VIDEO_RATE,
+    &FRAME_REASON_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에
