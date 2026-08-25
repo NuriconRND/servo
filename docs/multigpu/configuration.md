@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 23 + 조사용 env 15)
+# 설정 노브 전량 (pref 24 + 조사용 env 15)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -64,7 +64,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 23 개
+## pref 24 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
 
@@ -105,6 +105,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_audio_enabled` | bool | **`true`** | ★**의미가 뒤집힌 pref**★. 옛 `SERVO_GSTREAMER_DISABLE_AUDIO` 는 끄는 스위치였고 이것은 켜는 스위치다. |
 | `media_video_decoder_policy` | String | `""` (= software) | 비디오 디코더 선택 정책. 인정 토큰(대소문자 무시): `auto`/`default` = 자동 선택 유지, `software`/`avdec` = 소프트웨어 디코더 강제. 그 외 값은 경고 후 software. |
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
+| `media_video_sink_qos` | String | `""` (= 정책값) | appsink 의 `qos` 만 정책과 **독립적으로** 덮어쓴다. 토큰: `on`/`true`/`1`, `off`/`false`/`0`. 그 외는 경고 후 정책값. ★`media_video_sink_policy` 는 qos/drop/max-lateness/max-buffers 를 **한 묶음**으로 바꾸므로 qos 만 재려면 이쪽을 쓴다.★ 기본(Smooth)은 `qos=false` 이고 이는 GStreamer 기본이 아니라 **이 포크가 명시적으로 끄는 값**이다 — 꺼져 있으면 QoS 이벤트가 상류로 가지 않아 **avdec 이 부하 시 프레임을 건너뛰지 못한다**(과부하에서 완만한 열화 대신 절벽). |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
 ### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content` / `dom_iframe_toplevel_embed_enabled`

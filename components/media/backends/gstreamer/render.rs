@@ -75,6 +75,28 @@ impl VideoSinkPolicy {
         self == Self::LowLatency
     }
 
+    /// 정책이 정한 qos 에 `media_video_sink_qos` 오버라이드를 적용한다.
+    ///
+    /// 정책 하나가 qos/drop/max-lateness/max-buffers 를 함께 바꾸므로, qos 만 재려면
+    /// 나머지 셋을 고정한 채 이것만 뒤집을 수 있어야 한다.
+    fn effective_qos(self) -> bool {
+        let value = pref!(media_video_sink_qos);
+        if value.is_empty() {
+            return self.qos();
+        }
+        if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1" {
+            true
+        } else if value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("false")
+            || value == "0"
+        {
+            false
+        } else {
+            log::warn!("Ignoring invalid media_video_sink_qos={value:?}; expected on or off");
+            self.qos()
+        }
+    }
+
     fn max_lateness_ns(self) -> i64 {
         match self {
             Self::Smooth => DISABLED_VIDEO_MAX_LATENESS_NS,
@@ -299,7 +321,7 @@ impl GStreamerRender {
         let policy = VideoSinkPolicy::from_pref();
         appsink.set_max_buffers(policy.max_buffers());
         appsink.set_drop(policy.drop_late());
-        appsink.set_property("qos", policy.qos());
+        appsink.set_property("qos", policy.effective_qos());
         appsink.set_property("max-lateness", policy.max_lateness_ns());
         appsink.set_property("processing-deadline", VIDEO_SINK_PROCESSING_DEADLINE_NS);
         appsink.set_property("enable-last-sample", false);
@@ -309,7 +331,7 @@ impl GStreamerRender {
             policy.as_str(),
             policy.max_buffers(),
             policy.drop_late(),
-            policy.qos(),
+            policy.effective_qos(),
             policy.max_lateness_ns(),
             VIDEO_SINK_PROCESSING_DEADLINE_NS,
         );

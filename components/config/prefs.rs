@@ -499,6 +499,19 @@ pub struct Preferences {
     /// `smooth`/`complete` = Smooth. 그 외 값은 경고 후 Smooth 로 폴백. **빈 문자열 =
     /// Smooth** — 구 env 미설정 시의 `Err(_) => Smooth` 그대로.
     pub media_video_sink_policy: String,
+    /// 비디오 appsink 의 `qos` 를 정책과 **독립적으로** 덮어쓴다.
+    ///
+    /// `media_video_sink_policy` 는 qos/drop/max-lateness/max-buffers 를 한 묶음으로
+    /// 바꾸므로 qos 만 재려면 변수가 넷 섞인다. 이 pref 는 그 분리를 위한 것이다.
+    ///
+    /// 인정 토큰: 빈 문자열 = 정책값 그대로(기본), `on`/`true`/`1` = 강제 on,
+    /// `off`/`false`/`0` = 강제 off.
+    ///
+    /// ★왜 필요한가★ — 지금 기본(Smooth)은 `qos=false` 다. GStreamer 요소 기본값이
+    /// 무엇이든 이 포크가 명시적으로 끈다. qos 가 꺼져 있으면 QoS 이벤트가 상류로 가지
+    /// 않아 **avdec 이 부하 상황에서 프레임을 건너뛰지 못한다** — 한계를 넘는 순간
+    /// 완만한 열화가 아니라 절벽으로 무너진다(45 타일 CPU 100% 관측, 2026-08-25).
+    pub media_video_sink_qos: String,
     /// WebRTC `webrtcbin`의 지터버퍼 latency(ms, 구 env
     /// `SERVO_WEBRTC_JITTER_LATENCY_MS`). 기본 `0` = 무버퍼(최저 지연) — 구
     /// `unwrap_or(0)` 그대로.
@@ -759,6 +772,7 @@ impl Preferences {
             media_audio_enabled: true,
             media_video_decoder_policy: String::new(),
             media_video_sink_policy: String::new(),
+            media_video_sink_qos: String::new(),
             media_webrtc_jitter_latency_ms: 0,
             network_connection_timeout: 15,
             network_enforce_mixed_content: true,
