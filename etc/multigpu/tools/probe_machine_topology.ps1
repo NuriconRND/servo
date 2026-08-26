@@ -9,16 +9,18 @@
 #
 # Four things decide how to read a wall run here, and none of them are in the run's own log:
 #
-#  1. The Windows version. Up to Windows 10 / Server 2019 a process is assigned to ONE
-#     processor group at creation and every thread it makes goes there -- so on this box the
-#     wall would only ever see 40 of the 80 logical processors, which is not enough for 45
-#     decode threads. Windows 11 / Server 2022 made processes span all groups by default.
-#     ***This single fact changes what "0.98 cores per decode thread" means:*** either the
-#     threads are oversubscribed onto half the machine, or they are genuinely CPU-bound.
-#  2. Logical processors per group.
-#  3. Which NUMA node each group is, and which node the GPU hangs off. Cross-node PCIe
-#     traffic is the standing suspicion for why one group would be worse than the other.
-#  4. Whether the two groups are two sockets or one socket split in half.
+#  1. ***Which NUMA node the GPU hangs off.*** This is the one that matters now. Confirmed
+#     2026-08-26 by forcing the node with `run_wall_dist.ps1 -NumaNode`: three runs on node 0
+#     collapsed to 6 fps (Present 2.9-3.0 ms per call, dwm.exe at 0.65 cores) and three runs
+#     on node 1 were fine (23-29.5 fps, 0.65-0.73 ms, dwm at 0.09). Requested node matched the
+#     group the threads ran in 6/6, so this is causation, not correlation. The standing
+#     explanation is that the GPU is on one node and the far node pays the interconnect on
+#     every upload and present -- this probe is what confirms or kills that.
+#  2. Logical processors per group, and whether the groups are two sockets or one split.
+#  3. The Windows build, only to know whether a process spans groups by default
+#     (Windows 11 / Server 2022 and later do; earlier ones pin to one group at creation).
+#
+# NOT a capacity question: the collapsed runs left 31 of 80 cores idle.
 #
 # Pure ASCII on purpose (a Korean launcher once failed to parse on a test machine that
 # decodes with a legacy console codepage).
@@ -29,17 +31,16 @@ $ErrorActionPreference = "Continue"
 
 Write-Host "=== OS =========================================================="
 $os = Get-CimInstance Win32_OperatingSystem
-"  {0}" -f $os.Caption
-"  version {0}  build {1}" -f $os.Version, $os.BuildNumber
+Write-Host ("  {0}" -f $os.Caption)
+Write-Host ("  version {0}  build {1}" -f $os.Version, $os.BuildNumber)
 # 22000 = Windows 11 21H2, 20348 = Server 2022. At or above either, processes are group-aware
 # by default and a process can use every logical processor without asking.
 $build = [int]$os.BuildNumber
 if ($build -ge 20348) {
-    "  -> processes span ALL processor groups by default on this build"
+    Write-Host ("  -> processes span ALL processor groups by default on this build")
 } else {
-    "  -> ***processes are pinned to ONE processor group at creation on this build***"
-    "     A process here sees only its own group's logical processors unless it calls"
-    "     SetThreadGroupAffinity itself. On a 2-group box that is HALF the machine."
+    Write-Host ("  -> processes are pinned to ONE processor group at creation on this build")
+    Write-Host ("     (Windows 11 / Server 2022 and later span all groups instead).")
 }
 
 Write-Host ""
@@ -49,16 +50,16 @@ Add-Type -Namespace Win32 -Name Topo -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern ushort GetActiveProcessorGroupCount();
 '@
 $gc = [Win32.Topo]::GetActiveProcessorGroupCount()
-"  groups: $gc"
+Write-Host ("  groups: $gc")
 for ($g = 0; $g -lt $gc; $g++) {
-    "    group {0} : {1} logical processors" -f $g, [Win32.Topo]::GetActiveProcessorCount([ushort]$g)
+    Write-Host ("    group {0} : {1} logical processors" -f $g, [Win32.Topo]::GetActiveProcessorCount([ushort]$g))
 }
-"    ALL     : {0} logical processors" -f [Win32.Topo]::GetActiveProcessorCount([ushort]0xFFFF)
+Write-Host ("    ALL     : {0} logical processors" -f [Win32.Topo]::GetActiveProcessorCount([ushort]0xFFFF))
 
 Write-Host ""
 Write-Host "=== sockets / cores ============================================="
 Get-CimInstance Win32_Processor | ForEach-Object {
-    "  {0}  cores={1} logical={2}" -f $_.Name.Trim(), $_.NumberOfCores, $_.NumberOfLogicalProcessors
+    Write-Host ("  {0}  cores={1} logical={2}" -f $_.Name.Trim(), $_.NumberOfCores, $_.NumberOfLogicalProcessors)
 }
 
 Write-Host ""
@@ -68,7 +69,7 @@ $numa = Get-CimInstance -ClassName Win32_NumaNode -ErrorAction SilentlyContinue
 if ($numa) {
     $numa | ForEach-Object { "  node {0}  {1}" -f $_.NodeId, $_.Caption }
 } else {
-    "  Win32_NumaNode not exposed; see 'group' counts above (groups usually track nodes 1:1)"
+    Write-Host ("  Win32_NumaNode not exposed; see 'group' counts above (groups usually track nodes 1:1)")
 }
 
 Write-Host ""
@@ -80,19 +81,21 @@ Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue | ForEach-
     $numaProp = ($dev | Get-PnpDeviceProperty -KeyName 'DEVPKEY_Device_Numa_Node'    -ErrorAction SilentlyContinue).Data
     $loc      = ($dev | Get-PnpDeviceProperty -KeyName 'DEVPKEY_Device_LocationInfo' -ErrorAction SilentlyContinue).Data
     $prox     = ($dev | Get-PnpDeviceProperty -KeyName 'DEVPKEY_Device_Numa_Proximity_Domain' -ErrorAction SilentlyContinue).Data
-    "  {0}" -f $dev.FriendlyName
-    "      NUMA node = {0}   proximity domain = {1}" -f `
-        $(if ($null -ne $numaProp) { $numaProp } else { "not reported" }), `
-        $(if ($null -ne $prox)     { $prox }     else { "not reported" })
-    "      location  = {0}" -f $loc
+    Write-Host ("  {0}" -f $dev.FriendlyName)
+    $numaText = if ($null -ne $numaProp) { $numaProp } else { "not reported" }
+    $proxText = if ($null -ne $prox)     { $prox }     else { "not reported" }
+    Write-Host ("      NUMA node = {0}   proximity domain = {1}" -f $numaText, $proxText)
+    Write-Host ("      location  = {0}" -f $loc)
 }
 
 Write-Host ""
 Write-Host "=== what to do with this ========================================"
-"  - If the build is below 20348 AND there are 2 groups, the wall has been running on"
-"    HALF this machine all along. 45 decode threads on 40 logical processors is"
-"    oversubscription, and 0.98 cores per thread means the group is full, not that"
-"    decoding is expensive. That is a bigger finding than any knob measured so far."
-"  - If the GPU reports a NUMA node, runs that land in the OTHER group pay for every"
-"    upload and present across the interconnect -- which is the standing explanation"
-"    for why group 0 runs collapse and group 1 runs do not."
+Write-Host ("  - If the GPU reports a NUMA node, pin the wall to it and the bistability is over:")
+Write-Host ("      .\run_wall_dist.ps1 ... -NumaNode <that node>")
+Write-Host ("    On this box node N has matched processor group N, and node 1 is the good one.")
+Write-Host ("  - If the GPU reports NO node (the property is often absent on consumer parts), the")
+Write-Host ("    node cannot be derived and -NumaNode 1 stays an empirical setting, not a derived")
+Write-Host ("    one. Say so rather than inventing a reason.")
+Write-Host ("  - Either way this is NOT a capacity problem: the collapsed runs left 31 of 80 cores")
+Write-Host ("    idle, and the only thing outside our process that moved was dwm.exe (0.09 -> 0.65")
+Write-Host ("    cores) while the screen updated FIVE TIMES LESS often.")

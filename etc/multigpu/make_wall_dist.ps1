@@ -95,6 +95,11 @@ Copy-Item (Join-Path $PSScriptRoot "run_wall_dist.ps1") $Out -Force
 # The decode baseline tool ships too: the wall's cores-per-video number is only
 # readable next to this machine's single-thread decode ceiling.
 Copy-Item (Join-Path $PSScriptRoot "tools\measure_decode_only.ps1") $Out -Force
+# The machine's shape decides how to read every number this dist produces. Processor group
+# placement was measured to be the difference between 29 fps and 6 fps on 45 videos (2026-08-26,
+# forced with -NumaNode, 6/6), so the group/NUMA/GPU-node facts have to be available ON the test
+# machine, not only in the dev worktree.
+Copy-Item (Join-Path $PSScriptRoot "tools\probe_machine_topology.ps1") $Out -Force
 
 $dll = (Get-ChildItem (Join-Path $engine "*.dll") | Measure-Object).Count
 $size = [math]::Round(((Get-ChildItem $Out -Recurse -Force | Measure-Object -Property Length -Sum).Sum / 1GB), 2)
