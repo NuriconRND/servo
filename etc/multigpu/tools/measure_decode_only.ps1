@@ -101,7 +101,21 @@ param(
     #
     # Note the wall does not decode audio today (videos are muted, no audio decoder thread
     # exists) yet still pays for multiqueue's audio pads -- 4 pad tasks per video.
-    [switch] $WithAudio
+    [switch] $WithAudio,
+    # Use a high-level bin instead of a hand-built chain, to compare what the wall
+    # actually runs against what it could run.
+    #
+    #   playbin3       = urisourcebin + decodebin3 + PLAYSINK   <- what the wall runs
+    #   uridecodebin3  = urisourcebin + decodebin3              <- no playsink
+    #
+    # The expensive hop measured so far is the queue AFTER the decoder, and that queue
+    # belongs to playsink, not to decodebin3. If uridecodebin3 lands near the hand-built
+    # chain, the wall can keep decodebin3's codec autoplug (H264/H265/VP9 for free) and
+    # still lose the hop -- no hand-built pipeline needed.
+    #
+    # Hardware decoders are demoted to match the wall, which promotes avdec.
+    [ValidateSet('', 'playbin3', 'uridecodebin3')]
+    [string] $HighLevel = ''
 )
 
 $ErrorActionPreference = "Stop"
@@ -125,6 +139,17 @@ $gstBin = Join-Path $GstRoot "bin"
 $env:PATH = "$gstBin;$env:PATH"
 $env:GST_PLUGIN_PATH = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = Join-Path $GstRoot "lib\gstreamer-1.0"
+
+# The hand-built chains name avdec_h264 outright, but a high-level bin autoplugs and would
+# pick the D3D11 hardware decoder -- which decodes on the GPU and measures nothing. The wall
+# demotes exactly these and promotes avdec, so match it or the comparison is meaningless.
+if ($HighLevel -ne '') {
+    $env:GST_PLUGIN_FEATURE_RANK = (@(
+        'd3d11h264dec', 'd3d11h265dec', 'd3d11vp9dec', 'd3d11vp8dec', 'd3d11mpeg2dec',
+        'd3d11h264device1dec', 'd3d11h264device2dec', 'd3d11h264device3dec',
+        'd3d11h265device1dec', 'd3d11h265device2dec', 'd3d11h265device3dec'
+    ) | ForEach-Object { "${_}:NONE" }) -join ','
+}
 
 $version = (& $launch --version 2>&1 | Select-Object -First 1)
 $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
@@ -153,6 +178,19 @@ $sleepUs = [int](1000000.0 * 1001.0 / 30000.0)
 # Each chain needs its own demuxer name so N of them can share one process.
 $script:chainIndex = 0
 function DecodePipeline($sync) {
+    if ($HighLevel -ne '') {
+        $sinkArgs = if ($PaceWithSleep -and $sync -eq 'true') {
+            @("identity", "sleep-time=$sleepUs", "!", "fakesink", "sync=false")
+        } else {
+            @("fakesink", "sync=$sync")
+        }
+        if ($HighLevel -eq 'playbin3') {
+            # video-sink takes a bin description; audio is discarded either way.
+            return @("playbin3", "uri=file:///$videoUri",
+                     "video-sink=$($sinkArgs -join ' ')", "audio-sink=fakesink sync=false")
+        }
+        return @("uridecodebin3", "uri=file:///$videoUri", "!") + $sinkArgs
+    }
     $d = 'd' + $script:chainIndex
     $script:chainIndex++
     $chain = if ($WithAudio) {
@@ -217,6 +255,13 @@ if ($DurationSec -lt 5) { throw "clip too short to measure ($DurationSec s of us
 # `-D3d11ProfileMs 0` got silently ignored for a whole round of measurements.
 Write-Host "[2] $Count pipelines at playback rate"
 # Spell out the chain that was actually built, including what -WithAudio inserts.
+$topologyLine = ""
+if ($HighLevel -eq 'playbin3') {
+    $topologyLine = "playbin3 (urisourcebin + decodebin3 + PLAYSINK) ! sink   (what the wall runs)"
+} elseif ($HighLevel -eq 'uridecodebin3') {
+    $topologyLine = "uridecodebin3 (urisourcebin + decodebin3, no playsink) ! sink"
+}
+if ($topologyLine -eq "") {
 $topologyLine = "filesrc ! qtdemux ! "
 if ($WithAudio)     { $topologyLine += "queue ! " }
 $topologyLine += "h264parse ! "
@@ -226,6 +271,7 @@ if ($WallTopology)  { $topologyLine += "queue ! " }
 $topologyLine += "sink"
 if ($WallTopology)  { $topologyLine += "   (as playbin3 does)" }
 elseif (-not $WithAudio) { $topologyLine += "   (plain; NOT what the wall runs)" }
+}
 Write-Host ("      topology  : {0}" -f $topologyLine)
 Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
     "demuxed too; a queue on BOTH branches (audio-only queue deadlocks -- see -WithAudio)"
@@ -259,18 +305,34 @@ $cpu0 = 0.0
 $startAlive = 0
 foreach ($p in $procs) { try { $cpu0 += (Get-Process -Id $p.Id).TotalProcessorTime.TotalSeconds; $startAlive++ } catch {} }
 
-# Bound this loop by the CLOCK, not by an iteration count. Get-Counter blocks for about
-# a second on its own, so `for (22) { Start-Sleep 1; Get-Counter }` ran for ~44s, not 22 --
-# past the end of a 30.07s clip, which is why every pipeline hit EOS and the measurement
-# came back empty three times in a row (2026-08-25). The guard above only checked the
-# NOMINAL window, so it happily let it through. Nothing here may assume a fixed cost per
-# iteration.
-$samples = @()
-$loop = [Diagnostics.Stopwatch]::StartNew()
-while ($loop.Elapsed.TotalSeconds -lt $DurationSec) {
-    try { $samples += (Get-Counter '\Processor(_Total)\% Processor Time' -EA Stop).CounterSamples[0].CookedValue }
-    catch { Start-Sleep -Milliseconds 500 }
+# Machine-wide CPU by summing every process's CPU time and differencing it.
+#
+# NOT Get-Counter '\Processor(_Total)\% Processor Time': a single Get-Counter sample is
+# computed over an interval it picks itself, and the results were nonsense -- four runs
+# consuming 42 / 36 / 45 / 13 cores of 80 reported 13.6% / 66.5% / 21.5% / 0.8%. The last
+# claimed 0.8% while its own process was using 16.5%. The counter path is localised on
+# non-English Windows too.
+#
+# NOT Win32_PerfRawData_PerfOS_Processor either: exact and locale-independent, but the CIM
+# query itself took about ten seconds a call, which stretched a 12s window to 31.9s and
+# ran past the end of the clip. Measured, then reverted.
+#
+# Summing Get-Process is fast (<100ms) and needs no perf counters. It undercounts slightly
+# because a few system processes are not readable, so it is a floor, not a total.
+#
+# The loop is bounded by the CLOCK, not by an iteration count: Get-Counter used to block
+# for about a second on its own, so `for (22) { Start-Sleep 1; Get-Counter }` ran ~44s, not
+# 22 -- past the end of a 30.07s clip, so every pipeline hit EOS and three measurements in
+# a row came back empty. The guard above only checks the NOMINAL window.
+function AllProcessCpu {
+    (Get-Process -EA SilentlyContinue | ForEach-Object {
+        try { $_.TotalProcessorTime.TotalSeconds } catch { 0 }
+    } | Measure-Object -Sum).Sum
 }
+$allCpu0 = AllProcessCpu
+$loop = [Diagnostics.Stopwatch]::StartNew()
+while ($loop.Elapsed.TotalSeconds -lt $DurationSec) { Start-Sleep -Milliseconds 250 }
+$allCpu1 = AllProcessCpu
 
 $t1 = Get-Date
 $cpu1 = 0.0
@@ -305,8 +367,9 @@ Write-Host ("results over {0:N1}s ({1})" -f $wall, $(if ($SingleProcess) {
 Write-Host ("  decode CPU        : {0:N2} cores busy  ({1:N1}% of {2} logical)" -f $busyCores, (100 * $busyCores / $cores), $cores)
 $chainCount = if ($SingleProcess) { $Count } else { [math]::Max($alive, 1) }
 Write-Host ("  per video         : {0:N3} cores" -f ($busyCores / $chainCount))
-if ($samples.Count -gt 0) {
-    Write-Host ("  machine-wide CPU  : {0:N1}% avg" -f (($samples | Measure-Object -Average).Average))
+if ($allCpu0 -and $allCpu1 -and ($allCpu1 -gt $allCpu0)) {
+    $allCores = ($allCpu1 - $allCpu0) / $wall
+    Write-Host ("  all processes     : {0:N2} cores busy ({1:N1}% of {2}); this run is {3:N0}% of it" -f $allCores, (100 * $allCores / $cores), $cores, (100 * $busyCores / [math]::Max($allCores, 0.01)))
 }
 
 if ($coresFor30 -gt 0) {

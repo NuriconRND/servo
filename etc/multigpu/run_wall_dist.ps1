@@ -46,7 +46,7 @@ param(
     # the clock replaced by a plain sleep 0.284. The shared clock costs as much as the
     # decoding does. NOTE: "thread" gives each pipeline its own anchor, so videos are NOT
     # synchronised with each other -- that is a separate task (Video Sync Group).
-    [ValidateSet("", "clock", "thread")]
+    [ValidateSet("", "clock", "thread", "none")]
     [string] $SinkPacing = "",
     # media_audio_enabled=false: unset playbin3's audio + soft-volume flags.
     #
@@ -67,6 +67,17 @@ param(
     # Kept because the sink chain does go away and the wall is muted, so it is harmless and
     # it is where stream selection will hook in later. Do not expect it to buy anything now.
     [switch] $NoAudio,
+    # media_pipeline_mode. uridecodebin3 builds the pipeline without playsink, so the
+    # vqueue between the decoder and our appsink is gone -- that queue carries every raw
+    # 3.1MB frame across a thread boundary and measured as much CPU as the decoding
+    # itself (45 x FHD30, cores/video: no queue 0.284, front queue only 0.294, front+back
+    # 0.729). decodebin3 still autoplugs the codec, so H264/H265/VP9 keep working.
+    #
+    # SPIKE: falls back to playbin3 with a warning when it cannot be used (a renderer that
+    # does not hand playbin the appsink itself, or non-local-file playback). Track
+    # selection is not implemented on this path.
+    [ValidateSet('', 'playbin3', 'uridecodebin3')]
+    [string] $PipelineMode = '',
     [int]    $MaxPending = 0,            # 0 = leave default (1)
     [int]    $MinIntervalMs = 0,         # 0 = leave default (16)
     [int]    $DurationSec = 0,
@@ -179,6 +190,7 @@ if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQ
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
 if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$SinkPacing") }
 if ($NoAudio)             { $argList += @("--pref", "media_audio_enabled=false") }
+if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
 $argList += $Url
@@ -186,7 +198,7 @@ $argList += $Url
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) audio=$(if($NoAudio){'off'}else{'on'})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
