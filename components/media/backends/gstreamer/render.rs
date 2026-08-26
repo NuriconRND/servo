@@ -344,10 +344,60 @@ impl GStreamerRender {
         }
     }
 
+    /// appsink 을 만들고 정책만 적용한 뒤, **파이프라인에 붙이지 않고** 돌려준다.
+    ///
+    /// `media_pipeline_mode=uridecodebin3` 는 playbin 의 `video-sink` 속성이 아니라 손으로
+    /// 패드를 링크하므로 부착 단계가 다르다. 정책 설정(qos/drop/max-lateness/페이싱)은 두
+    /// 경로가 반드시 같아야 해서 여기 한 곳에서만 한다.
+    ///
+    /// 렌더러가 appsink 자체가 아닌 다른 것을 붙이는 경우(unix 의 `glsinkbin`)에는
+    /// `detached_video_sink_caps()` 가 `None` 이고, 이 함수도 그 사실을 그대로 돌려준다.
+    pub fn create_detached_video_sink(
+        &self,
+    ) -> Result<Option<gstreamer_app::AppSink>, PlayerError> {
+        let Some(caps) = self
+            .render
+            .as_ref()
+            .and_then(|render| render.detached_video_sink_caps())
+        else {
+            return Ok(None);
+        };
+        let appsink = self.new_configured_appsink()?;
+        appsink.set_property("caps", &caps);
+        Ok(Some(appsink))
+    }
+
     pub fn setup_video_sink(
         &self,
         pipeline: &gstreamer::Element,
     ) -> Result<gstreamer_app::AppSink, PlayerError> {
+        let appsink = self.new_configured_appsink()?;
+
+        if let Some(render) = self.render.as_ref() {
+            render.build_video_sink(appsink.upcast_ref::<gstreamer::Element>(), pipeline)?
+        } else {
+            let use_borrowed_yuv =
+                !servo_config::opts::get().multiprocess && !servo_config::opts::get().force_ipc;
+            let caps = if use_borrowed_yuv {
+                gstreamer_video::VideoCapsBuilder::new()
+                    .format(gstreamer_video::VideoFormat::I420)
+                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
+                    .build()
+            } else {
+                gstreamer_video::VideoCapsBuilder::new()
+                    .format(gstreamer_video::VideoFormat::Bgra)
+                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
+                    .build()
+            };
+
+            appsink.set_caps(Some(&caps));
+            pipeline.set_property("video-sink", &appsink);
+        };
+
+        Ok(appsink)
+    }
+
+    fn new_configured_appsink(&self) -> Result<gstreamer_app::AppSink, PlayerError> {
         let appsink = gstreamer::ElementFactory::make("appsink")
             .build()
             .map_err(|error| PlayerError::Backend(format!("appsink creation failed: {error:?}")))?
@@ -386,27 +436,6 @@ impl GStreamerRender {
             VIDEO_SINK_PROCESSING_DEADLINE_NS,
             pacing.as_str(),
         );
-
-        if let Some(render) = self.render.as_ref() {
-            render.build_video_sink(appsink.upcast_ref::<gstreamer::Element>(), pipeline)?
-        } else {
-            let use_borrowed_yuv =
-                !servo_config::opts::get().multiprocess && !servo_config::opts::get().force_ipc;
-            let caps = if use_borrowed_yuv {
-                gstreamer_video::VideoCapsBuilder::new()
-                    .format(gstreamer_video::VideoFormat::I420)
-                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
-                    .build()
-            } else {
-                gstreamer_video::VideoCapsBuilder::new()
-                    .format(gstreamer_video::VideoFormat::Bgra)
-                    .pixel_aspect_ratio(gstreamer::Fraction::from((1, 1)))
-                    .build()
-            };
-
-            appsink.set_caps(Some(&caps));
-            pipeline.set_property("video-sink", &appsink);
-        };
 
         Ok(appsink)
     }

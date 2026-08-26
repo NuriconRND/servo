@@ -48,4 +48,18 @@ pub trait Render {
         appsink: &gstreamer::Element,
         pipeline: &gstreamer::Element,
     ) -> Result<(), PlayerError>;
+
+    /// Caps this renderer's appsink accepts when the caller links it by hand.
+    ///
+    /// `None` (the default) means the renderer cannot be used that way, because
+    /// `build_video_sink` attaches something other than the bare appsink -- the unix
+    /// renderer wraps it in a `glsinkbin`, for instance. Only renderers that hand playbin
+    /// the appsink itself can be driven from a hand-built pipeline.
+    ///
+    /// Used by `media_pipeline_mode=uridecodebin3`, which exists to avoid playsink's
+    /// `vqueue`: that queue carries every raw 3.1MB frame across a thread boundary and
+    /// costs about as much as the decoding does.
+    fn detached_video_sink_caps(&self) -> Option<gstreamer::Caps> {
+        None
+    }
 }

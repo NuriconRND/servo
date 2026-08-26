@@ -390,6 +390,67 @@ fn video_rate_logging_enabled() -> bool {
     })
 }
 
+/// `media_pipeline_mode` 해석. 인정 토큰 밖은 경고 후 playbin3.
+fn use_uridecodebin3_pipeline() -> bool {
+    let value = pref!(media_pipeline_mode);
+    if value.eq_ignore_ascii_case("uridecodebin3") {
+        return true;
+    }
+    if !value.is_empty() && !value.eq_ignore_ascii_case("playbin3") {
+        log::warn!(
+            "Ignoring invalid media_pipeline_mode={value:?}; expected playbin3 or uridecodebin3"
+        );
+    }
+    false
+}
+
+/// `uridecodebin3 ! appsink` 파이프라인을 만든다. playsink 가 없으므로 디코더 뒤 큐도 없다.
+///
+/// 반환: (pipeline, uridecodebin3). 링크는 `pad-added` 에서 이뤄진다 — decodebin3 는
+/// 스트림을 발견한 뒤에야 소스 패드를 낸다.
+fn build_uridecodebin3_pipeline(
+    uri: &str,
+    appsink: &gstreamer_app::AppSink,
+) -> Result<(gstreamer::Pipeline, gstreamer::Element), PlayerError> {
+    let pipeline = gstreamer::Pipeline::new();
+    let decodebin = gstreamer::ElementFactory::make("uridecodebin3")
+        .property("uri", uri)
+        .build()
+        .map_err(|error| {
+            PlayerError::Backend(format!("uridecodebin3 creation failed: {error:?}"))
+        })?;
+    let sink = appsink.upcast_ref::<gstreamer::Element>().clone();
+    pipeline
+        .add_many([&decodebin, &sink])
+        .map_err(|error| PlayerError::Backend(format!("pipeline add failed: {error:?}")))?;
+
+    // 비디오 패드 하나만 연결한다. 오디오 패드는 링크하지 않고 두면 decodebin3 가 그
+    // 스트림을 계속 흘려보내며 multiqueue 패드를 유지하므로, 나중에 select-streams 로
+    // 아예 받지 않도록 하는 것이 다음 단계다.
+    let sink_for_pad = sink.clone();
+    decodebin.connect_pad_added(move |_, pad| {
+        let is_video = pad
+            .current_caps()
+            .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
+            .unwrap_or(false);
+        if !is_video {
+            return;
+        }
+        let Some(target) = sink_for_pad.static_pad("sink") else {
+            return;
+        };
+        if target.is_linked() {
+            // 비디오 스트림이 둘 이상인 파일: 첫 번째만 쓴다.
+            return;
+        }
+        if let Err(error) = pad.link(&target) {
+            log::error!("uridecodebin3: linking video pad to appsink failed: {error:?}");
+        }
+    });
+
+    Ok((pipeline, decodebin))
+}
+
 fn create_disabled_audio_sink() -> Result<gstreamer::Element, PlayerError> {
     let audio_sink = gstreamer::ElementFactory::make("fakesink")
         .build()

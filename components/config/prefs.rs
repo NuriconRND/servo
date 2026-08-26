@@ -535,6 +535,28 @@ pub struct Preferences {
     /// 않는다**(공유 base time 을 쓰는 `media_sync_group_target` 과 양립 불가). 다중
     /// 영상 동기는 별도 과제 "Video Sync Group" 으로 분리했다.
     pub media_video_sink_pacing: String,
+    /// 미디어 파이프라인을 무엇으로 구성할지. `playbin3`(기본) 또는 `uridecodebin3`.
+    ///
+    /// `playbin3` = 현행. `gstreamer_play::Play` 가 playbin3 를 소유한다.
+    ///
+    /// `uridecodebin3` = playsink 없이 파이프라인을 직접 만들고 appsink 를 손으로 링크한다.
+    ///
+    /// ★왜★ — playbin3 는 playsink 를 포함하고, playsink 는 디코더와 appsink 사이에
+    /// `vqueue` 를 끼운다. 그 큐는 **원본 3.1MB 프레임을 프레임마다 스레드 경계 너머로
+    /// 나른다.** 실측(45 x FHD30, Servo 없이 gst-launch, 코어/영상):
+    ///
+    /// ```text
+    /// 큐 없음                      0.284
+    /// 디먹서 직후 큐 + 오디오까지  0.294   <- 앞쪽 큐는 압축 데이터라 사실상 공짜
+    /// multiqueue(앞) + queue(뒤)   0.729   <- 뒤쪽 큐가 비용 전부
+    /// ```
+    ///
+    /// `decodebin3` 의 코덱 자동선택은 그대로 쓴다(H264/H265/VP9 등). 없애는 것은
+    /// playsink 뿐이다.
+    ///
+    /// ★제약★ — 렌더러가 appsink 자체가 아닌 것을 붙이는 경우(unix 의 `glsinkbin`) 이
+    /// 모드를 쓸 수 없고, 경고 후 `playbin3` 로 폴백한다. 트랙 선택 API 도 아직 없다.
+    pub media_pipeline_mode: String,
     /// WebRTC `webrtcbin`의 지터버퍼 latency(ms, 구 env
     /// `SERVO_WEBRTC_JITTER_LATENCY_MS`). 기본 `0` = 무버퍼(최저 지연) — 구
     /// `unwrap_or(0)` 그대로.
@@ -797,6 +819,7 @@ impl Preferences {
             media_video_sink_policy: String::new(),
             media_video_sink_qos: String::new(),
             media_video_sink_pacing: String::new(),
+            media_pipeline_mode: String::new(),
             media_webrtc_jitter_latency_ms: 0,
             network_connection_timeout: 15,
             network_enforce_mixed_content: true,

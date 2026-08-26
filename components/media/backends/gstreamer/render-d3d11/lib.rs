@@ -509,17 +509,28 @@ mod render_d3d11 {
             // 10-bit(I420_10LE 평면형, P010_10LE 반평면형)도 직접 수용한다 — 각각
             // R16/RG16 DYNAMIC plane 텍스처로 memcpy되고 WR이 16-bit 컨테이너로
             // 샘플한다(강등 videoconvert 회피).
-            let caps = gstreamer::Caps::builder("video/x-raw")
-                .field(
-                    "format",
-                    gstreamer::List::new(["I420", "YV12", "NV12", "I420_10LE", "P010_10LE"]),
-                )
-                .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
-                .build();
+            let caps = video_sink_caps();
             appsink.set_property("caps", &caps);
             pipeline.set_property("video-sink", appsink);
             Ok(())
         }
+
+        /// 이 렌더러는 appsink 자체를 넘기므로 손으로 링크하는 파이프라인에서도 쓸 수 있다.
+        fn detached_video_sink_caps(&self) -> Option<gstreamer::Caps> {
+            Some(video_sink_caps())
+        }
+    }
+
+    /// appsink 가 받는 포맷. 두 경로가 같은 caps 를 써야 한다 — 한쪽만 바뀌면 링크가
+    /// 조용히 실패하거나 원치 않는 변환이 끼어든다.
+    fn video_sink_caps() -> gstreamer::Caps {
+        gstreamer::Caps::builder("video/x-raw")
+            .field(
+                "format",
+                gstreamer::List::new(["I420", "YV12", "NV12", "I420_10LE", "P010_10LE"]),
+            )
+            .field("pixel-aspect-ratio", gstreamer::Fraction::from((1, 1)))
+            .build()
     }
 }
 

@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 25 + 조사용 env 17)
+# 설정 노브 전량 (pref 26 + 조사용 env 17)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -64,7 +64,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
-## pref 25 개
+## pref 26 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
 
@@ -107,6 +107,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `media_video_sink_policy` | String | `""` (= smooth) | appsink 버퍼링/지연 정책. 인정 토큰(대소문자 무시): `low-latency`/`low_latency`/`latency`, `smooth`/`complete`. 그 외 값은 경고 후 smooth. |
 | `media_video_sink_qos` | String | `""` (= 정책값) | appsink 의 `qos` 만 정책과 **독립적으로** 덮어쓴다. 토큰: `on`/`true`/`1`, `off`/`false`/`0`. 그 외는 경고 후 정책값. ★`media_video_sink_policy` 는 qos/drop/max-lateness/max-buffers 를 **한 묶음**으로 바꾸므로 qos 만 재려면 이쪽을 쓴다.★ 기본(Smooth)은 `qos=false` 이고 이는 GStreamer 기본이 아니라 **이 포크가 명시적으로 끄는 값**이다 — 꺼져 있으면 QoS 이벤트가 상류로 가지 않아 **avdec 이 부하 시 프레임을 건너뛰지 못한다**(과부하에서 완만한 열화 대신 절벽). |
 | `media_video_sink_pacing` | String | `""` (= clock) | 비디오 싱크의 **페이싱 방식**. `clock` = 현행(appsink `sync=true`, 파이프라인 클럭 대기). `thread` = appsink `sync=false` + 스트리밍 스레드가 PTS 앵커에 맞춰 직접 잠. ★`GstSystemClock::obtain()` 은 프로세스당 싱글턴이라 파이프라인 45 개의 싱크가 프레임마다 **같은 객체**에서 대기한다★ — 실측(80 논리코어, 45xFHD30, Servo 없이 디코드만): 45 프로세스 0.399 코어/영상, 1 프로세스 0.795, 1 프로세스 + 클럭 없이 sleep 0.284. 공유 클럭 대기가 디코딩만큼을 더 쓴다. **비범위**: `thread` 는 파이프라인마다 독립 앵커라 영상 간 동기를 보장하지 않는다(`media_sync_group_target` 과 양립 불가) — 별도 과제 Video Sync Group. |
+| `media_pipeline_mode` | String | `""` (= playbin3) | 미디어 파이프라인 구성. `playbin3` = 현행(`gstreamer_play::Play` 가 소유). `uridecodebin3` = playsink 없이 직접 구성하고 appsink 를 손으로 링크. ★playbin3 는 playsink 를 포함하고 playsink 가 디코더와 appsink 사이에 `vqueue` 를 끼운다 — 그 큐가 **원본 3.1MB 프레임을 프레임마다 스레드 경계 너머로 나른다**★ (실측 45xFHD30, 코어/영상: 큐 없음 0.284 / 디먹서 직후 큐+오디오 0.294 / multiqueue+뒤큐 0.729). `decodebin3` 의 코덱 자동선택은 유지된다(H264/H265/VP9 등) — 없애는 것은 playsink 뿐이다. **제약**: 렌더러가 appsink 자체가 아닌 것을 붙이면(unix 의 `glsinkbin`) 쓸 수 없고 경고 후 폴백한다. 트랙 선택 API 미구현. |
 | `media_webrtc_jitter_latency_ms` | i64 | `0` | `webrtcbin` 지터버퍼 latency(ms). `webrtcbin` 자체 기본은 200ms 인데 로컬/LAN 캡처에서는 그대로 고정 지연이 되므로 0(무버퍼)으로 둔다. 네트워크 지터로 프레임이 끊기면 올린다. |
 
 ### 표출용 웹 보안 완화 — `dom_enforce_framing_policy` / `network_enforce_mixed_content` / `dom_iframe_toplevel_embed_enabled`
