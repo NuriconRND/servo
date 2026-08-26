@@ -77,7 +77,31 @@ param(
     # chain has no multiqueue at all, so its numbers (0.399 / 0.795 / 0.284 cores per
     # video) do NOT model the wall. The wall's 0.98 sitting ABOVE the single-process
     # 0.795 was the tell, and it was read as a Servo cost instead.
-    [switch] $WallTopology
+    [switch] $WallTopology,
+    # Demux audio as well. Both branches get a queue.
+    #
+    # ***MEASURED 2026-08-25: a queue on the audio branch ALONE deadlocks.*** It was tried,
+    # because the expensive hop is on the video branch (3.1MB raw frames crossing a thread
+    # boundary) while audio buffers are kilobytes, so queueing only audio looked like a way
+    # to keep audio and still drop the video hop. It does not even start:
+    #
+    #   d.video_0 ! h264parse ! avdec_h264 ! fakesink
+    #   d.audio_0 ! queue ! aacparse ! avdec_aac ! fakesink
+    #   => Pipeline is PREROLLING ... and never reaches PLAYING
+    #
+    # The demuxer has one streaming thread; it blocks in the un-queued video branch and can
+    # therefore never push the first audio buffer, so the audio sink never prerolls. Setting
+    # async=false on the video sink does NOT help (also measured). Only a queue on BOTH
+    # branches prerolls, plays and reaches EOS. That is what decodebin3 uses multiqueue for.
+    #
+    # The plan survives anyway, because the two hops carry different things: the queue that
+    # audio needs sits right after the demuxer and carries COMPRESSED data (~40KB/frame),
+    # while the expensive one is playsink's queue AFTER the decoder (3.1MB/frame). Dropping
+    # the latter keeps audio working.
+    #
+    # Note the wall does not decode audio today (videos are muted, no audio decoder thread
+    # exists) yet still pays for multiqueue's audio pads -- 4 pad tasks per video.
+    [switch] $WithAudio
 )
 
 $ErrorActionPreference = "Stop"
@@ -126,8 +150,19 @@ Write-Host ""
 $videoUri = $Video -replace '\\', '/'
 # 29.97fps -> 33366 microseconds per frame.
 $sleepUs = [int](1000000.0 * 1001.0 / 30000.0)
+# Each chain needs its own demuxer name so N of them can share one process.
+$script:chainIndex = 0
 function DecodePipeline($sync) {
-    $chain = @("filesrc", "location=$videoUri", "!", "qtdemux", "!", "h264parse", "!")
+    $d = 'd' + $script:chainIndex
+    $script:chainIndex++
+    $chain = if ($WithAudio) {
+        # The video branch needs its own queue too -- see the -WithAudio note above. It sits
+        # before the parser/decoder so it only ever carries compressed data.
+        @("filesrc", "location=$videoUri", "!", "qtdemux", "name=$d", "$d.video_0", "!",
+          "queue", "!", "h264parse", "!")
+    } else {
+        @("filesrc", "location=$videoUri", "!", "qtdemux", "!", "h264parse", "!")
+    }
     # multiqueue uses request pads; gst-launch requests them automatically.
     if ($WallTopology) { $chain += @("multiqueue", "!") }
     $chain += @("avdec_h264", "max-threads=$MaxThreads", "!")
@@ -137,6 +172,10 @@ function DecodePipeline($sync) {
         $chain += @("identity", "sleep-time=$sleepUs", "!", "fakesink", "sync=false")
     } else {
         $chain += @("fakesink", "sync=$sync")
+    }
+    if ($WithAudio) {
+        $chain += @("$d.audio_0", "!", "queue", "!", "aacparse", "!", "avdec_aac", "!",
+                    "fakesink", "sync=$sync")
     }
     $chain
 }
@@ -177,10 +216,21 @@ if ($DurationSec -lt 5) { throw "clip too short to measure ($DurationSec s of us
 # Say what was actually measured. A run that does not name its own configuration is how
 # `-D3d11ProfileMs 0` got silently ignored for a whole round of measurements.
 Write-Host "[2] $Count pipelines at playback rate"
-Write-Host ("      topology  : {0}" -f $(if ($WallTopology) {
-    "filesrc ! qtdemux ! h264parse ! multiqueue ! avdec_h264 ! queue ! sink  (as playbin3 does)"
+# Spell out the chain that was actually built, including what -WithAudio inserts.
+$topologyLine = "filesrc ! qtdemux ! "
+if ($WithAudio)     { $topologyLine += "queue ! " }
+$topologyLine += "h264parse ! "
+if ($WallTopology)  { $topologyLine += "multiqueue ! " }
+$topologyLine += "avdec_h264 ! "
+if ($WallTopology)  { $topologyLine += "queue ! " }
+$topologyLine += "sink"
+if ($WallTopology)  { $topologyLine += "   (as playbin3 does)" }
+elseif (-not $WithAudio) { $topologyLine += "   (plain; NOT what the wall runs)" }
+Write-Host ("      topology  : {0}" -f $topologyLine)
+Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
+    "demuxed too; a queue on BOTH branches (audio-only queue deadlocks -- see -WithAudio)"
 } else {
-    "filesrc ! qtdemux ! h264parse ! avdec_h264 ! sink  (plain; NOT what the wall runs)"
+    "not demuxed (video branch only)"
 }))
 Write-Host ("      pacing    : {0}" -f $(if ($PaceWithSleep) { "identity sleep-time, NO clock" } else { "sink sync=true (shared GstSystemClock)" }))
 Write-Host ("      processes : {0}   max-threads={1}" -f $(if ($SingleProcess) { "1 holding $Count chains" } else { "$Count, one per chain" }), $MaxThreads)
