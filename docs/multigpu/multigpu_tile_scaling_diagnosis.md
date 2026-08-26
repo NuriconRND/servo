@@ -2451,3 +2451,39 @@ present 가 28.6 -> 8.5/s 로 굶어서다. `512x512` 에서 pts=1.00 인 것은
 샘플링하지 않는다. 이 조사에서 한 번도 제대로 켜본 적이 없다(초기에 재생이 안 된다는
 보고가 있었고, 그 뒤로 파이프라인이 바뀌었다).
 
+
+## 2026-08-26 — `gfx_video_escape_mode=external` 구조 확인 (개발기, 9 영상)
+
+★개발기(AMD 7800M)라 **성능 수치는 근거로 쓰지 않는다.** 여기서 확인한 것은 구조뿐이다.★
+
+`-DcompDebug`/`-VideoEscapeProf` 로 확인:
+
+- ***9 개 영상 전부가 external DComp 서피스로 승격된다*** — `create_external_surface` 9,
+  `attach_external_image` 9, `[vesc-prof] converts=270 presents=270`(= 9 x 30fps).
+- ***합성 1 회의 draw_calls 가 10 -> 1 로 떨어진다***(16ms 초과 프레임 기준 p50).
+  비디오가 콘텐츠 패스에서 빠지고 DComp 가 대신 합성하기 때문이다. 이것이 45 영상의
+  `render_ms p50 29.9ms` 를 겨누는 근거다.
+- 16ms 초과 프레임 수 133 -> 91.
+- ***화면은 육안으로 동일하다*** — 9 칸 모두 재생, 오버레이 텍스트가 영상 위에 정상,
+  투명 구멍 없음([[dcomp-transparent-hole-deferred]] 의 그 현상은 나타나지 않았다).
+  스케일/배치도 escape off 와 같다.
+
+### 2026-08-20 기록과의 관계 (모순 아님)
+
+당시 "표준 플래그 세트에서 비디오는 external 서피스로 승격되지 않는다"고 기록했는데,
+그 세트에는 ***`gfx_video_escape_mode=external` 이 없었다.*** 게이트가
+`DComp on` + `이 pref` 둘 다 요구하므로 승격이 없는 것이 정상이었다. 기본값은 여전히 off 다.
+
+### WebRender 상한을 오독할 뻔했다
+
+`MAX_COMPOSITOR_SURFACES = 4` 를 보고 "4 개까지만 승격되니 45 영상엔 무의미"라고 볼 뻔했다.
+그 상한은 ***오버레이 경로에만*** 걸린다(`sub_slice_index == len-1` 이면 `OverlaySurfaceLimit`).
+YUV 비디오는 macOS 가 아닌 곳에서 `prefer_underlay = true` 라 ***언더레이를 먼저 시도***하고,
+언더레이에는 개수 상한이 없다(마스크가 붙은 언더레이만 1 개 제한). 실제로 9/9 가 승격된 것이
+그 증거다. — `picture.rs::can_promote_to_surface`
+
+### 남은 것: 테스트 장비 45 영상 A/B (미실행)
+
+개발기에서 볼 수 있는 것은 여기까지다. `render_ms p50` 이 29.9ms 에서 내려오는지는
+테스트 장비에서만 판정된다.
+
