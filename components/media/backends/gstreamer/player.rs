@@ -318,12 +318,11 @@ fn configure_playbin_flags(
     prefer_native_video: bool,
 ) -> Result<(), PlayerError> {
     let flags = pipeline.property_value("flags");
-    let flags_class = glib::FlagsClass::with_type(flags.type_()).ok_or_else(|| {
-        PlayerError::Backend("FlagsClass creation failed".to_owned())
-    })?;
-    let mut flags_builder = flags_class.builder_with_value(flags).ok_or_else(|| {
-        PlayerError::Backend("FlagsClass creation failed".to_owned())
-    })?;
+    let flags_class = glib::FlagsClass::with_type(flags.type_())
+        .ok_or_else(|| PlayerError::Backend("FlagsClass creation failed".to_owned()))?;
+    let mut flags_builder = flags_class
+        .builder_with_value(flags)
+        .ok_or_else(|| PlayerError::Backend("FlagsClass creation failed".to_owned()))?;
 
     if !cfg!(any(target_os = "windows", target_os = "android")) {
         flags_builder = flags_builder.set_by_nick("download");
@@ -776,14 +775,13 @@ struct SyncGroupState {
     watchdog_started: bool,
 }
 
-static SYNC_GROUP: std::sync::LazyLock<Mutex<SyncGroupState>> =
-    std::sync::LazyLock::new(|| {
-        Mutex::new(SyncGroupState {
-            members: Vec::new(),
-            released: false,
-            watchdog_started: false,
-        })
-    });
+static SYNC_GROUP: std::sync::LazyLock<Mutex<SyncGroupState>> = std::sync::LazyLock::new(|| {
+    Mutex::new(SyncGroupState {
+        members: Vec::new(),
+        released: false,
+        watchdog_started: false,
+    })
+});
 
 fn sync_group_released() -> bool {
     SYNC_GROUP.lock().unwrap().released
@@ -838,7 +836,11 @@ fn register_sync_member(play: Option<gstreamer_play::Play>, pipeline: gstreamer:
         return;
     }
     state.members.push(SyncGroupMember { play, pipeline });
-    log::info!("Sync group: {}/{} pipelines armed", state.members.len(), target);
+    log::info!(
+        "Sync group: {}/{} pipelines armed",
+        state.members.len(),
+        target
+    );
     if !state.watchdog_started {
         state.watchdog_started = true;
         let _ = std::thread::Builder::new()
@@ -960,9 +962,9 @@ impl PlayerInner {
         // Synchronized group start (see `media_sync_group_target`): hold the pipeline
         // paused and prerolled; the sync group releases every member simultaneously on a
         // shared clock. Arming happens once metadata is known (`request_sync_group_arm`).
-        if sync_group_target().is_some() &&
-            self.stream_type == StreamType::Seekable &&
-            !sync_group_released()
+        if sync_group_target().is_some()
+            && self.stream_type == StreamType::Seekable
+            && !sync_group_released()
         {
             self.sync_hold.set(true);
             self.set_pipeline_paused();
@@ -1062,7 +1064,11 @@ impl PlayerInner {
             && let Some(ref duration) = metadata.duration
             && duration < &time::Duration::new(time as u64, 0)
         {
-            gstreamer::warning!(self.cat, obj = &self.pipeline, "Trying to seek out of range");
+            gstreamer::warning!(
+                self.cat,
+                obj = &self.pipeline,
+                "Trying to seek out of range"
+            );
             return Err(PlayerError::SeekOutOfRange);
         }
 
@@ -1479,8 +1485,9 @@ impl GStreamerPlayer {
         // element. For rtsp:// URIs this is `rtspsrc` (which itself depends on the
         // `rtpmanager` plugin). Fail fast with a clear error if the RTSP plugins
         // are not available in this GStreamer install.
-        if self.stream_type == StreamType::NetworkUri &&
-            self.network_uri
+        if self.stream_type == StreamType::NetworkUri
+            && self
+                .network_uri
                 .as_deref()
                 .is_some_and(|uri| uri.starts_with("rtsp"))
         {
@@ -1506,9 +1513,9 @@ impl GStreamerPlayer {
             None
         });
 
-        let prefer_native_video = !self.render.lock().unwrap().is_gl() &&
-            !servo_config::opts::get().multiprocess &&
-            !servo_config::opts::get().force_ipc;
+        let prefer_native_video = !self.render.lock().unwrap().is_gl()
+            && !servo_config::opts::get().multiprocess
+            && !servo_config::opts::get().force_ipc;
         configure_playbin_flags(&pipeline, prefer_native_video)?;
 
         // Set max size for the player buffer.
@@ -1615,9 +1622,7 @@ impl GStreamerPlayer {
                 // Let playbin3 own the source: it auto-plugs the right element
                 // (e.g. rtspsrc) for the scheme. No servo AppSrc is registered.
                 let uri = self.network_uri.clone().ok_or_else(|| {
-                    PlayerError::Backend(
-                        "NetworkUri stream type requires a network_uri".to_owned(),
-                    )
+                    PlayerError::Backend("NetworkUri stream type requires a network_uri".to_owned())
                 })?;
                 uri.to_value()
             },
