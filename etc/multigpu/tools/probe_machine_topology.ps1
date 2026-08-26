@@ -49,12 +49,15 @@ Add-Type -Namespace Win32 -Name Topo -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern uint GetActiveProcessorCount(ushort g);
 [DllImport("kernel32.dll")] public static extern ushort GetActiveProcessorGroupCount();
 '@
+# [System.UInt16] on purpose below: [ushort] is a PowerShell 7 type accelerator and the
+# test machine runs Windows PowerShell 5.1, where it fails with "type not found" and the
+# whole group section prints nothing but errors.
 $gc = [Win32.Topo]::GetActiveProcessorGroupCount()
 Write-Host ("  groups: $gc")
 for ($g = 0; $g -lt $gc; $g++) {
-    Write-Host ("    group {0} : {1} logical processors" -f $g, [Win32.Topo]::GetActiveProcessorCount([ushort]$g))
+    Write-Host ("    group {0} : {1} logical processors" -f $g, [Win32.Topo]::GetActiveProcessorCount([System.UInt16]$g))
 }
-Write-Host ("    ALL     : {0} logical processors" -f [Win32.Topo]::GetActiveProcessorCount([ushort]0xFFFF))
+Write-Host ("    ALL     : {0} logical processors" -f [Win32.Topo]::GetActiveProcessorCount([System.UInt16]0xFFFF))
 
 Write-Host ""
 Write-Host "=== sockets / cores ============================================="

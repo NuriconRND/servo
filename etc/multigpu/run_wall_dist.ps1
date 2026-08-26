@@ -168,7 +168,21 @@ param(
     # Launching has to go through `cmd /c start /NODE`, which is the only way to ask for a
     # node at creation. That in turn needs a temp .cmd wrapper so the stderr redirect belongs
     # to winit_wall and not to cmd, and the PID has to be found by name afterwards.
-    [int]    $NumaNode = -1,
+    # "auto" (default) = pin to the NUMA node the display adapters are on, derived at launch.
+    # "off" = let Windows pick, the pre-2026-08-26 behaviour. A number forces that node.
+    #
+    # ***THE GPUs ARE ON ONE NUMA NODE AND LANDING ON THE OTHER ONE DESTROYS THE WALL.***
+    # This box is two Xeon Gold 6248 sockets (20C/40T each) with four Radeon RX 580 all
+    # reporting NUMA node 1. Measured 2026-08-26 with the node forced, 45 videos, 6/6:
+    #
+    #   node 1 (the GPUs' node): 23-29.5 video fps, 0.65-0.73 ms per Present, dwm 0.09-0.11
+    #   node 0 (the far socket):  6.0     video fps, 2.9-3.0  ms per Present, dwm 0.64-0.66
+    #
+    # Every upload and every present crosses the inter-socket link on the far node. It is not
+    # a capacity problem -- the collapsed runs left 31 of 80 cores idle. Before this was found,
+    # the same command landed in either state at random and every A/B that straddled the two
+    # compared nothing.
+    [string] $NumaNode = "auto",
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
     # pipeline setup and first-frame staging, which are not the steady state.
@@ -254,11 +268,36 @@ Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.I
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
 
-if ($NumaNode -ge 0) {
+# Resolve -NumaNode "auto" into a number by asking the display adapters which node they are
+# on. DXGI does not expose this; it is a PnP device property. If they disagree, or none of them
+# answers, say so and pin nothing -- guessing here is how a wall ends up on the far socket.
+$numaResolved = -1
+if ($NumaNode -eq "auto") {
+    $nodes = @(Get-PnpDevice -Class Display -Status OK -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            ($_ | Get-PnpDeviceProperty -KeyName 'DEVPKEY_Device_Numa_Node' -EA SilentlyContinue).Data
+        } | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+    if ($nodes.Count -eq 1) {
+        $numaResolved = [int]$nodes[0]
+        Write-Host "  numa=auto -> node $numaResolved (from the display adapters)"
+    } elseif ($nodes.Count -gt 1) {
+        Write-Warning "Display adapters report different NUMA nodes ($($nodes -join ', ')). Pinning nothing -- pass -NumaNode <n> to choose."
+    } else {
+        Write-Warning "No display adapter reports a NUMA node, so it cannot be derived. Pinning nothing. On a multi-socket box pass -NumaNode <n> explicitly: landing on the far node has been measured to cut 45-video playback from 29 fps to 6."
+    }
+} elseif ($NumaNode -eq "off" -or $NumaNode -eq "") {
+    $numaResolved = -1
+} elseif ($NumaNode -match '^\d+$') {
+    $numaResolved = [int]$NumaNode
+} else {
+    throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
+}
+
+if ($numaResolved -ge 0) {
     # Quote EVERY argument: the page URL carries `?rows=5&cols=9`, and a bare `&` inside a
     # .cmd is a command separator, so an unquoted URL silently truncates the run.
     $argStr = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $NumaNode)
+    $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $numaResolved)
     # ***`start /NODE` has to be the thing that launches winit_wall itself.*** The first cut of
     # this put /NODE on the wrapper cmd.exe and let THAT spawn the exe -- a child inherits no
     # node preference, so the flag did nothing and the run landed wherever Windows felt like.
@@ -271,15 +310,16 @@ if ($NumaNode -ge 0) {
     @"
 @echo off
 cd /d "$here"
-start "" /NODE $NumaNode /B /WAIT "$exe" $argStr 2> "$LogPath"
+start "" /NODE $numaResolved /B /WAIT "$exe" $argStr 2> "$LogPath"
 "@ | Set-Content -Encoding ascii $cmdFile
-    Write-Host "  launching on NUMA node $NumaNode (via cmd start /NODE)"
-    # ***Hand `start` an explicit `cmd /c`, never the .cmd file itself.*** Pointed straight at a
-    # .cmd, `start` opens it with `cmd /K`, which stays alive after the wall exits -- a zombie
-    # whose working directory is the dist folder, so the next make_wall_dist fails with "the
-    # process cannot access the file". `/c` exits with the script.
-    Start-Process cmd -ArgumentList "/c", "start", '""', "/NODE", "$NumaNode", "/B", `
-        "cmd.exe", "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
+    Write-Host "  launching on NUMA node $numaResolved (via cmd start /NODE)"
+    # Just run the wrapper. ***The /NODE lives INSIDE it***, on the line that launches
+    # winit_wall itself -- an earlier cut put /NODE on this outer cmd and let it spawn the
+    # exe as a child, which inherits no node preference, so the flag did nothing at all
+    # (measured: 2 of 6 runs came up in the group they had not asked for).
+    # `cmd /c` (not the .cmd path directly) so the wrapper exits instead of lingering as a
+    # `cmd /K` zombie holding the dist folder open.
+    Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
     # start /B returns immediately, so the PID has to be found by name. Only one wall runs
     # at a time here, so the name is unambiguous.
     $proc = $null
@@ -287,7 +327,7 @@ start "" /NODE $NumaNode /B /WAIT "$exe" $argStr 2> "$LogPath"
         Start-Sleep -Milliseconds 100
         $proc = Get-Process winit_wall -ErrorAction SilentlyContinue | Select-Object -First 1
     }
-    if ($null -eq $proc) { throw "winit_wall did not start within 10s under 'start /NODE $NumaNode'" }
+    if ($null -eq $proc) { throw "winit_wall did not start within 10s under 'start /NODE $numaResolved'" }
 } else {
     $proc = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here `
         -RedirectStandardError $LogPath -PassThru
@@ -358,7 +398,7 @@ if ($DurationSec -gt 0) {
     Wait-Process -Id $proc.Id
 }
 
-if ($NumaNode -ge 0 -and $cmdFile -and (Test-Path $cmdFile)) {
+if ($numaResolved -ge 0 -and $cmdFile -and (Test-Path $cmdFile)) {
     Remove-Item $cmdFile -Force -ErrorAction SilentlyContinue
 }
 
