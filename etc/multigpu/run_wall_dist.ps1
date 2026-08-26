@@ -236,6 +236,33 @@ Write-Host "  log=$LogPath"
 $proc = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here `
     -RedirectStandardError $LogPath -PassThru
 
+# ***WHICH PROCESSOR GROUP THIS PROCESS LANDED IN DECIDES THE RESULT.*** Measured 2026-08-26,
+# 45 videos with escape=external, same command and same binary, nine runs:
+#
+#   group 1 (7 runs): 34.2-37.1 cores, 0.75-0.81 per decode thread, ~28 presents/s -- fine
+#   group 0 (2 runs): 46.4-46.5 cores, 0.98 SATURATED,               ~5 presents/s -- collapsed
+#
+# The box has 2 processor groups (40+40) and 2 NUMA nodes, and the GPU hangs off one of them.
+# Windows picks the group at process creation, so the SAME command lands in either state and
+# an A/B that straddles the two compares nothing. Print it early, before anyone reads a number
+# off this run. The 1s probe costs nothing next to a 40s run.
+$grpLine = ""
+$probeEarly = Join-Path $engine "thread_cpu_probe.exe"
+if (Test-Path $probeEarly) {
+    Start-Sleep -Seconds 3        # let the decode threads exist before asking where they are
+    $out = & $probeEarly --pid $proc.Id --duration 1 --top 1 2>&1
+    # The probe prints this section only on a box with more than one group, so a machine
+    # with a single group (the dev box) yields nothing here -- that is not an error.
+    $m = $out | Select-String -Pattern "^\s+group \d" | Select-Object -First 1
+    if ($null -ne $m) { $grpLine = $m.ToString().Trim() }
+}
+if ($grpLine -ne "") {
+    Write-Host "  processor $grpLine"
+    if ($grpLine -match "^group 0") {
+        Write-Warning "This run landed in processor GROUP 0. Measured 2026-08-26: at 45 videos with escape=external, group 0 collapses (0.98 cores/decode thread, ~5 presents/s) while group 1 runs at 0.77 and ~28. DO NOT compare this run against a group 1 run -- re-run until it lands in group 1, or treat this as the group 0 arm on purpose."
+    }
+}
+
 if ($DurationSec -gt 0) {
     $sampled = $false
     if ($ThreadCpu) {
