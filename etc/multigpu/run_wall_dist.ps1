@@ -28,6 +28,17 @@ param(
     [string] $DComp = "surface",
     [switch] $Vsync,                     # gfx_vsync_enabled (default off; see note below)
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
+    # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
+    # 0 = leave the pref alone (engine default 2 = current behaviour).
+    #
+    # With 2 buffers only one frame can be in flight, so Present waits for the compositor to
+    # release a back buffer. Measured at 45 videos: the renderer thread spends 85% of every
+    # second (854ms) inside Present while using under 0.3 cores -- it is sleeping, not working.
+    # Per-call cost also grows with the video count (0.42ms at 20, 0.70ms at 45), which a fixed
+    # driver submission cost would not do. Content swap chains are NOT affected (their partial
+    # Present catch-up copy requires exactly 2).
+    [ValidateRange(0, 4)]
+    [int]    $VideoEscapeBuffers = 0,
     # appsink qos, isolated from the sink policy. Empty = policy default (Smooth => off).
     # With qos off the decoder cannot skip frames under load, so an overloaded wall falls
     # off a cliff instead of degrading. See media_video_sink_qos in configuration.md.
@@ -204,6 +215,7 @@ $argList = @(
     "--pref", "media_sync_group_target=$SyncGroup"
 )
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
+if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
 if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$SinkPacing") }
@@ -215,7 +227,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
+Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"

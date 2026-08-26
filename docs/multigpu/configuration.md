@@ -91,6 +91,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_video_escape_mode` | String | `""` (= off) | 비디오를 WebRender 밖으로 빼는 모드. 유효 토큰은 `external` 하나뿐이고 빈 문자열이 off 다. DComp 게이트가 켜져 있어야 실제로 동작한다. |
 | `gfx_video_escape_stable_swapchain` | bool | **`true`** | 킬스위치. 탈출 경로의 스왑체인 안정화를 끄려면 `=false`. |
 | `gfx_video_escape_promote_hysteresis` | i64 | `10` | 비디오 레이어를 탈출 경로로 승격하기 전에 기다리는 프레임 수. |
+| `gfx_video_escape_buffer_count` | i64 | `2` | **external 비디오 스왑체인 전용** 백버퍼 수(2..=4, 범위 밖은 경고 후 클램프). ★2 면 in-flight 프레임이 1 장이라 `Present` 가 컴포지터의 백버퍼 반납을 기다린다★ — 45xFHD30 실측에서 렌더러 스레드가 1 초 중 **85%(854ms)를 Present 에서** 보내는데 CPU 는 0.3 코어도 안 쓴다(= 일하는 게 아니라 자고 있다). 1 회당 비용도 영상 수에 따라 0.42ms(20 개) → 0.70ms(45 개)로 커진다(고정 드라이버 비용이면 안 커진다). **콘텐츠 스왑체인에는 적용되지 않는다** — 그쪽 부분 Present 의 catch-up 복사가 `GetBuffer(1)`=직전 프레임이라는 정확한 2 버퍼 핑퐁을 전제한다. |
 | `gfx_video_decouple_enabled` | bool | **`true`** | 킬스위치. 비디오 프레임 갱신을 씬 재합성에서 분리하는 경로를 끄려면 `=false`. |
 
 ### `media_*` — 미디어

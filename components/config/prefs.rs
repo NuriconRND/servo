@@ -357,6 +357,20 @@ pub struct Preferences {
     /// 옛 env `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS`의 `unwrap_or(10)`을 그대로
     /// 기본값 10 으로 보존한다.
     pub gfx_video_escape_promote_hysteresis: i64,
+    /// 비디오별 external flip 스왑체인의 백버퍼 수. 기본 2 = 현행.
+    ///
+    /// ★2 면 in-flight 프레임이 1 장뿐이라 `Present` 가 컴포지터의 백버퍼 반납을 기다린다★ —
+    /// 45 영상 실측에서 렌더러 스레드가 1 초 중 85%(854ms)를 Present 에서 보내는데 CPU 는
+    /// 0.3 코어도 쓰지 않는다(= 일하는 게 아니라 자고 있다). 1 회당 비용이 영상 수에 따라
+    /// 0.42ms(20 개) → 0.70ms(45 개)로 커지는 것도 고정 드라이버 비용이 아니라 대기라는
+    /// 쪽에 맞는다. 이 값을 올려 그 대기를 없앨 수 있는지 재는 노브다.
+    ///
+    /// **콘텐츠 스왑체인에는 적용되지 않는다** — 그쪽 부분 Present 의 catch-up 복사가
+    /// `GetBuffer(1)` = 직전 프레임 버퍼라는 정확한 2 버퍼 핑퐁을 전제한다(스펙 §5.1-1).
+    /// 이 pref 는 external 비디오 스왑체인 전용이다.
+    ///
+    /// 범위 밖(2 미만/4 초과)이면 경고 후 클램프한다.
+    pub gfx_video_escape_buffer_count: i64,
     /// 외부 비디오 갱신을 콘텐츠 프레임 생성(`generate_frame`)에서 분리할지의 킬스위치.
     /// 기본 켜짐 — 옛 env `SERVO_VIDEO_DECOUPLE`은 `map(|v| v != "0").unwrap_or(true)`
     /// 판정이라 미설정이 곧 on 이었다. 끄면(false) 비디오 프레임마다 generate_frame 을
@@ -754,6 +768,7 @@ impl Preferences {
             gfx_video_escape_mode: String::new(), // 빈 문자열 = off (external 만 유효)
             gfx_video_escape_stable_swapchain: true,
             gfx_video_escape_promote_hysteresis: 10,
+            gfx_video_escape_buffer_count: 2,
             gfx_video_decouple_enabled: true,
             image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,

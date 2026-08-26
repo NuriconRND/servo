@@ -75,6 +75,26 @@ fn dcomp_debug() -> bool {
     debug_env::enabled(&debug_env::DCOMP_DEBUG)
 }
 
+/// external 비디오 스왑체인의 백버퍼 수(`gfx_video_escape_buffer_count` pref, 기본 2).
+/// 범위 밖이면 1 회 경고 후 클램프. `OnceLock` 캐시 근거는 `stable_swapchain()`과 같다
+/// (스왑체인 생성 경로에서 불리고, 프로세스 수명 동안 고정이어야 한다).
+///
+/// ★콘텐츠 스왑체인에는 쓰지 않는다★ — 그쪽은 부분 Present 의 catch-up 복사가 정확한
+/// 2 버퍼 핑퐁을 전제한다(create_composition_swapchain 주석).
+fn external_buffer_count() -> u32 {
+    static COUNT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let raw = pref!(gfx_video_escape_buffer_count);
+        let clamped = raw.clamp(2, 4);
+        if clamped != raw {
+            warn!(
+                "gfx_video_escape_buffer_count={raw} is out of range (2..=4); using {clamped}"
+            );
+        }
+        clamped as u32
+    })
+}
+
 /// External swap-chain stabilization gate (`gfx_video_escape_stable_swapchain` pref, 구
 /// env `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN`). Default on; false reverts to the old
 /// behavior (swap-chain sized to the clip, recreated every frame under a scale animation)
@@ -1006,7 +1026,8 @@ struct ExternalStorage {
     /// 브링업 계약 로그(서피스당 최초 5프레임)용 카운터(진단 전용, dcomp_debug 게이트).
     frames_logged: u32,
     /// flip 스왑체인 백버퍼별 RTV 캐시(키 = GetBuffer(0)가 준 백버퍼 텍스처 포인터 usize).
-    /// FLIP_SEQUENTIAL 2버퍼가 번갈아 반환되므로 엔트리 ≤2. 매 present GetBuffer(0)→조회/생성으로
+    /// FLIP_SEQUENTIAL 백버퍼가 번갈아 반환되므로 엔트리 ≤ BufferCount
+    /// (`gfx_video_escape_buffer_count`, 기본 2). 매 present GetBuffer(0)→조회/생성으로
     /// per-present CreateRenderTargetView(GCN1 등 구형 AMD에서 프레임 예산 비용)를 제거한다.
     ///
     /// ★SAFETY: 스왑체인 백버퍼는 CPU-Map(WRITE_DISCARD) 대상이 절대 아니므로(DYNAMIC이 아님)
@@ -1387,13 +1408,18 @@ impl DCompNativeCompositor {
     }
 
     /// 컴포지션용 flip 스왑체인 생성. 실패 시 None(호출자는 Virtual 유지 폴백).
-    /// FLIP_SEQUENTIAL + BufferCount 2: FLIP_DISCARD와 달리 Present 후에도 버퍼 콘텐츠가
-    /// 보존된다 — 부분 Present의 catch-up 복사(GetBuffer(1)에서 복사)가 이를 전제한다
+    /// FLIP_SEQUENTIAL: FLIP_DISCARD와 달리 Present 후에도 버퍼 콘텐츠가 보존된다 —
+    /// 부분 Present의 catch-up 복사(GetBuffer(1)에서 복사)가 이를 전제한다
     /// (스펙 §5.1-1; PoC G4가 정확 2버퍼 핑퐁 로테이션을 실기 확인).
+    ///
+    /// ★`buffer_count` 는 콘텐츠 경로에서 반드시 2 여야 한다★ — 위 catch-up 복사가 정확한
+    /// 2 버퍼 핑퐁을 전제하기 때문이다. 3 이상을 넘길 수 있는 곳은 그 복사를 하지 않는
+    /// external 비디오 경로뿐이다(`external_buffer_count`).
     fn create_composition_swapchain(
         &self,
         size: DeviceIntSize,
         is_opaque: bool,
+        buffer_count: u32,
     ) -> Option<ComOwned<IDXGISwapChain1>> {
         let Some(factory) = self.dxgi_factory.as_ref().map(ComOwned::as_ptr) else {
             warn!("[dcomp-native] create_composition_swapchain: no DXGI factory; giving up");
@@ -1410,7 +1436,7 @@ impl DCompNativeCompositor {
             Stereo: 0,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
+            BufferCount: buffer_count,
             Scaling: DXGI_SCALING_STRETCH, // CreateSwapChainForComposition 필수값
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: if is_opaque { DXGI_ALPHA_MODE_IGNORE } else { DXGI_ALPHA_MODE_PREMULTIPLIED },
@@ -1626,7 +1652,7 @@ impl DCompNativeCompositor {
             _ => return,
         };
         let created: Option<Option<ComOwned<IDXGISwapChain1>>> = if need_new && !resize_active {
-            Some(self.create_composition_swapchain(size, is_opaque))
+            Some(self.create_composition_swapchain(size, is_opaque, external_buffer_count()))
         } else {
             None
         };
@@ -1719,7 +1745,7 @@ impl DCompNativeCompositor {
         };
 
         // flip 스왑체인 present: GetBuffer(0)로 이번 백버퍼를 얻고, RTV는 백버퍼 포인터로 캐시
-        // 조회(FLIP 2버퍼 → 엔트리 ≤2)해 per-present CreateRenderTargetView를 없앤다. 이번 프레임
+        // 조회(FLIP 백버퍼 수만큼만 엔트리가 는다)해 per-present CreateRenderTargetView를 없앤다. 이번 프레임
         // 첫 external convert면 begin_batch로 컨텍스트-상태 배치를 연다(프레임당 스왑 2N→2).
         // Safety: 살아있는 스왑체인/디바이스/컨텍스트/백버퍼.
         let prof_on = video_escape_prof();
@@ -2965,7 +2991,7 @@ impl Compositor for DCompNativeCompositor {
                 None => continue,
             };
             let size = extent.size();
-            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque) else {
+            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque, 2) else {
                 // 생성 실패 → 이후 승격 영구 중단(Virtual 유지). helper가 warn 1회를 남긴다.
                 self.warned_promote_fail = true;
                 continue;
@@ -3023,7 +3049,7 @@ impl Compositor for DCompNativeCompositor {
                 None => continue,
             };
             let size = extent.size();
-            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque) else {
+            let Some(swapchain) = self.create_composition_swapchain(size, is_opaque, 2) else {
                 // 재생성 실패 → 이후 regen 영구 중단(옛 콘텐츠 동결 표시). warn 1회.
                 warn!(
                     "[dcomp-native] swapchain regen failed; keeping stale swapchain and \

@@ -374,6 +374,12 @@ fn video_defaults_preserve_the_kill_switches() {
         "as_deref() != Ok(\"0\") 이라 기본 on"
     );
     assert_eq!(defaults.gfx_video_escape_promote_hysteresis, 10);
+    // 기본 2 = 현행 동작. 이 값을 올리는 것은 external 비디오 스왑체인 전용 실험이고,
+    // 콘텐츠 스왑체인은 부분 Present catch-up 때문에 2 로 고정이다(prefs.rs 주석).
+    assert_eq!(defaults.gfx_video_escape_buffer_count, 2);
+    // 기본 2 = 현행 동작. 이 값을 올리는 것은 external 비디오 스왑체인 전용 실험이고,
+    // 콘텐츠 스왑체인은 부분 Present catch-up 때문에 2 로 고정이다(prefs.rs 주석).
+    assert_eq!(defaults.gfx_video_escape_buffer_count, 2);
     // gfx_video_escape_mode 는 이 파일의 다른 String pref 와 같은 관례 — 빈 문자열 = off
     // (external 만 유효 토큰).
     assert!(defaults.gfx_video_escape_mode.is_empty());
