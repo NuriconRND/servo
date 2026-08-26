@@ -630,8 +630,17 @@ enum PlayerSource {
 }
 
 struct PlayerInner {
-    player: gstreamer_play::Play,
-    _signal_adapter: gstreamer_play::PlaySignalAdapter,
+    /// `None` when the pipeline was not built by `gstreamer_play::Play`.
+    ///
+    /// `Play` owns a playbin3, and playbin3 owns a playsink, and playsink is what inserts
+    /// the `vqueue` between the decoder and our appsink -- the hop that carries every raw
+    /// 3.1MB frame across a thread boundary. `media_pipeline_mode=uridecodebin3` builds the
+    /// pipeline directly instead, so there is no `Play` to hold.
+    player: Option<gstreamer_play::Play>,
+    _signal_adapter: Option<gstreamer_play::PlaySignalAdapter>,
+    /// The top-level pipeline, whoever built it. Previously this was always reached through
+    /// `player.pipeline()`; it is a field now because `player` can be `None`.
+    pipeline: gstreamer::Element,
     source: Option<PlayerSource>,
     video_sink: gstreamer_app::AppSink,
     input_size: u64,
@@ -695,7 +704,8 @@ fn sync_group_target() -> Option<usize> {
 }
 
 struct SyncGroupMember {
-    play: gstreamer_play::Play,
+    /// `None` for a pipeline that was not built by `Play` -- released by state change.
+    play: Option<gstreamer_play::Play>,
     pipeline: gstreamer::Element,
 }
 
@@ -731,7 +741,12 @@ fn release_sync_group(members: &[SyncGroupMember]) {
         member.pipeline.set_base_time(base);
     }
     for member in members {
-        member.play.play();
+        match member.play.as_ref() {
+            Some(play) => play.play(),
+            None => {
+                let _ = member.pipeline.set_state(gstreamer::State::Playing);
+            },
+        }
     }
     log::info!(
         "Sync group released: {} pipelines starting at shared base time",
@@ -740,15 +755,25 @@ fn release_sync_group(members: &[SyncGroupMember]) {
 }
 
 /// Register an armed pipeline; releases the whole group when the target count is reached.
-fn register_sync_member(play: gstreamer_play::Play, pipeline: gstreamer::Element) {
+fn register_sync_member(play: Option<gstreamer_play::Play>, pipeline: gstreamer::Element) {
     let Some(target) = sync_group_target() else {
-        play.play();
+        match play.as_ref() {
+            Some(play) => play.play(),
+            None => {
+                let _ = pipeline.set_state(gstreamer::State::Playing);
+            },
+        }
         return;
     };
     let mut state = SYNC_GROUP.lock().unwrap();
     if state.released {
         drop(state);
-        play.play();
+        match play.as_ref() {
+            Some(play) => play.play(),
+            None => {
+                let _ = pipeline.set_state(gstreamer::State::Playing);
+            },
+        }
         return;
     }
     state.members.push(SyncGroupMember { play, pipeline });
@@ -811,7 +836,9 @@ impl PlayerInner {
         }
 
         self.muted.set(muted);
-        self.player.set_mute(muted);
+        if let Some(player) = self.player.as_ref() {
+            player.set_mute(muted);
+        }
         let audio_disabled = !pref!(media_audio_enabled);
         let audio_track_enabled = !muted && !audio_disabled;
         // Mute via GstPlay's reversible controls only: the `mute` property plus audio-track
@@ -820,7 +847,9 @@ impl PlayerInner {
         // audio branch, leaving audio dead after an unmute (mute becomes irreversible). The
         // construction-time media_audio_enabled=false fakesink (set before PLAYING) is
         // unaffected.
-        self.player.set_audio_track_enabled(audio_track_enabled);
+        if let Some(player) = self.player.as_ref() {
+            player.set_audio_track_enabled(audio_track_enabled);
+        }
         log::info!(
             "GStreamer mute state updated: muted={} audio_track_enabled={}",
             muted,
@@ -849,7 +878,9 @@ impl PlayerInner {
         // set immediately before the initial gstreamer_play_MESSAGE_MEDIA_INFO_UPDATED
         // message is posted to bus.
         if self.last_metadata.is_some() {
-            self.player.set_rate(playback_rate);
+            if let Some(player) = self.player.as_ref() {
+                player.set_rate(playback_rate);
+            }
         }
         Ok(())
     }
@@ -873,11 +904,11 @@ impl PlayerInner {
             !sync_group_released()
         {
             self.sync_hold.set(true);
-            self.player.pause();
+            self.set_pipeline_paused();
             self.request_sync_group_arm();
             return Ok(());
         }
-        self.player.play();
+        self.set_pipeline_playing();
         Ok(())
     }
 
@@ -893,7 +924,12 @@ impl PlayerInner {
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
-        self.player.stop();
+        match self.player.as_ref() {
+            Some(player) => player.stop(),
+            None => {
+                let _ = self.pipeline.set_state(gstreamer::State::Null);
+            },
+        }
         self.paused.set(true);
         self.can_resume.set(false);
         self.last_metadata = None;
@@ -910,8 +946,27 @@ impl PlayerInner {
         self.can_resume.set(true);
         // A real pause request cancels a pending synchronized start hold.
         self.sync_hold.set(false);
-        self.player.pause();
+        self.set_pipeline_paused();
         Ok(())
+    }
+
+    /// Start playback, whoever owns the pipeline.
+    fn set_pipeline_playing(&self) {
+        match self.player.as_ref() {
+            Some(player) => player.play(),
+            None => {
+                let _ = self.pipeline.set_state(gstreamer::State::Playing);
+            },
+        }
+    }
+
+    fn set_pipeline_paused(&self) {
+        match self.player.as_ref() {
+            Some(player) => player.pause(),
+            None => {
+                let _ = self.pipeline.set_state(gstreamer::State::Paused);
+            },
+        }
     }
 
     pub fn paused(&self) -> bool {
@@ -946,7 +1001,7 @@ impl PlayerInner {
             && let Some(ref duration) = metadata.duration
             && duration < &time::Duration::new(time as u64, 0)
         {
-            gstreamer::warning!(self.cat, obj = &self.player, "Trying to seek out of range");
+            gstreamer::warning!(self.cat, obj = &self.pipeline, "Trying to seek out of range");
             return Err(PlayerError::SeekOutOfRange);
         }
 
@@ -954,8 +1009,17 @@ impl PlayerInner {
         // A regular (flushing, non-SEGMENT) seek takes the pipeline out of segment-loop
         // mode; `connect_seek_done` re-enters it once the seek settles.
         self.segment_loop_active.set(false);
-        self.player
-            .seek(gstreamer::ClockTime::from_nseconds(time as u64));
+        let position = gstreamer::ClockTime::from_nseconds(time as u64);
+        match self.player.as_ref() {
+            Some(player) => player.seek(position),
+            // Same flushing seek `Play::seek` performs, issued straight on the pipeline.
+            None => {
+                let _ = self.pipeline.seek_simple(
+                    gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                    position,
+                );
+            },
+        }
         Ok(())
     }
 
@@ -988,7 +1052,9 @@ impl PlayerInner {
         }
 
         self.volume.set(volume);
-        self.player.set_volume(volume);
+        if let Some(player) = self.player.as_ref() {
+            player.set_volume(volume);
+        }
         Ok(())
     }
 
@@ -1032,7 +1098,7 @@ impl PlayerInner {
             return buffered_ranges;
         };
 
-        let pipeline = self.player.pipeline();
+        let pipeline = self.pipeline.clone();
         let mut buffering = gstreamer::query::Buffering::new(gstreamer::Format::Percent);
         if pipeline.query(&mut buffering) {
             let ranges = buffering.ranges();
@@ -1085,10 +1151,10 @@ impl PlayerInner {
         };
 
         let playbin = self
-            .player
-            .pipeline()
+            .pipeline
+            .clone()
             .dynamic_cast::<gstreamer::Pipeline>()
-            .unwrap();
+            .map_err(|_| PlayerError::SetStreamFailed)?;
         let clock = gstreamer::SystemClock::obtain();
         playbin.set_base_time(*BACKEND_BASE_TIME);
         playbin.set_start_time(gstreamer::ClockTime::NONE);
@@ -1099,18 +1165,25 @@ impl PlayerInner {
     }
 
     fn set_audio_track(&mut self, stream_index: i32, enabled: bool) -> Result<(), PlayerError> {
-        self.player
+        // Track selection is a `Play` feature; the direct pipeline has no equivalent yet.
+        let Some(player) = self.player.as_ref() else {
+            return Err(PlayerError::SetTrackFailed);
+        };
+        player
             .set_audio_track(stream_index)
             .map_err(|_| PlayerError::SetTrackFailed)?;
-        self.player.set_audio_track_enabled(enabled);
+        player.set_audio_track_enabled(enabled);
         Ok(())
     }
 
     fn set_video_track(&mut self, stream_index: i32, enabled: bool) -> Result<(), PlayerError> {
-        self.player
+        let Some(player) = self.player.as_ref() else {
+            return Err(PlayerError::SetTrackFailed);
+        };
+        player
             .set_video_track(stream_index)
             .map_err(|_| PlayerError::SetTrackFailed)?;
-        self.player.set_video_track_enabled(enabled);
+        player.set_video_track_enabled(enabled);
         Ok(())
     }
 }
@@ -1417,8 +1490,9 @@ impl GStreamerPlayer {
         }
 
         *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
-            player,
-            _signal_adapter: signal_adapter.clone(),
+            player: Some(player),
+            _signal_adapter: Some(signal_adapter.clone()),
+            pipeline: pipeline.clone(),
             source: None,
             video_sink,
             input_size: 0,
@@ -1509,7 +1583,7 @@ impl GStreamerPlayer {
         // bus callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
         // pipeline, so signal handlers only post messages here.
         if pref!(media_gapless_loop_enabled) || sync_group_target().is_some() {
-            let pipeline = inner.lock().unwrap().player.pipeline();
+            let pipeline = inner.lock().unwrap().pipeline.clone();
             if let Some(bus) = pipeline.bus() {
                 let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
                 inner.lock().unwrap().gapless_loop_sender = Some(loop_sender.clone());
@@ -1605,6 +1679,8 @@ impl GStreamerPlayer {
                                             inner.segment_loop_active.set(true);
                                         }
                                         inner.player.clone()
+                                        // `None` for the direct pipeline; the group
+                                        // then releases it by state change instead.
                                     };
                                     if pref!(media_gapless_loop_enabled) {
                                         if let Err(error) = pipeline.seek(
@@ -1709,7 +1785,9 @@ impl GStreamerPlayer {
                     // The `paused` state change event will be fired after the
                     // seek initiated by the playback rate change has
                     // completed.
-                    inner.player.set_rate(inner.playback_rate.get());
+                    if let Some(player) = inner.player.as_ref() {
+                        player.set_rate(inner.playback_rate.get());
+                    }
                 } else if inner.play_state == gstreamer_play::PlayState::Paused {
                     send_pause_event = true;
                 }
@@ -1720,10 +1798,12 @@ impl GStreamerPlayer {
             let audio_track_enabled = !inner.muted.get() && !audio_disabled;
             // Apply the initial mute state via audio-track selection only — no runtime
             // audio-sink swap (see set_mute: a live sink swap is irreversible on playbin3).
-            inner.player.set_audio_track_enabled(audio_track_enabled);
+            if let Some(player) = inner.player.as_ref() {
+                player.set_audio_track_enabled(audio_track_enabled);
+            }
             gstreamer::info!(
                 inner.cat,
-                obj = &inner.player,
+                obj = &inner.pipeline,
                 "Metadata updated: {:?}",
                 metadata
             );
@@ -1756,7 +1836,7 @@ impl GStreamerPlayer {
                 metadata.duration = duration;
                 gstreamer::info!(
                     inner.cat,
-                    obj = &inner.player,
+                    obj = &inner.pipeline,
                     "Duration changed: {:?}",
                     duration
                 );
@@ -1841,7 +1921,7 @@ impl GStreamerPlayer {
         let (receiver, error_handler_id) = {
             let inner_clone = inner.clone();
             let inner = inner.lock().unwrap();
-            let pipeline = inner.player.pipeline();
+            let pipeline = inner.pipeline.clone();
 
             let (sender, receiver) = mpsc::channel();
 
@@ -1967,7 +2047,7 @@ impl GStreamerPlayer {
                     signal_adapter.play().stop();
                 });
 
-            inner.player.pause();
+            inner.set_pipeline_paused();
 
             (receiver, error_handler_id)
         };
@@ -1983,10 +2063,9 @@ impl GStreamerPlayer {
         // so every later error permanently stopped playback instead of letting the element
         // recover — turning any transient error (an RTSP stream is full of them) into a
         // dead video.
-        glib::signal::signal_handler_disconnect(
-            &inner.lock().unwrap()._signal_adapter,
-            error_handler_id,
-        );
+        if let Some(adapter) = inner.lock().unwrap()._signal_adapter.as_ref() {
+            glib::signal::signal_handler_disconnect(adapter, error_handler_id);
+        }
         result
     }
 }
