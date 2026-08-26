@@ -1380,6 +1380,85 @@ impl GStreamerPlayer {
         }
     }
 
+    /// 비디오 appsink 콜백을 건다. playbin3 경로와 직접 파이프라인 경로가 **같은**
+    /// 콜백을 써야 한다 - 한쪽만 바뀌면 두 모드가 다른 것을 재게 된다.
+    fn install_video_sink_callbacks(&self, video_sink: &gstreamer_app::AppSink) {
+        let Some(video_renderer) = self.video_renderer.clone() else {
+            return;
+        };
+        let sample_diagnostics = Arc::new(Mutex::new(VideoSampleDiagnostics::default()));
+        // `media_video_sink_pacing=thread` 에서만 쓴다. 모드는 한 번만 읽는다 —
+        // 프레임마다 pref 를 읽으면 이 경로가 줄이려는 비용에 자기 자신이 섞인다.
+        let sink_pacing = crate::render::VideoSinkPacing::from_pref();
+        let sink_pacer = Arc::new(Mutex::new(SinkPacer::default()));
+        // Creates a closure that renders a frame using the video_renderer
+        // Used in the preroll and sample callbacks
+        let render_sample = {
+            let render = self.render.clone();
+            let observer = self.observer.clone();
+            let sample_diagnostics = sample_diagnostics.clone();
+            let sink_pacer = sink_pacer.clone();
+            let weak_video_renderer = Arc::downgrade(&video_renderer);
+
+            move |sample: gstreamer::Sample| {
+                // This closure runs on the video sink's streaming thread --
+                // a GLib thread with no OS name of its own. Latched inside.
+                crate::thread_name::tag_video_streaming_thread();
+                // 싱크가 클럭을 기다리지 않으므로 재생 속도를 여기서 지킨다.
+                // 잠은 락 밖에서 잔다.
+                if sink_pacing == crate::render::VideoSinkPacing::Thread {
+                    let sleep = sink_pacer
+                        .lock()
+                        .unwrap()
+                        .sleep_before(sample.buffer().and_then(|buffer| buffer.pts()));
+                    if let Some(sleep) = sleep {
+                        std::thread::sleep(sleep);
+                    }
+                }
+                sample_diagnostics.lock().unwrap().note_sample(&sample);
+
+                let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
+                    return Err(gstreamer::FlowError::Error);
+                };
+
+                match weak_video_renderer.upgrade() {
+                    Some(video_renderer) => {
+                        video_renderer.lock().unwrap().render(frame);
+                    },
+                    _ => {
+                        return Err(gstreamer::FlowError::Flushing);
+                    },
+                };
+
+                let _ = notify!(observer, PlayerEvent::VideoFrameUpdated);
+                Ok(gstreamer::FlowSuccess::Ok)
+            }
+        };
+
+        // Set video_sink callbacks.
+        video_sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_preroll({
+                    let render_sample = render_sample.clone();
+                    move |video_sink| {
+                        render_sample(
+                            video_sink
+                                .pull_preroll()
+                                .map_err(|_| gstreamer::FlowError::Eos)?,
+                        )
+                    }
+                })
+                .new_sample(move |video_sink| {
+                    render_sample(
+                        video_sink
+                            .pull_sample()
+                            .map_err(|_| gstreamer::FlowError::Eos)?,
+                    )
+                })
+                .build(),
+        );
+    }
+
     fn setup(&self) -> Result<(), PlayerError> {
         if self.inner.borrow().is_some() {
             return Ok(());
@@ -1905,79 +1984,7 @@ impl GStreamerPlayer {
             }
         });
 
-        if let Some(video_renderer) = self.video_renderer.clone() {
-            let sample_diagnostics = Arc::new(Mutex::new(VideoSampleDiagnostics::default()));
-            // `media_video_sink_pacing=thread` 에서만 쓴다. 모드는 한 번만 읽는다 —
-            // 프레임마다 pref 를 읽으면 이 경로가 줄이려는 비용에 자기 자신이 섞인다.
-            let sink_pacing = crate::render::VideoSinkPacing::from_pref();
-            let sink_pacer = Arc::new(Mutex::new(SinkPacer::default()));
-            // Creates a closure that renders a frame using the video_renderer
-            // Used in the preroll and sample callbacks
-            let render_sample = {
-                let render = self.render.clone();
-                let observer = self.observer.clone();
-                let sample_diagnostics = sample_diagnostics.clone();
-                let sink_pacer = sink_pacer.clone();
-                let weak_video_renderer = Arc::downgrade(&video_renderer);
-
-                move |sample: gstreamer::Sample| {
-                    // This closure runs on the video sink's streaming thread --
-                    // a GLib thread with no OS name of its own. Latched inside.
-                    crate::thread_name::tag_video_streaming_thread();
-                    // 싱크가 클럭을 기다리지 않으므로 재생 속도를 여기서 지킨다.
-                    // 잠은 락 밖에서 잔다.
-                    if sink_pacing == crate::render::VideoSinkPacing::Thread {
-                        let sleep = sink_pacer
-                            .lock()
-                            .unwrap()
-                            .sleep_before(sample.buffer().and_then(|buffer| buffer.pts()));
-                        if let Some(sleep) = sleep {
-                            std::thread::sleep(sleep);
-                        }
-                    }
-                    sample_diagnostics.lock().unwrap().note_sample(&sample);
-
-                    let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
-                        return Err(gstreamer::FlowError::Error);
-                    };
-
-                    match weak_video_renderer.upgrade() {
-                        Some(video_renderer) => {
-                            video_renderer.lock().unwrap().render(frame);
-                        },
-                        _ => {
-                            return Err(gstreamer::FlowError::Flushing);
-                        },
-                    };
-
-                    let _ = notify!(observer, PlayerEvent::VideoFrameUpdated);
-                    Ok(gstreamer::FlowSuccess::Ok)
-                }
-            };
-
-            // Set video_sink callbacks.
-            inner.lock().unwrap().video_sink.set_callbacks(
-                gstreamer_app::AppSinkCallbacks::builder()
-                    .new_preroll({
-                        let render_sample = render_sample.clone();
-                        move |video_sink| {
-                            render_sample(
-                                video_sink
-                                    .pull_preroll()
-                                    .map_err(|_| gstreamer::FlowError::Eos)?,
-                            )
-                        }
-                    })
-                    .new_sample(move |video_sink| {
-                        render_sample(
-                            video_sink
-                                .pull_sample()
-                                .map_err(|_| gstreamer::FlowError::Eos)?,
-                        )
-                    })
-                    .build(),
-            );
-        };
+        self.install_video_sink_callbacks(&inner.lock().unwrap().video_sink.clone());
 
         let (receiver, error_handler_id) = {
             let inner_clone = inner.clone();
