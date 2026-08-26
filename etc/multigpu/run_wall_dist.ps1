@@ -265,8 +265,12 @@ cd /d "$here"
 "$exe" $argStr 2> "$LogPath"
 "@ | Set-Content -Encoding ascii $cmdFile
     Write-Host "  launching on NUMA node $NumaNode (via cmd start /NODE)"
-    Start-Process cmd -ArgumentList "/c", "start", "/NODE", "$NumaNode", "/B", '""', "`"$cmdFile`"" `
-        -WindowStyle Hidden | Out-Null
+    # ***Hand `start` an explicit `cmd /c`, never the .cmd file itself.*** Pointed straight at a
+    # .cmd, `start` opens it with `cmd /K`, which stays alive after the wall exits -- a zombie
+    # whose working directory is the dist folder, so the next make_wall_dist fails with "the
+    # process cannot access the file". `/c` exits with the script.
+    Start-Process cmd -ArgumentList "/c", "start", '""', "/NODE", "$NumaNode", "/B", `
+        "cmd.exe", "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
     # start /B returns immediately, so the PID has to be found by name. Only one wall runs
     # at a time here, so the name is unambiguous.
     $proc = $null
@@ -343,6 +347,10 @@ if ($DurationSec -gt 0) {
     }
     Write-Host "Running. To stop: Ctrl+C then  Stop-Process -Name winit_wall -Force"
     Wait-Process -Id $proc.Id
+}
+
+if ($NumaNode -ge 0 -and $cmdFile -and (Test-Path $cmdFile)) {
+    Remove-Item $cmdFile -Force -ErrorAction SilentlyContinue
 }
 
 if (!(Test-Path $LogPath)) { exit 0 }

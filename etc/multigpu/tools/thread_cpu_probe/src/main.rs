@@ -113,6 +113,41 @@ fn find_processes(needle: &str) -> Vec<(u32, String)> {
     found
 }
 
+/// Every process's CPU ticks, keyed by pid, with its image name.
+///
+/// This is the only measurement here that actually spans all processor groups, because
+/// GetProcessTimes is per-process and processes are summed by hand. It answers the question
+/// the group-limited GetSystemTimes cannot: ***when the wall collapses but its own CPU does
+/// not rise, who else is running -- or starving?*** The prime suspect is dwm.exe: DirectComposition
+/// composites in DWM, not in this process, so a Present that blocks for 3ms while our own
+/// threads use no CPU points outside our process boundary, exactly where the old whole-machine
+/// line was blind.
+///
+/// Processes that refuse PROCESS_QUERY_LIMITED_INFORMATION (protected/system) are skipped, so
+/// the sum is a floor, not a total.
+fn all_process_cpu() -> HashMap<u32, (u64, String)> {
+    let mut out = HashMap::new();
+    // SAFETY: the snapshot handle is checked before use and closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: `entry` is zeroed with dwSize set, as the API requires.
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        if let Some(cpu) = process_cpu(entry.th32ProcessID) {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            out.insert(entry.th32ProcessID, (cpu, name));
+        }
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    out
+}
+
 fn thread_ids(pid: u32) -> Vec<u32> {
     let mut ids = Vec::new();
     // A thread snapshot cannot be scoped to one process (the pid argument is
@@ -219,14 +254,18 @@ fn thread_name(handle: HANDLE) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Busy CPU ticks for the WHOLE machine, so the report can say whether the process
-/// accounts for what the box is actually doing.
+/// Busy CPU ticks as GetSystemTimes reports them.
 ///
-/// This exists because a 45-video wall run showed 68% for the process while the machine
-/// was observed at 100%. A per-process tool cannot tell whether the missing quarter is
-/// another process, the GPU driver, or kernel work outside this process -- and that gap
-/// changes what the whole measurement means. GetSystemTimes counts idle inside kernel
-/// time, so busy = kernel + user - idle.
+/// ***ONLY THE CALLING THREAD'S PROCESSOR GROUP.*** On a box with more than 64 logical
+/// processors Windows splits it into groups, and this API answers for one of them. That is
+/// why this tool kept printing a machine total SMALLER than the process it was measuring
+/// (46.40 cores in the process, 38.29 "whole machine") -- an impossibility that made the
+/// whole line worse than useless: it was read as "the box is only half busy" when it was
+/// really "half the box was never looked at". Same failure family as the earlier
+/// available_parallelism() bug that printed 131.7%.
+///
+/// Kept only so the per-group figure can be shown next to the honest all-group one below.
+/// GetSystemTimes counts idle inside kernel time, so busy = kernel + user - idle.
 fn machine_cpu() -> Option<u64> {
     let mut idle: FILETIME = unsafe { std::mem::zeroed() };
     let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
@@ -359,6 +398,7 @@ fn main() {
     let before = sample_threads(pid, false);
     let process_before = process_cpu(pid);
     let machine_before = machine_cpu();
+    let procs_before = all_process_cpu();
     if before.is_empty() {
         eprintln!("no threads readable for pid {pid} (is it running? try an elevated shell)");
         std::process::exit(1);
@@ -367,6 +407,7 @@ fn main() {
     let after = sample_threads(pid, true);
     let process_after = process_cpu(pid);
     let machine_after = machine_cpu();
+    let procs_after = all_process_cpu();
     let elapsed = start.elapsed().as_secs_f64();
 
     if after.is_empty() {
@@ -459,10 +500,9 @@ fn main() {
             let machine_cores =
                 after_all.saturating_sub(before_all) as f64 / TICKS_PER_SEC / elapsed;
             println!(
-                "  {:6.2}  {:4.1}%               WHOLE MACHINE (this process is {:.0}% of it)",
+                "  {:6.2}  {:4.1}%               one group only (GetSystemTimes; NOT the machine)",
                 machine_cores,
                 100.0 * machine_cores / cpus as f64,
-                100.0 * process_cores / machine_cores.max(0.01)
             );
         }
         // The two should agree closely. A gap means threads came and went inside
@@ -473,6 +513,49 @@ fn main() {
                 "  note: {gap:+.2} cores unattributed -- {exited} thread(s) exited and \
                  {started_during} started during the window"
             );
+        }
+    }
+
+    // ***The honest machine total.*** Summed per process, so it spans every processor group --
+    // unlike the GetSystemTimes line above, which only ever saw one. Printed with the hottest
+    // processes because the question a collapsed wall raises is not "how busy is the box" but
+    // "who else is on it": DirectComposition composites in dwm.exe, so a wall whose Present
+    // blocks while its own threads idle is waiting on a process this list can show.
+    {
+        // `process_cores` lives inside the block above; recompute here, falling back to the
+        // per-thread sum when the process handle was refused.
+        let proc_cores = match (process_before, process_after) {
+            (Some(before_cpu), Some(after_cpu)) => {
+                after_cpu.saturating_sub(before_cpu) as f64 / TICKS_PER_SEC / elapsed
+            },
+            _ => total,
+        };
+        let mut rows: Vec<(f64, String, u32)> = Vec::new();
+        let mut machine_total = 0.0_f64;
+        for (pid, (cpu_after, name)) in &procs_after {
+            let delta = match procs_before.get(pid) {
+                Some((cpu_before, _)) => cpu_after.saturating_sub(*cpu_before),
+                // Started inside the window: its whole lifetime is inside it.
+                None => *cpu_after,
+            };
+            let cores = delta as f64 / TICKS_PER_SEC / elapsed;
+            machine_total += cores;
+            if cores >= 0.01 {
+                rows.push((cores, name.clone(), *pid));
+            }
+        }
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!();
+        println!(
+            "  ALL PROCESSES, ALL GROUPS: {:.2} cores busy of {} ({:.1}%)  -- this process is {:.0}% of it",
+            machine_total,
+            cpus,
+            100.0 * machine_total / cpus as f64,
+            100.0 * proc_cores / machine_total.max(0.01)
+        );
+        println!("  (a floor: protected processes that refuse a handle are skipped)");
+        for (cores, name, pid) in rows.iter().take(10) {
+            println!("    {cores:6.2} cores  {name}  (pid {pid})");
         }
     }
 
