@@ -259,10 +259,19 @@ if ($NumaNode -ge 0) {
     # .cmd is a command separator, so an unquoted URL silently truncates the run.
     $argStr = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $NumaNode)
+    # ***`start /NODE` has to be the thing that launches winit_wall itself.*** The first cut of
+    # this put /NODE on the wrapper cmd.exe and let THAT spawn the exe -- a child inherits no
+    # node preference, so the flag did nothing and the run landed wherever Windows felt like.
+    # Measured 2026-08-26: three runs asked for node 0 and one of them came up in group 1;
+    # three asked for node 1 and one came up in group 0. The requested node and the group the
+    # threads actually ran in were uncorrelated, so that round tested nothing.
+    #
+    # /B keeps it in this console so the `2>` redirect below still reaches winit_wall's stderr;
+    # /WAIT keeps the wrapper alive until the wall exits, so nothing is orphaned.
     @"
 @echo off
 cd /d "$here"
-"$exe" $argStr 2> "$LogPath"
+start "" /NODE $NumaNode /B /WAIT "$exe" $argStr 2> "$LogPath"
 "@ | Set-Content -Encoding ascii $cmdFile
     Write-Host "  launching on NUMA node $NumaNode (via cmd start /NODE)"
     # ***Hand `start` an explicit `cmd /c`, never the .cmd file itself.*** Pointed straight at a
