@@ -148,6 +148,27 @@ param(
     # threads, so if one of the FEW single-threaded stages (Compositor, Renderer,
     # Script) is pinned at ~1.0 cores, that thread is the ceiling and the GPU is
     # starved behind it. Needs -DurationSec (there is nothing to sample otherwise).
+    # Pin the process to a NUMA node (= processor group) at creation, instead of letting
+    # Windows pick. -1 = let Windows pick (the old behaviour).
+    #
+    # ***THIS IS THE ONLY THING THAT HAS EVER SEPARATED A GOOD RUN FROM A BAD ONE.*** Measured
+    # 2026-08-26 over 22 runs of 45 videos with escape=external, across four different flag
+    # sets (-VideoEscapeProf on/off, -NoSyncGroup, -SinkQos on):
+    #
+    #   group 1 (18 runs): 27.7-28.8 presents/s, 0.64-0.65 ms per Present, decode 0.68-0.83
+    #   group 0 ( 4 runs): 4.2-5.4  presents/s, 2.7-3.3  ms per Present, decode 0.97-0.98
+    #
+    # No exceptions either way, and NOTHING ELSE correlates -- the sync group armed 45/45 in
+    # both, and neither removing the shared base time nor allowing frame drops prevented a
+    # collapse. Windows picks the group at process creation, so the same command lands in
+    # either state at random. Use this to stop rolling dice, and to prove the direction of
+    # causation: if -NumaNode 0 collapses every time and -NumaNode 1 never does, it is the
+    # placement, not the run.
+    #
+    # Launching has to go through `cmd /c start /NODE`, which is the only way to ask for a
+    # node at creation. That in turn needs a temp .cmd wrapper so the stderr redirect belongs
+    # to winit_wall and not to cmd, and the PID has to be found by name afterwards.
+    [int]    $NumaNode = -1,
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
     # pipeline setup and first-frame staging, which are not the steady state.
@@ -233,8 +254,31 @@ Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.I
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
 
-$proc = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here `
-    -RedirectStandardError $LogPath -PassThru
+if ($NumaNode -ge 0) {
+    # Quote EVERY argument: the page URL carries `?rows=5&cols=9`, and a bare `&` inside a
+    # .cmd is a command separator, so an unquoted URL silently truncates the run.
+    $argStr = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $NumaNode)
+    @"
+@echo off
+cd /d "$here"
+"$exe" $argStr 2> "$LogPath"
+"@ | Set-Content -Encoding ascii $cmdFile
+    Write-Host "  launching on NUMA node $NumaNode (via cmd start /NODE)"
+    Start-Process cmd -ArgumentList "/c", "start", "/NODE", "$NumaNode", "/B", '""', "`"$cmdFile`"" `
+        -WindowStyle Hidden | Out-Null
+    # start /B returns immediately, so the PID has to be found by name. Only one wall runs
+    # at a time here, so the name is unambiguous.
+    $proc = $null
+    for ($i = 0; $i -lt 100 -and $null -eq $proc; $i++) {
+        Start-Sleep -Milliseconds 100
+        $proc = Get-Process winit_wall -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($null -eq $proc) { throw "winit_wall did not start within 10s under 'start /NODE $NumaNode'" }
+} else {
+    $proc = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here `
+        -RedirectStandardError $LogPath -PassThru
+}
 
 # ***WHICH PROCESSOR GROUP THIS PROCESS LANDED IN DECIDES THE RESULT.*** Measured 2026-08-26,
 # 45 videos with escape=external, same command and same binary, nine runs:
