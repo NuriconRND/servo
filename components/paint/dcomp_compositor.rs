@@ -179,7 +179,22 @@ struct EscProf {
     acquire_dur: std::time::Duration,
     convert_dur: std::time::Duration,
     present_dur: std::time::Duration,
+    /// ★Present 1 회 시간의 분포★ — 합계만으로는 "모든 호출이 균일하게 비싸다"와 "대부분
+    /// 공짜인데 몇 개가 크게 막힌다"를 구분할 수 없다. 그 둘은 원인이 완전히 다르다:
+    /// 균일하면 호출당 고정 비용(드라이버/DWM 제출)이고, 이봉이면 주기적인 무언가에
+    /// 막히는 것이라 그 주기가 16.7ms 인지 보면 vsync 인지 바로 갈린다.
+    ///
+    /// 45 영상 실측에서 present 가 초당 828ms(렌더러 스레드의 83%)를 먹는데 CPU 는 0.3 코어도
+    /// 쓰지 않아(= 자고 있다) 이 구분이 다음 표적을 정한다. 백버퍼 수를 2/3/4 로 바꿔도
+    /// 1 회당 0.655/0.647/0.648ms 로 평평했으므로 "백버퍼 반납 대기"는 이미 반증됐다.
+    ///
+    /// 창(1 초)당 최대 4096 개까지만 담는다 — 45 영상 x 30fps = 1284 개라 충분하고, 넘치면
+    /// 그 창의 나머지는 분포 계산에서 빠진다(합계 `present_dur` 는 영향 없음).
+    present_samples: Vec<u32>,
 }
+
+/// `present_samples` 상한. 초과분은 버린다(합계는 present_dur 가 따로 들고 있다).
+const PRESENT_SAMPLE_CAP: usize = 4096;
 
 impl EscProf {
     fn new() -> Self {
@@ -194,6 +209,15 @@ impl EscProf {
             acquire_dur: std::time::Duration::ZERO,
             convert_dur: std::time::Duration::ZERO,
             present_dur: std::time::Duration::ZERO,
+            present_samples: Vec::new(),
+        }
+    }
+
+    /// Present 1 회 시간을 마이크로초로 담는다(상한까지).
+    fn record_present(&mut self, dur: std::time::Duration) {
+        if self.present_samples.len() < PRESENT_SAMPLE_CAP {
+            self.present_samples
+                .push(dur.as_micros().min(u32::MAX as u128) as u32);
         }
     }
 
@@ -204,9 +228,20 @@ impl EscProf {
             return;
         }
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        // Present 1 회 시간 분포. 정렬은 창당 한 번(<=4096 개)이라 무시할 만하고, 게이트가
+        // 꺼져 있으면 샘플이 비어 있어 아무 일도 하지 않는다.
+        self.present_samples.sort_unstable();
+        let pct = |q: f64| -> f64 {
+            if self.present_samples.is_empty() {
+                return 0.0;
+            }
+            let idx = ((self.present_samples.len() - 1) as f64 * q).round() as usize;
+            self.present_samples[idx] as f64 / 1000.0
+        };
         log::info!(
             "[vesc-prof] frames={} converts={} presents={} srv_creates={} acquires={} \
-             acquire_ms={:.1} convert_ms={:.1} present_ms={:.1} batch_swaps={}",
+             acquire_ms={:.1} convert_ms={:.1} present_ms={:.1} batch_swaps={} \
+             present_each_ms=[min={:.3} p50={:.3} p90={:.3} p99={:.3} max={:.3}] n={}",
             self.frames,
             self.converts,
             self.presents,
@@ -216,6 +251,12 @@ impl EscProf {
             ms(self.convert_dur),
             ms(self.present_dur),
             self.batch_swaps,
+            pct(0.0),
+            pct(0.5),
+            pct(0.9),
+            pct(0.99),
+            pct(1.0),
+            self.present_samples.len(),
         );
         *self = EscProf::new();
     }
@@ -1754,6 +1795,8 @@ impl DCompNativeCompositor {
         let mut d_srv = 0u64;
         let mut d_presents = 0u64;
         let mut d_present_dur = std::time::Duration::ZERO;
+        // ext borrow 안에서는 self.esc_prof 를 만질 수 없다 — 다른 카운터와 같은 사정.
+        let mut d_present_each: Vec<std::time::Duration> = Vec::new();
         let mut d_batch_swaps = 0u64;
         unsafe {
             let mut back: *mut ID3D11Texture2D = ptr::null_mut();
@@ -1817,8 +1860,10 @@ impl DCompNativeCompositor {
                 let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
                 let hr = (*swapchain.as_ptr()).Present(0, 0);
                 if let Some(s) = p_start {
-                    d_present_dur += s.elapsed();
+                    let dur = s.elapsed();
+                    d_present_dur += dur;
                     d_presents += 1;
+                    d_present_each.push(dur);
                 }
                 if hr < 0 {
                     if !ext.warned_fail {
@@ -1856,6 +1901,9 @@ impl DCompNativeCompositor {
             self.esc_prof.srv_creates += d_srv;
             self.esc_prof.presents += d_presents;
             self.esc_prof.present_dur += d_present_dur;
+            for dur in d_present_each {
+                self.esc_prof.record_present(dur);
+            }
             self.esc_prof.batch_swaps += d_batch_swaps;
         }
     }
