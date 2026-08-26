@@ -31,6 +31,14 @@ const VIDEO_SINK_PROCESSING_DEADLINE_NS: u64 = 0;
 pub enum VideoSinkPacing {
     Clock,
     Thread,
+    /// 진단 전용: 싱크의 클럭 대기를 끄고 **아무 페이싱도 하지 않는다**.
+    ///
+    /// 재생 속도는 무의미해지지만(디코더가 전속력으로 돈다) ★프레임당 CPU 는 유효하다★.
+    /// `Clock` 과 비교하면 **공유 GstSystemClock 대기만의 비용**이, `Thread` 와 비교하면
+    /// **재우는 방식 자체의 비용**이 나온다. 둘이 섞여 있어 `Thread` 가 왜 손해인지 가릴
+    /// 수 없었기 때문에 필요하다 — 실측에서 `Thread` 는 CPU 가 줄지 않고 처리량이 절반이
+    /// 되어 프레임당 비용이 두 배가 됐다(34ms -> 65ms).
+    None,
 }
 
 impl VideoSinkPacing {
@@ -38,10 +46,12 @@ impl VideoSinkPacing {
         let value = pref!(media_video_sink_pacing);
         if value.eq_ignore_ascii_case("thread") {
             Self::Thread
+        } else if value.eq_ignore_ascii_case("none") {
+            Self::None
         } else {
             if !value.is_empty() && !value.eq_ignore_ascii_case("clock") {
                 log::warn!(
-                    "Ignoring invalid media_video_sink_pacing={value:?}; expected clock or thread"
+                    "Ignoring invalid media_video_sink_pacing={value:?};                      expected clock, thread or none"
                 );
             }
             Self::Clock
@@ -52,6 +62,7 @@ impl VideoSinkPacing {
         match self {
             Self::Clock => "clock",
             Self::Thread => "thread",
+            Self::None => "none",
         }
     }
 }
@@ -419,7 +430,8 @@ impl GStreamerRender {
         // 스레드가 PTS 앵커에 맞춰 직접 자므로(player.rs 의 SinkPacer) 재생 속도는
         // 그대로이고, 프로세스당 싱글턴인 GstSystemClock 에서의 경합만 사라진다.
         let pacing = VideoSinkPacing::from_pref();
-        if pacing == VideoSinkPacing::Thread {
+        // Clock 이 아닌 모드는 싱크가 클럭을 기다리지 않는다.
+        if pacing != VideoSinkPacing::Clock {
             appsink.set_property("sync", false);
         }
         let sink_sync = appsink.property::<bool>("sync");

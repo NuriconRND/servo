@@ -428,11 +428,21 @@ fn build_uridecodebin3_pipeline(
     // 아예 받지 않도록 하는 것이 다음 단계다.
     let sink_for_pad = sink.clone();
     decodebin.connect_pad_added(move |_, pad| {
-        let is_video = pad
-            .current_caps()
-            .and_then(|caps| caps.structure(0).map(|s| s.name().starts_with("video/")))
-            .unwrap_or(false);
-        if !is_video {
+        // ★`current_caps()` 만 보면 안 된다★ — pad-added 시점에는 아직 협상 전이라
+        // `None` 일 수 있고, 그러면 비디오 패드를 조용히 건너뛰어 아무 것도 링크되지
+        // 않는다(실측: 프레임 0, 에러도 없음). 협상 전에도 답이 나오는 `query_caps` 로
+        // 보완한다.
+        let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+        let media = caps
+            .as_ref()
+            .and_then(|caps| caps.structure(0))
+            .map(|structure| structure.name().to_string())
+            .unwrap_or_default();
+        if !media.starts_with("video/") {
+            log::info!(
+                "uridecodebin3: skipping non-video pad {} ({media})",
+                pad.name()
+            );
             return;
         }
         let Some(target) = sink_for_pad.static_pad("sink") else {
@@ -442,8 +452,11 @@ fn build_uridecodebin3_pipeline(
             // 비디오 스트림이 둘 이상인 파일: 첫 번째만 쓴다.
             return;
         }
-        if let Err(error) = pad.link(&target) {
-            log::error!("uridecodebin3: linking video pad to appsink failed: {error:?}");
+        match pad.link(&target) {
+            Ok(_) => log::info!("uridecodebin3: linked video pad {} ({media})", pad.name()),
+            Err(error) => {
+                log::error!("uridecodebin3: linking video pad to appsink failed: {error:?}")
+            },
         }
     });
 
@@ -953,6 +966,12 @@ impl PlayerInner {
     }
 
     pub fn play(&mut self) -> Result<(), PlayerError> {
+        log::info!(
+            "uridecodebin3 diag: play() paused={} sender={} metadata={}",
+            self.paused.get(),
+            self.gapless_loop_sender.is_some(),
+            self.last_metadata.is_some()
+        );
         if !self.paused.get() {
             return Ok(());
         }
@@ -1261,6 +1280,66 @@ macro_rules! notify(
     };
 );
 
+/// preroll 이 끝난 뒤 caps 와 길이로 `Metadata` 를 만들어 한 번만 발행한다.
+///
+/// `Play` 경로의 `connect_media_info_updated` 와 같은 자리다. 거기서 하는 두 호출
+/// (`request_segment_loop_entry`, `request_sync_group_arm`)을 여기서도 반드시 해야 한다 -
+/// ★빠뜨리면 gapless 루프와 동기 시작이 에러도 로그도 없이 죽는다.★
+fn emit_direct_metadata(
+    inner: &Arc<Mutex<PlayerInner>>,
+    pipeline: &gstreamer::Element,
+    observer: &Arc<Mutex<IpcSender<PlayerEvent>>>,
+) {
+    let mut guard = inner.lock().unwrap();
+    if guard.last_metadata.is_some() {
+        return;
+    }
+    log::info!("uridecodebin3: emit_direct_metadata reached");
+    let Some(caps) = guard
+        .video_sink
+        .static_pad("sink")
+        .and_then(|pad| pad.current_caps())
+    else {
+        log::warn!("uridecodebin3: appsink sink pad has no caps yet");
+        return;
+    };
+    let Ok(info) = gstreamer_video::VideoInfo::from_caps(&caps) else {
+        return;
+    };
+    let duration = pipeline
+        .query_duration::<gstreamer::ClockTime>()
+        .map(|duration| {
+            time::Duration::new(
+                duration.seconds(),
+                duration.nseconds() as u32 % 1_000_000_000,
+            )
+        });
+    let metadata = Metadata {
+        duration,
+        width: info.width(),
+        height: info.height(),
+        format: info.format().to_str().to_string(),
+        is_seekable: duration.is_some(),
+        video_tracks: vec![String::from("video_0")],
+        audio_tracks: Vec::new(),
+        is_live: duration.is_none(),
+        title: None,
+    };
+    guard.last_metadata = Some(metadata.clone());
+    guard.request_segment_loop_entry();
+    guard.request_sync_group_arm();
+    drop(guard);
+    let _ = notify!(observer, PlayerEvent::MetadataUpdated(metadata));
+    // ★메타데이터 ‘뒤에’ 상태를 한 번 더 보내야 한다★ — 엘리먼트는
+    // `playback_state_changed` 에서 `ready_state == HaveMetadata` 일 때만
+    // HaveEnoughData 로 올린다. 파이프라인이 PAUSED 에 닿는 시점은 메타데이터보다
+    // 앞이라 그때 보낸 Paused 는 아직 HaveNothing 이어서 버려지고, 그 뒤로는 상태가
+    // 바뀌지 않으므로 엘리먼트가 영원히 HaveMetadata 에 머문다. 실측: 링크/preroll/
+    // 메타데이터까지 전부 정상인데 play() 가 한 번도 불리지 않았다.
+    // `Play` 경로도 같은 이유로 media-info 직후에 Paused 를 한 번 더 보낸다.
+    let _ = notify!(observer, PlayerEvent::StateChanged(PlaybackState::Paused));
+}
+
 struct SeekChannel {
     sender: SeekLock,
     recv: IpcReceiver<SeekLockMsg>,
@@ -1388,6 +1467,411 @@ impl GStreamerPlayer {
 
     /// 비디오 appsink 콜백을 건다. playbin3 경로와 직접 파이프라인 경로가 **같은**
     /// 콜백을 써야 한다 - 한쪽만 바뀌면 두 모드가 다른 것을 재게 된다.
+    /// gapless 루프와 sync group 배선. 두 경로가 공유한다.
+    ///
+    /// 둘 다 파이프라인 레벨에서 seek()/bus() 만 쓰므로 Play 유무와 무관하다. 다만
+    /// ***직접 파이프라인 경로에서 이 호출을 빠뜨리면 gapless 루프와 동기 시작이 조용히
+    /// 죽는다*** - 에러도 로그도 없이 그냥 동작하지 않는다.
+    /// `uridecodebin3 ! appsink` 로 파이프라인을 직접 만든다(playsink 없음).
+    ///
+    /// `Ok(false)` = 이 모드를 쓸 수 없으니 호출부가 playbin3 로 폴백하라는 뜻이다.
+    /// 두 가지 경우가 있다: 렌더러가 appsink 자체를 넘기지 않거나(unix 의 `glsinkbin`),
+    /// 로컬 파일 재생이 아니거나.
+    ///
+    /// ★없애려는 것★ — playbin3 는 playsink 를 포함하고, playsink 는 디코더와 appsink
+    /// 사이에 `vqueue` 를 끼운다. 그 큐가 원본 3.1MB 프레임을 프레임마다 스레드 경계
+    /// 너머로 나르고, 실측상 디코딩만큼의 CPU 를 쓴다.
+    fn setup_direct_pipeline(&self) -> Result<bool, PlayerError> {
+        let Some(uri) = self.resolve_direct_file_url() else {
+            log::warn!(
+                "media_pipeline_mode=uridecodebin3 needs direct local-file playback; \
+                 falling back to playbin3"
+            );
+            return Ok(false);
+        };
+        let Some(video_sink) = self.render.lock().unwrap().create_detached_video_sink()? else {
+            log::warn!(
+                "media_pipeline_mode=uridecodebin3 is not supported by this renderer \
+                 (it does not hand playbin the appsink itself); falling back to playbin3"
+            );
+            return Ok(false);
+        };
+
+        let (pipeline, decodebin) = build_uridecodebin3_pipeline(&uri, &video_sink)?;
+        // playbin3 경로와 같은 후킹: 요소 로깅, avdec 스레드 수, RTSP 튜닝.
+        decodebin.connect("deep-element-added", false, move |args| {
+            if let Ok(element) = args[2].get::<gstreamer::Element>() {
+                log_pipeline_element_added(&element);
+                configure_software_decoder_threads(&element);
+                configure_rtsp_elements(&element);
+            }
+            None
+        });
+
+        let pipeline = pipeline.upcast::<gstreamer::Element>();
+        *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
+            player: None,
+            _signal_adapter: None,
+            pipeline: pipeline.clone(),
+            source: None,
+            video_sink: video_sink.clone(),
+            input_size: 0,
+            seekable: true,
+            play_state: gstreamer_play::PlayState::Stopped,
+            paused: Cell::new(DEFAULT_PAUSED),
+            can_resume: Cell::new(DEFAULT_CAN_RESUME),
+            playback_rate: Cell::new(DEFAULT_PLAYBACK_RATE),
+            muted: Cell::new(DEFAULT_MUTED),
+            volume: Cell::new(DEFAULT_VOLUME),
+            stream_type: self.stream_type,
+            last_metadata: None,
+            cat: gstreamer::DebugCategory::get("servoplayer").unwrap(),
+            enough_data: Arc::new(AtomicBool::new(false)),
+            looping: Cell::new(false),
+            segment_loop_active: Cell::new(false),
+            gapless_loop_sender: None,
+            sync_hold: Cell::new(false),
+            sync_armed: Cell::new(false),
+            direct_file: Cell::new(true),
+        })));
+
+        let inner = self.inner.borrow().as_ref().unwrap().clone();
+        self.install_video_sink_callbacks(&video_sink);
+        self.install_gapless_and_sync(&inner);
+        self.install_direct_bus_watch(&inner, &pipeline);
+        self.install_direct_position_ticker(&pipeline);
+
+        // PAUSED 로 올려 preroll 시킨다. 메타데이터는 preroll 이 끝나야 알 수 있다
+        // (해상도는 caps 에서, 길이는 query_duration 에서).
+        pipeline
+            .set_state(gstreamer::State::Paused)
+            .map_err(|error| PlayerError::Backend(format!("pipeline PAUSED failed: {error:?}")))?;
+        Ok(true)
+    }
+
+    /// 재생 위치를 500ms 마다 보고한다. `Play` 의 position-update 와 같은 주기다.
+    ///
+    /// ★이게 없으면 화면이 검게 남는다★ — `currentTime` 은 `PositionChanged` 로만
+    /// 갱신되고, 월 페이지는 **모든** 타일의 `currentTime > 0` 을 확인한 뒤에야 준비
+    /// 커버를 걷는다. 프레임은 정상적으로 흐르고 appsink 계측(fps 30.0, pts_rate 1.00x)도
+    /// 정상인데 화면만 검은 상태가 되므로, 지표만 보면 재생 중으로 오판하기 쉽다.
+    fn install_direct_position_ticker(&self, pipeline: &gstreamer::Element) {
+        let observer = self.observer.clone();
+        let pipeline = pipeline.downgrade();
+        let _ = std::thread::Builder::new()
+            .name(String::from("ServoGstPosition"))
+            .spawn(move || {
+                let mut reported = false;
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    // 파이프라인이 사라지면 스레드도 끝낸다.
+                    let Some(pipeline) = pipeline.upgrade() else {
+                        return;
+                    };
+                    let Some(position) = pipeline.query_position::<gstreamer::ClockTime>() else {
+                        continue;
+                    };
+                    if !reported {
+                        reported = true;
+                        // 한 번만. 위치가 흐르기 시작했다는 것은 곧 currentTime 이 움직인다는
+                        // 뜻이고, 월 페이지는 그때서야 준비 커버를 걷는다.
+                        log::info!(
+                            "uridecodebin3: position updates started ({:.2}s)",
+                            position.seconds_f64()
+                        );
+                    }
+                    if notify!(
+                        observer,
+                        PlayerEvent::PositionChanged(position.seconds_f64())
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+    }
+
+    /// 버스에서 EOS/에러/상태변화를 받아 관찰자에게 전달한다.
+    ///
+    /// `Play` 경로에서는 `PlaySignalAdapter` 가 해 주던 일이다. 여기서 발행하지 않으면
+    /// ★엘리먼트가 `HaveNothing` 을 벗어나지 못해 프레임이 아예 그려지지 않는다★ —
+    /// `playback_video_frame_updated` 가 그 상태에서 조기 반환하기 때문이다.
+    fn install_direct_bus_watch(
+        &self,
+        inner: &Arc<Mutex<PlayerInner>>,
+        pipeline: &gstreamer::Element,
+    ) {
+        let Some(bus) = pipeline.bus() else {
+            log::error!("uridecodebin3: pipeline has no bus; playback will not report state");
+            return;
+        };
+        let observer = self.observer.clone();
+        let inner = inner.clone();
+        let pipeline_weak = pipeline.downgrade();
+        // ★`add_watch` 가 아니라 sync 메시지다★ — `add_watch` 는 스레드 기본
+        // MainContext 에 붙고 누군가 그것을 돌려야 콜백이 뜬다. Servo 에는 그 루프가 없어
+        // 콜백이 한 번도 불리지 않았고, 그러면 메타데이터가 발행되지 않아 엘리먼트가
+        // `HaveNothing` 에 머물고 프레임이 하나도 그려지지 않는다(실측: 링크는 됐는데
+        // VIDEORATE 0). 기존 gapless 코드가 같은 이유로 sync 메시지를 쓴다.
+        bus.enable_sync_message_emission();
+        bus.connect_sync_message(None, move |_, message| {
+            use gstreamer::MessageView;
+            log::info!(
+                "uridecodebin3 bus: {:?} from {:?}",
+                message.type_(),
+                message.src().map(|src| src.name())
+            );
+            match message.view() {
+                MessageView::Eos(..) => {
+                    let _ = notify!(observer, PlayerEvent::EndOfStream);
+                },
+                MessageView::Error(error) => {
+                    let _ = notify!(observer, PlayerEvent::Error(error.error().to_string()));
+                },
+                MessageView::StreamCollection(collection) => {
+                    // ★비디오 스트림만 고른다★ — 고르지 않으면 decodebin3 가 오디오까지
+                    // 디코드한다(실측: avdec_aac 가 영상당 하나씩 붙었다). playbin3 는
+                    // 오디오 싱크가 없으면 파싱까지만 하므로, 이걸 빠뜨리면 새 경로가
+                    // 옛 경로보다 오히려 비싸진다.
+                    let collection = collection.stream_collection();
+                    let video: Vec<String> = collection
+                        .iter()
+                        .filter(|stream| {
+                            stream.stream_type().contains(gstreamer::StreamType::VIDEO)
+                        })
+                        .filter_map(|stream| stream.stream_id().map(|id| id.to_string()))
+                        .collect();
+                    if video.is_empty() {
+                        return;
+                    }
+                    let refs: Vec<&str> = video.iter().map(|id| id.as_str()).collect();
+                    // ★파이프라인이 아니라 컬렉션을 posted 한 요소로 보낸다★ —
+                    // select-streams 는 업스트림 이벤트라 파이프라인에 보내면 싱크에서
+                    // 거슬러 올라가는데, 그 경로는 컬렉션 주인(decodebin3)에게 닿지 않는다.
+                    // 실측: 파이프라인으로 보냈더니 선택 로그가 찍힌 뒤에도 avdec_aac 가
+                    // 그대로 붙었다.
+                    let Some(owner) = message
+                        .src()
+                        .and_then(|src| src.clone().downcast::<gstreamer::Element>().ok())
+                    else {
+                        return;
+                    };
+                    log::info!(
+                        "uridecodebin3: selecting video streams {refs:?} on {}",
+                        owner.name()
+                    );
+                    let _ = owner
+                        .send_event(gstreamer::event::SelectStreams::new(refs.iter().copied()));
+                },
+                MessageView::AsyncDone(..) => {
+                    // preroll 완료. 이제 caps 와 길이를 물어볼 수 있다.
+                    if let Some(pipeline) = pipeline_weak.upgrade() {
+                        emit_direct_metadata(&inner, &pipeline, &observer);
+                    }
+                },
+                MessageView::StateChanged(state) => {
+                    if state.src().map(|src| src.is::<gstreamer::Pipeline>()) != Some(true) {
+                        return;
+                    }
+                    let playback_state = match state.current() {
+                        gstreamer::State::Playing => Some(PlaybackState::Playing),
+                        gstreamer::State::Paused => Some(PlaybackState::Paused),
+                        gstreamer::State::Null => Some(PlaybackState::Stopped),
+                        _ => None,
+                    };
+                    if let Some(playback_state) = playback_state {
+                        let _ = notify!(observer, PlayerEvent::StateChanged(playback_state));
+                    }
+                },
+                _ => {},
+            }
+        });
+    }
+
+    fn install_gapless_and_sync(&self, inner: &Arc<Mutex<PlayerInner>>) {
+        log::info!("uridecodebin3 diag: install_gapless_and_sync entered");
+        if pref!(media_gapless_loop_enabled) || sync_group_target().is_some() {
+            let pipeline = inner.lock().unwrap().pipeline.clone();
+            if let Some(bus) = pipeline.bus() {
+                let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
+                inner.lock().unwrap().gapless_loop_sender = Some(loop_sender.clone());
+                let pipeline_weak = pipeline.downgrade();
+                let inner_for_loop = inner.clone();
+                std::thread::Builder::new()
+                .name(String::from("GstGaplessLoop"))
+                .spawn(move || {
+                    let mut last_rewind: Option<std::time::Instant> = None;
+                    while let Ok(message) = loop_receiver.recv() {
+                        let Some(pipeline) = pipeline_weak.upgrade() else {
+                            return;
+                        };
+                        match message {
+                            GaplessLoopMsg::MaybeEnter => {
+                                {
+                                    let inner = inner_for_loop.lock().unwrap();
+                                    if !inner.looping.get() ||
+                                        inner.segment_loop_active.get() ||
+                                        inner.stream_type != StreamType::Seekable ||
+                                        inner.play_state !=
+                                            gstreamer_play::PlayState::Playing ||
+                                        inner.last_metadata.is_none()
+                                    {
+                                        continue;
+                                    }
+                                }
+                                // Enter only once playback is well underway. A segment
+                                // seek during startup (preroll still settling, e.g.
+                                // dozens of pipelines starting at once) can wedge the
+                                // pipeline before its first frame, leaving a dead
+                                // tile. The position-updated signal retries this
+                                // entry periodically, so skipping here is safe.
+                                let Some(position) =
+                                    pipeline.query_position::<gstreamer::ClockTime>()
+                                else {
+                                    continue;
+                                };
+                                if position < gstreamer::ClockTime::from_mseconds(500) {
+                                    continue;
+                                }
+                                {
+                                    // Re-check and claim the mode before seeking
+                                    // (reverted on failure) so racing MaybeEnter
+                                    // messages do not double-seek.
+                                    let inner = inner_for_loop.lock().unwrap();
+                                    if !inner.looping.get() || inner.segment_loop_active.get()
+                                    {
+                                        continue;
+                                    }
+                                    inner.segment_loop_active.set(true);
+                                }
+                                match pipeline.seek(
+                                    1.0,
+                                    gstreamer::SeekFlags::FLUSH |
+                                        gstreamer::SeekFlags::SEGMENT |
+                                        gstreamer::SeekFlags::ACCURATE,
+                                    gstreamer::SeekType::Set,
+                                    position,
+                                    gstreamer::SeekType::None,
+                                    gstreamer::ClockTime::NONE,
+                                ) {
+                                    Ok(()) => {
+                                        log::info!(
+                                            "Gapless loop: entered segment mode at {position}"
+                                        );
+                                    },
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Gapless loop: segment mode entry failed: {error:?}"
+                                        );
+                                        inner_for_loop
+                                            .lock()
+                                            .unwrap()
+                                            .segment_loop_active
+                                            .set(false);
+                                    },
+                                }
+                            },
+                            GaplessLoopMsg::ArmSyncGroup => {
+                                let play_handle = {
+                                    let inner = inner_for_loop.lock().unwrap();
+                                    if !inner.sync_hold.get() || inner.sync_armed.get() {
+                                        continue;
+                                    }
+                                    inner.sync_armed.set(true);
+                                    // When gapless looping is on, arm SEGMENT mode at
+                                    // position 0 while still paused: the pipeline
+                                    // re-prerolls at 0 in segment mode, so the
+                                    // synchronized start needs no later flushing seek
+                                    // (which would break lockstep).
+                                    if pref!(media_gapless_loop_enabled) {
+                                        inner.segment_loop_active.set(true);
+                                    }
+                                    inner.player.clone()
+                                    // `None` for the direct pipeline; the group
+                                    // then releases it by state change instead.
+                                };
+                                if pref!(media_gapless_loop_enabled) {
+                                    if let Err(error) = pipeline.seek(
+                                        1.0,
+                                        gstreamer::SeekFlags::FLUSH |
+                                            gstreamer::SeekFlags::SEGMENT |
+                                            gstreamer::SeekFlags::ACCURATE,
+                                        gstreamer::SeekType::Set,
+                                        gstreamer::ClockTime::ZERO,
+                                        gstreamer::SeekType::None,
+                                        gstreamer::ClockTime::NONE,
+                                    ) {
+                                        log::warn!(
+                                            "Sync group: segment arm seek failed: {error:?}"
+                                        );
+                                        inner_for_loop
+                                            .lock()
+                                            .unwrap()
+                                            .segment_loop_active
+                                            .set(false);
+                                    }
+                                }
+                                register_sync_member(play_handle, pipeline.clone());
+                            },
+                            GaplessLoopMsg::SegmentDone => {
+                                let looping = {
+                                    let inner = inner_for_loop.lock().unwrap();
+                                    inner.looping.get() && inner.segment_loop_active.get()
+                                };
+                                if !looping {
+                                    continue;
+                                }
+                                // Storm guard: a SEGMENT_DONE right after the previous
+                                // rewind means the segment finished without playing
+                                // real data; leave segment mode instead of rewinding
+                                // in a tight loop.
+                                if let Some(previous) = last_rewind &&
+                                    previous.elapsed() <
+                                        std::time::Duration::from_millis(1000)
+                                {
+                                    log::warn!(
+                                        "Gapless loop: rewind storm detected; leaving segment mode"
+                                    );
+                                    inner_for_loop
+                                        .lock()
+                                        .unwrap()
+                                        .segment_loop_active
+                                        .set(false);
+                                    continue;
+                                }
+                                last_rewind = Some(std::time::Instant::now());
+                                // No FLUSH flag: decoders keep their state and the
+                                // pipeline wraps to the start without a stall or EOS.
+                                if let Err(error) = pipeline.seek(
+                                    1.0,
+                                    gstreamer::SeekFlags::SEGMENT,
+                                    gstreamer::SeekType::Set,
+                                    gstreamer::ClockTime::ZERO,
+                                    gstreamer::SeekType::None,
+                                    gstreamer::ClockTime::NONE,
+                                ) {
+                                    log::warn!(
+                                        "Gapless loop: rewind seek failed: {error:?}"
+                                    );
+                                }
+                            },
+                        }
+                    }
+                })
+                .expect("Could not create GstGaplessLoop thread.");
+                bus.enable_sync_message_emission();
+                // The callback must be Sync; mpsc senders are not, so guard with a mutex.
+                let loop_sender = Mutex::new(loop_sender);
+                bus.connect_sync_message(Some("segment-done"), move |_, _| {
+                    if let Ok(sender) = loop_sender.lock() {
+                        let _ = sender.send(GaplessLoopMsg::SegmentDone);
+                    }
+                });
+            }
+        }
+    }
+
     fn install_video_sink_callbacks(&self, video_sink: &gstreamer_app::AppSink) {
         let Some(video_renderer) = self.video_renderer.clone() else {
             return;
@@ -1499,6 +1983,11 @@ impl GStreamerPlayer {
                     )));
                 }
             }
+        }
+
+        // playsink 없는 경로. 쓸 수 없는 조건이면 false 를 돌려주고 아래로 흘러간다.
+        if use_uridecodebin3_pipeline() && self.setup_direct_pipeline()? {
+            return Ok(());
         }
 
         let player = gstreamer_play::Play::default();
@@ -1727,185 +2216,7 @@ impl GStreamerPlayer {
         // worker thread. Entering segment mode or rewinding from GstPlay signal threads /
         // bus callbacks (or while holding the `PlayerInner` mutex) deadlocks or stalls the
         // pipeline, so signal handlers only post messages here.
-        if pref!(media_gapless_loop_enabled) || sync_group_target().is_some() {
-            let pipeline = inner.lock().unwrap().pipeline.clone();
-            if let Some(bus) = pipeline.bus() {
-                let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
-                inner.lock().unwrap().gapless_loop_sender = Some(loop_sender.clone());
-                let pipeline_weak = pipeline.downgrade();
-                let inner_for_loop = inner.clone();
-                std::thread::Builder::new()
-                    .name(String::from("GstGaplessLoop"))
-                    .spawn(move || {
-                        let mut last_rewind: Option<std::time::Instant> = None;
-                        while let Ok(message) = loop_receiver.recv() {
-                            let Some(pipeline) = pipeline_weak.upgrade() else {
-                                return;
-                            };
-                            match message {
-                                GaplessLoopMsg::MaybeEnter => {
-                                    {
-                                        let inner = inner_for_loop.lock().unwrap();
-                                        if !inner.looping.get() ||
-                                            inner.segment_loop_active.get() ||
-                                            inner.stream_type != StreamType::Seekable ||
-                                            inner.play_state !=
-                                                gstreamer_play::PlayState::Playing ||
-                                            inner.last_metadata.is_none()
-                                        {
-                                            continue;
-                                        }
-                                    }
-                                    // Enter only once playback is well underway. A segment
-                                    // seek during startup (preroll still settling, e.g.
-                                    // dozens of pipelines starting at once) can wedge the
-                                    // pipeline before its first frame, leaving a dead
-                                    // tile. The position-updated signal retries this
-                                    // entry periodically, so skipping here is safe.
-                                    let Some(position) =
-                                        pipeline.query_position::<gstreamer::ClockTime>()
-                                    else {
-                                        continue;
-                                    };
-                                    if position < gstreamer::ClockTime::from_mseconds(500) {
-                                        continue;
-                                    }
-                                    {
-                                        // Re-check and claim the mode before seeking
-                                        // (reverted on failure) so racing MaybeEnter
-                                        // messages do not double-seek.
-                                        let inner = inner_for_loop.lock().unwrap();
-                                        if !inner.looping.get() || inner.segment_loop_active.get()
-                                        {
-                                            continue;
-                                        }
-                                        inner.segment_loop_active.set(true);
-                                    }
-                                    match pipeline.seek(
-                                        1.0,
-                                        gstreamer::SeekFlags::FLUSH |
-                                            gstreamer::SeekFlags::SEGMENT |
-                                            gstreamer::SeekFlags::ACCURATE,
-                                        gstreamer::SeekType::Set,
-                                        position,
-                                        gstreamer::SeekType::None,
-                                        gstreamer::ClockTime::NONE,
-                                    ) {
-                                        Ok(()) => {
-                                            log::info!(
-                                                "Gapless loop: entered segment mode at {position}"
-                                            );
-                                        },
-                                        Err(error) => {
-                                            log::warn!(
-                                                "Gapless loop: segment mode entry failed: {error:?}"
-                                            );
-                                            inner_for_loop
-                                                .lock()
-                                                .unwrap()
-                                                .segment_loop_active
-                                                .set(false);
-                                        },
-                                    }
-                                },
-                                GaplessLoopMsg::ArmSyncGroup => {
-                                    let play_handle = {
-                                        let inner = inner_for_loop.lock().unwrap();
-                                        if !inner.sync_hold.get() || inner.sync_armed.get() {
-                                            continue;
-                                        }
-                                        inner.sync_armed.set(true);
-                                        // When gapless looping is on, arm SEGMENT mode at
-                                        // position 0 while still paused: the pipeline
-                                        // re-prerolls at 0 in segment mode, so the
-                                        // synchronized start needs no later flushing seek
-                                        // (which would break lockstep).
-                                        if pref!(media_gapless_loop_enabled) {
-                                            inner.segment_loop_active.set(true);
-                                        }
-                                        inner.player.clone()
-                                        // `None` for the direct pipeline; the group
-                                        // then releases it by state change instead.
-                                    };
-                                    if pref!(media_gapless_loop_enabled) {
-                                        if let Err(error) = pipeline.seek(
-                                            1.0,
-                                            gstreamer::SeekFlags::FLUSH |
-                                                gstreamer::SeekFlags::SEGMENT |
-                                                gstreamer::SeekFlags::ACCURATE,
-                                            gstreamer::SeekType::Set,
-                                            gstreamer::ClockTime::ZERO,
-                                            gstreamer::SeekType::None,
-                                            gstreamer::ClockTime::NONE,
-                                        ) {
-                                            log::warn!(
-                                                "Sync group: segment arm seek failed: {error:?}"
-                                            );
-                                            inner_for_loop
-                                                .lock()
-                                                .unwrap()
-                                                .segment_loop_active
-                                                .set(false);
-                                        }
-                                    }
-                                    register_sync_member(play_handle, pipeline.clone());
-                                },
-                                GaplessLoopMsg::SegmentDone => {
-                                    let looping = {
-                                        let inner = inner_for_loop.lock().unwrap();
-                                        inner.looping.get() && inner.segment_loop_active.get()
-                                    };
-                                    if !looping {
-                                        continue;
-                                    }
-                                    // Storm guard: a SEGMENT_DONE right after the previous
-                                    // rewind means the segment finished without playing
-                                    // real data; leave segment mode instead of rewinding
-                                    // in a tight loop.
-                                    if let Some(previous) = last_rewind &&
-                                        previous.elapsed() <
-                                            std::time::Duration::from_millis(1000)
-                                    {
-                                        log::warn!(
-                                            "Gapless loop: rewind storm detected; leaving segment mode"
-                                        );
-                                        inner_for_loop
-                                            .lock()
-                                            .unwrap()
-                                            .segment_loop_active
-                                            .set(false);
-                                        continue;
-                                    }
-                                    last_rewind = Some(std::time::Instant::now());
-                                    // No FLUSH flag: decoders keep their state and the
-                                    // pipeline wraps to the start without a stall or EOS.
-                                    if let Err(error) = pipeline.seek(
-                                        1.0,
-                                        gstreamer::SeekFlags::SEGMENT,
-                                        gstreamer::SeekType::Set,
-                                        gstreamer::ClockTime::ZERO,
-                                        gstreamer::SeekType::None,
-                                        gstreamer::ClockTime::NONE,
-                                    ) {
-                                        log::warn!(
-                                            "Gapless loop: rewind seek failed: {error:?}"
-                                        );
-                                    }
-                                },
-                            }
-                        }
-                    })
-                    .expect("Could not create GstGaplessLoop thread.");
-                bus.enable_sync_message_emission();
-                // The callback must be Sync; mpsc senders are not, so guard with a mutex.
-                let loop_sender = Mutex::new(loop_sender);
-                bus.connect_sync_message(Some("segment-done"), move |_, _| {
-                    if let Ok(sender) = loop_sender.lock() {
-                        let _ = sender.send(GaplessLoopMsg::SegmentDone);
-                    }
-                });
-            }
-        }
+        self.install_gapless_and_sync(&inner);
 
         // Handle `media-info-updated` signal.
         let inner_clone = inner.clone();
