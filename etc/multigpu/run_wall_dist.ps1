@@ -48,6 +48,25 @@ param(
     # synchronised with each other -- that is a separate task (Video Sync Group).
     [ValidateSet("", "clock", "thread")]
     [string] $SinkPacing = "",
+    # media_audio_enabled=false: unset playbin3's audio + soft-volume flags.
+    #
+    # ***NO PERFORMANCE BENEFIT. MEASURED 2026-08-26.*** It was tried expecting one: the wall
+    # plays muted video and never decodes audio, yet every pipeline still carries aacparse +
+    # audiotee + two streamsynchronizer identities AND an audio pad on both multiqueues --
+    # 2 of the 4 pad tasks per video. Unsetting the flag changed NOTHING: with
+    # disable_audio=true the element list is byte-for-byte identical (aacparse 20, tee 20,
+    # identity 40 at 20 videos) and multiqueue still runs 4 tasks per video. 20-video A/B:
+    # 6.31 vs 6.25 cores on multiqueue:src, 80 threads either way.
+    #
+    # The flag only removes the audio SINK chain. Demuxing, parsing and stream
+    # synchronisation happen regardless, because the file still contains an audio stream and
+    # qtdemux/parsebin/multiqueue serve it whether or not anything consumes it. Dropping
+    # that work needs stream SELECTION (decodebin3's select-stream), not a playbin flag --
+    # which lands in the uridecodebin3 work, not here.
+    #
+    # Kept because the sink chain does go away and the wall is muted, so it is harmless and
+    # it is where stream selection will hook in later. Do not expect it to buy anything now.
+    [switch] $NoAudio,
     [int]    $MaxPending = 0,            # 0 = leave default (1)
     [int]    $MinIntervalMs = 0,         # 0 = leave default (16)
     [int]    $DurationSec = 0,
@@ -159,6 +178,7 @@ if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$Vide
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
 if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$SinkPacing") }
+if ($NoAudio)             { $argList += @("--pref", "media_audio_enabled=false") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
 $argList += $Url
@@ -166,7 +186,7 @@ $argList += $Url
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) audio=$(if($NoAudio){'off'}else{'on'})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"

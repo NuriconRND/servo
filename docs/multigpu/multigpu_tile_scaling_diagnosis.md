@@ -2324,3 +2324,54 @@ appsink 가 디코더와 같은 스레드가 되어 제자리를 찾는다. 그�
   기준선 0.795 보다 높다는 것이 신호였는데 "Servo 가 얹는 비용"으로 읽었다. 도구가 이제
   `(plain; NOT what the wall runs)` 를 명시한다.
 
+
+## 2026-08-26 — 월의 실제 파이프라인, 그리고 기각된 오디오 가설
+
+### 실측한 요소 목록 (영상 1 개당)
+
+로그 필터가 `queue`/`multiqueue` 를 빼고 있어서(klass 가 Generic) **디코더 뒤에 큐가 있는지조차
+로그로 알 수 없었다.** 필터를 전부 찍도록 넓힌 뒤 받은 실물:
+
+```
+filesrc -> typefind -> qtdemux -+-> h264parse -> capsfilter -> multiqueue -> avdec_h264
+                                |                                              |
+                                |                                    [vbin: vqueue]   <- ***비싼 홉***
+                                |                                              |
+                                |                                          appsink
+                                +-> aacparse -> audiotee              (오디오: 파싱만, 디코드 안 함)
+identity x2  (streamsynchronizer 의 스트림당 identity)
+```
+
+- ***`vqueue` 확정*** — playsink 소유의 비디오 큐. 원본 3.1MB 프레임이 스레드 경계를 건너는
+  자리이고 `uridecodebin3` 교체가 없애는 것이 정확히 이것이다.
+- `videoconvert`/`videobalance`/`deinterlace` 는 ***없다*** — `prefer_native_video` 가
+  `native-video` 를 켜고 두 필터를 꺼서 픽셀 단위 작업은 피하고 있다.
+- 요소 이름을 보지 않고 factory 만 세면 `tee` 가 비디오 경로에 있는 것처럼 보이는데,
+  실제 이름은 ***`audiotee`*** 다. 비디오와 무관하다.
+
+### 기각: `media_audio_enabled=false` 로 오디오 경로를 없앤다
+
+월은 muted 라 오디오를 디코드하지 않는데도 `aacparse` + `audiotee` + `identity` 2 개를
+유지하고, 양쪽 multiqueue 가 오디오 패드를 하나씩 갖는다(영상당 태스크 4 개 중 2 개).
+플래그로 없앨 수 있을 것으로 보고 A/B 했다. ***아무 것도 바뀌지 않았다.***
+
+| 20 영상 | multiqueue:src | 스레드 | 프로세스 총 |
+|---|---|---|---|
+| audio=on | 6.31 코어 | 80 | 8.15 |
+| audio=off (`disable_audio=true` 확인됨) | 6.25 코어 | 80 | 7.94 |
+
+요소 목록은 완전히 동일했다(aacparse 20, tee 20, identity 40, multiqueue 20 - 양쪽 같음).
+
+이유: 이 플래그는 **오디오 싱크 체인만** 끈다. 파일에 오디오 스트림이 있는 한 qtdemux 가
+패드를 내고 parsebin 이 파서를 붙이며 multiqueue 가 그 패드를 유지한다 - 소비자가 있든
+없든 상관없다. 없애려면 **스트림 선택**(decodebin3 의 `select-stream`)이 필요하고, 그건
+`uridecodebin3` 작업 안에 들어간다.
+
+### 1 단계 스파이크의 표적 (셋 다 같은 교체로 해결)
+
+| | 현재 | `uridecodebin3` 교체 후 |
+|---|---|---|
+| `vqueue` | 원본 3.1MB 가 스레드 경계 통과 | 없음 |
+| `audiotee` + `identity` x2 | 쓰지 않는 오디오 경로 유지 | 스트림 선택으로 제거 |
+| multiqueue 오디오 패드 x2 | 영상당 태스크 4 | 2 |
+

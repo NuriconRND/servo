@@ -187,17 +187,18 @@ fn format_optional_ms(value: Option<f64>) -> String {
     }
 }
 
-fn should_log_pipeline_element(factory_name: &str, klass: &str) -> bool {
-    let factory_name = factory_name.to_ascii_lowercase();
-    klass.contains("Decoder") ||
-        klass.contains("Converter") ||
-        klass.contains("Sink") ||
-        factory_name.contains("dec") ||
-        factory_name.contains("convert") ||
-        factory_name.contains("scale") ||
-        factory_name.contains("balance") ||
-        factory_name.contains("deinterlace") ||
-        factory_name.contains("appsink")
+/// 파이프라인에 실제로 들어간 요소를 전부 찍는다(파이프라인당 1 회, 핫패스 아님).
+///
+/// 예전에는 코덱/변환 계열만 골라 찍었는데, `queue` 와 `multiqueue` 는 klass 가 Generic
+/// 이라 그 필터를 통과하지 못했다. 그 결과 월의 로그에는 h264parse/avdec/appsink 세 종만
+/// 남았고, **디코더 뒤에 큐가 있는지조차 로그로 알 수 없었다.**
+///
+/// 그게 지금 문제가 되는 이유: 45 영상에서 영상당 디코드 비용이 0.39 코어여야 하는데
+/// 0.98 이고, 그 차이의 상당 부분이 **원본 3.1MB 프레임이 스레드 경계를 몇 번 건너는가**
+/// 에서 온다(측정: 앞 큐만 0.294, 앞+뒤 0.729). 스레드 토폴로지가 곧 성능이므로
+/// 토폴로지를 만드는 요소를 로그에서 빼면 안 된다.
+fn should_log_pipeline_element(_factory_name: &str, _klass: &str) -> bool {
+    true
 }
 
 fn log_pipeline_element_added(element: &gstreamer::Element) {
