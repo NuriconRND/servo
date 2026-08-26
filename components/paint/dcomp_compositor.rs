@@ -988,20 +988,6 @@ enum SurfaceStorage {
 
 /// External compositor surface의 저장소. 스왑체인은 클립 크기 확정 시 지연 생성하며,
 /// 첫 성공 Present 후에만 visual.SetContent(스왑체인)한다(그 전까지 visual은 콘텐츠
-/// convert 는 끝났고 Present 만 남은 external 서피스(프레임당 목록).
-///
-/// ★D3D11 `Present` 는 즉시 컨텍스트를 flush 한다★ — 영상마다 convert→Present 를 번갈아
-/// 하면 한 패스에 flush 가 N 번 일어나 GPU 제출이 N 조각으로 쪼개진다. convert 를 전부
-/// 끝낸 뒤 Present 를 몰아치면 첫 Present 가 N 개 convert 를 한 번에 flush 하고 나머지는
-/// 비울 것이 없다. 45 영상 실측에서 present 가 초당 837ms(렌더러 스레드의 84%)를 먹던
-/// 것이 이 구조 때문이라는 가설로 도입.
-struct PendingExternalPresent {
-    id: NativeSurfaceId,
-    /// 낙관적으로 기록해 둔 세대 — Present 가 실패하면 되돌려 다음 프레임에 재시도한다.
-    ring_id: u64,
-    frame_seq: u64,
-}
-
 /// 없음). last_presented로 (ring_id, frame_seq) 세대 dedup — 같은 프레임 재변환 스킵.
 struct ExternalStorage {
     /// 크기 확정 시 지연 생성되는 비디오별 flip 스왑체인. None = 미생성/생성 실패.
@@ -1221,9 +1207,6 @@ pub struct DCompNativeCompositor {
     /// (WR passes-루프 타일 GL 전 — 아래 close_external_batch/start_compositing 주석의 렌더러 앵커
     /// 참조). begin_frame/end_frame이 방어적으로 닫아 잔류를 막는다.
     external_batch_active: bool,
-    /// 이번 프레임에 convert 까지 끝나고 Present 를 기다리는 external 서피스들.
-    /// `flush_external_presents` 가 비운다(정본 호출 = start_compositing).
-    pending_external_presents: Vec<PendingExternalPresent>,
     /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
     esc_prof: EscProf,
     /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
@@ -1388,7 +1371,6 @@ pub fn maybe_create(
             d3d11_context1,
             warned_no_provider: false,
             external_batch_active: false,
-            pending_external_presents: Vec::new(),
             esc_prof: EscProf::new(),
             last_root_offset: None,
         })))
@@ -1741,12 +1723,11 @@ impl DCompNativeCompositor {
         // 첫 external convert면 begin_batch로 컨텍스트-상태 배치를 연다(프레임당 스왑 2N→2).
         // Safety: 살아있는 스왑체인/디바이스/컨텍스트/백버퍼.
         let prof_on = video_escape_prof();
-        // ext borrow 안에서는 self.pending_external_presents 를 만질 수 없다(프로파일 카운터를
-        // 지역에 모으는 것과 같은 사정) — borrow 가 끝난 뒤 아래에서 push 한다.
-        let mut queue_present: Option<(u64, u64)> = None;
         let mut d_converts = 0u64;
         let mut d_convert_dur = std::time::Duration::ZERO;
         let mut d_srv = 0u64;
+        let mut d_presents = 0u64;
+        let mut d_present_dur = std::time::Duration::ZERO;
         let mut d_batch_swaps = 0u64;
         unsafe {
             let mut back: *mut ID3D11Texture2D = ptr::null_mut();
@@ -1807,12 +1788,36 @@ impl DCompNativeCompositor {
             }
             // RTV는 캐시가 소유 — 여기서 Release하지 않는다(백버퍼는 아래에서 Release).
             if converted {
-                // Present 는 여기서 하지 않고 프레임 끝에 몰아친다(PendingExternalPresent 주석).
-                // 세대는 낙관적으로 지금 기록한다 — 한 프레임 안에서 같은 서피스를 두 번
-                // 방문해도 재변환하지 않기 위해서다. Present 가 실패하면 flush 쪽에서
-                // 되돌려 다음 프레임에 재시도한다.
-                ext.last_presented = Some((lease.ring_id, lease.frame_seq));
-                queue_present = Some((lease.ring_id, lease.frame_seq));
+                let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
+                let hr = (*swapchain.as_ptr()).Present(0, 0);
+                if let Some(s) = p_start {
+                    d_present_dur += s.elapsed();
+                    d_presents += 1;
+                }
+                if hr < 0 {
+                    if !ext.warned_fail {
+                        warn!("[dcomp-native] external {:?}: Present failed (hr=0x{:08x})", id, hr as u32);
+                        ext.warned_fail = true;
+                    }
+                } else {
+                    ext.last_presented = Some((lease.ring_id, lease.frame_seq));
+                    // 첫 성공 Present 후 visual 콘텐츠를 스왑체인으로 전환(1회). 같은
+                    // add_surface 안에서 convert+present+SetContent가 end_frame Commit 전
+                    // 완결되므로 플래시 없음(Commit 원자성).
+                    if !ext.content_attached {
+                        let hr = (*entry.visual.as_ptr())
+                            .SetContent(swapchain.as_ptr() as *const IUnknown);
+                        if hr >= 0 {
+                            ext.content_attached = true;
+                            if dcomp_debug() {
+                                log::info!("[dcomp-dbg] external content-attach id={:?}", id);
+                            }
+                        } else if !ext.warned_fail {
+                            warn!("[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})", id, hr as u32);
+                            ext.warned_fail = true;
+                        }
+                    }
+                }
             }
             (*(back as *mut IUnknown)).Release();
         }
@@ -1823,14 +1828,9 @@ impl DCompNativeCompositor {
             self.esc_prof.converts += d_converts;
             self.esc_prof.convert_dur += d_convert_dur;
             self.esc_prof.srv_creates += d_srv;
+            self.esc_prof.presents += d_presents;
+            self.esc_prof.present_dur += d_present_dur;
             self.esc_prof.batch_swaps += d_batch_swaps;
-        }
-        if let Some((ring_id, frame_seq)) = queue_present {
-            self.pending_external_presents.push(PendingExternalPresent {
-                id,
-                ring_id,
-                frame_seq,
-            });
         }
     }
 
@@ -1944,83 +1944,6 @@ impl DCompNativeCompositor {
     /// compositor.bind(:5380)로 GL 렌더한다 — 즉 start_compositing은 add_surface 루프의 모든
     /// external convert '뒤', 타일 GL '앞'이라 배치를 닫을 정확한 위치다. begin_frame/end_frame은
     /// 방어적 멱등 넷(정상 경로에선 이미 닫혀 no-op).
-    /// 이번 프레임에 convert 가 끝난 external 서피스들을 몰아서 Present 한다.
-    ///
-    /// ★convert 와 Present 를 분리하는 이유★ — D3D11 `Present` 는 즉시 컨텍스트를 flush 하므로,
-    /// 영상마다 convert→Present 를 번갈아 하면 한 패스에 flush 가 N 번 일어나고 GPU 제출이
-    /// N 조각으로 쪼개진다. 여기서 몰아치면 첫 Present 가 N 개 convert 를 한 번에 flush 하고
-    /// 나머지는 비울 것이 없다.
-    ///
-    /// 정본 호출 지점은 `start_compositing`(배치를 닫은 직후, 타일 GL 앞). `begin_frame`/
-    /// `end_frame` 의 호출은 방어 넷이다 — 정상 경로에선 이미 비어 no-op 이고, 어떤 경로가
-    /// start_compositing 없이 프레임을 끝내더라도 영상이 멈추지 않고 한 프레임 늦게 나간다.
-    fn flush_external_presents(&mut self) {
-        if self.pending_external_presents.is_empty() {
-            return;
-        }
-        let prof_on = video_escape_prof();
-        let mut d_presents = 0u64;
-        let mut d_present_dur = std::time::Duration::ZERO;
-        // borrow 사정: 목록을 통째로 꺼낸 뒤 surfaces 를 가변 대여한다.
-        let pending = std::mem::take(&mut self.pending_external_presents);
-        for item in pending {
-            let Some(entry) = self.surfaces.get_mut(&item.id) else {
-                continue;
-            };
-            let SurfaceStorage::External(ext) = &mut entry.storage else {
-                continue;
-            };
-            let Some(swapchain) = ext.swapchain.as_ref() else {
-                continue;
-            };
-            // Safety: 살아있는 스왑체인/비주얼(대여 중인 entry 가 소유).
-            unsafe {
-                let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
-                let hr = (*swapchain.as_ptr()).Present(0, 0);
-                if let Some(start) = p_start {
-                    d_present_dur += start.elapsed();
-                    d_presents += 1;
-                }
-                if hr < 0 {
-                    // 낙관적으로 기록해 둔 세대를 되돌려 다음 프레임에 재시도시킨다.
-                    if ext.last_presented == Some((item.ring_id, item.frame_seq)) {
-                        ext.last_presented = None;
-                    }
-                    if !ext.warned_fail {
-                        warn!(
-                            "[dcomp-native] external {:?}: Present failed (hr=0x{:08x})",
-                            item.id, hr as u32
-                        );
-                        ext.warned_fail = true;
-                    }
-                    continue;
-                }
-                // 첫 성공 Present 후 visual 콘텐츠를 스왑체인으로 전환(1회). 여전히 end_frame
-                // 의 Commit 앞이라 플래시는 없다(Commit 원자성).
-                if !ext.content_attached {
-                    let hr =
-                        (*entry.visual.as_ptr()).SetContent(swapchain.as_ptr() as *const IUnknown);
-                    if hr >= 0 {
-                        ext.content_attached = true;
-                        if dcomp_debug() {
-                            log::info!("[dcomp-dbg] external content-attach id={:?}", item.id);
-                        }
-                    } else if !ext.warned_fail {
-                        warn!(
-                            "[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})",
-                            item.id, hr as u32
-                        );
-                        ext.warned_fail = true;
-                    }
-                }
-            }
-        }
-        if prof_on {
-            self.esc_prof.presents += d_presents;
-            self.esc_prof.present_dur += d_present_dur;
-        }
-    }
-
     fn close_external_batch(&mut self) {
         if !self.external_batch_active {
             return;
@@ -2747,9 +2670,6 @@ impl Compositor for DCompNativeCompositor {
         // 닫아 우리 ID3DDeviceContextState를 ANGLE 상태로 되돌릴 정확한 지점이다. end_frame(:1913)은
         // passes 루프 '뒤'라 너무 늦다(그래서 end_frame의 닫기는 방어 넷일 뿐).
         self.close_external_batch();
-        // 배치를 닫은 '뒤'에 Present 를 몰아친다 — 첫 Present 의 flush 가 이 프레임의 external
-        // convert 를 통째로 제출한다(flush_external_presents 주석).
-        self.flush_external_presents();
     }
 
     fn end_frame(&mut self, device: &mut Device) {
@@ -2757,9 +2677,6 @@ impl Compositor for DCompNativeCompositor {
         // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
         // 돌면 ANGLE 상태가 어긋난다(close_external_batch/begin_batch 주석).
         self.close_external_batch();
-        // 방어: 정상 경로는 start_compositing이 이미 몰아쳤다(no-op). Commit 앞이라 여기서
-        // 늦게 나가도 화면 정합은 유지된다.
-        self.flush_external_presents();
         // GL 커맨드를 D3D 큐에 확실히 제출한 뒤 Present(순서 보장).
         device.gl().flush();
 
