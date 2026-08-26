@@ -117,6 +117,21 @@ param(
     # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
     # around 110/s -- yet a single painter was measured at 200+/s. This says who.
     [switch] $FrameReason,
+    # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
+    # present, and what does one composite cost". One PRESENT line per second per painter,
+    # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
+    # update/draw split. This is the metric the 45-video work is aimed at (render_ms p50),
+    # so an A/B without it cannot be compared to the earlier rounds.
+    [switch] $PresentCadence,
+    # SERVO_DCOMP_DEBUG: per-surface [dcomp-dbg] lines (create_surface, external add,
+    # bind). This is the ONLY way to see whether a video actually reached an external
+    # compositor surface -- the launcher wipes SERVO_* before every run, so exporting it
+    # in the shell does nothing. Needs paint=info, which the default RUST_LOG has.
+    [switch] $DcompDebug,
+    # SERVO_VIDEO_ESCAPE_PROF: one [vesc-prof] aggregate line per second from the
+    # renderer thread (frames/converts/presents/acquires). Use it with -VideoEscape
+    # external to tell "promoted and presenting" from "flag set, nothing promoted".
+    [switch] $VideoEscapeProf,
     # Attribute the wall's CPU to its individual threads while it plays. Answers the
     # question D3D11PROF cannot: decode and upload run on ~N parallel streaming
     # threads, so if one of the FEW single-threaded stages (Compositor, Renderer,
@@ -160,6 +175,9 @@ if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
 if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
 if ($NoImmediateComposite) { $env:SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
+if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
+if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
+if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
 
 $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
