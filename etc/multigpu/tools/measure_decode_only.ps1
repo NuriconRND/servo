@@ -158,7 +158,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+# Three levels up from etc\multigpu	ools\ is the worktree root -- but only when this file
+# actually sits there. In a dist it sits at <root>\wall_dist, and three Split-Paths walk off
+# the end of the drive and return $null.
+#
+# ***That $null then breaks the candidate list below, not just its own entry.*** PowerShell
+# builds the whole @(...) array before testing any element, so Join-Path $null throws while the
+# array is being constructed -- with $ErrorActionPreference = Stop that kills the script even
+# though the FIRST candidate (the dist path) would have matched. This is why it failed on the
+# test machine and not here.
+$repo = $PSScriptRoot
+for ($up = 0; $up -lt 3 -and $repo; $up++) { $repo = Split-Path -Parent $repo }
+if (-not $repo) { $repo = $PSScriptRoot }
 if ($GstRoot -eq "") {
     # First hit wins: the dist ships its own GStreamer under engine\, then the env var the
     # installers set, then the two well-known roots (dev box, test machine).
@@ -176,12 +187,17 @@ if ($GstRoot -eq "") {
     }
 }
 if ($Video -eq "") {
-    foreach ($candidate in @(
-        (Join-Path $PSScriptRoot "pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
-        (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
-        (Join-Path $PSScriptRoot "..\..\..\pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
-        (Join-Path (Get-Location) "pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4")
+    # Join the bases by hand rather than inside the array literal: one $null base would
+    # otherwise throw while the array is built, before any candidate is tested.
+    $clip = "Wildlife_FHD30fps_counter_10Mbitrate.mp4"
+    foreach ($base in @(
+        (Join-Path $PSScriptRoot "pages"),                    # dist layout
+        (Join-Path $repo "tests"),                            # worktree layout
+        (Join-Path $PSScriptRoot "..\..\..\pages"),
+        (Join-Path (Get-Location) "pages")
     )) {
+        if (-not $base) { continue }
+        $candidate = Join-Path $base $clip
         if (Test-Path $candidate) { $Video = (Resolve-Path $candidate).Path; break }
     }
 }
@@ -189,7 +205,7 @@ if ($Video -eq "") {
 # A normal install puts the executables in bin\; the dist keeps them flat in engine\.
 $gstBinDir = if (Test-Path (Join-Path $GstRoot "bin\gst-launch-1.0.exe")) { Join-Path $GstRoot "bin" } else { $GstRoot }
 $launch = Join-Path $gstBinDir "gst-launch-1.0.exe"
-$launchName = "gst-launch-1.0"   # StartDecode 가 새 프로세스를 이름으로 찾는다
+$launchName = "gst-launch-1.0"   # name StartDecode looks the new process up by
 $discover = Join-Path $gstBinDir "gst-discoverer-1.0.exe"
 if ($GstRoot -eq "" -or !(Test-Path $launch)) {
     throw "gst-launch-1.0.exe not found (pass -GstRoot <root>); tried: $GstRoot"
