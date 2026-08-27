@@ -47,7 +47,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ((Test-Path $Out) -and -not $Force) { throw "$Out already exists (use -Force)" }
-if (Test-Path $Out) { Remove-Item $Out -Recurse -Force }
+# Empty the folder, do not delete it. ***A shell sitting in the dist -- or anything that ever
+# opened a handle to it -- keeps the DIRECTORY locked while its CONTENTS delete fine.*** The
+# old line deleted the contents, then threw "the process cannot access the file" on the folder
+# itself, leaving a gutted dist that looked packaged. That cost several rounds of confusing
+# "the exe is missing" symptoms.
+if (Test-Path $Out) {
+    Get-ChildItem $Out -Force | ForEach-Object { Remove-Item $_.FullName -Recurse -Force -EA SilentlyContinue }
+    $left = @(Get-ChildItem $Out -Recurse -Force -EA SilentlyContinue)
+    if ($left.Count) { throw "could not empty $Out ($($left.Count) items left); close anything using it" }
+}
 New-Item -ItemType Directory -Path $Out -Force | Out-Null
 
 # --- 2. engine\ : exe + every DLL it can possibly need ---

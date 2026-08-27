@@ -183,6 +183,24 @@ param(
     # the same command landed in either state at random and every A/B that straddled the two
     # compared nothing.
     [string] $NumaNode = "auto",
+    # Hard-confine the wall to its processor group, on top of the node PREFERENCE that
+    # `start /NODE` gives. Off by default until measured on the wall itself.
+    #
+    # ***A preference is not a confinement, and the difference is worth 40% of the decode CPU.***
+    # Decode-only baseline, 54 x FHD30, same topology and pacing, cores per video (2026-08-27,
+    # with the affinity mask read back from the OS to prove it took):
+    #
+    #   1 process, no confinement : 1.001 1.004 1.005 1.007 (0.793 once)
+    #   1 process, HARD-confined  : 0.597 0.601 0.604 (0.735 twice)
+    #   2 processes, none         : 1.009 1.010 | 0.510 0.517 0.534   <- SPLITS IN TWO
+    #   2 processes, HARD-confined: 0.520 0.533 0.537 0.539
+    #
+    # Two processes land either on the same node (as bad as one process) or on different ones
+    # (half the cost) -- the same coin-flip the wall itself showed before -NumaNode, and
+    # confining removes it. The wall currently decodes at 0.99-1.37 cores per video, sitting
+    # exactly on the worst cluster. At 0.60 the 54-video wall would want 32 cores instead of 53,
+    # which fits inside one node s 40.
+    [switch] $Confine,
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
     # pipeline setup and first-frame staging, which are not the steady state.
@@ -343,6 +361,30 @@ start "" /NODE $numaResolved /B /WAIT "$exe" $argStr 2> "$LogPath"
 # Windows picks the group at process creation, so the SAME command lands in either state and
 # an A/B that straddles the two compares nothing. Print it early, before anyone reads a number
 # off this run. The 1s probe costs nothing next to a 40s run.
+# Hard confinement, applied after launch and then read back. ***Never report a run as pinned
+# without asking the OS whether it actually is.*** The measurement tool spent three rounds on a
+# `start /AFFINITY` that was refused in silence, producing unpinned numbers that looked like
+# data; the read-back is what makes this trustworthy.
+if ($Confine) {
+    Add-Type -Namespace Win32 -Name TopoW -MemberDefinition @"
+[DllImport("kernel32.dll")] public static extern uint GetActiveProcessorCount(ushort g);
+"@ -ErrorAction SilentlyContinue
+    $bits = [Win32.TopoW]::GetActiveProcessorCount([System.UInt16]0)
+    $want = [uint64]::MaxValue -shr (64 - [int]$bits)
+    try {
+        $proc.ProcessorAffinity = [IntPtr]([int64]$want)
+        $proc.Refresh()
+        $got = [uint64][int64]$proc.ProcessorAffinity
+        if ($got -eq $want) {
+            Write-Host ("  confined    : 0x{0:x} ({1} processors), read back from the OS" -f $got, $bits)
+        } else {
+            Write-Warning ("-Confine did not take: asked 0x{0:x}, OS reports 0x{1:x}. This run is NOT confined." -f $want, $got)
+        }
+    } catch {
+        Write-Warning "-Confine failed on pid $($proc.Id): $($_.Exception.Message). This run is NOT confined."
+    }
+}
+
 $grpLine = ""
 $probeEarly = Join-Path $engine "thread_cpu_probe.exe"
 if (Test-Path $probeEarly) {
