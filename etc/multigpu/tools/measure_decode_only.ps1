@@ -43,7 +43,10 @@ param(
     # avdec max-threads. The wall passes media_avdec_max_threads=1, so 1 is the
     # comparable setting; vary it here to see the tradeoff without the wall in the way.
     [int]    $MaxThreads = 1,
-    [string] $GstRoot = "F:\gstreamer-inhouse\1.28.4.100\1.0\msvc_x86_64",
+    # Empty = find it. This script runs both from the dev worktree and from a packaged dist on
+    # the test machine, and those keep GStreamer in different places -- hardcoding either one
+    # meant hand-editing the copy after every repackage. Pass -GstRoot to override.
+    [string] $GstRoot = "",
     [string] $Video = "",
     # Only measure the single-thread ceiling and stop. Fast (one pipeline, one pass).
     [switch] $CeilingOnly,
@@ -156,8 +159,25 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+if ($GstRoot -eq "") {
+    # First hit wins: the dist ships its own GStreamer under engine\, then the env var the
+    # installers set, then the two well-known roots (dev box, test machine).
+    foreach ($candidate in @(
+        (Join-Path $PSScriptRoot "engine"),
+        $env:GSTREAMER_1_0_ROOT_MSVC_X86_64,
+        "F:\gstreamer-inhouse\1.28.4.100\1.0\msvc_x86_64",
+        "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+        "C:\gstreamer\1.0\msvc_x86_64"
+    )) {
+        if (-not $candidate) { continue }
+        if (Test-Path (Join-Path $candidate "bin\gst-launch-1.0.exe")) { $GstRoot = $candidate; break }
+        # The dist keeps the executables flat in engine\, with no bin\ under it.
+        if (Test-Path (Join-Path $candidate "gst-launch-1.0.exe"))      { $GstRoot = $candidate; break }
+    }
+}
 if ($Video -eq "") {
     foreach ($candidate in @(
+        (Join-Path $PSScriptRoot "pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
         (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
         (Join-Path $PSScriptRoot "..\..\..\pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4"),
         (Join-Path (Get-Location) "pages\Wildlife_FHD30fps_counter_10Mbitrate.mp4")
@@ -166,13 +186,17 @@ if ($Video -eq "") {
     }
 }
 
-$launch = Join-Path $GstRoot "bin\gst-launch-1.0.exe"
+# A normal install puts the executables in bin\; the dist keeps them flat in engine\.
+$gstBinDir = if (Test-Path (Join-Path $GstRoot "bin\gst-launch-1.0.exe")) { Join-Path $GstRoot "bin" } else { $GstRoot }
+$launch = Join-Path $gstBinDir "gst-launch-1.0.exe"
 $launchName = "gst-launch-1.0"   # StartDecode 가 새 프로세스를 이름으로 찾는다
-$discover = Join-Path $GstRoot "bin\gst-discoverer-1.0.exe"
-if (!(Test-Path $launch)) { throw "gst-launch-1.0.exe not found: $launch" }
+$discover = Join-Path $gstBinDir "gst-discoverer-1.0.exe"
+if ($GstRoot -eq "" -or !(Test-Path $launch)) {
+    throw "gst-launch-1.0.exe not found (pass -GstRoot <root>); tried: $GstRoot"
+}
 if ($Video -eq "" -or !(Test-Path $Video)) { throw "video not found (pass -Video): $Video" }
 
-$gstBin = Join-Path $GstRoot "bin"
+$gstBin = $gstBinDir
 $env:PATH = "$gstBin;$env:PATH"
 $env:GST_PLUGIN_PATH = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = Join-Path $GstRoot "lib\gstreamer-1.0"
@@ -337,21 +361,46 @@ function StartDecode($argList, $tag) {
     }
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
     if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
-    $mask = ([bigint]1 -shl [int]$n) - 1
-    $args = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    # Mask is interpreted WITHIN the node, so all-ones is exactly that node. Plain hex, no 0x.
+    $mask = (([bigint]1 -shl [int]$n) - 1).ToString("x")
+
+    # ***The chain list goes in a FILE, never on a command line.*** The first cut built a .cmd
+    # holding all 54 chains inline; that is well past cmd.exe s 8191-character limit, so the
+    # line was truncated, gst-launch never ran, and the measurement reported 0.00 cores busy as
+    # if that were data. Six chains fit, which is why it passed on the dev box.
+    #
+    # A child process inherits its parent s affinity mask (unlike the NUMA *preference* that
+    # `start /NODE` alone gives), so pinning the little launcher pins gst-launch with it.
+    $helper  = Join-Path $env:TEMP ("decode_numa_{0}_{1}.ps1" -f $PID, $tag)
+    $pidFile = Join-Path $env:TEMP ("decode_numa_{0}_{1}.pid" -f $PID, $tag)
+    Remove-Item $pidFile -Force -EA SilentlyContinue
+    $quoted = ($argList | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ", "
+    @"
+`$chains = @($quoted)
+`$p = Start-Process -FilePath '$launch' -ArgumentList `$chains -WindowStyle Hidden -PassThru ``
+    -RedirectStandardOutput '$env:TEMP\decode_$tag.out' -RedirectStandardError '$env:TEMP\decode_$tag.err'
+`$p.Id | Set-Content -Encoding ascii '$pidFile'
+`$p.WaitForExit()
+"@ | Set-Content -Encoding utf8 $helper
+
     $cmdFile = Join-Path $env:TEMP ("decode_numa_{0}_{1}.cmd" -f $PID, $tag)
     @"
 @echo off
-start "" /NODE $NumaNode /AFFINITY 0x$($mask.ToString('x')) /B /WAIT "$launch" $args > "$env:TEMP\decode_$tag.out" 2> "$env:TEMP\decode_$tag.err"
+start "" /NODE $NumaNode /AFFINITY $mask /B /WAIT powershell -NoProfile -ExecutionPolicy Bypass -File "$helper"
 "@ | Set-Content -Encoding ascii $cmdFile
-    $before = @(Get-Process -Name ($launchName) -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
-    for ($i = 0; $i -lt 100; $i++) {
+
+    for ($i = 0; $i -lt 150; $i++) {
         Start-Sleep -Milliseconds 100
-        $now = @(Get-Process -Name ($launchName) -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
-        if ($now.Count -gt 0) { return $now[0] }
+        if (Test-Path $pidFile) {
+            $childPid = (Get-Content $pidFile -Raw).Trim()
+            if ($childPid) {
+                $proc = Get-Process -Id ([int]$childPid) -ErrorAction SilentlyContinue
+                if ($proc) { return $proc }
+            }
+        }
     }
-    throw "gst-launch did not start within 10s under 'start /NODE $NumaNode'"
+    throw "gst-launch did not start within 15s under 'start /NODE $NumaNode /AFFINITY $mask'"
 }
 
 $perProc = [math]::Ceiling($Count / [double]$groupCount)
@@ -433,7 +482,7 @@ if ($clipSec -gt 0 -and ($WarmupSec + $wall) -gt $clipSec) {
 foreach ($p in $procs) { try { Stop-Process -Id $p.Id -Force -EA SilentlyContinue } catch {} }
 Remove-Item "$env:TEMP\decode_*.out" -Force -EA SilentlyContinue
 Remove-Item "$env:TEMP\decode_*.err" -Force -EA SilentlyContinue
-Remove-Item "$env:TEMP\decode_numa_*.cmd" -Force -EA SilentlyContinue
+Remove-Item "$env:TEMP\decode_numa_*" -Force -EA SilentlyContinue
 
 # A pipeline that exits mid-window takes its CPU total with it, which drives the delta
 # negative. Refuse to report rather than print a number that looks like data.
