@@ -190,11 +190,17 @@ if ($GstRoot -eq "") {
         #   'g_io_module_load': The specified procedure could not be found
         # at the first gst-launch call, i.e. at the version check, which looks like the version
         # check being broken when nothing is wrong with it.
-        $hasPlugins = Test-Path (Join-Path $candidate "lib\gstreamer-1.0")
-        if (-not $hasPlugins) { $gstRootRejected += "$candidate (no lib\gstreamer-1.0)"; continue }
-        if (Test-Path (Join-Path $candidate "bin\gst-launch-1.0.exe")) { $GstRoot = $candidate; break }
-        if (Test-Path (Join-Path $candidate "gst-launch-1.0.exe"))            { $GstRoot = $candidate; break }
-        $gstRootRejected += "$candidate (no gst-launch-1.0.exe)"
+        # Two valid shapes: a normal install (bin\ + lib\gstreamer-1.0\) and the dist, which
+        # keeps gst-launch and all 300-odd plugin DLLs flat in engine\. Anything else is a
+        # partial copy: pointing PATH at it mixes its GLib with plugins found elsewhere, which
+        # surfaces as "'g_io_module_load': The specified procedure could not be found".
+        if ((Test-Path (Join-Path $candidate "bin\gst-launch-1.0.exe")) -and
+            (Test-Path (Join-Path $candidate "lib\gstreamer-1.0"))) { $GstRoot = $candidate; break }
+        if ((Test-Path (Join-Path $candidate "gst-launch-1.0.exe")) -and
+            (Get-ChildItem (Join-Path $candidate "gstcoreelements.dll") -EA SilentlyContinue)) {
+            $GstRoot = $candidate; break
+        }
+        $gstRootRejected += "$candidate (not a complete install)"
     }
 }
 if ($Video -eq "") {
@@ -226,7 +232,11 @@ if ($Video -eq "" -or !(Test-Path $Video)) { throw "video not found (pass -Video
 $gstBin = $gstBinDir
 $env:PATH = "$gstBin;$env:PATH"
 $env:GST_PLUGIN_PATH = ""
-$env:GST_PLUGIN_SYSTEM_PATH_1_0 = Join-Path $GstRoot "lib\gstreamer-1.0"
+$env:GST_PLUGIN_SYSTEM_PATH_1_0 = if (Test-Path (Join-Path $GstRoot "lib\gstreamer-1.0")) {
+    Join-Path $GstRoot "lib\gstreamer-1.0"
+} else {
+    $GstRoot   # dist layout: plugins sit flat beside the executables
+}
 
 # The hand-built chains name avdec_h264 outright, but a high-level bin autoplugs and would
 # pick the D3D11 hardware decoder -- which decodes on the GPU and measures nothing. The wall
@@ -420,7 +430,11 @@ function StartDecode($argList, $tag) {
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
     if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
     # Mask is interpreted WITHIN the node, so all-ones is exactly that node. Plain hex, no 0x.
-    $mask = (([bigint]1 -shl [int]$n) - 1).ToString("x")
+    # ***Not [bigint].ToString("x").*** BigInteger prefixes a sign nibble when the top bit is
+    # set, so a 40-processor node came out as "0ffffffffff" -- eleven digits, 44 bits, wider
+    # than the node -- and `start` refused it without a word, which reads as "gst-launch never
+    # ran". uint64 is exact here because the caller already rejected n > 64.
+    $mask = "{0:x}" -f ([uint64]::MaxValue -shr (64 - [int]$n))
 
     # ***The chain list goes in a FILE, never on a command line.*** The first cut built a .cmd
     # holding all 54 chains inline; that is well past cmd.exe s 8191-character limit, so the

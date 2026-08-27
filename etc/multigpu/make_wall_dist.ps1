@@ -95,6 +95,17 @@ Copy-Item (Join-Path $PSScriptRoot "run_wall_dist.ps1") $Out -Force
 # The decode baseline tool ships too: the wall's cores-per-video number is only
 # readable next to this machine's single-thread decode ceiling.
 Copy-Item (Join-Path $PSScriptRoot "tools\measure_decode_only.ps1") $Out -Force
+# ...and the two GStreamer executables it drives, from the SAME install the wall links against.
+#
+# ***Without these the baseline measured a different GStreamer than the wall runs.*** The test
+# machine has an old 1.22.4 in C:\gstreamer alongside the 1.28.4 the wall uses; with no
+# gst-launch in the dist the tool fell through to whichever install it could find and reported
+# 1.22.4 -- and a decode baseline taken on another version is not comparable to the wall at all.
+foreach ($exe in @("gst-launch-1.0.exe", "gst-discoverer-1.0.exe")) {
+    $src = Join-Path $GstRoot "bin\$exe"
+    if (Test-Path $src) { Copy-Item $src $engine -Force }
+    else { Write-Warning "$exe not found in $GstRoot; measure_decode_only.ps1 will fall back to another install" }
+}
 # The machine's shape decides how to read every number this dist produces. Processor group
 # placement was measured to be the difference between 29 fps and 6 fps on 45 videos (2026-08-26,
 # forced with -NumaNode, 6/6), so the group/NUMA/GPU-node facts have to be available ON the test
