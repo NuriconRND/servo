@@ -97,6 +97,16 @@ param(
     # memory => stays inefficient. At 0.412 the same 54 videos want 22 cores and fit in a node
     # with room to spare. Forbidding the spill is how to find out which way it settles.
     [int]    $NumaNode = -1,
+    # Confine each launched process to the processors of whatever group Windows put it in, by
+    # setting ProcessorAffinity right after it starts. No cmd, no `start`, no wrapper.
+    #
+    # ***For THIS tool that is the whole experiment.*** The decode baseline never touches a GPU,
+    # so which node it lands on is irrelevant -- the only question is whether a process is
+    # allowed to spread its threads over both sockets while its heap stays first-touched on one.
+    # -NumaNode picks a specific node and needs `start /NODE`, with everything that can go wrong
+    # in cmd -> start -> powershell -> gst-launch; -Confine answers the same question with one
+    # property assignment.
+    [switch] $Confine,
     # Pace with `identity sleep-time` and sync=false instead of the sink's clock wait.
     #
     # Splits the in-process penalty. One process holding 45 chains cost 0.795
@@ -407,7 +417,10 @@ Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
 } else {
     "not demuxed (video branch only)"
 }))
-Write-Host ("      affinity  : {0}" -f $(if ($NumaNode -ge 0) { "HARD, NUMA node $NumaNode only" } else { "none (Windows places it)" }))
+Write-Host ("      affinity  : {0}" -f $(
+    if ($NumaNode -ge 0) { "HARD, NUMA node $NumaNode only" }
+    elseif ($Confine)    { "HARD, confined to its own processor group" }
+    else                 { "none (Windows places it)" }))
 Write-Host ("      pacing    : {0}" -f $(if ($PaceWithSleep) { "identity sleep-time, NO clock" } else { "sink sync=true (shared GstSystemClock)" }))
 # -Processes N wins over -SingleProcess when both are given; N is clamped to [1, Count].
 $groupCount = if ($Processes -gt 0) { [math]::Min([math]::Max($Processes, 1), $Count) }
@@ -424,8 +437,19 @@ Add-Type -Namespace Win32 -Name Topo2 -MemberDefinition @'
 '@ -ErrorAction SilentlyContinue
 function StartDecode($argList, $tag) {
     if ($NumaNode -lt 0) {
-        return Start-Process -FilePath $launch -ArgumentList $argList -WindowStyle Hidden -PassThru `
+        $p = Start-Process -FilePath $launch -ArgumentList $argList -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput "$env:TEMP\decode_$tag.out" -RedirectStandardError "$env:TEMP\decode_$tag.err"
+        if ($Confine) {
+            # Affinity is per-group, so this pins the process to the group it already landed in.
+            # Report failures instead of silently measuring an unconfined run as if it were one.
+            $bits = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]0)
+            try {
+                $p.ProcessorAffinity = [IntPtr]([int64]([uint64]::MaxValue -shr (64 - [int]$bits)))
+            } catch {
+                Write-Warning "could not confine pid $($p.Id) to its group ($bits processors): $($_.Exception.Message)"
+            }
+        }
+        return $p
     }
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
     if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
@@ -455,12 +479,19 @@ function StartDecode($argList, $tag) {
 `$p.WaitForExit()
 "@ | Set-Content -Encoding utf8 $helper
 
+    # Capture what the wrapper itself says. Without this the only symptom is "did not start",
+    # which says nothing about WHICH link in cmd -> start -> powershell -> gst-launch broke --
+    # and this launcher has now been wrong twice for two different reasons.
+    $wrapLog = Join-Path $env:TEMP ("decode_numa_{0}_{1}.wrap" -f $PID, $tag)
     $cmdFile = Join-Path $env:TEMP ("decode_numa_{0}_{1}.cmd" -f $PID, $tag)
     @"
 @echo off
+echo [wrapper] start /NODE $NumaNode /AFFINITY $mask
 start "" /NODE $NumaNode /AFFINITY $mask /B /WAIT powershell -NoProfile -ExecutionPolicy Bypass -File "$helper"
+echo [wrapper] start returned errorlevel %ERRORLEVEL%
 "@ | Set-Content -Encoding ascii $cmdFile
-    Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
+    Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden -Wait:$false `
+        -RedirectStandardOutput $wrapLog -RedirectStandardError "$wrapLog.err" | Out-Null
 
     for ($i = 0; $i -lt 150; $i++) {
         Start-Sleep -Milliseconds 100
@@ -472,6 +503,25 @@ start "" /NODE $NumaNode /AFFINITY $mask /B /WAIT powershell -NoProfile -Executi
             }
         }
     }
+
+    Write-Host ""
+    Write-Warning "The NUMA-pinned launch failed. What each link reported:"
+    Write-Host "  mask         : $mask ($n processors on node $NumaNode)"
+    Write-Host "  helper       : $helper"
+    Write-Host "  gst-launch   : $launch"
+    foreach ($f in @(@{n="wrapper stdout"; p=$wrapLog},
+                     @{n="wrapper stderr"; p="$wrapLog.err"},
+                     @{n="gst-launch stderr"; p="$env:TEMP\decode_$tag.err"})) {
+        if (Test-Path $f.p) {
+            $text = (Get-Content $f.p -Raw -EA SilentlyContinue)
+            if ($text -and $text.Trim()) {
+                Write-Host ("  {0}:" -f $f.n)
+                ($text -split "`n") | Select-Object -First 8 | ForEach-Object { Write-Host "    $_" }
+            } else { Write-Host ("  {0}: (empty)" -f $f.n) }
+        } else { Write-Host ("  {0}: (no file -- that link never ran)" -f $f.n) }
+    }
+    Write-Host "  Re-run without -NumaNode to get the unpinned number; the pinning is the"
+    Write-Host "  experiment, not a prerequisite for the measurement."
     throw "gst-launch did not start within 15s under 'start /NODE $NumaNode /AFFINITY $mask'"
 }
 
