@@ -56,6 +56,9 @@ servo-media-gstreamer-render-android = { workspace = true }
 servo-media-gstreamer-render-d3d11 = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    # GROUP_AFFINITY / GetNumaNodeProcessorMaskEx live here; the rest of the NUMA pinning
+    # (SetThreadGroupAffinity) is under Win32_System_Threading.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

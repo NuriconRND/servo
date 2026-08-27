@@ -24,8 +24,10 @@ mod imp {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use log::info;
+    use windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
     use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, GetCurrentThreadId, SetThreadDescription,
+        GetCurrentThread, GetCurrentThreadId, GetNumaHighestNodeNumber, GetNumaNodeProcessorMaskEx,
+        SetThreadDescription, SetThreadGroupAffinity,
     };
 
     thread_local! {
@@ -40,18 +42,70 @@ mod imp {
     static AUDIO_THREADS: AtomicUsize = AtomicUsize::new(0);
 
     pub fn tag_video_streaming_thread() {
-        tag("ServoGstVideo", &VIDEO_THREADS);
+        let index = tag("ServoGstVideo", &VIDEO_THREADS);
+        // `tag` returns usize::MAX when this thread was already tagged; pinning is a
+        // once-per-thread action, so skip that case.
+        if index != usize::MAX && servo_config::pref!(media_numa_pin_streaming_threads) {
+            pin_to_node(index);
+        }
+    }
+
+    /// Pin this streaming thread to one NUMA node, round-robin by video index.
+    ///
+    /// ***The point is memory, not cores.*** Threads already reach both sockets when nothing
+    /// pins them -- that is the 1.005 cores-per-video case. What they do not get is local
+    /// memory: the heap is first-touched on whichever node ran first, Windows then migrates
+    /// the thread, and every 3.1MB frame afterwards crosses the interconnect. Hard-confining
+    /// the whole process to one node fixes the locality and takes away half the physical
+    /// cores instead (0.735, with SMT saturating at 54 videos).
+    ///
+    /// Nailing each thread to a node gets both: what it allocates lands on its node and it
+    /// is the one that reads it back, and the videos split evenly over all 40 physical cores.
+    ///
+    /// Failures are silent by design -- an unpinned thread still decodes correctly, and this
+    /// is a performance knob, not a correctness one. The THREADMAP line records what was
+    /// asked for, so `thread_cpu_probe`'s group breakdown can confirm it actually happened.
+    fn pin_to_node(index: usize) {
+        // SAFETY: both calls only read static topology into out-parameters.
+        let mut highest: u32 = 0;
+        if unsafe { GetNumaHighestNodeNumber(&mut highest) } == 0 {
+            return;
+        }
+        let nodes = highest as usize + 1;
+        if nodes < 2 {
+            return; // one node: nothing to spread across
+        }
+        let node = (index % nodes) as u16;
+        let mut affinity: GROUP_AFFINITY = unsafe { std::mem::zeroed() };
+        // SAFETY: `affinity` is a zeroed out-parameter sized by the API.
+        if unsafe { GetNumaNodeProcessorMaskEx(node, &mut affinity) } == 0 {
+            return;
+        }
+        // SAFETY: GetCurrentThread returns a pseudo-handle that must not be closed, and
+        // `affinity` was filled by the call above. A null previous-affinity out-param is
+        // allowed and means "do not report it".
+        unsafe {
+            SetThreadGroupAffinity(GetCurrentThread(), &affinity, std::ptr::null_mut());
+        }
+        info!(
+            target: "media",
+            "THREADMAP numa pin: ServoGstVideo-{index} -> node {node} (group {}, mask 0x{:x})",
+            affinity.Group, affinity.Mask
+        );
     }
 
     pub fn tag_audio_streaming_thread() {
-        tag("ServoGstAudio", &AUDIO_THREADS);
+        let _ = tag("ServoGstAudio", &AUDIO_THREADS);
     }
 
-    fn tag(kind: &str, counter: &AtomicUsize) {
+    /// Returns this thread's index within its kind, or `usize::MAX` if it was already tagged
+    /// (so a caller that acts on the index does so once, on the first callback only).
+    fn tag(kind: &str, counter: &AtomicUsize) -> usize {
         if TAGGED.with(|tagged| tagged.replace(true)) {
-            return;
+            return usize::MAX;
         }
-        let name = format!("{kind}-{}", counter.fetch_add(1, Ordering::Relaxed));
+        let index = counter.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{kind}-{index}");
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` is NUL-terminated and outlives the call, and
         // GetCurrentThread returns a pseudo-handle that must not be closed.
@@ -61,6 +115,7 @@ mod imp {
             GetCurrentThreadId()
         };
         info!(target: "media", "THREADMAP tid={tid} name={name}");
+        index
     }
 }
 
