@@ -58,6 +58,25 @@ param(
     # costs ~1.0, the cost is in-process sharing and not Servo's code; if it stays
     # ~0.4, it is Servo-specific.
     [switch] $SingleProcess,
+    # Split the chains across N processes instead of 1 or Count. 0 = ignore this and use
+    # -SingleProcess / one-per-chain as before.
+    #
+    # ***THE PROCESS BOUNDARY IS WORTH 2.4x AND NOBODY KNOWS WHY.*** Measured 2026-08-27,
+    # 54 x FHD30, identical topology and pacing, same machine:
+    #
+    #   54 processes, 1 chain each : 0.418 cores per video  (1.19x the single-thread ceiling)
+    #   1 process, 54 chains       : 1.005 cores per video  (2.83x)
+    #
+    # Servo's wall sits at 0.99-1.37, i.e. right on the single-process figure -- so the whole
+    # gap the wall has been chasing is this, not anything Servo does. The candidates are heap
+    # contention (54 decoders sharing one allocator, ~1620 frame buffers a second), GStreamer's
+    # per-process globals (caps interning, registry, GType locks -- the same family as the
+    # shared GstSystemClock), and NUMA first-touch putting one process's heap on one node while
+    # its threads spread over both.
+    #
+    # This knob draws the curve that separates them: if cost per video falls smoothly as chains
+    # per process drop, it is contention that eases; if it steps, it is structural.
+    [int]    $Processes = 0,
     # Pace with `identity sleep-time` and sync=false instead of the sink's clock wait.
     #
     # Splits the in-process penalty. One process holding 45 chains cost 0.795
@@ -279,11 +298,32 @@ Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
     "not demuxed (video branch only)"
 }))
 Write-Host ("      pacing    : {0}" -f $(if ($PaceWithSleep) { "identity sleep-time, NO clock" } else { "sink sync=true (shared GstSystemClock)" }))
-Write-Host ("      processes : {0}   max-threads={1}" -f $(if ($SingleProcess) { "1 holding $Count chains" } else { "$Count, one per chain" }), $MaxThreads)
+# -Processes N wins over -SingleProcess when both are given; N is clamped to [1, Count].
+$groupCount = if ($Processes -gt 0) { [math]::Min([math]::Max($Processes, 1), $Count) }
+              elseif ($SingleProcess) { 1 } else { $Count }
+
+$perProc = [math]::Ceiling($Count / [double]$groupCount)
+Write-Host ("      processes : {0}   max-threads={1}" -f $(
+    if ($groupCount -eq 1) { "1 holding $Count chains" }
+    elseif ($groupCount -eq $Count) { "$Count, one per chain" }
+    else { "$groupCount, about $perProc chains each" }), $MaxThreads)
 Write-Host "  window      : ${WarmupSec}s warmup + ${DurationSec}s sample"
 
 $procs = @()
-if ($SingleProcess) {
+if ($groupCount -ne 1 -and $groupCount -ne $Count) {
+    # Deal the chains out round-robin so every process gets within one chain of the same load.
+    $buckets = @{}
+    for ($i = 0; $i -lt $Count; $i++) {
+        $b = $i % $groupCount
+        if (-not $buckets.ContainsKey($b)) { $buckets[$b] = @() }
+        $buckets[$b] += DecodePipeline "true"
+    }
+    foreach ($b in ($buckets.Keys | Sort-Object)) {
+        $procs += Start-Process -FilePath $launch -ArgumentList $buckets[$b] `
+            -WindowStyle Hidden -PassThru -RedirectStandardOutput "$env:TEMP\decode_$b.out" `
+            -RedirectStandardError "$env:TEMP\decode_$b.err"
+    }
+} elseif ($groupCount -eq 1) {
     # gst-launch builds ONE pipeline; several disconnected chains in one argument list all
     # run inside it, which is exactly the in-process arrangement the wall has.
     $chains = @()
@@ -359,13 +399,14 @@ if ($alive -lt $startAlive) {
 
 $busyCores = ($cpu1 - $cpu0) / $wall
 Write-Host ""
-Write-Host ("results over {0:N1}s ({1})" -f $wall, $(if ($SingleProcess) {
-    "1 process holding $Count chains"
-} else {
-    "$alive/$Count pipelines alive throughout"
-}))
+Write-Host ("results over {0:N1}s ({1})" -f $wall, $(
+    if ($groupCount -eq 1) { "1 process holding $Count chains" }
+    elseif ($groupCount -eq $Count) { "$alive/$Count pipelines alive throughout" }
+    else { "$alive/$groupCount processes alive, $Count chains total" }))
 Write-Host ("  decode CPU        : {0:N2} cores busy  ({1:N1}% of {2} logical)" -f $busyCores, (100 * $busyCores / $cores), $cores)
-$chainCount = if ($SingleProcess) { $Count } else { [math]::Max($alive, 1) }
+# With several chains per process, a live process still carries all of its chains, so the
+# per-video divisor is the chain count, not the process count.
+$chainCount = if ($groupCount -eq $Count) { [math]::Max($alive, 1) } else { $Count }
 Write-Host ("  per video         : {0:N3} cores" -f ($busyCores / $chainCount))
 if ($allCpu0 -and $allCpu1 -and ($allCpu1 -gt $allCpu0)) {
     $allCores = ($allCpu1 - $allCpu0) / $wall
