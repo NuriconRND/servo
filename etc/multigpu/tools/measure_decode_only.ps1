@@ -418,7 +418,7 @@ Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
     "not demuxed (video branch only)"
 }))
 Write-Host ("      affinity  : {0}" -f $(
-    if ($NumaNode -ge 0) { "HARD, NUMA node $NumaNode only" }
+    if ($NumaNode -ge 0) { "NUMA node $NumaNode" + $(if ($Confine) { ", HARD-confined" } else { " (preference)" }) }
     elseif ($Confine)    { "HARD, confined to its own processor group" }
     else                 { "none (Windows places it)" }))
 Write-Host ("      pacing    : {0}" -f $(if ($PaceWithSleep) { "identity sleep-time, NO clock" } else { "sink sync=true (shared GstSystemClock)" }))
@@ -453,12 +453,14 @@ function StartDecode($argList, $tag) {
     }
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
     if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
-    # Mask is interpreted WITHIN the node, so all-ones is exactly that node. Plain hex, no 0x.
-    # ***Not [bigint].ToString("x").*** BigInteger prefixes a sign nibble when the top bit is
-    # set, so a 40-processor node came out as "0ffffffffff" -- eleven digits, 44 bits, wider
-    # than the node -- and `start` refused it without a word, which reads as "gst-launch never
-    # ran". uint64 is exact here because the caller already rejected n > 64.
-    $mask = "{0:x}" -f ([uint64]::MaxValue -shr (64 - [int]$n))
+    # ***`start` gets /NODE and nothing else.*** run_wall_dist.ps1 has been placing the wall
+    # this way since 2026-08-26 and it works on the test machine (six runs, requested node
+    # matched the group the threads ran in 6/6). The version here additionally passed
+    # /AFFINITY <mask>, which was never verified there -- and that is the only difference
+    # between the two. With it, `start` refuses without a word and the symptom is
+    # "gst-launch did not start". Hard confinement is -Confine s job, via ProcessorAffinity,
+    # which needs no `start` at all and can be combined with this.
+    $mask = "{0:x}" -f ([uint64]::MaxValue -shr (64 - [int]$n))   # -Confine only
 
     # ***The chain list goes in a FILE, never on a command line.*** The first cut built a .cmd
     # holding all 54 chains inline; that is well past cmd.exe s 8191-character limit, so the
@@ -486,8 +488,8 @@ function StartDecode($argList, $tag) {
     $cmdFile = Join-Path $env:TEMP ("decode_numa_{0}_{1}.cmd" -f $PID, $tag)
     @"
 @echo off
-echo [wrapper] start /NODE $NumaNode /AFFINITY $mask
-start "" /NODE $NumaNode /AFFINITY $mask /B /WAIT powershell -NoProfile -ExecutionPolicy Bypass -File "$helper"
+echo [wrapper] start /NODE $NumaNode
+start "" /NODE $NumaNode /B /WAIT powershell -NoProfile -ExecutionPolicy Bypass -File "$helper"
 echo [wrapper] start returned errorlevel %ERRORLEVEL%
 "@ | Set-Content -Encoding ascii $cmdFile
     Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden -Wait:$false `
@@ -499,7 +501,14 @@ echo [wrapper] start returned errorlevel %ERRORLEVEL%
             $childPid = (Get-Content $pidFile -Raw).Trim()
             if ($childPid) {
                 $proc = Get-Process -Id ([int]$childPid) -ErrorAction SilentlyContinue
-                if ($proc) { return $proc }
+                if ($proc) {
+                    # /NODE is a preference; -Confine turns it into a hard mask on top.
+                    if ($Confine) {
+                        try { $proc.ProcessorAffinity = [IntPtr]([int64]("0x$mask")) }
+                        catch { Write-Warning "could not confine pid $($proc.Id): $($_.Exception.Message)" }
+                    }
+                    return $proc
+                }
             }
         }
     }
