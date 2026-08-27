@@ -77,6 +77,23 @@ param(
     # This knob draws the curve that separates them: if cost per video falls smoothly as chains
     # per process drop, it is contention that eases; if it steps, it is structural.
     [int]    $Processes = 0,
+    # Confine every launched process to one NUMA node's processors. -1 = do not (default).
+    #
+    # ***This is a HARD affinity, not the preference `start /NODE` gives on its own.*** That
+    # distinction is the whole point: the wall already asks for its GPU's node and still spills,
+    # because a process wanting 54 cores cannot fit in a node's 40 -- so its threads cross to the
+    # far socket while its heap stays first-touched on the near one, which is the worst of both.
+    #
+    # The 2026-08-27 process-split curve says the penalty is a STEP, not a slope: 54 chains in
+    # one process cost 1.001 cores each, 27 chains in each of two cost 0.478, and squeezing on
+    # down to 1 chain per process only reaches 0.412. Chains per process is not the variable;
+    # the number of processes is. That kills the "shared heap / global lock contention" reading
+    # and points at per-process placement instead.
+    #
+    # Which leaves a chicken-and-egg to break: inefficient => needs 54 cores => spills => remote
+    # memory => stays inefficient. At 0.412 the same 54 videos want 22 cores and fit in a node
+    # with room to spare. Forbidding the spill is how to find out which way it settles.
+    [int]    $NumaNode = -1,
     # Pace with `identity sleep-time` and sync=false instead of the sink's clock wait.
     #
     # Splits the in-process penalty. One process holding 45 chains cost 0.795
@@ -150,6 +167,7 @@ if ($Video -eq "") {
 }
 
 $launch = Join-Path $GstRoot "bin\gst-launch-1.0.exe"
+$launchName = "gst-launch-1.0"   # StartDecode 가 새 프로세스를 이름으로 찾는다
 $discover = Join-Path $GstRoot "bin\gst-discoverer-1.0.exe"
 if (!(Test-Path $launch)) { throw "gst-launch-1.0.exe not found: $launch" }
 if ($Video -eq "" -or !(Test-Path $Video)) { throw "video not found (pass -Video): $Video" }
@@ -297,10 +315,44 @@ Write-Host ("      audio     : {0}" -f $(if ($WithAudio) {
 } else {
     "not demuxed (video branch only)"
 }))
+Write-Host ("      affinity  : {0}" -f $(if ($NumaNode -ge 0) { "HARD, NUMA node $NumaNode only" } else { "none (Windows places it)" }))
 Write-Host ("      pacing    : {0}" -f $(if ($PaceWithSleep) { "identity sleep-time, NO clock" } else { "sink sync=true (shared GstSystemClock)" }))
 # -Processes N wins over -SingleProcess when both are given; N is clamped to [1, Count].
 $groupCount = if ($Processes -gt 0) { [math]::Min([math]::Max($Processes, 1), $Count) }
               elseif ($SingleProcess) { 1 } else { $Count }
+
+# Launch one gst-launch, optionally confined to a NUMA node.
+#
+# `start /NODE n` alone only expresses a preference; adding /AFFINITY makes it a hard mask, and
+# the mask is interpreted WITHIN that node, so all-ones covers exactly that node's processors.
+# The wrapper .cmd exists because the redirects have to belong to gst-launch, and `cmd /c` (not
+# the .cmd path) so the wrapper exits instead of lingering as a `cmd /K` holding this folder.
+Add-Type -Namespace Win32 -Name Topo2 -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern uint GetActiveProcessorCount(ushort g);
+'@ -ErrorAction SilentlyContinue
+function StartDecode($argList, $tag) {
+    if ($NumaNode -lt 0) {
+        return Start-Process -FilePath $launch -ArgumentList $argList -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput "$env:TEMP\decode_$tag.out" -RedirectStandardError "$env:TEMP\decode_$tag.err"
+    }
+    $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
+    if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
+    $mask = ([bigint]1 -shl [int]$n) - 1
+    $args = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $cmdFile = Join-Path $env:TEMP ("decode_numa_{0}_{1}.cmd" -f $PID, $tag)
+    @"
+@echo off
+start "" /NODE $NumaNode /AFFINITY 0x$($mask.ToString('x')) /B /WAIT "$launch" $args > "$env:TEMP\decode_$tag.out" 2> "$env:TEMP\decode_$tag.err"
+"@ | Set-Content -Encoding ascii $cmdFile
+    $before = @(Get-Process -Name ($launchName) -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden | Out-Null
+    for ($i = 0; $i -lt 100; $i++) {
+        Start-Sleep -Milliseconds 100
+        $now = @(Get-Process -Name ($launchName) -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
+        if ($now.Count -gt 0) { return $now[0] }
+    }
+    throw "gst-launch did not start within 10s under 'start /NODE $NumaNode'"
+}
 
 $perProc = [math]::Ceiling($Count / [double]$groupCount)
 Write-Host ("      processes : {0}   max-threads={1}" -f $(
@@ -319,23 +371,17 @@ if ($groupCount -ne 1 -and $groupCount -ne $Count) {
         $buckets[$b] += DecodePipeline "true"
     }
     foreach ($b in ($buckets.Keys | Sort-Object)) {
-        $procs += Start-Process -FilePath $launch -ArgumentList $buckets[$b] `
-            -WindowStyle Hidden -PassThru -RedirectStandardOutput "$env:TEMP\decode_$b.out" `
-            -RedirectStandardError "$env:TEMP\decode_$b.err"
+        $procs += StartDecode $buckets[$b] $b
     }
 } elseif ($groupCount -eq 1) {
     # gst-launch builds ONE pipeline; several disconnected chains in one argument list all
     # run inside it, which is exactly the in-process arrangement the wall has.
     $chains = @()
     for ($i = 0; $i -lt $Count; $i++) { $chains += DecodePipeline "true" }
-    $procs += Start-Process -FilePath $launch -ArgumentList $chains `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput "$env:TEMP\decode_0.out" `
-        -RedirectStandardError "$env:TEMP\decode_0.err"
+    $procs += StartDecode $chains 0
 } else {
     for ($i = 0; $i -lt $Count; $i++) {
-        $procs += Start-Process -FilePath $launch -ArgumentList (DecodePipeline "true") `
-            -WindowStyle Hidden -PassThru -RedirectStandardOutput "$env:TEMP\decode_$i.out" `
-            -RedirectStandardError "$env:TEMP\decode_$i.err"
+        $procs += StartDecode (DecodePipeline "true") $i
     }
 }
 Start-Sleep -Seconds $WarmupSec
@@ -387,6 +433,7 @@ if ($clipSec -gt 0 -and ($WarmupSec + $wall) -gt $clipSec) {
 foreach ($p in $procs) { try { Stop-Process -Id $p.Id -Force -EA SilentlyContinue } catch {} }
 Remove-Item "$env:TEMP\decode_*.out" -Force -EA SilentlyContinue
 Remove-Item "$env:TEMP\decode_*.err" -Force -EA SilentlyContinue
+Remove-Item "$env:TEMP\decode_numa_*.cmd" -Force -EA SilentlyContinue
 
 # A pipeline that exits mid-window takes its CPU total with it, which drives the delta
 # negative. Refuse to report rather than print a number that looks like data.
