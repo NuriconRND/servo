@@ -435,20 +435,35 @@ $groupCount = if ($Processes -gt 0) { [math]::Min([math]::Max($Processes, 1), $C
 Add-Type -Namespace Win32 -Name Topo2 -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern uint GetActiveProcessorCount(ushort g);
 '@ -ErrorAction SilentlyContinue
+# Apply the confinement AND prove it took. ***Do not ask anyone to trust that a flag worked.***
+# The previous cut of this passed /AFFINITY to `start`, which refused it without a word; the
+# only symptom was "gst-launch did not start", and three separate wrong theories were chased
+# before the cause turned up. A pinning knob that cannot show its own effect is worse than no
+# knob: it silently produces numbers from an unpinned run and they look like data.
+#
+# So: set it, read it back from the OS, and refuse to measure if the two disagree.
+$script:confineProof = ""
+function Confine-Process($proc) {
+    $bits = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]0)
+    $want = [uint64]::MaxValue -shr (64 - [int]$bits)
+    try {
+        $proc.ProcessorAffinity = [IntPtr]([int64]$want)
+    } catch {
+        throw "-Confine failed on pid $($proc.Id): $($_.Exception.Message). Refusing to report a number from an unconfined run."
+    }
+    $proc.Refresh()
+    $got = [uint64][int64]$proc.ProcessorAffinity
+    if ($got -ne $want) {
+        throw ("-Confine did not take on pid {0}: asked for 0x{1:x}, the OS reports 0x{2:x}. Refusing to report a number from an unconfined run." -f $proc.Id, $want, $got)
+    }
+    $script:confineProof = "0x{0:x} ({1} processors), read back from the OS" -f $got, $bits
+}
+
 function StartDecode($argList, $tag) {
     if ($NumaNode -lt 0) {
         $p = Start-Process -FilePath $launch -ArgumentList $argList -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput "$env:TEMP\decode_$tag.out" -RedirectStandardError "$env:TEMP\decode_$tag.err"
-        if ($Confine) {
-            # Affinity is per-group, so this pins the process to the group it already landed in.
-            # Report failures instead of silently measuring an unconfined run as if it were one.
-            $bits = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]0)
-            try {
-                $p.ProcessorAffinity = [IntPtr]([int64]([uint64]::MaxValue -shr (64 - [int]$bits)))
-            } catch {
-                Write-Warning "could not confine pid $($p.Id) to its group ($bits processors): $($_.Exception.Message)"
-            }
-        }
+        if ($Confine) { Confine-Process $p }
         return $p
     }
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
@@ -503,10 +518,7 @@ echo [wrapper] start returned errorlevel %ERRORLEVEL%
                 $proc = Get-Process -Id ([int]$childPid) -ErrorAction SilentlyContinue
                 if ($proc) {
                     # /NODE is a preference; -Confine turns it into a hard mask on top.
-                    if ($Confine) {
-                        try { $proc.ProcessorAffinity = [IntPtr]([int64]("0x$mask")) }
-                        catch { Write-Warning "could not confine pid $($proc.Id): $($_.Exception.Message)" }
-                    }
+                    if ($Confine) { Confine-Process $proc }
                     return $proc
                 }
             }
@@ -564,6 +576,9 @@ if ($groupCount -ne 1 -and $groupCount -ne $Count) {
         $procs += StartDecode (DecodePipeline "true") $i
     }
 }
+# Printed after launch, not in the header above: the proof does not exist until the process
+# is running and the OS has been asked what its affinity actually is.
+if ($script:confineProof) { Write-Host ("  confined    : {0}" -f $script:confineProof) }
 Start-Sleep -Seconds $WarmupSec
 
 $t0 = Get-Date
