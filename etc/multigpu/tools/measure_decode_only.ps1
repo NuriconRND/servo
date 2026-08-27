@@ -468,6 +468,9 @@ function StartDecode($argList, $tag) {
     }
     $n = [Win32.Topo2]::GetActiveProcessorCount([System.UInt16]$NumaNode)
     if ($n -le 0 -or $n -gt 64) { throw "NUMA node $NumaNode reports $n processors; cannot build an affinity mask" }
+    # ***`start` needs powershell.exe by full path.*** With /B it does its own lookup and
+    # cannot resolve a bare "powershell": errorlevel 9059, stderr "cannot find the file
+    # powershell", and the only visible symptom is again "gst-launch did not start".
     # ***`start` gets /NODE and nothing else.*** run_wall_dist.ps1 has been placing the wall
     # this way since 2026-08-26 and it works on the test machine (six runs, requested node
     # matched the group the threads ran in 6/6). The version here additionally passed
@@ -504,7 +507,7 @@ function StartDecode($argList, $tag) {
     @"
 @echo off
 echo [wrapper] start /NODE $NumaNode
-start "" /NODE $NumaNode /B /WAIT powershell -NoProfile -ExecutionPolicy Bypass -File "$helper"
+start "" /NODE $NumaNode /B /WAIT "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$helper"
 echo [wrapper] start returned errorlevel %ERRORLEVEL%
 "@ | Set-Content -Encoding ascii $cmdFile
     Start-Process cmd -ArgumentList "/c", "`"$cmdFile`"" -WindowStyle Hidden -Wait:$false `
@@ -543,7 +546,7 @@ echo [wrapper] start returned errorlevel %ERRORLEVEL%
     }
     Write-Host "  Re-run without -NumaNode to get the unpinned number; the pinning is the"
     Write-Host "  experiment, not a prerequisite for the measurement."
-    throw "gst-launch did not start within 15s under 'start /NODE $NumaNode /AFFINITY $mask'"
+    throw "gst-launch did not start within 15s under 'start /NODE $NumaNode'"
 }
 
 $perProc = [math]::Ceiling($Count / [double]$groupCount)
