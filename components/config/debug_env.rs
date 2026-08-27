@@ -251,6 +251,13 @@ pub const FRAME_REASON_PROF: DebugFlag = DebugFlag {
     cache_index: 16,
 };
 
+pub const MEDIA_SINK_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_MEDIA_SINK_PROF",
+    kind: Kind::Str,
+    doc: "비디오 appsink 콜백을 단계별로 재서 1초에 한 줄 찍는다(pace/diag/build/render/          notify). truthy: \"1\"/\"true\"/\"on\"(대소문자 무시). ★D3D11PROF 는 build_frame           '안' 만 본다★ - 45 영상 실측에서 그 안은 프레임당 1.56ms(0.047 코어/영상)로           스레드가 쓰는 0.76 코어의 6% 에 불과했다. 나머지 0.35 코어(디코드 천장 0.36 을           빼고도 남는 몫)는 콜백의 '바깥' 어딘가이고, 후보가 넷뿐이라 재면 바로 갈린다           - 특히 notify 는 프레임마다 IpcSender 전송이라 45 영상이면 초당 1350 회다.           프레임마다 불리는 핫패스라 기본 off.",
+    cache_index: 17,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -271,6 +278,7 @@ pub const ALL: &[&DebugFlag] = &[
     &MEDIA_DISABLE_ENOUGHDATA_BACKOFF,
     &MEDIA_VIDEO_RATE,
     &FRAME_REASON_PROF,
+    &MEDIA_SINK_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

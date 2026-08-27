@@ -275,6 +275,18 @@ FRAMEREASON total=217 window_ms=1001 painter.rs:2030/SCENE=198 painter.rs:2136/S
 한 지점에서 나왔고 영상 도착 경로는 무시할 수준이었다. 런처는 `-FrameReason` 으로
 켜고 종료 후 호출 지점별 초당 횟수를 요약한다.
 
+### `SERVO_MEDIA_SINK_PROF` — `Str`
+
+비디오 appsink 콜백을 단계별로 재서 1초에 한 줄 찍는다(pace/diag/build/render/          notify). truthy: "1"/"true"/"on"(대소문자 무시). ★D3D11PROF 는 build_frame           '안' 만 본다★ - 45 영상 실측에서 그 안은 프레임당 1.56ms(0.047 코어/영상)로           스레드가 쓰는 0.76 코어의 6% 에 불과했다. 나머지 0.35 코어(디코드 천장 0.36 을           빼고도 남는 몫)는 콜백의 '바깥' 어딘가이고, 후보가 넷뿐이라 재면 바로 갈린다           - 특히 notify 는 프레임마다 IpcSender 전송이라 45 영상이면 초당 1350 회다.           프레임마다 불리는 핫패스라 기본 off.
+
+```
+SINKPROF id=3 fr=30 busy_ms=812.4 (pace=740.1 diag=1.2 build=47.0 render=9.8 notify=14.3)
+```
+
+★`pace` 는 CPU 가 아니다★ — `media_video_sink_pacing=thread` 에서 자는 시간이라 코어를
+쓰지 않는다. 단계 합이 벽시계와 맞는지 보려고 함께 찍을 뿐이고, 코어 환산은 나머지
+넷으로 한다. 런처는 `-SinkProf` 로 켠다.
+
 ## wall CLI 플래그
 
 pref 가 아니라 CLI 플래그다. 두 셸이 각자 파싱하지만 **검증과 해석은

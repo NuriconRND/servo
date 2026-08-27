@@ -128,6 +128,16 @@ param(
     # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
     # around 110/s -- yet a single painter was measured at 200+/s. This says who.
     [switch] $FrameReason,
+    # SERVO_MEDIA_SINK_PROF=1: one line per second per video splitting the appsink callback into
+    # pace / diag / build / render / notify.
+    #
+    # ***D3D11PROF only sees inside build_frame, and that turned out to be 6% of the thread.***
+    # 45 videos measured 1.56 ms per frame there (0.047 cores per video) while the streaming
+    # thread actually burns 0.76. Subtract the 0.36 pure-decode ceiling and 0.35 cores per video
+    # -- 16 cores at 45 videos -- are still unaccounted for. Outside build_frame the callback
+    # only does four things, so splitting them names it. notify is the one to watch: it is an
+    # IpcSender send per frame, 1350 a second at 45 videos.
+    [switch] $SinkProf,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -239,6 +249,7 @@ if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
 if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
 if ($NoImmediateComposite) { $env:SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
+if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }

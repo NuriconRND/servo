@@ -1365,6 +1365,57 @@ impl SeekChannel {
     }
 }
 
+/// 비디오 appsink 콜백의 단계별 시간(env `SERVO_MEDIA_SINK_PROF`). 스트리밍 스레드 하나가
+/// 소유하므로 락이 없다.
+///
+/// ★왜 필요한가★ — `D3D11PROF` 는 `build_frame` **안**만 본다. 45 영상 실측에서 그 안은
+/// 프레임당 1.56ms = 0.047 코어/영상으로, 이 스레드가 실제로 쓰는 0.76 코어의 **6%** 였다.
+/// 순수 디코드 천장 0.36 을 빼도 ***0.35 코어/영상이 설명되지 않는다*** — 45 영상이면 16 코어다.
+/// 콜백에서 `build_frame` 바깥은 넷뿐이라(페이싱/진단/렌더/알림) 단계별로 재면 바로 갈린다.
+/// 특히 `notify` 는 프레임마다 `IpcSender` 전송이라 45 영상이면 초당 1350 회다.
+#[derive(Default)]
+struct SinkStageProf {
+    last_log: Option<Instant>,
+    frames: u64,
+    pace: Duration,
+    diag: Duration,
+    build: Duration,
+    render: Duration,
+    notify: Duration,
+}
+
+impl SinkStageProf {
+    /// 1 초마다 한 줄. 창 안의 **총합**을 찍는다 — 프레임당 평균보다 코어 환산이 직접적이다
+    /// (1 초에 800ms 를 썼다면 그 스레드는 0.8 코어다).
+    fn maybe_log(&mut self, id: usize) {
+        let now = Instant::now();
+        match self.last_log {
+            Some(t) if now.duration_since(t) < Duration::from_secs(1) => return,
+            _ => {},
+        }
+        self.last_log = Some(now);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let total = self.pace + self.diag + self.build + self.render + self.notify;
+        log::warn!(
+            "SINKPROF id={} fr={} busy_ms={:.1} (pace={:.1} diag={:.1} build={:.1} render={:.1} notify={:.1})",
+            id,
+            self.frames,
+            ms(total),
+            ms(self.pace),
+            ms(self.diag),
+            ms(self.build),
+            ms(self.render),
+            ms(self.notify),
+        );
+        self.frames = 0;
+        self.pace = Duration::ZERO;
+        self.diag = Duration::ZERO;
+        self.build = Duration::ZERO;
+        self.render = Duration::ZERO;
+        self.notify = Duration::ZERO;
+    }
+}
+
 pub struct GStreamerPlayer {
     /// The player unique ID.
     id: usize,
@@ -1883,8 +1934,21 @@ impl GStreamerPlayer {
         let sink_pacer = Arc::new(Mutex::new(SinkPacer::default()));
         // Creates a closure that renders a frame using the video_renderer
         // Used in the preroll and sample callbacks
+        let prof_on = servo_config::debug_env::string(
+            &servo_config::debug_env::MEDIA_SINK_PROF,
+        )
+        .is_some_and(|value| {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+        });
         let render_sample = {
             let render = self.render.clone();
+            // One accumulator per video. Arc<Mutex<..>> because this closure is cloned for the
+            // preroll callback and so must be Clone -- and because both callbacks have to add
+            // into the same counters. The lock is uncontended (one streaming thread) and costs
+            // tens of nanoseconds against stages measured in milliseconds.
+            let stage_prof: Arc<Mutex<Option<SinkStageProf>>> =
+                Arc::new(Mutex::new(if prof_on { Some(SinkStageProf::default()) } else { None }));
+            let profile_id = self.id;
             let observer = self.observer.clone();
             let sample_diagnostics = sample_diagnostics.clone();
             let sink_pacer = sink_pacer.clone();
@@ -1894,8 +1958,19 @@ impl GStreamerPlayer {
                 // This closure runs on the video sink's streaming thread --
                 // a GLib thread with no OS name of its own. Latched inside.
                 crate::thread_name::tag_video_streaming_thread();
+                // Stage timing is off unless SERVO_MEDIA_SINK_PROF is set; when off the only
+                // cost is this bool and the `if`s below (no Instant::now at all).
+                let mut prof = stage_prof.lock().unwrap();
+                let mark = |on: bool| if on { Some(Instant::now()) } else { None };
+                let took = |start: Option<Instant>| start.map(|t| t.elapsed()).unwrap_or_default();
+
                 // 싱크가 클럭을 기다리지 않으므로 재생 속도를 여기서 지킨다.
                 // 잠은 락 밖에서 잔다.
+                //
+                // NOTE: the sleep is counted separately and must NOT be read as CPU -- a sleeping
+                // thread burns none. It is timed only so the stages below add up to the wall
+                // clock, making a missing chunk visible.
+                let t = mark(prof_on);
                 if sink_pacing == crate::render::VideoSinkPacing::Thread {
                     let sleep = sink_pacer
                         .lock()
@@ -1905,12 +1980,20 @@ impl GStreamerPlayer {
                         std::thread::sleep(sleep);
                     }
                 }
-                sample_diagnostics.lock().unwrap().note_sample(&sample);
+                if let Some(p) = prof.as_mut() { p.pace += took(t); }
 
-                let Some(frame) = render.lock().unwrap().get_frame_from_sample(sample) else {
+                let t = mark(prof_on);
+                sample_diagnostics.lock().unwrap().note_sample(&sample);
+                if let Some(p) = prof.as_mut() { p.diag += took(t); }
+
+                let t = mark(prof_on);
+                let frame = render.lock().unwrap().get_frame_from_sample(sample);
+                if let Some(p) = prof.as_mut() { p.build += took(t); }
+                let Some(frame) = frame else {
                     return Err(gstreamer::FlowError::Error);
                 };
 
+                let t = mark(prof_on);
                 match weak_video_renderer.upgrade() {
                     Some(video_renderer) => {
                         video_renderer.lock().unwrap().render(frame);
@@ -1919,8 +2002,15 @@ impl GStreamerPlayer {
                         return Err(gstreamer::FlowError::Flushing);
                     },
                 };
+                if let Some(p) = prof.as_mut() { p.render += took(t); }
 
+                let t = mark(prof_on);
                 let _ = notify!(observer, PlayerEvent::VideoFrameUpdated);
+                if let Some(p) = prof.as_mut() {
+                    p.notify += took(t);
+                    p.frames += 1;
+                    p.maybe_log(profile_id);
+                }
                 Ok(gstreamer::FlowSuccess::Ok)
             }
         };
