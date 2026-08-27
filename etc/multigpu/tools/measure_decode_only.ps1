@@ -170,7 +170,10 @@ $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 for ($up = 0; $up -lt 3 -and $repo; $up++) { $repo = Split-Path -Parent $repo }
 if (-not $repo) { $repo = $PSScriptRoot }
+$gstRootRejected = @()
+$gstRootWhy = "-GstRoot"
 if ($GstRoot -eq "") {
+    $gstRootWhy = "auto"
     # First hit wins: the dist ships its own GStreamer under engine\, then the env var the
     # installers set, then the two well-known roots (dev box, test machine).
     foreach ($candidate in @(
@@ -181,9 +184,17 @@ if ($GstRoot -eq "") {
         "C:\gstreamer\1.0\msvc_x86_64"
     )) {
         if (-not $candidate) { continue }
+        # Require the plugin directory too, not just the executable. A root with gst-launch but
+        # no lib\gstreamer-1.0 is a partial copy, and pointing PATH at it mixes its GLib with
+        # the plugins found elsewhere -- which fails as
+        #   'g_io_module_load': The specified procedure could not be found
+        # at the first gst-launch call, i.e. at the version check, which looks like the version
+        # check being broken when nothing is wrong with it.
+        $hasPlugins = Test-Path (Join-Path $candidate "lib\gstreamer-1.0")
+        if (-not $hasPlugins) { $gstRootRejected += "$candidate (no lib\gstreamer-1.0)"; continue }
         if (Test-Path (Join-Path $candidate "bin\gst-launch-1.0.exe")) { $GstRoot = $candidate; break }
-        # The dist keeps the executables flat in engine\, with no bin\ under it.
-        if (Test-Path (Join-Path $candidate "gst-launch-1.0.exe"))      { $GstRoot = $candidate; break }
+        if (Test-Path (Join-Path $candidate "gst-launch-1.0.exe"))            { $GstRoot = $candidate; break }
+        $gstRootRejected += "$candidate (no gst-launch-1.0.exe)"
     }
 }
 if ($Video -eq "") {
@@ -228,7 +239,37 @@ if ($HighLevel -ne '') {
     ) | ForEach-Object { "${_}:NONE" }) -join ','
 }
 
-$version = (& $launch --version 2>&1 | Select-Object -First 1)
+# ***A native command writing to stderr is a terminating error under $ErrorActionPreference =
+# Stop.*** So one line of DLL noise from gst-launch killed the whole script here, printing a
+# PowerShell trace that pointed at this line and made the version check look like the fault.
+# Run it with errors demoted and report what we picked, so the next failure is diagnosable.
+$version = "unknown"
+try {
+    $prevEA = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $versionOut = & $launch --version 2>&1
+    $ErrorActionPreference = $prevEA
+    $firstLine = ($versionOut | Where-Object { $_ -is [string] -and $_ -match "gst-launch" } | Select-Object -First 1)
+    if ($firstLine) { $version = $firstLine }
+    else {
+        Write-Host ""
+        Write-Warning "gst-launch-1.0.exe could not report its version. It is not the version check that is broken -- gst-launch itself failed to start."
+        Write-Host "  chosen GstRoot : $GstRoot   (by $gstRootWhy)"
+        Write-Host "  executable     : $launch"
+        Write-Host "  plugin path    : $env:GST_PLUGIN_SYSTEM_PATH_1_0"
+        if ($gstRootRejected.Count) { Write-Host ("  rejected       : {0}" -f ($gstRootRejected -join "; ")) }
+        Write-Host "  GSTREAMER_1_0_ROOT_MSVC_X86_64 = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64"
+        Write-Host "  what it said   :"
+        $versionOut | ForEach-Object { Write-Host "    $_" }
+        Write-Host "  A 'procedure could not be found' here means mixed GLib DLLs: gst-launch is"
+        Write-Host "  loading a gio/glib from somewhere other than its own install. Pass -GstRoot"
+        Write-Host "  <root> to pick the install explicitly."
+        throw "gst-launch-1.0.exe failed to run; see above"
+    }
+} catch {
+    if ($_.Exception.Message -notlike "gst-launch-1.0.exe failed to run*") { throw }
+    throw
+}
 $cores = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
 $physical = ((Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum)
 
@@ -244,6 +285,7 @@ if (Test-Path $discover) {
 
 Write-Host "decode-only baseline"
 Write-Host "  gstreamer   : $version"
+Write-Host "  gst root    : $GstRoot   (by $gstRootWhy)"
 Write-Host "  video       : $Video"
 Write-Host ("  clip length : {0}" -f $(if ($clipSec -gt 0) { "{0:N2}s" -f $clipSec } else { "UNKNOWN (gst-discoverer missing)" }))
 Write-Host "  cpus        : $cores logical / $physical physical"
