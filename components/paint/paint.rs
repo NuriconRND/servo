@@ -129,6 +129,10 @@ pub struct Paint {
     /// Total wall frame requests released by the latest-first pacer.
     wall_frame_pacing_released_count: Cell<u64>,
 
+    /// Which pacing gate blocked each coalesced request. See [`WallFramePacingBlockTally`]
+    /// for why a zero in one of these does not mean that gate never binds.
+    wall_frame_pacing_block_tally: WallFramePacingBlockTally,
+
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
     pub(crate) paint_proxy: PaintProxy,
@@ -218,6 +222,38 @@ enum WallFramePacingBlockReason {
     Active(WebViewId),
     Pending(usize),
     TooSoon(WebViewId, f64),
+}
+
+/// How many wall frame requests each pacing gate blocked.
+///
+/// `total_coalesced` alone says the pacer is holding frames back but not WHICH gate is
+/// doing it, and the three gates lead to completely different conclusions: `Pending` means
+/// WebRender is still busy (the pacer is a symptom, not the cause), `TooSoon` means the
+/// `gfx_wall_frame_min_interval_ms` knob is the limit, and `Active` means a previous wall
+/// frame's barrier has not completed.
+///
+/// ***These count the gate that blocked a request, not every gate that would have.***
+/// `wall_frame_request_pacing_block_reason` returns the FIRST match in the order
+/// Active -> Pending -> TooSoon, so an earlier gate masks the later ones: a zero here does
+/// NOT mean that gate never binds. Active and Pending very nearly coincide at the default
+/// `gfx_wall_frame_max_pending=1`, and Active is checked first, so read a low Pending count
+/// as "Active got there first", not as "pending frames are not a constraint".
+#[derive(Default)]
+struct WallFramePacingBlockTally {
+    active: Cell<u64>,
+    pending: Cell<u64>,
+    too_soon: Cell<u64>,
+}
+
+impl WallFramePacingBlockTally {
+    fn record(&self, reason: &WallFramePacingBlockReason) {
+        let counter = match reason {
+            WallFramePacingBlockReason::Active(_) => &self.active,
+            WallFramePacingBlockReason::Pending(_) => &self.pending,
+            WallFramePacingBlockReason::TooSoon(_, _) => &self.too_soon,
+        };
+        counter.set(counter.get() + 1);
+    }
 }
 
 struct KeepPreviousFrame {
@@ -944,6 +980,7 @@ impl Paint {
             wall_frame_pacing_next_wake_at: Default::default(),
             wall_frame_pacing_coalesced_count: Default::default(),
             wall_frame_pacing_released_count: Default::default(),
+            wall_frame_pacing_block_tally: Default::default(),
         }))
     }
 
@@ -1295,6 +1332,8 @@ impl Paint {
             return;
         };
 
+        self.wall_frame_pacing_block_tally.record(&block_reason);
+
         let pending_max = match block_reason {
             WallFramePacingBlockReason::Active(_) => {
                 self.max_pending_frames_for_targets(&request.target_painter_ids)
@@ -1399,10 +1438,14 @@ impl Paint {
             return;
         }
 
+        // The tally goes AFTER `policy=`, which is where the log parser's regex stops
+        // (wall_perf_analyzer/analyze_wall_perf.py, `PACING_SUMMARY_RE`). Appending keeps
+        // older parsers matching; inserting in the middle would break them.
         info!(
             "Wall frame pacing summary: event={} webview={:?} logical_frame_id={:?} \
              target_painters={:?} pending_max={} coalesced_for_webview={} \
-             total_coalesced={} total_released={} policy=latest-first",
+             total_coalesced={} total_released={} policy=latest-first \
+             blocked_by_active={} blocked_by_pending={} blocked_by_min_interval={}",
             event,
             webview_id,
             logical_frame_id,
@@ -1411,6 +1454,9 @@ impl Paint {
             coalesced_for_webview,
             total_coalesced,
             total_released,
+            self.wall_frame_pacing_block_tally.active.get(),
+            self.wall_frame_pacing_block_tally.pending.get(),
+            self.wall_frame_pacing_block_tally.too_soon.get(),
         );
     }
 

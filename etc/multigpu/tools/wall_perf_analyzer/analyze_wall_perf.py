@@ -56,6 +56,11 @@ PACING_SUMMARY_RE = re.compile(
     r"total_coalesced=(?P<total_coalesced>\d+) "
     r"total_released=(?P<total_released>\d+) "
     r"policy=(?P<policy>\S+)"
+    # Optional on purpose: logs captured before the per-reason tally existed must keep
+    # parsing, otherwise every archived run silently reports zero pacing summaries.
+    r"(?: blocked_by_active=(?P<blocked_active>\d+)"
+    r" blocked_by_pending=(?P<blocked_pending>\d+)"
+    r" blocked_by_min_interval=(?P<blocked_min_interval>\d+))?"
 )
 BARRIER_COMPLETE_RE = re.compile(
     r"Wall frame barrier complete: logical_frame_id=(?P<logical>\d+) "
@@ -209,6 +214,11 @@ class LogSummary:
     wall_frame_pacing_released: int = 0
     wall_frame_pacing_summaries: int = 0
     wall_frame_pacing_max_pending: int = 0
+    # Which gate blocked. Counts the FIRST matching gate (Active -> Pending -> TooSoon), so
+    # an earlier gate masks the later ones -- a zero does not prove that gate never binds.
+    wall_frame_pacing_blocked_active: int = 0
+    wall_frame_pacing_blocked_pending: int = 0
+    wall_frame_pacing_blocked_min_interval: int = 0
     media_frames: int = 0
     media_frame_summaries: int = 0
     media_frame_summary_frames: int = 0
@@ -323,6 +333,11 @@ class LogSummary:
                 "wall_frame_pacing_released": self.wall_frame_pacing_released,
                 "wall_frame_pacing_summaries": self.wall_frame_pacing_summaries,
                 "wall_frame_pacing_max_pending": self.wall_frame_pacing_max_pending,
+                "wall_frame_pacing_blocked_active": self.wall_frame_pacing_blocked_active,
+                "wall_frame_pacing_blocked_pending": self.wall_frame_pacing_blocked_pending,
+                "wall_frame_pacing_blocked_min_interval": (
+                    self.wall_frame_pacing_blocked_min_interval
+                ),
                 "media_frames": self.media_frames,
                 "media_frame_summaries": self.media_frame_summaries,
                 "media_frame_summary_frames": self.media_frame_summary_frames,
@@ -567,6 +582,15 @@ def analyze_log(path: Path) -> LogSummary:
                     summary.wall_frame_pacing_released,
                         int(match.group("total_released")),
                     )
+                # Cumulative in the log, so take the highest seen rather than summing.
+                for group, field in (
+                    ("blocked_active", "wall_frame_pacing_blocked_active"),
+                    ("blocked_pending", "wall_frame_pacing_blocked_pending"),
+                    ("blocked_min_interval", "wall_frame_pacing_blocked_min_interval"),
+                ):
+                    value = match.group(group)
+                    if value is not None:
+                        setattr(summary, field, max(getattr(summary, field), int(value)))
 
             if match := GST_VIDEO_SAMPLE_RE.search(line):
                 summary.gst_video_samples += 1
@@ -808,6 +832,14 @@ def to_markdown(results: list[dict[str, object]]) -> str:
                     f"{counts['wall_frame_pacing_released']} "
                     f"(summaries={counts['wall_frame_pacing_summaries']}, "
                     f"max_pending={counts['wall_frame_pacing_max_pending']})"
+                ),
+                (
+                    f"- Wall frame pacing blocked by "
+                    f"active/pending/min_interval: "
+                    f"{counts['wall_frame_pacing_blocked_active']} / "
+                    f"{counts['wall_frame_pacing_blocked_pending']} / "
+                    f"{counts['wall_frame_pacing_blocked_min_interval']} "
+                    f"(first matching gate only; an earlier gate masks later ones)"
                 ),
                 f"- Present balance: {present['tile_present_counts']} spread={present['spread']}",
                 (
