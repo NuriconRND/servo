@@ -991,6 +991,11 @@ impl PlayerInner {
             return Ok(());
         }
         self.set_pipeline_playing();
+        // `Play` 경로에서는 `connect_state_changed` 가 채워 주는 값이다. 직접 파이프라인
+        // 경로에는 그 신호가 없으므로 여기서 채운다 - 버스 핸들러에서 하면 위의 재진입
+        // 데드락이 된다. gapless 워커의 `MaybeEnter` 가 이 값을 보고 SEGMENT 진입을
+        // 결정하므로, 비워 두면 sync group 을 껐을 때 루프가 영영 켜지지 않는다.
+        self.play_state = gstreamer_play::PlayState::Playing;
         Ok(())
     }
 
@@ -1029,6 +1034,7 @@ impl PlayerInner {
         // A real pause request cancels a pending synchronized start hold.
         self.sync_hold.set(false);
         self.set_pipeline_paused();
+        self.play_state = gstreamer_play::PlayState::Paused;
         Ok(())
     }
 
@@ -1590,7 +1596,7 @@ impl GStreamerPlayer {
         self.install_video_sink_callbacks(&video_sink);
         self.install_gapless_and_sync(&inner);
         self.install_direct_bus_watch(&inner, &pipeline);
-        self.install_direct_position_ticker(&pipeline);
+        self.install_direct_position_ticker(&inner, &pipeline);
 
         // PAUSED 로 올려 preroll 시킨다. 메타데이터는 preroll 이 끝나야 알 수 있다
         // (해상도는 caps 에서, 길이는 query_duration 에서).
@@ -1606,8 +1612,15 @@ impl GStreamerPlayer {
     /// 갱신되고, 월 페이지는 **모든** 타일의 `currentTime > 0` 을 확인한 뒤에야 준비
     /// 커버를 걷는다. 프레임은 정상적으로 흐르고 appsink 계측(fps 30.0, pts_rate 1.00x)도
     /// 정상인데 화면만 검은 상태가 되므로, 지표만 보면 재생 중으로 오판하기 쉽다.
-    fn install_direct_position_ticker(&self, pipeline: &gstreamer::Element) {
+    fn install_direct_position_ticker(
+        &self,
+        inner: &Arc<Mutex<PlayerInner>>,
+        pipeline: &gstreamer::Element,
+    ) {
         let observer = self.observer.clone();
+        // Weak so the ticker never keeps the player alive; it exits when either the pipeline
+        // or the inner state is gone.
+        let inner = Arc::downgrade(inner);
         let pipeline = pipeline.downgrade();
         let _ = std::thread::Builder::new()
             .name(String::from("ServoGstPosition"))
@@ -1630,6 +1643,14 @@ impl GStreamerPlayer {
                             "uridecodebin3: position updates started ({:.2}s)",
                             position.seconds_f64()
                         );
+                    }
+                    // ★SEGMENT 진입 재시도도 여기서 해야 한다★ — `Play` 경로의
+                    // `connect_position_updated` 가 매 신호마다 하던 일이다. 워커는
+                    // 재생이 500ms 를 넘긴 뒤에만 진입하므로(기동 중 seek 이 파이프라인을
+                    // 멈춰 죽은 타일을 만든다), 첫 시도는 반드시 실패한다. 주기적으로
+                    // 다시 두드려 주지 않으면 ***gapless 루프가 영원히 켜지지 않는다.***
+                    if let Some(inner) = inner.upgrade() {
+                        inner.lock().unwrap().request_segment_loop_entry();
                     }
                     if notify!(
                         observer,
@@ -1725,6 +1746,13 @@ impl GStreamerPlayer {
                     if state.src().map(|src| src.is::<gstreamer::Pipeline>()) != Some(true) {
                         return;
                     }
+                    // ★여기서 `inner` 를 잠그면 안 된다★ — 이 핸들러는 sync 메시지라
+                    // **상태를 바꾼 그 스레드에서 동기 실행**된다. `PlayerInner::play()` 는
+                    // `inner` 뮤텍스를 쥔 채 `set_state(Playing)` 을 부르므로, 여기서 다시
+                    // 잠그면 같은 스레드가 자기 락을 기다린다(std Mutex 는 재진입 불가).
+                    // 실측: 스크립트 스레드가 첫 play() 에서 굳어 나머지 영상이 영영
+                    // 시작되지 않았다. `play_state` 는 대신 `play()`/`pause()` 가 직접
+                    // 갱신한다 - 거기서는 이미 락을 쥐고 있다.
                     let playback_state = match state.current() {
                         gstreamer::State::Playing => Some(PlaybackState::Playing),
                         gstreamer::State::Paused => Some(PlaybackState::Paused),
