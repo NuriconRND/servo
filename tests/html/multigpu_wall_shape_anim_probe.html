@@ -122,23 +122,29 @@
 
   // 120px = gcd(1920, 1080) 이라 1920/1080/2160/3840 을 모두 나눈다 — 어떤 타일 경계도
   // 항상 주눈금(밝은 선) 위에 온다. 40px 보조눈금은 가드밴드(32px)와 비교할 눈금자다.
-  (function drawGrid() {
+  // 120px = gcd(1920, 1080) 이라 1920/1080/2160/3840 을 모두 나눈다 — 어떤 타일 경계도
+  // 항상 주눈금(밝은 선) 위에 온다. 40px 보조눈금은 가드밴드(32px)와 비교할 눈금자다.
+  //
+  // ★격자는 반드시 뷰포트 크기로 만들 것★ — 처음엔 "넉넉하게" 20000x12000 에 깔았다가
+  // 눈금 800 개 + HUD 1050 개가 되어 ***26fps 로 떨어졌다***(최소 구성은 130fps). 이 페이지는
+  // 표출을 보는 도구이지 부하를 만드는 도구가 아니다.
+  function drawGrid() {
     const g = document.getElementById("grid");
+    g.textContent = "";
     if (g.style.display === "none") return;
-    const W0 = 20000, H0 = 12000;
-    for (let x = 0; x < W0; x += 40) {
+    for (let x = 0; x <= W; x += 40) {
       const d = document.createElement("div");
       d.className = "gl" + (x % 120 === 0 ? " major" : "");
-      d.style.left = x + "px"; d.style.top = "0"; d.style.width = "1px"; d.style.height = H0 + "px";
+      d.style.left = x + "px"; d.style.top = "0"; d.style.width = "1px"; d.style.height = H + "px";
       g.appendChild(d);
     }
-    for (let y = 0; y < H0; y += 40) {
+    for (let y = 0; y <= H; y += 40) {
       const d = document.createElement("div");
       d.className = "gl" + (y % 120 === 0 ? " major" : "");
-      d.style.top = y + "px"; d.style.left = "0"; d.style.height = "1px"; d.style.width = W0 + "px";
+      d.style.top = y + "px"; d.style.left = "0"; d.style.height = "1px"; d.style.width = W + "px";
       g.appendChild(d);
     }
-  })();
+  }
 
   // 가상 뷰포트 크기. 월에서는 이 값이 벽 전체(예: 5760x2160)이고, 타일 창은 그중
   // 일부만 보여준다. 도형은 이 좌표계 안에서 움직이므로 경계를 자연히 넘나든다.
@@ -177,9 +183,11 @@
   // --- CSS 키프레임 열 ------------------------------------------------------
   // rAF 로 움직이는 도형과 **같은 화면에** 두어, 둘의 위상이 타일마다 같은지 본다.
   // CSS 애니메이션은 rAF 와 다른 경로로 갱신되므로 어느 한쪽만 어긋나면 원인이 좁혀진다.
-  if (params.get("css") !== "0") {
+  function drawCssRow() {
     const row = document.getElementById("cssrow");
-    for (let x = 60; x < 20000; x += 240) {
+    row.textContent = "";
+    if (params.get("css") === "0") return;
+    for (let x = 60; x < W; x += 240) {
       const d = document.createElement("div");
       d.className = "kf";
       d.style.left = x + "px";
@@ -187,7 +195,6 @@
       row.appendChild(d);
     }
   }
-
   // --- HUD ------------------------------------------------------------------
   // ★모든 타일이 같은 frame 번호를 보여야 한다★ — 다르면 서로 다른 프레임을 present
   // 중이라는 뜻이다. 타일 크기를 모르므로 격자로 흩뿌려 어느 타일에나 하나는 들어가게 한다.
@@ -198,18 +205,30 @@
     huds.length = 0;
     // 첫 행은 CSS 키프레임 열(위 120px) 아래에서 시작한다 - 겹치면 그 열을 가려
     // rAF 와 CSS 애니메이션을 나란히 볼 수 없다(실측 스크린샷에서 확인).
-    for (let y = 150; y < 20000; y += HUD_STEP) {
-      for (let x = 24; x < 20000; x += HUD_STEP) {
+    for (let y = 150; y < H; y += HUD_STEP) {
+      for (let x = 24; x < W; x += HUD_STEP) {
         const d = document.createElement("div");
         d.className = "hud";
         d.style.left = x + "px";
         d.style.top = y + "px";
+        // 매 프레임 바뀌는 부분만 따로 둔다 - 위치 라벨까지 함께 다시 쓰면 그만큼
+        // 텍스트 레이아웃이 늘어난다. 벽에서는 HUD 가 수십 개다.
+        const live = document.createElement("span");
+        const fixed = document.createElement("span");
+        fixed.textContent = "\n@" + x + "," + y;
+        d.appendChild(live);
+        d.appendChild(fixed);
         hudLayer.appendChild(d);
-        huds.push({ el: d, x, y });
+        huds.push({ live, x, y });
       }
     }
   }
-  layoutHuds();
+  function rebuild() {
+    drawGrid();
+    drawCssRow();
+    layoutHuds();
+  }
+  rebuild();
 
   // --- 애니메이션 루프 ------------------------------------------------------
   // ★rAF 하트비트는 이 월에서 필수다★ — rAF 가 없으면 Servo 가 즉시-합성 경로를 타면서
@@ -247,11 +266,10 @@
     sweep.style.transform  = "translateX(" + ((t * 320) % (W + 10)).toFixed(1) + "px)";
     sweepv.style.transform = "translateY(" + ((t * 170) % (H + 10)).toFixed(1) + "px)";
 
-    const line1 = "frame " + frame;
-    const line2 = "t " + t.toFixed(2) + "s  fps " + fps.toFixed(1);
+    const live = "frame " + frame + "\nt " + t.toFixed(2) + "s  fps " + fps.toFixed(1) +
+      "  worst " + slowest.toFixed(0) + "ms";
     for (const h of huds) {
-      h.el.textContent = line1 + "\n" + line2 + "\n" +
-        "@" + h.x + "," + h.y + "  worst " + slowest.toFixed(0) + "ms";
+      h.live.textContent = live;
     }
     requestAnimationFrame(tick);
   }
@@ -260,6 +278,6 @@
   // 창 크기가 바뀌면(타일 창 리사이즈) 좌표계를 다시 잡는다.
   window.addEventListener("resize", () => {
     W = window.innerWidth; H = window.innerHeight;
-    layoutHuds();
+    rebuild();
   });
 </script>
