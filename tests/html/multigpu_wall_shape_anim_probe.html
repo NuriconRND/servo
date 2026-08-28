@@ -1,0 +1,265 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>multigpu wall shape/animation probe</title>
+<!--
+  월에서 **일반 DOM 도형과 애니메이션**이 제대로 표출되는지 보는 페이지.
+  비디오가 아닌 경로(레이아웃 → 디스플레이 리스트 → WebRender)를 확인한다.
+
+  ★이 월은 하나의 논리 WebView 를 여러 타일 창으로 팬아웃한다★ — 스크립트도 DOM 도
+  한 벌뿐이고, 타일은 같은 장면의 서로 다른 crop 일 뿐이다. 그래서:
+
+    - 도형이 타일 경계에서 어긋나거나 잘리면  -> 좌표/가드밴드 문제
+    - 타일마다 프레임 번호가 다르면            -> 서로 다른 프레임을 present 중(배리어)
+    - 한 타일만 굳으면                         -> 그 painter 문제
+
+  판정에 쓰는 것은 화면에 흩뿌린 HUD 다. 모든 타일이 **같은 frame 번호**를 보여야 한다.
+
+  쿼리 파라미터:
+    ?shapes=N     궤도 도형 수 (기본 24)
+    ?speed=F      전체 속도 배수 (기본 1)
+    ?hud=PX       HUD 격자 간격 (기본 480) — 타일보다 촘촘해야 모든 타일에 하나는 들어간다
+    ?css=0        CSS 키프레임 애니메이션 열을 끈다(rAF 와 비교용)
+    ?grid=0       배경 눈금 끄기
+
+  주의: Servo 는 `layout.grid.enabled` 가 기본 false 라 **CSS Grid 를 쓰지 않는다**.
+  배치는 전부 absolute / flex 다.
+-->
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0b12; }
+  body { font-family: monospace; color: #d8d8e8; }
+
+  /* 120px = gcd(1920, 1080). 1920/1080/2160/3840 을 모두 나누므로 어떤 타일 경계도
+     항상 주눈금 위에 온다 — 도형이 경계에서 밀렸는지 눈으로 재는 기준자다. */
+  /* ★눈금은 `repeating-linear-gradient` 로 그리지 말 것★ — 이 Servo 는 그걸 아무것도
+     그리지 않는다(실측: 눈금이 통째로 안 보였다). 평범한 `linear-gradient` 는 정상이라
+     도형·스윕 막대는 잘 나온다. 그래서 눈금은 실제 1px 요소로 깐다 — 겸사겸사 작은 박스
+     수십 개의 레이아웃/합성도 함께 시험된다.
+     `inset: 0` 단축도 쓰지 않는다 — 네 방향을 명시하는 편이 안전하다. */
+  #grid { position: absolute; left: 0; top: 0; right: 0; bottom: 0; pointer-events: none; }
+  .gl { position: absolute; background: #2f2f4d; }
+  .gl.major { background: #55558c; }
+
+  .layer { position: absolute; left: 0; top: 0; right: 0; bottom: 0; pointer-events: none; }
+
+  /* --- 궤도 도형: 경계를 계속 넘나든다 ------------------------------------ */
+  .orb { position: absolute; left: 0; top: 0; will-change: transform; }
+  .orb .body { width: 100%; height: 100%; }
+
+  /* 채움/테두리/둥근모서리/링 — 서로 다른 래스터 경로를 하나씩 태운다. */
+  .fill   { background: #4fc3f7; }
+  .circle { background: #ffb74d; border-radius: 50%; }
+  .ring   { border: 6px solid #81c784; border-radius: 50%; box-sizing: border-box; }
+  .rrect  { background: #ba68c8; border-radius: 14px; }
+  .grad   { background: linear-gradient(135deg, #ff5370 0%, #f78c6c 50%, #ffcb6b 100%); }
+  /* ★블러 그림자는 타일 경계에서 잘리기 쉬운 것★ — overlapPx 가드밴드가 이걸 위해 있다. */
+  .glow   { background: #26c6da; border-radius: 50%; box-shadow: 0 0 28px 10px rgba(38,198,218,.55); }
+  /* CSS 삼각형(테두리 트릭). 비직사각 클립 경로 확인용. */
+  .tri {
+    width: 0 !important; height: 0 !important;
+    border-left: 22px solid transparent; border-right: 22px solid transparent;
+    border-bottom: 38px solid #f06292;
+  }
+
+  /* --- 가로로 훑는 막대: 모든 세로 경계를 지나간다 ------------------------ */
+  #sweep {
+    position: absolute; top: 0; bottom: 0; width: 10px;
+    background: linear-gradient(to bottom, #ffd54f, #ff7043);
+    box-shadow: 0 0 24px 6px rgba(255,167,38,.45);
+    will-change: transform;
+  }
+  /* 세로로 훑는 막대: 모든 가로 경계를 지나간다. */
+  #sweepv {
+    position: absolute; left: 0; right: 0; height: 10px;
+    background: linear-gradient(to right, #64b5f6, #7e57c2);
+    opacity: .85; will-change: transform;
+  }
+
+  /* --- CSS 키프레임 열 (rAF 와 비교) -------------------------------------- */
+  #cssrow { position: absolute; left: 0; right: 0; top: 0; height: 120px; }
+  .kf {
+    position: absolute; top: 30px; width: 60px; height: 60px;
+    background: #90a4ae; border-radius: 10px;
+    animation: spin 2s linear infinite, hue 6s linear infinite;
+  }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes hue  {
+    0%   { background: #90a4ae; }
+    33%  { background: #ef5350; }
+    66%  { background: #66bb6a; }
+    100% { background: #90a4ae; }
+  }
+  /* 투명도 펄스: 합성 단계에서 알파가 타일마다 같은지 본다. */
+  .pulse { animation: fade 3s ease-in-out infinite; }
+  @keyframes fade { 0%,100% { opacity: 1; } 50% { opacity: .15; } }
+
+  /* --- HUD: 판정의 근거 ---------------------------------------------------- */
+  .hud {
+    position: absolute; padding: 4px 8px;
+    background: rgba(0,0,0,.72); border: 1px solid #3b3b5c; border-radius: 6px;
+    font: bold 20px/1.25 monospace; color: #ffe082; white-space: pre;
+    pointer-events: none;
+  }
+  .hud .small { font-weight: normal; font-size: 13px; color: #9fa8da; }
+</style>
+
+<div id="grid"></div>
+<div class="layer" id="orbs"></div>
+<div class="layer" id="cssrow"></div>
+<div class="layer" id="hudlayer"></div>
+<div id="sweep"></div>
+<div id="sweepv"></div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const intParam = (name, dflt, lo, hi) => {
+    const n = parseInt(params.get(name), 10);
+    return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : dflt;
+  };
+  const SHAPES   = intParam("shapes", 24, 1, 400);
+  const HUD_STEP = intParam("hud", 480, 120, 4000);
+  const SPEED    = (parseFloat(params.get("speed")) || 1) || 1;
+  if (params.get("grid") === "0") document.getElementById("grid").style.display = "none";
+
+  // 120px = gcd(1920, 1080) 이라 1920/1080/2160/3840 을 모두 나눈다 — 어떤 타일 경계도
+  // 항상 주눈금(밝은 선) 위에 온다. 40px 보조눈금은 가드밴드(32px)와 비교할 눈금자다.
+  (function drawGrid() {
+    const g = document.getElementById("grid");
+    if (g.style.display === "none") return;
+    const W0 = 20000, H0 = 12000;
+    for (let x = 0; x < W0; x += 40) {
+      const d = document.createElement("div");
+      d.className = "gl" + (x % 120 === 0 ? " major" : "");
+      d.style.left = x + "px"; d.style.top = "0"; d.style.width = "1px"; d.style.height = H0 + "px";
+      g.appendChild(d);
+    }
+    for (let y = 0; y < H0; y += 40) {
+      const d = document.createElement("div");
+      d.className = "gl" + (y % 120 === 0 ? " major" : "");
+      d.style.top = y + "px"; d.style.left = "0"; d.style.height = "1px"; d.style.width = W0 + "px";
+      g.appendChild(d);
+    }
+  })();
+
+  // 가상 뷰포트 크기. 월에서는 이 값이 벽 전체(예: 5760x2160)이고, 타일 창은 그중
+  // 일부만 보여준다. 도형은 이 좌표계 안에서 움직이므로 경계를 자연히 넘나든다.
+  let W = window.innerWidth, H = window.innerHeight;
+
+  // --- 궤도 도형 ------------------------------------------------------------
+  // 궤도 중심을 화면 폭에 걸쳐 흩어 놓아 **모든 세로 경계 위에 중심이 하나씩** 오도록
+  // 한다. 경계에 걸친 도형이 이 페이지의 핵심 관찰 대상이다.
+  const KINDS = ["fill", "circle", "ring", "rrect", "grad", "glow", "tri"];
+  const orbsEl = document.getElementById("orbs");
+  const orbs = [];
+  for (let i = 0; i < SHAPES; i++) {
+    const el = document.createElement("div");
+    el.className = "orb";
+    const kind = KINDS[i % KINDS.length];
+    const size = 34 + (i % 5) * 12;
+    el.style.width = size + "px";
+    el.style.height = size + "px";
+    const body = document.createElement("div");
+    body.className = "body " + kind + (i % 3 === 0 ? " pulse" : "");
+    el.appendChild(body);
+    orbsEl.appendChild(el);
+    orbs.push({
+      el,
+      size,
+      // 중심을 폭 방향으로 고르게 퍼뜨린다(경계마다 하나씩 걸리도록).
+      cx: (i + 0.5) / SHAPES,
+      cy: 0.30 + 0.40 * ((i % 3) / 2),
+      r: 90 + (i % 4) * 55,
+      w: (0.35 + (i % 7) * 0.08) * (i % 2 ? 1 : -1),
+      phase: (i / SHAPES) * Math.PI * 2,
+      spin: (i % 2 ? 1 : -1) * (30 + (i % 5) * 25),
+    });
+  }
+
+  // --- CSS 키프레임 열 ------------------------------------------------------
+  // rAF 로 움직이는 도형과 **같은 화면에** 두어, 둘의 위상이 타일마다 같은지 본다.
+  // CSS 애니메이션은 rAF 와 다른 경로로 갱신되므로 어느 한쪽만 어긋나면 원인이 좁혀진다.
+  if (params.get("css") !== "0") {
+    const row = document.getElementById("cssrow");
+    for (let x = 60; x < 20000; x += 240) {
+      const d = document.createElement("div");
+      d.className = "kf";
+      d.style.left = x + "px";
+      d.style.animationDelay = (-(x / 240) * 0.1) + "s";
+      row.appendChild(d);
+    }
+  }
+
+  // --- HUD ------------------------------------------------------------------
+  // ★모든 타일이 같은 frame 번호를 보여야 한다★ — 다르면 서로 다른 프레임을 present
+  // 중이라는 뜻이다. 타일 크기를 모르므로 격자로 흩뿌려 어느 타일에나 하나는 들어가게 한다.
+  const hudLayer = document.getElementById("hudlayer");
+  const huds = [];
+  function layoutHuds() {
+    hudLayer.textContent = "";
+    huds.length = 0;
+    // 첫 행은 CSS 키프레임 열(위 120px) 아래에서 시작한다 - 겹치면 그 열을 가려
+    // rAF 와 CSS 애니메이션을 나란히 볼 수 없다(실측 스크린샷에서 확인).
+    for (let y = 150; y < 20000; y += HUD_STEP) {
+      for (let x = 24; x < 20000; x += HUD_STEP) {
+        const d = document.createElement("div");
+        d.className = "hud";
+        d.style.left = x + "px";
+        d.style.top = y + "px";
+        hudLayer.appendChild(d);
+        huds.push({ el: d, x, y });
+      }
+    }
+  }
+  layoutHuds();
+
+  // --- 애니메이션 루프 ------------------------------------------------------
+  // ★rAF 하트비트는 이 월에서 필수다★ — rAF 가 없으면 Servo 가 즉시-합성 경로를 타면서
+  // 이벤트 루프를 압도해 창 조작이 굶는다(video_grid 페이지에 같은 주석이 있다).
+  // 이 페이지는 어차피 rAF 로 그리므로 그 조건을 자연히 만족한다.
+  const sweep = document.getElementById("sweep");
+  const sweepv = document.getElementById("sweepv");
+  const t0 = performance.now();
+  let frame = 0, fps = 0, fpsFrames = 0, fpsAt = t0, slowest = 0, lastAt = t0;
+
+  function tick(now) {
+    frame++;
+    const t = ((now - t0) / 1000) * SPEED;
+
+    // 프레임 간격의 최악값 — 한 타일만 끊기는 것이 아니라 전체가 끊기는지 구분한다.
+    const dt = now - lastAt;
+    lastAt = now;
+    if (frame > 30 && dt > slowest) slowest = dt;
+    fpsFrames++;
+    if (now - fpsAt >= 500) {
+      fps = (fpsFrames * 1000) / (now - fpsAt);
+      fpsFrames = 0; fpsAt = now;
+    }
+
+    for (const o of orbs) {
+      const a = o.phase + t * o.w;
+      const x = o.cx * W + Math.cos(a) * o.r - o.size / 2;
+      const y = o.cy * H + Math.sin(a) * o.r - o.size / 2;
+      o.el.style.transform =
+        "translate(" + x.toFixed(1) + "px," + y.toFixed(1) + "px) rotate(" +
+        (t * o.spin).toFixed(1) + "deg)";
+    }
+
+    // 톱니파로 좌->우, 위->아래를 반복해 모든 경계를 지난다.
+    sweep.style.transform  = "translateX(" + ((t * 320) % (W + 10)).toFixed(1) + "px)";
+    sweepv.style.transform = "translateY(" + ((t * 170) % (H + 10)).toFixed(1) + "px)";
+
+    const line1 = "frame " + frame;
+    const line2 = "t " + t.toFixed(2) + "s  fps " + fps.toFixed(1);
+    for (const h of huds) {
+      h.el.textContent = line1 + "\n" + line2 + "\n" +
+        "@" + h.x + "," + h.y + "  worst " + slowest.toFixed(0) + "ms";
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // 창 크기가 바뀌면(타일 창 리사이즈) 좌표계를 다시 잡는다.
+  window.addEventListener("resize", () => {
+    W = window.innerWidth; H = window.innerHeight;
+    layoutHuds();
+  });
+</script>

@@ -97,6 +97,10 @@ $pages = Join-Path $Out "pages"
 New-Item -ItemType Directory -Path (Join-Path $pages "html") -Force | Out-Null
 Copy-Item (Join-Path $repo "tests\html\video_grid_6x6_play.html") (Join-Path $pages "html") -Force
 Copy-Item (Join-Path $repo "tests\html\video_grid_6x6_perf.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# DOM shapes and animation, i.e. everything the video path does not exercise: layout ->
+# display list -> WebRender. Ships with the dist because the wall is where seams, the
+# overlapPx guard band, and per-tile frame agreement can actually be judged.
+Copy-Item (Join-Path $repo "tests\html\multigpu_wall_shape_anim_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---
