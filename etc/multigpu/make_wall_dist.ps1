@@ -101,6 +101,12 @@ Copy-Item (Join-Path $repo "tests\html\video_grid_6x6_perf.html") (Join-Path $pa
 # display list -> WebRender. Ships with the dist because the wall is where seams, the
 # overlapPx guard band, and per-tile frame agreement can actually be judged.
 Copy-Item (Join-Path $repo "tests\html\multigpu_wall_shape_anim_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# WebGL2 and WebGPU minimum probes. Both contexts are OFF by default, so these only draw
+# with `-Pref dom_webgl2_enabled=true` / `-Pref dom_webgpu_enabled=true`, and the WebGPU one
+# additionally needs `-Serve` (it hangs silently on file://) AND an engine built with the
+# `webgpu` cargo feature -- the pref alone cannot conjure a feature that is not compiled in.
+Copy-Item (Join-Path $repo "tests\html\wall_webgl2_min_triangle.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+Copy-Item (Join-Path $repo "tests\html\multigpu_wall_webgpu_min_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---

@@ -12,6 +12,20 @@
 param(
     [string] $Layout = "wall_layout.multigpu.json",
     [string] $Url = "",                  # empty = bundled 6x6 page
+    # Serve pages\html over http instead of handing the engine a file:/// URL, and shut the
+    # server down when the run ends. Needed for WebGPU and for any page using ES modules:
+    #
+    #   * ES modules do not load over file:// ("Unsupported scheme").
+    #   * ***WebGPU hangs on file:// with no error at all.*** The constellation keys the
+    #     WebGPU thread by host name, a file:// URL has an opaque origin and therefore no
+    #     host, and that path warns "Invalid host url" and returns WITHOUT answering the
+    #     response channel -- so requestAdapter() never resolves and never rejects. The page
+    #     just sits there. Run with RUST_LOG=warn and look for that line if unsure.
+    #
+    # With -Serve a relative -Url ("multigpu_wall_webgpu_min_probe.html", query string
+    # allowed) is resolved against the server root; an absolute http/file URL is left alone.
+    [switch] $Serve,
+    [int]    $ServePort = 8731,
     [int]    $Rows = 6,
     [int]    $Cols = 6,
     [int]    $SyncGroup = 0,             # 0 = auto (Rows * Cols)
@@ -251,10 +265,35 @@ $layout = Join-Path $here "config\$Layout"
 if (!(Test-Path $exe))    { throw "winit_wall.exe not found: $exe" }
 if (!(Test-Path $layout)) { throw "layout not found: $layout" }
 
+$serveRoot = Join-Path $here "pages\html"
+$httpServer = $null
+if ($Serve) {
+    if (!(Test-Path $serveRoot)) { throw "nothing to serve: $serveRoot" }
+    $py = (Get-Command python -EA SilentlyContinue).Source
+    if (-not $py) { $py = (Get-Command py -EA SilentlyContinue).Source }
+    if (-not $py) { throw "-Serve needs python on PATH (it runs: python -m http.server)" }
+    $httpServer = Start-Process -FilePath $py -PassThru -WindowStyle Hidden -ArgumentList @(
+        "-m", "http.server", "$ServePort", "--bind", "127.0.0.1", "--directory", $serveRoot)
+    Start-Sleep -Milliseconds 1200
+    # Fail loudly here. A dead server just makes every page 404 later, which reads as
+    # "the engine cannot render this page" -- a wrong and expensive conclusion.
+    if ($httpServer.HasExited) { throw "http server died immediately (port $ServePort in use?)" }
+    Write-Host "  serving $serveRoot at http://127.0.0.1:$ServePort/"
+}
+
 if ($Url -eq "") {
-    $page = Join-Path $here "pages\html\video_grid_6x6_play.html"
-    if (!(Test-Path $page)) { throw "bundled page not found: $page" }
-    $Url = "file:///" + (($page -replace '\\', '/')) + "?rows=$Rows&cols=$Cols"
+    if ($Serve) {
+        $Url = "http://127.0.0.1:$ServePort/video_grid_6x6_play.html?rows=$Rows&cols=$Cols"
+    } else {
+        $page = Join-Path $here "pages\html\video_grid_6x6_play.html"
+        if (!(Test-Path $page)) { throw "bundled page not found: $page" }
+        $Url = "file:///" + (($page -replace '\', '/')) + "?rows=$Rows&cols=$Cols"
+    }
+} elseif ($Serve -and $Url -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*:') {
+    # A bare page name under the server root. Keep any query string the caller attached.
+    $file = ($Url -split '\?', 2)[0]
+    if (!(Test-Path (Join-Path $serveRoot $file))) { throw "not under ${serveRoot}: $file" }
+    $Url = "http://127.0.0.1:$ServePort/$Url"
 }
 if ($NoSyncGroup)      { $SyncGroup = 0 }
 elseif ($SyncGroup -le 0) { $SyncGroup = $Rows * $Cols }
@@ -480,6 +519,14 @@ if ($DurationSec -gt 0) {
     Write-Host "Running. To stop: Ctrl+C then  Stop-Process -Name winit_wall -Force"
     Wait-Process -Id $proc.Id
 }
+
+# The engine is done, so the server has nothing left to answer. Kill it before the log
+# analysis below, which does not need it -- otherwise a Ctrl+C during analysis leaves a
+# python holding the port and the NEXT -Serve run dies with "port in use".
+if ($httpServer -and -not $httpServer.HasExited) {
+    Stop-Process -Id $httpServer.Id -Force -ErrorAction SilentlyContinue
+}
+
 
 if ($numaResolved -ge 0 -and $cmdFile -and (Test-Path $cmdFile)) {
     Remove-Item $cmdFile -Force -ErrorAction SilentlyContinue
