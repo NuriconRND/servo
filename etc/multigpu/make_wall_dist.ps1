@@ -15,6 +15,10 @@
 #     GStreamer sits on PATH).
 #  3. The 6x6 page references its source as `../Wildlife_....mp4`, so tests\ layout is
 #     preserved under pages\.
+#  4. `webgpu` is part of the STANDARD feature set. It is a cargo feature, not a pref, so
+#     an engine built without it has no `navigator.gpu` at all and `dom_webgpu_enabled=true`
+#     silently does nothing -- exactly the shape of failure as (1). This script does not
+#     build, it copies whatever exe it finds, so it checks the exe instead and hard-fails.
 #
 # Pure ASCII on purpose (a Korean launcher once failed to parse on a test machine that
 # decodes with a legacy console codepage).
@@ -36,7 +40,9 @@ $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)    # <worktree>
 if ($Out -eq "") { $Out = Join-Path $repo "target\wall_dist" }
 
 $exe = Join-Path $repo "target\$Profile\examples\winit_wall.exe"
-if (!(Test-Path $exe))     { throw "winit_wall.exe not found: $exe  (build it first: cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl --$Profile)" }
+$features = "media-gstreamer,no-wgl,webgpu"
+$buildCmd = "cargo build -p servo --example winit_wall --features $features --$Profile"
+if (!(Test-Path $exe))     { throw "winit_wall.exe not found: $exe  (build it first: $buildCmd)" }
 if (!(Test-Path $GstRoot)) { throw "GStreamer root not found: $GstRoot" }
 
 # --- 1. ANGLE must be the patched build. Hard-fail rather than ship a one-GPU wall. ---
@@ -44,6 +50,18 @@ Write-Host "Checking ANGLE LUID patch state..."
 & (Join-Path $PSScriptRoot 'patches\verify_angle_luid.ps1') -Profile $Profile
 if ($LASTEXITCODE -ne 0) {
     throw "ANGLE verification failed -- refusing to package. A dist built now would render every tile on one GPU."
+}
+
+# --- 1b. WebGPU must be compiled in. Same reason as ANGLE: shipping without it fails silently.
+# Two markers, both verified absent from a `media-gstreamer,no-wgl` build and present in a
+# `...,webgpu` one: `wgpu_core` (the crate is linked at all) and `GPUAdapter` (the DOM
+# bindings the pref actually switches on). findstr reads the 144 MB exe in ~0.1s.
+Write-Host "Checking the engine was built with the webgpu feature..."
+foreach ($marker in @("wgpu_core", "GPUAdapter")) {
+    & findstr.exe /M /C:$marker $exe | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "$exe has no '$marker' -- it was built WITHOUT the webgpu feature. Rebuild with:`n  $buildCmd`nRefusing to package: dom_webgpu_enabled=true cannot enable a feature that is not compiled in, so WebGPU pages would hang with no error."
+    }
 }
 
 if ((Test-Path $Out) -and -not $Force) { throw "$Out already exists (use -Force)" }
@@ -107,6 +125,9 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_wall_shape_anim_probe.html") (Jo
 # `webgpu` cargo feature -- the pref alone cannot conjure a feature that is not compiled in.
 Copy-Item (Join-Path $repo "tests\html\wall_webgl2_min_triangle.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\html\multigpu_wall_webgpu_min_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# These two were only ever hand-copied into a dist, so every repackage silently dropped them.
+Copy-Item (Join-Path $repo "tests\html\webgl2_ctx_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+Copy-Item (Join-Path $repo "tests\html\multigpu_wall_stress_cases.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---

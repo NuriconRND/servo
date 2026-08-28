@@ -246,9 +246,11 @@ param(
     # canvas 3D context needs one of these:
     #
     #   -Pref dom_webgl2_enabled=true      (WebGL2; the engine has the WebGL fixes compiled in)
-    #   -Pref dom_webgpu_enabled=true      (***needs a build with the `webgpu` cargo feature***
-    #                                       -- the dist is built without it, so the pref alone
-    #                                       does nothing)
+    #   -Pref dom_webgpu_enabled=true      (also needs -Serve: WebGPU hangs on file://)
+    #
+    # `webgpu` is a cargo feature and is part of the standard dist build; make_wall_dist.ps1
+    # refuses to package an engine without it, because the pref cannot enable a feature that
+    # is not compiled in and the page would just hang.
     [string[]] $Pref = @(),
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
