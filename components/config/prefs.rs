@@ -477,7 +477,7 @@ pub struct Preferences {
     /// 동일 — 디코더를 건드리지 않는다). `0` 이상이면 그 값으로 캡한다(구
     /// `parse::<i32>() >= 0` 검증 그대로).
     pub media_avdec_max_threads: i64,
-    /// 비디오 스트리밍 스레드를 NUMA 노드에 라운드로빈으로 고정한다. 기본 false.
+    /// 비디오 스트리밍 스레드를 NUMA 노드에 라운드로빈으로 고정한다. ★기본 true★.
     ///
     /// ★두 소켓을 쓰면서 메모리도 로컬로 두려는 것이다.★ 지금은 스레드가 두 소켓을
     /// 오가는데(고정 없음) 힙은 first-touch 로 한 노드에 잡히므로, 프레임 버퍼
@@ -491,10 +491,19 @@ pub struct Preferences {
     /// 절반씩 나뉘어 물리 40 코어를 다 쓴다. 경합 없는 구간의 0.45~0.48 이
     /// 유지되면 54 영상이 25 코어로, 40 물리 코어 안에 들어간다.
     ///
+    /// 실측(2026-08-27, 54xFHD30): 디코드 0.99 -> **0.53** 코어/영상, 머신 71% -> **35%**,
+    /// `pts_rate` 0.70 -> **1.00**. 대조군(비 Servo 월)이 같은 장비에서 54 영상을 50~70% 로
+    /// 도는데 이쪽이 더 낮다.
+    ///
+    /// **기본값이 true 인 이유**: 노드가 하나인 장비에서는 아무 일도 하지 않고 즉시
+    /// 돌아간다(no-op). 노드가 둘 이상인 장비에서는 켜지 않을 이유가 측정되지 않았다 —
+    /// 끄면 스레드가 소켓을 오가며 원격 메모리를 물거나(1.005), 프로세스를 한 노드에
+    /// 가두면 물리 코어가 절반이 된다(0.735). 되돌리려면 `=false`.
+    ///
     /// **비범위**: GStreamer 가 만드는 다른 스레드(`multiqueue:src`, `qtdemux:sink`)는
-    /// 잡지 않는다 — 실측상 전부 합쳐 1 코어 미만이라 뜨거운 스레드 하나로 충분한지
-    /// 부터 본다. 그리고 영상의 절반은 GPU 가 붙지 않은 노드에서 업로드하게 되는데,
-    /// 업로드는 영상당 0.047 코어라 디코드 전체가 원격인 것보다 싸다는 계산이다.
+    /// 잡지 않는다 — 실측상 전부 합쳐 1 코어 미만이라 뜨거운 스레드 하나로 충분했다.
+    /// 그리고 영상의 절반은 GPU 가 붙지 않은 노드에서 업로드하게 되는데, 업로드는 영상당
+    /// 0.047 코어라 디코드 전체가 원격인 것보다 싸다 — 실측으로 확인됐다.
     pub media_numa_pin_streaming_threads: bool,
     /// `rtspsrc` 지터버퍼 크기(ms). `-1` = 미설정 — GStreamer 기본값 **2000ms** 를 그대로
     /// 둔다(현행 동작).
@@ -846,7 +855,7 @@ impl Preferences {
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,
             media_avdec_max_threads: -1,
-            media_numa_pin_streaming_threads: false,
+            media_numa_pin_streaming_threads: true,
             media_rtsp_latency_ms: -1,
             media_rtsp_wait_for_keyframe: false,
             media_audio_enabled: true,

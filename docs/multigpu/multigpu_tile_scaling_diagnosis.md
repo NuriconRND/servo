@@ -3156,12 +3156,12 @@ uridecodebin3 + thread 페이싱:
 
 ### 권장 조합 (2026-08-27 기준)
 
-    --pref media_numa_pin_streaming_threads=true
+    (media_numa_pin_streaming_threads 는 2026-08-28 부터 기본 true — 끄려면 =false)
     --pref media_pipeline_mode=uridecodebin3
     --pref media_video_sink_pacing=thread
     --pref gfx_video_escape_mode=external
     --pref gfx_wr_picture_tile_size=display
 
-런처로는 `-NumaPin -PipelineMode uridecodebin3 -SinkPacing thread -VideoEscape external`.
+런처로는 `-PipelineMode uridecodebin3 -SinkPacing thread -VideoEscape external`
+(NUMA 핀은 기본 on, 끄려면 `-NoNumaPin`).
 ***`-Confine` 과 함께 쓰지 말 것*** — 정반대 교환이라 물리 코어를 도로 절반으로 만든다.
-

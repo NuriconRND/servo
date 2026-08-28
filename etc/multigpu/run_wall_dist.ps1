@@ -211,16 +211,22 @@ param(
     # exactly on the worst cluster. At 0.60 the 54-video wall would want 32 cores instead of 53,
     # which fits inside one node s 40.
     [switch] $Confine,
-    # media_numa_pin_streaming_threads=true: nail each video's streaming thread to a NUMA node,
-    # round-robin. The opposite trade to -Confine, and they are mutually exclusive in spirit:
+    # media_numa_pin_streaming_threads: nail each video's streaming thread to a NUMA node,
+    # round-robin. ***ON BY DEFAULT since 2026-08-27*** -- these switches only exist to turn it
+    # off or to say so explicitly.
     #
-    #   nothing      : threads reach both sockets, memory is first-touched on one -> 1.005
-    #   -Confine     : local memory, but half the physical cores (SMT saturates)  -> 0.735
-    #   -NumaPin     : local memory AND both sockets                              -> 0.45-0.48 ?
+    # It is the opposite trade to -Confine, and the two must not be combined:
     #
-    # The last row is the prediction this switch exists to test. If it holds, 54 videos need
-    # about 25 cores of the 40 physical ones and stop being a coin toss against the machine.
+    #   nothing   : threads reach both sockets, memory first-touched on one -> 0.99 cores/video
+    #   -Confine  : local memory, but half the physical cores (SMT saturates) -> 0.74
+    #   NUMA pin  : local memory AND both sockets                             -> 0.53
+    #
+    # At 54 videos that is 71% of the machine versus 35%, and pts_rate 0.70 versus 1.00. On a
+    # single-node box the engine skips it entirely, so leaving it on costs nothing there.
     [switch] $NumaPin,
+    # Turn the pin off (media_numa_pin_streaming_threads=false). Wins over -NumaPin if both
+    # are passed -- an explicit "off" should never be silently overridden.
+    [switch] $NoNumaPin,
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
     # pipeline setup and first-frame staging, which are not the steady state.
@@ -294,7 +300,8 @@ if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQ
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
 if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$SinkPacing") }
 if ($NoAudio)             { $argList += @("--pref", "media_audio_enabled=false") }
-if ($NumaPin)             { $argList += @("--pref", "media_numa_pin_streaming_threads=true") }
+if ($NoNumaPin)           { $argList += @("--pref", "media_numa_pin_streaming_threads=false") }
+elseif ($NumaPin)         { $argList += @("--pref", "media_numa_pin_streaming_threads=true") }
 if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
@@ -303,7 +310,7 @@ $argList += $Url
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$($NumaPin.IsPresent) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
