@@ -271,16 +271,12 @@ $serveRoot = Join-Path $here "pages\html"
 $httpServer = $null
 if ($Serve) {
     if (!(Test-Path $serveRoot)) { throw "nothing to serve: $serveRoot" }
-    $py = (Get-Command python -EA SilentlyContinue).Source
-    if (-not $py) { $py = (Get-Command py -EA SilentlyContinue).Source }
-    if (-not $py) { throw "-Serve needs python on PATH (it runs: python -m http.server)" }
-    $httpServer = Start-Process -FilePath $py -PassThru -WindowStyle Hidden -ArgumentList @(
-        "-m", "http.server", "$ServePort", "--bind", "127.0.0.1", "--directory", $serveRoot)
-    Start-Sleep -Milliseconds 1200
-    # Fail loudly here. A dead server just makes every page 404 later, which reads as
-    # "the engine cannot render this page" -- a wrong and expensive conclusion.
-    if ($httpServer.HasExited) { throw "http server died immediately (port $ServePort in use?)" }
-    Write-Host "  serving $serveRoot at http://127.0.0.1:$ServePort/"
+    # serve_http.ps1 sits beside this script in a dist, but under tools\ in the worktree.
+    $serveScript = @((Join-Path $here "serve_http.ps1"), (Join-Path $here "tools\serve_http.ps1")) |
+        Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $serveScript) { throw "serve_http.ps1 not found beside $here (nor in tools\)" }
+    # It throws unless the port is actually answering, so nothing below races startup.
+    $httpServer = & $serveScript -Root $serveRoot -Port $ServePort -Background
 }
 
 if ($Url -eq "") {
