@@ -1,0 +1,140 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>multigpu wall webgpu min probe</title>
+<!--
+  WebGPU 가 이 셸/빌드에서 실제로 그려지는지 보는 최소 페이지.
+
+  ★일부러 인라인 스크립트다★ — 이 엔진은 `file://` 에서 ES 모듈을 못 불러온다
+  ("Fetching module script failed Unsupported scheme"). 기존 WebGPU 페이지는 전부
+  three.js(모듈)라 그것 때문에도 HTTP 가 필요하다. 이 페이지는 모듈을 안 쓴다.
+
+  전제 세 가지 — 하나만 빠져도 화면은 검다:
+    1. 빌드에 `webgpu` cargo feature 가 들어 있어야 한다
+       (`cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webgpu`).
+       ***pref 만으로는 안 된다*** — 기능 자체가 컴파일되지 않는다.
+    2. `--pref dom_webgpu_enabled=true` (기본 off)
+    3. ***http(s) 로 띄울 것. `file://` 는 안 된다.***
+
+  3번은 조용히 실패해서 오진하기 쉽다. 에러도 거부도 없이 HUD 가 "starting..." 에서
+  영원히 멈춘다. 이유: constellation 이 WebGPU 스레드를 ***호스트 이름별로*** 만드는데
+  (`handle_wgpu_request` -> `registered_domain_name`), `file://` 은 opaque origin 이라
+  호스트가 없다. 그 경로는 `warn!("Invalid host url")` 하나 찍고 ***응답 채널에 아무것도
+  안 보낸 채 return*** 한다. 그래서 `requestAdapter()` 의 프라미스가 resolve 도 reject 도
+  되지 않는다. 확인하려면 `RUST_LOG=warn` 을 켜고 "Invalid host url" 을 찾아라.
+
+  띄우는 법:
+    python -m http.server 8731 --bind 127.0.0.1 --directory tests\html
+    winit_wall.exe --wall-layout ..\config\wall_layout.local_3x1.json --wall-all-tiles ^
+      --pref dom_webgpu_enabled=true http://127.0.0.1:8731/multigpu_wall_webgpu_min_probe.html
+
+  캔버스는 뷰포트 전체를 채운다. 월에서 타일 창은 가상 뷰포트의 일부만 보여주므로,
+  고정 크기로 잡으면 좌상단만 그려진다(과거에 그렇게 오진한 적이 있다).
+-->
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0b12; }
+  #c { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: absolute; left: 24px; top: 24px; padding: 8px 12px;
+    background: rgba(0,0,0,.75); border: 1px solid #3b3b5c; border-radius: 6px;
+    font: bold 20px/1.35 monospace; color: #ffe082; white-space: pre;
+  }
+  #hud.bad { color: #ff8a80; }
+</style>
+<canvas id="c"></canvas>
+<div id="hud">webgpu: starting...</div>
+<script>
+  const hud = document.getElementById("hud");
+  const canvas = document.getElementById("c");
+  const fail = (why) => { hud.className = "bad"; hud.textContent = "webgpu FAILED\n" + why; };
+
+  (async () => {
+    if (!navigator.gpu) {
+      // 여기서 걸리면 빌드에 webgpu feature 가 없거나 pref 가 꺼져 있다.
+      return fail("navigator.gpu is undefined\nbuild needs the `webgpu` cargo feature\nand --pref dom_webgpu_enabled=true");
+    }
+    let adapter, device;
+    try {
+      adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) return fail("requestAdapter() returned null");
+      device = await adapter.requestDevice();
+    } catch (e) {
+      return fail("adapter/device: " + e);
+    }
+
+    const ctx = canvas.getContext("webgpu");
+    if (!ctx) return fail('canvas.getContext("webgpu") returned null');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+
+    function resize() {
+      // 뷰포트 전체. 월에서는 이 값이 벽 전체(예: 5760x2160)다.
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.configure({ device, format, alphaMode: "opaque" });
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    // 화면을 가득 채우는 삼각형 하나. 색은 시간에 따라 흐르고, 좌표에 따라 변해서
+    // 타일 경계에서 색이 이어지는지 눈으로 확인할 수 있다.
+    const shader = device.createShaderModule({ code: `
+      struct VSOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+      @vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {
+        var p = array<vec2f, 3>(vec2f(-1.0, -3.0), vec2f(-1.0, 1.0), vec2f(3.0, 1.0));
+        var o: VSOut;
+        o.pos = vec4f(p[i], 0.0, 1.0);
+        o.uv = p[i] * 0.5 + vec2f(0.5, 0.5);
+        return o;
+      }
+      struct U { t: f32 };
+      @group(0) @binding(0) var<uniform> u: U;
+      @fragment fn fs(in: VSOut) -> @location(0) vec4f {
+        let a = in.uv.x * 6.0 + u.t;
+        let b = in.uv.y * 6.0 - u.t * 0.7;
+        return vec4f(0.5 + 0.5 * sin(a), 0.5 + 0.5 * sin(b), 0.5 + 0.5 * sin(a + b), 1.0);
+      }` });
+
+    const ubuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const pipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: shader, entryPoint: "vs" },
+      fragment: { module: shader, entryPoint: "fs", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    });
+    const bind = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: ubuf } }],
+    });
+
+    const t0 = performance.now();
+    let frame = 0, fps = 0, fpsFrames = 0, fpsAt = t0;
+    const info = adapter.info ? (adapter.info.vendor || "") + " " + (adapter.info.device || "") : "";
+
+    function draw(now) {
+      frame++;
+      fpsFrames++;
+      if (now - fpsAt >= 500) { fps = fpsFrames * 1000 / (now - fpsAt); fpsFrames = 0; fpsAt = now; }
+      const t = (now - t0) / 1000;
+      device.queue.writeBuffer(ubuf, 0, new Float32Array([t, 0, 0, 0]));
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: ctx.getCurrentTexture().createView(),
+          loadOp: "clear", storeOp: "store",
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        }],
+      });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bind);
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+
+      hud.textContent = "webgpu OK  frame " + frame + "\n" +
+        "fps " + fps.toFixed(1) + "  " + canvas.width + "x" + canvas.height +
+        (info.trim() ? "\n" + info.trim() : "");
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+  })();
+</script>

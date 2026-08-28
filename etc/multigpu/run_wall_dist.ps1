@@ -227,6 +227,15 @@ param(
     # Turn the pin off (media_numa_pin_streaming_threads=false). Wins over -NumaPin if both
     # are passed -- an explicit "off" should never be silently overridden.
     [switch] $NoNumaPin,
+    # Extra `--pref name=value` pairs passed straight through, for knobs this launcher does
+    # not wrap. WebGL2 and WebGPU are both OFF by default in this engine, so anything using a
+    # canvas 3D context needs one of these:
+    #
+    #   -Pref dom_webgl2_enabled=true      (WebGL2; the engine has the WebGL fixes compiled in)
+    #   -Pref dom_webgpu_enabled=true      (***needs a build with the `webgpu` cargo feature***
+    #                                       -- the dist is built without it, so the pref alone
+    #                                       does nothing)
+    [string[]] $Pref = @(),
     [switch] $ThreadCpu,
     # Seconds to let playback settle before sampling. The opening seconds are
     # pipeline setup and first-frame staging, which are not the steady state.
@@ -305,6 +314,9 @@ elseif ($NumaPin)         { $argList += @("--pref", "media_numa_pin_streaming_th
 if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
+# Passthrough is appended AFTER every pref this launcher sets itself, so `-Pref x=y` wins
+# over the launcher's own value for x. Servo takes the last --pref for a given name.
+foreach ($p in $Pref)     { $argList += @("--pref", $p) }
 $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
