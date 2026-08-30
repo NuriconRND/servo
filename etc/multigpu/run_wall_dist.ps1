@@ -26,6 +26,10 @@ param(
     # allowed) is resolved against the server root; an absolute http/file URL is left alone.
     [switch] $Serve,
     [int]    $ServePort = 8731,
+    # Pass --ignore-certificate-errors to the engine, for an -Url on https with a
+    # self-signed or internal-CA certificate. This is a FLAG, not a pref, so -Pref cannot
+    # carry it, and winit_wall rejects unknown --flags rather than ignoring them.
+    [switch] $IgnoreCertErrors,
     [int]    $Rows = 6,
     [int]    $Cols = 6,
     [int]    $SyncGroup = 0,             # 0 = auto (Rows * Cols)
@@ -343,6 +347,13 @@ $argList = @(
     "--pref", "media_avdec_max_threads=$DecoderThreads",
     "--pref", "media_sync_group_target=$SyncGroup"
 )
+# Accept any TLS certificate. Needed to point -Url at an https page served with a
+# self-signed or internal-CA certificate, which is how the output pages are served here.
+# It is an engine FLAG, not a pref, so it cannot go through -Pref -- and winit_wall's
+# argument parser rejects unknown `--flags` outright, so there was no way in at all.
+# The engine logs "accepting ALL TLS certificate errors" when this is on; keep it off for
+# anything but a page you control.
+if ($IgnoreCertErrors)    { $argList += "--ignore-certificate-errors" }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
@@ -364,6 +375,9 @@ Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
+# Record it in the transcript. A run that trusted every certificate should say so in
+# its own log, not only in the command someone typed.
+if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS errors accepted)" }
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
 

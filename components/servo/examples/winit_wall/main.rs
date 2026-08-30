@@ -462,15 +462,20 @@ impl ApplicationHandler<WakerEvent> for App {
             ignore_certificate_errors: config.ignore_certificate_errors,
             ..Default::default()
         };
-        if opts.ignore_certificate_errors {
-            log::warn!("--ignore-certificate-errors: accepting ALL TLS certificate errors");
-        }
+        let ignore_certificate_errors = opts.ignore_certificate_errors;
         let servo = ServoBuilder::default()
             .opts(opts)
             .event_loop_waker(Box::new(waker.clone()))
             .preferences(std::mem::take(&mut config.preferences))
             .build();
         servo.setup_logging();
+        // ***After `setup_logging()`, not before.*** This used to sit above the builder,
+        // where env_logger does not exist yet, so the line was swallowed and a run that
+        // trusted every certificate left no trace of it in its own log. Verified 2026-08-31:
+        // the flag was applied and the warning was nowhere in the captured stderr.
+        if ignore_certificate_errors {
+            log::warn!("--ignore-certificate-errors: accepting ALL TLS certificate errors");
+        }
         // Servo 레벨 델리게이트. WebView 델리게이트(`AppState`)와는 별개다 — 이걸 설정하지
         // 않으면 `DefaultServoDelegate` 의 빈 구현이 쓰이고, devtools 연결 요청 객체가 그대로
         // drop 되면서 기본값 Deny 가 회신된다(responders.rs 의 IpcResponder::drop). 그러면
