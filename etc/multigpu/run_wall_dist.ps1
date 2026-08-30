@@ -466,20 +466,41 @@ if ($Confine) {
     }
 }
 
-$grpLine = ""
+$grpLines = @()
 $probeEarly = Join-Path $engine "thread_cpu_probe.exe"
 if (Test-Path $probeEarly) {
     Start-Sleep -Seconds 3        # let the decode threads exist before asking where they are
     $out = & $probeEarly --pid $proc.Id --duration 1 --top 1 2>&1
     # The probe prints this section only on a box with more than one group, so a machine
     # with a single group (the dev box) yields nothing here -- that is not an error.
-    $m = $out | Select-String -Pattern "^\s+group \d" | Select-Object -First 1
-    if ($null -ne $m) { $grpLine = $m.ToString().Trim() }
+    # ***Keep EVERY group line, not the first one.*** Taking `-First 1` meant always taking
+    # group 0, because the probe lists groups in order -- so the "landed in GROUP 0" warning
+    # below fired on every multi-group machine no matter where the work actually was. Two
+    # runs on 2026-08-31 both warned while group 0 held 0.00 and 0.03 cores and group 1 held
+    # 34.5 and 36.3. A warning that says "discard this run" and is always wrong is worse
+    # than no warning: it either burns re-runs or teaches you to ignore the real case.
+    $grpLines = @($out | Select-String -Pattern "^\s+group \d" | ForEach-Object { $_.ToString().Trim() })
 }
-if ($grpLine -ne "") {
-    Write-Host "  processor $grpLine"
-    if ($grpLine -match "^group 0") {
-        Write-Warning "This run landed in processor GROUP 0. Measured 2026-08-26: at 45 videos with escape=external, group 0 collapses (0.98 cores/decode thread, ~5 presents/s) while group 1 runs at 0.77 and ~28. DO NOT compare this run against a group 1 run -- re-run until it lands in group 1, or treat this as the group 0 arm on purpose."
+if ($grpLines.Count) {
+    $groups = @($grpLines | ForEach-Object {
+        if ($_ -match "^group (\d+)\s*:\s*(\d+) threads\s+([0-9.]+) cores") {
+            [pscustomobject]@{ Id = [int]$Matches[1]; Threads = [int]$Matches[2]; Cores = [double]$Matches[3]; Line = $_ }
+        }
+    } | Where-Object { $null -ne $_ })
+
+    foreach ($g in $groups) { Write-Host ("  processor {0}" -f $g.Line) }
+
+    if ($groups.Count) {
+        # This sample is taken 3s in, so cores can still be ~0 everywhere. Fall back to
+        # thread placement in that case -- it is the thing the NUMA pin actually controls.
+        $busiest = if (($groups | Measure-Object -Property Cores -Sum).Sum -gt 0.5) {
+            $groups | Sort-Object Cores -Descending | Select-Object -First 1
+        } else {
+            $groups | Sort-Object Threads -Descending | Select-Object -First 1
+        }
+        if ($busiest.Id -eq 0) {
+            Write-Warning "This run landed in processor GROUP 0. Measured 2026-08-26: at 45 videos with escape=external, group 0 collapses (0.98 cores/decode thread, ~5 presents/s) while group 1 runs at 0.77 and ~28. DO NOT compare this run against a group 1 run -- re-run until it lands in group 1, or treat this as the group 0 arm on purpose."
+        }
     }
 }
 
