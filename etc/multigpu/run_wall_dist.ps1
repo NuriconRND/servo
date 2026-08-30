@@ -30,6 +30,27 @@ param(
     # self-signed or internal-CA certificate. This is a FLAG, not a pref, so -Pref cannot
     # carry it, and winit_wall rejects unknown --flags rather than ignoring them.
     [switch] $IgnoreCertErrors,
+    # The content features the output pages need. ***Every one of these is OFF in the
+    # engine by default***, and nothing in this launcher used to turn them on, so a page
+    # using any of them silently rendered nothing:
+    #
+    #   dom_video_network_uri_enabled          rtsp:// and rtsps:// in a plain <video>.
+    #                                          ***Without this an RTSP tile is simply blank.***
+    #   dom_video_extended_containers_enabled  Matroska/AVI/WMV/MPEG-TS/FLV in <video>
+    #   dom_image_extended_formats_enabled     TIFF/EXR/HDR/TGA/DDS/QOI/PNM/JPEG-XL in <img>
+    #   dom_webrtc_enabled                     WebRTC
+    #   dom_screen_capture_enabled             getDisplayMedia
+    #   dom_webgpu_enabled                     WebGPU (also needs an engine built with the
+    #                                          `webgpu` cargo feature -- the dist is)
+    #
+    # One switch rather than six -Pref arguments, because re-typing six is how a run ends
+    # up quietly missing one. -Pref still wins over these: it is appended after.
+    [switch] $PageFeatures,
+    # Devtools listen address, e.g. -Devtools 127.0.0.1:7000. Empty = devtools off.
+    # ***Deliberately NOT part of -PageFeatures: this opens a listening socket.*** Bind to
+    # loopback unless you actually need to attach from another machine, and note the engine
+    # auto-approves connection requests (this shell has no UI to prompt with).
+    [string] $Devtools = "",
     [int]    $Rows = 6,
     [int]    $Cols = 6,
     [int]    $SyncGroup = 0,             # 0 = auto (Rows * Cols)
@@ -354,6 +375,17 @@ $argList = @(
 # The engine logs "accepting ALL TLS certificate errors" when this is on; keep it off for
 # anything but a page you control.
 if ($IgnoreCertErrors)    { $argList += "--ignore-certificate-errors" }
+if ($PageFeatures) {
+    foreach ($f in @("dom_video_network_uri_enabled", "dom_video_extended_containers_enabled",
+                     "dom_image_extended_formats_enabled", "dom_webrtc_enabled",
+                     "dom_screen_capture_enabled", "dom_webgpu_enabled")) {
+        $argList += @("--pref", "$f=true")
+    }
+}
+if ($Devtools -ne "") {
+    $argList += @("--pref", "devtools_server_enabled=true")
+    $argList += @("--pref", "devtools_server_listen_address=$Devtools")
+}
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
@@ -378,6 +410,7 @@ Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.I
 # Record it in the transcript. A run that trusted every certificate should say so in
 # its own log, not only in the command someone typed.
 if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS errors accepted)" }
+Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$LogPath"
 
