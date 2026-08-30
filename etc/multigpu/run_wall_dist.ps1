@@ -285,7 +285,10 @@ if ($Url -eq "") {
     } else {
         $page = Join-Path $here "pages\html\video_grid_6x6_play.html"
         if (!(Test-Path $page)) { throw "bundled page not found: $page" }
-        $Url = "file:///" + (($page -replace '\', '/')) + "?rows=$Rows&cols=$Cols"
+        # -replace takes a REGEX, so a literal backslash is '\\'. Losing one of those
+        # backslashes makes it the invalid pattern '\' and every default (no -Url, no
+        # -Serve) run dies before the engine starts.
+        $Url = "file:///" + (($page -replace '\\', '/')) + "?rows=$Rows&cols=$Cols"
     }
 } elseif ($Serve -and $Url -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*:') {
     # A bare page name under the server root. Keep any query string the caller attached.
