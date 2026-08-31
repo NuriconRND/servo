@@ -225,13 +225,98 @@ struct AppState {
     present_window_start: Cell<Option<std::time::Instant>>,
     // `--capture`: read the primary tile's framebuffer to PNG once, at `capture_deadline`,
     // then request exit. Read happens before `present()` so the backbuffer still holds the frame.
+    // ***Is the serial tile loop actually costing us anything?*** `render_all_tiles` paints
+    // and presents each tile one after another on this thread, so a wall frame can never be
+    // faster than the SUM of the tiles. Parallelising would bring that down to the MAX, so
+    // the whole prize is sum/max -- and if the four GPUs already overlap their work, even
+    // that is optimistic. Accumulated per pass and reported once a second so the ratio can be
+    // read off instead of argued about. Enabled by SERVO_LOG_PRESENT_CADENCE.
+    pass_stats: RefCell<PassStats>,
     capture_path: Option<String>,
     capture_deadline: Option<std::time::Instant>,
     captured: Cell<bool>,
     should_exit: Cell<bool>,
 }
 
+/// One second of `render_all_tiles` timings.
+#[derive(Default)]
+struct PassStats {
+    window_start: Option<std::time::Instant>,
+    passes: u32,
+    /// Wall clock of the whole loop, i.e. what a wall frame actually costs.
+    pass_ms_sum: f64,
+    pass_ms_max: f64,
+    /// Per tile, so the slowest one is visible: it is the floor a parallel version would hit.
+    tile_ms_sum: Vec<f64>,
+    tile_ms_max: Vec<f64>,
+    /// Tiles skipped by the keep-previous barrier, which shorten a pass for a different reason.
+    skipped: u32,
+}
+
 impl AppState {
+    fn note_render_pass(&self, pass_ms: f64, tile_ms: &[f64], skipped: u32) {
+        // ***`string`, not `enabled`.*** This flag is `Kind::Str`, and `enabled` asserts the
+        // flag is `Kind::Presence` -- calling it here panicked on startup. Same truthiness
+        // test painter.rs uses for the same flag, and cached because this runs every pass.
+        static LOG_PASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            servo_config::debug_env::string(&servo_config::debug_env::LOG_PRESENT_CADENCE)
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        });
+        if !*LOG_PASS {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut stats = self.pass_stats.borrow_mut();
+        if stats.tile_ms_sum.len() != tile_ms.len() {
+            stats.tile_ms_sum = vec![0.0; tile_ms.len()];
+            stats.tile_ms_max = vec![0.0; tile_ms.len()];
+        }
+        let start = *stats.window_start.get_or_insert(now);
+        stats.passes += 1;
+        stats.pass_ms_sum += pass_ms;
+        stats.pass_ms_max = stats.pass_ms_max.max(pass_ms);
+        stats.skipped += skipped;
+        for (index, ms) in tile_ms.iter().enumerate() {
+            stats.tile_ms_sum[index] += ms;
+            stats.tile_ms_max[index] = stats.tile_ms_max[index].max(*ms);
+        }
+        if now.duration_since(start).as_secs_f64() < 1.0 {
+            return;
+        }
+
+        let passes = stats.passes.max(1) as f64;
+        let avg: Vec<f64> = stats.tile_ms_sum.iter().map(|ms| ms / passes).collect();
+        let serial: f64 = avg.iter().sum();
+        let slowest = avg.iter().cloned().fold(0.0_f64, f64::max);
+        // The ceiling on parallelising this loop, stated so nobody has to guess: with four
+        // tiles the hopeful number is 4x, but one heavy tile caps it far below that.
+        let ceiling = if slowest > 0.0 { serial / slowest } else { 0.0 };
+        log::info!(
+            "WALLPASS passes/s={:.1} pass_ms avg={:.2} max={:.2} | per-tile avg=[{}]              max=[{}] | serial_sum={:.2} slowest={:.2} parallel_ceiling={:.2}x skipped={}",
+            passes / now.duration_since(start).as_secs_f64(),
+            stats.pass_ms_sum / passes,
+            stats.pass_ms_max,
+            avg.iter()
+                .map(|ms| format!("{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            stats
+                .tile_ms_max
+                .iter()
+                .map(|ms| format!("{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            serial,
+            slowest,
+            ceiling,
+            stats.skipped,
+        );
+        *stats = PassStats {
+            window_start: Some(now),
+            ..Default::default()
+        };
+    }
+
     fn note_present(&self, present_ms: f64) {
         let now = std::time::Instant::now();
         let start = match self.present_window_start.get() {
@@ -294,7 +379,11 @@ impl AppState {
         let Some(webview) = webview.as_ref() else {
             return;
         };
-        for tile in &self.tiles {
+        let pass_start = std::time::Instant::now();
+        let mut tile_ms = vec![0.0f64; self.tiles.len()];
+        let mut skipped = 0u32;
+        for (tile_index, tile) in self.tiles.iter().enumerate() {
+            let tile_start = std::time::Instant::now();
             match tile.paint_target.get() {
                 Some(target) => {
                     // Wall frame barrier: skip if this target already rendered this
@@ -303,6 +392,7 @@ impl AppState {
                         .paint_target_keep_previous_logical_frame(target)
                         .is_some()
                     {
+                        skipped += 1;
                         continue;
                     }
                     let _ = tile.rendering_context.make_current();
@@ -321,7 +411,13 @@ impl AppState {
                     self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
                 },
             }
+            tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
         }
+        self.note_render_pass(
+            pass_start.elapsed().as_secs_f64() * 1000.0,
+            &tile_ms,
+            skipped,
+        );
     }
 }
 
@@ -493,6 +589,7 @@ impl ApplicationHandler<WakerEvent> for App {
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
             present_window_start: Cell::new(None),
+            pass_stats: RefCell::new(PassStats::default()),
             capture_deadline: config.capture.as_ref().map(|_| {
                 std::time::Instant::now() + std::time::Duration::from_secs_f64(config.capture_sec)
             }),

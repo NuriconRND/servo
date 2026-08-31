@@ -373,7 +373,12 @@ $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
 $env:PATH = "$engine;$env:PATH"
 if (-not $KeepRustLog) {
-    $env:RUST_LOG = "warn,paint=info,media=info," +
+    # ***`winit_wall=info` is not optional decoration.*** The shell's own diagnostics
+    # (WALLPASS render-pass timings, devtools port) log from the example crate, and without
+    # a target for it they fall under the leading `warn` and never appear -- a switch can
+    # then look like it did nothing when it worked fine. Learned twice: the same filter
+    # hid the image-downscale line from `net` until it was moved to warn.
+    $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info," +
                     "servo_media_gstreamer=info,servo_media_gstreamer_render_d3d11=info"
 }
 if ($env:RUST_LOG -notmatch "(^|,)media=") {
