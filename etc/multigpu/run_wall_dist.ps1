@@ -132,6 +132,14 @@ param(
     [int]    $MinIntervalMs = 0,         # 0 = leave default (16)
     [int]    $DurationSec = 0,
     [string] $LogPath = "",
+    # Write no log at all: engine stderr goes to the Windows null device, and the post-run
+    # analysis is skipped along with it (it has nothing to read). Use it for a demo or a
+    # long unattended run where the log would just grow.
+    #
+    # Runs stay ***unlimited*** by simply not passing -DurationSec; that is separate from
+    # this switch. Wall tile windows ignore WM_CLOSE, so stop such a run with
+    # `Stop-Process -Name winit_wall -Force`.
+    [switch] $NoLog,
     [switch] $KeepRustLog,
     # SERVO_D3D11_PROFILE=1: per-pipeline stage timings, one heartbeat line per second per
     # video plus any frame over the threshold. The copy= field is the CPU memcpy of the
@@ -334,7 +342,14 @@ if ($Url -eq "") {
 }
 if ($NoSyncGroup)      { $SyncGroup = 0 }
 elseif ($SyncGroup -le 0) { $SyncGroup = $Rows * $Cols }
-if ($LogPath -eq "")  { $LogPath = Join-Path $here ("wall_{0}.err.log" -f (Get-Date -Format "yyyyMMdd_HHmmss")) }
+if ($NoLog -and $LogPath -ne "") {
+    throw "-NoLog and -LogPath contradict each other; pass one or the other"
+}
+# "NUL" is the Windows null device, so nothing is written and no file by that name appears
+# (verified, not assumed). The analysis at the end of this script guards on Test-Path and
+# therefore skips itself.
+if ($NoLog)           { $LogPath = "NUL" }
+elseif ($LogPath -eq "") { $LogPath = Join-Path $here ("wall_{0}.err.log" -f (Get-Date -Format "yyyyMMdd_HHmmss")) }
 
 # Old env knobs block startup in this build (servo_config::removed_env). Clear any that
 # leaked in from an earlier session so the run does not die with a migration notice.
@@ -427,7 +442,7 @@ Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.I
 if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS errors accepted)" }
 Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
-Write-Host "  log=$LogPath"
+Write-Host "  log=$(if($NoLog){'off (-NoLog); no post-run analysis either'}else{$LogPath})"
 
 # Resolve -NumaNode "auto" into a number by asking the display adapters which node they are
 # on. DXGI does not expose this; it is a PnP device property. If they disagree, or none of them
@@ -577,7 +592,10 @@ if ($DurationSec -gt 0) {
             Write-Warning "-DurationSec $DurationSec leaves only ${window}s after a ${ThreadCpuWarmupSec}s warmup. Use at least -DurationSec $($ThreadCpuWarmupSec + 12). Skipping the thread breakdown."
         } else {
             Start-Sleep -Seconds $ThreadCpuWarmupSec
-            $threadLog = [IO.Path]::ChangeExtension($LogPath, ".threads.txt")
+            # ***Not ChangeExtension when -NoLog***: that turns "NUL" into
+            # "NUL.threads.txt", which is an ordinary file, and the switch would quietly
+            # leave one behind. The breakdown still prints to the console either way.
+            $threadLog = if ($NoLog) { "NUL" } else { [IO.Path]::ChangeExtension($LogPath, ".threads.txt") }
             Write-Host ""
             Write-Host "--- thread CPU breakdown (${window}s window, after ${ThreadCpuWarmupSec}s warmup) ---"
             # NOT Tee-Object: on Windows PowerShell 5.1 it writes UTF-16, and the
@@ -586,7 +604,7 @@ if ($DurationSec -gt 0) {
             $probeOut = & $probe --pid $proc.Id --duration $window --top 20 2>&1
             $probeOut | ForEach-Object { Write-Host $_ }
             $probeOut | Out-File -FilePath $threadLog -Encoding ascii
-            Write-Host "  saved: $threadLog"
+            if (-not $NoLog) { Write-Host "  saved: $threadLog" }
             Start-Sleep -Seconds 2
             $sampled = $true
         }
