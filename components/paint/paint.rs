@@ -1482,10 +1482,26 @@ impl Paint {
 
         self.wall_frame_pacing_next_wake_at.set(Some(wake_at));
         let event_loop_waker = self.event_loop_waker.clone_box();
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            event_loop_waker.wake();
-        });
+        // ***`Builder::spawn`, not `thread::spawn`, because the latter panics on failure.***
+        // A thread cannot be created while the process is being torn down, and this wake is
+        // scheduled straight out of the compositing path, so the two race on every
+        // force-killed run: measured 2026-08-31 as the very last line of an otherwise clean
+        // 29,465-line log -- `failed to spawn thread: Os { code: 5, PermissionDenied }`.
+        // Nothing was wrong with the run, but every analysis of it then reported panics=1,
+        // which is exactly the signal that must stay trustworthy.
+        //
+        // A missed wake is harmless on its own terms too: the next frame request reschedules
+        // one, and the pacer's own interval check is what actually gates the release.
+        let spawned = std::thread::Builder::new()
+            .name(String::from("WallFramePacingWake"))
+            .spawn(move || {
+                std::thread::sleep(delay);
+                event_loop_waker.wake();
+            });
+        if let Err(error) = spawned {
+            self.wall_frame_pacing_next_wake_at.set(None);
+            warn!("Could not schedule a wall frame pacing wake ({error}); skipping it");
+        }
     }
 
     fn log_wall_frame_pacing_summary(
