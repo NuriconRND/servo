@@ -457,7 +457,12 @@ impl RasterImage {
         let mut flags = ImageDescriptorFlags::ALLOW_MIPMAPS;
         flags.set(ImageDescriptorFlags::IS_OPAQUE, self.is_opaque);
 
-        let size = DeviceIntSize::new(self.metadata.width as i32, self.metadata.height as i32);
+        // ***The frame's size, not `metadata`.*** They are the same for every image as
+        // decoded, but `downscale_to_max_pixels` shrinks the pixel buffer while deliberately
+        // leaving `metadata` at the intrinsic size that layout sizes the box from. This
+        // descriptor describes the BUFFER; taking it from `metadata` would claim more pixels
+        // than were uploaded.
+        let size = DeviceIntSize::new(frame.width as i32, frame.height as i32);
         let descriptor = ImageDescriptor {
             size,
             stride: None,
@@ -466,6 +471,61 @@ impl RasterImage {
             flags,
         };
         (descriptor, data, should_animate)
+    }
+
+    /// Shrink the pixel buffer so it holds at most `max_pixels`, leaving the intrinsic size
+    /// alone. Returns the new dimensions when it did something.
+    ///
+    /// ***`metadata` is not touched on purpose.*** That is what layout sizes the box from, so
+    /// changing it would move the image on the page; only the texture resolution drops. The
+    /// descriptor reads the frame's size, which is why that had to stop reading `metadata`.
+    ///
+    /// Why this exists: a photo is uploaded to the GPU at its decoded size, and decoded size
+    /// has nothing to do with file size. Measured 2026-08-31 on the wall, an 8.3 MB JPEG was
+    /// 8103x5405 = ***175 MB*** of RGBA, against a WebRender standalone-texture eviction
+    /// threshold of 8 MB (`texture_cache.rs`). Past 4x that threshold WebRender evicts every
+    /// frame, so the image was re-uploaded on every composite: that one image took a wall tile
+    /// from 1.1ms to 26ms per render and the whole wall from 48.7 to 18.5 presents/s.
+    ///
+    /// Only single-frame RGBA8/BGRA8 images. Animated images keep several frames in one
+    /// buffer with per-frame byte ranges, and the RGB8 path re-packs bytes while building the
+    /// descriptor; neither is worth the risk for what is a photo-sized problem.
+    pub fn downscale_to_max_pixels(&mut self, max_pixels: u64) -> Option<(u32, u32)> {
+        if max_pixels == 0 || self.frames.len() != 1 {
+            return None;
+        }
+        if !matches!(self.format, PixelFormat::RGBA8 | PixelFormat::BGRA8) {
+            return None;
+        }
+        let frame = self.frames.first()?;
+        let (width, height) = (frame.width, frame.height);
+        let pixels = width as u64 * height as u64;
+        if pixels <= max_pixels || width == 0 || height == 0 {
+            return None;
+        }
+
+        // Keep the aspect ratio: scale both axes by sqrt(budget / pixels).
+        let ratio = (max_pixels as f64 / pixels as f64).sqrt();
+        let new_width = ((width as f64 * ratio).round() as u32).max(1);
+        let new_height = ((height as f64 * ratio).round() as u32).max(1);
+        if new_width >= width && new_height >= height {
+            return None;
+        }
+
+        // The buffer is premultiplied, which is the correct thing to interpolate.
+        let scaled = scale_rgba8_image(
+            Size2D::new(width, height),
+            &self.bytes,
+            Size2D::new(new_width, new_height),
+            FilterQuality::High,
+        )?;
+
+        self.bytes = Arc::new(scaled);
+        let frame = self.frames.first_mut()?;
+        frame.byte_range = 0..self.bytes.len();
+        frame.width = new_width;
+        frame.height = new_height;
+        Some((new_width, new_height))
     }
 
     /// For animations the image already exists in a cache in 'Painter'. We just send the description.

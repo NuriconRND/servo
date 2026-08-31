@@ -10,7 +10,7 @@ use std::mem;
 use std::sync::Arc;
 
 use imsz::imsz_from_reader;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
@@ -148,6 +148,27 @@ fn set_webrender_image_key(
 ) {
     if image.id.is_some() {
         return;
+    }
+
+    // Shrink an oversized decode before it ever reaches the GPU. Decoded size, not file
+    // size, is what costs: an 8.3 MB JPEG measured 8103x5405 = 175 MB of RGBA, which is 21x
+    // WebRender's 8 MB standalone-texture eviction threshold, so it was re-uploaded on every
+    // composite. The intrinsic size is left alone, so this changes texture resolution and
+    // nothing about layout.
+    let max_pixels = pref!(dom_image_max_decoded_pixels);
+    if max_pixels > 0 {
+        let before = image.metadata;
+        if let Some((width, height)) = image.downscale_to_max_pixels(max_pixels as u64) {
+            info!(
+                "Downscaled an oversized image before upload: {}x{} -> {}x{}                  ({:.1} MB -> {:.1} MB of RGBA). Intrinsic size is unchanged; raise or                  disable with --pref dom_image_max_decoded_pixels=N (0 = off).",
+                before.width,
+                before.height,
+                width,
+                height,
+                before.width as f64 * before.height as f64 * 4.0 / 1e6,
+                width as f64 * height as f64 * 4.0 / 1e6,
+            );
+        }
     }
 
     let (descriptor, ipc_shared_memory, should_be_cached) =

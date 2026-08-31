@@ -210,6 +210,18 @@ pub struct Preferences {
     /// still falls back to the standard broken-image/`error` path. Off by
     /// default; standard formats are unaffected.
     pub dom_image_extended_formats_enabled: bool,
+    /// 디코드된 이미지를 GPU 에 올리기 전에 줄이는 상한(픽셀 수). **기본 3840x2160 =
+    /// 8,294,400** (4K 상당). `0` 이하면 끈다.
+    ///
+    /// ★파일 크기가 아니라 디코드 크기가 GPU 비용이다★ — 2026-08-31 실측: 8.3MB JPEG 이
+    /// 8103x5405 = **175MB** RGBA 였다. WebRender 의 standalone 텍스처 축출 임계값은 **8MB**
+    /// 이고(`texture_cache.rs`) 그 4 배를 넘으면 매 프레임 축출 모드로 들어가므로, 그 이미지
+    /// 하나가 합성마다 재업로드됐다 — 타일 렌더 1.1ms -> 26ms, 월 전체 48.7 -> 18.5
+    /// presents/s.
+    ///
+    /// ***intrinsic 크기(`ImageMetadata`)는 건드리지 않는다*** — 레이아웃은 그대로고 텍스처
+    /// 해상도만 내려간다. 단일 프레임 RGBA8/BGRA8 만 대상이다(애니메이션·RGB8 제외).
+    pub dom_image_max_decoded_pixels: i64,
     /// Let the STANDARD `<video>` element report non-standard containers
     /// (Matroska/AVI/WMV/MPEG-TS/FLV/…) as playable for `<source type>`
     /// selection and `canPlayType()`. Off by default.
@@ -738,6 +750,7 @@ impl Preferences {
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
             dom_resize_observer_enabled: true,
             dom_image_extended_formats_enabled: false,
+            dom_image_max_decoded_pixels: 3840 * 2160,
             dom_video_extended_containers_enabled: false,
             dom_video_network_uri_enabled: false,
             dom_sanitizer_enabled: false,
