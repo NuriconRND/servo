@@ -239,6 +239,10 @@ pub(crate) struct Painter {
     /// `renderer_behind` (see [`DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT`]).
     display_composite_in_flight_since: Cell<Option<Instant>>,
 
+    /// When a video arrival last drove a composite, for the coalescing in
+    /// [`Painter::video_composite_due`].
+    last_video_driven_frame_at: Cell<Option<Instant>>,
+
     /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
     /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
     /// page's requestAnimationFrame count. `_start` is the current 1s window start, `_last` the
@@ -665,6 +669,7 @@ impl Painter {
             render_count: Default::default(),
             display_composite_in_flight: Default::default(),
             display_composite_in_flight_since: Default::default(),
+            last_video_driven_frame_at: Default::default(),
             present_cadence_start: Default::default(),
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
@@ -1553,6 +1558,40 @@ impl Painter {
     /// hiccup into multi-second stalls. Skipped requests lose nothing: the next composite
     /// carries the newest coalesced video frames. In the healthy steady state requests and
     /// renders alternate 1:1 on this thread, so this gate never throttles.
+    /// Whether a video arrival may ask for a composite yet.
+    ///
+    /// ***Video arrivals drive composites, but at the paint-timer cadence, not one per
+    /// arrival.*** Those are two different things and the code used to offer only the
+    /// extremes, both of which are wrong:
+    ///
+    /// * One composite per arrival: the request rate is the SUM of every video's frame rate
+    ///   (36 x FHD30 = 1080/s aimed at a 60Hz wall). Requests land while the renderer is
+    ///   still draining, and each queued publish marks the texture cache `must_be_drawn` so
+    ///   `Renderer::update()` re-renders it offscreen -- see `renderer_behind`. Measured
+    ///   2026-08-31 on the 4-GPU wall: 39.19 cores vs 22.72 with the path off, and on a
+    ///   heterogeneous page the primary tile's render was 17.42ms vs 6.02ms.
+    /// * No video-driven composites at all: then something ELSE has to drive them, and on a
+    ///   page whose only motion is video there is nothing. Measured on the same wall with a
+    ///   page holding one 30fps stream and stills: composites settled at **28/s, below the
+    ///   content's own 30fps**, so frames were built and never shown. It looked fine only
+    ///   while a CSS animation happened to be running (86/s), and collapsed when it ended.
+    ///   Adding a 60fps video "fixed" it by accident -- that video became the clock.
+    ///
+    /// Coalescing gives both: a floor at the paint cadence so video-only pages keep
+    /// updating, and a ceiling so a high aggregate arrival rate cannot amplify.
+    ///
+    /// `gfx_refresh_hz` is the period because it is exactly this: the free-running paint
+    /// timer whose job is to keep production near the display rate.
+    fn video_composite_due(&self) -> bool {
+        let hz = pref!(gfx_refresh_hz);
+        // Same clamp the pref documents; a bad value must not disable the floor.
+        let hz = if (1..=1000).contains(&hz) { hz } else { 120 };
+        let interval = Duration::from_secs_f64(1.0 / hz as f64);
+        self.last_video_driven_frame_at
+            .get()
+            .is_none_or(|last| last.elapsed() >= interval)
+    }
+
     fn renderer_behind(&self) -> bool {
         if !self.display_composite_in_flight.get() {
             return false;
@@ -2299,13 +2338,14 @@ impl Painter {
             self.pending_frames.get() == 0 &&
             !raf_driving_composites &&
             !self.renderer_behind() &&
-            // Off by default since 2026-08-31: requesting a composite per arriving video
-            // frame measured 42% MORE cpu at identical playback (pts_rate 1.00, 30.0fps on
-            // all 36 pipelines). See the pref's doc comment.
-            pref!(gfx_video_immediate_composite_enabled)
+            pref!(gfx_video_immediate_composite_enabled) &&
+            // Coalesced to the paint-timer cadence -- see `video_composite_due`. Without
+            // this the request rate is the SUM of every video's frame rate.
+            self.video_composite_due()
         {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             self.set_display_composite_in_flight(true);
+            self.last_video_driven_frame_at.set(Some(Instant::now()));
         }
 
         // With coalescing, a call that only stashed video frames produces an empty

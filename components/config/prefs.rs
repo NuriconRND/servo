@@ -376,18 +376,22 @@ pub struct Preferences {
     /// 판정이라 미설정이 곧 on 이었다. 끄면(false) 비디오 프레임마다 generate_frame 을
     /// 부르는 이전 동작으로 되돌아간다.
     pub gfx_video_decouple_enabled: bool,
-    /// 비디오 프레임이 도착할 때마다 즉시 재합성을 요청할지. ***기본 꺼짐*** — 옛 env
-    /// `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` 은 반대 방향(기본 켜짐)이었고 2026-08-31
-    /// 실측으로 뒤집었다. 켜면 비디오 도착이 합성을 유발하고, 끄면 refresh 주기가 합성을
-    /// 몰아 비디오는 그때 있는 프레임이 샘플링된다.
+    /// 비디오 프레임 도착이 합성을 구동할지. ***기본 켜짐, 단 도착마다가 아니라
+    /// `gfx_refresh_hz` 주기로 합쳐서 요청한다***(`painter.rs` `video_composite_due`).
     ///
-    /// 4-GPU 월 36 x FHD30 A/B: 켬 39.19 코어 / 끔 22.72 코어(**-42%**), 그때
-    /// pts_rate 1.00 · 30.0fps 가 36 파이프라인 전부에서 유지됐다 — 버려서 아낀 것이 아니다.
-    /// 이질 배치에서는 primary 타일 렌더가 17.42ms -> 6.02ms 로 줄었다. 도착마다 합성하면
-    /// 밀린 렌더러 뒤에 publish 가 쌓여 텍스처 캐시 전체 재도색을 유발하는데(painter.rs
-    /// `renderer_behind` 주석), 끄면 그 증폭이 사라진다.
+    /// 2026-08-31 실측으로 양극단이 둘 다 틀렸음이 확인됐다:
+    /// * 도착마다 요청 = 요청률이 전 영상 프레임레이트의 **합**(36xFHD30 이면 1080/s 를
+    ///   60Hz 월에 쏜다). 4-GPU 월 36xFHD30 에서 39.19 코어, 끄면 22.72 코어.
+    ///   이질 배치에서는 primary 타일 렌더가 17.42ms 대 6.02ms.
+    /// * 아예 안 함 = 합성을 구동할 다른 것이 필요한데 **영상만 움직이는 페이지에는 없다**.
+    ///   30fps 스트림 + 정지 이미지 페이지에서 합성이 **초당 28 회**로 주저앉았다 —
+    ///   콘텐츠 자신의 30fps 보다 낮다. CSS 애니메이션이 도는 동안만 86/s 로 멀쩡했고
+    ///   끝나자 무너졌다. 60fps 영상을 넣으면 "고쳐지는" 것은 그 영상이 클럭 노릇을 해서다.
     ///
-    /// 되돌리려면 `--pref gfx_video_immediate_composite_enabled=true`.
+    /// 합치면 둘 다 얻는다 — 영상만 있는 페이지에도 **하한**(페인트 주기)이 서고, 도착률이
+    /// 아무리 높아도 **상한**을 넘지 않아 증폭이 없다.
+    ///
+    /// `false` 로 두면 비디오 도착이 합성을 전혀 구동하지 않는다(위 두 번째 사례의 동작).
     pub gfx_video_immediate_composite_enabled: bool,
     /// The amount of image keys we request per batch for the image cache.
     pub image_key_batch_size: i64,
@@ -811,7 +815,7 @@ impl Preferences {
             gfx_video_escape_promote_hysteresis: 10,
             gfx_video_escape_buffer_count: 2,
             gfx_video_decouple_enabled: true,
-            gfx_video_immediate_composite_enabled: false,
+            gfx_video_immediate_composite_enabled: true,
             image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,
             intl_locale_override: String::new(),

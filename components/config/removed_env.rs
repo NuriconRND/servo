@@ -56,10 +56,10 @@ pub const REMOVED: &[RemovedEnv] = &[
     RemovedEnv {
         name: "SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE",
         pref: "gfx_video_immediate_composite_enabled",
-        message: "use --pref gfx_video_immediate_composite_enabled=true for the old \
-                  behaviour; the sense is INVERTED (the env disabled it, the pref enables \
-                  it) and it now defaults to false, which measured 42% less cpu at \
-                  identical playback speed",
+        message: "use --pref gfx_video_immediate_composite_enabled=false to stop video \
+                  arrivals driving composites; the sense is INVERTED (the env disabled it, \
+                  the pref enables it) and it defaults to true, but that path is now \
+                  coalesced to the gfx_refresh_hz cadence instead of firing per arrival",
     },
     RemovedEnv {
         name: "SERVO_COMPOSITOR_DCOMP",

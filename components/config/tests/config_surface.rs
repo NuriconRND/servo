@@ -475,9 +475,10 @@ const MIGRATED_ENV: &[&str] = &[
     // 추가 이관: Task 1 이 조사용으로 분류했으나 실제로는 운용 노브였다(런처 -TileSize 로
     // 출하되고 DComp 투명 구멍의 회피책으로 쓰인다).
     "SERVO_WR_PICTURE_TILE_SIZE",
-    // 2026-08-31: 조사용 게이트로 등록됐으나 실측이 기본값을 뒤집어 운용 노브가 됐다
-    // (36 x FHD30 4-GPU 월에서 켬 39.19 코어 / 끔 22.72 코어, pts_rate 는 양쪽 1.00).
-    // 새 pref 는 의미가 반대다: gfx_video_immediate_composite_enabled, 기본 false.
+    // 2026-08-31: 조사용 게이트 -> 운용 pref. 새 pref 는 의미가 반대이고
+    // (gfx_video_immediate_composite_enabled, 기본 true) 경로 자체가 바뀌었다 —
+    // 도착마다가 아니라 gfx_refresh_hz 주기로 합쳐서 요청한다. 양극단이 둘 다 틀렸다:
+    // 도착마다 = 39.19 코어(끄면 22.72), 아예 끔 = 합성 28/s < 콘텐츠 30fps.
     "SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE",
 ];
 
