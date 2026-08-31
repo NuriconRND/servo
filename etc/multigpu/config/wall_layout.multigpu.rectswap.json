@@ -1,0 +1,14 @@
+{
+  "_comment": "Diagnostic layout: same displays as wall_layout.multigpu.json, but each display shows the OTHER row's half of the virtual viewport. wall_layout.multigpu.reversed.json only reorders the tile array -- every display keeps its own rect there -- so it cannot tell content apart from hardware. This one moves the content while leaving display-to-adapter alone, so whichever of the two the cost follows is the answer. Renders the wall upside down on purpose; it is for measurement, not for looking at.",
+  "virtualViewport": {
+    "width": 11520,
+    "height": 4320
+  },
+  "tiles": [
+    { "display": 0, "rect": [0, 2160, 5760, 2160] },
+    { "display": 1, "rect": [5760, 2160, 5760, 2160] },
+    { "display": 2, "rect": [0, 0, 5760, 2160] },
+    { "display": 3, "rect": [5760, 0, 5760, 2160] }
+  ],
+  "overlapPx": 0
+}
