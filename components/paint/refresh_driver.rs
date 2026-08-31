@@ -242,6 +242,33 @@ impl TimerRefreshDriver {
     }
 }
 
+/// The free-running paint-timer period, from `gfx_refresh_hz`.
+///
+/// ***Exact, not truncated.*** This used to be `Duration::from_millis(1000 / hz)`: integer
+/// division into integer milliseconds, which cannot express a 60Hz period at all. 1000/60 is
+/// 16ms = 62.5Hz, so frame production ran 4.2% ahead of the display that the pref exists to
+/// match -- against the pref's own stated purpose of not beating with vsync. Every hz in
+/// `501..=999` was worse still: it collapsed to 1ms, so asking for 600Hz produced 1000Hz.
+///
+/// One function so the three places that need this period cannot drift apart again: this
+/// timer, the wall pacer's default minimum interval, and the video composite coalescing.
+///
+/// Read once, like the value it replaces: `gfx_refresh_hz` is a startup pref, and the video
+/// path asks for this per arriving frame (over a thousand times a second on a full wall).
+pub(crate) fn paint_timer_period() -> Duration {
+    static PERIOD: LazyLock<Duration> = LazyLock::new(|| {
+        let raw_hz = servo_config::pref!(gfx_refresh_hz);
+        let hz = if (1..=1000).contains(&raw_hz) {
+            raw_hz
+        } else {
+            warn!("Ignoring gfx_refresh_hz={raw_hz} (must be in [1, 1000]); using default 120");
+            120
+        };
+        Duration::from_secs_f64(1.0 / hz as f64)
+    });
+    *PERIOD
+}
+
 impl RefreshDriver for TimerRefreshDriver {
     fn observe_next_frame(&self, new_start_frame_callback: Box<dyn Fn() + Send + 'static>) {
         // Free-running paint-timer period. Default 120Hz. Override with the `gfx_refresh_hz`
@@ -251,17 +278,7 @@ impl RefreshDriver for TimerRefreshDriver {
         // single video). Read once; clamped to [1, 1000] Hz — task-2: the clamp is preserved
         // across the env->pref migration, but now warns instead of silently falling back, since
         // a pref typo is easier to make (and harder to notice) than a one-off env var.
-        static FRAME_DURATION: LazyLock<Duration> = LazyLock::new(|| {
-            let raw_hz = servo_config::pref!(gfx_refresh_hz);
-            let hz = if (1..=1000).contains(&raw_hz) {
-                raw_hz as u64
-            } else {
-                warn!("Ignoring gfx_refresh_hz={raw_hz} (must be in [1, 1000]); using default 120");
-                120
-            };
-            Duration::from_millis(1000 / hz)
-        });
-        self.queue_timer(*FRAME_DURATION, new_start_frame_callback);
+        self.queue_timer(paint_timer_period(), new_start_frame_callback);
     }
 }
 

@@ -54,6 +54,13 @@ use crate::InitialPaintState;
 use crate::painter::{FrameReadyDiagnostic, Painter};
 use crate::webview_renderer::UnknownWebView;
 
+/// How long the barrier waits for the remaining tiles after the first one is ready.
+///
+/// ***Deliberately NOT derived from `gfx_refresh_hz`, unlike the two rate limiters.*** This
+/// is a tolerance, not a cadence: it answers "how far apart may the tiles be before we give
+/// up on agreeing this frame", and that has no reason to track the display rate exactly. A
+/// flat, readable 16ms is the point. (It happens to be near a 60Hz frame, which is why the
+/// number was chosen, but nothing breaks if the display is 75Hz.)
 const WALL_FRAME_BARRIER_DEADLINE: Duration = Duration::from_millis(16);
 const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
 // task-2: SERVO_WALL_FRAME_PACING/_MAX_PENDING/_MIN_INTERVAL_MS 는 pref 로 옮겼다
@@ -317,15 +324,23 @@ impl WallFramePacingConfig {
             1
         };
 
+        // `0` now means "one paint-timer period", not "invalid, fall back to 16". It used to
+        // warn and use 16ms, so nothing that worked before changes -- but 16ms is 62.5Hz, and
+        // ***an integer-millisecond knob cannot express 60Hz at all***: 16 is 4.2% fast, 17 is
+        // 2% slow. Deriving it gets the exact period and keeps this limiter in step with the
+        // paint timer and the video composite coalescing instead of running 4% ahead of both.
+        // An explicit positive value is still honoured verbatim.
         let raw_min_interval_ms = pref!(gfx_wall_frame_min_interval_ms);
         let min_interval = if raw_min_interval_ms > 0 {
             Duration::from_millis(raw_min_interval_ms as u64)
         } else {
-            warn!(
-                "Ignoring gfx_wall_frame_min_interval_ms={raw_min_interval_ms}; \
-                 using default 16"
-            );
-            Duration::from_millis(16)
+            if raw_min_interval_ms < 0 {
+                warn!(
+                    "Ignoring gfx_wall_frame_min_interval_ms={raw_min_interval_ms} (negative); \
+                     using one paint-timer period"
+                );
+            }
+            crate::refresh_driver::paint_timer_period()
         };
 
         Self {

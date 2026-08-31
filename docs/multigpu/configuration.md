@@ -82,7 +82,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_refresh_hz` | i64 | `120` | 리프레시 드라이버 목표 주파수. `[1,1000]` 범위를 벗어나면 경고 후 기본값을 쓴다. |
 | `gfx_wall_frame_pacing_enabled` | bool | **`true`** | wall 프레임 페이싱(latest-wins). 이름과 달리 **기본 on** 이다 — 옛 판정이 `mode == Latest` 였다. |
 | `gfx_wall_frame_max_pending` | i64 | `1` | wall 프레임 배리어가 허용하는 미완료 프레임 수. |
-| `gfx_wall_frame_min_interval_ms` | i64 | `16` | wall 프레임 사이 최소 간격(ms). |
+| `gfx_wall_frame_min_interval_ms` | i64 | **`0`** | wall 프레임 사이 최소 간격(ms). ***`0` = `gfx_refresh_hz` 한 주기로 유도***. ★옛 기본값 `16` 은 62.5Hz 이고, 정수 ms 로는 60Hz(16.667ms)를 표현할 수 없다★ — 16 은 4.2% 빠르고 17 은 2% 느리다. 유도하면 페인트 타이머 및 비디오 합성 합치기와 같은 박자가 된다. 양수를 명시하면 그 값을 그대로 쓴다. |
 | `gfx_wr_picture_tile_size` | String | `""` (= 오버라이드 없음) | WebRender picture cache 타일 크기. `""` = WR 기본 분기(콘텐츠 1024x512, 스크롤바는 WR 이 자체 특수 크기), `WxH`(예 `1920x1080`) = 모든 painter 동일, **`display`** = painter 마다 자기 창 크기. 타일이 창 이상이면 슬라이스당 타일 1 장이 된다. ★**WR 은 이 값을 검사도 클램프도 하지 않는다**(2026-08-12 확인) — 실질 상한은 GPU 텍스처 크기다.★ ★**쪼개면 싸질 것이라는 예상은 반증되었다**(2026-08-26, 45xFHD30 5760x2160): `display` render_ms p50 29.9ms / present 28.6/s 인데, `1024x1024` 는 99.6ms / 8.4/s, `512x512` 는 108.4ms / 8.5/s 로 **합성 1 회가 3.5 배 느려진다**. 전면이 매 프레임 바뀌는 비디오 월에서 픽처 캐시는 순수 오버헤드이므로 `display` 를 유지할 것.★ |
 
 ### `gfx_video_*` — 비디오 WR 탈출 / 분리

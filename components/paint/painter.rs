@@ -1583,10 +1583,7 @@ impl Painter {
     /// `gfx_refresh_hz` is the period because it is exactly this: the free-running paint
     /// timer whose job is to keep production near the display rate.
     fn video_composite_due(&self) -> bool {
-        let hz = pref!(gfx_refresh_hz);
-        // Same clamp the pref documents; a bad value must not disable the floor.
-        let hz = if (1..=1000).contains(&hz) { hz } else { 120 };
-        let interval = Duration::from_secs_f64(1.0 / hz as f64);
+        let interval = crate::refresh_driver::paint_timer_period();
         self.last_video_driven_frame_at
             .get()
             .is_none_or(|last| last.elapsed() >= interval)

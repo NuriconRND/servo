@@ -316,7 +316,13 @@ pub struct Preferences {
     /// wall frame 코얼레싱이 쌓아 둘 수 있는 최대 보류 프레임 수. 0 이하면 경고 후
     /// 기본값(1)을 쓴다.
     pub gfx_wall_frame_max_pending: i64,
-    /// wall frame 코얼레싱 간 최소 간격(ms). 0 이하면 경고 후 기본값(16)을 쓴다.
+    /// wall frame 코얼레싱 간 최소 간격(ms). ***기본 `0` = `gfx_refresh_hz` 한 주기로
+    /// 유도***(`paint.rs` `from_prefs`, `refresh_driver::paint_timer_period`).
+    ///
+    /// 예전 기본값은 `16` 이었는데 그건 **62.5Hz** 다 — ★정수 ms 로는 60Hz(16.667ms)를
+    /// 아예 표현할 수 없다★(16 은 4.2% 빠르고 17 은 2% 느리다). 유도하면 정확한 주기가
+    /// 나오고, 페인트 타이머 및 비디오 합성 합치기와 같은 박자로 맞는다. 양수를 명시하면
+    /// 그 값을 그대로 쓴다. 음수는 경고 후 유도값.
     pub gfx_wall_frame_min_interval_ms: i64,
     /// WebRender picture cache 의 타일 크기 오버라이드(구 env `SERVO_WR_PICTURE_TILE_SIZE`).
     ///
@@ -805,7 +811,7 @@ impl Preferences {
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,
-            gfx_wall_frame_min_interval_ms: 16,
+            gfx_wall_frame_min_interval_ms: 0, // 0 = gfx_refresh_hz 한 주기(위 doc 참고)
             // 빈 문자열 = 오버라이드 없음(WR 기본). 위 필드 doc 주석 참고.
             gfx_wr_picture_tile_size: String::new(),
             // 근거는 위 필드 doc 주석 참고 (task-4 브리프의 반례 표: 킬스위치 둘은 기본

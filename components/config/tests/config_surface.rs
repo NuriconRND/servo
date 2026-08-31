@@ -354,7 +354,10 @@ fn gfx_defaults_match_the_behaviour_before_the_migration() {
         "WALL_FRAME_PACING_ENV 미설정 시 WallFramePacingMode::Latest -> enabled()==true"
     );
     assert_eq!(defaults.gfx_wall_frame_max_pending, 1);
-    assert_eq!(defaults.gfx_wall_frame_min_interval_ms, 16);
+    // 2026-08-31: 16 -> 0. ★16ms 는 62.5Hz 이고 정수 ms 로는 60Hz 를 표현할 수 없다★.
+    // 0 은 "gfx_refresh_hz 한 주기로 유도" 다 — 옛 0 은 "경고 후 16" 이라 실질 의미가
+    // 없었으므로 하위호환이 깨지지 않는다. 옛 동작이 필요하면 =16 을 명시한다.
+    assert_eq!(defaults.gfx_wall_frame_min_interval_ms, 0);
 }
 
 #[test]
