@@ -191,6 +191,9 @@ struct WallFrameCoordinator {
     active_webview_frames: HashMap<WebViewId, u64>,
     keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
     delay_injection: Option<WallFrameDelayInjection>,
+    /// How many keep-previous instructions have been expired by a newer wall frame, for
+    /// rate-limiting the log (see `expire_keep_previous_before`).
+    keep_previous_expired_count: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -878,6 +881,57 @@ impl WallFrameCoordinator {
         update
     }
 
+    /// Drop keep-previous instructions that a newer wall frame has made moot.
+    ///
+    /// ***A keep-previous entry is about ONE logical frame -- it carries that frame's id --
+    /// but nothing was comparing it.*** `render_all_tiles` only asks whether an entry exists
+    /// (`main.rs`, `paint_target_keep_previous_logical_frame(..).is_some()`), so "keep the
+    /// previous frame for logical frame N" was being obeyed forever.
+    ///
+    /// That turned one missed barrier into a permanently dark tile. The entry is otherwise
+    /// removed only while walking a barrier's painter list (on complete, or for the painters
+    /// that WERE ready on a miss), and a skipped painter renders nothing, so it never becomes
+    /// ready, so it drops out of later barriers -- measured 2026-08-31 as `ready=2/4` then
+    /// `2/3` then `1/2` -- and its entry is never reached again. One-way door.
+    ///
+    /// Expiring on the next wall frame restores the intended scope. The painters that still
+    /// have nothing new simply get presented with what they already had, which is what any
+    /// tile outside a barrier does anyway; the skip only ever saved a redundant present.
+    ///
+    /// Entries armed by the failure-injection path are left alone: that test exists to
+    /// observe the skip, so consuming it here would defeat it.
+    fn expire_keep_previous_before(&mut self, logical_frame_id: u64, painter_ids: &[PainterId]) {
+        for painter_id in painter_ids {
+            let stale = self
+                .keep_previous_painters
+                .get(painter_id)
+                .is_some_and(|frame| {
+                    !frame.remove_after_skip_query && frame.logical_frame_id < logical_frame_id
+                });
+            if !stale {
+                continue;
+            }
+            let previous = self.keep_previous_painters.remove(painter_id);
+            self.keep_previous_expired_count += 1;
+            let total = self.keep_previous_expired_count;
+            // Same rate-limit shape as the pacing summary: a tile that misses every barrier
+            // would otherwise warn once per wall frame.
+            if total <= 3 || total % WALL_FRAME_PACING_INFO_INTERVAL == 0 {
+                warn!(
+                    "Wall frame keep-previous expired: painter={:?} kept_for_logical_frame_id={} \
+                     superseded_by={} total_expired={}. The painter missed a barrier and would \
+                     otherwise have been skipped by the embedder for the rest of the session.",
+                    painter_id,
+                    previous
+                        .map(|frame| frame.logical_frame_id)
+                        .unwrap_or_default(),
+                    logical_frame_id,
+                    total,
+                );
+            }
+        }
+    }
+
     fn keep_previous_logical_frame(&mut self, painter_id: PainterId) -> Option<u64> {
         let keep_previous_frame = self.keep_previous_painters.get(&painter_id)?;
         let logical_frame_id = keep_previous_frame.logical_frame_id;
@@ -1463,6 +1517,13 @@ impl Paint {
     fn issue_wall_frame_request(&self, request: WallFrameRequest) -> Option<u64> {
         let wall_frame_requested_at = Instant::now();
         let logical_frame_id = self.next_logical_frame_id();
+        // Before anything else: a newer wall frame supersedes any "keep the previous frame"
+        // instruction left over from an older one. This runs over the REQUESTED targets, not
+        // the ones that end up generating -- a painter stuck behind a stale skip cannot
+        // generate, so keying off the generated set would never release it.
+        self.wall_frame_coordinator
+            .borrow_mut()
+            .expire_keep_previous_before(logical_frame_id, &request.target_painter_ids);
         if request.target_painter_ids.len() > 1 {
             info!(
                 "Wall logical frame {logical_frame_id} fan-out to paint targets \
