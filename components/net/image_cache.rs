@@ -10,7 +10,7 @@ use std::mem;
 use std::sync::Arc;
 
 use imsz::imsz_from_reader;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
@@ -159,7 +159,12 @@ fn set_webrender_image_key(
     if max_pixels > 0 {
         let before = image.metadata;
         if let Some((width, height)) = image.downscale_to_max_pixels(max_pixels as u64) {
-            info!(
+            // ***warn, not info.*** This alters what is displayed, it happens once per
+            // oversized image rather than per frame, and it is the only evidence the cap
+            // did anything. At info it was invisible: the wall launcher sets RUST_LOG to
+            // `warn,paint=info,media=info,...` with no `net` target, so the line could
+            // never appear in an operational log.
+            warn!(
                 "Downscaled an oversized image before upload: {}x{} -> {}x{}                  ({:.1} MB -> {:.1} MB of RGBA). Intrinsic size is unchanged; raise or                  disable with --pref dom_image_max_decoded_pixels=N (0 = off).",
                 before.width,
                 before.height,
