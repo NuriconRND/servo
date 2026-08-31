@@ -161,7 +161,16 @@ param(
     # completes, NOT by the display refresh: 20 videos measured 236 presents/s on a
     # 60Hz wall. With this set, video frames ride the script rendering-opportunity
     # cadence instead.
+    #
+    # ★2026-08-31: this is now the DEFAULT and the switch is a no-op kept for compatibility.★
+    # Measured on the 4-GPU wall, 36 x FHD30: immediate composite ON 39.19 cores, OFF
+    # 22.72 -- 42% less cpu -- while pts_rate stayed 1.00 and fps 30.0 on all 36 pipelines,
+    # so nothing was dropped to buy that. On a heterogeneous page the primary tile's render
+    # went 17.42ms -> 6.02ms. Use -ImmediateComposite to get the old behaviour back.
     [switch] $NoImmediateComposite,
+    # Turn video-arrival-driven composites back ON (pref gfx_video_immediate_composite_enabled).
+    # The engine default is off; see the note above for why.
+    [switch] $ImmediateComposite,
     # SERVO_FRAME_REASON_PROF=1: one line per second naming WHICH call site asked for each
     # composite. There are nine generate_frame call sites; gfx_refresh_hz only paces the
     # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
@@ -337,7 +346,6 @@ if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
     $env:SERVO_D3D11_PROFILE_MS = "$D3d11ProfileMs"
 }
 if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
-if ($NoImmediateComposite) { $env:SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
 if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
@@ -375,6 +383,11 @@ $argList = @(
 # The engine logs "accepting ALL TLS certificate errors" when this is on; keep it off for
 # anything but a page you control.
 if ($IgnoreCertErrors)    { $argList += "--ignore-certificate-errors" }
+# ***Must live here, with the other prefs, not up in the env-var section.*** `$argList` is
+# created below that section with `= @(...)`, so an append made earlier is thrown away --
+# which is exactly what happened on the first attempt, silently: the run started fine and
+# the header even said ON, but the engine never saw the pref.
+if ($ImmediateComposite)  { $argList += @("--pref", "gfx_video_immediate_composite_enabled=true") }
 if ($PageFeatures) {
     foreach ($f in @("dom_video_network_uri_enabled", "dom_video_extended_containers_enabled",
                      "dom_image_extended_formats_enabled", "dom_webrtc_enabled",
@@ -406,7 +419,7 @@ Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
 Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
-Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'off'}else{'on'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
+Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($ImmediateComposite){'ON (old behaviour)'}else{'off (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
 # its own log, not only in the command someone typed.
 if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS errors accepted)" }

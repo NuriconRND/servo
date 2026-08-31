@@ -158,21 +158,13 @@ pub const DCOMP_NO_PARTIAL_PRESENT: DebugFlag = DebugFlag {
 // (대소문자 무시, `"on"`/`"yes"`는 포함하지 않음 — D3D11_PROFILE 계열과 다른 변종).
 // ---------------------------------------------------------------------------------------------
 
-pub const DISABLE_VIDEO_IMMEDIATE_COMPOSITE: DebugFlag = DebugFlag {
-    name: "SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE",
-    kind: Kind::Str,
-    doc: "FPS-jitter 조사 A/B 게이트: update_images의 비디오-도착당 즉시 재합성을 끄고 스크립트 \
-          렌더링-기회 페이싱으로 대체. 기본 = 즉시 재합성 활성.",
-    cache_index: 9,
-};
-
 pub const LOG_PRESENT_CADENCE: DebugFlag = DebugFlag {
     name: "SERVO_LOG_PRESENT_CADENCE",
     kind: Kind::Str,
     doc: "진단: 초당 1회, 실제 엔진 present 빈도(frame-ready rate)와 프레임 간 최악 간격을 \
           로깅한다 — 페이지의 requestAnimationFrame 카운트나 외부 캡처 도구와 무관한 \
           그라운드트루스.",
-    cache_index: 10,
+    cache_index: 9,
 };
 
 pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
@@ -181,7 +173,7 @@ pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
     doc: "킬 스위치(기본 = 활성). 런타임 리사이즈(드래그/최대화) 정착 후 picture-cache \
           재구축을 끈다 — Task 12/12b 마스터 스위치, A/B 검증 및 회귀 시 안전 밸브. Windows \
           전용.",
-    cache_index: 11,
+    cache_index: 10,
 };
 
 pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
@@ -189,7 +181,7 @@ pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
     kind: Kind::Str,
     doc: "task-12b 전용 킬 스위치(기본 = 활성). \"드래그 중 가상 서피스 모드\"만 끄고 Task 12의 \
           정착 재구축은 유지한다. Windows 전용.",
-    cache_index: 12,
+    cache_index: 11,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -202,7 +194,7 @@ pub const VIDEO_ESCAPE_PROF: DebugFlag = DebugFlag {
     doc: "external 비디오 present 파이프라인 프로파일러 게이트. 켜지면 렌더러 스레드가 초당 \
           1회 [vesc-prof] 집계 라인(info)을 낸다 — acquire/convert/present 중 어느 단계가 \
           프레임 예산을 먹는지 판독용.",
-    cache_index: 13,
+    cache_index: 12,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -217,7 +209,7 @@ pub const MEDIA_DISABLE_ENOUGHDATA_BACKOFF: DebugFlag = DebugFlag {
     doc: "킬 스위치: PlayerError::EnoughData 백오프(요청 취소/재탐색)를 끈다. truthy: \
           \"1\"/\"true\"/\"yes\"/\"on\"(대소문자 무시). gstreamer player 백엔드와 \
           HTMLMediaElement 두 곳에서 각자 같은 판정으로 게이트한다.",
-    cache_index: 14,
+    cache_index: 13,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -233,7 +225,7 @@ pub const MEDIA_VIDEO_RATE: DebugFlag = DebugFlag {
           2.7이면 디코더가 그만큼 앞질러 돌고 있다는 뜻. 기본 off인 이유는 45타일 \
           장시간 운용에서 초당 45줄이 쌓이기 때문이다(같은 이유로 기존 sample \
           summary는 debug에 있다).",
-    cache_index: 15,
+    cache_index: 14,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -248,14 +240,14 @@ pub const FRAME_REASON_PROF: DebugFlag = DebugFlag {
           어느 것이 초당 200 회를 만드는지 로그만 보고는 가를 수 없다. 호출 지점은 \
           #[track_caller] 로 얻으므로 호출부는 손대지 않는다. 프레임마다 불리는 \
           핫패스라 기본 off 다.",
-    cache_index: 16,
+    cache_index: 15,
 };
 
 pub const MEDIA_SINK_PROF: DebugFlag = DebugFlag {
     name: "SERVO_MEDIA_SINK_PROF",
     kind: Kind::Str,
     doc: "비디오 appsink 콜백을 단계별로 재서 1초에 한 줄 찍는다(pace/diag/build/render/          notify). truthy: \"1\"/\"true\"/\"on\"(대소문자 무시). ★D3D11PROF 는 build_frame           '안' 만 본다★ - 45 영상 실측에서 그 안은 프레임당 1.56ms(0.047 코어/영상)로           스레드가 쓰는 0.76 코어의 6% 에 불과했다. 나머지 0.35 코어(디코드 천장 0.36 을           빼고도 남는 몫)는 콜백의 '바깥' 어딘가이고, 후보가 넷뿐이라 재면 바로 갈린다           - 특히 notify 는 프레임마다 IpcSender 전송이라 45 영상이면 초당 1350 회다.           프레임마다 불리는 핫패스라 기본 off.",
-    cache_index: 17,
+    cache_index: 16,
 };
 
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
@@ -270,7 +262,6 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_READBACK,
     &DCOMP_VALIDPROBE,
     &DCOMP_NO_PARTIAL_PRESENT,
-    &DISABLE_VIDEO_IMMEDIATE_COMPOSITE,
     &LOG_PRESENT_CADENCE,
     &DCOMP_DISABLE_RESIZE_REBUILD,
     &DCOMP_DISABLE_RESIZE_VIRTUAL,

@@ -51,6 +51,16 @@ pub struct RemovedEnv {
 
 pub const REMOVED: &[RemovedEnv] = &[
     // ---- Task 2/3: gfx_* 6 ----
+    // 2026-08-31: 조사용 A/B 게이트로 출발했으나 실측이 기본값을 뒤집어 운용 노브가 됐다.
+    // ***의미도 반대다*** — 옛 env 는 "끄기", 새 pref 는 "켜기"이고 기본이 꺼짐이다.
+    RemovedEnv {
+        name: "SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE",
+        pref: "gfx_video_immediate_composite_enabled",
+        message: "use --pref gfx_video_immediate_composite_enabled=true for the old \
+                  behaviour; the sense is INVERTED (the env disabled it, the pref enables \
+                  it) and it now defaults to false, which measured 42% less cpu at \
+                  identical playback speed",
+    },
     RemovedEnv {
         name: "SERVO_COMPOSITOR_DCOMP",
         pref: "gfx_dcomp_mode",

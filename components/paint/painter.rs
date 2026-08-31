@@ -62,11 +62,6 @@ use wr_malloc_size_of::MallocSizeOfOps;
 // immediate re-composite in `update_images` (falls back to script rendering-opportunity
 // pacing). Read once (cached inside `debug_env`). Default = enabled (current behavior).
 // Values "1"/"true" disable it.
-static VIDEO_IMMEDIATE_COMPOSITE_DISABLED: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::DISABLE_VIDEO_IMMEDIATE_COMPOSITE)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
 // Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
 // once per second per painter. This is the ground-truth displayed cadence, independent of the
 // page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
@@ -2304,7 +2299,10 @@ impl Painter {
             self.pending_frames.get() == 0 &&
             !raf_driving_composites &&
             !self.renderer_behind() &&
-            !*VIDEO_IMMEDIATE_COMPOSITE_DISABLED
+            // Off by default since 2026-08-31: requesting a composite per arriving video
+            // frame measured 42% MORE cpu at identical playback (pts_rate 1.00, 30.0fps on
+            // all 36 pipelines). See the pref's doc comment.
+            pref!(gfx_video_immediate_composite_enabled)
         {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             self.set_display_composite_in_flight(true);

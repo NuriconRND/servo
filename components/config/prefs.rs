@@ -376,6 +376,19 @@ pub struct Preferences {
     /// 판정이라 미설정이 곧 on 이었다. 끄면(false) 비디오 프레임마다 generate_frame 을
     /// 부르는 이전 동작으로 되돌아간다.
     pub gfx_video_decouple_enabled: bool,
+    /// 비디오 프레임이 도착할 때마다 즉시 재합성을 요청할지. ***기본 꺼짐*** — 옛 env
+    /// `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` 은 반대 방향(기본 켜짐)이었고 2026-08-31
+    /// 실측으로 뒤집었다. 켜면 비디오 도착이 합성을 유발하고, 끄면 refresh 주기가 합성을
+    /// 몰아 비디오는 그때 있는 프레임이 샘플링된다.
+    ///
+    /// 4-GPU 월 36 x FHD30 A/B: 켬 39.19 코어 / 끔 22.72 코어(**-42%**), 그때
+    /// pts_rate 1.00 · 30.0fps 가 36 파이프라인 전부에서 유지됐다 — 버려서 아낀 것이 아니다.
+    /// 이질 배치에서는 primary 타일 렌더가 17.42ms -> 6.02ms 로 줄었다. 도착마다 합성하면
+    /// 밀린 렌더러 뒤에 publish 가 쌓여 텍스처 캐시 전체 재도색을 유발하는데(painter.rs
+    /// `renderer_behind` 주석), 끄면 그 증폭이 사라진다.
+    ///
+    /// 되돌리려면 `--pref gfx_video_immediate_composite_enabled=true`.
+    pub gfx_video_immediate_composite_enabled: bool,
     /// The amount of image keys we request per batch for the image cache.
     pub image_key_batch_size: i64,
     /// Whether or not the DOM inspector should show shadow roots of user-agent shadow trees
@@ -798,6 +811,7 @@ impl Preferences {
             gfx_video_escape_promote_hysteresis: 10,
             gfx_video_escape_buffer_count: 2,
             gfx_video_decouple_enabled: true,
+            gfx_video_immediate_composite_enabled: false,
             image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,
             intl_locale_override: String::new(),

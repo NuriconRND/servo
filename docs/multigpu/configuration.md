@@ -43,6 +43,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx_video_escape_stable_swapchain` | **기본 on 킬스위치.** 옛 `=0` 이 `=false` 다 |
 | `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx_video_escape_promote_hysteresis` | `--pref gfx_video_escape_promote_hysteresis=N` |
 | `SERVO_VIDEO_DECOUPLE` | `gfx_video_decouple_enabled` | **기본 on 킬스위치.** 옛 `=0` 이 `=false` 다 |
+| `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` | `gfx_video_immediate_composite_enabled` | ★**의미가 반대다**★ — 옛 env 는 "끄기", 새 pref 는 "켜기"이고 **기본이 꺼짐**이다. 옛 동작은 `--pref gfx_video_immediate_composite_enabled=true` |
 | `SERVO_MEDIA_D3D11_VIDEO` | `media_d3d11_enabled` | `--pref media_d3d11_enabled=true` |
 | `SERVO_MEDIA_SYNC_GROUP` | `media_sync_group_target` | **불리언이 아니라 개수다.** `--pref media_sync_group_target=N` (타일 수). 이름도 바뀌었다 |
 | `SERVO_MEDIA_GAPLESS_LOOP` | `media_gapless_loop_enabled` | `--pref media_gapless_loop_enabled=true` |
@@ -93,6 +94,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_video_escape_promote_hysteresis` | i64 | `10` | 비디오 레이어를 탈출 경로로 승격하기 전에 기다리는 프레임 수. |
 | `gfx_video_escape_buffer_count` | i64 | `2` | **external 비디오 스왑체인 전용** 백버퍼 수(2..=4, 범위 밖은 경고 후 클램프). ★2 면 in-flight 프레임이 1 장이라 `Present` 가 컴포지터의 백버퍼 반납을 기다린다★ — 45xFHD30 실측에서 렌더러 스레드가 1 초 중 **85%(854ms)를 Present 에서** 보내는데 CPU 는 0.3 코어도 안 쓴다(= 일하는 게 아니라 자고 있다). 1 회당 비용도 영상 수에 따라 0.42ms(20 개) → 0.70ms(45 개)로 커진다(고정 드라이버 비용이면 안 커진다). **콘텐츠 스왑체인에는 적용되지 않는다** — 그쪽 부분 Present 의 catch-up 복사가 `GetBuffer(1)`=직전 프레임이라는 정확한 2 버퍼 핑퐁을 전제한다. |
 | `gfx_video_decouple_enabled` | bool | **`true`** | 킬스위치. 비디오 프레임 갱신을 씬 재합성에서 분리하는 경로를 끄려면 `=false`. |
+| `gfx_video_immediate_composite_enabled` | bool | **`false`** | 비디오 프레임이 도착할 때마다 즉시 재합성을 요청할지. ★2026-08-31 실측으로 기본값을 뒤집었다★ — 4-GPU 월 36xFHD30 A/B 에서 켬 **39.19 코어** / 끔 **22.72 코어(-42%)** 인데 그 사이 `pts_rate` 는 36 파이프라인 전부 **1.00**, fps 는 **30.0** 으로 동일했다(버려서 아낀 것이 아니다). 이질 배치에서는 primary 타일 렌더가 **17.42ms → 6.02ms**. 도착마다 합성하면 밀린 렌더러 뒤에 publish 가 쌓여 텍스처 캐시 전체 재도색을 유발하는데(`painter.rs` `renderer_behind` 주석), 끄면 그 증폭이 사라진다. 옛 동작은 `=true`. |
 
 ### `media_*` — 미디어
 
@@ -226,10 +228,6 @@ Task 9 결함 진단: non-opaque 서피스의 per-Virtual-bind valid_rect/dirty_
 ### `SERVO_DCOMP_NO_PARTIAL_PRESENT` — `Presence`
 
 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.
-
-### `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` — `Str`
-
-FPS-jitter 조사 A/B 게이트: update_images의 비디오-도착당 즉시 재합성을 끄고 스크립트 렌더링-기회 페이싱으로 대체. 기본 = 즉시 재합성 활성.
 
 ### `SERVO_LOG_PRESENT_CADENCE` — `Str`
 
