@@ -87,6 +87,26 @@ static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
 #[cfg(windows)]
 const DCOMP_RESIZE_DEBOUNCE_FRAMES: u32 = 10;
 
+/// How long `display_composite_in_flight` may stay set before it is force-released.
+///
+/// ***This exists because losing one redraw used to kill a wall tile permanently.***
+/// The flag is set when a display-paced composite is requested and cleared only by the
+/// render pass that follows (or by a frame-ready that will not repaint). If that render
+/// never arrives, nothing else clears it: `renderer_behind` stays true, so every later
+/// request is declined, so no transaction is sent, so no frame-ready arrives, so no render
+/// happens. The painter is dead with no way back.
+///
+/// Measured 2026-08-31 on the 4-GPU wall: two of four painters stopped rendering mid-run
+/// and never resumed for the remaining 44 seconds, while the paint side kept fanning out to
+/// all four. Their last line was a frame-ready with `need_repaint=true` and no render after
+/// it. It is intermittent but frequent, which is what a lost-redraw race looks like.
+///
+/// 2 seconds is deliberately far above any legitimate request->ready->render cycle (worst
+/// observed ~300ms: ~100ms to ready plus a ~200ms render). It also matches the media ring's
+/// demand TTL: past that the tile has already lost its plane ring and is showing green, so
+/// holding the gate shut protects nothing that is still intact.
+const DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(2);
+
 // 킬 스위치(기본 = 활성). "1"/"true"이면 런타임 리사이즈 시 picture-cache 재구축을 끈다.
 // A/B 검증(잔상 재현) 및 회귀 시 안전 밸브. 기본값에서는 재구축이 동작해 잔상을 제거한다.
 // 이 마스터 스위치는 Task 12(정착 재구축)와 12b(드래그 중 가상 모드+시작 재구축)를 모두 끈다.
@@ -216,7 +236,13 @@ pub(crate) struct Painter {
     /// skipped (see `renderer_behind`), which keeps WebRender's publish queue depth at <= 1
     /// by construction. Reset when a render pass completes, or when a frame-ready arrives
     /// that will not trigger a repaint.
+    /// Always written through `set_display_composite_in_flight`, never directly, so the
+    /// timestamp below cannot drift out of step with it.
     display_composite_in_flight: Cell<bool>,
+
+    /// When `display_composite_in_flight` was last set, for the force-release in
+    /// `renderer_behind` (see [`DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT`]).
+    display_composite_in_flight_since: Cell<Option<Instant>>,
 
     /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
     /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
@@ -643,6 +669,7 @@ impl Painter {
             unexpected_frame_ready_count: Default::default(),
             render_count: Default::default(),
             display_composite_in_flight: Default::default(),
+            display_composite_in_flight_since: Default::default(),
             present_cadence_start: Default::default(),
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
@@ -934,7 +961,7 @@ impl Painter {
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         // This render pass consumed every frame published so far (renderer.update() above
         // drained the whole publish queue), so the in-flight display composite is done.
-        self.display_composite_in_flight.set(false);
+        self.set_display_composite_in_flight(false);
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));
         }
@@ -1532,7 +1559,49 @@ impl Painter {
     /// carries the newest coalesced video frames. In the healthy steady state requests and
     /// renders alternate 1:1 on this thread, so this gate never throttles.
     fn renderer_behind(&self) -> bool {
-        self.display_composite_in_flight.get()
+        if !self.display_composite_in_flight.get() {
+            return false;
+        }
+        // Force-release rather than stay shut forever. See the constant's doc comment: with
+        // no escape here, a single lost redraw takes the tile out for the rest of the run.
+        //
+        // Checking on the DECLINE path is what makes this self-healing: a stuck painter
+        // sends no transactions, so it gets no frame-ready and no render -- but the wall
+        // keeps asking it for frames, so this runs. Recovery costs at most one timeout.
+        let stuck_for = self
+            .display_composite_in_flight_since
+            .get()
+            .map(|since| since.elapsed());
+        if stuck_for.is_none_or(|elapsed| elapsed < DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT) {
+            return true;
+        }
+        warn!(
+            "Painter {:?}: display composite stuck in flight for {:.1}ms with no render pass; \
+             force-releasing. The tile would otherwise stop rendering permanently. \
+             A lost redraw for this painter is the known cause.",
+            self.painter_id,
+            stuck_for
+                .map(|e| e.as_secs_f64() * 1000.0)
+                .unwrap_or_default(),
+        );
+        self.set_display_composite_in_flight(false);
+        false
+    }
+
+    /// Single writer for `display_composite_in_flight` and its timestamp, so the two cannot
+    /// disagree. The timestamp is only refreshed on a false->true edge: re-arming it while
+    /// already set would push the deadline out forever and defeat the whole guard.
+    fn set_display_composite_in_flight(&self, in_flight: bool) {
+        if !in_flight {
+            self.display_composite_in_flight.set(false);
+            self.display_composite_in_flight_since.set(None);
+            return;
+        }
+        if !self.display_composite_in_flight.get() {
+            self.display_composite_in_flight_since
+                .set(Some(Instant::now()));
+        }
+        self.display_composite_in_flight.set(true);
     }
 
     /// DComp Native 경로에서 런타임 리사이즈 후 picture-cache를 물리적으로 재구축한다.
@@ -1644,7 +1713,7 @@ impl Painter {
         if !need_repaint {
             // No render pass will follow this frame-ready, so an in-flight display
             // composite (if any) must be considered consumed here.
-            self.display_composite_in_flight.set(false);
+            self.set_display_composite_in_flight(false);
         }
         let pending_frames = self.pending_frames.get();
         if pending_frames == 0 {
@@ -2034,7 +2103,7 @@ impl Painter {
             Some(diagnostic_frame_id),
             Some(wall_requested_at),
         );
-        self.display_composite_in_flight.set(true);
+        self.set_display_composite_in_flight(true);
         self.send_transaction(transaction);
 
         let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
@@ -2135,7 +2204,7 @@ impl Painter {
         if self.frame_delayer.needs_new_frame() && !self.renderer_behind() {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
-            self.display_composite_in_flight.set(true);
+            self.set_display_composite_in_flight(true);
             generated_frame = true;
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
 
@@ -2238,7 +2307,7 @@ impl Painter {
             !*VIDEO_IMMEDIATE_COMPOSITE_DISABLED
         {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
-            self.display_composite_in_flight.set(true);
+            self.set_display_composite_in_flight(true);
         }
 
         // With coalescing, a call that only stashed video frames produces an empty
