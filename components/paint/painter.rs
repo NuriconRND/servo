@@ -243,6 +243,10 @@ pub(crate) struct Painter {
     /// [`Painter::video_composite_due`].
     last_video_driven_frame_at: Cell<Option<Instant>>,
 
+    /// A video arrival asked for a composite and the painter could not issue one yet. Kept
+    /// until it can, so a busy painter defers the request instead of dropping it.
+    video_composite_owed: Cell<bool>,
+
     /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
     /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
     /// page's requestAnimationFrame count. `_start` is the current 1s window start, `_last` the
@@ -670,6 +674,7 @@ impl Painter {
             display_composite_in_flight: Default::default(),
             display_composite_in_flight_since: Default::default(),
             last_video_driven_frame_at: Default::default(),
+            video_composite_owed: Default::default(),
             present_cadence_start: Default::default(),
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
@@ -2329,19 +2334,33 @@ impl Painter {
             }
         }
 
-        if !took_fast_path &&
-            immediate_image_update &&
+        // ***Owing a composite and being able to issue one are separate questions.*** The
+        // cadence decides the first, the painter's state decides the second, and mixing them
+        // into one condition is what kept the floor from working: an arrival that landed
+        // while a composite was in flight was DROPPED, not deferred, so the rate came out as
+        // "how often an arrival happens to coincide with an idle painter" -- measured at
+        // ~20/s on a wall whose paint cadence is 60.
+        if immediate_image_update
+            && pref!(gfx_video_immediate_composite_enabled)
+            && self.video_composite_due()
+        {
+            self.video_composite_owed.set(true);
+        }
+        if self.video_composite_owed.get() &&
+            !took_fast_path &&
             !generated_frame &&
             self.pending_frames.get() == 0 &&
+            // rAF already drives a steady cadence for this painter; the video rides that
+            // instead of adding a second source. The debt stays owed and is paid the moment
+            // rAF stops.
             !raf_driving_composites &&
-            !self.renderer_behind() &&
-            pref!(gfx_video_immediate_composite_enabled) &&
-            // Coalesced to the paint-timer cadence -- see `video_composite_due`. Without
-            // this the request rate is the SUM of every video's frame rate.
-            self.video_composite_due()
+            !self.renderer_behind()
         {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             self.set_display_composite_in_flight(true);
+            self.video_composite_owed.set(false);
+            // Stamped when the composite is ISSUED, not when it was owed, so a painter that
+            // was busy for a while does not immediately owe another one.
             self.last_video_driven_frame_at.set(Some(Instant::now()));
         }
 
