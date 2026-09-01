@@ -225,6 +225,19 @@ param(
     # Pair it with -PresentCadence: that reports angle_lock_ms per tile, which is the other half
     # -- whether the tiles are slow doing their own work or waiting on the WebGL thread's lock.
     [switch] $FanoutProf,
+    # SERVO_DCOMP_BIND_PROF=1: splits the DComp tile bind/unbind round trip into BeginDraw,
+    # the EGL pbuffer wrap, EndDraw and teardown, plus the dirty area against the tile area.
+    #
+    # This is the follow-up to the A/B that turned the native compositor off: the wall went
+    # 24.9 -> 61.9fps and the mean painter render 7.75 -> 0.83ms, and the cost was
+    # IDCompositionVirtualSurface::BeginDraw/EndDraw for each invalidated picture-cache tile.
+    # Which of those four it actually is decides the fix, and they have nothing in common --
+    # a slow BeginDraw means waiting for DComp to hand the surface back, an expensive pbuffer
+    # wrap is EGL work on an atlas texture, and a dirty area that always equals the tile area
+    # means partial update never engages, so the cost tracks -TileSize rather than content.
+    #
+    # Needs -DComp surface: with the compositor off there is nothing to bind.
+    [switch] $DcompBindProf,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -354,6 +367,9 @@ if ($VideoEscape -ne "" -and $DComp -eq "off") {
 if ($DcompDebug -and $DComp -eq "off") {
     Write-Warning "-DcompDebug with -DComp off will print nothing: there is no native compositor to trace. Add -DComp surface."
 }
+if ($DcompBindProf -and $DComp -eq "off") {
+    throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
+}
 
 $serveRoot = Join-Path $here "pages\html"
 $httpServer = $null
@@ -410,6 +426,7 @@ if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
 if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($FanoutProf)           { $env:SERVO_WEBGL_FANOUT_PROF = "1" }
+if ($DcompBindProf)        { $env:SERVO_DCOMP_BIND_PROF = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
@@ -912,6 +929,40 @@ if ($wex) {
     }
 } elseif ($FanoutProf) {
     Write-Warning "-FanoutProf was set but no WEBGLEXTIMG line was logged. It only emits from the external-image unlock callback, so a run whose page never shows a WebGL canvas produces nothing."
+}
+
+# --- DCOMPBIND: which part of the DComp tile round trip costs the 15ms? ---
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) binds=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) end_ms=([\d.]+) destroy_ms=([\d.]+) dirty_px=(\d+) tile_px=(\d+) full_tile=(\d+)/(\d+)" -EA SilentlyContinue
+if ($dbp) {
+    $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
+    $w = 0.0; $binds = 0.0; $begin = 0.0; $pbuf = 0.0; $end = 0.0; $destroy = 0.0
+    $dirty = 0.0; $tilepx = 0.0; $full = 0.0
+    foreach ($m in $dbp) {
+        $w += (& $v $m 1); $binds += (& $v $m 2); $begin += (& $v $m 3); $pbuf += (& $v $m 4)
+        $end += (& $v $m 5); $destroy += (& $v $m 6); $dirty += (& $v $m 7); $tilepx += (& $v $m 8)
+        $full += (& $v $m 9)
+    }
+    $secs = [math]::Max($w / 1000.0, 0.001)
+    $total = $begin + $pbuf + $end + $destroy
+    Write-Host ""
+    Write-Host ("DCOMPBIND -- the DComp tile round trip ({0:N0} binds/s over {1:N0}s):" -f ($binds/$secs), $secs)
+    foreach ($row in @(@{n="BeginDraw"; v=$begin}, @{n="pbuffer wrap"; v=$pbuf}, @{n="EndDraw"; v=$end}, @{n="teardown"; v=$destroy})) {
+        $share = if ($total -gt 0) { 100.0 * $row.v / $total } else { 0.0 }
+        Write-Host ("  {0,-14} {1,9:N1} ms/s  ({2,5:N1}% of the round trip)" -f $row.n, ($row.v/$secs), $share)
+    }
+    if ($binds -gt 0) {
+        Write-Host ("  per bind: {0:N3} ms" -f ($total/$binds))
+        $fullShare = 100.0 * $full / $binds
+        Write-Host ("  full-tile updates: {0:N0}/{1:N0} ({2:N1}%)" -f $full, $binds, $fullShare)
+        if ($fullShare -gt 90) {
+            Write-Warning "Partial update never engages -- every bind asks for the whole tile. The cost then tracks -TileSize (gfx_wr_picture_tile_size), not page content."
+        }
+        $worst = @(@{n="BeginDraw"; v=$begin}, @{n="pbuffer wrap"; v=$pbuf}, @{n="EndDraw"; v=$end}, @{n="teardown"; v=$destroy}) |
+            Sort-Object { -$_.v } | Select-Object -First 1
+        Write-Host ("  dominant phase: {0}" -f $worst.n)
+    }
+} elseif ($DcompBindProf) {
+    Write-Warning "-DcompBindProf was set but no DCOMPBIND line was logged. It emits from unbind, so a run where no picture-cache tile was ever invalidated produces nothing."
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }

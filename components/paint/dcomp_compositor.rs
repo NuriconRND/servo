@@ -1221,6 +1221,37 @@ fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool
 
 /// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
 /// DComp 가상 서피스에 직접 그리게 한다. 전역 상태 없음.
+/// `SERVO_DCOMP_BIND_PROF` 게이트. 타일마다 물어보는 자리라 env 읽기를 캐시한다.
+static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    servo_config::debug_env::string(&servo_config::debug_env::DCOMP_BIND_PROF)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+/// `SERVO_DCOMP_BIND_PROF` 누적기. 창은 1 초이고 `end_frame` 에서 닫는다.
+///
+/// 왜: DComp Native 를 끄면 월이 24.9 -> 61.9fps 이고 평균 painter 렌더가 7.75 -> 0.83ms 다
+/// (2026-09-01 짝 A/B). 그 차이 전부가 `wr_render_ms` 안에 있고 업로드도 락도 아니었으므로
+/// 남는 것은 이 bind/unbind 왕복이다. 그 안에서 **어느 구간인지**를 가르는 것이 이 계측의
+/// 전부다 — 구간마다 고칠 방법이 전혀 다르기 때문이다.
+#[derive(Default)]
+struct BindProfile {
+    window_start: Option<std::time::Instant>,
+    binds: u64,
+    /// `IDCompositionVirtualSurface::BeginDraw` 자체.
+    begin_ns: u64,
+    /// BeginDraw 가 돌려준 (아틀라스일 수 있는) 텍스처를 EGL pbuffer 로 감싸고 current 로 삼는 비용.
+    pbuffer_ns: u64,
+    /// `EndDraw`.
+    end_ns: u64,
+    /// pbuffer 파괴 + 텍스처 Release.
+    destroy_ns: u64,
+    /// 갱신 요청한 면적과 타일 전체 면적. ★둘이 같으면 부분 갱신이 성립하지 않는 것이다★ —
+    /// 그러면 비용이 캔버스가 아니라 `gfx_wr_picture_tile_size` 에 비례한다.
+    dirty_px: u64,
+    tile_px: u64,
+    full_tile: u64,
+}
+
 pub struct DCompNativeCompositor {
     rendering_context: Rc<dyn RenderingContext>,
     dcomp_device: Option<ComOwned<IDCompositionDevice>>,
@@ -1253,6 +1284,8 @@ pub struct DCompNativeCompositor {
     warned_regen_fail: bool,
     /// 누적된 프레임 번호 — begin_frame에서 증가. 쿨다운 만료 시점(frame_counter >= promote_blocked_until).
     frame_counter: u64,
+    /// bind/unbind 구간별 비용(`SERVO_DCOMP_BIND_PROF`). 꺼져 있으면 갱신되지 않는다.
+    bind_profile: BindProfile,
     /// 비디오 external surface 변환 패스(Task 4). 최초 external present 시 지연 생성 —
     /// 비-비디오 월은 셰이더 컴파일 비용을 아예 안 낸다. None + init_failed=false = 미시도.
     convert_pass: Option<crate::dcomp_video_convert::VideoConvertPass>,
@@ -1428,6 +1461,7 @@ pub fn maybe_create(
             warned_promote_fail: false,
             warned_regen_fail: false,
             frame_counter: 0,
+            bind_profile: BindProfile::default(),
             convert_pass: None,
             convert_pass_init_failed: false,
             d3d11_context1,
@@ -1925,6 +1959,38 @@ impl DCompNativeCompositor {
     /// 지연 적용해 둔 값을 그대로 물려받아 무해하다. 단 하나의 예외: DPI 변경으로
     /// `present_inset`이 갱신된 직후 다음 `begin_frame` 전에 이 경로가 먼저 돌면 그 1회는
     /// 갱신 전 오프셋으로 present된다. 후속 프레임이 `begin_frame`에 도달하면 자동 교정된다.
+    /// 계측 창(1 초)을 unbind 경계에서 닫고 한 줄 찍는다(`SERVO_DCOMP_BIND_PROF`).
+    ///
+    /// `warn!` 인 것은 의도적이다 — 이 모듈의 `[dcomp-dbg]` 는 `info!` 라 런처 RUST_LOG 의
+    /// `paint=info` 에 의존하는데, 그 의존이 이미 한 번 무출력으로 시간을 먹였다.
+    fn maybe_emit_bind_profile(&mut self) {
+        let now = std::time::Instant::now();
+        let window = now - *self.bind_profile.window_start.get_or_insert(now);
+        if window < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let profile = &self.bind_profile;
+        warn!(
+            "DCOMPBIND window_ms={:.0} binds={} begin_ms={:.1} pbuffer_ms={:.1} \
+             end_ms={:.1} destroy_ms={:.1} dirty_px={} tile_px={} full_tile={}/{}",
+            window.as_secs_f64() * 1000.0,
+            profile.binds,
+            ms(profile.begin_ns),
+            ms(profile.pbuffer_ns),
+            ms(profile.end_ns),
+            ms(profile.destroy_ns),
+            profile.dirty_px,
+            profile.tile_px,
+            profile.full_tile,
+            profile.binds,
+        );
+        self.bind_profile = BindProfile {
+            window_start: Some(now),
+            ..Default::default()
+        };
+    }
+
     pub(crate) fn present_external_only(&mut self) {
         let rc = self.rendering_context.clone();
         let Some(provider) = paint_api::video_external_surface_provider() else {
@@ -2350,6 +2416,7 @@ impl Compositor for DCompNativeCompositor {
 
                 // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
                 // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
+                let begin_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
                 let (texture, update_offset, desc) = unsafe {
                     let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
                     let mut update_offset = POINT { x: 0, y: 0 };
@@ -2368,6 +2435,21 @@ impl Compositor for DCompNativeCompositor {
                     (*tex).GetDesc(&mut desc);
                     (tex, update_offset, desc)
                 };
+                if let Some(start) = begin_start {
+                    let profile = &mut self.bind_profile;
+                    profile.binds += 1;
+                    profile.begin_ns += start.elapsed().as_nanos() as u64;
+                    // 갱신 요청 면적 대 타일 전체 면적. 부분 갱신이 실제로 성립하는지는
+                    // 이 둘의 비교로만 알 수 있다.
+                    let dirty = (update_rect_v.width() as u64) * (update_rect_v.height() as u64);
+                    let tile = (tile_rect.width() as u64) * (tile_rect.height() as u64);
+                    profile.dirty_px += dirty;
+                    profile.tile_px += tile;
+                    if dirty >= tile {
+                        profile.full_tile += 1;
+                    }
+                }
+                let pbuffer_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
 
                 let pbuffer = match rc.create_render_pbuffer_from_d3d_texture(
                     texture as usize,
@@ -2394,6 +2476,9 @@ impl Compositor for DCompNativeCompositor {
                         let _ = (*vsurf).EndDraw();
                     }
                     return fail;
+                }
+                if let Some(start) = pbuffer_start {
+                    self.bind_profile.pbuffer_ns += start.elapsed().as_nanos() as u64;
                 }
 
                 // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 영역)를
@@ -2517,6 +2602,8 @@ impl Compositor for DCompNativeCompositor {
         let Some(bound) = self.bound.take() else {
             return;
         };
+        // `self.surfaces` 를 빌린 match 안에서 `self.bind_profile` 을 건드리지 않으려고 밖으로 뺀다.
+        let mut end_ns: Option<u64> = None;
         // Task 6 defect-2 diagnosis: read the tile pixels BEFORE EndDraw/destroy while the
         // pbuffer is still current. Gated (env off => no glReadPixels) and frame-limited to
         // <=120 (spec §7.1 stall amplification). Only the Virtual arm sets `bound`, which is
@@ -2530,10 +2617,12 @@ impl Compositor for DCompNativeCompositor {
             match &entry.storage {
                 SurfaceStorage::Virtual { virtual_surface } => {
                     // Safety: 서피스는 bind~unbind 사이 파괴되지 않는다(WR 계약).
+                    let end_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
                     let hr = unsafe { (*virtual_surface.as_ptr()).EndDraw() };
                     if hr < 0 {
                         warn!("[dcomp-native] EndDraw failed (hr=0x{:08x})", hr as u32);
                     }
+                    end_ns = end_start.map(|start| start.elapsed().as_nanos() as u64);
                 },
                 SurfaceStorage::SwapChain(_) => {
                     // 도달 불가: 스왑체인 bind는 BoundTile을 만들지 않으므로(self.bound=None)
@@ -2558,12 +2647,20 @@ impl Compositor for DCompNativeCompositor {
             );
         }
         // EGL은 현재 서피스 파괴를 유예하므로 unbind 직후 destroy가 안전(Task 1 주석).
+        let destroy_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         self.rendering_context.destroy_render_pbuffer(bound.pbuffer);
         if !bound.texture.is_null() {
             // Safety: BeginDraw가 돌려준 AddRef된 텍스처를 EndDraw 이후 한 번 Release.
             unsafe {
                 (*(bound.texture as *mut IUnknown)).Release();
             }
+        }
+        if *DCOMP_BIND_PROF {
+            self.bind_profile.end_ns += end_ns.unwrap_or(0);
+            if let Some(start) = destroy_start {
+                self.bind_profile.destroy_ns += start.elapsed().as_nanos() as u64;
+            }
+            self.maybe_emit_bind_profile();
         }
     }
 

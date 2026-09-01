@@ -309,6 +309,20 @@ WEBGLEXTIMG painter=PainterId(1) window_ms=1000 locks=17 lock_ms=254.3 take_ms=0
 
 painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `angle_lock_ms` 로 본다.
 
+### `SERVO_DCOMP_BIND_PROF` — `Str`
+
+DComp Native 의 타일 bind/unbind 비용을 1 초에 한 줄로 쪼개 집계한다(BeginDraw / pbuffer 래핑 / EndDraw / pbuffer 파괴, 그리고 dirty 면적 대 타일 면적). truthy: "1" 또는 "true"(대소문자 무시). 2026-09-01 짝 A/B 에서 DComp Native 를 끄면 월이 24.9fps 에서 61.9fps 가 됐다 — 평균 painter 렌더 7.75ms 대 0.83ms. 그 비용은 WR 컴포지터의 bind()/unbind() 가 무효화된 picture-cache 타일마다 부르는 IDCompositionVirtualSurface::BeginDraw/EndDraw 다. 이 노브는 그 안에서 어느 구간인지를 가른다: BeginDraw 자체가 크면 DComp 가 서피스를 내주기를 기다리는 것이고, pbuffer 가 크면 아틀라스 텍스처를 EGL 로 감싸는 비용이며, dirty 면적이 늘 타일 면적과 같으면 부분 갱신이 성립하지 않아 매 프레임 타일 전체를 새로 받는 것이다. 타일마다 불리는 핫패스라 기본 off.
+
+```
+DCOMPBIND window_ms=1001 binds=243 begin_ms=3612.4 pbuffer_ms=41.2 end_ms=88.7   destroy_ms=12.1 dirty_px=503316480 tile_px=503316480 full_tile=243/243
+```
+
+읽는 법: `full_tile` 이 `binds` 와 같으면 **부분 갱신이 한 번도 성립하지 않는 것**이고, 그러면
+매 프레임 타일 전체를 DComp 에서 새로 받는 셈이라 비용이 타일 크기에 비례한다
+(`gfx_wr_picture_tile_size`, 런처 `-TileSize`). `begin_ms` 가 나머지를 압도하면 DComp 가
+서피스를 내주기를 기다리는 것이므로 버퍼링/타이밍 문제이고, `pbuffer_ms` 가 크면 아틀라스
+텍스처를 EGL pbuffer 로 감싸는 비용이라 성격이 다르다.
+
 ## wall CLI 플래그
 
 pref 가 아니라 CLI 플래그다. 두 셸이 각자 파싱하지만 **검증과 해석은

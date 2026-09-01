@@ -257,6 +257,13 @@ pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
     cache_index: 17,
 };
 
+pub const DCOMP_BIND_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_DCOMP_BIND_PROF",
+    kind: Kind::Str,
+    doc: "DComp Native 의 타일 bind/unbind 비용을 1 초에 한 줄로 쪼개 집계한다(BeginDraw / pbuffer 래핑 / \n          EndDraw / pbuffer 파괴, 그리고 dirty 면적 대 타일 면적). truthy: \"1\" 또는 \"true\"(대소문자 무시). \n          2026-09-01 짝 A/B 에서 DComp Native 를 끄면 월이 24.9fps 에서 61.9fps 가 됐다 — 평균 painter 렌더 \n          7.75ms 대 0.83ms. 그 비용은 WR 컴포지터의 bind()/unbind() 가 무효화된 picture-cache 타일마다 부르는 \n          IDCompositionVirtualSurface::BeginDraw/EndDraw 다. 이 노브는 그 안에서 어느 구간인지를 가른다: \n          BeginDraw 자체가 크면 DComp 가 서피스를 내주기를 기다리는 것이고, pbuffer 가 크면 아틀라스 텍스처를 EGL 로 감싸는 \n          비용이며, dirty 면적이 늘 타일 면적과 같으면 부분 갱신이 성립하지 않아 매 프레임 타일 전체를 새로 받는 것이다. 타일마다 불리는 \n          핫패스라 기본 off.",
+    cache_index: 18,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -278,6 +285,7 @@ pub const ALL: &[&DebugFlag] = &[
     &FRAME_REASON_PROF,
     &MEDIA_SINK_PROF,
     &WEBGL_FANOUT_PROF,
+    &DCOMP_BIND_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에
