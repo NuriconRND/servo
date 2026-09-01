@@ -146,8 +146,22 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
 1. **`BaseRefreshDriver` 를 타일별로 나눌 수 있나?** 지금은 `Paint` 와 painter 들이 하나를
    공유하고 observer 가 `Painter` 를 콜백한다. 나눌 수 없으면 메인에 남기고 메시지로 통신해야
    하는데, 그러면 프레임 시작 신호가 스레드를 한 번 더 건넌다.
-2. **`dcomp_shared: Option<Rc<RefCell<DCompNativeCompositor>>>`** — 이름의 "shared" 가 타일 간
-   공유를 뜻하는지 확인해야 한다. 공유라면 A 의 전제가 흔들린다.
+2. ~~**`dcomp_shared` 의 "shared" 가 타일 간 공유인가.**~~ **해소(2026-09-01). 공유가 아니다.**
+   "shared" 는 **WebRender 와 Painter 사이**를 뜻한다 — WR 이 `Box<SharedDComp>`
+   (`CompositorConfig::Native`)로 소유하고 painter 가 같은 인스턴스의 `Rc` 클론으로
+   `present_external_only()` 를 직접 부른다(WR 프레임 빌드를 우회하는 fast-path). 둘 다 A 에서
+   같은 타일 스레드에 산다.
+   - `maybe_create`(`dcomp_compositor.rs:1299`)는 **호출마다 새로 만든다.** 캐시도 전역도 없고
+     호출 지점이 `Painter::new`(`painter.rs:524`) **하나뿐**이라 painter 당 정확히 하나다.
+   - 그 인스턴스는 **그 painter 자신의 HWND 와 자신의 ANGLE D3D11 디바이스**에 묶인다. 마침
+     그 디바이스 포인터가 지금 ANGLE 락의 키이므로(`5cc95bd09ee`), DComp 경로도 이미
+     타일별로 갈려 있다.
+   - `dcomp_compositor.rs` 의 전역은 전부 `OnceLock` **설정 캐시**(버퍼 수, stable swapchain,
+     unbind 동작, 프로파일 게이트, storage mode)다. 최초 1회 읽고 불변이며 `OnceLock` 은
+     `Sync` 라 여러 스레드에서 안전하다. 타일별 상태를 든 전역은 없다.
+
+   A 에 대한 함의: 전제가 유지될 뿐 아니라 유리하다. 타일 스레드가 HWND 로 컨텍스트를 만들면
+   DComp 컴포지터도 그 스레드에서 그 컨텍스트로부터 자연히 만들어진다.
 3. ~~**`webrender::Renderer` 가 다른 스레드에서 생성·구동 가능한가.**~~ **해소(2026-09-01).**
    ★생성은 된다. 옮기는 것은 안 된다.★ A안은 옮기지 않고 타일 스레드가 직접 만드므로 성립한다.
    근거:
