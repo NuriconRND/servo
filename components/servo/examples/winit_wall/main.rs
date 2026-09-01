@@ -232,6 +232,15 @@ struct AppState {
     // that is optimistic. Accumulated per pass and reported once a second so the ratio can be
     // read off instead of argued about. Enabled by SERVO_LOG_PRESENT_CADENCE.
     pass_stats: RefCell<PassStats>,
+    /// Presentation clock period, from `gfx_refresh_hz`.
+    ///
+    /// ***The wall draws on a clock, not when content says it is ready.*** Everything that
+    /// produces pixels -- video decode, a WebGL rAF loop, script animation -- updates its own
+    /// state whenever it likes; the clock decides when what exists gets drawn. That is the
+    /// model a display wants, and it is not what this shell used to do.
+    present_period: std::time::Duration,
+    /// When the next presentation tick is due.
+    next_present_tick: Cell<std::time::Instant>,
     capture_path: Option<String>,
     capture_deadline: Option<std::time::Instant>,
     captured: Cell<bool>,
@@ -423,12 +432,15 @@ impl AppState {
 
 impl ::servo::WebViewDelegate for AppState {
     fn notify_new_frame_ready(&self, _: WebView) {
-        // Drive a single repaint request; `render_all_tiles` then paints every tile.
-        // winit may deliver `RedrawRequested` to only one window, so we never rely on
-        // per-window redraw to paint the wall (matches servoshell).
-        if let Some(tile) = self.tiles.first() {
-            tile.window.request_redraw();
-        }
+        // ***Deliberately does nothing.*** This used to request a redraw, which made the
+        // presentation cadence a function of when content happened to finish -- so the wall
+        // ran at 138 passes/s on one page and 52 on another, neither of them the display's
+        // 60. Worse, it made presentation depend on a content signal: when that signal was
+        // lost (a stuck in-flight flag, a stale keep-previous entry) the tile stopped
+        // updating for the rest of the session. Both were real bugs on this wall.
+        //
+        // `about_to_wait` now drives redraws from a clock, so a frame that has just been
+        // built is simply what the next tick will draw.
     }
 }
 
@@ -590,6 +602,18 @@ impl ApplicationHandler<WakerEvent> for App {
             present_count: Cell::new(0),
             present_window_start: Cell::new(None),
             pass_stats: RefCell::new(PassStats::default()),
+            present_period: {
+                // Same knob and the same clamp the paint timer uses; one refresh rate for the
+                // machine, not two that can disagree.
+                let raw_hz = servo_config::pref!(gfx_refresh_hz);
+                let hz = if (1..=1000).contains(&raw_hz) {
+                    raw_hz
+                } else {
+                    120
+                };
+                std::time::Duration::from_secs_f64(1.0 / hz as f64)
+            },
+            next_present_tick: Cell::new(std::time::Instant::now()),
             capture_deadline: config.capture.as_ref().map(|_| {
                 std::time::Instant::now() + std::time::Duration::from_secs_f64(config.capture_sec)
             }),
@@ -649,13 +673,35 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
-        // fires even on a static page that has otherwise gone idle (no new frame-ready events).
+        // fires even on a static page that has otherwise gone idle.
         if state.capture_path.is_some() && !state.captured.get() {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(tile) = state.tiles.first() {
                 tile.window.request_redraw();
             }
+            return;
         }
+
+        // The presentation clock. Every tick draws whatever the engine currently holds --
+        // no test of whether anything changed, which is the point: the cadence must not be a
+        // function of the content, or it is neither uniform nor recoverable when a content
+        // signal goes missing.
+        let now = std::time::Instant::now();
+        let mut next = state.next_present_tick.get();
+        if now >= next {
+            // ***Advance to the first future tick rather than adding one period.*** After a
+            // stall (a long render, a debugger break) `next` can be far in the past, and
+            // stepping by one period would fire a burst of catch-up frames for moments that
+            // have already gone by. Skipping them is what a display does.
+            while next <= now {
+                next += state.present_period;
+            }
+            state.next_present_tick.set(next);
+            if let Some(tile) = state.tiles.first() {
+                tile.window.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
     }
 
     fn window_event(
