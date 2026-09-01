@@ -946,18 +946,20 @@ if ($wex) {
 # only 6 binds/s against 18 renders/s -- most renders bind nothing yet all of them were slow,
 # so the cost is not per tile. end_frame is the one thing here that runs every frame, and it
 # holds the GL flush, the swap-chain Present and the DWM Commit.
-$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) external_ms=([\d.]+) externals=(\d+) present_ms=([\d.]+) presents=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) external_ms=([\d.]+) externals=(\d+) present_ms=([\d.]+) presents=(\d+) visuals=(\d+) surfaces=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
 if ($dbp) {
     $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     $w = 0.0; $bf = 0.0; $ef = 0.0; $binds = 0.0; $full = 0.0
     $endf = 0.0; $flush = 0.0; $commit = 0.0; $bd = 0.0; $pbuf = 0.0; $ed = 0.0; $td = 0.0
     $flushed = 0.0; $skipped = 0.0; $ext = 0.0; $extN = 0.0; $pres = 0.0; $presN = 0.0
+    $vis = 0.0; $surf = 0.0
     foreach ($m in $dbp) {
         $w += (& $v $m 1); $bf += (& $v $m 2); $ef += (& $v $m 3); $binds += (& $v $m 4)
         $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7)
         $flushed += (& $v $m 8); $skipped += (& $v $m 9); $commit += (& $v $m 10)
         $ext += (& $v $m 11); $extN += (& $v $m 12); $pres += (& $v $m 13); $presN += (& $v $m 14)
-        $bd += (& $v $m 15); $pbuf += (& $v $m 16); $ed += (& $v $m 17); $td += (& $v $m 18)
+        $vis += (& $v $m 15); $surf += (& $v $m 16)
+        $bd += (& $v $m 17); $pbuf += (& $v $m 18); $ed += (& $v $m 19); $td += (& $v $m 20)
     }
     # window_ms sums across every compositor that emitted, one per painter, so it is already
     # painter-seconds; dividing by it gives a per-painter-per-second rate rather than a wall rate.
@@ -974,6 +976,11 @@ if ($dbp) {
     # calls add_surface and we borrow the ring and present each video's own swap chain there.
     # Reporting it beside end_frame keeps a run from looking cheap while the cost sits next door.
     Write-Host ("  external video  {0,7:N1} ms/s  ({1:N0} external adds, outside end_frame)" -f ($ext/$secs), $extN)
+    if ($ef -gt 0) {
+        # Commit 이 비주얼 트리 크기를 따르는지 보기 위한 값. 비디오는 그리는 양이 훨씬
+        # 많은데 Commit 이 29 배 싸므로, 원인은 그리는 양이 아니다. 트리 크기라면 여기서 보인다.
+        Write-Host ("  visuals/frame {0,9:N1}   live surfaces {1,5:N1}   -> {2:N4} ms of Commit per visual" -f ($vis/$ef), ($surf/$dbp.Count), $(if ($vis -gt 0) { $commit/$vis } else { 0 }))
+    }
     Write-Host ("  tile round trip {0,7:N1} ms/s  (BeginDraw {1:N1} / pbuffer {2:N1} / EndDraw {3:N1} / teardown {4:N1})" -f ($tiles/$secs), ($bd/$secs), ($pbuf/$secs), ($ed/$secs), ($td/$secs))
     if ($binds -gt 0) { Write-Host ("  full-tile updates: {0:N0}/{1:N0}" -f $full, $binds) }
     if ($ef -gt 0) {

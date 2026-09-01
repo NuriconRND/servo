@@ -1253,6 +1253,11 @@ struct BindProfile {
     end_frame_ns: u64,
     end_frames: u64,
     create_surface_ns: u64,
+    /// 프레임마다 배치되는 비주얼 총수(external 뿐 아니라 전부)와, 살아 있는 DComp
+    /// 서피스 수. ★Commit 이 비주얼 트리 크기를 따르는지 판별하는 값이다★ — 비디오는
+    /// 그리는 양이 훨씬 많은데 Commit 이 29 배 싸므로, 원인은 그리는 양이 아니다.
+    add_surface_all: u64,
+    surfaces_live: u64,
     /// `end_frame` 내부 쪼개기 — 각각 성격이 완전히 다르다.
     /// `flush` 는 GL 큐 제출, `present` 는 스왑체인 Present, `commit` 은 DWM 반영 요청.
     flush_ns: u64,
@@ -1996,11 +2001,13 @@ impl DCompNativeCompositor {
             return;
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        self.bind_profile.surfaces_live = self.surfaces.len() as u64;
         let profile = &self.bind_profile;
         warn!(
             "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
              end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} \
              external_ms={:.1} externals={} present_ms={:.1} presents={} \
+             visuals={} surfaces={} \
              begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
@@ -2016,6 +2023,8 @@ impl DCompNativeCompositor {
             profile.add_surfaces,
             ms(profile.present_ns),
             profile.presents,
+            profile.add_surface_all,
+            profile.surfaces_live,
             ms(profile.begin_ns),
             ms(profile.pbuffer_ns),
             ms(profile.end_ns),
@@ -2783,6 +2792,9 @@ impl Compositor for DCompNativeCompositor {
         _rounded_clip_rect: DeviceIntRect,
         rounded_clip_radii: ClipRadius,
     ) {
+        if *DCOMP_BIND_PROF {
+            self.bind_profile.add_surface_all += 1;
+        }
         // 비디오 external surface(Task 5)는 전용 경로 — 기존 Virtual/SwapChain 경로 위 조기
         // 분기. scale 경고는 external에 미적용(브리프 계약: external은 dest=clip, scale 무시).
         if matches!(
