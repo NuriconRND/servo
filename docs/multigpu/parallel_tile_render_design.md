@@ -1,0 +1,181 @@
+# 월 타일 병렬 렌더 — 설계안
+
+작성 2026-09-01. 브랜치 `multigpu-wall-pacing`. 근거 로그 `log_webgpu/24~26`.
+
+## 1. 무엇을 사는가
+
+현재 한 월 패스는 **타일 비용의 합**이다. `render_all_tiles`(winit_wall `main.rs:386`)가
+타일마다 `make_current → paint_target → present` 를 차례로 돈다.
+
+```
+per-tile=[18.21,15.21,15.29,15.26]  pass_ms=63.98  slowest=18.21  ceiling=3.51x
+```
+
+목표는 한 패스를 **최댓값**으로 만드는 것: 64ms → ~18ms → **~55 passes/s**.
+
+★이 작업은 타일당 15ms 스톨을 없애지 않는다. 겹칠 뿐이다.★ 스톨 자체의 원인(ANGLE/드라이버가
+공유 서피스가 걸린 프레임마다 고정 지연을 내는 것)은 별개의 축으로 남는다. 그래도 하는 이유는
+그 스톨이 **타일별이고 GPU별이라 본질적으로 겹칠 수 있기** 때문이다.
+
+## 2. 왜 지금인가 — 그리고 왜 전에 기각했었나
+
+2026-08 말에 같은 작업을 **duty 57%, 천장 1.63배**로 기각했다. ★그 측정은 무효다★ — 당시엔
+전역 `ANGLE_GL_LOCK` 이 `Painter::render()` 전체를 감싸고 있어서, 스레드를 넷으로 늘려도
+그 락에서 다시 줄을 섰다. 락이 디바이스당으로 바뀐 뒤(`5cc95bd09ee`) 같은 계측이
+**3.5배**를 보고한다.
+
+그리고 스톨의 성격이 밝혀졌다(`log_webgpu/26`):
+
+| 후보 | 실측 | 판정 |
+|---|---|---|
+| 업로드 | `upload_mb=0.00 upload_ms=0.00` | 아님 |
+| ANGLE 락 | `angle_lock_ms=0.06` | 아님 |
+| WebRender update | `wr_update_ms=0.01` | 아님 |
+| external-image 콜백 | 타일당 7.8 ms/s | 아님 |
+| **`wr_render_ms`** | **30.66 (드로우 3번)** | **여기** |
+
+픽셀에 비례하지 않는다(`?scale=0.5` 가 0% 변화). 즉 fill 도 대역폭도 아닌 **고정 스톨**이고,
+CPU 작업이 아니므로 겹칠 수 있다.
+
+## 3. 제약 인벤토리 (코드 실측)
+
+병렬화를 막는 것은 성능이 아니라 **소유권**이다.
+
+1. **surfman `Device` 는 스레드 로컬이다** — `connection.rs:102` 의 계약이 "Device handles are
+   local to a single thread". 생성 스레드일 필요는 없지만 **한 번에 한 스레드**이므로, 타일
+   컨텍스트는 한 스레드가 **생성부터 소멸까지** 소유해야 한다.
+2. `TileWindow.rendering_context: Rc<dyn RenderingContext>` (`tile.rs:26`) — `!Send`.
+3. `Painter`(`painter.rs:191`)가 붙들고 있는 것: `Rc<dyn RenderingContext>`,
+   `Rc<BaseRefreshDriver>`, `Rc<AnimationRefreshDriverObserver>`, `Rc<dyn gleam::gl::Gl>`,
+   `Option<Rc<RefCell<DCompNativeCompositor>>>`, `webrender::Renderer`, 그리고 `Cell`/`RefCell`
+   필드 20여 개.
+4. `Paint` 가 `painters: Vec<Rc<RefCell<Painter>>>` 와 **월 프레임 배리어 상태**를 `Cell` 로 들고
+   있다. 배리어는 지금 단일 스레드 가정 위에 서 있다.
+5. `WebView::paint_target()` → `Paint::render_paint_target()` → `Painter::render()` 는
+   **호출 스레드에서 동기 실행**된다. 별도 페인트 스레드는 없다(이름과 달리).
+6. winit `Window` 의 생성과 이벤트는 메인 스레드. `present()` 는 DXGI 라 다른 스레드에서도
+   가능하지만 리사이즈·DComp 재구축과 조율이 필요하다.
+
+즉 A안은 "루프에 `par_iter` 를 붙이는" 종류가 아니라 **소유 모델을 바꾸는** 작업이다.
+
+## 4. 후보
+
+### A. 타일당 전용 스레드 (전체 소유권 이동)
+
+타일 스레드가 자기 `RenderingContext` + `Painter` + `webrender::Renderer` 를 **만들고 죽을 때까지
+소유**한다. 메인 스레드는 채널로 "논리 프레임 N 그려라" 를 보내고 완료를 기다린다.
+
+- 장점: 진짜 겹침. surfman 의 스레드 로컬 계약과 정확히 맞는다. 직렬 루프가 사라진다.
+- 단점: 가장 큰 변경. §3 의 `Rc` 들을 스레드별 인스턴스로 나누거나 `Arc` 로 올려야 하고,
+  refresh driver·배리어·`Paint` 레지스트리가 전부 단일 스레드 가정 위에 있다.
+
+### B. 렌더만 떼어내기
+
+`renderer.update()+render()` 만 워커로 보내고 `Painter` 는 메인에 남긴다.
+
+- **성립하지 않는다.** GL 컨텍스트가 렌더하는 스레드에서 current 여야 하므로 컨텍스트가 그쪽으로
+  가야 하고, 그러면 `Painter` 의 절반이 따라간다. 결국 A로 수렴한다. 기록만 남긴다.
+
+### C. 스레드 없이 겹치기
+
+루프를 **제출 패스 / 프레젠트 패스**로 쪼개고, 타일 스왑체인 버퍼 수를 늘린다.
+
+```
+for tile { make_current; paint_target }   // 4개 제출
+for tile { make_current; present }        // 4개 프레젠트
+```
+
+- 장점: 소유권을 건드리지 않는다. 하루면 된다.
+- 단점: **스톨이 백프레셔성일 때만 듣는다.** 드라이버가 `render()` 안에서 동기 대기를 하면
+  제출 패스에서 그대로 막히고 아무것도 나아지지 않는다.
+
+## 5. 권장 순서
+
+**C 를 먼저 하루, 안 되면 A.**
+
+A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다. C 가 안 되면 그 실패 자체가
+"스톨은 미룰 수 있는 백프레셔가 아니라 동기 대기"라는 정보이고, 그때 A 가 유일한 답으로 확정된다.
+
+**C 의 판정 기준(미리 고정한다)**: `WALLPASS` 의 `pass_ms` 가 `serial_sum` 아래로 내려가고
+`passes/s` 가 오르면 성공. 두 패스로 쪼갠 뒤에도 `pass_ms ≈ serial_sum` 이면 실패이고 즉시 A 로
+간다. ★"조금 나아졌다"는 성공이 아니다★ — 상금이 3.5배인데 1.2배가 나오면 그건 노이즈다.
+
+## 6. A 설계 (C 실패 시)
+
+### 6.1 소유 모델
+
+```
+메인 스레드                          타일 스레드 N (타일당 1개)
+  winit 이벤트 루프                    RenderingContext  (생성~소멸 전 구간 소유)
+  Servo / WebView / 스크립트           Painter
+  프레젠테이션 클럭                    webrender::Renderer
+  타일 창 핸들(HWND)                   ANGLE Device/Context
+        |                                     ^
+        |  RenderTile { logical_frame_id }     |
+        +------------------------------------->+
+        |  TileDone { local_frame_id, ms }     |
+        +<-------------------------------------+
+```
+
+창은 메인 스레드가 만들고 **HWND 만** 타일 스레드로 넘긴다(winit 창 객체 자체를 옮기지 않는다).
+컨텍스트는 타일 스레드가 그 HWND 로 직접 만든다 — surfman 의 스레드 로컬 계약을 지키는 유일한 길.
+
+### 6.2 단계 (각 단계가 되돌릴 수 있는 지점이다)
+
+1. **`RenderingContext` + WebRender 인스턴스를 타일 스레드에서 생성** — 아직 다른 것은
+   메인에서. WebRender 쪽은 위 §7-3 으로 정적 확인이 끝났으므로, 이 단계가 실제로 거는
+   것은 **surfman/ANGLE 이 다른 스레드에서 컨텍스트를 만들고 current 로 삼는가**다.
+   여기서 깨지면 A 는 성립하지 않는다.
+2. **`Painter` 를 타일 스레드로** — `Rc` 필드를 정리한다. `refresh_driver` 와
+   `animation_refresh_driver_observer` 는 **타일별 인스턴스**로 나눌 수 있는지, 아니면
+   메인에 남기고 메시지로 통신할지 결정해야 한다(미해결, §7).
+3. **채널 프로토콜 + 배리어 이동** — 월 프레임 배리어를 `Cell` 기반에서 스레드 안전 구조로.
+   실패 주입 env 3종(`SERVO_WALL_FRAME_DELAY_*`)이 계속 동작해야 한다.
+4. **`present()` 를 타일 스레드로** — 리사이즈/DComp 재구축과의 조율이 여기 있다.
+5. **직렬 경로 제거** — `render_all_tiles` 를 fan-out/join 으로 대체.
+
+### 6.3 유지해야 하는 것
+
+- 월 프레임 배리어의 의미론(16ms 데드라인, keep-previous 정책, `logical_frame_id`)
+- 프레젠테이션 클럭(`about_to_wait` + `ControlFlow::WaitUntil`) — ★틱은 메인 스레드에 남는다★
+- `--capture`, `--wall-tile-index` 단일 타일 모드
+- servoshell 은 건드리지 않는다(별도 셸, 가드밴드 담당)
+
+## 7. 미해결 (설계 확정 전에 답해야 함)
+
+1. **`BaseRefreshDriver` 를 타일별로 나눌 수 있나?** 지금은 `Paint` 와 painter 들이 하나를
+   공유하고 observer 가 `Painter` 를 콜백한다. 나눌 수 없으면 메인에 남기고 메시지로 통신해야
+   하는데, 그러면 프레임 시작 신호가 스레드를 한 번 더 건넌다.
+2. **`dcomp_shared: Option<Rc<RefCell<DCompNativeCompositor>>>`** — 이름의 "shared" 가 타일 간
+   공유를 뜻하는지 확인해야 한다. 공유라면 A 의 전제가 흔들린다.
+3. ~~**`webrender::Renderer` 가 다른 스레드에서 생성·구동 가능한가.**~~ **해소(2026-09-01).**
+   ★생성은 된다. 옮기는 것은 안 된다.★ A안은 옮기지 않고 타일 스레드가 직접 만드므로 성립한다.
+   근거:
+   - `Renderer` 는 `!Send` 다 — `shaders: Rc<RefCell<Shaders>>`(`renderer/mod.rs:833`)와
+     `device: Device` 안의 `Rc<dyn gl::Gl>`. 그래서 **이미 만들어진 것을 스레드로 넘길 수는
+     없다.**
+   - ★webrender 에 `thread_local!` 이 하나도 없다★ — 스레드별 초기화 요구가 없다. 가장 큰
+     위험이었는데 0 이다.
+   - 프로세스 전역 가변 상태는 `AtomicUsize` 카운터 셋뿐이다(`NEXT_TILE_ID` picture.rs:297,
+     `NEXT_NAMESPACE_ID` render_backend.rs:761, `NEXT_NATIVE_SURFACE_ID` resource_cache.rs:61).
+     비원자적인 것은 `PROFILER_HOOKS` 하나인데 **Servo 가 참조하지 않는다.**
+   - painter 마다 **완전히 독립적인 인스턴스**를 만든다(`painter.rs:559`): 자기 Renderer,
+     자기 RenderBackend + SceneBuilder 스레드(`create_webrender_instance` 가 직접 spawn 한다 —
+     `renderer/init.rs:643,667,707`), 자기 RenderApi, 그리고 `namespace_alloc_by_client: true`
+     + `shared_font_namespace: painter_id`. 네임스페이스가 이미 painter 별로 갈려 있다.
+
+   `Renderer` doc 의 *"all instances share the same thread"* 는 **Gecko/Servo 가 지금 그렇게
+   몰아서 구동한다는 서술**이지 제약이 아니다. 진짜 제약은 처음부터 있던 것 하나뿐이다 —
+   **Renderer 는 자기 GL 컨텍스트를 소유한 스레드에 머물러야 한다.** A 가 요구하는 바로 그것이다.
+
+   부수: 스레드 총수는 늘지 않는다. 지금도 인스턴스가 4 개라 WebRender 스레드는 이미 그만큼
+   떠 있고, 바뀌는 것은 **누가 Renderer 를 구동하느냐**뿐이다.
+4. **타일이 같은 GPU 를 공유하는 배치**(개발기 3-in-1). 그때는 두 타일 스레드가 하나의
+   per-LUID ANGLE 디바이스를 동시에 쓰게 되고, 디바이스당 락이 그 둘을 직렬화한다 —
+   4-GPU 월과 개발기의 동작이 갈린다. **개발기에서 성능을 재면 안 된다.**
+
+## 8. 하지 않을 것
+
+- 재실행 루프 뒤집기(전환 4N→4). ★반증됨★ — 전환은 적용의 96.7%에서 일어나지만 비용이 0.4%다.
+- 크로스-GPU 텍스처 복사. RX580 은 피어 복사가 없어 시스템 메모리를 경유한다.
+- 15ms 스톨의 원인 규명. 별개 축이고, 병렬화는 그것과 무관하게 이득을 낸다.
