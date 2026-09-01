@@ -260,7 +260,7 @@ pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
 pub const DCOMP_BIND_PROF: DebugFlag = DebugFlag {
     name: "SERVO_DCOMP_BIND_PROF",
     kind: Kind::Str,
-    doc: "DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() \n          / Commit(), 그리고 타일 왕복(BeginDraw / pbuffer 래핑 / EndDraw / teardown)과 \n          begin_frame·end_frame 호출 수. truthy: \"1\" 또는 \"true\"(대소문자 무시). ★1 차 계측이 타일 왕복을 \n          무죄로 밝혔다★(2026-09-01): 왕복이 bind 당 0.541ms, painter 당 초당 3.2ms 였고, 무엇보다 painter 가 \n          초당 18 번 렌더하는데 bind 는 6 번뿐인데도 모든 렌더가 느렸다 — 비용이 타일별이 아니라는 뜻이다. 그래서 end_frame 을 잰다: \n          bind 와 무관 하게 매 프레임 불리고, 이 컴포지터에서 무거운 일(GL flush, 스왑체인 Present, DWM Commit) 이 전부 \n          그 안에 있다. end_frame_ms 가 프레임 예산을 채우면 그 안의 flush/commit 분해가 어느 쪽인지 가르고, 채우지 않으면 \n          비용은 이 컴포지터가 아니라 WebRender 자신의 네이티브 컴포지터 경로에 있다. 프레임마다 불리는 핫패스라 기본 off.",
+    doc: "DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() \n          / Commit() / 스왑체인 Present, escape 경로의 external 변환·Present(add_surface 안이라 \n          end_frame 밖이다), 타일 왕복(BeginDraw / pbuffer / EndDraw / teardown), 그리고 \n          begin_frame·end_frame 호출 수. truthy: \"1\" 또는 \"true\"(대소문자 무시). ★차례로 둘이 무죄로 \n          밝혀졌다★: 타일 왕복은 bind 당 0.541ms 에 painter 당 초당 3.2ms 였고(2026-09-01), gl().flush() 는 \n          조건부로 바꾸자 대기가 그대로 Commit 으로 옮겨가 같은 90% 를 차지했다 — 즉 그 flush 는 헛된 호출이 아니라 DWM 동기화 \n          대기를 흡수하고 있었다. 캔버스가 없으면 bind 가 0 이고 Commit 이 프레임당 0.013ms 로 월이 60fps 를 낸다. 캔버스가 \n          생기면 Commit 이 프레임당 12.7ms 가 되고, painter 4 개가 순차 실행이라 월 패스마다 ~51ms 가 된다. ★그 모양이 \n          정확히 타일 병렬화가 겹칠 수 있는 모양이다★(docs/multigpu/parallel_tile_render_design.md). 프레임마다 \n          불리는 핫패스라 기본 off.",
     cache_index: 18,
 };
 

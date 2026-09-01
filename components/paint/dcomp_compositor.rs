@@ -2000,6 +2000,7 @@ impl DCompNativeCompositor {
         warn!(
             "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
              end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} \
+             external_ms={:.1} externals={} present_ms={:.1} presents={} \
              begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
@@ -2011,6 +2012,10 @@ impl DCompNativeCompositor {
             profile.flushes,
             profile.flush_skipped,
             ms(profile.commit_ns),
+            ms(profile.add_surface_ns),
+            profile.add_surfaces,
+            ms(profile.present_ns),
+            profile.presents,
             ms(profile.begin_ns),
             ms(profile.pbuffer_ns),
             ms(profile.end_ns),
@@ -2784,7 +2789,15 @@ impl Compositor for DCompNativeCompositor {
             self.surfaces.get(&id).map(|e| &e.storage),
             Some(SurfaceStorage::External(_))
         ) {
+            let start = DCOMP_BIND_PROF.then(std::time::Instant::now);
             self.add_external_surface(id, transform, clip_rect, rounded_clip_radii);
+            if let Some(start) = start {
+                // escape 경로의 값을 여기서 잰다 — WR 이 비디오 타일을 그리는 대신 이 안에서
+                // provider 링을 대여해 raw D3D11 변환 1-draw 로 비디오별 스왑체인을 채우고
+                // Present 한다. `end_frame` 밖이라 그쪽 계측에는 한 톨도 잡히지 않는다.
+                self.bind_profile.add_surfaces += 1;
+                self.bind_profile.add_surface_ns += start.elapsed().as_nanos() as u64;
+            }
             return;
         }
 
@@ -2931,6 +2944,10 @@ impl Compositor for DCompNativeCompositor {
         //  - regen_requests: 리사이즈 등으로 지오메트리가 바뀐 기존 SwapChain 재생성 (id, 새 extent)
         //  - demote_requests: withhold 임계·전면/부분 Present 런타임 실패 → 강등 대상
         //    (스펙 §6.1). 처리(가상 서피스 시딩 + 쿨다운)는 이 함수 뒤쪽 강등 루프.
+        // 아래 루프가 `self.surfaces` 를 mut 로 빌리는 동안에는 `self.bind_profile` 을 만질 수
+        // 없어, 지역에 모았다가 루프를 빠져나온 뒤 합친다.
+        let mut present_ns: u64 = 0;
+        let mut presents: u64 = 0;
         let mut promote_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
         let mut regen_requests: Vec<(NativeSurfaceId, DeviceIntRect)> = Vec::new();
         let mut demote_requests: Vec<NativeSurfaceId> = Vec::new();
@@ -3038,7 +3055,12 @@ impl Compositor for DCompNativeCompositor {
                         // 반드시 합류해야 함 — 드롭하면 stale 과소 기록으로 잔상 결함).
                         let dirty = std::mem::take(&mut sc.frame_dirty);
                         // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
+                        let present_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
                         let hr = unsafe { (*sc.swapchain.as_ptr()).Present(0, 0) };
+                        if let Some(start) = present_start {
+                            present_ns += start.elapsed().as_nanos() as u64;
+                            presents += 1;
+                        }
                         if hr < 0 {
                             if !sc.warned_present_fail {
                                 warn!("[dcomp-native] Present failed (hr=0x{:08x})", hr as u32);
@@ -3453,6 +3475,10 @@ impl Compositor for DCompNativeCompositor {
             return;
         };
         // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
+        if *DCOMP_BIND_PROF {
+            self.bind_profile.present_ns += present_ns;
+            self.bind_profile.presents += presents;
+        }
         let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         let hr = unsafe { (*dcomp_device).Commit() };
         if hr < 0 {

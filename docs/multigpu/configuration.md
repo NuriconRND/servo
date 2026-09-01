@@ -311,22 +311,17 @@ painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `angle_loc
 
 ### `SERVO_DCOMP_BIND_PROF` — `Str`
 
-DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() / Commit(), 그리고 타일 왕복(BeginDraw / pbuffer 래핑 / EndDraw / teardown)과 begin_frame·end_frame 호출 수. truthy: "1" 또는 "true"(대소문자 무시). ★1 차 계측이 타일 왕복을 무죄로 밝혔다★(2026-09-01): 왕복이 bind 당 0.541ms, painter 당 초당 3.2ms 였고, 무엇보다 painter 가 초당 18 번 렌더하는데 bind 는 6 번뿐인데도 모든 렌더가 느렸다 — 비용이 타일별이 아니라는 뜻이다. 그래서 end_frame 을 잰다: bind 와 무관 하게 매 프레임 불리고, 이 컴포지터에서 무거운 일(GL flush, 스왑체인 Present, DWM Commit) 이 전부 그 안에 있다. end_frame_ms 가 프레임 예산을 채우면 그 안의 flush/commit 분해가 어느 쪽인지 가르고, 채우지 않으면 비용은 이 컴포지터가 아니라 WebRender 자신의 네이티브 컴포지터 경로에 있다. 프레임마다 불리는 핫패스라 기본 off.
+DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() / Commit() / 스왑체인 Present, escape 경로의 external 변환·Present(add_surface 안이라 end_frame 밖이다), 타일 왕복(BeginDraw / pbuffer / EndDraw / teardown), 그리고 begin_frame·end_frame 호출 수. truthy: "1" 또는 "true"(대소문자 무시). ★차례로 둘이 무죄로 밝혀졌다★: 타일 왕복은 bind 당 0.541ms 에 painter 당 초당 3.2ms 였고(2026-09-01), gl().flush() 는 조건부로 바꾸자 대기가 그대로 Commit 으로 옮겨가 같은 90% 를 차지했다 — 즉 그 flush 는 헛된 호출이 아니라 DWM 동기화 대기를 흡수하고 있었다. 캔버스가 없으면 bind 가 0 이고 Commit 이 프레임당 0.013ms 로 월이 60fps 를 낸다. 캔버스가 생기면 Commit 이 프레임당 12.7ms 가 되고, painter 4 개가 순차 실행이라 월 패스마다 ~51ms 가 된다. ★그 모양이 정확히 타일 병렬화가 겹칠 수 있는 모양이다★(docs/multigpu/parallel_tile_render_design.md). 프레임마다 불리는 핫패스라 기본 off.
 
 ```
-DCOMPBIND window_ms=1001 frames=18/18 binds=6 full_tile=2 end_frame_ms=270.4   flush_ms=3.1 commit_ms=1.8 begin_ms=0.1 pbuffer_ms=3.0 enddraw_ms=0.1 teardown_ms=0.0
+DCOMPBIND window_ms=1000 frames=17/17 binds=13 full_tile=5 end_frame_ms=216.0   flush_ms=0.0 flushed=0/17 commit_ms=216.0 external_ms=0.0 externals=0   present_ms=0.0 presents=0 begin_ms=0.1 pbuffer_ms=5.0 enddraw_ms=0.1 teardown_ms=0.0
 ```
 
-읽는 법: `frames` 는 `begin_frame/end_frame` 호출 수다 — 이 값이 painter 의 렌더 횟수와 맞는지
-부터 본다(1 차 계측에서 bind 수와 렌더 수가 3 배 어긋난 것이 결정적 단서였다).
-`end_frame_ms / frames` 가 타일당 렌더 비용에 근접하면 원인은 이 컴포지터 안이고, 그러면
-`flush_ms` 와 `commit_ms` 가 어느 쪽인지 가른다. 반대로 `end_frame_ms` 가 작은데 렌더가 여전히
-느리면 **이 컴포지터가 아니라 WebRender 자신의 네이티브 경로**가 비용이고, 그때는 DComp 를
-켠 채로 고칠 여지가 없다는 뜻이라 판단이 달라진다.
-
-타일 왕복 넷(`begin_ms`/`pbuffer_ms`/`enddraw_ms`/`teardown_ms`)은 이미 무죄로 밝혀졌지만
-남겨 둔다 — 배치가 바뀌면(타일 크기, 페이지 구성) 다시 커질 수 있고, 빠졌다는 이유로 다시
-의심하는 일을 막는다.
+읽는 법: 판정은 `end_frame` 만이 아니라 **DComp 총비용**(`end_frame + external`)으로 한다 —
+escape 실행은 비용이 `add_surface` 안에 있어 `end_frame` 만 보면 싸 보이고, 그러면 우리 일을
+WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush 가 실제로 걸렸는지를 말한다.
+`frames` 가 painter 의 렌더 횟수와 맞는지부터 보는 습관은 유지할 것 — bind 수와 렌더 수가 3 배
+어긋난 것이 타일 왕복을 무죄로 만든 결정적 단서였다.
 
 ## wall CLI 플래그
 

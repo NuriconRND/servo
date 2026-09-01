@@ -946,17 +946,18 @@ if ($wex) {
 # only 6 binds/s against 18 renders/s -- most renders bind nothing yet all of them were slow,
 # so the cost is not per tile. end_frame is the one thing here that runs every frame, and it
 # holds the GL flush, the swap-chain Present and the DWM Commit.
-$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) external_ms=([\d.]+) externals=(\d+) present_ms=([\d.]+) presents=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
 if ($dbp) {
     $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     $w = 0.0; $bf = 0.0; $ef = 0.0; $binds = 0.0; $full = 0.0
     $endf = 0.0; $flush = 0.0; $commit = 0.0; $bd = 0.0; $pbuf = 0.0; $ed = 0.0; $td = 0.0
-    $flushed = 0.0; $skipped = 0.0
+    $flushed = 0.0; $skipped = 0.0; $ext = 0.0; $extN = 0.0; $pres = 0.0; $presN = 0.0
     foreach ($m in $dbp) {
         $w += (& $v $m 1); $bf += (& $v $m 2); $ef += (& $v $m 3); $binds += (& $v $m 4)
         $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7)
         $flushed += (& $v $m 8); $skipped += (& $v $m 9); $commit += (& $v $m 10)
-        $bd += (& $v $m 11); $pbuf += (& $v $m 12); $ed += (& $v $m 13); $td += (& $v $m 14)
+        $ext += (& $v $m 11); $extN += (& $v $m 12); $pres += (& $v $m 13); $presN += (& $v $m 14)
+        $bd += (& $v $m 15); $pbuf += (& $v $m 16); $ed += (& $v $m 17); $td += (& $v $m 18)
     }
     # window_ms sums across every compositor that emitted, one per painter, so it is already
     # painter-seconds; dividing by it gives a per-painter-per-second rate rather than a wall rate.
@@ -967,14 +968,34 @@ if ($dbp) {
     Write-Host ("  end_frame     {0,9:N1} ms/s   {1,8:N3} ms per frame" -f ($endf/$secs), $(if ($ef -gt 0) { $endf/$ef } else { 0 }))
     Write-Host ("    gl flush    {0,9:N1} ms/s   (ran on {1:N0} frames, skipped on {2:N0})" -f ($flush/$secs), $flushed, $skipped)
     Write-Host ("    Commit      {0,9:N1} ms/s" -f ($commit/$secs))
-    Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, Present, promote/demote)" -f (($endf-$flush-$commit)/$secs))
+    Write-Host ("    Present     {0,9:N1} ms/s   ({1:N0} swap-chain presents)" -f ($pres/$secs), $presN)
+    Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, promote/demote)" -f (($endf-$flush-$commit-$pres)/$secs))
+    # The escape path lives OUTSIDE end_frame: WebRender does not draw video tiles at all, it
+    # calls add_surface and we borrow the ring and present each video's own swap chain there.
+    # Reporting it beside end_frame keeps a run from looking cheap while the cost sits next door.
+    Write-Host ("  external video  {0,7:N1} ms/s  ({1:N0} external adds, outside end_frame)" -f ($ext/$secs), $extN)
     Write-Host ("  tile round trip {0,7:N1} ms/s  (BeginDraw {1:N1} / pbuffer {2:N1} / EndDraw {3:N1} / teardown {4:N1})" -f ($tiles/$secs), ($bd/$secs), ($pbuf/$secs), ($ed/$secs), ($td/$secs))
     if ($binds -gt 0) { Write-Host ("  full-tile updates: {0:N0}/{1:N0}" -f $full, $binds) }
     if ($ef -gt 0) {
-        $perFrame = $endf / $ef
+        # Judge on everything this compositor costs, not on end_frame alone. The escape path
+        # runs in add_surface, so an escape run can have a cheap end_frame and still be entirely
+        # bounded by DComp -- reading only end_frame there would blame WebRender for our own work.
+        $perFrame = ($endf + $ext) / $ef
         if ($perFrame -gt 5.0) {
-            $part = if ($flush -gt $commit) { "the GL flush" } else { "the DWM Commit" }
-            Write-Warning ("end_frame costs {0:N2} ms a frame -- this compositor IS the cost, and {1} is the larger half. Fixing it here is on the table." -f $perFrame, $part)
+            $parts = @(
+                @{n="the external video path (add_surface)"; v=$ext},
+                @{n="the DWM Commit"; v=$commit},
+                @{n="the GL flush"; v=$flush},
+                @{n="the swap-chain Present"; v=$pres}
+            ) | Sort-Object { -$_.v }
+            Write-Warning ("DComp costs {0:N2} ms a frame -- this compositor IS the cost, and {1} is the largest part. Fixing it here is on the table." -f $perFrame, $parts[0].n)
+            if ($commit -gt 0 -and $commit -ge $flush) {
+                # Commit is per painter and blocking, and the painters run one after another on
+                # the embedder thread, so N of them add up into the wall's frame time. That is
+                # the shape parallelising the tile loop would overlap -- see
+                # docs/multigpu/parallel_tile_render_design.md.
+                Write-Host ("  Commit alone is {0:N2} ms a frame; four painters run serially, so that is ~{1:N0} ms of every wall pass." -f ($commit/$ef), (4.0*$commit/$ef))
+            }
         } elseif ($skipped -gt 0 -and $flushed -eq 0) {
             # The conditional flush did its job. Say so, rather than reading a cheap end_frame
             # as evidence about WebRender -- that reading was written before the fix existed
