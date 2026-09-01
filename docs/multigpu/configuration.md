@@ -289,21 +289,25 @@ SINKPROF id=3 fr=30 busy_ms=812.4 (pace=740.1 diag=1.2 build=47.0 render=9.8 not
 
 ### `SERVO_WEBGL_FANOUT_PROF` — `Str`
 
-WebGL 멀티-GPU 팬아웃의 명령 재실행 비용을 1 초에 한 줄로 집계한다(논리 명령 수 / 디바이스별 적용 수 / 컨텍스트 전환 수 / ANGLE 락 대기 / 전환·적용·직렬화 시간). truthy: "1" 또는 "true"(대소문자 무시). 재실행 루프가 명령마다 디바이스를 돌기 때문에 make_context_current 의 if_needed 가드가 한 번도 적중하지 않는다 - 명령 N 개·디바이스 4 개면 컨텍스트 전환도 ANGLE 락도 postcard 왕복도 4N 회다. 4K 캔버스를 ?scale=0.5 로 줄여도 변화가 없었으므로 병목은 픽셀이 아니라 이 단가일 가능성이 높은데, 재실행 루프를 뒤집는 작업이 크므로 착수 전에 전환 단가가 실제로 지배적인지 확인한다. 명령마다 불리는 핫패스라 기본 off.
+WebGL 멀티-GPU 팬아웃의 비용을 1 초에 한 줄씩 집계한다 — 생산자 측 WEBGLFANOUT(논리 명령 수 / 디바이스별 적용 수 / 컨텍스트 전환 수 / ANGLE 락 대기 / 전환·적용·직렬화 시간)과 소비자 측 WEBGLEXTIMG(painter 별 lock·unlock 횟수와 시간, take_surface / create_texture / destroy_texture 시간, 프런트 버퍼가 없던 횟수). truthy: "1" 또는 "true"(대소문자 무시). ★재실행 단가 가설은 반증됐다★ - 명령마다 컨텍스트를 갈아타는 것은 사실이지만(적용의 96.7%) 그 비용이 창의 0.4% 라, 재실행 루프를 뒤집는 작업(전환 4N→4)은 아무것도 사주지 않는다. 남은 물음은 소비자 측이다: WebGL 캔버스가 생기는 순간 타일 하나의 렌더가 0.23ms 에서 15ms 로 뛰는데, 그 시간이 전부 renderer.render() 안이면서 그리는 일도(draw_calls=2) 올리는 일도(upload_mb=0.0) 아니다. create_ms 가 크면 서피스를 기다리는 것이고, no_front_buffer 가 크면 기다리는 게 아니라 받을 게 없는 것이다. 프레임마다 불리는 핫패스라 기본 off.
 
 ```
-WEBGLFANOUT window_ms=1001 swaps=14 ctx=1 dev=4 cmds=3812 applies=15248 switches=15248   lock_wait_ms=181.2 switch_ms=402.7 apply_ms=210.4 serialize_ms=61.9
+WEBGLFANOUT window_ms=1001 swaps=13 ctx=1 dev=4 cmds=767 applies=2630 switches=2540   lock_wait_ms=0.4 switch_ms=21.9 apply_ms=27.4 serialize_ms=0.6
+WEBGLEXTIMG painter=PainterId(1) window_ms=1000 locks=17 lock_ms=254.3 take_ms=0.1   create_ms=253.8 no_front_buffer=0 unlocks=17 unlock_ms=1.2 destroy_ms=1.1
 ```
 
-읽는 법: `switches` 가 `applies` 와 같으면 명령마다 컨텍스트를 갈아탄다는 뜻이다
-(`make_surface_current_if_needed` 의 가드가 한 번도 적중하지 않는 상태). `switch_ms`
-+ `lock_wait_ms` 가 창 시간의 큰 몫이면 병목은 GL 작업이 아니라 재실행의 단가이고,
-디바이스별로 명령을 모아 한 번에 재생하는 방향(전환 4N → 4)이 답이다. 반대로
-`apply_ms` 가 지배적이면 실제 GL 작업이 비싼 것이므로 루프를 뒤집어도 소용없다.
+읽는 법 — 생산자 측(`WEBGLFANOUT`): `switches` 가 `applies` 와 같으면 명령마다 컨텍스트를
+갈아탄다는 뜻이다. ★그 자체는 사실로 확인됐지만 비용이 0.4% 라 뒤집을 값어치가 없다★
+(2026-09-01 실측). `lock_wait_ms` 는 ANGLE 락이 디바이스당 하나가 된 뒤 46.7% 에서 0.0% 로
+떨어졌다 — 다시 커진다면 같은 GPU 에 타일이 여럿인 배치를 의심할 것.
 
-painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `lock_ms` 로 본다
-— 둘을 같이 켜야 "WebGL 스레드가 락을 쥐고 있어서 타일 렌더가 기다리는" 결합이
-보인다.
+읽는 법 — 소비자 측(`WEBGLEXTIMG`): `create_ms` 가 `lock_ms` 의 대부분이면 painter 가
+크로스-디바이스 서피스를 **기다리는** 것이고(keyed mutex), 그렇다면 생산자·소비자가 서로를
+기다리는 결합을 끊는 것이 답이다. 반대로 `no_front_buffer` 가 크면 기다리는 게 아니라
+**받을 게 없는** 것이므로 원인은 생산 쪽이다. 둘 다 작은데 타일 렌더가 여전히 느리면 이
+경로가 아니다.
+
+painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `angle_lock_ms` 로 본다.
 
 ## wall CLI 플래그
 

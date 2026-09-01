@@ -825,6 +825,48 @@ if ($wgf) {
     Write-Warning "-FanoutProf was set but no WEBGLFANOUT line was logged. The counters only emit at a swap boundary, so a run with no WebGL canvas produces nothing."
 }
 
+# --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
+# nothing to take? A tile render costs 0.23ms with no WebGL canvas and 15ms with one, and all
+# of that lands inside renderer.render() with draw_calls=2 and upload_mb=0.0. Neither drawing
+# nor uploading leaves waiting, and this callback is the only place a tile can wait.
+$wex = Select-String -Path $LogPath -Pattern "WEBGLEXTIMG painter=PainterId\((\d+)\) window_ms=([\d.]+) locks=(\d+) lock_ms=([\d.]+) take_ms=([\d.]+) create_ms=([\d.]+) no_front_buffer=(\d+) unlocks=(\d+) unlock_ms=([\d.]+) destroy_ms=([\d.]+)" -EA SilentlyContinue
+if ($wex) {
+    $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
+    $rows = @{}
+    foreach ($m in $wex) {
+        $id = [int](& $g $m 1)
+        if (-not $rows.ContainsKey($id)) { $rows[$id] = @{ w=0.0; n=0; locks=0.0; lock=0.0; take=0.0; create=0.0; nofb=0.0; unlock=0.0; destroy=0.0 } }
+        $r = $rows[$id]
+        $r.w += (& $g $m 2); $r.n++
+        $r.locks += (& $g $m 3); $r.lock += (& $g $m 4); $r.take += (& $g $m 5)
+        $r.create += (& $g $m 6); $r.nofb += (& $g $m 7)
+        $r.unlock += (& $g $m 9); $r.destroy += (& $g $m 10)
+    }
+    Write-Host ""
+    Write-Host "WEBGLEXTIMG -- what a tile pays to consume the WebGL canvas:"
+    Write-Host ("  {0,-8} {1,8} {2,10} {3,10} {4,10} {5,12} {6,10}" -f "painter", "locks/s", "lock ms/s", "take ms/s", "create ms/s", "no_front_buf", "destroy ms/s")
+    $totalCreate = 0.0; $totalNofb = 0.0; $totalLock = 0.0
+    foreach ($id in ($rows.Keys | Sort-Object)) {
+        $r = $rows[$id]
+        $secs = [math]::Max($r.w / 1000.0, 0.001)
+        Write-Host ("  {0,-8} {1,8:N1} {2,10:N1} {3,10:N1} {4,10:N1} {5,12:N0} {6,10:N1}" -f $id, ($r.locks/$secs), ($r.lock/$secs), ($r.take/$secs), ($r.create/$secs), $r.nofb, ($r.destroy/$secs))
+        $totalCreate += $r.create; $totalNofb += $r.nofb; $totalLock += $r.lock
+    }
+    if ($totalLock -gt 0) {
+        $share = 100.0 * $totalCreate / $totalLock
+        Write-Host ("  create_texture is {0:N1}% of the lock cost" -f $share)
+        if ($share -gt 60 -and $totalCreate -gt 100) {
+            Write-Warning "The painter is WAITING for the WebGL surface (create_texture dominates). Producer and consumer are handing one surface back and forth; that coupling is the thing to break, not the serial tile loop."
+        } elseif ($totalNofb -gt 0) {
+            Write-Host "  no_front_buffer is non-zero -- some locks found nothing to take, so look at the producer side."
+        } else {
+            Write-Host "  Neither waiting nor starved -- the 15ms is somewhere else in render()."
+        }
+    }
+} elseif ($FanoutProf) {
+    Write-Warning "-FanoutProf was set but no WEBGLEXTIMG line was logged. It only emits from the external-image unlock callback, so a run whose page never shows a WebGL canvas produces nothing."
+}
+
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }
 if ($egl -gt 0)    { Write-Warning "Some tiles could not wrap video textures ($egl occurrences) -- those tiles show green." }
 exit 0

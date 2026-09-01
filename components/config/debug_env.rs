@@ -253,7 +253,7 @@ pub const MEDIA_SINK_PROF: DebugFlag = DebugFlag {
 pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
     name: "SERVO_WEBGL_FANOUT_PROF",
     kind: Kind::Str,
-    doc: "WebGL 멀티-GPU 팬아웃의 명령 재실행 비용을 1 초에 한 줄로 집계한다(논리 명령 수 / 디바이스별 적용 수 / 컨텍스트 전환 수 / \n          ANGLE 락 대기 / 전환·적용·직렬화 시간). truthy: \"1\" 또는 \"true\"(대소문자 무시). 재실행 루프가 명령마다 \n          디바이스를 돌기 때문에 make_context_current 의 if_needed 가드가 한 번도 적중하지 않는다 - 명령 N 개·디바이스 4 \n          개면 컨텍스트 전환도 ANGLE 락도 postcard 왕복도 4N 회다. 4K 캔버스를 ?scale=0.5 로 줄여도 변화가 없었으므로 병목은 \n          픽셀이 아니라 이 단가일 가능성이 높은데, 재실행 루프를 뒤집는 작업이 크므로 착수 전에 전환 단가가 실제로 지배적인지 확인한다. 명령마다 \n          불리는 핫패스라 기본 off.",
+    doc: "WebGL 멀티-GPU 팬아웃의 비용을 1 초에 한 줄씩 집계한다 — 생산자 측 WEBGLFANOUT(논리 명령 수 / 디바이스별 적용 수 / \n          컨텍스트 전환 수 / ANGLE 락 대기 / 전환·적용·직렬화 시간)과 소비자 측 WEBGLEXTIMG(painter 별 lock·unlock \n          횟수와 시간, take_surface / create_texture / destroy_texture 시간, 프런트 버퍼가 없던 횟수). \n          truthy: \"1\" 또는 \"true\"(대소문자 무시). ★재실행 단가 가설은 반증됐다★ - 명령마다 컨텍스트를 갈아타는 것은 \n          사실이지만(적용의 96.7%) 그 비용이 창의 0.4% 라, 재실행 루프를 뒤집는 작업(전환 4N→4)은 아무것도 사주지 않는다. 남은 물음은 \n          소비자 측이다: WebGL 캔버스가 생기는 순간 타일 하나의 렌더가 0.23ms 에서 15ms 로 뛰는데, 그 시간이 전부 \n          renderer.render() 안이면서 그리는 일도(draw_calls=2) 올리는 일도(upload_mb=0.0) 아니다. create_ms \n          가 크면 서피스를 기다리는 것이고, no_front_buffer 가 크면 기다리는 게 아니라 받을 게 없는 것이다. 프레임마다 불리는 핫패스라 \n          기본 off.",
     cache_index: 17,
 };
 
