@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use std::{slice, thread};
 
 use bitflags::bitflags;
@@ -44,6 +45,7 @@ use servo_canvas_traits::webgl::{
     WebGLSamplerId, WebGLShaderId, WebGLSurfaceId, WebGLSyncId, WebGLTextureId, WebGLVersion,
     WebGLVertexArrayId, YAxisTreatment,
 };
+use servo_config::debug_env;
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
 use surfman::{
     self, Context, ContextAttributeFlags, ContextAttributes, Device, GLVersion, SurfaceAccess,
@@ -214,6 +216,39 @@ impl Default for GLState {
     }
 }
 
+/// `SERVO_WEBGL_FANOUT_PROF` 게이트. 명령마다 물어보는 자리라 env 읽기를 캐시한다.
+static WEBGL_FANOUT_PROF: LazyLock<bool> = LazyLock::new(|| {
+    debug_env::string(&debug_env::WEBGL_FANOUT_PROF)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+/// `SERVO_WEBGL_FANOUT_PROF` 누적기. 창은 1 초이고 스왑 경계에서 닫힌다.
+///
+/// 재는 목적은 하나다: 멀티-GPU 팬아웃에서 프레임 시간이 **GL 작업** 때문인지 **재실행의
+/// 단가**(컨텍스트 전환 · ANGLE 락 · postcard 왕복) 때문인지 가르는 것. 4K 캔버스를
+/// `?scale=0.5` 로 줄여도 프레임 시간이 그대로였으므로 픽셀 가설은 이미 반증됐고, 남은
+/// 후보가 이 단가다. 루프를 뒤집는 작업(전환 4N → 4)이 크므로 착수 전에 확인한다.
+#[derive(Default)]
+struct FanoutProfile {
+    /// 창의 시작. 첫 스왑에서 채워진다.
+    window_start: Option<Instant>,
+    swaps: u64,
+    /// 스크립트가 보낸 논리 명령 수.
+    commands: u64,
+    /// 디바이스별 적용 횟수. 팬아웃이 없으면 `commands` 와 같다.
+    applies: u64,
+    /// 실제 `make_context_current` 호출 수. ★`applies` 와 같으면 명령마다 컨텍스트를
+    /// 갈아타고 있다는 뜻이다★ — `make_surface_current_if_needed` 의 가드가 한 번도
+    /// 적중하지 않는 상태이고, 그것이 이 계측이 확인하려는 바로 그 가설이다.
+    switches: u64,
+    lock_wait_ns: u64,
+    switch_ns: u64,
+    /// 락 획득 이후 `WebGLImpl::apply` 까지의 총 소요(전환 시간을 포함한다 — 뺄셈은
+    /// 하지 않고 `switch_ns` 와 나란히 찍어 읽는 쪽이 판단한다).
+    apply_ns: u64,
+    serialize_ns: u64,
+}
+
 /// A WebGLThread manages the life cycle and message multiplexing of
 /// a set of WebGLContexts living in the same thread.
 pub(crate) struct WebGLThread {
@@ -243,6 +278,8 @@ pub(crate) struct WebGLThread {
     /// A usage map used to delay the deletion of WebGL contexts until all WebRender
     /// rendering is finished, so that any existing `Surface`s can be properly released.
     busy_webgl_context_map: WebGLContextBusyMap,
+    /// 팬아웃 재실행 비용 누적기(`SERVO_WEBGL_FANOUT_PROF`). 꺼져 있으면 갱신되지 않는다.
+    fanout_profile: FanoutProfile,
 
     #[cfg(feature = "webxr")]
     /// The bridge to WebXR
@@ -293,6 +330,7 @@ impl WebGLThread {
             webrender_swap_chains,
             painter_surfman_details_map,
             busy_webgl_context_map,
+            fanout_profile: FanoutProfile::default(),
             #[cfg(feature = "webxr")]
             webxr_bridge: Some(WebXRBridge::new(webxr_init)),
         }
@@ -452,6 +490,25 @@ impl WebGLThread {
             .clone()
     }
 
+    /// 이 서피스가 올라가 있는 ANGLE D3D11 디바이스 포인터 — `paint_api::angle_gl_lock` 의
+    /// 키다. WebGL 백엔드는 `create_isolated_device` 로 전용 디바이스를 받으므로
+    /// (`35b4c2ed799`) 이 값은 어떤 painter 의 것과도 겹치지 않는다. 그래서 이 키를 쓰면
+    /// WebGL 스레드가 타일 렌더와 더 이상 경합하지 않는다.
+    ///
+    /// 컨텍스트가 아직/이미 없으면 `None` 이고 락은 전량 배타로 접힌다 — 모르는 채로
+    /// 슬롯을 나누는 것보다 안전하다(그 실패 모드가 0xc0000005 다).
+    fn angle_device_key(&self, surface_id: WebGLSurfaceId) -> Option<usize> {
+        let _ = surface_id;
+        #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+        {
+            let data = self.contexts.get(&surface_id)?;
+            let pointer = data.device.native_device().d3d11_device as usize;
+            (pointer != 0).then_some(pointer)
+        }
+        #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+        None
+    }
+
     fn backend_surface_ids(&self, context_id: WebGLContextId) -> Vec<WebGLSurfaceId> {
         self.context_backends
             .get(&context_id)
@@ -533,6 +590,9 @@ impl WebGLThread {
     ) {
         if self.cached_context_info.get_mut(&context_id).is_none() {
             return;
+        }
+        if *WEBGL_FANOUT_PROF {
+            self.fanout_profile.commands += 1;
         }
         match command {
             WebGLCommand::BufferData(buffer_type, receiver, usage) => {
@@ -740,6 +800,7 @@ impl WebGLThread {
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
+        let serialize_start = WEBGL_FANOUT_PROF.then(Instant::now);
         let bytes = match postcard::to_stdvec(&command) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -750,12 +811,19 @@ impl WebGLThread {
                 return;
             },
         };
+        if let Some(start) = serialize_start {
+            self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
+        }
 
         for surface_id in self.backend_surface_ids(context_id) {
+            let deserialize_start = WEBGL_FANOUT_PROF.then(Instant::now);
             let Ok(command) = postcard::from_bytes::<WebGLCommand>(&bytes) else {
                 warn!("Could not deserialize cloned WebGL command for {surface_id:?}");
                 continue;
             };
+            if let Some(start) = deserialize_start {
+                self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
+            }
             self.apply_webgl_command_to_surface(surface_id, command, backtrace.clone());
         }
     }
@@ -766,18 +834,30 @@ impl WebGLThread {
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
-        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
-        let data = self.make_surface_current_if_needed_mut(surface_id);
-        if let Some(data) = data {
-            WebGLImpl::apply(
-                &data.device,
-                &data.ctx,
-                &data.gl,
-                &mut data.state,
-                &data.attributes,
-                command,
-                backtrace,
-            );
+        let lock_start = WEBGL_FANOUT_PROF.then(Instant::now);
+        let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
+        let apply_start = lock_start.map(|start| {
+            let acquired = Instant::now();
+            self.fanout_profile.lock_wait_ns += (acquired - start).as_nanos() as u64;
+            acquired
+        });
+        {
+            let data = self.make_surface_current_if_needed_mut(surface_id);
+            if let Some(data) = data {
+                WebGLImpl::apply(
+                    &data.device,
+                    &data.ctx,
+                    &data.gl,
+                    &mut data.state,
+                    &data.attributes,
+                    command,
+                    backtrace,
+                );
+            }
+        }
+        if let Some(start) = apply_start {
+            self.fanout_profile.applies += 1;
+            self.fanout_profile.apply_ns += start.elapsed().as_nanos() as u64;
         }
     }
 
@@ -786,7 +866,7 @@ impl WebGLThread {
         F: FnMut(WebGLSurfaceId, &mut GLContextData),
     {
         for surface_id in self.backend_surface_ids(context_id) {
-            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id);
             if let Some(context_data) = self.contexts.get_mut(&surface_id) {
                 f(surface_id, context_data);
@@ -901,7 +981,10 @@ impl WebGLThread {
         requested_size: Size2D<u32>,
         attributes: GLContextAttributes,
     ) -> Result<(GLContextData, webgl::GLLimits, Size2D<i32>, bool), String> {
-        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+        // ★키가 없는 유일한 지점★: 디바이스를 지금 만드는 중이라 어느 ANGLE 디바이스를
+        // 건드릴지 아직 모른다. `None` 은 전량 배타이므로 예전 전역 락과 같게 동작한다.
+        // 캔버스당 한 번뿐이라 비용은 없다.
+        let _angle_gl_guard = paint_api::angle_gl_lock(None);
         let painter_surfman_details = self
             .painter_surfman_details_map
             .get(painter_id)
@@ -1064,7 +1147,7 @@ impl WebGLThread {
         let mut primary_has_alpha = false;
 
         for surface_id in surface_ids {
-            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id)
                 .expect("Missing WebGL backend context!");
 
@@ -1187,7 +1270,7 @@ impl WebGLThread {
         }
 
         for surface_id in surface_ids {
-            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             // We need to make each backend context current so its resources can be disposed of.
             self.make_surface_current_if_needed(surface_id);
 
@@ -1217,11 +1300,14 @@ impl WebGLThread {
         _sent_time: u64,
     ) {
         debug!("handle_swap_buffers()");
+        if *WEBGL_FANOUT_PROF {
+            self.fanout_profile.swaps += 1;
+        }
         for context_id in context_ids {
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
             for surface_id in self.backend_surface_ids(context_id) {
-                let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+                let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
                 self.make_surface_current_if_needed(surface_id)
                     .expect("Where's the GL data?");
 
@@ -1304,6 +1390,50 @@ impl WebGLThread {
                 self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
             }
         }
+        self.maybe_emit_fanout_profile();
+    }
+
+    /// 계측 창(1 초)을 스왑 경계에서 닫고 한 줄 찍는다(`SERVO_WEBGL_FANOUT_PROF`).
+    ///
+    /// `warn!` 인 것은 의도적이다 — 런처의 `RUST_LOG` 에 `webgl` 타겟이 없어서 `info!`
+    /// 로 찍으면 아무것도 보이지 않는다(같은 이유로 이미 두 번 헛돌았다).
+    fn maybe_emit_fanout_profile(&mut self) {
+        if !*WEBGL_FANOUT_PROF {
+            return;
+        }
+        let now = Instant::now();
+        let window = now - *self.fanout_profile.window_start.get_or_insert(now);
+        if window < Duration::from_secs(1) {
+            return;
+        }
+        let devices = self
+            .context_backends
+            .values()
+            .map(|painter_ids| painter_ids.len())
+            .max()
+            .unwrap_or(0);
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let profile = &self.fanout_profile;
+        warn!(
+            "WEBGLFANOUT window_ms={:.0} swaps={} ctx={} dev={} cmds={} applies={} \
+             switches={} lock_wait_ms={:.1} switch_ms={:.1} apply_ms={:.1} \
+             serialize_ms={:.1}",
+            window.as_secs_f64() * 1000.0,
+            profile.swaps,
+            self.context_backends.len(),
+            devices,
+            profile.commands,
+            profile.applies,
+            profile.switches,
+            ms(profile.lock_wait_ns),
+            ms(profile.switch_ns),
+            ms(profile.apply_ns),
+            ms(profile.serialize_ns),
+        );
+        self.fanout_profile = FanoutProfile {
+            window_start: Some(now),
+            ..Default::default()
+        };
     }
 
     /// Which access mode to use
@@ -1336,12 +1466,22 @@ impl WebGLThread {
         &mut self,
         surface_id: WebGLSurfaceId,
     ) -> Option<&GLContextData> {
+        // 조건은 아래 실제 전환 조건과 같아야 한다(함께 고칠 것).
+        let switch_start = (*WEBGL_FANOUT_PROF
+            && Some(surface_id) != self.bound_context_id
+            && self.contexts.contains_key(&surface_id))
+        .then(Instant::now);
+
         let data = self.contexts.get(&surface_id);
         if let Some(data) = data
             && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
+        }
+        if let Some(start) = switch_start {
+            self.fanout_profile.switches += 1;
+            self.fanout_profile.switch_ns += start.elapsed().as_nanos() as u64;
         }
 
         data
@@ -1351,12 +1491,23 @@ impl WebGLThread {
         &mut self,
         surface_id: WebGLSurfaceId,
     ) -> Option<&mut GLContextData> {
+        // 계측(`SERVO_WEBGL_FANOUT_PROF`): 전환이 실제로 일어나는 경우만 잰다. 아래
+        // 조건은 뒤의 실제 전환 조건과 같아야 하므로 함께 고칠 것.
+        let switch_start = (*WEBGL_FANOUT_PROF
+            && Some(surface_id) != self.bound_context_id
+            && self.contexts.contains_key(&surface_id))
+        .then(Instant::now);
+
         let data = self.contexts.get_mut(&surface_id);
         if let Some(ref data) = data
             && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
+        }
+        if let Some(start) = switch_start {
+            self.fanout_profile.switches += 1;
+            self.fanout_profile.switch_ns += start.elapsed().as_nanos() as u64;
         }
 
         data

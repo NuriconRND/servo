@@ -909,8 +909,19 @@ impl Painter {
         let mut wr_update_ms = 0.0_f64;
         let mut wr_render_ms = 0.0_f64;
         let mut wr_stats: Option<webrender::RendererStats> = None;
+        // ANGLE 락을 기다린 시간. 이 락은 타일 렌더 전체를 감싸므로, 타일이 느린 것이
+        // 제 일 때문인지 남을 기다린 것인지는 이 값으로만 갈린다.
+        //
+        // 2026-09-01 이후 락은 ANGLE D3D11 디바이스당 하나다(`paint_api::angle_gl_lock`).
+        // 전역이던 시절 이 값은 WebGL 스레드와의 경합까지 포함했지만, 이제 같은 디바이스를
+        // 쓰는 상대하고만 부딪친다 — 그래서 이 수치가 여전히 크다면 그건 GPU 를 공유하는
+        // 다른 타일이지 WebGL 이 아니다.
+        let angle_lock_ms;
         {
-            let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+            let lock_start = Instant::now();
+            let _angle_gl_guard =
+                paint_api::angle_gl_lock(self.rendering_context.angle_d3d11_device_ptr());
+            angle_lock_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
 
             if let Err(error) = self.rendering_context.make_current() {
                 error!("Failed to make the rendering context current: {error:?}");
@@ -985,23 +996,32 @@ impl Painter {
                     )
                 });
             info!(
-                "Slow paint frame: painter {:?} total_ms={:.2} wr_update_ms={:.2} \
-                 wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} \
-                 pending_frames={}",
-                self.painter_id, render_ms, wr_update_ms, wr_render_ms, upload_mb, upload_ms,
-                draw_calls, self.pending_frames.get(),
+                "Slow paint frame: painter {:?} total_ms={:.2} \
+                 angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} \
+                 upload_mb={:.1} upload_ms={:.1} draw_calls={} pending_frames={}",
+                self.painter_id,
+                render_ms,
+                angle_lock_ms,
+                wr_update_ms,
+                wr_render_ms,
+                upload_mb,
+                upload_ms,
+                draw_calls,
+                self.pending_frames.get(),
             );
         }
         if self.rendering_context.requested_gpu_index().is_some() {
             info!(
                 "Wall render end: painter {:?} render_count={} local_frame_id={:?} \
-                 logical_frame_id={:?} render_ms={:.3} pending={} overlapping_request_count={} \
-                 unexpected_ready_count={} requested_gpu={:?} size={:?}",
+                 logical_frame_id={:?} render_ms={:.3} angle_lock_ms={:.3} pending={} \
+                 overlapping_request_count={} unexpected_ready_count={} \
+                 requested_gpu={:?} size={:?}",
                 self.painter_id,
                 render_count,
                 local_frame_id,
                 wall_logical_frame_id,
                 render_ms,
+                angle_lock_ms,
                 self.pending_frames.get(),
                 self.overlapping_frame_request_count.get(),
                 self.unexpected_frame_ready_count.get(),

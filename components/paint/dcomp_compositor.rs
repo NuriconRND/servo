@@ -1938,7 +1938,8 @@ impl DCompNativeCompositor {
         // 정상 경로(render())와 동일하게 ANGLE 공유 D3D11 즉시 컨텍스트 접근을 직렬화.
         // 이 fast-path는 update_images 게이트에서만 호출되고 render()(락 보유)와 중첩되지 않으므로
         // 재획득 데드락 없음.
-        let _angle_gl_guard = paint_api::ANGLE_GL_LOCK.lock().unwrap();
+        let _angle_gl_guard =
+            paint_api::angle_gl_lock(self.rendering_context.angle_d3d11_device_ptr());
 
         // borrow 사정: External 서피스의 present 입력을 먼저 스냅샷으로 수집한 뒤 present.
         // (present_external은 &mut self라 surfaces iter 중 호출 불가.)

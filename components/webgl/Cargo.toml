@@ -14,6 +14,7 @@ name = "webgl"
 path = "lib.rs"
 
 [features]
+no-wgl = ["surfman/sm-angle-default"]
 webgl_backtrace = ["servo-canvas-traits/webgl_backtrace"]
 webxr = ["dep:webxr", "dep:webxr-api"]
 
@@ -33,6 +34,7 @@ postcard = { workspace = true }
 rustc-hash = { workspace = true }
 servo-base = { workspace = true }
 servo-canvas-traits = { workspace = true }
+servo-config = { workspace = true }
 surfman = { workspace = true }
 webrender_api = { workspace = true }
 webxr = { workspace = true, optional = true }

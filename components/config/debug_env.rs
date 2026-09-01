@@ -250,6 +250,13 @@ pub const MEDIA_SINK_PROF: DebugFlag = DebugFlag {
     cache_index: 16,
 };
 
+pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_WEBGL_FANOUT_PROF",
+    kind: Kind::Str,
+    doc: "WebGL 멀티-GPU 팬아웃의 명령 재실행 비용을 1 초에 한 줄로 집계한다(논리 명령 수 / 디바이스별 적용 수 / 컨텍스트 전환 수 / \n          ANGLE 락 대기 / 전환·적용·직렬화 시간). truthy: \"1\" 또는 \"true\"(대소문자 무시). 재실행 루프가 명령마다 \n          디바이스를 돌기 때문에 make_context_current 의 if_needed 가드가 한 번도 적중하지 않는다 - 명령 N 개·디바이스 4 \n          개면 컨텍스트 전환도 ANGLE 락도 postcard 왕복도 4N 회다. 4K 캔버스를 ?scale=0.5 로 줄여도 변화가 없었으므로 병목은 \n          픽셀이 아니라 이 단가일 가능성이 높은데, 재실행 루프를 뒤집는 작업이 크므로 착수 전에 전환 단가가 실제로 지배적인지 확인한다. 명령마다 \n          불리는 핫패스라 기본 off.",
+    cache_index: 17,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -270,6 +277,7 @@ pub const ALL: &[&DebugFlag] = &[
     &MEDIA_VIDEO_RATE,
     &FRAME_REASON_PROF,
     &MEDIA_SINK_PROF,
+    &WEBGL_FANOUT_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

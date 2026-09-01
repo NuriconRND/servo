@@ -12,7 +12,7 @@ use embedder_traits::{AnimationState, EventLoopWaker};
 use euclid::{Rect, Scale, Size2D};
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 use servo_base::Epoch;
 use servo_base::id::{PainterId, PipelineId, WebViewId};
@@ -29,7 +29,7 @@ pub mod viewport_description;
 pub mod wall_args;
 pub mod wall_layout;
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use bitflags::bitflags;
 use display_list::PaintDisplayListInfo;
@@ -53,7 +53,91 @@ use crate::largest_contentful_paint_candidate::LCPCandidate;
 use crate::rendering_context::RenderingContext;
 use crate::viewport_description::ViewportDescription;
 
-pub static ANGLE_GL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+/// ANGLE 의 D3D11 즉시 컨텍스트 접근을 직렬화하는 락. ★전역 하나가 아니라 디바이스당 하나★.
+///
+/// # 왜 있는가 (그리고 왜 이제 전역이 아닌가)
+///
+/// 원래는 `pub static ANGLE_GL_LOCK: Mutex<()>` 하나였다. `d39b5af1362`("Stabilize WebGL wall
+/// rendering on ANGLE", 2026-06-13)가 ANGLE 을 만지는 7 곳을 한꺼번에 잠근 것으로, 당시
+/// WebGL 백엔드 컨텍스트와 컴포지터가 **ANGLE 의 LUID 캐시 EGLDisplay(따라서 하나의 D3D11
+/// 디바이스)를 공유**해 두 스레드가 한 렌더러를 구동하다 `libGLESv2.dll` 에서 access
+/// violation(0xc0000005)이 나던 문제를 멈추기 위한 것이었다.
+///
+/// ★그 공유는 그 다음 날 `35b4c2ed799`("멀티 GPU 월 WebGL: 타일별 격리 D3D11 디바이스")가
+/// 없앴다★ — WebGL 백엔드는 `create_isolated_device` 로 전용 D3D11 디바이스와 전용 ANGLE
+/// 디스플레이를 받는다. 근본 원인이 사라진 뒤에도 전역 락은 남았고, 2026-09-01 실측에서
+/// painter 들이 (드라이버 블로킹 중에) 락을 64 초 중 42.8 초 쥐는 바람에 WebGL 스레드가
+/// 자기 시간의 46.7% 를 대기로 썼다. 정작 필요한 실작업은 초당 20ms 였다.
+///
+/// # 키
+///
+/// 키는 **ANGLE D3D11 디바이스 포인터**다([`RenderingContext::angle_d3d11_device_ptr`],
+/// surfman 의 `Device::native_device().d3d11_device`). 이것이 정확히 공유 단위다 — 포인터가
+/// 같으면 즉시 컨텍스트가 같으므로 반드시 직렬화해야 하고, 다르면 서로 독립이다.
+///
+/// ★요청 GPU 인덱스를 키로 쓰면 안 된다★: `create_adapter_for_requested_gpu` 는 인덱스
+/// 선택이 실패하면 조용히 기본 어댑터로 폴백하므로, 요청한 인덱스가 실제로 열린 어댑터와
+/// 다를 수 있다. 그러면 같은 디바이스를 쓰는 둘이 다른 슬롯으로 갈려 보호가 사라진다 —
+/// 되돌아오는 증상이 하필 0xc0000005 라 가장 나쁜 실패 모드다.
+///
+/// # `None` 의 의미
+///
+/// 키를 모르는 호출부(아직 디바이스가 없는 컨텍스트 생성 경로, ANGLE 이 아닌 백엔드)는
+/// `None` 을 준다. 그러면 **전량 배타**를 잡는다 — 무엇을 건드리는지 모르므로 전부와
+/// 직렬화하는 것이 유일하게 안전한 선택이고, 모든 호출부가 `None` 인 비-ANGLE 빌드에서는
+/// 예전 전역 뮤텍스와 동작이 완전히 같아진다.
+///
+/// 잠금 순서는 항상 `shared -> device` 한 방향이고 배타 측은 디바이스 락을 잡지 않으므로
+/// 데드락이 생길 수 없다.
+pub fn angle_gl_lock(d3d11_device: Option<usize>) -> AngleGlGuard {
+    let Some(device) = d3d11_device.filter(|pointer| *pointer != 0) else {
+        return AngleGlGuard {
+            device: None,
+            shared: None,
+            exclusive: Some(ANGLE_GL_EXCLUSION.write()),
+        };
+    };
+
+    let shared = ANGLE_GL_EXCLUSION.read();
+    let device_lock = {
+        let mut registry = ANGLE_GL_DEVICE_LOCKS.lock().expect("poisoned");
+        let known = registry.len();
+        *registry.entry(device).or_insert_with(|| {
+            // ★이 줄이 안 찍히면 이 변경은 아무 일도 하지 않은 것이다★ — 키가 하나도
+            // 해석되지 않았다는 뜻이고(예: `no-wgl` 피처가 webgl 크레이트까지 전파되지
+            // 않음), 그러면 모든 호출부가 `None` 으로 떨어져 예전 전역 락과 똑같이 동작한다.
+            // 조용히 무효가 되는 것을 막으려고 디바이스당 한 번 찍는다.
+            log::warn!(
+                "ANGLE lock: separate slot for D3D11 device #{} (0x{device:x})",
+                known + 1
+            );
+            // 디바이스 하나당 한 번만 새는데(프로세스 수명 동안 몇 개), 그 대가로 가드가
+            // `'static` 이 되어 Arc 를 자기 참조로 들고 있을 필요가 없어진다.
+            &*Box::leak(Box::new(Mutex::new(())))
+        })
+    };
+
+    AngleGlGuard {
+        device: Some(device_lock.lock().expect("poisoned")),
+        shared: Some(shared),
+        exclusive: None,
+    }
+}
+
+/// 키를 모르는 작업(컨텍스트 생성 등)이 디바이스 락 전부를 배제하기 위한 상위 단계.
+static ANGLE_GL_EXCLUSION: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+
+/// ANGLE D3D11 디바이스 포인터 -> 그 디바이스의 락.
+static ANGLE_GL_DEVICE_LOCKS: LazyLock<Mutex<HashMap<usize, &'static Mutex<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// [`angle_gl_lock`] 이 돌려주는 가드. 필드 선언 순서가 곧 해제 순서이므로 디바이스 락이
+/// 상위 단계보다 먼저 풀린다(획득의 역순).
+pub struct AngleGlGuard {
+    device: Option<MutexGuard<'static, ()>>,
+    shared: Option<RwLockReadGuard<'static, ()>>,
+    exclusive: Option<RwLockWriteGuard<'static, ()>>,
+}
 
 /// Sends messages to `Paint`.
 #[derive(Clone)]

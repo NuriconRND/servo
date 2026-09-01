@@ -9224,6 +9224,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "servo-base",
  "servo-canvas-traits",
+ "servo-config",
  "servo-paint-api",
  "servo-pixels",
  "servo-webxr",

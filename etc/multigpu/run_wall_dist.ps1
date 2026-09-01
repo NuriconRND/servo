@@ -196,6 +196,21 @@ param(
     # only does four things, so splitting them names it. notify is the one to watch: it is an
     # IpcSender send per frame, 1350 a second at 45 videos.
     [switch] $SinkProf,
+    # SERVO_WEBGL_FANOUT_PROF=1: one line per second breaking down what a WebGL canvas costs
+    # when it spans several GPUs. Every WebGL command is replayed once per backend device, and
+    # the replay loop runs the DEVICE loop inside the COMMAND loop -- so the "if needed" guard in
+    # make_surface_current never hits and N commands across 4 devices cost 4N context switches,
+    # 4N global ANGLE lock acquisitions and 4N postcard round-trips.
+    #
+    # ***The pixel explanation is already ruled out.*** Halving the canvas with ?scale=0.5
+    # changed nothing, and all four tiles come in at ~17ms each regardless of which region they
+    # own. Read `switches` against `applies`: equal means every command changes context. If
+    # switch_ms + lock_wait_ms dominate the window, inverting the loop (4N switches -> 4) is the
+    # fix; if apply_ms dominates it is real GL work and inverting the loop buys nothing.
+    #
+    # Pair it with -PresentCadence: that reports angle_lock_ms per tile, which is the other half
+    # -- whether the tiles are slow doing their own work or waiting on the WebGL thread's lock.
+    [switch] $FanoutProf,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -365,6 +380,7 @@ if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
 if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
 if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
+if ($FanoutProf)           { $env:SERVO_WEBGL_FANOUT_PROF = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
@@ -769,6 +785,44 @@ if ($fr) {
     foreach ($k in ($tally.Keys | Sort-Object { -$tally[$_] })) {
         Write-Host ("    {0,8:N1}/s  {1}" -f ($tally[$k] / [math]::Max($windows, 1)), $k)
     }
+}
+
+# --- WEBGLFANOUT: is a spanning WebGL canvas paying for pixels or for the replay? ---
+# The verdict this is here to deliver: switches == applies means the replay loop changes GL
+# context on EVERY command, and switch+lock time is then the thing to attack (invert the loop).
+# If apply time dominates instead, the replay is doing real GL work and inverting buys nothing.
+$wgf = Select-String -Path $LogPath -Pattern "WEBGLFANOUT window_ms=([\d.]+) swaps=(\d+) ctx=(\d+) dev=(\d+) cmds=(\d+) applies=(\d+) switches=(\d+) lock_wait_ms=([\d.]+) switch_ms=([\d.]+) apply_ms=([\d.]+) serialize_ms=([\d.]+)" -EA SilentlyContinue
+if ($wgf) {
+    $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
+    $n        = $wgf.Count
+    $window   = ($wgf | ForEach-Object { & $g $_ 1 } | Measure-Object -Sum).Sum
+    $dev      = ($wgf | ForEach-Object { & $g $_ 4 } | Measure-Object -Maximum).Maximum
+    $cmds     = ($wgf | ForEach-Object { & $g $_ 5 } | Measure-Object -Sum).Sum
+    $applies  = ($wgf | ForEach-Object { & $g $_ 6 } | Measure-Object -Sum).Sum
+    $switches = ($wgf | ForEach-Object { & $g $_ 7 } | Measure-Object -Sum).Sum
+    $lockMs   = ($wgf | ForEach-Object { & $g $_ 8 } | Measure-Object -Sum).Sum
+    $switchMs = ($wgf | ForEach-Object { & $g $_ 9 } | Measure-Object -Sum).Sum
+    $applyMs  = ($wgf | ForEach-Object { & $g $_ 10 } | Measure-Object -Sum).Sum
+    $serMs    = ($wgf | ForEach-Object { & $g $_ 11 } | Measure-Object -Sum).Sum
+    $pct      = { param($ms) if ($window -gt 0) { 100.0 * $ms / $window } else { 0.0 } }
+    Write-Host ""
+    Write-Host "WEBGLFANOUT -- WebGL multi-GPU replay cost ($n one-second windows, max $dev backend devices):"
+    Write-Host ("  commands/s {0,10:N0}   applies/s {1,10:N0}   switches/s {2,10:N0}" -f ($cmds / $n), ($applies / $n), ($switches / $n))
+    Write-Host ("  context switch   {0,9:N1} ms  ({1,5:N1}% of window)" -f $switchMs, (& $pct $switchMs))
+    Write-Host ("  ANGLE lock wait  {0,9:N1} ms  ({1,5:N1}% of window)" -f $lockMs, (& $pct $lockMs))
+    Write-Host ("  apply (w/ switch){0,9:N1} ms  ({1,5:N1}% of window)" -f $applyMs, (& $pct $applyMs))
+    Write-Host ("  postcard trip    {0,9:N1} ms  ({1,5:N1}% of window)" -f $serMs, (& $pct $serMs))
+    if ($applies -gt 0) {
+        $ratio = $switches / $applies
+        Write-Host ("  switches per apply {0:N3}" -f $ratio)
+        if ($ratio -gt 0.95) {
+            Write-Warning "Every replayed command changes GL context (switches ~= applies). This is the interleaved device loop; inverting it would cut switches from 4N to 4."
+        } else {
+            Write-Host "  Context switching is NOT per-command -- look elsewhere before inverting the replay loop."
+        }
+    }
+} elseif ($FanoutProf) {
+    Write-Warning "-FanoutProf was set but no WEBGLFANOUT line was logged. The counters only emit at a swap boundary, so a run with no WebGL canvas produces nothing."
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }
