@@ -238,6 +238,15 @@ param(
     #
     # Needs -DComp surface: with the compositor off there is nothing to bind.
     [switch] $DcompBindProf,
+    # gfx_dcomp_always_flush_end_frame=true: restore the unconditional gl().flush() in the
+    # DComp end_frame. It is conditional by default -- it only runs when a SwapChain or
+    # External surface exists, which is when a submit actually has to become visible
+    # somewhere else. That one line measured 7.36ms a frame, 90% of the painter's render,
+    # on a run where every surface was Virtual and there was nothing to order against.
+    #
+    # ***Its failure mode is visual, not a crash.*** Stale tiles or tearing. If the wall
+    # looks wrong, set this and the old behaviour comes straight back.
+    [switch] $DcompAlwaysFlush,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -484,6 +493,7 @@ if ($Devtools -ne "") {
     $argList += @("--pref", "devtools_server_listen_address=$Devtools")
 }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
+if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
@@ -501,7 +511,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -936,15 +946,17 @@ if ($wex) {
 # only 6 binds/s against 18 renders/s -- most renders bind nothing yet all of them were slow,
 # so the cost is not per tile. end_frame is the one thing here that runs every frame, and it
 # holds the GL flush, the swap-chain Present and the DWM Commit.
-$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) commit_ms=([\d.]+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
 if ($dbp) {
     $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     $w = 0.0; $bf = 0.0; $ef = 0.0; $binds = 0.0; $full = 0.0
     $endf = 0.0; $flush = 0.0; $commit = 0.0; $bd = 0.0; $pbuf = 0.0; $ed = 0.0; $td = 0.0
+    $flushed = 0.0; $skipped = 0.0
     foreach ($m in $dbp) {
         $w += (& $v $m 1); $bf += (& $v $m 2); $ef += (& $v $m 3); $binds += (& $v $m 4)
-        $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7); $commit += (& $v $m 8)
-        $bd += (& $v $m 9); $pbuf += (& $v $m 10); $ed += (& $v $m 11); $td += (& $v $m 12)
+        $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7)
+        $flushed += (& $v $m 8); $skipped += (& $v $m 9); $commit += (& $v $m 10)
+        $bd += (& $v $m 11); $pbuf += (& $v $m 12); $ed += (& $v $m 13); $td += (& $v $m 14)
     }
     # window_ms sums across every compositor that emitted, one per painter, so it is already
     # painter-seconds; dividing by it gives a per-painter-per-second rate rather than a wall rate.
@@ -953,7 +965,7 @@ if ($dbp) {
     Write-Host ""
     Write-Host ("DCOMPBIND -- DComp per painter ({0:N1} frames/s, {1:N1} binds/s):" -f ($ef/$secs), ($binds/$secs))
     Write-Host ("  end_frame     {0,9:N1} ms/s   {1,8:N3} ms per frame" -f ($endf/$secs), $(if ($ef -gt 0) { $endf/$ef } else { 0 }))
-    Write-Host ("    gl flush    {0,9:N1} ms/s" -f ($flush/$secs))
+    Write-Host ("    gl flush    {0,9:N1} ms/s   (ran on {1:N0} frames, skipped on {2:N0})" -f ($flush/$secs), $flushed, $skipped)
     Write-Host ("    Commit      {0,9:N1} ms/s" -f ($commit/$secs))
     Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, Present, promote/demote)" -f (($endf-$flush-$commit)/$secs))
     Write-Host ("  tile round trip {0,7:N1} ms/s  (BeginDraw {1:N1} / pbuffer {2:N1} / EndDraw {3:N1} / teardown {4:N1})" -f ($tiles/$secs), ($bd/$secs), ($pbuf/$secs), ($ed/$secs), ($td/$secs))
@@ -963,6 +975,13 @@ if ($dbp) {
         if ($perFrame -gt 5.0) {
             $part = if ($flush -gt $commit) { "the GL flush" } else { "the DWM Commit" }
             Write-Warning ("end_frame costs {0:N2} ms a frame -- this compositor IS the cost, and {1} is the larger half. Fixing it here is on the table." -f $perFrame, $part)
+        } elseif ($skipped -gt 0 -and $flushed -eq 0) {
+            # The conditional flush did its job. Say so, rather than reading a cheap end_frame
+            # as evidence about WebRender -- that reading was written before the fix existed
+            # and would now credit the wrong thing.
+            Write-Host ("  end_frame is {0:N2} ms a frame and the flush was skipped on all {1:N0} of them." -f $perFrame, $skipped)
+            Write-Host "  That is the conditional flush working: every surface was Virtual, so nothing needed submitting"
+            Write-Host "  anywhere else. Check the wall visually -- this one is only proven by looking at it."
         } else {
             Write-Host ("  end_frame is only {0:N2} ms a frame, so this compositor is NOT where the render time goes." -f $perFrame)
             Write-Host "  That points at WebRender's own native-compositor path rather than anything callable from here,"

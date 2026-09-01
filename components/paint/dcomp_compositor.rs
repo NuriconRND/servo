@@ -1256,6 +1256,10 @@ struct BindProfile {
     /// `end_frame` 내부 쪼개기 — 각각 성격이 완전히 다르다.
     /// `flush` 는 GL 큐 제출, `present` 는 스왑체인 Present, `commit` 은 DWM 반영 요청.
     flush_ns: u64,
+    /// flush 를 실제로 건 프레임 수와 조건이 걸러 건너뛴 프레임 수. 둘을 함께 찍어야
+    /// "조건이 실제로 동작했는가" 가 로그만으로 판정된다.
+    flushes: u64,
+    flush_skipped: u64,
     present_ns: u64,
     presents: u64,
     commit_ns: u64,
@@ -1995,7 +1999,7 @@ impl DCompNativeCompositor {
         let profile = &self.bind_profile;
         warn!(
             "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
-             end_frame_ms={:.1} flush_ms={:.1} commit_ms={:.1} \
+             end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} \
              begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
@@ -2004,6 +2008,8 @@ impl DCompNativeCompositor {
             profile.full_tile,
             ms(profile.end_frame_ns),
             ms(profile.flush_ns),
+            profile.flushes,
+            profile.flush_skipped,
             ms(profile.commit_ns),
             ms(profile.begin_ns),
             ms(profile.pbuffer_ns),
@@ -2882,12 +2888,35 @@ impl Compositor for DCompNativeCompositor {
         // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
         // 돌면 ANGLE 상태가 어긋난다(close_external_batch/begin_batch 주석).
         self.close_external_batch();
-        // GL 커맨드를 D3D 큐에 확실히 제출한 뒤 Present(순서 보장).
         let end_frame_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-        let flush_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-        device.gl().flush();
-        if let Some(start) = flush_start {
-            self.bind_profile.flush_ns += start.elapsed().as_nanos() as u64;
+        // GL 커맨드를 D3D 큐에 제출해 뒤따르는 Present 와의 순서를 보장한다 — ★단, 그 Present
+        // 가 실제로 있을 때만★.
+        //
+        // 이 한 줄이 프레임당 7.36ms 였다(2026-09-01, `log_webgpu/29`): end_frame 7.364ms/frame
+        // 중 flush 가 98.9%, painter 평균 렌더 8.21ms 의 90%. 그런데 같은 실행에서 promote /
+        // regen / external add / content-swap / present-partial 이 전부 0 이었다. 서피스가 전부
+        // Virtual 이라 순서를 지켜줄 Present 가 아예 없는데 값을 치르고 있었다.
+        //
+        // 전부 Virtual 이면 GL 도 DComp 의 BeginDraw/EndDraw 도 같은 ANGLE D3D11 immediate
+        // context 위에 있고, 한 컨텍스트 안의 명령은 이미 순서가 보장된다. flush 가 필요한 것은
+        // 제출이 **다른 곳에서 보여야** 할 때다 — `External` 은 비디오 링의 다른 D3D11 디바이스를
+        // 빌려 쓰고, `SwapChain` 은 Present 로 넘긴다.
+        //
+        // `gfx_dcomp_always_flush_end_frame=true` 로 옛 무조건 flush 로 즉시 되돌릴 수 있다.
+        // ★실패 모드가 크래시가 아니라 시각적 깨짐이라 육안 확인이 필요하다.★
+        let needs_flush = servo_config::pref!(gfx_dcomp_always_flush_end_frame) ||
+            self.surfaces.values().any(|entry| {
+                !matches!(entry.storage, SurfaceStorage::Virtual { .. })
+            });
+        if needs_flush {
+            let flush_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+            device.gl().flush();
+            if let Some(start) = flush_start {
+                self.bind_profile.flush_ns += start.elapsed().as_nanos() as u64;
+                self.bind_profile.flushes += 1;
+            }
+        } else if *DCOMP_BIND_PROF {
+            self.bind_profile.flush_skipped += 1;
         }
 
         let mode = storage_mode();

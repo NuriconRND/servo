@@ -315,6 +315,24 @@ pub struct Preferences {
     /// `RenderingContext` 생성 전에 주입하고, surfman은 그 결과 불리언만 받는다. 옛
     /// `SERVO_COMPOSITOR_DCOMP` env는 더 이상 읽히지 않는다.
     pub gfx_dcomp_mode: String,
+    /// DComp `end_frame` 의 `gl().flush()` 를 **항상** 걸지, 그 flush 가 실제로 순서를
+    /// 지켜줄 대상이 있을 때만 걸지. 기본 `false` = 조건부(필요할 때만).
+    ///
+    /// ★그 한 줄이 프레임당 7.36ms 였다★(2026-09-01, `log_webgpu/29`): `end_frame` 이
+    /// 7.364ms/frame 인데 그중 flush 가 161.6/163.4 ms/s 로 98.9% 였고, painter 평균 렌더
+    /// 8.21ms 의 90% 였다. 같은 실행에서 그 flush 가 순서를 지켜주려는 대상은 전부 0 이었다 —
+    /// promote 0, regen 0, external add 0, content-swap 0, present-partial 0. 서피스가 전부
+    /// Virtual 이라 Present 자체가 없었다.
+    ///
+    /// 조건: `SwapChain`(Present 한다) 또는 `External`(비디오 링의 **다른** D3D11 디바이스를
+    /// 빌려 쓰므로 제출이 실제로 보여야 한다) 서피스가 하나라도 있으면 flush 한다. 전부
+    /// `Virtual` 이면 GL 도 DComp 도 같은 immediate context 위에 있어 순서가 이미 보장되므로
+    /// 건너뛴다.
+    ///
+    /// ★실패 모드가 크래시가 아니라 시각적 깨짐이다★ — 스테일 타일이나 티어링. 숫자만으로는
+    /// 검증되지 않으니 육안 확인이 필요하고, 의심스러우면 이 pref 를 `true` 로 두어 즉시 옛
+    /// 무조건 flush 로 되돌린다.
+    pub gfx_dcomp_always_flush_end_frame: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -820,6 +838,7 @@ impl Preferences {
             gfx_texture_swizzling_enabled: true,
             // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; 배선은 Task 3 이 완료).
             gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
+            gfx_dcomp_always_flush_end_frame: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
