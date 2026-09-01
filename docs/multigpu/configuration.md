@@ -311,17 +311,22 @@ painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `angle_loc
 
 ### `SERVO_DCOMP_BIND_PROF` — `Str`
 
-DComp Native 의 타일 bind/unbind 비용을 1 초에 한 줄로 쪼개 집계한다(BeginDraw / pbuffer 래핑 / EndDraw / pbuffer 파괴, 그리고 dirty 면적 대 타일 면적). truthy: "1" 또는 "true"(대소문자 무시). 2026-09-01 짝 A/B 에서 DComp Native 를 끄면 월이 24.9fps 에서 61.9fps 가 됐다 — 평균 painter 렌더 7.75ms 대 0.83ms. 그 비용은 WR 컴포지터의 bind()/unbind() 가 무효화된 picture-cache 타일마다 부르는 IDCompositionVirtualSurface::BeginDraw/EndDraw 다. 이 노브는 그 안에서 어느 구간인지를 가른다: BeginDraw 자체가 크면 DComp 가 서피스를 내주기를 기다리는 것이고, pbuffer 가 크면 아틀라스 텍스처를 EGL 로 감싸는 비용이며, dirty 면적이 늘 타일 면적과 같으면 부분 갱신이 성립하지 않아 매 프레임 타일 전체를 새로 받는 것이다. 타일마다 불리는 핫패스라 기본 off.
+DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() / Commit(), 그리고 타일 왕복(BeginDraw / pbuffer 래핑 / EndDraw / teardown)과 begin_frame·end_frame 호출 수. truthy: "1" 또는 "true"(대소문자 무시). ★1 차 계측이 타일 왕복을 무죄로 밝혔다★(2026-09-01): 왕복이 bind 당 0.541ms, painter 당 초당 3.2ms 였고, 무엇보다 painter 가 초당 18 번 렌더하는데 bind 는 6 번뿐인데도 모든 렌더가 느렸다 — 비용이 타일별이 아니라는 뜻이다. 그래서 end_frame 을 잰다: bind 와 무관 하게 매 프레임 불리고, 이 컴포지터에서 무거운 일(GL flush, 스왑체인 Present, DWM Commit) 이 전부 그 안에 있다. end_frame_ms 가 프레임 예산을 채우면 그 안의 flush/commit 분해가 어느 쪽인지 가르고, 채우지 않으면 비용은 이 컴포지터가 아니라 WebRender 자신의 네이티브 컴포지터 경로에 있다. 프레임마다 불리는 핫패스라 기본 off.
 
 ```
-DCOMPBIND window_ms=1001 binds=243 begin_ms=3612.4 pbuffer_ms=41.2 end_ms=88.7   destroy_ms=12.1 dirty_px=503316480 tile_px=503316480 full_tile=243/243
+DCOMPBIND window_ms=1001 frames=18/18 binds=6 full_tile=2 end_frame_ms=270.4   flush_ms=3.1 commit_ms=1.8 begin_ms=0.1 pbuffer_ms=3.0 enddraw_ms=0.1 teardown_ms=0.0
 ```
 
-읽는 법: `full_tile` 이 `binds` 와 같으면 **부분 갱신이 한 번도 성립하지 않는 것**이고, 그러면
-매 프레임 타일 전체를 DComp 에서 새로 받는 셈이라 비용이 타일 크기에 비례한다
-(`gfx_wr_picture_tile_size`, 런처 `-TileSize`). `begin_ms` 가 나머지를 압도하면 DComp 가
-서피스를 내주기를 기다리는 것이므로 버퍼링/타이밍 문제이고, `pbuffer_ms` 가 크면 아틀라스
-텍스처를 EGL pbuffer 로 감싸는 비용이라 성격이 다르다.
+읽는 법: `frames` 는 `begin_frame/end_frame` 호출 수다 — 이 값이 painter 의 렌더 횟수와 맞는지
+부터 본다(1 차 계측에서 bind 수와 렌더 수가 3 배 어긋난 것이 결정적 단서였다).
+`end_frame_ms / frames` 가 타일당 렌더 비용에 근접하면 원인은 이 컴포지터 안이고, 그러면
+`flush_ms` 와 `commit_ms` 가 어느 쪽인지 가른다. 반대로 `end_frame_ms` 가 작은데 렌더가 여전히
+느리면 **이 컴포지터가 아니라 WebRender 자신의 네이티브 경로**가 비용이고, 그때는 DComp 를
+켠 채로 고칠 여지가 없다는 뜻이라 판단이 달라진다.
+
+타일 왕복 넷(`begin_ms`/`pbuffer_ms`/`enddraw_ms`/`teardown_ms`)은 이미 무죄로 밝혀졌지만
+남겨 둔다 — 배치가 바뀌면(타일 크기, 페이지 구성) 다시 커질 수 있고, 빠졌다는 이유로 다시
+의심하는 일을 막는다.
 
 ## wall CLI 플래그
 

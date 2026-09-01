@@ -1233,10 +1233,32 @@ static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| 
 /// (2026-09-01 짝 A/B). 그 차이 전부가 `wr_render_ms` 안에 있고 업로드도 락도 아니었으므로
 /// 남는 것은 이 bind/unbind 왕복이다. 그 안에서 **어느 구간인지**를 가르는 것이 이 계측의
 /// 전부다 — 구간마다 고칠 방법이 전혀 다르기 때문이다.
+///
+/// ★1 차 계측이 bind/unbind 를 무죄로 밝혔다★(2026-09-01, `log_webgpu/28`): 왕복이 bind 당
+/// 0.541ms, painter 당 초당 3.2ms 였고, 무엇보다 painter 가 초당 18 번 렌더하는데 bind 는 6 번
+/// 뿐인데도 **모든 렌더가 느렸다**. 비용이 타일별이 아니라는 뜻이다. 그래서 후보를 또 하나
+/// 고르는 대신 **Compositor 경계 전체**를 잰다 — `end_frame` 은 bind 와 무관하게 매 프레임
+/// 불리고 그 안에 `gl().flush()`, `Present`, `Commit()` 이 모두 들어 있다.
 #[derive(Default)]
 struct BindProfile {
     window_start: Option<std::time::Instant>,
     binds: u64,
+    /// Compositor 트레이트 메서드별 호출 수와 누적 시간(begin_frame / add_surface /
+    /// start_compositing / end_frame / create_surface).
+    begin_frame_ns: u64,
+    begin_frames: u64,
+    add_surface_ns: u64,
+    add_surfaces: u64,
+    start_compositing_ns: u64,
+    end_frame_ns: u64,
+    end_frames: u64,
+    create_surface_ns: u64,
+    /// `end_frame` 내부 쪼개기 — 각각 성격이 완전히 다르다.
+    /// `flush` 는 GL 큐 제출, `present` 는 스왑체인 Present, `commit` 은 DWM 반영 요청.
+    flush_ns: u64,
+    present_ns: u64,
+    presents: u64,
+    commit_ns: u64,
     /// `IDCompositionVirtualSurface::BeginDraw` 자체.
     begin_ns: u64,
     /// BeginDraw 가 돌려준 (아틀라스일 수 있는) 텍스처를 EGL pbuffer 로 감싸고 current 로 삼는 비용.
@@ -1972,18 +1994,21 @@ impl DCompNativeCompositor {
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         let profile = &self.bind_profile;
         warn!(
-            "DCOMPBIND window_ms={:.0} binds={} begin_ms={:.1} pbuffer_ms={:.1} \
-             end_ms={:.1} destroy_ms={:.1} dirty_px={} tile_px={} full_tile={}/{}",
+            "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
+             end_frame_ms={:.1} flush_ms={:.1} commit_ms={:.1} \
+             begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
             window.as_secs_f64() * 1000.0,
+            profile.begin_frames,
+            profile.end_frames,
             profile.binds,
+            profile.full_tile,
+            ms(profile.end_frame_ns),
+            ms(profile.flush_ns),
+            ms(profile.commit_ns),
             ms(profile.begin_ns),
             ms(profile.pbuffer_ns),
             ms(profile.end_ns),
             ms(profile.destroy_ns),
-            profile.dirty_px,
-            profile.tile_px,
-            profile.full_tile,
-            profile.binds,
         );
         self.bind_profile = BindProfile {
             window_start: Some(now),
@@ -2665,6 +2690,14 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn begin_frame(&mut self, _device: &mut Device) {
+        if *DCOMP_BIND_PROF {
+            // 호출 수만 센다. 시간은 `end_frame` 에서 재는데, 이 컴포지터에서 매 프레임 무거운
+            // 일(flush / Present / Commit)을 하는 자리가 거기뿐이기 때문이다. 계수가 따로
+            // 필요한 이유는 `end_frames` 와 나란히 놓았을 때 프레임당 1:1 인지, 그리고 그 수가
+            // painter 의 렌더 횟수와 맞는지가 드러나기 때문이다 — 1 차 계측에서 bind 수와 렌더
+            // 수가 3 배 어긋난 것이 결정적 단서였다.
+            self.bind_profile.begin_frames += 1;
+        }
         // external 배치는 정상적으로 직전 프레임 start_compositing에서 닫힌다. 만약 어떤 이유로
         // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
         // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
@@ -2850,7 +2883,12 @@ impl Compositor for DCompNativeCompositor {
         // 돌면 ANGLE 상태가 어긋난다(close_external_batch/begin_batch 주석).
         self.close_external_batch();
         // GL 커맨드를 D3D 큐에 확실히 제출한 뒤 Present(순서 보장).
+        let end_frame_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        let flush_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         device.gl().flush();
+        if let Some(start) = flush_start {
+            self.bind_profile.flush_ns += start.elapsed().as_nanos() as u64;
+        }
 
         let mode = storage_mode();
         let rc = self.rendering_context.clone();
@@ -3386,9 +3424,18 @@ impl Compositor for DCompNativeCompositor {
             return;
         };
         // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
+        let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         let hr = unsafe { (*dcomp_device).Commit() };
         if hr < 0 {
             warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
+        }
+        if let Some(start) = commit_start {
+            self.bind_profile.commit_ns += start.elapsed().as_nanos() as u64;
+        }
+        if let Some(start) = end_frame_start {
+            self.bind_profile.end_frames += 1;
+            self.bind_profile.end_frame_ns += start.elapsed().as_nanos() as u64;
+            self.maybe_emit_bind_profile();
         }
 
         // external present 프로파일: 프레임 카운트 후 1초 경과 시 [vesc-prof] 집계 라인 출력.

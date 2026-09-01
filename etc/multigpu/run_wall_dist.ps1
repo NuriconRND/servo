@@ -931,38 +931,46 @@ if ($wex) {
     Write-Warning "-FanoutProf was set but no WEBGLEXTIMG line was logged. It only emits from the external-image unlock callback, so a run whose page never shows a WebGL canvas produces nothing."
 }
 
-# --- DCOMPBIND: which part of the DComp tile round trip costs the 15ms? ---
-$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) binds=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) end_ms=([\d.]+) destroy_ms=([\d.]+) dirty_px=(\d+) tile_px=(\d+) full_tile=(\d+)/(\d+)" -EA SilentlyContinue
+# --- DCOMPBIND: where does the DComp compositor spend a frame? ---
+# The tile round trip was measured first and cleared: 0.541ms a bind, 3.2 ms/s a painter, and
+# only 6 binds/s against 18 renders/s -- most renders bind nothing yet all of them were slow,
+# so the cost is not per tile. end_frame is the one thing here that runs every frame, and it
+# holds the GL flush, the swap-chain Present and the DWM Commit.
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) commit_ms=([\d.]+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
 if ($dbp) {
     $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
-    $w = 0.0; $binds = 0.0; $begin = 0.0; $pbuf = 0.0; $end = 0.0; $destroy = 0.0
-    $dirty = 0.0; $tilepx = 0.0; $full = 0.0
+    $w = 0.0; $bf = 0.0; $ef = 0.0; $binds = 0.0; $full = 0.0
+    $endf = 0.0; $flush = 0.0; $commit = 0.0; $bd = 0.0; $pbuf = 0.0; $ed = 0.0; $td = 0.0
     foreach ($m in $dbp) {
-        $w += (& $v $m 1); $binds += (& $v $m 2); $begin += (& $v $m 3); $pbuf += (& $v $m 4)
-        $end += (& $v $m 5); $destroy += (& $v $m 6); $dirty += (& $v $m 7); $tilepx += (& $v $m 8)
-        $full += (& $v $m 9)
+        $w += (& $v $m 1); $bf += (& $v $m 2); $ef += (& $v $m 3); $binds += (& $v $m 4)
+        $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7); $commit += (& $v $m 8)
+        $bd += (& $v $m 9); $pbuf += (& $v $m 10); $ed += (& $v $m 11); $td += (& $v $m 12)
     }
+    # window_ms sums across every compositor that emitted, one per painter, so it is already
+    # painter-seconds; dividing by it gives a per-painter-per-second rate rather than a wall rate.
     $secs = [math]::Max($w / 1000.0, 0.001)
-    $total = $begin + $pbuf + $end + $destroy
+    $tiles = $bd + $pbuf + $ed + $td
     Write-Host ""
-    Write-Host ("DCOMPBIND -- the DComp tile round trip ({0:N0} binds/s over {1:N0}s):" -f ($binds/$secs), $secs)
-    foreach ($row in @(@{n="BeginDraw"; v=$begin}, @{n="pbuffer wrap"; v=$pbuf}, @{n="EndDraw"; v=$end}, @{n="teardown"; v=$destroy})) {
-        $share = if ($total -gt 0) { 100.0 * $row.v / $total } else { 0.0 }
-        Write-Host ("  {0,-14} {1,9:N1} ms/s  ({2,5:N1}% of the round trip)" -f $row.n, ($row.v/$secs), $share)
-    }
-    if ($binds -gt 0) {
-        Write-Host ("  per bind: {0:N3} ms" -f ($total/$binds))
-        $fullShare = 100.0 * $full / $binds
-        Write-Host ("  full-tile updates: {0:N0}/{1:N0} ({2:N1}%)" -f $full, $binds, $fullShare)
-        if ($fullShare -gt 90) {
-            Write-Warning "Partial update never engages -- every bind asks for the whole tile. The cost then tracks -TileSize (gfx_wr_picture_tile_size), not page content."
+    Write-Host ("DCOMPBIND -- DComp per painter ({0:N1} frames/s, {1:N1} binds/s):" -f ($ef/$secs), ($binds/$secs))
+    Write-Host ("  end_frame     {0,9:N1} ms/s   {1,8:N3} ms per frame" -f ($endf/$secs), $(if ($ef -gt 0) { $endf/$ef } else { 0 }))
+    Write-Host ("    gl flush    {0,9:N1} ms/s" -f ($flush/$secs))
+    Write-Host ("    Commit      {0,9:N1} ms/s" -f ($commit/$secs))
+    Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, Present, promote/demote)" -f (($endf-$flush-$commit)/$secs))
+    Write-Host ("  tile round trip {0,7:N1} ms/s  (BeginDraw {1:N1} / pbuffer {2:N1} / EndDraw {3:N1} / teardown {4:N1})" -f ($tiles/$secs), ($bd/$secs), ($pbuf/$secs), ($ed/$secs), ($td/$secs))
+    if ($binds -gt 0) { Write-Host ("  full-tile updates: {0:N0}/{1:N0}" -f $full, $binds) }
+    if ($ef -gt 0) {
+        $perFrame = $endf / $ef
+        if ($perFrame -gt 5.0) {
+            $part = if ($flush -gt $commit) { "the GL flush" } else { "the DWM Commit" }
+            Write-Warning ("end_frame costs {0:N2} ms a frame -- this compositor IS the cost, and {1} is the larger half. Fixing it here is on the table." -f $perFrame, $part)
+        } else {
+            Write-Host ("  end_frame is only {0:N2} ms a frame, so this compositor is NOT where the render time goes." -f $perFrame)
+            Write-Host "  That points at WebRender's own native-compositor path rather than anything callable from here,"
+            Write-Host "  which would mean DComp cannot be made cheap from this side -- keep it off for this configuration."
         }
-        $worst = @(@{n="BeginDraw"; v=$begin}, @{n="pbuffer wrap"; v=$pbuf}, @{n="EndDraw"; v=$end}, @{n="teardown"; v=$destroy}) |
-            Sort-Object { -$_.v } | Select-Object -First 1
-        Write-Host ("  dominant phase: {0}" -f $worst.n)
     }
 } elseif ($DcompBindProf) {
-    Write-Warning "-DcompBindProf was set but no DCOMPBIND line was logged. It emits from unbind, so a run where no picture-cache tile was ever invalidated produces nothing."
+    Write-Warning "-DcompBindProf was set but no DCOMPBIND line was logged. It emits from end_frame, so a run where the native compositor never engaged produces nothing."
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }
