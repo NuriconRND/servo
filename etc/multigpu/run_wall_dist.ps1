@@ -930,12 +930,15 @@ if ($wex) {
     } elseif ($totalNofb -gt 0) {
         Write-Host "  no_front_buffer is non-zero -- some locks found nothing to take, so look at the producer side."
     } else {
-        Write-Host "  This callback is NOT the tile cost: a few ms a second against a ~15ms tile render."
-        Write-Host "  Not upload (upload_mb=0), not the ANGLE lock (angle_lock_ms~0), not WebRender update"
-        Write-Host "  (wr_update_ms~0). What is left is inside the draw submission itself, and it does not"
-        Write-Host "  scale with canvas pixels (?scale=0.5 changed nothing), so it reads as a fixed per-render"
-        Write-Host "  stall. It is per tile and per GPU, so parallelising the tile loop should overlap it --"
-        Write-Host "  see parallel_ceiling in the WALLPASS lines."
+        Write-Host "  Locking the canvas is not itself the cost -- a few ms a second, and the keyed-mutex"
+        Write-Host "  acquire runs about 0.4ms a lock whether the wall is fast or slow."
+        Write-Host "  What decides the frame rate is whether the tile gets REDRAWN from this texture:"
+        Write-Host "    static canvas  -> no tile binds -> Commit 0.007ms/frame -> 63.6fps"
+        Write-Host "    video (same D3D11 device as the painter) -> 54 binds/s -> Commit 0.44ms -> 61.5fps"
+        Write-Host "    animating canvas (isolated device, cross-device share) -> Commit 37ms -> 6.7fps"
+        Write-Host "  So read DCOMPBIND's binds/s next to this: cost appears when a tile is redrawn from a"
+        Write-Host "  CROSS-DEVICE texture. Parallelising the tile loop does not help -- that was measured"
+        Write-Host "  and shelved (docs/multigpu/parallel_tile_render_design.md)."
     }
 } elseif ($FanoutProf) {
     Write-Warning "-FanoutProf was set but no WEBGLEXTIMG line was logged. It only emits from the external-image unlock callback, so a run whose page never shows a WebGL canvas produces nothing."
