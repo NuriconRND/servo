@@ -832,11 +832,15 @@ if ($wgf) {
 $wex = Select-String -Path $LogPath -Pattern "WEBGLEXTIMG painter=PainterId\((\d+)\) window_ms=([\d.]+) locks=(\d+) lock_ms=([\d.]+) take_ms=([\d.]+) create_ms=([\d.]+) no_front_buffer=(\d+) unlocks=(\d+) unlock_ms=([\d.]+) destroy_ms=([\d.]+)" -EA SilentlyContinue
 if ($wex) {
     $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
-    $rows = @{}
+    # NOT $rows -- see the VIDEORATE block above. PowerShell variable names are
+    # case-insensitive, so $rows IS the [int] $Rows parameter and assigning a hashtable to
+    # it throws at runtime. That warning was already written down and still got walked into,
+    # so it is repeated here at the second site rather than left in one place.
+    $extRows = @{}
     foreach ($m in $wex) {
         $id = [int](& $g $m 1)
-        if (-not $rows.ContainsKey($id)) { $rows[$id] = @{ w=0.0; n=0; locks=0.0; lock=0.0; take=0.0; create=0.0; nofb=0.0; unlock=0.0; destroy=0.0 } }
-        $r = $rows[$id]
+        if (-not $extRows.ContainsKey($id)) { $extRows[$id] = @{ w=0.0; n=0; locks=0.0; lock=0.0; take=0.0; create=0.0; nofb=0.0; unlock=0.0; destroy=0.0 } }
+        $r = $extRows[$id]
         $r.w += (& $g $m 2); $r.n++
         $r.locks += (& $g $m 3); $r.lock += (& $g $m 4); $r.take += (& $g $m 5)
         $r.create += (& $g $m 6); $r.nofb += (& $g $m 7)
@@ -844,24 +848,38 @@ if ($wex) {
     }
     Write-Host ""
     Write-Host "WEBGLEXTIMG -- what a tile pays to consume the WebGL canvas:"
-    Write-Host ("  {0,-8} {1,8} {2,10} {3,10} {4,10} {5,12} {6,10}" -f "painter", "locks/s", "lock ms/s", "take ms/s", "create ms/s", "no_front_buf", "destroy ms/s")
-    $totalCreate = 0.0; $totalNofb = 0.0; $totalLock = 0.0
-    foreach ($id in ($rows.Keys | Sort-Object)) {
-        $r = $rows[$id]
+    Write-Host ("  {0,-8} {1,8} {2,10} {3,11} {4,11} {5,12} {6,12}" -f "painter", "locks/s", "lock ms/s", "unlock ms/s", "create ms/s", "no_front_buf", "destroy ms/s")
+    $totalCreate = 0.0; $totalNofb = 0.0; $totalLock = 0.0; $totalUnlock = 0.0
+    foreach ($id in ($extRows.Keys | Sort-Object)) {
+        $r = $extRows[$id]
         $secs = [math]::Max($r.w / 1000.0, 0.001)
-        Write-Host ("  {0,-8} {1,8:N1} {2,10:N1} {3,10:N1} {4,10:N1} {5,12:N0} {6,10:N1}" -f $id, ($r.locks/$secs), ($r.lock/$secs), ($r.take/$secs), ($r.create/$secs), $r.nofb, ($r.destroy/$secs))
-        $totalCreate += $r.create; $totalNofb += $r.nofb; $totalLock += $r.lock
+        Write-Host ("  {0,-8} {1,8:N1} {2,10:N1} {3,11:N1} {4,11:N1} {5,12:N0} {6,12:N1}" -f $id, ($r.locks/$secs), ($r.lock/$secs), ($r.unlock/$secs), ($r.create/$secs), $r.nofb, ($r.destroy/$secs))
+        $totalCreate += $r.create; $totalNofb += $r.nofb; $totalLock += $r.lock; $totalUnlock += $r.unlock
     }
-    if ($totalLock -gt 0) {
-        $share = 100.0 * $totalCreate / $totalLock
-        Write-Host ("  create_texture is {0:N1}% of the lock cost" -f $share)
-        if ($share -gt 60 -and $totalCreate -gt 100) {
-            Write-Warning "The painter is WAITING for the WebGL surface (create_texture dominates). Producer and consumer are handing one surface back and forth; that coupling is the thing to break, not the serial tile loop."
-        } elseif ($totalNofb -gt 0) {
-            Write-Host "  no_front_buffer is non-zero -- some locks found nothing to take, so look at the producer side."
+    # The callback's whole cost, against the per-tile render it sits inside. Reporting only
+    # the create/lock ratio hid this: create really is ~99% OF THE LOCK, but the lock is a
+    # couple of ms a second, so the ratio was true and useless.
+    $perTileMsPerSec = ($totalLock + $totalUnlock) / [math]::Max($extRows.Count, 1) /
+        [math]::Max((($extRows.Values | ForEach-Object { $_.w } | Measure-Object -Sum).Sum / $extRows.Count / 1000.0), 0.001)
+    Write-Host ("  callback total per tile: {0:N1} ms/s" -f $perTileMsPerSec)
+    # Judge on the ABSOLUTE cost, not on internal ratios. A tile render costs ~15ms once a
+    # canvas is on the page; if this callback is a few ms a second it cannot be that 15ms no
+    # matter how the time splits inside it.
+    if ($perTileMsPerSec -gt 100) {
+        if ($totalLock -gt 0 -and (100.0 * $totalCreate / $totalLock) -gt 60) {
+            Write-Warning "The painter is WAITING for the WebGL surface (create_texture dominates a callback that is itself expensive). Producer and consumer are handing one surface back and forth; break that coupling."
         } else {
-            Write-Host "  Neither waiting nor starved -- the 15ms is somewhere else in render()."
+            Write-Warning "The external-image callback is expensive, but not in create_texture. Split it further before concluding anything."
         }
+    } elseif ($totalNofb -gt 0) {
+        Write-Host "  no_front_buffer is non-zero -- some locks found nothing to take, so look at the producer side."
+    } else {
+        Write-Host "  This callback is NOT the tile cost: a few ms a second against a ~15ms tile render."
+        Write-Host "  Not upload (upload_mb=0), not the ANGLE lock (angle_lock_ms~0), not WebRender update"
+        Write-Host "  (wr_update_ms~0). What is left is inside the draw submission itself, and it does not"
+        Write-Host "  scale with canvas pixels (?scale=0.5 changed nothing), so it reads as a fixed per-render"
+        Write-Host "  stall. It is per tile and per GPU, so parallelising the tile loop should overlap it --"
+        Write-Host "  see parallel_ceiling in the WALLPASS lines."
     }
 } elseif ($FanoutProf) {
     Write-Warning "-FanoutProf was set but no WEBGLEXTIMG line was logged. It only emits from the external-image unlock callback, so a run whose page never shows a WebGL canvas produces nothing."
