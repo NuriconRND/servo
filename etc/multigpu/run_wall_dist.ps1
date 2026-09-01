@@ -63,8 +63,22 @@ param(
     [int]    $DecoderThreads = 1,
     [string] $TileSize = "display",      # gfx_wr_picture_tile_size
     [int]    $RefreshHz = 60,
+    # gfx_dcomp_mode. ***Defaults to off, which is also the engine's own default*** -- the
+    # launcher used to default to "surface" and that disagreement was never revisited after
+    # the DComp investigation that introduced it.
+    #
+    # On the standard set (escape=off) the native compositor costs 2.5x: a paired A/B on the
+    # test machine, same page back to back, measured 61.9fps off against 24.9fps on, a pass
+    # at 16.14ms against 42-56ms, and a mean painter render of 0.83ms against 7.75ms with
+    # slow frames dropping from 1471 to 53. The cost is IDCompositionSurface::BeginDraw and
+    # EndDraw, which the WR compositor calls from bind()/unbind() for every invalidated
+    # picture-cache tile -- which is also why a page with no WebGL canvas was fast: with the
+    # cache fully valid, bind() is never called.
+    #
+    # It is still worth turning on for the video escape path, where it cut draw calls from
+    # ten to one -- and that path REQUIRES it (see the check below).
     [ValidateSet("off", "on", "surface")]
-    [string] $DComp = "surface",
+    [string] $DComp = "off",
     [switch] $Vsync,                     # gfx_vsync_enabled (default off; see note below)
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
@@ -325,6 +339,21 @@ $layout = Join-Path $here "config\$Layout"
 
 if (!(Test-Path $exe))    { throw "winit_wall.exe not found: $exe" }
 if (!(Test-Path $layout)) { throw "layout not found: $layout" }
+# The escaped-video fast path is a method on the DirectComposition compositor, reached through
+# the painter's dcomp_shared handle -- which is None whenever the native compositor is not
+# engaged. So -VideoEscape with -DComp off does not fall back to anything, it simply never
+# runs, and the run looks like a valid escape measurement while measuring nothing. Refuse it
+# rather than enabling DComp behind the caller's back: which of the two they meant is their
+# call, and this pairing has already cost time once.
+if ($VideoEscape -ne "" -and $DComp -eq "off") {
+    throw "-VideoEscape $VideoEscape needs the DirectComposition compositor, but -DComp is off. The escape fast-path lives on that compositor, so it would silently do nothing. Pass -DComp surface to measure the escape path, or drop -VideoEscape to measure the standard set."
+}
+# Not fatal, unlike the escape pairing: -DcompDebug is a diagnostic and asking for it with the
+# compositor off is a wasted run rather than a wrong measurement. It already has one way to
+# produce nothing (it needs paint=info in RUST_LOG); this is the second, and now the default.
+if ($DcompDebug -and $DComp -eq "off") {
+    Write-Warning "-DcompDebug with -DComp off will print nothing: there is no native compositor to trace. Add -DComp surface."
+}
 
 $serveRoot = Join-Path $here "pages\html"
 $httpServer = $null
