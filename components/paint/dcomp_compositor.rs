@@ -1369,6 +1369,20 @@ pub fn enabled() -> bool {
 
 /// 컴포지터를 생성한다. 실패(HWND/디바이스 없음, HRESULT 실패)면 warn 후 None을 돌려
 /// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
+/// 인계받은 디바이스 포인터로 `Commit()` 만 부른다. 워커 스레드에서 불린다.
+///
+/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
+/// 만지는 다른 스레드가 없어야 한다(호출자가 join 으로 보장). 디바이스마다 서로 다르다.
+pub fn commit_device_ptr(device: usize) -> bool {
+    let device = device as *mut IDCompositionDevice;
+    let hr = unsafe { (*device).Commit() };
+    if hr < 0 {
+        warn!("[dcomp-native] parallel Commit failed (hr=0x{:08x})", hr as u32);
+        return false;
+    }
+    true
+}
+
 pub fn maybe_create(
     rendering_context: &Rc<dyn RenderingContext>,
 ) -> Option<Rc<RefCell<DCompNativeCompositor>>> {
@@ -2004,6 +2018,17 @@ impl DCompNativeCompositor {
     ///
     /// `warn!` 인 것은 의도적이다 — 이 모듈의 `[dcomp-dbg]` 는 `info!` 라 런처 RUST_LOG 의
     /// `paint=info` 에 의존하는데, 그 의존이 이미 한 번 무출력으로 시간을 먹였다.
+    /// 미뤄 둔 Commit 의 디바이스를 **인계**한다(호출자가 다른 스레드에서 부를 수 있게).
+    /// 밀린 게 없으면 `None`. 인계 후에는 이 컴포지터가 그 프레임의 Commit 을 책임지지
+    /// 않으므로, 호출자가 반드시 불러야 한다.
+    pub(crate) fn take_pending_commit(&mut self) -> Option<usize> {
+        if !self.commit_pending {
+            return None;
+        }
+        self.commit_pending = false;
+        self.dcomp_device_ptr().map(|device| device as usize)
+    }
+
     /// 미뤄 둔 Commit 을 지금 흘린다. 밀린 게 없으면 아무 일도 하지 않는다.
     ///
     /// 셸이 타일 루프를 마친 뒤 부른다. WR `render()` 밖이라 `dcomp_shared` 이중 대여

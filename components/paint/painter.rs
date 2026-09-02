@@ -2392,6 +2392,20 @@ impl Painter {
         }
     }
 
+    /// 미뤄 둔 DComp Commit 의 디바이스를 인계한다(병렬 Commit 용). 인계했으면 이 painter 는
+    /// 그 프레임의 Commit 을 더 이상 책임지지 않는다.
+    pub(crate) fn take_pending_dcomp_commit(&self) -> Option<usize> {
+        #[cfg(windows)]
+        {
+            return self
+                .dcomp_shared
+                .as_ref()
+                .and_then(|shared| shared.borrow_mut().take_pending_commit());
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
     /// 미뤄 둔 DComp Commit 을 흘린다(`gfx_dcomp_defer_commit`). WR `render()` 밖에서만
     /// 불러야 한다 — 안에서 부르면 `dcomp_shared` 이중 대여로 패닉한다(위 fast-path 주석).
     pub(crate) fn flush_deferred_dcomp_commit(&self) {

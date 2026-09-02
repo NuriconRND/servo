@@ -286,6 +286,25 @@ param(
     #
     # Cost shows as stage_ms in WEBGLEXTIMG, so pair with -FanoutProf.
     [switch] $WebglStageCopy,
+    # gfx_dcomp_parallel_commit: issue the four deferred DComp Commits on threads instead of
+    # one after another.
+    #
+    # This is the on/off gap. At steady state with a small canvas a pass is 15.4ms -- 5.6 of
+    # render and 9.8 of four serial Commits -- against a 16.67ms budget, so 1.3ms of margin.
+    # Lose it once and Commit waits for the next vsync, the pass grows, and the wall settles
+    # at 42fps; one run sat there for fifty seconds before climbing to 60. With DComp off the
+    # pass is 13.8ms, 2.9ms of margin, and it locks to 60 by the sixth second and stays.
+    #
+    # Commit is a wait and those waits overlap -- batching them already took one from 24.90ms
+    # to 9.83. Four at once should turn 9.8 into about 2.4, which buys 8ms of margin instead
+    # of 1.3.
+    #
+    # ***The thread contract is not confirmed.*** We call the vtable directly so COM
+    # marshalling never enters, the devices are per painter, and the scope joins before this
+    # returns, so nothing touches one device from two threads at once. But creation happens on
+    # the main thread and the Commit would not, and DirectComposition may not like that.
+    # A violation can be silent, so check the wall by eye, not only the numbers.
+    [switch] $DcompParallelCommit,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -415,6 +434,12 @@ if ($VideoEscape -ne "" -and $DComp -eq "off") {
 if ($DcompDebug -and $DComp -eq "off") {
     Write-Warning "-DcompDebug with -DComp off will print nothing: there is no native compositor to trace. Add -DComp surface."
 }
+if ($DcompParallelCommit -and $DcompCommitInFrame) {
+    throw "-DcompParallelCommit needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to run in parallel."
+}
+if ($DcompParallelCommit -and $DComp -eq "off") {
+    throw "-DcompParallelCommit has no Commit to parallelise with -DComp off. Pass -DComp surface."
+}
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
 }
@@ -536,6 +561,7 @@ if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }
+if ($DcompParallelCommit) { $argList += @("--pref", "gfx_dcomp_parallel_commit=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
@@ -553,7 +579,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -1028,6 +1054,9 @@ if ($dbp) {
     Write-Host ("DCOMPBIND -- DComp per painter ({0:N1} frames/s, {1:N1} binds/s):" -f ($ef/$secs), ($binds/$secs))
     Write-Host ("  end_frame     {0,9:N1} ms/s   {1,8:N3} ms per frame" -f ($endf/$secs), $(if ($ef -gt 0) { $endf/$ef } else { 0 }))
     Write-Host ("    gl flush    {0,9:N1} ms/s   (ran on {1:N0} frames, skipped on {2:N0})" -f ($flush/$secs), $flushed, $skipped)
+    if ($DcompParallelCommit -and $commit -eq 0) {
+        Write-Host "    Commit           (issued on worker threads -- not attributed per painter; read pass_ms in WALLPASS)"
+    }
     Write-Host ("    Commit      {0,9:N1} ms/s   ({1})" -f ($commit/$secs), $(if ($defer -gt 0) { "deferred to end of pass on {0:N0} frames (default)" -f $defer } else { "issued in end_frame -- old behaviour" }))
     Write-Host ("    Present     {0,9:N1} ms/s   ({1:N0} swap-chain presents)" -f ($pres/$secs), $presN)
     Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, promote/demote)" -f (($endf-$flush-$commitInFrame-$pres)/$secs))

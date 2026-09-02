@@ -381,6 +381,23 @@ pub struct Preferences {
     /// 복사는 WR `render()` 안에서 일어나므로 FBO 바인딩을 저장·복원한다. 비용은
     /// `SERVO_WEBGL_FANOUT_PROF` 의 `stage_ms` 로 보인다.
     pub gfx_webgl_stage_to_painter_device: bool,
+    /// 미뤄 둔 DComp `Commit()` 넷을 **스레드로 동시에** 부른다. 기본 `false`.
+    ///
+    /// ★근거★: 작은 캔버스 정상상태에서 패스 15.4ms = 렌더 5.6ms + Commit 4×2.44ms 다.
+    /// 60Hz 예산 16.67ms 에 여유가 **1.3ms 뿐**이고, 한 번 넘기면 Commit 이 다음 vsync 를
+    /// 기다려 패스가 더 길어지는 되먹임에 걸려 42fps 에 눌러앉는다(실측: 50 초를 그렇게
+    /// 보낸 뒤에야 60 으로 올라왔다). DComp off 는 13.8ms 로 2.9ms 여유가 있어 그 함정에
+    /// 안 빠진다 — 이것이 on/off 차이의 실체다.
+    ///
+    /// Commit 은 대기이고 그 대기는 겹친다(배치 실험에서 24.90→9.83ms). 넷을 동시에 걸면
+    /// 9.8→~2.4ms 라 여유가 1.3→8ms 가 되어 애초에 느린 모드에 빠지지 않는다.
+    ///
+    /// ★스레드 계약이 정적으로 확인되지 않았다★ — 우리는 winapi 로 vtable 을 직접 부르므로
+    /// COM 마샬링은 개입하지 않고, Gecko 도 DComp 를 렌더러 스레드에서 쓴다(디바이스마다
+    /// 다른 스레드). 다만 생성은 메인, Commit 은 워커라 정확히 같지는 않다. 디바이스는
+    /// 서로 다르고 메인은 join 으로 대기하므로 동시 접근은 없다. 실패하면 `Commit failed`
+    /// HRESULT 나 **화면 깨짐**으로 나타나므로 육안 확인이 필수다.
+    pub gfx_dcomp_parallel_commit: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -890,6 +907,7 @@ impl Preferences {
             gfx_dcomp_commit_in_end_frame: false,
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_webgl_stage_to_painter_device: false,
+            gfx_dcomp_parallel_commit: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

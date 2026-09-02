@@ -2329,6 +2329,36 @@ impl Paint {
     /// 대신 렌더 넷을 먼저 몰고 Commit 넷을 몰아, Commit 의 대기가 서로 겹칠 수 있는지를
     /// 스레드 없이 확인하는 것이다.
     pub fn flush_deferred_dcomp_commits(&self) {
+        // `gfx_dcomp_parallel_commit`: 넷을 동시에 건다.
+        //
+        // 왜: 정상상태 패스 15.4ms 중 Commit 이 4×2.44 = 9.8ms 이고, 60Hz 예산 16.67ms 에
+        // 여유가 1.3ms 뿐이라 한 번 넘기면 되먹임으로 42fps 에 눌러앉는다. Commit 은 대기이고
+        // 그 대기는 겹치므로(배치 실험 24.90→9.83ms) 동시에 걸면 9.8→~2.4ms 가 되어 여유가
+        // 8ms 로 벌어진다. DComp off 가 13.8ms 로 안 빠지는 그 함정을 같은 방식으로 피한다.
+        //
+        // 디바이스는 painter 마다 다르고, `scope` 가 join 을 보장하므로 이 호출이 돌아올 때
+        // 어떤 워커도 남아 있지 않다 — 즉 한 디바이스를 두 스레드가 동시에 만지는 일은 없다.
+        #[cfg(windows)]
+        if servo_config::pref!(gfx_dcomp_parallel_commit) {
+            let pending: Vec<usize> = self
+                .painters
+                .iter()
+                .filter_map(|painter| painter.borrow().take_pending_dcomp_commit())
+                .collect();
+            if pending.len() > 1 {
+                std::thread::scope(|scope| {
+                    for device in pending {
+                        scope.spawn(move || crate::dcomp_compositor::commit_device_ptr(device));
+                    }
+                });
+                return;
+            }
+            // 하나 이하면 스레드를 띄울 값어치가 없다 — 인계받은 것을 여기서 부른다.
+            for device in pending {
+                crate::dcomp_compositor::commit_device_ptr(device);
+            }
+            return;
+        }
         for painter in &self.painters {
             painter.borrow().flush_deferred_dcomp_commit();
         }
