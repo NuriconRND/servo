@@ -365,6 +365,22 @@ pub struct Preferences {
     /// `finish` 여야 하면 "완료를 기다려야 한다" 이며, 둘 다 소용없으면 가설이 틀린 것이다.
     /// 비용은 `SERVO_WEBGL_FANOUT_PROF` 의 `swap_sync_ms` 로 보인다.
     pub gfx_webgl_swap_sync: String,
+    /// WebGL 캔버스 텍스처를 WR 에 넘기기 전에 **painter 디바이스의 텍스처로 한 번 복사**한다.
+    /// 기본 `false`. 진단용이다.
+    ///
+    /// ★배제된 것부터★: `Commit` 이 캔버스가 있을 때만 비싼데(비주얼당 9.86ms 대 비디오
+    /// 0.30ms), 캔버스의 GPU 작업을 미리 끝내는 것은 **효과가 없었다**(2026-09-02,
+    /// `gfx_webgl_swap_sync=finish` 가 WebGL 스레드에서 17 초를 기다렸는데 Commit 은
+    /// 9.87→9.86ms). 그러니 "소스가 준비 안 됨" 은 아니다.
+    ///
+    /// 남은 후보는 **크로스-디바이스 텍스처를 DComp 서피스로 읽어 들이는 비용 자체**다.
+    /// 비디오는 painter 와 같은 ANGLE 디바이스에 살고(로그에서 포인터가 일치) 싸다. WebGL 은
+    /// `create_isolated_device` 때문에 다른 디바이스이고(6 월 AV 수정), 비싸다. 이 복사가 그
+    /// 건너기를 타일 드로우 밖으로 뺀다 — 떨어지면 원인 확정, 그대로면 크로스-디바이스도 아니다.
+    ///
+    /// 복사는 WR `render()` 안에서 일어나므로 FBO 바인딩을 저장·복원한다. 비용은
+    /// `SERVO_WEBGL_FANOUT_PROF` 의 `stage_ms` 로 보인다.
+    pub gfx_webgl_stage_to_painter_device: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -873,6 +889,7 @@ impl Preferences {
             gfx_dcomp_always_flush_end_frame: false,
             gfx_dcomp_commit_in_end_frame: false,
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
+            gfx_webgl_stage_to_painter_device: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

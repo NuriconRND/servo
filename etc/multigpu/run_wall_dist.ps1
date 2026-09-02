@@ -273,6 +273,19 @@ param(
     # this with -FanoutProf.
     [ValidateSet("off", "flush", "finish")]
     [string] $WebglSwapSync = "off",
+    # gfx_webgl_stage_to_painter_device: copy the canvas texture onto the painter's own
+    # device before handing it to WebRender, so the tile draw never samples across devices.
+    #
+    # What is left after the eliminations. Commit is expensive only with an animating canvas
+    # -- 9.86ms a visual against 0.30 for video -- and finishing the canvas GPU work first
+    # changed nothing, so the source being unready is not it. Video lives on the painter own
+    # ANGLE device and is cheap; the canvas is on an isolated one, because sharing was what
+    # produced the access violations, and it is expensive. This moves that crossing out of
+    # the tile draw. If Commit falls, the crossing is the cause and this is also a usable
+    # fix; if it does not, cross-device is not the cause either.
+    #
+    # Cost shows as stage_ms in WEBGLEXTIMG, so pair with -FanoutProf.
+    [switch] $WebglStageCopy,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -522,6 +535,7 @@ if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$Vide
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
+if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
@@ -539,7 +553,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -918,7 +932,7 @@ if ($wgf) {
 # nothing to take? A tile render costs 0.23ms with no WebGL canvas and 15ms with one, and all
 # of that lands inside renderer.render() with draw_calls=2 and upload_mb=0.0. Neither drawing
 # nor uploading leaves waiting, and this callback is the only place a tile can wait.
-$wex = Select-String -Path $LogPath -Pattern "WEBGLEXTIMG painter=PainterId\((\d+)\) window_ms=([\d.]+) locks=(\d+) lock_ms=([\d.]+) take_ms=([\d.]+) create_ms=([\d.]+) no_front_buffer=(\d+) unlocks=(\d+) unlock_ms=([\d.]+) destroy_ms=([\d.]+)" -EA SilentlyContinue
+$wex = Select-String -Path $LogPath -Pattern "WEBGLEXTIMG painter=PainterId\((\d+)\) window_ms=([\d.]+) locks=(\d+) lock_ms=([\d.]+) take_ms=([\d.]+) create_ms=([\d.]+) no_front_buffer=(\d+) unlocks=(\d+) unlock_ms=([\d.]+) destroy_ms=([\d.]+) stage_ms=([\d.]+) stages=(\d+)" -EA SilentlyContinue
 if ($wex) {
     $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     # NOT $rows -- see the VIDEORATE block above. PowerShell variable names are
@@ -928,22 +942,22 @@ if ($wex) {
     $extRows = @{}
     foreach ($m in $wex) {
         $id = [int](& $g $m 1)
-        if (-not $extRows.ContainsKey($id)) { $extRows[$id] = @{ w=0.0; n=0; locks=0.0; lock=0.0; take=0.0; create=0.0; nofb=0.0; unlock=0.0; destroy=0.0 } }
+        if (-not $extRows.ContainsKey($id)) { $extRows[$id] = @{ w=0.0; n=0; locks=0.0; lock=0.0; take=0.0; create=0.0; nofb=0.0; unlock=0.0; destroy=0.0; stage=0.0 } }
         $r = $extRows[$id]
         $r.w += (& $g $m 2); $r.n++
         $r.locks += (& $g $m 3); $r.lock += (& $g $m 4); $r.take += (& $g $m 5)
         $r.create += (& $g $m 6); $r.nofb += (& $g $m 7)
-        $r.unlock += (& $g $m 9); $r.destroy += (& $g $m 10)
+        $r.unlock += (& $g $m 9); $r.destroy += (& $g $m 10); $r.stage += (& $g $m 11)
     }
     Write-Host ""
     Write-Host "WEBGLEXTIMG -- what a tile pays to consume the WebGL canvas:"
     Write-Host ("  {0,-8} {1,8} {2,10} {3,11} {4,11} {5,12} {6,12}" -f "painter", "locks/s", "lock ms/s", "unlock ms/s", "create ms/s", "no_front_buf", "destroy ms/s")
-    $totalCreate = 0.0; $totalNofb = 0.0; $totalLock = 0.0; $totalUnlock = 0.0
+    $totalCreate = 0.0; $totalNofb = 0.0; $totalLock = 0.0; $totalUnlock = 0.0; $totalStage = 0.0
     foreach ($id in ($extRows.Keys | Sort-Object)) {
         $r = $extRows[$id]
         $secs = [math]::Max($r.w / 1000.0, 0.001)
         Write-Host ("  {0,-8} {1,8:N1} {2,10:N1} {3,11:N1} {4,11:N1} {5,12:N0} {6,12:N1}" -f $id, ($r.locks/$secs), ($r.lock/$secs), ($r.unlock/$secs), ($r.create/$secs), $r.nofb, ($r.destroy/$secs))
-        $totalCreate += $r.create; $totalNofb += $r.nofb; $totalLock += $r.lock; $totalUnlock += $r.unlock
+        $totalCreate += $r.create; $totalNofb += $r.nofb; $totalLock += $r.lock; $totalUnlock += $r.unlock; $totalStage += $r.stage
     }
     # The callback's whole cost, against the per-tile render it sits inside. Reporting only
     # the create/lock ratio hid this: create really is ~99% OF THE LOCK, but the lock is a
@@ -951,6 +965,11 @@ if ($wex) {
     $perTileMsPerSec = ($totalLock + $totalUnlock) / [math]::Max($extRows.Count, 1) /
         [math]::Max((($extRows.Values | ForEach-Object { $_.w } | Measure-Object -Sum).Sum / $extRows.Count / 1000.0), 0.001)
     Write-Host ("  callback total per tile: {0:N1} ms/s" -f $perTileMsPerSec)
+    if ($totalStage -gt 0) {
+        $stagePerTile = $totalStage / [math]::Max($extRows.Count, 1) /
+            [math]::Max((($extRows.Values | ForEach-Object { $_.w } | Measure-Object -Sum).Sum / $extRows.Count / 1000.0), 0.001)
+        Write-Host ("  staging copy per tile:  {0:N1} ms/s  (canvas copied onto the painter device)" -f $stagePerTile)
+    }
     # Judge on the ABSOLUTE cost, not on internal ratios. A tile render costs ~15ms once a
     # canvas is on the page; if this callback is a few ms a second it cannot be that 15ms no
     # matter how the time splits inside it.

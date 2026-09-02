@@ -18,6 +18,20 @@ use surfman::chains::{SwapChainAPI, SwapChains, SwapChainsAPI};
 use surfman::{Device, SurfaceTexture};
 use webgl::webgl_thread::WebGLContextBusyMap;
 
+/// `gfx_webgl_stage_to_painter_device` 게이트. 프레임마다 물어보는 자리라 pref 읽기를 캐시한다.
+static STAGE_TO_PAINTER_DEVICE: LazyLock<bool> =
+    LazyLock::new(|| servo_config::pref!(gfx_webgl_stage_to_painter_device));
+
+/// 스테이징 복사용으로 painter 디바이스에 사는 텍스처와 blit 용 FBO 둘.
+///
+/// 크기가 바뀌면 통째로 다시 만든다. 서피스당 하나다.
+struct StagingTarget {
+    texture: gleam::gl::GLuint,
+    read_fbo: gleam::gl::GLuint,
+    draw_fbo: gleam::gl::GLuint,
+    size: Size2D<i32>,
+}
+
 /// `SERVO_WEBGL_FANOUT_PROF` 게이트. 프레임마다 물어보는 자리라 env 읽기를 캐시한다.
 static WEBGL_FANOUT_PROF: LazyLock<bool> = LazyLock::new(|| {
     debug_env::string(&debug_env::WEBGL_FANOUT_PROF)
@@ -52,6 +66,9 @@ struct ExternalImageProfile {
     unlock_ns: u64,
     /// `destroy_texture()` — keyed mutex 해제와 서피스 반납.
     destroy_ns: u64,
+    /// 스테이징 복사(`gfx_webgl_stage_to_painter_device`)에 쓴 시간과 횟수.
+    stage_ns: u64,
+    stages: u64,
 }
 
 /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
@@ -65,6 +82,8 @@ pub struct WebGLExternalImages {
     logged_locked_surfaces: FxHashSet<WebGLSurfaceId>,
     /// 소비자 측 비용 누적기. 꺼져 있으면 갱신되지 않는다.
     profile: ExternalImageProfile,
+    /// 서피스별 스테이징 대상(`gfx_webgl_stage_to_painter_device`).
+    staging: FxHashMap<WebGLSurfaceId, StagingTarget>,
 }
 
 impl WebGLExternalImages {
@@ -84,6 +103,7 @@ impl WebGLExternalImages {
             locked_front_buffers: FxHashMap::default(),
             logged_locked_surfaces: FxHashSet::default(),
             profile: ExternalImageProfile::default(),
+            staging: FxHashMap::default(),
         }
     }
 
@@ -141,6 +161,18 @@ impl WebGLExternalImages {
             );
         }
         locked_buffers.push(surface_texture);
+        // 크로스-디바이스 텍스처 대신 painter 디바이스 사본을 넘긴다(진단용, 기본 off).
+        let gl_texture = if *STAGE_TO_PAINTER_DEVICE {
+            let start = WEBGL_FANOUT_PROF.then(Instant::now);
+            let staged = self.stage_to_painter_device(surface_id, gl_texture, size);
+            if let Some(start) = start {
+                self.profile.stage_ns += start.elapsed().as_nanos() as u64;
+                self.profile.stages += 1;
+            }
+            staged.unwrap_or(gl_texture)
+        } else {
+            gl_texture
+        };
         if self.logged_locked_surfaces.insert(surface_id) {
             info!(
                 "WebGL external image lock routed: surface={surface_id:?} painter={:?} texture={gl_texture} size={size:?}",
@@ -149,6 +181,92 @@ impl WebGLExternalImages {
         }
 
         Some((gl_texture, size))
+    }
+
+    /// 크로스-디바이스 텍스처를 painter 디바이스의 텍스처로 한 번 복사해서 그것을 WR 에게
+    /// 넘긴다(`gfx_webgl_stage_to_painter_device`).
+    ///
+    /// ★무엇을 가르려는 것인가★: `Commit` 이 캔버스가 있을 때만 비싸다. 캔버스의 GPU 작업을
+    /// 미리 끝내는 것(`gfx_webgl_swap_sync=finish`)은 **효과가 없었다** — WebGL 스레드가
+    /// 17 초를 기다렸는데 Commit 은 9.87→9.86ms 로 요지부동이었다. 그러니 "소스가 준비 안 됨"
+    /// 은 아니다. 남은 후보가 **크로스-디바이스 텍스처를 DComp 서피스로 읽어 들이는 비용
+    /// 자체**이고, 이 복사가 그것을 타일 드로우 밖으로 빼낸다. 떨어지면 원인 확정이고,
+    /// 그대로면 크로스-디바이스도 아니다.
+    ///
+    /// ★WR `render()` 안에서 도는 코드다★ — FBO 바인딩을 반드시 저장·복원한다. 안 그러면
+    /// WR 이 그리던 대상이 바뀌어 화면이 깨진다.
+    // `gleam` 의 `get_integer_v` 가 unsafe 다. WR 이 걸어 둔 FBO 바인딩을 되돌리려면 그것을
+    // 읽어야 하고, 읽지 않고 0 으로 되돌리면 WR 이 그리던 대상이 바뀐다.
+    #[expect(unsafe_code)]
+    fn stage_to_painter_device(
+        &mut self,
+        surface_id: WebGLSurfaceId,
+        source: gleam::gl::GLuint,
+        size: Size2D<i32>,
+    ) -> Option<gleam::gl::GLuint> {
+        use gleam::gl;
+
+        if size.width <= 0 || size.height <= 0 {
+            return None;
+        }
+        let api = self.rendering_context.gleam_gl_api();
+
+        let needs_new = self
+            .staging
+            .get(&surface_id)
+            .is_none_or(|target| target.size != size);
+        if needs_new {
+            if let Some(old) = self.staging.remove(&surface_id) {
+                api.delete_framebuffers(&[old.read_fbo, old.draw_fbo]);
+                api.delete_textures(&[old.texture]);
+            }
+            let texture = api.gen_textures(1)[0];
+            api.bind_texture(gl::TEXTURE_2D, texture);
+            api.tex_image_2d(
+                gl::TEXTURE_2D, 0, gl::RGBA8 as gl::GLint, size.width, size.height, 0,
+                gl::RGBA, gl::UNSIGNED_BYTE, None,
+            );
+            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as gl::GLint);
+            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as gl::GLint);
+            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as gl::GLint);
+            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as gl::GLint);
+            api.bind_texture(gl::TEXTURE_2D, 0);
+            let fbos = api.gen_framebuffers(2);
+            self.staging.insert(surface_id, StagingTarget {
+                texture,
+                read_fbo: fbos[0],
+                draw_fbo: fbos[1],
+                size,
+            });
+        }
+        let target = self.staging.get(&surface_id)?;
+
+        // WR 의 현재 바인딩을 기억해 두고 끝나면 되돌린다.
+        let mut prev_read = [0 as gl::GLint];
+        let mut prev_draw = [0 as gl::GLint];
+        unsafe {
+            api.get_integer_v(gl::READ_FRAMEBUFFER_BINDING, &mut prev_read);
+            api.get_integer_v(gl::DRAW_FRAMEBUFFER_BINDING, &mut prev_draw);
+        }
+
+        api.bind_framebuffer(gl::READ_FRAMEBUFFER, target.read_fbo);
+        api.framebuffer_texture_2d(
+            gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, source, 0,
+        );
+        api.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.draw_fbo);
+        api.framebuffer_texture_2d(
+            gl::DRAW_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, target.texture, 0,
+        );
+        api.blit_framebuffer(
+            0, 0, size.width, size.height,
+            0, 0, size.width, size.height,
+            gl::COLOR_BUFFER_BIT, gl::NEAREST,
+        );
+
+        api.bind_framebuffer(gl::READ_FRAMEBUFFER, prev_read[0] as gl::GLuint);
+        api.bind_framebuffer(gl::DRAW_FRAMEBUFFER, prev_draw[0] as gl::GLuint);
+
+        Some(target.texture)
     }
 
     /// 계측 창(1 초)을 닫고 한 줄 찍는다(`SERVO_WEBGL_FANOUT_PROF`).
@@ -166,7 +284,7 @@ impl WebGLExternalImages {
         warn!(
             "WEBGLEXTIMG painter={:?} window_ms={:.0} locks={} lock_ms={:.1} \
              take_ms={:.1} create_ms={:.1} no_front_buffer={} unlocks={} \
-             unlock_ms={:.1} destroy_ms={:.1}",
+             unlock_ms={:.1} destroy_ms={:.1} stage_ms={:.1} stages={}",
             self.painter_id,
             window.as_secs_f64() * 1000.0,
             profile.locks,
@@ -177,6 +295,8 @@ impl WebGLExternalImages {
             profile.unlocks,
             ms(profile.unlock_ns),
             ms(profile.destroy_ns),
+            ms(profile.stage_ns),
+            profile.stages,
         );
         self.profile = ExternalImageProfile {
             window_start: Some(now),
