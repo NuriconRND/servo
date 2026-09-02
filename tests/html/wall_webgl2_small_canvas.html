@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>wall webgl2 — small fixed canvas</title>
+<!--
+  `wall_webgl2_min_triangle.html` 과 그리는 내용이 같고 ★캔버스 크기만 다르다★.
+
+  그쪽은 `cv.width = innerWidth` 라 월에서 캔버스가 가상 뷰포트 전체가 된다 —
+  11520x4320 = 49.8 Mpx, RGBA8 로 199MB 다. 그걸 매 프레임 스왑한다.
+  `gfx_webgl_swap_sync=finish` 가 스왑당 3.7ms 를 기다린 것이 그 값이다.
+
+  이 페이지는 캔버스를 640x360(0.23 Mpx, 216 배 작다)으로 고정한다. CSS 로만 늘려
+  화면을 채우므로 보이는 크기는 비슷하되 백버퍼는 작다. 두 페이지의 DComp `Commit`
+  비용을 비교하면 **캔버스 픽셀 수가 원인인지**가 갈린다.
+
+  다섯 가설이 반증된 뒤 남은 후보다 — 그리는 양·트리 크기·페이지 복잡도·lock 빈도·
+  캔버스 GPU 완료·크로스-디바이스가 모두 배제됐다.
+-->
+<style>
+  html,body{margin:0;height:100%;background:#222;overflow:hidden}
+  /* 백버퍼는 640x360 인 채로 CSS 가 화면을 채운다 — 보이는 크기와 픽셀 수를 분리한다. */
+  canvas{width:100%;height:100%;display:block;image-rendering:pixelated}
+  #log{position:fixed;left:8px;top:8px;color:#7f7;font:14px monospace;white-space:pre}
+</style></head>
+<body><canvas id="c" width="640" height="360"></canvas><div id="log"></div>
+<script>
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2');
+const L = document.getElementById('log');
+function log(m){ L.textContent += m + "\n"; }
+if (!gl) { log('webgl2 NULL'); } else {
+  log('backbuffer ' + cv.width + 'x' + cv.height + '  (css ' + innerWidth + 'x' + innerHeight + ')');
+  const vs = `#version 300 es
+    in vec2 p; uniform float a;
+    void main(){ float s=sin(a), c=cos(a); gl_Position=vec4(mat2(c,-s,s,c)*p,0.0,1.0); }`;
+  const fs = `#version 300 es
+    precision mediump float; out vec4 o;
+    void main(){ o = vec4(0.2, 0.9, 0.4, 1.0); }`;
+  const mk = (t, src) => { const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  const pr = gl.createProgram();
+  gl.attachShader(pr, mk(gl.VERTEX_SHADER, vs));
+  gl.attachShader(pr, mk(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(pr);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0.8, -0.8,-0.6, 0.8,-0.6]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(pr, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const ua = gl.getUniformLocation(pr, 'a');
+  // ★뷰포트는 백버퍼 크기다 — CSS 크기가 아니다.★ 이것을 innerWidth 로 두면 이 페이지의
+  // 존재 이유가 사라진다.
+  gl.viewport(0, 0, cv.width, cv.height);
+  let f = 0;
+  function frame(){
+    f++;
+    gl.clearColor(0.05, 0.05, 0.08, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(pr);
+    gl.bindVertexArray(vao);
+    gl.uniform1f(ua, f * 0.02);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (f === 120) log('survived 120 frames');
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+</script></body></html>

@@ -124,6 +124,10 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_wall_shape_anim_probe.html") (Jo
 # additionally needs `-Serve` (it hangs silently on file://) AND an engine built with the
 # `webgpu` cargo feature -- the pref alone cannot conjure a feature that is not compiled in.
 Copy-Item (Join-Path $repo "tests\html\wall_webgl2_min_triangle.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# 같은 그림, 캔버스만 640x360 고정. min_triangle 은 innerWidth 를 쓰므로 월에서 백버퍼가
+# 11520x4320(199MB)이 된다 — 두 페이지를 나란히 돌려 캔버스 픽셀 수가 DComp Commit 비용을
+# 좌우하는지 가른다.
+Copy-Item (Join-Path $repo "tests\html\wall_webgl2_small_canvas.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\html\multigpu_wall_webgpu_min_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 # These two were only ever hand-copied into a dist, so every repackage silently dropped them.
 Copy-Item (Join-Path $repo "tests\html\webgl2_ctx_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
