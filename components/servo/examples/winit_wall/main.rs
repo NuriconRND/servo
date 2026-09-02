@@ -422,6 +422,14 @@ impl AppState {
             }
             tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
         }
+        // `gfx_dcomp_defer_commit` 이 켜져 있으면 각 타일의 `end_frame` 이 DComp Commit 을
+        // 미뤄 두었다. 여기가 그것을 흘리는 자리다 — 페인트 밖이라 컴포지터 대여와 겹치지
+        // 않는다. pref 가 꺼져 있으면 미뤄 둔 것이 없어 아무 일도 하지 않는다.
+        //
+        // 이 한 줄이 실험의 전부다: 지금까지 render→commit 이 타일마다 번갈아 돌았는데,
+        // 이제 렌더 넷이 먼저 끝나고 Commit 넷이 몰려 나간다. 패스 시간이 줄면 Commit 의
+        // 대기는 겹칠 수 있다는 뜻이고, 그대로면 DWM 이 직렬화한다는 뜻이다.
+        webview.flush_deferred_dcomp_commits();
         self.note_render_pass(
             pass_start.elapsed().as_secs_f64() * 1000.0,
             &tile_ms,

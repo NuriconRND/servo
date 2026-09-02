@@ -730,6 +730,13 @@ impl WebView {
             .render_paint_target(self.id(), target.painter_id);
     }
 
+    /// Flush any DirectComposition commit that `end_frame` deferred
+    /// (`gfx_dcomp_defer_commit`). Call once after painting every tile of a wall pass --
+    /// never from inside a paint, since the compositor is borrowed there.
+    pub fn flush_deferred_dcomp_commits(&self) {
+        self.inner().servo.paint().flush_deferred_dcomp_commits();
+    }
+
     /// Returns the wall logical frame id for which this target should keep its previous frame.
     pub fn paint_target_keep_previous_logical_frame(
         &self,

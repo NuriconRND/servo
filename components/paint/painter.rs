@@ -2392,6 +2392,15 @@ impl Painter {
         }
     }
 
+    /// 미뤄 둔 DComp Commit 을 흘린다(`gfx_dcomp_defer_commit`). WR `render()` 밖에서만
+    /// 불러야 한다 — 안에서 부르면 `dcomp_shared` 이중 대여로 패닉한다(위 fast-path 주석).
+    pub(crate) fn flush_deferred_dcomp_commit(&self) {
+        #[cfg(windows)]
+        if let Some(shared) = self.dcomp_shared.as_ref() {
+            shared.borrow_mut().flush_deferred_commit();
+        }
+    }
+
     pub(crate) fn delay_new_frames_for_canvas(
         &mut self,
         pipeline_id: PipelineId,

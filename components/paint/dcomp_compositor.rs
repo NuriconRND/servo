@@ -1258,6 +1258,8 @@ struct BindProfile {
     /// 그리는 양이 훨씬 많은데 Commit 이 29 배 싸므로, 원인은 그리는 양이 아니다.
     add_surface_all: u64,
     surfaces_live: u64,
+    /// `end_frame` 이 Commit 을 미룬 횟수. pref 가 실제로 먹었는지 로그로 판정하는 값이다.
+    deferred_commits: u64,
     /// `end_frame` 내부 쪼개기 — 각각 성격이 완전히 다르다.
     /// `flush` 는 GL 큐 제출, `present` 는 스왑체인 Present, `commit` 은 DWM 반영 요청.
     flush_ns: u64,
@@ -1315,6 +1317,13 @@ pub struct DCompNativeCompositor {
     warned_regen_fail: bool,
     /// 누적된 프레임 번호 — begin_frame에서 증가. 쿨다운 만료 시점(frame_counter >= promote_blocked_until).
     frame_counter: u64,
+    /// `gfx_dcomp_defer_commit`: `end_frame` 이 Commit 을 미뤄 두었는가.
+    ///
+    /// ★셸이 안 흘려도 안전해야 한다★ — winit_wall 은 타일 루프 뒤에 flush 하지만
+    /// servoshell 은 부르지 않는다. 그쪽에서는 다음 `end_frame` 이 스스로 흘리므로
+    /// 한 프레임 늦을 뿐 화면이 멈추지는 않는다. 이 자기복구가 없으면 pref 하나로
+    /// 다른 셸이 통째로 검은 화면이 된다.
+    commit_pending: bool,
     /// bind/unbind 구간별 비용(`SERVO_DCOMP_BIND_PROF`). 꺼져 있으면 갱신되지 않는다.
     bind_profile: BindProfile,
     /// 비디오 external surface 변환 패스(Task 4). 최초 external present 시 지연 생성 —
@@ -1492,6 +1501,7 @@ pub fn maybe_create(
             warned_promote_fail: false,
             warned_regen_fail: false,
             frame_counter: 0,
+            commit_pending: false,
             bind_profile: BindProfile::default(),
             convert_pass: None,
             convert_pass_init_failed: false,
@@ -1994,6 +2004,34 @@ impl DCompNativeCompositor {
     ///
     /// `warn!` 인 것은 의도적이다 — 이 모듈의 `[dcomp-dbg]` 는 `info!` 라 런처 RUST_LOG 의
     /// `paint=info` 에 의존하는데, 그 의존이 이미 한 번 무출력으로 시간을 먹였다.
+    /// 미뤄 둔 Commit 을 지금 흘린다. 밀린 게 없으면 아무 일도 하지 않는다.
+    ///
+    /// 셸이 타일 루프를 마친 뒤 부른다. WR `render()` 밖이라 `dcomp_shared` 이중 대여
+    /// 위험이 없다(`painter.rs` 의 fast-path 와 같은 근거).
+    pub(crate) fn flush_deferred_commit(&mut self) {
+        if !self.commit_pending {
+            return;
+        }
+        self.commit_pending = false;
+        if let Some(device) = self.dcomp_device_ptr() {
+            self.commit_device(device);
+        }
+    }
+
+    /// DWM 반영을 요청한다. 계측은 미루든 말든 같은 카운터에 쌓이므로, `deferred_commits` 와
+    /// 함께 보면 "미뤘는데도 총 시간이 그대로인지" 가 바로 읽힌다.
+    fn commit_device(&mut self, dcomp_device: *mut IDCompositionDevice) {
+        let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
+        let hr = unsafe { (*dcomp_device).Commit() };
+        if hr < 0 {
+            warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
+        }
+        if let Some(start) = commit_start {
+            self.bind_profile.commit_ns += start.elapsed().as_nanos() as u64;
+        }
+    }
+
     fn maybe_emit_bind_profile(&mut self) {
         let now = std::time::Instant::now();
         let window = now - *self.bind_profile.window_start.get_or_insert(now);
@@ -2007,7 +2045,7 @@ impl DCompNativeCompositor {
             "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
              end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} \
              external_ms={:.1} externals={} present_ms={:.1} presents={} \
-             visuals={} surfaces={} \
+             visuals={} surfaces={} deferred={} \
              begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
@@ -2025,6 +2063,7 @@ impl DCompNativeCompositor {
             profile.presents,
             profile.add_surface_all,
             profile.surfaces_live,
+            profile.deferred_commits,
             ms(profile.begin_ns),
             ms(profile.pbuffer_ns),
             ms(profile.end_ns),
@@ -2722,6 +2761,9 @@ impl Compositor for DCompNativeCompositor {
         // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
         // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
         self.close_external_batch();
+        // 지난 프레임이 미뤄 둔 Commit 이 아직 남아 있으면 여기서 흘린다 — 셸이 flush 를
+        // 부르지 않는 경우(servoshell)에도 화면이 멈추지 않게 하는 자기복구다.
+        self.flush_deferred_commit();
         let Some(root) = self.root_visual_ptr() else {
             return;
         };
@@ -3491,13 +3533,21 @@ impl Compositor for DCompNativeCompositor {
             self.bind_profile.present_ns += present_ns;
             self.bind_profile.presents += presents;
         }
-        let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-        let hr = unsafe { (*dcomp_device).Commit() };
-        if hr < 0 {
-            warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
-        }
-        if let Some(start) = commit_start {
-            self.bind_profile.commit_ns += start.elapsed().as_nanos() as u64;
+        // `gfx_dcomp_defer_commit`: Commit 을 패스 끝으로 미룬다.
+        //
+        // 왜: painter 4 개가 메인 스레드에서 순차 실행이라 지금은
+        // render1→commit1→render2→commit2… 로 돈다. Commit 이 GPU/DWM 을 **기다리는**
+        // 것이라면, 렌더 넷을 먼저 돌리고 Commit 넷을 몰아 치면 painter 1 의 GPU 작업이
+        // 2~4 가 렌더하는 동안 진행되어 첫 Commit 이 즉시 돌아와야 한다. 패스 시간이 줄면
+        // 그 대기는 겹칠 수 있다는 뜻이고, 그대로면 DWM 이 직렬화한다는 뜻이라 타일 병렬화도
+        // 캔버스 승격도 전제가 무너진다 — 스레드를 만들지 않고 그 답을 얻는 것이 목적이다.
+        if servo_config::pref!(gfx_dcomp_defer_commit) {
+            self.commit_pending = true;
+            if *DCOMP_BIND_PROF {
+                self.bind_profile.deferred_commits += 1;
+            }
+        } else {
+            self.commit_device(dcomp_device);
         }
         if let Some(start) = end_frame_start {
             self.bind_profile.end_frames += 1;

@@ -2323,6 +2323,17 @@ impl Paint {
         }
     }
 
+    /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
+    ///
+    /// 셸이 타일 루프를 마친 뒤 한 번 부른다. 목적은 render→commit 을 네 번 번갈아 도는
+    /// 대신 렌더 넷을 먼저 몰고 Commit 넷을 몰아, Commit 의 대기가 서로 겹칠 수 있는지를
+    /// 스레드 없이 확인하는 것이다.
+    pub fn flush_deferred_dcomp_commits(&self) {
+        for painter in &self.painters {
+            painter.borrow().flush_deferred_dcomp_commit();
+        }
+    }
+
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
         &self.paint_receiver

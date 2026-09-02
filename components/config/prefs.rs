@@ -333,6 +333,18 @@ pub struct Preferences {
     /// 검증되지 않으니 육안 확인이 필요하고, 의심스러우면 이 pref 를 `true` 로 두어 즉시 옛
     /// 무조건 flush 로 되돌린다.
     pub gfx_dcomp_always_flush_end_frame: bool,
+    /// DComp `end_frame` 의 `Commit()` 을 그 자리에서 부르지 않고 **패스 끝으로 미룬다**.
+    /// 기본 `false`(그 자리에서 호출 = 기존 동작).
+    ///
+    /// 진단용이다. painter 4 개가 메인 스레드에서 순차라 지금은 render→commit 이 네 번
+    /// 번갈아 도는데, Commit 이 프레임의 거의 전부를 차지한다(WebGL 캔버스 + DComp 에서
+    /// painter 당 12.7~37.4ms, 4 회 합이 월 패스의 ~100%). 렌더 넷을 먼저 돌리고 Commit 을
+    /// 몰아 치면 **그 대기가 겹칠 수 있는지**가 스레드를 만들지 않고 갈린다 — 패스 시간이
+    /// 줄면 겹치는 것이고, 그대로면 DWM 이 직렬화하는 것이라 타일 병렬화도 캔버스 승격도
+    /// 전제가 무너진다.
+    ///
+    /// ★셸이 flush 를 부르지 않아도 안전하다★ — 다음 `end_frame` 이 스스로 흘린다.
+    pub gfx_dcomp_defer_commit: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -839,6 +851,7 @@ impl Preferences {
             // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; 배선은 Task 3 이 완료).
             gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
             gfx_dcomp_always_flush_end_frame: false,
+            gfx_dcomp_defer_commit: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
