@@ -972,6 +972,32 @@ if ($wgf) {
     Write-Warning "-FanoutProf was set but no WEBGLFANOUT line was logged. The counters only emit at a swap boundary, so a run with no WebGL canvas produces nothing."
 }
 
+# --- WEBGLWATCHDOG: the stall. Everything above only reports from the healthy path, so when
+# the four tiles freeze they all just go quiet and that tells us nothing. This one is written
+# by a SEPARATE thread watching the WebGL thread's progress counter, so it still speaks when
+# the WebGL thread cannot. The phase name is the whole answer:
+#   "waiting for a message" -> the WebGL thread is IDLE. Nobody is asking it to draw, so the
+#                              fault is upstream (script or layout), not here.
+#   anything else           -> the WebGL thread is BLOCKED, at the named step.
+$wdog = Select-String -Path $LogPath -Pattern "WEBGLWATCHDOG: no progress for (\d+)s; stuck at \[([^\]]+)\]" -EA SilentlyContinue
+if ($wdog) {
+    Write-Host ""
+    Write-Host "WEBGLWATCHDOG -- the WebGL thread stopped making progress $($wdog.Count) time(s):" -ForegroundColor Yellow
+    foreach ($hit in $wdog) {
+        Write-Host ("  stuck {0,3}s at [{1}]" -f $hit.Matches[0].Groups[1].Value, $hit.Matches[0].Groups[2].Value)
+    }
+    $idleOnly = @($wdog | Where-Object { $_.Matches[0].Groups[2].Value -ne "waiting for a message" }).Count -eq 0
+    if ($idleOnly) {
+        Write-Host "  Every stall was in [waiting for a message]: the WebGL thread was IDLE, not blocked." -ForegroundColor Yellow
+        Write-Host "  => whatever stopped is UPSTREAM of it (script / layout / rAF), so look there, not at GL."
+    } else {
+        Write-Host "  At least one stall was NOT in [waiting for a message]: the WebGL thread itself blocked." -ForegroundColor Red
+        Write-Host "  => the named step is where it hung; that is the thing to fix."
+    }
+} elseif ($FanoutProf) {
+    Write-Host "WEBGLWATCHDOG: no stall (the WebGL thread never went 2s without progress)."
+}
+
 # --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
 # nothing to take? A tile render costs 0.23ms with no WebGL canvas and 15ms with one, and all
 # of that lands inside renderer.render() with draw_calls=2 and upload_mb=0.0. Neither drawing

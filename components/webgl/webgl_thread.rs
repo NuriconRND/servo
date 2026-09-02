@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
@@ -216,6 +217,70 @@ impl Default for GLState {
     }
 }
 
+/// WebGL 스레드의 진행 표시와 현재 단계. ★워치독이 밖에서 본다.★
+///
+/// 왜 밖에서 봐야 하나: 스톨 실행에서 `WEBGLFANOUT` 이 그냥 끊긴다. 그런데 그것은 스왑
+/// 경계에서만 찍히므로 스레드가 **막힌 것**인지 **할 일이 없어 노는 것**인지 구분되지 않는다.
+/// 안에서 찍는 계측은 막히는 순간 같이 멈추므로 그 질문에 답할 수 없다 — 이 조사에서
+/// 네 번째로 같은 함정이었다(2026-09-02, `log_webgpu/48`: refresh driver 는 60 초 내내 틱을
+/// 요청했는데 — `ANIMTICK stop` 이 없다 — WebGL 스왑은 1 초에 끊겼다).
+static WEBGL_PROGRESS: AtomicU64 = AtomicU64::new(0);
+static WEBGL_PHASE: AtomicUsize = AtomicUsize::new(PHASE_IDLE);
+
+const PHASE_IDLE: usize = 0;
+const PHASE_HANDLING: usize = 1;
+const PHASE_SWAP_LOCK: usize = 2;
+const PHASE_SWAP_BUFFERS: usize = 3;
+const PHASE_SWAP_AFTER: usize = 4;
+
+fn phase_name(phase: usize) -> &'static str {
+    match phase {
+        PHASE_IDLE => "waiting for a message",
+        PHASE_HANDLING => "handling a message",
+        PHASE_SWAP_LOCK => "swap: ANGLE lock / make current",
+        PHASE_SWAP_BUFFERS => "swap: swap_buffers",
+        PHASE_SWAP_AFTER => "swap: after swap_buffers",
+        _ => "unknown",
+    }
+}
+
+/// 진행이 멈추면 한 번 찍는다. `SERVO_WEBGL_FANOUT_PROF` 가 켜져 있을 때만 뜬다.
+///
+/// ★`waiting for a message` 로 멈춘 것과 그 밖에서 멈춘 것을 구분하는 것이 전부다★ — 전자는
+/// 아무도 그리라고 안 시키는 것(원인이 상류)이고, 후자는 이 스레드가 막힌 것이다.
+fn spawn_webgl_watchdog() {
+    let spawned = std::thread::Builder::new()
+        .name(String::from("WebGLWatchdog"))
+        .spawn(|| {
+            let mut last = u64::MAX;
+            let mut ticks_stuck = 0u32;
+            let mut reported = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let now = WEBGL_PROGRESS.load(Ordering::Relaxed);
+                if now != last {
+                    last = now;
+                    ticks_stuck = 0;
+                    reported = false;
+                    continue;
+                }
+                ticks_stuck += 1;
+                if ticks_stuck >= 4 && !reported {
+                    reported = true;
+                    warn!(
+                        "WEBGLWATCHDOG: no progress for {}s; stuck at [{}] (progress={})",
+                        ticks_stuck / 2,
+                        phase_name(WEBGL_PHASE.load(Ordering::Relaxed)),
+                        now
+                    );
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        warn!("Could not spawn the WebGL watchdog: {error:?}");
+    }
+}
+
 /// `gfx_webgl_swap_sync`: 스왑 직후 이 컨텍스트의 GPU 작업을 어디서 매듭지을지.
 ///
 /// ★가설★: DComp `Commit` 이 비싼 것은 캔버스의 GPU 작업이 아직 안 끝났기 때문이고, painter 가
@@ -386,7 +451,17 @@ impl WebGLThread {
 
     fn process(&mut self) {
         let webgl_chan = WebGLChan(self.sender.clone());
-        while let Ok(Ok(msg)) = self.receiver.recv() {
+        if *WEBGL_FANOUT_PROF {
+            spawn_webgl_watchdog();
+        }
+        loop {
+            WEBGL_PHASE.store(PHASE_IDLE, Ordering::Relaxed);
+            WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
+            let Ok(Ok(msg)) = self.receiver.recv() else {
+                break;
+            };
+            WEBGL_PHASE.store(PHASE_HANDLING, Ordering::Relaxed);
+            WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
             let exit = self.handle_msg(msg, &webgl_chan);
             if exit {
                 break;
@@ -1347,6 +1422,8 @@ impl WebGLThread {
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
             for surface_id in self.backend_surface_ids(context_id) {
+                WEBGL_PHASE.store(PHASE_SWAP_LOCK, Ordering::Relaxed);
+                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
                 self.make_surface_current_if_needed(surface_id)
                     .expect("Where's the GL data?");
@@ -1372,6 +1449,8 @@ impl WebGLThread {
                     .expect("Where's the swap chain?");
 
                 debug!("Swapping {:?}", surface_id);
+                WEBGL_PHASE.store(PHASE_SWAP_BUFFERS, Ordering::Relaxed);
+                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 swap_chain
                     .swap_buffers(
                         &data.device,
@@ -1383,6 +1462,8 @@ impl WebGLThread {
                         },
                     )
                     .unwrap();
+                WEBGL_PHASE.store(PHASE_SWAP_AFTER, Ordering::Relaxed);
+                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
                 if !data.attributes.preserve_drawing_buffer {
