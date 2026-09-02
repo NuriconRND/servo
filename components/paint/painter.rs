@@ -855,6 +855,54 @@ impl Painter {
         }
     }
 
+    /// 스크립트에 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다.
+    ///
+    /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
+    /// 로 잠기고 `script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 이
+    /// painter 가 `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀리는데, 그것을
+    /// 보내는 두 자리(`generate_frame_for_script`, `update_images`)는 각각 조건이 안 맞으면
+    /// 그냥 빠져나가고 **재확인을 "다음 `update_images` 호출"에 맡긴다**. 그 약속이
+    /// 캔버스만 있는 페이지에서는 거짓이다 — 이미지를 만드는 것이 스크립트인데 그 스크립트가
+    /// 바로 이 ack 를 기다리고 있으므로 다음 호출이 영원히 오지 않는다.
+    ///
+    /// 실측(2026-09-02, `log_webgpu/51` `ack_34`): 네 painter 전부 46.5 초 동안
+    /// `pending_frame=true pending_canvas_images=0 renderer_behind=false` 였다. ★보낼 조건이
+    /// 다 갖춰진 ack 를 부를 사람이 없어서 못 보낸 것★이지 무엇에 막힌 것이 아니었다.
+    /// 비디오 페이지가 멀쩡한 이유도 같다 — `update_images` 가 끊임없이 와서 재확인이
+    /// 저절로 일어난다.
+    ///
+    /// 그래서 매 페인트 기회마다 한 번 되묻는다. 조건이 안 맞으면 즉시 빠지므로 정상 경로의
+    /// 타이밍은 그대로다(빚이 없으면 첫 줄에서 끝난다). 보내고 나면 빚이 사라져 다음 렌더에서는
+    /// 다시 첫 줄에서 끝나므로, 한 번만 나간다.
+    fn flush_owed_canvas_ack(&mut self) {
+        if !self.frame_delayer.is_holding_ack() {
+            return;
+        }
+        if !self.frame_delayer.needs_new_frame() || self.renderer_behind() {
+            return;
+        }
+
+        // `update_images` 의 같은 블록과 하는 일이 정확히 같아야 한다 — 여기서만 다르게 하면
+        // 두 경로가 갈라진다.
+        let mut transaction = Transaction::new();
+        self.frame_delayer.set_pending_frame(false);
+        self.generate_frame(&mut transaction, RenderReasons::SCENE);
+        self.set_display_composite_in_flight(true);
+
+        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
+        self.send_to_constellation(
+            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
+                waiting_pipelines,
+            ),
+        );
+
+        self.screenshot_taker
+            .prepare_screenshot_requests_for_render(&*self);
+        if !transaction.is_empty() {
+            self.send_transaction(transaction);
+        }
+    }
+
     /// 스크립트가 이 painter 의 캔버스 ack 를 기다리다 잠긴 채로 남아 있는지 본다.
     ///
     /// ★여기에 거는 이유★: 스톨이 나면 스크립트도 WebGL 스레드도 논리 프레임도 전부 멈추는데
@@ -908,6 +956,9 @@ impl Painter {
 
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        // 복구가 먼저, 진단이 나중. 이 순서라면 아래 경고가 찍힌다는 것은 곧 "복구조차 할 수
+        // 없는 상태"라는 뜻이므로, 남겨 두면 회귀 탐지기가 된다.
+        self.flush_owed_canvas_ack();
         self.check_canvas_ack_latch();
         let render_count = self.render_count.get() + 1;
         self.render_count.set(render_count);
