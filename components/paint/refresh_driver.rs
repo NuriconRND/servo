@@ -157,6 +157,14 @@ impl AnimationRefreshDriverObserver {
             return false;
         }
 
+        // ★양성 대조★: 실제 전이가 일어나는 자리는 여기다. 처음엔 `frame_started` 에 걸었는데,
+        // 이 함수가 먼저 `animating` 을 세워서 그쪽 가드가 영영 참이 되지 않았다 — 그래서
+        // 로그가 0 줄이었고, 그것이 "stop 이 안 났다" 인지 "로깅이 고장났다" 인지 구분되지
+        // 않았다. 음성 결과를 증명하려면 양성 대조가 먼저 보여야 한다.
+        warn!(
+            "ANIMTICK start: {:?} began animating; refresh driver now observing",
+            webview_renderer.id
+        );
         self.animating.set(true);
         true
     }
@@ -181,9 +189,6 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             self.animating.set(false);
             return false;
         }
-        // 아래에서 벡터가 메시지로 move 되므로 개수를 미리 잡는다.
-        let animating_count = animating_webviews.len();
-
         // Request new animation frames from all animating WebViews.
         if let Err(error) =
             self.constellation_sender
@@ -195,9 +200,8 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             return false;
         }
 
-        if !self.animating.get() {
-            warn!("ANIMTICK start: {} animating webview(s)", animating_count);
-        }
+        // 여기서는 전이 로그를 걸지 않는다 — `notify_animation_state_changed` 가 이미
+        // `animating` 을 세운 뒤라 이 가드는 도달하지 않는다(그래서 처음에 0 줄이 나왔다).
         self.animating.set(true);
         true
     }
