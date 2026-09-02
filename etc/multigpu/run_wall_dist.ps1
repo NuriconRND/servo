@@ -1024,6 +1024,33 @@ if ($wdog) {
     Write-Warning "-FanoutProf was set but no WEBGLWATCHDOG line was logged. That thread emits once a second unconditionally, so its silence means it never started -- not that the run was healthy."
 }
 
+# --- WALLACK: the canvas-ack deadlock and its recovery.
+# A document that drew a canvas is locked until a painter sends the ack, and both places that
+# send it leave the recheck to a later update_images call that a canvas-only page never makes.
+# WALLACKFLUSH counts acks the recovery actually sent -- it is the POSITIVE CONTROL, without
+# which a clean run cannot be told apart from the recovery never running at all. WALLACKLATCH
+# means recovery was not even possible, which is a different and worse bug.
+$ackFlush = Select-String -Path $LogPath -Pattern "WALLACKFLUSH: painter PainterId\((\d+)\) sent (\d+) owed canvas ack" -EA SilentlyContinue
+$ackLatch = Select-String -Path $LogPath -Pattern "WALLACKLATCH: painter PainterId\((\d+)\) held the canvas ack for (\d+)ms" -EA SilentlyContinue
+Write-Host ""
+if ($ackLatch) {
+    $worstHeld = ($ackLatch | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Maximum).Maximum
+    Write-Host "WALLACK -- STALLED: a painter held script's canvas ack for up to $([math]::Round($worstHeld/1000,1))s across $($ackLatch.Count) report(s)." -ForegroundColor Red
+    Write-Host "  Recovery could not run, so the gate values on those lines say which condition blocked it."
+} elseif ($ackFlush) {
+    $sent = ($ackFlush | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Sum).Sum
+    $byPainter = $ackFlush | Group-Object { $_.Matches[0].Groups[1].Value } | Sort-Object Name
+    Write-Host "WALLACK -- recovery is live and no stall: $sent owed ack(s) sent, none left held." -ForegroundColor Green
+    foreach ($p in $byPainter) {
+        $n = ($p.Group | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Sum).Sum
+        Write-Host ("  painter {0}: {1} ack(s) recovered" -f $p.Name, $n)
+    }
+    Write-Host "  Each one is a frame that would have hung the wall permanently before this fix."
+} else {
+    Write-Host "WALLACK -- no stall, and recovery never had to fire in this run."
+    Write-Host "  Note this is the ambiguous outcome: it does not prove the recovery path works."
+}
+
 # --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
 # nothing to take? A tile render costs 0.23ms with no WebGL canvas and 15ms with one, and all
 # of that lands inside renderer.render() with draw_calls=2 and upload_mb=0.0. Neither drawing

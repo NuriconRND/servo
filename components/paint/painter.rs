@@ -267,6 +267,11 @@ pub(crate) struct Painter {
     canvas_ack_held_since: Cell<Option<Instant>>,
     canvas_ack_last_report: Cell<Option<Instant>>,
 
+    /// [`Painter::flush_owed_canvas_ack`] 가 실제로 보낸 횟수와 그 집계 창의 시작 시각.
+    /// ★양성 대조용★ — 고쳐진 것과 코드가 안 도는 것을 구분하기 위한 것이다.
+    owed_ack_flush_count: Cell<u64>,
+    owed_ack_window_start: Cell<Option<Instant>>,
+
     /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
     /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
     /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
@@ -687,6 +692,8 @@ impl Painter {
             last_render_end: Default::default(),
             canvas_ack_held_since: Default::default(),
             canvas_ack_last_report: Default::default(),
+            owed_ack_flush_count: Default::default(),
+            owed_ack_window_start: Default::default(),
             frame_reason_counts: Default::default(),
             frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
@@ -900,6 +907,28 @@ impl Painter {
             .prepare_screenshot_requests_for_render(&*self);
         if !transaction.is_empty() {
             self.send_transaction(transaction);
+        }
+
+        // ★양성 대조★: 고친 뒤에는 스톨이 안 나므로 "아무 줄도 없음"이 남는데, 그것만으로는
+        // **고쳐진 것**과 **이 코드가 아예 안 도는 것**이 구분되지 않는다. 이 조사에서만 네 번
+        // 같은 함정에 빠졌으므로, 실제로 보낸 횟수를 초당 한 줄로 남긴다. 0 이면 안 찍는다.
+        let count = self.owed_ack_flush_count.get() + 1;
+        self.owed_ack_flush_count.set(count);
+        let now = Instant::now();
+        let window_start = self.owed_ack_window_start.get().unwrap_or_else(|| {
+            self.owed_ack_window_start.set(Some(now));
+            now
+        });
+        if now.duration_since(window_start).as_secs_f64() >= 1.0 {
+            warn!(
+                "WALLACKFLUSH: painter {:?} sent {} owed canvas ack(s) in the last {:.1}s. \
+                 Each one is a frame script would otherwise have waited for forever.",
+                self.painter_id,
+                count,
+                now.duration_since(window_start).as_secs_f64(),
+            );
+            self.owed_ack_flush_count.set(0);
+            self.owed_ack_window_start.set(Some(now));
         }
     }
 
