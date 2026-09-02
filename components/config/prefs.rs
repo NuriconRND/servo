@@ -350,6 +350,21 @@ pub struct Preferences {
     /// 마지막 변경이 다음 페인트까지 안 보이게 된다 — 그래서 servoshell 은 페인트 직후 바로
     /// 부르고(동작 불변), winit_wall 만 패스 끝에서 몰아 이득을 가져간다.
     pub gfx_dcomp_commit_in_end_frame: bool,
+    /// WebGL 스왑 직후 그 컨텍스트의 GPU 작업을 매듭지을 방법. `""`/`"off"`(기본, 옛 동작) ·
+    /// `"flush"`(제출만) · `"finish"`(완료까지 대기).
+    ///
+    /// ★가설★: DComp `Commit` 이 캔버스가 있을 때만 비싼 것은, painter 가 아직 끝나지 않은
+    /// 캔버스 텍스처를 타일에 그려 그 미완이 DComp 서피스로 전파되기 때문이다. 2026-09-02
+    /// 지연 배치 실험이 그 방향을 가리켰다 — Commit 에 11ms 를 더 주자 대기가 24.90 → 9.83ms
+    /// 로 줄었다. 고정 비용이면 그렇게 줄지 않는다.
+    ///
+    /// 그렇다면 대기를 **생산자 쪽으로 옮기면** 된다. WebGL 스레드는 실작업이 초당 20ms 라
+    /// 95% 유휴이므로 거기서 기다리는 것은 사실상 공짜다.
+    ///
+    /// 세 값이 각각 다른 것을 판별한다 — `flush` 로 충분하면 문제는 "제출이 안 돼 있었다" 이고,
+    /// `finish` 여야 하면 "완료를 기다려야 한다" 이며, 둘 다 소용없으면 가설이 틀린 것이다.
+    /// 비용은 `SERVO_WEBGL_FANOUT_PROF` 의 `swap_sync_ms` 로 보인다.
+    pub gfx_webgl_swap_sync: String,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -857,6 +872,7 @@ impl Preferences {
             gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
             gfx_dcomp_always_flush_end_frame: false,
             gfx_dcomp_commit_in_end_frame: false,
+            gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

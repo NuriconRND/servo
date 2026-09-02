@@ -216,6 +216,38 @@ impl Default for GLState {
     }
 }
 
+/// `gfx_webgl_swap_sync`: 스왑 직후 이 컨텍스트의 GPU 작업을 어디서 매듭지을지.
+///
+/// ★가설★: DComp `Commit` 이 비싼 것은 캔버스의 GPU 작업이 아직 안 끝났기 때문이고, painter 가
+/// 그 텍스처를 타일에 그리면 그 미완이 DComp 서피스로 전파되어 Commit 이 기다린다. 2026-09-02
+/// 지연 배치 실험이 그 방향을 가리켰다 — Commit 에 시간을 11ms 더 주자 대기가 24.9→9.83ms 로
+/// 줄었다. 고정 비용이면 그렇게 줄지 않는다.
+///
+/// 그렇다면 그 대기를 **생산자 쪽으로 옮기면** 된다. WebGL 스레드는 실작업이 초당 20ms 라
+/// 95% 유휴이므로, 여기서 기다리는 것은 거의 공짜다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SwapSync {
+    /// 아무것도 하지 않는다(옛 동작).
+    Off,
+    /// 제출만 한다 — 큐에 넣되 기다리지 않는다. "명령이 아예 제출되지 않아서" 라면 이걸로 충분하다.
+    Flush,
+    /// 완료까지 기다린다. 가설의 강한 형태 — 소비자가 샘플링할 때 이미 끝나 있음을 보장한다.
+    Finish,
+}
+
+static WEBGL_SWAP_SYNC: LazyLock<SwapSync> = LazyLock::new(|| {
+    let raw = servo_config::pref!(gfx_webgl_swap_sync);
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "off" => SwapSync::Off,
+        "flush" => SwapSync::Flush,
+        "finish" => SwapSync::Finish,
+        other => {
+            warn!("Ignoring gfx_webgl_swap_sync={other:?} (expected off/flush/finish); using off");
+            SwapSync::Off
+        },
+    }
+});
+
 /// `SERVO_WEBGL_FANOUT_PROF` 게이트. 명령마다 물어보는 자리라 env 읽기를 캐시한다.
 static WEBGL_FANOUT_PROF: LazyLock<bool> = LazyLock::new(|| {
     debug_env::string(&debug_env::WEBGL_FANOUT_PROF)
@@ -247,6 +279,10 @@ struct FanoutProfile {
     /// 하지 않고 `switch_ns` 와 나란히 찍어 읽는 쪽이 판단한다).
     apply_ns: u64,
     serialize_ns: u64,
+    /// `gfx_webgl_swap_sync` 가 스왑 직후 쓴 시간과 횟수. 대기가 정말 이쪽으로 옮겨왔는지,
+    /// 그리고 그 대가가 얼마인지를 한 줄에서 읽기 위한 값이다.
+    swap_sync_ns: u64,
+    swap_syncs: u64,
 }
 
 /// A WebGLThread manages the life cycle and message multiplexing of
@@ -1303,6 +1339,10 @@ impl WebGLThread {
         if *WEBGL_FANOUT_PROF {
             self.fanout_profile.swaps += 1;
         }
+        // 루프가 `self.contexts` 를 빌리는 동안 `self.fanout_profile` 을 만질 수 없어 지역에
+        // 모았다가 루프를 빠져나온 뒤 합친다.
+        let mut sync_ns: u64 = 0;
+        let mut syncs: u64 = 0;
         for context_id in context_ids {
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
@@ -1363,6 +1403,26 @@ impl WebGLThread {
                 framebuffer_rebinding_info.apply(&data.device, &data.ctx, &data.gl);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
+                // 스왑 직후, 컨텍스트가 아직 current 이고 ANGLE 락을 쥔 자리에서 이 캔버스의
+                // GPU 작업을 매듭짓는다(`gfx_webgl_swap_sync`). 목적은 소비자(painter)가
+                // 이 프런트 버퍼를 타일에 그릴 때 이미 완료돼 있게 만들어, 그 미완이 DComp
+                // 서피스를 거쳐 `Commit` 의 대기로 나타나지 않게 하는 것이다.
+                let sync = *WEBGL_SWAP_SYNC;
+                if sync != SwapSync::Off {
+                    let start = WEBGL_FANOUT_PROF.then(Instant::now);
+                    unsafe {
+                        match sync {
+                            SwapSync::Flush => data.gl.flush(),
+                            SwapSync::Finish => data.gl.finish(),
+                            SwapSync::Off => unreachable!(),
+                        }
+                    }
+                    if let Some(start) = start {
+                        sync_ns += start.elapsed().as_nanos() as u64;
+                        syncs += 1;
+                    }
+                }
+
                 let SurfaceInfo {
                     size,
                     framebuffer_object,
@@ -1389,6 +1449,10 @@ impl WebGLThread {
             if let Some((size, has_alpha)) = primary_update {
                 self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
             }
+        }
+        if *WEBGL_FANOUT_PROF {
+            self.fanout_profile.swap_sync_ns += sync_ns;
+            self.fanout_profile.swap_syncs += syncs;
         }
         self.maybe_emit_fanout_profile();
     }
@@ -1417,7 +1481,7 @@ impl WebGLThread {
         warn!(
             "WEBGLFANOUT window_ms={:.0} swaps={} ctx={} dev={} cmds={} applies={} \
              switches={} lock_wait_ms={:.1} switch_ms={:.1} apply_ms={:.1} \
-             serialize_ms={:.1}",
+             serialize_ms={:.1} swap_sync_ms={:.1} swap_syncs={}",
             window.as_secs_f64() * 1000.0,
             profile.swaps,
             self.context_backends.len(),
@@ -1429,6 +1493,8 @@ impl WebGLThread {
             ms(profile.switch_ns),
             ms(profile.apply_ns),
             ms(profile.serialize_ns),
+            ms(profile.swap_sync_ns),
+            profile.swap_syncs,
         );
         self.fanout_profile = FanoutProfile {
             window_start: Some(now),

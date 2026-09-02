@@ -258,6 +258,21 @@ param(
     #
     # Use this to get the old behaviour back if a run looks wrong.
     [switch] $DcompCommitInFrame,
+    # gfx_webgl_swap_sync: settle the canvas's GPU work on the WebGL thread right after its
+    # swap, instead of leaving it for the painter to trip over.
+    #
+    # The DComp Commit is only expensive when an animating canvas is on the page, and
+    # deferring it showed the wait shrinks when given time -- 24.90ms down to 9.83 for about
+    # 11ms of extra slack. A fixed cost does not behave that way, so it is waiting on the
+    # canvas. The WebGL thread does roughly 20ms of real work a second, so waiting there is
+    # nearly free, while waiting inside Commit costs the whole wall.
+    #
+    # The three values separate three explanations: flush being enough means the commands
+    # were merely unsubmitted, finish being required means completion has to be waited for,
+    # and neither helping means the premise is wrong. Cost shows as swap_sync_ms, so pair
+    # this with -FanoutProf.
+    [ValidateSet("off", "flush", "finish")]
+    [string] $WebglSwapSync = "off",
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -506,6 +521,7 @@ if ($Devtools -ne "") {
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
+if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
@@ -523,7 +539,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -859,7 +875,7 @@ if ($fr) {
 # The verdict this is here to deliver: switches == applies means the replay loop changes GL
 # context on EVERY command, and switch+lock time is then the thing to attack (invert the loop).
 # If apply time dominates instead, the replay is doing real GL work and inverting buys nothing.
-$wgf = Select-String -Path $LogPath -Pattern "WEBGLFANOUT window_ms=([\d.]+) swaps=(\d+) ctx=(\d+) dev=(\d+) cmds=(\d+) applies=(\d+) switches=(\d+) lock_wait_ms=([\d.]+) switch_ms=([\d.]+) apply_ms=([\d.]+) serialize_ms=([\d.]+)" -EA SilentlyContinue
+$wgf = Select-String -Path $LogPath -Pattern "WEBGLFANOUT window_ms=([\d.]+) swaps=(\d+) ctx=(\d+) dev=(\d+) cmds=(\d+) applies=(\d+) switches=(\d+) lock_wait_ms=([\d.]+) switch_ms=([\d.]+) apply_ms=([\d.]+) serialize_ms=([\d.]+) swap_sync_ms=([\d.]+) swap_syncs=(\d+)" -EA SilentlyContinue
 if ($wgf) {
     $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     $n        = $wgf.Count
@@ -872,6 +888,8 @@ if ($wgf) {
     $switchMs = ($wgf | ForEach-Object { & $g $_ 9 } | Measure-Object -Sum).Sum
     $applyMs  = ($wgf | ForEach-Object { & $g $_ 10 } | Measure-Object -Sum).Sum
     $serMs    = ($wgf | ForEach-Object { & $g $_ 11 } | Measure-Object -Sum).Sum
+    $syncMs   = ($wgf | ForEach-Object { & $g $_ 12 } | Measure-Object -Sum).Sum
+    $syncN    = ($wgf | ForEach-Object { & $g $_ 13 } | Measure-Object -Sum).Sum
     $pct      = { param($ms) if ($window -gt 0) { 100.0 * $ms / $window } else { 0.0 } }
     Write-Host ""
     Write-Host "WEBGLFANOUT -- WebGL multi-GPU replay cost ($n one-second windows, max $dev backend devices):"
@@ -880,6 +898,9 @@ if ($wgf) {
     Write-Host ("  ANGLE lock wait  {0,9:N1} ms  ({1,5:N1}% of window)" -f $lockMs, (& $pct $lockMs))
     Write-Host ("  apply (w/ switch){0,9:N1} ms  ({1,5:N1}% of window)" -f $applyMs, (& $pct $applyMs))
     Write-Host ("  postcard trip    {0,9:N1} ms  ({1,5:N1}% of window)" -f $serMs, (& $pct $serMs))
+    # What the producer-side settle costs. It is meant to be large here and small in the
+    # wall pass -- this thread has the headroom, Commit does not.
+    Write-Host ("  swap sync        {0,9:N1} ms  ({1,5:N1}% of window)  on {2:N0} swaps" -f $syncMs, (& $pct $syncMs), $syncN)
     if ($applies -gt 0) {
         $ratio = $switches / $applies
         Write-Host ("  switches per apply {0:N3}" -f $ratio)
