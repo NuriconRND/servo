@@ -262,6 +262,11 @@ pub(crate) struct Painter {
     /// pass itself, which is logged separately as "Slow paint frame".
     last_render_end: Cell<Option<Instant>>,
 
+    /// 이 painter 가 스크립트의 캔버스 ack 를 붙잡기 시작한 시각, 그리고 마지막 보고 시각.
+    /// ★스톨 진단용★ — [`Painter::check_canvas_ack_latch`] 참고.
+    canvas_ack_held_since: Cell<Option<Instant>>,
+    canvas_ack_last_report: Cell<Option<Instant>>,
+
     /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
     /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
     /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
@@ -680,6 +685,8 @@ impl Painter {
             present_cadence_count: Default::default(),
             present_cadence_max_gap_ms: Default::default(),
             last_render_end: Default::default(),
+            canvas_ack_held_since: Default::default(),
+            canvas_ack_last_report: Default::default(),
             frame_reason_counts: Default::default(),
             frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
@@ -848,8 +855,60 @@ impl Painter {
         }
     }
 
+    /// 스크립트가 이 painter 의 캔버스 ack 를 기다리다 잠긴 채로 남아 있는지 본다.
+    ///
+    /// ★여기에 거는 이유★: 스톨이 나면 스크립트도 WebGL 스레드도 논리 프레임도 전부 멈추는데
+    /// **렌더 패스만은 계속 돈다**(winit_wall 의 표출 클럭이 내용과 무관하게 그리므로,
+    /// 2026-09-02 스톨 실행에서 초당 185회). 그래서 살아 있는 유일한 자리가 여기다.
+    ///
+    /// 잠기는 구조: 캔버스를 그린 문서는 `waiting_on_canvas_image_updates` 로 잠기고
+    /// (`script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다), 그 잠금은 painter 가
+    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다. 그런데 그것을 보내는
+    /// 두 자리(`generate_frame_for_script`, `update_images`)는 **둘 다 외부 트리거를 요구**하고
+    /// 그 트리거는 전부 스크립트 하류에 있다. 한 번 어긋나면 재시도할 주체가 없다.
+    ///
+    /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
+    fn check_canvas_ack_latch(&self) {
+        if !self.frame_delayer.is_holding_ack() {
+            self.canvas_ack_held_since.set(None);
+            self.canvas_ack_last_report.set(None);
+            return;
+        }
+        let now = Instant::now();
+        let held_since = match self.canvas_ack_held_since.get() {
+            Some(since) => since,
+            None => {
+                self.canvas_ack_held_since.set(Some(now));
+                return;
+            },
+        };
+        let held_ms = now.duration_since(held_since).as_secs_f64() * 1000.0;
+        if held_ms < 1000.0 {
+            return;
+        }
+        if let Some(last) = self.canvas_ack_last_report.get() {
+            if now.duration_since(last).as_secs_f64() < 1.0 {
+                return;
+            }
+        }
+        self.canvas_ack_last_report.set(Some(now));
+        // 두 게이트의 값을 그대로 싣는다 — 어느 쪽이 막았는지가 이 줄의 존재 이유다.
+        warn!(
+            "WALLACKLATCH: painter {:?} held the canvas ack for {:.0}ms; \
+             pending_frame={} pending_canvas_images={} renderer_behind={} \
+             composite_in_flight={}. Script cannot run another rAF until it is sent.",
+            self.painter_id,
+            held_ms,
+            self.frame_delayer.pending_frame,
+            self.frame_delayer.pending_canvas_image_count(),
+            self.renderer_behind(),
+            self.display_composite_in_flight.get(),
+        );
+    }
+
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        self.check_canvas_ack_latch();
         let render_count = self.render_count.get() + 1;
         self.render_count.set(render_count);
         let local_frame_id = self.last_ready_local_frame_id.get();
@@ -2959,6 +3018,17 @@ impl FrameDelayer {
 
     pub(crate) fn set_pending_frame(&mut self, value: bool) {
         self.pending_frame = value;
+    }
+
+    /// 스크립트가 이 painter 의 ack 를 기다리는 중인가. ★스톨 진단용★ — 이 집합이 비지
+    /// 않은 동안 그 파이프라인의 문서는 `waiting_on_canvas_image_updates` 로 잠겨 있어
+    /// rAF 를 한 번도 더 돌리지 못한다(`script_thread.rs:1200`).
+    pub(crate) fn is_holding_ack(&self) -> bool {
+        !self.waiting_pipelines.is_empty()
+    }
+
+    pub(crate) fn pending_canvas_image_count(&self) -> usize {
+        self.pending_canvas_images.len()
     }
 
     pub(crate) fn take_waiting_pipelines(&mut self) -> Vec<PipelineId> {
