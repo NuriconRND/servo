@@ -448,15 +448,12 @@ if ($DcompDebug -and $DComp -eq "off") {
 if ($DcompParallelCommit -and $DcompCommitInFrame) {
     throw "-DcompParallelCommit needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to run in parallel."
 }
-# ***Observed: this pairing stalled all four tiles mid-run.*** 2026-09-02, log_webgpu/41. On its
-# own the parallel commit ran two clean sixty-second runs with -DComp surface, and promotion on
-# its own ran clean too; only together did the wall freeze. In hybrid mode a promoted surface is
-# presented from the main thread while the Commit would go to a worker, and DirectComposition
-# evidently does not take that. Refuse it rather than leave a documented hang reachable by two
-# switches.
-if ($DcompParallelCommit -and $DComp -eq "on") {
-    throw "-DcompParallelCommit with -DComp on stalled the wall in testing (all four tiles froze). Promotion presents swap chains from the main thread while the Commit would run on a worker. Use -DComp surface with -DcompParallelCommit, or drop -DcompParallelCommit."
-}
+# ***-DComp on can stall the wall.*** All four tiles froze mid-run, first seen alongside
+# -DcompParallelCommit (log_webgpu/41) and then again with -DComp on ALONE (log_webgpu/45).
+# The first sighting was wrongly attributed to the pairing and the combination was refused for
+# it; one co-occurrence was never grounds for that, and the second sighting disproves it.
+# Nothing is refused on this account now -- the stall belongs to promotion, not to running the
+# Commit on a worker, and blocking the wrong switch only hides it.
 if ($DcompParallelCommit -and $DComp -eq "off") {
     throw "-DcompParallelCommit has no Commit to parallelise with -DComp off. Pass -DComp surface."
 }
