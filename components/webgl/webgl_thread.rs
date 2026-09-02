@@ -227,6 +227,19 @@ impl Default for GLState {
 static WEBGL_PROGRESS: AtomicU64 = AtomicU64::new(0);
 static WEBGL_PHASE: AtomicUsize = AtomicUsize::new(PHASE_IDLE);
 
+/// 도착한 메시지를 **종류별로** 센다.
+///
+/// ★진행 카운터 하나로는 부족했다★(2026-09-02, `log_webgpu/49`): stall 38 초 동안 워치독이
+/// 한 줄도 안 찍었는데, 그것은 스레드가 건강해서가 아니라 **painter 가 보내는
+/// `FinishedRenderingToContext` 가 루프를 계속 돌렸기** 때문이다(그 실행에서 `Wall render end`
+/// 8,490 줄). 스크립트가 죽어도 이 메시지는 계속 온다. 그래서 "메시지가 온다"가 아니라
+/// **"어떤 메시지가 오는가"** 를 세야 한다:
+///   `cmds` 가 멈춤  = 스크립트가 더 이상 그리라고 하지 않는다(원인이 상류)
+///   `cmds` 는 도는데 `swaps` 가 멈춤 = 그리기는 계속되는데 제출이 막혔다
+static WEBGL_MSG_CMDS: AtomicU64 = AtomicU64::new(0);
+static WEBGL_MSG_SWAPS: AtomicU64 = AtomicU64::new(0);
+static WEBGL_MSG_OTHER: AtomicU64 = AtomicU64::new(0);
+
 const PHASE_IDLE: usize = 0;
 const PHASE_HANDLING: usize = 1;
 const PHASE_SWAP_LOCK: usize = 2;
@@ -244,36 +257,42 @@ fn phase_name(phase: usize) -> &'static str {
     }
 }
 
-/// 진행이 멈추면 한 번 찍는다. `SERVO_WEBGL_FANOUT_PROF` 가 켜져 있을 때만 뜬다.
+/// 1 초마다 **무조건** 한 줄 찍는다. `SERVO_WEBGL_FANOUT_PROF` 가 켜져 있을 때만 뜬다.
 ///
-/// ★`waiting for a message` 로 멈춘 것과 그 밖에서 멈춘 것을 구분하는 것이 전부다★ — 전자는
-/// 아무도 그리라고 안 시키는 것(원인이 상류)이고, 후자는 이 스레드가 막힌 것이다.
+/// ★건강할 때도 찍는 것이 핵심이다.★ 이 조사에서 다섯 번 같은 함정에 빠졌다 — 건강한 경로에서만
+/// 찍는 계측(`WEBGLFANOUT` 은 스왑 경계, `WEBGLEXTIMG` 는 lock 경계)은 stall 이 오면 다 같이
+/// 조용해지고, "줄이 없음"은 **막힌 것**과 **할 일이 없는 것**과 **계측이 안 도는 것**을
+/// 구분해 주지 못한다. 그래서 이것은 별도 스레드에서, 아무 일도 없어도 찍는다.
 fn spawn_webgl_watchdog() {
     let spawned = std::thread::Builder::new()
         .name(String::from("WebGLWatchdog"))
         .spawn(|| {
-            let mut last = u64::MAX;
+            let mut last_progress = u64::MAX;
             let mut ticks_stuck = 0u32;
-            let mut reported = false;
+            let (mut cmds, mut swaps, mut other) = (0u64, 0u64, 0u64);
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let now = WEBGL_PROGRESS.load(Ordering::Relaxed);
-                if now != last {
-                    last = now;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let progress = WEBGL_PROGRESS.load(Ordering::Relaxed);
+                let now_cmds = WEBGL_MSG_CMDS.load(Ordering::Relaxed);
+                let now_swaps = WEBGL_MSG_SWAPS.load(Ordering::Relaxed);
+                let now_other = WEBGL_MSG_OTHER.load(Ordering::Relaxed);
+                if progress == last_progress {
+                    ticks_stuck += 1;
+                } else {
                     ticks_stuck = 0;
-                    reported = false;
-                    continue;
+                    last_progress = progress;
                 }
-                ticks_stuck += 1;
-                if ticks_stuck >= 4 && !reported {
-                    reported = true;
-                    warn!(
-                        "WEBGLWATCHDOG: no progress for {}s; stuck at [{}] (progress={})",
-                        ticks_stuck / 2,
-                        phase_name(WEBGL_PHASE.load(Ordering::Relaxed)),
-                        now
-                    );
-                }
+                warn!(
+                    "WEBGLWATCHDOG cmds=+{} swaps=+{} other=+{} phase=[{}] stuck_s={}",
+                    now_cmds - cmds,
+                    now_swaps - swaps,
+                    now_other - other,
+                    phase_name(WEBGL_PHASE.load(Ordering::Relaxed)),
+                    ticks_stuck
+                );
+                cmds = now_cmds;
+                swaps = now_swaps;
+                other = now_other;
             }
         });
     if let Err(error) = spawned {
@@ -462,6 +481,12 @@ impl WebGLThread {
             };
             WEBGL_PHASE.store(PHASE_HANDLING, Ordering::Relaxed);
             WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
+            match &msg {
+                WebGLMsg::WebGLCommand(..) => &WEBGL_MSG_CMDS,
+                WebGLMsg::SwapBuffers(..) => &WEBGL_MSG_SWAPS,
+                _ => &WEBGL_MSG_OTHER,
+            }
+            .fetch_add(1, Ordering::Relaxed);
             let exit = self.handle_msg(msg, &webgl_chan);
             if exit {
                 break;

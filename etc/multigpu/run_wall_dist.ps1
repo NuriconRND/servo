@@ -972,30 +972,56 @@ if ($wgf) {
     Write-Warning "-FanoutProf was set but no WEBGLFANOUT line was logged. The counters only emit at a swap boundary, so a run with no WebGL canvas produces nothing."
 }
 
-# --- WEBGLWATCHDOG: the stall. Everything above only reports from the healthy path, so when
-# the four tiles freeze they all just go quiet and that tells us nothing. This one is written
-# by a SEPARATE thread watching the WebGL thread's progress counter, so it still speaks when
-# the WebGL thread cannot. The phase name is the whole answer:
-#   "waiting for a message" -> the WebGL thread is IDLE. Nobody is asking it to draw, so the
-#                              fault is upstream (script or layout), not here.
-#   anything else           -> the WebGL thread is BLOCKED, at the named step.
-$wdog = Select-String -Path $LogPath -Pattern "WEBGLWATCHDOG: no progress for (\d+)s; stuck at \[([^\]]+)\]" -EA SilentlyContinue
+# --- WEBGLWATCHDOG: the stall. Every other instrument here reports from the healthy path
+# only -- WEBGLFANOUT at a swap boundary, WEBGLEXTIMG at a lock -- so when the four tiles
+# freeze they all go quiet at once and "no lines" cannot tell a blocked thread from an idle
+# one. This block is written by a SEPARATE thread once a second, ALWAYS, so it still speaks
+# when the WebGL thread cannot.
+#
+# ***Counting messages was not enough.*** The first version counted only "did the loop turn"
+# and reported no stall through a 38s freeze (log_webgpu/49) -- because WebRender keeps
+# sending FinishedRenderingToContext back on every painter render, which turns the loop even
+# with script dead. So the counters are split by KIND, and cmds is the one that means script:
+#   cmds=0 while other>0  -> script stopped asking for draws. The fault is UPSTREAM.
+#   cmds>0 but swaps=0    -> drawing continues but submission is gated.
+#   all 0 and stuck_s>0   -> the WebGL thread itself is blocked, at the phase named.
+$wdog = Select-String -Path $LogPath -Pattern "WEBGLWATCHDOG cmds=\+(\d+) swaps=\+(\d+) other=\+(\d+) phase=\[([^\]]+)\] stuck_s=(\d+)" -EA SilentlyContinue
 if ($wdog) {
-    Write-Host ""
-    Write-Host "WEBGLWATCHDOG -- the WebGL thread stopped making progress $($wdog.Count) time(s):" -ForegroundColor Yellow
-    foreach ($hit in $wdog) {
-        Write-Host ("  stuck {0,3}s at [{1}]" -f $hit.Matches[0].Groups[1].Value, $hit.Matches[0].Groups[2].Value)
+    $wins = foreach ($hit in $wdog) {
+        $g = $hit.Matches[0].Groups
+        [pscustomobject]@{
+            Cmds   = [int]$g[1].Value
+            Swaps  = [int]$g[2].Value
+            Other  = [int]$g[3].Value
+            Phase  = $g[4].Value
+            Stuck  = [int]$g[5].Value
+        }
     }
-    $idleOnly = @($wdog | Where-Object { $_.Matches[0].Groups[2].Value -ne "waiting for a message" }).Count -eq 0
-    if ($idleOnly) {
-        Write-Host "  Every stall was in [waiting for a message]: the WebGL thread was IDLE, not blocked." -ForegroundColor Yellow
-        Write-Host "  => whatever stopped is UPSTREAM of it (script / layout / rAF), so look there, not at GL."
+    $wins = @($wins)
+    $dead     = @($wins | Where-Object { $_.Cmds -eq 0 -and $_.Other -gt 0 })
+    $gated    = @($wins | Where-Object { $_.Cmds -gt 0 -and $_.Swaps -eq 0 })
+    $blocked  = @($wins | Where-Object { $_.Cmds -eq 0 -and $_.Other -eq 0 -and $_.Stuck -ge 2 })
+    $live     = @($wins | Where-Object { $_.Cmds -gt 0 -and $_.Swaps -gt 0 })
+    Write-Host ""
+    Write-Host "WEBGLWATCHDOG -- $($wins.Count) one-second windows on the WebGL thread:"
+    Write-Host ("  healthy (cmds>0, swaps>0) : {0}" -f $live.Count)
+    Write-Host ("  script silent (cmds=0)    : {0}" -f $dead.Count)
+    Write-Host ("  swaps gated (cmds>0,sw=0) : {0}" -f $gated.Count)
+    Write-Host ("  thread blocked            : {0}" -f $blocked.Count)
+    if ($blocked.Count -gt 0) {
+        $where = ($blocked | Group-Object Phase | Sort-Object Count -Descending | Select-Object -First 1).Name
+        Write-Host "  => the WebGL THREAD blocked, at [$where]. That step is the thing to fix." -ForegroundColor Red
+    } elseif ($dead.Count -gt 0) {
+        Write-Host "  => script stopped asking for draws for $($dead.Count)s while the painters kept running." -ForegroundColor Yellow
+        Write-Host "     The WebGL thread is a victim here. Look UPSTREAM: script / layout / rAF." -ForegroundColor Yellow
+    } elseif ($gated.Count -gt 0) {
+        Write-Host "  => drawing continued but SwapBuffers stopped arriving for $($gated.Count)s." -ForegroundColor Yellow
+        Write-Host "     Look at what asks for the swap (rAF -> compositor), not at GL." -ForegroundColor Yellow
     } else {
-        Write-Host "  At least one stall was NOT in [waiting for a message]: the WebGL thread itself blocked." -ForegroundColor Red
-        Write-Host "  => the named step is where it hung; that is the thing to fix."
+        Write-Host "  => no stall in this run: every window had both draws and swaps."
     }
 } elseif ($FanoutProf) {
-    Write-Host "WEBGLWATCHDOG: no stall (the WebGL thread never went 2s without progress)."
+    Write-Warning "-FanoutProf was set but no WEBGLWATCHDOG line was logged. That thread emits once a second unconditionally, so its silence means it never started -- not that the run was healthy."
 }
 
 # --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
