@@ -264,6 +264,32 @@ pub const DCOMP_BIND_PROF: DebugFlag = DebugFlag {
     cache_index: 18,
 };
 
+// ---------------------------------------------------------------------------------------------
+// 캔버스 ack 교착 실패 주입 (components/paint/painter.rs).
+//
+// 고친 교착(`2f97f5190c2`)은 **35 회 실행에 1 회** 재현됐다. 그 확률에 검증을 맡기면 고친 뒤
+// 12 회를 돌려도 복구 코드가 한 번도 안 도는 일이 생긴다(2026-09-02, `log_webgpu/52`:
+// stall 0 · `WALLACKFLUSH` 0 — 즉 아무것도 증명하지 못한 실행 12 개). 그래서 경합을 주입한다.
+// ---------------------------------------------------------------------------------------------
+
+pub const WALL_CANVAS_ACK_SKIP: DebugFlag = DebugFlag {
+    name: "SERVO_WALL_CANVAS_ACK_SKIP",
+    kind: Kind::Int,
+    doc: "캔버스 ack 교착 재현: painter 마다 처음 N 번의 ack 전송 기회를 \"게이트가 닫혀 있던 \
+          것처럼\" 건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 은 그대로 남기므로 \
+          실측된 교착 상태와 같아진다. 미설정/0 이면 주입 없음. 1 이면 충분하다.",
+    cache_index: 19,
+};
+
+pub const WALL_DISABLE_CANVAS_ACK_RECOVERY: DebugFlag = DebugFlag {
+    name: "SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY",
+    kind: Kind::Str,
+    doc: "`Painter::flush_owed_canvas_ack` 를 끈다(truthy: \"1\" 또는 \"true\"). ★주입이 진짜로 \
+          교착을 만드는지 보이는 대조군★ — 이것 없이 주입만 걸면 복구가 즉시 메워서 \
+          \"주입이 안 먹은 것\"과 구분되지 않는다. 운영에서 쓸 kill switch 이기도 하다.",
+    cache_index: 20,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -286,6 +312,8 @@ pub const ALL: &[&DebugFlag] = &[
     &MEDIA_SINK_PROF,
     &WEBGL_FANOUT_PROF,
     &DCOMP_BIND_PROF,
+    &WALL_CANVAS_ACK_SKIP,
+    &WALL_DISABLE_CANVAS_ACK_RECOVERY,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

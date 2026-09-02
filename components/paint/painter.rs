@@ -75,6 +75,21 @@ static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
+/// 캔버스 ack 교착 실패 주입. painter 마다 처음 N 번의 ack 전송 기회를 건너뛴다.
+static WALL_CANVAS_ACK_SKIP: LazyLock<u64> = LazyLock::new(|| {
+    debug_env::int(&debug_env::WALL_CANVAS_ACK_SKIP)
+        .filter(|value| *value > 0)
+        .map(|value| value as u64)
+        .unwrap_or(0)
+});
+
+/// [`Painter::flush_owed_canvas_ack`] kill switch. 주입이 진짜로 교착을 만드는지 보이는
+/// 대조군이자, 운영에서 복구를 끌 수 있는 스위치.
+static WALL_DISABLE_CANVAS_ACK_RECOVERY: LazyLock<bool> = LazyLock::new(|| {
+    debug_env::string(&debug_env::WALL_DISABLE_CANVAS_ACK_RECOVERY)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
 // DComp Native 경로에서 런타임 리사이즈(사용자 드래그/최대화) 후 picture-cache를 재구축하기
 // 전에 크기가 안정되어야 하는 연속 프레임 수. 드래그는 매 프레임 resize 이벤트를 쏟아내므로
 // 마지막 크기 변경 이후 이만큼 프레임이 흐른 뒤에 단 한 번만 재구축을 발동한다(≈170ms@60fps).
@@ -271,6 +286,9 @@ pub(crate) struct Painter {
     /// ★양성 대조용★ — 고쳐진 것과 코드가 안 도는 것을 구분하기 위한 것이다.
     owed_ack_flush_count: Cell<u64>,
     owed_ack_window_start: Cell<Option<Instant>>,
+
+    /// 남은 ack 주입 횟수(`SERVO_WALL_CANVAS_ACK_SKIP`). 0 이면 주입 없음 = 기본값.
+    canvas_ack_skips_left: Cell<u64>,
 
     /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
     /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
@@ -694,6 +712,7 @@ impl Painter {
             canvas_ack_last_report: Default::default(),
             owed_ack_flush_count: Default::default(),
             owed_ack_window_start: Default::default(),
+            canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
             frame_reason_counts: Default::default(),
             frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
@@ -881,7 +900,31 @@ impl Painter {
     /// 그래서 매 페인트 기회마다 한 번 되묻는다. 조건이 안 맞으면 즉시 빠지므로 정상 경로의
     /// 타이밍은 그대로다(빚이 없으면 첫 줄에서 끝난다). 보내고 나면 빚이 사라져 다음 렌더에서는
     /// 다시 첫 줄에서 끝나므로, 한 번만 나간다.
+    /// ack 전송을 한 번 일부러 건너뛸지(`SERVO_WALL_CANVAS_ACK_SKIP`). 기본값 0 = 항상 false.
+    ///
+    /// 건너뛸 때 빚(`waiting_pipelines`)과 `pending_frame` 을 ★그대로 남기는 것이 요점★이다 —
+    /// 게이트가 닫혀 있어서 못 보낸 것과 똑같은 상태가 되어야 실측된 교착이 재현된다.
+    /// [`Painter::flush_owed_canvas_ack`] 는 이것을 소비하지 않는다. 복구까지 같이 막으면
+    /// 주입이 무엇을 증명하는지가 사라진다.
+    fn consume_canvas_ack_skip(&self) -> bool {
+        let left = self.canvas_ack_skips_left.get();
+        if left == 0 {
+            return false;
+        }
+        self.canvas_ack_skips_left.set(left - 1);
+        warn!(
+            "WALLACKSKIP: painter {:?} skipped an ack send on purpose ({} left). \
+             Failure injection only -- SERVO_WALL_CANVAS_ACK_SKIP is set.",
+            self.painter_id,
+            left - 1,
+        );
+        true
+    }
+
     fn flush_owed_canvas_ack(&mut self) {
+        if *WALL_DISABLE_CANVAS_ACK_RECOVERY {
+            return;
+        }
         if !self.frame_delayer.is_holding_ack() {
             return;
         }
@@ -2291,6 +2334,11 @@ impl Painter {
             return false;
         }
 
+        // 실패 주입(기본 off). 게이트가 닫혔던 것과 같은 자리에서 같은 상태로 빠진다.
+        if self.consume_canvas_ack_skip() {
+            return false;
+        }
+
         let mut transaction = Transaction::new();
         self.generate_frame_with_diagnostic_id(
             &mut transaction,
@@ -2396,7 +2444,12 @@ impl Painter {
         // `renderer_behind`: while the renderer is draining published frames, defer this
         // composite; the pending-frame flag stays set and one of the frequent subsequent
         // `update_images` calls regenerates once the renderer has caught up.
-        if self.frame_delayer.needs_new_frame() && !self.renderer_behind() {
+        if self.frame_delayer.needs_new_frame() &&
+            !self.renderer_behind() &&
+            // 실패 주입(기본 off). 여기가 실측된 교착의 2 단계 — 이미지는 도착했는데 그 순간
+            // 합성이 in-flight 라 ack 없이 지나간 자리다.
+            !self.consume_canvas_ack_skip()
+        {
             self.frame_delayer.set_pending_frame(false);
             self.generate_frame(&mut txn, RenderReasons::SCENE);
             self.set_display_composite_in_flight(true);

@@ -1,4 +1,4 @@
-# 설정 노브 전량 (pref 26 + 조사용 env 17)
+# 설정 노브 전량 (pref 26 + 조사용 env 21)
 
 이 포크가 추가한 실행 설정의 **정본 목록**이다. 설계 근거는
 `multigpu_config_surface_consolidation_design.md`, 이행 기록은
@@ -182,7 +182,7 @@ nested document 에 적용되지 않는다. **진단용 iframe 의 배경은 반
 두면 차단된 로드가 검정 위 검정으로 그려져 "아무것도 안 그려짐" 으로 오진한다(실제로 3 회
 연속 오진했다).
 
-## 조사용 환경변수 15 개
+## 조사용 환경변수 21 개
 
 **이것들은 pref 가 아니다.** 실패 주입·프로파일링·이분탐색용이고, 조사가 끝나면 지운다.
 등록처는 `components/config/debug_env.rs` 한 곳이며 호출부는 이름 문자열을 갖지 않는다.
@@ -322,6 +322,31 @@ escape 실행은 비용이 `add_surface` 안에 있어 `end_frame` 만 보면 �
 WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush 가 실제로 걸렸는지를 말한다.
 `frames` 가 painter 의 렌더 횟수와 맞는지부터 보는 습관은 유지할 것 — bind 수와 렌더 수가 3 배
 어긋난 것이 타일 왕복을 무죄로 만든 결정적 단서였다.
+
+### `SERVO_WALL_CANVAS_ACK_SKIP` — `Int`
+
+캔버스 ack 교착 재현. painter 마다 처음 N 번의 ack 전송 기회를 "게이트가 닫혀 있던 것처럼"
+건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 을 그대로 남기므로 실측된 교착과 같은
+상태가 된다. 미설정/0 이면 주입 없음. **1 이면 충분하다.** 런처 `-CanvasAckSkip 1`.
+
+★왜 필요한가★: 이 교착(`2f97f5190c2`)은 **35 회 실행에 1 회** 나왔다. 그 확률에 검증을 맡기면
+고친 뒤 12 회를 돌려도 복구가 한 번도 안 도는 일이 생긴다 — 2026-09-02 `log_webgpu/52` 가
+정확히 그랬다(stall 0 · `WALLACKFLUSH` 0 = **아무것도 증명하지 못한 실행 12 개**).
+
+### `SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` — `Str`
+
+`Painter::flush_owed_canvas_ack` 를 끈다(truthy: `"1"` 또는 `"true"`). 런처
+`-NoCanvasAckRecovery`. ★주입이 진짜로 교착을 만드는지 보이는 대조군★ — 이것 없이 주입만
+걸면 복구가 즉시 메워서 "주입이 안 먹은 것"과 구분되지 않는다. 운영 kill switch 이기도 하다.
+
+검증은 두 번 실행하면 끝난다:
+
+| 실행 | 기대 | 뜻 |
+|---|---|---|
+| `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 주입이 교착을 진짜로 만든다 |
+| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 복구가 그 교착을 실제로 푼다 |
+
+첫 줄이 안 나오면 주입이 무효라는 뜻이므로, 둘째 줄의 "정상"은 아무 의미가 없다.
 
 ## wall CLI 플래그
 

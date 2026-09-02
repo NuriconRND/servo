@@ -238,6 +238,16 @@ param(
     #
     # Needs -DComp surface: with the compositor off there is nothing to bind.
     [switch] $DcompBindProf,
+    # Canvas-ack deadlock reproduction. The bug it targets showed up once in 35 runs, so
+    # leaving verification to chance does not work: 12 clean runs after the fix logged zero
+    # WALLACKFLUSH, meaning the recovery never ran and those runs proved nothing.
+    # -CanvasAckSkip N makes each painter skip its first N ack sends exactly the way a closed
+    # gate would, which reproduces the deadlock on demand.
+    [int] $CanvasAckSkip = 0,
+    # Turns the recovery off. Pair it with -CanvasAckSkip to show the injection really does
+    # deadlock the wall -- without this control, a run that stays healthy cannot distinguish
+    # "recovery worked" from "the injection never bit".
+    [switch] $NoCanvasAckRecovery,
     # gfx_dcomp_always_flush_end_frame=true: restore the unconditional gl().flush() in the
     # DComp end_frame. It is conditional by default -- it only runs when a SwapChain or
     # External surface exists, which is when a submit actually has to become visible
@@ -517,6 +527,8 @@ if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
 if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($FanoutProf)           { $env:SERVO_WEBGL_FANOUT_PROF = "1" }
 if ($DcompBindProf)        { $env:SERVO_DCOMP_BIND_PROF = "1" }
+if ($CanvasAckSkip -gt 0)  { $env:SERVO_WALL_CANVAS_ACK_SKIP = "$CanvasAckSkip" }
+if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
@@ -1048,7 +1060,17 @@ if ($ackLatch) {
     Write-Host "  Each one is a frame that would have hung the wall permanently before this fix."
 } else {
     Write-Host "WALLACK -- no stall, and recovery never had to fire in this run."
-    Write-Host "  Note this is the ambiguous outcome: it does not prove the recovery path works."
+    Write-Host "  Note this is the ambiguous outcome: it does not prove the recovery path works." -ForegroundColor Yellow
+    Write-Host "  To actually test it, reproduce the race on demand: -CanvasAckSkip 1"
+}
+$ackSkip = Select-String -Path $LogPath -Pattern "WALLACKSKIP: painter PainterId\((\d+)\) skipped an ack send" -EA SilentlyContinue
+if ($ackSkip) {
+    Write-Host "  (failure injection was active: $($ackSkip.Count) ack send(s) skipped on purpose)"
+    if ($NoCanvasAckRecovery) {
+        Write-Host "  Recovery was disabled for this run, so a stall here is the EXPECTED control result." -ForegroundColor Yellow
+    }
+} elseif ($CanvasAckSkip -gt 0) {
+    Write-Warning "-CanvasAckSkip $CanvasAckSkip was set but no WALLACKSKIP line was logged, so no ack send was ever reached and nothing was injected. The run tested nothing."
 }
 
 # --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
