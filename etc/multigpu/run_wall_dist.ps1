@@ -247,20 +247,17 @@ param(
     # ***Its failure mode is visual, not a crash.*** Stale tiles or tearing. If the wall
     # looks wrong, set this and the old behaviour comes straight back.
     [switch] $DcompAlwaysFlush,
-    # gfx_dcomp_defer_commit=true: hold each tile's DComp Commit until the whole wall pass has
-    # rendered, then issue all four together.
+    # gfx_dcomp_commit_in_end_frame=true: put the DComp Commit back inside end_frame.
     #
-    # This is a measurement, not a fix. Four painters run one after another on the embedder
-    # thread, so the pass is render1-commit1-render2-commit2 and so on, and Commit is close to
-    # the whole of it -- 12.7ms a frame on the production page, 37.4ms on a single triangle,
-    # four of them adding up to essentially the entire wall pass in both. If Commit is WAITING
-    # on the GPU or DWM, letting the other three tiles render first should let painter one's
-    # work finish, and the pass gets shorter. If the pass does not move, DWM serialises them,
-    # and both parallelising the tile loop and promoting the canvas lose their premise.
+    # ***Deferring it to the end of the pass is now the default, and it doubled the frame
+    # rate.*** Paired A/B on a single-triangle page: in end_frame gave 9.8fps with a 24.90ms
+    # Commit and a 108.5ms pass; deferred gave 19.3fps with a 9.83ms Commit and a 53.8ms pass.
+    # Commit waits on GPU completion, and letting the other three tiles render first gives it
+    # about 11ms to finish in. There is no added latency -- the commits still land in the same
+    # pass, only later in it.
     #
-    # Needs -DComp surface. Safe to leave off: with it off nothing is deferred at all, and even
-    # with it on, a shell that never flushes just commits one frame later.
-    [switch] $DcompDeferCommit,
+    # Use this to get the old behaviour back if a run looks wrong.
+    [switch] $DcompCommitInFrame,
     # SERVO_LOG_PRESENT_CADENCE=1: the ground truth for "how fast does this wall actually
     # present, and what does one composite cost". One PRESENT line per second per painter,
     # plus a "Slow paint frame" line for every composite over 16ms with the WebRender
@@ -390,9 +387,6 @@ if ($VideoEscape -ne "" -and $DComp -eq "off") {
 if ($DcompDebug -and $DComp -eq "off") {
     Write-Warning "-DcompDebug with -DComp off will print nothing: there is no native compositor to trace. Add -DComp surface."
 }
-if ($DcompDeferCommit -and $DComp -eq "off") {
-    throw "-DcompDeferCommit defers the DirectComposition Commit, but -DComp is off, so there is no Commit to defer. Pass -DComp surface."
-}
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
 }
@@ -511,7 +505,7 @@ if ($Devtools -ne "") {
 }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
-if ($DcompDeferCommit)    { $argList += @("--pref", "gfx_dcomp_defer_commit=true") }
+if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
 if ($SinkPolicy -ne "")   { $argList += @("--pref", "media_video_sink_policy=$SinkPolicy") }
@@ -529,7 +523,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompDeferCommit){'deferred to end of pass'}else{'in end_frame (default)'}) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -994,7 +988,7 @@ if ($dbp) {
     Write-Host ("DCOMPBIND -- DComp per painter ({0:N1} frames/s, {1:N1} binds/s):" -f ($ef/$secs), ($binds/$secs))
     Write-Host ("  end_frame     {0,9:N1} ms/s   {1,8:N3} ms per frame" -f ($endf/$secs), $(if ($ef -gt 0) { $endf/$ef } else { 0 }))
     Write-Host ("    gl flush    {0,9:N1} ms/s   (ran on {1:N0} frames, skipped on {2:N0})" -f ($flush/$secs), $flushed, $skipped)
-    Write-Host ("    Commit      {0,9:N1} ms/s   ({1})" -f ($commit/$secs), $(if ($defer -gt 0) { "deferred to end of pass on {0:N0} frames" -f $defer } else { "issued in end_frame" }))
+    Write-Host ("    Commit      {0,9:N1} ms/s   ({1})" -f ($commit/$secs), $(if ($defer -gt 0) { "deferred to end of pass on {0:N0} frames (default)" -f $defer } else { "issued in end_frame -- old behaviour" }))
     Write-Host ("    Present     {0,9:N1} ms/s   ({1:N0} swap-chain presents)" -f ($pres/$secs), $presN)
     Write-Host ("    rest        {0,9:N1} ms/s   (surface walk, promote/demote)" -f (($endf-$flush-$commitInFrame-$pres)/$secs))
     # The escape path lives OUTSIDE end_frame: WebRender does not draw video tiles at all, it

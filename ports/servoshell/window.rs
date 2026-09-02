@@ -234,6 +234,15 @@ impl ServoShellWindow {
         } else {
             webview.paint();
         }
+        // `gfx_dcomp_commit_in_end_frame=false`(기본)에서 DComp Commit 은 `end_frame` 에서
+        // 미뤄진다. 그것을 흘리는 것은 셸 책임이다.
+        //
+        // ★여기서는 창마다 즉시 흘린다 — 배치 이득을 포기하고 동작을 불변으로 둔다.★
+        // winit_wall 은 클럭에 맞춰 늘 그리므로 패스 끝까지 미뤄도 안전하지만, 이 셸은
+        // 필요할 때만 그리므로 미뤄 둔 Commit 이 다음 페인트까지 남으면 마지막 변경이
+        // 화면에 안 나타난다(타이핑 한 글자가 다음 페인트까지 안 보이는 식). present 앞이라
+        // 순서도 예전과 같다.
+        webview.flush_deferred_dcomp_commits();
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
 
         let present_start = Instant::now();

@@ -333,18 +333,23 @@ pub struct Preferences {
     /// 검증되지 않으니 육안 확인이 필요하고, 의심스러우면 이 pref 를 `true` 로 두어 즉시 옛
     /// 무조건 flush 로 되돌린다.
     pub gfx_dcomp_always_flush_end_frame: bool,
-    /// DComp `end_frame` 의 `Commit()` 을 그 자리에서 부르지 않고 **패스 끝으로 미룬다**.
-    /// 기본 `false`(그 자리에서 호출 = 기존 동작).
+    /// DComp `Commit()` 을 **`end_frame` 그 자리에서** 부른다(옛 동작). 기본 `false` =
+    /// 셸이 한 패스를 다 렌더한 뒤 몰아서 부른다.
     ///
-    /// 진단용이다. painter 4 개가 메인 스레드에서 순차라 지금은 render→commit 이 네 번
-    /// 번갈아 도는데, Commit 이 프레임의 거의 전부를 차지한다(WebGL 캔버스 + DComp 에서
-    /// painter 당 12.7~37.4ms, 4 회 합이 월 패스의 ~100%). 렌더 넷을 먼저 돌리고 Commit 을
-    /// 몰아 치면 **그 대기가 겹칠 수 있는지**가 스레드를 만들지 않고 갈린다 — 패스 시간이
-    /// 줄면 겹치는 것이고, 그대로면 DWM 이 직렬화하는 것이라 타일 병렬화도 캔버스 승격도
-    /// 전제가 무너진다.
+    /// ★Commit 은 GPU 완료를 기다린다 — 시간을 주면 줄어든다.★ 삼각형 하나짜리 페이지
+    /// 연속 A/B(2026-09-02, `log_webgpu/35`): 그 자리에서 부르면 타일 fps 9.8, painter 당
+    /// Commit 24.90ms, 타일당 렌더 26.92ms, 패스 108.5ms. 패스 끝으로 미루면 fps **19.3**,
+    /// Commit **9.83ms**, 타일당 렌더 **3.74ms**, 패스 **53.8ms**. 다른 세 타일이 렌더하는
+    /// 11ms 를 주었을 뿐인데 대기가 2.5 배 줄었다.
     ///
-    /// ★셸이 flush 를 부르지 않아도 안전하다★ — 다음 `end_frame` 이 스스로 흘린다.
-    pub gfx_dcomp_defer_commit: bool,
+    /// ★추가 지연시간은 0 이다★ — 같은 패스 안에서 순서만 바뀐다. 육안으로도 애니메이션이
+    /// 더 매끄럽다는 확인을 받았다.
+    ///
+    /// **셸은 한 패스가 끝나면 `WebView::flush_deferred_dcomp_commits()` 를 불러야 한다.**
+    /// 안 불러도 다음 `end_frame` 이 스스로 흘리므로 화면이 멈추지는 않지만, 대화형 셸에서는
+    /// 마지막 변경이 다음 페인트까지 안 보이게 된다 — 그래서 servoshell 은 페인트 직후 바로
+    /// 부르고(동작 불변), winit_wall 만 패스 끝에서 몰아 이득을 가져간다.
+    pub gfx_dcomp_commit_in_end_frame: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -851,7 +856,7 @@ impl Preferences {
             // 근거는 doc 주석 참고 (task-2 브리프 §4 로 확정; 배선은 Task 3 이 완료).
             gfx_dcomp_mode: String::new(), // 빈 문자열 = off. 위 필드 doc 주석 참고
             gfx_dcomp_always_flush_end_frame: false,
-            gfx_dcomp_defer_commit: false,
+            gfx_dcomp_commit_in_end_frame: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

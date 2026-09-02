@@ -3541,13 +3541,13 @@ impl Compositor for DCompNativeCompositor {
         // 2~4 가 렌더하는 동안 진행되어 첫 Commit 이 즉시 돌아와야 한다. 패스 시간이 줄면
         // 그 대기는 겹칠 수 있다는 뜻이고, 그대로면 DWM 이 직렬화한다는 뜻이라 타일 병렬화도
         // 캔버스 승격도 전제가 무너진다 — 스레드를 만들지 않고 그 답을 얻는 것이 목적이다.
-        if servo_config::pref!(gfx_dcomp_defer_commit) {
+        if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
+            self.commit_device(dcomp_device);
+        } else {
             self.commit_pending = true;
             if *DCOMP_BIND_PROF {
                 self.bind_profile.deferred_commits += 1;
             }
-        } else {
-            self.commit_device(dcomp_device);
         }
         if let Some(start) = end_frame_start {
             self.bind_profile.end_frames += 1;
