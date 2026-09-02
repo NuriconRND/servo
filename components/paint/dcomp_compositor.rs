@@ -2996,10 +2996,19 @@ impl Compositor for DCompNativeCompositor {
         //
         // `gfx_dcomp_always_flush_end_frame=true` 로 옛 무조건 flush 로 즉시 되돌릴 수 있다.
         // ★실패 모드가 크래시가 아니라 시각적 깨짐이라 육안 확인이 필요하다.★
+        // ★조건은 `External` 뿐이다 — `SwapChain` 은 아니다.★ 처음엔 "Virtual 이 아니면 flush"
+        // 로 잡았는데, 승격 모드(`-DComp on`)를 켜자 그 조건이 매 프레임 참이 되어 flush 가
+        // 프레임당 24ms 를 먹었다(2026-09-02, `log_webgpu/41`: 9.7fps. 승격 자체는 성공해서
+        // Commit 은 9.97→0.69ms 로 14 배 싸졌는데 flush 가 그걸 통째로 삼켰다).
+        //
+        // 승격된 스왑체인은 **우리 디바이스** 위에 있고 그 `Present` 는 GL 작업과 같은 ANGLE
+        // immediate context 로 간다 — 한 컨텍스트 안에서는 순서가 이미 보장되므로 제출을
+        // 강제할 이유가 없다. 제출이 **다른 곳에서 보여야** 하는 것은 `External` 뿐이다.
+        // 비디오 링의 D3D11 디바이스가 별개이기 때문이다.
         let needs_flush = servo_config::pref!(gfx_dcomp_always_flush_end_frame) ||
-            self.surfaces.values().any(|entry| {
-                !matches!(entry.storage, SurfaceStorage::Virtual { .. })
-            });
+            self.surfaces
+                .values()
+                .any(|entry| matches!(entry.storage, SurfaceStorage::External(_)));
         if needs_flush {
             let flush_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
             device.gl().flush();
