@@ -243,6 +243,8 @@ struct AppState {
     next_present_tick: Cell<std::time::Instant>,
     capture_path: Option<String>,
     capture_deadline: Option<std::time::Instant>,
+    /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
+    pass_counter: Cell<u64>,
     captured: Cell<bool>,
     should_exit: Cell<bool>,
 }
@@ -391,7 +393,26 @@ impl AppState {
         let pass_start = std::time::Instant::now();
         let mut tile_ms = vec![0.0f64; self.tiles.len()];
         let mut skipped = 0u32;
-        for (tile_index, tile) in self.tiles.iter().enumerate() {
+        // `gfx_wall_rotate_tile_order`: 시작 타일을 패스마다 한 칸 돌린다.
+        //
+        // 한 타일이 패스 비용을 몰아서 낸다(큰 캔버스 + DComp off 에서 타일 1 이 42.2ms 중
+        // 25.1ms, 나머지 셋은 각 5.7ms). GPU 는 30% 대라 처리량이 아니다. 돌려 보면 그 비용이
+        // **첫 번째 위치**의 것인지(그러면 타일별 평균이 고르게 퍼진다) 특정 painter 의
+        // 것인지(그 타일만 계속 느리다) 갈린다.
+        //
+        // `tile_ms` 는 계속 **타일 번호**로 기록한다 — 위치가 아니라. 그래야 WALLPASS 의
+        // per-tile 평균이 그대로 판별식이 된다.
+        let rotate = servo::pref!(gfx_wall_rotate_tile_order);
+        let count = self.tiles.len();
+        let offset = if rotate && count > 0 {
+            (self.pass_counter.get() as usize) % count
+        } else {
+            0
+        };
+        self.pass_counter.set(self.pass_counter.get().wrapping_add(1));
+        for step in 0..count {
+            let tile_index = (offset + step) % count;
+            let tile = &self.tiles[tile_index];
             let tile_start = std::time::Instant::now();
             match tile.paint_target.get() {
                 Some(target) => {
@@ -627,6 +648,7 @@ impl ApplicationHandler<WakerEvent> for App {
             }),
             capture_path: config.capture.clone(),
             captured: Cell::new(false),
+            pass_counter: Cell::new(0),
             should_exit: Cell::new(false),
         });
 

@@ -398,6 +398,20 @@ pub struct Preferences {
     /// 서로 다르고 메인은 join 으로 대기하므로 동시 접근은 없다. 실패하면 `Commit failed`
     /// HRESULT 나 **화면 깨짐**으로 나타나므로 육안 확인이 필수다.
     pub gfx_dcomp_parallel_commit: bool,
+    /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
+    ///
+    /// ★가르려는 것★: 패스 비용을 한 타일이 몰아서 낸다. 큰 캔버스 + DComp off 실측에서
+    /// 타일 1 이 42.2ms 패스 중 25.1ms 를 썼고(51 창 중 46 창), 나머지 셋은 각 5.7ms 였다.
+    /// 그런데 GPU 점유율은 30% 대라 처리량 문제가 아니다.
+    ///
+    /// 돌려 보면 답이 나온다. 비용이 **첫 번째 위치**를 따라 돌면 타일별 평균이 고르게
+    /// 퍼지고(파이프라인/백프레셔 — 첫 렌더가 직전 프레임의 무언가를 기다린다), 특정
+    /// **painter 에 붙어** 있으면 그 타일만 계속 느리다(그 대상을 좁혀 들어갈 수 있다).
+    /// 작은 캔버스 실행들에선 타일 3·4 가 느렸어서 지금 데이터로는 갈리지 않는다.
+    ///
+    /// 위치를 따라 도는 것이라면 회전 자체가 완화책이기도 하다 — 한 타일이 매번 몰아서
+    /// 맞는 대신 넷이 나눠 낸다.
+    pub gfx_wall_rotate_tile_order: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -908,6 +922,7 @@ impl Preferences {
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
+            gfx_wall_rotate_tile_order: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
