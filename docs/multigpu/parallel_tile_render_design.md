@@ -221,8 +221,35 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
    - `refresh_driver` / `animation_refresh_driver_observer` 는 §7-1 대로 **이미 타일별**이라
      할 일이 없다.
    - **남은 것**: `Painter` 를 실제로 스레드에 올리고 채널로 구동하기(3 단계와 맞물린다).
-3. **채널 프로토콜 + 배리어 이동** — 월 프레임 배리어를 `Cell` 기반에서 스레드 안전 구조로.
-   실패 주입 env 3종(`SERVO_WALL_FRAME_DELAY_*`)이 계속 동작해야 한다.
+3. **채널 프로토콜.** ★배리어는 옮기지 않는다 — 메인이 계속 소유한다.★ 원래 이 단계에
+   "배리어를 스레드 안전 구조로" 라고 적었으나, 실제로 `WallFrameCoordinator` 를 만지는 곳은
+   `paint.rs` 세 곳뿐이고 전부 메인이다(`webview_has_active_frame`,
+   `expire_keep_previous_before`, `register_frame`). §6.1 대로 **타일은 `TileDone` 만 돌려주고
+   메인이 판정**하면 `Mutex` 로 바꿀 이유가 없다. 실패 주입 env 3종도 그대로 동작한다.
+   `paint_target_keep_previous_logical_frame`(셸이 "이 타일 건너뛸까" 를 묻는 것)도 메인이
+   **디스패치 전에** 판정해 건너뛸 타일은 아예 보내지 않는 쪽이 맞다.
+
+   ### 3.1 실제 규모 (2026-09-03 실측)
+
+   `Paint` 가 `Painter` 를 **변형**하는 지점 48 곳, **읽는** 지점 13 곳. 그런데 48 중 22 는
+   이미 헬퍼 두 개를 거친다(`for_each_webview_painter_mut` 17,
+   `for_each_source_painter_target_mut` 5) — 그 22 는 **2 곳만 고치면 된다.**
+   흩어진 것은 23 곳이고, 성격이 둘로 갈린다:
+
+   | 성격 | 곳 | 어떻게 |
+   |---|---|---|
+   | **매 프레임** — `render_paint_target`, `render`, `handle_new_display_list`, `issue_wall_frame_request`, 위 헬퍼 2 | ~6 | 팬아웃/조인. **여기가 이득이 나오는 자리다** |
+   | **제어·설정** — `add_webview`/`remove_webview`, `show`/`hide`, `set_page_zoom`, `set_viewport_details`, `set_hidpi_scale_factor`, `resize_rendering_context`, `add`/`update_webview_paint_target`, 입력 이벤트 3, `device_pixels_per_page_pixel`, `handle_browser_message` 안의 13 | ~19 | **블로킹 왕복**으로 충분하다. 프레임당 도는 것이 아니라 성능에 무관하고, 동기 의미론이 그대로 보존된다 |
+
+   ★이 분류가 위험도를 결정한다★ — 제어 경로를 블로킹으로 두면 동작이 바뀌지 않으므로,
+   틀릴 수 있는 곳이 매 프레임 경로 여섯 곳으로 줄어든다.
+
+   ### 3.2 순서
+
+   1. `Painter` 접근을 단일 API 뒤로 모은다(`with_painter_mut(id, |p| ...)` 형태). 이 단계는
+      **전부 인라인 실행**이라 동작 불변이고, 되돌릴 수 있다.
+   2. 그 API 의 구현만 채널 왕복으로 바꾼다 — 제어 경로는 블로킹, 매 프레임 경로는 팬아웃/조인.
+   3. `painters: Vec<Rc<RefCell<Painter>>>` 를 스레드 핸들 목록으로 교체.
 4. **`present()` 를 타일 스레드로** — 리사이즈/DComp 재구축과의 조율이 여기 있다.
 5. **직렬 경로 제거** — `render_all_tiles` 를 fan-out/join 으로 대체.
 
