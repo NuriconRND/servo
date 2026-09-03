@@ -244,6 +244,85 @@ acquire 가 그 버퍼의 펜스 하나를 보는 값으로 떨어졌다.
 (리사이즈 폭주, 또는 생산자가 매 프레임 새 share handle 을 주는 경우)이고, 그러면 옛 비용이
 통째로 돌아온다.
 
+## ★5.7 비디오 그리드 — 45 영상 61.9fps (2026-09-03, `log_webgpu/71`~`73`)★
+
+병렬 타일은 비디오에도 듣는다. ★단 import 캐시(§5.6)는 비디오에 닿지 않는다★ —
+`create_surface_texture` 의 실사용 호출자는 `webrender_external_images.rs:140` 하나뿐이고
+그건 WebGL/캔버스 경로다. 비디오는 `media-thread/lib.rs` 의 `d3d11_wrap_cache` 로 애초에
+"정상 상태에서 프레임당 재래핑 0" 이다.
+
+45×FHD30(9열×5행), `-DComp on`, 같은 빌드:
+
+| | fps | pass_ms | paint | outside |
+|---|---|---|---|---|
+| 직렬 | 34.6 | 24.21 | 23.72 | 0.38 |
+| 병렬 | 42.1 | 10.37 | 4.84 | 5.53 |
+| **병렬 + CPU 플래그 2 개** | **61.9** | **4.63** | 1.79 | 2.84 |
+
+### ★이 결과의 전제: `-PipelineMode uridecodebin3` + `-SinkPacing thread`★
+
+둘 다 기본 off 이고 런처 주석에 cores/video 실측이 붙어 있다 — playbin3 의 `vqueue` 가
+원본 3.1MB 프레임을 매 장 스레드 경계 너머로 나르고(0.729 → 0.284),
+`GstSystemClock::obtain()` 은 프로세스당 싱글턴이라 45 개 sink 가 매 프레임 같은 객체를
+기다린다(0.795 → 0.284).
+
+★굶어도 증상이 벽 쪽에 나온다★ — 패스는 멀쩡해 보이고 타일만 느리다. 그래서 하루치
+타일-측 A/B(`log_webgpu/71`~`72`)를 통째로 굶은 구성 위에서 쟀고 **그 수치는 전부 무효다.**
+런처가 이제 실행 전에 경고한다(타일 16 개 이상 + 둘 중 하나라도 없음).
+
+### ★`-DcompParallelCommit` 는 병렬 타일과 같이 쓰면 손해★
+
+`outside` 5.53 → **8.84ms**, fps 42.1 → **30.8**.
+
+`flush_deferred_dcomp_commits`(`paint.rs:2780`)가 `with_painter()` 를 쓰는데, 병렬 경로의
+painter 는 `PainterHost::Threaded` 라 ★그 호출 하나가 그 스레드로 보내고 답을 기다리는
+왕복★이다. PC 경로는 포인터를 **가져오려고만** 4 번 왕복한 뒤 `std::thread::scope` 로
+**패스마다 OS 스레드 4 개를 새로 만든다.** PC 없으면 같은 4 번 왕복인데 Commit 을 **이미
+존재하는 그 페인터 스레드 안에서** 한다.
+
+★플래그의 전제가 병렬화로 무효가 됐다★ — 근거였던 "Commit 4×2.44 = 9.8ms, 메인 스레드
+직렬" 이 병렬 실행에서는 `Commit 5.7 ms/s ÷ 39.7 frames/s` = **회당 0.14ms** 다.
+겹칠 것이 없고 스레드 생성비만 남는다.
+
+### ★`outside` 는 병렬 경로에서 Commit 이 아니다★
+
+라벨("deferred DComp Commit flush + the loop itself")을 읽고 Commit 이라고 단정했는데,
+**같은 화면의 DCOMPBIND 가 0.14ms 라고 말하고 있었다** — §5.6 의 AcquireSync 와 같은 실수다.
+
+이유는 코드에 있다(`winit_wall/main.rs:579`): ★스레드 타일의 시간은 `tile_ms` 에만 넣고
+`split.paint_ms` 에는 더하지 않는다★(더하면 `outside` 가 음수가 된다). 따라서 병렬 경로의
+`outside` = **느린 타일을 기다리는 join 시간**이다. 산수가 닫힌다:
+
+| 실행 | paint | 느린 타일 | 차 | outside |
+|---|---|---|---|---|
+| 병렬 | 4.84 | 10.21 | 5.37 | 5.53 |
+| +PC | 5.35 | 12.99 | 7.64 | 8.84 |
+| +rotate | 5.14 | 11.35 | 6.21 | 5.88 |
+
+즉 ★`pass_ms ≈ 가장 느린 타일`, 나머지는 전부 장부★다.
+
+### 느린 타일은 painter 가 아니라 display 를 따라간다
+
+| | P1 | P2 | P3 | P4 |
+|---|---|---|---|---|
+| 정상 배치 | 5.24 | 5.31 | 5.39 | **9.78** |
+| `reversed.json` | **12.74** | 6.22 | 5.97 | 5.67 |
+
+★`-RotateTileOrder` 로는 이걸 구분할 수 없다★ — 회전은 **한 패스 안의 순회 순서**만 바꿀
+뿐, 어떤 painter 가 어떤 디스플레이를 모는지는 안 바꾼다. `reversed.json` 도 완전하지
+않다(그 파일 주석: *"every display keeps its own rect, so it cannot tell content apart from
+hardware"*). 하드웨어와 콘텐츠를 가르는 도구는 **`wall_layout.multigpu.rectswap.json`** 이다.
+
+지금은 쫓지 않는다 — CPU 플래그를 넣으면 느린 타일이 4.16ms 이고 예산은 16.67ms 라
+비대칭이 fps 를 잡지 않는다.
+
+### 부수 관찰: `-VideoEscape external` 의 판정이 타일 수에 따라 뒤집힌다
+
+36 영상은 escape 가 맞지만(61.1fps), 45 영상은 escape 30.5 대 escape 없음 42.1 이다.
+DCOMPBIND 가 직접 말한다: `external video 266.3 ms/s`, 101,445 adds,
+`visuals/frame 15.1`(escape 없으면 1.2) — ★영상마다 visual 을 만들므로 45 개면 관리 비용이
+아끼는 것을 이긴다.★ 단 이 비교도 CPU 플래그 없이 잰 것이라, 재비교가 필요하다.
+
 ## 6. A 설계 (C 실패 시)
 
 ### 6.1 소유 모델

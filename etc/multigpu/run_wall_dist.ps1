@@ -142,8 +142,15 @@ param(
     # selection is not implemented on this path.
     [ValidateSet('', 'playbin3', 'uridecodebin3')]
     [string] $PipelineMode = '',
-    [int]    $MaxPending = 0,            # 0 = leave default (1)
-    [int]    $MinIntervalMs = 0,         # 0 = leave default (16)
+    # gfx_wall_frame_max_pending: how many logical frames the coalescer may hold. The engine
+    # default is 1, which means nothing overlaps -- producing frame N+1 cannot start while
+    # frame N is being painted. Worth raising when passes/s sits far below what pass_ms says
+    # the loop could do (45 tiles: 33/s against a 10.4ms pass, so ~96/s of capacity).
+    [int]    $MaxPending = 0,            # 0 = leave the engine default (1)
+    # gfx_wall_frame_min_interval_ms. ***The engine default is 0, not 16.*** 0 means "derive
+    # one period from gfx_refresh_hz", which -RefreshHz sets to 60 here, so the floor is
+    # 16.667ms. The old fixed 16 could not express 60Hz at all (it is 62.5Hz).
+    [int]    $MinIntervalMs = 0,         # 0 = derive from -RefreshHz (60 -> 16.667ms)
     [int]    $DurationSec = 0,
     [string] $LogPath = "",
     # Write no log at all: engine stderr goes to the Windows null device, and the post-run
@@ -635,6 +642,25 @@ if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS err
 Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$(if($NoLog){'off (-NoLog); no post-run analysis either'}else{$LogPath})"
+
+# ***The two flags that decide whether a video grid is CPU-bound.*** Both default OFF, both
+# have measured cores/video attached to them above, and together they are the difference
+# between 37fps and 62fps at 45 x FHD30 (log_webgpu/73, same build, same layout, same pass):
+# playbin3's vqueue carries every raw 3.1MB frame across a thread boundary (0.729 -> 0.284
+# cores/video), and GstSystemClock::obtain() is a per-process singleton that all 45 sinks
+# wait on every frame (0.795 -> 0.284). Neither shows up as a wall symptom -- the pass looks
+# fine and the tiles just run slow -- so a whole afternoon of tile-side A/B ran without them
+# (log_webgpu/71-72) and every number from it was measured on a starved configuration.
+# Say so before the run, not after.
+if ($tiles -ge 16 -and ($PipelineMode -eq '' -or $SinkPacing -eq '')) {
+    $missing = @()
+    if ($PipelineMode -eq '') { $missing += "-PipelineMode uridecodebin3" }
+    if ($SinkPacing  -eq '') { $missing += "-SinkPacing thread" }
+    Write-Warning ("$tiles video tiles without $($missing -join ' and '). Those are the CPU flags; " +
+        "without them this run is decode-bound and its wall numbers say nothing about the wall. " +
+        "Add them unless you are deliberately measuring the default pipeline. " +
+        "(-SinkPacing thread gives each pipeline its own anchor, so videos are NOT synchronised with each other.)")
+}
 
 # Resolve -NumaNode "auto" into a number by asking the display adapters which node they are
 # on. DXGI does not expose this; it is a PnP device property. If they disagree, or none of them

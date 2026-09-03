@@ -397,6 +397,14 @@ pub struct Preferences {
     /// 다른 스레드). 다만 생성은 메인, Commit 은 워커라 정확히 같지는 않다. 디바이스는
     /// 서로 다르고 메인은 join 으로 대기하므로 동시 접근은 없다. 실패하면 `Commit failed`
     /// HRESULT 나 **화면 깨짐**으로 나타나므로 육안 확인이 필수다.
+    ///
+    /// ★`gfx_wall_parallel_tiles` 와 같이 쓰지 말 것 — 실측으로 손해다★
+    /// (2026-09-03, `log_webgpu/72`: `outside` 5.53 → 8.84ms, fps 42.1 → 30.8).
+    /// 위 근거는 Commit 넷이 **메인 스레드에서 직렬로** 도는 것을 전제로 하는데, 타일이
+    /// 자기 스레드를 가지면 그 전제가 사라진다. 그 경로에서 Commit 은 회당 **0.14ms** 라
+    /// 겹칠 것이 없고, `flush_deferred_dcomp_commits` 의 `with_painter` 는 스레드된
+    /// painter 에서 **왕복**이 되므로 남는 것은 패스마다 OS 스레드 넷을 새로 만드는
+    /// 비용뿐이다. 켜지 않으면 Commit 은 이미 존재하는 그 페인터 스레드 안에서 돈다.
     pub gfx_dcomp_parallel_commit: bool,
     /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
     ///
