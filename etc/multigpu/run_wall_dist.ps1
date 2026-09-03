@@ -1053,6 +1053,41 @@ if ($wdog) {
     Write-Warning "-FanoutProf was set but no WEBGLWATCHDOG line was logged. That thread emits once a second unconditionally, so its silence means it never started -- not that the run was healthy."
 }
 
+# --- SURFIMPORT: inside the one call that dominates the wall pass.
+# create_surface_texture is ~93% of paint in BOTH DComp modes (900-935 ms/s across four
+# painters, log_webgpu/57-59). It does four things per tile per frame, and which one is heavy
+# decides how invasive the fix is: caching just the OpenSharedResource result is a small patch,
+# while the EGL pbuffer or the GL texture would mean changing the surface texture's lifetime.
+$imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) open_ms=([\d.]+) pbuffer_ms=([\d.]+) mutex_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
+if ($imp) {
+    # The numbers are cumulative, so the last line is the whole run.
+    $impG = $imp[-1].Matches[0].Groups
+    $impN = [double]$impG[1].Value
+    $open = [double]$impG[2].Value
+    $pbuf = [double]$impG[3].Value
+    $mtx  = [double]$impG[4].Value
+    $rest = [double]$impG[5].Value
+    $tot  = $open + $pbuf + $mtx + $rest
+    Write-Host ""
+    Write-Host "SURFIMPORT -- inside create_surface_texture ($impN imports over the run):"
+    if ($tot -gt 0 -and $impN -gt 0) {
+        Write-Host ("  OpenSharedResource {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $open, (100 * $open / $tot), ($open / $impN))
+        Write-Host ("  EGL pbuffer       {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $pbuf, (100 * $pbuf / $tot), ($pbuf / $impN))
+        Write-Host ("  keyed mutex       {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $mtx, (100 * $mtx / $tot), ($mtx / $impN))
+        Write-Host ("  GL texture + bind {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $rest, (100 * $rest / $tot), ($rest / $impN))
+        Write-Host ("  TOTAL             {0,9:N1} ms                {1,6:N2} ms each" -f $tot, ($tot / $impN))
+        $dom = @(
+            @{ n = 'OpenSharedResource'; v = $open; fix = 'cache the opened texture per share handle -- a small, contained patch' },
+            @{ n = 'EGL pbuffer';        v = $pbuf; fix = 'the pbuffer must be cached too, so the SurfaceTexture lifetime has to change' },
+            @{ n = 'keyed mutex';        v = $mtx;  fix = 'this is synchronisation, not creation -- caching will NOT help' },
+            @{ n = 'GL texture + bind';  v = $rest; fix = 'the GL texture must persist across frames, so the lifetime has to change' }
+        ) | Sort-Object { $_.v } -Descending | Select-Object -First 1
+        Write-Host ("  => {0} dominates: {1}" -f $dom.n, $dom.fix) -ForegroundColor Yellow
+    }
+} else {
+    Write-Warning "No SURFIMPORT line was logged. It is a warn! from surfman and emits once a second whenever a WebGL canvas is imported, so its absence means no canvas was imported at all -- not that the import is free."
+}
+
 # --- WALLSPLIT: where a wall pass actually spends its time (needs -PresentCadence).
 # The DComp-on penalty is ~6.7ms a pass on the same page, and DCOMPBIND accounts for only the
 # ~1.5ms spent outside the tile loop. This splits the tile step itself with the SAME window and

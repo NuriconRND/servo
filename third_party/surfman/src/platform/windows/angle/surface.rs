@@ -22,6 +22,8 @@ use crate::platform::generic::egl::ffi::{EGLClientBuffer, EGLImageKHR};
 use crate::{Error, SurfaceAccess, SurfaceID, SurfaceInfo, SurfaceType};
 
 use euclid::default::Size2D;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use glow::HasContext;
 use log::{info, warn};
 use std::fmt::{self, Debug, Formatter};
@@ -183,6 +185,58 @@ fn ensure_dcomp_loaded() -> bool {
         }
         !LoadLibraryW(DCOMP_DLL.as_ptr()).is_null()
     })
+}
+
+/// `create_surface_texture` 의 네 부분을 따로 센다. ★어느 것이 무거운지가 고칠 범위를
+/// 정한다★ — `OpenSharedResource` 만 비싸면 그 결과만 캐시하는 작은 패치로 끝나고, EGL
+/// pbuffer 나 GL 텍스처 쪽이면 서피스 텍스처의 수명 전체를 바꿔야 한다.
+///
+/// 왜 여기서 재나: 이 호출 하나가 월 패스의 **93%** 다(2026-09-03, `log_webgpu/57`~`59`:
+/// painter 4 개 합 900~935 ms/s, DComp on/off 양쪽 동일). 소비자 측 계측(`WEBGLEXTIMG`)은
+/// 이 함수를 통째로 하나로만 재므로 안을 가를 수 없다.
+///
+/// env 게이트가 없는 이유: surfman 은 `servo-config` 에 의존하지 않는다(설정 표면 규약).
+/// 1 초에 한 줄이고 조사용이므로 무조건 찍는다 — 원인이 확정되면 지운다.
+static IMPORT_OPEN_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_PBUFFER_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_MUTEX_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_REST_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+static IMPORT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_START: OnceLock<Instant> = OnceLock::new();
+
+fn note_import_timing(open_ns: u64, pbuffer_ns: u64, mutex_ns: u64, rest_ns: u64) {
+    IMPORT_OPEN_NS.fetch_add(open_ns, Ordering::Relaxed);
+    IMPORT_PBUFFER_NS.fetch_add(pbuffer_ns, Ordering::Relaxed);
+    IMPORT_MUTEX_NS.fetch_add(mutex_ns, Ordering::Relaxed);
+    IMPORT_REST_NS.fetch_add(rest_ns, Ordering::Relaxed);
+    let count = IMPORT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // 창 경계는 기동 이후 경과 ms 로 잡는다 — `Instant` 는 `const` 로 static 에 못 넣는다.
+    let elapsed_ms = IMPORT_START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let last = IMPORT_LAST_LOG_MS.load(Ordering::Relaxed);
+    if elapsed_ms < last + 1000 {
+        return;
+    }
+    // 여러 스레드가 동시에 창을 넘겨도 한 줄만 찍는다.
+    if IMPORT_LAST_LOG_MS
+        .compare_exchange(last, elapsed_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    // ★`warn!` 이어야 한다★ — 런처의 기본 `RUST_LOG` 는 `warn,paint=info,media=info,...` 라
+    // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
+    // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
+    warn!(
+        "SURFIMPORT imports={} open_ms={:.1} pbuffer_ms={:.1} mutex_ms={:.1} rest_ms={:.1} (cumulative)",
+        count,
+        ms(IMPORT_OPEN_NS.load(Ordering::Relaxed)),
+        ms(IMPORT_PBUFFER_NS.load(Ordering::Relaxed)),
+        ms(IMPORT_MUTEX_NS.load(Ordering::Relaxed)),
+        ms(IMPORT_REST_NS.load(Ordering::Relaxed)),
+    );
 }
 
 impl Device {
@@ -460,11 +514,13 @@ impl Device {
                 // consumer/compositor device) so it stays on the correct adapter, then wrap the
                 // resulting texture via EGL_D3D_TEXTURE_ANGLE.
                 let mut local_d3d11_texture: *mut c_void = ptr::null_mut();
+                let open_start = Instant::now();
                 let open_result = self.d3d11_device.OpenSharedResource(
                     share_handle,
                     &d3d11::ID3D11Texture2D::uuidof(),
                     &mut local_d3d11_texture,
                 );
+                let open_ns = open_start.elapsed().as_nanos() as u64;
                 if !winerror::SUCCEEDED(open_result) || local_d3d11_texture.is_null() {
                     let (lh, ll) = self.d3d11_adapter_luid();
                     warn!(
@@ -476,6 +532,7 @@ impl Device {
                 let local_d3d11_texture =
                     ComPtr::from_raw(local_d3d11_texture as *mut d3d11::ID3D11Texture2D);
 
+                let pbuffer_start = Instant::now();
                 let local_egl_surface = egl.CreatePbufferFromClientBuffer(
                     self.egl_display,
                     EGL_D3D_TEXTURE_ANGLE,
@@ -483,11 +540,13 @@ impl Device {
                     local_egl_config,
                     pbuffer_attributes.as_ptr(),
                 );
+                let pbuffer_ns = pbuffer_start.elapsed().as_nanos() as u64;
                 if local_egl_surface == egl::NO_SURFACE {
                     let windowing_api_error = egl.GetError().to_windowing_api_error();
                     return Err((Error::SurfaceImportFailed(windowing_api_error), surface));
                 }
 
+                let mutex_start = Instant::now();
                 let mut local_keyed_mutex: *mut IDXGIKeyedMutex = ptr::null_mut();
                 let eglQuerySurfacePointerANGLE =
                     EGL_EXTENSION_FUNCTIONS.QuerySurfacePointerANGLE.unwrap();
@@ -508,12 +567,21 @@ impl Device {
                 } else {
                     None
                 };
-                self.create_surface_texture_from_local_surface(
+                let mutex_ns = mutex_start.elapsed().as_nanos() as u64;
+                let rest_start = Instant::now();
+                let result = self.create_surface_texture_from_local_surface(
                     context,
                     surface,
                     local_egl_surface,
                     local_keyed_mutex,
-                )
+                );
+                note_import_timing(
+                    open_ns,
+                    pbuffer_ns,
+                    mutex_ns,
+                    rest_start.elapsed().as_nanos() as u64,
+                );
+                result
             }
         })
     }
