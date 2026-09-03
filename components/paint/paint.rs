@@ -209,10 +209,75 @@ pub struct Paint {
 /// 끝나야 한다.
 struct PainterHost {
     painter_id: PainterId,
-    /// 컨텍스트 동일성 판정 전용(`register_rendering_context`). 스레드 변형에서는 컨텍스트가
-    /// 타일 스레드에서 만들어지므로 이 필드는 그 경로에 없다 — 등록 경로 자체가 달라진다.
-    rendering_context: Rc<dyn RenderingContext>,
-    painter: Rc<RefCell<Painter>>,
+    /// 컨텍스트 동일성 판정 전용(`register_rendering_context`). ★스레드 변형에는 `None` 이다★
+    /// — 컨텍스트가 타일 스레드에서 만들어지므로 메인에 사본이 없고, 등록 경로도 다르다.
+    rendering_context: Option<Rc<dyn RenderingContext>>,
+    kind: PainterHostKind,
+}
+
+enum PainterHostKind {
+    /// 오늘의 경로. painter 가 호출자와 같은 스레드에 있다.
+    Inline(Rc<RefCell<Painter>>),
+    /// 병렬 타일 렌더(A 안). painter 가 자기 스레드에 살고, 여기 있는 것은 그 스레드로
+    /// 일을 보내는 손잡이뿐이다.
+    Threaded(ThreadedPainter),
+}
+
+/// 타일 스레드로 일을 보내는 손잡이.
+struct ThreadedPainter {
+    requests: Sender<PainterRequest>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+enum PainterRequest {
+    /// ★열거형 변형이 아니라 클로저를 그대로 보낸다.★ 3.1~3.2 에서 painter 접근을 클로저로
+    /// 좁히고 `Send + 'static` 을 강제해 둔 덕에, 연산마다 메시지 변형을 만들 필요가 없다.
+    /// 그 준비가 없었다면 여기서 25 개짜리 열거형을 손으로 써야 했다.
+    Run(Box<dyn FnOnce(&mut Painter) + Send>),
+    Exit,
+}
+
+/// 타일 스레드에서 `RenderingContext` 를 **만들어 내는 것**.
+///
+/// ★메인이 만든 것을 넘길 수 없다★ — surfman `Device` 는 스레드 로컬이라 만든 스레드가
+/// 소멸까지 소유해야 한다(설계 §3-1). 그래서 만들어진 컨텍스트가 아니라 만드는 방법을
+/// 넘긴다. 실제로 이것이 되는지는 스파이크로 확인했다(`log_webgpu/62`, `-TileThreadSpike`).
+pub type RenderingContextFactory = Box<dyn FnOnce() -> Rc<dyn RenderingContext> + Send>;
+
+impl ThreadedPainter {
+    /// 클로저를 타일 스레드에서 돌리고 결과를 기다린다.
+    ///
+    /// ★제어 경로는 블로킹으로 둔다★ — `add_webview` 나 `set_page_zoom` 같은 것들은
+    /// 프레임당 도는 것이 아니라 성능에 무관하고, 블로킹이면 **동기 의미론이 그대로 보존된다**
+    /// (설계 §3.1). 이득이 나오는 매 프레임 경로만 나중에 팬아웃/조인으로 바꾼다.
+    ///
+    /// 스레드가 이미 죽었으면 `None` — 호출자에게는 "그 painter 가 없다" 와 같은 뜻이고,
+    /// 인라인 경로에서 id 를 못 찾았을 때와 같은 값이다.
+    fn run_blocking<R: Send + 'static>(
+        &self,
+        callback: impl FnOnce(&mut Painter) -> R + Send + 'static,
+    ) -> Option<R> {
+        let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
+        let request = PainterRequest::Run(Box::new(move |painter| {
+            let _ = result_sender.send(callback(painter));
+        }));
+        if self.requests.send(request).is_err() {
+            warn!("Painter thread is gone; dropping a request for it");
+            return None;
+        }
+        result_receiver.recv().ok()
+    }
+}
+
+impl Drop for ThreadedPainter {
+    fn drop(&mut self) {
+        // 스레드가 자기 컨텍스트를 소멸시켜야 한다(스레드 로컬 계약). 그래서 그냥 손잡이를
+        // 버리는 것이 아니라 끝내라고 말하고 기다린다.
+        let _ = self.requests.send(PainterRequest::Exit);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1084,7 +1149,11 @@ impl Paint {
         if let Some(painter_id) = self
             .painters
             .iter()
-            .find(|host| Rc::ptr_eq(&host.rendering_context, &rendering_context))
+            .find(|host| {
+                host.rendering_context
+                    .as_ref()
+                    .is_some_and(|context| Rc::ptr_eq(context, &rendering_context))
+            })
             .map(|host| host.painter_id)
         {
             return painter_id;
@@ -1114,10 +1183,75 @@ impl Paint {
         let painter_id = painter.painter_id;
         self.painters.push(PainterHost {
             painter_id,
-            rendering_context,
-            painter: Rc::new(RefCell::new(painter)),
+            rendering_context: Some(rendering_context),
+            kind: PainterHostKind::Inline(Rc::new(RefCell::new(painter))),
         });
         painter_id
+    }
+
+    /// 타일 스레드를 띄우고 그 스레드가 **자기 컨텍스트와 자기 `Painter` 를 직접 만들게**
+    /// 한다. 만들어진 것을 옮기는 길은 없다 — `webrender::Renderer` 도 `RenderingContext` 도
+    /// `!Send` 다(설계 §7-3, §3-1).
+    ///
+    /// `PainterId` 는 `Painter::new` 안에서 생기므로 만들어진 뒤에 돌려받는다. 여기서 한 번
+    /// 기다리는 값은 컨텍스트 생성 비용뿐이고(스파이크 실측 218~305ms), 타일들을 잇달아
+    /// 띄우면 그 대기는 서로 겹친다.
+    ///
+    /// 실패하면 `None` — 호출자는 인라인 경로로 되돌아갈 수 있어야 한다.
+    pub fn spawn_painter_thread(&mut self, factory: RenderingContextFactory) -> Option<PainterId> {
+        let inputs = self.painter_inputs();
+        let (requests, request_receiver) = crossbeam_channel::unbounded::<PainterRequest>();
+        let (id_sender, id_receiver) = crossbeam_channel::bounded(1);
+
+        let spawned = std::thread::Builder::new()
+            .name(String::from("WallTilePainter"))
+            .spawn(move || {
+                let rendering_context = factory();
+                let mut painter = Painter::new(rendering_context, inputs);
+                if id_sender.send(painter.painter_id).is_err() {
+                    // 아무도 안 기다린다 = 등록이 취소됐다. 컨텍스트를 이 스레드에서
+                    // 소멸시키고 조용히 끝낸다(스레드 로컬 계약).
+                    return;
+                }
+                while let Ok(request) = request_receiver.recv() {
+                    match request {
+                        PainterRequest::Run(work) => work(&mut painter),
+                        PainterRequest::Exit => break,
+                    }
+                }
+            });
+
+        let join_handle = match spawned {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!("Could not spawn a tile painter thread: {error:?}");
+                return None;
+            },
+        };
+        let painter_id = match id_receiver.recv() {
+            Ok(painter_id) => painter_id,
+            Err(_) => {
+                warn!("Tile painter thread died before it could build its painter");
+                let _ = join_handle.join();
+                return None;
+            },
+        };
+
+        self.painters.push(PainterHost {
+            painter_id,
+            rendering_context: None,
+            kind: PainterHostKind::Threaded(ThreadedPainter {
+                requests,
+                join_handle: Some(join_handle),
+            }),
+        });
+        Some(painter_id)
+    }
+
+    /// 등록된 모든 `PainterId`. ★painter 를 빌리지 않는다★ — 전수 순회는 이 목록을 얻은 뒤
+    /// `with_painter*` 로 하나씩 들어가는 형태여야 스레드 변형에서도 성립한다.
+    fn painter_ids(&self) -> Vec<PainterId> {
+        self.painters.iter().map(|host| host.painter_id).collect()
     }
 
     fn remove_painter(&mut self, painter_id: PainterId) {
@@ -1138,10 +1272,16 @@ impl Paint {
         painter_id: PainterId,
         callback: impl FnOnce(&Painter) -> R + Send + 'static,
     ) -> Option<R> {
-        self.painters
+        let host = self
+            .painters
             .iter()
-            .find(|host| host.painter_id == painter_id)
-            .map(|host| callback(&host.painter.borrow()))
+            .find(|host| host.painter_id == painter_id)?;
+        match &host.kind {
+            PainterHostKind::Inline(painter) => Some(callback(&painter.borrow())),
+            PainterHostKind::Threaded(threaded) => {
+                threaded.run_blocking(move |painter| callback(painter))
+            },
+        }
     }
 
     pub(crate) fn with_painter_mut<R: Send + 'static>(
@@ -1149,10 +1289,14 @@ impl Paint {
         painter_id: PainterId,
         callback: impl FnOnce(&mut Painter) -> R + Send + 'static,
     ) -> Option<R> {
-        self.painters
+        let host = self
+            .painters
             .iter()
-            .find(|host| host.painter_id == painter_id)
-            .map(|host| callback(&mut host.painter.borrow_mut()))
+            .find(|host| host.painter_id == painter_id)?;
+        match &host.kind {
+            PainterHostKind::Inline(painter) => Some(callback(&mut painter.borrow_mut())),
+            PainterHostKind::Threaded(threaded) => threaded.run_blocking(callback),
+        }
     }
 
     /// ★스레드 준비가 안 된 경로 전용.★ 스크린샷 기계는 콜백
@@ -1167,13 +1311,37 @@ impl Paint {
     fn with_primary_painter_not_thread_ready<R>(
         &self,
         webview_id: WebViewId,
+        reason: &str,
         callback: impl FnOnce(&Painter) -> R,
     ) -> Option<R> {
         let painter_id = self.primary_painter_id_for_webview(webview_id);
-        self.painters
+        self.with_painter_not_thread_ready(painter_id, reason, callback)
+    }
+
+    /// [`Self::with_primary_painter_not_thread_ready`] 와 같은 예외를 `PainterId` 로 건다.
+    fn with_painter_not_thread_ready<R>(
+        &self,
+        painter_id: PainterId,
+        reason: &str,
+        callback: impl FnOnce(&Painter) -> R,
+    ) -> Option<R> {
+        let host = self
+            .painters
             .iter()
-            .find(|host| host.painter_id == painter_id)
-            .map(|host| callback(&host.painter.borrow()))
+            .find(|host| host.painter_id == painter_id)?;
+        match &host.kind {
+            PainterHostKind::Inline(painter) => Some(callback(&painter.borrow())),
+            PainterHostKind::Threaded(_) => {
+                // 스레드에 있는 painter 에는 이 경로로 닿을 수 없다. ★조용히 건너뛰지
+                // 않고 말한다★ — 스크린샷이 그냥 안 찍히는 것으로 보이면 원인을 찾는 데
+                // 시간이 든다.
+                warn!(
+                    "{reason} reached {painter_id:?}, which runs on a tile thread, and that \
+                     path is not thread-ready. Skipping it for this painter."
+                );
+                None
+            },
+        }
     }
 
     fn with_primary_painter<R: Send + 'static>(
@@ -1774,9 +1942,12 @@ impl Paint {
     }
 
     pub fn webviews_needing_repaint(&self) -> Vec<WebViewId> {
-        self.painters
-            .iter()
-            .flat_map(|host| host.painter.borrow().webviews_needing_repaint())
+        self.painter_ids()
+            .into_iter()
+            .flat_map(|painter_id| {
+                self.with_painter(painter_id, |painter| painter.webviews_needing_repaint())
+                    .unwrap_or_default()
+            })
             .collect()
     }
 
@@ -2163,8 +2334,10 @@ impl Paint {
 
     fn collect_memory_report(&self, sender: profile_traits::mem::ReportsChan) {
         let mut memory_report = MemoryReport::default();
-        for host in &self.painters {
-            memory_report += host.painter.borrow().report_memory();
+        for painter_id in self.painter_ids() {
+            if let Some(report) = self.with_painter(painter_id, |painter| painter.report_memory()) {
+                memory_report += report;
+            }
         }
 
         let mut reports = vec![
@@ -2187,9 +2360,15 @@ impl Paint {
 
         perform_memory_report(|ops| {
             let scroll_trees_memory_usage = self
-                .painters
-                .iter()
-                .map(|host| host.painter.borrow().scroll_trees_memory_usage(ops))
+                .painter_ids()
+                .into_iter()
+                .map(|painter_id| {
+                    // `MallocSizeOfOps` 는 `dyn FnMut` 을 품고 있어 스레드를 건너지 못한다.
+                    self.with_painter_not_thread_ready(painter_id, "Memory report", |painter| {
+                        painter.scroll_trees_memory_usage(ops)
+                    })
+                    .unwrap_or_default()
+                })
                 .sum();
             reports.push(Report {
                 path: path!["paint", "scroll-tree"],
@@ -2457,9 +2636,12 @@ impl Paint {
         #[cfg(windows)]
         if servo_config::pref!(gfx_dcomp_parallel_commit) {
             let pending: Vec<usize> = self
-                .painters
-                .iter()
-                .filter_map(|host| host.painter.borrow().take_pending_dcomp_commit())
+                .painter_ids()
+                .into_iter()
+                .filter_map(|painter_id| {
+                    self.with_painter(painter_id, |painter| painter.take_pending_dcomp_commit())
+                        .flatten()
+                })
                 .collect();
             if pending.len() > 1 {
                 std::thread::scope(|scope| {
@@ -2475,8 +2657,8 @@ impl Paint {
             }
             return;
         }
-        for host in &self.painters {
-            host.painter.borrow().flush_deferred_dcomp_commit();
+        for painter_id in self.painter_ids() {
+            self.with_painter(painter_id, |painter| painter.flush_deferred_dcomp_commit());
         }
     }
 
@@ -2559,8 +2741,8 @@ impl Paint {
         #[cfg(feature = "webxr")]
         self.webxr_main_thread.borrow_mut().run_one_frame();
 
-        for host in &self.painters {
-            host.painter.borrow_mut().perform_updates();
+        for painter_id in self.painter_ids() {
+            self.with_painter_mut(painter_id, |painter| painter.perform_updates());
         }
 
         let wall_frame_repaint_decisions = self
@@ -2579,8 +2761,10 @@ impl Paint {
     }
 
     pub fn toggle_webrender_debug(&self, option: WebRenderDebugOption) {
-        for host in &self.painters {
-            host.painter.borrow_mut().toggle_webrender_debug(option);
+        for painter_id in self.painter_ids() {
+            self.with_painter_mut(painter_id, move |painter| {
+                painter.toggle_webrender_debug(option)
+            });
         }
     }
 
@@ -2700,9 +2884,13 @@ impl Paint {
         rect: Option<WebViewRect>,
         callback: Box<dyn FnOnce(Result<RgbaImage, ScreenshotCaptureError>) + 'static>,
     ) {
-        self.with_primary_painter_not_thread_ready(webview_id, move |painter| {
-            painter.request_screenshot(webview_id, rect, callback)
-        })
+        self.with_primary_painter_not_thread_ready(
+            webview_id,
+            // 콜백(`Box<dyn FnOnce(Result<RgbaImage, _>)>`)과
+            // `ScreenshotRequestPhase::WaitingOnPipelineDisplayLists(Rc<..>)` 때문이다.
+            "Screenshot request",
+            move |painter| painter.request_screenshot(webview_id, rect, callback),
+        )
         .expect("painter_id not found");
     }
 

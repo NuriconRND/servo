@@ -27,7 +27,7 @@ use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
     ImageUpdate, PaintProxy, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
     SerializableImageData, WebRenderExternalImageHandlers, WebRenderExternalImageIdManager,
-    WebRenderImageHandlerType, WebViewTrait,
+    WebRenderImageHandlerType,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
