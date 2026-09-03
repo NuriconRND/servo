@@ -945,7 +945,7 @@ if ($fr) {
 # The verdict this is here to deliver: switches == applies means the replay loop changes GL
 # context on EVERY command, and switch+lock time is then the thing to attack (invert the loop).
 # If apply time dominates instead, the replay is doing real GL work and inverting buys nothing.
-$wgf = Select-String -Path $LogPath -Pattern "WEBGLFANOUT window_ms=([\d.]+) swaps=(\d+) ctx=(\d+) dev=(\d+) cmds=(\d+) applies=(\d+) switches=(\d+) lock_wait_ms=([\d.]+) switch_ms=([\d.]+) apply_ms=([\d.]+) serialize_ms=([\d.]+) swap_sync_ms=([\d.]+) swap_syncs=(\d+)" -EA SilentlyContinue
+$wgf = Select-String -Path $LogPath -Pattern "WEBGLFANOUT window_ms=([\d.]+) swaps=(\d+) ctx=(\d+) dev=(\d+) cmds=(\d+) applies=(\d+) switches=(\d+) lock_wait_ms=([\d.]+) switch_ms=([\d.]+) apply_ms=([\d.]+) serialize_ms=([\d.]+) swap_sync_ms=([\d.]+) swap_syncs=(\d+) swap_ms=([\d.]+) clear_ms=([\d.]+) busy_ms=([\d.]+)" -EA SilentlyContinue
 if ($wgf) {
     $g = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
     $n        = $wgf.Count
@@ -960,6 +960,9 @@ if ($wgf) {
     $serMs    = ($wgf | ForEach-Object { & $g $_ 11 } | Measure-Object -Sum).Sum
     $syncMs   = ($wgf | ForEach-Object { & $g $_ 12 } | Measure-Object -Sum).Sum
     $syncN    = ($wgf | ForEach-Object { & $g $_ 13 } | Measure-Object -Sum).Sum
+    $swapMs   = ($wgf | ForEach-Object { & $g $_ 14 } | Measure-Object -Sum).Sum
+    $clearMs  = ($wgf | ForEach-Object { & $g $_ 15 } | Measure-Object -Sum).Sum
+    $busyMs   = ($wgf | ForEach-Object { & $g $_ 16 } | Measure-Object -Sum).Sum
     $pct      = { param($ms) if ($window -gt 0) { 100.0 * $ms / $window } else { 0.0 } }
     Write-Host ""
     Write-Host "WEBGLFANOUT -- WebGL multi-GPU replay cost ($n one-second windows, max $dev backend devices):"
@@ -971,6 +974,20 @@ if ($wgf) {
     # What the producer-side settle costs. It is meant to be large here and small in the
     # wall pass -- this thread has the headroom, Commit does not.
     Write-Host ("  swap sync        {0,9:N1} ms  ({1,5:N1}% of window)  on {2:N0} swaps" -f $syncMs, (& $pct $syncMs), $syncN)
+    # ***The swap path, which nothing measured until now.*** Before these two counters the
+    # thread's second was 95.8% unaccounted, so "one triangle and it will not reach 30fps"
+    # could not be answered: an idle thread and a thread stuck in swap_buffers looked the same.
+    Write-Host ("  swap_buffers     {0,9:N1} ms  ({1,5:N1}% of window)  on {2:N0} swaps" -f $swapMs, (& $pct $swapMs), $swaps)
+    Write-Host ("  clear_surface    {0,9:N1} ms  ({1,5:N1}% of window)" -f $clearMs, (& $pct $clearMs))
+    Write-Host ("  ---- BUSY TOTAL  {0,9:N1} ms  ({1,5:N1}% of window)" -f $busyMs, (& $pct $busyMs))
+    $busyPct = & $pct $busyMs
+    if ($busyPct -lt 40) {
+        Write-Host ("  => The WebGL thread is IDLE {0:N0}% of the time. The canvas is NOT the limit --" -f (100 - $busyPct)) -ForegroundColor Green
+        Write-Host "     it is only asked for $([math]::Round($swaps / $n, 1)) frames a second. Chase whatever drives rAF (the wall pass rate)."
+    } else {
+        Write-Host ("  => The WebGL thread is BUSY {0:N0}% of the time; it really is a producer-side limit." -f $busyPct) -ForegroundColor Yellow
+        Write-Host "     swap_buffers vs clear_surface above says whether buffer turnover or clearing dominates."
+    }
     if ($applies -gt 0) {
         $ratio = $switches / $applies
         Write-Host ("  switches per apply {0:N3}" -f $ratio)

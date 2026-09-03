@@ -367,6 +367,16 @@ struct FanoutProfile {
     /// 그리고 그 대가가 얼마인지를 한 줄에서 읽기 위한 값이다.
     swap_sync_ns: u64,
     swap_syncs: u64,
+    /// ★스왑 경로 자체의 비용.★ 여기까지 재기 전에는 이 스레드의 1 초 중 **95.8%가
+    /// 미계측**이었다(2026-09-03, `log_webgpu/55`: 계측된 것이 42.6ms/s 뿐). 그 미계측분이
+    /// "할 일이 없어 노는 것"인지 "스왑에서 쓰는 것"인지 구분할 수단이 없었고, 그래서
+    /// "삼각형 하나인데 왜 느린가"에 답할 수 없었다.
+    ///
+    /// `swap_ns` = `SwapChain::swap_buffers`(서피스 교체 — 새 버퍼를 만들어야 하면 여기서
+    /// 만든다), `clear_ns` = 스왑 후 `clear_surface`(`preserve_drawing_buffer` 가 거짓일 때).
+    /// 가상 뷰포트 전체 캔버스는 11520x4320 RGBA8 = 199MB 이고 백엔드가 4 개다.
+    swap_ns: u64,
+    clear_ns: u64,
 }
 
 /// A WebGLThread manages the life cycle and message multiplexing of
@@ -1476,6 +1486,7 @@ impl WebGLThread {
                 debug!("Swapping {:?}", surface_id);
                 WEBGL_PHASE.store(PHASE_SWAP_BUFFERS, Ordering::Relaxed);
                 WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
+                let swap_start = WEBGL_FANOUT_PROF.then(Instant::now);
                 swap_chain
                     .swap_buffers(
                         &data.device,
@@ -1487,6 +1498,9 @@ impl WebGLThread {
                         },
                     )
                     .unwrap();
+                if let Some(start) = swap_start {
+                    self.fanout_profile.swap_ns += start.elapsed().as_nanos() as u64;
+                }
                 WEBGL_PHASE.store(PHASE_SWAP_AFTER, Ordering::Relaxed);
                 WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
@@ -1498,9 +1512,13 @@ impl WebGLThread {
                         .requested_flags
                         .contains(ContextAttributeFlags::ALPHA);
                     let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+                    let clear_start = WEBGL_FANOUT_PROF.then(Instant::now);
                     swap_chain
                         .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
                         .unwrap();
+                    if let Some(start) = clear_start {
+                        self.fanout_profile.clear_ns += start.elapsed().as_nanos() as u64;
+                    }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
                 }
 
@@ -1584,10 +1602,21 @@ impl WebGLThread {
             .unwrap_or(0);
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         let profile = &self.fanout_profile;
+        // ★이 스레드가 실제로 바쁜 시간.★ 창 길이와 견주는 것이 요점이다 — 낮으면 캔버스가
+        // 느린 것이 아니라 **아무도 더 그리라고 하지 않는 것**이고, 그러면 원인은 rAF 를 모는
+        // 쪽(월의 패스 속도)에 있지 여기가 아니다.
+        let busy_ns = profile.lock_wait_ns
+            + profile.switch_ns
+            + profile.apply_ns
+            + profile.serialize_ns
+            + profile.swap_sync_ns
+            + profile.swap_ns
+            + profile.clear_ns;
         warn!(
             "WEBGLFANOUT window_ms={:.0} swaps={} ctx={} dev={} cmds={} applies={} \
              switches={} lock_wait_ms={:.1} switch_ms={:.1} apply_ms={:.1} \
-             serialize_ms={:.1} swap_sync_ms={:.1} swap_syncs={}",
+             serialize_ms={:.1} swap_sync_ms={:.1} swap_syncs={} swap_ms={:.1} clear_ms={:.1} \
+             busy_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.swaps,
             self.context_backends.len(),
@@ -1601,6 +1630,9 @@ impl WebGLThread {
             ms(profile.serialize_ns),
             ms(profile.swap_sync_ns),
             profile.swap_syncs,
+            ms(profile.swap_ns),
+            ms(profile.clear_ns),
+            ms(busy_ns),
         );
         self.fanout_profile = FanoutProfile {
             window_start: Some(now),
