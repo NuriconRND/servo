@@ -1043,24 +1043,45 @@ if ($wdog) {
 # produced a negative remainder.
 $split = Select-String -Path $LogPath -Pattern "WALLSPLIT pass_ms=([\d.]+) = make_current=([\d.]+) \+ paint=([\d.]+) \+ present=([\d.]+) \+ outside=(-?[\d.]+)" -EA SilentlyContinue
 if ($split) {
-    $acc = @{ pass = 0.0; mc = 0.0; paint = 0.0; present = 0.0; outside = 0.0 }
+    # ***A run holds two regimes, and averaging them together lies.*** With DComp on, tile
+    # surfaces are redrawn every frame until they get promoted to swapchains a few seconds in;
+    # before that the Commit flush costs ~9.8ms a pass, after it ~0.05ms. A whole-run average
+    # splits the difference and invents an "outside" cost that the steady state does not have.
+    # Reporting the warm-up separately is the whole point.
+    # NOT $rows -- PowerShell variable names are case-insensitive, so $rows IS the script's
+    # own [int] $Rows parameter. Two other blocks in this file carry the same warning and it
+    # still caught a third one here.
+    $warmupWindows = 10
+    $splitRows = @()
+    $i = 0
     foreach ($hit in $split) {
         $g = $hit.Matches[0].Groups
-        $acc.pass += [double]$g[1].Value
-        $acc.mc += [double]$g[2].Value
-        $acc.paint += [double]$g[3].Value
-        $acc.present += [double]$g[4].Value
-        $acc.outside += [double]$g[5].Value
+        $splitRows += [pscustomobject]@{
+            Phase   = if ($i -lt $warmupWindows) { 'warmup' } else { 'steady' }
+            Pass    = [double]$g[1].Value
+            Mc      = [double]$g[2].Value
+            Paint   = [double]$g[3].Value
+            Present = [double]$g[4].Value
+            Outside = [double]$g[5].Value
+        }
+        $i++
     }
-    $w = $split.Count
     Write-Host ""
-    Write-Host "WALLSPLIT -- where one wall pass goes ($w one-second windows, all tiles summed):"
-    Write-Host ("  pass_ms       {0,7:N2}" -f ($acc.pass / $w))
-    Write-Host ("    make_current{0,7:N2}" -f ($acc.mc / $w))
-    Write-Host ("    paint       {0,7:N2}   <- Painter::render for every tile" -f ($acc.paint / $w))
-    Write-Host ("    present     {0,7:N2}" -f ($acc.present / $w))
-    Write-Host ("    outside     {0,7:N2}   <- deferred DComp Commit flush + the loop itself" -f ($acc.outside / $w))
-    Write-Host "  Compare the same page with -DComp on and -DComp off: the line that grows is the one to chase."
+    Write-Host "WALLSPLIT -- where one wall pass goes (per pass, all tiles summed):"
+    foreach ($phase in @('warmup', 'steady')) {
+        $set = @($splitRows | Where-Object { $_.Phase -eq $phase })
+        if ($set.Count -eq 0) { continue }
+        $label = if ($phase -eq 'warmup') { "first $($set.Count)s (DComp: before swapchain promotion)" }
+                 else { "steady state ($($set.Count) windows)" }
+        Write-Host "  $label"
+        Write-Host ("    pass_ms     {0,7:N2}" -f (($set | Measure-Object Pass -Average).Average))
+        Write-Host ("      make_current{0,5:N2}" -f (($set | Measure-Object Mc -Average).Average))
+        Write-Host ("      paint     {0,7:N2}   <- Painter::render for every tile" -f (($set | Measure-Object Paint -Average).Average))
+        Write-Host ("      present   {0,7:N2}" -f (($set | Measure-Object Present -Average).Average))
+        Write-Host ("      outside   {0,7:N2}   <- deferred DComp Commit flush + the loop itself" -f (($set | Measure-Object Outside -Average).Average))
+    }
+    Write-Host "  Compare the same page with -DComp on and -DComp off, STEADY STATE against steady state:"
+    Write-Host "  the line that grows there is the one to chase. Warm-up differences are the promotion cost."
 } elseif ($PresentCadence) {
     Write-Warning "-PresentCadence was set but no WALLSPLIT line was logged. It comes from winit_wall's render pass, so a servoshell run or a run that never painted produces nothing."
 }
