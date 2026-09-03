@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
 use embedder_traits::{
-    InputEvent, InputEventAndId, InputEventId, InputEventResult, PaintHitTestResult,
-    ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
+    EventLoopWaker, InputEvent, InputEventAndId, InputEventId, InputEventResult,
+    PaintHitTestResult, ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
 };
 use euclid::{Point2D, Rect, Scale, Size2D};
 use gleam::gl::RENDERER;
@@ -25,8 +25,9 @@ use paint_api::largest_contentful_paint_candidate::LCPCandidate;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebRenderImageHandlerType, WebViewTrait,
+    ImageUpdate, PaintProxy, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
+    SerializableImageData, WebRenderExternalImageHandlers, WebRenderExternalImageIdManager,
+    WebRenderImageHandlerType, WebViewTrait,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
@@ -35,12 +36,17 @@ use servo_base::Epoch;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::id::{PainterId, PipelineId, WebViewId};
+use servo_canvas_traits::webgl::{WebGLSurfaceId, WebGLThreads};
 use servo_config::debug_env;
 use servo_config::{opts, pref};
 use servo_constellation_traits::{EmbedderToConstellationMessage, PaintMetricEvent};
 use servo_geometry::DeviceIndependentPixel;
 use smallvec::SmallVec;
 use style_traits::CSSPixel;
+use surfman::Device;
+use surfman::chains::SwapChains;
+use webgl::webgl_thread::WebGLContextBusyMap;
+use webgpu::canvas_context::WebGpuExternalImageMap;
 use webrender::{
     MemoryReport, ONE_TIME_USAGE_HINT, RenderApi, ShaderPrecacheFlags, Transaction, UploadMethod,
 };
@@ -435,8 +441,29 @@ impl Drop for Painter {
     }
 }
 
+/// `Painter::new` 이 `Paint` 로부터 필요로 하는 전부. ★모든 필드가 `Send` 다★ —
+/// [`Paint::assert_painter_inputs_are_send`] 가 컴파일 타임에 강제한다.
+///
+/// 왜 `&Paint` 대신 이 묶음인가: 병렬 타일 렌더(A 안)에서 `Painter` 는 **타일 스레드가
+/// 직접 만든다.** 만들어 놓고 옮기는 것은 불가능하다 — `webrender::Renderer` 도
+/// `RenderingContext` 도 `!Send` 이고(설계 §7-3, §3-1), `Paint` 자체도 `Rc` 투성이라
+/// 참조를 스레드로 건넬 수 없다. 그래서 생성에 필요한 것만 `Send` 값으로 떼어낸다.
+///
+/// 지금은 여전히 메인 스레드가 이것을 만들어 넘긴다. 이 단계는 **소유권 경계를 그은 것**
+/// 이지 스레드를 나눈 것이 아니다(설계 §6.2-2).
+pub(crate) struct PainterInputs {
+    pub(crate) webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+    pub(crate) webgl_threads: WebGLThreads,
+    pub(crate) swap_chains: SwapChains<WebGLSurfaceId, Device>,
+    pub(crate) busy_webgl_contexts_map: WebGLContextBusyMap,
+    pub(crate) webgpu_image_map: WebGpuExternalImageMap,
+    pub(crate) embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
+    pub(crate) event_loop_waker: Box<dyn EventLoopWaker>,
+    pub(crate) paint_proxy: PaintProxy,
+}
+
 impl Painter {
-    pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: &Paint) -> Self {
+    pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
         let webrender_gl = rendering_context.gleam_gl_api();
 
         // Make sure the gl context is made current.
@@ -470,16 +497,16 @@ impl Painter {
         }
 
         let painter_id = PainterId::next();
-        let id_manager = paint.webrender_external_image_id_manager();
+        let id_manager = paint.webrender_external_image_id_manager;
         let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));
 
         // Set WebRender external image handler for WebGL textures.
         let image_handler = Box::new(WebGLExternalImages::new(
             painter_id,
-            paint.webgl_threads(),
+            paint.webgl_threads,
             rendering_context.clone(),
-            paint.swap_chains.clone(),
-            paint.busy_webgl_contexts_map.clone(),
+            paint.swap_chains,
+            paint.busy_webgl_contexts_map,
         ));
         external_image_handlers.set_handler(image_handler, WebRenderImageHandlerType::WebGl);
 
@@ -492,7 +519,7 @@ impl Painter {
         #[cfg(feature = "webgpu")]
         external_image_handlers.set_handler(
             Box::new(webgpu::WebGpuExternalImages::new(
-                paint.webgpu_image_map(),
+                paint.webgpu_image_map,
                 rendering_context.clone(),
                 webgpu_painter_luid,
             )),
@@ -504,7 +531,7 @@ impl Painter {
             rendering_context.clone(),
         );
 
-        let embedder_to_constellation_sender = paint.embedder_to_constellation_sender.clone();
+        let embedder_to_constellation_sender = paint.embedder_to_constellation_sender;
         let timer_refresh_driver = LazyCell::default();
         let refresh_driver = Rc::new(BaseRefreshDriver::new(
             paint.event_loop_waker.clone_box(),
@@ -586,7 +613,7 @@ impl Painter {
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
-            Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
+            Box::new(RenderNotifier::new(painter_id, paint.paint_proxy)),
             webrender::WebRenderOptions {
                 compositor_config,
                 // We force the use of optimized shaders here because rendering is broken

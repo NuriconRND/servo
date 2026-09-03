@@ -51,7 +51,7 @@ use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
 use webrender_api::{BuiltDisplayListDescriptor, FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
-use crate::painter::{FrameReadyDiagnostic, Painter};
+use crate::painter::{FrameReadyDiagnostic, Painter, PainterInputs};
 use crate::webview_renderer::UnknownWebView;
 
 /// How long the barrier waits for the remaining tiles after the first one is ready.
@@ -1068,7 +1068,7 @@ impl Paint {
             return painter_id;
         }
 
-        let painter = Painter::new(rendering_context.clone(), self);
+        let painter = Painter::new(rendering_context.clone(), self.painter_inputs());
         if let Some(gpu_index) = rendering_context.requested_gpu_index() {
             debug!(
                 "Registering painter {:?} with requested target GPU index {gpu_index}",
@@ -1662,6 +1662,36 @@ impl Paint {
 
     pub fn rendering_context_size(&self, painter_id: PainterId) -> Size2D<u32, DevicePixel> {
         self.painter(painter_id).rendering_context.size2d()
+    }
+
+    /// ★병렬 타일 렌더(A 안) 2 단계의 컴파일 타임 관문.★
+    ///
+    /// A 안은 `Painter` 를 타일 스레드가 소유한다. `Painter::new` 는 `&Paint` 에서 여덟 가지를
+    /// 읽는데, 그것들이 전부 `Send` 여야 타일 스레드가 `Painter` 를 **직접 만들** 수 있다
+    /// (만들어 놓고 옮기는 것은 안 된다 — `webrender::Renderer` 도 `RenderingContext` 도
+    /// `!Send` 다. 설계 §7-3, §3-1).
+    ///
+    /// 눈으로 하나씩 따지는 대신 컴파일러가 판정하게 두고, 남겨서 회귀를 막는다 — 여기에
+    /// `Rc` 를 하나 끼워 넣는 변경이 들어오면 A 안이 조용히 깨지는 대신 빌드가 깨진다.
+    /// 호출되지 않는다. 존재 자체가 검사다.
+    #[allow(dead_code)]
+    fn assert_painter_inputs_are_send(&self) {
+        fn require_send<T: Send>(_value: &T) {}
+        require_send(&self.painter_inputs());
+    }
+
+    /// [`Painter::new`] 이 필요로 하는 것 전부를 `Send` 값으로 떼어낸다.
+    fn painter_inputs(&self) -> PainterInputs {
+        PainterInputs {
+            webrender_external_image_id_manager: self.webrender_external_image_id_manager(),
+            webgl_threads: self.webgl_threads(),
+            swap_chains: self.swap_chains.clone(),
+            busy_webgl_contexts_map: self.busy_webgl_contexts_map.clone(),
+            webgpu_image_map: self.webgpu_image_map(),
+            embedder_to_constellation_sender: self.embedder_to_constellation_sender.clone(),
+            event_loop_waker: self.event_loop_waker.clone_box(),
+            paint_proxy: self.paint_proxy.clone(),
+        }
     }
 
     pub fn webgl_threads(&self) -> WebGLThreads {
