@@ -298,7 +298,29 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
       `ScreenshotRequestPhase::WaitingOnPipelineDisplayLists(Rc<..>)` 를 들고 있어 별도
       하위 과제다. **경계를 통째로 내리는 대신 예외에 이름을 붙였다** — 이 함수를 쓰는 곳이
       늘면 그만큼 A 안에서 멀어진다는 뜻이고, 이름이 그것을 말한다.
-   3. `painters: Vec<Rc<RefCell<Painter>>>` 를 스레드 핸들 목록으로 교체.
+   3. ~~`painters: Vec<Rc<RefCell<Painter>>>` 를 스레드 핸들 목록으로 교체.~~
+      **완료(2026-09-03).** `PainterHost` 가 `Inline` / `Threaded` 로 갈리고, 스레드 경로는
+      pref `gfx_wall_parallel_tiles`(런처 `-ParallelTiles`, 기본 off) 뒤에 있다.
+
+      ### ★실기 확인 (`log_webgpu/67`)★
+
+      네 타일 모두 캔버스 출력, 격리 디바이스 8 개(painter 4 + WebGL 백엔드 4),
+      `missing swap chain` 0, 논리 프레임 **21.4/s** — 직렬 기준선 22.1/s 와 같다.
+      ★아직 팬아웃이 아니라 타일당 블로킹 왕복이므로 이득이 없는 것이 정상이다.★
+      스레드화 자체가 안전하고 비용이 없다는 것이 이것으로 확인됐다.
+
+      ### 여기까지 오며 걸린 함정 (같은 자리에 다시 빠지지 말 것)
+
+      **★`create_webgl_context` 는 surfman 상세가 없는 painter 를 조용히 걸러낸다★**
+      (`webgl_thread.rs`). 그 상세는 `Paint::register_rendering_context` 만 채우는데 스레드
+      타일은 그 경로를 지나지 않는다. 넷이 들어가 하나만 남아 세 타일이 캔버스를 못 받았고,
+      화면에는 "그 타일만 캔버스 없음" 으로만 보였다. ★그 침묵 때문에 원인을 두 번 잘못
+      짚었다★(`log_webgpu/64`~`66`: 처음엔 등록 순서, 다음엔 로드 시점). 지금은 타일 스레드가
+      자기 상세를 `Painter` 생성 전에 등록하고, 필터도 걸러낼 때 말한다.
+
+      교훈: **팬아웃 대상 목록은 양쪽 끝에서 찍어라.** `PAINTTARGETS`(Paint 가 답한 것)와
+      `WEBGLTARGETS`(WebGL 스레드가 받은 것)를 나란히 보고 나서야 "목록은 처음부터 옳았다"가
+      드러났고, 그제야 아래를 볼 수 있었다.
 4. **`present()` 를 타일 스레드로** — 리사이즈/DComp 재구축과의 조율이 여기 있다.
 5. **직렬 경로 제거** — `render_all_tiles` 를 fan-out/join 으로 대체.
 
