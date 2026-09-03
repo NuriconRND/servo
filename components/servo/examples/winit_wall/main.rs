@@ -464,8 +464,41 @@ impl AppState {
             0
         };
         self.pass_counter.set(self.pass_counter.get().wrapping_add(1));
+
+        // ★자기 스레드를 가진 타일은 먼저 전부 발사한다.★ 그래야 그것들이 도는 동안 아래
+        // 루프가 primary 타일을 그리고, 마지막에 한 번만 기다린다. 발사하고 곧장 기다리면
+        // primary 는 그 뒤에 혼자 남아 겹치지 않는다 — 그러면 팬아웃의 이득이 절반이 된다.
+        //
+        // 배리어는 여기서도 그대로다: keep-previous 로 표시된 타일은 **아예 보내지 않는다**.
+        // 판정을 메인에서 미리 하는 것이 설계 §3 의 결론이다(타일이 배리어를 볼 필요가 없다).
+        let mut dispatched = vec![false; self.tiles.len()];
+        let in_flight = {
+            let mut targets = Vec::new();
+            for (index, tile) in self.tiles.iter().enumerate() {
+                let (Some(target), None) = (tile.paint_target.get(), &tile.rendering_context)
+                else {
+                    continue;
+                };
+                if webview
+                    .paint_target_keep_previous_logical_frame(target)
+                    .is_some()
+                {
+                    skipped += 1;
+                    dispatched[index] = true;
+                    continue;
+                }
+                targets.push(target);
+                dispatched[index] = true;
+            }
+            (!targets.is_empty()).then(|| webview.dispatch_paint_targets(&targets))
+        };
+
         for step in 0..count {
             let tile_index = (offset + step) % count;
+            // 이미 발사한 타일은 여기서 다시 그리지 않는다(배리어로 건너뛴 것도 포함).
+            if dispatched[tile_index] {
+                continue;
+            }
             let tile = &self.tiles[tile_index];
             let tile_start = std::time::Instant::now();
             match tile.paint_target.get() {
@@ -530,6 +563,13 @@ impl AppState {
         // 이 한 줄이 실험의 전부다: 지금까지 render→commit 이 타일마다 번갈아 돌았는데,
         // 이제 렌더 넷이 먼저 끝나고 Commit 넷이 몰려 나간다. 패스 시간이 줄면 Commit 의
         // 대기는 겹칠 수 있다는 뜻이고, 그대로면 DWM 이 직렬화한다는 뜻이다.
+        // 발사해 둔 타일들을 여기서 기다린다 — primary 를 그리는 동안 나란히 돌았다.
+        // ★반드시 Commit 플러시보다 먼저다★: 그 타일들의 `end_frame` 이 아직 안 끝났으면
+        // 미뤄 둔 Commit 도 아직 없다.
+        if let Some(in_flight) = in_flight {
+            in_flight.join();
+        }
+
         webview.flush_deferred_dcomp_commits();
         self.note_render_pass(
             pass_start.elapsed().as_secs_f64() * 1000.0,

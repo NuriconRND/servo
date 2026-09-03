@@ -223,6 +223,25 @@ enum PainterHostKind {
     Threaded(ThreadedPainter),
 }
 
+/// 아직 끝나지 않은 타일 렌더들. [`Paint::dispatch_paint_targets`] 가 돌려준다.
+///
+/// ★들고 있는 동안 그 타일들이 나란히 돈다.★ 떨어뜨리면(`join` 없이) 결과를 안 기다리는
+/// 것이 되는데, 그러면 다음 패스가 이전 패스와 겹쳐 버리므로 반드시 `join` 할 것.
+pub struct PaintTargetsInFlight {
+    in_flight: Vec<crossbeam_channel::Receiver<()>>,
+}
+
+impl PaintTargetsInFlight {
+    /// 발사해 둔 타일들이 전부 끝나기를 기다린다.
+    pub fn join(self) {
+        for done in self.in_flight {
+            // 스레드가 죽었으면 `Err` 다. 그때는 기다릴 것이 없다 — 그 사실은 요청을 보낼 때
+            // 이미 경고했다.
+            let _ = done.recv();
+        }
+    }
+}
+
 /// 타일 스레드로 일을 보내는 손잡이.
 struct ThreadedPainter {
     requests: Sender<PainterRequest>,
@@ -257,6 +276,18 @@ impl ThreadedPainter {
         &self,
         callback: impl FnOnce(&mut Painter) -> R + Send + 'static,
     ) -> Option<R> {
+        self.dispatch(callback)?.recv().ok()
+    }
+
+    /// 일을 보내고 **기다리지 않는다.** 결과는 돌려받은 수신구로 나중에 받는다.
+    ///
+    /// ★팬아웃이 이득을 내는 지점이 여기다.★ 한 패스의 대부분이 타일마다의 `AcquireSync`
+    /// 대기인데, 그 대기는 타일별·GPU별이라 서로 겹칠 수 있다. 보내고 바로 다음 타일을
+    /// 보내면 네 번의 대기가 나란히 흐르고, 패스는 합이 아니라 **최댓값**이 된다.
+    fn dispatch<R: Send + 'static>(
+        &self,
+        callback: impl FnOnce(&mut Painter) -> R + Send + 'static,
+    ) -> Option<crossbeam_channel::Receiver<R>> {
         let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
         let request = PainterRequest::Run(Box::new(move |painter| {
             let _ = result_sender.send(callback(painter));
@@ -265,7 +296,7 @@ impl ThreadedPainter {
             warn!("Painter thread is gone; dropping a request for it");
             return None;
         }
-        result_receiver.recv().ok()
+        Some(result_receiver)
     }
 }
 
@@ -2653,6 +2684,64 @@ impl Paint {
             painter.render(&time_profiler_chan)
         })
         .expect("painter_id not found");
+    }
+
+    /// 여러 paint target 을 **한꺼번에 보내고**, 아직 기다리지 않는다.
+    ///
+    /// 자기 스레드를 가진 타일은 발사되어 곧장 그리기 시작하고, 메인에 있는 타일은 그
+    /// 자리에서 그린다. 돌려받은 토큰을 [`PaintTargetsInFlight::join`] 할 때까지 스레드
+    /// 타일들은 나란히 돈다 — 호출자는 그 사이에 **자기 일(예: primary 타일)** 을 할 수 있고,
+    /// 그것이 이 두 단계 API 의 존재 이유다. 한 번에 보내고 바로 기다리면 primary 는 겹치지
+    /// 못한다.
+    ///
+    /// 등록되지 않은 target 은 조용히 건너뛰지 않고 경고한다(기존 `render_paint_target` 과
+    /// 같은 판정).
+    pub fn dispatch_paint_targets(
+        &self,
+        webview_id: WebViewId,
+        painter_ids: &[PainterId],
+    ) -> PaintTargetsInFlight {
+        let registered = self.painter_targets_for_webview(webview_id);
+        let mut in_flight = Vec::new();
+        let mut inline_painter_ids = Vec::new();
+
+        for &painter_id in painter_ids {
+            if !registered.contains(&painter_id) {
+                warn!(
+                    "Ignoring render for unregistered paint target {painter_id:?} of {webview_id:?}"
+                );
+                continue;
+            }
+            let Some(host) = self
+                .painters
+                .iter()
+                .find(|host| host.painter_id == painter_id)
+            else {
+                continue;
+            };
+            match &host.kind {
+                PainterHostKind::Threaded(threaded) => {
+                    let time_profiler_chan = self.time_profiler_chan.clone();
+                    if let Some(done) =
+                        threaded.dispatch(move |painter| painter.render(&time_profiler_chan))
+                    {
+                        in_flight.push(done);
+                    }
+                },
+                // 메인에 있는 타일은 발사할 곳이 없다. 스레드들이 이미 돌기 시작한 뒤에
+                // 그리도록 **모아 두었다가 아래에서** 실행한다.
+                PainterHostKind::Inline(_) => inline_painter_ids.push(painter_id),
+            }
+        }
+
+        for painter_id in inline_painter_ids {
+            let time_profiler_chan = self.time_profiler_chan.clone();
+            self.with_painter_mut(painter_id, move |painter| {
+                painter.render(&time_profiler_chan)
+            });
+        }
+
+        PaintTargetsInFlight { in_flight }
     }
 
     /// Render one registered paint target for the given logical `WebView`.

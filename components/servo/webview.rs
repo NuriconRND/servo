@@ -20,7 +20,7 @@ use embedder_traits::{
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use log::debug;
-use paint::RenderingContextFactory;
+use paint::{PaintTargetsInFlight, RenderingContextFactory};
 use paint_api::WebViewTrait;
 use paint_api::rendering_context::RenderingContext;
 use servo_base::Epoch;
@@ -758,6 +758,19 @@ impl WebView {
             viewport_origin,
         )?;
         Some(WebViewPaintTarget { painter_id })
+    }
+
+    /// 여러 paint target 에 **한꺼번에 그리라고 보내고**, 아직 기다리지 않는다.
+    ///
+    /// 자기 스레드를 가진 타일들은 나란히 돌기 시작한다. 돌려받은 토큰을 `join` 하기 전까지
+    /// 호출자는 자기 일을 할 수 있고 — 이 셸에서는 primary 타일을 그리는 일이다 — 그래야
+    /// primary 도 겹친다. 보내고 곧장 기다리면 primary 는 그 뒤에 혼자 남는다.
+    pub fn dispatch_paint_targets(&self, targets: &[WebViewPaintTarget]) -> PaintTargetsInFlight {
+        let painter_ids: Vec<_> = targets.iter().map(|target| target.painter_id).collect();
+        self.inner()
+            .servo
+            .paint()
+            .dispatch_paint_targets(self.id(), &painter_ids)
     }
 
     /// Paint the contents of this [`WebView`] into one registered paint target.

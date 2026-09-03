@@ -16,7 +16,9 @@ use servo_constellation_traits::EmbedderToConstellationMessage;
 #[cfg(feature = "webxr")]
 use webxr::WebXrRegistry;
 
-pub use crate::paint::{Paint, RenderingContextFactory, WebRenderDebugOption};
+pub use crate::paint::{
+    Paint, PaintTargetsInFlight, RenderingContextFactory, WebRenderDebugOption,
+};
 
 #[macro_use]
 mod tracing;
