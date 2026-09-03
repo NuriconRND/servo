@@ -257,6 +257,22 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
       루프를 돌았는데, **키 하나마다 왕복하는 형태를 남겨 두지 않으려고** 배치 전체를 한 번의
       `with_painter` 안에서 만들도록 바꿨다.
    2. 그 API 의 구현만 채널 왕복으로 바꾼다 — 제어 경로는 블로킹, 매 프레임 경로는 팬아웃/조인.
+
+      ### ★2026-09-03: 컴파일러에게 미리 물어본 결과★
+
+      `with_painter*` 의 클로저에 `Send + 'static` 을 걸어 보면(4 줄 변경) **무엇이 스레드를
+      못 건너는지 전부 나온다.** 실측: 서로 다른 호출 지점 **33 곳, `E0277` 31 건.**
+      추측하지 말고 이 실험을 다시 돌려 목록을 뽑을 것 — 되돌리기도 4 줄이다.
+
+      갈래는 둘이고, **일의 성격이 완전히 다르다**:
+
+      | 갈래 | 정체 | 성격 |
+      |---|---|---|
+      | **A. 클로저가 `&self` 를 캡처** | `RefCell<HashMap<..>>`, `Cell<u64>`, `Rc<RefCell<Painter>>`, `Rc<Cell<ShutdownState>>`, `RefCell<WallFrameCoordinator>`, `OnceCell<..>`, `RefCell<MessageReader>` … 전부 `Paint` 필드다. 클로저가 `self.time_profiler_chan` 같은 것 **하나**를 쓰면 `Paint` 전체가 딸려 들어온다 | 기계적. **메인에서 계산해 소유 데이터만 넘기는** 형태로 재구성. 스레드에서는 클로저가 `Paint` 를 만질 수 **없으므로** 어차피 해야 하는 일이다 |
+      | **B. 페이로드 자체가 비-Send** | `dyn WebViewTrait`(→ `add_webview`), 스크린샷 콜백 `dyn FnOnce(Result<ImageBuffer, ..>)`, 브로드캐스트 헬퍼의 `impl FnMut(&mut Painter)` | ★설계 결정★. 앞의 둘은 **libservo 공개 트레이트 경계에 `Send` 를 요구**하므로 servoshell·예제까지 파급된다. 셋째는 `Fn + Send + Clone` 으로 바꿔 painter 마다 클론하면 된다 |
+
+      ★B 를 먼저 정해야 A 를 끝낼 수 있다★ — A 를 다 고쳐도 B 가 남으면 경계를 켤 수 없고,
+      경계를 못 켜면 A 가 실제로 스레드를 건널 수 있는지 검증할 방법이 없다.
    3. `painters: Vec<Rc<RefCell<Painter>>>` 를 스레드 핸들 목록으로 교체.
 4. **`present()` 를 타일 스레드로** — 리사이즈/DComp 재구축과의 조율이 여기 있다.
 5. **직렬 경로 제거** — `render_all_tiles` 를 fan-out/join 으로 대체.
