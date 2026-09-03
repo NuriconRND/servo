@@ -2137,7 +2137,15 @@ impl Paint {
                 }
             },
             PaintMessage::GetWebViewPainterTargets(webview_id, sender) => {
-                let _ = sender.send(self.painter_targets_for_webview(webview_id));
+                let targets = self.painter_targets_for_webview(webview_id);
+                // 질문과 답을 양쪽에서 볼 수 있어야 한다 — WebGL 팬아웃 대상이 이 답으로
+                // **고정**되므로(`WEBGLTARGETS` 참고), 짧게 답하면 빠진 타일은 캔버스를
+                // 영영 못 받는다. 이 줄이 없으면 "누가 짧게 답했나" 를 추론해야 한다.
+                warn!(
+                    "PAINTTARGETS: answering {webview_id:?} with {} painter(s): {targets:?}",
+                    targets.len()
+                );
+                let _ = sender.send(targets);
             },
             PaintMessage::GenerateImageKey(webview_id, result_sender) => {
                 self.handle_generate_image_key(webview_id, result_sender);

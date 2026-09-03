@@ -516,9 +516,16 @@ impl WebGLThread {
                 attributes,
                 result_sender,
             ) => {
-                debug!(
-                    "Creating WebGL context for primary painter {:?}; target painters {:?}",
-                    painter_id, target_painter_ids
+                // ★`warn!` 이다★ — 팬아웃 대상은 여기서 **고정**되고, 목록이 짧으면 빠진
+                // 타일은 그 캔버스를 영영 못 받는다(그 증상이 "missing swap chain" 홍수와
+                // 캔버스 없는 타일이다, 2026-09-03 `log_webgpu/64`~`65`). 그 목록이 무엇이었는지
+                // 추론하지 않고 볼 수 있어야 한다. 컨텍스트당 한 줄이라 비용도 없다.
+                warn!(
+                    "WEBGLTARGETS: creating context for primary painter {:?} with {} target \
+                     painter(s): {:?}",
+                    painter_id,
+                    target_painter_ids.len(),
+                    target_painter_ids
                 );
                 let result = self.create_webgl_context(
                     painter_id,
