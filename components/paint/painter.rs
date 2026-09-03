@@ -280,6 +280,10 @@ pub(crate) struct Painter {
     /// A large gap since this instant at the START of a render means the stall happened
     /// upstream of the renderer (no render was requested at all), as opposed to a slow render
     /// pass itself, which is logged separately as "Slow paint frame".
+    /// `Paint` 로 되돌아가는 통로. `WebViewRenderer` 가 애니메이션 상태 통보를 여기로 보낸다
+    /// — 예전에는 `Box<dyn WebViewTrait>` 를 직접 들고 불렀다(설계 §3.2).
+    paint_proxy: PaintProxy,
+
     last_render_end: Cell<Option<Instant>>,
 
     /// 이 painter 가 스크립트의 캔버스 ack 를 붙잡기 시작한 시각, 그리고 마지막 보고 시각.
@@ -612,7 +616,7 @@ impl Painter {
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
-            Box::new(RenderNotifier::new(painter_id, paint.paint_proxy)),
+            Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
             webrender::WebRenderOptions {
                 compositor_config,
                 // We force the use of optimized shaders here because rendering is broken
@@ -733,6 +737,7 @@ impl Painter {
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
             present_cadence_max_gap_ms: Default::default(),
+            paint_proxy: paint.paint_proxy,
             last_render_end: Default::default(),
             canvas_ack_held_since: Default::default(),
             canvas_ack_last_report: Default::default(),
@@ -2739,14 +2744,15 @@ impl Painter {
 
     pub(crate) fn add_webview(
         &mut self,
-        webview: Box<dyn WebViewTrait>,
+        webview_id: WebViewId,
         viewport_details: ViewportDetails,
         viewport_origin: DeviceVector2D,
     ) {
         self.webview_renderers
-            .entry(webview.id())
+            .entry(webview_id)
             .or_insert(WebViewRenderer::new(
-                webview,
+                webview_id,
+                self.paint_proxy.clone(),
                 viewport_details,
                 viewport_origin,
                 self.embedder_to_constellation_sender.clone(),

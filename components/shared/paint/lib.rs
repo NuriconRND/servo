@@ -178,6 +178,18 @@ impl PaintProxy {
 pub enum PaintMessage {
     /// Alerts `Paint` that the given pipeline has changed whether it is running animations.
     ChangeRunningAnimationsState(WebViewId, PipelineId, AnimationState),
+    /// Tell the embedder whether this `WebView` has animating content.
+    ///
+    /// ★`WebViewRenderer` 가 `Box<dyn WebViewTrait>` 를 직접 들고 부르던 것을 메시지로 바꾼
+    /// 것이다.★ 그 트레이트 객체는 `Weak<RefCell<..>>` 기반이라 `Send` 가 될 수 없는데,
+    /// 병렬 타일 렌더에서 `WebViewRenderer` 는 타일 스레드에 산다. 실제로 쓰던 메서드가
+    /// `set_animating` 하나뿐이고 반환값도 없어(`id` 는 따로 들고 있고 `screen_geometry` 는
+    /// paint 에서 한 번도 불리지 않는다) 통보 하나만 남기면 된다
+    /// (`docs/multigpu/parallel_tile_render_design.md` §3.2).
+    ///
+    /// paint 내부 판정은 그대로 `WebViewRenderer::animating()` **필드**를 쓴다 — 이 메시지는
+    /// 순수히 바깥(임베더 델리게이트)으로 나가는 통지이므로 한 홉 늦어도 판정이 흔들리지 않는다.
+    SetWebViewAnimating(WebViewId, bool),
     /// Updates the frame tree for the given webview.
     SetFrameTreeForWebView(WebViewId, SendableFrameTree),
     /// Set whether to use less resources by stopping animations.

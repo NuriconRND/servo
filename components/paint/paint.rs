@@ -115,6 +115,12 @@ pub struct Paint {
     next_logical_frame_id: Cell<u64>,
 
     /// Software barrier diagnostics for wall frames that fan out to multiple paint targets.
+    /// 임베더 쪽 `WebView` 핸들. ★메인 스레드 전용이다★ — `Weak<RefCell<..>>` 기반이라
+    /// `Send` 가 아니고, 그래서 `Painter`/`WebViewRenderer` 에는 넘기지 않는다. 그쪽은
+    /// `PaintMessage::SetWebViewAnimating` 으로 통보만 보내고 이 표를 거쳐 실제 호출이
+    /// 일어난다(설계 §3.2).
+    webviews: RefCell<HashMap<WebViewId, Box<dyn WebViewTrait>>>,
+
     wall_frame_coordinator: RefCell<WallFrameCoordinator>,
 
     /// Wall frame pacing policy used to avoid stacking stale logical frames while a
@@ -1042,6 +1048,7 @@ impl Paint {
             webgpu_image_map: Default::default(),
             webview_painter_targets: Default::default(),
             next_logical_frame_id: Default::default(),
+            webviews: Default::default(),
             wall_frame_coordinator: RefCell::new(WallFrameCoordinator::from_environment()),
             wall_frame_pacing_config: WallFramePacingConfig::from_prefs(),
             coalesced_wall_frame_requests: Default::default(),
@@ -1162,6 +1169,9 @@ impl Paint {
     }
 
     fn remove_webview_painter_targets(&self, webview_id: WebViewId) -> Vec<PainterId> {
+        // 임베더 핸들도 같이 놓아준다 — 안 그러면 `WebView` 가 사라진 뒤에도 이 표가
+        // 마지막 참조를 붙들고 있게 된다.
+        self.webviews.borrow_mut().remove(&webview_id);
         self.webview_painter_targets
             .borrow_mut()
             .remove(&webview_id)
@@ -1821,6 +1831,12 @@ impl Paint {
             PaintMessage::CollectMemoryReport(sender) => {
                 self.collect_memory_report(sender);
             },
+            PaintMessage::SetWebViewAnimating(webview_id, animating) => {
+                // 트레이트 객체는 메인(여기)에만 있다. painter 스레드는 통보만 보낸다.
+                if let Some(webview) = self.webviews.borrow().get(&webview_id) {
+                    webview.set_animating(animating);
+                }
+            },
             PaintMessage::ChangeRunningAnimationsState(
                 webview_id,
                 pipeline_id,
@@ -2218,10 +2234,11 @@ impl Paint {
         viewport_origin: DeviceVector2D,
     ) {
         let webview_id = webview.id();
+        self.webviews.borrow_mut().insert(webview_id, webview);
         let painter_id: PainterId = webview_id.into();
         self.register_webview_painter_target(webview_id, painter_id);
         self.with_painter_mut(painter_id, |painter| {
-            painter.add_webview(webview, viewport_details, viewport_origin)
+            painter.add_webview(webview_id, viewport_details, viewport_origin)
         })
         .expect("painter_id not found");
     }
@@ -2234,10 +2251,11 @@ impl Paint {
         viewport_origin: DeviceVector2D,
     ) -> PainterId {
         let webview_id = webview.id();
+        self.webviews.borrow_mut().insert(webview_id, webview);
         let painter_id = self.register_rendering_context(rendering_context);
         self.register_webview_painter_target(webview_id, painter_id);
         self.with_painter_mut(painter_id, |painter| {
-            painter.add_webview(webview, viewport_details, viewport_origin)
+            painter.add_webview(webview_id, viewport_details, viewport_origin)
         })
         .expect("painter_id not found");
         painter_id

@@ -19,7 +19,7 @@ use paint_api::display_list::ScrollType;
 use paint_api::viewport_description::{
     DEFAULT_PAGE_ZOOM, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM, ViewportDescription,
 };
-use paint_api::{PipelineExitSource, SendableFrameTree, WebViewTrait};
+use paint_api::{PaintMessage, PaintProxy, PipelineExitSource, SendableFrameTree};
 use rustc_hash::FxHashMap;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_constellation_traits::{
@@ -77,14 +77,18 @@ pub(crate) enum PinchZoomResult {
 
 /// A renderer for a libservo `WebView`. This is essentially the [`ServoRenderer`]'s interface to a
 /// libservo `WebView`, but the code here cannot depend on libservo in order to prevent circular
-/// dependencies, which is why we store a `dyn WebViewTrait` here instead of the `WebView` itself.
+/// dependencies, which is why the embedder-facing side is a message rather than the `WebView`.
 pub(crate) struct WebViewRenderer {
     /// The [`WebViewId`] of the `WebView` associated with this [`WebViewDetails`].
     pub id: WebViewId,
     /// The renderer's view of the embedding layer `WebView` as a trait implementation,
     /// so that the renderer doesn't need to depend on the embedding layer. This avoids
     /// a dependency cycle.
-    pub webview: Box<dyn WebViewTrait>,
+    /// 임베더에 애니메이션 상태를 알리는 통로. ★예전에는 `Box<dyn WebViewTrait>` 를 직접
+    /// 들고 있었다★ — 그 객체는 `Weak<RefCell<..>>` 기반이라 `Send` 가 아니고, 병렬 타일
+    /// 렌더에서 이 구조체는 타일 스레드에 산다. 실제로 쓰던 것이 `set_animating` 하나뿐이라
+    /// 그 통보만 남겼다(설계 §3.2). 트레이트 객체는 `Paint` 가 메인에서 계속 소유한다.
+    pub paint_proxy: PaintProxy,
     /// The root [`PipelineId`] of the currently displayed page in this WebView.
     pub root_pipeline_id: Option<PipelineId>,
     /// The rectangle of the [`WebView`] in device pixels, which is the viewport.
@@ -131,7 +135,8 @@ pub(crate) struct WebViewRenderer {
 
 impl WebViewRenderer {
     pub(crate) fn new(
-        renderer_webview: Box<dyn WebViewTrait>,
+        webview_id: WebViewId,
+        paint_proxy: PaintProxy,
         viewport_details: ViewportDetails,
         viewport_origin: DeviceVector2D,
         embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
@@ -141,10 +146,9 @@ impl WebViewRenderer {
         let hidpi_scale_factor = viewport_details.hidpi_scale_factor;
         let size = viewport_details.size * viewport_details.hidpi_scale_factor;
         let rect = DeviceRect::from_origin_and_size(DevicePoint::origin(), size);
-        let webview_id = renderer_webview.id();
         Self {
             id: webview_id,
-            webview: renderer_webview,
+            paint_proxy,
             root_pipeline_id: None,
             rect,
             viewport_origin,
@@ -353,7 +357,8 @@ impl WebViewRenderer {
 
     fn update_animation_state(&mut self) {
         self.animating = self.pipelines.values().any(PipelineDetails::animating);
-        self.webview.set_animating(self.animating());
+        self.paint_proxy
+            .send(PaintMessage::SetWebViewAnimating(self.id, self.animating()));
     }
 
     pub(crate) fn for_each_connected_pipeline(&self, callback: &mut impl FnMut(&PipelineDetails)) {
