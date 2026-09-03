@@ -56,6 +56,68 @@ pub(crate) fn create_tile_windows(
     have_topology: bool,
     vsync_driver: Option<Rc<dyn servo::RefreshDriver>>,
 ) -> Vec<TileWindow> {
+    let plans = plan_tile_windows(event_loop, layout, tile_indices, spatial, have_topology);
+    plans
+        .into_iter()
+        .map(|plan| bind_context(plan, display_handle, vsync_driver.clone()))
+        .collect()
+}
+
+/// 창과 그 창이 쓸 GPU 까지만 정해 둔 것. ★컨텍스트는 아직 없다.★
+///
+/// 창 생성과 컨텍스트 생성을 가른 이유가 둘이다. (1) A 안에서 컨텍스트는 **타일 스레드가**
+/// 만들어야 하는데(surfman `Device` 는 스레드 로컬), 창은 메인 스레드에서만 만들 수 있다.
+/// (2) [`run_tile_thread_spike`] 가 그 전제를 시험하려면 컨텍스트가 **아직 없는** 창이 필요하다
+/// — 이미 컨텍스트가 붙은 HWND 에 두 번째를 만들면 `-DComp on` 에서는 HWND 당 DComp 타깃이
+/// 하나뿐이라 실패하고, 그 실패가 "스레드 때문" 으로 오독된다.
+pub(crate) struct TilePlan {
+    pub(crate) window: Window,
+    pub(crate) gpu_index: Option<usize>,
+    pub(crate) tile_index: usize,
+}
+
+fn bind_context(
+    plan: TilePlan,
+    display_handle: DisplayHandle,
+    vsync_driver: Option<Rc<dyn servo::RefreshDriver>>,
+) -> TileWindow {
+    let TilePlan {
+        window, gpu_index, ..
+    } = plan;
+    let window_handle = window.window_handle().expect("Failed to get window handle");
+    #[cfg(target_os = "windows")]
+    let rendering_context_result =
+        WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
+            display_handle,
+            window_handle,
+            window.inner_size(),
+            vsync_driver,
+            gpu_index,
+        );
+    #[cfg(not(target_os = "windows"))]
+    let rendering_context_result = WindowRenderingContext::new_with_target_gpu(
+        display_handle,
+        window_handle,
+        window.inner_size(),
+        gpu_index,
+    );
+    let rendering_context: Rc<dyn RenderingContext> = Rc::new(
+        rendering_context_result.expect("Could not create RenderingContext for tile window"),
+    );
+    TileWindow {
+        window,
+        rendering_context,
+        paint_target: Cell::new(None),
+    }
+}
+
+fn plan_tile_windows(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+    layout: &WallLayout,
+    tile_indices: &[usize],
+    spatial: &[DisplayTopology],
+    have_topology: bool,
+) -> Vec<TilePlan> {
     let mut tiles = Vec::new();
     for &tile_index in tile_indices {
         let tile = &layout.tiles[tile_index];
@@ -163,32 +225,155 @@ pub(crate) fn create_tile_windows(
             }
         }
 
-        let window_handle = window.window_handle().expect("Failed to get window handle");
-        #[cfg(target_os = "windows")]
-        let rendering_context_result =
-            WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
-                display_handle,
-                window_handle,
-                window.inner_size(),
-                vsync_driver.clone(),
-                gpu_index,
-            );
-        #[cfg(not(target_os = "windows"))]
-        let rendering_context_result = WindowRenderingContext::new_with_target_gpu(
-            display_handle,
-            window_handle,
-            window.inner_size(),
-            gpu_index,
-        );
-        let rendering_context: Rc<dyn RenderingContext> = Rc::new(
-            rendering_context_result.expect("Could not create RenderingContext for tile window"),
-        );
-
-        tiles.push(TileWindow {
+        tiles.push(TilePlan {
             window,
-            rendering_context,
-            paint_target: Cell::new(None),
+            gpu_index,
+            tile_index,
         });
     }
     tiles
+}
+
+/// ★병렬 타일 렌더(A 안) 1 단계의 관문★: 타일 스레드가 자기 `RenderingContext` 를 **직접
+/// 만들고 current 로 삼을 수 있는가**. 여기서 깨지면 A 안은 설계대로 성립하지 않는다
+/// (`docs/multigpu/parallel_tile_render_design.md` §6.2-1).
+///
+/// 왜 "절반만 배선" 이 아니라 스파이크인가: surfman `Device` 는 스레드 로컬이라(설계 §3-1)
+/// 만든 스레드가 소멸까지 소유해야 한다. 메인이 만든 컨텍스트를 워커가 쓸 수 없고 그 반대도
+/// 안 되므로, 본 경로를 그대로 둔 채 답을 얻으려면 **본 경로 대신** 워커에서 만들어 보고
+/// 끝내는 수밖에 없다. 그래서 이 함수는 성공/실패만 보고하고 호출자는 종료한다.
+///
+/// 창은 메인 스레드가 만들고 **HWND 만** 넘긴다(설계 §6.1) — winit `Window` 는 옮기지
+/// 않는다. 그래서 스레드로 건너가는 것은 정수 두 개뿐이다.
+/// 창만 만들어 [`run_tile_thread_spike`] 에 넘긴다. ★컨텍스트는 메인 스레드에서 한 번도
+/// 만들지 않는다★ — 그래야 워커의 실패가 스레드 탓인지 HWND 재사용 탓인지 헷갈리지 않는다.
+#[cfg(target_os = "windows")]
+pub(crate) fn plan_and_run_tile_thread_spike(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+    layout: &WallLayout,
+    tile_indices: &[usize],
+    spatial: &[DisplayTopology],
+    have_topology: bool,
+) -> bool {
+    let plans = plan_tile_windows(event_loop, layout, tile_indices, spatial, have_topology);
+    run_tile_thread_spike(&plans, layout)
+}
+
+#[cfg(target_os = "windows")]
+fn run_tile_thread_spike(plans: &[TilePlan], layout: &WallLayout) -> bool {
+    use std::num::NonZeroIsize;
+
+    use winit::raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+    };
+
+    // GL_VENDOR / GL_RENDERER. `gleam` 은 이 예제의 직접 의존이 아니라 상수를 이름으로 쓸 수
+    // 없다 — 반환된 트레이트 객체의 메서드는 그대로 부를 수 있다.
+    const GL_VENDOR: u32 = 0x1F00;
+    const GL_RENDERER: u32 = 0x1F01;
+
+    let mut workers = Vec::new();
+    for plan in plans {
+        let tile_index = plan.tile_index;
+        let raw = match plan.window.window_handle() {
+            Ok(handle) => handle.as_raw(),
+            Err(error) => {
+                eprintln!("TILESPIKE tile {tile_index}: no window handle ({error:?})");
+                return false;
+            },
+        };
+        let RawWindowHandle::Win32(win32) = raw else {
+            eprintln!("TILESPIKE tile {tile_index}: not a Win32 window handle");
+            return false;
+        };
+        // 정수로 낮춘다 — `RawWindowHandle` 은 `Send` 가 아니고, 그럴 필요도 없다.
+        let hwnd = win32.hwnd.get();
+        let hinstance = win32.hinstance.map(|value| value.get());
+        let size = plan.window.inner_size();
+        let gpu_index = plan.gpu_index;
+        let display = layout.tiles.get(tile_index).map(|tile| tile.display);
+
+        workers.push(std::thread::spawn(move || {
+            let mut win32 =
+                Win32WindowHandle::new(NonZeroIsize::new(hwnd).expect("HWND must be non-zero"));
+            win32.hinstance = hinstance.and_then(NonZeroIsize::new);
+            // SAFETY: 호출자가 반환 전에 모든 워커를 join 하고, 창은 호출자의 프레임에 살아
+            // 있으므로 이 스레드보다 오래 산다.
+            let window_handle = unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(win32)) };
+            // SAFETY: Windows 의 디스플레이 핸들은 내용이 없다(프로세스 전역).
+            let display_handle = unsafe {
+                DisplayHandle::borrow_raw(RawDisplayHandle::Windows(WindowsDisplayHandle::new()))
+            };
+
+            let started = std::time::Instant::now();
+            let created = WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
+                display_handle,
+                window_handle,
+                size,
+                // ★vsync 드라이버는 `Rc` 라 `Send` 가 아니다★ — A 안에서는 타일 스레드가
+                // 자기 것을 만들어야 한다. 스파이크는 없이 간다.
+                None,
+                gpu_index,
+            );
+            let context = match created {
+                Ok(context) => context,
+                Err(error) => {
+                    eprintln!(
+                        "TILESPIKE tile {tile_index}: CREATE FAILED on a worker thread \
+                         (display={display:?} gpu={gpu_index:?}): {error:?}"
+                    );
+                    return false;
+                },
+            };
+            let create_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+            if let Err(error) = context.make_current() {
+                eprintln!(
+                    "TILESPIKE tile {tile_index}: MAKE_CURRENT FAILED on a worker thread: \
+                     {error:?}"
+                );
+                return false;
+            }
+
+            // 생성만 되고 current 가 안 되는 경우와 구분하려면 GL 에 직접 물어야 한다.
+            let gl = context.gleam_gl_api();
+            let vendor = gl.get_string(GL_VENDOR);
+            let renderer = gl.get_string(GL_RENDERER);
+            let context_size = context.size();
+            eprintln!(
+                "TILESPIKE tile {tile_index}: OK on worker {:?} -- display={display:?} \
+                 gpu={gpu_index:?} size={}x{} create_ms={create_ms:.1} vendor={vendor:?} \
+                 renderer={renderer:?}",
+                std::thread::current().id(),
+                context_size.width,
+                context_size.height,
+            );
+            // 만든 스레드에서 소멸시킨다(surfman 의 스레드 로컬 계약).
+            drop(context);
+            true
+        }));
+    }
+
+    let mut all_ok = true;
+    for worker in workers {
+        match worker.join() {
+            Ok(ok) => all_ok &= ok,
+            Err(_) => {
+                eprintln!("TILESPIKE: a worker thread PANICKED");
+                all_ok = false;
+            },
+        }
+    }
+    if all_ok {
+        eprintln!(
+            "TILESPIKE VERDICT: PASS -- every tile created and made current its own \
+             RenderingContext on its own thread. Plan A's blocking precondition holds."
+        );
+    } else {
+        eprintln!(
+            "TILESPIKE VERDICT: FAIL -- surfman/ANGLE will not do this off the main thread, \
+             so plan A does not stand as designed. Read the per-tile lines above."
+        );
+    }
+    all_ok
 }

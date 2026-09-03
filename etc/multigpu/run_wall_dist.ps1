@@ -243,6 +243,12 @@ param(
     # WALLACKFLUSH, meaning the recovery never ran and those runs proved nothing.
     # -CanvasAckSkip N makes each painter skip its first N ack sends exactly the way a closed
     # gate would, which reproduces the deadlock on demand.
+    # Plan A step 1: have each tile create its own RenderingContext on its own thread, report,
+    # and exit without rendering. surfman's Device is thread-local, so a context cannot be
+    # handed between threads -- which is why this is a separate run rather than half of the
+    # normal one. If it fails, parallel tile render does not stand as designed
+    # (docs/multigpu/parallel_tile_render_design.md section 6.2 step 1).
+    [switch] $TileThreadSpike,
     [int] $CanvasAckSkip = 0,
     # Turns the recovery off. Pair it with -CanvasAckSkip to show the injection really does
     # deadlock the wall -- without this control, a run that stays healthy cannot distinguish
@@ -605,6 +611,9 @@ if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval
 # Passthrough is appended AFTER every pref this launcher sets itself, so `-Pref x=y` wins
 # over the launcher's own value for x. Servo takes the last --pref for a given name.
 foreach ($p in $Pref)     { $argList += @("--pref", $p) }
+# The spike creates its tile contexts on worker threads instead of the main thread, reports,
+# and exits -- it never renders, so nothing else in this script applies to that run.
+if ($TileThreadSpike)     { $argList += "--tile-thread-spike" }
 $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
@@ -1051,6 +1060,31 @@ if ($wdog) {
     }
 } elseif ($FanoutProf) {
     Write-Warning "-FanoutProf was set but no WEBGLWATCHDOG line was logged. That thread emits once a second unconditionally, so its silence means it never started -- not that the run was healthy."
+}
+
+# --- TILESPIKE: plan A step 1. Can a tile create and make current its own context off the
+# main thread? Everything else about parallel tile render depends on this answer.
+$spike = Select-String -Path $LogPath -Pattern "TILESPIKE VERDICT: (PASS|FAIL)" -EA SilentlyContinue
+$spikeTiles = Select-String -Path $LogPath -Pattern "TILESPIKE tile (\d+): (OK|CREATE FAILED|MAKE_CURRENT FAILED)" -EA SilentlyContinue
+if ($spike -or $spikeTiles) {
+    Write-Host ""
+    Write-Host "TILESPIKE -- per-tile context creation on worker threads:"
+    foreach ($hit in $spikeTiles) {
+        $line = $hit.Line -replace '^\[[^\]]*\]\s*', ''
+        Write-Host "  $line"
+    }
+    if ($spike) {
+        $verdict = $spike[-1].Matches[0].Groups[1].Value
+        if ($verdict -eq 'PASS') {
+            Write-Host "  => PASS: plan A's blocking precondition holds; step 2 (move Painter) is next." -ForegroundColor Green
+        } else {
+            Write-Host "  => FAIL: plan A does not stand as designed. Read the per-tile lines above." -ForegroundColor Red
+        }
+    } else {
+        Write-Warning "Per-tile TILESPIKE lines exist but no VERDICT line -- the run died before joining its workers."
+    }
+} elseif ($TileThreadSpike) {
+    Write-Warning "-TileThreadSpike was set but no TILESPIKE line was logged, so the spike never ran. It is Windows-only and runs before any rendering; check the engine actually reached tile creation."
 }
 
 # --- SURFIMPORT: inside the one call that dominates the wall pass.
