@@ -228,17 +228,24 @@ enum PainterHostKind {
 /// ★들고 있는 동안 그 타일들이 나란히 돈다.★ 떨어뜨리면(`join` 없이) 결과를 안 기다리는
 /// 것이 되는데, 그러면 다음 패스가 이전 패스와 겹쳐 버리므로 반드시 `join` 할 것.
 pub struct PaintTargetsInFlight {
-    in_flight: Vec<crossbeam_channel::Receiver<()>>,
+    in_flight: Vec<crossbeam_channel::Receiver<f64>>,
 }
 
 impl PaintTargetsInFlight {
-    /// 발사해 둔 타일들이 전부 끝나기를 기다린다.
-    pub fn join(self) {
-        for done in self.in_flight {
+    /// 발사해 둔 타일들이 전부 끝나기를 기다리고, **각자 걸린 시간(ms)** 을 발사 순서대로
+    /// 돌려준다.
+    ///
+    /// ★시간을 돌려주는 것이 요점이다.★ 팬아웃 이후 셸의 루프는 스레드 타일을 건너뛰므로
+    /// `WALLPASS` 의 타일별 값이 0 이 되고, 그러면 "어느 타일이 패스를 붙잡는가" 를 볼 수
+    /// 없다. 실제로 그 눈이 없어 처음 팬아웃 측정에서 타일별 분포가
+    /// `[25.87, 0, 0, 0]` 으로 나왔다(2026-09-03, `log_webgpu/68`).
+    pub fn join(self) -> Vec<f64> {
+        self.in_flight
+            .into_iter()
             // 스레드가 죽었으면 `Err` 다. 그때는 기다릴 것이 없다 — 그 사실은 요청을 보낼 때
-            // 이미 경고했다.
-            let _ = done.recv();
-        }
+            // 이미 경고했으므로 0 으로 둔다.
+            .map(|done| done.recv().unwrap_or_default())
+            .collect()
     }
 }
 
@@ -2722,9 +2729,14 @@ impl Paint {
             match &host.kind {
                 PainterHostKind::Threaded(threaded) => {
                     let time_profiler_chan = self.time_profiler_chan.clone();
-                    if let Some(done) =
-                        threaded.dispatch(move |painter| painter.render(&time_profiler_chan))
-                    {
+                    // 타일이 자기 시간을 재서 돌려준다 — 메인은 이 타일이 언제 시작하고
+                    // 끝났는지 볼 수 없다.
+                    let dispatched = threaded.dispatch(move |painter| {
+                        let started = Instant::now();
+                        painter.render(&time_profiler_chan);
+                        started.elapsed().as_secs_f64() * 1000.0
+                    });
+                    if let Some(done) = dispatched {
                         in_flight.push(done);
                     }
                 },

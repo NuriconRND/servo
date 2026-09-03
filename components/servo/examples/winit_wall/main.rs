@@ -330,6 +330,10 @@ impl AppState {
         let slowest = avg.iter().cloned().fold(0.0_f64, f64::max);
         // The ceiling on parallelising this loop, stated so nobody has to guess: with four
         // tiles the hopeful number is 4x, but one heavy tile caps it far below that.
+        //
+        // ★`gfx_wall_parallel_tiles` 가 켜져 있으면 이 값은 "천장" 이 아니라 **아직 남은
+        // 여지** 다★ — 그때는 `serial_sum` 이 겹쳐서 돈 시간의 합이므로 `pass_ms` 보다 크고,
+        // `serial_sum / pass_ms` 가 **이미 얻은 병렬도**다. 둘의 차이가 남은 몫이다.
         let ceiling = if slowest > 0.0 { serial / slowest } else { 0.0 };
         log::info!(
             "WALLPASS passes/s={:.1} pass_ms avg={:.2} max={:.2} | per-tile avg=[{}]              max=[{}] | serial_sum={:.2} slowest={:.2} parallel_ceiling={:.2}x skipped={}",
@@ -472,6 +476,10 @@ impl AppState {
         // 배리어는 여기서도 그대로다: keep-previous 로 표시된 타일은 **아예 보내지 않는다**.
         // 판정을 메인에서 미리 하는 것이 설계 §3 의 결론이다(타일이 배리어를 볼 필요가 없다).
         let mut dispatched = vec![false; self.tiles.len()];
+        // 발사한 타일의 인덱스를 순서대로 들고 있어야 조인이 돌려준 시간을 `tile_ms` 의
+        // 제자리에 넣을 수 있다. ★이게 없으면 WALLPASS 의 타일별 값이 0 이 되어 어느 타일이
+        // 패스를 붙잡는지 볼 수 없다.★
+        let mut dispatched_indices = Vec::new();
         let in_flight = {
             let mut targets = Vec::new();
             for (index, tile) in self.tiles.iter().enumerate() {
@@ -489,6 +497,7 @@ impl AppState {
                 }
                 targets.push(target);
                 dispatched[index] = true;
+                dispatched_indices.push(index);
             }
             (!targets.is_empty()).then(|| webview.dispatch_paint_targets(&targets))
         };
@@ -567,7 +576,15 @@ impl AppState {
         // ★반드시 Commit 플러시보다 먼저다★: 그 타일들의 `end_frame` 이 아직 안 끝났으면
         // 미뤄 둔 Commit 도 아직 없다.
         if let Some(in_flight) = in_flight {
-            in_flight.join();
+            // ★`tile_ms` 에만 넣고 `split.paint_ms` 에는 더하지 않는다.★ 이 타일들은
+            // 서로, 그리고 primary 와 **겹쳐서** 돌았으므로 그 합은 패스가 실제로 쓴
+            // 시간이 아니다. 더하면 `WALLSPLIT` 의 `outside` 가 음수가 된다.
+            //
+            // 겹침은 대신 `WALLPASS` 에서 읽는다: `serial_sum` 이 `pass_ms` 보다 크면
+            // 그 배수가 실제로 얻은 병렬도다(겹치지 않으면 둘이 같다).
+            for (index, tile_render_ms) in dispatched_indices.iter().zip(in_flight.join()) {
+                tile_ms[*index] = tile_render_ms;
+            }
         }
 
         webview.flush_deferred_dcomp_commits();
