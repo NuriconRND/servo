@@ -325,9 +325,13 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 ### `SERVO_WALL_CANVAS_ACK_SKIP` — `Int`
 
-캔버스 ack 교착 재현. painter 마다 처음 N 번의 ack 전송 기회를 "게이트가 닫혀 있던 것처럼"
-건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 을 그대로 남기므로 실측된 교착과 같은
-상태가 된다. 미설정/0 이면 주입 없음. **1 이면 충분하다.** 런처 `-CanvasAckSkip 1`.
+캔버스 ack 교착 재현: painter 마다 처음 N 번의 ack 전송을 게이트가 닫혀 있던 것처럼
+건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 은 그대로 남기므로 실측된 교착
+상태와 같아진다. ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이
+없어서 네 painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이
+아무 일도 하지 않았다(2026-09-03). 미설정/0 이면 주입 없음. 1 이면 충분하다.
+
+런처 `-CanvasAckSkip 1`.
 
 ★왜 필요한가★: 이 교착(`2f97f5190c2`)은 **35 회 실행에 1 회** 나왔다. 그 확률에 검증을 맡기면
 고친 뒤 12 회를 돌려도 복구가 한 번도 안 도는 일이 생긴다 — 2026-09-02 `log_webgpu/52` 가
@@ -335,9 +339,11 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 ### `SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` — `Str`
 
-`Painter::flush_owed_canvas_ack` 를 끈다(truthy: `"1"` 또는 `"true"`). 런처
-`-NoCanvasAckRecovery`. ★주입이 진짜로 교착을 만드는지 보이는 대조군★ — 이것 없이 주입만
-걸면 복구가 즉시 메워서 "주입이 안 먹은 것"과 구분되지 않는다. 운영 kill switch 이기도 하다.
+`Painter::flush_owed_canvas_ack` 를 끈다(truthy: "1" 또는 "true"). ★주입이 진짜로 교착을
+만드는지 보이는 대조군★ — 이것 없이 주입만 걸면 복구가 즉시 메워서 "주입이 안 먹은 것"과
+구분되지 않는다. 운영에서 쓸 kill switch 이기도 하다.
+
+런처 `-NoCanvasAckRecovery`.
 
 검증은 두 번 실행하면 끝난다:
 
