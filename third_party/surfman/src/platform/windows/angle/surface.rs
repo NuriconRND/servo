@@ -199,16 +199,18 @@ fn ensure_dcomp_loaded() -> bool {
 /// 1 초에 한 줄이고 조사용이므로 무조건 찍는다 — 원인이 확정되면 지운다.
 static IMPORT_OPEN_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_PBUFFER_NS: AtomicU64 = AtomicU64::new(0);
-static IMPORT_MUTEX_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_QUERY_NS: AtomicU64 = AtomicU64::new(0);
+static IMPORT_ACQUIRE_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_REST_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 static IMPORT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_START: OnceLock<Instant> = OnceLock::new();
 
-fn note_import_timing(open_ns: u64, pbuffer_ns: u64, mutex_ns: u64, rest_ns: u64) {
+fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: u64, rest_ns: u64) {
     IMPORT_OPEN_NS.fetch_add(open_ns, Ordering::Relaxed);
     IMPORT_PBUFFER_NS.fetch_add(pbuffer_ns, Ordering::Relaxed);
-    IMPORT_MUTEX_NS.fetch_add(mutex_ns, Ordering::Relaxed);
+    IMPORT_QUERY_NS.fetch_add(query_ns, Ordering::Relaxed);
+    IMPORT_ACQUIRE_NS.fetch_add(acquire_ns, Ordering::Relaxed);
     IMPORT_REST_NS.fetch_add(rest_ns, Ordering::Relaxed);
     let count = IMPORT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -230,11 +232,13 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, mutex_ns: u64, rest_ns: u64
     // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
     // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
     warn!(
-        "SURFIMPORT imports={} open_ms={:.1} pbuffer_ms={:.1} mutex_ms={:.1} rest_ms={:.1} (cumulative)",
+        "SURFIMPORT imports={} open_ms={:.1} pbuffer_ms={:.1} query_ms={:.1} \
+         acquire_ms={:.1} rest_ms={:.1} (cumulative)",
         count,
         ms(IMPORT_OPEN_NS.load(Ordering::Relaxed)),
         ms(IMPORT_PBUFFER_NS.load(Ordering::Relaxed)),
-        ms(IMPORT_MUTEX_NS.load(Ordering::Relaxed)),
+        ms(IMPORT_QUERY_NS.load(Ordering::Relaxed)),
+        ms(IMPORT_ACQUIRE_NS.load(Ordering::Relaxed)),
         ms(IMPORT_REST_NS.load(Ordering::Relaxed)),
     );
 }
@@ -556,6 +560,12 @@ impl Device {
                     EGL_DXGI_KEYED_MUTEX_ANGLE as EGLint,
                     &mut local_keyed_mutex as *mut *mut IDXGIKeyedMutex as *mut *mut c_void,
                 );
+                // ★질의와 획득을 갈라 잰다.★ 하나로 재면 "EGL 질의가 느린 것"(캐시로 없앨 수
+                // 있다)과 "실제로 기다리는 것"(캐시로는 못 없앤다)이 구분되지 않는데, 그 둘은
+                // 고칠 방법이 정반대다. 처음에 하나로 쟀다가 이 구간이 68% 로 나와서
+                // 갈라야 했다(2026-09-03, `log_webgpu/60`).
+                let query_ns = mutex_start.elapsed().as_nanos() as u64;
+                let acquire_start = Instant::now();
                 let local_keyed_mutex = if result != egl::FALSE && !local_keyed_mutex.is_null() {
                     let local_keyed_mutex = ComPtr::from_raw(local_keyed_mutex);
                     local_keyed_mutex.AddRef();
@@ -567,7 +577,7 @@ impl Device {
                 } else {
                     None
                 };
-                let mutex_ns = mutex_start.elapsed().as_nanos() as u64;
+                let acquire_ns = acquire_start.elapsed().as_nanos() as u64;
                 let rest_start = Instant::now();
                 let result = self.create_surface_texture_from_local_surface(
                     context,
@@ -578,7 +588,8 @@ impl Device {
                 note_import_timing(
                     open_ns,
                     pbuffer_ns,
-                    mutex_ns,
+                    query_ns,
+                    acquire_ns,
                     rest_start.elapsed().as_nanos() as u64,
                 );
                 result

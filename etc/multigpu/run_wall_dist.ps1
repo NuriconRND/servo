@@ -1058,28 +1058,34 @@ if ($wdog) {
 # painters, log_webgpu/57-59). It does four things per tile per frame, and which one is heavy
 # decides how invasive the fix is: caching just the OpenSharedResource result is a small patch,
 # while the EGL pbuffer or the GL texture would mean changing the surface texture's lifetime.
-$imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) open_ms=([\d.]+) pbuffer_ms=([\d.]+) mutex_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
+$imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) open_ms=([\d.]+) pbuffer_ms=([\d.]+) query_ms=([\d.]+) acquire_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
 if ($imp) {
     # The numbers are cumulative, so the last line is the whole run.
     $impG = $imp[-1].Matches[0].Groups
     $impN = [double]$impG[1].Value
     $open = [double]$impG[2].Value
     $pbuf = [double]$impG[3].Value
-    $mtx  = [double]$impG[4].Value
-    $rest = [double]$impG[5].Value
-    $tot  = $open + $pbuf + $mtx + $rest
+    $qry  = [double]$impG[4].Value
+    $acq  = [double]$impG[5].Value
+    $rest = [double]$impG[6].Value
+    $tot  = $open + $pbuf + $qry + $acq + $rest
     Write-Host ""
     Write-Host "SURFIMPORT -- inside create_surface_texture ($impN imports over the run):"
     if ($tot -gt 0 -and $impN -gt 0) {
         Write-Host ("  OpenSharedResource {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $open, (100 * $open / $tot), ($open / $impN))
         Write-Host ("  EGL pbuffer       {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $pbuf, (100 * $pbuf / $tot), ($pbuf / $impN))
-        Write-Host ("  keyed mutex       {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $mtx, (100 * $mtx / $tot), ($mtx / $impN))
+        Write-Host ("  EGL mutex query   {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $qry, (100 * $qry / $tot), ($qry / $impN))
+        Write-Host ("  AcquireSync       {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $acq, (100 * $acq / $tot), ($acq / $impN))
         Write-Host ("  GL texture + bind {0,9:N1} ms  ({1,5:N1}%)  {2,6:N2} ms each" -f $rest, (100 * $rest / $tot), ($rest / $impN))
         Write-Host ("  TOTAL             {0,9:N1} ms                {1,6:N2} ms each" -f $tot, ($tot / $impN))
+        # Query and AcquireSync were one number at first and that number was 68%, which could
+        # not be acted on: an EGL call being slow and waiting on another device's GPU need
+        # opposite fixes.
         $dom = @(
             @{ n = 'OpenSharedResource'; v = $open; fix = 'cache the opened texture per share handle -- a small, contained patch' },
             @{ n = 'EGL pbuffer';        v = $pbuf; fix = 'the pbuffer must be cached too, so the SurfaceTexture lifetime has to change' },
-            @{ n = 'keyed mutex';        v = $mtx;  fix = 'this is synchronisation, not creation -- caching will NOT help' },
+            @{ n = 'EGL mutex query';    v = $qry;  fix = 'an EGL call, so caching the import removes it' },
+            @{ n = 'AcquireSync';        v = $acq;  fix = 'a WAIT, not creation -- caching will NOT help. Find who holds the mutex and why' },
             @{ n = 'GL texture + bind';  v = $rest; fix = 'the GL texture must persist across frames, so the lifetime has to change' }
         ) | Sort-Object { $_.v } -Descending | Select-Object -First 1
         Write-Host ("  => {0} dominates: {1}" -f $dom.n, $dom.fix) -ForegroundColor Yellow
