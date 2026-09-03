@@ -911,11 +911,22 @@ impl Painter {
         if left == 0 {
             return false;
         }
+
+        // ★빚이 없는 순간에 예산을 쓰면 아무것도 보류하지 못한다.★ 처음엔 이 검사가 없어서
+        // 네 painter 전부 기동 직후 첫 기회에 예산을 날렸고(2026-09-03, `log_webgpu/53`:
+        // 28 회 중 stall 2 회 = 주입 없을 때의 자연 발생률 그대로, 그나마도 skip 과 22 초
+        // 떨어져 있었다), 주입이 **아무 일도 하지 않았다**. 보류할 것이 실제로 있을 때만 쓴다.
+        let owed = self.frame_delayer.waiting_pipeline_count();
+        if owed == 0 {
+            return false;
+        }
+
         self.canvas_ack_skips_left.set(left - 1);
         warn!(
-            "WALLACKSKIP: painter {:?} skipped an ack send on purpose ({} left). \
-             Failure injection only -- SERVO_WALL_CANVAS_ACK_SKIP is set.",
+            "WALLACKSKIP: painter {:?} withheld an ack owed to {} pipeline(s) on purpose \
+             ({} skip(s) left). Failure injection only -- SERVO_WALL_CANVAS_ACK_SKIP is set.",
             self.painter_id,
+            owed,
             left - 1,
         );
         true
@@ -3162,6 +3173,11 @@ impl FrameDelayer {
 
     pub(crate) fn pending_canvas_image_count(&self) -> usize {
         self.pending_canvas_images.len()
+    }
+
+    /// ack 를 기다리는 파이프라인 수. 주입이 **실제로 무엇을 보류했는지** 로그에 싣기 위한 것.
+    pub(crate) fn waiting_pipeline_count(&self) -> usize {
+        self.waiting_pipelines.len()
     }
 
     pub(crate) fn take_waiting_pipelines(&mut self) -> Vec<PipelineId> {

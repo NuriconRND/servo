@@ -1063,14 +1063,14 @@ if ($ackLatch) {
     Write-Host "  Note this is the ambiguous outcome: it does not prove the recovery path works." -ForegroundColor Yellow
     Write-Host "  To actually test it, reproduce the race on demand: -CanvasAckSkip 1"
 }
-$ackSkip = Select-String -Path $LogPath -Pattern "WALLACKSKIP: painter PainterId\((\d+)\) skipped an ack send" -EA SilentlyContinue
+$ackSkip = Select-String -Path $LogPath -Pattern "WALLACKSKIP: painter PainterId\((\d+)\) withheld an ack owed to (\d+) pipeline" -EA SilentlyContinue
 if ($ackSkip) {
-    Write-Host "  (failure injection was active: $($ackSkip.Count) ack send(s) skipped on purpose)"
+    Write-Host "  (failure injection was active: $($ackSkip.Count) ack(s) withheld on purpose)"
     if ($NoCanvasAckRecovery) {
         Write-Host "  Recovery was disabled for this run, so a stall here is the EXPECTED control result." -ForegroundColor Yellow
     }
 } elseif ($CanvasAckSkip -gt 0) {
-    Write-Warning "-CanvasAckSkip $CanvasAckSkip was set but no WALLACKSKIP line was logged, so no ack send was ever reached and nothing was injected. The run tested nothing."
+    Write-Warning "-CanvasAckSkip $CanvasAckSkip was set but no ack was ever withheld, so nothing was injected and the run tested nothing. The budget is only spent when an ack is actually owed, so this means no canvas ever put one in flight -- check that the page really has an animating WebGL canvas and that -Pref dom_webgl2_enabled=true was passed."
 }
 
 # --- WEBGLEXTIMG: the consumer side -- is the painter WAITING for the canvas, or is there
