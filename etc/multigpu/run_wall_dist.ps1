@@ -1095,11 +1095,13 @@ if ($spike -or $spikeTiles) {
     Write-Warning "-TileThreadSpike was set but no TILESPIKE line was logged, so the spike never ran. It is Windows-only and runs before any rendering; check the engine actually reached tile creation."
 }
 
-# --- SURFIMPORT: inside the one call that dominates the wall pass.
-# create_surface_texture is ~93% of paint in BOTH DComp modes (900-935 ms/s across four
-# painters, log_webgpu/57-59). It does four things per tile per frame, and which one is heavy
-# decides how invasive the fix is: caching just the OpenSharedResource result is a small patch,
-# while the EGL pbuffer or the GL texture would mean changing the surface texture's lifetime.
+# --- SURFIMPORT: inside the call that used to dominate the wall pass.
+# create_surface_texture was ~93% of paint in BOTH DComp modes (900-935 ms/s across four
+# painters, log_webgpu/57-59), 10.01 ms an import. Caching the import per share handle took it
+# to 0.08 ms (log_webgpu/70) and the whole pass from 21.34 ms to 1.47 ms. This block is kept as
+# a regression watch, not a hunt: what it has to catch is the cache MISSING -- a resize storm,
+# or a producer handing out a fresh share handle every frame -- which brings the old cost back
+# whole. That is why reused= is in the header and is checked before the percentages.
 $imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) reused=(\d+) \([\d.]+%\) open_ms=([\d.]+) pbuffer_ms=([\d.]+) query_ms=([\d.]+) acquire_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
 if ($imp) {
     # The numbers are cumulative, so the last line is the whole run.
@@ -1124,14 +1126,29 @@ if ($imp) {
         # Query and AcquireSync were one number at first and that number was 68%, which could
         # not be acted on: an EGL call being slow and waiting on another device's GPU need
         # opposite fixes.
-        $dom = @(
-            @{ n = 'OpenSharedResource'; v = $open; fix = 'cache the opened texture per share handle -- a small, contained patch' },
-            @{ n = 'EGL pbuffer';        v = $pbuf; fix = 'the pbuffer must be cached too, so the SurfaceTexture lifetime has to change' },
-            @{ n = 'EGL mutex query';    v = $qry;  fix = 'an EGL call, so caching the import removes it' },
-            @{ n = 'AcquireSync';        v = $acq;  fix = 'a WAIT, not creation -- caching will NOT help. Find who holds the mutex and why' },
-            @{ n = 'GL texture + bind';  v = $rest; fix = 'the GL texture must persist across frames, so the lifetime has to change' }
-        ) | Sort-Object { $_.v } -Descending | Select-Object -First 1
-        Write-Host ("  => {0} dominates: {1}" -f $dom.n, $dom.fix) -ForegroundColor Yellow
+        # ***Read the share ratio before the percentages.*** Once the cache is hitting, these
+        # five add up to well under a millisecond, and then "which is the biggest share" is a
+        # question about noise. Reporting a dominant line anyway is how a solved cost center
+        # keeps getting chased -- so say it is solved instead.
+        $eachMs = $tot / $impN
+        $hitPct = if ($impN -gt 0) { 100 * $impHits / $impN } else { 0 }
+        if ($hitPct -ge 90 -and $eachMs -lt 0.5) {
+            Write-Host ("  => Not a cost center any more: {0:N0}% of imports are cache hits and one costs {1:N2} ms." -f $hitPct, $eachMs) -ForegroundColor Green
+            Write-Host "     The shares below are noise at this scale. Look at WALLPASS/WALLSPLIT for what is left." -ForegroundColor Green
+        } else {
+            $dom = @(
+                @{ n = 'OpenSharedResource'; v = $open; fix = 'cache the opened texture per share handle -- a small, contained patch' },
+                @{ n = 'EGL pbuffer';        v = $pbuf; fix = 'the pbuffer must be cached too, so the SurfaceTexture lifetime has to change' },
+                @{ n = 'EGL mutex query';    v = $qry;  fix = 'an EGL call, so caching the import removes it' },
+                # This line used to read "a WAIT, not creation -- caching will NOT help", and
+                # that was measured to be wrong (log_webgpu/70). Re-opening the shared texture
+                # every frame is what made the acquire expensive: caching the open took it from
+                # 7.41 ms to 0.04 ms. So check the share ratio before blaming the producer.
+                @{ n = 'AcquireSync';        v = $acq;  fix = 'a wait -- but if reused% is low, it is the re-import causing it. Cache first, then look for who holds the mutex' },
+                @{ n = 'GL texture + bind';  v = $rest; fix = 'the GL texture must persist across frames, so the lifetime has to change' }
+            ) | Sort-Object { $_.v } -Descending | Select-Object -First 1
+            Write-Host ("  => {0} dominates: {1}" -f $dom.n, $dom.fix) -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Warning "No SURFIMPORT line was logged. It is a warn! from surfman and emits once a second whenever a WebGL canvas is imported, so its absence means no canvas was imported at all -- not that the import is free."
