@@ -794,8 +794,16 @@ impl ApplicationHandler<WakerEvent> for App {
         });
 
         // 3) One logical WebView whose layout viewport is the whole virtual viewport.
+        // ★URL 을 여기서 주지 않는다.★ 주면 그 순간 로드가 시작되고, 페이지가 캔버스를
+        // 만드는 시점이 아래의 타일 등록과 경합한다. WebGL 팬아웃 대상은 컨텍스트 생성
+        // 시점에 고정되므로(`WebGLMsg::CreateContext` 가 painter 목록을 받는다), 아직
+        // 등록되지 않은 타일은 그 캔버스를 영영 못 받는다 — 그 타일은 캔버스만 빠진 채로
+        // 그려진다. 2026-09-03 `log_webgpu/64` 에서 정확히 그 모양이 나왔다: 격리 WebGL
+        // 디바이스가 4 개가 아니라 1 개만 생기고, painter 2~4 는 "missing swap chain".
+        //
+        // 직렬 경로에서도 같은 경합이 있었고 창이 좁아 안 걸렸을 뿐이다. 타일을 전부
+        // 세운 뒤에 로드를 시작하면 두 경로 모두에서 사라진다.
         let webview = WebViewBuilder::new(&app_state.servo, primary_context)
-            .url(config.url.clone())
             .hidpi_scale_factor(Scale::new(primary_scale))
             .viewport_size_override(virtual_viewport_css)
             .viewport_origin_override(
@@ -833,6 +841,9 @@ impl ApplicationHandler<WakerEvent> for App {
             };
             tile.paint_target.set(Some(target));
         }
+
+        // 모든 타일이 등록된 뒤에 로드를 시작한다(위 주석 참고).
+        webview.load(config.url.clone());
 
         *app_state.webview.borrow_mut() = Some(webview);
         *self = Self::Running(app_state);
