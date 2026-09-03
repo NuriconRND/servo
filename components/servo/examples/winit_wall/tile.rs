@@ -23,7 +23,10 @@ use winit::window::Window;
 /// [`servo::WebView::paint`] (the WebView's own rendering context).
 pub(crate) struct TileWindow {
     pub(crate) window: Window,
-    pub(crate) rendering_context: Rc<dyn RenderingContext>,
+    /// ★병렬 타일 경로(`gfx_wall_parallel_tiles`)에서는 `None` 이다.★ 그 경로에서는 컨텍스트가
+    /// 타일 스레드에 살고 셸은 그것을 아예 갖지 않는다 — 만들지도, current 로 삼지도,
+    /// present 하지도 않는다. 표출은 그 스레드의 `Painter::render` 가 한다.
+    pub(crate) rendering_context: Option<Rc<dyn RenderingContext>>,
     pub(crate) paint_target: Cell<Option<WebViewPaintTarget>>,
 }
 
@@ -106,9 +109,93 @@ fn bind_context(
     );
     TileWindow {
         window,
-        rendering_context,
+        rendering_context: Some(rendering_context),
         paint_target: Cell::new(None),
     }
+}
+
+/// 창은 만들되 컨텍스트는 만들지 않고, **타일 스레드가 쓸 factory** 와 함께 돌려준다.
+/// `gfx_wall_parallel_tiles` 경로 전용이다.
+///
+/// factory 로 건너가는 것은 HWND 와 hinstance 정수, 창 크기, GPU 인덱스뿐이다 — winit
+/// `Window` 자체는 메인 스레드에 남는다(설계 §6.1). 이것이 실제로 되는지는 1 단계
+/// 스파이크가 확인했다(`log_webgpu/62`).
+#[cfg(target_os = "windows")]
+pub(crate) fn split_plan_for_own_thread(
+    plan: TilePlan,
+) -> (TileWindow, servo::RenderingContextFactory) {
+    use std::num::NonZeroIsize;
+
+    use winit::raw_window_handle::{
+        RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
+    };
+
+    let raw = plan
+        .window
+        .window_handle()
+        .expect("Failed to get window handle")
+        .as_raw();
+    // 이 함수는 Windows 전용이고 이 셸은 winit 로만 창을 만든다 — 다른 종류가 나오면
+    // 가정이 깨진 것이므로 조용히 되돌아가지 않는다.
+    let RawWindowHandle::Win32(win32) = raw else {
+        panic!("tile {}: expected a Win32 window handle", plan.tile_index);
+    };
+    let hwnd = win32.hwnd.get();
+    let hinstance = win32.hinstance.map(|value| value.get());
+    let size = plan.window.inner_size();
+    let gpu_index = plan.gpu_index;
+
+    let factory: servo::RenderingContextFactory = Box::new(move || {
+        let mut win32 =
+            Win32WindowHandle::new(NonZeroIsize::new(hwnd).expect("HWND must be non-zero"));
+        win32.hinstance = hinstance.and_then(NonZeroIsize::new);
+        // SAFETY: 창은 메인 스레드가 프로세스 수명 동안 들고 있다(`AppState::tiles`).
+        let window_handle = unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(win32)) };
+        // SAFETY: Windows 의 디스플레이 핸들은 내용이 없다.
+        let display_handle = unsafe {
+            DisplayHandle::borrow_raw(RawDisplayHandle::Windows(WindowsDisplayHandle::new()))
+        };
+        let context = WindowRenderingContext::new_with_optional_refresh_driver_and_target_gpu(
+            display_handle,
+            window_handle,
+            size,
+            // vsync 드라이버는 `Rc` 라 건너오지 못한다. 이 경로에서는 표출 클럭이 셸에 있고
+            // 타일은 요청받을 때만 그리므로 없어도 된다.
+            None,
+            gpu_index,
+        )
+        .expect("Could not create the tile thread's RenderingContext");
+        Rc::new(context) as Rc<dyn RenderingContext>
+    });
+
+    (
+        TileWindow {
+            window: plan.window,
+            rendering_context: None,
+            paint_target: Cell::new(None),
+        },
+        factory,
+    )
+}
+
+/// [`plan_tile_windows`] 를 밖에서 부를 수 있게 한 것(병렬 경로가 창을 먼저 만들어야 한다).
+pub(crate) fn plan_tile_windows_pub(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+    layout: &WallLayout,
+    tile_indices: &[usize],
+    spatial: &[DisplayTopology],
+    have_topology: bool,
+) -> Vec<TilePlan> {
+    plan_tile_windows(event_loop, layout, tile_indices, spatial, have_topology)
+}
+
+/// [`TilePlan`] 을 인라인 경로의 [`TileWindow`] 로 만든다(컨텍스트를 메인에서 만든다).
+pub(crate) fn bind_context_pub(
+    plan: TilePlan,
+    display_handle: DisplayHandle,
+    vsync_driver: Option<Rc<dyn servo::RefreshDriver>>,
+) -> TileWindow {
+    bind_context(plan, display_handle, vsync_driver)
 }
 
 fn plan_tile_windows(

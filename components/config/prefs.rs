@@ -412,6 +412,20 @@ pub struct Preferences {
     /// 위치를 따라 도는 것이라면 회전 자체가 완화책이기도 하다 — 한 타일이 매번 몰아서
     /// 맞는 대신 넷이 나눠 낸다.
     pub gfx_wall_rotate_tile_order: bool,
+    /// 월 타일마다 **자기 스레드**를 주어 렌더를 겹칠지. 기본 꺼짐.
+    ///
+    /// 켜는 이유: 한 패스의 대부분이 타일마다의 `AcquireSync` 대기이고, 그 대기는 타일별·
+    /// GPU별이라 본질적으로 겹칠 수 있다(`docs/multigpu/parallel_tile_render_design.md`).
+    /// 2026-09-03 실측으로 `create_surface_texture` 가 `paint` 의 93%, 그 중 `AcquireSync` 가
+    /// 74%(회당 7.41ms)였고, `WALLPASS` 의 `parallel_ceiling` 은 3.0~3.8 배를 보고한다.
+    ///
+    /// ★기본을 끄는 이유는 이것이 소유 모델을 바꾸기 때문이다★ — 켜면 타일이 자기
+    /// `RenderingContext` 와 `Painter` 를 자기 스레드에서 만들고 표출까지 거기서 한다.
+    /// 직렬 경로를 남겨 두어야 A/B 로 이득을 재고 회귀 시 원인을 가릴 수 있다.
+    ///
+    /// 아직 스레드로 가지 못하는 경로가 둘 있다(스크린샷, 메모리 리포트). 켠 상태에서 그
+    /// 요청이 오면 건너뛰고 그 사실을 로그로 말한다.
+    pub gfx_wall_parallel_tiles: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -923,6 +937,7 @@ impl Preferences {
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
             gfx_wall_rotate_tile_order: false,
+            gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

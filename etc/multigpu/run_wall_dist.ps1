@@ -249,6 +249,13 @@ param(
     # normal one. If it fails, parallel tile render does not stand as designed
     # (docs/multigpu/parallel_tile_render_design.md section 6.2 step 1).
     [switch] $TileThreadSpike,
+    # Give each wall tile its own thread so their renders overlap. Off by default: it changes
+    # who owns the rendering context, so the serial path stays available for A/B and for
+    # falling back if something regresses. Most of a pass is per-tile AcquireSync waiting,
+    # which is per-tile and per-GPU and therefore overlappable -- WALLPASS reports a
+    # parallel_ceiling of 3.0-3.8x. Two paths cannot cross a thread yet (screenshots, the
+    # memory report) and say so in the log rather than failing quietly.
+    [switch] $ParallelTiles,
     [int] $CanvasAckSkip = 0,
     # Turns the recovery off. Pair it with -CanvasAckSkip to show the injection really does
     # deadlock the wall -- without this control, a run that stays healthy cannot distinguish
@@ -607,6 +614,7 @@ if ($NoNumaPin)           { $argList += @("--pref", "media_numa_pin_streaming_th
 elseif ($NumaPin)         { $argList += @("--pref", "media_numa_pin_streaming_threads=true") }
 if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
+if ($ParallelTiles)       { $argList += @("--pref", "gfx_wall_parallel_tiles=true") }
 if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval_ms=$MinIntervalMs") }
 # Passthrough is appended AFTER every pref this launcher sets itself, so `-Pref x=y` wins
 # over the launcher's own value for x. Servo takes the last --pref for a given name.

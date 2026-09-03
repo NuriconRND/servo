@@ -411,12 +411,21 @@ impl AppState {
         self.captured.set(true);
         self.should_exit.set(true);
 
-        let size = tile.rendering_context.size();
+        let Some(rendering_context) = tile.rendering_context.as_ref() else {
+            // 병렬 타일 경로에서는 셸에 컨텍스트가 없다. ★조용히 빈 파일을 만들지 않고
+            // 말한다★ — `--capture` 가 아무 말 없이 아무것도 안 하면 원인을 찾기 어렵다.
+            eprintln!(
+                "--capture: this tile renders on its own thread (gfx_wall_parallel_tiles), so                  the shell cannot read its framebuffer. Capture is skipped."
+            );
+            self.captured.set(true);
+            return;
+        };
+        let size = rendering_context.size();
         let rect = DeviceIntRect::from_origin_and_size(
             Point2D::new(0, 0),
             Size2D::new(size.width as i32, size.height as i32),
         );
-        match tile.rendering_context.read_to_image(rect) {
+        match rendering_context.read_to_image(rect) {
             Some(image) => match image.save(path) {
                 Ok(()) => eprintln!(
                     "capture: wrote {}x{} framebuffer to {path}",
@@ -470,21 +479,35 @@ impl AppState {
                         skipped += 1;
                         continue;
                     }
+                    // ★컨텍스트가 없는 타일은 자기 스레드가 전부 한다★
+                    // (`gfx_wall_parallel_tiles`): current 로 삼는 것도, 표출도 그쪽이다.
+                    // 셸이 여기서 할 수 있는 것은 "그려라" 뿐이다.
+                    let Some(rendering_context) = tile.rendering_context.as_ref() else {
+                        let paint_start = std::time::Instant::now();
+                        webview.paint_target(target);
+                        split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
+                        tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
+                        continue;
+                    };
                     let current_start = std::time::Instant::now();
-                    let _ = tile.rendering_context.make_current();
+                    let _ = rendering_context.make_current();
                     split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
                     let paint_start = std::time::Instant::now();
                     webview.paint_target(target);
                     split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
                     let present_start = std::time::Instant::now();
-                    tile.rendering_context.present();
+                    rendering_context.present();
                     let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
                     split.present_ms += present_ms;
                     self.note_present(present_ms);
                 },
                 None => {
+                    let rendering_context = tile
+                        .rendering_context
+                        .as_ref()
+                        .expect("the primary tile always owns its context on the shell side");
                     let current_start = std::time::Instant::now();
-                    let _ = tile.rendering_context.make_current();
+                    let _ = rendering_context.make_current();
                     split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
                     let paint_start = std::time::Instant::now();
                     webview.paint();
@@ -492,7 +515,7 @@ impl AppState {
                     // Capture before present (FLIP_DISCARD discards the backbuffer on Present).
                     self.maybe_capture(tile);
                     let present_start = std::time::Instant::now();
-                    tile.rendering_context.present();
+                    rendering_context.present();
                     let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
                     split.present_ms += present_ms;
                     self.note_present(present_ms);
@@ -659,19 +682,57 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
 
-        // Create one window + rendering context per tile.
-        let tiles = tile::create_tile_windows(
-            event_loop,
-            display_handle,
-            &config.layout,
-            &tile_indices,
-            &spatial,
-            have_topology,
-            vsync_driver,
-        );
+        // `gfx_wall_parallel_tiles`: 타일마다 자기 스레드를 준다. ★그 타일들은 셸이
+        // 컨텍스트를 만들지 않는다★ — 스레드가 만들고, current 로 삼고, 표출까지 한다.
+        // 타일 0 만은 예외다: Servo 자체가 그 컨텍스트 위에 세워지므로 셸이 소유한다.
+        let parallel_tiles = servo::pref!(gfx_wall_parallel_tiles);
+        let mut tile_factories: Vec<Option<servo::RenderingContextFactory>> = Vec::new();
+
+        // Create one window (and, unless the tile gets its own thread, a rendering context).
+        let tiles = if parallel_tiles {
+            let plans = tile::plan_tile_windows_pub(
+                event_loop,
+                &config.layout,
+                &tile_indices,
+                &spatial,
+                have_topology,
+            );
+            let mut tiles = Vec::with_capacity(plans.len());
+            for (slot, plan) in plans.into_iter().enumerate() {
+                if slot == 0 {
+                    tiles.push(tile::bind_context_pub(
+                        plan,
+                        display_handle,
+                        vsync_driver.clone(),
+                    ));
+                    tile_factories.push(None);
+                    continue;
+                }
+                let (tile, factory) = tile::split_plan_for_own_thread(plan);
+                tiles.push(tile);
+                tile_factories.push(Some(factory));
+            }
+            tiles
+        } else {
+            tile::create_tile_windows(
+                event_loop,
+                display_handle,
+                &config.layout,
+                &tile_indices,
+                &spatial,
+                have_topology,
+                vsync_driver,
+            )
+        };
 
         // 2) Build the shared Servo instance against tile 0's (primary) context.
-        let _ = tiles[0].rendering_context.make_current();
+        // ★타일 0(primary)은 언제나 셸이 컨텍스트를 소유한다★ — Servo 자체가 그 위에
+        // 세워지므로 스레드로 보낼 수 없다. 병렬 경로에서도 나머지 타일만 스레드를 갖는다.
+        let primary_context = tiles[0]
+            .rendering_context
+            .clone()
+            .expect("the primary tile always owns its context on the shell side");
+        let _ = primary_context.make_current();
         // 이 셸은 지금까지 Opts 를 넘기지 않아 항상 기본값이 쓰였다. 바꾸는 것은
         // `--ignore-certificate-errors` 하나뿐이고 나머지는 그대로 기본값이다
         // (`ServoBuilder` 가 opts 미지정 시 쓰던 값과 동일하다).
@@ -733,20 +794,17 @@ impl ApplicationHandler<WakerEvent> for App {
         });
 
         // 3) One logical WebView whose layout viewport is the whole virtual viewport.
-        let webview = WebViewBuilder::new(
-            &app_state.servo,
-            app_state.tiles[0].rendering_context.clone(),
-        )
-        .url(config.url.clone())
-        .hidpi_scale_factor(Scale::new(primary_scale))
-        .viewport_size_override(virtual_viewport_css)
-        .viewport_origin_override(
-            config
-                .layout
-                .tile_origin_device_vector(tile_indices[0], Scale::new(primary_scale)),
-        )
-        .delegate(app_state.clone())
-        .build();
+        let webview = WebViewBuilder::new(&app_state.servo, primary_context)
+            .url(config.url.clone())
+            .hidpi_scale_factor(Scale::new(primary_scale))
+            .viewport_size_override(virtual_viewport_css)
+            .viewport_origin_override(
+                config
+                    .layout
+                    .tile_origin_device_vector(tile_indices[0], Scale::new(primary_scale)),
+            )
+            .delegate(app_state.clone())
+            .build();
 
         // 4) Register each remaining tile as a secondary paint target.
         for (slot, &tile_index) in tile_indices.iter().enumerate().skip(1) {
@@ -759,8 +817,20 @@ impl ApplicationHandler<WakerEvent> for App {
             let origin = config
                 .layout
                 .tile_origin_device_vector(tile_index, Scale::new(scale));
-            let target =
-                webview.add_paint_target(tile.rendering_context.clone(), viewport_details, origin);
+            // 이 타일이 자기 스레드를 받기로 되어 있으면 factory 로 등록한다 — 컨텍스트는
+            // 그 스레드가 만든다. 아니면 셸이 이미 만들어 둔 컨텍스트를 넘긴다.
+            let target = match tile_factories.get_mut(slot).and_then(Option::take) {
+                Some(factory) => webview
+                    .add_paint_target_on_own_thread(factory, viewport_details, origin)
+                    .expect("Could not give tile its own painter thread"),
+                None => {
+                    let rendering_context = tile
+                        .rendering_context
+                        .clone()
+                        .expect("inline tiles own their context on the shell side");
+                    webview.add_paint_target(rendering_context, viewport_details, origin)
+                },
+            };
             tile.paint_target.set(Some(target));
         }
 

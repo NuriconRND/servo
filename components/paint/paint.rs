@@ -1208,6 +1208,8 @@ impl Paint {
             .spawn(move || {
                 let rendering_context = factory();
                 let mut painter = Painter::new(rendering_context, inputs);
+                // 셸은 이 컨텍스트를 갖고 있지 않으므로 표출도 이 스레드가 한다.
+                painter.take_over_presentation();
                 if id_sender.send(painter.painter_id).is_err() {
                     // 아무도 안 기다린다 = 등록이 취소됐다. 컨텍스트를 이 스레드에서
                     // 소멸시키고 조용히 끝낸다(스레드 로컬 계약).
@@ -2482,6 +2484,27 @@ impl Paint {
         })
         .expect("painter_id not found");
         painter_id
+    }
+
+    /// [`Self::add_webview_paint_target`] 과 같되, 이 타일은 **자기 스레드**를 갖고 그
+    /// 스레드가 컨텍스트와 `Painter` 를 직접 만든다(설계 §6.1).
+    pub fn add_webview_paint_target_on_own_thread(
+        &mut self,
+        webview: Box<dyn WebViewTrait>,
+        factory: RenderingContextFactory,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) -> Option<PainterId> {
+        let webview_id = webview.id();
+        let painter_id = self.spawn_painter_thread(factory)?;
+        // 스레드가 살아난 뒤에만 임베더 핸들을 등록한다 — 실패하면 아무것도 남기지 않는다.
+        self.webviews.borrow_mut().insert(webview_id, webview);
+        self.register_webview_painter_target(webview_id, painter_id);
+        self.with_painter_mut(painter_id, move |painter| {
+            painter.add_webview(webview_id, viewport_details, viewport_origin)
+        })
+        .expect("painter_id not found");
+        Some(painter_id)
     }
 
     pub fn show_webview(&self, webview_id: WebViewId) -> Result<(), UnknownWebView> {

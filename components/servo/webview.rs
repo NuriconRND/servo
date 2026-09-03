@@ -20,6 +20,7 @@ use embedder_traits::{
 use euclid::{Scale, Size2D};
 use image::RgbaImage;
 use log::debug;
+use paint::RenderingContextFactory;
 use paint_api::WebViewTrait;
 use paint_api::rendering_context::RenderingContext;
 use servo_base::Epoch;
@@ -720,6 +721,43 @@ impl WebView {
             viewport_origin,
         );
         WebViewPaintTarget { painter_id }
+    }
+
+    /// Like [`Self::add_paint_target`], but the target gets **its own thread**, and that
+    /// thread builds the rendering context itself.
+    ///
+    /// ★만들어진 컨텍스트를 넘길 수 없어서 이 형태다★ — surfman `Device` 는 스레드 로컬이라
+    /// 만든 스레드가 소멸까지 소유해야 하고, `webrender::Renderer` 는 `!Send` 다. 그래서
+    /// 호출자는 컨텍스트가 아니라 **만드는 방법**을 넘긴다(`docs/multigpu/
+    /// parallel_tile_render_design.md` §6.1). 창은 여전히 메인 스레드가 만들고, 스레드로
+    /// 건너가는 것은 그 창의 핸들 정도다.
+    ///
+    /// 그 타일은 **표출까지 자기 스레드에서 한다** — 셸에는 그 컨텍스트가 없으므로
+    /// `present()` 를 부르면 안 된다.
+    ///
+    /// 스레드를 못 띄우거나 컨텍스트 생성이 실패하면 `None`. 호출자는 인라인 경로로
+    /// 되돌아갈 수 있어야 한다.
+    pub fn add_paint_target_on_own_thread(
+        &self,
+        factory: RenderingContextFactory,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) -> Option<WebViewPaintTarget> {
+        let (servo, id) = {
+            let inner = self.inner();
+            (inner.servo.clone(), inner.id)
+        };
+
+        let painter_id = servo.paint_mut().add_webview_paint_target_on_own_thread(
+            Box::new(ServoRendererWebView {
+                id,
+                weak_handle: self.weak_handle(),
+            }),
+            factory,
+            viewport_details,
+            viewport_origin,
+        )?;
+        Some(WebViewPaintTarget { painter_id })
     }
 
     /// Paint the contents of this [`WebView`] into one registered paint target.

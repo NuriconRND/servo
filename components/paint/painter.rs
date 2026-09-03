@@ -280,6 +280,15 @@ pub(crate) struct Painter {
     /// A large gap since this instant at the START of a render means the stall happened
     /// upstream of the renderer (no render was requested at all), as opposed to a slow render
     /// pass itself, which is logged separately as "Slow paint frame".
+    /// 이 painter 가 **표출까지 책임지는가**.
+    ///
+    /// 인라인 경로에서는 셸이 `render()` 뒤에 직접 `present()` 한다(winit_wall 의
+    /// `render_all_tiles`). 타일 스레드에 사는 painter 는 그럴 수 없다 — 셸에는 그 컨텍스트가
+    /// 없고, 있어도 다른 스레드다. 그래서 그 경로에서는 `render()` 가 끝에 스스로 present 한다.
+    ///
+    /// ★기본값은 `false` 다★ — 켜져 있는데 셸도 present 하면 한 프레임을 두 번 내보낸다.
+    owns_presentation: bool,
+
     /// `Paint` 로 되돌아가는 통로. `WebViewRenderer` 가 애니메이션 상태 통보를 여기로 보낸다
     /// — 예전에는 `Box<dyn WebViewTrait>` 를 직접 들고 불렀다(설계 §3.2).
     paint_proxy: PaintProxy,
@@ -737,6 +746,7 @@ impl Painter {
             present_cadence_last: Default::default(),
             present_cadence_count: Default::default(),
             present_cadence_max_gap_ms: Default::default(),
+            owns_presentation: false,
             paint_proxy: paint.paint_proxy,
             last_render_end: Default::default(),
             canvas_ack_held_since: Default::default(),
@@ -1266,6 +1276,17 @@ impl Painter {
                 self.pending_frames.get(),
             );
         }
+
+        // 타일 스레드에 사는 painter 는 표출까지 자기가 한다 — 셸에는 이 컨텍스트가 없다.
+        // 인라인 경로에서는 셸이 present 하므로 여기서는 아무것도 하지 않는다.
+        if self.owns_presentation {
+            self.rendering_context.present();
+        }
+    }
+
+    /// 이 painter 가 `render()` 끝에서 스스로 present 하게 한다. 타일 스레드 경로 전용이다.
+    pub(crate) fn take_over_presentation(&mut self) {
+        self.owns_presentation = true;
     }
 
     fn clear_background(&self) {
