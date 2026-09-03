@@ -187,10 +187,30 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
 
 ### 6.2 단계 (각 단계가 되돌릴 수 있는 지점이다)
 
-1. **`RenderingContext` + WebRender 인스턴스를 타일 스레드에서 생성** — 아직 다른 것은
-   메인에서. WebRender 쪽은 위 §7-3 으로 정적 확인이 끝났으므로, 이 단계가 실제로 거는
-   것은 **surfman/ANGLE 이 다른 스레드에서 컨텍스트를 만들고 current 로 삼는가**다.
-   여기서 깨지면 A 는 성립하지 않는다.
+1. ~~**`RenderingContext` + WebRender 인스턴스를 타일 스레드에서 생성**~~ **★통과
+   (2026-09-03, `log_webgpu/62`).★** WebRender 쪽은 §7-3 으로 정적 확인이 끝나 있었고, 이
+   단계가 실제로 걸던 것은 **surfman/ANGLE 이 다른 스레드에서 컨텍스트를 만들고 current 로
+   삼는가**였다. 네 타일 전부 자기 워커 스레드에서 만들고 current 로 삼았으며, 각자 자기
+   GPU 에 붙었다(gpu 0/1/3/2 = display 0/1/2/3):
+
+   ```
+   TILESPIKE tile 0: OK on worker ThreadId(2) -- display=Some(0) gpu=Some(0) create_ms=272.6
+   TILESPIKE tile 1: OK on worker ThreadId(3) -- display=Some(1) gpu=Some(1) create_ms=218.4
+   TILESPIKE tile 2: OK on worker ThreadId(4) -- display=Some(2) gpu=Some(3) create_ms=218.3
+   TILESPIKE tile 3: OK on worker ThreadId(5) -- display=Some(3) gpu=Some(2) create_ms=305.2
+   TILESPIKE VERDICT: PASS
+   ```
+
+   ★생성만 된 것과 구분하려고 GL 에 직접 물었다★ — 각 스레드가
+   `ANGLE (AMD Radeon RX 580 ... D3D11)` 을 응답했다. 재현: `-TileThreadSpike`
+   (`tile::plan_and_run_tile_thread_spike`). 렌더하지 않고 즉시 종료하며 판정을 종료 코드로도
+   낸다.
+
+   부수 산물: **창 생성과 컨텍스트 생성이 갈렸다**(`plan_tile_windows` → `TilePlan` →
+   `bind_context`). A 안이 요구하는 바로 그 분리다 — 창은 메인 스레드 전용, 컨텍스트는 타일
+   스레드 전용, 그 사이를 건너는 것은 HWND 정수 하나뿐. 스파이크를 신뢰할 수 있게 만든 것도
+   이 분리다: 컨텍스트가 이미 붙은 HWND 에 두 번째를 만들면 `-DComp on` 에서 HWND 당 DComp
+   타깃이 하나뿐이라 실패하고, 그 실패가 "스레드 탓" 으로 오독된다.
 2. **`Painter` 를 타일 스레드로** — `Rc` 필드를 정리한다. `refresh_driver` 와
    `animation_refresh_driver_observer` 는 **타일별 인스턴스**로 나눌 수 있는지, 아니면
    메인에 남기고 메시지로 통신할지 결정해야 한다(미해결, §7).
