@@ -102,7 +102,7 @@ pub enum WebRenderDebugOption {
 pub struct Paint {
     /// All of the [`Painters`] for this [`Paint`]. Each [`Painter`] handles painting to
     /// a single [`RenderingContext`].
-    painters: Vec<Rc<RefCell<Painter>>>,
+    painters: Vec<PainterHost>,
 
     /// The set of [`Painter`] targets that should render each logical [`WebViewId`].
     ///
@@ -196,6 +196,23 @@ pub struct Paint {
     /// An map of external images shared between all `WebGpuExternalImages`.
     #[cfg(feature = "webgpu")]
     webgpu_image_map: std::cell::OnceCell<WebGpuExternalImageMap>,
+}
+
+/// 한 `Painter` 를 소유하는 주체.
+///
+/// ★지금은 인라인 하나뿐이다★ — 병렬 타일 렌더(A 안)에서 여기에 스레드 변형이 붙고,
+/// 그때 바뀌는 것은 이 구조체와 `Paint::with_painter*` 의 속뿐이다.
+///
+/// `painter_id` 와 `rendering_context` 를 **밖에 들고 있는 것이 요점**이다. 예전에는 둘 다
+/// painter 를 빌려서 읽었는데(`painters.iter().map(borrow)`), painter 가 다른 스레드로 가면
+/// id 를 알려고 스레드를 왕복하는 꼴이 된다. 등록·조회·제거는 painter 를 건드리지 않고
+/// 끝나야 한다.
+struct PainterHost {
+    painter_id: PainterId,
+    /// 컨텍스트 동일성 판정 전용(`register_rendering_context`). 스레드 변형에서는 컨텍스트가
+    /// 타일 스레드에서 만들어지므로 이 필드는 그 경로에 없다 — 등록 경로 자체가 달라진다.
+    rendering_context: Rc<dyn RenderingContext>,
+    painter: Rc<RefCell<Painter>>,
 }
 
 #[derive(Default)]
@@ -1064,14 +1081,12 @@ impl Paint {
         &mut self,
         rendering_context: Rc<dyn RenderingContext>,
     ) -> PainterId {
-        if let Some(painter_id) = self.painters.iter().find_map(|painter| {
-            let painter = painter.borrow();
-            if Rc::ptr_eq(&painter.rendering_context, &rendering_context) {
-                Some(painter.painter_id)
-            } else {
-                None
-            }
-        }) {
+        if let Some(painter_id) = self
+            .painters
+            .iter()
+            .find(|host| Rc::ptr_eq(&host.rendering_context, &rendering_context))
+            .map(|host| host.painter_id)
+        {
             return painter_id;
         }
 
@@ -1097,13 +1112,16 @@ impl Paint {
             .insert(painter.painter_id, painter_surfman_details);
 
         let painter_id = painter.painter_id;
-        self.painters.push(Rc::new(RefCell::new(painter)));
+        self.painters.push(PainterHost {
+            painter_id,
+            rendering_context,
+            painter: Rc::new(RefCell::new(painter)),
+        });
         painter_id
     }
 
     fn remove_painter(&mut self, painter_id: PainterId) {
-        self.painters
-            .retain(|painter| painter.borrow().painter_id != painter_id);
+        self.painters.retain(|host| host.painter_id != painter_id);
         self.painter_surfman_details_map.remove(painter_id);
     }
 
@@ -1122,9 +1140,8 @@ impl Paint {
     ) -> Option<R> {
         self.painters
             .iter()
-            .map(|painter| painter.borrow())
-            .find(|painter| painter.painter_id == painter_id)
-            .map(|painter| callback(&painter))
+            .find(|host| host.painter_id == painter_id)
+            .map(|host| callback(&host.painter.borrow()))
     }
 
     pub(crate) fn with_painter_mut<R: Send + 'static>(
@@ -1134,9 +1151,8 @@ impl Paint {
     ) -> Option<R> {
         self.painters
             .iter()
-            .map(|painter| painter.borrow_mut())
-            .find(|painter| painter.painter_id == painter_id)
-            .map(|mut painter| callback(&mut painter))
+            .find(|host| host.painter_id == painter_id)
+            .map(|host| callback(&mut host.painter.borrow_mut()))
     }
 
     /// ★스레드 준비가 안 된 경로 전용.★ 스크린샷 기계는 콜백
@@ -1153,11 +1169,11 @@ impl Paint {
         webview_id: WebViewId,
         callback: impl FnOnce(&Painter) -> R,
     ) -> Option<R> {
+        let painter_id = self.primary_painter_id_for_webview(webview_id);
         self.painters
             .iter()
-            .map(|painter| painter.borrow())
-            .find(|painter| painter.painter_id == self.primary_painter_id_for_webview(webview_id))
-            .map(|painter| callback(&painter))
+            .find(|host| host.painter_id == painter_id)
+            .map(|host| callback(&host.painter.borrow()))
     }
 
     fn with_primary_painter<R: Send + 'static>(
@@ -1688,7 +1704,7 @@ impl Paint {
     }
 
     pub fn painter_id(&self) -> PainterId {
-        self.painters[0].borrow().painter_id
+        self.painters[0].painter_id
     }
 
     pub fn rendering_context_size(&self, painter_id: PainterId) -> Size2D<u32, DevicePixel> {
@@ -1760,7 +1776,7 @@ impl Paint {
     pub fn webviews_needing_repaint(&self) -> Vec<WebViewId> {
         self.painters
             .iter()
-            .flat_map(|painter| painter.borrow().webviews_needing_repaint())
+            .flat_map(|host| host.painter.borrow().webviews_needing_repaint())
             .collect()
     }
 
@@ -2147,8 +2163,8 @@ impl Paint {
 
     fn collect_memory_report(&self, sender: profile_traits::mem::ReportsChan) {
         let mut memory_report = MemoryReport::default();
-        for painter in &self.painters {
-            memory_report += painter.borrow().report_memory();
+        for host in &self.painters {
+            memory_report += host.painter.borrow().report_memory();
         }
 
         let mut reports = vec![
@@ -2173,7 +2189,7 @@ impl Paint {
             let scroll_trees_memory_usage = self
                 .painters
                 .iter()
-                .map(|painter| painter.borrow().scroll_trees_memory_usage(ops))
+                .map(|host| host.painter.borrow().scroll_trees_memory_usage(ops))
                 .sum();
             reports.push(Report {
                 path: path!["paint", "scroll-tree"],
@@ -2443,7 +2459,7 @@ impl Paint {
             let pending: Vec<usize> = self
                 .painters
                 .iter()
-                .filter_map(|painter| painter.borrow().take_pending_dcomp_commit())
+                .filter_map(|host| host.painter.borrow().take_pending_dcomp_commit())
                 .collect();
             if pending.len() > 1 {
                 std::thread::scope(|scope| {
@@ -2459,8 +2475,8 @@ impl Paint {
             }
             return;
         }
-        for painter in &self.painters {
-            painter.borrow().flush_deferred_dcomp_commit();
+        for host in &self.painters {
+            host.painter.borrow().flush_deferred_dcomp_commit();
         }
     }
 
@@ -2543,8 +2559,8 @@ impl Paint {
         #[cfg(feature = "webxr")]
         self.webxr_main_thread.borrow_mut().run_one_frame();
 
-        for painter in &self.painters {
-            painter.borrow_mut().perform_updates();
+        for host in &self.painters {
+            host.painter.borrow_mut().perform_updates();
         }
 
         let wall_frame_repaint_decisions = self
@@ -2563,8 +2579,8 @@ impl Paint {
     }
 
     pub fn toggle_webrender_debug(&self, option: WebRenderDebugOption) {
-        for painter in &self.painters {
-            painter.borrow_mut().toggle_webrender_debug(option);
+        for host in &self.painters {
+            host.painter.borrow_mut().toggle_webrender_debug(option);
         }
     }
 
