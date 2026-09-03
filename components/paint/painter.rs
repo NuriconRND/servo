@@ -285,7 +285,7 @@ pub(crate) struct Painter {
     /// [`Painter::flush_owed_canvas_ack`] 가 실제로 보낸 횟수와 그 집계 창의 시작 시각.
     /// ★양성 대조용★ — 고쳐진 것과 코드가 안 도는 것을 구분하기 위한 것이다.
     owed_ack_flush_count: Cell<u64>,
-    owed_ack_window_start: Cell<Option<Instant>>,
+    owed_ack_last_report: Cell<Option<Instant>>,
 
     /// 남은 ack 주입 횟수(`SERVO_WALL_CANVAS_ACK_SKIP`). 0 이면 주입 없음 = 기본값.
     canvas_ack_skips_left: Cell<u64>,
@@ -711,7 +711,7 @@ impl Painter {
             canvas_ack_held_since: Default::default(),
             canvas_ack_last_report: Default::default(),
             owed_ack_flush_count: Default::default(),
-            owed_ack_window_start: Default::default(),
+            owed_ack_last_report: Default::default(),
             canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
             frame_reason_counts: Default::default(),
             frame_reason_window_start: Default::default(),
@@ -966,23 +966,25 @@ impl Painter {
         // ★양성 대조★: 고친 뒤에는 스톨이 안 나므로 "아무 줄도 없음"이 남는데, 그것만으로는
         // **고쳐진 것**과 **이 코드가 아예 안 도는 것**이 구분되지 않는다. 이 조사에서만 네 번
         // 같은 함정에 빠졌으므로, 실제로 보낸 횟수를 초당 한 줄로 남긴다. 0 이면 안 찍는다.
-        let count = self.owed_ack_flush_count.get() + 1;
-        self.owed_ack_flush_count.set(count);
+        // ★첫 건은 반드시 즉시 찍는다.★ 처음엔 1 초 창으로 합쳐서 찍었는데, 창 시작을 첫
+        // 호출에서 잡고 같은 호출에서 경과를 보므로 **딱 한 번 일어나는 경우가 영영 안 찍혔다**
+        // (2026-09-03, `log_webgpu/54`: painter 마다 1 회씩 복구했는데 `WALLACKFLUSH` 0 줄).
+        // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
+        // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
+        let total = self.owed_ack_flush_count.get() + 1;
+        self.owed_ack_flush_count.set(total);
         let now = Instant::now();
-        let window_start = self.owed_ack_window_start.get().unwrap_or_else(|| {
-            self.owed_ack_window_start.set(Some(now));
-            now
-        });
-        if now.duration_since(window_start).as_secs_f64() >= 1.0 {
+        let due = self
+            .owed_ack_last_report
+            .get()
+            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
+        if due {
+            self.owed_ack_last_report.set(Some(now));
             warn!(
-                "WALLACKFLUSH: painter {:?} sent {} owed canvas ack(s) in the last {:.1}s. \
+                "WALLACKFLUSH: painter {:?} sent an owed canvas ack ({} so far). \
                  Each one is a frame script would otherwise have waited for forever.",
-                self.painter_id,
-                count,
-                now.duration_since(window_start).as_secs_f64(),
+                self.painter_id, total,
             );
-            self.owed_ack_flush_count.set(0);
-            self.owed_ack_window_start.set(Some(now));
         }
     }
 

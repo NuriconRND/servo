@@ -1042,7 +1042,7 @@ if ($wdog) {
 # WALLACKFLUSH counts acks the recovery actually sent -- it is the POSITIVE CONTROL, without
 # which a clean run cannot be told apart from the recovery never running at all. WALLACKLATCH
 # means recovery was not even possible, which is a different and worse bug.
-$ackFlush = Select-String -Path $LogPath -Pattern "WALLACKFLUSH: painter PainterId\((\d+)\) sent (\d+) owed canvas ack" -EA SilentlyContinue
+$ackFlush = Select-String -Path $LogPath -Pattern "WALLACKFLUSH: painter PainterId\((\d+)\) sent an owed canvas ack \((\d+) so far\)" -EA SilentlyContinue
 $ackLatch = Select-String -Path $LogPath -Pattern "WALLACKLATCH: painter PainterId\((\d+)\) held the canvas ack for (\d+)ms" -EA SilentlyContinue
 Write-Host ""
 if ($ackLatch) {
@@ -1050,12 +1050,20 @@ if ($ackLatch) {
     Write-Host "WALLACK -- STALLED: a painter held script's canvas ack for up to $([math]::Round($worstHeld/1000,1))s across $($ackLatch.Count) report(s)." -ForegroundColor Red
     Write-Host "  Recovery could not run, so the gate values on those lines say which condition blocked it."
 } elseif ($ackFlush) {
-    $sent = ($ackFlush | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Sum).Sum
+    # The count in the line is that painter's RUNNING TOTAL, not a delta -- bursts are
+    # coalesced to one line a second, so summing the lines would double-count. Take the
+    # highest total each painter reported.
     $byPainter = $ackFlush | Group-Object { $_.Matches[0].Groups[1].Value } | Sort-Object Name
+    $perPainter = foreach ($p in $byPainter) {
+        [pscustomobject]@{
+            Painter = $p.Name
+            Count   = ($p.Group | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Maximum).Maximum
+        }
+    }
+    $sent = ($perPainter | Measure-Object Count -Sum).Sum
     Write-Host "WALLACK -- recovery is live and no stall: $sent owed ack(s) sent, none left held." -ForegroundColor Green
-    foreach ($p in $byPainter) {
-        $n = ($p.Group | ForEach-Object { [int]$_.Matches[0].Groups[2].Value } | Measure-Object -Sum).Sum
-        Write-Host ("  painter {0}: {1} ack(s) recovered" -f $p.Name, $n)
+    foreach ($p in $perPainter) {
+        Write-Host ("  painter {0}: {1} ack(s) recovered" -f $p.Painter, $p.Count)
     }
     Write-Host "  Each one is a frame that would have hung the wall permanently before this fix."
 } else {
