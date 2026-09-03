@@ -1036,6 +1036,35 @@ if ($wdog) {
     Write-Warning "-FanoutProf was set but no WEBGLWATCHDOG line was logged. That thread emits once a second unconditionally, so its silence means it never started -- not that the run was healthy."
 }
 
+# --- WALLSPLIT: where a wall pass actually spends its time (needs -PresentCadence).
+# The DComp-on penalty is ~6.7ms a pass on the same page, and DCOMPBIND accounts for only the
+# ~1.5ms spent outside the tile loop. This splits the tile step itself with the SAME window and
+# denominator as WALLPASS -- mixing per-sample and per-window averages is how an earlier attempt
+# produced a negative remainder.
+$split = Select-String -Path $LogPath -Pattern "WALLSPLIT pass_ms=([\d.]+) = make_current=([\d.]+) \+ paint=([\d.]+) \+ present=([\d.]+) \+ outside=(-?[\d.]+)" -EA SilentlyContinue
+if ($split) {
+    $acc = @{ pass = 0.0; mc = 0.0; paint = 0.0; present = 0.0; outside = 0.0 }
+    foreach ($hit in $split) {
+        $g = $hit.Matches[0].Groups
+        $acc.pass += [double]$g[1].Value
+        $acc.mc += [double]$g[2].Value
+        $acc.paint += [double]$g[3].Value
+        $acc.present += [double]$g[4].Value
+        $acc.outside += [double]$g[5].Value
+    }
+    $w = $split.Count
+    Write-Host ""
+    Write-Host "WALLSPLIT -- where one wall pass goes ($w one-second windows, all tiles summed):"
+    Write-Host ("  pass_ms       {0,7:N2}" -f ($acc.pass / $w))
+    Write-Host ("    make_current{0,7:N2}" -f ($acc.mc / $w))
+    Write-Host ("    paint       {0,7:N2}   <- Painter::render for every tile" -f ($acc.paint / $w))
+    Write-Host ("    present     {0,7:N2}" -f ($acc.present / $w))
+    Write-Host ("    outside     {0,7:N2}   <- deferred DComp Commit flush + the loop itself" -f ($acc.outside / $w))
+    Write-Host "  Compare the same page with -DComp on and -DComp off: the line that grows is the one to chase."
+} elseif ($PresentCadence) {
+    Write-Warning "-PresentCadence was set but no WALLSPLIT line was logged. It comes from winit_wall's render pass, so a servoshell run or a run that never painted produces nothing."
+}
+
 # --- WALLACK: the canvas-ack deadlock and its recovery.
 # A document that drew a canvas is locked until a painter sends the ack, and both places that
 # send it leave the recheck to a later update_images call that a canvas-only page never makes.

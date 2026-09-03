@@ -262,10 +262,25 @@ struct PassStats {
     tile_ms_max: Vec<f64>,
     /// Tiles skipped by the keep-previous barrier, which shorten a pass for a different reason.
     skipped: u32,
+    /// 타일 스텝을 셋으로 쪼갠 것. ★WALLPASS 와 **같은 창·같은 분모**여야 한다★ — 기존에는
+    /// `render_ms`(샘플 평균)와 WALLPASS per-tile(창 평균)을 빼려다 음수가 나왔다. DComp on 이
+    /// 패스당 +6.7ms 인데 그 중 타일 루프 **밖**은 1.5ms 뿐이라, 나머지 5.2ms 가 이 셋 중
+    /// 어디인지가 지금의 질문이다(2026-09-03, `log_webgpu/45` gap_off/gap_on).
+    make_current_ms_sum: f64,
+    paint_ms_sum: f64,
+    present_ms_sum: f64,
+}
+
+/// 한 패스에서 타일 스텝을 셋으로 나눈 합계(타일 전부를 더한 값).
+#[derive(Default)]
+struct PassSplit {
+    make_current_ms: f64,
+    paint_ms: f64,
+    present_ms: f64,
 }
 
 impl AppState {
-    fn note_render_pass(&self, pass_ms: f64, tile_ms: &[f64], skipped: u32) {
+    fn note_render_pass(&self, pass_ms: f64, tile_ms: &[f64], skipped: u32, split: PassSplit) {
         // ***`string`, not `enabled`.*** This flag is `Kind::Str`, and `enabled` asserts the
         // flag is `Kind::Presence` -- calling it here panicked on startup. Same truthiness
         // test painter.rs uses for the same flag, and cached because this runs every pass.
@@ -287,6 +302,9 @@ impl AppState {
         stats.pass_ms_sum += pass_ms;
         stats.pass_ms_max = stats.pass_ms_max.max(pass_ms);
         stats.skipped += skipped;
+        stats.make_current_ms_sum += split.make_current_ms;
+        stats.paint_ms_sum += split.paint_ms;
+        stats.present_ms_sum += split.present_ms;
         for (index, ms) in tile_ms.iter().enumerate() {
             stats.tile_ms_sum[index] += ms;
             stats.tile_ms_max[index] = stats.tile_ms_max[index].max(*ms);
@@ -321,6 +339,21 @@ impl AppState {
             slowest,
             ceiling,
             stats.skipped,
+        );
+        // 같은 창, 같은 분모(패스 수)로 나눈 타일 스텝의 내역. `outside` 는 패스 전체에서 이
+        // 셋을 뺀 것 = 지연 Commit 플러시와 루프 자체의 비용이다.
+        let make_current = stats.make_current_ms_sum / passes;
+        let paint = stats.paint_ms_sum / passes;
+        let present = stats.present_ms_sum / passes;
+        log::info!(
+            "WALLSPLIT pass_ms={:.2} = make_current={:.2} + paint={:.2} + present={:.2} \
+             + outside={:.2} (all per pass, {} tiles summed)",
+            stats.pass_ms_sum / passes,
+            make_current,
+            paint,
+            present,
+            stats.pass_ms_sum / passes - make_current - paint - present,
+            stats.tile_ms_sum.len(),
         );
         *stats = PassStats {
             window_start: Some(now),
@@ -392,6 +425,7 @@ impl AppState {
         };
         let pass_start = std::time::Instant::now();
         let mut tile_ms = vec![0.0f64; self.tiles.len()];
+        let mut split = PassSplit::default();
         let mut skipped = 0u32;
         // `gfx_wall_rotate_tile_order`: 시작 타일을 패스마다 한 칸 돌린다.
         //
@@ -425,20 +459,32 @@ impl AppState {
                         skipped += 1;
                         continue;
                     }
+                    let current_start = std::time::Instant::now();
                     let _ = tile.rendering_context.make_current();
+                    split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
+                    let paint_start = std::time::Instant::now();
                     webview.paint_target(target);
+                    split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
                     let present_start = std::time::Instant::now();
                     tile.rendering_context.present();
-                    self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
+                    let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
+                    split.present_ms += present_ms;
+                    self.note_present(present_ms);
                 },
                 None => {
+                    let current_start = std::time::Instant::now();
                     let _ = tile.rendering_context.make_current();
+                    split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
+                    let paint_start = std::time::Instant::now();
                     webview.paint();
+                    split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
                     // Capture before present (FLIP_DISCARD discards the backbuffer on Present).
                     self.maybe_capture(tile);
                     let present_start = std::time::Instant::now();
                     tile.rendering_context.present();
-                    self.note_present(present_start.elapsed().as_secs_f64() * 1000.0);
+                    let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
+                    split.present_ms += present_ms;
+                    self.note_present(present_ms);
                 },
             }
             tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
@@ -455,6 +501,7 @@ impl AppState {
             pass_start.elapsed().as_secs_f64() * 1000.0,
             &tile_ms,
             skipped,
+            split,
         );
     }
 }
