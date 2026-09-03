@@ -25,9 +25,9 @@ use paint_api::largest_contentful_paint_candidate::LCPCandidate;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PaintProxy, PipelineExitSource, SendableFrameTree, SerializableDisplayListPayload,
-    SerializableImageData, WebRenderExternalImageHandlers, WebRenderExternalImageIdManager,
-    WebRenderImageHandlerType,
+    ImageUpdate, PaintProxy, PainterSurfmanDetailsMap, PipelineExitSource, SendableFrameTree,
+    SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
+    WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
@@ -472,6 +472,11 @@ pub(crate) struct PainterInputs {
     pub(crate) embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
     pub(crate) event_loop_waker: Box<dyn EventLoopWaker>,
     pub(crate) paint_proxy: PaintProxy,
+    /// ★타일 스레드가 자기 것을 여기 등록해야 한다.★ WebGL 팬아웃은 이 표에 없는 painter 를
+    /// 대상 목록에서 **조용히 걸러낸다**(`webgl_thread::create_webgl_context`). 인라인 경로는
+    /// `Paint::register_rendering_context` 가 채우지만, 스레드 경로는 컨텍스트가 그쪽에서
+    /// 만들어지므로 그쪽에서 채울 수밖에 없다.
+    pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
 }
 
 impl Painter {

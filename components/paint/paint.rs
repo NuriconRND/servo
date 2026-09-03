@@ -1200,6 +1200,7 @@ impl Paint {
     /// 실패하면 `None` — 호출자는 인라인 경로로 되돌아갈 수 있어야 한다.
     pub fn spawn_painter_thread(&mut self, factory: RenderingContextFactory) -> Option<PainterId> {
         let inputs = self.painter_inputs();
+        let surfman_details_map = self.painter_surfman_details_map.clone();
         let (requests, request_receiver) = crossbeam_channel::unbounded::<PainterRequest>();
         let (id_sender, id_receiver) = crossbeam_channel::bounded(1);
 
@@ -1207,7 +1208,27 @@ impl Paint {
             .name(String::from("WallTilePainter"))
             .spawn(move || {
                 let rendering_context = factory();
+
+                // ★`Painter::new` 보다 먼저 등록해야 한다.★ WebGL 팬아웃은 이 표에 없는
+                // painter 를 대상에서 조용히 걸러내므로, 늦게 넣으면 그 타일은 캔버스를
+                // 영영 못 받는다(2026-09-03 `log_webgpu/64`~`66` 의 증상이 정확히 그것이다).
+                let connection = rendering_context
+                    .connection()
+                    .expect("Failed to get the tile thread's surfman connection");
+                let adapter = paint_api::rendering_context::create_adapter_for_requested_gpu(
+                    &connection,
+                    rendering_context.requested_gpu_index(),
+                )
+                .expect("Failed to create an adapter for the tile thread");
+
                 let mut painter = Painter::new(rendering_context, inputs);
+                surfman_details_map.insert(
+                    painter.painter_id,
+                    PainterSurfmanDetails {
+                        connection,
+                        adapter,
+                    },
+                );
                 // 셸은 이 컨텍스트를 갖고 있지 않으므로 표출도 이 스레드가 한다.
                 painter.take_over_presentation();
                 if id_sender.send(painter.painter_id).is_err() {
@@ -1911,6 +1932,7 @@ impl Paint {
             embedder_to_constellation_sender: self.embedder_to_constellation_sender.clone(),
             event_loop_waker: self.event_loop_waker.clone_box(),
             paint_proxy: self.paint_proxy.clone(),
+            painter_surfman_details_map: self.painter_surfman_details_map.clone(),
         }
     }
 

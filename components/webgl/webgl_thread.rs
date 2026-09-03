@@ -1081,9 +1081,21 @@ impl WebGLThread {
                 .into_iter()
                 .filter(|target_painter_id| *target_painter_id != painter_id)
                 .filter(|target_painter_id| {
-                    self.painter_surfman_details_map
+                    let known = self
+                        .painter_surfman_details_map
                         .get(*target_painter_id)
-                        .is_some()
+                        .is_some();
+                    if !known {
+                        // ★이 탈락은 조용하면 안 된다.★ 걸러진 타일은 이 캔버스를 영영 못
+                        // 받고(팬아웃 대상은 여기서 고정된다), 화면에는 "그 타일만 캔버스가
+                        // 없다" 로만 나타난다. 2026-09-03 에 그 침묵 때문에 원인을 두 번
+                        // 잘못 짚었다(`log_webgpu/64`~`66`) — 실제 원인은 그 painter 가
+                        // surfman 상세를 등록하지 않은 것이었다.
+                        warn!(
+                            "WebGL fan-out is dropping {target_painter_id:?}: it has no surfman                              details registered, so no backend can be built for it. That tile                              will render without this canvas."
+                        );
+                    }
+                    known
                 }),
         );
         let target_painter_ids: Vec<_> =
