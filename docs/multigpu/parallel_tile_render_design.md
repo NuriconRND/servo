@@ -211,9 +211,16 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
    스레드 전용, 그 사이를 건너는 것은 HWND 정수 하나뿐. 스파이크를 신뢰할 수 있게 만든 것도
    이 분리다: 컨텍스트가 이미 붙은 HWND 에 두 번째를 만들면 `-DComp on` 에서 HWND 당 DComp
    타깃이 하나뿐이라 실패하고, 그 실패가 "스레드 탓" 으로 오독된다.
-2. **`Painter` 를 타일 스레드로** — `Rc` 필드를 정리한다. `refresh_driver` 와
-   `animation_refresh_driver_observer` 는 **타일별 인스턴스**로 나눌 수 있는지, 아니면
-   메인에 남기고 메시지로 통신할지 결정해야 한다(미해결, §7).
+2. **`Painter` 를 타일 스레드로.** 진행 중.
+   - **완료(2026-09-03, `8ecab58122a`)**: `Painter::new` 가 `&Paint` 대신 `PainterInputs`
+     를 받는다 — `Paint` 에서 읽던 여덟 가지를 `Send` 값 묶음으로 떼어냈다. `Paint` 는 `Rc`
+     투성이라 참조를 스레드로 건넬 수 없고, `Renderer`/`RenderingContext` 는 `!Send` 라
+     만들어 놓고 옮길 수도 없다. 그래서 **타일 스레드가 직접 만들 수 있는 재료**만 남긴 것이
+     이 단계다. `Paint::assert_painter_inputs_are_send` 가 컴파일 타임에 강제한다(★가드가
+     실제로 잡는지 `Rc<()>` 를 끼워 넣어 확인했다★).
+   - `refresh_driver` / `animation_refresh_driver_observer` 는 §7-1 대로 **이미 타일별**이라
+     할 일이 없다.
+   - **남은 것**: `Painter` 를 실제로 스레드에 올리고 채널로 구동하기(3 단계와 맞물린다).
 3. **채널 프로토콜 + 배리어 이동** — 월 프레임 배리어를 `Cell` 기반에서 스레드 안전 구조로.
    실패 주입 env 3종(`SERVO_WALL_FRAME_DELAY_*`)이 계속 동작해야 한다.
 4. **`present()` 를 타일 스레드로** — 리사이즈/DComp 재구축과의 조율이 여기 있다.
@@ -228,9 +235,12 @@ A 는 주 단위 작업이고 C 는 하루다. C 가 되면 A 는 필요 없다.
 
 ## 7. 미해결 (설계 확정 전에 답해야 함)
 
-1. **`BaseRefreshDriver` 를 타일별로 나눌 수 있나?** 지금은 `Paint` 와 painter 들이 하나를
-   공유하고 observer 가 `Painter` 를 콜백한다. 나눌 수 없으면 메인에 남기고 메시지로 통신해야
-   하는데, 그러면 프레임 시작 신호가 스레드를 한 번 더 건넌다.
+1. ~~**`BaseRefreshDriver` 를 타일별로 나눌 수 있나?**~~ **해소(2026-09-03). ★이미 나뉘어
+   있다.★** 전제가 틀렸다 — `Paint` 는 하나도 들고 있지 않고, `Painter::new`
+   (`painter.rs:509`)가 painter 마다 자기 `BaseRefreshDriver` 와 자기
+   `AnimationRefreshDriverObserver` 를 만든다. 같은 날 스톨 조사에서 `ANIMTICK start` 가
+   4 줄 나오고 `stop` 이 없던 것이 그 증거였다(각 observer 가 자기 `animating` Cell 을 가진다).
+   메인에 남기고 메시지로 통신할 필요가 없다.
 2. ~~**`dcomp_shared` 의 "shared" 가 타일 간 공유인가.**~~ **해소(2026-09-01). 공유가 아니다.**
    "shared" 는 **WebRender 와 Painter 사이**를 뜻한다 — WR 이 `Box<SharedDComp>`
    (`CompositorConfig::Native`)로 소유하고 painter 가 같은 인스턴스의 `Rc` 클론으로
