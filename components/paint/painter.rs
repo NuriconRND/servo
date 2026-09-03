@@ -144,7 +144,6 @@ static DCOMP_RESIZE_VIRTUAL_DISABLED: LazyLock<bool> = LazyLock::new(|| {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
-use crate::Paint;
 use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator;
 use crate::paint::{RepaintReason, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};

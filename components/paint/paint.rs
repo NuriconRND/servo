@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::env;
 use std::fs::create_dir_all;
@@ -1100,31 +1100,52 @@ impl Paint {
         self.painter_surfman_details_map.remove(painter_id);
     }
 
-    pub(crate) fn maybe_painter<'a>(&'a self, painter_id: PainterId) -> Option<Ref<'a, Painter>> {
+    /// `Painter` 에 닿는 통로. ★`Ref`/`RefMut` 를 돌려주지 않는 것이 요점이다.★
+    ///
+    /// 병렬 타일 렌더(A 안)에서 painter 는 **다른 스레드에 산다.** 빌린 참조를 호출자에게
+    /// 건네는 형태는 그때 호출부까지 전부 다시 써야 하지만, 클로저로 좁혀 두면 **이 함수의
+    /// 구현만** 채널 왕복으로 바꾸면 된다(설계 §3.2-1). 지금은 그대로 인라인 실행이므로
+    /// 동작이 바뀌지 않는다.
+    ///
+    /// `None` 은 그 `PainterId` 가 없다는 뜻이고, 기존 `maybe_painter_mut` 의 `None` 과 같다.
+    pub(crate) fn with_painter<R>(
+        &self,
+        painter_id: PainterId,
+        callback: impl FnOnce(&Painter) -> R,
+    ) -> Option<R> {
         self.painters
             .iter()
             .map(|painter| painter.borrow())
             .find(|painter| painter.painter_id == painter_id)
+            .map(|painter| callback(&painter))
     }
 
-    pub(crate) fn painter<'a>(&'a self, painter_id: PainterId) -> Ref<'a, Painter> {
-        self.maybe_painter(painter_id)
-            .expect("painter_id not found")
-    }
-
-    pub(crate) fn maybe_painter_mut<'a>(
-        &'a self,
+    pub(crate) fn with_painter_mut<R>(
+        &self,
         painter_id: PainterId,
-    ) -> Option<RefMut<'a, Painter>> {
+        callback: impl FnOnce(&mut Painter) -> R,
+    ) -> Option<R> {
         self.painters
             .iter()
             .map(|painter| painter.borrow_mut())
             .find(|painter| painter.painter_id == painter_id)
+            .map(|mut painter| callback(&mut painter))
     }
 
-    pub(crate) fn painter_mut<'a>(&'a self, painter_id: PainterId) -> RefMut<'a, Painter> {
-        self.maybe_painter_mut(painter_id)
-            .expect("painter_id not found")
+    fn with_primary_painter<R>(
+        &self,
+        webview_id: WebViewId,
+        callback: impl FnOnce(&Painter) -> R,
+    ) -> Option<R> {
+        self.with_painter(self.primary_painter_id_for_webview(webview_id), callback)
+    }
+
+    fn with_primary_painter_mut<R>(
+        &self,
+        webview_id: WebViewId,
+        callback: impl FnOnce(&mut Painter) -> R,
+    ) -> Option<R> {
+        self.with_painter_mut(self.primary_painter_id_for_webview(webview_id), callback)
     }
 
     fn register_webview_painter_target(&self, webview_id: WebViewId, painter_id: PainterId) {
@@ -1196,12 +1217,13 @@ impl Paint {
             let mut snapshots = Vec::new();
             let mut missing_targets = Vec::new();
             for painter_id in target_painter_ids {
-                let Some(painter) = self.maybe_painter(*painter_id) else {
+                let Some(signature) = self.with_painter(*painter_id, |painter| {
+                    painter.wall_scroll_offsets_signature(*webview_id)
+                }) else {
                     missing_targets.push(format!("{painter_id:?}:missing-painter"));
                     continue;
                 };
-
-                let Some(signature) = painter.wall_scroll_offsets_signature(*webview_id) else {
+                let Some(signature) = signature else {
                     missing_targets.push(format!("{painter_id:?}:missing-webview"));
                     continue;
                 };
@@ -1251,9 +1273,7 @@ impl Paint {
         mut callback: impl FnMut(&mut Painter),
     ) {
         for painter_id in self.painter_targets_for_webview(webview_id) {
-            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                callback(&mut painter);
-            }
+            self.with_painter_mut(painter_id, &mut callback);
         }
     }
 
@@ -1263,9 +1283,7 @@ impl Paint {
         mut callback: impl FnMut(&mut Painter),
     ) {
         for painter_id in self.target_painter_ids_for_source_painter(source_painter_id) {
-            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-                callback(&mut painter);
-            }
+            self.with_painter_mut(painter_id, &mut callback);
         }
     }
 
@@ -1274,25 +1292,6 @@ impl Paint {
             .first()
             .copied()
             .unwrap_or_else(|| webview_id.into())
-    }
-
-    fn maybe_primary_painter<'a>(&'a self, webview_id: WebViewId) -> Option<Ref<'a, Painter>> {
-        self.maybe_painter(self.primary_painter_id_for_webview(webview_id))
-    }
-
-    fn maybe_primary_painter_mut<'a>(
-        &'a self,
-        webview_id: WebViewId,
-    ) -> Option<RefMut<'a, Painter>> {
-        self.maybe_painter_mut(self.primary_painter_id_for_webview(webview_id))
-    }
-
-    fn primary_painter<'a>(&'a self, webview_id: WebViewId) -> Ref<'a, Painter> {
-        self.painter(self.primary_painter_id_for_webview(webview_id))
-    }
-
-    fn primary_painter_mut<'a>(&'a self, webview_id: WebViewId) -> RefMut<'a, Painter> {
-        self.painter_mut(self.primary_painter_id_for_webview(webview_id))
     }
 
     fn next_logical_frame_id(&self) -> u64 {
@@ -1341,8 +1340,7 @@ impl Paint {
         target_painter_ids
             .iter()
             .filter_map(|painter_id| {
-                self.maybe_painter(*painter_id)
-                    .map(|painter| painter.pending_frames())
+                self.with_painter(*painter_id, |painter| painter.pending_frames())
             })
             .max()
             .unwrap_or_default()
@@ -1572,10 +1570,11 @@ impl Paint {
 
         let mut generated_painter_ids = Vec::new();
         for painter_id in &request.target_painter_ids {
-            if let Some(mut painter) = self.maybe_painter_mut(*painter_id) {
-                if painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at) {
-                    generated_painter_ids.push(*painter_id);
-                }
+            let generated = self.with_painter_mut(*painter_id, |painter| {
+                painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at)
+            });
+            if generated == Some(true) {
+                generated_painter_ids.push(*painter_id);
             }
         }
 
@@ -1661,7 +1660,8 @@ impl Paint {
     }
 
     pub fn rendering_context_size(&self, painter_id: PainterId) -> Size2D<u32, DevicePixel> {
-        self.painter(painter_id).rendering_context.size2d()
+        self.with_painter(painter_id, |painter| painter.rendering_context.size2d())
+            .expect("painter_id not found")
     }
 
     /// ★병렬 타일 렌더(A 안) 2 단계의 컴파일 타임 관문.★
@@ -1755,9 +1755,9 @@ impl Paint {
 
     fn handle_painters_ready_for_repaint(&self, frame_ready_for_painter: HashMap<PainterId, bool>) {
         for (painter_id, repaint_needed) in frame_ready_for_painter {
-            if let Some(painter) = self.maybe_painter(painter_id) {
-                painter.handle_new_webrender_frame_ready(repaint_needed);
-            }
+            self.with_painter(painter_id, |painter| {
+                painter.handle_new_webrender_frame_ready(repaint_needed)
+            });
         }
     }
 
@@ -1922,8 +1922,10 @@ impl Paint {
                     let requested_gpus: Vec<_> = target_painter_ids
                         .iter()
                         .map(|target_painter_id| {
-                            self.maybe_painter(*target_painter_id)
-                                .and_then(|painter| painter.rendering_context.requested_gpu_index())
+                            self.with_painter(*target_painter_id, |painter| {
+                                painter.rendering_context.requested_gpu_index()
+                            })
+                            .flatten()
                         })
                         .collect();
                     let mut add_count = 0;
@@ -1976,9 +1978,9 @@ impl Paint {
                     }
                 }
                 for target_painter_id in target_painter_ids {
-                    if let Some(mut painter) = self.maybe_painter_mut(target_painter_id) {
-                        painter.update_images(updates.clone());
-                    }
+                    self.with_painter_mut(target_painter_id, |painter| {
+                        painter.update_images(updates.clone())
+                    });
                 }
             },
             PaintMessage::DelayNewFrameForCanvas(
@@ -2054,9 +2056,9 @@ impl Paint {
                 });
             },
             PaintMessage::ScreenshotReadinessReponse(webview_id, pipelines_and_epochs) => {
-                if let Some(painter) = self.maybe_primary_painter(webview_id) {
-                    painter.handle_screenshot_readiness_reply(webview_id, pipelines_and_epochs);
-                }
+                self.with_primary_painter(webview_id, |painter| {
+                    painter.handle_screenshot_readiness_reply(webview_id, pipelines_and_epochs)
+                });
             },
             PaintMessage::SendLCPCandidate(lcp_candidate, webview_id, pipeline_id, epoch) => {
                 self.for_each_webview_painter_mut(webview_id, |painter| {
@@ -2089,14 +2091,14 @@ impl Paint {
         let painter_ids = self.remove_webview_painter_targets(webview_id);
 
         for painter_id in painter_ids {
-            let Some(mut painter) = self.maybe_painter_mut(painter_id) else {
-                continue;
-            };
-            painter.remove_webview(webview_id);
-            let should_remove_painter = painter.is_empty();
-            drop(painter);
+            // `drop(painter)` 로 빌림을 끊던 자리다 — 클로저가 끝나면서 같은 일을 하므로
+            // `remove_painter` 가 `painters` 를 다시 빌려도 겹치지 않는다.
+            let should_remove_painter = self.with_painter_mut(painter_id, |painter| {
+                painter.remove_webview(webview_id);
+                painter.is_empty()
+            });
 
-            if should_remove_painter {
+            if should_remove_painter == Some(true) {
                 self.remove_painter(painter_id);
             }
         }
@@ -2157,14 +2159,14 @@ impl Paint {
         };
 
         for painter_id in self.painter_targets_for_webview(webview_id) {
-            if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
+            self.with_painter_mut(painter_id, |painter| {
                 painter.handle_new_display_list(
                     webview_id,
                     display_list_descriptor.clone(),
                     display_list_info.clone(),
                     display_list_data.clone(),
-                );
-            }
+                )
+            });
         }
     }
 
@@ -2180,9 +2182,9 @@ impl Paint {
     fn handle_browser_message_while_shutting_down(&self, msg: PaintMessage) {
         match msg {
             PaintMessage::PipelineExited(webview_id, pipeline_id, pipeline_exit_source) => {
-                if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-                    painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source);
-                }
+                self.with_primary_painter_mut(webview_id, |painter| {
+                    painter.notify_pipeline_exited(webview_id, pipeline_id, pipeline_exit_source)
+                });
             },
             PaintMessage::GenerateImageKey(webview_id, result_sender) => {
                 self.handle_generate_image_key(webview_id, result_sender);
@@ -2218,8 +2220,10 @@ impl Paint {
         let webview_id = webview.id();
         let painter_id: PainterId = webview_id.into();
         self.register_webview_painter_target(webview_id, painter_id);
-        self.painter_mut(painter_id)
-            .add_webview(webview, viewport_details, viewport_origin);
+        self.with_painter_mut(painter_id, |painter| {
+            painter.add_webview(webview, viewport_details, viewport_origin)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn add_webview_paint_target(
@@ -2232,8 +2236,10 @@ impl Paint {
         let webview_id = webview.id();
         let painter_id = self.register_rendering_context(rendering_context);
         self.register_webview_painter_target(webview_id, painter_id);
-        self.painter_mut(painter_id)
-            .add_webview(webview, viewport_details, viewport_origin);
+        self.with_painter_mut(painter_id, |painter| {
+            painter.add_webview(webview, viewport_details, viewport_origin)
+        })
+        .expect("painter_id not found");
         painter_id
     }
 
@@ -2277,8 +2283,10 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .set_hidpi_scale_factor(webview_id, new_scale_factor);
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.set_hidpi_scale_factor(webview_id, new_scale_factor)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn set_viewport_details(&self, webview_id: WebViewId, viewport_details: ViewportDetails) {
@@ -2294,8 +2302,10 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .resize_rendering_context(new_size);
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.resize_rendering_context(new_size)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn update_webview_paint_target(
@@ -2314,9 +2324,11 @@ impl Paint {
             return;
         }
 
-        let mut painter = self.painter_mut(painter_id);
-        painter.resize_rendering_context(new_size);
-        painter.set_viewport_details_and_origin(webview_id, viewport_details, viewport_origin);
+        self.with_painter_mut(painter_id, |painter| {
+            painter.resize_rendering_context(new_size);
+            painter.set_viewport_details_and_origin(webview_id, viewport_details, viewport_origin);
+        })
+        .expect("painter_id not found");
     }
 
     pub fn set_page_zoom(&self, webview_id: WebViewId, new_zoom: f32) {
@@ -2329,13 +2341,16 @@ impl Paint {
     }
 
     pub fn page_zoom(&self, webview_id: WebViewId) -> f32 {
-        self.primary_painter(webview_id).page_zoom(webview_id)
+        self.with_primary_painter(webview_id, |painter| painter.page_zoom(webview_id))
+            .expect("painter_id not found")
     }
 
     /// Render the WebRender scene to the active `RenderingContext`.
     pub fn render(&self, webview_id: WebViewId) {
-        self.primary_painter_mut(webview_id)
-            .render(&self.time_profiler_chan);
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.render(&self.time_profiler_chan)
+        })
+        .expect("painter_id not found");
     }
 
     /// Render one registered paint target for the given logical `WebView`.
@@ -2348,9 +2363,9 @@ impl Paint {
             return;
         }
 
-        if let Some(mut painter) = self.maybe_painter_mut(painter_id) {
-            painter.render(&self.time_profiler_chan);
-        }
+        self.with_painter_mut(painter_id, |painter| {
+            painter.render(&self.time_profiler_chan)
+        });
     }
 
     /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
@@ -2409,8 +2424,11 @@ impl Paint {
         let mut frame_ready_diagnostics = Vec::new();
         messages.retain(|message| match message {
             PaintMessage::NewWebRenderFrameReady(painter_id, _document_id, need_repaint) => {
-                if let Some(painter) = self.maybe_painter(*painter_id) {
-                    if let Some(diagnostic) = painter.note_webrender_frame_ready(*need_repaint) {
+                let diagnostic = self.with_painter(*painter_id, |painter| {
+                    painter.note_webrender_frame_ready(*need_repaint)
+                });
+                if let Some(diagnostic) = diagnostic {
+                    if let Some(diagnostic) = diagnostic {
                         frame_ready_diagnostics.push(diagnostic);
                     } else {
                         Self::record_painter_ready_for_repaint(
@@ -2515,9 +2533,12 @@ impl Paint {
         };
 
         log::info!("Saving WebRender capture to {capture_path:?}");
-        self.primary_painter(webview_id)
-            .webrender_api
-            .save_capture(capture_path, CaptureBits::all());
+        self.with_primary_painter(webview_id, |painter| {
+            painter
+                .webrender_api
+                .save_capture(capture_path, CaptureBits::all())
+        })
+        .expect("painter_id not found");
     }
 
     /// Returning `false` means this is not going to reach the Constellation,
@@ -2535,8 +2556,10 @@ impl Paint {
             .point()
             .and_then(|point| self.painter_id_containing_input_point(webview_id, point))
             .unwrap_or_else(|| self.primary_painter_id_for_webview(webview_id));
-        self.painter_mut(painter_id)
-            .notify_input_event(webview_id, event)
+        self.with_painter_mut(painter_id, |painter| {
+            painter.notify_input_event(webview_id, event)
+        })
+        .expect("painter_id not found")
     }
 
     /// Finds the fanned-out painter whose tile viewport contains `point` (a positional input
@@ -2549,9 +2572,9 @@ impl Paint {
         self.painter_targets_for_webview(webview_id)
             .into_iter()
             .find(|&painter_id| {
-                self.maybe_painter(painter_id).is_some_and(|painter| {
+                self.with_painter(painter_id, |painter| {
                     painter.rendered_tile_contains_input_point(webview_id, point)
-                })
+                }) == Some(true)
             })
     }
 
@@ -2559,8 +2582,10 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id)
-            .notify_scroll_event(webview_id, scroll, point);
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.notify_scroll_event(webview_id, scroll, point)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn adjust_pinch_zoom(
@@ -2572,23 +2597,25 @@ impl Paint {
         if self.shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-        self.primary_painter_mut(webview_id).adjust_pinch_zoom(
-            webview_id,
-            pinch_zoom_delta,
-            center,
-        );
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.adjust_pinch_zoom(webview_id, pinch_zoom_delta, center)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn pinch_zoom(&self, webview_id: WebViewId) -> f32 {
-        self.primary_painter(webview_id).pinch_zoom(webview_id)
+        self.with_primary_painter(webview_id, |painter| painter.pinch_zoom(webview_id))
+            .expect("painter_id not found")
     }
 
     pub fn device_pixels_per_page_pixel(
         &self,
         webview_id: WebViewId,
     ) -> Scale<f32, CSSPixel, DevicePixel> {
-        self.primary_painter_mut(webview_id)
-            .device_pixels_per_page_pixel(webview_id)
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.device_pixels_per_page_pixel(webview_id)
+        })
+        .expect("painter_id not found")
     }
 
     pub(crate) fn shutdown_state(&self) -> ShutdownState {
@@ -2601,8 +2628,10 @@ impl Paint {
         rect: Option<WebViewRect>,
         callback: Box<dyn FnOnce(Result<RgbaImage, ScreenshotCaptureError>) + 'static>,
     ) {
-        self.primary_painter(webview_id)
-            .request_screenshot(webview_id, rect, callback);
+        self.with_primary_painter(webview_id, |painter| {
+            painter.request_screenshot(webview_id, rect, callback)
+        })
+        .expect("painter_id not found");
     }
 
     pub fn notify_input_event_handled(
@@ -2611,9 +2640,9 @@ impl Paint {
         input_event_id: InputEventId,
         result: InputEventResult,
     ) {
-        if let Some(mut painter) = self.maybe_primary_painter_mut(webview_id) {
-            painter.notify_input_event_handled(webview_id, input_event_id, result);
-        }
+        self.with_primary_painter_mut(webview_id, |painter| {
+            painter.notify_input_event_handled(webview_id, input_event_id, result)
+        });
     }
 
     /// Generate an image key from the appropriate [`Painter`] or, if it is unknown, generate
@@ -2626,10 +2655,11 @@ impl Paint {
         result_sender: GenericSender<ImageKey>,
     ) {
         let painter_id = self.primary_painter_id_for_webview(webview_id);
-        let image_key = self.maybe_painter(painter_id).map_or_else(
-            || ImageKey::new(painter_id.into(), 0),
-            |painter| painter.webrender_api.generate_image_key(),
-        );
+        let image_key = self
+            .with_painter(painter_id, |painter| {
+                painter.webrender_api.generate_image_key()
+            })
+            .unwrap_or_else(|| ImageKey::new(painter_id.into(), 0));
         let _ = result_sender.send(image_key);
     }
 
@@ -2643,15 +2673,19 @@ impl Paint {
         pipeline_id: PipelineId,
     ) {
         let painter_id = self.primary_painter_id_for_webview(webview_id);
-        let painter = self.maybe_painter(painter_id);
-        let image_keys = (0..pref!(image_key_batch_size))
-            .map(|_| {
-                painter.as_ref().map_or_else(
-                    || ImageKey::new(painter_id.into(), 0),
-                    |painter| painter.webrender_api.generate_image_key(),
-                )
+        // 한 번의 `with_painter` 안에서 전부 만든다 — painter 가 스레드로 가면 키 하나마다
+        // 왕복하는 형태는 그대로 쓸 수 없다.
+        let image_keys = self
+            .with_painter(painter_id, |painter| {
+                (0..pref!(image_key_batch_size))
+                    .map(|_| painter.webrender_api.generate_image_key())
+                    .collect()
             })
-            .collect();
+            .unwrap_or_else(|| {
+                (0..pref!(image_key_batch_size))
+                    .map(|_| ImageKey::new(painter_id.into(), 0))
+                    .collect()
+            });
 
         let _ = self.embedder_to_constellation_sender.send(
             EmbedderToConstellationMessage::SendImageKeysForPipeline(pipeline_id, image_keys),
@@ -2669,23 +2703,29 @@ impl Paint {
         result_sender: GenericSender<(Vec<FontKey>, Vec<FontInstanceKey>)>,
         painter_id: PainterId,
     ) {
-        let painter = self.maybe_painter(painter_id);
-        let font_keys = (0..number_of_font_keys)
-            .map(|_| {
-                painter.as_ref().map_or_else(
-                    || FontKey::new(painter_id.into(), 0),
-                    |painter| painter.webrender_api.generate_font_key(),
+        // 두 벌 모두 한 번의 `with_painter` 안에서 만든다 — 키 하나마다 왕복하는 형태는
+        // painter 가 스레드로 가면 그대로 쓸 수 없다.
+        let (font_keys, font_instance_keys) = self
+            .with_painter(painter_id, |painter| {
+                (
+                    (0..number_of_font_keys)
+                        .map(|_| painter.webrender_api.generate_font_key())
+                        .collect(),
+                    (0..number_of_font_instance_keys)
+                        .map(|_| painter.webrender_api.generate_font_instance_key())
+                        .collect(),
                 )
             })
-            .collect();
-        let font_instance_keys = (0..number_of_font_instance_keys)
-            .map(|_| {
-                painter.as_ref().map_or_else(
-                    || FontInstanceKey::new(painter_id.into(), 0),
-                    |painter| painter.webrender_api.generate_font_instance_key(),
+            .unwrap_or_else(|| {
+                (
+                    (0..number_of_font_keys)
+                        .map(|_| FontKey::new(painter_id.into(), 0))
+                        .collect(),
+                    (0..number_of_font_instance_keys)
+                        .map(|_| FontInstanceKey::new(painter_id.into(), 0))
+                        .collect(),
                 )
-            })
-            .collect();
+            });
 
         let _ = result_sender.send((font_keys, font_instance_keys));
     }
