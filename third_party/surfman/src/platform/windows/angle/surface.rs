@@ -3,7 +3,7 @@
 //! Surface management for Direct3D 11 on Windows using the ANGLE library as a frontend.
 
 use super::context::{Context, ContextDescriptor};
-use super::device::Device;
+use super::device::{Device, ImportedSurface};
 use crate::context::ContextID;
 use crate::egl::types::EGLNativeWindowType;
 use crate::egl::types::EGLSurface;
@@ -203,6 +203,9 @@ static IMPORT_QUERY_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_ACQUIRE_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_REST_NS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 캐시 적중 수. ★`open_ms` 가 낮은 것만으로는 "캐시가 듣는다" 를 말할 수 없다★ —
+/// 들여오기 자체가 적었을 수도 있다. 적중과 신규를 갈라 세어야 그 둘이 구분된다.
+static IMPORT_REUSED: AtomicU64 = AtomicU64::new(0);
 static IMPORT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_START: OnceLock<Instant> = OnceLock::new();
 
@@ -227,14 +230,21 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
     {
         return;
     }
+    let reused = IMPORT_REUSED.load(Ordering::Relaxed);
     let ms = |ns: u64| ns as f64 / 1_000_000.0;
     // ★`warn!` 이어야 한다★ — 런처의 기본 `RUST_LOG` 는 `warn,paint=info,media=info,...` 라
     // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
     // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
     warn!(
-        "SURFIMPORT imports={} open_ms={:.1} pbuffer_ms={:.1} query_ms={:.1} \
-         acquire_ms={:.1} rest_ms={:.1} (cumulative)",
+        "SURFIMPORT imports={} reused={} ({:.0}%) open_ms={:.1} pbuffer_ms={:.1} \
+         query_ms={:.1} acquire_ms={:.1} rest_ms={:.1} (cumulative)",
         count,
+        reused,
+        if count > 0 {
+            100.0 * reused as f64 / count as f64
+        } else {
+            0.0
+        },
         ms(IMPORT_OPEN_NS.load(Ordering::Relaxed)),
         ms(IMPORT_PBUFFER_NS.load(Ordering::Relaxed)),
         ms(IMPORT_QUERY_NS.load(Ordering::Relaxed)),
@@ -491,6 +501,14 @@ impl Device {
             Win32Objects::Pbuffer { share_handle, .. } => share_handle,
         };
 
+        // ★같은 핸들을 이미 들여왔으면 다시 만들지 않는다.★ 스왑체인은 적은 수의 서피스를
+        // 돌려 쓰므로 이 적중률은 사실상 100% 다. 남는 일은 `AcquireSync` 와 `BindTexImage`
+        // 뿐이고, 그 둘은 프레임마다 반드시 해야 한다(전자는 생산자와의 동기, 후자는 해제
+        // 때 풀리므로).
+        if self.imported_surfaces.borrow().contains_key(&share_handle) {
+            return self.reuse_imported_surface(context, surface, share_handle);
+        }
+
         let local_egl_config = self.context_descriptor_to_egl_config(&surface.context_descriptor);
         EGL_FUNCTIONS.with(|egl| {
             unsafe {
@@ -583,7 +601,7 @@ impl Device {
                     context,
                     surface,
                     local_egl_surface,
-                    local_keyed_mutex,
+                    local_keyed_mutex.clone(),
                 );
                 note_import_timing(
                     open_ns,
@@ -592,8 +610,86 @@ impl Device {
                     acquire_ns,
                     rest_start.elapsed().as_nanos() as u64,
                 );
+                // 성공했을 때만 캐시한다 — 실패한 것을 넣어 두면 다음 프레임이 그 죽은
+                // 핸들을 재사용한다.
+                if let Ok(ref surface_texture) = result {
+                    if let Some(gl_texture) = surface_texture.gl_texture {
+                        self.imported_surfaces.borrow_mut().insert(
+                            share_handle,
+                            ImportedSurface {
+                                d3d11_texture: local_d3d11_texture,
+                                egl_surface: local_egl_surface,
+                                keyed_mutex: local_keyed_mutex,
+                                gl_texture,
+                            },
+                        );
+                    }
+                }
                 result
             }
+        })
+    }
+
+    /// 이미 들여온 서피스를 다시 쓴다. ★프레임마다 반드시 해야 하는 두 가지만 한다★ —
+    /// `AcquireSync`(생산자와의 동기)와 `BindTexImage`(해제 때 풀리므로 다시 걸어야 한다).
+    ///
+    /// `OpenSharedResource`·EGL pbuffer 생성·GL 텍스처 생성이 여기서 빠진다. 실측으로
+    /// 한 번 들여오는 비용의 **26%** 다(2026-09-03, `log_webgpu/61`).
+    fn reuse_imported_surface(
+        &self,
+        context: &Context,
+        surface: Surface,
+        share_handle: HANDLE,
+    ) -> Result<SurfaceTexture, (Error, Surface)> {
+        let (local_egl_surface, local_keyed_mutex, gl_texture) = {
+            let imported = self.imported_surfaces.borrow();
+            let Some(entry) = imported.get(&share_handle) else {
+                // 위에서 존재를 확인하고 들어왔으므로 도달할 수 없다.
+                return Err((Error::Failed, surface));
+            };
+            (
+                entry.egl_surface,
+                entry.keyed_mutex.clone(),
+                entry.gl_texture,
+            )
+        };
+
+        let acquire_start = Instant::now();
+        if let Some(ref keyed_mutex) = local_keyed_mutex {
+            // SAFETY: 이 뮤텍스는 캐시가 살아 있는 동안 유효하다.
+            let result = unsafe { keyed_mutex.AcquireSync(0, INFINITE) };
+            assert_eq!(result, S_OK);
+        }
+        let acquire_ns = acquire_start.elapsed().as_nanos() as u64;
+
+        let rest_start = Instant::now();
+        let bound = EGL_FUNCTIONS.with(|egl| unsafe {
+            let _guard = self.temporarily_make_context_current(context)?;
+            let gl = &context.gl;
+            let previous_texture = gl.get_parameter_texture(gl::TEXTURE_BINDING_2D);
+            gl.bind_texture(gl::TEXTURE_2D, Some(gl_texture));
+            let ok =
+                egl.BindTexImage(self.egl_display, local_egl_surface, egl::BACK_BUFFER as _) !=
+                    egl::FALSE;
+            let error = (!ok).then(|| egl.GetError().to_windowing_api_error());
+            gl.bind_texture(gl::TEXTURE_2D, previous_texture);
+            match error {
+                Some(error) => Err(Error::SurfaceTextureCreationFailed(error)),
+                None => Ok(()),
+            }
+        });
+        if let Err(error) = bound {
+            return Err((error, surface));
+        }
+        IMPORT_REUSED.fetch_add(1, Ordering::Relaxed);
+        note_import_timing(0, 0, 0, acquire_ns, rest_start.elapsed().as_nanos() as u64);
+
+        Ok(SurfaceTexture {
+            surface,
+            local_egl_surface,
+            local_keyed_mutex,
+            gl_texture: Some(gl_texture),
+            phantom: PhantomData,
         })
     }
 
@@ -789,6 +885,18 @@ impl Device {
             return Err(Error::IncompatibleSurface);
         }
 
+        // ★서피스가 사라지면 그 핸들로 들여온 것도 죽는다.★ 리사이즈 등으로 스왑체인이
+        // 서피스를 버리는데 캐시가 남아 있으면, 다음 프레임이 이미 파괴된 EGL 서피스를
+        // 재사용한다.
+        if let Win32Objects::Pbuffer { share_handle, .. } = surface.win32_objects {
+            let imported = self.imported_surfaces.borrow_mut().remove(&share_handle);
+            if let Some(imported) = imported {
+                EGL_FUNCTIONS.with(|egl| unsafe {
+                    egl.DestroySurface(self.egl_display, imported.egl_surface);
+                });
+            }
+        }
+
         EGL_FUNCTIONS.with(|egl| {
             unsafe {
                 // If the surface is currently bound, unbind it.
@@ -809,6 +917,50 @@ impl Device {
             }
             Ok(())
         })
+    }
+
+    /// 캐시가 소유한 들여오기를 **부수지 않고** 놓아준다.
+    ///
+    /// `ReleaseTexImage` 로 바인딩을 풀고 `ReleaseSync` 로 생산자에게 버퍼를 넘긴다. EGL
+    /// pbuffer 와 GL 텍스처는 [`Device::imported_surfaces`] 가 계속 들고 있으므로 다음
+    /// 프레임의 [`Device::reuse_imported_surface`] 가 그대로 쓴다.
+    fn release_imported_surface(
+        &self,
+        context: &mut Context,
+        mut surface_texture: SurfaceTexture,
+    ) -> Result<Surface, (Error, SurfaceTexture)> {
+        unsafe {
+            let _guard = match self.temporarily_make_context_current(context) {
+                Ok(guard) => guard,
+                Err(error) => return Err((error, surface_texture)),
+            };
+            let released = EGL_FUNCTIONS.with(|egl| {
+                if egl.ReleaseTexImage(
+                    self.egl_display,
+                    surface_texture.local_egl_surface,
+                    egl::BACK_BUFFER as _,
+                ) == egl::FALSE
+                {
+                    return Err(Error::SurfaceTextureCreationFailed(
+                        egl.GetError().to_windowing_api_error(),
+                    ));
+                }
+                Ok(())
+            });
+            if let Err(error) = released {
+                return Err((error, surface_texture));
+            }
+            if let Some(ref keyed_mutex) = surface_texture.local_keyed_mutex {
+                let result = keyed_mutex.ReleaseSync(0);
+                assert_eq!(result, S_OK);
+            }
+        }
+
+        // 이 핸들들은 캐시의 것이다 — `SurfaceTexture` 가 떨어지면서 지우지 않도록 비운다.
+        surface_texture.gl_texture = None;
+        surface_texture.local_keyed_mutex = None;
+        surface_texture.local_egl_surface = egl::NO_SURFACE;
+        Ok(surface_texture.surface)
     }
 
     /// Destroys a surface texture and returns the underlying surface.
@@ -833,6 +985,23 @@ impl Device {
         // panics in `Surface::drop`.
         let is_import_path =
             surface_texture.surface.egl_surface == surface_texture.local_egl_surface;
+
+        // ★캐시가 소유한 것은 부수지 않는다.★ 프레임마다 돌려줘야 하는 것은 `Surface`
+        // 소유권뿐이고(생산자가 그 버퍼에 다시 그려야 한다), 들여온 것 자체는 같은 핸들이
+        // 다시 오면 그대로 쓴다. 그래서 여기서는 바인딩과 뮤텍스만 풀고, EGL pbuffer 와 GL
+        // 텍스처는 그대로 둔다.
+        let cached_share_handle = match surface_texture.surface.win32_objects {
+            Win32Objects::Pbuffer { share_handle, .. }
+                if !is_import_path
+                    && self.imported_surfaces.borrow().contains_key(&share_handle) =>
+            {
+                Some(share_handle)
+            },
+            _ => None,
+        };
+        if cached_share_handle.is_some() {
+            return self.release_imported_surface(context, surface_texture);
+        }
         unsafe {
             let _guard = match self.temporarily_make_context_current(context) {
                 Ok(guard) => guard,

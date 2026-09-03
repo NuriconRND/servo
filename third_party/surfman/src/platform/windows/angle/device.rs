@@ -22,6 +22,7 @@ use crate::{Error, GLApi};
 use euclid::default::Size2D;
 use log::{info, warn};
 use std::cell::{RefCell, RefMut};
+use std::collections::HashMap;
 use std::mem;
 use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
@@ -31,10 +32,12 @@ use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
 use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{BOOL, TRUE, UINT};
 use winapi::shared::winerror::{self, S_OK};
+use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::um::d3d11::{
     D3D11CreateDevice, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_SDK_VERSION,
-    ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
+use winapi::um::winnt::HANDLE;
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
 use wio::com::ComPtr;
@@ -91,6 +94,31 @@ pub struct Device {
     pub(crate) d3d11_device: ManuallyDrop<ComPtr<ID3D11Device>>,
     pub(crate) d3d_driver_type: D3D_DRIVER_TYPE,
     pub(crate) display_is_owned: bool,
+    /// 공유 서피스를 이 디바이스로 들여온 결과를 `share_handle` 로 캐시한다.
+    ///
+    /// ★왜 캐시가 성립하나★: 스왑체인은 **적은 수의 서피스를 돌려 쓴다.** 소비자가 매
+    /// 프레임 `create_surface_texture` → `destroy_surface_texture` 를 하는 이유는 들여온
+    /// 것이 무효가 되어서가 아니라, `SurfaceTexture` 가 `Surface` 를 삼키고 있어 **생산자가
+    /// 그 버퍼를 돌려받으려면 부수는 수밖에 없기** 때문이다. 돌려줘야 하는 것은 `Surface`
+    /// 소유권뿐이고, 들여온 것(로컬 D3D11 텍스처·EGL pbuffer·GL 텍스처)은 같은 핸들이 다시
+    /// 돌아오면 그대로 쓸 수 있다.
+    ///
+    /// 실측(2026-09-03, `log_webgpu/61`): 한 번 들여오는 데 10.01ms 이고 그 중
+    /// `OpenSharedResource` 1.15ms + EGL pbuffer 1.42ms + GL 텍스처 0.02ms = **26%** 가
+    /// 이 캐시로 사라진다. 나머지 74% 는 `AcquireSync` 대기라 캐시로는 줄지 않는다.
+    pub(crate) imported_surfaces: RefCell<HashMap<HANDLE, ImportedSurface>>,
+}
+
+/// 공유 서피스를 한 번 들여온 결과. [`Device::imported_surfaces`] 가 소유한다.
+///
+/// ★해제 순서가 `Device::drop` 보다 앞이어야 한다★ — `eglTerminate` 가 ANGLE 의 D3D11
+/// 디바이스를 부수므로, 그 뒤에 남은 COM 참조를 Release 하면 해제된 메모리를 건드린다.
+pub(crate) struct ImportedSurface {
+    /// 이 디바이스로 연 공유 텍스처. ComPtr 이 살아 있는 동안 EGL pbuffer 가 유효하다.
+    pub(crate) d3d11_texture: ComPtr<ID3D11Texture2D>,
+    pub(crate) egl_surface: EGLSurface,
+    pub(crate) keyed_mutex: Option<ComPtr<IDXGIKeyedMutex>>,
+    pub(crate) gl_texture: glow::Texture,
 }
 
 pub(crate) enum VendorPreference {
@@ -300,6 +328,7 @@ impl Device {
                     d3d11_device: ManuallyDrop::new(d3d11_device),
                     d3d_driver_type,
                     display_is_owned: true,
+                    imported_surfaces: RefCell::default(),
                 })
             })
         }
@@ -444,6 +473,7 @@ impl Device {
                     d3d11_device: ManuallyDrop::new(d3d11_device),
                     d3d_driver_type,
                     display_is_owned: true,
+                    imported_surfaces: RefCell::default(),
                 })
             })
         }
@@ -457,6 +487,7 @@ impl Device {
                 d3d11_device: ManuallyDrop::new(ComPtr::from_raw(native_device.d3d11_device)),
                 d3d_driver_type: native_device.d3d_driver_type,
                 display_is_owned: false,
+                imported_surfaces: RefCell::default(),
             })
         }
     }
@@ -469,6 +500,7 @@ impl Device {
             d3d11_device: ManuallyDrop::new(d3d11_device),
             d3d_driver_type: D3D_DRIVER_TYPE_UNKNOWN,
             display_is_owned: false,
+            imported_surfaces: RefCell::default(),
         })
     }
 
@@ -740,6 +772,21 @@ impl Drop for Device {
             // exactly that Release now — before termination — and the field is never touched
             // again. For a non-owned display (`display_is_owned == false`) we only Release
             // (balancing the AddRef taken when the device was adopted) and skip termination.
+            // ★들여온 것들을 `eglTerminate` 보다 먼저 놓아준다.★ EGL 서피스와 COM 참조가
+            // 종료 뒤까지 살아 있으면 해제된 객체를 Release 하게 된다(이 파일의 아래
+            // `d3d11_device` 주석과 같은 이유).
+            //
+            // GL 텍스처는 지우지 않는다 — 그것을 지우려면 컨텍스트를 current 로 삼아야 하고,
+            // 디바이스가 사라지는 시점에는 그 컨텍스트도 이미 없다. 디스플레이가 종료되면서
+            // 함께 사라진다.
+            for (_, imported) in self.imported_surfaces.borrow_mut().drain() {
+                EGL_FUNCTIONS.with(|egl| {
+                    egl.DestroySurface(self.egl_display, imported.egl_surface);
+                });
+                drop(imported.keyed_mutex);
+                drop(imported.d3d11_texture);
+            }
+
             ManuallyDrop::drop(&mut self.d3d11_device);
             if self.display_is_owned {
                 EGL_FUNCTIONS.with(|egl| {
