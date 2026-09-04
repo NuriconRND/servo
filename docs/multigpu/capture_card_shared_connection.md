@@ -74,8 +74,8 @@
   창을 닫아 스트림이 전부 해제되면 0이다.
 - **`capture hub: opened` 가 한 줄도 없으면 허브 실패가 아니라 페이지가 애초에 `getUserMedia`
   까지 도달하지 못했다는 뜻이다.** 이 로그는 허브가 실제로 열릴 때만 찍히므로, 프로브가
-  `navigator.mediaDevices` 를 못 봤거나(§4의 `--pref dom_webrtc_enabled=true` 누락 — 가장 흔한
-  원인이다) 장치 선택이 실패했거나(`?device=` 셀렉터가 아무 것도 못 찾음, 또는 `videoinput`
+  `navigator.mediaDevices` 를 못 봤거나(winit_wall 이면 `-PageFeatures` 누락, servoshell 이면
+  `--pref dom_webrtc_enabled=true` 누락 — 가장 흔한 원인이다) 장치 선택이 실패했거나(`?device=` 셀렉터가 아무 것도 못 찾음, 또는 `videoinput`
   0개) 둘 중 하나다. 이 경우 **먼저 pref 를, 그다음 HUD의 "videoinput devices:" 줄과 콘솔의
   `getUserMedia FAILED` 여부를 확인**하고, 그 뒤에도 재현되면 그때 코드 쪽을 의심한다 — "로그가
   0줄이니 허브가 깨졌다"로 바로 넘어가지 않는다.
@@ -84,7 +84,10 @@
 
 **`RUST_LOG=servo_media_gstreamer=info` 가 반드시 있어야 로그가 보인다.** 이 백엔드 로그는
 `script=info` 만으로는 안 잡힌다 — 흔히 `script=info` 만 켜고 "허브 로그가 안 나온다"고
-오해하기 쉬우니 주의. 두 로거를 같이 켜려면:
+오해하기 쉬우니 주의.
+
+**`run_wall_dist.ps1` 로 돌릴 때는 신경 쓸 필요가 없다** — 런처가 `servo_media_gstreamer=info`
+를 포함해 `RUST_LOG` 를 무조건 설정한다. 직접 실행할 때만 다음이 필요하다:
 
 ```powershell
 $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
@@ -94,95 +97,135 @@ $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
 
 **이 절차는 후속 작업이 아니라 머지 게이트다.** `create_input_stream`(`media_capture.rs`)의
 비디오 갈래는 자동 테스트로 전혀 덮이지 않는다 — 그 갈래를 예전 `get_track` 경로로 되돌려도
-(즉 이 브랜치의 핵심 변경을 통째로 되돌려도) 20개 단위 테스트는 그대로 전부 통과한다. 그
-20개는 **허브 자체가 옳다는 것**만 증명한다: 포트 재사용, 소비자 배포, 재개방 판단, 락 오염
+(즉 이 브랜치의 핵심 변경을 통째로 되돌려도) 21개 단위 테스트는 그대로 전부 통과한다. 그
+21개는 **허브 자체가 옳다는 것**만 증명한다: 포트 재사용, 소비자 배포, 재개방 판단, 락 오염
 내성. Servo가 실제로 그 허브를 쓰고 있는가 — 즉 `getUserMedia()` 가 진짜로 허브를 거쳐서
 같은 포트를 두 번 열지 않는가 — 는 오직 이 실기 절차만 증명한다. 이 절이 안 돌았다면 이
 브랜치는 검증되지 않은 것이다.
 
-테스트 장비에서, 이 브랜치 그대로 빌드된 `servoshell.exe` 로(아래 명령은 이 워크트리 루트 —
-`target\debug\servoshell.exe` 와 `tests\html\` 가 보이는 위치 — 에서 실행한다).
+### 셸은 winit_wall 이고, 클릭은 못 한다
 
-**`--pref dom_webrtc_enabled=true` 가 반드시 있어야 한다.** 이 pref 는 기본값이 `false`
-(`components/config/prefs.rs`)이고, 없으면 `navigator.mediaDevices` 자체가 `undefined`라
-프로브 페이지가 `getUserMedia` 를 호출하지도 못한다 — 그러면 캡처 허브는 아예 손도 안 타서
-아래 로그 확인에서 `capture hub: opened` 가 **한 줄도** 안 나온다(§3의 "0줄" 판정 참고).
+실기는 **winit_wall 배포본**으로 돌린다. 개발기에서 만들고 테스트 장비로 복사한다:
+
+```powershell
+# 개발기 (mozangle 경로 길이 때문에 반드시 subst 드라이브 경유 — Os error 206 방지)
+subst W: F:\20260609_SDWall_BrowserTest\20260606_multigpu_browser   # 이미 있으면 생략
+. W:\scripts\servo_env.ps1
+$ErrorActionPreference = 'Continue'
+cd W:\servo_multigpu-tiled-wall
+cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webgpu --release
+.\etc\multigpu\make_wall_dist.ps1 -Force        # -> target\wall_dist (444 DLL / 0.44 GB)
+```
+
+`make_wall_dist.ps1` 은 패키징 전에 ANGLE LUID 패치와 `webgpu` 피처 컴파일 여부를 **하드페일로**
+검증한다(둘 다 없으면 조용히 잘못 도는 종류의 실패라서). `target\wall_dist` 폴더를 통째로 테스트
+장비에 복사하면 Rust·GStreamer·ANGLE 설치 없이 실행된다.
+
+**★winit_wall 은 입력을 엔진에 전달하지 않는다★** — 이벤트 루프가 `CloseRequested` 와
+`RedrawRequested` 만 처리한다(`winit_wall/main.rs`). 그래서 프로브 페이지 좌하단의
+`stop() the current track` / `reload N times` **버튼은 여기서 누를 수 없다.** 대신 쿼리
+문자열로 구동한다:
+
+- `?cycles=N` — 클릭 없이 N회 페이지 전환을 자동 수행(전환 간 2초).
+- `&stop=1` — 매 전환 직전에 `track.stop()` 을 호출.
+
+### 1회차 — 기본 경로 (stop 없이)
+
+이게 **보고된 크래시를 실제로 일으키던 경로**다. 실제 웹페이지는 `stop()` 을 부르지 않고,
+해제는 파이프라인 종료 시 `release_capture_streams` 가 거둔다.
+
+```powershell
+# 테스트 장비, 복사해 온 wall_dist 폴더 안에서
+.\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 90 `
+  -Url "multigpu_capture_card_probe.html?cycles=20"
+```
+
+- `-PageFeatures` 가 `dom_webrtc_enabled` 를 켠다. **이게 없으면 `navigator.mediaDevices` 가
+  `undefined` 라 페이지가 `getUserMedia` 를 호출조차 못 하고, 로그에 `capture hub: opened` 가
+  한 줄도 안 나온다**(§3의 "0줄" 판정 참고). 허브 문제로 오독하기 딱 좋은 형태다.
+- `-Serve` 는 `pages\html` 을 http 로 띄우고 상대 URL(쿼리 문자열 포함)을 그 위에서 푼다.
+- `-DurationSec 90` 은 20회 × 2초 = 40초에 기동·첫 개방 여유를 더한 값이다. 전환 횟수를
+  바꾸면 **`N*2 + 30`초** 이상으로 잡는다. 시간이 모자라면 사이클이 다 안 돌고 끝나며,
+  그건 로그의 마지막 `reload cycle X/N` 으로 바로 보인다.
+- `-Layout` 은 주지 않는다 — 기본값 `wall_layout.multigpu.json`(4-GPU 월)이 맞다.
+- `RUST_LOG` 도 주지 않는다. 런처가 `servo_media_gstreamer=info` 를 포함해 무조건 설정한다.
+- 로그는 런처가 `wall_<날짜시각>.err.log` 로 남기고, 끝난 뒤 스스로 요약을 출력한다.
+
+### 2회차 — stop 경로
+
+```powershell
+.\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 90 `
+  -Url "multigpu_capture_card_probe.html?cycles=20&stop=1"
+```
+
+두 경로를 **일부러 분리해서** 돌린다. 섞으면 실패했을 때 어느 해제 경로가 깨졌는지 구분할 수
+없고, `stop()` 을 먼저 부르면 파이프라인 종료 경로는 이미 빈 목록을 보게 돼 사실상 미검증으로
+남는다.
+
+### 로그 판정
+
+```powershell
+$log = Get-ChildItem wall_*.err.log | Sort-Object LastWriteTime | Select-Object -Last 1
+Select-String -Path $log -Pattern "capture hub: opened"       # 포트당 정확히 1줄
+Select-String -Path $log -Pattern "consumers="                # 전환 후 다시 1로 돌아와야
+Select-String -Path $log -Pattern "panicked|not-negotiated"   # 0건
+Select-String -Path $log -Pattern "reload cycle"              # N회까지 다 돌았는지
+```
+
+통과 조건은 세 가지다. **(1)** `capture hub: opened` 가 사용한 포트 수만큼만 — 20회 전환에도
+포트당 1줄. 2줄 이상이면 그 바로 앞에 `is unhealthy; reopening` 이 있어야 정당한 재개방이고,
+없으면 실패다. **(2)** 전환 사이의 `consumers=` 가 계속 1로 복귀 — 계속 증가하면 소비자가
+누적되는 것이다. **(3)** `panicked` / `not-negotiated` 0건.
+
+`capture hub: opened` 가 **한 줄도** 없으면 허브 실패가 아니라 페이지가 `getUserMedia` 에
+도달하지 못한 것이다 — `-PageFeatures` 를 빠뜨렸거나 장치 선택이 실패한 경우다.
 
 ### 시간을 재야 할 두 지점
 
-이 브랜치는 캡처 장치 개방을 스크립트 스레드로 옮겼다 — 대칭적으로 해제도 스크립트 스레드
-경로에 걸려 있다. 둘 다 이 저장소가 전에 실측으로 걸렸던 종류의 정지이므로, 실기에서는
-**초 단위로 시간을 재서** 기록한다:
+이 브랜치는 캡처 장치 개방을 스크립트 스레드로 옮겼고, 대칭적으로 해제도 스크립트 스레드
+경로에 걸려 있다. 둘 다 이 저장소가 전에 실측으로 걸렸던 종류의 정지이므로, 실기에서
+**초 단위로 재서** 기록한다:
 
 - **런치 후 첫 `getUserMedia`.** 그 포트의 첫 개방은 스크립트 스레드가
   `DeviceHub::open`(`capture_hub.rs`) 안에서 최대 `START_TIMEOUT`(5초)까지 블록할 수 있다 —
   전에는 장치가 플레이어 스레드에서 나중에 열렸지만, 지금은 `getUserMedia()` 호출 자체가
   이 블록을 포함한다.
-- **창을 닫는 순간.** `release_capture_streams`(`globalscope.rs`)가
+- **런이 끝나는 순간.** `release_capture_streams`(`globalscope.rs`)가
   `Window::clear_js_runtime`(`window.rs`) 맨 앞에서 돌며 캡처 파이프라인을 `Null` 로 내리는데,
   그 파이프라인의 `proxysink` 가 플레이어 쪽 `PLAYING` 상태의 `proxysrc` 와 여전히 peer 로
   연결돼 있을 수 있다. 이 저장소는 라이브 파이프라인 teardown 에서 수 초짜리 정지를 반복해서
   기록한 전례가 있다(RTSP teardown 등).
 
-**문제처럼 보이는 것 = 눈에 보이는 정지(화면이 얼어붙거나 창이 응답하지 않는 것).** 둘 중
-하나라도 관찰되면, 정확한 지점(런치 후 첫 열기 vs 창 닫기)과 걸린 시간을 함께 보고할
-가치가 있다 — 이 문서는 그 재구조화를 지금 하지 않기로 한 결정 위에 있으므로, 실측이 다음
-판단의 근거가 된다.
+**문제처럼 보이는 것 = 눈에 보이는 정지**(화면이 얼어붙거나 창이 응답하지 않는 것). 둘 중
+하나라도 관찰되면 정확한 지점과 걸린 시간을 함께 보고할 가치가 있다 — 이 문서는 그 재구조화를
+지금 하지 않기로 한 결정 위에 있으므로, 실측이 다음 판단의 근거가 된다.
+
+### 로그가 잘려 보이면
+
+`-DurationSec` 은 시간이 다 되면 프로세스를 강제 종료한다(`Stop-Process -Force`). 런처의 사후
+분석 전체가 이 방식의 로그에 기대고 있으므로 정상 경로이지만, 만약 로그 끝이 잘린 것처럼
+보이면 `-DurationSec` 없이 돌리고 **창을 닫아서** 끝낸 뒤 다시 확인한다.
+
+### 참고 — servoshell 로 확인하고 싶을 때
+
+버튼을 실제로 눌러 보거나 대화형으로 확인하려면 servoshell 을 쓴다. 이쪽은 입력이 동작하므로
+좌하단 컨트롤 패널의 두 버튼이 그대로 먹는다(이 경로는 실기 게이트가 아니라 보조 수단이다).
 
 ```powershell
-$env:RUST_LOG = "servo_media_gstreamer=info,script=info"
 target\debug\servoshell.exe --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_probe.html 2> capture_cycles.err.log
 ```
-
-프로브 페이지(`tests/html/multigpu_capture_card_probe.html`)가 뜨면 좌하단 컨트롤 패널에서:
-
-1. `reload cycles` 입력칸에 원하는 반복 횟수(기본 20)를 넣는다.
-2. `reload N times` 를 누른다 — 페이지가 자기 자신을 N회 자동 전환한다(전환 사이 2초 간격,
-   상태 줄에 `cycle X/N` 이 표시되고 `X == N` 이 되면 `cycles done (N/N)` 으로 멈춘다).
-3. 다 돌 때까지 기다린다(상태 줄이 `cycles done` 을 보여줄 때까지).
-4. **창을 닫아서** 종료한다. **강제 종료(작업 관리자 등)하면 stderr 버퍼가 안 비워져 로그
-   파일이 비거나 잘려서 남는다** — 빈 `.err.log` 는 "아무 문제도 없었다"가 아니라 "강제
-   종료했다"는 뜻일 가능성이 높다.
-
-종료 후 로그를 확인한다:
-
-```powershell
-Select-String -Path capture_cycles.err.log -Pattern "capture hub: opened"       # 포트당 1줄이어야 한다
-Select-String -Path capture_cycles.err.log -Pattern "consumers="                # 마지막 값이 0이어야 한다
-Select-String -Path capture_cycles.err.log -Pattern "panicked|not-negotiated"   # 0건이어야 한다
-```
-
-추가로 `stop() the current track` 버튼으로 트랙을 수동으로 멈춰본다 — 누른 직후
-`capture hub: ... consumer ... removed` 가 찍히고 `consumers=` 가 하나 줄어야 한다(Task 6이
-연결한 `MediaStreamTrack.stop()` 경로 확인).
-
-### 월 팬아웃에서도 한 번 더
-
-같은 절차를 `--wall-layout --wall-all-tiles` 로 반복한다(같은 로그 패턴을 확인):
-
-```powershell
-target\debug\servoshell.exe --wall-layout ..\config\wall_layout.local_3x1.json --wall-all-tiles --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_probe.html 2> capture_wall.err.log
-```
-
-### 판정
-
-위 세 개의 `Select-String` 결과가 각각 "포트 수만큼 정확히 1줄(또는 그 앞에 `is unhealthy`가
-있는 예외적 재개방)", "마지막 `consumers=` 값 0", "0건" 이면 통과다. 어느 하나라도 어긋나면
-§3 의 판정 규칙으로 되짚어 어느 지점에서 재개방이 일어났는지 `Select-String -Context 3` 등으로
-앞뒤 로그를 넓혀서 본다.
 
 ## 5. 환경 함정 (이 작업을 만들며 실제로 걸린 것들)
 
 이 두 가지는 코드 문제가 아니라 **로컬 환경 상태**다. 겪으면 "기능이 고장났다"로 오귀인하기
 쉬우므로 여기 기록한다.
 
-### GST_PLUGIN_PATH — 캡처 허브 테스트가 13/20으로 죽는다
+### GST_PLUGIN_PATH — 캡처 허브 테스트가 13/21로 죽는다
 
 `mach build` 는 GStreamer 의 핵심 DLL들을 `target\debug` 에 **평평하게 복사**하고,
 `scripts\servo_env.ps1` 가 그 경로를 PATH 맨 앞에 놓는다. 그러면 이후의 `cargo test` 프로세스가
 시스템 GStreamer 대신 그 복사본을 로드하는데, **그 복사본이 내장하고 있는 상대경로 플러그인
-디렉터리는 존재하지 않는다** — 그래서 플러그인이 하나도 안 잡히고, `servo-media-gstreamer` /
-`servo-media-streams` 의 20개 테스트 중 13개가 0.01초만에 실패한다(플러그인 필요 엘리먼트를
+디렉터리는 존재하지 않는다** — 그래서 플러그인이 하나도 안 잡히고, `servo-media-gstreamer` 의 21개 테스트 중 13개가 0.01초만에 실패한다(플러그인 필요 엘리먼트를
 못 만들어서). 고치려면 `GST_PLUGIN_PATH` 를 mach가 DLL을 복사해 온 원본 슬롯#1로 명시 지정한다:
 
 ```powershell
@@ -207,6 +250,11 @@ cargo test -p servo-media-streams --lib
 
 ## 6. 알려진 한계
 
+- **winit_wall 은 입력을 엔진에 전달하지 않는다.** 이벤트 루프가 `CloseRequested` 와
+  `RedrawRequested` 만 처리하므로(`components/servo/examples/winit_wall/main.rs`), 프로브
+  페이지의 버튼은 실기 셸에서 누를 수 없다. 그래서 이 페이지는 `?cycles=N` / `&stop=1` 쿼리
+  파라미터로도 구동되게 만들어 뒀다(§4). 앞으로 실기용 페이지를 추가할 때도 **클릭에 의존하는
+  진입점만 두면 winit_wall 에서 시작 자체가 불가능하다**는 점을 염두에 둘 것.
 - **오디오 입력과 `getDisplayMedia` 는 허브를 쓰지 않는다.** 이 장비에서 오디오 입력은 포트
   배타성 문제가 없고(현재 빌드는 `audioinput` 0개), `getDisplayMedia` 도 마찬가지다. 두 경로
   모두 §2의 "수명 해제"(문서 종료 시 `GlobalScope::release_capture_streams` 가 스트림을

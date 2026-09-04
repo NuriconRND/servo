@@ -9,11 +9,21 @@
   <video> — on the wall this fans out to every tile through the existing media
   external-image broadcast (raw passthrough, no VP8 roundtrip).
 
-  Run (normal window):
+  Run (normal window, interactive — the buttons below work here):
     servoshell.exe --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_probe.html
-  Run (wall fan-out):
+  Run (wall fan-out, servoshell):
     servoshell.exe --wall-layout ..\config\wall_layout.local_3x1.json --wall-all-tiles \
       --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_probe.html
+  Run (wall fan-out, winit_wall — this is what the on-hardware procedure uses):
+    etc\multigpu\run_wall_dist.ps1 -PageFeatures -Serve `
+      -Url "multigpu_capture_card_probe.html?cycles=20"
+
+  ***winit_wall never forwards input to the engine*** — its event loop handles
+  only CloseRequested and RedrawRequested — so the buttons in the .controls
+  panel are unreachable there. Drive it from the query string instead:
+  ?cycles=N runs N page transitions with no click, and &stop=1 additionally
+  calls track.stop() before each reload. See the .controls note below for
+  which release path each one exercises.
 
   The HUD (top-left) lists every videoinput device and live stats for the opened
   one. With no capture device: 0 videoinput + getUserMedia 0 tracks, but NO
@@ -203,24 +213,55 @@
       location.reload();
     });
 
+    // ?cycles=N starts the same run with no click at all, because winit_wall --
+    // the shell the on-hardware procedure uses -- handles only CloseRequested and
+    // RedrawRequested and never forwards input to the engine, so the buttons above
+    // are unreachable there. Seed only when no run is already in progress:
+    // location.reload() keeps the query string, so re-seeding every load would
+    // reset the counter and cycle forever.
+    //
+    // &stop=1 additionally calls track.stop() right before each reload. Leave it
+    // off to exercise the path that actually matters -- a page that releases
+    // nothing, and relies on pipeline exit to do it -- which is what a real page
+    // does and what the reported crash came from. Run it once with &stop=1 to
+    // cover the explicit-release path separately; keeping them apart is what makes
+    // a failure attributable to one path or the other.
+    const params = new URLSearchParams(location.search);
+    const stopEachCycle = params.get("stop") === "1";
+    if (!sessionStorage.getItem(CYCLE_TOTAL_KEY)) {
+      const requested = parseInt(params.get("cycles") || "0", 10);
+      if (Number.isFinite(requested) && requested >= 1) {
+        sessionStorage.setItem(CYCLE_TOTAL_KEY, String(requested));
+        sessionStorage.setItem(CYCLE_DONE_KEY, "0");
+        clog(`cycles=${requested} from the query string, stop=${stopEachCycle}`);
+      }
+    }
+
     (function runCycleStep() {
       const total = parseInt(sessionStorage.getItem(CYCLE_TOTAL_KEY) || "0", 10);
       if (total < 1) { return; } // no cycle run in progress
       const done = parseInt(sessionStorage.getItem(CYCLE_DONE_KEY) || "0", 10) + 1;
+      const mode = stopEachCycle ? "stop+reload" : "reload";
 
       if (done >= total) {
-        cycleStatus.textContent = `cycles done (${done}/${total})`;
-        clog(`reload cycle ${done}/${total} (final)`);
+        cycleStatus.textContent = `cycles done (${done}/${total}, ${mode})`;
+        clog(`reload cycle ${done}/${total} (final, ${mode})`);
         sessionStorage.removeItem(CYCLE_TOTAL_KEY);
         sessionStorage.removeItem(CYCLE_DONE_KEY);
         return;
       }
 
-      cycleStatus.textContent = `cycle ${done}/${total} — reloading in 2s`;
-      clog(`reload cycle ${done}/${total}`);
+      cycleStatus.textContent = `cycle ${done}/${total} (${mode}) — reloading in 2s`;
+      clog(`reload cycle ${done}/${total} (${mode})`);
       sessionStorage.setItem(CYCLE_DONE_KEY, String(done));
       // Give getUserMedia() time to actually open the stream before moving on.
-      setTimeout(() => location.reload(), 2000);
+      setTimeout(() => {
+        if (stopEachCycle && window.currentStream) {
+          for (const track of window.currentStream.getTracks()) { track.stop(); }
+          clog(`cycle ${done}/${total}: stopped all tracks before reloading`);
+        }
+        location.reload();
+      }, 2000);
     })();
   </script>
 </body>

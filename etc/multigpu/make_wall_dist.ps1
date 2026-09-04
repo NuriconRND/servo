@@ -132,6 +132,12 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_wall_webgpu_min_probe.html") (Jo
 # These two were only ever hand-copied into a dist, so every repackage silently dropped them.
 Copy-Item (Join-Path $repo "tests\html\webgl2_ctx_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\html\multigpu_wall_stress_cases.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Capture-card probe. This is the ONLY way to verify the shared capture hub: nothing
+# automated covers the getUserMedia -> hub wiring (it needs the card), so the on-hardware
+# run with this page is a merge gate, not a follow-up. Needs -PageFeatures for
+# dom_webrtc_enabled, and is driven by ?cycles=N from the query string because winit_wall
+# never forwards input -- its buttons cannot be clicked on the wall.
+Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---
