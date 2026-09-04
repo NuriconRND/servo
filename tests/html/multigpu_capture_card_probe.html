@@ -29,6 +29,16 @@
   { video: { deviceId: { exact: id } } }; no ?device keeps the legacy
   { video: true } first-device behavior. A selector that matches nothing
   fails loudly (no track) instead of silently opening another port.
+
+  The .controls panel (bottom-left) reproduces a shared-connection capture
+  hub scenario on demand, for the on-hardware procedure in
+  docs/multigpu/capture_card_shared_connection.md:
+    - "stop() the current track" calls track.stop() on every track of the
+      live stream (window.currentStream) — exercises Task 6's release path.
+    - "reload N times" drives N page transitions on its own (location.reload()
+      in a loop, count carried across reloads in sessionStorage) — exercises
+      the capture hub's reuse-not-reopen path (capture_hub.rs) the way
+      repeated getUserMedia() calls across page navigations would.
 -->
 <html>
 <head>
@@ -44,11 +54,33 @@
       padding: 10px 12px; border: 1px solid #0f0; white-space: pre-wrap;
     }
     #hud b { color: #6f6; }
+    .controls {
+      position: fixed; left: 12px; bottom: 12px; z-index: 10; max-width: 60vw;
+      font: 13px/1.45 monospace; color: #0f0; background: rgba(0,0,0,.62);
+      padding: 10px 12px; border: 1px solid #0f0;
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    }
+    .controls button {
+      font: 13px/1.45 monospace; color: #0f0; background: #001a00;
+      border: 1px solid #0f0; padding: 4px 8px; cursor: pointer;
+    }
+    .controls label { display: flex; align-items: center; gap: 4px; }
+    .controls input[type="number"] {
+      width: 4.5em; font: 13px/1.45 monospace; color: #0f0; background: #001a00;
+      border: 1px solid #0f0;
+    }
+    #cycle-status { color: #6f6; }
   </style>
 </head>
 <body>
   <div id="stage"><video id="v" autoplay playsinline muted></video></div>
   <div id="hud">starting…</div>
+  <div class="controls">
+    <button id="stop-track">stop() the current track</button>
+    <label>reload cycles <input id="cycle-count" type="number" value="20" min="1" max="200"></label>
+    <button id="start-cycles">reload N times</button>
+    <span id="cycle-status"></span>
+  </div>
   <script>
     const hud = document.getElementById("hud");
     const v = document.getElementById("v");
@@ -103,6 +135,7 @@
       // 3) open
       try {
         const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        window.currentStream = stream; // reachable by the stop-track button below
         v.srcObject = stream;
         const track = stream.getVideoTracks()[0];
         let settings = {};
@@ -142,6 +175,57 @@
     }
     render();
     start();
+
+    // --- reproduce page transitions on demand (see docs/multigpu/capture_card_shared_connection.md) ---
+
+    document.getElementById("stop-track").addEventListener("click", () => {
+      const stream = window.currentStream;
+      if (!stream) {
+        document.getElementById("cycle-status").textContent = "no live stream to stop";
+        return;
+      }
+      for (const track of stream.getTracks()) { track.stop(); }
+      document.getElementById("cycle-status").textContent = "stopped";
+      clog("stop-track: stopped all tracks of window.currentStream");
+    });
+
+    // Drives N page transitions in a row, so a single "reload N times" click
+    // reproduces the failure mode this branch fixes (a getUserMedia() call on
+    // every page load, previously never released). The remaining/total counts
+    // are carried across reloads in sessionStorage since a full navigation
+    // clears all JS state. Status line always shows "cycle X/N" and stops
+    // (and clears its own sessionStorage keys) once X reaches N.
+    const CYCLE_TOTAL_KEY = "captureCardCycleTotal";
+    const CYCLE_DONE_KEY = "captureCardCycleDone";
+    const cycleStatus = document.getElementById("cycle-status");
+
+    document.getElementById("start-cycles").addEventListener("click", () => {
+      const count = parseInt(document.getElementById("cycle-count").value, 10);
+      if (!Number.isFinite(count) || count < 1) { return; }
+      sessionStorage.setItem(CYCLE_TOTAL_KEY, String(count));
+      sessionStorage.setItem(CYCLE_DONE_KEY, "0");
+      location.reload();
+    });
+
+    (function runCycleStep() {
+      const total = parseInt(sessionStorage.getItem(CYCLE_TOTAL_KEY) || "0", 10);
+      if (total < 1) { return; } // no cycle run in progress
+      const done = parseInt(sessionStorage.getItem(CYCLE_DONE_KEY) || "0", 10) + 1;
+
+      if (done >= total) {
+        cycleStatus.textContent = `cycles done (${done}/${total})`;
+        clog(`reload cycle ${done}/${total} (final)`);
+        sessionStorage.removeItem(CYCLE_TOTAL_KEY);
+        sessionStorage.removeItem(CYCLE_DONE_KEY);
+        return;
+      }
+
+      cycleStatus.textContent = `cycle ${done}/${total} — reloading in 2s`;
+      clog(`reload cycle ${done}/${total}`);
+      sessionStorage.setItem(CYCLE_DONE_KEY, String(done));
+      // Give getUserMedia() time to actually open the stream before moving on.
+      setTimeout(() => location.reload(), 2000);
+    })();
   </script>
 </body>
 </html>
