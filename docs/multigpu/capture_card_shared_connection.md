@@ -92,6 +92,14 @@ $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
 
 ## 4. 실기 절차
 
+**이 절차는 후속 작업이 아니라 머지 게이트다.** `create_input_stream`(`media_capture.rs`)의
+비디오 갈래는 자동 테스트로 전혀 덮이지 않는다 — 그 갈래를 예전 `get_track` 경로로 되돌려도
+(즉 이 브랜치의 핵심 변경을 통째로 되돌려도) 20개 단위 테스트는 그대로 전부 통과한다. 그
+20개는 **허브 자체가 옳다는 것**만 증명한다: 포트 재사용, 소비자 배포, 재개방 판단, 락 오염
+내성. Servo가 실제로 그 허브를 쓰고 있는가 — 즉 `getUserMedia()` 가 진짜로 허브를 거쳐서
+같은 포트를 두 번 열지 않는가 — 는 오직 이 실기 절차만 증명한다. 이 절이 안 돌았다면 이
+브랜치는 검증되지 않은 것이다.
+
 테스트 장비에서, 이 브랜치 그대로 빌드된 `servoshell.exe` 로(아래 명령은 이 워크트리 루트 —
 `target\debug\servoshell.exe` 와 `tests\html\` 가 보이는 위치 — 에서 실행한다).
 
@@ -99,6 +107,27 @@ $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
 (`components/config/prefs.rs`)이고, 없으면 `navigator.mediaDevices` 자체가 `undefined`라
 프로브 페이지가 `getUserMedia` 를 호출하지도 못한다 — 그러면 캡처 허브는 아예 손도 안 타서
 아래 로그 확인에서 `capture hub: opened` 가 **한 줄도** 안 나온다(§3의 "0줄" 판정 참고).
+
+### 시간을 재야 할 두 지점
+
+이 브랜치는 캡처 장치 개방을 스크립트 스레드로 옮겼다 — 대칭적으로 해제도 스크립트 스레드
+경로에 걸려 있다. 둘 다 이 저장소가 전에 실측으로 걸렸던 종류의 정지이므로, 실기에서는
+**초 단위로 시간을 재서** 기록한다:
+
+- **런치 후 첫 `getUserMedia`.** 그 포트의 첫 개방은 스크립트 스레드가
+  `DeviceHub::open`(`capture_hub.rs`) 안에서 최대 `START_TIMEOUT`(5초)까지 블록할 수 있다 —
+  전에는 장치가 플레이어 스레드에서 나중에 열렸지만, 지금은 `getUserMedia()` 호출 자체가
+  이 블록을 포함한다.
+- **창을 닫는 순간.** `release_capture_streams`(`globalscope.rs`)가
+  `Window::clear_js_runtime`(`window.rs`) 맨 앞에서 돌며 캡처 파이프라인을 `Null` 로 내리는데,
+  그 파이프라인의 `proxysink` 가 플레이어 쪽 `PLAYING` 상태의 `proxysrc` 와 여전히 peer 로
+  연결돼 있을 수 있다. 이 저장소는 라이브 파이프라인 teardown 에서 수 초짜리 정지를 반복해서
+  기록한 전례가 있다(RTSP teardown 등).
+
+**문제처럼 보이는 것 = 눈에 보이는 정지(화면이 얼어붙거나 창이 응답하지 않는 것).** 둘 중
+하나라도 관찰되면, 정확한 지점(런치 후 첫 열기 vs 창 닫기)과 걸린 시간을 함께 보고할
+가치가 있다 — 이 문서는 그 재구조화를 지금 하지 않기로 한 결정 위에 있으므로, 실측이 다음
+판단의 근거가 된다.
 
 ```powershell
 $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
@@ -187,14 +216,20 @@ cargo test -p servo-media-streams --lib
   스트림 id 를 가리키므로, 클론 하나를 `stop()` 하면 원본을 포함해 전부 멈춘다. Web 표준
   위반이지만, 고치려면 트랙별로 독립된 스트림 복제가 필요해 별건으로 남겨둔다.
   `mediastreamtrack.rs` 의 `Clone`/`Stop` 구현에 주석으로도 남아 있다.
-- **장치가 (에러를 내지 않고) 멈춰버리면 허브는 건강하다고 잘못 판단한다.** 허브가 여는 시점의
-  건강 확인은 파이프라인이 `PLAYING` 상태 전이에 성공했는지만 본다. 비동기 상태 전이가
-  "성공"으로 잡히는 경우, 장치가 실제로는 응답을 멈췄어도(에러/EOS 를 내지 않고 그냥 hang) 허브는
-  계속 건강한 것으로 저장된다 — 이런 장애는 버스 이벤트로 감지되지 않으므로 재개방되지 않는다.
+- **(해결됨, 2026-09-04 리뷰 수정)** ~~장치가 (에러를 내지 않고) 멈춰버리면 허브는 건강하다고
+  잘못 판단한다~~ — `DeviceHub::open` 의 건강 확인이 `pipeline.state(START_TIMEOUT).0.is_err()`
+  만 봤는데, `Ok(StateChangeSuccess::Async)`(START_TIMEOUT 이 다 되도록 전이가 안 끝난 상태)는
+  `is_err()` 가 아니라서 걸러지지 않았다. 이제 `Success`/`NoPreroll` 만 통과시키고 그 외
+  (`Async` 포함)는 실패로 처리해 슬롯에 저장하지 않는다.
 - **스크립트 스레드가 패닉하면 캡처 스트림이 해제되지 않는다.** §2/§3의 수명 해제는
   `Window::clear_js_runtime()`(정상적인 문서 종료 경로)에 걸려 있다. 스크립트 스레드가
   패닉으로 죽으면 이 경로를 거치지 않으므로, 그 문서가 열었던 캡처 스트림은 해제되지 않고
   장치는 **프로세스가 끝날 때까지** 계속 물려 있는다. 정상 종료(창 닫기)에는 영향이 없다.
+- **허브의 caps 는 처음 연 쪽이 고정한다.** 허브는 포트당 하나의 파이프라인이고 그 `capsfilter`
+  는 첫 `getUserMedia()` 가 장치를 열 때 결정된 포맷을 쓴다. 이후 다른 `width`/`height`/
+  `frameRate` 제약으로 같은 포트를 여는 두 번째 `getUserMedia()` 는 자기 제약이 조용히
+  무시되고 첫 호출자의 포맷을 그대로 받는다 — 지금 제약은 **장치 선택**에만 쓰이고 **포맷
+  협상**에는 쓰이지 않는다.
 
 ## 7. 스코프 밖 (이 문서/브랜치가 다루지 않는 것)
 
