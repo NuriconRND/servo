@@ -21,9 +21,12 @@
   ***winit_wall never forwards input to the engine*** — its event loop handles
   only CloseRequested and RedrawRequested — so the buttons in the .controls
   panel are unreachable there. Drive it from the query string instead:
-  ?cycles=N runs N page transitions with no click, and &stop=1 additionally
-  calls track.stop() before each reload. See the .controls note below for
-  which release path each one exercises.
+  ?cycles=N runs N page transitions with no click, and ?cycles=N,stop
+  additionally calls track.stop() before each one. One comma-separated
+  parameter, no `&`: the launcher hands the URL to the engine through
+  `cmd start`, where `&` is a command separator, and a URL truncated there
+  still loads the page -- so the dropped option looks like a passing run.
+  See the note above the cycle code for which release path each exercises.
 
   The HUD (top-left) lists every videoinput device and live stats for the opened
   one. With no capture device: 0 videoinput + getUserMedia 0 tracks, but NO
@@ -41,10 +44,11 @@
   docs/multigpu/capture_card_shared_connection.md:
     - "stop() the current track" calls track.stop() on every track of the
       live stream (window.currentStream) — exercises Task 6's release path.
-    - "reload N times" drives N page transitions on its own (location.reload()
-      in a loop, count carried across reloads in sessionStorage) — exercises
-      the capture hub's reuse-not-reopen path (capture_hub.rs) the way
-      repeated getUserMedia() calls across page navigations would.
+    - "reload N times" drives N page transitions on its own (a self-navigating
+      loop whose counter rides in the URL) — exercises the capture hub's
+      reuse-not-reopen path (capture_hub.rs) the way repeated getUserMedia()
+      calls across page navigations would. ?cycles=N does the same with no
+      click, which is how the wall runs it.
 -->
 <html>
 <head>
@@ -195,72 +199,89 @@
       clog("stop-track: stopped all tracks of window.currentStream");
     });
 
-    // Drives N page transitions in a row, so a single "reload N times" click
-    // reproduces the failure mode this branch fixes (a getUserMedia() call on
-    // every page load, previously never released). The remaining/total counts
-    // are carried across reloads in sessionStorage since a full navigation
-    // clears all JS state. Status line always shows "cycle X/N" and stops
-    // (and clears its own sessionStorage keys) once X reaches N.
-    const CYCLE_TOTAL_KEY = "captureCardCycleTotal";
-    const CYCLE_DONE_KEY = "captureCardCycleDone";
+    // Drives N page transitions in a row, reproducing the failure mode this
+    // branch fixes: a getUserMedia() call on every page load, previously never
+    // released. A full navigation clears all JS state, so the done/total counts
+    // have to survive outside it -- see the note below on where they live and
+    // why. The status line shows "cycle X/N" and stops once X reaches N.
     const cycleStatus = document.getElementById("cycle-status");
+
+    // The cycle counter lives in the URL, NOT in sessionStorage.
+    //
+    // ***sessionStorage is not available on the wall.*** Measured 2026-09-04 on the
+    // test machine: the engine logs
+    //   storage::client_storage] Failed to initialize ClientStorage engine ...
+    //   CannotOpen "unable to open database file: ...\Temp\.tmp*\clientstorage\..."
+    // and every getItem then returns null (or throws), so a storage-backed counter
+    // reads back as "no run in progress" on the very first load and the loop never
+    // starts. That failure is silent from the page's side and looked exactly like a
+    // passing run: one `capture hub: opened`, no panics, and nothing transitioned.
+    // The URL survives a navigation by construction and needs no engine subsystem.
+    //
+    // Syntax, deliberately using ONE parameter with comma-separated tokens so no `&`
+    // is needed -- the launcher hands the URL to the engine through `cmd start`,
+    // where `&` is a command separator:
+    //   ?cycles=20            20 transitions, no stop()
+    //   ?cycles=20,stop       20 transitions, track.stop() before each
+    //   ?cycles=20,stop,d3    ...as rewritten by the page itself; d<n> = done count
+    // `&stop=1` is still honored if it does arrive intact.
+    //
+    // Leave stop off to exercise the path that actually matters -- a page that
+    // releases nothing and relies on pipeline exit to do it -- which is what a real
+    // page does and what the reported crash came from. Run it once with `,stop` to
+    // cover the explicit-release path separately; keeping them apart is what makes a
+    // failure attributable to one path or the other.
+    const params = new URLSearchParams(location.search);
+    const cycleTokens = (params.get("cycles") || "").split(",").map(t => t.trim());
+    const cycleTotal = parseInt(cycleTokens[0] || "0", 10);
+    const stopEachCycle = cycleTokens.includes("stop") || params.get("stop") === "1";
+    const doneToken = cycleTokens.find(t => /^d\d+$/.test(t));
+    const cycleDone = doneToken ? parseInt(doneToken.slice(1), 10) : 0;
+
+    // Rebuild the whole query so an operator's ?device= selector survives every
+    // transition; only the `cycles` value changes.
+    function cycleUrl(done) {
+      const next = new URLSearchParams(location.search);
+      next.set("cycles",
+        [String(cycleTotal), stopEachCycle ? "stop" : null, "d" + done]
+          .filter(Boolean).join(","));
+      return location.pathname + "?" + next.toString();
+    }
 
     document.getElementById("start-cycles").addEventListener("click", () => {
       const count = parseInt(document.getElementById("cycle-count").value, 10);
-      if (!Number.isFinite(count) || count < 1) { return; }
-      sessionStorage.setItem(CYCLE_TOTAL_KEY, String(count));
-      sessionStorage.setItem(CYCLE_DONE_KEY, "0");
-      location.reload();
+      if (!Number.isFinite(count) || count < 1) {
+        cycleStatus.textContent = "enter a cycle count of 1 or more";
+        return;
+      }
+      const next = new URLSearchParams(location.search);
+      next.set("cycles", String(count));
+      location.href = location.pathname + "?" + next.toString();
     });
 
-    // ?cycles=N starts the same run with no click at all, because winit_wall --
-    // the shell the on-hardware procedure uses -- handles only CloseRequested and
-    // RedrawRequested and never forwards input to the engine, so the buttons above
-    // are unreachable there. Seed only when no run is already in progress:
-    // location.reload() keeps the query string, so re-seeding every load would
-    // reset the counter and cycle forever.
-    //
-    // &stop=1 additionally calls track.stop() right before each reload. Leave it
-    // off to exercise the path that actually matters -- a page that releases
-    // nothing, and relies on pipeline exit to do it -- which is what a real page
-    // does and what the reported crash came from. Run it once with &stop=1 to
-    // cover the explicit-release path separately; keeping them apart is what makes
-    // a failure attributable to one path or the other.
-    const params = new URLSearchParams(location.search);
-    const stopEachCycle = params.get("stop") === "1";
-    if (!sessionStorage.getItem(CYCLE_TOTAL_KEY)) {
-      const requested = parseInt(params.get("cycles") || "0", 10);
-      if (Number.isFinite(requested) && requested >= 1) {
-        sessionStorage.setItem(CYCLE_TOTAL_KEY, String(requested));
-        sessionStorage.setItem(CYCLE_DONE_KEY, "0");
-        clog(`cycles=${requested} from the query string, stop=${stopEachCycle}`);
-      }
-    }
-
     (function runCycleStep() {
-      const total = parseInt(sessionStorage.getItem(CYCLE_TOTAL_KEY) || "0", 10);
-      if (total < 1) { return; } // no cycle run in progress
-      const done = parseInt(sessionStorage.getItem(CYCLE_DONE_KEY) || "0", 10) + 1;
-      const mode = stopEachCycle ? "stop+reload" : "reload";
+      if (!Number.isFinite(cycleTotal) || cycleTotal < 1) { return; }
+      const done = cycleDone + 1;
+      const mode = stopEachCycle ? "stop+navigate" : "navigate";
 
-      if (done >= total) {
-        cycleStatus.textContent = `cycles done (${done}/${total}, ${mode})`;
-        clog(`reload cycle ${done}/${total} (final, ${mode})`);
-        sessionStorage.removeItem(CYCLE_TOTAL_KEY);
-        sessionStorage.removeItem(CYCLE_DONE_KEY);
+      if (done >= cycleTotal) {
+        cycleStatus.textContent = `cycles done (${done}/${cycleTotal}, ${mode})`;
+        clog(`cycle ${done}/${cycleTotal} (final, ${mode})`);
         return;
       }
 
-      cycleStatus.textContent = `cycle ${done}/${total} (${mode}) — reloading in 2s`;
-      clog(`reload cycle ${done}/${total} (${mode})`);
-      sessionStorage.setItem(CYCLE_DONE_KEY, String(done));
+      cycleStatus.textContent = `cycle ${done}/${cycleTotal} (${mode}) — next in 2s`;
+      clog(`cycle ${done}/${cycleTotal} (${mode})`);
       // Give getUserMedia() time to actually open the stream before moving on.
       setTimeout(() => {
         if (stopEachCycle && window.currentStream) {
           for (const track of window.currentStream.getTracks()) { track.stop(); }
-          clog(`cycle ${done}/${total}: stopped all tracks before reloading`);
+          clog(`cycle ${done}/${cycleTotal}: stopped all tracks before navigating`);
         }
-        location.reload();
+        // replace(), not assign(): 20 transitions should not build 20 history
+        // entries. It is still a full navigation, which is the point -- each one
+        // tears the document down and runs the pipeline-exit release path.
+        location.replace(cycleUrl(done));
       }, 2000);
     })();
   </script>

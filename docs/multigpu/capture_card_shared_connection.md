@@ -5,7 +5,7 @@
 
 이 문서는 **캡처카드가 실제로 물린 장비에서** 이 브랜치를 검증하려는 사람을 위한 것이다.
 개발기에는 캡처카드가 없어서, 여기 적힌 것 중 "실기 절차" 절 이전은 전부 하드웨어 없이 도는
-자동 테스트(20건)로 이미 증명되어 있다. 실기에서 확인해야 하는 것은 딱 하나 — **페이지를
+자동 테스트(21건)로 이미 증명되어 있다. 실기에서 확인해야 하는 것은 딱 하나 — **페이지를
 반복 전환해도 같은 물리 포트가 한 번만 열리는가**이다.
 
 ## 1. 왜 포트당 연결이 하나여야 하는가
@@ -127,7 +127,15 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 문자열로 구동한다:
 
 - `?cycles=N` — 클릭 없이 N회 페이지 전환을 자동 수행(전환 간 2초).
-- `&stop=1` — 매 전환 직전에 `track.stop()` 을 호출.
+- `?cycles=N,stop` — 거기에 더해 매 전환 직전 `track.stop()` 호출.
+
+**쉼표 하나짜리 파라미터인 것에 이유가 있다.** 런처는 URL 을 `cmd start` 를 통해 엔진에
+넘기는데 `cmd` 에서 `&` 는 명령 구분자다. `&stop=1` 형태는 도중에 잘려도 페이지는 멀쩡히
+뜨기 때문에 **조용히 무시된 채로 통과한 것처럼 보인다.** 그래서 `&` 를 아예 안 쓴다.
+
+전환 카운터도 **URL 에 실려서** 넘어간다(`?cycles=20,stop,d3` 의 `d3`). `sessionStorage`
+를 쓰지 않는 이유는 §5 에 있다 — 이 장비에서 그게 죽어 있고, 그 실패가 "통과처럼 보이는
+0회 실행"을 만들어냈다.
 
 ### 1회차 — 기본 경로 (stop 없이)
 
@@ -145,8 +153,9 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
   한 줄도 안 나온다**(§3의 "0줄" 판정 참고). 허브 문제로 오독하기 딱 좋은 형태다.
 - `-Serve` 는 `pages\html` 을 http 로 띄우고 상대 URL(쿼리 문자열 포함)을 그 위에서 푼다.
 - `-DurationSec 90` 은 20회 × 2초 = 40초에 기동·첫 개방 여유를 더한 값이다. 전환 횟수를
-  바꾸면 **`N*2 + 30`초** 이상으로 잡는다. 시간이 모자라면 사이클이 다 안 돌고 끝나며,
-  그건 로그의 마지막 `reload cycle X/N` 으로 바로 보인다.
+  바꾸면 **`N*2 + 30`초** 이상으로 잡는다. 시간이 모자라면 사이클이 다 안 돌고 끝나는데,
+  그건 `capture hub: reused` 개수가 기대한 전환 횟수보다 적은 것으로 드러난다(페이지의
+  `cycle X/N` 콘솔 줄은 런처 로그에 안 남는다 — 아래 판정 절 참고).
 - `-Layout` 은 주지 않는다 — 기본값 `wall_layout.multigpu.json`(4-GPU 월)이 맞다.
 - `RUST_LOG` 도 주지 않는다. 런처가 `servo_media_gstreamer=info` 를 포함해 무조건 설정한다.
 - 로그는 런처가 `wall_<날짜시각>.err.log` 로 남기고, 끝난 뒤 스스로 요약을 출력한다.
@@ -155,7 +164,7 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 
 ```powershell
 .\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 90 `
-  -Url "multigpu_capture_card_probe.html?cycles=20&stop=1"
+  -Url "multigpu_capture_card_probe.html?cycles=20,stop"
 ```
 
 두 경로를 **일부러 분리해서** 돌린다. 섞으면 실패했을 때 어느 해제 경로가 깨졌는지 구분할 수
@@ -166,19 +175,56 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 
 ```powershell
 $log = Get-ChildItem wall_*.err.log | Sort-Object LastWriteTime | Select-Object -Last 1
-Select-String -Path $log -Pattern "capture hub: opened"       # 포트당 정확히 1줄
-Select-String -Path $log -Pattern "consumers="                # 전환 후 다시 1로 돌아와야
-Select-String -Path $log -Pattern "panicked|not-negotiated"   # 0건
-Select-String -Path $log -Pattern "reload cycle"              # N회까지 다 돌았는지
+(Select-String -Path $log -Pattern "capture hub: opened" -SimpleMatch | Measure-Object).Count  # 포트당 1
+(Select-String -Path $log -Pattern "capture hub: reused" -SimpleMatch | Measure-Object).Count  # ★전환 횟수-1★
+(Select-String -Path $log -Pattern "panicked"            -SimpleMatch | Measure-Object).Count  # 0
+Select-String -Path $log -Pattern "consumers=" -SimpleMatch | Select-Object -Last 6            # 끝부분 확인
 ```
 
-통과 조건은 세 가지다. **(1)** `capture hub: opened` 가 사용한 포트 수만큼만 — 20회 전환에도
-포트당 1줄. 2줄 이상이면 그 바로 앞에 `is unhealthy; reopening` 이 있어야 정당한 재개방이고,
-없으면 실패다. **(2)** 전환 사이의 `consumers=` 가 계속 1로 복귀 — 계속 증가하면 소비자가
-누적되는 것이다. **(3)** `panicked` / `not-negotiated` 0건.
+**★`reused` 가 이 절차의 결정적 신호다 — 처음 쓴 판정 기준엔 이게 빠져 있었다★**
 
-`capture hub: opened` 가 **한 줄도** 없으면 허브 실패가 아니라 페이지가 `getUserMedia` 에
-도달하지 못한 것이다 — `-PageFeatures` 를 빠뜨렸거나 장치 선택이 실패한 경우다.
+2026-09-04 첫 실기에서 `opened=1`, `panicked=0` 이 나와 당시 기준으로는 통과처럼 보였다.
+그런데 같은 로그의 `reused` 는 **0** 이었고 `consumer 1 added (consumers=1)` 이 딱 한 줄뿐이었다
+— `getUserMedia` 가 전체 실행에서 **한 번만** 불렸다는 뜻, 즉 **전환이 0회**였다. 아무것도
+검증하지 않은 실행이 통과로 읽혔다.
+
+이유는 단순하다. `opened` 는 **"포트를 두 번 열지 않았다"** 만 말한다. 전환이 아예 없었어도
+그 조건은 만족된다. **"전환이 실제로 일어났다"를 말하는 건 `reused` 뿐이다.** 따라서
+`reused == 0` 이면 나머지가 아무리 깨끗해도 **판정 불가(무효 실행)** 로 다룬다.
+
+통과 조건은 네 가지다.
+
+1. **`opened` 가 사용한 포트 수만큼만.** 20회 전환에도 포트당 1줄. 2줄 이상이면 바로 앞에
+   `is unhealthy; reopening` 이 있어야 정당한 재개방이고, 없으면 실패다.
+2. **`reused` 가 대략 (전환 횟수 − 1) 만큼.** 0이면 무효 실행 — 아래 "0회로 끝났을 때"로 간다.
+3. **`consumers=` 의 added 와 removed 가 균형**을 이루고 끝에서 1(창이 살아있을 때) 또는
+   0(종료 후)으로 돌아온다. 단조 증가하면 소비자가 누적되는 것이다.
+4. **`panicked` / `not-negotiated` 0건.**
+
+### 전환이 0회로 끝났을 때 (reused=0)
+
+허브를 의심하기 전에 이 순서로 본다.
+
+- **`capture hub: opened` 도 0줄인가?** 그러면 페이지가 `getUserMedia` 에 도달조차 못 한 것이다
+  — `-PageFeatures` 누락이거나 장치 선택 실패(`?device=` 가 아무것도 못 찾음, 또는
+  `videoinput` 0개)다.
+- **`opened=1` 인데 `reused=0` 인가?** 스트림은 열렸는데 페이지가 전환을 안 한 것이다. URL 에
+  `?cycles=N` 이 실제로 들어갔는지 확인한다. 런처가 `cmd start` 를 거치므로 URL 에 `&` 가
+  있으면 거기서 잘릴 수 있다 — 그래서 이 페이지는 `?cycles=20,stop` 처럼 `&` 없는 문법을 쓴다.
+- 화면 좌하단 상태 줄(`cycle X/N`)이 갱신되는지 본다. 페이지 자신의 `console.log` 는 런처
+  로그에 안 남으므로(아래) 화면이 유일한 직접 신호다.
+
+페이지의 `console.log`(`[capture-card-probe] cycle 3/20 ...`)는 **런처 로그에 안 남는다** —
+런처 기본 `RUST_LOG` 에 `script=info` 가 없기 때문이다. 굳이 보려면 `RUST_LOG` 를 직접
+설정하고 `-KeepRustLog` 를 준다:
+
+```powershell
+$env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreamer=info,script=info"
+.\run_wall_dist.ps1 -KeepRustLog -PageFeatures -Serve -DurationSec 90 `
+  -Url "multigpu_capture_card_probe.html?cycles=20"
+```
+
+판정에 필요한 신호는 전부 허브 로그에 있으므로 보통은 필요 없다.
 
 ### 시간을 재야 할 두 지점
 
