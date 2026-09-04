@@ -138,6 +138,10 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_wall_stress_cases.html") (Join-P
 # dom_webrtc_enabled, and is driven by ?cycles=N from the query string because winit_wall
 # never forwards input -- its buttons cannot be clicked on the wall.
 Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Concurrent-consumer probe: N getUserMedia on ONE port, all live at once. This is
+# the case the hub exists for and the one the sequential probe never exercises --
+# its `consumers=` never went above 1. Driven by ?multi=N, again no `&`.
+Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_multi_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---

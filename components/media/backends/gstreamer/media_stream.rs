@@ -452,6 +452,61 @@ mod tests {
         assert!(hub.is_playing(), "releasing a stream closed the device");
     }
 
+    /// One `MediaStream` feeds exactly one `<video>`, and a second attach fails
+    /// without disturbing the first.
+    ///
+    /// Assigning the same `MediaStream` to two media elements makes each player
+    /// call `ServoMediaStreamSrc::set_stream`, which links the stream's tail
+    /// element to its own `proxysink`. That tail is a `queue`, whose src pad is
+    /// static and already linked -- so the second link fails and that player
+    /// reports `SetStreamFailed`. This is a pre-existing engine limit, unrelated
+    /// to the capture hub, but it is easy to mistake for a capture-card conflict
+    /// when two tiles are meant to show the same port. Pinned here so a change
+    /// that alters it -- in either direction -- is visible.
+    #[test]
+    fn one_stream_feeds_one_sink_and_a_second_attach_does_not_disturb_it() {
+        gstreamer::init().expect("gstreamer::init failed");
+        let id = GStreamerMediaStream::create_video_from(test_source().expect("source"));
+        let stream = get_stream(&id).expect("registered");
+        let mut guard = stream.lock().unwrap();
+        let stream = guard
+            .as_mut_any()
+            .downcast_mut::<GStreamerMediaStream>()
+            .unwrap();
+
+        let pipeline = stream.pipeline_or_new();
+        let tail = stream.raw();
+
+        let first = gstreamer::ElementFactory::make("proxysink")
+            .build()
+            .unwrap();
+        pipeline.add(&first).unwrap();
+        assert!(
+            gstreamer::Element::link_many([&tail, &first]).is_ok(),
+            "the first sink must attach"
+        );
+        first.sync_state_with_parent().unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+
+        let second = gstreamer::ElementFactory::make("proxysink")
+            .build()
+            .unwrap();
+        pipeline.add(&second).unwrap();
+        assert!(
+            gstreamer::Element::link_many([&tail, &second]).is_err(),
+            "the tail queue has one static src pad, so a second sink cannot attach"
+        );
+
+        assert_eq!(
+            pipeline.current_state(),
+            gstreamer::State::Playing,
+            "a failed second attach must not stop the stream the first sink is using"
+        );
+        assert_eq!(first.current_state(), gstreamer::State::Playing);
+
+        let _ = pipeline.set_state(gstreamer::State::Null);
+    }
+
     /// 허브를 안 쓰는 스트림(모의 소스, getDisplayMedia 등)은 그대로 동작한다.
     #[test]
     fn a_stream_without_a_capture_consumer_still_registers_and_releases() {

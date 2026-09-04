@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<!-- Copyright Servo. SPDX-License-Identifier: MPL-2.0 -->
+<!--
+  Phase: capture-card CONCURRENT consumers probe (multi-GPU wall).
+
+  The companion probe (multigpu_capture_card_probe.html) verifies the
+  *sequential* case: one consumer at a time, across N page transitions, with the
+  port opened exactly once. This one verifies the *concurrent* case, which is
+  what the capture hub actually exists for and which nothing else covers:
+
+      N simultaneous getUserMedia() calls on the SAME physical port,
+      all N playing at once.
+
+  Before the hub this collapsed. Measured 2026-08-20 on this hardware: opening
+  one port K times concurrently succeeded 5/5 at K=1, 4/5 at K=2, and **0/5 at
+  K=3, where every attempt left exactly one survivor**. "Each time I open
+  another video the previous one stops" is that failure, verbatim.
+
+  Run (winit_wall on the wall -- no input is forwarded there, so everything is
+  driven from the query string):
+    .\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 120 `
+      -Url "multigpu_capture_card_multi_probe.html?multi=3"
+
+  Run (servoshell, interactive):
+    servoshell.exe --pref dom_webrtc_enabled=true tests/html/multigpu_capture_card_multi_probe.html?multi=3
+
+  Query, one comma-separated parameter so no `&` is needed (the launcher hands
+  the URL to the engine through `cmd start`, where `&` is a command separator
+  and a truncated URL still loads the page -- a dropped option would look like
+  a passing run):
+    ?multi=N            open N streams on the first videoinput
+    ?multi=N,dev2       ...on videoinput index 2 instead
+    ?multi=N,gap1500    ...staggering the opens by 1500ms (default 800)
+
+  WHAT TO CHECK -- in the engine log, not on this page:
+    capture hub: opened <key>      exactly 1     (the port is opened once)
+    capture hub: reused <key>      N - 1         (everyone else joined it)
+    consumers=N                    reaches N     <-- the whole point
+  and on screen: N pictures live AT THE SAME TIME.
+
+  If instead you see N separate `opened` lines, the requests are not reaching
+  the hub at all. If you see consumers rise and fall back to 1, they are not
+  overlapping -- check that this page opened them all before any released.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>multigpu capture card — concurrent consumers</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+                 font: 13px/1.45 monospace; color: #0f0; }
+    #grid { position: fixed; inset: 0; display: grid; gap: 2px; }
+    .cell { position: relative; background: #060; overflow: hidden; }
+    .cell video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    .tag { position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,.7);
+           border: 1px solid #0f0; padding: 2px 6px; white-space: pre; }
+    .cell.live  { background: #000; }
+    .cell.fail  { background: #300; }
+    #hud { position: fixed; left: 12px; bottom: 12px; z-index: 10; max-width: 70vw;
+           background: rgba(0,0,0,.72); border: 1px solid #0f0; padding: 10px 12px;
+           white-space: pre-wrap; }
+    #hud b { color: #6f6; }
+  </style>
+</head>
+<body>
+  <div id="grid"></div>
+  <div id="hud">starting…</div>
+  <script>
+    const hud = document.getElementById("hud");
+    const grid = document.getElementById("grid");
+    function clog(m) { console.log("[capture-multi] " + m); }
+
+    // ---- query: ?multi=N[,devK][,gapMS] ------------------------------------
+    const tokens = (new URLSearchParams(location.search).get("multi") || "")
+      .split(",").map(t => t.trim());
+    const count = Math.max(1, parseInt(tokens[0] || "3", 10) || 3);
+    const devToken = tokens.find(t => /^dev\d+$/.test(t));
+    const deviceIndex = devToken ? parseInt(devToken.slice(3), 10) : 0;
+    const gapToken = tokens.find(t => /^gap\d+$/.test(t));
+    // Stagger the opens a little. With the hub only the FIRST call touches the
+    // device, so this is not needed for correctness -- it just makes the log
+    // readable and mirrors how tiles mount one after another in a real page.
+    const gapMs = gapToken ? parseInt(gapToken.slice(3), 10) : 800;
+
+    const cells = [];
+    grid.style.gridTemplateColumns = `repeat(${Math.ceil(Math.sqrt(count))}, 1fr)`;
+    for (let i = 0; i < count; i++) {
+      const cell = document.createElement("div");
+      cell.className = "cell";
+      const video = document.createElement("video");
+      video.autoplay = true; video.playsInline = true; video.muted = true;
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.textContent = `#${i} waiting`;
+      cell.appendChild(video); cell.appendChild(tag);
+      grid.appendChild(cell);
+      cells.push({ cell, video, tag, state: "waiting", stream: null });
+    }
+
+    function renderHud(extra) {
+      const live = cells.filter(c => c.state === "live").length;
+      const failed = cells.filter(c => c.state === "failed").length;
+      hud.innerHTML =
+        `<b>concurrent capture consumers</b>\n` +
+        `requested: ${count}   live: ${live}   failed: ${failed}\n` +
+        (extra ? extra + "\n" : "") +
+        cells.map((c, i) => `  #${i} ${c.state}` +
+          (c.video.videoWidth ? ` ${c.video.videoWidth}x${c.video.videoHeight}` : "")).join("\n") +
+        `\n\nPASS = all ${count} live at once, and the engine log shows one` +
+        `\n'capture hub: opened' with consumers reaching ${count}.`;
+    }
+
+    async function main() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        hud.textContent = "mediaDevices UNAVAILABLE\n" +
+          "(winit_wall: pass -PageFeatures; servoshell: --pref dom_webrtc_enabled=true)";
+        return;
+      }
+
+      let devices = [];
+      try {
+        devices = (await navigator.mediaDevices.enumerateDevices())
+          .filter(d => d.kind === "videoinput");
+      } catch (e) {
+        hud.textContent = "enumerateDevices FAILED: " + e;
+        return;
+      }
+      clog(`videoinput devices: ${devices.length}`);
+      const device = devices[deviceIndex];
+      if (!device) {
+        hud.textContent = `no videoinput at index ${deviceIndex} (have ${devices.length})`;
+        return;
+      }
+      clog(`target device [${deviceIndex}] label="${device.label}" id=${device.deviceId}`);
+      renderHud(`device: "${device.label}"`);
+
+      // N INDEPENDENT getUserMedia calls on the SAME deviceId. Every one of them
+      // must end up on the same hub, as an additional consumer -- not as another
+      // open of the port.
+      for (let i = 0; i < count; i++) {
+        const c = cells[i];
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: device.deviceId } },
+          });
+          c.stream = stream;
+          c.video.srcObject = stream;
+          c.state = "opened";
+          clog(`#${i}: getUserMedia resolved`);
+        } catch (e) {
+          c.state = "failed";
+          c.cell.classList.add("fail");
+          c.tag.textContent = `#${i} FAILED ${e}`;
+          clog(`#${i}: getUserMedia FAILED ${e}`);
+        }
+        renderHud(`device: "${device.label}"`);
+        if (i < count - 1 && gapMs > 0) {
+          await new Promise(r => setTimeout(r, gapMs));
+        }
+      }
+
+      // Report liveness continuously. A consumer that dies later -- which is the
+      // shape of the old failure, where opening the next one killed the previous
+      // -- shows up here as a cell dropping out of "live".
+      let lastT = cells.map(() => -1);
+      setInterval(() => {
+        cells.forEach((c, i) => {
+          if (c.state === "failed") { return; }
+          const t = c.video.currentTime;
+          const advancing = t !== lastT[i] && c.video.videoWidth > 0;
+          lastT[i] = t;
+          c.state = advancing ? "live" : (c.video.videoWidth > 0 ? "STALLED" : "opened");
+          c.cell.classList.toggle("live", advancing);
+          c.tag.textContent =
+            `#${i} ${c.state} ${c.video.videoWidth}x${c.video.videoHeight} t=${t.toFixed(1)}`;
+        });
+        renderHud(`device: "${device.label}"`);
+        clog("live=" + cells.filter(c => c.state === "live").length + "/" + count);
+      }, 1000);
+    }
+
+    renderHud();
+    main();
+  </script>
+</body>
+</html>
