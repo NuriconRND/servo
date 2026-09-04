@@ -237,13 +237,43 @@
     const stopEachCycle = cycleTokens.includes("stop") || params.get("stop") === "1";
     const doneToken = cycleTokens.find(t => /^d\d+$/.test(t));
     const cycleDone = doneToken ? parseInt(doneToken.slice(1), 10) : 0;
+    // hold<N>: seconds to keep the picture on screen once it is actually up.
+    const holdToken = cycleTokens.find(t => /^hold\d+$/.test(t));
+    const holdSec = holdToken ? parseInt(holdToken.slice(4), 10) : 3;
+
+    // Wait until the stream is really on screen, not merely requested.
+    //
+    // ***The timer used to start at page load, and that made the probe useless
+    // on the wall.*** Measured 2026-09-04: getUserMedia took most of the delay,
+    // so the consumer was added and removed inside the same second -- the log
+    // showed `consumer N added` and `consumer N removed` with the same
+    // timestamp, out of a 14-second cycle. The picture was up for a fraction of
+    // a second every cycle, so an operator watching the wall saw nothing and
+    // could not tell a working capture path from a broken one.
+    //
+    // Resolve on the first frame that has real dimensions and an advancing
+    // clock. Give up after a cap and resolve anyway: a port that never opens
+    // must not wedge the whole run, it should just show up as a cycle with no
+    // `capture hub` lines.
+    function whenPictureIsUp(capMs) {
+      return new Promise(resolve => {
+        const t0 = Date.now();
+        (function poll() {
+          if (v.videoWidth > 0 && v.currentTime > 0) { resolve("up"); return; }
+          if (Date.now() - t0 >= capMs) { resolve("timeout"); return; }
+          setTimeout(poll, 100);
+        })();
+      });
+    }
 
     // Rebuild the whole query so an operator's ?device= selector survives every
     // transition; only the `cycles` value changes.
     function cycleUrl(done) {
       const next = new URLSearchParams(location.search);
+      // Every token the next document needs has to be re-emitted here -- anything
+      // left out silently reverts to its default on the very next transition.
       next.set("cycles",
-        [String(cycleTotal), stopEachCycle ? "stop" : null, "d" + done]
+        [String(cycleTotal), stopEachCycle ? "stop" : null, "hold" + holdSec, "d" + done]
           .filter(Boolean).join(","));
       return location.pathname + "?" + next.toString();
     }
@@ -270,19 +300,24 @@
         return;
       }
 
-      cycleStatus.textContent = `cycle ${done}/${cycleTotal} (${mode}) — next in 2s`;
-      clog(`cycle ${done}/${cycleTotal} (${mode})`);
-      // Give getUserMedia() time to actually open the stream before moving on.
-      setTimeout(() => {
-        if (stopEachCycle && window.currentStream) {
-          for (const track of window.currentStream.getTracks()) { track.stop(); }
-          clog(`cycle ${done}/${cycleTotal}: stopped all tracks before navigating`);
-        }
-        // replace(), not assign(): 20 transitions should not build 20 history
-        // entries. It is still a full navigation, which is the point -- each one
-        // tears the document down and runs the pipeline-exit release path.
-        location.replace(cycleUrl(done));
-      }, 2000);
+      cycleStatus.textContent = `cycle ${done}/${cycleTotal} (${mode}) — waiting for picture`;
+      clog(`cycle ${done}/${cycleTotal} (${mode}) waiting for picture`);
+
+      whenPictureIsUp(20000).then(how => {
+        cycleStatus.textContent =
+          `cycle ${done}/${cycleTotal} (${mode}) — picture ${how}, holding ${holdSec}s`;
+        clog(`cycle ${done}/${cycleTotal}: picture ${how}, holding ${holdSec}s`);
+        setTimeout(() => {
+          if (stopEachCycle && window.currentStream) {
+            for (const track of window.currentStream.getTracks()) { track.stop(); }
+            clog(`cycle ${done}/${cycleTotal}: stopped all tracks before navigating`);
+          }
+          // replace(), not assign(): N transitions should not build N history
+          // entries. It is still a full navigation, which is the point -- each
+          // one tears the document down and runs the pipeline-exit release path.
+          location.replace(cycleUrl(done));
+        }, holdSec * 1000);
+      });
     })();
   </script>
 </body>

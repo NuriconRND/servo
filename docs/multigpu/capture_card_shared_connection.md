@@ -126,8 +126,16 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 `stop() the current track` / `reload N times` **버튼은 여기서 누를 수 없다.** 대신 쿼리
 문자열로 구동한다:
 
-- `?cycles=N` — 클릭 없이 N회 페이지 전환을 자동 수행(전환 간 2초).
+- `?cycles=N` — 클릭 없이 N회 페이지 전환을 자동 수행.
 - `?cycles=N,stop` — 거기에 더해 매 전환 직전 `track.stop()` 호출.
+- `?cycles=N,hold5` — 영상이 실제로 뜬 뒤 붙잡고 있을 초(기본 3).
+
+**`hold` 가 왜 필요한가.** 처음엔 전환 타이머를 *페이지 로드* 시점부터 쟀는데, 이 장비에서는
+`getUserMedia` 가 그 2초를 거의 다 써버린다. 2026-09-04 실측 로그에서 `consumer N added` 와
+`consumer N removed` 가 **같은 초**에 찍혔다 — 14초 주기 중 영상이 1초도 안 살아 있었고,
+월을 보고 있어도 **아무것도 안 보였다**. 지금은 `videoWidth > 0` 이고 `currentTime` 이
+움직이기 시작한 뒤부터 `hold` 초를 세고 넘어간다(최대 20초까지 기다렸다가, 안 뜨면 그 사이클은
+그냥 넘어간다 — 포트 하나가 안 열린다고 실행 전체가 멈추면 안 되므로).
 
 **쉼표 하나짜리 파라미터인 것에 이유가 있다.** 런처는 URL 을 `cmd start` 를 통해 엔진에
 넘기는데 `cmd` 에서 `&` 는 명령 구분자다. `&stop=1` 형태는 도중에 잘려도 페이지는 멀쩡히
@@ -145,17 +153,20 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 ```powershell
 # 테스트 장비, 복사해 온 wall_dist 폴더 안에서
 .\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 90 `
-  -Url "multigpu_capture_card_probe.html?cycles=20"
+  -Url "multigpu_capture_card_probe.html?cycles=10,hold3"
 ```
 
 - `-PageFeatures` 가 `dom_webrtc_enabled` 를 켠다. **이게 없으면 `navigator.mediaDevices` 가
   `undefined` 라 페이지가 `getUserMedia` 를 호출조차 못 하고, 로그에 `capture hub: opened` 가
   한 줄도 안 나온다**(§3의 "0줄" 판정 참고). 허브 문제로 오독하기 딱 좋은 형태다.
 - `-Serve` 는 `pages\html` 을 http 로 띄우고 상대 URL(쿼리 문자열 포함)을 그 위에서 푼다.
-- `-DurationSec 90` 은 20회 × 2초 = 40초에 기동·첫 개방 여유를 더한 값이다. 전환 횟수를
-  바꾸면 **`N*2 + 30`초** 이상으로 잡는다. 시간이 모자라면 사이클이 다 안 돌고 끝나는데,
-  그건 `capture hub: reused` 개수가 기대한 전환 횟수보다 적은 것으로 드러난다(페이지의
-  `cycle X/N` 콘솔 줄은 런처 로그에 안 남는다 — 아래 판정 절 참고).
+- **`-DurationSec` 은 넉넉히 잡는다.** 2026-09-04 실측에서 한 사이클은 약 **14초**였다(대부분이
+  새 문서 로드와 `getUserMedia`이고, 영상 표시 시간이 아니었다). 여기에 `hold` 가 더해지므로
+  대략 **`N * (12 + hold) + 30`초** 로 잡는다 — 예: `?cycles=10,hold3` 이면 `-DurationSec 200`.
+  모자라면 사이클이 다 안 돌고 끝나며, 그건 `capture hub: reused` 개수가 기대보다 적은 것으로
+  드러난다(페이지의 `cycle X/N` 콘솔 줄은 런처 로그에 안 남는다 — 아래 판정 절 참고).
+- **전환 횟수는 10회면 충분하다.** 이 절차가 증명하려는 건 "반복 전환해도 포트를 다시 안 연다"
+  이고, 그건 `reused` 가 9쯤 쌓이면 성립한다. 20회는 실행 시간만 두 배로 만든다.
 - `-Layout` 은 주지 않는다 — 기본값 `wall_layout.multigpu.json`(4-GPU 월)이 맞다.
 - `RUST_LOG` 도 주지 않는다. 런처가 `servo_media_gstreamer=info` 를 포함해 무조건 설정한다.
 - 로그는 런처가 `wall_<날짜시각>.err.log` 로 남기고, 끝난 뒤 스스로 요약을 출력한다.
@@ -164,7 +175,7 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 
 ```powershell
 .\run_wall_dist.ps1 -PageFeatures -Serve -DurationSec 90 `
-  -Url "multigpu_capture_card_probe.html?cycles=20,stop"
+  -Url "multigpu_capture_card_probe.html?cycles=10,stop,hold3"
 ```
 
 두 경로를 **일부러 분리해서** 돌린다. 섞으면 실패했을 때 어느 해제 경로가 깨졌는지 구분할 수
@@ -221,10 +232,45 @@ Select-String -Path $log -Pattern "consumers=" -SimpleMatch | Select-Object -Las
 ```powershell
 $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreamer=info,script=info"
 .\run_wall_dist.ps1 -KeepRustLog -PageFeatures -Serve -DurationSec 90 `
-  -Url "multigpu_capture_card_probe.html?cycles=20"
+  -Url "multigpu_capture_card_probe.html?cycles=10,hold3"
 ```
 
 판정에 필요한 신호는 전부 허브 로그에 있으므로 보통은 필요 없다.
+
+### ★미해결 — stop 없는 실행이 도중에 멈춘 적이 있다 (2026-09-04)★
+
+첫 유효 실기에서 관측된 것:
+
+| | stop 없이 | `,stop` |
+|---|---|---|
+| `capture hub: opened` | 1 | 1 |
+| `capture hub: reused` | 1 | 5 |
+| consumer added / removed | 2 / 2 | 6 / 6 |
+| 전환 | **2회에서 멈춤** | `-DurationSec` 끝까지 |
+
+멈춘 뒤 로그에는 **62초 동안 `paint` 만 흐르고 WARN/ERROR 는 0건**이었다. 엔진이 죽은 게 아니라
+**스크립트 쪽 활동만 사라진** 모양이다.
+
+두 실행의 유일한 차이는 **해제가 언제 일어나는가**다. `,stop` 은 네비게이션 *전에* 스트림을
+놓으므로 파이프라인 종료 시 `release_capture_streams` 가 빈 목록을 본다. stop 없는 쪽은 종료
+그 순간에 해제가 일어나고, `GStreamerMediaStream::drop` 이 **스크립트 스레드 위에서**
+`pipeline.set_state(Null)` 을 호출한다 — 그 파이프라인의 `proxysink` 가 아직 `PLAYING` 인
+`proxysrc` 와 짝지어진 채로. 이건 §6 에 적어둔 보류 항목(teardown 위험)과 정확히 같은 지점이다.
+
+**아직 가설이다.** 정황은 강하지만(차이가 그 경로 하나, paint 는 살아있고 script 만 침묵,
+에러 0건) 확정된 것이 아니다. 다음에 재현되면 **먼저 이걸 돌려서 script 쪽이 실제로 멈추는지**
+가른다 — 재빌드 없이 가능한 판별 실험이다:
+
+```powershell
+$env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreamer=info,script=info"
+.un_wall_dist.ps1 -KeepRustLog -PageFeatures -Serve -DurationSec 200 `
+  -Url "multigpu_capture_card_probe.html?cycles=10,hold3"
+```
+
+- 멈춘 뒤에도 새 문서의 script 로그가 이어지면 → 스크립트 스레드는 살아있고 **페이지 로직**
+  문제다(전환 URL 이 안 만들어졌는지 등).
+- 멈춘 시점 이후 script 로그가 완전히 끊기면 → **스크립트 스레드가 teardown 에서 막힌 것**이고,
+  그때는 해제 경로에 소요시간 계측을 넣어 확정한다(엔진 재빌드 필요).
 
 ### 시간을 재야 할 두 지점
 
