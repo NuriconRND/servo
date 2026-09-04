@@ -70,6 +70,7 @@ use servo_constellation_traits::{
     BlobData, BlobImpl, BroadcastChannelMsg, ConstellationInterest, FileBlob, MessagePortImpl,
     MessagePortMsg, PortMessageTask, ScriptToConstellationChan, ScriptToConstellationMessage,
 };
+use servo_media::streams::registry::{MediaStreamId, unregister_stream};
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
 use storage_traits::StorageThreads;
 use strum::VariantArray;
@@ -247,6 +248,12 @@ pub(crate) struct GlobalScope {
     /// Pipeline id associated with this global.
     #[no_trace]
     pipeline_id: PipelineId,
+
+    /// 이 global 이 `getUserMedia`/`getDisplayMedia` 로 만든 캡처 스트림들.
+    /// 스트림 레지스트리는 스트림을 강참조로 붙잡으므로, 여기서 명시적으로
+    /// 놓아주지 않으면 문서가 사라진 뒤에도 캡처 장치가 계속 물려 있다.
+    #[no_trace]
+    capture_streams: DomRefCell<Vec<MediaStreamId>>,
 
     /// Timers (milliseconds) used by the Console API.
     console_timers: DomRefCell<HashMap<DOMString, Instant>>,
@@ -811,6 +818,7 @@ impl GlobalScope {
             indexeddb: Default::default(),
             worker_map: DomRefCell::new(HashMapTracedValues::new_fx()),
             pipeline_id,
+            capture_streams: DomRefCell::new(Vec::new()),
 
             console_timers: DomRefCell::new(Default::default()),
             module_map: DomRefCell::new(Default::default()),
@@ -2527,6 +2535,23 @@ impl GlobalScope {
     /// Get the `PipelineId` for this global scope.
     pub(crate) fn pipeline_id(&self) -> PipelineId {
         self.pipeline_id
+    }
+
+    /// `getUserMedia`/`getDisplayMedia` 가 만든 스트림을 이 global 소유로 기록한다.
+    pub(crate) fn track_capture_stream(&self, id: MediaStreamId) {
+        self.capture_streams.borrow_mut().push(id);
+    }
+
+    /// 이 global 이 만든 캡처 스트림을 전부 놓는다. 파이프라인 종료 시 불린다.
+    /// 레지스트리 항목이 유일한 소유자이므로, 이게 캡처 소비자를 실제로 닫는
+    /// 유일한 지점이다.
+    pub(crate) fn release_capture_streams(&self) {
+        // borrow 를 놓고 나서 해제한다 — unregister_stream 은 스트림의 Drop 을
+        // 부르고, 그 Drop 이 무엇을 건드릴지 여기서 가정하지 않는다.
+        let ids = std::mem::take(&mut *self.capture_streams.borrow_mut());
+        for id in ids {
+            unregister_stream(&id);
+        }
     }
 
     /// Register interest in a notification category. Sends a `RegisterInterest`

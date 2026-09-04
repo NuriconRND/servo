@@ -65,12 +65,14 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
         if let Some(constraints) = convert_constraints(&constraints.audio)
             && let Some(audio) = media.create_audioinput_stream(constraints)
         {
+            self.global().track_capture_stream(audio);
             let track = MediaStreamTrack::new(cx, &self.global(), audio, MediaStreamType::Audio);
             stream.add_track(&track);
         }
         if let Some(constraints) = convert_constraints(&constraints.video)
             && let Some(video) = media.create_videoinput_stream(constraints)
         {
+            self.global().track_capture_stream(video);
             let track = MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video);
             stream.add_track(&track);
         }
@@ -99,6 +101,7 @@ impl MediaDevicesMethods<crate::DomTypeHolder> for MediaDevices {
                 show_cursor: pref!(media_screen_capture_show_cursor),
             };
             if let Some(video) = media.create_display_stream(source, video_constraints) {
+                self.global().track_capture_stream(video);
                 let track =
                     MediaStreamTrack::new(cx, &self.global(), video, MediaStreamType::Video);
                 stream.add_track(&track);

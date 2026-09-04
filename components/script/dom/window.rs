@@ -2468,6 +2468,10 @@ impl Window {
     }
 
     pub(crate) fn clear_js_runtime(&self) {
+        // 캡처 스트림을 먼저 놓는다. 문서가 사라진 뒤에도 캡처 장치를 물고
+        // 있으면, 다음 페이지가 같은 포트를 열면서 카드가 무너진다.
+        self.as_global_scope().release_capture_streams();
+
         self.as_global_scope()
             .remove_web_messaging_and_dedicated_workers_infra();
 
