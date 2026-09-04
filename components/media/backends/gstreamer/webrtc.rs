@@ -153,8 +153,14 @@ impl WebRtcControllerBackend for GStreamerWebRtcController {
     }
 
     fn add_stream(&mut self, stream_id: &MediaStreamId) -> WebRtcResult {
-        let stream =
-            get_stream(stream_id).expect("Media streams registry does not contain such ID");
+        let Some(stream) = get_stream(stream_id) else {
+            warn!(
+                "add_stream: stream id not found in registry (track stopped and reused, or a genuine internal inconsistency)"
+            );
+            return Err(WebRtcError::Backend(
+                "Media streams registry does not contain such ID".to_owned(),
+            ));
+        };
         let mut stream = stream.lock().unwrap();
         let stream = stream
             .as_mut_any()
@@ -591,8 +597,14 @@ impl GStreamerWebRtcController {
     fn flush_pending_streams(&mut self, request_new_pads: bool) -> WebRtcResult {
         let pending_streams = std::mem::take(&mut self.pending_streams);
         for stream_id in pending_streams {
-            let stream =
-                get_stream(&stream_id).expect("Media streams registry does not contain such ID");
+            let Some(stream) = get_stream(&stream_id) else {
+                warn!(
+                    "flush_pending_streams: stream id not found in registry (track stopped and reused, or a genuine internal inconsistency)"
+                );
+                return Err(WebRtcError::Backend(
+                    "Media streams registry does not contain such ID".to_owned(),
+                ));
+            };
             let mut stream = stream.lock().unwrap();
             let stream = stream
                 .as_mut_any()

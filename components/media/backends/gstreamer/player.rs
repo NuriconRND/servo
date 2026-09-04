@@ -1236,7 +1236,12 @@ impl PlayerInner {
             return Err(PlayerError::SetStreamFailed);
         };
 
-        let stream = get_stream(stream).expect("Media streams registry does not contain such ID");
+        let Some(stream) = get_stream(stream) else {
+            log::warn!(
+                "set_stream: stream id not found in registry (track stopped and reused, or a genuine internal inconsistency)"
+            );
+            return Err(PlayerError::SetStreamFailed);
+        };
         let mut stream = stream.lock().unwrap();
         let Some(stream) = stream.as_mut_any().downcast_mut::<GStreamerMediaStream>() else {
             return Err(PlayerError::SetStreamFailed);

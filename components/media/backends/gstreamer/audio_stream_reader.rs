@@ -22,7 +22,12 @@ pub struct GStreamerAudioStreamReader {
 impl GStreamerAudioStreamReader {
     pub fn new(stream: MediaStreamId, sample_rate: f32) -> Result<Self, String> {
         let (tx, rx) = channel();
-        let stream = get_stream(&stream).unwrap();
+        let Some(stream) = get_stream(&stream) else {
+            log::warn!(
+                "GStreamerAudioStreamReader::new: stream id not found in registry (track stopped and reused, or a genuine internal inconsistency)"
+            );
+            return Err("Media streams registry does not contain such ID".to_owned());
+        };
         let mut stream = stream.lock().unwrap();
         let g_stream = stream
             .as_mut_any()
@@ -115,5 +120,26 @@ impl AudioStreamReader for GStreamerAudioStreamReader {
 
     fn stop(&self) {
         self.pipeline.set_state(gstreamer::State::Null).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use servo_media_streams::registry::MediaStreamId;
+
+    use super::*;
+
+    /// A `MediaStreamId` that was never registered (or has since been released
+    /// via `Stop()` + registry teardown) must produce a descriptive `Err`
+    /// rather than panicking. This exercises the `None` branch added when
+    /// `get_stream(&stream).unwrap()` was replaced with a checked lookup.
+    #[test]
+    fn new_with_unregistered_stream_id_returns_err_instead_of_panicking() {
+        let unregistered_id = MediaStreamId::new();
+        let result = GStreamerAudioStreamReader::new(unregistered_id, 44100.0);
+        assert!(
+            result.is_err(),
+            "expected an Err for an unregistered stream id, got Ok"
+        );
     }
 }
