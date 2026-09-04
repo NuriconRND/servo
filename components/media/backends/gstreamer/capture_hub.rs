@@ -38,6 +38,23 @@ static NEXT_CONSUMER_ID: AtomicU64 = AtomicU64::new(1);
 type Slot = Arc<Mutex<Option<Arc<DeviceHub>>>>;
 static SLOTS: LazyLock<Mutex<HashMap<HubKey, Slot>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// What a page's `deviceId` last resolved to.
+///
+/// The hub stops the *device* being opened twice, but the lookup deciding WHICH
+/// device to open still ran on every `getUserMedia`: a fresh `GstDeviceMonitor`,
+/// a full provider probe, and -- because winks exposes no `device.path` property
+/// -- an actual `ksvideosrc` instantiated per candidate just to read its path
+/// back. Measured 2026-09-04 on the 4-port card: ~6.2s, paid again for every
+/// additional tile, even when the answer was a hub that was already open.
+///
+/// So remember the answer. It is only ever used as a shortcut to a hub that is
+/// already open and healthy (`rejoin_video_consumer`); otherwise the caller
+/// falls back to the full lookup. That condition is the safety property -- a
+/// stale entry cannot resurrect a dead device, it can only skip work in front
+/// of a live one.
+static RESOLVED_IDS: LazyLock<Mutex<HashMap<String, HubKey>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// 물리 포트 하나를 가리키는 키.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HubKey(String);
@@ -428,10 +445,55 @@ fn distribute(
 
 /// `device` 의 물리 포트에 대한 단 하나의 캡처 연결에 합류한다.
 /// 그 포트가 아직 안 열려 있으면 여기서 연다.
-pub fn open_video_consumer(device: &gstreamer::Device) -> Option<CaptureConsumer> {
+pub fn open_video_consumer(
+    device: &gstreamer::Device,
+    requested_id: Option<&str>,
+) -> Option<CaptureConsumer> {
+    // Compute the key once: `HubKey::for_video_device` may instantiate the source
+    // element to read `device-path`, which is the expensive half of the lookup.
     let key = HubKey::for_video_device(device);
-    let device = device.clone();
-    open_consumer_with(key, move || device.create_element(None).ok())
+    let source_device = device.clone();
+    let consumer =
+        open_consumer_with(key.clone(), move || source_device.create_element(None).ok())?;
+    if let Some(id) = requested_id {
+        RESOLVED_IDS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id.to_owned(), key);
+    }
+    Some(consumer)
+}
+
+/// Join the hub this `deviceId` resolved to last time, without enumerating.
+///
+/// Returns `None` whenever the shortcut cannot be taken -- id never seen, hub
+/// closed, hub unhealthy -- and the caller must then do the full lookup. Skipping
+/// enumeration also skips re-checking the width/height/framerate constraints
+/// against the device, which changes nothing: the hub's caps are fixed by
+/// whichever call opened the port first, and a later caller with different
+/// constraints already receives that format (documented in the ops notes).
+pub fn rejoin_video_consumer(requested_id: &str) -> Option<CaptureConsumer> {
+    let key = RESOLVED_IDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(requested_id)
+        .cloned()?;
+    // Take the locks in the same order as `open_consumer_with`: the global map
+    // first, released before the per-key slot is locked.
+    let slot = {
+        let slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+        slots.get(&key)?.clone()
+    };
+    let slot = slot.lock().unwrap_or_else(|error| error.into_inner());
+    let hub = slot.as_ref()?;
+    if !hub.is_healthy() {
+        return None;
+    }
+    log::info!(
+        "capture hub: rejoined {} for deviceId {requested_id:?} without enumerating",
+        key.0
+    );
+    hub.add_consumer()
 }
 
 pub(crate) fn open_consumer_with(
@@ -756,6 +818,60 @@ mod tests {
         );
         assert!(recovered.hub().is_healthy());
         assert!(!Arc::ptr_eq(recovered.hub(), &broken_hub));
+    }
+
+    /// A repeat request for a deviceId whose hub is open must not enumerate.
+    ///
+    /// This is the whole point of RESOLVED_IDS: on the 4-port card the lookup in
+    /// front of the hub cost ~6.2s, and it was paid once per tile even though
+    /// every tile after the first landed on the same hub.
+    #[test]
+    fn a_known_device_id_rejoins_without_enumerating() {
+        init();
+        let key = HubKey::for_test("rejoin-known-id");
+        let opens = Arc::new(AtomicUsize::new(0));
+        let first = open_consumer_with(key.clone(), counting_source(&opens)).expect("first");
+        let hub = first.hub().clone();
+        RESOLVED_IDS
+            .lock()
+            .unwrap()
+            .insert("fake-device-id".to_owned(), key);
+
+        let rejoined = rejoin_video_consumer("fake-device-id").expect("rejoined");
+
+        assert_eq!(opens.load(Ordering::Relaxed), 1, "the device was reopened");
+        assert!(Arc::ptr_eq(rejoined.hub(), &hub), "joined a different hub");
+        assert_eq!(hub.consumer_count(), 2);
+    }
+
+    #[test]
+    fn an_unknown_device_id_does_not_rejoin() {
+        init();
+        assert!(rejoin_video_consumer("never-resolved-anything").is_none());
+    }
+
+    /// The shortcut must never hand out a hub whose device has died -- that is
+    /// the property that makes a remembered mapping safe to keep forever.
+    #[test]
+    fn a_device_id_pointing_at_an_unhealthy_hub_does_not_rejoin() {
+        init();
+        let key = HubKey::for_test("rejoin-unhealthy");
+        let broken = open_consumer_with(key.clone(), failing_source).expect("broken");
+        let broken_hub = broken.hub().clone();
+        let _sink = ConsumerSink::start(&broken, true);
+        RESOLVED_IDS
+            .lock()
+            .unwrap()
+            .insert("dying-device-id".to_owned(), key);
+
+        wait_until("the hub to notice the device error", || {
+            !broken_hub.is_healthy()
+        });
+
+        assert!(
+            rejoin_video_consumer("dying-device-id").is_none(),
+            "the shortcut handed out a dead hub instead of forcing a fresh lookup"
+        );
     }
 
     #[test]

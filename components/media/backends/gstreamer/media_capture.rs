@@ -9,7 +9,7 @@ use servo_media_streams::MediaStreamType;
 use servo_media_streams::capture::*;
 use servo_media_streams::registry::MediaStreamId;
 
-use crate::capture_hub::open_video_consumer;
+use crate::capture_hub::{self, open_video_consumer};
 use crate::device_id::{device_api, device_path, normalized_port_key};
 use crate::media_stream::GStreamerMediaStream;
 
@@ -239,13 +239,36 @@ fn create_input_stream(
     stream_type: MediaStreamType,
     constraint_set: MediaTrackConstraintSet,
 ) -> Option<MediaStreamId> {
-    let devices = GstMediaDevices::new();
     match stream_type {
         // 비디오 입력만 허브를 거친다. 같은 포트를 두 번 여는 것이 불안정한
         // 것은 캡처카드 쪽 제약이고, 오디오 입력에는 그 제약이 없다.
         MediaStreamType::Video => {
+            // Read the requested id before `get_device` consumes the constraints.
+            let requested_id = constraint_set.device_id.as_ref().map(|constraint| {
+                let (ConstrainString::Exact(id) | ConstrainString::Ideal(id)) = constraint;
+                id.clone()
+            });
+
+            // A repeat request for a port whose hub is already open skips the
+            // whole lookup. That lookup costs a fresh GstDeviceMonitor, a full
+            // provider probe, and a ksvideosrc instantiated per candidate to read
+            // its device-path -- measured at ~6.2s on the 4-port card, and it was
+            // being paid once per tile even though every tile after the first was
+            // always going to land on the same hub. Only taken when a healthy hub
+            // exists; otherwise this returns None and the full path runs.
+            if let Some(id) = requested_id.as_deref()
+                && let Some(consumer) = capture_hub::rejoin_video_consumer(id)
+            {
+                let source = consumer.source_element();
+                return Some(GStreamerMediaStream::create_video_from_with(
+                    source,
+                    Some(consumer),
+                ));
+            }
+
+            let devices = GstMediaDevices::new();
             let device = devices.get_device(true, constraint_set)?;
-            let consumer = open_video_consumer(&device)?;
+            let consumer = open_video_consumer(&device, requested_id.as_deref())?;
             let source = consumer.source_element();
             Some(GStreamerMediaStream::create_video_from_with(
                 source,
@@ -253,6 +276,7 @@ fn create_input_stream(
             ))
         },
         MediaStreamType::Audio => {
+            let devices = GstMediaDevices::new();
             let track = devices.get_track(false, constraint_set)?;
             Some(GStreamerMediaStream::create_audio_from(track.element))
         },
