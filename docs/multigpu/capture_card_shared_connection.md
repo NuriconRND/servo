@@ -8,6 +8,9 @@
 자동 테스트(21건)로 이미 증명되어 있다. 실기에서 확인해야 하는 것은 딱 하나 — **페이지를
 반복 전환해도 같은 물리 포트가 한 번만 열리는가**이다.
 
+> **2026-09-04: 그 실기 검증은 통과했다** (§4의 "실기 결과"). 이 문서를 절차서로 다시 쓸
+> 일이 있다면 그 절의 수치를 기준선으로 삼으면 된다.
+
 ## 1. 왜 포트당 연결이 하나여야 하는가
 
 2026-08-20, `gst-launch` 로 같은 물리 포트를 K개 동시에 여는 실측(이 문서와 무관하게 이미
@@ -102,6 +105,25 @@ $env:RUST_LOG = "servo_media_gstreamer=info,script=info"
 내성. Servo가 실제로 그 허브를 쓰고 있는가 — 즉 `getUserMedia()` 가 진짜로 허브를 거쳐서
 같은 포트를 두 번 열지 않는가 — 는 오직 이 실기 절차만 증명한다. 이 절이 안 돌았다면 이
 브랜치는 검증되지 않은 것이다.
+
+### 실기 결과 (2026-09-04) — 통과
+
+테스트 장비 4-GPU 월, winit_wall 배포본, `?cycles=10,hold3` 및 `?cycles=10,stop,hold3`.
+
+| 항목 | stop 없이 | `,stop` | 기대값 |
+|---|---|---|---|
+| `capture hub: opened` | **1** | **1** | 포트당 1 |
+| `capture hub: reused` | **9** | **9** | 전환 횟수 − 1 |
+| consumer added / removed | 10 / 9 | 10 / 9 | added = 전환 횟수 |
+| `is unhealthy` / `closing` | 0 | 0 | 0 |
+| `panicked` / `not-negotiated` | 0 / 0 | 0 / 0 | 0 |
+
+10회 전환 동안 물리 포트는 **정확히 한 번** 열렸다. `removed` 가 9인 것은 정상이다 — 마지막
+문서의 소비자는 아직 살아 있는 채로 `-DurationSec` 이 프로세스를 끊는다. 소비자 수명은
+`08:38:04 added → 08:38:07 removed` 처럼 3~4초(= `hold3`), 사이클 주기는 17~18초였고, 매
+사이클 `consumers=0` 으로 복귀해 누적이 없었다. 영상은 육안으로도 확인됐다.
+
+**이것으로 §4 의 머지 게이트는 충족됐다.** 남은 관측 하나는 아래 "미해결" 절에 있다.
 
 ### 셸은 winit_wall 이고, 클릭은 못 한다
 
@@ -225,9 +247,11 @@ Select-String -Path $log -Pattern "consumers=" -SimpleMatch | Select-Object -Las
 - 화면 좌하단 상태 줄(`cycle X/N`)이 갱신되는지 본다. 페이지 자신의 `console.log` 는 런처
   로그에 안 남으므로(아래) 화면이 유일한 직접 신호다.
 
-페이지의 `console.log`(`[capture-card-probe] cycle 3/20 ...`)는 **런처 로그에 안 남는다** —
-런처 기본 `RUST_LOG` 에 `script=info` 가 없기 때문이다. 굳이 보려면 `RUST_LOG` 를 직접
-설정하고 `-KeepRustLog` 를 준다:
+페이지의 `console.log`(`[capture-card-probe] cycle 3/10 ...`)는 **런처 로그에 안 남는다.**
+`script=info` 를 켜도 안 남는다 — 2026-09-04 실측: `-KeepRustLog` 로 `script=info` 를 켠
+실행에서도 `[capture-card-probe]` 는 **0줄**이었다(`INFO script` 자체는 32줄 나왔다). 즉
+페이지 콘솔은 이 경로로는 못 본다. 진행 상황은 **화면 좌하단 상태 줄**과 로그의 허브 라인
+(`reused`, `consumer ... added/removed`)으로 판단한다. `script=info` 자체가 필요하면:
 
 ```powershell
 $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreamer=info,script=info"
@@ -257,13 +281,21 @@ $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreame
 `pipeline.set_state(Null)` 을 호출한다 — 그 파이프라인의 `proxysink` 가 아직 `PLAYING` 인
 `proxysrc` 와 짝지어진 채로. 이건 §6 에 적어둔 보류 항목(teardown 위험)과 정확히 같은 지점이다.
 
-**아직 가설이다.** 정황은 강하지만(차이가 그 경로 하나, paint 는 살아있고 script 만 침묵,
-에러 0건) 확정된 것이 아니다. 다음에 재현되면 **먼저 이걸 돌려서 script 쪽이 실제로 멈추는지**
-가른다 — 재빌드 없이 가능한 판별 실험이다:
+**★그 뒤 재현되지 않았다 — 그리고 그건 고쳤다는 뜻이 아니다★**
+
+`hold` 를 넣어 스트림이 3초 이상 살아 있게 만든 뒤의 실행(같은 날 `log_capturecard/02`)에서는
+**stop 유무와 무관하게 10회 전환이 모두 정상 완료**됐다. 하지만 고친 것은 **프로브의 타이밍**
+이지 엔진이 아니다. 멈춤이 관측됐을 때 스트림 수명은 **0.x초**였고 지금은 3~4초다 — 만약 저것이
+teardown 경쟁 상태였다면, 타이밍이 바뀌어 안 걸리게 된 것일 뿐 사라진 게 아니다.
+
+현실의 페이지는 영상을 몇 초씩 띄우므로 지금 통과한 형태가 실사용에 더 가깝다. 그래도 이건
+**설명되지 않은 채 남은 관측**으로 취급한다. 다시 재현되면 **먼저 이걸 돌려서 script 쪽이
+실제로 멈추는지** 가른다 — 재빌드 없이 가능한 판별 실험이다:
 
 ```powershell
 $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info,servo_media_gstreamer=info,script=info"
-.un_wall_dist.ps1 -KeepRustLog -PageFeatures -Serve -DurationSec 200 `
+.
+un_wall_dist.ps1 -KeepRustLog -PageFeatures -Serve -DurationSec 200 `
   -Url "multigpu_capture_card_probe.html?cycles=10,hold3"
 ```
 
