@@ -29,8 +29,13 @@
   and a truncated URL still loads the page -- a dropped option would look like
   a passing run):
     ?multi=N            open N streams on the first videoinput
-    ?multi=N,dev2       ...on videoinput index 2 instead
+    ?multi=N,dev2       ...on videoinput index 2 instead  <-- port selection
     ?multi=N,gap1500    ...staggering the opens by 1500ms (default 800)
+
+  ***devN is enumerateDevices() order, not the number printed on the card.***
+  The ks and mediafoundation views of this hardware enumerate in different
+  orders (measured: ks 01,03,02,04 / mf 04,01,03,02). The HUD lists every index
+  with its label, and so does the console -- read that first, then pick.
 
   WHAT TO CHECK -- in the engine log, not on this page:
     capture hub: opened <key>      exactly 1     (the port is opened once)
@@ -97,12 +102,19 @@
       cells.push({ cell, video, tag, state: "waiting", stream: null });
     }
 
+    // Filled in once enumeration returns: every index with its label, so the
+    // operator can pick one. enumerateDevices() order is NOT the number printed
+    // on the card -- the ks and mediafoundation views of this hardware enumerate
+    // differently (measured: ks 01,03,02,04 / mf 04,01,03,02).
+    let deviceList = "";
+
     function renderHud(extra) {
       const live = cells.filter(c => c.state === "live").length;
       const failed = cells.filter(c => c.state === "failed").length;
       hud.innerHTML =
         `<b>concurrent capture consumers</b>\n` +
-        `requested: ${count}   live: ${live}   failed: ${failed}\n` +
+        `requested: ${count}   live: ${live}   failed: ${failed}   dev index: ${deviceIndex}\n` +
+        (deviceList ? deviceList + "\n" : "") +
         (extra ? extra + "\n" : "") +
         cells.map((c, i) => `  #${i} ${c.state}` +
           (c.video.videoWidth ? ` ${c.video.videoWidth}x${c.video.videoHeight}` : "")).join("\n") +
@@ -126,9 +138,14 @@
         return;
       }
       clog(`videoinput devices: ${devices.length}`);
+      deviceList = devices
+        .map((d, i) => `  [${i}] ${d.label || "(no label)"}`)
+        .join("\n");
+      devices.forEach((d, i) => clog(`  [${i}] label="${d.label}" id=${d.deviceId}`));
       const device = devices[deviceIndex];
       if (!device) {
-        hud.textContent = `no videoinput at index ${deviceIndex} (have ${devices.length})`;
+        hud.textContent =
+          `no videoinput at index ${deviceIndex} (have ${devices.length})\n` + deviceList;
         return;
       }
       clog(`target device [${deviceIndex}] label="${device.label}" id=${device.deviceId}`);

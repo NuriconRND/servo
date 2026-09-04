@@ -32,12 +32,23 @@
   one. With no capture device: 0 videoinput + getUserMedia 0 tracks, but NO
   crash/abort (that alone confirms the capture plugins loaded).
 
-  Select a specific port with ?device=<N|substring>: a decimal N opens the
-  N-th (0-based) videoinput from enumerateDevices(); anything else matches
-  case-insensitively against device labels. Selection opens with
-  { video: { deviceId: { exact: id } } }; no ?device keeps the legacy
-  { video: true } first-device behavior. A selector that matches nothing
-  fails loudly (no track) instead of silently opening another port.
+  Select a specific port two ways:
+    ?cycles=10,hold3,dev2   the devN token -- use this from the launcher, where
+                            a second `&`-joined parameter would be eaten
+    ?device=<N|substring>   a separate parameter, for interactive servoshell;
+                            a decimal N is an index, anything else matches
+                            case-insensitively against device labels
+  ?device= wins when both are given. The devN token is re-emitted on every
+  transition, so the port stays selected for the whole cycle run. Selection
+  opens with { video: { deviceId: { exact: id } } }; no selector keeps the
+  legacy { video: true } first-device behavior, and a selector that matches
+  nothing fails loudly (no track) instead of silently opening another port.
+
+  ***The index is enumerateDevices() order, which is not the number printed on
+  the card.*** The ks and mediafoundation views of this hardware enumerate in
+  different orders (measured: ks 01,03,02,04 / mf 04,01,03,02), so read the
+  HUD's device list -- it prints every index with its label -- rather than
+  assuming index 2 is port 2.
 
   The .controls panel (bottom-left) reproduces a shared-connection capture
   hub scenario on demand, for the on-hardware procedure in
@@ -98,6 +109,20 @@
     let liveLines = "";
     let frames = 0, lastT = -1, fps = 0, fpsWin = 0, fpsT0 = 0;
 
+    // Query parsing lives here, above start(), because the port selector is one
+    // of the `cycles` tokens: from the launcher a second parameter is not usable
+    // (`&` is a command separator to `cmd start`, and a URL truncated there still
+    // loads the page, so the dropped selector would look like a passing run on
+    // the wrong port).
+    const params = new URLSearchParams(location.search);
+    const cycleTokens = (params.get("cycles") || "").split(",").map(t => t.trim());
+    // ?cycles=...,dev2  selects videoinput index 2. ?device=<N|substring> still
+    // works and wins when both are given, for interactive servoshell use.
+    const devToken = cycleTokens.find(t => /^dev\d+$/.test(t));
+    const deviceSelector = params.get("device") !== null
+      ? params.get("device")
+      : (devToken ? devToken.slice(3) : null);
+
     function render() {
       hud.innerHTML = "<b>capture-card probe</b>\n" + deviceLines +
         (liveLines ? "\n\n" + liveLines : "");
@@ -125,8 +150,9 @@
       } catch (e) { deviceLines = "enumerateDevices FAILED: " + e; }
       render();
 
-      // 2) pick the port: ?device=<N|substring> (default: first device)
-      const sel = new URLSearchParams(location.search).get("device");
+      // 2) pick the port: ?cycles=...,devN or ?device=<N|substring>
+      //    (default: first device)
+      const sel = deviceSelector;
       let constraints = { video: true };
       if (sel !== null) {
         const chosen = /^\d+$/.test(sel)
@@ -231,8 +257,6 @@
     // page does and what the reported crash came from. Run it once with `,stop` to
     // cover the explicit-release path separately; keeping them apart is what makes a
     // failure attributable to one path or the other.
-    const params = new URLSearchParams(location.search);
-    const cycleTokens = (params.get("cycles") || "").split(",").map(t => t.trim());
     const cycleTotal = parseInt(cycleTokens[0] || "0", 10);
     const stopEachCycle = cycleTokens.includes("stop") || params.get("stop") === "1";
     const doneToken = cycleTokens.find(t => /^d\d+$/.test(t));
@@ -273,8 +297,13 @@
       // Every token the next document needs has to be re-emitted here -- anything
       // left out silently reverts to its default on the very next transition.
       next.set("cycles",
-        [String(cycleTotal), stopEachCycle ? "stop" : null, "hold" + holdSec, "d" + done]
-          .filter(Boolean).join(","));
+        [
+          String(cycleTotal),
+          stopEachCycle ? "stop" : null,
+          devToken || null,
+          "hold" + holdSec,
+          "d" + done,
+        ].filter(Boolean).join(","));
       return location.pathname + "?" + next.toString();
     }
 

@@ -151,6 +151,12 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 - `?cycles=N` — 클릭 없이 N회 페이지 전환을 자동 수행.
 - `?cycles=N,stop` — 거기에 더해 매 전환 직전 `track.stop()` 호출.
 - `?cycles=N,hold5` — 영상이 실제로 뜬 뒤 붙잡고 있을 초(기본 3).
+- `?cycles=N,dev2` — **테스트할 포트 선택**(videoinput 인덱스, 기본 0). 전환을 넘어 유지된다.
+
+**★인덱스는 `enumerateDevices()` 순서이지 카드에 적힌 포트 번호가 아니다★** — 이 하드웨어는
+ks 와 mediafoundation 이 서로 다른 순서로 열거된다(실측: ks 01,03,02,04 / mf 04,01,03,02).
+프로브 HUD 가 인덱스와 라벨을 전부 찍으므로, **먼저 그걸 보고 고를 것.** servoshell 로
+대화형 확인할 때는 `?device=<N|라벨조각>` 도 쓸 수 있다(둘 다 주면 `?device=` 가 이긴다).
 
 **`hold` 가 왜 필요한가.** 처음엔 전환 타이머를 *페이지 로드* 시점부터 쟀는데, 이 장비에서는
 `getUserMedia` 가 그 2초를 거의 다 써버린다. 2026-09-04 실측 로그에서 `consumer N added` 와
@@ -192,6 +198,36 @@ cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webg
 - `-Layout` 은 주지 않는다 — 기본값 `wall_layout.multigpu.json`(4-GPU 월)이 맞다.
 - `RUST_LOG` 도 주지 않는다. 런처가 `servo_media_gstreamer=info` 를 포함해 무조건 설정한다.
 - 로그는 런처가 `wall_<날짜시각>.err.log` 로 남기고, 끝난 뒤 스스로 요약을 출력한다.
+
+### 3회차 — 동시 소비자 (허브의 존재 이유)
+
+**앞의 두 회차는 소비자가 항상 1명뿐이다.** 실측 로그에서 `consumers=` 는 1과 0만 왕복했다 —
+즉 "하나의 캡처를 여러 소비자에게 나눠준다"는 허브의 본래 기능은 그 절차로는 **한 번도 실행되지
+않는다.** 그건 별도 프로브가 필요하다.
+
+```powershell
+.un_wall_dist.ps1 -PageFeatures -Serve -DurationSec 120 `
+  -Url "multigpu_capture_card_multi_probe.html?multi=3"
+```
+
+같은 포트에 `getUserMedia` 를 3번 독립 호출해 셋을 동시에 띄운다. 포트를 고르려면
+`?multi=3,dev2`, 여는 간격을 바꾸려면 `?multi=3,gap1500`.
+
+판정:
+
+| 확인 | 기대값 |
+|---|---|
+| `capture hub: opened` | **1** (포트는 여전히 한 번만) |
+| `capture hub: reused` | **N−1** |
+| `consumers=` | **N 까지 올라간다** ← 앞의 두 회차에서 한 번도 안 나온 값 |
+| 화면 | N개가 **동시에** 살아 있음 (HUD `live: N`) |
+
+`opened` 가 N줄이면 요청이 허브를 타지 않은 것이다. `consumers` 가 1까지만 올랐다 내려가면
+동시에 열린 게 아니다 — 프로브가 다음 것을 열기 전에 앞의 것이 이미 해제된 경우다.
+
+> 이 경우가 중요한 이유: 허브 이전에는 같은 포트를 K개 동시에 여는 것이 K=2 에서 4/5, **K=3
+> 에서 0/5(매번 정확히 1개만 생존)** 였다. "영상을 하나씩 열 때마다 이전 것이 중단된다"는
+> 증상은 그 실측 결과의 서술 그대로다.
 
 ### 2회차 — stop 경로
 
