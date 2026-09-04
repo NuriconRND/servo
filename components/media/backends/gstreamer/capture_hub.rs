@@ -512,4 +512,144 @@ mod tests {
         init();
         assert!(open_consumer_with(HubKey::for_test("no-source"), || None).is_none());
     }
+
+    use std::time::{Duration, Instant};
+
+    /// 소비자의 appsrc 를 자기 파이프라인에서 돌리며 도착한 버퍼를 센다.
+    struct ConsumerSink {
+        pipeline: gstreamer::Pipeline,
+        received: Arc<AtomicUsize>,
+    }
+
+    impl ConsumerSink {
+        /// `playing=false` 면 PAUSED 에 머문다 = 프레임을 안 빼가는 소비자.
+        fn start(consumer: &CaptureConsumer, playing: bool) -> Self {
+            let pipeline = gstreamer::Pipeline::new();
+            let sink = gstreamer::ElementFactory::make("fakesink")
+                .property("sync", false)
+                .build()
+                .expect("fakesink");
+            let source = consumer.source_element();
+            pipeline.add_many([&source, &sink]).expect("add");
+            source.link(&sink).expect("link");
+
+            let received = Arc::new(AtomicUsize::new(0));
+            let counter = received.clone();
+            sink.static_pad("sink")
+                .expect("fakesink sink pad")
+                .add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    gstreamer::PadProbeReturn::Ok
+                });
+
+            let state = if playing {
+                gstreamer::State::Playing
+            } else {
+                gstreamer::State::Paused
+            };
+            pipeline.set_state(state).expect("consumer pipeline state");
+            Self { pipeline, received }
+        }
+
+        fn count(&self) -> usize {
+            self.received.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for ConsumerSink {
+        fn drop(&mut self) {
+            let _ = self.pipeline.set_state(gstreamer::State::Null);
+        }
+    }
+
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn every_consumer_receives_frames() {
+        init();
+        let key = HubKey::for_test("fan-out");
+        let consumers: Vec<_> = (0..3)
+            .map(|_| open_consumer_with(key.clone(), test_source).expect("consumer"))
+            .collect();
+        let sinks: Vec<_> = consumers
+            .iter()
+            .map(|consumer| ConsumerSink::start(consumer, true))
+            .collect();
+
+        wait_until("all three consumers to receive frames", || {
+            sinks.iter().all(|sink| sink.count() >= 3)
+        });
+    }
+
+    #[test]
+    fn dropping_one_consumer_leaves_the_others_running() {
+        init();
+        let key = HubKey::for_test("drop-one");
+        let keep = open_consumer_with(key.clone(), test_source).expect("keep");
+        let discard = open_consumer_with(key, test_source).expect("discard");
+        let hub = keep.hub().clone();
+        let keep_sink = ConsumerSink::start(&keep, true);
+        let discard_sink = ConsumerSink::start(&discard, true);
+
+        wait_until("both consumers to start", || {
+            keep_sink.count() >= 2 && discard_sink.count() >= 2
+        });
+
+        drop(discard_sink);
+        drop(discard);
+        assert_eq!(hub.consumer_count(), 1);
+
+        let before = keep_sink.count();
+        wait_until("the surviving consumer to keep receiving", || {
+            keep_sink.count() > before + 2
+        });
+        assert!(hub.is_playing());
+    }
+
+    #[test]
+    fn the_hub_keeps_running_with_no_consumers() {
+        init();
+        let key = HubKey::for_test("no-consumers");
+        let consumer = open_consumer_with(key.clone(), test_source).expect("consumer");
+        let hub = consumer.hub().clone();
+        drop(consumer);
+
+        assert_eq!(hub.consumer_count(), 0);
+        assert!(
+            hub.is_playing(),
+            "the device was closed when the last consumer left"
+        );
+
+        // 다시 요청해도 장치를 새로 열지 않는다.
+        let opens = Arc::new(AtomicUsize::new(0));
+        let rejoined = open_consumer_with(key, counting_source(&opens)).expect("rejoined");
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(rejoined.hub().consumer_count(), 1);
+    }
+
+    #[test]
+    fn a_stalled_consumer_does_not_stall_the_others() {
+        init();
+        let key = HubKey::for_test("stalled");
+        let healthy = open_consumer_with(key.clone(), test_source).expect("healthy");
+        let stalled = open_consumer_with(key, test_source).expect("stalled");
+        let hub = healthy.hub().clone();
+        let healthy_sink = ConsumerSink::start(&healthy, true);
+        // PAUSED 라 프레임을 빼가지 않는다. appsrc 가 leaky 라 밀린 것을 버린다.
+        let _stalled_sink = ConsumerSink::start(&stalled, false);
+
+        wait_until("the healthy consumer to keep receiving", || {
+            healthy_sink.count() >= 10
+        });
+        assert_eq!(hub.consumer_count(), 2, "the stalled consumer was evicted");
+    }
 }
