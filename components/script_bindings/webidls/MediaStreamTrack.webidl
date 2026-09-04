@@ -16,7 +16,7 @@ interface MediaStreamTrack : EventTarget {
     // readonly        attribute MediaStreamTrackState readyState;
     //                 attribute EventHandler onended;
     MediaStreamTrack clone();
-    // void stop();
+    undefined stop();
     // MediaTrackCapabilities getCapabilities();
     // MediaTrackConstraints getConstraints();
     // MediaTrackSettings getSettings();
