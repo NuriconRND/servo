@@ -15,6 +15,7 @@ use servo_media_streams::registry::{
 use servo_media_streams::{MediaOutput, MediaSocket, MediaStream, MediaStreamType};
 
 use super::BACKEND_BASE_TIME;
+use crate::capture_hub::CaptureConsumer;
 
 pub static RTP_CAPS_OPUS: LazyLock<gstreamer::Caps> = LazyLock::new(|| {
     gstreamer::Caps::builder("application/x-rtp")
@@ -68,6 +69,16 @@ pub struct GStreamerMediaStream {
     type_: MediaStreamType,
     elements: Vec<gstreamer::Element>,
     pipeline: Option<gstreamer::Pipeline>,
+    /// 공유 캡처 허브에서의 등록. 캡처 장치가 먹이는 스트림에만 있다.
+    /// 이걸 떨어뜨리면 이 스트림의 appsrc 만 허브 명단에서 빠진다 —
+    /// 장치는 계속 열려 있다.
+    capture_consumer: Option<CaptureConsumer>,
+    /// `pipeline` 이 이 스트림 자신이 `pipeline_or_new` 에서 만들어 소유하는지(true),
+    /// 아니면 `attach_to_pipeline` 으로 넘겨받은 남의 파이프라인의 복제본인지(false)를
+    /// 구분한다. WebRTC 의 공유 파이프라인(webrtc.rs)이 대표적인 후자다 — 여러 트랙이
+    /// 같은 파이프라인을 공유하므로, 그 경우 `Drop` 에서 이 플래그가 false 이면 하나의
+    /// 트랙이 다른 트랙을 딸려 보내는 파이프라인을 NULL 로 끌고 가는 사고를 막는다.
+    owns_pipeline: bool,
 }
 
 impl MediaStream for GStreamerMediaStream {
@@ -95,6 +106,8 @@ impl GStreamerMediaStream {
             type_,
             elements,
             pipeline: None,
+            capture_consumer: None,
+            owns_pipeline: false,
         }
     }
 
@@ -133,6 +146,9 @@ impl GStreamerMediaStream {
             element.sync_state_with_parent().unwrap();
         }
         self.pipeline = Some(pipeline.clone());
+        // 남의 파이프라인을 넘겨받은 것이므로 이 스트림이 소유하지 않는다 —
+        // Drop 에서 NULL 로 끌고 가면 안 된다.
+        self.owns_pipeline = false;
     }
 
     pub fn pipeline_or_new(&mut self) -> gstreamer::Pipeline {
@@ -146,6 +162,9 @@ impl GStreamerMediaStream {
                 pipeline.set_base_time(*BACKEND_BASE_TIME);
                 pipeline.use_clock(Some(&clock));
                 self.attach_to_pipeline(&pipeline);
+                // 방금 이 스트림을 위해 새로 만든 파이프라인이므로 이 스트림이 소유한다 —
+                // Drop 에서 다른 소유자 없이 NULL 로 끌고 가도 안전하다.
+                self.owns_pipeline = true;
                 pipeline
             },
         }
@@ -250,6 +269,15 @@ impl GStreamerMediaStream {
     }
 
     pub fn create_video_from(source: gstreamer::Element) -> MediaStreamId {
+        Self::create_video_from_with(source, None)
+    }
+
+    /// `create_video_from` 과 같되, 스트림이 살아있는 동안 붙잡고 있어야 하는
+    /// 캡처 허브 등록을 함께 소유한다.
+    pub fn create_video_from_with(
+        source: gstreamer::Element,
+        capture_consumer: Option<CaptureConsumer>,
+    ) -> MediaStreamId {
         let videoconvert = gstreamer::ElementFactory::make("videoconvert")
             .build()
             .unwrap();
@@ -269,10 +297,12 @@ impl GStreamerMediaStream {
             .unwrap();
         let queue = gstreamer::ElementFactory::make("queue").build().unwrap();
 
-        register_stream(Arc::new(Mutex::new(GStreamerMediaStream::new(
+        let mut stream = GStreamerMediaStream::new(
             MediaStreamType::Video,
             vec![source, videoconvert, i420_filter, queue],
-        ))))
+        );
+        stream.capture_consumer = capture_consumer;
+        register_stream(Arc::new(Mutex::new(stream)))
     }
 
     pub fn create_audio() -> MediaStreamId {
@@ -320,6 +350,19 @@ impl GStreamerMediaStream {
 
 impl Drop for GStreamerMediaStream {
     fn drop(&mut self) {
+        // 허브 등록을 먼저 놓는다 — 곧 NULL 로 갈 파이프라인에 프레임이
+        // 더 들어오지 않게.
+        self.capture_consumer = None;
+        if let Some(pipeline) = self.pipeline.take() {
+            // 이 파이프라인을 이 스트림이 만들었을 때만 NULL 로 끌고 간다. 남의
+            // 파이프라인(예: webrtc.rs 의 공유 파이프라인)이면 그냥 복제본을
+            // 떨어뜨릴 뿐 — 그 파이프라인에 딸린 다른 트랙까지 죽이면 안 된다.
+            if self.owns_pipeline {
+                if let Err(error) = pipeline.set_state(gstreamer::State::Null) {
+                    log::warn!("could not stop a media stream pipeline: {error}");
+                }
+            }
+        }
         if let Some(ref id) = self.id {
             unregister_stream(id);
         }
@@ -371,5 +414,90 @@ impl GstreamerMediaSocket {
 impl MediaSocket for GstreamerMediaSocket {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture_hub::{HubKey, open_consumer_with};
+
+    fn test_source() -> Option<gstreamer::Element> {
+        gstreamer::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .ok()
+    }
+
+    /// 페이지 전환의 축소판: 스트림을 레지스트리에서 빼면 소비자가 허브에서
+    /// 빠져야 하고, 장치는 계속 열려 있어야 한다.
+    #[test]
+    fn releasing_the_stream_releases_the_hub_consumer() {
+        gstreamer::init().expect("gstreamer::init failed");
+        let consumer =
+            open_consumer_with(HubKey::for_test("stream-release"), test_source).expect("consumer");
+        let hub = consumer.hub().clone();
+        let source = consumer.source_element();
+
+        let id = GStreamerMediaStream::create_video_from_with(source, Some(consumer));
+        assert_eq!(hub.consumer_count(), 1);
+
+        unregister_stream(&id);
+
+        assert_eq!(
+            hub.consumer_count(),
+            0,
+            "the stream did not release its hub consumer"
+        );
+        assert!(hub.is_playing(), "releasing a stream closed the device");
+    }
+
+    /// 허브를 안 쓰는 스트림(모의 소스, getDisplayMedia 등)은 그대로 동작한다.
+    #[test]
+    fn a_stream_without_a_capture_consumer_still_registers_and_releases() {
+        gstreamer::init().expect("gstreamer::init failed");
+        let id = GStreamerMediaStream::create_video_from(test_source().expect("source"));
+        assert!(get_stream(&id).is_some());
+        unregister_stream(&id);
+        assert!(get_stream(&id).is_none());
+    }
+
+    /// WebRTC 처럼 여러 트랙이 파이프라인 하나를 공유하는 경우를 축소한 것:
+    /// `attach_to_pipeline` 으로 남의 파이프라인에 붙은 스트림은 자신이
+    /// 그 파이프라인을 만들지 않았으므로, 드롭돼도 그 파이프라인을
+    /// NULL 로 끌고 가면 안 된다 — 같이 붙어 있는 다른 트랙까지 죽는다.
+    #[test]
+    fn dropping_a_stream_on_a_shared_pipeline_leaves_it_running() {
+        gstreamer::init().expect("gstreamer::init failed");
+        let pipeline = gstreamer::Pipeline::with_name(
+            "media_stream tests: dropping_a_stream_on_a_shared_pipeline_leaves_it_running",
+        );
+        let id = GStreamerMediaStream::create_video_from(test_source().expect("source"));
+        {
+            let stream = get_stream(&id).expect("stream");
+            let mut stream = stream.lock().unwrap();
+            let stream = stream
+                .as_mut_any()
+                .downcast_mut::<GStreamerMediaStream>()
+                .expect("GStreamerMediaStream");
+            stream.attach_to_pipeline(&pipeline);
+        }
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("shared pipeline should accept PLAYING");
+        pipeline
+            .state(gstreamer::ClockTime::from_seconds(5))
+            .0
+            .expect("shared pipeline should reach PLAYING");
+
+        unregister_stream(&id);
+
+        assert_eq!(
+            pipeline.current_state(),
+            gstreamer::State::Playing,
+            "dropping a stream that does not own its pipeline tore that pipeline down"
+        );
+
+        let _ = pipeline.set_state(gstreamer::State::Null);
     }
 }

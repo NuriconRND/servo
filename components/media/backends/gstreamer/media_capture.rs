@@ -9,6 +9,7 @@ use servo_media_streams::MediaStreamType;
 use servo_media_streams::capture::*;
 use servo_media_streams::registry::MediaStreamId;
 
+use crate::capture_hub::open_video_consumer;
 use crate::device_id::{device_api, device_path, normalized_port_key};
 use crate::media_stream::GStreamerMediaStream;
 
@@ -118,11 +119,13 @@ impl GstMediaDevices {
         }
     }
 
-    pub fn get_track(
+    /// 제약을 만족하는 `GstDevice` 를 고른다. element 는 만들지 않는다 —
+    /// 비디오 입력은 캡처 허브가 대신 열기 때문이다.
+    pub fn get_device(
         &self,
         video: bool,
         mut constraints: MediaTrackConstraintSet,
-    ) -> Option<GstMediaTrack> {
+    ) -> Option<gstreamer::Device> {
         let device_id = constraints.device_id.take();
         let (format, filter) = if video {
             ("video/x-raw", "Video/Source")
@@ -135,14 +138,22 @@ impl GstMediaDevices {
         if let Some(f) = f {
             let _ = self.monitor.remove_filter(f);
         }
-        let device = match &device_id {
+        match &device_id {
             Some(requested) => {
                 let (ConstrainString::Exact(requested_id) | ConstrainString::Ideal(requested_id)) =
                     requested;
-                select_device_by_id(devices.iter(), requested_id)?
+                select_device_by_id(devices.iter(), requested_id)
             },
-            None => devices.front()?.clone(),
-        };
+            None => devices.front().cloned(),
+        }
+    }
+
+    pub fn get_track(
+        &self,
+        video: bool,
+        constraints: MediaTrackConstraintSet,
+    ) -> Option<GstMediaTrack> {
+        let device = self.get_device(video, constraints)?;
         let element = device.create_element(None).ok()?;
         Some(GstMediaTrack { element })
     }
@@ -229,15 +240,23 @@ fn create_input_stream(
     constraint_set: MediaTrackConstraintSet,
 ) -> Option<MediaStreamId> {
     let devices = GstMediaDevices::new();
-    devices
-        .get_track(stream_type == MediaStreamType::Video, constraint_set)
-        .map(|track| {
-            let f = match stream_type {
-                MediaStreamType::Audio => GStreamerMediaStream::create_audio_from,
-                MediaStreamType::Video => GStreamerMediaStream::create_video_from,
-            };
-            f(track.element)
-        })
+    match stream_type {
+        // 비디오 입력만 허브를 거친다. 같은 포트를 두 번 여는 것이 불안정한
+        // 것은 캡처카드 쪽 제약이고, 오디오 입력에는 그 제약이 없다.
+        MediaStreamType::Video => {
+            let device = devices.get_device(true, constraint_set)?;
+            let consumer = open_video_consumer(&device)?;
+            let source = consumer.source_element();
+            Some(GStreamerMediaStream::create_video_from_with(
+                source,
+                Some(consumer),
+            ))
+        },
+        MediaStreamType::Audio => {
+            let track = devices.get_track(false, constraint_set)?;
+            Some(GStreamerMediaStream::create_audio_from(track.element))
+        },
+    }
 }
 
 pub fn create_audioinput_stream(constraint_set: MediaTrackConstraintSet) -> Option<MediaStreamId> {
