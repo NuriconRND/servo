@@ -206,7 +206,8 @@ ks 와 mediafoundation 이 서로 다른 순서로 열거된다(실측: ks 01,03
 않는다.** 그건 별도 프로브가 필요하다.
 
 ```powershell
-.un_wall_dist.ps1 -PageFeatures -Serve -DurationSec 120 `
+.
+un_wall_dist.ps1 -PageFeatures -Serve -DurationSec 120 `
   -Url "multigpu_capture_card_multi_probe.html?multi=3"
 ```
 
@@ -228,6 +229,37 @@ ks 와 mediafoundation 이 서로 다른 순서로 열거된다(실측: ks 01,03
 > 이 경우가 중요한 이유: 허브 이전에는 같은 포트를 K개 동시에 여는 것이 K=2 에서 4/5, **K=3
 > 에서 0/5(매번 정확히 1개만 생존)** 였다. "영상을 하나씩 열 때마다 이전 것이 중단된다"는
 > 증상은 그 실측 결과의 서술 그대로다.
+
+### 동시 소비자 결과 (2026-09-04) — 통과
+
+`?multi=3` 로 같은 포트에 `getUserMedia` 를 3번 독립 호출한 실행:
+
+```
+capture hub: opened   1
+capture hub: reused   2
+consumers=1 -> consumers=2 -> consumers=3
+removed 0   panicked 0
+```
+
+**`consumers=3`.** 물리 포트는 한 번만 열렸고 세 소비자가 동시에 살아 있었다. 앞의 순차 절차가
+끝내 보여주지 못한 값이고, **허브의 존재 이유가 실기로 증명된 지점**이다.
+
+### ★같은 캡처를 여러 곳에 띄우려면 `getUserMedia` 를 그 수만큼 불러야 한다★
+
+허브는 **포트를 여러 번 여는 것**을 안전하게 만든다. 하나의 `MediaStream` 을 여러 곳에
+꽂을 수 있게 만들어주지는 않는다. 두 가지 흔한 오해가 있고, 둘 다 실측으로 갈렸다.
+
+1. **`MediaStream` 하나를 두 `<video>` 에 대입** — 이 엔진에서는 **두 번째가 안 붙는다.**
+   `set_stream` 이 스트림 tail 인 `queue`(정적 src pad 1개)에 `proxysink` 를 링크하기 때문이다.
+   측정 결과 두 번째 attach 만 실패하고 **첫 번째는 계속 재생된다**(회귀 테스트로 고정해 둠:
+   `one_stream_feeds_one_sink_and_a_second_attach_does_not_disturb_it`).
+2. **`<video>` 엘리먼트 하나를 여러 컨테이너에 붙이기** — DOM 노드는 한 곳에만 존재한다.
+   새 컨테이너에 붙이는 순간 이전 컨테이너에서 **빠져나가므로 이전 영역이 검게 된다.**
+   2026-09-04 실기에서 실제로 관측된 것이 이 경우였다. 엔진 로그는 `consumers=1`, `removed 0`,
+   `panicked 0` — **스트림은 멀쩡했고 엘리먼트가 이동했을 뿐이다.**
+
+즉 N곳에 띄우려면 **`getUserMedia` 를 N번 부르고 `<video>` 도 N개** 만들어야 한다. 허브 이전에는
+그게 바로 카드를 무너뜨리던 행동(K=3 → 0/5)이라 회피할 수밖에 없었지만, 이제는 그게 정답이다.
 
 ### 2회차 — stop 경로
 

@@ -54,21 +54,41 @@
   <style>
     html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
                  font: 13px/1.45 monospace; color: #0f0; }
-    #grid { position: fixed; inset: 0; display: grid; gap: 2px; }
-    .cell { position: relative; background: #060; overflow: hidden; }
-    .cell video { width: 100%; height: 100%; object-fit: contain; background: #000; }
-    .tag { position: absolute; left: 4px; top: 4px; background: rgba(0,0,0,.7);
-           border: 1px solid #0f0; padding: 2px 6px; white-space: pre; }
-    .cell.live  { background: #000; }
-    .cell.fail  { background: #300; }
+    /* Both axes must be explicit 1fr tracks. With only grid-template-columns set,
+       the rows size to content -- and a <video> with height:100% inside an
+       auto-height row resolves to its intrinsic 1080px, so the first cell ate the
+       whole viewport and the others were pushed off screen. min-height/min-width 0
+       is what lets a grid item shrink below its content size at all. */
+    #grid { position: fixed; inset: 0; display: grid; gap: 4px; }
+    .cell { position: relative; min-width: 0; min-height: 0; overflow: hidden;
+            background: #000; border: 3px solid #444; box-sizing: border-box; }
+    .cell video { display: block; width: 100%; height: 100%; object-fit: contain;
+                  background: #000; }
+    .tag { position: absolute; left: 0; top: 0; background: rgba(0,0,0,.78);
+           border-right: 2px solid #444; border-bottom: 2px solid #444;
+           padding: 6px 14px; white-space: pre; font-size: 26px; line-height: 1.3; }
+    /* State is carried by the border, so it reads from across a wall even when the
+       picture itself is dark. */
+    .cell.live { border-color: #0f0; }
+    .cell.live .tag { border-color: #0f0; color: #0f0; }
+    .cell.stalled { border-color: #fc0; }
+    .cell.stalled .tag { border-color: #fc0; color: #fc0; }
+    .cell.fail { border-color: #f33; background: #200; }
+    .cell.fail .tag { border-color: #f33; color: #f33; }
     #hud { position: fixed; left: 12px; bottom: 12px; z-index: 10; max-width: 70vw;
-           background: rgba(0,0,0,.72); border: 1px solid #0f0; padding: 10px 12px;
-           white-space: pre-wrap; }
+           background: rgba(0,0,0,.82); border: 2px solid #0f0; padding: 12px 16px;
+           white-space: pre-wrap; font-size: 20px; }
     #hud b { color: #6f6; }
+    #verdict { position: fixed; right: 12px; top: 12px; z-index: 11;
+               background: rgba(0,0,0,.85); border: 3px solid #444; padding: 10px 20px;
+               font-size: 44px; font-weight: bold; }
+    #verdict.ok  { border-color: #0f0; color: #0f0; }
+    #verdict.bad { border-color: #f33; color: #f33; }
   </style>
 </head>
 <body>
   <div id="grid"></div>
+  <div id="verdict">…</div>
   <div id="hud">starting…</div>
   <script>
     const hud = document.getElementById("hud");
@@ -88,7 +108,10 @@
     const gapMs = gapToken ? parseInt(gapToken.slice(3), 10) : 800;
 
     const cells = [];
-    grid.style.gridTemplateColumns = `repeat(${Math.ceil(Math.sqrt(count))}, 1fr)`;
+    const cols = Math.ceil(Math.sqrt(count));
+    const rows = Math.ceil(count / cols);
+    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
     for (let i = 0; i < count; i++) {
       const cell = document.createElement("div");
       cell.className = "cell";
@@ -108,9 +131,15 @@
     // differently (measured: ks 01,03,02,04 / mf 04,01,03,02).
     let deviceList = "";
 
+    const verdict = document.getElementById("verdict");
+
     function renderHud(extra) {
       const live = cells.filter(c => c.state === "live").length;
       const failed = cells.filter(c => c.state === "failed").length;
+      // One number, readable from the far end of the wall: how many of the N
+      // requested consumers are actually playing right now.
+      verdict.textContent = `${live} / ${count} live`;
+      verdict.className = live === count ? "ok" : "bad";
       hud.innerHTML =
         `<b>concurrent capture consumers</b>\n` +
         `requested: ${count}   live: ${live}   failed: ${failed}   dev index: ${deviceIndex}\n` +
@@ -187,9 +216,10 @@
           const advancing = t !== lastT[i] && c.video.videoWidth > 0;
           lastT[i] = t;
           c.state = advancing ? "live" : (c.video.videoWidth > 0 ? "STALLED" : "opened");
-          c.cell.classList.toggle("live", advancing);
+          c.cell.classList.toggle("live", c.state === "live");
+          c.cell.classList.toggle("stalled", c.state === "STALLED");
           c.tag.textContent =
-            `#${i} ${c.state} ${c.video.videoWidth}x${c.video.videoHeight} t=${t.toFixed(1)}`;
+            `#${i} ${c.state}\n${c.video.videoWidth}x${c.video.videoHeight} t=${t.toFixed(1)}`;
         });
         renderHud(`device: "${device.label}"`);
         clog("live=" + cells.filter(c => c.state === "live").length + "/" + count);
