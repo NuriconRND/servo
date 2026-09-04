@@ -61,7 +61,8 @@
 | 로그 | 의미 |
 |---|---|
 | `capture hub: opened <key>` | 그 포트를 실제로 새로 열었다. **정상적인 전환 반복에서는 포트당 정확히 한 줄이어야 한다.** |
-| `capture hub: reused <key>` | 이미 열려 있는 허브에 새 소비자가 합류했다(장치는 다시 안 열림) — 페이지 전환마다 나와야 하는 정상 로그. |
+| `capture hub: reused <key>` | 이미 열려 있는 허브에 새 소비자가 합류했다(장치는 다시 안 열림). 장치 조회는 거쳤다. |
+| `capture hub: rejoined <key> for deviceId ... without enumerating` | 같은 뜻이되 **장치 조회까지 건너뛰고** 합류했다(§4의 해석 캐시). deviceId 를 지정한 요청에서 나온다. |
 | `capture hub: <key> consumer <id> added (consumers=N)` | 소비자가 늘었다. `N` 은 그 포트에 현재 붙어 있는 소비자 수. |
 | `capture hub: <key> consumer <id> removed (consumers=N)` | 소비자가 빠졌다(트랙 stop 또는 페이지 전환). |
 | `capture hub: <key> is unhealthy; reopening` | 허브가 죽어서(장치 뽑힘 등) 재개방으로 넘어간다. |
@@ -219,7 +220,7 @@ un_wall_dist.ps1 -PageFeatures -Serve -DurationSec 120 `
 | 확인 | 기대값 |
 |---|---|
 | `capture hub: opened` | **1** (포트는 여전히 한 번만) |
-| `capture hub: reused` | **N−1** |
+| `reused` + `rejoined` 합계 | **N−1** (어느 쪽으로 붙든 상관없다) |
 | `consumers=` | **N 까지 올라간다** ← 앞의 두 회차에서 한 번도 안 나온 값 |
 | 화면 | N개가 **동시에** 살아 있음 (HUD `live: N`) |
 
@@ -269,8 +270,22 @@ removed 0   panicked 0
 capture hub: rejoined <key> for deviceId "..." without enumerating
 ```
 
-기대 효과: 타일 3개 기준 기동이 약 12초 빨라진다(2·3번째가 각각 ~6.2초 → 거의 0).
-`?multi=3` 을 다시 돌려 **소비자 추가 간격이 7초에서 1초 미만으로** 줄었는지 보면 확인된다.
+**실측(2026-09-04, `log_capturecard/05`):**
+
+```
+opened : 1     rejoined : 2     panicked : 0
+11:10:05  consumer 1 added (consumers=1)
+11:10:06  consumer 2 added (consumers=2)
+11:10:06  consumer 3 added (consumers=3)
+```
+
+셋이 붙는 데 **총 1초**(이전 14초). 시각적으로도 2·3번째 재생 시작이 빨라진 것이 확인됐다.
+첫 타일은 여전히 6초대이고 그건 실제로 장치를 찾아 여는 비용이라 줄일 성질이 아니다.
+
+> ★이 변경이 판정 기준을 한 번 깨뜨렸다★ — 두 번째 이후가 `reused` 가 아니라 `rejoined` 로
+> 찍히면서, `reused` 개수를 세던 기존 기준으로는 **정상 실행이 `reused: 0` 이라 무효처럼
+> 읽혔다.** 그래서 판정을 `added (consumers` 개수로 옮겼다(§로그 판정). 로그 문자열을 세는
+> 기준은 그 문자열을 바꾸는 순간 같이 갱신해야 한다.
 
 > 부수효과 하나: 지름길은 caps 제약 재검사도 건너뛴다. 이는 기존 동작과 일치한다 — 허브의
 > caps 는 그 포트를 처음 연 호출이 고정하므로, 다른 제약으로 뒤늦게 합류한 호출은 원래도
@@ -319,12 +334,12 @@ capture hub: rejoined <key> for deviceId "..." without enumerating
 ```powershell
 $log = Get-ChildItem wall_*.err.log | Sort-Object LastWriteTime | Select-Object -Last 1
 (Select-String -Path $log -Pattern "capture hub: opened" -SimpleMatch | Measure-Object).Count  # 포트당 1
-(Select-String -Path $log -Pattern "capture hub: reused" -SimpleMatch | Measure-Object).Count  # ★전환 횟수-1★
+(Select-String -Path $log -Pattern "added (consumers"    -SimpleMatch | Measure-Object).Count  # ★= 요청 횟수★
 (Select-String -Path $log -Pattern "panicked"            -SimpleMatch | Measure-Object).Count  # 0
 Select-String -Path $log -Pattern "consumers=" -SimpleMatch | Select-Object -Last 6            # 끝부분 확인
 ```
 
-**★`reused` 가 이 절차의 결정적 신호다 — 처음 쓴 판정 기준엔 이게 빠져 있었다★**
+**★"소비자가 몇 번 생겼는가"가 결정적 신호다 — 처음 쓴 판정 기준엔 그게 빠져 있었다★**
 
 2026-09-04 첫 실기에서 `opened=1`, `panicked=0` 이 나와 당시 기준으로는 통과처럼 보였다.
 그런데 같은 로그의 `reused` 는 **0** 이었고 `consumer 1 added (consumers=1)` 이 딱 한 줄뿐이었다
@@ -332,26 +347,32 @@ Select-String -Path $log -Pattern "consumers=" -SimpleMatch | Select-Object -Las
 검증하지 않은 실행이 통과로 읽혔다.
 
 이유는 단순하다. `opened` 는 **"포트를 두 번 열지 않았다"** 만 말한다. 전환이 아예 없었어도
-그 조건은 만족된다. **"전환이 실제로 일어났다"를 말하는 건 `reused` 뿐이다.** 따라서
-`reused == 0` 이면 나머지가 아무리 깨끗해도 **판정 불가(무효 실행)** 로 다룬다.
+그 조건은 만족된다. **"요청이 실제로 여러 번 일어났다"를 말하는 건 `added (consumers` 의
+개수다.** 따라서 그 값이 1이면 나머지가 아무리 깨끗해도 **판정 불가(무효 실행)** 로 다룬다.
+
+> `reused` 하나만 세면 안 되는 이유: 2026-09-04 에 deviceId 해석 캐시가 들어가면서, 두 번째
+> 이후 요청은 `reused` 가 아니라 **`rejoined`** 로 찍힌다. 그때 `reused` 만 보던 기준으로는
+> **정상 실행이 `reused: 0` 이라 무효처럼 읽힌다** — 실제로 그 커밋 직후 실행이 그랬다.
+> 두 경로 어느 쪽으로 붙든 `added (consumers` 는 항상 올라가므로 그쪽을 센다.
 
 통과 조건은 네 가지다.
 
 1. **`opened` 가 사용한 포트 수만큼만.** 20회 전환에도 포트당 1줄. 2줄 이상이면 바로 앞에
    `is unhealthy; reopening` 이 있어야 정당한 재개방이고, 없으면 실패다.
-2. **`reused` 가 대략 (전환 횟수 − 1) 만큼.** 0이면 무효 실행 — 아래 "0회로 끝났을 때"로 간다.
+2. **`added (consumers` 가 요청 횟수만큼.** 1뿐이면 무효 실행 — 아래 "0회로 끝났을 때"로 간다.
+   (그중 몇 개가 `reused` 이고 몇 개가 `rejoined` 인지는 진단용 세부지 판정 기준이 아니다.)
 3. **`consumers=` 의 added 와 removed 가 균형**을 이루고 끝에서 1(창이 살아있을 때) 또는
    0(종료 후)으로 돌아온다. 단조 증가하면 소비자가 누적되는 것이다.
 4. **`panicked` / `not-negotiated` 0건.**
 
-### 전환이 0회로 끝났을 때 (reused=0)
+### 전환이 0회로 끝났을 때 (added 가 1뿐)
 
 허브를 의심하기 전에 이 순서로 본다.
 
 - **`capture hub: opened` 도 0줄인가?** 그러면 페이지가 `getUserMedia` 에 도달조차 못 한 것이다
   — `-PageFeatures` 누락이거나 장치 선택 실패(`?device=` 가 아무것도 못 찾음, 또는
   `videoinput` 0개)다.
-- **`opened=1` 인데 `reused=0` 인가?** 스트림은 열렸는데 페이지가 전환을 안 한 것이다. URL 에
+- **`opened=1` 인데 `added` 도 1뿐인가?** 스트림은 열렸는데 페이지가 전환을 안 한 것이다. URL 에
   `?cycles=N` 이 실제로 들어갔는지 확인한다. 런처가 `cmd start` 를 거치므로 URL 에 `&` 가
   있으면 거기서 잘릴 수 있다 — 그래서 이 페이지는 `?cycles=20,stop` 처럼 `&` 없는 문법을 쓴다.
 - 화면 좌하단 상태 줄(`cycle X/N`)이 갱신되는지 본다. 페이지 자신의 `console.log` 는 런처
