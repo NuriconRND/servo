@@ -225,10 +225,23 @@ impl DeviceHub {
         }
         // 라이브 소스는 NoPreroll 로 즉시 돌아온다. 장치가 사용 중이면 여기서
         // 실패하므로, 죽은 허브를 슬롯에 넣지 않고 바로 None 을 돌려준다.
-        if pipeline.state(START_TIMEOUT).0.is_err() {
-            log::warn!("capture hub: {} did not reach PLAYING", key.0);
-            let _ = pipeline.set_state(gstreamer::State::Null);
-            return None;
+        // `Ok(Async)` 도 실패로 친다 — 그건 START_TIMEOUT 이 다 되도록 전이가
+        // 아직 끝나지 않았다는 뜻이라 `is_err()` 만으로는 걸러지지 않는다.
+        // 걸러지지 않으면 "에러 없이 영원히 멈춘" 장치가 건강한 허브로
+        // SLOTS 에 저장되고, 버스에는 Error/Eos 가 결코 오지 않아 프로세스가
+        // 끝날 때까지 모든 후속 getUserMedia 가 죽은 허브에 합류한다.
+        match pipeline.state(START_TIMEOUT).0 {
+            Ok(
+                gstreamer::StateChangeSuccess::Success | gstreamer::StateChangeSuccess::NoPreroll,
+            ) => {},
+            other => {
+                log::warn!(
+                    "capture hub: {} did not reach PLAYING within {START_TIMEOUT} ({other:?})",
+                    key.0
+                );
+                let _ = pipeline.set_state(gstreamer::State::Null);
+                return None;
+            },
         }
 
         log::info!("capture hub: opened {}", key.0);
@@ -263,14 +276,22 @@ impl DeviceHub {
         // 목록에 없는 이 소비자를 건너뛴다. "바뀔 때만 갱신" 가드 때문에 그
         // 뒤로는 다시 안 열려서, 이 소비자는 캡스를 영영 못 받는다. 잠금 순서는
         // `distribute` 와 동일하게 caps -> consumers 로 유지한다.
-        let caps_guard = self.shared.caps.lock().unwrap();
+        let caps_guard = self
+            .shared
+            .caps
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if let Some(caps) = caps_guard.as_ref() {
             appsrc.set_caps(Some(caps));
         }
 
         let id = NEXT_CONSUMER_ID.fetch_add(1, Ordering::Relaxed);
         let count = {
-            let mut consumers = self.shared.consumers.lock().unwrap();
+            let mut consumers = self
+                .shared
+                .consumers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             consumers.push(Consumer {
                 id,
                 appsrc: appsrc.clone(),
@@ -291,7 +312,11 @@ impl DeviceHub {
 
     fn remove_consumer(&self, id: u64) {
         let count = {
-            let mut consumers = self.shared.consumers.lock().unwrap();
+            let mut consumers = self
+                .shared
+                .consumers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             consumers.retain(|consumer| consumer.id != id);
             consumers.len()
         };
@@ -307,7 +332,11 @@ impl DeviceHub {
 
     #[cfg(test)]
     pub(crate) fn consumer_count(&self) -> usize {
-        self.shared.consumers.lock().unwrap().len()
+        self.shared
+            .consumers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
     }
 
     #[cfg(test)]
@@ -345,10 +374,18 @@ fn distribute(
 
     if let Some(caps) = sample.caps() {
         let caps = caps.to_owned();
-        let mut cached = shared.caps.lock().unwrap();
+        let mut cached = shared
+            .caps
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if cached.as_ref() != Some(&caps) {
             *cached = Some(caps.clone());
-            for consumer in shared.consumers.lock().unwrap().iter() {
+            for consumer in shared
+                .consumers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+            {
                 consumer.appsrc.set_caps(Some(&caps));
             }
         }
@@ -358,7 +395,10 @@ fn distribute(
         return Ok(gstreamer::FlowSuccess::Ok);
     };
 
-    let mut consumers = shared.consumers.lock().unwrap();
+    let mut consumers = shared
+        .consumers
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     consumers.retain(|consumer| {
         // shallow copy — 메모리는 공유하고 헤더만 새로 만든다. 픽셀 복사 없음.
         let mut copy = buffer.copy();
