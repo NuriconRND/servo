@@ -54,13 +54,15 @@
   <style>
     html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
                  font: 13px/1.45 monospace; color: #0f0; }
-    /* Both axes must be explicit 1fr tracks. With only grid-template-columns set,
-       the rows size to content -- and a <video> with height:100% inside an
-       auto-height row resolves to its intrinsic 1080px, so the first cell ate the
-       whole viewport and the others were pushed off screen. min-height/min-width 0
-       is what lets a grid item shrink below its content size at all. */
-    #grid { position: fixed; inset: 0; display: grid; gap: 4px; }
-    .cell { position: relative; min-width: 0; min-height: 0; overflow: hidden;
+    /* ***No CSS Grid, and no flexbox either.*** Servo ships with
+       `layout_grid_enabled: false` (components/config/prefs.rs), so `display: grid`
+       falls back to `display: block`: every cell became a full-width block and the
+       first video ate the entire wall while the rest sat below the fold. Tiles are
+       positioned absolutely from percentages computed in JS instead, which depends
+       on nothing but the box model. (`-Pref layout_grid_enabled=true` would also
+       work, but a probe should not need a pref to lay itself out.) */
+    #grid { position: fixed; inset: 0; }
+    .cell { position: absolute; overflow: hidden;
             background: #000; border: 3px solid #444; box-sizing: border-box; }
     .cell video { display: block; width: 100%; height: 100%; object-fit: contain;
                   background: #000; }
@@ -110,11 +112,16 @@
     const cells = [];
     const cols = Math.ceil(Math.sqrt(count));
     const rows = Math.ceil(count / cols);
-    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-    grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
     for (let i = 0; i < count; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
       const cell = document.createElement("div");
       cell.className = "cell";
+      // Absolute percentages: see the CSS note on why this is not a grid.
+      cell.style.left = `${(col * 100) / cols}%`;
+      cell.style.top = `${(row * 100) / rows}%`;
+      cell.style.width = `${100 / cols}%`;
+      cell.style.height = `${100 / rows}%`;
       const video = document.createElement("video");
       video.autoplay = true; video.playsInline = true; video.muted = true;
       const tag = document.createElement("div");
