@@ -193,14 +193,26 @@ impl DeviceHub {
             let bus_healthy = healthy.clone();
             let bus_key = key.clone();
             bus.set_sync_handler(move |_, message| {
-                if let gstreamer::MessageView::Error(error) = message.view() {
-                    log::warn!(
-                        "capture hub: {} failed: {} ({:?})",
-                        bus_key.0,
-                        error.error(),
-                        error.debug()
-                    );
-                    bus_healthy.store(false, Ordering::Relaxed);
+                match message.view() {
+                    gstreamer::MessageView::Error(error) => {
+                        log::warn!(
+                            "capture hub: {} failed: {} ({:?})",
+                            bus_key.0,
+                            error.error(),
+                            error.debug()
+                        );
+                        bus_healthy.store(false, Ordering::Relaxed);
+                    },
+                    gstreamer::MessageView::Eos(_) => {
+                        // 살아있는 캡처 소스는 정상적으로 스트림을 끝내지 않는다 —
+                        // 장치가 뽑히면 소스에 따라 ERROR 대신 EOS 로 나타난다.
+                        log::warn!(
+                            "capture hub: {} reached EOS; a live capture source should never end",
+                            bus_key.0
+                        );
+                        bus_healthy.store(false, Ordering::Relaxed);
+                    },
+                    _ => {},
                 }
                 gstreamer::BusSyncReply::Drop
             });
@@ -651,5 +663,100 @@ mod tests {
             healthy_sink.count() >= 10
         });
         assert_eq!(hub.consumer_count(), 2, "the stalled consumer was evicted");
+    }
+
+    /// 몇 프레임 뒤 버스에 ERROR 를 올리는 소스 = 뽑힌 장치.
+    fn failing_source() -> Option<gstreamer::Element> {
+        let src = gstreamer::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .ok()?;
+        let identity = gstreamer::ElementFactory::make("identity")
+            .property("error-after", 3i32)
+            .build()
+            .ok()?;
+        let bin = gstreamer::Bin::new();
+        bin.add_many([&src, &identity]).ok()?;
+        src.link(&identity).ok()?;
+        let pad = identity.static_pad("src")?;
+        let ghost = gstreamer::GhostPad::with_target(&pad).ok()?;
+        bin.add_pad(&ghost).ok()?;
+        Some(bin.upcast())
+    }
+
+    /// 몇 프레임 뒤 EOS 를 내는 소스 = 장치 뽑힘이 ERROR 대신 EOS 로 나타나는 경우.
+    fn eos_source() -> Option<gstreamer::Element> {
+        gstreamer::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .property("num-buffers", 5i32)
+            .build()
+            .ok()
+    }
+
+    #[test]
+    fn a_failed_device_is_reopened_on_the_next_request() {
+        init();
+        let key = HubKey::for_test("failed-device");
+        let broken = open_consumer_with(key.clone(), failing_source).expect("broken consumer");
+        let broken_hub = broken.hub().clone();
+        let _broken_sink = ConsumerSink::start(&broken, true);
+
+        wait_until("the hub to notice the device error", || {
+            !broken_hub.is_healthy()
+        });
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let recovered =
+            open_consumer_with(key, counting_source(&opens)).expect("recovered consumer");
+
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            1,
+            "the failed hub was reused"
+        );
+        assert!(recovered.hub().is_healthy());
+        assert!(!Arc::ptr_eq(recovered.hub(), &broken_hub));
+    }
+
+    #[test]
+    fn a_healthy_device_is_never_reopened() {
+        init();
+        let key = HubKey::for_test("never-reopened");
+        let first = open_consumer_with(key.clone(), test_source).expect("first");
+        let sink = ConsumerSink::start(&first, true);
+        wait_until("the first consumer to receive frames", || sink.count() >= 3);
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        for _ in 0..5 {
+            let consumer =
+                open_consumer_with(key.clone(), counting_source(&opens)).expect("repeat consumer");
+            drop(consumer);
+        }
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            0,
+            "a page transition reopened the device"
+        );
+    }
+
+    #[test]
+    fn a_device_that_reaches_eos_is_reopened_on_the_next_request() {
+        init();
+        let key = HubKey::for_test("eos-device");
+        let broken = open_consumer_with(key.clone(), eos_source).expect("eos consumer");
+        let broken_hub = broken.hub().clone();
+        let _broken_sink = ConsumerSink::start(&broken, true);
+
+        wait_until("the hub to notice the device EOS", || {
+            !broken_hub.is_healthy()
+        });
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let recovered =
+            open_consumer_with(key, counting_source(&opens)).expect("recovered consumer");
+
+        assert_eq!(opens.load(Ordering::Relaxed), 1, "the EOS'd hub was reused");
+        assert!(recovered.hub().is_healthy());
+        assert!(!Arc::ptr_eq(recovered.hub(), &broken_hub));
     }
 }
