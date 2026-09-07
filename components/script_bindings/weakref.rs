@@ -12,13 +12,16 @@
 //! `WeakBox` itself is dropped too.
 
 use std::cell::Cell;
+use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 use std::ops::Drop;
 use std::{mem, ptr};
 
+use js::JSCLASS_RESERVED_SLOTS_MASK;
 use js::glue::JS_GetReservedSlot;
-use js::jsapi::{JS_SetReservedSlot, JSTracer};
+use js::jsapi::{JS_SetReservedSlot, JSCLASS_RESERVED_SLOTS_SHIFT, JSTracer};
 use js::jsval::{PrivateValue, UndefinedValue};
+use js::rust::get_object_class;
 use libc::c_void;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 
@@ -31,6 +34,14 @@ use crate::root::DomRoot;
 /// this is unsafe for globals, we disallow weak-referenceable globals
 /// directly in codegen.
 pub(crate) const DOM_WEAK_SLOT: u32 = 1;
+
+/// How many reserved slots a `JSClass` declares, read back out of its flags.
+///
+/// The count is packed into the class flags by codegen
+/// (`JSCLASS_HAS_RESERVED_SLOTS(n)`), so this is the inverse of that packing.
+fn reserved_slot_count(flags: u32) -> u32 {
+    (flags >> JSCLASS_RESERVED_SLOTS_SHIFT) & JSCLASS_RESERVED_SLOTS_MASK
+}
 
 /// A weak reference to a JS-managed DOM object.
 #[cfg_attr(crown, crown::unrooted_must_root_lint::allow_unrooted_interior)]
@@ -54,6 +65,33 @@ pub trait WeakReferenceable: DomObject + Sized {
     fn downgrade(&self) -> WeakRef<Self> {
         unsafe {
             let object = self.reflector().get_jsobject().get();
+            // ***The slot must actually exist on THIS object's class.*** The number of
+            // reserved slots is emitted per interface from its own `weakReferenceable`
+            // flag in Bindings.conf, with no inheritance check -- so an interface whose
+            // Rust struct embeds a weak-referenceable base, but which is not itself
+            // marked, gets one slot while this code reads and writes slot 1.
+            //
+            // That is not a graceful failure. The read returns whatever follows the
+            // object, and if it is zero this then WRITES a fresh `WeakBox` pointer out
+            // of bounds; a later read of the same place returns garbage that gets
+            // dereferenced here. Measured 2026-09-07: WebGL2RenderingContext shipped
+            // with one slot, and the wall died with STATUS_ACCESS_VIOLATION in exactly
+            // this function, at `box_.count.set(...)`, every single time.
+            //
+            // So check it. A panic naming the interface costs one shift and a compare
+            // per weak reference created, and it is the difference between a one-line
+            // fix and a week of chasing a corrupted heap.
+            let class = get_object_class(object);
+            let slots = reserved_slot_count((*class).flags);
+            assert!(
+                slots > DOM_WEAK_SLOT,
+                "{} is a weak-reference target but its JSClass declares only {} reserved \
+                 slot(s), so DOM_WEAK_SLOT ({}) is out of bounds. Add \
+                 'weakReferenceable': True to this interface in Bindings.conf.",
+                CStr::from_ptr((*class).name).to_string_lossy(),
+                slots,
+                DOM_WEAK_SLOT,
+            );
             let mut slot = UndefinedValue();
             JS_GetReservedSlot(object, DOM_WEAK_SLOT, &mut slot);
             let mut ptr = slot.to_private() as *mut WeakBox<Self>;
@@ -131,8 +169,8 @@ impl<T: WeakReferenceable> MallocSizeOf for WeakRef<T> {
 impl<T: WeakReferenceable> PartialEq for WeakRef<T> {
     fn eq(&self, other: &Self) -> bool {
         unsafe {
-            (*self.ptr.as_ptr()).value.get().map(ptr::NonNull::as_ptr) ==
-                (*other.ptr.as_ptr()).value.get().map(ptr::NonNull::as_ptr)
+            (*self.ptr.as_ptr()).value.get().map(ptr::NonNull::as_ptr)
+                == (*other.ptr.as_ptr()).value.get().map(ptr::NonNull::as_ptr)
         }
     }
 }
@@ -169,5 +207,40 @@ impl<T: WeakReferenceable> Drop for WeakRef<T> {
                 mem::drop(Box::from_raw(self.ptr.as_ptr()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The packing codegen emits is `(n & MASK) << SHIFT`; this is its inverse.
+    /// Pinned because the whole guard in `downgrade` rests on reading the count
+    /// back correctly -- a wrong shift would make the check either useless or a
+    /// spurious panic on every weak reference in the engine.
+    #[test]
+    fn reserved_slot_count_inverts_the_class_flag_packing() {
+        for n in [0u32, 1, 2, 3, 8] {
+            let flags = (n & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT;
+            assert_eq!(reserved_slot_count(flags), n, "round trip for {n} slots");
+        }
+    }
+
+    /// The two shapes that matter in practice: an interface marked
+    /// weakReferenceable (2 slots, slot 1 usable) and one that is not (1 slot,
+    /// slot 1 out of bounds -- what WebGL2RenderingContext shipped as).
+    #[test]
+    fn only_two_slots_make_the_weak_slot_addressable() {
+        let two = (2 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT;
+        let one = (1 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT;
+        assert!(reserved_slot_count(two) > DOM_WEAK_SLOT);
+        assert!(reserved_slot_count(one) <= DOM_WEAK_SLOT);
+    }
+
+    /// Other flag bits must not leak into the count.
+    #[test]
+    fn unrelated_class_flags_do_not_change_the_count() {
+        let slots = (2 & JSCLASS_RESERVED_SLOTS_MASK) << JSCLASS_RESERVED_SLOTS_SHIFT;
+        assert_eq!(reserved_slot_count(slots | js::JSCLASS_IS_DOMJSCLASS), 2);
     }
 }
