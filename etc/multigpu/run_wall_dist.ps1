@@ -1140,7 +1140,12 @@ if ($spike -or $spikeTiles) {
 # a regression watch, not a hunt: what it has to catch is the cache MISSING -- a resize storm,
 # or a producer handing out a fresh share handle every frame -- which brings the old cost back
 # whole. That is why reused= is in the header and is checked before the percentages.
-$imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) reused=(\d+) \([\d.]+%\) open_ms=([\d.]+) pbuffer_ms=([\d.]+) query_ms=([\d.]+) acquire_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
+# `live=` was added to the line later and is optional here on purpose. When it was added
+# this pattern stopped matching, and the miss did not read as "the pattern is stale" -- it
+# read as the warning below, "no canvas was imported at all", on a run where 82 SURFIMPORT
+# lines were sitting in the log. A parser that reports absence must be loose about fields
+# it does not use.
+$imp = Select-String -Path $LogPath -Pattern "SURFIMPORT imports=(\d+) reused=(\d+) \([\d.]+%\) (?:live=\d+ )?open_ms=([\d.]+) pbuffer_ms=([\d.]+) query_ms=([\d.]+) acquire_ms=([\d.]+) rest_ms=([\d.]+)" -EA SilentlyContinue
 if ($imp) {
     # The numbers are cumulative, so the last line is the whole run.
     $impG = $imp[-1].Matches[0].Groups
