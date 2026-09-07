@@ -206,6 +206,24 @@ static IMPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 캐시 적중 수. ★`open_ms` 가 낮은 것만으로는 "캐시가 듣는다" 를 말할 수 없다★ —
 /// 들여오기 자체가 적었을 수도 있다. 적중과 신규를 갈라 세어야 그 둘이 구분된다.
 static IMPORT_REUSED: AtomicU64 = AtomicU64::new(0);
+/// How many imports the caches are holding right now, across every device.
+///
+/// ***`imports`/`reused` are cumulative and cannot show a leak*** -- a 99% hit
+/// rate is exactly what a cache that never releases anything looks like. This is
+/// the live entry count, so if it does not come back down when content is
+/// swapped away, that is the leak, and it is measured rather than inferred.
+///
+/// This counter is unambiguous about its source: only the shared-surface import
+/// path touches it, so video, live streams and images cannot move it. That
+/// matters here -- the external-image traffic those share with WebGL cannot be
+/// attributed from the log at all.
+static IMPORT_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Account for entries dropped in bulk when a device tears its cache down.
+pub(crate) fn note_imports_released(count: usize) {
+    IMPORT_LIVE.fetch_sub(count as u64, Ordering::Relaxed);
+}
+
 static IMPORT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static IMPORT_START: OnceLock<Instant> = OnceLock::new();
 
@@ -236,8 +254,8 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
     // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
     // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
     warn!(
-        "SURFIMPORT imports={} reused={} ({:.0}%) open_ms={:.1} pbuffer_ms={:.1} \
-         query_ms={:.1} acquire_ms={:.1} rest_ms={:.1} (cumulative)",
+        "SURFIMPORT imports={} reused={} ({:.0}%) live={} open_ms={:.1} pbuffer_ms={:.1} \
+         query_ms={:.1} acquire_ms={:.1} rest_ms={:.1} (counters cumulative, live is not)",
         count,
         reused,
         if count > 0 {
@@ -245,6 +263,7 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
         } else {
             0.0
         },
+        IMPORT_LIVE.load(Ordering::Relaxed),
         ms(IMPORT_OPEN_NS.load(Ordering::Relaxed)),
         ms(IMPORT_PBUFFER_NS.load(Ordering::Relaxed)),
         ms(IMPORT_QUERY_NS.load(Ordering::Relaxed)),
@@ -614,6 +633,7 @@ impl Device {
                 // 핸들을 재사용한다.
                 if let Ok(ref surface_texture) = result {
                     if let Some(gl_texture) = surface_texture.gl_texture {
+                        IMPORT_LIVE.fetch_add(1, Ordering::Relaxed);
                         self.imported_surfaces.borrow_mut().insert(
                             share_handle,
                             ImportedSurface {
@@ -891,6 +911,7 @@ impl Device {
         if let Win32Objects::Pbuffer { share_handle, .. } = surface.win32_objects {
             let imported = self.imported_surfaces.borrow_mut().remove(&share_handle);
             if let Some(imported) = imported {
+                IMPORT_LIVE.fetch_sub(1, Ordering::Relaxed);
                 EGL_FUNCTIONS.with(|egl| unsafe {
                     egl.DestroySurface(self.egl_display, imported.egl_surface);
                 });

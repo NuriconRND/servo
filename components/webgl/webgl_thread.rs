@@ -408,6 +408,8 @@ pub(crate) struct WebGLThread {
     /// A usage map used to delay the deletion of WebGL contexts until all WebRender
     /// rendering is finished, so that any existing `Surface`s can be properly released.
     busy_webgl_context_map: WebGLContextBusyMap,
+    /// When `log_live_contexts` last emitted, so it stays at one line per second.
+    last_live_log: Option<Instant>,
     /// 팬아웃 재실행 비용 누적기(`SERVO_WEBGL_FANOUT_PROF`). 꺼져 있으면 갱신되지 않는다.
     fanout_profile: FanoutProfile,
 
@@ -460,6 +462,7 @@ impl WebGLThread {
             webrender_swap_chains,
             painter_surfman_details_map,
             busy_webgl_context_map,
+            last_live_log: None,
             fanout_profile: FanoutProfile::default(),
             #[cfg(feature = "webxr")]
             webxr_bridge: Some(WebXRBridge::new(webxr_init)),
@@ -507,6 +510,7 @@ impl WebGLThread {
     /// Handles a generic WebGLMsg message
     fn handle_msg(&mut self, msg: WebGLMsg, webgl_chan: &WebGLChan) -> bool {
         trace!("processing {:?}", msg);
+        self.log_live_contexts();
         match msg {
             WebGLMsg::CreateContext(
                 painter_id,
@@ -650,6 +654,47 @@ impl WebGLThread {
     ///
     /// 컨텍스트가 아직/이미 없으면 `None` 이고 락은 전량 배타로 접힌다 — 모르는 채로
     /// 슬롯을 나누는 것보다 안전하다(그 실패 모드가 0xc0000005 다).
+    /// Report what this thread is still holding, once a second, unconditionally.
+    ///
+    /// ***Only WebGL moves these numbers.*** The wall runs video, live streams and
+    /// images alongside WebGL, and the signals they share -- external images,
+    /// surface imports, GPU memory as seen from outside -- cannot be attributed
+    /// to one of them from a log. These counts can: they are this thread's own
+    /// tables.
+    ///
+    /// `pending_delete` is the one to watch. `remove_webgl_context` defers when
+    /// WebRender still has a surface busy, and the deferral only completes when
+    /// the busy count falls back to zero. If it never does, the context and its
+    /// swap chain are never freed -- and that is invisible today, because nothing
+    /// reports it.
+    fn log_live_contexts(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .last_live_log
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+        if !due {
+            return;
+        }
+        self.last_live_log = Some(now);
+        let pending_delete = self
+            .contexts
+            .values()
+            .filter(|data| data.marked_for_deletion)
+            .count();
+        let busy = {
+            let map = self.busy_webgl_context_map.read();
+            map.values().filter(|count| **count > 0).count()
+        };
+        warn!(
+            "WEBGLLIVE contexts={} surfaces={} pending_delete={} busy_surfaces={} images={}",
+            self.context_backends.len(),
+            self.contexts.len(),
+            pending_delete,
+            busy,
+            self.cached_context_info.len(),
+        );
+    }
+
     fn angle_device_key(&self, surface_id: WebGLSurfaceId) -> Option<usize> {
         let _ = surface_id;
         #[cfg(all(target_os = "windows", feature = "no-wgl"))]

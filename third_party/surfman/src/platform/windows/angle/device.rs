@@ -779,7 +779,9 @@ impl Drop for Device {
             // GL 텍스처는 지우지 않는다 — 그것을 지우려면 컨텍스트를 current 로 삼아야 하고,
             // 디바이스가 사라지는 시점에는 그 컨텍스트도 이미 없다. 디스플레이가 종료되면서
             // 함께 사라진다.
-            for (_, imported) in self.imported_surfaces.borrow_mut().drain() {
+            let drained = self.imported_surfaces.borrow_mut().drain().collect::<Vec<_>>();
+            crate::platform::windows::angle::surface::note_imports_released(drained.len());
+            for (_, imported) in drained {
                 EGL_FUNCTIONS.with(|egl| {
                     egl.DestroySurface(self.egl_display, imported.egl_surface);
                 });
