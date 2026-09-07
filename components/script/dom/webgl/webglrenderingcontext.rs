@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::ptr::{self, NonNull};
 #[cfg(feature = "webxr")]
@@ -24,6 +24,7 @@ use pixels::{self, Alpha, PixelFormat, Snapshot, SnapshotPixelFormat};
 use script_bindings::cell::{DomRefCell, Ref, RefMut};
 use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::reflector::{AssociatedMemory, Reflector, reflect_dom_object_with_cx};
+use script_bindings::weakref::WeakRef;
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericSharedMemory;
 use servo_base::{Epoch, generic_channel};
@@ -57,6 +58,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomOnceCell, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 #[cfg(feature = "webgl_backtrace")]
 use crate::dom::globalscope::GlobalScope;
@@ -164,6 +166,58 @@ pub(crate) enum VertexAttrib {
     Float(f32, f32, f32, f32),
     Int(i32, i32, i32, i32),
     Uint(u32, u32, u32, u32),
+}
+
+thread_local! {
+    /// Every WebGL context this script thread has made, held weakly.
+    static LIVE_CONTEXTS: RefCell<Vec<WeakRef<WebGLRenderingContext>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Report how many WebGL contexts are still alive, and whether their canvases are
+/// still in a document.
+///
+/// ***This is the question a forced collection cannot answer.*** Measured on the 4-GPU
+/// wall, 2026-09-07: with `SERVO_SCRIPT_FORCE_GC_SEC=5` running 24 full collections over
+/// two minutes, `WEBGLLIVE contexts=` still climbed 0 -> 8 and never fell once. So the
+/// contexts are not garbage waiting to be collected -- they are reachable, and the only
+/// thing left to learn is from where.
+///
+/// `connected` splits that in two, and the two halves have different owners:
+/// a canvas still in a document is held by the page, and no engine change will free it;
+/// a detached canvas that stays alive is held by something in here.
+pub(crate) fn report_live_contexts() {
+    LIVE_CONTEXTS.with(|live| {
+        let mut live = live.borrow_mut();
+        // Dropping the dead entries here is also what keeps this list from growing
+        // without bound on a long-running wall.
+        live.retain(|context| context.is_alive());
+        let (mut connected, mut detached, mut offscreen) = (0usize, 0usize, 0usize);
+        for context in live.iter() {
+            let Some(context) = context.root() else {
+                continue;
+            };
+            match &context.canvas {
+                HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
+                    if canvas.upcast::<Element>().is_connected() {
+                        connected += 1;
+                    } else {
+                        detached += 1;
+                    }
+                },
+                HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => offscreen += 1,
+            }
+        }
+        // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
+        // diagnostic nobody can see is a diagnostic that does not exist.
+        warn!(
+            "WEBGLDOM live={} connected={} detached={} offscreen={}",
+            live.len(),
+            connected,
+            detached,
+            offscreen
+        );
+    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -354,7 +408,16 @@ impl WebGLRenderingContext {
             cx,
         );
         context.account_drawing_buffer();
+        context.register_for_reporting();
         Some(context)
+    }
+
+    /// Remember this context weakly, so [`report_live_contexts`] can find it later.
+    ///
+    /// A weak reference is the whole point: the registry must not be the reason a
+    /// context stays alive, or it would answer its own question.
+    pub(crate) fn register_for_reporting(&self) {
+        LIVE_CONTEXTS.with(|live| live.borrow_mut().push(WeakRef::new(self)));
     }
 
     /// Tell the JS engine what this context's drawing buffer costs it.

@@ -140,6 +140,7 @@ use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, Proc
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::servoparser::{ParserContext, ServoParser};
 use crate::dom::types::DebuggerGlobalScope;
+use crate::dom::webgl::webglrenderingcontext::report_live_contexts as report_live_webgl_contexts;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::window::Window;
@@ -167,6 +168,9 @@ use crate::webdriver_handlers::jsval_to_webdriver;
 use crate::{devtools, webdriver_handlers};
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
+
+// When `maybe_report_live_webgl_contexts` last reported. Same reasoning as below.
+thread_local!(static LAST_WEBGL_DOM_REPORT: Cell<Option<Instant>> = const { Cell::new(None) });
 
 // When `maybe_force_gc` last collected. One script thread per OS thread, so a
 // thread-local is exactly the right scope and needs no field on `ScriptThread`.
@@ -1179,6 +1183,23 @@ impl ScriptThread {
     /// Forcing the collection separates them -- if the count falls, they were
     /// garbage; if it does not, something still holds them and that is what to
     /// go find.
+    /// One `WEBGLDOM` line a second, unconditionally.
+    ///
+    /// Paired with `WEBGLLIVE` from the WebGL thread: that one counts contexts the
+    /// renderer still holds, this one says whether the page still holds their canvases.
+    /// Neither number can be moved by video, live streams or images.
+    fn maybe_report_live_webgl_contexts(&self) {
+        let now = Instant::now();
+        if !LAST_WEBGL_DOM_REPORT.with(|last| {
+            last.get()
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        }) {
+            return;
+        }
+        LAST_WEBGL_DOM_REPORT.with(|last| last.set(Some(now)));
+        report_live_webgl_contexts();
+    }
+
     #[expect(unsafe_code)]
     fn maybe_force_gc(&self) {
         let Some(interval) = force_gc_interval() else {
@@ -1202,6 +1223,7 @@ impl ScriptThread {
 
     pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
         self.maybe_force_gc();
+        self.maybe_report_live_webgl_contexts();
         self.last_render_opportunity_time.set(Some(Instant::now()));
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);

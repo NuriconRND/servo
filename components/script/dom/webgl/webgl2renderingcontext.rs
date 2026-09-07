@@ -196,6 +196,7 @@ impl WebGL2RenderingContext {
             // until the line above -- so the base's own `new` never runs for a
             // WebGL2 context and the accounting has to be repeated here.
             context.base.account_drawing_buffer();
+            context.base.register_for_reporting();
             context
         })
     }
