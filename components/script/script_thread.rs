@@ -168,6 +168,23 @@ use crate::{devtools, webdriver_handlers};
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
+// When `maybe_force_gc` last collected. One script thread per OS thread, so a
+// thread-local is exactly the right scope and needs no field on `ScriptThread`.
+thread_local!(static LAST_FORCED_GC: Cell<Option<Instant>> = const { Cell::new(None) });
+
+/// The interval `SERVO_SCRIPT_FORCE_GC_SEC` asks for, parsed once. Absent,
+/// unparseable, or zero all mean "leave collection alone".
+fn force_gc_interval() -> Option<Duration> {
+    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("SERVO_SCRIPT_FORCE_GC_SEC")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+    })
+}
+
 fn with_optional_script_thread<R>(f: impl FnOnce(Option<&ScriptThread>) -> R) -> R {
     SCRIPT_THREAD_ROOT.with(|root| {
         f(root
@@ -1152,7 +1169,39 @@ impl ScriptThread {
     /// actually updated.
     ///
     /// Returns true if any reflows produced a new display list.
+    /// Collect on a timer instead of on pressure, when `SERVO_SCRIPT_FORCE_GC_SEC`
+    /// asks for it. Off otherwise, and not a mechanism to ship enabled.
+    ///
+    /// ***This exists to answer one question the logs cannot.*** When DOM objects
+    /// that own GPU memory are never finalized, there are two possible reasons
+    /// and they need opposite fixes: either the objects are garbage and no
+    /// collection ran, or they are still reachable and collecting would not help.
+    /// Forcing the collection separates them -- if the count falls, they were
+    /// garbage; if it does not, something still holds them and that is what to
+    /// go find.
+    #[expect(unsafe_code)]
+    fn maybe_force_gc(&self) {
+        let Some(interval) = force_gc_interval() else {
+            return;
+        };
+        let now = Instant::now();
+        if !LAST_FORCED_GC.with(|last| {
+            last.get()
+                .is_none_or(|last| now.duration_since(last) >= interval)
+        }) {
+            return;
+        }
+        LAST_FORCED_GC.with(|last| last.set(Some(now)));
+        // `warn!` deliberately: the launcher's default RUST_LOG leads with `warn`,
+        // and a diagnostic nobody can see is a diagnostic that does not exist.
+        warn!("SCRIPTGC forcing a full collection (SERVO_SCRIPT_FORCE_GC_SEC)");
+        unsafe {
+            JS_GC(*GlobalScope::get_cx(), GCReason::API);
+        }
+    }
+
     pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
+        self.maybe_force_gc();
         self.last_render_opportunity_time.set(Some(Instant::now()));
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);

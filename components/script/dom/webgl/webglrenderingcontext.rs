@@ -343,7 +343,7 @@ impl WebGLRenderingContext {
             },
         };
 
-        Some(reflect_dom_object_with_cx(
+        let context = reflect_dom_object_with_cx(
             Box::new(WebGLRenderingContext::new_inherited(
                 canvas,
                 webgl_version,
@@ -352,7 +352,33 @@ impl WebGLRenderingContext {
             )),
             window,
             cx,
-        ))
+        );
+        context.account_drawing_buffer();
+        Some(context)
+    }
+
+    /// Tell the JS engine what this context's drawing buffer costs it.
+    ///
+    /// ***A WebGL context is a few hundred bytes of Rust and up to hundreds of
+    /// megabytes of GPU memory.*** The collector runs on memory pressure, and it
+    /// knows only the pressure it is told about, so a context whose drawing
+    /// buffer was never reported reads as very nearly free: nothing collects it,
+    /// `RemoveContext` is therefore never sent, and its surfaces are never
+    /// released. Nothing about that is visible as a leak -- no allocation fails,
+    /// no table grows without bound; the GPU simply fills up.
+    ///
+    /// Measured on the 4-GPU wall, 2026-09-07: across content swaps
+    /// `WEBGLLIVE contexts=` climbed 0 -> 6 and never once fell, with
+    /// `pending_delete=0` on every line. That rules out the deferred-deletion
+    /// path -- this is not a deletion that stalled, it is a deletion that was
+    /// never asked for -- and the GPUs reached 100% dedicated memory.
+    ///
+    /// `resize` already reported this. Creation did not, so a canvas that is
+    /// sized once and never resized -- the ordinary case, and the case the wall
+    /// hits every swap -- reported nothing at all.
+    pub(crate) fn account_drawing_buffer(&self) {
+        self.reflector_
+            .update_memory_size(self, self.size.get().cast::<usize>().area() * 4);
     }
 
     pub(crate) fn set_image_key(&self, image_key: ImageKey) {
@@ -2039,8 +2065,7 @@ impl CanvasContext for WebGLRenderingContext {
         // FIXME(#21718) The backend is allowed to choose a size smaller than
         // what was requested
         self.size.set(size);
-        self.reflector_
-            .update_memory_size(self, size.cast::<usize>().area() * 4);
+        self.account_drawing_buffer();
 
         if let Err(msg) = receiver.recv().unwrap() {
             error!("Error resizing WebGLContext: {}", msg);

@@ -190,8 +190,14 @@ impl WebGL2RenderingContext {
         size: Size2D<u32>,
         attrs: GLContextAttributes,
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
-        WebGL2RenderingContext::new_inherited(window, canvas, size, attrs)
-            .map(|ctx| reflect_dom_object_with_cx(Box::new(ctx), window, cx))
+        WebGL2RenderingContext::new_inherited(window, canvas, size, attrs).map(|ctx| {
+            let context = reflect_dom_object_with_cx(Box::new(ctx), window, cx);
+            // The reflector these share is this object's, and it does not exist
+            // until the line above -- so the base's own `new` never runs for a
+            // WebGL2 context and the accounting has to be repeated here.
+            context.base.account_drawing_buffer();
+            context
+        })
     }
 
     pub(crate) fn set_image_key(&self, image_key: ImageKey) {

@@ -264,6 +264,13 @@ param(
     # memory report) and say so in the log rather than failing quietly.
     [switch] $ParallelTiles,
     [int] $CanvasAckSkip = 0,
+    # Collect the JS heap every N seconds instead of waiting for memory pressure.
+    # Diagnostic only, and only for one question: when DOM objects that own GPU memory are
+    # never finalized, either they are garbage and no collection ran, or they are still
+    # reachable and collecting changes nothing. Those need opposite fixes and the log cannot
+    # tell them apart. Run with this and watch WEBGLLIVE contexts= -- if it falls, they were
+    # garbage. Leave it at 0 for any run whose numbers are meant to mean anything.
+    [int] $ForceGcSec = 0,
     # Turns the recovery off. Pair it with -CanvasAckSkip to show the injection really does
     # deadlock the wall -- without this control, a run that stays healthy cannot distinguish
     # "recovery worked" from "the injection never bit".
@@ -548,6 +555,8 @@ if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($FanoutProf)           { $env:SERVO_WEBGL_FANOUT_PROF = "1" }
 if ($DcompBindProf)        { $env:SERVO_DCOMP_BIND_PROF = "1" }
 if ($CanvasAckSkip -gt 0)  { $env:SERVO_WALL_CANVAS_ACK_SKIP = "$CanvasAckSkip" }
+if ($ForceGcSec -gt 0)     { $env:SERVO_SCRIPT_FORCE_GC_SEC = "$ForceGcSec" }
+else                       { Remove-Item Env:\SERVO_SCRIPT_FORCE_GC_SEC -ErrorAction SilentlyContinue }
 if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
@@ -641,6 +650,9 @@ Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.I
 if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS errors accepted)" }
 Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
+# A forced-collection run measures a hypothesis, not the product. Say so in the transcript
+# so nobody reads its frame rates or its GPU memory as this build's normal behaviour.
+if ($ForceGcSec -gt 0) { Write-Host "  force_gc=every ${ForceGcSec}s (DIAGNOSTIC -- perf numbers from this run are not comparable)" }
 Write-Host "  log=$(if($NoLog){'off (-NoLog); no post-run analysis either'}else{$LogPath})"
 
 # ***The two flags that decide whether a video grid is CPU-bound.*** Both default OFF, both
