@@ -434,6 +434,44 @@ pub(crate) struct WebGLThreadInit {
 // A size at which it should be safe to create GL contexts
 const SAFE_VIEWPORT_DIMS: [u32; 2] = [1024, 1024];
 
+/// Copy a WebGL command for one more backend, ***serializing it again for every copy.***
+///
+/// The round trip looks like an expensive way to clone, and for most of a command it
+/// is. For one field it is not a clone at all. `GenericSharedMemory` -- the pixel
+/// payload of every `Tex*Image2D` -- does not serialize its bytes in single-process
+/// mode: `Serialize` hands over an `Arc::into_raw` and `Deserialize` takes that
+/// pointer back with `Arc::from_raw`. A round trip **moves one strong reference**.
+///
+/// So one serialize feeds exactly one deserialize. Serializing once and deserializing
+/// N times hands N owners a single reference: the buffer is freed while the original
+/// command still points into it, and freed again after that. Nothing reports it --
+/// the next reader simply reads whatever now lives there.
+///
+/// Measured on the 4-GPU wall, 2026-09-07 (crash dump `winit_wall.exe.26608.dmp`):
+/// `glTexImage2D` reached ANGLE with `pixels = 0xfffe01119dec70b8`, unmapped, and died
+/// inside `memcpy`. Four backends, one reference, three owners too many.
+///
+/// The extra serialize is what keeps the pair balanced. It is also why the caller
+/// hands the *original* command to the last backend rather than copying for it: N-1
+/// round trips instead of the N deserializes this replaced.
+fn clone_webgl_command(command: &WebGLCommand) -> Option<WebGLCommand> {
+    postcard::to_stdvec(command)
+        .map_err(|error| {
+            warn!("Could not serialize WebGL command for multi-GPU fan-out: {error:?}");
+        })
+        .ok()
+        .and_then(|bytes| {
+            postcard::from_bytes::<WebGLCommand>(&bytes)
+                .map_err(|error| {
+                    // A serialize with no deserialize to pair with leaks one strong
+                    // reference. That is the safe direction to fail in, which is why this
+                    // is not retried with the same bytes.
+                    warn!("Could not deserialize cloned WebGL command: {error:?}");
+                })
+                .ok()
+        })
+}
+
 impl WebGLThread {
     /// Create a new instance of WebGLThread.
     pub(crate) fn new(
@@ -992,38 +1030,36 @@ impl WebGLThread {
         self.apply_webgl_command_to_surface(surface_id, command, backtrace);
     }
 
+    /// Copy `command` for one more backend. See [`clone_webgl_command`] for why every
+    /// copy serializes again.
+    fn clone_command_for_backend(&mut self, command: &WebGLCommand) -> Option<WebGLCommand> {
+        let start = WEBGL_FANOUT_PROF.then(Instant::now);
+        let cloned = clone_webgl_command(command);
+        if let Some(start) = start {
+            self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
+        }
+        cloned
+    }
+
     fn apply_webgl_command_to_all_backends(
         &mut self,
         context_id: WebGLContextId,
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
-        let serialize_start = WEBGL_FANOUT_PROF.then(Instant::now);
-        let bytes = match postcard::to_stdvec(&command) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warn!(
-                    "Could not clone WebGL command for multi-GPU fan-out; applying primary only: {error:?}"
-                );
-                self.apply_webgl_command_to_primary(context_id, command, backtrace);
-                return;
-            },
+        let surface_ids = self.backend_surface_ids(context_id);
+        let Some((last_surface_id, rest)) = surface_ids.split_last() else {
+            return;
         };
-        if let Some(start) = serialize_start {
-            self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
-        }
-
-        for surface_id in self.backend_surface_ids(context_id) {
-            let deserialize_start = WEBGL_FANOUT_PROF.then(Instant::now);
-            let Ok(command) = postcard::from_bytes::<WebGLCommand>(&bytes) else {
-                warn!("Could not deserialize cloned WebGL command for {surface_id:?}");
+        for surface_id in rest {
+            let Some(command) = self.clone_command_for_backend(&command) else {
                 continue;
             };
-            if let Some(start) = deserialize_start {
-                self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
-            }
-            self.apply_webgl_command_to_surface(surface_id, command, backtrace.clone());
+            self.apply_webgl_command_to_surface(*surface_id, command, backtrace.clone());
         }
+        // The original goes to the last backend: it is a copy nobody has to make, and it
+        // is the one command whose payload reference is already owned here.
+        self.apply_webgl_command_to_surface(*last_surface_id, command, backtrace);
     }
 
     fn apply_webgl_command_to_surface(
@@ -4168,5 +4204,105 @@ impl FramebufferRebindingInfo {
                 self.viewport[3],
             )
         };
+    }
+}
+
+#[cfg(test)]
+mod fanout_clone_tests {
+    use std::sync::Arc;
+
+    use super::{
+        Size2D, TexDataType, TexFormat, WebGLCommand, YAxisTreatment, clone_webgl_command, gl,
+    };
+    use crate::webgl_thread::GenericSharedMemory;
+
+    const PIXEL: [u8; 4] = [1, 2, 3, 4];
+
+    fn one_pixel_upload() -> WebGLCommand {
+        WebGLCommand::TexImage2D {
+            target: gl::TEXTURE_2D,
+            level: 0,
+            internal_format: TexFormat::RGBA,
+            size: Size2D::new(1, 1),
+            format: TexFormat::RGBA,
+            data_type: TexDataType::UnsignedByte,
+            effective_data_type: gl::UNSIGNED_BYTE,
+            unpacking_alignment: 4,
+            alpha_treatment: None,
+            y_axis_treatment: YAxisTreatment::AsIs,
+            pixel_format: None,
+            data: GenericSharedMemory::from_bytes(&PIXEL).into(),
+        }
+    }
+
+    /// Read the payload's strong count without consuming the command it lives in.
+    /// The extra handle this clones is included, so a balanced command reports 2.
+    fn payload_strong_count(command: &WebGLCommand) -> usize {
+        let WebGLCommand::TexImage2D { data, .. } = command else {
+            panic!("expected the TexImage2D built by this module");
+        };
+        let arc = (*data).clone().into_arc_vec();
+        Arc::strong_count(&arc)
+    }
+
+    /// ***A round trip through serde moves a reference; it does not copy the buffer.***
+    /// This is the whole reason the fan-out cannot serialize once and deserialize per
+    /// backend, and it is invisible from the types -- so pin it here.
+    #[test]
+    fn a_round_trip_moves_exactly_one_strong_reference() {
+        let sent = GenericSharedMemory::from_bytes(&PIXEL);
+        let bytes = postcard::to_stdvec(&sent).expect("serialize");
+        let received: GenericSharedMemory = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(&*received, &PIXEL, "the bytes survive the trip");
+
+        // Serializing took one reference on the deserializer's behalf; deserializing took
+        // ownership of that one rather than adding another. Two handles, two references.
+        let arc = sent.into_arc_vec();
+        assert_eq!(Arc::strong_count(&arc), 2);
+        drop(received);
+        assert_eq!(Arc::strong_count(&arc), 1);
+        // Deserializing `bytes` a second time here would take a reference nobody gave,
+        // freeing a buffer `arc` still points at -- and freeing it again after that.
+    }
+
+    /// Every copy the fan-out makes must be self-contained: after the copies are applied
+    /// and dropped, the original command still owns its pixels. With one serialize shared
+    /// across N copies this is where the buffer was freed out from under the original.
+    #[test]
+    fn copies_do_not_consume_the_original_payload() {
+        let command = one_pixel_upload();
+        assert_eq!(
+            payload_strong_count(&command),
+            2,
+            "one handle plus the probe"
+        );
+
+        // Four backends is the shipping wall: the original goes to the last one, so three
+        // copies are made.
+        let copies: Vec<_> = (0..3)
+            .map(|_| clone_webgl_command(&command).expect("clone"))
+            .collect();
+        assert_eq!(
+            payload_strong_count(&command),
+            5,
+            "four handles plus the probe"
+        );
+        for copy in &copies {
+            let WebGLCommand::TexImage2D { data, .. } = copy else {
+                panic!("clone changed the variant");
+            };
+            assert_eq!(&***data, &PIXEL, "each copy sees the pixels");
+        }
+
+        drop(copies);
+        assert_eq!(
+            payload_strong_count(&command),
+            2,
+            "back to one handle plus the probe"
+        );
+        let WebGLCommand::TexImage2D { data, .. } = &command else {
+            unreachable!()
+        };
+        assert_eq!(&***data, &PIXEL, "the original still owns its pixels");
     }
 }
