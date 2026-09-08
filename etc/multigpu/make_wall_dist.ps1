@@ -142,6 +142,14 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_probe.html") (Join-
 # the case the hub exists for and the one the sequential probe never exercises --
 # its `consumers=` never went above 1. Driven by ?multi=N, again no `&`.
 Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_multi_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Does this engine run the animation the wall application actually creates? The
+# application prefers `Element.animate()`, which this engine does not have, and falls back
+# to a runtime-injected `@keyframes` plus an inline `animation` shorthand. This page walks
+# exactly that fallback and says through `console` whether the computed value ever moves.
+Copy-Item (Join-Path $repo "tests\html\wall_css_animation_support_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Does a CSS animation survive a blocked script thread? Blocks its own script thread on a
+# timer, the way a content switch does, with a CSS-animated bar next to a rAF counter.
+Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---

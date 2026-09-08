@@ -276,3 +276,71 @@ pub(crate) fn transform_binding(
         },
     ))
 }
+
+/// Report what the style system is actually animating, once a second.
+///
+/// ***`built=0` has two completely different causes and they need opposite work.*** Either
+/// the page is running CSS animations of properties this module does not bind yet -- and
+/// then the answer is to bind them -- or the style system has no animations at all,
+/// because the page is moving things from script instead, and then nothing on the paint
+/// side can help and the answer lies elsewhere entirely. Measured on the 4-GPU wall,
+/// 2026-09-08 (`log_ani_perf/04`): 115 display lists, `built=0` on every one, with no way
+/// to tell those apart from the log.
+///
+/// So this names the properties. It walks the whole document's animation set, which is
+/// why it is throttled to once a second rather than run per display list.
+pub(crate) fn log_document_animations(animations: &DocumentAnimationSet, now: f64) {
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static LAST: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    let due = LAST.with(|last| {
+        let now = Instant::now();
+        let due = last
+            .get()
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(1));
+        if due {
+            last.set(Some(now));
+        }
+        due
+    });
+    if !due {
+        return;
+    }
+
+    let sets = animations.sets.read();
+    let mut animation_count = 0usize;
+    let mut transition_count = 0usize;
+    let mut properties: BTreeSet<&'static str> = BTreeSet::new();
+    for set in sets.values() {
+        animation_count += set.animations.len();
+        transition_count += set.transitions.len();
+        // The keyframes themselves are private, so ask for the values the animations
+        // produce right now. One still inside its delay contributes nothing and is
+        // counted but unnamed, which is the honest report.
+        if let Some(map) = set.get_value_map_for_active_animations(now) {
+            for id in map.keys() {
+                if let OwnedPropertyDeclarationId::Longhand(id) = id {
+                    properties.insert(id.name());
+                }
+            }
+        }
+        for transition in &set.transitions {
+            if let PropertyDeclarationId::Longhand(id) = transition.property_animation.property_id()
+            {
+                properties.insert(id.name());
+            }
+        }
+    }
+
+    log::warn!(
+        "PAINTANIM document elements={} animations={} transitions={} properties=[{}]",
+        sets.len(),
+        animation_count,
+        transition_count,
+        properties.into_iter().collect::<Vec<_>>().join(",")
+    );
+}

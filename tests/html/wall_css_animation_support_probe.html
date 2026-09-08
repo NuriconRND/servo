@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>CSS animation support probe</title>
+<!--
+  Does this engine run the kind of animation the wall application actually creates?
+
+  The application's animation helper prefers `Element.animate()` and, when that is missing,
+  falls back to building a `@keyframes` rule at runtime, appending it in a <style> element,
+  and setting the `animation` shorthand on the element's inline style. This engine has no
+  `Element.animate`, so the fallback is the path that runs -- and this page walks exactly
+  that path, one step at a time, reporting each through `console`.
+
+  It reports through timers rather than requestAnimationFrame on purpose: a rendering loop
+  that is not running must not hide whether the style system created the animation.
+-->
+<style>
+  body { margin: 0; background: #101014; color: #ddd; font: 14px system-ui, sans-serif; }
+  #box { width: 40vw; height: 30vh; margin: 4vh; background: #4a9dff; }
+</style>
+<div id="box"></div>
+<script>
+  const say = (...args) => console.log("[cssanim]", ...args);
+  const box = document.getElementById("box");
+
+  say("Element.animate:", typeof box.animate);
+  say("document.getAnimations:", typeof document.getAnimations);
+
+  // Step 1: the runtime-injected @keyframes, exactly as the application builds it.
+  const name = "sd-anim-probe";
+  const style = document.createElement("style");
+  style.textContent =
+    "@keyframes " + name + "{" +
+    "0%{transform:translate3d(0px,0px,0px);opacity:0}" +
+    "100%{transform:translate3d(200px,0px,0px);opacity:1}" +
+    "}";
+  document.head.appendChild(style);
+  say("style injected, sheet:", !!style.sheet,
+      "rules:", style.sheet ? style.sheet.cssRules.length : -1);
+
+  // Step 2: the inline `animation` shorthand, again as the application sets it.
+  box.style.animation = name + " 1500ms linear 0s 1 normal forwards";
+  say("inline animation =", JSON.stringify(box.style.animation));
+
+  const computed = getComputedStyle(box);
+  say("computed animation-name =", JSON.stringify(computed.animationName),
+      "duration =", JSON.stringify(computed.animationDuration));
+
+  // Step 3: does the engine tell us the animation started?
+  let started = false;
+  box.addEventListener("animationstart", () => { started = true; say("EVENT animationstart"); });
+  box.addEventListener("animationend", () => say("EVENT animationend"));
+
+  // Step 4: is the computed value actually moving? This is the whole question -- an
+  // animation that exists in the style system but never advances looks identical on
+  // screen to one that was never created.
+  const samples = [];
+  let ticks = 0;
+  const sample = () => {
+    const c = getComputedStyle(box);
+    samples.push(c.opacity + " / " + c.transform);
+    if (++ticks < 10) {
+      setTimeout(sample, 150);
+    } else {
+      say("started event fired:", started);
+      samples.forEach((s, i) => say("sample", i, s));
+      say("VERDICT:",
+          new Set(samples).size > 1
+            ? "the computed value MOVES -- the animation runs"
+            : "the computed value NEVER CHANGES -- the animation is not running");
+    }
+  };
+  setTimeout(sample, 150);
+</script>

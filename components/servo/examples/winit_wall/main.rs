@@ -28,9 +28,9 @@ use euclid::{Point2D, Scale, Size2D};
 use servo::wall_args::WallArgs;
 use servo::wall_layout::WallLayout;
 use servo::{
-    AllowOrDenyRequest, DeviceIntRect, Opts, PrefValue, Preferences, Servo, ServoBuilder,
-    ServoDelegate, ViewportDetails, WebView, WebViewBuilder, enumerate_display_topology,
-    spatial_order,
+    AllowOrDenyRequest, ConsoleLogLevel, DeviceIntRect, Opts, PrefValue, Preferences, Servo,
+    ServoBuilder, ServoDelegate, ViewportDetails, WebView, WebViewBuilder,
+    enumerate_display_topology, spatial_order,
 };
 use url::Url;
 use winit::application::ApplicationHandler;
@@ -608,6 +608,21 @@ impl ::servo::WebViewDelegate for AppState {
         //
         // `about_to_wait` now drives redraws from a clock, so a frame that has just been
         // built is simply what the next tick will draw.
+    }
+
+    /// Put the page's own `console` output in the log.
+    ///
+    /// ***Without this a page cannot report anything.*** The default delegate drops these,
+    /// so every probe page written for this shell was talking to nobody -- and a probe
+    /// that appears to say nothing is indistinguishable from a probe whose page never ran.
+    /// Cost this a whole diagnostic round on 2026-09-08.
+    fn show_console_message(&self, _: WebView, level: ConsoleLogLevel, message: String) {
+        match level {
+            ConsoleLogLevel::Error => log::error!("[page] {message}"),
+            // `warn!` for the rest deliberately: the wall launcher's RUST_LOG leads with
+            // `warn`, and a page that cannot be heard is the problem being fixed here.
+            _ => log::warn!("[page] {message}"),
+        }
     }
 }
 
