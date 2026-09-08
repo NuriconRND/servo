@@ -4,9 +4,9 @@
 
 use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::{VecDeque, hash_map::Entry};
+use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
-use std::panic::Location;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
@@ -58,9 +58,9 @@ use webrender_api::{
     self, BuiltDisplayList, BuiltDisplayListDescriptor, ColorF, DirtyRect, DisplayListPayload,
     DocumentId, DynamicProperties, Epoch as WebRenderEpoch, ExternalScrollId, FontInstanceFlags,
     FontInstanceKey, FontInstanceOptions, FontKey, FontVariation, ImageData, ImageDescriptor,
-    ImageKey,
-    NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding, ReferenceFrameKind,
-    RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId, TransformStyle,
+    ImageKey, NativeFontHandle, PipelineId as WebRenderPipelineId, PropertyBinding,
+    ReferenceFrameKind, RenderReasons, SampledScrollOffset, SpaceAndClipInfo, SpatialId,
+    TransformStyle,
 };
 use wr_malloc_size_of::MallocSizeOfOps;
 
@@ -400,7 +400,8 @@ pub(crate) struct Painter {
     /// 확정 동작이다. 이 조사의 **최종 fix 는 병합이 아니라 in-flight 합성 게이트**였고
     /// (2026-07-09 검증 완료, 45타일 63.7fps/스톨 0), 병합은 백로그 드레인을 빠르게 하는
     /// 보조로 남아 상시 켜져 있다. A/B 가 끝난 게이트를 남기면 죽은 분기가 쌓인다.
-    pending_video_frame_updates: RefCell<FxHashMap<ImageKey, (ImageDescriptor, SerializableImageData)>>,
+    pending_video_frame_updates:
+        RefCell<FxHashMap<ImageKey, (ImageDescriptor, SerializableImageData)>>,
 
     /// A [`WebContentAnimator`] used to manage web content-derived animations. Currently this only
     /// manages blinking caret animations.
@@ -421,7 +422,6 @@ pub(crate) struct Painter {
     // vacated 영역을 재도색하지 않음). 해법: SetPictureTileSize로 타일 크기를 실제로 바꿔
     // picture-cache 슬라이스를 통째로 destroy_surface/재생성(picture.rs:2320-2332)시켜 옛
     // 콘텐츠를 물리적으로 소멸시킨다.
-
     /// 리사이즈가 발생해 재구축을 기다리는 중(디바운스 진행 중).
     #[cfg(windows)]
     dcomp_resize_pending: Cell<bool>,
@@ -497,6 +497,57 @@ pub(crate) struct PainterInputs {
     /// `Paint::register_rendering_context` 가 채우지만, 스레드 경로는 컨텍스트가 그쪽에서
     /// 만들어지므로 그쪽에서 채울 수밖에 없다.
     pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
+}
+
+/// 이 스레드가 지금까지 쓴 CPU 시간(ms). 커널 + 사용자.
+///
+/// ★벽시계로 320ms 걸린 렌더가 CPU 를 15ms 밖에 쓰지 않았다면 그 스레드는 일한 것이
+/// 아니라 **기다린** 것이다★ — 드라이버 안에서 막혔거나, 기계가 포화라 스케줄을 못 받았거나.
+/// 반대로 CPU 도 300ms 를 썼다면 그건 실제로 한 일이다. 이 둘은 고칠 곳이 완전히 다른데,
+/// `render_ms` 만으로는 구분할 수 없다.
+///
+/// ★분해능은 스케줄러 틱(약 15.6ms)이다★ — `GetThreadTimes` 는 그 단위로만 올라간다.
+/// 그러니 한 자릿수 ms 를 비교하는 데 쓰면 안 되고, 수백 ms 짜리 정체가 일인지 대기인지를
+/// 가르는 데만 쓴다. 20ms 렌더에서 `cpu_ms=0.0` 은 "CPU 를 전혀 안 썼다"가 아니라
+/// "틱 하나를 못 채웠다"는 뜻이다.
+// 크레이트는 `unsafe` 를 금지한다. 여기서 한 번 여는 이유는 Win32 호출 하나뿐이고,
+// 인자가 전부 out 파라미터라 안전 조건이 함수 안에서 닫힌다.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn thread_cpu_ms() -> f64 {
+    use std::mem::zeroed;
+
+    use winapi::shared::minwindef::FILETIME;
+    use winapi::um::processthreadsapi::{GetCurrentThread, GetThreadTimes};
+
+    // Safety: 모두 out 파라미터이고, 핸들은 항상 유효한 의사 핸들이다.
+    unsafe {
+        let (mut creation, mut exit, mut kernel, mut user): (
+            FILETIME,
+            FILETIME,
+            FILETIME,
+            FILETIME,
+        ) = (zeroed(), zeroed(), zeroed(), zeroed());
+        if GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return 0.0;
+        }
+        let to_ns100 =
+            |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+        // FILETIME 의 단위는 100ns 다.
+        (to_ns100(kernel) + to_ns100(user)) as f64 / 10_000.0
+    }
+}
+
+#[cfg(not(windows))]
+fn thread_cpu_ms() -> f64 {
+    0.0
 }
 
 impl Painter {
@@ -646,8 +697,10 @@ impl Painter {
         #[cfg(not(windows))]
         let compositor_config = webrender::CompositorConfig::default();
         #[cfg(windows)]
-        let dcomp_native_active =
-            matches!(compositor_config, webrender::CompositorConfig::Native { .. });
+        let dcomp_native_active = matches!(
+            compositor_config,
+            webrender::CompositorConfig::Native { .. }
+        );
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
@@ -741,8 +794,11 @@ impl Painter {
         #[cfg(windows)]
         let (dcomp_tile_size_steady, dcomp_tile_size_alternate) = {
             use webrender_api::units::DeviceIntSize;
-            let steady_effective_default = steady_tile_size_override.unwrap_or(DeviceIntSize::new(1024, 512));
-            let alternate = if steady_effective_default.width == 512 && steady_effective_default.height == 512 {
+            let steady_effective_default =
+                steady_tile_size_override.unwrap_or(DeviceIntSize::new(1024, 512));
+            let alternate = if steady_effective_default.width == 512
+                && steady_effective_default.height == 512
+            {
                 DeviceIntSize::new(1024, 512)
             } else {
                 DeviceIntSize::new(512, 512)
@@ -902,10 +958,8 @@ impl Painter {
         let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
         // Skipping does not touch `last_paint_animation_push_at`, so the next turn tries
         // again as soon as the pipeline is free rather than waiting out another period.
-        let animated_property_frame = has_values &&
-            push_due &&
-            !someone_else_is_producing &&
-            !painter_busy;
+        let animated_property_frame =
+            has_values && push_due && !someone_else_is_producing && !painter_busy;
         if has_values && push_due && painter_busy && !someone_else_is_producing {
             self.paint_animation_skipped_busy
                 .set(self.paint_animation_skipped_busy.get() + 1);
@@ -1044,10 +1098,10 @@ impl Painter {
             let device_point = point.as_device_point(renderer.device_pixels_per_page_pixel());
             let render_point = renderer.render_point_from_viewport_point(device_point);
             let size = self.rendering_context.size2d();
-            render_point.x >= 0.0 &&
-                render_point.y >= 0.0 &&
-                render_point.x < size.width as f32 &&
-                render_point.y < size.height as f32
+            render_point.x >= 0.0
+                && render_point.y >= 0.0
+                && render_point.x < size.width as f32
+                && render_point.y < size.height as f32
         })
     }
 
@@ -1106,8 +1160,8 @@ impl Painter {
         self.webview_renderers
             .values()
             .filter_map(|webview_renderer| {
-                if webview_renderer.animating() &&
-                    PainterId::from(webview_renderer.id) == self.painter_id
+                if webview_renderer.animating()
+                    && PainterId::from(webview_renderer.id) == self.painter_id
                 {
                     let mut paint_side = false;
                     webview_renderer.for_each_connected_pipeline(&mut |pipeline_details| {
@@ -1296,6 +1350,7 @@ impl Painter {
         let local_frame_id = self.last_ready_local_frame_id.get();
         let wall_logical_frame_id = self.last_ready_wall_logical_frame_id.get();
         let render_start = Instant::now();
+        let render_cpu_start = thread_cpu_ms();
         if self.rendering_context.requested_gpu_index().is_some() {
             info!(
                 "Wall render start: painter {:?} render_count={} local_frame_id={:?} \
@@ -1416,6 +1471,7 @@ impl Painter {
         self.send_pending_paint_metrics_messages_after_composite();
 
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+        let render_cpu_ms = thread_cpu_ms() - render_cpu_start;
         // This render pass consumed every frame published so far (renderer.update() above
         // drained the whole publish queue), so the in-flight display composite is done.
         self.set_display_composite_in_flight(false);
@@ -1437,9 +1493,7 @@ impl Painter {
                     )
                 });
             info!(
-                "Slow paint frame: painter {:?} total_ms={:.2} \
-                 angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} \
-                 upload_mb={:.1} upload_ms={:.1} draw_calls={} pending_frames={}",
+                "Slow paint frame: painter {:?} total_ms={:.2} angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} cpu_ms={:.1} pending_frames={}",
                 self.painter_id,
                 render_ms,
                 angle_lock_ms,
@@ -1448,6 +1502,7 @@ impl Painter {
                 upload_mb,
                 upload_ms,
                 draw_calls,
+                render_cpu_ms,
                 self.pending_frames.get(),
             );
         }
@@ -2132,9 +2187,9 @@ impl Painter {
     /// 비용이 너무 크다).
     #[cfg(windows)]
     fn tick_dcomp_resize_rebuild(&self) {
-        if !self.dcomp_native_active ||
-            !self.dcomp_resize_pending.get() ||
-            *DCOMP_RESIZE_REBUILD_DISABLED
+        if !self.dcomp_native_active
+            || !self.dcomp_resize_pending.get()
+            || *DCOMP_RESIZE_REBUILD_DISABLED
         {
             return;
         }
@@ -2255,7 +2310,8 @@ impl Painter {
                 }
             }
             self.present_cadence_last.set(Some(now));
-            self.present_cadence_count.set(self.present_cadence_count.get() + 1);
+            self.present_cadence_count
+                .set(self.present_cadence_count.get() + 1);
             let start = self.present_cadence_start.get().unwrap_or_else(|| {
                 self.present_cadence_start.set(Some(now));
                 now
@@ -3115,7 +3171,11 @@ impl Painter {
                 info!(
                     "[dcomp-native] runtime resize started; virtual-only mode {} + start-rebuild \
                      via SetPictureTileSize={}x{} (purges pre-drag ghosts{}) — task-12b",
-                    if virtual_mode { "ON" } else { "OFF (RESIZE_VIRTUAL disabled)" },
+                    if virtual_mode {
+                        "ON"
+                    } else {
+                        "OFF (RESIZE_VIRTUAL disabled)"
+                    },
                     next.width,
                     next.height,
                     if virtual_mode {
