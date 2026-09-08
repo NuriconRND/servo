@@ -1656,7 +1656,12 @@ impl Renderer {
         // 드로/합성 경로이고, 그것을 여기서 쪼갠다.
         let wall_t0 = std::time::Instant::now();
         let mut wall_prepare_gpu_cache_ms = 0.0_f64;
+        let mut wall_pre_draw_ms = 0.0_f64;
         let mut wall_draw_frame_ms = 0.0_f64;
+        let mut wall_texture_cache_ms = 0.0_f64;
+        let mut wall_native_surfaces_ms = 0.0_f64;
+        let mut wall_compositor_begin_ms = 0.0_f64;
+        let mut wall_debug_overlay_ms = 0.0_f64;
 
         if let Some(device_size) = device_size {
             self.update_gpu_profile(device_size);
@@ -1672,8 +1677,12 @@ impl Renderer {
             self.set_blend(false, FramebufferKind::Main);
             //self.update_shaders();
 
+            let wall_s = std::time::Instant::now();
             self.update_texture_cache();
+            wall_texture_cache_ms = wall_s.elapsed().as_secs_f64() * 1000.0;
+            let wall_s = std::time::Instant::now();
             self.update_native_surfaces();
+            wall_native_surfaces_ms = wall_s.elapsed().as_secs_f64() * 1000.0;
 
             frame_id
         };
@@ -1690,12 +1699,16 @@ impl Renderer {
             // we can create debug overlays after drawing the main surfaces.
             if let CompositorKind::Native { .. } = self.current_compositor_kind {
                 let compositor = self.compositor_config.compositor().unwrap();
+                let wall_s = std::time::Instant::now();
                 compositor.begin_frame(&mut self.device);
+                wall_compositor_begin_ms = wall_s.elapsed().as_secs_f64() * 1000.0;
             }
 
             // Update the state of the debug overlay surface, ensuring that
             // the compositor mode has a suitable surface to draw to, if required.
+            let wall_s = std::time::Instant::now();
             self.update_debug_overlay(device_size, !active_doc.frame.debug_items.is_empty());
+            wall_debug_overlay_ms = wall_s.elapsed().as_secs_f64() * 1000.0;
         }
 
         let frame = &mut active_doc.frame;
@@ -1707,13 +1720,18 @@ impl Renderer {
                     "Cleared texture cache without sending new document frame.");
         }
 
-        match self.prepare_gpu_cache(&frame.deferred_resolves) {
+        // ★여기서 외부 이미지의 deferred resolve 가 풀린다★ — 벽에서는 비디오 프레임의
+        // D3D11 서피스를 잠그고 가져오는 자리다. 영상이 많을수록 이 횟수가 늘어난다.
+        wall_pre_draw_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
+        let wall_s = std::time::Instant::now();
+        let wall_gpu_cache_result = self.prepare_gpu_cache(&frame.deferred_resolves);
+        wall_prepare_gpu_cache_ms = wall_s.elapsed().as_secs_f64() * 1000.0;
+        match wall_gpu_cache_result {
             Ok(..) => {
                 assert!(frame.gpu_cache_frame_id <= self.gpu_cache_frame_id,
                     "Received frame depends on a later GPU cache epoch ({:?}) than one we received last via `UpdateGpuCache` ({:?})",
                     frame.gpu_cache_frame_id, self.gpu_cache_frame_id);
 
-                wall_prepare_gpu_cache_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
                 let wall_draw_start = std::time::Instant::now();
                 self.draw_frame(
                     frame,
@@ -1770,10 +1788,15 @@ impl Renderer {
         if t > *WR_SLOW_MS {
             let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
             log::warn!(
-                "WRSLOW renderer_ms={:.1} prepare_gpu_cache_ms={:.1} draw_frame_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
+                "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} gpu_cache_resolve_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
                 t,
+                wall_pre_draw_ms,
                 wall_prepare_gpu_cache_ms,
                 wall_draw_frame_ms,
+                wall_texture_cache_ms,
+                wall_native_surfaces_ms,
+                wall_compositor_begin_ms,
+                wall_debug_overlay_ms,
                 get(profiler::SHADER_BUILD_TIME),
                 get(profiler::TEXTURE_CACHE_UPDATE_TIME),
                 get(profiler::CPU_TEXTURE_ALLOCATION_TIME),
