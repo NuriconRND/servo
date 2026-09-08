@@ -287,6 +287,14 @@ impl PipelineAnimations {
         !animations.is_empty()
     }
 
+    /// Whether this pipeline has anything the paint thread is playing on its own.
+    ///
+    /// Used to decide how often script still needs to be asked to tick the animation: see
+    /// [`AnimationRefreshDriverObserver::frame_started`].
+    pub(crate) fn has_paint_animations(&self) -> bool {
+        !self.paint.borrow().is_empty()
+    }
+
     /// Replace what this pipeline is playing with what the new display list says.
     ///
     /// ***Wholesale replacement is the correctness argument.*** Layout samples forward

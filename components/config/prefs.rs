@@ -461,6 +461,21 @@ pub struct Preferences {
     /// `SCRIPTBUSY` if this is raised a lot.
     pub gfx_paint_side_animation_horizon_ms: i64,
 
+    /// Ask script for an animation tick once every N display frames, for animations the
+    /// paint thread is already playing itself.
+    ///
+    /// ***A tick is a full rendering update, and a rendering update reflows the whole
+    /// document.*** When the paint thread has the animation, the value on screen between
+    /// ticks comes from its prediction, so ticks are only needed often enough to rebase
+    /// that prediction and to fire the animation's own events. Measured on the 4-GPU wall,
+    /// 2026-09-08 (log_ani_perf/13): 122 reflows a second with an animation running
+    /// against 54 without, and during a content switch one reflow there costs 14.5 ms --
+    /// which is what stopped the wall from drawing at all for two seconds.
+    ///
+    /// 1 restores a tick every frame. Animations the paint thread is not playing always
+    /// tick every frame, whatever this says.
+    pub gfx_paint_side_animation_tick_divisor: i64,
+
     pub gfx_wall_parallel_tiles: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
@@ -975,6 +990,7 @@ impl Preferences {
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
+            gfx_paint_side_animation_tick_divisor: 4,
             gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,

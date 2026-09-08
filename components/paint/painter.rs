@@ -1102,14 +1102,18 @@ impl Painter {
     /// The tiles of one wall frame are one tick, and the painter that owns the `WebView`
     /// is the one that speaks for it. Every other painter stays quiet, and a shell with a
     /// single painter is unaffected because it owns everything it paints.
-    pub(crate) fn animating_webviews(&self) -> Vec<WebViewId> {
+    pub(crate) fn animating_webviews(&self) -> Vec<(WebViewId, bool)> {
         self.webview_renderers
             .values()
             .filter_map(|webview_renderer| {
                 if webview_renderer.animating() &&
                     PainterId::from(webview_renderer.id) == self.painter_id
                 {
-                    Some(webview_renderer.id)
+                    let mut paint_side = false;
+                    webview_renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                        paint_side |= pipeline_details.animations.has_paint_animations();
+                    });
+                    Some((webview_renderer.id, paint_side))
                 } else {
                     None
                 }

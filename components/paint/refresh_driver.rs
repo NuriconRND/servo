@@ -12,7 +12,7 @@ use std::time::Duration;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use embedder_traits::{EventLoopWaker, RefreshDriver};
 use log::warn;
-use servo_base::id::PainterId;
+use servo_base::id::{PainterId, WebViewId};
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use timers::{BoxedTimerCallback, TimerEventRequest, TimerScheduler};
 
@@ -119,6 +119,10 @@ pub(crate) struct AnimationRefreshDriverObserver {
     /// Which painter this observer belongs to, so only the one that owns a `WebView`
     /// speaks for it. See [`Painter::animating_webviews`].
     painter_id: PainterId,
+
+    /// Frames this observer has seen, used to thin out ticks for animations the paint
+    /// thread is playing itself.
+    frames_observed: Cell<u64>,
 }
 
 impl AnimationRefreshDriverObserver {
@@ -130,6 +134,7 @@ impl AnimationRefreshDriverObserver {
             constellation_sender,
             animating: Default::default(),
             painter_id,
+            frames_observed: Default::default(),
         }
     }
 
@@ -204,11 +209,37 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
             self.animating.set(false);
             return false;
         }
+        // ***A `WebView` whose animation the paint thread is already playing does not need
+        // script to recompute the page every frame.*** The value on screen comes from the
+        // paint-side prediction between ticks, so a tick is only needed often enough to
+        // rebase that prediction and to fire the animation's own events. Every tick that
+        // is not needed costs a rendering update, and a rendering update reflows the whole
+        // document: measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/13), 122 reflows
+        // a second with an animation running against 54 without, and during a content
+        // switch a single reflow there costs 14.5 ms.
+        //
+        // Ticks for anything the paint thread is *not* playing keep the frame rate, since
+        // slowing those would genuinely slow the animation.
+        let divisor = servo_config::pref!(gfx_paint_side_animation_tick_divisor).max(1) as u64;
+        let frame = self.frames_observed.get().wrapping_add(1);
+        self.frames_observed.set(frame);
+        let due_for_paint_driven = divisor == 1 || frame % divisor == 0;
+        let webviews_to_tick: Vec<WebViewId> = animating_webviews
+            .into_iter()
+            .filter(|(_, paint_driven)| !*paint_driven || due_for_paint_driven)
+            .map(|(webview_id, _)| webview_id)
+            .collect();
+        if webviews_to_tick.is_empty() {
+            // Still observing: the next frame may be the one that ticks.
+            self.animating.set(true);
+            return true;
+        }
+
         // Request new animation frames from all animating WebViews.
         if let Err(error) =
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::TickAnimation(
-                    animating_webviews,
+                    webviews_to_tick,
                 ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");
