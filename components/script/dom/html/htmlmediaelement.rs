@@ -3622,9 +3622,24 @@ impl HTMLMediaElement {
             {
                 self.queue_media_element_task_to_fire_event(atom!("resize"));
             } else {
-                // If the natural dimensions have not been changed, the node should be marked as
-                // damaged to force a repaint with the new frame contents.
-                self.upcast::<Node>().dirty(NodeDamage::Other);
+                // If the natural dimensions have not been changed, the node should be
+                // marked as damaged to force a repaint with the new frame contents.
+                //
+                // ***`Style`, not `Other`, because only the picture changed.*** `Other`
+                // means `RestyleDamage::reconstruct()` plus marking the ancestor chain as
+                // having dirty descendants -- it asks for this element's box tree to be
+                // rebuilt. Nothing about the box changed here: this branch runs only when
+                // the natural dimensions came back unchanged, so the frame is the same
+                // size in the same place and just holds different pixels.
+                //
+                // The cost was the dominant one on the wall. Measured 2026-09-08
+                // (log_ani_perf/16), 54 videos at 30fps: `restyle:pending` fired 1550-1650
+                // times a second -- one per frame -- which kept the document dirty for
+                // restyle at all times, so every rendering opportunity rebuilt the whole
+                // document's display list: 49 a second, at 17.7 ms each during a content
+                // switch. That is 800 ms of every second, and while it ran the wall drew
+                // nothing at all.
+                self.upcast::<Node>().dirty(NodeDamage::Style);
             }
         }
     }
