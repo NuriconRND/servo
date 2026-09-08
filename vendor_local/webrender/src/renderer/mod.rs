@@ -1651,6 +1651,12 @@ impl Renderer {
         // render pass logic in tiled / mobile GPUs, resulting in an extra copy /
         // resolve step when the debug overlay is enabled.
         self.texture_resolver.begin_frame();
+        // servo wall: 아래 두 블록을 각각 잰다. 느린 프레임에서 WebRender 자체 타이머는
+        // 전부 0이었다(셰이더·텍스처 캐시·할당·업로드). 남은 것은 타이머가 없는
+        // 드로/합성 경로이고, 그것을 여기서 쪼갠다.
+        let wall_t0 = std::time::Instant::now();
+        let mut wall_prepare_gpu_cache_ms = 0.0_f64;
+        let mut wall_draw_frame_ms = 0.0_f64;
 
         if let Some(device_size) = device_size {
             self.update_gpu_profile(device_size);
@@ -1707,12 +1713,15 @@ impl Renderer {
                     "Received frame depends on a later GPU cache epoch ({:?}) than one we received last via `UpdateGpuCache` ({:?})",
                     frame.gpu_cache_frame_id, self.gpu_cache_frame_id);
 
+                wall_prepare_gpu_cache_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
+                let wall_draw_start = std::time::Instant::now();
                 self.draw_frame(
                     frame,
                     device_size,
                     buffer_age,
                     &mut results,
                 );
+                wall_draw_frame_ms = wall_draw_start.elapsed().as_secs_f64() * 1000.0;
 
                 // TODO(nical): do this automatically by selecting counters in the wr profiler
                 // Profile marker for the number of invalidated picture cache
@@ -1761,8 +1770,10 @@ impl Renderer {
         if t > *WR_SLOW_MS {
             let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
             log::warn!(
-                "WRSLOW renderer_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
+                "WRSLOW renderer_ms={:.1} prepare_gpu_cache_ms={:.1} draw_frame_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
                 t,
+                wall_prepare_gpu_cache_ms,
+                wall_draw_frame_ms,
                 get(profiler::SHADER_BUILD_TIME),
                 get(profiler::TEXTURE_CACHE_UPDATE_TIME),
                 get(profiler::CPU_TEXTURE_ALLOCATION_TIME),
