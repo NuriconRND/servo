@@ -143,7 +143,7 @@ use crate::dom::types::DebuggerGlobalScope;
 use crate::dom::webgl::webglrenderingcontext::report_live_contexts as report_live_webgl_contexts;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
-use crate::dom::window::Window;
+use crate::dom::window::{Window, take_reflow_stats};
 use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
 use crate::dom::worklet::WorkletThreadPool;
 use crate::dom::workletglobalscope::WorkletGlobalScopeInit;
@@ -182,6 +182,9 @@ struct TaskWindow {
     busy: Duration,
     longest: Duration,
     longest_category: Option<ScriptThreadEventCategory>,
+    display_reflows: u32,
+    query_reflows: u32,
+    reflow_time: Duration,
 }
 
 /// A task at or above this runs a `SCRIPTTASK` line. `SERVO_SCRIPT_SLOW_TASK_MS` moves it;
@@ -1228,13 +1231,17 @@ impl ScriptThread {
     /// feeding it. Pair it with the launcher's `-ThreadCpu`, which separates a task that is
     /// computing from one that is blocked waiting.
     fn note_task_duration(category: ScriptThreadEventCategory, duration: Duration) {
+        let (display_reflows, query_reflows, reflow_time) = take_reflow_stats();
         if let Some(threshold) = slow_task_threshold()
             && duration >= threshold
         {
             warn!(
-                "SCRIPTTASK slow: category={:?} ms={:.1}",
+                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={}                  reflow_ms={:.1}",
                 category,
-                duration.as_secs_f64() * 1000.0
+                duration.as_secs_f64() * 1000.0,
+                display_reflows,
+                query_reflows,
+                reflow_time.as_secs_f64() * 1000.0,
             );
         }
         let now = Instant::now();
@@ -1243,6 +1250,9 @@ impl ScriptThread {
             let started = *window.started.get_or_insert(now);
             window.tasks += 1;
             window.busy += duration;
+            window.display_reflows += display_reflows;
+            window.query_reflows += query_reflows;
+            window.reflow_time += reflow_time;
             if duration > window.longest {
                 window.longest = duration;
                 window.longest_category = Some(category);
@@ -1253,12 +1263,15 @@ impl ScriptThread {
             // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
             // diagnostic nobody can see is a diagnostic that does not exist.
             warn!(
-                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?}",
+                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1}                  longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1}",
                 now.duration_since(started).as_secs_f64() * 1000.0,
                 window.tasks,
                 window.busy.as_secs_f64() * 1000.0,
                 window.longest.as_secs_f64() * 1000.0,
                 window.longest_category,
+                window.display_reflows,
+                window.query_reflows,
+                window.reflow_time.as_secs_f64() * 1000.0,
             );
             *window = TaskWindow {
                 started: Some(now),

@@ -481,6 +481,54 @@ pub(crate) struct Window {
     devtools_wants_updates: Cell<bool>,
 }
 
+thread_local! {
+    /// Reflows performed by the task currently running on this thread, split by whether
+    /// script asked for the answer or the rendering did.
+    static REFLOW_STATS: Cell<(u32, u32, Duration)> = const { Cell::new((0, 0, Duration::ZERO)) };
+}
+
+/// Charge one reflow to the running task, however the reflow returns.
+struct ReflowTiming {
+    started: Instant,
+    for_display: bool,
+}
+
+impl ReflowTiming {
+    fn start(goal: &ReflowGoal) -> Self {
+        Self {
+            started: Instant::now(),
+            for_display: matches!(goal, ReflowGoal::UpdateTheRendering),
+        }
+    }
+}
+
+impl Drop for ReflowTiming {
+    fn drop(&mut self) {
+        REFLOW_STATS.with(|stats| {
+            let (display, query, elapsed) = stats.get();
+            let elapsed = elapsed + self.started.elapsed();
+            stats.set(if self.for_display {
+                (display + 1, query, elapsed)
+            } else {
+                (display, query + 1, elapsed)
+            });
+        });
+    }
+}
+
+/// Take what has accumulated since the last call: `(display, query, total time)`.
+///
+/// ***The `query` count is the one that decides who owns a slow task.*** A reflow for
+/// display happens once per rendering update by design. A reflow for a query happens
+/// because script read a layout value -- `offsetWidth`, `getBoundingClientRect` -- and had
+/// to be answered right then. Dozens of those inside one task is a page measuring in a
+/// loop it also mutates, which is quadratic in the number of elements and is fixed in the
+/// page. One of them, taking most of the task, is a single layout that is simply large,
+/// and that is ours.
+pub(crate) fn take_reflow_stats() -> (u32, u32, Duration) {
+    REFLOW_STATS.with(|stats| stats.replace((0, 0, Duration::ZERO)))
+}
+
 impl Window {
     pub(crate) fn script_thread(&self) -> Rc<ScriptThread> {
         Weak::upgrade(&self.weak_script_thread)
@@ -2633,6 +2681,8 @@ impl Window {
         cx: &mut JSContext,
         reflow_goal: ReflowGoal,
     ) -> (ReflowPhasesRun, ReflowStatistics) {
+        // Counted from here on: everything above returns without laying anything out.
+        let _reflow_timing = ReflowTiming::start(&reflow_goal);
         let document = self.Document();
 
         // Never reflow inactive Documents.
