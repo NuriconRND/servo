@@ -235,6 +235,10 @@ impl DisplayListBuilder<'_> {
         animations: &DocumentAnimationSet,
         animation_timeline_value: f64,
     ) -> BuiltDisplayList {
+        // Read before the mutable borrow of `paint_info` below.
+        let tree_phase_paint_animations = stacking_context_tree.tree_phase_paint_animations;
+        let tree_animation_timeline_value = stacking_context_tree.animation_timeline_value;
+
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
         let pipeline_id = paint_info.pipeline_id;
@@ -278,10 +282,26 @@ impl DisplayListBuilder<'_> {
 
         // Clear any caret color from previous display list constructions.
         builder.paint_info.caret_property_binding = None;
-        // ...and the paint-side animations, for the same reason: this info is reused
-        // across builds, and an animation left behind would be re-sent every frame with a
-        // stale zero point, so it would replay from the beginning forever.
-        builder.paint_info.paint_animations.clear();
+        // ...and this phase's own paint-side animations, for the same reason: this info is
+        // reused across builds, and one left behind would be re-sent every frame.
+        //
+        // ***Truncate, not clear.*** The entries below `tree_phase_paint_animations` were
+        // produced while building the stacking context tree -- every animated reference
+        // frame transform -- and clearing threw all of them away. Measured on the 4-GPU
+        // wall, 2026-09-08 (log_ani_perf/10): 168 transform bindings created, `built
+        // animations=0` shipped, and the application's transitions never moved.
+        builder
+            .paint_info
+            .paint_animations
+            .truncate(tree_phase_paint_animations);
+        // The tree can outlive several display lists, so its animations were sampled at a
+        // timeline value that is now in the past. Say how far, or the paint thread would
+        // replay them from the beginning every time the tree is reused.
+        for animation in builder.paint_info.paint_animations.iter_mut() {
+            animation.offset_from_display_list = tree_animation_timeline_value
+                .min(animation_timeline_value) -
+                animation_timeline_value;
+        }
 
         builder.add_all_spatial_nodes();
 

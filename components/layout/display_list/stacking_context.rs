@@ -120,7 +120,17 @@ pub(crate) struct StackingContextTree {
     /// at, so a reference frame whose transform is animating can be pushed as a binding
     /// the paint thread can move on its own. See [`paint_animation`].
     animations: DocumentAnimationSet,
-    animation_timeline_value: f64,
+    pub animation_timeline_value: f64,
+    /// How many [`PaintAnimation`]s this phase put in `paint_info`.
+    ///
+    /// ***The display list phase must not clear what this phase produced.*** Reference
+    /// frame transforms are bound here, during tree construction; opacity is bound later,
+    /// while building the WebRender display list. That later phase has to start from a
+    /// clean slate for its own entries, and clearing the whole list took the transforms
+    /// with it -- measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/10): 168 transform
+    /// bindings made and `built animations=0` shipped. Truncating to this count keeps
+    /// them.
+    pub tree_phase_paint_animations: usize,
 }
 
 impl StackingContextTree {
@@ -189,6 +199,7 @@ impl StackingContextTree {
             clip_store: Default::default(),
             animations,
             animation_timeline_value,
+            tree_phase_paint_animations: 0,
         };
 
         let text_decorations = Default::default();
@@ -207,6 +218,8 @@ impl StackingContextTree {
 
         root_stacking_context.sort();
         stacking_context_tree.root_stacking_context = root_stacking_context;
+        stacking_context_tree.tree_phase_paint_animations =
+            stacking_context_tree.paint_info.paint_animations.len();
 
         if debug.is_enabled(DiagnosticsLoggingOption::StackingContextTree) {
             stacking_context_tree

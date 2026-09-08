@@ -36,7 +36,6 @@
     flex: 1 1 auto;
     border-radius: 1vh;
     background: linear-gradient(90deg, #2bd6a4, #4a9dff 45%, #b06bff);
-    animation: fade var(--period, 1200ms) linear infinite alternate;
   }
   @keyframes fade {
     from { opacity: 0.12; }
@@ -70,7 +69,25 @@
   const blockMs = Number(params.get("block") || 1000);
   const gapMs = Number(params.get("gap") || 2000);
   const periodMs = Number(params.get("period") || 1200);
-  document.getElementById("fade").style.setProperty("--period", periodMs + "ms");
+  // `once` (the default) restarts a one-shot animation from script, which is the shape the
+  // wall application uses. `alternate` runs one infinite alternating animation instead --
+  // useful only to exercise a known limit: the style system clamps a sampled value to the
+  // CURRENT iteration, so a prediction can never cross an iteration boundary and a block
+  // longer than the remainder of the iteration will still show a pause.
+  const mode = params.get("anim") || "once";
+  const fade = document.getElementById("fade");
+  if (mode === "alternate") {
+    fade.style.animation = `fade ${periodMs}ms linear infinite alternate`;
+  } else {
+    const restart = () => {
+      fade.style.animation = "none";
+      // Force the style to take effect before re-applying, or the restart is coalesced away.
+      void fade.offsetWidth;
+      fade.style.animation = `fade ${periodMs}ms linear 1 normal forwards`;
+      setTimeout(restart, periodMs + 120);
+    };
+    restart();
+  }
 
   const framesEl = document.getElementById("frames");
   const gapEl = document.getElementById("gap");
