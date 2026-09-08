@@ -933,11 +933,11 @@ impl MediaExternalImages {
         let Some(device) = self.device else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
-        D3d11PlaneRings::note_demand(binding.group_id, device);
-
+        // 수요 표시와 링 찾기를 레지스트리 획득 **한 번**으로 끝낸다(전역 뮤텍스 경합).
+        //
         // 이 디바이스에 아직 링이 없다(첫 수요). 프로듀서가 다음 프레임에 만든다 —
         // 이번 프레임만 비운다. lock_count 를 올리지 않았으므로 unlock 도 no-op 이다.
-        let Some(ring_id) = D3d11PlaneRings::ring_for(binding.group_id, device) else {
+        let Some(ring_id) = D3d11PlaneRings::note_demand_and_ring(binding.group_id, device) else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
 
@@ -960,7 +960,15 @@ impl MediaExternalImages {
         // 합성당 1회 소비: 링별 lock_count 0→1 전이에서만 plan이 나온다.
         // Some(plan)은 반드시 정확히 한 번 commit_consume으로 끝나야 한다
         // (consume_plan이 모든 실패 분기 포함 이를 보장한다).
-        if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(ring_id) {
+        //
+        // ★계획이 없으면 같은 획득에서 plane 까지 받아 온다★ — 계획이 없다는 것은 이번
+        // lock 이 링을 돌리지 않는다는 뜻이고(같은 프레임의 나머지 면이거나 새 영상
+        // 프레임이 아직 없거나), 그게 흔한 경우다. 계획이 있으면 D3D11 작업을 자물쇠
+        // **밖에서** 끝낸 뒤 다시 집는다 — Map 을 자물쇠 안에서 하면 수 ms 를 쥐게 되어
+        // 지금 고치려는 그 경합이 된다.
+        let (plan, plane_without_consume) =
+            D3d11PlaneRings::plan_or_presenting_plane(ring_id, binding.plane_index);
+        if let Some(plan) = plan {
             LAST_CONSUME_SHAPE.with(|shape| shape.borrow_mut().clear());
             let consume_start = std::time::Instant::now();
             consume_plan(&*rc, ring_id, plan);
@@ -968,8 +976,12 @@ impl MediaExternalImages {
         }
 
         // lock 반환용 텍스처: 현재 Presenting 슬롯의 이 plane 기술자.
-        let Some(plane) = D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index) else {
-            return (ExternalImageSource::Invalid, Size2D::zero());
+        let plane = match plane_without_consume {
+            Some(plane) => plane,
+            None => match D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index) {
+                Some(plane) => plane,
+                None => return (ExternalImageSource::Invalid, Size2D::zero()),
+            },
         };
 
         // EGLImage 래핑 캐시(텍스처 usize 키). 정상 상태에서 프레임당 재래핑 0.

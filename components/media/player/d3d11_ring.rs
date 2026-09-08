@@ -495,8 +495,9 @@ impl D3d11PlaneRings {
     /// 무관하게 [`commit_consume`](Self::commit_consume)을 정확히 한 번
     /// 호출해야 한다 — 건너뛰면 그 슬롯이 영구히 claim 불가능해진다
     /// (링이 실질적으로 축소됨, "wedge").
-    pub fn note_plane_lock_and_plan(ring_id: u64) -> Option<ConsumePlan> {
-        let mut reg = lock(registry());
+    /// [`note_plane_lock_and_plan`](Self::note_plane_lock_and_plan) 의 본체. 이미 잠긴
+    /// 레지스트리 위에서 돈다 — 합친 진입점이 자물쇠를 두 번 잡지 않도록.
+    fn plan_locked(reg: &mut Registry, ring_id: u64) -> Option<ConsumePlan> {
         let ring = reg.rings.get_mut(&ring_id)?;
         ring.lock_count += 1;
         if ring.lock_count != 1 {
@@ -539,6 +540,11 @@ impl D3d11PlaneRings {
             map,
             filled_slot,
         })
+    }
+
+    pub fn note_plane_lock_and_plan(ring_id: u64) -> Option<ConsumePlan> {
+        let mut reg = lock(registry());
+        Self::plan_locked(&mut reg, ring_id)
     }
 
     /// plane unlock을 알린다(lock_count 감소). WR이 lock한 plane 개수만큼
@@ -805,6 +811,46 @@ impl D3d11PlaneRings {
 
     /// ★가시성 신호★ — 소비자가 `device` 에서 이 그룹을 합성하려 한다는 기록.
     /// 프레임마다 호출해도 싸다(HashMap 갱신 1회).
+    /// 수요 표시와 링 찾기를 **한 번의 획득으로** 끝낸다.
+    ///
+    /// ★레지스트리는 전역 뮤텍스 하나다★ — 실측(로그 39, 전환 구간)에서 스레드들이 1초
+    /// 동안 합쳐 **7.7초**를 이 자물쇠 앞에서 기다렸다. 획득 수는 오히려 평상시가 4배
+    /// 많은데(초당 78,546회) 대기는 160배 적다. 전형적인 경합이고, 프로듀서 수십 개가
+    /// 동시에 막히므로 CPU 도 같이 탄다. 그 획득의 대부분이 소비자이고, 소비자 lock
+    /// 한 번이 이 자물쇠를 네 번 잡았다.
+    pub fn note_demand_and_ring(group_id: u64, device: usize) -> Option<u64> {
+        let mut reg = lock(registry());
+        let group = reg.groups.get_mut(&group_id)?;
+        group.demand.insert(device, Instant::now());
+        group.rings.get(&device).copied()
+    }
+
+    /// 소비 계획을 뽑되, **계획이 없으면** 그 자리에서 현재 Presenting plane 까지 집어 온다.
+    ///
+    /// 계획이 없다는 것은 이번 lock 이 링을 돌리지 않는다는 뜻이고(같은 프레임의 나머지
+    /// 면이거나, 새 영상 프레임이 아직 없거나), 그때는 곧바로 plane 이 필요하다. 흔한
+    /// 경우이므로 여기서 한 번에 끝내면 자물쇠 획득이 한 번 줄어든다.
+    ///
+    /// 계획이 있으면 plane 은 돌려주지 않는다 — 호출자가 D3D11 작업을 **자물쇠 밖에서**
+    /// 끝낸 뒤 [`presenting_plane`](Self::presenting_plane) 으로 다시 집어야 한다. Map 을
+    /// 자물쇠 안에서 하면 수 ms 를 쥐고 있게 되어, 지금 고치려는 바로 그 경합이 된다.
+    pub fn plan_or_presenting_plane(
+        ring_id: u64,
+        plane: usize,
+    ) -> (Option<ConsumePlan>, Option<PlaneDesc>) {
+        let mut reg = lock(registry());
+        let plan = Self::plan_locked(&mut reg, ring_id);
+        if plan.is_some() {
+            return (plan, None);
+        }
+        let plane = reg
+            .rings
+            .get(&ring_id)
+            .and_then(|ring| ring.presenting_slot.map(|idx| (ring, idx)))
+            .and_then(|(ring, idx)| ring.slots[idx].planes.get(plane).copied().flatten());
+        (None, plane)
+    }
+
     pub fn note_demand(group_id: u64, device: usize) {
         let mut reg = lock(registry());
         if let Some(group) = reg.groups.get_mut(&group_id) {
@@ -935,6 +981,53 @@ mod tests {
     }
 
     /// 수요가 있는 디바이스만 프로듀서 대상이 된다(= 그 타일에 보이는 것만 업로드).
+    /// 합친 진입점은 예전 두 호출과 같은 것을 돌려준다: 수요가 기록되고, 링을 찾는다.
+    #[test]
+    fn combined_demand_and_ring_matches_the_old_pair() {
+        const DEV: usize = 0x5A_0000;
+        let ttl = Duration::from_secs(60);
+        let group = D3d11PlaneRings::create_group();
+        // 링이 붙기 전에는 None 이지만 수요는 기록된다 — 그래야 프로듀서가 만든다.
+        assert_eq!(D3d11PlaneRings::note_demand_and_ring(group, DEV), None);
+        assert_eq!(D3d11PlaneRings::demanded_devices(group, ttl), vec![DEV]);
+
+        let ring = D3d11PlaneRings::create_ring(DEV, 2, slots_of(0x51_0000));
+        D3d11PlaneRings::attach_ring(group, DEV, ring);
+        assert_eq!(
+            D3d11PlaneRings::note_demand_and_ring(group, DEV),
+            Some(ring)
+        );
+
+        D3d11PlaneRings::remove_group(group);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
+    }
+
+    /// 계획이 나올 때는 plane 을 함께 주지 않는다 — 호출자가 D3D11 작업을 자물쇠 밖에서
+    /// 끝낸 **뒤에** 집어야 하기 때문이다. 계획이 없을 때만 그 자리에서 준다.
+    #[test]
+    fn plane_comes_with_the_lock_only_when_nothing_rotates() {
+        const DEV: usize = 0x5B_0000;
+        let ring = D3d11PlaneRings::create_ring(DEV, 2, slots_of(0x52_0000));
+
+        // 첫 소비: 최초 Map 계획이 나오고, plane 은 아직 주지 않는다.
+        let (plan, plane) = D3d11PlaneRings::plan_or_presenting_plane(ring, 0);
+        assert!(matches!(plan, Some(ConsumePlan::InitialMapAll { .. })));
+        assert!(plane.is_none());
+        D3d11PlaneRings::commit_consume(ring, ConsumeCommit::InitialMapAll { mapped: Vec::new() });
+
+        // 같은 합성의 나머지 면: lock_count 가 이미 1 이라 계획이 없고, plane 이 바로 온다.
+        let (plan, plane) = D3d11PlaneRings::plan_or_presenting_plane(ring, 1);
+        assert!(plan.is_none());
+        assert!(plane.is_some());
+
+        // 짝 맞추기: 이 테스트가 건 lock 두 번을 되돌린다.
+        D3d11PlaneRings::note_plane_unlock(ring);
+        D3d11PlaneRings::note_plane_unlock(ring);
+
+        D3d11PlaneRings::remove_ring(ring);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
+    }
+
     #[test]
     fn only_demanded_devices_are_upload_targets() {
         const DEV_A: usize = 0x2A_0000;
