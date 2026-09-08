@@ -12,6 +12,7 @@ use std::time::Duration;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use embedder_traits::{EventLoopWaker, RefreshDriver};
 use log::warn;
+use servo_base::id::PainterId;
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use timers::{BoxedTimerCallback, TimerEventRequest, TimerScheduler};
 
@@ -114,13 +115,21 @@ pub(crate) struct AnimationRefreshDriverObserver {
 
     /// Whether or not we are currently animating via a timer.
     pub(crate) animating: Cell<bool>,
+
+    /// Which painter this observer belongs to, so only the one that owns a `WebView`
+    /// speaks for it. See [`Painter::animating_webviews`].
+    painter_id: PainterId,
 }
 
 impl AnimationRefreshDriverObserver {
-    pub(crate) fn new(constellation_sender: Sender<EmbedderToConstellationMessage>) -> Self {
+    pub(crate) fn new(
+        constellation_sender: Sender<EmbedderToConstellationMessage>,
+        painter_id: PainterId,
+    ) -> Self {
         Self {
             constellation_sender,
             animating: Default::default(),
+            painter_id,
         }
     }
 
@@ -128,6 +137,12 @@ impl AnimationRefreshDriverObserver {
         &self,
         webview_renderer: &WebViewRenderer,
     ) -> bool {
+        // A fan-out paints one `WebView` into several painters. Only the one that owns it
+        // asks for its ticks; the rest would each add one more tick per frame for the same
+        // animation. See [`Painter::animating_webviews`].
+        if PainterId::from(webview_renderer.id) != self.painter_id {
+            return false;
+        }
         if !webview_renderer.animating() {
             // If no other WebView is animating we will officially stop animating once the
             // next frame has been painted.

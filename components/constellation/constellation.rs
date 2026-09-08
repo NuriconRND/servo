@@ -88,7 +88,6 @@ use std::borrow::ToOwned;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
 use std::marker::PhantomData;
 use std::mem::replace;
 use std::rc::{Rc, Weak};
@@ -315,11 +314,6 @@ pub struct Constellation<STF, SWF> {
     /// A channel for the background hang monitor to send messages
     /// to the constellation.
     pub(crate) background_hang_monitor_sender: GenericSender<HangMonitorAlert>,
-
-    /// When each `WebView` last had an animation tick delivered, so the per-painter ticks
-    /// a wall produces coalesce down to the display refresh. See
-    /// [`Constellation::animation_tick_interval`].
-    last_animation_tick: HashMap<WebViewId, Instant>,
 
     /// A channel for the constellation to receiver messages
     /// from the background hang monitor.
@@ -680,7 +674,6 @@ where
                     namespace_ipc_sender,
                     script_sender: script_ipc_sender,
                     background_hang_monitor_sender: background_hang_monitor_ipc_sender,
-                    last_animation_tick: HashMap::default(),
                     background_hang_monitor_receiver,
                     background_monitor_register,
                     background_monitor_register_join_handle,
@@ -3783,41 +3776,11 @@ where
         }
     }
 
-    /// The shortest gap between animation ticks delivered to a `WebView`'s script thread.
-    ///
-    /// ***A wall sends one tick per painter, and there are four of them.*** Each painter
-    /// runs its own refresh driver and asks for an animation tick whenever it starts a
-    /// frame, so a four-tile wall at 60Hz produces 240 ticks a second for one animation.
-    /// Every tick becomes a rendering update, and every rendering update reflows the
-    /// animating document.
-    ///
-    /// Measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/12): with no animation running
-    /// the document reflowed 49 times a second; with one, 260 to 285. During a content
-    /// switch a single reflow costs 12-18 ms there, so the script thread cannot keep up,
-    /// display lists back up behind it, and frame production collapses -- renders fell
-    /// from 60 a second to zero for a second and a half, which is the animation "freezing"
-    /// that started this.
-    ///
-    /// One tick per display refresh is all any animation can use.
-    fn animation_tick_interval() -> Duration {
-        let hz = servo_config::pref!(gfx_refresh_hz).clamp(1, 1000) as f64;
-        Duration::from_secs_f64(1.0 / hz)
-    }
-
     #[servo_tracing::instrument(skip_all)]
     fn handle_tick_animation(&mut self, webview_ids: Vec<WebViewId>) {
         let mut animating_event_loops = HashSet::new();
-        let interval = Self::animation_tick_interval();
-        let now = Instant::now();
 
         for webview_id in webview_ids.iter() {
-            // Coalesce the per-painter ticks for this `WebView` down to the refresh rate.
-            match self.last_animation_tick.get(webview_id) {
-                Some(last) if now.duration_since(*last) < interval => continue,
-                _ => {
-                    self.last_animation_tick.insert(*webview_id, now);
-                },
-            }
             for browsing_context in self.fully_active_browsing_contexts_iter(*webview_id) {
                 let Some(pipeline) = self.pipelines.get(&browsing_context.pipeline_id) else {
                     continue;

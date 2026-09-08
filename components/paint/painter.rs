@@ -577,6 +577,7 @@ impl Painter {
         ));
         let animation_refresh_driver_observer = Rc::new(AnimationRefreshDriverObserver::new(
             embedder_to_constellation_sender.clone(),
+            painter_id,
         ));
 
         rendering_context.prepare_for_rendering();
@@ -1086,11 +1087,28 @@ impl Painter {
             .any(WebViewRenderer::animation_callbacks_running)
     }
 
+    /// The `WebView`s this painter should ask animation ticks for.
+    ///
+    /// ***One tick per wall frame, not one per tile.*** A fan-out paints one logical
+    /// `WebView` into several painters, and each painter runs its own refresh driver, so
+    /// every tile asking for a tick turns one animation into four ticks a frame -- 240 a
+    /// second on a four-tile 60Hz wall. Each tick becomes a rendering update and each
+    /// rendering update reflows the animating document: measured on the 4-GPU wall,
+    /// 2026-09-08 (log_ani_perf/12), 49 reflows a second with no animation against 260-285
+    /// with one. During a content switch a reflow there costs 12-18 ms, so the script
+    /// thread fell behind, display lists backed up, and frame production collapsed to zero
+    /// for a second and a half.
+    ///
+    /// The tiles of one wall frame are one tick, and the painter that owns the `WebView`
+    /// is the one that speaks for it. Every other painter stays quiet, and a shell with a
+    /// single painter is unaffected because it owns everything it paints.
     pub(crate) fn animating_webviews(&self) -> Vec<WebViewId> {
         self.webview_renderers
             .values()
             .filter_map(|webview_renderer| {
-                if webview_renderer.animating() {
+                if webview_renderer.animating() &&
+                    PainterId::from(webview_renderer.id) == self.painter_id
+                {
                     Some(webview_renderer.id)
                 } else {
                     None
