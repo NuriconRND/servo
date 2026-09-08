@@ -152,6 +152,10 @@ struct ActivePaintAnimation {
     property: PaintAnimationProperty,
     /// The instant the animation's own timeline reads zero. Usually in the past.
     zero: Instant,
+    /// Whether the segments run to the animation's end, as opposed to stopping at the
+    /// sampling horizon. Not used to decide whether to keep playing -- see `running` --
+    /// but it is the difference between "finished" and "outran its runway", which is worth
+    /// keeping straight when reading this back.
     complete: bool,
 }
 
@@ -189,14 +193,16 @@ fn find_segment<T>(
 impl ActivePaintAnimation {
     /// Whether this animation still has anything left to say at `now`.
     ///
-    /// An incomplete animation never finishes on its own: it was sampled up to a horizon
-    /// and the truth past that lives in script. Holding the last value is the honest
-    /// thing to do -- it is what the viewer already sees -- and the next display list
-    /// replaces it.
+    /// ***Past the end of what was sampled there is nothing left to say, finished or
+    /// not.*** An animation that outran its horizon is not over -- the rest of it lives in
+    /// script -- but the value cannot move again until the next display list arrives, and
+    /// WebRender keeps the last value it was given. Re-sending it every frame would burn
+    /// a frame per painter per tick to redraw an unchanged picture; measured on the 4-GPU
+    /// wall, 2026-09-08, that was 30 frames a second per painter of pure waste.
+    ///
+    /// It also makes `playing=` in the log mean "actually moving", which is the question
+    /// being asked of it.
     fn running(&self, now: Instant) -> bool {
-        if !self.complete {
-            return true;
-        }
         let elapsed = now.saturating_duration_since(self.zero).as_secs_f64();
         match &self.property {
             PaintAnimationProperty::Opacity(_, segments) => {

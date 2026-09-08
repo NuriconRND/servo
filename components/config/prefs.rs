@@ -446,6 +446,21 @@ pub struct Preferences {
     /// On by default; the switch exists to isolate this if a page ever renders wrong.
     pub gfx_paint_side_animations_enabled: bool,
 
+    /// How far ahead of each display list a paint-side animation is sampled, in
+    /// milliseconds.
+    ///
+    /// ***This is a bet on how long script might stop producing display lists.*** Past the
+    /// end of what was sampled the paint thread holds the last value, which looks exactly
+    /// like the freeze this feature exists to remove. Measured on the 4-GPU wall,
+    /// 2026-09-08 (log_ani_perf/07): a one-second script block against a one-second
+    /// horizon made the animation stop part-way through every block.
+    ///
+    /// Longer is close to free for the common case -- the segments are merged, so a linear
+    /// fade is one segment however far ahead it was sampled -- but the sampling itself
+    /// costs a style query per sample per animated element, on the script thread. Watch
+    /// `SCRIPTBUSY` if this is raised a lot.
+    pub gfx_paint_side_animation_horizon_ms: i64,
+
     pub gfx_wall_parallel_tiles: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
@@ -959,6 +974,7 @@ impl Preferences {
             gfx_dcomp_parallel_commit: false,
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
+            gfx_paint_side_animation_horizon_ms: 3000,
             gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,

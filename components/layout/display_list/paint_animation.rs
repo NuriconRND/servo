@@ -33,14 +33,20 @@ use style::values::computed::Transform as ComputedTransform;
 use webrender_api::units::LayoutTransform;
 use webrender_api::{PipelineId as WrPipelineId, PropertyBinding, PropertyBindingKey};
 
+/// How many samples one animation may cost, whatever the horizon asks for.
+///
+/// The horizon is a pref and the sample rate is fixed, so without a cap a large value
+/// would multiply the per-display-list style queries without bound. At the rate below this
+/// is a little over four seconds of runway.
+const MAX_SAMPLES: usize = 256;
+
 /// How far ahead of the display list each animation is sampled, in seconds.
 ///
-/// This is a bet on how long script might stop producing display lists. Too short and the
-/// animation freezes anyway at the end of the samples; too long and every display list
-/// carries samples that are thrown away on the next one. The stalls that motivated this
-/// were 0.3-0.4 s in steady state, with rare multi-second ones, and one second of runway
-/// covers the first without making the common case expensive.
-const HORIZON_SECONDS: f64 = 1.0;
+/// See `gfx_paint_side_animation_horizon_ms`: this is a bet on how long script might stop
+/// producing display lists, and past it the paint thread holds the last value.
+fn horizon_seconds() -> f64 {
+    (servo_config::pref!(gfx_paint_side_animation_horizon_ms).max(0) as f64) / 1000.0
+}
 
 /// Seconds between samples before collinear ones are merged away.
 ///
@@ -106,7 +112,7 @@ pub(crate) fn opacity_binding(
         return unbound;
     }
 
-    let count = (HORIZON_SECONDS / SAMPLE_SECONDS).ceil() as usize + 1;
+    let count = ((horizon_seconds() / SAMPLE_SECONDS).ceil() as usize + 1).min(MAX_SAMPLES);
     let mut samples = Vec::with_capacity(count);
     for index in 0..count {
         let time = now + index as f64 * SAMPLE_SECONDS;
@@ -233,7 +239,7 @@ pub(crate) fn transform_binding(
     let node = node?;
     animated_transform_list(animations, node, now)?;
 
-    let count = (HORIZON_SECONDS / SAMPLE_SECONDS).ceil() as usize + 1;
+    let count = ((horizon_seconds() / SAMPLE_SECONDS).ceil() as usize + 1).min(MAX_SAMPLES);
     let mut samples: Vec<LayoutTransform> = Vec::with_capacity(count);
     for index in 0..count {
         let time = now + index as f64 * SAMPLE_SECONDS;
