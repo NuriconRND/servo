@@ -1080,6 +1080,18 @@ impl MediaExternalImages {
                 rem_max_wait,
                 rem_max_hold,
             );
+            // 보유가 큰 호출 지점 상위 4개. 어느 함수가 자물쇠를 붙잡는지 이름으로 낸다.
+            let top = servo_media::player::d3d11_ring::take_top_registry_sites(4);
+            if !top.is_empty() {
+                let rows = top
+                    .iter()
+                    .map(|(name, n, wait, hold)| {
+                        format!("{name}:n={n},wait={wait:.1},hold={hold:.1}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                warn!("MEDIALOCKSITES {rows}");
+            }
             self.lock_window_start = lock_started;
             self.lock_window_calls = 0;
             self.lock_window_consumes = 0;

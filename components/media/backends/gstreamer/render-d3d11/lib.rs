@@ -155,11 +155,7 @@ mod render_d3d11 {
         /// 현재 caps 에 맞는 **그룹**을 보장한다(필요 시 (재)생성). 그룹은
         /// 디바이스를 모른다 — 실제 링은 소비자가 수요를 등록한 디바이스마다
         /// [`ensure_device_ring`](Self::ensure_device_ring) 이 만든다.
-        fn ensure_group(
-            &self,
-            state: &mut PlayerState,
-            caps: &gstreamer::CapsRef,
-        ) -> Option<u64> {
+        fn ensure_group(&self, state: &mut PlayerState, caps: &gstreamer::CapsRef) -> Option<u64> {
             if state.group_id.is_some() && state.in_caps.as_deref() == Some(caps) {
                 return state.group_id;
             }
@@ -381,59 +377,55 @@ mod render_d3d11 {
             // 스트림을 유지한다. 아직 한 번도 소비되지 않았다면(startup) 재표시할
             // 슬롯이 없으므로 기존 동작대로 None을 반환한다(startup-window
             // 잔여 경로 — 의도적으로 미변경).
-            let frame =
-                match gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info) {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        if state.ring_never_consumed {
-                            return None;
-                        }
-                        state.drop_count += 1;
-                        if !state.warned_map_fail {
-                            log::warn!(
-                                "D3D11 video: gst 버퍼 map 실패 — 기존 Presenting 슬롯 재표시로 폴백 (id={})",
-                                self.profile_id
-                            );
-                            state.warned_map_fail = true;
-                        }
-                        if prof {
-                            log::warn!(
-                                "D3D11PROF mapfail id={} group={group_id} drops={}",
-                                self.profile_id,
-                                state.drop_count,
-                            );
-                        }
-                        // 아래와 동일한 메타데이터 프레임을 즉시 반환 — 새 프레임
-                        // 복사 없이 재표시로 스트림 유지(배압 arm과 동형).
-                        return VideoFrame::new(
-                            width,
-                            height,
-                            Arc::new(D3D11YuvFrameBuffer {
-                                data: VideoFrameD3D11YuvData {
-                                    group_id,
-                                    ring_epoch: 1,
-                                    format,
-                                    color_space,
-                                    color_range,
-                                },
-                            }),
+            let frame = match gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
+                buffer, &info,
+            ) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    if state.ring_never_consumed {
+                        return None;
+                    }
+                    state.drop_count += 1;
+                    if !state.warned_map_fail {
+                        log::warn!(
+                            "D3D11 video: gst 버퍼 map 실패 — 기존 Presenting 슬롯 재표시로 폴백 (id={})",
+                            self.profile_id
                         );
-                    },
-                };
+                        state.warned_map_fail = true;
+                    }
+                    if prof {
+                        log::warn!(
+                            "D3D11PROF mapfail id={} group={group_id} drops={}",
+                            self.profile_id,
+                            state.drop_count,
+                        );
+                    }
+                    // 아래와 동일한 메타데이터 프레임을 즉시 반환 — 새 프레임
+                    // 복사 없이 재표시로 스트림 유지(배압 arm과 동형).
+                    return VideoFrame::new(
+                        width,
+                        height,
+                        Arc::new(D3D11YuvFrameBuffer {
+                            data: VideoFrameD3D11YuvData {
+                                group_id,
+                                ring_epoch: 1,
+                                format,
+                                color_space,
+                                color_range,
+                            },
+                        }),
+                    );
+                },
+            };
 
             // ★디바이스별 업로드★ — 수요가 있는 디바이스마다 그 GPU 위의 링에
             // 복사한다. 6x6 그리드를 4 타일이 나눠 보면 각 영상은 보통 한 타일에만
             // 보이므로 **총 업로드 횟수는 단일 GPU 때와 같다**(타일 경계에 걸친
             // 영상만 두 번 올라간다).
             for device in target_devices {
-                let Some(ring_id) = self.ensure_device_ring(
-                    group_id,
-                    device,
-                    format,
-                    info.format(),
-                    width,
-                    height,
-                ) else {
+                let Some(ring_id) =
+                    self.ensure_device_ring(group_id, device, format, info.format(), width, height)
+                else {
                     // 텍스처 생성 실패(디바이스 상실 등) — 이 디바이스만 건너뛴다.
                     // 다른 타일은 계속 정상 재생돼야 한다.
                     continue;
@@ -461,7 +453,9 @@ mod render_d3d11 {
                         // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
                         // 프레임 덮어쓴다. 스테이징은 링별이므로 디바이스마다 따로 둔다.
                         let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
-                        D3d11PlaneRings::stage_first_frame(ring_id, vecs);
+                        // 밀려난 이전 버퍼는 **여기서** 떨어진다 — 자물쇠 밖, 이 스레드에서.
+                        // 안에서 떨구면 전역 레지스트리가 그 해제 시간만큼 잠긴다.
+                        drop(D3d11PlaneRings::stage_first_frame(ring_id, vecs));
                     },
                     None => {
                         // 배압: 이 디바이스의 모든 슬롯이 아직 소비 대기다. 이번 gst

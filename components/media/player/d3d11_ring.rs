@@ -325,6 +325,24 @@ impl LockStats {
     }
 }
 
+/// 보유 시간이 큰 순으로 상위 몇 개를 꺼내고 모두 0 으로 되돌린다.
+pub fn take_top_registry_sites(top: usize) -> Vec<(&'static str, u64, f64, f64)> {
+    let mut rows: Vec<_> = (0..SITE_COUNT)
+        .map(|index| {
+            (
+                SITE_NAMES[index],
+                SITE_HITS[index].swap(0, Ordering::Relaxed),
+                SITE_WAIT_NS[index].swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+                SITE_HOLD_NS[index].swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            )
+        })
+        .filter(|row| row.1 > 0)
+        .collect();
+    rows.sort_by(|a, b| b.3.total_cmp(&a.3));
+    rows.truncate(top);
+    rows
+}
+
 /// 링 레지스트리(전역 하나). 소비자·프로듀서가 모두 여기서 만난다.
 pub static REGISTRY_LOCK: LockStats = LockStats::new();
 /// 제거된 링 회수 큐. 소비자가 lock 마다 한 번씩 들여다본다.
@@ -334,6 +352,7 @@ pub static REMOVED_LOCK: LockStats = LockStats::new();
 struct TrackedGuard<'a, T> {
     guard: MutexGuard<'a, T>,
     stats: &'static LockStats,
+    site: Option<usize>,
     acquired: Instant,
 }
 
@@ -352,37 +371,86 @@ impl<T> std::ops::DerefMut for TrackedGuard<'_, T> {
 
 impl<T> Drop for TrackedGuard<'_, T> {
     fn drop(&mut self) {
-        LockStats::note(
-            &self.stats.hold_ns,
-            &self.stats.max_hold_ns,
-            self.acquired.elapsed().as_nanos() as u64,
-        );
+        let held = self.acquired.elapsed().as_nanos() as u64;
+        LockStats::note(&self.stats.hold_ns, &self.stats.max_hold_ns, held);
+        if let Some(index) = self.site {
+            SITE_HOLD_NS[index].fetch_add(held, Ordering::Relaxed);
+        }
     }
 }
 
-fn lock_tracked<'a, T>(m: &'a Mutex<T>, stats: &'static LockStats) -> TrackedGuard<'a, T> {
+fn lock_tracked<'a, T>(
+    m: &'a Mutex<T>,
+    stats: &'static LockStats,
+    site: Option<usize>,
+) -> TrackedGuard<'a, T> {
     let started = Instant::now();
     let guard = m.lock().unwrap_or_else(|poison| poison.into_inner());
     let acquired = Instant::now();
-    LockStats::note(
-        &stats.wait_ns,
-        &stats.max_wait_ns,
-        acquired.duration_since(started).as_nanos() as u64,
-    );
+    let waited = acquired.duration_since(started).as_nanos() as u64;
+    LockStats::note(&stats.wait_ns, &stats.max_wait_ns, waited);
     stats.count.fetch_add(1, Ordering::Relaxed);
+    if let Some(index) = site {
+        SITE_WAIT_NS[index].fetch_add(waited, Ordering::Relaxed);
+        SITE_HITS[index].fetch_add(1, Ordering::Relaxed);
+    }
     TrackedGuard {
         guard,
         stats,
+        site,
         acquired,
     }
 }
 
+/// 호출 지점별 보유/대기 누계. ★어느 함수가 오래 쥐는지 이름으로 나오지 않으면 추정만
+/// 남는다★ — 획득당 보유가 평상시의 110배라는 것까지는 알아도, 그 안에서 무엇이
+/// 무거워지는지는 사이트별로 갈라야 보인다. 지점 수가 스물둘뿐이라 선형 탐색으로 족하다
+/// (포인터 비교 스물두 번, 잠금 자체보다 훨씬 싸다).
+const SITE_COUNT: usize = 22;
+
+const SITE_NAMES: [&str; SITE_COUNT] = [
+    "abandon_slot",
+    "attach_ring",
+    "claim_free_slot",
+    "commit_consume",
+    "create_group",
+    "create_ring",
+    "demanded_devices",
+    "dropped_frames",
+    "expire_stale_demand",
+    "note_demand",
+    "note_demand_and_ring",
+    "note_plane_lock_and_plan",
+    "note_plane_unlock",
+    "plan_or_presenting_plane",
+    "plane_count",
+    "presenting_filled_seq",
+    "presenting_plane",
+    "publish_slot",
+    "remove_group",
+    "remove_ring",
+    "ring_for",
+    "stage_first_frame",
+];
+
+static SITE_WAIT_NS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
+static SITE_HOLD_NS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
+static SITE_HITS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_COUNT];
+
+fn site(name: &'static str) -> Option<usize> {
+    SITE_NAMES.iter().position(|candidate| *candidate == name)
+}
+
+fn lock_at<'a, T>(m: &'a Mutex<T>, name: &'static str) -> TrackedGuard<'a, T> {
+    lock_tracked(m, &REGISTRY_LOCK, site(name))
+}
+
 fn lock<T>(m: &Mutex<T>) -> TrackedGuard<'_, T> {
-    lock_tracked(m, &REGISTRY_LOCK)
+    lock_tracked(m, &REGISTRY_LOCK, None)
 }
 
 fn lock_removed(m: &Mutex<Vec<RemovedRing>>) -> TrackedGuard<'_, Vec<RemovedRing>> {
-    lock_tracked(m, &REMOVED_LOCK)
+    lock_tracked(m, &REMOVED_LOCK, None)
 }
 
 fn plane_textures(slot: &SlotInfo) -> Vec<usize> {
@@ -447,7 +515,7 @@ impl D3d11PlaneRings {
             next_filled_seq: 0,
             staged_first_frame: None,
         };
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "create_ring");
         reg.rings.insert(ring_id, ring);
         reg.ring_device.insert(ring_id, device);
         ring_id
@@ -457,7 +525,7 @@ impl D3d11PlaneRings {
     /// [`take_removed_rings`](Self::take_removed_rings)로 나중에 가져간다.
     pub fn remove_ring(ring_id: u64) {
         let (removed, device) = {
-            let mut reg = lock(registry());
+            let mut reg = lock_at(registry(), "remove_ring");
             let ring = reg.rings.remove(&ring_id);
             let device = reg.ring_device.remove(&ring_id).unwrap_or(0);
             // 이 링을 참조하던 그룹 항목도 함께 끊는다(고아 참조 방지).
@@ -498,7 +566,7 @@ impl D3d11PlaneRings {
     /// 없으면 None(카운터만 증가 — memcpy 전이라 비용 없음). 이때 프로듀서는
     /// 프레임을 드롭하지 않고 직전 Presenting 슬롯을 재제시한다(bf70293c4 이후).
     pub fn claim_free_slot(ring_id: u64) -> Option<ClaimedSlot> {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "claim_free_slot");
         let ring = reg.rings.get_mut(&ring_id)?;
         let Some(idx) = ring.slots.iter().position(|s| s.state == SlotState::Free) else {
             ring.dropped_frames += 1;
@@ -523,7 +591,7 @@ impl D3d11PlaneRings {
 
     /// claim했던 슬롯을 Filled로 표시한다(memcpy 완료 후 호출).
     pub fn publish_slot(ring_id: u64, slot: usize) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "publish_slot");
         let Some(ring) = reg.rings.get_mut(&ring_id) else {
             return;
         };
@@ -537,7 +605,7 @@ impl D3d11PlaneRings {
 
     /// claim 후 실패(디코드 실패 등) 시 슬롯을 FREE로 되돌린다.
     pub fn abandon_slot(ring_id: u64, slot: usize) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "abandon_slot");
         let Some(ring) = reg.rings.get_mut(&ring_id) else {
             return;
         };
@@ -549,16 +617,30 @@ impl D3d11PlaneRings {
     /// 전 슬롯이 아직 Unmapped인 초기 구간용 — 첫 프레임을 CPU에
     /// 스테이징해 둔다(plane별 연속 바이트). 최초 소비(InitialMapAll) 시
     /// 슬롯 0으로 복사된다. 여러 번 호출하면 마지막 호출 값으로 덮어쓴다.
-    pub fn stage_first_frame(ring_id: u64, planes: Vec<Vec<u8>>) {
-        let mut reg = lock(registry());
-        if let Some(ring) = reg.rings.get_mut(&ring_id) {
-            ring.staged_first_frame = Some(planes);
+    /// 첫 프레임 바이트를 스테이징하고, **밀려난 이전 버퍼를 돌려준다.**
+    ///
+    /// ★큰 버퍼를 자물쇠 안에서 해제하면 안 된다★ — 이 자리는 아직 소비되지 않은 링마다
+    /// 프레임당 한 번 도는데, 예전에는 대입 한 줄이 이전 프레임(FHD I420 = 약 3MB)의
+    /// 해제를 임계 구역 안에서 했다. 전환 때는 그런 링이 수십 개라, 전역 자물쇠가 그
+    /// 해제들로 채워진다(실측: 전환 구간의 획득당 보유가 평상시의 110배).
+    ///
+    /// 돌려주는 버퍼는 호출자가 **다시 채워 쓰라고** 주는 것이기도 하다. 그러면 프레임마다
+    /// 3MB 를 새로 할당하는 일도 사라진다. 해제는 호출자의 스레드에서, 자물쇠 밖에서
+    /// 일어난다.
+    #[must_use = "이전 버퍼는 자물쇠 밖에서 재사용하거나 버려야 한다 — 안에서 해제하지 않으려고 돌려주는 것이다"]
+    pub fn stage_first_frame(ring_id: u64, planes: Vec<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+        let mut reg = lock_at(registry(), "stage_first_frame");
+        match reg.rings.get_mut(&ring_id) {
+            Some(ring) => ring.staged_first_frame.replace(planes),
+            // 링이 사라졌다면 방금 만든 것을 그대로 돌려준다 — 여기서 떨구면 그 해제도
+            // 자물쇠 안이다.
+            None => Some(planes),
         }
     }
 
     /// FREE 슬롯이 없어 memcpy 전에 드롭된 프레임 누적 개수.
     pub fn dropped_frames(ring_id: u64) -> u64 {
-        let reg = lock(registry());
+        let reg = lock_at(registry(), "dropped_frames");
         reg.rings
             .get(&ring_id)
             .map(|r| r.dropped_frames)
@@ -625,14 +707,14 @@ impl D3d11PlaneRings {
     }
 
     pub fn note_plane_lock_and_plan(ring_id: u64) -> Option<ConsumePlan> {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "note_plane_lock_and_plan");
         Self::plan_locked(&mut reg, ring_id)
     }
 
     /// plane unlock을 알린다(lock_count 감소). WR이 lock한 plane 개수만큼
     /// 짝을 맞춰 호출해야 다음 합성에서 게이트가 정상 리셋된다.
     pub fn note_plane_unlock(ring_id: u64) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "note_plane_unlock");
         if let Some(ring) = reg.rings.get_mut(&ring_id) {
             ring.lock_count = ring.lock_count.saturating_sub(1);
         }
@@ -665,7 +747,7 @@ impl D3d11PlaneRings {
     ///   남기고 no-op이다. 정상 경로에서는 `Remapping` 슬롯이 최대
     ///   하나여야 한다는 불변조건을 `debug_assert`로 검증한다.
     pub fn commit_consume(ring_id: u64, commit: ConsumeCommit) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "commit_consume");
         let Some(ring) = reg.rings.get_mut(&ring_id) else {
             return;
         };
@@ -809,7 +891,7 @@ impl D3d11PlaneRings {
     /// 실행되지 않았을 수도 있는 시점)이라도 이 함수는 이미 새
     /// Presenting 슬롯의 plane 기술자를 반환할 수 있다.
     pub fn presenting_plane(ring_id: u64, plane: usize) -> Option<PlaneDesc> {
-        let reg = lock(registry());
+        let reg = lock_at(registry(), "presenting_plane");
         let ring = reg.rings.get(&ring_id)?;
         let idx = ring.presenting_slot?;
         ring.slots[idx].planes.get(plane).copied().flatten()
@@ -818,7 +900,7 @@ impl D3d11PlaneRings {
     /// 링당 plane 개수(생성 시 고정, `create_ring`의 `planes_per_slot` 그대로).
     /// 존재하지 않는 ring_id면 None.
     pub fn plane_count(ring_id: u64) -> Option<usize> {
-        let reg = lock(registry());
+        let reg = lock_at(registry(), "plane_count");
         reg.rings.get(&ring_id).map(|r| r.planes_per_slot)
     }
 
@@ -827,7 +909,7 @@ impl D3d11PlaneRings {
     /// [`presenting_plane`](Self::presenting_plane)과 동일하게
     /// `presenting_slot` 술어를 그대로 재사용한다.
     pub fn presenting_filled_seq(ring_id: u64) -> Option<u64> {
-        let reg = lock(registry());
+        let reg = lock_at(registry(), "presenting_filled_seq");
         let ring = reg.rings.get(&ring_id)?;
         let idx = ring.presenting_slot?;
         Some(ring.slots[idx].filled_seq)
@@ -871,7 +953,7 @@ impl D3d11PlaneRings {
     /// 수요를 등록하면 프로듀서가 그 디바이스에 만든다.
     pub fn create_group() -> u64 {
         let group_id = NEXT_RING_ID.fetch_add(1, Ordering::Relaxed);
-        lock(registry())
+        lock_at(registry(), "create_group")
             .groups
             .insert(group_id, GroupState::default());
         group_id
@@ -880,7 +962,7 @@ impl D3d11PlaneRings {
     /// 그룹과 그에 딸린 **모든 디바이스의 링**을 제거한다(caps 변경/플레이어 종료).
     pub fn remove_group(group_id: u64) {
         let ring_ids: Vec<u64> = {
-            let mut reg = lock(registry());
+            let mut reg = lock_at(registry(), "remove_group");
             match reg.groups.remove(&group_id) {
                 Some(group) => group.rings.into_values().collect(),
                 None => Vec::new(),
@@ -901,7 +983,7 @@ impl D3d11PlaneRings {
     /// 동시에 막히므로 CPU 도 같이 탄다. 그 획득의 대부분이 소비자이고, 소비자 lock
     /// 한 번이 이 자물쇠를 네 번 잡았다.
     pub fn note_demand_and_ring(group_id: u64, device: usize) -> Option<u64> {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "note_demand_and_ring");
         let group = reg.groups.get_mut(&group_id)?;
         group.demand.insert(device, Instant::now());
         group.rings.get(&device).copied()
@@ -920,7 +1002,7 @@ impl D3d11PlaneRings {
         ring_id: u64,
         plane: usize,
     ) -> (Option<ConsumePlan>, Option<PlaneDesc>) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "plan_or_presenting_plane");
         let plan = Self::plan_locked(&mut reg, ring_id);
         if plan.is_some() {
             return (plan, None);
@@ -934,7 +1016,7 @@ impl D3d11PlaneRings {
     }
 
     pub fn note_demand(group_id: u64, device: usize) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "note_demand");
         if let Some(group) = reg.groups.get_mut(&group_id) {
             group.demand.insert(device, Instant::now());
         }
@@ -943,7 +1025,7 @@ impl D3d11PlaneRings {
     /// `device` 에서 이 그룹이 쓰는 링. 아직 없으면 None(프로듀서가 다음
     /// 프레임에 만든다).
     pub fn ring_for(group_id: u64, device: usize) -> Option<u64> {
-        lock(registry())
+        lock_at(registry(), "ring_for")
             .groups
             .get(&group_id)
             .and_then(|group| group.rings.get(&device).copied())
@@ -951,7 +1033,7 @@ impl D3d11PlaneRings {
 
     /// 프로듀서가 `device` 에 텍스처를 만든 뒤 그 링을 그룹에 등록한다.
     pub fn attach_ring(group_id: u64, device: usize, ring_id: u64) {
-        let mut reg = lock(registry());
+        let mut reg = lock_at(registry(), "attach_ring");
         if let Some(group) = reg.groups.get_mut(&group_id) {
             group.rings.insert(device, ring_id);
         }
@@ -961,7 +1043,7 @@ impl D3d11PlaneRings {
     /// **이 목록에만** 업로드한다 — 이것이 "타일에 보이는 것만 올린다" 의 실체다.
     pub fn demanded_devices(group_id: u64, ttl: Duration) -> Vec<usize> {
         let now = Instant::now();
-        lock(registry())
+        lock_at(registry(), "demanded_devices")
             .groups
             .get(&group_id)
             .map(|group| {
@@ -980,7 +1062,7 @@ impl D3d11PlaneRings {
     pub fn expire_stale_demand(group_id: u64, ttl: Duration) -> Vec<u64> {
         let now = Instant::now();
         let stale_rings: Vec<u64> = {
-            let mut reg = lock(registry());
+            let mut reg = lock_at(registry(), "expire_stale_demand");
             let Some(group) = reg.groups.get_mut(&group_id) else {
                 return Vec::new();
             };
@@ -1281,7 +1363,10 @@ mod tests {
 
         // stage_first_frame은 패닉 없이 받아들여져야 하며, claim 동작에는
         // 영향을 주지 않는다(여전히 Unmapped).
-        D3d11PlaneRings::stage_first_frame(ring_id, vec![vec![1, 2, 3], vec![4, 5]]);
+        drop(D3d11PlaneRings::stage_first_frame(
+            ring_id,
+            vec![vec![1, 2, 3], vec![4, 5]],
+        ));
         assert!(D3d11PlaneRings::claim_free_slot(ring_id).is_none());
         assert_eq!(D3d11PlaneRings::dropped_frames(ring_id), 2);
     }
@@ -1292,7 +1377,10 @@ mod tests {
         let ring_id = D3d11PlaneRings::create_ring(0, 2, slots);
 
         let staged_bytes = vec![vec![9u8, 9, 9], vec![8u8, 8]];
-        D3d11PlaneRings::stage_first_frame(ring_id, staged_bytes.clone());
+        drop(D3d11PlaneRings::stage_first_frame(
+            ring_id,
+            staged_bytes.clone(),
+        ));
 
         let plan = D3d11PlaneRings::note_plane_lock_and_plan(ring_id).expect("initial plan");
         let ConsumePlan::InitialMapAll {
