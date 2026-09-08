@@ -282,8 +282,25 @@ static NEXT_RING_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 포이즌된 뮤텍스를 복구해서 잠근다(한 스레드의 패닉이 다른 스레드의
 /// 비디오 처리를 영구히 막지 않도록).
+/// 이 자물쇠를 **기다린** 시간의 누계(ns)와 획득 횟수.
+///
+/// ★레지스트리는 전역 뮤텍스 하나다★ — 페인터 넷이 프레임마다 영상 수만큼 lock 을 걸고,
+/// 프로듀서 수십 개가 프레임마다 슬롯을 발행하며, lock 한 번이 이 자물쇠를 네 번 잡는다.
+/// 소비자 쪽 `lock` 의 시간 중 회전도 래핑도 아닌 나머지가 호출당 0.58ms 로 측정됐는데,
+/// 그 모양이 계산이 아니라 경합이다. 그러나 '경합처럼 보인다'와 '경합이다'는 다르므로,
+/// 기다린 시간을 직접 센다. 획득 자체는 원자적 덧셈 두 번만 더 든다.
+pub static REGISTRY_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static REGISTRY_ACQUIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poison| poison.into_inner())
+    let started = std::time::Instant::now();
+    let guard = m.lock().unwrap_or_else(|poison| poison.into_inner());
+    REGISTRY_WAIT_NS.fetch_add(
+        started.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    REGISTRY_ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    guard
 }
 
 fn plane_textures(slot: &SlotInfo) -> Vec<usize> {
