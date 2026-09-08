@@ -423,7 +423,37 @@ impl WebRenderExternalImageApi for GLPlayerExternalImages {
 /// even when some or all D3D11 Map calls fail — an empty `mapped`/`remapped`
 /// vector is a valid commit and is what keeps the ring from wedging (see the
 /// never-skip contract on [`ConsumePlan`]).
+thread_local! {
+    /// 직전 `consume_plan` 이 무엇을 했는지. 전환 정체가 링의 **최초 소비**(전 슬롯 Map +
+    /// 첫 프레임 복사)인지 **정상 진행**(Unmap 1 + Map 1)인지에 따라 고칠 곳이 다르다 --
+    /// 앞의 것은 영상이 새로 생길 때 한 번뿐이라 렌더 프레임 밖으로 옮길 수 있고, 뒤의
+    /// 것은 매 프레임이라 구조가 다르다. 문자열 한 줄로 로그에 실어 보낸다.
+    static LAST_CONSUME_SHAPE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
+    LAST_CONSUME_SHAPE.with(|shape| {
+        let mut shape = shape.borrow_mut();
+        shape.clear();
+        match &plan {
+            ConsumePlan::InitialMapAll { slots, staged } => {
+                let planes: usize = slots
+                    .iter()
+                    .map(|slot| slot.iter().filter(|plane| plane.is_some()).count())
+                    .sum();
+                let staged_bytes: usize = staged
+                    .as_ref()
+                    .map(|staged| staged.iter().map(Vec::len).sum())
+                    .unwrap_or(0);
+                shape.push_str(&format!(
+                    "initial planes={planes} staged_bytes={staged_bytes}"
+                ));
+            },
+            ConsumePlan::Advance { unmap, map, .. } => {
+                shape.push_str(&format!("advance unmap={} map={}", unmap.len(), map.len()));
+            },
+        }
+    });
     match plan {
         ConsumePlan::InitialMapAll { slots, staged } => {
             // Map ALL slots' planes. Slot 0 is special: after copying the staged
@@ -854,6 +884,7 @@ impl MediaExternalImages {
         // Some(plan)은 반드시 정확히 한 번 commit_consume으로 끝나야 한다
         // (consume_plan이 모든 실패 분기 포함 이를 보장한다).
         if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(ring_id) {
+            LAST_CONSUME_SHAPE.with(|shape| shape.borrow_mut().clear());
             let consume_start = std::time::Instant::now();
             consume_plan(&*rc, ring_id, plan);
             stage_consume_ms = consume_start.elapsed().as_secs_f64() * 1000.0;
@@ -923,8 +954,9 @@ impl MediaExternalImages {
         let total_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
         if total_ms > *MEDIA_LOCK_SLOW_MS {
             warn!(
-                "MEDIALOCK total_ms={total_ms:.2} consume_ms={stage_consume_ms:.2} wrap_ms={stage_wrap_ms:.2} wrap_cached={wrap_cached} ring_id={ring_id} plane={}",
+                "MEDIALOCK total_ms={total_ms:.2} consume_ms={stage_consume_ms:.2} wrap_ms={stage_wrap_ms:.2} wrap_cached={wrap_cached} ring_id={ring_id} plane={} consume=[{}]",
                 binding.plane_index,
+                LAST_CONSUME_SHAPE.with(|shape| shape.borrow().clone()),
             );
         }
         (
