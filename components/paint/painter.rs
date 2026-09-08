@@ -363,6 +363,10 @@ pub(crate) struct Painter {
     /// When this painter last generated a frame purely to advance a paint-side animation.
     /// The rate limit that keeps that from becoming a spin.
     last_paint_animation_frame_at: Cell<Option<Instant>>,
+    /// How often the back-pressure check turned an animation frame away in the current
+    /// `PAINTANIM` window. High next to a low `frames` means the pipeline, not the
+    /// animation, is the limit.
+    paint_animation_skipped_busy: Cell<u64>,
 
     /// The channel on which messages can be sent to the constellation.
     embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
@@ -785,6 +789,7 @@ impl Painter {
             paint_animation_frames: Default::default(),
             paint_animation_window_start: Default::default(),
             last_paint_animation_frame_at: Default::default(),
+            paint_animation_skipped_busy: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
             pending_video_frame_updates: RefCell::new(FxHashMap::default()),
@@ -859,7 +864,25 @@ impl Painter {
         // that omitted them would snap the animation back to whatever WebRender last had.
         let floats_log: Vec<f32> = floats.iter().map(|property| property.value).collect();
         let animation_period = crate::refresh_driver::paint_timer_period();
+        //
+        // ***And only when this painter is not already busy.*** The script-driven path
+        // asks the same question before requesting a frame, and the difference showed:
+        // measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/09), 1410 of 2166
+        // animation frames were requested on top of a frame that had not finished, against
+        // 8 of 1436 for script. Stacking them keeps WebRender's publish queue above the
+        // depth of one this painter tries to hold, and the latency that builds up comes out
+        // as an animation that moves, stalls, and jumps -- the symptom this was meant to
+        // remove.
+        //
+        // Skipping does not touch `last_paint_animation_frame_at`, so the next turn tries
+        // again the moment the pipeline is free rather than waiting out another period.
+        let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
+        if painter_busy {
+            self.paint_animation_skipped_busy
+                .set(self.paint_animation_skipped_busy.get() + 1);
+        }
         let animation_due = (!floats.is_empty() || !transforms.is_empty()) &&
+            !painter_busy &&
             self.last_paint_animation_frame_at
                 .get()
                 .is_none_or(|last| now.duration_since(last) >= animation_period);
@@ -930,9 +953,10 @@ impl Painter {
             .map(|value| format!("{value:.3}"))
             .collect::<Vec<_>>()
             .join(",");
+        let skipped = self.paint_animation_skipped_busy.replace(0);
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={} floats=[{}]",
-            self.painter_id, animating, frames, sample
+            "PAINTANIM painter={:?} playing={} frames={} skipped_busy={} floats=[{}]",
+            self.painter_id, animating, frames, skipped, sample
         );
     }
 
