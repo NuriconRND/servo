@@ -20,7 +20,7 @@ use paint_api::{
     ExternalImageSource, WebRenderExternalImageApi, WebRenderExternalImageHandlers,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use servo_config::debug_env;
 use servo_config::{opts, pref};
@@ -669,6 +669,15 @@ struct MediaExternalImages {
     /// 이 소비자(= 이 painter)의 D3D11 디바이스. 그룹에서 자기 링을 찾고,
     /// 회수 큐에서 **자기 디바이스 것만** 가져오는 데 쓴다.
     device: Option<usize>,
+    /// 최초 소비를 이미 치른 링. 새 링인지를 **계획을 뽑기 전에** 알아야 한다 --
+    /// `note_plane_lock_and_plan` 은 뽑는 순간 링 상태를 옮기고 반드시 한 번 커밋해야
+    /// 하므로, 뽑아 놓고 무를 수 없다. 링은 (영상, painter) 하나에 하나이므로 이 핸들러가
+    /// 이 ring_id 를 처음 본다는 것이 곧 최초 소비다. 링이 사라지면 함께 지운다.
+    initialized_rings: FxHashSet<u64>,
+    /// 상한을 재는 렌더 프레임과 그 프레임에서 이미 치른 최초 소비 수 / 미룬 영상 수.
+    ring_init_frame: u64,
+    ring_init_done: i64,
+    ring_init_deferred: u32,
 }
 
 /// 월 GPU 팬아웃 불변식 감시용 기록: `(D3D11 디바이스 포인터, 그 디바이스를 받은 첫
@@ -811,6 +820,45 @@ impl MediaExternalImages {
             diag_logged_wrap_ok: false,
             diag_logged_wrap_fail: false,
             device: own_device,
+            initialized_rings: Default::default(),
+            ring_init_frame: u64::MAX,
+            ring_init_done: 0,
+            ring_init_deferred: 0,
+        }
+    }
+
+    /// 새 링의 최초 소비를 이 프레임에 치러도 되는가.
+    ///
+    /// ★상한의 기준은 시간이 아니라 프레임이다★ — 프레임이 이미 190ms 로 부풀어 있으면
+    /// 시간 창은 그 안에서 여러 번 다시 차서 아무것도 막지 못한다. 프레임에 묶어야 그
+    /// 부푼 프레임이 애초에 만들어지지 않는다.
+    ///
+    /// 상한을 넘겼으면 `false` — 호출자는 그 영상만 이번 프레임을 비운다(이 경로의 기존
+    /// 선례와 같은 모양이다). 미룬 수는 프레임이 바뀔 때 한 줄 남긴다. 게이트가 실제로
+    /// 물렸는지 로그로 확인할 수 있어야 한다.
+    fn may_initialize_ring_now(&mut self) -> bool {
+        let max_per_frame = servo_config::pref!(media_ring_init_max_per_frame);
+        if max_per_frame <= 0 {
+            return true;
+        }
+        let frame = paint_api::render_frame::current_render_frame();
+        if frame != self.ring_init_frame {
+            if self.ring_init_deferred > 0 {
+                info!(
+                    "MEDIALOCKDEFER frame={} initialized={} deferred={}",
+                    self.ring_init_frame, self.ring_init_done, self.ring_init_deferred,
+                );
+            }
+            self.ring_init_frame = frame;
+            self.ring_init_done = 0;
+            self.ring_init_deferred = 0;
+        }
+        if self.ring_init_done < max_per_frame {
+            self.ring_init_done += 1;
+            true
+        } else {
+            self.ring_init_deferred += 1;
+            false
         }
     }
 
@@ -876,6 +924,19 @@ impl MediaExternalImages {
         let Some(ring_id) = D3d11PlaneRings::ring_for(binding.group_id, device) else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
+
+        // ★새 링이면 상한을 먼저 묻는다★ — 계획을 뽑기 **전에** 물어야 한다(위 필드 주석).
+        // 상한에 걸리면 이 영상만 이번 프레임을 비운다. lock_count 를 올리지 않았으므로
+        // unlock 도 no-op 이고, 이는 위 두 이른 반환과 같은 모양이다.
+        let first_consume = !self.initialized_rings.contains(&ring_id);
+        if first_consume {
+            if !self.may_initialize_ring_now() {
+                return (ExternalImageSource::Invalid, Size2D::zero());
+            }
+            // 같은 프레임의 나머지 면(1, 2)이 다시 묻지 않도록 지금 등록한다 — 실제 Map 은
+            // 면 0 의 계획 하나가 전부 처리한다.
+            self.initialized_rings.insert(ring_id);
+        }
 
         // 여기서부터 lock_count 를 올리므로 unlock 이 짝을 맞추도록 기록한다.
         self.locked_d3d11_planes.insert(id, ring_id);
@@ -978,6 +1039,8 @@ impl Drop for MediaExternalImages {
             return;
         };
         for ring in D3d11PlaneRings::take_removed_rings_for_device(device) {
+            // 링별 상태도 함께 버린다 — 남겨 두면 재생/정지를 반복하는 벽에서 끝없이 쌓인다.
+            self.initialized_rings.remove(&ring.ring_id);
             for texture in ring.mapped {
                 rc.unmap_d3d11_texture(texture);
             }

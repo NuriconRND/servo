@@ -651,6 +651,20 @@ pub struct Preferences {
     /// 두 판정식이 문자 그대로 동일함을 확인했다(둘 다 `1`/`true`/`yes`/`on`, 대소문자
     /// 무시) — Task 5 로 pref 하나로 합쳐 두 크레이트가 같은 값을 본다.
     pub media_d3d11_enabled: bool,
+    /// 한 렌더 프레임에서 **새 비디오의 D3D11 링을 처음 잡는 일**을 몇 개까지 할지.
+    /// `0` 이면 무제한(예전 동작).
+    ///
+    /// 링의 최초 소비는 슬롯 4개 × 면 3개 = D3D11 `Map` 12회이고 실측 중앙값 8.8ms,
+    /// 최대 87ms 다. 이 일이 렌더러 스레드에서 **프레임 안에** 있는데, 전환 때 영상이
+    /// 무더기로 뜨면 한 프레임에 21건이 몰려 그 프레임이 190~380ms 가 된다 -- 60Hz 장비에서
+    /// 프레임 하나가 190ms 라는 것 자체가 고장이고, 표출 클럭이 같은 스레드에 있으므로
+    /// 그동안 타일 넷이 통째로 멈춘다. 사용자가 보는 애니메이션 정지가 이것이다.
+    ///
+    /// 프레임당 하나로 묶으면 그 프레임은 ~9ms 늘 뿐이고 나머지는 다음 프레임으로 밀린다
+    /// -- 즉 부푼 프레임이 **애초에 만들어지지 않는다**. 아직 차례가 오지 않은 영상은 그
+    /// 프레임에 비어 보이는데, 이 경로에는 이미 같은 선례가 있다(링이 아직 없으면 그
+    /// 프레임을 비우고 다음 프레임에 뜬다).
+    pub media_ring_init_max_per_frame: i64,
     /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모)에서 **함께 출발하기를 기다릴
     /// 파이프라인 목표 수**. 온오프 스위치가 아니다 — 구 env `SERVO_MEDIA_SYNC_GROUP=N`이
     /// 그랬듯 타일 수를 그대로 받는다(`player.rs::sync_group_target`: 구코드는 usize 파싱
@@ -1060,6 +1074,7 @@ impl Preferences {
             // true, SYNC_GROUP 은 브리프 표기와 달리 목표 수 정수, 나머지는 구 env 미설정
             // 동작 보존).
             media_d3d11_enabled: false,
+            media_ring_init_max_per_frame: 1,
             media_sync_group_target: 0,
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,

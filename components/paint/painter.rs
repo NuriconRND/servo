@@ -1349,6 +1349,9 @@ impl Painter {
         self.render_count.set(render_count);
         let local_frame_id = self.last_ready_local_frame_id.get();
         let wall_logical_frame_id = self.last_ready_wall_logical_frame_id.get();
+        // 이 스레드의 렌더 프레임 경계를 알린다. 프레임 **안에서** 하는 일에 상한을
+        // 두려는 쪽(새 비디오 링의 최초 소비)이 이 값으로 프레임이 바뀐 것을 안다.
+        paint_api::render_frame::begin_render_frame();
         let render_start = Instant::now();
         let render_cpu_start = thread_cpu_ms();
         if self.rendering_context.requested_gpu_index().is_some() {
