@@ -360,6 +360,9 @@ pub(crate) struct Painter {
     /// paint-side animation, and when the current one-second window opened.
     paint_animation_frames: Cell<u64>,
     paint_animation_window_start: RefCell<Option<Instant>>,
+    /// When this painter last generated a frame purely to advance a paint-side animation.
+    /// The rate limit that keeps that from becoming a spin.
+    last_paint_animation_frame_at: Cell<Option<Instant>>,
 
     /// The channel on which messages can be sent to the constellation.
     embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
@@ -781,6 +784,7 @@ impl Painter {
             frame_delayer: Default::default(),
             paint_animation_frames: Default::default(),
             paint_animation_window_start: Default::default(),
+            last_paint_animation_frame_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
             pending_video_frame_updates: RefCell::new(FxHashMap::default()),
@@ -844,7 +848,21 @@ impl Painter {
             });
         }
 
-        let animated_property_frame = !floats.is_empty() || !transforms.is_empty();
+        // ***Rate-limited, because generating a frame is what wakes this loop again.***
+        // Without this the first animation turns the painter into a spin: `generate_frame`
+        // makes a frame, the frame wakes `perform_updates`, which generates another.
+        // Measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/05): 7425 animated-property
+        // frames in one second per painter, and the wall stopped responding.
+        //
+        // The sampled values still ride along on any transaction sent for another reason:
+        // `reset_dynamic_properties` clears every binding, so a caret-only transaction
+        // that omitted them would snap the animation back to whatever WebRender last had.
+        let animation_period = crate::refresh_driver::paint_timer_period();
+        let animation_due = (!floats.is_empty() || !transforms.is_empty()) &&
+            self.last_paint_animation_frame_at
+                .get()
+                .is_none_or(|last| now.duration_since(last) >= animation_period);
+        let animated_property_frame = animation_due;
         if colors.is_some() || animated_property_frame {
             let mut transaction = Transaction::new();
             transaction.reset_dynamic_properties();
@@ -855,13 +873,16 @@ impl Painter {
             });
             self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
             self.send_transaction(transaction);
+            if animation_due {
+                self.last_paint_animation_frame_at.set(Some(now));
+            }
         }
 
         // Nothing else may be waking this painter: the point of these animations is that
         // they run while script is not producing anything.
         if still_animating {
             self.web_content_animator
-                .wake_for_paint_animation(crate::refresh_driver::paint_timer_period());
+                .wake_for_paint_animation(animation_period);
         }
         self.log_paint_animation_activity(now, still_animating, animated_property_frame);
     }
