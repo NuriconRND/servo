@@ -294,6 +294,42 @@ pub enum PaintMessage {
     EnableLCPCalculation(WebViewId),
 }
 
+impl PaintMessage {
+    /// 변종 이름. 한 번의 드레인이 느릴 때 무엇이 쏟아졌는지 세는 데만 쓴다 --
+    /// 메시지가 몇 개인지는 알아도 어떤 것이었는지는 아무도 재고 있지 않았다.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ChangeRunningAnimationsState { .. } => "ChangeRunningAnimationsState",
+            Self::SetWebViewAnimating { .. } => "SetWebViewAnimating",
+            Self::SetFrameTreeForWebView { .. } => "SetFrameTreeForWebView",
+            Self::SetThrottled { .. } => "SetThrottled",
+            Self::NewWebRenderFrameReady { .. } => "NewWebRenderFrameReady",
+            Self::PipelineExited { .. } => "PipelineExited",
+            Self::SendInitialTransaction { .. } => "SendInitialTransaction",
+            Self::ScrollNodeByDelta { .. } => "ScrollNodeByDelta",
+            Self::ScrollViewportByDelta { .. } => "ScrollViewportByDelta",
+            Self::UpdateEpoch { .. } => "UpdateEpoch",
+            Self::SendDisplayList { .. } => "SendDisplayList",
+            Self::GenerateFrame { .. } => "GenerateFrame",
+            Self::GetWebViewPainterTargets { .. } => "GetWebViewPainterTargets",
+            Self::GenerateImageKey { .. } => "GenerateImageKey",
+            Self::GenerateImageKeysForPipeline { .. } => "GenerateImageKeysForPipeline",
+            Self::UpdateImages { .. } => "UpdateImages",
+            Self::DelayNewFrameForCanvas { .. } => "DelayNewFrameForCanvas",
+            Self::GenerateFontKeys { .. } => "GenerateFontKeys",
+            Self::AddFont { .. } => "AddFont",
+            Self::AddSystemFont { .. } => "AddSystemFont",
+            Self::AddFontInstance { .. } => "AddFontInstance",
+            Self::RemoveFonts { .. } => "RemoveFonts",
+            Self::CollectMemoryReport { .. } => "CollectMemoryReport",
+            Self::Viewport { .. } => "Viewport",
+            Self::ScreenshotReadinessReponse { .. } => "ScreenshotReadinessReponse",
+            Self::SendLCPCandidate { .. } => "SendLCPCandidate",
+            Self::EnableLCPCalculation { .. } => "EnableLCPCalculation",
+        }
+    }
+}
+
 impl Debug for PaintMessage {
     fn fmt(&self, formatter: &mut Formatter) -> Result<(), Error> {
         let string: &'static str = self.into();

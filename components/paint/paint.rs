@@ -2823,6 +2823,20 @@ impl Paint {
 
     #[servo_tracing::instrument(skip_all)]
     pub fn handle_messages(&self, mut messages: Vec<PaintMessage>) {
+        // ★이 함수는 임베더의 메인 스레드에서 돈다★(`Servo::spin_event_loop`), 그리고 그
+        // 스레드에 표출 클럭이 얹혀 있다. 전환 순간 한 번의 드레인이 698건 469ms 로
+        // 측정되었는데 -- 건당 0.67ms -- 무엇이 쏟아진 것인지는 아무도 세지 않고 있었다.
+        // 세는 비용은 건당 match 하나이므로 건당 0.67ms 옆에서 무시할 수 있다.
+        let drain_start = Instant::now();
+        let messages_seen = messages.len();
+        let mut kinds: Vec<(&'static str, u32)> = Vec::new();
+        for message in &messages {
+            let kind = message.kind();
+            match kinds.iter_mut().find(|(name, _)| *name == kind) {
+                Some((_, count)) => *count += 1,
+                None => kinds.push((kind, 1)),
+            }
+        }
         // Pull out the `NewWebRenderFrameReady` messages from the list of messages and handle them
         // at the end of this function. This prevents overdraw when more than a single message of
         // this type of received. In addition, if any of these frames need a repaint, that reflected
@@ -2883,6 +2897,18 @@ impl Paint {
 
         self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
+
+        // 30ms 는 표출 주기(16.7ms)의 두 배 -- 프레임 두 장을 놓치는 지점부터 관심 대상이다.
+        let drain_ms = drain_start.elapsed().as_secs_f64() * 1000.0;
+        if drain_ms > 30.0 {
+            kinds.sort_by(|left, right| right.1.cmp(&left.1));
+            let breakdown = kinds
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!("PAINTDRAIN drain_ms={drain_ms:.1} msgs={messages_seen} [{breakdown}]");
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]
