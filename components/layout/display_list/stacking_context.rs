@@ -19,6 +19,7 @@ use servo_base::print_tree::PrintTree;
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_geometry::MaxRect;
 use style::Zero;
+use style::animation::DocumentAnimationSet;
 use style::color::AbsoluteColor;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
@@ -29,13 +30,14 @@ use style::values::generics::box_::{OverflowClipMarginBox, Perspective};
 use style::values::generics::transform::{self, GenericRotate, GenericScale, GenericTranslate};
 use style_traits::CSSPixel;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutTransform, LayoutVector2D};
-use webrender_api::{self as wr, BorderRadius};
+use webrender_api::{self as wr, BorderRadius, PropertyBindingKey};
 use wr::StickyOffsetBounds;
 use wr::units::{LayoutPixel, LayoutSize};
 
 use super::ClipId;
 use super::clip::StackingContextTreeClipStore;
 use crate::display_list::conversions::ToWebRender;
+use crate::display_list::paint_animation;
 use crate::display_list::{BuilderForBoxFragment, offset_radii};
 use crate::fragment_tree::{
     BoxFragment, ContainingBlockCalculation, ContainingBlockManager, Fragment, FragmentFlags,
@@ -113,6 +115,12 @@ pub(crate) struct StackingContextTree {
     /// for things like `overflow`. More clips may be created later during WebRender
     /// display list construction, but they are never added here.
     pub clip_store: StackingContextTreeClipStore,
+
+    /// The animations running in this document and the timeline value this tree was built
+    /// at, so a reference frame whose transform is animating can be pushed as a binding
+    /// the paint thread can move on its own. See [`paint_animation`].
+    animations: DocumentAnimationSet,
+    animation_timeline_value: f64,
 }
 
 impl StackingContextTree {
@@ -124,6 +132,8 @@ impl StackingContextTree {
         pipeline_id: wr::PipelineId,
         first_reflow: bool,
         debug: &DiagnosticsLogging,
+        animations: DocumentAnimationSet,
+        animation_timeline_value: f64,
     ) -> Self {
         let scrollable_overflow = fragment_tree.scrollable_overflow();
         let scroll_area = scrollable_overflow.union(&fragment_tree.initial_containing_block);
@@ -177,6 +187,8 @@ impl StackingContextTree {
             root_stacking_context: StackingContext::root(root_scroll_node_id),
             paint_info,
             clip_store: Default::default(),
+            animations,
+            animation_timeline_value,
         };
 
         let text_decorations = Default::default();
@@ -213,6 +225,7 @@ impl StackingContextTree {
         transform_style: wr::TransformStyle,
         transform: LayoutTransform,
         kind: wr::ReferenceFrameKind,
+        animated_transform: Option<PropertyBindingKey<LayoutTransform>>,
     ) -> ScrollTreeNodeId {
         self.paint_info.scroll_tree.add_scroll_tree_node(
             Some(parent_scroll_node_id),
@@ -222,6 +235,7 @@ impl StackingContextTree {
                 transform_style,
                 transform: transform.into(),
                 kind,
+                animated_transform,
             }),
         )
     }
@@ -525,6 +539,15 @@ struct ReferenceFrameData {
     origin: PhysicalPoint<Au>,
     transform: LayoutTransform,
     kind: wr::ReferenceFrameKind,
+    /// The border box the transform was resolved against, and only when this frame's
+    /// matrix is the transform by itself.
+    ///
+    /// ***Both halves of that are load-bearing.*** Percentages in `transform` and
+    /// `transform-origin` resolve against this exact rect, so sampling an animation with
+    /// any other one produces a different matrix; and when perspective is mixed in, the
+    /// frame's matrix is `perspective.then(transform)`, which sampling the transform alone
+    /// would silently drop. `None` means do not bind.
+    animatable_border_rect: Option<Rect<Au, CSSPixel>>,
 }
 struct ScrollFrameData {
     scroll_tree_node_id: ScrollTreeNodeId,
@@ -610,6 +633,27 @@ impl BoxFragment {
             )
             .origin
             .to_webrender();
+        // ***Bound, not baked, when the transform is animating.*** A baked matrix means
+        // the paint thread cannot move this frame without a new display list, and a new
+        // display list means the script thread. See `paint_animation`.
+        let animated_transform = reference_frame_data
+            .animatable_border_rect
+            .and_then(|border_rect| {
+                paint_animation::transform_binding(
+                    &stacking_context_tree.animations,
+                    stacking_context_tree.paint_info.pipeline_id,
+                    self.base.tag.map(|tag| tag.node),
+                    stacking_context_tree.animation_timeline_value,
+                    |list| self.calculate_transform_matrix_for(&border_rect, list),
+                )
+            })
+            .map(|(key, animation)| {
+                stacking_context_tree
+                    .paint_info
+                    .paint_animations
+                    .push(animation);
+                key
+            });
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
             frame_origin_for_query,
@@ -617,6 +661,7 @@ impl BoxFragment {
             style.get_box().transform_style.to_webrender(),
             reference_frame_data.transform,
             reference_frame_data.kind,
+            animated_transform,
         );
 
         // WebRender reference frames establish a new coordinate system at their
@@ -1176,6 +1221,7 @@ impl BoxFragment {
         let border_rect = relative_border_rect.translate(containing_block_rect.origin.to_vector());
         let transform = self.calculate_transform_matrix(&border_rect);
         let perspective = self.calculate_perspective_matrix(&border_rect);
+        let mut animatable_border_rect = None;
         let (reference_frame_transform, reference_frame_kind) = match (transform, perspective) {
             (None, Some(perspective)) => (
                 perspective,
@@ -1183,14 +1229,17 @@ impl BoxFragment {
                     scrolling_relative_to: None,
                 },
             ),
-            (Some(transform), None) => (
-                transform,
-                wr::ReferenceFrameKind::Transform {
-                    is_2d_scale_translation: false,
-                    should_snap: false,
-                    paired_with_perspective: false,
-                },
-            ),
+            (Some(transform), None) => {
+                animatable_border_rect = Some(border_rect);
+                (
+                    transform,
+                    wr::ReferenceFrameKind::Transform {
+                        is_2d_scale_translation: false,
+                        should_snap: false,
+                        paired_with_perspective: false,
+                    },
+                )
+            },
             (Some(transform), Some(perspective)) => (
                 perspective.then(&transform),
                 wr::ReferenceFrameKind::Perspective {
@@ -1204,6 +1253,7 @@ impl BoxFragment {
             origin: border_rect.origin,
             transform: reference_frame_transform,
             kind: reference_frame_kind,
+            animatable_border_rect,
         })
     }
 
@@ -1212,8 +1262,21 @@ impl BoxFragment {
         &self,
         border_rect: &Rect<Au, CSSPixel>,
     ) -> Option<LayoutTransform> {
+        self.calculate_transform_matrix_for(border_rect, &self.style().get_box().transform)
+    }
+
+    /// The same matrix, for a `transform` list that is not the one in the current style.
+    ///
+    /// Used to sample a running animation ahead of time: everything else about the frame
+    /// -- `rotate`, `scale`, `translate`, `transform-origin`, the border box -- comes from
+    /// the style as usual, so a sampled matrix differs from the styled one only in the
+    /// property actually being animated.
+    pub fn calculate_transform_matrix_for(
+        &self,
+        border_rect: &Rect<Au, CSSPixel>,
+        list: &style::values::computed::Transform,
+    ) -> Option<LayoutTransform> {
         let style = self.style();
-        let list = &style.get_box().transform;
         let length_rect = au_rect_to_length_rect(border_rect);
         // https://drafts.csswg.org/css-transforms-2/#individual-transforms
         let rotate = match style.clone_rotate() {

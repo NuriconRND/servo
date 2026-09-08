@@ -6,12 +6,14 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use embedder_traits::EventLoopWaker;
 use rustc_hash::FxHashMap;
 use servo_base::id::WebViewId;
 use servo_config::prefs;
+use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnimationSegment};
+use webrender_api::units::LayoutTransform;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
 
 use crate::refresh_driver::TimerRefreshDriver;
@@ -35,6 +37,9 @@ pub(crate) struct WebContentAnimator {
     caret_visible: Cell<bool>,
     timer_scheduled: Cell<bool>,
     need_update: Arc<AtomicBool>,
+    /// Set while a wake for the next paint-animation frame is already queued, so a long
+    /// animation queues one timer at a time instead of one per turn.
+    paint_animation_wake_scheduled: Arc<AtomicBool>,
 }
 
 impl WebContentAnimator {
@@ -48,7 +53,32 @@ impl WebContentAnimator {
             caret_visible: Cell::new(true),
             timer_scheduled: Default::default(),
             need_update: Default::default(),
+            paint_animation_wake_scheduled: Default::default(),
         }
+    }
+
+    /// Ask for another turn of the paint loop soon, so an animation nobody else is
+    /// driving still advances.
+    ///
+    /// The wall usually has video pushing frames anyway, but a page whose only moving
+    /// thing is one CSS animation has nothing else to wake the painter -- and the whole
+    /// point of these animations is that they keep running when script has stopped
+    /// feeding us.
+    pub(crate) fn wake_for_paint_animation(&self, period: Duration) {
+        if self.paint_animation_wake_scheduled.load(Ordering::Relaxed) {
+            return;
+        }
+        let event_loop_waker = self.event_loop_waker.clone();
+        let scheduled = self.paint_animation_wake_scheduled.clone();
+        self.timer_refresh_driver.queue_timer(
+            period,
+            Box::new(move || {
+                scheduled.store(false, Ordering::Relaxed);
+                event_loop_waker.wake();
+            }),
+        );
+        self.paint_animation_wake_scheduled
+            .store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn schedule_timer_if_necessary(&self) {
@@ -112,6 +142,111 @@ impl WebContentAnimator {
 #[derive(Default)]
 pub(crate) struct PipelineAnimations {
     caret: RefCell<Option<CaretAnimation>>,
+    /// What layout last told us to keep playing, and the clock it is played against.
+    /// Replaced wholesale by every display list -- see [`PaintAnimation`].
+    paint: RefCell<Vec<ActivePaintAnimation>>,
+}
+
+/// A [`PaintAnimation`] anchored to this painter's clock.
+struct ActivePaintAnimation {
+    property: PaintAnimationProperty,
+    /// The instant the animation's own timeline reads zero. Usually in the past.
+    zero: Instant,
+    complete: bool,
+}
+
+/// Interpolate one segment. `Copy + Lerp` would be nicer than a trait per type, but two
+/// concrete types do not earn a trait.
+fn segment_progress<T>(segment: &PaintAnimationSegment<T>, elapsed: f64) -> f64 {
+    let span = segment.end - segment.start;
+    let raw = if span > 0.0 {
+        (elapsed - segment.start) / span
+    } else {
+        1.0
+    };
+    segment.easing.ease(raw)
+}
+
+/// Pick the segment covering `elapsed`, clamping to the first or last one outside the
+/// range. Segments are few (one for a transition, a handful for keyframes), so a scan
+/// beats anything cleverer.
+fn find_segment<T>(
+    segments: &[PaintAnimationSegment<T>],
+    elapsed: f64,
+) -> Option<&PaintAnimationSegment<T>> {
+    if segments.is_empty() {
+        return None;
+    }
+    if elapsed <= segments[0].start {
+        return segments.first();
+    }
+    segments
+        .iter()
+        .find(|segment| elapsed < segment.end)
+        .or_else(|| segments.last())
+}
+
+impl ActivePaintAnimation {
+    /// Whether this animation still has anything left to say at `now`.
+    ///
+    /// An incomplete animation never finishes on its own: it was sampled up to a horizon
+    /// and the truth past that lives in script. Holding the last value is the honest
+    /// thing to do -- it is what the viewer already sees -- and the next display list
+    /// replaces it.
+    fn running(&self, now: Instant) -> bool {
+        if !self.complete {
+            return true;
+        }
+        let elapsed = now.saturating_duration_since(self.zero).as_secs_f64();
+        match &self.property {
+            PaintAnimationProperty::Opacity(_, segments) => {
+                segments.last().is_some_and(|last| elapsed < last.end)
+            },
+            PaintAnimationProperty::Transform(_, segments) => {
+                segments.last().is_some_and(|last| elapsed < last.end)
+            },
+        }
+    }
+
+    fn sample(
+        &self,
+        now: Instant,
+        floats: &mut Vec<PropertyValue<f32>>,
+        transforms: &mut Vec<PropertyValue<LayoutTransform>>,
+    ) {
+        let elapsed = now.saturating_duration_since(self.zero).as_secs_f64();
+        match &self.property {
+            PaintAnimationProperty::Opacity(key, segments) => {
+                let Some(segment) = find_segment(segments, elapsed) else {
+                    return;
+                };
+                let progress = segment_progress(segment, elapsed) as f32;
+                floats.push(PropertyValue {
+                    key: *key,
+                    value: segment.from + (segment.to - segment.from) * progress,
+                });
+            },
+            PaintAnimationProperty::Transform(key, segments) => {
+                let Some(segment) = find_segment(segments, elapsed) else {
+                    return;
+                };
+                let progress = segment_progress(segment, elapsed) as f32;
+                // Componentwise on the matrix. Layout subdivided anything whose CSS
+                // interpolation is not linear in the matrix, so within one segment this
+                // agrees with the styled value to well under a pixel.
+                let from = segment.from.to_array();
+                let to = segment.to.to_array();
+                let mut lerped = [0.0f32; 16];
+                for (index, slot) in lerped.iter_mut().enumerate() {
+                    *slot = from[index] + (to[index] - from[index]) * progress;
+                }
+                transforms.push(PropertyValue {
+                    key: *key,
+                    value: LayoutTransform::from_array(lerped),
+                });
+            },
+        }
+    }
 }
 
 impl PipelineAnimations {
@@ -124,6 +259,53 @@ impl PipelineAnimations {
         }
         *maybe_caret = None;
         None
+    }
+
+    /// Sample every animation this pipeline is playing, and say whether any is still
+    /// going. Values are appended, never replaced -- the caller collects across pipelines
+    /// and sends one transaction.
+    pub(crate) fn update_paint_animations(
+        &self,
+        now: Instant,
+        floats: &mut Vec<PropertyValue<f32>>,
+        transforms: &mut Vec<PropertyValue<LayoutTransform>>,
+    ) -> bool {
+        let mut animations = self.paint.borrow_mut();
+        // A finished animation is dropped rather than kept at its end value: WebRender
+        // holds the last value it was given, and the display list that ends the animation
+        // carries the final value inline anyway.
+        animations.retain(|animation| animation.running(now));
+        for animation in animations.iter() {
+            animation.sample(now, floats, transforms);
+        }
+        !animations.is_empty()
+    }
+
+    /// Replace what this pipeline is playing with what the new display list says.
+    ///
+    /// ***Wholesale replacement is the correctness argument.*** Layout samples forward
+    /// from the moment it built the list, so as long as script keeps up, every frame's
+    /// prediction is overwritten by the truth before it can drift. Only when script stops
+    /// producing display lists does the prediction actually get used for long, and that is
+    /// exactly when it is worth having.
+    pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
+        let received_at = Instant::now();
+        *self.paint.borrow_mut() = paint_animations
+            .into_iter()
+            .map(|animation| {
+                let offset = Duration::from_secs_f64(animation.offset_from_display_list.abs());
+                let zero = if animation.offset_from_display_list <= 0.0 {
+                    received_at.checked_sub(offset).unwrap_or(received_at)
+                } else {
+                    received_at + offset
+                };
+                ActivePaintAnimation {
+                    property: animation.property,
+                    zero,
+                    complete: animation.complete,
+                }
+            })
+            .collect();
     }
 
     pub(crate) fn handle_new_display_list(

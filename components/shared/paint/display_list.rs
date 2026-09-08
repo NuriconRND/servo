@@ -195,6 +195,10 @@ pub struct ReferenceFrameNodeInfo {
     pub transform_style: TransformStyle,
     pub transform: FastLayoutTransform,
     pub kind: ReferenceFrameKind,
+    /// Set when this frame's transform is being animated on the paint side, so the
+    /// reference frame is pushed as a binding rather than a baked value. The matching
+    /// [`PaintAnimation`] travels in [`PaintDisplayListInfo::paint_animations`].
+    pub animated_transform: Option<PropertyBindingKey<LayoutTransform>>,
 }
 
 /// Data stored for nodes in the [ScrollTree] that actually scroll,
@@ -837,6 +841,275 @@ impl ScrollTree {
     }
 }
 
+/// The shape of one segment of a paint-side animation.
+///
+/// A CSS timing function, reduced to what the paint thread needs to evaluate it. Layout
+/// keeps the authoritative animation; this is only enough to play the next stretch of it.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum PaintAnimationEasing {
+    Linear,
+    /// The four control-point coordinates of a `cubic-bezier()`.
+    CubicBezier(f32, f32, f32, f32),
+    /// `steps(count, jump_start)`; `jump_start` distinguishes `start` from `end`.
+    Steps(u32, bool),
+}
+
+impl PaintAnimationEasing {
+    /// Map linear progress through a segment to eased progress.
+    ///
+    /// The bezier solve is Newton's method over the curve's x, which is what every engine
+    /// does here; ten iterations is far more than the four or five it takes to converge to
+    /// float precision on the curves CSS allows.
+    pub fn ease(&self, progress: f64) -> f64 {
+        let progress = progress.clamp(0.0, 1.0);
+        match *self {
+            Self::Linear => progress,
+            Self::CubicBezier(x1, y1, x2, y2) => {
+                let (x1, y1, x2, y2) = (x1 as f64, y1 as f64, x2 as f64, y2 as f64);
+                let sample = |a: f64, b: f64, t: f64| {
+                    let inverse = 1.0 - t;
+                    3.0 * inverse * inverse * t * a + 3.0 * inverse * t * t * b + t * t * t
+                };
+                let mut t = progress;
+                for _ in 0..10 {
+                    let x = sample(x1, x2, t) - progress;
+                    if x.abs() < 1e-6 {
+                        break;
+                    }
+                    let inverse = 1.0 - t;
+                    let derivative = 3.0 * inverse * inverse * x1
+                        + 6.0 * inverse * t * (x2 - x1)
+                        + 3.0 * t * t * (1.0 - x2);
+                    if derivative.abs() < 1e-6 {
+                        break;
+                    }
+                    t -= x / derivative;
+                    t = t.clamp(0.0, 1.0);
+                }
+                sample(y1, y2, t)
+            },
+            Self::Steps(count, jump_start) => {
+                let count = count.max(1) as f64;
+                let step = (progress * count).floor() + if jump_start { 1.0 } else { 0.0 };
+                (step / count).clamp(0.0, 1.0)
+            },
+        }
+    }
+}
+
+/// One stretch of a paint-side animation, in seconds from the animation's start.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct PaintAnimationSegment<T> {
+    pub start: f64,
+    pub end: f64,
+    pub from: T,
+    pub to: T,
+    pub easing: PaintAnimationEasing,
+}
+
+/// The animated property, its WebRender binding, and the segments to play.
+///
+/// ***Transform segments are interpolated as matrices, so layout subdivides.*** CSS
+/// interpolates transform *lists* componentwise, and a matrix lerp only agrees with that
+/// for translation and scale. Layout resolves the exact value at each sub-segment
+/// boundary, which keeps the error inside a sub-segment invisible without teaching the
+/// paint thread anything about transform lists.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub enum PaintAnimationProperty {
+    Opacity(PropertyBindingKey<f32>, Vec<PaintAnimationSegment<f32>>),
+    Transform(
+        PropertyBindingKey<LayoutTransform>,
+        Vec<PaintAnimationSegment<LayoutTransform>>,
+    ),
+}
+
+/// Which property of an element a binding key refers to, so one element can bind more
+/// than one property without the keys colliding.
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum PaintAnimatedProperty {
+    Opacity = 0,
+    Transform = 1,
+}
+
+/// The WebRender property binding key for one element's animated property.
+///
+/// ***The top bit is reserved so these can never collide with the caret's key.*** The
+/// caret builds its key out of the pipeline id itself (`PropertyBindingKey::new(pipeline)`),
+/// so an animation key must never land on a pipeline index. Real pipeline indices do not
+/// approach 2^31, so setting the top bit separates the two spaces outright instead of
+/// probabilistically.
+///
+/// The rest is a hash of the node, which is unique process-wide. That also makes the key
+/// stable across display lists: an element keeps its binding for as long as its animation
+/// runs, so WebRender keeps applying values to the same place.
+pub fn paint_animation_binding_key<T>(
+    pipeline_id: PipelineId,
+    node: u64,
+    property: PaintAnimatedProperty,
+) -> PropertyBindingKey<T> {
+    let mut hash = node;
+    hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= hash >> 32;
+    hash = hash.wrapping_add(property as u64);
+    let uid = (hash as u32) | 0x8000_0000;
+    PropertyBindingKey::new(((pipeline_id.0 as u64) << 32) | uid as u64)
+}
+
+impl PaintAnimationSegment<f32> {
+    /// Two sampled values closer than this count as the same value.
+    pub const EPSILON: f32 = 1.0 / 2048.0;
+
+    /// Turn evenly spaced samples into as few straight segments as reproduce them.
+    ///
+    /// ***Sampling and then merging, rather than reading keyframes, is deliberate.*** The
+    /// sample is whatever the style system says the value is, so easing, iteration count,
+    /// direction and fill are all handled by the code that already implements them, and
+    /// this stays a few lines instead of a second implementation of CSS animation. The
+    /// merge is what keeps that cheap: a linear fade -- the common case -- collapses to a
+    /// single segment no matter how densely it was sampled, and the result travels with
+    /// every display list and is cloned once per painter.
+    pub fn from_samples(samples: &[f32], step: f64) -> Vec<Self> {
+        let mut segments: Vec<Self> = Vec::new();
+        let mut start_index = 0usize;
+        for index in 1..samples.len() {
+            let start = samples[start_index];
+            let end = samples[index];
+            let span = (index - start_index) as f32;
+            // Does every sample in between sit on the line from `start` to `end`?
+            let straight = (start_index + 1..index).all(|between| {
+                let expected = start + (end - start) * ((between - start_index) as f32 / span);
+                (samples[between] - expected).abs() <= Self::EPSILON
+            });
+            if straight {
+                continue;
+            }
+            segments.push(Self {
+                start: start_index as f64 * step,
+                end: (index - 1) as f64 * step,
+                from: samples[start_index],
+                to: samples[index - 1],
+                easing: PaintAnimationEasing::Linear,
+            });
+            start_index = index - 1;
+        }
+        if start_index + 1 < samples.len() {
+            segments.push(Self {
+                start: start_index as f64 * step,
+                end: (samples.len() - 1) as f64 * step,
+                from: samples[start_index],
+                to: samples[samples.len() - 1],
+                easing: PaintAnimationEasing::Linear,
+            });
+        }
+        // A run that never moves is not an animation. Returning it anyway would let a
+        // caller bind a property to a value that never changes, and a bound property
+        // WebRender is never given a value for keeps whatever it last held -- which is
+        // worse than never binding it.
+        if segments
+            .iter()
+            .all(|segment| (segment.to - segment.from).abs() <= Self::EPSILON)
+        {
+            return Vec::new();
+        }
+        segments
+    }
+}
+
+impl PaintAnimationSegment<LayoutTransform> {
+    /// How far apart two matrices may be and still count as the same one.
+    ///
+    /// A matrix mixes translations in pixels with scales and rotations around one, so a
+    /// single tolerance has to be judged against the largest term. This is a hundredth of
+    /// a pixel at unit scale, which is below anything a display can show.
+    pub const EPSILON: f32 = 0.01;
+
+    /// The same merge as the scalar case, componentwise on the matrix.
+    ///
+    /// ***Matrices are interpolated componentwise here and CSS interpolates transform
+    /// lists.*** Those agree exactly for translation and scale, and diverge for rotation,
+    /// which is why layout samples at the rate it does and lets the merge decide: a
+    /// rotation simply fails the straightness test and keeps more segments, so the error
+    /// inside any surviving segment stays under `EPSILON` by construction.
+    pub fn from_samples(samples: &[LayoutTransform], step: f64) -> Vec<Self> {
+        let straight_between = |from: &LayoutTransform, to: &LayoutTransform, at: &LayoutTransform, progress: f32| {
+            let from = from.to_array();
+            let to = to.to_array();
+            let at = at.to_array();
+            (0..16).all(|index| {
+                let expected = from[index] + (to[index] - from[index]) * progress;
+                (at[index] - expected).abs() <= Self::EPSILON
+            })
+        };
+        let differs = |a: &LayoutTransform, b: &LayoutTransform| {
+            let a = a.to_array();
+            let b = b.to_array();
+            (0..16).any(|index| (a[index] - b[index]).abs() > Self::EPSILON)
+        };
+
+        let mut segments: Vec<Self> = Vec::new();
+        let mut start_index = 0usize;
+        for index in 1..samples.len() {
+            let span = (index - start_index) as f32;
+            let straight = (start_index + 1..index).all(|between| {
+                straight_between(
+                    &samples[start_index],
+                    &samples[index],
+                    &samples[between],
+                    (between - start_index) as f32 / span,
+                )
+            });
+            if straight {
+                continue;
+            }
+            segments.push(Self {
+                start: start_index as f64 * step,
+                end: (index - 1) as f64 * step,
+                from: samples[start_index],
+                to: samples[index - 1],
+                easing: PaintAnimationEasing::Linear,
+            });
+            start_index = index - 1;
+        }
+        if start_index + 1 < samples.len() {
+            segments.push(Self {
+                start: start_index as f64 * step,
+                end: (samples.len() - 1) as f64 * step,
+                from: samples[start_index],
+                to: samples[samples.len() - 1],
+                easing: PaintAnimationEasing::Linear,
+            });
+        }
+        if segments
+            .iter()
+            .all(|segment| !differs(&segment.from, &segment.to))
+        {
+            return Vec::new();
+        }
+        segments
+    }
+}
+
+/// An animation the paint thread can play without asking script for anything.
+///
+/// ***This is a prediction, and script rebases it.*** Every display list carries the
+/// animations that are live at the moment it was built, sampled forward from that moment.
+/// While script keeps up, each new display list replaces the previous prediction with the
+/// truth and nothing drifts. When script stalls -- laying out a new configuration,
+/// starting fifty video pipelines -- the paint thread keeps playing the last prediction
+/// instead of showing a frozen frame. That is the whole point: measured on the 4-GPU wall
+/// (log_ani_perf/03), a single content-switch task held script for 9.5 seconds while the
+/// painters were idle enough to composite 60 frames a second the entire time.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct PaintAnimation {
+    pub property: PaintAnimationProperty,
+    /// Seconds from the display list's creation to the animation's zero point. Negative
+    /// for an animation already under way, which is the usual case.
+    pub offset_from_display_list: f64,
+    /// Whether the segments run to the animation's end. When false the animation outlives
+    /// what was sampled and the paint thread holds the last value until script catches up.
+    pub complete: bool,
+}
+
 /// A data structure which stores `Paint`-side information about
 /// display lists sent to `Paint`.
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -882,6 +1155,10 @@ pub struct PaintDisplayListInfo {
     /// If this display list contains a blinking caret, this value will be filled with its animation
     /// key and original color value so that the painter can animate the caret.
     pub caret_property_binding: Option<(PropertyBindingKey<ColorF>, ColorF)>,
+
+    /// The animations the paint thread should keep playing on its own until the next
+    /// display list arrives. See [`PaintAnimation`].
+    pub paint_animations: Vec<PaintAnimation>,
 }
 
 impl PaintDisplayListInfo {
@@ -904,6 +1181,7 @@ impl PaintDisplayListInfo {
                 transform_style: TransformStyle::Flat,
                 transform: FastLayoutTransform::identity(),
                 kind: ReferenceFrameKind::default(),
+                animated_transform: None,
             }),
         );
         let root_scroll_node_id = scroll_tree.add_scroll_tree_node(
@@ -933,6 +1211,7 @@ impl PaintDisplayListInfo {
             is_contentful: false,
             first_reflow,
             caret_property_binding: Default::default(),
+            paint_animations: Vec::new(),
         }
     }
 
@@ -985,5 +1264,205 @@ mod promote_tests {
         // 3D Y-플립: z 결합 -> false.
         let m = LayoutTransform::rotation(0.0, 1.0, 0.0, Angle::degrees(45.0));
         assert!(!is_2d_scale_translation(&m));
+    }
+}
+
+#[cfg(test)]
+mod paint_animation_tests {
+    use super::*;
+
+    fn replay(segments: &[PaintAnimationSegment<f32>], step: f64, count: usize) -> Vec<f32> {
+        (0..count)
+            .map(|index| {
+                let time = index as f64 * step;
+                let segment = segments
+                    .iter()
+                    .find(|segment| time < segment.end)
+                    .unwrap_or_else(|| segments.last().expect("no segments"));
+                let span = segment.end - segment.start;
+                let progress = if span > 0.0 {
+                    ((time - segment.start) / span).clamp(0.0, 1.0) as f32
+                } else {
+                    1.0
+                };
+                segment.from + (segment.to - segment.from) * progress
+            })
+            .collect()
+    }
+
+    /// ***A straight fade must not cost a segment per sample.*** These segments travel
+    /// with every display list and are cloned once per painter, so a representation that
+    /// grew with the sample rate would make the fix a cost of its own.
+    #[test]
+    fn a_linear_run_collapses_to_one_segment() {
+        let samples: Vec<f32> = (0..=60).map(|index| index as f32 / 60.0).collect();
+        let segments = PaintAnimationSegment::<f32>::from_samples(&samples, 1.0 / 60.0);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].from, 0.0);
+        assert_eq!(segments[0].to, 1.0);
+    }
+
+    /// A curve keeps enough segments to stay within tolerance at every sample it was
+    /// built from -- the merge is allowed to be lossy only below what anyone can see.
+    #[test]
+    fn a_curve_is_reproduced_within_tolerance() {
+        let step = 1.0 / 60.0;
+        let samples: Vec<f32> = (0..=60)
+            .map(|index| {
+                let t = index as f32 / 60.0;
+                t * t * (3.0 - 2.0 * t)
+            })
+            .collect();
+        let segments = PaintAnimationSegment::<f32>::from_samples(&samples, step);
+        assert!(segments.len() > 1, "a smoothstep is not a straight line");
+        for (index, replayed) in replay(&segments, step, samples.len()).iter().enumerate() {
+            assert!(
+                (replayed - samples[index]).abs() <= PaintAnimationSegment::<f32>::EPSILON * 2.0,
+                "sample {index}: replayed {replayed}, sampled {}",
+                samples[index]
+            );
+        }
+    }
+
+    /// A constant run produces nothing to play, which is what tells the caller not to bind
+    /// the property at all. Binding with no values behind it would be worse than not
+    /// binding: WebRender would hold whatever it last had.
+    #[test]
+    fn a_constant_run_produces_nothing_to_play() {
+        let samples = vec![0.5f32; 61];
+        assert!(PaintAnimationSegment::<f32>::from_samples(&samples, 1.0 / 60.0).is_empty());
+    }
+
+    /// ***Animation keys must never collide with the caret's.*** The caret keys off the
+    /// pipeline id itself, so the top bit is reserved to keep the two spaces apart.
+    #[test]
+    fn keys_stay_out_of_the_caret_key_space() {
+        let pipeline = PipelineId(7, 3);
+        let key: PropertyBindingKey<f32> =
+            paint_animation_binding_key(pipeline, 0x1234_5678, PaintAnimatedProperty::Opacity);
+        assert_eq!(key.id.namespace.0, 7);
+        assert_ne!(key.id.uid, 3, "must not land on the pipeline's own uid");
+        assert_ne!(key.id.uid & 0x8000_0000, 0);
+    }
+
+    /// The same element keeps the same key, so its binding survives from one display list
+    /// to the next and WebRender keeps applying values to it. Different elements, and the
+    /// same element's different properties, do not share one.
+    #[test]
+    fn keys_are_stable_and_distinct() {
+        let pipeline = PipelineId(1, 1);
+        let opacity: PropertyBindingKey<f32> =
+            paint_animation_binding_key(pipeline, 42, PaintAnimatedProperty::Opacity);
+        let again: PropertyBindingKey<f32> =
+            paint_animation_binding_key(pipeline, 42, PaintAnimatedProperty::Opacity);
+        let other_node: PropertyBindingKey<f32> =
+            paint_animation_binding_key(pipeline, 43, PaintAnimatedProperty::Opacity);
+        let other_property: PropertyBindingKey<f32> =
+            paint_animation_binding_key(pipeline, 42, PaintAnimatedProperty::Transform);
+        assert_eq!(opacity.id, again.id);
+        assert_ne!(opacity.id, other_node.id);
+        assert_ne!(opacity.id, other_property.id);
+    }
+
+    /// The easing must hit both ends exactly, or a fade would never reach 0 or 1.
+    #[test]
+    fn easing_is_exact_at_the_ends() {
+        for easing in [
+            PaintAnimationEasing::Linear,
+            PaintAnimationEasing::CubicBezier(0.25, 0.1, 0.25, 1.0),
+            PaintAnimationEasing::Steps(4, false),
+        ] {
+            assert_eq!(easing.ease(0.0), 0.0, "{easing:?} at 0");
+            assert_eq!(easing.ease(1.0), 1.0, "{easing:?} at 1");
+        }
+    }
+
+    /// `ease` is the CSS default and must actually curve: an implementation that silently
+    /// fell back to linear would look right in a still frame and wrong in motion.
+    #[test]
+    fn the_default_easing_curves() {
+        let ease = PaintAnimationEasing::CubicBezier(0.25, 0.1, 0.25, 1.0);
+        let midpoint = ease.ease(0.5);
+        assert!(
+            midpoint > 0.55,
+            "ease() should be ahead of linear at the midpoint, got {midpoint}"
+        );
+        assert!(ease.ease(0.25) < ease.ease(0.75), "must be monotonic");
+    }
+
+    /// ***A translate must survive the merge as one segment, and a rotate must not.***
+    /// Matrix lerp and CSS transform-list interpolation agree for translation and
+    /// disagree for rotation; the merge is what keeps the disagreement below the
+    /// tolerance, by refusing to collapse what is not straight in matrix space.
+    #[test]
+    fn a_translation_collapses_but_a_rotation_does_not() {
+        let step = 1.0 / 60.0;
+        let translations: Vec<LayoutTransform> = (0..=60)
+            .map(|index| LayoutTransform::translation(index as f32, 0.0, 0.0))
+            .collect();
+        assert_eq!(
+            PaintAnimationSegment::<LayoutTransform>::from_samples(&translations, step).len(),
+            1,
+            "a straight translate is one segment"
+        );
+
+        let rotations: Vec<LayoutTransform> = (0..=60)
+            .map(|index| {
+                LayoutTransform::rotation(
+                    0.0,
+                    0.0,
+                    1.0,
+                    euclid::Angle::degrees(index as f32 * 3.0),
+                )
+            })
+            .collect();
+        let segments = PaintAnimationSegment::<LayoutTransform>::from_samples(&rotations, step);
+        assert!(
+            segments.len() > 1,
+            "a rotation is not straight in matrix space, got {} segment(s)",
+            segments.len()
+        );
+        // And what survives is within tolerance of the exact samples.
+        for (index, sample) in rotations.iter().enumerate() {
+            let time = index as f64 * step;
+            let segment = segments
+                .iter()
+                .find(|segment| time < segment.end)
+                .unwrap_or_else(|| segments.last().expect("no segments"));
+            let span = segment.end - segment.start;
+            let progress = if span > 0.0 {
+                ((time - segment.start) / span).clamp(0.0, 1.0) as f32
+            } else {
+                1.0
+            };
+            let from = segment.from.to_array();
+            let to = segment.to.to_array();
+            for (slot, exact) in sample.to_array().iter().enumerate() {
+                let replayed = from[slot] + (to[slot] - from[slot]) * progress;
+                assert!(
+                    (replayed - exact).abs() <= PaintAnimationSegment::<LayoutTransform>::EPSILON,
+                    "sample {index} slot {slot}: replayed {replayed}, exact {exact}"
+                );
+            }
+        }
+    }
+
+    /// A transform that never moves produces nothing to play, for the same reason as the
+    /// scalar case: a bound property with no values behind it keeps whatever it last had.
+    #[test]
+    fn a_constant_transform_produces_nothing_to_play() {
+        let samples = vec![LayoutTransform::translation(3.0, 4.0, 0.0); 61];
+        assert!(
+            PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, 1.0 / 60.0).is_empty()
+        );
+    }
+
+    /// Progress outside the segment clamps rather than extrapolating, so a late frame
+    /// cannot push a value past its endpoint.
+    #[test]
+    fn easing_clamps_outside_the_unit_interval() {
+        let easing = PaintAnimationEasing::Linear;
+        assert_eq!(easing.ease(-1.0), 0.0);
+        assert_eq!(easing.ease(2.0), 1.0);
     }
 }

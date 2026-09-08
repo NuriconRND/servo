@@ -29,6 +29,7 @@ use style::computed_values::text_decoration_style::{
     T as ComputedTextDecorationStyle, T as TextDecorationStyle,
 };
 use style::dom::OpaqueNode;
+use style::animation::DocumentAnimationSet;
 use style::properties::ComputedValues;
 use style::properties::longhands::visibility::computed_value::T as Visibility;
 use style::properties::style_structs::Border;
@@ -75,6 +76,7 @@ mod clip;
 mod conversions;
 mod gradient;
 mod hit_test;
+pub(crate) mod paint_animation;
 mod paint_timing_handler;
 mod paint_traversal;
 mod stacking_context;
@@ -137,6 +139,12 @@ pub(crate) struct DisplayListBuilder<'a> {
 
     /// The [`PaintDisplayListInfo`] used to collect display list items and metadata.
     pub paint_info: &'a mut PaintDisplayListInfo,
+
+    /// The animations running in this document, and the timeline value this display list
+    /// is being built at. Used to hand the paint thread animations it can keep playing on
+    /// its own; see [`paint_animation`].
+    animations: &'a DocumentAnimationSet,
+    animation_timeline_value: f64,
 
     /// Data about the fragments that are highlighted by the inspector, if any.
     ///
@@ -224,6 +232,8 @@ impl DisplayListBuilder<'_> {
         debug: &DiagnosticsLogging,
         paint_timing_handler: &mut PaintTimingHandler,
         reflow_statistics: &mut ReflowStatistics,
+        animations: &DocumentAnimationSet,
+        animation_timeline_value: f64,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
         let paint_info = &mut stacking_context_tree.paint_info;
@@ -246,6 +256,8 @@ impl DisplayListBuilder<'_> {
             current_reference_frame_scroll_node_id: paint_info.root_reference_frame_id,
             webrender_display_list_builder: &mut webrender_display_list_builder,
             paint_info,
+            animations,
+            animation_timeline_value,
             inspector_highlight: highlighted_dom_node.map(InspectorHighlight::for_node),
             paint_body_background: true,
             clip_map: Default::default(),
@@ -266,6 +278,10 @@ impl DisplayListBuilder<'_> {
 
         // Clear any caret color from previous display list constructions.
         builder.paint_info.caret_property_binding = None;
+        // ...and the paint-side animations, for the same reason: this info is reused
+        // across builds, and an animation left behind would be re-sent every frame with a
+        // stale zero point, so it would replay from the beginning forever.
+        builder.paint_info.paint_animations.clear();
 
         builder.add_all_spatial_nodes();
 
@@ -288,6 +304,7 @@ impl DisplayListBuilder<'_> {
 
         PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut builder);
         builder.paint_dom_inspector_highlight();
+        paint_animation::log_built(builder.paint_info.paint_animations.len());
 
         webrender_display_list_builder.end().1
     }
@@ -366,11 +383,16 @@ impl DisplayListBuilder<'_> {
 
             mapping.push(match &node.info {
                 SpatialTreeNodeInfo::ReferenceFrame(info) => {
+                    let transform = *info.transform.to_transform();
+                    let transform = match info.animated_transform {
+                        Some(key) => PropertyBinding::Binding(key, transform),
+                        None => PropertyBinding::Value(transform),
+                    };
                     let spatial_id = self.wr().push_reference_frame(
                         info.origin,
                         *parent_spatial_node_id,
                         info.transform_style,
-                        PropertyBinding::Value(*info.transform.to_transform()),
+                        transform,
                         info.kind,
                         spatial_tree_item_key,
                     );
@@ -510,11 +532,21 @@ impl DisplayListBuilder<'_> {
             .iter()
             .map(|filter| FilterToWebRender::to_webrender(filter, &current_color))
             .collect();
-        if effects.opacity != 1.0 {
-            filters.push(wr::FilterOp::Opacity(
-                effects.opacity.into(),
-                effects.opacity,
-            ));
+        // ***Bound, not baked, when it is animating.*** A baked opacity means the paint
+        // thread cannot move it without a whole new display list, and a new display list
+        // means the script thread. See `paint_animation`.
+        let (opacity_binding, paint_animation) = paint_animation::opacity_binding(
+            self.animations,
+            self.paint_info.pipeline_id,
+            fragment.base.tag.map(|tag| tag.node),
+            self.animation_timeline_value,
+            effects.opacity,
+        );
+        if let Some(paint_animation) = paint_animation {
+            self.paint_info.paint_animations.push(paint_animation);
+            filters.push(wr::FilterOp::Opacity(opacity_binding, effects.opacity));
+        } else if effects.opacity != 1.0 {
+            filters.push(wr::FilterOp::Opacity(opacity_binding, effects.opacity));
         }
 
         // TODO(jdm): WebRender now requires us to create stacking context items

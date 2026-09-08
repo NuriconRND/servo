@@ -433,6 +433,19 @@ pub struct Preferences {
     ///
     /// 아직 스레드로 가지 못하는 경로가 둘 있다(스크린샷, 메모리 리포트). 켠 상태에서 그
     /// 요청이 오면 건너뛰고 그 사실을 로그로 말한다.
+    /// Hand running CSS animations of paint-only properties to the paint thread, so they
+    /// keep playing while the script thread is busy.
+    ///
+    /// ***Off means an animation stops whenever script stops.*** Every animation frame
+    /// otherwise costs a restyle, a whole-document display list and a scene build per
+    /// painter, because the animated value is baked into the display list. Measured on the
+    /// 4-GPU wall, 2026-09-08 (`log_ani_perf/03`): a content-switch task held the script
+    /// thread for 9.5 seconds, and the recurring ones for 310-345 ms each, while the
+    /// painters composited 60 frames a second throughout with nothing to show.
+    ///
+    /// On by default; the switch exists to isolate this if a page ever renders wrong.
+    pub gfx_paint_side_animations_enabled: bool,
+
     pub gfx_wall_parallel_tiles: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
@@ -945,6 +958,7 @@ impl Preferences {
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
             gfx_wall_rotate_tile_order: false,
+            gfx_paint_side_animations_enabled: true,
             gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
             gfx_refresh_hz: 120,

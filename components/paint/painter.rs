@@ -356,6 +356,11 @@ pub(crate) struct Painter {
     /// `ScriptThread` display list construction.
     pub(crate) frame_delayer: FrameDelayer,
 
+    /// `PAINTANIM` accounting: frames this painter produced purely to advance a
+    /// paint-side animation, and when the current one-second window opened.
+    paint_animation_frames: Cell<u64>,
+    paint_animation_window_start: RefCell<Option<Instant>>,
+
     /// The channel on which messages can be sent to the constellation.
     embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
 
@@ -774,6 +779,8 @@ impl Painter {
             webrender_gl,
             last_mouse_move_position: None,
             frame_delayer: Default::default(),
+            paint_animation_frames: Default::default(),
+            paint_animation_window_start: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
             pending_video_frame_updates: RefCell::new(FxHashMap::default()),
@@ -817,17 +824,77 @@ impl Painter {
 
         self.send_zoom_and_scroll_offset_updates(need_zoom, scroll_offset_updates);
 
-        if let Some(colors) = self.web_content_animator.update(&self.webview_renderers) {
+        // ***One transaction carries every dynamic property, because sending resets them
+        // all.*** `reset_dynamic_properties` clears colors, floats and transforms
+        // together, so sending the caret's color alone would blank whatever a CSS
+        // animation had bound, and the reverse. They are collected together for that
+        // reason, not for tidiness.
+        let colors = self.web_content_animator.update(&self.webview_renderers);
+        let now = Instant::now();
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        let mut still_animating = false;
+        for renderer in self.webview_renderers.values() {
+            renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                still_animating |= pipeline_details.animations.update_paint_animations(
+                    now,
+                    &mut floats,
+                    &mut transforms,
+                );
+            });
+        }
+
+        let animated_property_frame = !floats.is_empty() || !transforms.is_empty();
+        if colors.is_some() || animated_property_frame {
             let mut transaction = Transaction::new();
             transaction.reset_dynamic_properties();
             transaction.append_dynamic_properties(DynamicProperties {
-                transforms: Vec::new(),
-                floats: Vec::new(),
-                colors,
+                transforms,
+                floats,
+                colors: colors.unwrap_or_default(),
             });
             self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
             self.send_transaction(transaction);
         }
+
+        // Nothing else may be waking this painter: the point of these animations is that
+        // they run while script is not producing anything.
+        if still_animating {
+            self.web_content_animator
+                .wake_for_paint_animation(crate::refresh_driver::paint_timer_period());
+        }
+        self.log_paint_animation_activity(now, still_animating, animated_property_frame);
+    }
+
+    /// One `PAINTANIM` line a second while anything is playing.
+    ///
+    /// ***The number that matters is `frames`.*** Whether an animation is bound at all is
+    /// visible from the display list, but whether it is still moving while script is stuck
+    /// is only visible here: these are frames the paint thread produced with no display
+    /// list behind them. On a build without this, that count is zero by construction.
+    fn log_paint_animation_activity(&self, now: Instant, animating: bool, generated: bool) {
+        if generated {
+            self.paint_animation_frames
+                .set(self.paint_animation_frames.get() + 1);
+        }
+        let started = *self
+            .paint_animation_window_start
+            .borrow_mut()
+            .get_or_insert(now);
+        if now.duration_since(started) < Duration::from_secs(1) {
+            return;
+        }
+        let frames = self.paint_animation_frames.replace(0);
+        *self.paint_animation_window_start.borrow_mut() = Some(now);
+        if frames == 0 && !animating {
+            return;
+        }
+        // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
+        // diagnostic nobody can see is a diagnostic that does not exist.
+        warn!(
+            "PAINTANIM painter={:?} playing={} frames={}",
+            self.painter_id, animating, frames
+        );
     }
 
     #[track_caller]
@@ -2373,6 +2440,9 @@ impl Painter {
             display_list_info.caret_property_binding,
             &self.web_content_animator,
         );
+        details
+            .animations
+            .install_paint_animations(display_list_info.paint_animations);
 
         let mut transaction = Transaction::new();
         let is_root_pipeline = Some(pipeline_id.into()) == webview_renderer.root_pipeline_id;

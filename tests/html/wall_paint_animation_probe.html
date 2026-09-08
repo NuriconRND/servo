@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Paint-side animation probe</title>
+<!--
+  Does a CSS animation keep running while the script thread is busy?
+
+  The page deliberately blocks its own script thread for a second at a time, which is what
+  the wall application does to itself on every content switch (measured 2026-09-08: 310-345
+  ms per switch, 9.5 s for the first). Two things are on screen:
+
+    * the FADE bar, animated by CSS `opacity` only
+    * the SCRIPT counter, redrawn from requestAnimationFrame
+
+  With paint-side animations working, the bar keeps fading while the counter is frozen.
+  Without them the bar freezes too, which is the bug this page exists to show.
+
+  Query parameters: ?block=<ms>&gap=<ms>&period=<ms>
+-->
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #101014;
+    color: #e8e8ef;
+    font: 16px/1.4 system-ui, sans-serif;
+  }
+  #wrap {
+    box-sizing: border-box;
+    height: 100%;
+    padding: 3vh 3vw;
+    display: flex;
+    flex-direction: column;
+    gap: 2vh;
+  }
+  #fade {
+    flex: 1 1 auto;
+    border-radius: 1vh;
+    background: linear-gradient(90deg, #2bd6a4, #4a9dff 45%, #b06bff);
+    animation: fade var(--period, 1200ms) linear infinite alternate;
+  }
+  @keyframes fade {
+    from { opacity: 0.12; }
+    to   { opacity: 1; }
+  }
+  #readout {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 3vw;
+    align-items: baseline;
+    font-variant-numeric: tabular-nums;
+  }
+  .label { opacity: 0.55; font-size: 0.8em; letter-spacing: 0.08em; }
+  .value { font-size: 2.2em; font-weight: 600; }
+  #state { font-size: 1.1em; }
+  .blocking { color: #ff8f6b; }
+  .idle { color: #7fe2a8; }
+</style>
+
+<div id="wrap">
+  <div id="fade"></div>
+  <div id="readout">
+    <div><div class="label">SCRIPT FRAMES</div><div class="value" id="frames">0</div></div>
+    <div><div class="label">LONGEST GAP</div><div class="value" id="gap">0 ms</div></div>
+    <div><div class="label">STATE</div><div class="value" id="state">starting</div></div>
+  </div>
+</div>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const blockMs = Number(params.get("block") || 1000);
+  const gapMs = Number(params.get("gap") || 2000);
+  const periodMs = Number(params.get("period") || 1200);
+  document.getElementById("fade").style.setProperty("--period", periodMs + "ms");
+
+  const framesEl = document.getElementById("frames");
+  const gapEl = document.getElementById("gap");
+  const stateEl = document.getElementById("state");
+
+  let frames = 0;
+  let longestGap = 0;
+  let lastFrame = performance.now();
+
+  function tick(now) {
+    const delta = now - lastFrame;
+    lastFrame = now;
+    if (delta > longestGap) {
+      longestGap = delta;
+      gapEl.textContent = Math.round(longestGap) + " ms";
+    }
+    framesEl.textContent = ++frames;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // Hold the script thread the way a content switch does: not waiting on anything, just
+  // not yielding. Nothing script-driven can advance while this runs.
+  function block() {
+    stateEl.textContent = "blocking " + blockMs + "ms";
+    stateEl.className = "value blocking";
+    const until = performance.now() + blockMs;
+    let sink = 0;
+    while (performance.now() < until) {
+      sink += Math.sqrt(sink + 1);
+    }
+    stateEl.textContent = "idle";
+    stateEl.className = "value idle";
+    console.log("[probe] blocked " + blockMs + "ms, sink=" + sink.toFixed(0));
+    setTimeout(block, gapMs);
+  }
+  setTimeout(block, gapMs);
+</script>

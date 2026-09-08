@@ -1246,6 +1246,10 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::PipelineId);
 malloc_size_of_is_webrender_malloc_size_of!(
     webrender_api::PropertyBindingKey<webrender_api::ColorF>
 );
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::PropertyBindingKey<f32>);
+malloc_size_of_is_webrender_malloc_size_of!(
+    webrender_api::PropertyBindingKey<webrender_api::units::LayoutTransform>
+);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ReferenceFrameKind);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::RepeatMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::SpatialId);

@@ -675,7 +675,11 @@ impl Layout for LayoutThread {
             {
                 return;
             }
-            self.build_stacking_context_tree(viewport_details);
+            // A tree built to answer a layout query carries no animations: this path has
+            // none to give, and the next reflow rebuilds the tree anyway. The cost of
+            // being wrong here is one display list without paint-side bindings, which is
+            // exactly the behaviour before they existed.
+            self.build_stacking_context_tree(viewport_details, &DocumentAnimationSet::default(), 0.0);
         })
     }
 
@@ -1306,11 +1310,20 @@ impl LayoutThread {
             return false;
         }
 
-        self.build_stacking_context_tree(reflow_request.viewport_details)
+        self.build_stacking_context_tree(
+            reflow_request.viewport_details,
+            &reflow_request.animations,
+            reflow_request.animation_timeline_value,
+        )
     }
 
     #[servo_tracing::instrument(name = "Stacking Context Tree Construction", skip_all)]
-    fn build_stacking_context_tree(&self, viewport_details: ViewportDetails) -> bool {
+    fn build_stacking_context_tree(
+        &self,
+        viewport_details: ViewportDetails,
+        animations: &DocumentAnimationSet,
+        animation_timeline_value: f64,
+    ) -> bool {
         let Some(fragment_tree) = &*self.fragment_tree.borrow() else {
             return false;
         };
@@ -1332,6 +1345,8 @@ impl LayoutThread {
             self.id.into(),
             !self.have_ever_generated_display_list.get(),
             &self.debug,
+            animations.clone(),
+            animation_timeline_value,
         );
 
         // When a new StackingContextTree is built, it contains a freshly built
@@ -1417,6 +1432,8 @@ impl LayoutThread {
             &self.debug,
             paint_timing_handler,
             reflow_statistics,
+            &reflow_request.animations,
+            reflow_request.animation_timeline_value,
         );
         self.paint_api.send_display_list(
             self.webview_id,
