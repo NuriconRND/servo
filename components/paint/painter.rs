@@ -550,6 +550,24 @@ fn thread_cpu_ms() -> f64 {
     0.0
 }
 
+/// `update_images` 한 번의 시간을 합성 요청 / 트랜잭션 전송 / 나머지로 가른 누계.
+///
+/// 이 함수는 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
+#[derive(Default)]
+struct UpdateImagesStats {
+    window_start: Option<Instant>,
+    calls: u64,
+    frames: u64,
+    total_ms: f64,
+    frame_ms: f64,
+    send_ms: f64,
+}
+
+thread_local! {
+    static UPDATE_IMAGES_STATS: RefCell<UpdateImagesStats> =
+        RefCell::new(UpdateImagesStats::default());
+}
+
 impl Painter {
     pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
         let webrender_gl = rendering_context.gleam_gl_api();
@@ -2728,6 +2746,13 @@ impl Painter {
     }
 
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
+        // 이 함수 한 번이 45µs 로 측정됐고(초당 5,812회 = 메인 스레드의 287ms), 그 시간이
+        // 스태시인지 합성 요청인지 트랜잭션 전송인지는 재지 않으면 모른다. pref 읽기는
+        // 하나뿐이라 이미 배제됐다.
+        let inner_started = Instant::now();
+        let mut frame_ms = 0.0_f64;
+        let mut send_ms = 0.0_f64;
+        let mut frames_generated = 0u32;
         let mut txn = Transaction::new();
         // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
         // frames). These are not paced by the script rendering-opportunity, so they otherwise wait
@@ -2797,7 +2822,10 @@ impl Painter {
             !self.consume_canvas_ack_skip()
         {
             self.frame_delayer.set_pending_frame(false);
+            let frame_started = Instant::now();
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            frame_ms += frame_started.elapsed().as_secs_f64() * 1000.0;
+            frames_generated += 1;
             self.set_display_composite_in_flight(true);
             generated_frame = true;
             let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
@@ -2914,7 +2942,10 @@ impl Painter {
             !raf_driving_composites &&
             !self.renderer_behind()
         {
+            let frame_started = Instant::now();
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            frame_ms += frame_started.elapsed().as_secs_f64() * 1000.0;
+            frames_generated += 1;
             self.set_display_composite_in_flight(true);
             self.video_composite_owed.set(false);
             // Stamped when the composite is ISSUED, not when it was owed, so a painter that
@@ -2926,8 +2957,36 @@ impl Painter {
         // transaction (the stash is flushed by the next composite); skip the send to avoid
         // pushing hundreds of no-op transactions per second through the scene builder.
         if !txn.is_empty() {
+            let send_started = Instant::now();
             self.send_transaction(txn);
+            send_ms = send_started.elapsed().as_secs_f64() * 1000.0;
         }
+        UPDATE_IMAGES_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            stats.calls += 1;
+            stats.total_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
+            stats.frame_ms += frame_ms;
+            stats.send_ms += send_ms;
+            stats.frames += frames_generated as u64;
+            let window = stats.window_start.get_or_insert_with(Instant::now);
+            let elapsed = window.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                warn!(
+                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    stats.calls,
+                    stats.total_ms,
+                    stats.frames,
+                    stats.frame_ms,
+                    stats.send_ms,
+                    (stats.total_ms - stats.frame_ms - stats.send_ms).max(0.0),
+                );
+                *stats = UpdateImagesStats {
+                    window_start: Some(Instant::now()),
+                    ..Default::default()
+                };
+            }
+        });
     }
 
     /// 미뤄 둔 DComp Commit 의 디바이스를 인계한다(병렬 Commit 용). 인계했으면 이 painter 는
