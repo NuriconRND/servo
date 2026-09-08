@@ -864,6 +864,17 @@ impl Painter {
             });
         }
         let floats_log: Vec<f32> = floats.iter().map(|property| property.value).collect();
+        // ***The transform values too.*** The application animates `transform`, and a log
+        // that only prints floats reports `floats=[]` for it -- which reads as "nothing is
+        // animating" when the truth is "the thing that is animating is not being printed".
+        // Cost a diagnostic round on 2026-09-08 (log_ani_perf/11).
+        let transforms_log: Vec<(f32, f32, f32)> = transforms
+            .iter()
+            .map(|property| {
+                let matrix = property.value.to_array();
+                (matrix[12], matrix[13], matrix[0])
+            })
+            .collect();
 
         // ***An animation is a value laid onto the frames this wall already produces, not
         // a reason to produce more.*** The painter renders and presents on a clock, and
@@ -926,7 +937,13 @@ impl Painter {
             self.web_content_animator
                 .wake_for_paint_animation(animation_period);
         }
-        self.log_paint_animation_activity(now, still_animating, animated_property_frame, &floats_log);
+        self.log_paint_animation_activity(
+            now,
+            still_animating,
+            animated_property_frame,
+            &floats_log,
+            &transforms_log,
+        );
     }
 
     /// One `PAINTANIM` line a second while anything is playing.
@@ -941,6 +958,7 @@ impl Painter {
         animating: bool,
         generated: bool,
         values: &[f32],
+        transforms: &[(f32, f32, f32)],
     ) {
         if generated {
             self.paint_animation_frames
@@ -976,9 +994,17 @@ impl Painter {
         // `rode_along` is the healthy number on a wall that is already drawing: the values
         // went out and somebody else's frame carried them. `frames` is what this animation
         // had to produce on its own, and on a page full of video it should be near zero.
+        // Translation x/y and the x scale: enough to see a slide or a zoom move, without
+        // printing sixteen numbers per animation.
+        let transform_sample = transforms
+            .iter()
+            .take(3)
+            .map(|(x, y, scale)| format!("{x:.1}/{y:.1}@{scale:.2}"))
+            .collect::<Vec<_>>()
+            .join(",");
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={} floats=[{}]",
-            self.painter_id, animating, frames, rode_along, skipped, sample
+            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={}              floats=[{}] transforms=[{}]",
+            self.painter_id, animating, frames, rode_along, skipped, sample, transform_sample
         );
     }
 
