@@ -10,6 +10,7 @@ mod media_thread;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use euclid::default::Size2D;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
@@ -678,6 +679,15 @@ struct MediaExternalImages {
     ring_init_frame: u64,
     ring_init_done: i64,
     ring_init_deferred: u32,
+    /// 초당 한 줄 요약. ★임계값 위만 찍으면 '보통 한 번이 얼마인가'를 알 수 없다★ —
+    /// 애니메이션 구간의 lock 은 평균 0.91ms 라 2ms 임계값 아래로 숨는데, 정작 프레임당
+    /// 59회가 도는 것이 그것들이다. 홍수를 내지 않고 보려면 합계여야 한다.
+    lock_window_start: Instant,
+    lock_window_calls: u32,
+    lock_window_consumes: u32,
+    lock_window_total_ms: f64,
+    lock_window_consume_ms: f64,
+    lock_window_wrap_ms: f64,
 }
 
 /// 월 GPU 팬아웃 불변식 감시용 기록: `(D3D11 디바이스 포인터, 그 디바이스를 받은 첫
@@ -824,6 +834,12 @@ impl MediaExternalImages {
             ring_init_frame: u64::MAX,
             ring_init_done: 0,
             ring_init_deferred: 0,
+            lock_window_start: Instant::now(),
+            lock_window_calls: 0,
+            lock_window_consumes: 0,
+            lock_window_total_ms: 0.0,
+            lock_window_consume_ms: 0.0,
+            lock_window_wrap_ms: 0.0,
         }
     }
 
@@ -1013,6 +1029,36 @@ impl MediaExternalImages {
             }
         };
         let total_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+        self.lock_window_calls += 1;
+        self.lock_window_total_ms += total_ms;
+        self.lock_window_consume_ms += stage_consume_ms;
+        self.lock_window_wrap_ms += stage_wrap_ms;
+        if stage_consume_ms > 0.0 {
+            self.lock_window_consumes += 1;
+        }
+        let window = lock_started.duration_since(self.lock_window_start);
+        if window >= Duration::from_secs(1) {
+            let rest_ms = (self.lock_window_total_ms
+                - self.lock_window_consume_ms
+                - self.lock_window_wrap_ms)
+                .max(0.0);
+            warn!(
+                "MEDIALOCKRATE window_ms={:.0} calls={} consumes={} total_ms={:.1} consume_ms={:.1} wrap_ms={:.1} rest_ms={:.1}",
+                window.as_secs_f64() * 1000.0,
+                self.lock_window_calls,
+                self.lock_window_consumes,
+                self.lock_window_total_ms,
+                self.lock_window_consume_ms,
+                self.lock_window_wrap_ms,
+                rest_ms,
+            );
+            self.lock_window_start = lock_started;
+            self.lock_window_calls = 0;
+            self.lock_window_consumes = 0;
+            self.lock_window_total_ms = 0.0;
+            self.lock_window_consume_ms = 0.0;
+            self.lock_window_wrap_ms = 0.0;
+        }
         if total_ms > *MEDIA_LOCK_SLOW_MS {
             warn!(
                 "MEDIALOCK total_ms={total_ms:.2} consume_ms={stage_consume_ms:.2} wrap_ms={stage_wrap_ms:.2} wrap_cached={wrap_cached} ring_id={ring_id} plane={} consume=[{}]",
