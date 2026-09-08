@@ -1484,16 +1484,24 @@ impl Painter {
         // A stall frame with normal upload_mb points at a driver/GPU sync or cache
         // reallocation; one with a big upload_mb spike points at an upload burst.
         if *LOG_PRESENT_CADENCE && render_ms > 16.0 {
-            let (upload_mb, upload_ms, draw_calls) =
-                wr_stats.as_ref().map_or((0.0, 0.0, 0), |stats| {
+            // ★`cpu_ms` 가 wall 의 절반을 넘는다는 것이 실측되었다★(340ms 중 140ms,
+            // 280ms 중 219ms) — 이 정체는 GPU 대기가 아니라 이 스레드가 태우는 CPU 다.
+            // 그런데 업로드는 0이고 draw call 은 26개다. 그러면 WebRender 가 이미 재고
+            // 있는 나머지 시계들을 봐야 한다 — 특히 GPU 캐시 갱신은 프레임마다 CPU 로
+            // 데이터를 채우는 자리라, 전환처럼 프리미티브가 통째로 바뀌면 커진다.
+            let (upload_mb, upload_ms, gpu_cache_ms, draw_calls, alpha_targets, color_targets) =
+                wr_stats.as_ref().map_or((0.0, 0.0, 0.0, 0, 0, 0), |stats| {
                     (
                         stats.texture_upload_mb,
                         stats.resource_upload_time,
+                        stats.gpu_cache_upload_time,
                         stats.total_draw_calls,
+                        stats.alpha_target_count,
+                        stats.color_target_count,
                     )
                 });
             info!(
-                "Slow paint frame: painter {:?} total_ms={:.2} angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} cpu_ms={:.1} pending_frames={}",
+                "Slow paint frame: painter {:?} total_ms={:.2} angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} gpu_cache_ms={:.1} alpha_targets={} color_targets={} cpu_ms={:.1} pending_frames={}",
                 self.painter_id,
                 render_ms,
                 angle_lock_ms,
@@ -1502,6 +1510,9 @@ impl Painter {
                 upload_mb,
                 upload_ms,
                 draw_calls,
+                gpu_cache_ms,
+                alpha_targets,
+                color_targets,
                 render_cpu_ms,
                 self.pending_frames.get(),
             );
