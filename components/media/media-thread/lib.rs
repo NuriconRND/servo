@@ -114,7 +114,10 @@ impl RawVideoFrameExternalImages {
         let planes = raw_video_planes().lock().unwrap();
         let lock_wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
         if lock_wait_ms > 10.0 {
-            warn!("Slow raw plane read lock: id={} lock_wait_ms={:.1}", id, lock_wait_ms);
+            warn!(
+                "Slow raw plane read lock: id={} lock_wait_ms={:.1}",
+                id, lock_wait_ms
+            );
         }
         planes.get(&id).cloned()
     }
@@ -430,7 +433,8 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
             // first Advance then re-Maps slot 0 legitimately. Slots 1..N stay
             // mapped and are committed Free.
             let mut mapped: Vec<RemappedPlane> = Vec::new();
-            let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] = [None; MAX_PLANES];
+            let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] =
+                [None; MAX_PLANES];
             for (slot_idx, slot) in slots.iter().enumerate() {
                 for (plane_idx, plane) in slot.iter().enumerate() {
                     let Some(desc) = plane else {
@@ -500,7 +504,9 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
                         data_ptr,
                         row_pitch,
                     }),
-                    None => warn!("D3D11 media: Advance re-map failed (ring={ring_id} texture={texture})"),
+                    None => warn!(
+                        "D3D11 media: Advance re-map failed (ring={ring_id} texture={texture})"
+                    ),
                 }
             }
             D3d11PlaneRings::commit_consume(
@@ -818,6 +824,15 @@ impl MediaExternalImages {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
 
+        // ★이 함수가 벽의 전환 정체 전부다★ — 느린 프레임에서 WebRender 의 deferred
+        // resolve 루프가 63회 lock 에 288ms 를 쓴다(회당 4.57ms). 그 안에서 무엇이 비싼지는
+        // 아무도 재지 않고 있었다. 단계별로 재서, 한 번이 임계값을 넘을 때만 한 줄 낸다
+        // (`SERVO_MEDIA_LOCK_SLOW_MS`, 기본 2ms).
+        let lock_started = std::time::Instant::now();
+        let mut stage_consume_ms = 0.0_f64;
+        let mut stage_wrap_ms = 0.0_f64;
+        let mut wrap_cached = true;
+
         // ★가시성 신호★ — WR 은 이 타일에서 실제로 합성하는 external image 만
         // lock 한다. 따라서 이 호출이 곧 "이 영상이 이 타일에 보인다" 이고,
         // 프로듀서는 여기에 기록된 디바이스에만 업로드한다.
@@ -839,12 +854,13 @@ impl MediaExternalImages {
         // Some(plan)은 반드시 정확히 한 번 commit_consume으로 끝나야 한다
         // (consume_plan이 모든 실패 분기 포함 이를 보장한다).
         if let Some(plan) = D3d11PlaneRings::note_plane_lock_and_plan(ring_id) {
+            let consume_start = std::time::Instant::now();
             consume_plan(&*rc, ring_id, plan);
+            stage_consume_ms = consume_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         // lock 반환용 텍스처: 현재 Presenting 슬롯의 이 plane 기술자.
-        let Some(plane) = D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index)
-        else {
+        let Some(plane) = D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index) else {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
 
@@ -852,6 +868,7 @@ impl MediaExternalImages {
         let wrap = if let Some(cached) = self.d3d11_wrap_cache.get(&plane.texture) {
             *cached
         } else {
+            wrap_cached = false;
             let import_start = std::time::Instant::now(); // D3D11PROF
             match rc.wrap_d3d11_texture_as_gl_texture(plane.texture) {
                 Some(wrap) => {
@@ -880,6 +897,7 @@ impl MediaExternalImages {
                         );
                     }
                     self.d3d11_wrap_cache.insert(plane.texture, wrap);
+                    stage_wrap_ms = import_start.elapsed().as_secs_f64() * 1000.0;
                     wrap
                 },
                 None => {
@@ -894,11 +912,21 @@ impl MediaExternalImages {
                             ring_id,
                         );
                     }
-                    warn!("D3D11 media: EGLImage 래핑 실패 (texture={})", plane.texture);
+                    warn!(
+                        "D3D11 media: EGLImage 래핑 실패 (texture={})",
+                        plane.texture
+                    );
                     return (ExternalImageSource::Invalid, Size2D::zero());
                 },
             }
         };
+        let total_ms = lock_started.elapsed().as_secs_f64() * 1000.0;
+        if total_ms > *MEDIA_LOCK_SLOW_MS {
+            warn!(
+                "MEDIALOCK total_ms={total_ms:.2} consume_ms={stage_consume_ms:.2} wrap_ms={stage_wrap_ms:.2} wrap_cached={wrap_cached} ring_id={ring_id} plane={}",
+                binding.plane_index,
+            );
+        }
         (
             ExternalImageSource::NativeTexture(wrap.gl_texture),
             Size2D::new(plane.width, plane.height),
@@ -937,8 +965,19 @@ impl Drop for MediaExternalImages {
     }
 }
 
-impl WebRenderExternalImageApi for MediaExternalImages {
-    fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
+/// 한 번의 미디어 lock 이 이 값을 넘으면 단계별로 한 줄 남긴다(ms).
+///
+/// 렌더러 스레드의 핫패스라 기본값을 낮게 두지 않는다 -- 63회가 도는 프레임에서 회당
+/// 2ms 면 이미 126ms 로, 프레임을 통째로 놓치는 크기다.
+static MEDIA_LOCK_SLOW_MS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+    std::env::var("SERVO_MEDIA_LOCK_SLOW_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2.0)
+});
+
+impl MediaExternalImages {
+    fn lock_inner(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         // 제거된 링의 GPU 텍스처를 공통 prologue에서 배출한다: 마지막 D3D11
         // 비디오가 멈춰 더 이상 D3D11 plane을 lock하지 않게 된 뒤에도 다음
         // 임의 미디어 lock(raw 포함)에서 배수되도록. take_removed_rings가 비면
@@ -1013,7 +1052,26 @@ impl WebRenderExternalImageApi for MediaExternalImages {
             .map(|glplayer_images| glplayer_images.lock(id))
             .unwrap_or((ExternalImageSource::Invalid, Size2D::zero()))
     }
+}
 
+impl WebRenderExternalImageApi for MediaExternalImages {
+    /// ★두 경로를 모두 덮는다★ — 아래 본체는 D3D11 zero-copy 와 raw 업로드로 갈리는데,
+    /// 벽이 어느 쪽을 타는지 개발기에서는 확인할 수 없다(월 모드에서 페이지가 뜨지
+    /// 않는다). 안쪽 한 갈래에만 계측을 넣으면 침묵할 위험이 있으므로, 총 시간과 경로는
+    /// 여기서 잰다. 단계별 분해(`MEDIALOCK`)는 D3D11 경로에서만 나온다.
+    fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
+        let outer_start = std::time::Instant::now();
+        let is_d3d11 = D3d11VideoFrameExternalImages::binding_for(id).is_some();
+        let locked = self.lock_inner(id);
+        let total_ms = outer_start.elapsed().as_secs_f64() * 1000.0;
+        if total_ms > *MEDIA_LOCK_SLOW_MS {
+            warn!(
+                "MEDIALOCKTOTAL total_ms={total_ms:.2} path={} id={id}",
+                if is_d3d11 { "d3d11" } else { "raw" },
+            );
+        }
+        locked
+    }
     fn unlock(&mut self, id: u64) {
         // D3D11 plane: lock에서 로컬 추적한 것만 note_plane_unlock으로 짝을 맞춘다
         // (lock_count 감소). 래핑 캐시는 unlock에서 유지한다 — 폐기는 링 제거 시.
