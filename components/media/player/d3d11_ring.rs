@@ -282,25 +282,107 @@ static NEXT_RING_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 포이즌된 뮤텍스를 복구해서 잠근다(한 스레드의 패닉이 다른 스레드의
 /// 비디오 처리를 영구히 막지 않도록).
-/// 이 자물쇠를 **기다린** 시간의 누계(ns)와 획득 횟수.
+/// 자물쇠 하나에 대한 대기/보유 통계.
 ///
-/// ★레지스트리는 전역 뮤텍스 하나다★ — 페인터 넷이 프레임마다 영상 수만큼 lock 을 걸고,
-/// 프로듀서 수십 개가 프레임마다 슬롯을 발행하며, lock 한 번이 이 자물쇠를 네 번 잡는다.
-/// 소비자 쪽 `lock` 의 시간 중 회전도 래핑도 아닌 나머지가 호출당 0.58ms 로 측정됐는데,
-/// 그 모양이 계산이 아니라 경합이다. 그러나 '경합처럼 보인다'와 '경합이다'는 다르므로,
-/// 기다린 시간을 직접 센다. 획득 자체는 원자적 덧셈 두 번만 더 든다.
-pub static REGISTRY_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static REGISTRY_ACQUIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ★대기만 재면 경합이 있다는 것까지만 안다★ — 소비자 획득을 25% 줄였는데(78,546 →
+/// 58,837/s) 대기는 7,678 → 7,050ms 로 거의 그대로였다. 그러면 원인은 잡는 횟수가 아니라
+/// 누군가 **오래 쥐고 있는 것**이고, 그건 보유 시간을 재야 보인다. 최댓값을 같이 두는
+/// 것은 합계만으로는 '많이 조금씩'과 '한 번 오래'를 구분할 수 없기 때문이다.
+pub struct LockStats {
+    pub wait_ns: AtomicU64,
+    pub hold_ns: AtomicU64,
+    pub count: AtomicU64,
+    pub max_wait_ns: AtomicU64,
+    pub max_hold_ns: AtomicU64,
+}
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    let started = std::time::Instant::now();
+impl LockStats {
+    const fn new() -> Self {
+        Self {
+            wait_ns: AtomicU64::new(0),
+            hold_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            max_wait_ns: AtomicU64::new(0),
+            max_hold_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn note(counter: &AtomicU64, max: &AtomicU64, value: u64) {
+        counter.fetch_add(value, Ordering::Relaxed);
+        max.fetch_max(value, Ordering::Relaxed);
+    }
+
+    /// 창 하나 분량을 꺼내고 0 으로 되돌린다: (대기ms, 보유ms, 횟수, 최대대기ms, 최대보유ms).
+    pub fn take(&self) -> (f64, f64, u64, f64, f64) {
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        (
+            ms(self.wait_ns.swap(0, Ordering::Relaxed)),
+            ms(self.hold_ns.swap(0, Ordering::Relaxed)),
+            self.count.swap(0, Ordering::Relaxed),
+            ms(self.max_wait_ns.swap(0, Ordering::Relaxed)),
+            ms(self.max_hold_ns.swap(0, Ordering::Relaxed)),
+        )
+    }
+}
+
+/// 링 레지스트리(전역 하나). 소비자·프로듀서가 모두 여기서 만난다.
+pub static REGISTRY_LOCK: LockStats = LockStats::new();
+/// 제거된 링 회수 큐. 소비자가 lock 마다 한 번씩 들여다본다.
+pub static REMOVED_LOCK: LockStats = LockStats::new();
+
+/// 보유 시간을 Drop 에서 기록하는 가드.
+struct TrackedGuard<'a, T> {
+    guard: MutexGuard<'a, T>,
+    stats: &'static LockStats,
+    acquired: Instant,
+}
+
+impl<T> std::ops::Deref for TrackedGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for TrackedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for TrackedGuard<'_, T> {
+    fn drop(&mut self) {
+        LockStats::note(
+            &self.stats.hold_ns,
+            &self.stats.max_hold_ns,
+            self.acquired.elapsed().as_nanos() as u64,
+        );
+    }
+}
+
+fn lock_tracked<'a, T>(m: &'a Mutex<T>, stats: &'static LockStats) -> TrackedGuard<'a, T> {
+    let started = Instant::now();
     let guard = m.lock().unwrap_or_else(|poison| poison.into_inner());
-    REGISTRY_WAIT_NS.fetch_add(
-        started.elapsed().as_nanos() as u64,
-        std::sync::atomic::Ordering::Relaxed,
+    let acquired = Instant::now();
+    LockStats::note(
+        &stats.wait_ns,
+        &stats.max_wait_ns,
+        acquired.duration_since(started).as_nanos() as u64,
     );
-    REGISTRY_ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    guard
+    stats.count.fetch_add(1, Ordering::Relaxed);
+    TrackedGuard {
+        guard,
+        stats,
+        acquired,
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> TrackedGuard<'_, T> {
+    lock_tracked(m, &REGISTRY_LOCK)
+}
+
+fn lock_removed(m: &Mutex<Vec<RemovedRing>>) -> TrackedGuard<'_, Vec<RemovedRing>> {
+    lock_tracked(m, &REMOVED_LOCK)
 }
 
 fn plane_textures(slot: &SlotInfo) -> Vec<usize> {
@@ -403,7 +485,7 @@ impl D3d11PlaneRings {
                 }
             }
         }
-        lock(removed_rings()).push(RemovedRing {
+        lock_removed(removed_rings()).push(RemovedRing {
             ring_id,
             textures,
             mapped,
@@ -758,7 +840,7 @@ impl D3d11PlaneRings {
     /// 가져가게 된다. [`take_removed_rings_for_device`](Self::take_removed_rings_for_device)
     /// 를 쓴다. 이 함수는 단일 소비자 경로와 테스트용으로 남긴다.
     pub fn take_removed_rings() -> Vec<RemovedRing> {
-        std::mem::take(&mut *lock(removed_rings()))
+        std::mem::take(&mut *lock_removed(removed_rings()))
     }
 
     /// 제거된 링 중 **`device` 가 만든 것만** 가져간다(나머지는 큐에 남겨 둔다).
@@ -767,7 +849,7 @@ impl D3d11PlaneRings {
     /// 디바이스에서 해야 한다. 전역 드레인을 쓰면 painter A 가 painter B 의
     /// 텍스처를 해제한다.
     pub fn take_removed_rings_for_device(device: usize) -> Vec<RemovedRing> {
-        let mut queue = lock(removed_rings());
+        let mut queue = lock_removed(removed_rings());
         let mut mine = Vec::new();
         let mut rest = Vec::with_capacity(queue.len());
         for ring in std::mem::take(&mut *queue) {

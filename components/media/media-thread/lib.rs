@@ -1050,17 +1050,16 @@ impl MediaExternalImages {
         }
         let window = lock_started.duration_since(self.lock_window_start);
         if window >= Duration::from_secs(1) {
-            let wait_ns = servo_media::player::d3d11_ring::REGISTRY_WAIT_NS
-                .swap(0, std::sync::atomic::Ordering::Relaxed);
-            let registry_acquires = servo_media::player::d3d11_ring::REGISTRY_ACQUIRES
-                .swap(0, std::sync::atomic::Ordering::Relaxed);
-            let registry_wait_ms = wait_ns as f64 / 1_000_000.0;
+            let (reg_wait, reg_hold, reg_n, reg_max_wait, reg_max_hold) =
+                servo_media::player::d3d11_ring::REGISTRY_LOCK.take();
+            let (rem_wait, rem_hold, rem_n, rem_max_wait, rem_max_hold) =
+                servo_media::player::d3d11_ring::REMOVED_LOCK.take();
             let rest_ms = (self.lock_window_total_ms
                 - self.lock_window_consume_ms
                 - self.lock_window_wrap_ms)
                 .max(0.0);
             warn!(
-                "MEDIALOCKRATE window_ms={:.0} calls={} consumes={} total_ms={:.1} consume_ms={:.1} wrap_ms={:.1} rest_ms={:.1} registry_wait_ms={:.1} registry_acquires={}",
+                "MEDIALOCKRATE window_ms={:.0} calls={} consumes={} total_ms={:.1} consume_ms={:.1} wrap_ms={:.1} rest_ms={:.1} reg[n={} wait={:.1} hold={:.1} max_wait={:.1} max_hold={:.1}] removed[n={} wait={:.1} hold={:.1} max_wait={:.1} max_hold={:.1}]",
                 window.as_secs_f64() * 1000.0,
                 self.lock_window_calls,
                 self.lock_window_consumes,
@@ -1068,9 +1067,18 @@ impl MediaExternalImages {
                 self.lock_window_consume_ms,
                 self.lock_window_wrap_ms,
                 rest_ms,
-                // 전역 레지스트리 뮤텍스를 기다린 시간(프로세스 전체 누계의 이 창 몫).
-                registry_wait_ms,
-                registry_acquires,
+                // 자물쇠 둘을 나눠 낸다. 대기만으로는 '많이 조금씩'과 '한 번 오래'가
+                // 구분되지 않으므로 보유 시간과 각각의 최댓값을 함께 낸다.
+                reg_n,
+                reg_wait,
+                reg_hold,
+                reg_max_wait,
+                reg_max_hold,
+                rem_n,
+                rem_wait,
+                rem_hold,
+                rem_max_wait,
+                rem_max_hold,
             );
             self.lock_window_start = lock_started;
             self.lock_window_calls = 0;
