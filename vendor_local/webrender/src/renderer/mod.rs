@@ -471,6 +471,13 @@ thread_local! {
     static WALL_RESOLVE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WALL_RESOLVE_LOCK_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static WALL_RESOLVE_RESET_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// 초당 한 줄 요약용 누계. ★느린 프레임만 찍으면 '평소에는 얼마인가'를 알 수 없다★ --
+    /// 애니메이션이 붙었을 때와 영상만 띄웠을 때가 어떻게 다른지는 그 비교로만 갈린다.
+    static WALL_WINDOW_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static WALL_WINDOW_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_LOCK_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static WALL_WINDOW_RENDER_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 #[derive(Debug)]
@@ -1786,6 +1793,38 @@ impl Renderer {
         // draw call 은 26개, GPU 캐시 갱신은 0.2ms 다 -- 그릴 게 많아서가 아니다.
         // WebRender 는 이미 단계별 시간을 재고 있지만 밖으로 내보내는 접근자가 없어,
         // 느린 프레임에서만 그 값을 한 줄로 낸다.
+        // 초당 한 줄: 프레임 수 / resolve 수 / lock 시간 / 렌더 시간. 임계값이 없으므로
+        // 빠른 구간도 그대로 보인다.
+        {
+            let now = std::time::Instant::now();
+            let start = WALL_WINDOW_START.with(|c| c.get()).unwrap_or_else(|| {
+                WALL_WINDOW_START.with(|c| c.set(Some(now)));
+                now
+            });
+            WALL_WINDOW_FRAMES.with(|c| c.set(c.get() + 1));
+            WALL_WINDOW_RESOLVES
+                .with(|c| c.set(c.get() + WALL_RESOLVE_COUNT.with(|n| n.get()) as u64));
+            WALL_WINDOW_LOCK_MS
+                .with(|c| c.set(c.get() + WALL_RESOLVE_LOCK_MS.with(|n| n.get())));
+            WALL_WINDOW_RENDER_MS.with(|c| c.set(c.get() + t));
+            let elapsed = now.duration_since(start);
+            if elapsed >= std::time::Duration::from_secs(1) {
+                log::warn!(
+                    "WRRATE window_ms={:.0} frames={} resolves={} lock_ms={:.1} render_ms={:.1}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    WALL_WINDOW_FRAMES.with(|c| c.get()),
+                    WALL_WINDOW_RESOLVES.with(|c| c.get()),
+                    WALL_WINDOW_LOCK_MS.with(|c| c.get()),
+                    WALL_WINDOW_RENDER_MS.with(|c| c.get()),
+                );
+                WALL_WINDOW_START.with(|c| c.set(Some(now)));
+                WALL_WINDOW_FRAMES.with(|c| c.set(0));
+                WALL_WINDOW_RESOLVES.with(|c| c.set(0));
+                WALL_WINDOW_LOCK_MS.with(|c| c.set(0.0));
+                WALL_WINDOW_RENDER_MS.with(|c| c.set(0.0));
+            }
+        }
+
         // 임계값을 env 로 뺀 것은 개발기에서 이 줄이 실제로 찍히는지 확인하기 위해서다
         // -- 침묵하는 계측을 테스트 장비로 보내는 실수를 이 작업에서 이미 두 번 했다.
         static WR_SLOW_MS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
