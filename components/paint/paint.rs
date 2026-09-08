@@ -1111,6 +1111,23 @@ bitflags! {
     }
 }
 
+/// `UpdateImages` 한 건의 시간을 팬아웃 바깥과 페인터 안으로 가른 누계(초당 한 줄).
+///
+/// 드레인이 메시지 77건에 45.7ms 였다 — 건당 0.59ms 다. 건수가 적은데 건당이 비싸면
+/// 줄이는 쪽이 아니라 안을 봐야 하고, 그 안이 어디인지는 재지 않으면 모른다.
+/// 이 드레인은 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
+#[derive(Default)]
+struct ImageUpdateStats {
+    window_start: Option<Instant>,
+    calls: u64,
+    total_ms: f64,
+    inner_ms: f64,
+}
+
+thread_local! {
+    static IMAGE_UPDATE_STATS: RefCell<ImageUpdateStats> = RefCell::new(ImageUpdateStats::default());
+}
+
 impl Paint {
     pub fn new(state: InitialPaintState) -> Rc<RefCell<Self>> {
         let registration = state.mem_profiler_chan.prepare_memory_reporting(
@@ -2215,6 +2232,10 @@ impl Paint {
                 self.handle_generate_image_keys_for_pipeline(webview_id, pipeline_id);
             },
             PaintMessage::UpdateImages(painter_id, updates) => {
+                // 이 한 건이 0.59ms 로 측정됐다(드레인 77건에 45.7ms). 그 시간이 팬아웃
+                // 바깥(타겟 찾기·복제)인지 페인터 안(스태시·합성 요청)인지 갈라야 고칠
+                // 곳이 정해진다. 초당 한 줄로 낸다.
+                let arm_started = Instant::now();
                 let target_painter_ids = self.target_painter_ids_for_source_painter(painter_id);
                 if target_painter_ids.len() > 1 {
                     let mut add_count = 0;
@@ -2255,12 +2276,37 @@ impl Paint {
                         );
                     }
                 }
+                let mut inner_ms = 0.0_f64;
                 for target_painter_id in target_painter_ids {
                     let updates = updates.clone();
+                    let inner_started = Instant::now();
                     self.with_painter_mut(target_painter_id, move |painter| {
                         painter.update_images(updates)
                     });
+                    inner_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
                 }
+                IMAGE_UPDATE_STATS.with(|stats| {
+                    let mut stats = stats.borrow_mut();
+                    stats.calls += 1;
+                    stats.total_ms += arm_started.elapsed().as_secs_f64() * 1000.0;
+                    stats.inner_ms += inner_ms;
+                    let window = stats.window_start.get_or_insert_with(Instant::now);
+                    let elapsed = window.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        warn!(
+                            "IMGUPDRATE window_ms={:.0} calls={} total_ms={:.1} inner_ms={:.1} fanout_ms={:.1}",
+                            elapsed.as_secs_f64() * 1000.0,
+                            stats.calls,
+                            stats.total_ms,
+                            stats.inner_ms,
+                            (stats.total_ms - stats.inner_ms).max(0.0),
+                        );
+                        *stats = ImageUpdateStats {
+                            window_start: Some(Instant::now()),
+                            ..Default::default()
+                        };
+                    }
+                });
             },
             PaintMessage::DelayNewFrameForCanvas(
                 webview_id,
