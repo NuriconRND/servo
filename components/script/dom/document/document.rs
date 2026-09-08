@@ -2963,8 +2963,24 @@ impl Document {
         // observers, or input is not visible from outside, and guessing it wrong sends the
         // work to the wrong layer -- as it did on 2026-09-08.
         if !self.window().layout_blocked() {
-            if !self.restyle_reason().is_empty() {
-                note_rendering_update_reason("restyle");
+            let restyle_reason = self.restyle_reason();
+            if !restyle_reason.is_empty() {
+                // ***Which restyle reason, not just "restyle".*** This page is dirty for
+                // restyle essentially all the time -- measured on the 4-GPU wall,
+                // 2026-09-08 (log_ani_perf/15), with and without an animation running --
+                // and "the document needs a restyle" does not say whether that is the DOM
+                // changing, a stylesheet, or pending element restyles. Those have
+                // different owners and different fixes.
+                note_rendering_update_reason(match restyle_reason {
+                    reason if reason.contains(RestyleReason::StylesheetsChanged) => {
+                        "restyle:stylesheets"
+                    },
+                    reason if reason.contains(RestyleReason::DOMChanged) => "restyle:dom",
+                    reason if reason.contains(RestyleReason::PendingRestyles) => "restyle:pending",
+                    reason if reason.contains(RestyleReason::ViewportChanged) => "restyle:viewport",
+                    reason if reason.contains(RestyleReason::ThemeChanged) => "restyle:theme",
+                    _ => "restyle:other",
+                });
                 return true;
             }
             if self.window().layout().needs_new_display_list() {
