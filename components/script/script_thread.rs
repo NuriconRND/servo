@@ -152,7 +152,7 @@ use crate::messaging::{
     CommonScriptMsg, MainThreadScriptMsg, MixedMessage, ScriptEventLoopSender,
     ScriptThreadReceivers, ScriptThreadSenders,
 };
-use crate::microtask::{Microtask, MicrotaskQueue};
+use crate::microtask::{Microtask, MicrotaskQueue, take_microtask_time};
 use crate::mime::{APPLICATION, CHARSET, MimeExt, TEXT, XML};
 use crate::navigation::{InProgressLoad, NavigationListener};
 use crate::network_listener::{FetchResponseListener, submit_timing};
@@ -1233,11 +1233,12 @@ impl ScriptThread {
     fn note_task_duration(category: ScriptThreadEventCategory, duration: Duration) {
         let (display_reflows, query_reflows, reflow_time) = take_reflow_stats();
         let (port_deserialize, port_handler) = take_port_message_stats();
+        let microtask_time = take_microtask_time();
         if let Some(threshold) = slow_task_threshold()
             && duration >= threshold
         {
             warn!(
-                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={} reflow_ms={:.1} port_clone_ms={:.1} port_handler_ms={:.1}",
+                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={} reflow_ms={:.1} port_clone_ms={:.1} port_handler_ms={:.1} microtask_ms={:.1}",
                 category,
                 duration.as_secs_f64() * 1000.0,
                 display_reflows,
@@ -1245,6 +1246,7 @@ impl ScriptThread {
                 reflow_time.as_secs_f64() * 1000.0,
                 port_deserialize.as_secs_f64() * 1000.0,
                 port_handler.as_secs_f64() * 1000.0,
+                microtask_time.as_secs_f64() * 1000.0,
             );
         }
         let now = Instant::now();
@@ -1712,6 +1714,9 @@ impl ScriptThread {
             // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
             // TODO(#32003): A microtask checkpoint is only supposed to be performed after running a task.
             self.perform_a_microtask_checkpoint(cx);
+            // This checkpoint belongs to no task, so it must not be charged to the next
+            // one that happens to finish.
+            let _ = take_microtask_time();
         }
 
         for (_, doc) in self.documents.borrow().iter() {

@@ -8,6 +8,7 @@
 
 use std::cell::Cell;
 use std::mem;
+use std::time::{Duration, Instant};
 use std::rc::Rc;
 
 use js::jsapi::JobQueueMayNotBeEmpty;
@@ -78,6 +79,33 @@ pub(crate) struct UserMicrotask {
     pub(crate) pipeline: PipelineId,
 }
 
+thread_local! {
+    /// How long the running task has spent draining microtasks.
+    static MICROTASK_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+/// Charge a checkpoint to the running task however it returns.
+struct CheckpointTiming(Instant);
+
+impl Drop for CheckpointTiming {
+    fn drop(&mut self) {
+        MICROTASK_TIME.with(|total| total.set(total.get() + self.0.elapsed()));
+    }
+}
+
+/// Take what has accumulated since the last call.
+///
+/// ***A task's own time and the microtasks it queued are the same task from outside.***
+/// `run_a_script` ends with a microtask checkpoint, so a page whose `message` handler is
+/// async returns almost immediately and does the real work in promise continuations that
+/// run here -- inside the same task, after the handler returned. Measured on the 4-GPU
+/// wall, 2026-09-08 (log_ani_perf/03): recurring 310-345 ms `PortMessage` tasks reported
+/// only 2-15 ms in the handler and 0 ms in the structured clone, leaving ~97% of each task
+/// unaccounted for. This is where that goes, or it is not, and either answer narrows it.
+pub(crate) fn take_microtask_time() -> Duration {
+    MICROTASK_TIME.with(|total| total.replace(Duration::ZERO))
+}
+
 impl MicrotaskQueue {
     /// Add a new microtask to this queue. It will be invoked as part of the next
     /// microtask checkpoint.
@@ -105,6 +133,9 @@ impl MicrotaskQueue {
 
         // Step 2. Set the event loop's performing a microtask checkpoint to true.
         self.performing_a_microtask_checkpoint.set(true);
+        // Charged to whichever task is running, and read at the task boundary. The early
+        // return above is deliberately outside this: a re-entrant checkpoint runs nothing.
+        let _checkpoint_timing = CheckpointTiming(Instant::now());
 
         debug!("Now performing a microtask checkpoint");
 
