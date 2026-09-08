@@ -6,7 +6,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::cmp::max;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 pub use embedder_traits::*;
@@ -265,7 +265,15 @@ impl ServoInner {
             return false;
         }
 
-        {
+        // ★이 함수는 임베더의 메인 스레드에서 돈다★ -- 그리고 그 스레드에 표출 클럭이
+        // 얹혀 있다. 전환 순간 이 함수 한 번이 141ms 걸리는 것이 실측되었고(그동안 벽은
+        // 아무것도 새로 그리지 못한다), 어느 단계가 그 시간을 쓰는지는 아무도 재지
+        // 않고 있었다. 셋으로 쪼갠다: 페인트 메시지 처리 / 임베더 메시지 처리 /
+        // 페인터의 턴별 갱신.
+        let spin_start = Instant::now();
+        let mut paint_messages = 0usize;
+        let mut embedder_messages = 0usize;
+        let paint_handle_ms = {
             let paint = self.paint.borrow();
             let mut messages = Vec::new();
             while let Ok(message) = paint.receiver().try_recv() {
@@ -276,8 +284,12 @@ impl ServoInner {
                     },
                 }
             }
+            paint_messages = messages.len();
+            let start = Instant::now();
             paint.handle_messages(messages);
-        }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let embedder_start = Instant::now();
 
         let mut selector = EmbedderMessageSelector::new(
             &self.embedder_receiver,
@@ -293,10 +305,12 @@ impl ServoInner {
                     self.handle_constellation_embedder_message(message)
                 },
             }
+            embedder_messages += 1;
             if self.shutdown_state.get() == ShutdownState::FinishedShuttingDown {
                 break;
             }
         }
+        let embedder_ms = embedder_start.elapsed().as_secs_f64() * 1000.0;
         let pending_handled_input_events =
             std::mem::take(&mut *self.pending_handled_input_events.borrow_mut());
         for PendingHandledInputEvent {
@@ -324,7 +338,17 @@ impl ServoInner {
                 .notify_error(ServoError::LostConnectionWithBackend);
         }
 
+        let updates_start = Instant::now();
         self.paint.borrow_mut().perform_updates();
+        let perform_updates_ms = updates_start.elapsed().as_secs_f64() * 1000.0;
+        // 30ms 는 표출 주기(16.7ms)의 두 배 -- 한 번에 프레임 두 장을 놓치는 지점부터
+        // 관심 대상이다. 그 아래는 찍지 않는다(이 함수는 초당 수백 번 불린다).
+        let spin_ms = spin_start.elapsed().as_secs_f64() * 1000.0;
+        if spin_ms > 30.0 {
+            warn!(
+                "SPINSLOW spin_ms={spin_ms:.1} paint_handle_ms={paint_handle_ms:.1}                  (msgs={paint_messages}) embedder_ms={embedder_ms:.1}                  (msgs={embedder_messages}) perform_updates_ms={perform_updates_ms:.1}"
+            );
+        }
         self.send_new_frame_ready_messages();
         self.handle_delegate_errors();
         self.clean_up_destroyed_webview_handles();
