@@ -464,6 +464,15 @@ impl GpuProfile {
     }
 }
 
+thread_local! {
+    /// servo wall 계측: 이 프레임의 deferred resolve 개수와, 그 루프가 external image
+    /// `lock` 과 `device.reset_state()` 에서 쓴 시간. 렌더러마다 스레드가 다르므로
+    /// thread_local 이다.
+    static WALL_RESOLVE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WALL_RESOLVE_LOCK_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static WALL_RESOLVE_RESET_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 #[derive(Debug)]
 pub struct CpuProfile {
     pub frame_id: GpuFrameId,
@@ -1788,10 +1797,13 @@ impl Renderer {
         if t > *WR_SLOW_MS {
             let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
             log::warn!(
-                "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} gpu_cache_resolve_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
+                "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} gpu_cache_resolve_ms={:.1} resolves={} resolve_lock_ms={:.1} resolve_reset_state_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
                 t,
                 wall_pre_draw_ms,
                 wall_prepare_gpu_cache_ms,
+                WALL_RESOLVE_COUNT.with(|c| c.get()),
+                WALL_RESOLVE_LOCK_MS.with(|c| c.get()),
+                WALL_RESOLVE_RESET_MS.with(|c| c.get()),
                 wall_draw_frame_ms,
                 wall_texture_cache_ms,
                 wall_native_surfaces_ms,
@@ -4957,6 +4969,14 @@ impl Renderer {
     }
 
     fn update_deferred_resolves(&mut self, deferred_resolves: &[DeferredResolve]) -> Option<GpuCacheUpdateList> {
+        // servo wall: 느린 프레임의 98% 가 이 함수를 품은 `prepare_gpu_cache` 다(307ms 중
+        // 302ms). 그 안은 임베더의 external image `lock` 과, resolve 마다 한 번씩 도는
+        // `device.reset_state()` 둘로 갈린다 -- 영상이 많으면 둘 다 횟수가 그만큼 늘어난다.
+        // 어느 쪽인지에 따라 고칠 곳이 다르다(전자는 우리 미디어 경로, 후자는 이 루프의
+        // 구조). 세어서 `WRSLOW` 에 함께 낸다.
+        WALL_RESOLVE_COUNT.with(|c| c.set(deferred_resolves.len()));
+        WALL_RESOLVE_LOCK_MS.with(|c| c.set(0.0));
+        WALL_RESOLVE_RESET_MS.with(|c| c.set(0.0));
         // The first thing we do is run through any pending deferred
         // resolves, and use a callback to get the UV rect for this
         // custom item. Then we patch the resource_rects structure
@@ -4985,7 +5005,11 @@ impl Renderer {
                 .external_image
                 .expect("BUG: Deferred resolves must be external images!");
             // Provide rendering information for NativeTexture external images.
+            let wall_lock_start = std::time::Instant::now();
             let image = handler.lock(ext_image.id, ext_image.channel_index, deferred_resolve.is_composited);
+            WALL_RESOLVE_LOCK_MS.with(|c| {
+                c.set(c.get() + wall_lock_start.elapsed().as_secs_f64() * 1000.0)
+            });
             let texture_target = match ext_image.image_type {
                 ExternalImageType::TextureHandle(target) => target,
                 ExternalImageType::Buffer => {
@@ -4995,7 +5019,11 @@ impl Renderer {
 
             // In order to produce the handle, the external image handler may call into
             // the GL context and change some states.
+            let wall_reset_start = std::time::Instant::now();
             self.device.reset_state();
+            WALL_RESOLVE_RESET_MS.with(|c| {
+                c.set(c.get() + wall_reset_start.elapsed().as_secs_f64() * 1000.0)
+            });
 
             let texture = match image.source {
                 ExternalImageSource::NativeTexture(texture_id) => {
