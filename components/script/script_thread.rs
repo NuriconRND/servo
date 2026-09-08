@@ -135,7 +135,7 @@ use crate::dom::document::{
     Document, DocumentSource, HasBrowsingContext, IsHTMLDocument, RenderingUpdateReason,
 };
 use crate::dom::element::Element;
-use crate::dom::globalscope::GlobalScope;
+use crate::dom::globalscope::{GlobalScope, take_port_message_stats};
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::servoparser::{ParserContext, ServoParser};
@@ -1232,16 +1232,19 @@ impl ScriptThread {
     /// computing from one that is blocked waiting.
     fn note_task_duration(category: ScriptThreadEventCategory, duration: Duration) {
         let (display_reflows, query_reflows, reflow_time) = take_reflow_stats();
+        let (port_deserialize, port_handler) = take_port_message_stats();
         if let Some(threshold) = slow_task_threshold()
             && duration >= threshold
         {
             warn!(
-                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={}                  reflow_ms={:.1}",
+                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={} reflow_ms={:.1} port_clone_ms={:.1} port_handler_ms={:.1}",
                 category,
                 duration.as_secs_f64() * 1000.0,
                 display_reflows,
                 query_reflows,
                 reflow_time.as_secs_f64() * 1000.0,
+                port_deserialize.as_secs_f64() * 1000.0,
+                port_handler.as_secs_f64() * 1000.0,
             );
         }
         let now = Instant::now();
@@ -1263,7 +1266,7 @@ impl ScriptThread {
             // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
             // diagnostic nobody can see is a diagnostic that does not exist.
             warn!(
-                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1}                  longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1}",
+                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1}",
                 now.duration_since(started).as_secs_f64() * 1000.0,
                 window.tasks,
                 window.busy.as_secs_f64() * 1000.0,

@@ -747,6 +747,39 @@ impl FileListener {
     }
 }
 
+thread_local! {
+    /// Time the running task spent turning a port message into a value, and time it spent
+    /// in the page's handler for that message. Reset at each task boundary.
+    static PORT_MESSAGE_STATS: Cell<(Duration, Duration)> =
+        const { Cell::new((Duration::ZERO, Duration::ZERO)) };
+}
+
+fn note_port_message_deserialize(elapsed: Duration) {
+    PORT_MESSAGE_STATS.with(|stats| {
+        let (deserialize, dispatch) = stats.get();
+        stats.set((deserialize + elapsed, dispatch));
+    });
+}
+
+fn note_port_message_dispatch(elapsed: Duration) {
+    PORT_MESSAGE_STATS.with(|stats| {
+        let (deserialize, dispatch) = stats.get();
+        stats.set((deserialize, dispatch + elapsed));
+    });
+}
+
+/// Take what has accumulated since the last call: `(deserialize, handler)`.
+///
+/// ***This is the line between our code and the page's.*** A `PortMessage` task is a
+/// structured-clone read followed by the page's `message` handler, and from outside they
+/// are one indistinguishable lump of CPU. Measured on the 4-GPU wall, 2026-09-08
+/// (log_ani_perf/02): one such task ran 9341 ms with `reflow_query=0` and `reflow_ms=0`,
+/// so it was neither layout thrash nor a big layout -- but nothing said which half of the
+/// task it was.
+pub(crate) fn take_port_message_stats() -> (Duration, Duration) {
+    PORT_MESSAGE_STATS.with(|stats| stats.replace((Duration::ZERO, Duration::ZERO)))
+}
+
 impl GlobalScope {
     /// <https://storage.spec.whatwg.org/#obtain-a-storage-key-for-non-storage-purposes>
     pub(crate) fn obtain_storage_key_for_non_storage_purposes(&self) -> ImmutableOrigin {
@@ -1545,8 +1578,11 @@ impl GlobalScope {
                 // consisting of all MessagePort objects in deserializeRecord.[[TransferredValues]],
                 // if any, maintaining their relative order.
                 // Note: both done in `structuredclone::read`.
-                if let Ok(ports) = structuredclone::read(cx, self, data, message_clone.handle_mut())
-                {
+                let deserialize_started = Instant::now();
+                let deserialized =
+                    structuredclone::read(cx, self, data, message_clone.handle_mut());
+                note_port_message_deserialize(deserialize_started.elapsed());
+                if let Ok(ports) = deserialized {
                     // Note: if this port is used to transfer a stream, we handle the events in Rust.
                     if let Some(transform) = cross_realm_transform.deref().as_ref() {
                         match transform {
@@ -1571,6 +1607,7 @@ impl GlobalScope {
                         // using MessageEvent,
                         // with the data attribute initialized to messageClone
                         // and the ports attribute initialized to newPorts.
+                        let dispatch_started = Instant::now();
                         MessageEvent::dispatch_jsval(
                             cx,
                             message_event_target,
@@ -1580,6 +1617,7 @@ impl GlobalScope {
                             None,
                             ports,
                         );
+                        note_port_message_dispatch(dispatch_started.elapsed());
                     }
                 } else if let Some(transform) = cross_realm_transform.deref().as_ref() {
                     match transform {
