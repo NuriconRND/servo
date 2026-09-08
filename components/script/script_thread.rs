@@ -134,6 +134,7 @@ use crate::dom::document::focus::FocusableArea;
 use crate::dom::document::{
     Document, DocumentSource, HasBrowsingContext, IsHTMLDocument, RenderingUpdateReason,
 };
+use crate::dom::document::take_rendering_update_reasons;
 use crate::dom::element::Element;
 use crate::dom::globalscope::{GlobalScope, take_port_message_stats};
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
@@ -1267,8 +1268,13 @@ impl ScriptThread {
             }
             // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
             // diagnostic nobody can see is a diagnostic that does not exist.
+            let reasons = take_rendering_update_reasons()
+                .into_iter()
+                .map(|(reason, count)| format!("{reason}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",");
             warn!(
-                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1}",
+                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1} update_reasons=[{}]",
                 now.duration_since(started).as_secs_f64() * 1000.0,
                 window.tasks,
                 window.busy.as_secs_f64() * 1000.0,
@@ -1277,6 +1283,7 @@ impl ScriptThread {
                 window.display_reflows,
                 window.query_reflows,
                 window.reflow_time.as_secs_f64() * 1000.0,
+                reasons,
             );
             *window = TaskWindow {
                 started: Some(now),

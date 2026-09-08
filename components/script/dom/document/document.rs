@@ -326,6 +326,35 @@ bitflags! {
     }
 }
 
+thread_local! {
+    /// How many times each branch of `needs_rendering_update` said yes, since the last
+    /// report. See [`take_rendering_update_reasons`].
+    static RENDERING_UPDATE_REASONS: RefCell<Vec<(&'static str, u32)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn note_rendering_update_reason(reason: &'static str) {
+    RENDERING_UPDATE_REASONS.with(|counts| {
+        let mut counts = counts.borrow_mut();
+        match counts.iter_mut().find(|(name, _)| *name == reason) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((reason, 1)),
+        }
+    });
+}
+
+/// Take the tally since the last call, most frequent first.
+///
+/// A handful of reasons at most, so a `Vec` beats a map and keeps the report ordered by
+/// what actually drove the work.
+pub(crate) fn take_rendering_update_reasons() -> Vec<(&'static str, u32)> {
+    RENDERING_UPDATE_REASONS.with(|counts| {
+        let mut counts = std::mem::take(&mut *counts.borrow_mut());
+        counts.sort_by(|left, right| right.1.cmp(&left.1));
+        counts
+    })
+}
+
 /// <https://dom.spec.whatwg.org/#document>
 #[dom_struct]
 pub(crate) struct Document {
@@ -2927,27 +2956,48 @@ impl Document {
         if !self.is_fully_active() {
             return false;
         }
-        if !self.window().layout_blocked() &&
-            (!self.restyle_reason().is_empty() ||
-                self.window().layout().needs_new_display_list() ||
-                self.window().layout().needs_accessibility_update())
-        {
-            return true;
+        // ***Which branch says yes is the whole question when this is hot.*** A rendering
+        // update rebuilds this document's display list, and on a wall page that costs
+        // 2 ms in the steady state and 14.5 ms during a content switch. Whether the page
+        // is asking for ~50 of those a second because of restyle, canvas or video content,
+        // observers, or input is not visible from outside, and guessing it wrong sends the
+        // work to the wrong layer -- as it did on 2026-09-08.
+        if !self.window().layout_blocked() {
+            if !self.restyle_reason().is_empty() {
+                note_rendering_update_reason("restyle");
+                return true;
+            }
+            if self.window().layout().needs_new_display_list() {
+                note_rendering_update_reason("display-list");
+                return true;
+            }
+            if self.window().layout().needs_accessibility_update() {
+                note_rendering_update_reason("accessibility");
+                return true;
+            }
         }
         if !self.rendering_update_reasons.get().is_empty() {
+            note_rendering_update_reason("observer");
             return true;
         }
         if self.event_handler.has_pending_input_events() {
+            note_rendering_update_reason("input");
             return true;
         }
         if self.has_pending_scroll_events() {
+            note_rendering_update_reason("scroll");
             return true;
         }
         if self.window().has_unhandled_resize_event() {
+            note_rendering_update_reason("resize");
             return true;
         }
-        if self.has_pending_animated_image_update.get() || !self.dirty_canvases.borrow().is_empty()
-        {
+        if self.has_pending_animated_image_update.get() {
+            note_rendering_update_reason("animated-image");
+            return true;
+        }
+        if !self.dirty_canvases.borrow().is_empty() {
+            note_rendering_update_reason("dirty-canvas");
             return true;
         }
 
