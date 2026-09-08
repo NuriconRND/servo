@@ -39,6 +39,7 @@ use servo_config::debug_env;
 use servo_config::pref;
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use servo_geometry::DeviceIndependentPixel;
+use smallvec::SmallVec;
 use style_traits::CSSPixel;
 use surfman::Device;
 use surfman::chains::SwapChains;
@@ -2837,22 +2838,35 @@ impl Paint {
         }
 
         // 뒤에서 앞으로 훑으며 (페인터, 키)마다 **가장 나중 것**만 남긴다.
-        let mut seen: HashSet<(PainterId, ImageKey)> = HashSet::new();
+        let mut seen: HashSet<(PainterId, SmallVec<[ImageKey; 3]>)> = HashSet::new();
         let mut keep = vec![true; messages.len()];
         let mut dropped = 0;
         for (index, message) in messages.iter().enumerate().rev() {
             let PaintMessage::UpdateImages(painter_id, updates) = message else {
                 continue;
             };
-            // 한 메시지에 갱신이 여럿이면 건드리지 않는다 — 메시지를 통째로 버릴 수 있을
-            // 때만 버리는 것이 이 합침의 안전 조건이다.
-            let [ImageUpdate::UpdateImage(key, _, _, None)] = updates.as_slice() else {
-                continue;
-            };
-            if protected.contains(key) {
+            // ★비디오 프레임 한 장은 메시지 하나에 갱신 **여러 건**으로 온다★ — YUV 는
+            // 면이 셋이라 `updates_total=3` 이다(실측). 그래서 한 건짜리만 보면 아무것도
+            // 잡히지 않는다. 메시지를 **통째로** 버릴 수 있을 때만 버리는 것이 이 합침의
+            // 안전 조건이므로, 안의 갱신이 전부 epoch 없는 이미지 갱신일 때만 후보다.
+            let mut keys = SmallVec::<[ImageKey; 3]>::new();
+            let all_plain_frames = updates.iter().all(|update| {
+                if let ImageUpdate::UpdateImage(key, _, _, None) = update {
+                    keys.push(*key);
+                    true
+                } else {
+                    false
+                }
+            });
+            if !all_plain_frames || keys.is_empty() {
                 continue;
             }
-            if !seen.insert((*painter_id, *key)) {
+            if keys.iter().any(|key| protected.contains(key)) {
+                continue;
+            }
+            // 같은 프레임의 면들은 함께 와야 뜻이 있으므로, 면 하나가 아니라 **면들의
+            // 조합**이 이 메시지의 신원이다.
+            if !seen.insert((*painter_id, keys)) {
                 keep[index] = false;
                 dropped += 1;
             }
@@ -3252,17 +3266,20 @@ mod superseded_video_frame_tests {
         })
     }
 
-    /// 비디오 프레임 한 장(epoch 없음).
+    /// 비디오 프레임 한 장(epoch 없음). 면이 하나인 경우.
     fn frame(painter: PainterId, image: ImageKey) -> PaintMessage {
+        planar_frame(painter, &[image])
+    }
+
+    /// 비디오 프레임 한 장을 **면 여러 개**로. 실제로 오는 모양이다 — YUV 는 면이 셋이라
+    /// 메시지 하나에 갱신 세 건이 실려 온다(실측 `updates_total=3`).
+    fn planar_frame(painter: PainterId, planes: &[ImageKey]) -> PaintMessage {
         PaintMessage::UpdateImages(
             painter,
-            [ImageUpdate::UpdateImage(
-                image,
-                descriptor(),
-                external(),
-                None,
-            )]
-            .into(),
+            planes
+                .iter()
+                .map(|plane| ImageUpdate::UpdateImage(*plane, descriptor(), external(), None))
+                .collect(),
         )
     }
 
@@ -3351,6 +3368,41 @@ mod superseded_video_frame_tests {
         ];
         assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 1);
         assert_eq!(kinds(&messages), vec!["GenerateFrame", "UpdateImages"]);
+    }
+
+    #[test]
+    fn keeps_only_the_last_multi_plane_frame() {
+        // YUV 세 면이 한 메시지로 오는, 실제로 오는 모양.
+        let p = painter(1);
+        let planes = [key(p, 20), key(p, 21), key(p, 22)];
+        let other = [key(p, 30), key(p, 31), key(p, 32)];
+        let mut messages = vec![
+            planar_frame(p, &planes),
+            planar_frame(p, &other),
+            planar_frame(p, &planes),
+        ];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 1);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1],
+            PaintMessage::UpdateImages(_, updates)
+                if matches!(updates.first(), Some(ImageUpdate::UpdateImage(k, ..)) if *k == planes[0])
+        ));
+    }
+
+    #[test]
+    fn a_protected_plane_saves_the_whole_frame() {
+        // 한 면이라도 추가·삭제가 섞였으면 그 프레임은 통째로 남겨야 한다 — 면을 쪼개
+        // 버리면 남은 면들과 짝이 맞지 않는다.
+        let p = painter(1);
+        let planes = [key(p, 20), key(p, 21), key(p, 22)];
+        let mut messages = vec![
+            planar_frame(p, &planes),
+            planar_frame(p, &planes),
+            PaintMessage::UpdateImages(p, [ImageUpdate::DeleteImage(planes[1])].into()),
+        ];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
+        assert_eq!(messages.len(), 3);
     }
 
     #[test]
