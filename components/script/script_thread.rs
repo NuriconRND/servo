@@ -169,6 +169,35 @@ use crate::{devtools, webdriver_handlers};
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
 
+// One-second window for `SCRIPTBUSY`, and the running total for `SCRIPTTASK`. One script
+// thread per OS thread, so a thread-local is the right scope for both.
+thread_local!(static TASK_WINDOW: RefCell<TaskWindow> = RefCell::new(TaskWindow::default()));
+
+/// How much of the last second this script thread spent inside tasks, and which task was
+/// the worst of them.
+#[derive(Default)]
+struct TaskWindow {
+    started: Option<Instant>,
+    tasks: u32,
+    busy: Duration,
+    longest: Duration,
+    longest_category: Option<ScriptThreadEventCategory>,
+}
+
+/// A task at or above this runs a `SCRIPTTASK` line. `SERVO_SCRIPT_SLOW_TASK_MS` moves it;
+/// 0 turns it off. The default is one frame's worth at 60Hz rounded up -- a task that long
+/// has already cost a frame, so it is worth a line.
+fn slow_task_threshold() -> Option<Duration> {
+    static THRESHOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let ms = std::env::var("SERVO_SCRIPT_SLOW_TASK_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(20);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    })
+}
+
 // When `maybe_report_live_webgl_contexts` last reported. Same reasoning as below.
 thread_local!(static LAST_WEBGL_DOM_REPORT: Cell<Option<Instant>> = const { Cell::new(None) });
 
@@ -1183,6 +1212,61 @@ impl ScriptThread {
     /// Forcing the collection separates them -- if the count falls, they were
     /// garbage; if it does not, something still holds them and that is what to
     /// go find.
+    /// Report tasks that ran long, and once a second how much of that second this thread
+    /// spent inside tasks at all.
+    ///
+    /// ***A stalled animation and a slow animation look identical in a frame counter.***
+    /// Measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/00): for ten straight seconds
+    /// the painters composited 60 frames a second each while the wall issued ZERO logical
+    /// frames, and the pacer coalesced 21 requests in that whole window -- so nothing was
+    /// being held back, and nothing was being asked for. The stall was on this thread, and
+    /// nothing in the engine said what it was doing.
+    ///
+    /// Read the summary this way: `busy_ms` near 1000 with one huge `longest` is a single
+    /// task that would not end; near 1000 spread over many tasks is thrash; near 0 while
+    /// frames are still missing means this thread was idle and something upstream stopped
+    /// feeding it. Pair it with the launcher's `-ThreadCpu`, which separates a task that is
+    /// computing from one that is blocked waiting.
+    fn note_task_duration(category: ScriptThreadEventCategory, duration: Duration) {
+        if let Some(threshold) = slow_task_threshold()
+            && duration >= threshold
+        {
+            warn!(
+                "SCRIPTTASK slow: category={:?} ms={:.1}",
+                category,
+                duration.as_secs_f64() * 1000.0
+            );
+        }
+        let now = Instant::now();
+        TASK_WINDOW.with(|window| {
+            let mut window = window.borrow_mut();
+            let started = *window.started.get_or_insert(now);
+            window.tasks += 1;
+            window.busy += duration;
+            if duration > window.longest {
+                window.longest = duration;
+                window.longest_category = Some(category);
+            }
+            if now.duration_since(started) < Duration::from_secs(1) {
+                return;
+            }
+            // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
+            // diagnostic nobody can see is a diagnostic that does not exist.
+            warn!(
+                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?}",
+                now.duration_since(started).as_secs_f64() * 1000.0,
+                window.tasks,
+                window.busy.as_secs_f64() * 1000.0,
+                window.longest.as_secs_f64() * 1000.0,
+                window.longest_category,
+            );
+            *window = TaskWindow {
+                started: Some(now),
+                ..Default::default()
+            };
+        });
+    }
+
     /// One `WEBGLDOM` line a second, unconditionally.
     ///
     /// Paired with `WEBGLLIVE` from the WebGL thread: that one counts contexts the
@@ -1829,6 +1913,7 @@ impl ScriptThread {
             f()
         };
         let task_duration = start.elapsed();
+        Self::note_task_duration(category, task_duration);
         for (doc_id, doc) in self.documents.borrow().iter() {
             if let Some(pipeline_id) = pipeline_id &&
                 pipeline_id == doc_id &&
