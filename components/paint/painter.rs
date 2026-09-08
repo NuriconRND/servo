@@ -367,6 +367,14 @@ pub(crate) struct Painter {
     /// `PAINTANIM` window. High next to a low `frames` means the pipeline, not the
     /// animation, is the limit.
     paint_animation_skipped_busy: Cell<u64>,
+    /// How often the animation's values rode along on frames somebody else was producing.
+    /// On a wall with video this should be nearly all of them.
+    paint_animation_rode_along: Cell<u64>,
+    /// When any frame was last generated for this painter, by any path.
+    last_frame_generated_at: Cell<Option<Instant>>,
+    /// When the animation values were last pushed. They only matter at frame-build time,
+    /// so pushing faster than frames are built is waste.
+    last_paint_animation_push_at: Cell<Option<Instant>>,
 
     /// The channel on which messages can be sent to the constellation.
     embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
@@ -790,6 +798,9 @@ impl Painter {
             paint_animation_window_start: Default::default(),
             last_paint_animation_frame_at: Default::default(),
             paint_animation_skipped_busy: Default::default(),
+            paint_animation_rode_along: Default::default(),
+            last_frame_generated_at: Default::default(),
+            last_paint_animation_push_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
             pending_video_frame_updates: RefCell::new(FxHashMap::default()),
@@ -852,42 +863,47 @@ impl Painter {
                 );
             });
         }
-
-        // ***Rate-limited, because generating a frame is what wakes this loop again.***
-        // Without this the first animation turns the painter into a spin: `generate_frame`
-        // makes a frame, the frame wakes `perform_updates`, which generates another.
-        // Measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/05): 7425 animated-property
-        // frames in one second per painter, and the wall stopped responding.
-        //
-        // The sampled values still ride along on any transaction sent for another reason:
-        // `reset_dynamic_properties` clears every binding, so a caret-only transaction
-        // that omitted them would snap the animation back to whatever WebRender last had.
         let floats_log: Vec<f32> = floats.iter().map(|property| property.value).collect();
+
+        // ***An animation is a value laid onto the frames this wall already produces, not
+        // a reason to produce more.*** The painter renders and presents on a clock, and
+        // video sources are composited with whatever frame they happen to have; the
+        // animated value belongs in that same pass. Generating a frame *for* the animation
+        // duplicates one that was coming anyway, and measured on the 4-GPU wall,
+        // 2026-09-08 (log_ani_perf/09), 1410 of 2166 such frames were queued on top of a
+        // frame still in flight -- which is what made the animation move, stall and jump.
+        //
+        // So the values go out every refresh period regardless, and a frame is generated
+        // only when nobody else has produced one within that period: a page whose only
+        // moving thing is a CSS animation still advances, and a wall full of video pays
+        // nothing.
         let animation_period = crate::refresh_driver::paint_timer_period();
-        //
-        // ***And only when this painter is not already busy.*** The script-driven path
-        // asks the same question before requesting a frame, and the difference showed:
-        // measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/09), 1410 of 2166
-        // animation frames were requested on top of a frame that had not finished, against
-        // 8 of 1436 for script. Stacking them keeps WebRender's publish queue above the
-        // depth of one this painter tries to hold, and the latency that builds up comes out
-        // as an animation that moves, stalls, and jumps -- the symptom this was meant to
-        // remove.
-        //
-        // Skipping does not touch `last_paint_animation_frame_at`, so the next turn tries
-        // again the moment the pipeline is free rather than waiting out another period.
+        let has_values = !floats.is_empty() || !transforms.is_empty();
+        let push_due = self
+            .last_paint_animation_push_at
+            .get()
+            .is_none_or(|last| now.duration_since(last) >= animation_period);
+        let someone_else_is_producing = self
+            .last_frame_generated_at
+            .get()
+            .is_some_and(|last| now.duration_since(last) < animation_period);
         let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
-        if painter_busy {
+        // Skipping does not touch `last_paint_animation_push_at`, so the next turn tries
+        // again as soon as the pipeline is free rather than waiting out another period.
+        let animated_property_frame = has_values &&
+            push_due &&
+            !someone_else_is_producing &&
+            !painter_busy;
+        if has_values && push_due && painter_busy && !someone_else_is_producing {
             self.paint_animation_skipped_busy
                 .set(self.paint_animation_skipped_busy.get() + 1);
         }
-        let animation_due = (!floats.is_empty() || !transforms.is_empty()) &&
-            !painter_busy &&
-            self.last_paint_animation_frame_at
-                .get()
-                .is_none_or(|last| now.duration_since(last) >= animation_period);
-        let animated_property_frame = animation_due;
-        if colors.is_some() || animated_property_frame {
+        if has_values && push_due && someone_else_is_producing {
+            self.paint_animation_rode_along
+                .set(self.paint_animation_rode_along.get() + 1);
+        }
+
+        if colors.is_some() || (has_values && push_due) {
             let mut transaction = Transaction::new();
             transaction.reset_dynamic_properties();
             transaction.append_dynamic_properties(DynamicProperties {
@@ -895,10 +911,12 @@ impl Painter {
                 floats,
                 colors: colors.unwrap_or_default(),
             });
-            self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+            if animated_property_frame {
+                self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+            }
             self.send_transaction(transaction);
-            if animation_due {
-                self.last_paint_animation_frame_at.set(Some(now));
+            if has_values && push_due {
+                self.last_paint_animation_push_at.set(Some(now));
             }
         }
 
@@ -954,9 +972,13 @@ impl Painter {
             .collect::<Vec<_>>()
             .join(",");
         let skipped = self.paint_animation_skipped_busy.replace(0);
+        let rode_along = self.paint_animation_rode_along.replace(0);
+        // `rode_along` is the healthy number on a wall that is already drawing: the values
+        // went out and somebody else's frame carried them. `frames` is what this animation
+        // had to produce on its own, and on a page full of video it should be near zero.
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={} skipped_busy={} floats=[{}]",
-            self.painter_id, animating, frames, skipped, sample
+            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={} floats=[{}]",
+            self.painter_id, animating, frames, rode_along, skipped, sample
         );
     }
 
@@ -1688,6 +1710,9 @@ impl Painter {
         wall_requested_at: Option<Instant>,
     ) {
         self.note_frame_reason(Location::caller(), reason);
+        // Every frame, whatever asked for it. A paint-side animation needs to know whether
+        // anyone else is already producing frames -- see `perform_updates`.
+        self.last_frame_generated_at.set(Some(Instant::now()));
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);
