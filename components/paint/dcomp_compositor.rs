@@ -87,9 +87,7 @@ fn external_buffer_count() -> u32 {
         let raw = pref!(gfx_video_escape_buffer_count);
         let clamped = raw.clamp(2, 4);
         if clamped != raw {
-            warn!(
-                "gfx_video_escape_buffer_count={raw} is out of range (2..=4); using {clamped}"
-            );
+            warn!("gfx_video_escape_buffer_count={raw} is out of range (2..=4); using {clamped}");
         }
         clamped as u32
     })
@@ -332,9 +330,21 @@ const SWAPCHAIN_REF_TOLERANCE_PX: i32 = 4;
 /// scale transform does not change the layout box), so a swap-chain sized to it is not
 /// recreated on scale changes. Degenerate scale (~0) is treated as 1.0; result clamped
 /// to at least 1x1 to keep swap-chain creation valid.
-fn external_swapchain_ref_size(clip_size: DeviceIntSize, scale_x: f32, scale_y: f32) -> DeviceIntSize {
-    let sx = if scale_x.abs() > 1e-4 { scale_x.abs() } else { 1.0 };
-    let sy = if scale_y.abs() > 1e-4 { scale_y.abs() } else { 1.0 };
+fn external_swapchain_ref_size(
+    clip_size: DeviceIntSize,
+    scale_x: f32,
+    scale_y: f32,
+) -> DeviceIntSize {
+    let sx = if scale_x.abs() > 1e-4 {
+        scale_x.abs()
+    } else {
+        1.0
+    };
+    let sy = if scale_y.abs() > 1e-4 {
+        scale_y.abs()
+    } else {
+        1.0
+    };
     let w = (clip_size.width as f32 / sx).round() as i32;
     let h = (clip_size.height as f32 / sy).round() as i32;
     DeviceIntSize::new(w.max(1), h.max(1))
@@ -398,10 +408,7 @@ fn subtract_rect(minuend: DeviceIntRect, sub: DeviceIntRect) -> Vec<DeviceIntRec
 }
 
 /// 감수 목록 전체를 순차 차감. 빈/역전 렉트는 자연 소거(밴드 조건이 걸러냄).
-fn region_subtract(
-    minuend: &[DeviceIntRect],
-    subtrahend: &[DeviceIntRect],
-) -> Vec<DeviceIntRect> {
+fn region_subtract(minuend: &[DeviceIntRect], subtrahend: &[DeviceIntRect]) -> Vec<DeviceIntRect> {
     let mut acc: Vec<DeviceIntRect> = minuend.to_vec();
     for sub in subtrahend {
         let mut next = Vec::with_capacity(acc.len());
@@ -526,7 +533,11 @@ fn surface_extent(
 /// 타일 집합이 조밀 사각형이 아니면(구멍) union 내부 무타일 영역이 FLIP_SEQUENTIAL의
 /// 미정의 픽셀인 채 Present될 수 있다(현 워크로드에서는 발생하지 않는다는 가정을
 /// 여기서 강제한다). 오버플로 방지 위해 i64로 계산.
-fn tiles_are_dense(tile_count: usize, tile_size: DeviceIntSize, extent_size: DeviceIntSize) -> bool {
+fn tiles_are_dense(
+    tile_count: usize,
+    tile_size: DeviceIntSize,
+    extent_size: DeviceIntSize,
+) -> bool {
     tile_count as i64 * tile_size.width as i64 * tile_size.height as i64
         == extent_size.width as i64 * extent_size.height as i64
 }
@@ -546,9 +557,9 @@ fn collapse_dirty_if_oversized(mut rects: Vec<DeviceIntRect>, limit: usize) -> V
     if rects.len() <= limit {
         return rects;
     }
-    let union = rects
-        .drain(..)
-        .fold(None::<DeviceIntRect>, |acc, r| Some(acc.map_or(r, |a| a.union(&r))));
+    let union = rects.drain(..).fold(None::<DeviceIntRect>, |acc, r| {
+        Some(acc.map_or(r, |a| a.union(&r)))
+    });
     union.into_iter().collect()
 }
 
@@ -701,7 +712,10 @@ fn probe_partial_present(swapchain: &ComOwned<IDXGISwapChain1>) -> bool {
             &mut tex as *mut _ as *mut _,
         );
         if hr < 0 || tex.is_null() {
-            warn!("[dcomp-native] GetBuffer(1) probe failed (hr=0x{:08x}); partial present off", hr as u32);
+            warn!(
+                "[dcomp-native] GetBuffer(1) probe failed (hr=0x{:08x}); partial present off",
+                hr as u32
+            );
             return false;
         }
         (*(tex as *mut IUnknown)).Release();
@@ -719,8 +733,12 @@ fn self_copy_catchup(
     if rects.is_empty() {
         return true;
     }
-    let Some(ctx) = ctx.as_ref() else { return false; };
-    let Some(fp) = sc.frame_pbuffer.as_ref() else { return false; };
+    let Some(ctx) = ctx.as_ref() else {
+        return false;
+    };
+    let Some(fp) = sc.frame_pbuffer.as_ref() else {
+        return false;
+    };
     // Safety: 살아있는 스왑체인/컨텍스트. src는 AddRef → 사용 후 Release.
     unsafe {
         let mut src: *mut ID3D11Texture2D = ptr::null_mut();
@@ -730,7 +748,10 @@ fn self_copy_catchup(
             &mut src as *mut _ as *mut _,
         );
         if hr < 0 || src.is_null() {
-            warn!("[dcomp-native] GetBuffer(1) failed at copy (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] GetBuffer(1) failed at copy (hr=0x{:08x})",
+                hr as u32
+            );
             return false;
         }
         for rc in rects {
@@ -743,12 +764,22 @@ fn self_copy_catchup(
                 continue;
             }
             let src_box = D3D11_BOX {
-                left: x0 as u32, top: y0 as u32, front: 0,
-                right: x1 as u32, bottom: y1 as u32, back: 1,
+                left: x0 as u32,
+                top: y0 as u32,
+                front: 0,
+                right: x1 as u32,
+                bottom: y1 as u32,
+                back: 1,
             };
             (*ctx.as_ptr()).CopySubresourceRegion(
-                fp.texture as *mut _, 0, x0 as u32, y0 as u32, 0,
-                src as *mut _, 0, &src_box,
+                fp.texture as *mut _,
+                0,
+                x0 as u32,
+                y0 as u32,
+                0,
+                src as *mut _,
+                0,
+                &src_box,
             );
         }
         (*(src as *mut IUnknown)).Release();
@@ -770,13 +801,22 @@ fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
             if right <= left || bottom <= top {
                 return None;
             }
-            Some(RECT { left, top, right, bottom })
+            Some(RECT {
+                left,
+                top,
+                right,
+                bottom,
+            })
         })
         .collect();
     let use_hint = !rects.is_empty() && rects.len() <= MAX_PRESENT_DIRTY_RECTS;
     let params = DXGI_PRESENT_PARAMETERS {
         DirtyRectsCount: if use_hint { rects.len() as u32 } else { 0 },
-        pDirtyRects: if use_hint { rects.as_ptr() as *mut RECT } else { ptr::null_mut() },
+        pDirtyRects: if use_hint {
+            rects.as_ptr() as *mut RECT
+        } else {
+            ptr::null_mut()
+        },
         pScrollRect: ptr::null_mut(),
         pScrollOffset: ptr::null_mut(),
     };
@@ -852,7 +892,10 @@ fn demote_seed_into_fallback(
             &mut tex as *mut _ as *mut _,
         );
         if hr < 0 || tex.is_null() {
-            warn!("[dcomp-native] demote fallback seed: GetBuffer(0) failed (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] demote fallback seed: GetBuffer(0) failed (hr=0x{:08x})",
+                hr as u32
+            );
             sc.fallback_virtual = Some(fallback);
             return None;
         }
@@ -874,9 +917,17 @@ fn demote_seed_into_fallback(
         let (dst_tex, update_offset) = unsafe {
             let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
             let mut off = POINT { x: 0, y: 0 };
-            let hr = (*vsurf).BeginDraw(&update, &ID3D11Texture2D::uuidof(), &mut tex as *mut _ as *mut _, &mut off);
+            let hr = (*vsurf).BeginDraw(
+                &update,
+                &ID3D11Texture2D::uuidof(),
+                &mut tex as *mut _ as *mut _,
+                &mut off,
+            );
             if hr < 0 || tex.is_null() {
-                warn!("[dcomp-native] demote fallback seed: BeginDraw failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] demote fallback seed: BeginDraw failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 ok = false;
                 break;
             }
@@ -897,13 +948,22 @@ fn demote_seed_into_fallback(
         // (target − BeginDraw origin = 0).
         unsafe {
             (*ctx).CopySubresourceRegion(
-                dst_tex as *mut _, 0, update_offset.x as u32, update_offset.y as u32, 0,
-                buffer0 as *mut _, 0, &src_box,
+                dst_tex as *mut _,
+                0,
+                update_offset.x as u32,
+                update_offset.y as u32,
+                0,
+                buffer0 as *mut _,
+                0,
+                &src_box,
             );
             (*(dst_tex as *mut IUnknown)).Release();
             let hr = (*vsurf).EndDraw();
             if hr < 0 {
-                warn!("[dcomp-native] demote fallback seed: EndDraw failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] demote fallback seed: EndDraw failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 ok = false;
             }
         }
@@ -951,7 +1011,10 @@ fn demote_seed_new_virtual(
             &mut raw,
         );
         if hr < 0 || raw.is_null() {
-            warn!("[dcomp-native] demote new-virtual seed: CreateVirtualSurface failed (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] demote new-virtual seed: CreateVirtualSurface failed (hr=0x{:08x})",
+                hr as u32
+            );
             return None;
         }
         ComOwned::from_raw(raw)?
@@ -972,7 +1035,10 @@ fn demote_seed_new_virtual(
             &mut tex as *mut _ as *mut _,
         );
         if hr < 0 || tex.is_null() {
-            warn!("[dcomp-native] demote new-virtual seed: GetBuffer(0) failed (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] demote new-virtual seed: GetBuffer(0) failed (hr=0x{:08x})",
+                hr as u32
+            );
             return None; // vsurf(ComOwned) Drop이 Release
         }
         tex
@@ -989,23 +1055,44 @@ fn demote_seed_new_virtual(
     let drew = unsafe {
         let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
         let mut off = POINT { x: 0, y: 0 };
-        let hr = (*vsurf.as_ptr()).BeginDraw(&update, &ID3D11Texture2D::uuidof(), &mut tex as *mut _ as *mut _, &mut off);
+        let hr = (*vsurf.as_ptr()).BeginDraw(
+            &update,
+            &ID3D11Texture2D::uuidof(),
+            &mut tex as *mut _ as *mut _,
+            &mut off,
+        );
         if hr < 0 || tex.is_null() {
-            warn!("[dcomp-native] demote new-virtual seed: BeginDraw failed (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] demote new-virtual seed: BeginDraw failed (hr=0x{:08x})",
+                hr as u32
+            );
             false
         } else {
             let src_box = D3D11_BOX {
-                left: 0, top: 0, front: 0,
-                right: sc.size.width as u32, bottom: sc.size.height as u32, back: 1,
+                left: 0,
+                top: 0,
+                front: 0,
+                right: sc.size.width as u32,
+                bottom: sc.size.height as u32,
+                back: 1,
             };
             (*ctx).CopySubresourceRegion(
-                tex as *mut _, 0, off.x as u32, off.y as u32, 0,
-                buffer0 as *mut _, 0, &src_box,
+                tex as *mut _,
+                0,
+                off.x as u32,
+                off.y as u32,
+                0,
+                buffer0 as *mut _,
+                0,
+                &src_box,
             );
             (*(tex as *mut IUnknown)).Release();
             let hr = (*vsurf.as_ptr()).EndDraw();
             if hr < 0 {
-                warn!("[dcomp-native] demote new-virtual seed: EndDraw failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] demote new-virtual seed: EndDraw failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 false
             } else {
                 true
@@ -1024,7 +1111,10 @@ fn demote_seed_new_virtual(
     // Safety: visual/vsurf 살아있음.
     let hr = unsafe { (*visual.as_ptr()).SetContent(vsurf.as_ptr() as *const IUnknown) };
     if hr < 0 {
-        warn!("[dcomp-native] demote new-virtual seed: SetContent failed (hr=0x{:08x})", hr as u32);
+        warn!(
+            "[dcomp-native] demote new-virtual seed: SetContent failed (hr=0x{:08x})",
+            hr as u32
+        );
         return None;
     }
     if let Some(placement) = last_placement {
@@ -1172,7 +1262,10 @@ fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool
     if pixels.len() < need {
         warn!(
             "[dcomp-readback] short read {} < {}x{}x4 for surface {:?}",
-            pixels.len(), tw, th, bound.surface_id
+            pixels.len(),
+            tw,
+            th,
+            bound.surface_id
         );
         return;
     }
@@ -1180,7 +1273,12 @@ fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool
         let x = sx.clamp(0, tw - 1) as usize;
         let y = sy.clamp(0, th - 1) as usize;
         let idx = (y * tw as usize + x) * 4;
-        (pixels[idx], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3])
+        (
+            pixels[idx],
+            pixels[idx + 1],
+            pixels[idx + 2],
+            pixels[idx + 3],
+        )
     };
     // (a) 8x8 grid over the drawn dirty sub-region.
     let (ox, oy) = bound.update_offset;
@@ -1213,9 +1311,24 @@ fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool
         "[dcomp-readback] surface={:?} tile=({},{}) opaque={:?} tex={}x{} update_off=({},{}) \
          dirty={}x{} alpha_min={} alpha_max={} rgb_nonzero={}/64 whole_rgb_nonzero={}/{} \
          whole_alpha_max={} gl_err=0x{:04x}->0x{:04x}",
-        bound.surface_id, bound.tile.0, bound.tile.1, is_opaque, tw, th, ox, oy,
-        bound.dirty_size.0, bound.dirty_size.1, a_min, a_max, rgb_nz, whole_nz,
-        SCAN * SCAN, whole_a_max, err_before, err_after
+        bound.surface_id,
+        bound.tile.0,
+        bound.tile.1,
+        is_opaque,
+        tw,
+        th,
+        ox,
+        oy,
+        bound.dirty_size.0,
+        bound.dirty_size.1,
+        a_min,
+        a_max,
+        rgb_nz,
+        whole_nz,
+        SCAN * SCAN,
+        whole_a_max,
+        err_before,
+        err_after
     );
 }
 
@@ -1270,6 +1383,10 @@ struct BindProfile {
     present_ns: u64,
     presents: u64,
     commit_ns: u64,
+    /// 창 안에서 **가장 오래 걸린 Commit 한 번**. 합계만으로는 22번이 22ms 씩인지 한 번이
+    /// 400ms 인지 구분할 수 없는데, 표출 클럭을 멈추는 것은 후자다 -- 앞의 것은 부하이고
+    /// 뒤의 것은 정체다.
+    commit_ns_max: u64,
     /// `IDCompositionVirtualSurface::BeginDraw` 자체.
     begin_ns: u64,
     /// BeginDraw 가 돌려준 (아틀라스일 수 있는) 텍스처를 EGL pbuffer 로 감싸고 current 로 삼는 비용.
@@ -1377,7 +1494,10 @@ pub fn commit_device_ptr(device: usize) -> bool {
     let device = device as *mut IDCompositionDevice;
     let hr = unsafe { (*device).Commit() };
     if hr < 0 {
-        warn!("[dcomp-native] parallel Commit failed (hr=0x{:08x})", hr as u32);
+        warn!(
+            "[dcomp-native] parallel Commit failed (hr=0x{:08x})",
+            hr as u32
+        );
         return false;
     }
     true
@@ -1426,12 +1546,12 @@ pub fn maybe_create(
         // QI IDXGIDevice → DCompositionCreateDevice → CreateTargetForHwnd(topmost=TRUE)
         // → CreateVisual(root) → SetRoot. 각 HRESULT 실패면 warn + None (PoC G1 시퀀스).
         let mut dxgi_raw: *mut IDXGIDevice = ptr::null_mut();
-        let hr = (*d3d).QueryInterface(
-            &IDXGIDevice::uuidof(),
-            &mut dxgi_raw as *mut _ as *mut _,
-        );
+        let hr = (*d3d).QueryInterface(&IDXGIDevice::uuidof(), &mut dxgi_raw as *mut _ as *mut _);
         if hr < 0 || dxgi_raw.is_null() {
-            warn!("[dcomp-native] QI IDXGIDevice failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            warn!(
+                "[dcomp-native] QI IDXGIDevice failed (hr=0x{:08x}); falling back to Draw",
+                hr as u32
+            );
             return None;
         }
         // dxgi는 dcomp 디바이스 생성 + 팩토리 확보(아래)에 쓰고, 함수 종료 시 Drop으로 Release된다.
@@ -1443,7 +1563,10 @@ pub fn maybe_create(
             let mut adapter_raw: *mut IDXGIAdapter = ptr::null_mut();
             let hr = (*dxgi.as_ptr()).GetAdapter(&mut adapter_raw);
             if hr < 0 || adapter_raw.is_null() {
-                warn!("[dcomp-native] GetAdapter failed (hr=0x{:08x}); swapchain promotion disabled", hr as u32);
+                warn!(
+                    "[dcomp-native] GetAdapter failed (hr=0x{:08x}); swapchain promotion disabled",
+                    hr as u32
+                );
                 None
             } else {
                 let adapter = ComOwned::from_raw(adapter_raw);
@@ -1470,7 +1593,10 @@ pub fn maybe_create(
             &mut dcomp_raw as *mut _ as *mut _,
         );
         if hr < 0 || dcomp_raw.is_null() {
-            warn!("[dcomp-native] DCompositionCreateDevice failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            warn!(
+                "[dcomp-native] DCompositionCreateDevice failed (hr=0x{:08x}); falling back to Draw",
+                hr as u32
+            );
             return None;
         }
         let dcomp_device = ComOwned::from_raw(dcomp_raw)?;
@@ -1478,7 +1604,10 @@ pub fn maybe_create(
         let mut target_raw: *mut IDCompositionTarget = ptr::null_mut();
         let hr = (*dcomp_device.as_ptr()).CreateTargetForHwnd(hwnd as HWND, TRUE, &mut target_raw);
         if hr < 0 || target_raw.is_null() {
-            warn!("[dcomp-native] CreateTargetForHwnd failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            warn!(
+                "[dcomp-native] CreateTargetForHwnd failed (hr=0x{:08x}); falling back to Draw",
+                hr as u32
+            );
             return None;
         }
         let target = ComOwned::from_raw(target_raw)?;
@@ -1486,14 +1615,20 @@ pub fn maybe_create(
         let mut root_raw: *mut IDCompositionVisual = ptr::null_mut();
         let hr = (*dcomp_device.as_ptr()).CreateVisual(&mut root_raw);
         if hr < 0 || root_raw.is_null() {
-            warn!("[dcomp-native] CreateVisual(root) failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            warn!(
+                "[dcomp-native] CreateVisual(root) failed (hr=0x{:08x}); falling back to Draw",
+                hr as u32
+            );
             return None;
         }
         let root_visual = ComOwned::from_raw(root_raw)?;
 
         let hr = (*target.as_ptr()).SetRoot(root_visual.as_ptr());
         if hr < 0 {
-            warn!("[dcomp-native] SetRoot failed (hr=0x{:08x}); falling back to Draw", hr as u32);
+            warn!(
+                "[dcomp-native] SetRoot failed (hr=0x{:08x}); falling back to Draw",
+                hr as u32
+            );
             return None;
         }
 
@@ -1556,7 +1691,10 @@ impl DCompNativeCompositor {
             return None;
         };
         if size.width <= 0 || size.height <= 0 {
-            warn!("[dcomp-native] create_composition_swapchain: invalid size {}x{}", size.width, size.height);
+            warn!(
+                "[dcomp-native] create_composition_swapchain: invalid size {}x{}",
+                size.width, size.height
+            );
             return None;
         }
         let desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -1564,12 +1702,19 @@ impl DCompNativeCompositor {
             Height: size.height as u32,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             Stereo: 0,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: buffer_count,
             Scaling: DXGI_SCALING_STRETCH, // CreateSwapChainForComposition 필수값
             SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-            AlphaMode: if is_opaque { DXGI_ALPHA_MODE_IGNORE } else { DXGI_ALPHA_MODE_PREMULTIPLIED },
+            AlphaMode: if is_opaque {
+                DXGI_ALPHA_MODE_IGNORE
+            } else {
+                DXGI_ALPHA_MODE_PREMULTIPLIED
+            },
             Flags: 0,
         };
         // Safety: factory/디바이스는 살아있는 COM 포인터(생성 시 확보). out-param은 ComOwned로.
@@ -1582,8 +1727,10 @@ impl DCompNativeCompositor {
                 &mut sc_raw,
             );
             if hr < 0 || sc_raw.is_null() {
-                warn!("[dcomp-native] CreateSwapChainForComposition {}x{} failed (hr=0x{:08x})",
-                    size.width, size.height, hr as u32);
+                warn!(
+                    "[dcomp-native] CreateSwapChainForComposition {}x{} failed (hr=0x{:08x})",
+                    size.width, size.height, hr as u32
+                );
                 return None;
             }
             ComOwned::from_raw(sc_raw)
@@ -1607,7 +1754,12 @@ impl DCompNativeCompositor {
     /// 오프셋 = clip.min(device 좌표), 클립 = 비주얼-로컬 (0,0)-(w,h). scale은 무시한다
     /// (dest=clip에 스케일이 이미 반영 — 브리프 계약). provider 유무와 무관하게 매 프레임
     /// 호출해 마지막 프레임을 유지한다.
-    fn place_external_visual(&self, id: NativeSurfaceId, clip_rect: DeviceIntRect, ref_size: DeviceIntSize) {
+    fn place_external_visual(
+        &self,
+        id: NativeSurfaceId,
+        clip_rect: DeviceIntRect,
+        ref_size: DeviceIntSize,
+    ) {
         let Some(entry) = self.surfaces.get(&id) else {
             return;
         };
@@ -1621,24 +1773,44 @@ impl DCompNativeCompositor {
         // (drag-time) swap-chain viewport is never exceeded. Legacy off: backbuffer == clip.
         let display = clip_rect.size();
         let (clip_w, clip_h) = if stable {
-            (display.width.min(ref_size.width) as f32, display.height.min(ref_size.height) as f32)
+            (
+                display.width.min(ref_size.width) as f32,
+                display.height.min(ref_size.height) as f32,
+            )
         } else {
-            ((clip_rect.max.x - clip_rect.min.x) as f32, (clip_rect.max.y - clip_rect.min.y) as f32)
+            (
+                (clip_rect.max.x - clip_rect.min.x) as f32,
+                (clip_rect.max.y - clip_rect.min.y) as f32,
+            )
         };
-        let local_clip = D2D_RECT_F { left: 0.0, top: 0.0, right: clip_w, bottom: clip_h };
+        let local_clip = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: clip_w,
+            bottom: clip_h,
+        };
         // Safety: visual은 ComOwned가 수명을 보장하는 살아있는 IDCompositionVisual.
         unsafe {
             let hr = (*entry.visual.as_ptr()).SetOffsetX_1(offset_x);
             if hr < 0 {
-                warn!("[dcomp-native] external SetOffsetX failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] external SetOffsetX failed (hr=0x{:08x})",
+                    hr as u32
+                );
             }
             let hr = (*entry.visual.as_ptr()).SetOffsetY_1(offset_y);
             if hr < 0 {
-                warn!("[dcomp-native] external SetOffsetY failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] external SetOffsetY failed (hr=0x{:08x})",
+                    hr as u32
+                );
             }
             let hr = (*entry.visual.as_ptr()).SetClip_1(&local_clip);
             if hr < 0 {
-                warn!("[dcomp-native] external SetClip failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] external SetClip failed (hr=0x{:08x})",
+                    hr as u32
+                );
             }
         }
     }
@@ -1689,7 +1861,8 @@ impl DCompNativeCompositor {
         let resize_active = rc.dcomp_resize_active();
 
         // is_opaque + 이번 서피스에 attach된 ExternalImageId 조회(짧은 borrow).
-        let (is_opaque, attached) = match self.surfaces.get(&id).map(|e| (e.is_opaque, &e.storage)) {
+        let (is_opaque, attached) = match self.surfaces.get(&id).map(|e| (e.is_opaque, &e.storage))
+        {
             Some((op, SurfaceStorage::External(ext))) => (op, ext.attached_external_id),
             // 도달 불가(호출 전 External 판정) — 방어적.
             _ => return,
@@ -1712,7 +1885,11 @@ impl DCompNativeCompositor {
         };
         // acquire는 링을 잠그고 소비계획을 실행한다 — Some이면 반드시 release로 짝맞춘다.
         // None(대여 실패)이면 아무것도 안 잠겼으므로 release 불필요(브리프 계약).
-        let acq_start = if video_escape_prof() { Some(std::time::Instant::now()) } else { None };
+        let acq_start = if video_escape_prof() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let maybe_lease = provider.acquire(&*rc, external_id);
         if let Some(start) = acq_start {
             self.esc_prof.acquires += 1;
@@ -1725,7 +1902,15 @@ impl DCompNativeCompositor {
 
         // Step 4-4/5: 스왑체인 보장 + 변환 + Present. 어떤 경로로 끝나도(정상 반환) 아래
         // release가 lease를 반납한다(present_external은 release를 호출하지 않는다).
-        self.present_external(id, &lease, ref_size, is_opaque, resize_active, transform, clip_rect);
+        self.present_external(
+            id,
+            &lease,
+            ref_size,
+            is_opaque,
+            resize_active,
+            transform,
+            clip_rect,
+        );
 
         // Step 4-6: release 짝맞춤(Present 성공/실패/스킵 무관).
         provider.release(&*rc, ring_id);
@@ -1809,7 +1994,9 @@ impl DCompNativeCompositor {
                     if dcomp_debug() {
                         log::info!(
                             "[dcomp-dbg] external swapchain (re)create id={:?} {}x{}",
-                            id, size.width, size.height
+                            id,
+                            size.width,
+                            size.height
                         );
                     }
                 },
@@ -1835,12 +2022,23 @@ impl DCompNativeCompositor {
         // 기대(월): scale=(1,1), clip≈타일 rect, src=1920x1080.
         if dcomp_debug() && ext.frames_logged < 5 {
             ext.frames_logged += 1;
-            let (sw, sh) = lease.planes[0].map(|p| (p.width, p.height)).unwrap_or((0, 0));
+            let (sw, sh) = lease.planes[0]
+                .map(|p| (p.width, p.height))
+                .unwrap_or((0, 0));
             log::info!(
                 "[dcomp-dbg] external add id={:?} scale=({},{}) offset=({},{}) \
                  clip=({},{})-({},{}) src={}x{}",
-                id, transform.scale.x, transform.scale.y, transform.offset.x, transform.offset.y,
-                clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y, sw, sh
+                id,
+                transform.scale.x,
+                transform.scale.y,
+                transform.offset.x,
+                transform.offset.y,
+                clip_rect.min.x,
+                clip_rect.min.y,
+                clip_rect.max.x,
+                clip_rect.max.y,
+                sw,
+                sh
             );
         }
 
@@ -1896,7 +2094,10 @@ impl DCompNativeCompositor {
             );
             if hr < 0 || back.is_null() {
                 if !ext.warned_fail {
-                    warn!("[dcomp-native] external {:?}: GetBuffer(0) failed (hr=0x{:08x})", id, hr as u32);
+                    warn!(
+                        "[dcomp-native] external {:?}: GetBuffer(0) failed (hr=0x{:08x})",
+                        id, hr as u32
+                    );
                     ext.warned_fail = true;
                 }
                 return;
@@ -1913,7 +2114,10 @@ impl DCompNativeCompositor {
                 );
                 if hr < 0 || raw.is_null() {
                     if !ext.warned_fail {
-                        warn!("[dcomp-native] external {:?}: CreateRenderTargetView failed (hr=0x{:08x})", id, hr as u32);
+                        warn!(
+                            "[dcomp-native] external {:?}: CreateRenderTargetView failed (hr=0x{:08x})",
+                            id, hr as u32
+                        );
                         ext.warned_fail = true;
                     }
                     (*(back as *mut IUnknown)).Release();
@@ -1936,9 +2140,18 @@ impl DCompNativeCompositor {
                 d_batch_swaps += 1;
             }
             // convert: 배치 활성이면 스왑 없이 per-draw 자원만 바인딩+draw(begin_batch 주석).
-            let c_start = if prof_on { Some(std::time::Instant::now()) } else { None };
-            let converted =
-                convert_pass.convert(ctx1.as_ptr(), lease, rtv, dst.width as u32, dst.height as u32);
+            let c_start = if prof_on {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let converted = convert_pass.convert(
+                ctx1.as_ptr(),
+                lease,
+                rtv,
+                dst.width as u32,
+                dst.height as u32,
+            );
             if let Some(s) = c_start {
                 d_convert_dur += s.elapsed();
                 d_converts += 1;
@@ -1946,7 +2159,11 @@ impl DCompNativeCompositor {
             }
             // RTV는 캐시가 소유 — 여기서 Release하지 않는다(백버퍼는 아래에서 Release).
             if converted {
-                let p_start = if prof_on { Some(std::time::Instant::now()) } else { None };
+                let p_start = if prof_on {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let hr = (*swapchain.as_ptr()).Present(0, 0);
                 if let Some(s) = p_start {
                     let dur = s.elapsed();
@@ -1956,7 +2173,10 @@ impl DCompNativeCompositor {
                 }
                 if hr < 0 {
                     if !ext.warned_fail {
-                        warn!("[dcomp-native] external {:?}: Present failed (hr=0x{:08x})", id, hr as u32);
+                        warn!(
+                            "[dcomp-native] external {:?}: Present failed (hr=0x{:08x})",
+                            id, hr as u32
+                        );
                         ext.warned_fail = true;
                     }
                 } else {
@@ -1973,7 +2193,10 @@ impl DCompNativeCompositor {
                                 log::info!("[dcomp-dbg] external content-attach id={:?}", id);
                             }
                         } else if !ext.warned_fail {
-                            warn!("[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})", id, hr as u32);
+                            warn!(
+                                "[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})",
+                                id, hr as u32
+                            );
                             ext.warned_fail = true;
                         }
                     }
@@ -2053,7 +2276,9 @@ impl DCompNativeCompositor {
             warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
         }
         if let Some(start) = commit_start {
-            self.bind_profile.commit_ns += start.elapsed().as_nanos() as u64;
+            let elapsed = start.elapsed().as_nanos() as u64;
+            self.bind_profile.commit_ns += elapsed;
+            self.bind_profile.commit_ns_max = self.bind_profile.commit_ns_max.max(elapsed);
         }
     }
 
@@ -2068,7 +2293,7 @@ impl DCompNativeCompositor {
         let profile = &self.bind_profile;
         warn!(
             "DCOMPBIND window_ms={:.0} frames={}/{} binds={} full_tile={} \
-             end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} \
+             end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} commit_ms_max={:.1} \
              external_ms={:.1} externals={} present_ms={:.1} presents={} \
              visuals={} surfaces={} deferred={} \
              begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
@@ -2082,6 +2307,7 @@ impl DCompNativeCompositor {
             profile.flushes,
             profile.flush_skipped,
             ms(profile.commit_ns),
+            ms(profile.commit_ns_max),
             ms(profile.add_surface_ns),
             profile.add_surfaces,
             ms(profile.present_ns),
@@ -2167,7 +2393,13 @@ impl DCompNativeCompositor {
                 p.transform_offset.1,
             );
             self.present_external(
-                p.id, &lease, p.ref_size, p.is_opaque, false, transform, p.clip_rect,
+                p.id,
+                &lease,
+                p.ref_size,
+                p.is_opaque,
+                false,
+                transform,
+                p.clip_rect,
             );
             provider.release(&*rc, ring_id);
         }
@@ -2181,7 +2413,10 @@ impl DCompNativeCompositor {
             // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
             let hr = unsafe { (*dcomp_device).Commit() };
             if hr < 0 {
-                warn!("[dcomp-native] present_external_only Commit failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] present_external_only Commit failed (hr=0x{:08x})",
+                    hr as u32
+                );
             }
         }
     }
@@ -2283,7 +2518,10 @@ impl Compositor for DCompNativeCompositor {
                 &mut vsurf_raw,
             );
             if hr < 0 || vsurf_raw.is_null() {
-                warn!("[dcomp-native] CreateVirtualSurface failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] CreateVirtualSurface failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 return;
             }
             let Some(virtual_surface) = ComOwned::from_raw(vsurf_raw) else {
@@ -2293,7 +2531,10 @@ impl Compositor for DCompNativeCompositor {
             let mut visual_raw: *mut IDCompositionVisual = ptr::null_mut();
             let hr = (*dcomp_device).CreateVisual(&mut visual_raw);
             if hr < 0 || visual_raw.is_null() {
-                warn!("[dcomp-native] CreateVisual(content) failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] CreateVisual(content) failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 return;
             }
             let Some(visual) = ComOwned::from_raw(visual_raw) else {
@@ -2328,7 +2569,12 @@ impl Compositor for DCompNativeCompositor {
         if dcomp_debug() {
             log::info!(
                 "[dcomp-dbg] create_surface id={:?} virtual_offset=({},{}) tile_size={}x{} opaque={}",
-                id, virtual_offset.x, virtual_offset.y, tile_size.width, tile_size.height, is_opaque
+                id,
+                virtual_offset.x,
+                virtual_offset.y,
+                tile_size.width,
+                tile_size.height,
+                is_opaque
             );
         }
         self.surfaces.insert(id, entry);
@@ -2413,7 +2659,10 @@ impl Compositor for DCompNativeCompositor {
                             &mut tex as *mut _ as *mut _,
                         );
                         if hr < 0 || tex.is_null() {
-                            warn!("[dcomp-native] GetBuffer(0) failed (hr=0x{:08x}); giving up tile", hr as u32);
+                            warn!(
+                                "[dcomp-native] GetBuffer(0) failed (hr=0x{:08x}); giving up tile",
+                                hr as u32
+                            );
                             return fail;
                         }
                         tex
@@ -2470,7 +2719,13 @@ impl Compositor for DCompNativeCompositor {
                 if dcomp_debug() {
                     log::info!(
                         "[dcomp-dbg] bind(swapchain) surface={:?} tile=({},{}) anchor=({},{}) -> origin=({},{})",
-                        id.surface_id, id.x, id.y, sc.anchor.x, sc.anchor.y, origin.x, origin.y
+                        id.surface_id,
+                        id.x,
+                        id.y,
+                        sc.anchor.x,
+                        sc.anchor.y,
+                        origin.x,
+                        origin.y
                     );
                 }
                 NativeSurfaceInfo { origin, fbo_id: 0 }
@@ -2536,7 +2791,10 @@ impl Compositor for DCompNativeCompositor {
                         &mut update_offset,
                     );
                     if hr < 0 || tex.is_null() {
-                        warn!("[dcomp-native] BeginDraw failed (hr=0x{:08x}); giving up tile", hr as u32);
+                        warn!(
+                            "[dcomp-native] BeginDraw failed (hr=0x{:08x}); giving up tile",
+                            hr as u32
+                        );
                         return fail;
                     }
                     // BeginDraw 텍스처의 실제 크기(아틀라스일 수 있음)로 pbuffer를 만든다.
@@ -2648,7 +2906,9 @@ impl Compositor for DCompNativeCompositor {
                 });
 
                 // 승격 판정용 프레임 피복 집계(dirty가 valid 전체를 덮는 전면 타일만).
-                entry.frame_coverage.note_tile((id.x, id.y), dirty_rect, valid_rect);
+                entry
+                    .frame_coverage
+                    .note_tile((id.x, id.y), dirty_rect, valid_rect);
                 // 부분 더티 프레임도 "그려짐"으로 세기(나이 카운터에 포함).
                 entry.frame_drawn_partial = true;
 
@@ -2668,41 +2928,70 @@ impl Compositor for DCompNativeCompositor {
                 // (luid_display_attribs, 두 호출부 동일 판정 = LUID 디스플레이 캐시 일관).
                 // 시도했다 무효였던 것: EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE — ANGLE이
                 // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
-                let origin = DeviceIntPoint::new(
-                    update_offset.x - r_min_x,
-                    update_offset.y - r_min_y,
-                );
+                let origin =
+                    DeviceIntPoint::new(update_offset.x - r_min_x, update_offset.y - r_min_y);
                 // Task 9 diagnosis: per-bind coverage for non-opaque surfaces (first 300 frames).
                 if valid_probe_enabled() && !entry_is_opaque && self.frame_counter <= 300 {
                     log::info!(
                         "[dcomp-validprobe] surface={:?} tile=({},{}) dirty=({},{})-({},{}) \
                          valid=({},{})-({},{}) update_rect=({},{})-({},{}) update_off=({},{}) \
                          tex={}x{} origin=({},{})",
-                        id.surface_id, id.x, id.y,
-                        dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
-                        valid_rect.min.x, valid_rect.min.y, valid_rect.max.x, valid_rect.max.y,
-                        update.left, update.top, update.right, update.bottom,
-                        update_offset.x, update_offset.y, desc.Width, desc.Height,
-                        origin.x, origin.y,
+                        id.surface_id,
+                        id.x,
+                        id.y,
+                        dirty_rect.min.x,
+                        dirty_rect.min.y,
+                        dirty_rect.max.x,
+                        dirty_rect.max.y,
+                        valid_rect.min.x,
+                        valid_rect.min.y,
+                        valid_rect.max.x,
+                        valid_rect.max.y,
+                        update.left,
+                        update.top,
+                        update.right,
+                        update.bottom,
+                        update_offset.x,
+                        update_offset.y,
+                        desc.Width,
+                        desc.Height,
+                        origin.x,
+                        origin.y,
                     );
                 }
                 if dcomp_debug() {
                     log::info!(
                         "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
                          update_off=({},{}) tex={}x{} -> origin=({},{})",
-                        id.surface_id, id.x, id.y,
-                        dirty_rect.min.x, dirty_rect.min.y, dirty_rect.max.x, dirty_rect.max.y,
-                        tile_rect.min.x, tile_rect.min.y,
-                        update_offset.x, update_offset.y, desc.Width, desc.Height,
-                        origin.x, origin.y
+                        id.surface_id,
+                        id.x,
+                        id.y,
+                        dirty_rect.min.x,
+                        dirty_rect.min.y,
+                        dirty_rect.max.x,
+                        dirty_rect.max.y,
+                        tile_rect.min.x,
+                        tile_rect.min.y,
+                        update_offset.x,
+                        update_offset.y,
+                        desc.Width,
+                        desc.Height,
+                        origin.x,
+                        origin.y
                     );
                 }
                 NativeSurfaceInfo { origin, fbo_id: 0 }
             },
             SurfaceStorage::External(_) => {
                 // WR은 external surface에 타일을 그리지 않는다(create_tile/bind 미호출) — 도달 불가.
-                warn!("[dcomp-native] bind on external surface {:?}; ignoring", id.surface_id);
-                NativeSurfaceInfo { origin: DeviceIntPoint::zero(), fbo_id: 0 }
+                warn!(
+                    "[dcomp-native] bind on external surface {:?}; ignoring",
+                    id.surface_id
+                );
+                NativeSurfaceInfo {
+                    origin: DeviceIntPoint::zero(),
+                    fbo_id: 0,
+                }
             },
         }
     }
@@ -2843,7 +3132,10 @@ impl Compositor for DCompNativeCompositor {
         // Safety: root는 살아있는 IDCompositionVisual.
         let hr = unsafe { (*root).RemoveAllVisuals() };
         if hr < 0 {
-            warn!("[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})", hr as u32);
+            warn!(
+                "[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})",
+                hr as u32
+            );
         }
         // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
         self.frame_surfaces.clear();
@@ -2881,8 +3173,8 @@ impl Compositor for DCompNativeCompositor {
         }
 
         // 월 시나리오는 scale=1·직사각 클립만 발생 예상 — 벗어나면 1회만 warn(스펙 §비범위).
-        if (transform.scale.x - 1.0).abs() > f32::EPSILON ||
-            (transform.scale.y - 1.0).abs() > f32::EPSILON
+        if (transform.scale.x - 1.0).abs() > f32::EPSILON
+            || (transform.scale.y - 1.0).abs() > f32::EPSILON
         {
             if !self.warned_scale {
                 warn!(
@@ -2895,7 +3187,9 @@ impl Compositor for DCompNativeCompositor {
         }
         if rounded_clip_radii != ClipRadius::EMPTY {
             if !self.warned_rounded_clip {
-                warn!("[dcomp-native] rounded clip radii unsupported; applying rectangular clip only");
+                warn!(
+                    "[dcomp-native] rounded clip radii unsupported; applying rectangular clip only"
+                );
                 self.warned_rounded_clip = true;
             }
         }
@@ -2947,10 +3241,21 @@ impl Compositor for DCompNativeCompositor {
             log::info!(
                 "[dcomp-dbg] add_surface id={:?} transform.offset=({},{}) scale=({},{}) \
                  clip=({},{})-({},{}) virt_off=({},{}) anchor=({},{}) -> visual_off=({},{})",
-                id, transform.offset.x, transform.offset.y, transform.scale.x, transform.scale.y,
-                clip_rect.min.x, clip_rect.min.y, clip_rect.max.x, clip_rect.max.y,
-                virtual_offset.x, virtual_offset.y, content_anchor.x, content_anchor.y,
-                offset_x, offset_y
+                id,
+                transform.offset.x,
+                transform.offset.y,
+                transform.scale.x,
+                transform.scale.y,
+                clip_rect.min.x,
+                clip_rect.min.y,
+                clip_rect.max.x,
+                clip_rect.max.y,
+                virtual_offset.x,
+                virtual_offset.y,
+                content_anchor.x,
+                content_anchor.y,
+                offset_x,
+                offset_y
             );
         }
 
@@ -3005,8 +3310,9 @@ impl Compositor for DCompNativeCompositor {
         // immediate context 로 간다 — 한 컨텍스트 안에서는 순서가 이미 보장되므로 제출을
         // 강제할 이유가 없다. 제출이 **다른 곳에서 보여야** 하는 것은 `External` 뿐이다.
         // 비디오 링의 D3D11 디바이스가 별개이기 때문이다.
-        let needs_flush = servo_config::pref!(gfx_dcomp_always_flush_end_frame) ||
-            self.surfaces
+        let needs_flush = servo_config::pref!(gfx_dcomp_always_flush_end_frame)
+            || self
+                .surfaces
                 .values()
                 .any(|entry| matches!(entry.storage, SurfaceStorage::External(_)));
         if needs_flush {
@@ -3046,8 +3352,8 @@ impl Compositor for DCompNativeCompositor {
                     // 전면 갱신 = 이 프레임의 dirty가 전 타일의 valid를 덮음(Virtual bind 집계).
                     // frame_coverage는 Virtual 전용 부기(스왑체인은 sc.coverage 사용)라
                     // 계산·리셋을 이 arm에서만 수행한다.
-                    let frame_drawn = !entry.frame_coverage.covered_tiles.is_empty()
-                        || entry.frame_drawn_partial;
+                    let frame_drawn =
+                        !entry.frame_coverage.covered_tiles.is_empty() || entry.frame_drawn_partial;
                     let frame_full = entry.frame_coverage.is_full(&entry.tiles);
                     entry.frame_coverage.reset();
                     entry.frame_drawn_partial = false;
@@ -3103,8 +3409,8 @@ impl Compositor for DCompNativeCompositor {
                     // regen 생성이 한 번 실패했으면 재시도하지 않는다(warn 스팸 방지, 콘텐츠 동결).
                     let cur_extent =
                         surface_extent(&entry.tiles, entry.virtual_offset, entry.tile_size);
-                    let geometry_changed = cur_extent
-                        .is_some_and(|e| e.min != sc.anchor || e.size() != sc.size);
+                    let geometry_changed =
+                        cur_extent.is_some_and(|e| e.min != sc.anchor || e.size() != sc.size);
 
                     if resize_active {
                         // task-12b: 리사이즈 중(드래그) — regen/present/withhold 정상 로직을
@@ -3132,8 +3438,10 @@ impl Compositor for DCompNativeCompositor {
                         // frame_dirty를 계속 push해 무한 성장할 수 있다. 규정 위 안전 방향으로
                         // 상한 초과분을 붕괴 — stale은 regen에서 리셋되고 다음 content-swap이
                         // 항상 전면 시딩하므로 정보 손실 없음.
-                        sc.frame_dirty =
-                            collapse_dirty_if_oversized(std::mem::take(&mut sc.frame_dirty), MAX_STALE_RECTS);
+                        sc.frame_dirty = collapse_dirty_if_oversized(
+                            std::mem::take(&mut sc.frame_dirty),
+                            MAX_STALE_RECTS,
+                        );
                     } else if sc.drawn_this_frame && sc.coverage.is_full(&entry.tiles) {
                         // 첫 콘텐츠 Present 여부는 성공 처리 전에 계산(성공 시 content_attached가
                         // 바뀌므로 stale 시딩 판정에 원본 값이 필요).
@@ -3220,7 +3528,8 @@ impl Compositor for DCompNativeCompositor {
                                     if dcomp_debug() {
                                         log::info!(
                                             "[dcomp-dbg] content-swap id={:?} -> swapchain partial_present={}",
-                                            id, sc.partial_present
+                                            id,
+                                            sc.partial_present
                                         );
                                     }
                                 } else {
@@ -3256,7 +3565,9 @@ impl Compositor for DCompNativeCompositor {
                             if dcomp_debug() {
                                 log::info!(
                                     "[dcomp-dbg] present-partial id={:?} dirty={} catchup={}",
-                                    id, dirty.len(), catchup.len()
+                                    id,
+                                    dirty.len(),
+                                    catchup.len()
                                 );
                             }
                         } else {
@@ -3290,8 +3601,12 @@ impl Compositor for DCompNativeCompositor {
                             );
                         }
                         if dcomp_debug() {
-                            log::info!("[dcomp-dbg] withhold id={:?} covered={}/{}",
-                                id, sc.coverage.covered_tiles.len(), entry.tiles.len());
+                            log::info!(
+                                "[dcomp-dbg] withhold id={:?} covered={}/{}",
+                                id,
+                                sc.coverage.covered_tiles.len(),
+                                entry.tiles.len()
+                            );
                         }
                     }
                     // 프레임 pbuffer 파기(미프레젠트여도 다음 프레임 GetBuffer(0)=같은 버퍼).
@@ -3356,7 +3671,11 @@ impl Compositor for DCompNativeCompositor {
             if dcomp_debug() {
                 log::info!(
                     "[dcomp-dbg] promote id={:?} extent={}x{} anchor=({},{})",
-                    surface_id, size.width, size.height, extent.min.x, extent.min.y
+                    surface_id,
+                    size.width,
+                    size.height,
+                    extent.min.x,
+                    extent.min.y
                 );
             }
         }
@@ -3405,7 +3724,11 @@ impl Compositor for DCompNativeCompositor {
                     if dcomp_debug() {
                         log::info!(
                             "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
-                            surface_id, size.width, size.height, extent.min.x, extent.min.y
+                            surface_id,
+                            size.width,
+                            size.height,
+                            extent.min.x,
+                            extent.min.y
                         );
                     }
                 }
@@ -3419,14 +3742,20 @@ impl Compositor for DCompNativeCompositor {
         // 불가 상태의 withhold 30 (c) 부분 Present 런타임 실패(즉시, Task 4) (d) 전면
         // Present DXGI 실패(즉시, 보강 항목 2 — §8 일반 정책).
         for surface_id in demote_requests {
-            let Some(dcomp_device) = self.dcomp_device_ptr() else { break };
+            let Some(dcomp_device) = self.dcomp_device_ptr() else {
+                break;
+            };
             let ctx = self.d3d11_context.as_ref().map(ComOwned::as_ptr);
-            let Some(entry) = self.surfaces.get_mut(&surface_id) else { continue };
+            let Some(entry) = self.surfaces.get_mut(&surface_id) else {
+                continue;
+            };
             let is_opaque = entry.is_opaque;
             let virtual_offset = entry.virtual_offset;
             let tile_size = entry.tile_size;
             let last_placement = entry.last_placement;
-            let SurfaceStorage::SwapChain(sc) = &mut entry.storage else { continue };
+            let SurfaceStorage::SwapChain(sc) = &mut entry.storage else {
+                continue;
+            };
             release_frame_pbuffer(&rc, sc);
 
             // 최종 리뷰 Important #1: 이미 제3상태로 판정·경고된 서피스는 매 프레임
@@ -3481,7 +3810,13 @@ impl Compositor for DCompNativeCompositor {
             } else {
                 // §6.2-2: 새 가상 서피스 생성 + buffer 0 전체 복사 + SetContent 원자 전환.
                 demote_seed_new_virtual(
-                    dcomp_device, ctx, sc, &entry.visual, last_placement, is_opaque, virtual_offset,
+                    dcomp_device,
+                    ctx,
+                    sc,
+                    &entry.visual,
+                    last_placement,
+                    is_opaque,
+                    virtual_offset,
                 )
             };
             let Some(new_virtual) = seeded else {
@@ -3499,7 +3834,9 @@ impl Compositor for DCompNativeCompositor {
             // 이미 fallback(케이스 1, 승격 후 한 번도 SetContent 안 됨) 또는 새 virtual
             // (케이스 2, 방금 SetContent 완료)이 붙어 있으므로 안전. displayed_anchor는
             // storage와 함께 소멸하고 Virtual arm의 content_anchor=zero 산식이 자동 적용된다.
-            entry.storage = SurfaceStorage::Virtual { virtual_surface: new_virtual };
+            entry.storage = SurfaceStorage::Virtual {
+                virtual_surface: new_virtual,
+            };
             if resize_active {
                 // task-12b (C): 리사이즈 강등은 병리(withhold/present 실패)가 아니라 의도된
                 // 모드 전환이다. 지수 쿨다운/demote_count 증가를 적용하면 정착 후 재승격이
@@ -3509,7 +3846,10 @@ impl Compositor for DCompNativeCompositor {
                 // 이는 쿨다운 페널티가 아니라 신규 서피스의 정상 히스테리시스.)
                 entry.promote_blocked_until = 0;
                 if dcomp_debug() {
-                    log::info!("[dcomp-dbg] resize-demote id={:?} (no cooldown)", surface_id);
+                    log::info!(
+                        "[dcomp-dbg] resize-demote id={:?} (no cooldown)",
+                        surface_id
+                    );
                 }
             } else {
                 entry.demote_count = entry.demote_count.saturating_add(1);
@@ -3518,7 +3858,9 @@ impl Compositor for DCompNativeCompositor {
                 if dcomp_debug() {
                     log::info!(
                         "[dcomp-dbg] demote id={:?} count={} cooldown={}",
-                        surface_id, entry.demote_count, cooldown
+                        surface_id,
+                        entry.demote_count,
+                        cooldown
                     );
                 }
             }
@@ -3542,7 +3884,9 @@ impl Compositor for DCompNativeCompositor {
         // 따라서 add_surface가 기록한 z-order(아래→위) 그대로, 컬 없이 전부 합성한다.
         if let Some(root) = self.root_visual_ptr() {
             for id in self.frame_surfaces.iter() {
-                let Some(entry) = self.surfaces.get(id) else { continue; };
+                let Some(entry) = self.surfaces.get(id) else {
+                    continue;
+                };
                 // Safety: visual/root 살아있음. 순서 = add_surface 순서(z 아래→위) 유지.
                 // insertAbove 인자는 MS 문서(IDCompositionVisual::AddVisual Remarks)의
                 // referenceVisual=NULL 특칙에서 직관과 반대로 동작한다: "If insertAbove is
@@ -3598,8 +3942,15 @@ impl Compositor for DCompNativeCompositor {
 
     fn destroy_surface(&mut self, _device: &mut Device, id: NativeSurfaceId) {
         // 방어적: 이 서피스가 mid-bind면(정상 흐름에선 없음) EndDraw 없이 bound 상태를 정리.
-        if self.bound.as_ref().is_some_and(|bound| bound.surface_id == id) {
-            warn!("[dcomp-native] destroy_surface on bound surface {:?}; dropping bound state", id);
+        if self
+            .bound
+            .as_ref()
+            .is_some_and(|bound| bound.surface_id == id)
+        {
+            warn!(
+                "[dcomp-native] destroy_surface on bound surface {:?}; dropping bound state",
+                id
+            );
             self.drop_bound_without_enddraw();
         }
         // SwapChain storage의 frame_pbuffer는 RAII가 아니므로 remove 전에 명시 정리한다.
@@ -3613,7 +3964,12 @@ impl Compositor for DCompNativeCompositor {
         self.surfaces.remove(&id);
     }
 
-    fn create_external_surface(&mut self, _device: &mut Device, id: NativeSurfaceId, is_opaque: bool) {
+    fn create_external_surface(
+        &mut self,
+        _device: &mut Device,
+        id: NativeSurfaceId,
+        is_opaque: bool,
+    ) {
         let Some(dcomp_device) = self.dcomp_device_ptr() else {
             return;
         };
@@ -3624,7 +3980,10 @@ impl Compositor for DCompNativeCompositor {
             let mut visual_raw: *mut IDCompositionVisual = ptr::null_mut();
             let hr = (*dcomp_device).CreateVisual(&mut visual_raw);
             if hr < 0 || visual_raw.is_null() {
-                warn!("[dcomp-native] create_external_surface: CreateVisual failed (hr=0x{:08x})", hr as u32);
+                warn!(
+                    "[dcomp-native] create_external_surface: CreateVisual failed (hr=0x{:08x})",
+                    hr as u32
+                );
                 return;
             }
             let Some(visual) = ComOwned::from_raw(visual_raw) else {
@@ -3657,7 +4016,11 @@ impl Compositor for DCompNativeCompositor {
             }
         };
         if dcomp_debug() {
-            log::info!("[dcomp-dbg] create_external_surface id={:?} opaque={}", id, is_opaque);
+            log::info!(
+                "[dcomp-dbg] create_external_surface id={:?} opaque={}",
+                id,
+                is_opaque
+            );
         }
         self.surfaces.insert(id, entry);
     }
@@ -3669,11 +4032,17 @@ impl Compositor for DCompNativeCompositor {
         external_image: ExternalImageId,
     ) {
         let Some(entry) = self.surfaces.get_mut(&id) else {
-            warn!("[dcomp-native] attach_external_image: unknown surface {:?}", id);
+            warn!(
+                "[dcomp-native] attach_external_image: unknown surface {:?}",
+                id
+            );
             return;
         };
         let SurfaceStorage::External(ext) = &mut entry.storage else {
-            warn!("[dcomp-native] attach_external_image: surface {:?} is not external", id);
+            warn!(
+                "[dcomp-native] attach_external_image: surface {:?} is not external",
+                id
+            );
             return;
         };
         let first = ext.attached_external_id != Some(external_image.0);
@@ -3681,19 +4050,27 @@ impl Compositor for DCompNativeCompositor {
         if first && dcomp_debug() {
             log::info!(
                 "[dcomp-dbg] attach_external_image id={:?} external_id={}",
-                id, external_image.0
+                id,
+                external_image.0
             );
         }
     }
 
-    fn create_backdrop_surface(&mut self, _device: &mut Device, _id: NativeSurfaceId, _color: ColorF) {
+    fn create_backdrop_surface(
+        &mut self,
+        _device: &mut Device,
+        _id: NativeSurfaceId,
+        _color: ColorF,
+    ) {
         self.warn_external_surface_once();
     }
 
     fn enable_native_compositor(&mut self, _device: &mut Device, _enable: bool) {
         // 디버그 커맨드 전용 경로(renderer mod.rs:1619) — Servo는 발행하지 않는다. warn-once.
         if !self.warned_enable_native {
-            warn!("[dcomp-native] enable_native_compositor is a debug-only path unused by Servo; ignoring");
+            warn!(
+                "[dcomp-native] enable_native_compositor is a debug-only path unused by Servo; ignoring"
+            );
             self.warned_enable_native = true;
         }
     }
@@ -3815,7 +4192,12 @@ impl Compositor for SharedDComp {
         self.0.borrow_mut().destroy_surface(device, id)
     }
 
-    fn create_external_surface(&mut self, device: &mut Device, id: NativeSurfaceId, is_opaque: bool) {
+    fn create_external_surface(
+        &mut self,
+        device: &mut Device,
+        id: NativeSurfaceId,
+        is_opaque: bool,
+    ) {
         self.0
             .borrow_mut()
             .create_external_surface(device, id, is_opaque)
@@ -3863,8 +4245,8 @@ mod tests {
     fn external_needs_present_dedups_by_ring_and_seq() {
         assert!(external_needs_present(None, 1, 5));
         assert!(!external_needs_present(Some((1, 5)), 1, 5));
-        assert!(external_needs_present(Some((1, 5)), 1, 6));   // 새 프레임
-        assert!(external_needs_present(Some((1, 5)), 2, 5));   // 링 교체(소스 전환)
+        assert!(external_needs_present(Some((1, 5)), 1, 6)); // 새 프레임
+        assert!(external_needs_present(Some((1, 5)), 2, 5)); // 링 교체(소스 전환)
     }
 
     #[test]
@@ -3895,11 +4277,20 @@ mod tests {
         // no swapchain -> must create
         assert!(external_swapchain_needs_recreate(false, a, a, 4));
         // jitter within tolerance -> no recreate
-        assert!(!external_swapchain_needs_recreate(true, a, DeviceIntSize::new(478, 349), 4));
+        assert!(!external_swapchain_needs_recreate(
+            true,
+            a,
+            DeviceIntSize::new(478, 349),
+            4
+        ));
         // change beyond tolerance -> recreate
-        assert!(external_swapchain_needs_recreate(true, a, DeviceIntSize::new(600, 347), 4));
+        assert!(external_swapchain_needs_recreate(
+            true,
+            a,
+            DeviceIntSize::new(600, 347),
+            4
+        ));
     }
-
 
     #[test]
     fn tile_virtual_rect_positions_tiles_on_grid() {
@@ -3935,7 +4326,10 @@ mod tests {
         assert_eq!(tile_visible_virtual_rect(tile, None, (0.0, 0.0), vo), tile);
         // 타일이 클립 밖 → 교차 비면 전체 타일 폴백(정확성 안전).
         let far = r(0, 0, 10, 10);
-        assert_eq!(tile_visible_virtual_rect(tile, Some(far), (0.0, 0.0), vo), tile);
+        assert_eq!(
+            tile_visible_virtual_rect(tile, Some(far), (0.0, 0.0), vo),
+            tile
+        );
         // transform_offset 반영: transform_offset=(100,0)이면 가상 클립이 −100 이동 →
         // 가시 우변이 18304에서 18204로 100 줄어든다(좌변은 타일 좌변 17408이 지배).
         let vis2 = tile_visible_virtual_rect(tile, Some(clip), (100.0, 0.0), vo);
@@ -3949,7 +4343,10 @@ mod tests {
         let wr_clip = r(0, 937, 1904, 1041);
         let drawn = r(0, 1024, 121, 1041);
         // 불투명 + 유니온 있음 → 그린 영역으로 좁힘(phantom 미도색 영역 합성 방지).
-        assert_eq!(refine_opaque_clip(wr_clip, true, Some(drawn)), r(0, 1024, 121, 1041));
+        assert_eq!(
+            refine_opaque_clip(wr_clip, true, Some(drawn)),
+            r(0, 1024, 121, 1041)
+        );
         // 비불투명 → 원 클립 유지(알파는 Task 9 투명 처리 담당).
         assert_eq!(refine_opaque_clip(wr_clip, false, Some(drawn)), wr_clip);
         // 유니온 미집계(None, add_surface 이전 첫 프레임) → 원 클립 폴백.
@@ -3957,30 +4354,42 @@ mod tests {
         // 전면 피복 불투명(비디오 그리드: 유니온 == 클립) → 무변화(순수 월 무회귀 보장).
         assert_eq!(refine_opaque_clip(wr_clip, true, Some(wr_clip)), wr_clip);
         // 교차 비면(비정상) → 원 클립 폴백(콘텐츠 소멸 방지).
-        assert_eq!(refine_opaque_clip(wr_clip, true, Some(r(5000, 5000, 5100, 5100))), wr_clip);
+        assert_eq!(
+            refine_opaque_clip(wr_clip, true, Some(r(5000, 5000, 5100, 5100))),
+            wr_clip
+        );
     }
 
     #[test]
     fn region_subtract_cases() {
         // 비겹침: 그대로
-        assert_eq!(region_subtract(&[r(0,0,10,10)], &[r(20,20,30,30)]), vec![r(0,0,10,10)]);
+        assert_eq!(
+            region_subtract(&[r(0, 0, 10, 10)], &[r(20, 20, 30, 30)]),
+            vec![r(0, 0, 10, 10)]
+        );
         // 완전 포함: 공집합
-        assert!(region_subtract(&[r(0,0,10,10)], &[r(0,0,10,10)]).is_empty());
-        assert!(region_subtract(&[r(2,2,8,8)], &[r(0,0,10,10)]).is_empty());
+        assert!(region_subtract(&[r(0, 0, 10, 10)], &[r(0, 0, 10, 10)]).is_empty());
+        assert!(region_subtract(&[r(2, 2, 8, 8)], &[r(0, 0, 10, 10)]).is_empty());
         // 부분 겹침(우하단 조각): 면적 보존 검증 — 결과 면적 = 10*10 - 5*5
-        let out = region_subtract(&[r(0,0,10,10)], &[r(5,5,15,15)]);
-        let area: i32 = out.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        let out = region_subtract(&[r(0, 0, 10, 10)], &[r(5, 5, 15, 15)]);
+        let area: i32 = out
+            .iter()
+            .map(|q| (q.max.x - q.min.x) * (q.max.y - q.min.y))
+            .sum();
         assert_eq!(area, 100 - 25);
         // 결과 조각이 서로 겹치지 않고 subtrahend와도 겹치지 않는다
         for (i, a) in out.iter().enumerate() {
-            assert!(a.intersection(&r(5,5,15,15)).is_none());
+            assert!(a.intersection(&r(5, 5, 15, 15)).is_none());
             for b in out.iter().skip(i + 1) {
                 assert!(a.intersection(b).is_none());
             }
         }
         // 여러 감수 렉트 순차 차감
-        let out = region_subtract(&[r(0,0,100,10)], &[r(10,0,20,10), r(30,0,40,10)]);
-        let area: i32 = out.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
+        let out = region_subtract(&[r(0, 0, 100, 10)], &[r(10, 0, 20, 10), r(30, 0, 40, 10)]);
+        let area: i32 = out
+            .iter()
+            .map(|q| (q.max.x - q.min.x) * (q.max.y - q.min.y))
+            .sum();
         assert_eq!(area, 1000 - 100 - 100);
     }
 
@@ -3991,14 +4400,20 @@ mod tests {
         // 첫 전면 Present: 반대 버퍼가 전면 stale
         st.on_present(&[full], full);
         // 이번 프레임 좌반만 갱신 → catch-up = 전면 − 좌반 = 우반
-        let catchup = st.catchup_rects(&[r(0,0,50,100)]);
-        let area: i32 = catchup.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
-        assert_eq!(area, 100*100 - 50*100);
+        let catchup = st.catchup_rects(&[r(0, 0, 50, 100)]);
+        let area: i32 = catchup
+            .iter()
+            .map(|q| (q.max.x - q.min.x) * (q.max.y - q.min.y))
+            .sum();
+        assert_eq!(area, 100 * 100 - 50 * 100);
         // 그 부분 프레임 Present 후: 반대 버퍼(방금 전면이었던 쪽)의 stale = 좌반
-        st.on_present(&[r(0,0,50,100)], full);
+        st.on_present(&[r(0, 0, 50, 100)], full);
         let catchup = st.catchup_rects(&[]);
-        let area: i32 = catchup.iter().map(|q| (q.max.x-q.min.x)*(q.max.y-q.min.y)).sum();
-        assert_eq!(area, 50*100);
+        let area: i32 = catchup
+            .iter()
+            .map(|q| (q.max.x - q.min.x) * (q.max.y - q.min.y))
+            .sum();
+        assert_eq!(area, 50 * 100);
         // 전면 더티 프레임의 catch-up은 공집합 (Global Constraints: 순수 월 0바이트)
         assert!(st.catchup_rects(&[full]).is_empty());
         // 단일 프레임 더티가 32개 초과 → 반대 버퍼 stale이 바운딩 유니온 1개로 붕괴(과대=안전)
