@@ -424,6 +424,10 @@ lto = "thin"
 codegen-units = 1
 
 [patch.crates-io]
+# 전환 구간 렌더 정체(200~340ms, 절반 이상이 CPU)를 WebRender 안에서 쪼개기 위한
+# 로컬 계측 사본. crates.io 0.68.0 과 같은 소스이고 느린 프레임에 한 줄(`WRSLOW`)을
+# 더한 것뿐이다. 원인이 잡히면 되돌린다.
+webrender = { path = "vendor_local/webrender" }
 surfman = { path = "third_party/surfman" }
 # If you need to temporarily test Servo with a local fork of some upstream
 # crate, add that here. Use the form:
