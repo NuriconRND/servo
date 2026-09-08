@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
@@ -2216,15 +2216,6 @@ impl Paint {
             PaintMessage::UpdateImages(painter_id, updates) => {
                 let target_painter_ids = self.target_painter_ids_for_source_painter(painter_id);
                 if target_painter_ids.len() > 1 {
-                    let requested_gpus: Vec<_> = target_painter_ids
-                        .iter()
-                        .map(|target_painter_id| {
-                            self.with_painter(*target_painter_id, move |painter| {
-                                painter.rendering_context.requested_gpu_index()
-                            })
-                            .flatten()
-                        })
-                        .collect();
                     let mut add_count = 0;
                     let mut update_count = 0;
                     let mut delete_count = 0;
@@ -2237,40 +2228,29 @@ impl Paint {
                             ImageUpdate::UpdateImageForAnimation(..) => animation_update_count += 1,
                         }
                     }
+                    // ★요약을 찍기로 정한 뒤에 그 인자를 만든다.★ 예전에는 타겟마다 painter 를 찾아
+                    // `requested_gpus` 를 만드는 일을 **메시지마다** 했는데, 그 값은 걸러지는 `debug!`
+                    // 와 드물게 나가는 아래 `info!` 에서만 쓰인다. 전환 순간 이 자리를 초당 수천 번
+                    // 지나므로, 쓰지도 않을 값을 위해 타일 수만큼 painter 를 찾는 왕복이 그대로 쌓인다.
                     let fanout_id =
                         WALL_MEDIA_IMAGE_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    debug!(
-                        "Wall media image fanout: source_painter={:?} target_painters={:?} \
-                         requested_gpus={:?} updates_total={} adds={} updates={} deletes={} \
-                         animation_updates={} fanout_id={}",
-                        painter_id,
-                        target_painter_ids,
-                        requested_gpus,
-                        updates.len(),
-                        add_count,
-                        update_count,
-                        delete_count,
-                        animation_update_count,
-                        fanout_id,
-                    );
                     if add_count > 0
                         || delete_count > 0
                         || fanout_id <= 3
                         || fanout_id % WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL == 0
                     {
+                        let requested_gpus: Vec<_> = target_painter_ids
+                            .iter()
+                            .map(|target_painter_id| {
+                                self.with_painter(*target_painter_id, move |painter| {
+                                    painter.rendering_context.requested_gpu_index()
+                                })
+                                .flatten()
+                            })
+                            .collect();
                         info!(
-                            "Wall media image fanout summary: fanout_id={} source_painter={:?} \
-                             target_painters={:?} requested_gpus={:?} updates_total={} \
-                             adds={} updates={} deletes={} animation_updates={}",
-                            fanout_id,
-                            painter_id,
-                            target_painter_ids,
-                            requested_gpus,
+                            "Wall media image fanout summary: fanout_id={fanout_id} source_painter={painter_id:?} target_painters={target_painter_ids:?} requested_gpus={requested_gpus:?} updates_total={} adds={add_count} updates={update_count} deletes={delete_count} animation_updates={animation_update_count}",
                             updates.len(),
-                            add_count,
-                            update_count,
-                            delete_count,
-                            animation_update_count,
                         );
                     }
                 }
@@ -2822,6 +2802,72 @@ impl Paint {
     }
 
     #[servo_tracing::instrument(skip_all)]
+    /// 한 드레인 안에서 **같은 이미지 키의 낡은 비디오 프레임 갱신을 버린다.** 버린 개수를
+    /// 돌려준다.
+    ///
+    /// 전환 순간 한 번의 드레인이 409건이었고 그 중 385건이 `UpdateImages` 였다. 그런데
+    /// `Painter::update_images` 는 epoch 없는 갱신(=비디오 프레임)을 이미 키별 latest-wins
+    /// 로 스태시한다 — 같은 키의 앞선 프레임은 **어차피 버려질 운명인데**, 그 앞선 것들까지
+    /// 타일 수만큼 팬아웃되어 페인터마다 스태시와 합성 판정을 한 바퀴씩 돌고 있었다.
+    /// 여기서 미리 버리면 그 왕복이 통째로 사라진다.
+    ///
+    /// ★표시되는 프레임 수는 줄지 않는다★ — 한 번의 표출에 같은 영상의 프레임 두 장을
+    /// 보여 줄 수는 없고, 이 합침의 범위는 드레인 한 번(수 ms 분량의 도착)이다.
+    ///
+    /// 의미가 흔들릴 수 있는 키는 손대지 않는다: 이 배치 안에서 추가·삭제·애니메이션
+    /// 갱신이 있었거나 epoch 가 붙은(캔버스처럼 스크립트와 짝이 맞아야 하는) 키는 그대로
+    /// 둔다. 그런 키에서는 순서가 곧 정확성이다.
+    fn drop_superseded_video_frame_updates(messages: &mut Vec<PaintMessage>) -> usize {
+        let mut protected: HashSet<ImageKey> = HashSet::new();
+        for message in messages.iter() {
+            let PaintMessage::UpdateImages(_, updates) = message else {
+                continue;
+            };
+            for update in updates.iter() {
+                match update {
+                    ImageUpdate::UpdateImage(_, _, _, None) => {},
+                    ImageUpdate::AddImage(key, ..)
+                    | ImageUpdate::DeleteImage(key)
+                    | ImageUpdate::UpdateImageForAnimation(key, _)
+                    | ImageUpdate::UpdateImage(key, _, _, Some(_)) => {
+                        protected.insert(*key);
+                    },
+                }
+            }
+        }
+
+        // 뒤에서 앞으로 훑으며 (페인터, 키)마다 **가장 나중 것**만 남긴다.
+        let mut seen: HashSet<(PainterId, ImageKey)> = HashSet::new();
+        let mut keep = vec![true; messages.len()];
+        let mut dropped = 0;
+        for (index, message) in messages.iter().enumerate().rev() {
+            let PaintMessage::UpdateImages(painter_id, updates) = message else {
+                continue;
+            };
+            // 한 메시지에 갱신이 여럿이면 건드리지 않는다 — 메시지를 통째로 버릴 수 있을
+            // 때만 버리는 것이 이 합침의 안전 조건이다.
+            let [ImageUpdate::UpdateImage(key, _, _, None)] = updates.as_slice() else {
+                continue;
+            };
+            if protected.contains(key) {
+                continue;
+            }
+            if !seen.insert((*painter_id, *key)) {
+                keep[index] = false;
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            let mut index = 0;
+            messages.retain(|_| {
+                let keep_this = keep[index];
+                index += 1;
+                keep_this
+            });
+        }
+        dropped
+    }
+
     pub fn handle_messages(&self, mut messages: Vec<PaintMessage>) {
         // ★이 함수는 임베더의 메인 스레드에서 돈다★(`Servo::spin_event_loop`), 그리고 그
         // 스레드에 표출 클럭이 얹혀 있다. 전환 순간 한 번의 드레인이 698건 469ms 로
@@ -2837,6 +2883,7 @@ impl Paint {
                 None => kinds.push((kind, 1)),
             }
         }
+        let superseded = Self::drop_superseded_video_frame_updates(&mut messages);
         // Pull out the `NewWebRenderFrameReady` messages from the list of messages and handle them
         // at the end of this function. This prevents overdraw when more than a single message of
         // this type of received. In addition, if any of these frames need a repaint, that reflected
@@ -2907,7 +2954,9 @@ impl Paint {
                 .map(|(name, count)| format!("{name}:{count}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            warn!("PAINTDRAIN drain_ms={drain_ms:.1} msgs={messages_seen} [{breakdown}]");
+            warn!(
+                "PAINTDRAIN drain_ms={drain_ms:.1} msgs={messages_seen} superseded={superseded} [{breakdown}]"
+            );
         }
     }
 
@@ -3168,5 +3217,146 @@ impl Paint {
             });
 
         let _ = result_sender.send((font_keys, font_instance_keys));
+    }
+}
+
+#[cfg(test)]
+mod superseded_video_frame_tests {
+    use paint_api::{ImageUpdate, PaintMessage, SerializableImageData};
+    use servo_base::id::PainterId;
+    use webrender_api::{
+        ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
+        ImageDescriptorFlags, ImageFormat, ImageKey,
+    };
+
+    use super::Paint;
+
+    fn painter(index: u32) -> PainterId {
+        webrender_api::IdNamespace(index).into()
+    }
+
+    fn key(painter: PainterId, index: u32) -> ImageKey {
+        ImageKey(painter.into(), index)
+    }
+
+    fn descriptor() -> ImageDescriptor {
+        ImageDescriptor::new(16, 16, ImageFormat::BGRA8, ImageDescriptorFlags::IS_OPAQUE)
+    }
+
+    fn external() -> SerializableImageData {
+        SerializableImageData::External(ExternalImageData {
+            id: ExternalImageId(1),
+            channel_index: 0,
+            image_type: ExternalImageType::TextureHandle(ImageBufferKind::Texture2D),
+            normalized_uvs: false,
+        })
+    }
+
+    /// 비디오 프레임 한 장(epoch 없음).
+    fn frame(painter: PainterId, image: ImageKey) -> PaintMessage {
+        PaintMessage::UpdateImages(
+            painter,
+            [ImageUpdate::UpdateImage(
+                image,
+                descriptor(),
+                external(),
+                None,
+            )]
+            .into(),
+        )
+    }
+
+    fn kinds(messages: &[PaintMessage]) -> Vec<&'static str> {
+        messages.iter().map(PaintMessage::kind).collect()
+    }
+
+    #[test]
+    fn keeps_only_the_last_frame_of_each_key() {
+        let p = painter(1);
+        let (a, b) = (key(p, 10), key(p, 11));
+        let mut messages = vec![frame(p, a), frame(p, b), frame(p, a), frame(p, a)];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 2);
+        assert_eq!(messages.len(), 2);
+        // 남은 것은 각 키의 **마지막** 것이고, 서로의 상대 순서는 그대로다.
+        assert!(matches!(
+            &messages[0],
+            PaintMessage::UpdateImages(_, updates)
+                if matches!(updates.as_slice(), [ImageUpdate::UpdateImage(k, ..)] if *k == b)
+        ));
+        assert!(matches!(
+            &messages[1],
+            PaintMessage::UpdateImages(_, updates)
+                if matches!(updates.as_slice(), [ImageUpdate::UpdateImage(k, ..)] if *k == a)
+        ));
+    }
+
+    #[test]
+    fn does_not_merge_across_painters() {
+        // 팬아웃의 각 타일은 자기 몫을 받아야 한다 — 같은 키라도 페인터가 다르면 별개다.
+        let (p1, p2) = (painter(1), painter(2));
+        let image = key(p1, 10);
+        let mut messages = vec![frame(p1, image), frame(p2, image)];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn leaves_a_key_alone_once_the_batch_adds_or_deletes_it() {
+        // 추가·삭제가 섞인 키에서는 순서가 곧 정확성이다. 하나라도 있으면 그 키는 통째로
+        // 손대지 않는다 — 삭제 뒤에 낡은 갱신이 남거나 그 반대가 되면 안 된다.
+        let p = painter(1);
+        let image = key(p, 10);
+        for extra in [
+            ImageUpdate::DeleteImage(image),
+            ImageUpdate::AddImage(image, descriptor(), external(), false),
+        ] {
+            let mut messages = vec![
+                frame(p, image),
+                frame(p, image),
+                PaintMessage::UpdateImages(p, [extra].into()),
+            ];
+            assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
+            assert_eq!(messages.len(), 3);
+        }
+    }
+
+    #[test]
+    fn leaves_canvas_updates_alone() {
+        // epoch 가 붙은 갱신은 스크립트와 짝이 맞아야 한다(캔버스). 버리면 ack 가 어긋난다.
+        let p = painter(1);
+        let image = key(p, 10);
+        let paired = PaintMessage::UpdateImages(
+            p,
+            [ImageUpdate::UpdateImage(
+                image,
+                descriptor(),
+                external(),
+                Some(servo_base::Epoch(7)),
+            )]
+            .into(),
+        );
+        let mut messages = vec![frame(p, image), paired, frame(p, image)];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn leaves_other_messages_in_place() {
+        let p = painter(1);
+        let image = key(p, 10);
+        let mut messages = vec![
+            frame(p, image),
+            PaintMessage::GenerateFrame(vec![p]),
+            frame(p, image),
+        ];
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 1);
+        assert_eq!(kinds(&messages), vec!["GenerateFrame", "UpdateImages"]);
+    }
+
+    #[test]
+    fn empty_input_is_a_no_op() {
+        let mut messages: Vec<PaintMessage> = Vec::new();
+        assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
+        assert!(messages.is_empty());
     }
 }
