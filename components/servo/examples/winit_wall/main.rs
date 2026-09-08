@@ -256,8 +256,40 @@ struct AppState {
     capture_deadline: Option<std::time::Instant>,
     /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
     pass_counter: Cell<u64>,
+    /// 메인 스레드의 1초를 어디에 썼는지.
+    ///
+    /// ★기계에 코어가 남아도는데 애니메이션이 죽는다면, 모자란 것은 처리량이 아니라 이
+    /// 한 스레드다.★ 벽의 렌더·표출·엔진 메시지 처리가 전부 여기서 직렬로 돌기 때문에,
+    /// 이 1초를 쪼개지 않으면 전환 구간에 패스가 60회에서 2회로 떨어진 이유가 렌더가
+    /// 길어서인지, `spin_event_loop` 이 붙잡아서인지, 아무도 그리라고 하지 않아서인지
+    /// 구분할 수 없다 -- 셋은 고쳐야 할 곳이 완전히 다르다.
+    ///
+    /// 계측을 pref 뒤에 두지 않는다: 초당 한 줄이고, 이것이 없는 로그는 이 질문에
+    /// 대해서는 다시 재야 하는 로그다.
+    main_busy: RefCell<MainBusy>,
     captured: Cell<bool>,
     should_exit: Cell<bool>,
+}
+
+/// 메인 스레드 한 창(1초)의 시간 배분.
+#[derive(Default)]
+struct MainBusy {
+    window_start: Option<std::time::Instant>,
+    spin_ms: f64,
+    spin_ms_max: f64,
+    spin_calls: u32,
+    render_ms: f64,
+    render_ms_max: f64,
+    render_calls: u32,
+}
+
+/// `charge_main` 이 시간을 적립할 칸.
+#[derive(Clone, Copy)]
+enum MainSlot {
+    /// `Servo::spin_event_loop` -- 엔진에서 올라온 메시지 처리.
+    Spin,
+    /// `render_all_tiles` -- 타일 페인트 + 표출.
+    Render,
 }
 
 /// One second of `render_all_tiles` timings.
@@ -442,6 +474,63 @@ impl AppState {
         }
     }
 
+    /// 메인 스레드가 `body` 에서 보낸 시간을 한 칸에 적립한다.
+    ///
+    /// `body` 가 끝난 뒤에야 `main_busy` 를 빌린다 -- `body` 안에서 다시 이 함수가
+    /// 불릴 수 있으므로(렌더 안에서 표출이 도는 식), 겹쳐 빌리면 패닉이다.
+    fn charge_main<T>(&self, slot: MainSlot, body: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let value = body();
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut busy = self.main_busy.borrow_mut();
+        if busy.window_start.is_none() {
+            busy.window_start = Some(start);
+        }
+        match slot {
+            MainSlot::Spin => {
+                busy.spin_ms += ms;
+                busy.spin_ms_max = busy.spin_ms_max.max(ms);
+                busy.spin_calls += 1;
+            },
+            MainSlot::Render => {
+                busy.render_ms += ms;
+                busy.render_ms_max = busy.render_ms_max.max(ms);
+                busy.render_calls += 1;
+            },
+        }
+        value
+    }
+
+    /// 1초가 찼으면 메인 스레드의 시간 배분을 한 줄로 찍고 창을 비운다.
+    ///
+    /// `idle` 은 창 길이에서 적립분을 뺀 나머지, 즉 **표출 클럭을 기다리며 논 시간**이다.
+    /// 이것이 큰데 패스가 적으면 붙잡힌 게 아니라 아무도 그리라고 하지 않은 것이고,
+    /// 0 에 가까우면 이 스레드가 포화된 것이다. 둘은 고칠 곳이 다르다.
+    fn report_main_busy(&self) {
+        let mut busy = self.main_busy.borrow_mut();
+        let Some(start) = busy.window_start else {
+            return;
+        };
+        let window_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if window_ms < 1000.0 {
+            return;
+        }
+        let accounted = busy.spin_ms + busy.render_ms;
+        log::info!(
+            "MAINBUSY window_ms={:.0} busy={:.1}% spin_ms={:.1} (n={} max={:.1}) render_ms={:.1} (n={} max={:.1}) idle_ms={:.1}",
+            window_ms,
+            100.0 * accounted / window_ms,
+            busy.spin_ms,
+            busy.spin_calls,
+            busy.spin_ms_max,
+            busy.render_ms,
+            busy.render_calls,
+            busy.render_ms_max,
+            (window_ms - accounted).max(0.0),
+        );
+        *busy = MainBusy::default();
+    }
+
     fn render_all_tiles(&self) {
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
@@ -467,7 +556,8 @@ impl AppState {
         } else {
             0
         };
-        self.pass_counter.set(self.pass_counter.get().wrapping_add(1));
+        self.pass_counter
+            .set(self.pass_counter.get().wrapping_add(1));
 
         // ★자기 스레드를 가진 타일은 먼저 전부 발사한다.★ 그래야 그것들이 도는 동안 아래
         // 루프가 primary 타일을 그리고, 마지막에 한 번만 기다린다. 발사하고 곧장 기다리면
@@ -862,6 +952,7 @@ impl ApplicationHandler<WakerEvent> for App {
             capture_path: config.capture.clone(),
             captured: Cell::new(false),
             pass_counter: Cell::new(0),
+            main_busy: RefCell::new(MainBusy::default()),
             should_exit: Cell::new(false),
         });
 
@@ -923,7 +1014,7 @@ impl ApplicationHandler<WakerEvent> for App {
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: WakerEvent) {
         if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
+            state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
         }
     }
 
@@ -935,6 +1026,7 @@ impl ApplicationHandler<WakerEvent> for App {
             event_loop.exit();
             return;
         }
+        state.report_main_busy();
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
         // fires even on a static page that has otherwise gone idle.
         if state.capture_path.is_some() && !state.captured.get() {
@@ -974,14 +1066,14 @@ impl ApplicationHandler<WakerEvent> for App {
         event: WindowEvent,
     ) {
         if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
+            state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
         }
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
-                    state.render_all_tiles();
+                    state.charge_main(MainSlot::Render, || state.render_all_tiles());
                 }
             },
             _ => (),
