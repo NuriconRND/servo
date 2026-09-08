@@ -10,7 +10,6 @@ mod media_thread;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
 use euclid::default::Size2D;
 use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
@@ -21,7 +20,7 @@ use paint_api::{
     ExternalImageSource, WebRenderExternalImageApi, WebRenderExternalImageHandlers,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_config::debug_env;
 use servo_config::{opts, pref};
@@ -670,14 +669,6 @@ struct MediaExternalImages {
     /// 이 소비자(= 이 painter)의 D3D11 디바이스. 그룹에서 자기 링을 찾고,
     /// 회수 큐에서 **자기 디바이스 것만** 가져오는 데 쓴다.
     device: Option<usize>,
-    /// 이 핸들러가 이미 최초 소비를 치른 링. 새 링인지 아닌지를 **계획을 뽑기 전에**
-    /// 알아야 한다 — 계획을 뽑으면(`note_plane_lock_and_plan`) 반드시 한 번 커밋해야
-    /// 하므로, 뽑아 놓고 무르는 선택지가 없다. 링은 (영상, painter) 하나에 하나이므로
-    /// 이 핸들러가 이 ring_id 를 처음 본다는 것이 곧 최초 소비다.
-    initialized_rings: FxHashSet<u64>,
-    /// 최초 소비 예산 창(16ms)의 시작 시각과 그 창에서 이미 쓴 시간.
-    ring_init_window_start: Instant,
-    ring_init_spent_ms: f64,
 }
 
 /// 월 GPU 팬아웃 불변식 감시용 기록: `(D3D11 디바이스 포인터, 그 디바이스를 받은 첫
@@ -820,33 +811,7 @@ impl MediaExternalImages {
             diag_logged_wrap_ok: false,
             diag_logged_wrap_fail: false,
             device: own_device,
-            initialized_rings: Default::default(),
-            ring_init_window_start: Instant::now(),
-            ring_init_spent_ms: 0.0,
         }
-    }
-
-    /// 새 링의 최초 소비를 이 프레임에 치러도 되는가.
-    ///
-    /// ★링의 최초 소비는 렌더러 스레드에서 30~100ms 다★(슬롯 4개 × 면 3개 = D3D11 `Map`
-    /// 12회 — 약 37MB 의 백킹 저장소를 처음 잡는 일이라, 첫 프레임 복사가 없어도 비싸다).
-    /// 그 스레드에 표출 클럭이 얹혀 있으므로, 전환 때 영상이 무더기로 뜨면 그 시간만큼
-    /// 타일 넷이 통째로 멈춘다. 16ms 창마다 예산만큼만 허용해 새 영상이 프레임당 하나씩
-    /// 들어오게 한다.
-    ///
-    /// 예산을 이미 넘겼으면 `false` — 호출자는 그 영상만 이번 프레임을 비운다. 이 경로에는
-    /// 같은 선례가 있다(링이 아직 없으면 그 프레임을 비우고 다음 프레임에 뜬다).
-    fn may_initialize_ring_now(&mut self) -> bool {
-        let budget_ms = servo_config::pref!(media_ring_init_budget_ms);
-        if budget_ms <= 0 {
-            return true;
-        }
-        let now = Instant::now();
-        if now.duration_since(self.ring_init_window_start) >= Duration::from_millis(16) {
-            self.ring_init_window_start = now;
-            self.ring_init_spent_ms = 0.0;
-        }
-        self.ring_init_spent_ms < budget_ms as f64
     }
 
     /// 제거된 링들을 정리한다: `mapped` 텍스처 Unmap(Presenting은 레지스트리가
@@ -912,20 +877,6 @@ impl MediaExternalImages {
             return (ExternalImageSource::Invalid, Size2D::zero());
         };
 
-        // ★새 링이면 예산을 먼저 묻는다★ — 계획을 뽑기 **전에** 물어야 한다. 계획은
-        // 뽑는 순간 링 상태를 옮기고 반드시 한 번 커밋해야 하므로, 뽑아 놓고 무를 수 없다.
-        // 예산이 없으면 이 영상만 이번 프레임을 비운다(lock_count 를 올리지 않았으므로
-        // unlock 도 no-op 이다 — 위 두 분기와 같은 모양).
-        let first_consume = !self.initialized_rings.contains(&ring_id);
-        if first_consume {
-            if !self.may_initialize_ring_now() {
-                return (ExternalImageSource::Invalid, Size2D::zero());
-            }
-            // 같은 프레임의 나머지 면(1, 2)이 다시 예산을 묻지 않도록 지금 등록한다 —
-            // 실제 Map 은 면 0 의 계획 하나가 전부 처리한다.
-            self.initialized_rings.insert(ring_id);
-        }
-
         // 여기서부터 lock_count 를 올리므로 unlock 이 짝을 맞추도록 기록한다.
         self.locked_d3d11_planes.insert(id, ring_id);
 
@@ -937,9 +888,6 @@ impl MediaExternalImages {
             let consume_start = std::time::Instant::now();
             consume_plan(&*rc, ring_id, plan);
             stage_consume_ms = consume_start.elapsed().as_secs_f64() * 1000.0;
-            if first_consume {
-                self.ring_init_spent_ms += stage_consume_ms;
-            }
         }
 
         // lock 반환용 텍스처: 현재 Presenting 슬롯의 이 plane 기술자.
@@ -1030,8 +978,6 @@ impl Drop for MediaExternalImages {
             return;
         };
         for ring in D3d11PlaneRings::take_removed_rings_for_device(device) {
-            // 링별 상태도 함께 버린다 — 남겨 두면 재생/정지를 반복하는 벽에서 끝없이 쌓인다.
-            self.initialized_rings.remove(&ring.ring_id);
             for texture in ring.mapped {
                 rc.unmap_d3d11_texture(texture);
             }

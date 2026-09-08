@@ -178,9 +178,6 @@ pub enum ConsumeCommit {
 /// 쓴다: `mapped`는 Unmap이 먼저 필요한 텍스처, `textures`는 전부 Release
 /// 대상이다.
 pub struct RemovedRing {
-    /// 사라진 링의 식별자. 소비자는 이 링에 대해 들고 있던 링별 상태(최초 소비를 이미
-    /// 치렀는지 등)를 이걸로 지운다 — 없으면 프로세스가 도는 내내 쌓인다.
-    pub ring_id: u64,
     pub textures: Vec<usize>,
     pub mapped: Vec<usize>,
     /// 이 링의 텍스처를 만든 D3D11 디바이스. ★그 디바이스를 소유한 소비자만
@@ -287,10 +284,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn plane_textures(slot: &SlotInfo) -> Vec<usize> {
-    slot.planes
-        .iter()
-        .filter_map(|p| p.map(|d| d.texture))
-        .collect()
+    slot.planes.iter().filter_map(|p| p.map(|d| d.texture)).collect()
 }
 
 /// 주어진 텍스처 핸들을 가진 (slot, plane) 매핑 정보를 갱신한다. 링 안의
@@ -387,7 +381,6 @@ impl D3d11PlaneRings {
             }
         }
         lock(removed_rings()).push(RemovedRing {
-            ring_id,
             textures,
             mapped,
             device,
@@ -401,7 +394,11 @@ impl D3d11PlaneRings {
     pub fn claim_free_slot(ring_id: u64) -> Option<ClaimedSlot> {
         let mut reg = lock(registry());
         let ring = reg.rings.get_mut(&ring_id)?;
-        let Some(idx) = ring.slots.iter().position(|s| s.state == SlotState::Free) else {
+        let Some(idx) = ring
+            .slots
+            .iter()
+            .position(|s| s.state == SlotState::Free)
+        else {
             ring.dropped_frames += 1;
             return None;
         };
@@ -460,10 +457,7 @@ impl D3d11PlaneRings {
     /// FREE 슬롯이 없어 memcpy 전에 드롭된 프레임 누적 개수.
     pub fn dropped_frames(ring_id: u64) -> u64 {
         let reg = lock(registry());
-        reg.rings
-            .get(&ring_id)
-            .map(|r| r.dropped_frames)
-            .unwrap_or(0)
+        reg.rings.get(&ring_id).map(|r| r.dropped_frames).unwrap_or(0)
     }
 
     /// plane lock 카운트가 0→1로 전이할 때만 소비 계획을 반환한다(합성당
@@ -1363,8 +1357,12 @@ mod tests {
 
         // take는 소진형 — 두 번째 호출엔 방금 항목들이 없어야 한다.
         let again = D3d11PlaneRings::take_removed_rings_for_device(DEV);
-        assert!(!again.iter().any(|r| r.textures.contains(&all_b[0])
-            || r.textures.contains(&slots_a[0][0].unwrap().texture)));
+        assert!(
+            !again
+                .iter()
+                .any(|r| r.textures.contains(&all_b[0])
+                    || r.textures.contains(&slots_a[0][0].unwrap().texture))
+        );
     }
 
     #[test]
@@ -1420,8 +1418,7 @@ mod tests {
         };
         assert_eq!(filled_slot2, c2.slot);
         // 이번엔 이전 presenting(=c1.slot)이 re-map 대상이어야 한다.
-        let expected_map2: Vec<usize> =
-            slots[c1.slot].iter().flatten().map(|d| d.texture).collect();
+        let expected_map2: Vec<usize> = slots[c1.slot].iter().flatten().map(|d| d.texture).collect();
         assert_eq!(map2, expected_map2);
         D3d11PlaneRings::note_plane_unlock(ring_id);
     }
@@ -1538,10 +1535,7 @@ mod tests {
 
         let presenting_before =
             D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting after advance");
-        assert_eq!(
-            presenting_before.texture,
-            slots[c1.slot][0].unwrap().texture
-        );
+        assert_eq!(presenting_before.texture, slots[c1.slot][0].unwrap().texture);
 
         // 프로듀서가 memcpy 중인(Writing) 슬롯을 하나 만들어 둔다.
         let writing = D3d11PlaneRings::claim_free_slot(ring_id).expect("writing slot");
@@ -1562,12 +1556,7 @@ mod tests {
                 })
             })
             .collect();
-        D3d11PlaneRings::commit_consume(
-            ring_id,
-            ConsumeCommit::InitialMapAll {
-                mapped: bogus_mapped,
-            },
-        );
+        D3d11PlaneRings::commit_consume(ring_id, ConsumeCommit::InitialMapAll { mapped: bogus_mapped });
 
         // Presenting 슬롯이 그대로다(슬롯0으로 강제되지 않았다).
         let presenting_after =
@@ -1634,10 +1623,7 @@ mod tests {
 
         let presenting_before =
             D3d11PlaneRings::presenting_plane(ring_id, 0).expect("presenting after first commit");
-        assert_eq!(
-            presenting_before.texture,
-            slots[c1.slot][0].unwrap().texture
-        );
+        assert_eq!(presenting_before.texture, slots[c1.slot][0].unwrap().texture);
 
         // 같은 filled_slot으로 다시 커밋(변조된 data_ptr로 재현) — 이제
         // Remapping 슬롯이 하나도 없으므로 완전히 no-op이어야 한다.
@@ -1665,8 +1651,7 @@ mod tests {
         // 첫 커밋으로 Free가 된 old-presenting 슬롯(=슬롯0)을 다시
         // claim해서, data_ptr이 중복 커밋의 bogus 값(texture*12345)이
         // 아니라 첫 커밋 값(texture*900) 그대로인지 확인한다.
-        let reclaimed =
-            D3d11PlaneRings::claim_free_slot(ring_id).expect("old presenting slot free");
+        let reclaimed = D3d11PlaneRings::claim_free_slot(ring_id).expect("old presenting slot free");
         assert_eq!(reclaimed.slot, 0);
         let p0 = reclaimed.planes[0].expect("plane0 mapped");
         let expected_texture = slots[0][0].unwrap().texture;
