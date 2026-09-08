@@ -23,6 +23,8 @@ use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use euclid::{Point2D, Scale, Size2D};
 use servo::wall_args::WallArgs;
@@ -267,6 +269,16 @@ struct AppState {
     /// 계측을 pref 뒤에 두지 않는다: 초당 한 줄이고, 이것이 없는 로그는 이 질문에
     /// 대해서는 다시 재야 하는 로그다.
     main_busy: RefCell<MainBusy>,
+    /// 아직 소비되지 않은 깨우기가 큐에 있는가.
+    ///
+    /// 엔진은 할 말이 생길 때마다 `EventLoopWaker::wake` 를 부르고, 그것은 winit 큐에
+    /// 이벤트 하나를 올린다. 전환 순간 그 호출이 **초당 수천 번**이 되는데(실측 6,949회),
+    /// 드레인은 어차피 한 번이면 전부 비우므로 나머지는 전부 군더더기다. 그런데 그
+    /// 군더더기가 큐를 비지 않게 만들고, 큐가 비지 않으면 `about_to_wait` 이 돌지 않는다.
+    ///
+    /// 그래서 **동시에 하나만** 올린다. 이 플래그는 waker 와 공유되며, 소비하는 쪽
+    /// (`user_event`)이 드레인 **전에** 내린다.
+    wake_pending: Arc<AtomicBool>,
     captured: Cell<bool>,
     should_exit: Cell<bool>,
 }
@@ -529,6 +541,36 @@ impl AppState {
             (window_ms - accounted).max(0.0),
         );
         *busy = MainBusy::default();
+    }
+
+    /// 표출 클럭. 한 틱마다 엔진이 지금 들고 있는 것을 그린다 -- 무엇이 바뀌었는지
+    /// 따지지 않는 것이 핵심이다. 박자가 내용의 함수가 되면 그것은 균일하지도 않고,
+    /// 내용 쪽 신호가 하나 빠졌을 때 스스로 회복하지도 못한다.
+    ///
+    /// ★`about_to_wait` 에만 두면 안 된다.★ winit 은 이벤트 큐가 **빌 때만** 거기에
+    /// 도달한다. 전환 순간 엔진이 초당 수천 번 깨우면 큐가 비지 않고, 그러면 이 클럭이
+    /// 통째로 멈춘다 -- 실측된 최악은 3.2초다(`MAINBUSY window_ms=3239`). 그동안 벽은
+    /// 아무것도 새로 표출하지 않으므로, 화면은 애니메이션이 얼어붙은 것으로 보인다.
+    /// 그래서 이벤트를 처리하는 쪽에서도 이 클럭을 돌린다.
+    ///
+    /// 다음 틱 시각을 돌려준다(호출자가 control flow 를 잡을 때 쓴다).
+    fn drive_present_clock(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        let mut next = self.next_present_tick.get();
+        if now >= next {
+            // ***Advance to the first future tick rather than adding one period.*** After a
+            // stall (a long render, a debugger break) `next` can be far in the past, and
+            // stepping by one period would fire a burst of catch-up frames for moments that
+            // have already gone by. Skipping them is what a display does.
+            while next <= now {
+                next += self.present_period;
+            }
+            self.next_present_tick.set(next);
+            if let Some(tile) = self.tiles.first() {
+                tile.window.request_redraw();
+            }
+        }
+        next
     }
 
     fn render_all_tiles(&self) {
@@ -953,6 +995,7 @@ impl ApplicationHandler<WakerEvent> for App {
             captured: Cell::new(false),
             pass_counter: Cell::new(0),
             main_busy: RefCell::new(MainBusy::default()),
+            wake_pending: waker.pending.clone(),
             should_exit: Cell::new(false),
         });
 
@@ -1014,7 +1057,12 @@ impl ApplicationHandler<WakerEvent> for App {
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: WakerEvent) {
         if let Self::Running(state) = self {
+            // ★깨우기가 합쳐졌음을 먼저 표시한다★ -- 비우기 전에. 이 드레인이 도는 동안
+            // 들어온 깨우기는 새 이벤트를 올려야 하고, 순서를 뒤집으면 그것을 잃는다.
+            state.wake_pending.store(false, Ordering::SeqCst);
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
+            // 큐가 비지 않아도 박자는 흘러야 한다(`drive_present_clock` 참조).
+            state.drive_present_clock();
         }
     }
 
@@ -1037,25 +1085,7 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
 
-        // The presentation clock. Every tick draws whatever the engine currently holds --
-        // no test of whether anything changed, which is the point: the cadence must not be a
-        // function of the content, or it is neither uniform nor recoverable when a content
-        // signal goes missing.
-        let now = std::time::Instant::now();
-        let mut next = state.next_present_tick.get();
-        if now >= next {
-            // ***Advance to the first future tick rather than adding one period.*** After a
-            // stall (a long render, a debugger break) `next` can be far in the past, and
-            // stepping by one period would fire a burst of catch-up frames for moments that
-            // have already gone by. Skipping them is what a display does.
-            while next <= now {
-                next += state.present_period;
-            }
-            state.next_present_tick.set(next);
-            if let Some(tile) = state.tiles.first() {
-                tile.window.request_redraw();
-            }
-        }
+        let next = state.drive_present_clock();
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
     }
 
@@ -1067,6 +1097,7 @@ impl ApplicationHandler<WakerEvent> for App {
     ) {
         if let Self::Running(state) = self {
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
+            state.drive_present_clock();
         }
 
         match event {
@@ -1089,23 +1120,45 @@ impl ApplicationHandler<WakerEvent> for App {
 }
 
 #[derive(Clone)]
-struct Waker(winit::event_loop::EventLoopProxy<WakerEvent>);
+struct Waker {
+    proxy: winit::event_loop::EventLoopProxy<WakerEvent>,
+    /// `AppState::wake_pending` 와 같은 플래그. 여기 올린 이벤트가 아직 소비되지
+    /// 않았으면 다시 올리지 않는다.
+    pending: Arc<AtomicBool>,
+}
 #[derive(Debug)]
 struct WakerEvent;
 
 impl Waker {
     fn new(event_loop: &EventLoop<WakerEvent>) -> Self {
-        Self(event_loop.create_proxy())
+        Self {
+            proxy: event_loop.create_proxy(),
+            pending: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
 impl embedder_traits::EventLoopWaker for Waker {
     fn clone_box(&self) -> Box<dyn embedder_traits::EventLoopWaker> {
-        Box::new(Self(self.0.clone()))
+        // ★복제본도 같은 플래그를 공유한다★ -- 엔진은 waker 를 복제해 여러 스레드에
+        // 나눠 갖는다. 복제마다 플래그가 따로면 합쳐지는 것이 스레드 하나뿐이다.
+        Box::new(Self {
+            proxy: self.proxy.clone(),
+            pending: self.pending.clone(),
+        })
     }
 
     fn wake(&self) {
-        if let Err(error) = self.0.send_event(WakerEvent) {
+        // ★큐에 이미 소비되지 않은 깨우기가 있으면 올리지 않는다.★ 드레인은 한 번이면
+        // 전부 비우므로 두 번째부터는 아무 일도 하지 않는데, 그 빈 이벤트들이 큐를
+        // 비지 않게 만들어 `about_to_wait` 을 굶긴다 -- 그리고 표출 클럭이 거기 있다.
+        // 자세한 것은 `AppState::wake_pending`.
+        if self.pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(error) = self.proxy.send_event(WakerEvent) {
+            // 올리지 못했으면 표시도 되돌린다 -- 아니면 이후의 모든 깨우기가 막힌다.
+            self.pending.store(false, Ordering::SeqCst);
             eprintln!("warning: failed to wake event loop: {error:?}");
         }
     }
