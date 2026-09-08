@@ -525,6 +525,13 @@ impl DisplayListBuilder<'_> {
             && style.get_svg().clip_path == ClipPath::None
             && transform_style == TransformStyle::Flat
         {
+            // Say so when the element that just got skipped is one that is animating:
+            // from outside, "never looked" and "looked and found nothing" are the same
+            // zero. See `paint_animation::note_stacking_context_skipped`.
+            paint_animation::note_stacking_context_skipped(
+                self.animations,
+                fragment.base.tag.map(|tag| tag.node),
+            );
             return false;
         }
 

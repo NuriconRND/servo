@@ -27,6 +27,8 @@ use paint_api::display_list::{
 };
 use style::animation::{AnimationSetKey, DocumentAnimationSet};
 use style::dom::OpaqueNode;
+use std::cell::RefCell;
+
 use style::properties::animated_properties::AnimationValue;
 use style::properties::{LonghandId, OwnedPropertyDeclarationId, PropertyDeclarationId};
 use style::values::computed::Transform as ComputedTransform;
@@ -58,6 +60,58 @@ const SAMPLE_SECONDS: f64 = 1.0 / 60.0;
 
 /// Two sampled values closer than this count as the same value.
 const EPSILON: f32 = PaintAnimationSegment::<f32>::EPSILON;
+
+/// Why a binding did or did not happen, for one display list.
+///
+/// ***`built=0` has several causes and they look identical from outside.*** Measured on
+/// the 4-GPU wall, 2026-09-08 (log_ani_perf/08): the document reported one to three
+/// running animations of exactly `opacity` and `transform`, and not one of them was ever
+/// bound, across 115 display lists. Whether that is the element never reaching this code,
+/// the node not matching the animation set, or the samples coming back constant is the
+/// whole question, and nothing distinguished them.
+#[derive(Default)]
+struct BindTally {
+    /// Stacking contexts that returned before this code could look, on an element that
+    /// does have a running animation. The interesting half of the early return.
+    skipped_with_animation: u32,
+    considered: u32,
+    no_tag: u32,
+    not_in_set: u32,
+    no_value: u32,
+    constant: u32,
+    bound: u32,
+    transform_considered: u32,
+    transform_no_rect: u32,
+    transform_no_value: u32,
+    transform_constant: u32,
+    transform_bound: u32,
+}
+
+thread_local! {
+    static TALLY: RefCell<BindTally> = RefCell::new(BindTally::default());
+}
+
+fn tally(update: impl FnOnce(&mut BindTally)) {
+    TALLY.with(|cell| update(&mut cell.borrow_mut()));
+}
+
+/// A stacking context that never reached the binding code. Counted only when the element
+/// actually has an animation, because that is the only case worth explaining.
+pub(crate) fn note_stacking_context_skipped(
+    animations: &DocumentAnimationSet,
+    node: Option<OpaqueNode>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    if animations
+        .sets
+        .read()
+        .contains_key(&AnimationSetKey::new_for_non_pseudo(node))
+    {
+        tally(|counters| counters.skipped_with_animation += 1);
+    }
+}
 
 /// The opacity this element's animations and transitions produce at `time`, if any of them
 /// touch opacity at all.
@@ -105,10 +159,21 @@ pub(crate) fn opacity_binding(
     if !servo_config::pref!(gfx_paint_side_animations_enabled) {
         return unbound;
     }
+    tally(|counters| counters.considered += 1);
     let Some(node) = node else {
+        tally(|counters| counters.no_tag += 1);
         return unbound;
     };
+    if !animations
+        .sets
+        .read()
+        .contains_key(&AnimationSetKey::new_for_non_pseudo(node))
+    {
+        tally(|counters| counters.not_in_set += 1);
+        return unbound;
+    }
     if animated_opacity(animations, node, now).is_none() {
+        tally(|counters| counters.no_value += 1);
         return unbound;
     }
 
@@ -128,13 +193,16 @@ pub(crate) fn opacity_binding(
 
     let first = samples[0];
     if samples.iter().all(|value| (value - first).abs() <= EPSILON) {
+        tally(|counters| counters.constant += 1);
         return unbound;
     }
 
     let segments = PaintAnimationSegment::<f32>::from_samples(&samples, SAMPLE_SECONDS);
     if segments.is_empty() {
+        tally(|counters| counters.constant += 1);
         return unbound;
     }
+    tally(|counters| counters.bound += 1);
 
     // Complete when the tail of the horizon is flat: the animation has settled and the
     // paint thread can stop rather than hold a value it would keep re-sending.
@@ -182,9 +250,24 @@ pub(crate) fn log_built(count: usize) {
             return;
         }
         last.set(Some((now, count)));
+        let counters = TALLY.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         // Zero is reported too: a page that should be animating and reports zero is
-        // exactly what this line exists to show.
-        log::warn!("PAINTANIM built animations={count}");
+        // exactly what this line exists to show -- and the tally says which zero it is.
+        log::warn!(
+            "PAINTANIM built animations={count} skipped_with_animation={} considered={}              no_tag={} not_in_set={} no_value={} constant={} bound={} tx_considered={}              tx_no_rect={} tx_no_value={} tx_constant={} tx_bound={}",
+            counters.skipped_with_animation,
+            counters.considered,
+            counters.no_tag,
+            counters.not_in_set,
+            counters.no_value,
+            counters.constant,
+            counters.bound,
+            counters.transform_considered,
+            counters.transform_no_rect,
+            counters.transform_no_value,
+            counters.transform_constant,
+            counters.transform_bound,
+        );
     });
 }
 
@@ -236,8 +319,12 @@ pub(crate) fn transform_binding(
     if !servo_config::pref!(gfx_paint_side_animations_enabled) {
         return None;
     }
+    tally(|counters| counters.transform_considered += 1);
     let node = node?;
-    animated_transform_list(animations, node, now)?;
+    if animated_transform_list(animations, node, now).is_none() {
+        tally(|counters| counters.transform_no_value += 1);
+        return None;
+    }
 
     let count = ((horizon_seconds() / SAMPLE_SECONDS).ceil() as usize + 1).min(MAX_SAMPLES);
     let mut samples: Vec<LayoutTransform> = Vec::with_capacity(count);
@@ -257,10 +344,13 @@ pub(crate) fn transform_binding(
         }
     }
 
-    let segments = PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, SAMPLE_SECONDS);
+    let segments =
+        PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, SAMPLE_SECONDS);
     if segments.is_empty() {
+        tally(|counters| counters.transform_constant += 1);
         return None;
     }
+    tally(|counters| counters.transform_bound += 1);
 
     let last = *samples.last().expect("just sampled");
     let settled = samples.iter().rev().take(3).all(|matrix| {

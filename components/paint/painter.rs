@@ -857,6 +857,7 @@ impl Painter {
         // The sampled values still ride along on any transaction sent for another reason:
         // `reset_dynamic_properties` clears every binding, so a caret-only transaction
         // that omitted them would snap the animation back to whatever WebRender last had.
+        let floats_log: Vec<f32> = floats.iter().map(|property| property.value).collect();
         let animation_period = crate::refresh_driver::paint_timer_period();
         let animation_due = (!floats.is_empty() || !transforms.is_empty()) &&
             self.last_paint_animation_frame_at
@@ -884,7 +885,7 @@ impl Painter {
             self.web_content_animator
                 .wake_for_paint_animation(animation_period);
         }
-        self.log_paint_animation_activity(now, still_animating, animated_property_frame);
+        self.log_paint_animation_activity(now, still_animating, animated_property_frame, &floats_log);
     }
 
     /// One `PAINTANIM` line a second while anything is playing.
@@ -893,7 +894,13 @@ impl Painter {
     /// visible from the display list, but whether it is still moving while script is stuck
     /// is only visible here: these are frames the paint thread produced with no display
     /// list behind them. On a build without this, that count is zero by construction.
-    fn log_paint_animation_activity(&self, now: Instant, animating: bool, generated: bool) {
+    fn log_paint_animation_activity(
+        &self,
+        now: Instant,
+        animating: bool,
+        generated: bool,
+        values: &[f32],
+    ) {
         if generated {
             self.paint_animation_frames
                 .set(self.paint_animation_frames.get() + 1);
@@ -912,9 +919,20 @@ impl Painter {
         }
         // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
         // diagnostic nobody can see is a diagnostic that does not exist.
+        // ***The values, not just the frame count.*** A frame count says the painter did
+        // work; it does not say the work changed anything. Measured on the 4-GPU wall,
+        // 2026-09-08 (log_ani_perf/08): frames flowed at 33-53 a second through every
+        // script block and the picture did not move, and from the log alone there was no
+        // way to tell a frozen value from a value that never reached the screen.
+        let sample = values
+            .iter()
+            .take(3)
+            .map(|value| format!("{value:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={}",
-            self.painter_id, animating, frames
+            "PAINTANIM painter={:?} playing={} frames={} floats=[{}]",
+            self.painter_id, animating, frames, sample
         );
     }
 
