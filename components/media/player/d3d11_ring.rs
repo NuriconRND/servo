@@ -68,6 +68,16 @@ pub fn removed_queue_inventory() -> (usize, usize) {
     (queue.len(), textures)
 }
 
+/// 살아 있는 **그룹** 수. 그룹은 영상 하나(정확히는 caps 세대 하나)에 대응하고, 플레이어가
+/// 해체될 때 `remove_group` 으로 사라진다.
+///
+/// ★이 값이 단조 증가하면 옛 영상의 파이프라인이 안 죽는다는 뜻이다.★ 전환마다 커밋
+/// 메모리가 약 3.5GB 씩 늘고 돌아오지 않는데, 링 텍스처의 생성·해제는 균형이 맞았다.
+/// 그러면 남는 후보가 파이프라인 자체다.
+pub fn group_inventory() -> usize {
+    lock_at(registry(), "group_inventory").groups.len()
+}
+
 pub fn ring_inventory() -> (usize, u64) {
     let reg = lock_at(registry(), "ring_inventory");
     let mut bytes: u64 = 0;
@@ -449,7 +459,7 @@ fn lock_tracked<'a, T>(
 /// 남는다★ — 획득당 보유가 평상시의 110배라는 것까지는 알아도, 그 안에서 무엇이
 /// 무거워지는지는 사이트별로 갈라야 보인다. 지점 수가 스물둘뿐이라 선형 탐색으로 족하다
 /// (포인터 비교 스물두 번, 잠금 자체보다 훨씬 싸다).
-const SITE_COUNT: usize = 24;
+const SITE_COUNT: usize = 25;
 
 const SITE_NAMES: [&str; SITE_COUNT] = [
     "abandon_slot",
@@ -462,6 +472,7 @@ const SITE_NAMES: [&str; SITE_COUNT] = [
     "dropped_frames",
     "expire_all_stale_demand",
     "expire_stale_demand",
+    "group_inventory",
     "note_demand",
     "note_demand_and_ring",
     "note_plane_lock_and_plan",

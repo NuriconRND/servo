@@ -1095,7 +1095,8 @@ impl MediaExternalImages {
                 let (queued_rings, queued_textures) =
                     servo_media::player::d3d11_ring::removed_queue_inventory();
                 warn!(
-                    "MEDIARINGS rings={rings} bytes_mb={:.0} queued_rings={queued_rings} queued_textures={queued_textures} tex_created={} tex_released={}",
+                    "MEDIARINGS groups={} rings={rings} bytes_mb={:.0} queued_rings={queued_rings} queued_textures={queued_textures} tex_created={} tex_released={}",
+                    servo_media::player::d3d11_ring::group_inventory(),
                     ring_bytes as f64 / (1024.0 * 1024.0),
                     servo_media::player::d3d11_ring::D3D11_TEXTURES_CREATED
                         .load(std::sync::atomic::Ordering::Relaxed),
