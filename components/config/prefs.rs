@@ -692,6 +692,18 @@ pub struct Preferences {
     /// 페이지에 알린다 — 놓은 백엔드는 GL 상태도 함께 잃으므로, 알리지 않으면 "돌아왔는데
     /// 빈 화면" 이 된다.
     pub dom_webgl_idle_context_reclaim_ms: i64,
+    /// 페인터에게 **기다리지 않고** 보낸 요청이 처리되기를 기다리며 쌓일 수 있는 최대 개수.
+    /// `0` 이면 무제한(예전 동작).
+    ///
+    /// 이미지 갱신을 기다리지 않고 보내면서 메인 스레드가 페인터 렌더 뒤에 줄서지 않게
+    /// 됐지만(초당 263ms → 60ms, 60fps 유지 구간 86 → 93초/104초), 그 대가로 배압이
+    /// 사라졌다. 큐는 무한이라 페인터가 밀리면 요청이 그대로 쌓이고 그 안의 프레임이
+    /// 메모리를 잡는다.
+    ///
+    /// 기다리는 것으로 되돌리면 그 개선이 통째로 사라지므로, 기다리지 않되 길이만 막는다.
+    /// 넘치면 **보내지 않고 버린다** — 페인터는 이미지 갱신을 키별 최신만 남기는 스태시에
+    /// 넣으므로, 밀린 상태의 옛 프레임은 어차피 다음 것에 덮인다. 버리는 것이 곧 합침이다.
+    pub gfx_painter_detached_queue_limit: i64,
     /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모)에서 **함께 출발하기를 기다릴
     /// 파이프라인 목표 수**. 온오프 스위치가 아니다 — 구 env `SERVO_MEDIA_SYNC_GROUP=N`이
     /// 그랬듯 타일 수를 그대로 받는다(`player.rs::sync_group_target`: 구코드는 usize 파싱
@@ -1104,6 +1116,7 @@ impl Preferences {
             media_ring_init_max_per_frame: 1,
             media_ring_stage_first_frame: false,
             dom_webgl_idle_context_reclaim_ms: 3000,
+            gfx_painter_detached_queue_limit: 8,
             media_sync_group_target: 0,
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,

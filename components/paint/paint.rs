@@ -7,7 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
@@ -254,6 +255,13 @@ impl PaintTargetsInFlight {
 struct ThreadedPainter {
     requests: Sender<PainterRequest>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+    /// 아직 처리되지 않은 **기다리지 않는** 요청 수.
+    ///
+    /// ★큐가 무한이라 배압이 없다.★ 결과를 기다리지 않게 바꾼 덕에 메인 스레드가 페인터
+    /// 렌더 뒤에 줄서지 않게 됐지만(초당 263ms → 60ms), 페인터가 밀리면 그만큼 요청이
+    /// 쌓이고 그 안의 프레임이 메모리를 잡는다. 기다리는 것으로 되돌리면 그 개선이 통째로
+    /// 사라지므로, 기다리지 않되 **길이만 막는다**.
+    detached_in_flight: Arc<AtomicUsize>,
 }
 
 enum PainterRequest {
@@ -292,6 +300,32 @@ impl ThreadedPainter {
     /// ★팬아웃이 이득을 내는 지점이 여기다.★ 한 패스의 대부분이 타일마다의 `AcquireSync`
     /// 대기인데, 그 대기는 타일별·GPU별이라 서로 겹칠 수 있다. 보내고 바로 다음 타일을
     /// 보내면 네 번의 대기가 나란히 흐르고, 패스는 합이 아니라 **최댓값**이 된다.
+    /// 결과를 기다리지 않는 요청. 큐가 이미 깊으면 **보내지 않는다**.
+    ///
+    /// 버려도 되는 이유는 이 경로로 오는 것이 이미지 갱신이고, 페인터가 그것을 키별
+    /// 최신만 남기는 스태시에 넣기 때문이다 — 밀린 상태에서 옛 프레임을 보내 봐야 다음
+    /// 것에 곧바로 덮인다. 버리는 것이 손해가 아니라 그게 합침이다.
+    fn dispatch_detached(
+        &self,
+        limit: usize,
+        callback: impl FnOnce(&mut Painter) + Send + 'static,
+    ) -> bool {
+        if limit > 0 && self.detached_in_flight.load(Ordering::Relaxed) >= limit {
+            return false;
+        }
+        self.detached_in_flight.fetch_add(1, Ordering::Relaxed);
+        let in_flight = self.detached_in_flight.clone();
+        let request = PainterRequest::Run(Box::new(move |painter| {
+            callback(painter);
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+        }));
+        if self.requests.send(request).is_err() {
+            self.detached_in_flight.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
     fn dispatch<R: Send + 'static>(
         &self,
         callback: impl FnOnce(&mut Painter) -> R + Send + 'static,
@@ -1126,6 +1160,8 @@ struct ImageUpdateStats {
 
 thread_local! {
     static IMAGE_UPDATE_STATS: RefCell<ImageUpdateStats> = RefCell::new(ImageUpdateStats::default());
+    /// 큐가 깊어 보내지 않은 이미지 갱신 수(초당 한 줄에 실어 낸다).
+    static DETACHED_DROPPED: Cell<u64> = const { Cell::new(0) };
 }
 
 impl Paint {
@@ -1320,6 +1356,7 @@ impl Paint {
             painter_id,
             rendering_context: None,
             kind: PainterHostKind::Threaded(ThreadedPainter {
+                detached_in_flight: Arc::new(AtomicUsize::new(0)),
                 requests,
                 join_handle: Some(join_handle),
             }),
@@ -1388,8 +1425,10 @@ impl Paint {
             // 스레드가 없으면 기다릴 것도 없다 — 예전과 같이 그 자리에서 돈다.
             PainterHostKind::Inline(painter) => callback(&mut painter.borrow_mut()),
             PainterHostKind::Threaded(threaded) => {
-                // 수신구를 버린다: 결과가 없고, 들고 있으면 기다리는 것과 같아진다.
-                let _ = threaded.dispatch(callback);
+                let limit = servo_config::pref!(gfx_painter_detached_queue_limit).max(0) as usize;
+                if !threaded.dispatch_detached(limit, callback) {
+                    DETACHED_DROPPED.with(|dropped| dropped.set(dropped.get() + 1));
+                }
             },
         }
     }
@@ -2325,12 +2364,13 @@ impl Paint {
                     let elapsed = window.elapsed();
                     if elapsed >= Duration::from_secs(1) {
                         warn!(
-                            "IMGUPDRATE window_ms={:.0} calls={} total_ms={:.1} inner_ms={:.1} fanout_ms={:.1}",
+                            "IMGUPDRATE window_ms={:.0} calls={} total_ms={:.1} inner_ms={:.1} fanout_ms={:.1} dropped={}",
                             elapsed.as_secs_f64() * 1000.0,
                             stats.calls,
                             stats.total_ms,
                             stats.inner_ms,
                             (stats.total_ms - stats.inner_ms).max(0.0),
+                            DETACHED_DROPPED.with(|dropped| dropped.replace(0)),
                         );
                         *stats = ImageUpdateStats {
                             window_start: Some(Instant::now()),
