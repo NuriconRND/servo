@@ -1781,13 +1781,26 @@ impl GStreamerPlayer {
                 let (loop_sender, loop_receiver) = mpsc::channel::<GaplessLoopMsg>();
                 inner.lock().unwrap().gapless_loop_sender = Some(loop_sender.clone());
                 let pipeline_weak = pipeline.downgrade();
-                let inner_for_loop = inner.clone();
+                // ★Weak 이어야 한다★ — 이 스레드는 `loop_receiver.recv()` 에서 영원히
+                // 막혀 있고, 그 송신단은 `PlayerInner.gapless_loop_sender` 다. 여기서
+                // `inner` 를 강하게 잡으면 스레드가 `PlayerInner` 를 살리고 `PlayerInner`
+                // 가 송신단을 살려 `recv()` 가 끝나지 않는다. 스레드가 자기 종료 조건을
+                // 자기가 붙들고 있는 사이클이라, 스크립트가 플레이어를 놓아도 GStreamer
+                // 파이프라인이 통째로 남는다. 실측(로그 57, 120초): `GstGaplessLoop`
+                // 스레드가 만들어진 요소 수만큼(234개) 그대로 살아 있었고 커밋 메모리가
+                // 주기마다 3GB 씩 늘었다. `pipeline` 을 이미 `downgrade` 해 둔 것은
+                // 그래서 소용이 없었다 -- `inner` 가 파이프라인을 소유한다.
+                // 바로 아래 `install_direct_position_ticker` 가 같은 이유로 Weak 다.
+                let inner_for_loop = Arc::downgrade(inner);
                 std::thread::Builder::new()
                 .name(String::from("GstGaplessLoop"))
                 .spawn(move || {
                     let mut last_rewind: Option<std::time::Instant> = None;
                     while let Ok(message) = loop_receiver.recv() {
                         let Some(pipeline) = pipeline_weak.upgrade() else {
+                            return;
+                        };
+                        let Some(inner_for_loop) = inner_for_loop.upgrade() else {
                             return;
                         };
                         match message {
