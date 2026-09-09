@@ -102,6 +102,7 @@ winapi = { workspace = true, features = [
     "objidlbase",
     "ocidl",
     "processthreadsapi",
+    "psapi",
     "propidl",
     "rpcndr",
     "unknwnbase",

@@ -1588,6 +1588,25 @@ impl WebGLThread {
             }
         }
         let released = surface_ids.len();
+        // ★해제 직전·직후를 같은 자리에서 잰다.★ 초당 표본으로는 다른 일이 섞여 델타가
+        // 묻힌다. 어댑터별로 재고, 이 컨텍스트의 백엔드가 붙은 디바이스마다 따로 본다 --
+        // "해제했다" 와 "메모리가 돌아왔다" 가 다르다는 것이 실측으로 드러났으므로, 그
+        // 둘을 한 줄에 나란히 놓는다.
+        let before: Vec<(WebGLSurfaceId, u64)> = surface_ids
+            .iter()
+            .filter_map(|surface_id| {
+                let device = self.contexts.get(surface_id)?.device.d3d11_device_ptr() as usize;
+                let used = paint_api::rendering_context::adapter_local_usage_bytes(device)?;
+                Some((*surface_id, used))
+            })
+            .collect();
+        let devices: Vec<(WebGLSurfaceId, usize)> = surface_ids
+            .iter()
+            .filter_map(|surface_id| {
+                let device = self.contexts.get(surface_id)?.device.d3d11_device_ptr() as usize;
+                Some((*surface_id, device))
+            })
+            .collect();
         for surface_id in surface_ids {
             let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id);
@@ -1609,7 +1628,27 @@ impl WebGLThread {
         self.context_backends.remove(&context_id);
         self.bound_context_id = None;
         self.released_contexts.insert(context_id);
-        warn!("WEBGLRECLAIM released context={context_id:?} backends={released}");
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let deltas = before
+            .iter()
+            .map(|(surface_id, used_before)| {
+                let after = devices
+                    .iter()
+                    .find(|(id, _)| id == surface_id)
+                    .and_then(|(_, device)| {
+                        paint_api::rendering_context::adapter_local_usage_bytes(*device)
+                    })
+                    .unwrap_or(*used_before);
+                format!(
+                    "{:?}:{:.0}->{:.0}MB",
+                    surface_id.painter_id,
+                    mb(*used_before),
+                    mb(after)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        warn!("WEBGLRECLAIM released context={context_id:?} backends={released} vram[{deltas}]");
         if let Some(notifier) = self.context_notifiers.get(&context_id) {
             let _ = notifier.send(WebGLContextNotification::Lost(context_id));
         }

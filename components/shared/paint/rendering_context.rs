@@ -9,6 +9,57 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
+/// 이 D3D11 디바이스가 붙은 어댑터에 **이 프로세스가** 지금 쓰고 있는 로컬(VRAM) 바이트.
+///
+/// ★해제가 실제로 메모리를 돌려주는지는 해제 직전·직후를 같은 자리에서 재야만 알 수 있다.★
+/// 초당 표본으로는 다른 일이 섞여 들어와 델타가 묻힌다 — 실제로 그렇게 두 번 헛읽었다.
+#[cfg_attr(all(target_os = "windows", feature = "no-wgl"), expect(unsafe_code))]
+pub fn adapter_local_usage_bytes(d3d11_device: usize) -> Option<u64> {
+    #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+    {
+        use winapi::Interface;
+        use winapi::shared::dxgi::IDXGIDevice;
+        use winapi::shared::dxgi1_4::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, IDXGIAdapter3};
+        use winapi::um::unknwnbase::IUnknown;
+
+        if d3d11_device == 0 {
+            return None;
+        }
+        // Safety: 호출자가 살아 있는 ID3D11Device 포인터를 준다. 얻은 인터페이스는 각각
+        // Release 한다.
+        unsafe {
+            let unknown = d3d11_device as *mut IUnknown;
+            let mut dxgi_device: *mut IDXGIDevice = std::ptr::null_mut();
+            if (*unknown).QueryInterface(
+                &IDXGIDevice::uuidof(),
+                &mut dxgi_device as *mut _ as *mut *mut _,
+            ) < 0
+                || dxgi_device.is_null()
+            {
+                return None;
+            }
+            let mut adapter: *mut IDXGIAdapter3 = std::ptr::null_mut();
+            let got = (*dxgi_device).GetParent(
+                &IDXGIAdapter3::uuidof(),
+                &mut adapter as *mut _ as *mut *mut _,
+            );
+            (*dxgi_device).Release();
+            if got < 0 || adapter.is_null() {
+                return None;
+            }
+            let mut info = std::mem::zeroed();
+            let ok = (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info);
+            (*adapter).Release();
+            (ok >= 0).then_some(info.CurrentUsage)
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+    {
+        let _ = d3d11_device;
+        None
+    }
+}
+
 /// D3D11 텍스처 `Release()` 호출 누계(진단용). 만든 수와 맞아야 '해제했다'가 성립한다.
 pub static D3D11_TEXTURES_RELEASED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);

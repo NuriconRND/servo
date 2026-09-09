@@ -628,9 +628,12 @@ fn log_gpu_memory(painter_id: PainterId, device: usize) {
         let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         let used = mb(local.CurrentUsage);
         let budget = mb(local.Budget);
+        // CPU 메모리도 같은 줄에 둔다 — 전환마다 순증한다는 보고가 있었는데, GPU 와
+        // 나란히 놓지 않으면 어느 전환에서 무엇이 늘었는지 맞춰 보기 어렵다.
+        let (working_set, private) = process_memory_mb();
         warn!(
             "GPUMEM painter={painter_id:?} local_mb={used:.0}/{budget:.0} ({:.0}%) \
-             nonlocal_mb={:.0}/{:.0} reserved_mb={:.0}",
+             nonlocal_mb={:.0}/{:.0} reserved_mb={:.0} process_ws_mb={:.0} process_private_mb={:.0}",
             if budget > 0.0 {
                 used / budget * 100.0
             } else {
@@ -639,12 +642,43 @@ fn log_gpu_memory(painter_id: PainterId, device: usize) {
             mb(non_local.CurrentUsage),
             mb(non_local.Budget),
             mb(local.CurrentReservation),
+            working_set,
+            private,
         );
     }
 }
 
 #[cfg(not(windows))]
 fn log_gpu_memory(_painter_id: PainterId, _device: usize) {}
+
+/// 이 프로세스의 워킹셋과 커밋(프라이빗) 바이트, MB 단위.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn process_memory_mb() -> (f64, f64) {
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+
+    // Safety: out 파라미터 하나뿐이고 크기를 정확히 넘긴다.
+    unsafe {
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters as *mut _ as *mut _,
+            counters.cb,
+        ) == 0
+        {
+            return (0.0, 0.0);
+        }
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        (mb(counters.WorkingSetSize), mb(counters.PrivateUsage))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_memory_mb() -> (f64, f64) {
+    (0.0, 0.0)
+}
 
 impl Painter {
     pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
