@@ -374,6 +374,12 @@ pub(crate) struct Painter {
     paint_animation_rode_along: Cell<u64>,
     /// When any frame was last generated for this painter, by any path.
     last_frame_generated_at: Cell<Option<Instant>>,
+    /// 비디오 프레임이 마지막으로 **화면에 실려 나간** 시각(합성에 flush 된 시각).
+    ///
+    /// 재생이 매끄러운지는 도착률이 아니라 이 간격이 말해 준다 — 도착은 30/s 인데 표출이
+    /// 한 번 300ms 를 건너뛰면 평균은 멀쩡해 보이고 눈에는 끊긴다.
+    last_video_presented_at: Cell<Option<Instant>>,
+
     /// When a frame was last generated for this painter **by something other than a video
     /// arrival** — script, a CSS/paint animation, scrolling, a resize.
     ///
@@ -571,9 +577,17 @@ pub(crate) fn raf_is_driving_composites(
     if !animation_callbacks_running {
         return false;
     }
-    // 두 주기: 한 주기를 놓친 것만으로 게이트를 열면 정상 rAF 도 흔들릴 때마다 두 번째
-    // 합성원이 끼어든다 — 그것이 이 게이트가 애초에 막으려던 지터다.
-    since_last_non_video_frame.is_some_and(|since| since < refresh_period * 2)
+    // ★한 주기 반★ — 위아래가 둘 다 막혀 있어서 그 사이다.
+    //
+    //   * 두 주기(처음에 잡았던 값)는 **너무 길다.** 애니메이션이 끝나는 경계에서 비디오가
+    //     그만큼 더 기다렸고, 그것이 화면에서 "뚝 끊겼다가 이어지는" 한 박자로 보였다.
+    //   * 정확히 한 주기는 **너무 짧다.** 60fps 로 도는 멀쩡한 rAF 도 도착이 다음 프레임
+    //     직전에 걸리면 간격이 한 주기에 닿으므로, 그때마다 판정이 뒤집혀 두 번째 합성원이
+    //     끼어든다 — 그것이 이 게이트가 애초에 막으려던 지터다.
+    //
+    // 그래서 멀쩡한 rAF 의 최대 간격(한 주기)보다는 확실히 크고, 사람이 한 박자로 느끼기에는
+    // 작은 값을 쓴다. 실제로 얼마나 끊기는지는 `IMGUPDINNER ... vidgap_max_ms` 가 잰다.
+    since_last_non_video_frame.is_some_and(|since| since < refresh_period * 3 / 2)
 }
 
 /// `update_images` 한 번의 시간을 합성 요청 / 트랜잭션 전송 / 나머지로 가른 누계.
@@ -590,6 +604,8 @@ struct UpdateImagesStats {
     /// rAF 는 돌고 있는데 프레임은 안 나오고 있어서 비디오가 스스로 합성해야 했던 횟수.
     /// 0 이 아니면 그 페이지에는 아무것도 그리지 않는 rAF 루프가 있다는 뜻이다.
     raf_idle_calls: u64,
+    /// 비디오가 화면에 실려 나간 순간들 사이의 **최대** 간격(ms). 끊김의 길이가 곧 이 값이다.
+    video_gap_max_ms: f64,
 }
 
 thread_local! {
@@ -1015,6 +1031,7 @@ impl Painter {
             paint_animation_skipped_busy: Default::default(),
             paint_animation_rode_along: Default::default(),
             last_frame_generated_at: Default::default(),
+            last_video_presented_at: Default::default(),
             last_non_video_frame_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
@@ -2048,9 +2065,26 @@ impl Painter {
     /// See `pending_video_frame_updates` for the rationale.
     fn flush_pending_video_frame_updates(&self, transaction: &mut Transaction) {
         let mut pending_updates = self.pending_video_frame_updates.borrow_mut();
+        let flushed = !pending_updates.is_empty();
         for (key, (descriptor, data)) in pending_updates.drain() {
             transaction.update_image(key, descriptor, data.into(), &DirtyRect::All);
         }
+        if !flushed {
+            return;
+        }
+        // 실제로 비디오가 실려 나간 순간들 사이의 간격. 최댓값만 남긴다 — 끊김은 평균이
+        // 아니라 최악의 한 번이다.
+        let now = Instant::now();
+        if let Some(last) = self.last_video_presented_at.get() {
+            let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+            UPDATE_IMAGES_STATS.with(|stats| {
+                let mut stats = stats.borrow_mut();
+                if gap_ms > stats.video_gap_max_ms {
+                    stats.video_gap_max_ms = gap_ms;
+                }
+            });
+        }
+        self.last_video_presented_at.set(Some(now));
     }
 
     pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
@@ -3187,7 +3221,7 @@ impl Painter {
             let elapsed = window.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 warn!(
-                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={}",
+                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={} vidgap_max_ms={:.1}",
                     elapsed.as_secs_f64() * 1000.0,
                     stats.calls,
                     stats.total_ms,
@@ -3196,6 +3230,7 @@ impl Painter {
                     stats.send_ms,
                     (stats.total_ms - stats.frame_ms - stats.send_ms).max(0.0),
                     stats.raf_idle_calls,
+                    stats.video_gap_max_ms,
                 );
                 *stats = UpdateImagesStats {
                     window_start: Some(Instant::now()),
@@ -3836,6 +3871,7 @@ mod raf_gate_tests {
     /// rAF 가 실제로 프레임을 내고 있으면 비디오는 그 박자를 탄다 — 이 게이트의 본래 뜻이다.
     #[test]
     fn raf_producing_frames_still_carries_the_video() {
+        // 60fps 로 도는 rAF 는 도착이 다음 프레임 직전에 걸려도 간격이 한 주기다.
         assert!(raf_is_driving_composites(
             true,
             Some(Duration::from_millis(16)),
@@ -3856,18 +3892,20 @@ mod raf_gate_tests {
         ));
     }
 
-    /// 한 주기를 놓친 것만으로 열지는 않는다 — 정상 rAF 의 흔들림에 두 번째 합성원이
-    /// 끼어들면 그것이 이 게이트가 막으려던 지터다.
+    /// 경계는 한 주기 반이다 — 멀쩡한 rAF 의 최대 간격(한 주기)보다는 크고, 경계에서
+    /// 한 박자로 느껴질 만큼 길지는 않다.
     #[test]
-    fn one_missed_period_is_tolerated() {
+    fn the_boundary_sits_between_one_and_two_periods() {
+        // 한 주기 간격은 아직 "남이 내고 있다"로 본다(60fps rAF 의 최악 위상).
         assert!(raf_is_driving_composites(
             true,
-            Some(Duration::from_millis(31)),
+            Some(Duration::from_millis(23)),
             REFRESH
         ));
+        // 한 주기 반을 넘기면 아무도 안 내고 있는 것이다.
         assert!(!raf_is_driving_composites(
             true,
-            Some(Duration::from_millis(33)),
+            Some(Duration::from_millis(25)),
             REFRESH
         ));
     }
