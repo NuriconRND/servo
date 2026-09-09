@@ -380,12 +380,17 @@ pub(crate) struct Painter {
     /// 한 번 300ms 를 건너뛰면 평균은 멀쩡해 보이고 눈에는 끊긴다.
     last_video_presented_at: Cell<Option<Instant>>,
 
-    /// When a frame was last generated for this painter **by something other than a video
-    /// arrival** — script, a CSS/paint animation, scrolling, a resize.
+    /// 이 페인터에 프레임을 낸 마지막 시각 — 단, ★자기 자신은 빼고★.
     ///
-    /// ★비디오가 스스로 낸 합성은 여기 찍지 않는다★ — 찍으면 "남이 프레임을 내고 있다"가
-    /// 자기 자신 때문에 참이 되어, 비디오 경로가 한 번 걸러 한 번씩만 도는 진동에 빠진다.
-    last_non_video_frame_at: Cell<Option<Instant>>,
+    /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다. 그 "남"에
+    /// 자기가 들어가면 판정이 자기 때문에 참이 되어, 한 번 걸러 한 번씩만 도는 진동이 된다.
+    /// 그래서 스스로 프레임을 내는 두 경로(페인트측 애니메이션, 비디오 도착)는 자기 프레임을
+    /// 낸 뒤 이 시각을 되돌려 놓는다.
+    ///
+    /// 되돌리지 않았을 때 실측된 결과(log_presentation/00, 60Hz 벽): 페이드가 도는 1 초 동안
+    /// 렌더가 **61 -> 72 프레임**으로 늘었다. 새로고침 주기보다 많이 낸 것이고, 그 초과분이
+    /// 애니메이션이 스스로 낸 프레임(`PAINTANIM frames=10~13`)과 정확히 맞는다.
+    last_frame_by_other_source_at: Cell<Option<Instant>>,
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
@@ -567,11 +572,11 @@ fn thread_cpu_ms() -> f64 {
 /// rAF 가 비디오를 태워 줄 만큼 실제로 합성을 내고 있는가. 판정만 떼어 두어 시험한다
 /// (`Painter::raf_is_producing_frames` 가 살아 있는 값으로 이것을 부른다).
 ///
-/// `since_last_non_video_frame` 이 `None` 이면 이 페인터는 아직 프레임을 한 장도 낸 적이
-/// 없다 — 그때는 태워 줄 것이 없으므로 거짓이다.
+/// `since_last_frame_by_others` 이 `None` 이면 남이 낸 프레임이 한 장도 없다 — 그때는
+/// 태워 줄 것이 없으므로 거짓이다.
 pub(crate) fn raf_is_driving_composites(
     animation_callbacks_running: bool,
-    since_last_non_video_frame: Option<Duration>,
+    since_last_frame_by_others: Option<Duration>,
     refresh_period: Duration,
 ) -> bool {
     if !animation_callbacks_running {
@@ -587,7 +592,7 @@ pub(crate) fn raf_is_driving_composites(
     //
     // 그래서 멀쩡한 rAF 의 최대 간격(한 주기)보다는 확실히 크고, 사람이 한 박자로 느끼기에는
     // 작은 값을 쓴다. 실제로 얼마나 끊기는지는 `IMGUPDINNER ... vidgap_max_ms` 가 잰다.
-    since_last_non_video_frame.is_some_and(|since| since < refresh_period * 3 / 2)
+    since_last_frame_by_others.is_some_and(|since| since < refresh_period * 3 / 2)
 }
 
 /// `update_images` 한 번의 시간을 합성 요청 / 트랜잭션 전송 / 나머지로 가른 누계.
@@ -1032,7 +1037,7 @@ impl Painter {
             paint_animation_rode_along: Default::default(),
             last_frame_generated_at: Default::default(),
             last_video_presented_at: Default::default(),
-            last_non_video_frame_at: Default::default(),
+            last_frame_by_other_source_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1127,10 +1132,19 @@ impl Painter {
             .last_paint_animation_push_at
             .get()
             .is_none_or(|last| now.duration_since(last) >= animation_period);
+        // ★"남"에서 자기를 뺀다★ — 여기서 `last_frame_generated_at`(자기 프레임도 찍힌다)을
+        // 보고 있었던 것이 위 주석의 규칙을 무너뜨렸다. 애니메이션이 프레임을 하나 내면 그
+        // 시각이 찍히고, 다음 밀어넣기가 그것을 "남이 내고 있다"로 읽는다. 두 판정이 서로
+        // 다른 위상의 같은 주기로 도니 맞물렸다 어긋났다 하면서 초당 10~13 개의 여분 프레임이
+        // 샜다(60Hz 벽에서 렌더 61 -> 72, log_presentation/00).
+        //
+        // 여유는 비디오 게이트와 같은 한 주기 반이다. 60Hz 로 도는 생산자는 언제나 그 안에
+        // 프레임이 있으므로 애니메이션은 값만 얹고, 정말 아무도 안 내는 페이지(움직이는 것이
+        // 이 애니메이션뿐인 화면)에서는 창이 비어 애니메이션이 매 주기 스스로 낸다.
         let someone_else_is_producing = self
-            .last_frame_generated_at
+            .last_frame_by_other_source_at
             .get()
-            .is_some_and(|last| now.duration_since(last) < animation_period);
+            .is_some_and(|last| now.duration_since(last) < animation_period * 3 / 2);
         let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
         // Skipping does not touch `last_paint_animation_push_at`, so the next turn tries
         // again as soon as the pipeline is free rather than waiting out another period.
@@ -1154,7 +1168,10 @@ impl Painter {
                 colors: colors.unwrap_or_default(),
             });
             if animated_property_frame {
+                // 자기 프레임은 "남"에 세지 않는다(위 판정 주석).
+                let others_before = self.last_frame_by_other_source_at.get();
                 self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+                self.last_frame_by_other_source_at.set(others_before);
             }
             self.send_transaction(transaction);
             if has_values && push_due {
@@ -1182,9 +1199,9 @@ impl Painter {
             let mut transaction = Transaction::new();
             // 이 프레임은 비디오 때문에 났다. `update_images` 의 게이트가 "남이 내고 있다"를
             // 판정할 때 자기 자신을 세지 않도록 그 시각은 되돌린다(그 주석 참고).
-            let non_video_before = self.last_non_video_frame_at.get();
+            let non_video_before = self.last_frame_by_other_source_at.get();
             self.generate_frame(&mut transaction, RenderReasons::SCENE);
-            self.last_non_video_frame_at.set(non_video_before);
+            self.last_frame_by_other_source_at.set(non_video_before);
             self.set_display_composite_in_flight(true);
             self.send_transaction(transaction);
         }
@@ -2068,8 +2085,9 @@ impl Painter {
         // Every frame, whatever asked for it. A paint-side animation needs to know whether
         // anyone else is already producing frames -- see `perform_updates`.
         self.last_frame_generated_at.set(Some(Instant::now()));
-        // 비디오 도착이 스스로 낸 합성만 이 시각을 되돌린다(아래 비디오 분기).
-        self.last_non_video_frame_at.set(Some(Instant::now()));
+        // 스스로 프레임을 내는 경로(페인트측 애니메이션, 비디오 도착)는 이 대입을 자기
+        // 프레임에 한해 되돌린다 — 필드 주석 참고.
+        self.last_frame_by_other_source_at.set(Some(Instant::now()));
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);
@@ -2411,7 +2429,7 @@ impl Painter {
     fn raf_is_producing_frames(&self) -> bool {
         raf_is_driving_composites(
             self.animation_callbacks_running(),
-            self.last_non_video_frame_at
+            self.last_frame_by_other_source_at
                 .get()
                 .map(|last| last.elapsed()),
             crate::refresh_driver::paint_timer_period(),
@@ -3220,9 +3238,9 @@ impl Painter {
             // ★이 합성은 "남이 내는 프레임"으로 세지 않는다★ — 세면 다음 도착에서
             // `raf_is_producing_frames` 가 자기 자신 때문에 참이 되어 한 번 걸러 한 번씩만
             // 도는 진동이 된다(그래서 프레임률이 반토막 난다).
-            let non_video_before = self.last_non_video_frame_at.get();
+            let non_video_before = self.last_frame_by_other_source_at.get();
             self.generate_frame(&mut txn, RenderReasons::SCENE);
-            self.last_non_video_frame_at.set(non_video_before);
+            self.last_frame_by_other_source_at.set(non_video_before);
             frame_ms += frame_started.elapsed().as_secs_f64() * 1000.0;
             frames_generated += 1;
             self.set_display_composite_in_flight(true);
