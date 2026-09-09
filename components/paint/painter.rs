@@ -374,6 +374,12 @@ pub(crate) struct Painter {
     paint_animation_rode_along: Cell<u64>,
     /// When any frame was last generated for this painter, by any path.
     last_frame_generated_at: Cell<Option<Instant>>,
+    /// When a frame was last generated for this painter **by something other than a video
+    /// arrival** — script, a CSS/paint animation, scrolling, a resize.
+    ///
+    /// ★비디오가 스스로 낸 합성은 여기 찍지 않는다★ — 찍으면 "남이 프레임을 내고 있다"가
+    /// 자기 자신 때문에 참이 되어, 비디오 경로가 한 번 걸러 한 번씩만 도는 진동에 빠진다.
+    last_non_video_frame_at: Cell<Option<Instant>>,
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
@@ -552,6 +558,24 @@ fn thread_cpu_ms() -> f64 {
     0.0
 }
 
+/// rAF 가 비디오를 태워 줄 만큼 실제로 합성을 내고 있는가. 판정만 떼어 두어 시험한다
+/// (`Painter::raf_is_producing_frames` 가 살아 있는 값으로 이것을 부른다).
+///
+/// `since_last_non_video_frame` 이 `None` 이면 이 페인터는 아직 프레임을 한 장도 낸 적이
+/// 없다 — 그때는 태워 줄 것이 없으므로 거짓이다.
+pub(crate) fn raf_is_driving_composites(
+    animation_callbacks_running: bool,
+    since_last_non_video_frame: Option<Duration>,
+    refresh_period: Duration,
+) -> bool {
+    if !animation_callbacks_running {
+        return false;
+    }
+    // 두 주기: 한 주기를 놓친 것만으로 게이트를 열면 정상 rAF 도 흔들릴 때마다 두 번째
+    // 합성원이 끼어든다 — 그것이 이 게이트가 애초에 막으려던 지터다.
+    since_last_non_video_frame.is_some_and(|since| since < refresh_period * 2)
+}
+
 /// `update_images` 한 번의 시간을 합성 요청 / 트랜잭션 전송 / 나머지로 가른 누계.
 ///
 /// 이 함수는 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
@@ -563,6 +587,9 @@ struct UpdateImagesStats {
     total_ms: f64,
     frame_ms: f64,
     send_ms: f64,
+    /// rAF 는 돌고 있는데 프레임은 안 나오고 있어서 비디오가 스스로 합성해야 했던 횟수.
+    /// 0 이 아니면 그 페이지에는 아무것도 그리지 않는 rAF 루프가 있다는 뜻이다.
+    raf_idle_calls: u64,
 }
 
 thread_local! {
@@ -988,6 +1015,7 @@ impl Painter {
             paint_animation_skipped_busy: Default::default(),
             paint_animation_rode_along: Default::default(),
             last_frame_generated_at: Default::default(),
+            last_non_video_frame_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1993,6 +2021,8 @@ impl Painter {
         // Every frame, whatever asked for it. A paint-side animation needs to know whether
         // anyone else is already producing frames -- see `perform_updates`.
         self.last_frame_generated_at.set(Some(Instant::now()));
+        // 비디오 도착이 스스로 낸 합성만 이 시각을 되돌린다(아래 비디오 분기).
+        self.last_non_video_frame_at.set(Some(Instant::now()));
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);
@@ -2294,6 +2324,36 @@ impl Painter {
     ///
     /// `gfx_refresh_hz` is the period because it is exactly this: the free-running paint
     /// timer whose job is to keep production near the display rate.
+    /// rAF 가 **실제로 합성을 내고 있는가.**
+    ///
+    /// ★rAF 가 돌고 있다는 것과 프레임이 나오고 있다는 것은 다른 말이다★ — 그런데
+    /// 비디오 즉시-합성 게이트는 오랫동안 앞의 것으로 뒤의 것을 판정했다.
+    ///
+    /// 스크립트는 문서가 **새 디스플레이 리스트를 냈을 때만** `GenerateFrame` 을 보낸다
+    /// (`script_thread::update_the_rendering`: `needs_frame()` 인 문서만 모아 보낸다).
+    /// 그래서 rAF 콜백이 매 프레임 돌면서도 화면에 바뀌는 것이 없으면 — 자기 시계를 돌리며
+    /// `setState` 하는데 그 값으로 그리는 스타일이 그대로인 루프가 정확히 그렇다 —
+    /// **프레임은 한 장도 나오지 않는다.** 그동안 `animation_callbacks_running()` 은 참이므로
+    /// 게이트는 "rAF 가 알아서 낸다"고 믿고 비디오의 합성을 막는다. 아무도 내지 않는다.
+    ///
+    /// 실측 증상: 소스를 일정 시간마다 바꿔 표출하는 화면(seamless)에서 **전환 애니메이션이
+    /// 도는 동안에만** 영상이 흐르고 그 사이에는 정지했다. 전환 중에는 CSS 애니메이션이
+    /// 매 프레임 새 디스플레이 리스트를 만들어 주기 때문이다. 상용 브라우저는 같은 페이지에서
+    /// 정상이다 — 거기서는 비디오 표출이 rAF 와 묶여 있지 않다.
+    ///
+    /// 그래서 rAF 등록 여부가 아니라 **최근에 실제로 프레임이 나왔는지**로 판정한다. rAF 가
+    /// 진짜로 화면을 돌리는 페이지(three.js·WebGL 루프·오버레이)에서는 프레임 간격이
+    /// 새로고침 주기이므로 판정이 그대로 참이고, 예전 동작이 유지된다.
+    fn raf_is_producing_frames(&self) -> bool {
+        raf_is_driving_composites(
+            self.animation_callbacks_running(),
+            self.last_non_video_frame_at
+                .get()
+                .map(|last| last.elapsed()),
+            crate::refresh_driver::paint_timer_period(),
+        )
+    }
+
     fn video_composite_due(&self) -> bool {
         let interval = crate::refresh_driver::paint_timer_period();
         self.last_video_driven_frame_at
@@ -3002,7 +3062,12 @@ impl Painter {
         // still composite per arrival so it presents at full frame rate rather than the slower
         // script rendering-opportunity rate. `animation_callbacks_running` tracks rAF only, so a
         // plain playing <video> (which sets `animations_running`) does not suppress this path.
-        let raf_driving_composites = self.animation_callbacks_running();
+        // ★"rAF 가 돌고 있다"가 아니라 "rAF 가 프레임을 내고 있다"로 판정한다★ —
+        // 이유는 `raf_is_producing_frames` 주석 참고.
+        let raf_driving_composites = self.raf_is_producing_frames();
+        if self.animation_callbacks_running() && !raf_driving_composites {
+            UPDATE_IMAGES_STATS.with(|stats| stats.borrow_mut().raf_idle_calls += 1);
+        }
 
         // external 갱신 분리(Task 1-4, 설계 §4): 승격된 external 비디오만 도착했다면
         // WR 프레임 빌드(generate_frame, 씬 트리 재구성)를 완전히 건너뛰고 DComp 레벨의
@@ -3088,7 +3153,12 @@ impl Painter {
             !self.renderer_behind()
         {
             let frame_started = Instant::now();
+            // ★이 합성은 "남이 내는 프레임"으로 세지 않는다★ — 세면 다음 도착에서
+            // `raf_is_producing_frames` 가 자기 자신 때문에 참이 되어 한 번 걸러 한 번씩만
+            // 도는 진동이 된다(그래서 프레임률이 반토막 난다).
+            let non_video_before = self.last_non_video_frame_at.get();
             self.generate_frame(&mut txn, RenderReasons::SCENE);
+            self.last_non_video_frame_at.set(non_video_before);
             frame_ms += frame_started.elapsed().as_secs_f64() * 1000.0;
             frames_generated += 1;
             self.set_display_composite_in_flight(true);
@@ -3117,7 +3187,7 @@ impl Painter {
             let elapsed = window.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 warn!(
-                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1}",
+                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={}",
                     elapsed.as_secs_f64() * 1000.0,
                     stats.calls,
                     stats.total_ms,
@@ -3125,6 +3195,7 @@ impl Painter {
                     stats.frame_ms,
                     stats.send_ms,
                     (stats.total_ms - stats.frame_ms - stats.send_ms).max(0.0),
+                    stats.raf_idle_calls,
                 );
                 *stats = UpdateImagesStats {
                     window_start: Some(Instant::now()),
@@ -3742,4 +3813,68 @@ pub(crate) enum PaintMetricState {
     Seen(WebRenderEpoch, bool /* first_reflow */),
     /// The metric has been sent to the constellation and no more work needs to be done.
     Sent,
+}
+
+#[cfg(test)]
+mod raf_gate_tests {
+    use std::time::Duration;
+
+    use super::raf_is_driving_composites;
+
+    const REFRESH: Duration = Duration::from_millis(16);
+
+    /// rAF 가 없으면 비디오가 스스로 낸다(예전부터 그랬다).
+    #[test]
+    fn no_raf_means_the_video_composites_itself() {
+        assert!(!raf_is_driving_composites(
+            false,
+            Some(Duration::from_millis(1)),
+            REFRESH
+        ));
+    }
+
+    /// rAF 가 실제로 프레임을 내고 있으면 비디오는 그 박자를 탄다 — 이 게이트의 본래 뜻이다.
+    #[test]
+    fn raf_producing_frames_still_carries_the_video() {
+        assert!(raf_is_driving_composites(
+            true,
+            Some(Duration::from_millis(16)),
+            REFRESH
+        ));
+    }
+
+    /// ★이 수정의 핵심★ — rAF 는 도는데 프레임이 안 나오는 상태.
+    ///
+    /// 아무것도 그리지 않는 rAF 루프(자기 시계만 돌리는 것)가 정확히 이 모습이고, 예전에는
+    /// 이때도 참이라 비디오 합성이 막혀 화면이 정지했다.
+    #[test]
+    fn raf_that_produces_nothing_does_not_count() {
+        assert!(!raf_is_driving_composites(
+            true,
+            Some(Duration::from_millis(200)),
+            REFRESH
+        ));
+    }
+
+    /// 한 주기를 놓친 것만으로 열지는 않는다 — 정상 rAF 의 흔들림에 두 번째 합성원이
+    /// 끼어들면 그것이 이 게이트가 막으려던 지터다.
+    #[test]
+    fn one_missed_period_is_tolerated() {
+        assert!(raf_is_driving_composites(
+            true,
+            Some(Duration::from_millis(31)),
+            REFRESH
+        ));
+        assert!(!raf_is_driving_composites(
+            true,
+            Some(Duration::from_millis(33)),
+            REFRESH
+        ));
+    }
+
+    /// 아직 한 장도 낸 적이 없으면 태워 줄 것이 없다.
+    #[test]
+    fn a_painter_that_never_drew_carries_nothing() {
+        assert!(!raf_is_driving_composites(true, None, REFRESH));
+    }
 }
