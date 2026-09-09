@@ -43,6 +43,7 @@ servo-allocator = { workspace = true }
 servo-base = { workspace = true }
 servo-canvas-traits = { workspace = true }
 servo-config = { workspace = true }
+servo-media = { workspace = true }
 servo-constellation-traits = { workspace = true }
 servo-geometry = { workspace = true }
 servo-tracing = { workspace = true }

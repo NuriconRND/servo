@@ -431,7 +431,7 @@ fn lock_tracked<'a, T>(
 /// 남는다★ — 획득당 보유가 평상시의 110배라는 것까지는 알아도, 그 안에서 무엇이
 /// 무거워지는지는 사이트별로 갈라야 보인다. 지점 수가 스물둘뿐이라 선형 탐색으로 족하다
 /// (포인터 비교 스물두 번, 잠금 자체보다 훨씬 싸다).
-const SITE_COUNT: usize = 23;
+const SITE_COUNT: usize = 24;
 
 const SITE_NAMES: [&str; SITE_COUNT] = [
     "abandon_slot",
@@ -442,6 +442,7 @@ const SITE_NAMES: [&str; SITE_COUNT] = [
     "create_ring",
     "demanded_devices",
     "dropped_frames",
+    "expire_all_stale_demand",
     "expire_stale_demand",
     "note_demand",
     "note_demand_and_ring",
@@ -1094,6 +1095,27 @@ impl D3d11PlaneRings {
 
     /// TTL 이 지난 수요를 걷어내고, 그 디바이스의 링을 제거한다. 제거된
     /// ring_id 를 돌려준다(테스트/로깅용). 프로듀서가 주기적으로 부른다.
+    /// **모든** 그룹에 대해 수요가 끊긴 링을 회수한다. 회수한 링 수를 돌려준다.
+    ///
+    /// ★[`expire_stale_demand`](Self::expire_stale_demand) 는 그 영상의 프로듀서가 프레임을
+    /// 만들 때만 불린다★ — 그런데 정작 회수해야 할 때는 그 프로듀서가 멈춘 뒤다. 앱이
+    /// 요소를 문서에 남긴 채 재생만 멈추면(SPA 가 흔히 그렇다) 프레임이 없으니 회수도
+    /// 없고, 링이 영영 남는다. 실측: 영상 54개짜리 구성을 오가는 동안 링이 321개, 3.8GB
+    /// 까지 쌓였고 바닥값이 한 번도 내려오지 않았다.
+    ///
+    /// 그래서 프로듀서와 무관하게 도는 청소가 따로 필요하다. 어느 타일에도 합성되지 않는
+    /// 영상은 `note_demand` 가 갱신되지 않으므로 TTL 이 지나면 여기서 걸린다.
+    pub fn expire_all_stale_demand(ttl: Duration) -> usize {
+        let group_ids: Vec<u64> = {
+            let reg = lock_at(registry(), "expire_all_stale_demand");
+            reg.groups.keys().copied().collect()
+        };
+        group_ids
+            .into_iter()
+            .map(|group_id| Self::expire_stale_demand(group_id, ttl).len())
+            .sum()
+    }
+
     pub fn expire_stale_demand(group_id: u64, ttl: Duration) -> Vec<u64> {
         let now = Instant::now();
         let stale_rings: Vec<u64> = {

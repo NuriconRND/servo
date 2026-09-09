@@ -1459,6 +1459,22 @@ impl Painter {
                 if let Some(device) = self.rendering_context.media_d3d11_device_handle_borrowed() {
                     log_gpu_memory(self.painter_id, device);
                 }
+                // 어느 타일에도 보이지 않는 영상의 D3D11 링을 회수한다.
+                //
+                // ★이 청소는 프레임마다 도는 이 자리에 있어야 한다★ — 링 회수는 원래
+                // 그 영상의 프로듀서가 프레임을 만들 때만 돌았는데, 정작 회수해야 할 때는
+                // 그 프로듀서가 멈춘 뒤다(앱이 요소를 남긴 채 재생만 멈추는 경우).
+                // 실측: 그렇게 링이 321개, 3.8GB 까지 쌓였고 바닥값이 내려오지 않았다.
+                let reclaimed =
+                    servo_media::player::d3d11_ring::D3d11PlaneRings::expire_all_stale_demand(
+                        servo_media::player::d3d11_ring::RING_DEMAND_TTL,
+                    );
+                if reclaimed > 0 {
+                    warn!(
+                        "MEDIARINGRECLAIM painter={:?} rings={reclaimed}",
+                        self.painter_id
+                    );
+                }
             }
         }
 
