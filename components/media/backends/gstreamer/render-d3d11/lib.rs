@@ -452,10 +452,17 @@ mod render_d3d11 {
                         // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
                         // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
                         // 프레임 덮어쓴다. 스테이징은 링별이므로 디바이스마다 따로 둔다.
-                        let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
-                        // 밀려난 이전 버퍼는 **여기서** 떨어진다 — 자물쇠 밖, 이 스레드에서.
-                        // 안에서 떨구면 전역 레지스트리가 그 해제 시간만큼 잠긴다.
-                        drop(D3d11PlaneRings::stage_first_frame(ring_id, vecs));
+                        // 기본은 스테이징하지 않는다: 그 바이트는 렌더 스레드의 최초
+                        // 소비 안에서 매핑된 D3D11 메모리로 복사되는데, 실측으로 최초
+                        // 소비의 절반이 그 복사다(12.6~23.9ms 대 6.5~10.9ms). 프레임
+                        // 예산이 16.6ms 이므로 그 한 번이 프레임을 넘긴다. 여기서 매
+                        // 프레임 3MB 를 복사해 두는 일도 함께 사라진다.
+                        if servo_config::pref!(media_ring_stage_first_frame) {
+                            let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
+                            // 밀려난 이전 버퍼는 **여기서** 떨어진다 — 자물쇠 밖, 이
+                            // 스레드에서. 안에서 떨구면 레지스트리가 그만큼 잠긴다.
+                            drop(D3d11PlaneRings::stage_first_frame(ring_id, vecs));
+                        }
                     },
                     None => {
                         // 배압: 이 디바이스의 모든 슬롯이 아직 소비 대기다. 이번 gst

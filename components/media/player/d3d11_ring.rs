@@ -231,6 +231,13 @@ struct RingState {
     /// claim_free_slot이 전부 실패하는 최초 구간에 프로듀서가 스테이징한
     /// 첫 프레임 바이트. InitialMapAll 계획 발급 시 소비(take)된다.
     staged_first_frame: Option<Vec<Vec<u8>>>,
+    /// 현재 Presenting 슬롯에 **실제 그림이 들어 있는가.**
+    ///
+    /// 최초 소비는 슬롯 0 을 Presenting 으로 확정하지만, 스테이징된 첫 프레임이 없으면
+    /// 그 슬롯의 내용은 한 번도 쓰인 적이 없다 — 그대로 샘플하면 쓰레기 픽셀이다.
+    /// 그때는 소비자에게 아무것도 주지 않고(Invalid) 프로듀서가 첫 슬롯을 채울 때까지
+    /// 기다린다. 이 경로에는 이미 같은 선례가 있다(링이 없으면 그 프레임을 비운다).
+    presenting_has_content: bool,
 }
 
 /// 링별 상태를 담는 전역 레지스트리. 포이즌된 뮤텍스는 복구해서 계속
@@ -514,6 +521,7 @@ impl D3d11PlaneRings {
             dropped_frames: 0,
             next_filled_seq: 0,
             staged_first_frame: None,
+            presenting_has_content: false,
         };
         let mut reg = lock_at(registry(), "create_ring");
         reg.rings.insert(ring_id, ring);
@@ -672,6 +680,8 @@ impl D3d11PlaneRings {
             let slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT] =
                 std::array::from_fn(|i| ring.slots[i].planes);
             let staged = ring.staged_first_frame.take();
+            // 스테이징이 없으면 슬롯 0 은 한 번도 쓰인 적이 없다 — 첫 Advance 까지 비운다.
+            ring.presenting_has_content = staged.is_some();
             return Some(ConsumePlan::InitialMapAll { slots, staged });
         }
 
@@ -698,6 +708,8 @@ impl D3d11PlaneRings {
         ring.slots[filled_slot].state = SlotState::Presenting;
         ring.slots[old_presenting].state = SlotState::Remapping;
         ring.presenting_slot = Some(filled_slot);
+        // Filled 슬롯은 프로듀서가 쓴 것이므로 여기서부터는 볼 것이 있다.
+        ring.presenting_has_content = true;
 
         Some(ConsumePlan::Advance {
             unmap,
@@ -893,6 +905,9 @@ impl D3d11PlaneRings {
     pub fn presenting_plane(ring_id: u64, plane: usize) -> Option<PlaneDesc> {
         let reg = lock_at(registry(), "presenting_plane");
         let ring = reg.rings.get(&ring_id)?;
+        if !ring.presenting_has_content {
+            return None;
+        }
         let idx = ring.presenting_slot?;
         ring.slots[idx].planes.get(plane).copied().flatten()
     }
@@ -1010,6 +1025,7 @@ impl D3d11PlaneRings {
         let plane = reg
             .rings
             .get(&ring_id)
+            .filter(|ring| ring.presenting_has_content)
             .and_then(|ring| ring.presenting_slot.map(|idx| (ring, idx)))
             .and_then(|(ring, idx)| ring.slots[idx].planes.get(plane).copied().flatten());
         (None, plane)
@@ -1145,6 +1161,63 @@ mod tests {
     }
 
     /// 수요가 있는 디바이스만 프로듀서 대상이 된다(= 그 타일에 보이는 것만 업로드).
+    /// ★한 번도 쓰인 적 없는 슬롯을 표시하지 않는다.★ 최초 소비는 슬롯 0 을 Presenting
+    /// 으로 확정하지만, 스테이징된 첫 프레임이 없으면 그 메모리는 쓰인 적이 없다 —
+    /// 그대로 샘플하면 쓰레기 픽셀이다. 프로듀서가 첫 슬롯을 채울 때까지 비운다.
+    #[test]
+    fn an_unwritten_presenting_slot_is_not_handed_out() {
+        const DEV: usize = 0x5C_0000;
+        let ring = D3d11PlaneRings::create_ring(DEV, 2, slots_of(0x53_0000));
+
+        // 스테이징 없이 최초 소비.
+        let (plan, plane) = D3d11PlaneRings::plan_or_presenting_plane(ring, 0);
+        assert!(matches!(
+            plan,
+            Some(ConsumePlan::InitialMapAll { staged: None, .. })
+        ));
+        assert!(plane.is_none());
+        D3d11PlaneRings::commit_consume(ring, ConsumeCommit::InitialMapAll { mapped: Vec::new() });
+        assert!(D3d11PlaneRings::presenting_plane(ring, 0).is_none());
+        D3d11PlaneRings::note_plane_unlock(ring);
+
+        // 프로듀서가 한 슬롯을 채우면 그때부터 볼 것이 있다.
+        let claimed = D3d11PlaneRings::claim_free_slot(ring).expect("a free slot after the map");
+        D3d11PlaneRings::publish_slot(ring, claimed.slot);
+        let (plan, _) = D3d11PlaneRings::plan_or_presenting_plane(ring, 0);
+        assert!(matches!(plan, Some(ConsumePlan::Advance { .. })));
+        assert!(D3d11PlaneRings::presenting_plane(ring, 0).is_some());
+        D3d11PlaneRings::note_plane_unlock(ring);
+
+        D3d11PlaneRings::remove_ring(ring);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
+    }
+
+    /// 반대로 스테이징된 첫 프레임이 있으면 최초 소비 직후부터 표시한다(예전 동작).
+    #[test]
+    fn a_staged_first_frame_is_shown_immediately() {
+        const DEV: usize = 0x5D_0000;
+        let ring = D3d11PlaneRings::create_ring(DEV, 2, slots_of(0x54_0000));
+        drop(D3d11PlaneRings::stage_first_frame(
+            ring,
+            vec![vec![1u8; 8], vec![2u8; 8]],
+        ));
+
+        let (plan, _) = D3d11PlaneRings::plan_or_presenting_plane(ring, 0);
+        assert!(matches!(
+            plan,
+            Some(ConsumePlan::InitialMapAll {
+                staged: Some(_),
+                ..
+            })
+        ));
+        D3d11PlaneRings::commit_consume(ring, ConsumeCommit::InitialMapAll { mapped: Vec::new() });
+        assert!(D3d11PlaneRings::presenting_plane(ring, 0).is_some());
+        D3d11PlaneRings::note_plane_unlock(ring);
+
+        D3d11PlaneRings::remove_ring(ring);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
+    }
+
     /// 합친 진입점은 예전 두 호출과 같은 것을 돌려준다: 수요가 기록되고, 링을 찾는다.
     #[test]
     fn combined_demand_and_ring_matches_the_old_pair() {
@@ -1179,10 +1252,12 @@ mod tests {
         assert!(plane.is_none());
         D3d11PlaneRings::commit_consume(ring, ConsumeCommit::InitialMapAll { mapped: Vec::new() });
 
-        // 같은 합성의 나머지 면: lock_count 가 이미 1 이라 계획이 없고, plane 이 바로 온다.
+        // 같은 합성의 나머지 면: lock_count 가 이미 1 이라 계획이 없다. 다만 스테이징된
+        // 첫 프레임이 없었으므로 아직 볼 것이 없어 plane 도 주지 않는다(아래 테스트가
+        // 그 규칙을 따로 잡는다).
         let (plan, plane) = D3d11PlaneRings::plan_or_presenting_plane(ring, 1);
         assert!(plan.is_none());
-        assert!(plane.is_some());
+        assert!(plane.is_none());
 
         // 짝 맞추기: 이 테스트가 건 lock 두 번을 되돌린다.
         D3d11PlaneRings::note_plane_unlock(ring);

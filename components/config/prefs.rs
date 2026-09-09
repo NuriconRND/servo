@@ -665,6 +665,19 @@ pub struct Preferences {
     /// 프레임에 비어 보이는데, 이 경로에는 이미 같은 선례가 있다(링이 아직 없으면 그
     /// 프레임을 비우고 다음 프레임에 뜬다).
     pub media_ring_init_max_per_frame: i64,
+    /// 새 영상의 **첫 프레임을 미리 스테이징**해 둘지. 켜면 영상이 한 프레임 일찍 뜨고,
+    /// 그 대가를 렌더 스레드가 낸다.
+    ///
+    /// 링의 최초 소비는 렌더 스레드에서 도는데, 스테이징이 있으면 그 안에서 프레임 하나를
+    /// **매핑된 D3D11 메모리(write-combined)로 복사**한다. 실측(FHD I420 = 3,110,400 바이트):
+    /// 스테이징 있는 최초 소비 12.6~23.9ms, 없는 것 6.5~10.9ms — 절반이 이 복사다. 프레임
+    /// 예산이 16.6ms 이므로 그 한 번이 프레임을 통째로 넘긴다.
+    ///
+    /// 꺼 두면 첫 슬롯이 아직 비어 있으므로 프로듀서가 채울 때까지(대개 한두 프레임)
+    /// 그 영상만 비워 두고, 벽은 계속 60fps 로 표출한다. 이 경로에는 같은 선례가 있다
+    /// (링이 아직 없으면 그 프레임을 비운다). 프로듀서가 소비 전까지 **매 프레임** 3MB 를
+    /// 복사해 두던 일도 함께 사라진다.
+    pub media_ring_stage_first_frame: bool,
     /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모)에서 **함께 출발하기를 기다릴
     /// 파이프라인 목표 수**. 온오프 스위치가 아니다 — 구 env `SERVO_MEDIA_SYNC_GROUP=N`이
     /// 그랬듯 타일 수를 그대로 받는다(`player.rs::sync_group_target`: 구코드는 usize 파싱
@@ -1075,6 +1088,7 @@ impl Preferences {
             // 동작 보존).
             media_d3d11_enabled: false,
             media_ring_init_max_per_frame: 1,
+            media_ring_stage_first_frame: false,
             media_sync_group_target: 0,
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,
