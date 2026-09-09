@@ -394,6 +394,9 @@ pub(crate) struct Painter {
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
+    /// 이 페인터가 마지막으로 **실제 렌더 패스를 시작한** 시각. 애니메이션 값을 밀어넣는
+    /// 박자를 여기에 맞춘다 — 자기 타이머로 돌면 벽의 표출 주기와 위상이 어긋나 미끄러진다.
+    last_render_started_at: Cell<Option<Instant>>,
 
     /// The channel on which messages can be sent to the constellation.
     embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
@@ -1039,6 +1042,7 @@ impl Painter {
             last_video_presented_at: Default::default(),
             last_frame_by_other_source_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
+            last_render_started_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
             pending_video_frame_updates: RefCell::new(FxHashMap::default()),
@@ -1128,10 +1132,22 @@ impl Painter {
         // nothing.
         let animation_period = crate::refresh_driver::paint_timer_period();
         let has_values = !floats.is_empty() || !transforms.is_empty();
-        let push_due = self
-            .last_paint_animation_push_at
-            .get()
-            .is_none_or(|last| now.duration_since(last) >= animation_period);
+        // ★박자는 밖에서 온다★ — 값을 밀어넣는 주기를 자기 타이머로 재면 벽의 표출 주기와
+        // 위상이 어긋나 미끄러지고, 그 미끄러짐이 그대로 프레임 초과분이 된다. 값이 쓸모를
+        // 갖는 시점은 프레임이 그려질 때이므로, 그 박자를 그대로 따라간다: **마지막 밀어넣기
+        // 이후 렌더가 한 번이라도 시작됐으면** 다음 것을 밀어넣는다.
+        //
+        // 아무도 렌더하지 않는 페이지(움직이는 것이 이 애니메이션뿐인 화면)에서는 그 신호가
+        // 영영 오지 않으므로 주기 타이머로 받쳐 준다 — 그때는 애니메이션이 스스로 프레임을
+        // 내야 렌더가 생기고, 그 첫 한 번을 이 폴백이 만든다.
+        let last_push = self.last_paint_animation_push_at.get();
+        let rendered_since_push = match (self.last_render_started_at.get(), last_push) {
+            (Some(rendered), Some(pushed)) => rendered > pushed,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let push_due = rendered_since_push
+            || last_push.is_none_or(|last| now.duration_since(last) >= animation_period);
         // ★"남"에서 자기를 뺀다★ — 여기서 `last_frame_generated_at`(자기 프레임도 찍힌다)을
         // 보고 있었던 것이 위 주석의 규칙을 무너뜨렸다. 애니메이션이 프레임을 하나 내면 그
         // 시각이 찍히고, 다음 밀어넣기가 그것을 "남이 내고 있다"로 읽는다. 두 판정이 서로
@@ -1636,6 +1652,9 @@ impl Painter {
                 self.rendering_context.size(),
             );
         }
+
+        // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
+        self.last_render_started_at.set(Some(Instant::now()));
 
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
