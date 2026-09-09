@@ -374,6 +374,12 @@ pub(crate) struct Painter {
     paint_animation_rode_along: Cell<u64>,
     /// When any frame was last generated for this painter, by any path.
     last_frame_generated_at: Cell<Option<Instant>>,
+    /// 비디오 프레임이 마지막으로 **도착한** 시각(페인터에 이미지 갱신으로 들어온 시각).
+    ///
+    /// `last_video_presented_at` 과 짝이다. 둘을 같이 재야 "안 왔다"와 "왔는데 못 내보냈다"가
+    /// 갈린다 — 화면이 멈춘 것만 보고는 그 둘을 구분할 수 없고, 고칠 곳은 정반대다.
+    last_video_arrived_at: Cell<Option<Instant>>,
+
     /// 비디오 프레임이 마지막으로 **화면에 실려 나간** 시각(합성에 flush 된 시각).
     ///
     /// 재생이 매끄러운지는 도착률이 아니라 이 간격이 말해 준다 — 도착은 30/s 인데 표출이
@@ -614,6 +620,10 @@ struct UpdateImagesStats {
     raf_idle_calls: u64,
     /// 비디오가 화면에 실려 나간 순간들 사이의 **최대** 간격(ms). 끊김의 길이가 곧 이 값이다.
     video_gap_max_ms: f64,
+    /// 비디오 프레임이 **도착한** 순간들 사이의 최대 간격(ms). 위 값과 함께 봐야 뜻이 있다:
+    /// 둘 다 크면 프레임이 안 온 것(디코더/파이프라인), 도착은 촘촘한데 표출만 크면 우리가
+    /// 못 내보낸 것(합성)이다.
+    video_arrival_gap_max_ms: f64,
 }
 
 thread_local! {
@@ -1039,6 +1049,7 @@ impl Painter {
             paint_animation_skipped_busy: Default::default(),
             paint_animation_rode_along: Default::default(),
             last_frame_generated_at: Default::default(),
+            last_video_arrived_at: Default::default(),
             last_video_presented_at: Default::default(),
             last_frame_by_other_source_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
@@ -3097,6 +3108,18 @@ impl Painter {
                         // dropped here instead of piling up in WebRender's queues (which
                         // cannot skip them; see `pending_video_frame_updates`).
                         immediate_image_update = true;
+                        // 도착 간격. 표출 간격(`last_video_presented_at`)과 짝으로 본다.
+                        let now = Instant::now();
+                        if let Some(last) = self.last_video_arrived_at.get() {
+                            let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
+                            UPDATE_IMAGES_STATS.with(|stats| {
+                                let mut stats = stats.borrow_mut();
+                                if gap_ms > stats.video_arrival_gap_max_ms {
+                                    stats.video_arrival_gap_max_ms = gap_ms;
+                                }
+                            });
+                        }
+                        self.last_video_arrived_at.set(Some(now));
                         self.pending_video_frame_updates
                             .borrow_mut()
                             .insert(key, (desc, data));
@@ -3288,7 +3311,7 @@ impl Painter {
             let elapsed = window.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 warn!(
-                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={} vidgap_max_ms={:.1}",
+                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} frames={} frame_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={} vidgap_max_ms={:.1} vidarrive_max_ms={:.1}",
                     elapsed.as_secs_f64() * 1000.0,
                     stats.calls,
                     stats.total_ms,
@@ -3298,6 +3321,7 @@ impl Painter {
                     (stats.total_ms - stats.frame_ms - stats.send_ms).max(0.0),
                     stats.raf_idle_calls,
                     stats.video_gap_max_ms,
+                    stats.video_arrival_gap_max_ms,
                 );
                 *stats = UpdateImagesStats {
                     window_start: Some(Instant::now()),
