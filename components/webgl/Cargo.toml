@@ -19,6 +19,7 @@ webgl_backtrace = ["servo-canvas-traits/webgl_backtrace"]
 webxr = ["dep:webxr", "dep:webxr-api"]
 
 [dependencies]
+ipc-channel = { workspace = true }
 bitflags = { workspace = true }
 byteorder = { workspace = true }
 crossbeam-channel = { workspace = true }

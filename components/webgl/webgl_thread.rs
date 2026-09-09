@@ -28,7 +28,7 @@ use paint_api::{
 };
 use parking_lot::RwLock;
 use pixels::{self, PixelFormat, SnapshotAlphaMode, unmultiply_inplace};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::Epoch;
 use servo_base::generic_channel::{
     GenericReceiver, GenericSender, GenericSharedMemory, RoutedReceiver,
@@ -41,10 +41,10 @@ use servo_canvas_traits::webgl::{
     ActiveAttribInfo, ActiveUniformBlockInfo, ActiveUniformInfo, AlphaTreatment,
     GLContextAttributes, GLLimits, GlType, InternalFormatIntVec, ProgramLinkInfo, TexDataType,
     TexFormat, WebGLBufferId, WebGLChan, WebGLCommand, WebGLCommandBacktrace, WebGLContextId,
-    WebGLCreateContextResult, WebGLFramebufferBindingRequest, WebGLFramebufferId, WebGLMsg,
-    WebGLMsgSender, WebGLProgramId, WebGLQueryId, WebGLRenderbufferId, WebGLSLVersion,
-    WebGLSamplerId, WebGLShaderId, WebGLSurfaceId, WebGLSyncId, WebGLTextureId, WebGLVersion,
-    WebGLVertexArrayId, YAxisTreatment,
+    WebGLContextNotification, WebGLCreateContextResult, WebGLFramebufferBindingRequest,
+    WebGLFramebufferId, WebGLMsg, WebGLMsgSender, WebGLProgramId, WebGLQueryId,
+    WebGLRenderbufferId, WebGLSLVersion, WebGLSamplerId, WebGLShaderId, WebGLSurfaceId,
+    WebGLSyncId, WebGLTextureId, WebGLVersion, WebGLVertexArrayId, YAxisTreatment,
 };
 use servo_config::debug_env;
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
@@ -390,6 +390,22 @@ pub(crate) struct WebGLThread {
     contexts: FxHashMap<WebGLSurfaceId, GLContextData>,
     /// Backend painter ids for each logical WebGL context. The first entry is the primary backend.
     context_backends: FxHashMap<WebGLContextId, Vec<PainterId>>,
+    /// 놓아 둔 컨텍스트를 **다시 만들기 위해** 필요한 것들.
+    ///
+    /// 화면에서 사라진 컨텍스트의 GPU 자원을 놓으려면, 다시 보일 때 같은 모양으로 되살릴
+    /// 수 있어야 한다. 생성 인자는 생성 시점에만 있으므로 여기 남긴다.
+    context_recipes: FxHashMap<WebGLContextId, ContextRecipe>,
+    /// 지금 백엔드를 놓아 둔 컨텍스트들.
+    released_contexts: FxHashSet<WebGLContextId>,
+    /// 컨텍스트별 마지막 합성 시각. 페인트가 합성을 마칠 때마다 보내는
+    /// `FinishedRenderingToContext` 가 곧 "이 타일에 보였다" 이므로, 그것이 끊긴 지
+    /// 오래된 컨텍스트가 회수 대상이다.
+    last_composited: FxHashMap<WebGLContextId, Instant>,
+    /// 회수 판정을 마지막으로 돌린 시각(초당 한 번으로 묶기 위한 것).
+    last_reclaim_sweep: Option<Instant>,
+    /// 손실/복구를 스크립트에 알릴 채널(컨텍스트별).
+    context_notifiers:
+        FxHashMap<WebGLContextId, ipc_channel::ipc::IpcSender<WebGLContextNotification>>,
     /// Cached information for WebGLContexts.
     cached_context_info: FxHashMap<WebGLContextId, WebGLContextInfo>,
     /// Current bound context.
@@ -492,6 +508,11 @@ impl WebGLThread {
             paint_api,
             contexts: Default::default(),
             context_backends: Default::default(),
+            context_recipes: Default::default(),
+            released_contexts: Default::default(),
+            last_composited: Default::default(),
+            last_reclaim_sweep: None,
+            context_notifiers: Default::default(),
             cached_context_info: Default::default(),
             bound_context_id: None,
             external_image_id_manager: external_images,
@@ -527,9 +548,19 @@ impl WebGLThread {
         loop {
             WEBGL_PHASE.store(PHASE_IDLE, Ordering::Relaxed);
             WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
-            let Ok(Ok(msg)) = self.receiver.recv() else {
-                break;
+            // ★대기에 시한을 둔다★ — 회수 판정이 메시지에만 얹혀 있으면, 정작 회수해야 할
+            // 상황(캔버스가 숨어 페이지가 그리지도 않는 때)에는 아무 메시지도 오지 않아
+            // 영영 돌지 않는다.
+            let msg = match self.receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(_)) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    self.maybe_reclaim_idle_contexts();
+                    continue;
+                },
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
+            self.maybe_reclaim_idle_contexts();
             WEBGL_PHASE.store(PHASE_HANDLING, Ordering::Relaxed);
             WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
             match &msg {
@@ -628,7 +659,19 @@ impl WebGLThread {
                 let _ = sender.send(self.resize_webgl_context(ctx_id, size));
             },
             WebGLMsg::RemoveContext(ctx_id) => {
+                self.context_recipes.remove(&ctx_id);
+                self.released_contexts.remove(&ctx_id);
+                self.context_notifiers.remove(&ctx_id);
                 self.remove_webgl_context(ctx_id);
+            },
+            WebGLMsg::SetContextNotifier(ctx_id, notifier) => {
+                self.context_notifiers.insert(ctx_id, notifier);
+            },
+            WebGLMsg::ReleaseIdleContext(ctx_id) => {
+                self.release_context_backends(ctx_id);
+            },
+            WebGLMsg::RestoreContext(ctx_id) => {
+                self.restore_context_backends(ctx_id);
             },
             WebGLMsg::WebGLCommand(ctx_id, command, backtrace) => {
                 self.handle_webgl_command(ctx_id, command, backtrace);
@@ -1212,7 +1255,17 @@ impl WebGLThread {
             }
             self.contexts.insert(surface_id, context_data);
         }
-        self.context_backends.insert(context_id, target_painter_ids);
+        self.context_backends
+            .insert(context_id, target_painter_ids.clone());
+        self.context_recipes.insert(
+            context_id,
+            ContextRecipe {
+                painters: target_painter_ids,
+                version: webgl_version,
+                size: requested_size,
+                attributes,
+            },
+        );
 
         primary_limits
             .ok_or_else(|| "Failed to create primary WebGL backend".to_string())
@@ -1448,7 +1501,44 @@ impl WebGLThread {
 
     /// Note that rendering has finished in WebRender for this context. If the context
     /// is marked for deletion, it will now be deleted.
+    /// 회수 판정: 오래 보이지 않은 컨텍스트의 백엔드를 놓는다. 메시지 처리마다 불리므로
+    /// 초당 한 번으로 묶는다.
+    fn maybe_reclaim_idle_contexts(&mut self) {
+        let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
+        if idle_ms <= 0 {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_reclaim_sweep
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_reclaim_sweep = Some(now);
+        let idle = Duration::from_millis(idle_ms as u64);
+        let stale: Vec<WebGLContextId> = self
+            .context_backends
+            .keys()
+            .copied()
+            .filter(|context_id| {
+                !self.released_contexts.contains(context_id)
+                    && self
+                        .last_composited
+                        .get(context_id)
+                        // 한 번도 합성된 적이 없으면 아직 회수 대상이 아니다 — 갓 만들어진
+                        // 컨텍스트를 첫 프레임 전에 빼앗지 않기 위해서다.
+                        .is_some_and(|last| now.duration_since(*last) >= idle)
+            })
+            .collect();
+        for context_id in stale {
+            self.release_context_backends(context_id);
+        }
+    }
+
     fn handle_finished_rendering_to_context(&mut self, surface_id: WebGLSurfaceId) {
+        self.last_composited
+            .insert(surface_id.context_id, Instant::now());
         let marked_for_deletion = self
             .contexts
             .get(&surface_id)
@@ -1470,6 +1560,101 @@ impl WebGLThread {
     }
 
     /// Removes a WebGLContext and releases attached resources.
+    /// 어느 타일에도 보이지 않는 컨텍스트의 GPU 자원을 놓는다.
+    ///
+    /// ★논리 컨텍스트를 지우는 것이 아니다★ — DOM 의 캔버스는 그대로 살아 있고, 우리는
+    /// 그것이 붙들고 있던 백엔드 GL 컨텍스트와 스왑체인(타일마다 한 벌씩)만 놓는다.
+    /// 이미지 키와 크기 정보는 남긴다: 다시 보일 때 같은 자리로 돌아와야 한다.
+    ///
+    /// 놓으면 그 백엔드의 GL 상태(텍스처·버퍼·프로그램)도 함께 사라진다. 그래서 표준이
+    /// 정한 대로 페이지에 `webglcontextlost` 를 알린다 — 알리지 않고 놓으면 "돌아왔는데
+    /// 빈 화면" 이 되고, 페이지는 다시 그릴 이유를 모른다.
+    fn release_context_backends(&mut self, context_id: WebGLContextId) {
+        if self.released_contexts.contains(&context_id) {
+            return;
+        }
+        let surface_ids = self.backend_surface_ids(context_id);
+        if surface_ids.is_empty() {
+            return;
+        }
+        if self.context_has_busy_surfaces(context_id) {
+            // WebRender 가 아직 이 서피스로 그리는 중이다 — 다음 기회에.
+            return;
+        }
+        {
+            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
+            for surface_id in &surface_ids {
+                busy_webgl_context_map.remove(surface_id);
+            }
+        }
+        let released = surface_ids.len();
+        for surface_id in surface_ids {
+            let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
+            self.make_surface_current_if_needed(surface_id);
+            let Some(mut data) = self.contexts.remove(&surface_id) else {
+                continue;
+            };
+            if let Err(error) =
+                self.webrender_swap_chains
+                    .destroy(surface_id, &data.device, &mut data.ctx)
+            {
+                warn!("WebGL reclaim: failed to destroy swap chain for {surface_id:?}: {error:?}");
+            }
+            if let Err(error) = data.device.destroy_context(&mut data.ctx) {
+                warn!(
+                    "WebGL reclaim: failed to destroy backend context for {surface_id:?}: {error:?}"
+                );
+            }
+        }
+        self.context_backends.remove(&context_id);
+        self.bound_context_id = None;
+        self.released_contexts.insert(context_id);
+        warn!("WEBGLRECLAIM released context={context_id:?} backends={released}");
+        if let Some(notifier) = self.context_notifiers.get(&context_id) {
+            let _ = notifier.send(WebGLContextNotification::Lost(context_id));
+        }
+    }
+
+    /// 놓았던 컨텍스트를 다시 만든다(다시 화면에 필요해졌을 때).
+    ///
+    /// 이미지 키는 유지한다 — 그 자리를 참조하는 디스플레이 리스트가 이미 나가 있다.
+    fn restore_context_backends(&mut self, context_id: WebGLContextId) {
+        if !self.released_contexts.contains(&context_id) {
+            return;
+        }
+        let Some(recipe) = self.context_recipes.get(&context_id).cloned() else {
+            return;
+        };
+        for target_painter_id in &recipe.painters {
+            let surface_id = WebGLSurfaceId::new(context_id, *target_painter_id);
+            match self.create_webgl_backend_context(
+                context_id,
+                *target_painter_id,
+                recipe.version,
+                recipe.size,
+                recipe.attributes,
+            ) {
+                Ok((context_data, _limits, _size, _has_alpha)) => {
+                    self.contexts.insert(surface_id, context_data);
+                },
+                Err(error) => {
+                    warn!("WebGL reclaim: failed to restore backend for {surface_id:?}: {error}");
+                    return;
+                },
+            }
+        }
+        self.context_backends
+            .insert(context_id, recipe.painters.clone());
+        self.released_contexts.remove(&context_id);
+        warn!(
+            "WEBGLRECLAIM restored context={context_id:?} backends={}",
+            recipe.painters.len()
+        );
+        if let Some(notifier) = self.context_notifiers.get(&context_id) {
+            let _ = notifier.send(WebGLContextNotification::Restored(context_id));
+        }
+    }
+
     fn remove_webgl_context(&mut self, context_id: WebGLContextId) {
         let surface_ids = self.backend_surface_ids(context_id);
         if self.context_has_busy_surfaces(context_id) {
@@ -1898,6 +2083,15 @@ impl WebGLThread {
 }
 
 /// Helper struct to store cached WebGLContext information.
+/// 놓아 둔 컨텍스트를 되살리는 데 필요한 생성 인자.
+#[derive(Clone)]
+struct ContextRecipe {
+    painters: Vec<PainterId>,
+    version: WebGLVersion,
+    size: Size2D<u32>,
+    attributes: GLContextAttributes,
+}
+
 struct WebGLContextInfo {
     image_key: Option<ImageKey>,
     size: Size2D<i32>,

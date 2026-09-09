@@ -117,7 +117,10 @@ impl WebGLExternalImages {
         }
 
         let Some(swap_chain) = self.swap_chains.get(surface_id) else {
-            warn!("WebGL external image lock failed: missing swap chain for {surface_id:?}");
+            // ★스왑체인이 없다 = 이 컨텍스트의 백엔드를 놓아 둔 상태★ — 그런데 방금 WR 이
+            // 이것을 합성하려 했으므로 다시 보이기 시작한 것이다. 되살려 달라고 알리고 이
+            // 프레임만 비운다(비디오 링이 처음 뜰 때와 같은 모양이다).
+            let _ = self.webgl_threads.restore_context(id);
             self.mark_surface_not_busy(surface_id);
             let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
             return None;
@@ -223,21 +226,47 @@ impl WebGLExternalImages {
             let texture = api.gen_textures(1)[0];
             api.bind_texture(gl::TEXTURE_2D, texture);
             api.tex_image_2d(
-                gl::TEXTURE_2D, 0, gl::RGBA8 as gl::GLint, size.width, size.height, 0,
-                gl::RGBA, gl::UNSIGNED_BYTE, None,
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as gl::GLint,
+                size.width,
+                size.height,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                None,
             );
-            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as gl::GLint);
-            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as gl::GLint);
-            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as gl::GLint);
-            api.tex_parameter_i(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as gl::GLint);
+            api.tex_parameter_i(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_MIN_FILTER,
+                gl::LINEAR as gl::GLint,
+            );
+            api.tex_parameter_i(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_MAG_FILTER,
+                gl::LINEAR as gl::GLint,
+            );
+            api.tex_parameter_i(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_S,
+                gl::CLAMP_TO_EDGE as gl::GLint,
+            );
+            api.tex_parameter_i(
+                gl::TEXTURE_2D,
+                gl::TEXTURE_WRAP_T,
+                gl::CLAMP_TO_EDGE as gl::GLint,
+            );
             api.bind_texture(gl::TEXTURE_2D, 0);
             let fbos = api.gen_framebuffers(2);
-            self.staging.insert(surface_id, StagingTarget {
-                texture,
-                read_fbo: fbos[0],
-                draw_fbo: fbos[1],
-                size,
-            });
+            self.staging.insert(
+                surface_id,
+                StagingTarget {
+                    texture,
+                    read_fbo: fbos[0],
+                    draw_fbo: fbos[1],
+                    size,
+                },
+            );
         }
         let target = self.staging.get(&surface_id)?;
 
@@ -251,16 +280,31 @@ impl WebGLExternalImages {
 
         api.bind_framebuffer(gl::READ_FRAMEBUFFER, target.read_fbo);
         api.framebuffer_texture_2d(
-            gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, source, 0,
+            gl::READ_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            source,
+            0,
         );
         api.bind_framebuffer(gl::DRAW_FRAMEBUFFER, target.draw_fbo);
         api.framebuffer_texture_2d(
-            gl::DRAW_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::TEXTURE_2D, target.texture, 0,
+            gl::DRAW_FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::TEXTURE_2D,
+            target.texture,
+            0,
         );
         api.blit_framebuffer(
-            0, 0, size.width, size.height,
-            0, 0, size.width, size.height,
-            gl::COLOR_BUFFER_BIT, gl::NEAREST,
+            0,
+            0,
+            size.width,
+            size.height,
+            0,
+            0,
+            size.width,
+            size.height,
+            gl::COLOR_BUFFER_BIT,
+            gl::NEAREST,
         );
 
         api.bind_framebuffer(gl::READ_FRAMEBUFFER, prev_read[0] as gl::GLuint);

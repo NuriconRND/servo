@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use ipc_channel::ipc::IpcSender;
 use std::borrow::Cow;
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -89,6 +90,22 @@ impl WebGLThreads {
         self.0
             .send(WebGLMsg::FinishedRenderingToContext(surface_id))
     }
+
+    /// 놓아 둔 컨텍스트가 다시 화면에 필요해졌음을 알린다.
+    pub fn restore_context(&self, context_id: WebGLContextId) -> WebGLSendResult {
+        self.0.send(WebGLMsg::RestoreContext(context_id))
+    }
+}
+
+/// 놓아 준 WebGL 컨텍스트의 상태 변화를 스크립트에 알리는 통지.
+///
+/// 표준이 정한 경로다: 자원을 놓을 때 `webglcontextlost`, 다시 마련했을 때
+/// `webglcontextrestored`. 페이지는 후자에서 다시 그린다 — 놓은 백엔드는 GL 상태를
+/// 함께 잃으므로, 알리지 않고 놓으면 "돌아왔는데 빈 화면" 이 된다.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum WebGLContextNotification {
+    Lost(WebGLContextId),
+    Restored(WebGLContextId),
 }
 
 /// WebGL Message API
@@ -113,6 +130,21 @@ pub enum WebGLMsg {
     ),
     /// Drops a WebGLContext.
     RemoveContext(WebGLContextId),
+    /// 이 컨텍스트의 손실/복구를 스크립트에 알릴 채널을 등록한다.
+    ///
+    /// 생성 응답은 일회성 sender 라 그 뒤로는 WebGL 스레드가 스크립트에 말을 걸 길이
+    /// 없었다. 화면에서 사라진 컨텍스트를 회수하려면 그 사실을 페이지에 알려야 하므로
+    /// (`webglcontextlost`), 생성 직후 상시 채널을 하나 걸어 둔다.
+    SetContextNotifier(WebGLContextId, IpcSender<WebGLContextNotification>),
+    /// 어느 타일에도 보이지 않는 컨텍스트의 GPU 자원을 놓는다.
+    ///
+    /// ★벽에서는 논리 컨텍스트 하나가 타일마다 백엔드와 스왑체인을 따로 갖는다★ — 즉
+    /// 보이지 않는 캔버스 하나가 GPU 자원 네 벌을 잡고 있다. 페이지가 그 캔버스를 문서에
+    /// 남겨 두면(SPA 가 흔히 그렇다) 수집도 되지 않아 영원히 남는다. 상용 브라우저가
+    /// 컨텍스트 수를 제한하고 오래된 것을 강제로 잃게 만드는 이유가 이것이다.
+    ReleaseIdleContext(WebGLContextId),
+    /// 놓았던 컨텍스트가 다시 화면에 필요해졌다.
+    RestoreContext(WebGLContextId),
     /// Runs a WebGLCommand in a specific WebGLContext.
     WebGLCommand(WebGLContextId, WebGLCommand, WebGLCommandBacktrace),
     /// Runs a WebXRCommand (WebXR layers need to be created in the WebGL
@@ -199,6 +231,14 @@ impl WebGLMsgSender {
 
     /// Set an [`ImageKey`] on this WebGL context.
     #[inline]
+    /// 이 컨텍스트의 손실/복구를 받을 채널을 등록한다.
+    #[inline]
+    pub fn set_context_notifier(&self, notifier: IpcSender<WebGLContextNotification>) {
+        let _ = self
+            .sender
+            .send(WebGLMsg::SetContextNotifier(self.ctx_id, notifier));
+    }
+
     pub fn set_image_key(&self, image_key: ImageKey) {
         let _ = self
             .sender
@@ -719,9 +759,7 @@ define_resource_id!(WebXRLayerManagerId, u32);
 )]
 pub struct WebGLContextId(pub u64);
 
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct WebGLSurfaceId {
     pub context_id: WebGLContextId,
     pub painter_id: PainterId,
@@ -979,9 +1017,9 @@ parameters! {
 impl TexParameter {
     pub fn required_webgl_version(self) -> WebGLVersion {
         match self {
-            Self::Float(TexParameterFloat::TextureMaxAnisotropyExt) |
-            Self::Int(TexParameterInt::TextureWrapS) |
-            Self::Int(TexParameterInt::TextureWrapT) => WebGLVersion::WebGL1,
+            Self::Float(TexParameterFloat::TextureMaxAnisotropyExt)
+            | Self::Int(TexParameterInt::TextureWrapS)
+            | Self::Int(TexParameterInt::TextureWrapT) => WebGLVersion::WebGL1,
             _ => WebGLVersion::WebGL2,
         }
     }
@@ -1154,11 +1192,11 @@ impl TexFormat {
         let gl_const = self.as_gl_constant();
         matches!(
             gl_const,
-            gl::COMPRESSED_RGB_S3TC_DXT1_EXT |
-                gl::COMPRESSED_RGBA_S3TC_DXT1_EXT |
-                gl::COMPRESSED_RGBA_S3TC_DXT3_EXT |
-                gl::COMPRESSED_RGBA_S3TC_DXT5_EXT |
-                gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL
+            gl::COMPRESSED_RGB_S3TC_DXT1_EXT
+                | gl::COMPRESSED_RGBA_S3TC_DXT1_EXT
+                | gl::COMPRESSED_RGBA_S3TC_DXT3_EXT
+                | gl::COMPRESSED_RGBA_S3TC_DXT5_EXT
+                | gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL
         )
     }
 
@@ -1166,15 +1204,15 @@ impl TexFormat {
     pub fn is_sized(&self) -> bool {
         !matches!(
             self,
-            TexFormat::DepthComponent |
-                TexFormat::DepthStencil |
-                TexFormat::Alpha |
-                TexFormat::Red |
-                TexFormat::RG |
-                TexFormat::RGB |
-                TexFormat::RGBA |
-                TexFormat::Luminance |
-                TexFormat::LuminanceAlpha
+            TexFormat::DepthComponent
+                | TexFormat::DepthStencil
+                | TexFormat::Alpha
+                | TexFormat::Red
+                | TexFormat::RG
+                | TexFormat::RGB
+                | TexFormat::RGBA
+                | TexFormat::Luminance
+                | TexFormat::LuminanceAlpha
         )
     }
 
@@ -1348,26 +1386,26 @@ impl TexFormat {
             TexFormat::DepthComponent32f => &[TexDataType::Float][..],
             TexFormat::Depth24Stencil8 => &[TexDataType::UnsignedInt248][..],
             TexFormat::Depth32fStencil8 => &[TexDataType::Float32UnsignedInt248Rev][..],
-            TexFormat::CompressedRgbS3tcDxt1 |
-            TexFormat::CompressedRgbaS3tcDxt1 |
-            TexFormat::CompressedRgbaS3tcDxt3 |
-            TexFormat::CompressedRgbaS3tcDxt5 => &[TexDataType::UnsignedByte][..],
+            TexFormat::CompressedRgbS3tcDxt1
+            | TexFormat::CompressedRgbaS3tcDxt1
+            | TexFormat::CompressedRgbaS3tcDxt3
+            | TexFormat::CompressedRgbaS3tcDxt5 => &[TexDataType::UnsignedByte][..],
             _ => &[][..],
         }
     }
 
     pub fn required_webgl_version(self) -> WebGLVersion {
         match self {
-            TexFormat::DepthComponent |
-            TexFormat::Alpha |
-            TexFormat::RGB |
-            TexFormat::RGBA |
-            TexFormat::Luminance |
-            TexFormat::LuminanceAlpha |
-            TexFormat::CompressedRgbS3tcDxt1 |
-            TexFormat::CompressedRgbaS3tcDxt1 |
-            TexFormat::CompressedRgbaS3tcDxt3 |
-            TexFormat::CompressedRgbaS3tcDxt5 => WebGLVersion::WebGL1,
+            TexFormat::DepthComponent
+            | TexFormat::Alpha
+            | TexFormat::RGB
+            | TexFormat::RGBA
+            | TexFormat::Luminance
+            | TexFormat::LuminanceAlpha
+            | TexFormat::CompressedRgbS3tcDxt1
+            | TexFormat::CompressedRgbaS3tcDxt1
+            | TexFormat::CompressedRgbaS3tcDxt3
+            | TexFormat::CompressedRgbaS3tcDxt5 => WebGLVersion::WebGL1,
             _ => WebGLVersion::WebGL2,
         }
     }
@@ -1395,16 +1433,16 @@ impl TexDataType {
             TexDataType::Byte => SizedDataType::Int8,
             TexDataType::UnsignedByte => SizedDataType::Uint8,
             TexDataType::Short => SizedDataType::Int16,
-            TexDataType::UnsignedShort |
-            TexDataType::UnsignedShort4444 |
-            TexDataType::UnsignedShort5551 |
-            TexDataType::UnsignedShort565 => SizedDataType::Uint16,
+            TexDataType::UnsignedShort
+            | TexDataType::UnsignedShort4444
+            | TexDataType::UnsignedShort5551
+            | TexDataType::UnsignedShort565 => SizedDataType::Uint16,
             TexDataType::Int => SizedDataType::Int32,
-            TexDataType::UnsignedInt |
-            TexDataType::UnsignedInt10f11f11fRev |
-            TexDataType::UnsignedInt2101010Rev |
-            TexDataType::UnsignedInt5999Rev |
-            TexDataType::UnsignedInt248 => SizedDataType::Uint32,
+            TexDataType::UnsignedInt
+            | TexDataType::UnsignedInt10f11f11fRev
+            | TexDataType::UnsignedInt2101010Rev
+            | TexDataType::UnsignedInt5999Rev
+            | TexDataType::UnsignedInt248 => SizedDataType::Uint32,
             TexDataType::HalfFloat => SizedDataType::Uint16,
             TexDataType::Float | TexDataType::Float32UnsignedInt248Rev => SizedDataType::Float32,
         }
@@ -1415,16 +1453,16 @@ impl TexDataType {
         use self::*;
         match *self {
             TexDataType::Byte | TexDataType::UnsignedByte => 1,
-            TexDataType::Short |
-            TexDataType::UnsignedShort |
-            TexDataType::UnsignedShort4444 |
-            TexDataType::UnsignedShort5551 |
-            TexDataType::UnsignedShort565 => 2,
-            TexDataType::Int |
-            TexDataType::UnsignedInt |
-            TexDataType::UnsignedInt10f11f11fRev |
-            TexDataType::UnsignedInt2101010Rev |
-            TexDataType::UnsignedInt5999Rev => 4,
+            TexDataType::Short
+            | TexDataType::UnsignedShort
+            | TexDataType::UnsignedShort4444
+            | TexDataType::UnsignedShort5551
+            | TexDataType::UnsignedShort565 => 2,
+            TexDataType::Int
+            | TexDataType::UnsignedInt
+            | TexDataType::UnsignedInt10f11f11fRev
+            | TexDataType::UnsignedInt2101010Rev
+            | TexDataType::UnsignedInt5999Rev => 4,
             TexDataType::UnsignedInt248 => 4,
             TexDataType::Float => 4,
             TexDataType::HalfFloat => 2,
@@ -1457,12 +1495,12 @@ impl TexDataType {
 
     pub fn required_webgl_version(self) -> WebGLVersion {
         match self {
-            TexDataType::UnsignedByte |
-            TexDataType::UnsignedShort4444 |
-            TexDataType::UnsignedShort5551 |
-            TexDataType::UnsignedShort565 |
-            TexDataType::Float |
-            TexDataType::HalfFloat => WebGLVersion::WebGL1,
+            TexDataType::UnsignedByte
+            | TexDataType::UnsignedShort4444
+            | TexDataType::UnsignedShort5551
+            | TexDataType::UnsignedShort565
+            | TexDataType::Float
+            | TexDataType::HalfFloat => WebGLVersion::WebGL1,
             _ => WebGLVersion::WebGL2,
         }
     }

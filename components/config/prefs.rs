@@ -678,6 +678,20 @@ pub struct Preferences {
     /// (링이 아직 없으면 그 프레임을 비운다). 프로듀서가 소비 전까지 **매 프레임** 3MB 를
     /// 복사해 두던 일도 함께 사라진다.
     pub media_ring_stage_first_frame: bool,
+    /// 어느 타일에도 이만큼(ms) 합성되지 않은 WebGL 컨텍스트의 GPU 자원을 놓는다.
+    /// `0` 이면 회수하지 않는다(예전 동작).
+    ///
+    /// ★벽에서는 논리 컨텍스트 하나가 타일마다 백엔드 GL 컨텍스트와 스왑체인을 따로
+    /// 갖는다★ — 보이지 않는 캔버스 하나가 GPU 자원을 네 벌 잡는다. 그리고 SPA 가 옛
+    /// 캔버스를 문서에 남겨 두면 그 요소는 수집되지 않으므로(연결된 노드는 크기와 무관하게
+    /// 살아 있다) `RemoveContext` 가 영영 나가지 않는다. 실측: WebGL 구성이 뜰 때마다
+    /// 컨텍스트가 하나씩 늘고 한 번도 줄지 않았으며 GPU 메모리가 100% 에 닿았다.
+    ///
+    /// 상용 브라우저가 컨텍스트 수를 제한하고 오래된 것을 강제로 잃게 만드는 이유가
+    /// 이것이다. 놓을 때 `webglcontextlost`, 다시 마련할 때 `webglcontextrestored` 를
+    /// 페이지에 알린다 — 놓은 백엔드는 GL 상태도 함께 잃으므로, 알리지 않으면 "돌아왔는데
+    /// 빈 화면" 이 된다.
+    pub dom_webgl_idle_context_reclaim_ms: i64,
     /// 다중 `<video>` 파이프라인 동시 시작 동기화(월 데모)에서 **함께 출발하기를 기다릴
     /// 파이프라인 목표 수**. 온오프 스위치가 아니다 — 구 env `SERVO_MEDIA_SYNC_GROUP=N`이
     /// 그랬듯 타일 수를 그대로 받는다(`player.rs::sync_group_target`: 구코드는 usize 파싱
@@ -1089,6 +1103,7 @@ impl Preferences {
             media_d3d11_enabled: false,
             media_ring_init_max_per_frame: 1,
             media_ring_stage_first_frame: false,
+            dom_webgl_idle_context_reclaim_ms: 3000,
             media_sync_group_target: 0,
             media_gapless_loop_enabled: false,
             media_direct_file_enabled: false,
