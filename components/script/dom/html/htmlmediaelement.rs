@@ -884,7 +884,9 @@ impl MediaFrameRenderer {
         let frame_height = frame.get_height();
         let format = d3d11_yuv.format;
         let Some(external_ids) = self.ensure_d3d11_plane_ids(format) else {
-            warn!("Dropping D3D11 YUV media frame because plane external image IDs are unavailable");
+            warn!(
+                "Dropping D3D11 YUV media frame because plane external image IDs are unavailable"
+            );
             if !updates.is_empty() {
                 self.paint_api
                     .update_images(self.webview_id.into(), updates);
@@ -1491,7 +1493,61 @@ enum PlaybackDirection {
     Backwards,
 }
 
+thread_local! {
+    /// 플레이어를 만든 미디어 요소를 **약하게** 기억한다.
+    ///
+    /// 약한 참조인 것이 핵심이다 — 이 목록이 요소를 살려 두면 스스로 던진 질문에 스스로
+    /// 답하는 꼴이 된다.
+    static LIVE_MEDIA_ELEMENTS: RefCell<Vec<WeakRef<HTMLMediaElement>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// 살아 있는 미디어 요소가 몇이고, 그 중 몇이 아직 문서에 붙어 있는지.
+///
+/// ★`unbind_from_tree` 는 일시정지만 하고 플레이어를 버리지 않는다★(사양대로다). 그래서
+/// 앱이 `<video>` 를 지워도 GStreamer 파이프라인은 요소가 수거될 때까지 살아 있고, GC 는
+/// 그 요소를 수백 바이트로 본다 — WebGL 컨텍스트가 남던 것과 같은 구조다. 실측에서 링
+/// 그룹(영상 하나당 하나)이 24 → 78 → 102 → 156 으로 한 번도 줄지 않았고, 프로세스 커밋
+/// 메모리가 100초에 844MB → 24GB 였다.
+///
+/// 여기서 갈린다: `detached` 가 늘면 요소는 지워졌는데 우리가 파이프라인을 안 버리는
+/// 것이고(엔진 문제), `connected` 가 늘면 페이지가 들고 있는 것이다(그때는 보이지 않는
+/// 것을 디코드하지 않게 하는 쪽이다).
+pub(crate) fn report_live_media_elements() {
+    LIVE_MEDIA_ELEMENTS.with(|live| {
+        let mut live = live.borrow_mut();
+        live.retain(|element| element.is_alive());
+        let (mut connected, mut detached, mut with_player) = (0usize, 0usize, 0usize);
+        for element in live.iter() {
+            let Some(element) = element.root() else {
+                continue;
+            };
+            if element.upcast::<Node>().is_connected() {
+                connected += 1;
+            } else {
+                detached += 1;
+            }
+            if element.player.borrow().is_some() {
+                with_player += 1;
+            }
+        }
+        // `warn!` 인 것은 의도적이다 — 벽 런처의 RUST_LOG 가 warn 으로 시작한다.
+        warn!(
+            "MEDIADOM live={} connected={} detached={} with_player={}",
+            live.len(),
+            connected,
+            detached,
+            with_player
+        );
+    });
+}
+
 impl HTMLMediaElement {
+    /// 이 요소를 [`report_live_media_elements`] 가 찾을 수 있도록 약하게 기억한다.
+    fn register_for_reporting(&self) {
+        LIVE_MEDIA_ELEMENTS.with(|live| live.borrow_mut().push(WeakRef::new(self)));
+    }
+
     pub(crate) fn new_inherited(
         tag_name: LocalName,
         prefix: Option<Prefix>,
@@ -3079,6 +3135,7 @@ impl HTMLMediaElement {
         };
 
         *self.player.borrow_mut() = Some(player);
+        self.register_for_reporting();
 
         let event_handler = Arc::new(Mutex::new(HTMLMediaElementEventHandler::new(self)));
         let weak_event_handler = Arc::downgrade(&event_handler);
