@@ -50,6 +50,18 @@ pub const RING_DEMAND_TTL: Duration = Duration::from_secs(2);
 /// ★GPU 가 예산의 65~71% 로 차 있는데 무엇이 들었는지 세는 곳이 없었다.★ 영상 하나의
 /// 링은 슬롯 4개 × 면 3개이고, 같은 영상이 여러 타일에 보이면 디바이스마다 따로 있다 —
 /// 즉 개수와 바이트를 같이 세지 않으면 규모를 알 수 없다.
+/// 회수 큐에 남아 있는 링 수와 그 텍스처 수.
+///
+/// ★`remove_ring` 은 링을 큐에 넣을 뿐이다★ — 실제 Unmap/Release 는 소비자의 다음 미디어
+/// lock 에서 일어난다. 그런데 WebGL 구성으로 넘어가면 미디어 lock 이 아예 없으므로, 큐가
+/// 텍스처를 그대로 들고 있는다. 살아 있는 레지스트리만 세면 그것이 안 보인다(실측: 링
+/// 950MB 를 "풀었는데" VRAM 은 그대로였다).
+pub fn removed_queue_inventory() -> (usize, usize) {
+    let queue = lock_removed(removed_rings());
+    let textures = queue.iter().map(|ring| ring.textures.len()).sum();
+    (queue.len(), textures)
+}
+
 pub fn ring_inventory() -> (usize, u64) {
     let reg = lock_at(registry(), "ring_inventory");
     let mut bytes: u64 = 0;

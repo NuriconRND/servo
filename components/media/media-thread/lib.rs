@@ -1092,8 +1092,10 @@ impl MediaExternalImages {
                     .join(" ");
                 warn!("MEDIALOCKSITES {rows}");
                 let (rings, ring_bytes) = servo_media::player::d3d11_ring::ring_inventory();
+                let (queued_rings, queued_textures) =
+                    servo_media::player::d3d11_ring::removed_queue_inventory();
                 warn!(
-                    "MEDIARINGS rings={rings} bytes_mb={:.0}",
+                    "MEDIARINGS rings={rings} bytes_mb={:.0} queued_rings={queued_rings} queued_textures={queued_textures}",
                     ring_bytes as f64 / (1024.0 * 1024.0)
                 );
             }
