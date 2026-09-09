@@ -1363,6 +1363,37 @@ impl Paint {
         }
     }
 
+    /// 결과가 필요 없는 일을 페인터에 **보내고 기다리지 않는다.**
+    ///
+    /// ★기다리면 페인터가 렌더 중일 때 그 렌더 뒤에 줄을 선다★ — 실측(로그 43/44)에서
+    /// `update_images` 는 함수 **안**이 초당 2~6ms 인데 감싼 시간은 263ms 였다. 즉 95% 가
+    /// 일이 아니라 페인터 스레드를 기다린 시간이고, 평상시(렌더 3~8ms)에는 호출당 2µs 인
+    /// 것이 애니메이션 때(렌더 50~85ms)는 250µs 가 된다. 영상 프레임은 초당 1,600건이
+    /// 들어오므로 그 대기가 메인 스레드를, 따라서 표출 클럭을 통째로 먹는다.
+    ///
+    /// 순서는 유지된다 — 같은 큐로 들어가므로 뒤이은 blocking 호출도 이 뒤에 선다.
+    pub(crate) fn with_painter_mut_detached(
+        &self,
+        painter_id: PainterId,
+        callback: impl FnOnce(&mut Painter) + Send + 'static,
+    ) {
+        let Some(host) = self
+            .painters
+            .iter()
+            .find(|host| host.painter_id == painter_id)
+        else {
+            return;
+        };
+        match &host.kind {
+            // 스레드가 없으면 기다릴 것도 없다 — 예전과 같이 그 자리에서 돈다.
+            PainterHostKind::Inline(painter) => callback(&mut painter.borrow_mut()),
+            PainterHostKind::Threaded(threaded) => {
+                // 수신구를 버린다: 결과가 없고, 들고 있으면 기다리는 것과 같아진다.
+                let _ = threaded.dispatch(callback);
+            },
+        }
+    }
+
     pub(crate) fn with_painter_mut<R: Send + 'static>(
         &self,
         painter_id: PainterId,
@@ -2280,7 +2311,7 @@ impl Paint {
                 for target_painter_id in target_painter_ids {
                     let updates = updates.clone();
                     let inner_started = Instant::now();
-                    self.with_painter_mut(target_painter_id, move |painter| {
+                    self.with_painter_mut_detached(target_painter_id, move |painter| {
                         painter.update_images(updates)
                     });
                     inner_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
