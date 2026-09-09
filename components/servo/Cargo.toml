@@ -166,6 +166,14 @@ gaol = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 webxr = { workspace = true, optional = true, features = ["glwindow", "headless", "openxr-api"] }
+# winit_wall 예제의 크래시 보고용(`crash_report`). 네이티브 크래시가 나면 스택의
+# 모듈+오프셋을 stderr 로 찍는다 -- 테스트 장비에 심볼이 없어도 여기서 심볼라이즈할 수 있다.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+] }
 
 [target.'cfg(target_env = "ohos")'.dependencies]
 servo-media-ohos = { workspace = true }

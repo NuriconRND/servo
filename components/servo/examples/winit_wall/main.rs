@@ -40,6 +40,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::HasDisplayHandle;
 
+mod crash_report;
 mod tile;
 #[cfg(target_os = "windows")]
 mod vsync_refresh_driver;
@@ -202,6 +203,9 @@ fn parse_url_or_filename(input: &str) -> Result<Url, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // 네이티브 크래시가 나면 스택을 모듈+오프셋으로 stderr 에 남긴다. 무엇보다 먼저 건다 --
+    // 초기화 중에 죽어도 그 스택이 필요하다.
+    crash_report::install();
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install crypto provider");
