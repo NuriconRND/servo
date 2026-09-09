@@ -1964,16 +1964,57 @@ impl GStreamerPlayer {
                                     }
                                     inner.segment_loop_active.set(true);
                                 }
-                                match pipeline.seek(
-                                    1.0,
-                                    gstreamer::SeekFlags::FLUSH |
-                                        gstreamer::SeekFlags::SEGMENT |
-                                        gstreamer::SeekFlags::ACCURATE,
-                                    gstreamer::SeekType::Set,
-                                    position,
-                                    gstreamer::SeekType::None,
-                                    gstreamer::ClockTime::NONE,
-                                ) {
+                                // ★FLUSH 도 ACCURATE 도 걸지 않는다★
+                                //
+                                // 이 seek 이 하는 일은 세그먼트에 SEGMENT 표시를 다는 것
+                                // 뿐이다 -- 끝 위치는 `SeekType::None` 이라 그대로고, 시작
+                                // 위치도 지금 있는 그 자리다. 그런데 `FLUSH` 는 버퍼와
+                                // 디코더 상태를 전부 버리고, `ACCURATE` 는 앞 키프레임부터
+                                // 그 지점까지 다시 디코드하게 만든다. 제자리로 돌아오려고
+                                // 그 값을 다 치르는 것이다.
+                                //
+                                // 그 대가가 화면에 그대로 보였다(log_presentation/02):
+                                // 소스가 바뀌어 영상이 시작되고 0.5 초 뒤 -- 전환 애니메이션이
+                                // 막 끝난 그 자리 -- 에 **215ms 동안 프레임이 한 장도 오지
+                                // 않았다**. 20 초 주기마다 어김없이 되풀이됐다.
+                                //
+                                //   vidarrive_max_ms=216   도착이 216ms 끊겼다(생산 쪽)
+                                //   vidgap_max_ms=200      온 것은 다 내보냈다(합성은 정상)
+                                //   MAINBUSY idle=820ms    엔진은 놀고 있었다
+                                //   "Gapless loop: entered segment mode at 0:00:00.500"
+                                //
+                                // 되감기(`SegmentDone`)는 이미 FLUSH 없이 돌고 있고 그
+                                // 주석이 이유까지 적어 두었다 -- "디코더가 상태를 유지해
+                                // 멈춤 없이 처음으로 넘어간다". 무장도 같은 방식이어야 한다.
+                                //
+                                // 위치를 아예 건드리지 않는 쪽(`SeekType::None`)을 먼저
+                                // 쓰고, 그것을 받지 않는 데뮉서를 만나면 지금 위치로 다시
+                                // 시도한다. 둘 다 실패하면 아래에서 무장을 되돌리므로
+                                // 사양대로 EOS 기반 반복으로 떨어진다(이음매가 생길 뿐
+                                // 재생은 이어진다).
+                                let armed = pipeline
+                                    .seek(
+                                        1.0,
+                                        gstreamer::SeekFlags::SEGMENT,
+                                        gstreamer::SeekType::None,
+                                        gstreamer::ClockTime::NONE,
+                                        gstreamer::SeekType::None,
+                                        gstreamer::ClockTime::NONE,
+                                    )
+                                    .or_else(|_| {
+                                        log::info!(
+                                            "Gapless loop: in-place segment arm refused;                                              retrying at {position}"
+                                        );
+                                        pipeline.seek(
+                                            1.0,
+                                            gstreamer::SeekFlags::SEGMENT,
+                                            gstreamer::SeekType::Set,
+                                            position,
+                                            gstreamer::SeekType::None,
+                                            gstreamer::ClockTime::NONE,
+                                        )
+                                    });
+                                match armed {
                                     Ok(()) => {
                                         log::info!(
                                             "Gapless loop: entered segment mode at {position}"
