@@ -1091,6 +1091,11 @@ impl MediaExternalImages {
                     .collect::<Vec<_>>()
                     .join(" ");
                 warn!("MEDIALOCKSITES {rows}");
+                let (rings, ring_bytes) = servo_media::player::d3d11_ring::ring_inventory();
+                warn!(
+                    "MEDIARINGS rings={rings} bytes_mb={:.0}",
+                    ring_bytes as f64 / (1024.0 * 1024.0)
+                );
             }
             self.lock_window_start = lock_started;
             self.lock_window_calls = 0;

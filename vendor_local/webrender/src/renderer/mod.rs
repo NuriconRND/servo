@@ -478,6 +478,8 @@ thread_local! {
     static WALL_WINDOW_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WALL_WINDOW_LOCK_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static WALL_WINDOW_RENDER_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// GPU 메모리 항목을 마지막으로 남긴 시각.
+    static WALL_MEM_LOG_AT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 #[derive(Debug)]
@@ -1925,6 +1927,33 @@ impl Renderer {
 
         self.profile.set(profiler::TEXTURES_CREATED, self.device.textures_created);
         self.profile.set(profiler::TEXTURES_DELETED, self.device.textures_deleted);
+
+        // servo wall: WebRender 가 GPU 에 들고 있는 것을 항목별로 초당 한 줄.
+        //
+        // ★GPU 가 예산의 65~71% 로 차 있는데(실측, 카드당 7.4GB 중 4.7~5.2GB) 그 안에
+        // 무엇이 들었는지는 아무도 세지 않고 있었다.★ 이 값들은 여기서야 채워지므로,
+        // 앞쪽의 느린-프레임 줄에서 읽으면 늘 0 이 나온다(그렇게 한 번 헛읽었다).
+        {
+            let now = std::time::Instant::now();
+            let due = WALL_MEM_LOG_AT
+                .with(|last| last.get().is_none_or(|at: std::time::Instant| {
+                    now.duration_since(at) >= std::time::Duration::from_secs(1)
+                }));
+            if due {
+                WALL_MEM_LOG_AT.with(|last| last.set(Some(now)));
+                let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
+                log::warn!(
+                    "WRMEM render_targets_mb={:.0} picture_tiles_mb={:.0} atlas_mb={:.0} standalone_mb={:.0} depth_mb={:.0} textures_created={:.0} textures_deleted={:.0}",
+                    get(profiler::RENDER_TARGET_MEM),
+                    get(profiler::PICTURE_TILES_MEM),
+                    get(profiler::ATLAS_TEXTURES_MEM),
+                    get(profiler::STANDALONE_TEXTURES_MEM),
+                    get(profiler::DEPTH_TARGETS_MEM),
+                    get(profiler::TEXTURES_CREATED),
+                    get(profiler::TEXTURES_DELETED),
+                );
+            }
+        }
 
         results.stats.texture_upload_mb = self.profile.get_or(profiler::TEXTURE_UPLOADS_MEM, 0.0);
         self.frame_counter += 1;

@@ -45,6 +45,24 @@ use log::warn;
 /// 경계 깜빡임은 흡수하는 값으로 2초를 쓴다.
 pub const RING_DEMAND_TTL: Duration = Duration::from_secs(2);
 
+/// 지금 살아 있는 링과 그것들이 붙들고 있는 GPU 바이트.
+///
+/// ★GPU 가 예산의 65~71% 로 차 있는데 무엇이 들었는지 세는 곳이 없었다.★ 영상 하나의
+/// 링은 슬롯 4개 × 면 3개이고, 같은 영상이 여러 타일에 보이면 디바이스마다 따로 있다 —
+/// 즉 개수와 바이트를 같이 세지 않으면 규모를 알 수 없다.
+pub fn ring_inventory() -> (usize, u64) {
+    let reg = lock_at(registry(), "ring_inventory");
+    let mut bytes: u64 = 0;
+    for ring in reg.rings.values() {
+        for slot in ring.slots.iter() {
+            for plane in slot.planes.iter().flatten() {
+                bytes += plane.row_bytes as u64 * plane.height.max(0) as u64;
+            }
+        }
+    }
+    (reg.rings.len(), bytes)
+}
+
 /// 링당 슬롯 개수(더블/트리플/쿼드 버퍼링 여유분).
 pub const SLOT_COUNT: usize = 4;
 /// 슬롯당 최대 plane 개수(I420=3, NV12=2).
@@ -413,7 +431,7 @@ fn lock_tracked<'a, T>(
 /// 남는다★ — 획득당 보유가 평상시의 110배라는 것까지는 알아도, 그 안에서 무엇이
 /// 무거워지는지는 사이트별로 갈라야 보인다. 지점 수가 스물둘뿐이라 선형 탐색으로 족하다
 /// (포인터 비교 스물두 번, 잠금 자체보다 훨씬 싸다).
-const SITE_COUNT: usize = 22;
+const SITE_COUNT: usize = 23;
 
 const SITE_NAMES: [&str; SITE_COUNT] = [
     "abandon_slot",
@@ -437,6 +455,7 @@ const SITE_NAMES: [&str; SITE_COUNT] = [
     "remove_group",
     "remove_ring",
     "ring_for",
+    "ring_inventory",
     "stage_first_frame",
 ];
 
