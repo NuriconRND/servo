@@ -1162,9 +1162,39 @@ impl Painter {
             }
         }
 
+        // ★비디오도 같은 규칙을 탄다★
+        //
+        // 위 주석이 세운 규칙 — "값은 매 주기 나가고, 프레임은 이 주기에 아무도 안 냈을 때만
+        // 낸다" — 은 옳은데, 그 주기 생산자가 **애니메이션이 있을 때만** 돌고 있었다. 비디오는
+        // 33ms 마다 새 내용이 도착하는데도 이 경로를 타지 못하고, `update_images` 의 도착
+        // 기반 경로에 따로 얹혀 있었다.
+        //
+        // 그래서 애니메이션이 끝나는 순간 **생산자가 갈린다.** 그 갈아타는 자리가 화면에서
+        // 한 박자 끊김으로 보였다(실측 보고). 프레임을 내는 주체가 바뀌지 않으면 경계도 없다.
+        //
+        // 새 내용이 기다리고 있다는 점에서 비디오는 애니메이션 값과 다르지 않다. 같은 판정을
+        // 그대로 적용한다: 기다리는 것이 있고 이 주기에 아무도 프레임을 내지 않았으면 낸다.
+        // `generate_frame` 이 언제나 쌓인 비디오 프레임을 함께 실어 보내므로, 그 한 번이
+        // 애니메이션 값과 비디오 프레임을 같이 내보낸다.
+        let video_pending = !self.pending_video_frame_updates.borrow().is_empty();
+        if video_pending && !animated_property_frame && !someone_else_is_producing && !painter_busy
+        {
+            let mut transaction = Transaction::new();
+            // 이 프레임은 비디오 때문에 났다. `update_images` 의 게이트가 "남이 내고 있다"를
+            // 판정할 때 자기 자신을 세지 않도록 그 시각은 되돌린다(그 주석 참고).
+            let non_video_before = self.last_non_video_frame_at.get();
+            self.generate_frame(&mut transaction, RenderReasons::SCENE);
+            self.last_non_video_frame_at.set(non_video_before);
+            self.set_display_composite_in_flight(true);
+            self.send_transaction(transaction);
+        }
+
         // Nothing else may be waking this painter: the point of these animations is that
         // they run while script is not producing anything.
-        if still_animating {
+        //
+        // 비디오가 기다리는 동안에도 계속 깨운다 — 위 판정이 주기마다 돌아야 애니메이션이
+        // 끝난 뒤에도 같은 생산자가 이어서 낸다.
+        if still_animating || video_pending {
             self.web_content_animator
                 .wake_for_paint_animation(animation_period);
         }
