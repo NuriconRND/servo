@@ -1139,6 +1139,15 @@ impl PlayerInner {
     }
 
     pub fn stop(&mut self) -> Result<(), PlayerError> {
+        // ★파이프라인을 내리기 전에 MediaStream 과의 연결을 먼저 끊는다★
+        //
+        // 우리 파이프라인이 사라지면 그 안의 proxysrc 도 사라지는데, 그 짝인 proxysink 는
+        // **MediaStream 쪽 파이프라인**에 있고 그쪽은 계속 돈다(캡처 허브가 계속 밀어 넣는다).
+        // 끊어 두지 않으면 그 사이에 이미 없는 짝으로 버퍼가 넘어간다 -- 캡처 표출을 끌 때
+        // 죽던 자리다(자세한 근거는 `ServoMediaStreamSrc::detach_streams`).
+        if let Some(PlayerSource::Stream(ref source)) = self.source {
+            source.detach_streams();
+        }
         match self.player.as_ref() {
             Some(player) => player.stop(),
             None => {

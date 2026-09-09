@@ -57,6 +57,12 @@ mod imp {
         flow_combiner: Arc<Mutex<UniqueFlowCombiner>>,
         has_audio_stream: Arc<AtomicBool>,
         has_video_stream: Arc<AtomicBool>,
+        /// `set_stream` 이 **남의 파이프라인**(MediaStream 쪽)에 심어 둔 proxysink 들.
+        ///
+        /// 이것을 기억해 두지 않으면 끊을 방법이 없다. 그리고 끊지 못하면 플레이어가 죽은
+        /// 뒤에도 그 파이프라인은 계속 돌면서 이미 사라진 proxysrc 로 버퍼를 밀어 넣는다
+        /// -- 캡처 표출을 끌 때 죽던 이유가 그것이다(`detach_streams` 주석).
+        attached_sinks: Mutex<Vec<(gstreamer::Pipeline, gstreamer::Element)>>,
     }
 
     impl ServoMediaStreamSrc {
@@ -92,6 +98,12 @@ mod imp {
             // and connect the media stream proxysink to it.
             self.setup_proxy_src(stream.ty(), &sink, src, only_stream);
 
+            // 끊을 때 되찾을 수 있도록 기억해 둔다(`detach_streams`).
+            self.attached_sinks
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((pipeline.clone(), sink.clone()));
+
             sink.sync_state_with_parent()
                 .map_err(|_| PlayerError::SetStreamFailed)?;
             pipeline
@@ -99,6 +111,63 @@ mod imp {
                 .map_err(|_| PlayerError::SetStreamFailed)?;
 
             Ok(())
+        }
+
+        /// 플레이어가 물러날 때, MediaStream 파이프라인에 심어 둔 proxysink 를 걷어낸다.
+        ///
+        /// ★이 함수가 없어서 캡처 표출을 끌 때 죽었다★
+        ///
+        /// `set_stream` 은 **남의 파이프라인**(MediaStream 이 소유한다)에 proxysink 를 넣고
+        /// 그것을 이 플레이어의 proxysrc 에 물린다. 두 파이프라인은 그 지점에서만 이어져
+        /// 있고, 수명은 서로 모른다.
+        ///
+        /// 실측(log_presentation/05, 22:08:43~45):
+        ///
+        /// ```text
+        /// 22:08:43  MEDIATEARDOWN player drop id=1/2/3 stream_type=Stream
+        /// 22:08:45  MEDIATEARDOWN stream drop ... has_consumer=true   (2 초 뒤)
+        /// -> 0xc0000005 in gstreamer-1.0-0.dll +0x1c79a
+        /// ```
+        ///
+        /// 플레이어가 먼저 죽어 proxysrc 가 사라지는데, MediaStream 파이프라인은 그대로
+        /// PLAYING 이라 캡처 허브가 계속 밀어 넣는다. 그 2 초 동안 proxysink 는 이미 없는
+        /// 짝에게 버퍼를 넘긴다. `media_release_detached_player` 를 끄면 사라지는 이유도
+        /// 이것이다 -- 그 전에는 플레이어가 GC 전까지 살아 있어 이 창이 열리지 않았다.
+        ///
+        /// 그래서 물러나기 전에 **먼저** 끊는다: sink 를 NULL 로 내리고, 링크를 풀고,
+        /// 파이프라인에서 뺀다. MediaStream 자체는 건드리지 않는다 -- 그 스트림은 다시
+        /// 표출되거나 WebRTC 로 나갈 수 있고, 그건 이 플레이어가 정할 일이 아니다.
+        pub fn detach_streams(&self) {
+            let attached = std::mem::take(
+                &mut *self
+                    .attached_sinks
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()),
+            );
+            if attached.is_empty() {
+                return;
+            }
+            // 실제로 끊었는지 다음 실행의 로그로 확인한다 -- 이 줄이 player drop 앞에
+            // 나와야 순서가 맞다.
+            log::warn!(
+                "MEDIATEARDOWN detaching {} proxysink(s) from stream pipelines",
+                attached.len()
+            );
+            for (pipeline, sink) in attached {
+                // 먼저 세운다 -- 내리기 전에 링크를 풀면 흐르던 버퍼가 갈 곳을 잃는다.
+                let _ = sink.set_state(gstreamer::State::Null);
+                if let Some(pad) = sink.static_pad("sink")
+                    && let Some(peer) = pad.peer()
+                {
+                    let _ = peer.unlink(&pad);
+                }
+                if let Err(error) = pipeline.remove(&sink) {
+                    gstreamer::warning!(
+                        self.cat,
+                        "could not remove the proxysink from the stream pipeline: {error}"
+                    );
+                }
+            }
         }
 
         fn setup_proxy_src(
@@ -224,6 +293,7 @@ mod imp {
                 flow_combiner,
                 has_video_stream: Arc::new(AtomicBool::new(false)),
                 has_audio_stream: Arc::new(AtomicBool::new(false)),
+                attached_sinks: Mutex::new(Vec::new()),
             }
         }
     }
@@ -308,8 +378,8 @@ mod imp {
         }
 
         fn set_uri(&self, uri: &str) -> Result<(), glib::Error> {
-            if let Ok(uri) = Url::parse(uri) &&
-                uri.scheme() == "mediastream"
+            if let Ok(uri) = Url::parse(uri)
+                && uri.scheme() == "mediastream"
             {
                 return Ok(());
             }
@@ -339,6 +409,12 @@ impl ServoMediaStreamSrc {
     ) -> Result<(), PlayerError> {
         self.imp()
             .set_stream(stream, self.upcast_ref::<gstreamer::Element>(), only_stream)
+    }
+
+    /// 이 소스가 남의 파이프라인에 심어 둔 proxysink 를 걷어낸다. 플레이어가 물러날 때
+    /// **반드시** 부른다 -- 이유는 `imp::ServoMediaStreamSrc::detach_streams` 주석.
+    pub fn detach_streams(&self) {
+        self.imp().detach_streams();
     }
 }
 
