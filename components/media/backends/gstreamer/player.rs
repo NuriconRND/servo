@@ -1161,6 +1161,40 @@ impl PlayerInner {
         Ok(())
     }
 
+    /// 해체 경로 전용 정리. ★`GstPlay` 에는 아무 것도 큐잉하지 않는다★
+    ///
+    /// `gst_play_pause` 도 `gst_play_stop` 도 **자기 루프 스레드에 큐잉되는 비동기 작업**이다.
+    /// 그것을 걸어 놓고 곧바로 `Play` 를 놓으면, 그 스레드가 나중에 큐를 처리하면서 이미
+    /// 해제된 데이터를 만진다. 실측 스택 두 개가 같은 모양이었다(log_presentation/07, 08):
+    ///
+    /// ```text
+    /// gstplay 루프 스레드 -> g_main_loop_run -> dispatch
+    ///   -> gst_play_pause -> gst_bus_post           -> 0xc0000005
+    ///   -> gst_play_stop  -> g_source_destroy       -> 0xc0000005
+    /// ```
+    ///
+    /// `g_main_loop_quit` 은 **이미 큐에 든 것을 취소하지 않는다.** 그래서 "멈춰 놓고
+    /// 놓는다"는 순서 자체가 성립하지 않는다.
+    ///
+    /// 놓기만 하면 된다 -- `GstPlay` 는 자기 `dispose` 에서 루프를 세우고 스레드를 join 하고
+    /// 파이프라인을 NULL 로 내린다. 우리가 큐에 아무것도 넣지 않으면 경합할 것이 없다.
+    ///
+    /// 직접 만든 파이프라인(`player` 가 `None` 인 uridecodebin3 경로)은 그런 주인이 없으므로
+    /// 여기서 내린다. 그건 동기 호출이라 안전하다.
+    pub fn shut_down(&mut self) {
+        // MediaStream 과의 연결은 파이프라인이 사라지기 전에 끊는다(`detach_streams`).
+        if let Some(PlayerSource::Stream(ref source)) = self.source {
+            source.detach_streams();
+        }
+        if self.player.is_none() {
+            let _ = self.pipeline.set_state(gstreamer::State::Null);
+        }
+        self.paused.set(true);
+        self.can_resume.set(false);
+        self.last_metadata = None;
+        self.source = None;
+    }
+
     pub fn pause(&mut self) -> Result<(), PlayerError> {
         if self.paused.get() {
             return Ok(());
@@ -2980,10 +3014,10 @@ impl Drop for GStreamerPlayer {
         //
         // 이미 준비된 것만 멈춘다. 준비된 적이 없으면 멈출 것도 없다.
         if let Some(inner) = self.inner.borrow().as_ref() {
-            let _ = inner
+            inner
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .stop();
+                .shut_down();
         }
         let (tx_ack, rx_ack) = mpsc::channel();
         let _ = self

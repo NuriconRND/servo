@@ -3291,12 +3291,12 @@ impl HTMLMediaElement {
             return;
         }
 
-        if let Some(ref player) = *self.player.borrow()
-            && let Err(error) = player.lock().unwrap().stop()
-        {
-            error!("Could not stop player: {error:?}");
-        }
-
+        // ★여기서 `stop()` 을 부르지 않는다★
+        //
+        // 백엔드의 `stop` 은 `GstPlay` 의 루프 스레드에 큐잉되는 비동기 작업이고, 바로
+        // 다음 줄에서 그 객체를 놓으면 그 스레드가 이미 해제된 데이터를 만진다(실측 스택
+        // 두 개, log_presentation/07·08). 놓기만 하면 백엔드가 `Drop` 에서 큐를 쓰지 않는
+        // 방식으로 정리한다(`PlayerInner::shut_down`).
         *self.player.borrow_mut() = None;
         self.video_renderer.lock().unwrap().reset();
         *self.event_handler.borrow_mut() = None;
