@@ -17,7 +17,9 @@
 //! textures are always built and indexed in Y,U,V order.
 
 use log::warn;
-use servo_media_player::d3d11_ring::{ClaimedSlot, MAX_PLANES, PlaneDesc, RingPlaneFormat, SLOT_COUNT};
+use servo_media_player::d3d11_ring::{
+    ClaimedSlot, D3D11_TEXTURES_CREATED, MAX_PLANES, PlaneDesc, RingPlaneFormat, SLOT_COUNT,
+};
 use servo_media_player::video::VideoFrameYuvFormat;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM,
@@ -50,12 +52,32 @@ pub fn plane_geoms(format: VideoFrameYuvFormat, width: i32, height: i32) -> Vec<
     let ch = (h + 1) / 2; // ceil(h/2)
     match format {
         VideoFrameYuvFormat::I420 => vec![
-            PlaneGeom { format: RingPlaneFormat::R8, width: w, height: h, row_bytes: w as usize },
-            PlaneGeom { format: RingPlaneFormat::R8, width: cw, height: ch, row_bytes: cw as usize },
-            PlaneGeom { format: RingPlaneFormat::R8, width: cw, height: ch, row_bytes: cw as usize },
+            PlaneGeom {
+                format: RingPlaneFormat::R8,
+                width: w,
+                height: h,
+                row_bytes: w as usize,
+            },
+            PlaneGeom {
+                format: RingPlaneFormat::R8,
+                width: cw,
+                height: ch,
+                row_bytes: cw as usize,
+            },
+            PlaneGeom {
+                format: RingPlaneFormat::R8,
+                width: cw,
+                height: ch,
+                row_bytes: cw as usize,
+            },
         ],
         VideoFrameYuvFormat::NV12 => vec![
-            PlaneGeom { format: RingPlaneFormat::R8, width: w, height: h, row_bytes: w as usize },
+            PlaneGeom {
+                format: RingPlaneFormat::R8,
+                width: w,
+                height: h,
+                row_bytes: w as usize,
+            },
             PlaneGeom {
                 format: RingPlaneFormat::Rg8,
                 width: cw,
@@ -205,7 +227,10 @@ fn create_dynamic_texture(
         MipLevels: 1,
         ArraySize: 1,
         Format: dxgi_format,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE,
@@ -221,6 +246,8 @@ fn create_dynamic_texture(
             );
             return None;
         }
+        // 만든 수를 센다 — 해제 수(`D3D11_TEXTURES_RELEASED`)와 맞아야 회수가 성립한다.
+        D3D11_TEXTURES_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(ComPtr::from_raw(texture))
     }
 }
@@ -260,7 +287,14 @@ pub fn copy_planes(
         // row_pitch × rows bytes. This slot is Writing (claimed by us) so the
         // renderer will not remap it concurrently.
         let dst = unsafe { std::slice::from_raw_parts_mut(mapped.data_ptr as *mut u8, dst_len) };
-        copy_rows(src, src_stride, dst, dst_pitch, mapped.row_bytes, mapped.rows);
+        copy_rows(
+            src,
+            src_stride,
+            dst,
+            dst_pitch,
+            mapped.row_bytes,
+            mapped.rows,
+        );
     }
 }
 
@@ -276,7 +310,11 @@ pub fn planes_to_vecs(
 ) -> Vec<Vec<u8>> {
     use gstreamer_video::VideoFrameExt;
 
-    let geoms = plane_geoms(format, frame.info().width() as i32, frame.info().height() as i32);
+    let geoms = plane_geoms(
+        format,
+        frame.info().width() as i32,
+        frame.info().height() as i32,
+    );
     let mut out = Vec::with_capacity(geoms.len());
     for (p, g) in geoms.iter().enumerate() {
         let rows = g.height.max(0) as usize;

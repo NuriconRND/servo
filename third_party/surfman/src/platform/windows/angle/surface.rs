@@ -11,9 +11,9 @@ use crate::egl::{self, EGLint};
 use crate::gl;
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::error::ToWindowingApiError;
-use crate::platform::generic::egl::ffi::EGL_D3D11_TEXTURE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_D3D_TEXTURE_2D_SHARE_HANDLE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_D3D_TEXTURE_ANGLE;
+use crate::platform::generic::egl::ffi::EGL_D3D11_TEXTURE_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_DIRECT_COMPOSITION_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_DXGI_KEYED_MUTEX_ANGLE;
 use crate::platform::generic::egl::ffi::EGL_EXTENSION_FUNCTIONS;
@@ -22,8 +22,6 @@ use crate::platform::generic::egl::ffi::{EGLClientBuffer, EGLImageKHR};
 use crate::{Error, SurfaceAccess, SurfaceID, SurfaceInfo, SurfaceType};
 
 use euclid::default::Size2D;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use glow::HasContext;
 use log::{info, warn};
 use std::fmt::{self, Debug, Formatter};
@@ -31,11 +29,13 @@ use std::marker::PhantomData;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::Instant;
+use winapi::Interface;
 use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::shared::winerror::{self, S_OK};
 use winapi::um::d3d11;
-use winapi::Interface;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::libloaderapi::{GetModuleHandleW, LoadLibraryW};
 use winapi::um::winbase::INFINITE;
@@ -218,6 +218,12 @@ static IMPORT_REUSED: AtomicU64 = AtomicU64::new(0);
 /// matters here -- the external-image traffic those share with WebGL cannot be
 /// attributed from the log at all.
 static IMPORT_LIVE: AtomicU64 = AtomicU64::new(0);
+/// ★만든 서피스와 부순 서피스를 센다.★ "해제했다" 는 말은 이 둘이 맞아야 성립한다 —
+/// GPU 메모리가 안 내려올 때 가장 먼저 확인할 것이 free 가 정말 불렸는지이고, 지금까지
+/// 그것을 세는 곳이 없었다. 서피스 하나가 벽 크기면 190MB 라, 몇 개가 남았는지가 곧
+/// 몇 백 MB 인지다.
+static SURFACES_CREATED: AtomicU64 = AtomicU64::new(0);
+static SURFACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
 
 /// Account for entries dropped in bulk when a device tears its cache down.
 pub(crate) fn note_imports_released(count: usize) {
@@ -254,7 +260,7 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
     // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
     // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
     warn!(
-        "SURFIMPORT imports={} reused={} ({:.0}%) live={} open_ms={:.1} pbuffer_ms={:.1} \
+        "SURFIMPORT imports={} reused={} ({:.0}%) live={} surfaces_created={} surfaces_destroyed={} surfaces_live={} open_ms={:.1} pbuffer_ms={:.1} \
          query_ms={:.1} acquire_ms={:.1} rest_ms={:.1} (counters cumulative, live is not)",
         count,
         reused,
@@ -264,6 +270,11 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
             0.0
         },
         IMPORT_LIVE.load(Ordering::Relaxed),
+        SURFACES_CREATED.load(Ordering::Relaxed),
+        SURFACES_DESTROYED.load(Ordering::Relaxed),
+        SURFACES_CREATED
+            .load(Ordering::Relaxed)
+            .saturating_sub(SURFACES_DESTROYED.load(Ordering::Relaxed)),
         ms(IMPORT_OPEN_NS.load(Ordering::Relaxed)),
         ms(IMPORT_PBUFFER_NS.load(Ordering::Relaxed)),
         ms(IMPORT_QUERY_NS.load(Ordering::Relaxed)),
@@ -283,6 +294,7 @@ impl Device {
         _: SurfaceAccess,
         surface_type: SurfaceType<NativeWidget>,
     ) -> Result<Surface, Error> {
+        SURFACES_CREATED.fetch_add(1, Ordering::Relaxed);
         match surface_type {
             SurfaceType::Generic { ref size } => self.create_pbuffer_surface(context, size, None),
             SurfaceType::Widget { ref native_widget } => {
@@ -688,9 +700,8 @@ impl Device {
             let gl = &context.gl;
             let previous_texture = gl.get_parameter_texture(gl::TEXTURE_BINDING_2D);
             gl.bind_texture(gl::TEXTURE_2D, Some(gl_texture));
-            let ok =
-                egl.BindTexImage(self.egl_display, local_egl_surface, egl::BACK_BUFFER as _) !=
-                    egl::FALSE;
+            let ok = egl.BindTexImage(self.egl_display, local_egl_surface, egl::BACK_BUFFER as _)
+                != egl::FALSE;
             let error = (!ok).then(|| egl.GetError().to_windowing_api_error());
             gl.bind_texture(gl::TEXTURE_2D, previous_texture);
             match error {
@@ -852,7 +863,7 @@ impl Device {
             Err(_) => {
                 (EGL_EXTENSION_FUNCTIONS.DestroyImageKHR)(self.egl_display, egl_image);
                 return Err(Error::Failed);
-            }
+            },
         };
         gl.bind_texture(gl::TEXTURE_2D, Some(gl_texture));
         (EGL_EXTENSION_FUNCTIONS.ImageTargetTexture2DOES)(gl::TEXTURE_2D, egl_image);
@@ -904,6 +915,7 @@ impl Device {
         if context.id != surface.context_id {
             return Err(Error::IncompatibleSurface);
         }
+        SURFACES_DESTROYED.fetch_add(1, Ordering::Relaxed);
 
         // ★서피스가 사라지면 그 핸들로 들여온 것도 죽는다.★ 리사이즈 등으로 스왑체인이
         // 서피스를 버리는데 캐시가 남아 있으면, 다음 프레임이 이미 파괴된 EGL 서피스를

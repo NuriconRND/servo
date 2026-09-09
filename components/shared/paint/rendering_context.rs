@@ -9,6 +9,10 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
+/// D3D11 텍스처 `Release()` 호출 누계(진단용). 만든 수와 맞아야 '해제했다'가 성립한다.
+pub static D3D11_TEXTURES_RELEASED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use dpi::PhysicalSize;
 use embedder_traits::RefreshDriver;
 use euclid::default::{Rect, Size2D as UntypedSize2D};
@@ -17,9 +21,9 @@ use gleam::gl::{self, Gl};
 use glow::{HasContext, NativeFramebuffer};
 use image::RgbaImage;
 use log::{debug, info, trace, warn};
-use raw_window_handle::{DisplayHandle, WindowHandle};
 #[cfg(windows)]
 use raw_window_handle::RawWindowHandle;
+use raw_window_handle::{DisplayHandle, WindowHandle};
 pub use surfman::Error;
 // Re-exported so external-image consumers (e.g. the WebGPU GPU-direct present path) can hold
 // the `SurfaceTexture` returned by `create_texture_from_shared_handle` without depending on
@@ -30,6 +34,7 @@ use surfman::{
     Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device, GLApi,
     GLVersion, NativeContext, NativeWidget, Surface, SurfaceAccess, SurfaceInfo, SurfaceType,
 };
+use webrender_api::units::{DeviceIntRect, DeviceIntSideOffsets, DevicePixel};
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
 use winapi::Interface;
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
@@ -38,7 +43,6 @@ use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIFactory1};
 use winapi::shared::winerror;
 #[cfg(all(target_os = "windows", feature = "no-wgl"))]
 use wio::com::ComPtr;
-use webrender_api::units::{DeviceIntRect, DeviceIntSideOffsets, DevicePixel};
 
 /// `SERVO_COMPOSITOR_DCOMP`/`gfx_dcomp_mode` 게이트 값의 3 상태. 파싱은 이 타입 하나뿐이다
 /// — 예전에는 surfman의 truthy 판정과 paint의 "surface" 판정이 같은 값을 서로 다른 문법으로
@@ -794,9 +798,9 @@ impl SurfmanRenderingContext {
     ) -> Result<Self, Error> {
         let device = connection.create_device(adapter)?;
 
-        let flags = ContextAttributeFlags::ALPHA |
-            ContextAttributeFlags::DEPTH |
-            ContextAttributeFlags::STENCIL;
+        let flags = ContextAttributeFlags::ALPHA
+            | ContextAttributeFlags::DEPTH
+            | ContextAttributeFlags::STENCIL;
         let gl_api = connection.gl_api();
         let version = match &gl_api {
             GLApi::GLES => surfman::GLVersion { major: 3, minor: 0 },
@@ -1126,6 +1130,9 @@ impl SurfmanRenderingContext {
             if texture == 0 {
                 return;
             }
+            // ★해제 호출이 정말 일어나는지 센다.★ GPU 메모리가 안 내려올 때 가장 먼저
+            // 확인할 것은 free 가 불렸는지인데, 지금까지 그것을 세는 곳이 없었다.
+            D3D11_TEXTURES_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             unsafe {
                 (*(texture as *mut winapi::um::unknwnbase::IUnknown)).Release();
             }
@@ -1143,7 +1150,11 @@ impl SurfmanRenderingContext {
         {
             let device = &self.device.borrow();
             let ptr = device.d3d11_device_ptr();
-            if ptr.is_null() { None } else { Some(ptr as usize) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(ptr as usize)
+            }
         }
         #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
         None
@@ -1428,7 +1439,8 @@ impl RenderingContext for SoftwareRenderingContext {
     }
 
     fn destroy_render_pbuffer(&self, egl_surface: usize) {
-        self.surfman_rendering_info.destroy_render_pbuffer(egl_surface)
+        self.surfman_rendering_info
+            .destroy_render_pbuffer(egl_surface)
     }
 
     fn copy_rows_to_mapped(
@@ -1802,7 +1814,8 @@ impl RenderingContext for WindowRenderingContext {
     }
 
     fn make_render_pbuffer_current(&self, egl_surface: usize) -> bool {
-        self.surfman_context.make_render_pbuffer_current(egl_surface)
+        self.surfman_context
+            .make_render_pbuffer_current(egl_surface)
     }
 
     fn destroy_render_pbuffer(&self, egl_surface: usize) {
@@ -2006,10 +2019,7 @@ impl OffscreenRenderingContext {
     pub fn render_to_parent_callback(&self) -> Option<RenderToParentCallback> {
         let size = self.size.get();
         let size = Size2D::new(size.width as i32, size.height as i32);
-        self.render_to_parent_callback_for_source_rect(Rect::new(
-            Point2D::origin(),
-            size.to_i32(),
-        ))
+        self.render_to_parent_callback_for_source_rect(Rect::new(Point2D::origin(), size.to_i32()))
     }
 
     pub fn render_to_parent_callback_for_source_rect(
@@ -2407,7 +2417,10 @@ mod test {
             VideoEscapeMode::External
         );
         // 제거된 토큰(native)은 안전하게 no-op(off)으로 폴백한다.
-        assert_eq!(parse_video_escape_token(Some("native")), VideoEscapeMode::Off);
+        assert_eq!(
+            parse_video_escape_token(Some("native")),
+            VideoEscapeMode::Off
+        );
         assert_eq!(parse_video_escape_token(Some("1")), VideoEscapeMode::Off); // 미정의 값은 off
         assert_eq!(parse_video_escape_token(Some("")), VideoEscapeMode::Off);
         assert_eq!(parse_video_escape_token(None), VideoEscapeMode::Off);

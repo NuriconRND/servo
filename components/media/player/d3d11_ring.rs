@@ -45,6 +45,12 @@ use log::warn;
 /// 경계 깜빡임은 흡수하는 값으로 2초를 쓴다.
 pub const RING_DEMAND_TTL: Duration = Duration::from_secs(2);
 
+/// D3D11 plane 텍스처 생성 누계(진단용).
+///
+/// ★"해제했다" 는 만든 수와 해제한 수가 맞아야 성립한다.★ GPU 메모리가 안 내려올 때
+/// 가장 먼저 확인할 것이 free 가 정말 불렸는지인데, 지금까지 그것을 세는 곳이 없었다.
+pub static D3D11_TEXTURES_CREATED: AtomicU64 = AtomicU64::new(0);
+
 /// 지금 살아 있는 링과 그것들이 붙들고 있는 GPU 바이트.
 ///
 /// ★GPU 가 예산의 65~71% 로 차 있는데 무엇이 들었는지 세는 곳이 없었다.★ 영상 하나의
