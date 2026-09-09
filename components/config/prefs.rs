@@ -678,6 +678,17 @@ pub struct Preferences {
     /// (링이 아직 없으면 그 프레임을 비운다). 프로듀서가 소비 전까지 **매 프레임** 3MB 를
     /// 복사해 두던 일도 함께 사라진다.
     pub media_ring_stage_first_frame: bool,
+    /// 문서에서 빠진 `<video>`/`<audio>` 요소의 미디어 파이프라인을 놓는다.
+    ///
+    /// 사양은 요소가 문서에서 제거되면 일시정지만 하라고 하는데, 벽에서는 앱이 구성
+    /// 전환마다 요소를 지우고 새로 만든다. 지워진 요소가 GStreamer 파이프라인과 D3D11
+    /// 링을 붙든 채 남으면 그것들이 영영 쌓인다 — 게다가 파이프라인이 콜백으로 요소를
+    /// 잡고 있어서 요소도 수집되지 않는다(서로가 서로를 살리는 사이클). 실측으로 링
+    /// 그룹이 24 → 78 → 156 으로 한 번도 줄지 않았고 커밋 메모리가 24GB 까지 갔다.
+    ///
+    /// 켜 두면 문서에서 빠진 것이 확정된 시점에 파이프라인을 놓고, 다시 문서에 들어오거나
+    /// `play()` 가 불리면 재생 위치를 유지한 채 리소스를 다시 연다.
+    pub media_release_detached_player: bool,
     /// 어느 타일에도 이만큼(ms) 합성되지 않은 WebGL 컨텍스트의 GPU 자원을 놓는다.
     /// `0` 이면 회수하지 않는다(예전 동작).
     ///
@@ -1115,6 +1126,7 @@ impl Preferences {
             media_d3d11_enabled: false,
             media_ring_init_max_per_frame: 1,
             media_ring_stage_first_frame: false,
+            media_release_detached_player: true,
             dom_webgl_idle_context_reclaim_ms: 3000,
             gfx_painter_detached_queue_limit: 8,
             media_sync_group_target: 0,

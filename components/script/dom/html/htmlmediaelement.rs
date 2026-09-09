@@ -98,7 +98,7 @@ use crate::dom::mediaerror::MediaError;
 use crate::dom::mediafragmentparser::MediaFragmentParser;
 use crate::dom::medialist::MediaList;
 use crate::dom::mediastream::MediaStream;
-use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeDamage, NodeTraits, UnbindContext};
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::promise::Promise;
 use crate::dom::texttrack::TextTrack;
@@ -1440,6 +1440,9 @@ pub(crate) struct HTMLMediaElement {
     /// URL of the media resource, if any.
     #[no_trace]
     resource_url: DomRefCell<Option<ServoUrl>>,
+    /// 문서에서 빠졌을 때 플레이어를 놓았는가. 놓았다면 다시 문서에 들어오거나
+    /// `play()` 가 불릴 때 리소스를 다시 연다.
+    player_released_while_detached: Cell<bool>,
     /// URL of the media resource, if the resource is set through the src_object attribute and it
     /// is a blob.
     #[no_trace]
@@ -1587,6 +1590,7 @@ impl HTMLMediaElement {
             current_playback_position: Cell::new(0.),
             official_playback_position: Cell::new(0.),
             default_playback_start_position: Cell::new(0.),
+            player_released_while_detached: Cell::new(false),
             volume: Cell::new(1.0),
             seeking: Cell::new(false),
             current_seek_position: Cell::new(f64::NAN),
@@ -1703,6 +1707,10 @@ impl HTMLMediaElement {
 
     /// <https://html.spec.whatwg.org/multipage/#internal-play-steps>
     fn internal_play_steps(&self, cx: &mut js::context::JSContext) {
+        // 사양 밖: 문서에서 빠져 있는 동안 놓았던 리소스가 있으면 먼저 다시 연다.
+        // (다시 문서에 넣지 않고 곧장 `play()` 하는 경우가 여기로 온다.)
+        self.restore_released_player(cx);
+
         // Step 1. If the media element's networkState attribute has the value NETWORK_EMPTY, invoke
         // the media element's resource selection algorithm.
         if self.network_state.get() == NetworkState::Empty {
@@ -3217,6 +3225,66 @@ impl HTMLMediaElement {
         }
     }
 
+    /// 문서에서 빠진 요소의 미디어 파이프라인을 놓는다.
+    ///
+    /// 사양은 요소가 문서에서 제거되면 **일시정지만** 하라고 하고(`internal_pause_steps`),
+    /// 리소스를 놓으라고는 하지 않는다. 그런데 벽에서는 그 차이가 전부다: 앱이 구성 전환마다
+    /// `<video>` 를 지우고 새로 만드는데, 지워진 요소가 GStreamer 파이프라인과 D3D11 링을
+    /// 그대로 붙들고 있으면 그것들이 영영 쌓인다. 실측(로그 56, 100초):
+    ///
+    /// ```text
+    /// MEDIADOM  live=78  connected=0 detached=78  with_player=54
+    /// MEDIADOM  live=156 connected=0 detached=156 with_player=108
+    /// MEDIADOM  live=234 connected=0 detached=234 with_player=162
+    /// ```
+    ///
+    /// `detached` 도 `with_player` 도 한 번도 줄지 않는다. 게다가 요소 자체도 수집되지
+    /// 않는데, 그건 파이프라인이 콜백으로 요소를 `Trusted` 로 잡고 있어서다 — 플레이어가
+    /// 요소를 살리고 요소가 플레이어를 살리는 사이클이라 GC 가 끊을 수 없다. 링 그룹이
+    /// 24 → 78 → 156 으로 늘어난 것과, 커밋 메모리가 844MB → 24GB 로 간 것이 이것이다.
+    ///
+    /// 그래서 문서에서 빠진 것이 확정된 시점에 파이프라인을 놓는다. 사양이 보장하는 것 —
+    /// `currentTime` 이 유지되고, 다시 넣거나 `play()` 하면 이어서 재생되는 것 — 은
+    /// 재생 위치를 `default_playback_start_position` 에 옮겨 두고 그때 리소스를 다시
+    /// 열어 지킨다(`restore_released_player`). 이것이 상용 브라우저가 하는 일이기도 하다.
+    fn release_player_while_detached(&self) {
+        if !pref!(media_release_detached_player) {
+            return;
+        }
+        if self.player.borrow().is_none() {
+            return;
+        }
+
+        // 다시 열 때 이어서 재생할 지점. `CurrentTime()` 도 이 값을 읽으므로 문서 밖에서도
+        // 스크립트가 보는 `currentTime` 은 그대로다.
+        // 라이브 소스는 이어볼 지점이라는 게 없으므로 위치를 옮기지 않는다 —
+        // 옮기면 다시 열 때 있지도 않은 지점으로 seek 하게 된다.
+        let is_live_stream = self
+            .resource_url
+            .borrow()
+            .as_ref()
+            .is_some_and(is_direct_uri_scheme);
+        let position = self.official_playback_position.get();
+        if position > 0. && !is_live_stream {
+            self.default_playback_start_position.set(position);
+        }
+
+        self.reset_media_player();
+        self.player_released_while_detached.set(true);
+    }
+
+    /// 놓았던 리소스를 다시 연다. 다시 문서에 들어왔거나 `play()` 가 불린 시점에 부른다.
+    fn restore_released_player(&self, cx: &mut js::context::JSContext) {
+        if !self.player_released_while_detached.get() {
+            return;
+        }
+        self.player_released_while_detached.set(false);
+
+        // 재생 위치는 `release_player_while_detached` 가 옮겨 두었고, 로드 알고리즘은 그
+        // 필드를 건드리지 않으므로 리소스가 준비되는 대로 그 지점으로 seek 된다.
+        self.media_element_load_algorithm(cx);
+    }
+
     fn reset_media_player(&self) {
         if self.player.borrow().is_none() {
             return;
@@ -4461,6 +4529,24 @@ impl VirtualMethods for HTMLMediaElement {
         };
     }
 
+    fn bind_to_tree(&self, cx: &mut JSContext, context: &BindContext) {
+        self.super_type().unwrap().bind_to_tree(cx, context);
+
+        // 문서에서 빠졌을 때 놓았던 리소스를 다시 연다. 놓은 적이 없으면 아무 일도 없다.
+        if context.tree_connected && self.player_released_while_detached.get() {
+            let this = Trusted::new(self);
+            self.owner_global()
+                .task_manager()
+                .media_element_task_source()
+                .queue(task!(restore_released_media_player: move |cx| {
+                    let this = this.root();
+                    if this.upcast::<Node>().is_connected() {
+                        this.restore_released_player(cx);
+                    }
+                }));
+        }
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#playing-the-media-resource:remove-an-element-from-a-document>
     fn unbind_from_tree(&self, cx: &mut js::context::JSContext, context: &UnbindContext) {
         self.super_type().unwrap().unbind_from_tree(cx, context);
@@ -4543,6 +4629,9 @@ impl MicrotaskRunnable for MediaElementMicrotask {
                 // Step 3. ⌛ Run the internal pause steps for the media element.
                 elem.internal_pause_steps();
                 elem.stop_live_stream_on_removal();
+                // 사양 밖: 문서에서 빠진 것이 확정된 지점이므로 파이프라인을 놓는다.
+                // 이유는 `release_player_while_detached` 주석 참고.
+                elem.release_player_while_detached();
             },
             &MediaElementMicrotask::Seeked {
                 ref elem,
