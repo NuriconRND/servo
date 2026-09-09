@@ -80,7 +80,21 @@ const VIDEO_SAMPLE_LATE_GAP_MS: f64 = 20.0;
 /// 따라잡지 않는 쪽을 택한 이유: 밀린 만큼을 전속력으로 디코드하면 부하가 더 늘어 더
 /// 밀리는 양의 되먹임이 된다. 늦은 프레임을 버리지 않고 그 지점부터 정상 속도로 잇는 편이
 /// 벽에서는 낫다(영상 간 위상은 어차피 `thread` 페이싱의 비범위다).
-const SINK_PACER_RESYNC_AFTER: Duration = Duration::from_secs(1);
+///
+/// ★1 초는 그 뜻을 못 지켰다★ — 밀린 양이 문턱 아래면 `sleep_before` 는 잠을 아예 건너뛰므로
+/// **밀린 만큼을 전속력으로 쏟아낸다**. 즉 1 초 미만의 공백은 전부 따라잡기가 되고, 위 주석이
+/// 피하려던 바로 그 일이 일어난다. 실측(log_presentation/03): 도착이 379ms 끊긴 다음 1 초에
+/// 30fps 인데 42 장이 도착했고, 화면에서도 "멈췄다가 본래 속도보다 빠르게 잠시 재생"으로
+/// 보였다(사용자 관찰).
+///
+/// 프레임 몇 장치 흔들림은 그대로 흡수하되(그건 따라잡아도 눈에 안 띈다), 그 이상 벌어지면
+/// 따라잡지 않고 그 자리에서 정상 속도로 잇는다. 절대 위치가 조금 밀리는 것은 벽에서 아무도
+/// 보지 않지만, 배속 재생은 바로 보인다.
+const SINK_PACER_RESYNC_AFTER: Duration = Duration::from_millis(150);
+
+/// 되감기까지 이만큼 남았을 때 세그먼트 모드를 무장한다. 무장 seek 이 파이프라인에 한 번의
+/// 끊김을 만들므로, 그 값을 실제로 되감을 영상만 치르게 한다.
+const SEGMENT_ARM_LEAD: gstreamer::ClockTime = gstreamer::ClockTime::from_seconds(3);
 
 /// `media_video_sink_pacing=thread` 일 때 비디오 스트리밍 스레드를 PTS 에 맞춰 재운다.
 ///
@@ -1951,6 +1965,36 @@ impl GStreamerPlayer {
                                     continue;
                                 };
                                 if position < gstreamer::ClockTime::from_mseconds(500) {
+                                    continue;
+                                }
+                                // ★되감기가 가까워졌을 때만 무장한다★
+                                //
+                                // 세그먼트 모드는 **되감는 순간**을 이음매 없이 만들려고
+                                // 있는 것이다. 그런데 무장 자체가 seek 이라 파이프라인에
+                                // 한 번의 끊김을 만든다. 재생 시작 0.5 초에 무장하면 그
+                                // 끊김을 ★되감지도 않을 영상★ 이 매번 치른다 -- 소스가
+                                // 10 초마다 바뀌는 화면에서는 끝까지 가는 일이 없으므로
+                                // 순전히 손해다. 실측으로 그 자리에서 216~379ms 동안
+                                // 프레임이 오지 않았고, 전환 직후 멈춤으로 보였다.
+                                //
+                                // 되감기가 실제로 다가왔을 때 무장한다. 그때는 어차피
+                                // 경계이고, 그 한 번이 이 기능이 사려던 값이다. 길이를
+                                // 모르는 소스(라이브 등)는 예전처럼 곧바로 무장한다 --
+                                // 되감을 지점을 모르니 미룰 근거도 없다.
+                                let duration = inner_for_loop
+                                    .lock()
+                                    .unwrap()
+                                    .last_metadata
+                                    .as_ref()
+                                    .and_then(|metadata| metadata.duration)
+                                    .and_then(|duration| {
+                                        u64::try_from(duration.as_nanos()).ok()
+                                    })
+                                    .map(gstreamer::ClockTime::from_nseconds);
+                                if let Some(duration) = duration &&
+                                    duration > SEGMENT_ARM_LEAD &&
+                                    position < duration - SEGMENT_ARM_LEAD
+                                {
                                     continue;
                                 }
                                 {
