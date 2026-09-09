@@ -15,6 +15,40 @@ pub mod d3d11_ring;
 pub mod metadata;
 pub mod video;
 
+/// 살아 있는 백엔드 플레이어 수. ★"놓았다" 와 "해체됐다" 는 다른 말이다★ -- 스크립트가
+/// 핸들을 놓아도(`MEDIADOM with_player=0`) 백엔드 객체는 자기 파이프라인이 붙들고 있으면
+/// 그대로 산다. 그 차이를 로그에서 직접 못 보면 어느 쪽을 고쳐야 할지 매번 추측하게 된다.
+///
+/// `player` 는 백엔드 플레이어(스크립트가 쥐는 것), `inner` 는 GStreamer 파이프라인을
+/// 소유하는 내부 상태다. 둘이 갈라지면 내부 상태를 붙드는 고리가 남아 있다는 뜻이다.
+pub mod live_counts {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    pub static PLAYERS: AtomicI64 = AtomicI64::new(0);
+    pub static PLAYER_INNERS: AtomicI64 = AtomicI64::new(0);
+
+    pub fn player_created() {
+        PLAYERS.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn player_dropped() {
+        PLAYERS.fetch_sub(1, Ordering::Relaxed);
+    }
+    pub fn inner_created() {
+        PLAYER_INNERS.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inner_dropped() {
+        PLAYER_INNERS.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// `(players, inners)`
+    pub fn snapshot() -> (i64, i64) {
+        (
+            PLAYERS.load(Ordering::Relaxed),
+            PLAYER_INNERS.load(Ordering::Relaxed),
+        )
+    }
+}
+
 use ipc_channel::ipc::{self, IpcSender};
 use serde::{Deserialize, Serialize};
 use servo_media_traits::MediaInstance;

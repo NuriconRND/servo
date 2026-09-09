@@ -20,6 +20,7 @@ use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
 use servo_config::{debug_env, pref};
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
+use servo_media_player::live_counts;
 use servo_media_player::context::PlayerGLContext;
 use servo_media_player::metadata::Metadata;
 use servo_media_player::video::VideoFrameRenderer;
@@ -1479,6 +1480,7 @@ impl GStreamerPlayer {
             Some("Servo player"),
         );
 
+        live_counts::player_created();
         Self {
             id,
             context_id: *context_id,
@@ -1571,6 +1573,7 @@ impl GStreamerPlayer {
         });
 
         let pipeline = pipeline.upcast::<gstreamer::Element>();
+        live_counts::inner_created();
         *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
             player: None,
             _signal_adapter: None,
@@ -1684,7 +1687,10 @@ impl GStreamerPlayer {
             return;
         };
         let observer = self.observer.clone();
-        let inner = inner.clone();
+        // ★Weak★ -- 이 클로저는 파이프라인의 버스에 붙고, 그 파이프라인은 `PlayerInner`
+        // 가 소유한다. 강하게 잡으면 `PlayerInner` -> pipeline -> bus -> 클로저 ->
+        // `PlayerInner` 로 고리가 닫혀 플레이어가 영영 해체되지 않는다.
+        let inner = Arc::downgrade(inner);
         let pipeline_weak = pipeline.downgrade();
         // ★`add_watch` 가 아니라 sync 메시지다★ — `add_watch` 는 스레드 기본
         // MainContext 에 붙고 누군가 그것을 돌려야 콜백이 뜬다. Servo 에는 그 루프가 없어
@@ -1694,6 +1700,9 @@ impl GStreamerPlayer {
         bus.enable_sync_message_emission();
         bus.connect_sync_message(None, move |_, message| {
             use gstreamer::MessageView;
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
             log::info!(
                 "uridecodebin3 bus: {:?} from {:?}",
                 message.type_(),
@@ -2259,6 +2268,7 @@ impl GStreamerPlayer {
             player.set_video_track_enabled(false);
         }
 
+        live_counts::inner_created();
         *self.inner.borrow_mut() = Some(Arc::new(Mutex::new(PlayerInner {
             player: Some(player),
             _signal_adapter: Some(signal_adapter.clone()),
@@ -2299,10 +2309,15 @@ impl GStreamerPlayer {
             let _ = notify!(observer, PlayerEvent::Error(error.to_string()));
         });
 
-        let inner_clone = inner.clone();
+        // ★Weak★ -- 이 클로저는 `PlaySignalAdapter` 에 붙고, 그 어댑터는
+        // `PlayerInner._signal_adapter` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+        let inner_clone = Arc::downgrade(inner);
         let observer = self.observer.clone();
         // Handle `state-changed` signal.
         signal_adapter.connect_state_changed(move |_, play_state| {
+            let Some(inner_clone) = inner_clone.upgrade() else {
+                return;
+            };
             {
                 let mut inner = inner_clone.lock().unwrap();
                 inner.play_state = play_state;
@@ -2327,8 +2342,13 @@ impl GStreamerPlayer {
 
         let observer = self.observer.clone();
         // Handle `position-update` signal.
-        let inner_clone = inner.clone();
+        // ★Weak★ -- 이 클로저는 `PlaySignalAdapter` 에 붙고, 그 어댑터는
+        // `PlayerInner._signal_adapter` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+        let inner_clone = Arc::downgrade(inner);
         signal_adapter.connect_position_updated(move |_, position| {
+            let Some(inner_clone) = inner_clone.upgrade() else {
+                return;
+            };
             // Gapless looping delays segment-mode entry until playback is well underway
             // (see the worker's position gate); this periodic signal retries the entry.
             inner_clone.lock().unwrap().request_segment_loop_entry();
@@ -2338,9 +2358,14 @@ impl GStreamerPlayer {
         });
 
         let observer = self.observer.clone();
-        let inner_clone = inner.clone();
+        // ★Weak★ -- 이 클로저는 `PlaySignalAdapter` 에 붙고, 그 어댑터는
+        // `PlayerInner._signal_adapter` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+        let inner_clone = Arc::downgrade(inner);
         // Handle `seek-done` signal.
         signal_adapter.connect_seek_done(move |_, position| {
+            let Some(inner_clone) = inner_clone.upgrade() else {
+                return;
+            };
             // A regular seek (e.g. the user dragging the scrubber) cancels segment-loop
             // mode; re-enter it once the seek has settled.
             inner_clone.lock().unwrap().request_segment_loop_entry();
@@ -2355,9 +2380,14 @@ impl GStreamerPlayer {
         self.install_gapless_and_sync(&inner);
 
         // Handle `media-info-updated` signal.
-        let inner_clone = inner.clone();
+        // ★Weak★ -- 이 클로저는 `PlaySignalAdapter` 에 붙고, 그 어댑터는
+        // `PlayerInner._signal_adapter` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+        let inner_clone = Arc::downgrade(inner);
         let observer = self.observer.clone();
         signal_adapter.connect_media_info_updated(move |_, info| {
+            let Some(inner_clone) = inner_clone.upgrade() else {
+                return;
+            };
             let Ok(metadata) = metadata_from_media_info(info) else {
                 return;
             };
@@ -2411,9 +2441,14 @@ impl GStreamerPlayer {
         });
 
         // Handle `duration-changed` signal.
-        let inner_clone = inner.clone();
+        // ★Weak★ -- 이 클로저는 `PlaySignalAdapter` 에 붙고, 그 어댑터는
+        // `PlayerInner._signal_adapter` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+        let inner_clone = Arc::downgrade(inner);
         let observer = self.observer.clone();
         signal_adapter.connect_duration_changed(move |_, duration| {
+            let Some(inner_clone) = inner_clone.upgrade() else {
+                return;
+            };
             let duration = duration.map(|duration| {
                 time::Duration::new(
                     duration.seconds(),
@@ -2439,7 +2474,9 @@ impl GStreamerPlayer {
         self.install_video_sink_callbacks(&inner.lock().unwrap().video_sink.clone());
 
         let (receiver, error_handler_id) = {
-            let inner_clone = inner.clone();
+            // ★Weak★ -- 이 클로저는 파이프라인의 시그널에 붙고, 그 파이프라인은
+            // `PlayerInner` 가 소유한다. 강하게 잡으면 고리가 닫힌다.
+            let inner_clone = Arc::downgrade(inner);
             let inner = inner.lock().unwrap();
             let pipeline = inner.pipeline.clone();
 
@@ -2452,6 +2489,7 @@ impl GStreamerPlayer {
             pipeline.connect("source-setup", false, move |args| {
                 let source = args[1].get::<gstreamer::Element>().unwrap();
 
+                let inner_clone = inner_clone.upgrade()?;
                 let mut inner = inner_clone.lock().unwrap();
 
                 // Direct file mode: playbin instantiated its own filesrc, not a ServoSrc.
@@ -2696,8 +2734,19 @@ impl MediaInstance for GStreamerPlayer {
     }
 }
 
+/// ★스크립트가 플레이어를 놓는 것과 파이프라인이 해체되는 것은 다른 사건이다★ --
+/// `PlayerInner` 가 GStreamer 파이프라인을 소유하므로, 이 `Drop` 이 돌지 않으면
+/// 디코더도 링도 스레드도 그대로 남는다. 세어 두지 않으면 "놓았다" 는 로그만 보고
+/// 해체됐다고 오판하게 된다(실제로 그렇게 두 번 오판했다).
+impl Drop for PlayerInner {
+    fn drop(&mut self) {
+        live_counts::inner_dropped();
+    }
+}
+
 impl Drop for GStreamerPlayer {
     fn drop(&mut self) {
+        live_counts::player_dropped();
         let _ = self.stop();
         let (tx_ack, rx_ack) = mpsc::channel();
         let _ = self

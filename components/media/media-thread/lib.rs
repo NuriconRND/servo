@@ -1082,6 +1082,10 @@ impl MediaExternalImages {
             );
             // 보유가 큰 호출 지점 상위 4개. 어느 함수가 자물쇠를 붙잡는지 이름으로 낸다.
             let top = servo_media::player::d3d11_ring::take_top_registry_sites(4);
+            // ★`if !top.is_empty()` 밖이다★ -- 아래 MEDIARINGS 는 락 사이트가 있을
+            // 때만 나가는데, 플레이어가 정말 해체됐는지는 조용한 구간에서도 알아야 한다.
+            let (players_live, inners_live) = servo_media::player::live_counts::snapshot();
+            warn!("MEDIAPLAYERS players={players_live} inners={inners_live}");
             if !top.is_empty() {
                 let rows = top
                     .iter()
