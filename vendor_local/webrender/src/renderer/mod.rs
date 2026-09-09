@@ -1778,10 +1778,18 @@ impl Renderer {
             }
         }
 
+        // servo wall: 여기가 계측 사각지대였다. 447.7ms 짜리 렌더에서 이름 붙은 것이
+        // 11ms 뿐이었고(draw_frame 10.9), `cpu_ms` 는 15.6 이었다 — 즉 일이 아니라
+        // 대기다. 남은 자리가 이 둘뿐이므로 각각 잰다. GPU 프로파일러의 프레임 종료는
+        // GPU 쿼리 결과를 읽는 자리라, 결과를 기다리면 그대로 GPU 동기점이 된다.
+        let wall_unlock_start = std::time::Instant::now();
         self.unlock_external_images(&frame.deferred_resolves);
+        let wall_unlock_ms = wall_unlock_start.elapsed().as_secs_f64() * 1000.0;
 
+        let wall_gpu_profiler_start = std::time::Instant::now();
         let _gm = self.gpu_profiler.start_marker("end frame");
         self.gpu_profiler.end_frame();
+        let wall_gpu_profiler_ms = wall_gpu_profiler_start.elapsed().as_secs_f64() * 1000.0;
 
         let t = self.profile.end_time(profiler::RENDERER_TIME);
         self.profile.end_time_if_started(profiler::TOTAL_FRAME_CPU_TIME);
@@ -1836,9 +1844,11 @@ impl Renderer {
         if t > *WR_SLOW_MS {
             let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
             log::warn!(
-                "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} gpu_cache_resolve_ms={:.1} resolves={} resolve_lock_ms={:.1} resolve_reset_state_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
+                "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} unlock_ms={:.1} gpu_profiler_ms={:.1} gpu_cache_resolve_ms={:.1} resolves={} resolve_lock_ms={:.1} resolve_reset_state_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",
                 t,
                 wall_pre_draw_ms,
+                wall_unlock_ms,
+                wall_gpu_profiler_ms,
                 wall_prepare_gpu_cache_ms,
                 WALL_RESOLVE_COUNT.with(|c| c.get()),
                 WALL_RESOLVE_LOCK_MS.with(|c| c.get()),
