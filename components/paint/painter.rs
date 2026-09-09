@@ -223,6 +223,8 @@ pub(crate) struct Painter {
 
     /// The number of frames pending to receive from WebRender.
     pub(crate) pending_frames: Cell<usize>,
+    /// GPU 메모리를 마지막으로 남긴 시각(초당 한 줄로 묶기 위한 것).
+    last_gpu_memory_log_at: Cell<Option<Instant>>,
 
     /// Frame diagnostics waiting for the corresponding WebRender frame-ready notification.
     pending_frame_diagnostics: RefCell<VecDeque<PendingFrameDiagnostic>>,
@@ -568,6 +570,82 @@ thread_local! {
         RefCell::new(UpdateImagesStats::default());
 }
 
+/// 이 painter 가 쓰는 어댑터의 GPU 메모리 사용량을 초당 한 줄로 남긴다.
+///
+/// ★전환 순간 드라이버 연산 전부가 25~100배 느려지고 CPU 는 거의 쓰지 않는다★ — D3D11
+/// Map(0.08→2.3ms), 텍스처 파괴(0.2→5.9ms), 렌더(cpu_ms 15.6/270ms). 어느 한 경로가
+/// 잘못된 모양이 아니라 드라이버가 막힌 모양이고, 그때 GPU 메모리가 100% 에 근접한다는
+/// 것이 실측으로 보고됐다. 그런데 이 프로세스가 실제로 얼마를 들고 있는지는 아무도 재지
+/// 않고 있었다 — 작업 관리자의 눈금 말고는.
+///
+/// DXGI 가 어댑터별로 예산과 현재 사용량을 알려 준다. 로컬(VRAM)과 논로컬(공유 시스템
+/// 메모리)을 모두 낸다: 벽은 타일마다 다른 GPU 이므로 어느 어댑터가 차는지가 곧 어느
+/// 타일이 막히는지다.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn log_gpu_memory(painter_id: PainterId, device: usize) {
+    use winapi::Interface;
+    use winapi::shared::dxgi::IDXGIDevice;
+    use winapi::shared::dxgi1_4::{
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
+    };
+    use winapi::um::unknwnbase::IUnknown;
+
+    // Safety: `device` 는 이 painter 의 살아 있는 ID3D11Device 포인터다(렌더링 컨텍스트가
+    // 수명을 보장한다). 아래 QueryInterface/GetParent 는 얻은 포인터를 각각 Release 한다.
+    unsafe {
+        let unknown = device as *mut IUnknown;
+        let mut dxgi_device: *mut IDXGIDevice = std::ptr::null_mut();
+        if (*unknown).QueryInterface(
+            &IDXGIDevice::uuidof(),
+            &mut dxgi_device as *mut _ as *mut *mut _,
+        ) < 0
+            || dxgi_device.is_null()
+        {
+            return;
+        }
+        let mut adapter: *mut IDXGIAdapter3 = std::ptr::null_mut();
+        let got_adapter = (*dxgi_device).GetParent(
+            &IDXGIAdapter3::uuidof(),
+            &mut adapter as *mut _ as *mut *mut _,
+        );
+        (*dxgi_device).Release();
+        if got_adapter < 0 || adapter.is_null() {
+            return;
+        }
+        let mut local: DXGI_QUERY_VIDEO_MEMORY_INFO = std::mem::zeroed();
+        let mut non_local: DXGI_QUERY_VIDEO_MEMORY_INFO = std::mem::zeroed();
+        let ok_local =
+            (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) >= 0;
+        let ok_non_local =
+            (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local)
+                >= 0;
+        (*adapter).Release();
+        if !ok_local && !ok_non_local {
+            return;
+        }
+        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let used = mb(local.CurrentUsage);
+        let budget = mb(local.Budget);
+        warn!(
+            "GPUMEM painter={painter_id:?} local_mb={used:.0}/{budget:.0} ({:.0}%) \
+             nonlocal_mb={:.0}/{:.0} reserved_mb={:.0}",
+            if budget > 0.0 {
+                used / budget * 100.0
+            } else {
+                0.0
+            },
+            mb(non_local.CurrentUsage),
+            mb(non_local.Budget),
+            mb(local.CurrentReservation),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn log_gpu_memory(_painter_id: PainterId, _device: usize) {}
+
 impl Painter {
     pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
         let webrender_gl = rendering_context.gleam_gl_api();
@@ -831,6 +909,7 @@ impl Painter {
             rendering_context,
             needs_repaint: Cell::default(),
             pending_frames: Default::default(),
+            last_gpu_memory_log_at: Cell::new(None),
             pending_frame_diagnostics: Default::default(),
             next_diagnostic_frame_id: Cell::new(0),
             last_ready_local_frame_id: Default::default(),
@@ -1367,6 +1446,22 @@ impl Painter {
         self.render_count.set(render_count);
         let local_frame_id = self.last_ready_local_frame_id.get();
         let wall_logical_frame_id = self.last_ready_wall_logical_frame_id.get();
+        // 초당 한 번 GPU 메모리를 남긴다. 전환 구간의 드라이버 정체가 메모리 압박과
+        // 같이 가는지를 보려면 그 눈금이 로그 안에 있어야 한다.
+        {
+            let now = Instant::now();
+            let due = self
+                .last_gpu_memory_log_at
+                .get()
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+            if due {
+                self.last_gpu_memory_log_at.set(Some(now));
+                if let Some(device) = self.rendering_context.media_d3d11_device_handle_borrowed() {
+                    log_gpu_memory(self.painter_id, device);
+                }
+            }
+        }
+
         // 이 스레드의 렌더 프레임 경계를 알린다. 프레임 **안에서** 하는 일에 상한을
         // 두려는 쪽(새 비디오 링의 최초 소비)이 이 값으로 프레임이 바뀐 것을 안다.
         paint_api::render_frame::begin_render_frame();

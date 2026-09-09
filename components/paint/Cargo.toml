@@ -85,6 +85,7 @@ winapi = { workspace = true, features = [
     "dwrite",
     "dxgi",
     "dxgi1_2",
+    "dxgi1_4",
     "dxgiformat",
     "dxgitype",
     "excpt",
