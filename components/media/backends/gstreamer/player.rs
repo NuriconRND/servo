@@ -20,8 +20,8 @@ use ipc_channel::ipc::{IpcReceiver, IpcSender, channel};
 use servo_config::{debug_env, pref};
 use servo_media::MediaInstanceError;
 use servo_media_player::audio::AudioRenderer;
-use servo_media_player::live_counts;
 use servo_media_player::context::PlayerGLContext;
+use servo_media_player::live_counts;
 use servo_media_player::metadata::Metadata;
 use servo_media_player::video::VideoFrameRenderer;
 use servo_media_player::{
@@ -228,25 +228,27 @@ fn log_pipeline_element_added(element: &gstreamer::Element) {
 // pool, which is what lets many <video> tiles decode at once without saturating CPU
 // scheduling (FPS jitter) or memory. `-1`(기본값) leaves the decoder at its automatic thread
 // count so single-video/4K playback is unchanged.
-/// Tune the RTSP elements that playbin3 auto-plugs for an `rtsp://` URI.
+/// Tune the RTSP elements that playbin3/uridecodebin3 auto-plug for an `rtsp://` URI.
 ///
-/// We hand playbin3 nothing but the URI, so every RTSP element arrives with GStreamer's
-/// defaults. Two of those defaults matter enough to expose:
+/// We hand the bin nothing but the URI, so every RTSP element arrives with GStreamer's
+/// defaults. The source's transport settings are not left at those defaults -- see
+/// [`configure_rtsp_source`] for what is applied and why. Two further properties are
+/// pref-gated because they are tuning, not policy:
 ///
 ///   - `rtspsrc latency` defaults to **2000 ms**, and that jitter buffer is what dominates
 ///     time-to-first-frame. Measured against the in-house camera with `gst-launch`: 2.02s at
 ///     the default, 0.76s at `latency=0`, 0.73s at `latency=200`. Hand-assembling the whole
 ///     pipeline instead of using playbin3 was worth only 0.24s by comparison — the lever is
-///     this property, not the pipeline's shape.
+///     this property, not the pipeline's shape. (`media_rtsp_latency_ms`, 기본 `-1` = 유지)
 ///   - `rtph264depay wait-for-keyframe` defaults to **false**, so the depayloader will emit
 ///     slices from mid-GOP. When those reach `h264parse` before the parameter sets do, it
 ///     fails with `Could not decode stream. No caps set` and the element stalls for good
 ///     (there is no retry path). That is the intermittent RTSP failure.
+///     (`media_rtsp_wait_for_keyframe`, 기본 `false` = 유지)
 ///
 /// ★These two pull in opposite directions★ — shrinking the jitter buffer makes it *more*
-/// likely that slices outrun the parameter sets. Both are therefore off by default (`-1` /
-/// `false` = leave GStreamer's value alone), so this function is a no-op unless an operator
-/// opts in, and the two are meant to be evaluated together rather than one at a time.
+/// likely that slices outrun the parameter sets, so they are meant to be evaluated together
+/// rather than one at a time.
 ///
 /// `eprintln!` rather than `log::debug!` on purpose: the in-house GStreamer build caps its
 /// own debug output at WARNING, so `GST_DEBUG=rtspsrc:5` yields nothing and our own stderr is
@@ -255,16 +257,15 @@ fn configure_rtsp_elements(element: &gstreamer::Element) {
     let Some(factory) = element.factory() else {
         return;
     };
-    match factory.name().as_str() {
-        "rtspsrc" => {
-            let latency_ms = pref!(media_rtsp_latency_ms);
-            if latency_ms < 0 {
-                return;
-            }
-            let latency_ms = u32::try_from(latency_ms).unwrap_or(u32::MAX);
-            element.set_property("latency", latency_ms);
-            eprintln!("[RTSP-DIAG] rtspsrc: latency set to {latency_ms}ms");
-        },
+    let name = factory.name();
+    // ★`rtspsrc` 하나로 매칭하면 안 된다★ -- 사내 GStreamer 빌드에는 Rust 플러그인
+    // `rsrtsp` 도 들어 있어(dist 에 `gstrsrtsp.dll`) 랭크에 따라 `rtspsrc2` 가 대신
+    // 붙을 수 있다. 이름으로 하나만 집으면 그 경우에 아래 설정이 통째로 조용히 빠진다.
+    if name.starts_with("rtspsrc") {
+        configure_rtsp_source(element, &name);
+        return;
+    }
+    match name.as_str() {
         "rtph264depay" => {
             if !pref!(media_rtsp_wait_for_keyframe) {
                 return;
@@ -273,6 +274,118 @@ fn configure_rtsp_elements(element: &gstreamer::Element) {
             eprintln!("[RTSP-DIAG] rtph264depay: wait-for-keyframe set to true");
         },
         _ => {},
+    }
+}
+
+/// RTSP 소스의 전송 설정. `rtspsrc` 와, 대신 붙을 수 있는 `rtspsrc2` 를 함께 다룬다.
+///
+///   - `protocols = tcp` (`0x00000004`, `GstRTSPLowerTrans`) -- RTP 를 RTSP 연결 안으로
+///     인터리브해 보낸다. 기본값은 `udp+udp-mcast+tcp`(`0x7`) 라서 UDP 를 먼저 시도하는데,
+///     UDP 는 방화벽/NAT 에 막히면 DESCRIBE 까지 성공해 놓고 데이터가 한 장도 안 오는 형태로
+///     실패한다(타임아웃 뒤에야 TCP 로 내려간다). 벽에서는 그 시간이 그대로 검은 타일이다.
+///   - `do-rtcp = true` -- 기본값과 같지만 명시한다. RTCP 없이는 서버가 살아 있는 수신자를
+///     알 수 없어 세션을 끊는 구현이 있고, 우리 쪽 지터버퍼의 시각 동기도 RTCP SR 을 쓴다.
+///   - `short-header = true` -- RTSP 요청 헤더를 최소한으로 줄인다. 헤더를 다 이해하지
+///     못하는 임베디드 카메라가 있어 상호운용성을 위해 켠다.
+///
+/// pref 로 빼지 않는다 -- 이 셋은 운용 중에 바꿀 튜닝값이 아니라 이 제품이 RTSP 를 여는
+/// 방식 그 자체다. 지터버퍼 크기(`media_rtsp_latency_ms`)와는 성격이 다르다.
+///
+/// `rtspsrc2` 로 대응하면 이렇게 갈린다(사내 빌드 1.28.4.100 에 `gst-inspect` 로 확인):
+///
+/// | 설정           | `rtspsrc`                          | `rtspsrc2`                       |
+/// |----------------|------------------------------------|----------------------------------|
+/// | `protocols`    | 플래그 `GstRTSPLowerTrans`, `"tcp"`| 문자열, 선호 순서. `"tcp"` 로 같음 |
+/// | `do-rtcp`      | Boolean, 기본 true                 | 없음 -- RTCP 를 항상 보낸다       |
+/// | `short-header` | Boolean, 기본 false                | 없음 -- 대응 프로퍼티가 없다      |
+///
+/// 그래서 프로퍼티를 하나하나 확인하고 넣는다. `set_property` 는 없는 프로퍼티에 **패닉**
+/// 하므로, 확인 없이 넣으면 대체 요소가 붙는 순간 프로세스가 죽는다. 값 타입도 함께 본다 --
+/// 두 요소의 `protocols` 는 이름만 같고 타입이 다르다(플래그 대 문자열).
+///
+/// 지금 이 빌드에서 실제로 붙는 것은 `rtspsrc` 다(rank primary(256) 대 rtspsrc2 none(0)).
+/// `rtspsrc2` 분기는 랭크를 올리거나 요소를 직접 지정했을 때를 위한 것이다.
+fn configure_rtsp_source(element: &gstreamer::Element, factory_name: &str) {
+    set_rtsp_enum_if_present(element, factory_name, "protocols", "tcp");
+    set_rtsp_bool_if_present(element, factory_name, "do-rtcp", true);
+    set_rtsp_bool_if_present(element, factory_name, "short-header", true);
+
+    // 지터버퍼는 별개 축이라 기존 pref 를 그대로 둔다(기본 `-1` = GStreamer 기본값 유지).
+    let latency_ms = pref!(media_rtsp_latency_ms);
+    if latency_ms >= 0 {
+        let latency_ms = u32::try_from(latency_ms).unwrap_or(u32::MAX);
+        set_rtsp_u32_if_present(element, factory_name, "latency", latency_ms);
+    }
+}
+
+fn set_rtsp_bool_if_present(
+    element: &gstreamer::Element,
+    factory_name: &str,
+    name: &str,
+    value: bool,
+) {
+    let Some(pspec) = element.find_property(name) else {
+        // `rtspsrc2` 에서는 정상이다 -- 위 표 참고.
+        eprintln!("[RTSP-DIAG] {factory_name}: no {name} property; leaving its default");
+        return;
+    };
+    if pspec.value_type() != glib::Type::BOOL {
+        eprintln!(
+            "[RTSP-DIAG] {factory_name}: {name} is {} , not a boolean; left alone",
+            pspec.value_type()
+        );
+        return;
+    }
+    element.set_property(name, value);
+    eprintln!("[RTSP-DIAG] {factory_name}: {name} set to {value}");
+}
+
+fn set_rtsp_u32_if_present(
+    element: &gstreamer::Element,
+    factory_name: &str,
+    name: &str,
+    value: u32,
+) {
+    let Some(pspec) = element.find_property(name) else {
+        eprintln!("[RTSP-DIAG] {factory_name}: no {name} property; leaving its default");
+        return;
+    };
+    if pspec.value_type() != glib::Type::U32 {
+        eprintln!(
+            "[RTSP-DIAG] {factory_name}: {name} is {}, not a u32; left alone",
+            pspec.value_type()
+        );
+        return;
+    }
+    element.set_property(name, value);
+    eprintln!("[RTSP-DIAG] {factory_name}: {name} set to {value}");
+}
+
+/// 열거/플래그 프로퍼티를 nick 문자열로 설정한다.
+///
+/// `set_property_from_str` 은 문자열을 그 프로퍼티 타입으로 역직렬화하지 못하면 **패닉**한다
+/// (`rtspsrc2` 가 `protocols` 를 문자열 배열로 갖는 식이면 바로 그 경우다). 그래서 먼저
+/// 역직렬화해 보고 성공했을 때만 넣는다.
+fn set_rtsp_enum_if_present(
+    element: &gstreamer::Element,
+    factory_name: &str,
+    name: &str,
+    value: &str,
+) {
+    let Some(pspec) = element.find_property(name) else {
+        eprintln!("[RTSP-DIAG] {factory_name}: no {name} property; leaving its default");
+        return;
+    };
+    match glib::Value::deserialize_with_pspec(value, &pspec) {
+        Ok(deserialized) => {
+            element.set_property_from_value(name, &deserialized);
+            eprintln!("[RTSP-DIAG] {factory_name}: {name} set to {value}");
+        },
+        Err(error) => {
+            eprintln!(
+                "[RTSP-DIAG] {factory_name}: {name} does not accept {value:?} ({error});                  left at its default"
+            );
+        },
     }
 }
 
@@ -1989,20 +2102,23 @@ impl GStreamerPlayer {
         let sink_pacer = Arc::new(Mutex::new(SinkPacer::default()));
         // Creates a closure that renders a frame using the video_renderer
         // Used in the preroll and sample callbacks
-        let prof_on = servo_config::debug_env::string(
-            &servo_config::debug_env::MEDIA_SINK_PROF,
-        )
-        .is_some_and(|value| {
-            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
-        });
+        let prof_on = servo_config::debug_env::string(&servo_config::debug_env::MEDIA_SINK_PROF)
+            .is_some_and(|value| {
+                value == "1"
+                    || value.eq_ignore_ascii_case("true")
+                    || value.eq_ignore_ascii_case("on")
+            });
         let render_sample = {
             let render = self.render.clone();
             // One accumulator per video. Arc<Mutex<..>> because this closure is cloned for the
             // preroll callback and so must be Clone -- and because both callbacks have to add
             // into the same counters. The lock is uncontended (one streaming thread) and costs
             // tens of nanoseconds against stages measured in milliseconds.
-            let stage_prof: Arc<Mutex<Option<SinkStageProf>>> =
-                Arc::new(Mutex::new(if prof_on { Some(SinkStageProf::default()) } else { None }));
+            let stage_prof: Arc<Mutex<Option<SinkStageProf>>> = Arc::new(Mutex::new(if prof_on {
+                Some(SinkStageProf::default())
+            } else {
+                None
+            }));
             let profile_id = self.id;
             let observer = self.observer.clone();
             let sample_diagnostics = sample_diagnostics.clone();
@@ -2035,15 +2151,21 @@ impl GStreamerPlayer {
                         std::thread::sleep(sleep);
                     }
                 }
-                if let Some(p) = prof.as_mut() { p.pace += took(t); }
+                if let Some(p) = prof.as_mut() {
+                    p.pace += took(t);
+                }
 
                 let t = mark(prof_on);
                 sample_diagnostics.lock().unwrap().note_sample(&sample);
-                if let Some(p) = prof.as_mut() { p.diag += took(t); }
+                if let Some(p) = prof.as_mut() {
+                    p.diag += took(t);
+                }
 
                 let t = mark(prof_on);
                 let frame = render.lock().unwrap().get_frame_from_sample(sample);
-                if let Some(p) = prof.as_mut() { p.build += took(t); }
+                if let Some(p) = prof.as_mut() {
+                    p.build += took(t);
+                }
                 let Some(frame) = frame else {
                     return Err(gstreamer::FlowError::Error);
                 };
@@ -2057,7 +2179,9 @@ impl GStreamerPlayer {
                         return Err(gstreamer::FlowError::Flushing);
                     },
                 };
-                if let Some(p) = prof.as_mut() { p.render += took(t); }
+                if let Some(p) = prof.as_mut() {
+                    p.render += took(t);
+                }
 
                 let t = mark(prof_on);
                 let _ = notify!(observer, PlayerEvent::VideoFrameUpdated);
@@ -2759,5 +2883,76 @@ impl Drop for GStreamerPlayer {
                 tx_ack,
             });
         let _ = rx_ack.recv();
+    }
+}
+
+/// RTSP 전송 설정이 실제로 요소에 박히는지 확인한다.
+///
+/// ★플러그인 경로를 주고 돌려야 한다★ -- 테스트 바이너리는 `target/release/deps` 에서
+/// 도는데 GStreamer 플러그인은 거기 없다. 그냥 `cargo test` 하면 두 테스트 모두
+/// `SKIPPED` 를 찍고 초록으로 지나간다(무효 통과).
+///
+/// ```text
+/// $env:GST_PLUGIN_PATH = "F:\gstreamer-inhouse.28.4.100.0\msvc_x86_64\lib\gstreamer-1.0"
+/// cargo test -p servo-media-gstreamer --release rtsp_transport -- --nocapture
+/// ```
+///
+/// `--nocapture` 로 `[RTSP-DIAG]` 여섯 줄이 보이면 진짜로 돈 것이다.
+#[cfg(test)]
+mod rtsp_transport_tests {
+    use glib::translate::ToGlibPtr;
+
+    use super::*;
+
+    /// 요소를 만들 수 없으면 그 확인은 건너뛴다 -- 플러그인이 없는 환경에서 실패하면
+    /// 검사 대상이 아닌 것으로 테스트가 붉어진다.
+    ///
+    /// ★건너뛴 이유를 반드시 찍는다★ -- 조용히 건너뛰면 이 테스트는 아무것도 확인하지
+    /// 않고 초록으로 지나간다. 실제로 처음 돌렸을 때 두 개 다 그렇게 지나갔다.
+    fn make(factory: &str) -> Option<gstreamer::Element> {
+        if let Err(error) = gstreamer::init() {
+            eprintln!("[rtsp-test] SKIPPED: gstreamer::init failed: {error}");
+            return None;
+        }
+        match gstreamer::ElementFactory::make(factory).build() {
+            Ok(element) => Some(element),
+            Err(error) => {
+                eprintln!("[rtsp-test] SKIPPED: cannot make {factory}: {error}");
+                None
+            },
+        }
+    }
+
+    /// `protocols=0x00000004`(TCP), `do-rtcp=true`, `short-header=true`.
+    ///
+    /// 값을 숫자로 확인한다 -- nick 문자열 `"tcp"` 가 어느 비트로 풀리는지가 이 설정의
+    /// 전부이므로, 문자열을 넣었다는 것만 확인하면 아무것도 확인하지 않은 것이다.
+    #[test]
+    fn rtspsrc_gets_tcp_only_transport() {
+        let Some(element) = make("rtspsrc") else {
+            return;
+        };
+        configure_rtsp_source(&element, "rtspsrc");
+
+        // `GstRTSPLowerTrans` 의 Rust 타입은 `gstreamer-rtsp` 크레이트에 있고 여기서는
+        // 의존하지 않으므로, 플래그 값을 숫자로 직접 읽는다.
+        let protocols = element.property_value("protocols");
+        let bits = unsafe { glib::gobject_ffi::g_value_get_flags(protocols.to_glib_none().0) };
+        assert_eq!(bits, 0x0000_0004, "protocols must be TCP only");
+        assert!(element.property::<bool>("do-rtcp"));
+        assert!(element.property::<bool>("short-header"));
+    }
+
+    /// `rtspsrc2` 는 `protocols` 가 **문자열**이고 나머지 둘은 아예 없다. 여기서 패닉하지
+    /// 않는 것이 요점이다 -- `set_property` 는 없는 프로퍼티에 패닉한다.
+    #[test]
+    fn rtspsrc2_gets_the_equivalent_without_panicking() {
+        let Some(element) = make("rtspsrc2") else {
+            return;
+        };
+        configure_rtsp_source(&element, "rtspsrc2");
+        assert_eq!(element.property::<String>("protocols"), "tcp");
+        assert!(element.find_property("do-rtcp").is_none());
+        assert!(element.find_property("short-header").is_none());
     }
 }
