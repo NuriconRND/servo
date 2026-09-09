@@ -350,6 +350,14 @@ impl GStreamerMediaStream {
 
 impl Drop for GStreamerMediaStream {
     fn drop(&mut self) {
+        // 캡처 표출을 끄는 자리에서 크래시가 보고됐다. 해체는 여러 객체가 정해진 순서로
+        // 죽어야 하는 일이라, 어디까지 갔는지가 로그에 남지 않으면 짚을 수가 없다.
+        log::warn!(
+            "MEDIATEARDOWN stream drop type={:?} owns_pipeline={} has_consumer={}",
+            self.type_,
+            self.owns_pipeline,
+            self.capture_consumer.is_some()
+        );
         // 허브 등록을 먼저 놓는다 — 곧 NULL 로 갈 파이프라인에 프레임이
         // 더 들어오지 않게.
         self.capture_consumer = None;

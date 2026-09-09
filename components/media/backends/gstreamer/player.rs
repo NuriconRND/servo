@@ -2956,7 +2956,26 @@ impl Drop for PlayerInner {
 impl Drop for GStreamerPlayer {
     fn drop(&mut self) {
         live_counts::player_dropped();
-        let _ = self.stop();
+        log::warn!(
+            "MEDIATEARDOWN player drop id={} stream_type={:?} was_set_up={}",
+            self.id,
+            self.stream_type,
+            self.inner.borrow().is_some()
+        );
+        // ★해체하는 자리에서 `Player::stop` 을 부르면 안 된다★
+        //
+        // 그 메서드는 `inner_player_proxy!` 로 만들어져 **`setup()` 을 먼저 부른다**. 그래서
+        // 한 번도 준비되지 않은 플레이어(주소만 받고 재생 전에 사라진 것, 캡처 장치를 못 연
+        // 것)를 drop 하면 여기서 playbin 파이프라인을 통째로 **새로 만들고** 곧바로 멈춘다.
+        // 만들어진 것은 아무도 쥐지 않으므로 그대로 샌다.
+        //
+        // 이미 준비된 것만 멈춘다. 준비된 적이 없으면 멈출 것도 없다.
+        if let Some(inner) = self.inner.borrow().as_ref() {
+            let _ = inner
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .stop();
+        }
         let (tx_ack, rx_ack) = mpsc::channel();
         let _ = self
             .backend_chan

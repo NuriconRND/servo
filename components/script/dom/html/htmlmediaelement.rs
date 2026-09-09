@@ -3269,6 +3269,7 @@ impl HTMLMediaElement {
             self.default_playback_start_position.set(position);
         }
 
+        warn!("MEDIATEARDOWN element detached; releasing its player");
         self.reset_media_player();
         self.player_released_while_detached.set(true);
     }
