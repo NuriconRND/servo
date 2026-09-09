@@ -4627,12 +4627,34 @@ impl MicrotaskRunnable for MediaElementMicrotask {
                 if elem.upcast::<Node>().is_connected() {
                     return;
                 }
-                // Step 3. ⌛ Run the internal pause steps for the media element.
-                elem.internal_pause_steps();
-                elem.stop_live_stream_on_removal();
                 // 사양 밖: 문서에서 빠진 것이 확정된 지점이므로 파이프라인을 놓는다.
                 // 이유는 `release_player_while_detached` 주석 참고.
+                //
+                // ★놓는 것이 pause 보다 먼저다★
+                //
+                // `internal_pause_steps` 는 끝에서 `update_media_state` 를 부르고, 그것이
+                // 백엔드에 `pause()` 를 건다. 그런데 `GstPlay` 의 pause 는 **자기 루프
+                // 스레드에 큐잉되는 비동기 작업**이다(stop 은 동기다). 그걸 걸어 놓고 곧바로
+                // `Play` 를 파괴하면, 그 스레드가 나중에 큐를 처리하면서 이미 사라진 버스에
+                // 메시지를 올린다.
+                //
+                // 실측 스택(log_presentation/07)이 그대로 그 순서다:
+                //
+                // ```text
+                // gst_play_loop (스레드) -> g_main_loop_run -> dispatch
+                //   -> gst_play_pause+0x135 -> gst_bus_post -> 0xc0000005
+                // ```
+                //
+                // 먼저 놓으면 `update_media_state` 가 볼 플레이어가 없어 큐잉 자체가
+                // 일어나지 않는다. 스크립트가 보는 것은 그대로다 -- `pause` 이벤트는
+                // 요소의 task source 에 따로 큐잉되므로 영향받지 않는다.
                 elem.release_player_while_detached();
+
+                // Step 3. ⌛ Run the internal pause steps for the media element.
+                elem.internal_pause_steps();
+                // 위에서 놓았으면 플레이어가 없어 no-op 이다(직접 URI 라이브 소스는 그때
+                // 이미 `reset_media_player` 가 멈췄다).
+                elem.stop_live_stream_on_removal();
             },
             &MediaElementMicrotask::Seeked {
                 ref elem,
