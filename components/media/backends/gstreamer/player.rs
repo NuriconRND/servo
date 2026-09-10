@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::time::{self, Duration, Instant};
 
 use byte_slice_cast::AsSliceOf;
@@ -1181,11 +1181,17 @@ impl PlayerInner {
     ///
     /// 직접 만든 파이프라인(`player` 가 `None` 인 uridecodebin3 경로)은 그런 주인이 없으므로
     /// 여기서 내린다. 그건 동기 호출이라 안전하다.
-    pub fn shut_down(&mut self) {
-        // MediaStream 과의 연결은 파이프라인이 사라지기 전에 끊는다(`detach_streams`).
+    /// MediaStream 과의 연결만 끊는다. ★해체를 다른 스레드로 넘기더라도 이것만은 그 자리에서
+    /// 한다★ -- 이 링크가 살아 있는 동안 캡처 허브가 이미 사라질 짝에게 버퍼를 밀어 넣고,
+    /// 그것이 2026-09-10 의 크래시였다. 요소 세 개를 만지는 값싼 일이다.
+    pub fn detach_media_streams(&self) {
         if let Some(PlayerSource::Stream(ref source)) = self.source {
             source.detach_streams();
         }
+    }
+
+    pub fn shut_down(&mut self) {
+        self.detach_media_streams();
         if self.player.is_none() {
             let _ = self.pipeline.set_state(gstreamer::State::Null);
         }
@@ -2996,6 +3002,51 @@ impl Drop for PlayerInner {
     }
 }
 
+/// 플레이어 해체 전용 스레드로 보내는 통로.
+///
+/// 첫 사용 때 스레드 하나를 띄우고 그 뒤로는 계속 쓴다. 순서대로 하나씩 해체하므로 동시에
+/// 수십 개의 GStreamer 파이프라인이 서로 경합하지 않는다(그게 원래 스크립트 스레드에서
+/// 벌어지던 일이다).
+static PLAYER_DISPOSAL: LazyLock<Sender<(usize, StreamType, Arc<Mutex<PlayerInner>>)>> =
+    LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<(usize, StreamType, Arc<Mutex<PlayerInner>>)>();
+        let _ = std::thread::Builder::new()
+            .name(String::from("GstPlayerDisposal"))
+            .spawn(move || {
+                while let Ok((id, stream_type, inner)) = receiver.recv() {
+                    let started = Instant::now();
+                    inner
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .shut_down();
+                    drop(inner);
+                    // 실제로 얼마나 걸렸는지 남긴다 -- 스크립트에서 걷어냈다는 것과 비용이
+                    // 사라졌다는 것은 다른 말이고, 뒤엣것은 여기서만 보인다.
+                    log::warn!(
+                        "MEDIATEARDOWN disposed id={id} stream_type={stream_type:?} ms={:.0}",
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+            });
+        sender
+    });
+
+/// 비싼 해체를 전용 스레드로 넘긴다. 넘기지 못하면(스레드가 없으면) 그 자리에서 놓는다 --
+/// 느릴지언정 새는 것보다는 낫다.
+fn dispose_player_inner_off_thread(
+    id: usize,
+    stream_type: StreamType,
+    inner: Arc<Mutex<PlayerInner>>,
+) {
+    if let Err(returned) = PLAYER_DISPOSAL.send((id, stream_type, inner)) {
+        let (_, _, inner) = returned.0;
+        inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .shut_down();
+    }
+}
+
 impl Drop for GStreamerPlayer {
     fn drop(&mut self) {
         live_counts::player_dropped();
@@ -3013,11 +3064,28 @@ impl Drop for GStreamerPlayer {
         // 만들어진 것은 아무도 쥐지 않으므로 그대로 샌다.
         //
         // 이미 준비된 것만 멈춘다. 준비된 적이 없으면 멈출 것도 없다.
-        if let Some(inner) = self.inner.borrow().as_ref() {
+        //
+        // ★비싼 해체는 이 스레드에서 하지 않는다★
+        //
+        // 이 `Drop` 은 요소가 문서에서 빠질 때 **스크립트 스레드의 마이크로태스크 안에서**
+        // 돈다(`release_player_while_detached`). 그런데 GStreamer 해체 비용은 소스마다
+        // 천차만별이다 -- 실측(log_webgl_memleak_repraise/00): 구성 전환 한 번에 rtsp
+        // 22 개가 사라지면서 **스크립트 태스크 하나가 21.9 초**를 썼고(그중 21.9 초가
+        // 마이크로태스크 배출), 그 동안 벽이 멈춘 것처럼 보였다. 같은 전환에서 파일 비디오
+        // 54 개는 2 초에 끝났다 -- 느린 것은 rtsp 쪽 해체다.
+        //
+        //     MEDIATEARDOWN player drop  01:11:20~22  NetworkUri x22   <- 21.9 초 태스크 안
+        //     MEDIATEARDOWN player drop  01:11:25~27  Seekable   x54   <- 그 뒤 2 초
+        //
+        // 그래서 `PlayerInner` 를 전용 스레드로 넘겨 거기서 놓는다. 스크립트는 즉시 돌아간다.
+        // **MediaStream 링크만은 여기서 끊는다** -- 그것이 살아 있는 동안 캡처 허브가 이미
+        // 사라질 짝에게 버퍼를 밀어 넣고, 그게 2026-09-10 의 크래시였다.
+        if let Some(inner) = self.inner.borrow_mut().take() {
             inner
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .shut_down();
+                .detach_media_streams();
+            dispose_player_inner_off_thread(self.id, self.stream_type, inner);
         }
         let (tx_ack, rx_ack) = mpsc::channel();
         let _ = self
