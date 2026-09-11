@@ -28,8 +28,8 @@ use std::fmt::{self, Debug, Formatter};
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 use winapi::Interface;
@@ -228,6 +228,30 @@ static SURFACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
 /// Account for entries dropped in bulk when a device tears its cache down.
 pub(crate) fn note_imports_released(count: usize) {
     IMPORT_LIVE.fetch_sub(count as u64, Ordering::Relaxed);
+}
+
+/// 파괴된 공유 서피스의 핸들 기록. ★들여온 쪽은 여기를 보고서야 버릴 수 있다★
+///
+/// `destroy_surface` 는 캐시에서 그 핸들을 지우지만 **그 서피스를 소유한 디바이스의 캐시
+/// 뿐이다.** 그런데 이 벽은 WebGL 서피스 하나를 GPU 마다 하나씩, 네 페인터 디바이스로
+/// 들여온다(`create_surface_texture`). 소유자가 서피스를 부숴도 나머지 디바이스의 캐시는
+/// 그 핸들의 EGL 서피스와 GL 텍스처를 그대로 들고 있다.
+///
+/// 실측(log_webgl_memleak_repraise/05): WebGL 구성이 뜰 때마다 `SURFIMPORT live` 가
+/// 정확히 12 씩 늘고 한 번도 줄지 않았다(12 → 24 → 36). 같은 줄의 `surfaces_live` 는 16
+/// 로 고정이다 -- 서피스 자체는 만든 만큼 부쉈고, 들여온 사본만 남는다. 서피스 하나가
+/// 벽 크기면 190MB 라 그 사본들이 곧 GPU 메모리다.
+///
+/// 그래서 파괴를 전역에 남기고, 각 디바이스가 자기 캐시에서 그것들을 버린다. 붙여 넣기만
+/// 하는 목록이라 디바이스는 자기가 어디까지 봤는지만 기억하면 된다.
+static RETIRED_SHARE_HANDLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// 공유 서피스가 파괴됐음을 다른 디바이스들에 알린다.
+fn note_share_handle_retired(share_handle: HANDLE) {
+    RETIRED_SHARE_HANDLES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(share_handle as usize);
 }
 
 static IMPORT_LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -536,6 +560,10 @@ impl Device {
         // 돌려 쓰므로 이 적중률은 사실상 100% 다. 남는 일은 `AcquireSync` 와 `BindTexImage`
         // 뿐이고, 그 둘은 프레임마다 반드시 해야 한다(전자는 생산자와의 동기, 후자는 해제
         // 때 풀리므로).
+        // 다른 디바이스가 부순 서피스의 사본을 여기서 버린다(`RETIRED_SHARE_HANDLES`).
+        // 들여오는 길목이라, 이 디바이스가 다시 일할 때 반드시 지나간다.
+        self.drop_retired_imports();
+
         if self.imported_surfaces.borrow().contains_key(&share_handle) {
             return self.reuse_imported_surface(context, surface, share_handle);
         }
@@ -667,6 +695,40 @@ impl Device {
     ///
     /// `OpenSharedResource`·EGL pbuffer 생성·GL 텍스처 생성이 여기서 빠진다. 실측으로
     /// 한 번 들여오는 비용의 **26%** 다(2026-09-03, `log_webgpu/61`).
+    /// 다른 디바이스가 부순 서피스의 사본을 이 디바이스 캐시에서 버린다.
+    ///
+    /// 전역 기록은 붙여 넣기만 하므로, 지난번에 본 지점부터 끝까지만 훑는다. WebGL 구성
+    /// 하나가 사라질 때 이 디바이스가 버릴 것은 몇 개뿐이고, 대개는 볼 것이 없다.
+    fn drop_retired_imports(&self) {
+        let (retired, total) = {
+            let log = RETIRED_SHARE_HANDLES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let seen = self.retired_imports_seen.get().min(log.len());
+            (log[seen..].to_vec(), log.len())
+        };
+        self.retired_imports_seen.set(total);
+        if retired.is_empty() {
+            return;
+        }
+        let mut dropped = 0usize;
+        for handle in retired {
+            let imported = self
+                .imported_surfaces
+                .borrow_mut()
+                .remove(&(handle as HANDLE));
+            if let Some(imported) = imported {
+                dropped += 1;
+                EGL_FUNCTIONS.with(|egl| unsafe {
+                    egl.DestroySurface(self.egl_display, imported.egl_surface);
+                });
+            }
+        }
+        if dropped > 0 {
+            IMPORT_LIVE.fetch_sub(dropped as u64, Ordering::Relaxed);
+        }
+    }
+
     fn reuse_imported_surface(
         &self,
         context: &Context,
@@ -928,6 +990,9 @@ impl Device {
                     egl.DestroySurface(self.egl_display, imported.egl_surface);
                 });
             }
+            // ★이 디바이스만 지워서는 모자란다★ — 같은 핸들을 들여온 다른 디바이스들이
+            // 아직 사본을 들고 있다. 그쪽은 이 기록을 보고 버린다.
+            note_share_handle_retired(share_handle);
         }
 
         EGL_FUNCTIONS.with(|egl| {

@@ -6,11 +6,11 @@ use super::connection::Connection;
 use super::context::Context;
 use super::surface::dcomp_native_compositor_requested;
 use crate::egl;
-use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLint, EGLSurface};
+use crate::egl::types::{EGLAttrib, EGLDeviceEXT, EGLDisplay, EGLSurface, EGLint};
 use crate::platform::generic::egl::device::EGL_FUNCTIONS;
 use crate::platform::generic::egl::ffi::EGL_DEVICE_EXT;
 use crate::platform::generic::egl::ffi::{
-    EGL_D3D11_DEVICE_ANGLE, EGL_D3D_TEXTURE_ANGLE, EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE,
+    EGL_D3D_TEXTURE_ANGLE, EGL_D3D11_DEVICE_ANGLE, EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE,
     EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE, EGL_EXTENSION_FUNCTIONS, EGL_NO_DEVICE_EXT,
     EGL_PLATFORM_ANGLE_ANGLE, EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE,
     EGL_PLATFORM_ANGLE_D3D_LUID_LOW_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_ANGLE,
@@ -21,25 +21,25 @@ use crate::{Error, GLApi};
 
 use euclid::default::Size2D;
 use log::{info, warn};
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::mem;
 use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::ptr;
 use winapi::Interface;
+use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::shared::dxgi::{self, IDXGIAdapter, IDXGIDevice, IDXGIFactory1};
 use winapi::shared::guiddef::GUID;
 use winapi::shared::minwindef::{BOOL, TRUE, UINT};
 use winapi::shared::winerror::{self, S_OK};
-use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::um::d3d11::{
-    D3D11CreateDevice, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE_DISCARD, D3D11_SDK_VERSION,
+    D3D11_MAP_WRITE_DISCARD, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11CreateDevice,
     ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
 };
-use winapi::um::winnt::HANDLE;
 use winapi::um::d3dcommon::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
+use winapi::um::winnt::HANDLE;
 use wio::com::ComPtr;
 
 const IID_ID3D11_MULTITHREAD: GUID = GUID {
@@ -107,6 +107,9 @@ pub struct Device {
     /// `OpenSharedResource` 1.15ms + EGL pbuffer 1.42ms + GL 텍스처 0.02ms = **26%** 가
     /// 이 캐시로 사라진다. 나머지 74% 는 `AcquireSync` 대기라 캐시로는 줄지 않는다.
     pub(crate) imported_surfaces: RefCell<HashMap<HANDLE, ImportedSurface>>,
+    /// 전역 파괴 기록(`RETIRED_SHARE_HANDLES`)에서 이 디바이스가 어디까지 반영했는지.
+    /// 붙여 넣기만 하는 목록이라 위치 하나면 충분하다.
+    pub(crate) retired_imports_seen: Cell<usize>,
 }
 
 /// 공유 서피스를 한 번 들여온 결과. [`Device::imported_surfaces`] 가 소유한다.
@@ -329,6 +332,7 @@ impl Device {
                     d3d_driver_type,
                     display_is_owned: true,
                     imported_surfaces: RefCell::default(),
+                    retired_imports_seen: Cell::new(0),
                 })
             })
         }
@@ -474,6 +478,7 @@ impl Device {
                     d3d_driver_type,
                     display_is_owned: true,
                     imported_surfaces: RefCell::default(),
+                    retired_imports_seen: Cell::new(0),
                 })
             })
         }
@@ -488,6 +493,7 @@ impl Device {
                 d3d_driver_type: native_device.d3d_driver_type,
                 display_is_owned: false,
                 imported_surfaces: RefCell::default(),
+                retired_imports_seen: Cell::new(0),
             })
         }
     }
@@ -501,6 +507,7 @@ impl Device {
             d3d_driver_type: D3D_DRIVER_TYPE_UNKNOWN,
             display_is_owned: false,
             imported_surfaces: RefCell::default(),
+            retired_imports_seen: Cell::new(0),
         })
     }
 
@@ -779,7 +786,11 @@ impl Drop for Device {
             // GL 텍스처는 지우지 않는다 — 그것을 지우려면 컨텍스트를 current 로 삼아야 하고,
             // 디바이스가 사라지는 시점에는 그 컨텍스트도 이미 없다. 디스플레이가 종료되면서
             // 함께 사라진다.
-            let drained = self.imported_surfaces.borrow_mut().drain().collect::<Vec<_>>();
+            let drained = self
+                .imported_surfaces
+                .borrow_mut()
+                .drain()
+                .collect::<Vec<_>>();
             crate::platform::windows::angle::surface::note_imports_released(drained.len());
             for (_, imported) in drained {
                 EGL_FUNCTIONS.with(|egl| {
@@ -817,11 +828,20 @@ mod present_path_tests {
         assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
         // present-path-fast pair (key followed by FAST value)
         let key = EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib;
-        let pos = a.iter().position(|&x| x == key).expect("present-path key missing");
-        assert_eq!(a[pos + 1], EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib);
+        let pos = a
+            .iter()
+            .position(|&x| x == key)
+            .expect("present-path key missing");
+        assert_eq!(
+            a[pos + 1],
+            EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib
+        );
         // LUID high/low present
         let hk = EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib;
-        let hp = a.iter().position(|&x| x == hk).expect("LUID high key missing");
+        let hp = a
+            .iter()
+            .position(|&x| x == hk)
+            .expect("LUID high key missing");
         assert_eq!(a[hp + 1], 0x1234 as EGLAttrib);
         // WARP device-type attribute must not appear on the LUID branch
         assert!(!a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
@@ -832,8 +852,14 @@ mod present_path_tests {
         let a = luid_display_attribs(D3D_DRIVER_TYPE_WARP, 0, 0, true);
         assert_eq!(*a.last().unwrap(), egl::NONE as EGLAttrib);
         let key = EGL_EXPERIMENTAL_PRESENT_PATH_ANGLE as EGLAttrib;
-        let pos = a.iter().position(|&x| x == key).expect("present-path key missing");
-        assert_eq!(a[pos + 1], EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib);
+        let pos = a
+            .iter()
+            .position(|&x| x == key)
+            .expect("present-path key missing");
+        assert_eq!(
+            a[pos + 1],
+            EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib
+        );
         // WARP branch: device-type WARP present, LUID high absent
         assert!(a.contains(&(EGL_PLATFORM_ANGLE_DEVICE_TYPE_D3D_WARP_ANGLE as EGLAttrib)));
         assert!(!a.contains(&(EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib)));
@@ -849,7 +875,10 @@ mod present_path_tests {
         assert!(!a.contains(&(EGL_EXPERIMENTAL_PRESENT_PATH_FAST_ANGLE as EGLAttrib)));
         // LUID high/low still present with correct values
         let hk = EGL_PLATFORM_ANGLE_D3D_LUID_HIGH_ANGLE as EGLAttrib;
-        let hp = a.iter().position(|&x| x == hk).expect("LUID high key missing");
+        let hp = a
+            .iter()
+            .position(|&x| x == hk)
+            .expect("LUID high key missing");
         assert_eq!(a[hp + 1], 0x1234 as EGLAttrib);
     }
 
