@@ -193,6 +193,30 @@ impl Animations {
         self.root_newly_animating_dom_nodes(&sets);
 
         for (key, set) in sets.iter_mut() {
+            // ***시작은 틱을 기다리면 안 된다.***
+            //
+            // `Pending -> Running` 승급이 일어나는 자리는 여기 말고
+            // `update_for_new_timeline_value` 하나뿐이고, 그건 페인트 refresh driver 가
+            // 보내는 애니메이션 틱을 타고 온다. 그 틱은 두 겹으로 조건부다: 페인트가
+            // 재생 중인 WebView 는 `gfx_paint_side_animation_tick_divisor` 프레임마다
+            // 한 번만 받고, "애니메이션이 있다" 신호가 꺼지면 refresh driver 가 관찰
+            // 자체를 그만둔다(`ANIMTICK stop`). 그 신호는 바로 아래 `sets.retain` 이
+            // 세트를 지운 뒤에 계산되므로, 세트가 한 번 비면 틱이 끊기고, 틱이 끊기면
+            // 그 뒤에 만들어진 애니메이션은 영영 시작하지 못한다.
+            //
+            // 리스타일도 구해 주지 못한다 -- `Animation::update_from_other` 의 승급은
+            // `old_state != Pending` 일 때만 돌기 때문에 이미 Pending 인 것은 몇 번을
+            // 재제출해도 Pending 이다.
+            //
+            // 실측(log_ani_debug/05): sd-anim-85 가 9초 동안 Pending p=0.000 에 머물렀고,
+            // 그동안 그 요소는 첫 키프레임인 translateX(11520) -- 폭 11520 뷰포트의
+            // 완전히 바깥 -- 에 주차되어 벽이 검었다.
+            //
+            // 그래서 승급을 리플로 경로로 옮긴다. 이 함수는 매 리플로 돌고 틱과 무관하다.
+            // 이벤트는 같은 함수가 그대로 쏘므로 `animationstart` 는 유지된다. 페인트측
+            // 틱 억제는 그대로 둔다 -- 그건 *이미 도는* 애니메이션을 진행시키는 얘기이고,
+            // 시작시키는 것과는 별개다.
+            self.start_pending_animations(key, set, now, pipeline_id);
             self.handle_canceled_animations(key, set, now, pipeline_id);
             self.handle_new_animations(key, set, now, pipeline_id);
         }
