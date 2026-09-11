@@ -4,6 +4,7 @@
 
 use std::rc::Rc;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use euclid::default::Size2D;
@@ -86,6 +87,11 @@ pub struct WebGLExternalImages {
     staging: FxHashMap<WebGLSurfaceId, StagingTarget>,
 }
 
+/// 스왑체인이 사라진 뒤에 돌아온 프론트 버퍼 수(진단용). 0 이 아니면 해체와 잠금이
+/// 겹치는 길이 실제로 밟혔다는 뜻이다 -- GPU 메모리가 새는 것은 아니지만(그 자원은
+/// `destroy_context` 가 이미 반환했다) 그 겹침 자체가 다음에 볼 것이다.
+static ORPHANED_FRONT_BUFFERS: AtomicU64 = AtomicU64::new(0);
+
 impl WebGLExternalImages {
     pub fn new(
         painter_id: PainterId,
@@ -147,10 +153,21 @@ impl WebGLExternalImages {
         let (surface_texture, gl_texture, size) = match created {
             Ok(texture) => texture,
             Err(front_buffer) => {
-                self.swap_chains
-                    .get(surface_id)
-                    .expect("Should always have a SwapChain after taking a surface")
-                    .recycle_surface(front_buffer);
+                // 잠금 경로에도 같은 함정이 있다 — 서피스를 집어온 사이에 컨텍스트가
+                // 해체되면 돌려줄 체인이 없다. 이유와 대처는 `unlock_swap_chain` 의
+                // 같은 자리 주석과 같다.
+                match self.swap_chains.get(surface_id) {
+                    Some(swap_chain) => swap_chain.recycle_surface(front_buffer),
+                    None => {
+                        let count = ORPHANED_FRONT_BUFFERS.fetch_add(1, Ordering::Relaxed) + 1;
+                        warn!(
+                            "WebGL external image: no swap chain for {surface_id:?} after taking \
+                             a surface; the context was torn down mid-lock \
+                             (orphaned_total={count})"
+                        );
+                        std::mem::forget(front_buffer);
+                    },
+                }
                 self.mark_surface_not_busy(surface_id);
                 let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
                 return None;
@@ -394,10 +411,35 @@ impl WebGLExternalImages {
         }
         let locked_front_buffer = destroyed?;
 
-        self.swap_chains
-            .get(surface_id)
-            .expect("Should always have a SwapChain for a busy WebGLContext")
-            .recycle_surface(locked_front_buffer);
+        match self.swap_chains.get(surface_id) {
+            Some(swap_chain) => swap_chain.recycle_surface(locked_front_buffer),
+            None => {
+                // ★여기서 패닉하면 안 된다★
+                //
+                // 예전에는 `expect("Should always have a SwapChain for a busy WebGLContext")`
+                // 였다. 그 "always" 가 깨지는 경우가 실제로 있다 -- WebGL 표출을 중단하면
+                // 컨텍스트가 그 자리에서 해체되는데(`release_contexts_of_destroyed_document`),
+                // 그때 이 페인터가 아직 프론트 버퍼를 쥐고 있으면 돌려줄 스왑체인이 없다.
+                //
+                // 대가가 컸다(log_webgl_memleak_repraise/06): 이 패닉이 `main` 에서 나면
+                // 프로세스가 통째로 죽고(크래시 로그도 안 남는다 -- 패닉이지 AV 가 아니다),
+                // `WallTilePainter` 에서 나면 그 타일만 죽어 **초기화 상태의 흰 화면**이
+                // 그대로 남는다(사용자가 본 "4번 타일에 작업표시줄과 흰 화면").
+                //
+                // 이 서피스의 GL 자원은 이미 사라졌다 -- 스왑체인을 부순 쪽이
+                // `destroy_context` 까지 했으므로 GPU 쪽은 그때 반환됐다. 남은 것은 죽은
+                // 핸들을 담은 러스트 구조체뿐인데, `Surface::drop` 은 파괴되지 않은 것을
+                // 보면 패닉하도록 되어 있다. 그래서 잊는다(GPU 메모리를 새게 하는 것이
+                // 아니다). 다만 이 길이 얼마나 밟히는지는 보여야 한다.
+                let count = ORPHANED_FRONT_BUFFERS.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(
+                    "WebGL external image: no swap chain for {surface_id:?} at unlock; \
+                     the context was torn down while this painter held a front buffer \
+                     (orphaned_total={count})"
+                );
+                std::mem::forget(locked_front_buffer);
+            },
+        }
 
         let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
 
