@@ -667,6 +667,13 @@ impl BoxFragment {
                     .push(animation);
                 key
             });
+        if animated_transform.is_none() {
+            paint_animation::note_unbound_transform_value(
+                self.base.tag.map(|tag| tag.node),
+                &reference_frame_data.transform,
+                reference_frame_data.origin.to_webrender(),
+            );
+        }
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
             frame_origin_for_query,

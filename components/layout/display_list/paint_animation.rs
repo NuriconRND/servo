@@ -268,6 +268,46 @@ fn note_gained(animations: &DocumentAnimationSet, node: OpaqueNode, property: u8
     );
 }
 
+/// The transform actually baked into the display list while this node has no binding.
+///
+/// ***Every number so far has been about whether a binding was there, not about what was
+/// drawn instead.*** An unbound reference frame carries the element's own computed
+/// transform, and that value is the whole question: off the side of an 11520px viewport
+/// and the wall is black by construction; at rest and the blank comes from somewhere else
+/// entirely. Logged on the first unbound display list and once a second after that, so a
+/// long blank is sampled without flooding.
+pub(crate) fn note_unbound_transform_value(
+    node: Option<OpaqueNode>,
+    transform: &LayoutTransform,
+    origin: webrender_api::units::LayoutPoint,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    let streak = UNBOUND_STREAK.with(|cell| {
+        cell.borrow()
+            .get(&(node.0 as u64, PROP_TRANSFORM))
+            .copied()
+            .unwrap_or(0)
+    });
+    // 0 means this node never reached the binding code at all (the pref is off, or it has
+    // no tag); those are not the elements in question.
+    if streak == 0 || (streak > 1 && streak % 60 != 0) {
+        return;
+    }
+    let matrix = transform.to_array();
+    log::warn!(
+        "PAINTANIMSTATIC node={} unbound_dls={} origin={:.1}/{:.1} translate={:.1}/{:.1} scale={:.3}",
+        node.0,
+        streak,
+        origin.x,
+        origin.y,
+        matrix[12],
+        matrix[13],
+        matrix[0]
+    );
+}
+
 /// Close the display list: this build's bindings become the previous ones.
 fn roll_binding_edges() {
     let current = BOUND_CURRENT.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
