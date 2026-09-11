@@ -200,7 +200,21 @@ impl Animations {
         // Remove empty states from our collection of states in order to free
         // up space as soon as we are no longer tracking any animations for
         // a node.
-        sets.retain(|_, state| !state.is_empty());
+        //
+        // ***지워진 항목은 레이아웃에서 `not_in_set` 이 되고, 그러면 그 요소는 자기
+        // 스타일로 그려진다.*** 애니메이션이 붙기 전의 자기 스타일이 화면 밖이면 그
+        // 순간부터 벽이 검다. 그래서 무엇이 언제 지워지는지를 남긴다.
+        sets.retain(|key, state| {
+            let keep = !state.is_empty();
+            if !keep {
+                log::warn!(
+                    "ANIMSETDROP node={} pseudo={:?}",
+                    key.node.0,
+                    key.pseudo_element
+                );
+            }
+            keep
+        });
         let have_running_animations = sets.values().any(|state| state.needs_animation_ticks());
 
         self.update_running_animations_presence(window, have_running_animations);
@@ -250,16 +264,43 @@ impl Animations {
         pipeline_id: PipelineId,
     ) {
         for animation in set.animations.iter_mut() {
-            if animation.state == AnimationState::Pending && animation.started_at <= now {
-                animation.state = AnimationState::Running;
-                self.add_animation_event(
-                    key,
-                    animation,
-                    TransitionOrAnimationEventType::AnimationStart,
-                    now,
-                    pipeline_id,
-                );
+            if animation.state != AnimationState::Pending {
+                continue;
             }
+            // ***이 한 줄만이 Pending 을 Running 으로 올린다.***
+            //
+            // `Animation::update_from_other` 는 리스타일마다 상태를 Pending 으로
+            // 되돌려 놓고, 그 함수의 마지막 승급은 `old_state != Pending` 일 때만 돈다 --
+            // 즉 이미 Pending 인 것은 리스타일로는 영영 못 벗어난다. 그래서 여기가
+            // 유일한 출구이고, 여기서 못 올리면 애니메이션은 첫 키프레임에 주차된다.
+            // log_ani_debug/05 의 sd-anim-85 가 9초 동안 그랬고, 그 첫 키프레임이
+            // translateX(11520) -- 뷰포트 폭 한 장 -- 이라 그동안 벽이 검었다.
+            if animation.started_at > now {
+                log::warn!(
+                    "ANIMPENDING name={} stuck_by_ms={:.1} started_at={:.3} now={:.3} delay={:.3}",
+                    animation.name,
+                    (animation.started_at - now) * 1000.0,
+                    animation.started_at,
+                    now,
+                    animation.delay
+                );
+                continue;
+            }
+            animation.state = AnimationState::Running;
+            log::warn!(
+                "ANIMSTART name={} node={} started_at={:.3} now={:.3}",
+                animation.name,
+                key.node.0,
+                animation.started_at,
+                now
+            );
+            self.add_animation_event(
+                key,
+                animation,
+                TransitionOrAnimationEventType::AnimationStart,
+                now,
+                pipeline_id,
+            );
         }
 
         for transition in set.transitions.iter_mut() {
