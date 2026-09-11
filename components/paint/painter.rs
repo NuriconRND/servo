@@ -372,6 +372,12 @@ pub(crate) struct Painter {
     /// How often the animation's values rode along on frames somebody else was producing.
     /// On a wall with video this should be nearly all of them.
     paint_animation_rode_along: Cell<u64>,
+    /// 한 전송에 도로 얹힌 "끝난 애니메이션" 값의 최대 개수(현재 `PAINTANIM` 창 기준).
+    ///
+    /// ***이 수가 0이 아니었던 창이 곧 화면이 검어질 수 있었던 창이다.*** 이 값들을 얹지
+    /// 않으면 그만큼의 키가 그 전송에서 지워져 시작값으로 되돌아간다 -- 검은 화면의 정체다.
+    /// 그래서 이 수는 성능 지표가 아니라 **가설의 증거**다.
+    paint_animation_held_max: Cell<usize>,
     /// When any frame was last generated for this painter, by any path.
     last_frame_generated_at: Cell<Option<Instant>>,
     /// 비디오 프레임이 마지막으로 **도착한** 시각(페인터에 이미지 갱신으로 들어온 시각).
@@ -1048,6 +1054,7 @@ impl Painter {
             last_paint_animation_frame_at: Default::default(),
             paint_animation_skipped_busy: Default::default(),
             paint_animation_rode_along: Default::default(),
+            paint_animation_held_max: Default::default(),
             last_frame_generated_at: Default::default(),
             last_video_arrived_at: Default::default(),
             last_video_presented_at: Default::default(),
@@ -1186,7 +1193,27 @@ impl Painter {
                 .set(self.paint_animation_rode_along.get() + 1);
         }
 
+        // ***이 전송이 남의 값을 지우지 않게 한다.***
+        //
+        // `reset_dynamic_properties` 는 이번에 실린 키만 남기고 나머지를 전부 지우며, 지워진
+        // 키는 바인딩에 구워진 기본값 -- 디스플레이 리스트를 만든 순간의 값 -- 으로 돌아간다.
+        // 그래서 엇갈려 끝나는 애니메이션들 중 먼저 끝난 것은, 아직 도는 것이 값을 밀 때마다
+        // 시작값으로 되돌아간다. 페이드인이면 그게 검은 화면이고, 다음 디스플레이 리스트가 올
+        // 때까지 그대로 있는다.
+        //
+        // 그러니 끝난 값을 여기서 도로 얹는다. 판정(`has_values`/`push_due`/
+        // `animated_property_frame`)은 이미 위에서 끝났으므로 이 값들은 전송을 만들지도,
+        // 프레임을 만들지도 않는다 -- 나가기로 정해진 전송에 얹혀 갈 뿐이다.
+        let mut held_values = 0usize;
         if colors.is_some() || (has_values && push_due) {
+            for renderer in self.webview_renderers.values() {
+                renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                    held_values += pipeline_details
+                        .animations
+                        .append_held_paint_values(&mut floats, &mut transforms);
+                });
+            }
+
             let mut transaction = Transaction::new();
             transaction.reset_dynamic_properties();
             transaction.append_dynamic_properties(DynamicProperties {
@@ -1242,6 +1269,8 @@ impl Painter {
             self.web_content_animator
                 .wake_for_paint_animation(animation_period);
         }
+        self.paint_animation_held_max
+            .set(self.paint_animation_held_max.get().max(held_values));
         self.log_paint_animation_activity(
             now,
             still_animating,
@@ -1277,8 +1306,12 @@ impl Painter {
             return;
         }
         let frames = self.paint_animation_frames.replace(0);
+        let held = self.paint_animation_held_max.replace(0);
         *self.paint_animation_window_start.borrow_mut() = Some(now);
-        if frames == 0 && !animating {
+        // ***held 가 0이 아니면 아무것도 안 움직여도 찍는다.*** 화면이 검어지는 구간은 정확히
+        // 아무 애니메이션도 안 도는 구간이라, `animating` 만 보고 입을 다물면 이 진단은 자기가
+        // 설명해야 할 상태에서만 말이 없어진다.
+        if frames == 0 && !animating && held == 0 {
             return;
         }
         // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
@@ -1308,8 +1341,8 @@ impl Painter {
             .collect::<Vec<_>>()
             .join(",");
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={}              floats=[{}] transforms=[{}]",
-            self.painter_id, animating, frames, rode_along, skipped, sample, transform_sample
+            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={} held={}              floats=[{}] transforms=[{}]",
+            self.painter_id, animating, frames, rode_along, skipped, held, sample, transform_sample
         );
     }
 

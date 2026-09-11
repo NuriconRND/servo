@@ -145,6 +145,74 @@ pub(crate) struct PipelineAnimations {
     /// What layout last told us to keep playing, and the clock it is played against.
     /// Replaced wholesale by every display list -- see [`PaintAnimation`].
     paint: RefCell<Vec<ActivePaintAnimation>>,
+    /// The last value of every paint animation that has stopped playing, kept so that a
+    /// later transaction does not erase it. See [`HeldPaintValues`].
+    held: RefCell<HeldPaintValues>,
+}
+
+/// ***전송 한 번이 안 실린 키를 전부 지운다.***
+///
+/// `Transaction::reset_dynamic_properties` 는 WebRender 의 `SceneProperties` 에서
+/// transform/float/color 맵 셋을 통째로 비우고 **그 트랜잭션에 실린 것만** 다시 채운다
+/// (`webrender/src/scene.rs`, `flush_pending_updates`). 그리고 맵에 없는 키는
+/// `resolve_float`/`resolve_layout_transform` 이 바인딩에 구워진 기본값으로 되돌린다 --
+/// 그 기본값은 **디스플레이 리스트를 만든 순간의 값**이다.
+///
+/// 그래서 먼저 끝난 애니메이션의 키는, 아직 도는 다른 애니메이션이 값을 밀 때마다 화면에서
+/// 시작값으로 되돌아간다. 페이드인이면 투명 -- 즉 검은 화면이다. 되돌아간 값은 다음 디스플레이
+/// 리스트가 올 때까지 그대로 있으므로, 끊긴 길이는 프레임 한 장이 아니라 **초 단위**가 된다.
+///
+/// ***고칠 자리는 "더 자주 보내는 쪽"이 아니라 "지우는 쪽"이다.*** 끝난 값을 매 주기 다시
+/// 밀면 페인터마다 초당 한 주기치 프레임이 더 나가고(`ActivePaintAnimation::running` 주석의
+/// 실측), 그건 비디오 표출을 다시 밀어내는 길이다. 대신 마지막 값을 여기 붙들어 두었다가
+/// **이미 나가기로 정해진 전송에만 얹는다** -- 추가 전송도, 추가 프레임도 없다.
+#[derive(Default)]
+struct HeldPaintValues {
+    floats: Vec<PropertyValue<f32>>,
+    transforms: Vec<PropertyValue<LayoutTransform>>,
+}
+
+/// 한 파이프라인이 붙들 수 있는 값의 상한. 설계의 일부가 아니라 누수 방지턱이다: 키는
+/// 디스플레이 리스트가 다시 선언해 줄 때 비로소 정리되므로(`prune_held`), 다시는 돌아오지
+/// 않는 요소의 키가 쌓일 수 있다. 애니메이션되는 요소가 수십 개인 화면에서는 닿지 않는다.
+const MAX_HELD_PAINT_VALUES: usize = 512;
+
+impl HeldPaintValues {
+    fn hold_float(&mut self, value: PropertyValue<f32>) {
+        match self
+            .floats
+            .iter_mut()
+            .find(|held| held.key.id == value.key.id)
+        {
+            Some(slot) => *slot = value,
+            None => {
+                if self.floats.len() >= MAX_HELD_PAINT_VALUES {
+                    self.floats.remove(0);
+                }
+                self.floats.push(value);
+            },
+        }
+    }
+
+    fn hold_transform(&mut self, value: PropertyValue<LayoutTransform>) {
+        match self
+            .transforms
+            .iter_mut()
+            .find(|held| held.key.id == value.key.id)
+        {
+            Some(slot) => *slot = value,
+            None => {
+                if self.transforms.len() >= MAX_HELD_PAINT_VALUES {
+                    self.transforms.remove(0);
+                }
+                self.transforms.push(value);
+            },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.floats.is_empty() && self.transforms.is_empty()
+    }
 }
 
 /// A [`PaintAnimation`] anchored to this painter's clock.
@@ -214,6 +282,39 @@ impl ActivePaintAnimation {
         }
     }
 
+    /// The instant this animation's own timeline runs out, if it has segments at all.
+    fn ends_at(&self) -> Option<Instant> {
+        let end = match &self.property {
+            PaintAnimationProperty::Opacity(_, segments) => segments.last()?.end,
+            PaintAnimationProperty::Transform(_, segments) => segments.last()?.end,
+        };
+        if !end.is_finite() || end < 0.0 {
+            return None;
+        }
+        self.zero.checked_add(Duration::from_secs_f64(end))
+    }
+
+    /// Sample the value this animation stops at.
+    ///
+    /// Sampled at exactly `ends_at` rather than at `now`: past the end `segment_progress`
+    /// would hand the easing a ratio above one, and an easing curve is only defined on
+    /// [0, 1] -- a cubic-bezier extrapolates, so "the value it finished on" would come out
+    /// as some value it never had.
+    fn sample_final(&self, held: &mut HeldPaintValues) {
+        let Some(end) = self.ends_at() else {
+            return;
+        };
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        self.sample(end, &mut floats, &mut transforms);
+        for value in floats {
+            held.hold_float(value);
+        }
+        for value in transforms {
+            held.hold_transform(value);
+        }
+    }
+
     fn sample(
         &self,
         now: Instant,
@@ -277,14 +378,77 @@ impl PipelineAnimations {
         transforms: &mut Vec<PropertyValue<LayoutTransform>>,
     ) -> bool {
         let mut animations = self.paint.borrow_mut();
-        // A finished animation is dropped rather than kept at its end value: WebRender
-        // holds the last value it was given, and the display list that ends the animation
-        // carries the final value inline anyway.
-        animations.retain(|animation| animation.running(now));
+        let mut held = self.held.borrow_mut();
+        // A finished animation stops being sampled, but its last value is held rather than
+        // forgotten -- see [`HeldPaintValues`] for why forgetting it blanks the element.
+        animations.retain(|animation| {
+            if animation.running(now) {
+                return true;
+            }
+            animation.sample_final(&mut held);
+            false
+        });
         for animation in animations.iter() {
             animation.sample(now, floats, transforms);
         }
         !animations.is_empty()
+    }
+
+    /// Append the values of animations that have stopped, for keys nothing is currently
+    /// animating, and say how many were appended.
+    ///
+    /// ***이 함수는 전송을 만들지 않는다.*** 이미 나가기로 정해진 트랜잭션에만 얹히도록
+    /// 호출되며(`Painter::perform_updates`), 그래서 프레임 생산 판정 -- `has_values`,
+    /// `push_due`, `animated_property_frame`, `still_animating` -- 어느 것에도 들어가지
+    /// 않는다. 전송이 없으면 reset 도 없고, reset 이 없으면 붙들 이유도 없다.
+    ///
+    /// 지금 도는 애니메이션이 먼저다: 같은 키를 둘 다 갖고 있으면 살아 있는 쪽이 옳다.
+    pub(crate) fn append_held_paint_values(
+        &self,
+        floats: &mut Vec<PropertyValue<f32>>,
+        transforms: &mut Vec<PropertyValue<LayoutTransform>>,
+    ) -> usize {
+        let held = self.held.borrow();
+        if held.is_empty() {
+            return 0;
+        }
+        let mut appended = 0;
+        for value in held.floats.iter() {
+            if !floats.iter().any(|live| live.key.id == value.key.id) {
+                floats.push(*value);
+                appended += 1;
+            }
+        }
+        for value in held.transforms.iter() {
+            if !transforms.iter().any(|live| live.key.id == value.key.id) {
+                transforms.push(*value);
+                appended += 1;
+            }
+        }
+        appended
+    }
+
+    /// Drop held values for keys the new display list drives again.
+    ///
+    /// Only those: a key the new list does not mention may still be referenced by the
+    /// scene WebRender is rendering right now -- the new one is not built yet -- and
+    /// dropping it there is the blank this whole mechanism exists to prevent. Keys that
+    /// really are gone age out against [`MAX_HELD_PAINT_VALUES`].
+    fn prune_held(&self, incoming: &[PaintAnimation]) {
+        let mut held = self.held.borrow_mut();
+        if held.is_empty() {
+            return;
+        }
+        for animation in incoming {
+            match &animation.property {
+                PaintAnimationProperty::Opacity(key, _) => {
+                    held.floats.retain(|value| value.key.id != key.id)
+                },
+                PaintAnimationProperty::Transform(key, _) => {
+                    held.transforms.retain(|value| value.key.id != key.id)
+                },
+            }
+        }
     }
 
     /// Whether this pipeline has anything the paint thread is playing on its own.
@@ -304,6 +468,7 @@ impl PipelineAnimations {
     /// exactly when it is worth having.
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
+        self.prune_held(&paint_animations);
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
             .map(|animation| {
@@ -371,5 +536,137 @@ impl CaretAnimation {
             key: self.caret_property_key,
             value,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paint_api::display_list::PaintAnimationEasing;
+
+    use super::*;
+
+    fn opacity_key(id: u64) -> PropertyBindingKey<f32> {
+        PropertyBindingKey::new(id)
+    }
+
+    /// A fade-in that ran `duration` seconds ago and is already over.
+    fn finished_fade(id: u64, duration: f64) -> PaintAnimation {
+        PaintAnimation {
+            property: PaintAnimationProperty::Opacity(
+                opacity_key(id),
+                vec![PaintAnimationSegment {
+                    start: 0.0,
+                    end: duration,
+                    from: 0.0,
+                    to: 1.0,
+                    easing: PaintAnimationEasing::Linear,
+                }],
+            ),
+            // Its zero point is far enough in the past that it has already ended.
+            offset_from_display_list: -(duration * 2.0),
+            complete: true,
+        }
+    }
+
+    /// A fade-in that is only starting now, so it is still playing.
+    fn running_fade(id: u64, duration: f64) -> PaintAnimation {
+        PaintAnimation {
+            offset_from_display_list: 0.0,
+            ..finished_fade(id, duration)
+        }
+    }
+
+    fn sample(animations: &PipelineAnimations) -> (Vec<PropertyValue<f32>>, bool) {
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        let playing =
+            animations.update_paint_animations(Instant::now(), &mut floats, &mut transforms);
+        (floats, playing)
+    }
+
+    /// The defect this whole mechanism exists for: after the animation ends, the next
+    /// transaction must still carry its final value, or WebRender reverts the binding to
+    /// the value baked in at display-list time -- opacity 0 for a fade-in.
+    #[test]
+    fn finished_animation_keeps_its_final_value() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![finished_fade(1, 0.5)]);
+
+        let (floats, playing) = sample(&animations);
+        assert!(!playing, "an animation past its end is not playing");
+        assert!(floats.is_empty(), "and it is no longer sampled");
+
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        let appended = animations.append_held_paint_values(&mut floats, &mut transforms);
+        assert_eq!(appended, 1);
+        assert_eq!(floats.len(), 1);
+        assert_eq!(floats[0].key.id, opacity_key(1).id);
+        assert_eq!(
+            floats[0].value, 1.0,
+            "the value it finished on, not the one it started from"
+        );
+    }
+
+    /// Holding a value must never let it overwrite one that is still moving.
+    #[test]
+    fn a_running_animation_wins_over_a_held_value() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![finished_fade(1, 0.5), finished_fade(2, 0.5)]);
+        sample(&animations);
+
+        // Key 1 is being animated right now; key 2 is only held. Appending key 2 and not
+        // key 1 is what proves the skip was a decision and not an empty held set.
+        let mut floats = vec![PropertyValue {
+            key: opacity_key(1),
+            value: 0.25,
+        }];
+        let mut transforms = Vec::new();
+        assert_eq!(
+            animations.append_held_paint_values(&mut floats, &mut transforms),
+            1
+        );
+        assert_eq!(floats.len(), 2);
+        assert_eq!(floats[0].value, 0.25, "the live value is left alone");
+        assert_eq!(floats[1].key.id, opacity_key(2).id);
+    }
+
+    /// A new display list that drives the key again takes the value back; one that says
+    /// nothing about a key leaves it held, because the scene being rendered right now may
+    /// still be the old one.
+    #[test]
+    fn a_new_display_list_reclaims_only_the_keys_it_drives() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![finished_fade(1, 0.5), finished_fade(2, 0.5)]);
+        sample(&animations);
+
+        animations.install_paint_animations(vec![running_fade(1, 10.0)]);
+
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        animations.append_held_paint_values(&mut floats, &mut transforms);
+        assert_eq!(
+            floats.len(),
+            1,
+            "key 1 is driven again; key 2 is still held"
+        );
+        assert_eq!(floats[0].key.id, opacity_key(2).id);
+    }
+
+    /// The held set is a value cache, not a queue: replaying the same key must not grow it.
+    #[test]
+    fn holding_the_same_key_twice_replaces_it() {
+        let animations = PipelineAnimations::default();
+        for _ in 0..3 {
+            animations.install_paint_animations(vec![finished_fade(1, 0.5)]);
+            sample(&animations);
+        }
+
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        assert_eq!(
+            animations.append_held_paint_values(&mut floats, &mut transforms),
+            1
+        );
     }
 }
