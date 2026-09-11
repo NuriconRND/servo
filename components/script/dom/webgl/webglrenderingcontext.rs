@@ -239,11 +239,14 @@ pub(crate) fn report_live_contexts() {
                 let identity = &*document as *const Document as usize;
                 if !documents.contains(&identity) {
                     documents.push(identity);
-                    if document
-                        .window()
-                        .window_proxy()
-                        .is_browsing_context_discarded()
-                    {
+                    // ★`window_proxy()` 를 쓰면 안 된다★ — 그 접근자는 브라우징 컨텍스트가
+                    // 버려진 뒤에 부르면 `unwrap` 으로 **패닉한다**(그 함수의 doc 주석이
+                    // 그렇게 적혀 있다). 즉 여기서 찾으려는 바로 그 상태에서 죽는다.
+                    // 실측: 스크립트 스레드가 그 자리에서 죽어 화면이 검게 서고 그 뒤
+                    // 아무 명령도 먹지 않았다(log_webgl_memleak_repraise/02).
+                    //
+                    // 프록시가 아예 없는 것 자체가 "버려졌다"는 신호이므로 그렇게 읽는다.
+                    if document.window().undiscarded_window_proxy().is_none() {
                         discarded_documents += 1;
                     }
                     if ScriptThread::find_document(document.window().pipeline_id()).is_none() {
