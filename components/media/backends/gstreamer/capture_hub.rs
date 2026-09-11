@@ -97,29 +97,107 @@ pub struct DeviceHub {
     healthy: Arc<AtomicBool>,
 }
 
+/// 소비자 하나의 공유 상태. ★허브는 나중에 붙을 수 있다★
+///
+/// 장치를 여는 것이 스크립트 스레드를 막던 자리라(`open_video_consumer_detached` 주석),
+/// appsrc 는 먼저 만들어 `MediaStream` 에 물리고 허브 합류는 배경에서 끝낸다. 그 사이
+/// 이 소비자는 존재하지만 조용하다.
+struct ConsumerBinding {
+    appsrc: AppSrc,
+    /// 붙은 허브와 그 안에서의 소비자 번호. 아직 안 붙었으면 `None`.
+    attached: Mutex<Option<(Arc<DeviceHub>, u64)>>,
+    /// 소비자가 이미 버려졌는가. 배경 작업이 그때는 등록하지 않는다(등록했으면 되돌린다).
+    released: AtomicBool,
+}
+
 /// 허브에 등록된 소비자 하나. drop 되면 명단에서 빠진다. 장치는 그대로 열려 있다.
 pub struct CaptureConsumer {
-    hub: Arc<DeviceHub>,
-    id: u64,
-    appsrc: AppSrc,
+    binding: Arc<ConsumerBinding>,
 }
 
 impl CaptureConsumer {
-    /// 이 소비자의 `MediaStream` 을 먹일 소스 엘리먼트.
+    /// 이 소비자의 `MediaStream` 을 먹일 소스 엘리먼트. ★허브가 붙기 전에도 유효하다★ —
+    /// 파이프라인은 이것으로 먼저 만들어지고, 프레임은 허브가 붙은 뒤부터 들어온다.
     pub fn source_element(&self) -> gstreamer::Element {
-        self.appsrc.clone().upcast()
+        self.binding.appsrc.clone().upcast()
     }
 
     #[cfg(test)]
-    pub(crate) fn hub(&self) -> &Arc<DeviceHub> {
-        &self.hub
+    pub(crate) fn hub(&self) -> Arc<DeviceHub> {
+        self.binding
+            .attached
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|(hub, _)| hub.clone())
+            .expect("the consumer is not attached to a hub")
     }
 }
 
 impl Drop for CaptureConsumer {
     fn drop(&mut self) {
-        self.hub.remove_consumer(self.id);
+        // 먼저 세운다 — 배경 작업이 이 뒤에 등록을 끝내면 그쪽이 스스로 되돌린다.
+        self.binding.released.store(true, Ordering::Relaxed);
+        let attached = self
+            .binding
+            .attached
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some((hub, id)) = attached {
+            hub.remove_consumer(id);
+        }
     }
+}
+
+/// 소비자가 프레임을 받아갈 `appsrc`. 허브와 무관하게 만들 수 있다.
+fn make_consumer_appsrc() -> Option<AppSrc> {
+    let appsrc = gstreamer::ElementFactory::make("appsrc")
+        .property("is-live", true)
+        // 소비자가 한참 뒤에 합류해도 타임스탬프가 튀지 않도록, 자기
+        // 파이프라인의 running time 으로 다시 찍게 한다.
+        .property("do-timestamp", true)
+        .build()
+        .ok()?
+        .downcast::<AppSrc>()
+        .ok()?;
+    appsrc.set_format(gstreamer::Format::Time);
+    appsrc.set_stream_type(AppStreamType::Stream);
+    appsrc.set_max_bytes(0);
+    let element: &gstreamer::Element = appsrc.upcast_ref();
+    set_u64_if_present(element, "max-buffers", CONSUMER_MAX_BUFFERS);
+    // 밀린 소비자는 장치를 막는 대신 자기 프레임을 버린다.
+    set_enum_if_present(element, "leaky-type", "downstream");
+    Some(appsrc)
+}
+
+/// 허브 없이 소비자를 만든다. 합류는 `attach_binding` 이 나중에 한다.
+fn new_detached_binding() -> Option<Arc<ConsumerBinding>> {
+    Some(Arc::new(ConsumerBinding {
+        appsrc: make_consumer_appsrc()?,
+        attached: Mutex::new(None),
+        released: AtomicBool::new(false),
+    }))
+}
+
+/// 이미 만들어 둔 소비자를 허브에 붙인다. 그 사이에 버려졌으면 붙이지 않는다.
+fn attach_binding(binding: &Arc<ConsumerBinding>, hub: &Arc<DeviceHub>) {
+    if binding.released.load(Ordering::Relaxed) {
+        return;
+    }
+    let id = hub.attach_appsrc(&binding.appsrc);
+    let mut slot = binding
+        .attached
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // 잠금 안에서 다시 본다 — 등록하는 사이에 버려졌을 수 있고, 그때는 `Drop` 이 이미
+    // 지나갔으므로 아무도 이 등록을 치우지 않는다.
+    if binding.released.load(Ordering::Relaxed) {
+        drop(slot);
+        hub.remove_consumer(id);
+        return;
+    }
+    *slot = Some((hub.clone(), id));
 }
 
 /// 없을 수도 있는 프로퍼티를 안전하게 설정한다. `set_property` 는 없는
@@ -271,23 +349,13 @@ impl DeviceHub {
     }
 
     fn add_consumer(self: &Arc<Self>) -> Option<CaptureConsumer> {
-        let appsrc = gstreamer::ElementFactory::make("appsrc")
-            .property("is-live", true)
-            // 소비자가 한참 뒤에 합류해도 타임스탬프가 튀지 않도록, 자기
-            // 파이프라인의 running time 으로 다시 찍게 한다.
-            .property("do-timestamp", true)
-            .build()
-            .ok()?
-            .downcast::<AppSrc>()
-            .ok()?;
-        appsrc.set_format(gstreamer::Format::Time);
-        appsrc.set_stream_type(AppStreamType::Stream);
-        appsrc.set_max_bytes(0);
-        let element: &gstreamer::Element = appsrc.upcast_ref();
-        set_u64_if_present(element, "max-buffers", CONSUMER_MAX_BUFFERS);
-        // 밀린 소비자는 장치를 막는 대신 자기 프레임을 버린다.
-        set_enum_if_present(element, "leaky-type", "downstream");
+        let binding = new_detached_binding()?;
+        attach_binding(&binding, self);
+        Some(CaptureConsumer { binding })
+    }
 
+    /// 이미 만들어진 appsrc 를 이 허브의 소비자 명단에 넣는다. 소비자 번호를 돌려준다.
+    fn attach_appsrc(self: &Arc<Self>, appsrc: &AppSrc) -> u64 {
         // caps 를 읽는 것과 소비자 목록에 넣는 것을 하나의 임계구역으로 묶는다 —
         // 그 사이에 첫 샘플이 도착하면 `distribute` 가 caps 를 캐시하고 아직
         // 목록에 없는 이 소비자를 건너뛴다. "바뀔 때만 갱신" 가드 때문에 그
@@ -320,11 +388,7 @@ impl DeviceHub {
             "capture hub: {} consumer {id} added (consumers={count})",
             self.key.0
         );
-        Some(CaptureConsumer {
-            hub: self.clone(),
-            id,
-            appsrc,
-        })
+        id
     }
 
     fn remove_consumer(&self, id: u64) {
@@ -443,6 +507,112 @@ fn distribute(
     Ok(gstreamer::FlowSuccess::Ok)
 }
 
+/// 소비자를 **즉시** 돌려주고, 장치를 찾아 여는 일은 배경 스레드에서 끝낸다.
+///
+/// ★이것이 없을 때 무슨 일이 벌어졌는지★ — `getUserMedia` 가 장치 열기를 스크립트
+/// 스레드에서 동기로 하고 있었다. 열기는 장치 열거(포트마다 `ksvideosrc` 를 하나씩
+/// 인스턴스화해 `device-path` 를 읽는다), 소스 생성, 파이프라인 PLAYING 전이 대기
+/// (`START_TIMEOUT` 5 초)를 포함한다. 실측(log_webgl_memleak_repraise/01):
+///
+/// ```text
+/// 03:03:41~45  pps=60.0                    WebGL 컨텐츠가 60fps 로 돌고 있었다
+/// 03:03:45~52  present 없음 (gap 6692ms)   ★화면이 6.7 초 정지★
+/// 03:03:50     getUserMedia: deviceId ...
+/// 03:03:52     capture hub: opened ...      열리자마자 재개
+/// ```
+///
+/// 그동안 WebGL 스레드는 `cmds=+0` 으로 놀고 있었고 리플로도 0 이었다 — 막힌 것은
+/// 스크립트 스레드 하나이고, 그것이 막히면 새 디스플레이 리스트가 안 나와 벽 전체가
+/// 멈춘다. 기록에도 남아 있던 성질이다("장치 하나 여는 데 10~20 초, 여는 동안 스크립트
+/// 스레드가 멈춘다") — 그때는 "미리 열어 둔다"는 운용 회피로 넘겼다.
+///
+/// 그래서 `appsrc` 만 먼저 만들어 돌려준다. `MediaStream` 은 그것으로 곧바로 만들어지고,
+/// 허브에 붙는 것은 배경에서 끝난다. **그 사이 이 자리는 비어 있다** — 예전에는 그 시간
+/// 동안 화면 전체가 멈춰 있었으니 바뀌는 것은 "전부 멈춤"이 "그 자리만 늦게 채워짐"이
+/// 되는 것이다.
+pub fn open_video_consumer_detached(
+    requested_id: Option<String>,
+    find_device: impl FnOnce() -> Option<gstreamer::Device> + Send + 'static,
+) -> Option<CaptureConsumer> {
+    spawn_detached_consumer(move || {
+        // 빠른 길: 이 deviceId 가 이미 열린 건강한 허브로 풀린 적이 있으면 열거를
+        // 통째로 건너뛴다(`rejoin_video_consumer` 주석의 6.2 초가 이것이다).
+        if let Some(id) = requested_id.as_deref()
+            && let Some(hub) = hub_for_resolved_id(id)
+        {
+            return Some(hub);
+        }
+        let Some(device) = find_device() else {
+            log::warn!("capture hub: no device matched; this consumer stays silent");
+            return None;
+        };
+        let key = HubKey::for_video_device(&device);
+        let source_device = device.clone();
+        let hub = hub_for(key.clone(), move || source_device.create_element(None).ok())?;
+        if let Some(id) = requested_id {
+            RESOLVED_IDS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id, key);
+        }
+        Some(hub)
+    })
+}
+
+/// 소비자를 즉시 만들고, `open` 이 돌려주는 허브에 배경에서 붙인다.
+///
+/// 붙이는 경로를 하나로 둔다 — 시험도 이 함수를 거친다(`open_consumer_detached_with`).
+/// 경로가 둘이면 시험이 통과해도 실제 경로는 다른 코드가 된다.
+fn spawn_detached_consumer(
+    open: impl FnOnce() -> Option<Arc<DeviceHub>> + Send + 'static,
+) -> Option<CaptureConsumer> {
+    let binding = new_detached_binding()?;
+    let background = binding.clone();
+    let spawned = std::thread::Builder::new()
+        .name(String::from("GstCaptureOpen"))
+        .spawn(move || {
+            if let Some(hub) = open() {
+                attach_binding(&background, &hub);
+            }
+        });
+    if spawned.is_err() {
+        log::warn!("capture hub: could not spawn the device-open thread");
+    }
+    Some(CaptureConsumer { binding })
+}
+
+/// 시험용: 장치 열거 없이 같은 배경 합류 경로를 밟는다.
+#[cfg(test)]
+pub(crate) fn open_consumer_detached_with(
+    key: HubKey,
+    make_source: impl FnOnce() -> Option<gstreamer::Element> + Send + 'static,
+) -> Option<CaptureConsumer> {
+    spawn_detached_consumer(move || hub_for(key, make_source))
+}
+
+/// 이미 열려 있고 건강한 허브를, 열거 없이 `deviceId` 로 찾는다.
+fn hub_for_resolved_id(requested_id: &str) -> Option<Arc<DeviceHub>> {
+    let key = RESOLVED_IDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(requested_id)
+        .cloned()?;
+    let slot = {
+        let slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+        slots.get(&key)?.clone()
+    };
+    let slot = slot.lock().unwrap_or_else(|error| error.into_inner());
+    let hub = slot.as_ref()?;
+    if !hub.is_healthy() {
+        return None;
+    }
+    log::info!(
+        "capture hub: rejoined {} for deviceId {requested_id:?} without enumerating",
+        key.0
+    );
+    Some(hub.clone())
+}
+
 /// `device` 의 물리 포트에 대한 단 하나의 캡처 연결에 합류한다.
 /// 그 포트가 아직 안 열려 있으면 여기서 연다.
 pub fn open_video_consumer(
@@ -500,6 +670,17 @@ pub(crate) fn open_consumer_with(
     key: HubKey,
     make_source: impl FnOnce() -> Option<gstreamer::Element>,
 ) -> Option<CaptureConsumer> {
+    let hub = hub_for(key, make_source)?;
+    hub.add_consumer()
+}
+
+/// 이 키의 허브를 가져온다. 없거나 죽었으면 연다. ★느린 쪽은 전부 여기다★ —
+/// `make_source()`(장치 인스턴스화)와 `DeviceHub::open`(PLAYING 전이 대기)이 그것이고,
+/// 그래서 배경 스레드가 부른다(`open_video_consumer_detached`).
+fn hub_for(
+    key: HubKey,
+    make_source: impl FnOnce() -> Option<gstreamer::Element>,
+) -> Option<Arc<DeviceHub>> {
     let slot = {
         let mut slots = SLOTS.lock().unwrap();
         slots
@@ -513,7 +694,7 @@ pub(crate) fn open_consumer_with(
     if let Some(hub) = slot.as_ref() {
         if hub.is_healthy() {
             log::info!("capture hub: reused {}", key.0);
-            return hub.add_consumer();
+            return Some(hub.clone());
         }
         log::warn!("capture hub: {} is unhealthy; reopening", key.0);
         // `*slot = None` 만으로는 부족하다 — 살아있는 `CaptureConsumer` 가 여전히
@@ -524,9 +705,8 @@ pub(crate) fn open_consumer_with(
     }
 
     let hub = DeviceHub::open(key, make_source()?)?;
-    let consumer = hub.add_consumer();
-    *slot = Some(hub);
-    consumer
+    *slot = Some(hub.clone());
+    Some(hub)
 }
 
 #[cfg(test)]
@@ -676,6 +856,85 @@ mod tests {
         }
     }
 
+    /// ★소스는 장치가 열리기 전에 이미 쓸 수 있어야 한다★ — 그것이 `getUserMedia` 를
+    /// 스크립트 스레드에서 떼어낸 이유다. 여는 데 시간이 걸려도 `MediaStream` 은 곧바로
+    /// 만들어지고, 프레임만 늦게 들어온다.
+    #[test]
+    fn a_detached_consumer_gives_its_source_before_the_device_opens() {
+        init();
+        let key = HubKey::for_test("detached-source");
+        let opened = Arc::new(AtomicBool::new(false));
+        let flag = opened.clone();
+        let consumer = open_consumer_detached_with(key, move || {
+            // 느린 장치를 흉내낸다. 이 동안 호출자는 이미 돌아가 있어야 한다.
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+            test_source()
+        })
+        .expect("the detached consumer must be created immediately");
+
+        // 아직 열리지 않았는데 소스는 있다.
+        assert!(
+            !opened.load(Ordering::Relaxed),
+            "the caller waited for the device to open"
+        );
+        let source = consumer.source_element();
+        assert_eq!(
+            source.factory().map(|f| f.name()).as_deref(),
+            Some("appsrc")
+        );
+
+        // 그 뒤에 붙는다.
+        wait_until("the consumer to join the hub", || {
+            consumer
+                .binding
+                .attached
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        });
+        assert_eq!(consumer.hub().consumer_count(), 1);
+    }
+
+    /// 붙기 전에 버려져도 등록이 남지 않는다. 배경 작업이 뒤늦게 끝나는 경우다.
+    #[test]
+    fn dropping_before_the_device_opens_leaves_no_registration() {
+        init();
+        let key = HubKey::for_test("detached-drop");
+        let consumer = open_consumer_detached_with(key.clone(), || {
+            std::thread::sleep(Duration::from_millis(300));
+            test_source()
+        })
+        .expect("the detached consumer must be created immediately");
+        drop(consumer);
+
+        // 배경 작업이 끝난 뒤에도 명단은 비어 있어야 한다.
+        wait_until("the hub to open", || {
+            SLOTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&key)
+                .map(|slot| {
+                    slot.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_some()
+                })
+                .unwrap_or(false)
+        });
+        let slot = {
+            let slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+            slots.get(&key).cloned().expect("the hub was opened")
+        };
+        let hub = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .expect("the hub was opened");
+        wait_until("the late registration to be undone", || {
+            hub.consumer_count() == 0
+        });
+    }
+
     fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -817,7 +1076,7 @@ mod tests {
             "the failed hub was reused"
         );
         assert!(recovered.hub().is_healthy());
-        assert!(!Arc::ptr_eq(recovered.hub(), &broken_hub));
+        assert!(!Arc::ptr_eq(&recovered.hub(), &broken_hub));
     }
 
     /// A repeat request for a deviceId whose hub is open must not enumerate.
@@ -840,7 +1099,7 @@ mod tests {
         let rejoined = rejoin_video_consumer("fake-device-id").expect("rejoined");
 
         assert_eq!(opens.load(Ordering::Relaxed), 1, "the device was reopened");
-        assert!(Arc::ptr_eq(rejoined.hub(), &hub), "joined a different hub");
+        assert!(Arc::ptr_eq(&rejoined.hub(), &hub), "joined a different hub");
         assert_eq!(hub.consumer_count(), 2);
     }
 
@@ -913,6 +1172,6 @@ mod tests {
 
         assert_eq!(opens.load(Ordering::Relaxed), 1, "the EOS'd hub was reused");
         assert!(recovered.hub().is_healthy());
-        assert!(!Arc::ptr_eq(recovered.hub(), &broken_hub));
+        assert!(!Arc::ptr_eq(&recovered.hub(), &broken_hub));
     }
 }

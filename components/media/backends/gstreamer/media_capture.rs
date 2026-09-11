@@ -9,7 +9,7 @@ use servo_media_streams::MediaStreamType;
 use servo_media_streams::capture::*;
 use servo_media_streams::registry::MediaStreamId;
 
-use crate::capture_hub::{self, open_video_consumer};
+use crate::capture_hub;
 use crate::device_id::{device_api, device_path, normalized_port_key};
 use crate::media_stream::GStreamerMediaStream;
 
@@ -249,26 +249,17 @@ fn create_input_stream(
                 id.clone()
             });
 
-            // A repeat request for a port whose hub is already open skips the
-            // whole lookup. That lookup costs a fresh GstDeviceMonitor, a full
-            // provider probe, and a ksvideosrc instantiated per candidate to read
-            // its device-path -- measured at ~6.2s on the 4-port card, and it was
-            // being paid once per tile even though every tile after the first was
-            // always going to land on the same hub. Only taken when a healthy hub
-            // exists; otherwise this returns None and the full path runs.
-            if let Some(id) = requested_id.as_deref()
-                && let Some(consumer) = capture_hub::rejoin_video_consumer(id)
-            {
-                let source = consumer.source_element();
-                return Some(GStreamerMediaStream::create_video_from_with(
-                    source,
-                    Some(consumer),
-                ));
-            }
-
-            let devices = GstMediaDevices::new();
-            let device = devices.get_device(true, constraint_set)?;
-            let consumer = open_video_consumer(&device, requested_id.as_deref())?;
+            // ★장치를 여기서 열지 않는다★ — 이 함수는 `getUserMedia` 안에서 **스크립트
+            // 스레드**가 부른다. 장치 열기(열거 + PLAYING 전이 대기)는 실측 6~7 초이고,
+            // 그 동안 벽 전체가 멈춘다(근거는 `open_video_consumer_detached` 주석).
+            //
+            // 소비자를 즉시 받아 스트림을 만들고, 찾기·열기는 배경 스레드가 끝낸다.
+            // 열릴 때까지 그 자리는 비어 있다 — 예전에는 그 시간 동안 화면 전체가 멈춰
+            // 있었다.
+            let consumer = capture_hub::open_video_consumer_detached(requested_id, move || {
+                let devices = GstMediaDevices::new();
+                devices.get_device(true, constraint_set)
+            })?;
             let source = consumer.source_element();
             Some(GStreamerMediaStream::create_video_from_with(
                 source,
