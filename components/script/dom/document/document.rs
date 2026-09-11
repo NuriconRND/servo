@@ -251,8 +251,8 @@ impl RefreshRedirectDue {
         // automatic features browsing context flag set,
         // then navigate document's node navigable to urlRecord using document,
         // with historyHandling set to "replace".
-        if self.from_meta_element &&
-            self.window.Document().has_active_sandboxing_flag(
+        if self.from_meta_element
+            && self.window.Document().has_active_sandboxing_flag(
                 SandboxingFlagSet::SANDBOXED_AUTOMATIC_FEATURES_BROWSING_CONTEXT_FLAG,
             )
         {
@@ -757,8 +757,8 @@ impl Document {
                 // will trigger a new empty display list.
                 self.root_removal_noted.set(false);
 
-                if let Some(dirty_root) = self.dirty_root.get() &&
-                    dirty_root.is_connected()
+                if let Some(dirty_root) = self.dirty_root.get()
+                    && dirty_root.is_connected()
                 {
                     // There was an existing dirty root so we mark its
                     // ancestors as dirty until the document element.
@@ -1014,8 +1014,8 @@ impl Document {
 
         // Step 2: If document's URL matches about:blank and document's about base URL is
         // non-null, then return document's about base URL.
-        if document_url.matches_about_blank() &&
-            let Some(about_base_url) = self.about_base_url()
+        if document_url.matches_about_blank()
+            && let Some(about_base_url) = self.about_base_url()
         {
             return about_base_url;
         }
@@ -1051,8 +1051,8 @@ impl Document {
         // FIXME: This should check the dirty bit on the document,
         // not the document element. Needs some layout changes to make
         // that workable.
-        if let Some(root) = self.GetDocumentElement() &&
-            root.upcast::<Node>().has_dirty_descendants()
+        if let Some(root) = self.GetDocumentElement()
+            && root.upcast::<Node>().has_dirty_descendants()
         {
             condition.insert(RestyleReason::DOMChanged);
         }
@@ -1970,8 +1970,8 @@ impl Document {
         // to fire an event named hashchange at document's relevant global object, using HashChangeEvent,
         // with the oldURL attribute initialized to the serialization of oldURL
         // and the newURL attribute initialized to the serialization of entry's URL.
-        if old_url.as_url()[Position::BeforeFragment..] !=
-            new_url.as_url()[Position::BeforeFragment..]
+        if old_url.as_url()[Position::BeforeFragment..]
+            != new_url.as_url()[Position::BeforeFragment..]
         {
             let window = Trusted::new(self.owner_window().deref());
             let old_url = old_url.to_string();
@@ -2616,6 +2616,11 @@ impl Document {
 
         // Step 5. For each port in ports, disentangle port.
         // TODO
+
+        // 사양 밖: 이 문서가 쥐고 있던 WebGL 컨텍스트의 GPU 자원을 여기서 놓는다.
+        // 수집을 기다리면 벽에서는 구성이 바뀔 때마다 수백 MB 가 남는다 -- 이유는
+        // `webglrenderingcontext::release_contexts_of_destroyed_document` 주석 참고.
+        crate::dom::webgl::webglrenderingcontext::release_contexts_of_destroyed_document(self);
 
         // Step 6. Run any unloading document cleanup steps for document that
         // are defined by this specification and other applicable specifications.
@@ -3365,8 +3370,8 @@ impl Document {
     ) {
         let metrics = self.interactive_time.borrow();
         match metric_type {
-            ProgressiveWebMetricType::FirstPaint |
-            ProgressiveWebMetricType::FirstContentfulPaint => {
+            ProgressiveWebMetricType::FirstPaint
+            | ProgressiveWebMetricType::FirstContentfulPaint => {
                 let binding = PerformancePaintTiming::new(
                     self.window.as_global_scope(),
                     metric_type.clone(),
@@ -3463,8 +3468,8 @@ impl Document {
             _ => {
                 // Step 9.1: If document's unload counter is greater than 0 or
                 // document's ignore-destructive-writes counter is greater than 0, then return.
-                if self.is_prompting_or_unloading() ||
-                    self.ignore_destructive_writes_counter.get() > 0
+                if self.is_prompting_or_unloading()
+                    || self.ignore_destructive_writes_counter.get() > 0
                 {
                     return Ok(());
                 }
@@ -3801,8 +3806,8 @@ impl Document {
     pub(crate) fn insecure_requests_policy(&self) -> InsecureRequestsPolicy {
         if let Some(csp_list) = self.get_csp_list().as_ref() {
             for policy in &csp_list.0 {
-                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests") &&
-                    policy.disposition == PolicyDisposition::Enforce
+                if policy.contains_a_directive_whose_name_is("upgrade-insecure-requests")
+                    && policy.disposition == PolicyDisposition::Enforce
                 {
                     return InsecureRequestsPolicy::Upgrade;
                 }
@@ -4447,8 +4452,8 @@ impl Document {
     }
 
     fn switch_font_face_set_to_loading_if_needed(&self, cx: &mut js::context::JSContext) {
-        if self.window.font_context().web_fonts_still_loading() != 0 &&
-            let Some(font_face_set) = self.fonts.get()
+        if self.window.font_context().web_fonts_still_loading() != 0
+            && let Some(font_face_set) = self.fonts.get()
         {
             font_face_set.switch_to_loading(cx);
         }
@@ -4761,8 +4766,8 @@ impl Document {
     }
 
     pub(crate) fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
-        self.has_trustworthy_ancestor_origin.get() ||
-            self.origin().immutable().is_potentially_trustworthy()
+        self.has_trustworthy_ancestor_origin.get()
+            || self.origin().immutable().is_potentially_trustworthy()
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
@@ -5738,8 +5743,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
         let node = new_body.upcast::<Node>();
         match node.type_id() {
-            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement)) |
-            NodeTypeId::Element(ElementTypeId::HTMLElement(
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLBodyElement))
+            | NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLFrameSetElement,
             )) => {},
             _ => return Err(Error::HierarchyRequest(None)),
@@ -5804,8 +5809,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     fn Links(&self, cx: &mut js::context::JSContext) -> DomRoot<HTMLCollection> {
         self.links.or_init(|| {
             HTMLCollection::new_with_filter_fn(cx, &self.window, self.upcast(), |element, _| {
-                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>()) &&
-                    element.has_attribute(&local_name!("href"))
+                (element.is::<HTMLAnchorElement>() || element.is::<HTMLAreaElement>())
+                    && element.has_attribute(&local_name!("href"))
             })
         })
     }
@@ -6057,8 +6062,8 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                         elem.get_name().as_ref() == Some(&self.name)
                     },
                     HTMLElementTypeId::HTMLImageElement => elem.get_name().is_some_and(|name| {
-                        name == *self.name ||
-                            !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
+                        name == *self.name
+                            || !name.is_empty() && elem.get_id().as_ref() == Some(&self.name)
                     }),
                     // TODO handle <embed> and <object>; these depend on whether the element is
                     // “exposed”, a concept that doesn’t fully make sense until embed/object
@@ -6723,9 +6728,9 @@ fn is_named_element_with_name_attribute(elem: &Element) -> bool {
         _ => return false,
     };
     match type_ {
-        HTMLElementTypeId::HTMLFormElement |
-        HTMLElementTypeId::HTMLIFrameElement |
-        HTMLElementTypeId::HTMLImageElement => true,
+        HTMLElementTypeId::HTMLFormElement
+        | HTMLElementTypeId::HTMLIFrameElement
+        | HTMLElementTypeId::HTMLImageElement => true,
         // TODO handle <embed> and <object>; these depend on whether the element is
         // “exposed”, a concept that doesn’t fully make sense until embed/object
         // behaviour is actually implemented

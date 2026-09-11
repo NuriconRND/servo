@@ -193,6 +193,49 @@ thread_local! {
 /// `connected` splits that in two, and the two halves have different owners:
 /// a canvas still in a document is held by the page, and no engine change will free it;
 /// a detached canvas that stays alive is held by something in here.
+/// 헐리는 문서가 쥐고 있던 WebGL 컨텍스트의 GPU 자원을 **그 자리에서** 놓는다.
+///
+/// ★수집을 기다릴 일이 아니다★
+///
+/// 컨텍스트는 러스트로 수백 바이트지만 GPU 로는 수백 MB 다(벽에서는 타일마다 백엔드가
+/// 따로라 네 벌이다). 수집기는 자기가 아는 압력만 보고 도는데, 그 압력은 JS 힙 기준이라
+/// 이 정도 객체로는 트리거되지 않는다. 실측(log_webgl_memleak_repraise/03~04): 문서는
+/// 제대로 헐리는데(`discarded_documents`/`orphan_documents` 가 같이 올라간다) 컨텍스트가
+/// 살아남아 `WEBGLDOM live=1→2→3`, WebRender 이미지가 `WEBGLLIVE images=1→2→3` 으로
+/// 쌓였고, 120 초 동안 한 번도 줄지 않았다. GPU 메모리가 구성마다 늘고 안 돌아오던 것이
+/// 이것이다.
+///
+/// 미디어에서 같은 결론을 이미 냈다 -- 요소가 문서에서 빠지면 GC 를 기다리지 않고 그 자리에서
+/// 파이프라인을 놓는다(`media_release_detached_player`). 크기가 문제인 자원은 수명을 GC 에
+/// 맡기면 안 된다.
+///
+/// DOM 객체 자체는 그대로 두고(언젠가 수집된다) **GPU 쪽만** 놓는다. 문서가 헐린 뒤라
+/// 그 컨텍스트로 그릴 스크립트도 없다.
+pub(crate) fn release_contexts_of_destroyed_document(document: &Document) {
+    let doomed: Vec<DomRoot<WebGLRenderingContext>> = LIVE_CONTEXTS.with(|live| {
+        live.borrow()
+            .iter()
+            .filter_map(|context| context.root())
+            .filter(|context| match &context.canvas {
+                HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
+                    std::ptr::eq(&*canvas.owner_document(), document)
+                },
+                HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => false,
+            })
+            .collect()
+    });
+    if doomed.is_empty() {
+        return;
+    }
+    warn!(
+        "WEBGLDOM releasing {} context(s) of a destroyed document",
+        doomed.len()
+    );
+    for context in doomed {
+        context.release_gpu_resources();
+    }
+}
+
 /// 살아 있는 컨텍스트 중 이 번호를 가진 것. 없으면 이미 수집된 것이다.
 ///
 /// `LIVE_CONTEXTS` 가 `WeakRef` 목록이라는 것이 요점이다 — 이 조회는 아무것도 붙들지
@@ -308,10 +351,16 @@ pub(crate) enum Operation {
 struct DroppableWebGLRenderingContext {
     #[no_trace]
     webgl_sender: WebGLMsgSender,
+    /// `RemoveContext` 를 이미 보냈는가. 문서가 헐릴 때 먼저 보내므로, `Drop` 이 두 번째로
+    /// 보내지 않게 막는다.
+    removed: Cell<bool>,
 }
 
 impl Drop for DroppableWebGLRenderingContext {
     fn drop(&mut self) {
+        if self.removed.replace(true) {
+            return;
+        }
         let _ = self.webgl_sender.send_remove();
     }
 }
@@ -447,6 +496,7 @@ impl WebGLRenderingContext {
             api_type: ctx_data.api_type,
             droppable: DroppableWebGLRenderingContext {
                 webgl_sender: ctx_data.sender,
+                removed: Cell::new(false),
             },
         }
     }
@@ -613,6 +663,20 @@ impl WebGLRenderingContext {
     pub(crate) fn account_drawing_buffer(&self) {
         self.reflector_
             .update_memory_size(self, self.size.get().cast::<usize>().area() * 4);
+    }
+
+    /// 이 컨텍스트의 GPU 자원을 놓는다. `Drop` 이 하던 일을 앞당겨 하는 것이고, 두 번
+    /// 보내지 않도록 `removed` 로 한 번만 한다.
+    ///
+    /// 놓은 뒤에는 잃은 컨텍스트로 표시한다 -- 남은 WebGL 호출이 없는 백엔드로 나가지
+    /// 않게 하고(`send_with_fallibility`), 스크립트가 `isContextLost()` 로 물으면 사실을
+    /// 돌려준다.
+    pub(crate) fn release_gpu_resources(&self) {
+        if self.droppable.removed.replace(true) {
+            return;
+        }
+        let _ = self.droppable.webgl_sender.send_remove();
+        self.context_lost.set(true);
     }
 
     pub(crate) fn set_image_key(&self, image_key: ImageKey) {
