@@ -193,6 +193,19 @@ thread_local! {
 /// `connected` splits that in two, and the two halves have different owners:
 /// a canvas still in a document is held by the page, and no engine change will free it;
 /// a detached canvas that stays alive is held by something in here.
+/// 살아 있는 컨텍스트 중 이 번호를 가진 것. 없으면 이미 수집된 것이다.
+///
+/// `LIVE_CONTEXTS` 가 `WeakRef` 목록이라는 것이 요점이다 — 이 조회는 아무것도 붙들지
+/// 않으므로, 알림 경로가 컨텍스트의 수명을 늘리지 않는다.
+fn find_live_context(context_id: WebGLContextId) -> Option<DomRoot<WebGLRenderingContext>> {
+    LIVE_CONTEXTS.with(|live| {
+        live.borrow()
+            .iter()
+            .filter_map(|context| context.root())
+            .find(|context| context.context_id() == context_id)
+    })
+}
+
 pub(crate) fn report_live_contexts() {
     LIVE_CONTEXTS.with(|live| {
         let mut live = live.borrow_mut();
@@ -502,16 +515,34 @@ impl WebGLRenderingContext {
             .task_manager()
             .dom_manipulation_task_source()
             .to_sendable();
-        let this = Trusted::new(self);
+        // ★이 라우트는 컨텍스트를 붙들면 안 된다★
+        //
+        // 처음에는 `Trusted::new(self)` 를 클로저에 담았다. `Trusted` 는 `LiveDOMReferences`
+        // 를 통한 **강한 루트**라, 그 라우트가 사는 동안 컨텍스트가 수집되지 않는다. 그런데
+        // 라우트는 송신단이 사라져야 죽고, 송신단은 `remove_context` 가 치우고,
+        // `remove_context` 는 DOM 객체가 수집돼야 나간다 — 자기가 자기 종료 조건을 붙드는
+        // 고리다. 이 저장소에서 같은 모양을 이번 주에만 세 번 봤다(gapless 스레드,
+        // 미디어 플레이어, 그리고 여기).
+        //
+        // 실측(log_webgl_memleak_repraise/03): WebGL 구성이 뜰 때마다 문서는 제대로
+        // 헐리는데(`discarded_documents`/`orphan_documents` 가 같이 올라간다) 컨텍스트는
+        // 살아남아 `live=1→2→3`, WebRender 이미지가 `images=1→2→3` 으로 쌓였다. GPU
+        // 메모리가 구성마다 늘고 안 돌아오던 것이 이것이다.
+        //
+        // 그래서 클로저에는 **번호만** 담고, 실제 객체는 태스크가 살아 있는 것들 중에서
+        // 찾는다(`LIVE_CONTEXTS` 는 `WeakRef` 라 붙들지 않는다). 못 찾으면 이미 사라진
+        // 컨텍스트이고, 알릴 사람도 없는 것이므로 조용히 지나간다.
+        let context_id = self.context_id();
         ROUTER.add_typed_route(
             receiver,
             Box::new(move |message| {
                 let Ok(message) = message else {
                     return;
                 };
-                let this = this.clone();
                 task_source.queue(task!(webgl_context_notification: move |cx| {
-                    this.root().handle_context_notification(cx, message);
+                    if let Some(context) = find_live_context(context_id) {
+                        context.handle_context_notification(cx, message);
+                    }
                 }));
             }),
         );
