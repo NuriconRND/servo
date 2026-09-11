@@ -95,6 +95,147 @@ fn tally(update: impl FnOnce(&mut BindTally)) {
     TALLY.with(|cell| update(&mut cell.borrow_mut()));
 }
 
+/// Which property a binding edge is about.
+const PROP_OPACITY: u8 = 0;
+const PROP_TRANSFORM: u8 = 1;
+
+/// At most this many `PAINTANIMEDGE` lines a second, whatever happens.
+const MAX_EDGE_LINES_PER_SECOND: u32 = 30;
+
+thread_local! {
+    /// (node, property) pairs that got a binding in the previous display list.
+    static BOUND_PREVIOUS: RefCell<std::collections::HashSet<(u64, u8)>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// The same, accumulating for the display list being built now.
+    static BOUND_CURRENT: RefCell<std::collections::HashSet<(u64, u8)>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// ***Two budgets, not one.*** A transition binds dozens of nodes at once, and a
+    /// shared budget would let that burst of `gained` lines crowd out the `lost` line --
+    /// the one the whole thing is for -- in the very second it happens.
+    static EDGE_BUDGET_LOST: std::cell::Cell<(Option<std::time::Instant>, u32)> =
+        const { std::cell::Cell::new((None, 0)) };
+    static EDGE_BUDGET_GAINED: std::cell::Cell<(Option<std::time::Instant>, u32)> =
+        const { std::cell::Cell::new((None, 0)) };
+}
+
+fn property_name(property: u8) -> &'static str {
+    if property == PROP_OPACITY {
+        "opacity"
+    } else {
+        "transform"
+    }
+}
+
+/// Whether another `PAINTANIMEDGE` line of this kind may go out this second.
+fn edge_line_allowed(
+    budget: &'static std::thread::LocalKey<std::cell::Cell<(Option<std::time::Instant>, u32)>>,
+) -> bool {
+    budget.with(|cell| {
+        let now = std::time::Instant::now();
+        let (start, used) = cell.get();
+        let fresh =
+            start.is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_secs(1));
+        let (start, used) = if fresh { (Some(now), 0) } else { (start, used) };
+        if used >= MAX_EDGE_LINES_PER_SECOND {
+            cell.set((start, used));
+            return false;
+        }
+        cell.set((start, used + 1));
+        true
+    })
+}
+
+/// This element's animations, as state the log can be read against.
+///
+/// ***`Canceled` and `Finished` land on the same screen and mean opposite things.*** With
+/// `fill-mode: none` a finished animation stops contributing a value and the element goes
+/// back to its own style, which is correct; a cancel does the same thing but for a reason
+/// the page never asked for. From the display list both look like "no value", and that is
+/// the distinction this line exists to make.
+fn describe_animations(animations: &DocumentAnimationSet, node: OpaqueNode, now: f64) -> String {
+    let sets = animations.sets.read();
+    let Some(set) = sets.get(&AnimationSetKey::new_for_non_pseudo(node)) else {
+        return "set_missing".to_string();
+    };
+    if set.animations.is_empty() && set.transitions.is_empty() {
+        return "set_empty".to_string();
+    }
+    let mut parts: Vec<String> = set
+        .animations
+        .iter()
+        .map(|animation| {
+            let progress = if animation.duration > 0.0 {
+                (now - animation.started_at) / animation.duration
+            } else {
+                f64::INFINITY
+            };
+            format!(
+                "{}:{:?}/fill={:?}/p={:.3}/delay={:.3}",
+                animation.name, animation.state, animation.fill_mode, progress, animation.delay
+            )
+        })
+        .collect();
+    if !set.transitions.is_empty() {
+        parts.push(format!("transitions={}", set.transitions.len()));
+    }
+    parts.join(",")
+}
+
+/// Remember that this node's property got a binding in the display list being built.
+fn note_bound(node: OpaqueNode, property: u8) {
+    BOUND_CURRENT.with(|cell| {
+        cell.borrow_mut().insert((node.0 as u64, property));
+    });
+}
+
+/// One display list drew this property bound and the next one does not.
+///
+/// ***This is the frame the defect is visible on, and a per-second counter cannot hold
+/// it.*** When the binding goes away the display list carries the element's own style
+/// instead -- for an element mid-transition that is wherever the page left it, which on
+/// this wall was off the right edge of an 11520px viewport (log_ani_debug/00, 08:11:01:
+/// four painters, 61 frames, zero external images resolved). So the edge is logged where
+/// it happens, with the style state that explains which kind of "no value" it was.
+fn note_unbound(
+    animations: &DocumentAnimationSet,
+    node: OpaqueNode,
+    property: u8,
+    reason: &str,
+    now: f64,
+) {
+    let was_bound = BOUND_PREVIOUS.with(|cell| cell.borrow().contains(&(node.0 as u64, property)));
+    if !was_bound || !edge_line_allowed(&EDGE_BUDGET_LOST) {
+        return;
+    }
+    log::warn!(
+        "PAINTANIMEDGE edge=lost node={} prop={} reason={} anims=[{}]",
+        node.0,
+        property_name(property),
+        reason,
+        describe_animations(animations, node, now)
+    );
+}
+
+/// The other end: the binding comes back. Pairs with `edge=lost` to give the gap a length.
+fn note_gained(animations: &DocumentAnimationSet, node: OpaqueNode, property: u8, now: f64) {
+    let was_bound = BOUND_PREVIOUS.with(|cell| cell.borrow().contains(&(node.0 as u64, property)));
+    if was_bound || !edge_line_allowed(&EDGE_BUDGET_GAINED) {
+        return;
+    }
+    log::warn!(
+        "PAINTANIMEDGE edge=gained node={} prop={} anims=[{}]",
+        node.0,
+        property_name(property),
+        describe_animations(animations, node, now)
+    );
+}
+
+/// Close the display list: this build's bindings become the previous ones.
+fn roll_binding_edges() {
+    let current = BOUND_CURRENT.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    BOUND_PREVIOUS.with(|cell| *cell.borrow_mut() = current);
+}
+
 /// A stacking context that never reached the binding code. Counted only when the element
 /// actually has an animation, because that is the only case worth explaining.
 pub(crate) fn note_stacking_context_skipped(
@@ -170,10 +311,12 @@ pub(crate) fn opacity_binding(
         .contains_key(&AnimationSetKey::new_for_non_pseudo(node))
     {
         tally(|counters| counters.not_in_set += 1);
+        note_unbound(animations, node, PROP_OPACITY, "not_in_set", now);
         return unbound;
     }
     if animated_opacity(animations, node, now).is_none() {
         tally(|counters| counters.no_value += 1);
+        note_unbound(animations, node, PROP_OPACITY, "no_value", now);
         return unbound;
     }
 
@@ -194,15 +337,19 @@ pub(crate) fn opacity_binding(
     let first = samples[0];
     if samples.iter().all(|value| (value - first).abs() <= EPSILON) {
         tally(|counters| counters.constant += 1);
+        note_unbound(animations, node, PROP_OPACITY, "constant", now);
         return unbound;
     }
 
     let segments = PaintAnimationSegment::<f32>::from_samples(&samples, SAMPLE_SECONDS);
     if segments.is_empty() {
         tally(|counters| counters.constant += 1);
+        note_unbound(animations, node, PROP_OPACITY, "no_segments", now);
         return unbound;
     }
     tally(|counters| counters.bound += 1);
+    note_gained(animations, node, PROP_OPACITY, now);
+    note_bound(node, PROP_OPACITY);
 
     // Complete when the tail of the horizon is flat: the animation has settled and the
     // paint thread can stop rather than hold a value it would keep re-sending.
@@ -234,6 +381,11 @@ pub(crate) fn opacity_binding(
 pub(crate) fn log_built(count: usize) {
     use std::cell::Cell;
     use std::time::Instant;
+
+    // ***Unconditional, and before the throttle.*** The summary below is skipped when
+    // nothing changed; the edge state is per display list and skipping it would make the
+    // next build compare against a list two builds old.
+    roll_binding_edges();
 
     thread_local! {
         static LAST: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
@@ -323,6 +475,7 @@ pub(crate) fn transform_binding(
     let node = node?;
     if animated_transform_list(animations, node, now).is_none() {
         tally(|counters| counters.transform_no_value += 1);
+        note_unbound(animations, node, PROP_TRANSFORM, "no_value", now);
         return None;
     }
 
@@ -339,7 +492,10 @@ pub(crate) fn transform_binding(
             // Hold the last one, which is what it will compute too.
             None => match samples.last().copied() {
                 Some(last) => samples.push(last),
-                None => return None,
+                None => {
+                    note_unbound(animations, node, PROP_TRANSFORM, "unresolvable", now);
+                    return None;
+                },
             },
         }
     }
@@ -348,9 +504,12 @@ pub(crate) fn transform_binding(
         PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, SAMPLE_SECONDS);
     if segments.is_empty() {
         tally(|counters| counters.transform_constant += 1);
+        note_unbound(animations, node, PROP_TRANSFORM, "constant", now);
         return None;
     }
     tally(|counters| counters.transform_bound += 1);
+    note_gained(animations, node, PROP_TRANSFORM, now);
+    note_bound(node, PROP_TRANSFORM);
 
     let last = *samples.last().expect("just sampled");
     let settled = samples.iter().rev().take(3).all(|matrix| {
