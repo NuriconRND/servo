@@ -576,10 +576,44 @@ impl Animation {
             .position(|animation_name| Some(&self.name) == animation_name.as_atom());
         let index = match index {
             Some(index) => index,
-            None => return true,
+            None => {
+                if self.state == AnimationState::Canceled {
+                    // Already cancelled and merely awaiting the sweep; the first one said it.
+                    return true;
+                }
+                // servo wall diagnostic: a cancel empties this element's animation set, the
+                // set is then pruned from the document (script/animations.rs), and layout
+                // draws the element from its own style again. With `fill-mode: forwards`
+                // that is the difference between holding the last keyframe and snapping
+                // back -- so record which names the new style actually carries.
+                log::warn!(
+                    "ANIMCANCEL name={} reason=name_gone state={:?} fill={:?} new_names=[{}]",
+                    self.name,
+                    self.state,
+                    self.fill_mode,
+                    new_ui
+                        .animation_name_iter()
+                        .map(|name| match name.as_atom() {
+                            Some(atom) => atom.to_string(),
+                            None => "none".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                return true;
+            },
         };
 
-        new_ui.animation_duration_mod(index).seconds() == 0.
+        let zero_duration = new_ui.animation_duration_mod(index).seconds() == 0.;
+        if zero_duration && self.state != AnimationState::Canceled {
+            log::warn!(
+                "ANIMCANCEL name={} reason=zero_duration state={:?} fill={:?}",
+                self.name,
+                self.state,
+                self.fill_mode
+            );
+        }
+        zero_duration
     }
 
     /// Given the current time, advances this animation to the next iteration,
