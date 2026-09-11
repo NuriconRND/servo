@@ -251,6 +251,27 @@ impl Animations {
         // ***지워진 항목은 레이아웃에서 `not_in_set` 이 되고, 그러면 그 요소는 자기
         // 스타일로 그려진다.*** 애니메이션이 붙기 전의 자기 스타일이 화면 밖이면 그
         // 순간부터 벽이 검다. 그래서 무엇이 언제 지워지는지를 남긴다.
+        //
+        // ***지우기 전에 그 노드를 스타일 더티로 표시한다.***
+        //
+        // 애니메이션을 (다시) 만드는 곳은 `maybe_start_animations` 하나이고, 그것은 그
+        // 요소가 리스타일될 때만 돈다. 그런데 애니메이션이 리스타일을 유발하는 곳은
+        // `mark_animating_nodes_as_dirty` 이고, 그 함수는 **세트가 있는 노드만** 더럽힌다.
+        // 그래서 여기서 세트를 지우면 그 노드는 그 목록에서 빠지고, 다시는 리스타일되지
+        // 않으며, 리스타일되지 않으니 애니메이션도 다시 만들어지지 않는다. 되살릴 유일한
+        // 경로가 "이미 애니메이션이 있는 요소" 에만 도는 자기잠금이다.
+        //
+        // 실측(log_ani_debug/07, node 64280494740912): `sd-anim-4` 가 세트 소멸 뒤
+        // 2.5~4.8초가 지나서야 -- 페이지가 그 요소를 다른 이유로 건드릴 때에야 -- 새
+        // `started_at` 으로 다시 만들어졌고, 그 사이 93 디스플레이 리스트 동안 요소는
+        // 스타일이 `animation-name: sd-anim-4` 를 그대로 지명한 채(`@keyframes` 도 있다)
+        // 애니메이션 없이 `translateX(11520)` -- 폭 11520 뷰포트의 바깥 -- 에 그려졌다.
+        // 슬롯 둘이 동시에 ±11520 에 주차되어 화면에 아무것도 남지 않는다.
+        //
+        // 더티로 표시해 두면 다음 리플로에서 `update_animations_for_new_style` 이 그
+        // 요소에 대해 돌고, 스타일이 여전히 이름을 지명하면 애니메이션이 되살아나며,
+        // 지명하지 않으면 아무 일도 일어나지 않는다. 비용은 삭제 한 번당 리스타일 한 번이다.
+        let rooted_nodes = self.rooted_nodes.borrow();
         sets.retain(|key, state| {
             let keep = !state.is_empty();
             if !keep {
@@ -259,9 +280,13 @@ impl Animations {
                     key.node.0,
                     key.pseudo_element
                 );
+                if let Some(node) = rooted_nodes.get(&NoTrace(key.node)) {
+                    node.dirty(NodeDamage::Style);
+                }
             }
             keep
         });
+        drop(rooted_nodes);
         let have_running_animations = sets.values().any(|state| state.needs_animation_ticks());
 
         self.update_running_animations_presence(window, have_running_animations);
