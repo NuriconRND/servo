@@ -103,6 +103,16 @@ const PROP_TRANSFORM: u8 = 1;
 const MAX_EDGE_LINES_PER_SECOND: u32 = 30;
 
 thread_local! {
+    /// How many display lists in a row this (node, property) has been considered and left
+    /// unbound.
+    ///
+    /// ***This is the length of the wrong frame.*** An element drawn unbound carries its
+    /// own style, which for one mid-transition is wherever the page left it -- the target
+    /// position before the animation starts, the starting position after it ends. One
+    /// display list of that is the reported flash; sixty of them is the reported blackout.
+    /// Same defect, and only the count tells them apart.
+    static UNBOUND_STREAK: RefCell<std::collections::HashMap<(u64, u8), u32>> =
+        RefCell::new(std::collections::HashMap::new());
     /// (node, property) pairs that got a binding in the previous display list.
     static BOUND_PREVIOUS: RefCell<std::collections::HashSet<(u64, u8)>> =
         RefCell::new(std::collections::HashSet::new());
@@ -155,7 +165,20 @@ fn edge_line_allowed(
 fn describe_animations(animations: &DocumentAnimationSet, node: OpaqueNode, now: f64) -> String {
     let sets = animations.sets.read();
     let Some(set) = sets.get(&AnimationSetKey::new_for_non_pseudo(node)) else {
-        return "set_missing".to_string();
+        // ***`OpaqueNode` is the node's address, so a repeated id is not a repeated
+        // element.*** If the page rebuilt this container the id can come back on a fresh
+        // node, and then a missing set is correct and the defect is elsewhere. Naming the
+        // keys the document does hold separates the two: ids we have never bound mean new
+        // elements; our own ids still present mean the entry went away under us.
+        let mut keys: Vec<String> = sets
+            .keys()
+            .take(4)
+            .map(|key| format!("{}", key.node.0))
+            .collect();
+        if sets.len() > keys.len() {
+            keys.push(format!("+{}", sets.len() - keys.len()));
+        }
+        return format!("set_missing doc=[{}]", keys.join(","));
     };
     if set.animations.is_empty() && set.transitions.is_empty() {
         return "set_empty".to_string();
@@ -203,6 +226,17 @@ fn note_unbound(
     reason: &str,
     now: f64,
 ) {
+    // Bumped for every unbound outcome, not only the edge: the count is read at the far
+    // end, by `note_gained`.
+    UNBOUND_STREAK.with(|cell| {
+        let mut map = cell.borrow_mut();
+        // A page that churns nodes would otherwise grow this map without bound. Dropping
+        // it whole costs at most one under-reported streak.
+        if map.len() > 4096 {
+            map.clear();
+        }
+        *map.entry((node.0 as u64, property)).or_insert(0) += 1;
+    });
     let was_bound = BOUND_PREVIOUS.with(|cell| cell.borrow().contains(&(node.0 as u64, property)));
     if !was_bound || !edge_line_allowed(&EDGE_BUDGET_LOST) {
         return;
@@ -218,14 +252,18 @@ fn note_unbound(
 
 /// The other end: the binding comes back. Pairs with `edge=lost` to give the gap a length.
 fn note_gained(animations: &DocumentAnimationSet, node: OpaqueNode, property: u8, now: f64) {
+    let streak = UNBOUND_STREAK
+        .with(|cell| cell.borrow_mut().remove(&(node.0 as u64, property)))
+        .unwrap_or(0);
     let was_bound = BOUND_PREVIOUS.with(|cell| cell.borrow().contains(&(node.0 as u64, property)));
     if was_bound || !edge_line_allowed(&EDGE_BUDGET_GAINED) {
         return;
     }
     log::warn!(
-        "PAINTANIMEDGE edge=gained node={} prop={} anims=[{}]",
+        "PAINTANIMEDGE edge=gained node={} prop={} unbound_dls={} anims=[{}]",
         node.0,
         property_name(property),
+        streak,
         describe_animations(animations, node, now)
     );
 }
