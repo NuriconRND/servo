@@ -1831,6 +1831,28 @@ pub fn maybe_start_animations<E>(
         }
 
         let Some(keyframe_animation) = context.stylist.lookup_keyframes(name, element) else {
+            // servo wall diagnostic: the style names an animation the stylist does not have
+            // a `@keyframes` rule for, so no animation is created at all and the element is
+            // laid out from its own style. When the page inserts the rule and sets the name
+            // together, any window where this fires is a window where the element is drawn
+            // without its animation -- which on this wall is off the side of the viewport.
+            thread_local! {
+                static LAST: std::cell::RefCell<(Option<Atom>, u32)> =
+                    const { std::cell::RefCell::new((None, 0)) };
+            }
+            let due = LAST.with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let changed = slot.0.as_ref() != Some(name);
+                if changed {
+                    *slot = (Some(name.clone()), 1);
+                    return true;
+                }
+                slot.1 += 1;
+                slot.1 % 60 == 0
+            });
+            if due {
+                log::warn!("ANIMNOKEYFRAMES name={}", name);
+            }
             continue;
         };
 

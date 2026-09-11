@@ -280,6 +280,7 @@ pub(crate) fn note_unbound_transform_value(
     node: Option<OpaqueNode>,
     transform: &LayoutTransform,
     origin: webrender_api::units::LayoutPoint,
+    animation_names: impl Fn() -> String,
 ) {
     let Some(node) = node else {
         return;
@@ -296,15 +297,19 @@ pub(crate) fn note_unbound_transform_value(
         return;
     }
     let matrix = transform.to_array();
+    // ***이름이 붙어 있는데 애니메이션이 없는 것과, 이름 자체가 아직 없는 것은 다른 결함이다.***
+    // 앞이면 `@keyframes` 를 못 찾은 것이고(ANIMNOKEYFRAMES 와 짝을 이룬다), 뒤면 스타일이
+    // 아직 그 요소를 애니메이션으로 지정하지 않은 것이다. 그려진 값만으로는 갈리지 않는다.
     log::warn!(
-        "PAINTANIMSTATIC node={} unbound_dls={} origin={:.1}/{:.1} translate={:.1}/{:.1} scale={:.3}",
+        "PAINTANIMSTATIC node={} unbound_dls={} origin={:.1}/{:.1} translate={:.1}/{:.1} scale={:.3} names=[{}]",
         node.0,
         streak,
         origin.x,
         origin.y,
         matrix[12],
         matrix[13],
-        matrix[0]
+        matrix[0],
+        animation_names()
     );
 }
 

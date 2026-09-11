@@ -127,8 +127,31 @@ impl Animations {
     /// Cancel animations for the given node, if any exist.
     pub(crate) fn cancel_animations_for_node(&self, node: &Node) {
         let mut animations = self.sets.sets.write();
-        let mut cancel_animations_for = |key| {
+        // ***세 번째 취소 자리.*** 이 함수는 노드가 트리에서 빠질 때(`unbind_from_tree`
+        // 정리 경로) 불린다. 여기서 취소된 애니메이션은 `clear_canceled_animations` 에
+        // 쓸려 세트가 비고, `sets.retain` 이 세트를 지운다. 그러면 레이아웃은
+        // `not_in_set` 으로 떨어져 그 요소를 자기 스타일로 그린다.
+        //
+        // log_ani_debug/06 에서 `ANIMSETDROP node=9888400807024` 가 17번 찍혔는데
+        // `ANIMCANCEL`(스타일 검사) 도 `ANIMDROP`(렌더링 안 됨) 도 그 노드에는 한 번도
+        // 안 찍혔다. 남은 취소 자리가 여기뿐이라 무엇이 여기로 들어오는지를 남긴다.
+        let mut cancel_animations_for = |key: AnimationSetKey| {
             if let Some(set) = animations.get_mut(&key) {
+                if !set.animations.is_empty() {
+                    log::warn!(
+                        "ANIMUNBIND node={} pseudo={:?} animations=[{}]",
+                        key.node.0,
+                        key.pseudo_element,
+                        set.animations
+                            .iter()
+                            .map(|animation| format!(
+                                "{}:{:?}/fill={:?}",
+                                animation.name, animation.state, animation.fill_mode
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
                 set.cancel_all_animations();
             }
         };

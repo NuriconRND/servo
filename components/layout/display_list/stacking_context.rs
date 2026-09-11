@@ -672,6 +672,17 @@ impl BoxFragment {
                 self.base.tag.map(|tag| tag.node),
                 &reference_frame_data.transform,
                 reference_frame_data.origin.to_webrender(),
+                || {
+                    style
+                        .get_ui()
+                        .animation_name_iter()
+                        .map(|name| match name.as_atom() {
+                            Some(atom) => atom.to_string(),
+                            None => "none".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                },
             );
         }
         let new_spatial_id = stacking_context_tree.push_reference_frame(
