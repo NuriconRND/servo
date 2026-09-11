@@ -97,6 +97,7 @@ use crate::dom::webgl::webglvertexarrayobject::WebGLVertexArrayObject;
 use crate::dom::webgl::webglvertexarrayobjectoes::WebGLVertexArrayObjectOES;
 use crate::dom::window::Window;
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
+use crate::script_thread::ScriptThread;
 
 // From the GLES 2.0.25 spec, page 85:
 //
@@ -212,6 +213,21 @@ pub(crate) fn report_live_contexts() {
         // 서로 다른 문서가 몇 개인지, 그 중 아직 **활성**인 것이 몇 개인지를 함께 센다.
         let mut documents: Vec<usize> = Vec::new();
         let mut in_inactive_document = 0usize;
+        // ★`is_fully_active` 로는 죽은 문서를 가려낼 수 없다★
+        //
+        // 그 값은 컨스텔레이션이 `set_activity` 로 세우는 플래그인데, 문서 파괴 경로
+        // (`Document::destroy`)는 그것을 건드리지 않는다 -- `discard_browsing_context` 로
+        // 창을 버리고 스크립트 스레드의 문서 맵에서 빠질 뿐이다. 그래서 이미 헐린 문서도
+        // `in_inactive_document` 에 안 잡힌다. 실측(log_webgl_memleak_repraise/00~01)에서
+        // `documents=1→4` 인데 `in_inactive_document=0` 이었고, 그걸 "넷 다 살아 있다"로
+        // 읽었다 -- 그 판정의 근거가 없었다.
+        //
+        // 그래서 파괴가 실제로 남기는 두 흔적을 센다:
+        //   `discarded`   `Window::discard_browsing_context` 가 세우는 플래그
+        //   `orphan`      스크립트 스레드의 문서 맵에 더는 없다(`PipelineExit` 처리 완료)
+        // 둘 중 하나라도 서면 그 문서는 헐렸는데 캔버스가 붙들고 있는 것이다.
+        let mut discarded_documents = 0usize;
+        let mut orphan_documents = 0usize;
         for context in live.iter() {
             let Some(context) = context.root() else {
                 continue;
@@ -223,6 +239,16 @@ pub(crate) fn report_live_contexts() {
                 let identity = &*document as *const Document as usize;
                 if !documents.contains(&identity) {
                     documents.push(identity);
+                    if document
+                        .window()
+                        .window_proxy()
+                        .is_browsing_context_discarded()
+                    {
+                        discarded_documents += 1;
+                    }
+                    if ScriptThread::find_document(document.window().pipeline_id()).is_none() {
+                        orphan_documents += 1;
+                    }
                 }
                 if !document.is_fully_active() {
                     in_inactive_document += 1;
@@ -242,13 +268,15 @@ pub(crate) fn report_live_contexts() {
         // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
         // diagnostic nobody can see is a diagnostic that does not exist.
         warn!(
-            "WEBGLDOM live={} connected={} detached={} offscreen={} documents={}              in_inactive_document={} buffer_floor_mb={:.0}",
+            "WEBGLDOM live={} connected={} detached={} offscreen={} documents={}              in_inactive_document={} discarded_documents={} orphan_documents={} buffer_floor_mb={:.0}",
             live.len(),
             connected,
             detached,
             offscreen,
             documents.len(),
             in_inactive_document,
+            discarded_documents,
+            orphan_documents,
             buffer_bytes as f64 / (1024.0 * 1024.0),
         );
     });
