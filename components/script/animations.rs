@@ -154,11 +154,38 @@ impl Animations {
         {
             let rooted_nodes = self.rooted_nodes.borrow();
             for (key, set) in sets.iter_mut() {
-                if rooted_nodes.get(&NoTrace(key.node)).is_some_and(|node| {
-                    !node.is_being_rendered_or_delegates_rendering(key.pseudo_element)
-                }) {
-                    set.cancel_all_animations();
+                let Some(node) = rooted_nodes.get(&NoTrace(key.node)) else {
+                    continue;
+                };
+                if node.is_being_rendered_or_delegates_rendering(key.pseudo_element) {
+                    continue;
                 }
+                // ***이 취소는 스타일을 보지 않는다.*** `Animation::is_cancelled_in_new_style`
+                // 을 거치지 않으므로 거기 붙인 진단(ANIMCANCEL)에 잡히지 않고, 취소된
+                // 애니메이션은 바로 아래에서 쓸려나가 세트가 비고, 세트가 비면
+                // `sets.retain` 이 문서에서 지운다. 레이아웃은 그 뒤로 그 노드를
+                // `not_in_set` 으로 보고 요소를 자기 스타일로 그린다 -- `fill-mode:
+                // forwards` 로 붙들고 있어야 할 마지막 키프레임까지 같이 버려진 채로.
+                //
+                // 화면에 보이는 요소가 여기 걸린다면 판정이 틀린 것이므로, 그때 노드가
+                // 문서에 붙어 있었는지와 무엇을 버렸는지를 남긴다.
+                if !set.animations.is_empty() {
+                    log::warn!(
+                        "ANIMDROP node={} pseudo={:?} connected={} animations=[{}]",
+                        key.node.0,
+                        key.pseudo_element,
+                        node.is_connected(),
+                        set.animations
+                            .iter()
+                            .map(|animation| format!(
+                                "{}:{:?}/fill={:?}",
+                                animation.name, animation.state, animation.fill_mode
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+                set.cancel_all_animations();
             }
         }
 
