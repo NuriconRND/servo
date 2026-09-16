@@ -2739,6 +2739,20 @@ impl Window {
 
         let document_context = self.web_font_context();
 
+        // ★디스플레이 리스트는 승급이 끝난 세트를 보아야 한다.★ 아래 `reflow` 가 넘기는
+        // `animations` 는 `Arc<RwLock<..>>` 공유 핸들이라 레이아웃은 **지금 이 순간의** 세트를
+        // 읽는다. 승급이 `update_animations_post_reflow()`(이 함수 아래쪽) 에만 있으면 요소가
+        // 처음 등장하는 리플로에서 디스플레이 리스트가 `Pending` 인 세트를 보게 되고,
+        // 레이아웃은 값이 없다고 판단해 요소 자신의 계산된 transform -- 슬라이드-인이라면
+        // **도착 위치** -- 를 굽는다. 그 한 장이 "새 구성이 제자리에 번쩍 떴다가 애니메이션이
+        // 재생되는" 증상이다. 자세한 실측은 `Animations::start_pending_animations_before_reflow`.
+        //
+        // 렌더링 갱신 리플로에서만 한다 -- 레이아웃 질의 리플로는 디스플레이 리스트를 만들지
+        // 않으므로 여기서 승급할 이유가 없고, 초당 수백 번 도는 경로다.
+        if reflow_goal == ReflowGoal::UpdateTheRendering {
+            document.start_pending_animations_before_reflow();
+        }
+
         // Send new document and relevant styles to layout.
         let reflow = ReflowRequest {
             document: document.upcast::<Node>().to_trusted_node_address(),

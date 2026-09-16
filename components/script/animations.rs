@@ -168,6 +168,35 @@ impl Animations {
         ));
     }
 
+    /// Promote `Pending` animations **before** layout builds the display list.
+    ///
+    /// ***디스플레이 리스트는 승급이 끝난 세트를 보아야 한다.*** 승급은
+    /// [`Self::do_post_reflow_update`] 안에 있었는데, 그 호출은 `Window::force_reflow` 에서
+    /// `layout.reflow()` **뒤**다. 그래서 요소가 처음 등장하는 리플로에서는 애니메이션이
+    /// 아직 `Pending` 인 채로 디스플레이 리스트가 만들어지고,
+    /// `get_value_map_for_active_animations` 가 값을 내주지 않으니 레이아웃이
+    /// `transform_binding` 에서 바인딩을 포기하고 **요소 자신의 계산된 transform** 을 굽는다.
+    /// 슬라이드-인 애니메이션에서 그 값은 곧 **도착 위치**이므로, 새 구성이 제자리에 한 장
+    /// 나타났다가 애니메이션이 붙으면서 시작 위치로 튀어 다시 들어온다.
+    ///
+    /// 실측(2026-09-16, log_ani_debug/13): `edge=gained` 90 건 중 75 건이 `unbound_dls` 1~2 이고
+    /// (p50=1), 그 첫 디스플레이 리스트에 구워진 값이 `PAINTANIMSTATIC ... translate=0.0/0.0
+    /// names=[sd-anim-5]` -- 스타일은 애니메이션을 지명하는데 도착 위치가 구워져 있다.
+    ///
+    /// 그래서 같은 승급을 리플로 **앞**에서 한 번 더 돌린다. `start_pending_animations` 는
+    /// 이미 `Pending` 이 아닌 것을 건너뛰므로 뒤의 호출은 그대로 두어도 무해하고, 틱이 끊긴
+    /// 경우를 위한 안전망으로 남는다(커밋 `ad1412abd60` 이 그 자리를 만든 이유다).
+    pub(crate) fn start_pending_animations_before_reflow(&self, window: &Window, now: f64) {
+        let mut sets = self.sets.sets.write();
+        if sets.is_empty() {
+            return;
+        }
+        let pipeline_id = window.pipeline_id();
+        for (key, set) in sets.iter_mut() {
+            self.start_pending_animations(key, set, now, pipeline_id);
+        }
+    }
+
     /// This does three things:
     ///  - Cancel animations for any nodes that are no longer being rendered or delegating rendering.
     ///  - Process any new animations that were discovered after reflow.

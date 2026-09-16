@@ -4551,6 +4551,14 @@ impl Document {
         &self.animations
     }
 
+    /// 디스플레이 리스트가 만들어지기 전에 `Pending` 애니메이션을 올린다.
+    /// 이유는 [`Animations::start_pending_animations_before_reflow`] 주석 참고.
+    pub(crate) fn start_pending_animations_before_reflow(&self) {
+        let current_timeline_value = self.current_animation_timeline_value();
+        self.animations
+            .start_pending_animations_before_reflow(&self.window, current_timeline_value);
+    }
+
     pub(crate) fn update_animations_post_reflow(&self) {
         let current_timeline_value = self.current_animation_timeline_value();
         self.animations
