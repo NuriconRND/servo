@@ -16,6 +16,8 @@ mod size_of;
 mod textinput;
 #[cfg(test)]
 mod timeranges;
+#[cfg(test)]
+mod web_animation;
 
 /**
 ```compile_fail,E0277

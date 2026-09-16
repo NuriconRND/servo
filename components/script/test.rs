@@ -79,3 +79,7 @@ pub mod encoding_detection {
         get_xml_encoding, prescan_the_byte_stream_to_determine_the_encoding,
     };
 }
+
+pub mod web_animation {
+    pub use crate::dom::animation::keyframes::{KeyframeError, resolve_offsets};
+}
