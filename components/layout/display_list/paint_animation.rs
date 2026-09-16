@@ -25,6 +25,7 @@ use paint_api::display_list::{
     PaintAnimatedProperty, PaintAnimation, PaintAnimationProperty, PaintAnimationSegment,
     paint_animation_binding_key,
 };
+use servo_base::cross_process_instant::CrossProcessInstant;
 use style::animation::{AnimationSetKey, DocumentAnimationSet};
 use style::dom::OpaqueNode;
 use std::cell::RefCell;
@@ -450,6 +451,7 @@ pub(crate) fn opacity_binding(
         Some(PaintAnimation {
             property: PaintAnimationProperty::Opacity(key, segments),
             offset_from_display_list: 0.0,
+            built_at: CrossProcessInstant::now(),
             complete: settled,
         }),
     )
@@ -610,6 +612,7 @@ pub(crate) fn transform_binding(
         PaintAnimation {
             property: PaintAnimationProperty::Transform(key, segments),
             offset_from_display_list: 0.0,
+            built_at: CrossProcessInstant::now(),
             complete: settled,
         },
     ))

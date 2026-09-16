@@ -14,6 +14,7 @@ use malloc_size_of_derive::MallocSizeOf;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_base::Epoch;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
 use servo_geometry::FastLayoutTransform;
@@ -1105,6 +1106,21 @@ pub struct PaintAnimation {
     /// Seconds from the display list's creation to the animation's zero point. Negative
     /// for an animation already under way, which is the usual case.
     pub offset_from_display_list: f64,
+    /// When layout sampled these segments.
+    ///
+    /// ***The segments are anchored to this instant, not to the one the painter receives
+    /// them on.*** `offset_from_display_list` is measured from the display list's
+    /// creation, so the paint thread has to be told when that was; the only other instant
+    /// available to it is the arrival, and anchoring there shifts the whole prediction by
+    /// however long the list spent in the rest of the reflow, the send, and the scene
+    /// build. A fixed shift would only be a fixed lag, but that time is not fixed -- on
+    /// the 4-GPU wall one display reflow costs 0.4 ms while the page is quiet and 2.0 ms
+    /// during a content switch, with 14.5 ms measured at the worst (log_ani_debug/08
+    /// `SCRIPTBUSY reflow_ms`/`reflow_display`) -- so the variation lands directly in the
+    /// animation's phase, once per display list, which is a hundred times a second on a
+    /// wall whose videos keep the document dirty. Anchoring here instead makes
+    /// consecutive predictions agree with each other.
+    pub built_at: CrossProcessInstant,
     /// Whether the segments run to the animation's end. When false the animation outlives
     /// what was sampled and the paint thread holds the last value until script catches up.
     pub complete: bool,

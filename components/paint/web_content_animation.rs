@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use embedder_traits::EventLoopWaker;
 use rustc_hash::FxHashMap;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::WebViewId;
 use servo_config::prefs;
 use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnimationSegment};
@@ -24,6 +25,15 @@ use crate::webview_renderer::WebViewRenderer;
 ///
 /// TODO: This should be controlled by system settings.
 pub(crate) const CARET_BLINK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 디스플레이 리스트가 만들어진 뒤 여기 도착하기까지 걸렸다고 인정하는 최대 시간.
+///
+/// ★신뢰할 수 없는 값으로 애니메이션을 과거로 끌고 가지 않기 위한 상한이다.★ 정상 경로에서
+/// 이 시간은 밀리초 단위다(리플로 잔여 + 전송 + 씬 빌드). 그보다 훨씬 큰 값이 나온다면 그
+/// 디스플레이 리스트가 어딘가에서 오래 묵었거나 시계가 어긋난 것이고, 그때 그 값을 그대로
+/// 빼면 애니메이션이 이미 끝난 지점으로 순간이동한다. 상한에 걸리면 그만큼만 되돌리므로
+/// 최악이라도 예전 동작(도착 시각 기준)보다 나쁘지 않다.
+const MAX_DISPLAY_LIST_TRANSIT: Duration = Duration::from_millis(250);
 
 /// A struct responsible for managing paint-side animations. Currently this only handles text caret
 /// blinking, but the idea is that in the future this would handle other types of paint-side
@@ -468,15 +478,34 @@ impl PipelineAnimations {
     /// exactly when it is worth having.
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
+        let now = CrossProcessInstant::now();
         self.prune_held(&paint_animations);
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
             .map(|animation| {
+                // ★원점은 이 리스트가 **만들어진** 시각이지 **받은** 시각이 아니다.★
+                //
+                // 세그먼트는 레이아웃이 샘플링을 시작한 순간을 0 으로 갖고,
+                // `offset_from_display_list` 도 그 순간에서 잰 값이다. 받은 시각에 0 을
+                // 박으면 그 사이에 든 시간(리플로 잔여 + 전송 + 씬 빌드)만큼 예측 전체가
+                // 과거로 밀린다. 그 시간이 일정하다면 일정한 지연일 뿐이지만 일정하지
+                // 않다 -- 같은 벽에서 디스플레이 리플로 한 번이 한가할 때 0.4ms, 컨텐츠
+                // 전환 중 2.0ms 다(log_ani_debug/08 `SCRIPTBUSY`). 그 차이가 그대로
+                // 애니메이션 위상에 실리고, 비디오가 문서를 계속 더럽히는 벽에서는
+                // 디스플레이 리스트가 초당 백여 장이므로 초당 백여 번 실린다.
+                //
+                // 만들어진 시각에 박으면 연달아 오는 예측들이 서로 정확히 맞물린다.
+                let transit = (now - animation.built_at)
+                    .as_seconds_f64()
+                    .clamp(0.0, MAX_DISPLAY_LIST_TRANSIT.as_secs_f64());
+                let created_at = received_at
+                    .checked_sub(Duration::from_secs_f64(transit))
+                    .unwrap_or(received_at);
                 let offset = Duration::from_secs_f64(animation.offset_from_display_list.abs());
                 let zero = if animation.offset_from_display_list <= 0.0 {
-                    received_at.checked_sub(offset).unwrap_or(received_at)
+                    created_at.checked_sub(offset).unwrap_or(created_at)
                 } else {
-                    received_at + offset
+                    created_at + offset
                 };
                 ActivePaintAnimation {
                     property: animation.property,
@@ -564,6 +593,9 @@ mod tests {
             ),
             // Its zero point is far enough in the past that it has already ended.
             offset_from_display_list: -(duration * 2.0),
+            // Sampled now, so the install anchors it to now: these tests are about the
+            // offset, not about how long a display list took to arrive.
+            built_at: CrossProcessInstant::now(),
             complete: true,
         }
     }
