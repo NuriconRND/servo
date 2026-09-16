@@ -679,6 +679,51 @@ struct MediaExternalImages {
     ring_init_frame: u64,
     ring_init_done: i64,
     ring_init_deferred: u32,
+    /// 같은 것을 **EGLImage 래핑**에 대해 따로 잰다.
+    ///
+    /// ★링 초기화 상한이 덮지 못하는 절반이다.★ `media_ring_init_max_per_frame` 은 링의
+    /// 최초 소비(`Map`)만 막는데, 래핑은 그 뒤에 있고 슬롯이 presenting 으로 돌 때마다
+    /// 새 텍스처에 대해 다시 일어난다. 실측(log_ani_debug/10)에서 소비 없는 lock 이 래핑만으로
+    /// 3~4ms 를 쓰고 있었다 -- `MEDIALOCK consume_ms=0.00 wrap_ms=3.18 wrap_cached=false`.
+    /// 54 영상 전환 직후 렌더 한 패스가 resolve 37~55 건에 100~130ms 를 쓰고
+    /// (`WRSLOW resolve_lock_ms=103 / renderer_ms=109`), 정작 그리기는 4.3ms 였다.
+    ///
+    /// 단위 비용이 링 초기화(중앙값 8.8ms)와 한 자릿수 배 다르므로 예산을 합치지 않고
+    /// 따로 둔다.
+    wrap_init_frame: u64,
+    wrap_init_done: i64,
+    wrap_init_deferred: u32,
+    /// 이 프레임에 래핑 예산을 이미 받은 링.
+    ///
+    /// ★예산의 단위는 면이 아니라 영상이다.★ YUV 한 장은 면 2~3 개가 **모두** 풀려야 그려진다.
+    /// 면 단위로 세면 Y 는 통과하고 V 는 막히는 프레임이 생기고, 그건 빈 화면이 아니라
+    /// 색이 깨진 화면이다. 한 링이 예산을 받으면 그 프레임의 나머지 면은 함께 통과시킨다
+    /// (`initialized_rings` 가 링 초기화에서 쓰는 것과 같은 수법이다).
+    wrap_init_rings: FxHashSet<u64>,
+    /// 이 프레임에 래핑 예산을 **거부당한** 링.
+    ///
+    /// ★통과시킨 링만 기억하는 것으로는 부족하다.★ 예산을 묻는 자리는 캐시 **미스**뿐이라,
+    /// 한 링의 면 일부가 이미 캐시에 있으면 그 면은 묻지도 않고 통과하고 나머지만 거부된다.
+    /// Y 는 나오고 U/V 는 비는 프레임이 되고, 그건 검은 화면이 아니라 **초록 화면**이다
+    /// (2026-09-16 실기에서 관찰됨). 그래서 거부도 링 단위로 기억해 두고, 캐시 조회보다
+    /// **먼저** 보아 히트한 면까지 함께 비운다 -- 한 프레임에서 링은 전부 그려지거나 전부
+    /// 비거나 둘 중 하나여야 한다.
+    wrap_denied_rings: FxHashSet<u64>,
+    /// 이번 프레임에 면을 내줄 수 없을 때 대신 묶을 1x1 텍스처 `(Y용, UV용)`.
+    ///
+    /// ★`ExternalImageSource::Invalid` 는 화면을 비우지 않는다 -- 초록으로 칠한다.★
+    /// WebRender 는 그 경우 **GL 텍스처 0 을 묶고 그대로 그린다**
+    /// (`vendor_local/webrender/src/renderer/mod.rs`, "Just use 0 as the gl handle").
+    /// 묶이지 않은 텍스처는 (0,0,0,1) 을 돌려주므로 YUV 역변환에서 Y=U=V=0 이 되고,
+    /// BT.601 로는 그것이 (0, 0.53, 0) -- 선명한 초록이다. 이 경로의 이른 반환마다 붙어 있는
+    /// "이번 프레임만 비운다" 라는 주석은 전부 그 전제가 틀렸다.
+    ///
+    /// 그래서 비우려는 자리에서는 Invalid 대신 중립값을 묶는다: Y 면은 0(검정), UV 면은
+    /// 128(무채색). 결과는 초록이 아니라 검은 사각형이고, 그것이 원래 의도였다.
+    ///
+    /// 1x1 이어도 된다 -- 어댑터가 `uv` 를 반환 size 로 만들므로(shared/paint `lib.rs` 의
+    /// `ExternalImageHandler::lock`) 1x1 을 그대로 보고하면 텍셀 하나가 사각형 전체로 늘어난다.
+    dummy_planes: Option<(gleam::gl::GLuint, gleam::gl::GLuint)>,
     /// 초당 한 줄 요약. ★임계값 위만 찍으면 '보통 한 번이 얼마인가'를 알 수 없다★ —
     /// 애니메이션 구간의 lock 은 평균 0.91ms 라 2ms 임계값 아래로 숨는데, 정작 프레임당
     /// 59회가 도는 것이 그것들이다. 홍수를 내지 않고 보려면 합계여야 한다.
@@ -834,6 +879,12 @@ impl MediaExternalImages {
             ring_init_frame: u64::MAX,
             ring_init_done: 0,
             ring_init_deferred: 0,
+            wrap_init_frame: u64::MAX,
+            wrap_init_done: 0,
+            wrap_init_deferred: 0,
+            wrap_init_rings: Default::default(),
+            wrap_denied_rings: Default::default(),
+            dummy_planes: None,
             lock_window_start: Instant::now(),
             lock_window_calls: 0,
             lock_window_consumes: 0,
@@ -876,6 +927,135 @@ impl MediaExternalImages {
             self.ring_init_deferred += 1;
             false
         }
+    }
+
+    /// 새 plane 텍스처의 EGLImage 래핑을 이 프레임에 만들어도 되는가.
+    ///
+    /// [`Self::may_initialize_ring_now`] 와 같은 판정을 래핑에 적용한다: 상한을 넘겼으면
+    /// `false` 이고, 호출자는 그 영상만 이번 프레임을 비운다(이 경로의 기존 선례 넷과 같은
+    /// 모양이다). 기준이 시간이 아니라 **렌더 프레임**인 이유도 같다 -- 프레임이 이미 부풀어
+    /// 있으면 시간 창은 그 안에서 다시 차서 아무것도 막지 못한다.
+    ///
+    /// ★캐시 적중은 여기 오지 않는다★ -- 호출자가 캐시를 먼저 보고, 없을 때만 묻는다.
+    /// 그래서 정상 상태(래핑이 다 데워진 뒤)에는 이 게이트가 한 번도 물리지 않는다.
+    ///
+    /// 예산은 링 하나 단위다(`wrap_init_rings` 주석 참고).
+    fn may_create_wrap_now(&mut self, ring_id: u64) -> bool {
+        let max_per_frame = servo_config::pref!(media_wrap_init_max_per_frame);
+        if max_per_frame <= 0 {
+            return true;
+        }
+        // 이 프레임에 이미 예산을 받은 링이면 나머지 면도 함께 통과시킨다.
+        if self.wrap_init_rings.contains(&ring_id) {
+            return true;
+        }
+        if self.wrap_init_done < max_per_frame {
+            self.wrap_init_done += 1;
+            self.wrap_init_rings.insert(ring_id);
+            true
+        } else {
+            self.wrap_init_deferred += 1;
+            // 거부도 기억한다 -- 같은 링의 캐시 히트 면까지 함께 비우기 위해서다
+            // (`wrap_denied_rings` 주석 참고).
+            self.wrap_denied_rings.insert(ring_id);
+            false
+        }
+    }
+
+    /// 이 면을 이번 프레임에 내줄 수 없을 때의 반환값.
+    ///
+    /// 중립 텍스처를 만들 수 있으면 그것을(= 검은 사각형), 못 만들면 예전대로 `Invalid` 를
+    /// 돌려준다. `lock_d3d11` 의 이른 반환들이 전부 이것을 쓴다 -- 그 자리들이 의도한 것은
+    /// 언제나 "이번 프레임은 비운다" 였고, `Invalid` 는 비우는 대신 초록으로 칠한다
+    /// (`dummy_planes` 주석 참고).
+    fn neutral_or_invalid(
+        &mut self,
+        rc: &Rc<dyn RenderingContext>,
+        plane_index: usize,
+    ) -> (ExternalImageSource<'static>, Size2D<i32>) {
+        match self.neutral_plane_texture(rc, plane_index) {
+            Some(texture) => (
+                ExternalImageSource::NativeTexture(texture),
+                Size2D::new(1, 1),
+            ),
+            None => (ExternalImageSource::Invalid, Size2D::zero()),
+        }
+    }
+
+    /// 이 면을 내줄 수 없을 때 대신 묶을 중립 텍스처(`dummy_planes` 주석 참고).
+    ///
+    /// 만들지 못하면 `None` 이고, 호출자는 예전처럼 `Invalid`(= 초록)로 떨어진다. 만드는 일은
+    /// 프로세스당 두 번뿐이다.
+    fn neutral_plane_texture(
+        &mut self,
+        rc: &Rc<dyn RenderingContext>,
+        plane_index: usize,
+    ) -> Option<gleam::gl::GLuint> {
+        use gleam::gl;
+
+        if self.dummy_planes.is_none() {
+            let api = rc.gleam_gl_api();
+            // Y 는 0(검정), UV 는 128(무채색). RGBA8 하나로 둘 다 덮는다 -- 단면(.r)으로
+            // 읽히든 NV12 의 두 면(.rg)으로 읽히든 같은 값이 나온다.
+            let make = |fill: [u8; 4]| -> gl::GLuint {
+                let texture = api.gen_textures(1)[0];
+                api.bind_texture(gl::TEXTURE_2D, texture);
+                api.tex_image_2d(
+                    gl::TEXTURE_2D,
+                    0,
+                    gl::RGBA8 as gl::GLint,
+                    1,
+                    1,
+                    0,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    Some(&fill),
+                );
+                // 1x1 을 사각형 전체로 늘려 쓰므로 가장자리로 고정한다.
+                for (name, value) in [
+                    (gl::TEXTURE_MIN_FILTER, gl::NEAREST),
+                    (gl::TEXTURE_MAG_FILTER, gl::NEAREST),
+                    (gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE),
+                    (gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE),
+                ] {
+                    api.tex_parameter_i(gl::TEXTURE_2D, name, value as gl::GLint);
+                }
+                api.bind_texture(gl::TEXTURE_2D, 0);
+                texture
+            };
+            let luma = make([0, 0, 0, 255]);
+            let chroma = make([128, 128, 128, 255]);
+            if luma == 0 || chroma == 0 {
+                return None;
+            }
+            self.dummy_planes = Some((luma, chroma));
+        }
+        let (luma, chroma) = self.dummy_planes?;
+        Some(if plane_index == 0 { luma } else { chroma })
+    }
+
+    /// 래핑 예산의 프레임 경계를 처리한다.
+    ///
+    /// ★캐시 조회보다 먼저 불러야 한다.★ 예산을 묻는 자리는 캐시 미스뿐인데, 거부 기록은
+    /// 캐시 히트에도 적용되어야 하므로(`wrap_denied_rings`) 경계 정리가 그보다 앞서야 한다.
+    /// [`Self::may_create_wrap_now`] 안에 두면 히트만 있는 면이 지난 프레임의 거부 기록을
+    /// 보게 된다.
+    fn roll_wrap_budget_frame(&mut self) {
+        let frame = paint_api::render_frame::current_render_frame();
+        if frame == self.wrap_init_frame {
+            return;
+        }
+        if self.wrap_init_deferred > 0 {
+            info!(
+                "MEDIAWRAPDEFER frame={} wrapped={} deferred={}",
+                self.wrap_init_frame, self.wrap_init_done, self.wrap_init_deferred,
+            );
+        }
+        self.wrap_init_frame = frame;
+        self.wrap_init_done = 0;
+        self.wrap_init_deferred = 0;
+        self.wrap_init_rings.clear();
+        self.wrap_denied_rings.clear();
     }
 
     /// 제거된 링들을 정리한다: `mapped` 텍스처 Unmap(Presenting은 레지스트리가
@@ -931,14 +1111,14 @@ impl MediaExternalImages {
         // lock 한다. 따라서 이 호출이 곧 "이 영상이 이 타일에 보인다" 이고,
         // 프로듀서는 여기에 기록된 디바이스에만 업로드한다.
         let Some(device) = self.device else {
-            return (ExternalImageSource::Invalid, Size2D::zero());
+            return self.neutral_or_invalid(&rc, binding.plane_index);
         };
         // 수요 표시와 링 찾기를 레지스트리 획득 **한 번**으로 끝낸다(전역 뮤텍스 경합).
         //
         // 이 디바이스에 아직 링이 없다(첫 수요). 프로듀서가 다음 프레임에 만든다 —
         // 이번 프레임만 비운다. lock_count 를 올리지 않았으므로 unlock 도 no-op 이다.
         let Some(ring_id) = D3d11PlaneRings::note_demand_and_ring(binding.group_id, device) else {
-            return (ExternalImageSource::Invalid, Size2D::zero());
+            return self.neutral_or_invalid(&rc, binding.plane_index);
         };
 
         // ★새 링이면 상한을 먼저 묻는다★ — 계획을 뽑기 **전에** 물어야 한다(위 필드 주석).
@@ -947,7 +1127,7 @@ impl MediaExternalImages {
         let first_consume = !self.initialized_rings.contains(&ring_id);
         if first_consume {
             if !self.may_initialize_ring_now() {
-                return (ExternalImageSource::Invalid, Size2D::zero());
+                return self.neutral_or_invalid(&rc, binding.plane_index);
             }
             // 같은 프레임의 나머지 면(1, 2)이 다시 묻지 않도록 지금 등록한다 — 실제 Map 은
             // 면 0 의 계획 하나가 전부 처리한다.
@@ -980,15 +1160,43 @@ impl MediaExternalImages {
             Some(plane) => plane,
             None => match D3d11PlaneRings::presenting_plane(ring_id, binding.plane_index) {
                 Some(plane) => plane,
-                None => return (ExternalImageSource::Invalid, Size2D::zero()),
+                None => return self.neutral_or_invalid(&rc, binding.plane_index),
             },
         };
 
+        // ★프레임 경계 정리와 거부 확인은 캐시 조회보다 먼저다.★ 이 링이 이번 프레임에
+        // 이미 예산을 거부당했다면, 이 면이 캐시에 있더라도 비운다 -- 한 링은 전부 그려지거나
+        // 전부 비거나 둘 중 하나여야 한다(`wrap_denied_rings` 주석: 섞이면 초록 화면이다).
+        self.roll_wrap_budget_frame();
+        if self.wrap_denied_rings.contains(&ring_id) {
+            return self.neutral_or_invalid(&rc, binding.plane_index);
+        }
+
         // EGLImage 래핑 캐시(텍스처 usize 키). 정상 상태에서 프레임당 재래핑 0.
-        let wrap = if let Some(cached) = self.d3d11_wrap_cache.get(&plane.texture) {
-            *cached
+        let cached_wrap = self.d3d11_wrap_cache.get(&plane.texture).copied();
+        let wrap = if let Some(cached) = cached_wrap {
+            // ★히트도 이 링을 '이번 프레임 통과' 로 적는다.★ 면이 어느 순서로 해석되는지는
+            // 정해져 있지 않다. 히트인 면이 먼저 나가 버린 뒤에 미스인 형제가 예산에 걸리면
+            // 그 링은 이미 반쯤 그려진 뒤이고, 위의 거부 확인으로도 되돌릴 수 없다.
+            //
+            // 예산을 쓰지 않고 적기만 하는 것이 맞다 -- 한 링의 면들은 이 게이트가 언제나 다
+            // 함께 래핑하므로(전부 통과 아니면 전부 거부), 한 면이 캐시에 있으면 형제들도 있다.
+            self.wrap_init_rings.insert(ring_id);
+            cached
         } else {
             wrap_cached = false;
+            // ★새 래핑도 프레임당 상한을 먼저 묻는다★ -- 링 초기화와 같은 이유다. 전환
+            // 직후에는 모든 면의 텍스처가 새것이라 한 프레임이 래핑 수십 건을 몰아 물고,
+            // 실측(log_ani_debug/10)에서 그 프레임의 렌더가 100~220ms 가 됐다. 표출 클럭이
+            // 같은 스레드에 있으므로 그동안 타일 넷이 함께 멈춘다.
+            //
+            // 상한에 걸리면 이 영상만 이번 프레임을 비우고 다음 프레임에 뜬다. 여기까지
+            // 왔으면 `locked_d3d11_planes` 에 이미 넣었으므로 unlock 이 짝을 맞추고,
+            // 소비 계획이 있었다면 `consume_plan` 이 이미 커밋을 끝냈다 -- 비우는 것은
+            // 이번 프레임의 그림뿐이고 링 상태는 온전하다.
+            if !self.may_create_wrap_now(ring_id) {
+                return self.neutral_or_invalid(&rc, binding.plane_index);
+            }
             let import_start = std::time::Instant::now(); // D3D11PROF
             match rc.wrap_d3d11_texture_as_gl_texture(plane.texture) {
                 Some(wrap) => {
@@ -1036,7 +1244,7 @@ impl MediaExternalImages {
                         "D3D11 media: EGLImage 래핑 실패 (texture={})",
                         plane.texture
                     );
-                    return (ExternalImageSource::Invalid, Size2D::zero());
+                    return self.neutral_or_invalid(&rc, binding.plane_index);
                 },
             }
         };
@@ -1136,6 +1344,12 @@ impl Drop for MediaExternalImages {
         let Some(rc) = self.rendering_context.clone() else {
             return;
         };
+        // 0) 중립 텍스처 둘(`dummy_planes`). device 유무와 무관하게 만들어질 수 있으므로
+        //    아래 device 검사보다 먼저 지운다.
+        if let Some((luma, chroma)) = self.dummy_planes.take() {
+            rc.gleam_gl_api().delete_textures(&[luma, chroma]);
+        }
+
         // 1) 이미 제거된 링: 전체 정리(Unmap + 래핑 파기 + Release).
         let Some(device) = self.device else {
             return;

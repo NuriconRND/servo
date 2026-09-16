@@ -665,6 +665,28 @@ pub struct Preferences {
     /// 프레임에 비어 보이는데, 이 경로에는 이미 같은 선례가 있다(링이 아직 없으면 그
     /// 프레임을 비우고 다음 프레임에 뜬다).
     pub media_ring_init_max_per_frame: i64,
+    /// 한 렌더 프레임에 EGLImage 래핑을 새로 만들어도 되는 **영상 수**.
+    /// `0` 이면 무제한(예전 동작).
+    ///
+    /// ***`media_ring_init_max_per_frame` 이 덮지 못하는 나머지 절반이다.*** 그쪽은 링의
+    /// 최초 소비(`Map`)만 막는데, plane 텍스처를 GL 로 래핑하는 일은 그 뒤에 있고 슬롯이
+    /// presenting 으로 돌 때마다 새 텍스처에 대해 다시 일어난다. 실측(2026-09-16,
+    /// log_ani_debug/10, 54 x FHD30 전환): 소비가 없는 lock 이 래핑만으로 3~4ms 를 쓰고
+    /// (`MEDIALOCK consume_ms=0.00 wrap_ms=3.18 wrap_cached=false`), 느린 lock 의 2/3 가
+    /// 캐시 미스였다. 그 결과 전환 직후 렌더 한 패스가 resolve 37~55 건에 100~130ms 를
+    /// 쓰는데(`WRSLOW resolve_lock_ms=103 / renderer_ms=109`) 정작 그리기는 4.3ms 다 --
+    /// 렌더의 95% 가 래핑 대기였다. 한 패스가 1.8ms 에서 40~97ms 로 부풀어 초당 58 회
+    /// 돌던 것이 10~24 회가 되고, 표출 클럭이 같은 스레드에 있으므로 벽 전체가 9~46fps 로
+    /// 떨어진다.
+    ///
+    /// ***단위는 면이 아니라 영상이다.*** YUV 한 장은 면 2~3 개가 모두 풀려야 그려지므로,
+    /// 면 단위로 세면 색이 깨진 프레임이 나온다. 차례가 오지 않은 영상은 그 프레임에 비어
+    /// 보이고 다음 프레임에 뜬다 -- 이 경로의 기존 선례와 같다.
+    ///
+    /// 기본값 `2`: 영상 하나의 래핑 한 벌이 3~12ms 이므로 프레임 예산 안에 든다. 링 초기화가
+    /// 이미 프레임당 1 개로 묶여 있어 새 영상은 어차피 1/프레임으로 뜨고, 남는 한 칸이 이미
+    /// 떠 있는 영상들의 슬롯 회전을 따라가게 한다.
+    pub media_wrap_init_max_per_frame: i64,
     /// 새 영상의 **첫 프레임을 미리 스테이징**해 둘지. 켜면 영상이 한 프레임 일찍 뜨고,
     /// 그 대가를 렌더 스레드가 낸다.
     ///
@@ -1125,6 +1147,7 @@ impl Preferences {
             // 동작 보존).
             media_d3d11_enabled: false,
             media_ring_init_max_per_frame: 1,
+            media_wrap_init_max_per_frame: 2,
             media_ring_stage_first_frame: false,
             media_release_detached_player: true,
             dom_webgl_idle_context_reclaim_ms: 3000,
