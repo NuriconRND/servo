@@ -131,7 +131,7 @@ use crate::dom::customelementregistry::{
     CallbackReaction, CustomElementDefinition, CustomElementReactionStack,
 };
 use crate::dom::document::focus::FocusableArea;
-use crate::dom::document::take_rendering_update_reasons;
+use crate::dom::document::{note_rendering_update_reason, take_rendering_update_reasons};
 use crate::dom::document::{
     Document, DocumentSource, HasBrowsingContext, IsHTMLDocument, RenderingUpdateReason,
 };
@@ -467,6 +467,16 @@ pub struct ScriptThread {
     /// animation tick, or if there are no animations running and the [`ScriptThread`] has noticed a
     /// change that requires a rendering update.
     needs_rendering_update: Arc<AtomicBool>,
+
+    /// 위 플래그를 **폴백 타이머**가 세웠는가.
+    ///
+    /// ★진단용.★ `reflow_display` 가 실제 렌더 대비 1.8~2.2 배로 돈다(2026-09-16,
+    /// log_ani_debug/16: 렌더 61 회인 초에 렌더링 갱신 117 회). 플래그를 세우는 자리는
+    /// 렌더러 틱과 이 타이머 둘뿐인데, 어느 쪽이 두 배인지 로그로 갈리지 않아 원인을
+    /// 세 번 잘못 짚었다. 타이머 콜백은 **다른 스레드**에서 돌아
+    /// `note_rendering_update_reason`(thread_local 집계)을 거기서 부를 수 없으므로,
+    /// 표시만 해 두고 스크립트 스레드가 갱신을 실제로 돌릴 때 집계한다.
+    rendering_update_from_timer: Arc<AtomicBool>,
 
     debugger_global: Dom<DebuggerGlobalScope>,
 
@@ -1108,6 +1118,7 @@ impl ScriptThread {
                     layout_factory,
                     scheduled_update_the_rendering: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
+                    rendering_update_from_timer: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
                     privileged_urls: state.privileged_urls,
@@ -1190,8 +1201,10 @@ impl ScriptThread {
 
         debug!("Scheduling ScriptThread animation frame.");
         let trigger_script_thread_animation = self.needs_rendering_update.clone();
+        let from_timer = self.rendering_update_from_timer.clone();
         let timer_id = self.schedule_timer(TimerEventRequest {
             callback: Box::new(move || {
+                from_timer.store(true, Ordering::Relaxed);
                 trigger_script_thread_animation.store(true, Ordering::Relaxed);
             }),
             duration: delay,
@@ -1337,6 +1350,9 @@ impl ScriptThread {
         self.last_render_opportunity_time.set(Some(Instant::now()));
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
+        if self.rendering_update_from_timer.swap(false, Ordering::Relaxed) {
+            note_rendering_update_reason("fallback-timer");
+        }
 
         if !self.can_continue_running_inner() {
             return false;
@@ -1557,6 +1573,31 @@ impl ScriptThread {
             // 20 milliseconds (50 FPS) is used here in order to allow any renderer-based
             // animation ticks to arrive first.
             Duration::from_millis(20)
+        };
+
+        // ★두 상수 다 60Hz 벽에서는 렌더러 틱보다 짧다.★
+        //
+        // 이 타이머는 렌더러가 틱을 주지 않을 때를 위한 폴백이고(위 두 주석이 "allow
+        // renderer-based ticks to arrive first" 라고 말한다), 위쪽 이른 반환이 렌더러를
+        // 믿는 조건은 `running_animations && built_any_display_lists` 다. 그런데 이 벽은
+        // 전환 **사이**에 CSS 애니메이션이 하나도 없어도 비디오가 문서를 계속 더럽혀
+        // 렌더러 틱이 끊이지 않는다 -- 믿어도 되는 상황인데 폴백이 매번 걸린다. 그리고
+        // 20ms 는 60Hz 틱 주기(16.7ms)보다 짧으므로 틱 사이에 **반드시** 한 번 끼어든다.
+        //
+        // 그래서 렌더링 갱신이 프레임당 두 번 돌았다. 실측(2026-09-16, log_ani_debug/15):
+        // 문서 하나인데 `reflow_display` 가 초당 107~117 이고 같은 초의 벽 출력은 60~62fps 다
+        // (60 + 50 = 110 과 맞는다). 갱신마다 디스플레이 리스트가 한 장 더 나가므로 리플로
+        // 비용이 두 배가 되고, **페이지가 아직 다 꾸미지 못한 중간 상태가 그려질 기회도 두
+        // 배가 된다** -- 전환 때 새 구성이 제자리에 한 장 번쩍였다가 애니메이션이 재생되는
+        // 증상이 그 중간 상태다(log_ani_debug/15 의 `edge=first`: 21 건 중 13 건이
+        // `set_missing`, 즉 그 요소의 애니메이션이 아직 문서 세트에 없는 시점에 그려졌다).
+        //
+        // 상수는 그대로 두고 리프레시 한 주기의 1.5 배를 하한으로 준다. 60Hz 면 25ms 라
+        // 16.7ms 틱이 언제나 먼저 와서 취소하고, 기본값 120Hz 면 12.5ms 라 예전 값이 그대로
+        // 남는다. 틱이 진짜로 끊기면 그 1.5 주기 뒤에 폴백이 살아나므로 원래 뜻도 유지된다.
+        let animation_delay = {
+            let hz = pref!(gfx_refresh_hz).clamp(1, 1000) as f64;
+            animation_delay.max(Duration::from_secs_f64(1.5 / hz))
         };
 
         let time_since_last_rendering_opportunity = self
@@ -2126,6 +2167,7 @@ impl ScriptThread {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
             ScriptThreadMessage::TickAllAnimations(_webviews) => {
+                note_rendering_update_reason("renderer-tick");
                 self.set_needs_rendering_update();
             },
             ScriptThreadMessage::NoLongerWaitingOnAsychronousImageUpdates(pipeline_id) => {

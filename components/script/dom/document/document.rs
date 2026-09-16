@@ -333,7 +333,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-fn note_rendering_update_reason(reason: &'static str) {
+pub(crate) fn note_rendering_update_reason(reason: &'static str) {
     RENDERING_UPDATE_REASONS.with(|counts| {
         let mut counts = counts.borrow_mut();
         match counts.iter_mut().find(|(name, _)| *name == reason) {
