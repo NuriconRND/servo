@@ -127,6 +127,11 @@ thread_local! {
         const { std::cell::Cell::new((None, 0)) };
     static EDGE_BUDGET_GAINED: std::cell::Cell<(Option<std::time::Instant>, u32)> =
         const { std::cell::Cell::new((None, 0)) };
+    /// ★세 번째 예산: 한 번도 묶인 적 없는 노드의 첫 디스플레이 리스트.★ `lost` 와 나누는
+    /// 이유는 `gained` 를 나눈 것과 같다 -- 전환은 새 요소를 수십 개 한꺼번에 들이므로, 예산이
+    /// 하나면 그 무리가 정작 필요한 `lost` 한 줄을 같은 초에 밀어낸다.
+    static EDGE_BUDGET_FIRST: std::cell::Cell<(Option<std::time::Instant>, u32)> =
+        const { std::cell::Cell::new((None, 0)) };
 }
 
 fn property_name(property: u8) -> &'static str {
@@ -229,21 +234,49 @@ fn note_unbound(
 ) {
     // Bumped for every unbound outcome, not only the edge: the count is read at the far
     // end, by `note_gained`.
-    UNBOUND_STREAK.with(|cell| {
+    let streak = UNBOUND_STREAK.with(|cell| {
         let mut map = cell.borrow_mut();
         // A page that churns nodes would otherwise grow this map without bound. Dropping
         // it whole costs at most one under-reported streak.
         if map.len() > 4096 {
             map.clear();
         }
-        *map.entry((node.0 as u64, property)).or_insert(0) += 1;
+        let entry = map.entry((node.0 as u64, property)).or_insert(0);
+        *entry += 1;
+        *entry
     });
     let was_bound = BOUND_PREVIOUS.with(|cell| cell.borrow().contains(&(node.0 as u64, property)));
-    if !was_bound || !edge_line_allowed(&EDGE_BUDGET_LOST) {
+    // ★한 번도 묶인 적 없는 노드의 첫 디스플레이 리스트도 찍는다(`edge=first`).★
+    //
+    // `was_bound` 만 보면 **새로 등장하는 요소는 통째로 로그에 안 남는다** -- 묶인 적이 없으니
+    // 잃을 것도 없기 때문이다. 그런데 전환 때 사용자가 보는 "새 구성이 제자리에 한 장 번쩍
+    // 떴다가 애니메이션이 재생된다" 가 정확히 그 구간이고(`edge=gained` 의 `unbound_dls` 가
+    // 1~2 인 것들, 로그 90 건 중 75 건), 그 한 장에 무엇이 구워졌는지는 `PAINTANIMSTATIC` 이
+    // 말해 주지만 **왜** 값이 없었는지는 아무 줄도 말해 주지 않았다.
+    //
+    // 그 공백 때문에 원인을 두 번 잘못 짚었다(2026-09-16): 예측 원점(e81236c6e8a)과 승급
+    // 시점(5679427ad7b) 둘 다 실측에서 효과가 없었다. 값이 없는 조건은 넷인데
+    // (`get_property_declaration_at_time`: 지연 중 + fill 이 안 붙듦 / Canceled /
+    // computed_steps 없음 / 이미 끝남) 그중 어느 것인지 `describe_animations` 가 이미 답할 수
+    // 있었고, 조건 하나가 그것을 막고 있었을 뿐이다.
+    let edge = if was_bound {
+        "lost"
+    } else if streak == 1 {
+        "first"
+    } else {
+        return;
+    };
+    let budget = if was_bound {
+        &EDGE_BUDGET_LOST
+    } else {
+        &EDGE_BUDGET_FIRST
+    };
+    if !edge_line_allowed(budget) {
         return;
     }
     log::warn!(
-        "PAINTANIMEDGE edge=lost node={} prop={} reason={} anims=[{}]",
+        "PAINTANIMEDGE edge={} node={} prop={} reason={} anims=[{}]",
+        edge,
         node.0,
         property_name(property),
         reason,
