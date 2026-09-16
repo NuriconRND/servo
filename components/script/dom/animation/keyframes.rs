@@ -71,3 +71,70 @@ pub fn resolve_offsets(declared: &[Option<f64>]) -> Result<Vec<f64>, KeyframeErr
 
     Ok(output)
 }
+
+/// 애니메이션 반복 횟수. stylo 의 `KeyframesIterationState` 로 옮기기 전 형태다.
+#[derive(Debug, PartialEq)]
+pub enum IterationSpec {
+    /// 유한 반복.
+    Finite(f64),
+    /// 무한 반복.
+    Infinite,
+}
+
+/// 밀리초 duration 을 stylo 가 쓰는 초 단위로 옮긴다.
+///
+/// ***`None` 이면 애니메이션을 만들지 않는다.*** `stylo::Animation` 은 진행도를
+/// `(now - started_at) / duration` 으로 계산하므로 0 이면 나눗셈이 깨진다. CSS 경로도
+/// `maybe_start_animations` 에서 `if duration == 0. { continue; }` 로 같은 것을 막는다.
+pub fn resolve_duration_seconds(duration_ms: f64) -> Option<f64> {
+    if !duration_ms.is_finite() || duration_ms <= 0.0 {
+        return None;
+    }
+    Some(duration_ms / 1000.0)
+}
+
+/// `iterations` 옵션을 해석한다. 음수와 NaN 은 `TypeError` 다.
+pub fn resolve_iterations(iterations: f64) -> Result<IterationSpec, KeyframeError> {
+    if iterations.is_nan() || iterations < 0.0 {
+        return Err(KeyframeError::InvalidIterations);
+    }
+    if iterations.is_infinite() {
+        return Ok(IterationSpec::Infinite);
+    }
+    Ok(IterationSpec::Finite(iterations))
+}
+
+/// <https://drafts.csswg.org/web-animations-1/#animation-property-name-to-idl-attribute-name>
+/// 의 역방향. 키프레임의 키는 IDL 속성 이름(camelCase)일 수도, CSS 속성 이름일 수도 있다.
+pub fn css_property_name(idl_name: &str) -> String {
+    match idl_name {
+        "cssFloat" => return "float".to_owned(),
+        "cssOffset" => return "offset".to_owned(),
+        _ => {},
+    }
+
+    // 이미 CSS 이름(하이픈이 있거나 대문자가 없다)이면 그대로 둔다.
+    if !idl_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return idl_name.to_owned();
+    }
+
+    let mut output = String::with_capacity(idl_name.len() + 2);
+    if let Some(rest) = idl_name.strip_prefix("webkit") {
+        output.push_str("-webkit");
+        push_kebab(&mut output, rest);
+        return output;
+    }
+    push_kebab(&mut output, idl_name);
+    output
+}
+
+fn push_kebab(output: &mut String, input: &str) {
+    for character in input.chars() {
+        if character.is_ascii_uppercase() {
+            output.push('-');
+            output.push(character.to_ascii_lowercase());
+        } else {
+            output.push(character);
+        }
+    }
+}

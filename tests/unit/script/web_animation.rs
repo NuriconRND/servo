@@ -2,7 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use script::test::web_animation::{KeyframeError, resolve_offsets};
+use script::test::web_animation::{
+    IterationSpec, KeyframeError, css_property_name, resolve_duration_seconds, resolve_iterations,
+    resolve_offsets,
+};
 
 #[test]
 fn offsets_empty() {
@@ -78,4 +81,61 @@ fn offsets_decreasing_is_rejected() {
         resolve_offsets(&[Some(0.6), Some(0.2)]),
         Err(KeyframeError::OffsetOutOfOrder)
     );
+}
+
+#[test]
+fn duration_is_milliseconds_to_seconds() {
+    assert_eq!(resolve_duration_seconds(1000.0), Some(1.0));
+    assert_eq!(resolve_duration_seconds(450.0), Some(0.45));
+}
+
+#[test]
+fn non_positive_or_non_finite_duration_creates_nothing() {
+    // ***하드 가드.*** stylo 의 Animation 은 진행도를
+    // `(now - started_at) / duration` 으로 계산하므로 0 이면 나눗셈이 깨진다.
+    // CSS 경로도 `maybe_start_animations` 에서 `if duration == 0. { continue; }`
+    // 로 같은 것을 막고 있다.
+    assert_eq!(resolve_duration_seconds(0.0), None);
+    assert_eq!(resolve_duration_seconds(-1.0), None);
+    assert_eq!(resolve_duration_seconds(f64::NAN), None);
+    assert_eq!(resolve_duration_seconds(f64::INFINITY), None);
+}
+
+#[test]
+fn iterations_finite_and_infinite() {
+    assert_eq!(resolve_iterations(1.0), Ok(IterationSpec::Finite(1.0)));
+    assert_eq!(resolve_iterations(2.5), Ok(IterationSpec::Finite(2.5)));
+    assert_eq!(resolve_iterations(0.0), Ok(IterationSpec::Finite(0.0)));
+    // 마퀴가 iterations: Infinity 를 넘긴다.
+    assert_eq!(
+        resolve_iterations(f64::INFINITY),
+        Ok(IterationSpec::Infinite)
+    );
+}
+
+#[test]
+fn iterations_negative_or_nan_is_rejected() {
+    assert_eq!(
+        resolve_iterations(-1.0),
+        Err(KeyframeError::InvalidIterations)
+    );
+    assert_eq!(
+        resolve_iterations(f64::NAN),
+        Err(KeyframeError::InvalidIterations)
+    );
+}
+
+#[test]
+fn property_names_map_from_idl_to_css() {
+    assert_eq!(css_property_name("opacity"), "opacity");
+    assert_eq!(css_property_name("transform"), "transform");
+    // 페이지(useEntranceAnimation.ts toCssFrames)가 camelCase 로 넘긴다.
+    assert_eq!(css_property_name("transformOrigin"), "transform-origin");
+    // 이미 CSS 이름이면 그대로.
+    assert_eq!(css_property_name("transform-origin"), "transform-origin");
+    // 명세가 정한 두 예외.
+    assert_eq!(css_property_name("cssFloat"), "float");
+    assert_eq!(css_property_name("cssOffset"), "offset");
+    // 벤더 접두사는 앞에 하이픈이 붙는다.
+    assert_eq!(css_property_name("webkitTransform"), "-webkit-transform");
 }

@@ -81,5 +81,8 @@ pub mod encoding_detection {
 }
 
 pub mod web_animation {
-    pub use crate::dom::animation::keyframes::{KeyframeError, resolve_offsets};
+    pub use crate::dom::animation::keyframes::{
+        IterationSpec, KeyframeError, css_property_name, resolve_duration_seconds,
+        resolve_iterations, resolve_offsets,
+    };
 }
