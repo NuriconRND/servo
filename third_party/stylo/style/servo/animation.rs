@@ -545,6 +545,13 @@ pub struct Animation {
     pub name: Atom,
 
     /// The properties that change in this animation.
+    ///
+    /// ***물리(physical) 속성 집합이다.*** `animating_properties` 와 마찬가지로
+    /// `to_physical(writing_mode)` 를 거친 뒤의 것을 담는다 -- 이 필드를 비교하는
+    /// 유일한 소비처(`start_script_animations` 의 회수 규칙)가 값 맵의 키 공간과
+    /// 맞대야 하기 때문이다. 값 맵은 물리 속성으로 채워지므로, 논리 속성 그대로
+    /// 저장하면 같은 논리 속성이라도 요소의 `writing-mode` 가 바뀌는 사이 다른
+    /// 물리 속성으로 매핑되어 커버리지 비교가 조용히 틀릴 수 있다.
     properties_changed: PropertyDeclarationIdSet,
 
     /// The computed style for each keyframe of this animation.
@@ -1366,6 +1373,14 @@ impl ElementAnimationSet {
                 }
             }
 
+            // 회수 규칙과 `Animation::properties_changed` 에는 이 물리 집합을
+            // 써야 한다 -- 값 맵이 물리 속성으로 채워지므로, 회수 규칙이 논리
+            // 집합끼리 비교하면 `writing-mode` 가 바뀐 사이 같은 논리 속성이
+            // 다른 물리 속성을 가리켜 커버리지 판정이 조용히 틀릴 수 있다.
+            // `animating_properties` 는 바로 아래에서 `generate_for_keyframes` 로
+            // 이동하므로 그 전에 복제해 둔다.
+            let physical_properties = animating_properties.clone();
+
             let computed_steps = ComputedKeyframe::generate_for_keyframes(
                 element,
                 &request.keyframes,
@@ -1397,9 +1412,30 @@ impl ElementAnimationSet {
             //
             // 그래서 **관측될 수 없는 것만** 버린다. 끝난 애니메이션이 값을 내놓는
             // 것은 `fill_mode` 가 `Forwards`/`Both` 일 때뿐이고, 그때도 새 애니메이션이
-            // 그 속성을 전부 덮으면 값 맵에서 나중 항목이 앞 항목을 덮어 관측되지
-            // 않는다. 덮지 못하면 남긴다 -- 그 속성의 최종 값을 아직 그것이 붙들고 있다.
-            let new_properties = &request.keyframes.properties_changed;
+            // 그 속성을 전부 덮으면 값 맵에서 나중 항목이 앞 항목을 덮는다 -- **단,
+            // 이는 새 애니메이션이 그 속성을 계속 내놓는 동안만이다.** 새 것이 나중에
+            // 취소되거나 자신의 `fill: none`/`backwards` 로 끝나면 옛 값은 이미
+            // `Vec` 에서 지워진 뒤라 되돌릴 수 없다 -- 스펙의 "removing replaced
+            // animations" 가 갖는 되돌릴 수 있는 대체 상태가 아니라 단순 삭제다.
+            // 이 간극은 의도적으로 다루지 않는다(이 최소 구현의 범위 밖).
+            //
+            // 비교는 반드시 **물리(physical)** 속성 집합끼리 해야 한다.
+            // `Animation::properties_changed` 가 물리 집합인 이유가 이것이다 --
+            // 값 맵은 물리 속성으로 채워지므로, 논리 속성으로 비교하면
+            // `writing-mode` 가 바뀐 사이 같은 논리 속성이 다른 물리 속성을
+            // 가리켜 커버리지 판정이 조용히 틀릴 수 있다.
+            //
+            // ***불변조건: `Finished` 는 종단 상태다.*** 이 규칙(조건 2)은
+            // `Finished` 가 된 애니메이션이 다시는 값을 더 내놓지 않는다는 것에
+            // 기대고 있다. 오늘은 `Finished` 가 `state == Running && has_ended(now)`
+            // 일 때 딱 한 곳에서만 대입되므로 참이다 -- `has_ended` 는
+            // `on_last_iteration()` 이 거짓이면(`Infinite` 반복은 항상 거짓이다)
+            // `false` 를 돌려주므로 `Finished` + `Infinite` 조합은 지금 도달 불가능
+            // 하다. 앞으로 누가 `Finished` 를 다른 곳에서 직접 대입하게 되면
+            // (`Finished` + `Infinite` + `fill: none` 처럼) 끝없이 끝 키프레임
+            // 값을 계속 내놓는 애니메이션이 생길 수 있고, 그러면 이 규칙이 그것을
+            // 관측 가능한데도 버리게 된다 -- 실제 값 손실이다.
+            let new_properties = &physical_properties;
             self.animations.retain(|animation| {
                 if animation.origin != AnimationOrigin::Script
                     || animation.state != AnimationState::Finished
@@ -1423,7 +1459,7 @@ impl ElementAnimationSet {
 
             self.animations.push(Animation {
                 name: request.name,
-                properties_changed: request.keyframes.properties_changed.clone(),
+                properties_changed: physical_properties,
                 computed_steps,
                 // 리스타일 시점의 타임라인 값. `animate()` 호출과 같은 렌더링 갱신이다.
                 started_at: context.current_time_for_animations,
@@ -2094,6 +2130,14 @@ pub fn maybe_start_animations<E>(
             }
         }
 
+        // 스크립트 경로(`start_script_animations`)와 같은 이유로 물리 집합을
+        // 복제해 둔다: `Animation::properties_changed` 는 항상 물리 속성을
+        // 담는다는 불변조건을 두 경로가 함께 지켜야, 그 필드를 훑는 소비처가
+        // 원산지(origin)에 따라 다른 의미를 가정하지 않아도 된다. CSS 경로
+        // 자체는 이 필드를 읽지 않으므로(오직 스크립트 경로의 회수 규칙만
+        // 읽는다) 지금은 동작에 영향이 없다.
+        let physical_properties = animating_properties.clone();
+
         let computed_steps = ComputedKeyframe::generate_for_keyframes(
             element,
             &keyframe_animation,
@@ -2107,7 +2151,7 @@ pub fn maybe_start_animations<E>(
 
         let mut new_animation = Animation {
             name: name.clone(),
-            properties_changed: keyframe_animation.properties_changed.clone(),
+            properties_changed: physical_properties,
             computed_steps,
             started_at,
             duration,
