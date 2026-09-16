@@ -770,9 +770,37 @@ trait PrivateMatchMethods: TElement {
             .transitions
             .retain(|transition| transition.state != AnimationState::Finished);
 
-        animation_set
-            .animations
-            .retain(|animation| animation.state != AnimationState::Finished);
+        // ★스타일이 아직 이름을 지명하는 애니메이션은 끝났어도 남긴다.★
+        //
+        // 지우면 두 가지가 한꺼번에 깨진다. 둘 다 이 벽에서 관측됐다(2026-09-16,
+        // log_ani_debug/18).
+        //
+        // 1. ***끝난 애니메이션을 처음부터 다시 재생한다.*** `maybe_start_animations` 는
+        //    같은 이름이 세트에 **있을 때만** `update_from_other` 로 넘기고, 그 함수는
+        //    "NB: We shall not touch the started_at field, since we don't want to restart
+        //    the animation" 이라고 명시한다. 여기서 먼저 지우면 다음 리스타일이 "없다" 고
+        //    보고 `started_at = now` 로 새로 만든다 -- 그 보호가 무력해진다. 실측: 같은
+        //    노드에서 `ANIMSTART sd-anim-3` 이 started_at 8.131 -> 11.673 -> 14.363 ->
+        //    16.845 로 네 번, 그 사이 `ANIMCANCEL` 은 한 줄도 없다. 화면에서는 슬라이드-인
+        //    구성이 다 들어온 뒤 화면 밖으로 돌아갔다가 다시 들어오기를 반복한다.
+        //
+        // 2. ***`fill-mode: forwards` 가 붙들어야 할 마지막 키프레임이 함께 버려진다.***
+        //    세트에서 빠지면 레이아웃은 그 노드를 `not_in_set` 으로 보고 요소를 자기
+        //    스타일로 그린다. 이 페이지의 슬롯 컨테이너는 자기 스타일이
+        //    `translateX(±100%)` -- 가상 뷰포트 한 장 바깥 -- 이라 그대로 화면이 빈다.
+        //    애니메이션 종료 직후 1~2 초 검은 화면이 이것이다.
+        //
+        // 이름이 스타일에서 빠지면 `is_cancelled_in_new_style` 이 `Canceled` 로 바꾸고,
+        // `Canceled` 는 여기 조건에 걸리지 않으므로 그때 정리된다. 메모리를 아끼려던 원래
+        // 뜻은 거기서 지켜진다 -- 지금 붙들고 있는 것은 **스타일이 여전히 요구하는**
+        // 애니메이션뿐이다.
+        animation_set.animations.retain(|animation| {
+            animation.state != AnimationState::Finished ||
+                new_values
+                    .get_ui()
+                    .animation_name_iter()
+                    .any(|name| name.as_atom() == Some(&animation.name))
+        });
 
         // If the ElementAnimationSet is empty, and don't store it in order to
         // save memory and to avoid extra processing later.
