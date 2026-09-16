@@ -1384,6 +1384,43 @@ impl ElementAnimationSet {
                 computed_steps.len()
             );
 
+            // ***끝난 스크립트 애니메이션 중 관측될 수 없는 것을 회수한다.***
+            //
+            // `matching.rs` 의 `Finished` retain 은 스크립트 애니메이션을 무조건
+            // 남긴다 -- 스타일이 합성 이름을 지명할 수 없으니 그 조건으로는 영영
+            // 걸러지지 않고, 걸러면 `fill: forwards` 최종 값이 버려져 애니메이션
+            // 종료 후 검은 화면이 재현된다. 그런데 이름이 호출마다 새로 나오고
+            // `maybe_start_animations` 의 이름 중복 제거도 `Script` 를 건너뛰므로
+            // 아무것도 이들을 대체하지 않는다. 10초마다 전환하는 이 벽에서 24시간이면
+            // 한 요소에 8천 개가 쌓이고, `get_value_map_for_active_animations` 는 매
+            // 스타일 적용마다 그 전부를 훑는다.
+            //
+            // 그래서 **관측될 수 없는 것만** 버린다. 끝난 애니메이션이 값을 내놓는
+            // 것은 `fill_mode` 가 `Forwards`/`Both` 일 때뿐이고, 그때도 새 애니메이션이
+            // 그 속성을 전부 덮으면 값 맵에서 나중 항목이 앞 항목을 덮어 관측되지
+            // 않는다. 덮지 못하면 남긴다 -- 그 속성의 최종 값을 아직 그것이 붙들고 있다.
+            let new_properties = &request.keyframes.properties_changed;
+            self.animations.retain(|animation| {
+                if animation.origin != AnimationOrigin::Script
+                    || animation.state != AnimationState::Finished
+                {
+                    return true;
+                }
+
+                let holds_a_value = matches!(
+                    animation.fill_mode,
+                    AnimationFillMode::Forwards | AnimationFillMode::Both
+                );
+                if !holds_a_value {
+                    return false;
+                }
+
+                !animation
+                    .properties_changed
+                    .iter()
+                    .all(|property| new_properties.contains(property))
+            });
+
             self.animations.push(Animation {
                 name: request.name,
                 properties_changed: request.keyframes.properties_changed.clone(),
