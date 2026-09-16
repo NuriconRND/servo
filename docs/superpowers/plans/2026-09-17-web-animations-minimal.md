@@ -28,7 +28,12 @@
 태스크 본문을 덮어쓴다** — 본문은 실행 당시 그대로 기록으로 남기지만, 이 계획을 다시
 실행하는 사람은 해당 지점에서 본문 대신 여기를 따른다.
 
-1. **`plan:1278-1287` + `plan:1322-1335` — ★use-after-free★.**
+★**줄 번호로 가리키지 않는다.**★ 이 정오표 블록 자체가 아래 내용을 통째로 밀어내므로,
+삽입하는 순간 줄 번호는 정확히 이 블록의 길이만큼 어긋난다 — 실제로 한 번 그렇게 됐다.
+태스크·스텝 번호와 식별자로만 가리키고, 앞으로도 여기에 줄 번호를 되살리지 말 것.
+
+1. **Task 5 Step 5 (`Animations` 진입점) — `add_script_animation` 정의와
+   `root_newly_animating_dom_nodes` 조건 확장 — ★use-after-free★.**
    `add_script_animation(&self, key, request)` 가 `node` 인자도, 루팅도 없이 정의되어
    있고, 별도로 `root_newly_animating_dom_nodes` 의 조건을 `|| !set.pending_script.is_empty()`
    로 넓힌 뒤 "누수 창은 렌더링 갱신 한 번이다" 라는 문단이 그것을 안전하다고 주장한다.
@@ -47,24 +52,24 @@
    루팅 없이 채우는 경로가 생겨도 UAF 가 아니라 유계(bounded) 누수로만 퇴화한다. 커밋
    `51595bd213f` 로 반영됨.
 
-2. **`plan:206-213` — `resolve_offsets` 양 끝 고정 순서.** 코드가 first→0 고정을
+2. **Task 1 Step 4 — `resolve_offsets` 의 양 끝 고정 순서.** 코드가 first→0 고정을
    last→1 보다 먼저 적용해서, 키프레임이 하나뿐이면 `0.0` 으로 풀린다. 이 계획 자신의
-   테스트(`plan:79-84`, `offsets_single_frame_is_the_last_frame`)가 `[1.0]` 을
+   테스트(Task 1 Step 2 의 `offsets_single_frame_is_the_last_frame`)가 `[1.0]` 을
    기대하는 것과 모순되고, WAAPI 의 "compute missing keyframe offsets" 절차와도
    모순된다. **정정:** last→1 고정을 먼저 적용하고, 그다음 first→0 을 적용한다.
    n≥2 에서는 두 분기가 서로 다른 인덱스를 건드리므로 순서가 상관없다.
 
-3. **`plan:133-136` — 불가능한 테스트 단언.**
+3. **Task 1 Step 2 — `offsets_out_of_range_is_rejected` 안의 NaN 단언.**
    `assert_eq!(resolve_offsets(&[Some(f64::NAN)]), Err(KeyframeError::OffsetOutOfRange(f64::NAN)))`
    는 `KeyframeError` 가 `PartialEq` 를 derive 하는 한 절대 참이 될 수 없다 — `NaN != NaN`
    이기 때문이다. 검증 대상 동작 자체는 맞고, 단언문만 깨져 있다. **정정:**
    `assert!(matches!(resolve_offsets(&[Some(f64::NAN)]), Err(KeyframeError::OffsetOutOfRange(value)) if value.is_nan()));`
 
-4. **`plan:1358, 1369, 1372, 1375` — `Error::Type` 시그니처.** 계획은
+4. **Task 5 Step 6 — `Animate` 안의 `Error::Type` 네 곳.** 계획은
    `Error::Type("…".to_owned())` 를 쓰지만, 이 트리의 `Error::Type` 은 `CString` 을
    받으므로 컴파일되지 않는다. **정정:** `c"…"` 리터럴을 쓴다.
 
-5. **`plan:261` — 모듈 루트에 rustfmt.** `rustfmt --edition 2024
+5. **Task 1 Step 6 (커밋 절차) — 모듈 루트에 rustfmt.** `rustfmt --edition 2024
    components/script/dom/animation/mod.rs` — rustfmt 는 `--skip-children` 없이는
    `mod` 선언을 **따라가 도달 가능한 모듈 트리 전체를 포맷한다**, 그리고 그 플래그는
    rustfmt 1.9.0-stable 에 **존재하지 않는다**. 실행 중 `components/script/dom/mod.rs`
@@ -73,7 +78,8 @@
    에는 절대 돌리지 않는다 — 그리고 rustfmt 를 실행할 때마다 `git status --porcelain`
    으로 확인해 의도치 않은 변경은 되돌린다.
 
-6. **`plan:769, 870` — 벤더 코드에 잘못된 rustfmt edition.** `rustfmt --edition 2024
+6. **Task 3 Step 9 · Task 4 Step 5 (커밋 절차) — 벤더 코드에 잘못된 rustfmt edition.**
+   `rustfmt --edition 2024
    third_party/stylo/…` — stylo 는 `style_edition` 을 일부러 빼 둔 자기 `rustfmt.toml`
    을 갖고 있고, 크레이트 자체는 `edition = "2021"` 이다. `--edition 2024` 를 주면
    `style_edition 2024` 가 암시되는데, 이때 import 정렬 규칙이 달라져 벤더 파일의
