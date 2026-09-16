@@ -117,8 +117,7 @@ impl AnimationState {
 /// 애니메이션은 `animation-name` 이 지명하는 동안만 살지만, 스크립트 애니메이션은
 /// 스타일에 이름이 없으므로 같은 규칙을 적용하면 만들어지자마자 취소된다. 세 자리에서
 /// `Script` 를 건너뛴다 -- `is_cancelled_in_new_style` 순회, `maybe_start_animations`
-/// 의 기존 애니메이션 순회, 그리고 `matching.rs` 의 `Finished` retain(이 세 번째는
-/// 다음 커밋에서 들어온다).
+/// 의 기존 애니메이션 순회, 그리고 `matching.rs` 의 `Finished` retain.
 #[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
 pub enum AnimationOrigin {
     /// `animation-name` 이 지명해서 만들어졌다. 스타일이 수명을 쥔다.

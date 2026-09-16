@@ -706,7 +706,7 @@ trait PrivateMatchMethods: TElement {
         new_values: &Arc<ComputedValues>,
         pseudo_element: Option<PseudoElement>,
     ) -> bool {
-        use crate::animation::{AnimationSetKey, AnimationState};
+        use crate::animation::{AnimationOrigin, AnimationSetKey, AnimationState};
 
         // We need to call this before accessing the `ElementAnimationSet` from the
         // map because this call will do a RwLock::read().
@@ -757,6 +757,27 @@ trait PrivateMatchMethods: TElement {
             );
         }
 
+        // ***스크립트 애니메이션은 `needs_animations_update` 밖에서 만든다.***
+        //
+        // 그 게이트는 "스타일이 애니메이션 관련해서 바뀌었나" 를 묻는다.
+        // `Element.animate()` 는 스타일을 바꾸지 않으므로 게이트를 통과하지 못하고,
+        // 안에 두면 요청이 영영 드레인되지 않는다.
+        if !animation_set.pending_script.is_empty() {
+            let mut resolver = StyleResolverForElement::new(
+                *self,
+                context,
+                RuleInclusion::All,
+                PseudoElementResolution::IfApplicable,
+            );
+
+            animation_set.start_script_animations::<Self>(
+                *self,
+                shared_context,
+                new_values,
+                &mut resolver,
+            );
+        }
+
         animation_set.update_transitions_for_new_style(
             might_need_transitions_update,
             &shared_context,
@@ -794,9 +815,14 @@ trait PrivateMatchMethods: TElement {
         // `Canceled` 는 여기 조건에 걸리지 않으므로 그때 정리된다. 메모리를 아끼려던 원래
         // 뜻은 거기서 지켜진다 -- 지금 붙들고 있는 것은 **스타일이 여전히 요구하는**
         // 애니메이션뿐이다.
+        //
+        // 스크립트 애니메이션은 스타일이 지명할 수 없으므로 아래 조건에 영영 걸리지
+        // 않는다. 예외를 두지 않으면 끝나는 즉시 지워지고, 그러면 위 2번(검은 화면)이
+        // 스크립트 애니메이션에서 그대로 재현된다.
         animation_set.animations.retain(|animation| {
-            animation.state != AnimationState::Finished ||
-                new_values
+            animation.origin == AnimationOrigin::Script
+                || animation.state != AnimationState::Finished
+                || new_values
                     .get_ui()
                     .animation_name_iter()
                     .any(|name| name.as_atom() == Some(&animation.name))
