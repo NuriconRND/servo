@@ -7,14 +7,15 @@
 // NOTE(emilio): This code isn't really executed in Gecko, but we don't want to
 // compile it out so that people remember it exists.
 
+use crate::Atom;
 use crate::context::{CascadeInputs, SharedStyleContext};
 use crate::derives::*;
 use crate::dom::{OpaqueNode, TDocument, TElement, TNode};
+use crate::properties::AnimationDeclarations;
 use crate::properties::animated_properties::{AnimationValue, AnimationValueMap};
 use crate::properties::longhands::animation_direction::computed_value::single_value::T as AnimationDirection;
 use crate::properties::longhands::animation_fill_mode::computed_value::single_value::T as AnimationFillMode;
 use crate::properties::longhands::animation_play_state::computed_value::single_value::T as AnimationPlayState;
-use crate::properties::AnimationDeclarations;
 use crate::properties::{
     ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
     PropertyDeclarationIdSet,
@@ -29,7 +30,6 @@ use crate::values::animated::{Animate, Procedure};
 use crate::values::computed::TimingFunction;
 use crate::values::generics::easing::BeforeFlag;
 use crate::values::specified::TransitionBehavior;
-use crate::Atom;
 // [수정] debug_unreachable 은 경계 패닉 근본원인이던 None-arm 을 안전 폴백으로 교체하면서
 // 더 이상 사용하지 않는다(자세한 내용은 get_property_declaration_at_time 참조).
 use parking_lot::RwLock;
@@ -109,6 +109,22 @@ impl AnimationState {
     fn needs_to_be_ticked(&self) -> bool {
         *self == AnimationState::Running || *self == AnimationState::Pending
     }
+}
+
+/// Where an animation came from.
+///
+/// ***스타일이 애니메이션의 수명을 모는 자리에서 이 둘은 다르게 취급된다.*** CSS
+/// 애니메이션은 `animation-name` 이 지명하는 동안만 살지만, 스크립트 애니메이션은
+/// 스타일에 이름이 없으므로 같은 규칙을 적용하면 만들어지자마자 취소된다. 세 자리에서
+/// `Script` 를 건너뛴다 -- `is_cancelled_in_new_style` 순회, `maybe_start_animations`
+/// 의 기존 애니메이션 순회, 그리고 `matching.rs` 의 `Finished` retain.
+#[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
+pub enum AnimationOrigin {
+    /// `animation-name` 이 지명해서 만들어졌다. 스타일이 수명을 쥔다.
+    Css,
+    /// `Element.animate()` 로 만들어졌다. 수명은 `cancel()` 과
+    /// `cancel_animations_for_node` 만 끝낸다.
+    Script,
 }
 
 enum IgnoreTransitions {
@@ -561,6 +577,9 @@ pub struct Animation {
 
     /// The number of properties that are affected by this animation.
     pub number_of_animating_properties: usize,
+
+    /// Where this animation came from. See [`AnimationOrigin`].
+    pub origin: AnimationOrigin,
 
     /// Whether or not this animation is new and or has already been tracked
     /// by the script thread.
@@ -1185,6 +1204,28 @@ impl Transition {
     }
 }
 
+/// A request from script (`Element.animate`) to create an animation.
+///
+/// ***2단계인 이유:*** `ComputedKeyframe::generate_for_keyframes` 는
+/// `SharedStyleContext` 와 요소의 `ComputedValues` 를 요구하는데 스크립트에는 둘 다
+/// 없다. 그것들은 리스타일 중에만 존재하므로, 파싱만 스크립트가 하고 계산은 CSS
+/// 애니메이션이 만들어지는 바로 그 자리로 미룬다.
+#[derive(Debug, MallocSizeOf)]
+pub struct ScriptAnimationRequest {
+    /// 합성 이름(`-servo-script-<N>`). `cancel()` 이 이것으로 자기 것을 찾는다.
+    pub name: Atom,
+    /// 스크립트가 넘긴 키프레임.
+    pub keyframes: KeyframesAnimation,
+    /// 초 단위 지속 시간. 항상 0 보다 크다(스크립트 쪽에서 걸렀다).
+    pub duration: f64,
+    /// 반복 상태.
+    pub iteration_state: KeyframesIterationState,
+    /// `fill` 옵션.
+    pub fill_mode: AnimationFillMode,
+    /// 프레임이 자기 것을 선언하지 않았을 때 쓰는 기본 타이밍 함수.
+    pub timing_function: TimingFunction,
+}
+
 /// Holds the animation state for a particular element.
 #[derive(Debug, Default, MallocSizeOf)]
 pub struct ElementAnimationSet {
@@ -1193,6 +1234,10 @@ pub struct ElementAnimationSet {
 
     /// The transitions for this element.
     pub transitions: Vec<Transition>,
+
+    /// Animations requested by script that have not been computed yet.
+    /// See [`ScriptAnimationRequest`].
+    pub pending_script: Vec<ScriptAnimationRequest>,
 
     /// Whether or not this ElementAnimationSet has had animations or transitions
     /// which have been added, removed, or had their state changed.
@@ -1203,7 +1248,8 @@ impl ElementAnimationSet {
     /// Cancel all animations in this `ElementAnimationSet`. This is typically called
     /// when the element has been removed from the DOM.
     pub fn cancel_all_animations(&mut self) {
-        self.dirty = !self.animations.is_empty();
+        self.dirty = !self.animations.is_empty() || !self.pending_script.is_empty();
+        self.pending_script.clear();
         for animation in self.animations.iter_mut() {
             animation.state = AnimationState::Canceled;
         }
@@ -1250,8 +1296,11 @@ impl ElementAnimationSet {
 
     /// Whether this `ElementAnimationSet` is empty, which means it doesn't
     /// hold any animations in any state.
+    ///
+    /// ***대기 중인 스크립트 요청도 센다.*** 세지 않으면 `do_post_reflow_update` 의
+    /// `sets.retain` 이 드레인되기 전에 요청째로 세트를 지운다.
     pub fn is_empty(&self) -> bool {
-        self.animations.is_empty() && self.transitions.is_empty()
+        self.animations.is_empty() && self.transitions.is_empty() && self.pending_script.is_empty()
     }
 
     /// Whether or not this state needs animation ticks for its transitions
@@ -1293,6 +1342,98 @@ impl ElementAnimationSet {
             .any(|transition| transition.state != AnimationState::Canceled)
     }
 
+    /// Turn every pending script animation request into a real `Animation`.
+    ///
+    /// 이 함수는 `maybe_start_animations` 가 CSS 애니메이션에 하는 것과 같은 일을
+    /// 하되, 값을 스타일이 아니라 요청에서 읽는다. 아래 경로(캐스케이드, 페인트측
+    /// 바인딩, 타임라인)는 전부 같다.
+    pub fn start_script_animations<E>(
+        &mut self,
+        element: E,
+        context: &SharedStyleContext,
+        new_style: &Arc<ComputedValues>,
+        resolver: &mut StyleResolverForElement<E>,
+    ) where
+        E: TElement,
+    {
+        for request in std::mem::take(&mut self.pending_script) {
+            let mut animating_properties = PropertyDeclarationIdSet::default();
+            let mut number_of_animating_properties = 0;
+            for property in request.keyframes.properties_changed.iter() {
+                debug_assert!(property.is_animatable());
+                if animating_properties.insert(property.to_physical(new_style.writing_mode)) {
+                    number_of_animating_properties += 1;
+                }
+            }
+
+            let computed_steps = ComputedKeyframe::generate_for_keyframes(
+                element,
+                &request.keyframes,
+                context,
+                new_style,
+                request.timing_function.clone(),
+                resolver,
+                animating_properties,
+                number_of_animating_properties,
+            );
+
+            log::warn!(
+                "ANIMSCRIPTSTART name={} properties={} steps={}",
+                request.name,
+                number_of_animating_properties,
+                computed_steps.len()
+            );
+
+            self.animations.push(Animation {
+                name: request.name,
+                properties_changed: request.keyframes.properties_changed.clone(),
+                computed_steps,
+                // 리스타일 시점의 타임라인 값. `animate()` 호출과 같은 렌더링 갱신이다.
+                started_at: context.current_time_for_animations,
+                duration: request.duration,
+                delay: 0.,
+                fill_mode: request.fill_mode,
+                iteration_state: request.iteration_state,
+                // ***`Pending` 이 아니라 `Running`.*** `start_pending_animations` 가
+                // 승급하면서 `animationstart` CSS 이벤트를 쏘는데, 스크립트
+                // 애니메이션에 그것이 나가면 안 된다.
+                state: AnimationState::Running,
+                direction: AnimationDirection::Normal,
+                current_direction: AnimationDirection::Normal,
+                number_of_animating_properties,
+                origin: AnimationOrigin::Script,
+                is_new: true,
+            });
+            self.dirty = true;
+        }
+    }
+
+    /// Cancel the script animation with the given synthetic name. Returns whether
+    /// anything changed.
+    ///
+    /// 아직 실체가 없으면 요청을 빼고, 이미 만들어졌으면 `Canceled` 로 바꾼다. 끝난
+    /// (`Finished`) 애니메이션도 세트에 남아 있으므로 여기서 잡히고, 그때의 취소는
+    /// 붙들고 있던 `fill: forwards` 최종 값을 푼다. 이미 `Canceled` 면 아무 일도
+    /// 하지 않는다.
+    pub fn cancel_script_animation(&mut self, name: &Atom) -> bool {
+        let before = self.pending_script.len();
+        self.pending_script.retain(|request| &request.name != name);
+        if self.pending_script.len() != before {
+            self.dirty = true;
+            return true;
+        }
+
+        for animation in self.animations.iter_mut() {
+            if &animation.name == name && animation.state != AnimationState::Canceled {
+                animation.state = AnimationState::Canceled;
+                self.dirty = true;
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Update our animations given a new style, canceling or starting new animations
     /// when appropriate.
     pub fn update_animations_for_new_style<E>(
@@ -1305,6 +1446,12 @@ impl ElementAnimationSet {
         E: TElement,
     {
         for animation in self.animations.iter_mut() {
+            // ***스크립트 애니메이션은 스타일이 취소하지 않는다.*** 스타일에 합성
+            // 이름이 있을 리 없으므로 이 검사를 그대로 태우면 만들어지자마자 취소된다.
+            // 수명은 `cancel()` 과 `cancel_animations_for_node` 가 쥔다.
+            if animation.origin == AnimationOrigin::Script {
+                continue;
+            }
             if animation.is_cancelled_in_new_style(new_style) {
                 animation.state = AnimationState::Canceled;
             }
@@ -1926,6 +2073,7 @@ pub fn maybe_start_animations<E>(
             direction: animation_direction,
             current_direction: initial_direction,
             number_of_animating_properties,
+            origin: AnimationOrigin::Css,
             is_new: true,
         };
 
@@ -1941,6 +2089,13 @@ pub fn maybe_start_animations<E>(
         // If the animation was already present in the list for the node, just update its state.
         for existing_animation in animation_state.animations.iter_mut() {
             if existing_animation.state == AnimationState::Canceled {
+                continue;
+            }
+
+            // 합성 이름은 스타일이 지명할 수 없으므로 아래 이름 비교에 걸릴 일이
+            // 없지만, 이름이 우연히 겹쳐도 CSS 가 스크립트 애니메이션을 건드리지
+            // 않도록 여기서 끊는다.
+            if existing_animation.origin == AnimationOrigin::Script {
                 continue;
             }
 
