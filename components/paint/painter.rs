@@ -1128,11 +1128,18 @@ impl Painter {
         // that only prints floats reports `floats=[]` for it -- which reads as "nothing is
         // animating" when the truth is "the thing that is animating is not being printed".
         // Cost a diagnostic round on 2026-09-08 (log_ani_perf/11).
-        let transforms_log: Vec<(f32, f32, f32)> = transforms
+        // ★어느 요소의 값인지 같이 찍는다.★ 값만 늘어놓으면 순서가 어디서 왔는지 알 수
+        // 없어 "어느 컨테이너가 어느 방향으로 움직였나" 를 귀속시킬 수 없다. 전환 때 사용자가
+        // 보는 것이 바로 그 질문이다 -- 들어와야 할 구성이 나가는 쪽으로 움직인다는 보고를
+        // 이 줄로는 확인할 수 없었다(2026-09-17).
+        //
+        // 키는 노드 id 의 해시라 역산은 안 되지만 노드마다 고정이므로, `ANIMSTART node=N` 의
+        // 해시를 같은 식으로 계산하면 맞출 수 있다(`paint_animation_binding_key`).
+        let transforms_log: Vec<(u32, f32, f32, f32)> = transforms
             .iter()
             .map(|property| {
                 let matrix = property.value.to_array();
-                (matrix[12], matrix[13], matrix[0])
+                (property.key.id.uid, matrix[12], matrix[13], matrix[0])
             })
             .collect();
 
@@ -1292,7 +1299,7 @@ impl Painter {
         animating: bool,
         generated: bool,
         values: &[f32],
-        transforms: &[(f32, f32, f32)],
+        transforms: &[(u32, f32, f32, f32)],
     ) {
         if generated {
             self.paint_animation_frames
@@ -1334,10 +1341,13 @@ impl Painter {
         // had to produce on its own, and on a page full of video it should be near zero.
         // Translation x/y and the x scale: enough to see a slide or a zoom move, without
         // printing sixteen numbers per animation.
+        // `key` 는 노드마다 고정인 해시라, 값이 어느 요소의 것인지 이것으로 갈린다.
+        // 상한을 6 으로 둔다 -- 이 페이지는 애니메이션되는 요소가 두셋이고, 3 에서 잘리면
+        // 정작 궁금한 셋째가 사라진다.
         let transform_sample = transforms
             .iter()
-            .take(3)
-            .map(|(x, y, scale)| format!("{x:.1}/{y:.1}@{scale:.2}"))
+            .take(6)
+            .map(|(key, x, y, scale)| format!("{key:x}:{x:.1}/{y:.1}@{scale:.2}"))
             .collect::<Vec<_>>()
             .join(",");
         warn!(
