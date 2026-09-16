@@ -176,3 +176,22 @@ partial interface Element {
 partial interface Element {
   [CEReactions, Throws] undefined setHTML(DOMString html, optional SetHTMLOptions options = {});
 };
+
+// https://drafts.csswg.org/web-animations-1/#the-animatable-interface-mixin
+//
+// Servo 최소 구현. 키프레임은 배열 형태만 받고, 값은 전부 문자열로 강제된다
+// (`offset: 0.5` 는 "0.5" 로 들어와 우리가 파싱한다). 옵션은 아래 넷뿐이며,
+// 선언되지 않은 멤버는 WebIDL 이 무시하므로 이 딕셔너리가 곧 지원 범위다.
+// 범위: docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md
+dictionary ServoKeyframeAnimationOptions {
+  unrestricted double duration = 0;
+  DOMString easing = "linear";
+  unrestricted double iterations = 1;
+  FillMode fill = "auto";
+};
+
+partial interface Element {
+  [Pref="dom_web_animations_enabled", Throws]
+  Animation animate(sequence<record<DOMString, DOMString>> keyframes,
+                    optional ServoKeyframeAnimationOptions options = {});
+};

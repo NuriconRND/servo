@@ -28,15 +28,18 @@ use layout_api::{LayoutDamage, QueryMsg, ScrollContainerQueryFlags, StyleData, w
 use net_traits::ReferrerPolicy;
 use net_traits::request::{CorsSettings, CredentialsMode};
 use script_bindings::cell::{DomRefCell, Ref, RefMut};
+use script_bindings::record::Record;
 use script_bindings::reflector::DomObject;
 use selectors::attr::CaseSensitivity;
 use selectors::matching::ElementSelectorFlags;
 use selectors::sink::Push;
 use servo_arc::Arc as ServoArc;
+use style::animation::{AnimationSetKey, KeyframesIterationState, ScriptAnimationRequest};
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::{AttrIdentifier, AttrValue, LengthOrPercentageOrAuto};
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::properties::longhands::animation_fill_mode::computed_value::single_value::T as AnimationFillMode;
 use style::properties::longhands::{
     self, background_image, border_spacing, color, font_family, font_size,
 };
@@ -64,11 +67,18 @@ use xml5ever::serialize::TraversalScope::{
 
 use crate::conversions::Convert;
 use crate::dom::activation::Activatable;
+use crate::dom::animation::Animation;
+use crate::dom::animation::builder::build_keyframes_animation;
+use crate::dom::animation::keyframes::{
+    IterationSpec, KeyframeError, resolve_duration_seconds, resolve_iterations,
+};
 use crate::dom::attr::{Attr, is_relevant_attribute};
+use crate::dom::bindings::codegen::Bindings::AnimationBinding::FillMode;
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
-    ElementMethods, GetHTMLOptions, ScrollIntoViewContainer, ScrollLogicalPosition, ShadowRootInit,
+    ElementMethods, GetHTMLOptions, ScrollIntoViewContainer, ScrollLogicalPosition,
+    ServoKeyframeAnimationOptions, ShadowRootInit,
 };
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
@@ -4429,6 +4439,87 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         self.ensure_rare_data()
             .part
             .or_init(|| DOMTokenList::new(cx, self, &local_name!("part"), None))
+    }
+
+    /// <https://drafts.csswg.org/web-animations-1/#dom-animatable-animate>
+    ///
+    /// Servo 최소 구현. 범위:
+    /// `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`
+    fn Animate(
+        &self,
+        cx: &mut JSContext,
+        keyframes: Vec<Record<DOMString, DOMString>>,
+        options: &ServoKeyframeAnimationOptions,
+    ) -> Fallible<DomRoot<Animation>> {
+        let can_gc = CanGc::from_cx(cx);
+        let node = self.upcast::<Node>();
+        let window = self.owner_window();
+        let document = self.owner_document();
+
+        let iterations = resolve_iterations(options.iterations)
+            .map_err(|_| Error::Type(c"iterations must be a non-negative number".to_owned()))?;
+
+        let (keyframes_animation, timing_function) = build_keyframes_animation(
+            &keyframes,
+            &options.easing.str(),
+            &document.base_url(),
+            document.quirks_mode(),
+            document.style_shared_author_lock(),
+        )
+        .map_err(|error| match error {
+            KeyframeError::OffsetOutOfRange(_) => {
+                Error::Type(c"keyframe offset must be in [0, 1]".to_owned())
+            },
+            KeyframeError::OffsetOutOfOrder => {
+                Error::Type(c"keyframe offsets must be non-decreasing".to_owned())
+            },
+            // `build_keyframes_animation` 은 오프셋 오류만 돌려준다. 이 갈래는
+            // 도달하지 않지만 `KeyframeError` 가 non_exhaustive 가 아니므로
+            // 망라성을 위해 필요하다.
+            KeyframeError::InvalidIterations => {
+                Error::Type(c"iterations must be a non-negative number".to_owned())
+            },
+        })?;
+
+        let name = document.animations().next_script_animation_name();
+
+        // ***duration 이 0 이하면 애니메이션을 만들지 않는다.*** stylo 의 진행도
+        // 계산이 duration 으로 나눈다. 핸들은 정상 반환하되 아무것도 붙들지 않는다.
+        if let Some(duration) = resolve_duration_seconds(options.duration) {
+            let iteration_state = match iterations {
+                IterationSpec::Infinite => KeyframesIterationState::Infinite(0.0),
+                IterationSpec::Finite(count) => KeyframesIterationState::Finite(0.0, count),
+            };
+
+            let fill_mode = match options.fill {
+                FillMode::Forwards => AnimationFillMode::Forwards,
+                FillMode::Backwards => AnimationFillMode::Backwards,
+                FillMode::Both => AnimationFillMode::Both,
+                // `auto` 는 이 범위에서 `none` 과 같다 (KeyframeEffect 가 없으므로
+                // 명세가 말하는 "effect 의 fill 로 해석" 할 대상이 없다).
+                FillMode::None | FillMode::Auto => AnimationFillMode::None,
+            };
+
+            document.animations().add_script_animation(
+                AnimationSetKey::new_for_non_pseudo(node.to_opaque()),
+                ScriptAnimationRequest {
+                    name: name.clone(),
+                    keyframes: keyframes_animation,
+                    duration,
+                    iteration_state,
+                    fill_mode,
+                    timing_function,
+                },
+            );
+
+            // ***요청을 드레인하려면 이 요소가 리스타일되어야 한다.***
+            // `needs_animation_ticks()` 는 `pending_script` 를 세지 않고,
+            // `mark_animating_nodes_as_dirty` 는 이미 루팅된 노드만 더럽힌다.
+            // 여기서 더럽히지 않으면 요청은 영영 드레인되지 않는다.
+            node.dirty(NodeDamage::Style);
+        }
+
+        Ok(Animation::new(&window, node, name, can_gc))
     }
 }
 

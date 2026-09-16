@@ -6,4 +6,9 @@
 //!
 //! 설계: `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`
 
+pub(crate) use self::animation::*;
+
+#[allow(clippy::module_inception, reason = "The interface name is animation")]
+pub(crate) mod animation;
+pub(crate) mod builder;
 pub(crate) mod keyframes;

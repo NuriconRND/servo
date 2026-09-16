@@ -112,6 +112,13 @@ pub struct Preferences {
     pub devtools_server_enabled: bool,
     /// The address:port the devtools server listens to, default to 127.0.0.1:7000.
     pub devtools_server_listen_address: String,
+    /// Web Animations 최소 구현 — `Element.animate()` 와 `Animation.cancel()`.
+    ///
+    /// 꺼져 있으면 메서드가 정의되지 않고, 페이지의
+    /// `typeof el.animate === 'function'` 검사가 실패해 지금의 CSS `@keyframes`
+    /// 폴백이 그대로 돈다. 같은 배포본으로 A/B 가 된다.
+    /// 설계: `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`
+    pub dom_web_animations_enabled: bool,
     // feature: WebGPU | #24706 | Web/API/WebGPU_API
     pub dom_webgpu_enabled: bool,
     /// List of comma-separated backends to be used by wgpu.
@@ -1040,6 +1047,7 @@ impl Preferences {
             dom_touch_events_legacy_apis_enabled: cfg!(target_os = "android")
                 | cfg!(target_env = "ohos"),
             dom_transient_activation_duration_ms: 5000,
+            dom_web_animations_enabled: false,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),

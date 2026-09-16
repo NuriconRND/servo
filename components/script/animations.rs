@@ -15,11 +15,12 @@ use serde::{Deserialize, Serialize};
 use servo_base::id::PipelineId;
 use servo_constellation_traits::ScriptToConstellationMessage;
 use style::animation::{
-    Animation, AnimationSetKey, AnimationState, DocumentAnimationSet, ElementAnimationSet,
-    KeyframesIterationState, Transition,
+    Animation, AnimationOrigin, AnimationSetKey, AnimationState, DocumentAnimationSet,
+    ElementAnimationSet, KeyframesIterationState, ScriptAnimationRequest, Transition,
 };
 use style::dom::OpaqueNode;
 use style::selector_parser::PseudoElement;
+use stylo_atoms::Atom;
 
 use crate::dom::animationevent::AnimationEvent;
 use crate::dom::bindings::codegen::Bindings::AnimationEventBinding::AnimationEventInit;
@@ -57,6 +58,9 @@ pub(crate) struct Animations {
     /// This is used to prevent marking animations dirty when the timeline
     /// has not changed.
     timeline_value_at_last_dirty: Cell<f64>,
+
+    /// `Element.animate()` 로 만든 애니메이션에 붙일 다음 합성 이름의 번호.
+    script_animation_counter: Cell<u64>,
 }
 
 impl Animations {
@@ -67,6 +71,7 @@ impl Animations {
             rooted_nodes: Default::default(),
             pending_events: Default::default(),
             timeline_value_at_last_dirty: Cell::new(0.0),
+            script_animation_counter: Cell::new(0),
         }
     }
 
@@ -74,6 +79,38 @@ impl Animations {
         self.sets.sets.write().clear();
         self.rooted_nodes.borrow_mut().clear();
         self.pending_events.borrow_mut().clear();
+    }
+
+    /// `Element.animate()` 가 만든 애니메이션에 붙일 이름.
+    ///
+    /// 페이지의 `@keyframes` 이름과 충돌할 수 없는 모양이어야 한다 -- 충돌하면
+    /// `maybe_start_animations` 가 같은 이름의 CSS 애니메이션으로 착각한다.
+    pub(crate) fn next_script_animation_name(&self) -> Atom {
+        let index = self.script_animation_counter.get() + 1;
+        self.script_animation_counter.set(index);
+        Atom::from(format!("-servo-script-{index}"))
+    }
+
+    /// 스크립트 애니메이션 요청을 세트에 적재한다. 실제 애니메이션은 다음
+    /// 리스타일에서 만들어진다(`ElementAnimationSet::start_script_animations`).
+    pub(crate) fn add_script_animation(
+        &self,
+        key: AnimationSetKey,
+        request: ScriptAnimationRequest,
+    ) {
+        let mut sets = self.sets.sets.write();
+        let set = sets.entry(key).or_default();
+        set.pending_script.push(request);
+        set.dirty = true;
+    }
+
+    /// `Animation.cancel()`. 무언가 바뀌었으면 `true`.
+    pub(crate) fn cancel_script_animation(&self, key: &AnimationSetKey, name: &Atom) -> bool {
+        let mut sets = self.sets.sets.write();
+        let Some(set) = sets.get_mut(key) else {
+            return false;
+        };
+        set.cancel_script_animation(name)
     }
 
     // Mark all animations dirty, if they haven't been marked dirty since the
@@ -530,8 +567,16 @@ impl Animations {
                 continue;
             }
 
+            // ***대기 중인 스크립트 요청도 루팅 사유다.*** 문서에 붙지 않았거나
+            // 렌더링되지 않는 요소에 `animate()` 를 걸면 요청이 드레인되지 않는데,
+            // `ElementAnimationSet::is_empty()` 가 `pending_script` 를 세므로
+            // `sets.retain` 도 그 세트를 지우지 않는다. 노드를 루팅해 두면 다음
+            // `do_post_reflow_update` 의 "렌더링되지 않음" 검사가 그것을 잡아
+            // `cancel_all_animations()` 로 요청을 비우고, 그다음 `sets.retain` 이
+            // 세트를 지운다. 누수 창은 렌더링 갱신 한 번이다.
             if set.animations.iter().any(|animation| animation.is_new) ||
-                set.transitions.iter().any(|transition| transition.is_new)
+                set.transitions.iter().any(|transition| transition.is_new) ||
+                !set.pending_script.is_empty()
             {
                 let address = UntrustedNodeAddress(opaque_node.0 as *const c_void);
                 unsafe {
@@ -601,6 +646,16 @@ impl Animations {
         now: f64,
         pipeline_id: PipelineId,
     ) {
+        // ***스크립트 애니메이션은 CSS 애니메이션 이벤트를 쏘지 않는다.***
+        // `animationstart`/`animationend` 의 `animationName` 은 합성 이름이라
+        // 페이지에 의미가 없고, 폴백 경로가 그 이벤트를 듣고 있다면 오작동한다.
+        // 시작은 `AnimationState::Running` 으로 만들어 승급 경로를 피하고, 끝과
+        // 취소는 여기서 끊는다. 네 종류(`AnimationStart`/`Iteration`/`End`/
+        // `Cancel`)가 전부 이 한 자리를 지난다.
+        if animation.origin == AnimationOrigin::Script {
+            return;
+        }
+
         let iteration_index = match animation.iteration_state {
             KeyframesIterationState::Finite(current, _) |
             KeyframesIterationState::Infinite(current) => current,
