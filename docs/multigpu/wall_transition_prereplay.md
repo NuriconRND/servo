@@ -126,6 +126,11 @@ DOM 이동으로 재시작되지 않는다.
 ★이 저장소의 제약: 수정은 엔진에 한한다. `frontend`/`backend` 는 **참고용이며 수정 금지**다
 (열람은 제약이 아니다 — 이 문서의 §2-c/2-d가 그 열람으로 나왔다).★
 
+★2026-09-17: 위 두 갈래 중 **엔진** 쪽을 택했다.★ `Element.animate` 최소 구현 —
+설계 `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`,
+계획 `docs/superpowers/plans/2026-09-17-web-animations-minimal.md`.
+`dom_web_animations_enabled` pref 뒤에 있고 기본값은 OFF 다.
+
 ---
 
 ## 4. 이 조사에서 함께 고친 것 (엔진 쪽 진짜 결함)
