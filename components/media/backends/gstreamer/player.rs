@@ -3004,30 +3004,61 @@ impl Drop for PlayerInner {
 
 /// 플레이어 해체 전용 스레드로 보내는 통로.
 ///
-/// 첫 사용 때 스레드 하나를 띄우고 그 뒤로는 계속 쓴다. 순서대로 하나씩 해체하므로 동시에
-/// 수십 개의 GStreamer 파이프라인이 서로 경합하지 않는다(그게 원래 스크립트 스레드에서
-/// 벌어지던 일이다).
+/// 첫 사용 때 스레드를 띄우고 그 뒤로는 계속 쓴다.
+///
+/// ★한 개로는 부족하다.★ 원래 이 자리는 스레드 하나였고, 그 이유는 "순서대로 하나씩
+/// 해체하므로 동시에 수십 개의 GStreamer 파이프라인이 서로 경합하지 않는다" 였다. 스크립트
+/// 스레드에서 걷어내는 것이 목적이었을 때는 맞는 판단이었지만, 직렬이면 **해체가 끝날 때까지
+/// 옛 파이프라인이 계속 디코딩한다**.
+///
+/// 실측(2026-09-16, log_ani_debug/16, `MEDIATEARDOWN disposed`):
+///
+///     Seekable   (파일) n=162  평균  28ms  최대   64ms
+///     NetworkUri (rtsp) n=72   평균 152ms  최대 1442ms
+///
+/// 24 개짜리 rtsp 구성이 빠질 때 24 x 152ms = 약 3.6 초. 그동안 새 구성의 54 개가 이미
+/// 올라오고 있으므로 한때 78 개가 함께 돈다(`MEDIAPLAYERS players=78` 로 관측된다). 그것이
+/// 24 라이브스트림 -> 54 FHD30 전환에서만 CPU 가 100% 에 닿고 몇 초 뒤 회복되는 이유다 --
+/// WebGL -> 54 전환에는 걷어낼 rtsp 가 없어서 나타나지 않는다.
+///
+/// 그래서 작은 풀로 넓힌다. 경합을 피하려던 원래 뜻은 유지된다 -- 수십 개가 아니라 몇 개이고,
+/// 스크립트 스레드는 여전히 관여하지 않는다. `media_player_disposal_threads` 로 조절하며,
+/// `1` 이면 예전 동작이다.
 static PLAYER_DISPOSAL: LazyLock<Sender<(usize, StreamType, Arc<Mutex<PlayerInner>>)>> =
     LazyLock::new(|| {
         let (sender, receiver) = mpsc::channel::<(usize, StreamType, Arc<Mutex<PlayerInner>>)>();
-        let _ = std::thread::Builder::new()
-            .name(String::from("GstPlayerDisposal"))
-            .spawn(move || {
-                while let Ok((id, stream_type, inner)) = receiver.recv() {
-                    let started = Instant::now();
-                    inner
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .shut_down();
-                    drop(inner);
-                    // 실제로 얼마나 걸렸는지 남긴다 -- 스크립트에서 걷어냈다는 것과 비용이
-                    // 사라졌다는 것은 다른 말이고, 뒤엣것은 여기서만 보인다.
-                    log::warn!(
-                        "MEDIATEARDOWN disposed id={id} stream_type={stream_type:?} ms={:.0}",
-                        started.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
-            });
+        let receiver = Arc::new(Mutex::new(receiver));
+        let threads = servo_config::pref!(media_player_disposal_threads).clamp(1, 16);
+        for index in 0..threads {
+            let receiver = receiver.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("GstPlayerDisposal{index}"))
+                .spawn(move || {
+                    loop {
+                        // ★수신은 자물쇠 안에서, 해체는 밖에서.★ 해체를 쥔 채로 받으면 풀이
+                        // 있으나 마나다.
+                        let next = receiver
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .recv();
+                        let Ok((id, stream_type, inner)) = next else {
+                            return;
+                        };
+                        let started = Instant::now();
+                        inner
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .shut_down();
+                        drop(inner);
+                        // 실제로 얼마나 걸렸는지 남긴다 -- 스크립트에서 걷어냈다는 것과 비용이
+                        // 사라졌다는 것은 다른 말이고, 뒤엣것은 여기서만 보인다.
+                        log::warn!(
+                            "MEDIATEARDOWN disposed id={id} stream_type={stream_type:?} ms={:.0}",
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                });
+        }
         sender
     });
 

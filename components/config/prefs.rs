@@ -687,6 +687,18 @@ pub struct Preferences {
     /// 이미 프레임당 1 개로 묶여 있어 새 영상은 어차피 1/프레임으로 뜨고, 남는 한 칸이 이미
     /// 떠 있는 영상들의 슬롯 회전을 따라가게 한다.
     pub media_wrap_init_max_per_frame: i64,
+    /// 플레이어 해체를 맡는 전용 스레드 수. `1` 이면 예전 동작(직렬).
+    ///
+    /// ***해체가 끝날 때까지 옛 파이프라인은 계속 디코딩한다.*** 해체를 스크립트 스레드에서
+    /// 걷어낸 것(21.9 초 프리즈 수정)과 비용이 사라진 것은 다른 말이다. 실측(2026-09-16,
+    /// log_ani_debug/16): rtsp 해체가 개당 평균 152ms, 최대 1442ms 다. 24 개짜리 rtsp 구성이
+    /// 빠질 때 직렬이면 약 3.6 초가 걸리고, 그동안 새 구성의 54 개가 이미 올라와 한때 78 개가
+    /// 함께 돈다 -- 24 라이브스트림 -> 54 FHD30 전환에서만 CPU 가 100% 에 닿고 몇 초 뒤
+    /// 회복되는 이유다.
+    ///
+    /// 기본값 `4`: 위 3.6 초가 약 0.9 초로 줄어든다. 경합을 피하려던 원래 판단은 유지된다 --
+    /// 수십 개가 아니라 넷이고, 스크립트 스레드는 여전히 관여하지 않는다.
+    pub media_player_disposal_threads: i64,
     /// 새 영상의 **첫 프레임을 미리 스테이징**해 둘지. 켜면 영상이 한 프레임 일찍 뜨고,
     /// 그 대가를 렌더 스레드가 낸다.
     ///
@@ -1148,6 +1160,7 @@ impl Preferences {
             media_d3d11_enabled: false,
             media_ring_init_max_per_frame: 1,
             media_wrap_init_max_per_frame: 2,
+            media_player_disposal_threads: 4,
             media_ring_stage_first_frame: false,
             media_release_detached_player: true,
             dom_webgl_idle_context_reclaim_ms: 3000,
