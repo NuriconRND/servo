@@ -7,15 +7,14 @@
 // NOTE(emilio): This code isn't really executed in Gecko, but we don't want to
 // compile it out so that people remember it exists.
 
-use crate::Atom;
 use crate::context::{CascadeInputs, SharedStyleContext};
 use crate::derives::*;
 use crate::dom::{OpaqueNode, TDocument, TElement, TNode};
-use crate::properties::AnimationDeclarations;
 use crate::properties::animated_properties::{AnimationValue, AnimationValueMap};
 use crate::properties::longhands::animation_direction::computed_value::single_value::T as AnimationDirection;
 use crate::properties::longhands::animation_fill_mode::computed_value::single_value::T as AnimationFillMode;
 use crate::properties::longhands::animation_play_state::computed_value::single_value::T as AnimationPlayState;
+use crate::properties::AnimationDeclarations;
 use crate::properties::{
     ComputedValues, Importance, LonghandId, PropertyDeclarationBlock, PropertyDeclarationId,
     PropertyDeclarationIdSet,
@@ -30,6 +29,7 @@ use crate::values::animated::{Animate, Procedure};
 use crate::values::computed::TimingFunction;
 use crate::values::generics::easing::BeforeFlag;
 use crate::values::specified::TransitionBehavior;
+use crate::Atom;
 // [수정] debug_unreachable 은 경계 패닉 근본원인이던 None-arm 을 안전 폴백으로 교체하면서
 // 더 이상 사용하지 않는다(자세한 내용은 get_property_declaration_at_time 참조).
 use parking_lot::RwLock;
