@@ -117,7 +117,8 @@ impl AnimationState {
 /// 애니메이션은 `animation-name` 이 지명하는 동안만 살지만, 스크립트 애니메이션은
 /// 스타일에 이름이 없으므로 같은 규칙을 적용하면 만들어지자마자 취소된다. 세 자리에서
 /// `Script` 를 건너뛴다 -- `is_cancelled_in_new_style` 순회, `maybe_start_animations`
-/// 의 기존 애니메이션 순회, 그리고 `matching.rs` 의 `Finished` retain.
+/// 의 기존 애니메이션 순회, 그리고 `matching.rs` 의 `Finished` retain(이 세 번째는
+/// 다음 커밋에서 들어온다).
 #[derive(Clone, Copy, Debug, MallocSizeOf, PartialEq)]
 pub enum AnimationOrigin {
     /// `animation-name` 이 지명해서 만들어졌다. 스타일이 수명을 쥔다.
@@ -1424,7 +1425,15 @@ impl ElementAnimationSet {
         }
 
         for animation in self.animations.iter_mut() {
-            if &animation.name == name && animation.state != AnimationState::Canceled {
+            // 합성 이름은 유효한 CSS `<custom-ident>` 이기도 하다. 페이지가 우연히
+            // (또는 의도적으로) 같은 이름의 `@keyframes` 와 `animation-name` 을 선언하면
+            // CSS 애니메이션이 이 이름을 가질 수 있으므로, 이름만 보고 취소하면 스크립트가
+            // 아닌 CSS 애니메이션을 지울 수 있다. `maybe_start_animations` 의 대칭 가드와
+            // 같은 이유로 origin 도 함께 검사한다.
+            if &animation.name == name
+                && animation.origin == AnimationOrigin::Script
+                && animation.state != AnimationState::Canceled
+            {
                 animation.state = AnimationState::Canceled;
                 self.dirty = true;
                 return true;
