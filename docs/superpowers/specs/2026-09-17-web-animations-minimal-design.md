@@ -101,7 +101,7 @@ el.animate(frames, opts)
 pub struct ElementAnimationSet {
     pub animations: Vec<Animation>,
     pub transitions: Vec<Transition>,
-    pub pending_script: Vec<PendingScriptAnimation>,   // 신규
+    pub pending_script: Vec<ScriptAnimationRequest>,   // 신규
     pub dirty: bool,
 }
 ```
@@ -123,17 +123,64 @@ pub enum AnimationOrigin { Css, Script }
 
 | 자리 | 그대로 두면 | 조치 |
 |---|---|---|
-| `is_cancelled_in_new_style` (`servo/animation.rs:1308`) | 스타일에 이름이 없으므로 **생성 즉시 취소** | `origin == Script` 면 검사 생략 |
-| `maybe_start_animations` 의 기존 애니메이션 순회 (`servo/animation.rs:1941`) | 합성 이름은 원래 매칭되지 않지만 방어적으로 | `Canceled` 를 건너뛰는 줄 옆에서 `Script` 도 건너뜀 |
-| `Finished` retain (`matching.rs:797`) | 스타일이 지명할 수 없으므로 끝나는 즉시 제거 → `fill: forwards` 최종 값 소실 = **검은 화면 재현** | `origin == Script` 면 무조건 남김 |
+| `ElementAnimationSet::update_animations_for_new_style` 안의 `is_cancelled_in_new_style` 검사 | 스타일에 이름이 없으므로 **생성 즉시 취소** | `origin == Script` 면 검사 생략 |
+| `maybe_start_animations` 의 기존 애니메이션 순회 | 합성 이름은 원래 매칭되지 않지만 방어적으로 | `Canceled` 를 건너뛰는 줄 옆에서 `Script` 도 건너뜀 |
+| `process_animations_for_style`(`matching.rs`) 의 `Finished` retain | 스타일이 지명할 수 없으므로 끝나는 즉시 제거 → `fill: forwards` 최종 값 소실 = **검은 화면 재현** | `origin == Script` 면 무조건 남김 |
+
+*(줄 번호는 리팩터를 거치며 계속 움직이므로 여기서는 함수 이름으로만 지시한다.)*
 
 세 자리 모두 `if origin == Script { … }` 한 줄짜리 분기이고, `Css` 일 때의 동작은
 지금과 동일하다. pref 가 꺼져 있으면 `Script` 애니메이션이 생성되지 않으므로 분기에
 도달조차 하지 않는다 — **pref OFF 상태에서 이 변경의 실질 영향은 0이다.**
 
-정리는 기존 경로가 한다: `cancel()` 또는 `cancel_animations_for_node`(요소가 DOM에서
-빠질 때) 가 `Canceled` 로 바꾸면 `handle_canceled_animations` → `sets.retain` 이 치운다.
-**새 정리 경로를 만들지 않는다.**
+정리는 대부분 기존 경로가 한다: `cancel()` 또는 `cancel_animations_for_node`(요소가
+DOM에서 빠질 때) 가 `Canceled` 로 바꾸면 `handle_canceled_animations` → `sets.retain`
+이 치운다. **다만 새 정리 경로가 하나 있다 — 아래 "회수(reap)".** 스크립트 애니메이션은
+합성 이름을 스타일이 지명할 수 없어 `maybe_start_animations` 의 이름 중복 제거에도,
+`matching.rs` 의 `Finished` retain 에도 걸리지 않는다. `cancel()` 도 불리지 않고
+요소도 DOM에 그대로 있는 한, 끝난 스크립트 애니메이션을 대신 치워 주는 것이
+**아무것도 없다** — 회수는 그 빈 자리를 메운다.
+
+#### 회수(reap) — 관측될 수 없는 끝난 스크립트 애니메이션을 버린다
+
+`start_script_animations` 가 새 요청을 `self.animations` 에 push 하기 **전에**, 같은
+세트 안에서 끝난(`Finished`) 스크립트 애니메이션 중 이제 관측될 수 없는 것을 먼저
+버린다. 둘 중 하나만 맞아도 버린다:
+
+- **fill_mode 로 관측 불가**: `fill_mode` 가 `None`/`Backwards` 면 애초에 끝난 뒤에는
+  값을 내놓지 않는다 — 버려도 관측되는 값이 없다.
+- **속성 커버리지로 관측 불가**: `fill_mode` 가 `Forwards`/`Both` 라 최종 값을 붙들고
+  있어도, 새 애니메이션이 그 (물리) `properties_changed` 를 전부 덮으면 값 맵에서
+  새 애니메이션의 항목이 뒤에 와 옛 항목을 가린다 — 버려도 관측되는 차이가 없다.
+  전부 덮지 못하면 남긴다.
+
+**왜 필요한가**: 회수가 없으면 끝난 스크립트 애니메이션을 대체하는 것이 아무것도
+없다 — 합성 이름은 호출마다 새로 나오고, `maybe_start_animations` 의 이름 중복
+제거와 `matching.rs` 의 `Finished` retain 이 둘 다 `Script` 를 건너뛴다. 10초마다
+전환하는 벽 하나에서 24시간이면 한 요소에 애니메이션이 약 8,600개까지 쌓이고,
+`get_value_map_for_active_animations` 는 스타일을 적용할 때마다 그 벡터 전체를
+훑는다.
+
+**문서화된 잔여 문제**: 새 애니메이션이 나중에 취소되거나 자신의 `fill: none` 으로
+끝나면, 회수가 이미 지워 버린 더 오래된 애니메이션의 값은 되돌릴 방법이 없다 —
+Servo 에는 명세가 말하는 underlying-value composition 이 없다. 이는 Chrome 의
+관측 가능한 동작과 같다(대체된 애니메이션 값은 명세상으로도 복구되지 않는다).
+
+#### 파일링 시점 루팅 — 문서에 없는 요소가 대기하다 안전하게 죽는 이유
+
+`AnimationSetKey.node` 는 리플렉터의 JSObject 주소를 담는 `usize`(`OpaqueNode`)일
+뿐 아무것도 소유하지 않는다. CSS 애니메이션의 키는 전부 리스타일이 만들어 주소가
+살아 있음이 보장되지만, 스크립트가 채우는 키는 그렇지 않다 — 문서에 붙은 적 없는
+요소는 `unbind_from_tree` 를 타지 않으므로 `cancel_animations_for_node` 도 돌지
+않는다.
+
+그래서 `Animations::add_script_animation` 은 요청을 세트에 넣기 **전에** 대상
+노드를 `rooted_nodes: FxHashMap<NoTrace<OpaqueNode>, Dom<Node>>` 에
+`entry(NoTrace(key.node)).or_insert_with(|| Dom::from_ref(node))` 로 루팅한다 —
+이 빌림은 `sets` 쓰기 잠금보다 먼저 잡고, 둘을 동시에 들고 있지 않는다. 이후
+세트가 드레인 없이 비면 `root_newly_animating_dom_nodes` 가 대응하는 루트를
+걷어낸다. §8의 "문서에 없는 요소" 행이 안전한 것은 바로 이 루팅 때문이다 — 없다면
+그 요청은 대기가 아니라 use-after-free 로 이어진다.
 
 ### 4. 키프레임 처리
 
@@ -258,6 +305,23 @@ media-gstreamer,no-wgl,webgpu`, 손댄 파일 rustfmt, `git diff --check`.
 2. OFF 무해성 확인
 3. `-Pref dom_web_animations_enabled=true` 로 실기 검증(같은 배포본 A/B)
 4. 검증되면 **별도 커밋으로** 기본값을 뒤집는다
+
+### 11. 구현 메모 — 이 설계에 없던, 구현 중 정해진 것
+
+이 절은 실제로 그렇게 지어진 뒤에 뒤늦게 문서화하는 두 가지 결정이다.
+
+- **JS 쪽 빌더는 `keyframes.rs` 가 아니라 `components/script/dom/animation/builder.rs`
+  에 있다.** `keyframes.rs` 는 std 밖의 것을 하나도 쓰지 않는 순수 함수만 담아 둔다 —
+  `cargo test -p script_tests` 를 빌드할 수 없는 환경에서도, 그 순수 함수들을 독립
+  `rustc --test` 하네스로 바로 돌릴 수 있게 하기 위해서다. `style::…` 를 쓰는 변환
+  (`build_keyframes_animation` 등)은 전부 `builder.rs` 에 있다.
+- **`Animation::properties_changed` 는 이제 두 생성 경로 모두에서 물리(physical)
+  속성 집합을 담는다.** CSS 경로(`maybe_start_animations`)와 스크립트 경로
+  (`start_script_animations`) 둘 다 `animating_properties`(물리로 변환된 집합)를
+  복제해 이 필드에 넣는다. 이 브랜치가 건드리는 **유일한 CSS 경로 변경**이지만, 그
+  필드를 읽는 자리가 회수(reap)의 속성 커버리지 비교 한 곳뿐이라 지금은 동작에
+  영향이 없다 — 비교가 반드시 물리 집합끼리여야(§3의 회수 절 참고) 하므로 CSS 경로도
+  같은 불변조건을 지키게 맞춘 것이다.
 
 ## 비목표
 

@@ -22,6 +22,81 @@
 - **커밋 전**: 손댄 파일에 `rustfmt`, 그리고 `git diff --check`.
 - **A/B 측정 시**: 반드시 `-NumaNode 1`. `-NumaNode auto` 는 이 장비에서 무효다.
 
+## ★정오표 — 이 계획의 실행 중 발견된 오류★
+
+아래 일곱 항목은 이 계획을 실행하는 동안 리뷰 루프가 찾아낸 오류다. **아래 정정이 각
+태스크 본문을 덮어쓴다** — 본문은 실행 당시 그대로 기록으로 남기지만, 이 계획을 다시
+실행하는 사람은 해당 지점에서 본문 대신 여기를 따른다.
+
+1. **`plan:1278-1287` + `plan:1322-1335` — ★use-after-free★.**
+   `add_script_animation(&self, key, request)` 가 `node` 인자도, 루팅도 없이 정의되어
+   있고, 별도로 `root_newly_animating_dom_nodes` 의 조건을 `|| !set.pending_script.is_empty()`
+   로 넓힌 뒤 "누수 창은 렌더링 갱신 한 번이다" 라는 문단이 그것을 안전하다고 주장한다.
+   둘을 합치면 use-after-free 다. `AnimationSetKey.node` (`OpaqueNode(pub usize)`) 는
+   리플렉터의 JSObject 주소를 담는 맨 `usize` 이고 아무것도 소유하지 않는다. 스크립트가
+   채운 키는 이 맵에서 리스타일이 만들지 않는 유일한 키이므로, `from_untrusted_node_address`
+   가 살아 있음이 보장되지 않은 주소를 역참조한다. `document.createElement('div').animate(
+   [{opacity:'0'},{opacity:'1'}],{duration:1000})` 로 재현된다. 두 번째 증상: SpiderMonkey
+   가 JSObject 주소를 재사용하므로, 죽지 않은 채로도 오래된 키가 엉뚱한 새 요소의 주소와
+   우연히 같아져 조용히 다른 노드를 애니메이트할 수 있다.
+   **정정:** `add_script_animation` 은 `&Node` 를 받아
+   `rooted_nodes.entry(NoTrace(key.node)).or_insert_with(|| Dom::from_ref(node))` 로
+   파일링 시점에 대상을 루팅한다 — 이 빌림은 `sets` 쓰기 잠금보다 먼저 잡고, 둘을 동시에
+   들고 있지 않는다. 그리고 `!pending_script.is_empty()` 분기는 **추가하지 않는다** —
+   즉시 루팅하면 `contains_key` 단락 평가가 그것을 죽은 코드로 만들고, 빼 두면 앞으로
+   루팅 없이 채우는 경로가 생겨도 UAF 가 아니라 유계(bounded) 누수로만 퇴화한다. 커밋
+   `51595bd213f` 로 반영됨.
+
+2. **`plan:206-213` — `resolve_offsets` 양 끝 고정 순서.** 코드가 first→0 고정을
+   last→1 보다 먼저 적용해서, 키프레임이 하나뿐이면 `0.0` 으로 풀린다. 이 계획 자신의
+   테스트(`plan:79-84`, `offsets_single_frame_is_the_last_frame`)가 `[1.0]` 을
+   기대하는 것과 모순되고, WAAPI 의 "compute missing keyframe offsets" 절차와도
+   모순된다. **정정:** last→1 고정을 먼저 적용하고, 그다음 first→0 을 적용한다.
+   n≥2 에서는 두 분기가 서로 다른 인덱스를 건드리므로 순서가 상관없다.
+
+3. **`plan:133-136` — 불가능한 테스트 단언.**
+   `assert_eq!(resolve_offsets(&[Some(f64::NAN)]), Err(KeyframeError::OffsetOutOfRange(f64::NAN)))`
+   는 `KeyframeError` 가 `PartialEq` 를 derive 하는 한 절대 참이 될 수 없다 — `NaN != NaN`
+   이기 때문이다. 검증 대상 동작 자체는 맞고, 단언문만 깨져 있다. **정정:**
+   `assert!(matches!(resolve_offsets(&[Some(f64::NAN)]), Err(KeyframeError::OffsetOutOfRange(value)) if value.is_nan()));`
+
+4. **`plan:1358, 1369, 1372, 1375` — `Error::Type` 시그니처.** 계획은
+   `Error::Type("…".to_owned())` 를 쓰지만, 이 트리의 `Error::Type` 은 `CString` 을
+   받으므로 컴파일되지 않는다. **정정:** `c"…"` 리터럴을 쓴다.
+
+5. **`plan:261` — 모듈 루트에 rustfmt.** `rustfmt --edition 2024
+   components/script/dom/animation/mod.rs` — rustfmt 는 `--skip-children` 없이는
+   `mod` 선언을 **따라가 도달 가능한 모듈 트리 전체를 포맷한다**, 그리고 그 플래그는
+   rustfmt 1.9.0-stable 에 **존재하지 않는다**. 실행 중 `components/script/dom/mod.rs`
+   에 돌렸다가 조용히 **파일 189개 / 약 2,700줄**이 바뀌었다. **정정:** 리프 파일만
+   포맷한다 — `mod x;` 를 담은 파일(그런 파일은 `mod`/`use` 목록뿐이라 포맷할 것이 없다)
+   에는 절대 돌리지 않는다 — 그리고 rustfmt 를 실행할 때마다 `git status --porcelain`
+   으로 확인해 의도치 않은 변경은 되돌린다.
+
+6. **`plan:769, 870` — 벤더 코드에 잘못된 rustfmt edition.** `rustfmt --edition 2024
+   third_party/stylo/…` — stylo 는 `style_edition` 을 일부러 빼 둔 자기 `rustfmt.toml`
+   을 갖고 있고, 크레이트 자체는 `edition = "2021"` 이다. `--edition 2024` 를 주면
+   `style_edition 2024` 가 암시되는데, 이때 import 정렬 규칙이 달라져 벤더 파일의
+   `use` 줄 순서가 바뀌고 업스트림 병합 노이즈가 생겼다. 실제로 한 번 일어나서 되돌리는
+   커밋(`ea092f25f50`)이 필요했다. **정정:** `third_party/stylo/` 아래는
+   `rustfmt --edition 2021`, `components/` 아래는 `--edition 2024`.
+
+7. **Task 4b 가 존재하지 않는다.** 이 계획에는 끝난 스크립트 애니메이션을 회수하는
+   단계가 없어서, 계획이 고치려던 검은 화면 문제와 별개로 계획 자신이 누수를 만든다.
+   `matching.rs` 의 `Finished` retain 이 스크립트 애니메이션을 무조건 남기고, 합성
+   이름은 호출마다 새로 나오고, `maybe_start_animations` 의 이름 중복 제거도 origin
+   Script 를 건너뛰므로 **아무것도 그것들을 대체하지 않는다** — 10초에 한 번 전환하는
+   벽 하나에서 24시간이면 요소 하나에 약 8,600개가 쌓이고,
+   `get_value_map_for_active_animations` 는 스타일을 적용할 때마다 그 벡터 전체를
+   훑는다. **정정:** Task 4와 5 사이에 회수 단계가 있어야 한다. 커밋
+   `545217a0335` 와 `1645490ab74` 로 반영되었고, 그 브리프는
+   `.superpowers/sdd/2026-09-17-web-animations-minimal/task-4b-brief.md` 에
+   남아 있다 — 다만 `.superpowers/` 는 git-ignore 대상이라 링크만으로는 못 찾을 수
+   있으므로 규칙 자체를 여기 적는다: 새 스크립트 애니메이션을 채우기 전에, 관측될 수
+   없는 끝난 스크립트 애니메이션을 버린다 — `fill_mode` 가 `None`/`Backwards` 인 것,
+   그리고 새 애니메이션이 (물리) `properties_changed` 를 전부 덮는 것. 전부 덮이지
+   않는 것은 남긴다.
+
 ---
 
 ### Task 1: 순수 키프레임 오프셋 해석 + 테스트 하네스
