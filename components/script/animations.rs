@@ -93,11 +93,30 @@ impl Animations {
 
     /// 스크립트 애니메이션 요청을 세트에 적재한다. 실제 애니메이션은 다음
     /// 리스타일에서 만들어진다(`ElementAnimationSet::start_script_animations`).
+    ///
+    /// ***스크립트가 적재한 세트는 여기서 곧바로 루팅되며, 주소 부활
+    /// (`from_untrusted_node_address`)에 기대서는 안 된다.*** CSS 경로의 키는 전부
+    /// 리스타일이 만들어 주소가 살아 있음이 보장되지만, 이 경로의 키는 그렇지 않다.
     pub(crate) fn add_script_animation(
         &self,
+        node: &Node,
         key: AnimationSetKey,
         request: ScriptAnimationRequest,
     ) {
+        // ***파일링 시점에 루팅한다.*** 키는 리플렉터의 JSObject 주소(`usize`)일 뿐 아무것도
+        // 소유하지 않는다. 문서에 붙은 적 없는 요소는 `unbind_from_tree` 를 거치지 않아
+        // `cancel_animations_for_node` 도 돌지 않으므로, 루팅하지 않으면 세트가 노드보다
+        // 오래 살아남고 `root_newly_animating_dom_nodes` 가 죽은 주소를 역참조한다.
+        // (SpiderMonkey 는 JSObject 주소를 재사용하므로, 죽지 않더라도 엉뚱한 새 요소를
+        // 가리켜 조용히 다른 노드를 애니메이트할 수 있다.)
+        //
+        // `rooted_nodes` 빌림은 `sets` 쓰기 잠금보다 먼저 잡고 이 문장에서 끝낸다 --
+        // 둘을 동시에 들고 있지 않는다.
+        self.rooted_nodes
+            .borrow_mut()
+            .entry(NoTrace(key.node))
+            .or_insert_with(|| Dom::from_ref(node));
+
         let mut sets = self.sets.sets.write();
         let set = sets.entry(key).or_default();
         set.pending_script.push(request);
@@ -567,16 +586,8 @@ impl Animations {
                 continue;
             }
 
-            // ***대기 중인 스크립트 요청도 루팅 사유다.*** 문서에 붙지 않았거나
-            // 렌더링되지 않는 요소에 `animate()` 를 걸면 요청이 드레인되지 않는데,
-            // `ElementAnimationSet::is_empty()` 가 `pending_script` 를 세므로
-            // `sets.retain` 도 그 세트를 지우지 않는다. 노드를 루팅해 두면 다음
-            // `do_post_reflow_update` 의 "렌더링되지 않음" 검사가 그것을 잡아
-            // `cancel_all_animations()` 로 요청을 비우고, 그다음 `sets.retain` 이
-            // 세트를 지운다. 누수 창은 렌더링 갱신 한 번이다.
             if set.animations.iter().any(|animation| animation.is_new) ||
-                set.transitions.iter().any(|transition| transition.is_new) ||
-                !set.pending_script.is_empty()
+                set.transitions.iter().any(|transition| transition.is_new)
             {
                 let address = UntrustedNodeAddress(opaque_node.0 as *const c_void);
                 unsafe {

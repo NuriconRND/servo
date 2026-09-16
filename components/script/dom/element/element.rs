@@ -4501,6 +4501,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
             };
 
             document.animations().add_script_animation(
+                node,
                 AnimationSetKey::new_for_non_pseudo(node.to_opaque()),
                 ScriptAnimationRequest {
                     name: name.clone(),
