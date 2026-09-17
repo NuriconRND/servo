@@ -15,15 +15,24 @@
   C행은 눈금자다. 등속 운동이 눈금을 지나는 간격이 고르지 않으면 그것이 끊김이고,
   화면을 찍어 두면 나중에 프레임 단위로 되짚을 수 있다.
 
-  아래 숫자는 rAF 간격 분포다. **평균이 아니라 분포를 본다** -- 평균 57fps 는 균일한
-  57fps 와 "60,60,60,20,60" 을 구분하지 못한다. 끊김은 정의상 꼬리에서만 보인다.
+  ★아래 숫자로 매끄러움을 판정하지 말 것.★ 그것은 rAF, 즉 **스크립트 틱**의 주기다.
+  이 애니메이션은 페인트측에 바인딩되므로 스크립트는 그 사이에 할 일이 없고,
+  `gfx_paint_side_animation_tick_divisor`(기본 4)가 rAF 를 60Hz 의 1/4 = 66.7ms 로
+  **의도적으로** 묶는다. 움직임 자체는 페인트 스레드가 매 합성마다 전진시킨다.
 
-  판정:
-    * rAF 간격이 고른데 눈으로 끊긴다        -> 프레임은 규칙적으로 만들어지는데
-                                              표시가 불규칙하다 (컴포지터/present)
-    * rAF 간격 자체가 튄다                   -> 프레임 생성이 불규칙하다
-    * A 만 끊긴다                            -> WAAPI 경로
-    * B 만 끊긴다                            -> CSS 애니메이션 경로
+  이 페이지를 처음 만들 때 p50=66.7 을 빨간색 "매우 나쁨" 으로 표시했는데 그것이
+  틀렸다(log_ani_debug/22). 같은 런에서 렌더러는 타일마다 60fps 를 냈고(WRRATE 최저
+  59.8), 네 타일의 값은 0.4px 안에서 일치했다(log_ani_debug/24). 숫자는 정보로만 둔다.
+
+  페이지 안에서는 합성된 결과를 볼 수 없으므로 매끄러움을 잴 방법이 없다. 판정은
+  눈금자 위의 눈과 엔진 로그가 한다:
+
+    * A 만 끊긴다                  -> WAAPI 경로
+    * B 만 끊긴다                  -> CSS 애니메이션 경로
+    * 둘 다 같은 모양으로 끊긴다   -> 애니메이션 경로가 아니다. 두 경로가 공유하는
+                                     프레임 파이프라인, 그중에서도 값이 아니라 표시
+                                     (present) 쪽을 봐야 한다 -- 값은 PAINTANIM 의
+                                     (t_ms, x) 로, 프레임 수는 WRRATE 로 확인된다.
 -->
 <style>
   :root { --dur: 4s; --travel: 80vw; }
@@ -96,19 +105,32 @@ function tick(now) {
     const s = intervals.slice().sort((a, b) => a - b);
     const over20 = intervals.filter((d) => d > 20).length;
     const over33 = intervals.filter((d) => d > 33).length;
+    // ★이 숫자로 매끄러움을 판정하지 말 것.★
+    //
+    // 처음에는 여기서 ">20ms 가 2% 넘으면 빨강" 으로 판정했는데, 그것이 틀렸다.
+    // 이 애니메이션은 페인트측에 바인딩되어(PAINTANIM tx_bound) 페인트 스레드가
+    // 매 합성마다 값을 전진시킨다. 스크립트는 그 사이에 할 일이 없으므로
+    // `gfx_paint_side_animation_tick_divisor`(기본 4)가 rAF 를 60Hz 의 1/4,
+    // 즉 66.7ms 로 **의도적으로** 묶는다. 실측(log_ani_debug/22)에서 p50=66.7 로
+    // 찍혔고 그것은 정상이다 -- 같은 런에서 렌더러는 타일마다 60fps 를 냈고
+    // (WRRATE 최저 59.8), 네 타일의 값은 0.4px 안에서 일치했다(log_ani_debug/24).
+    //
+    // 페이지 안에서는 합성된 결과를 볼 수 없으므로 움직임의 매끄러움을 잴 방법이
+    // 없다. 그래서 숫자는 정보로만 두고 판정하지 않는다. 판정은 눈금자 위의 눈과
+    // 엔진 로그(PAINTANIM t_ms / WRRATE)가 한다.
     const line =
-      'rAF 간격(ms)  p50=' + pct(s, 0.50).toFixed(1) +
+      '스크립트 틱 주기(rAF, ms)  p50=' + pct(s, 0.50).toFixed(1) +
       '  p95=' + pct(s, 0.95).toFixed(1) +
       '  p99=' + pct(s, 0.99).toFixed(1) +
       '  max=' + s[s.length - 1].toFixed(1) +
-      '\n프레임 ' + intervals.length +
-      ' · >20ms ' + over20 + ' (' + (100 * over20 / intervals.length).toFixed(1) + '%)' +
-      ' · >33ms ' + over33 +
+      '\n표본 ' + intervals.length + ' · >20ms ' + over20 + ' · >33ms ' + over33 +
+      '\n※ p50≈66.7 은 정상이다 — tick_divisor=4 가 rAF 를 60Hz/4 로 묶은 값이고,' +
+      '\n   움직임 자체는 페인트측이 매 합성마다 전진시킨다. 이 숫자는 매끄러움의' +
+      '\n   지표가 아니다. 끊김은 눈금자를 보고 판정하라.' +
       '\nWAAPI ' + (hasWaapi ? 'ON' : 'OFF') + ' · 이동폭 ' + travelPx() + 'px / ' + DURATION_MS + 'ms';
 
     const el = document.getElementById('stats');
     el.textContent = line;
-    el.className = over20 / intervals.length > 0.02 ? 'warn' : 'ok';
 
     // 로그 파일로도 내보낸다 -- 화면을 못 볼 때 이 줄만 grep 하면 된다.
     console.log('ANIMJITTER p50=' + pct(s, 0.50).toFixed(1) +
