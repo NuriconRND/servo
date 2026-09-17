@@ -273,6 +273,8 @@ struct AppState {
     /// 계측을 pref 뒤에 두지 않는다: 초당 한 줄이고, 이것이 없는 로그는 이 질문에
     /// 대해서는 다시 재야 하는 로그다.
     main_busy: RefCell<MainBusy>,
+    /// 표출 클럭이 유일한 렌더 권한인지 재는 집계. [`ClockStats`] 참고.
+    clock_stats: RefCell<ClockStats>,
     /// 아직 소비되지 않은 깨우기가 큐에 있는가.
     ///
     /// 엔진은 할 말이 생길 때마다 `EventLoopWaker::wake` 를 부르고, 그것은 winit 큐에
@@ -298,6 +300,40 @@ struct MainBusy {
     render_ms_max: f64,
     render_calls: u32,
 }
+
+/// 표출 클럭이 **유일한** 렌더 권한인지 판정하는 한 창(1초)의 집계.
+///
+/// ★셸은 이미 올바르다.★ `request_redraw()` 를 부르는 곳은 클럭 틱과 `--capture`
+/// 둘뿐이고 `RedrawRequested` 는 `render_all_tiles()` 하나로 간다. 그런데 실측에서
+/// 타일별 WRRATE 가 61~75 다(2026-09-17, log_ani_debug/25: 408 표본 중 304 개가
+/// 60 초과, p75=72.0, 최고 75.1). 60Hz 디스플레이가 그것을 고르게 보여줄 수 없고,
+/// 프레임당 변위가 달라지는 것이 등속 애니메이션을 떨리게 만든다.
+///
+/// 이 넷을 한 줄에 같이 내야 갈린다 -- 따로 보면 어느 단계에서 새는지 알 수 없다.
+#[derive(Default)]
+struct ClockStats {
+    window_start: Option<std::time::Instant>,
+    /// `drive_present_clock()` 이 틱을 발화한 횟수.
+    ticks: u32,
+    /// `WindowEvent::RedrawRequested` 진입 횟수. `ticks` 보다 크면 셸 밖에서 온다.
+    redraw: u32,
+    /// `render_all_tiles()` 진입 횟수. `redraw` 하나가 렌더 하나여야 한다.
+    renders: u32,
+    /// 클럭이 허가하지 않아 억제한 횟수. 2단계 전에는 항상 0 이다.
+    suppressed: u32,
+    /// `render_all_tiles()` 진입 간격(ms).
+    ///
+    /// ***평균이 아니라 분포를 낸다.*** 끊김은 정의상 꼬리에만 있고, 균일한 57fps 와
+    /// "60,60,60,20,60" 은 평균이 같다. 이 표본이 성공 기준 1 그 자체다.
+    gaps_ms: Vec<f64>,
+    last_render_at: Option<std::time::Instant>,
+}
+
+/// 한 창에 담을 간격 표본의 상한.
+///
+/// 60Hz 에서 한 창은 60 개다. 스톨로 창이 길어져도 메모리가 늘지 않게 막는다 --
+/// 실측된 최악의 정지가 3.2 초이므로(`MAINBUSY window_ms=3239`) 여유를 크게 둔다.
+const MAX_CLOCK_GAP_SAMPLES: usize = 4096;
 
 /// `charge_main` 이 시간을 적립할 칸.
 #[derive(Clone, Copy)]
@@ -517,6 +553,103 @@ impl AppState {
         value
     }
 
+    /// 클럭이 틱을 발화했다.
+    fn note_present_tick(&self) {
+        let mut stats = self.clock_stats.borrow_mut();
+        stats
+            .window_start
+            .get_or_insert_with(std::time::Instant::now);
+        stats.ticks += 1;
+    }
+
+    /// winit 이 `RedrawRequested` 를 전달했다.
+    fn note_redraw_requested(&self) {
+        let mut stats = self.clock_stats.borrow_mut();
+        stats
+            .window_start
+            .get_or_insert_with(std::time::Instant::now);
+        stats.redraw += 1;
+    }
+
+    /// 클럭이 허가하지 않아 그리지 않았다. 2단계 전에는 불리지 않는다.
+    #[allow(dead_code, reason = "2단계 분기 1 에서만 쓴다")]
+    fn note_redraw_suppressed(&self) {
+        self.clock_stats.borrow_mut().suppressed += 1;
+    }
+
+    /// 한 패스를 그리기 시작했다. 직전 패스와의 간격을 함께 남긴다.
+    fn note_clock_render_pass(&self) {
+        let now = std::time::Instant::now();
+        let mut stats = self.clock_stats.borrow_mut();
+        stats.window_start.get_or_insert(now);
+        stats.renders += 1;
+        if let Some(last) = stats.last_render_at
+            && stats.gaps_ms.len() < MAX_CLOCK_GAP_SAMPLES
+        {
+            let gap = now.duration_since(last).as_secs_f64() * 1000.0;
+            stats.gaps_ms.push(gap);
+        }
+        stats.last_render_at = Some(now);
+    }
+
+    /// 창이 1 초를 넘으면 `WALLCLOCK` 한 줄을 내고 리셋한다.
+    ///
+    /// `last_render_at` 은 **리셋하지 않는다** -- 창 경계에서 간격 하나가 통째로
+    /// 사라지면 그 자리가 정확히 측정에서 빠진다.
+    fn report_clock_stats(&self) {
+        let mut stats = self.clock_stats.borrow_mut();
+        let Some(start) = stats.window_start else {
+            return;
+        };
+        let window_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if window_ms < 1000.0 {
+            return;
+        }
+
+        let period_ms = self.present_period.as_secs_f64() * 1000.0;
+        let mut sorted = stats.gaps_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pct = |p: f64| -> f64 {
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let index = ((sorted.len() as f64) * p) as usize;
+            sorted[index.min(sorted.len() - 1)]
+        };
+        // ±20% 밖. p50/p95 만 보면 "대체로 괜찮은데 가끔 튐" 을 놓친다.
+        let (low, high) = (period_ms * 0.8, period_ms * 1.2);
+        let off = stats
+            .gaps_ms
+            .iter()
+            .filter(|g| **g < low || **g > high)
+            .count();
+        let off_pct = if stats.gaps_ms.is_empty() {
+            0.0
+        } else {
+            100.0 * off as f64 / stats.gaps_ms.len() as f64
+        };
+
+        log::info!(
+            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
+            window_ms,
+            stats.ticks,
+            stats.redraw,
+            stats.renders,
+            stats.suppressed,
+            period_ms,
+            pct(0.50),
+            pct(0.95),
+            sorted.last().copied().unwrap_or(0.0),
+            off,
+            off_pct,
+            stats.gaps_ms.len(),
+        );
+
+        let last_render_at = stats.last_render_at;
+        *stats = ClockStats::default();
+        stats.last_render_at = last_render_at;
+    }
+
     /// 1초가 찼으면 메인 스레드의 시간 배분을 한 줄로 찍고 창을 비운다.
     ///
     /// `idle` 은 창 길이에서 적립분을 뺀 나머지, 즉 **표출 클럭을 기다리며 논 시간**이다.
@@ -570,6 +703,7 @@ impl AppState {
                 next += self.present_period;
             }
             self.next_present_tick.set(next);
+            self.note_present_tick();
             if let Some(tile) = self.tiles.first() {
                 tile.window.request_redraw();
             }
@@ -578,6 +712,7 @@ impl AppState {
     }
 
     fn render_all_tiles(&self) {
+        self.note_clock_render_pass();
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
             return;
@@ -999,6 +1134,7 @@ impl ApplicationHandler<WakerEvent> for App {
             captured: Cell::new(false),
             pass_counter: Cell::new(0),
             main_busy: RefCell::new(MainBusy::default()),
+            clock_stats: RefCell::new(ClockStats::default()),
             wake_pending: waker.pending.clone(),
             should_exit: Cell::new(false),
         });
@@ -1079,6 +1215,7 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
         state.report_main_busy();
+        state.report_clock_stats();
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
         // fires even on a static page that has otherwise gone idle.
         if state.capture_path.is_some() && !state.captured.get() {
@@ -1108,6 +1245,7 @@ impl ApplicationHandler<WakerEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
+                    state.note_redraw_requested();
                     state.charge_main(MainSlot::Render, || state.render_all_tiles());
                 }
             },
