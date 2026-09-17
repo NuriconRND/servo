@@ -1179,13 +1179,37 @@ impl Painter {
         // 다른 위상의 같은 주기로 도니 맞물렸다 어긋났다 하면서 초당 10~13 개의 여분 프레임이
         // 샜다(60Hz 벽에서 렌더 61 -> 72, log_presentation/00).
         //
-        // 여유는 비디오 게이트와 같은 한 주기 반이다. 60Hz 로 도는 생산자는 언제나 그 안에
-        // 프레임이 있으므로 애니메이션은 값만 얹고, 정말 아무도 안 내는 페이지(움직이는 것이
-        // 이 애니메이션뿐인 화면)에서는 창이 비어 애니메이션이 매 주기 스스로 낸다.
-        let someone_else_is_producing = self
-            .last_frame_by_other_source_at
-            .get()
-            .is_some_and(|last| now.duration_since(last) < animation_period * 3 / 2);
+        // ★판정을 시간 창에서 렌더 클럭으로 옮긴다(2026-09-17).★ 전에는 "한 주기 반 안에
+        // 남의 프레임이 있었나" 로 봤는데, 그 창이 넓어 **낼 수 있는 프레임을 못 내고 있었다.**
+        //
+        // 실측(log_ani_debug/27, 412 창): 애니메이션 값은 초당 60.2 번 계산되는데 문서로
+        // 발행된 것은 54.0 뿐이었다. 스크립트가 초당 15.2 프레임을 내고 그 하나하나가 1.5
+        // 주기를 막으니 22.8 주기가 막혔고(15.2 x 1.5), 애니메이션 자체 프레임은 37.2 예상 /
+        // 38.6 실측으로 모델이 그대로 맞았다. 잃은 6.2 개는 다음 밀어넣기가 값을 덮어써
+        // 화면에 닿지 못했다. 화면에 도달한 위치는 초당 45.4 개인데 표출은 60.6 번이라,
+        // 표출 넷 중 하나가 직전 위치를 다시 그렸다 -- 등속 운동이 떨려 보이는 것이 이것이다.
+        //
+        // ★창을 한 주기로 좁히는 것은 답이 아니다.★ `raf_is_driving_composites` 의 주석이
+        // 이미 그 이유를 적어 두었다 -- 60fps 로 도는 남의 프레임은 간격이 한 주기에 닿을 수
+        // 있어 판정이 매번 뒤집히고, 그 뒤집힘이 이 게이트가 애초에 막으려던 지터다. 창을
+        // 조정하는 한 위상 문제는 남는다. 그래서 **위상을 없앤다.**
+        //
+        // 물음은 원래 "남이 이번 합성분의 프레임을 이미 냈는가" 이고, 그 경계는 시각이 아니라
+        // **마지막 렌더가 시작된 순간**이다(`Painter::render` 맨 앞에서 매 패스 찍힌다).
+        // 그 뒤에 남이 낸 프레임은 아직 합성되지 않았으니 다음 합성이 실어 간다 -- 애니메이션은
+        // 값만 얹으면 된다. 그 전에 난 프레임은 이미 소비됐으니 이번 주기는 비어 있고,
+        // 애니메이션이 내야 한다.
+        //
+        // `push_due` 가 쓰는 신호와 같은 것이므로 두 판정이 **같은 위상**으로 돈다 -- 위
+        // 문단이 말한 "서로 다른 위상의 같은 주기" 가 구조적으로 불가능해진다.
+        let someone_else_is_producing = match (
+            self.last_frame_by_other_source_at.get(),
+            self.last_render_started_at.get(),
+        ) {
+            (Some(other), Some(rendered)) => other > rendered,
+            // 렌더가 아직 없으면 얹혀 갈 합성도 없다. 남이 낸 적이 없어도 마찬가지다.
+            _ => false,
+        };
         let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
         // Skipping does not touch `last_paint_animation_push_at`, so the next turn tries
         // again as soon as the pipeline is free rather than waiting out another period.
