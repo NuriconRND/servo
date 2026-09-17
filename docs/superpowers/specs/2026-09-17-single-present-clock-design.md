@@ -161,6 +161,52 @@ for the machine, not two that can disagree" 라고 명시한다. 120 은 값이 
 틀렸을 때 갈 곳을 설계에 미리 적어 두는 것이 이번에는 필요하다. 이 경우 떨림은
 present 이후 — DComp 커밋/스캔아웃 — 에 있고, §5 와 같은 자리로 수렴한다.
 
+#### 판정 — 분기 4 (2026-09-17, log_ani_debug/26)
+
+1단계를 실기에 올린 결과 **분기 4**다. ★프레임 과잉 생산은 존재하지 않았다.★
+이 설계가 세운 전제가 틀렸다.
+
+한 런(103 초)에서 네 계수를 나란히 놓으면:
+
+| 계수 | 초당 | 출처 |
+|---|---|---|
+| 클럭 틱 `ticks` | 60.5 | `drive_present_clock()` |
+| 재그리기 `redraw` | 60.5 | `WindowEvent::RedrawRequested` |
+| 렌더 패스 `renders` | 60.5 | `render_all_tiles()` |
+| 셸 패스 `passes/s` | 60.0 | `WALLPASS` — `skipped=0` 이 103 창 전부 |
+| 타일 `WRRATE frames` | 68.0 | webrender `render_impl` 종료 지점 |
+
+`ticks = redraw = renders` 가 모든 창에서 일치하고 `period_ms=16.7` 이며, 간격
+분포는 p50 16.6~16.7 · p95 17.0~17.1 · `off=0(0%)` 가 여덟 창 중 일곱이다.
+★성공 기준 1(`p95 <= period_ms * 1.2` = 20.0)이 아무것도 고치기 전에 이미
+충족된다.★ 이것이 분기 1(`redraw>60`)과 분기 3(`period_ms` 오류)을 함께 배제한다.
+
+남은 것은 WRRATE 하나뿐이고, 그 초과분은 **표시되지 않는 렌더**다. `render_impl`
+을 부르는 곳은 다섯이며 그중 넷이 `Renderer::update()` 안에 있고 넷 다 프레임버퍼
+타깃에 `None` 을 넘긴다 — 텍스처 캐시 플러시와 오프스크린 문서 렌더이고, 그 자리
+주석이 "this render will not be presented" 라고 적어 두었다
+(`vendor_local/webrender/src/renderer/mod.rs` 의 1100 · 1186 · 1225 · 1242).
+표출되는 경로는 `pub fn render`(1417) 하나뿐이고 거기에 닿는 길은
+`Painter::render`(`components/paint/painter.rs:1802`) 밖에 없다. 그리고
+`Painter::render` 의 호출처는 `components/paint/paint.rs` 의 네 군데가 전부이며
+전부 셸의 공개 API 로만 들어온다. 셸은 `dispatched[]` 로 한 패스 안의 중복 렌더를
+막으므로 **타일당 패스당 정확히 한 번** 그린다. 즉 타일이 실제로 표출하는 프레임은
+60.0/s — 클럭 그대로다. WRRATE 는 present 를 세는 계수가 아니었다.
+
+측정이 이 설명을 한 번 더 지지한다. WRRATE 초과분은 렌더 비용과 같이 움직인다:
+`render_ms < 20` 인 표본 89 개는 평균 60.9fps, `render_ms 20~40` 인 표본 321 개는
+평균 70.5fps 다. 한가한 타일은 캐시 플러시를 하지 않아 클럭과 같고 바쁜 타일만
+오프스크린 패스를 더 돈다 — 과잉 **표출**이라면 나올 수 없는 상관이다.
+
+이 갈래를 설계에 미리 적어 둔 것이 값을 했다. 분기 4 문단은 원인을 "예: WebRender
+가 한 합성에서 서브패스마다 `render_impl` 을 세는 경우" 로 추측했는데, 실제 기전은
+그 이웃이었다(서브패스가 아니라 `update()` 안의 오프스크린 렌더). 갈 곳이 적혀
+있었으므로 전제가 무너진 자리에서 헤매지 않았다.
+
+***따라서 3단계(`present_due` 게이트)는 실행하지 않는다.*** 막을 프레임이 없다.
+떨림은 present 이후(DComp 커밋·스캔아웃)이거나 `PAINTANIM` 이 분해하지 못하는 층에
+있고, §5 가 가리키는 자리로 수렴한다.
+
 ### 3. 검증
 
 1단계 실행이 진단이자 **기준선**을 겸한다. 별도 기준선 런이 필요 없다.

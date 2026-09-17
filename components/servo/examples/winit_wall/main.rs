@@ -304,12 +304,19 @@ struct MainBusy {
 /// 표출 클럭이 **유일한** 렌더 권한인지 판정하는 한 창(1초)의 집계.
 ///
 /// ★셸은 이미 올바르다.★ `request_redraw()` 를 부르는 곳은 클럭 틱과 `--capture`
-/// 둘뿐이고 `RedrawRequested` 는 `render_all_tiles()` 하나로 간다. 그런데 실측에서
-/// 타일별 WRRATE 가 61~75 다(2026-09-17, log_ani_debug/25: 408 표본 중 304 개가
-/// 60 초과, p75=72.0, 최고 75.1). 60Hz 디스플레이가 그것을 고르게 보여줄 수 없고,
-/// 프레임당 변위가 달라지는 것이 등속 애니메이션을 떨리게 만든다.
+/// 둘뿐이고 `RedrawRequested` 는 `render_all_tiles()` 하나로 간다. 이 계수는 그것을
+/// 실기에서 확인하려고 붙였고, 확인됐다 -- log_ani_debug/26 의 103 창 전부에서
+/// `ticks=redraw=renders` 이고 간격은 p95 17.1ms(주기 16.7)에 `off=0%` 였다.
 ///
-/// 이 넷을 한 줄에 같이 내야 갈린다 -- 따로 보면 어느 단계에서 새는지 알 수 없다.
+/// ★WRRATE 61~75 는 과잉 표출이 아니다.★ 이 계수를 붙인 이유가 그 숫자였는데,
+/// WRRATE 는 present 가 아니라 `render_impl` 진입을 센다. 다섯 진입점 중 넷이
+/// `Renderer::update()` 안에서 프레임버퍼에 `None` 을 넘기는 오프스크린 렌더다
+/// (텍스처 캐시 플러시 -- 그 자리 주석이 "this render will not be presented" 라고
+/// 적어 두었다). 실제로 표출되는 프레임은 타일당 60.0/s 로 클럭과 같다.
+/// 근거 수치는 설계 문서 2026-09-17-single-present-clock-design.md §2 판정 절에 있다.
+///
+/// 계수는 남긴다 -- 클럭이 유일한 렌더 권한이라는 것을 다음 회귀 때 다시 재는
+/// 비용이 이 일곱 필드보다 크다.
 #[derive(Default)]
 struct ClockStats {
     window_start: Option<std::time::Instant>,
