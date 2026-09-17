@@ -493,6 +493,21 @@ pub struct Preferences {
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
+    /// vsync 틱과 실제 표출 사이에 둘 위상 오프셋(vsync 주기의 %). 기본 0.
+    ///
+    /// ★진단용 손잡이다.★ 표출을 vsync 에 묶었더니 오히려 나빠졌다(log_ani_debug/30,
+    /// 31) -- 개수 계수는 전부 정상인데 육안만 나쁘다. 운영자 기술은 "자유 구동일 때
+    /// 나쁜 구간의 상태가 재생 내내" 이고, 이는 위상이 한 자리에 고정됐는데 그 자리가
+    /// scanout 경계라는 모양이다. 자유 구동은 그 자리를 천천히 지나가므로 좋은 구간이
+    /// 생긴다.
+    ///
+    /// 그 가설은 개수로는 확인할 수 없고 시간 영역 계측이 필요한데, 그전에 **눈으로
+    /// 이분 탐색**할 수 있게 하는 것이 이 값이다. 0 / 25 / 50 / 75 를 쓸어 보아
+    /// 좋은 자리가 있으면 위상 가설이 확정되고 값도 같이 나온다. 어느 값도 좋지
+    /// 않으면 위상이 아니다.
+    ///
+    /// `[0, 99]` 로 조인다. `gfx_vsync_enabled` 가 꺼져 있으면 아무 효과가 없다.
+    pub gfx_vsync_phase_pct: i64,
     /// 프리-vsync 페이싱용 자유 실행 페인트 타이머 주기(Hz). 특정 디스플레이 주사율(예 60)에
     /// 맞춰 프레임 생산이 vsync 를 앞질러 저더가 생기는 것을 줄인다. `[1, 1000]` 범위를
     /// 벗어나면 경고 후 기본값(120)을 쓴다.
@@ -1105,6 +1120,7 @@ impl Preferences {
             gfx_paint_side_animation_tick_divisor: 4,
             gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
+            gfx_vsync_phase_pct: 0,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,

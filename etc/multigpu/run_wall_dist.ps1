@@ -98,6 +98,18 @@ param(
     # 판정: WALLCLOCK 의 backstop 필드. 0 이면 vsync 가 몰고 있는 것이고, 오르면
     # 신호가 끊겨 자유 구동 타이머로 내려앉은 것이다(로그에 warn 도 같이 나간다).
     [switch] $Vsync,
+    # gfx_vsync_phase_pct: vsync 틱과 실제 표출 사이의 위상 오프셋(vsync 주기의 %).
+    # 기본 0. -Vsync 와 같이 쓸 때만 의미가 있다.
+    #
+    # ★왜 있나★ -Vsync 로 묶었더니 오히려 나빠졌는데(log_ani_debug/30, 31) 개수
+    # 계수는 전부 정상이었다 -- 떨림은 "값을 뜬 시각과 화면에 나가는 시각의 간격"
+    # 이고 그것을 재는 계수가 없다. 관찰된 모양(자유 구동일 때 나쁜 구간의 상태가
+    # 재생 내내)은 위상이 한 자리에 고정됐는데 그 자리가 scanout 경계라는 뜻이다.
+    #
+    # 0 / 25 / 50 / 75 를 쓸어 보라. 좋은 자리가 있으면 위상 가설이 확정되고 값도
+    # 같이 나온다. 어느 값도 좋지 않으면 위상이 아니므로 -Vsync 를 접으면 된다.
+    [ValidateRange(0, 99)]
+    [int]    $VsyncPhase = 0,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -612,6 +624,7 @@ $argList = @(
     "--wall-layout", $layout, "--wall-all-tiles",
     "--pref", "gfx_dcomp_mode=$DComp",
     "--pref", "gfx_vsync_enabled=$($Vsync.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_vsync_phase_pct=$VsyncPhase",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -671,7 +684,7 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in

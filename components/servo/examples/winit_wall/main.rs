@@ -279,6 +279,13 @@ struct AppState {
     vsync_armed: Cell<bool>,
     /// vsync 신호가 멎었다고 판정한 상태. 이때만 자유 구동 타이머가 민다.
     vsync_stalled: Cell<bool>,
+    /// vsync 틱과 실제 표출 사이의 위상 오프셋(`gfx_vsync_phase_pct`).
+    /// 0 이면 vsync 가 오는 즉시 틱한다.
+    vsync_phase: std::time::Duration,
+    /// 오프셋 때문에 미뤄 둔 틱이 있는가.
+    vsync_tick_pending: Cell<bool>,
+    /// 그 틱을 낼 시각(`vsync + vsync_phase`).
+    vsync_tick_at: Cell<Option<std::time::Instant>>,
     /// vsync 콜백이 이벤트 루프를 깨우는 데 쓰는 waker. 엔진과 같은 것을 공유하므로
     /// 중복 깨우기는 그쪽 `pending` 플래그가 흡수한다.
     vsync_waker: Waker,
@@ -735,7 +742,17 @@ impl AppState {
         if let Some(driver) = self.present_vsync.as_ref() {
             self.pump_vsync(now, driver);
             if !self.vsync_stalled.get() {
-                // 깨우기는 콜백이 하므로 이 시각은 마감이 아니라 **정지 감시 기한**이다.
+                // 위상 오프셋이 걸려 있으면 **그 시각에** 깨어나야 한다. 콜백은 이미
+                // 왔고 틱만 미뤄 둔 상태이므로, 이 시각을 놓치면 한 주기가 통째로 빈다.
+                if self.vsync_tick_pending.get() {
+                    if let Some(at) = self.vsync_tick_at.get() {
+                        if at > now {
+                            return at;
+                        }
+                    }
+                }
+                // 미뤄 둔 틱이 없으면 깨우기는 콜백이 하므로 이 시각은 마감이 아니라
+                // **정지 감시 기한**이다.
                 return now + self.vsync_stall_after();
             }
             // 멎었다 -- 아래 자유 구동 타이머가 대신 민다.
@@ -769,15 +786,31 @@ impl AppState {
             self.vsync_armed.set(true);
         }
 
+        // ★위상 오프셋.★ 0 이면 vsync 가 오는 즉시 틱한다(종전). 0 이 아니면 vsync 를
+        // **기준점**으로만 쓰고 틱은 `vsync + offset` 에 낸다 -- `gfx_vsync_phase_pct` 주석
+        // 참고. 개수로는 보이지 않는 위상을 눈으로 이분 탐색하기 위한 손잡이다.
         if fired {
             if self.vsync_stalled.replace(false) {
                 log::warn!("wall: vsync 신호가 돌아왔다 -- 표출 클럭을 다시 vsync 에 묶는다.");
             }
+            self.vsync_tick_at.set(Some(now + self.vsync_phase));
+            self.vsync_tick_pending.set(true);
+        }
+
+        // 기한이 찼으면 낸다. `fired` 와 분리해 둔 것은 오프셋이 0 이 아닐 때 이 자리가
+        // **다음 호출**에서 돌기 때문이다(그때 깨워 줄 사람은 아래 반환값이 잡는 control flow).
+        if self.vsync_tick_pending.get()
+            && self.vsync_tick_at.get().is_some_and(|at| now >= at)
+        {
+            self.vsync_tick_pending.set(false);
             self.last_present_tick_at.set(now);
             self.note_present_tick();
             if let Some(tile) = self.tiles.first() {
                 tile.window.request_redraw();
             }
+        }
+
+        if fired {
             return;
         }
 
@@ -1122,7 +1155,8 @@ impl ApplicationHandler<WakerEvent> for App {
             let enabled = servo::prefs::get().gfx_vsync_enabled;
             if enabled {
                 eprintln!(
-                    "wall: gfx_vsync_enabled=true: pacing frame production to DWM vsync (DwmFlush)."
+                    "wall: gfx_vsync_enabled=true: DWM vsync(DwmFlush) 에 표출과 값 표본을 묶는다 (phase_pct={}).",
+                    servo_config::pref!(gfx_vsync_phase_pct).clamp(0, 99)
                 );
                 Some(Rc::new(vsync_refresh_driver::DwmVsyncRefreshDriver::new()))
             } else {
@@ -1260,6 +1294,19 @@ impl ApplicationHandler<WakerEvent> for App {
             vsync_due: Arc::new(AtomicBool::new(false)),
             vsync_armed: Cell::new(false),
             vsync_stalled: Cell::new(false),
+            vsync_phase: {
+                // vsync 주기는 미리 알 수 없으므로 `gfx_refresh_hz` 의 주기를 자로 쓴다.
+                // 60Hz 디스플레이에 `-RefreshHz 60` 이면 둘이 같으니 백분율이 곧 위상이다.
+                let pct = servo_config::pref!(gfx_vsync_phase_pct).clamp(0, 99) as u32;
+                let period = {
+                    let raw_hz = servo_config::pref!(gfx_refresh_hz);
+                    let hz = if (1..=1000).contains(&raw_hz) { raw_hz } else { 120 };
+                    std::time::Duration::from_secs_f64(1.0 / hz as f64)
+                };
+                period * pct / 100
+            },
+            vsync_tick_pending: Cell::new(false),
+            vsync_tick_at: Cell::new(None),
             vsync_waker: waker.clone(),
             last_present_tick_at: Cell::new(std::time::Instant::now()),
             capture_deadline: config.capture.as_ref().map(|_| {
