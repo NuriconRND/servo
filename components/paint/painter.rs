@@ -3024,6 +3024,40 @@ impl Painter {
             display_list_info.caret_property_binding,
             &self.web_content_animator,
         );
+        // ★타일마다 같은 애니메이션이 다른 위치에 있는 것을 여기서 가른다.★
+        //
+        // 실측(2026-09-17, log_ani_debug/22): 등속 translateX 하나를 4 타일이 그리는데
+        // PainterId(1) 이 나머지 셋보다 항상 50~74px(약 39ms) 뒤에 있었다. 부호가 한 번도
+        // 바뀌지 않았고, 2/3/4 는 서로 0.4px 안에 들었다. 밀어넣기 주기는 넷이 동일했으므로
+        // (frames=35 rode_along=25 skipped_busy=0) 원인은 박자가 아니라 **앵커**다.
+        //
+        // 앵커는 `created_at = received_at - (now - built_at)` 로 잡히므로 원리상 네 타일이
+        // 같은 절대 시각에 수렴해야 한다. 수렴하지 않는다면 셋 중 하나다: `built_at` 이 타일마다
+        // 다르거나(타일별로 디스플레이 리스트를 따로 만든다), transit 이
+        // `MAX_DISPLAY_LIST_TRANSIT` 에 잘리거나, `offset_from_display_list` 가 다르거나.
+        // 그 셋을 구분하려면 입력값을 그대로 봐야 한다 -- 결과인 좌표만으로는 되짚을 수 없다.
+        if !display_list_info.paint_animations.is_empty() {
+            let now = CrossProcessInstant::now();
+            let detail = display_list_info
+                .paint_animations
+                .iter()
+                .map(|animation| {
+                    format!(
+                        "offset={:.4} transit_ms={:.2}",
+                        animation.offset_from_display_list,
+                        (now - animation.built_at).as_seconds_f64() * 1000.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            warn!(
+                "PAINTANIMANCHOR painter={:?} epoch={:?} count={} {}",
+                self.painter_id,
+                epoch,
+                display_list_info.paint_animations.len(),
+                detail
+            );
+        }
         details
             .animations
             .install_paint_animations(display_list_info.paint_animations);
