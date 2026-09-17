@@ -13,7 +13,8 @@ use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
 use embedder_traits::{
     EventLoopWaker, InputEvent, InputEventAndId, InputEventId, InputEventResult,
-    PaintHitTestResult, ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint, WebViewRect,
+    PaintHitTestResult, RefreshDriver, ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint,
+    WebViewRect,
 };
 use euclid::{Point2D, Rect, Scale, Size2D};
 use gleam::gl::RENDERER;
@@ -818,9 +819,20 @@ impl Painter {
 
         let embedder_to_constellation_sender = paint.embedder_to_constellation_sender;
         let timer_refresh_driver = LazyCell::default();
+        // ★표출과 애니메이션 표본이 같은 클럭을 타게 한다.★ `BaseRefreshDriver` 는
+        // 이미 설치된 드라이버를 우선 쓰는데, `WebContentAnimator` 는 타이머를 직접
+        // 받아 그것을 우회하고 있었다. 그 결과 `gfx_vsync_enabled` 로 표출만 vsync 에
+        // 묶으면 값 표본은 자유 구동 타이머에 남아 둘이 매 프레임 어긋났다 -- 주기적
+        // 딸꾹질이 내내 떨림으로 바뀐다(실기 확인, log_ani_debug/30).
+        //
+        // vsync 가 꺼져 있으면 결정 결과가 `TimerRefreshDriver` 이고 그것의
+        // `observe_next_frame` 이 `queue_timer(paint_timer_period(), ..)` 이라
+        // 종전 동작과 정확히 같다. `unwrap_or_else` 라 vsync 일 때는 타이머 스레드를
+        // 띄우지도 않는다.
+        let installed_refresh_driver = rendering_context.refresh_driver();
         let refresh_driver = Rc::new(BaseRefreshDriver::new(
             paint.event_loop_waker.clone_box(),
-            rendering_context.refresh_driver(),
+            installed_refresh_driver.clone(),
             &timer_refresh_driver,
         ));
         let animation_refresh_driver_observer = Rc::new(AnimationRefreshDriverObserver::new(
@@ -1067,6 +1079,8 @@ impl Painter {
             web_content_animator: WebContentAnimator::new(
                 paint.event_loop_waker.clone_box(),
                 (*timer_refresh_driver).clone(),
+                installed_refresh_driver
+                    .unwrap_or_else(|| (*timer_refresh_driver).clone() as Rc<dyn RefreshDriver>),
             ),
             #[cfg(windows)]
             dcomp_native_active,
@@ -1298,7 +1312,7 @@ impl Painter {
         // 끝난 뒤에도 같은 생산자가 이어서 낸다.
         if still_animating || video_pending {
             self.web_content_animator
-                .wake_for_paint_animation(animation_period);
+                .wake_for_paint_animation();
         }
         self.paint_animation_held_max
             .set(self.paint_animation_held_max.get().max(held_values));

@@ -452,6 +452,57 @@ let someone_else_is_producing = match (
 
 45 영상 벽에서 프레임 빌드 4 배는 코어 1 개보다 비싸다. 1 을 권한다.
 
+### 5-6. vsync 로 묶었더니 더 나빠졌다 — 절반만 묶었기 때문 (log_ani_debug/30)
+
+실기 판정(운영자): `-Vsync` 를 켜면 **재생 내내** 나쁜 수준이고, 끄면 좋은 구간이
+120/240Hz 에 근접한다. 즉 켠 쪽이 더 나쁘다.
+
+계측은 정상으로 보인다:
+
+| | vsync ON | vsync OFF |
+|---|---|---|
+| `backstop` | 103 창 중 합 1 | 0 |
+| `ticks` / `renders` | 60.8 | 60.6 |
+| `presented` | 60.0 | 60.6 |
+| gap p50 | 16.70 | 16.67 |
+| gap p95 | 17.23 | 17.12 |
+| `published` / `superseded` | 62.0 / 2.0 | 71.6 / 11.1 |
+
+`backstop` 이 사실상 0 이므로 **vsync 는 실제로 몰고 있었다.** 과잉 발행도 오히려
+줄었다(71.6 → 62.0). 셸 계수로는 개선으로 보이는데 눈은 반대다.
+
+★원인: 값 표본이 vsync 를 타지 않았다.★ 애니메이션 값을 뜨는 시점은
+`WebContentAnimator::wake_for_paint_animation` 인데, 그것이
+`timer_refresh_driver.queue_timer(period, ..)` 를 불렀다 — **설치된 드라이버를 우회하는
+전용 타이머**다(`painter.rs` 가 `WebContentAnimator::new` 에 `TimerRefreshDriver` 를
+직접 넘기고 있었다). `BaseRefreshDriver` 는 설치된 드라이버를 우선 쓰는데 이 경로만
+그것을 비껴갔다.
+
+그래서 §5-5 의 수정은 **표출만** vsync 에 묶고 표본은 자유 구동 타이머에 남겼다.
+두 클럭이 매 프레임 맞물렸다 어긋나면서 "값을 뜬 시각 → 화면에 나가는 시각" 간격이
+프레임마다 달라진다. 자유 구동일 때는 두 클럭이 같은 종류라 그 간격이 대체로 유지되고
+표출/scanout 위상만 천천히 미끄러졌으므로, **주기적인 딸꾹질 하나**로 끝났다. 절반만
+묶으니 그 딸꾹질이 **내내 이어지는 떨림**으로 바뀐 것이다.
+
+★고쳐야 할 쌍을 잘못 골랐다.★ 균일해야 하는 것은 (렌더 시작 ↔ DWM 합성)이 아니라
+(값 표본 ↔ scanout)이다.
+
+#### 수정
+
+`WebContentAnimator` 가 결정된 드라이버를 같이 들고, `wake_for_paint_animation` 이
+`observe_next_frame` 으로 그것을 탄다. 캐럿 깜빡임(500ms)은 진짜 타이머라 그대로 둔다.
+
+vsync 가 꺼져 있으면 결정 결과가 `TimerRefreshDriver` 이고 그것의 `observe_next_frame`
+이 `queue_timer(paint_timer_period(), ..)` 이라 **종전 동작과 정확히 같다** — 기본
+경로는 무변화다.
+
+#### 이 라운드가 남기는 교훈
+
+셸 계수 다섯 개가 전부 좋아졌는데 화면은 나빠졌다. 이 계수들은 **생산과 소비의 개수**를
+재지 **표본과 표시의 시간 관계**를 재지 않는다. 다음에 이 층을 다시 건드리면 그것부터
+계측해야 한다 — `DwmGetCompositionTimingInfo` 의 `qpcVBlank` / `qpcRefreshPeriod` 로
+present 의 vblank 상대 위상 분포를 내면 개수가 아니라 위상이 보인다.
+
 ## 비목표
 
 `paint.rs` 와 엔진 통지 경로 수정(범위 밖, 분기 2 에서 필요해지면 별도 합의),

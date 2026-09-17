@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use embedder_traits::EventLoopWaker;
+use embedder_traits::{EventLoopWaker, RefreshDriver};
 use rustc_hash::FxHashMap;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::WebViewId;
@@ -44,6 +44,19 @@ const MAX_DISPLAY_LIST_TRANSIT: Duration = Duration::from_millis(250);
 pub(crate) struct WebContentAnimator {
     event_loop_waker: Box<dyn EventLoopWaker>,
     timer_refresh_driver: Rc<TimerRefreshDriver>,
+    /// ★애니메이션 값 표본이 타는 클럭.★ `gfx_vsync_enabled` 로 vsync 드라이버가
+    /// 설치돼 있으면 그것이고, 아니면 위 타이머다(그 경우 `observe_next_frame` 이
+    /// `queue_timer(paint_timer_period(), ..)` 이라 동작이 종전과 같다).
+    ///
+    /// ***왜 나눠 들고 있나*** -- 캐럿 깜빡임은 진짜 타이머(500ms)라 프레임 틱을
+    /// 탈 수 없다. 표본만 표출과 같은 클럭에 얹는다.
+    ///
+    /// ★이것을 안 맞추면 vsync 로 묶는 것이 오히려 해롭다.★ 표출만 vsync 에 묶고
+    /// 표본이 자유 구동 타이머에 남으면 둘이 매 프레임 맞물렸다 어긋나면서, 값을
+    /// 뜬 시각과 화면에 나가는 시각의 간격이 프레임마다 달라진다 -- 자유 구동일 때
+    /// 주기적으로 한 번 나던 딸꾹질이 **내내** 나는 떨림으로 바뀐다(실기 확인,
+    /// log_ani_debug/30).
+    frame_refresh_driver: Rc<dyn RefreshDriver>,
     caret_visible: Cell<bool>,
     timer_scheduled: Cell<bool>,
     need_update: Arc<AtomicBool>,
@@ -56,10 +69,12 @@ impl WebContentAnimator {
     pub(crate) fn new(
         event_loop_waker: Box<dyn EventLoopWaker>,
         timer_refresh_driver: Rc<TimerRefreshDriver>,
+        frame_refresh_driver: Rc<dyn RefreshDriver>,
     ) -> Self {
         Self {
             event_loop_waker,
             timer_refresh_driver,
+            frame_refresh_driver,
             caret_visible: Cell::new(true),
             timer_scheduled: Default::default(),
             need_update: Default::default(),
@@ -74,19 +89,20 @@ impl WebContentAnimator {
     /// thing is one CSS animation has nothing else to wake the painter -- and the whole
     /// point of these animations is that they keep running when script has stopped
     /// feeding us.
-    pub(crate) fn wake_for_paint_animation(&self, period: Duration) {
+    ///
+    /// ★박자는 표출과 같은 클럭에서 온다.★ 여기가 값 표본을 뜨는 시점이므로, 이것이
+    /// 표출과 다른 클럭에 있으면 둘이 매 프레임 어긋난다 -- `frame_refresh_driver` 주석.
+    /// 주기 인자를 받지 않는 이유도 그것이다: 주기는 드라이버가 안다.
+    pub(crate) fn wake_for_paint_animation(&self) {
         if self.paint_animation_wake_scheduled.load(Ordering::Relaxed) {
             return;
         }
         let event_loop_waker = self.event_loop_waker.clone();
         let scheduled = self.paint_animation_wake_scheduled.clone();
-        self.timer_refresh_driver.queue_timer(
-            period,
-            Box::new(move || {
-                scheduled.store(false, Ordering::Relaxed);
-                event_loop_waker.wake();
-            }),
-        );
+        self.frame_refresh_driver.observe_next_frame(Box::new(move || {
+            scheduled.store(false, Ordering::Relaxed);
+            event_loop_waker.wake();
+        }));
         self.paint_animation_wake_scheduled
             .store(true, Ordering::Relaxed);
     }
