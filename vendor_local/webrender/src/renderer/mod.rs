@@ -478,6 +478,16 @@ thread_local! {
     static WALL_WINDOW_RESOLVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WALL_WINDOW_LOCK_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
     static WALL_WINDOW_RENDER_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// servo wall: 생산과 소비를 **같은 창에서** 가르는 계수.
+    ///
+    /// `frames` 하나만으로는 무엇이 표출됐는지 알 수 없다 -- 그 값이 61~75 인 것을
+    /// 과잉 표출로 읽었다가 틀렸다(2026-09-17). `render_impl` 진입의 상당수가
+    /// 프레임버퍼를 건드리지 않는 캐시 플러시다. 아래 다섯이 그 오독을 구조적으로 막는다.
+    static WALL_WINDOW_ONSCREEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_PRESENTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_PUBLISHED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_SUPERSEDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static WALL_WINDOW_FLUSHED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// GPU 메모리 항목을 마지막으로 남긴 시각.
     static WALL_MEM_LOG_AT: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
@@ -1086,6 +1096,11 @@ impl Renderer {
                 ) => {
                     // Add a new document to the active set
 
+                    // servo wall: 콘텐츠 생산율. 이 메시지 하나가 렌더 백엔드가 만들어
+                    // 보낸 프레임 하나다. 초당 몇 개가 오는지가 생산율이고, 그중 합성
+                    // 전에 교체되는 수가 생산 초과분이다.
+                    WALL_WINDOW_PUBLISHED.with(|c| c.set(c.get() + 1));
+
                     // If the document we are replacing must be drawn (in order to
                     // update the texture cache), issue a render just to
                     // off-screen targets, ie pass None to render_impl. We do this
@@ -1095,7 +1110,18 @@ impl Renderer {
                     let prev_frame_memory = if let Some(mut prev_doc) = self.active_documents.remove(&document_id) {
                         doc.profile.merge(&mut prev_doc.profile);
 
+                        // servo wall: 직전 문서가 한 번도 합성되지 않은 채 교체된다.
+                        // 이것이 버려지는 콘텐츠 프레임이다 -- 표출 프레임이 빠지는 것은
+                        // 아니지만(합성은 언제나 최신 문서를 집는다), 생산이 소비보다
+                        // 빠르다는 직접 증거다.
+                        if !prev_doc.frame.has_been_rendered {
+                            WALL_WINDOW_SUPERSEDED.with(|c| c.set(c.get() + 1));
+                        }
+
                         if prev_doc.frame.must_be_drawn() {
+                            // superseded 중 캐시 작업이 있어 오프스크린 렌더를 강제하는
+                            // 것. WRRATE 의 frames 가 onscreen 을 넘는 몫이 여기서 나온다.
+                            WALL_WINDOW_FLUSHED.with(|c| c.set(c.get() + 1));
                             prev_doc.render_reasons |= RenderReasons::TEXTURE_CACHE_FLUSH;
                             self.render_impl(
                                 document_id,
@@ -1626,6 +1652,10 @@ impl Renderer {
         buffer_age: usize,
     ) -> Result<RenderResults, Vec<RendererError>> {
         profile_scope!("render");
+        // servo wall: 호출자가 프레임버퍼를 요구했는지. 아래에서 `frame.present == false`
+        // 면 `device_size` 가 None 으로 덮이므로, 그 전에 잡아 두어야 "요구했는데 표출되지
+        // 않은" 경우를 WRRATE 에서 가를 수 있다.
+        let wall_requested_onscreen = device_size.is_some();
         let mut results = RenderResults::default();
         self.profile.end_time_if_started(profiler::FRAME_SEND_TIME);
         self.profile.start_time(profiler::RENDERER_TIME);
@@ -1805,6 +1835,20 @@ impl Renderer {
         // 느린 프레임에서만 그 값을 한 줄로 낸다.
         // 초당 한 줄: 프레임 수 / resolve 수 / lock 시간 / 렌더 시간. 임계값이 없으므로
         // 빠른 구간도 그대로 보인다.
+        //
+        // ★한 창에 같이 내는 것이 요점이다.★ 이 추적에서 서로 다른 창에 찍힌 값을
+        // 비교했다가 두 번 틀렸다(타일 간 74px 어긋남, WRRATE 61~75 를 과잉 표출로 읽은 것).
+        // 생산과 소비를 가르려면 같은 창에서 나온 숫자여야 한다:
+        //
+        //   published  -- 렌더 백엔드가 이 렌더러에 발행한 문서 수 = 콘텐츠 생산율
+        //   superseded -- 그중 합성되기 전에 다음 문서로 교체된 수 = 생산 초과분
+        //   flushed    -- superseded 중 캐시 작업이 있어 오프스크린 렌더를 강제한 수
+        //   onscreen   -- 호출자가 프레임버퍼를 요구한 render_impl 수 = 셸 패스 수
+        //   presented  -- 그중 실제로 합성까지 간 수. `frame.present == false` 면
+        //                 `device_size` 가 None 으로 덮이므로 onscreen 이어도 표출되지
+        //                 않는다. ★onscreen > presented 면 셸이 요구한 합성을 WebRender
+        //                 가 거절한 것★이고, 그때는 빠진 표출 프레임이 실재한다.
+        //   frames     -- render_impl 진입 전체 = onscreen + 오프스크린 렌더.
         {
             let now = std::time::Instant::now();
             let start = WALL_WINDOW_START.with(|c| c.get()).unwrap_or_else(|| {
@@ -1812,6 +1856,12 @@ impl Renderer {
                 now
             });
             WALL_WINDOW_FRAMES.with(|c| c.set(c.get() + 1));
+            if wall_requested_onscreen {
+                WALL_WINDOW_ONSCREEN.with(|c| c.set(c.get() + 1));
+            }
+            if device_size.is_some() {
+                WALL_WINDOW_PRESENTED.with(|c| c.set(c.get() + 1));
+            }
             WALL_WINDOW_RESOLVES
                 .with(|c| c.set(c.get() + WALL_RESOLVE_COUNT.with(|n| n.get()) as u64));
             WALL_WINDOW_LOCK_MS
@@ -1820,15 +1870,27 @@ impl Renderer {
             let elapsed = now.duration_since(start);
             if elapsed >= std::time::Duration::from_secs(1) {
                 log::warn!(
-                    "WRRATE window_ms={:.0} frames={} resolves={} lock_ms={:.1} render_ms={:.1}",
+                    "WRRATE window_ms={:.0} frames={} onscreen={} presented={} \
+                     published={} superseded={} flushed={} resolves={} lock_ms={:.1} \
+                     render_ms={:.1}",
                     elapsed.as_secs_f64() * 1000.0,
                     WALL_WINDOW_FRAMES.with(|c| c.get()),
+                    WALL_WINDOW_ONSCREEN.with(|c| c.get()),
+                    WALL_WINDOW_PRESENTED.with(|c| c.get()),
+                    WALL_WINDOW_PUBLISHED.with(|c| c.get()),
+                    WALL_WINDOW_SUPERSEDED.with(|c| c.get()),
+                    WALL_WINDOW_FLUSHED.with(|c| c.get()),
                     WALL_WINDOW_RESOLVES.with(|c| c.get()),
                     WALL_WINDOW_LOCK_MS.with(|c| c.get()),
                     WALL_WINDOW_RENDER_MS.with(|c| c.get()),
                 );
                 WALL_WINDOW_START.with(|c| c.set(Some(now)));
                 WALL_WINDOW_FRAMES.with(|c| c.set(0));
+                WALL_WINDOW_ONSCREEN.with(|c| c.set(0));
+                WALL_WINDOW_PRESENTED.with(|c| c.set(0));
+                WALL_WINDOW_PUBLISHED.with(|c| c.set(0));
+                WALL_WINDOW_SUPERSEDED.with(|c| c.set(0));
+                WALL_WINDOW_FLUSHED.with(|c| c.set(0));
                 WALL_WINDOW_RESOLVES.with(|c| c.set(0));
                 WALL_WINDOW_LOCK_MS.with(|c| c.set(0.0));
                 WALL_WINDOW_RENDER_MS.with(|c| c.set(0.0));
