@@ -159,6 +159,13 @@ Copy-Item (Join-Path $repo "tests\html\wall_css_animation_support_probe.html") (
 # 20 animate() calls on detached, unreferenced elements. The page carries its own
 # pass/fail checklist at the top, so it can be read cold.
 Copy-Item (Join-Path $repo "tests\html\web_animations_minimal.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Animation jitter probe. One constant-velocity translateX, run through BOTH paths at once
+# (Element.animate and CSS @keyframes) on the same screen, over a ruler, with an in-page
+# rAF interval distribution. If both rows stutter identically the animation path is not the
+# cause -- the two compute their values in completely different code -- and what is left is
+# the frame pipeline they share. Prints ANIMJITTER (p50/p95/p99/max, >20ms count) to the log
+# once a second, so a run can be judged without watching the wall.
+Copy-Item (Join-Path $repo "tests\html\wall_anim_jitter_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 # Does a CSS animation survive a blocked script thread? Blocks its own script thread on a
 # timer, the way a content switch does, with a CSS-animated bar next to a rAF counter.
 Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue

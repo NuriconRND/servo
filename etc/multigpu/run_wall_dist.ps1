@@ -207,6 +207,16 @@ param(
     # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
     # around 110/s -- yet a single painter was measured at 200+/s. This says who.
     [switch] $FrameReason,
+    # SERVO_WR_SLOW_MS=<n>: the renderer logs a full WRSLOW breakdown (24 fields: pre_draw,
+    # unlock, gpu_cache_resolve, draw_frame, tex_cache, upload, ...) for every frame whose
+    # renderer time exceeds <n> ms.
+    #
+    # ***The default is 100 ms, which is useless for stutter.*** At 60 Hz anything over
+    # ~16.7 ms has already missed a frame, so judder lives entirely between 17 and 100 and
+    # the default threshold never fires. Pass 20 to catch it. WRRATE cannot answer this
+    # question at all -- it averages over a one-second window, and an average is exactly
+    # what a stutter hides behind: 57 fps of even frames and "60,60,60,20,60" read the same.
+    [int]    $WrSlowMs = 0,
     # SERVO_MEDIA_SINK_PROF=1: one line per second per video splitting the appsink callback into
     # pace / diag / build / render / notify.
     #
@@ -551,6 +561,7 @@ if ($PSBoundParameters.ContainsKey('D3d11ProfileMs')) {
 }
 if ($VideoRate)            { $env:SERVO_MEDIA_VIDEO_RATE = "1" }
 if ($FrameReason)          { $env:SERVO_FRAME_REASON_PROF = "1" }
+if ($WrSlowMs -gt 0)       { $env:SERVO_WR_SLOW_MS = "$WrSlowMs" }
 if ($SinkProf)             { $env:SERVO_MEDIA_SINK_PROF = "1" }
 if ($FanoutProf)           { $env:SERVO_WEBGL_FANOUT_PROF = "1" }
 if ($DcompBindProf)        { $env:SERVO_DCOMP_BIND_PROF = "1" }

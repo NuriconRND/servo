@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>애니메이션 끊김 판별</title>
+<!--
+  단순 등속 translateX 하나로 끊김의 층을 가른다.
+
+  같은 애니메이션을 두 경로로 동시에 돌린다:
+    A행 = Element.animate()  (WAAPI, dom_web_animations_enabled 필요)
+    B행 = CSS @keyframes     (엔진에 원래 있던 경로)
+
+  ★두 행이 똑같이 끊기면 애니메이션 경로가 원인이 아니다.★ 값 계산은 서로 완전히
+  다른 코드를 타는데 결과가 같다면, 남는 것은 두 경로가 공유하는 것 -- 프레임이
+  만들어지고 화면에 올라가는 파이프라인 -- 뿐이다. 한쪽만 끊기면 그 경로가 범인이다.
+
+  C행은 눈금자다. 등속 운동이 눈금을 지나는 간격이 고르지 않으면 그것이 끊김이고,
+  화면을 찍어 두면 나중에 프레임 단위로 되짚을 수 있다.
+
+  아래 숫자는 rAF 간격 분포다. **평균이 아니라 분포를 본다** -- 평균 57fps 는 균일한
+  57fps 와 "60,60,60,20,60" 을 구분하지 못한다. 끊김은 정의상 꼬리에서만 보인다.
+
+  판정:
+    * rAF 간격이 고른데 눈으로 끊긴다        -> 프레임은 규칙적으로 만들어지는데
+                                              표시가 불규칙하다 (컴포지터/present)
+    * rAF 간격 자체가 튄다                   -> 프레임 생성이 불규칙하다
+    * A 만 끊긴다                            -> WAAPI 경로
+    * B 만 끊긴다                            -> CSS 애니메이션 경로
+-->
+<style>
+  :root { --dur: 4s; --travel: 80vw; }
+  html, body { margin: 0; background: #0b0b0b; color: #eee;
+               font: 600 28px/1.4 "Consolas", monospace; overflow: hidden; }
+  .row { position: relative; height: 16vh; border-bottom: 1px solid #333; }
+  .label { position: absolute; left: 8px; top: 4px; font-size: 20px; color: #7a7a7a; }
+  .mover { position: absolute; top: 5vh; left: 0; white-space: nowrap;
+           font-size: 7vh; color: #4af; will-change: transform; }
+  #cssMover { color: #fa4; animation: slide var(--dur) linear infinite; }
+  @keyframes slide { from { transform: translateX(0); }
+                     to   { transform: translateX(var(--travel)); } }
+  /* 눈금자: 등속이면 눈금 통과 간격이 일정해야 한다. */
+  .ruler { position: absolute; top: 0; left: 0; right: 0; height: 100%;
+           background: repeating-linear-gradient(to right,
+             #222 0, #222 2px, transparent 2px, transparent calc(var(--travel) / 16)); }
+  #stats { padding: 12px 16px; font-size: 26px; white-space: pre; color: #ddd; }
+  .warn { color: #f66; }
+  .ok { color: #6d6; }
+</style>
+
+<div class="row"><div class="ruler"></div>
+  <div class="label">A · Element.animate() (WAAPI)</div>
+  <div class="mover" id="waapiMover">████████ WAAPI ████████</div>
+</div>
+<div class="row"><div class="ruler"></div>
+  <div class="label">B · CSS @keyframes</div>
+  <div class="mover" id="cssMover">████████ &nbsp;CSS&nbsp; ████████</div>
+</div>
+<div id="stats">측정 준비 중...</div>
+
+<script>
+'use strict';
+
+const DURATION_MS = 4000;
+const travelPx = () => Math.round(window.innerWidth * 0.80);
+
+// --- A행: WAAPI. 없으면 그렇게 적고 B행만 돈다. ---
+const waapi = document.getElementById('waapiMover');
+let waapiHandle = null;
+const hasWaapi = typeof waapi.animate === 'function';
+if (hasWaapi) {
+  waapiHandle = waapi.animate(
+    [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
+    { duration: DURATION_MS, iterations: Infinity, easing: 'linear' }
+  );
+} else {
+  document.querySelector('#waapiMover').textContent =
+    'Element.animate 없음 (dom_web_animations_enabled=false)';
+}
+
+// --- rAF 간격 분포. 평균이 아니라 꼬리를 본다. ---
+const intervals = [];
+let last = null;
+let reported = 0;
+
+function pct(sorted, p) {
+  if (!sorted.length) return 0;
+  const i = Math.min(sorted.length - 1, Math.floor(sorted.length * p));
+  return sorted[i];
+}
+
+function tick(now) {
+  if (last !== null) intervals.push(now - last);
+  last = now;
+
+  // 1초마다 분포를 낸다. 창을 비우지 않고 누적해서, 긴 런의 꼬리가 남게 한다.
+  if (intervals.length && now - reported >= 1000) {
+    reported = now;
+    const s = intervals.slice().sort((a, b) => a - b);
+    const over20 = intervals.filter((d) => d > 20).length;
+    const over33 = intervals.filter((d) => d > 33).length;
+    const line =
+      'rAF 간격(ms)  p50=' + pct(s, 0.50).toFixed(1) +
+      '  p95=' + pct(s, 0.95).toFixed(1) +
+      '  p99=' + pct(s, 0.99).toFixed(1) +
+      '  max=' + s[s.length - 1].toFixed(1) +
+      '\n프레임 ' + intervals.length +
+      ' · >20ms ' + over20 + ' (' + (100 * over20 / intervals.length).toFixed(1) + '%)' +
+      ' · >33ms ' + over33 +
+      '\nWAAPI ' + (hasWaapi ? 'ON' : 'OFF') + ' · 이동폭 ' + travelPx() + 'px / ' + DURATION_MS + 'ms';
+
+    const el = document.getElementById('stats');
+    el.textContent = line;
+    el.className = over20 / intervals.length > 0.02 ? 'warn' : 'ok';
+
+    // 로그 파일로도 내보낸다 -- 화면을 못 볼 때 이 줄만 grep 하면 된다.
+    console.log('ANIMJITTER p50=' + pct(s, 0.50).toFixed(1) +
+                ' p95=' + pct(s, 0.95).toFixed(1) +
+                ' p99=' + pct(s, 0.99).toFixed(1) +
+                ' max=' + s[s.length - 1].toFixed(1) +
+                ' frames=' + intervals.length +
+                ' over20=' + over20 + ' over33=' + over33 +
+                ' waapi=' + (hasWaapi ? 1 : 0));
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// 창 크기가 바뀌면 이동폭이 달라지므로 WAAPI 쪽을 다시 건다.
+// (CSS 쪽은 vw 단위라 알아서 따라간다.)
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!hasWaapi) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (waapiHandle) waapiHandle.cancel();
+    waapiHandle = waapi.animate(
+      [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
+      { duration: DURATION_MS, iterations: Infinity, easing: 'linear' }
+    );
+  }, 200);
+});
+</script>
