@@ -2,18 +2,26 @@
 <meta charset="utf-8">
 <title>애니메이션 끊김 판별</title>
 <!--
-  단순 등속 translateX 하나로 끊김의 층을 가른다.
+  단순 등속 translateX 로 끊김의 층을 가른다. 네 행이 같은 거리를 다른 시간에 간다:
 
-  같은 애니메이션을 두 경로로 동시에 돌린다:
-    A행 = Element.animate()  (WAAPI, dom_web_animations_enabled 필요)
-    B행 = CSS @keyframes     (엔진에 원래 있던 경로)
+    A = Element.animate()  1x     (WAAPI, dom_web_animations_enabled 필요)
+    B = CSS @keyframes     1x     (엔진에 원래 있던 경로)
+    C = Element.animate()  1/4x
+    D = Element.animate()  1/16x
 
-  ★두 행이 똑같이 끊기면 애니메이션 경로가 원인이 아니다.★ 값 계산은 서로 완전히
-  다른 코드를 타는데 결과가 같다면, 남는 것은 두 경로가 공유하는 것 -- 프레임이
-  만들어지고 화면에 올라가는 파이프라인 -- 뿐이다. 한쪽만 끊기면 그 경로가 범인이다.
+  ★두 축으로 동시에 가른다.★
 
-  C행은 눈금자다. 등속 운동이 눈금을 지나는 간격이 고르지 않으면 그것이 끊김이고,
-  화면을 찍어 두면 나중에 프레임 단위로 되짚을 수 있다.
+  1) A 와 B -- **경로**. 값 계산이 서로 완전히 다른 코드인데 똑같이 끊기면 애니메이션
+     경로가 원인이 아니다. 한쪽만 끊기면 그 경로가 범인이다.
+
+  2) A/C/D -- **속도**. 1x 는 초당 2,304px, 60Hz 에서 프레임당 38px 이다. 그만큼씩
+     건너뛰는 선명한 텍스트는 엔진이 완벽해도 끊겨 보인다 -- 모션 블러가 없으니
+     이산 점프가 그대로 보이고, output 페이지의 판 슬라이드처럼 큰 덩어리보다
+     텍스트에서 훨씬 심하게 드러난다. D(프레임당 2.4px)가 매끄럽고 A 만 끊기면
+     그것은 표본화 한계이지 결함이 아니다. 네 행이 똑같이 끊겨야 결함이다.
+
+  각 행에 눈금자가 깔려 있다. 등속 운동이 눈금을 지나는 간격이 고르지 않으면 그것이
+  끊김이고, 화면을 찍어 두면 나중에 프레임 단위로 되짚을 수 있다.
 
   ★아래 숫자로 매끄러움을 판정하지 말 것.★ 그것은 rAF, 즉 **스크립트 틱**의 주기다.
   이 애니메이션은 페인트측에 바인딩되므로 스크립트는 그 사이에 할 일이 없고,
@@ -38,10 +46,10 @@
   :root { --dur: 4s; --travel: 80vw; }
   html, body { margin: 0; background: #0b0b0b; color: #eee;
                font: 600 28px/1.4 "Consolas", monospace; overflow: hidden; }
-  .row { position: relative; height: 16vh; border-bottom: 1px solid #333; }
+  .row { position: relative; height: 15vh; border-bottom: 1px solid #333; }
   .label { position: absolute; left: 8px; top: 4px; font-size: 20px; color: #7a7a7a; }
-  .mover { position: absolute; top: 5vh; left: 0; white-space: nowrap;
-           font-size: 7vh; color: #4af; will-change: transform; }
+  .mover { position: absolute; top: 4vh; left: 0; white-space: nowrap;
+           font-size: 6vh; color: #4af; will-change: transform; }
   #cssMover { color: #fa4; animation: slide var(--dur) linear infinite; }
   @keyframes slide { from { transform: translateX(0); }
                      to   { transform: translateX(var(--travel)); } }
@@ -55,12 +63,26 @@
 </style>
 
 <div class="row"><div class="ruler"></div>
-  <div class="label">A · Element.animate() (WAAPI)</div>
-  <div class="mover" id="waapiMover">████████ WAAPI ████████</div>
+  <div class="label">A · WAAPI · 1x (프레임당 약 38px)</div>
+  <div class="mover" id="waapiMover">████ WAAPI 1x ████</div>
 </div>
 <div class="row"><div class="ruler"></div>
-  <div class="label">B · CSS @keyframes</div>
-  <div class="mover" id="cssMover">████████ &nbsp;CSS&nbsp; ████████</div>
+  <div class="label">B · CSS @keyframes · 1x</div>
+  <div class="mover" id="cssMover">████ &nbsp;CSS 1x&nbsp; ████</div>
+</div>
+<!--
+  ★속도를 나눠 같이 돌린다.★ 1x 는 초당 2,304px, 60Hz 에서 프레임당 38px 이다.
+  그만큼씩 건너뛰는 선명한 텍스트는 엔진이 완벽해도 끊겨 보인다 -- 모션 블러가
+  없으니 이산 점프가 그대로 보인다. 느린 행이 매끄럽고 빠른 행만 끊기면 그것은
+  속도에 따른 표본화 한계이지 결함이 아니다. 네 행이 똑같이 끊기면 그때가 결함이다.
+-->
+<div class="row"><div class="ruler"></div>
+  <div class="label">C · WAAPI · 1/4x (프레임당 약 9.6px)</div>
+  <div class="mover" id="quarterMover">████ 1/4x ████</div>
+</div>
+<div class="row"><div class="ruler"></div>
+  <div class="label">D · WAAPI · 1/16x (프레임당 약 2.4px)</div>
+  <div class="mover" id="slowMover">████ 1/16x ████</div>
 </div>
 <div id="stats">측정 준비 중...</div>
 
@@ -70,18 +92,39 @@
 const DURATION_MS = 4000;
 const travelPx = () => Math.round(window.innerWidth * 0.80);
 
-// --- A행: WAAPI. 없으면 그렇게 적고 B행만 돈다. ---
+// --- WAAPI 행들. 속도만 다르고 나머지는 같다. ---
+// 같은 거리를 4배/16배 긴 시간에 가므로, 프레임당 이동 픽셀이 1/4, 1/16 이 된다.
 const waapi = document.getElementById('waapiMover');
-let waapiHandle = null;
 const hasWaapi = typeof waapi.animate === 'function';
-if (hasWaapi) {
-  waapiHandle = waapi.animate(
+const handles = [];
+
+function runWaapi(el, durationMs) {
+  return el.animate(
     [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
-    { duration: DURATION_MS, iterations: Infinity, easing: 'linear' }
+    { duration: durationMs, iterations: Infinity, easing: 'linear' }
   );
+}
+
+const waapiRows = [
+  ['waapiMover', DURATION_MS],
+  ['quarterMover', DURATION_MS * 4],
+  ['slowMover', DURATION_MS * 16],
+];
+
+function startWaapiRows() {
+  while (handles.length) handles.pop().cancel();
+  for (const [id, duration] of waapiRows) {
+    handles.push(runWaapi(document.getElementById(id), duration));
+  }
+}
+
+if (hasWaapi) {
+  startWaapiRows();
 } else {
-  document.querySelector('#waapiMover').textContent =
-    'Element.animate 없음 (dom_web_animations_enabled=false)';
+  for (const [id] of waapiRows) {
+    document.getElementById(id).textContent =
+      'Element.animate 없음 (dom_web_animations_enabled=false)';
+  }
 }
 
 // --- rAF 간격 분포. 평균이 아니라 꼬리를 본다. ---
@@ -151,12 +194,6 @@ let resizeTimer = null;
 window.addEventListener('resize', () => {
   if (!hasWaapi) return;
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    if (waapiHandle) waapiHandle.cancel();
-    waapiHandle = waapi.animate(
-      [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
-      { duration: DURATION_MS, iterations: Infinity, easing: 'linear' }
-    );
-  }, 200);
+  resizeTimer = setTimeout(startWaapiRows, 200);
 });
 </script>
