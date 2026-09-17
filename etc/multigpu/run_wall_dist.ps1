@@ -79,7 +79,25 @@ param(
     # ten to one -- and that path REQUIRES it (see the check below).
     [ValidateSet("off", "on", "surface")]
     [string] $DComp = "off",
-    [switch] $Vsync,                     # gfx_vsync_enabled (default off; see note below)
+    # gfx_vsync_enabled. 기본 off.
+    #
+    # ★2026-09-17 부터 이 스위치는 둘을 한다.★ 원래는 DwmVsyncRefreshDriver 를 세워
+    # **콘텐츠 생산**만 DWM 합성에 맞췄고 셸의 표출 클럭은 건드리지 않았다 -- 그래서
+    # 켜도 화면상 변화가 없었고, 그 결과를 "vsync 는 원인이 아니다" 로 읽을 뻔했다.
+    # 이제는 셸의 표출 클럭(drive_present_clock)도 같은 드라이버를 구독한다.
+    #
+    # 왜 필요한가: 소프트 타이머는 정확히 60 개를 내도 디스플레이와 다른 발진기라,
+    # 화면에 보이는 위치가 scanout 직전 0~한 주기 사이의 표본이 되어 프레임마다
+    # 흔들린다(초당 2,304px 물체에서 60Hz 면 0~38px). vsync 에 묶으면 그 오차가
+    # 상수(한 vsync 지연)가 되어 사라진다. -RefreshHz 를 올리는 것은 오차를 작게
+    # 만들 뿐이고 프레임 빌드 비용이 배수로 는다.
+    #
+    # 치르는 값: 이 장비에서 DwmFlush 가 스핀-웨이트라 코어 1 개를 상시 먹는다.
+    # 셸이 매 vsync 재등록하므로 그 스레드는 더 이상 유휴로 잠들지 않는다.
+    #
+    # 판정: WALLCLOCK 의 backstop 필드. 0 이면 vsync 가 몰고 있는 것이고, 오르면
+    # 신호가 끊겨 자유 구동 타이머로 내려앉은 것이다(로그에 warn 도 같이 나간다).
+    [switch] $Vsync,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).

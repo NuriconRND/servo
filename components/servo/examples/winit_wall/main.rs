@@ -258,6 +258,32 @@ struct AppState {
     present_period: std::time::Duration,
     /// When the next presentation tick is due.
     next_present_tick: Cell<std::time::Instant>,
+    /// ★표출 클럭을 디스플레이 vsync 에 묶는다(`gfx_vsync_enabled`).★ 켜졌을 때만 Some.
+    ///
+    /// 소프트 타이머는 정확히 60 개를 내도 디스플레이와 **다른 발진기**다. 위상이
+    /// 미끄러지면 어떤 scanout 엔 present 가 둘 들어가고(한 장은 영영 안 보인다) 어떤
+    /// 구간엔 하나도 안 들어간다. 그러면 화면에 보이는 위치는 scanout 직전 0~한 주기
+    /// 사이의 표본이 되어 프레임마다 흔들린다 -- 초당 2,304px 로 움직이는 물체에서
+    /// 60Hz 면 0~38px 다. 실기에서 `gfx_refresh_hz` 를 60/120/240 으로 올릴수록 떨림이
+    /// 단조 감소한 것이 이 산수였다(log_ani_debug/28, 29). 주기를 줄이는 것은 오차를
+    /// 작게 만들 뿐이고, vsync 에 묶으면 상수(한 vsync 지연)가 되어 사라진다.
+    ///
+    /// ★이 드라이버는 이미 있다.★ `gfx_vsync_enabled` 가 `DwmVsyncRefreshDriver` 를
+    /// 세우는데, 그것은 `RefreshDriver` 라 **콘텐츠 생산**만 DWM 합성에 맞췄고 셸의
+    /// 표출 클럭은 건드린 적이 없다. 이전 실기에서 `-Vsync` 가 아무 변화를 안 낸 이유가
+    /// 그것이다. 여기서 같은 인스턴스를 셸도 구독한다 -- 전용 스레드 하나를 공유한다.
+    present_vsync: Option<Rc<dyn servo::RefreshDriver>>,
+    /// vsync 스레드가 세우고 메인이 내린다.
+    vsync_due: Arc<AtomicBool>,
+    /// 콜백이 걸려 있는가. 등록은 **메인에서만** 한다 -- 드라이버가 `Rc` 라 스레드를 못 건넌다.
+    vsync_armed: Cell<bool>,
+    /// vsync 신호가 멎었다고 판정한 상태. 이때만 자유 구동 타이머가 민다.
+    vsync_stalled: Cell<bool>,
+    /// vsync 콜백이 이벤트 루프를 깨우는 데 쓰는 waker. 엔진과 같은 것을 공유하므로
+    /// 중복 깨우기는 그쪽 `pending` 플래그가 흡수한다.
+    vsync_waker: Waker,
+    /// 마지막으로 틱이 발화한 시각. 백스톱 판정에만 쓴다.
+    last_present_tick_at: Cell<std::time::Instant>,
     capture_path: Option<String>,
     capture_deadline: Option<std::time::Instant>,
     /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
@@ -328,6 +354,9 @@ struct ClockStats {
     renders: u32,
     /// 클럭이 허가하지 않아 억제한 횟수. 2단계 전에는 항상 0 이다.
     suppressed: u32,
+    /// vsync 가 멎어 타이머 백스톱이 대신 민 횟수. ★vsync 로 묶었을 때 이 값이 0 이
+    /// 아니면 실제로 몰고 있는 것이 vsync 가 아니다.★ 자유 구동 경로에서는 늘 0 이다.
+    backstop: u32,
     /// `render_all_tiles()` 진입 간격(ms).
     ///
     /// ***평균이 아니라 분포를 낸다.*** 끊김은 정의상 꼬리에만 있고, 균일한 57fps 와
@@ -637,12 +666,13 @@ impl AppState {
         };
 
         log::info!(
-            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
+            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
             window_ms,
             stats.ticks,
             stats.redraw,
             stats.renders,
             stats.suppressed,
+            stats.backstop,
             period_ms,
             pct(0.50),
             pct(0.95),
@@ -700,6 +730,90 @@ impl AppState {
     /// 다음 틱 시각을 돌려준다(호출자가 control flow 를 잡을 때 쓴다).
     fn drive_present_clock(&self) -> std::time::Instant {
         let now = std::time::Instant::now();
+
+        // ★vsync 에 묶인 경로.★ 틱의 권한이 소프트 타이머가 아니라 DwmFlush 스레드에 있다.
+        if let Some(driver) = self.present_vsync.as_ref() {
+            self.pump_vsync(now, driver);
+            if !self.vsync_stalled.get() {
+                // 깨우기는 콜백이 하므로 이 시각은 마감이 아니라 **정지 감시 기한**이다.
+                return now + self.vsync_stall_after();
+            }
+            // 멎었다 -- 아래 자유 구동 타이머가 대신 민다.
+        }
+
+        self.drive_present_clock_timer(now)
+    }
+
+    /// vsync 신호를 소모하고 다음 것을 걸며, 신호가 끊겼는지 판정한다.
+    ///
+    /// ***왜 스레드를 거치는가*** — `DwmFlush` 는 다음 합성까지 **블록한다.** 메인에서
+    /// 부르면 그동안 이벤트를 하나도 처리하지 못하고, 이 셸은 메인이 전부를 돌린다.
+    /// `DwmVsyncRefreshDriver` 가 이미 전용 스레드에서 그것을 돌며 등록된 콜백을 쏘므로,
+    /// 셸은 콜백에서 플래그만 세우고 루프를 깨운다.
+    fn pump_vsync(&self, now: std::time::Instant, driver: &Rc<dyn servo::RefreshDriver>) {
+        let fired = self.vsync_due.swap(false, Ordering::AcqRel);
+        if fired {
+            self.vsync_armed.set(false);
+        }
+
+        // ★소모한 그 자리에서 다시 건다.★ 다음 호출까지 미루면 그 사이의 vsync 를 놓쳐
+        // 표출이 절반으로 떨어진다. 드라이버는 매 vsync 에 콜백을 드레인하므로 등록은
+        // 일회성이고 매번 새로 해야 한다.
+        if !self.vsync_armed.get() {
+            let due = self.vsync_due.clone();
+            let waker = self.vsync_waker.clone();
+            driver.observe_next_frame(Box::new(move || {
+                due.store(true, Ordering::Release);
+                <Waker as embedder_traits::EventLoopWaker>::wake(&waker);
+            }));
+            self.vsync_armed.set(true);
+        }
+
+        if fired {
+            if self.vsync_stalled.replace(false) {
+                log::warn!("wall: vsync 신호가 돌아왔다 -- 표출 클럭을 다시 vsync 에 묶는다.");
+            }
+            self.last_present_tick_at.set(now);
+            self.note_present_tick();
+            if let Some(tile) = self.tiles.first() {
+                tile.window.request_redraw();
+            }
+            return;
+        }
+
+        // ***정지 감시.*** vsync 신호가 멎으면(디스플레이 모드 전환, 원격 세션 전환, DWM
+        // 재시작) 이 클럭이 통째로 멈추고 벽은 얼어붙는다. 24 시간 도는 장비에서 그것은
+        // 허용할 수 없다. 멎었다고 판정하면 자유 구동 타이머로 내려앉고, 신호가 돌아오면
+        // 그 자리에서 vsync 로 복귀한다.
+        if !self.vsync_stalled.get()
+            && now.duration_since(self.last_present_tick_at.get()) >= self.vsync_stall_after()
+        {
+            self.vsync_stalled.set(true);
+            log::warn!(
+                "wall: vsync 신호가 {:.0}ms 동안 없다 -- 타이머 페이싱으로 내려앉는다. \
+                 WALLCLOCK backstop 이 오르는 동안은 표출이 vsync 에 묶여 있지 않다.",
+                self.vsync_stall_after().as_secs_f64() * 1000.0
+            );
+            // 타이머를 지금부터 다시 센다 -- 밀린 틱을 몰아 내지 않기 위해서다.
+            self.next_present_tick.set(now);
+        }
+    }
+
+    /// vsync 가 멎었다고 볼 시간.
+    ///
+    /// ★`present_period` 만으로 잡으면 안 된다.★ `-RefreshHz 240 -Vsync` 처럼 표출 주기를
+    /// vsync 간격(60Hz 면 16.7ms)보다 짧게 잡으면 두 주기(8.3ms)가 vsync 보다 먼저 지나
+    /// 매번 정지로 오판한다. 이 값은 **페이싱이 아니라 생존 판정**이므로, 어떤 흔한
+    /// 리프레시에서도 한 간격보다 확실히 길도록 100ms 를 하한으로 둔다.
+    fn vsync_stall_after(&self) -> std::time::Duration {
+        std::cmp::max(
+            self.present_period * 2,
+            std::time::Duration::from_millis(100),
+        )
+    }
+
+    /// 자유 구동 소프트 타이머 경로. vsync 를 안 쓰거나, 쓰다가 신호가 멎었을 때.
+    fn drive_present_clock_timer(&self, now: std::time::Instant) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
             // ***Advance to the first future tick rather than adding one period.*** After a
@@ -710,6 +824,9 @@ impl AppState {
                 next += self.present_period;
             }
             self.next_present_tick.set(next);
+            if self.vsync_stalled.get() {
+                self.clock_stats.borrow_mut().backstop += 1;
+            }
             self.note_present_tick();
             if let Some(tile) = self.tiles.first() {
                 tile.window.request_redraw();
@@ -1015,6 +1132,11 @@ impl ApplicationHandler<WakerEvent> for App {
         #[cfg(not(target_os = "windows"))]
         let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = None;
 
+        // ★셸도 같은 드라이버를 구독한다.★ 아래에서 `vsync_driver` 는 타일 생성으로
+        // 넘어가 버리므로 여기서 핸들을 하나 떠 둔다. 인스턴스를 새로 만들면 DwmFlush
+        // 스레드가 하나 더 뜬다 -- 위 주석이 타일마다 만들지 말라고 한 것과 같은 이유다.
+        let shell_vsync_driver = vsync_driver.clone();
+
         // ★A 안 1 단계의 관문만 시험하고 끝낸다.★ 본 경로보다 먼저 갈라지는 이유는, 컨텍스트가
         // 이미 붙은 HWND 에 워커가 두 번째를 만들면 `-DComp on` 에서 HWND 당 DComp 타깃이
         // 하나뿐이라 실패하고, 그 실패가 "스레드 때문" 으로 오독되기 때문이다.
@@ -1134,6 +1256,12 @@ impl ApplicationHandler<WakerEvent> for App {
                 std::time::Duration::from_secs_f64(1.0 / hz as f64)
             },
             next_present_tick: Cell::new(std::time::Instant::now()),
+            present_vsync: shell_vsync_driver,
+            vsync_due: Arc::new(AtomicBool::new(false)),
+            vsync_armed: Cell::new(false),
+            vsync_stalled: Cell::new(false),
+            vsync_waker: waker.clone(),
+            last_present_tick_at: Cell::new(std::time::Instant::now()),
             capture_deadline: config.capture.as_ref().map(|_| {
                 std::time::Instant::now() + std::time::Duration::from_secs_f64(config.capture_sec)
             }),
