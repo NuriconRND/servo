@@ -143,10 +143,22 @@ Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_probe.html") (Join-
 # its `consumers=` never went above 1. Driven by ?multi=N, again no `&`.
 Copy-Item (Join-Path $repo "tests\html\multigpu_capture_card_multi_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 # Does this engine run the animation the wall application actually creates? The
-# application prefers `Element.animate()`, which this engine does not have, and falls back
-# to a runtime-injected `@keyframes` plus an inline `animation` shorthand. This page walks
-# exactly that fallback and says through `console` whether the computed value ever moves.
+# application prefers `Element.animate()` and falls back to a runtime-injected `@keyframes`
+# plus an inline `animation` shorthand. This page walks exactly that fallback and says
+# through `console` whether the computed value ever moves.
+#
+# NOTE: this engine now HAS `Element.animate()`, but only behind
+# `-Pref dom_web_animations_enabled=true` (default off). With the pref off the application
+# still takes the fallback and this page is the probe for it; with the pref on the
+# application switches away from the fallback entirely -- see the next page.
 Copy-Item (Join-Path $repo "tests\html\wall_css_animation_support_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Web Animations smoke test. Run it BOTH ways: with the pref off it must report
+# `typeof Element.prototype.animate = undefined` and stop there (that is the proof the
+# feature is inert by default); with `-Pref dom_web_animations_enabled=true` all eight
+# cases must pass. Case 8 is the regression probe for a use-after-free found in review --
+# 20 animate() calls on detached, unreferenced elements. The page carries its own
+# pass/fail checklist at the top, so it can be read cold.
+Copy-Item (Join-Path $repo "tests\html\web_animations_minimal.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 # Does a CSS animation survive a blocked script thread? Blocks its own script thread on a
 # timer, the way a content switch does, with a CSS-animated bar next to a rAF counter.
 Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue

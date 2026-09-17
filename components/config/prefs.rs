@@ -114,9 +114,15 @@ pub struct Preferences {
     pub devtools_server_listen_address: String,
     /// Web Animations 최소 구현 — `Element.animate()` 와 `Animation.cancel()`.
     ///
-    /// 꺼져 있으면 메서드가 정의되지 않고, 페이지의
-    /// `typeof el.animate === 'function'` 검사가 실패해 지금의 CSS `@keyframes`
-    /// 폴백이 그대로 돈다. 같은 배포본으로 A/B 가 된다.
+    /// 꺼면 메서드가 정의되지 않고, 페이지의
+    /// `typeof el.animate === 'function'` 검사가 실패해 CSS `@keyframes`
+    /// 폴백이 그대로 돈다 — 같은 배포본으로 A/B 가 된다.
+    ///
+    /// ★2026-09-17 기본값 ON.★ 실기 검증(log_ani_debug/21)에서 확인됨:
+    /// `ANIMSCRIPTSTART` 12건 대 `ANIMSTART sd-anim` 0건으로 페이지가 폴백에서
+    /// 완전히 이탈했고, `PAINTANIM built tx_bound` 최대 186 으로 페인트측 바인딩이
+    /// 붙었으며(안 1 을 택한 근거), 전환 대상 구성 사전 재생과 애니메이션 종료 후
+    /// 검은 화면이 둘 다 사라졌다.
     /// 설계: `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`
     pub dom_web_animations_enabled: bool,
     // feature: WebGPU | #24706 | Web/API/WebGPU_API
@@ -1047,7 +1053,7 @@ impl Preferences {
             dom_touch_events_legacy_apis_enabled: cfg!(target_os = "android")
                 | cfg!(target_env = "ohos"),
             dom_transient_activation_duration_ms: 5000,
-            dom_web_animations_enabled: false,
+            dom_web_animations_enabled: true,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
