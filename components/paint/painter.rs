@@ -1350,9 +1350,33 @@ impl Painter {
             .map(|(key, x, y, scale)| format!("{key:x}:{x:.1}/{y:.1}@{scale:.2}"))
             .collect::<Vec<_>>()
             .join(",");
+        // ★값만으로는 타일을 비교할 수 없다 — 값을 만든 시각이 같이 있어야 한다.★
+        //
+        // 이 줄은 painter 마다 자기 1 초 창으로 나가고(`paint_animation_window_start` 가
+        // painter 별이다), 로그 타임스탬프는 초 단위다. 그래서 2026-09-17 에 네 타일의 x 를
+        // 나란히 놓고 "PainterId(1) 이 74px 뒤처진다" 고 읽었는데, 그 차이가 화면상의
+        // 어긋남인지 **네 줄이 서로 다른 순간에 찍힌 것뿐인지 구분할 방법이 없었다.**
+        // painter 1 이 먼저 올라오고 2/3/4 가 거의 동시에 올라오면, 창 위상이 그만큼
+        // 어긋나 똑같은 모양이 나온다.
+        //
+        // 그래서 공유 시계(`CrossProcessInstant`, 프로세스·타일을 가로질러 비교 가능)의
+        // 시각을 값과 함께 낸다. 이 함수는 샘플 직후에 불리고 `now` 가 그 샘플의 시각이므로,
+        // 여기서 읽는 값은 샘플 시각과 1ms 안쪽이다. 이제 (t, x) 를 네 타일에 대해 찍어
+        // 같은 직선 위에 있는지 보면 된다 -- 있으면 어긋남은 없고 로그 위상 차이였을 뿐이며,
+        // 없으면 그때 비로소 실제 어긋남이다.
+        let t_ms =
+            (CrossProcessInstant::now() - CrossProcessInstant::epoch()).as_seconds_f64() * 1000.0;
         warn!(
-            "PAINTANIM painter={:?} playing={} frames={} rode_along={} skipped_busy={} held={}              floats=[{}] transforms=[{}]",
-            self.painter_id, animating, frames, rode_along, skipped, held, sample, transform_sample
+            "PAINTANIM painter={:?} t_ms={:.1} playing={} frames={} rode_along={} skipped_busy={} held={}              floats=[{}] transforms=[{}]",
+            self.painter_id,
+            t_ms,
+            animating,
+            frames,
+            rode_along,
+            skipped,
+            held,
+            sample,
+            transform_sample
         );
     }
 
