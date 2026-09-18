@@ -3615,8 +3615,20 @@ impl Compositor for DCompNativeCompositor {
                         );
                         let dirty = std::mem::take(&mut sc.frame_dirty);
                         let catchup = sc.stale.catchup_rects(&dirty);
-                        let ok = self_copy_catchup(&self.d3d11_context, sc, &catchup)
-                            && present1_partial(sc, &dirty);
+                        // ★부분 Present 도 Present 다 -- 같이 센다.★ 이 분기는 조건이
+                        // 맞으면 매 프레임 타므로, 여기를 빼고 재면 `presents` 가 실제의
+                        // 일부만 보여 준다(2026-09-18 에 그 상태로 측정을 지시할 뻔했다).
+                        // `present_ms` 가 SyncInterval 이 실제로 블록하는지의 유일한 증거다.
+                        let ok = {
+                            let catchup_ok = self_copy_catchup(&self.d3d11_context, sc, &catchup);
+                            let present_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+                            let presented_ok = catchup_ok && present1_partial(sc, &dirty);
+                            if let Some(start) = present_start {
+                                present_ns += start.elapsed().as_nanos() as u64;
+                                presents += 1;
+                            }
+                            presented_ok
+                        };
                         if ok {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
