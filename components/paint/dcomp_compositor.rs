@@ -42,6 +42,7 @@ use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
+use winapi::um::dwmapi::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use winapi::um::d3d11::{
     D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11Texture2D,
@@ -51,6 +52,7 @@ use winapi::um::dcomp::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
     IDCompositionVirtualSurface, IDCompositionVisual,
 };
+use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use winapi::um::unknwnbase::IUnknown;
 
 /// Gecko DCLayerTree 관례와 동일한 가상 표면 크기. WR은 타일 그리드를 이
@@ -1395,9 +1397,27 @@ struct BindProfile {
     /// "조건이 실제로 동작했는가" 가 로그만으로 판정된다.
     flushes: u64,
     flush_skipped: u64,
+    commit_ns: u64,
     present_ns: u64,
     presents: u64,
-    commit_ns: u64,
+    /// ★DWM 합성 클럭 대비 우리 Commit 의 위상★ -- 주기의 분수(0.0~1.0).
+    ///
+    /// 이 프로세스는 디스플레이와 동기화된 지점이 하나도 없다: 콘텐츠 경로에 스왑체인
+    /// Present 가 없고(presents=0 으로 확인), Commit 은 0.02ms 로 즉시 돌아오며, 표출
+    /// 클럭은 자유 구동 소프트 타이머다. 그러면 화면에 무엇이 뜨는지는 전적으로 우리
+    /// Commit 이 DWM 합성 대비 **어느 자리에 떨어지느냐**가 정하는데, 그 양을 여태
+    /// 아무도 보지 않았다. 런마다·타일마다 결과가 갈리면서 다른 계수는 전부 같았던
+    /// 것이 그 때문이다(log_ani_debug/39~41).
+    ///
+    /// ★대기가 아니라 조회다.★ DwmGetCompositionTimingInfo 는 블록하지 않는다.
+    /// 여기에 대기를 넣으면 생산 스레드가 공유 객체에 줄 서는 회귀가 된다 --
+    /// GstSystemClock 이 정확히 그 사건이었다(-SinkPacing thread 가 그 대응).
+    dwm_phase: Vec<f64>,
+    /// DWM 자신의 집계. 창 시작 시점 값(델타를 내려고 보관).
+    dwm_first: Option<(u64, u64, u64, u64)>,
+    dwm_last: (u64, u64, u64, u64),
+    /// DWM 이 보고한 리프레시 주기(ms). 패널 주사율의 직접 확인이기도 하다.
+    dwm_period_ms: f64,
     /// 창 안에서 **가장 오래 걸린 Commit 한 번**. 합계만으로는 22번이 22ms 씩인지 한 번이
     /// 400ms 인지 구분할 수 없는데, 표출 클럭을 멈추는 것은 후자다 -- 앞의 것은 부하이고
     /// 뒤의 것은 정체다.
@@ -2339,6 +2359,69 @@ impl DCompNativeCompositor {
             self.bind_profile.commit_ns += elapsed;
             self.bind_profile.commit_ns_max = self.bind_profile.commit_ns_max.max(elapsed);
         }
+        if *DCOMP_BIND_PROF {
+            self.sample_dwm_phase();
+        }
+    }
+
+    /// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어졌나.★ 조회만 한다 -- 블록하지 않는다.
+    ///
+    /// `qpcVBlank` 는 호출 시점 기준 **마지막 vblank** 의 QPC 다. Commit 직후에 부르므로
+    /// `(지금 - qpcVBlank) / qpcRefreshPeriod` 가 곧 위상이다. 0 에 가까우면 vblank 직후에
+    /// 커밋한 것이고(다음 합성까지 여유 최대), 1 에 가까우면 경계에 걸터앉은 것이다 --
+    /// 그 자리에서는 작은 지터 하나가 프레임을 한 박자 늦춘다.
+    ///
+    /// ★여기에 대기를 넣지 말 것.★ `DCompositionWaitForCompositorClock` 은 프로세스 범위
+    /// 대기이고, 생산 스레드가 공유 객체에 줄 서는 회귀가 정확히 이 저장소에 기록돼 있다 --
+    /// `GstSystemClock::obtain()` 이 프로세스 싱글턴이라 45 개 파이프라인의 sink 가 매
+    /// 프레임 같은 객체를 기다렸고, 그 비용이 디코딩과 맞먹었다(`-SinkPacing thread` 가
+    /// 그 대응이다). `gfx_wall_frame_max_pending` 이 1 이라 메인이 한 프레임만 막혀도
+    /// 생산자가 곧장 뒤에 선다. 이 함수는 관측이고, 관측으로 끝나야 한다.
+    fn sample_dwm_phase(&mut self) {
+        let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
+        let hr = unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) };
+        if hr < 0 {
+            return;
+        }
+        // `#[repr(packed)]` 이라 필드를 **빌릴 수 없다**. 값으로 복사해 온다.
+        let period = info.qpcRefreshPeriod;
+        let vblank = info.qpcVBlank;
+        if period == 0 {
+            return;
+        }
+        let mut now: i64 = 0;
+        // Safety: 순수 out-param.
+        if unsafe { QueryPerformanceCounter(&mut now as *mut i64 as *mut _) } == 0 {
+            return;
+        }
+        let since = now as u64;
+        let since = since.wrapping_sub(vblank);
+        if now >= 0 && since < u64::MAX / 2 {
+            self.bind_profile
+                .dwm_phase
+                .push((since % period) as f64 / period as f64);
+        }
+        // QPC 틱은 초당 주파수로 나눠야 ms 가 되지만, DWM 이 주는 주기는 그 자체가 QPC
+        // 단위다. 주파수를 한 번만 읽어 ms 로 환산한다.
+        if self.bind_profile.dwm_period_ms == 0.0 {
+            let mut freq: i64 = 0;
+            // Safety: 순수 out-param.
+            if unsafe { QueryPerformanceFrequency(&mut freq as *mut i64 as *mut _) } != 0
+                && freq > 0
+            {
+                self.bind_profile.dwm_period_ms = period as f64 * 1000.0 / freq as f64;
+            }
+        }
+        let counts = (
+            info.cFramesDisplayed,
+            info.cFramesLate,
+            info.cFramesDropped,
+            info.cFramesMissed,
+        );
+        self.bind_profile.dwm_first.get_or_insert(counts);
+        self.bind_profile.dwm_last = counts;
     }
 
     fn maybe_emit_bind_profile(&mut self) {
@@ -2379,6 +2462,41 @@ impl DCompNativeCompositor {
             ms(profile.end_ns),
             ms(profile.destroy_ns),
         );
+
+        // ★DWM 합성 클럭 대비 우리 Commit 의 위상.★ 이 프로세스에서 디스플레이와 관계된
+        // 유일한 직접 관측이다 -- 나머지 계수는 전부 우리 쪽 개수다.
+        //
+        //   phase  0.0 에 가까움 = vblank 직후 커밋(다음 합성까지 여유 최대)
+        //          1.0 에 가까움 = 경계에 걸터앉음(작은 지터가 한 박자를 늦춘다)
+        //          분포가 넓다   = 위상이 미끄러지고 있다
+        //          분포가 좁은데 1.0 부근 = ★나쁜 자리에 고정★ -- 런 내내 저더의 모양
+        //
+        // late/dropped/missed 는 DWM 자신의 집계다. 우리가 낸 프레임이 실제로 늦었는지를
+        // 우리 계수가 아니라 컴포지터가 말해 주는 유일한 자리다.
+        if *DCOMP_BIND_PROF && !profile.dwm_phase.is_empty() {
+            let mut phase = profile.dwm_phase.clone();
+            phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
+            let (d0, l0, dr0, m0) = profile.dwm_first.unwrap_or_default();
+            let (d1, l1, dr1, m1) = profile.dwm_last;
+            warn!(
+                "DWMPHASE window_ms={:.0} n={} period_ms={:.3} \
+                 phase p05={:.3} p25={:.3} p50={:.3} p75={:.3} p95={:.3} \
+                 displayed={} late={} dropped={} missed={}",
+                window.as_secs_f64() * 1000.0,
+                phase.len(),
+                profile.dwm_period_ms,
+                at(0.05),
+                at(0.25),
+                at(0.50),
+                at(0.75),
+                at(0.95),
+                d1.saturating_sub(d0),
+                l1.saturating_sub(l0),
+                dr1.saturating_sub(dr0),
+                m1.saturating_sub(m0),
+            );
+        }
         self.bind_profile = BindProfile {
             window_start: Some(now),
             ..Default::default()
