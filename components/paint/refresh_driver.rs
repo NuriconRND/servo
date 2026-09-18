@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use embedder_traits::{EventLoopWaker, RefreshDriver};
@@ -268,6 +268,8 @@ enum TimerThreadMessage {
 /// behave respecting wakeup timeouts -- a bit too much to ask at the moment.
 pub(crate) struct TimerRefreshDriver {
     sender: Sender<TimerThreadMessage>,
+    /// ★다음 틱의 **절대 시각**.★ 자세한 것은 `observe_next_frame`.
+    next_frame_at: Cell<Option<Instant>>,
     join_handle: Option<JoinHandle<()>>,
 }
 
@@ -299,6 +301,7 @@ impl Default for TimerRefreshDriver {
 
         Self {
             sender,
+            next_frame_at: Cell::new(None),
             join_handle: Some(join_handle),
         }
     }
@@ -348,10 +351,29 @@ impl RefreshDriver for TimerRefreshDriver {
         // pref (formerly the `SERVO_REFRESH_TIMER_HZ` env var) to match a specific display
         // refresh (e.g. 60) so frame production does not run faster than the display and beat
         // against its vsync (which shows up as periodic judder / non-uniform 60fps even with a
-        // single video). Read once; clamped to [1, 1000] Hz — task-2: the clamp is preserved
-        // across the env->pref migration, but now warns instead of silently falling back, since
-        // a pref typo is easier to make (and harder to notice) than a one-off env var.
-        self.queue_timer(paint_timer_period(), new_start_frame_callback);
+        // single video). Read once; clamped to [1, 1000] Hz.
+        //
+        // ★절대 격자 위에서 잰다 -- "지금부터 한 주기" 가 아니다.★ 예전에는
+        // `queue_timer(paint_timer_period(), ..)` 였는데, 그것은 **호출된 순간부터** 한
+        // 주기다. 이 드라이버는 일회성이라 콜백이 끝난 뒤 다시 걸리므로, 한 사이클이
+        // `주기 + 디스패치·깨우기·처리 지연` 이 되고 그 지연이 **누적된다.** 구조적으로
+        // 공칭 주사율보다 느려진다.
+        //
+        // 셸의 표출 클럭은 반대로 `while next <= now { next += period }` 라 표류하지 않는다.
+        // 같은 공칭 주기의 두 시계 중 하나만 표류하면 둘은 반드시 서로를 지나가고, 그
+        // 어긋남이 화면에서는 제자리걸음 뒤 두 배 점프로 보인다.
+        //
+        // 그래서 여기도 기준점에 주기를 더해 나간다. ★늦었으면 지나간 틱은 버린다★ --
+        // 밀린 것을 몰아 내면 한 표시 간격에 여러 개가 들어가고, 그것이 정확히 없애려는
+        // 현상이다. 디스플레이가 하는 일도 그것이다.
+        let period = paint_timer_period();
+        let now = Instant::now();
+        let mut next = self.next_frame_at.get().unwrap_or(now + period);
+        while next <= now {
+            next += period;
+        }
+        self.next_frame_at.set(Some(next));
+        self.queue_timer(next - now, new_start_frame_callback);
     }
 }
 

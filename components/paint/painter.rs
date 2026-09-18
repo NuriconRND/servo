@@ -1127,6 +1127,38 @@ impl Painter {
 
         self.send_zoom_and_scroll_offset_updates(need_zoom, scroll_offset_updates);
 
+        // ★값 표본은 렌더가 끈다 -- 여기서는 렌더가 멈췄을 때만 돈다.★
+        //
+        // ***왜 옮겼나*** -- `perform_updates` 는 `spin_event_loop` 안에서 돌고, 셸은 그것을
+        // 엔진이 루프를 깨울 때와 아무 창 이벤트가 올 때 부른다. **렌더는 그 목록에 없다.**
+        // 그래서 표본을 뜨는 시점이 "렌더 뒤에 먼저 도착한 아무 spin" 이 되고, 그것이
+        // 1ms 뒤의 엔진 깨우기일 수도, 16ms 뒤의 다음 재그리기일 수도 있었다. 엔진 메시지
+        // 트래픽은 주기적이지 않고 뭉쳐서 오므로, 잘 맞는 구간이 한참 이어지다 어긋나는
+        // 구간이 한참 이어진다 -- 운영자가 보고한 불규칙한 양상이 그것이다.
+        //
+        // 실측이 이것만 가리켰다(log_ani_debug/37): 렌더 간격은 73 창 중 1 창만 결함인데
+        // (dup 0.04/s, skip1 0.00/s) 표본 간격은 25 창이 결함이었다(dup 0.44/s,
+        // skip1 0.42/s). 렌더 클럭은 이미 고르고, 망가지는 것은 렌더와 표본 사이다.
+        //
+        // 이제 `Painter::render` 가 시작하면서 직접 부른다. 표본 간격이 **정의상** 렌더
+        // 간격과 같아지고, 이벤트 루프 스케줄링에 의존하지 않으므로 dup/skip 이 구조적으로
+        // 불가능해진다. 여기 남은 호출은 **렌더가 멈춘 화면** 전용이다 -- 움직이는 것이
+        // 이 애니메이션뿐이면 첫 프레임을 만들 사람이 없고, 그 한 번을 이 자리가 만든다.
+        let renderer_idle = self.last_render_started_at.get().is_none_or(|at| {
+            Instant::now().duration_since(at) >= crate::refresh_driver::paint_timer_period() * 4
+        });
+        if renderer_idle {
+            self.pump_paint_animation();
+        }
+    }
+
+    /// 애니메이션 값을 뜨고 밀어 넣는다. ★한 번의 렌더에 정확히 한 번.★
+    ///
+    /// 호출처는 둘이고 둘은 배타적이다: `Painter::render` 의 시작(렌더가 돌고 있을 때)과
+    /// `perform_updates`(렌더가 멈췄을 때). 안쪽의 `push_due` 게이트가 한 렌더에 두 번
+    /// 밀어 넣는 것을 다시 한 번 막는다.
+    pub(crate) fn pump_paint_animation(&mut self) {
+
         // ***One transaction carries every dynamic property, because sending resets them
         // all.*** `reset_dynamic_properties` clears colors, floats and transforms
         // together, so sending the caret's color alone would blank whatever a CSS
@@ -1904,6 +1936,12 @@ impl Painter {
 
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
         self.last_render_started_at.set(Some(Instant::now()));
+
+        // ★표본을 여기서 뜬다 -- 렌더 하나에 정확히 하나.★ 바로 위에서 시각을
+        // 찍었으므로 `rendered_since_push` 가 지금 참이고, 여기서 밀고 나면 다음
+        // 렌더까지 다시 참이 되지 않는다. 그래서 이후에 몇 번의 `spin_event_loop`
+        // 가 끼어들든 표본은 늘어나지 않는다 -- 간격이 렌더 간격과 같아진다.
+        self.pump_paint_animation();
 
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
