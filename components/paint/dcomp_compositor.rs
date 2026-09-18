@@ -1531,9 +1531,17 @@ struct DwmPhaseWindow {
     first: Option<(u64, u64, u64, u64)>,
     last: (u64, u64, u64, u64),
     period_ms: f64,
+    skipped: u64,
 }
 
 static DWM_PHASE: std::sync::Mutex<Option<DwmPhaseWindow>> = std::sync::Mutex::new(None);
+
+/// 표본을 뜨지 못한 횟수. ★말없이 버리면 다음 사람이 n=2 를 보고 또 헤맨다.★
+fn note_dwm_phase_skip() {
+    if let Ok(mut guard) = DWM_PHASE.lock() {
+        guard.get_or_insert_with(DwmPhaseWindow::default).skipped += 1;
+    }
+}
 
 fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
@@ -1543,24 +1551,29 @@ fn note_dwm_phase() {
     info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
     // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
     if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
+        note_dwm_phase_skip();
         return;
     }
     // `#[repr(packed)]` 이라 필드를 **빌릴 수 없다**. 값으로 복사해 온다.
     let period = info.qpcRefreshPeriod;
     let vblank = info.qpcVBlank;
     if period == 0 {
+        note_dwm_phase_skip();
         return;
     }
     let mut now: i64 = 0;
     // Safety: 순수 out-param.
     if unsafe { QueryPerformanceCounter(&mut now as *mut i64 as *mut _) } == 0 || now < 0 {
+        note_dwm_phase_skip();
         return;
     }
-    let since = (now as u64).wrapping_sub(vblank);
-    // vblank 가 미래로 보이면(스케줄링 역전) 그 표본은 버린다.
-    if since > u64::MAX / 2 {
-        return;
-    }
+    // ★부호 있게 잰다.★ `qpcVBlank` 를 "마지막 vblank" 로만 가정하면 안 된다 -- 드라이버에
+    // 따라 **다음** vblank(미래)를 돌려주기도 하고, 그러면 무부호 뺄셈이 언더플로해 표본이
+    // 통째로 버려진다. 실제로 그렇게 초당 표본이 2 개로 떨어졌다(log_ani_debug/46).
+    // 나머지 연산을 두 번 걸어 어느 쪽이든 0..period 로 접는다.
+    let period_i = period as i128;
+    let diff = now as i128 - vblank as i128;
+    let since = (((diff % period_i) + period_i) % period_i) as u64;
 
     let Ok(mut guard) = DWM_PHASE.lock() else {
         return;
@@ -1593,6 +1606,7 @@ fn note_dwm_phase() {
     let (d0, l0, dr0, m0) = state.first.take().unwrap_or_default();
     let (d1, l1, dr1, m1) = state.last;
     let period_ms = state.period_ms;
+    let skipped = std::mem::take(&mut state.skipped);
     state.start = Some(now_instant);
     drop(guard);
 
@@ -1601,7 +1615,7 @@ fn note_dwm_phase() {
     warn!(
         "DWMPHASE window_ms={:.0} n={} period_ms={:.3} \
          phase p05={:.3} p25={:.3} p50={:.3} p75={:.3} p95={:.3} \
-         displayed={} late={} dropped={} missed={}",
+         displayed={} late={} dropped={} missed={} skipped={}",
         window.as_secs_f64() * 1000.0,
         phase.len(),
         period_ms,
@@ -1614,6 +1628,7 @@ fn note_dwm_phase() {
         l1.saturating_sub(l0),
         dr1.saturating_sub(dr0),
         m1.saturating_sub(m0),
+        skipped,
     );
 }
 
