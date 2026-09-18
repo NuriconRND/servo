@@ -660,6 +660,25 @@ impl AppState {
             sorted[index.min(sorted.len() - 1)]
         };
         // ±20% 밖. p50/p95 만 보면 "대체로 괜찮은데 가끔 튐" 을 놓친다.
+        // ★한 표시 간격에 렌더 패스가 몇 개 들어갔나.★ off(±20%) 만으로는 "건너뛴"
+        // 것과 "몰린" 것이 구분되지 않는다. 1x 애니메이션에서 하나를 건너뛰면 화면이
+        // 38.4px 이 아니라 76.8px 로 튀고, 둘이 몰리면 그중 하나는 영영 안 보인다.
+        // 눈에 보이는 튐의 크기를 이 세 칸이 직접 설명한다.
+        let inband = |low: f64, high: f64| -> usize {
+            stats
+                .gaps_ms
+                .iter()
+                .filter(|&&v| v >= low * period_ms && v < high * period_ms)
+                .count()
+        };
+        let dup = inband(0.0, 0.5);
+        let one = inband(0.5, 1.5);
+        let skip1 = inband(1.5, 2.5);
+        let skipn = stats
+            .gaps_ms
+            .iter()
+            .filter(|&&v| v >= 2.5 * period_ms)
+            .count();
         let (low, high) = (period_ms * 0.8, period_ms * 1.2);
         let off = stats
             .gaps_ms
@@ -673,13 +692,19 @@ impl AppState {
         };
 
         log::info!(
-            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
+            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} \
+             per_interval dup={} one={} skip1={} skipN={} \
+             period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
             window_ms,
             stats.ticks,
             stats.redraw,
             stats.renders,
             stats.suppressed,
             stats.backstop,
+            dup,
+            one,
+            skip1,
+            skipn,
             period_ms,
             pct(0.50),
             pct(0.95),

@@ -407,6 +407,11 @@ pub(crate) struct Painter {
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
+    /// `note_animation_step` 의 상태. 직전 표본의 (키, x, 시각).
+    anim_step_previous: Cell<Option<(u32, f32, Instant)>>,
+    anim_step_window_start: RefCell<Option<Instant>>,
+    anim_step_dt: RefCell<Vec<f64>>,
+    anim_step_dx: RefCell<Vec<f64>>,
     /// 이 페인터가 마지막으로 **실제 렌더 패스를 시작한** 시각. 애니메이션 값을 밀어넣는
     /// 박자를 여기에 맞춘다 — 자기 타이머로 돌면 벽의 표출 주기와 위상이 어긋나 미끄러진다.
     last_render_started_at: Cell<Option<Instant>>,
@@ -1072,6 +1077,10 @@ impl Painter {
             last_video_presented_at: Default::default(),
             last_frame_by_other_source_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
+            anim_step_previous: Default::default(),
+            anim_step_window_start: Default::default(),
+            anim_step_dt: Default::default(),
+            anim_step_dx: Default::default(),
             last_render_started_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1275,6 +1284,12 @@ impl Painter {
             self.send_transaction(transaction);
             if has_values && push_due {
                 self.last_paint_animation_push_at.set(Some(now));
+                // ★간격을 잰다 -- 개수가 아니라.★ 이 자리가 값 표본을 뜨는 시점이고,
+                // 사용자가 보고한 현상("순간마다 이동하는 정도가 다르다")은 정확히
+                // 이 표본들의 간격 문제다. 초당 개수는 60 인데 화면이 매끄럽지 않다면
+                // 남는 설명은 간격뿐이다 -- 60Hz 패널에 60 개를 고르게 넣으면
+                // 매끄러워야 한다(패널 주사율은 실측 확인, log_ani_debug/35).
+                self.note_animation_step(now, &transforms_log);
             }
         }
 
@@ -1322,6 +1337,101 @@ impl Painter {
             animated_property_frame,
             &floats_log,
             &transforms_log,
+        );
+    }
+
+    /// ★한 표본과 다음 표본 사이의 **간격**을 잰다.★
+    ///
+    /// ***왜 이것이 없으면 안 되는가*** -- 이 추적은 열 라운드 동안 전부 **초당 개수**만
+    /// 셌다(발행/합성/표출/화면 도달). 그 값들이 전부 60 에 맞았는데도 화면은 매끄럽지
+    /// 않았고, 패널은 실측 60Hz 다(log_ani_debug/35). 60Hz 패널에 초당 60 개의 위치를
+    /// **고르게** 넣으면 매끄러워야 하므로, 남는 설명은 고르지 않다는 것뿐이다.
+    /// 사용자가 처음부터 말한 "순간마다 이동하는 정도가 다르게 보인다" 가 그 말이었다.
+    ///
+    /// 두 분포를 같이 낸다. 등속 애니메이션에서는 둘 다 한 점에 모여야 한다:
+    ///
+    ///   * `dt` -- 표본 시각의 간격. 이것이 흔들리면 **표본을 뜨는 박자**가 문제다.
+    ///   * `dx` -- 그 사이 값의 변화량. `dt` 는 고른데 `dx` 가 흔들리면 **값 함수**가
+    ///     문제다(보간·세그먼트 경계·외삽).
+    ///
+    /// 둘을 갈라 놓는 것이 요점이다. 개수만으로는 이 둘을 구분할 수 없고, 지금까지
+    /// 세운 가설 셋이 전부 `dt` 쪽만 건드렸다.
+    ///
+    /// `dx` 는 첫 번째 변환 키 하나만 따라간다 -- 프로브의 1x 행이면 충분하고, 키가
+    /// 바뀌면(요소가 갈리면) 그 표본은 버린다.
+    fn note_animation_step(&self, now: Instant, transforms: &[(u32, f32, f32, f32)]) {
+        let Some(&(key, x, _, _)) = transforms.first() else {
+            return;
+        };
+        let previous = self.anim_step_previous.replace(Some((key, x, now)));
+        let window_start = *self.anim_step_window_start.borrow_mut().get_or_insert(now);
+
+        if let Some((previous_key, previous_x, previous_at)) = previous {
+            // 키가 바뀌면 같은 물체가 아니다. 간격도 변화량도 의미가 없다.
+            if previous_key == key {
+                let dt_ms = now.duration_since(previous_at).as_secs_f64() * 1000.0;
+                self.anim_step_dt.borrow_mut().push(dt_ms);
+                self.anim_step_dx.borrow_mut().push((x - previous_x) as f64);
+            }
+        }
+
+        if now.duration_since(window_start) < Duration::from_secs(1) {
+            return;
+        }
+        *self.anim_step_window_start.borrow_mut() = Some(now);
+        let mut dt: Vec<f64> = self.anim_step_dt.borrow_mut().drain(..).collect();
+        let mut dx: Vec<f64> = self.anim_step_dx.borrow_mut().drain(..).collect();
+        if dt.len() < 2 {
+            return;
+        }
+        dt.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |sorted: &[f64], p: f64| -> f64 {
+            // nearest-rank. 표본이 60 개 남짓이라 보간할 이유가 없다.
+            let index = (((sorted.len() - 1) as f64) * p).round() as usize;
+            sorted[index]
+        };
+        // ★판정은 이 한 값이다.★ 등속 운동에서 프레임당 이동량이 중앙값 대비 얼마나
+        // 흔들리는가. 0 이면 완벽하고, 1.0 이면 어떤 프레임은 제자리이고 어떤 프레임은
+        // 두 배로 튄다는 뜻이다 -- 그것이 화면에서 떨림으로 보인다.
+        // ★한 표시 간격에 표본이 몇 개 들어갔나.★ 이것이 사용자가 물은 것이고,
+        // 1x(2,304px/s)에서 한 스텝은 60Hz 기준 38.4px 다. 하나를 건너뛰면 화면에서
+        // 76.8px 로 튀고, 둘이 한 간격에 몰리면 그중 하나는 영영 안 보인다.
+        // 실기 보고가 "30px 보다 크게 튄다" 이므로 여기가 0 이 아니어야 한다.
+        let period_ms = crate::refresh_driver::paint_timer_period().as_secs_f64() * 1000.0;
+        let band = |low: f64, high: f64| -> usize {
+            dt.iter().filter(|&&v| v >= low * period_ms && v < high * period_ms).count()
+        };
+        let dup = band(0.0, 0.5);
+        let one = band(0.5, 1.5);
+        let skip1 = band(1.5, 2.5);
+        let skipn = dt.iter().filter(|&&v| v >= 2.5 * period_ms).count();
+
+        let dx_median = at(&dx, 0.50);
+        let spread = if dx_median.abs() > f64::EPSILON {
+            (at(&dx, 0.95) - at(&dx, 0.05)) / dx_median.abs()
+        } else {
+            0.0
+        };
+        log::warn!(
+            "ANIMSTEP painter={:?} n={} per_interval dup={} one={} skip1={} skipN={} \
+             dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
+             dx_px p05={:.2} p50={:.2} p95={:.2} max={:.2} spread={:.3}",
+            self.painter_id,
+            dt.len(),
+            dup,
+            one,
+            skip1,
+            skipn,
+            at(&dt, 0.05),
+            at(&dt, 0.50),
+            at(&dt, 0.95),
+            dt[dt.len() - 1],
+            at(&dx, 0.05),
+            dx_median,
+            at(&dx, 0.95),
+            dx[dx.len() - 1],
+            spread,
         );
     }
 
