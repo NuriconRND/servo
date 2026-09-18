@@ -30,7 +30,9 @@ use webrender::{
     NativeSurfaceId, NativeSurfaceInfo, NativeTileId, WindowVisibility,
 };
 use winapi::Interface;
-use winapi::shared::dxgi::{DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, IDXGIAdapter, IDXGIDevice};
+use winapi::shared::dxgi::{
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, IDXGIAdapter, IDXGIDevice, IDXGIDevice1,
+};
 use winapi::shared::dxgi1_2::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_PRESENT_PARAMETERS,
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain1,
@@ -1598,6 +1600,50 @@ pub fn maybe_create(
                 })
             }
         };
+
+        // ★프레임 큐 깊이를 1 로 고정한다 -- `gfx_present_sync_interval > 0` 일 때만.★
+        //
+        // SyncInterval 1 은 "다음 vblank" 가 아니라 **"큐에 밀린 프레임이 빠진 뒤의
+        // vblank"** 에 플립한다. 드라이버 기본 깊이에서는 기동 때 큐가 얼마나 찼느냐가
+        // 정상 상태의 위상을 정해 버린다.
+        //
+        // 실측(log_ani_debug/40): `-PresentSync 1` 다섯 런 중 넷은 120 초 내내 깨끗했는데
+        // 한 런은 전 구간 저더였고, 또 한 런은 처음 1 초만 저더 뒤 깨끗해졌다. 다섯 런의
+        // 계수가 전부 같았으므로(WALLCLOCK, ANIMSTEP, WRRATE, pass_ms) 남는 설명은 큐가
+        // 자리 잡는 과도구간뿐이다 -- "초기 조건" 이라는 운영자 관찰 그대로다.
+        //
+        // 깊이를 1 로 두면 Present(1) 이 언제나 **바로 다음** vblank 에 플립하고 그 의존이
+        // 구조적으로 사라진다. 디바이스 단위라 스왑체인 생성 플래그를 건드리지 않는다
+        // (IDXGISwapChain2 + FRAME_LATENCY_WAITABLE_OBJECT 가 필요 없다).
+        if *PRESENT_SYNC_INTERVAL > 0 {
+            let mut dev1_raw: *mut IDXGIDevice1 = ptr::null_mut();
+            let hr = (*dxgi.as_ptr()).QueryInterface(
+                &IDXGIDevice1::uuidof(),
+                &mut dev1_raw as *mut _ as *mut _,
+            );
+            match ComOwned::from_raw(if hr < 0 { ptr::null_mut() } else { dev1_raw }) {
+                Some(dev1) => {
+                    let hr = (*dev1.as_ptr()).SetMaximumFrameLatency(1);
+                    if hr < 0 {
+                        warn!(
+                            "[dcomp-native] SetMaximumFrameLatency(1) failed (hr=0x{:08x}); \
+                             큐 깊이가 드라이버 기본이라 present 위상이 기동 조건에 따라 달라진다",
+                            hr as u32
+                        );
+                    } else {
+                        log::info!(
+                            "[dcomp-native] maximum frame latency = 1 (present sync interval {})",
+                            *PRESENT_SYNC_INTERVAL
+                        );
+                    }
+                },
+                None => warn!(
+                    "[dcomp-native] QueryInterface(IDXGIDevice1) failed (hr=0x{:08x}); \
+                     프레임 큐 깊이를 드라이버 기본으로 둔다",
+                    hr as u32
+                ),
+            }
+        }
 
         let mut dcomp_raw: *mut IDCompositionDevice = ptr::null_mut();
         let hr = DCompositionCreateDevice(
