@@ -27,6 +27,14 @@
 #   etc\multigpu\make_wall_dist.ps1
 #   etc\multigpu\make_wall_dist.ps1 -Out D:\WallDist -Force
 
+# ★[CmdletBinding()] 을 빼지 말 것.★ 이것이 없으면 PowerShell 은 모르는 명명
+# 파라미터를 **조용히 무시하고 그냥 돈다** -- 오류도 경고도 없다. 이 벽의 A/B 는
+# 전부 이 스크립트의 스위치로 설정되므로, 배포본이 오래되면 새 스위치가 말없이
+# 사라지고 런은 완벽하게 정상으로 보인다. 실제로 2026-09-17 에 -VsyncPhase 를
+# 넘긴 네 번의 실기가 통째로 날아갔다(옛 스크립트 + 기본값으로 네 번 같은 런).
+# 엔진 쪽은 시끄럽다 -- 모르는 pref 이름은 set_value 가, 타입 불일치는
+# try_into().unwrap() 이 패닉한다. 조용한 구멍은 여기 하나뿐이었다.
+[CmdletBinding()]
 param(
     [string] $Out = "",
     [string] $GstRoot = "F:\gstreamer-inhouse\1.28.4.100\1.0\msvc_x86_64",
@@ -185,10 +193,12 @@ Copy-Item (Join-Path $PSScriptRoot "tools\serve_http.ps1") $Out -Force
 # machine has an old 1.22.4 in C:\gstreamer alongside the 1.28.4 the wall uses; with no
 # gst-launch in the dist the tool fell through to whichever install it could find and reported
 # 1.22.4 -- and a decode baseline taken on another version is not comparable to the wall at all.
-foreach ($exe in @("gst-launch-1.0.exe", "gst-discoverer-1.0.exe")) {
-    $src = Join-Path $GstRoot "bin\$exe"
+# ★루프 변수를 $exe 로 쓰지 말 것.★ 바깥 $exe(빌드된 winit_wall.exe)를 덮어쓴다 --
+# 이 루프 뒤에서 $exe 를 쓰는 코드가 조용히 gst 도구 이름을 보게 된다(2026-09-17 에 겪었다).
+foreach ($gstExe in @("gst-launch-1.0.exe", "gst-discoverer-1.0.exe")) {
+    $src = Join-Path $GstRoot "bin\$gstExe"
     if (Test-Path $src) { Copy-Item $src $engine -Force }
-    else { Write-Warning "$exe not found in $GstRoot; measure_decode_only.ps1 will fall back to another install" }
+    else { Write-Warning "$gstExe not found in $GstRoot; measure_decode_only.ps1 will fall back to another install" }
 }
 # The machine's shape decides how to read every number this dist produces. Processor group
 # placement was measured to be the difference between 29 fps and 6 fps on 45 videos (2026-08-26,
@@ -198,6 +208,29 @@ Copy-Item (Join-Path $PSScriptRoot "tools\probe_machine_topology.ps1") $Out -For
 
 $dll = (Get-ChildItem (Join-Path $engine "*.dll") | Measure-Object).Count
 $size = [math]::Round(((Get-ChildItem $Out -Recurse -Force | Measure-Object -Property Length -Sum).Sum / 1GB), 2)
+# ★배포본에 신원을 새긴다.★ 2026-09-17 에 같은 실수를 두 번 했다 -- 한 번은 exe 만
+# 오래됐고(벽이 돌고 있어 복사가 건너뛴 것으로 보인다) 한 번은 스크립트만 오래됐다.
+# 두 경우 다 런은 완벽하게 정상으로 보였고, 어느 빌드가 돌았는지 로그만으로는 알 수
+# 없어 실기 여덟 번이 날아갔다. 이 파일이 있으면 run 스크립트가 그것을 찍고,
+# console.txt 만 보면 어느 빌드인지 확정된다.
+#
+# ★git 출력에 2>$null 을 붙이지 말 것.★ PS 5.1 에서 native exe 의 stderr 를 리다이렉트하면
+# 줄마다 NativeCommandError 로 감싸이고, 이 파일의 $ErrorActionPreference="Stop" 아래에서는
+# 그것이 패키징을 통째로 죽인다. 대신 전체를 try/catch 로 감싼다 -- 스탬프 실패가 배포를
+# 막아서는 안 된다.
+$shippedExe = Join-Path $engine "winit_wall.exe"
+try {
+    $stamp = @(
+        ("commit   : {0}" -f (& git -C $repo rev-parse --short HEAD)),
+        ("branch   : {0}" -f (& git -C $repo rev-parse --abbrev-ref HEAD)),
+        ("dirty    : {0}" -f $(if (& git -C $repo status --porcelain) { "yes (uncommitted changes included)" } else { "no" })),
+        ("engine   : {0} bytes  ({1:yyyy-MM-dd HH:mm:ss})" -f (Get-Item $shippedExe).Length, (Get-Item $shippedExe).LastWriteTime),
+        ("packaged : {0:yyyy-MM-dd HH:mm:ss}" -f (Get-Date))
+    )
+    $stamp | Set-Content -Path (Join-Path $Out "BUILD.txt") -Encoding utf8
+} catch {
+    Write-Warning "could not write BUILD.txt: $($_.Exception.Message)"
+}
 Write-Host ""
 Write-Host ("Packaged: {0}" -f $Out)
 Write-Host ("  dll={0}  size={1} GB" -f $dll, $size)
