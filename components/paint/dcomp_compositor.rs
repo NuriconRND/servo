@@ -1400,24 +1400,6 @@ struct BindProfile {
     commit_ns: u64,
     present_ns: u64,
     presents: u64,
-    /// ★DWM 합성 클럭 대비 우리 Commit 의 위상★ -- 주기의 분수(0.0~1.0).
-    ///
-    /// 이 프로세스는 디스플레이와 동기화된 지점이 하나도 없다: 콘텐츠 경로에 스왑체인
-    /// Present 가 없고(presents=0 으로 확인), Commit 은 0.02ms 로 즉시 돌아오며, 표출
-    /// 클럭은 자유 구동 소프트 타이머다. 그러면 화면에 무엇이 뜨는지는 전적으로 우리
-    /// Commit 이 DWM 합성 대비 **어느 자리에 떨어지느냐**가 정하는데, 그 양을 여태
-    /// 아무도 보지 않았다. 런마다·타일마다 결과가 갈리면서 다른 계수는 전부 같았던
-    /// 것이 그 때문이다(log_ani_debug/39~41).
-    ///
-    /// ★대기가 아니라 조회다.★ DwmGetCompositionTimingInfo 는 블록하지 않는다.
-    /// 여기에 대기를 넣으면 생산 스레드가 공유 객체에 줄 서는 회귀가 된다 --
-    /// GstSystemClock 이 정확히 그 사건이었다(-SinkPacing thread 가 그 대응).
-    dwm_phase: Vec<f64>,
-    /// DWM 자신의 집계. 창 시작 시점 값(델타를 내려고 보관).
-    dwm_first: Option<(u64, u64, u64, u64)>,
-    dwm_last: (u64, u64, u64, u64),
-    /// DWM 이 보고한 리프레시 주기(ms). 패널 주사율의 직접 확인이기도 하다.
-    dwm_period_ms: f64,
     /// 창 안에서 **가장 오래 걸린 Commit 한 번**. 합계만으로는 22번이 22ms 씩인지 한 번이
     /// 400ms 인지 구분할 수 없는데, 표출 클럭을 멈추는 것은 후자다 -- 앞의 것은 부하이고
     /// 뒤의 것은 정체다.
@@ -1523,11 +1505,124 @@ pub fn enabled() -> bool {
 /// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
 /// 인계받은 디바이스 포인터로 `Commit()` 만 부른다. 워커 스레드에서 불린다.
 ///
+/// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어지는가.★ 조회만 한다 -- 블록하지 않는다.
+///
+/// ***왜 전역인가*** -- Commit 은 두 경로로 나간다. 즉시 커밋은 `commit_device`, 지연
+/// 커밋(기본값)은 `commit_device_ptr` 이고 후자는 컴포지터 밖의 자유 함수다. 처음에는
+/// `commit_device` 안에만 붙였는데 그 경로는 거의 돌지 않아 **초당 표본이 1 개**였다
+/// (log_ani_debug/45). 위상은 프로세스·데스크톱 단위 양이고(`DwmGetCompositionTimingInfo`
+/// 의 hWnd 는 NULL 만 지원된다) 타일 넷이 같은 DWM 을 보므로, 한 곳에 모으는 것이 맞다.
+///
+/// `qpcVBlank` 는 호출 시점 기준 **마지막 vblank** 의 QPC 다. Commit 직후에 부르므로
+/// `(지금 - qpcVBlank) / qpcRefreshPeriod` 가 곧 위상이다. 0 에 가까우면 vblank 직후에
+/// 커밋한 것이고(다음 합성까지 여유 최대), 1 에 가까우면 경계에 걸터앉은 것이다 --
+/// 그 자리에서는 작은 지터 하나가 프레임을 한 박자 늦춘다.
+///
+/// ★여기에 대기를 넣지 말 것.★ `DCompositionWaitForCompositorClock` 은 프로세스 범위
+/// 대기이고, 생산 스레드가 공유 객체에 줄 서는 회귀가 이 저장소에 기록돼 있다 --
+/// `GstSystemClock::obtain()` 이 프로세스 싱글턴이라 45 개 파이프라인의 sink 가 매 프레임
+/// 같은 객체를 기다렸고 그 비용이 디코딩과 맞먹었다(`-SinkPacing thread` 가 그 대응).
+/// `gfx_wall_frame_max_pending` 이 1 이라 메인이 한 프레임만 막혀도 생산자가 곧장 뒤에
+/// 선다. 이 함수는 관측이고, 관측으로 끝나야 한다.
+#[derive(Default)]
+struct DwmPhaseWindow {
+    start: Option<std::time::Instant>,
+    phase: Vec<f64>,
+    first: Option<(u64, u64, u64, u64)>,
+    last: (u64, u64, u64, u64),
+    period_ms: f64,
+}
+
+static DWM_PHASE: std::sync::Mutex<Option<DwmPhaseWindow>> = std::sync::Mutex::new(None);
+
+fn note_dwm_phase() {
+    if !*DCOMP_BIND_PROF {
+        return;
+    }
+    let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+    // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
+    if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
+        return;
+    }
+    // `#[repr(packed)]` 이라 필드를 **빌릴 수 없다**. 값으로 복사해 온다.
+    let period = info.qpcRefreshPeriod;
+    let vblank = info.qpcVBlank;
+    if period == 0 {
+        return;
+    }
+    let mut now: i64 = 0;
+    // Safety: 순수 out-param.
+    if unsafe { QueryPerformanceCounter(&mut now as *mut i64 as *mut _) } == 0 || now < 0 {
+        return;
+    }
+    let since = (now as u64).wrapping_sub(vblank);
+    // vblank 가 미래로 보이면(스케줄링 역전) 그 표본은 버린다.
+    if since > u64::MAX / 2 {
+        return;
+    }
+
+    let Ok(mut guard) = DWM_PHASE.lock() else {
+        return;
+    };
+    let state = guard.get_or_insert_with(DwmPhaseWindow::default);
+    let now_instant = std::time::Instant::now();
+    let start = *state.start.get_or_insert(now_instant);
+    state.phase.push((since % period) as f64 / period as f64);
+    if state.period_ms == 0.0 {
+        let mut freq: i64 = 0;
+        // Safety: 순수 out-param.
+        if unsafe { QueryPerformanceFrequency(&mut freq as *mut i64 as *mut _) } != 0 && freq > 0 {
+            state.period_ms = period as f64 * 1000.0 / freq as f64;
+        }
+    }
+    let counts = (
+        info.cFramesDisplayed,
+        info.cFramesLate,
+        info.cFramesDropped,
+        info.cFramesMissed,
+    );
+    state.first.get_or_insert(counts);
+    state.last = counts;
+
+    let window = now_instant - start;
+    if window < std::time::Duration::from_secs(1) {
+        return;
+    }
+    let mut phase = std::mem::take(&mut state.phase);
+    let (d0, l0, dr0, m0) = state.first.take().unwrap_or_default();
+    let (d1, l1, dr1, m1) = state.last;
+    let period_ms = state.period_ms;
+    state.start = Some(now_instant);
+    drop(guard);
+
+    phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
+    warn!(
+        "DWMPHASE window_ms={:.0} n={} period_ms={:.3} \
+         phase p05={:.3} p25={:.3} p50={:.3} p75={:.3} p95={:.3} \
+         displayed={} late={} dropped={} missed={}",
+        window.as_secs_f64() * 1000.0,
+        phase.len(),
+        period_ms,
+        at(0.05),
+        at(0.25),
+        at(0.50),
+        at(0.75),
+        at(0.95),
+        d1.saturating_sub(d0),
+        l1.saturating_sub(l0),
+        dr1.saturating_sub(dr0),
+        m1.saturating_sub(m0),
+    );
+}
+
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
 /// 만지는 다른 스레드가 없어야 한다(호출자가 join 으로 보장). 디바이스마다 서로 다르다.
 pub fn commit_device_ptr(device: usize) -> bool {
     let device = device as *mut IDCompositionDevice;
     let hr = unsafe { (*device).Commit() };
+    note_dwm_phase();
     if hr < 0 {
         warn!(
             "[dcomp-native] parallel Commit failed (hr=0x{:08x})",
@@ -2360,68 +2455,8 @@ impl DCompNativeCompositor {
             self.bind_profile.commit_ns_max = self.bind_profile.commit_ns_max.max(elapsed);
         }
         if *DCOMP_BIND_PROF {
-            self.sample_dwm_phase();
+            note_dwm_phase();
         }
-    }
-
-    /// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어졌나.★ 조회만 한다 -- 블록하지 않는다.
-    ///
-    /// `qpcVBlank` 는 호출 시점 기준 **마지막 vblank** 의 QPC 다. Commit 직후에 부르므로
-    /// `(지금 - qpcVBlank) / qpcRefreshPeriod` 가 곧 위상이다. 0 에 가까우면 vblank 직후에
-    /// 커밋한 것이고(다음 합성까지 여유 최대), 1 에 가까우면 경계에 걸터앉은 것이다 --
-    /// 그 자리에서는 작은 지터 하나가 프레임을 한 박자 늦춘다.
-    ///
-    /// ★여기에 대기를 넣지 말 것.★ `DCompositionWaitForCompositorClock` 은 프로세스 범위
-    /// 대기이고, 생산 스레드가 공유 객체에 줄 서는 회귀가 정확히 이 저장소에 기록돼 있다 --
-    /// `GstSystemClock::obtain()` 이 프로세스 싱글턴이라 45 개 파이프라인의 sink 가 매
-    /// 프레임 같은 객체를 기다렸고, 그 비용이 디코딩과 맞먹었다(`-SinkPacing thread` 가
-    /// 그 대응이다). `gfx_wall_frame_max_pending` 이 1 이라 메인이 한 프레임만 막혀도
-    /// 생산자가 곧장 뒤에 선다. 이 함수는 관측이고, 관측으로 끝나야 한다.
-    fn sample_dwm_phase(&mut self) {
-        let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
-        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
-        // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
-        let hr = unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) };
-        if hr < 0 {
-            return;
-        }
-        // `#[repr(packed)]` 이라 필드를 **빌릴 수 없다**. 값으로 복사해 온다.
-        let period = info.qpcRefreshPeriod;
-        let vblank = info.qpcVBlank;
-        if period == 0 {
-            return;
-        }
-        let mut now: i64 = 0;
-        // Safety: 순수 out-param.
-        if unsafe { QueryPerformanceCounter(&mut now as *mut i64 as *mut _) } == 0 {
-            return;
-        }
-        let since = now as u64;
-        let since = since.wrapping_sub(vblank);
-        if now >= 0 && since < u64::MAX / 2 {
-            self.bind_profile
-                .dwm_phase
-                .push((since % period) as f64 / period as f64);
-        }
-        // QPC 틱은 초당 주파수로 나눠야 ms 가 되지만, DWM 이 주는 주기는 그 자체가 QPC
-        // 단위다. 주파수를 한 번만 읽어 ms 로 환산한다.
-        if self.bind_profile.dwm_period_ms == 0.0 {
-            let mut freq: i64 = 0;
-            // Safety: 순수 out-param.
-            if unsafe { QueryPerformanceFrequency(&mut freq as *mut i64 as *mut _) } != 0
-                && freq > 0
-            {
-                self.bind_profile.dwm_period_ms = period as f64 * 1000.0 / freq as f64;
-            }
-        }
-        let counts = (
-            info.cFramesDisplayed,
-            info.cFramesLate,
-            info.cFramesDropped,
-            info.cFramesMissed,
-        );
-        self.bind_profile.dwm_first.get_or_insert(counts);
-        self.bind_profile.dwm_last = counts;
     }
 
     fn maybe_emit_bind_profile(&mut self) {
@@ -2462,41 +2497,6 @@ impl DCompNativeCompositor {
             ms(profile.end_ns),
             ms(profile.destroy_ns),
         );
-
-        // ★DWM 합성 클럭 대비 우리 Commit 의 위상.★ 이 프로세스에서 디스플레이와 관계된
-        // 유일한 직접 관측이다 -- 나머지 계수는 전부 우리 쪽 개수다.
-        //
-        //   phase  0.0 에 가까움 = vblank 직후 커밋(다음 합성까지 여유 최대)
-        //          1.0 에 가까움 = 경계에 걸터앉음(작은 지터가 한 박자를 늦춘다)
-        //          분포가 넓다   = 위상이 미끄러지고 있다
-        //          분포가 좁은데 1.0 부근 = ★나쁜 자리에 고정★ -- 런 내내 저더의 모양
-        //
-        // late/dropped/missed 는 DWM 자신의 집계다. 우리가 낸 프레임이 실제로 늦었는지를
-        // 우리 계수가 아니라 컴포지터가 말해 주는 유일한 자리다.
-        if *DCOMP_BIND_PROF && !profile.dwm_phase.is_empty() {
-            let mut phase = profile.dwm_phase.clone();
-            phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
-            let (d0, l0, dr0, m0) = profile.dwm_first.unwrap_or_default();
-            let (d1, l1, dr1, m1) = profile.dwm_last;
-            warn!(
-                "DWMPHASE window_ms={:.0} n={} period_ms={:.3} \
-                 phase p05={:.3} p25={:.3} p50={:.3} p75={:.3} p95={:.3} \
-                 displayed={} late={} dropped={} missed={}",
-                window.as_secs_f64() * 1000.0,
-                phase.len(),
-                profile.dwm_period_ms,
-                at(0.05),
-                at(0.25),
-                at(0.50),
-                at(0.75),
-                at(0.95),
-                d1.saturating_sub(d0),
-                l1.saturating_sub(l0),
-                dr1.saturating_sub(dr0),
-                m1.saturating_sub(m0),
-            );
-        }
         self.bind_profile = BindProfile {
             window_start: Some(now),
             ..Default::default()
