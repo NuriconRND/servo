@@ -1937,12 +1937,6 @@ impl Painter {
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
         self.last_render_started_at.set(Some(Instant::now()));
 
-        // ★표본을 여기서 뜬다 -- 렌더 하나에 정확히 하나.★ 바로 위에서 시각을
-        // 찍었으므로 `rendered_since_push` 가 지금 참이고, 여기서 밀고 나면 다음
-        // 렌더까지 다시 참이 되지 않는다. 그래서 이후에 몇 번의 `spin_event_loop`
-        // 가 끼어들든 표본은 늘어나지 않는다 -- 간격이 렌더 간격과 같아진다.
-        self.pump_paint_animation();
-
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -2039,6 +2033,20 @@ impl Painter {
         // This render pass consumed every frame published so far (renderer.update() above
         // drained the whole publish queue), so the in-flight display composite is done.
         self.set_display_composite_in_flight(false);
+
+        // ★표본은 렌더 **끝**에서 뜬다 -- 시작이 아니다.★
+        //
+        // 처음에는 `last_render_started_at` 을 찍은 직후, 즉 렌더 **시작**에서 불렀다.
+        // 그 자리에서는 `pending_frames > 0` 이라 `painter_busy` 가 참이고, 그러면
+        // `animated_property_frame` 이 거짓이 되어 **값만 나가고 프레임이 안 난다.**
+        // 실측(log_ani_debug/38): 간격은 완벽해졌는데(dup/skip 0.44/0.42 -> 0.01/0.01)
+        // `skipped_busy` 가 0 -> 15.2/s 로 뛰었고, 화면에 닿는 위치가 60.5 -> 45.3 으로
+        // 떨어져 화면은 오히려 나빠졌다. 잃은 15.2 가 정확히 그 차이다.
+        //
+        // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
+        // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
+        // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
+        self.pump_paint_animation();
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));
         }
