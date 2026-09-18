@@ -607,6 +607,60 @@ Get-CimInstance Win32_VideoController |
     Select-Object Name, CurrentRefreshRate, CurrentHorizontalResolution, CurrentVerticalResolution
 ```
 
+### 5-9. 값 경로를 다 고쳤고, 남은 것은 present 아래다 (log_ani_debug/38, 39)
+
+표본을 렌더가 끌게 하되 **렌더 끝**에서 부르도록 고친 뒤(시작에서 부르면
+`pending_frames > 0` 이라 프레임이 안 난다 — §커밋 79d8875effe), 값 경로의 세 조건이
+처음으로 동시에 충족됐다:
+
+| | 37 | 38 (렌더 시작) | 39 (렌더 끝) |
+|---|---|---|---|
+| ANIMSTEP 결함창 | 34% | 1% | **1~2%** |
+| `skipped_busy` | 0.0 | 15.2 | **0.0** |
+| 화면도달 위치/초 | 60.5 | 45.3 | **60.5** |
+| 육안 | 불규칙 저더 | 전 구간 저더 | **한 런은 120 초 전 구간 깨끗** |
+
+★그리고 39 는 같은 빌드로 세 번 돌린 결과가 갈렸다.★ 62 는 섞임(깨끗 구간 비율 큼),
+63 은 **타일에 따라** 저더가 생겼다 없어졌다, 64 는 120 초 내내 깨끗.
+
+**세 런의 계수가 전부 같다.** WALLCLOCK(dup 0.04~0.05, p50 16.66~16.68, 결함창 1),
+ANIMSTEP(네 painter 모두 결함창 1~2), WRRATE(화면도달 60.5, 다시그림 0.0),
+PAINTANIM(anim 60.5, skipped_busy 0.0). 육안만 다르다.
+
+★따라서 소거법으로 확정된다: 남은 저더는 `present()` 아래에 있다.★ present 위쪽의
+어떤 양도 "120 초 완벽" 과 "타일마다 튐" 을 구분하지 못한다.
+
+#### 코드가 그것을 확인해 준다
+
+`dcomp_compositor.rs` 의 present 호출이 **셋 다 SyncInterval 0** 이다:
+
+```rust
+(*sc.swapchain.as_ptr()).Present1(0, 0, &params)  // "SyncInterval 0 = 기존 Present와 동일 페이싱"
+(*swapchain.as_ptr()).Present(0, 0)
+(*sc.swapchain.as_ptr()).Present(0, 0)            // "SyncInterval 0 = 비블로킹"
+```
+
+즉 벽은 **어떤 패널의 vblank 도 기다리지 않는다.** 네 타일은 서로 genlock 되지 않은
+독립 60Hz 스캔아웃이고, 자유 구동 표출 클럭이 그 넷과 각각 임의의 위상으로 만난다.
+관측된 성질이 전부 여기서 나온다:
+
+* **런마다 다르다** — 시작 위상이 매번 다르고 천천히 미끄러진다
+* **타일마다 다르다** — 위상이 넷 다 다르다(63 의 관찰)
+* **present 위 계수로 안 보인다** — 그 위는 전부 동일하다
+* **리프레시를 올리면 좋아진다** — 위상 오차가 주기에 비례해 줄어든다(§5-5)
+
+#### ★`gfx_vsync_enabled` 가 이것을 못 고치는 이유★
+
+그 pref 가 세우는 `DwmVsyncRefreshDriver` 는 DWM 합성 클럭 **하나**다. 패널이 넷이고
+서로 동기되어 있지 않으므로, 하나에 맞추면 나머지 셋은 여전히 임의 위상이다. §5-6~5-8
+에서 그 스위치가 듣지 않은 이유가 이것이었을 가능성이 크다(그때는 값 경로가 망가져
+있어 구분되지 않았다).
+
+고치려면 **타일마다 자기 출력의 vblank** 에 맞춰야 한다 — 스왑체인별 SyncInterval 1,
+또는 waitable swapchain(`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`), 또는
+`IDXGIOutput::WaitForVBlank`. SyncInterval 1 은 호출 스레드를 블록하므로 primary
+타일(메인 스레드)에는 그대로 쓸 수 없다.
+
 ## 비목표
 
 `paint.rs` 와 엔진 통지 경로 수정(범위 밖, 분기 2 에서 필요해지면 별도 합의),
