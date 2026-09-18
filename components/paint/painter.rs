@@ -1194,8 +1194,31 @@ impl Painter {
             (Some(_), None) => true,
             (None, _) => false,
         };
+        // ★타이머 폴백은 "아무도 렌더하지 않을 때" 전용이다.★ 렌더가 돌고 있는데도 이
+        // disjunct 가 같은 주기로 같이 돌면 **두 시계가 맥놀이한다.** 타이머가 앞서면
+        // 렌더 없이 표본이 하나 나가고(그 간격에 둘이 들어간다), 그 대가로 다음 간격이
+        // 빈다. 1x(2,304px/s)에서 빈 간격은 화면에서 38.4px 이 아니라 **76.8px 로 튄다.**
+        //
+        // 실측(log_ani_debug/36): `dup` 과 `skip1` 이 **정확히 짝으로** 나온다 -- 1/1 이
+        // 20 창, 2/2 가 3 창, 3/3 이 1 창. 무작위 손실이 아니라 맥놀이의 서명이다. 빈도는
+        // 초당 0.6 회(≈1.7 초에 한 번)이고 73 창 중 48% 에 결함이 있었다. 두 시계의 위상이
+        // 가까워지는 구간에서 결함이 몰리는 것이 "재생 중 품질이 변동" 으로 보고된 현상이다.
+        //
+        // 그래서 렌더가 돌고 있는 동안에는 **렌더만이** 표본을 끈다. `rendered_since_push`
+        // 하나면 간격이 렌더 간격과 같아지고 dup/skip 이 구조적으로 불가능해진다.
+        // 폴백은 렌더가 한동안 없을 때만 살아난다 -- 움직이는 것이 이 애니메이션뿐인
+        // 화면에서 첫 프레임을 만드는 것이 그 자리이고, 그 뒤로는 자기가 낸 프레임이
+        // 렌더를 만들므로 `rendered_since_push` 가 이어받는다.
+        //
+        // 네 주기로 잡은 것은 한두 프레임 늦는 렌더를 "렌더가 없다" 로 오판하지 않기
+        // 위해서다. 진짜로 멈추면 67ms 뒤에 폴백이 받는다.
+        let renderer_is_running = self
+            .last_render_started_at
+            .get()
+            .is_some_and(|at| now.duration_since(at) < animation_period * 4);
         let push_due = rendered_since_push
-            || last_push.is_none_or(|last| now.duration_since(last) >= animation_period);
+            || (!renderer_is_running
+                && last_push.is_none_or(|last| now.duration_since(last) >= animation_period));
         // ★"남"에서 자기를 뺀다★ — 여기서 `last_frame_generated_at`(자기 프레임도 찍힌다)을
         // 보고 있었던 것이 위 주석의 규칙을 무너뜨렸다. 애니메이션이 프레임을 하나 내면 그
         // 시각이 찍히고, 다음 밀어넣기가 그것을 "남이 내고 있다"로 읽는다. 두 판정이 서로
