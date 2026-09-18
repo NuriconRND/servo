@@ -508,6 +508,24 @@ pub struct Preferences {
     ///
     /// `[0, 99]` 로 조인다. `gfx_vsync_enabled` 가 꺼져 있으면 아무 효과가 없다.
     pub gfx_vsync_phase_pct: i64,
+    /// 타일 스왑체인 `Present` 의 SyncInterval. 0 = 기다리지 않음(현재 동작), 1 = 자기
+    /// 출력의 vblank 에 맞춤. `[0, 4]` 로 조인다.
+    ///
+    /// ★왜 필요한가★ -- 값 경로를 다 고친 뒤에도 남은 저더가 있는데, 같은 빌드로
+    /// 세 번 돌린 결과가 갈렸고(120 초 내내 깨끗 / 타일마다 튐 / 섞임) **세 런의
+    /// 계수가 전부 같았다**(log_ani_debug/39). present 위쪽의 어떤 양도 그 차이를
+    /// 구분하지 못하므로 남은 원인은 present 아래다. 그리고 지금 present 는 셋 다
+    /// SyncInterval 0 이라 **어떤 패널의 vblank 도 기다리지 않는다.** 네 타일은
+    /// genlock 되지 않은 독립 60Hz 스캔아웃이고, 자유 구동 클럭이 넷과 각각 임의
+    /// 위상으로 만난다 -- 런마다 다른 것도, 타일마다 다른 것도 거기서 나온다.
+    ///
+    /// `gfx_vsync_enabled` 로는 못 고친다. 그것이 세우는 DWM 합성 클럭은 **하나**인데
+    /// 패널은 넷이다. 정렬은 타일마다여야 하고, 그 자리가 각 스왑체인의 Present 다.
+    ///
+    /// ★기본 0 이다.★ SyncInterval 1 은 큐가 찼을 때 **호출 스레드를 블록**하고,
+    /// primary 타일의 그 스레드는 메인이다. 실기로 득실을 재기 전에 기본을 바꾸지
+    /// 않는다 -- 막히면 WALLPASS 의 pass_ms 와 WALLCLOCK 의 gap 이 즉시 말해 준다.
+    pub gfx_present_sync_interval: i64,
     /// 프리-vsync 페이싱용 자유 실행 페인트 타이머 주기(Hz). 특정 디스플레이 주사율(예 60)에
     /// 맞춰 프레임 생산이 vsync 를 앞질러 저더가 생기는 것을 줄인다. `[1, 1000]` 범위를
     /// 벗어나면 경고 후 기본값(120)을 쓴다.
@@ -1121,6 +1139,7 @@ impl Preferences {
             gfx_wall_parallel_tiles: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
+            gfx_present_sync_interval: 0,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,

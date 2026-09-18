@@ -820,8 +820,8 @@ fn present1_partial(sc: &SwapChainStorage, dirty: &[DeviceIntRect]) -> bool {
         pScrollRect: ptr::null_mut(),
         pScrollOffset: ptr::null_mut(),
     };
-    // Safety: 살아있는 스왑체인. SyncInterval 0 = 기존 Present와 동일 페이싱.
-    let hr = unsafe { (*sc.swapchain.as_ptr()).Present1(0, 0, &params) };
+    // Safety: 살아있는 스왑체인. SyncInterval 은 `gfx_present_sync_interval`(기본 0 = 기다리지 않음).
+    let hr = unsafe { (*sc.swapchain.as_ptr()).Present1(*PRESENT_SYNC_INTERVAL, 0, &params) };
     if hr < 0 {
         warn!("[dcomp-native] Present1 failed (hr=0x{:08x})", hr as u32);
         return false;
@@ -1335,6 +1335,19 @@ fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool
 /// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
 /// DComp 가상 서피스에 직접 그리게 한다. 전역 상태 없음.
 /// `SERVO_DCOMP_BIND_PROF` 게이트. 타일마다 물어보는 자리라 env 읽기를 캐시한다.
+/// 타일 스왑체인 `Present` 의 SyncInterval(`gfx_present_sync_interval`). 프레임마다
+/// 묻는 자리라 한 번만 읽는다. 자세한 근거는 pref 주석.
+static PRESENT_SYNC_INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+    let raw = pref!(gfx_present_sync_interval).clamp(0, 4) as u32;
+    if raw > 0 {
+        log::warn!(
+            "[dcomp-native] present SyncInterval={raw} -- 타일마다 자기 출력의 vblank 에 \
+             맞춘다. 큐가 차면 이 스레드가 블록되므로 WALLPASS pass_ms 를 같이 보라."
+        );
+    }
+    raw
+});
+
 static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     servo_config::debug_env::string(&servo_config::debug_env::DCOMP_BIND_PROF)
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -2164,7 +2177,7 @@ impl DCompNativeCompositor {
                 } else {
                     None
                 };
-                let hr = (*swapchain.as_ptr()).Present(0, 0);
+                let hr = (*swapchain.as_ptr()).Present(*PRESENT_SYNC_INTERVAL, 0);
                 if let Some(s) = p_start {
                     let dur = s.elapsed();
                     d_present_dur += dur;
@@ -3450,9 +3463,9 @@ impl Compositor for DCompNativeCompositor {
                         // 로테이트되지 않았으므로 이 더티 영역은 이후 성공하는 Present의 부기에
                         // 반드시 합류해야 함 — 드롭하면 stale 과소 기록으로 잔상 결함).
                         let dirty = std::mem::take(&mut sc.frame_dirty);
-                        // Safety: 살아있는 스왑체인. SyncInterval 0 = 비블로킹(페이싱은 기존 유지).
+                        // Safety: 살아있는 스왑체인. SyncInterval 은 `gfx_present_sync_interval`(기본 0 = 비블로킹).
                         let present_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-                        let hr = unsafe { (*sc.swapchain.as_ptr()).Present(0, 0) };
+                        let hr = unsafe { (*sc.swapchain.as_ptr()).Present(*PRESENT_SYNC_INTERVAL, 0) };
                         if let Some(start) = present_start {
                             present_ns += start.elapsed().as_nanos() as u64;
                             presents += 1;
