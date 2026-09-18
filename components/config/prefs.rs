@@ -526,6 +526,26 @@ pub struct Preferences {
     /// primary 타일의 그 스레드는 메인이다. 실기로 득실을 재기 전에 기본을 바꾸지
     /// 않는다 -- 막히면 WALLPASS 의 pass_ms 와 WALLCLOCK 의 gap 이 즉시 말해 준다.
     pub gfx_present_sync_interval: i64,
+    /// ★표출 클럭을 DWM 합성 격자에 스냅한다.★ `-1`(기본) = 끔, `0..99` = DWM 주기의
+    /// 그 백분율 지점을 겨냥한다.
+    ///
+    /// ***왜 닫힌 루프여야 하나*** -- 자유 구동 타이머에 상수 오프셋을 더하는 것으로는
+    /// 안 된다. 기준점이 매 실행 임의라 결과도 임의다. 매 틱 **측정된 vblank 로부터**
+    /// 다시 계산해야 기동 위상과 무관하게 같은 자리에 떨어진다:
+    ///
+    ///     next_tick = qpcVBlank + k*period + target   (k = next_tick > now 인 최소 정수)
+    ///
+    /// 실측 근거(log_ani_debug/47): 깨끗한 런은 커밋이 주기의 8% 지점에, 저더 런은
+    /// 60% 지점에 떨어졌고 둘 다 44 창 내내 그 자리를 유지했다. DWM 은 vblank 이전에
+    /// 미리 합성을 시작하므로 60% 지점 커밋은 그 마감에 걸터앉아 프레임마다 되느냐
+    /// 마느냐가 갈린다 -- 그것이 저더이고, 어느 자리에 앉을지는 지금 순전히 운이다.
+    ///
+    /// 커밋은 틱보다 렌더 시간(≈2ms, 주기의 ≈0.12)만큼 늦으므로 틱은 vblank 부근을
+    /// 겨냥한다. `0` 이면 커밋이 실측된 좋은 자리에 온다. `DWMPHASE` 로 확인하라.
+    ///
+    /// ★대기가 아니다.★ 타이머가 깨어나는 **시각**만 바뀐다. 생산 스레드가 공유
+    /// 객체에 줄 서는 회귀(`GstSystemClock` 사건)가 구조적으로 생기지 않는다.
+    pub gfx_present_align_dwm_pct: i64,
     /// 프리-vsync 페이싱용 자유 실행 페인트 타이머 주기(Hz). 특정 디스플레이 주사율(예 60)에
     /// 맞춰 프레임 생산이 vsync 를 앞질러 저더가 생기는 것을 줄인다. `[1, 1000]` 범위를
     /// 벗어나면 경고 후 기본값(120)을 쓴다.
@@ -1140,6 +1160,7 @@ impl Preferences {
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
+            gfx_present_align_dwm_pct: -1,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,

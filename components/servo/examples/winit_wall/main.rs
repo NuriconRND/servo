@@ -40,6 +40,29 @@ use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::HasDisplayHandle;
 
+
+// QPC. `snap_to_dwm_grid` 가 DWM 이 준 QPC 값과 지금을 같은 단위로 비교해야 한다.
+// `dwmapi` 와 같은 이유로 직접 링크한다 -- winapi 피처를 셸까지 끌고 오지 않는다.
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn QueryPerformanceCounter(counter: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+}
+
+/// QPC 주파수는 부팅 중 고정이므로 한 번만 읽는다.
+fn qpc_frequency() -> Option<i64> {
+    static FREQ: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *FREQ.get_or_init(|| {
+        let mut freq: i64 = 0;
+        // Safety: 순수 out-param.
+        if unsafe { QueryPerformanceFrequency(&mut freq) } != 0 && freq > 0 {
+            Some(freq)
+        } else {
+            None
+        }
+    })
+}
+
 mod crash_report;
 mod tile;
 #[cfg(target_os = "windows")]
@@ -871,6 +894,49 @@ impl AppState {
     }
 
     /// 자유 구동 소프트 타이머 경로. vsync 를 안 쓰거나, 쓰다가 신호가 멎었을 때.
+    /// ★다음 틱을 DWM 합성 격자에 스냅한다.★ `gfx_present_align_dwm_pct` 가 켜졌을 때만.
+    ///
+    /// 자유 구동으로 `next += period` 하면 기준점이 기동 순간에 임의로 정해지고 그대로
+    /// 고정된다 -- 실측에서 깨끗한 런은 커밋이 주기의 8% 지점에, 저더 런은 60% 지점에
+    /// 떨어졌고 둘 다 런 내내 그 자리였다(log_ani_debug/47). **상수 오프셋을 더하는 것으로는
+    /// 고쳐지지 않는다**: 임의 기준점에 상수를 더하면 여전히 임의다.
+    ///
+    /// 그래서 매 틱 **측정된 vblank 로부터** 다시 센다. 기동 위상과 무관하게 같은 자리에
+    /// 떨어지고, DWM 과 우리 타이머의 주파수 차이도 매 틱 흡수된다.
+    ///
+    /// 조회일 뿐 대기가 아니다 -- 타이머가 깨어나는 시각만 바뀐다.
+    fn snap_to_dwm_grid(&self, now: std::time::Instant, free_running: std::time::Instant) -> std::time::Instant {
+        let pct = servo_config::pref!(gfx_present_align_dwm_pct);
+        if !(0..=99).contains(&pct) {
+            return free_running;
+        }
+        let Some((vblank_qpc, period_qpc)) = servo::dwm_composition_grid() else {
+            return free_running;
+        };
+        let Some(freq) = qpc_frequency() else {
+            return free_running;
+        };
+        let mut qpc_now: i64 = 0;
+        // Safety: 순수 out-param.
+        if unsafe { QueryPerformanceCounter(&mut qpc_now) } == 0 || qpc_now < 0 {
+            return free_running;
+        }
+        let period = period_qpc as i128;
+        let target = period * pct as i128 / 100;
+        // vblank 는 드라이버에 따라 직전일 수도 다음일 수도 있다. 나머지 연산을 두 번 걸어
+        // 어느 쪽이든 격자 위의 같은 점으로 접는다.
+        let base = vblank_qpc as i128 + target;
+        let delta = qpc_now as i128 - base;
+        let mut ahead = period - (((delta % period) + period) % period);
+        // 지금과 너무 가까우면(렌더를 시작할 틈이 없으면) 한 칸 뒤로 -- 그 칸을 놓치느니
+        // 다음 칸에 정확히 맞추는 것이 낫다. 이것이 없으면 0.5ms 뒤 틱이 잡혀 매번 늦는다.
+        if ahead < period / 8 {
+            ahead += period;
+        }
+        let wait_s = ahead as f64 / freq as f64;
+        now + std::time::Duration::from_secs_f64(wait_s)
+    }
+
     fn drive_present_clock_timer(&self, now: std::time::Instant) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
@@ -881,6 +947,9 @@ impl AppState {
             while next <= now {
                 next += self.present_period;
             }
+            // ★격자에 스냅한다.★ 자유 구동으로 센 다음 칸을 DWM 합성 격자 위의 같은
+            // 지점으로 옮긴다. 꺼져 있으면 그대로 돌려준다.
+            next = self.snap_to_dwm_grid(now, next);
             self.next_present_tick.set(next);
             if self.vsync_stalled.get() {
                 self.clock_stats.borrow_mut().backstop += 1;

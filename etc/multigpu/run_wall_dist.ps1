@@ -133,6 +133,26 @@ param(
     # 메인이므로, WALLPASS 의 pass_ms 와 WALLCLOCK 의 gap/off 를 반드시 같이 보라.
     [ValidateRange(0, 4)]
     [int]    $PresentSync = 0,
+    # gfx_present_align_dwm_pct: 표출 클럭을 DWM 합성 격자에 스냅한다.
+    # -1(기본) = 끔, 0..99 = DWM 주기의 그 백분율 지점을 겨냥.
+    #
+    # ★이것이 저더의 원인이고 해법이다.★ 실측(log_ani_debug/47): 같은 빌드·같은
+    # 설정인데 깨끗한 런은 커밋이 DWM 주기의 8% 지점에, 저더 런은 60% 지점에
+    # 떨어졌고 둘 다 44창 내내 그 자리를 유지했다. DWM 은 vblank 이전에 미리 합성을
+    # 시작하므로 60% 지점 커밋은 마감에 걸터앉아 프레임마다 되느냐 마느냐가 갈린다.
+    # 어느 자리에 앉을지는 지금 기동 순간의 운이다.
+    #
+    # 켜면 매 틱 측정된 vblank 로부터 다시 세므로 기동 위상과 무관하게 같은 자리에
+    # 떨어진다. 자유 구동 타이머에 상수를 더하는 것과는 다르다 -- 그건 임의 기준점에
+    # 상수를 더하는 것이라 여전히 임의다.
+    #
+    # 커밋은 틱보다 렌더 시간(약 2ms = 주기의 0.12)만큼 늦으므로 0 이 vblank 직후를
+    # 겨냥한다. DWMPHASE 의 phase p50 으로 확인하라 -- 0.1 근처면 좋은 자리다.
+    #
+    # 대기가 아니다. 타이머가 깨어나는 시각만 바뀌므로 생산 스레드가 공유 객체에
+    # 줄 서는 회귀(GstSystemClock 사건)가 구조적으로 생기지 않는다.
+    [ValidateRange(-1, 99)]
+    [int]    $DwmAlign = -1,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -649,6 +669,7 @@ $argList = @(
     "--pref", "gfx_vsync_enabled=$($Vsync.IsPresent.ToString().ToLower())",
     "--pref", "gfx_vsync_phase_pct=$VsyncPhase",
     "--pref", "gfx_present_sync_interval=$PresentSync",
+    "--pref", "gfx_present_align_dwm_pct=$DwmAlign",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -717,7 +738,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in

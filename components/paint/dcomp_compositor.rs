@@ -1543,6 +1543,22 @@ fn note_dwm_phase_skip() {
     }
 }
 
+/// `(qpcVBlank, qpcRefreshPeriod)`. 조회만 한다 -- `note_dwm_phase` 와 같은 API 를 쓰되
+/// 계측 창을 건드리지 않는다. 자세한 근거는 `crate::dwm_composition_grid`.
+pub(crate) fn composition_grid() -> Option<(u64, u64)> {
+    let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+    // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
+    if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
+        return None;
+    }
+    // `#[repr(packed)]` 이라 필드를 빌릴 수 없다. 값으로 복사한다.
+    let period = info.qpcRefreshPeriod;
+    let vblank = info.qpcVBlank;
+    if period == 0 { None } else { Some((vblank, period)) }
+}
+
+
 fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
         return;
