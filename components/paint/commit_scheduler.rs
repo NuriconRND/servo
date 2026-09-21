@@ -39,8 +39,9 @@ pub(crate) struct SchedulerStats {
 }
 
 struct Shared {
-    /// (마감 QPC, 디바이스 포인터). 작은 큐라 정렬 없이 최소값을 훑는다 -- 타일 수만큼이다.
-    queue: Mutex<Vec<(u64, usize)>>,
+    /// (마감 QPC, 디바이스 포인터, 모니터). 작은 큐라 정렬 없이 최소값을 훑는다 -- 타일
+    /// 수만큼이다.
+    queue: Mutex<Vec<(u64, usize, usize)>>,
     condvar: Condvar,
 }
 
@@ -51,6 +52,30 @@ static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
 static LOCK_MAX: AtomicU64 = AtomicU64::new(0);
 static LOCK_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// 모니터 -> 이번 창의 위상 표본. `OUTCOMMIT` 이 초당 비운다.
+static PHASES: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
+
+fn record_phase(monitor: usize, phase: f64) {
+    if let Ok(mut guard) = PHASES.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(monitor)
+            .or_default()
+            .push(phase);
+    }
+}
+
+/// 모니터별 위상 표본을 꺼내 비운다.
+pub(crate) fn take_phases() -> Vec<(usize, Vec<f64>)> {
+    let Ok(mut guard) = PHASES.lock() else {
+        return Vec::new();
+    };
+    match guard.as_mut() {
+        Some(map) => map.drain().collect(),
+        None => Vec::new(),
+    }
+}
 
 /// 스케줄러 스레드가 살아서 큐를 비우고 있는지. ★거짓이면 즉시 커밋으로 대체한다★ --
 /// 아무도 비우지 않는 큐에 쌓기만 하면 그 타일은 다시는 커밋되지 않고 벽이 멈춘다. 늦게
@@ -98,7 +123,9 @@ fn record_lock_wait(ticks: u64) {
 }
 
 /// 이 디바이스의 커밋을 `deadline_qpc` 에 건다. 마감이 이미 지났으면 즉시 커밋된다.
-pub(crate) fn schedule(device: usize, deadline_qpc: u64) {
+/// `monitor` 는 커밋 시점에 위상을 잴 출력을 가리킨다 -- 스케줄만으로는 어느 격자에
+/// 맞춰야 하는지 알 수 없다.
+pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
     let shared = SHARED.get_or_init(|| {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Vec::new()),
@@ -121,13 +148,17 @@ pub(crate) fn schedule(device: usize, deadline_qpc: u64) {
         // 이 타일은 영영 커밋되지 않고 벽이 멈춘다 -- 오늘 이전의 동작인 즉시 커밋으로
         // 떨어진다. 통계에는 잡아 둔다: 스케줄이 아니라 즉시 커밋이었다는 사실은 로그가 아닌
         // 별도 계수가 필요하지만, 최소한 "커밋은 일어났다" 는 여기서 놓치지 않는다.
+        //
+        // ★위상은 여기서 기록하지 않는다.★ 이 경로는 정렬 기능 자체가 죽었을 때만 타므로
+        // "격자 어디에 떨어졌나" 라는 질문이 성립하지 않는다 -- 기록하면 정상적으로
+        // 정렬된 표본들의 p50 을 의미 없는 값으로 오염시킨다.
         crate::dcomp_compositor::commit_device_ptr(device);
         SCHEDULED.fetch_add(1, Ordering::Relaxed);
         return;
     }
     {
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        upsert(&mut queue, device, deadline_qpc);
+        upsert(&mut queue, device, monitor, deadline_qpc);
     }
     SCHEDULED.fetch_add(1, Ordering::Relaxed);
     shared.condvar.notify_one();
@@ -158,16 +189,16 @@ fn scheduler_loop(shared: &Arc<Shared>) {
         // 때가 된 것을 전부 꺼낸다.
         // `let-else` 의 `else` 갈래는 반드시 발산해야 한다(값을 만들어 블록을 그 값으로
         // 끝내는 용도가 아니다) -- 그래서 바깥 블록에 이름을 붙이고 `break` 로 값을 낸다.
-        let due: Vec<(u64, usize)> = 'grab: {
+        let due: Vec<(u64, usize, usize)> = 'grab: {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             let Some(now) = qpc_now() else {
                 // 시계를 못 읽으면 큐를 비워 폴백한다 -- 붙들고 있으면 화면이 멈춘다.
                 break 'grab queue.drain(..).collect();
             };
             let mut ready = Vec::new();
-            queue.retain(|&(deadline, device)| {
+            queue.retain(|&(deadline, device, monitor)| {
                 if deadline <= now {
-                    ready.push((deadline, device));
+                    ready.push((deadline, device, monitor));
                     false
                 } else {
                     true
@@ -175,7 +206,7 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             });
             if ready.is_empty() {
                 // 가장 이른 마감까지 잔다. 큐가 비면 알림을 기다린다.
-                let wait = queue.iter().map(|&(d, _)| d).min().map(|d| {
+                let wait = queue.iter().map(|&(d, _, _)| d).min().map(|d| {
                     let ticks = d.saturating_sub(now);
                     std::time::Duration::from_secs_f64(ticks as f64 / freq as f64)
                 });
@@ -195,7 +226,7 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             ready
         };
 
-        for (deadline, device) in due {
+        for (deadline, device, monitor) in due {
             if let Some(now) = qpc_now() {
                 let slip = now.saturating_sub(deadline);
                 let us = slip.saturating_mul(1_000_000) / freq.max(1);
@@ -204,6 +235,19 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             }
             let _guard = device_guard(device);
             crate::dcomp_compositor::commit_device_ptr(device);
+
+            // ★이것이 판정이다.★ 이 커밋이 **자기 출력** 격자의 어디에 떨어졌나.
+            // 지금까지는 데스크톱 격자 하나만 보였으므로 나머지 셋이 어디 있는지 알 수 없었다.
+            if let (Some(grid), Some(after)) =
+                (crate::output_grid::grid_for_monitor(monitor), qpc_now())
+            {
+                if grid.period_qpc > 0 {
+                    let period = grid.period_qpc as i128;
+                    let delta = after as i128 - grid.vblank_qpc as i128;
+                    let folded = ((delta % period) + period) % period;
+                    record_phase(monitor, folded as f64 / period as f64);
+                }
+            }
         }
     }
 }
@@ -211,11 +255,12 @@ fn scheduler_loop(shared: &Arc<Shared>) {
 /// 큐에 마감을 넣거나 갱신한다. ★같은 디바이스는 덮어쓴다★ -- 밀린 커밋을 쌓으면 한
 /// 주기에 여러 개가 나가고, 그것이 정확히 없애려는 현상이다. 스레드·COM 없이 테스트할 수
 /// 있도록 `schedule` 에서 이 규칙만 갈라냈다.
-fn upsert(queue: &mut Vec<(u64, usize)>, device: usize, deadline: u64) {
-    if let Some(slot) = queue.iter_mut().find(|(_, d)| *d == device) {
+fn upsert(queue: &mut Vec<(u64, usize, usize)>, device: usize, monitor: usize, deadline: u64) {
+    if let Some(slot) = queue.iter_mut().find(|(_, d, _)| *d == device) {
         slot.0 = deadline;
+        slot.2 = monitor;
     } else {
-        queue.push((deadline, device));
+        queue.push((deadline, device, monitor));
     }
 }
 
@@ -226,18 +271,22 @@ mod tests {
     #[test]
     fn a_second_schedule_for_the_same_device_replaces_the_first() {
         let mut queue = Vec::new();
-        upsert(&mut queue, 0xAA, 100);
-        upsert(&mut queue, 0xAA, 250);
-        assert_eq!(queue, vec![(250, 0xAA)], "같은 디바이스는 쌓이지 않고 덮어써야 한다");
+        upsert(&mut queue, 0xAA, 0x11, 100);
+        upsert(&mut queue, 0xAA, 0x11, 250);
+        assert_eq!(
+            queue,
+            vec![(250, 0xAA, 0x11)],
+            "같은 디바이스는 쌓이지 않고 덮어써야 한다"
+        );
     }
 
     #[test]
     fn different_devices_each_keep_their_own_deadline() {
         let mut queue = Vec::new();
-        upsert(&mut queue, 0xAA, 100);
-        upsert(&mut queue, 0xBB, 250);
-        upsert(&mut queue, 0xAA, 300);
+        upsert(&mut queue, 0xAA, 0x11, 100);
+        upsert(&mut queue, 0xBB, 0x22, 250);
+        upsert(&mut queue, 0xAA, 0x11, 300);
         queue.sort();
-        assert_eq!(queue, vec![(250, 0xBB), (300, 0xAA)]);
+        assert_eq!(queue, vec![(250, 0xBB, 0x22), (300, 0xAA, 0x11)]);
     }
 }

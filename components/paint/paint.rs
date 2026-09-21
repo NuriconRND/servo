@@ -2941,8 +2941,10 @@ impl Paint {
                     let Some((device, monitor)) = pending else {
                         continue;
                     };
-                    match monitor.and_then(Self::deadline_for_monitor) {
-                        Some(deadline) => crate::commit_scheduler::schedule(device, deadline),
+                    match monitor.and_then(|m| Self::deadline_for_monitor(m).map(|d| (m, d))) {
+                        Some((monitor, deadline)) => {
+                            crate::commit_scheduler::schedule(device, monitor, deadline)
+                        },
                         None => {
                             // 격자를 못 구하면 지금 낸다 = 오늘 동작. 나빠지지 않는다.
                             //

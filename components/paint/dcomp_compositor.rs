@@ -2530,6 +2530,38 @@ impl DCompNativeCompositor {
             ms(profile.end_ns),
             ms(profile.destroy_ns),
         );
+
+        // ★OUTCOMMIT -- 타일별 커밋이 자기 출력 격자 어디에 떨어졌나.★
+        //
+        // 이 추적 내내 맹점이었던 양이다. DWMPHASE 는 데스크톱(주 모니터) 격자 하나만 보므로
+        // "주 모니터 기준 0.135 로 안전한데 화면은 저더" 가 성립했다. 출력마다 따로 봐야
+        // 넷이 전부 좋은 자리에 앉았는지 알 수 있다.
+        //
+        // slip = 스케줄러가 마감보다 늦은 시간(크면 스케줄러가 병목).
+        // lock_wait = 디바이스 뮤텍스 대기(0 에 가까워야 한다는 가정의 검산).
+        #[cfg(windows)]
+        if *DCOMP_BIND_PROF {
+            let stats = crate::commit_scheduler::take_stats();
+            for (monitor, mut phase) in crate::commit_scheduler::take_phases() {
+                if phase.is_empty() {
+                    continue;
+                }
+                phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
+                warn!(
+                    "OUTCOMMIT monitor={monitor:#x} n={} phase p05={:.3} p50={:.3} p95={:.3} \
+                     scheduled={} slip_us_max={} lock_wait_us_max={}",
+                    phase.len(),
+                    at(0.05),
+                    at(0.50),
+                    at(0.95),
+                    stats.scheduled,
+                    stats.slip_us_max,
+                    stats.lock_wait_us_max,
+                );
+            }
+        }
+
         self.bind_profile = BindProfile {
             window_start: Some(now),
             ..Default::default()
