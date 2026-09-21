@@ -19,7 +19,7 @@
 //! painter) 사이에서만 걸린다. 비디오·스트림 생산자는 이 경로에 없다.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use log::warn;
@@ -51,6 +51,11 @@ static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
 static LOCK_MAX: AtomicU64 = AtomicU64::new(0);
 static LOCK_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// 스케줄러 스레드가 살아서 큐를 비우고 있는지. ★거짓이면 즉시 커밋으로 대체한다★ --
+/// 아무도 비우지 않는 큐에 쌓기만 하면 그 타일은 다시는 커밋되지 않고 벽이 멈춘다. 늦게
+/// 커밋하는 것은 아예 안 하는 것보다 항상 낫다는 것이 이 폴백의 근거다.
+static SCHEDULER_ALIVE: AtomicBool = AtomicBool::new(false);
 
 // ★디바이스 뮤텍스는 `Arc` 로 나눠 갖지 않고 프로세스 수명으로 누수시킨다.★ 브리프가 제안한
 // `Arc<Mutex<()>> + transmute 로 수명 늘리기` 는 구조체 필드 드롭 순서(선언 순) 때문에
@@ -100,14 +105,26 @@ pub(crate) fn schedule(device: usize, deadline_qpc: u64) {
             condvar: Condvar::new(),
         });
         let worker = shared.clone();
-        if let Err(error) = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name(String::from("DcompCommitScheduler"))
             .spawn(move || scheduler_loop(&worker))
         {
-            warn!("[commitsched] 스레드를 띄우지 못했다: {error}");
+            // 스레드가 실제로 떴을 때만 켠다 -- 이 플래그가 "큐에 넣어도 누군가 비운다" 를
+            // 보장하는 유일한 근거다.
+            Ok(_) => SCHEDULER_ALIVE.store(true, Ordering::Relaxed),
+            Err(error) => warn!("[commitsched] 스레드를 띄우지 못했다: {error}"),
         }
         shared
     });
+    if !SCHEDULER_ALIVE.load(Ordering::Relaxed) {
+        // 스케줄러가 없다(뜨지 못했거나 이미 죽었다). 그래도 큐에 넣으면 아무도 비우지 않아
+        // 이 타일은 영영 커밋되지 않고 벽이 멈춘다 -- 오늘 이전의 동작인 즉시 커밋으로
+        // 떨어진다. 통계에는 잡아 둔다: 스케줄이 아니라 즉시 커밋이었다는 사실은 로그가 아닌
+        // 별도 계수가 필요하지만, 최소한 "커밋은 일어났다" 는 여기서 놓치지 않는다.
+        crate::dcomp_compositor::commit_device_ptr(device);
+        SCHEDULED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     {
         let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         upsert(&mut queue, device, deadline_qpc);
@@ -129,6 +146,9 @@ pub(crate) fn take_stats() -> SchedulerStats {
 fn scheduler_loop(shared: &Arc<Shared>) {
     let Some(freq) = qpc_frequency() else {
         warn!("[commitsched] QPC 주파수를 읽지 못했다; 스케줄러를 멈춘다");
+        // 이 스레드는 여기서 끝난다 -- 이후로는 큐에 넣어도 아무도 비우지 않는다. 플래그를
+        // 내려 그 순간부터 `schedule` 이 즉시 커밋으로 폴백하게 한다.
+        SCHEDULER_ALIVE.store(false, Ordering::Relaxed);
         return;
     };
     // 아래 `'grab` 라벨 블록 안에 있는 `continue` 를 그 블록이 아니라 이 루프로 보내려면
