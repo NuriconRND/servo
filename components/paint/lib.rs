@@ -54,6 +54,8 @@ mod tracing;
 /// WR Native Compositor(DirectComposition) 구현. Windows 전용, painter(Task 5)가 결선한다.
 #[cfg(windows)]
 mod dcomp_compositor;
+#[cfg(windows)]
+mod output_grid;
 /// raw D3D11 YUV→RGBA 변환 패스(VideoConvertPass, 비디오 WR 탈출 사이클 Task 4).
 /// dcomp_compositor(Task 5)가 external compositor surface 경로에서 소비한다.
 #[cfg(windows)]
