@@ -31,6 +31,7 @@ use webrender::{
 };
 use winapi::Interface;
 use winapi::shared::dxgi::{
+    CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
     DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, IDXGIAdapter, IDXGIDevice, IDXGIDevice1,
 };
 use winapi::shared::dxgi1_2::{
@@ -1559,10 +1560,151 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
 }
 
 
+/// ★모니터마다 vblank 가 얼마나 어긋나 있는가.★ 진단 전용, `SERVO_DCOMP_BIND_PROF` 게이트.
+///
+/// ***왜 필요한가*** -- `DwmGetCompositionTimingInfo` 는 `hWnd` 에 NULL 만 받는다. 즉
+/// `DWMPHASE` 의 위상은 **주 모니터 하나** 기준이다. 4-GPU 벽에서 나머지 셋의 vblank 가
+/// 얼마나 어긋나 있는지는 그 값으로 알 수 없고, 그래서 "주 모니터 기준으로는 0.135 로
+/// 안전한데 화면은 저더" 라는 상태가 성립한다(log_ani_debug_02/01). 어긋남이 작으면
+/// 타일별 정렬은 불필요하고, 크면 그것이 남은 저더의 정체다. 재기 전에는 모른다.
+///
+/// ***왜 전용 스레드인가*** -- `WaitForVBlank` 는 **블록한다**. 생산 스레드나 메인에서
+/// 부르면 공유 객체에 줄 서는 회귀가 된다(`GstSystemClock` 사건, `-SinkPacing thread` 가
+/// 그 대응). 그래서 아무도 기다리지 않는 자기 스레드에서, 초당 한 바퀴만 돈다. 엔진의
+/// 어떤 경로도 이 스레드를 기다리지 않는다.
+///
+/// 출력 넷을 차례로 기다려 각 vblank 의 QPC 를 잡고, 첫 출력 기준 상대 오프셋을 주기의
+/// 분수로 찍는다. 한 바퀴가 네 vblank(≈67ms)라 표본은 초당 하나다 -- 어긋남은 천천히
+/// 변하므로 그것으로 충분하다.
+#[cfg(windows)]
+fn start_output_vblank_probe() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    if !*DCOMP_BIND_PROF {
+        return;
+    }
+    ONCE.call_once(|| {
+        std::thread::Builder::new()
+            .name(String::from("OutputVBlankProbe"))
+            .spawn(output_vblank_probe_loop)
+            .ok();
+    });
+}
+
+#[cfg(windows)]
+fn output_vblank_probe_loop() {
+    // Safety: 전부 COM 생성/열거. 포인터는 이 스레드 안에서만 살고 쓰인 뒤 Release 된다.
+    unsafe {
+        let mut factory_raw: *mut IDXGIFactory1 = ptr::null_mut();
+        if CreateDXGIFactory1(
+            &IDXGIFactory1::uuidof(),
+            &mut factory_raw as *mut _ as *mut _,
+        ) < 0
+            || factory_raw.is_null()
+        {
+            warn!("[outphase] CreateDXGIFactory1 failed; 모니터별 vblank 를 잴 수 없다");
+            return;
+        }
+        let Some(factory) = ComOwned::from_raw(factory_raw) else {
+            return;
+        };
+
+        // 어댑터 전부의 출력 전부를 모은다. 타일 매핑은 하지 않는다 -- 지금 알고 싶은 것은
+        // "넷이 서로 얼마나 어긋나 있나" 이고, 그것은 이름만 있으면 읽을 수 있다.
+        let mut outputs: Vec<(String, ComOwned<IDXGIOutput>)> = Vec::new();
+        for ai in 0..16u32 {
+            let mut adapter_raw: *mut IDXGIAdapter1 = ptr::null_mut();
+            if (*factory.as_ptr()).EnumAdapters1(ai, &mut adapter_raw) < 0 || adapter_raw.is_null()
+            {
+                break;
+            }
+            let Some(adapter) = ComOwned::from_raw(adapter_raw) else {
+                continue;
+            };
+            for oi in 0..8u32 {
+                let mut output_raw: *mut IDXGIOutput = ptr::null_mut();
+                if (*adapter.as_ptr()).EnumOutputs(oi, &mut output_raw) < 0 || output_raw.is_null()
+                {
+                    break;
+                }
+                let Some(output) = ComOwned::from_raw(output_raw) else {
+                    continue;
+                };
+                let mut desc: DXGI_OUTPUT_DESC = std::mem::zeroed();
+                let name = if (*output.as_ptr()).GetDesc(&mut desc) >= 0 {
+                    String::from_utf16_lossy(
+                        &desc.DeviceName[..desc
+                            .DeviceName
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.DeviceName.len())],
+                    )
+                } else {
+                    format!("adapter{ai}/output{oi}")
+                };
+                outputs.push((name, output));
+            }
+        }
+        if outputs.len() < 2 {
+            warn!(
+                "[outphase] 출력이 {} 개다 -- 비교할 것이 없어 프로브를 멈춘다",
+                outputs.len()
+            );
+            return;
+        }
+        warn!("[outphase] 출력 {} 개를 잰다", outputs.len());
+
+        let freq = {
+            let mut f: i64 = 0;
+            if QueryPerformanceFrequency(&mut f as *mut i64 as *mut _) == 0 || f <= 0 {
+                return;
+            }
+            f as f64
+        };
+
+        loop {
+            let mut stamps: Vec<(String, f64)> = Vec::with_capacity(outputs.len());
+            for (name, output) in &outputs {
+                if (*output.as_ptr()).WaitForVBlank() < 0 {
+                    continue;
+                }
+                let mut now: i64 = 0;
+                if QueryPerformanceCounter(&mut now as *mut i64 as *mut _) == 0 {
+                    continue;
+                }
+                stamps.push((name.clone(), now as f64 / freq * 1000.0));
+            }
+            if stamps.len() >= 2 {
+                // 한 바퀴 도는 동안 각 출력을 **한 번씩** 기다렸으므로, i 번째 표본은
+                // 0 번째보다 최소 i 주기만큼 뒤다. 그 정수 주기를 빼야 순수 위상차가 남는다.
+                let period_ms = 1000.0 / 60.0;
+                let base = stamps[0].1;
+                let line = stamps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, t))| {
+                        let raw = t - base - i as f64 * period_ms;
+                        // -0.5 ~ +0.5 주기로 접는다.
+                        let folded = raw - (raw / period_ms).round() * period_ms;
+                        format!("{name}={folded:+.2}ms")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                warn!("OUTPHASE period_ms={period_ms:.3} {line}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+
 fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
         return;
     }
+    // 모니터별 vblank 프로브도 여기서 한 번만 띄운다 -- 같은 게이트, 같은 목적이다.
+    #[cfg(windows)]
+    start_output_vblank_probe();
     let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
     // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
