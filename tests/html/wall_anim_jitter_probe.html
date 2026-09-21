@@ -4,10 +4,17 @@
 <!--
   단순 등속 translateX 로 끊김의 층을 가른다. 네 행이 같은 거리를 다른 시간에 간다:
 
-    A = Element.animate()  1x     (WAAPI, dom_web_animations_enabled 필요)
+    A = Element.animate()  1x     ★네 GPU 영역을 모두 지난다★ (가로 이음매에 걸쳐 있다)
     B = CSS @keyframes     1x     (엔진에 원래 있던 경로)
     C = Element.animate()  1/4x
     D = Element.animate()  1/16x
+
+  ★A 행이 왜 이음매에 걸쳐 있나★ — 벽은 2x2 다(가상 뷰포트 11520x4320, 5760x2160 타일
+  넷). 상단에 쌓인 행은 **위쪽 두 타일만** 지난다. 표출 클럭을 DWM 합성 격자에 스냅한
+  뒤 이 프로브가 10/10 으로 깨끗했는데(log_ani_debug/48), 그것은 2 영역 테스트였다 --
+  output 페이지를 네 영역에 걸치자 저더가 돌아왔다(2026-09-21). 한 패스 안에서 타일
+  넷이 순차로 커밋하므로 뒤쪽 타일일수록 DWM 주기의 늦은 자리에 떨어지는 것이 가설이고,
+  그것을 재현하려면 한 객체가 네 영역을 다 지나야 한다.
 
   ★두 축으로 동시에 가른다.★
 
@@ -50,6 +57,23 @@
   .label { position: absolute; left: 8px; top: 4px; font-size: 20px; color: #7a7a7a; }
   .mover { position: absolute; top: 4vh; left: 0; white-space: nowrap;
            font-size: 6vh; color: #4af; will-change: transform; }
+
+  /* ★A 행은 네 GPU 영역을 모두 지난다.★
+     레이아웃은 2x2 다 -- 가상 뷰포트 11520x4320 에 5760x2160 타일 넷
+     (`wall_layout.multigpu.json`). 그래서 상단에 쌓인 행은 **위쪽 두 타일만** 지난다.
+     격자 스냅 검증에서 10/10 이 나온 것이 바로 그 2 영역 테스트였고, output 페이지가
+     네 영역에 걸치자 저더가 돌아왔다(2026-09-21 실기 보고).
+
+     세로 이음매는 y=2160 = 50vh 다. A 행을 거기에 **걸치게** 두면 한 객체가 위/아래
+     타일을 동시에 지나고, 가로로 80vw(9216px) 이동하면 x=5760 이음매도 넘는다 --
+     즉 이동 중에 네 영역을 모두 통과한다. */
+  .seam { position: absolute; left: 0; right: 0; top: 50vh;
+          transform: translateY(-50%); height: 14vh; }
+  /* 이음매 자체를 그려 둔다. 눈이 "지금 어느 타일에 있나" 를 판단할 기준선이다. */
+  .seam-guide { position: absolute; left: 0; right: 0; top: 50vh; height: 2px;
+                background: #533; }
+  .seam-guide.vertical { left: 50vw; right: auto; top: 0; bottom: 0;
+                         width: 2px; height: auto; }
   #cssMover { color: #fa4; animation: slide var(--dur) linear infinite; }
   @keyframes slide { from { transform: translateX(0); }
                      to   { transform: translateX(var(--travel)); } }
@@ -62,10 +86,19 @@
   .ok { color: #6d6; }
 </style>
 
-<div class="row"><div class="ruler"></div>
-  <div class="label">A · WAAPI · 1x (프레임당 약 38px)</div>
+<!-- 이음매 기준선. 가로 = y 2160(위/아래 타일 경계), 세로 = x 5760(좌/우 경계). -->
+<div class="seam-guide"></div>
+<div class="seam-guide vertical"></div>
+
+<!-- ★A: 네 GPU 영역을 모두 지나는 1x 객체.★ 가로 이음매에 걸쳐 있으므로 한 글자가
+     위/아래 타일에 동시에 걸리고, 80vw 를 이동하며 세로 이음매도 넘는다. 이것이
+     output 페이지에서 저더가 돌아온 조건(네 영역)과 같은 조건이다. -->
+<div class="seam">
+  <div class="ruler"></div>
+  <div class="label">A · WAAPI · 1x · ★네 GPU 영역 통과★ (프레임당 약 38px)</div>
   <div class="mover" id="waapiMover">████ WAAPI 1x ████</div>
 </div>
+
 <div class="row"><div class="ruler"></div>
   <div class="label">B · CSS @keyframes · 1x</div>
   <div class="mover" id="cssMover">████ &nbsp;CSS 1x&nbsp; ████</div>
