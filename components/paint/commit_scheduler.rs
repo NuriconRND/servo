@@ -16,18 +16,26 @@
 //! 짧아야 하며, 그 가정은 `lock_wait_us` 계수가 지켜본다.
 //!
 //! ★이 뮤텍스는 생산 스레드와 무관하지 않다.★ 설계 문서에 그렇게 적혀 있었지만 틀렸다 --
-//! 이것을 잡는 곳은 셋이고, 셋 다 생산·렌더 스레드 위에 있다:
+//! 이것을 잡는 곳은 다섯이고, 스케줄러를 뺀 넷은 전부 생산·렌더·셸 스레드 위에 있다:
 //! 1. 스케줄러 스레드(여기),
 //! 2. 그 타일의 painter 가 `end_frame` 에서(그 painter 는 그 순간 **ANGLE GL 락을 쥐고
 //!    있다** -- `painter.rs` 의 타일 렌더 전체가 그 락 안이다),
-//! 3. 비디오 fast-path `present_external_only`(역시 ANGLE GL 락 안, 타일당 최대 ~60/s).
+//! 3. 비디오 fast-path `present_external_only`(역시 ANGLE GL 락 안, 타일당 최대 ~60/s),
+//! 4. `begin_frame` → `flush_deferred_commit` 의 자기복구 커밋(역시 WR 렌더 경로 안),
+//! 5. 셸 스레드의 즉시 커밋(격자 미확보 폴백, 스케줄러 사망 폴백).
 //!
 //! 즉 이 뮤텍스를 기다리는 쪽은 ANGLE GL 락을 쥔 채로 기다릴 수 있고, 같은 디바이스의
 //! WebGL 스레드가 그 뒤에 줄을 선다. 과거에 한 번 터졌던 회귀 부류다(생산 스레드가 커밋
 //! 대기에 동기화되어 처리량을 잃은 건). 그래서 **기다림의 상한을 `Commit()` 하나(~0.02ms)로
 //! 못 박는다** -- 어느 쪽이든 가드 안에서 하는 일은 `Commit()` 뿐이고, `note_dwm_phase`
-//! (전역 뮤텍스 + DWM 조회 + 로그 I/O)와 위상 기록은 전부 가드 밖으로 뺀다. 그 상한이
-//! 지켜지는지는 `lock_wait_us_max` 가 지켜본다.
+//! (전역 뮤텍스 + DWM 조회)와 실패 로그와 위상 기록은 전부 가드 밖으로 뺀다. 그 상한이
+//! 지켜지는지는 `lock_wait_painter_us_max` 가 지켜본다.
+//!
+//! ★다섯을 하나씩 챙기는 방식은 이미 세 번 실패했다.★ 2·3·5 의 가드 누락이 따로따로
+//! 발견됐다. 그래서 가드를 잡는 책임을 커밋의 정문
+//! (`dcomp_compositor::commit_device_ptr`)으로 옮겼고, `Commit()` 을 실제로 부르는 자리는
+//! 크레이트 전체에서 `dcomp_compositor::raw_commit` 하나뿐이다. 새 커밋 지점은 그 함수를
+//! 지나갈 수밖에 없다.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -64,10 +72,16 @@ pub(crate) struct SchedulerStats {
     pub slip_n: u64,
     pub slip_us_max: u64,
     pub slip_us_sum: u64,
-    /// 디바이스 뮤텍스 대기. ★0 에 가까워야 한다는 위 가정의 검산이다.★
-    pub lock_n: u64,
-    pub lock_wait_us_max: u64,
-    pub lock_wait_us_sum: u64,
+    /// 콘텐츠 쪽이 디바이스 뮤텍스를 기다린 시간. ★Task 6 기준 4 가 읽어야 하는 것이
+    /// 이것이다★ -- 상한이 `Commit()` 하나라는 C3 의 주장을 검산한다.
+    pub lock_painter_n: u64,
+    pub lock_painter_us_max: u64,
+    pub lock_painter_us_sum: u64,
+    /// 스케줄러가 기다린 시간. Ruling 18 때문에 페인터 임계구역이 서피스 루프 전체를
+    /// 포함하므로 설계상 길다 -- 기준 4 와 섞으면 안 된다.
+    pub lock_sched_n: u64,
+    pub lock_sched_us_max: u64,
+    pub lock_sched_us_sum: u64,
 }
 
 struct Shared {
@@ -84,9 +98,12 @@ static IMMEDIATE: AtomicU64 = AtomicU64::new(0);
 static SLIP_N: AtomicU64 = AtomicU64::new(0);
 static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
-static LOCK_N: AtomicU64 = AtomicU64::new(0);
-static LOCK_MAX: AtomicU64 = AtomicU64::new(0);
-static LOCK_SUM: AtomicU64 = AtomicU64::new(0);
+static LOCK_PAINTER_N: AtomicU64 = AtomicU64::new(0);
+static LOCK_PAINTER_MAX: AtomicU64 = AtomicU64::new(0);
+static LOCK_PAINTER_SUM: AtomicU64 = AtomicU64::new(0);
+static LOCK_SCHED_N: AtomicU64 = AtomicU64::new(0);
+static LOCK_SCHED_MAX: AtomicU64 = AtomicU64::new(0);
+static LOCK_SCHED_SUM: AtomicU64 = AtomicU64::new(0);
 
 /// 모니터 -> 이번 창의 위상 표본. `OUTCOMMIT` 이 초당 비운다.
 static PHASES: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
@@ -138,24 +155,50 @@ fn device_lock(device: usize) -> &'static Mutex<()> {
         .or_insert_with(|| &*Box::leak(Box::new(Mutex::new(()))))
 }
 
-/// ★`end_frame` 진입 시 부른다.★ 반환값을 프레임이 끝날 때까지 들고 있는다 -- 스케줄러와
-/// 그 타일의 painter 가 같은 디바이스를 동시에 만지지 못하게 막는 것이 이 가드의 전부다.
-pub(crate) fn device_guard(device: usize) -> std::sync::MutexGuard<'static, ()> {
+/// 이 가드를 잡는 쪽이 누구인가. ★두 역할의 대기 시간은 섞으면 안 된다.★
+///
+/// Task 6 의 기준 4(`lock_wait_us_max < 100µs`)가 뜻하는 것은 **콘텐츠 쪽이 스케줄러의 커밋
+/// 하나를 기다린 시간**이다 -- 그 상한이 `Commit()` 하나라는 것이 C3 의 주장이고, 기준 4 는
+/// 그 주장을 검산한다. 그런데 반대 방향, 즉 스케줄러가 페인터의 `end_frame` 을 기다린 시간은
+/// Ruling 18 때문에 서피스 루프 전체를 포함해 **설계상 훨씬 길다**. 둘을 한 통에 넣으면
+/// 기준 4 는 정상인 벽에서도 실패하고, 그 실패가 무엇을 뜻하는지 아무도 말할 수 없다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GuardRole {
+    /// 콘텐츠 쪽(페인터 스레드의 `end_frame`·비디오 fast-path, 셸 스레드의 즉시 커밋).
+    /// 기준 4 가 읽어야 하는 것은 이 값이다.
+    Painter,
+    /// 커밋 스케줄러 스레드. 이쪽이 긴 것은 페인터가 가드를 오래 쥐었다는 뜻이고,
+    /// `slip` 과 같은 이야기를 한다.
+    Scheduler,
+}
+
+/// ★디바이스를 만지기 직전에 부른다.★ 반환값을 그 작업이 끝날 때까지 들고 있는다 --
+/// 스케줄러와 그 타일의 painter 가 같은 디바이스를 동시에 만지지 못하게 막는 것이 이 가드의
+/// 전부다. `role` 은 대기 시간을 어느 통에 넣을지만 정한다(위 `GuardRole` 참고).
+///
+/// ★재진입 불가다.★ 이미 이 디바이스의 가드를 쥔 채로 다시 부르면 자기 자신과 데드락한다 --
+/// 그래서 커밋 경로는 가드를 잡는 정문(`commit_device_ptr`)과 이미 쥐고 있을 때만 쓰는
+/// `_locked` 변형을 이름으로 갈라 둔다.
+pub(crate) fn device_guard(device: usize, role: GuardRole) -> std::sync::MutexGuard<'static, ()> {
     let lock = device_lock(device);
     let start = qpc_now();
     let held = lock.lock().unwrap_or_else(|e| e.into_inner());
     if let (Some(start), Some(now)) = (start, qpc_now()) {
-        record_lock_wait(now.saturating_sub(start));
+        record_lock_wait(role, now.saturating_sub(start));
     }
     held
 }
 
-fn record_lock_wait(ticks: u64) {
+fn record_lock_wait(role: GuardRole, ticks: u64) {
     let Some(freq) = qpc_frequency() else { return };
     let us = ticks.saturating_mul(1_000_000) / freq.max(1);
-    LOCK_N.fetch_add(1, Ordering::Relaxed);
-    LOCK_SUM.fetch_add(us, Ordering::Relaxed);
-    LOCK_MAX.fetch_max(us, Ordering::Relaxed);
+    let (n, sum, max) = match role {
+        GuardRole::Painter => (&LOCK_PAINTER_N, &LOCK_PAINTER_SUM, &LOCK_PAINTER_MAX),
+        GuardRole::Scheduler => (&LOCK_SCHED_N, &LOCK_SCHED_SUM, &LOCK_SCHED_MAX),
+    };
+    n.fetch_add(1, Ordering::Relaxed);
+    sum.fetch_add(us, Ordering::Relaxed);
+    max.fetch_max(us, Ordering::Relaxed);
 }
 
 /// 이 디바이스의 커밋을 `deadline_qpc` 에 건다. 마감이 이미 지났으면 즉시 커밋된다.
@@ -188,6 +231,11 @@ pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
         // ★위상은 여기서 기록하지 않는다.★ 이 경로는 정렬 기능 자체가 죽었을 때만 타므로
         // "격자 어디에 떨어졌나" 라는 질문이 성립하지 않는다 -- 기록하면 정상적으로
         // 정렬된 표본들의 p50 을 의미 없는 값으로 오염시킨다.
+        //
+        // ★가드는 `commit_device_ptr` 안에서 걸린다.★ 예전엔 이 줄이 가드 없이 커밋했는데,
+        // 이것은 셸 스레드에서 돌고 그 순간 스레드형 페인터가 같은 디바이스의 가드를 쥔
+        // `end_frame` 안에 있을 수 있다 -- 기능이 이미 퇴화한 상태에서 하필 동시 접근이 난다.
+        // 커밋의 정문이 스스로 가드를 잡게 바꾸면서 이 자리도 손대지 않고 안전해졌다.
         crate::dcomp_compositor::commit_device_ptr(device);
         IMMEDIATE.fetch_add(1, Ordering::Relaxed);
         return;
@@ -207,9 +255,12 @@ fn take_stats() -> SchedulerStats {
         slip_n: SLIP_N.swap(0, Ordering::Relaxed),
         slip_us_max: SLIP_MAX.swap(0, Ordering::Relaxed),
         slip_us_sum: SLIP_SUM.swap(0, Ordering::Relaxed),
-        lock_n: LOCK_N.swap(0, Ordering::Relaxed),
-        lock_wait_us_max: LOCK_MAX.swap(0, Ordering::Relaxed),
-        lock_wait_us_sum: LOCK_SUM.swap(0, Ordering::Relaxed),
+        lock_painter_n: LOCK_PAINTER_N.swap(0, Ordering::Relaxed),
+        lock_painter_us_max: LOCK_PAINTER_MAX.swap(0, Ordering::Relaxed),
+        lock_painter_us_sum: LOCK_PAINTER_SUM.swap(0, Ordering::Relaxed),
+        lock_sched_n: LOCK_SCHED_N.swap(0, Ordering::Relaxed),
+        lock_sched_us_max: LOCK_SCHED_MAX.swap(0, Ordering::Relaxed),
+        lock_sched_us_sum: LOCK_SCHED_SUM.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -285,12 +336,17 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             // 뒤에 줄을 선다 -- 생산 스레드가 커밋 대기에 동기화되는 그 회귀다. 그래서
             // `note_dwm_phase`(전역 뮤텍스 + DWM 조회 + 초당 한 번 로그 I/O)를 품은
             // `commit_device_ptr` 대신 순수 커밋만 부르고, 나머지는 전부 가드 밖으로 뺀다.
-            {
-                let _guard = device_guard(device);
-                crate::dcomp_compositor::commit_device_ptr_raw(device);
-            }
-            // 가드를 푼 뒤에 한다. 이 두 줄은 DComp 디바이스를 만지지 않으므로 painter 와
+            //
+            // ★실패 로그도 가드 밖이다.★ TDR·디바이스 제거 뒤에는 모든 커밋이 계속 실패하므로,
+            // 실패 경로에 로그가 들어 있으면 임계구역이 `Commit()` 이 아니라 파일 쓰기 길이가
+            // 된다 -- 그러면 위 상한이 무너진다. `hr` 만 들고 나와 밖에서 찍는다.
+            let hr = {
+                let _guard = device_guard(device, GuardRole::Scheduler);
+                crate::dcomp_compositor::commit_device_ptr_locked(device)
+            };
+            // 가드를 푼 뒤에 한다. 아래 세 줄은 DComp 디바이스를 만지지 않으므로 painter 와
             // 겹쳐도 안전하다.
+            crate::dcomp_compositor::note_commit_failure(hr, "commitsched");
             crate::dcomp_compositor::note_dwm_phase();
 
             // ★이것이 판정이다.★ 이 커밋이 **자기 출력** 격자의 어디에 떨어졌나.
@@ -375,17 +431,25 @@ fn emit_outcommit() {
     // ★평균마다 제 분모를 쓴다.★ 예전에는 셋 다 `scheduled` 로 나눴는데, `scheduled` 에는
     // 스케줄된 적 없는 즉시 커밋까지 들어 있었고 `lock_wait` 표본은 스케줄당 둘이었다 --
     // 모집단이 서로 다른 값을 같은 수로 나누고 있었다는 뜻이다.
+    // ★`lock_wait` 을 획득자 역할로 나눠 낸다.★ Task 6 기준 4 가 읽어야 하는 것은
+    // `lock_wait_painter_us_max` 다 -- 콘텐츠 쪽이 스케줄러의 커밋 하나를 기다린 시간이고,
+    // 그 상한이 `Commit()` 하나라는 주장의 검산이다. `lock_wait_sched_*` 는 반대 방향이라
+    // Ruling 18 의 서피스 루프만큼 길 수 있고, 기준 4 와 섞으면 정상인 벽도 탈락한다.
     warn!(
         "OUTCOMMIT total scheduled={} immediate={} slip_n={} slip_us_max={} slip_us_avg={} \
-         lock_n={} lock_wait_us_max={} lock_wait_us_avg={}",
+         lock_wait_painter_n={} lock_wait_painter_us_max={} lock_wait_painter_us_avg={} \
+         lock_wait_sched_n={} lock_wait_sched_us_max={} lock_wait_sched_us_avg={}",
         stats.scheduled,
         stats.immediate,
         stats.slip_n,
         stats.slip_us_max,
         stats.slip_us_sum / stats.slip_n.max(1),
-        stats.lock_n,
-        stats.lock_wait_us_max,
-        stats.lock_wait_us_sum / stats.lock_n.max(1),
+        stats.lock_painter_n,
+        stats.lock_painter_us_max,
+        stats.lock_painter_us_sum / stats.lock_painter_n.max(1),
+        stats.lock_sched_n,
+        stats.lock_sched_us_max,
+        stats.lock_sched_us_sum / stats.lock_sched_n.max(1),
     );
 }
 
@@ -403,7 +467,41 @@ fn upsert(queue: &mut Vec<(u64, usize, usize)>, device: usize, monitor: usize, d
 
 #[cfg(test)]
 mod tests {
-    use super::upsert;
+    use super::{GuardRole, record_lock_wait, take_stats, upsert};
+
+    /// ★두 역할이 같은 통에 들어가면 Task 6 의 기준 4 가 무의미해진다.★ 기준 4 는 "콘텐츠
+    /// 쪽이 스케줄러의 커밋 하나를 기다린 시간 < 100µs" 를 묻는데, 스케줄러가 페인터의
+    /// `end_frame` 서피스 루프 전체를 기다린 시간은 Ruling 18 때문에 설계상 훨씬 길다. 둘을
+    /// 섞으면 정상인 벽도 탈락하고, 그 탈락이 무엇을 뜻하는지 아무도 말할 수 없다.
+    ///
+    /// 이 테스트는 그 분리를 지킨다 -- 두 역할을 같은 카운터로 되돌리면 실패한다.
+    #[test]
+    fn lock_wait_is_counted_per_acquirer_role() {
+        // 이 스위트에서 이 전역들을 만지는 테스트는 이것뿐이다. 앞선 값이 남아 있을 수 있으니
+        // 먼저 비운다.
+        let _ = take_stats();
+
+        // 틱 단위로 넣는다. 실제 값은 QPC 주파수에 따라 달라지므로 크기 비교만 단언한다.
+        record_lock_wait(GuardRole::Painter, 1_000);
+        record_lock_wait(GuardRole::Scheduler, 1_000_000);
+        record_lock_wait(GuardRole::Scheduler, 2_000_000);
+
+        let stats = take_stats();
+        assert_eq!(stats.lock_painter_n, 1, "페인터 표본은 하나다");
+        assert_eq!(stats.lock_sched_n, 2, "스케줄러 표본은 둘이다");
+        assert!(
+            stats.lock_painter_us_max < stats.lock_sched_us_max,
+            "스케줄러의 긴 대기가 페인터 쪽 최댓값을 오염시키면 안 된다: \
+             painter_max={} sched_max={}",
+            stats.lock_painter_us_max,
+            stats.lock_sched_us_max
+        );
+
+        // 꺼낸 뒤에는 둘 다 0 이어야 한다 -- 창이 1 초라 다음 창으로 새면 안 된다.
+        let drained = take_stats();
+        assert_eq!(drained.lock_painter_n, 0);
+        assert_eq!(drained.lock_sched_n, 0);
+    }
 
     #[test]
     fn a_second_schedule_for_the_same_device_replaces_the_first() {

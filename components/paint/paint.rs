@@ -2939,32 +2939,31 @@ impl Paint {
     /// 격자 폴백 타일들을 **지금** 커밋한다. 병렬 커밋 설정을 그대로 따른다 -- 이 경로는
     /// 정의상 "정렬이 안 걸린 타일" 이므로 정렬이 꺼져 있을 때와 같게 나가야 한다.
     ///
-    /// ★그래도 디바이스 가드를 잡는다.★ 이 폴백이 나오는 바로 그 상황(핫플러그 직후
+    /// ★그래도 디바이스 가드가 걸린다.★ 이 폴백이 나오는 바로 그 상황(핫플러그 직후
     /// `monitor_for_hwnd` 가 새 HMONITOR 를 주는데 `grid_for_monitor` 가 아직 못 채웠다)에서,
     /// 옛 모니터를 향해 이전에 건 스케줄이 이 디바이스에 대해 아직 큐에 남아 있을 수 있다
     /// (최대 두 주기). `schedule()` 은 upsert 라 이 경로가 다시 `schedule()` 을 부르지 않는 한
     /// 그 옛 항목을 밀어내지 못한다 -- 즉 이 즉시 커밋은 스케줄러 스레드와 이 디바이스를 두고
-    /// 겹칠 수 있다. 가드는 `Commit()` 한 줄만 감싸고 `note_dwm_phase` 는 밖에서 부른다
-    /// (`commit_device_ptr_raw` 주석).
+    /// 겹칠 수 있다.
+    ///
+    /// 가드를 여기서 직접 잡지 않는 것에 주의하라: `commit_device_ptr` 이 정문이고 그 안에서
+    /// 잡는다(`dcomp_compositor::raw_commit` 주석). 커밋 지점마다 가드를 따로 챙기는 방식이
+    /// 세 번 새는 바람에 그 책임을 한 곳으로 옮겼다 -- 이 함수가 할 일은 "지금 낸다" 와
+    /// "병렬 설정을 따른다" 뿐이다.
     #[cfg(windows)]
     fn commit_now_guarded(devices: Vec<usize>) {
-        fn commit_one(device: usize) {
-            {
-                let _guard = crate::commit_scheduler::device_guard(device);
-                crate::dcomp_compositor::commit_device_ptr_raw(device);
-            }
-            crate::dcomp_compositor::note_dwm_phase();
-        }
         if devices.len() > 1 && servo_config::pref!(gfx_dcomp_parallel_commit) {
             std::thread::scope(|scope| {
                 for device in devices {
-                    scope.spawn(move || commit_one(device));
+                    scope.spawn(move || {
+                        crate::dcomp_compositor::commit_device_ptr(device);
+                    });
                 }
             });
             return;
         }
         for device in devices {
-            commit_one(device);
+            crate::dcomp_compositor::commit_device_ptr(device);
         }
     }
 

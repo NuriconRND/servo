@@ -1654,33 +1654,87 @@ pub(crate) fn note_dwm_phase() {
     );
 }
 
-/// `Commit()` 과 실패 로그만. ★디바이스 뮤텍스 안에서 부를 수 있는 유일한 형태다.★
-/// `commit_device_ptr` 은 뒤이어 `note_dwm_phase`(전역 `DWM_PHASE` 뮤텍스 + DWM 조회 + 초당
-/// 한 번 로그 I/O)를 부르는데, 그것까지 가드 안에서 돌면 그 뮤텍스를 기다리는 쪽 -- ANGLE GL
-/// 락을 쥔 painter 와 비디오 fast-path -- 의 대기 상한이 커밋 하나를 넘어선다
-/// (`commit_scheduler` 모듈 주석).
+/// ★이 크레이트에서 `IDCompositionDevice::Commit()` 을 실제로 부르는 **유일한** 자리다.★
 ///
-/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
-/// 만지는 다른 스레드가 없어야 한다(호출자가 join 또는 디바이스 가드로 보장).
-pub fn commit_device_ptr_raw(device: usize) -> bool {
-    let device = device as *mut IDCompositionDevice;
-    let hr = unsafe { (*device).Commit() };
-    if hr < 0 {
-        warn!(
-            "[dcomp-native] parallel Commit failed (hr=0x{:08x})",
-            hr as u32
-        );
-        return false;
-    }
-    true
+/// 가드 없는 커밋이 이 브랜치에서 세 번 따로 발견됐다 -- `present_external_only`(라운드 1),
+/// 죽은 스케줄러 폴백, 그리고 `begin_frame` → `flush_deferred_commit` → `commit_device`.
+/// 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로 모은다. 새 커밋 지점을
+/// 만들려면 이 함수를 지나갈 수밖에 없고, 그러면 "가드는?" 이라는 질문을 그 자리에서 하게
+/// 된다. 이 파일 밖에서 `(*device).Commit()` 을 직접 쓰면 그 질문을 건너뛰는 것이다.
+///
+/// 정문은 둘뿐이다: 가드 밖이면 [`commit_device_ptr`](가드를 스스로 잡는다), 이미 쥐고
+/// 있으면 [`commit_device_ptr_locked`].
+///
+/// Safety: 살아 있는 `IDCompositionDevice` 포인터여야 한다.
+#[inline]
+unsafe fn raw_commit(device: *mut IDCompositionDevice) -> i32 {
+    // 이 파일은 `unsafe_op_in_unsafe_fn` 을 끄지 않으므로 `unsafe fn` 안에서도 블록이 필요하다.
+    unsafe { (*device).Commit() }
 }
 
-/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
-/// 만지는 다른 스레드가 없어야 한다(호출자가 join 으로 보장). 디바이스마다 서로 다르다.
+/// 커밋 실패를 **초당 한 번**만 알린다. ★반드시 디바이스 가드 밖에서 부른다.★
+///
+/// TDR·디바이스 제거 뒤에는 그 디바이스의 모든 커밋이 계속 실패한다. 제한 없이 찍으면
+/// 디바이스당 초당 60 번의 파일 쓰기가 되고, 그것이 임계구역 안이라면 ANGLE 락을 쥔 페인터의
+/// 대기 상한이 `Commit()`(~0.02ms)이 아니라 **로그 쓰기**가 된다 -- C3 이 세우려던 상한이
+/// 정확히 그 순간 무너진다. 그래서 커밋 함수들은 `hr` 만 돌려주고 로그는 여기로 모은다.
+///
+/// 제한 창은 전역 하나다. 실패가 여러 자리에서 동시에 나면 한 자리만 찍히므로 `site` 로
+/// 어디였는지는 남긴다 -- 어느 쪽이든 "커밋이 실패하고 있다" 가 전달되면 목적을 다한다.
+pub(crate) fn note_commit_failure(hr: i32, site: &str) {
+    if hr >= 0 {
+        return;
+    }
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else { return };
+    let now = std::time::Instant::now();
+    let due = match *last {
+        Some(at) => now.duration_since(at) >= std::time::Duration::from_secs(1),
+        None => true,
+    };
+    if !due {
+        return;
+    }
+    *last = Some(now);
+    warn!("[dcomp-native] {site}: Commit failed (hr=0x{:08x})", hr as u32);
+}
+
+/// 가드를 **이 함수가 잡는다.** 가드 밖에서 커밋하는 모든 자리의 정문이다.
+///
+/// 정렬 pref 가 꺼져 있으면 가드가 아예 만들어지지 않으므로 off 경로의 동작은 예전과 같다.
+/// 켜져 있으면, 이 함수를 부르는 것만으로 스케줄러와의 동시 접근이 막힌다 -- 호출처가 그
+/// 사실을 알 필요가 없다는 것이 이 구조의 전부다.
+///
+/// ★이미 그 디바이스의 가드를 쥐고 있다면 이것을 부르면 안 된다★ -- `device_guard` 는 재진입
+/// 불가라 자기 자신과 데드락한다. 그 경우는 [`commit_device_ptr_locked`] 를 쓴다.
+///
+/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
 pub fn commit_device_ptr(device: usize) -> bool {
-    let committed = commit_device_ptr_raw(device);
+    let hr = {
+        let _guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+            crate::commit_scheduler::device_guard(
+                device,
+                crate::commit_scheduler::GuardRole::Painter,
+            )
+        });
+        // Safety: 위 계약.
+        unsafe { raw_commit(device as *mut IDCompositionDevice) }
+    };
+    note_commit_failure(hr, "commit_device_ptr");
     note_dwm_phase();
-    committed
+    hr >= 0
+}
+
+/// 호출자가 **이미 그 디바이스의 가드를 쥐고 있을 때만** 부른다. 이름의 `_locked` 가 그
+/// 계약이다.
+///
+/// `hr` 을 그대로 돌려주고 아무 로그도 찍지 않는다 -- 호출자가 가드를 푼 뒤
+/// [`note_commit_failure`] 로 찍어야 임계구역이 `Commit()` 하나로 유지된다.
+///
+/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
+pub fn commit_device_ptr_locked(device: usize) -> i32 {
+    // Safety: 위 계약.
+    unsafe { raw_commit(device as *mut IDCompositionDevice) }
 }
 
 pub fn maybe_create(
@@ -2486,24 +2540,51 @@ impl DCompNativeCompositor {
         }
         self.commit_pending = false;
         if let Some(device) = self.dcomp_device_ptr() {
-            self.commit_device(device);
+            self.commit_device_guarded(device);
         }
     }
 
-    /// DWM 반영을 요청한다. 계측은 미루든 말든 같은 카운터에 쌓이므로, `deferred_commits` 와
-    /// 함께 보면 "미뤘는데도 총 시간이 그대로인지" 가 바로 읽힌다.
-    fn commit_device(&mut self, dcomp_device: *mut IDCompositionDevice) {
+    /// DWM 반영을 요청한다. ★호출자가 **이미** 이 디바이스의 가드를 쥐고 있어야 한다★ --
+    /// 지금은 `end_frame` 하나뿐이고, 그쪽은 서피스 작업과 Commit 을 한 임계구역에 묶어야
+    /// 하므로(Ruling 18) 가드를 여기서 잡을 수 없다.
+    ///
+    /// `hr` 을 돌려주는 이유: 실패 로그는 호출자가 가드를 푼 뒤에 찍어야 한다
+    /// (`note_commit_failure` 주석).
+    ///
+    /// 계측은 미루든 말든 같은 카운터에 쌓이므로, `deferred_commits` 와 함께 보면 "미뤘는데도
+    /// 총 시간이 그대로인지" 가 바로 읽힌다.
+    fn commit_device_locked(&mut self, dcomp_device: *mut IDCompositionDevice) -> i32 {
         let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
-        let hr = unsafe { (*dcomp_device).Commit() };
-        if hr < 0 {
-            warn!("[dcomp-native] Commit failed (hr=0x{:08x})", hr as u32);
-        }
+        let hr = unsafe { raw_commit(dcomp_device) };
         if let Some(start) = commit_start {
             let elapsed = start.elapsed().as_nanos() as u64;
             self.bind_profile.commit_ns += elapsed;
             self.bind_profile.commit_ns_max = self.bind_profile.commit_ns_max.max(elapsed);
         }
+        hr
+    }
+
+    /// 가드를 **여기서 잡고** 커밋한다. `end_frame` **밖에서** 미뤄 둔 커밋을 흘리는 자리가
+    /// 쓴다.
+    ///
+    /// ★이 경로가 라운드 2 의 Critical 이었다★ -- `begin_frame` 이 매 프레임
+    /// `flush_deferred_commit()` 을 부르는데(셸이 flush 를 안 부르는 servoshell 에서도 화면이
+    /// 멈추지 않게 하는 자기복구), 그것이 가드 없이 맨 Commit 으로 내려갔다. 페인터의
+    /// `commit_pending` 이 셸의 flush 를 넘겨 살아남으면(`take_pending_commit` 왕복이 `None` 을
+    /// 주거나 한 패스에서 그 페인터가 두 번 렌더하면) 다음 프레임의 이 호출이 스케줄러가 바로
+    /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
+    fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice) {
+        let hr = {
+            let _guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+                crate::commit_scheduler::device_guard(
+                    dcomp_device as usize,
+                    crate::commit_scheduler::GuardRole::Painter,
+                )
+            });
+            self.commit_device_locked(dcomp_device)
+        };
+        note_commit_failure(hr, "flush_deferred_commit");
         if *DCOMP_BIND_PROF {
             note_dwm_phase();
         }
@@ -2648,17 +2729,19 @@ impl DCompNativeCompositor {
             // 뜨지 않아 겨룰 상대가 없고, 상대 없는 락을 여기서 잡는 비용만 남는다.
             //
             // 가드는 `Commit()` 한 줄만 감싼다. 위의 external 배치 작업은 DComp 디바이스가
-            // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다.
-            let _commit_guard = (*crate::commit_scheduler::ALIGN_PCT)
-                .map(|_| crate::commit_scheduler::device_guard(dcomp_device as usize));
-            // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
-            let hr = unsafe { (*dcomp_device).Commit() };
-            if hr < 0 {
-                warn!(
-                    "[dcomp-native] present_external_only Commit failed (hr=0x{:08x})",
-                    hr as u32
-                );
-            }
+            // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다. 실패 로그도 가드를 푼 뒤에
+            // 찍는다(`note_commit_failure` 주석).
+            let hr = {
+                let _commit_guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+                    crate::commit_scheduler::device_guard(
+                        dcomp_device as usize,
+                        crate::commit_scheduler::GuardRole::Painter,
+                    )
+                });
+                // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
+                unsafe { raw_commit(dcomp_device) }
+            };
+            note_commit_failure(hr, "present_external_only");
         }
     }
 
@@ -3592,8 +3675,12 @@ impl Compositor for DCompNativeCompositor {
         // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
         #[cfg(windows)]
         let commit_guard = (*crate::commit_scheduler::ALIGN_PCT).and_then(|_| {
-            self.dcomp_device_ptr()
-                .map(|device| crate::commit_scheduler::device_guard(device as usize))
+            self.dcomp_device_ptr().map(|device| {
+                crate::commit_scheduler::device_guard(
+                    device as usize,
+                    crate::commit_scheduler::GuardRole::Painter,
+                )
+            })
         });
 
         let mode = storage_mode();
@@ -4201,14 +4288,18 @@ impl Compositor for DCompNativeCompositor {
         // 2~4 가 렌더하는 동안 진행되어 첫 Commit 이 즉시 돌아와야 한다. 패스 시간이 줄면
         // 그 대기는 겹칠 수 있다는 뜻이고, 그대로면 DWM 이 직렬화한다는 뜻이라 타일 병렬화도
         // 캔버스 승격도 전제가 무너진다 — 스레드를 만들지 않고 그 답을 얻는 것이 목적이다.
-        if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
-            self.commit_device(dcomp_device);
+        // 커밋 자체는 가드 안에서 하고, **로그와 DWM 위상 채집은 가드를 푼 뒤에** 한다.
+        // 임계구역에 남는 것은 `Commit()` 하나뿐이어야 한다는 원칙(C3, R5)을 여기서도 지킨다 --
+        // 특히 실패 로그는 TDR 뒤에 매 프레임 찍히므로 가드 안에 두면 안 된다.
+        let commit_hr = if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
+            Some(self.commit_device_locked(dcomp_device))
         } else {
             self.commit_pending = true;
             if *DCOMP_BIND_PROF {
                 self.bind_profile.deferred_commits += 1;
             }
-        }
+            None
+        };
         // ★가드는 여기서 끝난다.★ 이 디바이스의 서피스 작업과 Commit 은 바로 위에서 끝났다 --
         // 여기부터 함수 끝까지는 BindProfile/esc_prof 카운터 갱신과 로그뿐이고 DComp 디바이스나
         // 서피스를 다시 만지지 않는다(검증됨: dcomp_device_ptr/commit_device/BeginDraw/EndDraw/
@@ -4217,6 +4308,12 @@ impl Compositor for DCompNativeCompositor {
         // 커밋 경합이 아니라 로그 I/O 시간을 재게 된다.
         #[cfg(windows)]
         drop(commit_guard);
+        if let Some(hr) = commit_hr {
+            note_commit_failure(hr, "end_frame");
+            if *DCOMP_BIND_PROF {
+                note_dwm_phase();
+            }
+        }
         if let Some(start) = end_frame_start {
             self.bind_profile.end_frames += 1;
             self.bind_profile.end_frame_ns += start.elapsed().as_nanos() as u64;
