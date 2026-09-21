@@ -2870,47 +2870,40 @@ impl Paint {
         });
     }
 
-}
+    /// 이 모니터의 다음 목표 커밋 시각(QPC). 격자가 없거나 너무 묵었으면 `None` -- 호출자는
+    /// 즉시 커밋으로 폴백한다.
+    ///
+    /// `deadline = vblank + k*period + target` 에서 `k` 는 마감이 미래가 되는 최소 정수다.
+    /// ★매번 측정된 vblank 로부터 다시 센다.★ 자유 구동 기준점에 상수를 더하면 기준점이 매
+    /// 실행 임의라 결과도 임의다(선행 설계 §5-10 의 교훈).
+    #[cfg(windows)]
+    fn deadline_for_monitor(monitor: usize) -> Option<u64> {
+        let pct = servo_config::pref!(gfx_present_align_per_output_pct).clamp(0, 99) as u64;
+        let grid = crate::output_grid::grid_for_monitor(monitor)?;
+        let now = crate::output_grid::qpc_now()?;
+        if grid.period_qpc == 0 {
+            return None;
+        }
+        // 격자가 60 주기(60Hz 면 1 초)보다 묵었으면 프로브가 정체한 것이다. 옛 격자로
+        // 스케줄하는 것보다 즉시 커밋이 낫다.
+        if now.saturating_sub(grid.sampled_qpc) > grid.period_qpc.saturating_mul(60) {
+            return None;
+        }
+        let target = grid.period_qpc * pct / 100;
+        let base = grid.vblank_qpc.wrapping_add(target);
+        // vblank 는 드라이버에 따라 직전일 수도 다음일 수도 있다. 나머지 연산을 두 번 걸어
+        // 어느 쪽이든 격자 위의 같은 점으로 접는다.
+        let period = grid.period_qpc as i128;
+        let delta = now as i128 - base as i128;
+        let mut ahead = period - (((delta % period) + period) % period);
+        // 지금과 너무 가까우면 한 칸 뒤로 -- 렌더가 끝난 직후라 커밋할 틈은 있지만, 스케줄러가
+        // 깨어나기도 전에 지나간 마감은 즉시 커밋이 되어 정렬이 무의미해진다.
+        if ahead < period / 8 {
+            ahead += period;
+        }
+        Some(now.wrapping_add(ahead as u64))
+    }
 
-/// 이 모니터의 다음 목표 커밋 시각(QPC). 격자가 없거나 너무 묵었으면 `None` -- 호출자는
-/// 즉시 커밋으로 폴백한다.
-///
-/// `deadline = vblank + k*period + target` 에서 `k` 는 마감이 미래가 되는 최소 정수다.
-/// ★매번 측정된 vblank 로부터 다시 센다.★ 자유 구동 기준점에 상수를 더하면 기준점이 매
-/// 실행 임의라 결과도 임의다(선행 설계 §5-10 의 교훈).
-///
-/// 자유 함수인 이유: `impl Paint` 메서드끼리는 이름만으로 서로를 못 부른다(연관 함수는
-/// `Self::` 로만 부를 수 있다) -- 아래 `flush_deferred_dcomp_commits` 가 `Self::` 없이
-/// 그냥 이름으로 부르므로, 여기서 `impl Paint` 를 한 번 닫고 다시 연다.
-#[cfg(windows)]
-fn deadline_for_monitor(monitor: usize) -> Option<u64> {
-    let pct = servo_config::pref!(gfx_present_align_per_output_pct).clamp(0, 99) as u64;
-    let grid = crate::output_grid::grid_for_monitor(monitor)?;
-    let now = crate::output_grid::qpc_now()?;
-    if grid.period_qpc == 0 {
-        return None;
-    }
-    // 격자가 60 주기(60Hz 면 1 초)보다 묵었으면 프로브가 정체한 것이다. 옛 격자로
-    // 스케줄하는 것보다 즉시 커밋이 낫다.
-    if now.saturating_sub(grid.sampled_qpc) > grid.period_qpc.saturating_mul(60) {
-        return None;
-    }
-    let target = grid.period_qpc * pct / 100;
-    let base = grid.vblank_qpc.wrapping_add(target);
-    // vblank 는 드라이버에 따라 직전일 수도 다음일 수도 있다. 나머지 연산을 두 번 걸어
-    // 어느 쪽이든 격자 위의 같은 점으로 접는다.
-    let period = grid.period_qpc as i128;
-    let delta = now as i128 - base as i128;
-    let mut ahead = period - (((delta % period) + period) % period);
-    // 지금과 너무 가까우면 한 칸 뒤로 -- 렌더가 끝난 직후라 커밋할 틈은 있지만, 스케줄러가
-    // 깨어나기도 전에 지나간 마감은 즉시 커밋이 되어 정렬이 무의미해진다.
-    if ahead < period / 8 {
-        ahead += period;
-    }
-    Some(now.wrapping_add(ahead as u64))
-}
-
-impl Paint {
     /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
     ///
     /// 셸이 타일 루프를 마친 뒤 한 번 부른다. 목적은 render→commit 을 네 번 번갈아 도는
@@ -2949,7 +2942,7 @@ impl Paint {
                     let Some((device, monitor)) = pending else {
                         continue;
                     };
-                    match monitor.and_then(deadline_for_monitor) {
+                    match monitor.and_then(Self::deadline_for_monitor) {
                         Some(deadline) => crate::commit_scheduler::schedule(device, deadline),
                         None => {
                             // 격자를 못 구하면 지금 낸다 = 오늘 동작. 나빠지지 않는다.

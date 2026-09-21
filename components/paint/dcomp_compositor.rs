@@ -3496,10 +3496,23 @@ impl Compositor for DCompNativeCompositor {
         // **나중에** 커밋하므로 그 보장이 사라진다. 정상 부하에서는 겹치지 않지만
         // (최대 지연 11.2ms < 주기 16.67ms) "정상 부하에서는" 은 보장이 아니다.
         // 경합은 드물고 짧아야 하며(커밋 0.02ms), 그 가정은 OUTCOMMIT 의 lock_wait 이 잰다.
+        //
+        // ★pref 로 게이트한다.★ 이 가드가 막는 위험은 스케줄러가 나중에 커밋하는 경우에만
+        // 존재한다 -- pref 가 꺼져 있으면(기본 `-1`) `flush_deferred_dcomp_commits` 가
+        // `schedule()` 를 아예 안 부르므로 스케줄러 스레드조차 뜨지 않고, 이 뮤텍스를 놓고
+        // 겨룰 상대가 없다. 상대가 없는 락을 매 프레임 잡는 비용만 남는 것은 "꺼져 있으면
+        // 오늘과 같다" 는 이 작업 전체의 전제와 어긋난다. `flush_deferred_dcomp_commits` 와
+        // 같은 조건식을 쓰는 것이 안전한 이유: 이 pref 는 커맨드라인에서 시작 시 한 번만
+        // 정해지고 이 셸의 무엇도 실행 중에 바꾸지 않으므로, 두 지점이 같은 실행 안에서
+        // 서로 다른 값을 볼 수 없다 -- 경합의 여지가 없다.
         #[cfg(windows)]
-        let _device_guard = self
-            .dcomp_device_ptr()
-            .map(|device| crate::commit_scheduler::device_guard(device as usize));
+        let _device_guard =
+            if (0..=99).contains(&servo_config::pref!(gfx_present_align_per_output_pct)) {
+                self.dcomp_device_ptr()
+                    .map(|device| crate::commit_scheduler::device_guard(device as usize))
+            } else {
+                None
+            };
 
         // 방어: 정상 경로는 start_compositing이 이미 배치를 닫았다(no-op). 혹시 열려 있으면
         // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
