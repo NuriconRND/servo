@@ -3649,6 +3649,17 @@ impl Painter {
         });
     }
 
+    /// 이 painter 의 창이 올라가 있는 모니터(`HMONITOR`).
+    ///
+    /// ★매번 다시 묻는다.★ 디스플레이 구성이 바뀌면 `HMONITOR` 가 달라지므로 기동 시 한 번
+    /// 캐시하면 핫플러그 뒤에 조용히 틀린 격자로 스케줄한다. `MonitorFromWindow` 는 API 한
+    /// 번이라 프레임당 호출해도 비용이 없다.
+    #[cfg(windows)]
+    pub(crate) fn pending_dcomp_commit_monitor(&self) -> Option<usize> {
+        let hwnd = self.rendering_context.window_hwnd()?;
+        crate::output_grid::monitor_for_hwnd(hwnd)
+    }
+
     /// 미뤄 둔 DComp Commit 의 디바이스를 인계한다(병렬 Commit 용). 인계했으면 이 painter 는
     /// 그 프레임의 Commit 을 더 이상 책임지지 않는다.
     pub(crate) fn take_pending_dcomp_commit(&self) -> Option<usize> {

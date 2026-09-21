@@ -3491,6 +3491,16 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn end_frame(&mut self, device: &mut Device) {
+        // ★스케줄러와 같은 디바이스를 동시에 만지지 않는다.★ 지금의 parallel_commit 은
+        // `thread::scope` 의 join 으로 "돌아올 때 워커가 없다" 를 보장하는데, 커밋 스케줄러는
+        // **나중에** 커밋하므로 그 보장이 사라진다. 정상 부하에서는 겹치지 않지만
+        // (최대 지연 11.2ms < 주기 16.67ms) "정상 부하에서는" 은 보장이 아니다.
+        // 경합은 드물고 짧아야 하며(커밋 0.02ms), 그 가정은 OUTCOMMIT 의 lock_wait 이 잰다.
+        #[cfg(windows)]
+        let _device_guard = self
+            .dcomp_device_ptr()
+            .map(|device| crate::commit_scheduler::device_guard(device as usize));
+
         // 방어: 정상 경로는 start_compositing이 이미 배치를 닫았다(no-op). 혹시 열려 있으면
         // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
         // 돌면 ANGLE 상태가 어긋난다(close_external_batch/begin_batch 주석).
