@@ -592,6 +592,14 @@ if ($DcompParallelCommit -and $DComp -eq "off") {
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
 }
+# Per-output alignment schedules the deferred Commit onto that tile's own vblank grid. There is
+# nothing to schedule if the Commit already went out inside end_frame: -DcompCommitInFrame issues
+# it there, so flush_deferred_dcomp_commits finds no pending commit and the alignment branch never
+# runs. The pairing produces a run that looks aligned on the command line and is not aligned at
+# all -- the same failure shape as the -DcompParallelCommit pairing just above.
+if ($PerOutputAlign -ge 0 -and $DcompCommitInFrame) {
+    throw "-PerOutputAlign $PerOutputAlign needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to schedule."
+}
 
 $serveRoot = Join-Path $here "pages\html"
 $httpServer = $null

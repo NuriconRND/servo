@@ -2878,7 +2878,9 @@ impl Paint {
     /// 실행 임의라 결과도 임의다(선행 설계 §5-10 의 교훈).
     #[cfg(windows)]
     fn deadline_for_monitor(monitor: usize) -> Option<u64> {
-        let pct = servo_config::pref!(gfx_present_align_per_output_pct).clamp(0, 99) as u64;
+        // 캐시된 값이다 -- `pref!` 는 RwLock 획득이고 이 함수는 타일마다 매 프레임 돈다
+        // (`commit_scheduler::ALIGN_PCT` 주석).
+        let pct = (*crate::commit_scheduler::ALIGN_PCT)?;
         let grid = crate::output_grid::grid_for_monitor(monitor)?;
         let now = crate::output_grid::qpc_now()?;
         if grid.period_qpc == 0 {
@@ -2904,6 +2906,68 @@ impl Paint {
         Some(now.wrapping_add(ahead as u64))
     }
 
+    /// 격자를 못 구해 즉시 커밋으로 떨어진 타일 수를 세고, 초당 한 번 알린다.
+    ///
+    /// ★once-warn 이 아니라 지속 카운터다.★ 이 폴백은 기동 직후 프로브가 첫 바퀴를 돌기
+    /// 전까지는 정상이지만, 핫플러그 뒤 새 HMONITOR 가 영영 격자를 못 받으면 **영구**가 된다.
+    /// 그 둘은 "한 번 났다" 로는 구분되지 않고, 초당 카운트가 계속 찍히느냐로만 구분된다.
+    /// 조용히 폴백하면 정렬이 아무 일도 안 하는 채로 벽이 계속 돌고 아무도 모른다.
+    #[cfg(windows)]
+    fn note_grid_fallback(count: u64) {
+        static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+        static LAST_WARN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        FALLBACKS.fetch_add(count, Ordering::Relaxed);
+        let Ok(mut last) = LAST_WARN.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let due = match *last {
+            Some(at) => now.duration_since(at) >= Duration::from_secs(1),
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        *last = Some(now);
+        let taken = FALLBACKS.swap(0, Ordering::Relaxed);
+        warn!(
+            "[commitsched] 출력 격자를 못 구해 즉시 커밋으로 폴백한 타일 {taken} 건/초 -- \
+             정렬이 이 타일들에는 걸리지 않는다. [outgrid] 줄과 OUTPHASE 를 보라"
+        );
+    }
+
+    /// 격자 폴백 타일들을 **지금** 커밋한다. 병렬 커밋 설정을 그대로 따른다 -- 이 경로는
+    /// 정의상 "정렬이 안 걸린 타일" 이므로 정렬이 꺼져 있을 때와 같게 나가야 한다.
+    ///
+    /// ★그래도 디바이스 가드를 잡는다.★ 이 폴백이 나오는 바로 그 상황(핫플러그 직후
+    /// `monitor_for_hwnd` 가 새 HMONITOR 를 주는데 `grid_for_monitor` 가 아직 못 채웠다)에서,
+    /// 옛 모니터를 향해 이전에 건 스케줄이 이 디바이스에 대해 아직 큐에 남아 있을 수 있다
+    /// (최대 두 주기). `schedule()` 은 upsert 라 이 경로가 다시 `schedule()` 을 부르지 않는 한
+    /// 그 옛 항목을 밀어내지 못한다 -- 즉 이 즉시 커밋은 스케줄러 스레드와 이 디바이스를 두고
+    /// 겹칠 수 있다. 가드는 `Commit()` 한 줄만 감싸고 `note_dwm_phase` 는 밖에서 부른다
+    /// (`commit_device_ptr_raw` 주석).
+    #[cfg(windows)]
+    fn commit_now_guarded(devices: Vec<usize>) {
+        fn commit_one(device: usize) {
+            {
+                let _guard = crate::commit_scheduler::device_guard(device);
+                crate::dcomp_compositor::commit_device_ptr_raw(device);
+            }
+            crate::dcomp_compositor::note_dwm_phase();
+        }
+        if devices.len() > 1 && servo_config::pref!(gfx_dcomp_parallel_commit) {
+            std::thread::scope(|scope| {
+                for device in devices {
+                    scope.spawn(move || commit_one(device));
+                }
+            });
+            return;
+        }
+        for device in devices {
+            commit_one(device);
+        }
+    }
+
     /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
     ///
     /// 셸이 타일 루프를 마친 뒤 한 번 부른다. 목적은 render→commit 을 네 번 번갈아 도는
@@ -2918,50 +2982,51 @@ impl Paint {
         // 이 함수는 메인(또는 스레드된 painter 로의 왕복)에서 도므로 여기서 기다리면
         // 그대로 패스가 길어진다.
         #[cfg(windows)]
-        {
-            let pct = servo_config::pref!(gfx_present_align_per_output_pct);
-            if (0..=99).contains(&pct) {
-                if servo_config::pref!(gfx_dcomp_parallel_commit) {
-                    static WARNED: std::sync::Once = std::sync::Once::new();
-                    WARNED.call_once(|| {
-                        warn!(
-                            "[commitsched] gfx_present_align_per_output_pct 가 켜져 있어 \
-                             gfx_dcomp_parallel_commit 을 무시한다 -- 목적이 겹친다"
-                        );
-                    });
-                }
-                for painter_id in self.painter_ids() {
-                    let pending = self
-                        .with_painter(painter_id, |painter| {
-                            painter
-                                .take_pending_dcomp_commit()
-                                .map(|device| (device, painter.pending_dcomp_commit_monitor()))
-                        })
-                        .flatten();
-                    let Some((device, monitor)) = pending else {
-                        continue;
-                    };
-                    match monitor.and_then(|m| Self::deadline_for_monitor(m).map(|d| (m, d))) {
-                        Some((monitor, deadline)) => {
-                            crate::commit_scheduler::schedule(device, monitor, deadline)
-                        },
-                        None => {
-                            // 격자를 못 구하면 지금 낸다 = 오늘 동작. 나빠지지 않는다.
-                            //
-                            // ★그래도 가드를 잡는다.★ 이 폴백이 나오는 바로 그 상황(핫플러그
-                            // 직후 monitor_for_hwnd 가 새 HMONITOR 를 주는데 grid_for_monitor
-                            // 가 아직 못 채웠다)에서, 옛 모니터를 향해 이전에 건 스케줄이 이
-                            // 디바이스에 대해 아직 큐에 남아 있을 수 있다(최대 두 주기).
-                            // schedule() 은 upsert 라 이 경로가 다시 schedule() 을 부르지
-                            // 않는 한 그 옛 항목을 밀어내지 못한다 -- 즉 이 즉시 커밋은
-                            // 스케줄러 스레드와 이 디바이스를 두고 겹칠 수 있다.
-                            let _guard = crate::commit_scheduler::device_guard(device);
-                            crate::dcomp_compositor::commit_device_ptr(device);
-                        },
-                    }
-                }
-                return;
+        if crate::commit_scheduler::ALIGN_PCT.is_some() {
+            // ★프로브는 이 기능이 켜지면 뜬다.★ 예전에는 유일한 호출처가 `note_dwm_phase`
+            // 안이었고 그 함수는 `SERVO_DCOMP_BIND_PROF` 뒤에서 시작한다 -- 즉 진단 플래그
+            // 없이 `-PerOutputAlign` 만 준 운영 구성에서는 격자가 영영 비어 전 타일이 매
+            // 프레임 즉시 커밋 폴백을 탔고, 그 사실을 알리는 로그조차 없었다. `start_probe`
+            // 는 `Once` 라 여러 곳에서 불러도 스레드는 하나다.
+            crate::output_grid::start_probe();
+            if servo_config::pref!(gfx_dcomp_parallel_commit) {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    warn!(
+                        "[commitsched] gfx_present_align_per_output_pct 가 켜져 있어 \
+                         gfx_dcomp_parallel_commit 을 (스케줄 경로에서) 무시한다 -- \
+                         목적이 겹친다. 격자 미확보 폴백은 여전히 그 설정을 따른다"
+                    );
+                });
             }
+            // 격자를 못 구한 타일들. ★모아서 기존 병렬 경로로 흘린다★ -- 예전에는 여기서
+            // 타일마다 그 자리에서 커밋했는데, 그러면 병렬 커밋이 켜져 있어도 네 커밋이
+            // 호출 스레드에서 순차로 나가 4×2.44 = 9.8ms 를 물었다. 폴백이 기능 off 보다
+            // 나빠지는 셈이고, "폴백 = 오늘 동작" 이라는 전제가 깨진다.
+            let mut fallback: Vec<usize> = Vec::new();
+            for painter_id in self.painter_ids() {
+                let pending = self
+                    .with_painter(painter_id, |painter| {
+                        painter
+                            .take_pending_dcomp_commit()
+                            .map(|device| (device, painter.pending_dcomp_commit_monitor()))
+                    })
+                    .flatten();
+                let Some((device, monitor)) = pending else {
+                    continue;
+                };
+                match monitor.and_then(|m| Self::deadline_for_monitor(m).map(|d| (m, d))) {
+                    Some((monitor, deadline)) => {
+                        crate::commit_scheduler::schedule(device, monitor, deadline)
+                    },
+                    None => fallback.push(device),
+                }
+            }
+            if !fallback.is_empty() {
+                Self::note_grid_fallback(fallback.len() as u64);
+                Self::commit_now_guarded(fallback);
+            }
+            return;
         }
         // `gfx_dcomp_parallel_commit`: 넷을 동시에 건다.
         //
