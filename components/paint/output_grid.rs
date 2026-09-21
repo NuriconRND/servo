@@ -150,12 +150,42 @@ impl Enumeration {
         }
     }
 
-    /// 구성이 바뀌었나. 팩토리가 없으면(생성 실패) 판단할 근거가 없으므로 거짓으로 둔다 --
-    /// 매 바퀴 재열거를 시도하는 것보다 지금 목록으로 계속 재는 편이 낫다.
+    /// 다시 열거해야 하나. ★"구성이 바뀌었나" 와 "지금 잴 것이 있나" 는 다른 질문이고,
+    /// 둘을 하나로 묶었던 것이 앞선 수정의 결함이었다.★
+    ///
+    /// 예전에는 `!factory.is_null() && IsCurrent() == 0` 만 보았다. 그러면 재열거 도중
+    /// `CreateDXGIFactory1` 이 한 번 실패해 NULL 팩토리 + 빈 목록이 남는 순간, 이 조건이
+    /// **영원히 거짓**이 되어 다시는 열거를 시도하지 않는다 -- 잴 출력도 없으므로 남은 실행
+    /// 내내 전 타일이 폴백한다. 핫플러그 도중의 일시적 실패 하나가 영구 고장이 되는 것이고,
+    /// 그것은 I-9 가 없애려던 바로 그 실패 모양이다.
+    ///
+    /// 그래서 세 경우 모두 재열거를 요구한다: 팩토리가 없거나(직전 시도 실패), 잴 출력이
+    /// 없거나, 팩토리가 구성 변경을 알렸거나. 재시도 폭주는 호출자의 백오프가 막는다.
     ///
     /// Safety: 살아 있는 팩토리이거나 NULL.
-    unsafe fn is_stale(&self) -> bool {
-        !self.factory.is_null() && (*self.factory).IsCurrent() == 0
+    unsafe fn needs_reenumerate(&self) -> bool {
+        self.factory.is_null() || self.outputs.is_empty() || (*self.factory).IsCurrent() == 0
+    }
+
+    /// 열거된 출력 이름들. `announce` 가 목록이 실제로 바뀌었는지 볼 때만 쓴다.
+    fn names(&self) -> Vec<String> {
+        self.outputs.iter().map(|o| o.name.clone()).collect()
+    }
+}
+
+/// 같은 사유의 경고를 **초당 한 번**으로 줄인다.
+///
+/// 구성 변경 과도 상태(팩토리는 살아 있는데 `IsCurrent()` 가 거짓이고 출력이 0)에서는 이
+/// 루프가 백오프 간격마다 돌고, 제한이 없으면 초당 스무 줄까지 나온다. 그 로그는 상황을
+/// 설명하지 않고 덮기만 한다.
+fn throttled(slot: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    match *slot {
+        Some(at) if now.duration_since(at) < Duration::from_secs(1) => false,
+        _ => {
+            *slot = Some(now);
+            true
+        },
     }
 }
 
@@ -170,6 +200,13 @@ impl Enumeration {
 /// 접은 마감은 매 프레임 실제 위상의 다른 자리에 떨어져 정확히 이 작업이 없애려는 저더를
 /// 만든다. 연속 두 vblank 사이에는 정의상 한 주기만 들어가므로 감는 횟수가 개입할 여지가
 /// 없다.
+///
+/// ★남아 있는 한계(고치지 않았다, 기록용).★ 두 대기 사이에 이 스레드가 선점당하면 첫 vblank
+/// 를 놓쳐 `2P` 가 측정될 수 있다. 60Hz 에서 `2P` = 33.3ms 는 30Hz 컷에 걸려 가정값으로
+/// 떨어지므로 이 벽에서는 드러나지 않는다. 그러나 **60Hz 를 넘는 출력에서는 그 `2P` 가
+/// 30~240Hz 창 안에 들어온다** -- 예컨대 120Hz 의 `2P` 는 16.67ms 라 `measured=1` 인 채로
+/// 정확히 절반의 주파수를 발행한다. 혼합 주사율 벽에서 이 격자를 쓰려면 표본을 여러 개 떠
+/// 중앙값을 쓰거나, `2P` 를 걸러낼 일관성 검사가 필요하다.
 fn period_from_pair(t1: u64, t2: u64, freq: u64, assumed: u64) -> (u64, bool) {
     // 역행(t2 < t1)은 있을 수 없는 관측이다 -- QPC 가 뒤로 갔거나 표본이 섞였다는 뜻이라
     // 값 자체를 믿을 수 없다.
@@ -210,36 +247,56 @@ fn probe_loop() {
     // 첫 표본이 나오기 전과, 실측이 말이 안 될 때 쓰는 값. `measured=0` 으로 구분된다.
     let assumed_period = freq / 60;
 
-    // Safety: 전부 COM 생성/열거. 포인터는 이 스레드 안에서만 살고, 재열거·종료 시 해제한다.
-    let mut current = unsafe { enumerate_outputs() };
-    if current.outputs.is_empty() {
-        warn!("[outgrid] 출력을 하나도 찾지 못했다; 전 타일 폴백");
-        // Safety: 방금 만든 팩토리뿐이고 아무도 쓰지 않는다.
-        unsafe { current.release() };
-        return;
-    }
-    announce(&current.outputs);
-    publish_names(&current.outputs);
-
+    // 첫 열거도 루프 안에서 한다 -- 기동 시 실패와 실행 중 실패를 같은 복구 경로가 다루게
+    // 하려는 것이다. 예전에는 기동 열거가 비면 스레드가 그냥 끝나 버렸고, 그러면 나중에
+    // 모니터가 붙어도 프로브가 없다.
+    let mut current = Enumeration {
+        factory: ptr::null_mut(),
+        outputs: Vec::new(),
+    };
+    // 재열거 실패 시의 백오프. 100ms 에서 시작해 2s 까지 배로 늘리고, 성공하면 되돌린다.
+    // 구성 변경 중에는 실패가 연달아 나므로 고정 간격이면 COM 열거와 로그가 같이 폭주한다.
+    const BACKOFF_MIN: Duration = Duration::from_millis(100);
+    const BACKOFF_MAX: Duration = Duration::from_secs(2);
+    let mut backoff = BACKOFF_MIN;
+    let mut announced: Vec<String> = Vec::new();
+    let mut last_reenum_warn: Option<Instant> = None;
+    let mut last_empty_warn: Option<Instant> = None;
     let mut last_outphase = Instant::now();
+
     loop {
         // ★출력을 한 번만 열거하면 핫플러그 뒤 영구 폴백이 된다.★ 모드 변경·핫플러그로
         // 생긴 새 HMONITOR 는 영영 격자를 못 받고, 사라진 HMONITOR 항목은 `GRID` 에 남아
         // 죽은 격자로 마감을 계산하게 한다. 팩토리가 구성 변경을 알려 주므로 한 바퀴에 한 번
         // 물어본다(비용은 API 한 번이다).
         // Safety: 살아 있는 팩토리이거나 NULL.
-        if unsafe { current.is_stale() } {
-            warn!("[outgrid] 디스플레이 구성이 바뀌었다; 출력을 다시 연다");
+        if unsafe { current.needs_reenumerate() } {
+            if throttled(&mut last_reenum_warn) {
+                warn!("[outgrid] 출력 목록을 다시 연다(구성 변경이거나 직전 열거 실패)");
+            }
             // Safety: 이 열거의 포인터는 이 스레드 밖으로 나간 적이 없다.
             unsafe { current.release() };
             // Safety: 위와 같다.
             current = unsafe { enumerate_outputs() };
             if current.outputs.is_empty() {
-                warn!("[outgrid] 재열거에서 출력을 찾지 못했다; 100ms 뒤 다시 본다");
-                std::thread::sleep(Duration::from_millis(100));
+                if throttled(&mut last_empty_warn) {
+                    warn!(
+                        "[outgrid] 잴 출력이 없다; {}ms 뒤 다시 본다(전 타일 폴백 중)",
+                        backoff.as_millis()
+                    );
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
-            announce(&current.outputs);
+            backoff = BACKOFF_MIN;
+            // ★목록이 실제로 바뀌었을 때만 찍는다.★ 과도 상태에서는 재열거가 연달아 돌므로
+            // 무조건 찍으면 같은 네 줄이 초당 여러 번 나온다.
+            let names = current.names();
+            if names != announced {
+                announce(&current.outputs);
+                announced = names;
+            }
             publish_names(&current.outputs);
             forget_vanished(&current.outputs);
         }
@@ -331,19 +388,34 @@ fn forget_vanished(outputs: &[Output]) {
 fn emit_outphase(outputs: &[Output], freq: u64) {
     // 기준은 격자가 있는 첫 출력이다. 열거 첫 출력이 아직(또는 영영) 격자를 못 얻었다고
     // 나머지 셋의 확산까지 못 보게 되면, 정작 그 상태에서 가장 보고 싶은 값을 잃는다.
-    let Some(base) = outputs
-        .iter()
-        .find_map(|out| grid_for_monitor(out.monitor))
-    else {
-        return;
+    let base = outputs.iter().find_map(|out| grid_for_monitor(out.monitor));
+    // 기준으로 삼을 격자가 하나도 없으면 상대 위상이라는 말 자체가 성립하지 않는다. 그래도
+    // ★줄은 낸다★ -- "전부 격자가 없다" 는 이 함수가 아무 것도 안 찍는 것과 구분되어야 하고,
+    // 후자는 프로브가 죽었다는 뜻이라 대처가 다르다.
+    let base = match base.filter(|grid| grid.period_qpc > 0) {
+        Some(base) => base,
+        None => {
+            for out in outputs {
+                warn!(
+                    "OUTPHASE out={} monitor={:#x} grid=none",
+                    out.name, out.monitor
+                );
+            }
+            return;
+        },
     };
-    if base.period_qpc == 0 {
-        return;
-    }
     let period = base.period_qpc as i128;
     let to_ms = |ticks: f64| ticks * 1000.0 / freq as f64;
     for out in outputs {
         let Some(grid) = grid_for_monitor(out.monitor) else {
+            // ★격자가 없는 출력이야말로 운영자가 봐야 할 줄이다.★ 조용히 건너뛰면 그 출력은
+            // `OUTPHASE` 에도 `OUTCOMMIT` 에도(위상 표본이 없으므로) 안 나와서, `[outgrid]`
+            // 열거 목록과 손으로 대조해야만 빠진 것을 알 수 있다. 매초 네 줄이 나오는지 세는
+            // 것만으로 판정이 되게 한다.
+            warn!(
+                "OUTPHASE out={} monitor={:#x} grid=none",
+                out.name, out.monitor
+            );
             continue;
         };
         // 표본은 출력마다 최대 한 바퀴(~83ms)까지 시각이 벌어지지만, 주기로 접으면 그

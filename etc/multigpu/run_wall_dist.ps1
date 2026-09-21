@@ -597,8 +597,19 @@ if ($DcompBindProf -and $DComp -eq "off") {
 # it there, so flush_deferred_dcomp_commits finds no pending commit and the alignment branch never
 # runs. The pairing produces a run that looks aligned on the command line and is not aligned at
 # all -- the same failure shape as the -DcompParallelCommit pairing just above.
-if ($PerOutputAlign -ge 0 -and $DcompCommitInFrame) {
+# The range here must match the engine gate exactly (gfx_present_align_per_output_pct is live for
+# 0..=99 and off otherwise). ValidateRange on the parameter already bounds it to -1..99, so the
+# only value that reaches here with alignment off is -1 -- but spelling the upper bound out keeps
+# this guard honest if that ValidateRange is ever widened, rather than throwing for a combination
+# that is not actually live.
+if ($PerOutputAlign -ge 0 -and $PerOutputAlign -le 99 -and $DcompCommitInFrame) {
     throw "-PerOutputAlign $PerOutputAlign needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to schedule."
+}
+# Out of 0..99 the engine silently treats the pref as off. -1 is the documented way to say that, so
+# say nothing for it; any other out-of-range value is someone expecting alignment and not getting
+# it, and that has to be visible on the console rather than only in a phase log that never appears.
+if ($PerOutputAlign -ne -1 -and ($PerOutputAlign -lt 0 -or $PerOutputAlign -gt 99)) {
+    Write-Warning "-PerOutputAlign $PerOutputAlign is outside 0..99, so the engine treats per-output alignment as OFF. Pass a value in 0..99 to enable it, or -1 to say off deliberately."
 }
 
 $serveRoot = Join-Path $here "pages\html"
