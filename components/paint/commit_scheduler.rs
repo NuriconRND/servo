@@ -67,7 +67,7 @@ fn record_phase(monitor: usize, phase: f64) {
 }
 
 /// 모니터별 위상 표본을 꺼내 비운다.
-pub(crate) fn take_phases() -> Vec<(usize, Vec<f64>)> {
+fn take_phases() -> Vec<(usize, Vec<f64>)> {
     let Ok(mut guard) = PHASES.lock() else {
         return Vec::new();
     };
@@ -164,7 +164,7 @@ pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
     shared.condvar.notify_one();
 }
 
-pub(crate) fn take_stats() -> SchedulerStats {
+fn take_stats() -> SchedulerStats {
     SchedulerStats {
         scheduled: SCHEDULED.swap(0, Ordering::Relaxed),
         slip_us_max: SLIP_MAX.swap(0, Ordering::Relaxed),
@@ -185,6 +185,13 @@ fn scheduler_loop(shared: &Arc<Shared>) {
     // 아래 `'grab` 라벨 블록 안에 있는 `continue` 를 그 블록이 아니라 이 루프로 보내려면
     // 라벨을 밝혀야 한다(라벨 블록 안의 무라벨 `continue` 는 어느 쪽을 뜻하는지 모호해
     // rustc 가 거부한다).
+    //
+    // ★OUTCOMMIT 은 여기서 낸다.★ 예전엔 타일 4 개 각자의 `maybe_emit_bind_profile` 이
+    // 독립된 ~1 초 타이머로 이 표본들을 비웠다 -- 즉 한 줄이 실제로는 임의의 ~0.25 초
+    // 조각이었고, 그 창이 짧아진 만큼 `slip_us_max`/`lock_wait_us_max` 도 작게 나와
+    // Task 6 판정 기준 4/5 를 엉뚱한 이유로 통과시킬 뻔했다(Fix round 1, Ruling 16). 표본을
+    // 만드는 스레드가 유일한 창을 재는 것이 맞다 -- 방출자는 하나, 창도 하나.
+    let mut last_emit = std::time::Instant::now();
     'sched: loop {
         // 때가 된 것을 전부 꺼낸다.
         // `let-else` 의 `else` 갈래는 반드시 발산해야 한다(값을 만들어 블록을 그 값으로
@@ -238,18 +245,69 @@ fn scheduler_loop(shared: &Arc<Shared>) {
 
             // ★이것이 판정이다.★ 이 커밋이 **자기 출력** 격자의 어디에 떨어졌나.
             // 지금까지는 데스크톱 격자 하나만 보였으므로 나머지 셋이 어디 있는지 알 수 없었다.
-            if let (Some(grid), Some(after)) =
-                (crate::output_grid::grid_for_monitor(monitor), qpc_now())
-            {
-                if grid.period_qpc > 0 {
-                    let period = grid.period_qpc as i128;
-                    let delta = after as i128 - grid.vblank_qpc as i128;
-                    let folded = ((delta % period) + period) % period;
-                    record_phase(monitor, folded as f64 / period as f64);
+            //
+            // ★게이트는 여기, 수집 자체에 건다.★ (Fix round 1, Ruling 15) 예전엔 `record_phase`
+            // 호출만 `DCOMP_BIND_PROF` 뒤에 있고 `grid_for_monitor` 는 무조건 불렸다 --
+            // `grid_for_monitor` 도 자기 락을 하나 잡으므로, 정렬 pref 는 켜져 있고
+            // `SERVO_DCOMP_BIND_PROF` 는 꺼져 있는 실제 운영 구성에서 `PHASES` 가 프로세스
+            // 수명 내내 무한히 자랐다(그 계측이 꺼져 있다는 사실 자체를 아무도 비우지 않았으므로).
+            if *crate::dcomp_compositor::DCOMP_BIND_PROF {
+                if let (Some(grid), Some(after)) =
+                    (crate::output_grid::grid_for_monitor(monitor), qpc_now())
+                {
+                    if grid.period_qpc > 0 {
+                        let period = grid.period_qpc as i128;
+                        let delta = after as i128 - grid.vblank_qpc as i128;
+                        let folded = ((delta % period) + period) % period;
+                        record_phase(monitor, folded as f64 / period as f64);
+                    }
                 }
             }
         }
+
+        // 큐가 비어 마감이 하나도 없으면 위 `due` 가 비고, 이 `for` 도 돌지 않은 채 다음
+        // 루프 회전 맨 위 `condvar.wait[_timeout]` 에서 잔다 -- 그동안은 여기 도달하지 않으므로
+        // 아무 것도 찍지 않는다. 맞다: 비운 큐는 보고할 것도 없다는 뜻이다.
+        if *crate::dcomp_compositor::DCOMP_BIND_PROF &&
+            last_emit.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            last_emit = std::time::Instant::now();
+            emit_outcommit();
+        }
     }
+}
+
+/// 모니터별 위상 한 줄씩 + 전역 스케줄러 통계 한 줄. 스케줄러 스레드가 표본을 만드는
+/// 유일한 곳이라 그 스레드가 유일한 1 초 창으로 낸다(Fix round 1, Ruling 16).
+///
+/// ★모니터 줄에는 모니터 값만 싣는다★(Ruling 17) -- `take_stats()` 는 네 디바이스 전체의
+/// 누적이라, 그걸 모니터별 줄마다 되풀이해 찍으면 그 줄이 마치 그 모니터만의 값인 것처럼
+/// 거짓말한다. 전역 통계는 별도의 `total` 줄로 딱 한 번만 낸다.
+fn emit_outcommit() {
+    let stats = take_stats();
+    for (monitor, mut phase) in take_phases() {
+        if phase.is_empty() {
+            continue;
+        }
+        phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
+        warn!(
+            "OUTCOMMIT monitor={monitor:#x} n={} phase p05={:.3} p50={:.3} p95={:.3}",
+            phase.len(),
+            at(0.05),
+            at(0.50),
+            at(0.95),
+        );
+    }
+    warn!(
+        "OUTCOMMIT total scheduled={} slip_us_max={} slip_us_avg={} \
+         lock_wait_us_max={} lock_wait_us_avg={}",
+        stats.scheduled,
+        stats.slip_us_max,
+        stats.slip_us_sum / stats.scheduled.max(1),
+        stats.lock_wait_us_max,
+        stats.lock_wait_us_sum / stats.scheduled.max(1),
+    );
 }
 
 /// 큐에 마감을 넣거나 갱신한다. ★같은 디바이스는 덮어쓴다★ -- 밀린 커밋을 쌓으면 한
@@ -277,6 +335,17 @@ mod tests {
             queue,
             vec![(250, 0xAA, 0x11)],
             "같은 디바이스는 쌓이지 않고 덮어써야 한다"
+        );
+
+        // 핫플러그: 같은 디바이스가 다른 모니터로 옮겨가면 마감뿐 아니라 모니터도 갱신돼야
+        // 한다. 이 어서션이 없으면 `upsert` 안의 `slot.2 = monitor;` 를 지워도 위 어서션까지는
+        // 전부 통과한다(Fix round 1, Ruling 19) -- 모니터가 안 바뀌는 회귀를 이 스위트가
+        // 놓치고 있었다는 뜻이다. 여전히 쌓이지 않는다(길이 1)는 것도 같이 확인한다.
+        upsert(&mut queue, 0xAA, 0x22, 400);
+        assert_eq!(
+            queue,
+            vec![(400, 0xAA, 0x22)],
+            "모니터가 바뀌어도 쌓이지 않고 마감·모니터 모두 덮어써야 한다"
         );
     }
 

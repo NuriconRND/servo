@@ -1352,7 +1352,9 @@ static PRESENT_SYNC_INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::ne
     raw
 });
 
-static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+// `pub(crate)`: `commit_scheduler` 도 이 플래그로 위상 수집 자체를 게이트한다(한 소스,
+// 두 번째 `LazyLock` 으로 같은 env 를 또 읽지 않는다) -- OUTCOMMIT Fix round 1, Ruling 15.
+pub(crate) static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     servo_config::debug_env::string(&servo_config::debug_env::DCOMP_BIND_PROF)
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
@@ -2531,37 +2533,6 @@ impl DCompNativeCompositor {
             ms(profile.destroy_ns),
         );
 
-        // ★OUTCOMMIT -- 타일별 커밋이 자기 출력 격자 어디에 떨어졌나.★
-        //
-        // 이 추적 내내 맹점이었던 양이다. DWMPHASE 는 데스크톱(주 모니터) 격자 하나만 보므로
-        // "주 모니터 기준 0.135 로 안전한데 화면은 저더" 가 성립했다. 출력마다 따로 봐야
-        // 넷이 전부 좋은 자리에 앉았는지 알 수 있다.
-        //
-        // slip = 스케줄러가 마감보다 늦은 시간(크면 스케줄러가 병목).
-        // lock_wait = 디바이스 뮤텍스 대기(0 에 가까워야 한다는 가정의 검산).
-        #[cfg(windows)]
-        if *DCOMP_BIND_PROF {
-            let stats = crate::commit_scheduler::take_stats();
-            for (monitor, mut phase) in crate::commit_scheduler::take_phases() {
-                if phase.is_empty() {
-                    continue;
-                }
-                phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
-                warn!(
-                    "OUTCOMMIT monitor={monitor:#x} n={} phase p05={:.3} p50={:.3} p95={:.3} \
-                     scheduled={} slip_us_max={} lock_wait_us_max={}",
-                    phase.len(),
-                    at(0.05),
-                    at(0.50),
-                    at(0.95),
-                    stats.scheduled,
-                    stats.slip_us_max,
-                    stats.lock_wait_us_max,
-                );
-            }
-        }
-
         self.bind_profile = BindProfile {
             window_start: Some(now),
             ..Default::default()
@@ -3538,7 +3509,7 @@ impl Compositor for DCompNativeCompositor {
         // 정해지고 이 셸의 무엇도 실행 중에 바꾸지 않으므로, 두 지점이 같은 실행 안에서
         // 서로 다른 값을 볼 수 없다 -- 경합의 여지가 없다.
         #[cfg(windows)]
-        let _device_guard =
+        let commit_guard =
             if (0..=99).contains(&servo_config::pref!(gfx_present_align_per_output_pct)) {
                 self.dcomp_device_ptr()
                     .map(|device| crate::commit_scheduler::device_guard(device as usize))
@@ -4204,6 +4175,14 @@ impl Compositor for DCompNativeCompositor {
                 self.bind_profile.deferred_commits += 1;
             }
         }
+        // ★가드는 여기서 끝난다.★ 이 디바이스의 서피스 작업과 Commit 은 바로 위에서 끝났다 --
+        // 여기부터 함수 끝까지는 BindProfile/esc_prof 카운터 갱신과 로그뿐이고 DComp 디바이스나
+        // 서피스를 다시 만지지 않는다(검증됨: dcomp_device_ptr/commit_device/BeginDraw/EndDraw/
+        // 비주얼 변경 없음). 가드를 함수 끝까지 들고 있으면 그 뒤에 도는 DCOMPBIND 로그 I/O 가
+        // "경합은 드물고 짧다" 를 검산해야 할 임계구역 안에 끼어들어, lock_wait_us_max 가 실제
+        // 커밋 경합이 아니라 로그 I/O 시간을 재게 된다.
+        #[cfg(windows)]
+        drop(commit_guard);
         if let Some(start) = end_frame_start {
             self.bind_profile.end_frames += 1;
             self.bind_profile.end_frame_ns += start.elapsed().as_nanos() as u64;
