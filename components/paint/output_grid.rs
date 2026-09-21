@@ -21,9 +21,10 @@
 // (dcomp_compositor.rs/dcomp_video_convert.rs의 `#![allow(unsafe_code)]`와 같은 취지).
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use log::warn;
 use winapi::Interface;
@@ -36,16 +37,26 @@ use winapi::um::winuser::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 /// 한 출력의 vblank 격자.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OutputGrid {
-    /// 마지막으로 관측한 vblank 의 QPC.
+    /// 마지막으로 관측한 vblank 의 QPC. ★"언제 뜬 표본인가" 도 이 값이다★ --
+    /// `WaitForVBlank` 가 돌아온 직후 시계를 읽으므로 관측 시각과 vblank 시각이 같은
+    /// 값이다. 그래서 격자가 얼마나 묵었는지도 이것 하나로 판단한다(예전에 따로 두었던
+    /// `sampled_qpc` 는 언제나 이것과 같은 값이라, 구분이 있는 척하는 이름뿐이었다).
     pub vblank_qpc: u64,
     /// 한 주기의 QPC 틱.
     pub period_qpc: u64,
-    /// 그 관측을 뜬 QPC. ★격자가 얼마나 묵었는지 호출자가 판단해야 한다★ — 프로브가
-    /// 정체하면 옛 격자로 스케줄하는 것보다 폴백이 낫다.
-    pub sampled_qpc: u64,
+    /// `period_qpc` 가 실측인가. 거짓이면 60Hz 가정값으로 떨어진 것이다.
+    /// ★틀린 주기는 마감을 매 프레임 격자의 다른 자리에 떨어뜨려, 이 작업이 없애려는 바로
+    /// 그 저더를 만든다.★ 그런데 위상 로그는 같은 격자로 접으므로 주기가 틀려도 목표치를
+    /// 가리킨다 -- 실측인지 가정인지를 따로 싣지 않으면 그 사실을 볼 방법이 없다.
+    pub measured: bool,
 }
 
 static GRID: Mutex<Option<HashMap<usize, OutputGrid>>> = Mutex::new(None);
+
+/// HMONITOR -> `DeviceName`. ★격자와 따로 둔다★ -- `OutputGrid` 는 타일마다 매 프레임
+/// 복사되는 `Copy` 값이고 이름은 초당 한 번 로그를 찍을 때만 필요하다. 이름을 격자에
+/// 실으면 그 뜨거운 경로가 `String` 복제를 물게 된다.
+static NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
 
 /// QPC 주파수는 부팅 중 고정이므로 한 번만 읽는다.
 pub(crate) fn qpc_frequency() -> Option<u64> {
@@ -90,6 +101,12 @@ pub(crate) fn grid_for_monitor(monitor: usize) -> Option<OutputGrid> {
     GRID.lock().ok()?.as_ref()?.get(&monitor).copied()
 }
 
+/// 이 HMONITOR 의 `DeviceName`(`\\.\DISPLAY3` 등). ★로그 전용이다★ -- `OUTCOMMIT` 의 p50
+/// 이 틀렸을 때 `monitor=0x…` 만으로는 어느 물리 디스플레이인지 짚을 수 없다.
+pub(crate) fn name_for_monitor(monitor: usize) -> Option<String> {
+    NAMES.lock().ok()?.as_ref()?.get(&monitor).cloned()
+}
+
 pub(crate) fn start_probe() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -113,13 +130,162 @@ struct Output {
 // `Vec<Output>` 이 스레드 경계를 넘지 않으므로 `Send` 가 필요 없다 — 이 구조체는 프로브
 // 루프의 지역 값으로만 존재한다.
 
+/// 한 번의 열거 결과. ★팩토리를 같이 들고 있는다★ -- `IDXGIFactory1::IsCurrent()` 는
+/// "이 팩토리를 만든 뒤 어댑터/출력 구성이 바뀌었나" 를 답하므로, 목록을 만든 바로 그
+/// 팩토리만이 그 목록이 썩었는지 알 수 있다.
+struct Enumeration {
+    factory: *mut IDXGIFactory1,
+    outputs: Vec<Output>,
+}
+
+impl Enumeration {
+    /// Safety: 프로브 스레드에서만, 이 열거의 포인터를 아무도 안 쓸 때 부른다.
+    unsafe fn release(&mut self) {
+        for out in self.outputs.drain(..) {
+            (*out.output).Release();
+        }
+        if !self.factory.is_null() {
+            (*self.factory).Release();
+            self.factory = ptr::null_mut();
+        }
+    }
+
+    /// 구성이 바뀌었나. 팩토리가 없으면(생성 실패) 판단할 근거가 없으므로 거짓으로 둔다 --
+    /// 매 바퀴 재열거를 시도하는 것보다 지금 목록으로 계속 재는 편이 낫다.
+    ///
+    /// Safety: 살아 있는 팩토리이거나 NULL.
+    unsafe fn is_stale(&self) -> bool {
+        !self.factory.is_null() && (*self.factory).IsCurrent() == 0
+    }
+}
+
+/// 같은 출력의 **연속 두 vblank** 시각에서 주기를 낸다. 두 번째 값은 실측인지 여부이고,
+/// 거짓이면 `assumed` 로 떨어졌다는 뜻이다.
+///
+/// ★한 바퀴 도는 시간에서 역산하면 안 된다.★ 예전 코드는 같은 출력의 연속 두 관측 간격을
+/// 출력 수로 나눴는데, 한 바퀴에 걸리는 시간은 각 구간 `(위상_{i+1} - 위상_i) mod P` 의 합
+/// 이라 항상 `w·P` 이고 그 `w` 는 열거 순서가 위상 원을 감는 횟수(`1..N`)다 -- 출력 수가
+/// 아니다. 게다가 모니터들이 서로 드리프트하므로 `w` 는 실행 중에 바뀐다. 그래서 그 계산은
+/// `w=2` 면 120Hz, `w=3` 이면 80Hz 처럼 **정상 범위 안의 틀린 주기**를 발행했고, 틀린 주기로
+/// 접은 마감은 매 프레임 실제 위상의 다른 자리에 떨어져 정확히 이 작업이 없애려는 저더를
+/// 만든다. 연속 두 vblank 사이에는 정의상 한 주기만 들어가므로 감는 횟수가 개입할 여지가
+/// 없다.
+fn period_from_pair(t1: u64, t2: u64, freq: u64, assumed: u64) -> (u64, bool) {
+    // 역행(t2 < t1)은 있을 수 없는 관측이다 -- QPC 가 뒤로 갔거나 표본이 섞였다는 뜻이라
+    // 값 자체를 믿을 수 없다.
+    let Some(measured) = t2.checked_sub(t1) else {
+        return (assumed, false);
+    };
+    // 말도 안 되는 값은 버린다(모드 전환·세션 잠금으로 한쪽이 지연된 경우). 30~240Hz 밖이면
+    // 가정값을 쓴다.
+    if measured > freq / 240 && measured < freq / 30 {
+        (measured, true)
+    } else {
+        (assumed, false)
+    }
+}
+
+/// 이 출력의 vblank 를 연속 두 번 기다린다. ★둘째는 반드시 첫째의 바로 다음 vblank다★ --
+/// `WaitForVBlank` 는 호출 시점 이후 그 출력의 다음 vblank 에 돌아오므로, 두 시각의 간격이
+/// 곧 이 출력의 주기다(`period_from_pair` 주석 참고).
+///
+/// Safety: 살아 있는 `IDXGIOutput`. 이 호출은 블록한다 -- 그래서 전용 스레드다.
+unsafe fn wait_two_vblanks(output: *mut IDXGIOutput) -> Option<(u64, u64)> {
+    if (*output).WaitForVBlank() < 0 {
+        return None;
+    }
+    let t1 = qpc_now()?;
+    if (*output).WaitForVBlank() < 0 {
+        return None;
+    }
+    let t2 = qpc_now()?;
+    Some((t1, t2))
+}
+
 fn probe_loop() {
-    // Safety: 전부 COM 생성/열거. 포인터는 이 스레드 안에서만 살고, 루프가 끝나면 해제한다.
-    let outputs = unsafe { enumerate_outputs() };
-    if outputs.is_empty() {
+    let Some(freq) = qpc_frequency() else {
+        warn!("[outgrid] QPC 주파수를 읽지 못했다; 전 타일 폴백");
+        return;
+    };
+    // 첫 표본이 나오기 전과, 실측이 말이 안 될 때 쓰는 값. `measured=0` 으로 구분된다.
+    let assumed_period = freq / 60;
+
+    // Safety: 전부 COM 생성/열거. 포인터는 이 스레드 안에서만 살고, 재열거·종료 시 해제한다.
+    let mut current = unsafe { enumerate_outputs() };
+    if current.outputs.is_empty() {
         warn!("[outgrid] 출력을 하나도 찾지 못했다; 전 타일 폴백");
+        // Safety: 방금 만든 팩토리뿐이고 아무도 쓰지 않는다.
+        unsafe { current.release() };
         return;
     }
+    announce(&current.outputs);
+    publish_names(&current.outputs);
+
+    let mut last_outphase = Instant::now();
+    loop {
+        // ★출력을 한 번만 열거하면 핫플러그 뒤 영구 폴백이 된다.★ 모드 변경·핫플러그로
+        // 생긴 새 HMONITOR 는 영영 격자를 못 받고, 사라진 HMONITOR 항목은 `GRID` 에 남아
+        // 죽은 격자로 마감을 계산하게 한다. 팩토리가 구성 변경을 알려 주므로 한 바퀴에 한 번
+        // 물어본다(비용은 API 한 번이다).
+        // Safety: 살아 있는 팩토리이거나 NULL.
+        if unsafe { current.is_stale() } {
+            warn!("[outgrid] 디스플레이 구성이 바뀌었다; 출력을 다시 연다");
+            // Safety: 이 열거의 포인터는 이 스레드 밖으로 나간 적이 없다.
+            unsafe { current.release() };
+            // Safety: 위와 같다.
+            current = unsafe { enumerate_outputs() };
+            if current.outputs.is_empty() {
+                warn!("[outgrid] 재열거에서 출력을 찾지 못했다; 100ms 뒤 다시 본다");
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            announce(&current.outputs);
+            publish_names(&current.outputs);
+            forget_vanished(&current.outputs);
+        }
+
+        // 한 바퀴는 출력마다 vblank 두 개씩이라 약 `(N+w)·P` ≈ 5P ≈ 83ms 다(`w` 는 열거 순서가
+        // 위상 원을 감는 횟수). 즉 출력별 격자가 그 주기로 갱신된다. 마감은 `vblank + k·P` 로
+        // 접으므로 그 정도 신선도면 충분하다.
+        let mut sampled = 0usize;
+        for out in &current.outputs {
+            // Safety: 살아 있는 IDXGIOutput.
+            let Some((t1, t2)) = (unsafe { wait_two_vblanks(out.output) }) else {
+                continue;
+            };
+            let (period, measured) = period_from_pair(t1, t2, freq, assumed_period);
+            if let Ok(mut guard) = GRID.lock() {
+                guard
+                    .get_or_insert_with(HashMap::new)
+                    .insert(out.monitor, OutputGrid {
+                        // 더 최근인 둘째 vblank 를 기준으로 삼는다.
+                        vblank_qpc: t2,
+                        period_qpc: period,
+                        measured,
+                    });
+            }
+            sampled += 1;
+        }
+
+        // ★한 바퀴가 전부 실패하면 이 루프는 코어 하나를 태운다.★ 세션 잠금, RDP 끊김,
+        // 모니터 전원 off, 토폴로지 변경 중에는 모든 출력의 `WaitForVBlank` 가 즉시 실패
+        // HRESULT 로 돌아오므로 블록하는 것이 하나도 없다. 그런 상태는 초 단위로 이어지니
+        // 잠시 자고 다시 본다.
+        if sampled == 0 {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+
+        if *crate::dcomp_compositor::DCOMP_BIND_PROF &&
+            last_outphase.elapsed() >= Duration::from_secs(1)
+        {
+            last_outphase = Instant::now();
+            emit_outphase(&current.outputs, freq);
+        }
+    }
+}
+
+fn announce(outputs: &[Output]) {
     warn!(
         "[outgrid] 출력 {} 개를 잰다: {}",
         outputs.len(),
@@ -129,63 +295,84 @@ fn probe_loop() {
             .collect::<Vec<_>>()
             .join(" ")
     );
-    // 이 반환은 이미 살아 있는 outputs 의 IDXGIOutput 을 해제하지 않는다 -- 프로세스 생애
-    // 동안 많아야 한 번, 넷짜리 객체라 감수한다.
-    let Some(freq) = qpc_frequency() else {
-        warn!("[outgrid] QPC 주파수를 읽지 못했다; 전 타일 폴백");
-        return;
-    };
-    // 주기는 DXGI 가 직접 주지 않으므로 vblank 간격에서 추정한다. 첫 바퀴에는 직전 관측이
-    // 없으므로 60Hz 를 가정하고, 두 번째 바퀴부터 실측으로 대체된다.
-    let mut previous: HashMap<usize, u64> = HashMap::new();
-    let assumed_period = freq / 60;
+}
 
-    loop {
-        for out in &outputs {
-            // Safety: 살아 있는 IDXGIOutput. 이 호출은 블록한다 -- 그래서 전용 스레드다.
-            let hr = unsafe { (*out.output).WaitForVBlank() };
-            if hr < 0 {
-                continue;
-            }
-            let Some(now) = qpc_now() else { continue };
-            let period = match previous.insert(out.monitor, now) {
-                // 연속 두 관측 사이에는 **출력 수만큼의 vblank** 가 들어간다(한 바퀴 도는
-                // 동안 다른 출력들을 기다렸기 때문). 관측 간격을 그 수로 나눠 주기를 얻는다.
-                Some(before) if now > before => {
-                    let span = now - before;
-                    let ticks = outputs.len() as u64;
-                    let estimate = span / ticks.max(1);
-                    // 말도 안 되는 값은 버린다(모드 전환·정체). 30~240Hz 밖이면 가정값.
-                    if estimate > freq / 240 && estimate < freq / 30 {
-                        estimate
-                    } else {
-                        assumed_period
-                    }
-                },
-                _ => assumed_period,
-            };
-            if let Ok(mut guard) = GRID.lock() {
-                guard
-                    .get_or_insert_with(HashMap::new)
-                    .insert(out.monitor, OutputGrid {
-                        vblank_qpc: now,
-                        period_qpc: period,
-                        sampled_qpc: now,
-                    });
-            }
+fn publish_names(outputs: &[Output]) {
+    if let Ok(mut guard) = NAMES.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        for out in outputs {
+            map.insert(out.monitor, out.name.clone());
         }
     }
 }
 
+/// 재열거에서 사라진 HMONITOR 의 격자·이름을 버린다. 남겨 두면 죽은 모니터의 옛 격자가
+/// 계속 조회되어, 그 자리에 붙은 창이 없는데도 마감이 계산된다.
+fn forget_vanished(outputs: &[Output]) {
+    let live: HashSet<usize> = outputs.iter().map(|o| o.monitor).collect();
+    if let Ok(mut guard) = GRID.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.retain(|monitor, _| live.contains(monitor));
+        }
+    }
+    if let Ok(mut guard) = NAMES.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.retain(|monitor, _| live.contains(monitor));
+        }
+    }
+}
+
+/// ★격자에 대한 독립적인 검산이다.★ `OUTCOMMIT` 의 위상은 마감을 정한 격자로 다시 접은
+/// 값이라 격자가 틀려도 목표치를 가리킨다(`commit_scheduler::scheduler_loop` 주석). 이 줄은
+/// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
+/// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
+///
+/// `rel_ms` 는 열거 첫 출력의 vblank 를 0 으로 둔 상대 위상으로, 주기로 접어 `[0,P)` 다.
+fn emit_outphase(outputs: &[Output], freq: u64) {
+    // 기준은 격자가 있는 첫 출력이다. 열거 첫 출력이 아직(또는 영영) 격자를 못 얻었다고
+    // 나머지 셋의 확산까지 못 보게 되면, 정작 그 상태에서 가장 보고 싶은 값을 잃는다.
+    let Some(base) = outputs
+        .iter()
+        .find_map(|out| grid_for_monitor(out.monitor))
+    else {
+        return;
+    };
+    if base.period_qpc == 0 {
+        return;
+    }
+    let period = base.period_qpc as i128;
+    let to_ms = |ticks: f64| ticks * 1000.0 / freq as f64;
+    for out in outputs {
+        let Some(grid) = grid_for_monitor(out.monitor) else {
+            continue;
+        };
+        // 표본은 출력마다 최대 한 바퀴(~83ms)까지 시각이 벌어지지만, 주기로 접으면 그
+        // 차이는 사라지고 위상만 남는다.
+        let delta = grid.vblank_qpc as i128 - base.vblank_qpc as i128;
+        let rel = (((delta % period) + period) % period) as f64;
+        warn!(
+            "OUTPHASE out={} monitor={:#x} period_ms={:.2} measured={} rel_ms={:+.2}",
+            out.name,
+            out.monitor,
+            to_ms(grid.period_qpc as f64),
+            u8::from(grid.measured),
+            to_ms(rel),
+        );
+    }
+}
+
 /// Safety: 호출자는 프로브 스레드여야 한다. 돌려준 포인터는 그 스레드에서만 쓰인다.
-unsafe fn enumerate_outputs() -> Vec<Output> {
+unsafe fn enumerate_outputs() -> Enumeration {
     let mut found = Vec::new();
     let mut factory: *mut IDXGIFactory1 = ptr::null_mut();
     if CreateDXGIFactory1(&IDXGIFactory1::uuidof(), &mut factory as *mut _ as *mut _) < 0
         || factory.is_null()
     {
         warn!("[outgrid] CreateDXGIFactory1 실패");
-        return found;
+        return Enumeration {
+            factory: ptr::null_mut(),
+            outputs: found,
+        };
     }
     for ai in 0..16u32 {
         let mut adapter: *mut IDXGIAdapter1 = ptr::null_mut();
@@ -202,7 +389,10 @@ unsafe fn enumerate_outputs() -> Vec<Output> {
                 (*output).Release();
                 continue;
             }
-            // `#[repr(packed)]` 이라 필드를 빌릴 수 없다. 값으로 복사한다.
+            // `desc` 는 이 회전에서만 사는 스택 임시인데 `Output` 은 루프 밖으로 나가므로,
+            // 필요한 둘을 소유 값으로 떠 온다. (`DXGI_OUTPUT_DESC` 는 packed 가 아니다 --
+            // 예전 주석이 그렇게 적혀 있었지만 빌림이 막히는 구조체는 `DWM_TIMING_INFO`
+            // 뿐이고, 그 설명은 `dcomp_compositor.rs` 의 해당 자리에 있다.)
             let monitor = desc.Monitor as usize;
             let name_end = desc
                 .DeviceName
@@ -218,6 +408,53 @@ unsafe fn enumerate_outputs() -> Vec<Output> {
         }
         (*adapter).Release();
     }
-    (*factory).Release();
-    found
+    Enumeration {
+        factory,
+        outputs: found,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::period_from_pair;
+
+    /// 10MHz QPC 를 가정한다(실제 하드웨어와 같은 값이라 ms 환산이 직관적이다).
+    const FREQ: u64 = 10_000_000;
+    /// 60Hz 가정값.
+    const ASSUMED: u64 = FREQ / 60;
+
+    #[test]
+    fn a_normal_pair_yields_the_measured_period() {
+        // 16.67ms = 60Hz. ★옛 코드는 이 표본을 출력 수(4)로 또 나눠 4.17ms 로 만들었고,
+        // 그 값은 240Hz 컷에 걸려 가정값으로 떨어졌다★ -- 즉 실측을 버리고 `measured=0` 을
+        // 냈다. 그래서 이 단언은 옛 계산으로는 통과할 수 없다.
+        let (period, measured) = period_from_pair(0, 166_667, FREQ, ASSUMED);
+        assert_eq!(period, 166_667, "연속 두 vblank 간격이 곧 주기다");
+        assert!(measured, "실측을 썼으면 measured 가 참이어야 한다");
+    }
+
+    #[test]
+    fn a_pair_faster_than_240hz_falls_back_to_the_assumed_period() {
+        // 0.1ms = 10kHz. 중복 깨움 등으로 나올 수 있는 값이고 주기가 아니다.
+        let (period, measured) = period_from_pair(1_000, 2_000, FREQ, ASSUMED);
+        assert_eq!(period, ASSUMED);
+        assert!(!measured);
+    }
+
+    #[test]
+    fn a_pair_slower_than_30hz_falls_back_to_the_assumed_period() {
+        // 50ms = 20Hz. 세션 잠금·모드 전환으로 한쪽이 지연되면 이렇게 나온다.
+        let (period, measured) = period_from_pair(0, 500_000, FREQ, ASSUMED);
+        assert_eq!(period, ASSUMED);
+        assert!(!measured);
+    }
+
+    #[test]
+    fn a_backwards_pair_falls_back_to_the_assumed_period() {
+        // t2 < t1. 있을 수 없는 관측이므로 뺄셈이 감싸 돌게 두면 안 된다 -- 감싸 돌면
+        // 거대한 값이 나와 30Hz 컷에 걸리긴 하지만, 그건 우연이지 의도가 아니다.
+        let (period, measured) = period_from_pair(500_000, 400_000, FREQ, ASSUMED);
+        assert_eq!(period, ASSUMED);
+        assert!(!measured);
+    }
 }

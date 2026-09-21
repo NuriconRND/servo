@@ -2886,7 +2886,7 @@ impl Paint {
         }
         // 격자가 60 주기(60Hz 면 1 초)보다 묵었으면 프로브가 정체한 것이다. 옛 격자로
         // 스케줄하는 것보다 즉시 커밋이 낫다.
-        if now.saturating_sub(grid.sampled_qpc) > grid.period_qpc.saturating_mul(60) {
+        if now.saturating_sub(grid.vblank_qpc) > grid.period_qpc.saturating_mul(60) {
             return None;
         }
         let target = grid.period_qpc * pct / 100;
