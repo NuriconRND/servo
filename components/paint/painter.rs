@@ -1975,7 +1975,9 @@ impl Painter {
         // 값에 들어간다.★ 이 락 안에서 도는 `end_frame` 이 그 디바이스의 커밋 뮤텍스를
         // 잡으므로, 스케줄러가 같은 디바이스를 커밋하는 중이면 이 painter 는 ANGLE 락을 쥔 채
         // 그 커밋이 끝나기를 기다린다. 그 대기의 상한은 `Commit()` 하나(~0.02ms)로 못 박혀
-        // 있고(`commit_scheduler` 모듈 주석), 실제 값은 OUTCOMMIT 의 `lock_wait_us_max` 다.
+        // 있고(`commit_scheduler` 모듈 주석), 실제 값은 OUTCOMMIT total 의
+        // `lock_wait_painter_us_max` 다 -- 반대 방향인 `lock_wait_sched_us_max`(스케줄러가
+        // 페인터의 `end_frame` 임계구역을 기다린 시간)와 섞어 읽으면 안 된다.
         let angle_lock_ms;
         {
             let lock_start = Instant::now();

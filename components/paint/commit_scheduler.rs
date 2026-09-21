@@ -108,6 +108,28 @@ static LOCK_SCHED_SUM: AtomicU64 = AtomicU64::new(0);
 /// 모니터 -> 이번 창의 위상 표본. `OUTCOMMIT` 이 초당 비운다.
 static PHASES: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 
+/// 디바이스 -> 그 디바이스가 그리는 모니터.
+///
+/// ★커밋 실패 로그가 "어느 타일이 죽었나" 를 말할 수 있게 하는 유일한 연결이다.★ 커밋
+/// 경로는 디바이스 포인터만 들고 다니고 `OUTCOMMIT`/`OUTPHASE` 는 모니터로만 말하므로,
+/// 이 맵이 없으면 TDR 로 한 타일이 죽은 것과 넷이 다 죽은 것이 같은 로그로 보인다.
+/// 실기 검증에서 그 둘을 구분하지 못하면 원인을 좁힐 수 없다.
+static DEVICE_MONITOR: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+fn remember_device_monitor(device: usize, monitor: usize) {
+    if let Ok(mut guard) = DEVICE_MONITOR.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(device, monitor);
+    }
+}
+
+/// 실패 로그가 디바이스를 출력 이름으로 옮길 때 쓴다. 정렬이 꺼져 있으면 `schedule` 이
+/// 불리지 않아 비어 있고, 그때는 로그가 디바이스 포인터만 낸다 -- 꺼진 상태에는 스케줄러가
+/// 없으므로 구분할 타일도 없다.
+pub(crate) fn monitor_for_device(device: usize) -> Option<usize> {
+    let guard = DEVICE_MONITOR.lock().ok()?;
+    guard.as_ref()?.get(&device).copied()
+}
+
 fn record_phase(monitor: usize, phase: f64) {
     if let Ok(mut guard) = PHASES.lock() {
         guard
@@ -205,6 +227,7 @@ fn record_lock_wait(role: GuardRole, ticks: u64) {
 /// `monitor` 는 커밋 시점에 위상을 잴 출력을 가리킨다 -- 스케줄만으로는 어느 격자에
 /// 맞춰야 하는지 알 수 없다.
 pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
+    remember_device_monitor(device, monitor);
     let shared = SHARED.get_or_init(|| {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Vec::new()),
@@ -346,7 +369,7 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             };
             // 가드를 푼 뒤에 한다. 아래 세 줄은 DComp 디바이스를 만지지 않으므로 painter 와
             // 겹쳐도 안전하다.
-            crate::dcomp_compositor::note_commit_failure(hr, "commitsched");
+            crate::dcomp_compositor::note_commit_failure(hr, device, "commitsched");
             crate::dcomp_compositor::note_dwm_phase();
 
             // ★이것이 판정이다.★ 이 커밋이 **자기 출력** 격자의 어디에 떨어졌나.

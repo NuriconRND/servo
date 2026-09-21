@@ -1560,8 +1560,9 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     if period == 0 { None } else { Some((vblank, period)) }
 }
 
-/// `pub(crate)`: 스케줄러가 디바이스 가드를 **푼 뒤에** 이것을 부른다(`commit_device_ptr_raw`
-/// 주석). 이 함수 자체가 전역 뮤텍스와 로그 I/O 를 쥐므로 임계구역 밖이어야 한다.
+/// `pub(crate)`: 스케줄러가 디바이스 가드를 **푼 뒤에** 이것을 부른다
+/// ([`commit_device_ptr_locked`] 주석). 이 함수 자체가 전역 뮤텍스와 로그 I/O 를 쥐므로
+/// 임계구역 밖이어야 한다.
 pub(crate) fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
         return;
@@ -1679,24 +1680,36 @@ unsafe fn raw_commit(device: *mut IDCompositionDevice) -> i32 {
 /// 대기 상한이 `Commit()`(~0.02ms)이 아니라 **로그 쓰기**가 된다 -- C3 이 세우려던 상한이
 /// 정확히 그 순간 무너진다. 그래서 커밋 함수들은 `hr` 만 돌려주고 로그는 여기로 모은다.
 ///
-/// 제한 창은 전역 하나다. 실패가 여러 자리에서 동시에 나면 한 자리만 찍히므로 `site` 로
-/// 어디였는지는 남긴다 -- 어느 쪽이든 "커밋이 실패하고 있다" 가 전달되면 목적을 다한다.
-pub(crate) fn note_commit_failure(hr: i32, site: &str) {
+/// ★제한 창은 **디바이스마다** 따로다.★ 전역 하나로 두면 TDR 로 타일 하나가 죽은 것과 네
+/// GPU 가 전부 죽은 것이 똑같이 한 줄로 보이고, 어느 `site` 가 그 1 초를 차지할지도
+/// 경쟁이다. 실기 검증에서 "한 타일인가 전부인가" 를 구분하지 못하면 원인을 좁힐 수 없다.
+/// 그래서 창을 디바이스로 가르고, 줄에 디바이스와 그 출력 이름을 같이 낸다.
+pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
     if hr >= 0 {
         return;
     }
-    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static LAST: std::sync::Mutex<Option<HashMap<usize, std::time::Instant>>> =
+        std::sync::Mutex::new(None);
     let Ok(mut last) = LAST.lock() else { return };
     let now = std::time::Instant::now();
-    let due = match *last {
-        Some(at) => now.duration_since(at) >= std::time::Duration::from_secs(1),
+    let windows = last.get_or_insert_with(HashMap::new);
+    let due = match windows.get(&device) {
+        Some(at) => now.duration_since(*at) >= std::time::Duration::from_secs(1),
         None => true,
     };
     if !due {
         return;
     }
-    *last = Some(now);
-    warn!("[dcomp-native] {site}: Commit failed (hr=0x{:08x})", hr as u32);
+    windows.insert(device, now);
+    drop(last);
+    // 이름은 찍을 때만 찾는다 -- 실패 경로가 매번 두 번째 뮤텍스를 잡을 이유가 없다.
+    let out = crate::commit_scheduler::monitor_for_device(device)
+        .and_then(crate::output_grid::name_for_monitor)
+        .unwrap_or_else(|| String::from("?"));
+    warn!(
+        "[dcomp-native] {site}: Commit failed (hr=0x{:08x}) device=0x{device:x} out={out}",
+        hr as u32
+    );
 }
 
 /// 가드를 **이 함수가 잡는다.** 가드 밖에서 커밋하는 모든 자리의 정문이다.
@@ -1720,7 +1733,7 @@ pub fn commit_device_ptr(device: usize) -> bool {
         // Safety: 위 계약.
         unsafe { raw_commit(device as *mut IDCompositionDevice) }
     };
-    note_commit_failure(hr, "commit_device_ptr");
+    note_commit_failure(hr, device, "commit_device_ptr");
     note_dwm_phase();
     hr >= 0
 }
@@ -2584,7 +2597,7 @@ impl DCompNativeCompositor {
             });
             self.commit_device_locked(dcomp_device)
         };
-        note_commit_failure(hr, "flush_deferred_commit");
+        note_commit_failure(hr, dcomp_device as usize, "flush_deferred_commit");
         if *DCOMP_BIND_PROF {
             note_dwm_phase();
         }
@@ -2741,7 +2754,7 @@ impl DCompNativeCompositor {
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
                 unsafe { raw_commit(dcomp_device) }
             };
-            note_commit_failure(hr, "present_external_only");
+            note_commit_failure(hr, dcomp_device as usize, "present_external_only");
         }
     }
 
@@ -4304,12 +4317,12 @@ impl Compositor for DCompNativeCompositor {
         // 여기부터 함수 끝까지는 BindProfile/esc_prof 카운터 갱신과 로그뿐이고 DComp 디바이스나
         // 서피스를 다시 만지지 않는다(검증됨: dcomp_device_ptr/commit_device/BeginDraw/EndDraw/
         // 비주얼 변경 없음). 가드를 함수 끝까지 들고 있으면 그 뒤에 도는 DCOMPBIND 로그 I/O 가
-        // "경합은 드물고 짧다" 를 검산해야 할 임계구역 안에 끼어들어, lock_wait_us_max 가 실제
-        // 커밋 경합이 아니라 로그 I/O 시간을 재게 된다.
+        // "경합은 드물고 짧다" 를 검산해야 할 임계구역 안에 끼어들어,
+        // `lock_wait_sched_us_max` 가 실제 커밋 경합이 아니라 로그 I/O 시간을 재게 된다.
         #[cfg(windows)]
         drop(commit_guard);
         if let Some(hr) = commit_hr {
-            note_commit_failure(hr, "end_frame");
+            note_commit_failure(hr, dcomp_device as usize, "end_frame");
             if *DCOMP_BIND_PROF {
                 note_dwm_phase();
             }
