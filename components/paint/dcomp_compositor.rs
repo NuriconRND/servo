@@ -1560,7 +1560,9 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     if period == 0 { None } else { Some((vblank, period)) }
 }
 
-fn note_dwm_phase() {
+/// `pub(crate)`: 스케줄러가 디바이스 가드를 **푼 뒤에** 이것을 부른다(`commit_device_ptr_raw`
+/// 주석). 이 함수 자체가 전역 뮤텍스와 로그 I/O 를 쥐므로 임계구역 밖이어야 한다.
+pub(crate) fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
         return;
     }
@@ -1652,12 +1654,17 @@ fn note_dwm_phase() {
     );
 }
 
+/// `Commit()` 과 실패 로그만. ★디바이스 뮤텍스 안에서 부를 수 있는 유일한 형태다.★
+/// `commit_device_ptr` 은 뒤이어 `note_dwm_phase`(전역 `DWM_PHASE` 뮤텍스 + DWM 조회 + 초당
+/// 한 번 로그 I/O)를 부르는데, 그것까지 가드 안에서 돌면 그 뮤텍스를 기다리는 쪽 -- ANGLE GL
+/// 락을 쥔 painter 와 비디오 fast-path -- 의 대기 상한이 커밋 하나를 넘어선다
+/// (`commit_scheduler` 모듈 주석).
+///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
-/// 만지는 다른 스레드가 없어야 한다(호출자가 join 으로 보장). 디바이스마다 서로 다르다.
-pub fn commit_device_ptr(device: usize) -> bool {
+/// 만지는 다른 스레드가 없어야 한다(호출자가 join 또는 디바이스 가드로 보장).
+pub fn commit_device_ptr_raw(device: usize) -> bool {
     let device = device as *mut IDCompositionDevice;
     let hr = unsafe { (*device).Commit() };
-    note_dwm_phase();
     if hr < 0 {
         warn!(
             "[dcomp-native] parallel Commit failed (hr=0x{:08x})",
@@ -1666,6 +1673,14 @@ pub fn commit_device_ptr(device: usize) -> bool {
         return false;
     }
     true
+}
+
+/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 이고, 이 호출 동안 그 디바이스를
+/// 만지는 다른 스레드가 없어야 한다(호출자가 join 으로 보장). 디바이스마다 서로 다르다.
+pub fn commit_device_ptr(device: usize) -> bool {
+    let committed = commit_device_ptr_raw(device);
+    note_dwm_phase();
+    committed
 }
 
 pub fn maybe_create(
@@ -2623,6 +2638,19 @@ impl DCompNativeCompositor {
 
         // Commit 1회.
         if let Some(dcomp_device) = self.dcomp_device_ptr() {
+            // ★이 경로도 디바이스 가드를 잡아야 한다.★ 여기는 비디오 fast-path(타일당 최대
+            // ~60/s)이고, 설계가 "이 디바이스를 만지는 것은 스케줄러와 그 타일 페인터 둘뿐"
+            // 이라고 적었을 때 빠져 있던 셋째 커밋 주체다. 하필 이 벽이 존재하는 이유인 비디오
+            // 경로라 빈도도 가장 높다. DComp 디바이스는 스레드 안전하지 않으므로, 스케줄러가
+            // 같은 순간 같은 디바이스를 커밋하면 둘이 동시에 만지게 된다.
+            //
+            // 조건은 다른 커밋 지점과 같다 -- 정렬 pref 가 꺼져 있으면 스케줄러 스레드 자체가
+            // 뜨지 않아 겨룰 상대가 없고, 상대 없는 락을 여기서 잡는 비용만 남는다.
+            //
+            // 가드는 `Commit()` 한 줄만 감싼다. 위의 external 배치 작업은 DComp 디바이스가
+            // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다.
+            let _commit_guard = (*crate::commit_scheduler::ALIGN_PCT)
+                .map(|_| crate::commit_scheduler::device_guard(dcomp_device as usize));
             // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
             let hr = unsafe { (*dcomp_device).Commit() };
             if hr < 0 {
@@ -3504,18 +3532,15 @@ impl Compositor for DCompNativeCompositor {
         // 존재한다 -- pref 가 꺼져 있으면(기본 `-1`) `flush_deferred_dcomp_commits` 가
         // `schedule()` 를 아예 안 부르므로 스케줄러 스레드조차 뜨지 않고, 이 뮤텍스를 놓고
         // 겨룰 상대가 없다. 상대가 없는 락을 매 프레임 잡는 비용만 남는 것은 "꺼져 있으면
-        // 오늘과 같다" 는 이 작업 전체의 전제와 어긋난다. `flush_deferred_dcomp_commits` 와
-        // 같은 조건식을 쓰는 것이 안전한 이유: 이 pref 는 커맨드라인에서 시작 시 한 번만
-        // 정해지고 이 셸의 무엇도 실행 중에 바꾸지 않으므로, 두 지점이 같은 실행 안에서
-        // 서로 다른 값을 볼 수 없다 -- 경합의 여지가 없다.
-        #[cfg(windows)]
-        let commit_guard =
-            if (0..=99).contains(&servo_config::pref!(gfx_present_align_per_output_pct)) {
-                self.dcomp_device_ptr()
-                    .map(|device| crate::commit_scheduler::device_guard(device as usize))
-            } else {
-                None
-            };
+        // 오늘과 같다" 는 이 작업 전체의 전제와 어긋난다. 조건은 `ALIGN_PCT` 한 곳에서 오므로
+        // 두 지점이 같은 실행 안에서 서로 다른 값을 볼 수 없다.
+        //
+        // ★가드는 여기서 시작하지 않고 아래 서피스 작업 직전에서 시작한다.★ 이 함수를 기다리는
+        // 쪽은 스케줄러 스레드이지만, 반대로 **이 painter 가 ANGLE GL 락을 쥔 채** 이 가드를
+        // 기다리므로 잡고 있는 시간이 곧 그 락을 잡고 있는 시간이다. 바로 아래 `close_external_batch`
+        // 와 `device.gl().flush()` 는 D3D11/GL 만 만지고 DComp 디바이스는 건드리지 않는데,
+        // 그 flush 하나가 프레임당 7.36ms 였던 적이 있다(log_webgpu/29) -- 임계구역에 들일
+        // 이유가 없다.
 
         // 방어: 정상 경로는 start_compositing이 이미 배치를 닫았다(no-op). 혹시 열려 있으면
         // 아래 device.gl().flush()를 포함한 어떤 GL보다 먼저 닫아야 한다 — 배치가 열린 채 GL이
@@ -3561,6 +3586,15 @@ impl Compositor for DCompNativeCompositor {
         } else if *DCOMP_BIND_PROF {
             self.bind_profile.flush_skipped += 1;
         }
+
+        // ★여기서부터가 임계구역이다.★ 아래 루프가 서피스를 만들고(`SetContent`), 비주얼을
+        // 붙이고(`AddVisual`), 마지막에 `commit_device` 한다 -- 셋 다 이 DComp 디바이스를
+        // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
+        #[cfg(windows)]
+        let commit_guard = (*crate::commit_scheduler::ALIGN_PCT).and_then(|_| {
+            self.dcomp_device_ptr()
+                .map(|device| crate::commit_scheduler::device_guard(device as usize))
+        });
 
         let mode = storage_mode();
         let rc = self.rendering_context.clone();

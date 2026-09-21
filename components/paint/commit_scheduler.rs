@@ -15,25 +15,57 @@
 //! 그래서 디바이스마다 뮤텍스를 두고, 양쪽이 그것을 잡는다. 커밋이 0.02ms 라 경합은 드물고
 //! 짧아야 하며, 그 가정은 `lock_wait_us` 계수가 지켜본다.
 //!
-//! 이 뮤텍스는 생산 스레드와 무관하다 -- DComp 디바이스를 만지는 둘(스케줄러, 그 타일의
-//! painter) 사이에서만 걸린다. 비디오·스트림 생산자는 이 경로에 없다.
+//! ★이 뮤텍스는 생산 스레드와 무관하지 않다.★ 설계 문서에 그렇게 적혀 있었지만 틀렸다 --
+//! 이것을 잡는 곳은 셋이고, 셋 다 생산·렌더 스레드 위에 있다:
+//! 1. 스케줄러 스레드(여기),
+//! 2. 그 타일의 painter 가 `end_frame` 에서(그 painter 는 그 순간 **ANGLE GL 락을 쥐고
+//!    있다** -- `painter.rs` 의 타일 렌더 전체가 그 락 안이다),
+//! 3. 비디오 fast-path `present_external_only`(역시 ANGLE GL 락 안, 타일당 최대 ~60/s).
+//!
+//! 즉 이 뮤텍스를 기다리는 쪽은 ANGLE GL 락을 쥔 채로 기다릴 수 있고, 같은 디바이스의
+//! WebGL 스레드가 그 뒤에 줄을 선다. 과거에 한 번 터졌던 회귀 부류다(생산 스레드가 커밋
+//! 대기에 동기화되어 처리량을 잃은 건). 그래서 **기다림의 상한을 `Commit()` 하나(~0.02ms)로
+//! 못 박는다** -- 어느 쪽이든 가드 안에서 하는 일은 `Commit()` 뿐이고, `note_dwm_phase`
+//! (전역 뮤텍스 + DWM 조회 + 로그 I/O)와 위상 기록은 전부 가드 밖으로 뺀다. 그 상한이
+//! 지켜지는지는 `lock_wait_us_max` 가 지켜본다.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 use log::warn;
 
 use crate::output_grid::{qpc_frequency, qpc_now};
 
+/// 정렬 pref(`gfx_present_align_per_output_pct`)를 **한 번만** 읽어 캐시한다.
+/// `Some(pct)` = 켜짐(`0..=99`), `None` = 꺼짐.
+///
+/// ★`pref!` 는 `PREFERENCES.read().unwrap()` 으로 펼쳐지는 RwLock 획득이다.★ 이 pref 를
+/// 묻는 자리는 painter 마다 `end_frame` 당 하나 + flush 당 하나라, 꺼져 있을 때도 프레임당
+/// 다섯 번의 락이 벽의 가장 뜨거운 경로에 새로 생긴다. "꺼져 있으면 오늘과 같다" 가 이
+/// 작업 전체의 전제이므로 그 비용은 0 이어야 한다.
+///
+/// `LazyLock` 으로 굳혀도 안전한 이유: 이 pref 는 기동 시 커맨드라인에서 한 번 정해지고
+/// 실행 중에 바뀌지 않는다(Ruling 9 에서 리뷰어가 `Preferences` 의 모든 쓰기 지점을
+/// 트리에서 감사해 확인했다). 같은 파일의 `PRESENT_SYNC_INTERVAL` 과 같은 이유·같은 방식.
+pub(crate) static ALIGN_PCT: LazyLock<Option<u64>> = LazyLock::new(|| {
+    let raw = servo_config::pref!(gfx_present_align_per_output_pct);
+    (0..=99).contains(&raw).then_some(raw as u64)
+});
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct SchedulerStats {
-    /// 스케줄에 올린 커밋 수.
+    /// 실제로 큐에 올린 커밋 수.
     pub scheduled: u64,
+    /// 스케줄러가 없어 호출 스레드에서 즉시 커밋한 수. ★`scheduled` 와 섞지 않는다★ --
+    /// 이것들은 스케줄된 적이 없으므로 slip 표본도 lock_wait 표본도 만들지 않는다.
+    pub immediate: u64,
     /// 마감보다 늦게 커밋한 시간. 크면 스케줄러가 병목이다.
+    pub slip_n: u64,
     pub slip_us_max: u64,
     pub slip_us_sum: u64,
     /// 디바이스 뮤텍스 대기. ★0 에 가까워야 한다는 위 가정의 검산이다.★
+    pub lock_n: u64,
     pub lock_wait_us_max: u64,
     pub lock_wait_us_sum: u64,
 }
@@ -48,8 +80,11 @@ struct Shared {
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
 static SCHEDULED: AtomicU64 = AtomicU64::new(0);
+static IMMEDIATE: AtomicU64 = AtomicU64::new(0);
+static SLIP_N: AtomicU64 = AtomicU64::new(0);
 static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
+static LOCK_N: AtomicU64 = AtomicU64::new(0);
 static LOCK_MAX: AtomicU64 = AtomicU64::new(0);
 static LOCK_SUM: AtomicU64 = AtomicU64::new(0);
 
@@ -118,6 +153,7 @@ pub(crate) fn device_guard(device: usize) -> std::sync::MutexGuard<'static, ()> 
 fn record_lock_wait(ticks: u64) {
     let Some(freq) = qpc_frequency() else { return };
     let us = ticks.saturating_mul(1_000_000) / freq.max(1);
+    LOCK_N.fetch_add(1, Ordering::Relaxed);
     LOCK_SUM.fetch_add(us, Ordering::Relaxed);
     LOCK_MAX.fetch_max(us, Ordering::Relaxed);
 }
@@ -153,7 +189,7 @@ pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
         // "격자 어디에 떨어졌나" 라는 질문이 성립하지 않는다 -- 기록하면 정상적으로
         // 정렬된 표본들의 p50 을 의미 없는 값으로 오염시킨다.
         crate::dcomp_compositor::commit_device_ptr(device);
-        SCHEDULED.fetch_add(1, Ordering::Relaxed);
+        IMMEDIATE.fetch_add(1, Ordering::Relaxed);
         return;
     }
     {
@@ -167,8 +203,11 @@ pub(crate) fn schedule(device: usize, monitor: usize, deadline_qpc: u64) {
 fn take_stats() -> SchedulerStats {
     SchedulerStats {
         scheduled: SCHEDULED.swap(0, Ordering::Relaxed),
+        immediate: IMMEDIATE.swap(0, Ordering::Relaxed),
+        slip_n: SLIP_N.swap(0, Ordering::Relaxed),
         slip_us_max: SLIP_MAX.swap(0, Ordering::Relaxed),
         slip_us_sum: SLIP_SUM.swap(0, Ordering::Relaxed),
+        lock_n: LOCK_N.swap(0, Ordering::Relaxed),
         lock_wait_us_max: LOCK_MAX.swap(0, Ordering::Relaxed),
         lock_wait_us_sum: LOCK_SUM.swap(0, Ordering::Relaxed),
     }
@@ -182,69 +221,87 @@ fn scheduler_loop(shared: &Arc<Shared>) {
         SCHEDULER_ALIVE.store(false, Ordering::Relaxed);
         return;
     };
-    // 아래 `'grab` 라벨 블록 안에 있는 `continue` 를 그 블록이 아니라 이 루프로 보내려면
-    // 라벨을 밝혀야 한다(라벨 블록 안의 무라벨 `continue` 는 어느 쪽을 뜻하는지 모호해
-    // rustc 가 거부한다).
-    //
     // ★OUTCOMMIT 은 여기서 낸다.★ 예전엔 타일 4 개 각자의 `maybe_emit_bind_profile` 이
     // 독립된 ~1 초 타이머로 이 표본들을 비웠다 -- 즉 한 줄이 실제로는 임의의 ~0.25 초
     // 조각이었고, 그 창이 짧아진 만큼 `slip_us_max`/`lock_wait_us_max` 도 작게 나와
     // Task 6 판정 기준 4/5 를 엉뚱한 이유로 통과시킬 뻔했다(Fix round 1, Ruling 16). 표본을
     // 만드는 스레드가 유일한 창을 재는 것이 맞다 -- 방출자는 하나, 창도 하나.
     let mut last_emit = std::time::Instant::now();
-    'sched: loop {
-        // 때가 된 것을 전부 꺼낸다.
-        // `let-else` 의 `else` 갈래는 반드시 발산해야 한다(값을 만들어 블록을 그 값으로
-        // 끝내는 용도가 아니다) -- 그래서 바깥 블록에 이름을 붙이고 `break` 로 값을 낸다.
-        let due: Vec<(u64, usize, usize)> = 'grab: {
+    loop {
+        // 때가 된 것을 전부 꺼낸다. ★기다림은 락을 쥔 채 이 안쪽 루프에서 한다★ --
+        // `condvar.wait*` 는 가드를 돌려주므로 그것을 그대로 다시 쓰면 되고, 깨자마자 놓았다가
+        // 바깥 루프 맨 위에서 다시 잡을 이유가 없다(그 한 사이클이 예전 구조의 잉여였다).
+        let due: Vec<(u64, usize, usize)> = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(now) = qpc_now() else {
-                // 시계를 못 읽으면 큐를 비워 폴백한다 -- 붙들고 있으면 화면이 멈춘다.
-                break 'grab queue.drain(..).collect();
-            };
-            let mut ready = Vec::new();
-            queue.retain(|&(deadline, device, monitor)| {
-                if deadline <= now {
-                    ready.push((deadline, device, monitor));
-                    false
-                } else {
-                    true
+            loop {
+                let Some(now) = qpc_now() else {
+                    // 시계를 못 읽으면 큐를 비워 폴백한다 -- 붙들고 있으면 화면이 멈춘다.
+                    break queue.drain(..).collect();
+                };
+                let mut ready = Vec::new();
+                queue.retain(|&(deadline, device, monitor)| {
+                    if deadline <= now {
+                        ready.push((deadline, device, monitor));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if !ready.is_empty() {
+                    break ready;
                 }
-            });
-            if ready.is_empty() {
                 // 가장 이른 마감까지 잔다. 큐가 비면 알림을 기다린다.
                 let wait = queue.iter().map(|&(d, _, _)| d).min().map(|d| {
                     let ticks = d.saturating_sub(now);
                     std::time::Duration::from_secs_f64(ticks as f64 / freq as f64)
                 });
-                // `let _ = ...` 로 락 가드를 받으면 `let_underscore_lock` 이 deny 라 빌드가
-                // 깨진다 -- 깨우자마자 버릴 가드라 바인딩 자체가 무의미하므로 `drop` 으로
-                // 명시한다(재잠금은 다음 루프 회전 맨 위에서 다시 한다).
-                match wait {
+                queue = match wait {
                     Some(duration) => {
-                        drop(shared.condvar.wait_timeout(queue, duration));
+                        shared
+                            .condvar
+                            .wait_timeout(queue, duration)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
                     },
-                    None => {
-                        drop(shared.condvar.wait(queue));
-                    },
-                }
-                continue 'sched;
+                    None => shared
+                        .condvar
+                        .wait(queue)
+                        .unwrap_or_else(|e| e.into_inner()),
+                };
             }
-            ready
         };
 
         for (deadline, device, monitor) in due {
             if let Some(now) = qpc_now() {
                 let slip = now.saturating_sub(deadline);
                 let us = slip.saturating_mul(1_000_000) / freq.max(1);
+                SLIP_N.fetch_add(1, Ordering::Relaxed);
                 SLIP_SUM.fetch_add(us, Ordering::Relaxed);
                 SLIP_MAX.fetch_max(us, Ordering::Relaxed);
             }
-            let _guard = device_guard(device);
-            crate::dcomp_compositor::commit_device_ptr(device);
+            // ★가드는 `Commit()` 한 줄만 감싼다.★ 이 뮤텍스를 기다리는 상대(그 타일의
+            // painter, 비디오 fast-path)는 ANGLE GL 락을 쥔 채로 기다린다. 가드 안에서 하는
+            // 일이 길어지면 그만큼 그 락도 길게 잡히고, 같은 디바이스의 WebGL 스레드가 그
+            // 뒤에 줄을 선다 -- 생산 스레드가 커밋 대기에 동기화되는 그 회귀다. 그래서
+            // `note_dwm_phase`(전역 뮤텍스 + DWM 조회 + 초당 한 번 로그 I/O)를 품은
+            // `commit_device_ptr` 대신 순수 커밋만 부르고, 나머지는 전부 가드 밖으로 뺀다.
+            {
+                let _guard = device_guard(device);
+                crate::dcomp_compositor::commit_device_ptr_raw(device);
+            }
+            // 가드를 푼 뒤에 한다. 이 두 줄은 DComp 디바이스를 만지지 않으므로 painter 와
+            // 겹쳐도 안전하다.
+            crate::dcomp_compositor::note_dwm_phase();
 
             // ★이것이 판정이다.★ 이 커밋이 **자기 출력** 격자의 어디에 떨어졌나.
             // 지금까지는 데스크톱 격자 하나만 보였으므로 나머지 셋이 어디 있는지 알 수 없었다.
+            //
+            // ★단, 이 위상은 순환이다.★ `Commit()` 이 돌아온 시각을 이 출력 격자에 접은
+            // 값인데, 마감을 정한 것도 같은 격자다 -- DWM 이 실제로 언제 가져갔는지는 재지
+            // 않으므로, 격자가 틀려도 이 값은 여전히 목표치를 가리킨다(재는 것은 사실상
+            // 스케줄러가 제 마감을 얼마나 잘 맞췄나이고, 그건 `slip` 이 이미 잰다). 격자 자체의
+            // 검산은 아래 `OUTCOMMIT` 줄의 `period_ms`/`measured` 와, 프로브가 커밋과 무관하게
+            // 내는 `OUTPHASE` 다.
             //
             // ★게이트는 여기, 수집 자체에 건다.★ (Fix round 1, Ruling 15) 예전엔 `record_phase`
             // 호출만 `DCOMP_BIND_PROF` 뒤에 있고 `grid_for_monitor` 는 무조건 불렸다 --
@@ -285,28 +342,50 @@ fn scheduler_loop(shared: &Arc<Shared>) {
 /// 거짓말한다. 전역 통계는 별도의 `total` 줄로 딱 한 번만 낸다.
 fn emit_outcommit() {
     let stats = take_stats();
+    let freq = qpc_frequency().unwrap_or(0);
     for (monitor, mut phase) in take_phases() {
         if phase.is_empty() {
             continue;
         }
         phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
+        // ★주기와 그 출처를 같이 찍는다.★ 위 위상은 마감을 정한 격자로 다시 접은 값이라
+        // 격자가 틀려도 목표치를 가리킨다 -- 즉 p50 만으로는 격자를 검산할 수 없다.
+        // 60Hz 벽에서 `period_ms` 가 16.67 이 아니면(8.33, 12.50 …) 주기 추정이 틀린 것이고,
+        // `measured=0` 이면 실측을 못 얻어 60Hz 가정값으로 돌고 있다는 뜻이다.
+        let grid = crate::output_grid::grid_for_monitor(monitor);
+        let period_ms = match (grid, freq) {
+            (Some(grid), freq) if freq > 0 => grid.period_qpc as f64 * 1000.0 / freq as f64,
+            _ => 0.0,
+        };
+        let measured = grid.is_some_and(|grid| grid.measured);
+        // 이름이 없으면(프로브가 아직 못 열거했거나 핫플러그 직후) 물음표를 남긴다 -- 줄을
+        // 통째로 거르면 정작 문제 있는 타일이 로그에서 사라진다.
+        let name = crate::output_grid::name_for_monitor(monitor).unwrap_or_else(|| "?".into());
         warn!(
-            "OUTCOMMIT monitor={monitor:#x} n={} phase p05={:.3} p50={:.3} p95={:.3}",
+            "OUTCOMMIT out={name} monitor={monitor:#x} period_ms={period_ms:.2} measured={} \
+             n={} phase p05={:.3} p50={:.3} p95={:.3}",
+            u8::from(measured),
             phase.len(),
             at(0.05),
             at(0.50),
             at(0.95),
         );
     }
+    // ★평균마다 제 분모를 쓴다.★ 예전에는 셋 다 `scheduled` 로 나눴는데, `scheduled` 에는
+    // 스케줄된 적 없는 즉시 커밋까지 들어 있었고 `lock_wait` 표본은 스케줄당 둘이었다 --
+    // 모집단이 서로 다른 값을 같은 수로 나누고 있었다는 뜻이다.
     warn!(
-        "OUTCOMMIT total scheduled={} slip_us_max={} slip_us_avg={} \
-         lock_wait_us_max={} lock_wait_us_avg={}",
+        "OUTCOMMIT total scheduled={} immediate={} slip_n={} slip_us_max={} slip_us_avg={} \
+         lock_n={} lock_wait_us_max={} lock_wait_us_avg={}",
         stats.scheduled,
+        stats.immediate,
+        stats.slip_n,
         stats.slip_us_max,
-        stats.slip_us_sum / stats.scheduled.max(1),
+        stats.slip_us_sum / stats.slip_n.max(1),
+        stats.lock_n,
         stats.lock_wait_us_max,
-        stats.lock_wait_us_sum / stats.scheduled.max(1),
+        stats.lock_wait_us_sum / stats.lock_n.max(1),
     );
 }
 

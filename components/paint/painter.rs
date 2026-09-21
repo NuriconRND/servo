@@ -1970,6 +1970,12 @@ impl Painter {
         // 전역이던 시절 이 값은 WebGL 스레드와의 경합까지 포함했지만, 이제 같은 디바이스를
         // 쓰는 상대하고만 부딪친다 — 그래서 이 수치가 여전히 크다면 그건 GPU 를 공유하는
         // 다른 타일이지 WebGL 이 아니다.
+        //
+        // ★정렬 pref(`gfx_present_align_per_output_pct`)가 켜져 있으면 스케줄러의 커밋도 이
+        // 값에 들어간다.★ 이 락 안에서 도는 `end_frame` 이 그 디바이스의 커밋 뮤텍스를
+        // 잡으므로, 스케줄러가 같은 디바이스를 커밋하는 중이면 이 painter 는 ANGLE 락을 쥔 채
+        // 그 커밋이 끝나기를 기다린다. 그 대기의 상한은 `Commit()` 하나(~0.02ms)로 못 박혀
+        // 있고(`commit_scheduler` 모듈 주석), 실제 값은 OUTCOMMIT 의 `lock_wait_us_max` 다.
         let angle_lock_ms;
         {
             let lock_start = Instant::now();
