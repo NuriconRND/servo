@@ -2930,7 +2930,6 @@ impl Paint {
                         );
                     });
                 }
-                let mut all_scheduled = true;
                 for painter_id in self.painter_ids() {
                     let pending = self
                         .with_painter(painter_id, |painter| {
@@ -2946,12 +2945,19 @@ impl Paint {
                         Some(deadline) => crate::commit_scheduler::schedule(device, deadline),
                         None => {
                             // 격자를 못 구하면 지금 낸다 = 오늘 동작. 나빠지지 않는다.
-                            all_scheduled = false;
+                            //
+                            // ★그래도 가드를 잡는다.★ 이 폴백이 나오는 바로 그 상황(핫플러그
+                            // 직후 monitor_for_hwnd 가 새 HMONITOR 를 주는데 grid_for_monitor
+                            // 가 아직 못 채웠다)에서, 옛 모니터를 향해 이전에 건 스케줄이 이
+                            // 디바이스에 대해 아직 큐에 남아 있을 수 있다(최대 두 주기).
+                            // schedule() 은 upsert 라 이 경로가 다시 schedule() 을 부르지
+                            // 않는 한 그 옛 항목을 밀어내지 못한다 -- 즉 이 즉시 커밋은
+                            // 스케줄러 스레드와 이 디바이스를 두고 겹칠 수 있다.
+                            let _guard = crate::commit_scheduler::device_guard(device);
                             crate::dcomp_compositor::commit_device_ptr(device);
                         },
                     }
                 }
-                let _ = all_scheduled;
                 return;
             }
         }
