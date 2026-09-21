@@ -546,6 +546,20 @@ pub struct Preferences {
     /// ★대기가 아니다.★ 타이머가 깨어나는 **시각**만 바뀐다. 생산 스레드가 공유
     /// 객체에 줄 서는 회귀(`GstSystemClock` 사건)가 구조적으로 생기지 않는다.
     pub gfx_present_align_dwm_pct: i64,
+    /// ★타일마다 자기 출력의 vblank 격자에 맞춰 Commit 한다.★ `-1`(기본) = 끔,
+    /// `0..99` = 그 출력 주기의 백분율 지점을 겨냥한다.
+    ///
+    /// `gfx_present_align_dwm_pct` 는 **데스크톱(주 모니터) 격자 하나**에만 맞춘다. 실측에서
+    /// 네 모니터의 vblank 가 주기의 0.67 에 흩어져 있어(log_ani_debug_02/02: 기준 대비
+    /// +1.17 / +6.57 / −4.63ms), 좋은 자리를 5ms 로 넉넉히 잡아도 네 창의 교집합이
+    /// 공집합이다 -- 어떤 커밋 시각을 골라도 최소 한 대는 나쁜 자리에 앉는다. 그래서
+    /// 타일마다 따로 맞춘다.
+    ///
+    /// 켜면 `gfx_dcomp_parallel_commit` 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
+    ///
+    /// 이 값이 고치는 것은 **타일 내 저더**다. 이음매를 넘는 물체의 완전한 연속성은 genlock
+    /// 없이 성립하지 않는다.
+    pub gfx_present_align_per_output_pct: i64,
     /// 프리-vsync 페이싱용 자유 실행 페인트 타이머 주기(Hz). 특정 디스플레이 주사율(예 60)에
     /// 맞춰 프레임 생산이 vsync 를 앞질러 저더가 생기는 것을 줄인다. `[1, 1000]` 범위를
     /// 벗어나면 경고 후 기본값(120)을 쓴다.
@@ -1161,6 +1175,7 @@ impl Preferences {
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
             gfx_present_align_dwm_pct: -1,
+            gfx_present_align_per_output_pct: -1,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,

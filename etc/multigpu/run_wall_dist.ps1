@@ -153,6 +153,18 @@ param(
     # 줄 서는 회귀(GstSystemClock 사건)가 구조적으로 생기지 않는다.
     [ValidateRange(-1, 99)]
     [int]    $DwmAlign = -1,
+    # gfx_present_align_per_output_pct: 타일마다 자기 출력의 vblank 격자에 맞춰 Commit.
+    # -1(기본) = 끔, 0..99 = 그 출력 주기의 백분율 지점.
+    #
+    # ★-DwmAlign 과의 차이★ -DwmAlign 은 데스크톱(주 모니터) 격자 하나에만 맞춘다. 실측에서
+    # 네 모니터의 vblank 가 주기의 0.67 에 흩어져 있어(기준 대비 +1.17 / +6.57 / -4.63ms),
+    # 좋은 자리를 5ms 로 잡아도 네 창의 교집합이 공집합이다 -- 어떤 시각을 골라도 최소 한
+    # 대는 나쁜 자리에 앉는다. 그래서 타일마다 따로 맞춘다.
+    #
+    # 켜면 -DcompParallelCommit 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
+    # 판정은 -DcompBindProf 의 OUTCOMMIT 줄 -- 네 출력의 phase p50 이 전부 목표 근처여야 한다.
+    [ValidateRange(-1, 99)]
+    [int]    $PerOutputAlign = -1,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -670,6 +682,7 @@ $argList = @(
     "--pref", "gfx_vsync_phase_pct=$VsyncPhase",
     "--pref", "gfx_present_sync_interval=$PresentSync",
     "--pref", "gfx_present_align_dwm_pct=$DwmAlign",
+    "--pref", "gfx_present_align_per_output_pct=$PerOutputAlign",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -738,7 +751,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign per_output_align=$PerOutputAlign escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
