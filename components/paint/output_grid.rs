@@ -106,77 +106,6 @@ pub(crate) fn grid_for_monitor(monitor: usize) -> Option<OutputGrid> {
     GRID.lock().ok()?.as_ref()?.get(&monitor).copied()
 }
 
-/// 이 벽 프레임의 **공통 목표 표시 시각**(QPC)과 그때 쓴 주기. 한 패스 안에서 네 painter 가
-/// 같은 값을 받는다.
-///
-/// ★타일마다 따로 올림하면 안 된다.★ 처음 구현이 그랬고, 그것이 실기에서 2 프레임 이상의
-/// 타일 간 어긋남을 만들었다(log_ani_debug_02/07). 각 타일이 *자기* 다음 vblank 로 올림하는데
-/// 공통 기준이 없으면, 두 타일의 렌더가 격자 경계를 사이에 두고 갈라질 때 절대 시각이 한
-/// 주기 통째로 벌어진다. 설계가 약속한 것은 "위상차 이내(= 1 프레임 미만)" 였으므로 그것은
-/// 거래가 아니라 결함이다.
-///
-/// 그래서 기준 출력 하나의 격자에서 T 를 한 번 구하고, 타일은 거기에 **자기 위상 오프셋만**
-/// 더한다. 오프셋은 정의상 `[0, period)` 이므로 네 타일의 퍼짐이 **구조적으로** 한 주기
-/// 미만이다. T 가 다음 격자점으로 넘어갈 때는 넷이 **함께** 넘어간다.
-///
-/// 한 패스 안에서 같은 T 를 주려고 반 주기 동안 기억한다 -- 벽 패스는 ~2.5ms 라 네 painter 가
-/// 그 창 안에 전부 들어온다.
-fn wall_sample_base(now: u64, lead_periods: u64) -> Option<(u64, u64)> {
-    static BASE: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
-    let (reference, period) = reference_grid()?;
-    let mut guard = BASE.lock().ok()?;
-    if let Some((set_at, base, remembered)) = *guard {
-        if remembered == period && now.saturating_sub(set_at) < period / 2 {
-            return Some((base, period));
-        }
-    }
-    let base = now
-        .saturating_add(lead_ticks(now, reference, period, lead_periods)?);
-    *guard = Some((now, base, period));
-    Some((base, period))
-}
-
-/// 기준 출력의 vblank 와 주기. ★어느 것을 고르든 상관없지만 **매번 같아야 한다**★ --
-/// 기준이 바뀌면 T 가 통째로 움직인다. HMONITOR 최솟값은 열거 순서와 무관하게 안정적이다.
-fn reference_grid() -> Option<(u64, u64)> {
-    let guard = GRID.lock().ok()?;
-    let map = guard.as_ref()?;
-    let (_, grid) = map
-        .iter()
-        .filter(|(_, grid)| grid.period_qpc > 0)
-        .min_by_key(|(monitor, _)| **monitor)?;
-    Some((grid.vblank_qpc, grid.period_qpc))
-}
-
-/// 기준 격자로부터 이 출력이 얼마나 뒤에 있나. 정의상 `[0, period)`.
-///
-/// 격자가 없는 타일은 0 -- ★`now` 로 떨어뜨리지 않는다.★ 예전에는 그렇게 했고, 그러면 그
-/// 타일만 lead 0 이고 나머지는 17~33ms 라 **즉시 2 프레임이 벌어졌다**. 공통 T 를 그대로
-/// 쓰는 편이 언제나 낫다: 위상 보정을 못 받을 뿐 같은 프레임 안에 머문다.
-fn phase_offset_for(monitor: usize, reference_vblank: u64, period: u64) -> u64 {
-    let Some(grid) = grid_for_monitor(monitor) else {
-        return 0;
-    };
-    if period == 0 {
-        return 0;
-    }
-    let period_i = period as i128;
-    let delta = grid.vblank_qpc as i128 - reference_vblank as i128;
-    (((delta % period_i) + period_i) % period_i) as u64
-}
-
-/// 이 타일이 **공통 목표 시각**에 닿기까지 남은 간격. B2 의 샘플 시각이 이것이다.
-pub(crate) fn lead_to_next_vblank(monitor: usize, lead_periods: u64) -> Option<Duration> {
-    let now = qpc_now()?;
-    let freq = qpc_frequency()?;
-    let (base, period) = wall_sample_base(now, lead_periods)?;
-    let (reference_vblank, _) = reference_grid()?;
-    let target = base.saturating_add(phase_offset_for(monitor, reference_vblank, period));
-    // 이미 지난 목표는 0 으로 -- 음수 lead 는 만들지 않는다. `lead_periods >= 1` 이면 T 가
-    // 최소 한 주기 앞이라 정상 부하에서는 걸리지 않는다.
-    let ticks = target.saturating_sub(now);
-    Some(Duration::from_secs_f64(ticks as f64 / freq as f64))
-}
 
 /// ★주기는 재는 것이 아니라 **정해진 값**이다.★ 디스플레이 모드가 알려 준다.
 ///
@@ -222,7 +151,7 @@ fn display_frequency_hz(name: &str) -> Option<u64> {
     }
 }
 
-/// `lead_to_next_vblank` 의 산술만 갈라낸 것 -- COM 도 시계도 없이 테스트할 수 있다.
+/// `lead_to_next_composition` 의 산술만 갈라낸 것 -- COM 도 시계도 없이 테스트할 수 있다.
 ///
 /// `vblank` 는 드라이버에 따라 직전일 수도 다음일 수도 있으므로 나머지 연산을 두 번 걸어
 /// 어느 쪽이든 격자 위의 같은 점으로 접는다(`deadline_for_monitor` 와 같은 규약).
@@ -256,6 +185,40 @@ struct DcompSample {
     /// 그 합성보다 이 타일의 커밋이 얼마나 **앞서** 들어갔나(한 주기로 접음).
     /// ★한 주기에 가까우면 여유가 많고, 0 에 가까우면 마감을 스치고 있다는 뜻이다.★
     commit_lead_ms: Option<f64>,
+}
+
+/// ★공통 합성 격자 — (마지막 합성 QPC, 주기 QPC).★
+///
+/// 실기(log_ani_debug_02/09·10)에서 네 DComp 디바이스가 **같은** `lastFrameTime` 과
+/// `rate=60.000Hz` 를 돌려주는 것이 확인됐다(`phase_ms p05=p50=p95=7.84`, 네 출력 동일).
+/// DWM 은 네 타일을 하나의 데스크톱 합성 패스에서 함께 올린다 -- 출력마다 다른 것은 합성이
+/// 아니라 스캔아웃 시점뿐이다. 그래서 맞출 격자는 출력별이 아니라 **이 하나**다.
+///
+/// 이 값이 B1·B2 가 왜 둘 다 아무 효과가 없었는지를 설명한다: 둘 다 출력별 vblank 에
+/// 맞췄는데, 맞출 대상인 합성이 이미 공통이었다.
+static COMPOSITION: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+pub(crate) fn composition_grid() -> Option<(u64, u64)> {
+    *COMPOSITION.lock().ok()?
+}
+
+/// 이 프레임이 표시될 **합성 시각**까지 남은 간격. 네 타일이 같은 값을 받는다.
+///
+/// ★샘플과 표시가 같은 클럭 위에 있어야 한다.★ 지금까지는 렌더가 끝난 순간의 벽시계로
+/// 샘플했다. 그 간격은 실측으로 16.06~18.07ms 로 흔들리는데(`ANIMSTEP dt_ms`), 합성은
+/// 정확히 16.667ms 마다 일어난다(지터 0). 그래서 36.0px 움직인 프레임과 41.0px 움직인
+/// 프레임이 같은 시간 동안 표시되고, 등속 운동이 ±6% 로 빨라졌다 느려졌다 한다 -- 그것이
+/// 이 추적 내내 쫓던 저더다. 애니메이션은 내내 정확했다. 틀린 것은 어느 시계로 물었느냐다.
+///
+/// ★렌더 틱도 같은 격자에 잠가야 한다(`gfx_present_align_dwm_pct`).★ 자유 실행하는 렌더를
+/// 격자에 스냅하기만 하면 가끔 두 렌더가 같은 격자점에 걸려 그 프레임의 변위가 0 이 되고
+/// 다음이 두 칸을 뛴다. 출력별 격자로 그것을 한 번 겪었다(B2 1 차, ANIMSTEP p05 35.0→29.3).
+pub(crate) fn lead_to_next_composition(lead_periods: u64) -> Option<Duration> {
+    let (last, period) = composition_grid()?;
+    let now = qpc_now()?;
+    let freq = qpc_frequency()?;
+    let ticks = lead_ticks(now, last, period, lead_periods)?;
+    Some(Duration::from_secs_f64(ticks as f64 / freq as f64))
 }
 
 static DCOMP_STATS: Mutex<Option<HashMap<usize, Vec<DcompSample>>>> = Mutex::new(None);
@@ -320,6 +283,15 @@ pub(crate) fn note_dcomp_stat(
         let delta = last as i128 - commit as i128;
         to_ms((((delta % period_i) + period_i) % period_i) as u64)
     });
+    // ★격자 갱신은 계측 게이트 밖이다.★ B2 가 이 격자를 쓰므로, 프로파일이 꺼져 있다고
+    // 격자를 안 채우면 B2 가 통째로 무력해진다 -- B1 에서 프로브를 진단 플래그 뒤에 두어
+    // 똑같이 당한 적이 있다(설계 문서 C5).
+    if let Ok(mut guard) = COMPOSITION.lock() {
+        *guard = Some((last, period_ticks));
+    }
+    if !*crate::dcomp_compositor::DCOMP_BIND_PROF {
+        return;
+    }
     let sample = DcompSample {
         phase_ms: to_ms(last % period_ticks),
         behind_ms: to_ms(now.saturating_sub(last)),
@@ -868,42 +840,47 @@ mod tests {
     /// 두고 갈라지면 두 타일이 한 주기 통째로 벌어졌다. 실기에서 2 프레임 이상, 관측자 기준
     /// 5 프레임까지 어긋났다(log_ani_debug_02/07). 설계가 약속한 것은 위상차 이내였다.
     ///
-    /// 지금은 공통 T 에 `phase_offset_for` 만 더하므로 퍼짐 = 오프셋들의 범위이고, 오프셋은
-    /// 정의상 `[0, period)` 다. 이 단언이 그 불변식을 지킨다.
+    /// 그런데 계측이 그 전제를 다시 뒤집었다 -- 아래 테스트가 지금의 보장이다.
     #[test]
-    fn every_offset_stays_inside_one_period() {
+    fn samples_land_exactly_on_the_grid() {
         let period = 166_667;
-        let reference = 1_000_000;
-        // 실측 위상(log_ani_debug_02/02): 기준 대비 +1.17 / +6.57 / −4.63ms.
-        let period_signed = period as i64;
-        for delta in [0_i64, 11_700, 65_700, -46_300, 1 - period_signed, period_signed - 1] {
-            let vblank = (reference as i64 + delta) as u64;
-            let period_i = period as i128;
-            let offset =
-                (((vblank as i128 - reference as i128) % period_i + period_i) % period_i) as u64;
-            assert!(
-                offset < period,
-                "delta={delta} 의 오프셋 {offset} 이 한 주기를 넘었다"
+        let last = 1_000_000;
+        // 격자점에서 얼마나 떨어져 물어도, 샘플 시각은 언제나 격자점 위다.
+        for offset in [1_u64, 1_000, 83_333, 166_666] {
+            let now = last + offset;
+            let lead = lead_ticks(now, last, period, 1).unwrap();
+            assert_eq!(
+                (now + lead - last) % period,
+                0,
+                "offset={offset} 에서 샘플이 격자를 벗어났다"
             );
         }
     }
 
-    /// ★두 출력의 샘플 시각 차이가 곧 위상차여야 한다.★ 오프셋이 전부 0 이면 B2 는 아무
-    /// 일도 하지 않고, 한 주기를 넘으면 위 보장이 깨진다 -- 그 사이여야 한다.
+    /// ★★네 타일이 **같은** 샘플 시각을 받아야 한다 -- 이제 이것이 보장이다.★★
+    ///
+    /// 출력별 격자에 맞추던 시절에는 "퍼짐이 한 주기 미만" 이 목표였다. 실기 계측이 그 전제를
+    /// 뒤집었다(log_ani_debug_02/09·10): 네 DComp 디바이스가 같은 `lastFrameTime` 과
+    /// `rate=60.000Hz` 를 돌려준다. DWM 은 네 타일을 하나의 합성 패스에서 함께 올리므로 맞출
+    /// 격자는 하나뿐이고, 그러면 네 타일의 lead 는 **같아야** 한다. 다르게 주는 것은 오차다.
+    ///
+    /// `lead_to_next_composition` 이 모니터를 인자로 받지 않으므로 이 성질은 타입으로도
+    /// 보장되지만, 그 설계 결정 자체를 여기 못박아 둔다.
     #[test]
-    fn two_outputs_differ_by_their_vblank_phase() {
+    fn all_tiles_get_the_same_lead_from_the_shared_grid() {
         let period = 166_667;
-        let reference = 1_000_000;
-        let period_i = period as i128;
-        let offset_of = |vblank: u64| {
-            (((vblank as i128 - reference as i128) % period_i + period_i) % period_i) as u64
-        };
-        // 두 출력의 vblank 가 11.2ms(= 112_000 틱) 떨어져 있다.
-        let a = offset_of(reference);
-        let b = offset_of(reference + 112_000);
-        assert_eq!(a, 0, "기준 출력의 오프셋은 0 이다");
-        assert_eq!(b - a, 112_000, "샘플 시각 차이가 vblank 위상차와 같아야 한다");
-        assert!(b < period, "그래도 한 주기 안이다");
+        let last = 1_000_000;
+        let now = 5_000_000;
+        let first = lead_ticks(now, last, period, 1).unwrap();
+        for tile in 0..4 {
+            assert_eq!(
+                lead_ticks(now, last, period, 1).unwrap(),
+                first,
+                "타일 {tile} 이 다른 lead 를 받았다 -- 공통 격자에서는 있을 수 없다"
+            );
+        }
+        // 한 주기 앞(lead_periods=1) + 다음 격자점까지의 거리.
+        assert_eq!(first, period - (4_000_000 % period) + period);
     }
 
     /// 모드에서 온 주기가 실측 흔들림을 흡수하는가. 60Hz 와 59.94Hz 를 가려내되, 고른 뒤에는

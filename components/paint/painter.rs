@@ -3700,7 +3700,13 @@ impl Painter {
     /// 영향을 주지 않을 만큼 드물고, 실패 횟수는 `failed` 가 센다).
     #[cfg(windows)]
     fn note_dcomp_frame_statistics(&self) {
-        if !*crate::dcomp_compositor::DCOMP_BIND_PROF {
+        // ★B2 가 켜져 있으면 프로파일과 무관하게 떠야 한다.★ 이 호출이 공통 합성 격자를
+        // 채우고 B2 가 그것을 쓴다 -- 진단 플래그 뒤에 두면 `-SampleLead` 만 준 운영 구성에서
+        // 격자가 영영 비어 기능이 통째로 무력해진다. B1 에서 프로브를 그렇게 두어 똑같이
+        // 당한 적이 있다(설계 문서 C5). 통계 히스토그램 쪽은 여전히 프로파일 뒤에 있다.
+        if !*crate::dcomp_compositor::DCOMP_BIND_PROF &&
+            crate::commit_scheduler::SAMPLE_LEAD_PERIODS.is_none()
+        {
             return;
         }
         let Some(monitor) = self.tile_monitor() else {
@@ -3726,19 +3732,18 @@ impl Painter {
             let Some(lead_periods) = *crate::commit_scheduler::SAMPLE_LEAD_PERIODS else {
                 return Duration::ZERO;
             };
-            // ★격자를 쓰는 쪽이 프로브를 띄운다.★ B1 에서 이것을 빠뜨려, 정렬만 켜고
-            // `-DcompBindProf` 를 안 주면 격자가 영영 비어 기능이 통째로 무력했다(설계 문서
-            // C5). `Once` 라 두 번째부터는 원자적 읽기 하나다.
-            crate::output_grid::start_probe();
-            let lead = self
-                .tile_monitor()
-                .and_then(|monitor| {
-                    crate::output_grid::lead_to_next_vblank(monitor, lead_periods)
-                        .map(|lead| (monitor, lead))
-                });
-            match lead {
-                Some((monitor, lead)) => {
-                    crate::output_grid::note_sample_lead(monitor, lead);
+            // ★격자는 **공통 합성 격자** 하나다.★ 출력별 vblank 가 아니다 -- 계측으로
+            // 확인된 바에 따르면 DWM 은 네 타일을 하나의 합성 패스에서 함께 올리므로
+            // (`output_grid::COMPOSITION` 주석), 타일마다 다른 기준에 맞추는 것은 오차만
+            // 더한다. B2 1 차가 그렇게 해서 `ANIMSTEP` 을 나쁘게 만들었다.
+            //
+            // 그 격자는 `note_dcomp_frame_statistics` 가 매 프레임 채운다. 첫 프레임 전이나
+            // 조회가 실패하면 `None` -> 오늘 동작(지금 시각 샘플)으로 떨어진다.
+            match crate::output_grid::lead_to_next_composition(lead_periods) {
+                Some(lead) => {
+                    if let Some(monitor) = self.tile_monitor() {
+                        crate::output_grid::note_sample_lead(monitor, lead);
+                    }
                     lead
                 },
                 None => {

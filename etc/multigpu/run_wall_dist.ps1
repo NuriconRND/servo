@@ -178,6 +178,10 @@ param(
     #
     # 판정은 -DcompBindProf 의 SAMPLELEAD 줄 -- 네 출력의 lead_ms 가 서로 위상차만큼
     # 벌어져 있어야 한다. 전부 같으면 B2 가 걸리지 않은 것이다.
+    #
+    # ★-DwmAlign 과 같이 써야 한다.★ 이것만 켜면 자유 실행하는 렌더를 합성 격자에 스냅하는
+    # 셈이라, 가끔 두 렌더가 같은 격자점에 걸려 그 프레임의 변위가 0 이 되고 다음이 두 칸을
+    # 뛴다. -DwmAlign 이 렌더 틱 자체를 같은 격자에 잠가 프레임↔합성을 1:1 로 만든다.
     [ValidateRange(-1, 4)]
     [int]    $SampleLead = -1,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
@@ -617,6 +621,16 @@ if ($DcompBindProf -and $DComp -eq "off") {
 # only value that reaches here with alignment off is -1 -- but spelling the upper bound out keeps
 # this guard honest if that ValidateRange is ever widened, rather than throwing for a combination
 # that is not actually live.
+# -SampleLead 는 애니메이션을 DWM 합성 격자 위에서 샘플한다. 그런데 렌더 틱이 자유 실행이면
+# (=-DwmAlign 없음) 렌더와 격자가 서서히 미끄러져, 가끔 두 렌더가 같은 격자점에 걸린다. 그
+# 프레임은 변위가 0 이고 다음 프레임이 두 칸을 뛴다 -- 고치려던 저더보다 나쁘다. 실측으로
+# 겪은 실패다(출력별 격자로 같은 일을 했을 때 ANIMSTEP p05 가 35.0 에서 29.3 으로 떨어졌다).
+# throw 하지 않는 이유: 둘을 따로 재보는 것 자체가 유효한 실험이다. 다만 조용히 나빠지게
+# 두지는 않는다.
+if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
+    Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
+}
+
 if ($PerOutputAlign -ge 0 -and $PerOutputAlign -le 99 -and $DcompCommitInFrame) {
     throw "-PerOutputAlign $PerOutputAlign needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to schedule."
 }
