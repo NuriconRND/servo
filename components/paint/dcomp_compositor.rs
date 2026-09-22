@@ -1666,6 +1666,11 @@ pub(crate) fn note_dwm_phase() {
 /// 정문은 둘뿐이다: 가드 밖이면 [`commit_device_ptr`](가드를 스스로 잡는다), 이미 쥐고
 /// 있으면 [`commit_device_ptr_locked`].
 ///
+/// `DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`. 그 디바이스의 서피스가 `BeginDraw` 로
+/// 열려 있는 동안 `Commit()` 이 돌려주는 값이다. ★실패가 아니라 "아직" 으로 다뤄야 한다★ --
+/// 버리면 그 프레임의 시각 변경이 화면에 닿지 않는다(`commit_scheduler` 의 재시도 주석).
+pub(crate) const DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED: i32 = 0x8898_0801_u32 as i32;
+
 /// Safety: 살아 있는 `IDCompositionDevice` 포인터여야 한다.
 #[inline]
 unsafe fn raw_commit(device: *mut IDCompositionDevice) -> i32 {
@@ -3415,6 +3420,15 @@ impl Compositor for DCompNativeCompositor {
         // 지난 프레임이 미뤄 둔 Commit 이 아직 남아 있으면 여기서 흘린다 — 셸이 flush 를
         // 부르지 않는 경우(servoshell)에도 화면이 멈추지 않게 하는 자기복구다.
         self.flush_deferred_commit();
+        // ★스케줄러에 걸린 마감도 여기서 먼저 내보낸다.★ 아래부터 이 프레임의 서피스가
+        // `BeginDraw` 로 열리고, 그동안 그 디바이스의 `Commit()` 은 전부 거부된다
+        // (`SURFACE_BEING_RENDERED`). 마감은 최대 한 주기 뒤이고 프레임 간격도 그 정도라
+        // 겹침은 타일에 따라 상시로 일어난다 -- 실기 2 회차에서 저더와 깜박임의 정체가
+        // 이것이었다. 정렬 pref 가 꺼져 있으면 이 함수는 즉시 돌아온다.
+        #[cfg(windows)]
+        if let Some(dcomp_device) = self.dcomp_device_ptr() {
+            crate::commit_scheduler::flush_before_render(dcomp_device as usize);
+        }
         let Some(root) = self.root_visual_ptr() else {
             return;
         };

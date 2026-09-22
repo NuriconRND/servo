@@ -82,6 +82,15 @@ pub(crate) struct SchedulerStats {
     pub lock_sched_n: u64,
     pub lock_sched_us_max: u64,
     pub lock_sched_us_sum: u64,
+    /// ★제한 없는 커밋 실패 수.★ `note_commit_failure` 의 로그는 디바이스당 초당 한 줄로
+    /// 묶여 있어, 실패가 잦아지면 그 줄 수가 초 수에 붙어 버리고 실제 횟수를 못 본다
+    /// (실기 2 회차에서 DISPLAY15 가 104 초 중 82 초에 걸쳐 실패했는데, 그게 82 번인지
+    /// 8200 번인지 알 방법이 없었다). 이 계수는 묶지 않는다.
+    pub failed: u64,
+    /// `SURFACE_BEING_RENDERED` 라서 버리지 않고 다시 큐에 넣은 수.
+    pub retried: u64,
+    /// 다음 렌더가 서피스를 열기 전에 앞당겨 내보낸 커밋 수.
+    pub early: u64,
 }
 
 struct Shared {
@@ -95,6 +104,9 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
 static SCHEDULED: AtomicU64 = AtomicU64::new(0);
 static IMMEDIATE: AtomicU64 = AtomicU64::new(0);
+static FAILED: AtomicU64 = AtomicU64::new(0);
+static RETRIED: AtomicU64 = AtomicU64::new(0);
+static EARLY: AtomicU64 = AtomicU64::new(0);
 static SLIP_N: AtomicU64 = AtomicU64::new(0);
 static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +140,63 @@ fn remember_device_monitor(device: usize, monitor: usize) {
 pub(crate) fn monitor_for_device(device: usize) -> Option<usize> {
     let guard = DEVICE_MONITOR.lock().ok()?;
     guard.as_ref()?.get(&device).copied()
+}
+
+fn bump_retry(device: usize) -> u32 {
+    let Ok(mut guard) = RETRY_COUNTS.lock() else {
+        return u32::MAX;
+    };
+    let slot = guard.get_or_insert_with(HashMap::new).entry(device).or_insert(0);
+    *slot += 1;
+    *slot
+}
+
+fn clear_retry(device: usize) {
+    if let Ok(mut guard) = RETRY_COUNTS.lock() {
+        if let Some(map) = guard.as_mut() {
+            map.remove(&device);
+        }
+    }
+}
+
+/// ★다음 렌더가 서피스를 열기 전에, 이 디바이스에 걸린 마감을 먼저 내보낸다.★
+///
+/// `begin_frame` 이 부른다. 이것이 없으면 마감이 다음 프레임의 렌더 창 안으로 떨어질 수
+/// 있고, 그러면 `Commit()` 이 `SURFACE_BEING_RENDERED` 로 거부된다. 마감은 최대 한 주기
+/// 뒤이고 프레임 간격도 그 정도라, 그 겹침은 드문 일이 아니라 타일에 따라 상시로 일어난다.
+///
+/// 여기서 내보내면 그 타일의 정렬은 이번 프레임에 한해 포기하는 셈이다. 그래도 옳다 --
+/// 다음 렌더가 시작할 때까지 마감이 오지 않았다는 것은 **이미 정렬에 실패했다**는 뜻이고,
+/// 그 시점에 남은 선택은 "지금 커밋" 과 "거부당하고 버림" 둘뿐이다.
+///
+/// 잠금 순서는 스케줄러와 같다: 큐 락을 먼저 잡아 항목을 빼고 **놓은 뒤에** 디바이스 가드를
+/// 잡는다. 두 락을 겹쳐 쥐지 않으므로 역전이 생길 수 없다.
+pub(crate) fn flush_before_render(device: usize) {
+    if ALIGN_PCT.is_none() {
+        return;
+    }
+    let Some(shared) = SHARED.get() else {
+        return;
+    };
+    let had_pending = {
+        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let before = queue.len();
+        queue.retain(|&(_, d, _)| d != device);
+        before != queue.len()
+    };
+    if !had_pending {
+        return;
+    }
+    EARLY.fetch_add(1, Ordering::Relaxed);
+    let hr = {
+        let _guard = device_guard(device, GuardRole::Painter);
+        crate::dcomp_compositor::commit_device_ptr_locked(device)
+    };
+    clear_retry(device);
+    if hr < 0 {
+        FAILED.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::dcomp_compositor::note_commit_failure(hr, device, "before_render");
 }
 
 fn record_phase(monitor: usize, phase: f64) {
@@ -165,6 +234,19 @@ static SCHEDULER_ALIVE: AtomicBool = AtomicBool::new(false);
 // 것은 실질적으로 정적 할당이다. 이러면 가드의 수명이 그 뮤텍스의 실제 수명(=프로세스 전체)
 // 과 타입 그대로 일치해서, 드롭 순서에 정확성이 매달리지 않는다.
 static DEVICE_LOCKS: Mutex<Option<HashMap<usize, &'static Mutex<()>>>> = Mutex::new(None);
+
+/// `SURFACE_BEING_RENDERED` 재시도 횟수를 디바이스마다 센다. 성공하면 0 으로 되돌린다.
+/// 큐 원소에 시도 횟수를 얹지 않고 여기 두는 이유는, 재시도가 **같은 디바이스에 대해서만**
+/// 연쇄하기 때문이다 -- 큐 원소는 재시도마다 새로 쓰이므로 거기 들고 다녀 봐야 같은 값이다.
+static RETRY_COUNTS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// 한 마감에 대해 이만큼까지만 다시 시도한다. 그 뒤에는 실패를 받아들이고 큐에서 뺀다 --
+/// 렌더가 어떤 이유로든 끝나지 않는 상황에서 스케줄러가 1kHz 로 도는 것을 막는 상한이다.
+/// 렌더 한 번이 1~2ms 이므로 정상 동작에서는 한두 번이면 끝난다.
+const MAX_RETRIES: u32 = 8;
+
+/// 재시도 간격. 서피스가 닫히기를 기다리는 것이므로 짧아야 하지만, 0 이면 바쁜 대기가 된다.
+const RETRY_DELAY_US: u64 = 1_000;
 
 /// 디바이스마다 하나. ★프로세스 수명으로 누수시킨다★ -- 디바이스는 넷이고 프로세스 내내
 /// 살므로 실질적으로 정적 할당이다. `Arc` + 수명 늘리기를 쓰면 가드와 소유권의 드롭 순서에
@@ -284,6 +366,9 @@ fn take_stats() -> SchedulerStats {
         lock_sched_n: LOCK_SCHED_N.swap(0, Ordering::Relaxed),
         lock_sched_us_max: LOCK_SCHED_MAX.swap(0, Ordering::Relaxed),
         lock_sched_us_sum: LOCK_SCHED_SUM.swap(0, Ordering::Relaxed),
+        failed: FAILED.swap(0, Ordering::Relaxed),
+        retried: RETRIED.swap(0, Ordering::Relaxed),
+        early: EARLY.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -369,6 +454,35 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             };
             // 가드를 푼 뒤에 한다. 아래 세 줄은 DComp 디바이스를 만지지 않으므로 painter 와
             // 겹쳐도 안전하다.
+            // ★`SURFACE_BEING_RENDERED` 는 실패가 아니라 "아직"이다.★
+            //
+            // 그 타일의 WebRender 렌더가 서피스를 `BeginDraw` 로 열어 둔 동안에는 그 디바이스의
+            // `Commit()` 이 통째로 거부된다. 예전에는 그걸 로그만 찍고 버렸고, 그러면 그 프레임의
+            // 시각 변경이 화면에 영영 닿지 않는다 -- 실기 2 회차(log_ani_debug_02/04)에서
+            // 육안 불량 순위와 이 실패 건수 순위가 정확히 같았다(129: 20 건, 130: 89 건,
+            // 131: 152 건, 그리고 실패가 몰린 출력이 곧 지목된 타일이었다).
+            //
+            // 그래서 버리지 않고 짧게 다시 건다. 렌더는 1~2ms 면 끝나므로 보통 한두 번이면
+            // 통과한다. `MAX_RETRIES` 는 렌더가 끝나지 않는 상황에서 이 스레드가 1kHz 로 도는
+            // 것을 막는 상한이다 -- 거기 닿으면 포기하고 다음 프레임의 스케줄에 맡긴다.
+            if hr == crate::dcomp_compositor::DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED {
+                let attempts = bump_retry(device);
+                if attempts <= MAX_RETRIES {
+                    RETRIED.fetch_add(1, Ordering::Relaxed);
+                    let delay = freq.saturating_mul(RETRY_DELAY_US) / 1_000_000;
+                    if let Some(now) = qpc_now() {
+                        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        upsert(&mut queue, device, monitor, now.saturating_add(delay));
+                    }
+                    // 위상도 통계도 남기지 않는다 -- 아직 일어나지 않은 커밋이다.
+                    continue;
+                }
+                // 상한에 닿았다. 아래로 떨어져 실패로 집계한다.
+            }
+            clear_retry(device);
+            if hr < 0 {
+                FAILED.fetch_add(1, Ordering::Relaxed);
+            }
             crate::dcomp_compositor::note_commit_failure(hr, device, "commitsched");
             crate::dcomp_compositor::note_dwm_phase();
 
@@ -459,11 +573,15 @@ fn emit_outcommit() {
     // 그 상한이 `Commit()` 하나라는 주장의 검산이다. `lock_wait_sched_*` 는 반대 방향이라
     // Ruling 18 의 서피스 루프만큼 길 수 있고, 기준 4 와 섞으면 정상인 벽도 탈락한다.
     warn!(
-        "OUTCOMMIT total scheduled={} immediate={} slip_n={} slip_us_max={} slip_us_avg={} \
+        "OUTCOMMIT total scheduled={} immediate={} failed={} retried={} early={} \
+         slip_n={} slip_us_max={} slip_us_avg={} \
          lock_wait_painter_n={} lock_wait_painter_us_max={} lock_wait_painter_us_avg={} \
          lock_wait_sched_n={} lock_wait_sched_us_max={} lock_wait_sched_us_avg={}",
         stats.scheduled,
         stats.immediate,
+        stats.failed,
+        stats.retried,
+        stats.early,
         stats.slip_n,
         stats.slip_us_max,
         stats.slip_us_sum / stats.slip_n.max(1),
