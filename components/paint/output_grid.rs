@@ -217,15 +217,32 @@ pub(crate) fn lead_to_next_composition(lead_periods: u64) -> Option<Duration> {
     let (last, period) = composition_grid()?;
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
-    let ticks = lead_ticks(now, last, period, lead_periods)?;
-    let target = now.saturating_add(ticks);
-    // 격자 인덱스로 옮겨 단조성을 강제한 뒤 다시 시각으로 돌린다.
-    let want = target.saturating_sub(last) / period;
+    let want = wanted_index(now, last, period, lead_periods)?;
     let index = monotonic_sample_index(now, period, want);
-    let target = last.saturating_add(index.saturating_mul(period));
+    let target = target_for_index(last, period, index);
     Some(Duration::from_secs_f64(
         target.saturating_sub(now) as f64 / freq as f64,
     ))
+}
+
+/// 이 시각이 겨누는 격자점의 **절대** 인덱스.
+///
+/// ★원점은 격자의 위상이지 `last` 가 아니다.★ 처음에는 `(target - last) / period` 로 셌는데,
+/// `last`(마지막 합성 시각)는 매 프레임 한 칸 전진한다. 그러면 정상 동작에서 인덱스가 늘
+/// 같은 값(예: 2)으로 나오고, 거기에 단조 증가를 강제하니 매 프레임 한 칸씩 **덧**전진해
+/// 샘플 시각이 두 배 속도로 달아났다. 실기에서 물체가 훨씬 빠르게 오른쪽 끝에 도달하고 그
+/// 뒤로 반복 재생되지 않았다(log_ani_debug_02/12).
+///
+/// `last % period` 는 격자의 위상이라 프레임이 지나도 **같은 값**이다. 그것을 원점으로 삼으면
+/// 인덱스가 절대값이 되고, 정상 동작에서 프레임마다 정확히 1 씩 는다.
+fn wanted_index(now: u64, last: u64, period: u64, lead_periods: u64) -> Option<u64> {
+    let ahead = lead_ticks(now, last, period, lead_periods)?;
+    let target = now.saturating_add(ahead);
+    Some(target.saturating_sub(last % period) / period)
+}
+
+fn target_for_index(last: u64, period: u64, index: u64) -> u64 {
+    (last % period).saturating_add(index.saturating_mul(period))
 }
 
 /// 한 프레임에 격자 한 칸. ★이것이 없으면 프레임당 변위가 가끔 0 이 되고 다음이 두 칸을
@@ -256,10 +273,13 @@ fn monotonic_sample_index(now: u64, period: u64, want: u64) -> u64 {
         if now.saturating_sub(set_at) < period / 2 {
             return index;
         }
+        // ★정상 대역에서는 **정확히** 한 칸이다.★ `max` 로 하한만 걸면 계산값이 두 칸 앞선
+        // 경우(skip)가 그대로 통과한다 -- dup 만 막고 skip 은 남는다. 프레임 하나에 합성
+        // 하나이므로 한 칸이 정답이고, 벗어난 값은 미끄러짐이지 정보가 아니다.
         let next = if want > index.saturating_add(STALL_CATCHUP) {
             want
         } else {
-            want.max(index.saturating_add(1))
+            index.saturating_add(1)
         };
         *guard = Some((now, next));
         return next;
@@ -859,7 +879,9 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_ticks, monotonic_sample_index, period_from_pair};
+    use super::{
+        lead_ticks, monotonic_sample_index, period_from_pair, target_for_index, wanted_index,
+    };
 
     /// B2 의 샘플 시각 산술. ★타일을 갈라놓는 것은 `vblank` 가 출력마다 다르다는 사실
     /// 하나이고, 이 함수가 그 차이를 그대로 통과시켜야 한다.★
@@ -928,6 +950,44 @@ mod tests {
         }
         // 한 주기 앞(lead_periods=1) + 다음 격자점까지의 거리.
         assert_eq!(first, period - (4_000_000 % period) + period);
+    }
+
+    /// ★★샘플 시각이 실시간보다 빨리 흐르면 안 된다.★★
+    ///
+    /// 이것을 못 잡아서 실기 한 라운드를 버렸다(log_ani_debug_02/12). 인덱스를 움직이는
+    /// 원점(`last`)에서 세어 놓고 단조 증가를 강제했더니, 정상 동작에서도 매 프레임 한 칸씩
+    /// 덧전진해 물체가 두 배 속도로 날아가 화면 끝에 닿고 멈췄다. 프레임을 여러 번 돌려
+    /// 샘플 시각이 **정확히 한 주기씩** 나아가는지 보는 것이 그 결함을 잡는 단언이다.
+    #[test]
+    fn the_sample_time_advances_exactly_one_period_per_frame() {
+        let period = 166_667;
+        let phase = 12_345;
+        let mut previous: Option<u64> = None;
+        let mut last_target: Option<u64> = None;
+        for frame in 0..10_u64 {
+            // 합성 격자도 매 프레임 한 칸 전진한다 -- 이것이 결함의 전제였다.
+            let last = phase + (100 + frame) * period;
+            // 렌더는 합성 직후 조금씩 다른 시각에 끝난다(±1ms 지터).
+            let jitter = (frame % 3) as u64 * 10_000;
+            let now = last + 1_000 + jitter;
+            let want = wanted_index(now, last, period, 1).unwrap();
+            let index = match previous {
+                Some(prev) if want > prev + 4 => want,
+                Some(prev) => prev + 1,
+                None => want,
+            };
+            previous = Some(index);
+            let target = target_for_index(last, period, index);
+            if let Some(before) = last_target {
+                assert_eq!(
+                    target - before,
+                    period,
+                    "프레임 {frame} 에서 샘플 시각이 한 주기가 아니라 {} 틱 나아갔다",
+                    target - before
+                );
+            }
+            last_target = Some(target);
+        }
     }
 
     /// ★한 프레임에 격자 한 칸.★ 미끄러져 같은 칸이 나와도 전진해야 하고, 한 패스 안에서는
