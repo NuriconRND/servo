@@ -1175,14 +1175,28 @@ impl Painter {
         //
         // 여기서 앞당겨 보면 이음매 오차가 사라지는 대신 **상수가 된다**(속도 × 위상차).
         // 그 거래가 이 pref 의 내용이다. 꺼져 있으면(`-1`, 기본) 예전 그대로 지금 시각이다.
-        let now = Instant::now() + self.paint_animation_sample_lead();
+        //
+        // ★★두 시계를 절대 섞지 않는다.★★ `now` 는 **진짜 지금**이고 아래의 게이트 판정
+        // (`renderer_is_running`, `push_due`, `last_paint_animation_push_at`)이 전부 이것을
+        // 쓴다. 그 판정들은 `last_render_started_at` 같은 **실제** 시각과 비교하므로, 여기에
+        // 미래 시각을 넣으면 경과 시간이 lead 만큼 부풀어 판정이 뒤집힌다.
+        //
+        // 처음 구현에서 실제로 그렇게 했고 실기에서 **fps 가 절반으로 보였다**
+        // (log_ani_debug_02/06, 137). lead 가 최대 두 주기(33ms)인데
+        // `renderer_is_running` 의 창이 `animation_period * 4`(120Hz 기준 33ms)라, 렌더가
+        // 멀쩡히 도는데도 "렌더가 멈췄다" 로 읽혀 타이머 폴백 경로로 넘어갔다.
+        //
+        // 샘플 시각은 오직 `update_paint_animations` 에만 들어간다 -- 그것이 B2 가 바꾸려는
+        // 유일한 것이다: **언제 그릴까가 아니라, 어느 시각의 값을 그릴까.**
+        let now = Instant::now();
+        let sample_at = now + self.paint_animation_sample_lead();
         let mut floats = Vec::new();
         let mut transforms = Vec::new();
         let mut still_animating = false;
         for renderer in self.webview_renderers.values() {
             renderer.for_each_connected_pipeline(&mut |pipeline_details| {
                 still_animating |= pipeline_details.animations.update_paint_animations(
-                    now,
+                    sample_at,
                     &mut floats,
                     &mut transforms,
                 );
