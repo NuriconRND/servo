@@ -339,69 +339,7 @@ fn emit_sampleslip() {
     }
 }
 
-/// 프레임 번호로 **언제** 한 칸 나아갈지 정하고, 시계로 **어디에 있어야 하는지**를 교정한다.
-///
-/// ★두 번 실패한 자리다. 실패 이유가 둘 다 같다: 프레임 경계를 흉내 냈다.★
-/// 처음에는 호출 수로 셌는데 네 페인터가 각자 올려 초당 256 칸이 됐고(실시간은 60 칸),
-/// 다음에는 반 주기 시간 창으로 묶었는데 `-ParallelTiles` 의 페인터들이 그보다 넓게
-/// 흩어져 끝나 같은 일이 났다. 둘 다 애니메이션이 몇 초 미래로 달아나 멈춘 것처럼 보였다.
-///
-/// 이 코드베이스에는 **진짜 프레임 번호**가 이미 있다 -- 벽 프레임마다 하나씩 늘고 네
-/// 페인터가 같은 값을 보는 `last_ready_wall_logical_frame_id`. 흉내 낼 필요가 없었다.
-///
-/// 그런데 프레임 번호만 쓰면 다른 쪽으로 어긋난다: 생산이 정확히 60.000/s 가 아니면
-/// (실측 60~61/s) 애니메이션 시각이 실시간에서 서서히 벌어진다. 앞선 폭주의 느린 판이다.
-/// 그래서 매 프레임 시계 쪽으로 **`MAX_CORRECTION` 칸 이내**로만 당긴다 -- 달아날 수 없고,
-/// 슬립(시계가 한 칸 튀는 것)은 흡수된다.
-///
-/// 왜 교정이 필요한가: 틱이 격자에 정확히 못 앉는다. 실측 틱 간격은 p50 16.67 / p95 17.23ms
-/// 인데 주기는 16.667ms 다(`ControlFlow::WaitUntil` 은 OS 타이머다). 그래서 시계에서 바로
-/// 뽑은 인덱스는 전체의 4.28% 에서 미끄러졌다(log_ani_debug_02/16).
-fn locked_sample_index(frame_id: Option<u64>, want: u64) -> u64 {
-    /// 한 프레임에 이만큼까지만 당긴다.
-    ///
-    /// ★작아야 한다.★ 0.25 로 잡았더니 `estimate` 가 프레임당 최대 1.25 칸 나아가고, 그
-    /// 반올림이 가끔 두 칸을 뛰었다 -- 없애려던 그 증상이다. 0.02 면 한 칸을 따라잡는 데
-    /// 50 프레임(0.8 초)이 걸리는 대신, 정상 상태에서 반올림이 흔들리지 않는다. 고칠 대상은
-    /// 느린 드리프트이고 빠른 지터는 걸러야 하는 쪽이므로 이 방향이 맞다.
-    const MAX_CORRECTION: f64 = 0.02;
-    /// 이보다 벌어지면 교정이 아니라 재동기다(스톨·탐색·시계 점프).
-    const RESYNC_PERIODS: f64 = 8.0;
-
-    static STATE: Mutex<Option<(u64, f64)>> = Mutex::new(None);
-    let Ok(mut guard) = STATE.lock() else {
-        return want;
-    };
-    // 프레임 번호가 없으면(렌더가 멈춰 폴백이 부른 경우) 시계를 그대로 쓴다 -- 그 경로는
-    // 애초에 "아무도 프레임을 안 만든다" 를 깨우려 있는 것이라 프레임 경계가 없다.
-    let Some(frame_id) = frame_id else {
-        *guard = None;
-        return want;
-    };
-    let Some((last_id, mut estimate)) = *guard else {
-        *guard = Some((frame_id, want as f64));
-        return want;
-    };
-    if frame_id == last_id {
-        // 같은 벽 프레임의 다른 페인터. ★여기서 올리면 안 된다★ -- 이것이 두 번의 폭주였다.
-        return estimate.round() as u64;
-    }
-    estimate += frame_id.saturating_sub(last_id) as f64;
-    let error = want as f64 - estimate;
-    if error.abs() > RESYNC_PERIODS {
-        estimate = want as f64;
-    } else {
-        estimate += error.clamp(-MAX_CORRECTION, MAX_CORRECTION);
-    }
-    *guard = Some((frame_id, estimate));
-    estimate.round() as u64
-}
-
-pub(crate) fn lead_to_next_composition(
-    monitor: usize,
-    lead_periods: u64,
-    frame_id: Option<u64>,
-) -> Option<Duration> {
+pub(crate) fn lead_to_next_composition(monitor: usize, lead_periods: u64) -> Option<Duration> {
     let (last, period) = composition_grid()?;
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
@@ -416,8 +354,7 @@ pub(crate) fn lead_to_next_composition(
     // 오므로 **달아날 수 없다** -- 미끄러질 때 한 칸을 건너뛸 뿐이고 실측에서 그 슬립은
     // 창의 11% 였다(나머지 89% 는 dx spread 0.005). 슬립을 없애려면 먼저 저 102 회의
     // 정체를 알아야 한다.
-    let want = wanted_index(now, last, period, lead_periods)?;
-    let index = locked_sample_index(frame_id, want);
+    let index = wanted_index(now, last, period, lead_periods)?;
     // 렌더가 격자의 어디에 떨어졌나. 슬립이 경계에 몰리는지 보려면 이 값이 필요하다.
     let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
     note_sample_slip(monitor, index, phase_ms);
@@ -1039,9 +976,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        lead_ticks, locked_sample_index, period_from_pair, target_for_index, wanted_index,
-    };
+    use super::{lead_ticks, period_from_pair, target_for_index, wanted_index};
 
     /// B2 의 샘플 시각 산술. ★타일을 갈라놓는 것은 `vblank` 가 출력마다 다르다는 사실
     /// 하나이고, 이 함수가 그 차이를 그대로 통과시켜야 한다.★
@@ -1148,55 +1083,6 @@ mod tests {
             }
             last_target = Some(target);
         }
-    }
-
-    /// ★같은 벽 프레임의 네 페인터는 인덱스를 올리지 않는다.★ 이것을 두 번 틀려 두 번
-    /// 회귀를 냈다(호출 수로 셌을 때, 시간 창으로 묶었을 때). 이 단언이 그 두 실패를
-    /// 동시에 막는다 -- 같은 `frame_id` 로 몇 번을 불러도 값이 그대로여야 한다.
-    #[test]
-    fn painters_in_one_frame_share_the_index() {
-        let base = 1_000_u64;
-        let first = locked_sample_index(Some(7), base);
-        for _painter in 0..8 {
-            assert_eq!(
-                locked_sample_index(Some(7), base + 1),
-                first,
-                "같은 벽 프레임인데 인덱스가 움직였다 -- 두 번 낸 회귀가 이것이다"
-            );
-        }
-    }
-
-    /// ★흔들리는 시계를 걸러 낸다.★ 실기에서 시계에서 바로 뽑은 인덱스는 전체의 4.28% 에서
-    /// 미끄러졌다(same 596 / jump2 28 / jumpN 447). 틱이 격자에 정확히 못 앉기 때문이다
-    /// (p50 16.67 / p95 17.23ms, 주기 16.667ms). 프레임 번호가 한 칸씩 늘고 시계가 그 주위로
-    /// 흔들릴 때, 인덱스는 **매 프레임 정확히 한 칸**이어야 한다.
-    #[test]
-    fn a_jittering_clock_still_advances_exactly_one_step() {
-        let _ = locked_sample_index(None, 0);
-        let mut previous = locked_sample_index(Some(300), 1_000);
-        // 시계는 한 칸씩 늘되 ±1 로 흔들린다 -- 실측 슬립의 모양이다.
-        let jitter = [0_i64, 1, 0, -1, 0, 1, -1, 0, 1, 0, -1, 0];
-        for (step, wobble) in jitter.iter().enumerate() {
-            let frame = 301 + step as u64;
-            let want = (1_000 + 1 + step as i64 + wobble) as u64;
-            let index = locked_sample_index(Some(frame), want);
-            assert_eq!(
-                index,
-                previous + 1,
-                "프레임 {frame}: 시계가 {want} 로 흔들렸다고 인덱스가 따라 흔들리면 안 된다"
-            );
-            previous = index;
-        }
-    }
-
-    /// 크게 벌어지면(스톨·시계 점프) 교정이 아니라 재동기다 -- 안 그러면 따라잡는 데
-    /// 몇 초가 걸린다.
-    #[test]
-    fn a_large_error_resyncs_instead_of_crawling() {
-        let _ = locked_sample_index(None, 0);
-        let _ = locked_sample_index(Some(200), 1_000);
-        let index = locked_sample_index(Some(201), 2_000);
-        assert_eq!(index, 2_000, "크게 벌어졌으면 바로 맞춰야 한다");
     }
 
     /// 모드에서 온 주기가 실측 흔들림을 흡수하는가. 60Hz 와 59.94Hz 를 가려내되, 고른 뒤에는
