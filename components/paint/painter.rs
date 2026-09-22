@@ -1148,6 +1148,8 @@ impl Painter {
             Instant::now().duration_since(at) >= crate::refresh_driver::paint_timer_period() * 4
         });
         if renderer_idle {
+            #[cfg(windows)]
+            crate::output_grid::note_pump_from_idle();
             self.pump_paint_animation();
         }
     }
@@ -2080,6 +2082,8 @@ impl Painter {
         // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
         // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
+        #[cfg(windows)]
+        crate::output_grid::note_pump_from_render();
         self.pump_paint_animation();
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));

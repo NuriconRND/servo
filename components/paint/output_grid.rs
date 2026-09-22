@@ -232,6 +232,27 @@ struct SlipTally {
 
 static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
 
+/// `pump_paint_animation` 이 어디서 불렸나. ★슬립의 정체가 호출 간격이므로 이것이 다음
+/// 질문이다.★
+///
+/// 위상 가설은 계측으로 폐기됐다(log_ani_debug_02/15): 렌더는 주기의 2~3ms 에 안정적으로
+/// 떨어지고 슬립도 같은 자리에서 난다. 남은 사실은 호출 간격이 불규칙하다는 것뿐이다 --
+/// `same` 476(같은 주기에 두 번)과 `jumpN` 248(세 주기 이상 거름)이 그 모양이고,
+/// 초당 호출이 64.4 회인데 렌더는 61 회다.
+///
+/// 호출 지점은 둘뿐이라 세면 바로 갈린다: 렌더 끝(`Painter::render`)과 렌더가 멈췄을 때의
+/// 폴백(`perform_updates`).
+static PUMP_FROM_RENDER: AtomicU64 = AtomicU64::new(0);
+static PUMP_FROM_IDLE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_pump_from_render() {
+    PUMP_FROM_RENDER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_pump_from_idle() {
+    PUMP_FROM_IDLE.fetch_add(1, Ordering::Relaxed);
+}
+
 /// ★슬립이 **언제** 일어나는지 찍는다.★
 ///
 /// 정상 창의 프레임당 변위는 38.40px 에 spread 0.004 로 사실상 완벽한데, 창의 28% 에
@@ -274,6 +295,8 @@ fn note_sample_slip(monitor: usize, index: u64, phase_ms: f64) {
 }
 
 fn emit_sampleslip() {
+    let from_render = PUMP_FROM_RENDER.swap(0, Ordering::Relaxed);
+    let from_idle = PUMP_FROM_IDLE.swap(0, Ordering::Relaxed);
     let tallies: Vec<(usize, SlipTally)> = match SLIPS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map
@@ -300,7 +323,8 @@ fn emit_sampleslip() {
         warn!(
             "SAMPLESLIP out={name} n={} same={} jump2={} jumpN={} \
              phase_all_ms p05={:.2} p50={:.2} p95={:.2} \
-             phase_slip_ms n={slip_n} p05={:.2} p50={:.2} p95={:.2}",
+             phase_slip_ms n={slip_n} p05={:.2} p50={:.2} p95={:.2} \
+             pump_all from_render={from_render} from_idle={from_idle}",
             tally.n,
             tally.same,
             tally.jump2,
