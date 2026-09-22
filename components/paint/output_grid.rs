@@ -33,7 +33,10 @@ use winapi::shared::dxgi::{
     CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
 };
 use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use winapi::um::winuser::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use winapi::um::wingdi::DEVMODEW;
+use winapi::um::winuser::{
+    ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+};
 
 /// 한 출력의 vblank 격자.
 #[derive(Clone, Copy, Debug)]
@@ -45,10 +48,11 @@ pub(crate) struct OutputGrid {
     pub vblank_qpc: u64,
     /// 한 주기의 QPC 틱.
     pub period_qpc: u64,
-    /// `period_qpc` 가 실측인가. 거짓이면 60Hz 가정값으로 떨어진 것이다.
-    /// ★틀린 주기는 마감을 매 프레임 격자의 다른 자리에 떨어뜨려, 이 작업이 없애려는 바로
-    /// 그 저더를 만든다.★ 그런데 위상 로그는 같은 격자로 접으므로 주기가 틀려도 목표치를
-    /// 가리킨다 -- 실측인지 가정인지를 따로 싣지 않으면 그 사실을 볼 방법이 없다.
+    /// `period_qpc` 를 믿을 근거가 있나. 참이면 디스플레이 모드에서 온 정확값(또는 정상
+    /// 범위의 실측)이고, 거짓이면 60Hz 가정값으로 떨어진 것이다.
+    /// ★틀린 주기는 목표 지점을 매 프레임 격자의 다른 자리에 떨어뜨려, 이 작업이 없애려는
+    /// 바로 그 저더를 만든다.★ 그런데 위상 로그는 같은 격자로 접으므로 주기가 틀려도
+    /// 목표치를 가리킨다 -- 출처를 따로 싣지 않으면 그 사실을 볼 방법이 없다.
     pub measured: bool,
 }
 
@@ -102,20 +106,120 @@ pub(crate) fn grid_for_monitor(monitor: usize) -> Option<OutputGrid> {
     GRID.lock().ok()?.as_ref()?.get(&monitor).copied()
 }
 
-/// 지금부터 그 출력이 **다음에 표시할 시각**까지의 간격. B2 의 샘플 시각이 이것이다.
+/// 이 벽 프레임의 **공통 목표 표시 시각**(QPC)과 그때 쓴 주기. 한 패스 안에서 네 painter 가
+/// 같은 값을 받는다.
 ///
-/// `lead_periods` 는 다음 vblank 에서 몇 주기를 더 앞서 볼지다 -- 값은 네 타일에 공통이라
-/// 이음매 정렬에는 영향이 없고 콘텐츠 전체의 이르냐 늦냐만 바꾼다. 타일을 갈라놓는 것은
-/// `vblank_qpc` 가 출력마다 다르다는 사실 하나다.
+/// ★타일마다 따로 올림하면 안 된다.★ 처음 구현이 그랬고, 그것이 실기에서 2 프레임 이상의
+/// 타일 간 어긋남을 만들었다(log_ani_debug_02/07). 각 타일이 *자기* 다음 vblank 로 올림하는데
+/// 공통 기준이 없으면, 두 타일의 렌더가 격자 경계를 사이에 두고 갈라질 때 절대 시각이 한
+/// 주기 통째로 벌어진다. 설계가 약속한 것은 "위상차 이내(= 1 프레임 미만)" 였으므로 그것은
+/// 거래가 아니라 결함이다.
 ///
-/// 격자가 없거나(프로브 미가동·핫플러그 직후) 시계를 못 읽으면 `None` -- 호출자는 오늘
-/// 동작(지금 시각 샘플)으로 떨어진다.
+/// 그래서 기준 출력 하나의 격자에서 T 를 한 번 구하고, 타일은 거기에 **자기 위상 오프셋만**
+/// 더한다. 오프셋은 정의상 `[0, period)` 이므로 네 타일의 퍼짐이 **구조적으로** 한 주기
+/// 미만이다. T 가 다음 격자점으로 넘어갈 때는 넷이 **함께** 넘어간다.
+///
+/// 한 패스 안에서 같은 T 를 주려고 반 주기 동안 기억한다 -- 벽 패스는 ~2.5ms 라 네 painter 가
+/// 그 창 안에 전부 들어온다.
+fn wall_sample_base(now: u64, lead_periods: u64) -> Option<(u64, u64)> {
+    static BASE: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
+    let (reference, period) = reference_grid()?;
+    let mut guard = BASE.lock().ok()?;
+    if let Some((set_at, base, remembered)) = *guard {
+        if remembered == period && now.saturating_sub(set_at) < period / 2 {
+            return Some((base, period));
+        }
+    }
+    let base = now
+        .saturating_add(lead_ticks(now, reference, period, lead_periods)?);
+    *guard = Some((now, base, period));
+    Some((base, period))
+}
+
+/// 기준 출력의 vblank 와 주기. ★어느 것을 고르든 상관없지만 **매번 같아야 한다**★ --
+/// 기준이 바뀌면 T 가 통째로 움직인다. HMONITOR 최솟값은 열거 순서와 무관하게 안정적이다.
+fn reference_grid() -> Option<(u64, u64)> {
+    let guard = GRID.lock().ok()?;
+    let map = guard.as_ref()?;
+    let (_, grid) = map
+        .iter()
+        .filter(|(_, grid)| grid.period_qpc > 0)
+        .min_by_key(|(monitor, _)| **monitor)?;
+    Some((grid.vblank_qpc, grid.period_qpc))
+}
+
+/// 기준 격자로부터 이 출력이 얼마나 뒤에 있나. 정의상 `[0, period)`.
+///
+/// 격자가 없는 타일은 0 -- ★`now` 로 떨어뜨리지 않는다.★ 예전에는 그렇게 했고, 그러면 그
+/// 타일만 lead 0 이고 나머지는 17~33ms 라 **즉시 2 프레임이 벌어졌다**. 공통 T 를 그대로
+/// 쓰는 편이 언제나 낫다: 위상 보정을 못 받을 뿐 같은 프레임 안에 머문다.
+fn phase_offset_for(monitor: usize, reference_vblank: u64, period: u64) -> u64 {
+    let Some(grid) = grid_for_monitor(monitor) else {
+        return 0;
+    };
+    if period == 0 {
+        return 0;
+    }
+    let period_i = period as i128;
+    let delta = grid.vblank_qpc as i128 - reference_vblank as i128;
+    (((delta % period_i) + period_i) % period_i) as u64
+}
+
+/// 이 타일이 **공통 목표 시각**에 닿기까지 남은 간격. B2 의 샘플 시각이 이것이다.
 pub(crate) fn lead_to_next_vblank(monitor: usize, lead_periods: u64) -> Option<Duration> {
-    let grid = grid_for_monitor(monitor)?;
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
-    let ticks = lead_ticks(now, grid.vblank_qpc, grid.period_qpc, lead_periods)?;
+    let (base, period) = wall_sample_base(now, lead_periods)?;
+    let (reference_vblank, _) = reference_grid()?;
+    let target = base.saturating_add(phase_offset_for(monitor, reference_vblank, period));
+    // 이미 지난 목표는 0 으로 -- 음수 lead 는 만들지 않는다. `lead_periods >= 1` 이면 T 가
+    // 최소 한 주기 앞이라 정상 부하에서는 걸리지 않는다.
+    let ticks = target.saturating_sub(now);
     Some(Duration::from_secs_f64(ticks as f64 / freq as f64))
+}
+
+/// ★주기는 재는 것이 아니라 **정해진 값**이다.★ 디스플레이 모드가 알려 준다.
+///
+/// 처음에는 vblank 관측에서 주기를 역산했다. 그 산술을 한 번 고쳤지만(한 바퀴를 출력 수로
+/// 나누던 것 → 같은 출력의 연속 두 vblank), **측정이 옳은 출처인가는 묻지 않았다.** 그것이
+/// 잘못이었다: 실측값은 16.55~16.78ms 로 흔들리고, 그 흔들림이 목표 지점을 주기 경계 너머로
+/// 밀어낸다. 실기에서 한 출력의 샘플 lead 가 17.00↔33.05ms, 즉 **한 주기를 통째로** 오갔다
+/// (log_ani_debug_02/07, 141).
+///
+/// 그래서 명목 주사율을 모드에서 읽고, 실측은 **정확값 후보 둘 중 어느 쪽인지 고르는 데만**
+/// 쓴다: 60Hz 냐 60000/1001Hz(59.94)냐. 고른 뒤에는 그 실행 동안 고정이다.
+fn nominal_period_ticks(name: &str, freq: u64, measured: Option<u64>) -> Option<u64> {
+    let hz = display_frequency_hz(name)?;
+    if hz == 0 {
+        return None;
+    }
+    // 정수 Hz 후보와 그 1000/1001 변형(59.94 등). 정수 나눗셈의 버림은 60Hz·10MHz 에서
+    // 0.02ppm 이라 무시할 수 있다.
+    let exact = freq / hz;
+    let ntsc = freq.saturating_mul(1001) / (hz.saturating_mul(1000));
+    let Some(measured) = measured else {
+        return Some(exact);
+    };
+    let pick_exact = measured.abs_diff(exact) <= measured.abs_diff(ntsc);
+    Some(if pick_exact { exact } else { ntsc })
+}
+
+/// 이 출력의 현재 모드 주사율(Hz). `\\.\DISPLAY3` 같은 `DeviceName` 을 그대로 받는다.
+fn display_frequency_hz(name: &str) -> Option<u64> {
+    let mut wide: Vec<u16> = name.encode_utf16().collect();
+    wide.push(0);
+    let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+    mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    // Safety: 널 종료된 장치 이름과 크기를 채운 DEVMODEW 를 넘긴다. 순수 조회다.
+    let ok = unsafe { EnumDisplaySettingsW(wide.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) };
+    if ok == 0 {
+        return None;
+    }
+    // 1 과 0 은 "기본값" 을 뜻하는 특수값이라 주사율로 쓸 수 없다.
+    match mode.dmDisplayFrequency {
+        0 | 1 => None,
+        hz => Some(hz as u64),
+    }
 }
 
 /// `lead_to_next_vblank` 의 산술만 갈라낸 것 -- COM 도 시계도 없이 테스트할 수 있다.
@@ -392,7 +496,16 @@ fn probe_loop() {
             let Some((t1, t2)) = (unsafe { wait_two_vblanks(out.output) }) else {
                 continue;
             };
-            let (period, measured) = period_from_pair(t1, t2, freq, assumed_period);
+            let (sampled_period, sane) = period_from_pair(t1, t2, freq, assumed_period);
+            // ★주기는 모드에서 온 고정값을 쓴다.★ 실측은 정확값 후보 둘 중 어느 쪽인지
+            // 고르는 데만 쓰고(`nominal_period_ticks`), 모드를 못 읽으면 그때만 실측으로
+            // 떨어진다. `measured` 는 이제 "이 주기를 믿을 근거가 있나" 를 뜻한다 --
+            // 모드에서 왔거나(참) 실측이 정상 범위였거나(참), 둘 다 아니면 거짓이다.
+            let nominal = nominal_period_ticks(&out.name, freq, sane.then_some(sampled_period));
+            let (period, measured) = match nominal {
+                Some(period) => (period, true),
+                None => (sampled_period, sane),
+            };
             if let Ok(mut guard) = GRID.lock() {
                 guard
                     .get_or_insert_with(HashMap::new)
@@ -593,19 +706,63 @@ mod tests {
         assert_eq!(lead_ticks(1_000_010, 1_000_000, 0, 0), None);
     }
 
-    /// ★두 출력의 lead 차이가 곧 위상차여야 한다.★ B2 가 성립하는 근거가 이것이다 --
-    /// 같은 순간에 물어도 출력마다 다른 샘플 시각이 나와야 하고, 그 차이가 vblank 차이와
-    /// 같아야 한다. 이 단언이 깨지면 네 타일이 다시 같은 시각을 샘플하게 된다.
+    /// ★★네 타일의 퍼짐은 한 주기 미만이어야 한다 -- 이것이 요구된 보장이다.★★
+    ///
+    /// 처음 구현은 타일마다 *자기* 다음 vblank 로 따로 올림해서, 렌더가 격자 경계를 사이에
+    /// 두고 갈라지면 두 타일이 한 주기 통째로 벌어졌다. 실기에서 2 프레임 이상, 관측자 기준
+    /// 5 프레임까지 어긋났다(log_ani_debug_02/07). 설계가 약속한 것은 위상차 이내였다.
+    ///
+    /// 지금은 공통 T 에 `phase_offset_for` 만 더하므로 퍼짐 = 오프셋들의 범위이고, 오프셋은
+    /// 정의상 `[0, period)` 다. 이 단언이 그 불변식을 지킨다.
+    #[test]
+    fn every_offset_stays_inside_one_period() {
+        let period = 166_667;
+        let reference = 1_000_000;
+        // 실측 위상(log_ani_debug_02/02): 기준 대비 +1.17 / +6.57 / −4.63ms.
+        let period_signed = period as i64;
+        for delta in [0_i64, 11_700, 65_700, -46_300, 1 - period_signed, period_signed - 1] {
+            let vblank = (reference as i64 + delta) as u64;
+            let period_i = period as i128;
+            let offset =
+                (((vblank as i128 - reference as i128) % period_i + period_i) % period_i) as u64;
+            assert!(
+                offset < period,
+                "delta={delta} 의 오프셋 {offset} 이 한 주기를 넘었다"
+            );
+        }
+    }
+
+    /// ★두 출력의 샘플 시각 차이가 곧 위상차여야 한다.★ 오프셋이 전부 0 이면 B2 는 아무
+    /// 일도 하지 않고, 한 주기를 넘으면 위 보장이 깨진다 -- 그 사이여야 한다.
     #[test]
     fn two_outputs_differ_by_their_vblank_phase() {
         let period = 166_667;
-        let now = 5_000_000;
+        let reference = 1_000_000;
+        let period_i = period as i128;
+        let offset_of = |vblank: u64| {
+            (((vblank as i128 - reference as i128) % period_i + period_i) % period_i) as u64
+        };
         // 두 출력의 vblank 가 11.2ms(= 112_000 틱) 떨어져 있다.
-        let a = lead_ticks(now, 1_000_000, period, 0).unwrap();
-        let b = lead_ticks(now, 1_000_000 + 112_000, period, 0).unwrap();
-        // vblank 가 늦은 출력은 다음 격자점도 그만큼 늦으므로 lead 가 그만큼 **길다**.
-        let diff = (b as i64 - a as i64).rem_euclid(period as i64);
-        assert_eq!(diff, 112_000, "lead 차이가 vblank 위상차와 같아야 한다");
+        let a = offset_of(reference);
+        let b = offset_of(reference + 112_000);
+        assert_eq!(a, 0, "기준 출력의 오프셋은 0 이다");
+        assert_eq!(b - a, 112_000, "샘플 시각 차이가 vblank 위상차와 같아야 한다");
+        assert!(b < period, "그래도 한 주기 안이다");
+    }
+
+    /// 모드에서 온 주기가 실측 흔들림을 흡수하는가. 60Hz 와 59.94Hz 를 가려내되, 고른 뒤에는
+    /// 실측이 어떻든 그 정확값이 나와야 한다.
+    #[test]
+    fn nominal_period_picks_the_exact_candidate() {
+        // 이 테스트는 산술만 본다 -- 모드 조회는 `display_frequency_hz` 가 하고 그것은
+        // 하드웨어를 요구한다. 두 후보의 계산이 맞는지가 요점이다.
+        let freq = 10_000_000_u64;
+        let exact = freq / 60; // 166_666
+        let ntsc = freq * 1001 / 60_000; // 166_833
+        assert_ne!(exact, ntsc, "두 후보가 구분돼야 한다");
+        // 실측이 60Hz 쪽에 가까우면 60Hz 후보를, 59.94 쪽이면 그쪽을 골라야 한다.
+        assert!(166_700_u64.abs_diff(exact) <= 166_700_u64.abs_diff(ntsc));
+        assert!(166_800_u64.abs_diff(ntsc) <= 166_800_u64.abs_diff(exact));
     }
 
     /// 10MHz QPC 를 가정한다(실제 하드웨어와 같은 값이라 ms 환산이 직관적이다).
