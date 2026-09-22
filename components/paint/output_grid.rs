@@ -151,22 +151,6 @@ fn display_frequency_hz(name: &str) -> Option<u64> {
     }
 }
 
-/// `lead_to_next_composition` 의 산술만 갈라낸 것 -- COM 도 시계도 없이 테스트할 수 있다.
-///
-/// `vblank` 는 드라이버에 따라 직전일 수도 다음일 수도 있으므로 나머지 연산을 두 번 걸어
-/// 어느 쪽이든 격자 위의 같은 점으로 접는다(`deadline_for_monitor` 와 같은 규약).
-fn lead_ticks(now: u64, vblank: u64, period: u64, lead_periods: u64) -> Option<u64> {
-    if period == 0 {
-        return None;
-    }
-    let period_i = period as i128;
-    let delta = now as i128 - vblank as i128;
-    // 다음 격자점까지 남은 틱. `now` 가 정확히 격자점이면 한 주기 뒤를 가리킨다 -- 이미
-    // 지나간 시각을 샘플 시각으로 주는 것보다 낫다.
-    let ahead = period_i - (((delta % period_i) + period_i) % period_i);
-    Some(ahead as u64 + period.saturating_mul(lead_periods))
-}
-
 /// DWM 이 이 타일을 실제로 합성한 기록 한 건. 전부 ms 로 환산해 둔다.
 #[derive(Clone, Copy)]
 struct DcompSample {
@@ -202,17 +186,6 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     *COMPOSITION.lock().ok()?
 }
 
-/// 이 프레임이 표시될 **합성 시각**까지 남은 간격. 네 타일이 같은 값을 받는다.
-///
-/// ★샘플과 표시가 같은 클럭 위에 있어야 한다.★ 지금까지는 렌더가 끝난 순간의 벽시계로
-/// 샘플했다. 그 간격은 실측으로 16.06~18.07ms 로 흔들리는데(`ANIMSTEP dt_ms`), 합성은
-/// 정확히 16.667ms 마다 일어난다(지터 0). 그래서 36.0px 움직인 프레임과 41.0px 움직인
-/// 프레임이 같은 시간 동안 표시되고, 등속 운동이 ±6% 로 빨라졌다 느려졌다 한다 -- 그것이
-/// 이 추적 내내 쫓던 저더다. 애니메이션은 내내 정확했다. 틀린 것은 어느 시계로 물었느냐다.
-///
-/// ★렌더 틱도 같은 격자에 잠가야 한다(`gfx_present_align_dwm_pct`).★ 자유 실행하는 렌더를
-/// 격자에 스냅하기만 하면 가끔 두 렌더가 같은 격자점에 걸려 그 프레임의 변위가 0 이 되고
-/// 다음이 두 칸을 뛴다. 출력별 격자로 그것을 한 번 겪었다(B2 1 차, ANIMSTEP p05 35.0→29.3).
 /// 한 타일의 샘플 인덱스가 어떻게 움직였나. `SAMPLESLIP` 이 초당 비운다.
 #[derive(Default)]
 struct SlipTally {
@@ -390,49 +363,56 @@ fn emit_sampleslip() {
     }
 }
 
+/// 이 프레임이 실릴 **합성 시각**까지 남은 간격. 네 타일이 같은 값을 받는다.
+///
+/// ★샘플과 표시가 같은 클럭 위에 있어야 한다.★ 원래는 렌더가 끝난 순간의 벽시계로
+/// 샘플했다. 그 간격은 실측으로 16.06~18.07ms 로 흔들리는데(`ANIMSTEP dt_ms`), 합성은
+/// 정확히 16.667ms 마다 일어난다(지터 0). 36.0px 움직인 프레임과 41.0px 움직인 프레임이
+/// 같은 시간 동안 표시되니 등속 운동이 ±6% 로 빨라졌다 느려졌다 했다 -- 애니메이션은 내내
+/// 정확했고, 틀린 것은 어느 시계로 물었느냐였다.
+///
+/// ★그리고 목표 시각은 `now` 에서 뽑지 않는다.★ 여기까지 오는 데 세 번의 회귀가 들었다.
+/// `now` 에서 올림으로 인덱스를 뽑으면 틱 지터가 그대로 반올림 경계를 넘나들고(전체의
+/// 4.28% 에서 슬립), 그걸 막으려고 단조 증가·시간 창·프레임 번호·PLL 을 차례로 얹었지만
+/// 전부 **흔들리는 값을 받아 놓고 뒤에서 떠는** 짓이었다.
+///
+/// `last`(= `lastFrameTime`)가 이미 격자점 위의 절대 시각이고, 네 페인터가 같은 값을
+/// 읽는다는 것도 측정돼 있다(`DCOMPSTAT`: 네 출력의 phase 가 동일, `distinct == n` 이라
+/// 합성마다 새 값). 그러면 목표는 그냥 `last + (1 + lead) * period` 다 -- 반올림도,
+/// 타이머도, 위상 추정도 없다. `now` 는 "그 시각까지 얼마나 남았나" 를 재는 데만 쓴다.
+/// `lead_to_next_composition` 의 산술 전부. 시계도 COM 도 없이 테스트할 수 있다.
+///
+/// `last` 는 격자점이므로 여기에 주기의 정수배를 더한 값도 격자점이다. 그래서 이 함수의
+/// 출력은 **정의상** 격자 위에 있고, 같은 `last` 를 읽은 타일들은 같은 값을 받는다.
+fn composition_target(last: u64, period: u64, lead_periods: u64) -> u64 {
+    last.saturating_add(period.saturating_mul(1 + lead_periods))
+}
+
 pub(crate) fn lead_to_next_composition(monitor: usize, lead_periods: u64) -> Option<Duration> {
     let (last, period) = composition_grid()?;
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
-    // ★인덱스는 시계에서만 온다.★ 여기에 "직전보다 최소 한 칸" 같은 단조 증가를 얹으려다
-    // 두 번 연속으로 회귀를 냈다(log_ani_debug_02/12·13). 두 번째 로그가 이유를 정확히
-    // 보여 준다: `pump_paint_animation` 이 페인터당 **초당 102 회** 불린다(60 이 아니다).
-    // 인덱스를 호출마다 올리면 네 페인터 × 102 = 408 칸/초가 되고, 실시간이 요구하는
-    // 60 칸/초를 초당 5.8 초씩 앞질러 샘플 시각이 6.6 초 미래로 달아났다
-    // (`SAMPLELEAD p50=6664ms`). 화면에서는 애니메이션이 멈춘 것처럼 보였다.
+    // ★★목표 시각은 `now` 에서 뽑지 않는다. **합성 번호에서 센다.**★★
     //
-    // 프레임 경계를 호출 수로 흉내 내려 한 것이 잘못이었다. `wanted_index` 는 시계에서 직접
-    // 오므로 **달아날 수 없다** -- 미끄러질 때 한 칸을 건너뛸 뿐이고 실측에서 그 슬립은
-    // 창의 11% 였다(나머지 89% 는 dx spread 0.005). 슬립을 없애려면 먼저 저 102 회의
-    // 정체를 알아야 한다.
-    let index = wanted_index(now, last, period, lead_periods)?;
-    // 렌더가 격자의 어디에 떨어졌나. 슬립이 경계에 몰리는지 보려면 이 값이 필요하다.
+    // `last`(= `lastFrameTime`)는 합성 격자 위의 절대 시각이고, 네 페인터가 **같은 값을
+    // 읽는다는 것이 이미 측정돼 있다**(DCOMPSTAT: 네 출력의 phase p05=p50=p95 가 동일,
+    // distinct == n 이므로 합성마다 새 값이다). 그러면 "이 프레임이 실릴 합성" 은
+    // `last` 에서 몇 칸 뒤인지로 그냥 세면 된다 -- 반올림도, 타이머도, 위상 추정도 필요 없다.
+    //
+    // ★이걸 몇 라운드 전에 했어야 했다.★ 나는 `last` 를 **위상 기준**으로만 쓰고 인덱스는
+    // 흔들리는 `now` 에서 올림으로 뽑았다. 그래서 틱 지터(p50 16.67 / p95 17.23ms, 주기
+    // 16.667ms)가 그대로 반올림 경계를 넘나들며 전체의 4.28% 에서 슬립을 만들었고, 그것을
+    // 막으려고 단조 증가·시간 창·프레임 번호·PLL 을 차례로 얹다가 세 번 회귀를 냈다.
+    // 흔들리는 값을 받아 놓고 뒤에서 떠는 것을 막으려 한 것이 전부 잘못이었다.
+    //
+    // `now` 는 이제 "그 시각까지 얼마나 남았나" 를 재는 데만 쓴다.
+    let target = composition_target(last, period, lead_periods);
+    // 렌더가 격자의 어디에 떨어졌나. 슬립 진단용이고 목표 계산에는 쓰이지 않는다.
     let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
-    note_sample_slip(monitor, index, phase_ms);
-    let target = target_for_index(last, period, index);
+    note_sample_slip(monitor, target / period, phase_ms);
     Some(Duration::from_secs_f64(
         target.saturating_sub(now) as f64 / freq as f64,
     ))
-}
-
-/// 이 시각이 겨누는 격자점의 **절대** 인덱스.
-///
-/// ★원점은 격자의 위상이지 `last` 가 아니다.★ 처음에는 `(target - last) / period` 로 셌는데,
-/// `last`(마지막 합성 시각)는 매 프레임 한 칸 전진한다. 그러면 정상 동작에서 인덱스가 늘
-/// 같은 값(예: 2)으로 나오고, 거기에 단조 증가를 강제하니 매 프레임 한 칸씩 **덧**전진해
-/// 샘플 시각이 두 배 속도로 달아났다. 실기에서 물체가 훨씬 빠르게 오른쪽 끝에 도달하고 그
-/// 뒤로 반복 재생되지 않았다(log_ani_debug_02/12).
-///
-/// `last % period` 는 격자의 위상이라 프레임이 지나도 **같은 값**이다. 그것을 원점으로 삼으면
-/// 인덱스가 절대값이 되고, 정상 동작에서 프레임마다 정확히 1 씩 는다.
-fn wanted_index(now: u64, last: u64, period: u64, lead_periods: u64) -> Option<u64> {
-    let ahead = lead_ticks(now, last, period, lead_periods)?;
-    let target = now.saturating_add(ahead);
-    Some(target.saturating_sub(last % period) / period)
-}
-
-fn target_for_index(last: u64, period: u64, index: u64) -> u64 {
-    (last % period).saturating_add(index.saturating_mul(period))
 }
 
 static DCOMP_STATS: Mutex<Option<HashMap<usize, Vec<DcompSample>>>> = Mutex::new(None);
@@ -1028,114 +1008,46 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_ticks, period_from_pair, target_for_index, wanted_index};
+    use super::{composition_target, period_from_pair};
 
-    /// B2 의 샘플 시각 산술. ★타일을 갈라놓는 것은 `vblank` 가 출력마다 다르다는 사실
-    /// 하나이고, 이 함수가 그 차이를 그대로 통과시켜야 한다.★
+    /// ★목표 시각은 언제나 격자 위에 있고, 시계 지터와 무관하다.★
+    ///
+    /// 세 번의 회귀가 전부 이 성질을 포기한 데서 나왔다. `now` 에서 올림으로 인덱스를 뽑으면
+    /// 틱 지터(p50 16.67 / p95 17.23ms, 주기 16.667ms)가 반올림 경계를 넘나들며 전체의
+    /// 4.28% 에서 슬립을 만들었고, 그것을 뒤에서 떨어 막으려다 매번 더 나빠졌다.
     #[test]
-    fn lead_reaches_the_next_grid_point_of_that_output() {
-        let period = 166_667; // 10MHz 에서 60Hz
-        // 격자점 직후: 거의 한 주기를 기다린다.
-        assert_eq!(lead_ticks(1_000_010, 1_000_000, period, 0), Some(period - 10));
-        // 격자점 직전: 조금만 기다린다.
-        assert_eq!(lead_ticks(1_166_600, 1_000_000, period, 0), Some(67));
-        // `vblank` 가 미래일 수도 있다(드라이버가 다음 vblank 를 준다) -- 같은 점으로 접힌다.
-        assert_eq!(lead_ticks(1_000_010, 1_166_667, period, 0), Some(period - 10));
-        // lead_periods 는 공통 오프셋이라 그대로 더해진다.
-        assert_eq!(
-            lead_ticks(1_000_010, 1_000_000, period, 2),
-            Some(period - 10 + 2 * period)
-        );
-        // 주기를 모르면 샘플 시각을 지어내지 않는다.
-        assert_eq!(lead_ticks(1_000_010, 1_000_000, 0, 0), None);
-    }
-
-    /// ★★네 타일의 퍼짐은 한 주기 미만이어야 한다 -- 이것이 요구된 보장이다.★★
-    ///
-    /// 처음 구현은 타일마다 *자기* 다음 vblank 로 따로 올림해서, 렌더가 격자 경계를 사이에
-    /// 두고 갈라지면 두 타일이 한 주기 통째로 벌어졌다. 실기에서 2 프레임 이상, 관측자 기준
-    /// 5 프레임까지 어긋났다(log_ani_debug_02/07). 설계가 약속한 것은 위상차 이내였다.
-    ///
-    /// 그런데 계측이 그 전제를 다시 뒤집었다 -- 아래 테스트가 지금의 보장이다.
-    #[test]
-    fn samples_land_exactly_on_the_grid() {
-        let period = 166_667;
-        let last = 1_000_000;
-        // 격자점에서 얼마나 떨어져 물어도, 샘플 시각은 언제나 격자점 위다.
-        for offset in [1_u64, 1_000, 83_333, 166_666] {
-            let now = last + offset;
-            let lead = lead_ticks(now, last, period, 1).unwrap();
-            assert_eq!(
-                (now + lead - last) % period,
-                0,
-                "offset={offset} 에서 샘플이 격자를 벗어났다"
-            );
-        }
-    }
-
-    /// ★★네 타일이 **같은** 샘플 시각을 받아야 한다 -- 이제 이것이 보장이다.★★
-    ///
-    /// 출력별 격자에 맞추던 시절에는 "퍼짐이 한 주기 미만" 이 목표였다. 실기 계측이 그 전제를
-    /// 뒤집었다(log_ani_debug_02/09·10): 네 DComp 디바이스가 같은 `lastFrameTime` 과
-    /// `rate=60.000Hz` 를 돌려준다. DWM 은 네 타일을 하나의 합성 패스에서 함께 올리므로 맞출
-    /// 격자는 하나뿐이고, 그러면 네 타일의 lead 는 **같아야** 한다. 다르게 주는 것은 오차다.
-    ///
-    /// `lead_to_next_composition` 이 모니터를 인자로 받지 않으므로 이 성질은 타입으로도
-    /// 보장되지만, 그 설계 결정 자체를 여기 못박아 둔다.
-    #[test]
-    fn all_tiles_get_the_same_lead_from_the_shared_grid() {
-        let period = 166_667;
-        let last = 1_000_000;
-        let now = 5_000_000;
-        let first = lead_ticks(now, last, period, 1).unwrap();
-        for tile in 0..4 {
-            assert_eq!(
-                lead_ticks(now, last, period, 1).unwrap(),
-                first,
-                "타일 {tile} 이 다른 lead 를 받았다 -- 공통 격자에서는 있을 수 없다"
-            );
-        }
-        // 한 주기 앞(lead_periods=1) + 다음 격자점까지의 거리.
-        assert_eq!(first, period - (4_000_000 % period) + period);
-    }
-
-    /// ★★샘플 시각이 실시간보다 빨리 흐르면 안 된다.★★
-    ///
-    /// 이것을 못 잡아서 실기 한 라운드를 버렸다(log_ani_debug_02/12). 인덱스를 움직이는
-    /// 원점(`last`)에서 세어 놓고 단조 증가를 강제했더니, 정상 동작에서도 매 프레임 한 칸씩
-    /// 덧전진해 물체가 두 배 속도로 날아가 화면 끝에 닿고 멈췄다. 프레임을 여러 번 돌려
-    /// 샘플 시각이 **정확히 한 주기씩** 나아가는지 보는 것이 그 결함을 잡는 단언이다.
-    #[test]
-    fn the_sample_time_advances_exactly_one_period_per_frame() {
+    fn the_target_is_always_on_the_grid_and_advances_one_period() {
         let period = 166_667;
         let phase = 12_345;
         let mut previous: Option<u64> = None;
-        let mut last_target: Option<u64> = None;
-        for frame in 0..10_u64 {
-            // 합성 격자도 매 프레임 한 칸 전진한다 -- 이것이 결함의 전제였다.
-            let last = phase + (100 + frame) * period;
-            // 렌더는 합성 직후 조금씩 다른 시각에 끝난다(±1ms 지터).
-            let jitter = (frame % 3) as u64 * 10_000;
-            let now = last + 1_000 + jitter;
-            let want = wanted_index(now, last, period, 1).unwrap();
-            let index = match previous {
-                Some(prev) if want > prev + 4 => want,
-                Some(prev) => prev + 1,
-                None => want,
-            };
-            previous = Some(index);
-            let target = target_for_index(last, period, index);
-            if let Some(before) = last_target {
-                assert_eq!(
-                    target - before,
-                    period,
-                    "프레임 {frame} 에서 샘플 시각이 한 주기가 아니라 {} 틱 나아갔다",
-                    target - before
-                );
+        for step in 0..10_u64 {
+            // 합성 격자가 한 칸씩 전진한다. `now` 는 등장하지도 않는다 -- 그것이 요점이다.
+            let last = phase + (100 + step) * period;
+            let target = composition_target(last, period, 1);
+            assert_eq!(
+                (target - phase) % period,
+                0,
+                "목표가 격자를 벗어났다(step={step})"
+            );
+            if let Some(before) = previous {
+                assert_eq!(target - before, period, "한 주기가 아니다(step={step})");
             }
-            last_target = Some(target);
+            previous = Some(target);
         }
     }
+
+    /// 같은 `last` 를 읽은 타일들은 같은 목표를 받는다 -- 네 페인터가 같은 값을 읽는다는
+    /// 것은 `DCOMPSTAT` 으로 측정돼 있으므로, 이 함수가 결정적이면 타일 간 어긋남이 없다.
+    #[test]
+    fn tiles_reading_the_same_composition_agree() {
+        let period = 166_667;
+        let last = 12_345 + 500 * period;
+        let target = composition_target(last, period, 1);
+        for _tile in 0..4 {
+            assert_eq!(composition_target(last, period, 1), target);
+        }
+    }
+
 
     /// 모드에서 온 주기가 실측 흔들림을 흡수하는가. 60Hz 와 59.94Hz 를 가려내되, 고른 뒤에는
     /// 실측이 어떻든 그 정확값이 나와야 한다.
