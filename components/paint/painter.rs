@@ -1189,6 +1189,8 @@ impl Painter {
         // 샘플 시각은 오직 `update_paint_animations` 에만 들어간다 -- 그것이 B2 가 바꾸려는
         // 유일한 것이다: **언제 그릴까가 아니라, 어느 시각의 값을 그릴까.**
         let now = Instant::now();
+        #[cfg(windows)]
+        self.note_dcomp_frame_statistics();
         let sample_at = now + self.paint_animation_sample_lead();
         let mut floats = Vec::new();
         let mut transforms = Vec::new();
@@ -3687,6 +3689,32 @@ impl Painter {
     /// 캐시하면 핫플러그 뒤에 조용히 틀린 격자로 스케줄한다. `MonitorFromWindow` 는 API 한
     /// 번이라 프레임당 호출해도 비용이 없다.
     #[cfg(windows)]
+    /// DWM 이 이 타일을 실제로 언제 합성했는지 한 표본 뜬다(`DCOMPSTAT`).
+    ///
+    /// ★계측이 없어서 세 번 틀렸다.★ 지금까지의 계측은 전부 DWM 에 넘기기 전까지만 봤고,
+    /// 관찰된 타일 간 어긋남은 그 앞단으로 설명되는 크기의 20 배였다. 이 줄이 그 구간을
+    /// 컴포지터 자신에게서 직접 받는다.
+    ///
+    /// 정렬·B2 와 무관하게 `-DcompBindProf` 만으로 켜진다 -- 대조군에서도 재야 비교가 된다.
+    /// 컴포지터를 이미 대여 중일 수 있으므로 `try_borrow` 로 물러난다(빠진 표본은 통계에
+    /// 영향을 주지 않을 만큼 드물고, 실패 횟수는 `failed` 가 센다).
+    #[cfg(windows)]
+    fn note_dcomp_frame_statistics(&self) {
+        if !*crate::dcomp_compositor::DCOMP_BIND_PROF {
+            return;
+        }
+        let Some(monitor) = self.tile_monitor() else {
+            return;
+        };
+        let Some(shared) = self.dcomp_shared.as_ref() else {
+            return;
+        };
+        match shared.try_borrow() {
+            Ok(compositor) => compositor.note_frame_statistics(monitor),
+            Err(_) => crate::output_grid::note_dcomp_stat_failed(),
+        }
+    }
+
     /// B2 의 샘플 시각 보정. 꺼져 있으면 0 이라 `Instant::now()` 그대로다.
     ///
     /// 격자나 모니터를 못 구하면(프로브 미가동·핫플러그 직후) 0 으로 떨어진다 -- 그 타일만

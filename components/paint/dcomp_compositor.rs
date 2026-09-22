@@ -48,6 +48,7 @@ use winapi::um::d3d11::{
     ID3D11Resource, ID3D11Texture2D,
 };
 use winapi::um::d3d11_1::ID3D11DeviceContext1;
+use winapi::shared::dcomptypes::DCOMPOSITION_FRAME_STATISTICS;
 use winapi::um::dcomp::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
     IDCompositionVirtualSurface, IDCompositionVisual,
@@ -1962,6 +1963,49 @@ pub fn maybe_create(
 impl DCompNativeCompositor {
     fn dcomp_device_ptr(&self) -> Option<*mut IDCompositionDevice> {
         self.dcomp_device.as_ref().map(ComOwned::as_ptr)
+    }
+
+    /// ★이 추적 내내 없던 측정이다.★ DWM 이 **이 타일을** 실제로 언제 합성했는가.
+    ///
+    /// 지금까지 잰 것은 전부 DWM 에 넘기기 **전**까지였다: `OUTPHASE`(WaitForVBlank 로 추정한
+    /// 출력 격자), `OUTCOMMIT`(커밋이 그 격자 어디에 떨어졌나), `SAMPLELEAD`(어느 시각의
+    /// 값을 담았나). 그런데 실기에서 관찰된 타일 간 어긋남은 샘플 시각 차이(가로 이음매
+    /// 기준 최대 8.5px)의 20 배였다 -- 즉 어긋남은 샘플링 **이후**, 같은 값을 담은 프레임이
+    /// GPU 마다 다른 시점에 latch 되는 단계에서 생긴다. 그 단계를 추측으로 세 번 고치려다
+    /// 세 번 틀렸다.
+    ///
+    /// `GetFrameStatistics` 는 그 답을 컴포지터 자신에게서 직접 받는다. 타일마다 DComp
+    /// 디바이스가 따로 있으므로 타일별로 얻어진다.
+    pub(crate) fn note_frame_statistics(&self, monitor: usize) {
+        let Some(device) = self.dcomp_device_ptr() else {
+            return;
+        };
+        let mut stats: DCOMPOSITION_FRAME_STATISTICS = unsafe { std::mem::zeroed() };
+        // Safety: 살아 있는 `IDCompositionDevice`. 순수 out-param 조회다.
+        if unsafe { (*device).GetFrameStatistics(&mut stats) } < 0 {
+            crate::output_grid::note_dcomp_stat_failed();
+            return;
+        }
+        // `LARGE_INTEGER` 는 union 이라 접근자로 읽는다.
+        // Safety: 위 호출이 성공했으므로 전부 채워져 있다.
+        let (last, now, next, freq) = unsafe {
+            (
+                *stats.lastFrameTime.QuadPart() as u64,
+                *stats.currentTime.QuadPart() as u64,
+                *stats.nextEstimatedFrameTime.QuadPart() as u64,
+                *stats.timeFrequency.QuadPart() as u64,
+            )
+        };
+        let rate = stats.currentCompositionRate;
+        crate::output_grid::note_dcomp_stat(
+            monitor,
+            last,
+            now,
+            next,
+            freq,
+            rate.Numerator,
+            rate.Denominator,
+        );
     }
 
     fn root_visual_ptr(&self) -> Option<*mut IDCompositionVisual> {

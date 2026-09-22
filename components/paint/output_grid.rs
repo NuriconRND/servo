@@ -238,6 +238,105 @@ fn lead_ticks(now: u64, vblank: u64, period: u64, lead_periods: u64) -> Option<u
     Some(ahead as u64 + period.saturating_mul(lead_periods))
 }
 
+/// DWM 이 이 타일을 실제로 합성한 기록 한 건. 전부 ms 로 환산해 둔다.
+#[derive(Clone, Copy)]
+struct DcompSample {
+    /// `lastFrameTime` 을 그 디바이스의 합성 주기로 접은 값. ★타일 간 비교의 핵심이다★ --
+    /// QPC 절대 시각을 공통 모듈러로 접었으므로, 네 줄의 이 값 차이가 곧 네 타일이 실제로
+    /// 얼마나 떨어져 합성되는지다.
+    phase_ms: f64,
+    /// 표본을 뜬 시점 기준으로 마지막 합성이 얼마나 지났나.
+    behind_ms: f64,
+    /// 다음 합성까지 남은 예상 시간.
+    next_ms: f64,
+    period_ms: f64,
+    rate_hz: f64,
+}
+
+static DCOMP_STATS: Mutex<Option<HashMap<usize, Vec<DcompSample>>>> = Mutex::new(None);
+static DCOMP_STAT_FAILED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_dcomp_stat_failed() {
+    DCOMP_STAT_FAILED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn note_dcomp_stat(
+    monitor: usize,
+    last: u64,
+    now: u64,
+    next: u64,
+    freq: u64,
+    rate_num: u32,
+    rate_den: u32,
+) {
+    if freq == 0 || rate_num == 0 || rate_den == 0 {
+        note_dcomp_stat_failed();
+        return;
+    }
+    let to_ms = |ticks: u64| ticks as f64 * 1000.0 / freq as f64;
+    // 합성 주기는 DWM 이 유리수로 알려 준다 -- 추정할 필요가 없다.
+    let period_ticks = freq.saturating_mul(rate_den as u64) / rate_num as u64;
+    if period_ticks == 0 {
+        note_dcomp_stat_failed();
+        return;
+    }
+    let sample = DcompSample {
+        phase_ms: to_ms(last % period_ticks),
+        behind_ms: to_ms(now.saturating_sub(last)),
+        next_ms: to_ms(next.saturating_sub(now)),
+        period_ms: to_ms(period_ticks),
+        rate_hz: rate_num as f64 / rate_den as f64,
+    };
+    if let Ok(mut guard) = DCOMP_STATS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(monitor)
+            .or_default()
+            .push(sample);
+    }
+}
+
+/// ★네 줄의 `phase_ms` 차이가 곧 타일 간 실제 표시 시점 차이다.★ 이 추적에서 지금까지
+/// 추측으로만 다루던 값이고, 세 번의 잘못된 수정이 전부 이 값을 모르는 상태에서 나왔다.
+fn emit_dcompstat() {
+    let stats: Vec<(usize, Vec<DcompSample>)> = match DCOMP_STATS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let failed = DCOMP_STAT_FAILED.swap(0, Ordering::Relaxed);
+    for (monitor, samples) in stats {
+        if samples.is_empty() {
+            continue;
+        }
+        let pick = |mut values: Vec<f64>, p: f64| {
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            values[(((values.len() - 1) as f64) * p).round() as usize]
+        };
+        let phases: Vec<f64> = samples.iter().map(|s| s.phase_ms).collect();
+        let behinds: Vec<f64> = samples.iter().map(|s| s.behind_ms).collect();
+        let nexts: Vec<f64> = samples.iter().map(|s| s.next_ms).collect();
+        let last = samples[samples.len() - 1];
+        let name = name_for_monitor(monitor).unwrap_or_else(|| "?".into());
+        warn!(
+            "DCOMPSTAT out={name} monitor={monitor:#x} n={} rate={:.3}Hz period_ms={:.3} \
+             phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:.2} next_ms p50={:.2} \
+             failed={failed}",
+            samples.len(),
+            last.rate_hz,
+            last.period_ms,
+            pick(phases.clone(), 0.05),
+            pick(phases.clone(), 0.50),
+            pick(phases, 0.95),
+            pick(behinds, 0.50),
+            pick(nexts, 0.50),
+        );
+    }
+}
+
 /// 모니터 -> 이번 창의 샘플 lead 표본(ms). `SAMPLELEAD` 가 초당 비운다.
 static LEADS: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 /// 격자나 모니터를 못 구해 오늘 동작으로 떨어진 횟수.
@@ -534,6 +633,7 @@ fn probe_loop() {
             last_outphase = Instant::now();
             emit_outphase(&current.outputs, freq);
             emit_samplelead();
+            emit_dcompstat();
         }
     }
 }
