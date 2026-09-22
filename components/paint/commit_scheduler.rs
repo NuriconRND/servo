@@ -61,6 +61,17 @@ pub(crate) static ALIGN_PCT: LazyLock<Option<u64>> = LazyLock::new(|| {
     (0..=99).contains(&raw).then_some(raw as u64)
 });
 
+/// B2 pref(`gfx_sample_lead_periods`)를 **한 번만** 읽어 캐시한다. `Some(n)` = 켜짐,
+/// `None` = 꺼짐(`-1`). 이 값을 묻는 자리가 painter 마다 프레임당 하나라 `ALIGN_PCT` 와
+/// 같은 이유로 `LazyLock` 이다(그 주석 참고).
+///
+/// 상한을 4 로 둔다 -- 그보다 앞서 보는 것은 네 주기(67ms) 뒤의 위치를 그리는 것이라
+/// 애니메이션이 눈에 띄게 앞서 나가고, 실수로 큰 값을 준 것과 구분되지 않는다.
+pub(crate) static SAMPLE_LEAD_PERIODS: LazyLock<Option<u64>> = LazyLock::new(|| {
+    let raw = servo_config::pref!(gfx_sample_lead_periods);
+    (0..=4).contains(&raw).then_some(raw as u64)
+});
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct SchedulerStats {
     /// 실제로 큐에 올린 커밋 수.

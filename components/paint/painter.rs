@@ -1165,7 +1165,17 @@ impl Painter {
         // animation had bound, and the reverse. They are collected together for that
         // reason, not for tidiness.
         let colors = self.web_content_animator.update(&self.webview_renderers);
-        let now = Instant::now();
+        // ★B2 — 이 타일이 **자기 출력에 표시될 시각**으로 샘플한다.★
+        //
+        // 지금까지는 렌더가 끝난 순간의 벽시계로 값을 계산했다. 그 시각은 이 타일의 픽셀이
+        // 실제로 화면에 나오는 시각과 무관하다. 네 모니터의 vblank 가 11.2ms 에 흩어져
+        // 있으므로, 거의 같은 순간에 샘플한 값을 든 두 타일은 이음매에서 그만큼 어긋난 위치를
+        // 보여 주고 그 차이가 매 프레임 흔들린다 -- B1(커밋 시각 정렬)로는 못 고친 부분이고,
+        // 실기에서 B1 을 완전히 동작시켜도 저더가 남은 이유다(설계 문서 `## 실기 결과`).
+        //
+        // 여기서 앞당겨 보면 이음매 오차가 사라지는 대신 **상수가 된다**(속도 × 위상차).
+        // 그 거래가 이 pref 의 내용이다. 꺼져 있으면(`-1`, 기본) 예전 그대로 지금 시각이다.
+        let now = Instant::now() + self.paint_animation_sample_lead();
         let mut floats = Vec::new();
         let mut transforms = Vec::new();
         let mut still_animating = false;
@@ -3663,6 +3673,50 @@ impl Painter {
     /// 캐시하면 핫플러그 뒤에 조용히 틀린 격자로 스케줄한다. `MonitorFromWindow` 는 API 한
     /// 번이라 프레임당 호출해도 비용이 없다.
     #[cfg(windows)]
+    /// B2 의 샘플 시각 보정. 꺼져 있으면 0 이라 `Instant::now()` 그대로다.
+    ///
+    /// 격자나 모니터를 못 구하면(프로브 미가동·핫플러그 직후) 0 으로 떨어진다 -- 그 타일만
+    /// 오늘 동작으로 돌아가는 것이고, 화면이 멈추는 쪽보다 낫다. 그 건수는 `SAMPLELEAD` 의
+    /// `nogrid` 가 센다.
+    fn paint_animation_sample_lead(&self) -> Duration {
+        #[cfg(windows)]
+        {
+            let Some(lead_periods) = *crate::commit_scheduler::SAMPLE_LEAD_PERIODS else {
+                return Duration::ZERO;
+            };
+            // ★격자를 쓰는 쪽이 프로브를 띄운다.★ B1 에서 이것을 빠뜨려, 정렬만 켜고
+            // `-DcompBindProf` 를 안 주면 격자가 영영 비어 기능이 통째로 무력했다(설계 문서
+            // C5). `Once` 라 두 번째부터는 원자적 읽기 하나다.
+            crate::output_grid::start_probe();
+            let lead = self
+                .tile_monitor()
+                .and_then(|monitor| {
+                    crate::output_grid::lead_to_next_vblank(monitor, lead_periods)
+                        .map(|lead| (monitor, lead))
+                });
+            match lead {
+                Some((monitor, lead)) => {
+                    crate::output_grid::note_sample_lead(monitor, lead);
+                    lead
+                },
+                None => {
+                    crate::output_grid::note_sample_lead_missing();
+                    Duration::ZERO
+                },
+            }
+        }
+        #[cfg(not(windows))]
+        Duration::ZERO
+    }
+
+    /// 이 타일이 올라가 있는 출력. 디스플레이 구성이 바뀌면 달라지므로 매번 다시 묻는다
+    /// (`MonitorFromWindow` 한 번 + 캐시된 목록 대조라 비용이 없다).
+    #[cfg(windows)]
+    pub(crate) fn tile_monitor(&self) -> Option<usize> {
+        let hwnd = self.rendering_context.window_hwnd()?;
+        crate::output_grid::monitor_for_hwnd(hwnd)
+    }
+
     pub(crate) fn pending_dcomp_commit_monitor(&self) -> Option<usize> {
         let hwnd = self.rendering_context.window_hwnd()?;
         crate::output_grid::monitor_for_hwnd(hwnd)

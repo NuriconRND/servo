@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -99,6 +100,87 @@ pub(crate) fn monitor_for_hwnd(hwnd: usize) -> Option<usize> {
 
 pub(crate) fn grid_for_monitor(monitor: usize) -> Option<OutputGrid> {
     GRID.lock().ok()?.as_ref()?.get(&monitor).copied()
+}
+
+/// 지금부터 그 출력이 **다음에 표시할 시각**까지의 간격. B2 의 샘플 시각이 이것이다.
+///
+/// `lead_periods` 는 다음 vblank 에서 몇 주기를 더 앞서 볼지다 -- 값은 네 타일에 공통이라
+/// 이음매 정렬에는 영향이 없고 콘텐츠 전체의 이르냐 늦냐만 바꾼다. 타일을 갈라놓는 것은
+/// `vblank_qpc` 가 출력마다 다르다는 사실 하나다.
+///
+/// 격자가 없거나(프로브 미가동·핫플러그 직후) 시계를 못 읽으면 `None` -- 호출자는 오늘
+/// 동작(지금 시각 샘플)으로 떨어진다.
+pub(crate) fn lead_to_next_vblank(monitor: usize, lead_periods: u64) -> Option<Duration> {
+    let grid = grid_for_monitor(monitor)?;
+    let now = qpc_now()?;
+    let freq = qpc_frequency()?;
+    let ticks = lead_ticks(now, grid.vblank_qpc, grid.period_qpc, lead_periods)?;
+    Some(Duration::from_secs_f64(ticks as f64 / freq as f64))
+}
+
+/// `lead_to_next_vblank` 의 산술만 갈라낸 것 -- COM 도 시계도 없이 테스트할 수 있다.
+///
+/// `vblank` 는 드라이버에 따라 직전일 수도 다음일 수도 있으므로 나머지 연산을 두 번 걸어
+/// 어느 쪽이든 격자 위의 같은 점으로 접는다(`deadline_for_monitor` 와 같은 규약).
+fn lead_ticks(now: u64, vblank: u64, period: u64, lead_periods: u64) -> Option<u64> {
+    if period == 0 {
+        return None;
+    }
+    let period_i = period as i128;
+    let delta = now as i128 - vblank as i128;
+    // 다음 격자점까지 남은 틱. `now` 가 정확히 격자점이면 한 주기 뒤를 가리킨다 -- 이미
+    // 지나간 시각을 샘플 시각으로 주는 것보다 낫다.
+    let ahead = period_i - (((delta % period_i) + period_i) % period_i);
+    Some(ahead as u64 + period.saturating_mul(lead_periods))
+}
+
+/// 모니터 -> 이번 창의 샘플 lead 표본(ms). `SAMPLELEAD` 가 초당 비운다.
+static LEADS: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
+/// 격자나 모니터를 못 구해 오늘 동작으로 떨어진 횟수.
+static LEAD_MISSING: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_sample_lead(monitor: usize, lead: Duration) {
+    if let Ok(mut guard) = LEADS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(monitor)
+            .or_default()
+            .push(lead.as_secs_f64() * 1000.0);
+    }
+}
+
+pub(crate) fn note_sample_lead_missing() {
+    LEAD_MISSING.fetch_add(1, Ordering::Relaxed);
+}
+
+/// ★네 타일의 lead 가 실제로 위상차만큼 벌어져 있는지 보는 줄이다.★ 전부 같은 값이 나오면
+/// B2 가 걸리지 않은 것이고(모니터 해석 실패 등), 그러면 이 작업은 아무 일도 하지 않는다.
+/// 프로브 스레드가 자기 1 초 창으로 낸다 -- 페인터마다 찍으면 창이 넷으로 쪼개진다.
+fn emit_samplelead() {
+    let leads: Vec<(usize, Vec<f64>)> = match LEADS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let missing = LEAD_MISSING.swap(0, Ordering::Relaxed);
+    for (monitor, mut lead) in leads {
+        if lead.is_empty() {
+            continue;
+        }
+        lead.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |p: f64| lead[(((lead.len() - 1) as f64) * p).round() as usize];
+        let name = name_for_monitor(monitor).unwrap_or_else(|| "?".into());
+        warn!(
+            "SAMPLELEAD out={name} monitor={monitor:#x} n={} lead_ms p05={:.2} p50={:.2} \
+             p95={:.2} nogrid={missing}",
+            lead.len(),
+            at(0.05),
+            at(0.50),
+            at(0.95),
+        );
+    }
 }
 
 /// 이 HMONITOR 의 `DeviceName`(`\\.\DISPLAY3` 등). ★로그 전용이다★ -- `OUTCOMMIT` 의 p50
@@ -338,6 +420,7 @@ fn probe_loop() {
         {
             last_outphase = Instant::now();
             emit_outphase(&current.outputs, freq);
+            emit_samplelead();
         }
     }
 }
@@ -488,7 +571,42 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::period_from_pair;
+    use super::{lead_ticks, period_from_pair};
+
+    /// B2 의 샘플 시각 산술. ★타일을 갈라놓는 것은 `vblank` 가 출력마다 다르다는 사실
+    /// 하나이고, 이 함수가 그 차이를 그대로 통과시켜야 한다.★
+    #[test]
+    fn lead_reaches_the_next_grid_point_of_that_output() {
+        let period = 166_667; // 10MHz 에서 60Hz
+        // 격자점 직후: 거의 한 주기를 기다린다.
+        assert_eq!(lead_ticks(1_000_010, 1_000_000, period, 0), Some(period - 10));
+        // 격자점 직전: 조금만 기다린다.
+        assert_eq!(lead_ticks(1_166_600, 1_000_000, period, 0), Some(67));
+        // `vblank` 가 미래일 수도 있다(드라이버가 다음 vblank 를 준다) -- 같은 점으로 접힌다.
+        assert_eq!(lead_ticks(1_000_010, 1_166_667, period, 0), Some(period - 10));
+        // lead_periods 는 공통 오프셋이라 그대로 더해진다.
+        assert_eq!(
+            lead_ticks(1_000_010, 1_000_000, period, 2),
+            Some(period - 10 + 2 * period)
+        );
+        // 주기를 모르면 샘플 시각을 지어내지 않는다.
+        assert_eq!(lead_ticks(1_000_010, 1_000_000, 0, 0), None);
+    }
+
+    /// ★두 출력의 lead 차이가 곧 위상차여야 한다.★ B2 가 성립하는 근거가 이것이다 --
+    /// 같은 순간에 물어도 출력마다 다른 샘플 시각이 나와야 하고, 그 차이가 vblank 차이와
+    /// 같아야 한다. 이 단언이 깨지면 네 타일이 다시 같은 시각을 샘플하게 된다.
+    #[test]
+    fn two_outputs_differ_by_their_vblank_phase() {
+        let period = 166_667;
+        let now = 5_000_000;
+        // 두 출력의 vblank 가 11.2ms(= 112_000 틱) 떨어져 있다.
+        let a = lead_ticks(now, 1_000_000, period, 0).unwrap();
+        let b = lead_ticks(now, 1_000_000 + 112_000, period, 0).unwrap();
+        // vblank 가 늦은 출력은 다음 격자점도 그만큼 늦으므로 lead 가 그만큼 **길다**.
+        let diff = (b as i64 - a as i64).rem_euclid(period as i64);
+        assert_eq!(diff, 112_000, "lead 차이가 vblank 위상차와 같아야 한다");
+    }
 
     /// 10MHz QPC 를 가정한다(실제 하드웨어와 같은 값이라 ms 환산이 직관적이다).
     const FREQ: u64 = 10_000_000;
