@@ -1150,7 +1150,9 @@ impl Painter {
         if renderer_idle {
             #[cfg(windows)]
             crate::output_grid::note_pump_from_idle();
-            self.pump_paint_animation();
+            // 프레임 번호 없음 -- 이 경로는 아무도 프레임을 안 만들 때 깨우는 자리라
+            // 벽 프레임 경계가 없다. 샘플 인덱스는 시계에서 바로 온다.
+            self.pump_paint_animation(None);
         }
     }
 
@@ -1159,7 +1161,7 @@ impl Painter {
     /// 호출처는 둘이고 둘은 배타적이다: `Painter::render` 의 시작(렌더가 돌고 있을 때)과
     /// `perform_updates`(렌더가 멈췄을 때). 안쪽의 `push_due` 게이트가 한 렌더에 두 번
     /// 밀어 넣는 것을 다시 한 번 막는다.
-    pub(crate) fn pump_paint_animation(&mut self) {
+    pub(crate) fn pump_paint_animation(&mut self, frame_id: Option<u64>) {
 
         // ***One transaction carries every dynamic property, because sending resets them
         // all.*** `reset_dynamic_properties` clears colors, floats and transforms
@@ -1193,7 +1195,7 @@ impl Painter {
         let now = Instant::now();
         #[cfg(windows)]
         self.note_dcomp_frame_statistics();
-        let sample_at = now + self.paint_animation_sample_lead();
+        let sample_at = now + self.paint_animation_sample_lead(frame_id);
         let mut floats = Vec::new();
         let mut transforms = Vec::new();
         let mut still_animating = false;
@@ -2084,7 +2086,7 @@ impl Painter {
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
         #[cfg(windows)]
         crate::output_grid::note_pump_from_render();
-        self.pump_paint_animation();
+        self.pump_paint_animation(self.last_ready_wall_logical_frame_id.get());
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));
         }
@@ -3730,7 +3732,7 @@ impl Painter {
     /// 격자나 모니터를 못 구하면(프로브 미가동·핫플러그 직후) 0 으로 떨어진다 -- 그 타일만
     /// 오늘 동작으로 돌아가는 것이고, 화면이 멈추는 쪽보다 낫다. 그 건수는 `SAMPLELEAD` 의
     /// `nogrid` 가 센다.
-    fn paint_animation_sample_lead(&self) -> Duration {
+    fn paint_animation_sample_lead(&self, frame_id: Option<u64>) -> Duration {
         #[cfg(windows)]
         {
             let Some(lead_periods) = *crate::commit_scheduler::SAMPLE_LEAD_PERIODS else {
@@ -3744,7 +3746,7 @@ impl Painter {
             // 그 격자는 `note_dcomp_frame_statistics` 가 매 프레임 채운다. 첫 프레임 전이나
             // 조회가 실패하면 `None` -> 오늘 동작(지금 시각 샘플)으로 떨어진다.
             let monitor = self.tile_monitor().unwrap_or(0);
-            match crate::output_grid::lead_to_next_composition(monitor, lead_periods) {
+            match crate::output_grid::lead_to_next_composition(monitor, lead_periods, frame_id) {
                 Some(lead) => {
                     crate::output_grid::note_sample_lead(monitor, lead);
                     lead
