@@ -245,6 +245,57 @@ static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
 static PUMP_FROM_RENDER: AtomicU64 = AtomicU64::new(0);
 static PUMP_FROM_IDLE: AtomicU64 = AtomicU64::new(0);
 
+/// 페인터 -> (렌더 수, 벽 프레임 번호를 달고 온 수, 본 번호들).
+///
+/// ★"이 경로의 렌더가 벽 프레임 조정을 받고 있나" 를 묻는 계측이다.★
+///
+/// 샘플 인덱스를 `last_ready_wall_logical_frame_id` 에 걸었다가 실기에서 더 나빠졌다
+/// (log_ani_debug_02/17: 프레임의 73% 에서 인덱스가 멈췄다). 원인을 뒤져 보니 논리적 프레임
+/// 카운터는 **있는데**(`paint.rs` 의 `next_logical_frame_id`, 벽 프레임 요청 하나당 한 번),
+/// 그 번호가 **벽 프레임 요청으로 생긴 프레임에만** 붙는다 -- 페인터가 받는 필드가
+/// `Option<u64>` 인 것이 그 뜻이다.
+///
+/// 그렇다면 이 애니메이션 경로의 렌더 대부분이 벽 프레임 조정을 거치지 않는다는 뜻이고,
+/// 그건 샘플 시각보다 **먼저** 확인해야 할 사실이다. 네 타일을 같은 프레임에 묶는 배리어가
+/// 그 프레임들에는 걸리지 않는다는 뜻이므로, 지금까지 쫓던 타일 간 어긋남의 원인이 거기일
+/// 수 있다. 숫자로 확정하고 나서 다음을 정한다.
+static FRAME_IDS: Mutex<Option<HashMap<String, (u64, u64, HashSet<u64>)>>> = Mutex::new(None);
+
+pub(crate) fn note_frame_id(painter: &str, frame_id: Option<u64>) {
+    if let Ok(mut guard) = FRAME_IDS.lock() {
+        let slot = guard
+            .get_or_insert_with(HashMap::new)
+            .entry(painter.to_owned())
+            .or_insert_with(|| (0, 0, HashSet::new()));
+        slot.0 += 1;
+        if let Some(id) = frame_id {
+            slot.1 += 1;
+            slot.2.insert(id);
+        }
+    }
+}
+
+fn emit_frameid() {
+    let rows: Vec<(String, (u64, u64, HashSet<u64>))> = match FRAME_IDS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    for (painter, (renders, with_id, ids)) in rows {
+        if renders == 0 {
+            continue;
+        }
+        warn!(
+            "FRAMEID painter={painter} renders={renders} with_id={with_id} distinct_ids={} \
+             without_id={}",
+            ids.len(),
+            renders.saturating_sub(with_id),
+        );
+    }
+}
+
 pub(crate) fn note_pump_from_render() {
     PUMP_FROM_RENDER.fetch_add(1, Ordering::Relaxed);
 }
@@ -825,6 +876,7 @@ fn probe_loop() {
             emit_outphase(&current.outputs, freq);
             emit_samplelead();
             emit_sampleslip();
+            emit_frameid();
             emit_dcompstat();
         }
     }

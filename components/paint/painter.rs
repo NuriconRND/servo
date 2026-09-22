@@ -2084,6 +2084,14 @@ impl Painter {
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
         #[cfg(windows)]
         crate::output_grid::note_pump_from_render();
+        // ★이 렌더가 벽 프레임 번호를 달고 왔나.★ 대부분이 안 달고 온다면 이 경로는 벽
+        // 프레임 조정(네 타일을 같은 프레임에 묶는 배리어) 밖에서 도는 것이고, 그것이
+        // 샘플 시각보다 먼저 확인해야 할 사실이다(`output_grid::FRAME_IDS` 주석).
+        #[cfg(windows)]
+        crate::output_grid::note_frame_id(
+            &format!("{:?}", self.painter_id),
+            self.last_ready_wall_logical_frame_id.get(),
+        );
         self.pump_paint_animation();
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));
