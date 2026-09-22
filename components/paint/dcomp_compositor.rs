@@ -1739,6 +1739,7 @@ pub fn commit_device_ptr(device: usize) -> bool {
         // Safety: 위 계약.
         unsafe { raw_commit(device as *mut IDCompositionDevice) }
     };
+    crate::output_grid::note_commit_at(device);
     note_commit_failure(hr, device, "commit_device_ptr");
     note_dwm_phase();
     hr >= 0
@@ -1997,8 +1998,10 @@ impl DCompNativeCompositor {
             )
         };
         let rate = stats.currentCompositionRate;
+        crate::commit_scheduler::remember_device_monitor(device as usize, monitor);
         crate::output_grid::note_dcomp_stat(
             monitor,
+            device as usize,
             last,
             now,
             next,
@@ -2646,6 +2649,7 @@ impl DCompNativeCompositor {
             });
             self.commit_device_locked(dcomp_device)
         };
+        crate::output_grid::note_commit_at(dcomp_device as usize);
         note_commit_failure(hr, dcomp_device as usize, "flush_deferred_commit");
         if *DCOMP_BIND_PROF {
             note_dwm_phase();
@@ -2803,6 +2807,7 @@ impl DCompNativeCompositor {
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
                 unsafe { raw_commit(dcomp_device) }
             };
+            crate::output_grid::note_commit_at(dcomp_device as usize);
             note_commit_failure(hr, dcomp_device as usize, "present_external_only");
         }
     }
@@ -4380,6 +4385,7 @@ impl Compositor for DCompNativeCompositor {
         #[cfg(windows)]
         drop(commit_guard);
         if let Some(hr) = commit_hr {
+            crate::output_grid::note_commit_at(dcomp_device as usize);
             note_commit_failure(hr, dcomp_device as usize, "end_frame");
             if *DCOMP_BIND_PROF {
                 note_dwm_phase();

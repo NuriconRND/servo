@@ -251,10 +251,40 @@ struct DcompSample {
     next_ms: f64,
     period_ms: f64,
     rate_hz: f64,
+    /// 이 합성이 직전 표본과 같은 합성인가를 가리기 위한 원본 값.
+    last_qpc: u64,
+    /// 그 합성보다 이 타일의 커밋이 얼마나 **앞서** 들어갔나(한 주기로 접음).
+    /// ★한 주기에 가까우면 여유가 많고, 0 에 가까우면 마감을 스치고 있다는 뜻이다.★
+    commit_lead_ms: Option<f64>,
 }
 
 static DCOMP_STATS: Mutex<Option<HashMap<usize, Vec<DcompSample>>>> = Mutex::new(None);
 static DCOMP_STAT_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// 디바이스 -> 그 디바이스에 마지막으로 `Commit()` 을 낸 시각(QPC).
+///
+/// ★재려는 것은 "그 커밋이 공통 합성 시점보다 얼마나 앞서 들어갔나" 다.★ 계측으로 확인된
+/// 바에 따르면 DWM 은 네 타일을 **하나의** 합성 패스에서 함께 올린다(네 디바이스의
+/// `lastFrameTime` 이 같다). 그러면 타일마다 다를 수 있는 것은 합성 시점이 아니라 **그
+/// 마감에 제때 들어갔는가** 뿐이고, 마감을 아슬아슬하게 스치는 타일은 간헐적으로 직전
+/// 프레임이 한 번 더 올라간다 -- 그 타일에만 나타나는 저더다.
+///
+/// ★반드시 디바이스 가드 **밖**에서 기록한다.★ 임계구역에 남는 것은 `Commit()` 하나여야
+/// 한다는 규칙(C3)을 이 계측이 깨서는 안 된다. 호출 지점은 전부 `note_commit_failure` 옆,
+/// 즉 가드를 푼 뒤다.
+static COMMITS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+pub(crate) fn note_commit_at(device: usize) {
+    let Some(now) = qpc_now() else { return };
+    if let Ok(mut guard) = COMMITS.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(device, now);
+    }
+}
+
+fn commit_at(device: usize) -> Option<u64> {
+    let guard = COMMITS.lock().ok()?;
+    guard.as_ref()?.get(&device).copied()
+}
 
 pub(crate) fn note_dcomp_stat_failed() {
     DCOMP_STAT_FAILED.fetch_add(1, Ordering::Relaxed);
@@ -263,6 +293,7 @@ pub(crate) fn note_dcomp_stat_failed() {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn note_dcomp_stat(
     monitor: usize,
+    device: usize,
     last: u64,
     now: u64,
     next: u64,
@@ -281,12 +312,22 @@ pub(crate) fn note_dcomp_stat(
         note_dcomp_stat_failed();
         return;
     }
+    // 커밋이 그 합성보다 얼마나 앞섰나. 커밋이 합성 뒤일 수도 있으므로(다음 합성을 향한
+    // 커밋) 부호 안전하게 한 주기로 접는다 -- 결과는 언제나 `[0, period)` 이고 "직전 합성
+    // 이후 얼마나 지나 커밋했나" 의 여집합, 즉 "다음 합성까지 얼마나 남기고 커밋했나" 다.
+    let period_i = period_ticks as i128;
+    let commit_lead_ms = commit_at(device).map(|commit| {
+        let delta = last as i128 - commit as i128;
+        to_ms((((delta % period_i) + period_i) % period_i) as u64)
+    });
     let sample = DcompSample {
         phase_ms: to_ms(last % period_ticks),
         behind_ms: to_ms(now.saturating_sub(last)),
         next_ms: to_ms(next.saturating_sub(now)),
         period_ms: to_ms(period_ticks),
         rate_hz: rate_num as f64 / rate_den as f64,
+        last_qpc: last,
+        commit_lead_ms,
     };
     if let Ok(mut guard) = DCOMP_STATS.lock() {
         guard
@@ -319,13 +360,26 @@ fn emit_dcompstat() {
         let phases: Vec<f64> = samples.iter().map(|s| s.phase_ms).collect();
         let behinds: Vec<f64> = samples.iter().map(|s| s.behind_ms).collect();
         let nexts: Vec<f64> = samples.iter().map(|s| s.next_ms).collect();
+        let leads: Vec<f64> = samples.iter().filter_map(|s| s.commit_lead_ms).collect();
+        // ★서로 다른 합성이 몇 번이었나.★ 프레임을 60 개 냈는데 이 값이 60 보다 작으면, 그
+        // 차이만큼은 **같은 합성에 두 프레임이 들어갔거나 합성을 건너뛴 것**이다 -- 그 타일이
+        // 직전 프레임을 한 번 더 보여 준 횟수이고, 그 타일에만 나타나는 저더의 정체다.
+        let mut seen: Vec<u64> = samples.iter().map(|s| s.last_qpc).collect();
+        seen.sort_unstable();
+        seen.dedup();
         let last = samples[samples.len() - 1];
         let name = name_for_monitor(monitor).unwrap_or_else(|| "?".into());
+        let (lead_p05, lead_p50) = if leads.is_empty() {
+            (f64::NAN, f64::NAN)
+        } else {
+            (pick(leads.clone(), 0.05), pick(leads, 0.50))
+        };
         warn!(
-            "DCOMPSTAT out={name} monitor={monitor:#x} n={} rate={:.3}Hz period_ms={:.3} \
-             phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:.2} next_ms p50={:.2} \
-             failed={failed}",
+            "DCOMPSTAT out={name} monitor={monitor:#x} n={} distinct={} rate={:.3}Hz \
+             period_ms={:.3} phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:.2} \
+             next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} failed={failed}",
             samples.len(),
+            seen.len(),
             last.rate_hz,
             last.period_ms,
             pick(phases.clone(), 0.05),
@@ -333,6 +387,8 @@ fn emit_dcompstat() {
             pick(phases, 0.95),
             pick(behinds, 0.50),
             pick(nexts, 0.50),
+            lead_p05,
+            lead_p50,
         );
     }
 }

@@ -139,7 +139,7 @@ static PHASES: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 /// 실기 검증에서 그 둘을 구분하지 못하면 원인을 좁힐 수 없다.
 static DEVICE_MONITOR: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
-fn remember_device_monitor(device: usize, monitor: usize) {
+pub(crate) fn remember_device_monitor(device: usize, monitor: usize) {
     if let Ok(mut guard) = DEVICE_MONITOR.lock() {
         guard.get_or_insert_with(HashMap::new).insert(device, monitor);
     }
@@ -494,6 +494,8 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             if hr < 0 {
                 FAILED.fetch_add(1, Ordering::Relaxed);
             }
+            crate::output_grid::note_commit_at(device);
+
             crate::dcomp_compositor::note_commit_failure(hr, device, "commitsched");
             crate::dcomp_compositor::note_dwm_phase();
 
