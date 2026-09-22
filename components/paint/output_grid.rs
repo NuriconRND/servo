@@ -213,7 +213,109 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
 /// ★렌더 틱도 같은 격자에 잠가야 한다(`gfx_present_align_dwm_pct`).★ 자유 실행하는 렌더를
 /// 격자에 스냅하기만 하면 가끔 두 렌더가 같은 격자점에 걸려 그 프레임의 변위가 0 이 되고
 /// 다음이 두 칸을 뛴다. 출력별 격자로 그것을 한 번 겪었다(B2 1 차, ANIMSTEP p05 35.0→29.3).
-pub(crate) fn lead_to_next_composition(lead_periods: u64) -> Option<Duration> {
+/// 한 타일의 샘플 인덱스가 어떻게 움직였나. `SAMPLESLIP` 이 초당 비운다.
+#[derive(Default)]
+struct SlipTally {
+    last_index: Option<u64>,
+    n: u64,
+    /// 인덱스가 그대로였다 = 이 프레임의 변위가 0 이다.
+    same: u64,
+    /// 두 칸 뛰었다 = 직전 프레임이 건너뛰어졌다.
+    jump2: u64,
+    /// 세 칸 이상.
+    jump_n: u64,
+    /// 슬립이 난 순간, 렌더가 격자의 어디에 있었나(ms).
+    phase_at_slip: Vec<f64>,
+    /// 전체 프레임의 같은 값 -- 위와 비교해야 "경계에 몰렸나" 를 말할 수 있다.
+    phase_all: Vec<f64>,
+}
+
+static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
+
+/// ★슬립이 **언제** 일어나는지 찍는다.★
+///
+/// 정상 창의 프레임당 변위는 38.40px 에 spread 0.004 로 사실상 완벽한데, 창의 28% 에
+/// 결함이 있고 10% 는 spread≈1.0 으로 파탄이다(log_ani_debug_02/14). 그리고 변위 0 프레임
+/// 12 창 중 8 창을 기존 `dup`/`skip1` 계수가 **놓쳤다** -- 그 계수는 렌더 간격을 세지 샘플
+/// 인덱스를 세지 않기 때문이다.
+///
+/// 가설은 "렌더가 격자 경계 근처에 떨어져 올림이 두 칸 사이를 오간다" 이지만, 두 번 추측으로
+/// 고치려다 두 번 회귀를 냈으므로 이번에는 재고 나서 고친다. 슬립 순간의 위상 분포를 전체
+/// 분포와 나란히 내면 경계에 몰렸는지 아닌지가 바로 보인다.
+fn note_sample_slip(monitor: usize, index: u64, phase_ms: f64) {
+    let Ok(mut guard) = SLIPS.lock() else { return };
+    let tally = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(monitor)
+        .or_default();
+    tally.n += 1;
+    tally.phase_all.push(phase_ms);
+    if let Some(last) = tally.last_index {
+        let slipped = match index.saturating_sub(last) {
+            1 => false,
+            0 => {
+                tally.same += 1;
+                true
+            },
+            2 => {
+                tally.jump2 += 1;
+                true
+            },
+            _ => {
+                tally.jump_n += 1;
+                true
+            },
+        };
+        if slipped {
+            tally.phase_at_slip.push(phase_ms);
+        }
+    }
+    tally.last_index = Some(index);
+}
+
+fn emit_sampleslip() {
+    let tallies: Vec<(usize, SlipTally)> = match SLIPS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map
+                .iter_mut()
+                .map(|(monitor, tally)| (*monitor, std::mem::take(tally)))
+                .collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    for (monitor, tally) in tallies {
+        if tally.n == 0 {
+            continue;
+        }
+        let pick = |mut v: Vec<f64>, p: f64| -> f64 {
+            if v.is_empty() {
+                return f64::NAN;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[(((v.len() - 1) as f64) * p).round() as usize]
+        };
+        let name = name_for_monitor(monitor).unwrap_or_else(|| "?".into());
+        let slip_n = tally.phase_at_slip.len();
+        warn!(
+            "SAMPLESLIP out={name} n={} same={} jump2={} jumpN={} \
+             phase_all_ms p05={:.2} p50={:.2} p95={:.2} \
+             phase_slip_ms n={slip_n} p05={:.2} p50={:.2} p95={:.2}",
+            tally.n,
+            tally.same,
+            tally.jump2,
+            tally.jump_n,
+            pick(tally.phase_all.clone(), 0.05),
+            pick(tally.phase_all.clone(), 0.50),
+            pick(tally.phase_all, 0.95),
+            pick(tally.phase_at_slip.clone(), 0.05),
+            pick(tally.phase_at_slip.clone(), 0.50),
+            pick(tally.phase_at_slip, 0.95),
+        );
+    }
+}
+
+pub(crate) fn lead_to_next_composition(monitor: usize, lead_periods: u64) -> Option<Duration> {
     let (last, period) = composition_grid()?;
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
@@ -229,6 +331,9 @@ pub(crate) fn lead_to_next_composition(lead_periods: u64) -> Option<Duration> {
     // 창의 11% 였다(나머지 89% 는 dx spread 0.005). 슬립을 없애려면 먼저 저 102 회의
     // 정체를 알아야 한다.
     let index = wanted_index(now, last, period, lead_periods)?;
+    // 렌더가 격자의 어디에 떨어졌나. 슬립이 경계에 몰리는지 보려면 이 값이 필요하다.
+    let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
+    note_sample_slip(monitor, index, phase_ms);
     let target = target_for_index(last, period, index);
     Some(Duration::from_secs_f64(
         target.saturating_sub(now) as f64 / freq as f64,
@@ -695,6 +800,7 @@ fn probe_loop() {
             last_outphase = Instant::now();
             emit_outphase(&current.outputs, freq);
             emit_samplelead();
+            emit_sampleslip();
             emit_dcompstat();
         }
     }

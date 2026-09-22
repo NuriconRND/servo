@@ -3739,11 +3739,10 @@ impl Painter {
             //
             // 그 격자는 `note_dcomp_frame_statistics` 가 매 프레임 채운다. 첫 프레임 전이나
             // 조회가 실패하면 `None` -> 오늘 동작(지금 시각 샘플)으로 떨어진다.
-            match crate::output_grid::lead_to_next_composition(lead_periods) {
+            let monitor = self.tile_monitor().unwrap_or(0);
+            match crate::output_grid::lead_to_next_composition(monitor, lead_periods) {
                 Some(lead) => {
-                    if let Some(monitor) = self.tile_monitor() {
-                        crate::output_grid::note_sample_lead(monitor, lead);
-                    }
+                    crate::output_grid::note_sample_lead(monitor, lead);
                     lead
                 },
                 None => {
