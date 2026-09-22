@@ -218,7 +218,54 @@ pub(crate) fn lead_to_next_composition(lead_periods: u64) -> Option<Duration> {
     let now = qpc_now()?;
     let freq = qpc_frequency()?;
     let ticks = lead_ticks(now, last, period, lead_periods)?;
-    Some(Duration::from_secs_f64(ticks as f64 / freq as f64))
+    let target = now.saturating_add(ticks);
+    // 격자 인덱스로 옮겨 단조성을 강제한 뒤 다시 시각으로 돌린다.
+    let want = target.saturating_sub(last) / period;
+    let index = monotonic_sample_index(now, period, want);
+    let target = last.saturating_add(index.saturating_mul(period));
+    Some(Duration::from_secs_f64(
+        target.saturating_sub(now) as f64 / freq as f64,
+    ))
+}
+
+/// 한 프레임에 격자 한 칸. ★이것이 없으면 프레임당 변위가 가끔 0 이 되고 다음이 두 칸을
+/// 뛴다.★
+///
+/// 렌더 틱을 같은 격자에 스냅해도(`gfx_present_align_dwm_pct`) 둘이 완전히 같은 클럭은
+/// 아니라 서서히 미끄러진다. 실측에서 412 창 중 45 개(11%)에 슬립이 있었고 합계 dup 31 /
+/// skip1 41 이었다(log_ani_debug_02/11) -- 그 창의 `dx_px` 는 p05=0.00, max=76.80(두 칸)이다.
+/// 나머지 창은 p05 38.30 / p50 38.40 / p95 38.49 로 사실상 완벽했으므로, 남은 저더는 이
+/// 슬립뿐이다.
+///
+/// 두 가지를 같이 건다:
+/// * **한 패스 안에서는 같은 인덱스** -- 네 painter 가 각자 계산하면 먼저 온 쪽이 인덱스를
+///   올려 버리고 나머지 셋이 그 다음 칸으로 밀린다. 반 주기 동안 기억해 같은 값을 준다.
+/// * **패스 사이에는 최소 한 칸 전진** -- 미끄러져 같은 칸이 나와도 한 칸 올린다.
+///
+/// 진짜로 프레임이 밀린 경우(스톨)까지 한 칸으로 묶으면 애니메이션이 실시간에서 뒤처지므로,
+/// 계산값이 `STALL_CATCHUP` 칸 넘게 앞서면 그대로 받아들여 따라잡는다.
+fn monotonic_sample_index(now: u64, period: u64, want: u64) -> u64 {
+    /// 이만큼 넘게 벌어졌으면 스톨로 보고 따라잡는다.
+    const STALL_CATCHUP: u64 = 4;
+    static STATE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let Ok(mut guard) = STATE.lock() else {
+        return want;
+    };
+    if let Some((set_at, index)) = *guard {
+        // 같은 패스인가.
+        if now.saturating_sub(set_at) < period / 2 {
+            return index;
+        }
+        let next = if want > index.saturating_add(STALL_CATCHUP) {
+            want
+        } else {
+            want.max(index.saturating_add(1))
+        };
+        *guard = Some((now, next));
+        return next;
+    }
+    *guard = Some((now, want));
+    want
 }
 
 static DCOMP_STATS: Mutex<Option<HashMap<usize, Vec<DcompSample>>>> = Mutex::new(None);
@@ -812,7 +859,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{lead_ticks, period_from_pair};
+    use super::{lead_ticks, monotonic_sample_index, period_from_pair};
 
     /// B2 의 샘플 시각 산술. ★타일을 갈라놓는 것은 `vblank` 가 출력마다 다르다는 사실
     /// 하나이고, 이 함수가 그 차이를 그대로 통과시켜야 한다.★
@@ -881,6 +928,30 @@ mod tests {
         }
         // 한 주기 앞(lead_periods=1) + 다음 격자점까지의 거리.
         assert_eq!(first, period - (4_000_000 % period) + period);
+    }
+
+    /// ★한 프레임에 격자 한 칸.★ 미끄러져 같은 칸이 나와도 전진해야 하고, 한 패스 안에서는
+    /// 네 painter 가 같은 칸을 받아야 하며, 진짜 스톨은 따라잡아야 한다.
+    #[test]
+    fn the_sample_index_advances_exactly_one_step_per_pass() {
+        let period = 166_667;
+        let half = period / 2;
+        let mut now = 10 * period;
+        // 첫 패스.
+        assert_eq!(monotonic_sample_index(now, period, 10), 10);
+        // 같은 패스의 나머지 세 painter -- 계산값이 흔들려도 같은 칸을 받는다.
+        for want in [10, 11, 9] {
+            assert_eq!(monotonic_sample_index(now + half / 2, period, want), 10);
+        }
+        // 다음 패스인데 미끄러져 같은 칸이 나왔다 -> 한 칸 전진(이것이 dup 를 없앤다).
+        now += period;
+        assert_eq!(monotonic_sample_index(now, period, 10), 11);
+        // 정상 전진은 그대로 받는다.
+        now += period;
+        assert_eq!(monotonic_sample_index(now, period, 12), 12);
+        // 스톨: 계산값이 멀리 앞서면 묶지 않고 따라잡는다.
+        now += 10 * period;
+        assert_eq!(monotonic_sample_index(now, period, 22), 22);
     }
 
     /// 모드에서 온 주기가 실측 흔들림을 흡수하는가. 60Hz 와 59.94Hz 를 가려내되, 고른 뒤에는
