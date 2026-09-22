@@ -2897,12 +2897,18 @@ impl Paint {
         // 어느 쪽이든 격자 위의 같은 점으로 접는다.
         let period = grid.period_qpc as i128;
         let delta = now as i128 - base as i128;
-        let mut ahead = period - (((delta % period) + period) % period);
-        // 지금과 너무 가까우면 한 칸 뒤로 -- 렌더가 끝난 직후라 커밋할 틈은 있지만, 스케줄러가
-        // 깨어나기도 전에 지나간 마감은 즉시 커밋이 되어 정렬이 무의미해진다.
-        if ahead < period / 8 {
-            ahead += period;
-        }
+        let ahead = period - (((delta % period) + period) % period);
+        // ★마감은 절대로 한 주기를 넘지 않는다.★ 여기 원래 "지금과 너무 가까우면 한 칸 뒤로"
+        // 가 있었다(`ahead < period/8` 이면 `+= period`). 스케줄러가 깨기도 전에 지나간 마감은
+        // 즉시 커밋이 되어 정렬이 무의미해진다는 걱정이었는데, **그 걱정 자체가 틀렸다.**
+        // `ahead` 가 0 에 가깝다는 것은 지금이 이미 목표 위상이라는 뜻이므로, 그 자리에서
+        // 커밋하는 것이 곧 정렬된 커밋이다. 늦출 이유가 없다.
+        //
+        // 그리고 그 한 줄이 실기에서 타일 둘을 굶겼다(`log_ani_debug_02/03`, ani_debug_128).
+        // 마감을 프레임 간격(16.67ms)보다 멀리 밀어 두면 다음 스케줄이 먼저 도착하고, 그러면
+        // `upsert` 가 마감을 또 뒤로 민다. `ahead` 는 타일마다 거의 일정하므로 한 번 걸린
+        // 타일은 영원히 걸린다 -- DISPLAY22 는 초당 60 건을 스케줄하고 8 건만 커밋했다.
+        // `upsert` 의 `min` 이 되먹임을 끊고, 이 제거가 애초에 그 상황을 만들지 않는다.
         Some(now.wrapping_add(ahead as u64))
     }
 

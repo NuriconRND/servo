@@ -476,12 +476,26 @@ fn emit_outcommit() {
     );
 }
 
-/// 큐에 마감을 넣거나 갱신한다. ★같은 디바이스는 덮어쓴다★ -- 밀린 커밋을 쌓으면 한
+/// 큐에 마감을 넣거나 갱신한다. 같은 디바이스는 하나만 둔다 -- 밀린 커밋을 쌓으면 한
 /// 주기에 여러 개가 나가고, 그것이 정확히 없애려는 현상이다. 스레드·COM 없이 테스트할 수
 /// 있도록 `schedule` 에서 이 규칙만 갈라냈다.
+///
+/// ★마감은 **앞으로만** 옮긴다. 아직 발화하지 않은 마감을 뒤로 미는 일은 없다.★
+///
+/// 처음에는 무조건 덮어썼는데, 그것이 실기에서 타일 둘을 통째로 굶겼다(`log_ani_debug_02/03`,
+/// ani_debug_128): 초당 60 건을 스케줄한 DISPLAY22 가 실제로는 8 건, DISPLAY1 이 10 건만
+/// 커밋했고 화면은 0.5fps 수준으로 파탄났다. 기전은 이렇다 -- 마감은 최대 한 주기 앞이고
+/// 페인터는 16.67ms 마다 다시 스케줄하므로, `ahead` 가 프레임 간격보다 큰 타일에서는 **다음
+/// 스케줄이 항상 먼저 도착해 마감을 또 뒤로 민다.** 그리고 `ahead` 는 타일마다 거의 일정하다
+/// (렌더 종료와 그 출력 vblank 의 관계가 안정적이라는 것이 이 설계의 전제다). 그래서 한 번
+/// 나쁜 쪽에 걸린 타일은 영원히 나쁜 쪽에 남는다 -- 간헐적 저더가 아니라 영구 기아다.
+///
+/// `min` 은 그 되먹임을 끊는다. 먼저 잡힌 마감이 서고, 뒤에 오는 프레임은 모니터만 갱신한다.
+/// 이미 지난 마감이 남아 있으면 다음 깨어남에 바로 나간다 -- 늦게 커밋하는 것이 아예 안
+/// 하는 것보다 항상 낫다는, 이 모듈 전체를 관통하는 규칙 그대로다.
 fn upsert(queue: &mut Vec<(u64, usize, usize)>, device: usize, monitor: usize, deadline: u64) {
     if let Some(slot) = queue.iter_mut().find(|(_, d, _)| *d == device) {
-        slot.0 = deadline;
+        slot.0 = slot.0.min(deadline);
         slot.2 = monitor;
     } else {
         queue.push((deadline, device, monitor));
@@ -527,35 +541,48 @@ mod tests {
     }
 
     #[test]
-    fn a_second_schedule_for_the_same_device_replaces_the_first() {
+    fn a_second_schedule_for_the_same_device_never_pushes_the_deadline_later() {
         let mut queue = Vec::new();
         upsert(&mut queue, 0xAA, 0x11, 100);
+
+        // ★이것이 실기에서 타일 둘을 굶긴 회귀다.★ 예전 `upsert` 는 무조건 덮어써서, 다음
+        // 프레임의 스케줄이 아직 발화하지 않은 마감을 계속 뒤로 밀었다. `ahead` 가 프레임
+        // 간격보다 큰 타일에서는 그 밀기가 매 프레임 일어나 커밋이 영영 나가지 못했다
+        // (DISPLAY22: 초당 60 건 스케줄, 8 건 커밋).
         upsert(&mut queue, 0xAA, 0x11, 250);
         assert_eq!(
             queue,
-            vec![(250, 0xAA, 0x11)],
-            "같은 디바이스는 쌓이지 않고 덮어써야 한다"
+            vec![(100, 0xAA, 0x11)],
+            "더 나중 마감은 아직 발화하지 않은 마감을 밀어내면 안 된다"
         );
 
-        // 핫플러그: 같은 디바이스가 다른 모니터로 옮겨가면 마감뿐 아니라 모니터도 갱신돼야
+        // 앞으로 옮기는 것은 허용한다 -- 더 일찍 내보내는 쪽은 기아를 만들지 않는다.
+        upsert(&mut queue, 0xAA, 0x11, 60);
+        assert_eq!(
+            queue,
+            vec![(60, 0xAA, 0x11)],
+            "더 이른 마감은 받아들여야 한다"
+        );
+
+        // 핫플러그: 같은 디바이스가 다른 모니터로 옮겨가면 마감이 그대로여도 모니터는 갱신돼야
         // 한다. 이 어서션이 없으면 `upsert` 안의 `slot.2 = monitor;` 를 지워도 위 어서션까지는
-        // 전부 통과한다(Fix round 1, Ruling 19) -- 모니터가 안 바뀌는 회귀를 이 스위트가
-        // 놓치고 있었다는 뜻이다. 여전히 쌓이지 않는다(길이 1)는 것도 같이 확인한다.
+        // 전부 통과한다(Fix round 1, Ruling 19). 여전히 쌓이지 않는다(길이 1)는 것도 같이 본다.
         upsert(&mut queue, 0xAA, 0x22, 400);
         assert_eq!(
             queue,
-            vec![(400, 0xAA, 0x22)],
-            "모니터가 바뀌어도 쌓이지 않고 마감·모니터 모두 덮어써야 한다"
+            vec![(60, 0xAA, 0x22)],
+            "모니터는 갱신하되 마감은 뒤로 밀지 않는다"
         );
     }
 
     #[test]
     fn different_devices_each_keep_their_own_deadline() {
         let mut queue = Vec::new();
-        upsert(&mut queue, 0xAA, 0x11, 100);
-        upsert(&mut queue, 0xBB, 0x22, 250);
         upsert(&mut queue, 0xAA, 0x11, 300);
+        upsert(&mut queue, 0xBB, 0x22, 250);
+        // 한 디바이스를 앞으로 당겨도 다른 디바이스의 마감은 건드리지 않는다.
+        upsert(&mut queue, 0xAA, 0x11, 100);
         queue.sort();
-        assert_eq!(queue, vec![(250, 0xBB, 0x22), (300, 0xAA, 0x11)]);
+        assert_eq!(queue, vec![(100, 0xAA, 0x11), (250, 0xBB, 0x22)]);
     }
 }
