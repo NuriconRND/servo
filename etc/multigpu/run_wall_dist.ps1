@@ -165,6 +165,19 @@ param(
     # 판정은 -DcompBindProf 의 OUTCOMMIT 줄 -- 네 출력의 phase p50 이 전부 목표 근처여야 한다.
     [ValidateRange(-1, 99)]
     [int]    $PerOutputAlign = -1,
+    # gfx_paint_side_animation_tick_divisor: 페인트 스레드가 직접 재생하는 애니메이션에
+    # 대해, 스크립트 틱(= 전체 리플로)을 몇 프레임에 한 번 요청할지. 기본 4.
+    #
+    # ★이 값이 타일 동기의 해상도를 정한다.★ 실측(log_ani_debug_02/18): 초당 렌더 60 회,
+    # 전부 벽 프레임 번호를 달고 오지만 **서로 다른 번호는 16 개**다(= 60/4). 번호 하나를
+    # 약 3.75 번의 렌더가 공유하고, 그 사이 프레임의 위치는 각 페인터가 **따로 예측**한다.
+    # 네 타일을 같은 프레임에 묶는 배리어는 초당 16 번만 걸린다는 뜻이다.
+    #
+    # 1 로 두면 매 프레임 틱이 돌아 배리어가 매 프레임 걸린다 -- 대신 리플로가 초당 122 회로
+    # 돌아간다(그 비용 때문에 이 divisor 가 도입됐다: 콘텐츠 전환 때 리플로 한 번이 14.5ms,
+    # 벽이 2 초간 안 그려졌다). ★운영값이 아니라 기전 확인용 실험 스위치로 쓴다.★
+    [ValidateRange(1, 16)]
+    [int]    $AnimTickDivisor = 4,
     # gfx_sample_lead_periods -- B2. 타일마다 자기 출력이 그 프레임을 표시할 시각에
     # 애니메이션을 샘플한다. -1 = 꺼짐(기본), 0 = 다음 vblank, 1 = +1 주기 (0..4).
     #
@@ -732,6 +745,7 @@ $argList = @(
     "--pref", "gfx_present_align_dwm_pct=$DwmAlign",
     "--pref", "gfx_present_align_per_output_pct=$PerOutputAlign",
     "--pref", "gfx_sample_lead_periods=$SampleLead",
+    "--pref", "gfx_paint_side_animation_tick_divisor=$AnimTickDivisor",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -800,7 +814,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign per_output_align=$PerOutputAlign sample_lead=$SampleLead escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign per_output_align=$PerOutputAlign sample_lead=$SampleLead anim_tick_div=$AnimTickDivisor escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
