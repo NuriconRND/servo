@@ -279,6 +279,9 @@ struct AppState {
     /// state whenever it likes; the clock decides when what exists gets drawn. That is the
     /// model a display wants, and it is not what this shell used to do.
     present_period: std::time::Duration,
+    /// `gfx_wall_direct_render` 를 한 번만 읽어 둔다 -- 틱 판정이 초당 300 회 도는 자리라
+    /// 거기서 pref 락을 잡을 이유가 없다.
+    direct_render: bool,
     /// When the next presentation tick is due.
     next_present_tick: Cell<std::time::Instant>,
     /// ★표출 클럭을 디스플레이 vsync 에 묶는다(`gfx_vsync_enabled`).★ 켜졌을 때만 Some.
@@ -853,9 +856,7 @@ impl AppState {
             self.vsync_tick_pending.set(false);
             self.last_present_tick_at.set(now);
             self.note_present_tick();
-            if let Some(tile) = self.tiles.first() {
-                tile.window.request_redraw();
-            }
+            self.fire_present_tick();
         }
 
         if fired {
@@ -955,11 +956,37 @@ impl AppState {
                 self.clock_stats.borrow_mut().backstop += 1;
             }
             self.note_present_tick();
-            if let Some(tile) = self.tiles.first() {
-                tile.window.request_redraw();
-            }
+            self.fire_present_tick();
         }
         next
+    }
+
+    /// 틱이 발화했다 -- 그릴 사람을 부른다.
+    ///
+    /// ★`gfx_wall_direct_render` 가 켜져 있으면 `request_redraw()` 를 거치지 않는다.★
+    /// 화면에 내보내는 것은 `IDCompositionDevice::Commit`(또는 스왑체인 `Present`)이고 둘 다
+    /// 순수 COM 호출이라 메시지 펌프와 무관하다. 그런데 `request_redraw()` 는 Windows 에서
+    /// `RedrawWindow` 로 `WM_PAINT` 를 요청하고, `WM_PAINT` 는 posted message 큐가 다 빈
+    /// 뒤에야 합성되는 최저 우선순위 메시지다 -- 엔진 wake 를 초당 300 회 받는 이 셸에서
+    /// 렌더가 그 큐 뒤에 줄을 선다. 틱 간격이 p95 17.23ms(주기 16.667ms)로 늦는 것의 유력한
+    /// 후보가 그 왕복이다(타이머 해상도는 아니다 -- winit 은 100ns 단위 고해상도 대기를 쓴다).
+    ///
+    /// 렌더를 스레드로 옮기는 것과는 다른 이야기다. 그것을 막는 것은 메시지 루프가 아니라
+    /// 메인 스레드 친화성이다(`render_all_tiles` 가 `Rc<RefCell<..>>` 인 임베더 핸들을
+    /// 만지고, 타일 0 의 GL 컨텍스트가 메인에서 current 다). 여기서 바꾸는 것은 **누가 언제
+    /// 부르나**뿐이고, 부르는 스레드는 그대로 메인이다.
+    ///
+    /// `redraw` 계수도 같이 올린다 -- `WALLCLOCK` 의 `ticks == redraw == renders` 검산이
+    /// 두 경로에서 같은 뜻을 유지해야 한다.
+    fn fire_present_tick(&self) {
+        if self.direct_render {
+            self.note_redraw_requested();
+            self.charge_main(MainSlot::Render, || self.render_all_tiles());
+            return;
+        }
+        if let Some(tile) = self.tiles.first() {
+            tile.window.request_redraw();
+        }
     }
 
     fn render_all_tiles(&self) {
@@ -1372,6 +1399,7 @@ impl ApplicationHandler<WakerEvent> for App {
             present_count: Cell::new(0),
             present_window_start: Cell::new(None),
             pass_stats: RefCell::new(PassStats::default()),
+            direct_render: servo_config::pref!(gfx_wall_direct_render),
             present_period: {
                 // Same knob and the same clamp the paint timer uses; one refresh rate for the
                 // machine, not two that can disagree.

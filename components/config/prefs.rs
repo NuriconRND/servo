@@ -490,6 +490,24 @@ pub struct Preferences {
     pub gfx_paint_side_animation_tick_divisor: i64,
 
     pub gfx_wall_parallel_tiles: bool,
+    /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
+    /// 그릴지. 기본 꺼짐(= 종전 경로).
+    ///
+    /// ★왜 거칠 이유가 없나★ — 화면에 내보내는 것은 `IDCompositionDevice::Commit`(또는
+    /// 스왑체인 `Present`)이고 둘 다 순수 COM 호출이다. 메시지 펌프와 무관하다. 그런데
+    /// `request_redraw()` 는 Windows 에서 `RedrawWindow` 로 **`WM_PAINT` 를 요청**하고
+    /// (winit `window.rs` 의 플랫폼 주석), `WM_PAINT` 는 posted message 큐가 다 빈 뒤에야
+    /// 합성되는 최저 우선순위 메시지다. 이 셸은 엔진 wake 를 초당 297~314 회 받으므로
+    /// (`MAINBUSY spin n=`) 렌더가 그 큐 뒤에 줄을 서게 된다.
+    ///
+    /// 실측된 증상: 틱 간격 p50 16.67 / p95 17.23 / max 60.60ms(주기 16.667ms). winit 은
+    /// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 으로 100ns 단위 대기를 걸므로 타이머
+    /// 해상도는 원인이 아니다 -- 남는 후보가 이 `WM_PAINT` 왕복이다.
+    ///
+    /// 렌더 자체는 여전히 메인 스레드가 한다. 옮길 수 없는 이유는 메시지 루프가 아니라
+    /// **메인 스레드 친화성**이다: `render_all_tiles` 가 임베더 `WebView` 핸들을 만지고
+    /// (`Rc<RefCell<..>>`, `Send` 아님) 타일 0 의 GL 컨텍스트가 메인에서 current 다.
+    pub gfx_wall_direct_render: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -1190,6 +1208,7 @@ impl Preferences {
             gfx_paint_side_animation_horizon_ms: 3000,
             gfx_paint_side_animation_tick_divisor: 4,
             gfx_wall_parallel_tiles: false,
+            gfx_wall_direct_render: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
