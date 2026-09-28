@@ -1383,7 +1383,7 @@ if ($imp) {
 # ~1.5ms spent outside the tile loop. This splits the tile step itself with the SAME window and
 # denominator as WALLPASS -- mixing per-sample and per-window averages is how an earlier attempt
 # produced a negative remainder.
-$split = Select-String -Path $LogPath -Pattern "WALLSPLIT pass_ms=([\d.]+) = make_current=([\d.]+) \+ paint=([\d.]+) \+ present=([\d.]+) \+ outside=(-?[\d.]+)" -EA SilentlyContinue
+$split = Select-String -Path $LogPath -Pattern "WALLSPLIT pass_ms=([\d.]+) = make_current=([\d.]+) \+ paint=([\d.]+) \+ present=([\d.]+) \+ dispatch=([\d.]+) \+ join=([\d.]+) \+ flush=([\d.]+) \+ outside=(-?[\d.]+)" -EA SilentlyContinue
 if ($split) {
     # ***A run holds two regimes, and averaging them together lies.*** With DComp on, tile
     # surfaces are redrawn every frame until they get promoted to swapchains a few seconds in;
@@ -1403,8 +1403,11 @@ if ($split) {
             Pass    = [double]$g[1].Value
             Mc      = [double]$g[2].Value
             Paint   = [double]$g[3].Value
-            Present = [double]$g[4].Value
-            Outside = [double]$g[5].Value
+            Present  = [double]$g[4].Value
+            Dispatch = [double]$g[5].Value
+            Join     = [double]$g[6].Value
+            Flush    = [double]$g[7].Value
+            Outside  = [double]$g[8].Value
         }
         $i++
     }
@@ -1420,12 +1423,55 @@ if ($split) {
         Write-Host ("      make_current{0,5:N2}" -f (($set | Measure-Object Mc -Average).Average))
         Write-Host ("      paint     {0,7:N2}   <- Painter::render for every tile" -f (($set | Measure-Object Paint -Average).Average))
         Write-Host ("      present   {0,7:N2}" -f (($set | Measure-Object Present -Average).Average))
-        Write-Host ("      outside   {0,7:N2}   <- deferred DComp Commit flush + the loop itself" -f (($set | Measure-Object Outside -Average).Average))
+        Write-Host ("      dispatch  {0,7:N2}   <- barrier keep-previous decision + inline painters" -f (($set | Measure-Object Dispatch -Average).Average))
+        Write-Host ("      join      {0,7:N2}   <- waiting for the threaded tiles to finish" -f (($set | Measure-Object Join -Average).Average))
+        Write-Host ("      flush     {0,7:N2}   <- deferred DComp Commit flush" -f (($set | Measure-Object Flush -Average).Average))
+        Write-Host ("      outside   {0,7:N2}   <- still unaccounted: the loop itself" -f (($set | Measure-Object Outside -Average).Average))
     }
     Write-Host "  Compare the same page with -DComp on and -DComp off, STEADY STATE against steady state:"
     Write-Host "  the line that grows there is the one to chase. Warm-up differences are the promotion cost."
+    Write-Host "  If join dominates, read WALLQUEUE next: it splits that wait into queue latency vs render."
 } elseif ($PresentCadence) {
     Write-Warning "-PresentCadence was set but no WALLSPLIT line was logged. It comes from winit_wall's render pass, so a servoshell run or a run that never painted produces nothing."
+}
+
+# --- WALLQUEUE: the other half of WALLSPLIT's `join` (needs -PresentCadence).
+# `join` is the wall clock the pass spent waiting for the threaded tiles, and it is
+# `queued_ms + render_ms` per tile. The two have opposite causes: render is that tile's own
+# work, queued is time the REQUEST sat in line -- the request channel is unbounded and shared
+# with image updates (`dispatch_detached`), so a render request can queue behind those.
+# WALLPASS already reports render (per-tile avg/max); this is the queue side, same window.
+$queue = Select-String -Path $LogPath -Pattern "WALLQUEUE per-tile queued_ms avg=\[([\d.,]+)\] max=\[([\d.,]+)\]" -EA SilentlyContinue
+if ($queue) {
+    # Same two regimes as WALLSPLIT: warm-up before swapchain promotion, then steady state.
+    $warmupWindows = 10
+    $tileCount = @(($queue[0].Matches[0].Groups[1].Value -split ',')).Count
+    $avgSums = New-Object 'double[]' $tileCount
+    $maxes = New-Object 'double[]' $tileCount
+    $steady = 0
+    $i = 0
+    foreach ($hit in $queue) {
+        $avgs = @($hit.Matches[0].Groups[1].Value -split ',' | ForEach-Object { [double]$_ })
+        $mx = @($hit.Matches[0].Groups[2].Value -split ',' | ForEach-Object { [double]$_ })
+        for ($t = 0; $t -lt $tileCount; $t++) {
+            if ($t -lt $mx.Count -and $mx[$t] -gt $maxes[$t]) { $maxes[$t] = $mx[$t] }
+            # Steady state only for the average: the warm-up windows are a different regime.
+            if ($i -ge $warmupWindows -and $t -lt $avgs.Count) { $avgSums[$t] += $avgs[$t] }
+        }
+        if ($i -ge $warmupWindows) { $steady++ }
+        $i++
+    }
+    Write-Host ""
+    Write-Host "WALLQUEUE -- how long a tile render request waited in line before its thread took it:"
+    if ($steady -gt 0) {
+        $perTile = @(0..($tileCount - 1) | ForEach-Object { "{0:N2}" -f ($avgSums[$_] / $steady) })
+        Write-Host ("  steady-state avg ms per tile  [{0}]  ({1} windows)" -f ($perTile -join ", "), $steady)
+    } else {
+        Write-Host "  (run too short for a steady-state window)"
+    }
+    Write-Host ("  worst single window per tile  [{0}]" -f (@(0..($tileCount - 1) | ForEach-Object { "{0:N2}" -f $maxes[$_] }) -join ", "))
+    Write-Host "  Near zero means the tile threads were idle and took the request at once, so WALLSPLIT's"
+    Write-Host "  join is real render time. Large means the request queued behind other work on that thread."
 }
 
 # --- WALLACK: the canvas-ack deadlock and its recovery.
