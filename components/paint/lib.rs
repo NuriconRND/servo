@@ -17,7 +17,7 @@ use servo_constellation_traits::EmbedderToConstellationMessage;
 use webxr::WebXrRegistry;
 
 pub use crate::paint::{
-    Paint, PaintTargetsInFlight, RenderingContextFactory, WebRenderDebugOption,
+    Paint, PaintTargetsInFlight, RenderingContextFactory, TileRenderTiming, WebRenderDebugOption,
 };
 
 /// ★DWM 합성 격자.★ `(vblank 의 QPC, 한 주기의 QPC 틱)` -- 조회만 한다, 블록하지 않는다.

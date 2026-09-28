@@ -45,7 +45,8 @@ pub use net_traits::CookieSource;
 // fleshed out public domains API if we want to expose it.
 pub use net_traits::pub_domains::is_reg_domain;
 pub use paint::{
-    PaintTargetsInFlight, RenderingContextFactory, WebRenderDebugOption, dwm_composition_grid,
+    PaintTargetsInFlight, RenderingContextFactory, TileRenderTiming, WebRenderDebugOption,
+    dwm_composition_grid,
 };
 pub use paint_api::rendering_context::{
     DisplayTopology, OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext,

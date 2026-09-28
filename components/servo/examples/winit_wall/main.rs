@@ -448,6 +448,11 @@ struct PassStats {
     /// Per tile, so the slowest one is visible: it is the floor a parallel version would hit.
     tile_ms_sum: Vec<f64>,
     tile_ms_max: Vec<f64>,
+    /// 발사에서 그 타일 스레드가 요청을 **집기까지** 기다린 시간. ★`tile_ms` 와 나란히
+    /// 읽어야 한다★ — 둘을 더한 것이 셸이 조인에서 보는 대기이고, 어느 쪽이 큰지가 원인을
+    /// 가른다(무거운 렌더 vs. 줄 서 있던 요청).
+    tile_queued_ms_sum: Vec<f64>,
+    tile_queued_ms_max: Vec<f64>,
     /// Tiles skipped by the keep-previous barrier, which shorten a pass for a different reason.
     skipped: u32,
     /// 타일 스텝을 셋으로 쪼갠 것. ★WALLPASS 와 **같은 창·같은 분모**여야 한다★ — 기존에는
@@ -457,18 +462,41 @@ struct PassStats {
     make_current_ms_sum: f64,
     paint_ms_sum: f64,
     present_ms_sum: f64,
+    /// `outside` 를 다시 쪼갠 것. ★이 셋은 타일 루프 **밖**이다★ — 발사(배리어 판정 포함),
+    /// 스레드 타일 조인 대기, 미뤄 둔 Commit 플러시.
+    ///
+    /// 2026-09-28 계측에서 `pass_ms=13.13` 중 `outside=12.88` 이었는데 그 안을 볼 수가
+    /// 없었다(타일 넷의 페인트 합은 2.6ms 뿐이다). 셋을 빼고도 남는 것이 진짜 루프
+    /// 오버헤드이고, 어느 하나가 지배적이면 그것이 박자를 먹는 범인이다.
+    dispatch_ms_sum: f64,
+    join_ms_sum: f64,
+    flush_ms_sum: f64,
 }
 
-/// 한 패스에서 타일 스텝을 셋으로 나눈 합계(타일 전부를 더한 값).
+/// 한 패스에서 타일 스텝을 셋으로 나눈 합계(타일 전부를 더한 값)와, 루프 밖의 세 구간.
 #[derive(Default)]
 struct PassSplit {
     make_current_ms: f64,
     paint_ms: f64,
     present_ms: f64,
+    /// 스레드 타일을 발사하기까지 — 배리어의 keep-previous 판정이 여기 들어 있다.
+    dispatch_ms: f64,
+    /// 발사해 둔 타일이 끝나기를 기다린 시간. ★타일 자신의 렌더 시간(`tile_ms`)이 아니다★:
+    /// 늦게 시작하거나 스케줄을 못 받아 생긴 대기까지 포함한 벽시계다.
+    join_ms: f64,
+    /// 미뤄 둔 DComp Commit 을 흘리는 데 쓴 시간.
+    flush_ms: f64,
 }
 
 impl AppState {
-    fn note_render_pass(&self, pass_ms: f64, tile_ms: &[f64], skipped: u32, split: PassSplit) {
+    fn note_render_pass(
+        &self,
+        pass_ms: f64,
+        tile_ms: &[f64],
+        tile_queued_ms: &[f64],
+        skipped: u32,
+        split: PassSplit,
+    ) {
         // ***`string`, not `enabled`.*** This flag is `Kind::Str`, and `enabled` asserts the
         // flag is `Kind::Presence` -- calling it here panicked on startup. Same truthiness
         // test painter.rs uses for the same flag, and cached because this runs every pass.
@@ -484,6 +512,8 @@ impl AppState {
         if stats.tile_ms_sum.len() != tile_ms.len() {
             stats.tile_ms_sum = vec![0.0; tile_ms.len()];
             stats.tile_ms_max = vec![0.0; tile_ms.len()];
+            stats.tile_queued_ms_sum = vec![0.0; tile_ms.len()];
+            stats.tile_queued_ms_max = vec![0.0; tile_ms.len()];
         }
         let start = *stats.window_start.get_or_insert(now);
         stats.passes += 1;
@@ -493,9 +523,16 @@ impl AppState {
         stats.make_current_ms_sum += split.make_current_ms;
         stats.paint_ms_sum += split.paint_ms;
         stats.present_ms_sum += split.present_ms;
+        stats.dispatch_ms_sum += split.dispatch_ms;
+        stats.join_ms_sum += split.join_ms;
+        stats.flush_ms_sum += split.flush_ms;
         for (index, ms) in tile_ms.iter().enumerate() {
             stats.tile_ms_sum[index] += ms;
             stats.tile_ms_max[index] = stats.tile_ms_max[index].max(*ms);
+        }
+        for (index, ms) in tile_queued_ms.iter().enumerate() {
+            stats.tile_queued_ms_sum[index] += ms;
+            stats.tile_queued_ms_max[index] = stats.tile_queued_ms_max[index].max(*ms);
         }
         if now.duration_since(start).as_secs_f64() < 1.0 {
             return;
@@ -532,19 +569,57 @@ impl AppState {
             ceiling,
             stats.skipped,
         );
-        // 같은 창, 같은 분모(패스 수)로 나눈 타일 스텝의 내역. `outside` 는 패스 전체에서 이
-        // 셋을 뺀 것 = 지연 Commit 플러시와 루프 자체의 비용이다.
+        // 발사에서 타일 스레드가 요청을 집기까지의 대기. ★`WALLPASS` 의 per-tile 과 같은 창,
+        // 같은 분모다★ — 그래서 둘을 그대로 더할 수 있고, 그 합이 `WALLSPLIT` 의 `join` 에
+        // 맞아야 한다(가장 늦은 타일이 패스를 붙잡으므로 `max` 쪽이 `join` 에 가깝다).
+        //
+        // 값이 0 이면 스레드가 비어 있다가 곧장 집은 것이다. 크면 요청 채널에 앞선 일이
+        // 있었다는 뜻인데, 그 채널은 이미지 갱신(`dispatch_detached`)과 공유하는 무한 큐다.
+        log::info!(
+            "WALLQUEUE per-tile queued_ms avg=[{}] max=[{}]",
+            stats
+                .tile_queued_ms_sum
+                .iter()
+                .map(|ms| format!("{:.2}", ms / passes))
+                .collect::<Vec<_>>()
+                .join(","),
+            stats
+                .tile_queued_ms_max
+                .iter()
+                .map(|ms| format!("{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        // 같은 창, 같은 분모(패스 수)로 나눈 패스 내역. 앞의 셋은 타일 루프 **안**이고,
+        // `dispatch`·`join`·`flush` 는 루프 **밖**의 세 구간이다. `outside` 는 그 여섯을
+        // 모두 뺀 나머지 = 루프 자체와 `note_clock_render_pass`·`maybe_capture` 등의 비용이다.
+        //
+        // ★`join` 이 지배적이면 스레드 타일이 늦게 끝나는 것이고, `flush` 면 Commit 대기,
+        // `dispatch` 면 배리어 판정, `outside` 가 여전히 크면 아직 못 본 구간이 남은 것이다.★
         let make_current = stats.make_current_ms_sum / passes;
         let paint = stats.paint_ms_sum / passes;
         let present = stats.present_ms_sum / passes;
+        let dispatch = stats.dispatch_ms_sum / passes;
+        let join = stats.join_ms_sum / passes;
+        let flush = stats.flush_ms_sum / passes;
         log::info!(
             "WALLSPLIT pass_ms={:.2} = make_current={:.2} + paint={:.2} + present={:.2} \
-             + outside={:.2} (all per pass, {} tiles summed)",
+             + dispatch={:.2} + join={:.2} + flush={:.2} + outside={:.2} \
+             (all per pass, {} tiles summed)",
             stats.pass_ms_sum / passes,
             make_current,
             paint,
             present,
-            stats.pass_ms_sum / passes - make_current - paint - present,
+            dispatch,
+            join,
+            flush,
+            stats.pass_ms_sum / passes
+                - make_current
+                - paint
+                - present
+                - dispatch
+                - join
+                - flush,
             stats.tile_ms_sum.len(),
         );
         *stats = PassStats {
@@ -1115,6 +1190,9 @@ impl AppState {
         };
         let pass_start = std::time::Instant::now();
         let mut tile_ms = vec![0.0f64; self.tiles.len()];
+        // 스레드 타일만 값을 갖는다(메인에서 그린 타일은 줄을 서지 않는다). 0 은 "줄을
+        // 서지 않았다" 는 뜻이고, 그것이 맞는 값이다.
+        let mut tile_queued_ms = vec![0.0f64; self.tiles.len()];
         let mut split = PassSplit::default();
         let mut skipped = 0u32;
         // `gfx_wall_rotate_tile_order`: 시작 타일을 패스마다 한 칸 돌린다.
@@ -1147,6 +1225,10 @@ impl AppState {
         // 제자리에 넣을 수 있다. ★이게 없으면 WALLPASS 의 타일별 값이 0 이 되어 어느 타일이
         // 패스를 붙잡는지 볼 수 없다.★
         let mut dispatched_indices = Vec::new();
+        // 발사 구간을 따로 잰다: 배리어의 keep-previous 판정이 타일마다 여기서 일어나고,
+        // `dispatch_paint_targets` 는 **인라인 painter 를 그 자리에서 돌린다**. 둘 중 하나라도
+        // 패스를 붙잡고 있다면 그 값이 여기 나타난다.
+        let dispatch_start = std::time::Instant::now();
         let in_flight = {
             let mut targets = Vec::new();
             for (index, tile) in self.tiles.iter().enumerate() {
@@ -1168,6 +1250,7 @@ impl AppState {
             }
             (!targets.is_empty()).then(|| webview.dispatch_paint_targets(&targets))
         };
+        split.dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
         for step in 0..count {
             let tile_index = (offset + step) % count;
@@ -1249,15 +1332,25 @@ impl AppState {
             //
             // 겹침은 대신 `WALLPASS` 에서 읽는다: `serial_sum` 이 `pass_ms` 보다 크면
             // 그 배수가 실제로 얻은 병렬도다(겹치지 않으면 둘이 같다).
-            for (index, tile_render_ms) in dispatched_indices.iter().zip(in_flight.join()) {
-                tile_ms[*index] = tile_render_ms;
+            //
+            // 조인 **대기**는 다르다. 그건 패스가 실제로 여기서 멈춰 있던 시간이므로
+            // `split.join_ms` 에 들어가고, 그만큼 `outside` 에서 빠진다.
+            let join_start = std::time::Instant::now();
+            let tile_times = in_flight.join();
+            split.join_ms = join_start.elapsed().as_secs_f64() * 1000.0;
+            for (index, timing) in dispatched_indices.iter().zip(tile_times) {
+                tile_ms[*index] = timing.render_ms;
+                tile_queued_ms[*index] = timing.queued_ms;
             }
         }
 
+        let flush_start = std::time::Instant::now();
         webview.flush_deferred_dcomp_commits();
+        split.flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
         self.note_render_pass(
             pass_start.elapsed().as_secs_f64() * 1000.0,
             &tile_ms,
+            &tile_queued_ms,
             skipped,
             split,
         );

@@ -230,18 +230,34 @@ enum PainterHostKind {
 /// ★들고 있는 동안 그 타일들이 나란히 돈다.★ 떨어뜨리면(`join` 없이) 결과를 안 기다리는
 /// 것이 되는데, 그러면 다음 패스가 이전 패스와 겹쳐 버리므로 반드시 `join` 할 것.
 pub struct PaintTargetsInFlight {
-    in_flight: Vec<crossbeam_channel::Receiver<f64>>,
+    in_flight: Vec<crossbeam_channel::Receiver<TileRenderTiming>>,
+}
+
+/// 스레드 타일 하나가 돌려주는 시간. ★둘로 나뉘어 있는 것이 요점이다.★
+///
+/// 셸이 보는 조인 대기는 `queued_ms + render_ms` 인데, 이 둘은 원인이 완전히 다르다.
+/// `render_ms` 가 크면 그 타일의 렌더가 무거운 것이고, `queued_ms` 가 크면 **요청이 줄에서
+/// 기다린 것**이다 — 요청 채널이 `dispatch_detached`(이미지 갱신)와 같은 무한 큐라서, 그쪽
+/// 일이 밀려 있으면 렌더 요청이 그 뒤에 선다.
+///
+/// 하나로 합쳐 놓았던 동안 2026-09-28 계측에서 타일별 렌더가 각 0.5~0.8ms 인데 패스는
+/// 13.1ms 였다. 그 차이가 어느 쪽인지 볼 수 없었다.
+#[derive(Clone, Copy, Default)]
+pub struct TileRenderTiming {
+    /// 발사에서 타일 스레드가 실제로 그 요청을 집기까지 — 큐에서 기다린 시간(ms).
+    pub queued_ms: f64,
+    /// `painter.render` 가 실제로 쓴 시간(ms).
+    pub render_ms: f64,
 }
 
 impl PaintTargetsInFlight {
-    /// 발사해 둔 타일들이 전부 끝나기를 기다리고, **각자 걸린 시간(ms)** 을 발사 순서대로
-    /// 돌려준다.
+    /// 발사해 둔 타일들이 전부 끝나기를 기다리고, **각자의 시간** 을 발사 순서대로 돌려준다.
     ///
     /// ★시간을 돌려주는 것이 요점이다.★ 팬아웃 이후 셸의 루프는 스레드 타일을 건너뛰므로
     /// `WALLPASS` 의 타일별 값이 0 이 되고, 그러면 "어느 타일이 패스를 붙잡는가" 를 볼 수
     /// 없다. 실제로 그 눈이 없어 처음 팬아웃 측정에서 타일별 분포가
     /// `[25.87, 0, 0, 0]` 으로 나왔다(2026-09-03, `log_webgpu/68`).
-    pub fn join(self) -> Vec<f64> {
+    pub fn join(self) -> Vec<TileRenderTiming> {
         self.in_flight
             .into_iter()
             // 스레드가 죽었으면 `Err` 다. 그때는 기다릴 것이 없다 — 그 사실은 요청을 보낼 때
@@ -2829,10 +2845,21 @@ impl Paint {
                     let time_profiler_chan = self.time_profiler_chan.clone();
                     // 타일이 자기 시간을 재서 돌려준다 — 메인은 이 타일이 언제 시작하고
                     // 끝났는지 볼 수 없다.
+                    //
+                    // ★보낸 시점도 같이 넘긴다.★ 그래야 타일 스레드가 이 요청을 **집기까지**
+                    // 걸린 시간을 알 수 있다. 요청 채널은 무한 큐이고 이미지 갱신
+                    // (`dispatch_detached`)과 공유하므로, 렌더 요청이 그 뒤에 서 있었는지가
+                    // 조인 대기의 큰 몫일 수 있다.
+                    let dispatched_at = Instant::now();
                     let dispatched = threaded.dispatch(move |painter| {
                         let started = Instant::now();
+                        let queued_ms =
+                            started.duration_since(dispatched_at).as_secs_f64() * 1000.0;
                         painter.render(&time_profiler_chan);
-                        started.elapsed().as_secs_f64() * 1000.0
+                        TileRenderTiming {
+                            queued_ms,
+                            render_ms: started.elapsed().as_secs_f64() * 1000.0,
+                        }
                     });
                     if let Some(done) = dispatched {
                         in_flight.push(done);
