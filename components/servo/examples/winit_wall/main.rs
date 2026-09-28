@@ -396,6 +396,27 @@ struct ClockStats {
     /// "60,60,60,20,60" 은 평균이 같다. 이 표본이 성공 기준 1 그 자체다.
     gaps_ms: Vec<f64>,
     last_render_at: Option<std::time::Instant>,
+    /// `about_to_wait` 진입 횟수. ★루프가 큐를 다 비우고 잠들기 직전에만 도달한다★ --
+    /// 이 값이 작으면 큐가 비지 않는다는 뜻이고, 그러면 `WaitUntil` 타이머가 박자를 쥐고
+    /// 있지 않다.
+    about_to_wait: u32,
+    /// 틱을 **누가 알아챘나**. `[about_to_wait, user_event, window_event]`.
+    ///
+    /// ★이것이 "타이머가 박자를 쥐고 있나" 를 가리는 값이다.★ `about_to_wait` 이 대부분이면
+    /// `WaitUntil` 이 제때 깨워 준 것이고, 남은 지터는 타이머 정밀도·스케줄링이다. 반대로
+    /// `user_event`/`window_event` 가 대부분이면 타이머가 깨운 게 아니라 **엔진 wake 가
+    /// 지나가며 우연히 알아챈** 것이고, 그러면 박자가 엔진 활동에 얹혀 있다 -- `about_to_wait`
+    /// 이 굶는다는 이 셸의 알려진 실패(`drive_present_clock` 주석, 실측 정지 3.2 초)와 같은
+    /// 기전이다. 어느 쪽이냐로 다음 할 일이 갈린다.
+    tick_by_site: [u32; 3],
+}
+
+/// `drive_present_clock` 을 부른 자리. `ClockStats::tick_by_site` 의 첨자다.
+#[derive(Clone, Copy)]
+enum ClockSite {
+    AboutToWait = 0,
+    UserEvent = 1,
+    WindowEvent = 2,
 }
 
 /// 한 창에 담을 간격 표본의 상한.
@@ -632,6 +653,22 @@ impl AppState {
     }
 
     /// winit 이 `RedrawRequested` 를 전달했다.
+    fn note_tick_site(&self, site: ClockSite) {
+        let mut stats = self.clock_stats.borrow_mut();
+        stats
+            .window_start
+            .get_or_insert_with(std::time::Instant::now);
+        stats.tick_by_site[site as usize] += 1;
+    }
+
+    fn note_about_to_wait(&self) {
+        let mut stats = self.clock_stats.borrow_mut();
+        stats
+            .window_start
+            .get_or_insert_with(std::time::Instant::now);
+        stats.about_to_wait += 1;
+    }
+
     fn note_redraw_requested(&self) {
         let mut stats = self.clock_stats.borrow_mut();
         stats
@@ -719,6 +756,7 @@ impl AppState {
 
         log::info!(
             "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} \
+             atw={} tick_by atw={} user={} win={} \
              per_interval dup={} one={} skip1={} skipN={} \
              period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
             window_ms,
@@ -727,6 +765,10 @@ impl AppState {
             stats.renders,
             stats.suppressed,
             stats.backstop,
+            stats.about_to_wait,
+            stats.tick_by_site[0],
+            stats.tick_by_site[1],
+            stats.tick_by_site[2],
             dup,
             one,
             skip1,
@@ -786,12 +828,12 @@ impl AppState {
     /// 그래서 이벤트를 처리하는 쪽에서도 이 클럭을 돌린다.
     ///
     /// 다음 틱 시각을 돌려준다(호출자가 control flow 를 잡을 때 쓴다).
-    fn drive_present_clock(&self) -> std::time::Instant {
+    fn drive_present_clock(&self, site: ClockSite) -> std::time::Instant {
         let now = std::time::Instant::now();
 
         // ★vsync 에 묶인 경로.★ 틱의 권한이 소프트 타이머가 아니라 DwmFlush 스레드에 있다.
         if let Some(driver) = self.present_vsync.as_ref() {
-            self.pump_vsync(now, driver);
+            self.pump_vsync(now, driver, site);
             if !self.vsync_stalled.get() {
                 // 위상 오프셋이 걸려 있으면 **그 시각에** 깨어나야 한다. 콜백은 이미
                 // 왔고 틱만 미뤄 둔 상태이므로, 이 시각을 놓치면 한 주기가 통째로 빈다.
@@ -809,7 +851,7 @@ impl AppState {
             // 멎었다 -- 아래 자유 구동 타이머가 대신 민다.
         }
 
-        self.drive_present_clock_timer(now)
+        self.drive_present_clock_timer(now, site)
     }
 
     /// vsync 신호를 소모하고 다음 것을 걸며, 신호가 끊겼는지 판정한다.
@@ -818,7 +860,12 @@ impl AppState {
     /// 부르면 그동안 이벤트를 하나도 처리하지 못하고, 이 셸은 메인이 전부를 돌린다.
     /// `DwmVsyncRefreshDriver` 가 이미 전용 스레드에서 그것을 돌며 등록된 콜백을 쏘므로,
     /// 셸은 콜백에서 플래그만 세우고 루프를 깨운다.
-    fn pump_vsync(&self, now: std::time::Instant, driver: &Rc<dyn servo::RefreshDriver>) {
+    fn pump_vsync(
+        &self,
+        now: std::time::Instant,
+        driver: &Rc<dyn servo::RefreshDriver>,
+        site: ClockSite,
+    ) {
         let fired = self.vsync_due.swap(false, Ordering::AcqRel);
         if fired {
             self.vsync_armed.set(false);
@@ -856,6 +903,7 @@ impl AppState {
             self.vsync_tick_pending.set(false);
             self.last_present_tick_at.set(now);
             self.note_present_tick();
+            self.note_tick_site(site);
             self.fire_present_tick();
         }
 
@@ -938,7 +986,7 @@ impl AppState {
         now + std::time::Duration::from_secs_f64(wait_s)
     }
 
-    fn drive_present_clock_timer(&self, now: std::time::Instant) -> std::time::Instant {
+    fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
             // ***Advance to the first future tick rather than adding one period.*** After a
@@ -956,6 +1004,7 @@ impl AppState {
                 self.clock_stats.borrow_mut().backstop += 1;
             }
             self.note_present_tick();
+            self.note_tick_site(site);
             self.fire_present_tick();
         }
         next
@@ -1506,7 +1555,7 @@ impl ApplicationHandler<WakerEvent> for App {
             state.wake_pending.store(false, Ordering::SeqCst);
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
             // 큐가 비지 않아도 박자는 흘러야 한다(`drive_present_clock` 참조).
-            state.drive_present_clock();
+            state.drive_present_clock(ClockSite::UserEvent);
         }
     }
 
@@ -1518,6 +1567,7 @@ impl ApplicationHandler<WakerEvent> for App {
             event_loop.exit();
             return;
         }
+        state.note_about_to_wait();
         state.report_main_busy();
         state.report_clock_stats();
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
@@ -1530,7 +1580,7 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
 
-        let next = state.drive_present_clock();
+        let next = state.drive_present_clock(ClockSite::AboutToWait);
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
     }
 
@@ -1542,7 +1592,7 @@ impl ApplicationHandler<WakerEvent> for App {
     ) {
         if let Self::Running(state) = self {
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
-            state.drive_present_clock();
+            state.drive_present_clock(ClockSite::WindowEvent);
         }
 
         match event {
