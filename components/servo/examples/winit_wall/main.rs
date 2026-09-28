@@ -408,7 +408,7 @@ struct ClockStats {
     /// 지나가며 우연히 알아챈** 것이고, 그러면 박자가 엔진 활동에 얹혀 있다 -- `about_to_wait`
     /// 이 굶는다는 이 셸의 알려진 실패(`drive_present_clock` 주석, 실측 정지 3.2 초)와 같은
     /// 기전이다. 어느 쪽이냐로 다음 할 일이 갈린다.
-    tick_by_site: [u32; 3],
+    tick_by_site: [u32; 4],
 }
 
 /// `drive_present_clock` 을 부른 자리. `ClockStats::tick_by_site` 의 첨자다.
@@ -417,6 +417,9 @@ enum ClockSite {
     AboutToWait = 0,
     UserEvent = 1,
     WindowEvent = 2,
+    /// 전용 페이싱 스레드가 올린 틱. ★이 값이 커지는 것이 목표다★ -- `UserEvent` 쪽이
+    /// 크면 박자가 여전히 엔진 활동에 얹혀 있다는 뜻이다.
+    PacingThread = 3,
 }
 
 /// 한 창에 담을 간격 표본의 상한.
@@ -756,7 +759,7 @@ impl AppState {
 
         log::info!(
             "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} \
-             atw={} tick_by atw={} user={} win={} \
+             atw={} tick_by atw={} user={} win={} pace={} \
              per_interval dup={} one={} skip1={} skipN={} \
              period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
             window_ms,
@@ -769,6 +772,7 @@ impl AppState {
             stats.tick_by_site[0],
             stats.tick_by_site[1],
             stats.tick_by_site[2],
+            stats.tick_by_site[3],
             dup,
             one,
             skip1,
@@ -955,6 +959,14 @@ impl AppState {
     ///
     /// 조회일 뿐 대기가 아니다 -- 타이머가 깨어나는 시각만 바뀐다.
     fn snap_to_dwm_grid(&self, now: std::time::Instant, free_running: std::time::Instant) -> std::time::Instant {
+        snap_to_dwm_grid_at(now, free_running)
+    }
+}
+
+/// `AppState::snap_to_dwm_grid` 의 본체. ★`self` 를 쓰지 않으므로 자유 함수로 뺀다★ --
+/// 페이싱 스레드도 같은 격자에 맞춰 자야 하고, 그 스레드는 `AppState`(Send 아님)를 볼 수
+/// 없다. 둘이 다른 산식을 쓰면 박자가 갈린다.
+fn snap_to_dwm_grid_at(now: std::time::Instant, free_running: std::time::Instant) -> std::time::Instant {
         let pct = servo_config::pref!(gfx_present_align_dwm_pct);
         if !(0..=99).contains(&pct) {
             return free_running;
@@ -982,10 +994,67 @@ impl AppState {
         if ahead < period / 8 {
             ahead += period;
         }
-        let wait_s = ahead as f64 / freq as f64;
-        now + std::time::Duration::from_secs_f64(wait_s)
-    }
+    let wait_s = ahead as f64 / freq as f64;
+    now + std::time::Duration::from_secs_f64(wait_s)
+}
 
+/// ★박자를 이벤트 루프에서 뗀다.★
+///
+/// 실측(log_ani_debug_02/20, output 페이지): 틱이 초당 60 이 아니라 56.0(최악 41)이고,
+/// `about_to_wait` 진입이 185 -> 132(최악 56)로 굶고, **틱의 37% 를 타이머가 아니라 엔진
+/// wake 가 알아챈다**(프로브에서는 2%). `WaitUntil` 이 깨워서 그리는 게 아니라 엔진이 마침
+/// 깨워서 지나가다 "틱이 지났네" 하고 그리는 것이다. `gap_ms p95` 가 17.23 -> 29.08 로
+/// 벌어지는 것이 그 결과다.
+///
+/// 원인은 구조적이다: `about_to_wait` 은 winit 이 **이벤트 큐를 다 비운 뒤에만** 도달하는
+/// 자리인데, 표출 클럭의 `WaitUntil` 이 거기 걸려 있다. 애니메이션 다섯 개가 엔진을 계속
+/// 깨우면 큐가 비지 않고 박자가 엔진 활동에 얹힌다.
+///
+/// 그래서 **깨우는 일만** 전용 스레드로 옮긴다. 렌더는 메인에 남는다 -- 그것을 옮길 수 없는
+/// 이유는 메시지 루프가 아니라 메인 스레드 친화성이다(`render_all_tiles` 가
+/// `Rc<RefCell<..>>` 인 임베더 핸들을 만지고, 타일 0 의 GL 컨텍스트가 메인에서 current 다).
+/// 바뀌는 것은 박자의 **권한**뿐이다.
+///
+/// 메인의 `WaitUntil` 은 그대로 둔다 -- 이 스레드가 죽거나 `send_event` 가 막혀도 벽이
+/// 멈추면 안 된다. 두 경로가 같은 격자(`snap_to_dwm_grid_at`)를 쓰므로 박자가 갈리지 않고,
+/// `drive_present_clock_timer` 는 `now >= next` 일 때만 발화하므로 이중 틱이 되지 않는다.
+///
+/// 알려진 약점: `send_event` 도 posted message 라 이미 큐에 쌓인 메시지 뒤에 선다
+/// (`WM_PAINT` 보다는 앞이다). 그래도 틱 누락과 "엔진이 알아채는" 것은 사라진다.
+fn spawn_pacing_thread(
+    proxy: winit::event_loop::EventLoopProxy<WakerEvent>,
+    period: std::time::Duration,
+) {
+    let spawned = std::thread::Builder::new()
+        .name(String::from("WallPacing"))
+        .spawn(move || {
+            let mut next = std::time::Instant::now() + period;
+            loop {
+                let now = std::time::Instant::now();
+                // 지나간 틱은 버린다 -- 몰아 치면 이미 지난 순간들을 위한 프레임이 쏟아진다
+                // (`drive_present_clock_timer` 의 같은 규칙).
+                while next <= now {
+                    next += period;
+                }
+                next = snap_to_dwm_grid_at(now, next);
+                let sleep = next.saturating_duration_since(std::time::Instant::now());
+                if !sleep.is_zero() {
+                    // Win10 1803+ 에서 `sleep` 은 고해상도 대기 타이머를 쓴다 -- winit 이
+                    // 같은 이유로 그것을 쓴다고 자기 주석에 적어 두었다.
+                    std::thread::sleep(sleep);
+                }
+                // 루프가 끝나면 프록시가 닫힌다. 그때 이 스레드도 끝낸다.
+                if proxy.send_event(WakerEvent::Tick).is_err() {
+                    return;
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        log::warn!("wall: 페이싱 스레드를 띄우지 못했다: {error}; 메인 타이머로 돈다");
+    }
+}
+
+impl AppState {
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
@@ -1545,17 +1614,39 @@ impl ApplicationHandler<WakerEvent> for App {
         webview.load(config.url.clone());
 
         *app_state.webview.borrow_mut() = Some(webview);
+
+        // ★박자를 이벤트 루프에서 떼는 경로.★ 타일과 webview 가 다 준비된 뒤에 띄운다 --
+        // 더 일찍 띄우면 아직 `Running` 이 아닌 상태로 틱이 올라와 버려진다.
+        if servo_config::pref!(gfx_wall_pacing_thread) {
+            eprintln!(
+                "wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다 \
+                 (WALLCLOCK 의 tick_by pace 가 대부분이어야 한다)."
+            );
+            spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);
+        }
+
         *self = Self::Running(app_state);
     }
 
-    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: WakerEvent) {
+    fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: WakerEvent) {
         if let Self::Running(state) = self {
+            // 페이싱 스레드가 올린 틱과 엔진 wake 를 구분해 센다 -- 어느 쪽이 박자를 쥐고
+            // 있는지가 `WALLCLOCK tick_by` 로 드러나야 한다.
+            let site = match event {
+                WakerEvent::Tick => ClockSite::PacingThread,
+                WakerEvent::Engine => ClockSite::UserEvent,
+            };
             // ★깨우기가 합쳐졌음을 먼저 표시한다★ -- 비우기 전에. 이 드레인이 도는 동안
             // 들어온 깨우기는 새 이벤트를 올려야 하고, 순서를 뒤집으면 그것을 잃는다.
-            state.wake_pending.store(false, Ordering::SeqCst);
+            //
+            // 단 **엔진 wake 일 때만** 내린다. 페이싱 틱이 내리면 아직 소비되지 않은 엔진
+            // 깨우기를 소비한 것처럼 표시해, 합침이 무의미해진다(같은 wake 가 두 번 올라온다).
+            if matches!(event, WakerEvent::Engine) {
+                state.wake_pending.store(false, Ordering::SeqCst);
+            }
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
             // 큐가 비지 않아도 박자는 흘러야 한다(`drive_present_clock` 참조).
-            state.drive_present_clock(ClockSite::UserEvent);
+            state.drive_present_clock(site);
         }
     }
 
@@ -1622,8 +1713,17 @@ struct Waker {
     /// 않았으면 다시 올리지 않는다.
     pending: Arc<AtomicBool>,
 }
+/// 이벤트 루프에 올리는 두 종류.
+///
+/// ★엔진 wake 와 표출 틱을 구분한다.★ 하나로 묶으면 `tick_by` 계수가 "타이머가 깨웠나
+/// 엔진이 깨웠나" 를 더 이상 가릴 수 없다 -- 그 구분이 9/28 계측의 핵심이었다.
 #[derive(Debug)]
-struct WakerEvent;
+enum WakerEvent {
+    /// 엔진 스레드가 메인에 처리할 일이 있다고 알린다.
+    Engine,
+    /// 페이싱 스레드가 표출 틱 시각을 알린다.
+    Tick,
+}
 
 impl Waker {
     fn new(event_loop: &EventLoop<WakerEvent>) -> Self {
@@ -1652,7 +1752,7 @@ impl embedder_traits::EventLoopWaker for Waker {
         if self.pending.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Err(error) = self.proxy.send_event(WakerEvent) {
+        if let Err(error) = self.proxy.send_event(WakerEvent::Engine) {
             // 올리지 못했으면 표시도 되돌린다 -- 아니면 이후의 모든 깨우기가 막힌다.
             self.pending.store(false, Ordering::SeqCst);
             eprintln!("warning: failed to wake event loop: {error:?}");

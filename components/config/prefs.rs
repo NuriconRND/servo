@@ -508,6 +508,18 @@ pub struct Preferences {
     /// **메인 스레드 친화성**이다: `render_all_tiles` 가 임베더 `WebView` 핸들을 만지고
     /// (`Rc<RefCell<..>>`, `Send` 아님) 타일 0 의 GL 컨텍스트가 메인에서 current 다.
     pub gfx_wall_direct_render: bool,
+    /// 표출 틱을 전용 스레드가 올릴지. 기본 꺼짐(= 메인의 `WaitUntil` 만).
+    ///
+    /// ★실제 부하에서 박자가 엔진에 얹힌다.★ 실측(log_ani_debug_02/20, 애니메이션 5 개):
+    /// 틱이 초당 60 이 아니라 56.0(최악 41), `about_to_wait` 진입이 185 -> 132(최악 56),
+    /// 그리고 **틱의 37% 를 타이머가 아니라 엔진 wake 가 알아챈다**(프로브 2%).
+    /// `gap_ms p95` 가 17.23 -> 29.08 로 벌어진다.
+    ///
+    /// 원인은 구조적이다: `about_to_wait` 은 winit 이 이벤트 큐를 다 비운 뒤에만 도달하는
+    /// 자리인데 표출 클럭의 `WaitUntil` 이 거기 걸려 있다. 켜면 깨우는 일만 스레드로
+    /// 옮긴다 -- 렌더는 그대로 메인이다(임베더 핸들과 타일 0 컨텍스트가 메인 전용).
+    /// 메인의 `WaitUntil` 은 백스톱으로 남는다.
+    pub gfx_wall_pacing_thread: bool,
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -1209,6 +1221,7 @@ impl Preferences {
             gfx_paint_side_animation_tick_divisor: 4,
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
+            gfx_wall_pacing_thread: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
