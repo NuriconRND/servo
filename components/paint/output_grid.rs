@@ -32,10 +32,12 @@ use winapi::Interface;
 use winapi::shared::dxgi::{
     CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
 };
+use winapi::shared::windef::HMONITOR;
 use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use winapi::um::wingdi::DEVMODEW;
 use winapi::um::winuser::{
-    ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+    ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MONITORINFOF_PRIMARY, MonitorFromWindow,
 };
 
 /// 한 출력의 vblank 격자.
@@ -904,6 +906,22 @@ fn forget_vanished(outputs: &[Output]) {
 /// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
 /// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
 ///
+/// 이 출력이 primary 인가.
+///
+/// ★DWM 합성은 primary 의 vblank 에 물려 있다.★ `DwmGetCompositionTimingInfo(NULL)` 의
+/// `qpcVBlank` 가 곧 그 패널의 vblank 이므로, 넷 중 어느 것이 primary 인지 모르면 "어느
+/// 타일이 합성 클럭과 동기인가" 를 답할 수 없다. 열거 순서(`OUTPHASE` 의 `rel_ms` 기준)는
+/// DXGI 어댑터/출력 번호일 뿐 primary 와 무관하다 -- 그래서 따로 묻는다.
+fn is_primary(monitor: usize) -> bool {
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // Safety: 순수 out-param 조회. `monitor` 는 DXGI 열거가 준 살아 있는 `HMONITOR` 다.
+    if unsafe { GetMonitorInfoW(monitor as HMONITOR, &mut info) } == 0 {
+        return false;
+    }
+    info.dwFlags & MONITORINFOF_PRIMARY != 0
+}
+
 /// `rel_ms` 는 열거 첫 출력의 vblank 를 0 으로 둔 상대 위상으로, 주기로 접어 `[0,P)` 다.
 fn emit_outphase(outputs: &[Output], freq: u64) {
     // 기준은 격자가 있는 첫 출력이다. 열거 첫 출력이 아직(또는 영영) 격자를 못 얻었다고
@@ -917,8 +935,10 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
         None => {
             for out in outputs {
                 warn!(
-                    "OUTPHASE out={} monitor={:#x} grid=none",
-                    out.name, out.monitor
+                    "OUTPHASE out={} monitor={:#x} primary={} grid=none",
+                    out.name,
+                    out.monitor,
+                    u8::from(is_primary(out.monitor)),
                 );
             }
             return;
@@ -926,6 +946,21 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
     };
     let period = base.period_qpc as i128;
     let to_ms = |ticks: f64| ticks * 1000.0 / freq as f64;
+    // ★두 격자를 같은 축에 올린다.★ `vblank_qpc % period` 만 찍으면 비교가 안 된다 --
+    // `DCOMPSTAT phase_ms` 는 **합성** 주기로 접고 여기는 **출력** 주기로 접는데, QPC 값이
+    // 1e12 규모라 두 주기가 한 틱만 달라도 나머지는 전혀 다른 값이 나온다. 그래서 절대
+    // 위상(`abs_ms`)은 참고로만 두고, 판정은 **차이를 접은** 두 값으로 한다.
+    //
+    // `vs_dwmvb_ms` = 이 출력의 vblank 가 DWM(=primary) vblank 뒤 얼마인가. primary 라면
+    // 0 에 붙어야 한다 -- `primary=1` 인 줄과 대조하면 그 자체가 검산이다.
+    // `vs_comp_ms`  = DComp 가 마지막으로 합성한 시각 뒤 얼마인가 = 합성에서 스캔아웃까지.
+    //
+    // 두 값이 창마다 **흐르면** 그 격자와 이 출력의 주기가 실제로 다르다는 뜻이고, 그것이
+    // 고정 오프셋과 구분되는 유일한 신호다(고정 오프셋은 프레임을 중복시키지 않는다).
+    let dwm_vblank = crate::dcomp_compositor::composition_grid();
+    let composition = composition_grid();
+    let show =
+        |value: Option<f64>| value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:+.2}"));
     for out in outputs {
         let Some(grid) = grid_for_monitor(out.monitor) else {
             // ★격자가 없는 출력이야말로 운영자가 봐야 할 줄이다.★ 조용히 건너뛰면 그 출력은
@@ -933,8 +968,10 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
             // 열거 목록과 손으로 대조해야만 빠진 것을 알 수 있다. 매초 네 줄이 나오는지 세는
             // 것만으로 판정이 되게 한다.
             warn!(
-                "OUTPHASE out={} monitor={:#x} grid=none",
-                out.name, out.monitor
+                "OUTPHASE out={} monitor={:#x} primary={} grid=none",
+                out.name,
+                out.monitor,
+                u8::from(is_primary(out.monitor)),
             );
             continue;
         };
@@ -942,13 +979,29 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
         // 차이는 사라지고 위상만 남는다.
         let delta = grid.vblank_qpc as i128 - base.vblank_qpc as i128;
         let rel = (((delta % period) + period) % period) as f64;
+        // 이 출력의 vblank 를 남의 원점 기준으로 접는다. 주기가 0 이면 접을 수 없다.
+        let against = |origin: u64, other_period: u64| -> Option<f64> {
+            let other_period = i128::from(other_period);
+            if other_period == 0 {
+                return None;
+            }
+            let diff = grid.vblank_qpc as i128 - origin as i128;
+            Some(to_ms(
+                (((diff % other_period) + other_period) % other_period) as f64,
+            ))
+        };
         warn!(
-            "OUTPHASE out={} monitor={:#x} period_ms={:.2} measured={} rel_ms={:+.2}",
+            "OUTPHASE out={} monitor={:#x} primary={} period_ms={:.2} measured={} rel_ms={:+.2} \
+             abs_ms={:.2} vs_dwmvb_ms={} vs_comp_ms={}",
             out.name,
             out.monitor,
+            u8::from(is_primary(out.monitor)),
             to_ms(grid.period_qpc as f64),
             u8::from(grid.measured),
             to_ms(rel),
+            to_ms((grid.vblank_qpc % grid.period_qpc.max(1)) as f64),
+            show(dwm_vblank.and_then(|(vblank, p)| against(vblank, p))),
+            show(composition.and_then(|(last, p)| against(last, p))),
         );
     }
 }
