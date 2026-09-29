@@ -414,6 +414,11 @@ struct ClockStats {
 /// `drive_present_clock` 을 부른 자리. `ClockStats::tick_by_site` 의 첨자다.
 #[derive(Clone, Copy)]
 enum ClockSite {
+    /// ★더는 구성되지 않는다★ -- `about_to_wait` 에서 박자를 내던 줄을 뺐다(그 함수의
+    /// 주석 참고). 자리는 남겨 둔다: 첨자를 당기면 `tick_by` 의 열이 밀려 예전 로그와
+    /// 나란히 읽을 수 없게 된다. 이제 이 칸은 항상 0 이고, 0 이 아니면 그 줄이 되살아난
+    /// 것이다.
+    #[allow(dead_code)]
     AboutToWait = 0,
     UserEvent = 1,
     WindowEvent = 2,
@@ -1764,8 +1769,19 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
 
-        let next = state.drive_present_clock(ClockSite::AboutToWait);
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(next));
+        // ★여기서는 박자를 내지 않는다.★ `about_to_wait` 는 이벤트 큐가 **다 빌 때만**
+        // 닿으므로, 엔진이 바쁘면 박자가 그 뒤에 선다 -- 2026-09-28 계측에서 최악 3.2s 까지
+        // 밀렸다. 틱의 권한은 `-PacingThread` 가 보내는 `WakerEvent::Tick` 에 있고, 그것은
+        // `user_event` 에서 `drive_present_clock(ClockSite::PacingThread)` 로 들어온다.
+        //
+        // ★`-PacingThread` 없이 돌리면 박자를 낼 사람이 엔진 wake(`WakerEvent::Engine`)와
+        // 윈도우 이벤트뿐이다.★ 애니메이션이 도는 동안은 painter 가 매 펌프마다 깨우므로
+        // 끊기지는 않지만, 그것은 보장이 아니라 부작용이다.
+        //
+        // 깨어나는 **시각**은 그대로 다음 틱에 맞춰 둔다. 여기서 빠진 것은 발화뿐이다.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            state.next_present_tick.get(),
+        ));
     }
 
     fn window_event(
