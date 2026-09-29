@@ -171,6 +171,23 @@ struct DcompSample {
     /// 그 합성보다 이 타일의 커밋이 얼마나 **앞서** 들어갔나(한 주기로 접음).
     /// ★한 주기에 가까우면 여유가 많고, 0 에 가까우면 마감을 스치고 있다는 뜻이다.★
     commit_lead_ms: Option<f64>,
+    /// `Commit()` 에서 합성 엔진이 그 배치를 처리하기까지. ★접지 않은 부호 있는 값이다.★
+    ///
+    /// `commit_lead_ms` 는 같은 차이를 한 주기로 접으므로 "2ms 만에 처리됐다" 와 "한 주기를
+    /// 넘겨 18.7ms 만에 처리됐다" 가 같은 값으로 찍힌다 -- 정작 묻고 싶은 것이 그 구분인데
+    /// 그것만 지워진다. 여기에는 생값을 둔다.
+    ///
+    /// `lastFrameTime` 은 MSDN 정의상 "합성 엔진이 마지막으로 처리한 배치의 시각" 이므로
+    /// 이 차이가 곧 커밋 -> 합성 처리 완료다. 스캔아웃까지는 여기에 `OUTPHASE` 의
+    /// `vs_comp_ms` 를 더하면 된다.
+    ///
+    /// 음수일 수 있다: 표본을 뜬 `lastFrameTime` 이 이 커밋보다 **앞선** 합성일 때다(아직
+    /// 우리 배치가 처리되지 않았다).
+    commit_to_comp_ms: Option<f64>,
+    /// 위 값이 몇 주기인가. `0` 이면 같은 주기 안에 처리됐고, `1` 이면 다음 합성이 실어
+    /// 갔고, `2` 이상이면 ★합성을 한 번 이상 놓쳤다★ -- 그 타일이 직전 프레임을 한 번 더
+    /// 보여 줬다는 뜻이다. 음수는 아직 처리 전이다.
+    commit_periods: Option<i64>,
 }
 
 /// ★공통 합성 격자 — (마지막 합성 QPC, 주기 QPC).★
@@ -475,10 +492,16 @@ pub(crate) fn note_dcomp_stat(
     // 커밋) 부호 안전하게 한 주기로 접는다 -- 결과는 언제나 `[0, period)` 이고 "직전 합성
     // 이후 얼마나 지나 커밋했나" 의 여집합, 즉 "다음 합성까지 얼마나 남기고 커밋했나" 다.
     let period_i = period_ticks as i128;
-    let commit_lead_ms = commit_at(device).map(|commit| {
-        let delta = last as i128 - commit as i128;
-        to_ms((((delta % period_i) + period_i) % period_i) as u64)
-    });
+    let commit_delta = commit_at(device).map(|commit| last as i128 - commit as i128);
+    let commit_lead_ms =
+        commit_delta.map(|delta| to_ms((((delta % period_i) + period_i) % period_i) as u64));
+    // ★같은 차이를 접지 않고 그대로 남긴다.★ 위의 접힌 값이 "몇 번째 합성이었나" 를 지우는데,
+    // 커밋에서 합성까지 얼마나 걸리는가는 바로 그 정보다. `to_ms` 는 `u64` 를 받으므로 부호를
+    // 여기서 직접 처리한다.
+    let commit_to_comp_ms = commit_delta.map(|delta| delta as f64 * 1000.0 / freq as f64);
+    // 몇 주기인가. 음수 쪽으로도 바닥 나눗셈이 되도록 `div_euclid` 를 쓴다 -- `-1 / P` 가
+    // 0 이 되면 "아직 처리 전" 이 "같은 주기에 처리됨" 으로 둔갑한다.
+    let commit_periods = commit_delta.map(|delta| delta.div_euclid(period_i) as i64);
     // ★격자 갱신은 계측 게이트 밖이다.★ B2 가 이 격자를 쓰므로, 프로파일이 꺼져 있다고
     // 격자를 안 채우면 B2 가 통째로 무력해진다 -- B1 에서 프로브를 진단 플래그 뒤에 두어
     // 똑같이 당한 적이 있다(설계 문서 C5).
@@ -496,6 +519,8 @@ pub(crate) fn note_dcomp_stat(
         rate_hz: rate_num as f64 / rate_den as f64,
         last_qpc: last,
         commit_lead_ms,
+        commit_to_comp_ms,
+        commit_periods,
     };
     if let Ok(mut guard) = DCOMP_STATS.lock() {
         guard
@@ -542,10 +567,40 @@ fn emit_dcompstat() {
         } else {
             (pick(leads.clone(), 0.05), pick(leads, 0.50))
         };
+        // ★커밋 -> 합성 처리.★ 접히지 않은 생값이라 "몇 번째 합성이 실어 갔나" 가 남아
+        // 있다. `p95` 를 같이 내는 것은 평균이 괜찮아도 꼬리가 한 주기를 넘으면 그 프레임은
+        // 화면에 늦게 뜨기 때문이다.
+        let to_comp: Vec<f64> = samples.iter().filter_map(|s| s.commit_to_comp_ms).collect();
+        let (comp_p05, comp_p50, comp_p95) = if to_comp.is_empty() {
+            (f64::NAN, f64::NAN, f64::NAN)
+        } else {
+            (
+                pick(to_comp.clone(), 0.05),
+                pick(to_comp.clone(), 0.50),
+                pick(to_comp, 0.95),
+            )
+        };
+        // 주기 분포. ★`late` 가 0 이 아니면 그만큼의 커밋이 합성을 한 번 이상 놓쳤다★ --
+        // 그 타일이 직전 프레임을 다시 보여 준 횟수이고, 저더를 세는 직접적인 수다.
+        // `pending` 은 표본을 뜰 때 아직 처리되지 않았던 것이라 결함이 아니다.
+        let mut pending = 0usize;
+        let mut same = 0usize;
+        let mut next_comp = 0usize;
+        let mut late = 0usize;
+        for periods in samples.iter().filter_map(|s| s.commit_periods) {
+            match periods {
+                p if p < 0 => pending += 1,
+                0 => same += 1,
+                1 => next_comp += 1,
+                _ => late += 1,
+            }
+        }
         warn!(
             "DCOMPSTAT out={name} monitor={monitor:#x} n={} distinct={} rate={:.3}Hz \
              period_ms={:.3} phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:.2} \
-             next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} failed={failed}",
+             next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} \
+             commit_to_comp_ms p05={:.2} p50={:.2} p95={:.2} \
+             periods pending={pending} same={same} next={next_comp} late={late} failed={failed}",
             samples.len(),
             seen.len(),
             last.rate_hz,
@@ -557,6 +612,9 @@ fn emit_dcompstat() {
             pick(nexts, 0.50),
             lead_p05,
             lead_p50,
+            comp_p05,
+            comp_p50,
+            comp_p95,
         );
     }
 }
