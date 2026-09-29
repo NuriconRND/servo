@@ -1778,10 +1778,16 @@ impl ApplicationHandler<WakerEvent> for App {
         // 윈도우 이벤트뿐이다.★ 애니메이션이 도는 동안은 painter 가 매 펌프마다 깨우므로
         // 끊기지는 않지만, 그것은 보장이 아니라 부작용이다.
         //
-        // 깨어나는 **시각**은 그대로 다음 틱에 맞춰 둔다. 여기서 빠진 것은 발화뿐이다.
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-            state.next_present_tick.get(),
-        ));
+        // ★기다리지 않고 돈다.★ `WaitUntil(next_present_tick)` 은 타이머가 만료될 때까지
+        // 루프를 재운다. 그러면 페이싱 스레드가 그 사이에 올린 `WakerEvent::Tick` 이
+        // **깨우기 신호로 소비되고 나서야** 처리되고, 그 왕복(프록시 -> PostMessage ->
+        // 메시지 큐 -> user_event)이 박자에 그대로 얹힌다.
+        //
+        // `Poll` 이면 루프가 자지 않으므로 `Tick` 이 올라온 즉시 다음 바퀴에서 잡힌다.
+        // ★대가는 메인 스레드가 코어 하나를 계속 태우는 것이다★ -- 이 실험에서 박자가
+        // 개선되지 않으면 되돌려야 하는 이유가 그것이다. 이 셸은 이미 `--capture` 대기
+        // 중에 같은 방식으로 돈다(바로 위 분기).
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     }
 
     fn window_event(
