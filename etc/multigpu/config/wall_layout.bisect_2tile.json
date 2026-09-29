@@ -1,0 +1,11 @@
+{
+  "virtualViewport": {
+    "width": 11520,
+    "height": 2160
+  },
+  "tiles": [
+    { "display": 0, "rect": [0, 0, 5760, 2160] },
+    { "display": 1, "rect": [5760, 0, 5760, 2160] }
+  ],
+  "overlapPx": 0
+}
