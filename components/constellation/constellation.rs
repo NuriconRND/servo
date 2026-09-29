@@ -342,6 +342,22 @@ pub struct Constellation<STF, SWF> {
     /// Bookkeeping data for all webviews in the constellation.
     webviews: FxHashMap<WebViewId, ConstellationWebView>,
 
+    /// Embedder loads that arrived before the webview's browsing context existed.
+    ///
+    /// ★`NewWebView` 는 브라우징 컨텍스트를 **그 자리에서 만들지 않는다.★** 파이프라인만
+    /// 세우고 `SessionHistoryChange` 를 대기 목록에 넣으며, `browsing_contexts` 에 항목이
+    /// 생기는 것은 그 파이프라인의 스크립트 스레드가 문서를 활성화한 뒤다. 그 사이에 도착한
+    /// `LoadUrl` 은 컨텍스트를 못 찾아 **조용히 버려졌다** -- 임베더는 보낸 줄 알고, 화면은
+    /// 영영 초기 화면에 머문다.
+    ///
+    /// `build()` 직후 `load()` 하는 것은 완전히 정상적인 임베더 순서다. 이 창이 좁아서
+    /// 대개는 이겼을 뿐이고, `winit_wall` 에서 타일이 하나뿐이면(등록할 보조 타일이 없어
+    /// 사이에 할 일이 없다) 매번 졌다. 그래서 버리지 않고 여기 두었다가 컨텍스트가 생기는
+    /// 순간 낸다.
+    ///
+    /// 웹뷰당 하나이고 나중 것이 앞선 것을 덮는다 -- 주소창에 두 번 친 것과 같은 의미다.
+    pending_embedder_loads: FxHashMap<WebViewId, LoadData>,
+
     /// Channels for the constellation to send messages to the public
     /// resource-related threads. There are two groups of resource threads: one
     /// for public browsing, and one for private browsing.
@@ -685,6 +701,7 @@ where
                     constellation_to_embedder_proxy: state.constellation_to_embedder_proxy,
                     paint_proxy: state.paint_proxy,
                     webviews: Default::default(),
+                    pending_embedder_loads: Default::default(),
                     devtools_sender: state.devtools_sender,
                     script_to_devtools_callback: Default::default(),
                     #[cfg(feature = "bluetooth")]
@@ -1398,6 +1415,15 @@ where
                 let ctx_id = BrowsingContextId::from(webview_id);
                 let pipeline_id = match self.browsing_contexts.get(&ctx_id) {
                     Some(ctx) => ctx.pipeline_id,
+                    // ★아직 안 생긴 것과 영영 없는 것은 다르다.★ `NewWebView` 가 방금
+                    // 왔다면 브라우징 컨텍스트는 그 초기 문서가 활성화될 때 생긴다. 그
+                    // 사이에 온 로드를 버리면 임베더는 보낸 줄 알고 화면은 초기 화면에
+                    // 머문다 -- `pending_embedder_loads` 주석 참고. 웹뷰 자체가 없으면
+                    // 그때는 종전대로 버린다.
+                    None if self.webviews.contains_key(&webview_id) => {
+                        self.pending_embedder_loads.insert(webview_id, load_data);
+                        return;
+                    },
                     None => {
                         return warn!("{}: LoadUrl for unknown browsing context", webview_id);
                     },
@@ -3348,6 +3374,8 @@ where
             self.close_browsing_context(browsing_context_id, ExitPipelineMode::Normal);
         // Step 4. Remove traversable from the user interface (e.g., close or hide its tab in a tabbed browser).
         self.webviews.remove(&webview_id);
+        // 활성화되기 전에 닫힌 웹뷰의 대기 로드는 낼 곳이 없다. 두면 샌다.
+        self.pending_embedder_loads.remove(&webview_id);
         self.constellation_to_embedder_proxy
             .send(ConstellationToEmbedderMsg::WebViewClosed(webview_id));
 
@@ -5048,6 +5076,19 @@ where
                     new_context_info.throttled,
                 );
                 self.update_activity(change.new_pipeline_id);
+                // ★컨텍스트가 방금 생겼다 -- 기다리던 임베더 로드가 있으면 지금 낸다.★
+                // 최상위 브라우징 컨텍스트에서만 본다(iframe 은 `LoadUrl` 의 대상이 아니다).
+                if change.browsing_context_id == BrowsingContextId::from(change.webview_id) &&
+                    let Some(load_data) = self.pending_embedder_loads.remove(&change.webview_id)
+                {
+                    self.load_url(
+                        change.webview_id,
+                        change.new_pipeline_id,
+                        load_data,
+                        NavigationHistoryBehavior::Push,
+                        TargetSnapshotParams::default(),
+                    );
+                }
             },
             Some(old_pipeline_id) => {
                 // Deactivate the old pipeline, and activate the new one.
