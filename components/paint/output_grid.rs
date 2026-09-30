@@ -169,6 +169,12 @@ struct DcompSample {
     behind_ms: f64,
     /// 다음 합성까지 남은 예상 시간.
     next_ms: f64,
+    /// `currentTime - (그 호출 직후 읽은 QPC)`.
+    ///
+    /// ★`currentTime` 이 정말 호출 시각인가를 가리는 값이다.★ 0 에 가까우면 그렇고,
+    /// 그때에만 `behind_ms`·`next_ms` 를 "읽은 순간 기준" 으로 읽을 수 있다. 0 이 아니면
+    /// 그 셋의 기준점이 전부 이 값만큼 밀려 있는 것이다.
+    current_vs_qpc_ms: Option<f64>,
     period_ms: f64,
     rate_hz: f64,
     /// 이 합성이 직전 표본과 같은 합성인가를 가리기 위한 원본 값.
@@ -481,6 +487,7 @@ pub(crate) fn note_dcomp_stat(
     freq: u64,
     rate_num: u32,
     rate_den: u32,
+    qpc_at_read: Option<u64>,
 ) {
     if freq == 0 || rate_num == 0 || rate_den == 0 {
         note_dcomp_stat_failed();
@@ -523,6 +530,7 @@ pub(crate) fn note_dcomp_stat(
         phase_ms: to_ms(last % period_ticks),
         behind_ms: to_ms_signed(now as i128 - last as i128),
         next_ms: to_ms(next.saturating_sub(now)),
+        current_vs_qpc_ms: qpc_at_read.map(|qpc| to_ms_signed(now as i128 - qpc as i128)),
         period_ms: to_ms(period_ticks),
         rate_hz: rate_num as f64 / rate_den as f64,
         last_qpc: last,
@@ -578,6 +586,17 @@ fn emit_dcompstat() {
         // ★커밋 -> 합성 처리.★ 접히지 않은 생값이라 "몇 번째 합성이 실어 갔나" 가 남아
         // 있다. `p95` 를 같이 내는 것은 평균이 괜찮아도 꼬리가 한 주기를 넘으면 그 프레임은
         // 화면에 늦게 뜨기 때문이다.
+        // `currentTime` 이 호출 시각인가. 0 에 가까워야 나머지 값들의 기준점이 성립한다.
+        let vs_qpc: Vec<f64> = samples.iter().filter_map(|s| s.current_vs_qpc_ms).collect();
+        let (qpc_p05, qpc_p50, qpc_p95) = if vs_qpc.is_empty() {
+            (f64::NAN, f64::NAN, f64::NAN)
+        } else {
+            (
+                pick(vs_qpc.clone(), 0.05),
+                pick(vs_qpc.clone(), 0.50),
+                pick(vs_qpc, 0.95),
+            )
+        };
         let to_comp: Vec<f64> = samples.iter().filter_map(|s| s.commit_to_comp_ms).collect();
         let (comp_p05, comp_p50, comp_p95) = if to_comp.is_empty() {
             (f64::NAN, f64::NAN, f64::NAN)
@@ -608,6 +627,7 @@ fn emit_dcompstat() {
              period_ms={:.3} phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:+.2} \
              next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} \
              commit_to_comp_ms p05={:.2} p50={:.2} p95={:.2} \
+             current_vs_qpc_ms p05={:+.2} p50={:+.2} p95={:+.2} \
              periods pending={pending} same={same} next={next_comp} late={late} failed={failed}",
             samples.len(),
             seen.len(),
@@ -623,6 +643,9 @@ fn emit_dcompstat() {
             comp_p05,
             comp_p50,
             comp_p95,
+            qpc_p05,
+            qpc_p50,
+            qpc_p95,
         );
     }
 }

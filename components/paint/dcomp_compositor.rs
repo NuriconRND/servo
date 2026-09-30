@@ -1987,6 +1987,12 @@ impl DCompNativeCompositor {
             crate::output_grid::note_dcomp_stat_failed();
             return;
         }
+        // ★`currentTime` 이 정말 이 호출의 시각인가.★ 로그를 역산해 보면
+        // `lastFrameTime` 이 `currentTime` 보다 14ms 쯤 **미래**인데, 그 해석이 성립하려면
+        // `currentTime` 이 호출 시점이어야 한다. 그 전제만 검증이 안 돼 있었다 -- 여기서
+        // 곧바로 QPC 를 읽어 둔다. 둘의 차가 0 에 가까우면 전제가 맞고, 아니면 `behind_ms`
+        // 와 `next_ms` 의 기준점이 통째로 그만큼 밀려 있는 것이다.
+        let qpc_at_read = crate::output_grid::qpc_now();
         // `LARGE_INTEGER` 는 union 이라 접근자로 읽는다.
         // Safety: 위 호출이 성공했으므로 전부 채워져 있다.
         let (last, now, next, freq) = unsafe {
@@ -2008,6 +2014,7 @@ impl DCompNativeCompositor {
             freq,
             rate.Numerator,
             rate.Denominator,
+            qpc_at_read,
         );
     }
 
