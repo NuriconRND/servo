@@ -199,6 +199,19 @@ struct DcompSample {
     /// 갔고, `2` 이상이면 ★합성을 한 번 이상 놓쳤다★ -- 그 타일이 직전 프레임을 한 번 더
     /// 보여 줬다는 뜻이다. 음수는 아직 처리 전이다.
     commit_periods: Option<i64>,
+    /// `lastFrameTime` 과 **DWM vblank** 의 위상차. `(-P/2, P/2]` 로 접는다.
+    ///
+    /// ★0 에 붙어 있으면 커밋된 DComp 명령의 수행이 DWM vblank 마다 일어난다는 뜻이다.★
+    /// `phase_ms` 가 답하지 못하는 질문이 이것이다 -- 그쪽은 QPC 0 을 원점으로 접으므로
+    /// 기준이 아무것도 아니고, 접는 주기가 한 틱만 달라져도 값이 주기 안에서 통째로
+    /// 옮겨진다. 여기는 두 절대 시각의 **차이**를 접으니 그 증폭이 없다.
+    last_vs_dwmvb_ms: Option<f64>,
+    /// `lastFrameTime` 과 **이 출력의 vblank** 의 위상차. 같은 규칙으로 접는다.
+    ///
+    /// 위 값이 0 이면 이것이 곧 "합성은 언제 되는데 이 패널은 언제 스캔아웃하나" 다. 출력별
+    /// 커밋 시점을 같은 `lastFrameTime` 에 걸도록 맞추려면 먼저 이 값이 필요하다. 창마다
+    /// 흐르면 그 패널의 주기가 합성 격자와 실제로 다른 것이다.
+    last_vs_outvb_ms: Option<f64>,
 }
 
 /// ★공통 합성 격자 — (마지막 합성 QPC, 주기 QPC).★
@@ -526,6 +539,33 @@ pub(crate) fn note_dcomp_stat(
     if !*crate::dcomp_compositor::DCOMP_BIND_PROF {
         return;
     }
+    // ★위상차는 `0 에 가까운가` 로 판정하고 싶다.★ `[0, P)` 로 접으면 정렬된 경우가 0 쪽과
+    // P 쪽 양끝에 나뉘어 나타나 한눈에 안 보인다. `(-P/2, P/2]` 로 접는다.
+    let fold_centered = |delta: i128, period: i128| -> f64 {
+        let folded = ((delta % period) + period) % period;
+        to_ms_signed(if folded * 2 > period {
+            folded - period
+        } else {
+            folded
+        })
+    };
+    // ★1) `lastFrameTime` 이 DWM vblank 격자에 걸려 있나.★ 0 에 붙어 있으면 커밋된 DComp
+    // 명령의 수행이 DWM vblank 마다 일어난다고 볼 수 있다. `phase_ms` 와 달리 이것은 두
+    // 절대 시각의 **차이**를 접으므로, 접는 주기가 한 틱 틀려도 결과가 그만큼만 움직인다.
+    let last_vs_dwmvb_ms = crate::dcomp_compositor::composition_grid()
+        .filter(|(_, period)| *period > 0)
+        .map(|(vblank, period)| fold_centered(last as i128 - vblank as i128, period as i128));
+    // ★2) `lastFrameTime` 이 **이 출력**의 vblank 에서 얼마나 떨어져 있나.★ 1)이 성립하면
+    // 이 값이 곧 "합성은 언제 되는데 이 패널은 언제 스캔아웃하나" 이고, 출력별 커밋 시점을
+    // 같은 `lastFrameTime` 에 걸도록 맞추려면 먼저 이 값을 알아야 한다.
+    let last_vs_outvb_ms = grid_for_monitor(monitor)
+        .filter(|grid| grid.period_qpc > 0)
+        .map(|grid| {
+            fold_centered(
+                last as i128 - grid.vblank_qpc as i128,
+                grid.period_qpc as i128,
+            )
+        });
     let sample = DcompSample {
         phase_ms: to_ms(last % period_ticks),
         behind_ms: to_ms_signed(now as i128 - last as i128),
@@ -537,6 +577,8 @@ pub(crate) fn note_dcomp_stat(
         commit_lead_ms,
         commit_to_comp_ms,
         commit_periods,
+        last_vs_dwmvb_ms,
+        last_vs_outvb_ms,
     };
     if let Ok(mut guard) = DCOMP_STATS.lock() {
         guard
@@ -587,6 +629,23 @@ fn emit_dcompstat() {
         // 있다. `p95` 를 같이 내는 것은 평균이 괜찮아도 꼬리가 한 주기를 넘으면 그 프레임은
         // 화면에 늦게 뜨기 때문이다.
         // `currentTime` 이 호출 시각인가. 0 에 가까워야 나머지 값들의 기준점이 성립한다.
+        // ★`lastFrameTime` 이 어느 격자에 걸려 있나.★ 둘 다 0 에 붙어야 하는지, 하나만
+        // 붙는지가 이 줄의 요점이다.
+        let three = |values: Vec<f64>| -> (f64, f64, f64) {
+            if values.is_empty() {
+                (f64::NAN, f64::NAN, f64::NAN)
+            } else {
+                (
+                    pick(values.clone(), 0.05),
+                    pick(values.clone(), 0.50),
+                    pick(values, 0.95),
+                )
+            }
+        };
+        let (dwmvb_p05, dwmvb_p50, dwmvb_p95) =
+            three(samples.iter().filter_map(|s| s.last_vs_dwmvb_ms).collect());
+        let (outvb_p05, outvb_p50, outvb_p95) =
+            three(samples.iter().filter_map(|s| s.last_vs_outvb_ms).collect());
         let vs_qpc: Vec<f64> = samples.iter().filter_map(|s| s.current_vs_qpc_ms).collect();
         let (qpc_p05, qpc_p50, qpc_p95) = if vs_qpc.is_empty() {
             (f64::NAN, f64::NAN, f64::NAN)
@@ -628,6 +687,8 @@ fn emit_dcompstat() {
              next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} \
              commit_to_comp_ms p05={:.2} p50={:.2} p95={:.2} \
              current_vs_qpc_ms p05={:+.2} p50={:+.2} p95={:+.2} \
+             last_vs_dwmvb_ms p05={:+.2} p50={:+.2} p95={:+.2} \
+             last_vs_outvb_ms p05={:+.2} p50={:+.2} p95={:+.2} \
              periods pending={pending} same={same} next={next_comp} late={late} failed={failed}",
             samples.len(),
             seen.len(),
@@ -646,6 +707,12 @@ fn emit_dcompstat() {
             qpc_p05,
             qpc_p50,
             qpc_p95,
+            dwmvb_p05,
+            dwmvb_p50,
+            dwmvb_p95,
+            outvb_p05,
+            outvb_p50,
+            outvb_p95,
         );
     }
 }
