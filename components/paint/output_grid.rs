@@ -160,7 +160,12 @@ struct DcompSample {
     /// QPC 절대 시각을 공통 모듈러로 접었으므로, 네 줄의 이 값 차이가 곧 네 타일이 실제로
     /// 얼마나 떨어져 합성되는지다.
     phase_ms: f64,
-    /// 표본을 뜬 시점 기준으로 마지막 합성이 얼마나 지났나.
+    /// 표본을 뜬 시점(`currentTime`) 기준으로 `lastFrameTime` 이 얼마나 지났나. `now - last`.
+    ///
+    /// ★부호 있는 값이다.★ 예전에는 `saturating_sub` 라 음수가 전부 0 으로 뭉개졌고, 실기
+    /// 로그에서 이 값이 **모든 창에서 정확히 0.00** 이었다 -- 즉 `last >= now` 가 항상 참인데
+    /// 그 사실도, 얼마나 미래인지도 볼 수 없었다. `lastFrameTime` 이 과거인지 미래인지가
+    /// `commit_to_comp_ms` 를 해석하는 전제이므로 그 부호를 지우면 안 된다.
     behind_ms: f64,
     /// 다음 합성까지 남은 예상 시간.
     next_ms: f64,
@@ -482,6 +487,10 @@ pub(crate) fn note_dcomp_stat(
         return;
     }
     let to_ms = |ticks: u64| ticks as f64 * 1000.0 / freq as f64;
+    // ★부호 있는 환산.★ `to_ms` 는 `u64` 만 받아서, 음수가 나올 수 있는 차이를 담으려면
+    // 호출부마다 `saturating_sub` 로 뭉개거나 캐스팅을 손으로 쓰게 된다. 전자는 실제로
+    // `behind_ms` 를 전 창 0.00 으로 만들어 버렸다.
+    let to_ms_signed = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
     // 합성 주기는 DWM 이 유리수로 알려 준다 -- 추정할 필요가 없다.
     let period_ticks = freq.saturating_mul(rate_den as u64) / rate_num as u64;
     if period_ticks == 0 {
@@ -496,9 +505,8 @@ pub(crate) fn note_dcomp_stat(
     let commit_lead_ms =
         commit_delta.map(|delta| to_ms((((delta % period_i) + period_i) % period_i) as u64));
     // ★같은 차이를 접지 않고 그대로 남긴다.★ 위의 접힌 값이 "몇 번째 합성이었나" 를 지우는데,
-    // 커밋에서 합성까지 얼마나 걸리는가는 바로 그 정보다. `to_ms` 는 `u64` 를 받으므로 부호를
-    // 여기서 직접 처리한다.
-    let commit_to_comp_ms = commit_delta.map(|delta| delta as f64 * 1000.0 / freq as f64);
+    // 커밋에서 합성까지 얼마나 걸리는가는 바로 그 정보다.
+    let commit_to_comp_ms = commit_delta.map(&to_ms_signed);
     // 몇 주기인가. 음수 쪽으로도 바닥 나눗셈이 되도록 `div_euclid` 를 쓴다 -- `-1 / P` 가
     // 0 이 되면 "아직 처리 전" 이 "같은 주기에 처리됨" 으로 둔갑한다.
     let commit_periods = commit_delta.map(|delta| delta.div_euclid(period_i) as i64);
@@ -513,7 +521,7 @@ pub(crate) fn note_dcomp_stat(
     }
     let sample = DcompSample {
         phase_ms: to_ms(last % period_ticks),
-        behind_ms: to_ms(now.saturating_sub(last)),
+        behind_ms: to_ms_signed(now as i128 - last as i128),
         next_ms: to_ms(next.saturating_sub(now)),
         period_ms: to_ms(period_ticks),
         rate_hz: rate_num as f64 / rate_den as f64,
@@ -597,7 +605,7 @@ fn emit_dcompstat() {
         }
         warn!(
             "DCOMPSTAT out={name} monitor={monitor:#x} n={} distinct={} rate={:.3}Hz \
-             period_ms={:.3} phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:.2} \
+             period_ms={:.3} phase_ms p05={:.2} p50={:.2} p95={:.2} behind_ms p50={:+.2} \
              next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} \
              commit_to_comp_ms p05={:.2} p50={:.2} p95={:.2} \
              periods pending={pending} same={same} next={next_comp} late={late} failed={failed}",
