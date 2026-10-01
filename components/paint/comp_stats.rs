@@ -69,15 +69,6 @@ struct Luid {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct CompositionStats {
-    present_count: UINT,
-    refresh_count: UINT,
-    virtual_refresh_count: UINT,
-    time: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct CompositionTargetStats {
     outstanding_presents: UINT,
     present_time: u64,
@@ -103,22 +94,40 @@ unsafe extern "system" {
     ) -> HRESULT;
 }
 
+/// `COMPOSITION_STATS` 를 그대로 옮긴 것. `presentedStats`/`completedStats` 둘 다 이 모양이다.
+///
+/// ★`refresh_count` 가 이 모듈에서 가장 중요한 수다.★ 합성 프레임 하나가 지나는 동안 이
+/// 값이 어떤 타깃에서만 2 올랐다면, 그 패널은 그 합성에 **리프레시를 두 번 썼다** -- 같은
+/// 그림을 두 번 보여 줬다는 뜻이고, 그것이 곧 저더다. 시각을 추론할 필요 없이 세어진다.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CompositionStats {
+    pub present_count: UINT,
+    pub refresh_count: UINT,
+    pub virtual_refresh_count: UINT,
+    pub time: u64,
+}
+
 /// 한 합성 프레임에 대해 한 타깃(디스플레이)이 돌려준 것.
 #[derive(Clone, Copy)]
 pub(crate) struct TargetSample {
     /// 이 타깃을 구동하는 어댑터의 LUID. 우리 타일에 붙이는 열쇠다 -- 기동 로그의
     /// `tile N: display N -> \\.\DISPLAYxx adapter N luid ...` 와 같은 값이다.
     pub display_adapter_luid: (u32, i32),
-    /// ★그 패널에 실제로 표출된 시각(QPC).★
+    /// DWM 이 이 타깃에 그 프레임을 **제출한** 시각(QPC).
+    ///
+    /// ★스캔아웃 시각이 아니다.★ 네 패널의 vblank 가 12.7ms 에 걸쳐 흩어져 있는데 이 값은
+    /// 넷이 0.6ms 안에 모여 있다 -- 같은 순간에 네 패널이 표출하는 것은 물리적으로 불가능
+    /// 하므로, 이것은 제출/큐잉 시각이다. 실제 표출은 `completed` 쪽에서 찾아야 한다.
     pub present_time: u64,
     /// 그 타깃에 아직 밀려 있는 present 수.
     pub outstanding_presents: u32,
-    pub vblank_duration: u64,
+    pub presented: CompositionStats,
+    pub completed: CompositionStats,
 }
 
 /// 한 합성 프레임의 전부.
 pub(crate) struct FrameSample {
-    pub frame_id: u64,
     /// 합성이 시작한 시각(QPC).
     pub start_time: u64,
     /// 그 합성이 겨냥한 vblank(QPC).
@@ -135,16 +144,25 @@ pub(crate) struct FrameSample {
 /// 이 벽은 넷이고, 상한을 크게 잡아 봐야 스택만 먹는다. 잘리면 `target_count` 로 보인다.
 const MAX_TARGETS: usize = 16;
 
-/// 마지막으로 **완료된** 합성 프레임의 통계. 실패하면 `None` -- 호출자는 그 창을 건너뛴다.
+/// 마지막으로 **완료된** 합성 프레임의 id.
 ///
-/// ★조회만 한다.★ 어떤 대기도 넣지 말 것 -- 이 저장소에는 합성 경로에 프로세스 범위 대기를
-/// 넣어 생긴 회귀가 기록돼 있다(`dcomp_compositor::composition_grid` 주석).
-pub(crate) fn sample_completed_frame() -> Option<FrameSample> {
+/// ★id 는 조밀하게 연속이다★ -- 실측에서 창(약 1 초)마다 62~64 씩 오른다. 즉 합성마다
+/// 하나이고, 그래서 `sample_frame` 으로 지난 창의 프레임을 **빠짐없이** 되짚을 수 있다.
+pub(crate) fn completed_frame_id() -> Option<u64> {
     let mut frame_id: u64 = 0;
     // Safety: 순수 out-param 조회.
     if unsafe { DCompositionGetFrameId(FrameIdType::Completed as u32, &mut frame_id) } < 0 {
         return None;
     }
+    Some(frame_id)
+}
+
+/// 주어진 합성 프레임 하나의 통계. 실패하면 `None` -- DWM 이 보관하는 이력은 유한하므로
+/// 너무 오래된 id 는 실패한다. 호출자는 그 프레임을 건너뛰고 센다.
+///
+/// ★조회만 한다.★ 어떤 대기도 넣지 말 것 -- 이 저장소에는 합성 경로에 프로세스 범위 대기를
+/// 넣어 생긴 회귀가 기록돼 있다(`dcomp_compositor::composition_grid` 주석).
+pub(crate) fn sample_frame(frame_id: u64) -> Option<FrameSample> {
     let mut stats = CompositionFrameStats::default();
     let mut ids = [CompositionTargetId::default(); MAX_TARGETS];
     let mut actual: UINT = 0;
@@ -176,11 +194,11 @@ pub(crate) fn sample_completed_frame() -> Option<FrameSample> {
             ),
             present_time: target_stats.present_time,
             outstanding_presents: target_stats.outstanding_presents,
-            vblank_duration: target_stats.vblank_duration,
+            presented: target_stats.presented_stats,
+            completed: target_stats.completed_stats,
         });
     }
     Some(FrameSample {
-        frame_id,
         start_time: stats.start_time,
         target_time: stats.target_time,
         frame_period: stats.frame_period,

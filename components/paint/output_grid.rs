@@ -990,6 +990,8 @@ fn probe_loop() {
     let mut last_reenum_warn: Option<Instant> = None;
     let mut last_empty_warn: Option<Instant> = None;
     let mut last_outphase = Instant::now();
+    // 직전 창에서 마지막으로 본 합성 프레임 id. 다음 창은 그 다음부터 훑는다.
+    let mut last_comp_frame_id: Option<u64> = None;
 
     loop {
         // ★출력을 한 번만 열거하면 핫플러그 뒤 영구 폴백이 된다.★ 모드 변경·핫플러그로
@@ -1074,7 +1076,7 @@ fn probe_loop() {
         {
             last_outphase = Instant::now();
             emit_outphase(&current.outputs, freq);
-            emit_comp_stats(&current.outputs, freq);
+            emit_comp_stats(&current.outputs, freq, &mut last_comp_frame_id);
             emit_samplelead();
             emit_sampleslip();
             emit_frameid();
@@ -1120,75 +1122,179 @@ fn forget_vanished(outputs: &[Output]) {
     }
 }
 
-/// ★격자에 대한 독립적인 검산이다.★ `OUTCOMMIT` 의 위상은 마감을 정한 격자로 다시 접은
-/// 값이라 격자가 틀려도 목표치를 가리킨다(`commit_scheduler::scheduler_loop` 주석). 이 줄은
-/// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
-/// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
+/// 한 타깃이 이번 창에서 보인 것. `emit_comp_stats` 가 프레임을 훑으며 채운다.
+#[derive(Default)]
+struct TargetWalk {
+    name: Option<String>,
+    frames: u32,
+    /// 합성 프레임 하나가 지나는 동안 이 타깃의 `refreshCount` 가 몇 올랐나의 분포.
+    /// ★`[2]` 이상이 저더를 **직접 센** 수다★ -- 그 패널이 같은 합성에 리프레시를 두 번
+    /// 썼다는 뜻이니 같은 그림을 두 번 보여 준 것이다.
+    refresh_delta: [u32; 4],
+    /// 같은 식의 `presentCount` 분포. `[0]` 이 크면 그 프레임에 새 present 를 못 받았다.
+    present_delta: [u32; 4],
+    outstanding: [u32; 4],
+    present_vs_start_sum: f64,
+    present_vs_start_max: f64,
+    /// `completedStats.time` 이 채워지는지부터가 질문이다. 0 이면 못 쓴다.
+    completed_zero: u32,
+    completed_vs_start_sum: f64,
+    completed_vs_start_max: f64,
+    last_refresh: Option<u32>,
+    last_present: Option<u32>,
+}
+
+fn bump(slot: &mut [u32; 4], value: i64) {
+    let index = value.clamp(0, 3) as usize;
+    slot[index] += 1;
+}
+
+/// ★합성 프레임을 **하나도 빼놓지 않고** 훑어 패널별로 센다.★
 ///
-/// ★합성 프레임 하나가 **각 패널에 언제 떴는지**를 찍는다.★
-///
-/// `DCOMPSTAT` 이 답하지 못하는 것이 이것이다 -- 거기 나오는 `lastFrameTime` 은 데스크톱
-/// 합성 하나이고(네 디바이스가 같은 값을 준다), `DWM_TIMING_INFO::qpcCompose` 는 실측에서
-/// `qpcVBlank` 와 완전히 같았다. 둘 다 "그 프레임이 어느 패널에 언제 떴나" 를 말하지 않는다.
+/// 예전 판은 창마다 "마지막으로 완료된 프레임" 하나만 봤다. 그런데 `frame_id` 는 창당
+/// 62~64 씩 오른다 -- 즉 60 개 중 1 개, 1.6% 만 본 것이다. 보고된 저더가 3~4 초에 한 번
+/// (초당 0.3 회)이니 그 표본으로는 운이 좋아야 걸린다. `DCompositionGetStatistics` 는 임의
+/// id 를 받고 id 가 조밀하게 연속이므로, 직전 창의 끝부터 지금까지를 전부 되짚는다.
 ///
 /// 읽는 법:
 /// - `period_ms` ★가장 먼저 본다.★ 16.67 이 아니면 이 구조체의 시간들이 QPC 가 아니라는
-///   뜻이고, 그러면 아래 값들을 믿으면 안 된다. 단위 가정을 출력 자체가 검산하게 둔다.
-/// - `present_vs_target_ms` -- 그 패널이 **이 합성이 겨냥한 vblank** 에 떴나. 네 패널 중
-///   하나만 한 주기 크면 그 패널이 그 프레임을 놓치고 다음 것을 기다린 것이다.
-/// - `outstanding` -- 그 타깃에 밀려 있는 present. 0 이 아니면 그 패널이 따라가지 못한다.
-fn emit_comp_stats(outputs: &[Output], freq: u64) {
-    let Some(frame) = crate::comp_stats::sample_completed_frame() else {
+///   뜻이고, 그러면 나머지를 믿으면 안 된다. 단위 가정을 출력 자체가 검산하게 둔다.
+/// - ★`refresh_d[2]`/`[3+]`★ -- 그 패널이 한 합성에 리프레시를 둘 이상 쓴 횟수. 네 패널 중
+///   하나만 크면 그 패널만 프레임을 중복해 보여 주고 있다는 뜻이고, 그게 저더다.
+/// - `present_d[0]` -- 그 프레임에 새 present 를 못 받은 횟수.
+/// - `completed_zero` -- `completedStats.time` 이 0 이던 횟수. 창 전체면 그 필드는 이
+///   프로세스에서 못 쓰는 것이고, 표출 시각은 다른 데서 찾아야 한다.
+fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
+    let Some(current) = crate::comp_stats::completed_frame_id() else {
         // ★조용히 건너뛰지 않는다.★ 이 API 는 Windows 10 1803+ 이고 실패가 조용하면
         // "값이 안 나온다" 와 "줄이 아예 없다" 를 구분할 수 없다.
         warn!("COMPSTATS unavailable=1");
         return;
     };
+    // 한 창에 훑을 상한. 창이 늘어지거나 첫 호출이어도 비용이 터지지 않게 막는다.
+    const MAX_WALK: u64 = 240;
+    let first = match *last_id {
+        Some(previous) if current > previous => {
+            (previous + 1).max(current.saturating_sub(MAX_WALK))
+        },
+        // 첫 창이거나 id 가 되감겼다. 이번 것 하나만 보고 다음 창부터 훑는다.
+        _ => current,
+    };
+    *last_id = Some(current);
+
     let to_ms = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
-    let dwm_vblank = crate::dcomp_compositor::composition_grid();
-    let start_vs_dwmvb = dwm_vblank
-        .filter(|(_, period)| *period > 0)
-        .map(|(vblank, period)| {
+    let mut walks: Vec<((u32, i32), TargetWalk)> = Vec::new();
+    let mut seen = 0u32;
+    let mut missing = 0u32;
+    let mut period_ms = 0.0;
+    let mut target_vs_start_ms = 0.0;
+    // ★목록이 잘렸는지 본다.★ `returned` 가 `targets` 보다 작으면 `MAX_TARGETS` 에 걸린
+    // 것이고, 그러면 보이지 않는 디스플레이가 있다는 뜻이다.
+    let mut targets_declared = 0u32;
+    let mut targets_returned = 0usize;
+    let mut start_vs_dwmvb: Option<f64> = None;
+    let dwm_vblank = crate::dcomp_compositor::composition_grid().filter(|(_, p)| *p > 0);
+
+    for id in first..=current {
+        let Some(frame) = crate::comp_stats::sample_frame(id) else {
+            missing += 1;
+            continue;
+        };
+        seen += 1;
+        targets_declared = targets_declared.max(frame.target_count);
+        targets_returned = targets_returned.max(frame.targets.len());
+        period_ms = to_ms(frame.frame_period as i128);
+        target_vs_start_ms = to_ms(frame.target_time as i128 - frame.start_time as i128);
+        start_vs_dwmvb = dwm_vblank.map(|(vblank, period)| {
             let period = period as i128;
             to_ms(((frame.start_time as i128 - vblank as i128) % period + period) % period)
         });
+        for target in &frame.targets {
+            let luid = target.display_adapter_luid;
+            let slot = match walks.iter().position(|(key, _)| *key == luid) {
+                Some(index) => &mut walks[index].1,
+                None => {
+                    let name = outputs
+                        .iter()
+                        .find(|out| out.adapter_luid == luid)
+                        .map(|out| out.name.clone());
+                    walks.push((
+                        luid,
+                        TargetWalk {
+                            name,
+                            ..Default::default()
+                        },
+                    ));
+                    &mut walks.last_mut().expect("just pushed").1
+                },
+            };
+            slot.frames += 1;
+            if let Some(previous) = slot.last_refresh {
+                bump(
+                    &mut slot.refresh_delta,
+                    i64::from(target.presented.refresh_count) - i64::from(previous),
+                );
+            }
+            if let Some(previous) = slot.last_present {
+                bump(
+                    &mut slot.present_delta,
+                    i64::from(target.presented.present_count) - i64::from(previous),
+                );
+            }
+            slot.last_refresh = Some(target.presented.refresh_count);
+            slot.last_present = Some(target.presented.present_count);
+            bump(
+                &mut slot.outstanding,
+                i64::from(target.outstanding_presents),
+            );
+            let present = to_ms(target.present_time as i128 - frame.start_time as i128);
+            slot.present_vs_start_sum += present;
+            slot.present_vs_start_max = slot.present_vs_start_max.max(present);
+            if target.completed.time == 0 {
+                slot.completed_zero += 1;
+            } else {
+                let completed = to_ms(target.completed.time as i128 - frame.start_time as i128);
+                slot.completed_vs_start_sum += completed;
+                slot.completed_vs_start_max = slot.completed_vs_start_max.max(completed);
+            }
+        }
+    }
+
     warn!(
-        "COMPSTATS frame_id={} targets={} returned={} period_ms={:.3} \
-         target_vs_start_ms={:+.2} start_vs_dwmvb_ms={}",
-        frame.frame_id,
-        frame.target_count,
-        frame.targets.len(),
-        to_ms(frame.frame_period as i128),
-        to_ms(frame.target_time as i128 - frame.start_time as i128),
+        "COMPWALK ids={first}..{current} seen={seen} missing={missing} \
+         targets={targets_declared}/{targets_returned} period_ms={period_ms:.3} \
+         target_vs_start_ms={target_vs_start_ms:+.2} start_vs_dwmvb_ms={}",
         start_vs_dwmvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
     );
-    for target in &frame.targets {
-        let (name, out_grid) = outputs
-            .iter()
-            .find(|out| out.adapter_luid == target.display_adapter_luid)
-            .map_or((None, None), |out| {
-                (Some(out.name.as_str()), grid_for_monitor(out.monitor))
-            });
-        // 그 패널의 vblank 격자에서 `presentTime` 이 어디인가. 0 에 가까워야 정상이다 --
-        // present 는 vblank 에 일어나므로.
-        let present_vs_outvb = out_grid.filter(|grid| grid.period_qpc > 0).map(|grid| {
-            let period = grid.period_qpc as i128;
-            to_ms(
-                ((target.present_time as i128 - grid.vblank_qpc as i128) % period + period)
-                    % period,
-            )
-        });
+    for (luid, walk) in &walks {
+        let frames = walk.frames.max(1) as f64;
+        let completed_n = walk.frames.saturating_sub(walk.completed_zero).max(1) as f64;
         warn!(
-            "COMPTARGET out={} luid={:08x}:{:08x} present_vs_target_ms={:+.2} \
-             present_vs_start_ms={:+.2} present_vs_outvb_ms={} outstanding={} vblank_dur_ms={:.3}",
-            name.unwrap_or("?"),
-            target.display_adapter_luid.1,
-            target.display_adapter_luid.0,
-            to_ms(target.present_time as i128 - frame.target_time as i128),
-            to_ms(target.present_time as i128 - frame.start_time as i128),
-            present_vs_outvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
-            target.outstanding_presents,
-            to_ms(target.vblank_duration as i128),
+            "COMPREFRESH out={} luid={:08x}:{:08x} frames={} \
+             refresh_d=[{},{},{},{}] present_d=[{},{},{},{}] outstanding=[{},{},{},{}] \
+             present_vs_start_ms avg={:+.2} max={:+.2} \
+             completed_zero={} completed_vs_start_ms avg={:+.2} max={:+.2}",
+            walk.name.as_deref().unwrap_or("?"),
+            luid.1,
+            luid.0,
+            walk.frames,
+            walk.refresh_delta[0],
+            walk.refresh_delta[1],
+            walk.refresh_delta[2],
+            walk.refresh_delta[3],
+            walk.present_delta[0],
+            walk.present_delta[1],
+            walk.present_delta[2],
+            walk.present_delta[3],
+            walk.outstanding[0],
+            walk.outstanding[1],
+            walk.outstanding[2],
+            walk.outstanding[3],
+            walk.present_vs_start_sum / frames,
+            walk.present_vs_start_max,
+            walk.completed_zero,
+            walk.completed_vs_start_sum / completed_n,
+            walk.completed_vs_start_max,
         );
     }
 }
@@ -1209,6 +1315,11 @@ fn is_primary(monitor: usize) -> bool {
     info.dwFlags & MONITORINFOF_PRIMARY != 0
 }
 
+/// ★격자에 대한 독립적인 검산이다.★ `OUTCOMMIT` 의 위상은 마감을 정한 격자로 다시 접은
+/// 값이라 격자가 틀려도 목표치를 가리킨다(`commit_scheduler::scheduler_loop` 주석). 이 줄은
+/// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
+/// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
+///
 /// `rel_ms` 는 열거 첫 출력의 vblank 를 0 으로 둔 상대 위상으로, 주기로 접어 `[0,P)` 다.
 fn emit_outphase(outputs: &[Output], freq: u64) {
     // 기준은 격자가 있는 첫 출력이다. 열거 첫 출력이 아직(또는 영영) 격자를 못 얻었다고
