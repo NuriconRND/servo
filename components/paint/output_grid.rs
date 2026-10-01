@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 use log::warn;
 use winapi::Interface;
 use winapi::shared::dxgi::{
-    CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
+    CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
+    IDXGIOutput,
 };
 use winapi::shared::windef::HMONITOR;
 use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -845,6 +846,11 @@ struct Output {
     name: String,
     monitor: usize,
     output: *mut IDXGIOutput,
+    /// 이 출력을 구동하는 어댑터의 LUID `(LowPart, HighPart)`.
+    ///
+    /// ★`DCompositionGetStatistics` 가 돌려주는 타깃은 이름이 없다★ -- `displayAdapterLuid`
+    /// 로만 자기를 밝히므로, 그 통계를 `\\.\DISPLAYxx` 에 붙이려면 이 값이 필요하다.
+    adapter_luid: (u32, i32),
 }
 
 // Safety: 이 포인터는 프로브 스레드에서 만들어 그 스레드에서만 쓰이고 그 스레드에서 해제된다.
@@ -1068,6 +1074,7 @@ fn probe_loop() {
         {
             last_outphase = Instant::now();
             emit_outphase(&current.outputs, freq);
+            emit_comp_stats(&current.outputs, freq);
             emit_samplelead();
             emit_sampleslip();
             emit_frameid();
@@ -1118,6 +1125,74 @@ fn forget_vanished(outputs: &[Output]) {
 /// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
 /// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
 ///
+/// ★합성 프레임 하나가 **각 패널에 언제 떴는지**를 찍는다.★
+///
+/// `DCOMPSTAT` 이 답하지 못하는 것이 이것이다 -- 거기 나오는 `lastFrameTime` 은 데스크톱
+/// 합성 하나이고(네 디바이스가 같은 값을 준다), `DWM_TIMING_INFO::qpcCompose` 는 실측에서
+/// `qpcVBlank` 와 완전히 같았다. 둘 다 "그 프레임이 어느 패널에 언제 떴나" 를 말하지 않는다.
+///
+/// 읽는 법:
+/// - `period_ms` ★가장 먼저 본다.★ 16.67 이 아니면 이 구조체의 시간들이 QPC 가 아니라는
+///   뜻이고, 그러면 아래 값들을 믿으면 안 된다. 단위 가정을 출력 자체가 검산하게 둔다.
+/// - `present_vs_target_ms` -- 그 패널이 **이 합성이 겨냥한 vblank** 에 떴나. 네 패널 중
+///   하나만 한 주기 크면 그 패널이 그 프레임을 놓치고 다음 것을 기다린 것이다.
+/// - `outstanding` -- 그 타깃에 밀려 있는 present. 0 이 아니면 그 패널이 따라가지 못한다.
+fn emit_comp_stats(outputs: &[Output], freq: u64) {
+    let Some(frame) = crate::comp_stats::sample_completed_frame() else {
+        // ★조용히 건너뛰지 않는다.★ 이 API 는 Windows 10 1803+ 이고 실패가 조용하면
+        // "값이 안 나온다" 와 "줄이 아예 없다" 를 구분할 수 없다.
+        warn!("COMPSTATS unavailable=1");
+        return;
+    };
+    let to_ms = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
+    let dwm_vblank = crate::dcomp_compositor::composition_grid();
+    let start_vs_dwmvb = dwm_vblank
+        .filter(|(_, period)| *period > 0)
+        .map(|(vblank, period)| {
+            let period = period as i128;
+            to_ms(((frame.start_time as i128 - vblank as i128) % period + period) % period)
+        });
+    warn!(
+        "COMPSTATS frame_id={} targets={} returned={} period_ms={:.3} \
+         target_vs_start_ms={:+.2} start_vs_dwmvb_ms={}",
+        frame.frame_id,
+        frame.target_count,
+        frame.targets.len(),
+        to_ms(frame.frame_period as i128),
+        to_ms(frame.target_time as i128 - frame.start_time as i128),
+        start_vs_dwmvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
+    );
+    for target in &frame.targets {
+        let (name, out_grid) = outputs
+            .iter()
+            .find(|out| out.adapter_luid == target.display_adapter_luid)
+            .map_or((None, None), |out| {
+                (Some(out.name.as_str()), grid_for_monitor(out.monitor))
+            });
+        // 그 패널의 vblank 격자에서 `presentTime` 이 어디인가. 0 에 가까워야 정상이다 --
+        // present 는 vblank 에 일어나므로.
+        let present_vs_outvb = out_grid.filter(|grid| grid.period_qpc > 0).map(|grid| {
+            let period = grid.period_qpc as i128;
+            to_ms(
+                ((target.present_time as i128 - grid.vblank_qpc as i128) % period + period)
+                    % period,
+            )
+        });
+        warn!(
+            "COMPTARGET out={} luid={:08x}:{:08x} present_vs_target_ms={:+.2} \
+             present_vs_start_ms={:+.2} present_vs_outvb_ms={} outstanding={} vblank_dur_ms={:.3}",
+            name.unwrap_or("?"),
+            target.display_adapter_luid.1,
+            target.display_adapter_luid.0,
+            to_ms(target.present_time as i128 - frame.target_time as i128),
+            to_ms(target.present_time as i128 - frame.start_time as i128),
+            present_vs_outvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
+            target.outstanding_presents,
+            to_ms(target.vblank_duration as i128),
+        );
+    }
+}
+
 /// 이 출력이 primary 인가.
 ///
 /// ★DWM 합성은 primary 의 vblank 에 물려 있다.★ `DwmGetCompositionTimingInfo(NULL)` 의
@@ -1236,6 +1311,18 @@ unsafe fn enumerate_outputs() -> Enumeration {
         if (*factory).EnumAdapters1(ai, &mut adapter) < 0 || adapter.is_null() {
             break;
         }
+        // ★어댑터 LUID 를 떠 둔다.★ `DCompositionGetStatistics` 가 돌려주는 타깃은 이름이
+        // 아니라 `displayAdapterLuid` 로만 자기를 밝힌다 -- 그 통계를 우리 출력에 붙이는
+        // 열쇠가 이것이다. 못 읽으면 0 으로 두고, 그러면 그 출력은 매칭에서 빠진다.
+        let mut adapter_desc: DXGI_ADAPTER_DESC1 = std::mem::zeroed();
+        let adapter_luid = if (*adapter).GetDesc1(&mut adapter_desc) < 0 {
+            (0u32, 0i32)
+        } else {
+            (
+                adapter_desc.AdapterLuid.LowPart,
+                adapter_desc.AdapterLuid.HighPart,
+            )
+        };
         for oi in 0..8u32 {
             let mut output: *mut IDXGIOutput = ptr::null_mut();
             if (*adapter).EnumOutputs(oi, &mut output) < 0 || output.is_null() {
@@ -1261,6 +1348,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
                 name,
                 monitor,
                 output,
+                adapter_luid,
             });
         }
         (*adapter).Release();

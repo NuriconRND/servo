@@ -55,6 +55,8 @@ mod tracing;
 #[cfg(windows)]
 mod dcomp_compositor;
 #[cfg(windows)]
+mod comp_stats;
+#[cfg(windows)]
 mod output_grid;
 #[cfg(windows)]
 mod commit_scheduler;
