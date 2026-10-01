@@ -1561,6 +1561,34 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     if period == 0 { None } else { Some((vblank, period)) }
 }
 
+/// `(qpcVBlank, qpcCompose, qpcRefreshPeriod)`. 조회만 한다.
+///
+/// ★`qpcVBlank` 와 `qpcCompose` 는 다른 것이다.★ 앞은 격자점이고, 뒤는 DWM 이 실제로
+/// 합성 패스를 돈 시각이다. 스캔아웃이 "합성이 끝난 뒤 처음 오는 패널 vblank" 에서
+/// 일어난다면, 판정을 가르는 것은 격자점이 아니라 `qpcCompose` 다 -- 그리고 어떤 패널의
+/// vblank 가 거기에 바짝 붙어 있으면 작은 흔들림 하나로 그 프레임을 잡느냐 다음 것을
+/// 잡느냐가 뒤집힌다.
+///
+/// `composition_grid` 와 따로 두는 이유는 그쪽이 셸의 `-DwmAlign` 격자로 공개돼 있어
+/// 서명을 바꾸면 파급이 크기 때문이다. 한 번의 호출로 셋을 받아 가는 쪽이 싸다.
+pub(crate) fn dwm_timing() -> Option<(u64, u64, u64)> {
+    let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+    // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
+    if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
+        return None;
+    }
+    // `#[repr(packed)]` 이라 필드를 빌릴 수 없다. 값으로 복사한다.
+    let period = info.qpcRefreshPeriod;
+    let vblank = info.qpcVBlank;
+    let compose = info.qpcCompose;
+    if period == 0 {
+        None
+    } else {
+        Some((vblank, compose, period))
+    }
+}
+
 /// `pub(crate)`: 스케줄러가 디바이스 가드를 **푼 뒤에** 이것을 부른다
 /// ([`commit_device_ptr_locked`] 주석). 이 함수 자체가 전역 뮤텍스와 로그 I/O 를 쥐므로
 /// 임계구역 밖이어야 한다.
