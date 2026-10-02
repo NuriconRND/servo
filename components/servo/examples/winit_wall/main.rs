@@ -1038,15 +1038,15 @@ impl AppState {
     /// 떨어지고, DWM 과 우리 타이머의 주파수 차이도 매 틱 흡수된다.
     ///
     /// 조회일 뿐 대기가 아니다 -- 타이머가 깨어나는 시각만 바뀐다.
-    fn snap_to_dwm_grid(&self, now: std::time::Instant, free_running: std::time::Instant) -> std::time::Instant {
-        snap_to_dwm_grid_at(now, free_running)
+    fn snap_to_dwm_grid(&self, free_running: std::time::Instant) -> std::time::Instant {
+        snap_to_dwm_grid_at(free_running)
     }
 }
 
 /// `AppState::snap_to_dwm_grid` 의 본체. ★`self` 를 쓰지 않으므로 자유 함수로 뺀다★ --
 /// 페이싱 스레드도 같은 격자에 맞춰 자야 하고, 그 스레드는 `AppState`(Send 아님)를 볼 수
 /// 없다. 둘이 다른 산식을 쓰면 박자가 갈린다.
-fn snap_to_dwm_grid_at(now: std::time::Instant, free_running: std::time::Instant) -> std::time::Instant {
+fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
         let pct = servo_config::pref!(gfx_present_align_dwm_pct);
         if !(0..=99).contains(&pct) {
             return free_running;
@@ -1057,6 +1057,16 @@ fn snap_to_dwm_grid_at(now: std::time::Instant, free_running: std::time::Instant
         let Some(freq) = qpc_frequency() else {
             return free_running;
         };
+        // ★두 시계를 **붙여서** 읽는다.★ `ahead` 는 `qpc_now` 에서 격자점까지의 거리이므로
+        // 더할 앵커도 같은 순간의 `Instant` 여야 한다.
+        //
+        // 예전에는 호출자가 넘긴 `now` 에 더했는데, 그 사이에 `pref!` 의 RwLock 획득과
+        // `dwm_composition_grid()` 의 **시스템 콜**(`DwmGetCompositionTimingInfo`)이 있다.
+        // 그만큼 돌려주는 시각이 **일렀고**, 페이싱 스레드는 그 값으로 잘 시간을 계산하므로
+        // (`spawn_pacing_thread`) 오차가 Tick 송신 시각에 그대로 샜다. 상수면 거의 무해하지만
+        // 시스템 콜 지연은 흔들리고, 그 변동분이 틱 위상의 지터가 된다 -- 위상 측정의 해상도를
+        // 깎는 바로 그 양이다(설계 문서 §1 의 경계 ±0.5ms).
+        let anchor = std::time::Instant::now();
         let mut qpc_now: i64 = 0;
         // Safety: 순수 out-param.
         if unsafe { QueryPerformanceCounter(&mut qpc_now) } == 0 || qpc_now < 0 {
@@ -1075,7 +1085,7 @@ fn snap_to_dwm_grid_at(now: std::time::Instant, free_running: std::time::Instant
             ahead += period;
         }
     let wait_s = ahead as f64 / freq as f64;
-    now + std::time::Duration::from_secs_f64(wait_s)
+    anchor + std::time::Duration::from_secs_f64(wait_s)
 }
 
 /// ★박자를 이벤트 루프에서 뗀다.★
@@ -1116,7 +1126,7 @@ fn spawn_pacing_thread(
                 while next <= now {
                     next += period;
                 }
-                next = snap_to_dwm_grid_at(now, next);
+                next = snap_to_dwm_grid_at(next);
                 let sleep = next.saturating_duration_since(std::time::Instant::now());
                 if !sleep.is_zero() {
                     // Win10 1803+ 에서 `sleep` 은 고해상도 대기 타이머를 쓴다 -- winit 이
@@ -1147,7 +1157,7 @@ impl AppState {
             }
             // ★격자에 스냅한다.★ 자유 구동으로 센 다음 칸을 DWM 합성 격자 위의 같은
             // 지점으로 옮긴다. 꺼져 있으면 그대로 돌려준다.
-            next = self.snap_to_dwm_grid(now, next);
+            next = self.snap_to_dwm_grid(next);
             self.next_present_tick.set(next);
             if self.vsync_stalled.get() {
                 self.clock_stats.borrow_mut().backstop += 1;
