@@ -557,6 +557,43 @@ pub(crate) fn note_present_tick_now() {
     }
 }
 
+/// 이 패스의 틱 시각(QPC). 아직 틱이 없었으면 `None`.
+///
+/// 0 을 "없음" 으로 쓰는 것이 안전한 이유: QPC 는 부팅부터 단조 증가하고, 0 은 부팅
+/// 순간뿐이다. 그 시각에 벽이 프레임을 내고 있을 수는 없다.
+pub(crate) fn tick_qpc() -> Option<u64> {
+    let tick = TICK_QPC.load(Ordering::Relaxed);
+    (tick != 0).then_some(tick)
+}
+
+/// ★`tick` 직후의 첫 `pct%` 격자점.★ 순수 함수 -- 시계도 COM 도 만지지 않는다.
+///
+/// `vblank`/`period` 는 `DwmGetCompositionTimingInfo` 가 준 **공통** 합성 격자이고, `pct` 는
+/// 주기 안에서 겨냥할 백분율이다. 돌려주는 것은 그 격자점의 절대 QPC 다.
+///
+/// ★"직후" 는 엄격하다.★ `tick` 이 정확히 목표점 위에 있으면 한 주기 뒤를 돌려준다 -- 틱
+/// 시점에는 그 패스가 아직 돌지도 않았으므로, 그 자리에서 커밋하면 **이전 프레임**을
+/// 내보내게 된다.
+///
+/// `vblank` 는 드라이버에 따라 `tick` 보다 과거일 수도 미래일 수도 있다. 나머지 연산을 두 번
+/// 걸어 어느 쪽이든 격자 위의 같은 점으로 접는다(`snap_to_dwm_grid_at` 과 같은 이유).
+///
+/// 돌려주는 값은 `tick` 으로부터 **최대 한 주기** 뒤다. 그보다 멀면 다음 스케줄이 먼저
+/// 도착해 `commit_scheduler::upsert` 가 마감을 계속 뒤로 밀고, 한 번 걸린 타일은 영원히
+/// 걸린다(`log_ani_debug_02/03` 에서 DISPLAY22 가 초당 60 건 중 8 건만 커밋했다).
+pub(crate) fn next_grid_point(tick: u64, vblank: u64, period: u64, pct: u64) -> Option<u64> {
+    if period == 0 {
+        return None;
+    }
+    // `period` 는 한 주기의 QPC 틱 수(10MHz 에서 ~1.7e5)이고 `pct <= 99` 이므로 u64 에서
+    // 넘치지 않는다.
+    let base = vblank.wrapping_add(period * pct / 100);
+    let period_i = period as i128;
+    let delta = tick as i128 - base as i128;
+    let ahead = period_i - (((delta % period_i) + period_i) % period_i);
+    Some(tick.wrapping_add(ahead as u64))
+}
+
 /// 디바이스 -> 이번 창의 `틱 -> 커밋` 표본(ms). `TICKCOMMIT` 이 초당 비운다.
 static TICK_TO_COMMIT: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 
@@ -1729,7 +1766,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{composition_target, period_from_pair};
+    use super::{composition_target, next_grid_point, period_from_pair};
 
     /// ★목표 시각은 언제나 격자 위에 있고, 시계 지터와 무관하다.★
     ///
@@ -1823,5 +1860,86 @@ mod tests {
         let (period, measured) = period_from_pair(500_000, 400_000, FREQ, ASSUMED);
         assert_eq!(period, ASSUMED);
         assert!(!measured);
+    }
+
+    /// 10MHz QPC 에서 60Hz 한 주기. 실기 값(`COMPWALK period_ms=16.667`)과 같은 규모다.
+    const P: u64 = 166_667;
+    /// 임의의 vblank 기준점. 절대값은 결과에 영향이 없어야 한다.
+    const V: u64 = 1_000_000_000;
+
+    /// 목표점 바로 앞의 틱은 **그** 격자점을 겨냥한다.
+    #[test]
+    fn a_tick_just_before_the_target_aims_at_it() {
+        let base = V + P * 25 / 100;
+        assert_eq!(next_grid_point(base - 1, V, P, 25), Some(base));
+    }
+
+    /// 목표점을 막 지난 틱은 **다음** 격자점을 겨냥한다.
+    #[test]
+    fn a_tick_just_past_the_target_aims_at_the_next_one() {
+        let base = V + P * 25 / 100;
+        assert_eq!(next_grid_point(base + 1, V, P, 25), Some(base + P));
+    }
+
+    /// ★목표점 정확히 위의 틱은 한 주기 뒤다 -- 0 이 아니다.★
+    ///
+    /// 틱 시점에는 그 패스가 아직 돌지도 않았다. 그 자리에서 커밋하면 이전 프레임을 내보낸다.
+    #[test]
+    fn a_tick_exactly_on_the_target_waits_a_full_period() {
+        let base = V + P * 25 / 100;
+        assert_eq!(next_grid_point(base, V, P, 25), Some(base + P));
+    }
+
+    /// 몇 주기가 지났든 바로 다음 격자점 하나만 건너뛴다.
+    #[test]
+    fn many_periods_later_still_lands_on_the_very_next_point() {
+        let base = V + P * 25 / 100;
+        assert_eq!(
+            next_grid_point(base + 3 * P + 5, V, P, 25),
+            Some(base + 4 * P)
+        );
+    }
+
+    /// ★`vblank` 가 틱보다 **미래**일 수 있다.★ (Review Focus 1)
+    ///
+    /// `qpcVBlank` 는 드라이버에 따라 직전일 수도 다음일 수도 된다. 음수 나머지를 접지 않으면
+    /// 마감이 과거로 나오고, 그러면 매 프레임 즉시 커밋이 되어 기능이 켜진 채 아무 일도 안 한다.
+    #[test]
+    fn a_vblank_in_the_future_of_the_tick_still_folds_correctly() {
+        // 틱이 vblank 보다 반 주기 **앞**에 있다. pct=0 이므로 목표점은 vblank 격자 자체다.
+        assert_eq!(next_grid_point(V - P / 2, V, P, 0), Some(V));
+        // 두 주기도 더 앞이어도 같은 격자 위의 다음 점으로 간다.
+        assert_eq!(next_grid_point(V - 2 * P - 7, V, P, 0), Some(V - 2 * P));
+    }
+
+    /// `pct` 경계. (Review Focus 3)
+    #[test]
+    fn pct_boundaries_land_on_the_right_point() {
+        // pct = 0 -> vblank 격자점 자체.
+        assert_eq!(next_grid_point(V - 1, V, P, 0), Some(V));
+        // pct = 99 -> 주기의 99% 지점.
+        let base99 = V + P * 99 / 100;
+        assert_eq!(next_grid_point(base99 - 1, V, P, 99), Some(base99));
+    }
+
+    /// ★`period == 0` 에 패닉하지 않는다.★ (Review Focus 4)
+    #[test]
+    fn a_zero_period_yields_none_instead_of_dividing_by_zero() {
+        assert_eq!(next_grid_point(V, V, 0, 25), None);
+    }
+
+    /// ★주사율이 바뀌면 다음 호출부터 새 주기를 따른다.★ (Review Focus 5)
+    ///
+    /// 격자는 패스마다 다시 조회되므로 이 함수는 상태를 들지 않아야 한다. 같은 틱에 다른
+    /// 주기를 주면 다른 답이 나와야 한다 -- 같으면 어딘가에 옛 주기가 남은 것이다.
+    #[test]
+    fn a_changed_period_is_followed_immediately() {
+        const P75: u64 = 133_333; // 75Hz
+        let tick = V + 1_000;
+        let at60 = next_grid_point(tick, V, P, 50).expect("60Hz");
+        let at75 = next_grid_point(tick, V, P75, 50).expect("75Hz");
+        assert_ne!(at60, at75);
+        assert_eq!(at60, V + P * 50 / 100);
+        assert_eq!(at75, V + P75 * 50 / 100);
     }
 }
