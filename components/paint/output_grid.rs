@@ -515,6 +515,13 @@ static TICK_QPC: AtomicU64 = AtomicU64::new(0);
 /// 차이를 그대로 드러낸다.
 #[derive(Clone, Copy)]
 struct PassMark {
+    /// 단조 증가하는 패스 번호. ★연속한 두 합성이 같은 번호를 물면 그 사이에
+    /// 새 커밋이 없었다는 것이 **정의상** 참이다★ -- 시간 문턱이 필요 없다.
+    ///
+    /// 전에는 `c2s > 한 주기` 로 갈랐는데 그걸로 나온 분류가 합성/렌더 속도차와
+    /// 맞지 않았다(초당 1.1~1.9 개가 새 커밋 없이 지나야 하는데 0.01 개로 잡혔다).
+    /// ★임계값을 찍는 실수를 두 번째 했다.★
+    seq: u64,
     tick_qpc: u64,
     /// 이 패스의 첫/마지막 커밋(QPC). 0 = 아직 커밋이 없다.
     first_commit_qpc: u64,
@@ -528,6 +535,8 @@ struct PassMark {
 /// 가능하므로 그보다 길게 잡는다.
 const PASS_RING_CAP: usize = 288;
 static PASS_RING: Mutex<Option<VecDeque<PassMark>>> = Mutex::new(None);
+/// 다음 패스에 붙일 번호. 0 은 "없음" 으로 쓰지 않으므로 1 부터 나간다.
+static PASS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 셸이 표출 틱을 낼 때 부른다. ★틱마다 한 번★ -- 타일마다가 아니다.
 pub(crate) fn note_present_tick_now() {
@@ -539,6 +548,7 @@ pub(crate) fn note_present_tick_now() {
             ring.pop_front();
         }
         ring.push_back(PassMark {
+            seq: PASS_SEQ.fetch_add(1, Ordering::Relaxed) + 1,
             tick_qpc: now,
             first_commit_qpc: 0,
             last_commit_qpc: 0,
@@ -635,7 +645,8 @@ fn emit_tickcommit() {
             None => -1,
         };
         warn!(
-            "TICKCOMMIT device={device:#x} n={} t2c_ms p05={:.2} p50={:.2} p95={:.2}              max={:.2} spread={:.2} late={late}",
+            "TICKCOMMIT device={device:#x} n={} t2c_ms p05={:.2} p50={:.2} p95={:.2} \
+             max={:.2} spread={:.2} late={late}",
             t2c.len(),
             at(0.05),
             at(0.50),
@@ -1355,6 +1366,8 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
     const MAX_MISS_LINES: u32 = 24;
     let mut miss_lines = 0u32;
     let mut miss_suppressed = 0u32;
+    // 앞 합성 프레임을 먹인 패스 번호.
+    let mut prev_seq: Option<u64> = None;
 
     for id in first..=current {
         let Some(frame) = crate::comp_stats::sample_frame(id) else {
@@ -1366,6 +1379,16 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
         targets_returned = targets_returned.max(frame.targets.len());
         period_ms = to_ms(frame.frame_period as i128);
         target_vs_start_ms = to_ms(frame.target_time as i128 - frame.start_time as i128);
+        // ★패스는 프레임당 한 번만 찾는다.★ 네 타일이 공유하는 값이고, 앞 프레임과
+        // 비교해야 "그 사이에 새 커밋이 있었나" 를 말할 수 있으므로 놓침 때만 찾으면 늦다.
+        let pass = pass_before(frame.start_time, freq);
+        let seq = pass.as_ref().map(|(mark, _)| mark.seq);
+        let newcommit: i32 = match (seq, prev_seq) {
+            (Some(now), Some(before)) if now == before => 0,
+            (Some(_), Some(_)) => 1,
+            _ => -1,
+        };
+        prev_seq = seq;
         start_vs_dwmvb = dwm_vblank.map(|(vblank, period)| {
             let period = period as i128;
             to_ms(((frame.start_time as i128 - vblank as i128) % period + period) % period)
@@ -1404,7 +1427,15 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
                 if delta == 0 {
                     if miss_lines < MAX_MISS_LINES {
                         miss_lines += 1;
-                        emit_missevent(id, slot.name.as_deref(), &frame, target, freq);
+                        emit_missevent(
+                            id,
+                            slot.name.as_deref(),
+                            &frame,
+                            target,
+                            freq,
+                            pass.as_ref(),
+                            newcommit,
+                        );
                     } else {
                         miss_suppressed += 1;
                     }
@@ -1432,7 +1463,8 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
     warn!(
         "COMPWALK ids={first}..{current} seen={seen} missing={missing} \
          targets={targets_declared}/{targets_returned} period_ms={period_ms:.3} \
-         target_vs_start_ms={target_vs_start_ms:+.2} start_vs_dwmvb_ms={}          miss_lines={miss_lines} miss_suppressed={miss_suppressed}",
+         target_vs_start_ms={target_vs_start_ms:+.2} start_vs_dwmvb_ms={} \
+         miss_lines={miss_lines} miss_suppressed={miss_suppressed}",
         start_vs_dwmvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
     );
     for (luid, walk) in &walks {
@@ -1492,11 +1524,13 @@ fn emit_missevent(
     frame: &crate::comp_stats::FrameSample,
     target: &crate::comp_stats::TargetSample,
     freq: u64,
+    pass: Option<&(PassMark, Vec<f64>)>,
+    newcommit: i32,
 ) {
     let to_ms = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
     let out = name.unwrap_or("?");
     let outstanding = target.outstanding_presents;
-    match pass_before(frame.start_time, freq) {
+    match pass {
         Some((mark, prev)) => {
             let c2s = to_ms(frame.start_time as i128 - mark.last_commit_qpc as i128);
             let t2c = to_ms(mark.last_commit_qpc as i128 - mark.tick_qpc as i128);
@@ -1507,12 +1541,17 @@ fn emit_missevent(
                 .collect::<Vec<_>>()
                 .join(",");
             warn!(
-                "MISSEVENT fid={frame_id} out={out} outstanding={outstanding}                  c2s_ms={c2s:.2} t2c_ms={t2c:.2} span_ms={span:.2} commits={}                  prev_t2c=[{prev}]",
-                mark.commits,
+                "MISSEVENT fid={frame_id} out={out} outstanding={outstanding} \
+                 newcommit={newcommit} pass_seq={} c2s_ms={c2s:.2} t2c_ms={t2c:.2} \
+                 span_ms={span:.2} commits={} prev_t2c=[{prev}]",
+                mark.seq, mark.commits,
             );
         },
         None => {
-            warn!("MISSEVENT fid={frame_id} out={out} outstanding={outstanding} pass=none");
+            warn!(
+                "MISSEVENT fid={frame_id} out={out} outstanding={outstanding} \
+                 newcommit={newcommit} pass=none"
+            );
         },
     }
 }
