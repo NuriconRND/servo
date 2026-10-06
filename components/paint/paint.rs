@@ -2922,12 +2922,19 @@ impl Paint {
         crate::output_grid::next_grid_point(tick, vblank, period, pct)
     }
 
-    /// 격자를 못 구해 즉시 커밋으로 떨어진 타일 수를 세고, 초당 한 번 알린다.
+    /// 마감을 못 구해 즉시 커밋으로 떨어진 타일 수를 세고, 초당 한 번 알린다.
     ///
-    /// ★once-warn 이 아니라 지속 카운터다.★ 이 폴백은 기동 직후 프로브가 첫 바퀴를 돌기
-    /// 전까지는 정상이지만, 핫플러그 뒤 새 HMONITOR 가 영영 격자를 못 받으면 **영구**가 된다.
-    /// 그 둘은 "한 번 났다" 로는 구분되지 않고, 초당 카운트가 계속 찍히느냐로만 구분된다.
-    /// 조용히 폴백하면 정렬이 아무 일도 안 하는 채로 벽이 계속 돌고 아무도 모른다.
+    /// ★원인이 셋이다.★ 마감은 pref·공통 격자·틱 셋을 모두 갖춰야 나오므로, 폴백은 그중 아무
+    /// 하나가 비었다는 뜻이다 -- (1) `composition_grid()` 실패(DWM 합성 꺼짐 등), (2) `tick_qpc()`
+    /// 가 `None`(셸이 `servo::note_present_tick()` 을 부르지 않는다), (3) 그 타일의 `monitor` 가
+    /// `None`. ★어느 것인지 말하지 않으면 엉뚱한 곳을 보게 된다★ -- 예전 이 줄은 "출력 격자" 를
+    /// 지목하고 `[outgrid]`/`OUTPHASE` 를 보라고 했는데, 지금 마감은 그 프로브 격자를 전혀 읽지
+    /// 않으므로 그 로그는 멀쩡해 보인다.
+    ///
+    /// ★once-warn 이 아니라 지속 카운터다.★ 기동 지후 한두 프레임은 정상이지만, 셸이 틱을 안
+    /// 찍는 구성(원인 (2))이면 **영구**가 된다. 그 둘은 "한 번 났다" 로는 구분되지 않고, 초당
+    /// 카운트가 계속 찍히느냐로만 구분된다. 조용히 폴백하면 정렬이 아무 일도 안 하는 채로 벽이
+    /// 계속 돌고 아무도 모른다.
     #[cfg(windows)]
     fn note_grid_fallback(count: u64) {
         static FALLBACKS: AtomicU64 = AtomicU64::new(0);
@@ -2946,9 +2953,15 @@ impl Paint {
         }
         *last = Some(now);
         let taken = FALLBACKS.swap(0, Ordering::Relaxed);
+        // 어느 입력이 비었는지를 줄에 집어 넣는다. 세 원인은 서로 전혀 다른 곳을 가리킨다.
+        let grid = crate::dcomp_compositor::composition_grid().is_some();
+        let tick = crate::output_grid::tick_qpc().is_some();
         warn!(
-            "[commitsched] 출력 격자를 못 구해 즉시 커밋으로 폴백한 타일 {taken} 건/초 -- \
-             정렬이 이 타일들에는 걸리지 않는다. [outgrid] 줄과 OUTPHASE 를 보라"
+            "[commitsched] 마감을 못 구해 즉시 커밋으로 폴백한 타일 {taken} 건/초 -- \
+             정렬이 이 타일들에는 걸리지 않는다. dwm_grid={grid} tick={tick} -- \
+             grid=false 는 DWM 합성이 꺼졌다는 뜻이고, tick=false 는 셸이 \
+             servo::note_present_tick() 을 부르지 않는다는 뜻이다(그러면 이 기능은 \
+             아무 일도 하지 않는다). 둘 다 true 면 그 타일의 monitor 를 못 구한 것이다"
         );
     }
 
@@ -2989,16 +3002,27 @@ impl Paint {
     /// 대신 렌더 넷을 먼저 몰고 Commit 넷을 몰아, Commit 의 대기가 서로 겹칠 수 있는지를
     /// 스레드 없이 확인하는 것이다.
     pub fn flush_deferred_dcomp_commits(&self) {
-        // ★타일마다 자기 출력의 격자에 맞춘다.★ 데스크톱 격자 하나로는 넷을 만족시킬 수
-        // 없다 -- 실측에서 네 모니터의 vblank 가 주기의 0.67 에 흩어져 있고, 좋은 자리를
-        // 5ms 로 잡아도 네 창의 교집합이 공집합이다(log_ani_debug_02/02).
+        // ★네 타일을 **하나의** 공통 합성 격자에 맞춘다.★ DWM 은 네 타일을 한 합성 패스에서
+        // 함께 올린다(네 디바이스의 `lastFrameTime` 이 동일하다). 그러므로 맞출 격자도 하나고,
+        // 마감도 패스당 하나다.
+        //
+        // ★예전에는 여기에 그 반대가 적혀 있었다★ -- "타일마다 자기 출력의 격자에 맞춘다, 네
+        // 모니터의 vblank 가 주기의 0.67 에 흩어져 있으니 교집합이 공집합이다". 그것이 B1 의
+        // 생각이었고, 그렇게 해서 **듣지 않았다**. 출력별 vblank 는 맞출 대상이 아니다 -- 맞출
+        // 것은 DWM 의 합성 시점이고 그것은 하나다. 출력별 위상차는 여전히 있지만 그것은 이
+        // 함수가 아니라 B2(`gfx_sample_lead_periods`)의 일이다.
+        // 설계 문서 §21~27 과 `2026-10-06-commit-on-composition-grid-design.md`.
         //
         // 여기서는 **거는 것만** 한다. 실제 Commit 은 스케줄러 스레드가 그 시각에 낸다.
         // 이 함수는 메인(또는 스레드된 painter 로의 왕복)에서 도므로 여기서 기다리면
         // 그대로 패스가 길어진다.
         #[cfg(windows)]
         if crate::commit_scheduler::COMMIT_ALIGN_PCT.is_some() {
-            // ★프로브는 이 기능이 켜지면 뜬다.★ 예전에는 유일한 호출처가 `note_dwm_phase`
+            // ★프로브는 이 기능이 켜지면 뜬다.★ 단, 마감은 이제 프로브의 격자를 전혀 읽지
+            // 않는다(공통 격자만 쓴다). 그래도 띄우는 이유는 `OUTCOMMIT`/`OUTPHASE` 의 위상
+            // 표본이 거기서 나오기 때문이다 -- 그것이 위상 법칙의 계측이다.
+            //
+            // 아래는 그 함수가 전에 다른 이유로 필요했던 사정이다(지금은 해당 없다): 예전에는 유일한 호출처가 `note_dwm_phase`
             // 안이었고 그 함수는 `SERVO_DCOMP_BIND_PROF` 뒤에서 시작한다 -- 즉 진단 플래그
             // 없이 정렬 pref 만 준 운영 구성에서는 격자가 영영 비어 전 타일이 매
             // 프레임 즉시 커밋 폴백을 탔고, 그 사실을 알리는 로그조차 없었다. `start_probe`
@@ -3013,14 +3037,22 @@ impl Paint {
             {
                 static WARNED_GAP: std::sync::Once = std::sync::Once::new();
                 WARNED_GAP.call_once(|| {
-                    let commit = *crate::commit_scheduler::COMMIT_ALIGN_PCT;
+                    let Some(commit) = *crate::commit_scheduler::COMMIT_ALIGN_PCT else {
+                        return;
+                    };
                     let tick = servo_config::pref!(gfx_present_align_dwm_pct);
-                    if let Some(commit) = commit
-                        && (0..=99).contains(&tick)
-                        && commit.saturating_sub(tick as u64) < 15
-                    {
+                    // `-DwmAlign` 이 꺼지면 틱에 고정 위상이 없으니 보할 것이 없다.
+                    if !(0..=99).contains(&tick) {
+                        return;
+                    }
+                    let slack = crate::output_grid::commit_slack_pct(commit, tick as u64);
+                    if slack < 15 {
                         warn!(
-                            "[commitsched] gfx_present_align_commit_pct={commit} 가                              gfx_present_align_dwm_pct={tick} 보다 15%p 넘게 크지 않다 --                              마감이 패스보다 먼저 와서 거의 매 프레임 즉시 커밋으로 떨어질                              수 있다(프로브의 패스 p95 가 주기의 13.4%). OUTCOMMIT 의                              slip_us 로 확인할 것"
+                            "[commitsched] gfx_present_align_commit_pct={commit} 은 \
+                             gfx_present_align_dwm_pct={tick} 에서 주기의 {slack}% 뿐 떨어져 \
+                             있다 -- 마감이 패스보다 먼저 와서 거의 매 프레임 즉시 \
+                             커밋으로 떨어질 수 있다(프로브의 패스 p95 가 주기의 13.4%). \
+                             OUTCOMMIT 의 slip_us 로 확인할 것"
                         );
                     }
                 });

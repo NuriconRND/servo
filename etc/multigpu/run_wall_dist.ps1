@@ -161,9 +161,13 @@ param(
     # 두 증상을 모두 만들었다 -- 큰 탈선은 합성 마감을 스치고(MISSEVENT nc=1), 그
     # 흔들림이 커밋 간격을 흔들어 합성 경계를 넘나든다(nc=0).
     #
-    # ★-DwmAlign 보다 15%p 이상 커야 한다.★ 작으면 마감이 패스보다 먼저 와서 거의
-    # 매 프레임 즉시 커밋으로 떨어지고, 기능이 켜진 채 아무 일도 하지 않는다
-    # (프로브의 패스 p95 가 주기의 13.4%). 엔진이 기동 로그에 경고를 한 줄 낸다.
+    # ★-DwmAlign 의 바로 앞에 두지 말 것.★ 여유는 틱에서 마감까지의 **전방** 거리라
+    # (CommitAlign - DwmAlign) mod 100 이고, 그것이 15%p 미만이면 마감이 패스보다
+    # 먼저 와서 거의 매 프레임 즉시 커밋으로 떨어진다 -- 기능이 켜진 채 아무 일도
+    # 하지 않는다(프로브의 패스 p95 가 주기의 13.4%). 엔진이 기동 로그에 경고를 한 줄 낸다.
+    #
+    # ★CommitAlign < DwmAlign 은 적법하다★ -- 마감이 다음 주기의 그 지점이 되므로
+    # 여유가 거의 한 주기로 가장 많다. 대신 합성까지의 여유는 가장 적다.
     #
     # 켜면 -DcompParallelCommit 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
     # ★판정은 TICKCOMMIT 의 spread 다★ -- 0 에 가까워져야 성공이다.
@@ -636,7 +640,7 @@ if ($DcompParallelCommit -and $DComp -eq "off") {
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
 }
-# Per-output alignment schedules the deferred Commit onto that tile's own vblank grid. There is
+# Commit alignment schedules the deferred Commit onto the common DWM composition grid. There is
 # nothing to schedule if the Commit already went out inside end_frame: -DcompCommitInFrame issues
 # it there, so flush_deferred_dcomp_commits finds no pending commit and the alignment branch never
 # runs. The pairing produces a run that looks aligned on the command line and is not aligned at

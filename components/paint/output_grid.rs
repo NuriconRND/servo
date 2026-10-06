@@ -566,6 +566,25 @@ pub(crate) fn tick_qpc() -> Option<u64> {
     (tick != 0).then_some(tick)
 }
 
+/// ★커밋 마감까지 패스에 주는 여유(주기의 %).★ 틱은 `tick_pct%` 에, 커밋은 그 뒤 첫
+/// `commit_pct%` 에 떨어지므로, 여유는 단어진 전방 거리다.
+///
+/// ★부호 없는 차로 재서는 안 된다.★ `commit_pct < tick_pct` 면 마감은 **다음 주기**의 그
+/// 지점이므로 여유가 거의 한 주기다 -- 가장 **많은** 경우다. `commit - tick` 을 포화 뫨산으로
+/// 재면 그것이 0 으로 바닥을 치고, "여유가 없다" 는 정반대의 경고를 내게 된다. 설계
+/// 문서 §3 은 `CommitAlign < DwmAlign` 을 적법이라고 적어 둔다.
+///
+/// 똑같은 위상이면 100 을 돌려준다 -- `next_grid_point` 의 "직후는 엄감하다" 에 맞춰
+/// 한 주기 전지이고, 여유는 최대다.
+///
+/// 두 인자 모두 `0..=99` 를 전제한다(양쪽 pref 가 그 범위로 걸러진다).
+pub(crate) fn commit_slack_pct(commit_pct: u64, tick_pct: u64) -> u64 {
+    if commit_pct == tick_pct {
+        return 100;
+    }
+    (commit_pct + 100 - tick_pct) % 100
+}
+
 /// ★`tick` 직후의 첫 `pct%` 격자점.★ 순수 함수 -- 시계도 COM 도 만지지 않는다.
 ///
 /// `vblank`/`period` 는 `DwmGetCompositionTimingInfo` 가 준 **공통** 합성 격자이고, `pct` 는
@@ -1766,7 +1785,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{composition_target, next_grid_point, period_from_pair};
+    use super::{commit_slack_pct, composition_target, next_grid_point, period_from_pair};
 
     /// ★목표 시각은 언제나 격자 위에 있고, 시계 지터와 무관하다.★
     ///
@@ -1941,5 +1960,36 @@ mod tests {
         assert_ne!(at60, at75);
         assert_eq!(at60, V + P * 50 / 100);
         assert_eq!(at75, V + P75 * 50 / 100);
+    }
+
+    /// ★커밋이 틱보다 앞에 있는 좌표는 여유가 가장 **많다** -- 가장 적지 않다.★
+    ///
+    /// 부호 없는 차(`commit - tick`)로 재면 이 구간이 0 으로 바닥을 치고, 경고가 진실의
+    /// 반대를 말한다. 설계 문서 §3 은 `CommitAlign < DwmAlign` 을 적법이라고 적어 둔다 --
+    /// 그런 설정에 경고를 내면 운용자는 줄을 무시하게 되고, 정말 위험한 구간에서도 무시한다.
+    #[test]
+    fn a_commit_phase_before_the_tick_has_the_most_slack() {
+        // DwmAlign 8, CommitAlign 0 -> 다음 주기의 0% 지점이므로 여유가 92% 다.
+        assert_eq!(commit_slack_pct(0, 8), 92);
+        // 훨씬 앞에 나더라도 마찬가지.
+        assert_eq!(commit_slack_pct(1, 50), 51);
+    }
+
+    /// ★똑같은 위상이면 한 주기 전지다 -- 0 이 아니다.★
+    ///
+    /// `next_grid_point` 의 "직후는 엄감하다" 와 같은 사심이다. 그러므로 여유는 최대다.
+    #[test]
+    fn the_same_phase_means_a_full_period_of_slack() {
+        assert_eq!(commit_slack_pct(8, 8), 100);
+        assert_eq!(commit_slack_pct(0, 0), 100);
+    }
+
+    /// 정상 사용 구간과 경고 경계(15%).
+    #[test]
+    fn slack_is_the_forward_distance_and_the_warning_edge_is_fifteen() {
+        assert_eq!(commit_slack_pct(25, 8), 17); // 설계 문서의 예
+        assert_eq!(commit_slack_pct(23, 8), 15); // 경계 -- 경고 없음
+        assert_eq!(commit_slack_pct(22, 8), 14); // 경계 아래 -- 경고
+        assert_eq!(commit_slack_pct(99, 0), 99);
     }
 }

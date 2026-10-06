@@ -54,7 +54,11 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
 /// 흔들리면 커밋 위상이 1:1 로 흔들린다. 그 몫을 분리해야 `commit_lead_ms` 의 산포가
 /// 어디서 오는지 가린다 -- 자세한 것은 `output_grid::TICK_QPC`.
 ///
-/// 틱을 안 찍어도 동작은 같다. 그때 `TICKCOMMIT` 줄이 안 나올 뿐이다.
+/// ★이것을 부르지 않으면 `gfx_present_align_commit_pct` 가 아무 일도 하지 않는다.★
+/// 마감이 틱에서 세지므로, 틱이 없으면 `commit_deadline()` 이 `None` 이고 전 타일이 즉시 커밋
+/// 폴백을 한다(그러니 초당 한 번 `[commitsched] ... tick=false` 경고가 나온다). 정렬 pref 를
+/// 쓰려는 셸은 반드시 이것을 틱마다 부르고, 쓰지 않는 셸은 그 pref 를 켜지 않는다.
+/// `TICKCOMMIT` 줄도 이것에 달려 있다.
 pub fn note_present_tick() {
     #[cfg(windows)]
     crate::output_grid::note_present_tick_now();
