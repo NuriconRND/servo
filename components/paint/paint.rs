@@ -2915,8 +2915,8 @@ impl Paint {
     #[cfg(windows)]
     fn commit_deadline() -> Option<u64> {
         // 캐시된 값이다 -- `pref!` 는 RwLock 획득이고 이 함수는 패스마다 돌다
-        // (`commit_scheduler::ALIGN_PCT` 주석).
-        let pct = (*crate::commit_scheduler::ALIGN_PCT)?;
+        // (`commit_scheduler::COMMIT_ALIGN_PCT` 주석).
+        let pct = (*crate::commit_scheduler::COMMIT_ALIGN_PCT)?;
         let (vblank, period) = crate::dcomp_compositor::composition_grid()?;
         let tick = crate::output_grid::tick_qpc()?;
         crate::output_grid::next_grid_point(tick, vblank, period, pct)
@@ -2997,18 +2997,39 @@ impl Paint {
         // 이 함수는 메인(또는 스레드된 painter 로의 왕복)에서 도므로 여기서 기다리면
         // 그대로 패스가 길어진다.
         #[cfg(windows)]
-        if crate::commit_scheduler::ALIGN_PCT.is_some() {
+        if crate::commit_scheduler::COMMIT_ALIGN_PCT.is_some() {
             // ★프로브는 이 기능이 켜지면 뜬다.★ 예전에는 유일한 호출처가 `note_dwm_phase`
             // 안이었고 그 함수는 `SERVO_DCOMP_BIND_PROF` 뒤에서 시작한다 -- 즉 진단 플래그
-            // 없이 `-PerOutputAlign` 만 준 운영 구성에서는 격자가 영영 비어 전 타일이 매
+            // 없이 정렬 pref 만 준 운영 구성에서는 격자가 영영 비어 전 타일이 매
             // 프레임 즉시 커밋 폴백을 탔고, 그 사실을 알리는 로그조차 없었다. `start_probe`
             // 는 `Once` 라 여러 곳에서 불러도 스레드는 하나다.
             crate::output_grid::start_probe();
+            // ★마감이 패스보다 먼저 오면 기능이 켜진 채 아무 일도 하지 않는다.★ 거의 매
+            // 프레임 즉시 커밋으로 떨어지는데, 로그에는 정렬이 켜진 것으로 보인다.
+            //
+            // 15% 는 프로브의 패스 p95(주기의 13.4%)에 여유를 조금 준 값이다. 패스 p95 는
+            // 기동 시점에 알 수 없으므로 상수로 둔다. 막지는 않는다 -- 스윈에서 일부러 좁게
+            // 주는 경우가 있고, 그때 무슨 일이 생기는지 보는 것이 측정의 일부다.
+            {
+                static WARNED_GAP: std::sync::Once = std::sync::Once::new();
+                WARNED_GAP.call_once(|| {
+                    let commit = *crate::commit_scheduler::COMMIT_ALIGN_PCT;
+                    let tick = servo_config::pref!(gfx_present_align_dwm_pct);
+                    if let Some(commit) = commit
+                        && (0..=99).contains(&tick)
+                        && commit.saturating_sub(tick as u64) < 15
+                    {
+                        warn!(
+                            "[commitsched] gfx_present_align_commit_pct={commit} 가                              gfx_present_align_dwm_pct={tick} 보다 15%p 넘게 크지 않다 --                              마감이 패스보다 먼저 와서 거의 매 프레임 즉시 커밋으로 떨어질                              수 있다(프로브의 패스 p95 가 주기의 13.4%). OUTCOMMIT 의                              slip_us 로 확인할 것"
+                        );
+                    }
+                });
+            }
             if servo_config::pref!(gfx_dcomp_parallel_commit) {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     warn!(
-                        "[commitsched] gfx_present_align_per_output_pct 가 켜져 있어 \
+                        "[commitsched] gfx_present_align_commit_pct 가 켜져 있어 \
                          gfx_dcomp_parallel_commit 을 (스케줄 경로에서) 무시한다 -- \
                          목적이 겹친다. 격자 미확보 폴백은 여전히 그 설정을 따른다"
                     );

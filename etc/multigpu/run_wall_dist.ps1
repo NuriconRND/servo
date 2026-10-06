@@ -153,22 +153,26 @@ param(
     # 줄 서는 회귀(GstSystemClock 사건)가 구조적으로 생기지 않는다.
     [ValidateRange(-1, 99)]
     [int]    $DwmAlign = -1,
-    # gfx_present_align_per_output_pct: 타일마다 자기 출력의 vblank 격자에 맞춰 Commit.
-    # -1(기본) = 끔, 0..99 = 그 출력 주기의 백분율 지점.
+    # gfx_present_align_commit_pct -- B3. DComp Commit 을 공통 합성 격자 위의 고정된
+    # 위상에 내보낸다. -1 = 꺼짐(기본), 0..99 = 합성 주기의 그 백분율 지점.
     #
-    # ★-DwmAlign 과의 차이★ -DwmAlign 은 데스크톱(주 모니터) 격자 하나에만 맞춘다. 실측에서
-    # 네 모니터의 vblank 가 주기의 0.67 에 흩어져 있어(기준 대비 +1.17 / +6.57 / -4.63ms),
-    # 좋은 자리를 5ms 로 잡아도 네 창의 교집합이 공집합이다 -- 어떤 시각을 골라도 최소 한
-    # 대는 나쁜 자리에 앉는다. 그래서 타일마다 따로 맞춘다.
+    # 커밋은 그동안 렌더 패스의 **끝**에서 나갔고, -DwmAlign 은 패스의 **시작**만
+    # 고정한다. 그래서 커밋 위상이 패스 길이를 그대로 물려받았고, 그 산포가 저더의
+    # 두 증상을 모두 만들었다 -- 큰 탈선은 합성 마감을 스치고(MISSEVENT nc=1), 그
+    # 흔들림이 커밋 간격을 흔들어 합성 경계를 넘나든다(nc=0).
+    #
+    # ★-DwmAlign 보다 15%p 이상 커야 한다.★ 작으면 마감이 패스보다 먼저 와서 거의
+    # 매 프레임 즉시 커밋으로 떨어지고, 기능이 켜진 채 아무 일도 하지 않는다
+    # (프로브의 패스 p95 가 주기의 13.4%). 엔진이 기동 로그에 경고를 한 줄 낸다.
     #
     # 켜면 -DcompParallelCommit 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
-    # 판정은 -DcompBindProf 의 OUTCOMMIT 줄 -- 네 출력의 phase p50 이 전부 목표 근처여야 한다.
+    # ★판정은 TICKCOMMIT 의 spread 다★ -- 0 에 가까워져야 성공이다.
     [ValidateRange(-1, 99)]
-    [int]    $PerOutputAlign = -1,
+    [int]    $CommitAlign = -1,
     # gfx_sample_lead_periods -- B2. 타일마다 자기 출력이 그 프레임을 표시할 시각에
     # 애니메이션을 샘플한다. -1 = 꺼짐(기본), 0 = 다음 vblank, 1 = +1 주기 (0..4).
     #
-    # B1(-PerOutputAlign)이 커밋 시각만 옮겨 못 고친 것을 고친다. 실기에서 B1 을 완전히
+    # B1(출력별 vblank 겨냥, 지금은 B3 -CommitAlign 으로 교체)이 커밋 시각만 옮겨 못 고친 것을 고친다. 실기에서 B1 을 완전히
     # 동작시켜도 저더가 줄지 않았다(설계 문서 `## 실기 결과`).
     #
     # ★이음매에 고정 어긋남이 생긴다 -- 그것이 이 거래의 내용이다.★ 속도 × 출력 간 위상차
@@ -637,7 +641,7 @@ if ($DcompBindProf -and $DComp -eq "off") {
 # it there, so flush_deferred_dcomp_commits finds no pending commit and the alignment branch never
 # runs. The pairing produces a run that looks aligned on the command line and is not aligned at
 # all -- the same failure shape as the -DcompParallelCommit pairing just above.
-# The range here must match the engine gate exactly (gfx_present_align_per_output_pct is live for
+# The range here must match the engine gate exactly (gfx_present_align_commit_pct is live for
 # 0..=99 and off otherwise). ValidateRange on the parameter already bounds it to -1..99, so the
 # only value that reaches here with alignment off is -1 -- but spelling the upper bound out keeps
 # this guard honest if that ValidateRange is ever widened, rather than throwing for a combination
@@ -652,14 +656,14 @@ if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
 }
 
-if ($PerOutputAlign -ge 0 -and $PerOutputAlign -le 99 -and $DcompCommitInFrame) {
-    throw "-PerOutputAlign $PerOutputAlign needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to schedule."
+if ($CommitAlign -ge 0 -and $CommitAlign -le 99 -and $DcompCommitInFrame) {
+    throw "-CommitAlign $CommitAlign needs the Commit deferred to the end of the pass; -DcompCommitInFrame issues it inside end_frame, so there would be nothing to schedule."
 }
 # Out of 0..99 the engine silently treats the pref as off. -1 is the documented way to say that, so
 # say nothing for it; any other out-of-range value is someone expecting alignment and not getting
 # it, and that has to be visible on the console rather than only in a phase log that never appears.
-if ($PerOutputAlign -ne -1 -and ($PerOutputAlign -lt 0 -or $PerOutputAlign -gt 99)) {
-    Write-Warning "-PerOutputAlign $PerOutputAlign is outside 0..99, so the engine treats per-output alignment as OFF. Pass a value in 0..99 to enable it, or -1 to say off deliberately."
+if ($CommitAlign -ne -1 -and ($CommitAlign -lt 0 -or $CommitAlign -gt 99)) {
+    Write-Warning "-CommitAlign $CommitAlign is outside 0..99, so the engine treats commit alignment as OFF. Pass a value in 0..99 to enable it, or -1 to say off deliberately."
 }
 
 $serveRoot = Join-Path $here "pages\html"
@@ -751,7 +755,7 @@ $argList = @(
     "--pref", "gfx_vsync_phase_pct=$VsyncPhase",
     "--pref", "gfx_present_sync_interval=$PresentSync",
     "--pref", "gfx_present_align_dwm_pct=$DwmAlign",
-    "--pref", "gfx_present_align_per_output_pct=$PerOutputAlign",
+    "--pref", "gfx_present_align_commit_pct=$CommitAlign",
     "--pref", "gfx_sample_lead_periods=$SampleLead",
     "--pref", "gfx_wall_direct_render=$($DirectRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
@@ -823,7 +827,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign per_output_align=$PerOutputAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in

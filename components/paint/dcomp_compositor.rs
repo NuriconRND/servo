@@ -1758,7 +1758,7 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
 pub fn commit_device_ptr(device: usize) -> bool {
     let hr = {
-        let _guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+        let _guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
             crate::commit_scheduler::device_guard(
                 device,
                 crate::commit_scheduler::GuardRole::Painter,
@@ -2676,7 +2676,7 @@ impl DCompNativeCompositor {
     /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
     fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice) {
         let hr = {
-            let _guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+            let _guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
                 crate::commit_scheduler::device_guard(
                     dcomp_device as usize,
                     crate::commit_scheduler::GuardRole::Painter,
@@ -2833,7 +2833,7 @@ impl DCompNativeCompositor {
             // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다. 실패 로그도 가드를 푼 뒤에
             // 찍는다(`note_commit_failure` 주석).
             let hr = {
-                let _commit_guard = (*crate::commit_scheduler::ALIGN_PCT).map(|_| {
+                let _commit_guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
                     crate::commit_scheduler::device_guard(
                         dcomp_device as usize,
                         crate::commit_scheduler::GuardRole::Painter,
@@ -3726,7 +3726,7 @@ impl Compositor for DCompNativeCompositor {
         // 존재한다 -- pref 가 꺼져 있으면(기본 `-1`) `flush_deferred_dcomp_commits` 가
         // `schedule()` 를 아예 안 부르므로 스케줄러 스레드조차 뜨지 않고, 이 뮤텍스를 놓고
         // 겨룰 상대가 없다. 상대가 없는 락을 매 프레임 잡는 비용만 남는 것은 "꺼져 있으면
-        // 오늘과 같다" 는 이 작업 전체의 전제와 어긋난다. 조건은 `ALIGN_PCT` 한 곳에서 오므로
+        // 오늘과 같다" 는 이 작업 전체의 전제와 어긋난다. 조건은 `COMMIT_ALIGN_PCT` 한 곳에서 오므로
         // 두 지점이 같은 실행 안에서 서로 다른 값을 볼 수 없다.
         //
         // ★가드는 여기서 시작하지 않고 아래 서피스 작업 직전에서 시작한다.★ 이 함수를 기다리는
@@ -3785,7 +3785,7 @@ impl Compositor for DCompNativeCompositor {
         // 붙이고(`AddVisual`), 마지막에 `commit_device` 한다 -- 셋 다 이 DComp 디바이스를
         // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
         #[cfg(windows)]
-        let commit_guard = (*crate::commit_scheduler::ALIGN_PCT).and_then(|_| {
+        let commit_guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).and_then(|_| {
             self.dcomp_device_ptr().map(|device| {
                 crate::commit_scheduler::device_guard(
                     device as usize,

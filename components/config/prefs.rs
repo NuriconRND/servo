@@ -576,25 +576,29 @@ pub struct Preferences {
     /// ★대기가 아니다.★ 타이머가 깨어나는 **시각**만 바뀐다. 생산 스레드가 공유
     /// 객체에 줄 서는 회귀(`GstSystemClock` 사건)가 구조적으로 생기지 않는다.
     pub gfx_present_align_dwm_pct: i64,
-    /// ★타일마다 자기 출력의 vblank 격자에 맞춰 Commit 한다.★ `-1`(기본) = 끔,
-    /// `0..99` = 그 출력 주기의 백분율 지점을 겨냥한다.
+    /// ★DComp Commit 을 공통 합성 격자 위의 고정된 위상에 내보낸다(B3).★ `-1`(기본) = 끔,
+    /// `0..99` = 합성 주기의 그 백분율 지점을 겨냥한다.
     ///
-    /// `gfx_present_align_dwm_pct` 는 **데스크톱(주 모니터) 격자 하나**에만 맞춘다. 실측에서
-    /// 네 모니터의 vblank 가 주기의 0.67 에 흩어져 있어(log_ani_debug_02/02: 기준 대비
-    /// +1.17 / +6.57 / −4.63ms), 좋은 자리를 5ms 로 넉넉히 잡아도 네 창의 교집합이
-    /// 공집합이다 -- 어떤 커밋 시각을 골라도 최소 한 대는 나쁜 자리에 앉는다. 그래서
-    /// 타일마다 따로 맞춘다.
+    /// 커밋은 그동안 렌더 패스의 **끝**에서 나갔다. `gfx_present_align_dwm_pct` 가 고정하는
+    /// 것은 패스의 **시작**이므로 커밋 위상이 패스 길이를 그대로 물려받았고, 그 산포가
+    /// 저더의 두 증상을 모두 만들었다 -- 큰 탈선은 합성 마감을 스치고, 그 흔들림이 커밋
+    /// 간격을 흔들어 합성 경계를 넘나든다. 실측에서 패스 산포와 커밋 위상 산포가 네 실행
+    /// 모두 같은 크기였다(`docs/superpowers/specs/2026-10-06-commit-on-composition-grid-design.md`).
+    ///
+    /// 마감은 `틱 직후의 첫 pct% 격자점` 이고 틱으로부터 최대 한 주기 뒤다. 패스가 그때까지
+    /// 못 끝내면 **즉시 커밋한다** -- 늦더라도 최신 내용을 내보낸다.
+    ///
+    /// ★`pct` 는 `gfx_present_align_dwm_pct` 보다 패스 p95 만큼 커야 한다.★ 작으면 마감이
+    /// 패스보다 먼저 와서 거의 매 프레임 초과하고, 기능이 켜진 채 아무 일도 하지 않는다.
+    /// 프로브의 패스 p95 는 주기의 13.4% 다.
     ///
     /// 켜면 `gfx_dcomp_parallel_commit` 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
-    ///
-    /// 이 값이 고치는 것은 **타일 내 저더**다. 이음매를 넘는 물체의 완전한 연속성은 genlock
-    /// 없이 성립하지 않는다.
-    pub gfx_present_align_per_output_pct: i64,
+    pub gfx_present_align_commit_pct: i64,
     /// B2 — 타일마다 **자기 출력이 그 프레임을 표시할 시각**에 애니메이션을 샘플한다.
     /// 값은 그 시각을 자기 출력 vblank 기준으로 몇 주기 앞서 볼지다. `-1` = 꺼짐(기본,
     /// 오늘 동작), `0` = 다음 vblank, `1` = 다음 vblank + 한 주기.
     ///
-    /// ★B1(`gfx_present_align_per_output_pct`)이 못 고친 것을 고친다.★ B1 은 커밋이 나가는
+    /// ★B1(출력별 vblank 겨냥, 지금은 B3 `gfx_present_align_commit_pct` 로 교체)이 못 고친 것을 고친다.★ B1 은 커밋이 나가는
     /// 시각만 옮겼고 프레임이 **담은 값**은 바꾸지 못했다. vblank 가 11.2ms 떨어진 두 타일이
     /// 거의 같은 순간에 샘플한 값을 들고 있으면 이음매에서 한쪽이 그만큼 낡은 위치를 보여
     /// 주고, 그 차이가 매 프레임 흔들린다. 실기에서 B1 을 완전히 동작시켜도 저더가 줄지
@@ -1226,7 +1230,7 @@ impl Preferences {
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
             gfx_present_align_dwm_pct: -1,
-            gfx_present_align_per_output_pct: -1,
+            gfx_present_align_commit_pct: -1,
             gfx_sample_lead_periods: -1,
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,

@@ -45,7 +45,7 @@ use log::warn;
 
 use crate::output_grid::{qpc_frequency, qpc_now};
 
-/// 정렬 pref(`gfx_present_align_per_output_pct`)를 **한 번만** 읽어 캐시한다.
+/// 정렬 pref(`gfx_present_align_commit_pct`)를 **한 번만** 읽어 캐시한다.
 /// `Some(pct)` = 켜짐(`0..=99`), `None` = 꺼짐.
 ///
 /// ★`pref!` 는 `PREFERENCES.read().unwrap()` 으로 펼쳐지는 RwLock 획득이다.★ 이 pref 를
@@ -56,13 +56,13 @@ use crate::output_grid::{qpc_frequency, qpc_now};
 /// `LazyLock` 으로 굳혀도 안전한 이유: 이 pref 는 기동 시 커맨드라인에서 한 번 정해지고
 /// 실행 중에 바뀌지 않는다(Ruling 9 에서 리뷰어가 `Preferences` 의 모든 쓰기 지점을
 /// 트리에서 감사해 확인했다). 같은 파일의 `PRESENT_SYNC_INTERVAL` 과 같은 이유·같은 방식.
-pub(crate) static ALIGN_PCT: LazyLock<Option<u64>> = LazyLock::new(|| {
-    let raw = servo_config::pref!(gfx_present_align_per_output_pct);
+pub(crate) static COMMIT_ALIGN_PCT: LazyLock<Option<u64>> = LazyLock::new(|| {
+    let raw = servo_config::pref!(gfx_present_align_commit_pct);
     (0..=99).contains(&raw).then_some(raw as u64)
 });
 
 /// B2 pref(`gfx_sample_lead_periods`)를 **한 번만** 읽어 캐시한다. `Some(n)` = 켜짐,
-/// `None` = 꺼짐(`-1`). 이 값을 묻는 자리가 painter 마다 프레임당 하나라 `ALIGN_PCT` 와
+/// `None` = 꺼짐(`-1`). 이 값을 묻는 자리가 painter 마다 프레임당 하나라 `COMMIT_ALIGN_PCT` 와
 /// 같은 이유로 `LazyLock` 이다(그 주석 참고).
 ///
 /// 상한을 4 로 둔다 -- 그보다 앞서 보는 것은 네 주기(67ms) 뒤의 위치를 그리는 것이라
@@ -183,7 +183,7 @@ fn clear_retry(device: usize) {
 /// 잠금 순서는 스케줄러와 같다: 큐 락을 먼저 잡아 항목을 빼고 **놓은 뒤에** 디바이스 가드를
 /// 잡는다. 두 락을 겹쳐 쥐지 않으므로 역전이 생길 수 없다.
 pub(crate) fn flush_before_render(device: usize) {
-    if ALIGN_PCT.is_none() {
+    if COMMIT_ALIGN_PCT.is_none() {
         return;
     }
     let Some(shared) = SHARED.get() else {
