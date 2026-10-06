@@ -3057,13 +3057,21 @@ impl Paint {
                     }
                 });
             }
-            if servo_config::pref!(gfx_dcomp_parallel_commit) {
+            // ★예전에는 여기서 "무시한다" 고 경고했다.★ B1 때는 커밋 시각이 타일마다
+            // 달라 목적이 겹친다고 봤는데, 지금은 네 타일이 **같은** 마감을 받으므로 겹치지
+            // 않는다 -- 넷을 동시에 내는 것이 바로 이 설계가 원하는 것이다. 그래서 이 pref 는
+            // 이제 스케줄 경로에서도 **적용된다**(`commit_scheduler::PARALLEL_COMMIT`).
+            //
+            // 끄면 커밋이 순차로 나가고, 2·3·4 번째 타일의 slip 에 앞 타일들의 `Commit()`
+            // 시간이 들어간다(실측 상수 ~360µs). A/B 를 재려면 그쪽으로 끄면 된다.
+            if !servo_config::pref!(gfx_dcomp_parallel_commit) {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
                     warn!(
-                        "[commitsched] gfx_present_align_commit_pct 가 켜져 있어 \
-                         gfx_dcomp_parallel_commit 을 (스케줄 경로에서) 무시한다 -- \
-                         목적이 겹친다. 격자 미확보 폴백은 여전히 그 설정을 따른다"
+                        "[commitsched] gfx_present_align_commit_pct 가 켜졌는데 \
+                         gfx_dcomp_parallel_commit 이 꺼져 있다 -- 네 커밋이 순차로 나가 \
+                         2·3·4 번째 타일이 앞 타일들의 Commit 시간만큼 늦는다(실측 ~360µs). \
+                         OUTCOMMIT 의 slip_us_avg 로 확인할 것"
                     );
                 });
             }

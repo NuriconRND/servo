@@ -12,8 +12,13 @@
 //! 성립한다. 스케줄러는 **나중에** 커밋하므로 그 보장이 사라진다: 스케줄러가 디바이스 D 를
 //! 커밋하는 동안 그 painter 가 다음 프레임의 `end_frame` 에 들어갈 수 있다. 정상 부하에서는
 //! 겹치지 않지만(최대 지연 11.2ms < 주기 16.67ms) **"정상 부하에서는" 은 보장이 아니다.**
-//! 그래서 디바이스마다 뮤텍스를 두고, 양쪽이 그것을 잡는다. 커밋이 0.02ms 라 경합은 드물고
-//! 짧아야 하며, 그 가정은 `lock_wait_us` 계수가 지켜본다.
+//! 그래서 디바이스마다 뮤텍스를 두고, 양쪽이 그것을 잡는다. 경합은 드물고 짧아야 하며, 그
+//! 가정은 `lock_wait_us` 계수가 지켜본다.
+//!
+//! ★"커밋이 0.02ms" 는 틀렸다.★ 실측 4× Commit 폭(`MISSEVENT span_ms`)이 좋은 실행에서
+//! 1~3ms, 나쁜 실행에서 8~10ms 다(log_ani_debug_03/10~11). 그래서 넷을 차례로 내면
+//! 2·3·4 번째가 그만큼 늦고, 그것이 `slip_us_avg` 의 상수 360µs 로 나타났다 -- `PARALLEL_COMMIT`
+//! 이 그 직렬화를 없앤다. 뮤텍스 경합의 상한은 여전히 `Commit()` 하나지만 그 하나가 1ms 급이다.
 //!
 //! ★이 뮤텍스는 생산 스레드와 무관하지 않다.★ 설계 문서에 그렇게 적혀 있었지만 틀렸다 --
 //! 이것을 잡는 곳은 다섯이고, 스케줄러를 뺀 넷은 전부 생산·렌더·셸 스레드 위에 있다:
@@ -272,6 +277,19 @@ const RETRY_DELAY_US: u64 = 1_000;
 /// 하나의 ~6% 다. 메인 스레드가 `Poll` 로 코어 하나를 통째로 태우는 것에 비하면 작다.
 const SPIN_MARGIN_US: u64 = 2_000;
 
+/// `gfx_dcomp_parallel_commit` 을 **한 번만** 읽어 캐시한다(`COMMIT_ALIGN_PCT` 와 같은 이유).
+///
+/// ★이 경로에서 이 pref 의 뜻이 바뀌었다.★ B1 때는 커밋 시각이 타일마다 달라서 "목적이
+/// 겹친다" 고 무시했다. 지금은 네 타일이 **같은** 마감을 받으므로 겹치지 않는다 -- 넷을
+/// 동시에 내는 것이 바로 그 설계가 원하는 것이다.
+///
+/// 왜 필요한가: 깨끗한 구간의 `slip_us_avg` 가 357~371µs 로 **상수**였다(log_ani_debug_03/11).
+/// 깨어남 지터가 아니라 직렬화다 -- 한 번 깨어나 네 커밋을 차례로 내므로 2·3·4 번째 타일의
+/// slip 에 앞 타일들의 `Commit()` 시간이 그대로 들어간다. 실측 4× Commit 폭(`MISSEVENT
+/// span_ms`)이 1~3ms 였으니 평균 ~0.4ms 이고, 관측된 360µs 와 맞는다.
+static PARALLEL_COMMIT: LazyLock<bool> =
+    LazyLock::new(|| servo_config::pref!(gfx_dcomp_parallel_commit));
+
 /// 가장 이른 마감까지 `remaining` 틱 남았을 때 **얼마나 잘 것인가**.
 ///
 /// `Some(ticks)` = 그만큼 자고 다시 본다. `None` = ★자지 말고 돌라★ -- 마감이 마진 안에
@@ -486,7 +504,18 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             }
         };
 
-        for (deadline, device, monitor) in due {
+        // ★`Commit()` 넷을 겹쳐서 낸다.★ 네 타일이 같은 마감을 받으므로 차례로 내면
+        // 2·3·4 번째가 앞 타일들의 커밋 시간만큼 늦는다 -- 그것이 깨끗한 구간에서도 남아
+        // 있던 상수 360µs 였다(`PARALLEL_COMMIT` 주석).
+        //
+        // ★겹치는 것은 `Commit()` 하나뿐이다.★ 재시도는 `shared.queue` 를 다시 잡고,
+        // `note_dwm_phase` 는 전역 뮤텍스와 DWM 조회를 품고, 통계는 초당 한 번 I/O 를 한다 --
+        // 그것들을 스레드로 흩으면 이 파일이 지켜 온 "임계구역은 `Commit()` 한 줄" 규칙이
+        // 무너진다. 그래서 커밋만 병렬로 내고 결과를 모아 **순차로** 뒷일을 한다.
+        //
+        // slip 은 각 디바이스가 **자기 커밋 직전에** 잰다. 그래야 "이 커밋이 마감에서 얼마나
+        // 늦었나" 이고, 앞 타일의 비용이 섞이지 않는다.
+        let commit_one = |deadline: u64, device: usize, monitor: usize| {
             if let Some(now) = qpc_now() {
                 let slip = now.saturating_sub(deadline);
                 let us = slip.saturating_mul(1_000_000) / freq.max(1);
@@ -494,6 +523,32 @@ fn scheduler_loop(shared: &Arc<Shared>) {
                 SLIP_SUM.fetch_add(us, Ordering::Relaxed);
                 SLIP_MAX.fetch_max(us, Ordering::Relaxed);
             }
+            let hr = {
+                let _guard = device_guard(device, GuardRole::Scheduler);
+                crate::dcomp_compositor::commit_device_ptr_locked(device)
+            };
+            (device, monitor, hr)
+        };
+        let committed: Vec<(usize, usize, i32)> = if due.len() > 1 && *PARALLEL_COMMIT {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = due
+                    .iter()
+                    .map(|&(deadline, device, monitor)| {
+                        scope.spawn(move || commit_one(deadline, device, monitor))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("커밋 스레드가 패닉했다"))
+                    .collect()
+            })
+        } else {
+            due.iter()
+                .map(|&(deadline, device, monitor)| commit_one(deadline, device, monitor))
+                .collect()
+        };
+
+        for (device, monitor, hr) in committed {
             // ★가드는 `Commit()` 한 줄만 감싼다.★ 이 뮤텍스를 기다리는 상대(그 타일의
             // painter, 비디오 fast-path)는 ANGLE GL 락을 쥔 채로 기다린다. 가드 안에서 하는
             // 일이 길어지면 그만큼 그 락도 길게 잡히고, 같은 디바이스의 WebGL 스레드가 그
@@ -504,12 +559,8 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             // ★실패 로그도 가드 밖이다.★ TDR·디바이스 제거 뒤에는 모든 커밋이 계속 실패하므로,
             // 실패 경로에 로그가 들어 있으면 임계구역이 `Commit()` 이 아니라 파일 쓰기 길이가
             // 된다 -- 그러면 위 상한이 무너진다. `hr` 만 들고 나와 밖에서 찍는다.
-            let hr = {
-                let _guard = device_guard(device, GuardRole::Scheduler);
-                crate::dcomp_compositor::commit_device_ptr_locked(device)
-            };
-            // 가드를 푼 뒤에 한다. 아래 세 줄은 DComp 디바이스를 만지지 않으므로 painter 와
-            // 겹쳐도 안전하다.
+            // 커밋은 위에서 이미 났다. 아래는 전부 DComp 디바이스를 만지지 않으므로
+            // painter 와 겹쳐도 안전하고, 공유 상태를 만지므로 **순차**여야 한다.
             // ★`SURFACE_BEING_RENDERED` 는 실패가 아니라 "아직"이다.★
             //
             // 그 타일의 WebRender 렌더가 서피스를 `BeginDraw` 로 열어 둔 동안에는 그 디바이스의
