@@ -21,7 +21,7 @@
 // (dcomp_compositor.rs/dcomp_video_convert.rs의 `#![allow(unsafe_code)]`와 같은 취지).
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -507,10 +507,43 @@ pub(crate) fn note_commit_at(device: usize) {
 /// "커밋을 패스 끝에서 떼어낼 가치가 있나" 를 결정한다.
 static TICK_QPC: AtomicU64 = AtomicU64::new(0);
 
+/// 한 패스가 남긴 자국. `MISSEVENT` 가 놓친 합성 프레임에서 거꾸로 되짚는다.
+///
+/// ★디바이스별이 아니라 패스별이다.★ 네 타일은 한 패스의 끝에서 한꺼번에 커밋되므로
+/// (`flush_deferred_dcomp_commits`), "그 순간 무슨 일이 있었나" 의 단위는 패스다. 대신
+/// 네 커밋이 얼마나 벌어졌는지를 `first`↔`last` 로 남긴다 -- 그 폭이 디바이스별
+/// 차이를 그대로 드러낸다.
+#[derive(Clone, Copy)]
+struct PassMark {
+    tick_qpc: u64,
+    /// 이 패스의 첫/마지막 커밋(QPC). 0 = 아직 커밋이 없다.
+    first_commit_qpc: u64,
+    last_commit_qpc: u64,
+    /// 이 패스가 낸 커밋 수. ★4 보다 작으면 타일이 건너뛰었다는 뜻이다★
+    /// (`skipped_busy`). 놓침과 같은 줄에서 보여야 하는 값이라 여기 둔다.
+    commits: u32,
+}
+
+/// 최근 패스들. walk 상한(`MAX_WALK` = 240 프레임 ≈ 4초)를 덮어야 되짚기가
+/// 가능하므로 그보다 길게 잡는다.
+const PASS_RING_CAP: usize = 288;
+static PASS_RING: Mutex<Option<VecDeque<PassMark>>> = Mutex::new(None);
+
 /// 셸이 표출 틱을 낼 때 부른다. ★틱마다 한 번★ -- 타일마다가 아니다.
 pub(crate) fn note_present_tick_now() {
-    if let Some(now) = qpc_now() {
-        TICK_QPC.store(now, Ordering::Relaxed);
+    let Some(now) = qpc_now() else { return };
+    TICK_QPC.store(now, Ordering::Relaxed);
+    if let Ok(mut guard) = PASS_RING.lock() {
+        let ring = guard.get_or_insert_with(VecDeque::new);
+        if ring.len() >= PASS_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(PassMark {
+            tick_qpc: now,
+            first_commit_qpc: 0,
+            last_commit_qpc: 0,
+            commits: 0,
+        });
     }
 }
 
@@ -533,6 +566,39 @@ fn note_tick_to_commit(device: usize, commit_qpc: u64) {
             .or_default()
             .push(ms);
     }
+    // 현재 패스에 새긴다. ★틱이 미리 칸을 만들어 두므로 여기서는 뒤가 항상 있다★
+    // -- 없다면 틱 없이 커밋이 난 것이고, 그런 커밋은 어느 패스의 것도 아니니 버린다.
+    if let Ok(mut guard) = PASS_RING.lock()
+        && let Some(mark) = guard.as_mut().and_then(|ring| ring.back_mut())
+    {
+        if mark.first_commit_qpc == 0 {
+            mark.first_commit_qpc = commit_qpc;
+        }
+        mark.last_commit_qpc = commit_qpc;
+        mark.commits += 1;
+    }
+}
+
+/// 합성 시각 `start` 을 먹였을 패스 -- 그 전에 커밋을 마친 마지막 패스다.
+///
+/// 돌려주는 것: `(그 패스, 직전 세 패스의 t2c_ms)`. 직전 값이 필요한 이유는
+/// ★이것이 갑작스러운 튜는 패스였는지, 원래 계속 길었는지를 가르기 위해서다★.
+fn pass_before(start_qpc: u64, freq: u64) -> Option<(PassMark, Vec<f64>)> {
+    let guard = PASS_RING.lock().ok()?;
+    let ring = guard.as_ref()?;
+    let index = ring
+        .iter()
+        .rposition(|m| m.last_commit_qpc != 0 && m.last_commit_qpc <= start_qpc)?;
+    let mark = ring[index];
+    let prev = ring
+        .iter()
+        .take(index)
+        .rev()
+        .take(3)
+        .filter(|m| m.last_commit_qpc != 0 && m.last_commit_qpc > m.tick_qpc)
+        .map(|m| (m.last_commit_qpc - m.tick_qpc) as f64 * 1000.0 / freq as f64)
+        .collect();
+    Some((mark, prev))
 }
 
 /// ★패스가 커밋 위상을 얼마나 미는가.★
@@ -1283,6 +1349,12 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
     let mut targets_returned = 0usize;
     let mut start_vs_dwmvb: Option<f64> = None;
     let dwm_vblank = crate::dcomp_compositor::composition_grid().filter(|(_, p)| *p > 0);
+    // `MISSEVENT` 의 창당 상한. 놓침은 프로브에선 초당 0.1 회지만 output 페이지에선
+    // 30 회를 넘는다. ★상한에 걸리면 건너뛴 수를 같은 줄에 찍는다★ -- 줄이 없는 것과
+    // 많아서 잘린 것은 전혀 다른 상황이다.
+    const MAX_MISS_LINES: u32 = 24;
+    let mut miss_lines = 0u32;
+    let mut miss_suppressed = 0u32;
 
     for id in first..=current {
         let Some(frame) = crate::comp_stats::sample_frame(id) else {
@@ -1325,10 +1397,18 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
                 );
             }
             if let Some(previous) = slot.last_present {
-                bump(
-                    &mut slot.present_delta,
-                    i64::from(target.presented.present_count) - i64::from(previous),
-                );
+                let delta = i64::from(target.presented.present_count) - i64::from(previous);
+                bump(&mut slot.present_delta, delta);
+                // ★놓친 바로 그 순간을 뽑는다.★ 초당 통계로는 보이지 않는 사건이다 --
+                // 프로브 a8 은 120초에 11 회라 1초 창의 p50/p95 가 구조적으로 못 본다.
+                if delta == 0 {
+                    if miss_lines < MAX_MISS_LINES {
+                        miss_lines += 1;
+                        emit_missevent(id, slot.name.as_deref(), &frame, target, freq);
+                    } else {
+                        miss_suppressed += 1;
+                    }
+                }
             }
             slot.last_refresh = Some(target.presented.refresh_count);
             slot.last_present = Some(target.presented.present_count);
@@ -1352,7 +1432,7 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
     warn!(
         "COMPWALK ids={first}..{current} seen={seen} missing={missing} \
          targets={targets_declared}/{targets_returned} period_ms={period_ms:.3} \
-         target_vs_start_ms={target_vs_start_ms:+.2} start_vs_dwmvb_ms={}",
+         target_vs_start_ms={target_vs_start_ms:+.2} start_vs_dwmvb_ms={}          miss_lines={miss_lines} miss_suppressed={miss_suppressed}",
         start_vs_dwmvb.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.2}")),
     );
     for (luid, walk) in &walks {
@@ -1385,6 +1465,55 @@ fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
             walk.completed_vs_start_sum / completed_n,
             walk.completed_vs_start_max,
         );
+    }
+}
+
+/// ★놓친 합성 프레임 하나를 그 순간의 맥락과 함께 찍는다.★
+///
+/// 왜 초당 통계가 아니라 사건이어야 하는가: 프로브 페이지의 놓침은 120초에 11 회다.
+/// 1초 창의 p50/p95 는 60 표본의 분위수라 1/600 사건을 구조적으로 못 본다. 똑같은
+/// 실수를 한 번 했다 -- 초당 0.3 회 사건을 초당 1 표본으로 쪽다가 음성 결론을 냈다
+/// (설계 문서 §6-4).
+///
+/// 읽는 법:
+///
+/// * `c2s` -- 그 패스의 마지막 커밋이 이 합성 시작보다 얼마나 앞선나. ★작을수록
+///   마감을 스친 것★이고, 음수면 합성이 시작된 뒤에 커밋했다는 뜻이다.
+/// * `t2c` -- 그 패스의 틱→마지막커밋. `prev` 와 비교해 ★갑작스러운 튜인지
+///   원래 길었는지★를 가른다.
+/// * `commits` -- 그 패스가 낸 커밋 수. ★4 미만이면 타일이 건너뛰었다★(`skipped_busy`).
+/// * `outstanding` -- 그 프레임에서 DWM 의 큐에 쌓여 있던 present 수.
+///
+/// 패스를 못 찾으면(링이 비었거나 링보다 오래된 프레임) `pass=none` 으로 찍는다 --
+/// 그런 놓침이 있었다는 사실 자체는 남아야 한다.
+fn emit_missevent(
+    frame_id: u64,
+    name: Option<&str>,
+    frame: &crate::comp_stats::FrameSample,
+    target: &crate::comp_stats::TargetSample,
+    freq: u64,
+) {
+    let to_ms = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
+    let out = name.unwrap_or("?");
+    let outstanding = target.outstanding_presents;
+    match pass_before(frame.start_time, freq) {
+        Some((mark, prev)) => {
+            let c2s = to_ms(frame.start_time as i128 - mark.last_commit_qpc as i128);
+            let t2c = to_ms(mark.last_commit_qpc as i128 - mark.tick_qpc as i128);
+            let span = to_ms(mark.last_commit_qpc as i128 - mark.first_commit_qpc as i128);
+            let prev = prev
+                .iter()
+                .map(|v| format!("{v:.2}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(
+                "MISSEVENT fid={frame_id} out={out} outstanding={outstanding}                  c2s_ms={c2s:.2} t2c_ms={t2c:.2} span_ms={span:.2} commits={}                  prev_t2c=[{prev}]",
+                mark.commits,
+            );
+        },
+        None => {
+            warn!("MISSEVENT fid={frame_id} out={out} outstanding={outstanding} pass=none");
+        },
     }
 }
 
