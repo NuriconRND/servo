@@ -395,6 +395,10 @@ struct ClockStats {
     /// ***평균이 아니라 분포를 낸다.*** 끊김은 정의상 꼬리에만 있고, 균일한 57fps 와
     /// "60,60,60,20,60" 은 평균이 같다. 이 표본이 성공 기준 1 그 자체다.
     gaps_ms: Vec<f64>,
+    /// 틱이 격자점에서 얼마나 늦게 떨어졌나(ms). ★페이싱 스레드의 깨어남 정확도★만
+    /// 재는 값이다 -- 패스 길이는 여기 들어오지 않고 `TICKCOMMIT` 이 받는다. 둘을
+    /// 나눔어야 `commit_lead_ms` 의 산포가 어느 구간에서 왔는지 말할 수 있다.
+    tick_jitter_ms: Vec<f64>,
     last_render_at: Option<std::time::Instant>,
     /// `about_to_wait` 진입 횟수. ★루프가 큐를 다 비우고 잠들기 직전에만 도달한다★ --
     /// 이 값이 작으면 큐가 비지 않는다는 뜻이고, 그러면 `WaitUntil` 타이머가 박자를 쥐고
@@ -735,6 +739,17 @@ impl AppState {
         stats.ticks += 1;
     }
 
+    /// 틱이 격자점에서 얼마나 늦었나. 항상 ≥ 0 이다 -- 기한이 찼을 때만 불리므로.
+    ///
+    /// 긴 멈춤(디버거, 긴 렌더) 뒤에는 이 값이 크게 나온다. ★그대로 두고 중앙값으로
+    /// 읽는다★ -- 잘라 내면 바로 그 사건을 잃는다. p95 와 max 가 그것을 드러낸다.
+    fn note_tick_jitter(&self, jitter: std::time::Duration) {
+        self.clock_stats
+            .borrow_mut()
+            .tick_jitter_ms
+            .push(jitter.as_secs_f64() * 1000.0);
+    }
+
     /// winit 이 `RedrawRequested` 를 전달했다.
     fn note_tick_site(&self, site: ClockSite) {
         let mut stats = self.clock_stats.borrow_mut();
@@ -831,6 +846,16 @@ impl AppState {
             .iter()
             .filter(|g| **g < low || **g > high)
             .count();
+        // 틱 지터. ★비어 있으면 0 이 아니라 정보 없음이다★ -- 그렇게 찍히게 한다(n=0).
+        let mut jit = std::mem::take(&mut stats.tick_jitter_ms);
+        jit.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let jit_at = |p: f64| {
+            if jit.is_empty() {
+                f64::NAN
+            } else {
+                jit[(((jit.len() - 1) as f64) * p).round() as usize]
+            }
+        };
         let off_pct = if stats.gaps_ms.is_empty() {
             0.0
         } else {
@@ -841,7 +866,7 @@ impl AppState {
             "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} \
              atw={} tick_by atw={} user={} win={} pace={} \
              per_interval dup={} one={} skip1={} skipN={} \
-             period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}",
+             period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}              jit_ms p50={:.3} p95={:.3} max={:.3} jn={}",
             window_ms,
             stats.ticks,
             stats.redraw,
@@ -864,6 +889,10 @@ impl AppState {
             off,
             off_pct,
             stats.gaps_ms.len(),
+            jit_at(0.50),
+            jit_at(0.95),
+            jit_at(1.00),
+            jit.len(),
         );
 
         let last_render_at = stats.last_render_at;
@@ -1152,6 +1181,10 @@ impl AppState {
             // stall (a long render, a debugger break) `next` can be far in the past, and
             // stepping by one period would fire a burst of catch-up frames for moments that
             // have already gone by. Skipping them is what a display does.
+            // ★이 틱이 맞춰야 했던 격자점★ -- 덮어쓰기 전에 받아 둔다. 지금과의 차가
+            // 페이싱이 얼마나 제때 깨었는가다(`WALLCLOCK jit_ms`). 패스 길이에서 오는
+            // 흔들림(`TICKCOMMIT`)과 분리해야 커밋 위상의 산포를 귀속할 수 있다.
+            let fired_for = next;
             while next <= now {
                 next += self.present_period;
             }
@@ -1163,6 +1196,7 @@ impl AppState {
                 self.clock_stats.borrow_mut().backstop += 1;
             }
             self.note_present_tick();
+            self.note_tick_jitter(now.saturating_duration_since(fired_for));
             self.note_tick_site(site);
             self.fire_present_tick();
         }
@@ -1187,6 +1221,10 @@ impl AppState {
     /// `redraw` 계수도 같이 올린다 -- `WALLCLOCK` 의 `ticks == redraw == renders` 검산이
     /// 두 경로에서 같은 뜻을 유지해야 한다.
     fn fire_present_tick(&self) {
+        // ★틱의 시각을 paint 쪽에 남긴다.★ 커밋은 저쪽에서 나가므로, 두 시각의 차를
+        // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
+        // 지나므로 한 자리면 충분하다.★
+        servo::note_present_tick();
         if self.direct_render {
             self.note_redraw_requested();
             self.charge_main(MainSlot::Render, || self.render_all_tiles());

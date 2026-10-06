@@ -490,6 +490,94 @@ pub(crate) fn note_commit_at(device: usize) {
     if let Ok(mut guard) = COMMITS.lock() {
         guard.get_or_insert_with(HashMap::new).insert(device, now);
     }
+    note_tick_to_commit(device, now);
+}
+
+/// ★이 틱이 난 시각(QPC).★ 셸이 `render_all_tiles` 를 부르기 **직전**에 찍는다.
+///
+/// 커밋 위상이 흔들리는 원인을 가르려고 둔다. 체인은 셋으로 쫪어진다:
+///
+/// ```text
+/// 격자점 --tick_jitter--> 실제 틱 --tick_to_commit--> 커밋 --commit_lead--> 합성
+///        (페이싱 깨어남)        (패스 길이)          (이미 있던 값)
+/// ```
+///
+/// ★가운데 구간만 측정이 없었다.★ `commit_lead_ms` 의 산포(p50-p05 = 0.63ms)가 패스
+/// 길이에서 오는지 페이싱 스레드의 깨어남에서 오는지 구별할 수가 없었고, 그 구별이
+/// "커밋을 패스 끝에서 떼어낼 가치가 있나" 를 결정한다.
+static TICK_QPC: AtomicU64 = AtomicU64::new(0);
+
+/// 셸이 표출 틱을 낼 때 부른다. ★틱마다 한 번★ -- 타일마다가 아니다.
+pub(crate) fn note_present_tick_now() {
+    if let Some(now) = qpc_now() {
+        TICK_QPC.store(now, Ordering::Relaxed);
+    }
+}
+
+/// 디바이스 -> 이번 창의 `틱 -> 커밋` 표본(ms). `TICKCOMMIT` 이 초당 비운다.
+static TICK_TO_COMMIT: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
+
+fn note_tick_to_commit(device: usize, commit_qpc: u64) {
+    let tick = TICK_QPC.load(Ordering::Relaxed);
+    // 기동 직후에는 아직 틱이 없다. 그리고 커밋이 틱보다 앞설 수는 없으므로, 그런 표본은
+    // 틱을 놓친 것이니 세지 않는다 -- 음수를 0 으로 접으면 분포가 조용히 거짓말을 한다.
+    if tick == 0 || commit_qpc <= tick {
+        return;
+    }
+    let Some(freq) = qpc_frequency() else { return };
+    let ms = (commit_qpc - tick) as f64 * 1000.0 / freq as f64;
+    if let Ok(mut guard) = TICK_TO_COMMIT.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(device)
+            .or_default()
+            .push(ms);
+    }
+}
+
+/// ★패스가 커밋 위상을 얼마나 미는가.★
+///
+/// 읽는 법: `spread`(p95-p05)를 같은 창의 `DCOMPSTAT commit_lead_ms` 의 산포와 견준다.
+/// 두 값이 같은 크기면 커밋 위상의 흔들림은 **패스 길이**에서 오는 것이고, 그러면 커밋을
+/// 패스 끝에서 떼어낼(= `commit_scheduler` 를 공통 격자에 겨름) 이유가 선다. 훨씬 작으면
+/// 원인은 그 앞 구간(페이싱 깨어남)이고, `WALLCLOCK jit_ms` 가 그것을 받는다.
+///
+/// `late` 는 커밋이 반 주기(P/2)보다 늦게 나간 횟수다 -- 그 프레임은 겨냥한 위상에서
+/// 통째로 벗어났다. 이 수가 `COMPREFRESH` 의 `d0-d2` 와 함께 움직이는지가 인과의 방향을
+/// 가른다(관측만으로는 못 가리던 바로 그것이다). DWM 주기를 못 구하면 `late=-1`.
+fn emit_tickcommit() {
+    let samples: Vec<(usize, Vec<f64>)> = match TICK_TO_COMMIT.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    // 반 주기. ★측정된 DWM 주기에서 가져온다★ -- 60Hz 를 상수로 박으면 주사율 변경
+    // 테스트에서 조용히 틀린 값을 낸다(`assumed_period` 가 같은 함정을 이미 한 번 놓았다).
+    let half_period_ms = crate::dcomp_compositor::composition_grid()
+        .zip(qpc_frequency())
+        .map(|((_, period), freq)| period as f64 * 500.0 / freq as f64);
+    for (device, mut t2c) in samples {
+        if t2c.is_empty() {
+            continue;
+        }
+        t2c.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |p: f64| t2c[(((t2c.len() - 1) as f64) * p).round() as usize];
+        let late = match half_period_ms {
+            Some(half) => t2c.iter().filter(|&&v| v >= half).count() as i64,
+            None => -1,
+        };
+        warn!(
+            "TICKCOMMIT device={device:#x} n={} t2c_ms p05={:.2} p50={:.2} p95={:.2}              max={:.2} spread={:.2} late={late}",
+            t2c.len(),
+            at(0.05),
+            at(0.50),
+            at(0.95),
+            at(1.00),
+            at(0.95) - at(0.05),
+        );
+    }
 }
 
 fn commit_at(device: usize) -> Option<u64> {
@@ -1079,6 +1167,7 @@ fn probe_loop() {
             emit_comp_stats(&current.outputs, freq, &mut last_comp_frame_id);
             emit_samplelead();
             emit_sampleslip();
+            emit_tickcommit();
             emit_frameid();
             emit_dcompstat();
         }

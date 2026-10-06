@@ -48,6 +48,18 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
     }
 }
 
+/// ★표출 틱을 냈다고 알린다.★ 셸이 그리는 사람을 부르기 **직전**에 틱마다 한 번 부른다.
+///
+/// 재려는 것은 `틱 -> 커밋` 이다. 커밋은 렌더 패스의 **끝**에서 나가므로, 패스 길이가
+/// 흔들리면 커밋 위상이 1:1 로 흔들린다. 그 몫을 분리해야 `commit_lead_ms` 의 산포가
+/// 어디서 오는지 가린다 -- 자세한 것은 `output_grid::TICK_QPC`.
+///
+/// 틱을 안 찍어도 동작은 같다. 그때 `TICKCOMMIT` 줄이 안 나올 뿐이다.
+pub fn note_present_tick() {
+    #[cfg(windows)]
+    crate::output_grid::note_present_tick_now();
+}
+
 #[macro_use]
 mod tracing;
 
