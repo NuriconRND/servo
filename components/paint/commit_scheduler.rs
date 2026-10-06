@@ -259,6 +259,33 @@ const MAX_RETRIES: u32 = 8;
 /// 재시도 간격. 서피스가 닫히기를 기다리는 것이므로 짧아야 하지만, 0 이면 바쁜 대기가 된다.
 const RETRY_DELAY_US: u64 = 1_000;
 
+/// ★마감 직전 이만큼은 자지 않고 돈다(µs).★
+///
+/// `condvar.wait_timeout` 은 Windows 에서 고해상도 타이머를 쓰지 않는다 -- 페이싱 스레드가
+/// `std::thread::sleep` 으로 얻는 것(Win10 1803+ 의 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`)을
+/// 이쪽은 못 얻는다. 실측에서 `slip_us_avg` 가 756~1045µs 였고, ★그것이 커밋 위상 산포
+/// (0.62~1.39ms)와 같은 크기였다★ -- B3 가 "커밋을 격자 고정점에 앉힌다" 는 주장을 못 지킨
+/// 이유가 이것이다(log_ani_debug_03/10). 마감은 정확했고 그것을 집행하는 스레드가 늦었다.
+///
+/// 2ms 는 관측된 평균 슬립(~1ms)의 두 배다. 깨어남이 그 안으로 들어오면 남은 구간을 돌아
+/// 메운다. 평균 스핀은 `2ms − 실제 슬립` ≈ 1ms 이고 초당 네 번(타일당 한 번)이므로 코어
+/// 하나의 ~6% 다. 메인 스레드가 `Poll` 로 코어 하나를 통째로 태우는 것에 비하면 작다.
+const SPIN_MARGIN_US: u64 = 2_000;
+
+/// 가장 이른 마감까지 `remaining` 틱 남았을 때 **얼마나 잘 것인가**.
+///
+/// `Some(ticks)` = 그만큼 자고 다시 본다. `None` = ★자지 말고 돌라★ -- 마감이 마진 안에
+/// 들어왔거나 이미 지났다.
+///
+/// 순수 함수로 떼어 둔 이유: 이 결정이 커밋 위상 정확도를 그대로 정하는데, 스케줄러 루프
+/// 안에서는 시계·뮤텍스·condvar 없이 확인할 방법이 없다.
+fn wait_slice(remaining: u64, margin: u64) -> Option<u64> {
+    if remaining <= margin {
+        return None;
+    }
+    Some(remaining - margin)
+}
+
 /// 디바이스마다 하나. ★프로세스 수명으로 누수시킨다★ -- 디바이스는 넷이고 프로세스 내내
 /// 살므로 실질적으로 정적 할당이다. `Arc` + 수명 늘리기를 쓰면 가드와 소유권의 드롭 순서에
 /// 정확성이 매달리는데, 여기서는 타입이 스스로 옳다.
@@ -421,17 +448,35 @@ fn scheduler_loop(shared: &Arc<Shared>) {
                     break ready;
                 }
                 // 가장 이른 마감까지 잔다. 큐가 비면 알림을 기다린다.
-                let wait = queue.iter().map(|&(d, _, _)| d).min().map(|d| {
-                    let ticks = d.saturating_sub(now);
-                    std::time::Duration::from_secs_f64(ticks as f64 / freq as f64)
-                });
-                queue = match wait {
-                    Some(duration) => {
-                        shared
-                            .condvar
-                            .wait_timeout(queue, duration)
-                            .unwrap_or_else(|e| e.into_inner())
-                            .0
+                let earliest = queue.iter().map(|&(d, _, _)| d).min();
+                let margin = freq.saturating_mul(SPIN_MARGIN_US) / 1_000_000;
+                queue = match earliest {
+                    Some(deadline) => {
+                        let remaining = deadline.saturating_sub(now);
+                        match wait_slice(remaining, margin) {
+                            // 멀다 -- 마진만큼 일찍 깨도록 자고 다시 본다.
+                            Some(ticks) => {
+                                shared
+                                    .condvar
+                                    .wait_timeout(
+                                        queue,
+                                        std::time::Duration::from_secs_f64(
+                                            ticks as f64 / freq as f64,
+                                        ),
+                                    )
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .0
+                            },
+                            // ★마지막 구간은 락을 놓고 돈다.★ 자면 그만큼 늦는다
+                            // (`SPIN_MARGIN_US` 주석). 락을 쥐고 돌면 `schedule()` 이 막힌다.
+                            None => {
+                                drop(queue);
+                                while qpc_now().is_some_and(|t| t < deadline) {
+                                    std::hint::spin_loop();
+                                }
+                                shared.queue.lock().unwrap_or_else(|e| e.into_inner())
+                            },
+                        }
                     },
                     None => shared
                         .condvar
@@ -635,7 +680,7 @@ fn upsert(queue: &mut Vec<(u64, usize, usize)>, device: usize, monitor: usize, d
 
 #[cfg(test)]
 mod tests {
-    use super::{GuardRole, record_lock_wait, take_stats, upsert};
+    use super::{GuardRole, record_lock_wait, take_stats, upsert, wait_slice};
 
     /// ★두 역할이 같은 통에 들어가면 Task 6 의 기준 4 가 무의미해진다.★ 기준 4 는 "콘텐츠
     /// 쪽이 스케줄러의 커밋 하나를 기다린 시간 < 100µs" 를 묻는데, 스케줄러가 페인터의
@@ -715,5 +760,40 @@ mod tests {
         upsert(&mut queue, 0xAA, 0x11, 100);
         queue.sort();
         assert_eq!(queue, vec![(100, 0xAA, 0x11), (250, 0xBB, 0x22)]);
+    }
+
+    /// 10MHz QPC 에서 2ms 마진 = 20_000 틱.
+    const MARGIN: u64 = 20_000;
+
+    /// 마감이 멀면 **마진만큼 일찍** 깨도록 기다린다 -- 그 차이를 스핀이 메운다.
+    #[test]
+    fn a_distant_deadline_waits_until_one_margin_before_it() {
+        assert_eq!(wait_slice(100_000, MARGIN), Some(80_000));
+    }
+
+    /// ★마감이 마진 안에 들어오면 기다리지 않는다 -- 스핀 구간이다.★
+    ///
+    /// `condvar.wait_timeout` 의 깨어남 입자가 ~1ms 라, 남은 시간이 그 정도면 자는 것이 곧
+    /// 늦는 것이다. 실측 `slip_us_avg` 가 756~1045us 였고 그것이 커밋 위상 산포(0.62~1.39ms)와
+    /// 같은 크기였다 -- B3 가 주장을 못 지킨 이유가 이것이다(log_ani_debug_03/10).
+    #[test]
+    fn a_deadline_inside_the_margin_spins_instead_of_sleeping() {
+        assert_eq!(wait_slice(MARGIN, MARGIN), None);
+        assert_eq!(wait_slice(MARGIN - 1, MARGIN), None);
+        assert_eq!(wait_slice(1, MARGIN), None);
+    }
+
+    /// 이미 지난 마감도 자지 않는다. 한 바퀴 더 돌면 `ready` 가 집어낸다.
+    #[test]
+    fn a_past_deadline_does_not_sleep() {
+        assert_eq!(wait_slice(0, MARGIN), None);
+    }
+
+    /// 마진 0 은 예전 동작(전부 자기)으로 되돌린다 -- 회귀를 재볼 때 쓴다.
+    #[test]
+    fn a_zero_margin_restores_the_old_sleep_everything_behavior() {
+        assert_eq!(wait_slice(100_000, 0), Some(100_000));
+        assert_eq!(wait_slice(1, 0), Some(1));
+        assert_eq!(wait_slice(0, 0), None);
     }
 }
