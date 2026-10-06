@@ -2897,46 +2897,29 @@ impl Paint {
         });
     }
 
-    /// 이 모니터의 다음 목표 커밋 시각(QPC). 격자가 없거나 너무 묵었으면 `None` -- 호출자는
-    /// 즉시 커밋으로 폴백한다.
+    /// ★이 패스의 커밋이 떨어져야 할 격자점(절대 QPC).★
     ///
-    /// `deadline = vblank + k*period + target` 에서 `k` 는 마감이 미래가 되는 최소 정수다.
-    /// ★매번 측정된 vblank 로부터 다시 센다.★ 자유 구동 기준점에 상수를 더하면 기준점이 매
-    /// 실행 임의라 결과도 임의다(선행 설계 §5-10 의 교훈).
+    /// 커밋은 지금까지 렌더 패스의 **끝**에서 나갔다. `-DwmAlign` 이 고정하는 것은 패스의
+    /// **시작**(틱)이므로 커밋 시각 = `틱 + 패스 길이` 였고, 커밋 위상이 패스 길이를 그대로
+    /// 물려받았다. 그 산포가 저더의 두 증상을 모두 만든다 -- 큰 탈선은 합성 마감을 스치고
+    /// (`MISSEVENT nc=1`), 그 흔들림이 커밋 간격을 흔들어 합성 경계를 넘나든다(`nc=0`).
+    /// 설계 문서 §21~27 과 `2026-10-06-commit-on-composition-grid-design.md` §1.
+    ///
+    /// ★타일과 무관하다 -- 패스당 하나다.★ DWM 은 네 타일을 하나의 합성 패스에서 함께
+    /// 올리므로(네 디바이스의 `lastFrameTime` 이 동일하다) 맞출 격자도 하나다. 예전
+    /// `deadline_for_monitor` 는 출력별 격자에 맞췄고, 그것이 B1 이 효과를 내지 못한 이유다.
+    ///
+    /// 묵은 격자 검사가 없는 것이 맞다. `grid_for_monitor` 는 프로브 스레드의 캐시라 최대
+    /// ~100ms 낡을 수 있어 검사가 필요했지만, `composition_grid()` 는 매번 조회하는 시스템
+    /// 콜이라 묵을 수가 없다. 들고 가면 영원히 거짓인 분기가 남는다.
     #[cfg(windows)]
-    fn deadline_for_monitor(monitor: usize) -> Option<u64> {
-        // 캐시된 값이다 -- `pref!` 는 RwLock 획득이고 이 함수는 타일마다 매 프레임 돈다
+    fn commit_deadline() -> Option<u64> {
+        // 캐시된 값이다 -- `pref!` 는 RwLock 획득이고 이 함수는 패스마다 돌다
         // (`commit_scheduler::ALIGN_PCT` 주석).
         let pct = (*crate::commit_scheduler::ALIGN_PCT)?;
-        let grid = crate::output_grid::grid_for_monitor(monitor)?;
-        let now = crate::output_grid::qpc_now()?;
-        if grid.period_qpc == 0 {
-            return None;
-        }
-        // 격자가 60 주기(60Hz 면 1 초)보다 묵었으면 프로브가 정체한 것이다. 옛 격자로
-        // 스케줄하는 것보다 즉시 커밋이 낫다.
-        if now.saturating_sub(grid.vblank_qpc) > grid.period_qpc.saturating_mul(60) {
-            return None;
-        }
-        let target = grid.period_qpc * pct / 100;
-        let base = grid.vblank_qpc.wrapping_add(target);
-        // vblank 는 드라이버에 따라 직전일 수도 다음일 수도 있다. 나머지 연산을 두 번 걸어
-        // 어느 쪽이든 격자 위의 같은 점으로 접는다.
-        let period = grid.period_qpc as i128;
-        let delta = now as i128 - base as i128;
-        let ahead = period - (((delta % period) + period) % period);
-        // ★마감은 절대로 한 주기를 넘지 않는다.★ 여기 원래 "지금과 너무 가까우면 한 칸 뒤로"
-        // 가 있었다(`ahead < period/8` 이면 `+= period`). 스케줄러가 깨기도 전에 지나간 마감은
-        // 즉시 커밋이 되어 정렬이 무의미해진다는 걱정이었는데, **그 걱정 자체가 틀렸다.**
-        // `ahead` 가 0 에 가깝다는 것은 지금이 이미 목표 위상이라는 뜻이므로, 그 자리에서
-        // 커밋하는 것이 곧 정렬된 커밋이다. 늦출 이유가 없다.
-        //
-        // 그리고 그 한 줄이 실기에서 타일 둘을 굶겼다(`log_ani_debug_02/03`, ani_debug_128).
-        // 마감을 프레임 간격(16.67ms)보다 멀리 밀어 두면 다음 스케줄이 먼저 도착하고, 그러면
-        // `upsert` 가 마감을 또 뒤로 민다. `ahead` 는 타일마다 거의 일정하므로 한 번 걸린
-        // 타일은 영원히 걸린다 -- DISPLAY22 는 초당 60 건을 스케줄하고 8 건만 커밋했다.
-        // `upsert` 의 `min` 이 되먹임을 끊고, 이 제거가 애초에 그 상황을 만들지 않는다.
-        Some(now.wrapping_add(ahead as u64))
+        let (vblank, period) = crate::dcomp_compositor::composition_grid()?;
+        let tick = crate::output_grid::tick_qpc()?;
+        crate::output_grid::next_grid_point(tick, vblank, period, pct)
     }
 
     /// 격자를 못 구해 즉시 커밋으로 떨어진 타일 수를 세고, 초당 한 번 알린다.
@@ -3036,6 +3019,10 @@ impl Paint {
             // 호출 스레드에서 순차로 나가 4×2.44 = 9.8ms 를 물었다. 폴백이 기능 off 보다
             // 나빠지는 셈이고, "폴백 = 오늘 동작" 이라는 전제가 깨진다.
             let mut fallback: Vec<usize> = Vec::new();
+            // ★마감은 패스당 하나다.★ 공통 격자에서 나오므로 타일마다 다시 셀 것이 없고,
+            // 네 타일이 **같은** 마감을 받아야 한 합성에 함께 실린다. 루프 안에서 재면
+            // 타일마다 조회 시각이 달라 미세하게 다른 답이 나온다.
+            let deadline = Self::commit_deadline();
             for painter_id in self.painter_ids() {
                 let pending = self
                     .with_painter(painter_id, |painter| {
@@ -3047,11 +3034,13 @@ impl Paint {
                 let Some((device, monitor)) = pending else {
                     continue;
                 };
-                match monitor.and_then(|m| Self::deadline_for_monitor(m).map(|d| (m, d))) {
-                    Some((monitor, deadline)) => {
+                // `monitor` 는 이제 마감 계산에 쓰이지 않는다 -- `OUTCOMMIT` 이 "어느 타일이
+                // 죽었나" 를 말할 수 있게 하는 기록용으로만 스케줄러에 넘긴다.
+                match (monitor, deadline) {
+                    (Some(monitor), Some(deadline)) => {
                         crate::commit_scheduler::schedule(device, monitor, deadline)
                     },
-                    None => fallback.push(device),
+                    _ => fallback.push(device),
                 }
             }
             if !fallback.is_empty() {
