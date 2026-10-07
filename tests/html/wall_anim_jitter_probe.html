@@ -109,7 +109,14 @@
                          width: 2px; height: auto; }
   /* ★둘을 한 규칙으로 묶는다.★ 같은 선언이면 같은 순간에 시작하므로 위상이 맞는다 --
      따로 쓰면 규칙 적용 시점이 갈려 거울상이 어긋날 수 있다. */
-  #cssMover, #cssMover2 { color: #fa4; animation: slide var(--dur) linear infinite; }
+  /* ★`alternate` 다 -- `infinite` 단방향이 아니다.★ 단방향은 한 바퀴 끝에서 레이어가
+     이동폭(9,216px)만큼 **되돌아 점프**하고, 그 프레임에 그 레이어가 떠난 영역과 착지한
+     영역이 모두 무효화된다. 실측에서 그 프레임의 패스가 24.3~24.6ms(한 주기의 1.46 배)로
+     세 실행 모두 같았고, 64 초마다(= `DURATION_MS * 16`, 가장 느린 행의 한 바퀴) 났다
+     (log_ani_debug_03/16). 착지점이 `translateX(0)` 이라 왼쪽 열(타일 0·2)만 걸렸다.
+     ★프로브가 스스로 만든 저더였다.★ 왕복으로 바꾸면 끝에서 방향만 바뀌므로 점프가 없고,
+     등속 판정은 그대로 성립한다. */
+  #cssMover, #cssMover2 { color: #fa4; animation: slide var(--dur) linear infinite alternate; }
   @keyframes slide { from { transform: translateX(0); }
                      to   { transform: translateX(var(--travel)); } }
   /* 눈금자: 등속이면 눈금 통과 간격이 일정해야 한다. */
@@ -190,7 +197,14 @@ const handles = [];
 function runWaapi(el, durationMs) {
   return el.animate(
     [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
-    { duration: durationMs, iterations: Infinity, easing: 'linear' }
+    // ★`alternate` 다★ -- 이유는 `#cssMover` 의 CSS 주석에 있다(단방향 랩의 점프가
+    // 그 프레임을 24ms 로 만든다).
+    {
+      duration: durationMs,
+      iterations: Infinity,
+      direction: 'alternate',
+      easing: 'linear',
+    }
   );
 }
 
