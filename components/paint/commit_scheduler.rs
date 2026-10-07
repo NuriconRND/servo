@@ -86,6 +86,11 @@ pub(crate) struct SchedulerStats {
     pub immediate: u64,
     /// 마감보다 늦게 커밋한 시간. 크면 스케줄러가 병목이다.
     pub slip_n: u64,
+    /// 스케줄러가 마감에서 깨어난 지연. `slip_*` 와 달리 **배분 전**에 배치당 한 번 잰다
+    /// (`WAKE_N` 주석). 둘이 갈라지면 원인이 배분이다.
+    pub wake_n: u64,
+    pub wake_us_max: u64,
+    pub wake_us_sum: u64,
     pub slip_us_max: u64,
     pub slip_us_sum: u64,
     /// 콘텐츠 쪽이 디바이스 뮤텍스를 기다린 시간. ★Task 6 기준 4 가 읽어야 하는 것이
@@ -118,6 +123,81 @@ struct Shared {
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
+/// 커밋 하나를 맡는 상주 워커의 손잡이.
+struct CommitWorker {
+    jobs: std::sync::mpsc::Sender<(u64, usize, usize)>,
+}
+
+/// ★상주 워커 풀.★ 패스마다 스레드를 만들지 않는다.
+///
+/// 처음에는 `std::thread::scope` 로 패스마다 넷을 띄웠다. 그게 동작은 했지만 OS 스레드 생성이
+/// 건당 수십~수백 µs 라 초당 240 개를 만들고 있었고, `slip` 을 워커 **안에서** 재므로 그
+/// 생성 지연이 그대로 slip 에 들어갔다 -- 스핀·병렬화를 다 넣고도 `slip_us_avg` 가 335µs 에서
+/// 멈춘 것이 그 설명과 크기가 맞았다(4 × ~80µs). 그리고 측정만이 아니라 ★실제 커밋도 그만큼
+/// 늦었다★.
+///
+/// 워커는 지연 생성되고 필요한 수만큼 늘어난다(타일 수 = 디바이스 수가 상한이다). 한 번
+/// 만들면 프로세스 수명 동안 산다 -- 벽은 타일 수가 고정이고, 종료는 프로세스 종료다.
+static WORKERS: Mutex<Vec<CommitWorker>> = Mutex::new(Vec::new());
+/// 워커가 커밋을 마쳤다고 알리는 통로. `(device, monitor, hr)`.
+static DONE: OnceLock<(
+    std::sync::mpsc::Sender<(usize, usize, i32)>,
+    Mutex<std::sync::mpsc::Receiver<(usize, usize, i32)>>,
+)> = OnceLock::new();
+
+/// 워커 하나가 도는 몸통. 받은 디바이스를 커밋하고 결과를 돌려준다.
+///
+/// ★여기서 하는 일은 `Commit()` 하나와 그 직전의 slip 측정뿐이다.★ 재시도·통계·
+/// `note_dwm_phase` 는 스케줄러 스레드가 결과를 모아 순차로 한다 -- 그것들은 공유 상태를
+/// 만지므로 병렬로 돌면 이 파일이 지켜 온 규칙이 무너진다.
+fn worker_loop(
+    jobs: std::sync::mpsc::Receiver<(u64, usize, usize)>,
+    done: std::sync::mpsc::Sender<(usize, usize, i32)>,
+    freq: u64,
+) {
+    for (deadline, device, monitor) in jobs {
+        if let Some(now) = qpc_now() {
+            let us = now.saturating_sub(deadline).saturating_mul(1_000_000) / freq.max(1);
+            SLIP_N.fetch_add(1, Ordering::Relaxed);
+            SLIP_SUM.fetch_add(us, Ordering::Relaxed);
+            SLIP_MAX.fetch_max(us, Ordering::Relaxed);
+        }
+        let hr = {
+            let _guard = device_guard(device, GuardRole::Scheduler);
+            crate::dcomp_compositor::commit_device_ptr_locked(device)
+        };
+        if done.send((device, monitor, hr)).is_err() {
+            return;
+        }
+    }
+}
+
+/// 워커가 `want` 개 있도록 보장한다. 돌려주는 것은 실제로 쓸 수 있는 수다.
+fn ensure_workers(want: usize, freq: u64) -> usize {
+    let (done_tx, _) = DONE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (tx, Mutex::new(rx))
+    });
+    let Ok(mut workers) = WORKERS.lock() else {
+        return 0;
+    };
+    while workers.len() < want {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = done_tx.clone();
+        match std::thread::Builder::new()
+            .name(format!("DcompCommit{}", workers.len()))
+            .spawn(move || worker_loop(rx, done, freq))
+        {
+            Ok(_) => workers.push(CommitWorker { jobs: tx }),
+            Err(error) => {
+                warn!("[commitsched] 커밋 워커를 띄우지 못했다: {error}; 그만큼 순차로 낸다");
+                break;
+            },
+        }
+    }
+    workers.len()
+}
+
 static SCHEDULED: AtomicU64 = AtomicU64::new(0);
 static IMMEDIATE: AtomicU64 = AtomicU64::new(0);
 static FAILED: AtomicU64 = AtomicU64::new(0);
@@ -126,6 +206,18 @@ static EARLY: AtomicU64 = AtomicU64::new(0);
 static SLIP_N: AtomicU64 = AtomicU64::new(0);
 static SLIP_MAX: AtomicU64 = AtomicU64::new(0);
 static SLIP_SUM: AtomicU64 = AtomicU64::new(0);
+/// ★스케줄러가 마감에서 얼마나 늦게 깨어났나(µs).★ `SLIP_*` 와 **다른 것을 재므로** 따로 둔다.
+///
+/// `SLIP_*` 는 각 디바이스의 `Commit()` 직전에 재므로 깨어남 지연 **더하기** 그 커밋까지의
+/// 배분 비용이다. 이것은 깨어난 직후 스케줄러 스레드에서 배치당 한 번 잰다. 둘이 갈라지면
+/// 원인이 배분이고, 같이 크면 대기 쪽이다.
+///
+/// 왜 필요했나: 스핀과 병렬 커밋을 넣고도 `slip_us_avg` 가 335µs 에서 멈췄는데, 그것이
+/// 깨어남인지 `std::thread::scope` 의 스레드 생성(패스마다 4 개, 초당 240 개)인지 구별할
+/// 수단이 없었다. 이제 갈린다.
+static WAKE_N: AtomicU64 = AtomicU64::new(0);
+static WAKE_MAX: AtomicU64 = AtomicU64::new(0);
+static WAKE_SUM: AtomicU64 = AtomicU64::new(0);
 static LOCK_PAINTER_N: AtomicU64 = AtomicU64::new(0);
 static LOCK_PAINTER_MAX: AtomicU64 = AtomicU64::new(0);
 static LOCK_PAINTER_SUM: AtomicU64 = AtomicU64::new(0);
@@ -414,6 +506,9 @@ fn take_stats() -> SchedulerStats {
         scheduled: SCHEDULED.swap(0, Ordering::Relaxed),
         immediate: IMMEDIATE.swap(0, Ordering::Relaxed),
         slip_n: SLIP_N.swap(0, Ordering::Relaxed),
+        wake_n: WAKE_N.swap(0, Ordering::Relaxed),
+        wake_us_max: WAKE_MAX.swap(0, Ordering::Relaxed),
+        wake_us_sum: WAKE_SUM.swap(0, Ordering::Relaxed),
         slip_us_max: SLIP_MAX.swap(0, Ordering::Relaxed),
         slip_us_sum: SLIP_SUM.swap(0, Ordering::Relaxed),
         lock_painter_n: LOCK_PAINTER_N.swap(0, Ordering::Relaxed),
@@ -504,21 +599,65 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             }
         };
 
-        // ★`Commit()` 넷을 겹쳐서 낸다.★ 네 타일이 같은 마감을 받으므로 차례로 내면
-        // 2·3·4 번째가 앞 타일들의 커밋 시간만큼 늦는다 -- 그것이 깨끗한 구간에서도 남아
-        // 있던 상수 360µs 였다(`PARALLEL_COMMIT` 주석).
+        // ★깨어난 직후, 배분 **전**에 찍는다.★ 이것이 순수한 깨어남 지연이다.
+        // `SLIP_*` 는 각 커밋 직전에 재므로 배분 비용까지 포함한다 -- 둘이 갈라지면 원인이
+        // 배분이고, 같이 크면 대기 쪽이다(`WAKE_*` 주석).
+        // ★최소 마감으로 잰다.★ `due` 는 큐 순서라 `first()` 가 임의이고, 재시도로 다시 걸린
+        // 항목은 마감이 `now + 1ms` 라 그것이 잡히면 지연이 0 으로 과소 측정된다. 대기가
+        // 겨냥한 것은 가장 이른 마감이다.
+        if let Some(now) = qpc_now()
+            && let Some(deadline) = due.iter().map(|&(d, _, _)| d).min()
+        {
+            let us = now.saturating_sub(deadline).saturating_mul(1_000_000) / freq.max(1);
+            WAKE_N.fetch_add(1, Ordering::Relaxed);
+            WAKE_SUM.fetch_add(us, Ordering::Relaxed);
+            WAKE_MAX.fetch_max(us, Ordering::Relaxed);
+        }
+
+        // ★`Commit()` 넷을 상주 워커로 겹쳐서 낸다.★ 네 타일이 같은 마감을 받으므로 차례로
+        // 내면 2·3·4 번째가 앞 타일들의 커밋 시간만큼 늦는다. 패스마다 스레드를 만들지
+        // 않는 이유는 `WORKERS` 주석에 있다(생성 지연이 그대로 커밋을 늦췄다).
         //
         // ★겹치는 것은 `Commit()` 하나뿐이다.★ 재시도는 `shared.queue` 를 다시 잡고,
         // `note_dwm_phase` 는 전역 뮤텍스와 DWM 조회를 품고, 통계는 초당 한 번 I/O 를 한다 --
-        // 그것들을 스레드로 흩으면 이 파일이 지켜 온 "임계구역은 `Commit()` 한 줄" 규칙이
-        // 무너진다. 그래서 커밋만 병렬로 내고 결과를 모아 **순차로** 뒷일을 한다.
-        //
-        // slip 은 각 디바이스가 **자기 커밋 직전에** 잰다. 그래야 "이 커밋이 마감에서 얼마나
-        // 늦었나" 이고, 앞 타일의 비용이 섞이지 않는다.
-        let commit_one = |deadline: u64, device: usize, monitor: usize| {
+        // 그것들을 스레드로 흩으면 "임계구역은 `Commit()` 한 줄" 규칙이 무너진다. 커밋만
+        // 워커에 맡기고 결과를 모아 **순차로** 뒷일을 한다.
+        let parallel = due.len() > 1 && *PARALLEL_COMMIT;
+        let dispatched = if parallel {
+            let available = ensure_workers(due.len(), freq);
+            let n = available.min(due.len());
+            if let Ok(workers) = WORKERS.lock() {
+                let mut sent = 0;
+                for (index, &job) in due.iter().take(n).enumerate() {
+                    if workers[index].jobs.send(job).is_ok() {
+                        sent += 1;
+                    }
+                }
+                sent
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let mut committed: Vec<(usize, usize, i32)> = Vec::with_capacity(due.len());
+        // 워커에 보낸 것들을 거둔다. ★보낸 수만큼만 받는다★ -- 더 기다리면 영원히 멈춘다.
+        if dispatched > 0
+            && let Some((_, rx)) = DONE.get()
+            && let Ok(rx) = rx.lock()
+        {
+            for _ in 0..dispatched {
+                match rx.recv() {
+                    Ok(result) => committed.push(result),
+                    // 워커가 죽었다. 남은 것은 아래에서 이 스레드가 직접 낸다.
+                    Err(_) => break,
+                }
+            }
+        }
+        // 워커에 못 보낸 것(병렬 off, 워커 생성 실패, 채널 닫힘)은 여기서 직접 낸다.
+        for &(deadline, device, monitor) in due.iter().skip(committed.len().max(dispatched)) {
             if let Some(now) = qpc_now() {
-                let slip = now.saturating_sub(deadline);
-                let us = slip.saturating_mul(1_000_000) / freq.max(1);
+                let us = now.saturating_sub(deadline).saturating_mul(1_000_000) / freq.max(1);
                 SLIP_N.fetch_add(1, Ordering::Relaxed);
                 SLIP_SUM.fetch_add(us, Ordering::Relaxed);
                 SLIP_MAX.fetch_max(us, Ordering::Relaxed);
@@ -527,26 +666,8 @@ fn scheduler_loop(shared: &Arc<Shared>) {
                 let _guard = device_guard(device, GuardRole::Scheduler);
                 crate::dcomp_compositor::commit_device_ptr_locked(device)
             };
-            (device, monitor, hr)
-        };
-        let committed: Vec<(usize, usize, i32)> = if due.len() > 1 && *PARALLEL_COMMIT {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = due
-                    .iter()
-                    .map(|&(deadline, device, monitor)| {
-                        scope.spawn(move || commit_one(deadline, device, monitor))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("커밋 스레드가 패닉했다"))
-                    .collect()
-            })
-        } else {
-            due.iter()
-                .map(|&(deadline, device, monitor)| commit_one(deadline, device, monitor))
-                .collect()
-        };
+            committed.push((device, monitor, hr));
+        }
 
         for (device, monitor, hr) in committed {
             // ★가드는 `Commit()` 한 줄만 감싼다.★ 이 뮤텍스를 기다리는 상대(그 타일의
@@ -684,6 +805,7 @@ fn emit_outcommit() {
     warn!(
         "OUTCOMMIT total scheduled={} immediate={} failed={} retried={} early={} \
          slip_n={} slip_us_max={} slip_us_avg={} \
+         wake_n={} wake_us_max={} wake_us_avg={} \
          lock_wait_painter_n={} lock_wait_painter_us_max={} lock_wait_painter_us_avg={} \
          lock_wait_sched_n={} lock_wait_sched_us_max={} lock_wait_sched_us_avg={}",
         stats.scheduled,
@@ -694,6 +816,9 @@ fn emit_outcommit() {
         stats.slip_n,
         stats.slip_us_max,
         stats.slip_us_sum / stats.slip_n.max(1),
+        stats.wake_n,
+        stats.wake_us_max,
+        stats.wake_us_sum / stats.wake_n.max(1),
         stats.lock_painter_n,
         stats.lock_painter_us_max,
         stats.lock_painter_us_sum / stats.lock_painter_n.max(1),
