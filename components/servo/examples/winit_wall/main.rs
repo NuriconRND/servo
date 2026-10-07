@@ -506,6 +506,53 @@ impl AppState {
         skipped: u32,
         split: PassSplit,
     ) {
+        // ★긴 패스 하나를 그 자리에서 뽑는다.★
+        //
+        // 창 평균으로는 더 갈 수 없다. 실측에서 깨끗한 창과 더러운 창의 평균 패스가
+        // 1.20 대 1.28ms 로 사실상 같은데 **최대**가 4.80 대 12.77ms 였다
+        // (log_ani_debug_03/12 test_55) -- 창당 60 패스 중 하나가 튀고, 평균은 그것을 60 으로
+        // 나눠 지운다. `MISSEVENT` 를 만들 때와 같은 상황이다: 사건이 희박하면 평균이 아니라
+        // 사건을 봐야 한다.
+        //
+        // ★`-PresentCadence` 게이트보다 **앞**에 둔다.★ 그 플래그가 없으면 `WALLSPLIT`/
+        // `WALLPASS` 가 통째로 사라지고(log_ani_debug_03/14 가 그래서 패스 분해가 비었다)
+        // 이 줄까지 같이 없어진다. 꺼져 있을 때의 비용은 float 비교 하나다.
+        //
+        // 문턱 5ms 는 정상 패스(p50 1.2ms)의 네 배이고 한 주기(16.67ms)의 30% 다. 창당 0~2 줄
+        // 나온다. ★`tile_ms` 를 함께 찍는다★ -- 어느 타일이 먹었는지가 `join` 과 묶여야
+        // 읽히고, 그것이 "한 타일만 느리다" 와 "넷이 다 느리다" 를 가른다.
+        const PASS_EVENT_MS: f64 = 5.0;
+        if pass_ms >= PASS_EVENT_MS {
+            let outside = pass_ms
+                - split.make_current_ms
+                - split.paint_ms
+                - split.present_ms
+                - split.dispatch_ms
+                - split.join_ms
+                - split.flush_ms;
+            log::warn!(
+                "PASSEVENT pass_ms={pass_ms:.2} make_current={:.2} paint={:.2} present={:.2} \
+                 dispatch={:.2} join={:.2} flush={:.2} outside={outside:.2} skipped={skipped} \
+                 tile_ms=[{}] tile_queued_ms=[{}]",
+                split.make_current_ms,
+                split.paint_ms,
+                split.present_ms,
+                split.dispatch_ms,
+                split.join_ms,
+                split.flush_ms,
+                tile_ms
+                    .iter()
+                    .map(|ms| format!("{ms:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                tile_queued_ms
+                    .iter()
+                    .map(|ms| format!("{ms:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+
         // ***`string`, not `enabled`.*** This flag is `Kind::Str`, and `enabled` asserts the
         // flag is `Kind::Presence` -- calling it here panicked on startup. Same truthiness
         // test painter.rs uses for the same flag, and cached because this runs every pass.
@@ -517,6 +564,7 @@ impl AppState {
             return;
         }
         let now = std::time::Instant::now();
+
         let mut stats = self.pass_stats.borrow_mut();
         if stats.tile_ms_sum.len() != tile_ms.len() {
             stats.tile_ms_sum = vec![0.0; tile_ms.len()];
