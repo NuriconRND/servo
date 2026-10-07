@@ -3099,6 +3099,12 @@ impl Paint {
                 // 죽었나" 를 말할 수 있게 하는 기록용으로만 스케줄러에 넘긴다.
                 match (monitor, deadline) {
                     (Some(monitor), Some(deadline)) => {
+                        // ★이 커밋이 어느 패스의 것인지 남긴다.★ 마감이 다음 틱 가까이에
+                        // 있으면 커밋이 그 틱을 넘어가고, 그러면 `TICK_QPC` 로는 기준이
+                        // 뒤집힌다(`output_grid::COMMIT_TICK` 주석).
+                        if let Some(tick) = crate::output_grid::tick_qpc() {
+                            crate::output_grid::note_scheduled_for_tick(device, tick);
+                        }
                         crate::commit_scheduler::schedule(device, monitor, deadline)
                     },
                     _ => fallback.push(device),

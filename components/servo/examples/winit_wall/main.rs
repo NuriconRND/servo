@@ -1107,12 +1107,21 @@ fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
         // 어느 쪽이든 격자 위의 같은 점으로 접는다.
         let base = vblank_qpc as i128 + target;
         let delta = qpc_now as i128 - base;
-        let mut ahead = period - (((delta % period) + period) % period);
-        // 지금과 너무 가까우면(렌더를 시작할 틈이 없으면) 한 칸 뒤로 -- 그 칸을 놓치느니
-        // 다음 칸에 정확히 맞추는 것이 낫다. 이것이 없으면 0.5ms 뒤 틱이 잡혀 매번 늦는다.
-        if ahead < period / 8 {
-            ahead += period;
-        }
+        // ★"너무 가까우면 한 칸 뒤로" 가 여기 있었다 -- 치웠다.★
+        //
+        // 그 근거는 "렌더를 시작할 틈이 없으면 그 칸을 놓치느니 다음 칸에 정확히 맞춘다"
+        // 였고, 틈이 중요했던 이유는 **커밋이 패스 끝에서 나갔기 때문**이다. 틱이 격자점
+        // 직전에 잡히면 커밋도 그만큼 당겨져 위상이 어긋났다.
+        //
+        // B3 이후 커밋은 틱 위치와 무관하게 격자 고정점에서 나간다
+        // (`gfx_present_align_commit_pct`). 틱이 조금 일찍 잡히면 렌더가 그만큼 일찍
+        // 시작할 뿐이고, 커밋 위상은 그대로다. 논증이 성립하지 않는다.
+        //
+        // 그리고 실측에서 이 가드는 ★한 번도 걸리지 않았다★ -- 걸리면 그 틱 간격이 2 주기가
+        // 되어 `WALLCLOCK per_interval skip1` 에 잡히는데, log_ani_debug_03/12 의 두 실행
+        // 모두 `skip1=0` 이고 `ticks/s=60.0` 이었다. 그러니 이 제거는 동작을 바꾸지 않는다 --
+        // 죽은 근거를 치우는 것이다.
+        let ahead = period - (((delta % period) + period) % period);
     let wait_s = ahead as f64 / freq as f64;
     anchor + std::time::Duration::from_secs_f64(wait_s)
 }

@@ -613,11 +613,37 @@ pub(crate) fn next_grid_point(tick: u64, vblank: u64, period: u64, pct: u64) -> 
     Some(tick.wrapping_add(ahead as u64))
 }
 
+/// 디바이스 -> 그 디바이스의 커밋을 **스케줄한** 패스의 틱(QPC).
+///
+/// ★`TICK_QPC` 하나로는 기준이 뒤집힌다.★ 커밋이 마감에 맞춰 나가는데 그 마감이 다음 틱
+/// 바로 앞이면(`CommitAlign` 이 `DwmAlign` 보다 조금 앞설 때, slack 96% 같은 경우) 커밋이
+/// 다음 틱 직후로 밀리는 일이 상시로 생긴다. 그러면 `TICK_QPC` 는 이미 다음 틱이고, 같은
+/// 사건이 16.6ms(이전 틱 기준) 또는 0.15ms(다음 틱 기준)로 찍힌다 -- 실측에서 `t2c` 가
+/// 정확히 그 두 봉우리였다(log_ani_debug_03/12). 분포가 두 조각으로 갈라져 위상 지표로
+/// 쓸 수 없게 된다.
+///
+/// 그래서 **스케줄한 순간의** 틱을 디바이스마다 남겨 두고 커밋 때 그것을 쓴다. 즉시 커밋
+/// 경로(스케줄러 미사용, 격자 폴백, `flush_before_render`)는 패스 안에서 동기적으로 나가므로
+/// `TICK_QPC` 가 맞다 -- 그쪽은 이 맵에 항목이 없고 예전처럼 동작한다.
+static COMMIT_TICK: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// 이 디바이스의 커밋을 이 틱의 패스가 걸었다. 스케줄 직전에 부른다.
+pub(crate) fn note_scheduled_for_tick(device: usize, tick: u64) {
+    if let Ok(mut guard) = COMMIT_TICK.lock() {
+        guard.get_or_insert_with(HashMap::new).insert(device, tick);
+    }
+}
+
 /// 디바이스 -> 이번 창의 `틱 -> 커밋` 표본(ms). `TICKCOMMIT` 이 초당 비운다.
 static TICK_TO_COMMIT: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 
 fn note_tick_to_commit(device: usize, commit_qpc: u64) {
-    let tick = TICK_QPC.load(Ordering::Relaxed);
+    // ★스케줄한 패스의 틱을 쓴다★ -- 없으면(즉시 커밋 경로) 현재 틱이 맞다.
+    let scheduled = COMMIT_TICK
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(&device).copied()));
+    let tick = scheduled.unwrap_or_else(|| TICK_QPC.load(Ordering::Relaxed));
     // 기동 직후에는 아직 틱이 없다. 그리고 커밋이 틱보다 앞설 수는 없으므로, 그런 표본은
     // 틱을 놓친 것이니 세지 않는다 -- 음수를 0 으로 접으면 분포가 조용히 거짓말을 한다.
     if tick == 0 || commit_qpc <= tick {
