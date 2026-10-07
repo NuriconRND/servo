@@ -63,13 +63,24 @@
                                      (t_ms, x) 로, 프레임 수는 WRRATE 로 확인된다.
 -->
 <style>
-  :root { --dur: 4s; --travel: 80vw; --rowh: 12.5vh; }
+  /* ★`--span` 은 복제 간격이자 한 반복의 이동 거리다.★ 둘이 **같아야** 한 바퀴가
+     시각적으로 무해해진다 -- 복제 i 가 되돌아 점프하면 직전에 복제 i-1 이 있던 자리에
+     정확히 내려앉으므로, 화면은 점프 전후가 **동일**하다. 단방향 랩이 보이지 않는다.
+     (예전에는 한 행에 객체 하나가 80vw 를 가고 끝에서 되돌아 점프했다. 그 프레임의 패스가
+     24.3~24.6ms 로 세 실행 모두 같았고 64 초마다 났다 -- 프로브가 스스로 만든 저더였다.
+     log_ani_debug_03/16, 설계 문서 §37.)
+     50vw = 타일 한 폭이다. 한 행이 100vw 이므로 ★항상 두 개가 보인다★. */
+  :root { --dur: 2.5s; --span: 50vw; --rowh: 12.5vh; }
   html, body { margin: 0; background: #0b0b0b; color: #eee;
                font: 600 28px/1.4 "Consolas", monospace; overflow: hidden; }
   .row { position: absolute; left: 0; right: 0; height: var(--rowh);
          border-bottom: 1px solid #333; }
   .label { position: absolute; left: 8px; top: 4px; font-size: 20px; color: #7a7a7a; }
-  .mover { position: absolute; top: 3vh; left: 0; white-space: nowrap;
+  /* 복제들이 사는 자리. 행을 꽉 채우고 아무것도 그리지 않는다. */
+  .lane { position: absolute; left: 0; right: 0; top: 0; bottom: 0; }
+  /* `left` 는 복제마다 JS 가 넣는다(-50, 0, 50, 100vw). 네 복제가 50vw 간격의 빗이고
+     그 빗이 50vw 를 밀려 간 뒤 제자리로 돌아온다 -- 그래서 점프가 안 보인다. */
+  .mover { position: absolute; top: 3vh; white-space: nowrap;
            font-size: 5vh; color: #4af; will-change: transform; }
 
   /* ★아래 절반에도 같은 행을 거울상으로 둔다.★
@@ -107,22 +118,19 @@
                 background: #533; }
   .seam-guide.vertical { left: 50vw; right: auto; top: 0; bottom: 0;
                          width: 2px; height: auto; }
-  /* ★둘을 한 규칙으로 묶는다.★ 같은 선언이면 같은 순간에 시작하므로 위상이 맞는다 --
-     따로 쓰면 규칙 적용 시점이 갈려 거울상이 어긋날 수 있다. */
-  /* ★`alternate` 다 -- `infinite` 단방향이 아니다.★ 단방향은 한 바퀴 끝에서 레이어가
-     이동폭(9,216px)만큼 **되돌아 점프**하고, 그 프레임에 그 레이어가 떠난 영역과 착지한
-     영역이 모두 무효화된다. 실측에서 그 프레임의 패스가 24.3~24.6ms(한 주기의 1.46 배)로
-     세 실행 모두 같았고, 64 초마다(= `DURATION_MS * 16`, 가장 느린 행의 한 바퀴) 났다
-     (log_ani_debug_03/16). 착지점이 `translateX(0)` 이라 왼쪽 열(타일 0·2)만 걸렸다.
-     ★프로브가 스스로 만든 저더였다.★ 왕복으로 바꾸면 끝에서 방향만 바뀌므로 점프가 없고,
-     등속 판정은 그대로 성립한다. */
-  #cssMover, #cssMover2 { color: #fa4; animation: slide var(--dur) linear infinite alternate; }
+  /* ★CSS 행과 WAAPI 행이 **같은** 움직임을 해야 한다.★ 이 엔진의 `Element.animate` 는
+     `iterations`·`easing`·`duration`·`fill` 네 개만 읽는다(`element.rs` 의 `fn Animate`) --
+     `direction` 과 `delay` 는 받아도 **조용히 무시**된다. 그래서 `alternate` 를 쓰면 CSS 만
+     왕복하고 WAAPI 는 그대로 단방향이 되어 두 경로를 비교할 수 없다. 둘 다 쓰지 않는다.
+     한 규칙으로 묶는 것은 유지한다 -- 같은 선언이면 같은 순간에 시작하므로 거울상의 위상이
+     맞는다. */
+  .mover.css { color: #fa4; animation: slide var(--dur) linear infinite; }
   @keyframes slide { from { transform: translateX(0); }
-                     to   { transform: translateX(var(--travel)); } }
+                     to   { transform: translateX(var(--span)); } }
   /* 눈금자: 등속이면 눈금 통과 간격이 일정해야 한다. */
   .ruler { position: absolute; top: 0; left: 0; right: 0; height: 100%;
            background: repeating-linear-gradient(to right,
-             #222 0, #222 2px, transparent 2px, transparent calc(var(--travel) / 16)); }
+             #222 0, #222 2px, transparent 2px, transparent calc(var(--span) / 5)); }
   /* 위 블록(…37.5vh)과 A 행(43vh…) 사이의 빈 띠에 둔다. 아래 절반이 거울상으로 차므로
      흐름 배치로는 놓을 자리가 없다. */
   #stats { position: absolute; left: 8px; top: 38vh; margin: 0;
@@ -141,12 +149,12 @@
 <div class="seam">
   <div class="ruler"></div>
   <div class="label">A · WAAPI · 1x · ★네 GPU 영역 통과★ (프레임당 약 38px)</div>
-  <div class="mover" id="waapiMover">████ WAAPI 1x ████</div>
+  <div class="lane" id="waapiMover"></div>
 </div>
 
 <div class="row" id="rowB"><div class="ruler"></div>
   <div class="label">B · CSS @keyframes · 1x · 위</div>
-  <div class="mover" id="cssMover">████ &nbsp;CSS 1x&nbsp; ████</div>
+  <div class="lane" id="cssMover"></div>
 </div>
 <!--
   ★속도를 나눠 같이 돌린다.★ 1x 는 초당 2,304px, 60Hz 에서 프레임당 38px 이다.
@@ -156,11 +164,11 @@
 -->
 <div class="row" id="rowC"><div class="ruler"></div>
   <div class="label">C · WAAPI · 1/4x (프레임당 약 9.6px) · 위</div>
-  <div class="mover" id="quarterMover">████ 1/4x ████</div>
+  <div class="lane" id="quarterMover"></div>
 </div>
 <div class="row" id="rowD"><div class="ruler"></div>
   <div class="label">D · WAAPI · 1/16x (프레임당 약 2.4px) · 위</div>
-  <div class="mover" id="slowMover">████ 1/16x ████</div>
+  <div class="lane" id="slowMover"></div>
 </div>
 
 <!-- ★아래 두 타일용 거울상.★ 가로 이음매(50vh)에 대해 위 블록과 마주 본다. 같은 속도의
@@ -169,15 +177,15 @@
      거울이기 때문이다(위가 B·C·D 이므로 아래는 뒤집힌 순서라야 축에 대해 대칭이다). -->
 <div class="row" id="rowD2"><div class="ruler"></div>
   <div class="label">D' · WAAPI · 1/16x · 아래</div>
-  <div class="mover" id="slowMover2">████ 1/16x ████</div>
+  <div class="lane" id="slowMover2"></div>
 </div>
 <div class="row" id="rowC2"><div class="ruler"></div>
   <div class="label">C' · WAAPI · 1/4x · 아래</div>
-  <div class="mover" id="quarterMover2">████ 1/4x ████</div>
+  <div class="lane" id="quarterMover2"></div>
 </div>
 <div class="row" id="rowB2"><div class="ruler"></div>
   <div class="label">B' · CSS @keyframes · 1x · 아래</div>
-  <div class="mover" id="cssMover2">████ &nbsp;CSS 1x&nbsp; ████</div>
+  <div class="lane" id="cssMover2"></div>
 </div>
 
 <div id="stats">측정 준비 중...</div>
@@ -185,50 +193,86 @@
 <script>
 'use strict';
 
-const DURATION_MS = 4000;
-const travelPx = () => Math.round(window.innerWidth * 0.80);
+/* ★한 행에 복제를 넷 둔다.★ 50vw(= 타일 한 폭) 간격으로 -50 / 0 / 50 / 100vw 에 놓고
+   넷이 모두 `translateX(0 -> 50vw)` 를 돈다. 그러면:
 
-// --- WAAPI 행들. 속도만 다르고 나머지는 같다. ---
-// 같은 거리를 4배/16배 긴 시간에 가므로, 프레임당 이동 픽셀이 1/4, 1/16 이 된다.
-const waapi = document.getElementById('waapiMover');
-const hasWaapi = typeof waapi.animate === 'function';
+     * 100vw 짜리 행 안에 ★항상 두 개가 보인다★ -- 어느 순간에도 타일이 비지 않는다.
+     * 오른쪽으로 나가는 동시에 왼쪽에서 들어온다(같은 방향, 왕복 아님).
+     * ★한 바퀴가 시각적으로 무해하다★ -- 복제 i 가 50vw 되돌아 점프하면 직전에 복제 i-1 이
+       있던 자리에 정확히 내려앉는다. 글자가 모두 같으므로 화면은 점프 전후가 동일하다.
+
+   예전에는 한 행에 객체 하나가 80vw 를 가고 끝에서 되돌아 점프했다. 그 프레임에 그 레이어가
+   떠난 영역과 착지한 영역이 모두 무효화되어 패스가 24.3~24.6ms(한 주기의 1.46 배)가 됐고,
+   세 실행 모두 64 초마다(= 가장 느린 행의 한 바퀴) 났다 -- ★프로브가 스스로 만든 저더였다★
+   (log_ani_debug_03/16, 설계 문서 §37).
+
+   ★CSS 와 WAAPI 가 같은 움직임을 한다.★ 이 엔진의 `Element.animate` 는 `iterations`·
+   `easing`·`duration`·`fill` 네 개만 읽는다(`element.rs` 의 `fn Animate`) -- `direction` 과
+   `delay` 는 받아도 **조용히 무시**된다. 그래서 `alternate` 로 고치려던 첫 시도는 CSS 만
+   왕복시키고 WAAPI 는 그대로 두어 두 경로의 비교를 깨뜨렸다. 둘 다 그 네 개만 쓴다. */
+const COPIES = 4;
+/** 복제 간격 = 한 반복의 이동 거리. CSS `--span` 과 **같아야** 한다. */
+const SPAN_VW = 50;
+/** 1x 가 한 칸(50vw)을 가는 시간. CSS `--dur` 과 같아야 한다. */
+const DURATION_MS = 2500;
+const spanPx = () => Math.round(window.innerWidth * (SPAN_VW / 100));
+
+/** 레인 하나를 복제 넷으로 채운다. `useCss` 면 CSS 애니메이션이 붙는 클래스를 준다. */
+function fillLane(laneId, text, useCss) {
+  const lane = document.getElementById(laneId);
+  while (lane.firstChild) lane.removeChild(lane.firstChild);
+  const made = [];
+  for (let i = 0; i < COPIES; i++) {
+    const el = document.createElement('div');
+    el.className = useCss ? 'mover css' : 'mover';
+    el.textContent = text;
+    // -50 / 0 / 50 / 100vw. 맨 왼쪽은 화면 밖에서 들어올 몫이다.
+    el.style.left = (i - 1) * SPAN_VW + 'vw';
+    lane.appendChild(el);
+    made.push(el);
+  }
+  return made;
+}
+
+// --- 행 정의. 속도만 다르고 나머지는 같다. ---
+// 같은 거리를 4배/16배 긴 시간에 가므로 프레임당 이동 픽셀이 1/4, 1/16 이 된다.
+const CSS_ROWS = [
+  ['cssMover', '████ CSS 1x ████'],
+  ['cssMover2', '████ CSS 1x ████'],
+];
+const WAAPI_ROWS = [
+  ['waapiMover', '████ WAAPI 1x ████', DURATION_MS],
+  ['quarterMover', '████ 1/4x ████', DURATION_MS * 4],
+  ['slowMover', '████ 1/16x ████', DURATION_MS * 16],
+  ['quarterMover2', '████ 1/4x ████', DURATION_MS * 4],
+  ['slowMover2', '████ 1/16x ████', DURATION_MS * 16],
+];
+
+for (const row of CSS_ROWS) fillLane(row[0], row[1], true);
+
+const hasWaapi = typeof document.createElement('div').animate === 'function';
 const handles = [];
 
 function runWaapi(el, durationMs) {
   return el.animate(
-    [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + travelPx() + 'px)' }],
-    // ★`alternate` 다★ -- 이유는 `#cssMover` 의 CSS 주석에 있다(단방향 랩의 점프가
-    // 그 프레임을 24ms 로 만든다).
-    {
-      duration: durationMs,
-      iterations: Infinity,
-      direction: 'alternate',
-      easing: 'linear',
-    }
+    [{ transform: 'translateX(0px)' }, { transform: 'translateX(' + spanPx() + 'px)' }],
+    // ★네 개만 쓴다★ -- `direction`/`delay` 는 이 엔진이 무시한다(위 주석).
+    { duration: durationMs, iterations: Infinity, easing: 'linear' }
   );
 }
 
-// 아래 절반은 거울상이지만 **같은 속도·같은 방향**이다. 위아래 짝이 같은 x 에 있어야
-// 수직선 하나로 두 타일을 비교할 수 있다.
-const waapiRows = [
-  ['waapiMover', DURATION_MS],
-  ['quarterMover', DURATION_MS * 4],
-  ['slowMover', DURATION_MS * 16],
-  ['quarterMover2', DURATION_MS * 4],
-  ['slowMover2', DURATION_MS * 16],
-];
-
 function startWaapiRows() {
   while (handles.length) handles.pop().cancel();
-  for (const [id, duration] of waapiRows) {
-    handles.push(runWaapi(document.getElementById(id), duration));
+  for (const row of WAAPI_ROWS) {
+    for (const el of fillLane(row[0], row[1], false)) {
+      handles.push(runWaapi(el, row[2]));
+    }
   }
-  // ★시작 시각을 하나로 묶는다.★ `animate()` 는 각자 다음 프레임에 시작하므로 그대로
-  // 두면 위아래 짝의 위상이 프레임 단위로 어긋날 수 있고, 그러면 "같은 x 인가" 로
-  // 판정하는 이 배치의 목적이 깨진다. 같은 속도끼리는 이걸로 영구히 정렬된다.
-  // ★`startTime` 설정을 못 해도 프로브는 돌아야 한다.★ 이 엔진의 Web Animations 는 최소
-  // 구현이라 setter 가 없을 수 있다. 그때는 같은 틱에 만든 것만으로 대개 맞고, 어긋나면
-  // 위아래가 같은 x 에 있지 않은 것으로 눈에 보인다 -- 조용히 틀리지는 않는다.
+  // ★시작 시각을 하나로 묶는다.★ `animate()` 는 각자 다음 프레임에 시작하므로 그대로 두면
+  // 복제끼리도, 위아래 짝끼리도 위상이 프레임 단위로 어긋날 수 있다. 복제가 어긋나면 빗의
+  // 간격이 깨져 한 바퀴가 시각적으로 무해하지 않게 되므로 ★이 정렬이 이 설계의 전제다★.
+  // 못 해도 프로브는 돌고, 어긋나면 간격이 고르지 않은 것으로 눈에 보인다 -- 조용히 틀리지
+  // 않는다.
   try {
     const origin = document.timeline && document.timeline.currentTime;
     if (origin !== null && origin !== undefined) {
@@ -242,8 +286,8 @@ function startWaapiRows() {
 if (hasWaapi) {
   startWaapiRows();
 } else {
-  for (const [id] of waapiRows) {
-    document.getElementById(id).textContent =
+  for (const row of WAAPI_ROWS) {
+    document.getElementById(row[0]).textContent =
       'Element.animate 없음 (dom_web_animations_enabled=false)';
   }
 }
@@ -291,7 +335,7 @@ function tick(now) {
       '\n※ p50≈66.7 은 정상이다 — tick_divisor=4 가 rAF 를 60Hz/4 로 묶은 값이고,' +
       '\n   움직임 자체는 페인트측이 매 합성마다 전진시킨다. 이 숫자는 매끄러움의' +
       '\n   지표가 아니다. 끊김은 눈금자를 보고 판정하라.' +
-      '\nWAAPI ' + (hasWaapi ? 'ON' : 'OFF') + ' · 이동폭 ' + travelPx() + 'px / ' + DURATION_MS + 'ms';
+      '\nWAAPI ' + (hasWaapi ? 'ON' : 'OFF') + ' · 한 칸 ' + spanPx() + 'px / ' + DURATION_MS + 'ms';
 
     const el = document.getElementById('stats');
     el.textContent = line;
