@@ -196,24 +196,22 @@
 <script>
 'use strict';
 
-/* ★복제를 **위상**으로 흩는다 -- `left` 로 흩지 않는다.★
-   빗(간격을 `left` 로 주고 넷이 같은 위상)은 위치는 이어졌지만 비용을 몰았다: 넷이 **동시에**
-   랩을 돌므로 그 한 프레임에 레이어 넷(1x 행 셋이면 열둘)이 각각 5,760px 움직인다. 그리고 그중
-   둘은 화면 **안**에서 랩한다(left 0 과 50vw 짜리). 실기에서 1x 주기마다 "전체가 잠깐 멈췄다
-   다시 재생" 으로 보였다(log_ani_debug_03/17).
+/* ★복제를 **위상**으로 흩는다.★ `--travel` 150vw 를 네 복제가 1/4 위상차로 돌므로 간격이
+   37.5vw 이고, 100vw 짜리 행 안에 항상 두세 개(부분 표출까지 넷)가 보인다. 경로의 양 끝이
+   화면 밖(-25vw / 125vw)이라 ★한 바퀴의 점프가 보이지 않는 자리에서 일어난다★.
 
-   위상으로 흩으면:
-     * 랩이 복제마다 다른 시각에 온다 -- 한 번에 ★레이어 하나★만 움직인다.
-     * 경로의 양 끝을 화면 밖(-25vw / 125vw)에 두므로 랩이 ★보이지 않는 자리에서★ 일어난다.
-     * 간격은 150vw/4 = 37.5vw 이고, 100vw 짜리 행 안에 ★항상 두세 개가 보인다★.
+   위상은 ★양쪽 다 `delay`(음수)로 준다★. CSS 는 `animation-delay`, WAAPI 는 `animate()` 의
+   `delay` 옵션이고 ★같은 계산을 거친다★ -- stylo 의 `started_at = now + delay` 와 음수 delay
+   반복 전진 루프가 한 곳이다(`servo/animation.rs`). 그래서 두 경로가 글자 그대로 같이 움직인다.
 
-   ★이 엔진의 `Animation` 은 `cancel()` 하나뿐이다★(`Animation.webidl`) -- `startTime` 이 없다.
-   그래서 예전 코드의 `handle.startTime = origin` 은 줄곧 조용한 no-op 이었다(래퍼에 JS 속성만
-   생기고 예외도 안 난다). 거울상 위상 정렬은 한 번도 동작한 적이 없다. 위상은 ★키프레임
-   offset★ 으로 넣는다(그것은 지원된다 -- `resolve_offsets`).
-
-   CSS 쪽은 `animation-delay` 로 같은 위상을 만든다. 수단은 다르지만 ★움직임은 같다★ --
-   어느 시각에도 두 경로의 객체가 같은 x 에 있어야 하고, 그것이 이 프로브의 판정 조건이다. */
+   ★그 `delay` 는 이 엔진에 없었다.★ `Element.animate` 가 `iterations`·`easing`·`duration`·
+   `fill` 네 개만 읽었고 `direction`/`delay` 는 사전에 선언되어 있지도 않아 WebIDL 이 조용히
+   버렸다. 그래서 두 차례 우회를 시도했고 둘 다 더 나빴다:
+     1. `direction: 'alternate'` -- WAAPI 에서 무시되어 CSS 만 왕복, 두 경로가 갈렸다.
+     2. 키프레임 안에 불연속(offset w -> w+1e-6)을 박아 위상을 만들었다 -- CSS 쪽에는 없는
+        잔상이 WAAPI 객체마다 생겼다(log_ani_debug_03/18). 큰 transform 점프가 떠난 자리의
+        picture cache 를 무효화하지 않는 것으로 보이고, Edge/Chrome 에서는 나지 않는다.
+   그래서 엔진에 `delay` 와 `direction` 을 넣었다. 이제 우회가 필요 없다. */
 const COPIES = 4;
 /** 전체 이동 거리(vw). 양 끝이 화면 밖이어야 랩이 안 보인다. */
 const TRAVEL_VW = 150;
@@ -221,35 +219,14 @@ const TRAVEL_VW = 150;
 const X0_VW = -25;
 /** 1x 가 150vw 를 가는 시간. 2,304px/s = 20vw/s 를 유지한다. CSS `--dur` 과 같아야 한다. */
 const DURATION_MS = 7500;
-/** 랩 구간의 폭. 한 프레임보다 훨씬 짧아 그 사이에 표본될 확률이 무시할 만하다. */
-const WRAP_EPS = 1e-6;
 
 const travelPx = () => window.innerWidth * (TRAVEL_VW / 100);
 const x0Px = () => window.innerWidth * (X0_VW / 100);
+/** 복제 `i` 의 위상 = 음수 delay(ms). CSS 와 WAAPI 가 같은 값을 쓴다. */
+const delayMs = (i, durationMs) => -Math.round((durationMs * i) / COPIES);
 
-/** 복제 `i`(전체 `n` 개)의 위상이 박힌 키프레임. 위상 0 은 랩이 끝에 있으므로 두 줄로 끝난다. */
-function phaseKeyframes(i, n) {
-  const L = travelPx();
-  const x0 = x0Px();
-  const start = x0 + (L * i) / n;
-  const at = (px) => ({ transform: 'translateX(' + Math.round(px) + 'px)' });
-  if (i === 0) {
-    return [
-      Object.assign({ offset: '0' }, at(x0)),
-      Object.assign({ offset: '1' }, at(x0 + L)),
-    ];
-  }
-  const wrap = 1 - i / n;
-  return [
-    Object.assign({ offset: '0' }, at(start)),
-    Object.assign({ offset: String(wrap) }, at(x0 + L)),
-    Object.assign({ offset: String(wrap + WRAP_EPS) }, at(x0)),
-    Object.assign({ offset: '1' }, at(start)),
-  ];
-}
-
-/** 레인 하나를 복제로 채운다. `useCss` 면 CSS 애니메이션 + 음수 delay 로 위상을 준다. */
-function fillLane(laneId, text, useCss) {
+/** 레인 하나를 복제로 채운다. `useCss` 면 CSS 애니메이션 + 음수 delay. */
+function fillLane(laneId, text, useCss, durationMs) {
   const lane = document.getElementById(laneId);
   while (lane.firstChild) lane.removeChild(lane.firstChild);
   const made = [];
@@ -257,10 +234,7 @@ function fillLane(laneId, text, useCss) {
     const el = document.createElement('div');
     el.className = useCss ? 'mover css' : 'mover';
     el.textContent = text;
-    if (useCss) {
-      // 음수 delay = 이미 그만큼 진행한 상태로 시작. WAAPI 쪽 키프레임 위상과 같은 값이다.
-      el.style.animationDelay = -Math.round((DURATION_MS * i) / COPIES) + 'ms';
-    }
+    if (useCss) el.style.animationDelay = delayMs(i, durationMs) + 'ms';
     lane.appendChild(el);
     made.push(el);
   }
@@ -281,21 +255,25 @@ const WAAPI_ROWS = [
   ['slowMover2', '████ 1/16x ████', DURATION_MS * 16],
 ];
 
-for (const row of CSS_ROWS) fillLane(row[0], row[1], true);
+for (const row of CSS_ROWS) fillLane(row[0], row[1], true, DURATION_MS);
 
 const hasWaapi = typeof document.createElement('div').animate === 'function';
 const handles = [];
 
 function startWaapiRows() {
   while (handles.length) handles.pop().cancel();
+  const frames = [
+    { transform: 'translateX(' + Math.round(x0Px()) + 'px)' },
+    { transform: 'translateX(' + Math.round(x0Px() + travelPx()) + 'px)' },
+  ];
   for (const row of WAAPI_ROWS) {
-    const copies = fillLane(row[0], row[1], false);
+    const copies = fillLane(row[0], row[1], false, row[2]);
     for (let i = 0; i < copies.length; i++) {
-      // ★네 옵션만 쓴다★ -- 이 엔진은 `direction`/`delay` 를 받아도 무시한다
-      // (`element.rs` 의 `fn Animate`). 위상은 키프레임에 박혀 있다.
+      // ★CSS 와 같은 옵션을 쓴다.★ 키프레임은 단조다 -- 불연속이 없으므로 잔상도 없다.
       handles.push(
-        copies[i].animate(phaseKeyframes(i, copies.length), {
+        copies[i].animate(frames, {
           duration: row[2],
+          delay: delayMs(i, row[2]),
           iterations: Infinity,
           easing: 'linear',
         })
