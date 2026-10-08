@@ -6,8 +6,23 @@
 //! 다 "합성이 실제로 끝난 시각" 도, "그 프레임이 어느 패널에 언제 떴는지" 도 말해 주지
 //! 않는다.
 //!
-//! `dcomp.dll` 은 그 둘을 주는 함수를 따로 내보낸다(Windows 10 1803+). COM 이 아니라 평범한
-//! export 이고 조회만 한다 -- 블록하지 않는다.
+//! `dcomp.dll` 은 그 둘을 주는 함수를 따로 내보낸다. COM 이 아니라 평범한 export 이고
+//! 조회만 한다 -- 블록하지 않는다.
+//!
+//! ★그런데 모든 Windows 에 있는 것이 아니다.★ 여기 "Windows 10 1803+" 라고 적어 두었던 것은
+//! 틀렸다. 실측: Windows 10 Enterprise 19045 의 `dcomp.dll` 은 **12 개만** 내보내고 그중에
+//! 이 셋이 없다 -- `DCompositionAttachMouseDragToHwnd`, `AttachMouseWheelToHwnd`,
+//! `CreateDevice`, `CreateDevice2`, `CreateDevice3`, `CreateSurfaceHandle`,
+//! `DllCanUnloadNow`, `DllGetActivationFactory`, `DllGetClassObject`, `DwmEnableMMCSS`,
+//! `DwmFlush`, `DwmpEnableDDASupport`.
+//!
+//! ★그래서 `GetProcAddress` 로 지연 로드한다.★ `#[link(name = "dcomp")]` 으로 정적 선언하면
+//! import 가 프로세스 **시작 시** 전부 해결돼야 하므로, 이 셋을 한 번도 부르지 않아도
+//! ***exe 자체가 뜨지 않는다*** -- `STATUS_ENTRYPOINT_NOT_FOUND`(0xC0000139). 실제로 그 일이
+//! 일어났다: 개발기(Win10 19045)에서 `winit_wall.exe --help` 조차 그 코드로 죽었고, 직전
+//! 빌드(이 모듈이 붙기 전)는 같은 장비에서 정상이었다. 원인을 찾는 데 한참 걸렸는데,
+//! ***증상이 "DLL 문제" 처럼 보이고 어느 심볼인지 아무도 말해 주지 않기 때문이다.***
+//! 지연 로드면 그 장비에서 이 텔레메트리만 조용히 꺼지고 엔진은 돈다.
 //!
 //! - [`DCompositionGetFrameId`] : 합성 프레임의 id. `CREATED`/`CONFIRMED`/`COMPLETED` 세
 //!   단계가 있어 "완료된 마지막 프레임" 을 특정할 수 있다.
@@ -28,6 +43,7 @@
 
 use winapi::shared::minwindef::UINT;
 use winapi::shared::ntdef::HRESULT;
+use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
 
 /// `COMPOSITION_FRAME_ID_TYPE`. 쓰는 것은 `COMPLETED` 뿐이지만, 셋을 같이 적어 두어야
 /// 나중에 "확정 단계와 완료 단계가 얼마나 벌어지나" 를 묻고 싶을 때 손댈 곳이 없다.
@@ -77,21 +93,69 @@ struct CompositionTargetStats {
     completed_stats: CompositionStats,
 }
 
-#[link(name = "dcomp")]
-unsafe extern "system" {
-    fn DCompositionGetFrameId(frame_id_type: u32, frame_id: *mut u64) -> HRESULT;
-    fn DCompositionGetStatistics(
-        frame_id: u64,
-        frame_stats: *mut CompositionFrameStats,
-        target_id_count: UINT,
-        target_ids: *mut CompositionTargetId,
-        actual_target_id_count: *mut UINT,
-    ) -> HRESULT;
-    fn DCompositionGetTargetStatistics(
-        frame_id: u64,
-        target_id: *const CompositionTargetId,
-        target_stats: *mut CompositionTargetStats,
-    ) -> HRESULT;
+type GetFrameIdFn = unsafe extern "system" fn(u32, *mut u64) -> HRESULT;
+type GetStatisticsFn = unsafe extern "system" fn(
+    u64,
+    *mut CompositionFrameStats,
+    UINT,
+    *mut CompositionTargetId,
+    *mut UINT,
+) -> HRESULT;
+type GetTargetStatisticsFn = unsafe extern "system" fn(
+    u64,
+    *const CompositionTargetId,
+    *mut CompositionTargetStats,
+) -> HRESULT;
+
+/// 세 함수 포인터. 하나라도 없으면 `None` -- 이 모듈 전체가 조용히 꺼진다.
+struct DcompStatsApi {
+    get_frame_id: GetFrameIdFn,
+    get_statistics: GetStatisticsFn,
+    get_target_statistics: GetTargetStatisticsFn,
+}
+
+/// ★`GetProcAddress` 로 한 번만 찾는다.★ 모듈 주석의 이유로 정적 링크가 아니다.
+///
+/// `LoadLibraryA` 를 쓰지만 `dcomp.dll` 은 이 프로세스가 이미(COM 디바이스 생성 경로에서)
+/// 들고 있으므로 참조 수만 하나 오른다. 내리지 않는다 -- 프로세스 수명 동안 쓴다.
+fn api() -> Option<&'static DcompStatsApi> {
+    static API: std::sync::OnceLock<Option<DcompStatsApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| {
+        // Safety: 널 종료 리터럴을 넘기고 반환값을 널 검사한다.
+        let module = unsafe { LoadLibraryA(c"dcomp.dll".as_ptr()) };
+        if module.is_null() {
+            log::warn!("dcomp.dll 을 열 수 없다 -- 합성 통계를 끈다");
+            return None;
+        }
+        // Safety: `module` 은 위에서 확인한 유효한 핸들이고, 이름은 널 종료 리터럴이다.
+        // 찾은 주소를 해당 시그니처로 옮기는 것은 SDK 선언(`um/dcomp.h`)에 근거한다.
+        let (frame_id, stats, target_stats) = unsafe {
+            (
+                GetProcAddress(module, c"DCompositionGetFrameId".as_ptr()),
+                GetProcAddress(module, c"DCompositionGetStatistics".as_ptr()),
+                GetProcAddress(module, c"DCompositionGetTargetStatistics".as_ptr()),
+            )
+        };
+        if frame_id.is_null() || stats.is_null() || target_stats.is_null() {
+            // ★이 장비에서는 이 텔레메트리가 없다.★ 에러가 아니다 -- 엔진은 그대로 돈다.
+            // `COMPWALK`/`COMPREFRESH`/`DCOMPSTAT` 이 한 줄도 나오지 않는 것이 그 표시다.
+            log::warn!(
+                "dcomp.dll 에 DCompositionGet* 가 없다(Windows 10 19045 등) --                  합성 통계(COMPWALK/COMPREFRESH)를 끈다"
+            );
+            return None;
+        }
+        // Safety: 널이 아님을 바로 위에서 확인했다.
+        Some(unsafe {
+            DcompStatsApi {
+                get_frame_id: std::mem::transmute::<*const (), GetFrameIdFn>(frame_id as _),
+                get_statistics: std::mem::transmute::<*const (), GetStatisticsFn>(stats as _),
+                get_target_statistics: std::mem::transmute::<*const (), GetTargetStatisticsFn>(
+                    target_stats as _,
+                ),
+            }
+        })
+    })
+    .as_ref()
 }
 
 /// `COMPOSITION_STATS` 를 그대로 옮긴 것. `presentedStats`/`completedStats` 둘 다 이 모양이다.
@@ -149,9 +213,10 @@ const MAX_TARGETS: usize = 16;
 /// ★id 는 조밀하게 연속이다★ -- 실측에서 창(약 1 초)마다 62~64 씩 오른다. 즉 합성마다
 /// 하나이고, 그래서 `sample_frame` 으로 지난 창의 프레임을 **빠짐없이** 되짚을 수 있다.
 pub(crate) fn completed_frame_id() -> Option<u64> {
+    let api = api()?;
     let mut frame_id: u64 = 0;
-    // Safety: 순수 out-param 조회.
-    if unsafe { DCompositionGetFrameId(FrameIdType::Completed as u32, &mut frame_id) } < 0 {
+    // Safety: 순수 out-param 조회. 포인터는 `api()` 가 확인한 것이다.
+    if unsafe { (api.get_frame_id)(FrameIdType::Completed as u32, &mut frame_id) } < 0 {
         return None;
     }
     Some(frame_id)
@@ -163,12 +228,13 @@ pub(crate) fn completed_frame_id() -> Option<u64> {
 /// ★조회만 한다.★ 어떤 대기도 넣지 말 것 -- 이 저장소에는 합성 경로에 프로세스 범위 대기를
 /// 넣어 생긴 회귀가 기록돼 있다(`dcomp_compositor::composition_grid` 주석).
 pub(crate) fn sample_frame(frame_id: u64) -> Option<FrameSample> {
+    let api = api()?;
     let mut stats = CompositionFrameStats::default();
     let mut ids = [CompositionTargetId::default(); MAX_TARGETS];
     let mut actual: UINT = 0;
     // Safety: `ids` 는 `MAX_TARGETS` 개를 담을 수 있고 그 수를 그대로 넘긴다.
     if unsafe {
-        DCompositionGetStatistics(
+        (api.get_statistics)(
             frame_id,
             &mut stats,
             MAX_TARGETS as UINT,
@@ -184,7 +250,7 @@ pub(crate) fn sample_frame(frame_id: u64) -> Option<FrameSample> {
     for id in ids.iter().take(returned) {
         let mut target_stats = CompositionTargetStats::default();
         // Safety: `id` 는 바로 위 호출이 채운 값이고, 호출 동안 살아 있다.
-        if unsafe { DCompositionGetTargetStatistics(frame_id, id, &mut target_stats) } < 0 {
+        if unsafe { (api.get_target_statistics)(frame_id, id, &mut target_stats) } < 0 {
             continue;
         }
         targets.push(TargetSample {
