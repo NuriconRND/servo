@@ -14,3 +14,5 @@ interface Animation {
 
 // https://drafts.csswg.org/web-animations-1/#the-effecttiming-dictionaries
 enum FillMode { "none", "forwards", "backwards", "both", "auto" };
+
+enum PlaybackDirection { "normal", "reverse", "alternate", "alternate-reverse" };

@@ -1229,6 +1229,11 @@ pub struct ScriptAnimationRequest {
     pub iteration_state: KeyframesIterationState,
     /// `fill` 옵션.
     pub fill_mode: AnimationFillMode,
+    /// 초 단위 지연(`delay` 옵션). 음수면 그만큼 **이미 진행한** 상태로 시작한다 --
+    /// CSS `animation-delay` 와 같은 뜻이고, 같은 계산을 거친다.
+    pub delay: f64,
+    /// `direction` 옵션.
+    pub direction: AnimationDirection,
     /// 프레임이 자기 것을 선언하지 않았을 때 쓰는 기본 타이밍 함수.
     pub timing_function: TimingFunction,
 }
@@ -1457,26 +1462,53 @@ impl ElementAnimationSet {
                     .all(|property| new_properties.contains(property))
             });
 
-            self.animations.push(Animation {
+            // ***`delay` 와 `direction` 계산은 CSS 경로와 **같은** 식이어야 한다.***
+            // 두 경로가 다른 식을 쓰면 같은 타이밍을 준 CSS 애니메이션과
+            // `Element.animate` 가 다르게 움직이고, 그 차이는 눈으로만 드러난다.
+            // 원본은 `maybe_start_animations` 의 같은 세 줄이다.
+            let now = context.current_time_for_animations;
+            let started_at = now + request.delay;
+            let mut starting_progress = (now - started_at) / request.duration;
+            // `current_direction` 은 `normal` 또는 `reverse` 만 될 수 있다(그 필드 주석).
+            let initial_direction = match request.direction {
+                AnimationDirection::Normal | AnimationDirection::Alternate => {
+                    AnimationDirection::Normal
+                },
+                AnimationDirection::Reverse | AnimationDirection::AlternateReverse => {
+                    AnimationDirection::Reverse
+                },
+            };
+
+            let mut new_animation = Animation {
                 name: request.name,
                 properties_changed: physical_properties,
                 computed_steps,
-                // 리스타일 시점의 타임라인 값. `animate()` 호출과 같은 렌더링 갱신이다.
-                started_at: context.current_time_for_animations,
+                // 리스타일 시점의 타임라인 값(+ delay). `animate()` 호출과 같은 렌더링 갱신이다.
+                started_at,
                 duration: request.duration,
-                delay: 0.,
+                delay: request.delay,
                 fill_mode: request.fill_mode,
                 iteration_state: request.iteration_state,
                 // ***`Pending` 이 아니라 `Running`.*** `start_pending_animations` 가
                 // 승급하면서 `animationstart` CSS 이벤트를 쏘는데, 스크립트
                 // 애니메이션에 그것이 나가면 안 된다.
                 state: AnimationState::Running,
-                direction: AnimationDirection::Normal,
-                current_direction: AnimationDirection::Normal,
+                direction: request.direction,
+                current_direction: initial_direction,
                 number_of_animating_properties,
                 origin: AnimationOrigin::Script,
                 is_new: true,
-            });
+            };
+
+            // ***음수 delay 가 첫 반복을 넘겼으면 그만큼 진행시킨다.*** 이것이 없으면
+            // `starting_progress > 1` 인 채로 반복 0 에 머물러, `-1.5 * duration` 같은
+            // delay 가 조용히 끝 값에 붙어 버린다. CSS 경로의 같은 루프다.
+            while starting_progress > 1. && !new_animation.on_last_iteration() {
+                new_animation.iterate();
+                starting_progress -= 1.;
+            }
+
+            self.animations.push(new_animation);
             self.dirty = true;
         }
     }

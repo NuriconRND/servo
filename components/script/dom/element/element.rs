@@ -56,6 +56,7 @@ use style::values::computed::Overflow;
 use style::values::generics::NonNegative;
 use style::values::generics::position::PreferredRatio;
 use style::values::generics::ratio::Ratio;
+use style::values::specified::AnimationDirection;
 use style::values::{AtomIdent, CSSFloat, GenericAtomIdent, computed, specified};
 use style::{ArcSlice, CaseSensitivityExt, dom_apis, thread_state};
 use style_traits::CSSPixel;
@@ -73,7 +74,7 @@ use crate::dom::animation::keyframes::{
     IterationSpec, KeyframeError, resolve_duration_seconds, resolve_iterations,
 };
 use crate::dom::attr::{Attr, is_relevant_attribute};
-use crate::dom::bindings::codegen::Bindings::AnimationBinding::FillMode;
+use crate::dom::bindings::codegen::Bindings::AnimationBinding::{FillMode, PlaybackDirection};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
@@ -4507,6 +4508,17 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
                     name: name.clone(),
                     keyframes: keyframes_animation,
                     duration,
+                    // ***ms -> s.*** `duration` 과 같은 단위다(`resolve_duration_seconds`).
+                    // 음수가 유효하다 -- 그만큼 이미 진행한 상태로 시작한다.
+                    delay: *options.delay / 1000.0,
+                    direction: match options.direction {
+                        PlaybackDirection::Normal => AnimationDirection::Normal,
+                        PlaybackDirection::Reverse => AnimationDirection::Reverse,
+                        PlaybackDirection::Alternate => AnimationDirection::Alternate,
+                        PlaybackDirection::Alternate_reverse => {
+                            AnimationDirection::AlternateReverse
+                        },
+                    },
                     iteration_state,
                     fill_mode,
                     timing_function,

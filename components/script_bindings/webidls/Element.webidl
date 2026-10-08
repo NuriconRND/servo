@@ -183,11 +183,22 @@ partial interface Element {
 // (`offset: 0.5` 는 "0.5" 로 들어와 우리가 파싱한다). 옵션은 아래 넷뿐이며,
 // 선언되지 않은 멤버는 WebIDL 이 무시하므로 이 딕셔너리가 곧 지원 범위다.
 // 범위: docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md
+// ★선언한 것만 구현되어 있다.★ WebIDL 은 사전(dictionary)의 모르는 멤버를 조용히
+// 버리므로, 여기에 없는 옵션(`iterationStart`, `endDelay`, `composite` ...)을 넘기면
+// 아무 일도 일어나지 않는다. 그것이 표준 동작이지만 조용하므로, 쓰는 쪽이 여기를 보고
+// 무엇이 실제로 듣는지 알 수 있어야 한다.
+//
+// `iterationStart`/`endDelay` 는 stylo 가 애초에 모델하지 않는다(CSS 에 대응 속성이
+// 없다). 넣으려면 `Animation` 에 새 상태를 더해야 하므로 범위가 다르다.
 dictionary ServoKeyframeAnimationOptions {
   unrestricted double duration = 0;
+  // 음수면 그만큼 이미 진행한 상태로 시작한다. CSS `animation-delay` 와 같은 뜻이다.
+  // `unrestricted` 가 아니다 -- NaN/Infinity 는 의미가 없고 바인딩이 거부해야 한다.
+  double delay = 0;
   DOMString easing = "linear";
   unrestricted double iterations = 1;
   FillMode fill = "auto";
+  PlaybackDirection direction = "normal";
 };
 
 partial interface Element {
