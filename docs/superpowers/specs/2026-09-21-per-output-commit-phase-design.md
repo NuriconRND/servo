@@ -1208,3 +1208,90 @@ nc=0 /s:      probe 0.02        output 1.23     (60 배)
 
 계측에는 `-PresentCadence` 를 함께 준다. 그것이 없으면 `WALLSPLIT`/`WALLPASS`/`PASSEVENT` 가
 통째로 사라진다(/14 가 그래서 패스 분해가 비어 있었다).
+
+---
+
+# ★끝났다 — 정상 구간이 100% 다 (2026-10-08 계측)★
+
+`log_ani_debug_03/19`. `-DwmAlign 14 -CommitAlign 8 -DcompParallelCommit -PresentCadence`,
+`wall_layout.multigpu.json`, 각 304 초 × 3 회. 커밋 `f95fb86b407`.
+
+## 40. 수치
+
+각 실행을 **기동 20 초**와 **그 뒤**로 나눠 재면:
+
+| | 기동 20 초 | ★정상 구간 (270~272 창)★ |
+|---|---|---|
+| 무놓침% | 35 / 65 / 75% | ★**99 / 100 / 100%**★ |
+| `wake_us_avg` | 545~687 | ★**1 / 1 / 8**★ |
+| `slip_us_avg` | 220~274 | ★**16 / 17 / 20**★ |
+| `retried` | 0 | **0** |
+| `PASSEVENT`/창 | 0.45~1.05 | 0.05~0.08 |
+| `pass_max` | **372~375ms** | 8.9 / 9.5 / 71.8 |
+| ★`d0−d2`/1k★ | 12.8~50.0 | ★**0.00 / 0.00 / 0.06**★ |
+
+★`d0−d2` 가 0 이다 -- 효과 (ii)가 사라졌다.★ 지금까지 최선이 0.3 이었고 §30 시점에는 1~5
+였다. 그리고 `wake_us_avg` 가 1045 → **1µs** 다(§35 의 세 수정 + 상주 워커).
+
+육안 관찰이 수치와 일치한다: "처음 저더 심한 구간을 지나면 멈칫거림 현상 없음, 저더 관찰되지
+않음"(examination). 남은 것은 ★기동 20 초뿐★이고 `pass_max 372~375ms` 가 셰이더 사전 로드
+off 와 맞는다. test_94 의 정상 구간 `71.8ms` / 99% 는 270 창 중 한두 창의 단일 사건이다.
+
+## 41. ★그 100% 의 절반은 프로브를 고친 몫이다★
+
+이 축에서 저더를 만든 것이 셋이고, ★둘은 프로브 자신이었다★:
+
+1. **엔진** -- 커밋 위상이 패스 길이·스케줄러 깨어남·커밋 직렬화·스레드 생성에 끌려다녔다
+   (§35). 스핀 + 상주 워커 + 병렬 커밋으로 `wake` 1045 → 1µs.
+2. **프로브: 랩 점프** -- 한 행에 객체 하나가 80vw 를 가고 끝에서 되돌아 점프했다. 그 프레임의
+   패스가 24ms, 64 초마다(§37).
+3. **프로브: 복제의 동시 랩** -- 간격을 `left` 로 주고 넷이 같은 위상이면 그 한 프레임에
+   레이어 열둘이 각각 5,760px 움직이고 그중 둘은 화면 **안**에서 랩한다. 1x 주기마다
+   "전체가 잠깐 멈췄다 다시 재생"(log_ani_debug_03/17).
+
+★그리고 2·3 을 고치려면 엔진에 없던 기능이 필요했다.★ `Element.animate` 가 `iterations`·
+`easing`·`duration`·`fill` 네 개만 읽었고 `direction`/`delay` 는 사전에 선언되어 있지도 않아
+WebIDL 이 조용히 버렸다. 우회를 두 번 시도해 둘 다 더 나빴다:
+
+* `direction: 'alternate'` -- WAAPI 에서 무시되어 CSS 만 왕복, 두 경로가 갈렸다.
+* 키프레임 안에 불연속(offset `w` → `w+1e-6`)을 박아 위상을 만들었다 -- CSS 에는 없는
+  ★잔상★이 WAAPI 객체마다 생겼다(/18). 큰 transform 점프가 떠난 자리의 picture cache 를
+  무효화하지 않는 것으로 보이고, ★Edge/Chrome 에서는 나지 않는다★.
+
+그래서 엔진에 `delay` 와 `direction` 을 넣었다(`0f7829f0356`). stylo 가 둘을 이미 모델하고
+있어서(`Animation` 의 `delay: f64`, `direction`/`current_direction`) 빠진 것은 요청 구조체의
+두 필드와 그 전달뿐이었다. 생성부는 ★CSS 경로와 같은 식★을 쓴다 -- `started_at = now + delay`,
+`initial_direction` 매핑, 음수 delay 의 반복 전진 루프. 두 경로가 다른 식을 쓰면 같은 타이밍을
+준 CSS 와 `animate()` 가 다르게 움직이고 그 차이는 눈으로만 드러난다.
+
+`startTime` 은 넣지 않았다. 살아 있는 애니메이션을 사후에 옮기는 것이라 모양이 다르고,
+필요하지도 않다 -- 거울상 정렬은 같은 스크립트 턴의 애니메이션이 같은
+`current_time_for_animations` 를 받아 이미 성립한다(/18 에서 확인됐다). ★예전 프로브의
+`handle.startTime = origin` 은 줄곧 조용한 no-op 이었다★(`Animation` 인터페이스에 그 속성이
+없다). try/catch 가 그것을 알려 주지도 못했다.
+
+## 42. 남은 숙제
+
+* ★기동 20 초★ -- `pass_max 372~375ms`. 셰이더 사전 로드 pref 를 켜면 사라질 것으로 보이지만
+  측정하지 않았다.
+* ★잔상(picture cache 무효화)★ -- 이번에 쓰지 않게 됐지만 엔진 결함으로 남아 있다. 재현 조건이
+  명확하다: 키프레임 안의 큰 transform 불연속 + `will-change: transform`. Edge/Chrome 에는 없다.
+* ★다른 프로브★ -- `multigpu_wall_shape_anim_probe.html` 은 `rotate`·`hue`·`opacity` +
+  `border-radius`/`box-shadow` 를 애니메이트한다. `translateX` 와 달리 ★rotate 는 재래스터화,
+  hue 는 비합성 속성★이라 매 프레임 페인트가 다시 돈다 -- 패스가 여유(13.9ms)를 먹을 수 있다.
+  `multigpu_wall_stress_cases.html` 은 WebGL/WebGPU/2D 캔버스 + 비디오 + iframe + `filter:
+  blur` 를 동시에 돌리는 설계상 스트레스 페이지로, 60fps 가 목표였던 적이 없다.
+* output 페이지의 `flush` 4.53ms(프로브 1.00ms)는 여전히 미해결이다(§25).
+
+## 43. 운영값 (확정)
+
+```
+-DwmAlign 14 -CommitAlign 8 -DcompParallelCommit
+```
+
+`CommitAlign` 은 작게(4~20) -- `lead` 가 커야 한다(§24, §38). `DwmAlign` 은 거의 아무 값이나.
+★`-DcompParallelCommit` 은 필수★이고, 이제 그것이 ★상주 워커 풀★을 켜는 스위치다(끄면 커밋이
+스케줄러 스레드에서 순차로 나가 2·3·4 번째 타일이 앞 타일의 `Commit()` 만큼 늦는다).
+
+계측에는 `-PresentCadence` 를 함께 준다 -- 없으면 `WALLSPLIT`/`WALLPASS`/`PASSEVENT` 가 통째로
+사라진다.
