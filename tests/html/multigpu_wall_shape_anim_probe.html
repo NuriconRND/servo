@@ -20,8 +20,31 @@
     ?hud=PX       HUD 격자 간격 (기본 480) — 타일보다 촘촘해야 모든 타일에 하나는 들어간다
     ?css=0        CSS 키프레임 애니메이션 열을 끈다(rAF 와 비교용)
     ?grid=0       배경 눈금 끄기
-    ?anim=raf|css|none  궤도를 무엇이 돌리는가 (기본 raf)
+    ?anim=raf|css|waapi|none  궤도를 무엇이 돌리는가 (기본 raf)
     ?wc=0         will-change: transform 을 뗀다
+    ?ctr=0        CSS/WAAPI 모드의 프레임 카운터를 끈다
+    ?heartbeat=1  CSS/WAAPI 모드에서도 빈 rAF 를 돌린다(아래 참고)
+
+  ★`css` 와 `waapi` 모드에는 rAF 가 **한 번도** 돌지 않는다.★ 그 전까지는 모드와 무관하게
+  스윕 막대와 HUD 가 rAF 로 그려졌고, 그래서 "anim=css" 라고 적어 놓고도 화면의 절반이
+  스크립트에 매달려 있었다. 실측(log_ani_debug_04/02)에서 한 화면이 세 값으로 갈렸다 --
+  ***CSS 도형 60fps, rAF 스윕 15fps, fps 표시 15.0***. 60Hz 월에서 15 는 60/4 이고, 그 4 는
+  `gfx_paint_side_animation_tick_divisor` 다. 페인트측 애니메이션은 페인트가 틱 사이를
+  예측해 전진시키므로 스크립트 틱을 줄여도 되지만, ***rAF 에는 예측할 식이 없다*** --
+  콜백이 돌지 않으면 값 자체가 생기지 않는다.
+
+  ★fps 는 CSS/WAAPI 모드에서 측정할 수 없다★ -- 프레임을 세는 주체가 스크립트뿐이다.
+  대신 ***CSS 로 만든 프레임 카운터***를 쓴다: `steps(10)` 으로 숫자 띠를 한 칸씩 끌어올려
+  00-99 를 60Hz 로 돌린다(1.67 초에 한 바퀴). 타일이 한 프레임 뒤처지면 일의 자리가 한
+  칸 다르게 보이므로, ***rAF 카운터보다 분해능이 높다***(그쪽은 15Hz 였다).
+  띠는 요소 10 개가 아니라 `white-space: pre` 로 ***한 요소에 10 줄***이다 -- HUD 가 벽에서
+  200 개를 넘으므로 HUD 당 10 개면 2,000 개가 더 붙는다. 지금은 HUD 당 4 개다.
+
+  ★rAF 하트비트가 필요했던 적이 있다★ -- rAF 가 없으면 Servo 가 즉시-합성 경로를 타면서
+  이벤트 루프를 압도해 창 조작이 굶었다(video_grid 페이지에 같은 주석). CSS 애니메이션이
+  돌면 refresh driver 가 관찰을 유지하므로 그 조건에 걸리지 않을 것으로 보지만 확인하지
+  않았다. 굶으면 `?heartbeat=1` 로 아무것도 안 하는 rAF 를 하나 돌려 가른다 --
+  ***그것으로 증상이 사라지면 그 자체가 결과다.***
 
   ★프레임마다 JS 로 style.transform 을 쓰는 것이 이 페이지에서 가장 비싼 일이다★
   (개발기 1920x1080, 도형 400 개):
@@ -62,6 +85,10 @@
      반지름만큼 밀려 있다 — 화면상 움직임은 rAF 모드와 같고, 프레임당 JS 는 0 이다. */
   .orb.cssmode { width: 0 !important; height: 0 !important; animation: orbit linear infinite; }
   .orb.cssmode > .body { position: absolute; }
+  /* ?anim=waapi: 기하는 cssmode 와 같고 ***회전을 `Element.animate()` 가 돈다***. CSS
+     선언은 붙이지 않는다 -- 두 경로가 겹치면 어느 쪽이 그린 것인지 알 수 없다. */
+  .orb.waapimode { width: 0 !important; height: 0 !important; }
+  .orb.waapimode > .body { position: absolute; }
   @keyframes orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   .orb .body { width: 100%; height: 100%; }
 
@@ -94,6 +121,28 @@
     opacity: .85; will-change: transform;
   }
 
+  /* ★스윕은 모드와 무관하게 rAF 가 그리고 있었다★ -- `anim=css` 를 주고도 막대만 15fps 로
+     움직인 것이 그 때문이다(log_ani_debug_04/02). CSS 모드용 키프레임을 둔다. 톱니파이므로
+     `linear infinite` 한 번이면 된다. 거리는 뷰포트 폭이라 JS 가 `--dx`/`--dy` 로 준다 --
+     `var()` 를 키프레임 안에서 쓰는 것은 이 Servo 에서 동작한다(wall_anim_jitter_probe
+     에서 쓰고 있다). */
+  #sweep.cssmode  { animation: sweepx linear infinite; }
+  #sweepv.cssmode { animation: sweepy linear infinite; }
+  @keyframes sweepx { from { transform: translateX(0); } to { transform: translateX(var(--dx)); } }
+  @keyframes sweepy { from { transform: translateY(0); } to { transform: translateY(var(--dy)); } }
+
+  /* --- CSS 로 만든 프레임 카운터 ------------------------------------------ */
+  /* ★숫자 띠를 `steps()` 로 한 칸씩 끌어올린다.★ 띠는 요소 10 개가 아니라 `white-space:
+     pre` 로 ***한 요소에 10 줄***이다 -- HUD 가 벽에서 200 개를 넘으므로 자리수마다 요소
+     10 개를 쓰면 2,000 개가 더 붙는다. 줄높이를 명시해 띠 높이(10 줄 = 250px)가
+     `--ch` 와 정확히 맞게 한다 -- 어긋나면 숫자가 반씩 걸쳐 보인다. */
+  .ctr { display: inline-block; overflow: hidden; height: 25px; vertical-align: top; }
+  .ctr > .strip { display: block; white-space: pre; line-height: 25px; }
+  .ctr.ones > .strip { animation: digit var(--ones) steps(10) infinite; }
+  .ctr.tens > .strip { animation: digit var(--tens) steps(10) infinite; }
+  /* px 로 준다 -- `-100%` 는 요소 자신의 상자에 대한 비율이라 한 겹 더 풀어야 한다. */
+  @keyframes digit { from { transform: translateY(0); } to { transform: translateY(-250px); } }
+
   /* --- CSS 키프레임 열 (rAF 와 비교) -------------------------------------- */
   #cssrow { position: absolute; left: 0; right: 0; top: 0; height: 120px; }
   .kf {
@@ -101,6 +150,9 @@
     background: #90a4ae; border-radius: 10px;
     animation: spin 2s linear infinite, hue 6s linear infinite;
   }
+  /* waapi 모드: 같은 움직임을 `Element.animate()` 가 돈다. 두 경로가 겹치지 않게 끈다. */
+  .kf.waapimode { animation: none; }
+  .pulse.waapimode { animation: none; }
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   @keyframes hue  {
     0%   { background: #90a4ae; }
@@ -142,9 +194,16 @@
   // 그 뒤(인라인 스타일 파싱 -> 리스타일 -> 리플로우 -> 디스플레이 리스트)가 원인이다.
   //   anim=raf  (기본) 프레임마다 JS 가 style.transform 문자열을 쓴다
   //   anim=css        CSS 키프레임이 돈다. 프레임당 JS 0 -> 남는 비용이 곧 스타일/합성 몫
+  //   anim=waapi      `Element.animate()` 가 돈다. CSS 와 같은 엔진 경로이지만 선언이 JS 다
   //   anim=none       도형은 정지. HUD 만 갱신 -> 이 페이지의 바닥값
   //   wc=0            will-change: transform 을 떼고 본다
-  const ANIM = ["raf", "css", "none"].includes(params.get("anim")) ? params.get("anim") : "raf";
+  //
+  // ★`css`/`waapi` 는 rAF 를 한 번도 돌리지 않는다★ -- 스윕과 HUD 까지 전부 선언형이다.
+  const ANIM = ["raf", "css", "waapi", "none"].includes(params.get("anim"))
+    ? params.get("anim") : "raf";
+  const DECLARATIVE = ANIM === "css" || ANIM === "waapi";
+  const COUNTER = DECLARATIVE && params.get("ctr") !== "0";
+  const HEARTBEAT = params.get("heartbeat") === "1";
   const WILLCHANGE = params.get("wc") !== "0";
   if (params.get("grid") === "0") document.getElementById("grid").style.display = "none";
 
@@ -186,17 +245,24 @@
   const orbs = [];
   for (let i = 0; i < SHAPES; i++) {
     const el = document.createElement("div");
-    el.className = "orb" + (ANIM === "css" ? " cssmode" : (WILLCHANGE ? " wc" : ""));
+    el.className = "orb" +
+      (ANIM === "css" ? " cssmode" :
+       ANIM === "waapi" ? " waapimode" :
+       (WILLCHANGE ? " wc" : ""));
     const kind = KINDS[i % KINDS.length];
     const size = 34 + (i % 5) * 12;
     el.style.width = size + "px";
     el.style.height = size + "px";
     const body = document.createElement("div");
-    body.className = "body " + kind + (i % 3 === 0 ? " pulse" : "");
+    const pulsing = i % 3 === 0;
+    body.className = "body " + kind +
+      (pulsing ? (ANIM === "waapi" ? " pulse waapimode" : " pulse") : "");
     el.appendChild(body);
     orbsEl.appendChild(el);
     orbs.push({
       el,
+      body,
+      pulsing,
       size,
       // 중심을 폭 방향으로 고르게 퍼뜨린다(경계마다 하나씩 걸리도록).
       cx: (i + 0.5) / SHAPES,
@@ -219,13 +285,44 @@
       b.style.height = o.size + "px";
       b.style.left = (o.r - o.size / 2) + "px";
       b.style.top = (-o.size / 2) + "px";
+      // 각속도 w(rad/s) -> 한 바퀴 초. 음수 delay 로 위상을, direction 으로 방향을 준다.
+      const turnSec = Math.abs(2 * Math.PI / o.w) / SPEED;
+      const phaseSec = -(o.phase / (2 * Math.PI)) * turnSec;
+      const dir = o.w < 0 ? "reverse" : "normal";
       if (ANIM === "css") {
-        // 각속도 w(rad/s) -> 한 바퀴 초. 방향은 animation-direction 으로 준다.
-        el.style.animationDuration = (Math.abs(2 * Math.PI / o.w) / SPEED).toFixed(2) + "s";
-        el.style.animationDirection = o.w < 0 ? "reverse" : "normal";
-        el.style.animationDelay = (-(o.phase / (2 * Math.PI)) *
-          (Math.abs(2 * Math.PI / o.w) / SPEED)).toFixed(2) + "s";
+        el.style.animationDuration = turnSec.toFixed(2) + "s";
+        el.style.animationDirection = dir;
+        el.style.animationDelay = phaseSec.toFixed(2) + "s";
+      } else if (ANIM === "waapi") {
+        // ★CSS 경로와 같은 세 값을 그대로 넘긴다.★ `delay`/`direction` 은 이 엔진에
+        // 2026-10-08 에 들어왔다 -- 그 전에는 둘 다 선언되어 있지 않아 WebIDL 이 조용히
+        // 버렸고, 그래서 이 모드를 만들 수 없었다. 엔진 안에서 두 경로가 같은 식
+        // (`started_at = now + delay`)을 쓰므로 css 모드와 글자 그대로 같이 움직인다.
+        track(el.animate(
+          [{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }],
+          { duration: turnSec * 1000, delay: phaseSec * 1000, direction: dir,
+            iterations: Infinity, easing: "linear" }));
       }
+      if (o.pulsing && ANIM === "waapi") {
+        // .pulse 의 CSS 선언(fade 3s ease-in-out)과 같은 움직임.
+        track(o.body.animate(
+          [{ opacity: 1 }, { opacity: 0.15 }, { opacity: 1 }],
+          { duration: 3000, iterations: Infinity, easing: "ease-in-out" }));
+      }
+    }
+  }
+
+  // --- WAAPI 핸들 수거 ------------------------------------------------------
+  // ★리사이즈마다 다시 만든다★ -- 취소하지 않으면 같은 요소에 애니메이션이 겹쳐 쌓이고,
+  // 그러면 리사이즈 한 번에 프레임 비용이 배로 는다. CSS 모드는 선언을 덮어쓰므로 이
+  // 문제가 없다.
+  const handles = [];
+  function track(h) { if (h) handles.push(h); }
+  function cancelAll() {
+    while (handles.length) {
+      const h = handles.pop();
+      // `cancel()` 은 이 엔진의 `Animation` 에 있는 유일한 메서드다.
+      if (h && typeof h.cancel === "function") h.cancel();
     }
   }
   if (ANIM !== "raf") placeStatic();
@@ -239,9 +336,22 @@
     if (params.get("css") === "0") return;
     for (let x = 60; x < W; x += 240) {
       const d = document.createElement("div");
-      d.className = "kf";
+      d.className = ANIM === "waapi" ? "kf waapimode" : "kf";
       d.style.left = x + "px";
-      d.style.animationDelay = (-(x / 240) * 0.1) + "s";
+      if (ANIM === "waapi") {
+        // CSS 선언(spin 2s + hue 6s)과 같은 두 애니메이션. ***`background` 단축이 아니라
+        // `backgroundColor`*** 로 준다 -- 단축은 애니메이션 가능한 속성이 아니다.
+        const ph = -(x / 240) * 100;
+        track(d.animate(
+          [{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }],
+          { duration: 2000, delay: ph, iterations: Infinity, easing: "linear" }));
+        track(d.animate(
+          [{ backgroundColor: "#90a4ae" }, { backgroundColor: "#ef5350", offset: 0.33 },
+           { backgroundColor: "#66bb6a", offset: 0.66 }, { backgroundColor: "#90a4ae" }],
+          { duration: 6000, delay: ph, iterations: Infinity, easing: "linear" }));
+      } else {
+        d.style.animationDelay = (-(x / 240) * 0.1) + "s";
+      }
       row.appendChild(d);
     }
   }
@@ -250,6 +360,14 @@
   // 중이라는 뜻이다. 타일 크기를 모르므로 격자로 흩뿌려 어느 타일에나 하나는 들어가게 한다.
   const hudLayer = document.getElementById("hudlayer");
   const huds = [];
+  // 60Hz 에서 일의 자리가 프레임마다 한 칸. 디스플레이가 60Hz 가 아니면 이 값을 바꿔야
+  // 하지만, 카운터의 쓸모(타일끼리 같은 값인가)는 주기와 무관하다.
+  const ONES_MS = 1000 / 6;
+  if (COUNTER && ANIM === "css") {
+    const root = document.documentElement.style;
+    root.setProperty("--ones", (ONES_MS / 1000).toFixed(5) + "s");
+    root.setProperty("--tens", (ONES_MS / 100).toFixed(5) + "s");
+  }
   function layoutHuds() {
     hudLayer.textContent = "";
     huds.length = 0;
@@ -264,8 +382,35 @@
         // 매 프레임 바뀌는 부분만 따로 둔다 - 위치 라벨까지 함께 다시 쓰면 그만큼
         // 텍스트 레이아웃이 늘어난다. 벽에서는 HUD 가 수십 개다.
         const live = document.createElement("span");
+        if (COUNTER) {
+          // ★스크립트 없는 프레임 카운터.★ 자리수마다 `white-space: pre` 로 10 줄을 쌓은
+          // 띠 하나를 두고 `steps(10)` 으로 한 줄씩 끌어올린다. 일의 자리가 60Hz, 십의
+          // 자리가 그 1/10 이므로 00-99 를 1.67 초에 한 바퀴 돈다.
+          // ***타일이 한 프레임 뒤처지면 일의 자리가 한 칸 다르게 보인다*** -- 15Hz 였던
+          // rAF 카운터로는 보이지 않던 차이다.
+          for (const place of ["tens", "ones"]) {
+            const ctr = document.createElement("span");
+            ctr.className = "ctr " + place;
+            const strip = document.createElement("span");
+            strip.className = "strip";
+            strip.textContent = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
+            ctr.appendChild(strip);
+            d.appendChild(ctr);
+            if (ANIM === "waapi") {
+              // CSS `.ctr.ones > .strip` 선언과 같은 움직임. `steps()` 는 양쪽 경로가
+              // 같은 파서를 쓴다(stylo `easing.rs`).
+              track(strip.animate(
+                [{ transform: "translateY(0)" }, { transform: "translateY(-250px)" }],
+                { duration: place === "ones" ? ONES_MS : ONES_MS * 10,
+                  iterations: Infinity, easing: "steps(10)" }));
+            }
+          }
+        }
         const fixed = document.createElement("span");
-        fixed.textContent = "\n@" + x + "," + y;
+        // 선언형 모드에는 fps 가 없다 - 프레임을 셀 주체가 스크립트뿐이다. 모드를 적어
+        // 두면 스크린샷만 보고도 무엇을 보고 있는지 알 수 있다.
+        fixed.textContent = DECLARATIVE ? ("  " + ANIM + "\n@" + x + "," + y)
+                                        : ("\n@" + x + "," + y);
         d.appendChild(live);
         d.appendChild(fixed);
         hudLayer.appendChild(d);
@@ -273,6 +418,30 @@
       }
     }
   }
+  // --- 스윕 막대 ------------------------------------------------------------
+  // ★여기가 `anim=css` 를 반쪽으로 만들고 있던 자리다.★ 두 막대는 모드와 무관하게 rAF 가
+  // 그렸다. 톱니파(0 -> 폭+10 을 선형 반복)이므로 선언형으로 그대로 옮겨진다.
+  // 수평 320px/s, 수직 170px/s -- rAF 경로와 같은 속도다.
+  function startSweeps() {
+    const dx = W + 10, dy = H + 10;
+    const sx = dx / 320 / SPEED, sy = dy / 170 / SPEED;
+    if (ANIM === "css") {
+      sweep.className = "cssmode";
+      sweepv.className = "cssmode";
+      sweep.style.setProperty("--dx", dx + "px");
+      sweepv.style.setProperty("--dy", dy + "px");
+      sweep.style.animationDuration = sx.toFixed(3) + "s";
+      sweepv.style.animationDuration = sy.toFixed(3) + "s";
+    } else if (ANIM === "waapi") {
+      track(sweep.animate(
+        [{ transform: "translateX(0)" }, { transform: "translateX(" + dx + "px)" }],
+        { duration: sx * 1000, iterations: Infinity, easing: "linear" }));
+      track(sweepv.animate(
+        [{ transform: "translateY(0)" }, { transform: "translateY(" + dy + "px)" }],
+        { duration: sy * 1000, iterations: Infinity, easing: "linear" }));
+    }
+  }
+
   function rebuild() {
     drawGrid();
     drawCssRow();
@@ -281,11 +450,17 @@
   rebuild();
 
   // --- 애니메이션 루프 ------------------------------------------------------
-  // ★rAF 하트비트는 이 월에서 필수다★ — rAF 가 없으면 Servo 가 즉시-합성 경로를 타면서
-  // 이벤트 루프를 압도해 창 조작이 굶는다(video_grid 페이지에 같은 주석이 있다).
-  // 이 페이지는 어차피 rAF 로 그리므로 그 조건을 자연히 만족한다.
+  // ★`css`/`waapi` 모드는 여기를 한 번도 지나지 않는다.★ 그 전까지는 모드와 무관하게 스윕
+  // 막대와 HUD 텍스트를 rAF 가 그렸고, 그래서 `anim=css` 를 주고도 화면의 절반이 스크립트
+  // 틱에 매달려 `gfx_paint_side_animation_tick_divisor` 만큼 느려졌다.
+  //
+  // 예전 주석은 "rAF 하트비트는 이 월에서 필수다 — 없으면 Servo 가 즉시-합성 경로를 타면서
+  // 이벤트 루프를 압도해 창 조작이 굶는다" 였다. CSS 애니메이션이 돌면 refresh driver 가
+  // 관찰을 유지하므로 그 조건에 걸리지 않을 것으로 보지만 ***확인하지 않았다*** --
+  // 굶으면 `?heartbeat=1` 로 가른다.
   const sweep = document.getElementById("sweep");
   const sweepv = document.getElementById("sweepv");
+  startSweeps();
   const t0 = performance.now();
   let frame = 0, fps = 0, fpsFrames = 0, fpsAt = t0, slowest = 0, lastAt = t0;
 
@@ -323,12 +498,22 @@
     }
     requestAnimationFrame(tick);
   }
-  requestAnimationFrame(tick);
+  if (!DECLARATIVE) {
+    requestAnimationFrame(tick);
+  } else if (HEARTBEAT) {
+    // 아무것도 하지 않는 하트비트. ***이것을 켜서 증상이 사라지면 그 자체가 결과다*** --
+    // 선언형 애니메이션만으로는 이벤트 루프가 유지되지 않는다는 뜻이다.
+    const beat = () => requestAnimationFrame(beat);
+    requestAnimationFrame(beat);
+  }
 
   // 창 크기가 바뀌면(타일 창 리사이즈) 좌표계를 다시 잡는다.
   window.addEventListener("resize", () => {
     W = window.innerWidth; H = window.innerHeight;
+    // ★먼저 걷는다.★ `rebuild()` 가 HUD 와 kf 열을 다시 만들므로 그 전에 취소하지 않으면
+    // 버려진 요소의 애니메이션이 핸들 배열에 남아 계속 쌓인다.
+    cancelAll();
     rebuild();
-    if (ANIM !== "raf") placeStatic();
+    if (ANIM !== "raf") { placeStatic(); startSweeps(); }
   });
 </script>
