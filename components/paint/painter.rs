@@ -1711,11 +1711,33 @@ impl Painter {
                 if webview_renderer.animating()
                     && PainterId::from(webview_renderer.id) == self.painter_id
                 {
+                    // ★rAF 가 걸려 있으면 페인트측으로 분류할 수 없다.★ 이 bool 은
+                    // refresh driver 가 틱을 `gfx_paint_side_animation_tick_divisor` 분의
+                    // 1 로 줄여도 되는지를 가린다(`refresh_driver.rs`). 줄여도 되는 근거는
+                    // "화면의 값이 틱 사이의 페인트측 예측에서 나온다" 인데, ***rAF 로
+                    // 그리는 것에는 예측할 식이 없다*** -- 콜백이 돌지 않으면 값 자체가
+                    // 생기지 않는다. 그래서 틱을 줄이면 그 애니메이션이 그만큼 느려진다.
+                    //
+                    // 한 문서에 CSS 애니메이션과 rAF 가 ***섞여*** 있으면 rAF 쪽이 이긴다.
+                    // 섞인 경우 CSS 쪽은 어차피 페인트가 전진시키므로 틱을 더 줘서 잃는
+                    // 것이 없고, rAF 쪽은 틱을 못 받으면 멈춘다.
+                    //
+                    // 실측(log_ani_debug_04/01-02, `multigpu_wall_shape_anim_probe.html`):
+                    // CSS 도형과 rAF 선이 한 페이지에 있으니 CSS 의 존재만으로 페인트측
+                    // 판정이 서고, ***도형은 60fps, 선은 15fps*** 로 갈렸다. 60Hz 월에서
+                    // 분주기가 4 이므로 정확히 60/4 다.
+                    //
+                    // 둘을 ***같은 순회***에서 잰다. `WebViewRenderer::
+                    // animation_callbacks_running` 은 연결 여부를 보지 않고 모든
+                    // 파이프라인을 훑으므로, 끊긴 파이프라인에 남은 콜백 하나가 틱을
+                    // 영구히 full-rate 로 묶을 수 있다.
                     let mut paint_side = false;
+                    let mut script_side = false;
                     webview_renderer.for_each_connected_pipeline(&mut |pipeline_details| {
                         paint_side |= pipeline_details.animations.has_paint_animations();
+                        script_side |= pipeline_details.animation_callbacks_running();
                     });
-                    Some((webview_renderer.id, paint_side))
+                    Some((webview_renderer.id, paint_side && !script_side))
                 } else {
                     None
                 }
