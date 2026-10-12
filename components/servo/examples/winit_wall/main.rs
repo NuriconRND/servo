@@ -284,6 +284,9 @@ struct AppState {
     direct_render: bool,
     /// When the next presentation tick is due.
     next_present_tick: Cell<std::time::Instant>,
+    /// 페이싱 스레드가 마지막으로 박자를 낸 시각. ★엔진 wake 가 박자를 가로채지 못하게
+    /// 하는 판정에만 쓴다★ -- `user_event` 의 주석 참고.
+    last_pacing_tick_at: Cell<Option<std::time::Instant>>,
     /// ★표출 클럭을 디스플레이 vsync 에 묶는다(`gfx_vsync_enabled`).★ 켜졌을 때만 Some.
     ///
     /// 소프트 타이머는 정확히 60 개를 내도 디스플레이와 **다른 발진기**다. 위상이
@@ -800,11 +803,28 @@ impl AppState {
 
     /// winit 이 `RedrawRequested` 를 전달했다.
     fn note_tick_site(&self, site: ClockSite) {
+        // ★발화한 것만 센다.★ 이 함수는 `drive_present_clock_timer` 의 게이트를 통과한
+        // 뒤에만 불리므로, 여기 찍힌 시각은 "페이싱이 실제로 박자를 냈다" 는 뜻이다.
+        if matches!(site, ClockSite::PacingThread) {
+            self.last_pacing_tick_at
+                .set(Some(std::time::Instant::now()));
+        }
         let mut stats = self.clock_stats.borrow_mut();
         stats
             .window_start
             .get_or_insert_with(std::time::Instant::now);
         stats.tick_by_site[site as usize] += 1;
+    }
+
+    /// 페이싱 스레드가 박자를 쥐고 있는가.
+    ///
+    /// 창을 네 주기로 잡은 것은 `pump_paint_animation` 의 `renderer_is_running` 과 같은
+    /// 이유다 -- 한두 프레임 늦은 것을 "멎었다" 로 오판하지 않기 위해서다. 진짜로 멎으면
+    /// 67ms 뒤에 엔진 wake 가 백스톱으로 받는다.
+    fn pacing_is_driving(&self) -> bool {
+        self.last_pacing_tick_at
+            .get()
+            .is_some_and(|at| at.elapsed() < self.present_period * 4)
     }
 
     fn note_about_to_wait(&self) {
@@ -1733,6 +1753,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 std::time::Duration::from_secs_f64(1.0 / hz as f64)
             },
             next_present_tick: Cell::new(std::time::Instant::now()),
+            last_pacing_tick_at: Cell::new(None),
             present_vsync: shell_vsync_driver,
             vsync_due: Arc::new(AtomicBool::new(false)),
             vsync_armed: Cell::new(false),
@@ -1848,8 +1869,44 @@ impl ApplicationHandler<WakerEvent> for App {
                 state.wake_pending.store(false, Ordering::SeqCst);
             }
             state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
-            // 큐가 비지 않아도 박자는 흘러야 한다(`drive_present_clock` 참조).
-            state.drive_present_clock(site);
+            // ★페이싱이 살아 있으면 페이싱만이 박자를 끈다.★
+            //
+            // `drive_present_clock_timer` 의 게이트는 `now >= next` 하나이고 ***호출자를
+            // 보지 않는다.*** 그래서 엔진 wake 가 격자점을 조금이라도 지나서 도착하면 그
+            // 자리에서 렌더가 나가고, 제시간에 깬 페이싱 틱은 이미 지나간 격자점을 보고
+            // 아무것도 하지 않는다. 발화 시각이 ***격자점 + 엔진 wake 가 올 때까지의 랜덤
+            // 지연***이 되는데, 이 셸은 엔진 wake 를 초당 300 회 받으므로(그 주석은
+            // `fire_present_tick` 에 있다) 격자점 직후 아무 때나 하나가 온다.
+            //
+            // ★같은 버그를 페인트 쪽에서는 이미 고쳤다.★ `pump_paint_animation` 주석:
+            // "타이머 폴백은 '아무도 렌더하지 않을 때' 전용이다. 렌더가 돌고 있는데도 이
+            // disjunct 가 같은 주기로 같이 돌면 ***두 시계가 맥놀이한다.***" 셸의 박자에만
+            // 그 수정이 빠져 있었다.
+            //
+            // 실측(log_ani_debug_04/07_temp, 08_temp): `WALLCLOCK` 의 `user/s` 가
+            // 0.02 -> 1.76 -> 3.38 -> 4.18 -> 6.65 로 가는 동안 저더가 재발했고, 같은
+            // 방향으로 `jit_ms p50` 이 0.41 -> 0.47 로, 프레임당 이동 `dx_px` 의 창별
+            // max 가 38.4(기대값) 근처에서 41.6 까지 올랐다가 가끔 제자리로 돌아오는
+            // ***드리프트·리셋***을 보였다. 프레임을 놓친 흔적은 없다(`dup=0 skip1=0
+            // renders=60`) -- 늦은 프레임이 아니라 ***고르지 않은 간격***이다.
+            //
+            // 페이싱이 이르게 깨느냐 늦게 깨느냐는 경계에 걸린 양자택일이라 환경 변화로
+            // 뒤집힌다. 그래서 상관이 아니라 ***구조***로 막는다.
+            //
+            // `spin_event_loop` 은 그대로 돈다 -- 엔진 메시지 처리는 아무것도 바뀌지
+            // 않는다. 바뀌는 것은 ***누가 렌더를 끄나*** 뿐이다.
+            match event {
+                // 페이싱 틱은 언제나 박자를 끈다.
+                WakerEvent::Tick => {
+                    state.drive_present_clock(site);
+                },
+                // 엔진 wake 는 ★페이싱이 멎었을 때만★ 받는다. 큐가 비지 않아도 박자는
+                // 흘러야 한다는 원래 요구는 이 백스톱이 그대로 만족시킨다.
+                WakerEvent::Engine if !state.pacing_is_driving() => {
+                    state.drive_present_clock(site);
+                },
+                WakerEvent::Engine => {},
+            }
         }
     }
 
