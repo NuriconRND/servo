@@ -1190,10 +1190,30 @@ impl Painter {
         //
         // 샘플 시각은 오직 `update_paint_animations` 에만 들어간다 -- 그것이 B2 가 바꾸려는
         // 유일한 것이다: **언제 그릴까가 아니라, 어느 시각의 값을 그릴까.**
-        let now = Instant::now();
+        // ★★두 시계 읽기 사이에 아무것도 두지 않는다.★★
+        //
+        // 아래 `sample_at` 은 `now + (target - qpc_now())` 이고 `target` 은 합성 격자 위의
+        // 정수배다. ***두 시계를 같은 순간에 읽으면 `now` 가 상쇄되어 `sample_at` 이 정확히
+        // `target` 이 된다*** -- 즉 샘플 시각이 격자 위에 떨어져 간격이 완벽히 고르다.
+        // 그 사이에 무엇이든 끼면 그만큼 `sample_at` 이 뒤로 밀리고, ***그 일의 소요 시간
+        // 변동이 그대로 샘플 간격의 지터가 된다.***
+        //
+        // `note_dcomp_frame_statistics` 가 바로 거기 있었다. DWM 통계 조회
+        // (`DCompositionGetStatistics` + 타깃마다 `GetTargetStatistics`)라 비용이 일정하지
+        // 않다. 샘플 시각과는 아무 상관이 없으므로 앞으로 옮긴다.
+        //
+        // 실측(log_ani_debug_04/09): 프레임당 이동 `dx_px` 의 폭이 4.22px 인데 샘플 간격
+        // `dt_ms` 폭 1.13ms 로 설명되는 것은 2.60px 뿐이었다(2,304px/s). 나머지가 이
+        // 틈이다. `SAMPLELEAD lead_ms` 와 `SAMPLESLIP phase_all_ms` 의 폭이 둘 다
+        // 1.18ms 로 같은 것이 그 방증이다 -- `target` 이 고정이므로 lead 의 변동은 곧
+        // 호출 시각의 변동이고, 그것은 상쇄되어야 하는 값이다.
+        //
+        // ★같은 버그를 `snap_to_dwm_grid_at` 에서 이미 고쳤다★ -- anchor 를 QPC 읽기 바로
+        // 옆에서 읽게 바꿔 missed present 가 3~4 배 줄었다. 같은 형태가 여기 남아 있었다.
         #[cfg(windows)]
         self.note_dcomp_frame_statistics();
-        let sample_at = now + self.paint_animation_sample_lead();
+        let now = Instant::now();
+        let sample_at = self.paint_animation_sample_at().unwrap_or(now);
         let mut floats = Vec::new();
         let mut transforms = Vec::new();
         let mut still_animating = false;
@@ -3760,12 +3780,18 @@ impl Painter {
     /// 격자나 모니터를 못 구하면(프로브 미가동·핫플러그 직후) 0 으로 떨어진다 -- 그 타일만
     /// 오늘 동작으로 돌아가는 것이고, 화면이 멈추는 쪽보다 낫다. 그 건수는 `SAMPLELEAD` 의
     /// `nogrid` 가 센다.
-    fn paint_animation_sample_lead(&self) -> Duration {
+    /// 이 프레임의 애니메이션 값을 ★어느 시각으로★ 뽑을까. 꺼져 있으면 `None` -> 호출자가
+    /// 지금 시각을 쓴다.
+    ///
+    /// ★`Duration` 이 아니라 `Instant` 를 돌려준다.★ 앵커(`Instant::now()`)를 QPC 읽기와
+    /// 같은 순간에 잡아야 두 시계가 상쇄되어 샘플 시각이 격자 위에 정확히 떨어진다 --
+    /// `lead_to_next_composition` 의 주석이 그 산수를 적고 있다. 호출자가 자기 `now` 를
+    /// 더하면 그 사이의 `MonitorFromWindow` + `DwmGetCompositionTimingInfo` 가 그대로
+    /// 지터가 된다.
+    fn paint_animation_sample_at(&self) -> Option<Instant> {
         #[cfg(windows)]
         {
-            let Some(lead_periods) = *crate::commit_scheduler::SAMPLE_LEAD_PERIODS else {
-                return Duration::ZERO;
-            };
+            let lead_periods = (*crate::commit_scheduler::SAMPLE_LEAD_PERIODS)?;
             // ★격자는 **공통 합성 격자** 하나다.★ 출력별 vblank 가 아니다 -- 계측으로
             // 확인된 바에 따르면 DWM 은 네 타일을 하나의 합성 패스에서 함께 올리므로
             // (`output_grid::COMPOSITION` 주석), 타일마다 다른 기준에 맞추는 것은 오차만
@@ -3775,18 +3801,18 @@ impl Painter {
             // 조회가 실패하면 `None` -> 오늘 동작(지금 시각 샘플)으로 떨어진다.
             let monitor = self.tile_monitor().unwrap_or(0);
             match crate::output_grid::lead_to_next_composition(monitor, lead_periods) {
-                Some(lead) => {
+                Some((anchor, lead)) => {
                     crate::output_grid::note_sample_lead(monitor, lead);
-                    lead
+                    Some(anchor + lead)
                 },
                 None => {
                     crate::output_grid::note_sample_lead_missing();
-                    Duration::ZERO
+                    None
                 },
             }
         }
         #[cfg(not(windows))]
-        Duration::ZERO
+        None
     }
 
     /// 이 타일이 올라가 있는 출력. 디스플레이 구성이 바뀌면 달라지므로 매번 다시 묻는다

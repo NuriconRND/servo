@@ -442,10 +442,27 @@ fn composition_target(last: u64, period: u64, lead_periods: u64) -> u64 {
     last.saturating_add(period.saturating_mul(1 + lead_periods))
 }
 
-pub(crate) fn lead_to_next_composition(monitor: usize, lead_periods: u64) -> Option<Duration> {
+/// 돌려주는 것은 ★`(앵커, 남은 시간)`★ 이고, 호출자는 `앵커 + 남은 시간` 을 써야 한다.
+///
+/// ★앵커를 여기서 읽는 이유.★ `sample_at = anchor + (target - qpc_now)` 이고 `target` 은
+/// 격자 위 정수배다. ***두 시계를 같은 순간에 읽으면 `anchor` 가 상쇄되어 `sample_at` 이
+/// 정확히 `target` 이 된다*** -- 샘플 시각이 격자에 떨어져 간격이 완벽히 고르다. 둘 사이에
+/// 무엇이든 끼면 그만큼 밀리고, ***그 일의 소요 시간 변동이 그대로 샘플 간격의 지터가
+/// 된다.*** 호출자가 `Instant::now()` 를 따로 읽어 넘기면 그 사이에 `tile_monitor`
+/// (`MonitorFromWindow`)와 `composition_grid`(`DwmGetCompositionTimingInfo`, DWM 과
+/// 통신한다)가 들어가므로, ★앵커는 반드시 `qpc_now()` 옆에서 읽어야 한다.★
+///
+/// `snap_to_dwm_grid_at` 이 같은 이유로 같은 모양이다 -- 그쪽은 이 수정으로 missed present
+/// 가 3~4 배 줄었다.
+pub(crate) fn lead_to_next_composition(
+    monitor: usize,
+    lead_periods: u64,
+) -> Option<(std::time::Instant, Duration)> {
     let (last, period) = composition_grid()?;
-    let now = qpc_now()?;
     let freq = qpc_frequency()?;
+    // ★이 두 줄 사이에 아무것도 두지 말 것.★ 위 문단이 그 이유다.
+    let anchor = std::time::Instant::now();
+    let now = qpc_now()?;
     // ★★목표 시각은 `now` 에서 뽑지 않는다. **합성 번호에서 센다.**★★
     //
     // `last`(= `lastFrameTime`)는 합성 격자 위의 절대 시각이고, 네 페인터가 **같은 값을
@@ -464,8 +481,9 @@ pub(crate) fn lead_to_next_composition(monitor: usize, lead_periods: u64) -> Opt
     // 렌더가 격자의 어디에 떨어졌나. 슬립 진단용이고 목표 계산에는 쓰이지 않는다.
     let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
     note_sample_slip(monitor, target / period, phase_ms);
-    Some(Duration::from_secs_f64(
-        target.saturating_sub(now) as f64 / freq as f64,
+    Some((
+        anchor,
+        Duration::from_secs_f64(target.saturating_sub(now) as f64 / freq as f64),
     ))
 }
 
