@@ -168,6 +168,12 @@ impl WebContentAnimator {
 #[derive(Default)]
 pub(crate) struct PipelineAnimations {
     caret: RefCell<Option<CaretAnimation>>,
+    /// 직전 디스플레이 리스트의 `built_at`(초). `TIMELINESTEP` 전용.
+    built_at_previous: Cell<Option<f64>>,
+    /// 이번 창에 모인 `built_at` 간격(ms).
+    built_at_gaps: RefCell<Vec<f64>>,
+    /// 창이 열린 시각.
+    built_at_window_start: Cell<Option<Instant>>,
     /// What layout last told us to keep playing, and the clock it is played against.
     /// Replaced wholesale by every display list -- see [`PaintAnimation`].
     paint: RefCell<Vec<ActivePaintAnimation>>,
@@ -492,9 +498,54 @@ impl PipelineAnimations {
     /// prediction is overwritten by the truth before it can drift. Only when script stops
     /// producing display lists does the prediction actually get used for long, and that is
     /// exactly when it is worth having.
+    /// ★레이아웃이 애니메이션을 샘플링한 시각의 간격을 모아 1 초마다 찍는다.★
+    ///
+    /// `SERVO_LOG_ANIM_STEP_SEQ=1` 일 때만 돈다 -- `ANIMSTEPSEQ` 와 같은 스위치, 같은 창,
+    /// 같은 포맷이라 두 줄을 나란히 읽으면 된다. ***`ANIMSTEPSEQ` 의 `dt_ms` 는 표출 격자가
+    /// 고른지를 재고, 이 줄은 값의 출처가 고른지를 잰다.*** 실측에서 전자는 고른데
+    /// (이탈의 95%에서 `dt` 정상) 화면은 떨었으므로, 남은 곳이 여기다.
+    ///
+    /// `built_at` 은 한 디스플레이 리스트의 모든 애니메이션이 공유하므로 첫 번째만 본다.
+    fn note_timeline_step(&self, paint_animations: &[PaintAnimation], received_at: Instant) {
+        if !*crate::painter::LOG_ANIM_STEP_SEQ {
+            return;
+        }
+        let Some(first) = paint_animations.first() else {
+            return;
+        };
+        // `CrossProcessInstant` 는 뺄셈만 정의돼 있다. 고정 기준과의 차로 초를 만든다.
+        let current = (first.built_at - CrossProcessInstant::epoch()).as_seconds_f64();
+        if let Some(gap) = note_built_at_gap(self.built_at_previous.get(), current) {
+            self.built_at_gaps.borrow_mut().push(gap);
+        }
+        self.built_at_previous.set(Some(current));
+
+        let window_start = match self.built_at_window_start.get() {
+            Some(at) => at,
+            None => {
+                self.built_at_window_start.set(Some(received_at));
+                received_at
+            },
+        };
+        if received_at.duration_since(window_start) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.built_at_window_start.set(Some(received_at));
+        let gaps: Vec<f64> = self.built_at_gaps.borrow_mut().drain(..).collect();
+        if gaps.len() < 2 {
+            return;
+        }
+        log::warn!(
+            "TIMELINESTEP n={} built_at_gap_ms=[{}]",
+            gaps.len(),
+            crate::painter::format_step_sequence(&gaps),
+        );
+    }
+
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
         let now = CrossProcessInstant::now();
+        self.note_timeline_step(&paint_animations, received_at);
         self.prune_held(&paint_animations);
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
@@ -581,6 +632,57 @@ impl CaretAnimation {
             key: self.caret_property_key,
             value,
         })
+    }
+}
+
+/// 직전 디스플레이 리스트의 `built_at` 과 이번 것의 간격(ms). 없거나 뒤로 가면 `None`.
+///
+/// ★`built_at` 은 레이아웃이 애니메이션을 샘플링한 시각이다★ -- `current_time_for_animations`
+/// 와 같은 리플로 안에서 정해진다. 표출 격자는 `ANIMSTEPSEQ` 의 `dt_ms` 로 이미 재고 있고
+/// 그쪽은 고르다. ***둘을 나란히 놓으면 "프레임은 제때 나오는데 값이 떤다" 를 값의 출처에서
+/// 직접 확인할 수 있다.***
+///
+/// 시계가 뒤로 간 표본은 버린다 -- `built_at` 은 레이아웃 스레드가 찍고 이 함수는 페인트
+/// 스레드에서 돈다. 순서가 뒤집힌 표본을 간격으로 세면 음수가 분포에 섞여, 정작 찾는
+/// "한 프레임 밀림" 을 가린다.
+fn note_built_at_gap(previous_seconds: Option<f64>, current_seconds: f64) -> Option<f64> {
+    let previous = previous_seconds?;
+    let gap = current_seconds - previous;
+    if gap < 0.0 {
+        return None;
+    }
+    Some((gap * 1000.0 * 10.0).round() / 10.0)
+}
+
+#[cfg(test)]
+mod timeline_step_tests {
+    use super::note_built_at_gap;
+
+    /// 첫 표본은 비교 대상이 없다 -- 간격이 아니라 기준점이다.
+    #[test]
+    fn first_sample_yields_no_gap() {
+        assert_eq!(note_built_at_gap(None, 1.000), None);
+    }
+
+    /// ★이것이 재려는 값이다.★ 레이아웃이 애니메이션을 샘플링한 시각의 간격. 표출은
+    /// 고른데 이것이 고르지 않다면, 화면이 떠는 이유는 프레임 타이밍이 아니라 값이다.
+    #[test]
+    fn reports_gap_in_milliseconds() {
+        assert_eq!(note_built_at_gap(Some(1.000), 1.0167), Some(16.7));
+    }
+
+    /// ★시계가 뒤로 가면 버린다.★ `built_at` 은 레이아웃 스레드가 찍고 여기는 페인트
+    /// 스레드다. 순서가 뒤집힌 표본을 간격으로 세면 음수가 분포에 섞여, 정작 찾는
+    /// "한 프레임 밀림" 을 가린다.
+    #[test]
+    fn drops_samples_that_go_backwards() {
+        assert_eq!(note_built_at_gap(Some(2.000), 1.990), None);
+    }
+
+    /// 같은 시각이면 간격 0 이다 -- 한 리플로에서 두 번 설치된 경우이고, 그것도 정보다.
+    #[test]
+    fn zero_gap_is_a_real_sample() {
+        assert_eq!(note_built_at_gap(Some(1.000), 1.000), Some(0.0));
     }
 }
 

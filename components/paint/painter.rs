@@ -4470,7 +4470,7 @@ pub(crate) enum PaintMetricState {
 /// 한 줄에 한 창(60 개)을 담는다. 프레임마다 한 줄이면 300 초에 72,000 줄이 되고, 이
 /// 로그는 이미 200MB 를 넘긴 적이 있다. 소수 한 자리면 충분하다 -- 1x(2,304px/s)에서
 /// 0.1 은 0.1px 이고 0.006 주기다.
-fn format_step_sequence(samples: &[f64]) -> String {
+pub(crate) fn format_step_sequence(samples: &[f64]) -> String {
     let mut out = String::with_capacity(samples.len() * 6);
     for (index, value) in samples.iter().enumerate() {
         if index > 0 {
@@ -4486,7 +4486,7 @@ fn format_step_sequence(samples: &[f64]) -> String {
 /// 기본은 꺼짐이다. 켜면 창당 한 줄(약 600 자)이 painter 수만큼 늘고, 벽에서는 초당 네
 /// 줄이다 -- 300 초에 1,200 줄, 700KB 남짓. `ANIMSTEP` 과 같은 창, 같은 표본이므로 둘을
 /// 나란히 읽으면 "요약이 무엇을 묻었나" 가 바로 드러난다.
-static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
+pub(crate) static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SERVO_LOG_ANIM_STEP_SEQ").is_ok_and(|value| value != "0"));
 
 #[cfg(test)]
