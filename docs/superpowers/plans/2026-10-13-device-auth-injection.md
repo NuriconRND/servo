@@ -965,7 +965,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `#[derive(Default)] pub struct InjectionTracker`
   - `pub fn on_document_event(&mut self, event: DocumentEvent) -> Option<AuthState>` — 지금 넣을 값
   - `pub fn on_auth_state(&mut self, state: AuthState) -> Option<AuthState>` — 지금 넣을 값
-  - `pub fn on_injection_failed(&mut self)` — 다음 `HeadParsed`/`Complete`에서 다시 넣게 한다
+  - `pub fn document(&self) -> u64` — 현재 문서 세대(`Started`마다 1 증가). 주입할 때 함께 들고 간다
+  - `pub fn on_injection_failed(&mut self, document: u64)` — 그 문서가 아직 현재 문서면 다음 `HeadParsed`/`Complete`에서 다시 넣게 한다. 앞 문서의 늦은 실패는 버린다 (리뷰 후 결정, 2026-10-13)
 
 규칙: `Started`는 새 문서(이전 주입 무효). 문서가 `HeadParsed` 또는 `Complete`에 이르렀고 결과가 있으면 그 문서에 한 번 넣는다. 결과가 바뀌면 준비된 현재 문서에 곧바로 다시 넣는다. 결과가 아직 없으면 넣지 않는다(페이지는 기다린다). `#`만 바뀌는 이동은 `LoadStatus`를 내지 않으므로 아무것도 하지 않는다.
 
@@ -1166,7 +1167,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `#[cfg(test)] mod tests` (2163행 근처)
 
 **Interfaces:**
-- Consumes: `spawn_poller`, `AuthState`, `PageScope`, `InjectionTracker`, `DocumentEvent`, `SIGNING_KEY_KIND` (Task 1–5); `servo::{LoadStatus, JSValue, WebView}`; `WebView::evaluate_javascript(&self, script, callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static)` (components/servo/webview.rs:831)
+- Consumes: `spawn_poller`, `AuthState`, `PageScope`, `InjectionTracker`, `DocumentEvent`, `SIGNING_KEY_KIND` (Task 1–5); `servo::{LoadStatus, JSValue, WebView}`; `WebView::evaluate_javascript(&self, script, callback: impl FnOnce(Result<JSValue, JavaScriptEvaluationError>) + 'static)` (components/servo/webview.rs:831) — `InjectionTracker::document() -> u64`, `on_injection_failed(document: u64)` (Task 5 ruling: 늦게 온 실패는 버린다)
 - Produces: `fn document_event(status: LoadStatus) -> DocumentEvent` (main.rs, 시험 대상)
 
 - [ ] **Step 1: 실패하는 시험 작성 (main.rs `mod tests` 안)**
@@ -1232,8 +1233,10 @@ fn document_event(status: ::servo::LoadStatus) -> sdwall_device_auth::DocumentEv
         let (Some(auth), Some(scope)) = (pending, self.device_auth_scope.as_ref()) else {
             return;
         };
+        // 이 주입이 어느 문서의 것인지 -- 늦게 온 실패가 새 문서의 주입을 무르지 않게 한다.
+        let document = self.device_auth.borrow().document();
         let Some(webview) = self.webview.borrow().clone() else {
-            self.device_auth.borrow_mut().on_injection_failed();
+            self.device_auth.borrow_mut().on_injection_failed(document);
             return;
         };
         let tracker = self.device_auth.clone();
@@ -1245,7 +1248,7 @@ fn document_event(status: ::servo::LoadStatus) -> sdwall_device_auth::DocumentEv
             Ok(other) => log::warn!("device-auth: inject {label} -> unexpected {other:?}"),
             Err(error) => {
                 log::warn!("device-auth: inject {label} failed: {error:?}");
-                tracker.borrow_mut().on_injection_failed();
+                tracker.borrow_mut().on_injection_failed(document);
             },
         });
     }
