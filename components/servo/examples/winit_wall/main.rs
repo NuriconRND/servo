@@ -2242,9 +2242,18 @@ mod tests {
     #[test]
     fn load_status_maps_to_document_event() {
         use sdwall_device_auth::DocumentEvent;
-        assert_eq!(document_event(::servo::LoadStatus::Started), DocumentEvent::Started);
-        assert_eq!(document_event(::servo::LoadStatus::HeadParsed), DocumentEvent::HeadParsed);
-        assert_eq!(document_event(::servo::LoadStatus::Complete), DocumentEvent::Complete);
+        assert_eq!(
+            document_event(::servo::LoadStatus::Started),
+            DocumentEvent::Started
+        );
+        assert_eq!(
+            document_event(::servo::LoadStatus::HeadParsed),
+            DocumentEvent::HeadParsed
+        );
+        assert_eq!(
+            document_event(::servo::LoadStatus::Complete),
+            DocumentEvent::Complete
+        );
     }
 
     /// ★vsync 가 켜져 있으면 그것이 이긴다.★ 이미 있는 동작이고 바뀌면 안 된다.
