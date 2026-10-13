@@ -40,7 +40,9 @@ param(
     [string] $GstRoot = "F:\gstreamer-inhouse\1.28.4.100\1.0\msvc_x86_64",
     [ValidateSet("release", "debug")]
     [string] $Profile = "release",
-    [switch] $Force
+    [switch] $Force,
+    # Only to deliberately package an engine built with the test signing key (lab use, never site deployment).
+    [switch] $AllowTestSigningKey
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +54,19 @@ $features = "media-gstreamer,no-wgl,webgpu"
 $buildCmd = "cargo build -p servo --example winit_wall --features $features --$Profile"
 if (!(Test-Path $exe))     { throw "winit_wall.exe not found: $exe  (build it first: $buildCmd)" }
 if (!(Test-Path $GstRoot)) { throw "GStreamer root not found: $GstRoot" }
+
+# Never ship a test-signing-key build. The key is baked in at build time
+# (SDWALL_DEVICE_AUTH_SIGNING_KEY), so it is told apart by the PEM body inside the exe.
+# A test-key build accepts the "auth ok" that fake-auth signs.
+# device_auth_key_kind.ps1 is only used here, before packaging; it is not copied into the dist.
+. (Join-Path $PSScriptRoot "device_auth_key_kind.ps1")
+$deviceAuthKey = Get-DeviceAuthKeyKind -Exe $exe -Repo $repo
+if ($deviceAuthKey -ne 'release') {
+    if (-not $AllowTestSigningKey) {
+        throw "winit_wall.exe device-auth signing key is '$deviceAuthKey', not 'release'. Rebuild without SDWALL_DEVICE_AUTH_SIGNING_KEY (or pass -AllowTestSigningKey for a lab package)."
+    }
+    Write-Warning "Packaging a '$deviceAuthKey'-signing-key engine (-AllowTestSigningKey). Not for site deployment."
+}
 
 # --- 1. ANGLE must be the patched build. Hard-fail rather than ship a one-GPU wall. ---
 Write-Host "Checking ANGLE LUID patch state..."
