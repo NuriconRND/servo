@@ -3,9 +3,11 @@
 //! 명세: servo-handoff/servo-device-auth.md. 엔진에 의존하지 않는 부분만 여기 둔다 --
 //! 셸은 폴러를 띄우고, 문서 이벤트를 `InjectionTracker` 에 넣고, 나온 스크립트를 실행한다.
 
+mod client;
 mod key;
 mod verify;
 
+pub use client::{DEVICE_SERVICE_ADDR, new_nonce, query_device_auth};
 pub use key::{SIGNING_KEY_KIND, embedded_verifying_key, parse_public_key_pem};
 pub use p256::ecdsa::VerifyingKey;
 pub use verify::{AuthState, DeviceAuthResponse, verify_response};
