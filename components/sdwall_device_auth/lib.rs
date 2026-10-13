@@ -5,11 +5,13 @@
 
 mod client;
 mod key;
+mod page;
 mod poller;
 mod verify;
 
 pub use client::{DEVICE_SERVICE_ADDR, new_nonce, query_device_auth};
 pub use key::{SIGNING_KEY_KIND, embedded_verifying_key, parse_public_key_pem};
 pub use p256::ecdsa::VerifyingKey;
+pub use page::{PageScope, SCOPED_PATH_PREFIXES};
 pub use poller::{QUERY_TIMEOUT, RETRY_INTERVAL, run_poll_loop, spawn_poller};
 pub use verify::{AuthState, DeviceAuthResponse, verify_response};
