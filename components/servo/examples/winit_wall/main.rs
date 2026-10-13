@@ -257,6 +257,10 @@ struct AppState {
     servo: Servo,
     // Filled in after the tiles exist (the WebView's delegate is `AppState` itself).
     webview: RefCell<Option<WebView>>,
+    /// 장비 인증(servo-device-auth.md): 언제 넣을지. 평가 콜백도 만지므로 `Rc` 로 나눈다.
+    device_auth: Rc<RefCell<sdwall_device_auth::InjectionTracker>>,
+    /// 넘겨도 되는 페이지. 시작 URL 이 불투명 오리진이면 `None` -- 아무 데도 넘기지 않는다.
+    device_auth_scope: Option<sdwall_device_auth::PageScope>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -1257,6 +1261,37 @@ fn spawn_pacing_thread(
 }
 
 impl AppState {
+    fn on_device_auth_state(&self, auth: sdwall_device_auth::AuthState) {
+        // 지문은 로그에도 남기지 않는다 -- `AuthState` 에는 애초에 없다.
+        log::warn!("device-auth: {}", auth.label());
+        let pending = self.device_auth.borrow_mut().on_auth_state(auth);
+        self.inject_device_auth(pending);
+    }
+
+    fn inject_device_auth(&self, pending: Option<sdwall_device_auth::AuthState>) {
+        let (Some(auth), Some(scope)) = (pending, self.device_auth_scope.as_ref()) else {
+            return;
+        };
+        // 이 주입이 어느 문서의 것인지 -- 늦게 온 실패가 새 문서의 주입을 무르지 않게 한다.
+        let document = self.device_auth.borrow().document();
+        let Some(webview) = self.webview.borrow().clone() else {
+            self.device_auth.borrow_mut().on_injection_failed(document);
+            return;
+        };
+        let tracker = self.device_auth.clone();
+        let label = auth.label();
+        webview.evaluate_javascript(scope.injection_script(&auth), move |result| match result {
+            Ok(::servo::JSValue::String(outcome)) => {
+                log::info!("device-auth: inject {label} -> {outcome}")
+            },
+            Ok(other) => log::warn!("device-auth: inject {label} -> unexpected {other:?}"),
+            Err(error) => {
+                log::warn!("device-auth: inject {label} failed: {error:?}");
+                tracker.borrow_mut().on_injection_failed(document);
+            },
+        });
+    }
+
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
@@ -1500,7 +1535,25 @@ impl AppState {
     }
 }
 
+/// `LoadStatus` 는 최상위 문서에만 나온다 -- 장비 인증을 넘길 문서도 최상위뿐이다.
+fn document_event(status: ::servo::LoadStatus) -> sdwall_device_auth::DocumentEvent {
+    use sdwall_device_auth::DocumentEvent;
+    match status {
+        ::servo::LoadStatus::Started => DocumentEvent::Started,
+        ::servo::LoadStatus::HeadParsed => DocumentEvent::HeadParsed,
+        ::servo::LoadStatus::Complete => DocumentEvent::Complete,
+    }
+}
+
 impl ::servo::WebViewDelegate for AppState {
+    fn notify_load_status_changed(&self, _: WebView, status: ::servo::LoadStatus) {
+        let pending = self
+            .device_auth
+            .borrow_mut()
+            .on_document_event(document_event(status));
+        self.inject_device_auth(pending);
+    }
+
     fn notify_new_frame_ready(&self, _: WebView) {
         // ***Deliberately does nothing.*** This used to request a redraw, which made the
         // presentation cadence a function of when content happened to finish -- so the wall
@@ -1790,6 +1843,8 @@ impl ApplicationHandler<WakerEvent> for App {
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
+            device_auth: Rc::default(),
+            device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
             tiles,
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
@@ -1905,16 +1960,33 @@ impl ApplicationHandler<WakerEvent> for App {
             spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);
         }
 
+        if sdwall_device_auth::SIGNING_KEY_KIND != "release" {
+            log::warn!(
+                "device-auth: built with the {} signing key -- not for deployment",
+                sdwall_device_auth::SIGNING_KEY_KIND
+            );
+        }
+        let device_auth_proxy = waker.proxy.clone();
+        sdwall_device_auth::spawn_poller(move |auth| {
+            let _ = device_auth_proxy.send_event(WakerEvent::DeviceAuth(auth));
+        });
+
         *self = Self::Running(app_state);
     }
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: WakerEvent) {
         if let Self::Running(state) = self {
+            // 장비 인증은 표출 박자와 상관없다 -- 세지도, 렌더를 끌지도 않는다.
+            if let WakerEvent::DeviceAuth(auth) = &event {
+                state.on_device_auth_state(auth.clone());
+                return;
+            }
             // 페이싱 스레드가 올린 틱과 엔진 wake 를 구분해 센다 -- 어느 쪽이 박자를 쥐고
             // 있는지가 `WALLCLOCK tick_by` 로 드러나야 한다.
             let site = match event {
                 WakerEvent::Tick => ClockSite::PacingThread,
                 WakerEvent::Engine => ClockSite::UserEvent,
+                WakerEvent::DeviceAuth(_) => unreachable!("handled above"),
             };
             // ★깨우기가 합쳐졌음을 먼저 표시한다★ -- 비우기 전에. 이 드레인이 도는 동안
             // 들어온 깨우기는 새 이벤트를 올려야 하고, 순서를 뒤집으면 그것을 잃는다.
@@ -1962,6 +2034,7 @@ impl ApplicationHandler<WakerEvent> for App {
                     state.drive_present_clock(site);
                 },
                 WakerEvent::Engine => {},
+                WakerEvent::DeviceAuth(_) => unreachable!("handled above"),
             }
         }
     }
@@ -2069,6 +2142,8 @@ enum WakerEvent {
     Engine,
     /// 페이싱 스레드가 표출 틱 시각을 알린다.
     Tick,
+    /// 장비 인증 폴러가 바뀐 결과를 알린다.
+    DeviceAuth(sdwall_device_auth::AuthState),
 }
 
 impl Waker {
@@ -2163,6 +2238,14 @@ fn choose_frame_clock(vsync_enabled: bool, pacing_thread: bool) -> FrameClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_status_maps_to_document_event() {
+        use sdwall_device_auth::DocumentEvent;
+        assert_eq!(document_event(::servo::LoadStatus::Started), DocumentEvent::Started);
+        assert_eq!(document_event(::servo::LoadStatus::HeadParsed), DocumentEvent::HeadParsed);
+        assert_eq!(document_event(::servo::LoadStatus::Complete), DocumentEvent::Complete);
+    }
 
     /// ★vsync 가 켜져 있으면 그것이 이긴다.★ 이미 있는 동작이고 바뀌면 안 된다.
     #[test]

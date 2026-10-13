@@ -7747,6 +7747,7 @@ dependencies = [
  "parking_lot",
  "rustc-hash 2.1.2",
  "rustls",
+ "sdwall-device-auth",
  "serde",
  "servo",
  "servo-background-hang-monitor",
