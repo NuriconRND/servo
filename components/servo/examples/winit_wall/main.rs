@@ -272,6 +272,8 @@ struct AppState {
     device_auth_scope: Option<sdwall_device_auth::PageScope>,
     /// `--device-auth-selftest` (시험 키 빌드 전용).
     device_auth_selftest: Option<Rc<RefCell<device_auth_selftest::DeviceAuthSelfTest>>>,
+    /// 자가 시험이 평가 콜백 안에서 정한 다음 동작 스크립트. `about_to_wait` 에서 실행한다.
+    device_auth_selftest_next: Rc<Cell<Option<&'static str>>>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -1292,15 +1294,17 @@ impl AppState {
         let tracker = self.device_auth.clone();
         let label = auth.label();
         let selftest = self.device_auth_selftest.clone();
-        let selftest_webview = webview.clone();
+        let selftest_next = self.device_auth_selftest_next.clone();
         webview.evaluate_javascript(scope.injection_script(&auth), move |result| match result {
             Ok(::servo::JSValue::String(outcome)) => {
                 log::info!("device-auth: inject {label} -> {outcome}");
                 if outcome == "set" {
                     let next = selftest.as_ref().and_then(|s| s.borrow_mut().on_injected());
                     if let Some(script) = next {
-                        log::warn!("device-auth selftest: next step");
-                        selftest_webview.evaluate_javascript(script, |_| {});
+                        // Servo 는 완료 콜백을 `javascript_evaluator` 를 빌린 채 부른다. 콜백 안에서
+                        // `evaluate_javascript` 를 또 부르면 `RefCell already borrowed` 로 죽으므로
+                        // 스크립트만 적어 두고 `about_to_wait` 에서 실행한다.
+                        selftest_next.set(Some(script));
                     }
                 }
             },
@@ -1894,6 +1898,7 @@ impl ApplicationHandler<WakerEvent> for App {
             webview: RefCell::new(None),
             device_auth: Rc::default(),
             device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
+            device_auth_selftest_next: Rc::default(),
             device_auth_selftest: config.device_auth_selftest.then(|| {
                 Rc::new(RefCell::new(device_auth_selftest::DeviceAuthSelfTest::new(
                     std::time::Instant::now(),
@@ -2100,6 +2105,12 @@ impl ApplicationHandler<WakerEvent> for App {
         if state.should_exit.get() {
             event_loop.exit();
             return;
+        }
+        if let Some(script) = state.device_auth_selftest_next.take() {
+            if let Some(webview) = state.webview.borrow().clone() {
+                log::warn!("device-auth selftest: next step");
+                webview.evaluate_javascript(script, |_| {});
+            }
         }
         if state.device_auth_selftest_finished() {
             event_loop.exit();
