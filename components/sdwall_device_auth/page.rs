@@ -23,6 +23,13 @@ impl PageScope {
         })
     }
 
+    /// 시험 전용: 아래 스크립트 가드(`window.top`·`location.origin`·경로)를 Rust 로 옮긴 거울.
+    ///
+    /// ***엔진 쪽에서 이것으로 주입을 거르지 않는다.*** `webview.url()` 은 실제로 스크립트를
+    /// 실행할 문서보다 늦을 수 있어, 거르면 정당한 주입을 버린다. 집행은 스크립트 가드
+    /// 하나뿐이다 -- 실행되는 바로 그 문서에서 돌고, 위조할 수 없는 속성(`top`, `origin`)을
+    /// 먼저 보고 거기서 끊는다. 이 함수는 그 규칙을 시험으로 고정하는 데만 쓴다.
+    #[cfg(test)]
     pub fn contains(&self, url: &Url) -> bool {
         url.origin().ascii_serialization() == self.origin
             && SCOPED_PATH_PREFIXES
