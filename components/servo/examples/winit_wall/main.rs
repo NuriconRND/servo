@@ -259,6 +259,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let App::SpikeFinished { passed: false } = app {
         std::process::exit(1);
     }
+    // 장비 인증 자가 시험도 판정을 종료 코드로 낸다(FAIL = 1). 엔진은 먼저 평소처럼 내린다.
+    let selftest_exit_code = match &app {
+        App::Running(state) => state.device_auth_selftest_exit_code.get(),
+        _ => None,
+    };
+    drop(app);
+    if let Some(code) = selftest_exit_code.filter(|code| *code != 0) {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -274,6 +283,8 @@ struct AppState {
     device_auth_selftest: Option<Rc<RefCell<device_auth_selftest::DeviceAuthSelfTest>>>,
     /// 자가 시험이 평가 콜백 안에서 정한 다음 동작 스크립트. `about_to_wait` 에서 실행한다.
     device_auth_selftest_next: Rc<Cell<Option<&'static str>>>,
+    /// 자가 시험 판정의 종료 코드. 판정이 나면 채우고, `main` 이 이벤트 루프 뒤에 읽는다.
+    device_auth_selftest_exit_code: Cell<Option<i32>>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -1327,17 +1338,21 @@ impl AppState {
         let verdict = selftest
             .borrow_mut()
             .take_verdict(std::time::Instant::now());
-        match verdict {
-            Some(device_auth_selftest::Verdict::Pass) => {
-                log::warn!("device-auth selftest: PASS documents=3");
-                true
+        let Some(verdict) = verdict else {
+            return false;
+        };
+        match &verdict {
+            device_auth_selftest::Verdict::Pass => {
+                log::warn!("device-auth selftest: PASS documents=3")
             },
-            Some(device_auth_selftest::Verdict::Fail(reason)) => {
-                log::error!("device-auth selftest: FAIL {reason}");
-                true
+            device_auth_selftest::Verdict::Fail(reason) => {
+                log::error!("device-auth selftest: FAIL {reason}")
             },
-            None => false,
         }
+        // 이벤트 루프가 끝난 뒤 `main` 이 이 값으로 종료 코드를 낸다(FAIL = 1).
+        self.device_auth_selftest_exit_code
+            .set(Some(verdict.exit_code()));
+        true
     }
 
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
@@ -1902,6 +1917,7 @@ impl ApplicationHandler<WakerEvent> for App {
             device_auth: Rc::default(),
             device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
             device_auth_selftest_next: Rc::default(),
+            device_auth_selftest_exit_code: Cell::new(None),
             device_auth_selftest: config.device_auth_selftest.then(|| {
                 Rc::new(RefCell::new(device_auth_selftest::DeviceAuthSelfTest::new(
                     std::time::Instant::now(),

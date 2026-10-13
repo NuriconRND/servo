@@ -30,6 +30,16 @@ pub enum Verdict {
     Fail(String),
 }
 
+impl Verdict {
+    /// 판정을 프로세스 종료 코드로도 낸다 -- 스크립트가 로그를 읽지 않고도 가를 수 있게.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Verdict::Pass => 0,
+            Verdict::Fail(_) => 1,
+        }
+    }
+}
+
 pub struct DeviceAuthSelfTest {
     phase: Phase,
     new_document: bool,
@@ -157,6 +167,12 @@ mod tests {
             Some(Verdict::Fail(reason)) => assert!(reason.contains("WaitReload"), "{reason}"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn fail_exits_non_zero_and_pass_exits_zero() {
+        assert_eq!(Verdict::Pass.exit_code(), 0);
+        assert_eq!(Verdict::Fail("x".into()).exit_code(), 1);
     }
 
     #[test]
