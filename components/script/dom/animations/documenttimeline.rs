@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
 use dom_struct::dom_struct;
 use js::gc::HandleObject;
 use num_traits::ToPrimitive;
@@ -29,6 +31,10 @@ pub(crate) struct DocumentTimeline {
     ///   - <https://html.spec.whatwg.org/multipage/#concept-settings-object-time-origin>
     #[no_trace]
     origin_offset: Duration,
+    /// 직전에 돌려준 스냅 값(초). `dom_animation_timeline_snap_hz` 가 꺼져 있으면 쓰이지
+    /// 않는다. ★격자는 이 값에서 이어진다★ -- 매번 지금 시각에서 다시 계산하면 스냅이
+    /// 의미가 없다.
+    snap_previous: Cell<Option<f64>>,
 }
 
 impl DocumentTimeline {
@@ -44,6 +50,7 @@ impl DocumentTimeline {
             Box::new(Self {
                 animation_timeline: AnimationTimeline::new_inherited(duration_since_time_origin),
                 origin_offset: origin_time,
+                snap_previous: Cell::new(None),
             }),
             window,
             proto,
@@ -61,6 +68,7 @@ impl DocumentTimeline {
             Box::new(Self {
                 animation_timeline: AnimationTimeline::new_inherited(duration),
                 origin_offset: Duration::ZERO,
+                snap_previous: Cell::new(None),
             }),
             window,
             can_gc,
@@ -68,11 +76,27 @@ impl DocumentTimeline {
     }
 
     /// Updates the value of the `AnimationTimeline` to the current clock time.
+    ///
+    /// ★`dom_animation_timeline_snap_hz` 가 켜져 있으면 격자에 맞춘다.★ 이 값이 애니메이션
+    /// 전체의 기준 시각이고, 여기 실린 지터가 그대로 화면의 떨림이 된다 -- 그 인과는
+    /// 설계 문서 50 이 측정으로 닫았다. 꺼져 있으면(기본) 아래 `snap_animation_timeline` 이
+    /// `raw` 를 그대로 돌려주므로 ***지금 동작과 같다.***
     pub(crate) fn update(&self, window: &Window) {
-        let duration_since_time_origin =
-            CrossProcessInstant::now() - window.navigation_start() - self.origin_offset;
+        let raw = CrossProcessInstant::now() - window.navigation_start() - self.origin_offset;
+        let hz = pref!(dom_animation_timeline_snap_hz);
+        let period = if (1..=1000).contains(&hz) {
+            1.0 / hz as f64
+        } else {
+            0.0
+        };
+        let snapped = servo_base::animation_timeline_snap::snap_animation_timeline(
+            self.snap_previous.get(),
+            raw.as_seconds_f64(),
+            period,
+        );
+        self.snap_previous.set(Some(snapped));
         self.animation_timeline
-            .set_current_time(duration_since_time_origin);
+            .set_current_time(Duration::seconds_f64(snapped));
     }
 
     /// Increments the current value of the timeline by a specific number of seconds.

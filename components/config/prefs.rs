@@ -143,6 +143,16 @@ pub struct Preferences {
     pub dom_adoptedstylesheet_enabled: bool,
     pub dom_allow_preloading_module_descendants: bool,
     // feature: Clipboard API | #36084 | Web/API/Clipboard_API
+    /// 애니메이션 타임라인 값을 이 주파수의 격자에 맞춘다. `0`(기본)이면 끈다.
+    ///
+    /// ★끄면 지금 동작 그대로다.★ `DocumentTimeline::update` 가 `CrossProcessInstant::now()`
+    /// 를 그대로 쓰는데, 그것은 "스크립트가 그 함수에 도달한 순간" 이라 틱 도착 지연의
+    /// 변동이 그대로 애니메이션 값이 된다(설계 문서 50). 켜면 그 값을 격자에 스냅해
+    /// 지터를 흡수한다.
+    ///
+    /// 보통 `gfx_refresh_hz` 와 같은 값을 준다. 다르게 주면 애니메이션이 그 격자로 양자화
+    /// 되므로, 표출 주기보다 낮게 주면 눈에 보인다.
+    pub dom_animation_timeline_snap_hz: i64,
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
     pub dom_bluetooth_testing_enabled: bool,
@@ -1113,6 +1123,7 @@ impl Preferences {
             dom_adoptedstylesheet_enabled: false,
             dom_allow_preloading_module_descendants: false,
             dom_allow_scripts_to_close_windows: false,
+            dom_animation_timeline_snap_hz: 0,
             dom_async_clipboard_enabled: false,
             dom_bluetooth_enabled: false,
             dom_bluetooth_testing_enabled: false,
