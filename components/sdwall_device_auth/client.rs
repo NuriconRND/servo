@@ -47,6 +47,8 @@ enum HttpOutcome {
 ///
 /// ***1.0 인 이유:*** 1.1 이면 Kestrel 이 chunked 로 답할 수 있고, 그러면 청크 해석이
 /// 필요하다. 1.0 요청에는 서버가 chunked 를 쓰면 안 되므로 연결이 닫힐 때까지 읽으면 된다.
+///
+/// ***`timeout` 은 질의 하나 전체의 한도다.*** 연결·쓰기·읽기가 같은 마감 시각을 나눠 쓴다.
 fn http_get(addr: SocketAddr, path_and_query: &str, timeout: Duration) -> HttpOutcome {
     let deadline = Instant::now() + timeout;
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
@@ -55,7 +57,11 @@ fn http_get(addr: SocketAddr, path_and_query: &str, timeout: Duration) -> HttpOu
     let request = format!(
         "GET {path_and_query} HTTP/1.0\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
     );
-    if stream.set_write_timeout(Some(timeout)).is_err()
+    // 연결에 쓴 만큼 뺀 나머지만 준다 -- 쓰기에 `timeout` 을 새로 주면 한 질의가 한도를 넘는다.
+    let Some(remaining) = time_left(deadline, Instant::now()) else {
+        return HttpOutcome::Unreachable;
+    };
+    if stream.set_write_timeout(Some(remaining)).is_err()
         || stream.write_all(request.as_bytes()).is_err()
     {
         return HttpOutcome::Unreachable;
@@ -64,8 +70,10 @@ fn http_get(addr: SocketAddr, path_and_query: &str, timeout: Duration) -> HttpOu
     let mut data = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+        let Some(remaining) = time_left(deadline, Instant::now()) else {
+            return HttpOutcome::Unreachable;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
             return HttpOutcome::Unreachable;
         }
         match stream.read(&mut chunk) {
@@ -82,6 +90,12 @@ fn http_get(addr: SocketAddr, path_and_query: &str, timeout: Duration) -> HttpOu
         }
     }
     parse_response(&data)
+}
+
+/// 마감까지 남은 시간. 다 썼으면 `None` -- 소켓 한도에 0 을 넘기면 오류이므로 넘기지 않는다.
+fn time_left(deadline: Instant, now: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(now);
+    (!left.is_zero()).then_some(left)
 }
 
 fn parse_response(data: &[u8]) -> HttpOutcome {
@@ -258,6 +272,21 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn time_left_is_remaining_deadline_not_full_timeout() {
+        let now = Instant::now();
+        assert_eq!(
+            time_left(now + Duration::from_millis(300), now),
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(time_left(now, now), None, "deadline reached");
+        assert_eq!(
+            time_left(now, now + Duration::from_millis(1)),
+            None,
+            "deadline passed"
         );
     }
 
