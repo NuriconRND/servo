@@ -57,16 +57,16 @@ $prefs = @(
 # 저더가 나오는 조건. 틱이 60Hz 로 오고, 거기서 도착 지연의 변동이 값에 그대로 실린다.
 $judder = $prefs + "gfx_paint_side_animation_tick_divisor=1"
 
-Write-Host "`n(1/4) divisor=1, 평활 끔 -> smooth_off.err.log" -ForegroundColor Cyan
+Write-Host "`n(1/4) divisor=1, smoothing OFF           -> smooth_off.err.log" -ForegroundColor Cyan
 & .\run_wall_dist.ps1 @base -Pref $judder -LogPath smooth_off.err.log
 
-Write-Host "`n(2/4) divisor=1, 평활 켬 -> smooth_on.err.log" -ForegroundColor Cyan
+Write-Host "`n(2/4) divisor=1, smoothing ON ($SmoothingHz Hz) -> smooth_on.err.log" -ForegroundColor Cyan
 & .\run_wall_dist.ps1 @base -Pref $judder -TimelineSmoothing $SmoothingHz -LogPath smooth_on.err.log
 
-Write-Host "`n(3/4) divisor=4(기본), 평활 끔 -> smooth_control.err.log" -ForegroundColor Cyan
+Write-Host "`n(3/4) divisor=4 (default), smoothing OFF -> smooth_control.err.log" -ForegroundColor Cyan
 & .\run_wall_dist.ps1 @base -Pref $prefs -LogPath smooth_control.err.log
 
-Write-Host "`n(4/4) divisor=4(기본), 평활 켬 -> smooth_control_on.err.log" -ForegroundColor Cyan
+Write-Host "`n(4/4) divisor=4 (default), smoothing ON  -> smooth_control_on.err.log" -ForegroundColor Cyan
 & .\run_wall_dist.ps1 @base -Pref $prefs -TimelineSmoothing $SmoothingHz -LogPath smooth_control_on.err.log
 
-Write-Host "`n네 로그를 넘겨 달라. 51.4 에 기록한다." -ForegroundColor Green
+Write-Host "`nDone. Hand over the four .err.log files (recorded in design doc 51.4)." -ForegroundColor Green
