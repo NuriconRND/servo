@@ -9,7 +9,7 @@
 //! You should almost never need to add a data type to this crate. Instead look for
 //! a more shared crate that has fewer dependents.
 
-pub mod animation_timeline_snap;
+pub mod animation_timeline_smoothing;
 pub mod cross_process_instant;
 pub mod generic_channel;
 pub mod id;

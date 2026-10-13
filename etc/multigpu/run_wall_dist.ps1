@@ -508,11 +508,12 @@ param(
     # ***음의 상관***이었다(설계 문서 45). 창당 한 줄 약 700 자, 벽에서 초당 네 줄이다.
     [switch] $AnimStepSeq,
 
-    # dom_animation_timeline_snap_hz: 애니메이션 타임라인 값을 이 주파수의 격자에 맞춘다.
-    # 0 이면 끈다(기본). 보통 -RefreshHz 와 같은 값을 준다. 왜 필요한지는 설계 문서 50 --
-    # 타임라인 값이 "스크립트가 도달한 순간" 이라 틱 도착 지연의 변동이 그대로 화면의
-    # 떨림이 된다.
-    [int]    $TimelineSnap = 0,
+    # dom_animation_timeline_smoothing_hz: 애니메이션 타임라인 값의 간격을 고르게 만든다.
+    # 0 이면 끈다(기본). 예상 틱 주파수이고, 보통 -RefreshHz 와 같은 값을 준다. 왜 필요한지는
+    # 설계 문서 50 -- 타임라인 값이 "스크립트가 도달한 순간" 이라 틱 도착 지연의 변동이
+    # 그대로 화면의 떨림이 된다. 범위를 벗어난 값은 엔진이 1..1000 으로 조이고 경고한다.
+    [ValidateRange(0, 1000)]
+    [int]    $TimelineSmoothing = 0,
     # SERVO_DCOMP_DEBUG: per-surface [dcomp-dbg] lines (create_surface, external add,
     # bind). This is the ONLY way to see whether a video actually reached an external
     # compositor surface -- the launcher wipes SERVO_* before every run, so exporting it
@@ -808,7 +809,7 @@ if ($Devtools -ne "") {
 }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
-if ($TimelineSnap -gt 0)  { $argList += @("--pref", "dom_animation_timeline_snap_hz=$TimelineSnap") }
+if ($TimelineSmoothing -gt 0) { $argList += @("--pref", "dom_animation_timeline_smoothing_hz=$TimelineSmoothing") }
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }

@@ -143,19 +143,30 @@ pub struct Preferences {
     pub dom_adoptedstylesheet_enabled: bool,
     pub dom_allow_preloading_module_descendants: bool,
     // feature: Clipboard API | #36084 | Web/API/Clipboard_API
-    /// 애니메이션 타임라인 값을 이 주파수의 격자에 맞춘다. `0`(기본)이면 끈다.
-    ///
-    /// ★끄면 지금 동작 그대로다.★ `DocumentTimeline::update` 가 `CrossProcessInstant::now()`
-    /// 를 그대로 쓰는데, 그것은 "스크립트가 그 함수에 도달한 순간" 이라 틱 도착 지연의
-    /// 변동이 그대로 애니메이션 값이 된다(설계 문서 50). 켜면 그 값을 격자에 스냅해
-    /// 지터를 흡수한다.
-    ///
-    /// 보통 `gfx_refresh_hz` 와 같은 값을 준다. 다르게 주면 애니메이션이 그 격자로 양자화
-    /// 되므로, 표출 주기보다 낮게 주면 눈에 보인다.
-    pub dom_animation_timeline_snap_hz: i64,
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
     pub dom_bluetooth_testing_enabled: bool,
+    /// 애니메이션 타임라인 값의 ***간격***을 고르게 만든다. 값은 예상되는 틱 주파수이고,
+    /// `0`(기본)이면 끈다. 보통 `gfx_refresh_hz` 와 같은 값을 준다.
+    ///
+    /// ★끄면 지금 동작 그대로다.★ `DocumentTimeline::update` 가 `CrossProcessInstant::now()`
+    /// 를 그대로 쓰는데, 그것은 "스크립트가 그 함수에 도달한 순간" 이라 틱 도착 지연의
+    /// 변동이 그대로 애니메이션 값이 된다(설계 문서 50).
+    ///
+    /// ★격자에 스냅하는 것이 아니다.★ 그쪽은 측정해 보니 더 나빴다 -- 칸 경계를 넘을
+    /// 때마다 0배/2배 스텝이 나와 한 프레임을 통째로 건너뛴 것처럼 보인다. 대신 관측된
+    /// 간격을 추정해 그만큼씩 내보내므로, `gfx_paint_side_animation_tick_divisor` 가 4 라서
+    /// 틱이 15Hz 로 와도 따라간다. 그래서 이 값이 실제 틱 주파수와 꼭 같을 필요는 없다 --
+    /// 씨앗과 허용오차로만 쓴다.
+    ///
+    /// ★켜면 깨지는 보증이 하나 있다.★ `document.timeline.currentTime` 이 같은 프레임의
+    /// rAF 타임스탬프(`performance.now()`)와 더 이상 일치하지 않는다. rAF 로 움직이는
+    /// 요소와 `Element.animate()` 로 움직이는 요소를 한 페이지에서 섞으면 둘 사이에 최대
+    /// 한 프레임의 흔들리는 어긋남이 생긴다. 벽에서는 문제가 아니지만 범용 브라우징에서는
+    /// 켜지 말아야 하는 이유다.
+    ///
+    /// 범위를 벗어난 값은 1..=1000 으로 조인다.
+    pub dom_animation_timeline_smoothing_hz: i64,
     pub dom_allow_scripts_to_close_windows: bool,
     // feature: Media Capture and Streams API | #26861 | Web/API/Media_Capture_and_Streams_API
     pub dom_canvas_capture_enabled: bool,
@@ -1122,8 +1133,8 @@ impl Preferences {
             dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
             dom_allow_preloading_module_descendants: false,
+            dom_animation_timeline_smoothing_hz: 0,
             dom_allow_scripts_to_close_windows: false,
-            dom_animation_timeline_snap_hz: 0,
             dom_async_clipboard_enabled: false,
             dom_bluetooth_enabled: false,
             dom_bluetooth_testing_enabled: false,

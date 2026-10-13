@@ -1,5 +1,12 @@
 # 애니메이션 타임라인 격자 스냅 Implementation Plan
 
+> ★실행 결과 설계가 바뀌었다.★ 이 계획대로 고정 격자 스냅을 구현하고 측정했더니
+> ***그쪽이 더 나빴다*** -- 칸 경계를 넘을 때마다 0배/2배 스텝이 나와 비균일이 3.1~8.9%,
+> 즉 고치려던 저더(3.46%)와 같은 자릿수인데 한 번에 틀리는 양이 ±6% 에서 ±100% 로 커진다.
+> 실제로 들어간 것은 ***간격을 추정해 그만큼씩 내보내는 평활기***다. 경위와 수치는
+> 설계 문서 51. 아래 본문은 당시의 계획이고, Task 1-3 의 코드 블록은 ***실제 구현과
+> 다르다*** -- 기록으로만 읽을 것.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 애니메이션 타임라인 값을 "스크립트가 도착한 순간" 이 아니라 "리프레시 주기의 격자점" 으로 잡아, 틱 도착 지터가 애니메이션 값에 실리지 않게 한다.
