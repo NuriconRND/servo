@@ -1731,33 +1731,43 @@ impl Painter {
                 if webview_renderer.animating()
                     && PainterId::from(webview_renderer.id) == self.painter_id
                 {
-                    // ★rAF 가 걸려 있으면 페인트측으로 분류할 수 없다.★ 이 bool 은
-                    // refresh driver 가 틱을 `gfx_paint_side_animation_tick_divisor` 분의
-                    // 1 로 줄여도 되는지를 가린다(`refresh_driver.rs`). 줄여도 되는 근거는
-                    // "화면의 값이 틱 사이의 페인트측 예측에서 나온다" 인데, ***rAF 로
-                    // 그리는 것에는 예측할 식이 없다*** -- 콜백이 돌지 않으면 값 자체가
-                    // 생기지 않는다. 그래서 틱을 줄이면 그 애니메이션이 그만큼 느려진다.
+                    // ★★"rAF 가 걸려 있으면 페인트측으로 치지 말자" 는 틀렸다.★★
                     //
-                    // 한 문서에 CSS 애니메이션과 rAF 가 ***섞여*** 있으면 rAF 쪽이 이긴다.
-                    // 섞인 경우 CSS 쪽은 어차피 페인트가 전진시키므로 틱을 더 줘서 잃는
-                    // 것이 없고, rAF 쪽은 틱을 못 받으면 멈춘다.
+                    // 한 번 그렇게 고쳤다가(87f593db7d2) 되돌렸다. 논리는 그럴듯했다 --
+                    // 틱을 줄여도 되는 근거가 "화면의 값이 페인트측 예측에서 나온다" 인데
+                    // rAF 에는 예측할 식이 없으니 줄이면 안 된다는 것이다. 맞는 말이지만
+                    // ***"rAF 콜백이 있다" 와 "rAF 가 화면을 그린다" 는 다르고, 엔진은 그
+                    // 둘을 구별할 수 없다.***
                     //
-                    // 실측(log_ani_debug_04/01-02, `multigpu_wall_shape_anim_probe.html`):
-                    // CSS 도형과 rAF 선이 한 페이지에 있으니 CSS 의 존재만으로 페인트측
-                    // 판정이 서고, ***도형은 60fps, 선은 15fps*** 로 갈렸다. 60Hz 월에서
-                    // 분주기가 4 이므로 정확히 60/4 다.
+                    // `wall_anim_jitter_probe.html` 의 rAF 는 ***자기 호출 간격을 재서 1 초에
+                    // 한 번 HUD 텍스트를 쓸 뿐*** 이다 -- 움직임은 전부 CSS/WAAPI 이고
+                    // 페인트측이 전진시킨다. 그 장식용 rAF 하나 때문에 WebView 전체의
+                    // 틱이 풀려 ***디스플레이 리스트가 15/s 에서 60/s 로, 리플로가 4 배***가
+                    // 됐고, 저더가 났다.
                     //
-                    // 둘을 ***같은 순회***에서 잰다. `WebViewRenderer::
-                    // animation_callbacks_running` 은 연결 여부를 보지 않고 모든
-                    // 파이프라인을 훑으므로, 끊긴 파이프라인에 남은 콜백 하나가 틱을
-                    // 영구히 full-rate 로 묶을 수 있다.
+                    // ★통제 실험(log_ani_debug_04/13, 14)★ -- 같은 빌드·같은 페이지에서
+                    // pref 하나만 바꿨다:
+                    //
+                    //     tick_divisor=4 (기본)  epoch/s 14.9  PASSEV/s 0.21  저더 없음
+                    //     tick_divisor=1         epoch/s 59.7  PASSEV/s 0.71  ***저더***
+                    //
+                    // ***`dx_px` 와 `dt_ms` 의 산포는 저더 쪽이 오히려 더 좋았다***
+                    // (4.54/1.28 대 4.77/1.67). 다섯 라운드를 그 둘을 줄이는 데 썼는데
+                    // 저더와는 음의 상관이었다 -- 움직인 것은 `epoch/s` 와 `PASSEVENT` 다.
+                    //
+                    // 고친 쪽의 이득은 진단용 프로브 한 장(`multigpu_wall_shape_anim_probe`
+                    // 의 `anim=raf` 가 15 -> 25.5fps)이고, 깨진 쪽은 ***rAF 를 쓰는 모든
+                    // 페이지의 표출 품질***이다. 실제 벽 콘텐츠가 통계 루프 하나만 가져도
+                    // 똑같이 당한다. 교환이 명백히 나쁘다.
+                    //
+                    // 다시 손대려면 먼저 ***"이 rAF 가 실제로 프레임을 만드는가"***를
+                    // 판정할 신호를 찾아야 한다. `animation_callbacks_running` 은 콜백의
+                    // 존재만 말하므로 그 신호가 아니다.
                     let mut paint_side = false;
-                    let mut script_side = false;
                     webview_renderer.for_each_connected_pipeline(&mut |pipeline_details| {
                         paint_side |= pipeline_details.animations.has_paint_animations();
-                        script_side |= pipeline_details.animation_callbacks_running();
                     });
-                    Some((webview_renderer.id, paint_side && !script_side))
+                    Some((webview_renderer.id, paint_side))
                 } else {
                     None
                 }
