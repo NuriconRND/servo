@@ -2044,6 +2044,13 @@ impl ApplicationHandler<WakerEvent> for App {
                 sdwall_device_auth::SIGNING_KEY_KIND
             );
         }
+        // 시작 URL 이 불투명 오리진이면 폴러는 돌아도 어디에도 넘기지 않는다 -- 왜 값이 안
+        // 오는지 현장에서 알 수 있게 시작할 때 한 번 남긴다.
+        if app_state.device_auth_scope.is_none() {
+            log::warn!(
+                "device-auth: start URL has an opaque origin; device auth will not be delivered to any page"
+            );
+        }
         let device_auth_proxy = waker.proxy.clone();
         sdwall_device_auth::spawn_poller(move |auth| {
             let _ = device_auth_proxy.send_event(WakerEvent::DeviceAuth(auth));
