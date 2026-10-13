@@ -64,6 +64,7 @@ fn qpc_frequency() -> Option<i64> {
 }
 
 mod crash_report;
+mod pacing_refresh_driver;
 mod tile;
 #[cfg(target_os = "windows")]
 mod vsync_refresh_driver;
