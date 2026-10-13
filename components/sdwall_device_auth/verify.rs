@@ -1,3 +1,5 @@
+use std::fmt;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use p256::ecdsa::signature::Verifier;
@@ -25,7 +27,7 @@ impl AuthState {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceAuthResponse {
     pub state: String,
@@ -33,6 +35,19 @@ pub struct DeviceAuthResponse {
     pub project_key: String,
     pub nonce: String,
     pub signature: String,
+}
+
+/// 지문은 `{:?}` 로도 새지 않게 가린다(명세: 로그에 남기지 않는다).
+impl fmt::Debug for DeviceAuthResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAuthResponse")
+            .field("state", &self.state)
+            .field("fingerprint", &"<redacted>")
+            .field("project_key", &self.project_key)
+            .field("nonce", &self.nonce)
+            .field("signature", &self.signature)
+            .finish()
+    }
 }
 
 pub fn verify_response(
@@ -102,6 +117,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn debug_redacts_fingerprint() {
+        let response = DeviceAuthResponse {
+            state: "ok".into(),
+            fingerprint: "HJY0BWGD".into(),
+            project_key: "123412".into(),
+            nonce: "a1B2c3D4e5F6g7H8".into(),
+            signature: "c2ln".into(),
+        };
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("HJY0BWGD"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            debug.contains("123412") && debug.contains("a1B2c3D4e5F6g7H8"),
+            "{debug}"
+        );
+        let pretty = format!("{response:#?}");
+        assert!(!pretty.contains("HJY0BWGD"), "{pretty}");
     }
 
     #[test]
