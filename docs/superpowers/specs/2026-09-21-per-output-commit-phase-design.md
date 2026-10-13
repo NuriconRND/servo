@@ -1376,3 +1376,87 @@ f95fb86b407(저더가 없던 마지막 빌드)로 되돌린 dist 를 만들어 �
 더 좋거나 같은데 눈에는 나쁘다. 페인트측 예측이 사실상 ***저역통과 필터***로 동작해 왔고
 그것을 치우면 드러나는 지터가 있다는 뜻이다. 그 지터의 원천(스크립트가 값을 계산하는
 기준 시각의 고르기)은 아직 재지 않았다.
+
+---
+
+# ★49. 시계를 하나로 (2026-10-13)★
+
+§44~48 을 쫓다 드러난 구조 결함 하나를 닫는다. 저더와는 별개다 -- 저더의 원인은
+`87f593db7d2` 였고 `6d279788750` 이 되돌렸다(§46).
+
+## 왜 둘이었나
+
+`BaseRefreshDriver::notify_will_paint` 는 `Painter::render` 안에서 불려 rAF 틱을 발사하고
+(`painter.rs:2021`, `last_render_started_at` 를 찍는 바로 다음 줄), **그 끝에서
+`observe_next_frame` 을 다시 건다.** 기본 `RefreshDriver` 는 `TimerRefreshDriver` 이고 전용
+스레드(`PaintTimerThread`)에서 `gfx_refresh_hz` 주기로 돌므로, ***렌더가 끝날 때마다 한 주기
+뒤에 자기를 깨우도록 예약***하고 그 콜백이 `event_loop_waker.wake()` 를 쏜다:
+
+    WallPacing 스레드   : period 마다  WakerEvent::Tick
+    PaintTimerThread   : period 마다  WakerEvent::Engine      ← ★완전 중복★
+
+둘 다 `while next <= now { next += period }` 격자라 표류는 없지만 ★위상은 임의★다. 그래서
+Engine 이 Tick 보다 먼저 도착하는 비율이 실행마다 달라지고, `WALLCLOCK` 의 `user/s` 가
+0.02 와 6.65 사이를 오갔다(§44 의 표). `8de1ff6d90b` 의 게이트가 증상을 막고 있었을 뿐
+중복은 그대로였다.
+
+## 무엇으로 합쳤나
+
+`PacingRefreshDriver`(`winit_wall/pacing_refresh_driver.rs`, 약 90 줄). ★스레드를 띄우지
+않는다★ -- 콜백을 모아 두었다가 `fire_present_tick` 이 렌더 직전에 전부 발사한다.
+`DwmVsyncRefreshDriver` 와 같은 모양이고, 차이는 "자기 스레드에서 `DwmFlush` 를 기다린다"
+대신 "남이 부르면 발사한다" 하나다. 드라이버 선택은 ★vsync > pacing > 기본 타이머★.
+
+★가장 조용한 수정은 `shell_vsync_driver` 를 조건부로 바꾼 것이다.★ 예전에는
+`vsync_driver.clone()` 을 무조건 했는데, 그대로 두면 페이싱 드라이버가
+`AppState::present_vsync` 로 들어가 `drive_present_clock` 이 `pump_vsync` 경로로 빠진다 --
+그 드라이버는 `vsync_due` 를 세우지 않으므로 `vsync_stalled` 로 떨어지고 표출 클럭이
+깨진다. 판정을 `FrameClock::drives_shell_present_clock` 에 두고 테스트를 붙였다.
+
+그리고 ★보루가 하나 필요했다★(최종 리뷰 지적). `FrameClock::Pacing` 에는 주기적 엔진
+wake 가 없다 -- `PaintTimerThread` 에 남은 일은 caret 깜빡임뿐이고 벽 콘텐츠에는 편집
+caret 이 없다. 그래서 `spawn_pacing_thread` 가 실패하면 ***clock 을 돌릴 사람이 하나도
+없어 화면이 영구히 멈춘다.*** 선택이 그 spawn 보다 260 줄 앞서 일어나 성패를 볼 수 없으므로
+`about_to_wait` 에서 런타임으로 판정한다(`needs_pacing_backstop`). 그 함수는 `Poll` 이라
+계속 불리므로 폴백으로 충분하다.
+
+## 실측 (log_ani_debug_04/16)
+
+    실행                        user/s  pace/s  backstop  atw   epoch/s   저더
+    one_clock                     0.02   59.38         0    0      14.9   없음
+    one_clock + divisor=1         0.01   59.37         0    0      59.7   ★있음★
+    one_clock + divisor=1 shapes  0.01   59.36         0    0      23.0   (25fps 미만)
+
+★`backstop=0`★ 이 위 "가장 조용한 수정" 이 실제로 들었다는 증거다. ★`atw=0`★ 은 보루가
+돌지 않았다는 뜻이고, ★`epoch/s 14.9`★ 는 틱 분주기가 그대로여서 §46 의 저더가 재발하지
+않았다는 뜻이다.
+
+## ★이 변경이 바꾸지 않은 것★
+
+★클럭의 **개수**를 바꿨지 틱의 **빈도**를 바꾸지 않았다.★ `divisor=1` 에서 여전히 저더가
+나고 `shape_anim` 이 여전히 25fps 에 못 미친다 -- 둘 다 예상된 결과인데, 실기 검증 때
+그렇지 않을 것으로 기대됐으므로 적어 둔다.
+
+* `divisor=1` 은 디스플레이 리스트를 15/s 에서 60/s 로 만들고, ***그것이 저더의 원인***
+  이라는 것은 §45 의 통제 실험이 이미 확정했다. 시계를 합쳐도 그 사실은 바뀌지 않는다.
+* `shape_anim` 의 rAF 는 매 프레임 도형 400 개에 인라인 `style.transform` 을 쓴다. 그
+  비용은 클럭과 무관하다 -- 그 페이지 자신의 주석이 `anim=raf 37.4fps 26.7ms` 로 재 두었고,
+  4-GPU 월에서는 23 이다. ***콜백이 제때 불려도 그 안에서 하는 일이 26.7ms 면 37fps 가
+  상한이다.***
+
+## 한계 둘 (최종 리뷰에서)
+
+* ★`PaintTimerThread` 는 여전히 뜬다.★ `Painter::new` 가 `(*timer_refresh_driver).clone()`
+  을 무조건 평가해 `LazyCell` 을 forced 한다(`painter.rs:1088`). 거기 남는 일은 caret
+  깜빡임뿐이다. ***스레드 수를 세어 이 변경을 확인하려 하면 틀린 결론이 나온다*** --
+  확인은 `WALLCLOCK` 의 `user`/`pace` 로 한다.
+* ★`-ParallelTiles` 에서는 타일 0 의 painter 만 이 드라이버를 받는다.★ 나머지 타일은 자기
+  스레드에서 컨텍스트를 만들며 `None` 을 받아 각자 `TimerRefreshDriver` 를 쓴다. `Rc` 가
+  `!Send` 라 구조적이고 선행 조건이다. ***"시계 하나" 는 주 painter 에 한해 참이다.***
+
+## 남은 것
+
+★§48 이 이제 유일한 큰 질문이다★ -- 디스플레이 리스트가 60/s 로 올 때 왜 15/s 보다
+나쁜가. `dx_px`·`dt_ms`·`present_d` 는 모두 더 좋거나 같은데 눈에는 나쁘다. 페인트측 예측이
+사실상 ***저역통과 필터***로 동작해 왔고, 그것을 치우면 드러나는 지터가 있다는 뜻이다.
+그 지터의 원천(스크립트가 값을 계산하는 기준 시각의 고르기)은 아직 재지 않았다.
