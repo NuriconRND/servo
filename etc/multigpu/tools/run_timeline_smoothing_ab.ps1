@@ -40,16 +40,33 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$base = @(
-    "-Layout", "wall_layout.multigpu.json", "-Serve",
-    "-Url", "wall_anim_jitter_probe.html",
-    "-IgnoreCertErrors", "-PageFeatures",
-    "-DComp", "surface", "-RefreshHz", "60", "-DwmAlign", "14", "-CommitAlign", "8",
-    "-SampleLead", "1", "-DirectRender", "-DcompParallelCommit", "-PacingThread",
-    "-ParallelTiles", "-PipelineMode", "uridecodebin3", "-DecoderThreads", "1",
-    "-SinkPacing", "thread", "-NumaNode", "1", "-NoSyncGroup",
-    "-DurationSec", "$DurationSec", "-PresentCadence", "-DcompBindProf", "-AnimStepSeq"
-)
+# HASHTABLE splatting, on purpose: an ARRAY splat passes every element POSITIONALLY,
+# so "-Layout" lands in the first positional parameter instead of naming one.
+$base = @{
+    Layout              = "wall_layout.multigpu.json"
+    Serve               = $true
+    Url                 = "wall_anim_jitter_probe.html"
+    IgnoreCertErrors    = $true
+    PageFeatures        = $true
+    DComp               = "surface"
+    RefreshHz           = 60
+    DwmAlign            = 14
+    CommitAlign         = 8
+    SampleLead          = 1
+    DirectRender        = $true
+    DcompParallelCommit = $true
+    PacingThread        = $true
+    ParallelTiles       = $true
+    PipelineMode        = "uridecodebin3"
+    DecoderThreads      = 1
+    SinkPacing          = "thread"
+    NumaNode            = "1"
+    NoSyncGroup         = $true
+    DurationSec         = $DurationSec
+    PresentCadence      = $true
+    DcompBindProf       = $true
+    AnimStepSeq         = $true
+}
 $prefs = @(
     "dom_webgl2_enabled=true", "dom_webgpu_enabled=true",
     "gfx_precache_shaders=true", "media_wrap_init_max_per_frame=2"
