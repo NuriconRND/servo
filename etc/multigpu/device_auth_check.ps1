@@ -86,7 +86,8 @@ function Stop-FakeAuth {
 
 # 엔진을 띄우고 스스로 끝날 때까지 기다린다(자가 시험 판정 또는 --capture-sec).
 # 강제 종료하면 stderr 가 비므로 시간 초과는 그 자체로 실패다.
-function Invoke-Engine([string] $Name, [string] $Url, [string[]] $Extra) {
+# Start-Engine 은 띄우기만 하고, Wait-Engine 이 끝나기를 기다린다(그 사이에 다른 일을 할 수 있게).
+function Start-Engine([string] $Name, [string] $Url, [string[]] $Extra) {
     $log = Join-Path $OutDir "$Name.err.log"
     $out = Join-Path $OutDir "$Name.out.log"
     $a = @('--wall-layout', $Layout, '--wall-tile-index', '0') + $Extra + @($Url)
@@ -94,13 +95,29 @@ function Invoke-Engine([string] $Name, [string] $Url, [string[]] $Extra) {
     $p = Start-Process -FilePath $Exe -ArgumentList $a -PassThru `
         -RedirectStandardError $log -RedirectStandardOutput $out
     $null = $p.Handle  # PS 5.1: 핸들을 잡아 두지 않으면 ExitCode 가 비어 온다.
-    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
-    if ($timedOut) { Stop-Process -Id $p.Id -Force }
-    $lines = @(Get-Content $log -Encoding UTF8) + @(Get-Content $out -Encoding UTF8)
-    return @{ Log = $log; TimedOut = $timedOut; Lines = $lines; ExitCode = $p.ExitCode }
+    return @{ Process = $p; Log = $log; Out = $out; Started = [DateTime]::Now }
+}
+
+function Wait-Engine($Engine) {
+    $p = $Engine.Process
+    $left = [int][Math]::Max(0, $TimeoutSec * 1000 - ([DateTime]::Now - $Engine.Started).TotalMilliseconds)
+    $timedOut = -not $p.WaitForExit($left)
+    if ($timedOut) { Stop-Process -Id $p.Id -Force; $p.WaitForExit() }
+    $lines = @(Get-Content $Engine.Log -Encoding UTF8) + @(Get-Content $Engine.Out -Encoding UTF8)
+    return @{ Log = $Engine.Log; TimedOut = $timedOut; Lines = $lines; ExitCode = $p.ExitCode }
+}
+
+function Invoke-Engine([string] $Name, [string] $Url, [string[]] $Extra) {
+    Wait-Engine (Start-Engine $Name $Url $Extra)
 }
 
 function Get-Notices($Run) { @($Run.Lines | Where-Object { $_ -match '\[device-auth-check\] 알림' }) }
+
+# 값 JSON 전체와 판정까지 그대로 맞는 알림만 센다(새어 나온 projectKey 같은 군더더기가 있으면 안 맞는다).
+function Select-Notice($Notices, [string] $Json) {
+    $needle = "[device-auth-check] 알림 $Json 맞음"
+    @($Notices | Where-Object { $_.EndsWith($needle) })
+}
 
 function Add-Result([string] $Name, [bool] $Pass, [string] $Detail) {
     [void]$results.Add([pscustomobject]@{ Case = $Name; Result = $(if ($Pass) { 'PASS' } else { 'FAIL' }); Detail = $Detail })
@@ -120,13 +137,12 @@ function Test-SelfTestCase([string] $Name, [string[]] $FakeArgs, [int] $FakePort
         $run = Invoke-Engine $Name "http://127.0.0.1:$PagePort/ipwall/device-auth-check" @('--device-auth-selftest')
     } finally { Stop-FakeAuth }
     $notices = Get-Notices $run
-    $want = @($notices | Where-Object {
-        $_ -match ('"state":"' + $State + '"') -and $_ -match '맞음' -and
-        ($ProjectKey -eq '' -or $_ -match ('"projectKey":"' + $ProjectKey + '"'))
-    })
+    $json = if ($ProjectKey) { '{"state":"' + $State + '","projectKey":"' + $ProjectKey + '"}' } else { '{"state":"' + $State + '"}' }
+    $want = Select-Notice $notices $json
+    # 새 문서 셋(처음·새로고침·이동)에 한 번씩, # 이동 뒤에는 없음 = 정확히 3.
     $pass = (-not $run.TimedOut) -and
         (@($run.Lines | Where-Object { $_ -match 'device-auth selftest: PASS' }).Count -eq 1) -and
-        ($want.Count -ge 3) -and ($want.Count -eq $notices.Count) -and (Test-Hygiene $run)
+        ($want.Count -eq 3) -and ($want.Count -eq $notices.Count) -and (Test-Hygiene $run)
     Add-Result $Name $pass "notices=$($notices.Count) expected=$($want.Count) timedOut=$($run.TimedOut) exit=$($run.ExitCode) log=$($run.Log)"
 }
 
@@ -138,24 +154,23 @@ if ($kind -eq 'test') {
 
     # unreachable -> ok: 엔진이 뜬 뒤 7250 에 fake-auth 를 띄운다. 같은 문서에 값이 바뀌어 다시 들어와야 한다.
     $name = 'unreachable_to_ok'
-    $job = $null
+    # 이 스크립트가 띄운 프로세스($fakes)만 끈다 -- 장비의 진짜 DeviceService 는 건드리지 않는다.
+    $engine = $null
     try {
         Start-FakeAuth $name @('--state', 'invalid') 7251
         $png = Join-Path $OutDir "$name.png"
-        $job = Start-Job -ScriptBlock {
-            param($ds, $key, $dir)
-            Start-Sleep -Seconds 8
-            & $ds fake-auth --state ok --project-key 123412 --port 7250 --key $key *> (Join-Path $dir 'unreachable_to_ok.fake7250.log')
-        } -ArgumentList $DeviceService, $testKey, $OutDir
-        $run = Invoke-Engine $name "http://127.0.0.1:7251/ipwall/device-auth-check" @('--capture', $png, '--capture-sec', '20')
+        $engine = Start-Engine $name "http://127.0.0.1:7251/ipwall/device-auth-check" @('--capture', $png, '--capture-sec', '20')
+        Start-Sleep -Seconds 8
+        Start-FakeAuth $name @('--state', 'ok', '--project-key', '123412') 7250
+        $run = Wait-Engine $engine
+        $engine = $null
     } finally {
-        if ($job) { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
-        Get-Process DeviceService -ErrorAction SilentlyContinue | Stop-Process -Force
+        if ($engine -and !$engine.Process.HasExited) { Stop-Process -Id $engine.Process.Id -Force }
         Stop-FakeAuth
     }
     $notices = [string[]](Get-Notices $run)
-    $u = [array]::FindIndex($notices, [Predicate[string]]{ param($l) $l -match '"state":"unreachable"' })
-    $o = [array]::FindIndex($notices, [Predicate[string]]{ param($l) $l -match '"state":"ok"' -and $l -match '"projectKey":"123412"' })
+    $u = [array]::FindIndex($notices, [Predicate[string]]{ param($l) $l.EndsWith('[device-auth-check] 알림 {"state":"unreachable"} 맞음') })
+    $o = [array]::FindIndex($notices, [Predicate[string]]{ param($l) $l.EndsWith('[device-auth-check] 알림 {"state":"ok","projectKey":"123412"} 맞음') })
     Add-Result $name (($u -ge 0) -and ($o -gt $u) -and (Test-Hygiene $run)) "unreachable@$u ok@$o exit=$($run.ExitCode) log=$($run.Log)"
 }
 else {
@@ -166,9 +181,10 @@ else {
         $run = Invoke-Engine $name "http://127.0.0.1:7250/ipwall/device-auth-check" @('--capture', (Join-Path $OutDir "$name.png"), '--capture-sec', '12')
     } finally { Stop-FakeAuth }
     $notices = Get-Notices $run
-    $invalid = @($notices | Where-Object { $_ -match '"state":"invalid"' })
+    $invalid = Select-Notice $notices '{"state":"invalid"}'
     $ok = @($notices | Where-Object { $_ -match '"state":"ok"' })
-    Add-Result $name (($invalid.Count -ge 1) -and ($ok.Count -eq 0) -and (Test-Hygiene $run)) "invalid=$($invalid.Count) ok=$($ok.Count) exit=$($run.ExitCode) log=$($run.Log)"
+    # 한 문서에 한 번: 정확히 1, ok 는 0, 그 밖의 알림도 없음.
+    Add-Result $name (($invalid.Count -eq 1) -and ($notices.Count -eq 1) -and ($ok.Count -eq 0) -and (Test-Hygiene $run)) "invalid=$($invalid.Count) ok=$($ok.Count) exit=$($run.ExitCode) log=$($run.Log)"
 
     # 실제 키 빌드는 자가 시험 인자를 받지 않는다.
     $name = 'selftest_rejected'
