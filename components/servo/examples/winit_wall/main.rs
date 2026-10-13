@@ -303,6 +303,11 @@ struct AppState {
     /// 표출 클럭은 건드린 적이 없다. 이전 실기에서 `-Vsync` 가 아무 변화를 안 낸 이유가
     /// 그것이다. 여기서 같은 인스턴스를 셸도 구독한다 -- 전용 스레드 하나를 공유한다.
     present_vsync: Option<Rc<dyn servo::RefreshDriver>>,
+    /// 페이싱 틱이 Servo 의 프레임 관찰자를 깨우는 손잡이. `FrameClock::Pacing` 일 때만 Some.
+    ///
+    /// ★`present_vsync` 와 배타적이다.★ 전자는 셸의 표출 클럭을 vsync 에 묶고, 이것은
+    /// 표출 틱을 Servo 의 프레임 클럭으로 쓴다 -- 방향이 반대다.
+    pacing_fire: Option<pacing_refresh_driver::PacingFireHandle>,
     /// vsync 스레드가 세우고 메인이 내린다.
     vsync_due: Arc<AtomicBool>,
     /// 콜백이 걸려 있는가. 등록은 **메인에서만** 한다 -- 드라이버가 `Rc` 라 스레드를 못 건넌다.
@@ -1303,6 +1308,13 @@ impl AppState {
         // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
         // 지나므로 한 자리면 충분하다.★
         servo::note_present_tick();
+        // ★Servo 의 프레임 관찰자를 여기서 깨운다.★ `FrameClock::Pacing` 이면 Servo 의
+        // `PaintTimerThread` 가 돌지 않으므로, `notify_will_paint` 가 등록해 둔 콜백을
+        // 부를 사람이 이 자리뿐이다. ***렌더 전에 불러야 한다*** -- 그 콜백이
+        // `waiting_for_frame` 을 내리고, 그것이 내려가야 `needs_repaint()` 가 참이 된다.
+        if let Some(fire) = self.pacing_fire.as_ref() {
+            fire.fire();
+        }
         if self.direct_render {
             self.note_redraw_requested();
             self.charge_main(MainSlot::Render, || self.render_all_tiles());
@@ -1613,26 +1625,62 @@ impl ApplicationHandler<WakerEvent> for App {
         //
         // pref 는 전역 싱글턴을 읽는다 — 아래에서 `servo_config::prefs::set()`을 창 생성보다
         // 먼저 명시적으로 호출해 뒀으므로(이 함수 최상단) 여기서 이미 확정된 값이 보인다.
+        // ★시계를 하나로 고른다.★ `FrameClock` 의 주석과 `choose_frame_clock` 의 테스트가
+        // 조합을 정한다.
         #[cfg(target_os = "windows")]
-        let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = {
-            let enabled = servo::prefs::get().gfx_vsync_enabled;
-            if enabled {
+        let clock = choose_frame_clock(
+            servo::prefs::get().gfx_vsync_enabled,
+            servo_config::pref!(gfx_wall_pacing_thread),
+        );
+        #[cfg(not(target_os = "windows"))]
+        let clock = FrameClock::Timer;
+
+        // ★두 값이 나오는 이유.★ `vsync_driver` 는 Servo 가 가져가고(프레임 클럭),
+        // `pacing_fire` 는 페이싱 틱이 그 드라이버를 깨우는 손잡이다. Servo 생성자가
+        // 드라이버를 가져가 버리므로 손잡이는 여기서 떠 둬야 한다.
+        let (vsync_driver, pacing_fire): (
+            Option<Rc<dyn servo::RefreshDriver>>,
+            Option<pacing_refresh_driver::PacingFireHandle>,
+        ) = match clock {
+            #[cfg(target_os = "windows")]
+            FrameClock::Vsync => {
                 eprintln!(
                     "wall: gfx_vsync_enabled=true: DWM vsync(DwmFlush) 에 표출과 값 표본을 묶는다 (phase_pct={}).",
                     servo_config::pref!(gfx_vsync_phase_pct).clamp(0, 99)
                 );
-                Some(Rc::new(vsync_refresh_driver::DwmVsyncRefreshDriver::new()))
-            } else {
-                None
-            }
+                (
+                    Some(Rc::new(vsync_refresh_driver::DwmVsyncRefreshDriver::new())),
+                    None,
+                )
+            },
+            // 비-Windows 에는 `DwmVsyncRefreshDriver` 가 없다. `choose_frame_clock` 이
+            // 거기서 `Timer` 만 돌려주므로 이 팔은 도달하지 않는다.
+            #[cfg(not(target_os = "windows"))]
+            FrameClock::Vsync => (None, None),
+            FrameClock::Pacing => {
+                eprintln!(
+                    "wall: 표출 틱이 프레임 클럭이다 -- Servo 의 PaintTimerThread 를 쓰지 않는다."
+                );
+                let driver = pacing_refresh_driver::PacingRefreshDriver::new();
+                let handle = driver.handle();
+                (Some(Rc::new(driver)), Some(handle))
+            },
+            FrameClock::Timer => (None, None),
         };
-        #[cfg(not(target_os = "windows"))]
-        let vsync_driver: Option<Rc<dyn servo::RefreshDriver>> = None;
 
-        // ★셸도 같은 드라이버를 구독한다.★ 아래에서 `vsync_driver` 는 타일 생성으로
-        // 넘어가 버리므로 여기서 핸들을 하나 떠 둔다. 인스턴스를 새로 만들면 DwmFlush
-        // 스레드가 하나 더 뜬다 -- 위 주석이 타일마다 만들지 말라고 한 것과 같은 이유다.
-        let shell_vsync_driver = vsync_driver.clone();
+        // ★셸의 표출 클럭은 vsync 일 때만 드라이버를 탄다.★ 예전에는 여기서 무조건
+        // `vsync_driver.clone()` 했는데, 그러면 페이싱 드라이버가 `present_vsync` 로 들어가
+        // `drive_present_clock` 이 `pump_vsync` 경로로 빠진다 -- 그 드라이버는 `vsync_due` 를
+        // 세우지 않으므로 `vsync_stalled` 로 떨어진다. 판정을 `FrameClock` 에 두고 테스트를
+        // 붙였다(`only_vsync_drives_the_shell_present_clock`).
+        //
+        // vsync 일 때 인스턴스를 새로 만들지 않고 복제하는 것은 예전 주석의 이유 그대로다 --
+        // 새로 만들면 DwmFlush 스레드가 하나 더 뜬다.
+        let shell_vsync_driver = if clock.drives_shell_present_clock() {
+            vsync_driver.clone()
+        } else {
+            None
+        };
 
         // ★A 안 1 단계의 관문만 시험하고 끝낸다.★ 본 경로보다 먼저 갈라지는 이유는, 컨텍스트가
         // 이미 붙은 HWND 에 워커가 두 번째를 만들면 `-DComp on` 에서 HWND 당 DComp 타깃이
@@ -1756,6 +1804,7 @@ impl ApplicationHandler<WakerEvent> for App {
             next_present_tick: Cell::new(std::time::Instant::now()),
             last_pacing_tick_at: Cell::new(None),
             present_vsync: shell_vsync_driver,
+            pacing_fire,
             vsync_due: Arc::new(AtomicBool::new(false)),
             vsync_armed: Cell::new(false),
             vsync_stalled: Cell::new(false),
@@ -2035,5 +2084,79 @@ impl embedder_traits::EventLoopWaker for Waker {
             self.pending.store(false, Ordering::SeqCst);
             eprintln!("warning: failed to wake event loop: {error:?}");
         }
+    }
+}
+
+/// `gfx_vsync_enabled` / `gfx_wall_pacing_thread` 조합에서 어느 프레임 클럭을 쓸까.
+///
+/// ★순수 함수로 뗀 이유.★ 실제 선택은 `Rc<dyn RefreshDriver>` 를 만들어야 해서 테스트에서
+/// 부르기 어렵다. 틀리면 화면이 멈추는 조합이 하나 있으므로(`Timer` 의 주석) 그 판정만
+/// 따로 재현 가능하게 둔다.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FrameClock {
+    /// `gfx_vsync_enabled` -- DwmFlush 스레드가 발사한다. ★셸의 표출 클럭도 이것을 탄다★
+    /// (`AppState::present_vsync`).
+    Vsync,
+    /// 페이싱 틱이 발사한다. 셸의 표출 클럭은 ***타이머 경로 그대로*** 다.
+    Pacing,
+    /// Servo 기본 `TimerRefreshDriver`(전용 스레드).
+    Timer,
+}
+
+impl FrameClock {
+    /// 셸의 표출 클럭(`AppState::present_vsync` -> `pump_vsync`)이 이 드라이버를 타는가.
+    ///
+    /// ★`Vsync` 만 참이다.★ 페이싱 드라이버를 그 자리에 넣으면 `vsync_due` 를 세우는 사람이
+    /// 없어 `vsync_stalled` 로 떨어진다 -- 표출 클럭이 깨진다.
+    fn drives_shell_present_clock(self) -> bool {
+        matches!(self, FrameClock::Vsync)
+    }
+}
+
+fn choose_frame_clock(vsync_enabled: bool, pacing_thread: bool) -> FrameClock {
+    if vsync_enabled {
+        FrameClock::Vsync
+    } else if pacing_thread {
+        FrameClock::Pacing
+    } else {
+        // ★페이싱이 없으면 `Pacing` 을 고르면 안 된다.★ 아무도 발사하지 않아 Servo 가
+        // 영원히 `waiting_for_frame=true` 로 멈춘다.
+        FrameClock::Timer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★vsync 가 켜져 있으면 그것이 이긴다.★ 이미 있는 동작이고 바뀌면 안 된다.
+    #[test]
+    fn vsync_wins_over_pacing() {
+        assert_eq!(choose_frame_clock(true, true), FrameClock::Vsync);
+        assert_eq!(choose_frame_clock(true, false), FrameClock::Vsync);
+    }
+
+    /// 페이싱이 돌고 vsync 가 꺼져 있을 때만 페이싱 드라이버를 쓴다.
+    #[test]
+    fn pacing_only_when_the_thread_runs() {
+        assert_eq!(choose_frame_clock(false, true), FrameClock::Pacing);
+    }
+
+    /// ★페이싱이 없으면 기본 타이머로 떨어진다.★ 이 조합에서 `Pacing` 을 고르면 아무도
+    /// 발사하지 않아 화면이 영원히 멈춘다.
+    #[test]
+    fn no_pacing_thread_falls_back_to_timer() {
+        assert_eq!(choose_frame_clock(false, false), FrameClock::Timer);
+    }
+
+    /// ★셸의 표출 클럭은 vsync 일 때만 드라이버를 탄다.★ 페이싱 드라이버가 그 자리
+    /// (`AppState::present_vsync`)로 새면 `vsync_due` 를 세우는 사람이 없어
+    /// `drive_present_clock` 이 `vsync_stalled` 로 떨어진다 -- 표출 클럭이 깨진다.
+    /// 기존 코드의 `let shell_vsync_driver = vsync_driver.clone();` 가 정확히 그 사고였다.
+    #[test]
+    fn only_vsync_drives_the_shell_present_clock() {
+        assert!(FrameClock::Vsync.drives_shell_present_clock());
+        assert!(!FrameClock::Pacing.drives_shell_present_clock());
+        assert!(!FrameClock::Timer.drives_shell_present_clock());
     }
 }
