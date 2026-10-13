@@ -1298,7 +1298,10 @@ impl AppState {
         webview.evaluate_javascript(scope.injection_script(&auth), move |result| match result {
             Ok(::servo::JSValue::String(outcome)) => {
                 log::info!("device-auth: inject {label} -> {outcome}");
-                if outcome == "set" {
+                // `same` = 이 문서에 같은 값이 이미 있어 다시 쓰지 않았다(page.rs). 자가 시험에는
+                // `set` 과 똑같이 센다 -- `#` 이동 구간에 `same` 이 와도 "또 넘기려 했다"는
+                // 회귀이므로 그대로 실패로 잡혀야 한다.
+                if outcome == "set" || outcome == "same" {
                     let next = selftest.as_ref().and_then(|s| s.borrow_mut().on_injected());
                     if let Some(script) = next {
                         // Servo 는 완료 콜백을 `javascript_evaluator` 를 빌린 채 부른다. 콜백 안에서
