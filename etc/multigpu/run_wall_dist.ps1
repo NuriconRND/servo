@@ -502,6 +502,11 @@ param(
     # update/draw split. This is the metric the 45-video work is aimed at (render_ms p50),
     # so an A/B without it cannot be compared to the earlier rounds.
     [switch] $PresentCadence,
+    # SERVO_LOG_ANIM_STEP_SEQ: ANIMSTEP 과 같은 창, 같은 표본을 ***도착 순서 그대로*** 한
+    # 줄에 찍는다(ANIMSTEPSEQ). 분위수 요약은 버스트를 묻는다 -- "0.5 초 간격 세 번 뒤
+    # 1.5~2 초 안정" 같은 구조가 p05/p50/p95 로는 보이지 않고, 실측에서 그 요약이 저더와
+    # ***음의 상관***이었다(설계 문서 45). 창당 한 줄 약 700 자, 벽에서 초당 네 줄이다.
+    [switch] $AnimStepSeq,
     # SERVO_DCOMP_DEBUG: per-surface [dcomp-dbg] lines (create_surface, external add,
     # bind). This is the ONLY way to see whether a video actually reached an external
     # compositor surface -- the launcher wipes SERVO_* before every run, so exporting it
@@ -732,6 +737,7 @@ if ($ForceGcSec -gt 0)     { $env:SERVO_SCRIPT_FORCE_GC_SEC = "$ForceGcSec" }
 else                       { Remove-Item Env:\SERVO_SCRIPT_FORCE_GC_SEC -ErrorAction SilentlyContinue }
 if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
+if ($AnimStepSeq)          { $env:SERVO_LOG_ANIM_STEP_SEQ = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
 
