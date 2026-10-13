@@ -507,6 +507,12 @@ param(
     # 1.5~2 초 안정" 같은 구조가 p05/p50/p95 로는 보이지 않고, 실측에서 그 요약이 저더와
     # ***음의 상관***이었다(설계 문서 45). 창당 한 줄 약 700 자, 벽에서 초당 네 줄이다.
     [switch] $AnimStepSeq,
+
+    # dom_animation_timeline_snap_hz: 애니메이션 타임라인 값을 이 주파수의 격자에 맞춘다.
+    # 0 이면 끈다(기본). 보통 -RefreshHz 와 같은 값을 준다. 왜 필요한지는 설계 문서 50 --
+    # 타임라인 값이 "스크립트가 도달한 순간" 이라 틱 도착 지연의 변동이 그대로 화면의
+    # 떨림이 된다.
+    [int]    $TimelineSnap = 0,
     # SERVO_DCOMP_DEBUG: per-surface [dcomp-dbg] lines (create_surface, external add,
     # bind). This is the ONLY way to see whether a video actually reached an external
     # compositor surface -- the launcher wipes SERVO_* before every run, so exporting it
@@ -802,6 +808,7 @@ if ($Devtools -ne "") {
 }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
+if ($TimelineSnap -gt 0)  { $argList += @("--pref", "dom_animation_timeline_snap_hz=$TimelineSnap") }
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }
