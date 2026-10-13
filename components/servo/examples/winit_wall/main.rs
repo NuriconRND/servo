@@ -64,6 +64,7 @@ fn qpc_frequency() -> Option<i64> {
 }
 
 mod crash_report;
+mod device_auth_selftest;
 mod pacing_refresh_driver;
 mod tile;
 #[cfg(target_os = "windows")]
@@ -94,6 +95,8 @@ struct Config {
     /// `--tile-thread-spike`: 병렬 타일 렌더(A 안) 1 단계의 관문만 시험하고 종료한다.
     /// 자세한 것은 [`tile::run_tile_thread_spike`].
     tile_thread_spike: bool,
+    /// `--device-auth-selftest` (시험 키 빌드 전용).
+    device_auth_selftest: bool,
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -108,6 +111,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut preferences = Preferences::default();
     let mut ignore_certificate_errors = false;
     let mut tile_thread_spike = false;
+    let mut device_auth_selftest = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -131,6 +135,10 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             // servoshell 과 같은 이름/의미다(ports/servoshell/prefs.rs). 인자를 받지 않는
             // 순수 스위치다.
             "--ignore-certificate-errors" => ignore_certificate_errors = true,
+            // 시험 키 빌드에서만 받는다 -- 실제 키 빌드에서는 아래 `unknown argument` 로 간다.
+            "--device-auth-selftest" if sdwall_device_auth::SIGNING_KEY_KIND == "test" => {
+                device_auth_selftest = true
+            },
             "--tile-thread-spike" => tile_thread_spike = true,
             "--capture-sec" => {
                 capture_sec = args
@@ -174,6 +182,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         preferences,
         ignore_certificate_errors,
         tile_thread_spike,
+        device_auth_selftest,
     })
 }
 
@@ -261,6 +270,8 @@ struct AppState {
     device_auth: Rc<RefCell<sdwall_device_auth::InjectionTracker>>,
     /// 넘겨도 되는 페이지. 시작 URL 이 불투명 오리진이면 `None` -- 아무 데도 넘기지 않는다.
     device_auth_scope: Option<sdwall_device_auth::PageScope>,
+    /// `--device-auth-selftest` (시험 키 빌드 전용).
+    device_auth_selftest: Option<Rc<RefCell<device_auth_selftest::DeviceAuthSelfTest>>>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -1280,9 +1291,18 @@ impl AppState {
         };
         let tracker = self.device_auth.clone();
         let label = auth.label();
+        let selftest = self.device_auth_selftest.clone();
+        let selftest_webview = webview.clone();
         webview.evaluate_javascript(scope.injection_script(&auth), move |result| match result {
             Ok(::servo::JSValue::String(outcome)) => {
-                log::info!("device-auth: inject {label} -> {outcome}")
+                log::info!("device-auth: inject {label} -> {outcome}");
+                if outcome == "set" {
+                    let next = selftest.as_ref().and_then(|s| s.borrow_mut().on_injected());
+                    if let Some(script) = next {
+                        log::warn!("device-auth selftest: next step");
+                        selftest_webview.evaluate_javascript(script, |_| {});
+                    }
+                }
             },
             Ok(other) => log::warn!("device-auth: inject {label} -> unexpected {other:?}"),
             Err(error) => {
@@ -1290,6 +1310,27 @@ impl AppState {
                 tracker.borrow_mut().on_injection_failed(document);
             },
         });
+    }
+
+    /// 자가 시험이 끝났으면 판정을 남기고 `true` -- 호출자가 이벤트 루프를 끝낸다.
+    fn device_auth_selftest_finished(&self) -> bool {
+        let Some(selftest) = &self.device_auth_selftest else {
+            return false;
+        };
+        let verdict = selftest
+            .borrow_mut()
+            .take_verdict(std::time::Instant::now());
+        match verdict {
+            Some(device_auth_selftest::Verdict::Pass) => {
+                log::warn!("device-auth selftest: PASS documents=3");
+                true
+            },
+            Some(device_auth_selftest::Verdict::Fail(reason)) => {
+                log::error!("device-auth selftest: FAIL {reason}");
+                true
+            },
+            None => false,
+        }
     }
 
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
@@ -1547,6 +1588,11 @@ fn document_event(status: ::servo::LoadStatus) -> sdwall_device_auth::DocumentEv
 
 impl ::servo::WebViewDelegate for AppState {
     fn notify_load_status_changed(&self, _: WebView, status: ::servo::LoadStatus) {
+        if matches!(status, ::servo::LoadStatus::Started) {
+            if let Some(selftest) = &self.device_auth_selftest {
+                selftest.borrow_mut().on_document_started();
+            }
+        }
         let pending = self
             .device_auth
             .borrow_mut()
@@ -1573,6 +1619,9 @@ impl ::servo::WebViewDelegate for AppState {
     /// that appears to say nothing is indistinguishable from a probe whose page never ran.
     /// Cost this a whole diagnostic round on 2026-09-08.
     fn show_console_message(&self, _: WebView, level: ConsoleLogLevel, message: String) {
+        if let Some(selftest) = &self.device_auth_selftest {
+            selftest.borrow_mut().on_console(&message);
+        }
         match level {
             ConsoleLogLevel::Error => log::error!("[page] {message}"),
             // `warn!` for the rest deliberately: the wall launcher's RUST_LOG leads with
@@ -1845,6 +1894,11 @@ impl ApplicationHandler<WakerEvent> for App {
             webview: RefCell::new(None),
             device_auth: Rc::default(),
             device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
+            device_auth_selftest: config.device_auth_selftest.then(|| {
+                Rc::new(RefCell::new(device_auth_selftest::DeviceAuthSelfTest::new(
+                    std::time::Instant::now(),
+                )))
+            }),
             tiles,
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
@@ -2044,6 +2098,10 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         };
         if state.should_exit.get() {
+            event_loop.exit();
+            return;
+        }
+        if state.device_auth_selftest_finished() {
             event_loop.exit();
             return;
         }
