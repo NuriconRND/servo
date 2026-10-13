@@ -1658,8 +1658,14 @@ impl ApplicationHandler<WakerEvent> for App {
             #[cfg(not(target_os = "windows"))]
             FrameClock::Vsync => (None, None),
             FrameClock::Pacing => {
+                // ★"스레드가 안 뜬다" 가 아니라 "프레임을 끌지 않는다" 다.★
+                // `Painter::new` 가 `WebContentAnimator::new(.., (*timer_refresh_driver)
+                // .clone(), ..)` 를 무조건 평가하므로 `LazyCell` 이 forced 되고
+                // `PaintTimerThread` 는 어차피 뜬다(`painter.rs:1088`). 거기 남는 일은
+                // caret 깜빡임뿐이다. 스레드 수를 세어 이 변경을 확인하려 하면 틀린 결론이
+                // 나온다 -- 확인은 `WALLCLOCK` 의 `user`/`pace` 로 한다.
                 eprintln!(
-                    "wall: 표출 틱이 프레임 클럭이다 -- Servo 의 PaintTimerThread 를 쓰지 않는다."
+                    "wall: 표출 틱이 프레임 클럭이다 -- Servo 의 PaintTimerThread 가 프레임을 끌지 않는다."
                 );
                 let driver = pacing_refresh_driver::PacingRefreshDriver::new();
                 let handle = driver.handle();
@@ -1999,6 +2005,19 @@ impl ApplicationHandler<WakerEvent> for App {
         // ★대가는 메인 스레드가 코어 하나를 계속 태우는 것이다★ -- 이 실험에서 박자가
         // 개선되지 않으면 되돌려야 하는 이유가 그것이다. 이 셸은 이미 `--capture` 대기
         // 중에 같은 방식으로 돈다(바로 위 분기).
+        // ★마지막 보루.★ 위 문단이 "여기서는 박자를 내지 않는다" 고 못박은 것은 페이싱이
+        // **돌고 있을 때** 의 이야기다. `FrameClock::Pacing` 을 골랐는데 페이싱 스레드가
+        // 뜨지 못하면 `WakerEvent::Tick` 이 영영 오지 않고, 그 구성에는 주기적 엔진 wake 도
+        // 없다 -- `needs_pacing_backstop` 의 주석이 왜인지 적는다. 그러면 clock 을 돌릴
+        // 사람이 하나도 없어 화면이 멈춘다.
+        //
+        // `Poll` 이라 이 함수는 계속 불리므로 폴백으로 충분하다. 페이싱이 정상이면
+        // `pacing_is_driving()` 이 참이라 끼어들지 않는다 -- ★`WALLCLOCK` 의 `tick_by atw`
+        // 가 0 이 아니면 이 보루가 돌고 있다는 뜻★이고, 그 칸은 그것 말고는 0 이다.
+        if needs_pacing_backstop(state.pacing_fire.is_some(), state.pacing_is_driving()) {
+            state.drive_present_clock(ClockSite::AboutToWait);
+        }
+
         event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     }
 
@@ -2113,6 +2132,22 @@ impl FrameClock {
     }
 }
 
+/// 페이싱 드라이버를 설치했는데 페이싱이 돌지 않을 때, `about_to_wait` 이 대신 박자를
+/// 내야 하는가.
+///
+/// ★`FrameClock::Pacing` 에는 주기적 엔진 wake 가 없다.★ `PaintTimerThread` 는 여전히
+/// 뜨지만(아래 배너 주석) 프레임 경로에서 빠졌고, 그 타이머에 남은 일은 caret 깜빡임뿐이라
+/// 편집 caret 이 없는 벽 콘텐츠에서는 아무것도 걸지 않는다. 그래서 `spawn_pacing_thread` 가
+/// 실패하면 ***`WakerEvent::Tick` 도 주기적 `Engine` 도 오지 않아 clock 을 돌릴 사람이
+/// 하나도 없다*** -- 화면이 영구히 멈추고 `about_to_wait` 이 `Poll` 로 코어만 태운다.
+/// 변경 전에는 그 타이머가 저하된 박자라도 냈다.
+///
+/// 선택은 `spawn_pacing_thread` 보다 260 줄 앞서 일어나므로 그 성패를 볼 수 없다. 그래서
+/// 런타임에 판정한다.
+fn needs_pacing_backstop(pacing_installed: bool, pacing_alive: bool) -> bool {
+    pacing_installed && !pacing_alive
+}
+
 fn choose_frame_clock(vsync_enabled: bool, pacing_thread: bool) -> FrameClock {
     if vsync_enabled {
         FrameClock::Vsync
@@ -2158,5 +2193,21 @@ mod tests {
         assert!(FrameClock::Vsync.drives_shell_present_clock());
         assert!(!FrameClock::Pacing.drives_shell_present_clock());
         assert!(!FrameClock::Timer.drives_shell_present_clock());
+    }
+
+    /// ★페이싱이 멎으면 누군가 대신 박자를 내야 한다.★ `FrameClock::Pacing` 에서는
+    /// `PaintTimerThread` 가 프레임 경로에서 빠지므로 주기적 엔진 wake 가 없다 -- 그 타이머는
+    /// caret 깜빡임에만 쓰이고, 편집 caret 이 없는 벽 콘텐츠에서는 아무것도 걸지 않는다.
+    /// 그래서 `spawn_pacing_thread` 가 실패하면 ***아무도 clock 을 돌리지 않아 화면이
+    /// 영구히 멈춘다.*** 변경 전에는 그 타이머가 저하된 박자라도 냈다.
+    #[test]
+    fn backstop_only_when_pacing_was_installed_but_is_not_running() {
+        // 페이싱이 돌고 있으면 백스톱은 끼어들지 않는다 -- 두 시계로 되돌아간다.
+        assert!(!needs_pacing_backstop(true, true));
+        // ★설치했는데 돌지 않는다 = 아무도 박자를 내지 않는다.★
+        assert!(needs_pacing_backstop(true, false));
+        // 페이싱을 아예 안 쓰는 구성(Timer/Vsync)은 자기 드라이버가 있다.
+        assert!(!needs_pacing_backstop(false, false));
+        assert!(!needs_pacing_backstop(false, true));
     }
 }
