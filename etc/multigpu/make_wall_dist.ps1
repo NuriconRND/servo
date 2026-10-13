@@ -61,6 +61,11 @@ if (!(Test-Path $GstRoot)) { throw "GStreamer root not found: $GstRoot" }
 # device_auth_key_kind.ps1 is only used here, before packaging; it is not copied into the dist.
 . (Join-Path $PSScriptRoot "device_auth_key_kind.ps1")
 $deviceAuthKey = Get-DeviceAuthKeyKind -Exe $exe -Repo $repo
+# 'unknown' = the exe holds neither or both key PEM bodies (tampered, foreign or stale binary).
+# Nothing about it is known, so -AllowTestSigningKey does not cover it; only 'test' can be allowed.
+if ($deviceAuthKey -eq 'unknown') {
+    throw "winit_wall.exe contains neither or both device-auth signing keys, so its key cannot be determined. Rebuild it cleanly ($buildCmd) and package again. -AllowTestSigningKey does not apply."
+}
 if ($deviceAuthKey -ne 'release') {
     if (-not $AllowTestSigningKey) {
         throw "winit_wall.exe device-auth signing key is '$deviceAuthKey', not 'release'. Rebuild without SDWALL_DEVICE_AUTH_SIGNING_KEY (or pass -AllowTestSigningKey for a lab package)."
