@@ -2,14 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::ptr;
 use std::sync::Arc;
 
-use dwrote::{Font, FontCollection, FontStretch, FontStyle};
+use dwrote::{Font, FontCollection, FontFamily, FontStretch, FontStyle};
 use fonts_traits::LocalFontIdentifier;
 use servo_base::text::{UnicodeBlock, UnicodeBlockMethod, unicode_plane};
 use style::values::computed::font::GenericFontFamily;
 use style::values::computed::{FontStyle as StyleFontStyle, FontWeight as StyleFontWeight};
 use style::values::specified::font::FontStretchKeyword;
+use winapi::shared::winerror::S_OK;
+use winapi::um::dwrite::IDWriteLocalizedStrings;
 
 use crate::{
     EmojiPresentationPreference, FallbackFontSelectionOptions, FontIdentifier, FontTemplate,
@@ -22,10 +25,53 @@ where
 {
     let system_fc = FontCollection::system();
     for family in system_fc.families_iter() {
-        if let Ok(family_name) = family.family_name() {
+        let names = all_family_names(&family);
+        if names.is_empty() {
+            if let Ok(family_name) = family.family_name() {
+                callback(family_name);
+            }
+            continue;
+        }
+        for family_name in names {
             callback(family_name);
         }
     }
+}
+
+/// Every localized name of `family`, deduplicated.
+///
+/// `FontFamily::family_name` returns only the name for the system locale, so on a Korean
+/// system "Malgun Gothic" is listed as "맑은 고딕" and a CSS `font-family: "Malgun Gothic"` (or
+/// the English names in [`fallback_font_families`]) never matches. Listing every name lets
+/// either spelling match, as in other browsers; `for_each_variation` resolves any of them
+/// through `FindFamilyName`.
+fn all_family_names(family: &FontFamily) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    unsafe {
+        let mut strings: *mut IDWriteLocalizedStrings = ptr::null_mut();
+        if (*family.as_ptr()).GetFamilyNames(&mut strings) != S_OK || strings.is_null() {
+            return names;
+        }
+        let strings = &*strings;
+        for index in 0..strings.GetCount() {
+            let mut length = 0;
+            if strings.GetStringLength(index, &mut length) != S_OK {
+                continue;
+            }
+            let mut buffer = vec![0u16; length as usize + 1];
+            if strings.GetString(index, buffer.as_mut_ptr(), length + 1) != S_OK {
+                continue;
+            }
+            buffer.truncate(length as usize);
+            if let Ok(name) = String::from_utf16(&buffer) {
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        strings.Release();
+    }
+    names
 }
 
 pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
@@ -351,4 +397,28 @@ pub(crate) fn default_system_generic_font_family(
         GenericFontFamily::SystemUi => "Segoe UI",
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn available_families() -> Vec<String> {
+        let mut families = Vec::new();
+        for_each_available_family(|name| families.push(name));
+        families
+    }
+
+    #[test]
+    fn families_are_listed_under_their_english_name_on_any_locale() {
+        let families = available_families();
+        assert!(families.iter().any(|name| name == "Arial"));
+
+        // Malgun Gothic ships with Windows 7+; on a Korean system its locale name is "맑은 고딕".
+        let system_fc = FontCollection::system();
+        if let Ok(Some(_)) = system_fc.font_family_by_name("Malgun Gothic") {
+            assert!(families.iter().any(|name| name == "Malgun Gothic"));
+            assert!(families.iter().any(|name| name == "맑은 고딕"));
+        }
+    }
 }

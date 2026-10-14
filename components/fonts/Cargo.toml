@@ -80,7 +80,7 @@ xml = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 dwrote = { workspace = true }
-winapi = { workspace = true }
+winapi = { workspace = true, features = ["dwrite", "winerror"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ohos_mock)'] }
