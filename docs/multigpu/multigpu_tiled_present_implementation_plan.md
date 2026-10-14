@@ -103,6 +103,14 @@ for cross-GPU testing, see `etc/multigpu/config/wall_layout.test_2x1_gpu1.json`)
 (recommended) path omits `gpu` entirely and lets auto-GPU pick the adapter that drives each
 tile's `display`.
 
+(2026-10-14 update) Tile `rect`s may be written in Windows desktop coordinates, so a display
+left of or above the primary display can be given a negative origin (e.g. `[-1920, 0, 1920, 1080]`).
+The parser shifts every tile by the same amount so the leftmost/topmost tile edge becomes page
+`(0, 0)` (an axis that never goes negative is not shifted, so existing layouts are unchanged), then
+checks the shifted rects against `virtualViewport` as before — the viewport must still cover the
+whole span. `display` is independent of `rect` and was already ordered from signed DXGI desktop
+coordinates.
+
 ### Verification
 
 - [ ] 1 GPU/1 monitor 援ъ꽦???뺥솗??異쒕젰?쒕떎.
