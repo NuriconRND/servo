@@ -331,6 +331,12 @@ impl TimerRefreshDriver {
     }
 }
 
+/// 셸이 알려준 프레임 시각을 버리는 나이. 네 주기다 -- 그보다 오래됐으면 셸이 틱을
+/// 내지 않고 있다는 뜻이므로 지금 시각으로 떨어진다(설계 문서 3.3).
+fn frame_time_max_age() -> Duration {
+    paint_timer_period() * 4
+}
+
 /// The free-running paint-timer period, from `gfx_refresh_hz`.
 ///
 /// ***Exact, not truncated.*** This used to be `Duration::from_millis(1000 / hz)`: integer
@@ -344,12 +350,6 @@ impl TimerRefreshDriver {
 ///
 /// Read once, like the value it replaces: `gfx_refresh_hz` is a startup pref, and the video
 /// path asks for this per arriving frame (over a thousand times a second on a full wall).
-/// 셸이 알려준 프레임 시각을 버리는 나이. 네 주기다 -- 그보다 오래됐으면 셸이 틱을
-/// 내지 않고 있다는 뜻이므로 지금 시각으로 떨어진다(설계 문서 3.3).
-fn frame_time_max_age() -> Duration {
-    paint_timer_period() * 4
-}
-
 pub(crate) fn paint_timer_period() -> Duration {
     static PERIOD: LazyLock<Duration> = LazyLock::new(|| {
         let raw_hz = servo_config::pref!(gfx_refresh_hz);
