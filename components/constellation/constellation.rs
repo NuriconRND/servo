@@ -141,6 +141,7 @@ use script_traits::{
     ProgressiveWebMetricType, ScriptThreadMessage, UpdatePipelineIdReason,
 };
 use servo_background_hang_monitor::HangMonitorRegister;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::{
     GenericCallback, GenericSend, GenericSender, RoutedReceiver, SendError,
 };
@@ -1487,8 +1488,8 @@ where
             EmbedderToConstellationMessage::ThemeChange(webview_id, theme) => {
                 self.handle_theme_change(webview_id, theme);
             },
-            EmbedderToConstellationMessage::TickAnimation(webview_ids) => {
-                self.handle_tick_animation(webview_ids)
+            EmbedderToConstellationMessage::TickAnimation(webview_ids, frame_time) => {
+                self.handle_tick_animation(webview_ids, frame_time)
             },
             EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
                 pipeline_ids,
@@ -3805,7 +3806,11 @@ where
     }
 
     #[servo_tracing::instrument(skip_all)]
-    fn handle_tick_animation(&mut self, webview_ids: Vec<WebViewId>) {
+    fn handle_tick_animation(
+        &mut self,
+        webview_ids: Vec<WebViewId>,
+        frame_time: CrossProcessInstant,
+    ) {
         let mut animating_event_loops = HashSet::new();
 
         for webview_id in webview_ids.iter() {
@@ -3820,8 +3825,10 @@ where
                     // with a particular pipeline. In addition, the danger of not progressing animations is pretty
                     // low, so it's probably safe to ignore this error and handle the crashed ScriptThread on
                     // some other message.
-                    let _ = event_loop
-                        .send(ScriptThreadMessage::TickAllAnimations(webview_ids.clone()));
+                    let _ = event_loop.send(ScriptThreadMessage::TickAllAnimations(
+                        webview_ids.clone(),
+                        frame_time,
+                    ));
                     animating_event_loops.insert(event_loop.id());
                 }
             }

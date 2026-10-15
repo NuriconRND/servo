@@ -468,6 +468,11 @@ pub struct ScriptThread {
     /// change that requires a rendering update.
     needs_rendering_update: Arc<AtomicBool>,
 
+    /// 가장 최근 틱이 알려준 프레임 시각. `update_the_rendering` 이 소비하며 비운다.
+    /// 틱이 아닌 이유로 도는 회차에서는 `None` 이고, 그때는 지금 시각을 쓴다.
+    #[no_trace]
+    pending_frame_time: Cell<Option<CrossProcessInstant>>,
+
     /// 위 플래그를 **폴백 타이머**가 세웠는가.
     ///
     /// ★진단용.★ `reflow_display` 가 실제 렌더 대비 1.8~2.2 배로 돈다(2026-09-16,
@@ -1118,6 +1123,7 @@ impl ScriptThread {
                     layout_factory,
                     scheduled_update_the_rendering: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
+                    pending_frame_time: Cell::new(None),
                     rendering_update_from_timer: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
@@ -2166,8 +2172,13 @@ impl ScriptThread {
             ScriptThreadMessage::SetWebGPUPort(port) => {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
-            ScriptThreadMessage::TickAllAnimations(_webviews) => {
+            ScriptThreadMessage::TickAllAnimations(_webviews, frame_time) => {
                 note_rendering_update_reason("renderer-tick");
+                // 최신이 이긴다. 한 번의 `update_the_rendering` 전에 틱이 여러 번
+                // 도착하면, 지금 만드는 디스플레이 리스트는 가장 최근 프레임을 위한
+                // 것이다. 밀린 프레임은 어차피 표출되지 않는다 -- 디스플레이가 하는 일과
+                // 같다.
+                self.pending_frame_time.set(Some(frame_time));
                 self.set_needs_rendering_update();
             },
             ScriptThreadMessage::NoLongerWaitingOnAsychronousImageUpdates(pipeline_id) => {

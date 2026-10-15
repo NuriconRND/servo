@@ -245,8 +245,9 @@ pub enum ScriptThreadMessage {
     FocusDocument(PipelineId, RemoteFocusOperation),
     /// Passes a webdriver command to the script thread for execution
     WebDriverScriptCommand(PipelineId, WebDriverScriptCommand),
-    /// Notifies script thread that all animations are done
-    TickAllAnimations(Vec<WebViewId>),
+    /// Notifies the script thread to tick all animations, with the time of the frame
+    /// these animations are being ticked for. See `EmbedderToConstellationMessage::TickAnimation`.
+    TickAllAnimations(Vec<WebViewId>, CrossProcessInstant),
     /// Notifies the script thread that a new Web font has been loaded, and thus the page should be
     /// reflowed.
     WebFontLoaded(PipelineId),

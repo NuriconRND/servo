@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use embedder_traits::{EventLoopWaker, RefreshDriver};
 use log::warn;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{PainterId, WebViewId};
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use timers::{BoxedTimerCallback, TimerEventRequest, TimerScheduler};
@@ -164,11 +165,17 @@ impl AnimationRefreshDriverObserver {
             return false;
         }
 
+        let frame_time = crate::frame_time::frame_time_for_tick(
+            CrossProcessInstant::now(),
+            frame_time_max_age(),
+        )
+        .unwrap_or_else(CrossProcessInstant::now);
         if let Err(error) =
             self.constellation_sender
-                .send(EmbedderToConstellationMessage::TickAnimation(vec![
-                    webview_renderer.id,
-                ]))
+                .send(EmbedderToConstellationMessage::TickAnimation(
+                    vec![webview_renderer.id],
+                    frame_time,
+                ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");
         }
@@ -236,10 +243,16 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         }
 
         // Request new animation frames from all animating WebViews.
+        let frame_time = crate::frame_time::frame_time_for_tick(
+            CrossProcessInstant::now(),
+            frame_time_max_age(),
+        )
+        .unwrap_or_else(CrossProcessInstant::now);
         if let Err(error) =
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::TickAnimation(
                     webviews_to_tick,
+                    frame_time,
                 ))
         {
             warn!("Sending tick to constellation failed ({error:?}).");
@@ -331,6 +344,12 @@ impl TimerRefreshDriver {
 ///
 /// Read once, like the value it replaces: `gfx_refresh_hz` is a startup pref, and the video
 /// path asks for this per arriving frame (over a thousand times a second on a full wall).
+/// 셸이 알려준 프레임 시각을 버리는 나이. 네 주기다 -- 그보다 오래됐으면 셸이 틱을
+/// 내지 않고 있다는 뜻이므로 지금 시각으로 떨어진다(설계 문서 3.3).
+fn frame_time_max_age() -> Duration {
+    paint_timer_period() * 4
+}
+
 pub(crate) fn paint_timer_period() -> Duration {
     static PERIOD: LazyLock<Duration> = LazyLock::new(|| {
         let raw_hz = servo_config::pref!(gfx_refresh_hz);
