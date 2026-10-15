@@ -16,6 +16,7 @@ use servo_constellation_traits::EmbedderToConstellationMessage;
 #[cfg(feature = "webxr")]
 use webxr::WebXrRegistry;
 
+pub use frame_time::note_frame_time;
 pub use crate::paint::{
     Paint, PaintTargetsInFlight, RenderingContextFactory, TileRenderTiming, WebRenderDebugOption,
 };
@@ -80,6 +81,7 @@ mod commit_scheduler;
 /// dcomp_compositor(Task 5)가 external compositor surface 경로에서 소비한다.
 #[cfg(windows)]
 mod dcomp_video_convert;
+mod frame_time;
 mod largest_contentful_paint_calculator;
 mod paint;
 mod painter;
