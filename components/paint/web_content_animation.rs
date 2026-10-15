@@ -388,6 +388,36 @@ impl ActivePaintAnimation {
     }
 }
 
+/// 세그먼트의 시간 원점.
+///
+/// ★원점은 이 리스트가 **만들어진** 시각이지 **받은** 시각이 아니다.★
+///
+/// 세그먼트는 레이아웃이 샘플링을 시작한 순간을 0 으로 갖고, `offset_from_display_list` 도
+/// 그 순간에서 잰 값이다. 받은 시각에 0 을 박으면 그 사이에 든 시간(리플로 잔여 + 전송 +
+/// 씬 빌드)만큼 예측 전체가 과거로 밀린다. 그 시간이 일정하다면 일정한 지연일 뿐이지만
+/// 일정하지 않다 -- 같은 벽에서 한가할 때 0.4ms, 콘텐츠 전환 중 2.0ms 다
+/// (log_ani_debug/08 `SCRIPTBUSY`). 만들어진 시각에 박으면 연달아 오는 예측들이 서로
+/// 정확히 맞물린다.
+fn animation_zero(
+    built_at: CrossProcessInstant,
+    now: CrossProcessInstant,
+    received_at: Instant,
+    offset_from_display_list: f64,
+) -> Instant {
+    let transit = (now - built_at)
+        .as_seconds_f64()
+        .clamp(0.0, MAX_DISPLAY_LIST_TRANSIT.as_secs_f64());
+    let created_at = received_at
+        .checked_sub(Duration::from_secs_f64(transit))
+        .unwrap_or(received_at);
+    let offset = Duration::from_secs_f64(offset_from_display_list.abs());
+    if offset_from_display_list <= 0.0 {
+        created_at.checked_sub(offset).unwrap_or(created_at)
+    } else {
+        created_at + offset
+    }
+}
+
 impl PipelineAnimations {
     pub(crate) fn update(&self, caret_visible: bool) -> Option<PropertyValue<ColorF>> {
         let mut maybe_caret = self.caret.borrow_mut();
@@ -550,30 +580,12 @@ impl PipelineAnimations {
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
             .map(|animation| {
-                // ★원점은 이 리스트가 **만들어진** 시각이지 **받은** 시각이 아니다.★
-                //
-                // 세그먼트는 레이아웃이 샘플링을 시작한 순간을 0 으로 갖고,
-                // `offset_from_display_list` 도 그 순간에서 잰 값이다. 받은 시각에 0 을
-                // 박으면 그 사이에 든 시간(리플로 잔여 + 전송 + 씬 빌드)만큼 예측 전체가
-                // 과거로 밀린다. 그 시간이 일정하다면 일정한 지연일 뿐이지만 일정하지
-                // 않다 -- 같은 벽에서 디스플레이 리플로 한 번이 한가할 때 0.4ms, 컨텐츠
-                // 전환 중 2.0ms 다(log_ani_debug/08 `SCRIPTBUSY`). 그 차이가 그대로
-                // 애니메이션 위상에 실리고, 비디오가 문서를 계속 더럽히는 벽에서는
-                // 디스플레이 리스트가 초당 백여 장이므로 초당 백여 번 실린다.
-                //
-                // 만들어진 시각에 박으면 연달아 오는 예측들이 서로 정확히 맞물린다.
-                let transit = (now - animation.built_at)
-                    .as_seconds_f64()
-                    .clamp(0.0, MAX_DISPLAY_LIST_TRANSIT.as_secs_f64());
-                let created_at = received_at
-                    .checked_sub(Duration::from_secs_f64(transit))
-                    .unwrap_or(received_at);
-                let offset = Duration::from_secs_f64(animation.offset_from_display_list.abs());
-                let zero = if animation.offset_from_display_list <= 0.0 {
-                    created_at.checked_sub(offset).unwrap_or(created_at)
-                } else {
-                    created_at + offset
-                };
+                let zero = animation_zero(
+                    animation.built_at,
+                    now,
+                    received_at,
+                    animation.offset_from_display_list,
+                );
                 ActivePaintAnimation {
                     property: animation.property,
                     zero,
@@ -817,6 +829,81 @@ mod tests {
         assert_eq!(
             animations.append_held_paint_values(&mut floats, &mut transforms),
             1
+        );
+    }
+
+    /// ★원점은 "리스트가 만들어진 시각" 이어야 한다.★ 받은 시각에 박으면 그 사이에 든
+    /// 시간(리플로 잔여 + 전송 + 씬 빌드)만큼 예측 전체가 과거로 밀린다.
+    #[test]
+    fn zero_is_anchored_at_build_time_not_receipt() {
+        let built = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        let now = built + time::Duration::milliseconds(3);
+        let received_at = Instant::now();
+        let zero = animation_zero(built, now, received_at, 0.0);
+        let behind = received_at.saturating_duration_since(zero);
+        assert!(
+            (behind.as_secs_f64() - 0.003).abs() < 1e-4,
+            "받은 시각보다 3ms 앞이어야 한다: {behind:?}"
+        );
+    }
+
+    /// ★이 테스트가 Task 6 의 이유다.★ 연달아 오는 리스트의 `built_at` 이 고른 격자 위에
+    /// 있으면, 전송 시간이 매번 달라도 ***원점이 정확히 같은 간격으로*** 늘어서야 한다.
+    /// 그래야 예측들이 서로 맞물린다. 원점이 흔들리면 그 흔들림이 그대로 화면의 떨림이다.
+    #[test]
+    fn even_build_times_give_even_zeros_despite_jittery_transit() {
+        let base = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        let period = time::Duration::seconds_f64(1.0 / 60.0);
+        let start = Instant::now();
+        // 전송 지연을 0.2ms ~ 2.0ms 로 흔든다. 실측 범위다(log_ani_debug/08 SCRIPTBUSY).
+        let transits_ms = [0.2, 2.0, 0.5, 1.7, 0.3];
+        let zeros: Vec<Instant> = transits_ms
+            .iter()
+            .enumerate()
+            .map(|(index, transit_ms)| {
+                let built = base + period * (index as i32);
+                let now = built + time::Duration::seconds_f64(transit_ms / 1000.0);
+                let received_at = start
+                    + std::time::Duration::from_secs_f64(
+                        (index as f64) / 60.0 + transit_ms / 1000.0,
+                    );
+                animation_zero(built, now, received_at, 0.0)
+            })
+            .collect();
+        for pair in zeros.windows(2) {
+            let gap = pair[1].saturating_duration_since(pair[0]).as_secs_f64();
+            assert!(
+                (gap - 1.0 / 60.0).abs() < 1e-4,
+                "원점 간격이 고르지 않다: {gap}"
+            );
+        }
+    }
+
+    /// 오래된 트리의 애니메이션은 과거에서 시작한다 -- `offset_from_display_list` 가 음수다.
+    #[test]
+    fn a_negative_offset_moves_zero_into_the_past() {
+        let built = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        let received_at = Instant::now();
+        let zero = animation_zero(built, built, received_at, -0.5);
+        let behind = received_at.saturating_duration_since(zero);
+        assert!(
+            (behind.as_secs_f64() - 0.5).abs() < 1e-4,
+            "0.5초 과거여야 한다: {behind:?}"
+        );
+    }
+
+    /// ★전송 시간이 터무니없으면 자른다.★ 콘텐츠 전환이나 스톨 뒤에 몇 초짜리 transit 이
+    /// 나오면 원점이 그만큼 과거로 가 애니메이션이 순간이동한다.
+    #[test]
+    fn an_absurd_transit_is_clamped() {
+        let built = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        let now = built + time::Duration::seconds(10);
+        let received_at = Instant::now();
+        let zero = animation_zero(built, now, received_at, 0.0);
+        let behind = received_at.saturating_duration_since(zero);
+        assert!(
+            behind <= MAX_DISPLAY_LIST_TRANSIT,
+            "{behind:?} 가 상한 {MAX_DISPLAY_LIST_TRANSIT:?} 를 넘었다"
         );
     }
 }
