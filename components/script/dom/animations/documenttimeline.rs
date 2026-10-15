@@ -68,9 +68,17 @@ impl DocumentTimeline {
     }
 
     /// Updates the value of the `AnimationTimeline` to the current clock time.
-    pub(crate) fn update(&self, window: &Window) {
-        let duration_since_time_origin =
-            CrossProcessInstant::now() - window.navigation_start() - self.origin_offset;
+    ///
+    /// ★`frame_time` 이 있고 pref 가 켜져 있으면 그것을 쓴다.★ 이 값이 애니메이션 전체의
+    /// 기준 시각이고, 여기 실린 지터가 그대로 화면의 떨림이 된다 -- 그 인과는 설계 문서
+    /// 50 이 측정으로 닫았다. `None` 은 틱이 아닌 이유(scroll, resize, input, …)로 도는
+    /// 회차이고, 그때는 지금 시각이 맞다.
+    pub(crate) fn update(&self, window: &Window, frame_time: Option<CrossProcessInstant>) {
+        let now = match frame_time {
+            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
+            _ => CrossProcessInstant::now(),
+        };
+        let duration_since_time_origin = now - window.navigation_start() - self.origin_offset;
         self.animation_timeline
             .set_current_time(duration_since_time_origin);
     }

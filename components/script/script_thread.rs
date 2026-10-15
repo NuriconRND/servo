@@ -1354,6 +1354,9 @@ impl ScriptThread {
         self.maybe_force_gc();
         self.maybe_report_live_webgl_contexts();
         self.last_render_opportunity_time.set(Some(Instant::now()));
+        // ★소비하며 비운다.★ 다음 회차가 틱이 아닌 이유로 돌면 이 값을 재사용하면 안 된다
+        // -- 그때는 이미 지나간 프레임의 시각이다.
+        let frame_time = self.pending_frame_time.take();
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
         if self.rendering_update_from_timer.swap(false, Ordering::Relaxed) {
@@ -1459,7 +1462,7 @@ impl ScriptThread {
             // > 11. For each doc of docs, update animations and send events for doc, passing
             // > in relative high resolution time given frameTimestamp and doc's relevant
             // > global object as the timestamp [WEBANIMATIONS]
-            document.update_animations_and_send_events(cx);
+            document.update_animations_and_send_events(cx, frame_time);
 
             // TODO(#31866): Implement "run the fullscreen steps" from
             // https://fullscreen.spec.whatwg.org/multipage/#run-the-fullscreen-steps.
@@ -1470,7 +1473,7 @@ impl ScriptThread {
             // > 14. For each doc of docs, run the animation frame callbacks for doc, passing
             // > in the relative high resolution time given frameTimestamp and doc's
             // > relevant global object as the timestamp.
-            document.run_the_animation_frame_callbacks(cx);
+            document.run_the_animation_frame_callbacks(cx, frame_time);
 
             // Run the resize observer steps.
             let mut depth = Default::default();

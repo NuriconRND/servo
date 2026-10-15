@@ -146,6 +146,17 @@ pub struct Preferences {
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
     pub dom_bluetooth_testing_enabled: bool,
+    /// 애니메이션의 기준 시각을 "script 가 도달한 순간" 대신 ***"그 프레임의 시각"***으로
+    /// 쓴다. 타임라인(`document.timeline.currentTime`)과 rAF 콜백의 timestamp ***양쪽***에
+    /// 걸린다.
+    ///
+    /// ★끄면 지금 동작 그대로다.★ 왜 필요한지는 설계 문서 50 -- 틱 발송은 페이싱 클럭이라
+    /// 고른데, script 가 그 메시지를 처리하기까지의 큐 지연이 매번 달라 그 변동이 그대로
+    /// 애니메이션 값이 된다.
+    ///
+    /// ★한쪽만 끄는 선택지를 두지 않았다.★ 타임라인과 rAF 가 갈라지면 둘을 섞은 페이지에서
+    /// 최대 한 프레임의 흔들리는 어긋남이 생긴다 -- 이 기능이 없애려는 바로 그 증상이다.
+    pub dom_animation_timeline_use_frame_time: bool,
     pub dom_allow_scripts_to_close_windows: bool,
     // feature: Media Capture and Streams API | #26861 | Web/API/Media_Capture_and_Streams_API
     pub dom_canvas_capture_enabled: bool,
@@ -1112,6 +1123,7 @@ impl Preferences {
             dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
             dom_allow_preloading_module_descendants: false,
+            dom_animation_timeline_use_frame_time: true,
             dom_allow_scripts_to_close_windows: false,
             dom_async_clipboard_enabled: false,
             dom_bluetooth_enabled: false,

@@ -1749,9 +1749,23 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-the-animation-frame-callbacks>
-    pub(crate) fn run_the_animation_frame_callbacks(&self, cx: &mut CurrentRealm) {
+    pub(crate) fn run_the_animation_frame_callbacks(
+        &self,
+        cx: &mut CurrentRealm,
+        frame_time: Option<CrossProcessInstant>,
+    ) {
         self.running_animation_callbacks.set(true);
-        let timing = self.global().performance().Now();
+        // ★타임라인과 같은 순간을 가리켜야 한다.★ 표준은 한 회차의 "update the rendering"
+        // 이 하나의 timestamp 를 쓰라고 한다. 갈라지면 rAF 로 움직이는 요소와
+        // `Element.animate()` 로 움직이는 요소 사이에 최대 한 프레임의 흔들리는 어긋남이
+        // 생긴다 -- 이 기능이 없애려는 바로 그 증상이다.
+        let timing = match frame_time {
+            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => self
+                .global()
+                .performance()
+                .to_dom_high_res_time_stamp(frame_time),
+            _ => self.global().performance().Now(),
+        };
 
         let num_callbacks = self.animation_frame_list.borrow().len();
         for _ in 0..num_callbacks {
@@ -4576,10 +4590,14 @@ impl Document {
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
-    pub(crate) fn update_animations_and_send_events(&self, cx: &mut CurrentRealm) {
+    pub(crate) fn update_animations_and_send_events(
+        &self,
+        cx: &mut CurrentRealm,
+        frame_time: Option<CrossProcessInstant>,
+    ) {
         // Only update the time if it isn't being managed by a test.
         if !self.layout_animations_test_enabled {
-            self.timeline.update(self.window());
+            self.timeline.update(self.window(), frame_time);
         }
 
         // > 1. Update the current time of all timelines associated with doc passing now
