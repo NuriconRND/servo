@@ -1754,17 +1754,17 @@ impl Document {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#run-the-animation-frame-callbacks>
-    pub(crate) fn run_the_animation_frame_callbacks(
-        &self,
-        cx: &mut CurrentRealm,
-        frame_time: Option<CrossProcessInstant>,
-    ) {
+    pub(crate) fn run_the_animation_frame_callbacks(&self, cx: &mut CurrentRealm) {
         self.running_animation_callbacks.set(true);
         // ★타임라인과 같은 순간을 가리켜야 한다.★ 표준은 한 회차의 "update the rendering"
         // 이 하나의 timestamp 를 쓰라고 한다. 갈라지면 rAF 로 움직이는 요소와
         // `Element.animate()` 로 움직이는 요소 사이에 최대 한 프레임의 흔들리는 어긋남이
         // 생긴다 -- 이 기능이 없애려는 바로 그 증상이다.
-        let timing = match frame_time {
+        //
+        // 그래서 시각을 인자로 다시 받지 않고, 같은 회차 11 단계의
+        // [`Document::resolve_frame_time`] 이 기록해 둔 값을 그대로 읽는다. 단조 증가
+        // 하한도 거기서 이미 걸렸으므로 타임라인과 완전히 같은 순간이 된다.
+        let timing = match self.last_frame_time.get() {
             Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => self
                 .global()
                 .performance()
@@ -4576,6 +4576,37 @@ impl Document {
         }
     }
 
+    /// 이번 "update the rendering" 회차가 쓸 프레임 시각을 정하고 기록한다.
+    ///
+    /// ★한 회차의 타임라인, rAF timestamp, `built_at` 이 전부 이 하나의 값을 쓴다.★
+    /// 셋이 갈라지면 그 차이가 그대로 페인트측 예측의 위상 오차가 된다(설계 문서 3.4).
+    ///
+    /// ★`None` 이어도 무조건 덮는다.★ 틱이 아닌 회차(scroll, dirty canvas, 폴백 타이머,
+    /// …)에는 틱 시각이 없어 지금 시각으로 떨어지는데, 그때 직전 틱 값을 남겨 두면
+    /// 타임라인만 지금으로 가고 `built_at` 은 과거에 남는다. 그러면 마지막 틱 이후 흐른
+    /// 시간 전체가 위상 오차가 된다 -- `tick_divisor=4` 인 60Hz 벽이면 최대 66.7ms,
+    /// 애니메이션이 쉬었다 돌면 그 이상이라 페인트측 250ms 상한에 말없이 잘린다.
+    /// 덮으면 원점도 값도 똑같이 `now()` 라 어긋남이 마이크로초로 돌아간다 -- 이 브랜치
+    /// 이전 동작이 바로 그것이다.
+    ///
+    /// ★뒤로 가지 않는다.★ 틱 시각 P 가 큐에 있는 동안 P+δ 에 다른 이유로 한 회차가
+    /// 돌면 그 회차는 P+δ 를 쓰고, 뒤이어 틱 회차가 P 를 쓰면 타임라인과 rAF 의
+    /// timestamp 가 **감소한다**. Web Animations 는 타임라인의 단조 증가를 요구하고,
+    /// 페이지가 재는 `dt` 는 음수가 된다. 어긋남의 크기가 이 기능이 없애려는 지터와 같은
+    /// 자릿수라 그냥 두면 이득을 그대로 깎아먹는다. 직전 값으로 하한을 둔다.
+    fn resolve_frame_time(&self, frame_time: Option<CrossProcessInstant>) -> CrossProcessInstant {
+        let candidate = match frame_time {
+            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
+            _ => CrossProcessInstant::now(),
+        };
+        let resolved = match self.last_frame_time.get() {
+            Some(previous) if previous > candidate => previous,
+            _ => candidate,
+        };
+        self.last_frame_time.set(Some(resolved));
+        resolved
+    }
+
     pub(crate) fn animations(&self) -> &Animations {
         &self.animations
     }
@@ -4610,11 +4641,10 @@ impl Document {
         cx: &mut CurrentRealm,
         frame_time: Option<CrossProcessInstant>,
     ) {
-        // 틱이 아닌 회차의 `None` 이 직전 값을 지우면 그 직후 리플로가 `now()` 로 떨어져
-        // 한 프레임만 원점이 튄다.
-        if frame_time.is_some() {
-            self.last_frame_time.set(frame_time);
-        }
+        // 이 한 줄이 이번 회차의 유일한 시각 출처다. `built_at`(`animation_frame_time`),
+        // 타임라인, rAF timestamp 가 전부 여기서 나온다 -- 자세한 이유는
+        // [`Document::resolve_frame_time`] 주석 참고.
+        let frame_time = self.resolve_frame_time(frame_time);
 
         // Only update the time if it isn't being managed by a test.
         if !self.layout_animations_test_enabled {

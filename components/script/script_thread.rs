@@ -468,8 +468,10 @@ pub struct ScriptThread {
     /// change that requires a rendering update.
     needs_rendering_update: Arc<AtomicBool>,
 
-    /// 가장 최근 틱이 알려준 프레임 시각. `update_the_rendering` 이 소비하며 비운다.
-    /// 틱이 아닌 이유로 도는 회차에서는 `None` 이고, 그때는 지금 시각을 쓴다.
+    /// 가장 최근 틱이 알려준 프레임 시각. `update_the_rendering` 이 소비하며 비우되,
+    /// ***아무 문서도 쓰지 못한 회차는 되돌려 놓는다***
+    /// ([`ScriptThread::restore_pending_frame_time`]). 틱이 아닌 이유로 도는 회차에서는
+    /// `None` 이고, 그때는 지금 시각을 쓴다.
     #[no_trace]
     pending_frame_time: Cell<Option<CrossProcessInstant>>,
 
@@ -1350,13 +1352,45 @@ impl ScriptThread {
         }
     }
 
+    /// 아무 문서도 쓰지 못한 틱 시각을 `pending_frame_time` 으로 되돌려 놓는다.
+    ///
+    /// ★렌더링 갱신을 새로 예약하지는 않는다.★ 되돌리는 상황은 대개 모든 문서가 캔버스
+    /// 업로드를 기다리는 경우인데, 여기서 `set_needs_rendering_update` 를 부르면 조건이
+    /// 그대로인 채 같은 회차가 다시 돌아 바쁜 대기가 된다. 깨우는 일은 원래 그 조건을
+    /// 푸는 쪽(`NoLongerWaitingOnAsychronousImageUpdates` 등)이 한다. 여기서는 시각만
+    /// 남겨 두면 되고, 그 회차가 `take()` 로 집어 간다.
+    fn restore_pending_frame_time(&self, frame_time: Option<CrossProcessInstant>) {
+        let Some(frame_time) = frame_time else {
+            return;
+        };
+        // 되돌리는 사이에 더 새 틱이 들어왔으면 그쪽이 이긴다 -- `TickAllAnimations` 와
+        // 같은 규칙이다. 밀린 프레임은 어차피 표출되지 않는다.
+        if self
+            .pending_frame_time
+            .get()
+            .is_none_or(|pending| pending < frame_time)
+        {
+            self.pending_frame_time.set(Some(frame_time));
+        }
+    }
+
     pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
         self.maybe_force_gc();
         self.maybe_report_live_webgl_contexts();
         self.last_render_opportunity_time.set(Some(Instant::now()));
-        // ★소비하며 비운다.★ 다음 회차가 틱이 아닌 이유로 돌면 이 값을 재사용하면 안 된다
+        // ★소비하며 비운다.★ 한 번 쓴 프레임 시각을 다음 회차가 재사용하면 안 된다
         // -- 그때는 이미 지나간 프레임의 시각이다.
+        //
+        // 다만 **쓴 회차만** 비워야 한다. 이 함수는 아래에서 그냥 돌아가거나
+        // (`can_continue_running_inner`) 모든 문서를 건너뛸 수 있는데
+        // (`is_fully_active`/`waiting_on_canvas_image_updates`/`is_render_blocked`),
+        // 그러면 틱 시각이 타임라인에도 rAF 에도 `built_at` 에도 닿지 못한 채 사라진다.
+        // 벽의 프로브는 전부 캔버스를 쓰므로 캔버스 업로드를 기다리는 동안 들어온 틱이
+        // 바로 그렇게 버려지고, 뒤이어 업로드가 깨운 회차는 `None` 으로 돈다 --
+        // **스크립트 스레드가 바빴던 프레임, 즉 지터가 가장 큰 프레임에서만 기능이 꺼진다.**
+        // 그래서 아무도 쓰지 않았으면 `restore_pending_frame_time` 으로 되돌려 놓는다.
         let frame_time = self.pending_frame_time.take();
+        let mut frame_time_consumed = false;
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
         if self.rendering_update_from_timer.swap(false, Ordering::Relaxed) {
@@ -1364,6 +1398,7 @@ impl ScriptThread {
         }
 
         if !self.can_continue_running_inner() {
+            self.restore_pending_frame_time(frame_time);
             return false;
         }
 
@@ -1462,6 +1497,10 @@ impl ScriptThread {
             // > 11. For each doc of docs, update animations and send events for doc, passing
             // > in relative high resolution time given frameTimestamp and doc's relevant
             // > global object as the timestamp [WEBANIMATIONS]
+            //
+            // `frame_time` 은 이 루프 안에서 바뀌지 않는 지역 변수다. 그래서 이 회차의
+            // 모든 문서가 ***반드시 같은 값***을 받는다. 소비 여부만 따로 기록한다.
+            frame_time_consumed = true;
             document.update_animations_and_send_events(cx, frame_time);
 
             // TODO(#31866): Implement "run the fullscreen steps" from
@@ -1473,7 +1512,7 @@ impl ScriptThread {
             // > 14. For each doc of docs, run the animation frame callbacks for doc, passing
             // > in the relative high resolution time given frameTimestamp and doc's
             // > relevant global object as the timestamp.
-            document.run_the_animation_frame_callbacks(cx, frame_time);
+            document.run_the_animation_frame_callbacks(cx);
 
             // Run the resize observer steps.
             let mut depth = Default::default();
@@ -1516,6 +1555,10 @@ impl ScriptThread {
 
             // TODO: Process top layer removals according to
             // https://drafts.csswg.org/css-position-4/#process-top-layer-removals.
+        }
+
+        if !frame_time_consumed {
+            self.restore_pending_frame_time(frame_time);
         }
 
         let should_generate_frame = !painters_generating_frames.is_empty();

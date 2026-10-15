@@ -174,6 +174,13 @@ pub(crate) struct PipelineAnimations {
     built_at_gaps: RefCell<Vec<f64>>,
     /// 창이 열린 시각.
     built_at_window_start: Cell<Option<Instant>>,
+    /// `TRANSITCLAMP` 창이 열린 시각. `None` 이면 아직 한 번도 안 찍었다는 뜻이고,
+    /// 그때는 첫 건을 바로 찍는다.
+    transit_clamp_window_start: Cell<Option<Instant>>,
+    /// 이번 창에서 상한에 걸린 애니메이션 수.
+    transit_clamp_count: Cell<u32>,
+    /// 이번 창에서 본 가장 큰 transit(초, 자르기 전).
+    transit_clamp_max: Cell<f64>,
     /// What layout last told us to keep playing, and the clock it is played against.
     /// Replaced wholesale by every display list -- see [`PaintAnimation`].
     paint: RefCell<Vec<ActivePaintAnimation>>,
@@ -418,6 +425,24 @@ fn animation_zero(
     }
 }
 
+/// transit 이 [`MAX_DISPLAY_LIST_TRANSIT`] 를 넘었으면 ***자르기 전***의 값(초)을 준다.
+///
+/// ★상한이 죽은 안전망에서 살아 있는 코드 경로가 됐다.★ 예전 `built_at` 은 디스플레이
+/// 리스트를 만든 시각이라 transit 은 리플로 잔여 + 전송 + 씬 빌드, 실측 0.4~2.0ms 였고
+/// 250ms 는 닿을 일이 없었다. 지금 `built_at` 은 페이싱 틱 시각이므로 transit 은
+/// 틱 → 컨스텔레이션 → 스크립트 → 큐 → 리플로 → 전송 → 수신 전체 지연이고, 이 벽에서
+/// 흔히 5~30ms, 콘텐츠 전환 리플로 한 번이 14.5ms 다. 상한에 걸리면 원점이 넘친 만큼
+/// 늦게 놓이는데 지금까지 어디에도 로그가 없었다 -- 게다가 이걸 보여 줬을 `TIMELINESTEP`
+/// 은 이 브랜치가 은퇴시켰다(설계 문서 3.6). A/B 에서 "효과가 없다" 와 "잘려서 없어졌다"
+/// 를 가르려면 이 신호가 있어야 한다.
+fn transit_overflow_seconds(
+    built_at: CrossProcessInstant,
+    now: CrossProcessInstant,
+) -> Option<f64> {
+    let transit = (now - built_at).as_seconds_f64();
+    (transit > MAX_DISPLAY_LIST_TRANSIT.as_secs_f64()).then_some(transit)
+}
+
 impl PipelineAnimations {
     pub(crate) fn update(&self, caret_visible: bool) -> Option<PropertyValue<ColorF>> {
         let mut maybe_caret = self.caret.borrow_mut();
@@ -535,7 +560,10 @@ impl PipelineAnimations {
     /// 고른지를 재고, 이 줄은 값의 출처가 고른지를 잰다.*** 실측에서 전자는 고른데
     /// (이탈의 95%에서 `dt` 정상) 화면은 떨었으므로, 남은 곳이 여기다.
     ///
-    /// `built_at` 은 한 디스플레이 리스트의 모든 애니메이션이 공유하므로 첫 번째만 본다.
+    /// 첫 번째 애니메이션의 `built_at` 만 본다. ***모두 같다고 보장할 수는 없다*** --
+    /// 스태킹 컨텍스트 트리가 디스플레이 리스트 사이에 재사용되면 transform 애니메이션은
+    /// 옛 트리의 값을, opacity 는 새 값을 들고 올 수 있다. 보장되는 것은 "이 리스트가
+    /// 실어 온 어느 애니메이션의 샘플 시각"뿐이고, 어차피 폐기된 진단이라 그 정도면 된다.
     ///
     /// ★이 지표는 더 이상 검증에 쓸 수 없다.★ `built_at` 이 프레임 시각(= 페이싱 클럭)이
     /// 된 뒤로는 그 간격이 정의상 고르게 나오므로, 구조적으로 성공을 보고한다. "값의
@@ -577,14 +605,54 @@ impl PipelineAnimations {
         );
     }
 
+    /// ★`MAX_DISPLAY_LIST_TRANSIT` 가 물렸음을 알린다.★ 이유는
+    /// [`transit_overflow_seconds`] 주석 참고.
+    ///
+    /// 디스플레이 리스트마다 한 줄이면 이미 수십 MB 인 로그를 덮어 버리므로
+    /// `note_timeline_step` 과 같은 1 초 창으로 묶는다. 다른 점은 둘: 걸린 적이 없으면
+    /// 아무 상태도 건드리지 않고 바로 돌아가고(설치 경로라 비싸면 안 된다), 첫 건은
+    /// 창을 기다리지 않고 바로 찍는다(한 번만 걸린 경우를 놓치지 않으려고).
+    fn note_transit_clamp(&self, received_at: Instant, clamped: u32, max_seconds: f64) {
+        if clamped > 0 {
+            self.transit_clamp_count
+                .set(self.transit_clamp_count.get() + clamped);
+            self.transit_clamp_max
+                .set(self.transit_clamp_max.get().max(max_seconds));
+        }
+        if self.transit_clamp_count.get() == 0 {
+            return;
+        }
+        let due = match self.transit_clamp_window_start.get() {
+            None => true,
+            Some(at) => received_at.duration_since(at) >= std::time::Duration::from_secs(1),
+        };
+        if !due {
+            return;
+        }
+        self.transit_clamp_window_start.set(Some(received_at));
+        let count = self.transit_clamp_count.replace(0);
+        let max_ms = self.transit_clamp_max.replace(0.0) * 1000.0;
+        // `warn!` 은 일부러다. 런처 기본 `RUST_LOG` 가 `warn` 부터 싣는다.
+        log::warn!(
+            "TRANSITCLAMP n={count} max_ms={max_ms:.1} limit_ms={:.0} -- 원점이 넘친 만큼 늦게 놓였다",
+            MAX_DISPLAY_LIST_TRANSIT.as_secs_f64() * 1000.0
+        );
+    }
+
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
         let now = CrossProcessInstant::now();
         self.note_timeline_step(&paint_animations, received_at);
         self.prune_held(&paint_animations);
+        let mut clamped = 0u32;
+        let mut max_transit = 0.0f64;
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
             .map(|animation| {
+                if let Some(transit) = transit_overflow_seconds(animation.built_at, now) {
+                    clamped += 1;
+                    max_transit = max_transit.max(transit);
+                }
                 let zero = animation_zero(
                     animation.built_at,
                     now,
@@ -598,6 +666,7 @@ impl PipelineAnimations {
                 }
             })
             .collect();
+        self.note_transit_clamp(received_at, clamped, max_transit);
     }
 
     pub(crate) fn handle_new_display_list(
@@ -895,6 +964,35 @@ mod tests {
             (behind.as_secs_f64() - 0.5).abs() < 1e-4,
             "0.5초 과거여야 한다: {behind:?}"
         );
+    }
+
+    /// ★상한에 걸렸는지를 말없이 넘기지 않는다.★ `built_at` 이 페이싱 틱 시각이 된 뒤로
+    /// transit 은 틱에서 수신까지의 전체 지연이라 상한이 실제로 물릴 수 있는 값이 됐다.
+    /// 물리면 원점이 그만큼 늦게 놓이는데, 그걸 보여 줬을 `TIMELINESTEP` 은 은퇴했다.
+    /// 그래서 이 함수가 그 사실을 `install_paint_animations` 에 알리고 `TRANSITCLAMP` 이
+    /// 찍힌다 -- A/B 에서 "효과가 없다" 와 "잘려서 없어졌다" 를 가르는 신호다.
+    #[test]
+    fn transit_overflow_is_reported_only_past_the_limit() {
+        let built = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        // 벽에서 흔한 범위(5~30ms)는 상한 안이라 조용해야 한다.
+        for within_ms in [0.4, 2.0, 14.5, 30.0] {
+            let now = built + time::Duration::seconds_f64(within_ms / 1000.0);
+            assert_eq!(
+                transit_overflow_seconds(built, now),
+                None,
+                "{within_ms}ms 는 상한 안이다"
+            );
+        }
+        // 상한을 넘으면 ***자르기 전***의 값이 나와야 한다. 넘친 양이 곧 위상 오차다.
+        let now = built + time::Duration::seconds(10);
+        let overflow = transit_overflow_seconds(built, now).expect("상한을 넘었으면 알려야 한다");
+        assert!(
+            (overflow - 10.0).abs() < 1e-6,
+            "자르기 전 값이어야 한다: {overflow}"
+        );
+        // `built_at` 이 미래로 읽히는 경우(두 시계의 읽기 시점이 달라 생긴다)는 잘림이 아니다.
+        let future = now + time::Duration::milliseconds(2);
+        assert_eq!(transit_overflow_seconds(future, now), None);
     }
 
     /// ★전송 시간이 터무니없으면 자른다.★ 콘텐츠 전환이나 스톨 뒤에 몇 초짜리 transit 이

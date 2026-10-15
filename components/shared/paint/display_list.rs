@@ -1106,20 +1106,30 @@ pub struct PaintAnimation {
     /// Seconds from the display list's creation to the animation's zero point. Negative
     /// for an animation already under way, which is the usual case.
     pub offset_from_display_list: f64,
-    /// When layout sampled these segments.
+    /// The frame this reflow was produced for: the shell's pacing tick instant, carried
+    /// through paint and the constellation into script.
     ///
     /// ***The segments are anchored to this instant, not to the one the painter receives
-    /// them on.*** `offset_from_display_list` is measured from the display list's
-    /// creation, so the paint thread has to be told when that was; the only other instant
-    /// available to it is the arrival, and anchoring there shifts the whole prediction by
-    /// however long the list spent in the rest of the reflow, the send, and the scene
-    /// build. A fixed shift would only be a fixed lag, but that time is not fixed -- on
-    /// the 4-GPU wall one display reflow costs 0.4 ms while the page is quiet and 2.0 ms
-    /// during a content switch, with 14.5 ms measured at the worst (log_ani_debug/08
-    /// `SCRIPTBUSY reflow_ms`/`reflow_display`) -- so the variation lands directly in the
-    /// animation's phase, once per display list, which is a hundred times a second on a
-    /// wall whose videos keep the document dirty. Anchoring here instead makes
-    /// consecutive predictions agree with each other.
+    /// them on, and not to the moment the display list happened to be built.*** It is the
+    /// time origin that `offset_from_display_list` is measured from, and it must name the
+    /// same instant as the reflow's `animation_timeline_value`, which fixes the segments'
+    /// *values*: origin and values disagreeing by `d` puts `d` straight into the
+    /// prediction's phase. Script keeps the two together by taking both from one
+    /// `Document::resolve_frame_time` call per "update the rendering" turn.
+    ///
+    /// Anchoring on arrival instead would shift the whole prediction by however long the
+    /// list spent in the rest of the reflow, the send, and the scene build. A fixed shift
+    /// would only be a fixed lag, but that time is not fixed -- on the 4-GPU wall one
+    /// display reflow costs 0.4 ms while the page is quiet and 2.0 ms during a content
+    /// switch, with 14.5 ms measured at the worst (log_ani_debug/08 `SCRIPTBUSY
+    /// reflow_ms`/`reflow_display`). Anchoring on the build moment removes that, but the
+    /// build moment still carries the script thread's queue delay, which is the jitter
+    /// this field exists to take out; the pacing tick is the only instant upstream of it.
+    ///
+    /// The cost of moving the origin this far upstream is that the painter's
+    /// `now - built_at` is no longer the sub-millisecond scene-build transit but the whole
+    /// tick-to-arrival latency, routinely 5-30 ms on the wall. The paint thread clamps it
+    /// (`MAX_DISPLAY_LIST_TRANSIT`) and logs `TRANSITCLAMP` when the clamp binds.
     pub built_at: CrossProcessInstant,
     /// Whether the segments run to the animation's end. When false the animation outlives
     /// what was sampled and the paint thread holds the last value until script catches up.

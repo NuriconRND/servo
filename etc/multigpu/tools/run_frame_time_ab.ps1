@@ -32,9 +32,14 @@ $base = @{
     DurationSec = $DurationSec; PresentCadence = $true; DcompBindProf = $true
     AnimStepSeq = $true
 }
-$prefs = @("dom_webgl2_enabled=true", "dom_webgpu_enabled=true",
-           "gfx_precache_shaders=true", "media_wrap_init_max_per_frame=2")
-$judder = $prefs + "gfx_paint_side_animation_tick_divisor=1"
+$common = @("dom_webgl2_enabled=true", "dom_webgpu_enabled=true",
+            "gfx_precache_shaders=true", "media_wrap_init_max_per_frame=2")
+# Pin the divisor on BOTH arms. Rows 3 and 4 are labelled div=4 and used to ride on the
+# engine default (gfx_paint_side_animation_tick_divisor, 4 in components/config/prefs.rs).
+# That default moving would silently relabel the control arm of a 12-minute run on a
+# machine someone has to travel to, so state it.
+$prefs = $common + "gfx_paint_side_animation_tick_divisor=4"
+$judder = $common + "gfx_paint_side_animation_tick_divisor=1"
 
 $runs = @(
     @{ N = "1/6 div=1 ft=off lead=on";  Pref = $judder; Ft = "off"; Lead = 1;  Log = "ft_1_off.err.log" }
