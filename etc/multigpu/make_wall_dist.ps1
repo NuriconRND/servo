@@ -187,6 +187,7 @@ Copy-Item (Join-Path $PSScriptRoot "tools\measure_decode_only.ps1") $Out -Force
 # ...and the http server -Serve drives. WebGPU pages hang on file:// with no error at all,
 # so without this the dist can only run the file:///-served pages.
 Copy-Item (Join-Path $PSScriptRoot "tools\serve_http.ps1") $Out -Force
+Copy-Item (Join-Path $PSScriptRoot "tools\run_frame_time_ab.ps1") $Out -Force
 # ...and the two GStreamer executables it drives, from the SAME install the wall links against.
 #
 # ***Without these the baseline measured a different GStreamer than the wall runs.*** The test

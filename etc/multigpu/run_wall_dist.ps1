@@ -507,6 +507,11 @@ param(
     # 1.5~2 초 안정" 같은 구조가 p05/p50/p95 로는 보이지 않고, 실측에서 그 요약이 저더와
     # ***음의 상관***이었다(설계 문서 45). 창당 한 줄 약 700 자, 벽에서 초당 네 줄이다.
     [switch] $AnimStepSeq,
+    # dom_animation_timeline_use_frame_time: 애니메이션의 기준 시각을 "script 가 도달한
+    # 순간" 대신 "그 프레임의 시각" 으로 쓴다. 엔진 기본은 켜짐이므로, 이 스위치는 끌 때
+    # 쓴다. 왜 필요한지는 설계 문서 50 과 2026-10-15 설계.
+    [ValidateSet("on", "off", "")]
+    [string] $FrameTime = "",
 
     # SERVO_DCOMP_DEBUG: per-surface [dcomp-dbg] lines (create_surface, external add,
     # bind). This is the ONLY way to see whether a video actually reached an external
@@ -803,6 +808,7 @@ if ($Devtools -ne "") {
 }
 if ($VideoEscape -ne "")  { $argList += @("--pref", "gfx_video_escape_mode=$VideoEscape") }
 if ($DcompAlwaysFlush)    { $argList += @("--pref", "gfx_dcomp_always_flush_end_frame=true") }
+if ($FrameTime -ne "")    { $argList += @("--pref", "dom_animation_timeline_use_frame_time=$(if ($FrameTime -eq 'on') { 'true' } else { 'false' })") }
 if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_frame=true") }
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }

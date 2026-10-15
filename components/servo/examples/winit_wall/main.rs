@@ -1304,6 +1304,12 @@ impl AppState {
     /// `redraw` 계수도 같이 올린다 -- `WALLCLOCK` 의 `ticks == redraw == renders` 검산이
     /// 두 경로에서 같은 뜻을 유지해야 한다.
     fn fire_present_tick(&self) {
+        // ★이 순간이 이 프레임의 시각이다.★ 여기서 재야 렌더 준비 비용이 섞이지 않는다 --
+        // 섞이면 그만큼이 애니메이션 값의 지터가 된다(설계 문서 3). 엔진은 이 값을
+        // `TickAnimation` 에 실어 script 까지 보내고, script 는 "자기가 메시지를 처리한
+        // 순간" 대신 이것을 애니메이션의 기준으로 쓴다. 이 예제는 `servo` 패키지 안에
+        // 있어 `servo_base` 를 그대로 쓸 수 있으므로 시그니처는 바꾸지 않는다.
+        servo::note_frame_time(servo_base::cross_process_instant::CrossProcessInstant::now());
         // ★틱의 시각을 paint 쪽에 남긴다.★ 커밋은 저쪽에서 나가므로, 두 시각의 차를
         // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
         // 지나므로 한 자리면 충분하다.★
