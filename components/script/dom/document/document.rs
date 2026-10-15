@@ -672,6 +672,11 @@ pub(crate) struct Document {
     /// Reflect the value of that preferences to prevent paying the cost of a RwLock access.
     layout_animations_test_enabled: bool,
 
+    /// 마지막 "update the rendering" 회차의 프레임 시각. 리플로가 `built_at` 을 이 값으로
+    /// 잡으면 ***세그먼트의 값과 시간 원점이 같은 순간을 가리킨다***(설계 문서 3.4).
+    #[no_trace]
+    last_frame_time: Cell<Option<CrossProcessInstant>>,
+
     /// <https://w3c.github.io/editing/docs/execCommand/#state-override>
     #[no_trace]
     state_override: DomRefCell<FxHashMap<CommandName, bool>>,
@@ -3808,6 +3813,7 @@ impl Document {
             details_name_groups: Default::default(),
             protocol_handler_automation_mode: Default::default(),
             layout_animations_test_enabled: pref!(layout_animations_test_enabled),
+            last_frame_time: Cell::new(None),
             state_override: Default::default(),
             value_override: Default::default(),
             default_single_line_container_name: Default::default(),
@@ -4590,11 +4596,26 @@ impl Document {
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
+    /// 리플로가 `built_at` 으로 쓸 시각. pref 가 꺼져 있거나 아직 틱을 못 받았으면 지금
+    /// 시각이다 -- 그것이 변경 전 동작이다.
+    pub(crate) fn animation_frame_time(&self) -> CrossProcessInstant {
+        match self.last_frame_time.get() {
+            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
+            _ => CrossProcessInstant::now(),
+        }
+    }
+
     pub(crate) fn update_animations_and_send_events(
         &self,
         cx: &mut CurrentRealm,
         frame_time: Option<CrossProcessInstant>,
     ) {
+        // 틱이 아닌 회차의 `None` 이 직전 값을 지우면 그 직후 리플로가 `now()` 로 떨어져
+        // 한 프레임만 원점이 튄다.
+        if frame_time.is_some() {
+            self.last_frame_time.set(frame_time);
+        }
+
         // Only update the time if it isn't being managed by a test.
         if !self.layout_animations_test_enabled {
             self.timeline.update(self.window(), frame_time);

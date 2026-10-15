@@ -44,6 +44,7 @@ use script::layout_dom::{
 use script_traits::{DrawAPaintImageResult, PaintWorkletError, Painter, ScriptThreadMessage};
 use servo_arc::Arc as ServoArc;
 use servo_base::Epoch;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::{PipelineId, WebViewId};
 use servo_config::opts::{self, DiagnosticsLogging, DiagnosticsLoggingOption};
@@ -679,7 +680,12 @@ impl Layout for LayoutThread {
             // none to give, and the next reflow rebuilds the tree anyway. The cost of
             // being wrong here is one display list without paint-side bindings, which is
             // exactly the behaviour before they existed.
-            self.build_stacking_context_tree(viewport_details, &DocumentAnimationSet::default(), 0.0);
+            self.build_stacking_context_tree(
+                viewport_details,
+                &DocumentAnimationSet::default(),
+                0.0,
+                CrossProcessInstant::now(),
+            );
         })
     }
 
@@ -1314,6 +1320,7 @@ impl LayoutThread {
             reflow_request.viewport_details,
             &reflow_request.animations,
             reflow_request.animation_timeline_value,
+            reflow_request.animation_frame_time,
         )
     }
 
@@ -1323,6 +1330,7 @@ impl LayoutThread {
         viewport_details: ViewportDetails,
         animations: &DocumentAnimationSet,
         animation_timeline_value: f64,
+        animation_frame_time: CrossProcessInstant,
     ) -> bool {
         let Some(fragment_tree) = &*self.fragment_tree.borrow() else {
             return false;
@@ -1347,6 +1355,7 @@ impl LayoutThread {
             &self.debug,
             animations.clone(),
             animation_timeline_value,
+            animation_frame_time,
         );
 
         // When a new StackingContextTree is built, it contains a freshly built
@@ -1434,6 +1443,7 @@ impl LayoutThread {
             reflow_statistics,
             &reflow_request.animations,
             reflow_request.animation_timeline_value,
+            reflow_request.animation_frame_time,
         );
         self.paint_api.send_display_list(
             self.webview_id,

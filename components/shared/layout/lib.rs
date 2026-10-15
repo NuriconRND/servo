@@ -52,6 +52,7 @@ use script_traits::{InitialScriptState, Painter, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_base::Epoch;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::generic_channel::GenericSender;
 use servo_base::id::{BrowsingContextId, PipelineId, WebViewId};
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -740,6 +741,12 @@ pub struct ReflowRequest {
     pub origin: ImmutableOrigin,
     /// The current animation timeline value.
     pub animation_timeline_value: f64,
+    /// `PaintAnimation::built_at` 으로 쓸 시각.
+    ///
+    /// ★`animation_timeline_value` 와 같은 순간이어야 한다.★ 전자는 세그먼트의 값을,
+    /// 이것은 세그먼트의 ***시간 원점***을 정한다. 둘이 어긋나면 그 차이가 그대로 페인트측
+    /// 예측의 위상 오차가 된다(설계 문서 3.4).
+    pub animation_frame_time: CrossProcessInstant,
     /// The set of animations for this document.
     pub animations: DocumentAnimationSet,
     /// An [`AnimatingImages`] struct used to track images that are animating.

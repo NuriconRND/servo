@@ -15,6 +15,7 @@ use layout_api::{MediaFrameYuvFormat, ReflowStatistics};
 use net_traits::image_cache::Image as CachedImage;
 use paint_api::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo, is_2d_scale_translation};
 use servo_arc::Arc as ServoArc;
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::{PipelineId, ScrollTreeNodeId};
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_config::{pref, prefs};
@@ -145,6 +146,8 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// its own; see [`paint_animation`].
     animations: &'a DocumentAnimationSet,
     animation_timeline_value: f64,
+    /// `animation_timeline_value` 와 같은 순간. 세그먼트의 시간 원점(`built_at`)이 된다.
+    animation_frame_time: CrossProcessInstant,
 
     /// Data about the fragments that are highlighted by the inspector, if any.
     ///
@@ -234,6 +237,7 @@ impl DisplayListBuilder<'_> {
         reflow_statistics: &mut ReflowStatistics,
         animations: &DocumentAnimationSet,
         animation_timeline_value: f64,
+        animation_frame_time: CrossProcessInstant,
     ) -> BuiltDisplayList {
         // Read before the mutable borrow of `paint_info` below.
         let tree_phase_paint_animations = stacking_context_tree.tree_phase_paint_animations;
@@ -262,6 +266,7 @@ impl DisplayListBuilder<'_> {
             paint_info,
             animations,
             animation_timeline_value,
+            animation_frame_time,
             inspector_highlight: highlighted_dom_node.map(InspectorHighlight::for_node),
             paint_body_background: true,
             clip_map: Default::default(),
@@ -571,6 +576,7 @@ impl DisplayListBuilder<'_> {
             self.paint_info.pipeline_id,
             fragment.base.tag.map(|tag| tag.node),
             self.animation_timeline_value,
+            self.animation_frame_time,
             effects.opacity,
         );
         if let Some(paint_animation) = paint_animation {

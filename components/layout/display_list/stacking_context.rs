@@ -14,6 +14,7 @@ use paint_api::display_list::{
     AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
     SpatialTreeNodeInfo, StickyNodeInfo,
 };
+use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::ScrollTreeNodeId;
 use servo_base::print_tree::PrintTree;
 use servo_config::opts::{DiagnosticsLogging, DiagnosticsLoggingOption};
@@ -121,6 +122,8 @@ pub(crate) struct StackingContextTree {
     /// the paint thread can move on its own. See [`paint_animation`].
     animations: DocumentAnimationSet,
     pub animation_timeline_value: f64,
+    /// `animation_timeline_value` 와 같은 순간. 세그먼트의 시간 원점(`built_at`)이 된다.
+    pub animation_frame_time: CrossProcessInstant,
     /// How many [`PaintAnimation`]s this phase put in `paint_info`.
     ///
     /// ***The display list phase must not clear what this phase produced.*** Reference
@@ -144,6 +147,7 @@ impl StackingContextTree {
         debug: &DiagnosticsLogging,
         animations: DocumentAnimationSet,
         animation_timeline_value: f64,
+        animation_frame_time: CrossProcessInstant,
     ) -> Self {
         let scrollable_overflow = fragment_tree.scrollable_overflow();
         let scroll_area = scrollable_overflow.union(&fragment_tree.initial_containing_block);
@@ -199,6 +203,7 @@ impl StackingContextTree {
             clip_store: Default::default(),
             animations,
             animation_timeline_value,
+            animation_frame_time,
             tree_phase_paint_animations: 0,
         };
 
@@ -657,6 +662,7 @@ impl BoxFragment {
                     stacking_context_tree.paint_info.pipeline_id,
                     self.base.tag.map(|tag| tag.node),
                     stacking_context_tree.animation_timeline_value,
+                    stacking_context_tree.animation_frame_time,
                     |list| self.calculate_transform_matrix_for(&border_rect, list),
                 )
             })

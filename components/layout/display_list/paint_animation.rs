@@ -411,6 +411,7 @@ pub(crate) fn opacity_binding(
     pipeline_id: WrPipelineId,
     node: Option<OpaqueNode>,
     now: f64,
+    built_at: CrossProcessInstant,
     opacity: f32,
 ) -> (PropertyBinding<f32>, Option<PaintAnimation>) {
     let unbound = (PropertyBinding::Value(opacity), None);
@@ -484,7 +485,7 @@ pub(crate) fn opacity_binding(
         Some(PaintAnimation {
             property: PaintAnimationProperty::Opacity(key, segments),
             offset_from_display_list: 0.0,
-            built_at: CrossProcessInstant::now(),
+            built_at,
             complete: settled,
         }),
     )
@@ -584,6 +585,7 @@ pub(crate) fn transform_binding(
     pipeline_id: WrPipelineId,
     node: Option<OpaqueNode>,
     now: f64,
+    built_at: CrossProcessInstant,
     resolve: impl Fn(&ComputedTransform) -> Option<LayoutTransform>,
 ) -> Option<(PropertyBindingKey<LayoutTransform>, PaintAnimation)> {
     if !servo_config::pref!(gfx_paint_side_animations_enabled) {
@@ -645,7 +647,7 @@ pub(crate) fn transform_binding(
         PaintAnimation {
             property: PaintAnimationProperty::Transform(key, segments),
             offset_from_display_list: 0.0,
-            built_at: CrossProcessInstant::now(),
+            built_at,
             complete: settled,
         },
     ))

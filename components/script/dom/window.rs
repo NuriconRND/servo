@@ -2762,6 +2762,7 @@ impl Window {
             origin: self.origin().immutable().clone(),
             reflow_goal,
             animation_timeline_value: document.current_animation_timeline_value(),
+            animation_frame_time: document.animation_frame_time(),
             animations: document.animations().sets.clone(),
             animating_images: document.image_animation_manager().animating_images(),
             highlighted_dom_node: document.highlighted_dom_node().map(|node| node.to_opaque()),

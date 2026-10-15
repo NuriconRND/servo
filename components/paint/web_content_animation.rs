@@ -536,6 +536,11 @@ impl PipelineAnimations {
     /// (이탈의 95%에서 `dt` 정상) 화면은 떨었으므로, 남은 곳이 여기다.
     ///
     /// `built_at` 은 한 디스플레이 리스트의 모든 애니메이션이 공유하므로 첫 번째만 본다.
+    ///
+    /// ★이 지표는 더 이상 검증에 쓸 수 없다.★ `built_at` 이 프레임 시각(= 페이싱 클럭)이
+    /// 된 뒤로는 그 간격이 정의상 고르게 나오므로, 구조적으로 성공을 보고한다. "값의
+    /// 출처가 떤다" 를 보이기 위한 진단이었고 그 역할은 끝났다. 판정은 `ANIMSTEP` 의
+    /// `dx spread` 로 한다.
     fn note_timeline_step(&self, paint_animations: &[PaintAnimation], received_at: Instant) {
         if !*crate::painter::LOG_ANIM_STEP_SEQ {
             return;
@@ -904,6 +909,21 @@ mod tests {
         assert!(
             behind <= MAX_DISPLAY_LIST_TRANSIT,
             "{behind:?} 가 상한 {MAX_DISPLAY_LIST_TRANSIT:?} 를 넘었다"
+        );
+    }
+
+    /// ★`built_at` 이 미래일 수 있다.★ Task 6 이후 그 값은 셸이 잰 프레임 시각이고, paint 의
+    /// `now` 와는 다른 시점의 읽기라 두 시계가 역전해 보일 수 있다. 하한 클램프를 잃으면
+    /// `Duration::from_secs_f64` 가 음수로 ***패닉한다.***
+    #[test]
+    fn a_built_at_in_the_future_does_not_panic() {
+        let now = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
+        let built = now + time::Duration::milliseconds(2);
+        let received_at = Instant::now();
+        let zero = animation_zero(built, now, received_at, 0.0);
+        assert_eq!(
+            zero, received_at,
+            "transit 이 0 으로 잘려 수신 시각과 같아야 한다"
         );
     }
 }
