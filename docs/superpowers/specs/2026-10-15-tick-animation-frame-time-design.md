@@ -111,7 +111,78 @@ paint 에 알리는 통로다. 관찰자는 `Painter::new` 안에서 만들어�
 폴백한다. 셸이 애초에 부르지 않으면(servoshell, 다른 임베더) 저장값이 없어 같은 폴백을
 타므로 ★지금 동작 그대로★ 다.
 
-### 3.4 rAF 도 같은 값을 쓴다
+### 3.4 `built_at` 도 같은 값으로 잡는다 ★(빠뜨리면 지터가 자리만 옮긴다)★
+
+★페인트측 예측의 시간 원점은 `built_at` 이다.★ `web_content_animation.rs:565-574`:
+
+```rust
+let transit = (now - animation.built_at).as_seconds_f64().clamp(0.0, MAX_DISPLAY_LIST_TRANSIT);
+let created_at = received_at - transit;              // built_at 에 대응하는 Instant
+let zero = created_at ± offset_from_display_list;    // 세그먼트의 0 점
+```
+
+그리고 `built_at` 은 `current_time_for_animations` 와 ***따로*** 잡힌다 --
+`CrossProcessInstant::now()` 두 군데(`layout/display_list/paint_animation.rs:487, :648`).
+
+오늘은 둘이 같은 리플로 안이라 간격이 거의 0 이다. `current_time_for_animations` 만
+`frame_time` 으로 되돌리면 이렇게 된다:
+
+| | 지금 | `frame_time` 만 바꿨을 때 |
+|---|---|---|
+| 값이 가리키는 순간 | `now()` | ★`frame_time`★ |
+| 원점이 가리키는 순간 | `now()` | `now()` |
+| 둘의 간격 | ~0 | ★δ = 큐 지연 (= 없애려던 0.4ms)★ |
+
+★제거한 지터가 값에서 사라져 예측의 위상으로 옮겨갈 뿐이다.★ 그리고 `divisor=4` 는 리스트
+하나로 ***네 프레임을 외삽***하므로 하필 거기서 가장 크게 나타난다.
+
+그러므로 ★`built_at` 도 `frame_time` 으로 잡는다.★ `transit = 수신 − frame_time` 이 되어
+`created_at` 이 정확히 페이싱 틱에 대응하고, 원점과 값이 같은 순간을 가리킨다.
+`MAX_DISPLAY_LIST_TRANSIT` 는 250ms 라(`web_content_animation.rs:36`) 0.4ms 증가는
+문제가 되지 않는다.
+
+레이아웃이 `frame_time` 을 알아야 하므로, script 가 reflow 를 요청할 때 함께 내려보낸다 --
+`current_time_for_animations` 가 이미 그 경로로 간다(`layout_impl.rs:834`).
+
+### 3.5 `-SampleLead` 와의 관계 ★— 직교하고, 함께 쓴다★
+
+둘은 같은 함수의 ***정의역 원점***과 ***평가점***이라 이중 보정이 아니다.
+
+```
+script/layout                               paint
+  current_time_for_animations  ─┐
+  offset_from_display_list     ─┼→ 세그먼트의 값
+  built_at ────────────────────→ 세그먼트의 시간 원점(zero)
+                                      ↓
+                                 sample(sample_at − zero)
+                                      ↑
+                                 ★SampleLead★ 가 정하는 평가 시점
+                                 (= 이 타일의 픽셀이 화면에 나오는 순간)
+```
+
+- ★`frame_time` / `built_at`★ = 입력. 세그먼트가 어떤 값을, 어느 순간을 기준으로 담는가.
+- ★`-SampleLead`★ = 출력. 그 세그먼트를 언제 평가하는가.
+
+★`frame_time` 은 SampleLead 를 대체하지 않는다.★ SampleLead 가 푸는 것은 ***네 모니터의
+vblank 가 11.2ms 에 흩어져 있다***는 별개의 문제이고(`painter.rs:3816-3819`), 그것은
+입력을 고쳐도 남는다.
+
+★다만 SampleLead 의 측정된 효용 일부는 사라질 수 있다.★ §50.1 에서 SampleLead 를 끄니
+이탈이 2.23 -> 5.42 로 악화됐는데, 그 이득의 일부는 ***흔들리는 원점을 규칙적인 합성 격자
+위에서 평가해 가려준 것***이다. 원점이 고정되면 그 가림은 필요 없어진다. 그래서 A/B 에
+★`-SampleLead` 를 끈 칸을 넣는다★(§5).
+
+### 3.6 `TIMELINESTEP` 은 의미가 바뀐다 ★(검증에 쓰면 안 된다)★
+
+`TIMELINESTEP` 은 `built_at` 간격을 잰다(`web_content_animation.rs:517`). `built_at` 이
+`frame_time`(= 페이싱 클럭)이 되면 ★그 간격은 정의상 고르게 나온다★ -- 구조적으로 성공을
+보고하는 지표가 된다.
+
+검증은 ★`ANIMSTEP` 의 `dx spread`★ 로 한다. `TIMELINESTEP` 은 "값의 출처가 떤다" 를
+보이기 위한 진단이었고 그 역할을 이미 다했으므로, 이 변경 이후로는 ***페이싱 클럭의
+규칙성만 재는 줄***임을 주석에 남긴다.
+
+### 3.7 rAF 도 같은 값을 쓴다
 
 `run_the_animation_frame_callbacks` 는 지금 `performance().Now()` 를 쓴다
 (`document.rs:1754`). 타임라인만 바꾸면 ***둘이 큐 지연만큼 어긋나***, rAF 로 움직이는
@@ -123,12 +194,12 @@ paint 에 알리는 통로다. 관찰자는 `Painter::new` 안에서 만들어�
 
 ★웹에 관측되는 값이 바뀐다★ -- 표준에 가까워지는 방향이지만, 변경임은 분명하다.
 
-### 3.5 pref
+### 3.8 pref
 
 `dom_animation_timeline_use_frame_time`, ★기본 `true`★. 끄면 `frame_time` 을 무시하고
 타임라인과 rAF 모두 지금 경로로 간다. 실기 A/B 와 즉시 되돌리기를 위한 것이다.
 
-### 3.6 평활기를 걷어낸다
+### 3.9 평활기를 걷어낸다
 
 `components/shared/base/animation_timeline_smoothing.rs` 와
 `dom_animation_timeline_smoothing_hz`, `-TimelineSmoothing` 스위치,
@@ -156,7 +227,19 @@ paint 에 알리는 통로다. 관찰자는 `Painter::new` 안에서 만들어�
 - `dx p50` 이 38.4 로 유지된다(느려지지 않았다는 증거)
 - `divisor=4` 에서 켜도 `spread` 가 0.007 에서 나빠지지 않는다
 
-A/B 는 네 칸이다: divisor 1/4 × frame_time on/off.
+A/B 는 ★여섯 칸★이다.
+
+| | divisor | frame_time | SampleLead | 보려는 것 |
+|---|---|---|---|---|
+| 1 | 1 | off | on | 저더 재현(기준선) |
+| 2 | 1 | ★on★ | on | ★이 변경의 효과★ |
+| 3 | 4 | off | on | 이미 깨끗한 쪽(대조군) |
+| 4 | 4 | ★on★ | on | 깨끗한 쪽이 나빠지지 않는가 |
+| 5 | 1 | off | ★off★ | SampleLead 의 기존 효용 |
+| 6 | 1 | ★on★ | ★off★ | ★원점을 고친 뒤에도 SampleLead 가 필요한가★ |
+
+5·6 이 §3.5 의 질문에 답한다. 6 이 2 와 같으면 SampleLead 의 이득은 원점 지터를 가린
+것이었고, 6 이 2 보다 나쁘면 vblank 분산을 푸는 역할이 따로 남아 있는 것이다.
 
 ## 6. 비-목표
 
