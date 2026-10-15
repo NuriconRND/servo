@@ -4567,6 +4567,15 @@ impl Document {
             .current_time_in_seconds()
     }
 
+    /// 리플로가 `built_at` 으로 쓸 시각. pref 가 꺼져 있거나 아직 틱을 못 받았으면 지금
+    /// 시각이다 -- 그것이 변경 전 동작이다.
+    pub(crate) fn animation_frame_time(&self) -> CrossProcessInstant {
+        match self.last_frame_time.get() {
+            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
+            _ => CrossProcessInstant::now(),
+        }
+    }
+
     pub(crate) fn animations(&self) -> &Animations {
         &self.animations
     }
@@ -4596,15 +4605,6 @@ impl Document {
     }
 
     /// An implementation of <https://drafts.csswg.org/web-animations-1/#update-animations-and-send-events>.
-    /// 리플로가 `built_at` 으로 쓸 시각. pref 가 꺼져 있거나 아직 틱을 못 받았으면 지금
-    /// 시각이다 -- 그것이 변경 전 동작이다.
-    pub(crate) fn animation_frame_time(&self) -> CrossProcessInstant {
-        match self.last_frame_time.get() {
-            Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
-            _ => CrossProcessInstant::now(),
-        }
-    }
-
     pub(crate) fn update_animations_and_send_events(
         &self,
         cx: &mut CurrentRealm,
