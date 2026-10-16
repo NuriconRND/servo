@@ -721,6 +721,29 @@ if ($NoLog -and $LogPath -ne "") {
 if ($NoLog)           { $LogPath = "NUL" }
 elseif ($LogPath -eq "") { $LogPath = Join-Path $here ("wall_{0}.err.log" -f (Get-Date -Format "yyyyMMdd_HHmmss")) }
 
+# ★여기서 절대 경로로 굳힌다.★ 아래에서 이 값을 쓰는 네 곳이 상대 경로를 ***서로 다르게***
+# 푼다:
+#   - `cmd ... 2> "$LogPath"`  -> cmd 의 현재 디렉터리
+#   - `Start-Process -RedirectStandardError` -> ***.NET 프로세스의 CWD***. PowerShell 의
+#     현재 위치가 아니고, 같은 줄의 `-WorkingDirectory` 도 아니다.
+#   - `Test-Path` / `Select-String -Path` -> PowerShell 의 현재 위치
+# 셋이 어긋나면 로그는 엉뚱한 데 쓰이고 분석은 "파일 없음" 으로 조용히 건너뛴다.
+#
+# 그리고 ***부모 디렉터리를 만들어 준다.*** `2>` 도 `-RedirectStandardError` 도 없는
+# 디렉터리를 만들지 않는다 -- `-LogPath ..\logs\run.err.log` 는 그래서 실패한다.
+# dist 폴더는 `make_wall_dist.ps1 -Force` 가 통째로 다시 만들므로, 로그를 보존하려면
+# ***dist 바깥***에 두어야 한다. 이 두 줄이 그것을 가능하게 한다.
+if ($LogPath -ne "NUL") {
+    # `[IO.Path]::GetFullPath` 를 홀로 쓰면 안 된다 -- Windows PowerShell 5.1 에서 그것은
+    # PowerShell 의 현재 위치가 아니라 ***프로세스의 CWD*** 를 기준으로 푼다. 사용자가
+    # 친 상대 경로는 자기가 서 있는 곳 기준이므로 `$PWD` 와 명시적으로 합친다.
+    $LogPath = [IO.Path]::GetFullPath([IO.Path]::Combine($PWD.Path, $LogPath))
+    $logDir = Split-Path -Parent $LogPath
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+}
+
 # Old env knobs block startup in this build (servo_config::removed_env). Clear any that
 # leaked in from an earlier session so the run does not die with a migration notice.
 Get-ChildItem Env: | Where-Object { $_.Name -like "SERVO_*" } |
