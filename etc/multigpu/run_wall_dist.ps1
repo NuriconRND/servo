@@ -826,6 +826,9 @@ if ($PageFeatures) {
     }
 }
 if ($Devtools -ne "") {
+    # Site deployments keep devtools off (device auth decision, docs/multigpu/device_auth.md).
+    # When on, the console can set window.sdwallDeviceAuth by hand and unlock /output.
+    Write-Warning "Devtools ON ($Devtools): development only -- never on a site deployment (device auth can be forged from the console)."
     $argList += @("--pref", "devtools_server_enabled=true")
     $argList += @("--pref", "devtools_server_listen_address=$Devtools")
 }

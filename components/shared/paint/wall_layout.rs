@@ -213,7 +213,7 @@ fn parse_tiles(
         ));
     }
 
-    let mut parsed_tiles = Vec::with_capacity(tiles.len());
+    let mut parsed_tiles: Vec<WallTile> = Vec::with_capacity(tiles.len());
     for (index, tile) in tiles.iter().enumerate() {
         let display = match get_usize(tile, "display") {
             Ok(display) => display,
@@ -245,14 +245,51 @@ fn parse_tiles(
             None
         };
         let rect = get_rect(tile, "rect")?;
-        validate_tile_rect(index, rect, virtual_viewport)?;
         parsed_tiles.push(WallTile {
             display,
             rect,
             gpu_override,
         });
     }
+
+    shift_tiles_to_non_negative_origin(&mut parsed_tiles);
+    for (index, tile) in parsed_tiles.iter().enumerate() {
+        validate_tile_rect(index, tile.rect, virtual_viewport)?;
+    }
     Ok(parsed_tiles)
+}
+
+/// Tile rects may be written in Windows desktop coordinates, where a display left of or
+/// above the primary display has a negative origin. Shift every tile by the same amount so
+/// the leftmost/topmost tile edge lands on page 0; an axis that never goes negative is left
+/// alone, so existing non-negative layouts are unchanged.
+fn shift_tiles_to_non_negative_origin(tiles: &mut [WallTile]) {
+    let min_x = tiles
+        .iter()
+        .map(|tile| tile.rect.origin.x)
+        .min()
+        .unwrap_or(0);
+    let min_y = tiles
+        .iter()
+        .map(|tile| tile.rect.origin.y)
+        .min()
+        .unwrap_or(0);
+    let shift: Vector2D<i32, DeviceIndependentPixel> = Vector2D::new(-min_x.min(0), -min_y.min(0));
+    if shift == Vector2D::zero() {
+        return;
+    }
+    // See the NOTE in `parse_tiles`: logging isn't initialized yet at parse time.
+    eprintln!(
+        "wall layout: tile rects extend to negative coordinates; shifting every tile by \
+         ({}, {}) so the top-left tile starts at page (0, 0)",
+        shift.x, shift.y
+    );
+    for tile in tiles {
+        tile.rect.origin = Point2D::new(
+            tile.rect.origin.x.saturating_add(shift.x),
+            tile.rect.origin.y.saturating_add(shift.y),
+        );
+    }
 }
 
 fn validate_tile_rect(
@@ -400,6 +437,69 @@ mod tests {
             }"#,
         )
         .expect_err("out-of-bounds tile should fail");
+
+        assert!(error.to_string().contains("exceeds virtualViewport"));
+    }
+
+    #[test]
+    fn shifts_tiles_left_of_and_above_the_origin_into_the_viewport() {
+        // A monitor left of the primary display has a negative desktop x; writing the tile
+        // rects in desktop coordinates must work, with the top-left tile at page (0, 0).
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 2160 },
+                "tiles": [
+                    { "display": 0, "rect": [-1920, -1080, 1920, 1080] },
+                    { "display": 1, "rect": [0, -1080, 1920, 1080] },
+                    { "display": 2, "rect": [-1920, 0, 1920, 1080] },
+                    { "display": 3, "rect": [0, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect("negative tile origins should parse");
+
+        let origins: Vec<_> = layout.tiles.iter().map(|tile| tile.rect.origin).collect();
+        assert_eq!(
+            origins,
+            vec![
+                Point2D::new(0, 0),
+                Point2D::new(1920, 0),
+                Point2D::new(0, 1080),
+                Point2D::new(1920, 1080),
+            ]
+        );
+        assert_eq!(layout.tiles[3].rect.size, Size2D::new(1920, 1080));
+    }
+
+    #[test]
+    fn shifts_only_the_axis_that_goes_negative() {
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 3840, "height": 1080 },
+                "tiles": [
+                    { "display": 0, "rect": [-1920, 0, 1920, 1080] },
+                    { "display": 1, "rect": [0, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect("negative x should parse");
+
+        assert_eq!(layout.tiles[0].rect.origin, Point2D::new(0, 0));
+        assert_eq!(layout.tiles[1].rect.origin, Point2D::new(1920, 0));
+    }
+
+    #[test]
+    fn rejects_shifted_tiles_that_still_exceed_the_viewport() {
+        let error = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 1920, "height": 1080 },
+                "tiles": [
+                    { "display": 0, "rect": [-1920, 0, 1920, 1080] },
+                    { "display": 1, "rect": [0, 0, 1920, 1080] }
+                ]
+            }"#,
+        )
+        .expect_err("a 3840-wide span does not fit a 1920-wide viewport");
 
         assert!(error.to_string().contains("exceeds virtualViewport"));
     }

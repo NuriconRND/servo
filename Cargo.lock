@@ -7493,6 +7493,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdwall-device-auth"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "p256",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "sea-query"
 version = "1.0.0-rc.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7735,6 +7747,7 @@ dependencies = [
  "parking_lot",
  "rustc-hash 2.1.2",
  "rustls",
+ "sdwall-device-auth",
  "serde",
  "servo",
  "servo-background-hang-monitor",
@@ -7783,6 +7796,7 @@ dependencies = [
  "url",
  "webrender",
  "webrender_api",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
@@ -7911,6 +7925,7 @@ dependencies = [
  "crossbeam-channel",
  "euclid",
  "glow",
+ "ipc-channel",
  "kurbo",
  "malloc_size_of_derive",
  "serde",
@@ -8587,6 +8602,7 @@ name = "servo-media-thread"
 version = "0.3.0"
 dependencies = [
  "euclid",
+ "gleam",
  "ipc-channel",
  "log",
  "malloc_size_of_derive",
@@ -8765,6 +8781,7 @@ dependencies = [
  "servo-embedder-traits",
  "servo-geometry",
  "servo-malloc-size-of",
+ "servo-media",
  "servo-media-thread",
  "servo-paint-api",
  "servo-profile-traits",
@@ -9217,6 +9234,7 @@ dependencies = [
  "euclid",
  "glow",
  "half",
+ "ipc-channel",
  "itertools 0.14.0",
  "log",
  "parking_lot",
@@ -11363,8 +11381,6 @@ dependencies = [
 [[package]]
 name = "webrender"
 version = "0.68.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a591c25221a9f8ac2ad7754659b283d912cee6c8424f0fa3777aabed3be91c16"
 dependencies = [
  "allocator-api2",
  "bincode",

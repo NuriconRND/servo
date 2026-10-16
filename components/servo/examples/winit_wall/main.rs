@@ -64,6 +64,7 @@ fn qpc_frequency() -> Option<i64> {
 }
 
 mod crash_report;
+mod device_auth_selftest;
 mod pacing_refresh_driver;
 mod tile;
 #[cfg(target_os = "windows")]
@@ -94,6 +95,8 @@ struct Config {
     /// `--tile-thread-spike`: 병렬 타일 렌더(A 안) 1 단계의 관문만 시험하고 종료한다.
     /// 자세한 것은 [`tile::run_tile_thread_spike`].
     tile_thread_spike: bool,
+    /// `--device-auth-selftest` (시험 키 빌드 전용).
+    device_auth_selftest: bool,
 }
 
 fn parse_args() -> Result<Config, Box<dyn Error>> {
@@ -108,6 +111,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut preferences = Preferences::default();
     let mut ignore_certificate_errors = false;
     let mut tile_thread_spike = false;
+    let mut device_auth_selftest = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -131,6 +135,10 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             // servoshell 과 같은 이름/의미다(ports/servoshell/prefs.rs). 인자를 받지 않는
             // 순수 스위치다.
             "--ignore-certificate-errors" => ignore_certificate_errors = true,
+            // 시험 키 빌드에서만 받는다 -- 실제 키 빌드에서는 아래 `unknown argument` 로 간다.
+            "--device-auth-selftest" if sdwall_device_auth::SIGNING_KEY_KIND == "test" => {
+                device_auth_selftest = true
+            },
             "--tile-thread-spike" => tile_thread_spike = true,
             "--capture-sec" => {
                 capture_sec = args
@@ -174,6 +182,7 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         preferences,
         ignore_certificate_errors,
         tile_thread_spike,
+        device_auth_selftest,
     })
 }
 
@@ -250,6 +259,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let App::SpikeFinished { passed: false } = app {
         std::process::exit(1);
     }
+    // 장비 인증 자가 시험도 판정을 종료 코드로 낸다(FAIL = 1). 엔진은 먼저 평소처럼 내린다.
+    let selftest_exit_code = match &app {
+        App::Running(state) => state.device_auth_selftest_exit_code.get(),
+        _ => None,
+    };
+    drop(app);
+    if let Some(code) = selftest_exit_code.filter(|code| *code != 0) {
+        std::process::exit(code);
+    }
     Ok(())
 }
 
@@ -257,6 +275,16 @@ struct AppState {
     servo: Servo,
     // Filled in after the tiles exist (the WebView's delegate is `AppState` itself).
     webview: RefCell<Option<WebView>>,
+    /// 장비 인증(servo-device-auth.md): 언제 넣을지. 평가 콜백도 만지므로 `Rc` 로 나눈다.
+    device_auth: Rc<RefCell<sdwall_device_auth::InjectionTracker>>,
+    /// 넘겨도 되는 페이지. 시작 URL 이 불투명 오리진이면 `None` -- 아무 데도 넘기지 않는다.
+    device_auth_scope: Option<sdwall_device_auth::PageScope>,
+    /// `--device-auth-selftest` (시험 키 빌드 전용).
+    device_auth_selftest: Option<Rc<RefCell<device_auth_selftest::DeviceAuthSelfTest>>>,
+    /// 자가 시험이 평가 콜백 안에서 정한 다음 동작 스크립트. `about_to_wait` 에서 실행한다.
+    device_auth_selftest_next: Rc<Cell<Option<&'static str>>>,
+    /// 자가 시험 판정의 종료 코드. 판정이 나면 채우고, `main` 이 이벤트 루프 뒤에 읽는다.
+    device_auth_selftest_exit_code: Cell<Option<i32>>,
     tiles: Vec<TileWindow>,
     // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
     // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
@@ -1257,6 +1285,76 @@ fn spawn_pacing_thread(
 }
 
 impl AppState {
+    fn on_device_auth_state(&self, auth: sdwall_device_auth::AuthState) {
+        // 지문은 로그에도 남기지 않는다 -- `AuthState` 에는 애초에 없다.
+        log::warn!("device-auth: {}", auth.label());
+        let pending = self.device_auth.borrow_mut().on_auth_state(auth);
+        self.inject_device_auth(pending);
+    }
+
+    fn inject_device_auth(&self, pending: Option<sdwall_device_auth::AuthState>) {
+        let (Some(auth), Some(scope)) = (pending, self.device_auth_scope.as_ref()) else {
+            return;
+        };
+        // 이 주입이 어느 문서의 것인지 -- 늦게 온 실패가 새 문서의 주입을 무르지 않게 한다.
+        let document = self.device_auth.borrow().document();
+        let Some(webview) = self.webview.borrow().clone() else {
+            self.device_auth.borrow_mut().on_injection_failed(document);
+            return;
+        };
+        let tracker = self.device_auth.clone();
+        let label = auth.label();
+        let selftest = self.device_auth_selftest.clone();
+        let selftest_next = self.device_auth_selftest_next.clone();
+        webview.evaluate_javascript(scope.injection_script(&auth), move |result| match result {
+            Ok(::servo::JSValue::String(outcome)) => {
+                log::info!("device-auth: inject {label} -> {outcome}");
+                // `same` = 이 문서에 같은 값이 이미 있어 다시 쓰지 않았다(page.rs). 자가 시험에는
+                // `set` 과 똑같이 센다 -- `#` 이동 구간에 `same` 이 와도 "또 넘기려 했다"는
+                // 회귀이므로 그대로 실패로 잡혀야 한다.
+                if outcome == "set" || outcome == "same" {
+                    let next = selftest.as_ref().and_then(|s| s.borrow_mut().on_injected());
+                    if let Some(script) = next {
+                        // Servo 는 완료 콜백을 `javascript_evaluator` 를 빌린 채 부른다. 콜백 안에서
+                        // `evaluate_javascript` 를 또 부르면 `RefCell already borrowed` 로 죽으므로
+                        // 스크립트만 적어 두고 `about_to_wait` 에서 실행한다.
+                        selftest_next.set(Some(script));
+                    }
+                }
+            },
+            Ok(other) => log::warn!("device-auth: inject {label} -> unexpected {other:?}"),
+            Err(error) => {
+                log::warn!("device-auth: inject {label} failed: {error:?}");
+                tracker.borrow_mut().on_injection_failed(document);
+            },
+        });
+    }
+
+    /// 자가 시험이 끝났으면 판정을 남기고 `true` -- 호출자가 이벤트 루프를 끝낸다.
+    fn device_auth_selftest_finished(&self) -> bool {
+        let Some(selftest) = &self.device_auth_selftest else {
+            return false;
+        };
+        let verdict = selftest
+            .borrow_mut()
+            .take_verdict(std::time::Instant::now());
+        let Some(verdict) = verdict else {
+            return false;
+        };
+        match &verdict {
+            device_auth_selftest::Verdict::Pass => {
+                log::warn!("device-auth selftest: PASS documents=3")
+            },
+            device_auth_selftest::Verdict::Fail(reason) => {
+                log::error!("device-auth selftest: FAIL {reason}")
+            },
+        }
+        // 이벤트 루프가 끝난 뒤 `main` 이 이 값으로 종료 코드를 낸다(FAIL = 1).
+        self.device_auth_selftest_exit_code
+            .set(Some(verdict.exit_code()));
+        true
+    }
+
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
         let mut next = self.next_present_tick.get();
         if now >= next {
@@ -1506,7 +1604,30 @@ impl AppState {
     }
 }
 
+/// `LoadStatus` 는 최상위 문서에만 나온다 -- 장비 인증을 넘길 문서도 최상위뿐이다.
+fn document_event(status: ::servo::LoadStatus) -> sdwall_device_auth::DocumentEvent {
+    use sdwall_device_auth::DocumentEvent;
+    match status {
+        ::servo::LoadStatus::Started => DocumentEvent::Started,
+        ::servo::LoadStatus::HeadParsed => DocumentEvent::HeadParsed,
+        ::servo::LoadStatus::Complete => DocumentEvent::Complete,
+    }
+}
+
 impl ::servo::WebViewDelegate for AppState {
+    fn notify_load_status_changed(&self, _: WebView, status: ::servo::LoadStatus) {
+        if matches!(status, ::servo::LoadStatus::Started) {
+            if let Some(selftest) = &self.device_auth_selftest {
+                selftest.borrow_mut().on_document_started();
+            }
+        }
+        let pending = self
+            .device_auth
+            .borrow_mut()
+            .on_document_event(document_event(status));
+        self.inject_device_auth(pending);
+    }
+
     fn notify_new_frame_ready(&self, _: WebView) {
         // ***Deliberately does nothing.*** This used to request a redraw, which made the
         // presentation cadence a function of when content happened to finish -- so the wall
@@ -1526,6 +1647,9 @@ impl ::servo::WebViewDelegate for AppState {
     /// that appears to say nothing is indistinguishable from a probe whose page never ran.
     /// Cost this a whole diagnostic round on 2026-09-08.
     fn show_console_message(&self, _: WebView, level: ConsoleLogLevel, message: String) {
+        if let Some(selftest) = &self.device_auth_selftest {
+            selftest.borrow_mut().on_console(&message);
+        }
         match level {
             ConsoleLogLevel::Error => log::error!("[page] {message}"),
             // `warn!` for the rest deliberately: the wall launcher's RUST_LOG leads with
@@ -1796,6 +1920,15 @@ impl ApplicationHandler<WakerEvent> for App {
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
+            device_auth: Rc::default(),
+            device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
+            device_auth_selftest_next: Rc::default(),
+            device_auth_selftest_exit_code: Cell::new(None),
+            device_auth_selftest: config.device_auth_selftest.then(|| {
+                Rc::new(RefCell::new(device_auth_selftest::DeviceAuthSelfTest::new(
+                    std::time::Instant::now(),
+                )))
+            }),
             tiles,
             present_ms_sum: Cell::new(0.0),
             present_count: Cell::new(0),
@@ -1911,16 +2044,40 @@ impl ApplicationHandler<WakerEvent> for App {
             spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);
         }
 
+        if sdwall_device_auth::SIGNING_KEY_KIND != "release" {
+            log::warn!(
+                "device-auth: built with the {} signing key -- not for deployment",
+                sdwall_device_auth::SIGNING_KEY_KIND
+            );
+        }
+        // 시작 URL 이 불투명 오리진이면 폴러는 돌아도 어디에도 넘기지 않는다 -- 왜 값이 안
+        // 오는지 현장에서 알 수 있게 시작할 때 한 번 남긴다.
+        if app_state.device_auth_scope.is_none() {
+            log::warn!(
+                "device-auth: start URL has an opaque origin; device auth will not be delivered to any page"
+            );
+        }
+        let device_auth_proxy = waker.proxy.clone();
+        sdwall_device_auth::spawn_poller(move |auth| {
+            let _ = device_auth_proxy.send_event(WakerEvent::DeviceAuth(auth));
+        });
+
         *self = Self::Running(app_state);
     }
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, event: WakerEvent) {
         if let Self::Running(state) = self {
+            // 장비 인증은 표출 박자와 상관없다 -- 세지도, 렌더를 끌지도 않는다.
+            if let WakerEvent::DeviceAuth(auth) = &event {
+                state.on_device_auth_state(auth.clone());
+                return;
+            }
             // 페이싱 스레드가 올린 틱과 엔진 wake 를 구분해 센다 -- 어느 쪽이 박자를 쥐고
             // 있는지가 `WALLCLOCK tick_by` 로 드러나야 한다.
             let site = match event {
                 WakerEvent::Tick => ClockSite::PacingThread,
                 WakerEvent::Engine => ClockSite::UserEvent,
+                WakerEvent::DeviceAuth(_) => unreachable!("handled above"),
             };
             // ★깨우기가 합쳐졌음을 먼저 표시한다★ -- 비우기 전에. 이 드레인이 도는 동안
             // 들어온 깨우기는 새 이벤트를 올려야 하고, 순서를 뒤집으면 그것을 잃는다.
@@ -1968,6 +2125,7 @@ impl ApplicationHandler<WakerEvent> for App {
                     state.drive_present_clock(site);
                 },
                 WakerEvent::Engine => {},
+                WakerEvent::DeviceAuth(_) => unreachable!("handled above"),
             }
         }
     }
@@ -1977,6 +2135,16 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         };
         if state.should_exit.get() {
+            event_loop.exit();
+            return;
+        }
+        if let Some(script) = state.device_auth_selftest_next.take() {
+            if let Some(webview) = state.webview.borrow().clone() {
+                log::warn!("device-auth selftest: next step");
+                webview.evaluate_javascript(script, |_| {});
+            }
+        }
+        if state.device_auth_selftest_finished() {
             event_loop.exit();
             return;
         }
@@ -2075,6 +2243,8 @@ enum WakerEvent {
     Engine,
     /// 페이싱 스레드가 표출 틱 시각을 알린다.
     Tick,
+    /// 장비 인증 폴러가 바뀐 결과를 알린다.
+    DeviceAuth(sdwall_device_auth::AuthState),
 }
 
 impl Waker {
@@ -2169,6 +2339,23 @@ fn choose_frame_clock(vsync_enabled: bool, pacing_thread: bool) -> FrameClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_status_maps_to_document_event() {
+        use sdwall_device_auth::DocumentEvent;
+        assert_eq!(
+            document_event(::servo::LoadStatus::Started),
+            DocumentEvent::Started
+        );
+        assert_eq!(
+            document_event(::servo::LoadStatus::HeadParsed),
+            DocumentEvent::HeadParsed
+        );
+        assert_eq!(
+            document_event(::servo::LoadStatus::Complete),
+            DocumentEvent::Complete
+        );
+    }
 
     /// ★vsync 가 켜져 있으면 그것이 이긴다.★ 이미 있는 동작이고 바뀌면 안 된다.
     #[test]

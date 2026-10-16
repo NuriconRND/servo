@@ -1,0 +1,76 @@
+{
+  "vectors": [
+    {
+      "name": "인증 정상",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "ok",
+      "response": {
+        "state": "ok",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "123412",
+        "nonce": "a1B2c3D4e5F6g7H8",
+        "signature": "SehUqci8TzVFitfoM2IM+QgL+vs7sBOMLAkxlIGTibltn4TLUUjVRcPVaW7V/Pz/r4ziXuq63vQgyeEr5fsfYQ=="
+      }
+    },
+    {
+      "name": "판정이 비정상",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "invalid",
+      "response": {
+        "state": "invalid",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "",
+        "nonce": "a1B2c3D4e5F6g7H8",
+        "signature": "edvVI2mAMu3Bq49S8efHIpM90WECucSsNMA5HUXeEniaucUC15xYjs72qNHvNeaRwAWH9Rob2HCZA9cI47sh0Q=="
+      }
+    },
+    {
+      "name": "서명 뒤 프로젝트 키를 바꿈",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "invalid",
+      "response": {
+        "state": "ok",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "9999",
+        "nonce": "a1B2c3D4e5F6g7H8",
+        "signature": "SehUqci8TzVFitfoM2IM+QgL+vs7sBOMLAkxlIGTibltn4TLUUjVRcPVaW7V/Pz/r4ziXuq63vQgyeEr5fsfYQ=="
+      }
+    },
+    {
+      "name": "서명 뒤 상태를 바꿈",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "invalid",
+      "response": {
+        "state": "ok",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "",
+        "nonce": "a1B2c3D4e5F6g7H8",
+        "signature": "gPgoFyY38OkhC0TuFQwLeQZKCOz/4fb82gTlI/re5/N0wL6Jc3i/Q2wDM4afC+uk0tKbkJ0EcljtALfuk9tVVw=="
+      }
+    },
+    {
+      "name": "보낸 무작위 값과 다름",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "invalid",
+      "response": {
+        "state": "ok",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "123412",
+        "nonce": "Z9y8X7w6V5u4T3s2",
+        "signature": "iq6AAQ04K0MGPzOQ1glyJtSEr64Lcdth5kN8pMfRyzJOatpRB2IgLJLltOWfye2NOaexcRHYI35C+mBcagBDrw=="
+      }
+    },
+    {
+      "name": "다른 키로 서명",
+      "sentNonce": "a1B2c3D4e5F6g7H8",
+      "expected": "invalid",
+      "response": {
+        "state": "ok",
+        "fingerprint": "HJY0BWGD",
+        "projectKey": "123412",
+        "nonce": "a1B2c3D4e5F6g7H8",
+        "signature": "VL/QCghFyEcwVTPj50K3g6muWBzuvMFrMFXaBcThvw7PmftfhF7/Ndf+3wLmdJ7pG1L92sl1A1FkWinFUGUp7w=="
+      }
+    }
+  ]
+}

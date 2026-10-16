@@ -1,0 +1,21 @@
+[package]
+name = "sdwall-device-auth"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "SDWall device auth: ask DeviceService, verify its signature, hand the result to the page."
+
+[lib]
+name = "sdwall_device_auth"
+path = "lib.rs"
+
+[dependencies]
+base64 = { workspace = true }
+p256 = { workspace = true, features = ["ecdsa", "pem"] }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+url = { workspace = true }
