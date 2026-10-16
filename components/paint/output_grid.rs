@@ -262,6 +262,17 @@ struct SlipTally {
     residue_at_slip: Vec<f64>,
     /// 전체 프레임의 같은 값. 위와 나란히 놓아야 "경계에 몰렸나" 를 말할 수 있다.
     residue_all: Vec<f64>,
+    /// 직전에 본 `last`(합성 격자점의 절대 QPC).
+    last_grid: Option<u64>,
+    /// ★`last` 가 뒤로 갔거나 제자리였던 횟수.★ 인덱스는 `last / period` 이므로 `last` 가
+    /// 단조롭지 않으면 몫이 반복되고, 그 다음 프레임이 밀린 만큼을 한꺼번에 따라잡는다 --
+    /// `same` 바로 뒤에 `jumpN` 이 붙는 모양이 그것이다. `DCOMPSTAT distinct` 는 값이
+    /// 달라지기만 하면 세므로 ***역행을 잡지 못한다.***
+    grid_back: u64,
+    /// 역행했을 때 뒤로 간 양(ms). 한 주기에 못 미치는 흔들림인지 그 이상인지 가른다.
+    grid_back_ms: Vec<f64>,
+    /// 한 주기를 크게 넘겨 앞으로 뛴 횟수(>= 2 주기). 역행의 짝이다.
+    grid_leap: u64,
 }
 
 static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
@@ -348,7 +359,15 @@ pub(crate) fn note_pump_from_idle() {
 /// 가설은 "렌더가 격자 경계 근처에 떨어져 올림이 두 칸 사이를 오간다" 이지만, 두 번 추측으로
 /// 고치려다 두 번 회귀를 냈으므로 이번에는 재고 나서 고친다. 슬립 순간의 위상 분포를 전체
 /// 분포와 나란히 내면 경계에 몰렸는지 아닌지가 바로 보인다.
-fn note_sample_slip(monitor: usize, index: u64, phase_ms: f64, residue_ms: f64) {
+fn note_sample_slip(
+    monitor: usize,
+    index: u64,
+    phase_ms: f64,
+    residue_ms: f64,
+    last_grid: u64,
+    period_ticks: u64,
+    freq: u64,
+) {
     let Ok(mut guard) = SLIPS.lock() else { return };
     let tally = guard
         .get_or_insert_with(HashMap::new)
@@ -357,6 +376,17 @@ fn note_sample_slip(monitor: usize, index: u64, phase_ms: f64, residue_ms: f64) 
     tally.n += 1;
     tally.phase_all.push(phase_ms);
     tally.residue_all.push(residue_ms);
+    if let Some(previous) = tally.last_grid {
+        if last_grid <= previous {
+            tally.grid_back += 1;
+            tally
+                .grid_back_ms
+                .push((previous - last_grid) as f64 * 1000.0 / freq as f64);
+        } else if last_grid - previous >= period_ticks.saturating_mul(2) {
+            tally.grid_leap += 1;
+        }
+    }
+    tally.last_grid = Some(last_grid);
     if let Some(last) = tally.last_index {
         let slipped = match index.saturating_sub(last) {
             1 => false,
@@ -422,6 +452,7 @@ fn emit_sampleslip() {
              phase_slip_ms n={slip_n} p05={:.2} p50={:.2} p95={:.2} \
              residue_all_ms p05={:.2} p50={:.2} p95={:.2} \
              residue_slip_ms p05={:.2} p50={:.2} p95={:.2} period_ms={:.3} \
+             grid_back={} grid_back_ms p50={:.3} max={:.3} grid_leap={} \
              pump_all from_render={from_render} from_idle={from_idle}",
             tally.n,
             tally.same,
@@ -440,6 +471,10 @@ fn emit_sampleslip() {
             pick(tally.residue_at_slip.clone(), 0.50),
             pick(tally.residue_at_slip, 0.95),
             period_ms_for_log(),
+            tally.grid_back,
+            pick(tally.grid_back_ms.clone(), 0.50),
+            pick(tally.grid_back_ms, 1.00),
+            tally.grid_leap,
         );
     }
 }
@@ -511,7 +546,7 @@ pub(crate) fn lead_to_next_composition(
     // `last` 가 `period` 의 배수를 넘을 때만 올라간다. 이 잔차가 0 이나 주기 끝에 붙어
     // 있으면 `last` 의 흔들림이 그 경계를 왔다 갔다 하고, 그때만 슬립이 난다.
     let residue_ms = (last % period) as f64 * 1000.0 / freq as f64;
-    note_sample_slip(monitor, target / period, phase_ms, residue_ms);
+    note_sample_slip(monitor, target / period, phase_ms, residue_ms, last, period, freq);
     Some((
         anchor,
         Duration::from_secs_f64(target.saturating_sub(now) as f64 / freq as f64),
