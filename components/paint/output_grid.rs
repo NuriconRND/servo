@@ -243,7 +243,6 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
 /// 한 타일의 샘플 인덱스가 어떻게 움직였나. `SAMPLESLIP` 이 초당 비운다.
 #[derive(Default)]
 struct SlipTally {
-    last_index: Option<u64>,
     n: u64,
     /// 인덱스가 그대로였다 = 이 프레임의 변위가 0 이다.
     same: u64,
@@ -359,9 +358,43 @@ pub(crate) fn note_pump_from_idle() {
 /// 가설은 "렌더가 격자 경계 근처에 떨어져 올림이 두 칸 사이를 오간다" 이지만, 두 번 추측으로
 /// 고치려다 두 번 회귀를 냈으므로 이번에는 재고 나서 고친다. 슬립 순간의 위상 분포를 전체
 /// 분포와 나란히 내면 경계에 몰렸는지 아닌지가 바로 보인다.
+/// 직전 샘플 이후 합성이 몇 번 지났나. 음수면 격자가 뒤로 간 것이다.
+///
+/// ★증분으로 센다. 절대 몫으로 세면 안 된다.★ 예전에는 `last / period` 를 인덱스로 삼고
+/// 그 차를 봤는데, `last` 는 부팅 이후 QPC(가동 4.2 시간이면 1,518 억 틱)라 ***나눗수가
+/// 몇 틱만 달라져도 몫이 수십 칸 움직인다.*** 그리고 그 나눗수는 고정이 아니다 --
+/// `period_ticks` 는 DWM 이 돌려주는 rate 에서 매번 다시 계산되는데, 이 기계에서 그 rate 가
+/// 60.002 / 60.003 / 60.004Hz 로 흔들렸다(log_ani_debug 24/local_05: 106 / 11 / 1 회).
+/// 세 값의 `period_ticks` 는 166661 / 166658 / 166655 라 한 번 흔들릴 때마다 인덱스가
+/// 16 칸씩 튀었다.
+///
+/// 그 16 칸은 전진하면 `jumpN`, 되돌아오면 -- `saturating_sub` 가 음수를 0 으로 뭉개므로 --
+/// `same` 으로 기록됐다. ★측정된 "슬립 2.2%" 는 그래서 전부 이 둘의 짝이었다★(40 대 40).
+/// 실제 애니메이션은 멀쩡했다. 쓰이는 값은 `target = last + 2 * period` 이고, 주기가 3 틱
+/// 달라져도 그것은 0.6µs 움직일 뿐이다.
+///
+/// 벽에서 이 지표가 0.00% 였던 것도 샘플링이 더 좋아서가 아니라 ***그 기계의 rate 가
+/// 60.000Hz 로 고정이라 나눗수가 안 흔들렸기 때문***이다.
+///
+/// 증분은 한 주기 남짓이라 나눗수의 몇 틱 차이에 무감하다. 반올림으로 센다 -- 실제 합성
+/// 간격은 공칭 주기와 정확히 같지 않으므로 절삭하면 한 칸이 0 으로 떨어진다.
+fn compositions_advanced(previous: u64, last: u64, period: u64) -> i64 {
+    if period == 0 {
+        return 0;
+    }
+    let delta = last as i128 - previous as i128;
+    let period = period as i128;
+    // 반올림 나눗셈. 음수 쪽도 대칭이어야 역행이 -1 로 나온다.
+    let rounded = if delta >= 0 {
+        (delta + period / 2) / period
+    } else {
+        (delta - period / 2) / period
+    };
+    rounded as i64
+}
+
 fn note_sample_slip(
     monitor: usize,
-    index: u64,
     phase_ms: f64,
     residue_ms: f64,
     last_grid: u64,
@@ -385,10 +418,9 @@ fn note_sample_slip(
         } else if last_grid - previous >= period_ticks.saturating_mul(2) {
             tally.grid_leap += 1;
         }
-    }
-    tally.last_grid = Some(last_grid);
-    if let Some(last) = tally.last_index {
-        let slipped = match index.saturating_sub(last) {
+        // ★분류는 `last` 의 증분으로 한다.★ 왜 절대 몫이면 안 되는지는
+        // `compositions_advanced`.
+        let slipped = match compositions_advanced(previous, last_grid, period_ticks) {
             1 => false,
             0 => {
                 tally.same += 1;
@@ -408,7 +440,7 @@ fn note_sample_slip(
             tally.residue_at_slip.push(residue_ms);
         }
     }
-    tally.last_index = Some(index);
+    tally.last_grid = Some(last_grid);
 }
 
 /// 로그에 싣는 합성 주기(ms). 잔차를 읽으려면 주기를 알아야 한다 -- 잔차가 0 에
@@ -542,11 +574,14 @@ pub(crate) fn lead_to_next_composition(
     let target = composition_target(last, period, lead_periods);
     // 렌더가 격자의 어디에 떨어졌나. 슬립 진단용이고 목표 계산에는 쓰이지 않는다.
     let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
-    // ★인덱스가 뒤집히는 자리.★ `index = target / period = last / period + 2` 이므로 몫은
-    // `last` 가 `period` 의 배수를 넘을 때만 올라간다. 이 잔차가 0 이나 주기 끝에 붙어
-    // 있으면 `last` 의 흔들림이 그 경계를 왔다 갔다 하고, 그때만 슬립이 난다.
+    // ★이 잔차는 진단으로만 남는다.★ 한때 인덱스를 `last / period` 로 뽑았고, 그래서
+    // 이 값이 0 이나 주기 끝에 붙으면 몫이 뒤집힌다는 가설을 세웠다. ***측정이 그것을
+    // 반증했다*** -- 슬립은 주기 한가운데(9~11ms)에서 났고 `residue_slip` 이 `residue_all`
+    // 과 구별되지 않았다(log_ani_debug 24/local_04). 진짜 원인은 나눗수 쪽이었고
+    // (`compositions_advanced`), 분류는 이제 증분으로 한다. 분포는 그대로 찍어 둔다 --
+    // 다음에 같은 질문이 오면 다시 재는 대신 이 줄을 보면 된다.
     let residue_ms = (last % period) as f64 * 1000.0 / freq as f64;
-    note_sample_slip(monitor, target / period, phase_ms, residue_ms, last, period, freq);
+    note_sample_slip(monitor, phase_ms, residue_ms, last, period, freq);
     Some((
         anchor,
         Duration::from_secs_f64(target.saturating_sub(now) as f64 / freq as f64),
@@ -1895,7 +1930,77 @@ unsafe fn enumerate_outputs() -> Enumeration {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_slack_pct, composition_target, next_grid_point, period_from_pair};
+    use super::{
+        commit_slack_pct, compositions_advanced, composition_target, next_grid_point,
+        period_from_pair,
+    };
+
+
+    /// ★합성이 몇 번 지났는지는 `last` 의 **증분**으로 센다.★ 보통의 한 칸.
+    #[test]
+    fn one_composition_is_one_step() {
+        let period = 166_658;
+        let last = 151_809_443_760_u64;
+        assert_eq!(compositions_advanced(last, last + period, period), 1);
+    }
+
+    /// 두 칸, 세 칸도 그대로 센다.
+    #[test]
+    fn several_compositions_are_counted() {
+        let period = 166_658;
+        let last = 151_809_443_760_u64;
+        assert_eq!(compositions_advanced(last, last + period * 2, period), 2);
+        assert_eq!(compositions_advanced(last, last + period * 5, period), 5);
+    }
+
+    /// 같은 격자점을 두 번 보면 0 -- ***진짜*** 변위 0 프레임이다.
+    #[test]
+    fn the_same_grid_point_is_zero_steps() {
+        let period = 166_658;
+        let last = 151_809_443_760_u64;
+        assert_eq!(compositions_advanced(last, last, period), 0);
+    }
+
+    /// ★이 테스트가 이 변경의 이유다.★
+    ///
+    /// DWM 이 돌려주는 rate 는 흔들린다 -- 이 기계에서 60.002 / 60.003 / 60.004Hz 가 모두
+    /// 관측됐고(log_ani_debug 24/local_05), 그때 `period_ticks` 는 166661 / 166658 / 166655
+    /// 가 된다. 예전처럼 ***절대 몫*** `last / period` 로 인덱스를 뽑으면, `last` 가 부팅
+    /// 이후 QPC(가동 4.2 시간에 1,518 억 틱)이라 나눗수가 3 틱 달라지는 것만으로 몫이
+    /// ***16 칸*** 움직였다. 그 16 칸이 `jumpN` 으로, 되돌아온 것이 `saturating_sub` 때문에
+    /// `same` 으로 기록돼 둘이 1:1 로 짝지어 나왔다(40 대 40).
+    ///
+    /// 증분으로 세면 나눗수가 바뀌어도 답은 1 이다. 합성은 한 번 지났을 뿐이기 때문이다.
+    #[test]
+    fn a_wobbling_reported_rate_does_not_invent_steps() {
+        let last = 151_809_443_760_u64;
+        // 60.003Hz 로 보고된 주기로 한 칸 전진한 뒤, 다음 호출에서 60.004Hz 로 보고된다.
+        let advanced = last + 166_658;
+        assert_eq!(compositions_advanced(last, advanced, 166_655), 1);
+        assert_eq!(compositions_advanced(last, advanced, 166_661), 1);
+
+        // 같은 입력을 예전 방식으로 세면 열여섯 칸이 생겨난다 -- 그것이 측정된 "슬립" 이었다.
+        let old_delta = (advanced / 166_655) as i64 - (last / 166_658) as i64;
+        assert!(
+            old_delta.abs() > 10,
+            "절대 몫 방식은 흔들림 하나에 열 칸 넘게 움직인다: {old_delta}"
+        );
+    }
+
+    /// 격자가 뒤로 가면 음수다. ★`saturating_sub` 로 0 에 뭉개면 역행이 "변위 0" 으로
+    /// 둔갑한다★ -- 그것이 `same` 을 부풀렸다.
+    #[test]
+    fn a_backward_grid_is_negative_not_zero() {
+        let period = 166_658;
+        let last = 151_809_443_760_u64;
+        assert_eq!(compositions_advanced(last, last - period, period), -1);
+    }
+
+    /// 주기가 0 이면 셀 수 없다. 나누기 전에 걸러야 패닉하지 않는다.
+    #[test]
+    fn a_zero_period_counts_nothing() {
+        assert_eq!(compositions_advanced(100, 200, 0), 0);
+    }
 
     /// ★목표 시각은 언제나 격자 위에 있고, 시계 지터와 무관하다.★
     ///
