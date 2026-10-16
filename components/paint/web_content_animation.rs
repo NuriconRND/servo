@@ -184,6 +184,24 @@ pub(crate) struct PipelineAnimations {
     /// What layout last told us to keep playing, and the clock it is played against.
     /// Replaced wholesale by every display list -- see [`PaintAnimation`].
     paint: RefCell<Vec<ActivePaintAnimation>>,
+    /// ★리베이스 순간의 점프(px). 창마다 모았다가 한 줄로 낸다.★
+    ///
+    /// [`PaintAnimation`] 의 문서가 이 순간을 이렇게 적는다 -- *"This is a
+    /// prediction, and script rebases it. … each new display list replaces the previous
+    /// prediction with the truth … origin and values disagreeing by `d` puts `d` straight
+    /// into the prediction's phase."* 그 `d` 가 바로 여기서 재는 값이다.
+    ///
+    /// 운영자 관측(log_ani_debug 32): divisor 를 15/30/60 으로 두면 저더 간격이
+    /// 0.25/0.5/1 초 -- ***`divisor / 60`, 정확히 스크립트 틱이고 곳 새 디스플레이
+    /// 리스트가 오는 순간이다.*** 모양은 객체가 잠시 앞으로 튀어나갔다 돌아온다.
+    ///
+    /// 샘플값 자체는 결백이다 -- 28 개 레인 전부 `dx max` 가 공칭값을 단 한 번도
+    /// 넘지 않았다(log_ani_debug 33). 그러면 튀는 것은 수열 안이 아니라 ***수열이
+    /// 갈리는 순간***뿐이다. 올 것과 있던 것을 같은 시각에 재서 뺀다.
+    rebase_jumps: RefCell<Vec<f64>>,
+    rebase_window_start: Cell<Option<Instant>>,
+    /// 점프가 한 프레임 이동량을 넘은 횟수. 눈에 보일 만한 것만 센다.
+    rebase_visible: Cell<u64>,
     /// The last value of every paint animation that has stopped playing, kept so that a
     /// later transaction does not erase it. See [`HeldPaintValues`].
     held: RefCell<HeldPaintValues>,
@@ -642,6 +660,9 @@ impl PipelineAnimations {
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
         let now = CrossProcessInstant::now();
+        // ★갈아끼우기 전에 옫 예측을 지금 시각으로 샘플해 둔다.★ 아래에서 새
+        // 진실을 같은 시각으로 샘플해 빼면 그 차가 화면에서 보일 점프다.
+        let before = self.sample_transforms_at(received_at);
         self.note_timeline_step(&paint_animations, received_at);
         self.prune_held(&paint_animations);
         let mut clamped = 0u32;
@@ -667,6 +688,66 @@ impl PipelineAnimations {
             })
             .collect();
         self.note_transit_clamp(received_at, clamped, max_transit);
+        let after = self.sample_transforms_at(received_at);
+        self.note_rebase_jump(received_at, &before, &after);
+    }
+
+    /// 현재 설치된 애니메이션을 한 시각에서 샘플해 (키, x) 로 돌려준다.
+    fn sample_transforms_at(&self, now: Instant) -> Vec<(u32, f32)> {
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        for animation in self.paint.borrow().iter() {
+            animation.sample(now, &mut floats, &mut transforms);
+        }
+        transforms
+            .into_iter()
+            .map(|property| (property.key.id.uid, property.value.to_array()[12]))
+            .collect()
+    }
+
+    /// ★올 것과 있던 것의 차를 레인별로 뺀다.★ `rebase_jumps` 참고.
+    fn note_rebase_jump(&self, now: Instant, before: &[(u32, f32)], after: &[(u32, f32)]) {
+        {
+            let mut jumps = self.rebase_jumps.borrow_mut();
+            for (key, new_x) in after {
+                // 키가 양쪽에 다 있을 때만 의미가 있다. 새로 생긴 것은 갈리는 게 아니다.
+                if let Some((_, old_x)) = before.iter().find(|(k, _)| k == key) {
+                    jumps.push((new_x - old_x) as f64);
+                }
+            }
+        }
+        let start = match self.rebase_window_start.get() {
+            Some(start) => start,
+            None => {
+                self.rebase_window_start.set(Some(now));
+                now
+            },
+        };
+        if now.duration_since(start) < Duration::from_secs(1) {
+            return;
+        }
+        self.rebase_window_start.set(Some(now));
+        let mut jumps: Vec<f64> = self.rebase_jumps.borrow_mut().drain(..).collect();
+        if jumps.is_empty() {
+            return;
+        }
+        // 한 프레임 이동량을 모르므로 1px 를 눈에 보일 만한 것의 하한으로 둔다.
+        let visible = jumps.iter().filter(|value| value.abs() >= 1.0).count() as u64;
+        self.rebase_visible
+            .set(self.rebase_visible.get() + visible);
+        jumps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |p: f64| -> f64 { jumps[(((jumps.len() - 1) as f64) * p).round() as usize] };
+        let forward = jumps.iter().filter(|value| **value > 0.0).count();
+        log::warn!(
+            "PAINTANIMREBASE n={} jump_px p05={:.2} p50={:.2} p95={:.2} min={:.2} max={:.2} \
+             forward={forward} visible={visible}",
+            jumps.len(),
+            at(0.05),
+            at(0.50),
+            at(0.95),
+            at(0.00),
+            at(1.00),
+        );
     }
 
     pub(crate) fn handle_new_display_list(
