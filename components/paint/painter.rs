@@ -412,6 +412,29 @@ pub(crate) struct Painter {
     anim_step_window_start: RefCell<Option<Instant>>,
     anim_step_dt: RefCell<Vec<f64>>,
     anim_step_dx: RefCell<Vec<f64>>,
+    /// ★`ANIMSTEP` 은 WebRender 에 넘기기 **전** 값이다.★ `transforms_log` 는
+    /// `update_paint_animations` 가 막 채운 `transforms` 를 그대로 복사한 것이라, 그 수열이
+    /// 고르다는 것은 ***샘플링이 고르다*** 는 뜻이지 화면이 고르다는 뜻이 아니다. 그 사이에
+    /// WebRender 자신의 스레드들이 있다 -- `WRRenderBackend` / `WRSceneBuilder` 는 각자
+    /// 큐를 갖고, 우리 페이싱 스레드도 커밋 스케줄러도 그 큐가 언제 프레임을 내놓는지
+    /// 정하지 못한다. 요청은 `generate_frame` 이고 완료는 `notifier.wake_up` 역통지다.
+    ///
+    /// 그래서 ***완료 쪽***에서 한 번 더 센다. 밀어넣은 x 를 그 요청에 달아 두고, 프레임
+    /// 준비 통지가 올 때 꺼내 직전 완료와의 차를 본다. 보낸 쪽 dx 가 12.80 으로 평평한데
+    /// 완료 쪽 dx 가 벌어지면 ***범인은 이 구간***이고, 완료 쪽도 평평하면 이 구간은
+    /// 결백하다. 지금까지 이 구간만 미계측이었다.
+    anim_ready_queue: RefCell<VecDeque<(u64, Option<f32>, Instant)>>,
+    /// 다음 `generate_frame` 에 달아 보낼 x. 밀어넣기 자리가 세우고 요청 자리가 가져간다.
+    anim_ready_pending_x: Cell<Option<f32>>,
+    /// 직전 **완료** 프레임의 (x, 시각).
+    anim_ready_previous: Cell<Option<(f32, Instant)>>,
+    anim_ready_window_start: RefCell<Option<Instant>>,
+    anim_ready_dx: RefCell<Vec<f64>>,
+    anim_ready_dt: RefCell<Vec<f64>>,
+    /// 요청에서 완료까지 걸린 시간(ms). WebRender 큐가 밀리는지를 본다.
+    anim_ready_latency: RefCell<Vec<f64>>,
+    /// 애니메이션 값을 달지 않은 완료의 수. 그 사이 밀어넣은 값은 자기 프레임을 못 얻었다.
+    anim_ready_unmatched: Cell<u64>,
     /// 이 페인터가 마지막으로 **실제 렌더 패스를 시작한** 시각. 애니메이션 값을 밀어넣는
     /// 박자를 여기에 맞춘다 — 자기 타이머로 돌면 벽의 표출 주기와 위상이 어긋나 미끄러진다.
     last_render_started_at: Cell<Option<Instant>>,
@@ -1081,6 +1104,14 @@ impl Painter {
             anim_step_window_start: Default::default(),
             anim_step_dt: Default::default(),
             anim_step_dx: Default::default(),
+            anim_ready_queue: Default::default(),
+            anim_ready_pending_x: Default::default(),
+            anim_ready_previous: Default::default(),
+            anim_ready_window_start: Default::default(),
+            anim_ready_dx: Default::default(),
+            anim_ready_dt: Default::default(),
+            anim_ready_latency: Default::default(),
+            anim_ready_unmatched: Default::default(),
             last_render_started_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1381,6 +1412,9 @@ impl Painter {
             if animated_property_frame {
                 // 자기 프레임은 "남"에 세지 않는다(위 판정 주석).
                 let others_before = self.last_frame_by_other_source_at.get();
+                // 이 프레임이 실어 가는 x 를 요청 자리에 넘긴다 -- 완료 때 짝을 찾으려고.
+                self.anim_ready_pending_x
+                    .set(transforms_log.first().map(|&(_, x, _, _)| x));
                 self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
                 self.last_frame_by_other_source_at.set(others_before);
             }
@@ -1440,6 +1474,105 @@ impl Painter {
             animated_property_frame,
             &floats_log,
             &transforms_log,
+        );
+    }
+
+    /// ★실제로 프레임이 된 값만 센다.★
+    ///
+    /// `note_animation_step` 의 짝이다. 그쪽은 `update_paint_animations` 가 채운 값을
+    /// ***보내는 순간*** 재고, 이쪽은 WebRender 가 그 요청의 프레임을 다 만들었다고 알려 온
+    /// 순간 잰다. 둘 사이에 `WRRenderBackend` / `WRSceneBuilder` 스레드가 있고, 그 큐가 언제
+    /// 비는지는 우리 페이싱 스레드도 커밋 스케줄러도 정하지 않는다.
+    ///
+    /// 요청과 완료는 순서가 보장되므로 줄의 앞에서 꺼내면 된다 -- `pending_frames` 가 이미
+    /// 그 전제로 돌아간다.
+    fn note_animation_ready(&self) {
+        let Some((_, x, requested_at)) = self.anim_ready_queue.borrow_mut().pop_front() else {
+            return;
+        };
+        let now = Instant::now();
+        let window_start = *self.anim_ready_window_start.borrow_mut().get_or_insert(now);
+        match x {
+            Some(x) => {
+                self.anim_ready_latency
+                    .borrow_mut()
+                    .push(now.duration_since(requested_at).as_secs_f64() * 1000.0);
+                if let Some((previous_x, previous_at)) = self.anim_ready_previous.get() {
+                    self.anim_ready_dt
+                        .borrow_mut()
+                        .push(now.duration_since(previous_at).as_secs_f64() * 1000.0);
+                    self.anim_ready_dx.borrow_mut().push((x - previous_x) as f64);
+                }
+                self.anim_ready_previous.set(Some((x, now)));
+            },
+            None => self
+                .anim_ready_unmatched
+                .set(self.anim_ready_unmatched.get() + 1),
+        }
+
+        if now.duration_since(window_start) < Duration::from_secs(1) {
+            return;
+        }
+        *self.anim_ready_window_start.borrow_mut() = Some(now);
+        let mut dt: Vec<f64> = self.anim_ready_dt.borrow_mut().drain(..).collect();
+        let mut dx: Vec<f64> = self.anim_ready_dx.borrow_mut().drain(..).collect();
+        let mut latency: Vec<f64> = self.anim_ready_latency.borrow_mut().drain(..).collect();
+        let unmatched = self.anim_ready_unmatched.replace(0);
+        if dt.len() < 2 {
+            return;
+        }
+        // ★정렬 전에 찍는다.★ `ANIMSTEPSEQ` 와 같은 이유 -- 아래가 제자리 정렬이다.
+        if *LOG_ANIM_STEP_SEQ {
+            log::warn!(
+                "ANIMREADYSEQ painter={:?} n={} dt_ms=[{}] dx_px=[{}]",
+                self.painter_id,
+                dt.len(),
+                format_step_sequence(&dt),
+                format_step_sequence(&dx),
+            );
+        }
+        dt.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        latency.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |sorted: &[f64], p: f64| -> f64 {
+            sorted[(((sorted.len() - 1) as f64) * p).round() as usize]
+        };
+        let period_ms = crate::refresh_driver::paint_timer_period().as_secs_f64() * 1000.0;
+        let band = |low: f64, high: f64| -> usize {
+            dt.iter()
+                .filter(|&&v| v >= low * period_ms && v < high * period_ms)
+                .count()
+        };
+        let dx_median = at(&dx, 0.50);
+        let spread = if dx_median.abs() > f64::EPSILON {
+            (at(&dx, 0.95) - at(&dx, 0.05)) / dx_median.abs()
+        } else {
+            0.0
+        };
+        log::warn!(
+            "ANIMREADY painter={:?} n={} per_interval dup={} one={} skip1={} skipN={} \
+             dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
+             dx_px p05={:.2} p50={:.2} p95={:.2} max={:.2} spread={:.3} \
+             lat_ms p50={:.2} p95={:.2} max={:.2} unmatched={}",
+            self.painter_id,
+            dt.len(),
+            band(0.0, 0.5),
+            band(0.5, 1.5),
+            band(1.5, 2.5),
+            dt.iter().filter(|&&v| v >= 2.5 * period_ms).count(),
+            at(&dt, 0.05),
+            at(&dt, 0.50),
+            at(&dt, 0.95),
+            at(&dt, 1.00),
+            at(&dx, 0.05),
+            at(&dx, 0.50),
+            at(&dx, 0.95),
+            at(&dx, 1.00),
+            spread,
+            at(&latency, 0.50),
+            at(&latency, 0.95),
+            at(&latency, 1.00),
+            unmatched,
         );
     }
 
@@ -2526,6 +2659,14 @@ impl Painter {
             pending_frames_before_request,
         );
         self.pending_frames.set(pending_frames_before_request + 1);
+        // ★완료와 짝지으려고 모든 요청을 줄 세운다.★ 애니메이션이 아닌 요청도 넣는다 --
+        // `pending_frames` 가 종류를 가리지 않고 세므로, 줄도 같은 규칙이어야 완료 하나에
+        // 요청 하나가 대응한다. 애니메이션 값이 없는 요청은 `None` 으로 들어간다.
+        self.anim_ready_queue.borrow_mut().push_back((
+            local_frame_id,
+            self.anim_ready_pending_x.take(),
+            Instant::now(),
+        ));
     }
 
     pub(crate) fn pending_frames(&self) -> usize {
@@ -3041,6 +3182,7 @@ impl Painter {
         }
 
         self.pending_frames.set(pending_frames - 1);
+        self.note_animation_ready();
 
         // Diagnostic: accumulate the actual frame-ready cadence and log once per second.
         if *LOG_PRESENT_CADENCE {
