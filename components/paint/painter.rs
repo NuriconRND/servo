@@ -1609,9 +1609,12 @@ impl Painter {
         let overwritten = self.anim_win_overwritten.replace(0);
         log::warn!(
             "ANIMWIN painter={:?} took_anim={anim} took_script={script} \
-             overwritten={overwritten} script_rode_painter={}",
+             overwritten={overwritten} script_rode_painter={} holding_ack={}",
             self.painter_id,
             self.script_frame_rode_painter.replace(0),
+            // ★이것이 참인 채로 머물면 스크립트의 rAF 가 잠긴 것이다.★ 위 게이트가 ack 를
+            // 안 풀어 실제로 멎은 적이 있다(log_ani_debug 36). 한 줄로 드러내 둔다.
+            self.frame_delayer.is_holding_ack(),
         );
     }
 
@@ -3792,6 +3795,25 @@ impl Painter {
         if self.script_frame_rides_the_painter() {
             self.script_frame_rode_painter
                 .set(self.script_frame_rode_painter.get() + 1);
+            // ★ack 는 반드시 풀어 준다.★ `take_waiting_pipelines` 의 주석이 그 이유다 --
+            // 이 집합이 비지 않은 동안 그 파이프라인의 문서는 `waiting_on_canvas_image_updates`
+            // 로 잠겨 ***rAF 를 한 번도 더 돌리지 못한다***(script_thread.rs:1200).
+            //
+            // 위의 `renderer_behind()` 가 안 풀고 빠져도 되는 것은 그것이 ***일시적인***
+            // 상태이기 때문이다. 이 게이트는 다르다 -- divisor=1 이면 스크립트 요청이
+            // ***매번*** 여기로 빠지므로, 안 풀면 영영 안 풀린다. 실측(log_ani_debug 36):
+            // 안 풀었더니 divisor=1 실행만 117 초에서 멎었다(다른 둘은 124 초까지 정상).
+            // 그 직전까지 계수는 전부 건강했다 -- 초당 60 프레임, dx 공칭값, overwritten=0.
+            // ★멈춘 것은 페인터가 아니라 스크립트였다.★
+            let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
+            self.send_to_constellation(
+                EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
+                    waiting_pipelines,
+                ),
+            );
+            // `pending_frame` 은 그대로 둔다. 합성은 페인터가 하지만 "빚" 자체는 남아 있어야
+            // 페인터가 멈췄을 때 나중 호출이 다시 만든다. `needs_new_frame` 은 이 값과
+            // `pending_canvas_images` 만 보므로 남겨 두어도 아무것도 막지 않는다.
             return false;
         }
 
