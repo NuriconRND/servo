@@ -435,6 +435,27 @@ pub(crate) struct Painter {
     anim_ready_latency: RefCell<Vec<f64>>,
     /// 애니메이션 값을 달지 않은 완료의 수. 그 사이 밀어넣은 값은 자기 프레임을 못 얻었다.
     anim_ready_unmatched: Cell<u64>,
+    /// ★아직 렌더가 집어가지 않은 완료의 꼬리표.★ `true` = 애니메이션 값을 단 프레임.
+    ///
+    /// `-FrameReason` 이 보여준 대로 프레임 원천은 둘이다 -- `painter.rs:1418`
+    /// (ANIMATED_PROPERTY, 언제나 초당 60)과 `generate_frame_for_script`(SCENE, 틱 속도
+    /// 그대로 60 또는 15). div=1 이면 초당 120 개를 요청하는데 화면에 가는 것은 60 개뿐이다
+    /// (`WRRATE onscreen`). ***둘 중 어느 쪽이 합성 슬롯을 가져가는지***가 화면 위치를
+    /// 정하는데, 그것만 미계측이었다.
+    ///
+    /// 앞섬 가설은 반증됐다 -- `-SampleLead 0/1/2`(lead_ms 28.91/45.57/62.26)로 여섯 번
+    /// 돌렸는데 저더가 똑같았다. 그런데 divisor 에는 반응한다(d=4 가 더 나쁘다). 그러면
+    /// 어긋남의 크기는 앞섬이 아니라 ***디스플레이 리스트의 나이***로 재야 하고, 그 나이를
+    /// 실어 오는 것이 스크립트 프레임이다. 그 프레임이 슬롯을 가져가면 직전 애니메이션
+    /// 위치는 ***화면에 닿지 못한다.***
+    anim_win_pending_tag: Cell<Option<bool>>,
+    /// 렌더가 집어간 완료를 꼬리표별로 센다.
+    anim_win_took_anim: Cell<u64>,
+    anim_win_took_script: Cell<u64>,
+    /// ★이 추적이 찾는 수.★ 애니메이션 완료가 렌더에 집히기 전에 다음 완료로 덮인
+    /// 횟수 -- 그 위치는 영영 화면에 나오지 않았다.
+    anim_win_overwritten: Cell<u64>,
+    anim_win_window_start: RefCell<Option<Instant>>,
     /// 이 페인터가 마지막으로 **실제 렌더 패스를 시작한** 시각. 애니메이션 값을 밀어넣는
     /// 박자를 여기에 맞춘다 — 자기 타이머로 돌면 벽의 표출 주기와 위상이 어긋나 미끄러진다.
     last_render_started_at: Cell<Option<Instant>>,
@@ -1112,6 +1133,11 @@ impl Painter {
             anim_ready_dt: Default::default(),
             anim_ready_latency: Default::default(),
             anim_ready_unmatched: Default::default(),
+            anim_win_pending_tag: Default::default(),
+            anim_win_took_anim: Default::default(),
+            anim_win_took_script: Default::default(),
+            anim_win_overwritten: Default::default(),
+            anim_win_window_start: Default::default(),
             last_render_started_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1477,6 +1503,32 @@ impl Painter {
         );
     }
 
+    /// ★합성 슬롯을 어느 원천이 가져갔나.★ `anim_win_pending_tag` 참고.
+    fn note_animation_win(&self) {
+        let now = Instant::now();
+        let window_start = *self.anim_win_window_start.borrow_mut().get_or_insert(now);
+        match self.anim_win_pending_tag.take() {
+            Some(true) => self.anim_win_took_anim.set(self.anim_win_took_anim.get() + 1),
+            Some(false) => self
+                .anim_win_took_script
+                .set(self.anim_win_took_script.get() + 1),
+            // 새 완료 없이 도는 렌더. 같은 내용을 다시 그린다.
+            None => {},
+        }
+        if now.duration_since(window_start) < Duration::from_secs(1) {
+            return;
+        }
+        *self.anim_win_window_start.borrow_mut() = Some(now);
+        let anim = self.anim_win_took_anim.replace(0);
+        let script = self.anim_win_took_script.replace(0);
+        let overwritten = self.anim_win_overwritten.replace(0);
+        log::warn!(
+            "ANIMWIN painter={:?} took_anim={anim} took_script={script} \
+             overwritten={overwritten}",
+            self.painter_id,
+        );
+    }
+
     /// ★실제로 프레임이 된 값만 센다.★
     ///
     /// `note_animation_step` 의 짝이다. 그쪽은 `update_paint_animations` 가 채운 값을
@@ -1491,6 +1543,12 @@ impl Painter {
             return;
         };
         let now = Instant::now();
+        // ★렌더가 집어가기 전에 덮이면 그 위치는 화면에 못 간다.★
+        if self.anim_win_pending_tag.get() == Some(true) {
+            self.anim_win_overwritten
+                .set(self.anim_win_overwritten.get() + 1);
+        }
+        self.anim_win_pending_tag.set(Some(x.is_some()));
         let window_start = *self.anim_ready_window_start.borrow_mut().get_or_insert(now);
         match x {
             Some(x) => {
@@ -2159,6 +2217,7 @@ impl Painter {
         }
 
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
+        self.note_animation_win();
         self.last_render_started_at.set(Some(Instant::now()));
 
         let refresh_driver = self.refresh_driver.clone();
