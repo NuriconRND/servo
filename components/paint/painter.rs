@@ -435,6 +435,10 @@ pub(crate) struct Painter {
     anim_ready_latency: RefCell<Vec<f64>>,
     /// 애니메이션 값을 달지 않은 완료의 수. 그 사이 밀어넣은 값은 자기 프레임을 못 얻었다.
     anim_ready_unmatched: Cell<u64>,
+    /// 밀어넣은 값이 아직 제 프레임을 기다리는가, 그리고 그때의 프레임 id.
+    /// `deferred_animation_frame_is_due` 참고.
+    deferred_animation_frame: Cell<Option<u64>>,
+
     /// ★아직 렌더가 집어가지 않은 완료의 꼬리표.★ `true` = 애니메이션 값을 단 프레임.
     ///
     /// `-FrameReason` 이 보여준 대로 프레임 원천은 둘이다 -- `painter.rs:1418`
@@ -797,6 +801,35 @@ fn process_memory_mb() -> (f64, f64) {
     (0.0, 0.0)
 }
 
+/// ★내 프레임을 낼지를 턴 끝에 정한다.★
+///
+/// 전에는 애니메이션이 제 턴에서 곧바로 정했다. 그런데 `Paint::perform_updates` 는
+/// 애니메이션 푸시를 먼저 돌리고 월 프레임 경로를 나중에 돌린다 -- 그래서 그 판정은
+/// ***같은 턴의 뒤쪽에서 날 프레임을 원리적으로 볼 수 없었다.***
+///
+/// 실측(log_ani_debug 30, divisor=1): `took_anim=0 took_script=61 overwritten=61`,
+/// `rode_along=0`. 둘이 매 간격 각자 프레임을 내 ***초당 120 개를 요청하고 60 개를
+/// 버렸다***(`WRRATE frames=120 onscreen=60`). 애니메이션 프레임은 합성 슬롯을 한 번도
+/// 못 가져갔다. `gfx_paint_side_animations_enabled=false` 로 두면 요청이 61 로 떨어지고
+/// 저더가 사라졌다(log_ani_debug 31) -- 다만 그것은 벍에서 쓸 수 없다. 끄면 스크립트가
+/// 매 프레임 틱해 리플로가 초당 60 이 되고, 그것이 바로 이 서브시스템을 만든 이유다
+/// (prefs.rs 실측: 4-GPU 벍에서 초당 122 리플로, 전환 중 하나가 14.5ms).
+///
+/// 그래서 값과 프레임을 나눔다. 값은 제 자리에서 그대로 보내고(그래야 뒤에 오는
+/// 월 프레임이 ***최신 값***을 실어간다), 프레임을 낼지만 턴 끝으로 미룬다.
+/// 그때는 답이 나와 있다 -- 프레임 id 가 올라갔으면 남이 낸 것이다.
+///
+/// `frame_id_at_push` / `frame_id_now` 는 `next_diagnostic_frame_id` 의 값이다. 모든
+/// `generate_frame` 이 그것을 올리므로 종류를 가리지 않고 "누가든 냈나" 를 답한다.
+fn deferred_animation_frame_is_due(
+    wanted: bool,
+    frame_id_at_push: u64,
+    frame_id_now: u64,
+    painter_busy: bool,
+) -> bool {
+    wanted && frame_id_now == frame_id_at_push && !painter_busy
+}
+
 impl Painter {
     pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
         let webrender_gl = rendering_context.gleam_gl_api();
@@ -1133,6 +1166,7 @@ impl Painter {
             anim_ready_dt: Default::default(),
             anim_ready_latency: Default::default(),
             anim_ready_unmatched: Default::default(),
+            deferred_animation_frame: Default::default(),
             anim_win_pending_tag: Default::default(),
             anim_win_took_anim: Default::default(),
             anim_win_took_script: Default::default(),
@@ -1435,14 +1469,16 @@ impl Painter {
                 floats,
                 colors: colors.unwrap_or_default(),
             });
+            // ★값은 지금 보내고 프레임은 턴 끝에 정한다.★
+            //
+            // 값이 먼저 나가야 같은 턴의 뒤쪽에서 오는 월 프레임이 ***최신 값***을
+            // 실어간다. 그러고 나서 아무도 프레임을 안 냈을 때만 우리가 낸다 --
+            // 왜 여기서 정할 수 없는지는 `deferred_animation_frame_is_due`.
             if animated_property_frame {
-                // 자기 프레임은 "남"에 세지 않는다(위 판정 주석).
-                let others_before = self.last_frame_by_other_source_at.get();
-                // 이 프레임이 실어 가는 x 를 요청 자리에 넘긴다 -- 완료 때 짝을 찾으려고.
                 self.anim_ready_pending_x
                     .set(transforms_log.first().map(|&(_, x, _, _)| x));
-                self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
-                self.last_frame_by_other_source_at.set(others_before);
+                self.deferred_animation_frame
+                    .set(Some(self.next_diagnostic_frame_id.get()));
             }
             self.send_transaction(transaction);
             if has_values && push_due {
@@ -2726,6 +2762,40 @@ impl Painter {
             self.anim_ready_pending_x.take(),
             Instant::now(),
         ));
+    }
+
+    /// ★턴 끝에 유보해 둔 애니메이션 프레임을 정리한다.★
+    ///
+    /// `Paint::perform_updates` 가 월 프레임 경로까지 다 돌린 뒤에 불러야 한다 --
+    /// 그게 이 유보의 전부다. 판정은 `deferred_animation_frame_is_due`.
+    pub(crate) fn flush_deferred_animation_frame(&mut self) {
+        let Some(frame_id_at_push) = self.deferred_animation_frame.take() else {
+            return;
+        };
+        let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
+        if !deferred_animation_frame_is_due(
+            true,
+            frame_id_at_push,
+            self.next_diagnostic_frame_id.get(),
+            painter_busy,
+        ) {
+            // 남이 낸 프레임에 얹혀 간다 -- 값은 이미 그 프레임 전에 도착했다.
+            if painter_busy {
+                self.paint_animation_skipped_busy
+                    .set(self.paint_animation_skipped_busy.get() + 1);
+            } else {
+                self.paint_animation_rode_along
+                    .set(self.paint_animation_rode_along.get() + 1);
+            }
+            self.anim_ready_pending_x.set(None);
+            return;
+        }
+        let mut transaction = Transaction::new();
+        // 자기 프레임은 "남" 에 세지 않는다(판정 주석).
+        let others_before = self.last_frame_by_other_source_at.get();
+        self.generate_frame(&mut transaction, RenderReasons::ANIMATED_PROPERTY);
+        self.last_frame_by_other_source_at.set(others_before);
+        self.send_transaction(transaction);
     }
 
     pub(crate) fn pending_frames(&self) -> usize {
@@ -4689,6 +4759,52 @@ pub(crate) fn format_step_sequence(samples: &[f64]) -> String {
 /// 나란히 읽으면 "요약이 무엇을 묻었나" 가 바로 드러난다.
 pub(crate) static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SERVO_LOG_ANIM_STEP_SEQ").is_ok_and(|value| value != "0"));
+
+#[cfg(test)]
+mod deferred_animation_frame_tests {
+    use super::deferred_animation_frame_is_due;
+
+    /// ★아무도 프레임을 안 냈으면 애니메이션이 낸다.★ divisor=4 의 나머지 45 간격이 이것이다.
+    #[test]
+    fn an_empty_turn_is_the_animation_s_to_fill() {
+        assert!(deferred_animation_frame_is_due(true, 100, 100, false));
+    }
+
+    /// ★이 테스트가 이 변경의 이유다.★
+    ///
+    /// 전에는 애니메이션이 제 턴에서 곧바로 프레임을 낼지 정했는데, 그 판정은
+    /// 같은 턴의 뒤쪽에서 월 프레임 경로가 낼 프레임을 원리적으로 볼 수 없었다
+    /// (`Paint::perform_updates` 에서 애니메이션 푸시가 먼저고 월 프레임 요청이
+    /// 나중이다). 그래서 divisor=1 에서 둘이 매 간격 각자 프레임을 냈고,
+    /// 측정상 초당 120 개를 요청해 그중 60 개를 버렸다(log_ani_debug 30:
+    /// `took_anim=0 took_script=61 overwritten=61`, `rode_along=0`).
+    ///
+    /// 결정을 턴 끝으로 미루면 그때는 이미 답을 안다 -- 프레임 id 가 올라갔으면
+    /// 남이 낸 것이고, 애니메이션은 그 프레임에 얹혀 가면 된다.
+    #[test]
+    fn a_frame_from_another_source_is_ridden_not_duplicated() {
+        assert!(!deferred_animation_frame_is_due(true, 100, 101, false));
+    }
+
+    /// 밀어넣을 값이 없었으면 낼 프레임도 없다.
+    #[test]
+    fn nothing_was_pushed_so_nothing_is_due() {
+        assert!(!deferred_animation_frame_is_due(false, 100, 100, false));
+    }
+
+    /// 파이프라인이 막혔 상태면 더 밀지 않는다. 가득 차있는 큐에 더 쌓으면
+    /// 깊이만 깊어지고 화면은 더 늦는다.
+    #[test]
+    fn a_busy_painter_is_not_given_more_work() {
+        assert!(!deferred_animation_frame_is_due(true, 100, 100, true));
+    }
+
+    /// 프레임 id 는 단조증가만 한다. 한 턴에 여럿이 났어도 얹혀 가면 된다.
+    #[test]
+    fn several_frames_from_others_are_still_just_a_ride() {
+        assert!(!deferred_animation_frame_is_due(true, 100, 104, false));
+    }
+}
 
 #[cfg(test)]
 mod anim_step_seq_tests {

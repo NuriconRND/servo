@@ -3357,6 +3357,17 @@ impl Paint {
         self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
 
+        // ★여기가 애니메이션 프레임을 정하는 자리다.★ 위 월 프레임 경로가 끝난 뒤여야
+        // "이번 턴에 남이 프레임을 냈나" 에 답할 수 있다 -- 애니메이션 푸시는 이 함수의
+        // 맨 앞(`painter.perform_updates()`)에서 이미 값만 보내 두었고, 그래서 그 자리의
+        // 판정은 ***같은 턴 뒤쪽의 프레임을 원리적으로 볼 수 없었다.***
+        // `Painter::flush_deferred_animation_frame` 과 `deferred_animation_frame_is_due`.
+        for painter_id in self.painter_ids() {
+            self.with_painter_mut(painter_id, |painter| {
+                painter.flush_deferred_animation_frame()
+            });
+        }
+
         self.shutdown_state() != ShutdownState::FinishedShuttingDown
     }
 
