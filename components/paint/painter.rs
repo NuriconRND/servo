@@ -407,8 +407,20 @@ pub(crate) struct Painter {
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
-    /// `note_animation_step` 의 상태. 직전 표본의 (키, x, 시각).
-    anim_step_previous: Cell<Option<(u32, f32, Instant)>>,
+    /// `note_animation_step` 의 상태. ★레인마다★ 직전 표본의 (x, 시각).
+    ///
+    /// ★전에는 `transforms.first()` 하나만 봤다.★ 그게 두 번 생각을 빗나가게 했다 --
+    /// 프로브는 레인을 일곱 줄(A / B / B' / C / C' / D / D') 그리고 `PAINTANIM` 은
+    /// animations=28 을 세는데, 지표는 그중 하나만 따라갔다. 그 하나가 균일하다는
+    /// 것은 ***나머지가 균일하다는 뜻이 아니다.*** 운영자가 보는 레인이 추적하는
+    /// 레인이라는 보장도 없다.
+    ///
+    /// 관측(log_ani_debug 32): divisor 를 15/30/60 으로 두자 저더 간격이 각각
+    /// 0.25 / 0.5 / 1 초로 나왔다 -- ***`divisor / 60` 정확히 스크립트 틱 순간***이다.
+    /// 모양은 객체가 잠시 앞으로 튀어나갔다 돌아온다. 그런데 추적 중인 레인은
+    /// div=60 에서도 `dx max=12.80` 으로 ***튀지 않았다.*** 둘 중 하나다: 다른
+    /// 레인이거나, 튀는 것이 샘플값이 아니거나. 앞에거를 먼저 닫는다.
+    anim_step_previous: RefCell<FxHashMap<u32, (f32, Instant)>>,
     anim_step_window_start: RefCell<Option<Instant>>,
     anim_step_dt: RefCell<Vec<f64>>,
     anim_step_dx: RefCell<Vec<f64>>,
@@ -1690,20 +1702,25 @@ impl Painter {
     /// `dx` 는 첫 번째 변환 키 하나만 따라간다 -- 프로브의 1x 행이면 충분하고, 키가
     /// 바뀌면(요소가 갈리면) 그 표본은 버린다.
     fn note_animation_step(&self, now: Instant, transforms: &[(u32, f32, f32, f32)]) {
-        let Some(&(key, x, _, _)) = transforms.first() else {
+        if transforms.is_empty() {
             return;
-        };
-        let previous = self.anim_step_previous.replace(Some((key, x, now)));
+        }
         let window_start = *self.anim_step_window_start.borrow_mut().get_or_insert(now);
-
-        if let Some((previous_key, previous_x, previous_at)) = previous {
-            // 키가 바뀌면 같은 물체가 아니다. 간격도 변화량도 의미가 없다.
-            if previous_key == key {
-                let dt_ms = now.duration_since(previous_at).as_secs_f64() * 1000.0;
-                self.anim_step_dt.borrow_mut().push(dt_ms);
-                self.anim_step_dx.borrow_mut().push((x - previous_x) as f64);
+        // ★레인마다 따로 센다.★ 키는 노드 id 의 해시라 레인을 가른다. 한 레인만 보면
+        // 다른 레인의 튐을 통째로 놓친다 -- `anim_step_previous` 주석.
+        {
+            let mut previous_by_lane = self.anim_step_previous.borrow_mut();
+            let mut dt_out = self.anim_step_dt.borrow_mut();
+            let mut dx_out = self.anim_step_dx.borrow_mut();
+            for &(key, x, _, _) in transforms {
+                if let Some(&(previous_x, previous_at)) = previous_by_lane.get(&key) {
+                    dt_out.push(now.duration_since(previous_at).as_secs_f64() * 1000.0);
+                    dx_out.push((x - previous_x) as f64);
+                }
+                previous_by_lane.insert(key, (x, now));
             }
         }
+        let lanes = transforms.len();
 
         if now.duration_since(window_start) < Duration::from_secs(1) {
             return;
@@ -1755,7 +1772,7 @@ impl Painter {
             0.0
         };
         log::warn!(
-            "ANIMSTEP painter={:?} n={} per_interval dup={} one={} skip1={} skipN={} \
+            "ANIMSTEP painter={:?} lanes={lanes} n={} per_interval dup={} one={} skip1={} skipN={} \
              dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
              dx_px p05={:.2} p50={:.2} p95={:.2} max={:.2} spread={:.3}",
             self.painter_id,
