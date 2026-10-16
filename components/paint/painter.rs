@@ -447,6 +447,10 @@ pub(crate) struct Painter {
     anim_ready_latency: RefCell<Vec<f64>>,
     /// 애니메이션 값을 달지 않은 완료의 수. 그 사이 밀어넣은 값은 자기 프레임을 못 얻었다.
     anim_ready_unmatched: Cell<u64>,
+    /// ★페인터가 이미 내고 있어 스크립트 요청이 프레임을 만들지 않은 횟수.★
+    /// `script_frame_is_redundant` 참고.
+    script_frame_rode_painter: Cell<u64>,
+
     /// 밀어넣은 값이 아직 제 프레임을 기다리는가, 그리고 그때의 프레임 id.
     /// `deferred_animation_frame_is_due` 참고.
     deferred_animation_frame: Cell<Option<u64>>,
@@ -842,6 +846,38 @@ fn deferred_animation_frame_is_due(
     wanted && frame_id_now == frame_id_at_push && !painter_busy
 }
 
+/// ★표출 간격 하나에 프레임 하나.★ 페인터가 이미 내고 있으면 스크립트는 안 낸다.
+///
+/// 전에는 둘이 각자 냈다. 실측(log_ani_debug 28/30/32):
+///
+/// ```text
+/// divisor=1  FRAMEREASON total=120  ANIMATED_PROPERTY=60 + SCENE=60
+/// divisor=4  FRAMEREASON total=75   ANIMATED_PROPERTY=60 + SCENE=15
+/// WRRATE frames=120 onscreen=60     ANIMWIN overwritten=61
+/// ```
+///
+/// 60Hz 화면에 초당 120 개를 요청해 절반을 버렸다. 그리고 둘은 ***같은 값을 실지
+/// 않는다*** -- 바인딩은 `grid + lead` 에서 뜬 예측이고, 디스플레이 리스트에 구워진
+/// 기본값은 `built_at` 의 값이다. 어느 쪽이 합성 슬롯을 가져가느냐가 화면 위치를
+/// 정하는데 ***그걸 정하는 규칙이 없었다.*** 운영자 관측에서 저더 간격이
+/// `divisor / 60` 으로 나온 것이 그것이다 -- 두 원천이 맞붙는 순간.
+///
+/// 페인터 쪽을 살린다. 그쪽은 페이싱 클럭으로 매 간격 내므로 디스플레이 리스트는
+/// 다음 프레임(<= 한 주기)에 실려 간다. 반대로 스크립트 쪽을 살리면 divisor 간격으로만
+/// 갱신되어 d=4 면 15Hz 모션이 된다 -- 벍은 리플로 부담(초당 122) 때문에 divisor>1 이
+/// 필수라 그 쪽은 성립하지 않는다.
+///
+/// ★두 주기까지만 믿는다.★ 밀어넣기가 끊긴 지 오래되면 페인터가 멈췄을 수 있고,
+/// 그때도 억제하면 디스플레이 리스트를 실어 갈 프레임이 없어진다.
+fn script_frame_is_redundant(
+    paint_side_animating: bool,
+    since_last_push: Option<Duration>,
+    period: Duration,
+) -> bool {
+    paint_side_animating &&
+        since_last_push.is_some_and(|elapsed| elapsed <= period.saturating_mul(2))
+}
+
 impl Painter {
     pub(crate) fn new(rendering_context: Rc<dyn RenderingContext>, paint: PainterInputs) -> Self {
         let webrender_gl = rendering_context.gleam_gl_api();
@@ -1178,6 +1214,7 @@ impl Painter {
             anim_ready_dt: Default::default(),
             anim_ready_latency: Default::default(),
             anim_ready_unmatched: Default::default(),
+            script_frame_rode_painter: Default::default(),
             deferred_animation_frame: Default::default(),
             anim_win_pending_tag: Default::default(),
             anim_win_took_anim: Default::default(),
@@ -1572,8 +1609,9 @@ impl Painter {
         let overwritten = self.anim_win_overwritten.replace(0);
         log::warn!(
             "ANIMWIN painter={:?} took_anim={anim} took_script={script} \
-             overwritten={overwritten}",
+             overwritten={overwritten} script_rode_painter={}",
             self.painter_id,
+            self.script_frame_rode_painter.replace(0),
         );
     }
 
@@ -2815,6 +2853,23 @@ impl Painter {
         self.send_transaction(transaction);
     }
 
+    /// `script_frame_is_redundant` 에 이 페인터의 지금 상태를 먹인다.
+    fn script_frame_rides_the_painter(&self) -> bool {
+        let mut paint_side_animating = false;
+        for renderer in self.webview_renderers.values() {
+            renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                paint_side_animating |= pipeline_details.animations.has_paint_animations();
+            });
+        }
+        script_frame_is_redundant(
+            paint_side_animating,
+            self.last_paint_animation_push_at
+                .get()
+                .map(|at| Instant::now().saturating_duration_since(at)),
+            crate::refresh_driver::paint_timer_period(),
+        )
+    }
+
     pub(crate) fn pending_frames(&self) -> usize {
         self.pending_frames.get()
     }
@@ -3727,6 +3782,16 @@ impl Painter {
         // published frames (see `renderer_behind`). The pending-frame flag stays set, so a
         // subsequent `update_images` call regenerates once the renderer has caught up.
         if self.renderer_behind() {
+            return false;
+        }
+
+        // ★표출 간격 하나에 프레임 하나.★ 페인터가 이미 내고 있으면 여기서 또 내지 않는다 --
+        // 왜 그래야 하는지는 `script_frame_is_redundant`. 위 두 게이트와 같은 모양으로
+        // 빠진다: `set_pending_frame(true)` 가 그대로 남아, 페인터가 멈추더라도 나중 호출이
+        // 다시 만든다.
+        if self.script_frame_rides_the_painter() {
+            self.script_frame_rode_painter
+                .set(self.script_frame_rode_painter.get() + 1);
             return false;
         }
 
@@ -4776,6 +4841,58 @@ pub(crate) fn format_step_sequence(samples: &[f64]) -> String {
 /// 나란히 읽으면 "요약이 무엇을 묻었나" 가 바로 드러난다.
 pub(crate) static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SERVO_LOG_ANIM_STEP_SEQ").is_ok_and(|value| value != "0"));
+
+#[cfg(test)]
+mod script_frame_gate_tests {
+    use std::time::Duration;
+
+    use super::script_frame_is_redundant;
+
+    const PERIOD: Duration = Duration::from_micros(16_667);
+
+    /// ★페인터가 돌고 있으면 스크립트는 프레임을 더 낼 이유가 없다.★
+    ///
+    /// 이것이 이 변경의 이유다. 둘이 각자 내면 한 표출 간격에 두 장이 나고
+    /// 한 장은 버려진다 -- 실측(log_ani_debug 30/32, divisor=1): 초당 120 요청에
+    /// `WRRATE onscreen=60`, `ANIMWIN overwritten=61`. 그리고 둘은 ***같은 값을 실지
+    /// 않는다*** -- 바인딩은 `grid + lead` 에서 뜬 예측이고, 디스플레이 리스트에
+    /// 구워진 기본값은 `built_at` 의 값이다. 어느 쪽이 이기느냐가 화면 위치를
+    /// 가르는데, 그걸 정하는 규칙이 없었다.
+    #[test]
+    fn a_painter_that_is_already_producing_makes_the_script_frame_redundant() {
+        assert!(script_frame_is_redundant(true, Some(PERIOD), PERIOD));
+    }
+
+    /// 밀어넣기가 끊긴 지 오래되면 페인터가 멈췄을 수 있다. 그때 억제하면
+    /// ★디스플레이 리스트를 실어 갈 프레임이 없어진다.★ 두 주기까지만 믿는다.
+    #[test]
+    fn a_stale_push_does_not_promise_a_frame() {
+        assert!(!script_frame_is_redundant(true, Some(PERIOD * 5), PERIOD));
+    }
+
+    /// 페인트 측 애니메이션이 없으면 얹혀 갈 프레임도 없다. 스크립트가 내야 한다.
+    #[test]
+    fn without_a_paint_side_animation_the_script_must_produce() {
+        assert!(!script_frame_is_redundant(false, Some(PERIOD), PERIOD));
+    }
+
+    /// 한 번도 밀어넣은 적이 없으면 약속도 없다.
+    #[test]
+    fn a_painter_that_never_pushed_promises_nothing() {
+        assert!(!script_frame_is_redundant(true, None, PERIOD));
+    }
+
+    /// 경계는 두 주기다. 그 안은 믿고 바깥은 안 믿는다.
+    #[test]
+    fn the_promise_lasts_exactly_two_periods() {
+        assert!(script_frame_is_redundant(true, Some(PERIOD * 2), PERIOD));
+        assert!(!script_frame_is_redundant(
+            true,
+            Some(PERIOD * 2 + Duration::from_millis(1)),
+            PERIOD
+        ));
+    }
+}
 
 #[cfg(test)]
 mod deferred_animation_frame_tests {
