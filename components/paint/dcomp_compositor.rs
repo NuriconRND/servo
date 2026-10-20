@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use euclid::default::Size2D as UntypedSize2D;
 use log::warn;
@@ -1399,7 +1399,11 @@ struct SizeSet {
 }
 
 impl SizeSet {
-    const CAP: usize = 16;
+    /// ★16 이었다가 64 로 올렸다.★ T5 실측에서 저더가 나는 두 런의 **모든** 창이 16 에
+    /// 포화됐다(`log_ani_debug_05\05`, 스펙 8-1 절). 포화된 지표는 깨끗한 창과 더러운 창을
+    /// 가르지 못한다 -- 실제로 그 둘을 가른 것은 이 값이 아니라 `tex_reused` 였고, 이 값은
+    /// 양쪽 다 16 이라 아무 말도 하지 않았다. 64 쌍이면 1KB 남짓이고 페인터당 둘이다.
+    const CAP: usize = 64;
 
     fn note(&mut self, w: u32, h: u32) {
         if self.seen[..self.len].contains(&(w, h)) {
@@ -1939,6 +1943,174 @@ struct CommitTotals {
 static COMMIT_SITES: [CommitSlot; CommitSite::COUNT] =
     [const { CommitSlot::new() }; CommitSite::COUNT];
 
+/// 커밋 한 번이 실어 나른 일. 커밋과 커밋 **사이에** 페인터가 쌓고, [`raw_commit`] 이 집어 간다.
+///
+/// 왜 생겼나(T5 실측, 스펙 8-1 절): Commit 시간이 **호출 지점**에만 귀속되고 그 Commit 이
+/// 무엇을 실어 날랐는지에는 귀속되지 않아, 초 단위 상관만 보이고 인과를 못 봤다. 같은 런
+/// 안에서 비싼 창과 싼 창을 가른 유일한 단조 신호가 ★새로 realize 된 텍스처의 수★인데
+/// (재사용 45%->4% 일 때 `bf_early` 7.9->158.9 ms/s), 그것이 정말 **그 Commit** 의 비용인지는
+/// 커밋 단위로 붙여야만 답이 난다. 창 단위로는 영영 상관으로 남는다.
+struct DeviceWork {
+    /// 이 칸의 주인 디바이스. 0 = 빈 칸. 한 번 잡으면 프로세스 수명 동안 유지한다
+    /// (벽은 타일 수가 고정이고 종료는 프로세스 종료다 -- `commit_scheduler` 의 워커와 같다).
+    device: AtomicUsize,
+    binds: AtomicU32,
+    tex_new: AtomicU32,
+    tex_same: AtomicU32,
+    visuals: AtomicU32,
+}
+
+/// 직전 커밋 이후 쌓인 일. 전부 `swap` 으로 집으므로 집는 순간 누적기는 0 이 된다.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct WorkSnapshot {
+    binds: u32,
+    tex_new: u32,
+    tex_same: u32,
+    visuals: u32,
+}
+
+impl DeviceWork {
+    const fn new() -> Self {
+        DeviceWork {
+            device: AtomicUsize::new(0),
+            binds: AtomicU32::new(0),
+            tex_new: AtomicU32::new(0),
+            tex_same: AtomicU32::new(0),
+            visuals: AtomicU32::new(0),
+        }
+    }
+
+    fn note_bind(&self, reused: bool) {
+        self.binds.fetch_add(1, Ordering::Relaxed);
+        if reused {
+            self.tex_same.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.tex_new.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn note_visual(&self) {
+        self.visuals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> WorkSnapshot {
+        WorkSnapshot {
+            binds: self.binds.swap(0, Ordering::Relaxed),
+            tex_new: self.tex_new.swap(0, Ordering::Relaxed),
+            tex_same: self.tex_same.swap(0, Ordering::Relaxed),
+            visuals: self.visuals.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+/// 벽은 디바이스가 넷이다. 여덟이면 승격·재생성으로 주소가 한 번 바뀌어도 자리가 남는다.
+const DEVICE_WORK_SLOTS: usize = 8;
+static DEVICE_WORK: [DeviceWork; DEVICE_WORK_SLOTS] =
+    [const { DeviceWork::new() }; DEVICE_WORK_SLOTS];
+
+/// 이 디바이스의 칸을 찾거나 빈 칸을 잡는다. 칸이 다 차면 `None` -- ★계측이 조용히 틀리느니
+/// 비는 쪽이 낫다★(두 디바이스가 한 칸을 나눠 쓰면 버킷이 섞여 결론이 뒤집힌다).
+///
+/// 항상 0 번 칸부터 훑고 자기 디바이스를 가진 **첫** 칸을 돌려주므로 한 디바이스가 두 칸을
+/// 차지할 수 없다: CAS 에 졌으면 같은 칸을 다시 읽어, 이긴 쪽이 나였으면 그 칸을 쓴다.
+fn find_device_work(slots: &[DeviceWork], device: usize) -> Option<&DeviceWork> {
+    if device == 0 {
+        return None;
+    }
+    for slot in slots {
+        if slot.device.load(Ordering::Relaxed) == device {
+            return Some(slot);
+        }
+        if slot.device.load(Ordering::Relaxed) == 0 {
+            match slot
+                .device
+                .compare_exchange(0, device, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(slot),
+                // 졌다. 이긴 쪽이 나였으면 이 칸이 내 칸이고, 아니면 다음 칸을 본다.
+                Err(winner) if winner == device => return Some(slot),
+                Err(_) => continue,
+            }
+        }
+    }
+    None
+}
+
+fn device_work(device: usize) -> Option<&'static DeviceWork> {
+    find_device_work(&DEVICE_WORK, device)
+}
+
+/// `COMMITWORK` 의 버킷 수. idle / reuse / 1 / 2 / 3-4 / 5+.
+const WORK_BUCKETS: usize = 6;
+const WORK_BUCKET_TAGS: [&str; WORK_BUCKETS] = ["idle", "reuse", "new1", "new2", "new3_4", "new5p"];
+
+/// ★이 Commit 이 realize 한 새 텍스처의 수★로 가른다. `reuse` 와 `new*` 의 평균 커밋 시간이
+/// 갈리면 비용이 거기 붙는 것이고, 안 갈리면 텍스처 재사용도 상관일 뿐이다(스펙 9 절 Q4').
+///
+/// ★`idle` 을 따로 두는 것이 이 함수의 핵심이다.★ 커밋이 bind 보다 잦다 -- M0 실측에서
+/// 디바이스당 초당 커밋 60 회에 bind 37 회였다. 그래서 "새 텍스처 0" 칸에 그냥 둬 버리면
+/// **실어 나를 것이 아예 없던 커밋**이 그 칸을 채우고, 당연히 싸게 나온다. 그 값을 `new1`
+/// 과 비교하면 "새 텍스처가 비싸다" 는 결론이 공짜로 나온다 -- 측정이 아니라 자기 성취다.
+/// 비교의 기준선은 `reuse`(실어 날랐는데 전부 같은 텍스처였다)여야 한다.
+fn work_bucket(work: &WorkSnapshot) -> usize {
+    if work.binds == 0 {
+        return 0;
+    }
+    match work.tex_new {
+        0 => 1,
+        1 => 2,
+        2 => 3,
+        3..=4 => 4,
+        _ => 5,
+    }
+}
+
+struct WorkSlot {
+    n: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    visuals: AtomicU64,
+    binds: AtomicU64,
+    tex_same: AtomicU64,
+}
+
+impl WorkSlot {
+    const fn new() -> Self {
+        WorkSlot {
+            n: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            visuals: AtomicU64::new(0),
+            binds: AtomicU64::new(0),
+            tex_same: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, ns: u64, work: &WorkSnapshot) {
+        self.n.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        self.visuals
+            .fetch_add(work.visuals as u64, Ordering::Relaxed);
+        self.binds.fetch_add(work.binds as u64, Ordering::Relaxed);
+        self.tex_same
+            .fetch_add(work.tex_same as u64, Ordering::Relaxed);
+    }
+
+    fn drain(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.n.swap(0, Ordering::Relaxed),
+            self.sum_ns.swap(0, Ordering::Relaxed),
+            self.max_ns.swap(0, Ordering::Relaxed),
+            self.visuals.swap(0, Ordering::Relaxed),
+            self.binds.swap(0, Ordering::Relaxed),
+            self.tex_same.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
+static COMMIT_WORK: [WorkSlot; WORK_BUCKETS] = [const { WorkSlot::new() }; WORK_BUCKETS];
+
 /// `SERVO_DCOMP_SLOW_COMMIT_MS` 를 ns 로. 기본 8ms.
 ///
 /// ★`max` 하나로는 "22ms 짜리 한 번" 과 "22ms 짜리 60 번" 이 구분되지 않는다★ -- 앞은
@@ -1983,10 +2155,21 @@ fn release_commitsite_emitter(emitter: &AtomicUsize, me: usize) {
 #[inline]
 unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 {
     let start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+    // ★일 스냅샷은 Commit **전에** 집는다.★ 뒤에 집으면 Commit 이 도는 동안 다른 스레드가
+    // 쌓은 것까지 이 Commit 의 몫으로 끌어온다 -- 그 오염이 정확히 "느린 커밋일수록 일이
+    // 많아 보인다" 는 가짜 상관을 만든다. 이 자리는 디바이스 가드 안이고, swap 넷은 락도
+    // 할당도 I/O 도 아니므로 "가드 안은 Commit 하나" 불변식을 깨지 않는다.
+    let work = start
+        .and_then(|_| device_work(device as usize))
+        .map(|w| w.take());
     // 이 파일은 `unsafe_op_in_unsafe_fn` 을 끄지 않으므로 `unsafe fn` 안에서도 블록이 필요하다.
     let hr = unsafe { (*device).Commit() };
     if let Some(start) = start {
-        COMMIT_SITES[site.index()].record(start.elapsed().as_nanos() as u64, *SLOW_COMMIT_NS);
+        let ns = start.elapsed().as_nanos() as u64;
+        COMMIT_SITES[site.index()].record(ns, *SLOW_COMMIT_NS);
+        if let Some(work) = work {
+            COMMIT_WORK[work_bucket(&work)].record(ns, &work);
+        }
     }
     hr
 }
@@ -3185,6 +3368,35 @@ impl DCompNativeCompositor {
             );
         }
         warn!("{line}");
+
+        // ★같은 커밋들을 "무엇을 실어 날랐나" 로 다시 가른다.★ 위 줄은 어디서 불렸나로
+        // 가르는데, T5 가 답하지 못한 것은 그쪽이 아니라 이쪽이다(스펙 8-1 절).
+        let mut work_line = String::with_capacity(320);
+        let _ = write!(
+            work_line,
+            "COMMITWORK window_ms={:.0}",
+            window.as_secs_f64() * 1000.0
+        );
+        for (bucket, tag) in WORK_BUCKET_TAGS.iter().enumerate() {
+            let (n, sum_ns, max_ns, visuals, binds, tex_same) = COMMIT_WORK[bucket].drain();
+            let _ = write!(
+                work_line,
+                " {} n={} ms={:.1} avg={:.3} max={:.2} vis={} bind={} same={}",
+                tag,
+                n,
+                sum_ns as f64 / 1_000_000.0,
+                if n > 0 {
+                    sum_ns as f64 / n as f64 / 1_000_000.0
+                } else {
+                    0.0
+                },
+                max_ns as f64 / 1_000_000.0,
+                visuals,
+                binds,
+                tex_same,
+            );
+        }
+        warn!("{work_line}");
     }
 
     pub(crate) fn present_external_only(&mut self) {
@@ -3495,6 +3707,13 @@ impl Compositor for DCompNativeCompositor {
         // rendering_context 호출을 엔트리 borrow와 분리(같은 self의 다른 필드지만 명시
         // clone으로 borrow 충돌 여지를 없앤다 — 엔트리는 get_mut로 지속 borrow된다).
         let rc = self.rendering_context.clone();
+        // 같은 이유로 디바이스 포인터도 여기서 미리 꺼낸다 -- `dcomp_device_ptr` 는 `&self`
+        // 라 아래 `surfaces.get_mut` 의 대여와 겹친다. `COMMITWORK` 가 쓴다.
+        let work_device = if *DCOMP_BIND_PROF {
+            self.dcomp_device_ptr().map(|d| d as usize)
+        } else {
+            None
+        };
 
         let Some(entry) = self.surfaces.get_mut(&id.surface_id) else {
             warn!("[dcomp-native] bind: unknown surface {:?}", id.surface_id);
@@ -3721,6 +3940,10 @@ impl Compositor for DCompNativeCompositor {
                         profile.tex_reused += 1;
                     } else {
                         profile.tex_changed += 1;
+                    }
+                    // 다음 Commit 이 집어 갈 몫에 이 bind 를 얹는다.
+                    if let Some(work) = work_device.and_then(device_work) {
+                        work.note_bind(reused);
                     }
                 }
                 let pbuffer_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
@@ -4026,6 +4249,13 @@ impl Compositor for DCompNativeCompositor {
     ) {
         if *DCOMP_BIND_PROF {
             self.bind_profile.add_surface_all += 1;
+            if let Some(work) = self
+                .dcomp_device_ptr()
+                .map(|d| d as usize)
+                .and_then(device_work)
+            {
+                work.note_visual();
+            }
         }
         // 비디오 external surface(Task 5)는 전용 경로 — 기존 Virtual/SwapChain 경로 위 조기
         // 분기. scale 경고는 external에 미적용(브리프 계약: external은 dest=clip, scale 무시).
@@ -5261,7 +5491,7 @@ mod commit_probe_tests {
         assert_eq!(sizes.overflow_mark(), "");
     }
 
-    /// 넘쳐도 할당하지 않는다. 16 에서 멈추고 넘침을 표시한다.
+    /// 넘쳐도 할당하지 않는다. 상한에서 멈추고 넘침을 표시한다.
     #[test]
     fn a_size_set_saturates_without_allocating() {
         let mut sizes = SizeSet::default();
@@ -5270,6 +5500,117 @@ mod commit_probe_tests {
         }
         assert_eq!(sizes.distinct(), SizeSet::CAP);
         assert_eq!(sizes.overflow_mark(), "+");
+    }
+
+    /// ★상한은 실측이 포화되지 않을 만큼이어야 한다.★ 16 일 때 저더가 나는 런의 모든 창이
+    /// 16 으로 찍혀 아무것도 가르지 못했다(스펙 8-1 절). 그 값으로 되돌아가는 것을 막는다.
+    #[test]
+    fn the_size_set_cap_is_past_the_value_that_saturated_in_the_field() {
+        assert!(
+            SizeSet::CAP > 16,
+            "16 saturated on every window of the stalling runs; a cap that saturates measures nothing"
+        );
+    }
+
+    fn carried(binds: u32, tex_new: u32) -> WorkSnapshot {
+        WorkSnapshot {
+            binds,
+            tex_new,
+            tex_same: binds - tex_new,
+            visuals: 0,
+        }
+    }
+
+    /// 버킷 경계. idle / reuse / 1 / 2 / 3-4 / 5+.
+    #[test]
+    fn work_buckets_split_at_the_documented_edges() {
+        let got: Vec<usize> = [
+            (1u32, 0u32),
+            (1, 1),
+            (2, 2),
+            (4, 3),
+            (4, 4),
+            (9, 5),
+            (99, 60),
+        ]
+        .iter()
+        .map(|&(b, n)| work_bucket(&carried(b, n)))
+        .collect();
+        assert_eq!(got, vec![1, 2, 3, 4, 4, 5, 5]);
+    }
+
+    /// ★실어 나를 것이 없던 커밋은 기준선이 아니다.★ 커밋이 bind 보다 잦아서(M0: 초당
+    /// 60 대 37) 빈 커밋을 "새 텍스처 0" 칸에 섞으면 그 칸이 싸지고, `new1` 과 비교해
+    /// "새 텍스처가 비싸다" 는 결론이 측정 없이 나온다.
+    #[test]
+    fn an_empty_commit_is_not_the_baseline_for_a_reusing_one() {
+        assert_eq!(work_bucket(&carried(0, 0)), 0, "no binds at all");
+        assert_eq!(work_bucket(&carried(5, 0)), 1, "carried five, all reused");
+        assert_ne!(
+            work_bucket(&carried(0, 0)),
+            work_bucket(&carried(5, 0)),
+            "an empty commit and a fully-reusing one must not share a bucket"
+        );
+    }
+
+    fn work_slots(n: usize) -> Vec<DeviceWork> {
+        (0..n).map(|_| DeviceWork::new()).collect()
+    }
+
+    /// 한 디바이스는 한 칸만 차지하고, 다시 물으면 같은 칸이 나온다.
+    #[test]
+    fn a_device_keeps_the_one_slot_it_claimed() {
+        let slots = work_slots(4);
+        let first = find_device_work(&slots, 0x1000).expect("slot");
+        first.note_bind(false);
+        let again = find_device_work(&slots, 0x1000).expect("same slot");
+        assert_eq!(
+            again.take().tex_new,
+            1,
+            "the second lookup found another slot"
+        );
+        // 다른 디바이스는 다른 칸이다 -- 섞이면 버킷이 오염된다.
+        let other = find_device_work(&slots, 0x2000).expect("slot");
+        other.note_bind(true);
+        assert_eq!(first.take(), WorkSnapshot::default());
+    }
+
+    /// 칸이 다 차면 `None`. ★두 디바이스가 한 칸을 나눠 쓰느니 안 재는 쪽이 낫다.★
+    #[test]
+    fn a_full_table_declines_rather_than_sharing_a_slot() {
+        let slots = work_slots(2);
+        assert!(find_device_work(&slots, 0x1000).is_some());
+        assert!(find_device_work(&slots, 0x2000).is_some());
+        assert!(find_device_work(&slots, 0x3000).is_none());
+        // 이미 자리를 가진 디바이스는 테이블이 꽉 차도 계속 찾는다.
+        assert!(find_device_work(&slots, 0x1000).is_some());
+    }
+
+    /// 널 디바이스는 빈 칸 표식과 겹치므로 잡지 않는다.
+    #[test]
+    fn a_null_device_claims_no_slot() {
+        let slots = work_slots(2);
+        assert!(find_device_work(&slots, 0).is_none());
+        assert!(find_device_work(&slots, 0x1000).is_some());
+    }
+
+    /// 집으면 비워진다 -- 다음 커밋이 이번 커밋의 일을 물려받지 않는다.
+    #[test]
+    fn taking_the_work_hands_it_over_once() {
+        let work = DeviceWork::new();
+        work.note_bind(false);
+        work.note_bind(true);
+        work.note_visual();
+        assert_eq!(
+            work.take(),
+            WorkSnapshot {
+                binds: 2,
+                tex_new: 1,
+                tex_same: 1,
+                visuals: 1
+            }
+        );
+        assert_eq!(work.take(), WorkSnapshot::default());
     }
 }
 

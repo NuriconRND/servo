@@ -1830,6 +1830,81 @@ if ($cs) {
     Write-Warning "-DcompBindProf was set but no COMMITSITE line was logged. Only one compositor emits it, from the same window as DCOMPBIND -- if DCOMPBIND printed and this did not, the election in maybe_emit_bind_profile is broken."
 }
 
+# --- COMMITWORK: does a Commit cost what it CARRIES? ---
+# COMMITSITE splits the same commits by where they were called from. That answered where the
+# stall lives and nothing about why. The 2026-10-20 runs then showed, inside a single run, that
+# the expensive seconds are the ones where DComp stops handing the same texture back (reuse
+# 45% -> 4%, bf_early 7.9 -> 158.9 ms/s) while bind count, visual count and surface count all
+# move the OTHER way -- the cheapest windows had twice the binds. That is a per-second
+# correlation and nothing more, because a commit's duration was never attributed to the work it
+# published. This table does that: each commit lands in a bucket by how many textures DComp had
+# to realize since the previous commit on that device.
+#
+# Read avg, not max. If avg rises from new0 to new9p the cost is in the realization; if it is
+# flat the texture-reuse signal was a passenger and the search moves elsewhere.
+$cw = Select-String -Path $LogPath -Pattern "COMMITWORK window_ms=" -EA SilentlyContinue
+if ($cw) {
+    # "idle" is commits that carried no bind at all. It is listed for completeness and is NOT
+    # the baseline: commits outrun binds (M0 measured 60 commits/s/device against 37 binds/s),
+    # so an idle bucket is cheap by construction and comparing it against new1 would manufacture
+    # the conclusion. The baseline is "reuse" -- it carried work, and every texture came back.
+    $workTags = [ordered]@{
+        idle   = "(carried nothing)"
+        reuse  = "0 - all reused"
+        new1   = "1"
+        new2   = "2"
+        new3_4 = "3-4"
+        new5p  = "5 or more"
+    }
+    $bucket = @{}
+    $cwWin = 0.0
+    foreach ($m in $cw) {
+        if ($m.Line -match "COMMITWORK window_ms=([\d.]+)") { $cwWin += [double]$Matches[1] }
+        foreach ($k in @($workTags.Keys)) {
+            if ($m.Line -match "\b$k n=(\d+) ms=([\d.]+) avg=([\d.]+) max=([\d.]+) vis=(\d+) bind=(\d+) same=(\d+)") {
+                if (-not $bucket.ContainsKey($k)) { $bucket[$k] = @(0.0, 0.0, 0.0, 0.0, 0.0, 0.0) }
+                $bucket[$k][0] += [double]$Matches[1]   # n
+                $bucket[$k][1] += [double]$Matches[2]   # ms total
+                $bucket[$k][2] = [math]::Max($bucket[$k][2], [double]$Matches[4])  # max
+                $bucket[$k][3] += [double]$Matches[5]   # visuals
+                $bucket[$k][4] += [double]$Matches[6]   # binds
+                $bucket[$k][5] += [double]$Matches[7]   # same-texture binds
+            }
+        }
+    }
+    $cwSecs = [math]::Max($cwWin / 1000.0, 0.001)
+    Write-Host ""
+    Write-Host ("COMMITWORK -- Commit cost by how many textures it had to realize (over {0:N0}s):" -f $cwSecs)
+    Write-Host ("  {0,-16} {1,8}  {2,9}  {3,9}  {4,8}  {5,8}  {6,8}" -f "new textures", "commits", "avg ms", "worst ms", "vis/cmt", "bind/cmt", "reuse")
+    $firstAvg = $null
+    $lastAvg = $null
+    foreach ($k in @($workTags.Keys)) {
+        if (-not $bucket.ContainsKey($k)) { continue }
+        $b = $bucket[$k]
+        if ($b[0] -eq 0) { continue }
+        $avg = $b[1] / $b[0]
+        $reuse = if (($b[4] + $b[5]) -gt 0) { 100.0 * $b[5] / ($b[4] + $b[5]) } else { 0.0 }
+        Write-Host ("  {0,-16} {1,8:N0}  {2,9:N3}  {3,9:N2}  {4,8:N2}  {5,8:N2}  {6,7:N0}%" -f `
+            $workTags[$k], $b[0], $avg, $b[2], ($b[3] / $b[0]), ($b[4] / $b[0]), $reuse)
+        if ($k -eq "idle") { continue }   # listed, never the baseline -- see above
+        if ($null -eq $firstAvg) { $firstAvg = $avg }
+        $lastAvg = $avg
+    }
+    if ($null -ne $firstAvg -and $firstAvg -gt 0 -and $null -ne $lastAvg) {
+        $ratio = $lastAvg / $firstAvg
+        if ($ratio -ge 2.0) {
+            Write-Host ("  A Commit carrying the most new textures costs {0:N1}x one carrying the fewest." -f $ratio)
+            Write-Host "  That is the cost sitting in texture realization, so holding the update rect still is the lever."
+        } else {
+            Write-Host ("  Cost is flat across the buckets ({0:N1}x end to end)." -f $ratio)
+            Write-Host "  Then texture churn is a passenger, not the cause, and neither pbuffer reuse nor update-rect"
+            Write-Host "  quantisation will fix the stall. Look outside this compositor."
+        }
+    }
+} elseif ($DcompBindProf) {
+    Write-Warning "-DcompBindProf was set but no COMMITWORK line was logged. It is emitted right after COMMITSITE by the same compositor; if COMMITSITE printed and this did not, the engine predates this table."
+}
+
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }
 if ($egl -gt 0)    { Write-Warning "Some tiles could not wrap video textures ($egl occurrences) -- those tiles show green." }
 exit 0
