@@ -1,0 +1,510 @@
+# DComp 커밋·BeginDraw 계측과 서피스별 자원 재사용 설계
+
+- 작성: 2026-10-20
+- 근거 분석: `F:\20260609_SDWall_BrowserTest\frontend\ANALYSIS-output-ticker-jitter.md`(이하 분석서)
+- 대상 브랜치: `wall-sample-index-slip` cba6e697388
+- 다루는 것: 분석서 7절의 **W13**(정체 위치 계측) 중 커밋·BeginDraw 부분과 **W1**(bind 마다 GPU 자원을 만들고 지우는 구조)
+- 다루지 않는 것: W16(`overflow: hidden` pref), W14(빈 트리 경쟁), W15(페이싱 루프), 프론트 P-clip
+
+---
+
+## 0. 왜 이 두 가지를 한 스펙에 묶나
+
+분석서가 좁힌 사슬은 이렇다.
+
+```text
+IPWall 저더
+  = 프레임 전달 간격 불균일(값은 정확하다. 한 프레임 -42.33px 고정)
+  <- 20ms 넘는 렌더 정체가 초당 5 회
+  <- 그 정체의 거의 전부가 compositor_begin_ms(22~24ms), draw_frame_ms 는 1ms 미만
+  <- begin_frame 안에서 블로킹할 수 있는 것은 Commit() 하나뿐
+```
+
+그런데 ★그 Commit 만 계측이 없다★. `commit_ns` 는 `commit_device_locked`(메서드)만 재고,
+`begin_frame` 이 부르는 경로는 `commit_device_ptr_locked`(자유 함수)라 타이머를 지나지 않는다.
+그래서 모든 실행에서 `commit_ms=0.0` 이 찍혔고, 22ms 정체의 정체는 ★소거법 추정★으로 남았다.
+한 번은 그 추정을 `BeginDraw` 로 잘못 짚기도 했다 -- `compositor_begin_ms` 를 BeginDraw 시간으로
+읽은 것인데, 실제 BeginDraw 는 `DCOMPBIND begin_ms` 로 이미 재고 있었고 호출당 0.08~0.31ms 였다.
+
+동시에 분석서는 **유력(미증명) A1** 을 세웠다 -- bind 마다 갱신 영역 크기로 pbuffer 를 새로
+만들고, 그 크기가 글자 위치에 따라 프레임마다 달라져 할당이 반복된다. 관측과 맞는 점이 둘이다:
+가장자리에서만 비싸진다는 비용 지도, 그리고 GPU 메모리가 글자 주기(6 초)로 수백 MB 씩
+오르내린다는 것.
+
+**계측과 수정이 같은 코드 지점에 있다.** 계측 없이 고치면 효과를 판정할 수 없고, 고치지 않고
+계측만 하면 A1 을 확인만 하고 끝난다. 그래서 한 스펙으로 묶되 ★계측을 먼저 들여보내고, 그
+실측으로 수정의 방향을 정한다★.
+
+---
+
+## 1. 지금 코드가 하는 일 (전부 확인함)
+
+### 1.1 Commit 호출 지점
+
+`Commit()` 을 실제로 부르는 자리는 크레이트 전체에서 `raw_commit`(`dcomp_compositor.rs:1705`)
+하나다(예제 바이너리 제외). 그리로 들어오는 경로는 여섯이다.
+
+| # | 경로 | 함수 | 계측 | 스레드 |
+|---|---|---|---|---|
+| 1 | `end_frame` 안의 즉시 커밋 | `commit_device_locked` :2652 | O (`commit_ns`) | 렌더 |
+| 2 | 미뤄 둔 커밋 흘리기 | `flush_deferred_commit` :2634 -> `commit_device_guarded` :2676 -> 1 | O (같은 카운터) | 렌더/셸 |
+| 3 | **`begin_frame` 의 마감 선반출** | `commit_scheduler::flush_before_render` :270 -> `commit_device_ptr_locked` :1784 | **X** | **렌더** |
+| 4 | 스케줄러 워커 | `commit_scheduler::worker_loop` :167 -> `commit_device_ptr_locked` | **X** | 커밋 워커 |
+| 5 | 셸 즉시 커밋(폴백) | `commit_device_ptr` :1760 | **X** | 셸 |
+| 6 | 비디오 fast-path | `present_external_only` :2843 | **X** | 렌더 |
+
+★3 번이 문제의 그 호출이다★ -- `begin_frame` 이 매 프레임 부르고, `OUTCOMMIT` 의
+`early/scheduled` 가 0.65~0.81 이므로 커밋의 2/3~3/4 가 이 경로로 나간다. 그리고 계측이 없다.
+
+### 1.2 `begin_frame` 이 하는 일 (`dcomp_compositor.rs:3491-3577`)
+
+```text
+begin_frames += 1          (수만 센다. 시간은 안 잰다)
+close_external_batch()
+flush_deferred_commit()    -> 경로 2
+flush_before_render()      -> 경로 3   ★여기가 22ms 로 의심되는 자리★
+root SetOffsetX/Y          (값이 바뀔 때만)
+RemoveAllVisuals()
+frame_surfaces.clear()
+```
+
+WR 쪽 `compositor_begin_ms`(`vendor_local/webrender/src/renderer/mod.rs:1746-1753`)가 이 함수
+전체를 잰 값이다. 즉 22~24ms 는 위 다섯 줄 어딘가의 합이고, ★안을 쪼갠 적이 없다★.
+
+### 1.3 bind 가 하는 일 (`dcomp_compositor.rs:3156-3310`, Virtual arm)
+
+```text
+expand_transparent = !불투명 && dirty == valid          (IPWall 알파 슬라이스가 여기 해당)
+update_rect_v      = expand ? (타일 ∩ 서피스클립) : (타일 + dirty)
+BeginDraw(update_rect_v)   -> (AddRef 된 텍스처, 아틀라스 오프셋, desc)   [begin_ns]
+create_render_pbuffer_from_d3d_texture(텍스처, desc 크기)                 [pbuffer_ns]
+make_render_pbuffer_current(pbuffer)
+expand 면 scissor(update_offset, update 크기) 투명 클리어
+... WR 이 그린다 ...
+unbind: EndDraw                                                           [end_ns]
+        destroy_render_pbuffer(pbuffer)                                   [destroy_ns]
+        texture->Release()
+```
+
+세 가지가 **bind 마다** 생겼다 사라진다.
+
+1. DComp 가 `BeginDraw` 로 내주는 텍스처(아틀라스 슬롯일 수 있다)
+2. 그 텍스처를 감싼 EGL pbuffer (`third_party/surfman/src/platform/windows/angle/device.rs:589-624`)
+3. 그 pbuffer 의 깊이·스텐실 -- 컨텍스트 설정이 `ALPHA|DEPTH|STENCIL`
+   (`components/shared/paint/rendering_context.rs:852-854`)이라 ANGLE 이 같은 크기로 함께
+   만드는 것으로 보인다(ANGLE 내부는 확인하지 않았다)
+
+★그리고 `update_rect_v` 가 프레임마다 달라진다★ -- `expand_transparent` 경로의 서피스 클립은
+직전 `add_surface` 의 `clip_rect`(`entry.last_placement`, :3052)이고, 그 값은 WR 쪽에서
+"device_clip ∩ 모든 타일 valid_rect 의 바운딩 유니온"이라 글자가 움직이면 같이 움직인다.
+크기가 달라지면 DComp 는 다른 슬롯·다른 크기의 텍스처를 내주고, 그러면 pbuffer 와 깊이·스텐실도
+매번 새 크기로 만들어진다.
+
+### 1.4 이미 있는 선례 -- SwapChain 쪽은 이미 재사용한다
+
+`SurfaceStorage::SwapChain` 은 `frame_pbuffer: Option<FramePbuffer>`(:666)를 들고 있고,
+`if sc.frame_pbuffer.is_none()` 일 때만 만든다(:3077). 해제는 `release_frame_pbuffer`(:607)
+하나로 모아 두고 파기 지점마다 부른다(:2896 release_all, :4093 end_frame, :4185 regen,
+:4239 demote, :4459 destroy_surface).
+
+★Virtual 쪽에만 그 구조가 없다.★ 이 스펙의 W1 은 그 선례를 Virtual 에 그대로 옮기는 일이다.
+
+---
+
+## 2. 이 스펙이 답해야 할 질문
+
+| Q | 답하는 계측 | 판정 |
+|---|---|---|
+| Q1 | 22ms 를 먹는 것이 정말 `flush_before_render` 의 `Commit()` 인가 | `COMMITSITE br_max` 와 `DCOMPBIND bf_early_ms_max` | 둘 다 22 근처면 확정 |
+| Q2 | 아니라면 `begin_frame` 의 어느 줄인가 | `bf_deferred` / `bf_early` / `bf_removeall` / `bf_total` | 합과 total 의 차이가 남은 몫 |
+| Q3 | 정체가 느린 커밋 한 번인가 느린 커밋 여럿인가 | `*_max` 와 `*_over` | max 만 크면 정체, over 가 크면 부하 |
+| Q4 | 갱신 렉트가 실제로 프레임마다 달라지는가 (A1) | `update_sizes`, `tex_sizes`, `tex_changed/binds` | IPWall 에서 크고 프로브에서 1 이면 A1 성립 |
+| Q5 | GPU 메모리 톱니가 그 할당으로 설명되는가 | `alloc_mb` | `GPUMEM` 진폭과 자릿수가 맞는가 |
+| Q6 | 재사용이 실제로 먹히는가 | `tex_reused/binds` | 수정 후 binds 에 근접해야 한다 |
+
+Q4 가 "아니오"면 W1 은 취소한다. 그래서 ★계측이 먼저다★.
+
+---
+
+## 3. W13-C: 커밋 계측
+
+### 3.1 호출 지점마다 따로 센다
+
+`raw_commit` 에 호출 지점을 받는 인자를 추가한다. 여기가 유일한 통로이므로 ★새 커밋 지점이
+생겨도 계측을 빠뜨릴 수 없다★ -- 이 파일이 이미 같은 이유로 디바이스 가드를 이 함수 쪽에 모았다.
+
+```rust
+/// Commit 을 부른 자리. `COMMITSITE` 한 줄이 이것으로 갈린다.
+///
+/// ★`before_render` 하나만 계측이 없었고 하필 그것이 전체의 2/3 였다★ -- OUTCOMMIT
+/// early/scheduled 0.65~0.81. 그래서 `commit_ms` 가 모든 실행에서 0.0 이었고, 22ms 정체의
+/// 정체가 소거법 추정으로 남았다.
+#[derive(Clone, Copy)]
+pub(crate) enum CommitSite {
+    EndFrame,     // end_frame 즉시 커밋
+    Deferred,     // flush_deferred_commit
+    BeforeRender, // begin_frame -> commit_scheduler::flush_before_render
+    Scheduler,    // 커밋 워커
+    Direct,       // 셸 즉시 커밋(폴백)
+    External,     // 비디오 fast-path
+}
+```
+
+바꾸는 시그니처는 넷이다.
+
+- `unsafe fn raw_commit(device, site)`
+- `fn commit_device_locked(&mut self, device, site)` -- `end_frame` 은 `EndFrame`,
+  `commit_device_guarded` 는 호출자가 넘긴 값을 그대로 전달(`Deferred`)
+- `pub fn commit_device_ptr_locked(device, site)` -- `flush_before_render` 는 `BeforeRender`,
+  `worker_loop` 은 `Scheduler`
+- `pub fn commit_device_ptr(device)` -- 셸 ABI 를 지키려고 시그니처는 두고 내부에서 `Direct` 고정
+
+### 3.2 누적기
+
+`raw_commit` 안에서만 쓰는 전역 배열이다. `self` 가 없는 경로(:1768, :1785)가 있으므로
+컴포지터 필드에 둘 수 없다.
+
+```rust
+struct CommitSlot {
+    n: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    over_n: AtomicU64, // SLOW_COMMIT_MS 를 넘긴 횟수
+}
+static COMMIT_SITES: [CommitSlot; 6] = [...];
+```
+
+`*DCOMP_BIND_PROF` 가 꺼져 있으면 `Instant::now` 를 부르지 않는다(이 파일의 모든 계측과 같은 규약).
+
+★로그는 임계구역 안에서 절대 찍지 않는다.★ 이 파일이 세 번 고쳐 세운 불변식이다 -- 가드 안에서
+하는 일은 `Commit()` 하나뿐이고 그 상한을 `lock_wait_painter_us_max` 가 감시한다.
+`fetch_add`/`fetch_max` 는 락이 없으므로 이 불변식을 깨지 않는다.
+
+### 3.3 느린 커밋 문턱
+
+디버그 환경변수를 하나 추가한다(`components/config/debug_env.rs`, `cache_index: 21`,
+`ALL` 끝에 등록).
+
+```text
+SERVO_DCOMP_SLOW_COMMIT_MS   Kind::Int   기본 8
+```
+
+창 안에서 이 값을 넘긴 커밋의 수가 `over` 다. ★`max` 하나로는 "22ms 짜리 한 번"과 "22ms 짜리
+60 번"이 구분되지 않는다★ -- 앞은 정체고 뒤는 구조적 부하라 고칠 방법이 정반대다.
+
+### 3.4 한 줄 내기
+
+★방출자는 하나다.★ 카운터가 전역인데 페인터 넷이 각자 1 초 창으로 비우면 한 줄이 실제로는
+0.25 초 조각이 된다 -- `OUTCOMMIT` 이 이미 같은 이유로 방출자를 스케줄러 스레드로 옮긴 전례가
+있다(Fix round 1, Ruling 16).
+
+```rust
+/// COMMITSITE 를 낼 컴포지터 하나를 선착순으로 정한다. 0 = 미정.
+static COMMITSITE_EMITTER: AtomicUsize = AtomicUsize::new(0);
+```
+
+`maybe_emit_bind_profile` 안에서 자기 디바이스 포인터로 `compare_exchange(0, me)` 를 시도하고,
+성공했거나 이미 자기면 그 창에 한 줄을 더 낸다. `release_all` 에서 자기 주소면 0 으로 되돌린다.
+
+★`OUTCOMMIT` 쪽이 아니라 `DCOMPBIND` 쪽에 붙이는 이유★: 스케줄러 스레드는
+`gfx_present_align_commit_pct` 가 꺼져 있으면 아예 뜨지 않는다. 그런데 A/B 1 순위 arm 이
+바로 `-CommitAlign -1` 이고, 그 실행에서 커밋 시간을 못 보면 arm 자체가 무의미해진다.
+
+로그 형식(한 줄, 줄바꿈은 가독성용):
+
+```text
+COMMITSITE window_ms=1002 slow_ms=8
+  ef n=0   ms=0.0   max=0.00  over=0
+  df n=2   ms=0.1   max=0.05  over=0
+  br n=252 ms=481.0 max=22.91 over=63
+  sc n=56  ms=1.2   max=0.31  over=0
+  di n=0   ms=0.0   max=0.00  over=0
+  ex n=0   ms=0.0   max=0.00  over=0
+```
+
+### 3.5 `begin_frame` 쪼개기
+
+```rust
+bf_total_ns / bf_total_ns_max         // begin_frame 전체(= WR 의 compositor_begin_ms)
+bf_deferred_ns / bf_deferred_ns_max   // flush_deferred_commit
+bf_early_ns / bf_early_ns_max         // flush_before_render        ★주범 후보★
+bf_removeall_ns / bf_removeall_ns_max // RemoveAllVisuals
+```
+
+`DCOMPBIND` 줄에 붙인다. ★합과 total 의 차이를 남겨 둔다★ -- 셋의 합이 total 에 못 미치면
+`SetOffsetX/Y` 나 `close_external_batch` 같은 남은 줄이 범인이고, 그건 아무도 의심하지 않은
+자리다. 계측이 "남은 몫"을 보여주지 않으면 그 가능성은 영영 보이지 않는다.
+
+`bf_early_ns` 와 `COMMITSITE br_*` 는 ★같은 호출을 두 겹으로 잰다★. 의도한 것이다 -- 둘이
+갈라지면 `flush_before_render` 의 큐 락이나 `retain` 이 범인이고, 같이 크면 `Commit()` 자체다.
+
+---
+
+## 4. W13-B: BeginDraw·갱신 렉트 계측
+
+### 4.1 분포의 꼬리를 남긴다
+
+지금은 `begin_ns`, `pbuffer_ns`, `end_ns`, `destroy_ns` 가 합계뿐이다. 각각 `_max` 를 붙인다.
+이유는 3.3 과 같다.
+
+### 4.2 갱신 렉트와 텍스처 크기
+
+bind 마다 이미 손에 있는 값이다(`update_rect_v`, `desc.Width/Height`). 추가로 센다.
+
+```rust
+update_px_max: u64,    // 갱신 요청 면적 최대
+update_sizes: SizeSet, // 창 안에서 서로 다른 (w,h) 의 수
+tex_px_max: u64,
+tex_sizes: SizeSet,
+alloc_px: u64,         // 새로 만든 pbuffer 들의 텍스처 면적 합 -> alloc_mb 로 환산
+```
+
+`SizeSet` 은 ★할당 없는 고정 배열★이다 -- 최대 16 쌍과 넘침 카운터. 타일마다 지나가는 자리에
+`HashSet` 을 두지 않는다.
+
+### 4.3 텍스처 동일성 -- 재사용이 먹힐지 미리 아는 값
+
+`SurfaceEntry` 에 진단 전용 필드를 하나 둔다.
+
+```rust
+/// 직전 bind 에서 BeginDraw 가 돌려준 텍스처 주소. ★절대 역참조하지 않는다★ --
+/// 같은 텍스처가 다시 오는지만 세는 값이고, 그 판정이 W1 재사용의 적중률 예보다.
+/// (재사용 구현은 이 주소를 믿지 않고 자기 AddRef 를 들고 비교한다. 5.2 절)
+last_begin_texture: usize,
+```
+
+`tex_reused` / `tex_changed` 를 센다. ★IPWall 에서 `tex_changed` 가 `binds` 에 가깝게 나오면
+A1 이 성립하고, 동시에 "pbuffer 재사용만으로는 IPWall 이 안 고쳐진다"는 것도 같이 증명된다★ --
+재사용은 같은 텍스처가 다시 와야 적중하기 때문이다. 그 경우 6 절의 양자화가 필수가 된다.
+
+### 4.4 `DCOMPBIND` 추가분
+
+```text
+... begin_ms=7.9 begin_ms_max=0.31 pbuffer_ms=20.4 pbuffer_ms_max=0.58
+    enddraw_ms=1.1 enddraw_ms_max=0.09 teardown_ms=3.2 teardown_ms_max=0.21
+    update_px_max=12441600 update_sizes=47 tex_px_max=12582912 tex_sizes=12
+    tex_reused=0 tex_changed=60 alloc_mb=712.4
+    begin_frame_ms=1283.0 begin_frame_ms_max=23.4
+    bf_deferred_ms=0.1 bf_early_ms=1279.0 bf_early_ms_max=22.9
+    bf_removeall_ms=2.1 bf_removeall_ms_max=0.04
+```
+
+---
+
+## 5. W1-A: 서피스별 pbuffer 재사용
+
+### 5.1 구조
+
+`SwapChain` 의 `frame_pbuffer` 를 Virtual 에 옮긴다. 두는 자리는 `SurfaceEntry` 다 --
+`frame_coverage` 와 같이 "Virtual 전용 부기"로 문서화한다.
+
+```rust
+/// Virtual bind 가 만든 pbuffer 를 서피스에 매달아 둔다. ★같은 텍스처가 다시 오면
+/// 그대로 쓴다★ -- 안 그러면 bind 마다 EGL pbuffer 와, 컨텍스트 설정이 DEPTH|STENCIL
+/// 이므로 그만한 깊이·스텐실까지 새로 만들고 지운다. 초당 60~120 회다.
+cached_pbuffer: Option<CachedPbuffer>,
+
+struct CachedPbuffer {
+    /// BeginDraw 가 돌려준 텍스처. ★이 구조체가 AddRef 하나를 들고 있다★ -- 그래야
+    /// 주소가 재활용되지 않아 아래 동일성 비교가 성립한다(5.2 절).
+    texture: *mut ID3D11Texture2D,
+    size: (u32, u32),
+    pbuffer: usize,
+}
+```
+
+bind(Virtual arm)의 BeginDraw 직후:
+
+```text
+같은가 = 캐시가 있고 && 캐시.texture == 이번 texture && 캐시.size == (desc.W, desc.H)
+
+같으면: 이번 BeginDraw 가 준 AddRef 를 즉시 Release 한다(캐시가 이미 하나 들고 있다).
+        캐시의 pbuffer 를 그대로 make_current 한다.
+        tex_reused += 1
+
+다르면: release_cached_pbuffer(rc, entry)   // 옛 pbuffer destroy + 옛 texture Release
+        pbuffer 를 새로 만들고 캐시에 넣는다(AddRef 는 이번 BeginDraw 것을 그대로 보유).
+        tex_changed += 1, alloc_px += desc.W * desc.H
+```
+
+unbind 는 `EndDraw` 만 한다. `destroy_render_pbuffer` 와 `texture->Release()` 를 **뺀다** --
+소유가 캐시로 옮겨갔다. `BoundTile.pbuffer`/`texture` 는 readback 좌표용으로 남기되 비소유로
+문서화한다. `drop_bound_without_enddraw` 도 같은 이유로 해제를 뺀다(그 경로의 호출자가
+`release_cached_pbuffer` 를 책임진다).
+
+### 5.2 안전성 논증
+
+**주장: 포인터 동일성 비교는 건전하다.**
+
+1. 캐시가 자기 AddRef 를 들고 있다 -> 그 COM 객체는 캐시가 사는 동안 해제되지 않는다 ->
+   그 주소가 다른 텍스처에 재배정될 수 없다 -> ★주소가 같으면 객체가 같다★.
+2. 캐시된 pbuffer 는 ★그 텍스처를 BeginDraw 가 방금 돌려준 그 bind 안에서만★ current 가 된다.
+   즉 쓰는 순간 그 텍스처는 DComp 가 지금 막 내준 유효한 것이다.
+3. 크기가 달라지면 캐시를 버린다. 아틀라스 오프셋(`update_offset`)은 매 bind 새로 받아 쓰므로
+   슬롯이 바뀌어도 좌표 계산은 그대로 맞는다.
+
+**받아들이는 대가:** AddRef 를 하나 더 들고 있으므로 DComp 아틀라스 할당이 서피스마다 하나씩
+오래 산다. 상한은 서피스당 하나이고, 크기 변경·타일 파기·서피스 파기에서 즉시 놓는다.
+
+**실기로 확인해야 하는 것:** DComp 가 `EndDraw` 뒤에 그 텍스처의 **내용**을 무효화할 수 있는가.
+우리는 프레임을 넘겨 내용을 읽지 않는다(WR 이 dirty 를 다시 그리고, expand 경로는 나머지를
+투명으로 민다). 그래도 `clip=all`/`clip=none` 양쪽에서 육안 + `SERVO_DCOMP_READBACK` 으로 본다.
+
+**알려진 미묘한 점(변화 아님):** 지금도 `destroy_render_pbuffer` 는 current 인 서피스를 지우고
+EGL 은 파기를 유예하므로, unbind 뒤 컨텍스트의 current draw surface 는 ★이미 좀비★다. 재사용
+후에는 그 자리가 살아 있는 pbuffer 가 된다. unbind 와 다음 bind 사이에 WR 이 거는 GL 은
+`end_frame` 의 `gl().flush()` 뿐이고 그린 적은 없다. 즉 위험의 성격이 바뀌지는 않는다 --
+그래도 리뷰 항목으로 남긴다.
+
+### 5.3 해제 지점 (빠뜨리면 누수다)
+
+`release_frame_pbuffer` 의 호출부를 그대로 거울삼아 `release_cached_pbuffer` 를 건다.
+
+| 지점 | 줄 | 왜 |
+|---|---|---|
+| `destroy_surface` | :4442 (remove 직전) | 서피스가 사라진다 |
+| `release_all` | :2890 | deinit/Drop |
+| `destroy_tile` | :3017 | 그 타일의 DComp 할당이 사라진다 |
+| Virtual -> SwapChain 승격 | storage 교체 지점 | Virtual 캐시가 주인을 잃는다 |
+| SwapChain -> Virtual 강등 | :4239 부근 | 캐시 상태를 깨끗이 두고 시작한다 |
+| 가상 서피스 리사이즈/재생성 | regen 경로 | 텍스처 전부 무효 |
+| bind 에서 크기·텍스처가 달라질 때 | 5.1 절 | 본문 |
+
+구현 과제의 검증 단계는 ★`grep -n "release_frame_pbuffer"` 가 내는 줄 전부에 대해 Virtual
+대응이 필요한지 한 줄씩 판정★하는 것이다. "찾아봤다"가 아니라 그 표를 남긴다.
+
+---
+
+## 6. W1-B: 갱신 렉트 양자화 (pref, 기본 off)
+
+### 6.1 왜 필요한가
+
+4.3 절이 `tex_changed` 가 `binds` 에 가깝다고 내면 재사용은 적중률 0 이다. 텍스처가 매번
+달라지는 이유는 갱신 렉트가 매번 달라지기 때문이고, 그 뿌리는 서피스 클립이 글자를 따라
+움직이는 것이다. ★재사용과 고정은 택일이 아니라 짝이다★ -- 분석서 W1 이 둘을 "또는"으로 적은
+것은 정정한다.
+
+### 6.2 설계
+
+새 pref:
+
+```rust
+/// `expand_transparent` 경로의 BeginDraw 갱신 렉트를 고정 격자로 키운다.
+/// `0` = 끔(기본, 오늘 동작). `>0` = 그 픽셀 배수로 바깥으로 키운다. `-1` = 타일 전체.
+pub gfx_dcomp_update_quantum_px: i64,
+```
+
+적용은 ★`expand_transparent` 가 참인 가지에서만★ 한다. 그 가지의 조건이
+`!불투명 && dirty == valid` 이므로 ★그 타일에 보존해야 할 콘텐츠가 애초에 없다★ -- 전면 재도색
+슬라이스다. 그래서 렉트를 키우고 그만큼 투명으로 미는 것이 안전하다. 비확장 가지는 부분
+갱신이라 키우면 기존 내용을 지운다. 절대 건드리지 않는다.
+
+```text
+확장 렉트 = tile_visible_virtual_rect(...)
+양자화    = 바깥으로 q 배수 정렬
+결과      = 양자화 ∩ tile_rect        (타일 밖으로는 절대 나가지 않는다)
+q == -1   -> tile_rect
+```
+
+`dirty ⊆ tile` 이고 밖으로만 키우므로 ★dirty 포함은 항상 유지된다★. 투명 클리어는 이미
+`update_rect_v` 크기로 시저링되어 있어(:3299-3306) 자동으로 따라 커진다. `origin` 산식
+(`update_offset - r_min`, :3366)도 확장 렉트를 전제로 쓰여 있어 그대로 맞는다.
+
+### 6.3 `q = -1`(타일 전체)이 특별한 이유
+
+그렇게 하면 갱신 렉트가 ★타일 크기로 고정★된다. 프레임마다 같다. 그러면
+
+- DComp 가 같은 텍스처를 돌려줄 공산이 크다 -> 5 절 재사용이 적중한다
+- 타일 전체 갱신 비율이 100% 가 된다 -> ★그것이 정확히 프로브와 `clip=all` 의 모습이고, 둘 다
+  깨끗하다★ (분석서 2-1절: 타일 전체 갱신 100%, 값 결함 0.29 / 0.35)
+
+대가는 EndDraw 가 커밋하는 면적과 DWM 합성량이 는다는 것이다. 프로브가 그 부하로 깨끗하므로
+감당 가능한 것으로 본다. 그래도 기본값은 `0`(끔)이고, A/B 로 정한다.
+
+### 6.4 런처
+
+```text
+-DcompUpdateQuantum <px>   -> --pref gfx_dcomp_update_quantum_px=<px>
+```
+
+`-DComp surface` 가 아니면 의미가 없으므로 그 조합에서만 허용하고 아니면 런처가 거부한다
+(`-DcompParallelCommit` 과 같은 방식, `run_wall_dist.ps1:648`).
+
+---
+
+## 7. 범위 밖으로 두는 것과 그 이유
+
+**깊이·스텐실 없는 pbuffer 설정.** 컨텍스트 디스크립터가 `DEPTH|STENCIL` 이라 pbuffer 마다
+깊이·스텐실이 붙는다. 이것을 떼면 할당이 절반 이하가 된다. 그러나 (a) EGL 은 서피스 config 가
+컨텍스트 config 와 호환이어야 하는데 ANGLE 이 ancillary 만 다른 config 를 받아줄지 확인하지
+않았고, (b) WR 이 네이티브 서피스 타깃에 깊이를 쓰는지도 확인하지 않았다. 무엇보다 ★5 절과
+6 절이 할당을 초당 60 회에서 서피스당 1 회로 줄이므로, 깊이 버퍼는 "반복 비용"에서 "상주
+메모리"로 성격이 바뀐다★ -- 급한 문제가 아니게 된다. 후속으로 남긴다.
+
+**`-TileSize` 축소 A/B.** 코드 변경 없이 지금 빌드로 가능하다. 계측이 들어간 뒤 먼저 돌려 보는
+공짜 실험이지만 이 스펙의 구현 대상은 아니다.
+
+**W14 / W15 / W16, 프론트 P-clip.** 다른 결함이거나 다른 레이어다.
+
+---
+
+## 8. 측정 계획
+
+모두 `-DComp surface -NumaNode 1 -DcompBindProf -WrSlowMs 20`, 120 초, divisor 15.
+비교 기준은 분석서 2-1절의 같은 조건 표다.
+
+| 단계 | 실행 | 먼저 볼 것 |
+|---|---|---|
+| M0 | 계측만 들어간 빌드, IPWall | `br max`가 22 근처, `bf_early_ms_max`가 22 근처 -> Q1 확정. 아니면 `bf_*` 분해로 Q2 |
+| M1 | 같은 빌드, 프로브 | 같은 지표가 1ms 아래여야 한다(대조군) |
+| M2 | 같은 빌드, `ticker_slice_probe.html` 의 `clip=none` / `clip=all` | `tex_changed` 가 `none` 에서 크고 `all` 에서 0 에 가까운가 -> Q4 |
+| M3 | 5 절 재사용만, `clip=none` | `tex_reused` 가 거의 0 일 것으로 예상한다(정직한 예측) |
+| M4 | 5 절 + 6 절 `-DcompUpdateQuantum -1`, `clip=none` | `tex_reused`가 `binds`에 근접, `alloc_mb` 0 근처, `GPUMEM` 평탄, `br max` 붕괴 |
+| M5 | M4 설정으로 라이브 IPWall | 분석서 9 절 수용 기준 |
+
+★M3 이 "효과 없음"으로 나오는 것은 실패가 아니라 예측대로다.★ 그것을 먼저 적어 두지 않으면
+M3 에서 작업을 접게 된다.
+
+**반증 조건.** M4 에서 `alloc_mb` 가 0 근처이고 `tex_reused` 가 `binds` 에 근접하는데도
+`br max` 가 22ms 로 남으면 A1 은 틀렸고, 정체는 할당이 아니라 DComp/DWM 프로세스 단위의 다른
+무엇이다(분석서 2-1절의 "같은 초에 스케줄러 깨어남도 22ms 늦었다"가 그쪽을 가리킨다). 그 경우
+이 스펙의 5·6 절은 GPU 메모리 톱니를 없앤 성과로 남기고, 저더 조사는 `-CommitAlign` A/B 로
+옮긴다.
+
+**수용 기준**은 분석서 9 절을 그대로 쓴다(값 결함 0.03/페인터·초 이하, `present_d0`
+0.1/출력·초 이하, 10ms 넘는 렌더 0.05/페인터·초 이하, 16.7ms 넘는 패스가 있는 창 113 중 1 이하,
+`TICKCOMMIT` 산포 3ms 이하). 여기에 둘을 더한다.
+
+| 추가 항목 | 기준 |
+|---|---|
+| `tex_reused / binds` | 0.95 이상 (M4 설정) |
+| `alloc_mb` | 10 /페인터·초 이하 (M4 설정) |
+
+---
+
+## 9. 작업 분할
+
+TDD 가능한 단위로 가른다. COM 을 부르는 자리는 단위 테스트가 안 되므로 ★판정 규칙만 순수
+함수로 떼어내 거기에 테스트를 건다★.
+
+| # | 내용 | 파일 | 테스트 |
+|---|---|---|---|
+| T1 | `CommitSite` + `raw_commit` 인자화 + 전역 누적기 + `SERVO_DCOMP_SLOW_COMMIT_MS` | `dcomp_compositor.rs`, `commit_scheduler.rs`, `debug_env.rs` | 누적·비우기 로직 단위 테스트 |
+| T2 | 방출자 선출 + `COMMITSITE` 한 줄 | `dcomp_compositor.rs` | 선출 함수 단위 테스트(둘이 다투면 하나만 이긴다) |
+| T3 | `begin_frame` 4 분할 계측 | `dcomp_compositor.rs` | 계측이라 없음. `bf_total >= 합` 을 debug_assert 로 |
+| T4 | BeginDraw `_max` + `SizeSet` + `tex_reused/changed` + `alloc_mb` | `dcomp_compositor.rs` | `SizeSet` 순수 단위 테스트(중복·넘침) |
+| T5 | **M0~M2 실행.** Q1·Q4 판정 | -- | 로그 |
+| T6 | `CachedPbuffer` + 재사용 판정 + 해제 지점 표 | `dcomp_compositor.rs` | `should_reuse(cache, tex, size)` 순수 함수 |
+| T7 | `gfx_dcomp_update_quantum_px` + 양자화 함수 + 런처 플래그 | `prefs.rs`, `dcomp_compositor.rs`, `run_wall_dist.ps1` | 양자화 순수 함수: dirty 포함 유지, 타일 밖으로 안 나감, q=-1 이면 타일, q=0 이면 불변 |
+| T8 | **M3~M5 실행.** 수용 기준 판정 | -- | 로그 + 육안 |
+
+T5 가 ★게이트★다. Q4 가 "아니오"면 T6~T8 을 취소한다.
+
+---
+
+## 10. 미확인으로 남는 것
+
+- DComp 가 `EndDraw` 뒤 텍스처 내용을 보존하는지 (문서화되지 않음. M3 의 육안·readback 으로만 판정)
+- ANGLE 이 pbuffer 마다 깊이·스텐실을 실제로 만드는지 (추정. `alloc_mb` 와 `GPUMEM` 의 비율로 간접 확인)
+- 양자화가 DWM 합성 비용을 얼마나 올리는지 (프로브가 그 부하로 깨끗하다는 것이 유일한 근거)
+- `q=-1` 에서 서피스당 상주 메모리 (타일 5760x2160 기준 RGBA 50MB + 깊이·스텐실 50MB 추정)
