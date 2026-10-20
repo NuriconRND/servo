@@ -430,6 +430,26 @@ pub struct Preferences {
     /// painter 에서 **왕복**이 되므로 남는 것은 패스마다 OS 스레드 넷을 새로 만드는
     /// 비용뿐이다. 켜지 않으면 Commit 은 이미 존재하는 그 페인터 스레드 안에서 돈다.
     pub gfx_dcomp_parallel_commit: bool,
+    /// `expand_transparent` 경로의 `BeginDraw` 갱신 렉트를 고정 격자로 키운다. 기본 `0`(끔).
+    ///
+    /// `0` = 오늘 동작. `>0` = 타일 좌상단을 원점으로 그 픽셀 배수까지 **바깥으로** 넓힌다.
+    /// `-1` = 타일 전체.
+    ///
+    /// ★무엇을 사려는 것인가★: 비용은 우리가 만드는 pbuffer 의 **양**이 아니라 DComp 가
+    /// 내주는 텍스처 **크기의 가짓수**를 따라간다(2026-10-20 실측, 스펙 8-1/8-2 절).
+    /// 같은 일(bind 하나, 새 텍스처 하나)을 실어 나른 커밋이 텍스처 크기가 한 가지인
+    /// 페이지에서 0.39ms, 여러 가지인 페이지에서 3.73~3.81ms 였다. 한 초 안에서도
+    /// 크기 가짓수 7.4 / 11.7 / 22.4 에 커밋 86 / 324 / 681 ms/s 로 따라붙는다. 갱신 렉트가
+    /// 글자를 따라 매 프레임 달라지는 것이 그 가짓수의 뿌리이므로, 격자에 붙여 고정한다.
+    ///
+    /// ★`expand_transparent` 가지에서만 적용한다.★ 그 가지의 조건이 `!불투명 &&
+    /// dirty == valid` 라 그 타일에 보존해야 할 콘텐츠가 애초에 없다 -- 전면 재도색
+    /// 슬라이스다. 비확장 가지는 부분 갱신이므로 렉트를 키우면 기존 내용을 지운다.
+    ///
+    /// 대가는 `EndDraw` 가 커밋하는 면적과 DWM 합성량이 는다는 것이다. 프로브가 매 프레임
+    /// 타일 전체를 갱신하면서도 깨끗하므로 감당 가능한 것으로 본다. 그래도 기본은 끔이고
+    /// A/B 로 정한다.
+    pub gfx_dcomp_update_quantum_px: i64,
     /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
     ///
     /// ★가르려는 것★: 패스 비용을 한 타일이 몰아서 낸다. 큰 캔버스 + DComp off 실측에서
@@ -1235,6 +1255,7 @@ impl Preferences {
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
+            gfx_dcomp_update_quantum_px: 0,
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,

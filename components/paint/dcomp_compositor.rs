@@ -288,6 +288,58 @@ fn tile_virtual_rect(
 /// off-screen 내부 타일 낭비뿐, 정확성엔 안전(합성되지 않는 영역까지 투명으로 커밋할 뿐).
 /// scale=1 가정(add_surface와 동일): device 좌표 D → 가상좌표 D − transform_offset + virtual_offset
 /// (visual offset = transform_offset − virtual_offset의 역변환). transform_offset은 반올림.
+/// `gfx_dcomp_update_quantum_px`. 타일마다 프레임마다 묻는 자리라 한 번만 읽는다.
+static UPDATE_QUANTUM_PX: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| pref!(gfx_dcomp_update_quantum_px));
+
+/// `expand_transparent` 갱신 렉트를 고정 격자에 붙인다. pref 주석이 왜인지를 들고 있다.
+///
+/// ★격자의 원점은 타일 좌상단이다.★ 가상 좌표 원점을 쓰면 타일마다 격자가 어긋나 크기가
+/// 다시 여러 가지가 되고, 그러면 이 함수가 사려는 것(텍스처 크기 한 가지)을 못 산다.
+///
+/// 불변식 셋을 지킨다 -- 아래 테스트가 그대로 검사한다:
+/// 1. 결과는 입력을 포함한다(바깥으로만 넓힌다). `dirty ⊆ 입력` 이므로 `dirty ⊆ 결과` 다.
+/// 2. 결과는 타일을 벗어나지 않는다. 벗어나면 다른 타일의 커밋된 픽셀을 건드린다.
+/// 3. ★빈 렉트는 빈 채로 둔다★ -- 클립이 이 타일과 겹치지 않으면 오늘은 아무것도 그리지
+///    않는다. 그것을 타일 전체로 키우면 안 그리던 자리를 투명으로 미는 **동작 변경**이다.
+fn quantize_update_rect(
+    rect: DeviceIntRect,
+    tile_rect: DeviceIntRect,
+    quantum: i64,
+) -> DeviceIntRect {
+    if quantum == 0 || rect.is_empty() {
+        return rect;
+    }
+    if quantum < 0 {
+        return tile_rect;
+    }
+    let q = quantum.clamp(1, i32::MAX as i64) as i32;
+    // ★격자에 맞추는 것은 위치가 아니라 **크기**다.★ 양변을 격자로 밀어 붙이면 같은 폭의
+    // 띠도 위상에 따라 칸 수가 하나 달라진다 -- 폭 300 짜리가 격자 128 에서 384 도 되고
+    // 512 도 된다. 그러면 크기가 두 가지로 남고, 이 pref 가 줄이려는 것이 정확히 그
+    // 가짓수다. 크기를 먼저 올림해 고정하고, 시작점은 격자에 얹되 아래 두 사정으로만 민다.
+    // ★DComp 가 할당을 가르는 것은 크기이지 정렬이 아니므로, 양보할 것은 정렬 쪽이다.★
+    let axis = |lo: i32, hi: i32, t_lo: i32, t_hi: i32| -> (i32, i32) {
+        let span = (t_hi - t_lo).max(0);
+        let want = hi.saturating_sub(lo);
+        let size = (want.saturating_add(q - 1) / q).saturating_mul(q).min(span);
+        // 시작점을 격자에 얹되, ★덮어야 할 끝을 놓치지 않을 만큼만 오른쪽으로 당긴다.★
+        // 바닥 내림만 하면 고정된 크기로는 최대 q-1 만큼 모자란다 -- 폭 300 짜리 띠가
+        // 격자 128 에서 350..650 에 있으면 256..640 이 되어 끝 10px 을 잃는다.
+        let mut start = (t_lo + (lo.saturating_sub(t_lo)).div_euclid(q) * q).max(hi - size);
+        // 오른쪽 끝을 넘으면 ★크기를 줄이지 말고 왼쪽으로 민다★ -- 줄이면 가장자리에서만
+        // 또 다른 크기가 생기고, 가장자리가 바로 저더가 보이던 자리다.
+        if start.saturating_add(size) > t_hi {
+            start = t_hi - size;
+        }
+        let start = start.max(t_lo);
+        (start, start + size)
+    };
+    let (x0, x1) = axis(rect.min.x, rect.max.x, tile_rect.min.x, tile_rect.max.x);
+    let (y0, y1) = axis(rect.min.y, rect.max.y, tile_rect.min.y, tile_rect.max.y);
+    DeviceIntRect::new(DeviceIntPoint::new(x0, y0), DeviceIntPoint::new(x1, y1))
+}
+
 fn tile_visible_virtual_rect(
     tile_rect: DeviceIntRect,
     clip_device: Option<DeviceIntRect>,
@@ -3854,11 +3906,18 @@ impl Compositor for DCompNativeCompositor {
                 // 절대 지우지 않는다(전체 재도색 슬라이스에만 적용). 불투명/스왑체인 경로 무영향.
                 let expand_transparent = !entry_is_opaque && dirty_rect == valid_rect;
                 let update_rect_v = if expand_transparent {
-                    tile_visible_virtual_rect(
+                    // 확장 렉트를 격자에 붙인다(`gfx_dcomp_update_quantum_px`, 기본 끔).
+                    // 투명 클리어는 이미 `update_rect_v` 크기로 시저링되어 있고(아래),
+                    // `origin` 산식도 확장 렉트를 전제로 쓰여 있어 둘 다 그대로 따라온다.
+                    quantize_update_rect(
+                        tile_visible_virtual_rect(
+                            tile_rect,
+                            entry_clip,
+                            entry_transform_offset,
+                            entry_virtual_offset,
+                        ),
                         tile_rect,
-                        entry_clip,
-                        entry_transform_offset,
-                        entry_virtual_offset,
+                        *UPDATE_QUANTUM_PX,
                     )
                 } else {
                     // 기존: 타일 rect를 타일-로컬 dirty로 오프셋한 가상 절대좌표 렉트.
@@ -5592,6 +5651,123 @@ mod commit_probe_tests {
         let slots = work_slots(2);
         assert!(find_device_work(&slots, 0).is_none());
         assert!(find_device_work(&slots, 0x1000).is_some());
+    }
+
+    /// 타일은 가상 좌표 어딘가에 있다 -- 격자 원점이 타일 좌상단이라는 것을 검사하려면
+    /// 원점이 0 이 아니어야 한다(실제 `virtual_offset` 은 16384 근처다).
+    fn tile() -> DeviceIntRect {
+        DeviceIntRect::new(
+            DeviceIntPoint::new(16_390, 16_395),
+            DeviceIntPoint::new(16_390 + 1024, 16_395 + 512),
+        )
+    }
+
+    fn band(x0: i32, y0: i32, x1: i32, y1: i32) -> DeviceIntRect {
+        let t = tile();
+        DeviceIntRect::new(
+            DeviceIntPoint::new(t.min.x + x0, t.min.y + y0),
+            DeviceIntPoint::new(t.min.x + x1, t.min.y + y1),
+        )
+    }
+
+    /// 꺼져 있으면(기본) 한 픽셀도 달라지지 않는다.
+    #[test]
+    fn quantum_zero_is_todays_behaviour() {
+        let r = band(13, 7, 400, 93);
+        assert_eq!(quantize_update_rect(r, tile(), 0), r);
+    }
+
+    /// `-1` 은 타일 전체다 -- `clip=all` 이 만들던 모양이고, 텍스처 크기를 한 가지로 만든다.
+    #[test]
+    fn quantum_minus_one_is_the_whole_tile() {
+        assert_eq!(
+            quantize_update_rect(band(13, 7, 400, 93), tile(), -1),
+            tile()
+        );
+    }
+
+    /// ★바깥으로만 넓힌다.★ `dirty ⊆ 입력` 이므로 이것이 dirty 포함을 보장한다.
+    #[test]
+    fn quantising_only_grows_the_rect() {
+        let t = tile();
+        for q in [16i64, 64, 128, 256] {
+            let r = band(13, 7, 400, 93);
+            let out = quantize_update_rect(r, t, q);
+            assert!(out.contains_box(&r), "q={q}: {out:?} dropped part of {r:?}");
+        }
+    }
+
+    /// ★타일 밖으로는 절대 안 나간다.★ 나가면 다른 타일의 커밋된 픽셀을 건드린다.
+    #[test]
+    fn quantising_never_leaves_the_tile() {
+        let t = tile();
+        // 타일 가장자리에 딱 붙은 띠 -- 격자로 키우면 양쪽으로 넘칠 자리다.
+        for r in [
+            band(0, 0, 3, 3),
+            band(1021, 509, 1024, 512),
+            band(5, 500, 1020, 512),
+        ] {
+            for q in [16i64, 100, 512] {
+                let out = quantize_update_rect(r, t, q);
+                assert!(t.contains_box(&out), "q={q}: {out:?} escaped {t:?}");
+            }
+        }
+    }
+
+    /// ★이 함수의 존재 이유를 그대로 고정하는 테스트다.★ 같은 폭의 띠가 타일을 가로질러
+    /// 흘러가도 크기는 하나여야 한다 -- DComp 가 내주는 텍스처 크기의 **가짓수**가 커밋
+    /// 비용을 따라가기 때문이다(스펙 8-2 절: 가짓수 7.4/11.7/22.4 에 커밋 86/324/681 ms/s).
+    ///
+    /// ★초안 둘을 이 테스트가 잡았다.★ (1) 양변을 격자에 밀어 붙이면 폭 300 짜리가 위상에
+    /// 따라 384 와 512 두 가지로 나온다. (2) 크기를 고정하고 시작점을 바닥 내림만 하면
+    /// 350..650 이 256..640 이 되어 끝 10px 을 잃는다 -- 안 그린 자리가 남는 결함이다.
+    /// 그래서 크기를 먼저 고정하고, 시작점은 끝을 덮을 만큼만 당긴다.
+    #[test]
+    fn a_band_sliding_across_the_tile_keeps_one_size() {
+        let t = tile();
+        let q = 128i64;
+        let mut sizes = std::collections::HashSet::new();
+        for x in 0..=103 {
+            // 폭 300 짜리 띠가 7px 씩 흘러 타일 오른쪽 끝까지 간다(마지막은 724..1024).
+            let r = band(x * 7, 0, x * 7 + 300, 120);
+            let out = quantize_update_rect(r, t, q);
+            assert!(out.contains_box(&r), "{out:?} dropped part of {r:?}");
+            assert!(t.contains_box(&out), "{out:?} escaped the tile");
+            sizes.insert((out.width(), out.height()));
+        }
+        assert_eq!(
+            sizes.len(),
+            1,
+            "a sliding band must land on one size; got {sizes:?}"
+        );
+        assert_eq!(
+            sizes.into_iter().next().expect("one size"),
+            (384, 128),
+            "384 = 3*128 covers any 300px band; 128 covers 120"
+        );
+    }
+
+    /// 띠가 타일보다 넓으면 그 축은 타일 전체가 된다. 더 키울 곳이 없다.
+    #[test]
+    fn a_band_wider_than_the_tile_takes_the_whole_axis() {
+        let t = tile();
+        let out = quantize_update_rect(band(0, 10, 1024, 40), t, 128);
+        assert_eq!((out.min.x, out.max.x), (t.min.x, t.max.x));
+        assert_eq!(out.height(), 128);
+    }
+
+    /// 빈 렉트는 빈 채로 둔다. 키우면 안 그리던 자리를 투명으로 미는 동작 변경이다.
+    #[test]
+    fn an_empty_rect_stays_empty() {
+        let t = tile();
+        let empty = DeviceIntRect::new(t.min, t.min);
+        assert!(empty.is_empty());
+        for q in [-1i64, 0, 64] {
+            assert!(
+                quantize_update_rect(empty, t, q).is_empty(),
+                "q={q} turned an empty update into a painted one"
+            );
+        }
     }
 
     /// 집으면 비워진다 -- 다음 커밋이 이번 커밋의 일을 물려받지 않는다.

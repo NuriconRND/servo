@@ -485,6 +485,22 @@ param(
     # the main thread and the Commit would not, and DirectComposition may not like that.
     # A violation can be silent, so check the wall by eye, not only the numbers.
     [switch] $DcompParallelCommit,
+    # gfx_dcomp_update_quantum_px: pin the BeginDraw update rect to a fixed grid so DComp is
+    # asked for ONE texture size instead of dozens. 0 = off (default), -1 = the whole tile,
+    # >0 = round the rect's SIZE up to that many pixels.
+    #
+    # What this buys, measured 2026-10-20 (log_ani_debug_05\05 and \06): a Commit carrying
+    # identical work -- one bind, one newly realized texture -- costs 0.39 ms on a page whose
+    # textures are all one size and 3.73-3.81 ms on one with many. Inside a single run the
+    # seconds sort the same way: 7.4 / 11.7 / 22.4 distinct texture sizes against 86 / 324 /
+    # 681 ms/s of Commit. Allocation VOLUME does the opposite -- the cheapest run allocates the
+    # most -- so this is about size variety, not bytes.
+    #
+    # Only the transparent-expand path is touched (a non-opaque slice whose dirty == valid,
+    # i.e. a full repaint), where there is no content to preserve. -1 reproduces what
+    # ticker_slice_probe.html?clip=all already demonstrates without removing the second slice,
+    # which is the point: it separates "one texture size" from "one WebRender slice".
+    [int] $DcompUpdateQuantum = 0,
     # gfx_wall_rotate_tile_order: start the tile loop one tile further along each pass.
     #
     # One tile pays for the pass. With the big canvas and DComp off, tile 1 took 25.1ms of a
@@ -650,6 +666,12 @@ if ($DcompParallelCommit -and $DComp -eq "off") {
 }
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
+}
+if ($DcompUpdateQuantum -ne 0 -and $DComp -eq "off") {
+    throw "-DcompUpdateQuantum rounds the BeginDraw update rect, and BeginDraw only happens on DComp virtual surfaces. With -DComp off nothing reads the pref, so the run would look configured and change nothing. Pass -DComp surface."
+}
+if ($DcompUpdateQuantum -lt -1) {
+    throw "-DcompUpdateQuantum takes 0 (off), -1 (whole tile) or a positive pixel grid. $DcompUpdateQuantum is none of those."
 }
 # Commit alignment schedules the deferred Commit onto the common DWM composition grid. There is
 # nothing to schedule if the Commit already went out inside end_frame: -DcompCommitInFrame issues
@@ -839,6 +861,7 @@ if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_fra
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }
 if ($DcompParallelCommit) { $argList += @("--pref", "gfx_dcomp_parallel_commit=true") }
+if ($DcompUpdateQuantum -ne 0) { $argList += @("--pref", "gfx_dcomp_update_quantum_px=$DcompUpdateQuantum") }
 if ($RotateTileOrder)     { $argList += @("--pref", "gfx_wall_rotate_tile_order=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }
@@ -870,7 +893,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
