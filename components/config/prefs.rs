@@ -446,9 +446,24 @@ pub struct Preferences {
     /// dirty == valid` 라 그 타일에 보존해야 할 콘텐츠가 애초에 없다 -- 전면 재도색
     /// 슬라이스다. 비확장 가지는 부분 갱신이므로 렉트를 키우면 기존 내용을 지운다.
     ///
-    /// 대가는 `EndDraw` 가 커밋하는 면적과 DWM 합성량이 는다는 것이다. 프로브가 매 프레임
-    /// 타일 전체를 갱신하면서도 깨끗하므로 감당 가능한 것으로 본다. 그래도 기본은 끔이고
-    /// A/B 로 정한다.
+    /// ★A/B 를 마치고 기본값을 `-1` 로 정했다★(2026-10-20 T8, 스펙 8-4 절). 라이브 IPWall
+    /// 에서 이 한 값만 바꿨을 때:
+    ///
+    /// ```text
+    /// 벽 패스(WALLSPLIT, 정상 구간)  6.35 -> 1.03 ms
+    /// 8ms 넘는 Commit                2,668 -> 9 회 (그중 5 회가 기동 창 1·5·6)
+    /// begin_frame                    81.9 -> 9.6 ms/s
+    /// 전달 간격 결함                  9.12% -> 0.12%
+    /// 20ms 넘는 렌더                  0.181 -> 0.021 /페인터·초
+    /// ```
+    ///
+    /// 대가는 `EndDraw` 가 커밋하는 면적과 pbuffer 할당(1,021 -> 1,842 MB/s)이 는다는 것인데,
+    /// ★타일 왕복은 오히려 23.1 -> 10.4 ms/s 로 줄었다★ -- 크기가 일정하면 드라이버가
+    /// 같은 크기 할당을 재활용한다. 유보 조건은 arm 마다 실행이 한 번씩이라는 것뿐이다.
+    ///
+    /// `>0` 은 운용값이 아니다. 격자는 **주어진 폭에 대해** 크기를 고정하는데 클립된 띠의
+    /// 폭 자체가 글자를 따라 변하므로 그 변동을 그대로 물려받는다 -- `256` 으로도 크기가
+    /// 21 가지 남았고 저더가 그대로였다. 내용과 무관하게 하나인 값은 타일 전체뿐이다.
     pub gfx_dcomp_update_quantum_px: i64,
     /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
     ///
@@ -1255,7 +1270,7 @@ impl Preferences {
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
-            gfx_dcomp_update_quantum_px: 0,
+            gfx_dcomp_update_quantum_px: -1, // 타일 전체. 근거는 필드 doc 주석
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
@@ -1486,5 +1501,26 @@ impl UserAgentPlatform {
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Preferences;
+
+    /// 기본값을 되돌리는 것을 막는다.
+    ///
+    /// ★A/B 로 정한 값이고, 되돌아가면 조용히 저더가 돌아온다.★ 2026-10-20 T8 실측에서
+    /// 라이브 IPWall 의 벽 패스가 이 한 값으로 6.35 -> 1.03ms, 8ms 넘는 Commit 이
+    /// 2,668 -> 9 회였다(스펙 `docs/superpowers/specs/2026-10-20-dcomp-commit-probe-and-
+    /// surface-reuse-design.md` 8-4 절). 숫자가 로그에만 남아 있으면 다음 사람이 "기본은
+    /// 끄는 게 안전하지" 로 되돌리기 쉽다.
+    #[test]
+    fn the_dcomp_update_quantum_defaults_to_the_whole_tile() {
+        assert_eq!(
+            Preferences::const_default().gfx_dcomp_update_quantum_px,
+            -1,
+            "0 (off) was measured at 6.35ms a wall pass against 1.03ms for -1"
+        );
     }
 }

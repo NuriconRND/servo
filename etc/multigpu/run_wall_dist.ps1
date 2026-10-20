@@ -500,7 +500,14 @@ param(
     # i.e. a full repaint), where there is no content to preserve. -1 reproduces what
     # ticker_slice_probe.html?clip=all already demonstrates without removing the second slice,
     # which is the point: it separates "one texture size" from "one WebRender slice".
-    [int] $DcompUpdateQuantum = 0,
+    #
+    # ***-1 IS NOW THE ENGINE DEFAULT*** (T8, 2026-10-20): on the live IPWall page it took the
+    # wall pass from 6.35 to 1.03 ms and 8ms+ commits from 2,668 to 9. Pass -DcompUpdateQuantum 0
+    # to turn it back OFF -- that is the A/B arm now, and it is why this value is always sent to
+    # the engine rather than only when non-zero. >0 is not an operating value: the grid fixes the
+    # size for a GIVEN width, and the clipped band's width moves with the text, so 256 still left
+    # 21 sizes and judder.
+    [int] $DcompUpdateQuantum = -1,
     # gfx_wall_rotate_tile_order: start the tile loop one tile further along each pass.
     #
     # One tile pays for the pass. With the big canvas and DComp off, tile 1 took 25.1ms of a
@@ -667,7 +674,9 @@ if ($DcompParallelCommit -and $DComp -eq "off") {
 if ($DcompBindProf -and $DComp -eq "off") {
     throw "-DcompBindProf measures the DComp tile bind/unbind round trip, but -DComp is off, so nothing binds and the run would report an empty window. Pass -DComp surface."
 }
-if ($DcompUpdateQuantum -ne 0 -and $DComp -eq "off") {
+# Only complain when the operator TYPED it. The default is -1 now, so testing `-ne 0` here
+# would throw on every -DComp off run -- and -DComp off is this script's own default.
+if ($PSBoundParameters.ContainsKey('DcompUpdateQuantum') -and $DcompUpdateQuantum -ne 0 -and $DComp -eq "off") {
     throw "-DcompUpdateQuantum rounds the BeginDraw update rect, and BeginDraw only happens on DComp virtual surfaces. With -DComp off nothing reads the pref, so the run would look configured and change nothing. Pass -DComp surface."
 }
 if ($DcompUpdateQuantum -lt -1) {
@@ -861,7 +870,9 @@ if ($DcompCommitInFrame)  { $argList += @("--pref", "gfx_dcomp_commit_in_end_fra
 if ($WebglSwapSync -ne "off") { $argList += @("--pref", "gfx_webgl_swap_sync=$WebglSwapSync") }
 if ($WebglStageCopy)      { $argList += @("--pref", "gfx_webgl_stage_to_painter_device=true") }
 if ($DcompParallelCommit) { $argList += @("--pref", "gfx_dcomp_parallel_commit=true") }
-if ($DcompUpdateQuantum -ne 0) { $argList += @("--pref", "gfx_dcomp_update_quantum_px=$DcompUpdateQuantum") }
+# Always sent, never conditional. The engine default is -1 now, so "only send it when non-zero"
+# would make `-DcompUpdateQuantum 0` a no-op -- the off arm of the A/B would silently run ON.
+$argList += @("--pref", "gfx_dcomp_update_quantum_px=$DcompUpdateQuantum")
 if ($RotateTileOrder)     { $argList += @("--pref", "gfx_wall_rotate_tile_order=true") }
 if ($VideoEscapeBuffers -gt 0) { $argList += @("--pref", "gfx_video_escape_buffer_count=$VideoEscapeBuffers") }
 if ($SinkQos -ne "")      { $argList += @("--pref", "media_video_sink_qos=$SinkQos") }

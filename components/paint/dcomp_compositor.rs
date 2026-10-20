@@ -3906,7 +3906,8 @@ impl Compositor for DCompNativeCompositor {
                 // 절대 지우지 않는다(전체 재도색 슬라이스에만 적용). 불투명/스왑체인 경로 무영향.
                 let expand_transparent = !entry_is_opaque && dirty_rect == valid_rect;
                 let update_rect_v = if expand_transparent {
-                    // 확장 렉트를 격자에 붙인다(`gfx_dcomp_update_quantum_px`, 기본 끔).
+                    // 확장 렉트를 격자에 붙인다(`gfx_dcomp_update_quantum_px`,
+                    // 기본 -1 = 타일 전체).
                     // 투명 클리어는 이미 `update_rect_v` 크기로 시저링되어 있고(아래),
                     // `origin` 산식도 확장 렉트를 전제로 쓰여 있어 둘 다 그대로 따라온다.
                     quantize_update_rect(
@@ -5670,9 +5671,10 @@ mod commit_probe_tests {
         )
     }
 
-    /// 꺼져 있으면(기본) 한 픽셀도 달라지지 않는다.
+    /// `0` 은 끄는 값이다 -- 한 픽셀도 달라지지 않는다. ★기본값이 -1 로 바뀐 뒤에도
+    /// 이 경로는 남아야 한다★: A/B 의 off arm 이 이것이다.
     #[test]
-    fn quantum_zero_is_todays_behaviour() {
+    fn quantum_zero_turns_it_off() {
         let r = band(13, 7, 400, 93);
         assert_eq!(quantize_update_rect(r, tile(), 0), r);
     }
