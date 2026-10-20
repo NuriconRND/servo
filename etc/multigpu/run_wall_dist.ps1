@@ -1887,10 +1887,18 @@ if ($cw) {
         Write-Host ("  {0,-16} {1,8:N0}  {2,9:N3}  {3,9:N2}  {4,8:N2}  {5,8:N2}  {6,7:N0}%" -f `
             $workTags[$k], $b[0], $avg, $b[2], ($b[3] / $b[0]), ($b[4] / $b[0]), $reuse)
         if ($k -eq "idle") { continue }   # listed, never the baseline -- see above
-        if ($null -eq $firstAvg) { $firstAvg = $avg }
+        if ($k -eq "reuse") { $firstAvg = $avg }
         $lastAvg = $avg
     }
-    if ($null -ne $firstAvg -and $firstAvg -gt 0 -and $null -ne $lastAvg) {
+    if ($null -eq $firstAvg) {
+        # No commit in the whole run carried work whose textures all came back. Falling through
+        # to "new1 vs new5p" here would print a ratio between two kinds of churn and call it a
+        # verdict, which is how a measurement starts lying.
+        Write-Host "  No commit carried work with every texture reused, so there is no baseline to"
+        Write-Host "  compare against and this table cannot be read as a verdict. That DComp never"
+        Write-Host "  hands the same texture back is itself the finding -- check tex_reused above."
+    }
+    elseif ($firstAvg -gt 0 -and $null -ne $lastAvg) {
         $ratio = $lastAvg / $firstAvg
         if ($ratio -ge 2.0) {
             Write-Host ("  A Commit carrying the most new textures costs {0:N1}x one carrying the fewest." -f $ratio)
