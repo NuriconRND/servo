@@ -1878,18 +1878,30 @@ if ($cw) {
     Write-Host ("  {0,-16} {1,8}  {2,9}  {3,9}  {4,8}  {5,8}  {6,8}" -f "new textures", "commits", "avg ms", "worst ms", "vis/cmt", "bind/cmt", "reuse")
     $firstAvg = $null
     $lastAvg = $null
+    $newN = 0.0
+    $newMs = 0.0
     foreach ($k in @($workTags.Keys)) {
         if (-not $bucket.ContainsKey($k)) { continue }
         $b = $bucket[$k]
         if ($b[0] -eq 0) { continue }
         $avg = $b[1] / $b[0]
-        $reuse = if (($b[4] + $b[5]) -gt 0) { 100.0 * $b[5] / ($b[4] + $b[5]) } else { 0.0 }
+        # bind already counts the reused binds, so the denominator is bind, not bind+same.
+        # Dividing by the sum printed 50% for the bucket whose definition is "every texture
+        # came back", i.e. 100% -- a column that contradicts its own row label.
+        $reuse = if ($b[4] -gt 0) { 100.0 * $b[5] / $b[4] } else { 0.0 }
         Write-Host ("  {0,-16} {1,8:N0}  {2,9:N3}  {3,9:N2}  {4,8:N2}  {5,8:N2}  {6,7:N0}%" -f `
             $workTags[$k], $b[0], $avg, $b[2], ($b[3] / $b[0]), ($b[4] / $b[0]), $reuse)
         if ($k -eq "idle") { continue }   # listed, never the baseline -- see above
-        if ($k -eq "reuse") { $firstAvg = $avg }
-        $lastAvg = $avg
+        if ($k -eq "reuse") { $firstAvg = $avg; continue }
+        # Weighted by commits, NOT the last bucket's average. Taking the last one compared the
+        # baseline against whatever bucket happened to be non-empty: on the 2026-10-20 clip=none
+        # run that was new5p with ONE commit, so the table printed "flat, 1.8x" and told the
+        # reader neither fix would work -- while 12,919 commits sat in new1 at 5.3x the
+        # baseline. A verdict that a single sample can flip is not a verdict.
+        $newN += $b[0]
+        $newMs += $b[1]
     }
+    $lastAvg = if ($newN -gt 0) { $newMs / $newN } else { $null }
     if ($null -eq $firstAvg) {
         # No commit in the whole run carried work whose textures all came back. Falling through
         # to "new1 vs new5p" here would print a ratio between two kinds of churn and call it a
@@ -1901,8 +1913,9 @@ if ($cw) {
     elseif ($firstAvg -gt 0 -and $null -ne $lastAvg) {
         $ratio = $lastAvg / $firstAvg
         if ($ratio -ge 2.0) {
-            Write-Host ("  A Commit carrying the most new textures costs {0:N1}x one carrying the fewest." -f $ratio)
-            Write-Host "  That is the cost sitting in texture realization, so holding the update rect still is the lever."
+            Write-Host ("  A Commit that had to realize a new texture costs {0:N1}x one whose textures all came back" -f $ratio)
+            Write-Host ("  ({1:N0} commits against {2:N0}). That is the cost sitting in texture realization, so holding" -f $ratio, $newN, $bucket["reuse"][0])
+            Write-Host "  the update rect still -- one texture size instead of many -- is the lever."
         } else {
             Write-Host ("  Cost is flat across the buckets ({0:N1}x end to end)." -f $ratio)
             Write-Host "  Then texture churn is a passenger, not the cause, and neither pbuffer reuse nor update-rect"
