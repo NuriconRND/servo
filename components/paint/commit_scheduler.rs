@@ -41,6 +41,10 @@
 //! (`dcomp_compositor::commit_device_ptr`)으로 옮겼고, `Commit()` 을 실제로 부르는 자리는
 //! 크레이트 전체에서 `dcomp_compositor::raw_commit` 하나뿐이다. 새 커밋 지점은 그 함수를
 //! 지나갈 수밖에 없다.
+//!
+//! 그 함수가 `CommitSite` 를 받는 것도 같은 이유다 -- ★계측이 빠진 커밋 경로를 만들 수
+//! 없게★ 한다. 하필 계측이 없던 한 경로(`flush_before_render`)가 전체 커밋의 2/3 를
+//! 차지하는 바람에 `DCOMPBIND commit_ms` 가 모든 실행에서 0.0 으로 찍혔다.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -164,7 +168,10 @@ fn worker_loop(
         }
         let hr = {
             let _guard = device_guard(device, GuardRole::Scheduler);
-            crate::dcomp_compositor::commit_device_ptr_locked(device)
+            crate::dcomp_compositor::commit_device_ptr_locked(
+                device,
+                crate::dcomp_compositor::CommitSite::Scheduler,
+            )
         };
         if done.send((device, monitor, hr)).is_err() {
             return;
@@ -238,7 +245,9 @@ static DEVICE_MONITOR: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 pub(crate) fn remember_device_monitor(device: usize, monitor: usize) {
     if let Ok(mut guard) = DEVICE_MONITOR.lock() {
-        guard.get_or_insert_with(HashMap::new).insert(device, monitor);
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(device, monitor);
     }
 }
 
@@ -254,7 +263,10 @@ fn bump_retry(device: usize) -> u32 {
     let Ok(mut guard) = RETRY_COUNTS.lock() else {
         return u32::MAX;
     };
-    let slot = guard.get_or_insert_with(HashMap::new).entry(device).or_insert(0);
+    let slot = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(device)
+        .or_insert(0);
     *slot += 1;
     *slot
 }
@@ -298,7 +310,10 @@ pub(crate) fn flush_before_render(device: usize) {
     EARLY.fetch_add(1, Ordering::Relaxed);
     let hr = {
         let _guard = device_guard(device, GuardRole::Painter);
-        crate::dcomp_compositor::commit_device_ptr_locked(device)
+        crate::dcomp_compositor::commit_device_ptr_locked(
+            device,
+            crate::dcomp_compositor::CommitSite::BeforeRender,
+        )
     };
     clear_retry(device);
     if hr < 0 {
@@ -664,7 +679,10 @@ fn scheduler_loop(shared: &Arc<Shared>) {
             }
             let hr = {
                 let _guard = device_guard(device, GuardRole::Scheduler);
-                crate::dcomp_compositor::commit_device_ptr_locked(device)
+                crate::dcomp_compositor::commit_device_ptr_locked(
+                    device,
+                    crate::dcomp_compositor::CommitSite::Scheduler,
+                )
             };
             committed.push((device, monitor, hr));
         }
@@ -748,8 +766,8 @@ fn scheduler_loop(shared: &Arc<Shared>) {
         // 큐가 비어 마감이 하나도 없으면 위 `due` 가 비고, 이 `for` 도 돌지 않은 채 다음
         // 루프 회전 맨 위 `condvar.wait[_timeout]` 에서 잔다 -- 그동안은 여기 도달하지 않으므로
         // 아무 것도 찍지 않는다. 맞다: 비운 큐는 보고할 것도 없다는 뜻이다.
-        if *crate::dcomp_compositor::DCOMP_BIND_PROF &&
-            last_emit.elapsed() >= std::time::Duration::from_secs(1)
+        if *crate::dcomp_compositor::DCOMP_BIND_PROF
+            && last_emit.elapsed() >= std::time::Duration::from_secs(1)
         {
             last_emit = std::time::Instant::now();
             emit_outcommit();

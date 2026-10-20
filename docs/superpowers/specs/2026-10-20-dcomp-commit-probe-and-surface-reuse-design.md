@@ -267,11 +267,16 @@ alloc_px: u64,         // 새로 만든 pbuffer 들의 텍스처 면적 합 -> a
 `SurfaceEntry` 에 진단 전용 필드를 하나 둔다.
 
 ```rust
-/// 직전 bind 에서 BeginDraw 가 돌려준 텍스처 주소. ★절대 역참조하지 않는다★ --
+/// 타일마다, 직전 bind 에서 BeginDraw 가 돌려준 텍스처 주소. ★절대 역참조하지 않는다★ --
 /// 같은 텍스처가 다시 오는지만 세는 값이고, 그 판정이 W1 재사용의 적중률 예보다.
 /// (재사용 구현은 이 주소를 믿지 않고 자기 AddRef 를 들고 비교한다. 5.2 절)
-last_begin_texture: usize,
+last_begin_texture: FxHashMap<(i32, i32), usize>,
 ```
+
+★구현하면서 고친 것 -- 서피스 하나로 묶으면 안 된다.★ 초안은 `usize` 하나였는데, 티커 바는
+타일 여럿에 걸쳐 있고 WR 은 더티 타일을 차례로 bind 한다(A, B, C, A, B, C …). 서피스 단위로
+직전 값과 비교하면 타일마다 텍스처가 고정이어도 매 bind "달라졌다" 로 읽혀 ★A1 이 거짓으로
+확정된다★. 타일 좌표로 키를 가른다.
 
 `tex_reused` / `tex_changed` 를 센다. ★IPWall 에서 `tex_changed` 가 `binds` 에 가깝게 나오면
 A1 이 성립하고, 동시에 "pbuffer 재사용만으로는 IPWall 이 안 고쳐진다"는 것도 같이 증명된다★ --
@@ -493,12 +498,22 @@ TDD 가능한 단위로 가른다. COM 을 부르는 자리는 단위 테스트�
 | T2 | 방출자 선출 + `COMMITSITE` 한 줄 | `dcomp_compositor.rs` | 선출 함수 단위 테스트(둘이 다투면 하나만 이긴다) |
 | T3 | `begin_frame` 4 분할 계측 | `dcomp_compositor.rs` | 계측이라 없음. `bf_total >= 합` 을 debug_assert 로 |
 | T4 | BeginDraw `_max` + `SizeSet` + `tex_reused/changed` + `alloc_mb` | `dcomp_compositor.rs` | `SizeSet` 순수 단위 테스트(중복·넘침) |
+| T4b | 런처 요약 복구 (T1~T4 구현 중 추가) | `run_wall_dist.ps1` | 합성 로그로 블록 실행 |
 | T5 | **M0~M2 실행.** Q1·Q4 판정 | -- | 로그 |
 | T6 | `CachedPbuffer` + 재사용 판정 + 해제 지점 표 | `dcomp_compositor.rs` | `should_reuse(cache, tex, size)` 순수 함수 |
 | T7 | `gfx_dcomp_update_quantum_px` + 양자화 함수 + 런처 플래그 | `prefs.rs`, `dcomp_compositor.rs`, `run_wall_dist.ps1` | 양자화 순수 함수: dirty 포함 유지, 타일 밖으로 안 나감, q=-1 이면 타일, q=0 이면 불변 |
 | T8 | **M3~M5 실행.** 수용 기준 판정 | -- | 로그 + 육안 |
 
 T5 가 ★게이트★다. Q4 가 "아니오"면 T6~T8 을 취소한다.
+
+**T4b 가 왜 생겼나.** `run_wall_dist.ps1` 의 `DCOMPBIND` 요약은 ★자리 기반 정규식 하나★로
+40 개 필드를 받고 있었는데, 그것이 이미 깨져 있었다 -- 언젠가 `commit_ms_max` 가 중간에
+끼면서 매칭이 멈췄고, 그러면 표가 통째로 사라지는 데서 끝나지 않고 아래 `elseif` 가
+"no DCOMPBIND line was logged"(= 네이티브 컴포지터가 안 떴다)를 ★거짓으로★ 경고한다.
+M0 를 그 상태로 돌리면 읽는 사람이 먼저 엉뚱한 곳을 파게 된다. `key=value` 파싱으로 바꿔
+다시 썩지 않게 하고, `begin_frame` 분해·갱신 렉트·`COMMITSITE` 를 같은 자리에 붙였다.
+같은 이유로 "DComp 가 병목인가" 판정식에 `begin_frame` 을 더했다 -- 그것이 빠져 있어서
+end_frame 1.7ms·begin_frame 21ms 인 실행을 "병목 아님" 으로 읽고 있었다.
 
 ---
 

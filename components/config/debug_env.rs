@@ -292,6 +292,20 @@ pub const WALL_DISABLE_CANVAS_ACK_RECOVERY: DebugFlag = DebugFlag {
     cache_index: 20,
 };
 
+// ---------------------------------------------------------------------------------------------
+// DComp 커밋 정체 계측 (components/paint/dcomp_compositor.rs, COMMITSITE).
+// ---------------------------------------------------------------------------------------------
+
+pub const DCOMP_SLOW_COMMIT_MS: DebugFlag = DebugFlag {
+    name: "SERVO_DCOMP_SLOW_COMMIT_MS",
+    kind: Kind::Int,
+    doc: "`COMMITSITE` 의 `over` 를 세는 문턱(ms). 이 값 이상 걸린 Commit() 을 호출 지점별로 \
+          따로 센다. 미설정/파싱 실패 시 기본 8. ★`max` 하나로는 \"22ms 짜리 한 번\" 과 \
+          \"22ms 짜리 60 번\" 이 구분되지 않는다★ — 앞은 정체고 뒤는 구조적 부하라 고칠 \
+          방법이 정반대다. 계측 자체는 `SERVO_DCOMP_BIND_PROF` 가 켜져 있을 때만 돈다.",
+    cache_index: 21,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -316,6 +330,7 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_BIND_PROF,
     &WALL_CANVAS_ACK_SKIP,
     &WALL_DISABLE_CANVAS_ACK_RECOVERY,
+    &DCOMP_SLOW_COMMIT_MS,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

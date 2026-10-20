@@ -1639,21 +1639,41 @@ if ($wex) {
 # only 6 binds/s against 18 renders/s -- most renders bind nothing yet all of them were slow,
 # so the cost is not per tile. end_frame is the one thing here that runs every frame, and it
 # holds the GL flush, the swap-chain Present and the DWM Commit.
-$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=([\d.]+) frames=(\d+)/(\d+) binds=(\d+) full_tile=(\d+) end_frame_ms=([\d.]+) flush_ms=([\d.]+) flushed=(\d+)/(\d+) commit_ms=([\d.]+) external_ms=([\d.]+) externals=(\d+) present_ms=([\d.]+) presents=(\d+) visuals=(\d+) surfaces=(\d+) deferred=(\d+) begin_ms=([\d.]+) pbuffer_ms=([\d.]+) enddraw_ms=([\d.]+) teardown_ms=([\d.]+)" -EA SilentlyContinue
+# Parsed as key=value pairs, not as one long positional regex. The positional one rotted the
+# moment a field was inserted in the middle (commit_ms_max): it stopped matching, the whole
+# table vanished, and the branch below then warned "no DCOMPBIND line was logged" about a run
+# whose log was full of them. A false "the compositor never engaged" is worse than no table.
+$dbp = Select-String -Path $LogPath -Pattern "DCOMPBIND window_ms=" -EA SilentlyContinue
 if ($dbp) {
-    $v = { param($m, $i) [double]$m.Matches[0].Groups[$i].Value }
-    $w = 0.0; $bf = 0.0; $ef = 0.0; $binds = 0.0; $full = 0.0
-    $endf = 0.0; $flush = 0.0; $commit = 0.0; $bd = 0.0; $pbuf = 0.0; $ed = 0.0; $td = 0.0
-    $flushed = 0.0; $skipped = 0.0; $ext = 0.0; $extN = 0.0; $pres = 0.0; $presN = 0.0
-    $vis = 0.0; $surf = 0.0; $defer = 0.0
+    # Sums across windows, except *_max (a max of maxima) and the *_sizes counts, which are
+    # "how many distinct sizes in THIS window" and mean nothing added up.
+    $maxKeys = @("update_sizes", "tex_sizes")
+    $f = @{}
     foreach ($m in $dbp) {
-        $w += (& $v $m 1); $bf += (& $v $m 2); $ef += (& $v $m 3); $binds += (& $v $m 4)
-        $full += (& $v $m 5); $endf += (& $v $m 6); $flush += (& $v $m 7)
-        $flushed += (& $v $m 8); $skipped += (& $v $m 9); $commit += (& $v $m 10)
-        $ext += (& $v $m 11); $extN += (& $v $m 12); $pres += (& $v $m 13); $presN += (& $v $m 14)
-        $vis += (& $v $m 15); $surf += (& $v $m 16); $defer += (& $v $m 17)
-        $bd += (& $v $m 18); $pbuf += (& $v $m 19); $ed += (& $v $m 20); $td += (& $v $m 21)
+        foreach ($kv in [regex]::Matches($m.Line, '([A-Za-z_]+)=([\d.]+)(?:/([\d.]+))?')) {
+            $k = $kv.Groups[1].Value
+            $x = [double]$kv.Groups[2].Value
+            if (-not $f.ContainsKey($k)) { $f[$k] = 0.0 }
+            if ($k.EndsWith("_max") -or $maxKeys -contains $k) { $f[$k] = [math]::Max($f[$k], $x) }
+            else                                               { $f[$k] += $x }
+            # "a/b" fields (frames=60/60, flushed=59/0) keep the second half under <name>_b.
+            if ($kv.Groups[3].Success) {
+                $k2 = $k + "_b"
+                if (-not $f.ContainsKey($k2)) { $f[$k2] = 0.0 }
+                $f[$k2] += [double]$kv.Groups[3].Value
+            }
+        }
     }
+    $g = { param($k) if ($f.ContainsKey($k)) { $f[$k] } else { 0.0 } }
+    $w = (& $g "window_ms");    $bf = (& $g "frames");      $ef = (& $g "frames_b")
+    $binds = (& $g "binds");    $full = (& $g "full_tile")
+    $endf = (& $g "end_frame_ms"); $flush = (& $g "flush_ms")
+    $flushed = (& $g "flushed"); $skipped = (& $g "flushed_b"); $commit = (& $g "commit_ms")
+    $ext = (& $g "external_ms"); $extN = (& $g "externals")
+    $pres = (& $g "present_ms"); $presN = (& $g "presents")
+    $vis = (& $g "visuals");    $surf = (& $g "surfaces");  $defer = (& $g "deferred")
+    $bd = (& $g "begin_ms");    $pbuf = (& $g "pbuffer_ms")
+    $ed = (& $g "enddraw_ms");  $td = (& $g "teardown_ms")
     # window_ms sums across every compositor that emitted, one per painter, so it is already
     # painter-seconds; dividing by it gives a per-painter-per-second rate rather than a wall rate.
     $secs = [math]::Max($w / 1000.0, 0.001)
@@ -1682,18 +1702,46 @@ if ($dbp) {
         Write-Host ("  visuals/frame {0,9:N1}   live surfaces {1,5:N1}   -> {2:N4} ms of Commit per visual" -f ($vis/$ef), ($surf/$dbp.Count), $(if ($vis -gt 0) { $commit/$vis } else { 0 }))
     }
     Write-Host ("  tile round trip {0,7:N1} ms/s  (BeginDraw {1:N1} / pbuffer {2:N1} / EndDraw {3:N1} / teardown {4:N1})" -f ($tiles/$secs), ($bd/$secs), ($pbuf/$secs), ($ed/$secs), ($td/$secs))
+    Write-Host ("    worst single   BeginDraw {0:N2} / pbuffer {1:N2} / EndDraw {2:N2} / teardown {3:N2} ms" -f (& $g "begin_ms_max"), (& $g "pbuffer_ms_max"), (& $g "enddraw_ms_max"), (& $g "teardown_ms_max"))
     if ($binds -gt 0) { Write-Host ("  full-tile updates: {0:N0}/{1:N0}" -f $full, $binds) }
+    # begin_frame is what WebRender reports as compositor_begin_ms, and that is where the
+    # 22ms render stalls showed up. The three parts are measured inside it; "rest" is what is
+    # left over (close_external_batch, the root offset) -- if rest is the big one, the suspect
+    # is a line nobody has looked at yet.
+    if ((& $g "begin_frame_ms") -gt 0) {
+        Write-Host ("  begin_frame   {0,9:N1} ms/s   worst single pass {1:N2} ms" -f ((& $g "begin_frame_ms")/$secs), (& $g "begin_frame_ms_max"))
+        Write-Host ("    deferred commit  {0,6:N1} ms/s   worst {1:N2} ms" -f ((& $g "bf_deferred_ms")/$secs), (& $g "bf_deferred_ms_max"))
+        Write-Host ("    before_render    {0,6:N1} ms/s   worst {1:N2} ms   (the scheduler deadline flushed ahead of the render)" -f ((& $g "bf_early_ms")/$secs), (& $g "bf_early_ms_max"))
+        Write-Host ("    RemoveAllVisuals {0,6:N1} ms/s   worst {1:N2} ms" -f ((& $g "bf_removeall_ms")/$secs), (& $g "bf_removeall_ms_max"))
+        Write-Host ("    rest             {0,6:N1} ms/s" -f ((& $g "bf_rest_ms")/$secs))
+    }
+    # Does the BeginDraw update rect change shape every frame? If it does, DComp hands back a
+    # differently sized texture each time and the EGL pbuffer (plus its depth/stencil) is built
+    # and torn down 60-120 times a second. tex_reused is the direct count of "same texture came
+    # back for this tile", so it is also the forecast for whether caching the pbuffer can hit.
+    if ($binds -gt 0) {
+        Write-Host ("  update rect   max {0:N0} px, {1:N0} distinct sizes in a window" -f (& $g "update_px_max"), (& $g "update_sizes"))
+        Write-Host ("  BeginDraw tex max {0:N0} px, {1:N0} distinct sizes; same texture again {2:N0}/{3:N0} binds" -f (& $g "tex_px_max"), (& $g "tex_sizes"), (& $g "tex_reused"), $binds)
+        Write-Host ("  new pbuffers  {0,9:N1} MB/s  (colour only; ANGLE builds a depth/stencil of the same size alongside)" -f ((& $g "alloc_mb")/$secs))
+    }
     if ($ef -gt 0) {
         # Judge on everything this compositor costs, not on end_frame alone. The escape path
         # runs in add_surface, so an escape run can have a cheap end_frame and still be entirely
         # bounded by DComp -- reading only end_frame there would blame WebRender for our own work.
-        # DComp total = end_frame + the escape path (add_surface) + a deferred Commit,
-        # which lands outside end_frame and would otherwise vanish from the verdict.
-        $perFrame = ($endf + $ext + ($commit - $commitInFrame)) / $ef
+        # DComp total = end_frame + the escape path (add_surface) + begin_frame.
+        #
+        # begin_frame joined this sum once it was measured, and it changes verdicts: a run can
+        # have a 1.7ms end_frame and still spend 21ms a frame inside begin_frame flushing the
+        # scheduler's deadline. The old sum said "DComp is not the bottleneck" about exactly
+        # that run. The deferred Commit is no longer added separately -- when begin_frame is
+        # the one that flushes it, its cost is already inside bf_deferred_ms.
+        $bfTotal = (& $g "begin_frame_ms")
+        $perFrame = ($endf + $ext + $bfTotal) / $ef
         if ($perFrame -gt 5.0) {
             $parts = @(
                 @{n="the external video path (add_surface)"; v=$ext},
                 @{n="the DWM Commit"; v=$commit},
+                @{n="begin_frame's before_render commit flush"; v=(& $g "bf_early_ms")},
                 @{n="the GL flush"; v=$flush},
                 @{n="the swap-chain Present"; v=$pres}
             ) | Sort-Object { -$_.v }
@@ -1725,6 +1773,61 @@ if ($dbp) {
     }
 } elseif ($DcompBindProf) {
     Write-Warning "-DcompBindProf was set but no DCOMPBIND line was logged. It emits from end_frame, so a run where the native compositor never engaged produces nothing."
+}
+
+# --- COMMITSITE: which call site actually pays for Commit()? ---
+# Five of the six call sites had no timer, and the one that carries two thirds of all commits
+# (begin_frame -> flush_before_render) was among them -- which is why DCOMPBIND commit_ms read
+# 0.0 in every run while renders were stalling for 22ms inside begin_frame.
+#
+# The counters are process-global and one elected compositor drains them, so these are WALL
+# totals, not per painter. Read "worst" first: one 22ms commit is a stall, sixty of them is
+# structural load, and the two are fixed in opposite directions.
+$cs = Select-String -Path $LogPath -Pattern "COMMITSITE window_ms=" -EA SilentlyContinue
+if ($cs) {
+    $siteNames = [ordered]@{
+        ef = "end_frame"
+        df = "deferred flush"
+        br = "before_render (begin_frame)"
+        sc = "scheduler / worker"
+        di = "shell direct (fallback)"
+        ex = "video fast-path"
+    }
+    $site = @{}
+    $csWin = 0.0
+    $csSlow = 0.0
+    foreach ($m in $cs) {
+        if ($m.Line -match "window_ms=([\d.]+) slow_ms=([\d.]+)") {
+            $csWin += [double]$Matches[1]
+            $csSlow = [double]$Matches[2]
+        }
+        foreach ($k in @($siteNames.Keys)) {
+            if ($m.Line -match "\b$k n=(\d+) ms=([\d.]+) max=([\d.]+) over=(\d+)") {
+                if (-not $site.ContainsKey($k)) { $site[$k] = @(0.0, 0.0, 0.0, 0.0) }
+                $site[$k][0] += [double]$Matches[1]
+                $site[$k][1] += [double]$Matches[2]
+                $site[$k][2] = [math]::Max($site[$k][2], [double]$Matches[3])
+                $site[$k][3] += [double]$Matches[4]
+            }
+        }
+    }
+    $csSecs = [math]::Max($csWin / 1000.0, 0.001)
+    Write-Host ""
+    Write-Host ("COMMITSITE -- DComp Commit() by call site over {0:N0}s (slow = {1:N0} ms or more):" -f $csSecs, $csSlow)
+    $worstSite = ""
+    $worstMs = 0.0
+    foreach ($k in @($siteNames.Keys)) {
+        if (-not $site.ContainsKey($k)) { continue }
+        $t = $site[$k]
+        if ($t[0] -eq 0) { continue }
+        Write-Host ("  {0,-28} {1,8:N0} calls {2,9:N1} ms/s  worst {3,7:N2} ms  slow {4:N0}" -f $siteNames[$k], $t[0], ($t[1]/$csSecs), $t[2], $t[3])
+        if ($t[2] -gt $worstMs) { $worstMs = $t[2]; $worstSite = $siteNames[$k] }
+    }
+    if ($worstMs -ge 10.0) {
+        Write-Warning ("One Commit took {0:N1} ms at {1}. A render that waits that long drops frames on a 60Hz wall -- compare it with begin_frame's worst pass above: if they match, the Commit IS the stall." -f $worstMs, $worstSite)
+    }
+} elseif ($DcompBindProf) {
+    Write-Warning "-DcompBindProf was set but no COMMITSITE line was logged. Only one compositor emits it, from the same window as DCOMPBIND -- if DCOMPBIND printed and this did not, the election in maybe_emit_bind_profile is broken."
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }

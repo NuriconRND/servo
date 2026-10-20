@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use euclid::default::Size2D as UntypedSize2D;
 use log::warn;
@@ -30,6 +31,7 @@ use webrender::{
     NativeSurfaceId, NativeSurfaceInfo, NativeTileId, WindowVisibility,
 };
 use winapi::Interface;
+use winapi::shared::dcomptypes::DCOMPOSITION_FRAME_STATISTICS;
 use winapi::shared::dxgi::{
     DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, IDXGIAdapter, IDXGIDevice, IDXGIDevice1,
 };
@@ -42,17 +44,16 @@ use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT
 use winapi::shared::minwindef::{FALSE, TRUE};
 use winapi::shared::windef::{HWND, POINT, RECT};
 use winapi::um::d2dbasetypes::D2D_RECT_F;
-use winapi::um::dwmapi::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use winapi::um::d3d11::{
     D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
     ID3D11Resource, ID3D11Texture2D,
 };
 use winapi::um::d3d11_1::ID3D11DeviceContext1;
-use winapi::shared::dcomptypes::DCOMPOSITION_FRAME_STATISTICS;
 use winapi::um::dcomp::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget,
     IDCompositionVirtualSurface, IDCompositionVisual,
 };
+use winapi::um::dwmapi::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use winapi::um::unknwnbase::IUnknown;
 
@@ -1219,6 +1220,16 @@ struct SurfaceEntry {
     /// 불투명 phantom 서피스의 그려지지 않은 영역 합성을 억제하기 위한 clip 좁힘 근거
     /// (add_surface의 refine_opaque_clip). None=아직 미집계. destroy_tile(지오메트리 변경)에서 리셋.
     content_valid_union: Option<DeviceIntRect>,
+    /// 타일마다, 직전 Virtual bind 에서 `BeginDraw` 가 돌려준 텍스처의 주소. ★진단 전용이고
+    /// 절대 역참조하지 않는다★ -- 같은 텍스처가 다시 오는지만 세는 값이다(`tex_reused` /
+    /// `tex_changed`). 그 판정이 W1 pbuffer 재사용의 적중률 예보이기도 하다. 재사용을
+    /// 실제로 구현할 때는 이 주소를 믿지 않고 캐시가 자기 AddRef 를 들고 비교한다.
+    ///
+    /// ★서피스 하나로 묶으면 안 된다.★ 티커 바는 타일 여럿에 걸쳐 있고 WR 은 더티 타일을
+    /// 차례로 bind 하므로(A, B, C, A, B, C …), 서피스 단위로 직전 값과 비교하면 타일마다
+    /// 텍스처가 고정이어도 매번 "달라졌다" 로 읽힌다 -- A1 이 거짓으로 확정된다.
+    /// `SERVO_DCOMP_BIND_PROF` 가 꺼져 있으면 비어 있다.
+    last_begin_texture: FxHashMap<(i32, i32), usize>,
 }
 
 /// bind()가 BeginDraw로 연 타일 상태. unbind()에서 EndDraw + 자원 정리.
@@ -1372,13 +1383,74 @@ pub(crate) static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLo
 /// 뿐인데도 **모든 렌더가 느렸다**. 비용이 타일별이 아니라는 뜻이다. 그래서 후보를 또 하나
 /// 고르는 대신 **Compositor 경계 전체**를 잰다 — `end_frame` 은 bind 와 무관하게 매 프레임
 /// 불리고 그 안에 `gl().flush()`, `Present`, `Commit()` 이 모두 들어 있다.
+/// 창 안에서 서로 다른 `(w, h)` 가 **몇 가지**였는지 센다.
+///
+/// ★할당이 없다★ -- 타일마다 프레임마다 지나가는 자리라 `HashSet` 을 두지 않는다. 16 가지를
+/// 넘으면 그 뒤는 `overflow` 로만 세고 `distinct` 는 16 에서 멈춘다(로그에 `16+` 로 나간다).
+///
+/// 왜 "몇 번" 이 아니라 "몇 가지" 인가: 갱신 렉트가 프레임마다 달라지면 DComp 가 매번 다른
+/// 크기의 텍스처를 내주고, 그러면 그것을 감싼 EGL pbuffer 와(컨텍스트 설정이 `DEPTH|STENCIL`
+/// 이므로) 그만한 깊이·스텐실까지 초당 60~120 번 새로 만들어진다. 가짓수가 1 이면 그 사슬이
+/// 애초에 성립하지 않는다.
+struct SizeSet {
+    seen: [(u32, u32); SizeSet::CAP],
+    len: usize,
+    overflow: u64,
+}
+
+impl SizeSet {
+    const CAP: usize = 16;
+
+    fn note(&mut self, w: u32, h: u32) {
+        if self.seen[..self.len].contains(&(w, h)) {
+            return;
+        }
+        if self.len == Self::CAP {
+            self.overflow += 1;
+            return;
+        }
+        self.seen[self.len] = (w, h);
+        self.len += 1;
+    }
+
+    fn distinct(&self) -> usize {
+        self.len
+    }
+
+    /// 넘쳤으면 `"+"`. 로그에서 `16` 과 `16+` 를 가른다.
+    fn overflow_mark(&self) -> &'static str {
+        if self.overflow > 0 { "+" } else { "" }
+    }
+}
+
+impl Default for SizeSet {
+    fn default() -> Self {
+        SizeSet {
+            seen: [(0, 0); Self::CAP],
+            len: 0,
+            overflow: 0,
+        }
+    }
+}
+
+/// `begin_frame` 한 번을 쪼갠 시간. 전체에서 이 셋을 빼고 ★남는 몫을 로그에 남긴다★ --
+/// 셋의 합이 전체에 못 미치면 `close_external_batch` 나 root `SetOffsetX/Y` 처럼 아무도
+/// 의심하지 않은 줄이 범인이고, 계측이 그 몫을 보여주지 않으면 그 가능성은 영영 보이지 않는다.
+#[derive(Default)]
+struct BeginFrameSplit {
+    deferred_ns: u64,
+    early_ns: u64,
+    removeall_ns: u64,
+}
+
 #[derive(Default)]
 struct BindProfile {
     window_start: Option<std::time::Instant>,
     binds: u64,
-    /// Compositor 트레이트 메서드별 호출 수와 누적 시간(begin_frame / add_surface /
-    /// start_compositing / end_frame / create_surface).
-    begin_frame_ns: u64,
+    /// Compositor 트레이트 메서드별 호출 수와 누적 시간(add_surface / start_compositing /
+    /// end_frame / create_surface). `begin_frame` 의 시간은 아래 `bf_*` 가 쪼개 잰다 --
+    /// 한 번도 채워진 적 없는 `begin_frame_ns` 를 그 옆에 남겨 두면 둘 중 어느 쪽이 진짜인지
+    /// 로그만 보고는 알 수 없다.
     begin_frames: u64,
     add_surface_ns: u64,
     add_surfaces: u64,
@@ -1415,6 +1487,37 @@ struct BindProfile {
     end_ns: u64,
     /// pbuffer 파괴 + 텍스처 Release.
     destroy_ns: u64,
+    /// 위 넷의 창 안 최댓값. ★합계만으로는 "한 번이 20ms" 와 "60 번이 0.3ms" 가 구분되지
+    /// 않는다★ -- 표출 클럭을 멈추는 것은 앞이고, 고칠 방법은 서로 반대다.
+    begin_ns_max: u64,
+    pbuffer_ns_max: u64,
+    end_ns_max: u64,
+    destroy_ns_max: u64,
+    /// BeginDraw 에 요청한 갱신 렉트와, 그 결과로 DComp 가 내준 텍스처의 크기 분포.
+    /// 분석서 A1("갱신 렉트가 글자를 따라 움직여 매 bind 새 자원을 만든다")의 직접 증거다.
+    update_px_max: u64,
+    update_sizes: SizeSet,
+    tex_px_max: u64,
+    tex_sizes: SizeSet,
+    /// 이 창에서 새로 만든 pbuffer 가 감싼 텍스처 면적의 합. `alloc_mb` 로 환산해 찍는다 --
+    /// `GPUMEM` 의 톱니 진폭과 자릿수가 맞는지 보는 값이다.
+    alloc_px: u64,
+    /// 직전 bind 와 **같은** 텍스처가 다시 왔는가. ★W1 재사용의 적중률 예보다★ --
+    /// `tex_changed` 가 `binds` 에 가까우면 재사용만으로는 아무것도 고쳐지지 않는다.
+    tex_reused: u64,
+    tex_changed: u64,
+    /// `begin_frame` 전체와 그 안의 세 토막(`BeginFrameSplit`). WR 의 `compositor_begin_ms`
+    /// 가 재는 것이 바로 `bf_total` 이고, 22~24ms 짜리 렌더 정체가 그 값으로 나타났다.
+    bf_total_ns: u64,
+    bf_total_ns_max: u64,
+    bf_deferred_ns: u64,
+    bf_deferred_ns_max: u64,
+    bf_early_ns: u64,
+    bf_early_ns_max: u64,
+    bf_removeall_ns: u64,
+    bf_removeall_ns_max: u64,
+    /// 전체에서 셋을 뺀 나머지(`close_external_batch`, root 오프셋, 부기). 위 주석 참조.
+    bf_rest_ns: u64,
     /// 갱신 요청한 면적과 타일 전체 면적. ★둘이 같으면 부분 갱신이 성립하지 않는 것이다★ —
     /// 그러면 비용이 캔버스가 아니라 `gfx_wr_picture_tile_size` 에 비례한다.
     dirty_px: u64,
@@ -1558,7 +1661,11 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     // `#[repr(packed)]` 이라 필드를 빌릴 수 없다. 값으로 복사한다.
     let period = info.qpcRefreshPeriod;
     let vblank = info.qpcVBlank;
-    if period == 0 { None } else { Some((vblank, period)) }
+    if period == 0 {
+        None
+    } else {
+        Some((vblank, period))
+    }
 }
 
 /// `(qpcVBlank, qpcCompose, qpcRefreshPeriod)`. 조회만 한다.
@@ -1700,11 +1807,188 @@ pub(crate) fn note_dwm_phase() {
 /// 버리면 그 프레임의 시각 변경이 화면에 닿지 않는다(`commit_scheduler` 의 재시도 주석).
 pub(crate) const DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED: i32 = 0x8898_0801_u32 as i32;
 
+/// `Commit()` 을 부른 자리. `COMMITSITE` 한 줄이 이것으로 갈린다.
+///
+/// ★`BeforeRender` 하나만 계측이 없었고 하필 그것이 전체의 2/3 였다★ -- `OUTCOMMIT` 의
+/// `early/scheduled` 가 0.65~0.81 이다. 그래서 `DCOMPBIND commit_ms` 가 모든 실행에서 0.0 으로
+/// 찍혔고, 22ms 짜리 렌더 정체의 정체가 소거법 추정으로 남았다. 한 번은 그 추정을 `BeginDraw`
+/// 로 잘못 짚기도 했다 -- 실제 BeginDraw 는 `DCOMPBIND begin_ms` 로 이미 재고 있었고 호출당
+/// 0.08~0.31ms 였다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CommitSite {
+    /// `end_frame` 의 즉시 커밋.
+    EndFrame,
+    /// 미뤄 둔 커밋 흘리기(`flush_deferred_commit`).
+    Deferred,
+    /// `begin_frame` -> `commit_scheduler::flush_before_render`. ★주범 후보★
+    BeforeRender,
+    /// 커밋 워커, 그리고 워커에 못 보내 스케줄러 스레드가 직접 낸 것.
+    Scheduler,
+    /// 셸 즉시 커밋 폴백(`commit_device_ptr`).
+    Direct,
+    /// 비디오 fast-path(`present_external_only`).
+    External,
+}
+
+impl CommitSite {
+    const COUNT: usize = 6;
+
+    /// `COMMIT_SITES` 의 슬롯 번호.
+    const fn index(self) -> usize {
+        match self {
+            CommitSite::EndFrame => 0,
+            CommitSite::Deferred => 1,
+            CommitSite::BeforeRender => 2,
+            CommitSite::Scheduler => 3,
+            CommitSite::Direct => 4,
+            CommitSite::External => 5,
+        }
+    }
+
+    /// 로그의 두 글자 이름.
+    const fn tag(self) -> &'static str {
+        match self {
+            CommitSite::EndFrame => "ef",
+            CommitSite::Deferred => "df",
+            CommitSite::BeforeRender => "br",
+            CommitSite::Scheduler => "sc",
+            CommitSite::Direct => "di",
+            CommitSite::External => "ex",
+        }
+    }
+}
+
+/// 로그 열 순서 = 슬롯 순서. `index()` 와 어긋나면 아래 const 어서션이 컴파일을 막는다.
+const COMMIT_SITE_ORDER: [CommitSite; CommitSite::COUNT] = [
+    CommitSite::EndFrame,
+    CommitSite::Deferred,
+    CommitSite::BeforeRender,
+    CommitSite::Scheduler,
+    CommitSite::Direct,
+    CommitSite::External,
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < COMMIT_SITE_ORDER.len() {
+        assert!(
+            COMMIT_SITE_ORDER[i].index() == i,
+            "CommitSite::index() must match its position in COMMIT_SITE_ORDER"
+        );
+        i += 1;
+    }
+};
+
+/// 커밋 지점 하나의 누적기.
+///
+/// 전역인 이유: `self` 가 없는 커밋 경로가 둘 있다(`commit_device_ptr`,
+/// `commit_device_ptr_locked` -- 둘 다 자유 함수이고 스케줄러 스레드에서도 불린다). 그래서
+/// 컴포지터 필드에 둘 수 없다. 대신 비우는 쪽을 하나로 정한다([`COMMITSITE_EMITTER`]).
+struct CommitSlot {
+    n: AtomicU64,
+    sum_ns: AtomicU64,
+    max_ns: AtomicU64,
+    /// `SERVO_DCOMP_SLOW_COMMIT_MS` 를 넘긴 횟수.
+    over_n: AtomicU64,
+}
+
+impl CommitSlot {
+    const fn new() -> Self {
+        CommitSlot {
+            n: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            over_n: AtomicU64::new(0),
+        }
+    }
+
+    /// 커밋 한 번을 넣는다.
+    ///
+    /// ★이 호출은 디바이스 가드 **안**에서 일어난다.★ 그 임계구역에 있어도 되는 것은
+    /// `Commit()` 하나뿐이라는 것이 이 파일이 세 번 고쳐 세운 불변식인데, `fetch_add` /
+    /// `fetch_max` 는 락도 할당도 I/O 도 아니므로 그 불변식을 깨지 않는다. ★로그는 절대
+    /// 여기서 찍지 않는다★ -- 그것이 바로 불변식이 금지하는 것이다.
+    fn record(&self, ns: u64, slow_ns: u64) {
+        self.n.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        if ns >= slow_ns {
+            self.over_n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 창을 닫는다 -- 읽으면서 0 으로 되돌린다.
+    fn drain(&self) -> CommitTotals {
+        CommitTotals {
+            n: self.n.swap(0, Ordering::Relaxed),
+            sum_ns: self.sum_ns.swap(0, Ordering::Relaxed),
+            max_ns: self.max_ns.swap(0, Ordering::Relaxed),
+            over_n: self.over_n.swap(0, Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Default, PartialEq, Eq, Debug)]
+struct CommitTotals {
+    n: u64,
+    sum_ns: u64,
+    max_ns: u64,
+    over_n: u64,
+}
+
+static COMMIT_SITES: [CommitSlot; CommitSite::COUNT] =
+    [const { CommitSlot::new() }; CommitSite::COUNT];
+
+/// `SERVO_DCOMP_SLOW_COMMIT_MS` 를 ns 로. 기본 8ms.
+///
+/// ★`max` 하나로는 "22ms 짜리 한 번" 과 "22ms 짜리 60 번" 이 구분되지 않는다★ -- 앞은
+/// 정체고 뒤는 구조적 부하라 고칠 방법이 정반대다.
+static SLOW_COMMIT_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    let ms = debug_env::int(&debug_env::DCOMP_SLOW_COMMIT_MS)
+        .unwrap_or(8)
+        .max(0) as u64;
+    ms.saturating_mul(1_000_000)
+});
+
+/// `COMMITSITE` 를 낼 컴포지터 하나를 선착순으로 정한다. 0 = 미정.
+///
+/// ★방출자는 하나다.★ 누적기가 전역인데 페인터 넷이 각자 1 초 창으로 비우면 한 줄이 실제로는
+/// 0.25 초 조각이 된다 -- `OUTCOMMIT` 이 같은 이유로 방출을 한 스레드로 모은 전례가 있다.
+///
+/// ★`OUTCOMMIT` 쪽이 아니라 `DCOMPBIND` 쪽에 매다는 이유★: 스케줄러 스레드는
+/// `gfx_present_align_commit_pct` 가 꺼져 있으면 아예 뜨지 않는다. 그런데 A/B 1 순위 arm 이
+/// 바로 `-CommitAlign -1` 이고, 그 실행에서 커밋 시간을 못 보면 arm 자체가 무의미해진다.
+static COMMITSITE_EMITTER: AtomicUsize = AtomicUsize::new(0);
+
+/// 내가 이 창의 방출자인가. 미정이면 선착순으로 집는다.
+///
+/// `me` 가 0 이면 집지 않는다 -- 미정 표식과 겹친다. 디바이스 포인터라 실제로 0 이 될 일은
+/// 없고, 만약 된다면 아무도 방출하지 않는 쪽이 둘이 방출하는 쪽보다 안전하다.
+fn claim_commitsite_emitter(emitter: &AtomicUsize, me: usize) -> bool {
+    if me == 0 {
+        return false;
+    }
+    match emitter.compare_exchange(0, me, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => true,
+        Err(current) => current == me,
+    }
+}
+
+/// 방출자가 죽는다. 자기 자리였을 때만 비워 다음 컴포지터가 집게 한다.
+fn release_commitsite_emitter(emitter: &AtomicUsize, me: usize) {
+    let _ = emitter.compare_exchange(me, 0, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// Safety: 살아 있는 `IDCompositionDevice` 포인터여야 한다.
 #[inline]
-unsafe fn raw_commit(device: *mut IDCompositionDevice) -> i32 {
+unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 {
+    let start = DCOMP_BIND_PROF.then(std::time::Instant::now);
     // 이 파일은 `unsafe_op_in_unsafe_fn` 을 끄지 않으므로 `unsafe fn` 안에서도 블록이 필요하다.
-    unsafe { (*device).Commit() }
+    let hr = unsafe { (*device).Commit() };
+    if let Some(start) = start {
+        COMMIT_SITES[site.index()].record(start.elapsed().as_nanos() as u64, *SLOW_COMMIT_NS);
+    }
+    hr
 }
 
 /// 커밋 실패를 **초당 한 번**만 알린다. ★반드시 디바이스 가드 밖에서 부른다.★
@@ -1765,7 +2049,7 @@ pub fn commit_device_ptr(device: usize) -> bool {
             )
         });
         // Safety: 위 계약.
-        unsafe { raw_commit(device as *mut IDCompositionDevice) }
+        unsafe { raw_commit(device as *mut IDCompositionDevice, CommitSite::Direct) }
     };
     crate::output_grid::note_commit_at(device);
     note_commit_failure(hr, device, "commit_device_ptr");
@@ -1780,9 +2064,9 @@ pub fn commit_device_ptr(device: usize) -> bool {
 /// [`note_commit_failure`] 로 찍어야 임계구역이 `Commit()` 하나로 유지된다.
 ///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
-pub fn commit_device_ptr_locked(device: usize) -> i32 {
+pub fn commit_device_ptr_locked(device: usize, site: CommitSite) -> i32 {
     // Safety: 위 계약.
-    unsafe { raw_commit(device as *mut IDCompositionDevice) }
+    unsafe { raw_commit(device as *mut IDCompositionDevice, site) }
 }
 
 pub fn maybe_create(
@@ -1884,10 +2168,8 @@ pub fn maybe_create(
         // (IDXGISwapChain2 + FRAME_LATENCY_WAITABLE_OBJECT 가 필요 없다).
         if *PRESENT_SYNC_INTERVAL > 0 {
             let mut dev1_raw: *mut IDXGIDevice1 = ptr::null_mut();
-            let hr = (*dxgi.as_ptr()).QueryInterface(
-                &IDXGIDevice1::uuidof(),
-                &mut dev1_raw as *mut _ as *mut _,
-            );
+            let hr = (*dxgi.as_ptr())
+                .QueryInterface(&IDXGIDevice1::uuidof(), &mut dev1_raw as *mut _ as *mut _);
             match ComOwned::from_raw(if hr < 0 { ptr::null_mut() } else { dev1_raw }) {
                 Some(dev1) => {
                     let hr = (*dev1.as_ptr()).SetMaximumFrameLatency(1);
@@ -2640,7 +2922,7 @@ impl DCompNativeCompositor {
         }
         self.commit_pending = false;
         if let Some(device) = self.dcomp_device_ptr() {
-            self.commit_device_guarded(device);
+            self.commit_device_guarded(device, CommitSite::Deferred);
         }
     }
 
@@ -2653,10 +2935,14 @@ impl DCompNativeCompositor {
     ///
     /// 계측은 미루든 말든 같은 카운터에 쌓이므로, `deferred_commits` 와 함께 보면 "미뤘는데도
     /// 총 시간이 그대로인지" 가 바로 읽힌다.
-    fn commit_device_locked(&mut self, dcomp_device: *mut IDCompositionDevice) -> i32 {
+    fn commit_device_locked(
+        &mut self,
+        dcomp_device: *mut IDCompositionDevice,
+        site: CommitSite,
+    ) -> i32 {
         let commit_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
         // Safety: dcomp_device는 살아있는 IDCompositionDevice. Commit은 DWM 반영을 비동기 요청.
-        let hr = unsafe { raw_commit(dcomp_device) };
+        let hr = unsafe { raw_commit(dcomp_device, site) };
         if let Some(start) = commit_start {
             let elapsed = start.elapsed().as_nanos() as u64;
             self.bind_profile.commit_ns += elapsed;
@@ -2674,7 +2960,7 @@ impl DCompNativeCompositor {
     /// `commit_pending` 이 셸의 flush 를 넘겨 살아남으면(`take_pending_commit` 왕복이 `None` 을
     /// 주거나 한 패스에서 그 페인터가 두 번 렌더하면) 다음 프레임의 이 호출이 스케줄러가 바로
     /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
-    fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice) {
+    fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice, site: CommitSite) {
         let hr = {
             let _guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
                 crate::commit_scheduler::device_guard(
@@ -2682,13 +2968,112 @@ impl DCompNativeCompositor {
                     crate::commit_scheduler::GuardRole::Painter,
                 )
             });
-            self.commit_device_locked(dcomp_device)
+            self.commit_device_locked(dcomp_device, site)
         };
         crate::output_grid::note_commit_at(dcomp_device as usize);
         note_commit_failure(hr, dcomp_device as usize, "flush_deferred_commit");
         if *DCOMP_BIND_PROF {
             note_dwm_phase();
         }
+    }
+
+    /// `begin_frame` 의 몸통. 돌려주는 것은 토막별 시간이며, 계측이 꺼져 있으면 전부 0 이다.
+    fn begin_frame_inner(&mut self, _device: &mut Device) -> BeginFrameSplit {
+        let mut split = BeginFrameSplit::default();
+        // external 배치는 정상적으로 직전 프레임 start_compositing에서 닫힌다. 만약 어떤 이유로
+        // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
+        // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
+        self.close_external_batch();
+        // 지난 프레임이 미뤄 둔 Commit 이 아직 남아 있으면 여기서 흘린다 — 셸이 flush 를
+        // 부르지 않는 경우(servoshell)에도 화면이 멈추지 않게 하는 자기복구다.
+        let deferred_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        self.flush_deferred_commit();
+        if let Some(start) = deferred_start {
+            split.deferred_ns = start.elapsed().as_nanos() as u64;
+        }
+        // ★스케줄러에 걸린 마감도 여기서 먼저 내보낸다.★ 아래부터 이 프레임의 서피스가
+        // `BeginDraw` 로 열리고, 그동안 그 디바이스의 `Commit()` 은 전부 거부된다
+        // (`SURFACE_BEING_RENDERED`). 마감은 최대 한 주기 뒤이고 프레임 간격도 그 정도라
+        // 겹침은 타일에 따라 상시로 일어난다 -- 실기 2 회차에서 저더와 깜박임의 정체가
+        // 이것이었다. 정렬 pref 가 꺼져 있으면 이 함수는 즉시 돌아온다.
+        //
+        // ★이 토막은 `COMMITSITE br_*` 와 같은 호출을 두 겹으로 잰다. 의도한 것이다★ --
+        // 둘이 갈라지면 범인은 `flush_before_render` 의 큐 락이나 `retain` 이고, 같이 크면
+        // `Commit()` 자체다. 한 겹만 재면 그 둘을 영원히 가를 수 없다.
+        #[cfg(windows)]
+        if let Some(dcomp_device) = self.dcomp_device_ptr() {
+            let early_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+            crate::commit_scheduler::flush_before_render(dcomp_device as usize);
+            if let Some(start) = early_start {
+                split.early_ns = start.elapsed().as_nanos() as u64;
+            }
+        }
+        let Some(root) = self.root_visual_ptr() else {
+            return split;
+        };
+        // 월 가드밴드 크롭: 렌더 서피스는 render rect(오버랩 확장) 크기인데 창은 visible rect
+        // 크기다. root visual을 -inset만큼 밀어 visible 영역이 창 원점에 오게 한다. 전 비주얼이
+        // root의 직속 자식이므로(end_frame의 AddVisual) WR 타일과 external 비디오에 균일하게
+        // 적용된다. root의 오프셋은 자식들에게는 부모 변환이라, 각 자식의 offset과 clip
+        // 모두에 동일하게(uniformly) 걸린다 — 그래서 둘 사이의 상대 관계가 그대로 보존되고
+        // `apply_visual_placement`(자식 offset/clip 산식)는 수정할 필요가 없다. 창 밖으로
+        // 밀려난 가드밴드는 HWND 경계에서 DWM이 클립하므로 root 클립은 불필요하다.
+        //
+        // DComp는 top-left 원점이라 y에 `-top`을 쓴다 — GL blit 경로가 `bottom`을 쓰는 것과
+        // 규약이 반대다(§`RenderingContext::present_inset`).
+        let inset = self.rendering_context.present_inset();
+        let offset = (-inset.left, -inset.top);
+        if self.last_root_offset != Some(offset) {
+            // Safety: root는 살아있는 IDCompositionVisual.
+            let (hr_x, hr_y) = unsafe {
+                let hr_x = (*root).SetOffsetX_1(offset.0 as f32);
+                if hr_x < 0 {
+                    warn!(
+                        "[dcomp-native] root SetOffsetX failed (hr=0x{:08x})",
+                        hr_x as u32
+                    );
+                }
+                let hr_y = (*root).SetOffsetY_1(offset.1 as f32);
+                if hr_y < 0 {
+                    warn!(
+                        "[dcomp-native] root SetOffsetY failed (hr=0x{:08x})",
+                        hr_y as u32
+                    );
+                }
+                (hr_x, hr_y)
+            };
+            // present_inset은 타일 창 수명 내내 고정값이라 캐시가 "값 변화"로 무효화될 일이 없다.
+            // 따라서 SetOffsetX/Y 중 하나라도 실패했는데 캐시를 기록해버리면 그 프레임이 "이미
+            // 적용됨"으로 오인되어 이후 어떤 프레임에서도 재시도되지 않는다 — 두 HRESULT가
+            // 모두 성공했을 때만 캐시를 기록한다.
+            if hr_x >= 0 && hr_y >= 0 {
+                // 이 파일은 `use log::warn;`만 import하고 info는 항상 경로 한정으로 쓴다(:184 등).
+                log::info!(
+                    "[dcomp-native] root guard-band offset ({}, {}) applied from present_inset {:?}",
+                    offset.0,
+                    offset.1,
+                    inset
+                );
+                self.last_root_offset = Some(offset);
+            }
+        }
+        self.frame_counter += 1;
+        // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
+        // Safety: root는 살아있는 IDCompositionVisual.
+        let removeall_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        let hr = unsafe { (*root).RemoveAllVisuals() };
+        if let Some(start) = removeall_start {
+            split.removeall_ns = start.elapsed().as_nanos() as u64;
+        }
+        if hr < 0 {
+            warn!(
+                "[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})",
+                hr as u32
+            );
+        }
+        // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
+        self.frame_surfaces.clear();
+        split
     }
 
     fn maybe_emit_bind_profile(&mut self) {
@@ -2705,7 +3090,14 @@ impl DCompNativeCompositor {
              end_frame_ms={:.1} flush_ms={:.1} flushed={}/{} commit_ms={:.1} commit_ms_max={:.1} \
              external_ms={:.1} externals={} present_ms={:.1} presents={} \
              visuals={} surfaces={} deferred={} \
-             begin_ms={:.1} pbuffer_ms={:.1} enddraw_ms={:.1} teardown_ms={:.1}",
+             begin_ms={:.1} begin_ms_max={:.2} pbuffer_ms={:.1} pbuffer_ms_max={:.2} \
+             enddraw_ms={:.1} enddraw_ms_max={:.2} teardown_ms={:.1} teardown_ms_max={:.2} \
+             update_px_max={} update_sizes={}{} tex_px_max={} tex_sizes={}{} \
+             tex_reused={} tex_changed={} alloc_mb={:.1} \
+             begin_frame_ms={:.1} begin_frame_ms_max={:.2} \
+             bf_deferred_ms={:.1} bf_deferred_ms_max={:.2} \
+             bf_early_ms={:.1} bf_early_ms_max={:.2} \
+             bf_removeall_ms={:.1} bf_removeall_ms_max={:.2} bf_rest_ms={:.1}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
             profile.end_frames,
@@ -2725,15 +3117,74 @@ impl DCompNativeCompositor {
             profile.surfaces_live,
             profile.deferred_commits,
             ms(profile.begin_ns),
+            ms(profile.begin_ns_max),
             ms(profile.pbuffer_ns),
+            ms(profile.pbuffer_ns_max),
             ms(profile.end_ns),
+            ms(profile.end_ns_max),
             ms(profile.destroy_ns),
+            ms(profile.destroy_ns_max),
+            profile.update_px_max,
+            profile.update_sizes.distinct(),
+            profile.update_sizes.overflow_mark(),
+            profile.tex_px_max,
+            profile.tex_sizes.distinct(),
+            profile.tex_sizes.overflow_mark(),
+            profile.tex_reused,
+            profile.tex_changed,
+            // BGRA8 4 바이트 가정. 깊이·스텐실은 여기 안 들어간다 — `GPUMEM` 진폭이 이 값의
+            // 두 배 가까이 나오면 그것이 ANGLE 이 pbuffer 마다 깊이·스텐실을 같이 만든다는
+            // 간접 증거다(스펙 10 절의 미확인 항목).
+            profile.alloc_px as f64 * 4.0 / (1024.0 * 1024.0),
+            ms(profile.bf_total_ns),
+            ms(profile.bf_total_ns_max),
+            ms(profile.bf_deferred_ns),
+            ms(profile.bf_deferred_ns_max),
+            ms(profile.bf_early_ns),
+            ms(profile.bf_early_ns_max),
+            ms(profile.bf_removeall_ns),
+            ms(profile.bf_removeall_ns_max),
+            ms(profile.bf_rest_ns),
         );
+
+        self.emit_commitsite(window);
 
         self.bind_profile = BindProfile {
             window_start: Some(now),
             ..Default::default()
         };
+    }
+
+    /// `COMMITSITE` 한 줄. ★선출된 컴포지터 하나만 낸다★ -- 누적기가 전역이라 넷이 각자
+    /// 비우면 한 줄이 실제로는 0.25 초 조각이 된다([`COMMITSITE_EMITTER`]).
+    fn emit_commitsite(&mut self, window: std::time::Duration) {
+        let Some(device) = self.dcomp_device_ptr() else {
+            return;
+        };
+        if !claim_commitsite_emitter(&COMMITSITE_EMITTER, device as usize) {
+            return;
+        }
+        use std::fmt::Write as _;
+        let mut line = String::with_capacity(256);
+        let _ = write!(
+            line,
+            "COMMITSITE window_ms={:.0} slow_ms={:.0}",
+            window.as_secs_f64() * 1000.0,
+            *SLOW_COMMIT_NS as f64 / 1_000_000.0,
+        );
+        for site in COMMIT_SITE_ORDER {
+            let totals = COMMIT_SITES[site.index()].drain();
+            let _ = write!(
+                line,
+                " {} n={} ms={:.1} max={:.2} over={}",
+                site.tag(),
+                totals.n,
+                totals.sum_ns as f64 / 1_000_000.0,
+                totals.max_ns as f64 / 1_000_000.0,
+                totals.over_n,
+            );
+        }
+        warn!("{line}");
     }
 
     pub(crate) fn present_external_only(&mut self) {
@@ -2840,7 +3291,7 @@ impl DCompNativeCompositor {
                     )
                 });
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
-                unsafe { raw_commit(dcomp_device) }
+                unsafe { raw_commit(dcomp_device, CommitSite::External) }
             };
             crate::output_grid::note_commit_at(dcomp_device as usize);
             note_commit_failure(hr, dcomp_device as usize, "present_external_only");
@@ -2888,6 +3339,11 @@ impl DCompNativeCompositor {
     /// §3-q UAF 교훈: 자식(pbuffer→서피스)부터 디바이스 순으로 해제한다. WR renderer
     /// deinit이 egl.Terminate보다 먼저 이 경로를 호출하므로 EGL 자원이 아직 살아있다.
     fn release_all(&mut self) {
+        // 방출자 자리를 비운다 -- 아직 디바이스 포인터가 살아 있을 때 해야 한다. 안 비우면
+        // 그 창 이후로 `COMMITSITE` 가 영영 안 나오고 전역 누적기만 부푼다.
+        if let Some(device) = self.dcomp_device_ptr() {
+            release_commitsite_emitter(&COMMITSITE_EMITTER, device as usize);
+        }
         self.drop_bound_without_enddraw();
         // SwapChain storage의 frame_pbuffer는 RAII가 아니므로 clear 전에 명시 정리한다.
         let rc = self.rendering_context.clone();
@@ -2988,6 +3444,7 @@ impl Compositor for DCompNativeCompositor {
                 promote_blocked_until: 0,
                 frame_drawn_partial: false,
                 content_valid_union: None,
+                last_begin_texture: FxHashMap::default(),
             }
         };
 
@@ -3018,6 +3475,7 @@ impl Compositor for DCompNativeCompositor {
         // Trim 최적화는 후속(고정 크기 월 창에서는 타일 집합이 안정적) — 여기서는 부기만 갱신.
         if let Some(entry) = self.surfaces.get_mut(&id.surface_id) {
             entry.tiles.remove(&(id.x, id.y));
+            entry.last_begin_texture.remove(&(id.x, id.y));
             // Task 10: 타일 집합(지오메트리) 변경 → 누적 valid 유니온 무효화 후 재집계.
             entry.content_valid_union = None;
         }
@@ -3229,17 +3687,40 @@ impl Compositor for DCompNativeCompositor {
                     (tex, update_offset, desc)
                 };
                 if let Some(start) = begin_start {
-                    let profile = &mut self.bind_profile;
-                    profile.binds += 1;
-                    profile.begin_ns += start.elapsed().as_nanos() as u64;
+                    let elapsed = start.elapsed().as_nanos() as u64;
                     // 갱신 요청 면적 대 타일 전체 면적. 부분 갱신이 실제로 성립하는지는
                     // 이 둘의 비교로만 알 수 있다.
                     let dirty = (update_rect_v.width() as u64) * (update_rect_v.height() as u64);
                     let tile = (tile_rect.width() as u64) * (tile_rect.height() as u64);
+                    // ★같은 텍스처가 다시 왔는가만 본다. 이 주소는 역참조하지 않는다★ --
+                    // `last_begin_texture` 주석 참조. 지금은 bind 마다 pbuffer 를 새로 만들고
+                    // 지우므로 이 값은 "재사용을 넣으면 얼마나 적중할까" 의 사전 예보다.
+                    let reused = entry
+                        .last_begin_texture
+                        .insert((id.x, id.y), texture as usize)
+                        == Some(texture as usize);
+                    let profile = &mut self.bind_profile;
+                    profile.binds += 1;
+                    profile.begin_ns += elapsed;
+                    profile.begin_ns_max = profile.begin_ns_max.max(elapsed);
                     profile.dirty_px += dirty;
                     profile.tile_px += tile;
                     if dirty >= tile {
                         profile.full_tile += 1;
+                    }
+                    profile.update_px_max = profile.update_px_max.max(dirty);
+                    profile.update_sizes.note(
+                        update_rect_v.width().max(0) as u32,
+                        update_rect_v.height().max(0) as u32,
+                    );
+                    profile.tex_px_max = profile
+                        .tex_px_max
+                        .max(desc.Width as u64 * desc.Height as u64);
+                    profile.tex_sizes.note(desc.Width, desc.Height);
+                    if reused {
+                        profile.tex_reused += 1;
+                    } else {
+                        profile.tex_changed += 1;
                     }
                 }
                 let pbuffer_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
@@ -3271,7 +3752,13 @@ impl Compositor for DCompNativeCompositor {
                     return fail;
                 }
                 if let Some(start) = pbuffer_start {
-                    self.bind_profile.pbuffer_ns += start.elapsed().as_nanos() as u64;
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    let profile = &mut self.bind_profile;
+                    profile.pbuffer_ns += elapsed;
+                    profile.pbuffer_ns_max = profile.pbuffer_ns_max.max(elapsed);
+                    // 지금은 bind 마다 하나씩 만드므로 창 합계가 곧 "초당 새로 만든 면적"
+                    // 이다. `alloc_mb` 로 환산해 `GPUMEM` 톱니와 자릿수를 맞춰 본다.
+                    profile.alloc_px += desc.Width as u64 * desc.Height as u64;
                 }
 
                 // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 영역)를
@@ -3480,100 +3967,51 @@ impl Compositor for DCompNativeCompositor {
             }
         }
         if *DCOMP_BIND_PROF {
-            self.bind_profile.end_ns += end_ns.unwrap_or(0);
+            let end = end_ns.unwrap_or(0);
+            self.bind_profile.end_ns += end;
+            self.bind_profile.end_ns_max = self.bind_profile.end_ns_max.max(end);
             if let Some(start) = destroy_start {
-                self.bind_profile.destroy_ns += start.elapsed().as_nanos() as u64;
+                let teardown = start.elapsed().as_nanos() as u64;
+                self.bind_profile.destroy_ns += teardown;
+                self.bind_profile.destroy_ns_max = self.bind_profile.destroy_ns_max.max(teardown);
             }
             self.maybe_emit_bind_profile();
         }
     }
 
-    fn begin_frame(&mut self, _device: &mut Device) {
-        if *DCOMP_BIND_PROF {
-            // 호출 수만 센다. 시간은 `end_frame` 에서 재는데, 이 컴포지터에서 매 프레임 무거운
-            // 일(flush / Present / Commit)을 하는 자리가 거기뿐이기 때문이다. 계수가 따로
-            // 필요한 이유는 `end_frames` 와 나란히 놓았을 때 프레임당 1:1 인지, 그리고 그 수가
-            // painter 의 렌더 횟수와 맞는지가 드러나기 때문이다 — 1 차 계측에서 bind 수와 렌더
-            // 수가 3 배 어긋난 것이 결정적 단서였다.
-            self.bind_profile.begin_frames += 1;
-        }
-        // external 배치는 정상적으로 직전 프레임 start_compositing에서 닫힌다. 만약 어떤 이유로
-        // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
-        // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
-        self.close_external_batch();
-        // 지난 프레임이 미뤄 둔 Commit 이 아직 남아 있으면 여기서 흘린다 — 셸이 flush 를
-        // 부르지 않는 경우(servoshell)에도 화면이 멈추지 않게 하는 자기복구다.
-        self.flush_deferred_commit();
-        // ★스케줄러에 걸린 마감도 여기서 먼저 내보낸다.★ 아래부터 이 프레임의 서피스가
-        // `BeginDraw` 로 열리고, 그동안 그 디바이스의 `Commit()` 은 전부 거부된다
-        // (`SURFACE_BEING_RENDERED`). 마감은 최대 한 주기 뒤이고 프레임 간격도 그 정도라
-        // 겹침은 타일에 따라 상시로 일어난다 -- 실기 2 회차에서 저더와 깜박임의 정체가
-        // 이것이었다. 정렬 pref 가 꺼져 있으면 이 함수는 즉시 돌아온다.
-        #[cfg(windows)]
-        if let Some(dcomp_device) = self.dcomp_device_ptr() {
-            crate::commit_scheduler::flush_before_render(dcomp_device as usize);
-        }
-        let Some(root) = self.root_visual_ptr() else {
+    /// ★여기가 22~24ms 짜리 렌더 정체가 나타난 자리다.★ WR 의 `compositor_begin_ms`
+    /// (`vendor_local/webrender/src/renderer/mod.rs:1746-1753`)가 재는 것이 이 함수 **전체**
+    /// 이고, 같은 프레임의 `draw_frame_ms` 는 1ms 미만이었다. 그런데 이 안을 쪼갠 적이 없어서
+    /// 어느 줄인지는 소거법 추정으로만 남아 있었다 -- 그 추정을 숫자로 바꾸는 것이 아래
+    /// 계측이다. 토막 셋의 합과 전체의 차이(`bf_rest`)를 반드시 남긴다.
+    fn begin_frame(&mut self, device: &mut Device) {
+        let start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        let split = self.begin_frame_inner(device);
+        let Some(start) = start else {
             return;
         };
-        // 월 가드밴드 크롭: 렌더 서피스는 render rect(오버랩 확장) 크기인데 창은 visible rect
-        // 크기다. root visual을 -inset만큼 밀어 visible 영역이 창 원점에 오게 한다. 전 비주얼이
-        // root의 직속 자식이므로(end_frame의 AddVisual) WR 타일과 external 비디오에 균일하게
-        // 적용된다. root의 오프셋은 자식들에게는 부모 변환이라, 각 자식의 offset과 clip
-        // 모두에 동일하게(uniformly) 걸린다 — 그래서 둘 사이의 상대 관계가 그대로 보존되고
-        // `apply_visual_placement`(자식 offset/clip 산식)는 수정할 필요가 없다. 창 밖으로
-        // 밀려난 가드밴드는 HWND 경계에서 DWM이 클립하므로 root 클립은 불필요하다.
-        //
-        // DComp는 top-left 원점이라 y에 `-top`을 쓴다 — GL blit 경로가 `bottom`을 쓰는 것과
-        // 규약이 반대다(§`RenderingContext::present_inset`).
-        let inset = self.rendering_context.present_inset();
-        let offset = (-inset.left, -inset.top);
-        if self.last_root_offset != Some(offset) {
-            // Safety: root는 살아있는 IDCompositionVisual.
-            let (hr_x, hr_y) = unsafe {
-                let hr_x = (*root).SetOffsetX_1(offset.0 as f32);
-                if hr_x < 0 {
-                    warn!(
-                        "[dcomp-native] root SetOffsetX failed (hr=0x{:08x})",
-                        hr_x as u32
-                    );
-                }
-                let hr_y = (*root).SetOffsetY_1(offset.1 as f32);
-                if hr_y < 0 {
-                    warn!(
-                        "[dcomp-native] root SetOffsetY failed (hr=0x{:08x})",
-                        hr_y as u32
-                    );
-                }
-                (hr_x, hr_y)
-            };
-            // present_inset은 타일 창 수명 내내 고정값이라 캐시가 "값 변화"로 무효화될 일이 없다.
-            // 따라서 SetOffsetX/Y 중 하나라도 실패했는데 캐시를 기록해버리면 그 프레임이 "이미
-            // 적용됨"으로 오인되어 이후 어떤 프레임에서도 재시도되지 않는다 — 두 HRESULT가
-            // 모두 성공했을 때만 캐시를 기록한다.
-            if hr_x >= 0 && hr_y >= 0 {
-                // 이 파일은 `use log::warn;`만 import하고 info는 항상 경로 한정으로 쓴다(:184 등).
-                log::info!(
-                    "[dcomp-native] root guard-band offset ({}, {}) applied from present_inset {:?}",
-                    offset.0,
-                    offset.1,
-                    inset
-                );
-                self.last_root_offset = Some(offset);
-            }
-        }
-        self.frame_counter += 1;
-        // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
-        // Safety: root는 살아있는 IDCompositionVisual.
-        let hr = unsafe { (*root).RemoveAllVisuals() };
-        if hr < 0 {
-            warn!(
-                "[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})",
-                hr as u32
-            );
-        }
-        // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
-        self.frame_surfaces.clear();
+        let total = start.elapsed().as_nanos() as u64;
+        let parts = split.deferred_ns + split.early_ns + split.removeall_ns;
+        // 전체는 토막들을 감싸고 재므로 단조 시계에서 항상 크거나 같다. 어긋났다면 계측
+        // 배선이 틀린 것이지 측정값이 아니다.
+        debug_assert!(
+            total >= parts,
+            "begin_frame split {parts}ns exceeds total {total}ns"
+        );
+        let profile = &mut self.bind_profile;
+        // 호출 수만 세던 자리다. `end_frames` 와 나란히 놓았을 때 프레임당 1:1 인지, 그리고
+        // 그 수가 painter 의 렌더 횟수와 맞는지가 드러난다 — 1 차 계측에서 bind 수와 렌더
+        // 수가 3 배 어긋난 것이 결정적 단서였다.
+        profile.begin_frames += 1;
+        profile.bf_total_ns += total;
+        profile.bf_total_ns_max = profile.bf_total_ns_max.max(total);
+        profile.bf_deferred_ns += split.deferred_ns;
+        profile.bf_deferred_ns_max = profile.bf_deferred_ns_max.max(split.deferred_ns);
+        profile.bf_early_ns += split.early_ns;
+        profile.bf_early_ns_max = profile.bf_early_ns_max.max(split.early_ns);
+        profile.bf_removeall_ns += split.removeall_ns;
+        profile.bf_removeall_ns_max = profile.bf_removeall_ns_max.max(split.removeall_ns);
+        profile.bf_rest_ns += total.saturating_sub(parts);
     }
 
     fn add_surface(
@@ -3920,7 +4358,8 @@ impl Compositor for DCompNativeCompositor {
                         let dirty = std::mem::take(&mut sc.frame_dirty);
                         // Safety: 살아있는 스왑체인. SyncInterval 은 `gfx_present_sync_interval`(기본 0 = 비블로킹).
                         let present_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-                        let hr = unsafe { (*sc.swapchain.as_ptr()).Present(*PRESENT_SYNC_INTERVAL, 0) };
+                        let hr =
+                            unsafe { (*sc.swapchain.as_ptr()).Present(*PRESENT_SYNC_INTERVAL, 0) };
                         if let Some(start) = present_start {
                             present_ns += start.elapsed().as_nanos() as u64;
                             presents += 1;
@@ -4403,7 +4842,7 @@ impl Compositor for DCompNativeCompositor {
         // 임계구역에 남는 것은 `Commit()` 하나뿐이어야 한다는 원칙(C3, R5)을 여기서도 지킨다 --
         // 특히 실패 로그는 TDR 뒤에 매 프레임 찍히므로 가드 안에 두면 안 된다.
         let commit_hr = if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
-            Some(self.commit_device_locked(dcomp_device))
+            Some(self.commit_device_locked(dcomp_device, CommitSite::EndFrame))
         } else {
             self.commit_pending = true;
             if *DCOMP_BIND_PROF {
@@ -4512,6 +4951,7 @@ impl Compositor for DCompNativeCompositor {
                 promote_blocked_until: 0,
                 frame_drawn_partial: false,
                 content_valid_union: None,
+                last_begin_texture: FxHashMap::default(),
             }
         };
         if dcomp_debug() {
@@ -4733,6 +5173,103 @@ impl Compositor for SharedDComp {
 
     fn deinit(&mut self, device: &mut Device) {
         self.0.borrow_mut().deinit(device)
+    }
+}
+
+/// 커밋 계측의 누적·비우기와 방출자 선출. COM 을 부르는 자리는 단위 테스트가 안 되므로
+/// 판정 규칙만 떼어 여기에 건다.
+#[cfg(test)]
+mod commit_probe_tests {
+    use super::*;
+
+    const SLOW: u64 = 8_000_000;
+
+    /// 합·최댓값·문턱 초과가 따로 쌓인다. ★`max` 하나로는 "느린 커밋 한 번" 과 "느린
+    /// 커밋 여럿" 이 구분되지 않는다★ -- 앞은 정체, 뒤는 구조적 부하다.
+    #[test]
+    fn a_slot_keeps_sum_max_and_the_slow_count_apart() {
+        let slot = CommitSlot::new();
+        slot.record(1_000_000, SLOW);
+        slot.record(22_000_000, SLOW);
+        slot.record(2_000_000, SLOW);
+        assert_eq!(
+            slot.drain(),
+            CommitTotals {
+                n: 3,
+                sum_ns: 25_000_000,
+                max_ns: 22_000_000,
+                over_n: 1,
+            }
+        );
+    }
+
+    /// 문턱은 포함 경계다(`>=`). 기본 8ms 에서 정확히 8ms 짜리는 느린 쪽이다.
+    #[test]
+    fn the_threshold_includes_its_own_value() {
+        let slot = CommitSlot::new();
+        slot.record(SLOW - 1, SLOW);
+        slot.record(SLOW, SLOW);
+        assert_eq!(slot.drain().over_n, 1);
+    }
+
+    /// 비우면 0 으로 돌아간다 -- 창이 겹쳐 읽히지 않는다.
+    #[test]
+    fn draining_closes_the_window() {
+        let slot = CommitSlot::new();
+        slot.record(5_000_000, SLOW);
+        let _ = slot.drain();
+        assert_eq!(slot.drain(), CommitTotals::default());
+    }
+
+    /// ★둘이 다투면 하나만 이긴다.★ 넷이 각자 비우면 한 줄이 0.25 초 조각이 된다.
+    #[test]
+    fn only_one_compositor_wins_the_emitter_seat() {
+        let emitter = AtomicUsize::new(0);
+        assert!(claim_commitsite_emitter(&emitter, 0x1000));
+        assert!(!claim_commitsite_emitter(&emitter, 0x2000));
+        // 이긴 쪽은 다음 창에도 계속 이긴다.
+        assert!(claim_commitsite_emitter(&emitter, 0x1000));
+    }
+
+    /// 방출자가 죽으면 자리가 비고 다음 컴포지터가 집는다. 남의 자리는 비우지 못한다.
+    #[test]
+    fn the_seat_is_freed_only_by_its_owner() {
+        let emitter = AtomicUsize::new(0);
+        assert!(claim_commitsite_emitter(&emitter, 0x1000));
+        release_commitsite_emitter(&emitter, 0x2000);
+        assert!(!claim_commitsite_emitter(&emitter, 0x2000));
+        release_commitsite_emitter(&emitter, 0x1000);
+        assert!(claim_commitsite_emitter(&emitter, 0x2000));
+    }
+
+    /// 디바이스 포인터가 0 이면 집지 않는다 -- 0 은 "미정" 표식이라 겹친다.
+    #[test]
+    fn a_null_device_never_claims_the_seat() {
+        let emitter = AtomicUsize::new(0);
+        assert!(!claim_commitsite_emitter(&emitter, 0));
+        assert_eq!(emitter.load(Ordering::Relaxed), 0);
+    }
+
+    /// 같은 크기는 한 가지로 센다. 세는 것은 횟수가 아니라 가짓수다.
+    #[test]
+    fn a_size_set_counts_kinds_not_occurrences() {
+        let mut sizes = SizeSet::default();
+        sizes.note(1024, 512);
+        sizes.note(1024, 512);
+        sizes.note(1024, 513);
+        assert_eq!(sizes.distinct(), 2);
+        assert_eq!(sizes.overflow_mark(), "");
+    }
+
+    /// 넘쳐도 할당하지 않는다. 16 에서 멈추고 넘침을 표시한다.
+    #[test]
+    fn a_size_set_saturates_without_allocating() {
+        let mut sizes = SizeSet::default();
+        for i in 0..SizeSet::CAP as u32 + 5 {
+            sizes.note(i, i);
+        }
+        assert_eq!(sizes.distinct(), SizeSet::CAP);
+        assert_eq!(sizes.overflow_mark(), "+");
     }
 }
 
