@@ -197,6 +197,17 @@ Copy-Item (Join-Path $repo "tests\html\wall_anim_jitter_probe.html") (Join-Path 
 # Does a CSS animation survive a blocked script thread? Blocks its own script thread on a
 # timer, the way a content switch does, with a CSS-animated bar next to a rAF counter.
 Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# Ticker slice probe (E-clip). The jitter probe above is clean on the wall while the IPWall
+# output page is not, and the one structural difference is the output shell's `overflow:
+# hidden`: Servo turns that into a WebRender scroll root, every scroll root cuts a slice, and
+# every slice asks DComp for an opaque + alpha virtual surface pair. This page rebuilds the
+# output page's five nested overflow boxes and lets `?clip=none|all|shell|inner` turn each
+# level from `hidden` into `clip` (a plain clip, no scroll root), so the slice count is the
+# only thing that moves. It is the control group for the DComp commit probe:
+#   .\run_wall_dist.ps1 -Serve -Url "ticker_slice_probe.html?clip=none" -DcompBindProf ...
+# Read `[page] ECLIP` for the configuration that actually ran, then COMMITSITE and the
+# begin_frame split against the same run with `clip=all`.
+Copy-Item (Join-Path $repo "tests\html\ticker_slice_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # --- 5. launcher ---
