@@ -468,6 +468,24 @@ struct WallFrameRequest {
     wall_webview_targets: Vec<(WebViewId, Vec<PainterId>)>,
 }
 
+/// `issue_wall_frame_request` 가 타일마다 부를 진입점.
+///
+/// ★두 경로가 같은 팬아웃을 쓰되 타일에 닿는 문은 다르다.★ 번호 채번·배리어 등록·
+/// keep-previous 만료는 벽 수준이라 공유해야 하지만, 틱은 `Script` 쪽 게이트를 타면 안
+/// 된다 -- `generate_frame_for_script` 는 `!needs_new_frame()` 에서 `renderer_behind()`
+/// ***전에*** 돌아서므로, 틱이 그 문으로 들어가면 2 초 강제 해제가 영영 안 돈다(그것이
+/// "4 개 중 2 개 타일 44 초 사망" 조건이다).
+///
+/// Task 7 이 스크립트 경로를 값 적재로 격하하면 `Script` 가 사라지고 이 선택도 같이
+/// 사라진다. 그때까지만 있는 갈림길이다.
+#[derive(Clone, Copy)]
+enum TileEntryPoint {
+    /// 오늘의 열한 생산 경로. `Painter::generate_frame_for_script`.
+    Script,
+    /// 페이싱 틱. `Painter::generate_frame_for_wall_tick`.
+    Tick,
+}
+
 struct CoalescedWallFrameRequest {
     request: WallFrameRequest,
     coalesced_count: u64,
@@ -1856,10 +1874,9 @@ impl Paint {
     /// 한 주기에 두 번 밀어 넣지 않을까: 안 그런다. 안쪽 `push_due` 게이트가 ★마지막
     /// 밀어넣기 이후 렌더가 있었는가★ 로 판정하므로, 렌더 없이 또 불러도 값이 다시
     /// 나가지 않는다.
-    #[allow(
-        dead_code,
-        reason = "틱 배선은 Task 5 다. 순서를 구조로 고정하려고 먼저 낸다."
-    )]
+    ///
+    /// ★크레이트 밖으로 내보내지 않는다.★ 유일한 호출자는 `on_wall_tick` 이고, 그래야
+    /// 순서를 틀리게 부를 방법이 애초에 없다.
     pub(crate) fn gather_components(&self) {
         for painter_id in self.painter_ids() {
             self.with_painter_mut(painter_id, |painter| painter.pump_paint_animation());
@@ -1875,12 +1892,29 @@ impl Paint {
     /// ★pacing 게이트를 거치지 않고 `issue_wall_frame_request` 로 바로 간다.★ 틱 자체가
     /// 페이서다. coalesce 는 "스크립트가 주기보다 빨리 조른다" 를 막는 장치이고, 주기마다
     /// 정확히 한 번 부르는 호출자에게는 미룰 것이 없다.
-    pub fn produce_wall_frame(&self) -> Option<u64> {
+    ///
+    /// ★`gather_components` 와 마찬가지로 크레이트 밖에 내지 않는다★ — 밖에서 쓰는 문은
+    /// `on_wall_tick` 하나다.
+    pub(crate) fn produce_wall_frame(&self) -> Option<u64> {
         let request = self.wall_frame_request_for_all_tiles();
         if request.target_painter_ids.is_empty() {
             return None;
         }
-        self.issue_wall_frame_request(request)
+        self.issue_wall_frame_request(request, TileEntryPoint::Tick)
+    }
+
+    /// ★페이싱 틱이 벽에 들어오는 유일한 문.★ 셸이 표출 주기마다 한 번 부른다.
+    ///
+    /// 하는 일은 순서 둘뿐이다: 구성 요소를 모으고(`gather_components`), 그 다음 프레임을
+    /// 낸다(`produce_wall_frame`). 둘을 각각 내놓지 않고 이 문 하나만 공개하는 이유가
+    /// 그 순서다 — 불변식 8 은 동적 속성의 합집합을 합성 ***전에*** 모으라 하고, 불변식 9 는
+    /// 뒤집었을 때의 실측(요청 120 / 폐기 60)을 걸어 둔다. 바깥에 둘 다 공개하면 호출자가
+    /// 순서를 틀릴 수 있지만, 문이 하나면 ★틀릴 방법 자체가 없다.★
+    ///
+    /// 돌려주는 값은 이번 주기의 논리 프레임 번호다(낼 타일이 없으면 `None`).
+    pub fn on_wall_tick(&self) -> Option<u64> {
+        self.gather_components();
+        self.produce_wall_frame()
     }
 
     fn max_pending_frames_for_targets(&self, target_painter_ids: &[PainterId]) -> usize {
@@ -1942,7 +1976,7 @@ impl Paint {
         block_reason: WallFramePacingBlockReason,
     ) {
         let Some(webview_id) = request.pacing_key() else {
-            let _ = self.issue_wall_frame_request(request);
+            let _ = self.issue_wall_frame_request(request, TileEntryPoint::Script);
             return;
         };
 
@@ -2090,7 +2124,11 @@ impl Paint {
         );
     }
 
-    fn issue_wall_frame_request(&self, request: WallFrameRequest) -> Option<u64> {
+    fn issue_wall_frame_request(
+        &self,
+        request: WallFrameRequest,
+        entry_point: TileEntryPoint,
+    ) -> Option<u64> {
         let wall_frame_requested_at = Instant::now();
         let logical_frame_id = self.next_logical_frame_id();
         // Before anything else: a newer wall frame supersedes any "keep the previous frame"
@@ -2117,9 +2155,19 @@ impl Paint {
 
         let mut generated_painter_ids = Vec::new();
         for painter_id in &request.target_painter_ids {
-            let generated = self.with_painter_mut(*painter_id, move |painter| {
-                painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at)
-            });
+            // ★타일에 닿는 문만 갈린다.★ 위의 번호 채번과 아래의 배리어 등록은 두 경로가
+            // 같이 쓴다 -- 벽 수준 연산이기 때문이다. 왜 틱이 스크립트 문으로 못 들어가는지는
+            // `TileEntryPoint`.
+            let generated = match entry_point {
+                TileEntryPoint::Script => self.with_painter_mut(*painter_id, move |painter| {
+                    painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at)
+                }),
+                TileEntryPoint::Tick => self.with_painter_mut(*painter_id, move |painter| {
+                    painter
+                        .generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+                        .generated()
+                }),
+            };
             if generated == Some(true) {
                 generated_painter_ids.push(*painter_id);
             }
@@ -2186,7 +2234,10 @@ impl Paint {
                     self.with_painter(*painter_id, |painter| painter.note_wall_pacer_join());
                 }
             }
-            let logical_frame_id = self.issue_wall_frame_request(coalesced_request.request.clone());
+            let logical_frame_id = self.issue_wall_frame_request(
+                coalesced_request.request.clone(),
+                TileEntryPoint::Script,
+            );
             debug!(
                 "Wall frame pacing released: webview={:?} logical_frame_id={:?} \
                  target_painters={:?} pending_max={} coalesced_for_webview={} \
@@ -2471,7 +2522,7 @@ impl Paint {
                 if let Some(block_reason) = self.wall_frame_request_pacing_block_reason(&request) {
                     self.coalesce_wall_frame_request(request, block_reason);
                 } else {
-                    let _ = self.issue_wall_frame_request(request);
+                    let _ = self.issue_wall_frame_request(request, TileEntryPoint::Script);
                 }
             },
             PaintMessage::GetWebViewPainterTargets(webview_id, sender) => {

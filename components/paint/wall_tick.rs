@@ -27,6 +27,17 @@ pub(crate) enum TileOutcome {
     KeepPrevious,
 }
 
+impl TileOutcome {
+    /// 이 타일이 실제로 합성을 냈는가. ★배리어가 기다릴 대상을 고르는 자리에서 쓴다.★
+    ///
+    /// 유지한 타일을 "냈다" 로 세면 배리어가 ***오지 않을 frame-ready 를*** 기다리고,
+    /// 그 논리 프레임은 마감까지 안 닫힌다. 변형이 늘어날 때 무엇이 생산으로 세어지는지를
+    /// 한자리에서 정하려고 메서드로 둔다.
+    pub(crate) fn generated(self) -> bool {
+        matches!(self, TileOutcome::Generated)
+    }
+}
+
 /// 이 타일이 이번 틱에 합성을 낼 수 있는가.
 ///
 /// ★두 인자는 호출자가 **고정된 순서로** 평가해서 넘긴다.★ `renderer_behind` 가 먼저다.
@@ -66,5 +77,16 @@ mod tests {
     #[test]
     fn a_free_tile_generates() {
         assert_eq!(tile_may_generate(false, false), TileOutcome::Generated);
+    }
+
+    /// ★배리어는 실제로 낸 타일만 기다린다.★ 유지한 타일을 생성 집합에 넣으면 배리어가
+    /// 오지 않을 frame-ready 를 기다리고 그 논리 프레임이 안 닫힌다.
+    #[test]
+    fn only_a_generated_tile_counts_as_produced() {
+        let counted: Vec<TileOutcome> = [TileOutcome::Generated, TileOutcome::KeepPrevious]
+            .into_iter()
+            .filter(|outcome| outcome.generated())
+            .collect();
+        assert_eq!(counted, vec![TileOutcome::Generated]);
     }
 }

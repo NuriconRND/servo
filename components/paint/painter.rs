@@ -3825,12 +3825,11 @@ impl Painter {
     ///
     /// 돌려주는 `TileOutcome` 은 호출자가 이 타일을 배리어에 어떻게 넣을지 정하는 값이다.
     /// 거절한 타일을 조용히 빼면 화면에 프레임 N 과 N-1 이 섞이므로, 그 타일은
-    /// `KeepPrevious` 로 같은 논리 프레임에 참여해야 한다 -- 그 배선은 Task 8 이 넣는다.
-    #[allow(
-        dead_code,
-        reason = "아직 아무도 안 부른다. `issue_wall_frame_request` 의 팬아웃을 \
-                  `generate_frame_for_script` 에서 이쪽으로 옮기는 것은 Task 7/8 이다."
-    )]
+    /// `KeepPrevious` 로 같은 논리 프레임에 참여해야 한다 -- 지금은 `generated()` 가
+    /// 거짓인 타일이 배리어의 기대 집합에서 빠질 뿐이고, 유지를 실제로 지시하는 배선은
+    /// Task 8 이 넣는다.
+    ///
+    /// 호출자는 `Paint::issue_wall_frame_request` 의 `TileEntryPoint::Tick` 갈래 하나다.
     pub(crate) fn generate_frame_for_wall_tick(
         &mut self,
         logical_frame_id: u64,
