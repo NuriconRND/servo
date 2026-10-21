@@ -156,6 +156,7 @@ use crate::paint::{RepaintReason, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::ScreenshotTaker;
+use crate::wall_tick::{TileOutcome, tile_may_generate};
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
@@ -3803,6 +3804,59 @@ impl Painter {
         self.send_transaction(transaction);
     }
 
+    /// 페이싱 틱이 이 타일에 벽 프레임 하나를 요구한다.
+    ///
+    /// ★`generate_frame_for_script` 의 인자 하나가 아니라 별개의 진입점인 이유는 몸통의
+    /// 순서다.★ 저쪽은 `needs_new_frame()` 이 거짓이면 `renderer_behind()` 에 닿기 전에
+    /// 돌아선다. 여기서는 그럴 수 없다 -- 아래 1 번의 이유를 보라.
+    ///
+    /// 몸통 순서는 바꿀 수 없다:
+    ///
+    /// 1. `renderer_behind()` 를 ★무조건 먼저★ 부른다. 그것은 조회가 아니라 liveness
+    ///    프로브이고, 2 초 강제 해제가 **거절 경로에서만** 돈다("a stuck painter sends no
+    ///    transactions, so it gets no frame-ready and no render -- but the wall keeps asking
+    ///    it for frames, so this runs"). 답이 "건너뛴다" 인 타일에서도 매 틱 불러야 한다.
+    ///    실측(2026-08-31): 이 호출을 잃자 네 페인터 중 둘이 렌더를 멈추고 남은 44 초 동안
+    ///    돌아오지 않았다.
+    /// 2. 캔버스 이미지 대기만 본다. `needs_new_frame()` 이 아닌 이유는
+    ///    `FrameDelayer::waiting_on_canvas_images` 에 적혀 있다 -- 그쪽은 `pending_frame`,
+    ///    곧 ★스크립트의 빚★ 도 같이 보는데 틱 생산은 그것과 무관하게 돈다(규칙 2).
+    /// 3. 둘을 `tile_may_generate` 에 넘겨 판정한다.
+    ///
+    /// 돌려주는 `TileOutcome` 은 호출자가 이 타일을 배리어에 어떻게 넣을지 정하는 값이다.
+    /// 거절한 타일을 조용히 빼면 화면에 프레임 N 과 N-1 이 섞이므로, 그 타일은
+    /// `KeepPrevious` 로 같은 논리 프레임에 참여해야 한다 -- 그 배선은 Task 8 이 넣는다.
+    #[allow(
+        dead_code,
+        reason = "아직 아무도 안 부른다. `issue_wall_frame_request` 의 팬아웃을 \
+                  `generate_frame_for_script` 에서 이쪽으로 옮기는 것은 Task 7/8 이다."
+    )]
+    pub(crate) fn generate_frame_for_wall_tick(
+        &mut self,
+        logical_frame_id: u64,
+        requested_at: Instant,
+    ) -> TileOutcome {
+        let behind = self.renderer_behind();
+        let waiting = self.frame_delayer.waiting_on_canvas_images();
+        match tile_may_generate(behind, waiting) {
+            TileOutcome::KeepPrevious => TileOutcome::KeepPrevious,
+            TileOutcome::Generated => {
+                let mut transaction = Transaction::new();
+                // 쌓인 비디오 프레임은 이 안에서 무조건 실린다 -- 생산은 구성 요소를
+                // **모을** 뿐이고, 무엇이 들었는지 묻지 않는다(규칙 3).
+                self.generate_frame_with_diagnostic_id(
+                    &mut transaction,
+                    RenderReasons::SCENE,
+                    Some(logical_frame_id),
+                    Some(requested_at),
+                );
+                self.set_display_composite_in_flight(true);
+                self.send_transaction(transaction);
+                TileOutcome::Generated
+            },
+        }
+    }
+
     pub(crate) fn generate_frame_for_script(
         &mut self,
         diagnostic_frame_id: u64,
@@ -4834,6 +4888,16 @@ impl FrameDelayer {
         self.pending_frame && self.pending_canvas_images.is_empty()
     }
 
+    /// 틱 생산이 기다려야 하는가. ★`pending_frame` 은 보지 않는다.★
+    ///
+    /// `needs_new_frame()` 과 묻는 것이 다르다. 그쪽은 "스크립트가 빚진 프레임이 있고 그걸
+    /// 낼 준비가 됐는가" 이고, 여기는 "이 타일의 캔버스가 아직 WR 에 안 올라갔는가" 다.
+    /// 틱 생산은 ★스크립트의 빚과 무관하게★ 돌아야 하므로(규칙 2) 그 플래그를 보면 안
+    /// 된다 -- 보면 스크립트가 조용한 동안 틱이 영영 쉰다.
+    pub(crate) fn waiting_on_canvas_images(&self) -> bool {
+        !self.pending_canvas_images.is_empty()
+    }
+
     pub(crate) fn set_pending_frame(&mut self, value: bool) {
         self.pending_frame = value;
     }
@@ -5194,5 +5258,42 @@ mod raf_gate_tests {
     #[test]
     fn a_painter_that_never_drew_carries_nothing() {
         assert!(!raf_is_driving_composites(true, None, REFRESH));
+    }
+}
+
+#[cfg(test)]
+mod frame_delayer_canvas_wait_tests {
+    use servo_base::Epoch;
+    use servo_base::id::TEST_PIPELINE_ID;
+    use webrender_api::ImageKey;
+
+    use super::FrameDelayer;
+
+    /// ★스크립트의 빚은 틱을 세우지 않는다.★ `needs_new_frame()` 은 `pending_frame` 을
+    /// 같이 보므로 이 상태에서 참이고, 그 판정을 틱이 쓰면 스크립트가 아무것도 안 올리는
+    /// 동안 생산이 통째로 멎는다. 틱이 묻는 것은 캔버스뿐이다(규칙 2).
+    #[test]
+    fn a_pending_script_frame_is_not_a_canvas_wait() {
+        let mut delayer = FrameDelayer::default();
+        delayer.set_pending_frame(true);
+        assert!(delayer.needs_new_frame());
+        assert!(!delayer.waiting_on_canvas_images());
+    }
+
+    /// 캔버스가 아직 WR 에 안 올라갔으면 기다린다 -- `FrameDelayer` 계약 그대로다.
+    #[test]
+    fn an_outstanding_canvas_image_is_a_canvas_wait() {
+        let mut delayer = FrameDelayer::default();
+        delayer.add_delay(TEST_PIPELINE_ID, Epoch(1), vec![ImageKey::DUMMY]);
+        assert!(delayer.waiting_on_canvas_images());
+    }
+
+    /// 그 이미지가 올라오면 대기가 풀린다.
+    #[test]
+    fn an_uploaded_canvas_image_ends_the_wait() {
+        let mut delayer = FrameDelayer::default();
+        delayer.add_delay(TEST_PIPELINE_ID, Epoch(1), vec![ImageKey::DUMMY]);
+        delayer.update_image(ImageKey::DUMMY, Epoch(1));
+        assert!(!delayer.waiting_on_canvas_images());
     }
 }

@@ -91,6 +91,8 @@ mod refresh_driver;
 mod render_notifier;
 mod screenshot;
 mod touch;
+/// 벽 프레임 생산 틱의 순수 판정. 생산자가 하나라는 규칙을 떠받치는 타입들이 여기 모인다.
+mod wall_tick;
 mod web_content_animation;
 mod webrender_external_images;
 mod webview_renderer;

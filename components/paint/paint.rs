@@ -1830,6 +1830,59 @@ impl Paint {
         }
     }
 
+    /// ★전 타일을 대상으로 한 요청.★ 틱 생산은 벽 수준 연산이라 `WebView` 별로 나누지
+    /// 않는다 -- 한 주기에 논리 프레임 하나를 떠서 벽 전체에 뿌린다(규칙 1).
+    ///
+    /// 스크립트 경로의 생성자를 그대로 쓰고 **원천 집합만 "등록된 모든 painter"** 로
+    /// 바꾼다. 그래야 `wall_webview_targets`(스크롤 메타데이터 비교 대상)가 두 경로에서
+    /// 같은 규칙으로 채워지고, 순회가 `painters` 의 등록 순서를 따라 ★결정적★ 이다 --
+    /// `webview_painter_targets` 를 직접 훑으면 `HashMap` 순서라 배리어 등록과 pacing
+    /// 키가 실행마다 달라진다.
+    fn wall_frame_request_for_all_tiles(&self) -> WallFrameRequest {
+        self.wall_frame_request_from_source_painters(self.painter_ids())
+    }
+
+    /// ★구성 요소를 모은다. 생산보다 먼저, 독립된 호출로.★
+    ///
+    /// 불변식 8 은 동적 속성(색·float·transform·유지값)의 합집합을 합성을 만들기 ***전에***
+    /// 모으라 하고, 불변식 9 는 순서가 틀렸을 때의 실측(요청 120 / 폐기 60)을 걸어 둔다.
+    /// `produce_wall_frame` 안에 묻어 두면 나중에 재배치가 가능해지므로 별도 메서드로 둔다.
+    ///
+    /// 지금 값이 밀려 나가는 자리는 `Painter::pump_paint_animation` 하나이므로 그것을
+    /// 부른다. 그 함수는 값 푸시 말고 생산(쌓인 비디오 프레임, 유보한 애니메이션 프레임)도
+    /// 아직 쥐고 있는데, 그 격하는 Task 7 이다 -- 여기서 함수를 쪼개지 않는다. 떼고 나면
+    /// 이 호출이 순수한 값 푸시가 된다.
+    ///
+    /// 한 주기에 두 번 밀어 넣지 않을까: 안 그런다. 안쪽 `push_due` 게이트가 ★마지막
+    /// 밀어넣기 이후 렌더가 있었는가★ 로 판정하므로, 렌더 없이 또 불러도 값이 다시
+    /// 나가지 않는다.
+    #[allow(
+        dead_code,
+        reason = "틱 배선은 Task 5 다. 순서를 구조로 고정하려고 먼저 낸다."
+    )]
+    pub(crate) fn gather_components(&self) {
+        for painter_id in self.painter_ids() {
+            self.with_painter_mut(painter_id, |painter| painter.pump_paint_animation());
+        }
+    }
+
+    /// ★벽 프레임 하나를 낸다 -- 페이싱 틱의 단일 생산 지점.★
+    ///
+    /// 돌려주는 값은 이번 주기의 논리 프레임 번호다. 타일이 하나도 없으면 `None` 이고,
+    /// 그때는 번호를 태우지 않는다 -- 틱은 내용과 무관하게 매 주기 도므로, 받을 타일이
+    /// 없는 동안 번호만 올라가면 배리어 진단이 읽을 수 없게 된다.
+    ///
+    /// ★pacing 게이트를 거치지 않고 `issue_wall_frame_request` 로 바로 간다.★ 틱 자체가
+    /// 페이서다. coalesce 는 "스크립트가 주기보다 빨리 조른다" 를 막는 장치이고, 주기마다
+    /// 정확히 한 번 부르는 호출자에게는 미룰 것이 없다.
+    pub fn produce_wall_frame(&self) -> Option<u64> {
+        let request = self.wall_frame_request_for_all_tiles();
+        if request.target_painter_ids.is_empty() {
+            return None;
+        }
+        self.issue_wall_frame_request(request)
+    }
+
     fn max_pending_frames_for_targets(&self, target_painter_ids: &[PainterId]) -> usize {
         target_painter_ids
             .iter()
