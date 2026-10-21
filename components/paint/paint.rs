@@ -244,8 +244,10 @@ pub struct Paint {
     /// 나타난다. 그러면 로그만 보는 사람은 폭주를 영영 못 본다. 실제로 그랬다:
     /// `gather_components` 안의 깨우기가 다음 에지를 다시 예약해 ★틱 N 이 틱 N+1 을
     /// 되먹임하는 고리★ 가 있었고(2026-10-22 전수 리뷰 5 번), 아무 지표도 그것을 안 보였다.
-    /// `produced / edges` 가 1 에 가까우면 생산이 박자를 쥔 것이고, 0 에 가까우면 루프가
-    /// 헛도는 것이다.
+    ///
+    /// ★판정은 `produced` 혼자 한다 -- 비(ratio)가 아니다.★ 건강한 상태에서 `produced` 는
+    /// 표출률(60)이고 `edges` 는 폴링 속도(수만)라, 정상일수록 비는 0 에 가깝다. 비를
+    /// 판정으로 쓰면 고친 상태가 고장으로 읽힌다. 읽는 법은 `Paint::note_demand_tick`.
     demand_tick_edges_in_window: Cell<u64>,
     demand_tick_produced_in_window: Cell<u64>,
     demand_tick_window_start: Cell<Option<Instant>>,
