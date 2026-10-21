@@ -317,10 +317,11 @@ pub(crate) struct Painter {
     /// 남은 ack 주입 횟수(`SERVO_WALL_CANVAS_ACK_SKIP`). 0 이면 주입 없음 = 기본값.
     canvas_ack_skips_left: Cell<u64>,
 
-    /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
-    /// ★낡음(2026-08-25 기록, 2026-09-02 `2f97f5190c2`·2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고, `present_external_only`(:4047)는 `generate_frame` 을 안 거쳐 이 집계에 아예 안 들어온다.
-    /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
-    /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
+    /// 합성 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `(FrameSource, 이유 문자열)` 이다.
+    /// `FrameSource::WebRender` 는 `generate_frame` 을 부른 호출 지점의 줄 번호(11 곳)이고,
+    /// WR 프레임이 아닌 두 경로도 같은 집계에 들어온다 — `ExternalSurface`(`present_external_only`
+    /// 의 DComp 직행 commit)와 `WallPacerJoin`(coalesce 됐다 풀린 벽 요청; total 에는 안 더한다).
+    /// 요청 경로가 여럿이라, 초당 200 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
     frame_reason_counts: RefCell<FrameReasonCounts>,
     frame_reason_window_start: Cell<Option<Instant>>,
 
@@ -2750,8 +2751,8 @@ impl Painter {
     /// ★왜★ — 20 영상 월에서 단일 painter 가 초당 200 회 이상 합성했는데,
     /// `gfx_refresh_hz` 는 렌더러 틱(60Hz)만 페이싱하고 script 는 자체 20/30ms 타이머를
     /// 따로 돌린다. 둘을 합쳐도 상한이 ~110 이라 남은 몫이 어디서 오는지 총합만으로는
-    /// ★낡음(2026-08-25 기록, 2026-09-02 `2f97f5190c2`·2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고 `present_external_only`(:4047)는 WR 을 안 거쳐 여기 안 잡힌다.
-    /// 알 수 없다. `generate_frame` 호출 지점이 9 곳이므로 출처를 줄 번호로 가른다.
+    /// 알 수 없다. `generate_frame` 호출 지점이 11 곳이므로 WR 출처는 줄 번호로 가른다.
+    /// WR 을 안 거치는 `present_external_only` 는 `note_frame_source` 로 따로 센다.
     ///
     /// 기본 off(`SERVO_FRAME_REASON_PROF`). 프레임마다 불리는 자리라 켜져 있을 때만
     /// 해시맵을 건드린다.
@@ -2800,8 +2801,7 @@ impl Painter {
     /// Queue a new frame in the transaction and increase the pending frames count.
     ///
     /// `#[track_caller]`: so `note_frame_reason` can name the call site without every one of
-    /// ★낡음(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ — nine 이 아니라 열한 자리다.
-    /// the nine callers having to pass a label.
+    /// the eleven callers having to pass a label.
     #[track_caller]
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
         self.generate_frame_with_diagnostic_id(transaction, reason, None, None);
