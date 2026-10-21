@@ -1496,7 +1496,6 @@ impl Default for SizeSet {
 struct BeginFrameSplit {
     deferred_ns: u64,
     early_ns: u64,
-    removeall_ns: u64,
 }
 
 #[derive(Default)]
@@ -1570,10 +1569,13 @@ struct BindProfile {
     bf_deferred_ns_max: u64,
     bf_early_ns: u64,
     bf_early_ns_max: u64,
-    bf_removeall_ns: u64,
-    bf_removeall_ns_max: u64,
-    /// 전체에서 셋을 뺀 나머지(`close_external_batch`, root 오프셋, 부기). 위 주석 참조.
+    /// 전체에서 둘을 뺀 나머지(`close_external_batch`, root 오프셋, 부기). 위 주석 참조.
     bf_rest_ns: u64,
+    /// `RemoveAllVisuals`. ★`begin_frame` 이 아니라 `end_frame` 안에 있다★ -- 지우기와 다시
+    /// 붙이기 사이에 트리가 비는 구간을 임계구역 안으로 가두려고 옮겼다(그쪽 주석 참고).
+    /// 그래서 `bf_*` 가 아니라 따로 찍는다. `end_frame_ms` 안에 포함된 값이다.
+    removeall_ns: u64,
+    removeall_ns_max: u64,
     /// 갱신 요청한 면적과 타일 전체 면적. ★둘이 같으면 부분 갱신이 성립하지 않는 것이다★ —
     /// 그러면 비용이 캔버스가 아니라 `gfx_wr_picture_tile_size` 에 비례한다.
     dirty_px: u64,
@@ -3293,19 +3295,22 @@ impl DCompNativeCompositor {
             }
         }
         self.frame_counter += 1;
-        // 매 프레임 z-order를 add_surface 호출 순서로 재구성하기 위해 전부 제거(트레이트 계약).
-        // Safety: root는 살아있는 IDCompositionVisual.
-        let removeall_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-        let hr = unsafe { (*root).RemoveAllVisuals() };
-        if let Some(start) = removeall_start {
-            split.removeall_ns = start.elapsed().as_nanos() as u64;
-        }
-        if hr < 0 {
-            warn!(
-                "[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})",
-                hr as u32
-            );
-        }
+        // ★`RemoveAllVisuals` 는 여기 있었다. `end_frame` 의 AddVisual 직전으로 옮겼다.★
+        //
+        // 여기서 비우면 그 순간부터 `end_frame` 이 가드를 잡을 때까지 비주얼 트리가 **빈 채로**
+        // 남고, 그 구간은 가드 밖이다. 그동안 스케줄러 워커가 그 디바이스를 커밋하면 DWM 이
+        // 빈 트리를 합성하고, 그러면 창 자체의 DComp 이전 내용(작업표시줄·좌상단 흰 사각형·
+        // 검은 영역)이 한 프레임 비친다 -- 실기에서 재생 중 간헐적으로 관측된 깜박임이다.
+        //
+        // `SURFACE_BEING_RENDERED` 는 막아 주지 못한다. 그 거부는 `BeginDraw` 가 열려 있는
+        // 동안만 나오는데, ★bind 가 하나도 없는 프레임이 전체의 약 1/3★ 이다
+        // (`COMMITWORK idle` 10,236~11,289 / 약 29,500, 2026-10-20 실측). 그 프레임에는
+        // 열린 서피스가 없어 커밋이 그대로 성공한다.
+        //
+        // 옮긴 뒤에는 트리가 비는 구간이 임계구역 **안**이고, 그 안에서는 다른 스레드가
+        // 커밋할 수 없다. 트레이트 계약(매 프레임 z-order 재구성)은 그대로다 -- 지우고 다시
+        // 붙이는 쌍이 한 자리로 모였을 뿐이다.
+
         // add_surface의 AddVisual은 end_frame으로 이연 — 이번 프레임 기록 초기화.
         self.frame_surfaces.clear();
         split
@@ -3332,7 +3337,7 @@ impl DCompNativeCompositor {
              begin_frame_ms={:.1} begin_frame_ms_max={:.2} \
              bf_deferred_ms={:.1} bf_deferred_ms_max={:.2} \
              bf_early_ms={:.1} bf_early_ms_max={:.2} \
-             bf_removeall_ms={:.1} bf_removeall_ms_max={:.2} bf_rest_ms={:.1}",
+             bf_rest_ms={:.1} removeall_ms={:.1} removeall_ms_max={:.2}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
             profile.end_frames,
@@ -3377,9 +3382,9 @@ impl DCompNativeCompositor {
             ms(profile.bf_deferred_ns_max),
             ms(profile.bf_early_ns),
             ms(profile.bf_early_ns_max),
-            ms(profile.bf_removeall_ns),
-            ms(profile.bf_removeall_ns_max),
             ms(profile.bf_rest_ns),
+            ms(profile.removeall_ns),
+            ms(profile.removeall_ns_max),
         );
 
         self.emit_commitsite(window);
@@ -4274,7 +4279,7 @@ impl Compositor for DCompNativeCompositor {
             return;
         };
         let total = start.elapsed().as_nanos() as u64;
-        let parts = split.deferred_ns + split.early_ns + split.removeall_ns;
+        let parts = split.deferred_ns + split.early_ns;
         // 전체는 토막들을 감싸고 재므로 단조 시계에서 항상 크거나 같다. 어긋났다면 계측
         // 배선이 틀린 것이지 측정값이 아니다.
         debug_assert!(
@@ -4292,8 +4297,6 @@ impl Compositor for DCompNativeCompositor {
         profile.bf_deferred_ns_max = profile.bf_deferred_ns_max.max(split.deferred_ns);
         profile.bf_early_ns += split.early_ns;
         profile.bf_early_ns_max = profile.bf_early_ns_max.max(split.early_ns);
-        profile.bf_removeall_ns += split.removeall_ns;
-        profile.bf_removeall_ns_max = profile.bf_removeall_ns_max.max(split.removeall_ns);
         profile.bf_rest_ns += total.saturating_sub(parts);
     }
 
@@ -5092,6 +5095,26 @@ impl Compositor for DCompNativeCompositor {
         //  (3) virtual/device 좌표 이중성이 만드는 결함 표면적을 통째로 제거한다.
         // 따라서 add_surface가 기록한 z-order(아래→위) 그대로, 컬 없이 전부 합성한다.
         if let Some(root) = self.root_visual_ptr() {
+            // ★지우는 것과 다시 붙이는 것은 한 자리에, 가드 안에 있어야 한다.★ 예전에는
+            // 지우기가 `begin_frame` 에 있어서 그 사이 내내 트리가 빈 채였고, 그 구간은
+            // 가드 밖이라 스케줄러가 빈 트리를 커밋할 수 있었다(begin_frame 주석 참고).
+            // 여기서는 아래 루프까지 빠져나가는 길이 없으므로 둘이 항상 짝을 이룬다.
+            //
+            // Safety: root는 살아있는 IDCompositionVisual.
+            let removeall_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+            let hr = unsafe { (*root).RemoveAllVisuals() };
+            if let Some(start) = removeall_start {
+                let elapsed = start.elapsed().as_nanos() as u64;
+                self.bind_profile.removeall_ns += elapsed;
+                self.bind_profile.removeall_ns_max =
+                    self.bind_profile.removeall_ns_max.max(elapsed);
+            }
+            if hr < 0 {
+                warn!(
+                    "[dcomp-native] RemoveAllVisuals failed (hr=0x{:08x})",
+                    hr as u32
+                );
+            }
             for id in self.frame_surfaces.iter() {
                 let Some(entry) = self.surfaces.get(id) else {
                     continue;

@@ -1746,8 +1746,15 @@ if ($dbp) {
         Write-Host ("  begin_frame   {0,9:N1} ms/s   worst single pass {1:N2} ms" -f ((& $g "begin_frame_ms")/$secs), (& $g "begin_frame_ms_max"))
         Write-Host ("    deferred commit  {0,6:N1} ms/s   worst {1:N2} ms" -f ((& $g "bf_deferred_ms")/$secs), (& $g "bf_deferred_ms_max"))
         Write-Host ("    before_render    {0,6:N1} ms/s   worst {1:N2} ms   (the scheduler deadline flushed ahead of the render)" -f ((& $g "bf_early_ms")/$secs), (& $g "bf_early_ms_max"))
-        Write-Host ("    RemoveAllVisuals {0,6:N1} ms/s   worst {1:N2} ms" -f ((& $g "bf_removeall_ms")/$secs), (& $g "bf_removeall_ms_max"))
         Write-Host ("    rest             {0,6:N1} ms/s" -f ((& $g "bf_rest_ms")/$secs))
+    }
+    # RemoveAllVisuals used to sit in begin_frame and is now inside end_frame, next to the
+    # AddVisual loop, so that the window where the visual tree is EMPTY falls inside the device
+    # guard -- outside it, the scheduler could commit an empty tree and the bare window showed
+    # through for a frame. It is reported on its own line because it is no longer part of
+    # begin_frame; its cost is inside end_frame_ms above.
+    if ((& $g "removeall_ms") -gt 0) {
+        Write-Host ("  RemoveAllVisuals {0,8:N1} ms/s   worst single call {1:N2} ms  (inside end_frame)" -f ((& $g "removeall_ms")/$secs), (& $g "removeall_ms_max"))
     }
     # Does the BeginDraw update rect change shape every frame? If it does, DComp hands back a
     # differently sized texture each time and the EGL pbuffer (plus its depth/stencil) is built
