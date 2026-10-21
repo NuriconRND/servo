@@ -3604,6 +3604,16 @@ impl Painter {
             .remove_lcp_candidates_for_pipeline(&pipeline_id.into());
     }
 
+    /// 파이프라인 부트스트랩. ★설계 7 절의 예외 -- 틱 루프를 믿을 수 있기 전의 한 장이다.★
+    /// 종료 조건(파이프라인당 정확히 1 회)과 계수기는 Task 9 가 붙인다.
+    ///
+    /// ★`advance_screenshot_requests` 와 짝이 없는 유일한 생산자다.★ 다른 생산 지점은 틱
+    /// 하나뿐이고 그쪽은 짝이 있다(`generate_frame_for_wall_tick` 의 `Generated` 갈래).
+    /// 여기에 안 붙인 이유: 이 함수가 세우는 epoch 은 `Epoch(0)` 인데 스크린샷 요청이
+    /// 기다리는 `expected_epoch` 은 스크립트의 현재 렌더링 epoch 이라 보통 0 보다 크다 --
+    /// 그래서 이 프레임으로는 `WaitingOnPipelineDisplayLists` 가 어차피 안 풀린다. 설령
+    /// 0 을 기다리는 요청이 있더라도 다음 틱의 생산이 같은 주기에 전진시킨다. ★실무상
+    /// 무해하지만 비대칭이므로 적어 둔다★ -- 부트스트랩이 한 장 이상 내게 바뀌면 다시 볼 것.
     pub(crate) fn send_initial_pipeline_transaction(
         &mut self,
         webview_id: WebViewId,
@@ -4918,30 +4928,43 @@ impl FrameReasonCounts {
 mod frame_reason_source_tests {
     use super::{FrameReasonCounts, FrameSource};
 
+    /// ★자리표일 뿐이다 -- 이 모듈의 어떤 단언도 이 값을 보지 않는다.★
+    ///
+    /// 두 라운드 연속으로 ***실제 생산 지점***의 줄 번호를 적었다가, 그것을 적은 커밋
+    /// 자신의 줄 이동으로 둘 다 낡았다(2026-10-21 / 10-22). 리터럴이 구조적으로 틀렸던
+    /// 것이므로 ★번호 의존을 지웠다★ -- 단언은 `painter.rs:` 접두와 `/SCENE=` 접미만 본다.
+    /// 실제 번호는 `Location::caller()` 가 런타임에 넣고, 그 값이 맞는지는 실기의
+    /// `FRAMEREASON` 구별 값이 판정한다(설계 8 절).
+    const ANY_LINE: u32 = 1;
+
     /// ★WR 호출 지점과 DComp 직행 표출은 둘로 센다.★ 전에는 후자가 집계에 아예 없어
     /// "생산 지점이 하나" 가 거짓으로 나왔다.
     #[test]
     fn a_non_webrender_present_gets_its_own_reason_key() {
         let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: 3811 }, "SCENE");
+        counts.note(FrameSource::WebRender { line: ANY_LINE }, "SCENE");
         counts.note(FrameSource::ExternalSurface, "PRESENT");
         assert_eq!(counts.distinct_sources(), 2);
     }
 
     /// ★런처 파서가 읽는 `<source>/<reason>=<n>` 꼴을 지킨다.★ 합류는 total 에 안 더한다.
-    ///
-    /// 줄 번호는 ★꼴만 보는 자리표★ 다 -- 어느 함수인지는 세지 않는다. 그래도 살아 있는
-    /// 생산 지점의 번호를 쓴다(2026-10-21 기준 `generate_frame_for_wall_tick`): 삭제된
-    /// 자리의 번호를 남기면 다음 사람이 그 줄을 찾아가 주석 블록을 만난다.
     #[test]
     fn report_keeps_the_launcher_parsed_shape() {
         let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: 3811 }, "SCENE");
+        counts.note(FrameSource::WebRender { line: ANY_LINE }, "SCENE");
         counts.note(FrameSource::ExternalSurface, "PRESENT");
         counts.note(FrameSource::WallPacerJoin, "RELEASE");
         let (total, breakdown) = counts.drain_report();
         assert_eq!(total, 2);
-        for part in ["painter.rs:3811/SCENE=1", "external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
+        // WR 쪽은 줄 번호가 커밋마다 달라지므로 ★꼴만★ 본다.
+        let webrender = breakdown
+            .split(' ')
+            .find(|part| part.starts_with("painter.rs:"));
+        assert!(
+            webrender.is_some_and(|part| part.ends_with("/SCENE=1")),
+            "`painter.rs:<line>/SCENE=1` 꼴이 있어야 한다 (실제 {breakdown})"
+        );
+        for part in ["external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
             assert!(breakdown.split(' ').any(|p| p == part), "{part} in {breakdown}");
         }
     }

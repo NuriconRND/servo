@@ -99,14 +99,28 @@ pub(crate) fn take_scheduled_edge() -> bool {
     NEXT_EDGE_SCHEDULED.swap(false, Ordering::AcqRel)
 }
 
-/// ★지금까지 센 틱 에지의 번호.★ 셸이 `note_present_tick()` 을 부를 때마다 하나 올라간다.
+/// ★지금까지 센 틱 에지의 번호.★
 ///
 /// 벽 전체에 하나인 것이 요점이다 -- 틱도 하나이기 때문이다(규칙 1). 타일마다 자기
 /// 예산(`ExternalPresentBudget`)을 들고 이 번호를 보면 "틱마다, 타일마다 한 번" 이 번호
 /// 비교 하나로 정해진다.
+///
+/// ★writer 가 둘이다★ -- 셸의 구성에 따라 틱 에지가 다른 자리에서 나기 때문이다:
+///
+/// - `paint::note_present_tick()` — 자유 실행 표출 클럭이 있는 셸(`winit_wall`, 세 클럭
+///   구성 전부가 이 함수를 지난다).
+/// - `Paint::on_demand_wall_tick()` — 자유 실행 클럭이 없는 임베더(servoshell / WPT /
+///   Android). 그쪽은 `note_present_tick()` 을 부르지 않으므로 여기서 올리지 않으면
+///   번호가 0 에 멈추고 `ExternalPresentBudget` 이 ***최초 1 회 뒤 영구 정지***한다.
+///
+/// ★강제하지 않는다 -- 증상만 적어 둔다.★ 둘 다 부르는 셸은 아직 없다. 생기면 한 에지에
+/// 번호가 ***두 번*** 올라 `ExternalPresentBudget` 의 천장이 깨지고(한 틱에 외부 서피스
+/// 표출이 두 번 나간다), `FRAMEREASON` 의 `external_surface` 계수가 틱당 2 로 보인다 --
+/// 설계 8 절의 "틱당 1 회 이하" 판정이 그것을 잡는다. 잡힌 쪽이 writer 를 하나로 줄이면 된다.
 static TICK_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// 셸이 표출 틱을 냈다. ★틱마다 한 번★ -- 타일마다가 아니다(`paint::note_present_tick`).
+/// 틱 에지가 났다. ★틱마다 한 번★ -- 타일마다가 아니다. 부르는 자리는 둘이고 어느
+/// 구성에서 어느 쪽이 도는지는 `TICK_SEQ` 의 주석에 있다.
 pub(crate) fn note_tick_edge() {
     TICK_SEQ.fetch_add(1, Ordering::Release);
 }

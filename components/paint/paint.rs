@@ -1943,11 +1943,15 @@ impl Paint {
         if !crate::wall_tick::take_scheduled_edge() {
             return None;
         }
-        // ★틱 번호를 여기서도 올린다.★ 자유 실행 셸은 `paint::note_present_tick()` 에서
-        // 올리지만, 수요 구동 임베더는 그 함수를 부르지 않는다 -- 그러면 번호가 0 에 멈춰
-        // `ExternalPresentBudget` 이 ***최초 1 회 뒤 영구 정지***한다. 이 함수가 그 구성의
-        // 틱 에지이므로 여기가 그 자리다. 두 경로가 같은 틱에서 둘 다 돌지는 않는다 --
-        // 셸은 둘 중 하나만 쓴다(`on_wall_tick` 직통 또는 예약 기반).
+        // ★틱 번호를 여기서도 올린다 -- 이것이 `TICK_SEQ` 의 ***두 번째 writer*** 다.★
+        // 자유 실행 셸은 `paint::note_present_tick()` 에서 올리지만, 수요 구동 임베더는 그
+        // 함수를 부르지 않는다 -- 그러면 번호가 0 에 멈춰 `ExternalPresentBudget` 이
+        // ***최초 1 회 뒤 영구 정지***한다. 이 함수가 그 구성의 틱 에지이므로 여기가 그
+        // 자리다.
+        //
+        // ★둘 다 부르는 셸은 아직 없고, 강제 장치도 두지 않는다.★ 생기면 한 에지에 번호가
+        // 두 번 올라 외부 서피스 표출의 천장이 깨진다(틱당 2 회). 그 증상은 설계 8 절의
+        // `external_surface` "틱당 1 회 이하" 판정이 잡는다 -- `wall_tick::TICK_SEQ` 주석.
         crate::wall_tick::note_tick_edge();
         self.on_wall_tick()
     }

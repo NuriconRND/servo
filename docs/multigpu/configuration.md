@@ -345,17 +345,22 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 ### `SERVO_WALL_CANVAS_ACK_SKIP` — `Int`
 
 캔버스 ack 교착 재현: painter 마다 처음 N 번의 ack 전송을 게이트가 닫혀 있던 것처럼
-건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 은 그대로 남기므로 실측된 교착
-상태와 같아진다. ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이
+건너뛴다. 빚(`waiting_pipelines`)을 그대로 남기므로 실측된 교착 상태와 같아진다
+(`pending_frame` 도 같이 남겼었는데 그 필드는 2026-10-21 Task 7 에 사라졌다). ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이
 없어서 네 painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이
 아무 일도 하지 않았다(2026-09-03). 미설정/0 이면 주입 없음. 1 이면 충분하다.
 
 런처 `-CanvasAckSkip 1`.
 
 ★2026-10-21 로 바뀐 것: 예산을 쓰는 자리가 `Painter::release_owed_canvas_ack` 하나다.★
-1 차 해제가 전부 그 함수를 지나므로(생산 경로 셋 + 페이싱 틱), 거기 한 번 걸면 모든 1 차
-해제자에 걸린다. 예전처럼 호출 지점마다 걸면 ★주입이 안 걸린 해제자가 먼저 풀어 버려서★
-보류가 아예 일어나지 않는다. 복구(`flush_owed_canvas_ack`)는 예전과 같이 소비하지 않는다.
+예전처럼 호출 지점마다 걸면 ★주입이 안 걸린 해제자가 먼저 풀어 버려서★ 보류가 아예
+일어나지 않는다. 복구(`flush_owed_canvas_ack`)는 예전과 같이 소비하지 않는다.
+
+★같은 날 Task 7 로 한 번 더 좁혀졌다 — 그 함수를 부르는 자리도 하나다(페이싱 틱).★
+생산 경로 셋(`generate_frame_for_script` 의 성공 / rides-the-painter 경로, `update_images`
+의 합성 블록)이 생산과 함께 사라졌다. ★그래서 `gfx_single_frame_producer` 가 꺼진
+구성에서는 이 주입이 성립하지 않는다★ — 예산을 소비할 사람이 없다. 자세한 것은 아래
+`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` 항의 설명.
 
 그 자리가 바뀌면서 생긴 차이 하나: 예전에는 주입이 합성까지 같이 막았다(예산 검사가
 `generate_frame_for_script` 의 early-return 과 `update_images` 의 `if` 조건에 있었다). 지금은
@@ -377,7 +382,7 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 ★2026-10-21(Task 7)로 1 차 해제자가 ***페이싱 틱 하나***가 됐다.★ 생산 경로 셋이 생산과
 함께 사라졌기 때문이다.
 
-### ★`gfx_single_frame_producer` 가 꺼진 구성에서는 이 주입으로 아무것도 검증할 수 없다★
+#### ★`gfx_single_frame_producer` 가 꺼진 구성에서는 이 주입으로 아무것도 검증할 수 없다★
 
 여기 있던 pref off 검증 표는 2026-10-21 에 ***지웠다***. 그 표는 조용한 거짓 인증이었다.
 
@@ -394,7 +399,7 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 ★주입을 쓰려면 pref 를 켜라.★ 아래 표가 그 구성의 것이고, 그쪽은 유효하다.
 
-### pref on — 보류도 영구여야 교착이 보인다
+#### pref on — 보류도 영구여야 교착이 보인다
 
 틱이 ***매 틱*** 1 차 해제를 다시 시도하므로 예산 1 짜리 보류는 다음 틱에 풀린다 — 한 틱
 지연이지 교착이 아니다. 그 구성에서 교착을 보려면 보류도 영구여야 한다:
