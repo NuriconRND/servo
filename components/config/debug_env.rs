@@ -281,10 +281,12 @@ pub const WALL_CANVAS_ACK_SKIP: DebugFlag = DebugFlag {
     name: "SERVO_WALL_CANVAS_ACK_SKIP",
     kind: Kind::Int,
     doc: "캔버스 ack 교착 재현: painter 마다 처음 N 번의 ack 전송을 게이트가 닫혀 있던 것처럼 \
-          건너뛴다. 빚(`waiting_pipelines`)과 `pending_frame` 은 그대로 남기므로 실측된 교착 \
-          상태와 같아진다. ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이 \
-          없어서 네 painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이 \
-          아무 일도 하지 않았다(2026-09-03). 미설정/0 이면 주입 없음. 1 이면 충분하다.",
+          건너뛴다. 빚(`waiting_pipelines`)을 그대로 남기므로 실측된 교착 상태와 같아진다. \
+          ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이 없어서 네 \
+          painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이 아무 \
+          일도 하지 않았다(2026-09-03). ★2026-10-21 부터 소비 경로가 페이싱 틱 하나다★ — \
+          `gfx_single_frame_producer` 가 꺼져 있으면 예산이 영영 안 쓰이므로 주입이 성립하지 \
+          않는다(그 구성에는 1 차 해제 자체가 없다). 미설정/0 이면 주입 없음. 1 이면 충분하다.",
     cache_index: 19,
 };
 

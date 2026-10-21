@@ -394,17 +394,19 @@ pub(crate) struct Painter {
     /// 한 번 300ms 를 건너뛰면 평균은 멀쩡해 보이고 눈에는 끊긴다.
     last_video_presented_at: Cell<Option<Instant>>,
 
-    /// 이 페인터에 프레임을 낸 마지막 시각 — 단, ★자기 자신은 빼고★.
+    /// 이 페인터에 프레임을 낸 마지막 시각.
     ///
-    /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다. 그 "남"에
-    /// 자기가 들어가면 판정이 자기 때문에 참이 되어, 한 번 걸러 한 번씩만 도는 진동이 된다.
-    /// ★낡음(2026-09-09 `6e3a7ba8fd2` 기록, 무효 시점 불명 — 한 커밋 앞선 `9eeb4f911ed` 때문에 쓸 때 이미 틀렸다)★ — 두 경로가 아니라 셋이다(1564·2853·4085).
-    /// 그래서 스스로 프레임을 내는 두 경로(페인트측 애니메이션, 비디오 도착)는 자기 프레임을
-    /// 낸 뒤 이 시각을 되돌려 놓는다.
+    /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다
+    /// (`pump_paint_animation` 의 `someone_else_is_producing`, `raf_is_producing_frames`).
     ///
-    /// 되돌리지 않았을 때 실측된 결과(log_presentation/00, 60Hz 벽): 페이드가 도는 1 초 동안
-    /// 렌더가 **61 -> 72 프레임**으로 늘었다. 새로고침 주기보다 많이 낸 것이고, 그 초과분이
-    /// 애니메이션이 스스로 낸 프레임(`PAINTANIM frames=10~13`)과 정확히 맞는다.
+    /// ★"자기 자신은 빼고" 가 2026-10-21 Task 7 에 사라졌다.★ 스스로 프레임을 내던 세 경로
+    /// (페인트측 애니메이션, 유보 애니메이션 프레임, 비디오 도착)가 자기 프레임을 낸 뒤 이
+    /// 시각을 되돌려 놓았었다. 그 셋이 ★한꺼번에★ 삭제되어 writer 가 이 함수 하나만 남았고,
+    /// 되돌릴 "자기 프레임" 자체가 없다. 하나라도 남겨 두면 안 됐던 이유는 실측에 있다
+    /// (log_presentation/00, 60Hz 벽): 되돌리지 않은 채로 페이드가 도는 1 초 동안 렌더가
+    /// **61 -> 72 프레임**으로 늘었고, 그 초과분이 애니메이션이 스스로 낸 프레임과 정확히
+    /// 맞았다. ★지금 "남" 은 언제나 틱이다★ -- 틱이 주기마다 찍으므로 이 두 판정은
+    /// 사실상 "이번 주기의 틱 프레임이 아직 렌더되지 않았나" 를 묻는다.
     last_frame_by_other_source_at: Cell<Option<Instant>>,
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
@@ -466,6 +468,13 @@ pub(crate) struct Painter {
     /// 위치는 ***화면에 닿지 못한다.***
     anim_win_pending_tag: Cell<Option<bool>>,
     /// 렌더가 집어간 완료를 꼬리표별로 센다.
+    ///
+    /// ★2026-10-21 Task 7 뒤로 `took_script` 는 구조적으로 ~0 이다.★ 꼬리표는
+    /// `anim_ready_pending_x` 가 붙었는지로 갈리는데, 그 부착 조건이 "애니메이션이 자기
+    /// 프레임을 낼 때" 에서 "값을 밀어 넣은 주기마다" 로 바뀌었다(생산자가 틱 하나가 되어
+    /// 앞의 조건이 영영 거짓이기 때문이다). 그래서 값이 도는 동안의 완료는 거의 전부
+    /// `took_anim` 으로 간다. ★둘의 비율을 2026-10-21 이전 로그와 비교하지 말 것.★
+    /// 뜻이 남아 있는 것은 `anim_win_overwritten` 이다.
     anim_win_took_anim: Cell<u64>,
     anim_win_took_script: Cell<u64>,
     /// ★이 추적이 찾는 수.★ 애니메이션 완료가 렌더에 집히기 전에 다음 완료로 덮인
@@ -2186,6 +2195,32 @@ impl Painter {
         self.send_owed_canvas_ack();
     }
 
+    /// ★스크린샷 상태 기계를 한 칸 민다 -- 반드시 ***생산 뒤***에.★ 설계 2-8 / 불변식 16.
+    ///
+    /// 호출자는 하나다: `generate_frame_for_wall_tick` 의 `Generated` 갈래, 그 타일의
+    /// `generate_frame` + `send_transaction` ***뒤***.
+    ///
+    /// ★왜 생산 뒤여야 하는가.★ `WaitingOnPipelineDisplayLists -> WaitingOnFrame` 전이는
+    /// `ReadyForScreenshot` 재도색을 걸 수 있고, 그 재도색은 `has_pending_frames()` 가
+    /// 거짓일 때만 걸린다(`ScreenshotTaker::maybe_trigger_paint_for_screenshot`). 생산
+    /// ***앞***에서 전진시키면 그 순간 `pending_frames == 0` 이라 전이가 곧바로 재도색을
+    /// 걸고, 다음 렌더가 ***그 디스플레이 리스트를 아직 안 실은*** WebRender 의 직전
+    /// 프레임을 다시 그려 그것을 찍는다.
+    ///
+    /// ★왜 벽 수준(`produce_wall_frame` 끝)이 아니라 타일 수준인가.★ 거절한 타일
+    /// (`KeepPrevious`)은 이번 주기에 프레임을 ***요청하지 않았으므로*** `pending_frames`
+    /// 가 0 일 수 있다. 벽 수준에서 전 타일을 돌면 그 타일에서 위 역전이 그대로 되살아난다.
+    /// 생산한 타일에서만 전진시키는 것이 2026-10-21 Task 7 이전의 순서
+    /// (`generate_frame_for_script` / `update_images` 가 ***자기*** 합성 뒤에 했다)를
+    /// 글자 그대로 복원한다.
+    ///
+    /// 전진이 ***충분히 자주*** 도는 것도 이 자리라야 보장된다 -- 틱은 주기마다 돌고,
+    /// 요청이 떠 있는 동안 매 주기 다시 확인한다.
+    fn advance_screenshot_requests(&self) {
+        self.screenshot_taker
+            .prepare_screenshot_requests_for_render(self);
+    }
+
     /// 빚진 파이프라인에 ack 를 보낸다. ★보낼지 말지는 호출자가 이미 정했다.★
     ///
     /// 1 차([`Painter::release_owed_canvas_ack`])와 복구
@@ -2803,9 +2838,16 @@ impl Painter {
     /// 풀린 요청은 이어서 WR 프레임이 되어 그쪽에서 또 세어지므로, 이 값은 합성 총합
     /// (`total`)에 더하지 않는다 -- "두 번째 문" 이 열린 횟수만 보인다.
     ///
-    /// ★2026-10-21 Task 7 뒤로 이 값은 0 이어야 한다★ — coalesce 큐에 요청을 넣던 자리가
-    /// 사라졌기 때문이다(`PaintMessage::GenerateFrame` 이 아무 일도 하지 않는다). 0 이
-    /// 아니면 생산자가 둘이라는 뜻이고, 그것이 설계 8 절의 실패 판정이다.
+    /// ★2026-10-21 Task 7 뒤로 이 값은 ***영구히 0*** 이다★ — 울릴 수 있어서 0 인 것이
+    /// 아니라, coalesce 큐를 채우던 유일한 자리(`Paint::coalesce_wall_frame_request`, 그
+    /// 호출자는 `PaintMessage::GenerateFrame`)가 같이 사라져 ★채울 경로가 없기 때문★ 이다.
+    /// 지금 이 계수기는 탐지기라기보다 ★걸림쇠의 위치 표시★ 다.
+    ///
+    /// ★언제 다시 울릴 수 있나:★ 누군가 `Paint::coalesced_wall_frame_requests` 에 다시 요청을 넣는
+    /// 경로를 들이면(= 삭제된 `coalesce_wall_frame_request` 의 재추가, 또는
+    /// `PaintMessage::GenerateFrame` 을 다시 생산으로 잇는 변경) 그때부터
+    /// `try_release_coalesced_wall_frame_requests` 가 ★두 번째 문으로 프레임을 낸다★.
+    /// 그 순간 이 값이 0 을 벗어나고, 그것이 설계 8 절의 실패 판정이다 — 생산자가 둘이다.
     pub(crate) fn note_wall_pacer_join(&self) {
         self.note_frame_source(FrameSource::WallPacerJoin, "RELEASE".to_string());
     }
@@ -2833,9 +2875,10 @@ impl Painter {
         // Every frame, whatever asked for it. A paint-side animation needs to know whether
         // anyone else is already producing frames -- see `perform_updates`.
         self.last_frame_generated_at.set(Some(Instant::now()));
-        // ★낡음(2026-09-09 기록, 무효 시점 불명 — 한 커밋 앞선 `9eeb4f911ed` 때문에 쓸 때 이미 틀렸다)★ — 주기 생산자(`pump_paint_animation`, :1564)가 빠졌다. 되돌리는 자리는 1564·2853·4085 셋이다.
-        // 스스로 프레임을 내는 경로(페인트측 애니메이션, 비디오 도착)는 이 대입을 자기
-        // 프레임에 한해 되돌린다 — 필드 주석 참고.
+        // ★이 대입을 되돌리는 자리는 더 없다(2026-10-21 Task 7).★ 셋이 있었고
+        // (`pump_paint_animation` 비디오 분기, `flush_deferred_animation_frame`,
+        // `update_images` 의 비디오 도착 합성) 전부 자기 생산 블록과 함께 사라졌다 --
+        // 필드 주석 참고. writer 는 이제 여기 하나다.
         self.last_frame_by_other_source_at.set(Some(Instant::now()));
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
@@ -3652,15 +3695,12 @@ impl Painter {
         webview_renderer
             .ensure_pipeline_details(pipeline_id)
             .display_list_epoch = Some(Epoch(epoch.0));
-        // ★스크린샷 상태 기계를 밀어 주는 자리는 2026-10-21 에 여기로 왔다.★
-        //
-        // `WaitingOnPipelineDisplayLists` 는 ***이 대입***을 기다린다
-        // (`ScreenshotTaker::prepare_screenshot_requests_for_render`). 전에는 그 확인을
-        // `generate_frame_for_script` 와 `update_images` 의 합성 블록이 했는데, 둘 다 생산
-        // 지점이라 Task 7 이 지웠다. 기다리는 사건이 일어나는 자리에 그대로 붙여 둔다 --
-        // 생산과 무관하므로 틱이 꺼져 있어도 상태 기계가 멈추지 않는다(불변식 16).
-        self.screenshot_taker
-            .prepare_screenshot_requests_for_render(&*self);
+        // ★여기서 스크린샷 상태 기계를 밀지 않는다.★ `WaitingOnPipelineDisplayLists` 가
+        // 기다리는 것은 이 대입이 맞지만, 이 시점은 ***그 리스트를 실은 프레임이 아직
+        // 요청되지도 않은*** 자리다 -- `pending_frames == 0` 이라 전이가 곧바로
+        // `ReadyForScreenshot` 재도색을 걸고, 다음 렌더가 WebRender 의 직전 프레임을 다시
+        // 그려 그것을 찍는다. 전진은 생산 뒤에서 돈다
+        // (`Painter::advance_screenshot_requests`, 틱의 `Generated` 갈래).
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -3816,6 +3856,9 @@ impl Painter {
                 );
                 self.set_display_composite_in_flight(true);
                 self.send_transaction(transaction);
+                // ★스크린샷 상태 기계는 ***이 타일이 프레임을 요청한 뒤***에 민다.★
+                // 그 순서가 전부다 -- 자세한 것은 `advance_screenshot_requests`.
+                self.advance_screenshot_requests();
                 TileOutcome::Generated
             },
         }
@@ -3941,9 +3984,10 @@ impl Painter {
         // 타일마다 부른다(설계 2-7). 실패 주입(`consume_canvas_ack_skip`)은 여전히
         // `release_owed_canvas_ack` 안에 있으므로 주입의 효력도 그대로다.
         //
-        // ★스크린샷 상태 기계를 미는 일도 여기 붙어 있었는데, 생산이 아니라 그것이 기다리는
-        // 사건 쪽으로 옮겼다★ -- `Painter::update_epoch`(디스플레이 리스트 epoch 이 들어오는
-        // 자리). 생산과 무관해져서 틱이 꺼진 구성에서도 돈다(불변식 16).
+        // ★스크린샷 상태 기계를 미는 일도 같이 빠졌다★ -- 생산이 일어나는 유일한 자리인
+        // 틱으로 옮겼다(`Painter::advance_screenshot_requests`, 틱의 `Generated` 갈래).
+        // ***전진은 반드시 생산 뒤여야 한다*** -- 앞에서 밀면 아직 요청되지 않은 프레임을
+        // 기다린 셈이 되어 직전 프레임이 찍힌다(그 함수의 주석).
         // 설계 2-6: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
 
         // ★여기 있던 "도착률로 즉시 합성" 설명은 그 경로와 함께 2026-10-21 에 사라졌다.★
@@ -4030,6 +4074,12 @@ impl Painter {
         // 그 생산이 `flush_pending_video_frame_updates` 를 무조건 거치므로 쌓인 프레임은
         // 늦어도 다음 주기에 실려 나간다. 도착 수가 몇이든 합성은 주기당 하나이고, 도착이
         // 없어도 주기는 돈다 -- 어느 쪽 증상도 성립할 자리가 없다.
+        //
+        // ★단 그 바닥은 `gfx_single_frame_producer` 가 켜졌을 때의 것이고, 그 pref 는 아직
+        // 기본 off 다★(Task 10 이 뒤집는다). 꺼져 있으면 틱이 생산하지 않으므로 비디오만
+        // 있는 페이지의 합성은 지운 주석이 적은 28/s 가 아니라 ***0/s*** 다 -- 그것이
+        // 설계 8 절의 음성 대조군(생산자가 없으면 화면이 선다)이고, 벽에 내보낼 구성이
+        // 아니다. 바닥의 근거는 "틱이 돈다" 이지 "이 블록이 없다" 가 아니다.
         //
         // ★주의: `gfx_video_immediate_composite_enabled` 의 유일한 런타임 사용처가 여기였다★
         // -- 설계 8 절의 A/B 대조군이 이 블록과 함께 사라진다. 대조군은
@@ -4873,21 +4923,25 @@ mod frame_reason_source_tests {
     #[test]
     fn a_non_webrender_present_gets_its_own_reason_key() {
         let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: 1565 }, "SCENE");
+        counts.note(FrameSource::WebRender { line: 3811 }, "SCENE");
         counts.note(FrameSource::ExternalSurface, "PRESENT");
         assert_eq!(counts.distinct_sources(), 2);
     }
 
     /// ★런처 파서가 읽는 `<source>/<reason>=<n>` 꼴을 지킨다.★ 합류는 total 에 안 더한다.
+    ///
+    /// 줄 번호는 ★꼴만 보는 자리표★ 다 -- 어느 함수인지는 세지 않는다. 그래도 살아 있는
+    /// 생산 지점의 번호를 쓴다(2026-10-21 기준 `generate_frame_for_wall_tick`): 삭제된
+    /// 자리의 번호를 남기면 다음 사람이 그 줄을 찾아가 주석 블록을 만난다.
     #[test]
     fn report_keeps_the_launcher_parsed_shape() {
         let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: 3826 }, "SCENE");
+        counts.note(FrameSource::WebRender { line: 3811 }, "SCENE");
         counts.note(FrameSource::ExternalSurface, "PRESENT");
         counts.note(FrameSource::WallPacerJoin, "RELEASE");
         let (total, breakdown) = counts.drain_report();
         assert_eq!(total, 2);
-        for part in ["painter.rs:3826/SCENE=1", "external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
+        for part in ["painter.rs:3811/SCENE=1", "external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
             assert!(breakdown.split(' ').any(|p| p == part), "{part} in {breakdown}");
         }
     }
