@@ -155,8 +155,10 @@ use crate::largest_contentful_paint_calculator::LargestContentfulPaintCalculator
 use crate::paint::{RepaintReason, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
-use crate::screenshot::ScreenshotTaker;
-use crate::wall_tick::{TileOutcome, ack_is_releasable, tile_may_generate};
+use crate::screenshot::{ScreenshotTaker, ScreenshotWaitSummary};
+use crate::wall_tick::{
+    TileOutcome, ack_is_releasable, bootstrap_frame_allowed, tile_may_generate,
+};
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
@@ -357,6 +359,26 @@ pub(crate) struct Painter {
 
     /// A [`ScreenshotTaker`] responsible for handling all screenshot requests.
     pub(crate) screenshot_taker: ScreenshotTaker,
+
+    /// ★이 타일이 틱 생산으로 낸 WR 프레임 수.★ 부트스트랩 예외의 종료 조건이 이 값을
+    /// 읽는다(`wall_tick::bootstrap_frame_allowed`). `KeepPrevious` 는 세지 않는다 --
+    /// 유지는 WR 프레임이 아니다. 단조 증가이므로 "한 번 생산했으면 영원히 예외 없음"
+    /// 이 이 한 필드로 성립한다.
+    wall_tick_frames_produced: Cell<u64>,
+
+    /// 부트스트랩 프레임을 이미 낸 파이프라인. ★"파이프라인당 정확히 1 회" 의 근거다.★
+    /// 지우지 않는다 -- 파이프라인이 끝나고 같은 id 가 다시 올 일은 없고, 지우면 그것이
+    /// 곧 두 번째 생산 기회가 된다.
+    bootstrapped_pipelines: RefCell<FxHashSet<PipelineId>>,
+
+    /// 부트스트랩이 실제로 낸 프레임 수와 거절한 횟수. 설계 7 절이 요구하는 계수기다 --
+    /// ★예외가 몇 장을 냈는지 로그에서 셀 수 없으면 "종료 조건이 있다" 를 확인할 방법이
+    /// 없다.★
+    bootstrap_frames_emitted: Cell<u64>,
+    bootstrap_frames_declined: Cell<u64>,
+    /// 거절 로그의 1 초 창 시작. 첫 건은 즉시 찍고 몰아칠 때만 합친다(`WALLACKFLUSH`
+    /// 와 같은 모양) -- iframe 이 많은 페이지는 기동에 거절이 수십 건 날 수 있다.
+    bootstrap_decline_last_report: Cell<Option<Instant>>,
 
     /// A [`FrameRequestDelayer`] which is used to wait for canvas image updates to
     /// arrive before requesting a new frame, as these happen asynchronously with
@@ -1163,6 +1185,11 @@ impl Painter {
             frame_reason_counts: Default::default(),
             frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
+            wall_tick_frames_produced: Default::default(),
+            bootstrapped_pipelines: Default::default(),
+            bootstrap_frames_emitted: Default::default(),
+            bootstrap_frames_declined: Default::default(),
+            bootstrap_decline_last_report: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
@@ -1955,7 +1982,10 @@ impl Painter {
     ///
     /// ★틱이 매 주기 생산하면 이 값이 거의 항상 참이 되어 `--capture` 가 안 찍힌다★
     /// (불변식 16). 그것은 여기서 거르는 문제가 아니라 ***생산을 쉬는*** 문제이고,
-    /// Task 9 가 `tick_should_produce` 로 처리한다(설계 2-8).
+    /// 2026-10-22 Task 9 가 `wall_tick::tick_should_produce` 로 처리했다(설계 2-8) --
+    /// 요청이 `WaitingOnFrame` 에 닿는 순간부터 틱이 생산을 쉬므로 이 값이 0 까지 빠진다.
+    /// ★쉬는 조건이 "요청 존재" 가 아니라 그 상인 이유는
+    /// `ScreenshotRequestPhase::suspends_production` 에 있다 -- 앞 상에서 쉬면 교착이다.★
     pub(crate) fn has_pending_frames(&self) -> bool {
         self.pending_frames.get() != 0
     }
@@ -2225,6 +2255,27 @@ impl Painter {
     fn advance_screenshot_requests(&self) {
         self.screenshot_taker
             .prepare_screenshot_requests_for_render(self);
+    }
+
+    /// 벽 틱이 "지금 생산을 쉬어야 하는가" 를 묻는 자리. ★상(phase)은 밖으로 나가지
+    /// 않는다★ -- 판정은 `ScreenshotRequestPhase::suspends_production` 한 곳에 있다.
+    pub(crate) fn screenshot_wait_summary(&self) -> ScreenshotWaitSummary {
+        self.screenshot_taker.wait_summary()
+    }
+
+    /// ★생산을 쉬는 틱에서도 이 프로브만은 돈다.★ 2026-10-22 Task 9.
+    ///
+    /// `renderer_behind()` 는 조회가 아니라 liveness 프로브이고, 안에 2 초 강제 해제가
+    /// 들어 있다(`DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT`). 평소에는
+    /// `generate_frame_for_wall_tick` 이 매 틱 ***무조건 먼저*** 불러 주지만(설계 2-5),
+    /// 스크린샷으로 생산을 쉬면 그 함수 자체가 안 불린다. 실측(2026-08-31): 이 호출을
+    /// 잃자 네 페인터 중 둘이 렌더를 멈추고 남은 44 초 동안 돌아오지 않았다 -- ★쉬는
+    /// 동안에도 잃으면 안 된다.★
+    ///
+    /// 결과를 버리는 것이 맞다. 쉬는 틱에는 생성 여부를 정할 일이 없고, 이 호출의 값어치는
+    /// ***부작용*** (막힌 타일의 강제 해제)에 있다.
+    pub(crate) fn run_liveness_probe(&self) {
+        let _ = self.renderer_behind();
     }
 
     /// 빚진 파이프라인에 ack 를 보낸다. ★보낼지 말지는 호출자가 이미 정했다.★
@@ -3611,15 +3662,24 @@ impl Painter {
     }
 
     /// 파이프라인 부트스트랩. ★설계 7 절의 예외 -- 틱 루프를 믿을 수 있기 전의 한 장이다.★
-    /// 종료 조건(파이프라인당 정확히 1 회)과 계수기는 Task 9 가 붙인다.
+    ///
+    /// ★2026-10-22 Task 9 로 종료 조건이 붙었다.★ 판정은
+    /// `wall_tick::bootstrap_frame_allowed` 한 자리에 있고 조건은 둘이다: 파이프라인당
+    /// 정확히 1 회(`bootstrapped_pipelines`), 그리고 ***이 타일의 첫 틱 생산 이전에만***
+    /// (`wall_tick_frames_produced == 0`). 뒤의 것이 종료를 준다 -- 그 계수기는 단조
+    /// 증가하므로 틱이 한 장이라도 내고 나면 이 자리는 다시는 프레임을 내지 않는다.
+    ///
+    /// ★거절해도 디스플레이 리스트는 싣는다.★ 값 적재는 생산이 아니고(규칙 3), 그
+    /// 트랜잭션을 화면에 올리는 프레임은 같은 주기나 다음 주기의 틱이 낸다.
     ///
     /// ★`advance_screenshot_requests` 와 짝이 없는 유일한 생산자다.★ 다른 생산 지점은 틱
     /// 하나뿐이고 그쪽은 짝이 있다(`generate_frame_for_wall_tick` 의 `Generated` 갈래).
     /// 여기에 안 붙인 이유: 이 함수가 세우는 epoch 은 `Epoch(0)` 인데 스크린샷 요청이
     /// 기다리는 `expected_epoch` 은 스크립트의 현재 렌더링 epoch 이라 보통 0 보다 크다 --
     /// 그래서 이 프레임으로는 `WaitingOnPipelineDisplayLists` 가 어차피 안 풀린다. 설령
-    /// 0 을 기다리는 요청이 있더라도 다음 틱의 생산이 같은 주기에 전진시킨다. ★실무상
-    /// 무해하지만 비대칭이므로 적어 둔다★ -- 부트스트랩이 한 장 이상 내게 바뀌면 다시 볼 것.
+    /// 0 을 기다리는 요청이 있더라도 다음 틱의 생산이 같은 주기에 전진시킨다. ★종료 조건이
+    /// 붙은 뒤로 이 비대칭은 더 좁아졌다★ -- 이 자리가 내는 프레임은 파이프라인당 최대
+    /// 한 장이고, 그나마 틱이 아직 아무것도 안 낸 동안에만 난다.
     pub(crate) fn send_initial_pipeline_transaction(
         &mut self,
         webview_id: WebViewId,
@@ -3630,13 +3690,55 @@ impl Painter {
         };
 
         let starting_epoch = Epoch(0);
-        let details = webview_renderer.ensure_pipeline_details(pipeline_id.into());
+        let servo_pipeline_id: PipelineId = pipeline_id.into();
+        let details = webview_renderer.ensure_pipeline_details(servo_pipeline_id);
         details.display_list_epoch = Some(starting_epoch);
 
         let mut txn = Transaction::new();
         txn.set_display_list(starting_epoch.into(), (pipeline_id, Default::default()));
 
-        self.generate_frame(&mut txn, RenderReasons::SCENE);
+        // `insert` 가 거짓이면 이 파이프라인은 이미 한 번 지나갔다.
+        let already_bootstrapped = !self
+            .bootstrapped_pipelines
+            .borrow_mut()
+            .insert(servo_pipeline_id);
+        let tick_frames_produced = self.wall_tick_frames_produced.get();
+        if bootstrap_frame_allowed(already_bootstrapped, tick_frames_produced) {
+            self.generate_frame(&mut txn, RenderReasons::SCENE);
+            let emitted = self.bootstrap_frames_emitted.get() + 1;
+            self.bootstrap_frames_emitted.set(emitted);
+            // 파이프라인당 최대 한 번이라 합치지 않는다 -- 이 줄의 총합이 곧 "예외가 낸
+            // 프레임 수" 이고, 설계 8 절이 세는 값이다.
+            info!(
+                "WALLBOOTSTRAP: painter {:?} emitted the bootstrap frame for {:?} \
+                 (emitted={emitted} declined={} tick_frames_produced={tick_frames_produced}). \
+                 This is the only producer outside the wall tick; it terminates once the tick \
+                 has produced once for this tile.",
+                self.painter_id,
+                servo_pipeline_id,
+                self.bootstrap_frames_declined.get(),
+            );
+        } else {
+            let declined = self.bootstrap_frames_declined.get() + 1;
+            self.bootstrap_frames_declined.set(declined);
+            let now = Instant::now();
+            let due = self
+                .bootstrap_decline_last_report
+                .get()
+                .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
+            if due {
+                self.bootstrap_decline_last_report.set(Some(now));
+                info!(
+                    "WALLBOOTSTRAP: painter {:?} declined the bootstrap frame for {:?} \
+                     (declined={declined} emitted={} already_bootstrapped={already_bootstrapped} \
+                     tick_frames_produced={tick_frames_produced}). The display list still went \
+                     out; the wall tick carries it.",
+                    self.painter_id,
+                    servo_pipeline_id,
+                    self.bootstrap_frames_emitted.get(),
+                );
+            }
+        }
         self.send_transaction(txn);
     }
 
@@ -3825,8 +3927,9 @@ impl Painter {
     }
 
     /// 페이싱 틱이 이 타일에 벽 프레임 하나를 요구한다. ★이 타일이 WR 프레임을 내는 유일한
-    /// 자리다★ (파이프라인 부트스트랩 `send_initial_pipeline_transaction` 제외 -- 설계 7 절,
-    /// 종료 조건은 Task 9 가 붙인다).
+    /// 자리다★ (파이프라인 부트스트랩 `send_initial_pipeline_transaction` 제외 -- 설계 7 절.
+    /// ★2026-10-22 Task 9 로 그쪽에 종료 조건이 붙었다★: 파이프라인당 1 회, 그리고 이
+    /// 함수가 한 장이라도 낸 뒤로는 영영 0 회).
     ///
     /// 2026-10-21 Task 7 전에는 스크립트 경로(`generate_frame_for_script`)가 따로 있었고,
     /// 저쪽은 `needs_new_frame()` 이 거짓이면 `renderer_behind()` 에 ***닿기 전에***
@@ -3870,6 +3973,13 @@ impl Painter {
                     Some(logical_frame_id),
                     Some(requested_at),
                 );
+                // ★부트스트랩 예외의 종료 조건이 읽는 계수기다★ -- 이 한 번으로 이
+                // 타일의 `send_initial_pipeline_transaction` 은 영원히 프레임을 내지 않게
+                // 된다(`wall_tick::bootstrap_frame_allowed`). `KeepPrevious` 갈래에서는
+                // 올리지 않는다: 유지는 WR 프레임이 아니므로 "틱 루프를 믿을 수 있다" 의
+                // 증거가 못 된다.
+                self.wall_tick_frames_produced
+                    .set(self.wall_tick_frames_produced.get() + 1);
                 self.set_display_composite_in_flight(true);
                 self.send_transaction(transaction);
                 // ★스크린샷 상태 기계는 ***이 타일이 프레임을 요청한 뒤***에 민다.★

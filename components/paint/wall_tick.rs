@@ -80,6 +80,51 @@ pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) 
     holds_debt && pending_canvas_images == 0
 }
 
+/// 이번 틱이 벽 프레임을 낼 차례인가. ★"쉰다" 사유는 스크린샷 하나뿐이다.★ 설계 2-8 /
+/// 불변식 16, 2026-10-22 Task 9.
+///
+/// 막으려는 것: `maybe_take_screenshots` 와 `maybe_trigger_paint_for_screenshot` 는
+/// `has_pending_frames()` 가 참이면 그 자리에서 돌아선다(`screenshot.rs`). 틱이 매 주기
+/// 생산하면 그 값이 거의 항상 참이라 ★벽 자신의 `--capture` 가 영영 안 찍힌다.★
+///
+/// ★규칙 3 을 어기지 않는다.★ 이 질문은 프레임의 *내용* 이 아니라 ***외부 모드*** 를
+/// 묻는다 -- 생산자는 여전히 프레임에 무엇이 들었는지 모른다.
+///
+/// ★인자는 "요청이 떠 있는가" 가 아니라 "`WaitingOnFrame` 에 닿은 요청이 있는가" 다.★
+/// 그 차이가 동작과 교착을 가른다. 상태 기계를 미는 자리
+/// (`Painter::advance_screenshot_requests`)의 호출자는 `generate_frame_for_wall_tick` 의
+/// `Generated` 갈래 하나이므로 ★전진하려면 생산해야 한다★ -- "요청이 있으면 쉰다" 로 두면
+/// 요청이 `WaitingOnPipelineDisplayLists` 에서 영영 못 나가고 생산이 영구 정지한다.
+/// 상별 판정은 `ScreenshotRequestPhase::suspends_production` 한 자리에 있다.
+pub(crate) fn tick_should_produce(screenshot_waiting_on_frame: bool) -> bool {
+    !screenshot_waiting_on_frame
+}
+
+/// 부트스트랩 한 장을 허용할지. ★설계 7 절 예외의 종료 조건.★ 2026-10-22 Task 9.
+///
+/// `Painter::send_initial_pipeline_transaction` 은 틱 말고 WR 프레임을 내는 유일한
+/// 자리다. 틱 루프를 믿을 수 있기 전의 한 장이라 남기지만, 조건이 없으면 그것은 예외가
+/// 아니라 ★두 번째 생산자★ 다(규칙 1).
+///
+/// 둘 다 만족해야 낸다:
+///
+/// 1. `already_bootstrapped` 가 거짓 -- ★파이프라인당 정확히 1 회.★ 같은 파이프라인에
+///    `SendInitialTransaction` 이 또 오면 디스플레이 리스트만 싣고 프레임은 다음 틱에
+///    맡긴다(값 적재는 생산이 아니다).
+/// 2. `tick_frames_produced == 0` -- ★그 타일의 첫 틱 생산 이전에만.★ 틱이 이미 한 장이라도
+///    냈다면 틱 루프는 믿을 수 있고 예외가 할 일이 없다. ★이것이 ***종료*** 조건이다★ --
+///    계수기가 단조 증가하므로 한 번 0 을 벗어나면 이 타일에서 다시는 통과하지 않는다.
+///
+/// ★`gfx_single_frame_producer` 가 꺼진 구성에서는 2 번이 영원히 참이다★ -- 그쪽은 틱
+/// 생산이 아예 없다. 그래서 이 조건이 기동 화면을 검게 만들지 않는다(1 번이 여전히
+/// 파이프라인당 1 회로 묶는다).
+pub(crate) fn bootstrap_frame_allowed(
+    already_bootstrapped: bool,
+    tick_frames_produced: u64,
+) -> bool {
+    !already_bootstrapped && tick_frames_produced == 0
+}
+
 /// ★다음 틱 에지에 벽 생산 1 회가 예약됐는가.★ 자유 실행 표출 클럭이 없는 임베더
 /// (servoshell / WPT / Android)용이다 -- `frame_time.rs` 의 전역 통지와 같은 모양이다.
 ///
@@ -165,8 +210,9 @@ impl ExternalPresentBudget {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalPresentBudget, TileOutcome, ack_is_releasable, schedule_production_at_next_edge,
-        take_scheduled_edge, tile_may_generate,
+        ExternalPresentBudget, TileOutcome, ack_is_releasable, bootstrap_frame_allowed,
+        schedule_production_at_next_edge, take_scheduled_edge, tick_should_produce,
+        tile_may_generate,
     };
 
     /// ★틱마다 한 번은 반드시 받는다 -- 그것이 비디오의 바닥이다(불변식 4).★
@@ -257,6 +303,60 @@ mod tests {
         assert!(
             !releasable,
             "빚이 없으면 보낼 것도 없다 (실제 {releasable})"
+        );
+    }
+
+    /// 스크린샷이 프레임을 기다리는 동안은 생산을 쉰다 -- 매 틱 생산하면
+    /// `has_pending_frames()` 가 영영 참이라 `--capture` 가 안 찍힌다.
+    /// ★이것은 프레임의 *내용* 을 묻는 것이 아니라 외부 모드이므로 규칙 3 을 어기지 않는다.★
+    #[test]
+    fn a_screenshot_waiting_on_a_frame_suspends_production() {
+        let should_produce = tick_should_produce(true);
+        assert!(
+            !should_produce,
+            "`WaitingOnFrame` 요청이 있으면 쉬어야 한다 (실제 {should_produce})"
+        );
+    }
+
+    #[test]
+    fn production_resumes_once_the_screenshot_is_taken() {
+        let should_produce = tick_should_produce(false);
+        assert!(
+            should_produce,
+            "기다리는 요청이 없으면 매 틱 생산한다 (실제 {should_produce})"
+        );
+    }
+
+    /// ★예외는 그 타일의 첫 틱 생산 이전에, 파이프라인당 한 번만 통과한다.★
+    #[test]
+    fn the_bootstrap_frame_is_allowed_before_the_first_tick_production() {
+        let allowed = bootstrap_frame_allowed(false, 0);
+        assert!(
+            allowed,
+            "처음 보는 파이프라인이고 틱이 아직 아무것도 안 냈으면 통과한다 (실제 {allowed})"
+        );
+    }
+
+    /// 같은 파이프라인의 두 번째 `SendInitialTransaction` 은 프레임을 내지 않는다 --
+    /// 디스플레이 리스트만 싣고 다음 틱에 맡긴다.
+    #[test]
+    fn a_second_bootstrap_for_the_same_pipeline_is_refused() {
+        let allowed = bootstrap_frame_allowed(true, 0);
+        assert!(
+            !allowed,
+            "이미 부트스트랩한 파이프라인은 거절한다 (실제 {allowed}, tick_frames_produced=0)"
+        );
+    }
+
+    /// ★이것이 ***종료*** 조건이다.★ 계수기는 단조 증가하므로 한 번 0 을 벗어나면 이
+    /// 타일에서 부트스트랩은 다시는 통과하지 않는다 -- 틱 루프를 믿을 수 있게 된 뒤의
+    /// 예외는 두 번째 생산자일 뿐이다(규칙 1).
+    #[test]
+    fn the_bootstrap_is_refused_once_the_tick_has_produced() {
+        let allowed = bootstrap_frame_allowed(false, 1);
+        assert!(
+            !allowed,
+            "틱이 한 장이라도 냈으면 거절한다 (실제 {allowed}, already_bootstrapped=false)"
         );
     }
 }

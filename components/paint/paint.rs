@@ -214,6 +214,24 @@ pub struct Paint {
     /// for why a zero in one of these does not mean that gate never binds.
     wall_frame_pacing_block_tally: WallFramePacingBlockTally,
 
+    /// ★스크린샷 폴링 래치.★ `Paint::request_screenshot` 이 세우고, 전 타일에 요청이
+    /// 하나도 안 남은 것을 확인한 틱이 내린다. 2026-10-22 Task 9.
+    ///
+    /// 판정이 아니라 ***비용*** 장치다. 생산 여부를 정하려면 매 틱 전 타일에 물어야 하는데
+    /// (`with_painter` 는 스레드 타일에서 채널 왕복이다 -- 바쁠 때 호출당 250µs),
+    /// 스크린샷을 한 번도 요청하지 않은 실행에서는 그 왕복이 통째로 낭비다. 래치가 내려가
+    /// 있으면 아예 묻지 않는다.
+    ///
+    /// ★세우는 자리가 요청 진입점 하나뿐이라 "요청이 있는데 안 묻는" 경우는 없다.★
+    /// 반대로 잘못 세워져 있으면 손해는 한 틱 한 번의 질의뿐이고, 그 질의가 곧 래치를
+    /// 내린다 -- 틀리는 방향이 안전한 쪽이다.
+    screenshot_poll_latch: Cell<bool>,
+
+    /// 스크린샷 때문에 생산을 쉰 틱 수. 현재 1 초 창 / 누계 / 창 시작.
+    production_suspended_in_window: Cell<u64>,
+    production_suspended_total: Cell<u64>,
+    production_suspended_last_report: Cell<Option<Instant>>,
+
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
     pub(crate) paint_proxy: PaintProxy,
@@ -1240,6 +1258,53 @@ impl WallFrameCoordinator {
         }
     }
 
+    /// ★생산을 쉬는 틱이 keep-previous 지시를 걷는다 -- 교착 방지.★ 2026-10-22 Task 9.
+    ///
+    /// 무장한 타일은 셸이 `paint_target` 과 `present` 를 ***둘 다*** 건너뛴다
+    /// (`keep_previous_logical_frame`, `winit_wall/main.rs`). 그런데 스크린샷을 실제로
+    /// 찍는 자리는 ★렌더 패스의 끝★ 이다(`Painter::render` ->
+    /// `ScreenshotTaker::maybe_take_screenshots`). 요청을 쥔 타일이 무장한 채 생산이
+    /// 멈추면 그 타일은 영영 렌더되지 않고, 지시를 걷는 다른 자리
+    /// (`expire_keep_previous_before`)는 ***다음 생산***에 있다 -- 생산이 쉬는 이유가
+    /// 스크린샷이므로 그대로 영구 정지다.
+    ///
+    /// ★닿을 수 있는 상태다.★ 둘 다 생산 밖에서 일어난다:
+    ///
+    /// - `handle_screenshot_readiness_reply` 가 디스플레이 리스트가 이미 다 와 있는 경우
+    ///   그 자리에서 `WaitingOnFrame` 까지 민다. 그 순간 요청을 쥔 타일이 직전 벽
+    ///   프레임에서 거절했다면 이미 무장해 있다.
+    /// - `miss_barrier` 는 배리어 마감(16ms)에서 돌고, ***생산을 쉬는 동안에도*** 빠진
+    ///   타일을 새로 무장시킨다.
+    ///
+    /// 그래서 한 번이 아니라 ★쉬는 틱마다★ 걷는다 -- 쉬는 중에 새로 생긴 무장도 다음
+    /// 틱(8.3ms 뒤)에 걷힌다.
+    ///
+    /// ★화면상 손해는 없다.★ 쉬는 동안에는 어느 타일도 새 프레임을 내지 않으므로, 걷힌
+    /// 타일이 다시 그려도 올라가는 내용은 같다. 불변식 14("지명된 논리 프레임에만 유효")
+    /// 와도 어긋나지 않는다 -- 걷는 것은 유효 범위를 ***좁히는*** 쪽이다.
+    ///
+    /// 실패 주입이 세워 둔 관찰용 지시는 건드리지 않는다 -- `expire_keep_previous_before`
+    /// 와 같은 이유다.
+    fn release_keep_previous_while_production_is_suspended(
+        &mut self,
+        painter_ids: &[PainterId],
+    ) -> usize {
+        let mut released = 0;
+        for painter_id in painter_ids {
+            if self
+                .keep_previous_painters
+                .get(painter_id)
+                .is_some_and(|frame| frame.remove_after_skip_query)
+            {
+                continue;
+            }
+            if self.keep_previous_painters.remove(painter_id).is_some() {
+                released += 1;
+            }
+        }
+        released
+    }
+
     /// `render_all_tiles` 가 타일마다 패스에 한 번 묻는다. `Some` 이면 그 타일의
     /// `paint_target` 과 `present` 를 **둘 다** 건너뛴다(`main.rs`).
     ///
@@ -1398,6 +1463,10 @@ impl Paint {
             wall_frame_pacing_next_wake_at: Default::default(),
             wall_frame_pacing_coalesced_count: Default::default(),
             wall_frame_pacing_released_count: Default::default(),
+            screenshot_poll_latch: Default::default(),
+            production_suspended_in_window: Default::default(),
+            production_suspended_total: Default::default(),
+            production_suspended_last_report: Default::default(),
             wall_frame_pacing_block_tally: Default::default(),
         }))
     }
@@ -1937,15 +2006,104 @@ impl Paint {
     ///
     /// ★`gather_components` 와 마찬가지로 크레이트 밖에 내지 않는다★ — 밖에서 쓰는 문은
     /// `on_wall_tick` 하나다.
+    ///
+    /// ★생산을 쉬는 사유는 하나뿐이다 -- 스크린샷★(`wall_tick::tick_should_produce`,
+    /// 설계 2-8 / 불변식 16, 2026-10-22 Task 9). ★쉬는 것은 생산뿐이다★: 캔버스 ack 해제도
+    /// liveness 프로브도 그대로 매 틱 돈다 -- 자세한 것은
+    /// `hold_the_wall_while_a_screenshot_is_taken`.
     pub(crate) fn produce_wall_frame(&self) -> Option<u64> {
-        let request = self.wall_frame_request_for_all_tiles();
-        let logical_frame_id = if request.target_painter_ids.is_empty() {
-            None
+        let should_produce =
+            crate::wall_tick::tick_should_produce(self.a_screenshot_is_waiting_on_a_frame());
+        let logical_frame_id = if should_produce {
+            let request = self.wall_frame_request_for_all_tiles();
+            if request.target_painter_ids.is_empty() {
+                None
+            } else {
+                self.issue_wall_frame_request(request)
+            }
         } else {
-            self.issue_wall_frame_request(request)
+            self.hold_the_wall_while_a_screenshot_is_taken();
+            None
         };
         self.release_owed_canvas_acks();
         logical_frame_id
+    }
+
+    /// 전 타일을 통틀어 ★`WaitingOnFrame` 에 닿은 스크린샷 요청★ 이 있는가. 이것 하나가
+    /// 생산을 쉬게 한다 -- "요청이 떠 있는가" 를 쓰면 교착이다
+    /// (`ScreenshotRequestPhase::suspends_production`).
+    ///
+    /// 요청이 전부 소진된 것을 본 틱이 폴링 래치를 내린다. 그래서 스크린샷을 안 쓰는
+    /// 실행에서 이 함수의 비용은 `Cell` 읽기 하나다.
+    fn a_screenshot_is_waiting_on_a_frame(&self) -> bool {
+        if !self.screenshot_poll_latch.get() {
+            return false;
+        }
+        let mut any_request = false;
+        for painter_id in self.painter_ids() {
+            let Some(summary) =
+                self.with_painter(painter_id, |painter| painter.screenshot_wait_summary())
+            else {
+                continue;
+            };
+            if summary.waiting_on_frame {
+                // 기다리는 요청이 있으면 요청도 있는 것이므로 래치는 그대로 둔다.
+                return true;
+            }
+            any_request |= summary.any_request;
+        }
+        if !any_request {
+            self.screenshot_poll_latch.set(false);
+        }
+        false
+    }
+
+    /// 생산을 쉬는 틱. ★쉬는 것은 생산뿐이고, 타일을 살려 두는 일 셋은 그대로 돈다.★
+    ///
+    /// 1. ★keep-previous 지시를 걷는다 -- 이것이 교착을 막는 자리다.★ 무장한 타일은 셸이
+    ///    `paint_target` 과 `present` 를 ***둘 다*** 건너뛰는데(`winit_wall/main.rs`),
+    ///    스크린샷을 실제로 찍는 자리는 렌더 패스의 끝이다(`Painter::render` ->
+    ///    `ScreenshotTaker::maybe_take_screenshots`). 자세한 것은
+    ///    `WallFrameCoordinator::release_keep_previous_while_production_is_suspended`.
+    /// 2. ★liveness 프로브는 쉬지 않는다.★ 2 초 강제 해제는 `renderer_behind()` 안에
+    ///    있고, 그것을 매 틱 불러 주던 `generate_frame_for_wall_tick` 이 이 틱에는 안
+    ///    돈다. 실측(2026-08-31): 그 호출을 잃자 네 페인터 중 둘이 44 초 동안 죽었다.
+    /// 3. 캔버스 ack 해제는 이 함수 밖, `produce_wall_frame` 의 꼬리에 있다 -- ★생산
+    ///    여부와 무관하게 돌기 때문에 거기 있는 것이고★, 그래서 여기서 다시 부르지
+    ///    않는다(실측 117 초 스톨, `log_ani_debug 36`).
+    fn hold_the_wall_while_a_screenshot_is_taken(&self) {
+        let painter_ids = self.painter_ids();
+
+        let released = self
+            .wall_frame_coordinator
+            .borrow_mut()
+            .release_keep_previous_while_production_is_suspended(&painter_ids);
+
+        for painter_id in &painter_ids {
+            let _ = self.with_painter(*painter_id, |painter| painter.run_liveness_probe());
+        }
+
+        let in_window = self.production_suspended_in_window.get() + 1;
+        let total = self.production_suspended_total.get() + 1;
+        self.production_suspended_in_window.set(in_window);
+        self.production_suspended_total.set(total);
+        let now = Instant::now();
+        let due = self
+            .production_suspended_last_report
+            .get()
+            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
+        if !due {
+            return;
+        }
+        self.production_suspended_last_report.set(Some(now));
+        self.production_suspended_in_window.set(0);
+        info!(
+            "WALLSHOTPAUSE: wall tick production is suspended while a screenshot waits for \
+             frames to drain; ticks_in_window={in_window} total={total} \
+             released_keep_previous={released} targets={}. Canvas ack release and the \
+             display-composite liveness probe keep running every tick.",
+            painter_ids.len(),
+        );
     }
 
     /// ★틱마다, 타일마다 — 그 타일이 이번 틱에 합성했든 안 했든 — 빚이 있고 캔버스가 다
@@ -3705,6 +3863,10 @@ impl Paint {
         rect: Option<WebViewRect>,
         callback: Box<dyn FnOnce(Result<RgbaImage, ScreenshotCaptureError>) + 'static>,
     ) {
+        // ★여기가 폴링 래치를 세우는 유일한 자리다★ — 요청이 생기는 문이 이것 하나이므로
+        // "요청이 있는데 틱이 안 묻는" 경우가 생기지 않는다(`screenshot_poll_latch`).
+        // 래치를 내리는 것은 요청이 다 소진된 것을 본 틱이다.
+        self.screenshot_poll_latch.set(true);
         self.with_primary_painter_not_thread_ready(
             webview_id,
             // 콜백(`Box<dyn FnOnce(Result<RgbaImage, _>)>`)과
