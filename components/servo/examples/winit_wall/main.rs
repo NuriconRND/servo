@@ -412,6 +412,7 @@ struct MainBusy {
 /// 근거 수치는 설계 문서 2026-09-17-single-present-clock-design.md §2 판정 절에 있다.
 ///
 /// 계수는 남긴다 -- 클럭이 유일한 렌더 권한이라는 것을 다음 회귀 때 다시 재는
+/// ★낡음(2026-09-17 기록, 같은 날 `785cbd01735` 이후 무효)★ — 지금 `ClockStats` 는 열한 필드다.
 /// 비용이 이 일곱 필드보다 크다.
 #[derive(Default)]
 struct ClockStats {
@@ -441,6 +442,7 @@ struct ClockStats {
     /// 이 값이 작으면 큐가 비지 않는다는 뜻이고, 그러면 `WaitUntil` 타이머가 박자를 쥐고
     /// 있지 않다.
     about_to_wait: u32,
+    /// ★낡음(2026-09-28 기록, 같은 날 `b1eb8663b5d` 이후 무효)★ — `[about_to_wait, user_event, window_event, pacing_thread]` 넷이고, 0 번은 `1f3bb467e0a`(2026-09-29) 이후 늘 0 이다.
     /// 틱을 **누가 알아챘나**. `[about_to_wait, user_event, window_event]`.
     ///
     /// ★이것이 "타이머가 박자를 쥐고 있나" 를 가리는 값이다.★ `about_to_wait` 이 대부분이면
@@ -1562,6 +1564,7 @@ impl AppState {
             }
             tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
         }
+        // ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — 미루기가 기본이다. 조건은 "`gfx_dcomp_commit_in_end_frame` 이 꺼져 있으면" 이다.
         // `gfx_dcomp_defer_commit` 이 켜져 있으면 각 타일의 `end_frame` 이 DComp Commit 을
         // 미뤄 두었다. 여기가 그것을 흘리는 자리다 — 페인트 밖이라 컴포지터 대여와 겹치지
         // 않는다. pref 가 꺼져 있으면 미뤄 둔 것이 없어 아무 일도 하지 않는다.
@@ -1791,6 +1794,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 // ★"스레드가 안 뜬다" 가 아니라 "프레임을 끌지 않는다" 다.★
                 // `Painter::new` 가 `WebContentAnimator::new(.., (*timer_refresh_driver)
                 // .clone(), ..)` 를 무조건 평가하므로 `LazyCell` 이 forced 되고
+                // ★낡음(2026-10-13 기록, 2026-10-16 `e96e9f71a06` 이후 줄 표류로 무효)★ — 실제 자리는 `painter.rs:1228`.
                 // `PaintTimerThread` 는 어차피 뜬다(`painter.rs:1088`). 거기 남는 일은
                 // caret 깜빡임뿐이다. 스레드 수를 세어 이 변경을 확인하려 하면 틀린 결론이
                 // 나온다 -- 확인은 `WALLCLOCK` 의 `user`/`pace` 로 한다.

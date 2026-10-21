@@ -782,6 +782,7 @@ impl WebView {
     }
 
     /// Flush any DirectComposition commit that `end_frame` deferred
+    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — the pref is `gfx_dcomp_commit_in_end_frame` (inverted sense, default false).
     /// (`gfx_dcomp_defer_commit`). Call once after painting every tile of a wall pass --
     /// never from inside a paint, since the compositor is borrowed there.
     pub fn flush_deferred_dcomp_commits(&self) {

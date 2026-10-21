@@ -300,6 +300,7 @@ servoshell 은 `--wall-layout` 이 없으면 평범한 브라우저 창으로 �
 
 ---
 
+> ★낡음(2026-08-12 기록, 2026-08-25 `749ffde32c8` 이후 무효)★ — `debug_env::ALL` 은 지금 23 개다.
 ## 6. 조사용 환경변수 (15 개)
 
 pref 가 아니다. **실패 주입 · 프로파일링 · 이분탐색용**이고 조사가 끝나면 지운다. 그래서
@@ -356,6 +357,7 @@ target\debug\servoshell.exe ... 2> diag.err.log
 - `gfx_video_escape_mode=external` 만 켜고 `gfx_dcomp_mode` 를 빼먹기.
 - 기본이 `true` 인 노브를 "설정 안 했으니 off" 로 가정하기 —
   `gfx_wall_frame_pacing_enabled`, `gfx_video_escape_stable_swapchain`,
+  > ★낡음(2026-08-12 기록, 2026-08-28 `ffb167e2dbf` 이후 무효)★ — 넷이 아니다. `gfx_video_immediate_composite_enabled`·`gfx_paint_side_animations_enabled` 등도 기본 true 다.
   `gfx_video_decouple_enabled`, `media_audio_enabled` 넷이다.
 - `SERVO_DCOMP_DEBUG=0` 으로 껐다고 믿기 (`Presence` 는 값을 안 본다).
 

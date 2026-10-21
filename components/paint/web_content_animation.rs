@@ -502,6 +502,7 @@ impl PipelineAnimations {
     /// Append the values of animations that have stopped, for keys nothing is currently
     /// animating, and say how many were appended.
     ///
+    /// ★낡음(2026-09-11 기록, 2026-09-18 `ca080974d42`/`79d8875effe` 이후 무효)★ — 호출처는 `pump_paint_animation`(painter.rs:1510)이고 평소 그것은 `Painter::render` 끝에서 돈다.
     /// ***이 함수는 전송을 만들지 않는다.*** 이미 나가기로 정해진 트랜잭션에만 얹히도록
     /// 호출되며(`Painter::perform_updates`), 그래서 프레임 생산 판정 -- `has_values`,
     /// `push_due`, `animated_property_frame`, `still_animating` -- 어느 것에도 들어가지
@@ -564,6 +565,7 @@ impl PipelineAnimations {
         !self.paint.borrow().is_empty()
     }
 
+    /// ★낡음(2026-09-08 기록, 2026-10-13 `2021b0a796f` 가 사이에 함수를 끼워 넣어 무효)★ — 설명 대상은 `install_paint_animations`(:660)다.
     /// Replace what this pipeline is playing with what the new display list says.
     ///
     /// ***Wholesale replacement is the correctness argument.*** Layout samples forward

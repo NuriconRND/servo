@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+//! ★낡음(2026-08-11 기록, 2026-10-13 `5b88710bc08` 이후 무효)★ — `SERVO_LOG_ANIM_STEP_SEQ` 가 미등록인 채 painter.rs:4861 · raf_clock.rs:127 두 곳에서 이름 리터럴로 읽힌다.
 //! 조사용 환경변수의 단일 등록처.
 //!
 //! 운용 설정은 pref 다(설계 문서 §3 의 판정 기준). 여기 있는 것은 실패 주입·
@@ -154,6 +155,7 @@ pub const DCOMP_NO_PARTIAL_PRESENT: DebugFlag = DebugFlag {
 };
 
 // ---------------------------------------------------------------------------------------------
+// ★낡음(2026-08-12 기록, 2026-08-31 `4ff3075ca97` 이후 무효)★ — DISABLE_VIDEO_IMMEDIATE_COMPOSITE 가 pref 로 나가 지금은 셋이다.
 // components/paint/painter.rs 킬 스위치/진단. 넷 다 `"1"`/`"true"` truthy 판정
 // (대소문자 무시, `"on"`/`"yes"`는 포함하지 않음 — D3D11_PROFILE 계열과 다른 변종).
 // ---------------------------------------------------------------------------------------------
@@ -232,6 +234,9 @@ pub const MEDIA_VIDEO_RATE: DebugFlag = DebugFlag {
 // 합성 요청 출처 계측 (components/paint/painter.rs).
 // ---------------------------------------------------------------------------------------------
 
+// ★아래 doc 의 "9 곳" 은 낡았다(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ —
+// 지금 `generate_frame` 호출 지점은 11 곳이다. 이 doc 문자열은 configuration.md:281 로
+// 그대로 복제되므로 고칠 때 둘을 같이 고쳐야 표류 테스트가 통과한다.
 pub const FRAME_REASON_PROF: DebugFlag = DebugFlag {
     name: "SERVO_FRAME_REASON_PROF",
     kind: Kind::Str,

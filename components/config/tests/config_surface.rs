@@ -19,6 +19,7 @@ const UPSTREAM_OWNED: &[&str] = &[
     "SERVO_STYLE_THREAD_STACK_SIZE_KB",
 ];
 
+/// ★낡음(2026-08-11 기록, 2026-08-12 `2030cf68b7a` 로 이관 완료)★ — 이 목록은 비어 있고 면제되는 이름은 하나도 없다. 아래 22-33 행은 비게 되기까지의 사정이다.
 /// 운용 설정으로 분류돼 pref 로 옮겨질 예정이지만, 아직 이관 태스크가 실행되지 않아
 /// env::var 로 남아 있는 이름. 이 태스크(Task 1)의 범위는 조사용 17 개뿐이다 — 나머지는
 /// `docs/superpowers/plans/2026-08-11-config-surface-consolidation.md`의 Task 2/4/5가

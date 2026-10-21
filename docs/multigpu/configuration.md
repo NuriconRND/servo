@@ -65,6 +65,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 기본값과 다른 것만 `servo: config: <이름>=<값> (default <기본값>)` 으로 찍힌다. 조용한 것이
 정상이다 — 전량을 매번 찍으면 아무도 읽지 않는다.
 
+> ★낡음(2026-08-26 기록, 2026-08-27 `ba5539b2ca6` 이후 무효)★ — 표는 38 행이다. `8218b61a9bd`(2026-09-10)가 8 개를 더하고 제목을 안 고쳤다.
 ## pref 26 개
 
 기본값은 전부 `components/config/prefs.rs` 의 `const_default()` 에서 온 것이다.
@@ -101,6 +102,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_video_decouple_enabled` | bool | **`true`** | 킬스위치. 비디오 프레임 갱신을 씬 재합성에서 분리하는 경로를 끄려면 `=false`. |
 | `dom_image_max_decoded_pixels` | i64 | **`8294400`** (3840x2160) | 디코드된 이미지를 GPU 에 올리기 전에 줄이는 상한(픽셀). `0` 이하면 끈다. ★파일 크기가 아니라 디코드 크기가 GPU 비용이다★ — 실측 8.3MB JPEG = 8103x5405 = **175MB** RGBA. WebRender standalone 축출 임계값이 **8MB**(`texture_cache.rs`)이고 그 **4 배(32MB)**를 넘으면 매 프레임 축출 모드라, 그 이미지 하나가 타일 렌더를 1.1ms → 26ms, 월을 48.7 → 18.5 presents/s 로 떨어뜨렸다. ***intrinsic 크기는 안 바뀐다*** — 레이아웃 동일, 텍스처 해상도만 하락(캡처 대조 확인). 단일 프레임 RGBA8/BGRA8 만. ★참고: 상한 자체가 4K 면 이미지 한 장이 33.2MB 라 이미 32MB 선을 넘는다★ — 표출이 FHD 라면 `=2073600` 이 맞다. |
 | `gfx_video_immediate_composite_enabled` | bool | **`true`** | 비디오 프레임 도착이 합성을 구동할지. ***도착마다가 아니라 `gfx_refresh_hz` 주기로 합쳐서*** 요청한다(`painter.rs` `video_composite_due`). ★2026-08-31 실측: 양극단이 둘 다 틀렸다★ — **도착마다**면 요청률이 전 영상 프레임레이트의 합이 되어(36xFHD30 = 1080/s 를 60Hz 월에) 4-GPU 월에서 **39.19 코어** 대 **22.72 코어**, 이질 배치 primary 타일 렌더 **17.42ms 대 6.02ms**. **아예 끄면** 영상만 움직이는 페이지에서 합성을 구동할 것이 없어 **초당 28 회**로 주저앉는다 — 콘텐츠 자신의 30fps 보다 낮다(CSS 애니메이션 도는 동안만 86/s). 합치면 **하한**(페인트 주기)과 **상한**을 동시에 얻는다. `=false` 면 비디오가 합성을 전혀 구동하지 않는다. |
+> ★낡음(2026-09-10 기록, 2026-09-18 `79d8875effe`·2026-10-16 `af88ed98231` 이후 무효)★ — 값은 `Painter::render` 끝에서 밀고, 프레임 판정은 `paint.rs` 의 턴 끝(`flush_deferred_animation_frame`)이다.
 | `gfx_paint_side_animations_enabled` (2026-09) | bool | **`true`** | 킬스위치. CSS `opacity`/`transform` 애니메이션을 **페인트 측이 직접** 재생할지. 켜면 레이아웃이 그 값을 앞으로 `gfx_paint_side_animation_horizon_ms` 만큼 샘플링해 세그먼트로 만들고 WebRender `PropertyBinding` 에 묶는다 — 스크립트가 멈춰 있어도 애니메이션이 흐른다(그것이 이 기능의 목적이다). ★값을 얹는 것이지 프레임을 만드는 것이 아니다★ — 프레임은 그 주기에 **남이** 안 냈을 때만 낸다(`painter.rs` `perform_updates`). `=false` 면 예전처럼 스크립트가 매 프레임 디스플레이 리스트를 내야 움직인다. |
 | `gfx_paint_side_animation_horizon_ms` (2026-09) | i64 | `3000` | 위 샘플링을 앞으로 얼마나 내다볼지. **스크립트가 얼마나 오래 멈출 수 있는가에 대한 내기**이고, 그 뒤로는 페인트가 마지막 값을 유지한다. 샘플 간격은 1/60 초 고정, 한 애니메이션당 상한 256 샘플(`paint_animation.rs` `MAX_SAMPLES`)이라 기본값은 약 181 샘플이다. ★비용은 프래그먼트 수에 비례한다★ — 애니메이션 프래그먼트 하나마다 디스플레이 리스트 빌드당 그만큼 스타일 질의가 돈다. |
 | `gfx_paint_side_animation_tick_divisor` (2026-09) | i64 | `4` | 페인트가 **이미 재생 중인** 애니메이션에 대해 스크립트 틱을 몇 프레임에 한 번 요구할지. 화면의 값은 틱 사이에 페인트측 예측이 만들므로, 틱은 그 예측을 다시 맞추고 애니메이션 이벤트를 쏘는 데만 필요하다. ★틱 하나가 문서 전체 리플로 하나다★ — 실측(4-GPU 월, 2026-09-08): 애니메이션이 도는 동안 초당 122 리플로 대 없을 때 54, 전환 순간 리플로 한 번이 14.5ms. `1` 이면 매 프레임(예전 동작). 페인트가 재생하지 **않는** 애니메이션의 틱은 이 값과 무관하게 그대로 나간다 — 늦추면 그건 진짜로 느려진다. |
@@ -195,6 +197,7 @@ nested document 에 적용되지 않는다. **진단용 iframe 의 배경은 반
 두면 차단된 로드가 검정 위 검정으로 그려져 "아무것도 안 그려짐" 으로 오진한다(실제로 3 회
 연속 오진했다).
 
+> ★낡음(2026-09-02 기록, 2026-10-20 `60a8e2b0a98`·2026-10-21 `00427c49054` 이후 무효)★ — 23 개다. `SERVO_DCOMP_SLOW_COMMIT_MS` 와 `SERVO_FRAME_TIME_PROF` 가 이 표에 아직 없다.
 ## 조사용 환경변수 21 개
 
 **이것들은 pref 가 아니다.** 실패 주입·프로파일링·이분탐색용이고, 조사가 끝나면 지운다.
@@ -278,9 +281,11 @@ VIDEORATE id=12 fps=82.3 pts_rate=2.74x frames=247 window_ms=1002
 
 ### `SERVO_FRAME_REASON_PROF` — `Str`
 
+> ★낡음(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이다. 원본은 `debug_env.rs:239` 이니 거기부터 고쳐야 표류 테스트가 통과한다.
 generate_frame 을 부른 호출 지점과 RenderReasons 를 1초에 한 줄로 집계한다. truthy: "1"/"true"/"on"(대소문자 무시). 합성 요청 경로가 9 곳이라 어느 것이 초당 200 회를 만드는지 로그만 보고는 가를 수 없다. 호출 지점은 #[track_caller] 로 얻으므로 호출부는 손대지 않는다. 프레임마다 불리는 핫패스라 기본 off 다.
 
 ```
+> ★낡음(2026-08-25 실측 로그 그대로, 2026-08-31 `11ab4d9fae5` 이후 번호 무효)★ — 지금의 같은 지점은 `painter.rs:3826` 이다.
 FRAMEREASON total=217 window_ms=1001 painter.rs:2030/SCENE=198 painter.rs:2136/SCENE=1
 ```
 
@@ -366,6 +371,14 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 | `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 복구가 그 교착을 실제로 푼다 |
 
 첫 줄이 안 나오면 주입이 무효라는 뜻이므로, 둘째 줄의 "정상"은 아무 의미가 없다.
+
+### `SERVO_DCOMP_SLOW_COMMIT_MS` — `Int`
+
+`COMMITSITE` 의 `over` 를 세는 문턱(ms). 이 값 이상 걸린 Commit() 을 호출 지점별로 따로 센다. 미설정/파싱 실패 시 기본 8. ★`max` 하나로는 "22ms 짜리 한 번" 과 "22ms 짜리 60 번" 이 구분되지 않는다★ — 앞은 정체고 뒤는 구조적 부하라 고칠 방법이 정반대다. 계측 자체는 `SERVO_DCOMP_BIND_PROF` 가 켜져 있을 때만 돈다.
+
+### `SERVO_FRAME_TIME_PROF` — `Str`
+
+틱에 실려 나간 프레임 시각의 간격을 painter 별로 1 초에 한 줄씩 집계한다 -- `FRAMETIME`(dup / one / skip1 / skipN, dt 백분위, 틱 시점과의 지연 lag, 셸 값 대신 now() 로 떨어진 fallback 수). truthy: "1" 또는 "true"(대소문자 무시). ★이 값이 곧 페이지의 `requestAnimationFrame` 타임스탬프다★ -- 프레임이 초당 60 개 나가도 이 수열이 고르지 않으면 화면의 변위가 고르지 않다. 그래서 `dup` 이 0 이 아니면 그 자체가 결함이다(연속한 두 틱이 같은 시각을 실어 보냈다는 뜻이고, 페이지는 같은 위치를 두 번 계산한다). 같은 출력 페이지를 Chrome 은 single tile 에서 60fps 로 돌리는데 winit_wall 은 떨리고, 우리 지표는 전부 깨끗했다(2026-10-21, log_ani_debug_05/12) -- 그때 남아 있던 유일한 변수가 이것이라 만들었다. 같은 스위치가 스크립트 쪽의 `RAFCLOCK` 도 켠다 (`components/script/raf_clock.rs`) -- 이쪽은 ***보낸*** 값이고 저쪽은 페이지가 ***받은*** 값이라, 둘을 나란히 읽어야 어느 구간에서 고르지 않게 됐는지가 갈린다. `RAFCLOCK` 의 `clamped` 는 `Document::resolve_frame_time` 의 단조 증가 하한에 걸려 페이지가 직전과 같은 시각을 받은 횟수다. `SERVO_LOG_ANIM_STEP_SEQ` 를 함께 켜면 정렬 전 원시 수열(`FRAMETIMESEQ` / `RAFCLOCKSEQ`)도 찍는다. 틱마다 불리는 자리라 기본 off.
 
 ## wall CLI 플래그
 

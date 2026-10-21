@@ -73,6 +73,7 @@ mod render_d3d11 {
             .unwrap_or(8.0)
     }
 
+    /// ★낡음(2026-07-12 기록, 2026-08-25 `6ff890d501b` 이후 무효)★ — 실제 자리는 `render.rs:309-316`.
     /// colorimetry 매핑 (components/media/backends/gstreamer/render.rs:240-246과 동일).
     fn colorimetry_from_info(
         info: &gstreamer_video::VideoInfo,

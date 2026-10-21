@@ -16,6 +16,7 @@ use servo_base::interval_summary::{percentiles, summarize_intervals};
 /// 셸이 마지막으로 알려준 프레임 시각, epoch 로부터의 나노초. `i64::MIN` 은 "없음".
 ///
 /// ★전역인 이유.★ 이 값을 쓰는 `AnimationRefreshDriverObserver` 는 `Painter::new` 안에서
+/// ★낡음(2026-10-15 기록, 2026-10-16 `e96e9f71a06` 이후 줄 표류로 무효)★ — 생성 자리는 `painter.rs:968` 이다.
 /// 만들어져(`painter.rs:843`) 셸이 닿을 수 없다. `Servo -> Paint -> Painter -> observer`
 /// 로 배선하는 것보다 `note_present_tick`(`lib.rs:62`)의 선례를 따르는 편이 작다.
 static FRAME_TIME_NANOS: AtomicI64 = AtomicI64::new(i64::MIN);

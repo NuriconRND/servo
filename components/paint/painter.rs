@@ -137,6 +137,7 @@ static DCOMP_RESIZE_REBUILD_DISABLED: LazyLock<bool> = LazyLock::new(|| {
 // 강등/승격·regen 억제)"만 끄고, Task 12의 정착 재구축은 그대로 유지한다. 드래그 시작
 // 재구축(B)은 이 스위치와 무관하게 마스터 스위치에만 걸린다 — 결정론 수렴 방식에서 정착
 // 재구축은 current(=alternate) != steady 전이에 의존하므로, 시작-발동까지 끄면 정착이
+// ★낡음(2026-07-16 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 판정 자리는 `vendor_local/webrender/src/picture.rs:2332`.
 // desired==current no-op이 되어 Task 12마저 무력화되기 때문(리뷰 수정; picture.rs:2320).
 // RED(12b off, Task 12 on) ↔ GREEN(둘 다 on) A/B를 같은 바이너리에서 재현하기 위한 스위치.
 #[cfg(windows)]
@@ -312,6 +313,7 @@ pub(crate) struct Painter {
     canvas_ack_skips_left: Cell<u64>,
 
     /// 합성 요청 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `generate_frame` 을 부른
+    /// ★낡음(2026-08-25 기록, 2026-09-02 `2f97f5190c2`·2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고, `present_external_only`(:4047)는 `generate_frame` 을 안 거쳐 이 집계에 아예 안 들어온다.
     /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
     /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
     frame_reason_counts: RefCell<FxHashMap<(u32, String), u64>>,
@@ -397,6 +399,7 @@ pub(crate) struct Painter {
     ///
     /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다. 그 "남"에
     /// 자기가 들어가면 판정이 자기 때문에 참이 되어, 한 번 걸러 한 번씩만 도는 진동이 된다.
+    /// ★낡음(2026-09-09 `6e3a7ba8fd2` 기록, 무효 시점 불명 — 한 커밋 앞선 `9eeb4f911ed` 때문에 쓸 때 이미 틀렸다)★ — 두 경로가 아니라 셋이다(1564·2853·4085).
     /// 그래서 스스로 프레임을 내는 두 경로(페인트측 애니메이션, 비디오 도착)는 자기 프레임을
     /// 낸 뒤 이 시각을 되돌려 놓는다.
     ///
@@ -457,6 +460,7 @@ pub(crate) struct Painter {
 
     /// ★아직 렌더가 집어가지 않은 완료의 꼬리표.★ `true` = 애니메이션 값을 단 프레임.
     ///
+    /// ★낡음(2026-10-16 `dfb6116e8ef` 기록, 같은 날 `af88ed98231` 이후 무효)★ — ANIMATED_PROPERTY 를 내는 자리는 `flush_deferred_animation_frame`(:2854)이지 `pump_paint_animation` 안이 아니다.
     /// `-FrameReason` 이 보여준 대로 프레임 원천은 둘이다 -- `painter.rs:1418`
     /// (ANIMATED_PROPERTY, 언제나 초당 60)과 `generate_frame_for_script`(SCENE, 틱 속도
     /// 그대로 60 또는 15). div=1 이면 초당 120 개를 요청하는데 화면에 가는 것은 60 개뿐이다
@@ -464,6 +468,7 @@ pub(crate) struct Painter {
     /// 정하는데, 그것만 미계측이었다.
     ///
     /// 앞섬 가설은 반증됐다 -- `-SampleLead 0/1/2`(lead_ms 28.91/45.57/62.26)로 여섯 번
+    /// ★낡음(2026-10-16 기록, 같은 날 `c515ae4c1df` 이후 무효)★ — 부호가 :2047 과 반대이고, 2026-10-19 실측에서 divisor 1~60 전부 60/60 이다.
     /// 돌렸는데 저더가 똑같았다. 그런데 divisor 에는 반응한다(d=4 가 더 나쁘다). 그러면
     /// 어긋남의 크기는 앞섬이 아니라 ***디스플레이 리스트의 나이***로 재야 하고, 그 나이를
     /// 실어 오는 것이 스크립트 프레임이다. 그 프레임이 슬롯을 가져가면 직전 애니메이션
@@ -540,6 +545,7 @@ pub(crate) struct Painter {
     dcomp_tile_size_steady: Option<webrender_api::units::DeviceIntSize>,
     /// steady와 반드시 다른 유효 타일 크기(내부 크기 기준). 드래그 시작 때 이 값을 먼저 보내
     /// desired != current를 보장해 파괴/재생성을 강제한다. steady가 None이면 WR 기본
+    /// ★낡음(2026-07-16 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — `default_tile_size()` 는 `vendor_local/webrender/src/picture.rs:2325`.
     /// 1024x512와 비교해 다른 값을 고른다(picture.rs:2306-2311의 default_tile_size와 충돌 방지).
     #[cfg(windows)]
     dcomp_tile_size_alternate: webrender_api::units::DeviceIntSize,
@@ -819,6 +825,7 @@ fn process_memory_mb() -> (f64, f64) {
 
 /// ★내 프레임을 낼지를 턴 끝에 정한다.★
 ///
+/// ★낡음(2026-10-16 기록이지만 2026-09-18 `79d8875effe` 기준으로 쓸 때 이미 틀렸다)★ — `Painter::perform_updates` 의 푸시는 렌더가 멈췄을 때 전용이다(:1286). 평소는 `Painter::render` 끝(:2444).
 /// 전에는 애니메이션이 제 턴에서 곧바로 정했다. 그런데 `Paint::perform_updates` 는
 /// 애니메이션 푸시를 먼저 돌리고 월 프레임 경로를 나중에 돌린다 -- 그래서 그 판정은
 /// ***같은 턴의 뒤쪽에서 날 프레임을 원리적으로 볼 수 없었다.***
@@ -1082,6 +1089,7 @@ impl Painter {
         let surface_size = rendering_context.size2d().to_i32();
         let webrender_document = webrender_api.add_document(surface_size);
 
+        // ★낡음(2026-08-12 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 스크롤바 분기는 `vendor_local/webrender/src/picture.rs:2318-2323`, 기본값은 2325.
         // WR picture cache 타일 크기 오버라이드 (`gfx_wr_picture_tile_size` pref, 구 env
         // SERVO_WR_PICTURE_TILE_SIZE). 빈 문자열이면 WR 기본(콘텐츠 1024x512, 스크롤바는 WR이
         // 자체 특수 크기 분기 — picture.rs:2306-2311)을 그대로 쓴다. 타일 수·무효화 입도·
@@ -1089,6 +1097,7 @@ impl Painter {
         // 슬라이스당 타일 1장이고, `display` 가 정확히 그 상태를 노린다.
         //
         // ★WR 은 이 값을 검사하지도 클램프하지도 않는다★(2026-08-12 확인: render_backend.rs 가
+        // ★낡음(2026-08-12 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 실제 자리는 `vendor_local/webrender/src/picture.rs:2313-2316`(2302 는 unused 표시 루프).
         // frame_config.tile_size_override 에 그대로 넣고 picture.rs:2302 가 그대로
         // desired_tile_size 로 쓴다). 실질 상한은 GPU 텍스처 크기다.
         let steady_tile_size_override = {
@@ -1296,6 +1305,7 @@ impl Painter {
 
     /// 애니메이션 값을 뜨고 밀어 넣는다. ★한 번의 렌더에 정확히 한 번.★
     ///
+    /// ★낡음(2026-09-18 `ca080974d42` 기록, 같은 날 `79d8875effe` 이후 무효)★ — 호출은 `Painter::render` 의 **끝**(:2444)이다. 시작에서는 프레임이 안 난다(:2422).
     /// 호출처는 둘이고 둘은 배타적이다: `Painter::render` 의 시작(렌더가 돌고 있을 때)과
     /// `perform_updates`(렌더가 멈췄을 때). 안쪽의 `push_due` 게이트가 한 렌더에 두 번
     /// 밀어 넣는 것을 다시 한 번 막는다.
@@ -2077,9 +2087,11 @@ impl Painter {
         }
     }
 
+    /// ★낡음(2026-09-02 기록, 같은 날 `2a37b6653b2` 가 사이에 함수를 끼워 넣어 무효)★ — 설명 대상은 `flush_owed_canvas_ack`(:2131)이고 바로 아래 :2105 는 반대로 ack 를 보류한다.
     /// 스크립트에 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다.
     ///
     /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
+    /// ★낡음(2026-09-02 기록, 2026-09-07 `6d1542c888c` 이후 줄 표류로 무효)★ — 실제 자리는 `script_thread.rs:1441` 이고 1200 은 무관한 함수다.
     /// 로 잠기고 `script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 이
     /// painter 가 `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀리는데, 그것을
     /// 보내는 두 자리(`generate_frame_for_script`, `update_images`)는 각각 조건이 안 맞으면
@@ -2191,9 +2203,11 @@ impl Painter {
     /// 2026-09-02 스톨 실행에서 초당 185회). 그래서 살아 있는 유일한 자리가 여기다.
     ///
     /// 잠기는 구조: 캔버스를 그린 문서는 `waiting_on_canvas_image_updates` 로 잠기고
+    /// ★낡음(2026-09-02 기록, 2026-09-07 `6d1542c888c` 이후 줄 표류로 무효)★ — 실제 자리는 `script_thread.rs:1441`.
     /// (`script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다), 그 잠금은 painter 가
     /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다. 그런데 그것을 보내는
     /// 두 자리(`generate_frame_for_script`, `update_images`)는 **둘 다 외부 트리거를 요구**하고
+    /// ★낡음(2026-09-02 18:35 기록, 같은 날 19:54 `2f97f5190c2` 이후 무효)★ — 재시도 주체는 `flush_owed_canvas_ack`(:2131, 호출 :2242)이고 보내는 자리는 넷이다(:2151, :3810, :3838, :3965).
     /// 그 트리거는 전부 스크립트 하류에 있다. 한 번 어긋나면 재시도할 주체가 없다.
     ///
     /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
@@ -2351,6 +2365,7 @@ impl Painter {
         // ★정렬 pref(`gfx_present_align_commit_pct`)가 켜져 있으면 스케줄러의 커밋도 이
         // 값에 들어간다.★ 이 락 안에서 도는 `end_frame` 이 그 디바이스의 커밋 뮤텍스를
         // 잡으므로, 스케줄러가 같은 디바이스를 커밋하는 중이면 이 painter 는 ANGLE 락을 쥔 채
+        // ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 가 반증)★ — 실측 1~3ms(나쁜 실행 8~10ms), 라이브 평균 2.04ms. ANGLE 락 안전 논증을 다시 세워야 한다.
         // 그 커밋이 끝나기를 기다린다. 그 대기의 상한은 `Commit()` 하나(~0.02ms)로 못 박혀
         // 있고(`commit_scheduler` 모듈 주석), 실제 값은 OUTCOMMIT total 의
         // `lock_wait_painter_us_max` 다 -- 반대 방향인 `lock_wait_sched_us_max`(스케줄러가
@@ -2730,6 +2745,7 @@ impl Painter {
     /// ★왜★ — 20 영상 월에서 단일 painter 가 초당 200 회 이상 합성했는데,
     /// `gfx_refresh_hz` 는 렌더러 틱(60Hz)만 페이싱하고 script 는 자체 20/30ms 타이머를
     /// 따로 돌린다. 둘을 합쳐도 상한이 ~110 이라 남은 몫이 어디서 오는지 총합만으로는
+    /// ★낡음(2026-08-25 기록, 2026-09-02 `2f97f5190c2`·2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고 `present_external_only`(:4047)는 WR 을 안 거쳐 여기 안 잡힌다.
     /// 알 수 없다. `generate_frame` 호출 지점이 9 곳이므로 출처를 줄 번호로 가른다.
     ///
     /// 기본 off(`SERVO_FRAME_REASON_PROF`). 프레임마다 불리는 자리라 켜져 있을 때만
@@ -2775,6 +2791,7 @@ impl Painter {
     /// Queue a new frame in the transaction and increase the pending frames count.
     ///
     /// `#[track_caller]`: so `note_frame_reason` can name the call site without every one of
+    /// ★낡음(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ — nine 이 아니라 열한 자리다.
     /// the nine callers having to pass a label.
     #[track_caller]
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
@@ -2794,6 +2811,7 @@ impl Painter {
         // Every frame, whatever asked for it. A paint-side animation needs to know whether
         // anyone else is already producing frames -- see `perform_updates`.
         self.last_frame_generated_at.set(Some(Instant::now()));
+        // ★낡음(2026-09-09 기록, 무효 시점 불명 — 한 커밋 앞선 `9eeb4f911ed` 때문에 쓸 때 이미 틀렸다)★ — 주기 생산자(`pump_paint_animation`, :1564)가 빠졌다. 되돌리는 자리는 1564·2853·4085 셋이다.
         // 스스로 프레임을 내는 경로(페인트측 애니메이션, 비디오 도착)는 이 대입을 자기
         // 프레임에 한해 되돌린다 — 필드 주석 참고.
         self.last_frame_by_other_source_at.set(Some(Instant::now()));
@@ -3264,6 +3282,7 @@ impl Painter {
     /// desired != current를 다시 만들어(steady != alternate가 되도록 계산해 두었으므로 항상
     /// 참 — 아래 fire_dcomp_tile_rebuild_settle 문서 참조) WR이 모든 picture-cache 슬라이스의
     /// 네이티브 서피스를 destroy_surface하고 타일을 비운 뒤 재생성하게 만들어(webrender-0.68
+    /// ★낡음(2026-07-16 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 지금 트리의 자리는 `vendor_local/webrender/src/renderer/mod.rs:5402`.
     /// picture.rs:2297-2332 → resource_cache::destroy_compositor_surface → renderer/mod.rs:5163
     /// compositor.destroy_surface), 리사이즈 이전 가상 서피스에 남은 옛 픽셀(잔상)을 물리적으로
     /// 소멸시킨다. task-10b가 증명한 FORCE_PICTURE_INVALIDATION의 한계(재계산만 강제, vacated
@@ -3322,6 +3341,7 @@ impl Painter {
 
     /// task-12b: 드래그 "시작" 재구축 1회 발동 — 항상 alternate 타일 크기를 보낸다. 정상상태는
     /// 항상 steady이므로(정착 시 fire_dcomp_tile_rebuild_settle이 되돌린다) desired(alternate)
+    /// ★낡음(2026-07-16 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 조건은 `vendor_local/webrender/src/picture.rs:2332`, destroy 는 2337-2338.
     /// != current(steady)가 보장되어 picture.rs:2320의 파괴/재생성 조건이 반드시 참이 된다.
     /// 이전의 primary↔alternate "교대" 방식은 시작/정착 호출이 짝을 이루지 못하면(예: 12b
     /// 전용 킬 스위치로 시작 발동만 스킵된 경우) 정상상태가 하드코딩된 대체값 512x512에
@@ -3797,6 +3817,7 @@ impl Painter {
                 .set(self.script_frame_rode_painter.get() + 1);
             // ★ack 는 반드시 풀어 준다.★ `take_waiting_pipelines` 의 주석이 그 이유다 --
             // 이 집합이 비지 않은 동안 그 파이프라인의 문서는 `waiting_on_canvas_image_updates`
+            // ★낡음(2026-10-16 기록이지만 번호는 2026-09-07 `6d1542c888c` 이전 것을 베꼈다)★ — 실제 자리는 `script_thread.rs:1441`.
             // 로 잠겨 ***rAF 를 한 번도 더 돌리지 못한다***(script_thread.rs:1200).
             //
             // 위의 `renderer_behind()` 가 안 풀고 빠져도 되는 것은 그것이 ***일시적인***
@@ -3975,6 +3996,7 @@ impl Painter {
         // re-compositing the current scene now, instead of waiting for the script's
         // rendering-opportunity GenerateFrame (which paces well below the video frame rate).
         // generate_frame re-renders the full current display list, so all other DOM composites
+        // ★낡음(2026-06-15 기록, 2026-08-31 `0b1b1249ad4` 이후 무효)★ — in-flight 중 도착은 버리지 않고 `video_composite_owed` 로 미뤘다가 갚는다(:4059-4095).
         // together with the updated image (z-order/clip preserved). Only when no frame is already
         // in flight, so we don't stack composites or double up with the script's own GenerateFrame
         // (which also increments pending_frames); this self-limits to roughly the present rate.
@@ -4238,6 +4260,7 @@ impl Painter {
         None
     }
 
+    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 는 `gfx_dcomp_commit_in_end_frame`(기본 false = 미룸)이다.
     /// 미뤄 둔 DComp Commit 을 흘린다(`gfx_dcomp_defer_commit`). WR `render()` 밖에서만
     /// 불러야 한다 — 안에서 부르면 `dcomp_shared` 이중 대여로 패닉한다(위 fast-path 주석).
     pub(crate) fn flush_deferred_dcomp_commit(&self) {
@@ -4465,6 +4488,7 @@ impl Painter {
             //
             // 게이트 구조(리뷰 수정): (B) 시작-발동은 마스터 스위치에만 걸린다 — 결정론 수렴
             // 방식에서 정착 재구축(Task 12)은 current(=alternate) != steady 전이에 의존하므로,
+            // ★낡음(2026-07-16 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68)★ — 판정 자리는 `vendor_local/webrender/src/picture.rs:2332`.
             // 시작-발동이 빠지면 정착 시 desired==current가 되어 picture.rs:2320이 no-op =
             // Task 12까지 무력화된다. (A) 가상 모드(강등/억제)만 12b 전용 스위치로 추가
             // 게이트한다. 따라서 RED(SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL=1) = 정확히 Task 12
@@ -4800,6 +4824,7 @@ impl FrameDelayer {
 
     /// 스크립트가 이 painter 의 ack 를 기다리는 중인가. ★스톨 진단용★ — 이 집합이 비지
     /// 않은 동안 그 파이프라인의 문서는 `waiting_on_canvas_image_updates` 로 잠겨 있어
+    /// ★낡음(2026-09-02 기록, 2026-09-07 `6d1542c888c` 이후 줄 표류로 무효)★ — 실제 자리는 `script_thread.rs:1441`.
     /// rAF 를 한 번도 더 돌리지 못한다(`script_thread.rs:1200`).
     pub(crate) fn is_holding_ack(&self) -> bool {
         !self.waiting_pipelines.is_empty()

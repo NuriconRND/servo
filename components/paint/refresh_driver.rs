@@ -345,6 +345,7 @@ fn frame_time_max_age() -> Duration {
 /// match -- against the pref's own stated purpose of not beating with vsync. Every hz in
 /// `501..=999` was worse still: it collapsed to 1ms, so asking for 600Hz produced 1000Hz.
 ///
+/// ★낡음(2026-08-31 기록, 2026-09-08 `a18686dbd77` 이후 무효)★ — three 가 아니라 호출 지점이 11 곳이고, `script/raf_clock.rs:42` 의 바깥 제약이 하나 더 있다.
 /// One function so the three places that need this period cannot drift apart again: this
 /// timer, the wall pacer's default minimum interval, and the video composite coalescing.
 ///

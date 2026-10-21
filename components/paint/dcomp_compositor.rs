@@ -1615,6 +1615,7 @@ pub struct DCompNativeCompositor {
     warned_regen_fail: bool,
     /// 누적된 프레임 번호 — begin_frame에서 증가. 쿨다운 만료 시점(frame_counter >= promote_blocked_until).
     frame_counter: u64,
+    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 이름은 `gfx_dcomp_commit_in_end_frame`(prefs.rs:376)이고 극성이 반대다. 이 플래그는 그 pref 가 `false` 일 때 선다.
     /// `gfx_dcomp_defer_commit`: `end_frame` 이 Commit 을 미뤄 두었는가.
     ///
     /// ★셸이 안 흘려도 안전해야 한다★ — winit_wall 은 타일 루프 뒤에 flush 하지만
@@ -1665,12 +1666,14 @@ pub fn enabled() -> bool {
     paint_api::rendering_context::dcomp_native_compositor_requested()
 }
 
+/// ★낡음(2026-07-13·2026-09-02 기록, 2026-09-18 `c970764fffd` 이후 무효)★ — 설명 대상 함수가 사라져 아래 `struct DwmPhaseWindow`(:1692)에 붙어 있다.
 /// 컴포지터를 생성한다. 실패(HWND/디바이스 없음, HRESULT 실패)면 warn 후 None을 돌려
 /// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
 /// 인계받은 디바이스 포인터로 `Commit()` 만 부른다. 워커 스레드에서 불린다.
 ///
 /// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어지는가.★ 조회만 한다 -- 블록하지 않는다.
 ///
+/// ★낡음(2026-09-18 기록, 2026-10-20 `60a8e2b0a98` 이후 무효)★ — 커밋 경로는 둘이 아니라 여섯이다(`enum CommitSite`, :1876).
 /// ***왜 전역인가*** -- Commit 은 두 경로로 나간다. 즉시 커밋은 `commit_device`, 지연
 /// 커밋(기본값)은 `commit_device_ptr` 이고 후자는 컴포지터 밖의 자유 함수다. 처음에는
 /// `commit_device` 안에만 붙였는데 그 경로는 거의 돌지 않아 **초당 표본이 1 개**였다
@@ -2232,6 +2235,7 @@ unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 
 ///
 /// TDR·디바이스 제거 뒤에는 그 디바이스의 모든 커밋이 계속 실패한다. 제한 없이 찍으면
 /// 디바이스당 초당 60 번의 파일 쓰기가 되고, 그것이 임계구역 안이라면 ANGLE 락을 쥔 페인터의
+/// ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 이후 무효)★ — `Commit()` 은 ~0.02ms 가 아니라 ms 급이다. 조치는 유효하고 이 대비만 못 쓴다.
 /// 대기 상한이 `Commit()`(~0.02ms)이 아니라 **로그 쓰기**가 된다 -- C3 이 세우려던 상한이
 /// 정확히 그 순간 무너진다. 그래서 커밋 함수들은 `hr` 만 돌려주고 로그는 여기로 모은다.
 ///
@@ -3217,6 +3221,7 @@ impl DCompNativeCompositor {
     /// `begin_frame` 의 몸통. 돌려주는 것은 토막별 시간이며, 계측이 꺼져 있으면 전부 0 이다.
     fn begin_frame_inner(&mut self, _device: &mut Device) -> BeginFrameSplit {
         let mut split = BeginFrameSplit::default();
+        // ★낡음(2026-07-18 기록, 2026-09-02 `594bcac4acf`·2026-10-21 `25eb69bdf0d` 이후 무효)★ — begin_frame 은 RemoveAllVisuals 를 안 하고 커밋을 흘린다. 결론(여기서 닫아도 안전)만 유효.
         // external 배치는 정상적으로 직전 프레임 start_compositing에서 닫힌다. 만약 어떤 이유로
         // 잔류했다면(방어) 이 프레임 작업 전에 닫아 external_batch_active를 리셋한다 — begin_frame은
         // DComp(RemoveAllVisuals)만 하고 GL을 안 쓰므로 여기서 닫아도 안전하다.
@@ -3717,6 +3722,7 @@ impl Compositor for DCompNativeCompositor {
             }
         };
 
+        // ★낡음(2026-07-13 기록, AddVisual 은 2026-07-14 `461ee73dc2c`·RemoveAllVisuals 는 2026-10-21 `25eb69bdf0d` 이후 무효)★ — 지금은 둘 다 `end_frame`(:5105, :5131)이다.
         // 비주얼은 매 프레임 begin_frame(RemoveAllVisuals) 후 add_surface에서 트리에 추가한다.
         if dcomp_debug() {
             log::info!(
@@ -3897,6 +3903,7 @@ impl Compositor for DCompNativeCompositor {
                 // valid_rect == dirty_rect == "움직이는 텍스트 밴드"만 넘긴다(스크롤 텍스트 = 전체
                 // 재도색). 그런데 이 서피스 visual의 클립은 티커 바 전체다(WR composite.rs:1043 —
                 // native 경로 클립 = device_clip ∩ 모든 타일 valid_rect의 바운딩 유니온 = 바 전체;
+                // ★낡음(2026-07-15 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68 이었다)★ — 지금 트리의 자리는 `vendor_local/webrender/src/renderer/mod.rs:3954-3959`.
                 // Draw 경로는 renderer/mod.rs:3739에서 타일별로 device_valid_rect까지 클립하므로
                 // 결함이 없다). 따라서 DWM은 가상 서피스의 [타일 ∩ 클립] 전체를 합성하지만 우리는
                 // 텍스트 밴드만 그리므로, 텍스트 아래 띠(그려진 적 없는 영역)가 DComp 가상 서피스의
@@ -4387,6 +4394,7 @@ impl Compositor for DCompNativeCompositor {
         //
         // 수정: 불투명 서피스는 visual 클립을 WR 슬라이스 클립 대신 "이 서피스가 실제로 bind한
         // 타일 valid 영역의 device 바운딩 유니온"(content_valid_union)으로 교차해 좁힌다. 이는 Draw
+        // ★낡음(2026-07-15 기록, 무효 시점 불명 — 당시 webrender 는 트리 밖 0.68 이었다)★ — 지금 트리의 자리는 `vendor_local/webrender/src/renderer/mod.rs:3954-3959`.
         // 경로가 타일별 device_valid_rect로 per-tile 클립하는 것(renderer/mod.rs:3737)과 등가 근사이며,
         // phantom(미도색) 영역이 합성되지 않게 한다. 전면 피복 불투명 서피스(비디오 그리드 등)는
         // 유니온 == 전체 클립이라 무변화(순수 월 무회귀). 비불투명 서피스는 알파 블렌딩으로 미도색
@@ -4451,6 +4459,7 @@ impl Compositor for DCompNativeCompositor {
         // `thread::scope` 의 join 으로 "돌아올 때 워커가 없다" 를 보장하는데, 커밋 스케줄러는
         // **나중에** 커밋하므로 그 보장이 사라진다. 정상 부하에서는 겹치지 않지만
         // (최대 지연 11.2ms < 주기 16.67ms) "정상 부하에서는" 은 보장이 아니다.
+        // ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 가 반증)★ — 커밋은 ms 급이다(1~3ms, 나쁜 실행 8~10ms, 라이브 평균 2.04ms). "짧다" 는 전제를 다시 세울 것.
         // 경합은 드물고 짧아야 하며(커밋 0.02ms), 그 가정은 OUTCOMMIT 의 lock_wait 이 잰다.
         //
         // ★pref 로 게이트한다.★ 이 가드가 막는 위험은 스케줄러가 나중에 커밋하는 경우에만
@@ -5143,6 +5152,7 @@ impl Compositor for DCompNativeCompositor {
             self.bind_profile.present_ns += present_ns;
             self.bind_profile.presents += presents;
         }
+        // ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 는 `gfx_dcomp_commit_in_end_frame`(:5157)이고 의미가 반대다. 미루기가 기본이다.
         // `gfx_dcomp_defer_commit`: Commit 을 패스 끝으로 미룬다.
         //
         // 왜: painter 4 개가 메인 스레드에서 순차 실행이라 지금은
@@ -5318,6 +5328,7 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn enable_native_compositor(&mut self, _device: &mut Device, _enable: bool) {
+        // ★낡음(2026-07-13 기록, 2026-09-08 `c7fc67574af` 이후 무효)★ — 실제 자리는 `vendor_local/webrender/src/renderer/mod.rs:1690`(커맨드는 1370).
         // 디버그 커맨드 전용 경로(renderer mod.rs:1619) — Servo는 발행하지 않는다. warn-once.
         if !self.warned_enable_native {
             warn!(

@@ -2089,6 +2089,7 @@ impl Paint {
 
     /// ★병렬 타일 렌더(A 안) 2 단계의 컴파일 타임 관문.★
     ///
+    /// ★낡음(2026-09-03 기록, 같은 날 `b2480f98270` 이후 무효)★ — `painter_surfman_details_map` 가 늘어 아홉 가지다.
     /// A 안은 `Painter` 를 타일 스레드가 소유한다. `Painter::new` 는 `&Paint` 에서 여덟 가지를
     /// 읽는데, 그것들이 전부 `Send` 여야 타일 스레드가 `Painter` 를 **직접 만들** 수 있다
     /// (만들어 놓고 옮기는 것은 안 된다 — `webrender::Renderer` 도 `RenderingContext` 도
@@ -3036,6 +3037,7 @@ impl Paint {
         }
     }
 
+    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 는 `gfx_dcomp_commit_in_end_frame`(기본 false = 미룸)이다. 옛 이름으로는 아무것도 안 잡힌다.
     /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
     ///
     /// 셸이 타일 루프를 마친 뒤 한 번 부른다. 목적은 render→commit 을 네 번 번갈아 도는
@@ -3398,6 +3400,7 @@ impl Paint {
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
 
         // ★여기가 애니메이션 프레임을 정하는 자리다.★ 위 월 프레임 경로가 끝난 뒤여야
+        // ★낡음(2026-10-16 기록이지만 2026-09-18 `79d8875effe` 기준으로 쓸 때 이미 틀렸다)★ — 평소 푸시는 `Painter::render` 의 끝(painter.rs:2444)이고 `perform_updates` 쪽은 렌더가 멈췄을 때만 돈다(painter.rs:1286).
         // "이번 턴에 남이 프레임을 냈나" 에 답할 수 있다 -- 애니메이션 푸시는 이 함수의
         // 맨 앞(`painter.perform_updates()`)에서 이미 값만 보내 두었고, 그래서 그 자리의
         // 판정은 ***같은 턴 뒤쪽의 프레임을 원리적으로 볼 수 없었다.***

@@ -129,6 +129,7 @@ DOM 이동으로 재시작되지 않는다.
 ★2026-09-17: 위 두 갈래 중 **엔진** 쪽을 택했다.★ `Element.animate` 최소 구현 —
 설계 `docs/superpowers/specs/2026-09-17-web-animations-minimal-design.md`,
 계획 `docs/superpowers/plans/2026-09-17-web-animations-minimal.md`.
+> ★낡음(2026-09-17 05:55 기록, 같은 날 14:13 `4ef72f2e34c` 이후 무효)★ — 기본값은 ON 이다(prefs.rs:1227).
 `dom_web_animations_enabled` pref 뒤에 있고 기본값은 OFF 다.
 
 ---

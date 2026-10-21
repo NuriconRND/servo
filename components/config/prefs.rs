@@ -116,6 +116,7 @@ pub struct Preferences {
     ///
     /// 꺼면 메서드가 정의되지 않고, 페이지의
     /// `typeof el.animate === 'function'` 검사가 실패해 CSS `@keyframes`
+    /// ★낡음(2026-09-17 기록, 2026-09-29 이후 무효 — 프런트 저장소 변경이라 커밋 불명)★ — 프런트에 CSS 폴백이 없어 이 pref 는 "CSS 팔" 이 아니라 "효과 끄기 팔" 이다(cadence.md:114).
     /// 폴백이 그대로 돈다 — 같은 배포본으로 A/B 가 된다.
     ///
     /// ★2026-09-17 기본값 ON.★ 실기 검증(log_ani_debug/21)에서 확인됨:
@@ -430,6 +431,7 @@ pub struct Preferences {
     /// painter 에서 **왕복**이 되므로 남는 것은 패스마다 OS 스레드 넷을 새로 만드는
     /// 비용뿐이다. 켜지 않으면 Commit 은 이미 존재하는 그 페인터 스레드 안에서 돈다.
     pub gfx_dcomp_parallel_commit: bool,
+    /// ★낡음(2026-10-20 기록, 같은 날 `b24687d184c` 이후 무효)★ — 기본값은 `-1`(:1273)이고 `0` 은 A/B 의 off 팔이다. 435 행도 같이 낡았다(449 행이 현재 값).
     /// `expand_transparent` 경로의 `BeginDraw` 갱신 렉트를 고정 격자로 키운다. 기본 `0`(끔).
     ///
     /// `0` = 오늘 동작. `>0` = 타일 좌상단을 원점으로 그 픽셀 배수까지 **바깥으로** 넓힌다.
@@ -479,6 +481,7 @@ pub struct Preferences {
     /// 위치를 따라 도는 것이라면 회전 자체가 완화책이기도 하다 — 한 타일이 매번 몰아서
     /// 맞는 대신 넷이 나눠 낸다.
     pub gfx_wall_rotate_tile_order: bool,
+    /// ★낡음(2026-09-03 기록, 2026-09-08 `a18686dbd77` 이후 무효)★ — 이 13 줄은 `gfx_wall_parallel_tiles`(:538)의 doc 인데 사이에 pref 가 끼어 떨어졌다. 바로 아래 필드(:506)의 기본값은 `true`(:1275)다.
     /// 월 타일마다 **자기 스레드**를 주어 렌더를 겹칠지. 기본 꺼짐.
     ///
     /// 켜는 이유: 한 패스의 대부분이 타일마다의 `AcquireSync` 대기이고, 그 대기는 타일별·
@@ -566,6 +569,7 @@ pub struct Preferences {
     /// 옮긴다 -- 렌더는 그대로 메인이다(임베더 핸들과 타일 0 컨텍스트가 메인 전용).
     /// 메인의 `WaitUntil` 은 백스톱으로 남는다.
     pub gfx_wall_pacing_thread: bool,
+    /// ★낡음(2026-08-11 기록, 2026-09-17 `785cbd01735` 이후 무효)★ — 이제 셸의 표출 클럭까지 같이 묶는다. "프레임 생산" 만 읽으면 그 전의 결론을 되풀이한다(run_wall_dist.ps1:92).
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
     pub gfx_vsync_enabled: bool,
@@ -642,6 +646,7 @@ pub struct Preferences {
     /// ★`pct < dwm` 은 적법하고, 오히려 여유가 가장 많다★ -- 마감이 다음 주기의 그 지점이
     /// 되므로 거의 한 주기를 쓴다. 대신 합성까지의 여유가 가장 적다.
     ///
+    /// ★낡음(2026-10-06 기록, 같은 날 `1cdfd52cf3d` 가 뜻을 뒤집었다)★ — 무시가 아니라 적용이고, 경고는 `gfx_dcomp_parallel_commit` 이 ***꺼져*** 있을 때 난다(paint.rs:3100).
     /// 켜면 `gfx_dcomp_parallel_commit` 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
     pub gfx_present_align_commit_pct: i64,
     /// B2 — 타일마다 **자기 출력이 그 프레임을 표시할 시각**에 애니메이션을 샘플한다.
