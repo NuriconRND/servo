@@ -207,9 +207,9 @@ pub(crate) fn wall_frame_arms_keep_previous(
 /// ★살아 있는 실행자가 생겼다 -- 2026-10-22 Task 9.5.★ `ScreenshotTaker` 로 들어오는 문은
 /// `Paint::request_screenshot` 하나이고 그것을 부르는 것은 servoshell / WPT 인데, 그 셸의
 /// 틱이 그날 배선됐다(`RunningAppState::spin_event_loop` 의 `on_demand_wall_tick`).
-/// ★`gfx_single_frame_producer` 와는 무관하다★ -- 그 셸의 틱은 의도적으로 pref 뒤에 두지
-/// 않았다(그쪽에는 대안 생산자가 없어 끄면 순백 화면이다). 그래서 이 규칙은 ***지금 매
-/// 스크린샷마다 발화한다***.
+/// 그래서 이 규칙은 ***지금 매 스크린샷마다 발화한다***. (그 셸의 틱은 끌 수 없었고 --
+/// 대안 생산자가 없어 끄면 순백 화면이다 -- 2026-10-22 부터는 `winit_wall` 도 같다:
+/// 생산을 끄던 `gfx_single_frame_producer` 가 그날 사라졌다.)
 ///
 /// 실측(2026-10-22, 배선 당일): 헤드리스 `servoshell -z -x -o` 가 0.3 초에 정상 이미지를
 /// 저장했다 -- 이 규칙이 생산을 쉬게 하고, WR frame-ready 가 `pending_frames` 를 비우고,
@@ -246,9 +246,10 @@ pub(crate) fn tick_should_produce(screenshot_waiting_on_frame: bool) -> bool {
 ///    냈다면 틱 루프는 믿을 수 있고 예외가 할 일이 없다. ★이것이 ***종료*** 조건이다★ --
 ///    계수기가 단조 증가하므로 한 번 0 을 벗어나면 이 타일에서 다시는 통과하지 않는다.
 ///
-/// ★`gfx_single_frame_producer` 가 꺼진 구성에서는 2 번이 영원히 참이다★ -- 그쪽은 틱
-/// 생산이 아예 없다. 그래서 이 조건이 기동 화면을 검게 만들지 않는다(1 번이 여전히
-/// 파이프라인당 1 회로 묶는다).
+/// ★생산이 아예 없는 구성에서는 2 번이 영원히 참이고, 그래도 기동 화면은 검지 않다★ --
+/// 1 번이 여전히 파이프라인당 1 회로 묶는다. (그런 구성은 2026-10-22 에 사라졌다. 틱 생산을
+/// 끄던 `gfx_single_frame_producer` 가 그날 삭제되어, 지금은 모든 셸이 틱마다 생산한다.
+/// 그 뒤 이 조건은 ***종료*** 조건으로만 돈다.)
 pub(crate) fn bootstrap_frame_allowed(
     already_bootstrapped: bool,
     tick_frames_produced: u64,

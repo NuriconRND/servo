@@ -89,7 +89,6 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_wall_frame_pacing_enabled` | bool | **`true`** | wall 프레임 페이싱(latest-wins). 이름과 달리 **기본 on** 이다 — 옛 판정이 `mode == Latest` 였다. |
 | `gfx_wall_frame_max_pending` | i64 | `1` | wall 프레임 배리어가 허용하는 미완료 프레임 수. |
 | `gfx_wall_frame_min_interval_ms` | i64 | **`0`** | wall 프레임 사이 최소 간격(ms). ***`0` = `gfx_refresh_hz` 한 주기로 유도***. ★옛 기본값 `16` 은 62.5Hz 이고, 정수 ms 로는 60Hz(16.667ms)를 표현할 수 없다★ — 16 은 4.2% 빠르고 17 은 2% 느리다. 유도하면 페인트 타이머 및 비디오 합성 합치기와 같은 박자가 된다. 양수를 명시하면 그 값을 그대로 쓴다. |
-| `gfx_single_frame_producer` (2026-10) | bool | `false` | 페이싱 틱이 벽 프레임의 **단일 생산자**가 된다. 켜면 `winit_wall` 이 틱마다 `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다(`note_present_tick` 뒤, 렌더 앞). ★2026-10-21(Task 7)부터 구 생산자가 없다★ — 그래서 이 pref 는 더는 "새 경로를 덧붙이는 스위치" 가 아니라 ***생산을 켜고 끄는 스위치***다. **끄면 `winit_wall` 에서 WebRender 프레임이 한 장도 안 난다**(파이프라인 부트스트랩 제외) — 그것이 설계 8 절의 음성 대조군이고, 화면이 서는 것이 정상이다. 캔버스 ack 는 그 구성에서도 복구 경로(`flush_owed_canvas_ack`)가 푼다. 기본값은 실기 검증을 통과한 뒤 뒤집는다. ★**2026-10-22(Task 9.5)부터 이 pref 는 `winit_wall` 전용이다.**★ 자유 실행 표출 클럭이 없는 임베더(servoshell 데스크톱 / WPT 헤드리스 / Android·OHOS)는 `RunningAppState::spin_event_loop` 에서 `WebView::on_demand_wall_tick` 을 ***pref 와 무관하게*** 부른다 — 그쪽에는 대안 생산자가 없어 끄는 것이 폴백이 아니라 순백 화면이기 때문이다(실측: 배선 전 헤드리스 `-z -x -o` 가 `WALLBOOTSTRAP ... tick_frames_produced=0` 뒤에 1024x740 전면 `#FFFFFF` 저장). 그쪽 틱은 깨우기가 예약한 에지에서만 생산한다(설계 2-4). |
 | `gfx_wr_picture_tile_size` | String | `""` (= 오버라이드 없음) | WebRender picture cache 타일 크기. `""` = WR 기본 분기(콘텐츠 1024x512, 스크롤바는 WR 이 자체 특수 크기), `WxH`(예 `1920x1080`) = 모든 painter 동일, **`display`** = painter 마다 자기 창 크기. 타일이 창 이상이면 슬라이스당 타일 1 장이 된다. ★**WR 은 이 값을 검사도 클램프도 하지 않는다**(2026-08-12 확인) — 실질 상한은 GPU 텍스처 크기다.★ ★**쪼개면 싸질 것이라는 예상은 반증되었다**(2026-08-26, 45xFHD30 5760x2160): `display` render_ms p50 29.9ms / present 28.6/s 인데, `1024x1024` 는 99.6ms / 8.4/s, `512x512` 는 108.4ms / 8.5/s 로 **합성 1 회가 3.5 배 느려진다**. 전면이 매 프레임 바뀌는 비디오 월에서 픽처 캐시는 순수 오버헤드이므로 `display` 를 유지할 것.★ |
 
 ### `gfx_video_*` — 비디오 WR 탈출 / 분리
@@ -345,10 +344,13 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 ### `SERVO_WALL_CANVAS_ACK_SKIP` — `Int`
 
 캔버스 ack 교착 재현: painter 마다 처음 N 번의 ack 전송을 게이트가 닫혀 있던 것처럼
-건너뛴다. 빚(`waiting_pipelines`)을 그대로 남기므로 실측된 교착 상태와 같아진다
-(`pending_frame` 도 같이 남겼었는데 그 필드는 2026-10-21 Task 7 에 사라졌다). ★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이
-없어서 네 painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이
-아무 일도 하지 않았다(2026-09-03). 미설정/0 이면 주입 없음. 1 이면 충분하다.
+건너뛴다. 빚(`waiting_pipelines`)을 그대로 남기므로 실측된 교착 상태와 같아진다.
+★예산은 실제로 빚진 ack 가 있을 때만 소비한다★ — 처음에는 이 조건이 없어서 네
+painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이 아무
+일도 하지 않았다(2026-09-03). ★2026-10-21 부터 소비 경로가 페이싱 틱 하나다★ —
+틱이 생산할 때만 예산이 소비된다. 미설정/0 이면 주입 없음. 1 이면 충분하다.
+
+(`pending_frame` 도 같이 남겼었는데 그 필드는 2026-10-21 Task 7 에 사라졌다.)
 
 런처 `-CanvasAckSkip 1`.
 
@@ -358,9 +360,10 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 ★같은 날 Task 7 로 한 번 더 좁혀졌다 — 그 함수를 부르는 자리도 하나다(페이싱 틱).★
 생산 경로 셋(`generate_frame_for_script` 의 성공 / rides-the-painter 경로, `update_images`
-의 합성 블록)이 생산과 함께 사라졌다. ★그래서 `gfx_single_frame_producer` 가 꺼진
-구성에서는 이 주입이 성립하지 않는다★ — 예산을 소비할 사람이 없다. 자세한 것은 아래
-`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` 항의 설명.
+의 합성 블록)이 생산과 함께 사라졌다. ★그래서 틱이 생산하지 않으면 이 주입은 성립하지
+않는다★ — 예산을 소비할 사람이 없다. 2026-10-22 까지는 그것이 운영 중에 만들 수 있는
+구성이었다(`gfx_single_frame_producer` off). 그 pref 가 그날 삭제되어 지금은 틱이 있는
+셸이 곧 생산하는 셸이고, 주입은 언제나 성립한다.
 
 그 자리가 바뀌면서 생긴 차이 하나: 예전에는 주입이 합성까지 같이 막았다(예산 검사가
 `generate_frame_for_script` 의 early-return 과 `update_images` 의 `if` 조건에 있었다). 지금은
@@ -382,35 +385,30 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 ★2026-10-21(Task 7)로 1 차 해제자가 ***페이싱 틱 하나***가 됐다.★ 생산 경로 셋이 생산과
 함께 사라졌기 때문이다.
 
-#### ★`gfx_single_frame_producer` 가 꺼진 구성에서는 이 주입으로 아무것도 검증할 수 없다★
+#### 여기 있던 "pref off" 절은 2026-10-22 에 사라졌다
 
-여기 있던 pref off 검증 표는 2026-10-21 에 ***지웠다***. 그 표는 조용한 거짓 인증이었다.
+사슬은 이렇다: `consume_canvas_ack_skip` 을 부르는 자리는 `release_owed_canvas_ack`
+하나이고, 그 함수를 부르는 자리는 `Paint::produce_wall_frame` 하나이며, 그것을 부르는 것은
+틱(`on_wall_tick`)이다. ★틱이 생산하지 않으면 주입 예산이 영영 소비되지 않는다.★
 
-사슬을 끝까지 따라가면 이렇다: `consume_canvas_ack_skip` 을 부르는 자리는
-`release_owed_canvas_ack` 하나이고, 그 함수를 부르는 자리는 `Paint::produce_wall_frame`
-하나이며, 그것을 부르는 것은 틱(`on_wall_tick`)이다. ★pref 가 꺼져 있으면 틱이 생산하지
-않으므로 주입 예산이 영영 소비되지 않는다.★ 그러면 `-CanvasAckSkip` 을 주든 안 주든 ***출력이
-똑같다*** — 빚은 복구(`flush_owed_canvas_ack`, 렌더 맨 앞)가 평소처럼 풀고 페이지는 계속
-돈다. 그 표의 "첫 줄이 안 나오면 주입이 무효" 라는 보증 문장은 ★언제나 통과한다★. 검증
-절차처럼 생겼지만 아무것도 걸러내지 못한다.
+2026-10-22 까지는 `gfx_single_frame_producer` 를 꺼서 그 상태를 만들 수 있었고, 그 구성의
+검증 표가 여기 있었다 — ***조용한 거짓 인증***이었다. `-CanvasAckSkip` 을 주든 안 주든 출력이
+똑같으므로("첫 줄이 안 나오면 주입이 무효" 라는 보증 문장이 ★언제나 통과한다★) 검증 절차처럼
+생겼지만 아무것도 걸러내지 못했다. 그 표는 2026-10-21 에 지웠고, pref 자체는 2026-10-22 에
+삭제됐다 — Task 7 이후 off 는 폴백이 아니라 ***생산자가 없는 멈춘 벽***이었기 때문이다.
 
-그리고 Task 7 이후 pref off 는 ***생산자가 없는 구성***이다(설계 8 절의 음성 대조군). 거기에
-검증 절차를 남겨 두면 누군가 그대로 따라 하고, 통과한 것으로 읽는다. 그래서 표를 없앴다.
-
-★주입을 쓰려면 pref 를 켜라.★ 아래 표가 그 구성의 것이고, 그쪽은 유효하다.
-
-#### pref on — 보류도 영구여야 교착이 보인다
+#### 보류도 영구여야 교착이 보인다
 
 틱이 ***매 틱*** 1 차 해제를 다시 시도하므로 예산 1 짜리 보류는 다음 틱에 풀린다 — 한 틱
-지연이지 교착이 아니다. 그 구성에서 교착을 보려면 보류도 영구여야 한다:
+지연이지 교착이 아니다. 교착을 보려면 보류도 영구여야 한다:
 
-| 실행(pref on) | 기대 | 뜻 |
+| 실행 | 기대 | 뜻 |
 |---|---|---|
 | `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall 없음, 한 틱만 지연** | ★이것이 이 구조의 요점★ — 한 번 놓쳐도 영구 교착이 아니다 |
 | `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 1 차와 복구를 다 막으면 교착이 재현된다. ★`WALLACKLATCH` 를 찾을 때 주의★ — 아래 `WALLACKSKIP` 경고 |
 | `-CanvasAckSkip 1` | **stall 없음 + `WALLACKSKIP`** | 주입이 실제로 ack 를 보류했다 |
 
-★마지막 행의 증거 줄은 `WALLACKFLUSH` 가 아니라 `WALLACKSKIP` 이다.★ pref on 에서는 1 차
+★마지막 행의 증거 줄은 `WALLACKFLUSH` 가 아니라 `WALLACKSKIP` 이다.★ 1 차
 해제(틱)가 ***매 틱*** 다시 시도하므로, 보류된 빚을 복구(`flush_owed_canvas_ack`)보다
 ***다음 틱의 1 차가 먼저 줍는 일이 흔하다***. 그러면 `WALLACKFLUSH` 는 한 줄도 안 찍히는데
 ★주입은 분명히 걸린 것★ 이다 — 없는 줄을 찾다가 "주입이 무력하다" 로 오독하기 쉬우므로,

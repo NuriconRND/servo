@@ -66,8 +66,11 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
 /// 틱 에지를 직접 받아야 한다(설계 7 절, `wall_tick::ExternalPresentBudget`). 세 클럭 구성
 /// (Pacing / Timer / Vsync)이 전부 이 함수를 지나므로 한 자리면 충분하다.
 ///
-/// ★`gfx_single_frame_producer` 와 무관하다.★ 그 pref 는 ***생산*** 스위치이지 틱 스위치가
-/// 아니다 -- 틱은 셸의 표출 클럭이고, 꺼 두는 것은 그 틱이 벽 프레임을 내느냐뿐이다.
+/// ★이 함수는 에지만 센다 -- 생산은 셸이 따로 부른다.★ 둘이 한 자리에 묶여 있지 않은
+/// 것은 `winit_wall` 이 `note_present_tick()` 뒤에 `WebView::on_wall_tick()` 을 부르는
+/// 순서(콜백 발사와 렌더 사이)를 스스로 정하기 때문이다. 생산을 끄는 pref
+/// (`gfx_single_frame_producer`)가 있었지만 2026-10-22 에 사라졌다 -- 지금 틱 에지가 있는
+/// 셸은 반드시 생산한다.
 pub fn note_present_tick() {
     crate::wall_tick::note_tick_edge();
     #[cfg(windows)]

@@ -370,8 +370,8 @@ struct AppState {
     capture_deadline: Option<std::time::Instant>,
     /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
     pass_counter: Cell<u64>,
-    /// `gfx_single_frame_producer` 가 켜졌을 때, 틱이 낸 논리 프레임 번호 감시.
-    /// `fire_present_tick` 의 디버그 어서션이 쓴다 -- `TickIssueAudit` 참고.
+    /// 틱이 낸 논리 프레임 번호 감시. `fire_present_tick` 의 디버그 어서션이 쓴다 --
+    /// `TickIssueAudit` 참고.
     tick_issue_audit: RefCell<TickIssueAudit>,
     /// 메인 스레드의 1초를 어디에 썼는지.
     ///
@@ -1470,28 +1470,31 @@ impl AppState {
         // ***렌더 전에 불러야 한다*** -- 그 콜백이 `waiting_for_frame` 을 내리고, 그것이
         // 내려가야 `needs_repaint()` 가 참이 된다.
         self.tick_fire.fire();
-        // ★틱이 벽 프레임을 낸다 -- `gfx_single_frame_producer` 가 켜졌을 때만.★ 자리는
-        // 콜백 발사(`fire`) 뒤, 렌더 앞이다 -- 설계 2-2 의 순서 그대로이고, `gather_components`
-        // 가 건 깨우기를 같은 틱의 `fire()` 가 먹어 치워 `wake()` 가 두 번 나는 일도 없다.
-        // 구성 요소를 모으고 내는 순서는 `on_wall_tick` 안에 있어 여기서 틀릴 수 없다.
+        // ★틱이 벽 프레임을 낸다.★ 자리는 콜백 발사(`fire`) 뒤, 렌더 앞이다 -- 설계 2-2 의
+        // 순서 그대로이고, `gather_components` 가 건 깨우기를 같은 틱의 `fire()` 가 먹어
+        // 치워 `wake()` 가 두 번 나는 일도 없다. 구성 요소를 모으고 내는 순서는
+        // `on_wall_tick` 안에 있어 여기서 틀릴 수 없다.
         //
-        // ★중간 상태다.★ 구 생산자가 아직 살아 있어 이 구간의 합성 수와 `FRAMEID` 는 판정에
-        // 쓰지 않는다(한 틱이 합성을 두 번 낼 수 있다). 기본 꺼짐.
+        // ★`gfx_single_frame_producer` 게이트는 2026-10-22 에 사라졌다. 그것이 막던 증상
+        // (구 생산자 열한 곳이 살아 있는 동안 틱까지 내서 한 틱에 합성이 두 번 나가던 것)은
+        // 그 열한 곳이 2026-10-21 Task 7 에 삭제되어 구조적으로 불가능하다 —
+        // docs/superpowers/specs/2026-10-21-single-frame-producer-design.md 4 절.★ 그 뒤로
+        // 게이트의 off 는 폴백이 아니라 ***멈춘 벽***이었고(부트스트랩 외에 WR 프레임이 한
+        // 장도 안 난다), servoshell 쪽은 2026-10-22 Task 9.5 부터 pref 와 무관하게 틱한다 --
+        // 셸마다 다른 규칙을 남겨 둘 이유가 없다.
         //
         // 이 셸은 틱 에지가 어느 구성에서도 나온다(Pacing / Vsync 는 자기 스레드, Timer 는
         // `PaintTimerThread` 의 깨우기 -- 다만 Timer 의 박동은 `waiting_for_frame` 일 때만
         // 걸린다). 그래서 예약 비트(`on_demand_wall_tick`)를 보지 않고 에지마다 부른다.
-        if servo::pref!(gfx_single_frame_producer) {
-            let webview = self.webview.borrow().clone();
-            if let Some(webview) = webview {
-                let issued = webview.on_wall_tick();
-                let mut audit = self.tick_issue_audit.borrow_mut();
-                debug_assert!(
-                    audit.record_tick(issued).is_ok(),
-                    "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: issued={issued:?} audit={:?}",
-                    audit
-                );
-            }
+        let webview = self.webview.borrow().clone();
+        if let Some(webview) = webview {
+            let issued = webview.on_wall_tick();
+            let mut audit = self.tick_issue_audit.borrow_mut();
+            debug_assert!(
+                audit.record_tick(issued).is_ok(),
+                "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: issued={issued:?} audit={:?}",
+                audit
+            );
         }
         if self.direct_render {
             self.note_redraw_requested();

@@ -423,7 +423,9 @@ pub(crate) struct Painter {
     /// 이 페인터에 프레임을 낸 마지막 시각.
     ///
     /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다
-    /// (`pump_paint_animation` 의 `someone_else_is_producing`, `raf_is_producing_frames`).
+    /// (`pump_paint_animation` 의 `someone_else_is_producing`). ★독자가 둘이었는데
+    /// 2026-10-22 에 하나가 됐다★ -- `raf_is_producing_frames` 가 같이 읽고 있었고 그
+    /// 술어가 그날 삭제됐다(설계 4 절).
     ///
     /// ★"자기 자신은 빼고" 가 2026-10-21 Task 7 에 사라졌다.★ 스스로 프레임을 내던 세 경로
     /// (페인트측 애니메이션, 유보 애니메이션 프레임, 비디오 도착)가 자기 프레임을 낸 뒤 이
@@ -692,36 +694,25 @@ fn thread_cpu_ms() -> f64 {
     0.0
 }
 
-/// rAF 가 비디오를 태워 줄 만큼 실제로 합성을 내고 있는가. 판정만 떼어 두어 시험한다
-/// (`Painter::raf_is_producing_frames` 가 살아 있는 값으로 이것을 부른다).
-///
-/// `since_last_frame_by_others` 이 `None` 이면 남이 낸 프레임이 한 장도 없다 — 그때는
-/// 태워 줄 것이 없으므로 거짓이다.
-pub(crate) fn raf_is_driving_composites(
-    animation_callbacks_running: bool,
-    since_last_frame_by_others: Option<Duration>,
-    refresh_period: Duration,
-) -> bool {
-    if !animation_callbacks_running {
-        return false;
-    }
-    // ★한 주기 반★ — 위아래가 둘 다 막혀 있어서 그 사이다.
-    //
-    //   * 두 주기(처음에 잡았던 값)는 **너무 길다.** 애니메이션이 끝나는 경계에서 비디오가
-    //     그만큼 더 기다렸고, 그것이 화면에서 "뚝 끊겼다가 이어지는" 한 박자로 보였다.
-    //   * 정확히 한 주기는 **너무 짧다.** 60fps 로 도는 멀쩡한 rAF 도 도착이 다음 프레임
-    //     직전에 걸리면 간격이 한 주기에 닿으므로, 그때마다 판정이 뒤집혀 두 번째 합성원이
-    //     끼어든다 — 그것이 이 게이트가 애초에 막으려던 지터다.
-    //
-    // 그래서 멀쩡한 rAF 의 최대 간격(한 주기)보다는 확실히 크고, 사람이 한 박자로 느끼기에는
-    // 작은 값을 쓴다. 실제로 얼마나 끊기는지는 `IMGUPDINNER ... vidgap_max_ms` 가 잰다.
-    since_last_frame_by_others.is_some_and(|since| since < refresh_period * 3 / 2)
-}
+// ★`raf_is_driving_composites` / `Painter::raf_is_producing_frames` 는 2026-10-22 에
+// 삭제됐다. 그것이 막던 증상(rAF 가 프레임을 내는 동안 비디오 도착이 두 번째 합성원이 되어
+// 합성이 도착률만큼 늘던 지터)은 생산자가 하나라서 구조적으로 불가능하다 —
+// docs/superpowers/specs/2026-10-21-single-frame-producer-design.md 4 절.★
+//
+// 마지막 소비자는 `dcomp_compositor::should_fast_present` 의 `raf_driving` 인자였고,
+// 지금 그 자리의 답은 술어가 아니라 ★틱★ 이 준다 -- `wall_tick::ExternalPresentBudget`
+// 이 대역외 표출을 틱당 1 회로 묶는다. 그 함수의 주석에 근거가 더 있다.
+//
+// ★이 술어의 "한 주기 반" 창을 어떤 형태로든 되살리지 말 것(설계 4 절).★ 창을 조정하는
+// 한 위상 문제가 남는다는 것이 이 함수가 남긴 교훈이고, 같은 이유로 `pump_paint_animation`
+// 의 `someone_else_is_producing` 도 2026-09-17 에 시간 창을 버리고 렌더 클럭으로 갔다.
 
 /// `update_images` 한 번의 시간을 트랜잭션 전송과 나머지로 가른 누계.
 ///
 /// ★`frames` / `frame_ms` 는 2026-10-21 에 빠졌다★ -- 이 함수는 더는 합성을 요청하지
-/// 않으므로 구조적으로 0 이다(설계 2-6).
+/// 않으므로 구조적으로 0 이다(설계 2-6). ★`raf_idle_calls` 도 2026-10-22 에 같은 이유로
+/// 빠졌다★ -- 그것이 세던 것은 "rAF 는 도는데 프레임이 안 나와서 비디오가 스스로 합성해야
+/// 했다" 였고, 비디오가 합성하지 않는 지금 그 사건은 일어날 수 없다(설계 4 절).
 ///
 /// 이 함수는 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
 #[derive(Default)]
@@ -730,9 +721,6 @@ struct UpdateImagesStats {
     calls: u64,
     total_ms: f64,
     send_ms: f64,
-    /// rAF 는 돌고 있는데 프레임은 안 나오고 있어서 비디오가 스스로 합성해야 했던 횟수.
-    /// 0 이 아니면 그 페이지에는 아무것도 그리지 않는 rAF 루프가 있다는 뜻이다.
-    raf_idle_calls: u64,
     /// 비디오가 화면에 실려 나간 순간들 사이의 **최대** 간격(ms). 끊김의 길이가 곧 이 값이다.
     video_gap_max_ms: f64,
     /// 비디오 프레임이 **도착한** 순간들 사이의 최대 간격(ms). 위 값과 함께 봐야 뜻이 있다:
@@ -1468,10 +1456,12 @@ impl Painter {
         // 화면에 닿지 못했다. 화면에 도달한 위치는 초당 45.4 개인데 표출은 60.6 번이라,
         // 표출 넷 중 하나가 직전 위치를 다시 그렸다 -- 등속 운동이 떨려 보이는 것이 이것이다.
         //
-        // ★창을 한 주기로 좁히는 것은 답이 아니다.★ `raf_is_driving_composites` 의 주석이
-        // 이미 그 이유를 적어 두었다 -- 60fps 로 도는 남의 프레임은 간격이 한 주기에 닿을 수
-        // 있어 판정이 매번 뒤집히고, 그 뒤집힘이 이 게이트가 애초에 막으려던 지터다. 창을
-        // 조정하는 한 위상 문제는 남는다. 그래서 **위상을 없앤다.**
+        // ★창을 한 주기로 좁히는 것은 답이 아니다.★ 60fps 로 도는 남의 프레임은 간격이 한
+        // 주기에 닿을 수 있어 판정이 매번 뒤집히고, 그 뒤집힘이 이 게이트가 애초에 막으려던
+        // 지터다. 창을 조정하는 한 위상 문제는 남는다. 그래서 **위상을 없앤다.**
+        // (이 문단은 `raf_is_driving_composites` 의 주석을 가리키고 있었다. 그 술어는
+        // 2026-10-22 에 삭제됐고 -- 설계 4 절 -- 같은 교훈을 여기 옮겨 적었다. ★한 주기 반이든
+        // 한 주기든, 시간 창을 다시 들이지 말 것.★)
         //
         // 물음은 원래 "남이 이번 합성분의 프레임을 이미 냈는가" 이고, 그 경계는 시각이 아니라
         // **마지막 렌더가 시작된 순간**이다(`Painter::render` 맨 앞에서 매 패스 찍힌다).
@@ -2130,9 +2120,11 @@ impl Painter {
     /// [`Painter::release_owed_canvas_ack`] 를 지나고, ★그 호출자는 페이싱 틱 하나다★
     /// (2026-10-21 Task 7 전에는 생산 경로 셋이 더 있었다).
     ///
-    /// ★그래서 `gfx_single_frame_producer` 가 꺼진 구성에서는 1 차 해제가 아예 돌지
-    /// 않는다★ — 그 구성에는 생산자도 없다(설계 8 절의 음성 대조군). 그때 빚을 푸는 것은
-    /// 이 복구뿐이고, 렌더 패스는 표출 클럭이 내용과 무관하게 돌리므로 계속 닿는다.
+    /// ★1 차 해제가 아예 안 도는 구성은 2026-10-22 에 없어졌다★ — 그런 구성을 만들던
+    /// `gfx_single_frame_producer` off 가 그날 삭제됐다(생산자가 없는 벽이라 폴백이 아니라
+    /// 고장이었다). 그래도 이 복구는 남는다: 틱이 돌아도 1 차가 못 미치는 자리
+    /// (아래 2 번, 빚만 남은 상태)가 있고, 렌더 패스는 표출 클럭이 내용과 무관하게
+    /// 돌리므로 여기는 계속 닿는다.
     ///
     /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
     /// 로 잠기고 `script_thread.rs:1441` 에서 rAF 가 ***통째로*** 건너뛰어진다. 그 잠금은
@@ -2183,11 +2175,12 @@ impl Painter {
         // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
         // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
         //
-        // ★그런데 "드물다"가 더는 전부 참이 아니다.★ 1 차 해제(틱)는 보통 먼저 비우지만,
-        // ***틱이 없는 구성***(`gfx_single_frame_producer` off = 설계 8 절의 음성 대조군)
-        // 에서는 1 차가 아예 안 돌아 빚을 전부 여기가 잡는다. 그러면 1 초 합치기 상한까지 =
-        // painter 당 초당 1 줄까지 나온다. 그 양은 병증이 아니라 이 갈래가 메워지고 있다는
-        // 뜻이다. 병증은 `WALLACKLATCH` 쪽이다.
+        // ★"드물다"가 전부 참은 아니다.★ 1 차 해제(틱)는 보통 먼저 비우지만, 그것이 못
+        // 미친 빚은 전부 여기가 잡는다. 그러면 1 초 합치기 상한까지 = painter 당 초당 1 줄
+        // 까지 나온다. 그 양은 병증이 아니라 이 갈래가 메워지고 있다는 뜻이다. 병증은
+        // `WALLACKLATCH` 쪽이다. (2026-10-22 전에는 ***틱 생산이 통째로 없는 구성***
+        // (`gfx_single_frame_producer` off)이 있어서 이 줄이 상시로 나왔다. 그 pref 는
+        // 삭제됐다 -- 지금은 1 차가 언제나 돈다.)
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -3240,6 +3233,21 @@ impl Painter {
         // 전송 자체가 같이 없어진다 -- 실어 보낼 것이 남지 않았다. 설계 2-6.
     }
 
+    // ★`raf_is_producing_frames` 는 2026-10-22 에 삭제됐다. 그것이 막던 증상(rAF 가 프레임을
+    // 내는 동안 비디오 도착이 두 번째 합성원이 되어 합성이 도착률만큼 늘던 지터)은 생산자가
+    // 하나라서 구조적으로 불가능하다 —
+    // docs/superpowers/specs/2026-10-21-single-frame-producer-design.md 4 절.★
+    //
+    // ★반대쪽 증상도 같이 사라졌다는 것이 이 삭제의 요점이다.★ 이 술어는 원래
+    // "rAF 가 등록돼 있다" 로 "rAF 가 프레임을 내고 있다" 를 판정하던 게이트를 고치려고
+    // 생겼다 -- 아무것도 그리지 않는 rAF 루프가 있는 페이지(seamless 전환 화면)에서
+    // 비디오가 **전환 애니메이션이 도는 동안에만** 흐르고 그 사이에는 정지한 것이 그 증상이다.
+    // 지금은 묻는 사람이 없다: 비디오는 합성을 요청하지 않고(규칙 2), 틱이 주기마다 낸다.
+    //
+    // ★`video_composite_due` 의 긴 주석도 2026-10-21 Task 7 이후 여기에 주인 없이 남아
+    // 있었고 같이 치웠다.★ 그 실측 숫자(도착마다 = 39.19 코어 대 22.72, 아예 안 내면
+    // 비디오 전용 페이지가 28/s)는 `update_images` 의 삭제 주석이 그대로 들고 있다.
+
     /// True while a display-paced composite is in flight (requested but not yet rendered);
     /// see `display_composite_in_flight`. Requesting more display composites in this state
     /// makes things strictly worse: every publish queued behind the renderer whose resource
@@ -3248,60 +3256,6 @@ impl Painter {
     /// hiccup into multi-second stalls. Skipped requests lose nothing: the next composite
     /// carries the newest coalesced video frames. In the healthy steady state requests and
     /// renders alternate 1:1 on this thread, so this gate never throttles.
-    /// Whether a video arrival may ask for a composite yet.
-    ///
-    /// ***Video arrivals drive composites, but at the paint-timer cadence, not one per
-    /// arrival.*** Those are two different things and the code used to offer only the
-    /// extremes, both of which are wrong:
-    ///
-    /// * One composite per arrival: the request rate is the SUM of every video's frame rate
-    ///   (36 x FHD30 = 1080/s aimed at a 60Hz wall). Requests land while the renderer is
-    ///   still draining, and each queued publish marks the texture cache `must_be_drawn` so
-    ///   `Renderer::update()` re-renders it offscreen -- see `renderer_behind`. Measured
-    ///   2026-08-31 on the 4-GPU wall: 39.19 cores vs 22.72 with the path off, and on a
-    ///   heterogeneous page the primary tile's render was 17.42ms vs 6.02ms.
-    /// * No video-driven composites at all: then something ELSE has to drive them, and on a
-    ///   page whose only motion is video there is nothing. Measured on the same wall with a
-    ///   page holding one 30fps stream and stills: composites settled at **28/s, below the
-    ///   content's own 30fps**, so frames were built and never shown. It looked fine only
-    ///   while a CSS animation happened to be running (86/s), and collapsed when it ended.
-    ///   Adding a 60fps video "fixed" it by accident -- that video became the clock.
-    ///
-    /// Coalescing gives both: a floor at the paint cadence so video-only pages keep
-    /// updating, and a ceiling so a high aggregate arrival rate cannot amplify.
-    ///
-    /// `gfx_refresh_hz` is the period because it is exactly this: the free-running paint
-    /// timer whose job is to keep production near the display rate.
-    /// rAF 가 **실제로 합성을 내고 있는가.**
-    ///
-    /// ★rAF 가 돌고 있다는 것과 프레임이 나오고 있다는 것은 다른 말이다★ — 그런데
-    /// 비디오 즉시-합성 게이트는 오랫동안 앞의 것으로 뒤의 것을 판정했다.
-    ///
-    /// 스크립트는 문서가 **새 디스플레이 리스트를 냈을 때만** `GenerateFrame` 을 보낸다
-    /// (`script_thread::update_the_rendering`: `needs_frame()` 인 문서만 모아 보낸다).
-    /// 그래서 rAF 콜백이 매 프레임 돌면서도 화면에 바뀌는 것이 없으면 — 자기 시계를 돌리며
-    /// `setState` 하는데 그 값으로 그리는 스타일이 그대로인 루프가 정확히 그렇다 —
-    /// **프레임은 한 장도 나오지 않는다.** 그동안 `animation_callbacks_running()` 은 참이므로
-    /// 게이트는 "rAF 가 알아서 낸다"고 믿고 비디오의 합성을 막는다. 아무도 내지 않는다.
-    ///
-    /// 실측 증상: 소스를 일정 시간마다 바꿔 표출하는 화면(seamless)에서 **전환 애니메이션이
-    /// 도는 동안에만** 영상이 흐르고 그 사이에는 정지했다. 전환 중에는 CSS 애니메이션이
-    /// 매 프레임 새 디스플레이 리스트를 만들어 주기 때문이다. 상용 브라우저는 같은 페이지에서
-    /// 정상이다 — 거기서는 비디오 표출이 rAF 와 묶여 있지 않다.
-    ///
-    /// 그래서 rAF 등록 여부가 아니라 **최근에 실제로 프레임이 나왔는지**로 판정한다. rAF 가
-    /// 진짜로 화면을 돌리는 페이지(three.js·WebGL 루프·오버레이)에서는 프레임 간격이
-    /// 새로고침 주기이므로 판정이 그대로 참이고, 예전 동작이 유지된다.
-    fn raf_is_producing_frames(&self) -> bool {
-        raf_is_driving_composites(
-            self.animation_callbacks_running(),
-            self.last_frame_by_other_source_at
-                .get()
-                .map(|last| last.elapsed()),
-            crate::refresh_driver::paint_timer_period(),
-        )
-    }
-
     fn renderer_behind(&self) -> bool {
         if !self.display_composite_in_flight.get() {
             return false;
@@ -4127,16 +4081,15 @@ impl Painter {
         // 설계 2-6: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
 
         // ★여기 있던 "도착률로 즉시 합성" 설명은 그 경로와 함께 2026-10-21 에 사라졌다.★
-        // 남은 것은 아래 external fast-path 가 쓰는 판정 하나다.
         //
-        // ★"rAF 가 돌고 있다" 가 아니라 "rAF 가 프레임을 내고 있다" 로 판정한다★ --
-        // 이유는 `raf_is_producing_frames` 주석. ★이 술어는 Task 10 이 지운다★ -- 생산자가
-        // 틱 하나가 되면 답이 상수가 되고, `should_fast_present` 는 그 답을 틱에서 직접
-        // 받는다(설계 4 절).
-        let raf_driving_composites = self.raf_is_producing_frames();
-        if self.animation_callbacks_running() && !raf_driving_composites {
-            UPDATE_IMAGES_STATS.with(|stats| stats.borrow_mut().raf_idle_calls += 1);
-        }
+        // ★rAF 판정(`raf_is_producing_frames`)과 그 계수기(`raf_idle_calls`)도 2026-10-22 에
+        // 삭제됐다. 그것이 막던 증상(rAF 가 프레임을 내는 동안 비디오 도착이 두 번째
+        // 합성원이 되어 합성이 도착률만큼 늘던 지터)은 생산자가 하나라서 구조적으로
+        // 불가능하다 — docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
+        // 4 절.★ 아래 fast-path 의 박자는 술어가 아니라 ***틱***이 준다
+        // (`wall_tick::ExternalPresentBudget`, 틱당 1 회). 계수기 쪽은 세던 사건
+        // ("rAF 는 도는데 프레임이 안 나와서 비디오가 스스로 합성해야 했다")이 아예 없어져
+        // 구조적으로 0 이다 -- 비디오는 합성하지 않는다.
 
         // external 갱신 분리(Task 1-4, 설계 §4): 승격된 external 비디오만 도착했다면
         // WR 프레임 빌드(generate_frame, 씬 트리 재구성)를 완전히 건너뛰고 DComp 레벨의
@@ -4167,7 +4120,6 @@ impl Painter {
                 // 프레임을 내지 않으므로(위 주석). 인자는 남긴다: 이 판정이 "이 호출이
                 // 이미 비싼 프레임을 냈나" 를 묻는 자리라는 사실이 서명에 남아야 한다.
                 false,
-                raf_driving_composites,
                 escaped_count,
                 resize_active,
                 crate::dcomp_compositor::decouple_enabled(),
@@ -4211,15 +4163,15 @@ impl Painter {
         // 늦어도 다음 주기에 실려 나간다. 도착 수가 몇이든 합성은 주기당 하나이고, 도착이
         // 없어도 주기는 돈다 -- 어느 쪽 증상도 성립할 자리가 없다.
         //
-        // ★단 그 바닥은 `gfx_single_frame_producer` 가 켜졌을 때의 것이고, 그 pref 는 아직
-        // 기본 off 다★(Task 10 이 뒤집는다). 꺼져 있으면 틱이 생산하지 않으므로 비디오만
-        // 있는 페이지의 합성은 지운 주석이 적은 28/s 가 아니라 ***0/s*** 다 -- 그것이
-        // 설계 8 절의 음성 대조군(생산자가 없으면 화면이 선다)이고, 벽에 내보낼 구성이
-        // 아니다. 바닥의 근거는 "틱이 돈다" 이지 "이 블록이 없다" 가 아니다.
+        // ★바닥의 근거는 "틱이 돈다" 이지 "이 블록이 없다" 가 아니다.★ 2026-10-22 전에는
+        // 그 전제에 단서가 붙어 있었다 -- 틱 생산이 `gfx_single_frame_producer` 뒤에 있어
+        // 끄면 비디오만 있는 페이지의 합성이 28/s 가 아니라 ***0/s*** 였다. 그 pref 는
+        // 그날 삭제됐다(off 가 폴백이 아니라 멈춘 벽이었다). 지금은 틱이 있는 셸이 곧
+        // 생산하는 셸이라 단서가 없다.
         //
         // ★주의: `gfx_video_immediate_composite_enabled` 의 유일한 런타임 사용처가 여기였다★
-        // -- 설계 8 절의 A/B 대조군이 이 블록과 함께 사라진다. 대조군은
-        // `gfx_single_frame_producer` 를 끄는 음성 대조로 바뀐다.
+        // -- 설계 8 절의 A/B 대조군이 이 블록과 함께 사라진다. pref 를 끄는 음성 대조도
+        // 이제 없으므로, 대조군은 ★브랜치 이전 빌드★ 다.
         // 설계 2-6 / 4 절: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
 
         // With coalescing, a call that only stashed video frames produces an empty
@@ -4239,13 +4191,13 @@ impl Painter {
             let elapsed = window.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 warn!(
-                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} send_ms={:.1} rest_ms={:.1} raf_idle={} vidgap_max_ms={:.1} vidarrive_max_ms={:.1}",
+                    // ★`raf_idle=` 는 2026-10-22 에 빠졌다★ -- 필드 주석 참고(구조적으로 0).
+                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} send_ms={:.1} rest_ms={:.1} vidgap_max_ms={:.1} vidarrive_max_ms={:.1}",
                     elapsed.as_secs_f64() * 1000.0,
                     stats.calls,
                     stats.total_ms,
                     stats.send_ms,
                     (stats.total_ms - stats.send_ms).max(0.0),
-                    stats.raf_idle_calls,
                     stats.video_gap_max_ms,
                     stats.video_arrival_gap_max_ms,
                 );
@@ -5132,72 +5084,11 @@ mod anim_step_seq_tests {
     }
 }
 
-#[cfg(test)]
-mod raf_gate_tests {
-    use std::time::Duration;
-
-    use super::raf_is_driving_composites;
-
-    const REFRESH: Duration = Duration::from_millis(16);
-
-    /// rAF 가 없으면 비디오가 스스로 낸다(예전부터 그랬다).
-    #[test]
-    fn no_raf_means_the_video_composites_itself() {
-        assert!(!raf_is_driving_composites(
-            false,
-            Some(Duration::from_millis(1)),
-            REFRESH
-        ));
-    }
-
-    /// rAF 가 실제로 프레임을 내고 있으면 비디오는 그 박자를 탄다 — 이 게이트의 본래 뜻이다.
-    #[test]
-    fn raf_producing_frames_still_carries_the_video() {
-        // 60fps 로 도는 rAF 는 도착이 다음 프레임 직전에 걸려도 간격이 한 주기다.
-        assert!(raf_is_driving_composites(
-            true,
-            Some(Duration::from_millis(16)),
-            REFRESH
-        ));
-    }
-
-    /// ★이 수정의 핵심★ — rAF 는 도는데 프레임이 안 나오는 상태.
-    ///
-    /// 아무것도 그리지 않는 rAF 루프(자기 시계만 돌리는 것)가 정확히 이 모습이고, 예전에는
-    /// 이때도 참이라 비디오 합성이 막혀 화면이 정지했다.
-    #[test]
-    fn raf_that_produces_nothing_does_not_count() {
-        assert!(!raf_is_driving_composites(
-            true,
-            Some(Duration::from_millis(200)),
-            REFRESH
-        ));
-    }
-
-    /// 경계는 한 주기 반이다 — 멀쩡한 rAF 의 최대 간격(한 주기)보다는 크고, 경계에서
-    /// 한 박자로 느껴질 만큼 길지는 않다.
-    #[test]
-    fn the_boundary_sits_between_one_and_two_periods() {
-        // 한 주기 간격은 아직 "남이 내고 있다"로 본다(60fps rAF 의 최악 위상).
-        assert!(raf_is_driving_composites(
-            true,
-            Some(Duration::from_millis(23)),
-            REFRESH
-        ));
-        // 한 주기 반을 넘기면 아무도 안 내고 있는 것이다.
-        assert!(!raf_is_driving_composites(
-            true,
-            Some(Duration::from_millis(25)),
-            REFRESH
-        ));
-    }
-
-    /// 아직 한 장도 낸 적이 없으면 태워 줄 것이 없다.
-    #[test]
-    fn a_painter_that_never_drew_carries_nothing() {
-        assert!(!raf_is_driving_composites(true, None, REFRESH));
-    }
-}
+// ★`raf_gate_tests` 모듈은 2026-10-22 에 술어와 함께 삭제됐다. 그것이 고정하던 "한 주기 반"
+// 경계는 시간 창이고, 지금 대역외 표출의 박자는 시간이 아니라 틱 번호다 —
+// docs/superpowers/specs/2026-10-21-single-frame-producer-design.md 4 절.★ 그 박자를
+// 고정하는 시험은 `wall_tick::tests` 의 `each_tick_gets_its_own_external_present`
+// (바닥)과 `a_second_external_present_in_the_same_tick_is_refused`(천장)이다.
 
 #[cfg(test)]
 mod frame_delayer_canvas_wait_tests {
