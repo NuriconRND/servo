@@ -92,9 +92,11 @@ impl BaseRefreshDriver {
     }
 
     fn observe_next_frame(&self) {
-        // ★`Release` 다 -- [`Heartbeat::beat`] 의 `Acquire` 적재와 짝이다.★ 그쪽이 이
-        // 저장을 놓치면 아무도 박동을 다시 걸지 않아 `FrameClock::Timer` 가 얼어붙는다.
-        self.waiting_for_frame.store(true, Ordering::Release);
+        // ★`SeqCst` 다 -- [`Heartbeat::beat`] 의 적재와 ***같은 전순서*** 위에 있어야
+        // 한다.★ 그쪽이 이 저장을 놓치면 아무도 박동을 다시 걸지 않아 `FrameClock::Timer`
+        // 가 얼어붙는다. `Release`/`Acquire` 짝으로는 그것이 닫히지 않는다 -- 왜인지는
+        // `beat` 의 주석.
+        self.waiting_for_frame.store(true, Ordering::SeqCst);
 
         let waiting_for_frame = self.waiting_for_frame.clone();
         let event_loop_waker = self.event_loop_waker.clone_box();
@@ -456,15 +458,36 @@ impl Heartbeat {
         // 할 때 "이미 걸려 있다" 로 보이면 그 에지가 통째로 사라진다. 먼저 내려 두면 최악이
         // 메인과 여기가 하나씩 걸려 하나가 `armed` 에 막히는 경우이고, 그때도 하나는 남는다.
         //
-        // ★그 "최악" 이 성립하는 근거는 두 플래그의 순서다.★ 메인이 `armed` 에 막히는
-        // 경우는 메인의 `swap` 이 이 `store` 보다 먼저인 경우뿐이고(둘 다 `SeqCst` 라 한
-        // 전순서 위에 있다), 그러면 메인이 그보다 앞서 한 `waiting_for_frame` 저장
-        // (`Release`)이 아래 적재(`Acquire`)에 보인다 -- 그래서 여기서 다시 건다.
-        // ★`Relaxed` 로 두면 그 문장이 성립하지 않고, 둘 다 물러나 아무도 안 거는 끼어듦이
-        // 남는다★(x86 에서는 나지 않지만, 주석이 갖지 않은 안전을 주장하게 된다).
+        // ★그 "하나는 남는다" 를 지탱하는 것은 ***네 접근이 전부 `SeqCst`*** 라는 것
+        // 하나다.★ 그래야 `armed` 의 두 연산과 `waiting_for_frame` 의 두 접근이 ***같은***
+        // 전순서 위에 놓인다. 메인이 ***이 박동이 소비한 등록*** 때문에 막혔다는 것은
+        // 메인의 `swap` 이 바로 아래 `store` 보다 그 순서에서 앞섰다는 뜻이고(아래에서
+        // 다시 건 뒤에 막힌 것이라면 이미 하나가 걸려 있으니 잃을 것이 없다), 그러면
+        //
+        //     메인: store(waiting, true) -> swap(armed)
+        //     여기:                          store(armed, false) -> load(waiting)
+        //
+        // 가 한 줄로 늘어선다. 그 전순서에서 아래 적재 앞의 마지막 `waiting` 쓰기가 메인의
+        // `true` 이므로 적재는 그것을 본다 -- 그래서 여기서 다시 건다. (`waiting` 의 다른
+        // 쓰기는 프레임 콜백의 `store(false)` 하나뿐이고 `SeqCst` 가 아닌데, 그것은 이 셸에서
+        // 메인이 틱 안에서 부르므로 위 `store(true)` 보다 happens-before 다 -- 그래서 대신
+        // 읽힐 수 없다. 콜백을 자기 스레드에서 쏘는 드라이버는 박동을 달지 않는다.)
+        //
+        // ★`Release`/`Acquire` 짝으로는 닫히지 않는다★(한 번 그렇게 쓰고 고쳤다). 그 짝이
+        // 간선을 만드는 것은 acquire 가 ***그 release 가 쓴 값을 읽을 때뿐***인데, 문제의
+        // 끼어듦은 정확히 아래 적재가 메인의 저장을 **안 읽는** 경우라 간선이 없다.
+        // ★`armed` 만 `SeqCst` 인 것도 모자라다★ -- 그 전순서는 `armed` 연산만 담고
+        // `waiting_for_frame` 접근은 담지 않으므로 그것들을 제약하지 못한다. 스레드마다
+        // 두 연산 사이에 `SeqCst` 펜스를 두어도 같은 효과지만, 플래그가 프레임당 한 번씩만
+        // 닿는 자리라 ★순서를 접근 옆에 적어 두는 쪽★ 을 골랐다 -- 펜스는 떨어져 있어서
+        // 다음 사람이 둘을 같이 읽지 못한다.
+        //
+        // 이 끼어듦이 x86-64 에서 실제로 관측될 일은 사실상 없다(그 `SeqCst` 들이 전부 full
+        // barrier 로 내려간다). 그래도 적어 두는 이유는 버그가 아니라 주석이다 -- ★갖지
+        // 않은 안전을 주장하는 동시성 주석은 남기지 않는다.★
         self.armed.store(false, Ordering::SeqCst);
         self.event_loop_waker.wake();
-        if self.waiting_for_frame.load(Ordering::Acquire) {
+        if self.waiting_for_frame.load(Ordering::SeqCst) {
             self.arm();
         }
     }
@@ -638,16 +661,22 @@ mod tests {
         );
         // ★상한은 `paint_timer_period()` 를 쓰고 있는지만 가린다.★ 두 박동이면 두 주기
         // 남짓인데, Windows 의 기본 타이머 해상도(15.6ms)가 120Hz 주기(8.3ms)보다 굵어
-        // 실측은 서너 주기까지 늘어난다. 여덟 주기면 그 흔들림의 두 배라 안정적이고,
-        // 주기를 잘못 잡은 경우(예: 1Hz)는 그래도 잡힌다.
+        // 실측은 서너 주기까지 늘어난다.
+        //
+        // ★주기 배수만으로는 안 된다 -- 상한이 `gfx_refresh_hz` 를 따라 **줄어든다**.★
+        // 1000Hz 면 여덟 주기가 8ms 라 타이머 해상도보다 작아 체계적으로 실패하고, 부하가
+        // 걸린 기계에서 스케줄 슬라이스 한 번이 그보다 길면 거짓 실패다. 그래서 바닥을
+        // 깐다. 250ms 를 둬도 잡을 것은 다 잡힌다: 1Hz 로 걸면 두 박동이 2 초고, 재장전이
+        // 빠지면 위 단언이 5 초 마감에서 잡는다.
+        let too_slow = std::cmp::max(paint_timer_period() * 8, Duration::from_millis(250));
         assert!(
-            elapsed < paint_timer_period() * 8,
+            elapsed < too_slow,
             "박동 간격이 `paint_timer_period()` 가 아니다 ({elapsed:?}, \
              기대 ~2 x {:?})",
             paint_timer_period()
         );
         assert!(
-            base.waiting_for_frame.load(Ordering::Acquire),
+            base.waiting_for_frame.load(Ordering::SeqCst),
             "깨우기만 와야 한다 -- 콜백이 쏘였다면 waiting_for_frame 이 내려갔을 것이다"
         );
         assert_eq!(
