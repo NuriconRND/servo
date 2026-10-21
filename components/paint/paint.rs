@@ -1895,17 +1895,27 @@ impl Paint {
     ///
     /// ★★그런데 게이트를 우회해도 게이트가 읽는 상태는 남긴다.★★ 공유하는
     /// `issue_wall_frame_request` 가 `last_wall_frame_issue_at` 을 찍고 `register_frame` 으로
-    /// `active_webview_frames` 에 넣는데, `wall_frame_request_pacing_block_reason` 이 막는
-    /// 근거가 정확히 그 둘이다(`Active` 와 `TooSoon`). 그래서 ***틱이 배선된 구간 동안
-    /// 스크립트의 `PaintMessage::GenerateFrame` 이 훨씬 자주 coalesce 된다*** -- 틱은
-    /// 주기마다 그 두 상태를 새로 찍는데 스크립트는 그것을 넘어야 하기 때문이다.
+    /// `active_webview_frames` 에 넣으며(둘 다 ★생성한 타일이 둘 이상일 때만★ 돈다),
+    /// `wall_frame_request_pacing_block_reason` 의 `Active`/`TooSoon` 분기가 그 둘을 읽는다
+    /// (셋째 분기 `Pending` 은 painter 의 `pending_frames` 를 본다). 그래서 ***틱이 배선된
+    /// 구간 동안 스크립트의 `PaintMessage::GenerateFrame` 이 더 자주 coalesce 된다.***
+    /// ★조건이 붙는다★ — 그 게이트는 `gfx_wall_frame_pacing_enabled` 가 켜져 있고 대상
+    /// 타일이 둘 이상일 때만 적용되므로, 단일 타일 구성에서는 이 상호작용이 아예 없다.
     ///
-    /// ★그것이 캔버스 ack 해제를 조인다.★ 지금 `take_waiting_pipelines` +
-    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내는 곳은
-    /// `Painter::generate_frame_for_script` 하나뿐이고, 그 유일한 해제자를 조이는 것은 이
-    /// 저장소가 이미 실측한 rAF 잠금(divisor=1 실행이 117 초에서 멎음, log_ani_debug 36)의
-    /// 설정 조건이다. coalesce 된 요청은 `try_release_coalesced_wall_frame_requests` 로
-    /// 늦게나마 풀려 나가므로 해제가 ***없어지는*** 것은 아니고 늦어진다.
+    /// ★그것이 캔버스 ack 해제를 늦춘다.★ 다만 ***유일한 해제자를 막는 것은 아니다***:
+    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내는 자리는 넷이고(`painter.rs`
+    /// `check_canvas_ack_latch` 의 표시 참고), coalesce 가 미루는 것은 그중
+    /// `generate_frame_for_script` 안의 둘이다. 나머지 둘은 경로가 다르다:
+    ///
+    /// - `flush_owed_canvas_ack` — `Painter::render` 맨 앞에서 매 렌더 돈다. ★틱은 렌더를
+    ///   만들어 내므로 이 복구 경로는 오히려 더 자주 돈다.★
+    /// - `update_images` — 캔버스 이미지가 도착할 때 돈다.
+    ///
+    /// 그래서 위험은 ★사라지는 게 아니라 좁아진다.★ 좁아진 자리는 저 둘이 같이 못 도는
+    /// 구간이다 -- 둘 다 `needs_new_frame() && !renderer_behind()` 를 요구하므로, 틱이
+    /// 계속 바쁘게 만든 타일(`renderer_behind()` 참)이나 렌더가 멎은 타일에서는 빚이 그대로
+    /// 남는다. 실측된 rAF 잠금(divisor=1 실행이 117 초에서 멎음, log_ani_debug 36)이 바로
+    /// 그 모양이었다: 매번 거절하는 경로가 ack 를 안 풀어 스크립트가 선다.
     ///
     /// ★Task 6 이 해제를 생산에서 떼어 틱마다 돌리면 이 상호작용은 사라진다.★ 그때까지만
     /// 있는 중간 상태이고, Task 5 의 pref 뒤에서만 존재한다.
