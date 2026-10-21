@@ -480,7 +480,8 @@ struct ClockStats {
 /// ★증명하지 못하는 것:★ (1) 합성이 한 번이었다는 것 -- 돌려주는 값은 ***낸 것(issue)*** 을
 /// 세지, 합성을 세지 않는다(타일이 전부 `KeepPrevious` 여도 `Some`). (2) 틱 사이에 스크립트
 /// 경로가 번호를 쓰지 않았다는 것 -- 번호는 공유 카운터라 건너뛰는 것은 정상이다(그래서
-/// "연속" 이 아니라 "증가" 만 본다). "생산 지점이 하나" 라는 판정은 Task 7 이후의 `FRAMEREASON`
+/// "연속" 이 아니라 "증가" 만 본다). (3) ★릴리스 빌드에서는 아예 돌지 않는다★(`debug_assert!` 가
+/// 인자째 사라진다). "생산 지점이 하나" 라는 판정은 Task 7 이후의 `FRAMEREASON`
 /// 로그가 한다.
 #[derive(Debug, Default)]
 struct TickIssueAudit {
@@ -1461,27 +1462,6 @@ impl AppState {
         // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
         // 지나므로 한 자리면 충분하다.★
         servo::note_present_tick();
-        // ★틱이 벽 프레임을 낸다 -- `gfx_single_frame_producer` 가 켜졌을 때만.★ 자리는
-        // `note_present_tick` 뒤, 콜백 발사와 렌더 앞이다. 구성 요소를 모으고 내는 순서는
-        // `on_wall_tick` 안에 있어 여기서 틀릴 수 없다.
-        //
-        // ★중간 상태다.★ 구 생산자가 아직 살아 있어 이 구간의 합성 수와 `FRAMEID` 는 판정에
-        // 쓰지 않는다(한 틱이 합성을 두 번 낼 수 있다). 기본 꺼짐.
-        //
-        // 이 셸의 세 구성(Pacing / Timer / Vsync)은 모두 자유 실행 틱 에지가 있으므로
-        // 예약 비트(`on_demand_wall_tick`)를 보지 않고 매 주기 부른다.
-        if servo::pref!(gfx_single_frame_producer) {
-            let webview = self.webview.borrow().clone();
-            if let Some(webview) = webview {
-                let issued = webview.on_wall_tick();
-                let mut audit = self.tick_issue_audit.borrow_mut();
-                debug_assert!(
-                    audit.record_tick(issued).is_ok(),
-                    "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: {:?}",
-                    audit
-                );
-            }
-        }
         // ★Servo 의 프레임 관찰자를 여기서 깨운다.★ 세 구성(Pacing / Timer / Vsync)
         // 모두 이 자리에서 쏜다 -- `notify_will_paint` 가 등록해 둔 콜백을 부를 사람은
         // 여기뿐이다. 구성마다 다른 것은 ***틱 에지를 누가 내는가*** 뿐이고(페이싱 스레드 /
@@ -1490,6 +1470,29 @@ impl AppState {
         // ***렌더 전에 불러야 한다*** -- 그 콜백이 `waiting_for_frame` 을 내리고, 그것이
         // 내려가야 `needs_repaint()` 가 참이 된다.
         self.tick_fire.fire();
+        // ★틱이 벽 프레임을 낸다 -- `gfx_single_frame_producer` 가 켜졌을 때만.★ 자리는
+        // 콜백 발사(`fire`) 뒤, 렌더 앞이다 -- 설계 2-2 의 순서 그대로이고, `gather_components`
+        // 가 건 깨우기를 같은 틱의 `fire()` 가 먹어 치워 `wake()` 가 두 번 나는 일도 없다.
+        // 구성 요소를 모으고 내는 순서는 `on_wall_tick` 안에 있어 여기서 틀릴 수 없다.
+        //
+        // ★중간 상태다.★ 구 생산자가 아직 살아 있어 이 구간의 합성 수와 `FRAMEID` 는 판정에
+        // 쓰지 않는다(한 틱이 합성을 두 번 낼 수 있다). 기본 꺼짐.
+        //
+        // 이 셸은 틱 에지가 어느 구성에서도 나온다(Pacing / Vsync 는 자기 스레드, Timer 는
+        // `PaintTimerThread` 의 깨우기 -- 다만 Timer 의 박동은 `waiting_for_frame` 일 때만
+        // 걸린다). 그래서 예약 비트(`on_demand_wall_tick`)를 보지 않고 에지마다 부른다.
+        if servo::pref!(gfx_single_frame_producer) {
+            let webview = self.webview.borrow().clone();
+            if let Some(webview) = webview {
+                let issued = webview.on_wall_tick();
+                let mut audit = self.tick_issue_audit.borrow_mut();
+                debug_assert!(
+                    audit.record_tick(issued).is_ok(),
+                    "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: issued={issued:?} audit={:?}",
+                    audit
+                );
+            }
+        }
         if self.direct_render {
             self.note_redraw_requested();
             self.charge_main(MainSlot::Render, || self.render_all_tiles());

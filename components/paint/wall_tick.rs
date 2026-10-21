@@ -14,6 +14,8 @@
 //! 이것을 못 찾는다. 위 규칙을 떠받치는 타입끼리 한자리에 모아 두어야 규칙을 깨는 변경이
 //! 리뷰에서 눈에 띈다.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// 한 타일이 이번 틱에 한 일.
 ///
 /// ★`KeepPrevious` 는 "아무 일도 안 했다" 가 아니다.★ 그 타일은 **직전 프레임을 그대로
@@ -56,8 +58,6 @@ pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) 
     TileOutcome::Generated
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 /// ★다음 틱 에지에 벽 생산 1 회가 예약됐는가.★ 자유 실행 표출 클럭이 없는 임베더
 /// (servoshell / WPT / Android)용이다 -- `frame_time.rs` 의 전역 통지와 같은 모양이다.
 ///
@@ -77,28 +77,26 @@ pub(crate) fn schedule_production_at_next_edge() {
 
 /// 예약을 집어 간다. ★`swap(false)` 라서 한 예약은 한 번만 생산이 된다.★
 pub(crate) fn take_scheduled_edge() -> bool {
-    take_flag(&NEXT_EDGE_SCHEDULED)
-}
-
-fn take_flag(flag: &AtomicBool) -> bool {
-    flag.swap(false, Ordering::AcqRel)
+    NEXT_EDGE_SCHEDULED.swap(false, Ordering::AcqRel)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{
+        TileOutcome, schedule_production_at_next_edge, take_scheduled_edge, tile_may_generate,
+    };
 
-    use super::{TileOutcome, take_flag, tile_may_generate};
-
-    /// ★예약은 한 번만 생산이 된다.★ 집어 가면 비트가 내려가야 한다 -- 안 내려가면
-    /// 깨우기 한 번이 매 틱 생산이 되어 수요 구동 임베더가 자유 실행으로 변한다.
+    /// ★예약은 한 번만 생산이 된다 -- 두 공개 함수가 같은 비트를 만지는지까지 본다.★
+    /// 집어 가면 비트가 내려가야 한다: 안 내려가면 깨우기 한 번이 매 틱 생산이 되어 수요
+    /// 구동 임베더가 자유 실행으로 변한다. `NEXT_EDGE_SCHEDULED` 를 만지는 시험은 이것 하나뿐
+    /// 이라 전역이어도 병렬 실행에서 흔들리지 않는다.
     #[test]
     fn a_scheduled_edge_is_taken_exactly_once() {
-        let flag = AtomicBool::new(false);
-        assert!(!take_flag(&flag), "예약이 없으면 생산하지 않는다");
-        flag.store(true, Ordering::Release);
-        assert!(take_flag(&flag), "예약이 있으면 한 번 생산한다");
-        assert!(!take_flag(&flag), "집어 간 뒤에는 비어 있어야 한다");
+        assert!(!take_scheduled_edge(), "예약이 없으면 생산하지 않는다");
+        schedule_production_at_next_edge();
+        schedule_production_at_next_edge();
+        assert!(take_scheduled_edge(), "예약이 있으면 한 번 생산한다");
+        assert!(!take_scheduled_edge(), "집어 간 뒤에는 비어 있어야 한다");
     }
 
     /// 앞 합성이 아직 안 끝난 타일은 이번 프레임을 건너뛴다. 그래도 호출자는

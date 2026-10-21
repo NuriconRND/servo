@@ -68,6 +68,9 @@ pub fn note_present_tick() {
 /// ★다음 틱 에지에 벽 생산 1 회를 예약한다 -- 프레임을 내지 않는다.★ 자유 실행 표출
 /// 클럭이 없는 임베더(servoshell / WPT / Android)의 깨우기가 부른다. 틱이 에지에서
 /// `Paint::on_demand_wall_tick` 으로 집어 가 생산한다. 몇 번 불러도 에지당 생산은 한 번이다.
+///
+/// ★첫 호출자는 Task 7 에 온다★(`pump_paint_animation` 의 깨우기 동반자). 지금은 호출자가
+/// 없는 것이 정상이다.
 pub fn schedule_wall_production() {
     crate::wall_tick::schedule_production_at_next_edge();
 }
