@@ -43,7 +43,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `SERVO_VIDEO_ESCAPE_STABLE_SWAPCHAIN` | `gfx_video_escape_stable_swapchain` | **기본 on 킬스위치.** 옛 `=0` 이 `=false` 다 |
 | `SERVO_VIDEO_ESCAPE_PROMOTE_HYSTERESIS` | `gfx_video_escape_promote_hysteresis` | `--pref gfx_video_escape_promote_hysteresis=N` |
 | `SERVO_VIDEO_DECOUPLE` | `gfx_video_decouple_enabled` | **기본 on 킬스위치.** 옛 `=0` 이 `=false` 다 |
-| `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` | `gfx_video_immediate_composite_enabled` | ★**의미가 반대다**★ — 옛 env 는 "끄기", 새 pref 는 "켜기"(기본 **켜짐**). 비디오 도착이 합성을 구동하되 `gfx_refresh_hz` 주기로 합쳐서 요청한다. 완전히 끄려면 `--pref gfx_video_immediate_composite_enabled=false` |
+| `SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE` | `gfx_video_immediate_composite_enabled` | ★**2026-10-21 부터 아무 효과가 없다**★ — 그 pref 를 읽던 유일한 블록(비디오 도착 합성)이 삭제됐다. 아래 pref 표 참고 |
 | `SERVO_MEDIA_D3D11_VIDEO` | `media_d3d11_enabled` | `--pref media_d3d11_enabled=true` |
 | `SERVO_MEDIA_SYNC_GROUP` | `media_sync_group_target` | **불리언이 아니라 개수다.** `--pref media_sync_group_target=N` (타일 수). 이름도 바뀌었다 |
 | `SERVO_MEDIA_GAPLESS_LOOP` | `media_gapless_loop_enabled` | `--pref media_gapless_loop_enabled=true` |
@@ -89,7 +89,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_wall_frame_pacing_enabled` | bool | **`true`** | wall 프레임 페이싱(latest-wins). 이름과 달리 **기본 on** 이다 — 옛 판정이 `mode == Latest` 였다. |
 | `gfx_wall_frame_max_pending` | i64 | `1` | wall 프레임 배리어가 허용하는 미완료 프레임 수. |
 | `gfx_wall_frame_min_interval_ms` | i64 | **`0`** | wall 프레임 사이 최소 간격(ms). ***`0` = `gfx_refresh_hz` 한 주기로 유도***. ★옛 기본값 `16` 은 62.5Hz 이고, 정수 ms 로는 60Hz(16.667ms)를 표현할 수 없다★ — 16 은 4.2% 빠르고 17 은 2% 느리다. 유도하면 페인트 타이머 및 비디오 합성 합치기와 같은 박자가 된다. 양수를 명시하면 그 값을 그대로 쓴다. |
-| `gfx_single_frame_producer` (2026-10) | bool | `false` | 페이싱 틱이 벽 프레임의 **단일 생산자**가 된다. 켜면 `winit_wall` 이 틱마다 `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다(`note_present_tick` 뒤, 렌더 앞). ★중간 상태이므로 켠 채 배포하지 않는다★ — 구 생산자 열한 곳이 아직 살아 있어 한 틱이 합성을 두 번 낼 수 있고, 틱이 페이서 게이트가 읽는 상태를 써서 스크립트 `GenerateFrame` 의 coalesce 가 늘어 캔버스 ack 해제가 늦어진다(Task 6 이 틱에 해제자를 ***추가***해 그 구간을 메운다 — 생산 경로 셋의 해제는 Task 7 이 그 생산자들과 함께 지운다). 이 구간의 합성 수와 `FRAMEID` 는 판정에 쓰지 않는다. 기본값은 구 생산자를 내린 뒤 뒤집는다. |
+| `gfx_single_frame_producer` (2026-10) | bool | `false` | 페이싱 틱이 벽 프레임의 **단일 생산자**가 된다. 켜면 `winit_wall` 이 틱마다 `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다(`note_present_tick` 뒤, 렌더 앞). ★2026-10-21(Task 7)부터 구 생산자가 없다★ — 그래서 이 pref 는 더는 "새 경로를 덧붙이는 스위치" 가 아니라 ***생산을 켜고 끄는 스위치***다. **끄면 WebRender 프레임이 한 장도 안 난다**(파이프라인 부트스트랩 제외) — 그것이 설계 8 절의 음성 대조군이고, 화면이 서는 것이 정상이다. 캔버스 ack 는 그 구성에서도 복구 경로(`flush_owed_canvas_ack`)가 푼다. 기본값은 실기 검증을 통과한 뒤 뒤집는다. |
 | `gfx_wr_picture_tile_size` | String | `""` (= 오버라이드 없음) | WebRender picture cache 타일 크기. `""` = WR 기본 분기(콘텐츠 1024x512, 스크롤바는 WR 이 자체 특수 크기), `WxH`(예 `1920x1080`) = 모든 painter 동일, **`display`** = painter 마다 자기 창 크기. 타일이 창 이상이면 슬라이스당 타일 1 장이 된다. ★**WR 은 이 값을 검사도 클램프도 하지 않는다**(2026-08-12 확인) — 실질 상한은 GPU 텍스처 크기다.★ ★**쪼개면 싸질 것이라는 예상은 반증되었다**(2026-08-26, 45xFHD30 5760x2160): `display` render_ms p50 29.9ms / present 28.6/s 인데, `1024x1024` 는 99.6ms / 8.4/s, `512x512` 는 108.4ms / 8.5/s 로 **합성 1 회가 3.5 배 느려진다**. 전면이 매 프레임 바뀌는 비디오 월에서 픽처 캐시는 순수 오버헤드이므로 `display` 를 유지할 것.★ |
 
 ### `gfx_video_*` — 비디오 WR 탈출 / 분리
@@ -102,7 +102,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_video_escape_buffer_count` | i64 | `2` | **external 비디오 스왑체인 전용** 백버퍼 수(2..=4, 범위 밖은 경고 후 클램프). ★2 면 in-flight 프레임이 1 장이라 `Present` 가 컴포지터의 백버퍼 반납을 기다린다★ — 45xFHD30 실측에서 렌더러 스레드가 1 초 중 **85%(854ms)를 Present 에서** 보내는데 CPU 는 0.3 코어도 안 쓴다(= 일하는 게 아니라 자고 있다). 1 회당 비용도 영상 수에 따라 0.42ms(20 개) → 0.70ms(45 개)로 커진다(고정 드라이버 비용이면 안 커진다). **콘텐츠 스왑체인에는 적용되지 않는다** — 그쪽 부분 Present 의 catch-up 복사가 `GetBuffer(1)`=직전 프레임이라는 정확한 2 버퍼 핑퐁을 전제한다. |
 | `gfx_video_decouple_enabled` | bool | **`true`** | 킬스위치. 비디오 프레임 갱신을 씬 재합성에서 분리하는 경로를 끄려면 `=false`. |
 | `dom_image_max_decoded_pixels` | i64 | **`8294400`** (3840x2160) | 디코드된 이미지를 GPU 에 올리기 전에 줄이는 상한(픽셀). `0` 이하면 끈다. ★파일 크기가 아니라 디코드 크기가 GPU 비용이다★ — 실측 8.3MB JPEG = 8103x5405 = **175MB** RGBA. WebRender standalone 축출 임계값이 **8MB**(`texture_cache.rs`)이고 그 **4 배(32MB)**를 넘으면 매 프레임 축출 모드라, 그 이미지 하나가 타일 렌더를 1.1ms → 26ms, 월을 48.7 → 18.5 presents/s 로 떨어뜨렸다. ***intrinsic 크기는 안 바뀐다*** — 레이아웃 동일, 텍스처 해상도만 하락(캡처 대조 확인). 단일 프레임 RGBA8/BGRA8 만. ★참고: 상한 자체가 4K 면 이미지 한 장이 33.2MB 라 이미 32MB 선을 넘는다★ — 표출이 FHD 라면 `=2073600` 이 맞다. |
-| `gfx_video_immediate_composite_enabled` | bool | **`true`** | 비디오 프레임 도착이 합성을 구동할지. ***도착마다가 아니라 `gfx_refresh_hz` 주기로 합쳐서*** 요청한다(`painter.rs` `video_composite_due`). ★2026-08-31 실측: 양극단이 둘 다 틀렸다★ — **도착마다**면 요청률이 전 영상 프레임레이트의 합이 되어(36xFHD30 = 1080/s 를 60Hz 월에) 4-GPU 월에서 **39.19 코어** 대 **22.72 코어**, 이질 배치 primary 타일 렌더 **17.42ms 대 6.02ms**. **아예 끄면** 영상만 움직이는 페이지에서 합성을 구동할 것이 없어 **초당 28 회**로 주저앉는다 — 콘텐츠 자신의 30fps 보다 낮다(CSS 애니메이션 도는 동안만 86/s). 합치면 **하한**(페인트 주기)과 **상한**을 동시에 얻는다. `=false` 면 비디오가 합성을 전혀 구동하지 않는다. |
+| `gfx_video_immediate_composite_enabled` | bool | **`true`** | ★**2026-10-21 부터 런타임 효과가 없다**★ — 이 pref 를 읽던 유일한 블록(`painter.rs` 의 비디오 도착 합성)이 생산자 일원화로 삭제됐다(설계 2-6). 비디오는 이제 틱이 낸 프레임에 실려 나간다(바닥과 천장을 같은 틱이 준다). 런처 `-NoImmediateComposite` 도 같이 무효다. 아래는 그 블록이 있던 시절의 근거 기록이다. 비디오 프레임 도착이 합성을 구동할지. ***도착마다가 아니라 `gfx_refresh_hz` 주기로 합쳐서*** 요청한다(`painter.rs` `video_composite_due`). ★2026-08-31 실측: 양극단이 둘 다 틀렸다★ — **도착마다**면 요청률이 전 영상 프레임레이트의 합이 되어(36xFHD30 = 1080/s 를 60Hz 월에) 4-GPU 월에서 **39.19 코어** 대 **22.72 코어**, 이질 배치 primary 타일 렌더 **17.42ms 대 6.02ms**. **아예 끄면** 영상만 움직이는 페이지에서 합성을 구동할 것이 없어 **초당 28 회**로 주저앉는다 — 콘텐츠 자신의 30fps 보다 낮다(CSS 애니메이션 도는 동안만 86/s). 합치면 **하한**(페인트 주기)과 **상한**을 동시에 얻는다. `=false` 면 비디오가 합성을 전혀 구동하지 않는다. |
 > ★낡음(2026-09-10 기록, 2026-09-18 `79d8875effe`·2026-10-16 `af88ed98231` 이후 무효)★ — 값은 `Painter::render` 끝에서 밀고, 프레임 판정은 `paint.rs` 의 턴 끝(`flush_deferred_animation_frame`)이다.
 | `gfx_paint_side_animations_enabled` (2026-09) | bool | **`true`** | 킬스위치. CSS `opacity`/`transform` 애니메이션을 **페인트 측이 직접** 재생할지. 켜면 레이아웃이 그 값을 앞으로 `gfx_paint_side_animation_horizon_ms` 만큼 샘플링해 세그먼트로 만들고 WebRender `PropertyBinding` 에 묶는다 — 스크립트가 멈춰 있어도 애니메이션이 흐른다(그것이 이 기능의 목적이다). ★값을 얹는 것이지 프레임을 만드는 것이 아니다★ — 프레임은 그 주기에 **남이** 안 냈을 때만 낸다(`painter.rs` `perform_updates`). `=false` 면 예전처럼 스크립트가 매 프레임 디스플레이 리스트를 내야 움직인다. |
 | `gfx_paint_side_animation_horizon_ms` (2026-09) | i64 | `3000` | 위 샘플링을 앞으로 얼마나 내다볼지. **스크립트가 얼마나 오래 멈출 수 있는가에 대한 내기**이고, 그 뒤로는 페인트가 마지막 값을 유지한다. 샘플 간격은 1/60 초 고정, 한 애니메이션당 상한 256 샘플(`paint_animation.rs` `MAX_SAMPLES`)이라 기본값은 약 181 샘플이다. ★비용은 프래그먼트 수에 비례한다★ — 애니메이션 프래그먼트 하나마다 디스플레이 리스트 빌드당 그만큼 스타일 질의가 돈다. |
@@ -374,10 +374,11 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 런처 `-NoCanvasAckRecovery`.
 
-검증은 두 번 실행하면 끝난다. ★`gfx_single_frame_producer` 가 꺼진 기본 구성에서는 예전
-그대로다★ — 1 차 해제자가 여전히 생산 경로 셋이고, 그 셋이 다 놓친 것을 복구가 줍는다:
+★2026-10-21(Task 7)로 1 차 해제자가 ***페이싱 틱 하나***가 됐다.★ 생산 경로 셋은 생산과
+함께 사라졌다. 그래서 `gfx_single_frame_producer` 가 꺼진 구성에는 1 차 해제가 아예 없고,
+빚을 푸는 것은 복구(`flush_owed_canvas_ack`) 하나다:
 
-| 실행 | 기대 | 뜻 |
+| 실행(pref off) | 기대 | 뜻 |
 |---|---|---|
 | `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 주입이 교착을 진짜로 만든다 |
 | `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 복구가 그 교착을 실제로 푼다 |
@@ -395,10 +396,10 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 | `-CanvasAckSkip 1` | **stall 없음 + `WALLACKSKIP`** | 주입이 실제로 ack 를 보류했다 |
 
 ★마지막 행의 증거 줄은 `WALLACKFLUSH` 가 아니라 `WALLACKSKIP` 이다.★ pref on 에서는 1 차
-해제자가 넷(생산 경로 셋 + 틱)이라, 보류된 빚을 복구(`flush_owed_canvas_ack`)보다 ***그중
-하나가 먼저 줍는 일이 흔하다***. 그러면 `WALLACKFLUSH` 는 한 줄도 안 찍히는데 ★주입은
-분명히 걸린 것★ 이다 — 없는 줄을 찾다가 "주입이 무력하다" 로 오독하기 쉬우므로, 그
-구성에서는 보류 자체의 증거인 `WALLACKSKIP` 을 본다.
+해제(틱)가 ***매 틱*** 다시 시도하므로, 보류된 빚을 복구(`flush_owed_canvas_ack`)보다
+***다음 틱의 1 차가 먼저 줍는 일이 흔하다***. 그러면 `WALLACKFLUSH` 는 한 줄도 안 찍히는데
+★주입은 분명히 걸린 것★ 이다 — 없는 줄을 찾다가 "주입이 무력하다" 로 오독하기 쉬우므로,
+그 구성에서는 보류 자체의 증거인 `WALLACKSKIP` 을 본다.
 
 `WALLACKSKIP` 은 `consume_canvas_ack_skip` 이 예산을 쓸 때마다 찍는 경고다 — "painter N 이
 파이프라인 M 개에 빚진 ack 를 일부러 보류했다(남은 예산 K)". ★rate limit 이 없다.★ 그래서

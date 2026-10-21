@@ -468,34 +468,21 @@ struct WallFrameRequest {
     wall_webview_targets: Vec<(WebViewId, Vec<PainterId>)>,
 }
 
-/// `issue_wall_frame_request` 가 타일마다 부를 진입점.
-///
-/// ★두 경로가 같은 팬아웃을 쓰되 타일에 닿는 문은 다르다.★ 번호 채번·배리어 등록·
-/// keep-previous 만료는 벽 수준이라 공유해야 하지만, 틱은 `Script` 쪽 게이트를 타면 안
-/// 된다 -- `generate_frame_for_script` 는 `!needs_new_frame()` 에서 `renderer_behind()`
-/// ***전에*** 돌아서므로, 틱이 그 문으로 들어가면 2 초 강제 해제가 영영 안 돈다(그것이
-/// "4 개 중 2 개 타일 44 초 사망" 조건이다).
-///
-/// Task 7 이 스크립트 경로를 값 적재로 격하하면 `Script` 가 사라지고 이 선택도 같이
-/// 사라진다. 그때까지만 있는 갈림길이다.
-#[derive(Clone, Copy)]
-enum TileEntryPoint {
-    /// 오늘의 열한 생산 경로. `Painter::generate_frame_for_script`.
-    Script,
-    /// 페이싱 틱. `Painter::generate_frame_for_wall_tick`.
-    Tick,
-}
-
 struct CoalescedWallFrameRequest {
     request: WallFrameRequest,
     coalesced_count: u64,
     max_pending_seen: usize,
 }
 
+/// 어느 페이싱 게이트가 요청을 막았나.
+///
+/// ★2026-10-21 에 payload 가 빠졌다.★ `webview_id` / `pending_max` / `elapsed_ms` 를 읽던
+/// 유일한 자리가 `coalesce_wall_frame_request` 였고, 그 함수는 요청을 넣어 줄 사람과 함께
+/// 사라졌다(`PaintMessage::GenerateFrame` 은 이제 아무 일도 하지 않는다).
 enum WallFramePacingBlockReason {
-    Active(WebViewId),
-    Pending(usize),
-    TooSoon(WebViewId, f64),
+    Active,
+    Pending,
+    TooSoon,
 }
 
 /// How many wall frame requests each pacing gate blocked.
@@ -512,22 +499,15 @@ enum WallFramePacingBlockReason {
 /// NOT mean that gate never binds. Active and Pending very nearly coincide at the default
 /// `gfx_wall_frame_max_pending=1`, and Active is checked first, so read a low Pending count
 /// as "Active got there first", not as "pending frames are not a constraint".
+///
+/// ★2026-10-21 부터 이 셋은 영구히 0 이다★ -- 세던 자리(`coalesce_wall_frame_request`)가
+/// 요청을 넣어 줄 사람과 함께 사라졌다. 0 이 아닌 값이 나오면 coalesce 큐를 다시 채운
+/// 사람이 생겼다는 뜻이고, 그것이 곧 두 번째 생산자다(설계 8 절).
 #[derive(Default)]
 struct WallFramePacingBlockTally {
     active: Cell<u64>,
     pending: Cell<u64>,
     too_soon: Cell<u64>,
-}
-
-impl WallFramePacingBlockTally {
-    fn record(&self, reason: &WallFramePacingBlockReason) {
-        let counter = match reason {
-            WallFramePacingBlockReason::Active(_) => &self.active,
-            WallFramePacingBlockReason::Pending(_) => &self.pending,
-            WallFramePacingBlockReason::TooSoon(_, _) => &self.too_soon,
-        };
-        counter.set(counter.get() + 1);
-    }
 }
 
 struct KeepPreviousFrame {
@@ -1866,10 +1846,9 @@ impl Paint {
     /// 모으라 하고, 불변식 9 는 순서가 틀렸을 때의 실측(요청 120 / 폐기 60)을 걸어 둔다.
     /// `produce_wall_frame` 안에 묻어 두면 나중에 재배치가 가능해지므로 별도 메서드로 둔다.
     ///
-    /// 지금 값이 밀려 나가는 자리는 `Painter::pump_paint_animation` 하나이므로 그것을
-    /// 부른다. 그 함수는 값 푸시 말고 생산(쌓인 비디오 프레임, 유보한 애니메이션 프레임)도
-    /// 아직 쥐고 있는데, 그 격하는 Task 7 이다 -- 여기서 함수를 쪼개지 않는다. 떼고 나면
-    /// 이 호출이 순수한 값 푸시가 된다.
+    /// 값이 밀려 나가는 자리는 `Painter::pump_paint_animation` 하나이므로 그것을 부른다.
+    /// ★2026-10-21 Task 7 로 그 함수에서 생산이 빠져 이 호출은 순수한 값 푸시다★ -- 거기
+    /// 있던 비디오 분기와 유보 애니메이션 프레임은 둘 다 삭제됐다(설계 2-6).
     ///
     /// 한 주기에 두 번 밀어 넣지 않을까: 안 그런다. 안쪽 `push_due` 게이트가 ★마지막
     /// 밀어넣기 이후 렌더가 있었는가★ 로 판정하므로, 렌더 없이 또 불러도 값이 다시
@@ -1895,19 +1874,12 @@ impl Paint {
     /// 페이서다. coalesce 는 "스크립트가 주기보다 빨리 조른다" 를 막는 장치이고, 주기마다
     /// 정확히 한 번 부르는 호출자에게는 미룰 것이 없다.
     ///
-    /// ★★그런데 게이트를 우회해도 게이트가 읽는 상태는 남긴다.★★ 공유하는
+    /// ★게이트를 우회해도 게이트가 읽는 상태는 남긴다.★ 공유하는
     /// `issue_wall_frame_request` 가 `last_wall_frame_issue_at` 을 찍고 `register_frame` 으로
-    /// `active_webview_frames` 에 넣으며(둘 다 ★생성한 타일이 둘 이상일 때만★ 돈다),
-    /// `wall_frame_request_pacing_block_reason` 의 `Active`/`TooSoon` 분기가 그 둘을 읽는다
-    /// (셋째 분기 `Pending` 은 painter 의 `pending_frames` 를 본다). 그래서 ***틱이 배선된
-    /// 구간 동안 스크립트의 `PaintMessage::GenerateFrame` 이 더 자주 coalesce 된다.***
-    /// ★조건이 붙는다★ — 그 게이트는 `gfx_wall_frame_pacing_enabled` 가 켜져 있고 대상
-    /// 타일이 둘 이상일 때만 적용되므로, 단일 타일 구성에서는 이 상호작용이 아예 없다.
-    ///
-    /// ★그것이 캔버스 ack 해제를 늦춘다 — 다만 더는 유일한 해제자를 막는 것이 아니다.★
-    /// 2026-10-21 에 아래 `release_owed_canvas_acks` 가 생겼고, 그것은 coalesce 와 무관하게
-    /// ***매 틱*** 돈다(설계 2-7). 생산 경로 셋도 아직 풀지만(Task 7 까지), 그 셋이 전부
-    /// 미뤄지는 구간 — 실측된 117 초 rAF 잠금이 그 모양이었다 — 을 이제 틱이 메운다.
+    /// `active_webview_frames` 에 넣는다(둘 다 ★생성한 타일이 둘 이상일 때만★ 돈다).
+    /// 2026-10-21 Task 7 전에는 그 상태가 스크립트의 `PaintMessage::GenerateFrame` 을 더
+    /// 자주 coalesce 시켰는데, 그 메시지가 아무 일도 하지 않게 되면서 상호작용 자체가
+    /// 없어졌다 -- coalesce 큐에 들어갈 요청이 없다.
     ///
     /// ★`gather_components` 와 마찬가지로 크레이트 밖에 내지 않는다★ — 밖에서 쓰는 문은
     /// `on_wall_tick` 하나다.
@@ -1916,7 +1888,7 @@ impl Paint {
         let logical_frame_id = if request.target_painter_ids.is_empty() {
             None
         } else {
-            self.issue_wall_frame_request(request, TileEntryPoint::Tick)
+            self.issue_wall_frame_request(request)
         };
         self.release_owed_canvas_acks();
         logical_frame_id
@@ -1994,14 +1966,14 @@ impl Paint {
             let wall_frame_coordinator = self.wall_frame_coordinator.borrow();
             for webview_id in request.wall_webview_ids() {
                 if wall_frame_coordinator.webview_has_active_frame(webview_id) {
-                    return Some(WallFramePacingBlockReason::Active(webview_id));
+                    return Some(WallFramePacingBlockReason::Active);
                 }
             }
         }
 
         let pending_max = self.max_pending_frames_for_targets(&request.target_painter_ids);
         if pending_max >= self.wall_frame_pacing_config.max_pending {
-            return Some(WallFramePacingBlockReason::Pending(pending_max));
+            return Some(WallFramePacingBlockReason::Pending);
         }
 
         let now = Instant::now();
@@ -2012,128 +1984,23 @@ impl Paint {
             };
             let elapsed = now.saturating_duration_since(*last_issue_at);
             if elapsed < self.wall_frame_pacing_config.min_interval {
-                return Some(WallFramePacingBlockReason::TooSoon(
-                    webview_id,
-                    elapsed.as_secs_f64() * 1000.0,
-                ));
+                return Some(WallFramePacingBlockReason::TooSoon);
             }
         }
 
         None
     }
 
-    fn coalesce_wall_frame_request(
-        &self,
-        request: WallFrameRequest,
-        block_reason: WallFramePacingBlockReason,
-    ) {
-        let Some(webview_id) = request.pacing_key() else {
-            let _ = self.issue_wall_frame_request(request, TileEntryPoint::Script);
-            return;
-        };
-
-        self.wall_frame_pacing_block_tally.record(&block_reason);
-
-        let pending_max = match block_reason {
-            WallFramePacingBlockReason::Active(_) => {
-                self.max_pending_frames_for_targets(&request.target_painter_ids)
-            },
-            WallFramePacingBlockReason::Pending(pending_max) => pending_max,
-            WallFramePacingBlockReason::TooSoon(_, _) => {
-                self.max_pending_frames_for_targets(&request.target_painter_ids)
-            },
-        };
-        let reason = match block_reason {
-            WallFramePacingBlockReason::Active(active_webview_id) => {
-                format!("active_webview={active_webview_id:?}")
-            },
-            WallFramePacingBlockReason::Pending(pending_max) => {
-                format!("pending_max={pending_max}")
-            },
-            WallFramePacingBlockReason::TooSoon(webview_id, elapsed_ms) => {
-                let remaining = self
-                    .wall_frame_pacing_config
-                    .min_interval
-                    .saturating_sub(Duration::from_secs_f64(elapsed_ms / 1000.0));
-                self.schedule_wall_frame_pacing_wake(remaining);
-                format!("min_interval_webview={webview_id:?} elapsed_ms={elapsed_ms:.3}")
-            },
-        };
-
-        let total_coalesced = self.wall_frame_pacing_coalesced_count.get() + 1;
-        self.wall_frame_pacing_coalesced_count.set(total_coalesced);
-        let coalesced_for_webview = {
-            let mut coalesced_requests = self.coalesced_wall_frame_requests.borrow_mut();
-            let coalesced_request = coalesced_requests
-                .entry(webview_id)
-                .and_modify(|coalesced_request| {
-                    coalesced_request.request = request.clone();
-                    coalesced_request.coalesced_count += 1;
-                    coalesced_request.max_pending_seen =
-                        coalesced_request.max_pending_seen.max(pending_max);
-                })
-                .or_insert_with(|| CoalescedWallFrameRequest {
-                    request: request.clone(),
-                    coalesced_count: 1,
-                    max_pending_seen: pending_max,
-                });
-            coalesced_request.coalesced_count
-        };
-
-        debug!(
-            "Wall frame pacing coalesced: webview={:?} target_painters={:?} \
-             pending_max={} coalesced_for_webview={} total_coalesced={} reason={} \
-             policy=latest-first",
-            webview_id,
-            request.target_painter_ids,
-            pending_max,
-            coalesced_for_webview,
-            total_coalesced,
-            reason,
-        );
-        self.log_wall_frame_pacing_summary(
-            "coalesced",
-            webview_id,
-            &request,
-            pending_max,
-            coalesced_for_webview,
-            None,
-        );
-    }
-
-    fn schedule_wall_frame_pacing_wake(&self, delay: Duration) {
-        let wake_at = Instant::now() + delay;
-        if self
-            .wall_frame_pacing_next_wake_at
-            .get()
-            .is_some_and(|scheduled_wake_at| scheduled_wake_at <= wake_at)
-        {
-            return;
-        }
-
-        self.wall_frame_pacing_next_wake_at.set(Some(wake_at));
-        let event_loop_waker = self.event_loop_waker.clone_box();
-        // ***`Builder::spawn`, not `thread::spawn`, because the latter panics on failure.***
-        // A thread cannot be created while the process is being torn down, and this wake is
-        // scheduled straight out of the compositing path, so the two race on every
-        // force-killed run: measured 2026-08-31 as the very last line of an otherwise clean
-        // 29,465-line log -- `failed to spawn thread: Os { code: 5, PermissionDenied }`.
-        // Nothing was wrong with the run, but every analysis of it then reported panics=1,
-        // which is exactly the signal that must stay trustworthy.
-        //
-        // A missed wake is harmless on its own terms too: the next frame request reschedules
-        // one, and the pacer's own interval check is what actually gates the release.
-        let spawned = std::thread::Builder::new()
-            .name(String::from("WallFramePacingWake"))
-            .spawn(move || {
-                std::thread::sleep(delay);
-                event_loop_waker.wake();
-            });
-        if let Err(error) = spawned {
-            self.wall_frame_pacing_next_wake_at.set(None);
-            warn!("Could not schedule a wall frame pacing wake ({error}); skipping it");
-        }
-    }
+    // ★`coalesce_wall_frame_request` 와 `schedule_wall_frame_pacing_wake` 는 2026-10-21 에
+    // 삭제됐다.★ 벽 페이서는 "스크립트가 주기보다 빨리 조른다" 를 막는 장치였고, 요청을
+    // 넣어 주던 유일한 자리(`PaintMessage::GenerateFrame`)가 아무 일도 하지 않게 되면서
+    // 넣을 것이 없어졌다. 틱 자체가 페이서다 -- 주기마다 정확히 한 번 부르는 호출자에게는
+    // 미룰 것이 없다(`produce_wall_frame` 주석).
+    //
+    // ★나머지 페이싱 장치는 남긴다 -- 그것이 설계 4 절이 요구하는 탐지기다.★
+    // `try_release_coalesced_wall_frame_requests` 와 `note_wall_pacer_join` 은 "프레임을
+    // 받는 두 번째 문" 이 열리는지 보는 계측이고, 벽 구성에서 `FRAMEREASON` 의
+    // `wall_pacer_join` 이 0 이 아니면 생산자가 둘이라는 뜻이다(설계 8 절).
 
     fn log_wall_frame_pacing_summary(
         &self,
@@ -2176,11 +2043,10 @@ impl Paint {
         );
     }
 
-    fn issue_wall_frame_request(
-        &self,
-        request: WallFrameRequest,
-        entry_point: TileEntryPoint,
-    ) -> Option<u64> {
+    /// ★타일에 닿는 문은 하나다 -- 틱 전용 진입점.★ 2026-10-21 전에는 스크립트 경로
+    /// (`Painter::generate_frame_for_script`)와 둘이었고, 어느 문으로 들어가는지를
+    /// `TileEntryPoint` 가 골랐다. 그 경로가 값 적재로 격하되면서 고를 것이 없어졌다.
+    fn issue_wall_frame_request(&self, request: WallFrameRequest) -> Option<u64> {
         let wall_frame_requested_at = Instant::now();
         let logical_frame_id = self.next_logical_frame_id();
         // Before anything else: a newer wall frame supersedes any "keep the previous frame"
@@ -2207,19 +2073,11 @@ impl Paint {
 
         let mut generated_painter_ids = Vec::new();
         for painter_id in &request.target_painter_ids {
-            // ★타일에 닿는 문만 갈린다.★ 위의 번호 채번과 아래의 배리어 등록은 두 경로가
-            // 같이 쓴다 -- 벽 수준 연산이기 때문이다. 왜 틱이 스크립트 문으로 못 들어가는지는
-            // `TileEntryPoint`.
-            let generated = match entry_point {
-                TileEntryPoint::Script => self.with_painter_mut(*painter_id, move |painter| {
-                    painter.generate_frame_for_script(logical_frame_id, wall_frame_requested_at)
-                }),
-                TileEntryPoint::Tick => self.with_painter_mut(*painter_id, move |painter| {
-                    painter
-                        .generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
-                        .generated()
-                }),
-            };
+            let generated = self.with_painter_mut(*painter_id, move |painter| {
+                painter
+                    .generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+                    .generated()
+            });
             if generated == Some(true) {
                 generated_painter_ids.push(*painter_id);
             }
@@ -2286,10 +2144,8 @@ impl Paint {
                     self.with_painter(*painter_id, |painter| painter.note_wall_pacer_join());
                 }
             }
-            let logical_frame_id = self.issue_wall_frame_request(
-                coalesced_request.request.clone(),
-                TileEntryPoint::Script,
-            );
+            let logical_frame_id =
+                self.issue_wall_frame_request(coalesced_request.request.clone());
             debug!(
                 "Wall frame pacing released: webview={:?} logical_frame_id={:?} \
                  target_painters={:?} pending_max={} coalesced_for_webview={} \
@@ -2569,13 +2425,17 @@ impl Paint {
                     display_list_data_receiver,
                 );
             },
-            PaintMessage::GenerateFrame(painter_ids) => {
-                let request = self.wall_frame_request_from_source_painters(painter_ids);
-                if let Some(block_reason) = self.wall_frame_request_pacing_block_reason(&request) {
-                    self.coalesce_wall_frame_request(request, block_reason);
-                } else {
-                    let _ = self.issue_wall_frame_request(request, TileEntryPoint::Script);
-                }
+            PaintMessage::GenerateFrame(_painter_ids) => {
+                // ★스크립트의 프레임 요청은 2026-10-21 부터 아무 일도 하지 않는다(규칙 2).★
+                //
+                // 프레임의 구성 요소는 그 프레임의 생산 트리거가 될 수 없다. 스크립트가 올린
+                // 장면은 ***별개 전송***으로 이미 WR 에 가 있고(`PaintMessage::SendDisplayList`
+                // -> `handle_new_display_list`), 그것을 화면에 올리는 프레임은 다음 틱이
+                // 낸다(`Paint::on_wall_tick`). 그래서 이 메시지로 남는 일이 없다.
+                //
+                // ★메시지 자체는 지우지 않는다.★ `script` 쪽 계약(렌더링 기회마다 보낸다)과
+                // WPT 를 건드리지 않고 벽의 생산만 일원화하는 것이 이 변경의 범위다.
+                // 설계 2-6: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
             },
             PaintMessage::GetWebViewPainterTargets(webview_id, sender) => {
                 let targets = self.painter_targets_for_webview(webview_id);
@@ -3635,17 +3495,11 @@ impl Paint {
         self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
 
-        // ★여기가 애니메이션 프레임을 정하는 자리다.★ 위 월 프레임 경로가 끝난 뒤여야
-        // ★낡음(2026-10-16 기록이지만 2026-09-18 `79d8875effe` 기준으로 쓸 때 이미 틀렸다)★ — 평소 푸시는 `Painter::render` 의 끝(painter.rs:2444)이고 `perform_updates` 쪽은 렌더가 멈췄을 때만 돈다(painter.rs:1286).
-        // "이번 턴에 남이 프레임을 냈나" 에 답할 수 있다 -- 애니메이션 푸시는 이 함수의
-        // 맨 앞(`painter.perform_updates()`)에서 이미 값만 보내 두었고, 그래서 그 자리의
-        // 판정은 ***같은 턴 뒤쪽의 프레임을 원리적으로 볼 수 없었다.***
-        // `Painter::flush_deferred_animation_frame` 과 `deferred_animation_frame_is_due`.
-        for painter_id in self.painter_ids() {
-            self.with_painter_mut(painter_id, |painter| {
-                painter.flush_deferred_animation_frame()
-            });
-        }
+        // ★애니메이션 프레임을 정하던 자리는 2026-10-21 에 사라졌다.★ 턴 끝으로 미뤘던
+        // 것은 "같은 턴 뒤쪽에서 월 프레임이 날지" 를 그 자리에서 알 수 없었기 때문인데,
+        // 생산자가 틱 하나가 되자 그 물음 자체가 없어졌다 -- 애니메이션은 값만 밀어 넣고
+        // (`gather_components`), 프레임은 같은 주기의 틱이 하나만 낸다
+        // (`produce_wall_frame`). 설계 2-6.
 
         self.shutdown_state() != ShutdownState::FinishedShuttingDown
     }

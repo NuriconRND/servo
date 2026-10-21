@@ -14,7 +14,7 @@
 //! 이것을 못 찾는다. 위 규칙을 떠받치는 타입끼리 한자리에 모아 두어야 규칙을 깨는 변경이
 //! 리뷰에서 눈에 띈다.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 한 타일이 이번 틱에 한 일.
 ///
@@ -48,9 +48,10 @@ impl TileOutcome {
 /// 한다 -- 실측(2026-08-31): 그 호출을 잃자 네 페인터 중 둘이 렌더를 멈추고 남은 44 초
 /// 동안 돌아오지 않았다.
 ///
-/// `waiting_on_canvas` 는 ★캔버스 이미지 대기만★ 본다. `FrameDelayer::needs_new_frame` 은
-/// `pending_frame` 도 같이 보는데 그것은 스크립트의 빚이고, 틱 생산은 그 빚과 무관하게
-/// 돈다(규칙 2).
+/// `waiting_on_canvas` 는 ★캔버스 이미지 대기만★ 본다. 2026-10-21 Task 7 전에는
+/// `FrameDelayer::needs_new_frame` 이 스크립트의 빚(`pending_frame`)도 같이 봤고, 틱 생산은
+/// 그 빚과 무관하게 돌아야 하므로(규칙 2) 그쪽을 쓰면 안 됐다. 그 플래그는 세울 사람과 함께
+/// 사라졌다.
 pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) -> TileOutcome {
     if renderer_behind || waiting_on_canvas {
         return TileOutcome::KeepPrevious;
@@ -60,9 +61,10 @@ pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) 
 
 /// 이 타일이 쥔 캔버스 ack 를 지금 풀어도 되는가. ★해제는 생산과 무관하다.★
 ///
-/// 인자가 둘뿐인 것이 이 술어의 전부다 -- ★`pending_frame` 도 `renderer_behind` 도 보지
-/// 않는다.★ 둘 다 "이 타일이 지금 합성을 낼 수 있는가" 를 묻는 값이고, 해제는 그 질문과
-/// 상관이 없다. 상관시키면 ***거절하는 타일에서 빚이 영영 안 풀린다***: 실측
+/// 인자가 둘뿐인 것이 이 술어의 전부다 -- ★`renderer_behind` 를 보지 않는다★(그리고
+/// 2026-10-21 에 사라진 `pending_frame` 도 보지 않았다). 그 둘은 "이 타일이 지금 합성을 낼
+/// 수 있는가" 를 묻는 값이고, 해제는 그 질문과 상관이 없다. 상관시키면 ***거절하는
+/// 타일에서 빚이 영영 안 풀린다***: 실측
 /// (2026-10-16, `log_ani_debug 36`) 에서 divisor=1 실행은 스크립트 요청이 ***매번***
 /// 거절 경로로 빠졌고, 그 경로가 ack 를 안 풀어 117 초에서 멎었다. 멈춘 것은 페인터가
 /// 아니라 스크립트였다 -- 그때까지 초당 60 프레임, dx 공칭값, overwritten=0 이었다.
@@ -97,12 +99,87 @@ pub(crate) fn take_scheduled_edge() -> bool {
     NEXT_EDGE_SCHEDULED.swap(false, Ordering::AcqRel)
 }
 
+/// ★지금까지 센 틱 에지의 번호.★ 셸이 `note_present_tick()` 을 부를 때마다 하나 올라간다.
+///
+/// 벽 전체에 하나인 것이 요점이다 -- 틱도 하나이기 때문이다(규칙 1). 타일마다 자기
+/// 예산(`ExternalPresentBudget`)을 들고 이 번호를 보면 "틱마다, 타일마다 한 번" 이 번호
+/// 비교 하나로 정해진다.
+static TICK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 셸이 표출 틱을 냈다. ★틱마다 한 번★ -- 타일마다가 아니다(`paint::note_present_tick`).
+pub(crate) fn note_tick_edge() {
+    TICK_SEQ.fetch_add(1, Ordering::Release);
+}
+
+/// 지금 틱의 번호.
+pub(crate) fn current_tick_seq() -> u64 {
+    TICK_SEQ.load(Ordering::Acquire)
+}
+
+/// ★타일 하나가 틱 하나에 쓸 수 있는 외부 서피스 표출 예산.★
+///
+/// `present_external_only` 는 WR 프레임을 안 거치고 DComp 에 바로 commit 하는 경로라
+/// `generate_frame` 의 회계 밖에 있다. 그래서 자기 스로틀을 들고 있었는데 -- 직전 표출에서
+/// 14ms -- 그 숫자는 표출 주기와 아무 관계가 없는 상수다. 120Hz 로 도는 벽의 주기는
+/// 8.33ms 라 ★한 틱 걸러 한 번만★ 통과했다.
+///
+/// 박자는 틱이 준다. 천장("틱당 한 번")과 바닥("매 틱 한 번")이 같은 값이므로 상수 하나가
+/// 사라지고, 원래 요구 -- "fast-path 는 WR 빌드와 무관하므로 WR 이 바쁠 때에도 발동해야
+/// 한다"(`dcomp_compositor::should_fast_present`) -- 는 그대로 선다. 틱은 WR 의 바쁨과
+/// 무관하게 매 주기 돌기 때문이다.
+///
+/// ★시각이 아니라 틱 번호를 쥔다.★ 그래야 "틱마다 한 번" 이 상수 없이 정의된다.
+#[derive(Default)]
+pub(crate) struct ExternalPresentBudget {
+    last_tick: Option<u64>,
+}
+
+impl ExternalPresentBudget {
+    /// 이번 틱(`tick`)의 몫이 남아 있으면 참을 돌려주고 소진한다.
+    pub(crate) fn take(&mut self, tick: u64) -> bool {
+        if self.last_tick == Some(tick) {
+            return false;
+        }
+        self.last_tick = Some(tick);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        TileOutcome, ack_is_releasable, schedule_production_at_next_edge, take_scheduled_edge,
-        tile_may_generate,
+        ExternalPresentBudget, TileOutcome, ack_is_releasable, schedule_production_at_next_edge,
+        take_scheduled_edge, tile_may_generate,
     };
+
+    /// ★틱마다 한 번은 반드시 받는다 -- 그것이 비디오의 바닥이다(불변식 4).★
+    ///
+    /// 전에는 직전 표출에서 14ms 라는 자기 상수로 걸렀다. 그 상수는 표출 주기와 무관해서
+    /// 120Hz 벽(주기 8.33ms)에서는 한 틱 걸러 한 번만 통과했고, 빠진 틱의 비디오는 다음
+    /// 틱까지 화면에 안 올라갔다. 박자는 틱이 준다.
+    #[test]
+    fn each_tick_gets_its_own_external_present() {
+        let mut budget = ExternalPresentBudget::default();
+        assert!(budget.take(1), "첫 틱은 자기 몫을 받는다");
+        let second = budget.take(2);
+        assert!(
+            second,
+            "새 틱은 자기 몫을 받아야 한다 (실제 {second}) -- 틱 번호가 1 에서 2 로 넘어갔다"
+        );
+    }
+
+    /// ★천장도 같은 값이다 -- 틱당 한 번을 넘지 않는다.★ 도착마다 present 하면 36 타일에서
+    /// 초당 1,080 Commit 이 된다.
+    #[test]
+    fn a_second_external_present_in_the_same_tick_is_refused() {
+        let mut budget = ExternalPresentBudget::default();
+        assert!(budget.take(7), "그 틱의 첫 표출은 나간다");
+        let second = budget.take(7);
+        assert!(
+            !second,
+            "같은 틱의 두 번째 표출은 거절해야 한다 (실제 {second}) -- 틱 번호가 둘 다 7 이다"
+        );
+    }
 
     /// ★예약은 한 번만 생산이 된다 -- 두 공개 함수가 같은 비트를 만지는지까지 본다.★
     /// 집어 가면 비트가 내려가야 한다: 안 내려가면 깨우기 한 번이 매 틱 생산이 되어 수요

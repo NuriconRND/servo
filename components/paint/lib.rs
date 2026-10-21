@@ -60,7 +60,16 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
 /// 폴백을 한다(그러니 초당 한 번 `[commitsched] ... tick=false` 경고가 나온다). 정렬 pref 를
 /// 쓰려는 셸은 반드시 이것을 틱마다 부르고, 쓰지 않는 셸은 그 pref 를 켜지 않는다.
 /// `TICKCOMMIT` 줄도 이것에 달려 있다.
+///
+/// ★여기가 틱 번호를 올리는 자리이기도 하다.★ 외부 서피스 표출(`present_external_only`)은
+/// WR 프레임을 안 거쳐 `generate_frame` 회계 밖에 있으므로, "틱마다 최대 1 회" 를 세려면
+/// 틱 에지를 직접 받아야 한다(설계 7 절, `wall_tick::ExternalPresentBudget`). 세 클럭 구성
+/// (Pacing / Timer / Vsync)이 전부 이 함수를 지나므로 한 자리면 충분하다.
+///
+/// ★`gfx_single_frame_producer` 와 무관하다.★ 그 pref 는 ***생산*** 스위치이지 틱 스위치가
+/// 아니다 -- 틱은 셸의 표출 클럭이고, 꺼 두는 것은 그 틱이 벽 프레임을 내느냐뿐이다.
 pub fn note_present_tick() {
+    crate::wall_tick::note_tick_edge();
     #[cfg(windows)]
     crate::output_grid::note_present_tick_now();
 }
@@ -69,8 +78,8 @@ pub fn note_present_tick() {
 /// 클럭이 없는 임베더(servoshell / WPT / Android)의 깨우기가 부른다. 틱이 에지에서
 /// `Paint::on_demand_wall_tick` 으로 집어 가 생산한다. 몇 번 불러도 에지당 생산은 한 번이다.
 ///
-/// ★첫 호출자는 Task 7 에 온다★(`pump_paint_animation` 의 깨우기 동반자). 지금은 호출자가
-/// 없는 것이 정상이다.
+/// ★호출자는 `Painter::pump_paint_animation` 의 깨우기 동반자다★(2026-10-21 Task 7).
+/// 임베더 쪽 호출자(servoshell / WPT / Android 의 깨우기)는 아직 배선되지 않았다.
 pub fn schedule_wall_production() {
     crate::wall_tick::schedule_production_at_next_edge();
 }
