@@ -2105,10 +2105,11 @@ impl Painter {
     /// [`Painter::flush_owed_canvas_ack`] 는 이것을 소비하지 않는다. 복구까지 같이 막으면
     /// 주입이 무엇을 증명하는지가 사라진다.
     ///
-    /// ★부르는 자리는 1 차 해제자 하나다★ — 2026-10-21 전에는 `generate_frame_for_script`
-    /// 와 `update_images` 가 불렀는데, 그 두 자리는 이제 ack 를 풀지 않으므로 거기서
-    /// 예산을 쓰면 ***아무 ack 도 보류하지 못한 채*** 주입만 소진된다. 1 차 해제자가
-    /// [`Painter::release_owed_canvas_ack`] 로 옮겨 갔으니 주입도 같이 옮긴다.
+    /// ★부르는 자리는 [`Painter::release_owed_canvas_ack`] 하나다★ — 1 차 해제가 전부 그
+    /// 함수를 지나므로, 주입을 거기 한 번 걸면 ***모든*** 1 차 해제자에 걸린다. 2026-10-21
+    /// 전에는 `generate_frame_for_script` 와 `update_images` 가 직접 불렀는데, 해제자가
+    /// 늘어난 지금 그 방식이면 ★주입이 걸리지 않은 해제자가 먼저 풀어 버려서★ 보류가
+    /// 아예 일어나지 않는다.
     fn consume_canvas_ack_skip(&self) -> bool {
         let left = self.canvas_ack_skips_left.get();
         if left == 0 {
@@ -2188,10 +2189,9 @@ impl Painter {
         // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
         // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
         //
-        // ★"드물다"는 `gfx_single_frame_producer` 가 켜져 있을 때의 이야기다.★ 틱이 돌면
-        // 1 차 해제자가 그쪽이라 여기는 틱이 못 닿은 몫만 줍는다. 틱이 꺼져 있으면 ***여기가
-        // 유일한 해제자***이므로 캔버스 페이지에서는 초당 한 줄이 계속 나온다 — 그 구성에서
-        // 이 줄은 병증이 아니라 정상 동작의 계수다.
+        // 드물다는 성질은 그대로다 — 1 차 해제자
+        // ([`Painter::release_owed_canvas_ack`])가 보통 먼저 비우므로 여기까지 빚이 오지
+        // 않는다. 여기가 돈다는 것은 1 차가 전부 못 닿았다는 뜻이고, 그것이 이 줄의 값어치다.
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -2209,20 +2209,30 @@ impl Painter {
         }
     }
 
-    /// ★틱이 타일마다 부르는 1 차 캔버스 ack 해제.★ 이 타일이 이번 틱에 합성했든 안
-    /// 했든, `renderer_behind()` 든 아니든 부른다 — 판정은 `ack_is_releasable` 하나다.
+    /// ★1 차 캔버스 ack 해제 — 모든 1 차 해제자가 지나는 한 자리.★ 판정은
+    /// `ack_is_releasable` 하나다: `pending_frame` 도 `renderer_behind()` 도 보지 않는다.
     ///
-    /// ★왜 생산에서 떼었나.★ 2026-10-21 전에는 해제가 `generate_frame_for_script` 의
-    /// 성공 경로와 rides-the-painter 경로, 그리고 `update_images` 의 합성 블록에 붙어
-    /// 있었다. 생산이 틱 하나로 모이면 그 세 자리는 ***전부 거절***이 되고, 해제가 거기
-    /// 붙어 있으면 빚이 영영 안 풀린다. 실측(2026-10-16, `log_ani_debug 36`): divisor=1
-    /// 실행이 117 초에서 멎었는데 그때까지 계수는 전부 건강했다 — 초당 60 프레임, dx
-    /// 공칭값, overwritten=0. ★멈춘 것은 페인터가 아니라 스크립트였다.★
+    /// 호출자는 넷이고, ★그중 하나만 영구적이다★:
     ///
-    /// 복구 자리([`Painter::flush_owed_canvas_ack`])가 그 교착을 못 건진 이유도 같다:
-    /// 그때 그 자리는 `needs_new_frame() && !renderer_behind()` 뒤에 있었다. 지금은 둘 다
-    /// 같은 술어를 쓰고, ★닿는 클럭만 다르다★ — 이쪽은 틱, 저쪽은 렌더. 틱은 렌더가 멎은
-    /// 타일에도 닿고, 렌더는 틱이 없는 임베더에서도 돈다.
+    /// - `Paint::produce_wall_frame` — 페이싱 틱이 ***타일마다, 생산 여부와 무관하게***
+    ///   부른다. ★이것이 새 구조의 해제자다.★
+    /// - `generate_frame_for_script` 성공 경로 / rides-the-painter 경로, `update_images`
+    ///   합성 블록 — ★Task 7 까지만 남는다.★ 그 셋은 오늘의 생산 지점이고, Task 7 이
+    ///   그것들을 값 적재로 격하할 때 ***생산과 함께*** 사라진다.
+    ///
+    /// ★왜 틱으로 옮기나.★ 생산이 틱 하나로 모이면 저 세 자리는 ***전부 거절***이 되고,
+    /// 해제가 거기 붙어 있으면 빚이 영영 안 풀린다. 실측(2026-10-16, `log_ani_debug 36`):
+    /// divisor=1 실행이 117 초에서 멎었는데 그때까지 계수는 전부 건강했다 — 초당 60 프레임,
+    /// dx 공칭값, overwritten=0. ★멈춘 것은 페인터가 아니라 스크립트였다.★
+    ///
+    /// ★왜 그 셋을 지금 지우지 않나.★ 틱은 `gfx_single_frame_producer` 뒤에 있고 그 pref 는
+    /// 기본 off 다. 지금 지우면 ***오늘 모두가 쓰는 경로***에서 ack 가 동기 해제에서 "다음
+    /// 렌더" 로 미뤄진다 — 중간 구간 태스크가 기본 경로의 거동을 바꾸면 안 된다. 중복
+    /// 해제는 무해하다: 첫 해제가 `waiting_pipelines` 를 비우므로 뒤이은 호출은 위
+    /// `is_holding_ack()` 에서 돌아선다(전문 자체가 안 나간다).
+    ///
+    /// 복구 자리([`Painter::flush_owed_canvas_ack`])는 이 함수를 지나지 않는다 — 실패
+    /// 주입을 소비하면 안 되기 때문이다(`consume_canvas_ack_skip` 참고).
     pub(crate) fn release_owed_canvas_ack(&mut self) {
         if !ack_is_releasable(
             self.frame_delayer.is_holding_ack(),
@@ -2230,8 +2240,9 @@ impl Painter {
         ) {
             return;
         }
-        // 실패 주입(기본 off). ★1 차 해제자에만 건다★ — 복구는 소비하지 않으므로 주입
-        // 한 번은 "보류 → 다음 렌더의 복구가 보냄(`WALLACKFLUSH`)" 으로 보인다.
+        // 실패 주입(기본 off). ★1 차 해제자 전부에 건다★ — 하나라도 빠지면 그 자리가
+        // 주입을 통과시켜 버려서 보류가 일어나지 않는다. 복구는 소비하지 않으므로 주입
+        // 한 번은 "보류 → 복구가 보냄(`WALLACKFLUSH`)" 으로 보인다.
         if self.consume_canvas_ack_skip() {
             return;
         }
@@ -2240,8 +2251,9 @@ impl Painter {
 
     /// 빚진 파이프라인에 ack 를 보낸다. ★보낼지 말지는 호출자가 이미 정했다.★
     ///
-    /// 해제자가 둘(틱의 1 차, 렌더의 복구)이므로 전문 만드는 자리는 하나로 둔다 — 넷이던
-    /// 시절에 각자 조금씩 달라졌던 것이 이 조사의 비용 대부분이었다.
+    /// 1 차([`Painter::release_owed_canvas_ack`])와 복구
+    /// ([`Painter::flush_owed_canvas_ack`])가 같은 전문을 보내게 하려고 둔다 — 해제자가
+    /// 넷이던 시절에 각자 조금씩 달라져 있었던 것이 이 조사의 비용 대부분이었다.
     fn send_owed_canvas_ack(&mut self) {
         let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
         self.send_to_constellation(
@@ -2261,11 +2273,12 @@ impl Painter {
     /// `script_thread.rs:1441` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 painter 가
     /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다.
     ///
-    /// ★보내는 자리는 둘이다★(2026-10-21 이전에는 넷이었고, 전부 생산에 붙어 있었다):
-    /// 1 차는 틱의 [`Painter::release_owed_canvas_ack`], 복구는 렌더 맨 앞의
-    /// [`Painter::flush_owed_canvas_ack`]. 둘 다 생산 여부를 묻지 않으므로, 이 줄이 뜬다는
-    /// 것은 ★둘 다 못 돌았다★ 는 뜻이다 — 틱이 멎었고 렌더도 멎었거나, 복구 킬 스위치
-    /// (`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY`)가 켜져 있다.
+    /// ★전문을 만드는 자리는 둘이다★(2026-10-21 이전에는 넷이었고, 전부 생산에 붙어
+    /// 있었다): 1 차는 [`Painter::release_owed_canvas_ack`], 복구는 렌더 맨 앞의
+    /// [`Painter::flush_owed_canvas_ack`]. 1 차의 호출자는 넷이고 그중 ★틱만 생산 여부를
+    /// 묻지 않는다★ — 나머지 셋(생산 경로)은 Task 7 까지만 있다. 이 줄이 뜬다는 것은
+    /// ★그 전부가 못 돌았다★ 는 뜻이다 — 생산 경로가 거절만 하고 틱도 렌더도 멎었거나,
+    /// 복구 킬 스위치(`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY`)가 켜져 있다.
     ///
     /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
     fn check_canvas_ack_latch(&self) {
@@ -3927,13 +3940,21 @@ impl Painter {
         if self.script_frame_rides_the_painter() {
             self.script_frame_rode_painter
                 .set(self.script_frame_rode_painter.get() + 1);
-            // ★여기 있던 캔버스 ack 해제는 2026-10-21 에 틱으로 옮겼다★
-            // ([`Painter::release_owed_canvas_ack`]). 해제를 거절 경로에 달아 두면
-            // divisor=1 처럼 ***매번*** 거절하는 구성에서 빚이 영영 안 풀린다는 것이
-            // 실측이었고(log_ani_debug 36: 117 초에서 멎음), 생산이 틱 하나로 모이면
-            // 이 함수의 ***모든*** 경로가 그 상태가 된다. 그래서 해제는 생산과 같은
-            // 자리에 둘 수 없다.
+            // ★ack 는 반드시 풀어 준다.★ 이 집합이 비지 않은 동안 그 파이프라인의 문서는
+            // `waiting_on_canvas_image_updates` 로 잠겨 ***rAF 를 한 번도 더 돌리지
+            // 못한다***(`script_thread.rs:1441` 이 렌더링 기회를 통째로 건너뛴다).
             //
+            // 위의 `renderer_behind()` 가 안 풀고 빠져도 되는 것은 그것이 ***일시적인***
+            // 상태이기 때문이다. 이 게이트는 다르다 -- divisor=1 이면 스크립트 요청이
+            // ***매번*** 여기로 빠지므로, 안 풀면 영영 안 풀린다. 실측(log_ani_debug 36):
+            // 안 풀었더니 divisor=1 실행만 117 초에서 멎었다(다른 둘은 124 초까지 정상).
+            // 그 직전까지 계수는 전부 건강했다 -- 초당 60 프레임, dx 공칭값, overwritten=0.
+            // ★멈춘 것은 페인터가 아니라 스크립트였다.★
+            //
+            // ★이 호출은 Task 7 까지만 있다★ — 틱이 같은 일을 매 틱 하지만 그것은
+            // `gfx_single_frame_producer` 뒤에 있고, 기본 off 인 동안 기본 경로의 해제자는
+            // 여기다. Task 7 이 이 생산 지점을 격하할 때 같이 지운다.
+            self.release_owed_canvas_ack();
             // `pending_frame` 은 그대로 둔다. 합성은 페인터가 하지만 "빚" 자체는 남아 있어야
             // 페인터가 멈췄을 때 나중 호출이 다시 만든다. `needs_new_frame` 은 이 값과
             // `pending_canvas_images` 만 보므로 남겨 두어도 아무것도 막지 않는다.
@@ -3950,10 +3971,14 @@ impl Painter {
         self.set_display_composite_in_flight(true);
         self.send_transaction(transaction);
 
-        // 성공 경로의 캔버스 ack 해제도 틱으로 갔다([`Painter::release_owed_canvas_ack`]).
-        // 해제자가 생산 경로에 하나라도 남아 있으면 "어떤 경로는 풀고 어떤 경로는 안 푼다"
-        // 가 되살아난다 — 넷이던 해제자가 조금씩 달라져 있었던 것이 이 조사의 비용
-        // 대부분이었다.
+        // ★이 호출도 Task 7 까지만 있다★ — 틱이 매 틱 같은 일을 하지만
+        // `gfx_single_frame_producer` 가 기본 off 인 동안 기본 경로의 해제자는 여기다.
+        // 여기까지 왔다는 것은 `needs_new_frame()` 이 참이었다는 뜻이므로
+        // `pending_canvas_images` 는 비어 있고, 따라서 `ack_is_releasable` 은 "빚이
+        // 있는가" 만 묻는다 — 예전의 무조건 전송과 다른 점은 ★빚이 없을 때 빈 전문을
+        // 안 보내는 것★ 뿐이다(받는 쪽은 그 벡터를 순회하므로 빈 전문은 무동작이었다).
+        self.release_owed_canvas_ack();
+
         self.frame_delayer.set_pending_frame(false);
         self.screenshot_taker
             .prepare_screenshot_requests_for_render(self);
@@ -4069,9 +4094,13 @@ impl Painter {
             self.set_display_composite_in_flight(true);
             generated_frame = true;
 
-            // 여기 있던 캔버스 ack 해제도 틱으로 갔다([`Painter::release_owed_canvas_ack`]).
-            // 실패 주입(`consume_canvas_ack_skip`)도 같이 갔다 — 해제하지 않는 자리에서
-            // 예산을 쓰면 ***아무것도 보류하지 못한 채*** 주입만 소진된다.
+            // ★이 호출도 Task 7 까지만 있다★ — 틱이 매 틱 같은 일을 하지만
+            // `gfx_single_frame_producer` 가 기본 off 인 동안 기본 경로의 해제자는 여기다.
+            // 실패 주입(`consume_canvas_ack_skip`)은 이 안에 있다 — 예전에는 위 `if` 의
+            // 조건이었고, 그래서 주입이 합성까지 같이 막았다. 지금은 ★ack 만 보류한다★:
+            // 주입의 일은 "풀 수 있는 ack 를 안 푸는 것" 이지 프레임을 굶기는 것이 아니다.
+            self.release_owed_canvas_ack();
+
             self.screenshot_taker
                 .prepare_screenshot_requests_for_render(&*self);
         }

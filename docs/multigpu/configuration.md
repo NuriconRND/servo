@@ -352,13 +352,15 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 런처 `-CanvasAckSkip 1`.
 
-★2026-10-21 로 바뀐 것: 예산을 쓰는 자리가 ***1 차 해제자*** 하나다★
-(`Painter::release_owed_canvas_ack`, 페이싱 틱). 그 전에는 `generate_frame_for_script` 와
-`update_images` 가 썼는데, 그 두 자리는 이제 ack 를 풀지 않으므로 거기서 예산을 쓰면
-***아무 ack 도 보류하지 못한 채*** 주입만 소진된다. 따라서 ★`gfx_single_frame_producer` 가
-꺼져 있으면(기본값) 이 주입은 아무 일도 하지 않는다★ — 그 구성에서는 틱이 안 돌고 해제자가
-`flush_owed_canvas_ack` 하나뿐인데, 그쪽은 예산을 소비하지 않는다(소비하면 복구가 무엇을
-증명하는지가 사라진다).
+★2026-10-21 로 바뀐 것: 예산을 쓰는 자리가 `Painter::release_owed_canvas_ack` 하나다.★
+1 차 해제가 전부 그 함수를 지나므로(생산 경로 셋 + 페이싱 틱), 거기 한 번 걸면 모든 1 차
+해제자에 걸린다. 예전처럼 호출 지점마다 걸면 ★주입이 안 걸린 해제자가 먼저 풀어 버려서★
+보류가 아예 일어나지 않는다. 복구(`flush_owed_canvas_ack`)는 예전과 같이 소비하지 않는다.
+
+그 자리가 바뀌면서 생긴 차이 하나: 예전에는 주입이 합성까지 같이 막았다(예산 검사가
+`generate_frame_for_script` 의 early-return 과 `update_images` 의 `if` 조건에 있었다). 지금은
+★ack 만 보류한다★ — 주입의 일은 "풀 수 있는 ack 를 안 푸는 것" 이지 프레임을 굶기는 것이
+아니다.
 
 ★왜 필요한가★: 이 교착(`2f97f5190c2`)은 **35 회 실행에 1 회** 나왔다. 그 확률에 검증을 맡기면
 고친 뒤 12 회를 돌려도 복구가 한 번도 안 도는 일이 생긴다 — 2026-09-02 `log_webgpu/52` 가
@@ -372,29 +374,25 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 런처 `-NoCanvasAckRecovery`.
 
-검증 조합은 `gfx_single_frame_producer` 에 따라 갈린다 — ★2026-10-21 에 ack 해제를 생산에서
-떼어 틱으로 옮겼기 때문이고, 그 틱은 pref 뒤에 있다.★
-
-**pref off(기본, 해제자는 `flush_owed_canvas_ack` 하나):**
+검증은 두 번 실행하면 끝난다. ★`gfx_single_frame_producer` 가 꺼진 기본 구성에서는 예전
+그대로다★ — 1 차 해제자가 여전히 생산 경로 셋이고, 그 셋이 다 놓친 것을 복구가 줍는다:
 
 | 실행 | 기대 | 뜻 |
 |---|---|---|
-| `-NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 유일한 해제자를 끄면 교착이 그대로 재현된다 |
-| (아무 것도 안 걺) | **stall 없음, `WALLACKFLUSH` 초당 1 줄** | 그 해제자가 캔버스 페이지에서 계속 돈다 |
+| `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 주입이 교착을 진짜로 만든다 |
+| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 복구가 그 교착을 실제로 푼다 |
 
-이 구성에서 `-CanvasAckSkip` 은 ★무효★ 다(위 항목 참고). 교착을 만들려면
-`-NoCanvasAckRecovery` 하나면 된다.
+첫 줄이 안 나오면 주입이 무효라는 뜻이므로, 둘째 줄의 "정상"은 아무 의미가 없다.
 
-**pref on(해제자 둘: 틱의 1 차 + 렌더의 복구):**
+★`gfx_single_frame_producer` 를 켜면 첫 줄이 달라진다.★ 틱이 ***매 틱*** 1 차 해제를 다시
+시도하므로, 예산 1 짜리 보류는 다음 틱에 풀린다 — 한 틱 지연이지 교착이 아니다. 그 구성에서
+교착을 보려면 보류도 영구여야 한다:
 
-| 실행 | 기대 | 뜻 |
+| 실행(pref on) | 기대 | 뜻 |
 |---|---|---|
-| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 1 차가 한 번 보류한 ack 를 복구가 푼다 |
-| `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall 없음, 한 틱만 지연** | ★예산이 1 이면 다음 틱이 바로 푼다★ |
-| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 두 해제자를 다 막으면 교착이 재현된다 |
-
-둘째 줄이 교착이 아닌 것이 ★이 구조의 요점★이다 — 예전에는 한 번만 놓쳐도 영구 교착이었다.
-해제가 생산에서 떨어져 매 틱 되묻게 되었으므로, 영구 교착을 보려면 보류도 영구여야 한다.
+| `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall 없음, 한 틱만 지연** | ★이것이 이 구조의 요점★ — 한 번 놓쳐도 영구 교착이 아니다 |
+| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 1 차와 복구를 다 막으면 교착이 재현된다 |
+| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 보류한 ack 를 복구가 푼다 |
 
 ### `SERVO_DCOMP_SLOW_COMMIT_MS` — `Int`
 
