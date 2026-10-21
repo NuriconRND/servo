@@ -5,34 +5,50 @@
   ★무엇을 가리는 프로브인가.★
 
   표출 페이지(IPWall)의 영역 회전은 rAF 콜백 안에서 인라인 `transform: rotate()` 를 매
-  프레임 다시 쓰는 방식이다. 그 회전이 winit_wall 에서 떨리는데, 같은 페이지를 Chrome 은
-  single tile 에서 60fps 로 돌린다(2026-10-21 운영자 확인). 즉 ***그 구조 자체는 60fps 를
-  낼 수 있다***. 그렇다면 남는 것은 엔진이 그 콜백에 넘기는 ***시각값***이다.
+  프레임 다시 쓰는 방식이다. 그 회전이 winit_wall 에서 떨리는데, 같은 페이지를 Chrome 과
+  Edge 는 single tile 에서 60fps 로 돌린다(2026-10-21 운영자 확인). 즉 ***그 구조 자체는
+  60fps 를 낼 수 있다***. 그렇다면 남는 것은 엔진이 그 콜백에 넘기는 ***시각값***이다.
 
-  각도는 rAF 타임스탬프의 순수 함수다. 그래서 타임스탬프 수열이 고르지 않으면 프레임이
-  초당 60 개 나가도 각도가 고르지 않다 -- 프레임 수를 세는 지표로는 보이지 않는 결함이고,
-  엔진 쪽 `FRAMETIME`/`RAFCLOCK` 이 같은 수열을 양끝에서 잰다.
+  각도는 rAF 타임스탬프의 순수 함수다. 수열이 고르지 않으면 프레임이 초당 60 개 나가도
+  각도가 고르지 않다 -- 프레임 수를 세는 지표로는 보이지 않는 결함이고, 엔진 쪽
+  `FRAMETIME`/`RAFCLOCK` 이 같은 수열을 양끝에서 잰다.
+
+  ★세 사각형을 나란히 돌린다.★
+
+    rAF     -- 표출 페이지와 같은 구조. rAF 콜백에서 인라인 transform 을 다시 쓴다.
+    WAAPI   -- `Element.animate()`. 페인트측이 매 프레임 값을 전진시킨다.
+    CSS     -- `@keyframes`. 엔진에 원래 있던 경로. WAAPI 와 같은 페인트측이지만
+               스크립트를 한 번도 거치지 않는다.
+
+  셋이 같은 곡선·같은 주기로 돈다. 어느 하나만 다르게 보이면 그 경로가 범인이다.
 
   ★두 수열을 같이 잰다.★
 
     rAF dt   -- 콜백이 받은 타임스탬프의 간격. 엔진이 정하는 값이다.
     wall dt  -- 콜백이 ***실제로 실행된*** 시각(`performance.now()`)의 간격.
 
-  둘을 비교하면 범인이 갈린다.
-
     rAF 고름 + wall 고름    -> 시계는 정상. 떨림은 화면 도달 시점의 문제다.
     rAF 거침 + wall 고름    -> ★엔진이 주는 값이 거칠다★. 스크립트는 제때 깨어났다.
     rAF 거침 + wall 거침    -> 스크립트 스레드가 고르게 깨어나지 못한다.
 
-  ★두 사각형을 같이 돌린다.★ 왼쪽은 위의 rAF 방식(표출 페이지와 같은 구조), 오른쪽은
-  `Element.animate()` 로 걸어 페인트측이 전진시키는 방식이다. Chrome 에서는 둘이 똑같이
-  보인다. winit_wall 에서 한쪽만 떨면 ***로그 없이도*** 어느 경로가 깨졌는지 눈으로 갈린다.
+  ★`gfx_paint_side_animation_tick_divisor` 를 조심하라 (2026-10-21, log 13).★ 이 페이지는
+  WAAPI/CSS 애니메이션을 ***계속*** 돌리므로 WebView 가 "페인트가 재생 중" 으로 판정되고,
+  그러면 refresh driver 가 틱을 `divisor` 분의 1 로 묶는다(`refresh_driver.rs`). rAF 는 그
+  틱을 타므로 ***rAF 까지 같이 묶인다*** -- divisor=15 로 돌린 첫 실행에서 rAF 사각형이
+  정확히 4fps(250ms 간격)로 돌았다. 이 페이지로 rAF 를 재려면 ★`-Pref
+  gfx_paint_side_animation_tick_divisor=1`★ 로 돌릴 것. 표출 페이지는 이 덫에 걸리지
+  않는데(페인트측 애니메이션이 진입 효과뿐이라 금방 끝난다), 그 차이 자체가 발견이다.
 
   ★회전에 easing 이 있다.★ 표출 페이지의 회전은 등속이 아니라 한 바퀴의 시작이 가속하고
-  끝이 감속한다(운영자 확인). 그래서 여기도 `ease-in-out` 을 한 바퀴에 건다 -- 등속으로
-  바꾸면 변위가 가장 큰 중간 구간이 사라져서 같은 크기의 지터가 훨씬 덜 보인다.
+  끝이 감속한다(운영자 확인). 등속으로 바꾸면 변위가 가장 큰 중간 구간이 사라져서 같은
+  크기의 지터가 훨씬 덜 보인다.
 
-  쿼리: ?period=8000 (한 바퀴 ms) ?size=520 (사각형 한 변 px)
+  ★회전축을 눈으로 확인할 수 있게 해 두었다.★ 첫 실행에서 WAAPI 사각형이 중심이 아니라
+  왼쪽 위 꼭지점을 축으로 도는 것처럼 보였다(2026-10-21). 그래서 세 사각형 모두에
+  `transform-origin: 50% 50%` 를 명시하고, 중심에 십자를, 한 모서리에 큰 표식을 두었다.
+  십자가 제자리에 머물면 축은 중심이다.
+
+  쿼리: ?period=8000 (한 바퀴 ms) ?size=420 (사각형 한 변 px)
 
   로그: 1 초에 한 줄 `RAFPROBE`. 화면을 못 볼 때는 이 줄만 grep 하면 된다.
 -->
@@ -40,28 +56,46 @@
   :root { color-scheme: dark; }
   html, body { margin: 0; height: 100%; background: #0b0d10; color: #e8ecf1;
                font: 15px/1.5 ui-monospace, Consolas, monospace; overflow: hidden; }
+  /* grid 의 place-items 가 아니라 flex 로 가운데를 잡는다 -- 첫 실행에서 글자가 사각형
+     위쪽에 붙어 나왔다(2026-10-21). flex 쪽이 이 엔진에서 확실하다. */
   .wrap { display: flex; height: 100%; align-items: center; justify-content: space-evenly; }
-  .cell { text-align: center; }
-  .label { margin-bottom: 18px; letter-spacing: .04em; color: #9fb0c3; }
-  .box { background: linear-gradient(135deg, #2f6df6 0%, #27c1a4 100%);
-         display: grid; place-items: center; font-size: 54px; font-weight: 700;
-         color: #06202a; will-change: transform; }
-  /* 축을 눈으로 잡아 주는 표식 -- 모서리가 돌아가는 것을 봐야 끊김이 보인다. */
-  .box::after { content: ""; position: absolute; width: 14px; height: 14px;
-                border-radius: 50%; background: #0b0d10; transform: translateY(-38%); }
+  .cell { display: flex; flex-direction: column; align-items: center; }
+  .label { margin-bottom: 20px; text-align: center; letter-spacing: .04em; color: #9fb0c3; }
+  .box {
+    position: relative;                 /* 안의 표식이 이 상자를 기준으로 놓이게 한다 */
+    display: flex; align-items: center; justify-content: center;
+    transform-origin: 50% 50%;          /* ★기본값이지만 명시한다 -- 축을 시험 중이다★ */
+    background: linear-gradient(135deg, #2f6df6 0%, #27c1a4 100%);
+    font-size: 44px; font-weight: 700; color: #06202a;
+  }
+  /* 중심 십자. 축이 중심이면 회전해도 제자리에 머문다. */
+  .cross-h, .cross-v { position: absolute; background: #0b0d10; }
+  .cross-h { left: 50%; top: 50%; width: 76px; height: 4px; margin-left: -38px; margin-top: -2px; }
+  .cross-v { left: 50%; top: 50%; width: 4px; height: 76px; margin-left: -2px; margin-top: -38px; }
+  /* 한 모서리 표식. 축이 이 모서리면 이 점이 제자리에 머문다. */
+  .corner { position: absolute; left: 0; top: 0; width: 26px; height: 26px;
+            background: #ff4d6d; }
   #stats { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 18px;
            background: #11151b; border-top: 1px solid #222a33; white-space: pre;
            font-size: 17px; line-height: 1.45; }
+  @keyframes probe-spin {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
 </style>
 
 <div class="wrap">
   <div class="cell">
     <div class="label">rAF + inline transform<br>(표출 페이지와 같은 구조)</div>
-    <div class="box" id="raf">rAF</div>
+    <div class="box" id="raf"><i class="cross-h"></i><i class="cross-v"></i><i class="corner"></i>rAF</div>
   </div>
   <div class="cell">
-    <div class="label">Element.animate()<br>(페인트측이 전진시킨다)</div>
-    <div class="box" id="waapi">WAAPI</div>
+    <div class="label">Element.animate()<br>(페인트측, 스크립트가 건다)</div>
+    <div class="box" id="waapi"><i class="cross-h"></i><i class="cross-v"></i><i class="corner"></i>WAAPI</div>
+  </div>
+  <div class="cell">
+    <div class="label">@keyframes<br>(페인트측, 스타일만으로)</div>
+    <div class="box" id="css"><i class="cross-h"></i><i class="cross-v"></i><i class="corner"></i>CSS</div>
   </div>
 </div>
 <div id="stats">측정 중…</div>
@@ -71,7 +105,7 @@
 
 const params = new URLSearchParams(location.search);
 const PERIOD_MS = Math.max(500, Number(params.get('period')) || 8000);
-const SIZE_PX = Math.max(80, Number(params.get('size')) || 520);
+const SIZE_PX = Math.max(80, Number(params.get('size')) || 420);
 
 for (const el of document.querySelectorAll('.box')) {
   el.style.width = SIZE_PX + 'px';
@@ -79,25 +113,41 @@ for (const el of document.querySelectorAll('.box')) {
 }
 
 // 한 바퀴에 걸리는 ease-in-out. 표출 페이지의 프리셋과 같은 모양이다.
-// (cubic-bezier 가 아니라 해석적 easing 을 쓴다 -- JS 쪽과 WAAPI 쪽이 ***정확히*** 같은
-//  곡선이어야 둘을 나란히 두고 비교할 수 있는데, 브라우저의 "ease-in-out" 은
-//  cubic-bezier(.42,0,.58,1) 이라 JS 로 그대로 재현하려면 근을 풀어야 한다.)
+// (cubic-bezier 가 아니라 해석적 easing 을 쓴다 -- 세 경로가 ***정확히*** 같은 곡선이어야
+//  나란히 두고 비교할 수 있는데, 브라우저의 "ease-in-out" 은 cubic-bezier(.42,0,.58,1) 이라
+//  JS 로 그대로 재현하려면 근을 풀어야 한다.)
 function easeInOut(t) {
   return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 }
 
-// --- 오른쪽: 페인트측 경로 ------------------------------------------------------------
-// 같은 곡선을 키프레임으로 떠서 건다. `Element.animate` 가 없는 엔진에서는 걸리지 않고
-// 그대로 멈춰 있는데, 그 자체가 정보다(표출 페이지도 같은 조건에서 효과가 빠진다).
+// 같은 곡선을 키프레임 61 개로 떠 둔다. WAAPI 와 CSS 가 이것을 공유한다.
+const STEPS = 60;
+const waapiFrames = [];
+let cssRule = '';
+for (let i = 0; i <= STEPS; i++) {
+  const t = i / STEPS;
+  const deg = (easeInOut(t) * 360).toFixed(3);
+  waapiFrames.push({ offset: t, transform: 'rotate(' + deg + 'deg)' });
+  cssRule += (t * 100).toFixed(4) + '% { transform: rotate(' + deg + 'deg); }\n';
+}
+
+// --- 오른쪽: CSS @keyframes ------------------------------------------------------------
+// 규칙을 스크립트로 만들되, 거는 것은 스타일뿐이다 -- 스크립트는 이후 한 번도 끼어들지
+// 않는다. WAAPI 쪽과 ***같은 곡선, 같은 주기, 같은 축***이라 둘이 다르게 보이면 그 차이는
+// 경로 때문이다.
+const sheet = document.createElement('style');
+sheet.textContent = '@keyframes probe-spin-eased {\n' + cssRule + '}';
+document.head.appendChild(sheet);
+const cssEl = document.getElementById('css');
+cssEl.style.animation = 'probe-spin-eased ' + PERIOD_MS + 'ms linear infinite';
+
+// --- 가운데: 페인트측 경로(스크립트가 건다) --------------------------------------------
+// `Element.animate` 가 없는 엔진에서는 걸리지 않고 멈춰 있는데, 그 자체가 정보다
+// (표출 페이지도 같은 조건에서 전환 효과가 빠진다).
 const waapiEl = document.getElementById('waapi');
 let waapiOn = false;
 if (typeof waapiEl.animate === 'function') {
-  const frames = [];
-  for (let i = 0; i <= 60; i++) {
-    const t = i / 60;
-    frames.push({ offset: t, transform: 'rotate(' + (easeInOut(t) * 360).toFixed(3) + 'deg)' });
-  }
-  waapiEl.animate(frames, { duration: PERIOD_MS, iterations: Infinity, easing: 'linear' });
+  waapiEl.animate(waapiFrames, { duration: PERIOD_MS, iterations: Infinity, easing: 'linear' });
   waapiOn = true;
 }
 
@@ -163,20 +213,25 @@ function tick(now) {
     const ws = w.slice().sort((a, b) => a - b);
     const period = pct(rs, 0.50) || 16.67;
     const b = bands(r, period);
+    const fps = Math.round(frames / seconds);
 
     const fmt = (s) => 'p50=' + pct(s, 0.50).toFixed(2) +
                        ' p95=' + pct(s, 0.95).toFixed(2) +
                        ' max=' + s[s.length - 1].toFixed(2);
 
+    // divisor 덫에 걸린 실행을 화면에서 바로 알아보게 한다.
+    const starved = fps < 30
+      ? '\n★rAF 가 ' + fps + 'fps 로 묶였다 -- gfx_paint_side_animation_tick_divisor 를 1 로 두고 다시 돌릴 것★'
+      : '';
+
     statsEl.textContent =
       'rAF  타임스탬프 간격  ' + fmt(rs) + '   (엔진이 정하는 값)\n' +
       'wall 실행 시각 간격   ' + fmt(ws) + '   (performance.now())\n' +
       '한 주기 ' + b.one + ' · 중복 ' + b.dup + ' · 1 건너뜀 ' + b.skip1 +
-      ' · 그 이상 ' + b.skipN + '   (기준 주기 ' + period.toFixed(2) + 'ms, 프레임 ' +
-      Math.round(frames / seconds) + '/s)\n' +
-      'WAAPI ' + (waapiOn ? 'ON — 오른쪽이 매끄러우면 페인트측 경로는 멀쩡하다'
-                          : 'OFF — Element.animate 가 없어 오른쪽은 멈춰 있다') +
-      ' · 한 바퀴 ' + PERIOD_MS + 'ms (ease-in-out)';
+      ' · 그 이상 ' + b.skipN + '   (기준 주기 ' + period.toFixed(2) + 'ms, rAF ' + fps + '/s)\n' +
+      'WAAPI ' + (waapiOn ? 'ON' : 'OFF — Element.animate 가 없다') +
+      ' · 한 바퀴 ' + PERIOD_MS + 'ms (ease-in-out) · 세 사각형은 같은 곡선이다' +
+      starved;
 
     console.log('RAFPROBE n=' + r.length +
                 ' per_interval dup=' + b.dup + ' one=' + b.one +
@@ -187,7 +242,7 @@ function tick(now) {
                 ' wall_ms p50=' + pct(ws, 0.50).toFixed(2) +
                 ' p95=' + pct(ws, 0.95).toFixed(2) +
                 ' max=' + ws[ws.length - 1].toFixed(2) +
-                ' fps=' + Math.round(frames / seconds) +
+                ' fps=' + fps +
                 ' waapi=' + (waapiOn ? 1 : 0));
   }
   requestAnimationFrame(tick);

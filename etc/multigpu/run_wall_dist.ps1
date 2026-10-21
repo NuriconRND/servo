@@ -169,6 +169,7 @@ param(
     # ★CommitAlign < DwmAlign 은 적법하다★ -- 마감이 다음 주기의 그 지점이 되므로
     # 여유가 거의 한 주기로 가장 많다. 대신 합성까지의 여유는 가장 적다.
     #
+    # ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 이후 거꾸로다)★ — -CommitAlign 을 쓸 때는 -DcompParallelCommit 을 ***같이 줘야*** 하고, 빼면 엔진이 직렬화 경고를 낸다.
     # 켜면 -DcompParallelCommit 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
     # ★판정은 TICKCOMMIT 의 spread 다★ -- 0 에 가까워져야 성공이다.
     [ValidateRange(-1, 99)]
@@ -313,6 +314,7 @@ param(
     # running that far ahead, which is the difference between a throttling bug and
     # a machine that is simply contended. Off by default: 45 lines a second.
     [switch] $VideoRate,
+    # ★낡음(2026-08-25 기록, 2026-08-31 `4ff3075ca97` 이후 무효)★ — 이 env 는 없다. 설정하면 기동이 막히고, 이 스위치는 `--pref gfx_video_immediate_composite_enabled=false` 를 보낸다.
     # SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE=1: stop re-compositing the whole scene
     # every time a video frame arrives.
     #
@@ -336,6 +338,7 @@ param(
     # script that passes it keeps working and reads correctly.
     [switch] $ImmediateComposite,
     # SERVO_FRAME_REASON_PROF=1: one line per second naming WHICH call site asked for each
+    # ★낡음(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고 `present_external_only` 는 여기 안 찍힌다.
     # composite. There are nine generate_frame call sites; gfx_refresh_hz only paces the
     # renderer tick (60Hz) and script runs its own 20/30ms timer, so the two together cap
     # around 110/s -- yet a single painter was measured at 200+/s. This says who.
@@ -486,6 +489,7 @@ param(
     # A violation can be silent, so check the wall by eye, not only the numbers.
     [switch] $DcompParallelCommit,
     # gfx_dcomp_update_quantum_px: pin the BeginDraw update rect to a fixed grid so DComp is
+    # ★낡음(2026-10-20 기록, 같은 날 `b24687d184c` 이후 무효)★ — 기본은 `-1` 이다(:504, :510). "(default)" 만 죽었다.
     # asked for ONE texture size instead of dozens. 0 = off (default), -1 = the whole tile,
     # >0 = round the rect's SIZE up to that many pixels.
     #
@@ -1976,6 +1980,61 @@ if ($cw) {
     Write-Warning "-DcompBindProf was set but no COMMITWORK line was logged. It is emitted right after COMMITSITE by the same compositor; if COMMITSITE printed and this did not, the engine predates this table."
 }
 
+# --- FRAMEID: how many renders were covered by a wall frame request? ---
+# ***This is a barrier-coverage ratio, not a content-freshness ratio.*** Read
+# components/paint/output_grid.rs:292-305 before drawing any conclusion from it.
+#
+# A wall logical frame id is attached only to composites that came from a wall frame request
+# (`Painter::generate_frame_for_script`), and `last_ready_wall_logical_frame_id` is sticky
+# once set. So `distinct_ids` counts how many DIFFERENT wall frames completed in that second
+# -- effectively the script path's own rate -- while `renders` counts every composite from
+# every source. A low ratio means most renders went out OUTSIDE any wall frame barrier, so the
+# four tiles were not held to the same frame for those composites.
+#
+# It does NOT mean the picture repeated. Display lists are published in their own transaction
+# (painter.rs:3761-3770), separate from `generate_frame`, so a composite requested by the video
+# path still picks up script's newest scene.
+#
+# Measured 2026-10-21 (log_ani_debug_05/13, SINGLE tile, one rotating region):
+#   rotating a still image   distinct/renders = 0.99-1.00
+#   rotating a 30fps video   distinct/renders = 0.54
+# On a single tile the barrier never engages at all (paint.rs:1774 short-circuits at
+# target_painter_ids.len() <= 1), so there the ratio is only telling you what fraction of
+# composites the script path asked for.
+$fid = Select-String -Path $LogPath -Pattern "FRAMEID painter=" -EA SilentlyContinue
+if ($fid) {
+    $fidByPainter = @{}
+    foreach ($m in $fid) {
+        if ($m.Line -notmatch "painter=PainterId\((\d+)\) renders=(\d+) with_id=(\d+) distinct_ids=(\d+) without_id=(\d+)") { continue }
+        $p = [int]$Matches[1]
+        if (-not $fidByPainter.ContainsKey($p)) { $fidByPainter[$p] = @(0, 0, 0, 0) }  # windows, renders, distinct, without_id
+        $fidByPainter[$p][0] += 1
+        $fidByPainter[$p][1] += [int]$Matches[2]
+        $fidByPainter[$p][2] += [int]$Matches[4]
+        $fidByPainter[$p][3] += [int]$Matches[5]
+    }
+    if ($fidByPainter.Count -gt 0) {
+        Write-Host ""
+        # ★커밋 전 작업분(2026-10-21), 무효 시점 불명 — 같은 블록 머리(:1980)가 이미 반박한다★ — 배리어 커버리지 비율이지 "새 내용" 비율이 아니다.
+        Write-Host "FRAMEID -- of the composites that went out, how many carried new content:"
+        $worstRatio = 1.0
+        foreach ($p in ($fidByPainter.Keys | Sort-Object)) {
+            $t = $fidByPainter[$p]
+            if ($t[0] -eq 0 -or $t[1] -eq 0) { continue }
+            $ratio = [double]$t[2] / [double]$t[1]
+            if ($ratio -lt $worstRatio) { $worstRatio = $ratio }
+            Write-Host ("  painter {0}   {1,6:N1} composites/s   {2,6:N1} distinct/s   ratio {3:N3}{4}" -f `
+                $p, ($t[1] / $t[0]), ($t[2] / $t[0]), $ratio, $(if ($t[3] -gt 0) { "   ({0:N0} had no id)" -f $t[3] } else { "" }))
+        }
+        if ($worstRatio -ge 0.95) {
+            Write-Host "  Nearly every render was covered by a wall frame request, so the tiles were held to"
+            Write-Host "  the same frame. This says nothing about whether the content changed."
+        } else {
+            Write-Warning ("Only {0:N0}% of renders carried a wall frame id, so most composites went out outside any wall frame barrier -- on a multi-tile wall the tiles were not held to the same frame for those. Read FRAMEREASON above to see which other source asked for them. This is NOT evidence that the picture repeated; display lists publish separately from generate_frame." -f ($worstRatio * 100))
+        }
+    }
+}
+
 # --- FRAMETIME: is the timestamp the PAGE receives evenly spaced? ---
 # Every other metric in this script counts frames. This one counts the VALUES those frames
 # carried. `frame_time` is handed to the script thread and becomes the page's
@@ -2018,13 +2077,22 @@ if ($ft) {
         Write-Host ("  worst gap            {0,8:N2} ms" -f $ftDtMax)
         Write-Host ("  worst lag behind tick{0,8:N2} ms  (how old the value was when it went out)" -f $ftLagMax)
         Write-Host ("  fell back to now()   {0,8:N0}  {1,5:N1}%   <- shell value missing or stale" -f $ftFallback, (& $pct $ftFallback))
+        # 비율로 판정한다. 7,100 구간 중 4 개가 어긋난 것은 기동과 장면 전환의 흔적이지
+        # 저더가 아니다 -- 숫자는 그대로 위에 찍어 두고, 경고는 화면에서 보일 만한 크기일
+        # 때만 낸다(2026-10-21: 처음 판정식이 깨끗한 실행 여섯 개 전부에 경고를 띄웠다).
         $uneven = $ftDup + $ftSkip1 + $ftSkipN
-        if ($uneven -eq 0) {
-            Write-Host "  Every interval was one period on the way out. Read RAFCLOCK below before concluding"
-            Write-Host "  anything: the script thread can still lose or clamp these values, and only that line"
-            Write-Host "  shows what the page was actually handed."
+        $unevenPct = & $pct $uneven
+        if ($unevenPct -lt 1.0) {
+            if ($uneven -eq 0) {
+                Write-Host "  Every interval was one period on the way out."
+            } else {
+                Write-Host ("  {0:N0} intervals ({1:N2}%) were not one period -- startup and scene changes leave that" -f $uneven, $unevenPct)
+                Write-Host "  much behind. Too small to be a visible judder; the clock left paint even."
+            }
+            Write-Host "  Read RAFCLOCK below before concluding anything: the script thread can still lose or"
+            Write-Host "  clamp these values, and only that line shows what the page was actually handed."
         } else {
-            Write-Warning ("{0:N0} of {1:N0} intervals ({2:N1}%) were not one period. The page was handed an uneven clock, so it computed uneven positions -- the animation cannot be smooth no matter how many frames go out. This is already uneven on the way out of paint, so the pacing is the first suspect -- RAFCLOCK below can only make it worse, never better." -f $uneven, $ftN, (& $pct $uneven))
+            Write-Warning ("{0:N0} of {1:N0} intervals ({2:N1}%) were not one period -- too many to be startup noise. The page was handed an uneven clock, so it computed uneven positions -- the animation cannot be smooth no matter how many frames go out. This is already uneven on the way out of paint, so the pacing is the first suspect -- RAFCLOCK below can only make it worse, never better." -f $uneven, $ftN, (& $pct $uneven))
         }
     }
 } elseif ($FrameTimeProf) {
@@ -2072,13 +2140,26 @@ if ($rc) {
         Write-Host ("  worst gap            {0,8:N2} ms" -f $rcMax)
         Write-Host ("  monotonic clamp hit  {0,8:N0}  {1,5:N1}%   <- handed the previous value again" -f $rcClamped, (& $rcPct $rcClamped))
         Write-Host ("  fell back to now()   {0,8:N0}  {1,5:N1}%   <- the round had no tick to use" -f $rcFallback, (& $rcPct $rcFallback))
+        # 같은 이유로 비율 판정이다. `clamped`/`fallback` 은 한 번만 나도 메커니즘으로는
+        # 흥미롭지만, 7,100 회차 중 몇 번이면 화면에서는 보이지 않는다. 그 둘을 합쳐
+        # 1% 를 넘을 때만 "우리 쪽 결함" 이라고 말한다.
         $rcUneven = $rcDup + $rcSkip1 + $rcSkipN
-        if ($rcClamped -gt 0 -or $rcFallback -gt 0) {
-            Write-Warning ("The page's clock was distorted on the script side: {0:N0} rounds fell back to now() and {1:N0} were clamped back to the previous value. That is ours, in Document::resolve_frame_time -- the page cannot draw an even animation from an uneven clock no matter how many frames go out." -f $rcFallback, $rcClamped)
-        } elseif ($rcUneven -eq 0) {
-            Write-Host "  Even. Together with a clean FRAMETIME this clears the whole clock path: the page was"
-            Write-Host "  handed one period per frame. An animation that still looks uneven is then about WHEN"
-            Write-Host "  the frame carrying each value reached the screen, not about the value it carried."
+        $rcUnevenPct = & $rcPct $rcUneven
+        $rcDistorted = $rcClamped + $rcFallback
+        $rcDistortedPct = & $rcPct $rcDistorted
+        if ($rcDistortedPct -ge 1.0) {
+            Write-Warning ("The page's clock was distorted on the script side: {0:N0} rounds fell back to now() and {1:N0} were clamped back to the previous value ({2:N1}% together). That is ours, in Document::resolve_frame_time -- a round that cannot use a tick takes now(), which is LATER than the paced tick, so the clock jumps forward and the real ticks after it get clamped to the previous value. The page then computes the same position twice." -f $rcFallback, $rcClamped, $rcDistortedPct)
+        } elseif ($rcUnevenPct -lt 1.0) {
+            if ($rcUneven -eq 0 -and $rcDistorted -eq 0) {
+                Write-Host "  Even, end to end."
+            } else {
+                Write-Host ("  {0:N0} uneven intervals ({1:N2}%), {2:N0} clamped, {3:N0} fell back -- all of it startup" -f $rcUneven, $rcUnevenPct, $rcClamped, $rcFallback)
+                Write-Host "  and scene-change noise at this size, not a visible judder."
+            }
+            Write-Host "  ★This clears the whole clock path.★ The page was handed one period per frame, so an"
+            Write-Host "  animation that still looks uneven is about WHEN the frame carrying each value reached"
+            Write-Host "  the screen -- not about the value it carried. Stop looking at the clock and look at"
+            Write-Host "  FRAMEREASON (who caused each composite) and the present cadence."
         } else {
             Write-Warning ("{0:N0} of {1:N0} intervals ({2:N1}%) were not one period, with no clamp and no fallback. Compare with FRAMETIME above: if that one is even, the ticks were lost between paint and the page (pending_frame_time is a single Cell and a second tick overwrites the first); if it is uneven too, the problem is upstream in the pacing." -f $rcUneven, $rcN, (& $rcPct $rcUneven))
         }
