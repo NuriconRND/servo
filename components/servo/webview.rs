@@ -702,6 +702,10 @@ impl WebView {
 
     /// 자유 실행 표출 클럭이 없는 임베더용. 깨우기가 `schedule_wall_production` 으로
     /// 예약한 에지에서만 `on_wall_tick` 과 같은 생산을 한다. 예약이 없으면 `None`.
+    ///
+    /// ★[`Servo::on_demand_wall_tick`] 과 ***같은 자리***로 내려간다 -- 이쪽은 `WebView` 를
+    /// 이미 쥐고 있을 때의 편의 손잡이다.★ 틱은 벽 전체에 하나라 이 `WebView` 가 생산
+    /// 범위를 정하지 않는다. 둘 중 하나만, 틱 에지당 한 번 부를 것(2026-10-22).
     pub fn on_demand_wall_tick(&self) -> Option<u64> {
         self.inner().servo.paint().on_demand_wall_tick()
     }

@@ -77,9 +77,22 @@ impl ServoTest {
     /// Spin the Servo event loop until one of:
     ///  - The given callback returns `Ok(false)`.
     ///  - The given callback returns an `Error`, in which case the `Error` will be returned.
+    ///
+    /// ★이 하네스의 틱 지점 -- 프레임을 내는 유일한 자리다.★ 2026-10-22, 설계 2-4.
+    /// `spin_event_loop` 은 메시지만 처리한다. 틱이 없던 동안 이 하네스는 부트스트랩 한 장
+    /// 뒤로 프레임이 없었고, 프레임을 기다리는 헬퍼
+    /// (`show_webview_and_wait_for_rendering_to_be_ready`,
+    /// `wait_for_webview_scene_to_be_up_to_date`)가 ★타임아웃 없이 도는 이 루프 안에서★
+    /// 멈추거나 빈 지표로 실패했다(실측 2026-10-22: `performance_paint_timing` 의 paint
+    /// 엔트리 0 대 1).
+    ///
+    /// `Servo` 수준 입구를 쓰는 이유는 ★이 하네스가 `WebView` 를 안 쥐기 때문★ 이다 --
+    /// 그것이 같은 누락이 다섯 번 재무장된 구조적 원인이었다. 자세한 것은
+    /// [`Servo::on_demand_wall_tick`].
     pub fn spin(&self, callback: impl Fn() -> bool + 'static) {
         while callback() {
             self.servo.spin_event_loop();
+            self.servo.on_demand_wall_tick();
             std::thread::sleep(Duration::from_millis(1));
         }
     }

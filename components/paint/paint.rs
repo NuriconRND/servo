@@ -478,9 +478,16 @@ struct WallFrameCoordinator {
     barriers: HashMap<u64, WallFrameBarrier>,
     active_webview_frames: HashMap<WebViewId, u64>,
     /// "이 논리 프레임에는 직전 프레임을 유지하라" 는 타일별 지시. ★무장 지점은 둘이다★ --
-    /// `miss_barrier`(마감을 놓친 타일)와 `arm_keep_previous`(역압으로 거절한 타일,
-    /// 2026-10-22 Task 8). 지우는 쪽은 셋이다: `complete_barrier`, `miss_barrier` 의 준비된
-    /// 타일, 그리고 다음 벽 프레임의 `expire_keep_previous_before`.
+    /// `miss_barrier`(마감을 놓친 타일)와 `arm_keep_previous`(2026-10-22 Task 8).
+    /// 지우는 쪽은 셋이다: `complete_barrier`, `miss_barrier` 의 준비된 타일, 그리고 다음
+    /// 벽 프레임의 `expire_keep_previous_before`.
+    ///
+    /// ★`arm_keep_previous` 는 "역압으로 거절한 타일" 이 ***아니다*** -- 2026-10-22 정정.★
+    /// 그렇게 적혀 있었고 그것이 "역압" 으로 grep 하면 제일 먼저 걸리는 자리였다. 실제로
+    /// 무장까지 가는 거절은 `WaitingOnCanvasImages` 하나뿐이다
+    /// (`wall_tick::decline_may_arm_keep_previous(RendererBehind)` 이 거짓 -- 역압에 무장하면
+    /// 자기잠금이다). 설계 2-5 가 말하던 "역압 거절의 배리어 참여" 는 미구현이고, 그 전말은
+    /// `WallFrameCoordinator::arm_keep_previous` 주석 한 벌에만 둔다.
     keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
     /// 한 번이라도 프레임을 화면에 낸 painter. ★"직전 프레임 유지" 는 직전 프레임이 있는
     /// 타일에게만 말이 된다★ -- 없는 타일에게 그러면 검은 타일이 된다
@@ -1242,11 +1249,15 @@ impl WallFrameCoordinator {
     /// observe the skip, so consuming it here would defeat it.
     ///
     /// ★2026-10-22 Task 8 부터 만료는 드문 일이 아니다.★ 무장 지점이 둘이 됐고
-    /// (`miss_barrier`, `arm_keep_previous`), 그중 역압 거절은 무거운 타일에서 주기마다
-    /// 일어날 수 있다. 질의는 지시를 소비해도 **지우지 않으므로**(실패 주입 제외) 거절한
-    /// 타일의 지시는 거의 언제나 다음 벽 프레임의 이 자리에서 걷힌다 -- 그것이 역압 유지가
-    /// 한 프레임짜리임을 보장하는 자리다(불변식 14). 아래 경고문이 "배리어를 놓쳤다" 고
-    /// 단정하지 않는 이유다.
+    /// (`miss_barrier`, `arm_keep_previous`), 그중 뒤쪽은 캔버스 이미지를 기다리는 타일에서
+    /// 주기마다 일어날 수 있다. 질의는 지시를 소비해도 **지우지 않으므로**(실패 주입 제외)
+    /// 거절한 타일의 지시는 거의 언제나 다음 벽 프레임의 이 자리에서 걷힌다 -- 그것이 유지
+    /// 지시가 한 프레임짜리임을 보장하는 자리다(불변식 14). 아래 경고문이 "배리어를
+    /// 놓쳤다" 고 단정하지 않는 이유다.
+    ///
+    /// ★"역압 거절" 이라고 적혀 있던 것을 2026-10-22 에 바로잡았다★ -- 역압 거절은
+    /// 무장되지 않는다(`wall_tick::decline_may_arm_keep_previous`). 그 주장은 철회된 설계
+    /// 2-5 의 잔재다.
     fn expire_keep_previous_before(&mut self, logical_frame_id: u64, painter_ids: &[PainterId]) {
         for painter_id in painter_ids {
             let stale = self
@@ -1262,14 +1273,19 @@ impl WallFrameCoordinator {
             self.keep_previous_expired_count += 1;
             let total = self.keep_previous_expired_count;
             // Same rate-limit shape as the pacing summary: a tile that misses every barrier
-            // -- or declines on back-pressure every tick -- would otherwise warn once per
+            // -- or waits on canvas images every tick -- would otherwise warn once per
             // wall frame.
+            //
+            // ★문자열에 "declined on back-pressure" 가 있었다 -- 2026-10-22 에 고쳤다.★
+            // 역압 거절은 무장되지 않으므로(`wall_tick::decline_may_arm_keep_previous`)
+            // 이 줄에 그 사유로 들어오는 타일은 없다. 로그로 나가는 문자열이라 읽는 사람을
+            // 곧장 틀린 원인으로 보냈다.
             if total <= 3 || total % WALL_FRAME_PACING_INFO_INTERVAL == 0 {
                 warn!(
                     "Wall frame keep-previous expired: painter={:?} kept_for_logical_frame_id={} \
                      superseded_by={} total_expired={}. The painter did not generate that frame \
-                     (missed barrier, or declined on back-pressure) and would otherwise have \
-                     been skipped by the embedder for the rest of the session.",
+                     (missed barrier, or declined while waiting on canvas images) and would \
+                     otherwise have been skipped by the embedder for the rest of the session.",
                     painter_id,
                     previous
                         .map(|frame| frame.logical_frame_id)

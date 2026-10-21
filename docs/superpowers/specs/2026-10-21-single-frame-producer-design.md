@@ -248,7 +248,7 @@ generate_frame_for_wall_tick(logical_frame_id, requested_at) -> TileOutcome
 | 11 | 놓친 틱은 버리고, 주기는 정확히 | 기존 클럭 그대로. ★정리★: `gfx_refresh_hz` 클램프 사본이 다섯이다 — `refresh_driver.rs:353-363`, `main.rs:1941-1947`, `main.rs:1961-1964`, `script/raf_clock.rs:45-53`, `script_thread.rs:1651` |
 | 12 | 틱 솎기와 합성률은 분리 | divisor 가 나누는 것은 ★표출 틱이 아니라 `RefreshDriver` 틱★ 이다(`refresh_driver.rs:230-234`). 둘이 같은 주기인 것은 `FrameClock::Pacing` 뿐. 2-4 가 콜백을 한 손잡이로 모으면 둘이 같아진다 — ★그러면 8 절의 `epoch/s` 기대값은 `gfx_refresh_hz`/divisor 다★ |
 | 13 | WebView 소유 painter 만 틱 요청 | ★문구가 코드와 다르다 — 2026-10-22 정정★. `Paint::wall_frame_request_for_all_tiles` 의 원천 집합은 `self.painter_ids()`, 즉 ***등록된 모든 painter*** 다. "WebView 소유 painter 만" 은 아니다. 지금 있는 셸에서는 둘이 같은 집합이라 무해하고(추가 paint target 은 전부 어느 `WebView` 의 것이다), 소유자 없는 painter 가 생기면 그때 좁히면 된다. ★팬아웃이 있다고 페이싱 틱이 있는 것은 아니다★ |
-| 14 | keep-previous 는 지명된 논리 프레임에만 유효 | ★2-5 가 이것을 적극적으로 쓴다★ — 역압 거절이 곧 그 프레임의 keep-previous 참여다 |
+| 14 | keep-previous 는 지명된 논리 프레임에만 유효 | 그대로 선다 — `expire_keep_previous_before` 가 다음 벽 프레임에서 지시를 걷는다. ★초안의 "역압 거절이 곧 그 프레임의 keep-previous 참여다" 는 2026-10-22 에 철회했다★: `wall_tick::decline_may_arm_keep_previous(RendererBehind)` 이 거짓이라 ***역압 거절은 어떤 경로로도 무장되지 않는다***(무장이 자기잠금이 된다 — 무장이 막는 렌더가 곧 그 사유를 푸는 자리다). 무장까지 가는 유일한 사유는 `WaitingOnCanvasImages` 이고, 2-5 가 요구한 ***배리어 참여*** 자체는 미구현이다 — 전말은 `WallFrameCoordinator::arm_keep_previous` 주석 |
 | 15 | 배리어 16ms 마감은 주사율에서 유도하지 않은 허용 오차 | 틱 주기와 묶지 않는다 |
 | 16 | 스크린샷이 가능해야 한다 | ★2-8★ — 수요 구동 임베더는 깨우기 없으면 생산 없음, 벽은 요청 중 생산 일시 중지 |
 | 17 | 캐럿은 진짜 500ms 타이머, 값 표본은 표출과 같은 클럭 | 그대로. ★스레드 수로 클럭 일원화를 확인하지 말 것★ — `PaintTimerThread` 는 어차피 뜬다 |
