@@ -337,6 +337,17 @@ pub const FRAME_TIME_PROF: DebugFlag = DebugFlag {
     cache_index: 22,
 };
 
+// ---------------------------------------------------------------------------------------------
+// `with_painter_mut` 의 큐 대기 (components/paint/paint.rs, PAINTERLOCK).
+// ---------------------------------------------------------------------------------------------
+
+pub const WALL_PAINTER_LOCK_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_WALL_PAINTER_LOCK_PROF",
+    kind: Kind::Str,
+    doc: "`with_painter_mut` 가 painter 스레드의 큐에서 기다린 시간을 painter 별로 1 초에 한 줄씩 집계한다 -- `PAINTERLOCK`(n, wait_ms p50 / p95 / max, 1ms 이상 기다린 횟수 over_1ms). 호출한 순간부터 콜백이 painter 스레드에서 시작하는 순간까지를 재며 콜백 자신의 실행 시간은 뺀다. 스레드 없는 painter 는 기다릴 것이 없어 재지 않는다. truthy: \"1\" 또는 \"true\"(대소문자 무시). 왜: 표출 틱이 단일 프레임 생산자가 되면 틱이 각 painter 에 `with_painter_mut` 로 닿는데, 이 호출이 타일 스레드의 진행 중 렌더 뒤에 서서 막히면 틱 자신의 클럭이 흔들린다 -- 그것이 설계에서 확인되지 않은 유일한 항목이었다. ★`max` 하나로는 \"3ms 한 번\" 과 \"3ms 를 60 번\" 이 구분되지 않고 그 둘은 결론이 정반대다★ 그래서 `over_1ms` 를 같이 센다. 판정: `p95 < 1ms` 면 틱이 블로킹 호출로 가고, `p95 >= 1ms` 면 비블로킹 포스트로 간다 -- ★어느 쪽이든 생산자는 하나다★. 호출마다 불리는 자리라 기본 off.",
+    cache_index: 23,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -363,6 +374,7 @@ pub const ALL: &[&DebugFlag] = &[
     &WALL_DISABLE_CANVAS_ACK_RECOVERY,
     &DCOMP_SLOW_COMMIT_MS,
     &FRAME_TIME_PROF,
+    &WALL_PAINTER_LOCK_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

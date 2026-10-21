@@ -380,6 +380,10 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 
 틱에 실려 나간 프레임 시각의 간격을 painter 별로 1 초에 한 줄씩 집계한다 -- `FRAMETIME`(dup / one / skip1 / skipN, dt 백분위, 틱 시점과의 지연 lag, 셸 값 대신 now() 로 떨어진 fallback 수). truthy: "1" 또는 "true"(대소문자 무시). ★이 값이 곧 페이지의 `requestAnimationFrame` 타임스탬프다★ -- 프레임이 초당 60 개 나가도 이 수열이 고르지 않으면 화면의 변위가 고르지 않다. 그래서 `dup` 이 0 이 아니면 그 자체가 결함이다(연속한 두 틱이 같은 시각을 실어 보냈다는 뜻이고, 페이지는 같은 위치를 두 번 계산한다). 같은 출력 페이지를 Chrome 은 single tile 에서 60fps 로 돌리는데 winit_wall 은 떨리고, 우리 지표는 전부 깨끗했다(2026-10-21, log_ani_debug_05/12) -- 그때 남아 있던 유일한 변수가 이것이라 만들었다. 같은 스위치가 스크립트 쪽의 `RAFCLOCK` 도 켠다 (`components/script/raf_clock.rs`) -- 이쪽은 ***보낸*** 값이고 저쪽은 페이지가 ***받은*** 값이라, 둘을 나란히 읽어야 어느 구간에서 고르지 않게 됐는지가 갈린다. `RAFCLOCK` 의 `clamped` 는 `Document::resolve_frame_time` 의 단조 증가 하한에 걸려 페이지가 직전과 같은 시각을 받은 횟수다. `SERVO_LOG_ANIM_STEP_SEQ` 를 함께 켜면 정렬 전 원시 수열(`FRAMETIMESEQ` / `RAFCLOCKSEQ`)도 찍는다. 틱마다 불리는 자리라 기본 off.
 
+### `SERVO_WALL_PAINTER_LOCK_PROF` — `Str`
+
+`with_painter_mut` 가 painter 스레드의 큐에서 기다린 시간을 painter 별로 1 초에 한 줄씩 집계한다 -- `PAINTERLOCK`(n, wait_ms p50 / p95 / max, 1ms 이상 기다린 횟수 over_1ms). 호출한 순간부터 콜백이 painter 스레드에서 시작하는 순간까지를 재며 콜백 자신의 실행 시간은 뺀다. 스레드 없는 painter 는 기다릴 것이 없어 재지 않는다. truthy: "1" 또는 "true"(대소문자 무시). 왜: 표출 틱이 단일 프레임 생산자가 되면 틱이 각 painter 에 `with_painter_mut` 로 닿는데, 이 호출이 타일 스레드의 진행 중 렌더 뒤에 서서 막히면 틱 자신의 클럭이 흔들린다 -- 그것이 설계에서 확인되지 않은 유일한 항목이었다. ★`max` 하나로는 "3ms 한 번" 과 "3ms 를 60 번" 이 구분되지 않고 그 둘은 결론이 정반대다★ 그래서 `over_1ms` 를 같이 센다. 판정: `p95 < 1ms` 면 틱이 블로킹 호출로 가고, `p95 >= 1ms` 면 비블로킹 포스트로 간다 -- ★어느 쪽이든 생산자는 하나다★. 호출마다 불리는 자리라 기본 off.
+
 ## wall CLI 플래그
 
 pref 가 아니라 CLI 플래그다. 두 셸이 각자 파싱하지만 **검증과 해석은
