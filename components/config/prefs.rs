@@ -569,6 +569,17 @@ pub struct Preferences {
     /// 옮긴다 -- 렌더는 그대로 메인이다(임베더 핸들과 타일 0 컨텍스트가 메인 전용).
     /// 메인의 `WaitUntil` 은 백스톱으로 남는다.
     pub gfx_wall_pacing_thread: bool,
+    /// ★페이싱 틱이 벽 프레임의 단일 생산자가 된다★(2026-10-21, 설계 문서
+    /// `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 켜면 셸이 틱마다
+    /// `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다.
+    ///
+    /// ★중간 상태다 -- 기본 꺼짐이고, 켜 둔 채 배포하지 않는다.★ 구 생산자 열한 곳이 아직
+    /// 살아 있어 이 값을 켜면 생산자가 일부러 둘 이상이다: 한 틱이 합성을 두 번 낼 수 있고
+    /// (`gather_components` 가 `pump_paint_animation` 을 통째로 부르며 그 안의 비디오·
+    /// 애니메이션 분기가 프레임을 낸다), 틱이 게이트가 읽는 상태를 써서 스크립트의
+    /// `GenerateFrame` 이 더 자주 coalesce 된다(캔버스 ack 해제가 늦어진다). 합성 수와
+    /// `FRAMEID` 는 이 구간에서 판정에 쓰지 않는다. 기본값은 구 생산자를 내린 뒤 뒤집는다.
+    pub gfx_single_frame_producer: bool,
     /// ★낡음(2026-08-11 기록, 2026-09-17 `785cbd01735` 이후 무효)★ — 이제 셸의 표출 클럭까지 같이 묶는다. "프레임 생산" 만 읽으면 그 전의 결론을 되풀이한다(run_wall_dist.ps1:92).
     /// Windows 에서 DWM 합성 클럭(vsync)에 프레임 생산을 맞출지 여부. 기본 꺼짐 —
     /// `DwmFlush` 가 스핀-웨이트로 동작해 코어 1개를 상시 소모한다(`vsync_refresh_driver.rs`).
@@ -1283,6 +1294,7 @@ impl Preferences {
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,
+            gfx_single_frame_producer: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
@@ -1512,6 +1524,14 @@ impl UserAgentPlatform {
 #[cfg(test)]
 mod tests {
     use super::Preferences;
+
+    /// ★중간 상태는 기본으로 켜지 않는다.★ 켜면 생산자가 일부러 둘 이상이 된다(구 생산자
+    /// 열한 곳이 아직 살아 있다). 기본값은 Task 10 이 뒤집는다 -- 그 전에 이 시험이 먼저
+    /// 깨지는 것이 맞다.
+    #[test]
+    fn the_single_frame_producer_starts_off() {
+        assert!(!Preferences::const_default().gfx_single_frame_producer);
+    }
 
     /// 기본값을 되돌리는 것을 막는다.
     ///

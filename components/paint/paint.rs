@@ -1944,6 +1944,20 @@ impl Paint {
         self.produce_wall_frame()
     }
 
+    /// ★자유 실행 표출 클럭이 없는 임베더의 틱 문.★ 깨우기가 예약해 둔 에지에서만 생산한다
+    /// (`wall_tick::schedule_production_at_next_edge`). 예약이 없으면 아무것도 하지 않고
+    /// `None` 이다 -- 조용한 페이지는 깨우기가 없으므로 생산도 없다(불변식 16).
+    ///
+    /// 자유 실행 클럭이 있는 구성(`winit_wall`)은 이것이 아니라 `on_wall_tick` 을 매 주기
+    /// 부른다. 어느 쪽이든 ★생산은 `on_wall_tick` 하나를 지난다★ -- 이 함수는 그 앞에
+    /// 예약 비트 하나를 거는 것뿐이라 생산자가 둘이 되지 않는다.
+    pub fn on_demand_wall_tick(&self) -> Option<u64> {
+        if !crate::wall_tick::take_scheduled_edge() {
+            return None;
+        }
+        self.on_wall_tick()
+    }
+
     fn max_pending_frames_for_targets(&self, target_painter_ids: &[PainterId]) -> usize {
         target_painter_ids
             .iter()

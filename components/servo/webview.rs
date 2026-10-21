@@ -692,6 +692,20 @@ impl WebView {
         self.inner().servo.paint().render(self.id());
     }
 
+    /// ★페이싱 틱이 벽 프레임을 낸다.★ 표출 주기마다 한 번, `note_present_tick` 뒤 렌더 앞에
+    /// 부른다. 구성 요소를 모으고 프레임을 내는 순서는 `Paint::on_wall_tick` 안에 있어
+    /// 밖에서 틀릴 수 없다. 돌려주는 값은 이번 주기에 ★낸(issue)★ 논리 프레임 번호이고,
+    /// 합성했다는 뜻이 아니다(타일이 전부 이전 프레임을 유지해도 `Some` 이다).
+    pub fn on_wall_tick(&self) -> Option<u64> {
+        self.inner().servo.paint().on_wall_tick()
+    }
+
+    /// 자유 실행 표출 클럭이 없는 임베더용. 깨우기가 `schedule_wall_production` 으로
+    /// 예약한 에지에서만 `on_wall_tick` 과 같은 생산을 한다. 예약이 없으면 `None`.
+    pub fn on_demand_wall_tick(&self) -> Option<u64> {
+        self.inner().servo.paint().on_demand_wall_tick()
+    }
+
     /// Get the primary paint target for this [`WebView`].
     pub fn primary_paint_target(&self) -> WebViewPaintTarget {
         WebViewPaintTarget {

@@ -370,6 +370,9 @@ struct AppState {
     capture_deadline: Option<std::time::Instant>,
     /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
     pass_counter: Cell<u64>,
+    /// `gfx_single_frame_producer` 가 켜졌을 때, 틱이 낸 논리 프레임 번호 감시.
+    /// `fire_present_tick` 의 디버그 어서션이 쓴다 -- `TickIssueAudit` 참고.
+    tick_issue_audit: RefCell<TickIssueAudit>,
     /// 메인 스레드의 1초를 어디에 썼는지.
     ///
     /// ★기계에 코어가 남아도는데 애니메이션이 죽는다면, 모자란 것은 처리량이 아니라 이
@@ -464,6 +467,38 @@ struct ClockStats {
     /// 이 굶는다는 이 셸의 알려진 실패(`drive_present_clock` 주석, 실측 정지 3.2 초)와 같은
     /// 기전이다. 어느 쪽이냐로 다음 할 일이 갈린다.
     tick_by_site: [u32; 4],
+}
+
+/// 틱이 낸 논리 프레임 번호 감시. ★`debug_assert!` 전용이다.★
+///
+/// ★이것이 증명하는 것:★ 틱마다 `on_wall_tick` 이 부른 `issue_wall_frame_request` 가 한 번이고
+/// 그것이 앞 틱의 번호보다 큰 새 번호를 받았다 -- 같은 틱 안에서 두 번 낸 호출이 있다면
+/// 둘째 번호가 첫째를 넘으므로 ★이 감시는 그것을 못 잡는다★(틱 하나당 한 번 기록할 뿐이다).
+/// 잡는 것은 번호의 되돌림·되풀이, 즉 틱 두 개가 같은 번호를 쓰거나 번호 발급이 틱 사이에서
+/// 후퇴하는 경우다.
+///
+/// ★증명하지 못하는 것:★ (1) 합성이 한 번이었다는 것 -- 돌려주는 값은 ***낸 것(issue)*** 을
+/// 세지, 합성을 세지 않는다(타일이 전부 `KeepPrevious` 여도 `Some`). (2) 틱 사이에 스크립트
+/// 경로가 번호를 쓰지 않았다는 것 -- 번호는 공유 카운터라 건너뛰는 것은 정상이다(그래서
+/// "연속" 이 아니라 "증가" 만 본다). "생산 지점이 하나" 라는 판정은 Task 7 이후의 `FRAMEREASON`
+/// 로그가 한다.
+#[derive(Debug, Default)]
+struct TickIssueAudit {
+    last_issued: Option<u64>,
+}
+
+impl TickIssueAudit {
+    /// 이번 틱의 결과를 기록한다. `None`(낼 타일이 없었다)은 번호를 태우지 않았으므로 통과다.
+    fn record_tick(&mut self, issued: Option<u64>) -> Result<(), ()> {
+        let Some(frame) = issued else {
+            return Ok(());
+        };
+        if self.last_issued.is_some_and(|last| frame <= last) {
+            return Err(());
+        }
+        self.last_issued = Some(frame);
+        Ok(())
+    }
 }
 
 /// `drive_present_clock` 을 부른 자리. `ClockStats::tick_by_site` 의 첨자다.
@@ -1426,6 +1461,27 @@ impl AppState {
         // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
         // 지나므로 한 자리면 충분하다.★
         servo::note_present_tick();
+        // ★틱이 벽 프레임을 낸다 -- `gfx_single_frame_producer` 가 켜졌을 때만.★ 자리는
+        // `note_present_tick` 뒤, 콜백 발사와 렌더 앞이다. 구성 요소를 모으고 내는 순서는
+        // `on_wall_tick` 안에 있어 여기서 틀릴 수 없다.
+        //
+        // ★중간 상태다.★ 구 생산자가 아직 살아 있어 이 구간의 합성 수와 `FRAMEID` 는 판정에
+        // 쓰지 않는다(한 틱이 합성을 두 번 낼 수 있다). 기본 꺼짐.
+        //
+        // 이 셸의 세 구성(Pacing / Timer / Vsync)은 모두 자유 실행 틱 에지가 있으므로
+        // 예약 비트(`on_demand_wall_tick`)를 보지 않고 매 주기 부른다.
+        if servo::pref!(gfx_single_frame_producer) {
+            let webview = self.webview.borrow().clone();
+            if let Some(webview) = webview {
+                let issued = webview.on_wall_tick();
+                let mut audit = self.tick_issue_audit.borrow_mut();
+                debug_assert!(
+                    audit.record_tick(issued).is_ok(),
+                    "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: {:?}",
+                    audit
+                );
+            }
+        }
         // ★Servo 의 프레임 관찰자를 여기서 깨운다.★ 세 구성(Pacing / Timer / Vsync)
         // 모두 이 자리에서 쏜다 -- `notify_will_paint` 가 등록해 둔 콜백을 부를 사람은
         // 여기뿐이다. 구성마다 다른 것은 ***틱 에지를 누가 내는가*** 뿐이고(페이싱 스레드 /
@@ -1933,6 +1989,7 @@ impl ApplicationHandler<WakerEvent> for App {
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
+            tick_issue_audit: RefCell::new(TickIssueAudit::default()),
             device_auth: Rc::default(),
             device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
             device_auth_selftest_next: Rc::default(),
@@ -2398,6 +2455,24 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+
+    /// 번호는 틱마다 늘고, 스크립트 경로가 사이에서 번호를 써서 건너뛰는 것은 정상이다.
+    /// 낼 타일이 없는 틱(`None`)은 감시를 건드리지 않는다.
+    #[test]
+    fn tick_issue_audit_accepts_increasing_numbers_and_gaps() {
+        let mut audit = TickIssueAudit::default();
+        assert!(audit.record_tick(Some(3)).is_ok());
+        assert!(audit.record_tick(None).is_ok());
+        assert!(audit.record_tick(Some(7)).is_ok(), "건너뛰는 것은 정상이다");
+    }
+
+    #[test]
+    fn tick_issue_audit_rejects_a_repeated_or_backwards_number() {
+        let mut audit = TickIssueAudit::default();
+        assert!(audit.record_tick(Some(5)).is_ok());
+        assert!(audit.record_tick(Some(5)).is_err(), "되풀이");
+        assert!(audit.record_tick(Some(4)).is_err(), "되돌림");
+    }
 
     /// ★세 구성 모두에서 표출 틱이 refresh-driver 콜백을 쏜다.★ 한 구성이라도 자기
     /// 스레드가 쏘면 "콜백 → 생산 → 렌더" 가 한 틱 안의 순서가 아니라 ***두 시계의
