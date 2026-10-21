@@ -2321,7 +2321,14 @@ impl Paint {
             }
         }
 
-        if !kept_previous_painter_ids.is_empty() {
+        // ★무장은 ***벽이 둘 이상일 때만***★ -- 판정과 그 근거는
+        // `wall_tick::wall_frame_arms_keep_previous`(2026-10-22 Task 9.5). 한 타일짜리 벽에서
+        // 무장은 "그 타일의 렌더를 건너뛰라" 이고, 역압 거절의 원인이 바로 그 렌더가 아직
+        // 안 왔다는 것이라 원인을 영구화한다.
+        if crate::wall_tick::wall_frame_arms_keep_previous(
+            request.target_painter_ids.len(),
+            !kept_previous_painter_ids.is_empty(),
+        ) {
             self.wall_frame_coordinator
                 .borrow_mut()
                 .arm_keep_previous(logical_frame_id, &kept_previous_painter_ids);
@@ -2672,16 +2679,35 @@ impl Paint {
                 );
             },
             PaintMessage::GenerateFrame(_painter_ids) => {
-                // ★스크립트의 프레임 요청은 2026-10-21 부터 아무 일도 하지 않는다(규칙 2).★
+                // ★스크립트의 프레임 요청은 2026-10-21 부터 프레임을 내지 않는다(규칙 2).★
                 //
                 // 프레임의 구성 요소는 그 프레임의 생산 트리거가 될 수 없다. 스크립트가 올린
                 // 장면은 ***별개 전송***으로 이미 WR 에 가 있고(`PaintMessage::SendDisplayList`
                 // -> `handle_new_display_list`), 그것을 화면에 올리는 프레임은 다음 틱이
-                // 낸다(`Paint::on_wall_tick`). 그래서 이 메시지로 남는 일이 없다.
+                // 낸다(`Paint::on_wall_tick`).
                 //
                 // ★메시지 자체는 지우지 않는다.★ `script` 쪽 계약(렌더링 기회마다 보낸다)과
                 // WPT 를 건드리지 않고 벽의 생산만 일원화하는 것이 이 변경의 범위다.
                 // 설계 2-6: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
+                //
+                // ★2026-10-22 Task 9.5 — 여기는 "아무 일도 안 하는 자리" 가 아니라
+                // ***깨우기의 자리***다.★ 자유 실행 표출 클럭이 없는 임베더(servoshell /
+                // WPT / Android)는 틱 에지를 깨우기에서 받는다(설계 2-4). 그 임베더에서
+                // 이 메시지가 비트를 세우지 않으면 ***부트스트랩 한 장 뒤로 영영 프레임이
+                // 없다*** -- 2026-10-22 실측: 헤드리스 `-z -x -o` 스크린샷이
+                // `WALLBOOTSTRAP ... tick_frames_produced=0` 한 줄 뒤에 1024x740 순백을
+                // 저장했다.
+                //
+                // ★규칙 2 는 그대로다 -- 세우기만 하고 내지 않는다.★ 비트는 ***다음***
+                // 틱 에지의 생산 1 회를 예약할 뿐이고, 그 에지에서 집어 가 내는 것은
+                // `Paint::on_demand_wall_tick` 이다. 그래서 생산자는 여전히 틱 하나이고
+                // (규칙 1), 깨우기가 없는 조용한 페이지는 생산도 없다(불변식 16) --
+                // 스크립트는 `needs_frame()` 일 때만 이 메시지를 보낸다
+                // (`script_thread.rs` 의 `update_the_rendering`).
+                //
+                // 몇 번 와도 에지당 생산은 한 번이다(`swap(false)`). 자유 실행 클럭이 있는
+                // 구성(`winit_wall`)은 이 비트를 보지 않고 매 에지에 낸다.
+                crate::wall_tick::schedule_production_at_next_edge();
             },
             PaintMessage::GetWebViewPainterTargets(webview_id, sender) => {
                 let targets = self.painter_targets_for_webview(webview_id);

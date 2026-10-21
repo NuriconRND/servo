@@ -78,8 +78,19 @@ pub fn note_present_tick() {
 /// 클럭이 없는 임베더(servoshell / WPT / Android)의 깨우기가 부른다. 틱이 에지에서
 /// `Paint::on_demand_wall_tick` 으로 집어 가 생산한다. 몇 번 불러도 에지당 생산은 한 번이다.
 ///
-/// ★호출자는 `Painter::pump_paint_animation` 의 깨우기 동반자다★(2026-10-21 Task 7).
-/// 임베더 쪽 호출자(servoshell / WPT / Android 의 깨우기)는 아직 배선되지 않았다.
+/// ★이 ***공개*** 함수에는 아직 호출자가 없다★(2026-10-22 Task 9.5 확인). 같은 비트를
+/// 세우는 자리는 `paint` 안에 둘이고, 둘 다 크레이트 내부 함수
+/// (`wall_tick::schedule_production_at_next_edge`)를 직접 부른다:
+///
+/// - `Paint::handle_message` 의 `PaintMessage::GenerateFrame` — 스크립트가 새 디스플레이
+///   리스트를 올렸다는 신호(2026-10-22 Task 9.5).
+/// - `Painter::pump_paint_animation` 의 깨우기 동반자 — 페인트측 애니메이션·비디오
+///   (2026-10-21 Task 7).
+///
+/// 임베더가 ***직접*** 예약해야 할 깨우기(엔진 밖에서 오는 것)가 생기면 그때 이 문으로
+/// 들어온다. 그런 깨우기는 아직 없다 -- 지금 수요 구동 임베더(servoshell / WPT /
+/// Android)가 하는 일은 틱 에지를 내는 것뿐이고, 그 자리는
+/// `RunningAppState::spin_event_loop` 의 `on_demand_wall_tick` 이다.
 pub fn schedule_wall_production() {
     crate::wall_tick::schedule_production_at_next_edge();
 }

@@ -463,6 +463,9 @@ impl RunningAppState {
 
         self.servo.spin_event_loop();
 
+        // ★이 셸의 틱 지점 -- 이벤트 처리 뒤, 렌더 앞.★ 2026-10-22 Task 9.5, 설계 2-2/2-4.
+        self.on_demand_wall_tick();
+
         let windows_to_update: Vec<_> = self.windows.borrow().values().cloned().collect();
         let mut windows_to_repaint = Vec::new();
         for window in windows_to_update {
@@ -505,6 +508,64 @@ impl RunningAppState {
         }
 
         !self.exit_scheduled.get()
+    }
+
+    /// ★이 셸의 틱 에지 -- 벽 프레임을 내는 유일한 자리.★ 2026-10-22 Task 9.5.
+    ///
+    /// 자유 실행 표출 클럭이 없는 임베더가 전부 여기를 지난다: 데스크톱 servoshell
+    /// (`desktop/app.rs` 의 `pump_servo_event_loop`), WPT(= `--headless` servoshell,
+    /// `desktop/event_loop.rs` 의 `HeadlessEventLoop`), Android·OHOS(`egl/app.rs` 의
+    /// "Servo heartbeat"). 셋이 `RunningAppState::spin_event_loop` 하나를 공유하므로
+    /// ★배선도 한 자리면 된다★.
+    ///
+    /// ★깨우기가 예약한 에지에서만 생산한다.★ `WebView::on_demand_wall_tick` 이 예약
+    /// 비트를 `swap(false)` 로 가져가고, 참이었을 때만 `Paint::on_wall_tick`(구성 요소
+    /// 수집 -> 생산)으로 내려간다. 예약이 없으면 아무 일도 없다 -- 깨우기가 없는 조용한
+    /// 페이지는 생산도 없다(설계 불변식 16). 깨우기를 거는 자리는 `paint` 안에 둘이다:
+    /// 스크립트의 `PaintMessage::GenerateFrame`(= 새 디스플레이 리스트)과
+    /// `Painter::pump_paint_animation`(= 페인트측 애니메이션·비디오).
+    ///
+    /// ★`WebView` 는 문을 여는 손잡이일 뿐이다.★ 이 틱은 벽 전체에 하나이고
+    /// (`Paint::on_demand_wall_tick` 은 `Paint` 를 통째로 돈다), 고른 `WebView` 가 생산
+    /// 범위를 정하지 않는다. 그래서 ★한 번만 부른다★ -- 여럿을 돌면 첫 호출이 비트를
+    /// 가져가 나머지는 전부 `None` 이고, 그것은 틱이 여럿인 것처럼 보이는 거짓 그림이다.
+    ///
+    /// ★`gfx_single_frame_producer` 뒤에 두지 않는다.★ 그 pref 는 구 생산자 열한 곳이
+    /// 아직 살아 있던 중간 상태의 스위치였고(설계 4 절), 그 열한 곳은 2026-10-21 에
+    /// 사라졌다. 이 셸에는 대안 생산자가 없으므로 끄는 것은 폴백이 아니라 ***순백 화면***
+    /// 이다 -- 2026-10-22 실측(배선 전): `WALLBOOTSTRAP ... tick_frames_produced=0` 뒤에
+    /// 헤드리스 스크린샷이 1024x740 전면 `#FFFFFF`.
+    ///
+    /// ★`servo::note_present_tick()` 은 부르지 않는다.★ 이 셸의 `wall_tick::TICK_SEQ`
+    /// writer 는 `Paint::on_demand_wall_tick` 하나다. 둘 다 부르면 한 에지에 번호가 두 번
+    /// 올라 `ExternalPresentBudget` 의 "틱당 1 회" 천장이 깨진다.
+    fn on_demand_wall_tick(&self) {
+        let Some(webview) = self.any_webview() else {
+            return;
+        };
+        webview.on_demand_wall_tick();
+    }
+
+    /// 틱 문을 열 `WebView` 하나. ★어느 것이든 같다★ -- [`Self::on_demand_wall_tick`] 참고.
+    ///
+    /// 활성 `WebView` 를 먼저 보는 것은 ★스핀마다 Vec 을 만들지 않기 위해서다★ --
+    /// `ServoShellWindow::webviews()` 는 그 창의 `WebView` 를 전부 복제해 담는다. 활성이
+    /// 없는 창(띄운 직후, WebDriver)이 있을 수 있어 그 경우에만 그쪽으로 내려간다.
+    ///
+    /// `windows` 의 빌림은 이 함수가 돌려줄 때 끝난다 -- 틱은 painter 를 건드리므로 빌린
+    /// 채로 넘어가지 않는다.
+    fn any_webview(&self) -> Option<WebView> {
+        let windows = self.windows.borrow();
+        if let Some(active) = windows.values().find_map(|window| window.active_webview()) {
+            return Some(active);
+        }
+        windows.values().find_map(|window| {
+            window
+                .webviews()
+                .into_iter()
+                .next()
+                .map(|(_id, webview)| webview)
+        })
     }
 
     pub(crate) fn maybe_window_for_webview_id(
