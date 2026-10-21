@@ -4996,6 +4996,8 @@ impl FrameReasonCounts {
     }
 
     /// 창을 비우며 `(total, "<source>/<reason>=<n> ...")` 를 낸다. 많은 순.
+    /// ★`wall_pacer_join` 은 total 에서 뺀다★ — 목적이 "프레임을 받는 두 번째 문이 실제로 열리는가" 이지
+    /// 합성 수가 아니고, 넣으면 같은 프레임이 WR 쪽에서 또 세어져 "생산 지점이 하나인가" 판정이 망가진다.
     fn drain_report(&mut self) -> (u64, String) {
         let mut counts: Vec<((FrameSource, String), u64)> = self.counts.drain().collect();
         counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.1.cmp(&b.0.1)));
