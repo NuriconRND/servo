@@ -539,6 +539,18 @@ impl RunningAppState {
     /// ★`servo::note_present_tick()` 은 부르지 않는다.★ 이 셸의 `wall_tick::TICK_SEQ`
     /// writer 는 `Paint::on_demand_wall_tick` 하나다. 둘 다 부르면 한 에지에 번호가 두 번
     /// 올라 `ExternalPresentBudget` 의 "틱당 1 회" 천장이 깨진다.
+    ///
+    /// ★표출률 상한이 없다 -- 에지는 ***이벤트 루프의 스핀***이지 표출 클럭이 아니다.★
+    /// 헤드리스는 5ms condvar 폴링이고(`desktop/event_loop.rs`), 헤드는 애니메이션 중
+    /// `ControlFlow::Poll` 이라 둘 다 패널 주사율과 무관하다. 실측(2026-10-22, 60Hz 패널
+    /// + rAF 페이지): 초당 63~64 장. `winit_wall` 쪽 상한
+    /// (`gfx_refresh_hz` / vsync / 페이싱 스레드)에 해당하는 것이 이 셸에는 없다.
+    ///
+    /// ★지금은 그것이 폭주하지 않는다★ -- 실제 상한은 두 가지가 준다: 예약 비트가 에지당
+    /// 한 번만 소비되고(`swap(false)`), 깨우기를 내는 rAF 루프 자체가 렌더에 묶여 있다
+    /// (렌더 -> `notify_will_paint` -> rAF -> `GenerateFrame` -> 예약). 그리고 `renderer_behind`
+    /// 가 앞 프레임이 안 그려진 타일의 생산을 거절하므로 in-flight 는 한 장을 안 넘는다.
+    /// 상한을 두고 싶어지면 그것은 ★이 자리★ 이지 `Paint` 안이 아니다.
     fn on_demand_wall_tick(&self) {
         let Some(webview) = self.any_webview() else {
             return;

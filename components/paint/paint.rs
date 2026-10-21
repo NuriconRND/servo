@@ -1272,9 +1272,19 @@ impl WallFrameCoordinator {
     /// 세운 지시를 읽는 자리는 `keep_previous_logical_frame` 하나이고, 그것을 묻는 것은
     /// 임베더다(`winit_wall/main.rs` 의 `render_all_tiles`, servoshell `window.rs` 의
     /// `repaint_webviews`). `Some` 이면 그 타일의 `paint_target` 과 `present` 를 ★둘 다★
-    /// 건너뛴다. 나머지 네 자리(`complete_barrier`, `miss_barrier`,
-    /// `expire_keep_previous_before`, `release_keep_previous_while_production_is_suspended`)는
-    /// 전부 ***지우는*** 자리다.
+    /// 건너뛴다.
+    ///
+    /// ★무장 지점은 ***둘***이다 -- 이 함수가 유일하지 않다.★
+    ///
+    /// - 이 함수 -- 거절한 타일. 호출자에서 게이트 둘을 지난다(아래).
+    /// - `WallFrameCoordinator::miss_barrier` -- 배리어 마감(16ms)을 놓친 타일.
+    ///   ★`keep_previous_painters` 에 ***직접*** insert 하므로 이 함수를 지나지 않고,
+    ///   따라서 아래 게이트 둘도 지나지 않는다.★ 잔여 위험은 맨 아래.
+    ///
+    /// 나머지 세 자리(`complete_barrier`, `expire_keep_previous_before`,
+    /// `release_keep_previous_while_production_is_suspended`)는 ***지우기만*** 한다.
+    /// `miss_barrier` 는 ★지우기도 하고 걸기도 한다★ -- 그 프레임에 ready 였던 타일은
+    /// 지우고, 빠진 타일은 건다.
     ///
     /// ★배리어(`register_frame`)에는 넣지 않는다.★ 배리어가 기다리는 것은 frame-ready 이고
     /// 거절한 타일은 트랜잭션을 안 보냈으므로 그 신호를 영영 안 낸다 -- 넣으면 그 논리
@@ -1294,6 +1304,29 @@ impl WallFrameCoordinator {
     /// 호출자(`Paint::issue_wall_frame_request`)가 게이트 둘을 이미 지났다:
     /// `wall_tick::decline_may_arm_keep_previous`(자기잠금인 `RendererBehind` 제외)와
     /// `wall_tick::wall_frame_arms_keep_previous`(타일 하나짜리 벽 제외). 2026-10-22 Task 9.5.
+    ///
+    /// ## ★잔여 위험 -- `miss_barrier` 의 무게이트 무장★
+    ///
+    /// 위 게이트 둘은 ***이 함수를 지나는 무장에만*** 걸린다. `miss_barrier` 는 직접
+    /// insert 하므로 ★사유도 타일 수도 묻지 않는다★. 그래서 같은 닫힌 고리가 그쪽으로
+    /// 재현될 수 있다:
+    ///
+    /// ```text
+    /// 다중 타일 수요 구동 셸에서 ***전 타일***이 배리어 마감을 놓친다
+    ///   -> miss_barrier 가 전 타일을 무장 -> 셸이 전 타일의 렌더를 건너뛴다
+    ///   -> display_composite_in_flight 가 아무 데서도 안 풀린다
+    ///   -> 렌더가 없으니 rAF 도 `GenerateFrame` 도 없다 -> 예약도 틱도 없다
+    ///   -> 무장을 걷을 다음 벽 프레임이 영영 안 온다
+    /// ```
+    ///
+    /// 마감을 놓친 타일은 ***프레임을 냈지만 frame-ready 가 안 온*** 상태라
+    /// `RendererBehind` 와 같은 모양이다. 자유 실행 벽은 매 주기 틱이 돌아 다음 프레임이
+    /// 무장을 걷으므로 한 틱으로 끝나고, 수요 구동 셸에서도 타일 하나라도 마감을 지키면
+    /// 그 타일의 렌더가 고리를 푼다. ★전 타일 동시 미스에서만 닫힌다.★
+    ///
+    /// ★2026-10-22 Task 9.5 에서 거동은 바꾸지 않았다★ -- 배리어 의미를 건드리는 변경이고
+    /// 검증할 실기 벽이 없다(같은 이유로 설계 2-5 의 배리어 참여도 미구현으로 남겼다).
+    /// 여기서 재현되면 `miss_barrier` 의 insert 에도 같은 게이트 둘을 끼우면 된다.
     ///
     /// ★"표출한 적 있는가" 는 여기서 보지 않는다.★ 그 면제는
     /// `keep_previous_logical_frame` 한 곳에만 둔다(불변식 14). 무장 지점이 둘이 된 지금
@@ -2434,10 +2467,26 @@ impl Paint {
                 wall_frame_requested_at,
             );
         } else if request.target_painter_ids.len() > 1 {
-            debug!(
+            // ★`info!` 다 -- `debug!` 는 릴리스에서 컴파일 단계에 지워진다★(servoshell 의
+            // 기본 피처 `max_log_level` = `log/release_max_level_info`). 이 줄이 필드에서
+            // ***거절***과 ***무장***을 가르는 유일한 자리인데 정작 읽을 빌드에서 사라져
+            // 있었다. 2026-10-22 Task 9.5.
+            //
+            // ★두 집합은 다르다.★ `kept_previous` 는 이번 주기에 프레임을 못 낸 타일
+            // 전부이고, `armed` 는 그중 셸이 ***렌더까지 건너뛸*** 타일이다 -- 게이트 둘
+            // (`wall_tick::decline_may_arm_keep_previous`,
+            // `wall_tick::wall_frame_arms_keep_previous`)을 지난 부분집합이다. 역압으로
+            // 거절한 타일은 `kept_previous` 에 있고 `armed` 에는 없다.
+            //
+            // 빈도: 이 갈래는 ***다중 타일 벽이 한 장 이하를 냈을 때***만 돈다 -- 정상
+            // 운영에서는 안 나온다. 같은 함수의 fan-out 줄이 이미 매 벽 프레임 `info!` 다.
+            info!(
                 "Wall logical frame {logical_frame_id} barrier skipped: generated_targets={:?} \
-                 kept_previous_targets={:?} requested_targets={:?}",
-                generated_painter_ids, kept_previous_painter_ids, request.target_painter_ids
+                 kept_previous_targets={:?} armed_targets={:?} requested_targets={:?}",
+                generated_painter_ids,
+                kept_previous_painter_ids,
+                armable_painter_ids,
+                request.target_painter_ids
             );
         }
 
@@ -2866,6 +2915,39 @@ impl Paint {
                     });
                     inner_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
                 }
+                // ★이미지 도착도 깨우기다 -- 다음 틱 에지에 생산 1 회를 예약한다.★
+                // 2026-10-22 Task 9.5 2 차. 규칙 2 를 어기지 않는다: 비트를 세우는 것은
+                // 생산이 아니고(설계 2-4), 내는 것은 그 에지의 틱이다. 같은 모양의 깨우기가
+                // 이미 둘 있다 -- `PaintMessage::GenerateFrame` 과
+                // `Painter::pump_paint_animation`. ★구성 요소는 종을 울릴 수 있다. 방아쇠를
+                // 당길 수 없을 뿐이다.★ 새 이미지 데이터는 스크립트 쪽 `needs_frame()` 의
+                // `UpdatedImageData` 와 같은 신호이기도 하다.
+                //
+                // ★이것이 없으면 캔버스 페이지가 영구 정지한다.★ 닫힌 고리는 이렇다:
+                //
+                // ```text
+                // 스크립트가 캔버스 지연을 건다 -> 문서가 잠긴다(`script_thread.rs` 의
+                //   `waiting_on_canvas_image_updates()` 가 그 문서를 건너뛴다 = 더는
+                //   `GenerateFrame` 이 없다)
+                //   -> 예약돼 있던 틱이 발화 -> `KeepPrevious(WaitingOnCanvasImages)`
+                //   -> 프레임도 렌더도 없음
+                //   -> `release_owed_canvas_acks` 는 `pending_canvas_images > 0` 이라 못 푼다
+                //   -> ★예약 비트는 이미 소비됐다★(`swap(false)`)
+                //   -> 이미지가 여기 도착해 `pending_canvas_images` 를 비우지만 예약이 없다
+                //   -> 다시 올 틱이 없다 -> ack 가 영영 안 나가고 문서가 영영 잠긴다
+                // ```
+                //
+                // 실측(2026-10-22, servoshell `-z`, 주입·킬스위치 없음, 1000x700 캔버스 4 개를
+                // rAF 마다 다시 그리는 페이지): 이 줄이 없으면 10 초 동안 `FRAMEREASON` 0 줄
+                // (= 프레임 0), 있으면 초당 수십 장으로 계속 돈다.
+                //
+                // ★비디오도 같은 문에 걸려 있었다.★ 비디오 프레임 도착은 Task 7 이후 순수
+                // 적재이고(설계 2-6), 그 적재를 화면에 올리는 것은 틱이다. 수요 구동
+                // 임베더에서 이 예약이 없으면 그 틱이 안 와서 불변식 4 의 ***바닥***("비디오는
+                // 아예 없음이 아닌 페인트 박자")이 무너진다. 천장은 그대로 틱이 준다 --
+                // 비트는 에지당 한 번만 소비되므로 도착이 초당 1,080 번이어도 생산은 틱마다
+                // 한 장이다.
+                crate::wall_tick::schedule_production_at_next_edge();
                 IMAGE_UPDATE_STATS.with(|stats| {
                     let mut stats = stats.borrow_mut();
                     stats.calls += 1;

@@ -100,9 +100,16 @@ pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) 
 ///
 /// ## `RendererBehind` 에 무장하면 ★자기잠금★ 이다
 ///
-/// 그 사유의 조건은 `display_composite_in_flight` 이고, 그 깃발을 내리는 자리는
-/// ★`Painter::render` 의 끝 하나★ 다. 무장은 바로 그 렌더를 건너뛰게 하므로 ***무장이
-/// 자기 전제를 영구화한다***:
+/// 그 사유의 조건은 `display_composite_in_flight` 다. 그 깃발을 내리는 자리는 셋인데
+/// ★무장이 걸린 타일에서는 셋 다 안 돈다★:
+///
+/// 1. `Painter::render` 의 끝 -- ★무장이 막는 것이 바로 이 렌더다.★
+/// 2. `Painter::renderer_behind` 의 2 초 강제 해제 -- 거절 경로에서만 돌므로 ***다음
+///    틱***이 와야 한다.
+/// 3. `Painter::note_webrender_frame_ready` 의 `!need_repaint` 갈래 -- 이름대로 "뒤따를
+///    렌더가 없다" 일 때만이고, 무장 중에는 `need_repaint` 가 참인 프레임이 남아 있다.
+///
+/// 그래서 무장은 ***자기 전제를 영구화한다***:
 ///
 /// ```text
 /// 거절(renderer_behind) -> 무장 -> 셸이 렌더를 건너뜀 -> in_flight 가 안 내려감
@@ -197,11 +204,19 @@ pub(crate) fn wall_frame_arms_keep_previous(
 /// `screenshot` 이라는 낱말이 한 번도 안 나온다). 설계 2-8 과 8 절이 이 규칙의 검증으로
 /// `--capture` 를 지목한 것은 틀렸다.
 ///
-/// ★그래서 이 규칙에는 아직 살아 있는 실행자가 없다.★ `ScreenshotTaker` 로 들어오는 문은
-/// `Paint::request_screenshot` 하나이고, 그것을 부르는 것은 servoshell / WPT 쪽이다 --
-/// 그쪽에서 `gfx_single_frame_producer` 를 켜야 이 규칙이 실제로 발화한다. 벽에서 이
-/// 규칙이 도는지는 `WALLSHOTPAUSE` 로그 한 줄이 말해 주고, 그 줄이 ***안 나오는 것***이
-/// 정상이다.
+/// ★살아 있는 실행자가 생겼다 -- 2026-10-22 Task 9.5.★ `ScreenshotTaker` 로 들어오는 문은
+/// `Paint::request_screenshot` 하나이고 그것을 부르는 것은 servoshell / WPT 인데, 그 셸의
+/// 틱이 그날 배선됐다(`RunningAppState::spin_event_loop` 의 `on_demand_wall_tick`).
+/// ★`gfx_single_frame_producer` 와는 무관하다★ -- 그 셸의 틱은 의도적으로 pref 뒤에 두지
+/// 않았다(그쪽에는 대안 생산자가 없어 끄면 순백 화면이다). 그래서 이 규칙은 ***지금 매
+/// 스크린샷마다 발화한다***.
+///
+/// 실측(2026-10-22, 배선 당일): 헤드리스 `servoshell -z -x -o` 가 0.3 초에 정상 이미지를
+/// 저장했다 -- 이 규칙이 생산을 쉬게 하고, WR frame-ready 가 `pending_frames` 를 비우고,
+/// 렌더 끝의 `maybe_take_screenshots` 가 찍는 순서가 교착 없이 돌았다.
+///
+/// 벽(`winit_wall`)에서 이 규칙이 도는지는 `WALLSHOTPAUSE` 로그 한 줄이 말해 주고, 그
+/// 셸은 `ScreenshotTaker` 를 안 지나므로 그 줄이 ***안 나오는 것***이 정상이다.
 ///
 /// ★규칙 3 을 어기지 않는다.★ 이 질문은 프레임의 *내용* 이 아니라 ***외부 모드*** 를
 /// 묻는다 -- 생산자는 여전히 프레임에 무엇이 들었는지 모른다.
@@ -410,8 +425,9 @@ mod tests {
 
     /// ★역압 거절은 절대 무장하지 않는다 -- 무장이 자기 전제를 영구화한다.★
     ///
-    /// 무장이 막는 `Painter::render` 의 끝이 `display_composite_in_flight` 를 내리는
-    /// 유일한 자리다. 참으로 뒤집히면 자유 실행 벽에서 타일 하나가 2 초(강제 해제 주기)
+    /// `display_composite_in_flight` 를 내리는 자리 셋 중 무장한 타일에서 도는 것은
+    /// ***하나도 없다***(`decline_may_arm_keep_previous` 주석의 1·2·3). 참으로
+    /// 뒤집히면 자유 실행 벽에서 타일 하나가 2 초(강제 해제 주기)
     /// 멈추고, 수요 구동 임베더에서는 그 렌더가 다음 깨우기의 출처라 ***영구 정지***다
     /// (실측 2026-10-22: 논리 프레임이 3 에서 멈추고 skip 로그가 초당 63 회).
     #[test]
