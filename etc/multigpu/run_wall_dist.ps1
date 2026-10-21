@@ -1257,7 +1257,7 @@ if ($fr) {
     foreach ($m in $fr) {
         $totals += [int]$m.Matches[0].Groups[1].Value
         foreach ($part in ($m.Matches[0].Groups[2].Value -split ' ')) {
-            if ($part -match "^(painter\.rs:\d+/\S+)=(\d+)$") {
+            if ($part -match "^((?:painter\.rs:\d+|external_surface|wall_pacer_join)/\S+)=(\d+)$") {
                 $tally[$Matches[1]] = [int]$Matches[2] + $tally[$Matches[1]]
             }
         }
@@ -1269,6 +1269,12 @@ if ($fr) {
     foreach ($k in ($tally.Keys | Sort-Object { -$tally[$_] })) {
         Write-Host ("    {0,8:N1}/s  {1}" -f ($tally[$k] / [math]::Max($windows, 1)), $k)
     }
+    # 단일 생산자 판정: 구별 값이 정확히 둘 = WR 호출 지점 하나 + external_surface.
+    # wall_pacer_join 은 문이 열린 횟수라 출처로 세지 않는다(합성 total 에도 안 들어간다).
+    $srcs = @($tally.Keys | ForEach-Object { ($_ -split '/')[0] } | Where-Object { $_ -ne 'wall_pacer_join' } | Sort-Object -Unique)
+    $wrSrcs = @($srcs | Where-Object { $_ -like 'painter.rs:*' })
+    $verdict = if ($srcs.Count -eq 2 -and $wrSrcs.Count -eq 1 -and ($srcs -contains 'external_surface')) { "OK (one WebRender site + external_surface)" } else { "not yet two" }
+    Write-Host ("  distinct sources={0} (WebRender sites={1}, external_surface={2}, wall_pacer_join={3}) -- {4}" -f $srcs.Count, $wrSrcs.Count, [int]($srcs -contains 'external_surface'), [int]($tally.Keys | Where-Object { $_ -like 'wall_pacer_join/*' }).Count, $verdict)
 }
 
 # --- WEBGLFANOUT: is a spanning WebGL canvas paying for pixels or for the replay? ---

@@ -2126,6 +2126,13 @@ impl Paint {
 
             let total_released = self.wall_frame_pacing_released_count.get() + 1;
             self.wall_frame_pacing_released_count.set(total_released);
+            // ★coalesce 됐다 풀려 나가는 요청은 직접 낸 요청과 다른 문으로 나간다★ — 이어서
+            // WR 프레임이 되어 painter.rs 줄로도 세어지지만, 어느 쪽 문이었는지는 거기서 안 보인다.
+            if crate::painter::frame_reason_prof_enabled() {
+                if let Some(painter_id) = coalesced_request.request.target_painter_ids.first() {
+                    self.with_painter(*painter_id, |painter| painter.note_wall_pacer_join());
+                }
+            }
             let logical_frame_id = self.issue_wall_frame_request(coalesced_request.request.clone());
             debug!(
                 "Wall frame pacing released: webview={:?} logical_frame_id={:?} \

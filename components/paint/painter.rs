@@ -77,6 +77,11 @@ static FRAME_REASON_PROF: LazyLock<bool> = LazyLock::new(|| {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
+/// `Paint` 쪽 계수 지점이 꺼져 있을 때 `with_painter`(스레드 왕복)를 아예 안 하도록 묻는 자리.
+pub(crate) fn frame_reason_prof_enabled() -> bool {
+    *FRAME_REASON_PROF
+}
+
 static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
     debug_env::string(&debug_env::LOG_PRESENT_CADENCE)
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -316,7 +321,7 @@ pub(crate) struct Painter {
     /// ★낡음(2026-08-25 기록, 2026-09-02 `2f97f5190c2`·2026-09-09 `9eeb4f911ed` 이후 무효)★ — 11 곳이고, `present_external_only`(:4047)는 `generate_frame` 을 안 거쳐 이 집계에 아예 안 들어온다.
     /// 호출 지점의 줄 번호와 RenderReasons 문자열이다. 요청 경로가 9 곳이라, 초당 200
     /// 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
-    frame_reason_counts: RefCell<FxHashMap<(u32, String), u64>>,
+    frame_reason_counts: RefCell<FrameReasonCounts>,
     frame_reason_window_start: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
@@ -2751,6 +2756,15 @@ impl Painter {
     /// 기본 off(`SERVO_FRAME_REASON_PROF`). 프레임마다 불리는 자리라 켜져 있을 때만
     /// 해시맵을 건드린다.
     fn note_frame_reason(&self, caller: &'static Location<'static>, reason: RenderReasons) {
+        self.note_frame_source(
+            FrameSource::WebRender { line: caller.line() },
+            format!("{reason:?}"),
+        );
+    }
+
+    /// ★`generate_frame` 을 안 거치는 표출 경로의 자리다.★ `note_frame_reason` 과 같은 창·같은
+    /// 줄에 같은 `<source>/<reason>=<n>` 꼴로 들어간다(런처 파서가 그 꼴을 읽는다).
+    fn note_frame_source(&self, source: FrameSource, reason: String) {
         if !*FRAME_REASON_PROF {
             return;
         }
@@ -2762,30 +2776,25 @@ impl Painter {
                 now
             },
         };
-        *self
-            .frame_reason_counts
-            .borrow_mut()
-            .entry((caller.line(), format!("{reason:?}")))
-            .or_insert(0) += 1;
+        self.frame_reason_counts.borrow_mut().note(source, reason);
 
         let elapsed = now.duration_since(start);
         if elapsed < Duration::from_secs(1) {
             return;
         }
-        let mut counts: Vec<((u32, String), u64)> =
-            self.frame_reason_counts.borrow_mut().drain().collect();
-        counts.sort_by(|a, b| b.1.cmp(&a.1));
-        let total: u64 = counts.iter().map(|(_, n)| n).sum();
-        let breakdown = counts
-            .iter()
-            .map(|((line, reason), n)| format!("painter.rs:{line}/{reason}={n}"))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let (total, breakdown) = self.frame_reason_counts.borrow_mut().drain_report();
         info!(
             "FRAMEREASON total={total} window_ms={:.0} {breakdown}",
             elapsed.as_secs_f64() * 1000.0
         );
         self.frame_reason_window_start.set(Some(now));
+    }
+
+    /// 벽 페이서가 coalesce 해 두었던 요청을 풀어 낸 것을 센다(`wall_pacer_join`).
+    /// 풀린 요청은 이어서 `generate_frame_for_script` 로 WR 프레임이 되어 그쪽에서 또 세어지므로,
+    /// 이 값은 합성 총합(`total`)에 더하지 않는다 -- "두 번째 문" 이 열린 횟수만 보인다.
+    pub(crate) fn note_wall_pacer_join(&self) {
+        self.note_frame_source(FrameSource::WallPacerJoin, "RELEASE".to_string());
     }
 
     /// Queue a new frame in the transaction and increase the pending frames count.
@@ -4068,6 +4077,9 @@ impl Painter {
                         crate::dcomp_compositor::SharedDComp(shared.clone())
                             .present_external_only();
                         self.last_external_present.set(Some(now));
+                        // ★WR 프레임이 아니라 DComp 직행 commit 이다★ — `generate_frame` 을
+                        // 안 거쳐 FRAMEREASON 에 안 잡히던 경로(2026-10-21).
+                        self.note_frame_source(FrameSource::ExternalSurface, "PRESENT".to_string());
                     }
                 }
                 // 스로틀에 막혀 이번 호출에서 실제 present를 안 냈어도, 판정 자체는
@@ -4934,6 +4946,99 @@ mod script_frame_gate_tests {
             Some(PERIOD * 2 + Duration::from_millis(1)),
             PERIOD
         ));
+    }
+}
+
+/// 합성 한 번을 만든 출처. `FRAMEREASON` 줄에서 `<source>/<reason>=<n>` 의 `<source>` 자리다.
+///
+/// ★`WebRender` 만 줄 번호를 가진다.★ 나머지는 WR 프레임이 아니거나(`ExternalSurface`: DComp
+/// 직행 commit) 합성이 아니라 합류 자체다(`WallPacerJoin`). 줄 번호로 못 가르는 둘을 이름으로 가른다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum FrameSource {
+    WebRender { line: u32 },
+    ExternalSurface,
+    WallPacerJoin,
+}
+
+impl FrameSource {
+    /// 런처 파서(`run_wall_dist.ps1`)가 읽는 이름. `painter.rs:<line>` 꼴은 바꾸지 않는다.
+    fn label(&self) -> String {
+        match self {
+            FrameSource::WebRender { line } => format!("painter.rs:{line}"),
+            FrameSource::ExternalSurface => "external_surface".to_string(),
+            FrameSource::WallPacerJoin => "wall_pacer_join".to_string(),
+        }
+    }
+
+    /// 화면에 닿는 합성 하나로 세는가. 합류는 같은 프레임이 WR 쪽에서 또 세어지므로 아니다.
+    fn is_composite(&self) -> bool {
+        !matches!(self, FrameSource::WallPacerJoin)
+    }
+}
+
+/// `(출처, 이유)` 별 횟수. 창 하나(1초) 분량.
+#[derive(Default)]
+pub(crate) struct FrameReasonCounts {
+    counts: FxHashMap<(FrameSource, String), u64>,
+}
+
+impl FrameReasonCounts {
+    pub(crate) fn note(&mut self, source: FrameSource, reason: impl Into<String>) {
+        *self.counts.entry((source, reason.into())).or_insert(0) += 1;
+    }
+
+    /// 서로 다른 출처의 수(이유는 세지 않는다).
+    pub(crate) fn distinct_sources(&self) -> usize {
+        let mut sources: Vec<FrameSource> = self.counts.keys().map(|(s, _)| *s).collect();
+        sources.sort_by_key(|s| s.label());
+        sources.dedup();
+        sources.len()
+    }
+
+    /// 창을 비우며 `(total, "<source>/<reason>=<n> ...")` 를 낸다. 많은 순.
+    fn drain_report(&mut self) -> (u64, String) {
+        let mut counts: Vec<((FrameSource, String), u64)> = self.counts.drain().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.1.cmp(&b.0.1)));
+        let total = counts
+            .iter()
+            .filter(|((s, _), _)| s.is_composite())
+            .map(|(_, n)| n)
+            .sum();
+        let breakdown = counts
+            .iter()
+            .map(|((source, reason), n)| format!("{}/{reason}={n}", source.label()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (total, breakdown)
+    }
+}
+
+#[cfg(test)]
+mod frame_reason_source_tests {
+    use super::{FrameReasonCounts, FrameSource};
+
+    /// ★WR 호출 지점과 DComp 직행 표출은 둘로 센다.★ 전에는 후자가 집계에 아예 없어
+    /// "생산 지점이 하나" 가 거짓으로 나왔다.
+    #[test]
+    fn a_non_webrender_present_gets_its_own_reason_key() {
+        let mut counts = FrameReasonCounts::default();
+        counts.note(FrameSource::WebRender { line: 1565 }, "SCENE");
+        counts.note(FrameSource::ExternalSurface, "PRESENT");
+        assert_eq!(counts.distinct_sources(), 2);
+    }
+
+    /// ★런처 파서가 읽는 `<source>/<reason>=<n>` 꼴을 지킨다.★ 합류는 total 에 안 더한다.
+    #[test]
+    fn report_keeps_the_launcher_parsed_shape() {
+        let mut counts = FrameReasonCounts::default();
+        counts.note(FrameSource::WebRender { line: 3826 }, "SCENE");
+        counts.note(FrameSource::ExternalSurface, "PRESENT");
+        counts.note(FrameSource::WallPacerJoin, "RELEASE");
+        let (total, breakdown) = counts.drain_report();
+        assert_eq!(total, 2);
+        for part in ["painter.rs:3826/SCENE=1", "external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
+            assert!(breakdown.split(' ').any(|p| p == part), "{part} in {breakdown}");
+        }
     }
 }
 
