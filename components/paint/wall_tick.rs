@@ -20,24 +20,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 ///
 /// ★`KeepPrevious` 는 "아무 일도 안 했다" 가 아니다.★ 그 타일은 **직전 프레임을 그대로
 /// 유지하는 방식으로** 이 논리 프레임에 참여한다 -- 배리어에서 조용히 빠지면 화면에 프레임
-/// N 과 N-1 이 섞인다. 그 유지를 실제로 지시하는 배선은 Task 8 이 넣는다.
+/// N 과 N-1 이 섞인다. 그 유지를 실제로 지시하는 자리는
+/// `WallFrameCoordinator::arm_keep_previous` 다(2026-10-22 Task 8).
+/// ★분류하는 자리는 하나다 -- `issue_wall_frame_request` 의 `match`.★ 2026-10-22 Task 8
+/// 전에는 `generated()` 라는 술어가 그 일을 했는데, 거절한 타일도 갈 곳이 생기면서
+/// 참/거짓 하나로는 모자라게 됐다. 술어 대신 ★빠짐없는 `match`★ 를 쓰는 편이 그 메서드의
+/// 취지("변형이 늘면 한자리에서 정한다")를 더 강하게 지킨다 -- 변형을 더하면 분류가
+/// 조용히 한쪽으로 묶이지 않고 ***컴파일 오류***가 난다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TileOutcome {
-    /// 이 타일이 이번 논리 프레임의 합성을 냈다.
+    /// 이 타일이 이번 논리 프레임의 합성을 냈다. ★배리어가 기다리는 대상이다★ -- 이쪽만
+    /// frame-ready 를 낸다.
     Generated,
-    /// 이 타일은 이번 논리 프레임에 직전 프레임을 유지한다.
+    /// 이 타일은 이번 논리 프레임에 직전 프레임을 유지한다. ★배리어에 넣으면 안 된다★ --
+    /// 트랜잭션을 안 보냈으므로 ***오지 않을 frame-ready 를*** 기다리게 되고, 그 논리
+    /// 프레임이 마감까지 안 닫힌다.
     KeepPrevious,
-}
-
-impl TileOutcome {
-    /// 이 타일이 실제로 합성을 냈는가. ★배리어가 기다릴 대상을 고르는 자리에서 쓴다.★
-    ///
-    /// 유지한 타일을 "냈다" 로 세면 배리어가 ***오지 않을 frame-ready 를*** 기다리고,
-    /// 그 논리 프레임은 마감까지 안 닫힌다. 변형이 늘어날 때 무엇이 생산으로 세어지는지를
-    /// 한자리에서 정하려고 메서드로 둔다.
-    pub(crate) fn generated(self) -> bool {
-        matches!(self, TileOutcome::Generated)
-    }
 }
 
 /// 이 타일이 이번 틱에 합성을 낼 수 있는가.
@@ -257,14 +255,9 @@ mod tests {
         );
     }
 
-    /// ★배리어는 실제로 낸 타일만 기다린다.★ 유지한 타일을 생성 집합에 넣으면 배리어가
-    /// 오지 않을 frame-ready 를 기다리고 그 논리 프레임이 안 닫힌다.
-    #[test]
-    fn only_a_generated_tile_counts_as_produced() {
-        let counted: Vec<TileOutcome> = [TileOutcome::Generated, TileOutcome::KeepPrevious]
-            .into_iter()
-            .filter(|outcome| outcome.generated())
-            .collect();
-        assert_eq!(counted, vec![TileOutcome::Generated]);
-    }
+    // ★`only_a_generated_tile_counts_as_produced` 는 2026-10-22 Task 8 에서 삭제됐다.★
+    // 그 시험이 보던 `TileOutcome::generated()` 와 함께 사라졌다 -- 거절한 타일이
+    // `arm_keep_previous` 로 가게 되면서 분류가 참/거짓이 아니게 됐고, 분류는
+    // `issue_wall_frame_request` 의 빠짐없는 `match` 하나가 한다. 같은 규칙("배리어는
+    // 실제로 낸 타일만 기다린다")은 이제 시험이 아니라 ★컴파일러★ 가 지킨다.
 }

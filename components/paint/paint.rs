@@ -54,6 +54,7 @@ use webrender_api::{BuiltDisplayListDescriptor, FontInstanceKey, FontKey, ImageK
 
 use crate::InitialPaintState;
 use crate::painter::{FrameReadyDiagnostic, Painter, PainterInputs};
+use crate::wall_tick::TileOutcome;
 use crate::webview_renderer::UnknownWebView;
 
 /// How long the barrier waits for the remaining tiles after the first one is ready.
@@ -438,6 +439,10 @@ impl Drop for ThreadedPainter {
 struct WallFrameCoordinator {
     barriers: HashMap<u64, WallFrameBarrier>,
     active_webview_frames: HashMap<WebViewId, u64>,
+    /// "이 논리 프레임에는 직전 프레임을 유지하라" 는 타일별 지시. ★무장 지점은 둘이다★ --
+    /// `miss_barrier`(마감을 놓친 타일)와 `arm_keep_previous`(역압으로 거절한 타일,
+    /// 2026-10-22 Task 8). 지우는 쪽은 셋이다: `complete_barrier`, `miss_barrier` 의 준비된
+    /// 타일, 그리고 다음 벽 프레임의 `expire_keep_previous_before`.
     keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
     /// 한 번이라도 프레임을 화면에 낸 painter. ★"직전 프레임 유지" 는 직전 프레임이 있는
     /// 타일에게만 말이 된다★ -- 없는 타일에게 그러면 검은 타일이 된다
@@ -1159,6 +1164,13 @@ impl WallFrameCoordinator {
     ///
     /// Entries armed by the failure-injection path are left alone: that test exists to
     /// observe the skip, so consuming it here would defeat it.
+    ///
+    /// ★2026-10-22 Task 8 부터 만료는 드문 일이 아니다.★ 무장 지점이 둘이 됐고
+    /// (`miss_barrier`, `arm_keep_previous`), 그중 역압 거절은 무거운 타일에서 주기마다
+    /// 일어날 수 있다. 질의는 지시를 소비해도 **지우지 않으므로**(실패 주입 제외) 거절한
+    /// 타일의 지시는 거의 언제나 다음 벽 프레임의 이 자리에서 걷힌다 -- 그것이 역압 유지가
+    /// 한 프레임짜리임을 보장하는 자리다(불변식 14). 아래 경고문이 "배리어를 놓쳤다" 고
+    /// 단정하지 않는 이유다.
     fn expire_keep_previous_before(&mut self, logical_frame_id: u64, painter_ids: &[PainterId]) {
         for painter_id in painter_ids {
             let stale = self
@@ -1174,12 +1186,14 @@ impl WallFrameCoordinator {
             self.keep_previous_expired_count += 1;
             let total = self.keep_previous_expired_count;
             // Same rate-limit shape as the pacing summary: a tile that misses every barrier
-            // would otherwise warn once per wall frame.
+            // -- or declines on back-pressure every tick -- would otherwise warn once per
+            // wall frame.
             if total <= 3 || total % WALL_FRAME_PACING_INFO_INTERVAL == 0 {
                 warn!(
                     "Wall frame keep-previous expired: painter={:?} kept_for_logical_frame_id={} \
-                     superseded_by={} total_expired={}. The painter missed a barrier and would \
-                     otherwise have been skipped by the embedder for the rest of the session.",
+                     superseded_by={} total_expired={}. The painter did not generate that frame \
+                     (missed barrier, or declined on back-pressure) and would otherwise have \
+                     been skipped by the embedder for the rest of the session.",
                     painter_id,
                     previous
                         .map(|frame| frame.logical_frame_id)
@@ -1188,6 +1202,41 @@ impl WallFrameCoordinator {
                     total,
                 );
             }
+        }
+    }
+
+    /// 역압으로 거절한 타일을 ★이 논리 프레임의 keep-previous 참가자★ 로 세운다.
+    ///
+    /// ★거절은 "이 프레임에서 빠진다" 가 아니다.★ 조용히 빼면 그 주기의 벽 프레임이 전
+    /// 타일을 덮지 않고 화면에 프레임 N 인 타일과 N-1 인 타일이 섞인다(설계 2-5). 거절한
+    /// 타일은 직전 프레임을 유지하는 방식으로 같은 논리 프레임에 참여한다.
+    ///
+    /// ★배리어(`register_frame`)에는 넣지 않는다.★ 배리어가 기다리는 것은 frame-ready 이고
+    /// 거절한 타일은 트랜잭션을 안 보냈으므로 그 신호를 영영 안 낸다 -- 넣으면 그 논리
+    /// 프레임은 마감까지 안 닫힌다(`TileOutcome::generated` 주석).
+    ///
+    /// ★"표출한 적 있는가" 는 여기서 보지 않는다.★ 그 면제는
+    /// `keep_previous_logical_frame` 한 곳에만 둔다(불변식 14). 무장 지점이 둘이 된 지금
+    /// 면제를 복사하면 두 벌이 어긋날 수 있고, 질의가 어차피 모든 지시를 지난다.
+    ///
+    /// 실패 주입이 세워 둔 관찰용 지시는 건드리지 않는다 --
+    /// `expire_keep_previous_before` 와 같은 이유다(그 주석 마지막 문단).
+    fn arm_keep_previous(&mut self, logical_frame_id: u64, painter_ids: &[PainterId]) {
+        for painter_id in painter_ids {
+            if self
+                .keep_previous_painters
+                .get(painter_id)
+                .is_some_and(|frame| frame.remove_after_skip_query)
+            {
+                continue;
+            }
+            self.keep_previous_painters.insert(
+                *painter_id,
+                KeepPreviousFrame {
+                    logical_frame_id,
+                    remove_after_skip_query: false,
+                },
+            );
         }
     }
 
@@ -2086,18 +2135,31 @@ impl Paint {
             );
         }
 
+        // ★타일은 둘 중 하나로 이 논리 프레임에 참여한다 -- 생성 아니면 keep-previous.★
+        // 거절한 타일을 아무 데도 안 넣으면 그 타일만 전 주기의 내용을 들고 남아 화면에
+        // 프레임 N 과 N-1 이 섞인다(설계 2-5). 호스트가 없어진 타일(`None`)만 어느 쪽도
+        // 아니다 -- 유지할 화면 자체가 없다.
         let mut generated_painter_ids = Vec::new();
+        let mut kept_previous_painter_ids = Vec::new();
         for painter_id in &request.target_painter_ids {
-            let generated = self.with_painter_mut(*painter_id, move |painter| {
-                painter
-                    .generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
-                    .generated()
+            let outcome = self.with_painter_mut(*painter_id, move |painter| {
+                painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
             });
-            if generated == Some(true) {
-                generated_painter_ids.push(*painter_id);
+            match outcome {
+                Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
+                Some(TileOutcome::KeepPrevious) => kept_previous_painter_ids.push(*painter_id),
+                None => {},
             }
         }
 
+        if !kept_previous_painter_ids.is_empty() {
+            self.wall_frame_coordinator
+                .borrow_mut()
+                .arm_keep_previous(logical_frame_id, &kept_previous_painter_ids);
+        }
+
+        // ★배리어에는 ***생성한*** 타일만 넘긴다.★ 배리어가 기다리는 것은 frame-ready 이고,
+        // keep-previous 타일은 트랜잭션을 안 보냈으므로 그 신호를 안 낸다.
         if generated_painter_ids.len() > 1 {
             let mut last_wall_frame_issue_at = self.last_wall_frame_issue_at.borrow_mut();
             for webview_id in request.wall_webview_ids() {
@@ -2112,8 +2174,8 @@ impl Paint {
         } else if request.target_painter_ids.len() > 1 {
             debug!(
                 "Wall logical frame {logical_frame_id} barrier skipped: generated_targets={:?} \
-                 requested_targets={:?}",
-                generated_painter_ids, request.target_painter_ids
+                 kept_previous_targets={:?} requested_targets={:?}",
+                generated_painter_ids, kept_previous_painter_ids, request.target_painter_ids
             );
         }
 
@@ -3942,6 +4004,19 @@ mod wall_frame_keep_previous_tests {
         webrender_api::IdNamespace(index).into()
     }
 
+    /// 한 번 표출한 타일을 만든다.
+    ///
+    /// ★질의 자체가 "표출했다" 가 된다★ -- `None` 을 돌려준 타일은 호출자가 곧 그리기
+    /// 때문이다(`keep_previous_logical_frame` 주석). 그래서 이 모듈에서 "직전 프레임이 있는
+    /// 타일" 의 설정은 한 번 묻는 것이다.
+    fn has_presented(coordinator: &mut WallFrameCoordinator, painter_id: PainterId) {
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(painter_id),
+            None,
+            "setup: the first query must draw, which is what records 'has presented'"
+        );
+    }
+
     /// 배리어 하나를 열고 마감을 놓치게 한다. `late` 는 준비 신호를 내지 않은 타일이다.
     fn missed_barrier(
         coordinator: &mut WallFrameCoordinator,
@@ -4001,5 +4076,68 @@ mod wall_frame_keep_previous_tests {
     fn a_painter_with_no_instruction_just_draws() {
         let mut coordinator = WallFrameCoordinator::default();
         assert_eq!(coordinator.keep_previous_logical_frame(painter(1)), None);
+    }
+
+    /// 역압으로 거절한 타일은 그 논리 프레임에 keep-previous 로 **참여한다**.
+    ///
+    /// 배리어에서 조용히 빠지면 그 주기의 벽 프레임이 전 타일을 덮지 않고, 화면에 프레임
+    /// N 인 타일과 N-1 인 타일이 섞인다(설계 2-5). 거절은 "이 프레임에서 빠진다" 가 아니라
+    /// "직전 프레임을 유지하는 방식으로 이 프레임에 참여한다" 다.
+    #[test]
+    fn a_back_pressured_tile_joins_the_frame_as_keep_previous() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let busy = painter(2);
+        has_presented(&mut coordinator, busy);
+
+        coordinator.arm_keep_previous(7, &[busy]);
+
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(busy),
+            Some(7),
+            "a declined tile must hold frame 7, not drop out of it"
+        );
+    }
+
+    /// 역압 거절에도 불변식 14 가 그대로 선다 -- 한 번도 표출한 적 없는 타일은 유지 지시를
+    /// 받지 않는다.
+    ///
+    /// `a_painter_that_never_presented_is_not_told_to_keep_a_frame_it_does_not_have` 가
+    /// 배리어 실패 경로에서 같은 것을 못박는다. 역압은 ★그 경로를 안 지나는 두 번째 무장
+    /// 지점★ 이므로 여기서 따로 못박는다 -- 면제를 무장 자리에 복사하지 않고
+    /// `keep_previous_logical_frame` 한 곳에만 두기 때문에, 새 무장 지점이 그 한 곳을
+    /// 지나는지는 시험으로만 확인된다.
+    #[test]
+    fn a_back_pressured_tile_that_never_presented_is_not_held() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let never_presented = painter(3);
+
+        coordinator.arm_keep_previous(7, &[never_presented]);
+
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(never_presented),
+            None,
+            "a tile with nothing committed must draw, not hold a frame it never had"
+        );
+    }
+
+    /// 역압 유지는 ★지명된 그 논리 프레임에만★ 유효하다(불변식 14).
+    ///
+    /// 역압은 틱마다 다시 판정되므로, 한 번의 거절이 다음 주기까지 타일을 붙잡으면 그것이
+    /// `expire_keep_previous_before` 주석이 말하는 일방통행 문이 된다. 다음 벽 프레임이
+    /// 그 지시를 만료시키는지를 새 무장 경로에서 확인한다.
+    #[test]
+    fn a_back_pressure_hold_expires_with_the_next_wall_frame() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let busy = painter(2);
+        has_presented(&mut coordinator, busy);
+
+        coordinator.arm_keep_previous(7, &[busy]);
+        coordinator.expire_keep_previous_before(8, &[busy]);
+
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(busy),
+            None,
+            "a decline holds one logical frame, not every frame after it"
+        );
     }
 }

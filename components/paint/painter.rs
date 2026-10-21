@@ -407,6 +407,12 @@ pub(crate) struct Painter {
     /// **61 -> 72 프레임**으로 늘었고, 그 초과분이 애니메이션이 스스로 낸 프레임과 정확히
     /// 맞았다. ★지금 "남" 은 언제나 틱이다★ -- 틱이 주기마다 찍으므로 이 두 판정은
     /// 사실상 "이번 주기의 틱 프레임이 아직 렌더되지 않았나" 를 묻는다.
+    ///
+    /// ★되살아날 자리가 없다는 것을 2026-10-22 Task 8 이 한 번 더 못박는다.★ 롤백이 있던
+    /// 이유는 "자기가 낸 프레임을 남의 프레임으로 세면 안 된다" 였는데, 역압이 벽 단위
+    /// 결정이 된 지금 타일이 할 수 있는 일은 틱의 요구에 ***생성하거나 직전 프레임을
+    /// 유지하거나*** 둘뿐이다(`generate_frame_for_wall_tick`). 유지는 이 시각을 찍지
+    /// 않으므로, 뺄 "자기 프레임" 이 애초에 생기지 않는다.
     last_frame_by_other_source_at: Cell<Option<Instant>>,
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
@@ -3838,11 +3844,11 @@ impl Painter {
     ///    있던 `FrameDelayer::pending_frame` 은 Task 7 에서 필드째 사라졌다.
     /// 3. 둘을 `tile_may_generate` 에 넘겨 판정한다.
     ///
-    /// 돌려주는 `TileOutcome` 은 호출자가 이 타일을 배리어에 어떻게 넣을지 정하는 값이다.
-    /// 거절한 타일을 조용히 빼면 화면에 프레임 N 과 N-1 이 섞이므로, 그 타일은
-    /// `KeepPrevious` 로 같은 논리 프레임에 참여해야 한다 -- 지금은 `generated()` 가
-    /// 거짓인 타일이 배리어의 기대 집합에서 빠질 뿐이고, 유지를 실제로 지시하는 배선은
-    /// Task 8 이 넣는다.
+    /// 돌려주는 `TileOutcome` 은 호출자가 이 타일을 이번 논리 프레임에 ★어떻게 넣을지★ 를
+    /// 정하는 값이다. 거절한 타일을 조용히 빼면 화면에 프레임 N 과 N-1 이 섞이므로, 그
+    /// 타일은 `KeepPrevious` 로 같은 논리 프레임에 참여한다. 2026-10-22 Task 8 부터
+    /// `issue_wall_frame_request` 가 `Generated` 는 배리어에, `KeepPrevious` 는
+    /// `WallFrameCoordinator::arm_keep_previous` 에 넣는다 -- 어느 쪽도 아닌 갈래는 없다.
     ///
     /// 호출자는 `Paint::issue_wall_frame_request` 하나다.
     pub(crate) fn generate_frame_for_wall_tick(
