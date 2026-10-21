@@ -1288,19 +1288,28 @@ impl Painter {
             Instant::now().duration_since(at) >= crate::refresh_driver::paint_timer_period() * 4
         });
         if renderer_idle {
-            #[cfg(windows)]
-            crate::output_grid::note_pump_from_idle();
-            self.pump_paint_animation();
+            self.pump_paint_animation(PumpSource::Idle);
         }
     }
 
     /// 애니메이션 값을 뜨고 밀어 넣는다. ★한 번의 렌더에 정확히 한 번.★
     ///
-    /// ★낡음(2026-09-18 `ca080974d42` 기록, 같은 날 `79d8875effe` 이후 무효)★ — 호출은 `Painter::render` 의 **끝**(:2444)이다. 시작에서는 프레임이 안 난다(:2422).
-    /// 호출처는 둘이고 둘은 배타적이다: `Painter::render` 의 시작(렌더가 돌고 있을 때)과
-    /// `perform_updates`(렌더가 멈췄을 때). 안쪽의 `push_due` 게이트가 한 렌더에 두 번
-    /// 밀어 넣는 것을 다시 한 번 막는다.
-    pub(crate) fn pump_paint_animation(&mut self) {
+    /// ★낡음(2026-09-18 `ca080974d42` 기록, 같은 날 `79d8875effe` 이후 무효)★ — 호출은 `Painter::render` 의 **끝**이다. 시작에서는 프레임이 안 난다.
+    ///
+    /// ★호출처는 셋이고 배타적이지 않다★(2026-10-22 정정 -- 전에는 "둘이고 둘은 배타적"
+    /// 이라고 적혀 있었다). [`PumpSource`] 가 그 셋을 가른다:
+    ///
+    /// - `Render` -- `Painter::render` 의 끝. 렌더가 돌고 있을 때의 박자.
+    /// - `Idle` -- `perform_updates`. 렌더가 멈췄을 때의 폴백.
+    /// - `Tick` -- `Paint::gather_components`. ★위 둘과 배타적이지 않다★ -- 틱은 렌더가
+    ///   돌든 말든 매 에지에 전 painter 를 훑는다.
+    ///
+    /// 안쪽의 `push_due` 게이트가 한 렌더에 값을 두 번 밀어 넣는 것을 막으므로, 셋이
+    /// 겹쳐 불려도 ***값이 나가는 횟수***는 여전히 렌더당 한 번이다. 겹침이 실제로 문제가
+    /// 됐던 것은 값이 아니라 ★맨 아래의 생산 예약★ 이다 -- [`PumpSource::may_schedule`].
+    pub(crate) fn pump_paint_animation(&mut self, source: PumpSource) {
+        #[cfg(windows)]
+        source.note();
 
         // ***One transaction carries every dynamic property, because sending resets them
         // all.*** `reset_dynamic_properties` clears colors, floats and transforms
@@ -1574,7 +1583,13 @@ impl Painter {
             // 자유 실행 표출 클럭이 없는 임베더(servoshell / WPT / Android)에서 이 비트가
             // 없으면 `on_demand_wall_tick` 이 집어 갈 것이 없어 애니메이션과 비디오가 선다.
             // 자유 실행 클럭이 있는 구성은 이 비트를 보지 않고 매 주기 생산한다(설계 2-4).
-            crate::wall_tick::schedule_production_at_next_edge();
+            //
+            // ★단, 틱 자신이 부른 pump 는 예약하지 않는다 -- [`PumpSource::may_schedule`].★
+            // 그쪽은 생산의 ***구성 요소 수집 단계***이고, 거기서 다시 예약하면 틱 N 이
+            // 틱 N+1 을 되먹여 생산이 이벤트 루프의 폴링 속도로 돈다(규칙 2).
+            if source.may_schedule() {
+                crate::wall_tick::schedule_production_at_next_edge();
+            }
         }
         self.paint_animation_held_max
             .set(self.paint_animation_held_max.get().max(held_values));
@@ -2183,10 +2198,19 @@ impl Painter {
         // ★1 차가 아예 안 도는 구성이 아직 하나 남아 있다 -- 수요 구동 임베더의 조용한
         // 페이지다.★ servoshell / WPT / Android 는 깨우기가 에지를 예약해야 생산하므로
         // (`wall_tick::take_scheduled_edge`, 불변식 16), 깨우기가 없으면 틱이 돌아도
-        // `produce_wall_frame` 이 안 불리고 1 차 해제도 안 돈다. 그때 빚을 푸는 것은 이
-        // 복구뿐이다. 자유 실행 표출 클럭이 있는 셸(`winit_wall`)에서만 1 차가 매 주기
-        // 닿는다. (2026-10-22 전에는 그 셸에도 `gfx_single_frame_producer` off 라는
-        // ***틱 생산이 통째로 없는 구성***이 있었다. 그 pref 는 삭제됐다.)
+        // `produce_wall_frame` 이 안 불리고 1 차 해제도 안 돈다. 자유 실행 표출 클럭이 있는
+        // 셸(`winit_wall`)에서만 1 차가 매 주기 닿는다. (2026-10-22 전에는 그 셸에도
+        // `gfx_single_frame_producer` off 라는 ***틱 생산이 통째로 없는 구성***이 있었다.
+        // 그 pref 는 삭제됐다.)
+        //
+        // ★다만 그 고리를 푸는 것은 이 복구가 ***아니다*** -- 2026-10-22 전수 리뷰에서
+        // 바로잡았다.★ 이 함수의 호출자는 `Painter::render` 하나이고, 조용한 수요 구동
+        // 페이지에는 ***그 렌더도 없다***. 그러니 "그때 빚을 푸는 것은 이 복구뿐" 은 거짓
+        // 이었다. 실제로 고리를 끊는 것은 ★`PaintMessage::UpdateImages` 가 거는 예약★ 이다
+        // (`Paint::handle_message`): 이미지가 도착하면 다음 틱 에지가 예약되고, 그 틱의
+        // `release_owed_canvas_acks` 가 빚을 푼다. 그 줄의 주석에 닫힌 고리 전문과 실측
+        // (이 줄이 없으면 10 초 동안 프레임 0)이 있다. 이 복구는 ***렌더가 도는*** 타일의
+        // 2 차 그물이다.
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -2554,8 +2578,6 @@ impl Painter {
         // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
         // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
-        #[cfg(windows)]
-        crate::output_grid::note_pump_from_render();
         // ★이 렌더가 벽 프레임 번호를 달고 왔나.★ 대부분이 안 달고 온다면 이 경로는 벽
         // 프레임 조정(네 타일을 같은 프레임에 묶는 배리어) 밖에서 도는 것이고, 그것이
         // 샘플 시각보다 먼저 확인해야 할 사실이다(`output_grid::FRAME_IDS` 주석).
@@ -2564,7 +2586,7 @@ impl Painter {
             &format!("{:?}", self.painter_id),
             self.last_ready_wall_logical_frame_id.get(),
         );
-        self.pump_paint_animation();
+        self.pump_paint_animation(PumpSource::Render);
         if *LOG_PRESENT_CADENCE {
             self.last_render_end.set(Some(Instant::now()));
         }
@@ -4134,12 +4156,20 @@ impl Painter {
                 //
                 // 여기 있던 것은 직전 fast-present 에서 14ms 라는 자기 스로틀이었다. 그
                 // 상수는 표출 주기와 아무 관계가 없어서 120Hz 벽(주기 8.33ms)에서는 한 틱
-                // 걸러 한 번만 통과했다. 틱 번호로 바꾸면 천장("틱당 한 번")과 바닥("매 틱
-                // 한 번")이 같은 값이 되고, 원래 요구 -- fast-path 는 WR 빌드와 무관하므로
-                // WR 이 바쁠 때에도 발동해야 한다 -- 는 그대로 선다(틱은 WR 의 바쁨과
-                // 무관하게 매 주기 돈다). dedup(`external_needs_present`)이 프레임이 안
-                // 바뀐 비디오를 이미 걸러 주므로, 이 틱의 present 가 그 시점의 최신
-                // 프레임을 반영한다.
+                // 걸러 한 번만 통과했다. 틱 번호로 바꾸면 그 상수가 사라지고, 원래 요구 --
+                // fast-path 는 WR 빌드와 무관하므로 WR 이 바쁠 때에도 발동해야 한다 -- 는
+                // 그대로 선다(틱은 WR 의 바쁨과 무관하게 매 주기 돈다).
+                // dedup(`external_needs_present`)이 프레임이 안 바뀐 비디오를 이미 걸러
+                // 주므로, 이 틱의 present 가 그 시점의 최신 프레임을 반영한다.
+                //
+                // ★예산은 천장만 준다 -- 바닥은 없다.★ 2026-10-22 전수 리뷰에서 바로잡았다.
+                // 이 블록은 `update_images` 안, 즉 ***외부 서피스가 도착했을 때***만 돈다.
+                // 도착이 없는 틱에는 `take` 조차 안 불리므로 "매 틱 한 번" 은 성립하지
+                // 않는다. 설계 7 절이 요구한 ★틱 소유로의 이관★ 은 ***하지 않았다*** --
+                // 착지한 것은 도착 구동 호출의 틱 단위 속도 제한이다. 그 차이를 좁히는 것은
+                // DComp commit 경로의 거동 변경이고, 이 저장소에는 commit 이 렌더 스레드로
+                // 새면 저더가 난다는 실측이 있어 실기 벽 없이는 못 잰다.
+                // 근거 한 벌은 `wall_tick::ExternalPresentBudget` 주석에 있다.
                 let due = self
                     .external_present_budget
                     .borrow_mut()
@@ -4946,6 +4976,69 @@ pub(crate) fn format_step_sequence(samples: &[f64]) -> String {
 /// 나란히 읽으면 "요약이 무엇을 묻었나" 가 바로 드러난다.
 pub(crate) static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
     LazyLock::new(|| std::env::var("SERVO_LOG_ANIM_STEP_SEQ").is_ok_and(|value| value != "0"));
+
+/// [`Painter::pump_paint_animation`] 을 부른 자리. ★2026-10-22 에 셋이 됐고, 셋은 서로
+/// 배타적이지 않다★ -- 그 전까지 코드 주석 두 곳이 "호출 지점은 둘뿐이고 배타적" 이라고
+/// 적고 있었다(`pump_paint_animation`, `output_grid::PUMP_FROM_RENDER`).
+///
+/// 이 enum 이 실제로 가르는 것은 하나다: ★이 pump 가 다음 틱 에지에 생산을 예약해도
+/// 되는가★([`PumpSource::may_schedule`]). 계수기는 덤이다.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PumpSource {
+    /// `Painter::render` 의 끝. ★렌더가 도는 동안의 정규 박자.★ 렌더당 정확히 한 번이고,
+    /// 그래서 여기서 거는 예약이 ***생산 한 번당 예약 한 번*** 이 된다.
+    Render,
+    /// `Painter::perform_updates` -- 렌더가 네 주기 동안 없었을 때의 폴백. 움직이는 것이
+    /// 페인트측 애니메이션뿐인 화면에서 첫 프레임을 만드는 자리다.
+    Idle,
+    /// `Paint::gather_components` -- ★틱의 구성 요소 수집 단계.★ 위 둘과 배타적이지 않고,
+    /// 렌더가 돌든 말든 틱 에지마다 전 painter 를 훑는다.
+    Tick,
+}
+
+impl PumpSource {
+    /// 이 자리의 pump 가 ★다음 틱 에지에 생산 1 회를 예약해도 되는가.★ 2026-10-22.
+    ///
+    /// ★`Tick` 만 거짓이다 -- 규칙 2 가 금지하는 되먹임이기 때문이다.★ `gather_components`
+    /// 는 ***생산의 구성 요소 수집 단계***다. 거기서 다시 예약하면 틱 N 이 틱 N+1 을
+    /// 되먹이고, 그 고리에는 박자를 주는 것이 아무것도 없다 -- 예약 비트는 세워지자마자
+    /// 다음 스핀이 집어 가므로 생산이 ★이벤트 루프의 폴링 속도★ 로 돈다. 헤드 servoshell 은
+    /// 애니메이션 중 `ControlFlow::Poll` 이라 그 속도에 상한이 없다.
+    ///
+    /// ★실측(2026-10-22, headed servoshell, CSS `transform` 애니메이션 한 개, 20 초)★:
+    /// 고치기 전 `WALLTICKRATE edges≈produced≈13,000/s`(최대 21,568/s) 대 WR 합성 60/s --
+    /// 논리 프레임이 합성보다 ★220 배★ 앞서 달렸다. 설계 8 절의
+    /// `FRAMEID distinct_ids / renders ≈ 1.0` 가 이 셸에서 무의미해지는 것이 그 값이다.
+    /// fps 로는 안 보인다 -- `renderer_behind` 거절이 WR 프레임을 60 으로 묶어 주기 때문에,
+    /// 남는 증상은 메인 스레드 CPU 와 틱마다 태우는 `next_logical_frame_id` 뿐이다.
+    ///
+    /// ★그래도 애니메이션은 선다 -- 불변식 16 의 양쪽이 다 산다.★ 예약을 거는 자리가
+    /// 없어지는 것이 아니라 ***하나로 줄 뿐***이다:
+    ///
+    /// - 애니메이션이 도는 페이지: `Render` pump 가 렌더당 한 번 예약한다. 고리는
+    ///   `예약 -> 틱 생산 -> 렌더 -> Render pump -> 예약` 이고, 박자는 렌더 클럭이다 --
+    ///   값 표본(`push_due`)이 이미 쓰는 바로 그 클럭이라 둘이 같은 위상으로 돈다.
+    /// - 렌더가 멎은 화면: `Idle` pump 가 네 주기(≈67ms) 뒤에 받아 첫 프레임을 만든다.
+    /// - 조용한 페이지: `still_animating` 도 `video_pending` 도 거짓이라 셋 다 예약하지
+    ///   않는다 -- ★생산 없음★ 이 그대로 선다.
+    ///
+    /// ★대안(틱 쪽에 최소 간격 게이트)을 택하지 않은 이유★: 그것은 폴링 속도를 숫자 하나로
+    /// 덮을 뿐 되먹임 고리를 남긴다. 상한을 새로 고르는 일이기도 하다 -- 이 계획이 다섯 개를
+    /// 걷어낸 바로 그 종류의 상수다. 고리를 끊으면 박자는 이미 있는 렌더 클럭이 준다.
+    pub(crate) fn may_schedule(self) -> bool {
+        !matches!(self, PumpSource::Tick)
+    }
+
+    /// `SAMPLESLIP` 의 `pump_all` 계수기에 한 번 센다.
+    #[cfg(windows)]
+    fn note(self) {
+        match self {
+            PumpSource::Render => crate::output_grid::note_pump_from_render(),
+            PumpSource::Idle => crate::output_grid::note_pump_from_idle(),
+            PumpSource::Tick => crate::output_grid::note_pump_from_tick(),
+        }
+    }
+}
 
 /// 합성 한 번을 만든 출처. `FRAMEREASON` 줄에서 `<source>/<reason>=<n>` 의 `<source>` 자리다.
 ///

@@ -521,9 +521,13 @@ impl RunningAppState {
     /// ★깨우기가 예약한 에지에서만 생산한다.★ `WebView::on_demand_wall_tick` 이 예약
     /// 비트를 `swap(false)` 로 가져가고, 참이었을 때만 `Paint::on_wall_tick`(구성 요소
     /// 수집 -> 생산)으로 내려간다. 예약이 없으면 아무 일도 없다 -- 깨우기가 없는 조용한
-    /// 페이지는 생산도 없다(설계 불변식 16). 깨우기를 거는 자리는 `paint` 안에 둘이다:
-    /// 스크립트의 `PaintMessage::GenerateFrame`(= 새 디스플레이 리스트)과
-    /// `Painter::pump_paint_animation`(= 페인트측 애니메이션·비디오).
+    /// 페이지는 생산도 없다(설계 불변식 16). 예약을 거는 자리는 `paint` 안에 셋이다:
+    /// 스크립트의 `PaintMessage::GenerateFrame`(= 새 디스플레이 리스트),
+    /// `PaintMessage::UpdateImages`(= 캔버스·비디오 이미지가 WR 에 닿았다),
+    /// `Painter::pump_paint_animation`(= 페인트측 애니메이션·비디오). ★셋째는 렌더 끝과
+    /// 유휴 폴백에서 부른 것만이다★ -- 틱 자신의 구성 요소 수집(`PumpSource::Tick`)은
+    /// 예약하지 않는다. 걸면 틱 N 이 틱 N+1 을 되먹여 생산이 이 루프의 폴링 속도로 돈다
+    /// (2026-10-22 실측: 초당 13,000 논리 프레임 대 WR 합성 60).
     ///
     /// ★`WebView` 는 문을 여는 손잡이일 뿐이다.★ 이 틱은 벽 전체에 하나이고
     /// (`Paint::on_demand_wall_tick` 은 `Paint` 를 통째로 돈다), 고른 `WebView` 가 생산
@@ -547,11 +551,25 @@ impl RunningAppState {
     /// + rAF 페이지): 초당 63~64 장. `winit_wall` 쪽 상한
     /// (`gfx_refresh_hz` / vsync / 페이싱 스레드)에 해당하는 것이 이 셸에는 없다.
     ///
-    /// ★지금은 그것이 폭주하지 않는다★ -- 실제 상한은 두 가지가 준다: 예약 비트가 에지당
-    /// 한 번만 소비되고(`swap(false)`), 깨우기를 내는 rAF 루프 자체가 렌더에 묶여 있다
-    /// (렌더 -> `notify_will_paint` -> rAF -> `GenerateFrame` -> 예약). 그리고 `renderer_behind`
-    /// 가 앞 프레임이 안 그려진 타일의 생산을 거절하므로 in-flight 는 한 장을 안 넘는다.
-    /// 상한을 두고 싶어지면 그것은 ★이 자리★ 이지 `Paint` 안이 아니다.
+    /// ★그래도 폭주하지 않는다 -- 다만 이 주장은 한 번 거짓이었다.★ 상한을 주는 것은
+    /// 예약 비트가 에지당 한 번만 소비되는 것(`swap(false)`)과, ★그 비트를 다시 세우는
+    /// 것이 전부 렌더에 묶여 있다★ 는 사실이다: rAF 는 렌더 -> `notify_will_paint` ->
+    /// rAF -> `GenerateFrame` -> 예약이고, 페인트측 애니메이션은 렌더 끝의
+    /// `pump_paint_animation`(`PumpSource::Render`)이다. 그리고 `renderer_behind` 가 앞
+    /// 프레임이 안 그려진 타일의 생산을 거절하므로 in-flight 는 한 장을 안 넘는다.
+    ///
+    /// ★2026-10-22 전수 리뷰 전까지는 그 "전부" 가 참이 아니었다.★ 틱 자신의 구성 요소
+    /// 수집(`Paint::gather_components` -> `pump_paint_animation`)이 다음 에지를 다시
+    /// 예약해서, 페인트측 CSS 애니메이션이 도는 페이지에서는 ***틱 N 이 틱 N+1 을
+    /// 되먹였다***. 실측(headed servoshell, `transform` 애니메이션 한 개, 20 초):
+    /// 논리 프레임 초당 13,000(최대 21,568) 대 WR 합성 60. WR 프레임은 `renderer_behind`
+    /// 가 묶어 주어 fps 로는 안 보였고, 남는 증상이 메인 스레드 CPU 와
+    /// `next_logical_frame_id` 소각이었다. `PumpSource::Tick` 이 그 되먹임을 끊었고, 같은
+    /// 측정이 초당 60 으로 돌아왔다. 진단 줄은 `WALLTICKRATE`(`Paint::note_demand_tick`).
+    ///
+    /// 상한(최소 간격 게이트)을 두고 싶어지면 그것은 ★이 자리★ 이지 `Paint` 안이 아니다.
+    /// 다만 2026-10-22 에는 두지 않았다 -- 되먹임을 끊는 쪽이 상한 상수를 새로 고르는
+    /// 것보다 낫고, 끊고 나면 박자는 이미 있는 렌더 클럭이 준다.
     fn on_demand_wall_tick(&self) {
         let Some(webview) = self.any_webview() else {
             return;

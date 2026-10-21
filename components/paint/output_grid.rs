@@ -284,10 +284,14 @@ static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
 /// `same` 476(같은 주기에 두 번)과 `jumpN` 248(세 주기 이상 거름)이 그 모양이고,
 /// 초당 호출이 64.4 회인데 렌더는 61 회다.
 ///
-/// 호출 지점은 둘뿐이라 세면 바로 갈린다: 렌더 끝(`Painter::render`)과 렌더가 멈췄을 때의
-/// 폴백(`perform_updates`).
+/// ★호출 지점은 셋이다 -- 2026-10-22 정정★(전에는 "둘뿐이라" 라고 적혀 있었고, 그동안
+/// 세 번째가 ***안 세어지고 있었다***). 렌더 끝(`Painter::render`), 렌더가 멈췄을 때의
+/// 폴백(`Painter::perform_updates`), 그리고 틱의 구성 요소 수집
+/// (`Paint::gather_components`). 분류는 `painter::PumpSource` 가 하고, 셋은 서로
+/// 배타적이지 않다 -- 틱은 렌더가 돌든 말든 매 에지에 전 painter 를 훑는다.
 static PUMP_FROM_RENDER: AtomicU64 = AtomicU64::new(0);
 static PUMP_FROM_IDLE: AtomicU64 = AtomicU64::new(0);
+static PUMP_FROM_TICK: AtomicU64 = AtomicU64::new(0);
 
 /// 페인터 -> (렌더 수, 벽 프레임 번호를 달고 온 수, 본 번호들).
 ///
@@ -346,6 +350,10 @@ pub(crate) fn note_pump_from_render() {
 
 pub(crate) fn note_pump_from_idle() {
     PUMP_FROM_IDLE.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_pump_from_tick() {
+    PUMP_FROM_TICK.fetch_add(1, Ordering::Relaxed);
 }
 
 /// ★슬립이 **언제** 일어나는지 찍는다.★
@@ -455,6 +463,7 @@ fn period_ms_for_log() -> f64 {
 fn emit_sampleslip() {
     let from_render = PUMP_FROM_RENDER.swap(0, Ordering::Relaxed);
     let from_idle = PUMP_FROM_IDLE.swap(0, Ordering::Relaxed);
+    let from_tick = PUMP_FROM_TICK.swap(0, Ordering::Relaxed);
     let tallies: Vec<(usize, SlipTally)> = match SLIPS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map
@@ -485,7 +494,7 @@ fn emit_sampleslip() {
              residue_all_ms p05={:.2} p50={:.2} p95={:.2} \
              residue_slip_ms p05={:.2} p50={:.2} p95={:.2} period_ms={:.3} \
              grid_back={} grid_back_ms p50={:.3} max={:.3} grid_leap={} \
-             pump_all from_render={from_render} from_idle={from_idle}",
+             pump_all from_render={from_render} from_idle={from_idle} from_tick={from_tick}",
             tally.n,
             tally.same,
             tally.jump2,

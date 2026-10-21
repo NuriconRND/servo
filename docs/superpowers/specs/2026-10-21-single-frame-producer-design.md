@@ -118,11 +118,18 @@ tick edge:                                   ← 유일한 생산자. 내용물�
 생산도 없어 불변식 16 의 조용한 창이 생긴다. ★구 구조로 되돌아가는 런타임 전환은 없다★ —
 되돌아갈 다중 생산자 레짐 자체를 남기지 않으므로 초고의 staleness 폴백 조항은 삭제한다.
 
-구성별로 콜백을 누가 쏘는지는 다르다. `pacing_fire` 는 `FrameClock::Pacing` 일 때만
-`Some` 이고(`main.rs:1419-1421`, `:334`, `:1790-1803`), 나머지 둘은 `PaintTimerThread` 나
-DwmFlush 스레드가 자기 클럭으로 쏜다. ★그 셋을 한 손잡이로 모으는 것이 2 단계 작업에
-포함된다★ — 모으지 않으면 "콜백 → 생산 → 렌더" 가 한 틱 안의 순서가 아니라 두 클럭의
-경합이 되고, 그것이 8 절이 실패로 세는 "두 시계 맥놀이" 다.
+구성별로 콜백을 누가 쏘는지가 달랐다 -- `pacing_fire` 는 `FrameClock::Pacing` 일 때만
+`Some` 이었고 나머지 둘은 `PaintTimerThread` 나 DwmFlush 스레드가 자기 클럭으로 쐈다.
+모으지 않으면 "콜백 → 생산 → 렌더" 가 한 틱 안의 순서가 아니라 두 클럭의 경합이 되고,
+그것이 8 절이 실패로 세는 "두 시계 맥놀이" 다.
+
+★2026-10-21 `9b6cd8dfcf3` 에서 셋 다 틱이 쏘도록 모았다(계획 Task 3).★ 그때 드러난 것이
+하나 있다 -- 콜백을 틱으로 옮기면 `PaintTimerThread` 가 프레임 경로에서 빠지고, 그러면
+***기본 구성(`FrameClock::Timer`)에서 이벤트 루프를 깨울 것이 하나도 없어진다***. rAF 만
+도는 페이지가 영구 정지한다. 그래서 `embedder_traits::RefreshDriver` 에 기본값 거짓인
+`needs_paint_timer_heartbeat` 를 두고, 참인 구성에서만 같은 타이머 스레드가 같은 주기·같은
+절대 격자로 ★깨우기만★ 낸다. ***틱이 언제 나는지는 바뀌지 않는다*** -- 깨우기는 생산이
+아니다(규칙 2).
 
 ★`gfx_wall_direct_render` 기본값도 `false` 다★(`prefs.rs:1279`). 그 경로에서
 `fire_present_tick` 은 `render_all_tiles` 를 부르지 않고 `request_redraw` 만 한다
@@ -231,16 +238,16 @@ generate_frame_for_wall_tick(logical_frame_id, requested_at) -> TileOutcome
 | 1 | ★영구★ 거절 경로는 캔버스 ack 를 해제해야 한다 | ★2-7★ — 해제를 생산에서 떼어 틱마다 조건부로 돌린다. 네 지점 각각 처분됨 |
 | 2 | `display_composite_in_flight` 강제 해제는 계속 묻는 호출자의 거절 경로에서 | ★2-5★ — 틱 전용 진입점이 `renderer_behind()` 를 ***무조건 먼저*** 부른다. 단일 writer·에지 타임스탬프 규칙(`:3244-3258`) 그대로 |
 | 3 | 모든 합성이 비디오 스태시를 flush, 도착은 적재 | 공유 에필로그가 보장. 빈 트랜잭션 생략(`:4097-4104`)도 유지 |
-| 4 | 비디오는 도착당 하나도 아예 없음도 아닌 페인트 박자 | 틱이 천장과 바닥을 동시에 준다. ★2-4 로 모든 임베더에서★ — 깨우기가 에지를 예약하므로 "틱이 없는 곳" 이 없다 |
+| 4 | 비디오는 도착당 하나도 아예 없음도 아닌 페인트 박자 | 틱이 천장과 바닥을 동시에 준다. ★2-4 로 모든 임베더에서★ — 깨우기가 에지를 예약하므로 "틱이 없는 곳" 이 없다. ★2026-10-22 확정된 구멍 둘★: (a) 외부 서피스 fast-path 에는 바닥이 없다 — 7 절의 인용 블록, (b) 캔버스 대기 타일은 ***틱 전체를*** 거절하므로 승격되지 않은 비디오의 바닥도 같이 빠진다 — `wall_tick::tile_may_generate` 주석 |
 | 5 | ack 복구는 생산이 멎어도 도는 자리에서 | ★2-7★ — 렌더가 아니라 틱에 붙인다. `direct_render=false` 와 keep-previous 타일 모두 커버 |
 | 6 | `pending_frames` ↔ `anim_ready_queue` 1:1 | 공유 에필로그가 ***무조건*** 둘 다 올린다(`:2814-2821`) — 초고가 "토큰 없이 올리는 경로가 있다" 고 쓴 것은 틀렸다. ★2-6 이 writer 를 틱 하나로 못박는다★ |
 | 7 | 값 표본은 렌더 클럭이 몰고 패스당 한 번, 타이머 폴백은 렌더 정지 전용 | 표본은 `pump_paint_animation` 자리에 둔다. 틱이 더는 그 자리에서 ***생성하지 않으므로*** `painter_busy` 억제가 표본을 막지 않는다 — `:2415-2435` 의 15.2fps 회귀는 생성과 묶였을 때의 것이다 |
 | 8 | 한 트랜잭션이 모든 동적 속성 + 끝난 애니메이션 값 재첨부 | `gather_components()` 가 독립 단계로 합집합을 합성 ***전에*** 모은다(2-2) |
-| 9 | 콜백은 렌더보다 먼저, 값은 합성보다 먼저 | 2-2 의 순서. ★세 구성의 콜백 발사를 한 손잡이로 모으는 것이 2 단계★(2-4) |
+| 9 | 콜백은 렌더보다 먼저, 값은 합성보다 먼저 | 2-2 의 순서. ★세 구성의 콜백 발사를 2026-10-21 `9b6cd8dfcf3` 에서 틱으로 모았다★(2-4) |
 | 10 | 표출은 콘텐츠 완료 시점의 함수가 아니다 | 벽 그대로. 수요 구동 임베더에서도 깨우기는 ***에지를 예약할 뿐*** 이므로 표출이 콘텐츠 함수가 되지 않는다 |
 | 11 | 놓친 틱은 버리고, 주기는 정확히 | 기존 클럭 그대로. ★정리★: `gfx_refresh_hz` 클램프 사본이 다섯이다 — `refresh_driver.rs:353-363`, `main.rs:1941-1947`, `main.rs:1961-1964`, `script/raf_clock.rs:45-53`, `script_thread.rs:1651` |
 | 12 | 틱 솎기와 합성률은 분리 | divisor 가 나누는 것은 ★표출 틱이 아니라 `RefreshDriver` 틱★ 이다(`refresh_driver.rs:230-234`). 둘이 같은 주기인 것은 `FrameClock::Pacing` 뿐. 2-4 가 콜백을 한 손잡이로 모으면 둘이 같아진다 — ★그러면 8 절의 `epoch/s` 기대값은 `gfx_refresh_hz`/divisor 다★ |
-| 13 | WebView 소유 painter 만 틱 요청 | 그대로. ★팬아웃이 있다고 페이싱 틱이 있는 것은 아니다★ |
+| 13 | WebView 소유 painter 만 틱 요청 | ★문구가 코드와 다르다 — 2026-10-22 정정★. `Paint::wall_frame_request_for_all_tiles` 의 원천 집합은 `self.painter_ids()`, 즉 ***등록된 모든 painter*** 다. "WebView 소유 painter 만" 은 아니다. 지금 있는 셸에서는 둘이 같은 집합이라 무해하고(추가 paint target 은 전부 어느 `WebView` 의 것이다), 소유자 없는 painter 가 생기면 그때 좁히면 된다. ★팬아웃이 있다고 페이싱 틱이 있는 것은 아니다★ |
 | 14 | keep-previous 는 지명된 논리 프레임에만 유효 | ★2-5 가 이것을 적극적으로 쓴다★ — 역압 거절이 곧 그 프레임의 keep-previous 참여다 |
 | 15 | 배리어 16ms 마감은 주사율에서 유도하지 않은 허용 오차 | 틱 주기와 묶지 않는다 |
 | 16 | 스크린샷이 가능해야 한다 | ★2-8★ — 수요 구동 임베더는 깨우기 없으면 생산 없음, 벽은 요청 중 생산 일시 중지 |
@@ -272,7 +279,7 @@ generate_frame_for_wall_tick(logical_frame_id, requested_at) -> TileOutcome
 off(기본) / vsync / servoshell `--wall-all-tiles` / WPT(servoshell headless).
 
 (참고: `RefreshDriver` 구현은 ★다섯★ 이다 — `refresh_driver.rs:367`,
-`winit_wall/pacing_refresh_driver.rs:70`, `winit_wall/vsync_refresh_driver.rs:92`,
+`winit_wall/tick_refresh_driver.rs`(구 `pacing_refresh_driver.rs`), `winit_wall/vsync_refresh_driver.rs:92`,
 `servoshell/desktop/vsync_refresh_driver.rs:92`, `servoshell/egl/app.rs:269`. servoshell
 데스크톱에도 DwmVsync 드라이버가 있고 `gfx_vsync_enabled` 에서 설치된다.)
 
@@ -297,6 +304,18 @@ off(기본) / vsync / servoshell `--wall-all-tiles` / WPT(servoshell headless).
   바쁨과 무관하게 매 주기 도므로 원래 요구("WR 이 바쁠 때에도 발동")가 그대로 충족된다.
   그리고 ★`FRAMEREASON` 에 자기 값을 갖는다★ — 지금 안 보이는 경로가 하나 있다는 사실
   자체가 조사를 반복시킨다.
+
+  > ★착지한 것은 이관이 아니다 — 2026-10-22 전수 리뷰에서 확정한 미달 사항.★
+  > `present_external_only` 의 호출자는 여전히 `Painter::update_images` 하나이고
+  > (`painter.rs` 의 즉시-합성 게이트), 즉 ***외부 서피스가 도착한 틱***에만 불린다.
+  > 바뀐 것은 스로틀의 단위뿐이다: 14ms 상수 → `wall_tick::ExternalPresentBudget` 의 틱
+  > 번호. 그래서 ★천장("틱당 한 번 이하")은 섰고 바닥("매 틱 한 번")은 서지 않았다.★
+  > `FRAMEREASON` 의 `external_surface` 값은 들어갔다(그쪽 요구는 충족).
+  >
+  > ★왜 좁히지 않았나★: 호출을 틱으로 옮기는 것은 DComp commit 경로의 거동 변경이고, 이
+  > 저장소에는 ***commit 이 렌더 스레드로 새면 눈에 보이는 저더가 난다*** 는 실측 기록이
+  > 있다. 실기 4-GPU 벽 없이는 그 변경을 잴 수 없어, 2026-10-22 에는 코드·시험·이 문서의
+  > ★주장만 바로잡고 거동은 두었다★. 근거 한 벌은 `wall_tick::ExternalPresentBudget` 주석.
 - **`send_initial_pipeline_transaction`(`painter.rs:3592`)** — 틱 루프를 믿을 수 있기 전의
   부트스트랩. ★파이프라인당 정확히 1 회, 그 파이프라인의 첫 틱 생산 이전에만★ 허용하고
   계수기를 붙인다. 종료 조건이 있는 예외다.
@@ -310,7 +329,7 @@ off(기본) / vsync / servoshell `--wall-all-tiles` / WPT(servoshell headless).
 | 보는 것 | 성공 | 실패 |
 |---|---|---|
 | `FRAMEREASON` 구별 값 | ★정확히 둘★ — `tick`, `external_surface` | 그 외 값이 하나라도 등장 |
-| `external_surface` 계수 | 틱당 1 회 이하 | 초과 |
+| `external_surface` 계수 | 틱당 1 회 이하 (★이하이지 "매 틱" 이 아니다 — 7 절★) | 초과 |
 | `bootstrap` 계수 | 파이프라인당 정확히 1 | 2 이상 |
 | 벽 페이서 합류 계수 | 벽 구성에서 0 | 0 이 아님 |
 | `FRAMEID distinct_ids / renders` | 다중 타일에서 1.0 | 0.5 대 유지 |

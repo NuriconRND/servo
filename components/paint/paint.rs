@@ -53,7 +53,7 @@ use webrender_api::units::{DevicePixel, DevicePoint, DeviceVector2D};
 use webrender_api::{BuiltDisplayListDescriptor, FontInstanceKey, FontKey, ImageKey};
 
 use crate::InitialPaintState;
-use crate::painter::{FrameReadyDiagnostic, Painter, PainterInputs};
+use crate::painter::{FrameReadyDiagnostic, Painter, PainterInputs, PumpSource};
 use crate::wall_tick::TileOutcome;
 use crate::webview_renderer::UnknownWebView;
 
@@ -235,6 +235,20 @@ pub struct Paint {
     /// 같은 줄의 `ticks_in_window` 와 단위를 맞춰야 설계 8-1 이 지목한 교착 탐지기로
     /// 읽힌다(둘을 섞어 두면 "이 창에 몇 개를 걷었나" 를 답할 수 없다).
     keep_previous_released_in_window: Cell<u64>,
+
+    /// ★수요 구동 틱의 진입 수와 그중 생산한 수.★ 현재 1 초 창 / 창 시작. 2026-10-22.
+    ///
+    /// ***왜 재는가*** -- `Paint::on_demand_wall_tick` 은 이벤트 루프 스핀마다 불리므로
+    /// 진입 수는 표출 주기가 아니라 ***루프의 폴링 속도***다. 그 둘이 벌어져도 WR 프레임은
+    /// `renderer_behind` 거절이 막아 주어 fps 에는 안 나타나고, 메인 스레드 CPU 로만
+    /// 나타난다. 그러면 로그만 보는 사람은 폭주를 영영 못 본다. 실제로 그랬다:
+    /// `gather_components` 안의 깨우기가 다음 에지를 다시 예약해 ★틱 N 이 틱 N+1 을
+    /// 되먹임하는 고리★ 가 있었고(2026-10-22 전수 리뷰 5 번), 아무 지표도 그것을 안 보였다.
+    /// `produced / edges` 가 1 에 가까우면 생산이 박자를 쥔 것이고, 0 에 가까우면 루프가
+    /// 헛도는 것이다.
+    demand_tick_edges_in_window: Cell<u64>,
+    demand_tick_produced_in_window: Cell<u64>,
+    demand_tick_window_start: Cell<Option<Instant>>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -1563,6 +1577,9 @@ impl Paint {
             production_suspended_total: Default::default(),
             production_suspended_last_report: Default::default(),
             keep_previous_released_in_window: Default::default(),
+            demand_tick_edges_in_window: Default::default(),
+            demand_tick_produced_in_window: Default::default(),
+            demand_tick_window_start: Default::default(),
             wall_frame_pacing_block_tally: Default::default(),
         }))
     }
@@ -2050,6 +2067,13 @@ impl Paint {
     /// 같은 규칙으로 채워지고, 순회가 `painters` 의 등록 순서를 따라 ★결정적★ 이다 --
     /// `webview_painter_targets` 를 직접 훑으면 `HashMap` 순서라 배리어 등록과 pacing
     /// 키가 실행마다 달라진다.
+    ///
+    /// ★설계 불변식 13 의 문구("WebView 소유 painter 만 틱 요청")와 다르다 -- 2026-10-22
+    /// 전수 리뷰에서 확인했다.★ 여기 원천은 `self.painter_ids()`, 즉 ***등록된 모든
+    /// painter*** 이고 소유 `WebView` 를 묻지 않는다. 지금 있는 셸에서는 두 집합이 같아
+    /// 무해하다 -- 추가 paint target 도 전부 어느 `WebView` 가 `add_paint_target` 으로
+    /// 등록한 것이다. 소유자 없는 painter 가 생기면 그때 `webview_painter_targets` 의
+    /// 키 집합으로 좁히면 되고, 불변식 표에도 같은 정정을 적어 두었다.
     fn wall_frame_request_for_all_tiles(&self) -> WallFrameRequest {
         self.wall_frame_request_from_source_painters(self.painter_ids())
     }
@@ -2065,9 +2089,17 @@ impl Paint {
     /// 애니메이션 프레임은 둘 다 삭제됐다(설계 2-6).
     ///
     /// ★다만 "순수한 값 푸시" 는 아니다★ -- 아직 움직이는 것이 있으면 그 함수가 깨우기
-    /// 동반자를 건다(`wake_for_paint_animation`, `arm_paint_timer_heartbeat`,
-    /// `wall_tick::schedule_production_at_next_edge`). 규칙 2 위반은 아니다: 깨우기는
-    /// 프레임을 내지 않고 ***다음 틱 에지에 생산 1 회를 예약***할 뿐이다(설계 2-4).
+    /// 동반자를 건다(`wake_for_paint_animation`, `arm_paint_timer_heartbeat`). 규칙 2
+    /// 위반은 아니다: 깨우기는 프레임을 내지 않고 ***이벤트 루프를 한 번 더 돌릴 뿐***
+    /// 이다(설계 2-4).
+    ///
+    /// ★그러나 ***생산 예약***은 여기서 걸지 않는다 -- `PumpSource::Tick` 을 넘기는 이유가
+    /// 그것이다.★ 2026-10-22 전수 리뷰. 깨우기와 달리 예약
+    /// (`wall_tick::schedule_production_at_next_edge`)은 ***다음 에지에 생산 1 회***를
+    /// 뜻하고, 생산의 구성 요소 수집 단계에서 그것을 걸면 ★틱 N 이 틱 N+1 을 되먹인다★.
+    /// 그 고리에는 박자를 주는 것이 없어 생산이 이벤트 루프의 폴링 속도로 돌았다
+    /// (실측: 초당 13,000 논리 프레임 대 WR 합성 60). 근거와 대안 비교는
+    /// `painter::PumpSource::may_schedule`.
     ///
     /// 한 주기에 두 번 밀어 넣지 않을까: 안 그런다. 안쪽 `push_due` 게이트가 ★마지막
     /// 밀어넣기 이후 렌더가 있었는가★ 로 판정하므로, 렌더 없이 또 불러도 값이 다시
@@ -2077,7 +2109,9 @@ impl Paint {
     /// 순서를 틀리게 부를 방법이 애초에 없다.
     pub(crate) fn gather_components(&self) {
         for painter_id in self.painter_ids() {
-            self.with_painter_mut(painter_id, |painter| painter.pump_paint_animation());
+            self.with_painter_mut(painter_id, |painter| {
+                painter.pump_paint_animation(PumpSource::Tick)
+            });
         }
     }
 
@@ -2269,6 +2303,58 @@ impl Paint {
     /// 구분되지 않는다, (2) 되돌린 비트를 집어 갈 ***깨우기***가 헤드 모드에서 따로 필요하다
     /// (렌더가 끝났다고 이벤트 루프가 깨지는 않는다).
     pub fn on_demand_wall_tick(&self) -> Option<u64> {
+        let produced = self.on_demand_wall_tick_inner();
+        self.note_demand_tick(produced.is_some());
+        produced
+    }
+
+    /// ★진입 수와 생산 수를 초당 한 줄로 남긴다 -- `WALLTICKRATE`.★ 2026-10-22.
+    ///
+    /// 이 셸의 에지는 표출 클럭이 아니라 ***이벤트 루프의 스핀***이라, 진입이 초당 수천
+    /// 번이 되어도 WR 프레임은 `renderer_behind` 거절이 막아 fps 에 안 나타난다. 그러면
+    /// 남는 증상이 메인 스레드 CPU 뿐이고, 로그에는 아무것도 안 보인다. ★그 침묵이
+    /// 2026-10-22 전수 리뷰 5 번을 세 작업에 걸쳐 숨겼다★ -- `gather_components` 안의
+    /// 깨우기가 다음 에지를 되먹여 틱이 폴링 속도로 돌고 있었다.
+    ///
+    /// 읽는 법: ★`produced` 가 판정이고 `edges` 는 배경이다.★
+    ///
+    /// - `produced` 는 표출률이어야 한다 -- 애니메이션 페이지에서 60, 조용한 페이지에서 0
+    ///   (불변식 16). 이 값이 세 자리를 넘으면 ***생산자가 되먹임 고리 안에 있다***.
+    /// - `edges` 는 생산과 무관하다. 이 셸의 에지는 이벤트 루프의 스핀이라
+    ///   `ControlFlow::Poll` 의 속도를 그대로 적는다. 실측(2026-10-22, headed):
+    ///   애니메이션 페이지 ~27,000/s, ★조용한 페이지 ~130,000/s(프로세스 CPU 0.97 코어)★.
+    ///   후자는 틱과 무관한 ***이 셸의 별개 문제***다 -- 조용한데도 `Wait` 로 안 내려간다.
+    ///   틱은 그 스핀마다 `swap` 하나를 하고 돌아선다.
+    ///
+    /// ★줄은 스핀이 도는 한 매초 나간다★ -- 조용한 페이지에서도. 침묵으로 "고쳐졌다" 와
+    /// "이 코드가 안 돈다" 를 구별할 수 없게 만들지 않는다(이 저장소가 같은 함정에 네 번
+    /// 빠진 기록이 `WALLACKFLUSH` 주석에 있다).
+    fn note_demand_tick(&self, produced: bool) {
+        let now = Instant::now();
+        let edges = self.demand_tick_edges_in_window.get() + 1;
+        self.demand_tick_edges_in_window.set(edges);
+        if produced {
+            self.demand_tick_produced_in_window
+                .set(self.demand_tick_produced_in_window.get() + 1);
+        }
+        let Some(started) = self.demand_tick_window_start.get() else {
+            self.demand_tick_window_start.set(Some(now));
+            return;
+        };
+        let elapsed = now.duration_since(started);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        self.demand_tick_window_start.set(Some(now));
+        self.demand_tick_edges_in_window.set(0);
+        let frames = self.demand_tick_produced_in_window.replace(0);
+        info!(
+            "WALLTICKRATE window_ms={:.0} edges={edges} produced={frames}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+
+    fn on_demand_wall_tick_inner(&self) -> Option<u64> {
         if !crate::wall_tick::take_scheduled_edge() {
             return None;
         }
@@ -4445,13 +4531,19 @@ mod wall_frame_keep_previous_tests {
         assert_eq!(coordinator.keep_previous_logical_frame(painter(1)), None);
     }
 
-    /// 역압으로 거절한 타일은 그 논리 프레임에 keep-previous 로 **참여한다**.
+    /// 무장한 타일은 그 논리 프레임 동안 직전 프레임을 유지한다.
     ///
-    /// 배리어에서 조용히 빠지면 그 주기의 벽 프레임이 전 타일을 덮지 않고, 화면에 프레임
-    /// N 인 타일과 N-1 인 타일이 섞인다(설계 2-5). 거절은 "이 프레임에서 빠진다" 가 아니라
-    /// "직전 프레임을 유지하는 방식으로 이 프레임에 참여한다" 다.
+    /// ★이 시험이 거는 사유는 캔버스 대기다 -- 역압이 아니다.★ HEAD 에서 무장까지 가는
+    /// 거절은 `WaitingOnCanvasImages` 하나뿐이고
+    /// (`wall_tick::decline_may_arm_keep_previous(RendererBehind)` 가 거짓이다),
+    /// 역압 거절은 ***어떤 경로로도 무장되지 않는다***. 이름이 "역압" 이던 동안 이 세 줄이
+    /// 역압 경로의 증거로 읽혔고, 2026-10-22 에 바로잡았다.
+    ///
+    /// ★설계 2-5 의 "배리어 참여" 를 이 시험이 보이지는 않는다★ -- 그 요구는 미구현이고,
+    /// 무장이 실제로 바꾸는 것이 무엇인지는
+    /// [`WallFrameCoordinator::arm_keep_previous`] 의 주석에 있다(거기 한 벌만 둔다).
     #[test]
-    fn a_back_pressured_tile_joins_the_frame_as_keep_previous() {
+    fn an_armed_tile_joins_the_frame_as_keep_previous() {
         let mut coordinator = WallFrameCoordinator::default();
         let busy = painter(2);
         has_presented(&mut coordinator, busy);
@@ -4465,16 +4557,16 @@ mod wall_frame_keep_previous_tests {
         );
     }
 
-    /// 역압 거절에도 불변식 14 가 그대로 선다 -- 한 번도 표출한 적 없는 타일은 유지 지시를
-    /// 받지 않는다.
+    /// 캔버스 대기 거절에도 불변식 14 가 그대로 선다 -- 한 번도 표출한 적 없는 타일은 유지
+    /// 지시를 받지 않는다.
     ///
     /// `a_painter_that_never_presented_is_not_told_to_keep_a_frame_it_does_not_have` 가
-    /// 배리어 실패 경로에서 같은 것을 못박는다. 역압은 ★그 경로를 안 지나는 두 번째 무장
-    /// 지점★ 이므로 여기서 따로 못박는다 -- 면제를 무장 자리에 복사하지 않고
+    /// 배리어 실패 경로에서 같은 것을 못박는다. `arm_keep_previous` 는 ★그 경로를 안 지나는
+    /// 두 번째 무장 지점★ 이므로 여기서 따로 못박는다 -- 면제를 무장 자리에 복사하지 않고
     /// `keep_previous_logical_frame` 한 곳에만 두기 때문에, 새 무장 지점이 그 한 곳을
     /// 지나는지는 시험으로만 확인된다.
     #[test]
-    fn a_back_pressured_tile_that_never_presented_is_not_held() {
+    fn a_canvas_waiting_tile_that_never_presented_is_not_held() {
         let mut coordinator = WallFrameCoordinator::default();
         let never_presented = painter(3);
 
@@ -4487,13 +4579,13 @@ mod wall_frame_keep_previous_tests {
         );
     }
 
-    /// 역압 유지는 ★지명된 그 논리 프레임에만★ 유효하다(불변식 14).
+    /// 유지 지시는 ★지명된 그 논리 프레임에만★ 유효하다(불변식 14).
     ///
-    /// 역압은 틱마다 다시 판정되므로, 한 번의 거절이 다음 주기까지 타일을 붙잡으면 그것이
+    /// 거절은 틱마다 다시 판정되므로, 한 번의 거절이 다음 주기까지 타일을 붙잡으면 그것이
     /// `expire_keep_previous_before` 주석이 말하는 일방통행 문이 된다. 다음 벽 프레임이
     /// 그 지시를 만료시키는지를 새 무장 경로에서 확인한다.
     #[test]
-    fn a_back_pressure_hold_expires_with_the_next_wall_frame() {
+    fn a_canvas_wait_hold_expires_with_the_next_wall_frame() {
         let mut coordinator = WallFrameCoordinator::default();
         let busy = painter(2);
         has_presented(&mut coordinator, busy);

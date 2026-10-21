@@ -82,13 +82,18 @@ pub fn note_present_tick() {
 /// `Paint::on_demand_wall_tick` 으로 집어 가 생산한다. 몇 번 불러도 에지당 생산은 한 번이다.
 ///
 /// ★이 ***공개*** 함수에는 아직 호출자가 없다★(2026-10-22 Task 9.5 확인). 같은 비트를
-/// 세우는 자리는 `paint` 안에 둘이고, 둘 다 크레이트 내부 함수
+/// 세우는 자리는 `paint` 안에 셋이고, 셋 다 크레이트 내부 함수
 /// (`wall_tick::schedule_production_at_next_edge`)를 직접 부른다:
 ///
 /// - `Paint::handle_message` 의 `PaintMessage::GenerateFrame` — 스크립트가 새 디스플레이
 ///   리스트를 올렸다는 신호(2026-10-22 Task 9.5).
+/// - `Paint::handle_message` 의 `PaintMessage::UpdateImages` — 캔버스·비디오 이미지가
+///   WR 에 닿았다는 신호(2026-10-22). 없으면 캔버스 페이지가 영구 정지한다 -- 그 줄의
+///   주석에 닫힌 고리 전문이 있다.
 /// - `Painter::pump_paint_animation` 의 깨우기 동반자 — 페인트측 애니메이션·비디오
-///   (2026-10-21 Task 7).
+///   (2026-10-21 Task 7). ★단 `PumpSource::Tick` 으로 불린 것은 예약하지 않는다★ --
+///   그쪽은 틱 자신의 구성 요소 수집이라 되먹임이 된다(`painter::PumpSource::may_schedule`,
+///   2026-10-22).
 ///
 /// 임베더가 ***직접*** 예약해야 할 깨우기(엔진 밖에서 오는 것)가 생기면 그때 이 문으로
 /// 들어온다. 그런 깨우기는 아직 없다 -- 지금 수요 구동 임베더(servoshell / WPT /

@@ -1250,17 +1250,66 @@ if ($rate) {
 }
 
 # --- FRAMEREASON: which call site is producing the composites (only with -FrameReason) ---
-$fr = Select-String -Path $LogPath -Pattern "FRAMEREASON total=(\d+) window_ms=[\d.]+ (.*)$" -EA SilentlyContinue
+$fr = Select-String -Path $LogPath -Pattern "FRAMEREASON total=(\d+) window_ms=([\d.]+) (.*)$" -EA SilentlyContinue
 if ($fr) {
+    # ★단일 생산자 판정은 ***창마다*** 한다 -- 로그 전체 누적이 아니다.★ 2026-10-22 전수
+    # 리뷰에서 고쳤다.
+    #
+    # 고장: 부트스트랩 예외(`Painter::send_initial_pipeline_transaction`)는 WR 호출 지점을
+    # 하나 더 만들고, 그것이 누적 집계에서는 ***영구히*** 남는다. 그래서 0 초에 난 정상적인
+    # 부트스트랩 한 장이 건강한 실행 내내 "not yet two" 를 찍었다 -- 설계 8 절이 구조
+    # 판정으로 지목한 바로 그 지표에서. (이번 세션에 런처 게이트가 거짓 경보를 낸 두 번째
+    # 사례다. 앞의 것은 비율이 아니라 `fallback > 0` 로 판정했다.)
+    #
+    # ★줄 번호로 빼지 않는 이유.★ 뺄 이름이 `painter.rs:<줄>` 이라 그 파일을 한 줄만
+    # 건드려도 낡는다 -- 이 저장소는 같은 함정에 이미 두 번 빠졌다(시험 리터럴, 2026-10-21
+    # 과 10-22, 둘 다 그것을 적은 커밋 자신의 줄 이동으로 낡았다). 창 단위 판정은 번호를
+    # 몰라도 되고, 덤으로 ★"두 생산자가 ***동시에*** 있었나" 와 "서로 다른 때에 하나씩
+    # 있었나" 를 가른다★ -- 누적 집계는 그 둘을 구별하지 못한다.
+    $bootstrapTimes = @()
+    foreach ($b in (Select-String -Path $LogPath -Pattern "WALLBOOTSTRAP" -EA SilentlyContinue)) {
+        if ($b.Line -match "\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)") {
+            $bootstrapTimes += [datetime]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        }
+    }
+
     $tally = @{}
     $totals = @()
+    $cleanWindows = 0
+    $skippedWindows = 0
+    $maxWrSitesInOneWindow = 0
+    $windowsWithTwoWrSites = 0
+    $externalSeenInCleanWindow = $false
     foreach ($m in $fr) {
         $totals += [int]$m.Matches[0].Groups[1].Value
-        foreach ($part in ($m.Matches[0].Groups[2].Value -split ' ')) {
+        $windowMs = [double]$m.Matches[0].Groups[2].Value
+        $windowSrcs = @{}
+        foreach ($part in ($m.Matches[0].Groups[3].Value -split ' ')) {
             if ($part -match "^((?:painter\.rs:\d+|external_surface|wall_pacer_join)/\S+)=(\d+)$") {
                 $tally[$Matches[1]] = [int]$Matches[2] + $tally[$Matches[1]]
+                $windowSrcs[($Matches[1] -split '/')[0]] = $true
             }
         }
+        # 이 창이 부트스트랩을 품었나. 창은 [t - window_ms, t] 이고 로그 타임스탬프가 초
+        # 단위라 1.5 초를 더 준다. 부트스트랩은 파이프라인당 1 회뿐이라 넉넉히 버려도
+        # 판정에 쓸 창은 남는다.
+        $contaminated = $false
+        if ($bootstrapTimes.Count -gt 0 -and $m.Line -match "\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)") {
+            $windowEnd = [datetime]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+            $windowStart = $windowEnd.AddMilliseconds(-($windowMs + 1500))
+            foreach ($bt in $bootstrapTimes) {
+                if ($bt -ge $windowStart -and $bt -le $windowEnd) { $contaminated = $true }
+            }
+        }
+        if ($contaminated) {
+            $skippedWindows++
+            continue
+        }
+        $cleanWindows++
+        $wrInWindow = @($windowSrcs.Keys | Where-Object { $_ -like 'painter.rs:*' }).Count
+        if ($wrInWindow -gt $maxWrSitesInOneWindow) { $maxWrSitesInOneWindow = $wrInWindow }
+        if ($wrInWindow -ge 2) { $windowsWithTwoWrSites++ }
+        if ($windowSrcs.ContainsKey('external_surface')) { $externalSeenInCleanWindow = $true }
     }
     $windows = $fr.Count
     Write-Host ""
@@ -1269,12 +1318,20 @@ if ($fr) {
     foreach ($k in ($tally.Keys | Sort-Object { -$tally[$_] })) {
         Write-Host ("    {0,8:N1}/s  {1}" -f ($tally[$k] / [math]::Max($windows, 1)), $k)
     }
-    # 단일 생산자 판정: 구별 값이 정확히 둘 = WR 호출 지점 하나 + external_surface.
     # wall_pacer_join 은 문이 열린 횟수라 출처로 세지 않는다(합성 total 에도 안 들어간다).
-    $srcs = @($tally.Keys | ForEach-Object { ($_ -split '/')[0] } | Where-Object { $_ -ne 'wall_pacer_join' } | Sort-Object -Unique)
-    $wrSrcs = @($srcs | Where-Object { $_ -like 'painter.rs:*' })
-    $verdict = if ($srcs.Count -eq 2 -and $wrSrcs.Count -eq 1 -and ($srcs -contains 'external_surface')) { "OK (one WebRender site + external_surface)" } else { "not yet two" }
-    Write-Host ("  distinct sources={0} (WebRender sites={1}, external_surface={2}, wall_pacer_join={3}) -- {4}" -f $srcs.Count, $wrSrcs.Count, [int]($srcs -contains 'external_surface'), [int]($tally.Keys | Where-Object { $_ -like 'wall_pacer_join/*' }).Count, $verdict)
+    $wrSitesWholeLog = @($tally.Keys | ForEach-Object { ($_ -split '/')[0] } | Where-Object { $_ -like 'painter.rs:*' } | Sort-Object -Unique)
+    $joinKeys = @($tally.Keys | Where-Object { $_ -like 'wall_pacer_join/*' })
+    if ($cleanWindows -eq 0) {
+        $verdict = "no verdict: every window contained a WALLBOOTSTRAP"
+    } elseif ($windowsWithTwoWrSites -gt 0) {
+        $verdict = "FAIL: $windowsWithTwoWrSites of $cleanWindows clean windows had two or more WebRender sites AT ONCE"
+    } elseif (-not $externalSeenInCleanWindow) {
+        $verdict = "OK (one WebRender site; external_surface never fired -- no promoted external video in this run)"
+    } else {
+        $verdict = "OK (one WebRender site + external_surface)"
+    }
+    Write-Host ("  clean windows={0} (skipped {1} that contained a WALLBOOTSTRAP), max WebRender sites in one window={2}, wall_pacer_join keys={3}" -f $cleanWindows, $skippedWindows, $maxWrSitesInOneWindow, $joinKeys.Count)
+    Write-Host ("  whole-log WebRender sites={0} (the bootstrap exception adds one permanently; NOT the verdict) -- {1}" -f $wrSitesWholeLog.Count, $verdict)
 }
 
 # --- WEBGLFANOUT: is a spanning WebGL canvas paying for pixels or for the replay? ---

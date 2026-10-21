@@ -1074,6 +1074,22 @@ impl Servo {
     ///   - Performs updates in `Paint`, such as queued pinch zoom events
     ///   - Runs delegate methods on all `WebView`s and `Servo` itself
     ///   - Maybe update the rendered `Paint` output, but *without* swapping buffers.
+    ///
+    /// ★이 함수는 프레임을 내지 않는다 -- 메시지를 처리할 뿐이다.★ 2026-10-22, 설계 2-4.
+    /// 벽 프레임을 내는 것은 틱 하나이고(규칙 1), 임베더는 둘 중 하나를 ***반드시*** 자기
+    /// 루프에 배선해야 한다:
+    ///
+    /// - 자유 실행 표출 클럭이 있으면(`winit_wall`) 주기마다 [`WebView::on_wall_tick`].
+    /// - 없으면(servoshell / WPT / Android / `examples/winit_minimal`) 이 함수를 부른
+    ///   ***직후*** [`WebView::on_demand_wall_tick`] 한 번. 깨우기가 세워 둔 예약 비트가
+    ///   있을 때만 생산하므로, 조용한 페이지에서는 아무 일도 하지 않는다(불변식 16).
+    ///
+    /// ★배선을 빠뜨리면 증상이 하나다 -- 부트스트랩 한 장 뒤로 창이 영영 안 바뀐다.★
+    /// `examples/winit_minimal` 이 실제로 그랬고(실측 2026-10-22: 15 초 동안 합성 0 회),
+    /// 이 계획에서 같은 누락이 네 번 났다. ★여기서 대신 불러 주지 않는 이유★: 이 함수는
+    /// 자유 실행 클럭이 있는 셸도 지나므로, 여기에 틱을 넣으면 그 셸의 생산자가 둘이 되고
+    /// `wall_tick::TICK_SEQ` 의 writer 도 둘이 되어 외부 서피스 표출의 "틱당 한 번" 천장이
+    /// 깨진다. 가르려면 손잡이가 필요하고, 이 계획은 손잡이를 없애는 중이다.
     pub fn spin_event_loop(&self) {
         self.0.spin_event_loop();
     }

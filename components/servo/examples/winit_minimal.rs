@@ -46,6 +46,38 @@ impl ::servo::WebViewDelegate for AppState {
     }
 }
 
+impl AppState {
+    /// ★엔진 메시지를 처리하고, 그 뒤에 벽 틱을 한 번 돈다 -- 이 임베더의 유일한 생산
+    /// 지점이다.★ 2026-10-22, 설계 2-4 / 규칙 1.
+    ///
+    /// `Servo::spin_event_loop` 은 메시지만 처리한다. 생산은 틱이 하고, 자유 실행 표출
+    /// 클럭이 없는 임베더의 틱은 `WebView::on_demand_wall_tick` 이다 -- 깨우기가 세워 둔
+    /// 예약 비트를 집어 가 그때 한 번 생산한다. 이 예제가 그것을 안 부르던 동안
+    /// ★부트스트랩 한 장 뒤로 창이 영영 안 바뀌었다★(실측 2026-10-22: 15 초 동안
+    /// `WALLBOOTSTRAP` 1 줄, 합성 0 회, 프로세스 CPU 0.01 코어 -- 그동안 스크립트는
+    /// 초당 32 번 돌고 있었다).
+    ///
+    /// ★`Servo::spin_event_loop` 안으로 올리지 않았다.★ 그 함수는 자유 실행 클럭이 있는
+    /// 셸(`winit_wall`)도 지나는데, 그쪽은 이미 매 주기 `on_wall_tick` 으로 생산한다.
+    /// 거기에 이것이 얹히면 생산자가 둘이 되고(규칙 1), `wall_tick::TICK_SEQ` 의 writer 도
+    /// 둘이 되어 한 에지에 번호가 두 번 올라 `ExternalPresentBudget` 의 "틱당 한 번"
+    /// 천장이 깨진다(그 상수의 주석이 바로 이 증상을 적어 두고 있다). 올리려면 "이 셸에
+    /// 자유 실행 클럭이 있는가" 라는 손잡이가 필요한데, 이 계획은 그런 손잡이를 없애는
+    /// 중이다.
+    ///
+    /// ★한 번만 부른다.★ 틱은 벽 전체에 하나이고(`Paint::on_demand_wall_tick` 은 `Paint`
+    /// 를 통째로 돈다) 고른 `WebView` 는 문을 여는 손잡이일 뿐이다. 여럿을 돌면 첫 호출이
+    /// 비트를 가져가 나머지는 전부 `None` 이다.
+    fn spin_event_loop_and_wall_tick(&self) {
+        self.servo.spin_event_loop();
+        // 빌림을 틱보다 먼저 끝낸다 -- 틱은 painter 를 건드리므로 빌린 채로 넘기지 않는다.
+        let webview = self.webviews.borrow().last().cloned();
+        if let Some(webview) = webview {
+            webview.on_demand_wall_tick();
+        }
+    }
+}
+
 enum App {
     Initial(Waker),
     Running(Rc<AppState>),
@@ -105,7 +137,7 @@ impl ApplicationHandler<WakerEvent> for App {
 
     fn user_event(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop, _event: WakerEvent) {
         if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
+            state.spin_event_loop_and_wall_tick();
         }
     }
 
@@ -116,7 +148,7 @@ impl ApplicationHandler<WakerEvent> for App {
         event: WindowEvent,
     ) {
         if let Self::Running(state) = self {
-            state.servo.spin_event_loop();
+            state.spin_event_loop_and_wall_tick();
         }
 
         match event {

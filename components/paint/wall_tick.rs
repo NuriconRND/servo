@@ -79,6 +79,24 @@ pub(crate) enum KeepPreviousReason {
 /// ★`renderer_behind` 를 먼저 본다 -- 순서가 사유를 정한다.★ 둘 다 참이면
 /// `RendererBehind` 다. 그쪽이 더 센 조건이기 때문이다: 낸 프레임이 아직 안 그려졌다는 뜻이고,
 /// 그 상태에서는 무장이 자기잠금이 된다(`decline_may_arm_keep_previous`).
+///
+/// ## ★여기가 이 브랜치에서 유일하게 바닥을 ***좁힌*** 자리다★ (2026-10-22 전수 리뷰)
+///
+/// `waiting_on_canvas` 가 참이면 이 타일은 ***이번 틱 전체를*** 거절한다. 그런데 틱 생산은
+/// 비디오의 바닥이기도 하다 -- 생산이 `flush_pending_video_frame_updates` 를 무조건 거치는
+/// 것이 불변식 4 의 "아예 없음이 아닌 페인트 박자" 다. 그래서 ★캔버스를 기다리는 타일에
+/// 승격되지 않은(= WR 텍스처로 올라가는) 비디오가 같이 있으면 그 비디오도 같이 선다.★
+///
+/// ★삭제된 `video_composite_owed` 블록에는 그 조건이 없었다★ -- 그쪽은 캔버스 대기와
+/// 무관하게 비디오 빚을 갚았다. 이 브랜치의 다른 변경은 전부 바닥을 ***넓혔고***(생산자를
+/// 하나로 모으면서 거절 사유가 줄었다), 여기 하나만 좁아졌으므로 적어 둔다.
+///
+/// ★크지 않다고 보는 근거★: 대기는 캔버스 이미지가 WR 에 닿을 때까지이고, 닿는 즉시
+/// `PaintMessage::UpdateImages` 가 다음 에지를 예약해 그 틱이 비디오까지 같이 싣는다. 즉
+/// 지연이지 정지가 아니다. 승격된(DComp 직행) 비디오는 애초에 이 경로 밖이라 영향이 없다.
+/// 좁히려면 "캔버스 대기 타일도 비디오 flush 만은 한다" 가 필요한데, 그러면 거절 타일이
+/// 트랜잭션을 내게 되어 `TileOutcome` 의 두 갈래 계약이 깨진다 -- 실기 벽에서 재기 전에는
+/// 손대지 않는다.
 pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) -> TileOutcome {
     if renderer_behind {
         return TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind);
@@ -317,12 +335,25 @@ pub(crate) fn current_tick_seq() -> u64 {
 /// 14ms -- 그 숫자는 표출 주기와 아무 관계가 없는 상수다. 120Hz 로 도는 벽의 주기는
 /// 8.33ms 라 ★한 틱 걸러 한 번만★ 통과했다.
 ///
-/// 박자는 틱이 준다. 천장("틱당 한 번")과 바닥("매 틱 한 번")이 같은 값이므로 상수 하나가
-/// 사라지고, 원래 요구 -- "fast-path 는 WR 빌드와 무관하므로 WR 이 바쁠 때에도 발동해야
-/// 한다"(`dcomp_compositor::should_fast_present`) -- 는 그대로 선다. 틱은 WR 의 바쁨과
-/// 무관하게 매 주기 돌기 때문이다.
+/// 박자는 틱이 준다: 상수 하나가 사라지고, 원래 요구 -- "fast-path 는 WR 빌드와 무관하므로
+/// WR 이 바쁠 때에도 발동해야 한다"(`dcomp_compositor::should_fast_present`) -- 는 그대로
+/// 선다. 틱은 WR 의 바쁨과 무관하게 매 주기 돌기 때문이다.
 ///
-/// ★시각이 아니라 틱 번호를 쥔다.★ 그래야 "틱마다 한 번" 이 상수 없이 정의된다.
+/// ★시각이 아니라 틱 번호를 쥔다.★ 그래야 "틱당 한 번 이하" 가 상수 없이 정의된다.
+///
+/// ## ★이것은 천장이다. 바닥이 아니다.★ 2026-10-22 전수 리뷰에서 바로잡았다
+///
+/// 이 구조체의 초안 주석은 천장("틱당 한 번")과 바닥("매 틱 한 번")이 같은 값이라고 적었다.
+/// ★거짓이다.★ `take` 는 ***불려야*** 무언가를 하고, 부르는 자리는
+/// `Painter::update_images` 안의 즉시-합성 게이트 하나뿐이다 -- 즉 ***외부 서피스가 도착한
+/// 틱***에만 불린다. 도착이 없는 틱에는 아무도 `take` 를 부르지 않으므로 그 틱의
+/// `present_external_only` 도 없다. 이 예산이 주는 것은 "틱당 한 번을 넘지 않는다" 하나다.
+///
+/// ★설계 7 절과의 차이를 여기 적어 둔다.★ 7 절은 fast-path 를 ***틱 소유로 이관***하라고
+/// 했고(그러면 바닥이 생긴다), 실제로 착지한 것은 ***도착 구동 호출의 틱 단위
+/// 속도 제한***이다. 그 차이는 좁힐 수 있지만 DComp commit 경로의 거동 변경이고, 이
+/// 저장소에는 ★commit 이 렌더 스레드로 새면 눈에 보이는 저더가 난다★ 는 실측 기록이 있어
+/// 실기 벽 없이는 재지 못한다. 그래서 2026-10-22 에는 ***주장만 바로잡고 거동은 두었다***.
 #[derive(Default)]
 pub(crate) struct ExternalPresentBudget {
     last_tick: Option<u64>,
@@ -347,13 +378,20 @@ mod tests {
         take_scheduled_edge, tick_should_produce, tile_may_generate, wall_frame_arms_keep_previous,
     };
 
-    /// ★틱마다 한 번은 반드시 받는다 -- 그것이 비디오의 바닥이다(불변식 4).★
+    /// ★새 틱은 몫을 ***거절당하지 않는다***.★ 예산이 주는 보장은 이것 하나다.
     ///
     /// 전에는 직전 표출에서 14ms 라는 자기 상수로 걸렀다. 그 상수는 표출 주기와 무관해서
     /// 120Hz 벽(주기 8.33ms)에서는 한 틱 걸러 한 번만 통과했고, 빠진 틱의 비디오는 다음
     /// 틱까지 화면에 안 올라갔다. 박자는 틱이 준다.
+    ///
+    /// ★이 시험을 불변식 4 의 바닥으로 읽지 말 것 -- 바닥은 여기 없다.★ 초안 이름과 주석
+    /// ("틱마다 한 번은 반드시 받는다")은 틀렸다: `take` 를 부르는 자리는
+    /// `Painter::update_images` 하나이고 외부 서피스가 ***도착한*** 틱에만 불린다. 도착이
+    /// 없으면 이 예산은 아예 조회되지 않는다. 근거와 설계 7 절과의 차이는
+    /// [`ExternalPresentBudget`] 주석에 있다. 비디오의 바닥을 주는 것은 틱 생산이 무조건
+    /// 거치는 `flush_pending_video_frame_updates` 쪽이지 이 경로가 아니다.
     #[test]
-    fn each_tick_gets_its_own_external_present() {
+    fn a_new_tick_is_not_refused_its_external_present() {
         let mut budget = ExternalPresentBudget::default();
         assert!(budget.take(1), "첫 틱은 자기 몫을 받는다");
         let second = budget.take(2);
