@@ -89,7 +89,7 @@ winit_wall 을 띄우면 무엇을 무엇으로 바꾸라는 안내를 찍고 �
 | `gfx_wall_frame_pacing_enabled` | bool | **`true`** | wall 프레임 페이싱(latest-wins). 이름과 달리 **기본 on** 이다 — 옛 판정이 `mode == Latest` 였다. |
 | `gfx_wall_frame_max_pending` | i64 | `1` | wall 프레임 배리어가 허용하는 미완료 프레임 수. |
 | `gfx_wall_frame_min_interval_ms` | i64 | **`0`** | wall 프레임 사이 최소 간격(ms). ***`0` = `gfx_refresh_hz` 한 주기로 유도***. ★옛 기본값 `16` 은 62.5Hz 이고, 정수 ms 로는 60Hz(16.667ms)를 표현할 수 없다★ — 16 은 4.2% 빠르고 17 은 2% 느리다. 유도하면 페인트 타이머 및 비디오 합성 합치기와 같은 박자가 된다. 양수를 명시하면 그 값을 그대로 쓴다. |
-| `gfx_single_frame_producer` (2026-10) | bool | `false` | 페이싱 틱이 벽 프레임의 **단일 생산자**가 된다. 켜면 `winit_wall` 이 틱마다 `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다(`note_present_tick` 뒤, 렌더 앞). ★중간 상태이므로 켠 채 배포하지 않는다★ — 구 생산자 열한 곳이 아직 살아 있어 한 틱이 합성을 두 번 낼 수 있고, 틱이 페이서 게이트가 읽는 상태를 써서 스크립트 `GenerateFrame` 의 coalesce 가 늘어 캔버스 ack 해제가 늦어진다(Task 6 이 해제를 생산에서 뗀다). 이 구간의 합성 수와 `FRAMEID` 는 판정에 쓰지 않는다. 기본값은 구 생산자를 내린 뒤 뒤집는다. |
+| `gfx_single_frame_producer` (2026-10) | bool | `false` | 페이싱 틱이 벽 프레임의 **단일 생산자**가 된다. 켜면 `winit_wall` 이 틱마다 `WebView::on_wall_tick` 을 불러 구성 요소를 모으고 프레임을 낸다(`note_present_tick` 뒤, 렌더 앞). ★중간 상태이므로 켠 채 배포하지 않는다★ — 구 생산자 열한 곳이 아직 살아 있어 한 틱이 합성을 두 번 낼 수 있고, 틱이 페이서 게이트가 읽는 상태를 써서 스크립트 `GenerateFrame` 의 coalesce 가 늘어 캔버스 ack 해제가 늦어진다(Task 6 이 틱에 해제자를 ***추가***해 그 구간을 메운다 — 생산 경로 셋의 해제는 Task 7 이 그 생산자들과 함께 지운다). 이 구간의 합성 수와 `FRAMEID` 는 판정에 쓰지 않는다. 기본값은 구 생산자를 내린 뒤 뒤집는다. |
 | `gfx_wr_picture_tile_size` | String | `""` (= 오버라이드 없음) | WebRender picture cache 타일 크기. `""` = WR 기본 분기(콘텐츠 1024x512, 스크롤바는 WR 이 자체 특수 크기), `WxH`(예 `1920x1080`) = 모든 painter 동일, **`display`** = painter 마다 자기 창 크기. 타일이 창 이상이면 슬라이스당 타일 1 장이 된다. ★**WR 은 이 값을 검사도 클램프도 하지 않는다**(2026-08-12 확인) — 실질 상한은 GPU 텍스처 크기다.★ ★**쪼개면 싸질 것이라는 예상은 반증되었다**(2026-08-26, 45xFHD30 5760x2160): `display` render_ms p50 29.9ms / present 28.6/s 인데, `1024x1024` 는 99.6ms / 8.4/s, `512x512` 는 108.4ms / 8.5/s 로 **합성 1 회가 3.5 배 느려진다**. 전면이 매 프레임 바뀌는 비디오 월에서 픽처 캐시는 순수 오버헤드이므로 `display` 를 유지할 것.★ |
 
 ### `gfx_video_*` — 비디오 WR 탈출 / 분리
@@ -391,8 +391,20 @@ WebRender 탓으로 돌리게 된다. `flushed`/`skipped` 는 조건부 flush �
 | 실행(pref on) | 기대 | 뜻 |
 |---|---|---|
 | `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall 없음, 한 틱만 지연** | ★이것이 이 구조의 요점★ — 한 번 놓쳐도 영구 교착이 아니다 |
-| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 1 차와 복구를 다 막으면 교착이 재현된다 |
-| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKFLUSH`** | 보류한 ack 를 복구가 푼다 |
+| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 1 차와 복구를 다 막으면 교착이 재현된다. ★`WALLACKLATCH` 를 찾을 때 주의★ — 아래 `WALLACKSKIP` 경고 |
+| `-CanvasAckSkip 1` | **stall 없음 + `WALLACKSKIP`** | 주입이 실제로 ack 를 보류했다 |
+
+★마지막 행의 증거 줄은 `WALLACKFLUSH` 가 아니라 `WALLACKSKIP` 이다.★ pref on 에서는 1 차
+해제자가 넷(생산 경로 셋 + 틱)이라, 보류된 빚을 복구(`flush_owed_canvas_ack`)보다 ***그중
+하나가 먼저 줍는 일이 흔하다***. 그러면 `WALLACKFLUSH` 는 한 줄도 안 찍히는데 ★주입은
+분명히 걸린 것★ 이다 — 없는 줄을 찾다가 "주입이 무력하다" 로 오독하기 쉬우므로, 그
+구성에서는 보류 자체의 증거인 `WALLACKSKIP` 을 본다.
+
+`WALLACKSKIP` 은 `consume_canvas_ack_skip` 이 예산을 쓸 때마다 찍는 경고다 — "painter N 이
+파이프라인 M 개에 빚진 ack 를 일부러 보류했다(남은 예산 K)". ★rate limit 이 없다.★ 그래서
+`-CanvasAckSkip 1000000` 처럼 예산을 크게 주면 해제 시도마다 한 줄이 나와 ***초당 수십~수백
+줄***이 되고, 1 초에 한 줄인 `WALLACKLATCH` 가 그 안에 묻힌다. 그 조합을 돌 때는 `WALLACKLATCH`
+를 눈으로 찾지 말고 따로 grep 할 것.
 
 ### `SERVO_DCOMP_SLOW_COMMIT_MS` — `Int`
 

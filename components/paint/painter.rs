@@ -2136,8 +2136,10 @@ impl Painter {
         true
     }
 
-    /// 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다. ★복구 경로★ — 1 차 해제자는
-    /// 틱의 [`Painter::release_owed_canvas_ack`] 다.
+    /// 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다. ★복구 경로★ — 1 차 해제는
+    /// [`Painter::release_owed_canvas_ack`] 를 지나고, 그 호출자는 넷이다(생산 경로 셋 +
+    /// 페이싱 틱). ★기본 구성에서는 그중 틱이 빠진다★ — `gfx_single_frame_producer` 가
+    /// off 이기 때문이고, 그래서 거기서는 생산 경로 셋이 1 차다.
     ///
     /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
     /// 로 잠기고 `script_thread.rs:1441` 에서 rAF 가 ***통째로*** 건너뛰어진다. 그 잠금은
@@ -2189,9 +2191,15 @@ impl Painter {
         // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
         // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
         //
-        // 드물다는 성질은 그대로다 — 1 차 해제자
-        // ([`Painter::release_owed_canvas_ack`])가 보통 먼저 비우므로 여기까지 빚이 오지
-        // 않는다. 여기가 돈다는 것은 1 차가 전부 못 닿았다는 뜻이고, 그것이 이 줄의 값어치다.
+        // ★그런데 "드물다"가 더는 전부 참이 아니다 — `renderer_behind` 갈래가 있다.★
+        // 1 차 해제자들(`release_owed_canvas_ack` 의 네 호출자)은 보통 먼저 비우지만,
+        // 생산 경로 셋은 ***`renderer_behind()` 면 해제 전에 돌아선다***
+        // (`generate_frame_for_script` 의 두 번째 게이트, `update_images` 의 `if` 조건).
+        // 그 갈래의 빚을 이제 여기가 잡는다 — 예전에는 이 함수도 같은 조건에 막혀 못
+        // 잡았고, 그래서 latch 가 났다. 그러므로 ★기본 실행(틱 off)에서도 합성이
+        // in-flight 인 동안 들어온 요청마다 여기가 돌 수 있고, 1 초 합치기 상한까지 =
+        // painter 당 초당 1 줄까지 나온다.★ 그 양은 병증이 아니라 이 갈래가 메워지고
+        // 있다는 뜻이다. 병증은 `WALLACKLATCH` 쪽이다.
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -2281,6 +2289,16 @@ impl Painter {
     /// 복구 킬 스위치(`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY`)가 켜져 있다.
     ///
     /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
+    ///
+    /// ★주입(`SERVO_WALL_CANVAS_ACK_SKIP`)으로 만든 latch 는 `pending_frame` 필드가
+    /// 경로마다 다르다★ — 실측 기록과 필드별로 맞춰 보려 할 때 걸린다. 보류가
+    /// `generate_frame_for_script` 성공 경로나 `update_images` 에서 일어나면 그 직전/직후에
+    /// `set_pending_frame(false)` 가 돌아 ★`pending_frame=false`★ 로 찍히고,
+    /// rides-the-painter 경로에서 일어나면 그 경로가 플래그를 일부러 남기므로
+    /// ★`pending_frame=true`★ 로 찍힌다. 실측된 ***자연*** 스톨(2026-09-02,
+    /// `log_webgpu/51` `ack_34`)은 `pending_frame=true` 였으므로, 주입 실행의 latch 줄을 그
+    /// 기록과 필드 대 필드로 비교하면 안 맞을 수 있다. ★재현 여부는 영향받지 않는다★ —
+    /// 잠긴다는 사실과 빚이 남는다는 사실은 세 경로가 같다.
     fn check_canvas_ack_latch(&self) {
         if !self.frame_delayer.is_holding_ack() {
             self.canvas_ack_held_since.set(None);
