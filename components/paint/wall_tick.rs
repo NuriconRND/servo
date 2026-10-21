@@ -58,6 +58,23 @@ pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) 
     TileOutcome::Generated
 }
 
+/// 이 타일이 쥔 캔버스 ack 를 지금 풀어도 되는가. ★해제는 생산과 무관하다.★
+///
+/// 인자가 둘뿐인 것이 이 술어의 전부다 -- ★`pending_frame` 도 `renderer_behind` 도 보지
+/// 않는다.★ 둘 다 "이 타일이 지금 합성을 낼 수 있는가" 를 묻는 값이고, 해제는 그 질문과
+/// 상관이 없다. 상관시키면 ***거절하는 타일에서 빚이 영영 안 풀린다***: 실측
+/// (2026-10-16, `log_ani_debug 36`) 에서 divisor=1 실행은 스크립트 요청이 ***매번***
+/// 거절 경로로 빠졌고, 그 경로가 ack 를 안 풀어 117 초에서 멎었다. 멈춘 것은 페인터가
+/// 아니라 스크립트였다 -- 그때까지 초당 60 프레임, dx 공칭값, overwritten=0 이었다.
+///
+/// `pending_canvas_images` 조건은 ★남는다 -- FrameDelayer 계약이다.★ ack 는 "네가
+/// 기다리던 캔버스가 화면에 올라갔다" 는 뜻이라, 이미지가 WR 에 닿기 전에 풀면 스크립트가
+/// 합성되지 않은 캔버스 위에서 다음 rAF 를 돈다. ★진입점 무조건 해제는 검토했고 택하지
+/// 않았다.★
+pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) -> bool {
+    holds_debt && pending_canvas_images == 0
+}
+
 /// ★다음 틱 에지에 벽 생산 1 회가 예약됐는가.★ 자유 실행 표출 클럭이 없는 임베더
 /// (servoshell / WPT / Android)용이다 -- `frame_time.rs` 의 전역 통지와 같은 모양이다.
 ///
@@ -83,7 +100,8 @@ pub(crate) fn take_scheduled_edge() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        TileOutcome, schedule_production_at_next_edge, take_scheduled_edge, tile_may_generate,
+        TileOutcome, ack_is_releasable, schedule_production_at_next_edge, take_scheduled_edge,
+        tile_may_generate,
     };
 
     /// ★예약은 한 번만 생산이 된다 -- 두 공개 함수가 같은 비트를 만지는지까지 본다.★
@@ -116,6 +134,36 @@ mod tests {
     #[test]
     fn a_free_tile_generates() {
         assert_eq!(tile_may_generate(false, false), TileOutcome::Generated);
+    }
+
+    /// ★해제는 생산과 무관하다.★ 이 타일이 이번 틱에 합성했든 안 했든 같다 --
+    /// 그러지 않으면 "모든 요청이 거절" 인 새 구조에서 빚이 영영 안 풀린다.
+    #[test]
+    fn a_debt_with_no_outstanding_images_is_releasable() {
+        let releasable = ack_is_releasable(true, 0);
+        assert!(
+            releasable,
+            "holds_debt=true pending_canvas_images=0 이면 풀어야 한다 (실제 {releasable})"
+        );
+    }
+
+    /// 캔버스가 아직 안 올라갔으면 풀지 않는다 -- FrameDelayer 계약이다.
+    #[test]
+    fn a_debt_with_outstanding_images_waits() {
+        let releasable = ack_is_releasable(true, 1);
+        assert!(
+            !releasable,
+            "holds_debt=true pending_canvas_images=1 이면 기다려야 한다 (실제 {releasable})"
+        );
+    }
+
+    #[test]
+    fn no_debt_releases_nothing() {
+        let releasable = ack_is_releasable(false, 0);
+        assert!(
+            !releasable,
+            "빚이 없으면 보낼 것도 없다 (실제 {releasable})"
+        );
     }
 
     /// ★배리어는 실제로 낸 타일만 기다린다.★ 유지한 타일을 생성 집합에 넣으면 배리어가

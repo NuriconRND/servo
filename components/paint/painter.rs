@@ -156,7 +156,7 @@ use crate::paint::{RepaintReason, WebRenderDebugOption};
 use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::ScreenshotTaker;
-use crate::wall_tick::{TileOutcome, tile_may_generate};
+use crate::wall_tick::{TileOutcome, ack_is_releasable, tile_may_generate};
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
 use crate::webview_renderer::{PinchZoomResult, ScrollResult, UnknownWebView, WebViewRenderer};
@@ -2098,33 +2098,17 @@ impl Painter {
         }
     }
 
-    /// ★낡음(2026-09-02 기록, 같은 날 `2a37b6653b2` 가 사이에 함수를 끼워 넣어 무효)★ — 설명 대상은 `flush_owed_canvas_ack`(:2131)이고 바로 아래 :2105 는 반대로 ack 를 보류한다.
-    /// 스크립트에 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다.
-    ///
-    /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
-    /// ★낡음(2026-09-02 기록, 2026-09-07 `6d1542c888c` 이후 줄 표류로 무효)★ — 실제 자리는 `script_thread.rs:1441` 이고 1200 은 무관한 함수다.
-    /// 로 잠기고 `script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 이
-    /// painter 가 `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀리는데, 그것을
-    /// 보내는 두 자리(`generate_frame_for_script`, `update_images`)는 각각 조건이 안 맞으면
-    /// 그냥 빠져나가고 **재확인을 "다음 `update_images` 호출"에 맡긴다**. 그 약속이
-    /// 캔버스만 있는 페이지에서는 거짓이다 — 이미지를 만드는 것이 스크립트인데 그 스크립트가
-    /// 바로 이 ack 를 기다리고 있으므로 다음 호출이 영원히 오지 않는다.
-    ///
-    /// 실측(2026-09-02, `log_webgpu/51` `ack_34`): 네 painter 전부 46.5 초 동안
-    /// `pending_frame=true pending_canvas_images=0 renderer_behind=false` 였다. ★보낼 조건이
-    /// 다 갖춰진 ack 를 부를 사람이 없어서 못 보낸 것★이지 무엇에 막힌 것이 아니었다.
-    /// 비디오 페이지가 멀쩡한 이유도 같다 — `update_images` 가 끊임없이 와서 재확인이
-    /// 저절로 일어난다.
-    ///
-    /// 그래서 매 페인트 기회마다 한 번 되묻는다. 조건이 안 맞으면 즉시 빠지므로 정상 경로의
-    /// 타이밍은 그대로다(빚이 없으면 첫 줄에서 끝난다). 보내고 나면 빚이 사라져 다음 렌더에서는
-    /// 다시 첫 줄에서 끝나므로, 한 번만 나간다.
     /// ack 전송을 한 번 일부러 건너뛸지(`SERVO_WALL_CANVAS_ACK_SKIP`). 기본값 0 = 항상 false.
     ///
     /// 건너뛸 때 빚(`waiting_pipelines`)과 `pending_frame` 을 ★그대로 남기는 것이 요점★이다 —
     /// 게이트가 닫혀 있어서 못 보낸 것과 똑같은 상태가 되어야 실측된 교착이 재현된다.
     /// [`Painter::flush_owed_canvas_ack`] 는 이것을 소비하지 않는다. 복구까지 같이 막으면
     /// 주입이 무엇을 증명하는지가 사라진다.
+    ///
+    /// ★부르는 자리는 1 차 해제자 하나다★ — 2026-10-21 전에는 `generate_frame_for_script`
+    /// 와 `update_images` 가 불렀는데, 그 두 자리는 이제 ack 를 풀지 않으므로 거기서
+    /// 예산을 쓰면 ***아무 ack 도 보류하지 못한 채*** 주입만 소진된다. 1 차 해제자가
+    /// [`Painter::release_owed_canvas_ack`] 로 옮겨 갔으니 주입도 같이 옮긴다.
     fn consume_canvas_ack_skip(&self) -> bool {
         let left = self.canvas_ack_skips_left.get();
         if left == 0 {
@@ -2151,36 +2135,49 @@ impl Painter {
         true
     }
 
+    /// 빚진 캔버스 ack 를 보낼 수 있으면 **지금** 보낸다. ★복구 경로★ — 1 차 해제자는
+    /// 틱의 [`Painter::release_owed_canvas_ack`] 다.
+    ///
+    /// ★없으면 월이 영구히 멈춘다.★ 캔버스를 그린 문서는 `waiting_on_canvas_image_updates`
+    /// 로 잠기고 `script_thread.rs:1441` 에서 rAF 가 ***통째로*** 건너뛰어진다. 그 잠금은
+    /// 이 painter 가 `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다.
+    ///
+    /// 실측(2026-09-02, `log_webgpu/51` `ack_34`): 네 painter 전부 46.5 초 동안
+    /// `pending_frame=true pending_canvas_images=0 renderer_behind=false` 였다. ★보낼 조건이
+    /// 다 갖춰진 ack 를 부를 사람이 없어서 못 보낸 것★이지 무엇에 막힌 것이 아니었다.
+    /// 비디오 페이지가 멀쩡한 이유도 같다 — `update_images` 가 끊임없이 와서 재확인이
+    /// 저절로 일어난다.
+    ///
+    /// ★2026-10-21 로 달라진 것 둘.★
+    ///
+    /// 1. ***합성을 떼었다.*** 설계 2-6/2-7 — 생산자는 틱 하나다. 여기 남는 일은 전문 하나를
+    ///    보내는 것뿐이고, 빚진 프레임은 ack 를 받은 스크립트가 바로 다시 요청한다
+    ///    (그 46.5 초 교착도 "스크립트가 ack 를 기다리느라 멈춘" 것이지 합성이 모자란 것이
+    ///    아니었다). `set_pending_frame(false)` 도 합성과 같이 뗀다 — 안 낸 프레임을 갚은
+    ///    것으로 적으면 안 된다.
+    /// 2. ***게이트를 `ack_is_releasable` 로 바꾸었다.*** `needs_new_frame() &&
+    ///    !renderer_behind()` 는 ★합성의 조건이지 해제의 조건이 아니다.★ 합성을 뗀 자리에
+    ///    남겨 두면 정확히 이 복구가 필요한 상태를 걸러 낸다 — 합성을 이미 낸 직후에는
+    ///    `pending_frame` 이 내려가 있어서 `needs_new_frame()` 이 거짓이고, 그래서
+    ///    "합성은 했는데 ack 만 안 보낸" 빚이 영영 안 풀린다. `renderer_behind()` 도
+    ///    마찬가지다 — 틱이 계속 바쁘게 만든 타일에서 빚이 그대로 남는다.
+    ///
+    /// `renderer_behind()` 를 더는 부르지 않으므로 그 안의 2 초 강제 해제도 여기서는 안
+    /// 돈다. ★그 프로브는 거절 경로의 것이다★ — `generate_frame_for_wall_tick` 이 매 틱
+    /// ***무조건 먼저*** 부르고(`wall_tick::tile_may_generate`), 스크립트·이미지 경로도
+    /// 그대로 부른다.
     fn flush_owed_canvas_ack(&mut self) {
         if *WALL_DISABLE_CANVAS_ACK_RECOVERY {
             return;
         }
-        if !self.frame_delayer.is_holding_ack() {
+        if !ack_is_releasable(
+            self.frame_delayer.is_holding_ack(),
+            self.frame_delayer.pending_canvas_image_count(),
+        ) {
             return;
         }
-        if !self.frame_delayer.needs_new_frame() || self.renderer_behind() {
-            return;
-        }
 
-        // `update_images` 의 같은 블록과 하는 일이 정확히 같아야 한다 — 여기서만 다르게 하면
-        // 두 경로가 갈라진다.
-        let mut transaction = Transaction::new();
-        self.frame_delayer.set_pending_frame(false);
-        self.generate_frame(&mut transaction, RenderReasons::SCENE);
-        self.set_display_composite_in_flight(true);
-
-        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
-        self.send_to_constellation(
-            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
-                waiting_pipelines,
-            ),
-        );
-
-        self.screenshot_taker
-            .prepare_screenshot_requests_for_render(&*self);
-        if !transaction.is_empty() {
-            self.send_transaction(transaction);
-        }
+        self.send_owed_canvas_ack();
 
         // ★양성 대조★: 고친 뒤에는 스톨이 안 나므로 "아무 줄도 없음"이 남는데, 그것만으로는
         // **고쳐진 것**과 **이 코드가 아예 안 도는 것**이 구분되지 않는다. 이 조사에서만 네 번
@@ -2190,6 +2187,11 @@ impl Painter {
         // (2026-09-03, `log_webgpu/54`: painter 마다 1 회씩 복구했는데 `WALLACKFLUSH` 0 줄).
         // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
         // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
+        //
+        // ★"드물다"는 `gfx_single_frame_producer` 가 켜져 있을 때의 이야기다.★ 틱이 돌면
+        // 1 차 해제자가 그쪽이라 여기는 틱이 못 닿은 몫만 줍는다. 틱이 꺼져 있으면 ***여기가
+        // 유일한 해제자***이므로 캔버스 페이지에서는 초당 한 줄이 계속 나온다 — 그 구성에서
+        // 이 줄은 병증이 아니라 정상 동작의 계수다.
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -2207,6 +2209,48 @@ impl Painter {
         }
     }
 
+    /// ★틱이 타일마다 부르는 1 차 캔버스 ack 해제.★ 이 타일이 이번 틱에 합성했든 안
+    /// 했든, `renderer_behind()` 든 아니든 부른다 — 판정은 `ack_is_releasable` 하나다.
+    ///
+    /// ★왜 생산에서 떼었나.★ 2026-10-21 전에는 해제가 `generate_frame_for_script` 의
+    /// 성공 경로와 rides-the-painter 경로, 그리고 `update_images` 의 합성 블록에 붙어
+    /// 있었다. 생산이 틱 하나로 모이면 그 세 자리는 ***전부 거절***이 되고, 해제가 거기
+    /// 붙어 있으면 빚이 영영 안 풀린다. 실측(2026-10-16, `log_ani_debug 36`): divisor=1
+    /// 실행이 117 초에서 멎었는데 그때까지 계수는 전부 건강했다 — 초당 60 프레임, dx
+    /// 공칭값, overwritten=0. ★멈춘 것은 페인터가 아니라 스크립트였다.★
+    ///
+    /// 복구 자리([`Painter::flush_owed_canvas_ack`])가 그 교착을 못 건진 이유도 같다:
+    /// 그때 그 자리는 `needs_new_frame() && !renderer_behind()` 뒤에 있었다. 지금은 둘 다
+    /// 같은 술어를 쓰고, ★닿는 클럭만 다르다★ — 이쪽은 틱, 저쪽은 렌더. 틱은 렌더가 멎은
+    /// 타일에도 닿고, 렌더는 틱이 없는 임베더에서도 돈다.
+    pub(crate) fn release_owed_canvas_ack(&mut self) {
+        if !ack_is_releasable(
+            self.frame_delayer.is_holding_ack(),
+            self.frame_delayer.pending_canvas_image_count(),
+        ) {
+            return;
+        }
+        // 실패 주입(기본 off). ★1 차 해제자에만 건다★ — 복구는 소비하지 않으므로 주입
+        // 한 번은 "보류 → 다음 렌더의 복구가 보냄(`WALLACKFLUSH`)" 으로 보인다.
+        if self.consume_canvas_ack_skip() {
+            return;
+        }
+        self.send_owed_canvas_ack();
+    }
+
+    /// 빚진 파이프라인에 ack 를 보낸다. ★보낼지 말지는 호출자가 이미 정했다.★
+    ///
+    /// 해제자가 둘(틱의 1 차, 렌더의 복구)이므로 전문 만드는 자리는 하나로 둔다 — 넷이던
+    /// 시절에 각자 조금씩 달라졌던 것이 이 조사의 비용 대부분이었다.
+    fn send_owed_canvas_ack(&mut self) {
+        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
+        self.send_to_constellation(
+            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
+                waiting_pipelines,
+            ),
+        );
+    }
+
     /// 스크립트가 이 painter 의 캔버스 ack 를 기다리다 잠긴 채로 남아 있는지 본다.
     ///
     /// ★여기에 거는 이유★: 스톨이 나면 스크립트도 WebGL 스레드도 논리 프레임도 전부 멈추는데
@@ -2214,12 +2258,14 @@ impl Painter {
     /// 2026-09-02 스톨 실행에서 초당 185회). 그래서 살아 있는 유일한 자리가 여기다.
     ///
     /// 잠기는 구조: 캔버스를 그린 문서는 `waiting_on_canvas_image_updates` 로 잠기고
-    /// ★낡음(2026-09-02 기록, 2026-09-07 `6d1542c888c` 이후 줄 표류로 무효)★ — 실제 자리는 `script_thread.rs:1441`.
-    /// (`script_thread.rs:1200` 에서 rAF 가 통째로 건너뛰어진다), 그 잠금은 painter 가
-    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다. 그런데 그것을 보내는
-    /// 두 자리(`generate_frame_for_script`, `update_images`)는 **둘 다 외부 트리거를 요구**하고
-    /// ★낡음(2026-09-02 18:35 기록, 같은 날 19:54 `2f97f5190c2` 이후 무효)★ — 재시도 주체는 `flush_owed_canvas_ack`(:2131, 호출 :2242)이고 보내는 자리는 넷이다(:2151, :3810, :3838, :3965).
-    /// 그 트리거는 전부 스크립트 하류에 있다. 한 번 어긋나면 재시도할 주체가 없다.
+    /// `script_thread.rs:1441` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 painter 가
+    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다.
+    ///
+    /// ★보내는 자리는 둘이다★(2026-10-21 이전에는 넷이었고, 전부 생산에 붙어 있었다):
+    /// 1 차는 틱의 [`Painter::release_owed_canvas_ack`], 복구는 렌더 맨 앞의
+    /// [`Painter::flush_owed_canvas_ack`]. 둘 다 생산 여부를 묻지 않으므로, 이 줄이 뜬다는
+    /// 것은 ★둘 다 못 돌았다★ 는 뜻이다 — 틱이 멎었고 렌더도 멎었거나, 복구 킬 스위치
+    /// (`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY`)가 켜져 있다.
     ///
     /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
     fn check_canvas_ack_latch(&self) {
@@ -3881,31 +3927,16 @@ impl Painter {
         if self.script_frame_rides_the_painter() {
             self.script_frame_rode_painter
                 .set(self.script_frame_rode_painter.get() + 1);
-            // ★ack 는 반드시 풀어 준다.★ `take_waiting_pipelines` 의 주석이 그 이유다 --
-            // 이 집합이 비지 않은 동안 그 파이프라인의 문서는 `waiting_on_canvas_image_updates`
-            // ★낡음(2026-10-16 기록이지만 번호는 2026-09-07 `6d1542c888c` 이전 것을 베꼈다)★ — 실제 자리는 `script_thread.rs:1441`.
-            // 로 잠겨 ***rAF 를 한 번도 더 돌리지 못한다***(script_thread.rs:1200).
+            // ★여기 있던 캔버스 ack 해제는 2026-10-21 에 틱으로 옮겼다★
+            // ([`Painter::release_owed_canvas_ack`]). 해제를 거절 경로에 달아 두면
+            // divisor=1 처럼 ***매번*** 거절하는 구성에서 빚이 영영 안 풀린다는 것이
+            // 실측이었고(log_ani_debug 36: 117 초에서 멎음), 생산이 틱 하나로 모이면
+            // 이 함수의 ***모든*** 경로가 그 상태가 된다. 그래서 해제는 생산과 같은
+            // 자리에 둘 수 없다.
             //
-            // 위의 `renderer_behind()` 가 안 풀고 빠져도 되는 것은 그것이 ***일시적인***
-            // 상태이기 때문이다. 이 게이트는 다르다 -- divisor=1 이면 스크립트 요청이
-            // ***매번*** 여기로 빠지므로, 안 풀면 영영 안 풀린다. 실측(log_ani_debug 36):
-            // 안 풀었더니 divisor=1 실행만 117 초에서 멎었다(다른 둘은 124 초까지 정상).
-            // 그 직전까지 계수는 전부 건강했다 -- 초당 60 프레임, dx 공칭값, overwritten=0.
-            // ★멈춘 것은 페인터가 아니라 스크립트였다.★
-            let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
-            self.send_to_constellation(
-                EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
-                    waiting_pipelines,
-                ),
-            );
             // `pending_frame` 은 그대로 둔다. 합성은 페인터가 하지만 "빚" 자체는 남아 있어야
             // 페인터가 멈췄을 때 나중 호출이 다시 만든다. `needs_new_frame` 은 이 값과
             // `pending_canvas_images` 만 보므로 남겨 두어도 아무것도 막지 않는다.
-            return false;
-        }
-
-        // 실패 주입(기본 off). 게이트가 닫혔던 것과 같은 자리에서 같은 상태로 빠진다.
-        if self.consume_canvas_ack_skip() {
             return false;
         }
 
@@ -3919,14 +3950,10 @@ impl Painter {
         self.set_display_composite_in_flight(true);
         self.send_transaction(transaction);
 
-        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
-
-        self.send_to_constellation(
-            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
-                waiting_pipelines,
-            ),
-        );
-
+        // 성공 경로의 캔버스 ack 해제도 틱으로 갔다([`Painter::release_owed_canvas_ack`]).
+        // 해제자가 생산 경로에 하나라도 남아 있으면 "어떤 경로는 풀고 어떤 경로는 안 푼다"
+        // 가 되살아난다 — 넷이던 해제자가 조금씩 달라져 있었던 것이 이 조사의 비용
+        // 대부분이었다.
         self.frame_delayer.set_pending_frame(false);
         self.screenshot_taker
             .prepare_screenshot_requests_for_render(self);
@@ -4033,12 +4060,7 @@ impl Painter {
         // `renderer_behind`: while the renderer is draining published frames, defer this
         // composite; the pending-frame flag stays set and one of the frequent subsequent
         // `update_images` calls regenerates once the renderer has caught up.
-        if self.frame_delayer.needs_new_frame() &&
-            !self.renderer_behind() &&
-            // 실패 주입(기본 off). 여기가 실측된 교착의 2 단계 — 이미지는 도착했는데 그 순간
-            // 합성이 in-flight 라 ack 없이 지나간 자리다.
-            !self.consume_canvas_ack_skip()
-        {
+        if self.frame_delayer.needs_new_frame() && !self.renderer_behind() {
             self.frame_delayer.set_pending_frame(false);
             let frame_started = Instant::now();
             self.generate_frame(&mut txn, RenderReasons::SCENE);
@@ -4046,14 +4068,10 @@ impl Painter {
             frames_generated += 1;
             self.set_display_composite_in_flight(true);
             generated_frame = true;
-            let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
 
-            self.send_to_constellation(
-                EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
-                    waiting_pipelines,
-                ),
-            );
-
+            // 여기 있던 캔버스 ack 해제도 틱으로 갔다([`Painter::release_owed_canvas_ack`]).
+            // 실패 주입(`consume_canvas_ack_skip`)도 같이 갔다 — 해제하지 않는 자리에서
+            // 예산을 쓰면 ***아무것도 보류하지 못한 채*** 주입만 소진된다.
             self.screenshot_taker
                 .prepare_screenshot_requests_for_render(&*self);
         }

@@ -1883,7 +1883,9 @@ impl Paint {
         }
     }
 
-    /// ★벽 프레임 하나를 낸다 -- 페이싱 틱의 단일 생산 지점.★
+    /// ★벽 프레임 하나를 낸다 -- 페이싱 틱의 단일 생산 지점.★ 그리고 그 뒤에 빚진 캔버스
+    /// ack 를 푼다(`release_owed_canvas_acks`) -- ★해제는 생산과 무관하므로★ 생산이 거절된
+    /// 타일에서도, 낼 타일이 하나도 없던 주기에도 돈다. 설계 2-7.
     ///
     /// 돌려주는 값은 이번 주기의 논리 프레임 번호다. 타일이 하나도 없으면 `None` 이고,
     /// 그때는 번호를 태우지 않는다 -- 틱은 내용과 무관하게 매 주기 도므로, 받을 타일이
@@ -1902,32 +1904,40 @@ impl Paint {
     /// ★조건이 붙는다★ — 그 게이트는 `gfx_wall_frame_pacing_enabled` 가 켜져 있고 대상
     /// 타일이 둘 이상일 때만 적용되므로, 단일 타일 구성에서는 이 상호작용이 아예 없다.
     ///
-    /// ★그것이 캔버스 ack 해제를 늦춘다.★ 다만 ***유일한 해제자를 막는 것은 아니다***:
-    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내는 자리는 넷이고(`painter.rs`
-    /// `check_canvas_ack_latch` 의 표시 참고), coalesce 가 미루는 것은 그중
-    /// `generate_frame_for_script` 안의 둘이다. 나머지 둘은 경로가 다르다:
-    ///
-    /// - `flush_owed_canvas_ack` — `Painter::render` 맨 앞에서 매 렌더 돈다. ★틱은 렌더를
-    ///   만들어 내므로 이 복구 경로는 오히려 더 자주 돈다.★
-    /// - `update_images` — 캔버스 이미지가 도착할 때 돈다.
-    ///
-    /// 그래서 위험은 ★사라지는 게 아니라 좁아진다.★ 좁아진 자리는 저 둘이 같이 못 도는
-    /// 구간이다 -- 둘 다 `needs_new_frame() && !renderer_behind()` 를 요구하므로, 틱이
-    /// 계속 바쁘게 만든 타일(`renderer_behind()` 참)이나 렌더가 멎은 타일에서는 빚이 그대로
-    /// 남는다. 실측된 rAF 잠금(divisor=1 실행이 117 초에서 멎음, log_ani_debug 36)이 바로
-    /// 그 모양이었다: 매번 거절하는 경로가 ack 를 안 풀어 스크립트가 선다.
-    ///
-    /// ★Task 6 이 해제를 생산에서 떼어 틱마다 돌리면 이 상호작용은 사라진다.★ 그때까지만
-    /// 있는 중간 상태이고, Task 5 의 pref 뒤에서만 존재한다.
+    /// 그것이 스크립트의 생산 요청을 늦추기는 한다. ★그런데 캔버스 ack 해제는 더는 그
+    /// 요청에 붙어 있지 않다★ — 2026-10-21 에 생산에서 떼어 아래 `release_owed_canvas_acks`
+    /// 로 옮겼다(설계 2-7). coalesce 가 미루는 것은 합성뿐이다.
     ///
     /// ★`gather_components` 와 마찬가지로 크레이트 밖에 내지 않는다★ — 밖에서 쓰는 문은
     /// `on_wall_tick` 하나다.
     pub(crate) fn produce_wall_frame(&self) -> Option<u64> {
         let request = self.wall_frame_request_for_all_tiles();
-        if request.target_painter_ids.is_empty() {
-            return None;
+        let logical_frame_id = if request.target_painter_ids.is_empty() {
+            None
+        } else {
+            self.issue_wall_frame_request(request, TileEntryPoint::Tick)
+        };
+        self.release_owed_canvas_acks();
+        logical_frame_id
+    }
+
+    /// ★틱마다, 타일마다 — 그 타일이 이번 틱에 합성했든 안 했든 — 빚이 있고 캔버스가 다
+    /// 올라갔으면 ack 를 푼다.★ 설계 2-7.
+    ///
+    /// 생산 뒤에 도는 이유: 이번 틱의 합성이 그 캔버스를 화면에 올리는 합성이다. 앞에서
+    /// 풀면 스크립트가 ***합성되기 전에*** 다음 rAF 를 돌 수 있다.
+    ///
+    /// 생산 집합이 아니라 ★등록된 모든 painter★ 를 돈다. 거절한 타일이야말로 빚을 쥔 채
+    /// 남는 타일이고(실측: divisor=1 에서 스크립트 요청이 매번 거절로 빠져 117 초에
+    /// 멎었다), 생성 집합으로 키를 잡으면 그 타일에 영영 안 닿는다. 낼 타일이 하나도
+    /// 없어 논리 프레임을 태우지 않은 주기에도 돈다 — 해제는 생산과 무관하다.
+    ///
+    /// 결과가 필요 없지만 ★`with_painter_mut_detached` 를 쓰지 않는다★: 그쪽은 큐가 차면
+    /// 콜백을 ***버리고***, 버려진 해제는 곧 멎은 스크립트다.
+    fn release_owed_canvas_acks(&self) {
+        for painter_id in self.painter_ids() {
+            self.with_painter_mut(painter_id, |painter| painter.release_owed_canvas_ack());
         }
-        self.issue_wall_frame_request(request, TileEntryPoint::Tick)
     }
 
     /// ★페이싱 틱이 벽에 들어오는 유일한 문.★ 셸이 표출 주기마다 한 번 부른다.
