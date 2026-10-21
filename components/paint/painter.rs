@@ -2175,12 +2175,18 @@ impl Painter {
         // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
         // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
         //
-        // ★"드물다"가 전부 참은 아니다.★ 1 차 해제(틱)는 보통 먼저 비우지만, 그것이 못
-        // 미친 빚은 전부 여기가 잡는다. 그러면 1 초 합치기 상한까지 = painter 당 초당 1 줄
-        // 까지 나온다. 그 양은 병증이 아니라 이 갈래가 메워지고 있다는 뜻이다. 병증은
-        // `WALLACKLATCH` 쪽이다. (2026-10-22 전에는 ***틱 생산이 통째로 없는 구성***
-        // (`gfx_single_frame_producer` off)이 있어서 이 줄이 상시로 나왔다. 그 pref 는
-        // 삭제됐다 -- 지금은 1 차가 언제나 돈다.)
+        // ★"드물다"가 더는 전부 참이 아니다.★ 1 차 해제(틱)는 보통 먼저 비우지만, 그것이
+        // 못 미친 빚은 전부 여기가 잡는다. 그러면 1 초 합치기 상한까지 = painter 당 초당
+        // 1 줄까지 나온다. 그 양은 병증이 아니라 이 갈래가 메워지고 있다는 뜻이다. 병증은
+        // `WALLACKLATCH` 쪽이다.
+        //
+        // ★1 차가 아예 안 도는 구성이 아직 하나 남아 있다 -- 수요 구동 임베더의 조용한
+        // 페이지다.★ servoshell / WPT / Android 는 깨우기가 에지를 예약해야 생산하므로
+        // (`wall_tick::take_scheduled_edge`, 불변식 16), 깨우기가 없으면 틱이 돌아도
+        // `produce_wall_frame` 이 안 불리고 1 차 해제도 안 돈다. 그때 빚을 푸는 것은 이
+        // 복구뿐이다. 자유 실행 표출 클럭이 있는 셸(`winit_wall`)에서만 1 차가 매 주기
+        // 닿는다. (2026-10-22 전에는 그 셸에도 `gfx_single_frame_producer` off 라는
+        // ***틱 생산이 통째로 없는 구성***이 있었다. 그 pref 는 삭제됐다.)
         let total = self.owed_ack_flush_count.get() + 1;
         self.owed_ack_flush_count.set(total);
         let now = Instant::now();
@@ -4191,7 +4197,12 @@ impl Painter {
             let elapsed = window.elapsed();
             if elapsed >= Duration::from_secs(1) {
                 warn!(
-                    // ★`raf_idle=` 는 2026-10-22 에 빠졌다★ -- 필드 주석 참고(구조적으로 0).
+                    // ★`raf_idle=` 필드는 2026-10-22 에 이 줄에서 사라졌다(rAF 게이트
+                    // 삭제, 설계 4 절).★ 세던 사건("rAF 는 도는데 프레임이 안 나와서
+                    // 비디오가 스스로 합성해야 했다")이 구조적으로 0 이라 값이 아니라
+                    // ***필드째*** 뺐다. ★그래서 2026-10-22 이전 로그와는 필드 수가
+                    // 다르다★ -- 옛 로그를 자리로 파싱하는 외부 스크립트는 그 날짜를
+                    // 경계로 갈라서 읽어야 한다.
                     "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} send_ms={:.1} rest_ms={:.1} vidgap_max_ms={:.1} vidarrive_max_ms={:.1}",
                     elapsed.as_secs_f64() * 1000.0,
                     stats.calls,
