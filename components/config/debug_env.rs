@@ -306,6 +306,32 @@ pub const DCOMP_SLOW_COMMIT_MS: DebugFlag = DebugFlag {
     cache_index: 21,
 };
 
+// ---------------------------------------------------------------------------------------------
+// 스크립트가 받은 프레임 시각의 수열 (components/paint/frame_time.rs, FRAMETIME).
+// ---------------------------------------------------------------------------------------------
+
+pub const FRAME_TIME_PROF: DebugFlag = DebugFlag {
+    name: "SERVO_FRAME_TIME_PROF",
+    kind: Kind::Str,
+    doc: "틱에 실려 나간 프레임 시각의 간격을 painter 별로 1 초에 한 줄씩 집계한다 -- \
+          `FRAMETIME`(dup / one / skip1 / skipN, dt 백분위, 틱 시점과의 지연 lag, 셸 값 대신 \
+          now() 로 떨어진 fallback 수). truthy: \"1\" 또는 \"true\"(대소문자 무시). \
+          ★이 값이 곧 페이지의 `requestAnimationFrame` 타임스탬프다★ -- 프레임이 초당 60 개 \
+          나가도 이 수열이 고르지 않으면 화면의 변위가 고르지 않다. 그래서 `dup` 이 0 이 \
+          아니면 그 자체가 결함이다(연속한 두 틱이 같은 시각을 실어 보냈다는 뜻이고, 페이지는 \
+          같은 위치를 두 번 계산한다). 같은 출력 페이지를 Chrome 은 single tile 에서 60fps 로 \
+          돌리는데 winit_wall 은 떨리고, 우리 지표는 전부 깨끗했다(2026-10-21, \
+          log_ani_debug_05/12) -- 그때 남아 있던 유일한 변수가 이것이라 만들었다. \
+          같은 스위치가 스크립트 쪽의 `RAFCLOCK` 도 켠다 \
+          (`components/script/raf_clock.rs`) -- 이쪽은 ***보낸*** 값이고 저쪽은 페이지가 ***받은*** 값이라, \
+          둘을 나란히 읽어야 어느 구간에서 고르지 않게 됐는지가 갈린다. `RAFCLOCK` 의 `clamped` 는 \
+          `Document::resolve_frame_time` 의 단조 증가 하한에 걸려 페이지가 직전과 같은 시각을 \
+          받은 횟수다. `SERVO_LOG_ANIM_STEP_SEQ` 를 함께 켜면 정렬 전 원시 수열(`FRAMETIMESEQ` / \
+          `RAFCLOCKSEQ`)도 찍는다. \
+          틱마다 불리는 자리라 기본 off.",
+    cache_index: 22,
+};
+
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
 /// 어서션이 강제한다).
 pub const ALL: &[&DebugFlag] = &[
@@ -331,6 +357,7 @@ pub const ALL: &[&DebugFlag] = &[
     &WALL_CANVAS_ACK_SKIP,
     &WALL_DISABLE_CANVAS_ACK_RECOVERY,
     &DCOMP_SLOW_COMMIT_MS,
+    &FRAME_TIME_PROF,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

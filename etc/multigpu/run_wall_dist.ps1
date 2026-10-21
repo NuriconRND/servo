@@ -530,6 +530,14 @@ param(
     # 1.5~2 초 안정" 같은 구조가 p05/p50/p95 로는 보이지 않고, 실측에서 그 요약이 저더와
     # ***음의 상관***이었다(설계 문서 45). 창당 한 줄 약 700 자, 벽에서 초당 네 줄이다.
     [switch] $AnimStepSeq,
+    # SERVO_FRAME_TIME_PROF=1: FRAMETIME -- 틱에 실려 나간 프레임 시각의 간격을 painter 별로
+    # 1 초에 한 줄씩 잰다. ★다른 지표는 전부 프레임을 세지만 이것은 그 프레임이 실은 값을
+    # 센다★ -- 이 값이 그대로 페이지의 requestAnimationFrame 타임스탬프이므로, 초당 60 프레임이
+    # 나가도 이 수열이 고르지 않으면 페이지가 계산하는 위치가 고르지 않다. 같은 출력 페이지를
+    # Chrome 은 single tile 에서 60fps 로 돌리는데 winit_wall 은 떨리고 우리 지표는 전부
+    # 깨끗했다(2026-10-21) -- 그때 남아 있던 유일한 변수가 이것이다.
+    # -AnimStepSeq 를 함께 주면 정렬 전 원시 수열(FRAMETIMESEQ)도 찍는다.
+    [switch] $FrameTimeProf,
     # dom_animation_timeline_use_frame_time: 애니메이션의 기준 시각을 "script 가 도달한
     # 순간" 대신 "그 프레임의 시각" 으로 쓴다. 엔진 기본은 켜짐이므로, 이 스위치는 끌 때
     # 쓴다. 왜 필요한지는 설계 문서 50 과 2026-10-15 설계.
@@ -798,6 +806,7 @@ else                       { Remove-Item Env:\SERVO_SCRIPT_FORCE_GC_SEC -ErrorAc
 if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($AnimStepSeq)          { $env:SERVO_LOG_ANIM_STEP_SEQ = "1" }
+if ($FrameTimeProf)        { $env:SERVO_FRAME_TIME_PROF = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
 
@@ -1965,6 +1974,117 @@ if ($cw) {
     }
 } elseif ($DcompBindProf) {
     Write-Warning "-DcompBindProf was set but no COMMITWORK line was logged. It is emitted right after COMMITSITE by the same compositor; if COMMITSITE printed and this did not, the engine predates this table."
+}
+
+# --- FRAMETIME: is the timestamp the PAGE receives evenly spaced? ---
+# Every other metric in this script counts frames. This one counts the VALUES those frames
+# carried. `frame_time` is handed to the script thread and becomes the page's
+# requestAnimationFrame timestamp, so the page computes its own position from this sequence:
+# 60 frames a second with an uneven sequence still draws an uneven animation, and no frame
+# counter anywhere shows it.
+#
+# Read `repeated` first. It means two consecutive ticks carried the same time, so the page
+# computed the same position twice and the screen stood still for that frame -- the one
+# failure mode that looks exactly like "the animation is not 60fps" while every frame counter
+# reads 60.
+$ft = Select-String -Path $LogPath -Pattern "FRAMETIME painter=" -EA SilentlyContinue
+if ($ft) {
+    $ftWindows = 0; $ftN = 0; $ftDup = 0; $ftOne = 0; $ftSkip1 = 0; $ftSkipN = 0
+    $ftFallback = 0; $ftDtMax = 0.0; $ftLagMax = 0.0; $ftP50 = @()
+    foreach ($m in $ft) {
+        if ($m.Line -notmatch "n=(\d+) per_interval dup=(\d+) one=(\d+) skip1=(\d+) skipN=(\d+) dt_ms p05=([-\d.]+) p50=([-\d.]+) p95=([-\d.]+) max=([-\d.]+) lag_ms p50=([-\d.]+) p95=([-\d.]+) max=([-\d.]+) fallback=(\d+)") { continue }
+        $ftWindows++
+        $ftN        += [int]$Matches[1]
+        $ftDup      += [int]$Matches[2]
+        $ftOne      += [int]$Matches[3]
+        $ftSkip1    += [int]$Matches[4]
+        $ftSkipN    += [int]$Matches[5]
+        $ftP50      += [double]$Matches[7]
+        $ftDtMax     = [math]::Max($ftDtMax,  [double]$Matches[9])
+        $ftLagMax    = [math]::Max($ftLagMax, [double]$Matches[12])
+        $ftFallback += [int]$Matches[13]
+    }
+    if ($ftN -gt 0) {
+        $sorted = $ftP50 | Sort-Object
+        $median = $sorted[[int]([math]::Floor($sorted.Count / 2))]
+        $pct = { param($k) 100.0 * $k / $ftN }
+        Write-Host ""
+        Write-Host ("FRAMETIME -- the rAF timestamp the page received ({0:N0} windows, {1:N0} intervals):" -f $ftWindows, $ftN)
+        Write-Host ("  one period apart     {0,8:N0}  {1,5:N1}%   <- what a clean run is made of" -f $ftOne, (& $pct $ftOne))
+        Write-Host ("  repeated             {0,8:N0}  {1,5:N1}%   <- page computed the same position twice" -f $ftDup, (& $pct $ftDup))
+        Write-Host ("  one period skipped   {0,8:N0}  {1,5:N1}%" -f $ftSkip1, (& $pct $ftSkip1))
+        Write-Host ("  more skipped         {0,8:N0}  {1,5:N1}%" -f $ftSkipN, (& $pct $ftSkipN))
+        Write-Host ("  median interval      {0,8:N2} ms  (60Hz = 16.67)" -f $median)
+        Write-Host ("  worst gap            {0,8:N2} ms" -f $ftDtMax)
+        Write-Host ("  worst lag behind tick{0,8:N2} ms  (how old the value was when it went out)" -f $ftLagMax)
+        Write-Host ("  fell back to now()   {0,8:N0}  {1,5:N1}%   <- shell value missing or stale" -f $ftFallback, (& $pct $ftFallback))
+        $uneven = $ftDup + $ftSkip1 + $ftSkipN
+        if ($uneven -eq 0) {
+            Write-Host "  Every interval was one period on the way out. Read RAFCLOCK below before concluding"
+            Write-Host "  anything: the script thread can still lose or clamp these values, and only that line"
+            Write-Host "  shows what the page was actually handed."
+        } else {
+            Write-Warning ("{0:N0} of {1:N0} intervals ({2:N1}%) were not one period. The page was handed an uneven clock, so it computed uneven positions -- the animation cannot be smooth no matter how many frames go out. This is already uneven on the way out of paint, so the pacing is the first suspect -- RAFCLOCK below can only make it worse, never better." -f $uneven, $ftN, (& $pct $uneven))
+        }
+    }
+} elseif ($FrameTimeProf) {
+    Write-Warning "-FrameTimeProf was set but no FRAMETIME line was logged. It emits from frame_time_for_tick, which only runs while something on the page is animating -- a static page produces no ticks and no line."
+}
+
+# --- RAFCLOCK: the other end of the same sequence ---
+# FRAMETIME is what paint SENT. This is what the page RECEIVED: the timestamp handed to its
+# requestAnimationFrame callbacks, after the script thread consumed the tick and
+# Document::resolve_frame_time applied its monotonic clamp.
+#
+# `clamped` is the one to read. It counts rounds where the candidate was older than the last
+# value the page saw, so the page was handed the SAME timestamp twice and computed the same
+# position twice. A round that could not use a tick falls back to now(), which jumps the clock
+# forward, and every paced (therefore earlier) tick after it gets clamped -- 60 frames out, a
+# screen that stands still.
+$rc = Select-String -Path $LogPath -Pattern "RAFCLOCK pipeline=" -EA SilentlyContinue
+if ($rc) {
+    $rcWindows = 0; $rcN = 0; $rcDup = 0; $rcOne = 0; $rcSkip1 = 0; $rcSkipN = 0
+    $rcFallback = 0; $rcClamped = 0; $rcMax = 0.0; $rcP50 = @()
+    foreach ($m in $rc) {
+        if ($m.Line -notmatch "n=(\d+) per_interval dup=(\d+) one=(\d+) skip1=(\d+) skipN=(\d+) dt_ms p05=([-\d.]+) p50=([-\d.]+) p95=([-\d.]+) max=([-\d.]+) fallback=(\d+) clamped=(\d+)") { continue }
+        $rcWindows++
+        $rcN        += [int]$Matches[1]
+        $rcDup      += [int]$Matches[2]
+        $rcOne      += [int]$Matches[3]
+        $rcSkip1    += [int]$Matches[4]
+        $rcSkipN    += [int]$Matches[5]
+        $rcP50      += [double]$Matches[7]
+        $rcMax       = [math]::Max($rcMax, [double]$Matches[9])
+        $rcFallback += [int]$Matches[10]
+        $rcClamped  += [int]$Matches[11]
+    }
+    if ($rcN -gt 0) {
+        $rcSorted = $rcP50 | Sort-Object
+        $rcMedian = $rcSorted[[int]([math]::Floor($rcSorted.Count / 2))]
+        $rcPct = { param($k) 100.0 * $k / $rcN }
+        Write-Host ""
+        Write-Host ("RAFCLOCK -- the timestamp the page's rAF callback received ({0:N0} windows, {1:N0} intervals):" -f $rcWindows, $rcN)
+        Write-Host ("  one period apart     {0,8:N0}  {1,5:N1}%" -f $rcOne, (& $rcPct $rcOne))
+        Write-Host ("  repeated             {0,8:N0}  {1,5:N1}%   <- page computed the same position twice" -f $rcDup, (& $rcPct $rcDup))
+        Write-Host ("  one period skipped   {0,8:N0}  {1,5:N1}%" -f $rcSkip1, (& $rcPct $rcSkip1))
+        Write-Host ("  more skipped         {0,8:N0}  {1,5:N1}%" -f $rcSkipN, (& $rcPct $rcSkipN))
+        Write-Host ("  median interval      {0,8:N2} ms  (60Hz = 16.67)" -f $rcMedian)
+        Write-Host ("  worst gap            {0,8:N2} ms" -f $rcMax)
+        Write-Host ("  monotonic clamp hit  {0,8:N0}  {1,5:N1}%   <- handed the previous value again" -f $rcClamped, (& $rcPct $rcClamped))
+        Write-Host ("  fell back to now()   {0,8:N0}  {1,5:N1}%   <- the round had no tick to use" -f $rcFallback, (& $rcPct $rcFallback))
+        $rcUneven = $rcDup + $rcSkip1 + $rcSkipN
+        if ($rcClamped -gt 0 -or $rcFallback -gt 0) {
+            Write-Warning ("The page's clock was distorted on the script side: {0:N0} rounds fell back to now() and {1:N0} were clamped back to the previous value. That is ours, in Document::resolve_frame_time -- the page cannot draw an even animation from an uneven clock no matter how many frames go out." -f $rcFallback, $rcClamped)
+        } elseif ($rcUneven -eq 0) {
+            Write-Host "  Even. Together with a clean FRAMETIME this clears the whole clock path: the page was"
+            Write-Host "  handed one period per frame. An animation that still looks uneven is then about WHEN"
+            Write-Host "  the frame carrying each value reached the screen, not about the value it carried."
+        } else {
+            Write-Warning ("{0:N0} of {1:N0} intervals ({2:N1}%) were not one period, with no clamp and no fallback. Compare with FRAMETIME above: if that one is even, the ticks were lost between paint and the page (pending_frame_time is a single Cell and a second tick overwrites the first); if it is uneven too, the problem is upstream in the pacing." -f $rcUneven, $rcN, (& $rcPct $rcUneven))
+        }
+    }
+} elseif ($FrameTimeProf) {
+    Write-Warning "-FrameTimeProf was set but no RAFCLOCK line was logged. It emits from Document::resolve_frame_time, which runs on every rendering update -- if FRAMETIME printed and this did not, the ticks are not reaching the script thread at all."
 }
 
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }

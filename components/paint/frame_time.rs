@@ -4,10 +4,14 @@
 
 //! 셸이 알려준 프레임 시각.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use servo_base::cross_process_instant::CrossProcessInstant;
+use servo_base::id::PainterId;
+use servo_base::interval_summary::{percentiles, summarize_intervals};
 
 /// 셸이 마지막으로 알려준 프레임 시각, epoch 로부터의 나노초. `i64::MIN` 은 "없음".
 ///
@@ -63,12 +67,131 @@ pub(crate) fn fresh_frame_time(
     (age <= time::Duration::try_from(max_age).ok()?).then_some(stored)
 }
 
-/// 틱에 실을 프레임 시각. 없거나 오래됐으면 `None` -- 호출자가 `now()` 로 떨어진다.
+/// 틱에 실을 프레임 시각. 셸 값이 없거나 오래됐으면 `now` 로 떨어진다.
+///
+/// ★폴백까지 여기서 한다.★ 두 호출 지점이 각자 `unwrap_or_else(now)` 하던 것을 모았다.
+/// 계측이 빠진 틱 경로가 하나라도 있으면 `FRAMETIME` 이 "실제로 나간 수열" 을 재지 못한다
+/// (`CommitSite` 를 인자로 받는 `raw_commit` 과 같은 이유).
 pub(crate) fn frame_time_for_tick(
+    painter_id: PainterId,
     now: CrossProcessInstant,
     max_age: Duration,
-) -> Option<CrossProcessInstant> {
-    fresh_frame_time(stored_frame_time(), now, max_age)
+) -> CrossProcessInstant {
+    let fresh = fresh_frame_time(stored_frame_time(), now, max_age);
+    let delivered = fresh.unwrap_or(now);
+    if *FRAME_TIME_PROF {
+        record_delivered(painter_id, delivered, now, fresh.is_some());
+    }
+    delivered
+}
+
+// -------------------------------------------------------------------------------------
+// FRAMETIME -- 틱에 실려 나간 프레임 시각의 수열.
+//
+// ★무엇을 재는가.★ 다른 지표는 전부 프레임을 세지만 이것은 그 프레임이 실은 값을 센다.
+// 이 값은 스크립트로 건너가 페이지의 `requestAnimationFrame` 타임스탬프가 되고, 페이지는
+// 그것으로 자기 위치를 계산한다. ***프레임이 초당 60 개 나가도 이 수열이 고르지 않으면
+// 화면의 변위가 고르지 않다.***
+//
+// 왜 필요한가(2026-10-21): 같은 출력 페이지를 Chrome 은 single tile 에서 60fps 로 돌리는데
+// winit_wall 은 떨린다. 그런데 우리 쪽 지표는 전부 깨끗하다 -- 초당 60~61 프레임이 전부
+// 화면에 나가고(`WRRATE superseded=0`), 스크립트 스레드는 1%, 메인은 13% 다. 남은 변수가
+// "그 프레임들이 어떤 시각값을 실었는가" 인데 그것을 재는 수단이 없었다.
+//
+// ★반드시 `RAFCLOCK` 과 함께 읽는다★(`components/script/raf_clock.rs`). 이쪽은 보낸 값이고
+// 저쪽은 페이지가 받은 값이다. 둘이 다르면 그 사이 -- 스크립트 스레드의 틱 소비와
+// `Document::resolve_frame_time` 의 단조 증가 클램프 -- 가 범인이다.
+// -------------------------------------------------------------------------------------
+
+/// `SERVO_FRAME_TIME_PROF` 게이트. 틱마다 묻는 자리라 env 읽기를 캐시한다.
+static FRAME_TIME_PROF: LazyLock<bool> = LazyLock::new(|| {
+    servo_config::debug_env::string(&servo_config::debug_env::FRAME_TIME_PROF)
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+});
+
+/// painter 하나의 한 창.
+#[derive(Default)]
+struct DeliveryWindow {
+    start: Option<Instant>,
+    previous: Option<CrossProcessInstant>,
+    dt_ms: Vec<f64>,
+    lag_ms: Vec<f64>,
+    fallback: u32,
+}
+
+/// painter 별 창. 틱은 painter 스레드에서 오고 여럿이 같은 전역을 쓰므로 뮤텍스다 --
+/// 초당 수백 번이라 경합이 문제되지 않는다. 게이트가 꺼져 있으면 아예 잠그지 않는다.
+static DELIVERIES: LazyLock<Mutex<HashMap<PainterId, DeliveryWindow>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn millis(duration: time::Duration) -> f64 {
+    duration.as_seconds_f64() * 1000.0
+}
+
+fn record_delivered(
+    painter_id: PainterId,
+    delivered: CrossProcessInstant,
+    now: CrossProcessInstant,
+    from_shell: bool,
+) {
+    let Ok(mut deliveries) = DELIVERIES.lock() else {
+        return;
+    };
+    let window = deliveries.entry(painter_id).or_default();
+    let at = Instant::now();
+    let start = *window.start.get_or_insert(at);
+    if !from_shell {
+        window.fallback += 1;
+    }
+    if let Some(previous) = window.previous {
+        window.dt_ms.push(millis(delivered - previous));
+    }
+    window.previous = Some(delivered);
+    // ★음수를 자르지 않는다.★ `fresh_frame_time` 이 미래의 값도 쓰므로 `now - delivered`
+    // 는 음수일 수 있다. 자르면 위상이 앞선 것을 못 본다.
+    window.lag_ms.push(millis(now - delivered));
+
+    if at.duration_since(start) < Duration::from_secs(1) {
+        return;
+    }
+    window.start = Some(at);
+    let mut dt = std::mem::take(&mut window.dt_ms);
+    let mut lag = std::mem::take(&mut window.lag_ms);
+    let fallback = std::mem::replace(&mut window.fallback, 0);
+    // 로그는 락 밖에서 찍는다 -- 다른 painter 의 틱을 막지 않는다.
+    drop(deliveries);
+
+    let period_ms = crate::refresh_driver::paint_timer_period().as_secs_f64() * 1000.0;
+    let (Some(intervals), Some(lag)) = (
+        summarize_intervals(&mut dt, period_ms),
+        percentiles(&mut lag),
+    ) else {
+        return;
+    };
+    if *crate::painter::LOG_ANIM_STEP_SEQ {
+        log::warn!(
+            "FRAMETIMESEQ painter={painter_id:?} n={} dt_ms=[{}]",
+            intervals.n,
+            intervals.sequence,
+        );
+    }
+    log::warn!(
+        "FRAMETIME painter={painter_id:?} n={} per_interval dup={} one={} skip1={} skipN={} \
+         dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
+         lag_ms p50={:.2} p95={:.2} max={:.2} fallback={fallback}",
+        intervals.n,
+        intervals.dup,
+        intervals.one,
+        intervals.skip1,
+        intervals.skip_n,
+        intervals.p05,
+        intervals.p50,
+        intervals.p95,
+        intervals.max,
+        lag.p50,
+        lag.p95,
+        lag.max,
+    );
 }
 
 #[cfg(test)]

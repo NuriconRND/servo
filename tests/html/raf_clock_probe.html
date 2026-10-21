@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>rAF 시계 대조</title>
+<!--
+  ★무엇을 가리는 프로브인가.★
+
+  표출 페이지(IPWall)의 영역 회전은 rAF 콜백 안에서 인라인 `transform: rotate()` 를 매
+  프레임 다시 쓰는 방식이다. 그 회전이 winit_wall 에서 떨리는데, 같은 페이지를 Chrome 은
+  single tile 에서 60fps 로 돌린다(2026-10-21 운영자 확인). 즉 ***그 구조 자체는 60fps 를
+  낼 수 있다***. 그렇다면 남는 것은 엔진이 그 콜백에 넘기는 ***시각값***이다.
+
+  각도는 rAF 타임스탬프의 순수 함수다. 그래서 타임스탬프 수열이 고르지 않으면 프레임이
+  초당 60 개 나가도 각도가 고르지 않다 -- 프레임 수를 세는 지표로는 보이지 않는 결함이고,
+  엔진 쪽 `FRAMETIME`/`RAFCLOCK` 이 같은 수열을 양끝에서 잰다.
+
+  ★두 수열을 같이 잰다.★
+
+    rAF dt   -- 콜백이 받은 타임스탬프의 간격. 엔진이 정하는 값이다.
+    wall dt  -- 콜백이 ***실제로 실행된*** 시각(`performance.now()`)의 간격.
+
+  둘을 비교하면 범인이 갈린다.
+
+    rAF 고름 + wall 고름    -> 시계는 정상. 떨림은 화면 도달 시점의 문제다.
+    rAF 거침 + wall 고름    -> ★엔진이 주는 값이 거칠다★. 스크립트는 제때 깨어났다.
+    rAF 거침 + wall 거침    -> 스크립트 스레드가 고르게 깨어나지 못한다.
+
+  ★두 사각형을 같이 돌린다.★ 왼쪽은 위의 rAF 방식(표출 페이지와 같은 구조), 오른쪽은
+  `Element.animate()` 로 걸어 페인트측이 전진시키는 방식이다. Chrome 에서는 둘이 똑같이
+  보인다. winit_wall 에서 한쪽만 떨면 ***로그 없이도*** 어느 경로가 깨졌는지 눈으로 갈린다.
+
+  ★회전에 easing 이 있다.★ 표출 페이지의 회전은 등속이 아니라 한 바퀴의 시작이 가속하고
+  끝이 감속한다(운영자 확인). 그래서 여기도 `ease-in-out` 을 한 바퀴에 건다 -- 등속으로
+  바꾸면 변위가 가장 큰 중간 구간이 사라져서 같은 크기의 지터가 훨씬 덜 보인다.
+
+  쿼리: ?period=8000 (한 바퀴 ms) ?size=520 (사각형 한 변 px)
+
+  로그: 1 초에 한 줄 `RAFPROBE`. 화면을 못 볼 때는 이 줄만 grep 하면 된다.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e8ecf1;
+               font: 15px/1.5 ui-monospace, Consolas, monospace; overflow: hidden; }
+  .wrap { display: flex; height: 100%; align-items: center; justify-content: space-evenly; }
+  .cell { text-align: center; }
+  .label { margin-bottom: 18px; letter-spacing: .04em; color: #9fb0c3; }
+  .box { background: linear-gradient(135deg, #2f6df6 0%, #27c1a4 100%);
+         display: grid; place-items: center; font-size: 54px; font-weight: 700;
+         color: #06202a; will-change: transform; }
+  /* 축을 눈으로 잡아 주는 표식 -- 모서리가 돌아가는 것을 봐야 끊김이 보인다. */
+  .box::after { content: ""; position: absolute; width: 14px; height: 14px;
+                border-radius: 50%; background: #0b0d10; transform: translateY(-38%); }
+  #stats { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 18px;
+           background: #11151b; border-top: 1px solid #222a33; white-space: pre;
+           font-size: 17px; line-height: 1.45; }
+</style>
+
+<div class="wrap">
+  <div class="cell">
+    <div class="label">rAF + inline transform<br>(표출 페이지와 같은 구조)</div>
+    <div class="box" id="raf">rAF</div>
+  </div>
+  <div class="cell">
+    <div class="label">Element.animate()<br>(페인트측이 전진시킨다)</div>
+    <div class="box" id="waapi">WAAPI</div>
+  </div>
+</div>
+<div id="stats">측정 중…</div>
+
+<script>
+'use strict';
+
+const params = new URLSearchParams(location.search);
+const PERIOD_MS = Math.max(500, Number(params.get('period')) || 8000);
+const SIZE_PX = Math.max(80, Number(params.get('size')) || 520);
+
+for (const el of document.querySelectorAll('.box')) {
+  el.style.width = SIZE_PX + 'px';
+  el.style.height = SIZE_PX + 'px';
+}
+
+// 한 바퀴에 걸리는 ease-in-out. 표출 페이지의 프리셋과 같은 모양이다.
+// (cubic-bezier 가 아니라 해석적 easing 을 쓴다 -- JS 쪽과 WAAPI 쪽이 ***정확히*** 같은
+//  곡선이어야 둘을 나란히 두고 비교할 수 있는데, 브라우저의 "ease-in-out" 은
+//  cubic-bezier(.42,0,.58,1) 이라 JS 로 그대로 재현하려면 근을 풀어야 한다.)
+function easeInOut(t) {
+  return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+}
+
+// --- 오른쪽: 페인트측 경로 ------------------------------------------------------------
+// 같은 곡선을 키프레임으로 떠서 건다. `Element.animate` 가 없는 엔진에서는 걸리지 않고
+// 그대로 멈춰 있는데, 그 자체가 정보다(표출 페이지도 같은 조건에서 효과가 빠진다).
+const waapiEl = document.getElementById('waapi');
+let waapiOn = false;
+if (typeof waapiEl.animate === 'function') {
+  const frames = [];
+  for (let i = 0; i <= 60; i++) {
+    const t = i / 60;
+    frames.push({ offset: t, transform: 'rotate(' + (easeInOut(t) * 360).toFixed(3) + 'deg)' });
+  }
+  waapiEl.animate(frames, { duration: PERIOD_MS, iterations: Infinity, easing: 'linear' });
+  waapiOn = true;
+}
+
+// --- 왼쪽: 표출 페이지와 같은 구조 ------------------------------------------------------
+const rafEl = document.getElementById('raf');
+const statsEl = document.getElementById('stats');
+
+let rafStart = null;      // 첫 rAF 타임스탬프
+let lastRaf = null;       // 직전 rAF 타임스탬프
+let lastWall = null;      // 직전 performance.now()
+let reportedAt = null;
+const rafDt = [];
+const wallDt = [];
+let windowFrames = 0;
+
+function pct(sorted, p) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.round((sorted.length - 1) * p))];
+}
+
+// 한 주기의 몇 배인지로 나눈다 -- 엔진의 FRAMETIME/RAFCLOCK/ANIMREADY 와 같은 경계다.
+// 그래야 네 줄을 나란히 읽을 수 있다.
+function bands(samples, period) {
+  let dup = 0, one = 0, skip1 = 0, skipN = 0;
+  for (const v of samples) {
+    if (v < 0.5 * period) dup++;
+    else if (v < 1.5 * period) one++;
+    else if (v < 2.5 * period) skip1++;
+    else skipN++;
+  }
+  return { dup, one, skip1, skipN };
+}
+
+function tick(now) {
+  const wall = performance.now();
+  if (rafStart === null) { rafStart = now; reportedAt = wall; }
+  if (lastRaf !== null) rafDt.push(now - lastRaf);
+  if (lastWall !== null) wallDt.push(wall - lastWall);
+  lastRaf = now;
+  lastWall = wall;
+  windowFrames++;
+
+  // ★각도는 rAF 타임스탬프의 순수 함수다.★ 표출 페이지와 같다 -- 그래서 이 각도의
+  // 매끄러움은 위 수열의 매끄러움과 같은 것이지, 별개의 성질이 아니다.
+  const phase = ((now - rafStart) % PERIOD_MS) / PERIOD_MS;
+  rafEl.style.transform = 'rotate(' + (easeInOut(phase) * 360).toFixed(3) + 'deg)';
+
+  if (wall - reportedAt >= 1000) {
+    const seconds = (wall - reportedAt) / 1000;
+    reportedAt = wall;
+    // 창마다 비운다 -- 누적하면 기동 구간이 끝까지 꼬리를 남겨 추이를 못 본다.
+    const r = rafDt.splice(0, rafDt.length);
+    const w = wallDt.splice(0, wallDt.length);
+    const frames = windowFrames;
+    windowFrames = 0;
+    if (!r.length) { requestAnimationFrame(tick); return; }
+
+    // 한 프레임이 "한 주기" 인지 판정하려면 주기를 알아야 하는데, 디스플레이 주사율을
+    // 페이지가 직접 물을 방법이 없다. 그래서 이 창의 중앙값을 주기로 삼는다 -- 고른
+    // 실행에서는 그것이 곧 주사율 주기이고, 거친 실행에서는 중앙값 자체가 흔들리므로
+    // 밴드가 과장되지 않는 쪽으로 틀린다(보수적이다).
+    const rs = r.slice().sort((a, b) => a - b);
+    const ws = w.slice().sort((a, b) => a - b);
+    const period = pct(rs, 0.50) || 16.67;
+    const b = bands(r, period);
+
+    const fmt = (s) => 'p50=' + pct(s, 0.50).toFixed(2) +
+                       ' p95=' + pct(s, 0.95).toFixed(2) +
+                       ' max=' + s[s.length - 1].toFixed(2);
+
+    statsEl.textContent =
+      'rAF  타임스탬프 간격  ' + fmt(rs) + '   (엔진이 정하는 값)\n' +
+      'wall 실행 시각 간격   ' + fmt(ws) + '   (performance.now())\n' +
+      '한 주기 ' + b.one + ' · 중복 ' + b.dup + ' · 1 건너뜀 ' + b.skip1 +
+      ' · 그 이상 ' + b.skipN + '   (기준 주기 ' + period.toFixed(2) + 'ms, 프레임 ' +
+      Math.round(frames / seconds) + '/s)\n' +
+      'WAAPI ' + (waapiOn ? 'ON — 오른쪽이 매끄러우면 페인트측 경로는 멀쩡하다'
+                          : 'OFF — Element.animate 가 없어 오른쪽은 멈춰 있다') +
+      ' · 한 바퀴 ' + PERIOD_MS + 'ms (ease-in-out)';
+
+    console.log('RAFPROBE n=' + r.length +
+                ' per_interval dup=' + b.dup + ' one=' + b.one +
+                ' skip1=' + b.skip1 + ' skipN=' + b.skipN +
+                ' raf_ms p50=' + pct(rs, 0.50).toFixed(2) +
+                ' p95=' + pct(rs, 0.95).toFixed(2) +
+                ' max=' + rs[rs.length - 1].toFixed(2) +
+                ' wall_ms p50=' + pct(ws, 0.50).toFixed(2) +
+                ' p95=' + pct(ws, 0.95).toFixed(2) +
+                ' max=' + ws[ws.length - 1].toFixed(2) +
+                ' fps=' + Math.round(frames / seconds) +
+                ' waapi=' + (waapiOn ? 1 : 0));
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>

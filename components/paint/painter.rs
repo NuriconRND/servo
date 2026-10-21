@@ -4845,15 +4845,11 @@ pub(crate) enum PaintMetricState {
 /// 한 줄에 한 창(60 개)을 담는다. 프레임마다 한 줄이면 300 초에 72,000 줄이 되고, 이
 /// 로그는 이미 200MB 를 넘긴 적이 있다. 소수 한 자리면 충분하다 -- 1x(2,304px/s)에서
 /// 0.1 은 0.1px 이고 0.006 주기다.
+///
+/// ★구현은 `servo_base::interval_summary` 에 있다★ -- `FRAMETIME`/`RAFCLOCK` 이 같은 꼴로
+/// 찍어야 세 수열을 나란히 읽을 수 있고, 포맷이 두 벌이면 조용히 어긋난다.
 pub(crate) fn format_step_sequence(samples: &[f64]) -> String {
-    let mut out = String::with_capacity(samples.len() * 6);
-    for (index, value) in samples.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!("{value:.1}"));
-    }
-    out
+    servo_base::interval_summary::format_intervals(samples)
 }
 
 /// `SERVO_LOG_ANIM_STEP_SEQ=1` 이면 창마다 `ANIMSTEPSEQ` 를 찍는다.

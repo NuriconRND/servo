@@ -210,6 +210,16 @@ Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-P
 Copy-Item (Join-Path $repo "tests\html\ticker_slice_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
+# rAF 시계 대조 프로브. 표출 페이지의 영역 회전은 rAF 콜백 안에서 인라인 transform 을 매
+# 프레임 다시 쓰는 구조인데, 같은 페이지를 Chrome 은 single tile 에서 60fps 로 돌리고
+# winit_wall 은 떤다(2026-10-21). 그 구조가 느린 것이 아니라면 남는 변수는 엔진이 그
+# 콜백에 넘기는 시각값이다. 이 페이지는 같은 구조의 사각형과 Element.animate 로 건
+# 사각형을 나란히 돌리면서 rAF 타임스탬프 간격과 실제 실행 시각 간격을 따로 잰다.
+#   .\run_wall_dist.ps1 -Serve -Url "raf_clock_probe.html" -FrameTimeProf -AnimStepSeq ...
+# 페이지의 `RAFPROBE` 줄과 엔진의 `FRAMETIME`/`RAFCLOCK` 을 같은 창에서 맞춰 읽는다.
+# ★같은 URL 을 Chrome 으로도 열어 둘 것★ -- 대조가 이 프로브의 전부다.
+Copy-Item (Join-Path $repo "tests\html\raf_clock_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+
 # --- 5. launcher ---
 Copy-Item (Join-Path $PSScriptRoot "run_wall_dist.ps1") $Out -Force
 # The decode baseline tool ships too: the wall's cores-per-video number is only

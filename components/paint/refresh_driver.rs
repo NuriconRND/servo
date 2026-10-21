@@ -166,10 +166,10 @@ impl AnimationRefreshDriverObserver {
         }
 
         let frame_time = crate::frame_time::frame_time_for_tick(
+            self.painter_id,
             CrossProcessInstant::now(),
             frame_time_max_age(),
-        )
-        .unwrap_or_else(CrossProcessInstant::now);
+        );
         if let Err(error) =
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::TickAnimation(
@@ -244,10 +244,10 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
 
         // Request new animation frames from all animating WebViews.
         let frame_time = crate::frame_time::frame_time_for_tick(
+            self.painter_id,
             CrossProcessInstant::now(),
             frame_time_max_age(),
-        )
-        .unwrap_or_else(CrossProcessInstant::now);
+        );
         if let Err(error) =
             self.constellation_sender
                 .send(EmbedderToConstellationMessage::TickAnimation(

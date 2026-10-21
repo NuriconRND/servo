@@ -4595,15 +4595,29 @@ impl Document {
     /// 페이지가 재는 `dt` 는 음수가 된다. 어긋남의 크기가 이 기능이 없애려는 지터와 같은
     /// 자릿수라 그냥 두면 이득을 그대로 깎아먹는다. 직전 값으로 하한을 둔다.
     fn resolve_frame_time(&self, frame_time: Option<CrossProcessInstant>) -> CrossProcessInstant {
+        let from_frame_time =
+            frame_time.is_some() && pref!(dom_animation_timeline_use_frame_time);
         let candidate = match frame_time {
             Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
             _ => CrossProcessInstant::now(),
         };
+        // ★이 클램프가 페이지에 보이는 모양.★ 후보가 직전 값보다 과거면 페이지는
+        // ***지난 프레임과 똑같은 타임스탬프***를 받고 같은 위치를 두 번 계산한다. 틱을
+        // 쓰지 못한 회차가 `now()` 로 떨어지면 시계가 한 번 앞으로 튀고, 뒤이어 오는
+        // (페이싱된, 따라서 더 이른) 진짜 틱들이 줄줄이 여기 걸린다. `RAFCLOCK` 의
+        // `clamped` 가 그 횟수다 -- 자세한 이유는 `crate::raf_clock` 머리 주석.
+        let clamped = matches!(self.last_frame_time.get(), Some(previous) if previous > candidate);
         let resolved = match self.last_frame_time.get() {
             Some(previous) if previous > candidate => previous,
             _ => candidate,
         };
         self.last_frame_time.set(Some(resolved));
+        crate::raf_clock::note_resolved(
+            self.window().pipeline_id(),
+            resolved,
+            from_frame_time,
+            clamped,
+        );
         resolved
     }
 
