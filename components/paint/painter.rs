@@ -367,8 +367,12 @@ pub(crate) struct Painter {
     wall_tick_frames_produced: Cell<u64>,
 
     /// 부트스트랩 프레임을 이미 낸 파이프라인. ★"파이프라인당 정확히 1 회" 의 근거다.★
-    /// 지우지 않는다 -- 파이프라인이 끝나고 같은 id 가 다시 올 일은 없고, 지우면 그것이
-    /// 곧 두 번째 생산 기회가 된다.
+    ///
+    /// 끝난 파이프라인은 `notify_pipeline_exited` 에서 치운다. ★치워도 두 번째 생산
+    /// 기회가 생기지 않는다★ -- 조건 2(`wall_tick_frames_produced == 0`)가 이미 걸려
+    /// 있으면 이 집합과 무관하게 거절이고, 아직 안 걸려 있다면 그 파이프라인은 애초에
+    /// 틱이 돌기 전에 끝난 것이라 부트스트랩 한 장이 정당하다. 안 치우면 긴 실행에서
+    /// 내비게이션마다 항목이 쌓이기만 한다.
     bootstrapped_pipelines: RefCell<FxHashSet<PipelineId>>,
 
     /// 부트스트랩이 실제로 낸 프레임 수와 거절한 횟수. 설계 7 절이 요구하는 계수기다 --
@@ -3657,6 +3661,11 @@ impl Painter {
         if let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) {
             webview_renderer.pipeline_exited(pipeline_id, pipeline_exit_source);
         }
+        // 부트스트랩 기록을 같이 치운다 -- 끝난 파이프라인의 항목은 판정에 쓰이지 않고
+        // 쌓이기만 한다(`bootstrapped_pipelines` 주석에 안전한 이유가 있다).
+        self.bootstrapped_pipelines
+            .borrow_mut()
+            .remove(&pipeline_id);
         self.lcp_calculator
             .remove_lcp_candidates_for_pipeline(&pipeline_id.into());
     }

@@ -85,7 +85,20 @@ pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) 
 ///
 /// 막으려는 것: `maybe_take_screenshots` 와 `maybe_trigger_paint_for_screenshot` 는
 /// `has_pending_frames()` 가 참이면 그 자리에서 돌아선다(`screenshot.rs`). 틱이 매 주기
-/// 생산하면 그 값이 거의 항상 참이라 ★벽 자신의 `--capture` 가 영영 안 찍힌다.★
+/// 생산하면 그 값이 거의 항상 참이라 ★`ScreenshotTaker` 를 지나는 스크린샷이 영영 안
+/// 찍힌다.★
+///
+/// ★`winit_wall --capture` 는 그 실행자가 ***아니다*** -- 2026-10-22 에 바로잡았다.★ 그
+/// 플래그는 `ScreenshotTaker` 를 아예 안 지나고, 셸의 `maybe_capture` 가 주 타일의
+/// `rendering_context.read_to_image()` 를 직접 부른다(`winit_wall/main.rs`; 그 파일에
+/// `screenshot` 이라는 낱말이 한 번도 안 나온다). 설계 2-8 과 8 절이 이 규칙의 검증으로
+/// `--capture` 를 지목한 것은 틀렸다.
+///
+/// ★그래서 이 규칙에는 아직 살아 있는 실행자가 없다.★ `ScreenshotTaker` 로 들어오는 문은
+/// `Paint::request_screenshot` 하나이고, 그것을 부르는 것은 servoshell / WPT 쪽이다 --
+/// 그쪽에서 `gfx_single_frame_producer` 를 켜야 이 규칙이 실제로 발화한다. 벽에서 이
+/// 규칙이 도는지는 `WALLSHOTPAUSE` 로그 한 줄이 말해 주고, 그 줄이 ***안 나오는 것***이
+/// 정상이다.
 ///
 /// ★규칙 3 을 어기지 않는다.★ 이 질문은 프레임의 *내용* 이 아니라 ***외부 모드*** 를
 /// 묻는다 -- 생산자는 여전히 프레임에 무엇이 들었는지 모른다.

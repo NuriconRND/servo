@@ -231,6 +231,10 @@ pub struct Paint {
     production_suspended_in_window: Cell<u64>,
     production_suspended_total: Cell<u64>,
     production_suspended_last_report: Cell<Option<Instant>>,
+    /// 현재 창에서 걷은 keep-previous 지시의 누계. ★창 단위다 -- 틱 단위가 아니다.★
+    /// 같은 줄의 `ticks_in_window` 와 단위를 맞춰야 설계 8-1 이 지목한 교착 탐지기로
+    /// 읽힌다(둘을 섞어 두면 "이 창에 몇 개를 걷었나" 를 답할 수 없다).
+    keep_previous_released_in_window: Cell<u64>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -1467,6 +1471,7 @@ impl Paint {
             production_suspended_in_window: Default::default(),
             production_suspended_total: Default::default(),
             production_suspended_last_report: Default::default(),
+            keep_previous_released_in_window: Default::default(),
             wall_frame_pacing_block_tally: Default::default(),
         }))
     }
@@ -2085,8 +2090,13 @@ impl Paint {
 
         let in_window = self.production_suspended_in_window.get() + 1;
         let total = self.production_suspended_total.get() + 1;
+        // ★창 단위로 누적한다★ -- 같은 줄의 `ticks_in_window` 와 단위를 맞춘다. 이 틱의
+        // 값만 싣던 초안은 "1 초 동안 몇 개를 걷었나" 에 답하지 못했다.
+        let released_in_window = self.keep_previous_released_in_window.get() + released as u64;
         self.production_suspended_in_window.set(in_window);
         self.production_suspended_total.set(total);
+        self.keep_previous_released_in_window
+            .set(released_in_window);
         let now = Instant::now();
         let due = self
             .production_suspended_last_report
@@ -2097,11 +2107,12 @@ impl Paint {
         }
         self.production_suspended_last_report.set(Some(now));
         self.production_suspended_in_window.set(0);
+        self.keep_previous_released_in_window.set(0);
         info!(
             "WALLSHOTPAUSE: wall tick production is suspended while a screenshot waits for \
              frames to drain; ticks_in_window={in_window} total={total} \
-             released_keep_previous={released} targets={}. Canvas ack release and the \
-             display-composite liveness probe keep running every tick.",
+             keep_previous_released_in_window={released_in_window} targets={}. Canvas ack \
+             release and the display-composite liveness probe keep running every tick.",
             painter_ids.len(),
         );
     }
@@ -4160,7 +4171,7 @@ mod wall_frame_keep_previous_tests {
 
     use servo_base::id::PainterId;
 
-    use super::WallFrameCoordinator;
+    use super::{WallFrameCoordinator, WallFrameDelayInjection};
 
     fn painter(index: u32) -> PainterId {
         webrender_api::IdNamespace(index).into()
@@ -4309,6 +4320,82 @@ mod wall_frame_keep_previous_tests {
             coordinator.keep_previous_logical_frame(busy),
             None,
             "a decline holds one logical frame, not every frame after it"
+        );
+    }
+
+    /// ★생산을 쉬는 틱은 유지 지시를 걷는다 -- 그러지 않으면 스크린샷이 영영 안 찍힌다.★
+    ///
+    /// 무장한 타일은 셸이 `paint_target` 과 `present` 를 **둘 다** 건너뛰는데
+    /// (`main.rs`), 스크린샷을 실제로 찍는 자리는 ***렌더 패스의 끝***이다
+    /// (`Painter::render` -> `ScreenshotTaker::maybe_take_screenshots`, 호출자 1 곳).
+    /// 그리고 지시를 걷는 다른 자리(`expire_keep_previous_before`)는 ***다음 생산***에
+    /// 있다. 그래서 요청을 쥔 타일이 무장한 채 생산이 멈추면 ★정지에서 벗어나는 데 생산이
+    /// 필요한 상태★ 가 되고, 그것이 정확히 `tick_should_produce` 가 피하려던 교착이다.
+    ///
+    /// 이 시험이 지키는 것은 기능이 아니라 그 교착의 부재다. 지우거나 무력화하기 전에
+    /// `ScreenshotRequestPhase::suspends_production` 의 주석을 읽을 것.
+    #[test]
+    fn a_suspended_tick_releases_the_keep_previous_hold() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let busy = painter(2);
+        has_presented(&mut coordinator, busy);
+
+        coordinator.arm_keep_previous(7, &[busy]);
+        // 걷기 ***전***에 한 번 본다 -- 없으면 애초에 무장이 안 된 구현도 통과한다.
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(busy),
+            Some(7),
+            "the hold must exist before a suspended tick can release it"
+        );
+
+        let released = coordinator.release_keep_previous_while_production_is_suspended(&[busy]);
+
+        assert_eq!(
+            released, 1,
+            "the suspended tick must report the hold it released (실제 {released})"
+        );
+        let held = coordinator.keep_previous_logical_frame(busy);
+        assert_eq!(
+            held, None,
+            "a tile held out of the render pass cannot take the screenshot the tick is \
+             waiting for (실제 {held:?})"
+        );
+    }
+
+    /// ★실패 주입이 세워 둔 관찰용 지시는 살아남는다.★
+    ///
+    /// 그 주입은 **스킵을 관찰하는 것이 목적**이라, 걷어 버리면 재현하려던 상태를 못 보게
+    /// 된다 -- `expire_keep_previous_before` 가 같은 예외를 두는 이유와 같다. 걷는 자리가
+    /// 둘이 된 지금, 새 자리가 그 예외를 따르는지는 시험으로만 확인된다.
+    #[test]
+    fn a_suspended_tick_leaves_the_injected_skip_observation_alone() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let injected = painter(4);
+        has_presented(&mut coordinator, injected);
+
+        // 주입 경로의 무장은 `miss_barrier` 가 `injected_delayed_painter_id` 로 세운다.
+        // 그 값을 넣어 주는 것은 `register_frame` 의 `delay_injection` 이고, 배리어는
+        // 타일이 둘 이상이어야 열린다.
+        let other = painter(5);
+        coordinator.delay_injection = Some(WallFrameDelayInjection {
+            target_index: 0,
+            after_logical_frame_id: 0,
+            remaining_frames: 1,
+        });
+        coordinator.register_frame(9, Vec::new(), vec![injected, other], Instant::now());
+        coordinator.miss_barrier(9, Instant::now());
+
+        let released = coordinator.release_keep_previous_while_production_is_suspended(&[injected]);
+
+        assert_eq!(
+            released, 0,
+            "the injected skip observation is not ours to release (실제 {released})"
+        );
+        let held = coordinator.keep_previous_logical_frame(injected);
+        assert_eq!(
+            held,
+            Some(9),
+            "consuming it here would defeat the very test that arms it (실제 {held:?})"
         );
     }
 }

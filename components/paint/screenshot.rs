@@ -59,9 +59,17 @@ impl ScreenshotRequestPhase {
     /// ★이 상에 있는 요청이 틱의 생산을 쉬게 하는가.★ 2026-10-22 Task 9, 설계 2-8.
     ///
     /// 참인 상은 ★`WaitingOnFrame` 하나뿐★ 이고, 근거는 하나다: ***그 상을 떠나는 데
-    /// 생산이 필요 없다.*** `maybe_take_screenshots` 는 `pending_frames` 가 0 이 되기만
+    /// 새 생산이 필요 없다.*** `maybe_take_screenshots` 는 `pending_frames` 가 0 이 되기만
     /// 기다리고, 그 숫자를 빼는 것은 WebRender 의 frame-ready 다
-    /// (`Painter::note_webrender_frame_ready`) -- 렌더 패스도 새 생산도 요구하지 않는다.
+    /// (`Painter::note_webrender_frame_ready`) -- 그 알림은 생산과 무관하게 온다.
+    ///
+    /// ★다만 ***렌더 패스***는 여전히 필요하다 -- 그것이 공짜가 아니다.★
+    /// `maybe_take_screenshots` 의 호출자는 `Painter::render` 안 하나뿐이라, 요청을 쥔
+    /// 타일이 렌더를 못 받으면 이 상에서 못 나간다. 그리고 keep-previous 로 무장한 타일은
+    /// 셸이 렌더를 통째로 건너뛴다. ★그래서
+    /// `WallFrameCoordinator::release_keep_previous_while_production_is_suspended` 가
+    /// 존재한다 -- 그 함수가 없으면 이 상이 "떠나는 데 생산이 필요한 상" 으로 바뀐다.★
+    /// 지우기 전에 그 함수의 주석과 시험 둘을 읽을 것.
     ///
     /// 앞의 두 상은 ★반드시 거짓이어야 한다 -- 참이면 영구 정지다.★
     /// `WaitingOnPipelineDisplayLists` 를 떠나려면
@@ -262,13 +270,87 @@ mod tests {
     use std::rc::Rc;
 
     use rustc_hash::FxHashMap;
+    use servo_base::id::{BrowsingContextId, WebViewId};
 
-    use super::ScreenshotRequestPhase;
+    use super::{ScreenshotRequest, ScreenshotRequestPhase, ScreenshotTaker};
     use crate::wall_tick::tick_should_produce;
+
+    /// 요청 하나를 지정한 상으로 넣는다. ★`Painter` 없이 선다★ -- `wait_summary` 는
+    /// 요청 벡터만 읽으므로 렌더러가 필요 없다.
+    fn taker_holding(phases: Vec<ScreenshotRequestPhase>) -> ScreenshotTaker {
+        let webview_id = WebViewId::mock_for_testing(
+            BrowsingContextId::from_string("BrowsingContext(1,1)")
+                .expect("the literal above is a well-formed BrowsingContextId"),
+        );
+        let taker = ScreenshotTaker::default();
+        for phase in phases {
+            taker.requests.borrow_mut().push(ScreenshotRequest {
+                webview_id,
+                rect: None,
+                callback: Box::new(|_| {}),
+                phase,
+            });
+        }
+        taker
+    }
+
+    /// ★시험된 술어와 시험 안 된 호출자 사이의 유일한 합성 단계다.★
+    ///
+    /// `suspends_production` 이 상 하나를 보고, `Paint::produce_wall_frame` 이 타일을
+    /// 가로지른다. 그 둘을 잇는 것이 이 함수 하나뿐이라, 여기서 `any()` 가 `all()` 로
+    /// 바뀌거나 상이 뒤바뀌면 아무 시험도 안 잡는다.
+    #[test]
+    fn the_summary_reports_a_waiting_request_among_requests_that_are_not() {
+        let taker = taker_holding(vec![
+            ScreenshotRequestPhase::ConstellationRequest,
+            ScreenshotRequestPhase::WaitingOnFrame,
+        ]);
+        let summary = taker.wait_summary();
+        assert!(
+            summary.waiting_on_frame,
+            "한 건이라도 `WaitingOnFrame` 이면 참이어야 한다 (실제 {summary:?})"
+        );
+        assert!(
+            summary.any_request,
+            "요청이 둘 있는데 거짓이면 래치가 내려간다 (실제 {summary:?})"
+        );
+    }
+
+    /// 앞 상만 떠 있는 동안은 ★생산이 계속돼야 한다★ -- 그것이 전진을 일으킨다.
+    #[test]
+    fn the_summary_keeps_the_latch_but_not_the_pause_for_a_pre_advance_request() {
+        let taker = taker_holding(vec![ScreenshotRequestPhase::WaitingOnPipelineDisplayLists(
+            Rc::new(FxHashMap::default()),
+        )]);
+        let summary = taker.wait_summary();
+        assert!(
+            !summary.waiting_on_frame,
+            "전진 전 요청은 생산을 쉬게 하면 안 된다 (실제 {summary:?})"
+        );
+        assert!(
+            summary.any_request,
+            "요청이 남아 있으면 래치는 서 있어야 한다 -- 내리면 전진을 못 본다 \
+             (실제 {summary:?})"
+        );
+    }
+
+    /// 요청이 다 소진되면 래치를 내릴 신호가 나온다.
+    #[test]
+    fn an_empty_taker_reports_nothing_to_poll() {
+        let summary = taker_holding(Vec::new()).wait_summary();
+        assert!(
+            !summary.any_request && !summary.waiting_on_frame,
+            "요청이 없으면 둘 다 거짓이다 (실제 {summary:?})"
+        );
+    }
 
     /// ★생산을 쉬게 하는 상은 `WaitingOnFrame` 하나뿐이다.★ 거기서 나가는 길
     /// (`maybe_take_screenshots`)은 `pending_frames` 가 0 이 되기만 기다리고, 그 숫자는
     /// WebRender 의 frame-ready 가 뺀다 -- ★새 생산을 요구하지 않는다.★
+    ///
+    /// ★렌더 패스는 요구한다★ -- 그 함수의 호출자가 `Painter::render` 하나뿐이다. 그
+    /// 조건을 지키는 자리는 `release_keep_previous_while_production_is_suspended` 이고,
+    /// 거기에 시험이 둘 있다.
     #[test]
     fn only_a_request_waiting_on_a_frame_suspends_production() {
         let phase = ScreenshotRequestPhase::WaitingOnFrame;
