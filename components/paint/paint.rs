@@ -1213,7 +1213,7 @@ impl WallFrameCoordinator {
     ///
     /// ★배리어(`register_frame`)에는 넣지 않는다.★ 배리어가 기다리는 것은 frame-ready 이고
     /// 거절한 타일은 트랜잭션을 안 보냈으므로 그 신호를 영영 안 낸다 -- 넣으면 그 논리
-    /// 프레임은 마감까지 안 닫힌다(`TileOutcome::generated` 주석).
+    /// 프레임은 마감까지 안 닫힌다(`TileOutcome::KeepPrevious` 주석).
     ///
     /// ★"표출한 적 있는가" 는 여기서 보지 않는다.★ 그 면제는
     /// `keep_previous_logical_frame` 한 곳에만 둔다(불변식 14). 무장 지점이 둘이 된 지금
@@ -4132,6 +4132,15 @@ mod wall_frame_keep_previous_tests {
         has_presented(&mut coordinator, busy);
 
         coordinator.arm_keep_previous(7, &[busy]);
+        // 만료 ***전***에 한 번 본다. 질의는 비주입 지시를 소비해도 지우지 않으므로 이
+        // 단언이 성립하고, 이것이 있어야 아래 `None` 이 "만료됐다" 를 뜻한다 -- 없으면
+        // 애초에 무장이 안 된 구현도 이 시험을 통과한다.
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(busy),
+            Some(7),
+            "the hold must exist before the next wall frame can expire it"
+        );
+
         coordinator.expire_keep_previous_before(8, &[busy]);
 
         assert_eq!(

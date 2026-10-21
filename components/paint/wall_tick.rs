@@ -22,11 +22,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// 유지하는 방식으로** 이 논리 프레임에 참여한다 -- 배리어에서 조용히 빠지면 화면에 프레임
 /// N 과 N-1 이 섞인다. 그 유지를 실제로 지시하는 자리는
 /// `WallFrameCoordinator::arm_keep_previous` 다(2026-10-22 Task 8).
+///
 /// ★분류하는 자리는 하나다 -- `issue_wall_frame_request` 의 `match`.★ 2026-10-22 Task 8
 /// 전에는 `generated()` 라는 술어가 그 일을 했는데, 거절한 타일도 갈 곳이 생기면서
-/// 참/거짓 하나로는 모자라게 됐다. 술어 대신 ★빠짐없는 `match`★ 를 쓰는 편이 그 메서드의
-/// 취지("변형이 늘면 한자리에서 정한다")를 더 강하게 지킨다 -- 변형을 더하면 분류가
-/// 조용히 한쪽으로 묶이지 않고 ***컴파일 오류***가 난다.
+/// 참/거짓 하나로는 모자라게 됐다.
+///
+/// ★컴파일러가 지키는 것은 빠짐없음(exhaustiveness)뿐이다.★ 변형을 더하면 그 `match` 가
+/// 컴파일 오류가 나므로 ***분류되지 않는 변형***은 생길 수 없다. 그러나 아래 두 변종이
+/// **어느 집합으로** 가야 하는지는 ★문서만 지킨다★ -- `KeepPrevious` 를
+/// `generated_painter_ids` 에 밀어 넣어도 컴파일은 된다. 그 규칙을 깨는 변경은 리뷰에서
+/// 잡는 수밖에 없다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TileOutcome {
     /// 이 타일이 이번 논리 프레임의 합성을 냈다. ★배리어가 기다리는 대상이다★ -- 이쪽만
@@ -254,10 +259,4 @@ mod tests {
             "빚이 없으면 보낼 것도 없다 (실제 {releasable})"
         );
     }
-
-    // ★`only_a_generated_tile_counts_as_produced` 는 2026-10-22 Task 8 에서 삭제됐다.★
-    // 그 시험이 보던 `TileOutcome::generated()` 와 함께 사라졌다 -- 거절한 타일이
-    // `arm_keep_previous` 로 가게 되면서 분류가 참/거짓이 아니게 됐고, 분류는
-    // `issue_wall_frame_request` 의 빠짐없는 `match` 하나가 한다. 같은 규칙("배리어는
-    // 실제로 낸 타일만 기다린다")은 이제 시험이 아니라 ★컴파일러★ 가 지킨다.
 }
