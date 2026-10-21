@@ -292,6 +292,19 @@ pub trait RefreshDriver {
     /// Multiple callbacks may be registered for the same frame. It is up to the implementation
     /// to call *all* callbacks that have been registered since the last frame.
     fn observe_next_frame(&self, start_frame_callback: Box<dyn Fn() + Send + 'static>);
+
+    /// ★이 드라이버가 자기 클럭을 갖고 있지 않으면 참.★ 콜백을 모아 두기만 하고 임베더가
+    /// 자기 틱에서 쏘는 구현이 그렇다 -- 그런 드라이버는 **이벤트 루프를 깨우지 않으므로**,
+    /// 임베더에 주기적인 깨우기가 따로 없으면 틱이 올 일이 없어 화면이 영구히 멈춘다.
+    ///
+    /// 참이면 paint 가 자기 타이머 스레드로 ***깨우기만*** 계속 내 준다(주기는
+    /// `gfx_refresh_hz`). ★콜백은 거기서 쏘지 않는다★ -- 콜백은 이 드라이버에 쌓인 채로
+    /// 임베더의 틱을 기다린다. 그래서 "콜백 → 렌더" 가 한 틱 안의 순서로 남는다.
+    ///
+    /// 기본은 거짓이다: 자기 스레드로 발사하는 드라이버(vsync 등)는 깨우기도 스스로 낸다.
+    fn needs_paint_timer_heartbeat(&self) -> bool {
+        false
+    }
 }
 
 /// Credentials to use in an HTTP authentication challenge.

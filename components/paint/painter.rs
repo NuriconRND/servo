@@ -1590,8 +1590,12 @@ impl Painter {
         // 비디오가 기다리는 동안에도 계속 깨운다 — 위 판정이 주기마다 돌아야 애니메이션이
         // 끝난 뒤에도 같은 생산자가 이어서 낸다.
         if still_animating || video_pending {
-            self.web_content_animator
-                .wake_for_paint_animation();
+            self.web_content_animator.wake_for_paint_animation();
+            // ★그 깨우기를 쏘는 것은 임베더의 틱이다.★ 위 호출은 설치된 드라이버에 콜백을
+            // 쌓을 뿐이고, 자기 클럭이 없는 드라이버(셸이 틱에서 쏘는 종류)에서는 그 틱을
+            // 낼 깨우기도 여기서 걸어 줘야 한다 -- 안 걸면 `RefreshDriverObserver` 가 하나도
+            // 없는 동안(스크립트가 아무것도 안 내는 바로 그 상황)에 이 애니메이션이 선다.
+            self.refresh_driver.arm_paint_timer_heartbeat();
         }
         self.paint_animation_held_max
             .set(self.paint_animation_held_max.get().max(held_values));

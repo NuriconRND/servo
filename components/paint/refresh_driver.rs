@@ -5,7 +5,7 @@
 use std::cell::{Cell, LazyCell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,9 @@ pub(crate) struct BaseRefreshDriver {
     /// The implementation of the [`RefreshDriver`]. By default this is a simple timer, but the
     /// embedder can install a custom driver, such as one that is run via the hardware vsync signal.
     refresh_driver: Rc<dyn RefreshDriver>,
+    /// 설치된 드라이버가 자기 클럭을 갖고 있지 않을 때, 타이머 스레드가 대신 내 주는
+    /// ★깨우기★. [`Heartbeat`] 와 [`RefreshDriver::needs_paint_timer_heartbeat`] 참고.
+    heartbeat: Option<Arc<Heartbeat>>,
 }
 
 impl BaseRefreshDriver {
@@ -45,11 +48,23 @@ impl BaseRefreshDriver {
         timer_refresh_driver: &LazyCell<Rc<TimerRefreshDriver>>,
     ) -> Self {
         let refresh_driver = refresh_driver.unwrap_or_else(|| (**timer_refresh_driver).clone());
+        let waiting_for_frame = Arc::new(AtomicBool::new(false));
+        // ★콜백을 모아 두기만 하는 드라이버는 이벤트 루프를 깨우지 않는다.★ 그러면 임베더의
+        // 틱이 올 일이 없고, 틱이 콜백을 쏘는 구조에서 그것은 화면이 영구히 멈춘다는 뜻이다.
+        // 그 구성에서만 타이머 스레드가 ***깨우기만*** 계속 내 준다 -- 발사는 여전히 틱이다.
+        let heartbeat = refresh_driver.needs_paint_timer_heartbeat().then(|| {
+            Heartbeat::new(
+                (**timer_refresh_driver).clone(),
+                event_loop_waker.clone_box(),
+                waiting_for_frame.clone(),
+            )
+        });
         Self {
-            waiting_for_frame: Arc::new(AtomicBool::new(false)),
+            waiting_for_frame,
             event_loop_waker,
             observers: Default::default(),
             refresh_driver,
+            heartbeat,
         }
     }
 
@@ -85,6 +100,25 @@ impl BaseRefreshDriver {
             waiting_for_frame.store(false, Ordering::Relaxed);
             event_loop_waker.wake();
         }));
+
+        // ★자기 클럭이 없는 드라이버면 타이머 스레드가 틱 에지를 내 준다.★ 바로 위에서
+        // `waiting_for_frame` 을 세웠으므로, 박동은 틱이 그 콜백을 쏠 때까지 이어진다.
+        self.arm_paint_timer_heartbeat();
+    }
+
+    /// ★프레임 관찰자 없이도 틱이 필요할 때 박동을 건다.★
+    ///
+    /// 페인트 쪽 애니메이션과 비디오 도착은 `RefreshDriverObserver` 를 달지 않고도 다음
+    /// 프레임에 깨워 달라고 한다(`WebContentAnimator::wake_for_paint_animation`). 그 요청은
+    /// 설치된 드라이버에 쌓이고 임베더의 틱이 쏘는데, 자기 클럭이 없는 드라이버에서는 그
+    /// 틱을 낼 깨우기도 여기서 나와야 한다 -- 걸지 않으면 그 애니메이션이 선다.
+    ///
+    /// 한 번만 건다. 박동이 틱을 내고, 틱이 그 콜백을 쏘고, 쏘인 쪽이 계속 돌 생각이면
+    /// 다음 바퀴에서 다시 여기를 부른다.
+    pub(crate) fn arm_paint_timer_heartbeat(&self) {
+        if let Some(heartbeat) = self.heartbeat.as_ref() {
+            heartbeat.arm();
+        }
     }
 
     /// Whether or not the renderer should trigger a message to the embedder to request a
@@ -227,6 +261,14 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         //
         // Ticks for anything the paint thread is *not* playing keep the frame rate, since
         // slowing those would genuinely slow the animation.
+        //
+        // ★이것이 나누는 것은 표출 틱이 아니라 `RefreshDriver` 틱이다.★ 전에는 그 둘이
+        // 같은 주기인 구성이 `FrameClock::Pacing` 뿐이었다 -- `Timer` 는 `PaintTimerThread`
+        // 가, `Vsync` 는 DwmFlush 스레드가 자기 클럭으로 콜백을 쐈기 때문이다. 2026-10-21
+        // 부터 세 구성 모두 셸의 표출 틱이 콜백을 쏘므로 ★여기서 세는 프레임이 곧 표출
+        // 틱★ 이 됐다. ***의도한 결과다***: `epoch/s` 의 기대값은 세 구성 모두에서
+        // `gfx_refresh_hz`/divisor 다. 예전 측정값과 비교하는 사람이 회귀로 읽지 않도록
+        // 여기 적어 둔다(`Timer`/`Vsync` 의 옛 기대값은 자유 구동 페인트 타이머 기준이었다).
         let divisor = servo_config::pref!(gfx_paint_side_animation_tick_divisor).max(1) as u64;
         let frame = self.frames_observed.get().wrapping_add(1);
         self.frames_observed.set(frame);
@@ -331,6 +373,94 @@ impl TimerRefreshDriver {
     }
 }
 
+/// 임베더 드라이버가 자기 클럭을 갖고 있지 않을 때, 타이머 스레드가 대신 내 주는
+/// ★틱 에지★(= 이벤트 루프 깨우기).
+///
+/// ★깨우기만 한다.★ 프레임 콜백은 임베더 드라이버에 쌓인 채로 임베더의 틱을 기다린다 --
+/// 여기서 쏘면 발사 주체가 다시 둘이 되고, 그것이 없애려는 "두 시계 맥놀이" 다. 바뀌는
+/// 것은 ***누가 콜백을 쏘나*** 뿐이고, 에지가 언제 생기나는 종전 그대로다(같은 스레드,
+/// 같은 `paint_timer_period`, 같은 절대 격자).
+///
+/// ★스스로 다시 건다.★ `observe_next_frame` 에서 한 번만 걸면, 그 깨우기가 임베더의 틱
+/// 게이트를 통과하지 못한 경우(아직 기한이 안 참) 다시 걸어 줄 사람이 없어 그대로 멎는다 --
+/// 임베더의 재등록은 렌더를 거쳐야 하고, 렌더는 틱을 거쳐야 하기 때문이다. 그래서 프레임을
+/// 기다리는 동안은(`waiting_for_frame`) 타이머 스레드에서 자기 자신을 다시 건다. 틱이
+/// 콜백을 쏘면 그 플래그가 내려가고 다음 박동에서 저절로 멎는다 -- ★조용한 페이지가
+/// 영원히 깨어 있지는 않는다.★
+struct Heartbeat {
+    sender: Sender<TimerThreadMessage>,
+    period: Duration,
+    /// 다음 에지의 **절대 시각**. `TimerRefreshDriver::observe_next_frame` 과 같은 격자
+    /// 규칙이다 -- ★늦었으면 지나간 에지는 버린다★(그쪽 주석이 왜인지 적는다).
+    next_at: Mutex<Instant>,
+    event_loop_waker: Box<dyn EventLoopWaker>,
+    /// [`BaseRefreshDriver::waiting_for_frame`] 과 같은 플래그. 참인 동안만 박동한다.
+    waiting_for_frame: Arc<AtomicBool>,
+    /// 타이머에 하나가 걸려 있는가. 같은 에지에 둘이 걸리면 깨우기가 두 배가 된다.
+    armed: AtomicBool,
+}
+
+impl Heartbeat {
+    fn new(
+        timer_refresh_driver: Rc<TimerRefreshDriver>,
+        event_loop_waker: Box<dyn EventLoopWaker>,
+        waiting_for_frame: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        let period = paint_timer_period();
+        Arc::new(Self {
+            sender: timer_refresh_driver.sender.clone(),
+            period,
+            next_at: Mutex::new(Instant::now() + period),
+            event_loop_waker,
+            waiting_for_frame,
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// 다음 격자점에 하나 건다. 이미 걸려 있으면 아무 일도 하지 않는다.
+    fn arm(self: &Arc<Self>) {
+        if self.armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let now = Instant::now();
+        let delay = {
+            // 중독된 락에서도 격자를 들고 간다 -- 박동을 포기하면 화면이 멈춘다.
+            let mut next = self
+                .next_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while *next <= now {
+                *next += self.period;
+            }
+            *next - now
+        };
+        let this = self.clone();
+        let sent = self
+            .sender
+            .send(TimerThreadMessage::Request(TimerEventRequest {
+                callback: Box::new(move || this.beat()),
+                duration: delay,
+            }));
+        if sent.is_err() {
+            // 타이머 스레드가 이미 내려갔다. 다음 `observe_next_frame` 이 다시 시도할 수
+            // 있도록 표시만 되돌린다.
+            self.armed.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// 타이머 스레드에서 돈다.
+    fn beat(self: &Arc<Self>) {
+        // ★표시를 먼저 내린다.★ 깨어난 메인이 `observe_next_frame` 으로 다음 것을 걸려고
+        // 할 때 "이미 걸려 있다" 로 보이면 그 에지가 통째로 사라진다. 먼저 내려 두면 최악이
+        // 메인과 여기가 하나씩 걸려 하나가 `armed` 에 막히는 경우이고, 그때도 하나는 남는다.
+        self.armed.store(false, Ordering::SeqCst);
+        self.event_loop_waker.wake();
+        if self.waiting_for_frame.load(Ordering::Relaxed) {
+            self.arm();
+        }
+    }
+}
+
 /// 셸이 알려준 프레임 시각을 버리는 나이. 네 주기다 -- 그보다 오래됐으면 셸이 틱을
 /// 내지 않고 있다는 뜻이므로 지금 시각으로 떨어진다(설계 문서 3.3).
 fn frame_time_max_age() -> Duration {
@@ -403,5 +533,116 @@ impl Drop for TimerRefreshDriver {
         if let Some(join_handle) = self.join_handle.take() {
             let _ = join_handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// 콜백을 모아 두기만 하는 드라이버. ★셸의 틱 드라이버와 같은 모양이다★ -- 스레드가
+    /// 없고, 남이 부를 때까지 아무것도 쏘지 않는다.
+    struct HoardingRefreshDriver {
+        needs_heartbeat: bool,
+        held: Mutex<Vec<Box<dyn Fn() + Send + 'static>>>,
+    }
+
+    impl HoardingRefreshDriver {
+        fn new(needs_heartbeat: bool) -> Rc<Self> {
+            Rc::new(Self {
+                needs_heartbeat,
+                held: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl RefreshDriver for HoardingRefreshDriver {
+        fn observe_next_frame(&self, start_frame_callback: Box<dyn Fn() + Send + 'static>) {
+            self.held.lock().unwrap().push(start_frame_callback);
+        }
+
+        fn needs_paint_timer_heartbeat(&self) -> bool {
+            self.needs_heartbeat
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingWaker(Arc<AtomicUsize>);
+
+    impl EventLoopWaker for CountingWaker {
+        fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+            Box::new(self.clone())
+        }
+
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// ★자기 클럭이 없는 드라이버에는 타이머 스레드가 깨우기를 내 줘야 한다.★
+    ///
+    /// 그 드라이버는 콜백을 모아 두기만 하므로 이벤트 루프를 깨우지 않는다. 깨우기가 없으면
+    /// 임베더의 틱이 올 일이 없고, 틱이 콜백을 쏘는 구조에서 그것은 ***화면이 영구히
+    /// 멈춘다*** 는 뜻이다.
+    ///
+    /// ★깨우기만이다.★ 타이머가 콜백까지 쏘면 발사 주체가 다시 둘이 된다 -- 그것을
+    /// `waiting_for_frame` 이 아직 서 있는 것으로 확인한다(콜백이 쏘였다면 내려갔을 값이다).
+    #[test]
+    fn a_driver_without_a_clock_of_its_own_gets_woken_by_the_paint_timer() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let timer_refresh_driver: LazyCell<Rc<TimerRefreshDriver>> = LazyCell::default();
+        let driver = HoardingRefreshDriver::new(true);
+        let base = BaseRefreshDriver::new(
+            Box::new(CountingWaker(wakes.clone())),
+            Some(driver.clone() as Rc<dyn RefreshDriver>),
+            &timer_refresh_driver,
+        );
+
+        base.observe_next_frame();
+
+        // 주기는 `paint_timer_period()`. 느린 기계에서도 흔들리지 않도록 넉넉히 기다린다.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while wakes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            wakes.load(Ordering::SeqCst) >= 1,
+            "타이머 스레드가 깨우지 않았다 -- 이 구성에는 틱을 낼 사람이 없다"
+        );
+        assert!(
+            base.waiting_for_frame.load(Ordering::Relaxed),
+            "깨우기만 와야 한다 -- 콜백이 쏘였다면 waiting_for_frame 이 내려갔을 것이다"
+        );
+        assert_eq!(
+            driver.held.lock().unwrap().len(),
+            1,
+            "콜백은 드라이버에 쌓인 채로 틱을 기다려야 한다"
+        );
+    }
+
+    /// ★자기 스레드로 발사하는 드라이버에는 박동을 걸지 않는다.★ 걸면 그 구성의 깨우기가
+    /// 두 배가 되고, 그것은 이 작업이 없애려는 두 번째 시계를 다시 들이는 것이다.
+    #[test]
+    fn a_driver_with_its_own_clock_gets_no_heartbeat() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let timer_refresh_driver: LazyCell<Rc<TimerRefreshDriver>> = LazyCell::default();
+        let driver = HoardingRefreshDriver::new(false);
+        let base = BaseRefreshDriver::new(
+            Box::new(CountingWaker(wakes.clone())),
+            Some(driver.clone() as Rc<dyn RefreshDriver>),
+            &timer_refresh_driver,
+        );
+
+        base.observe_next_frame();
+        thread::sleep(paint_timer_period() * 8);
+
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "자기 클럭이 있는 드라이버에 박동을 걸면 시계가 둘이 된다"
+        );
     }
 }
