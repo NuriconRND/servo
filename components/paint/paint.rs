@@ -1893,6 +1893,23 @@ impl Paint {
     /// 페이서다. coalesce 는 "스크립트가 주기보다 빨리 조른다" 를 막는 장치이고, 주기마다
     /// 정확히 한 번 부르는 호출자에게는 미룰 것이 없다.
     ///
+    /// ★★그런데 게이트를 우회해도 게이트가 읽는 상태는 남긴다.★★ 공유하는
+    /// `issue_wall_frame_request` 가 `last_wall_frame_issue_at` 을 찍고 `register_frame` 으로
+    /// `active_webview_frames` 에 넣는데, `wall_frame_request_pacing_block_reason` 이 막는
+    /// 근거가 정확히 그 둘이다(`Active` 와 `TooSoon`). 그래서 ***틱이 배선된 구간 동안
+    /// 스크립트의 `PaintMessage::GenerateFrame` 이 훨씬 자주 coalesce 된다*** -- 틱은
+    /// 주기마다 그 두 상태를 새로 찍는데 스크립트는 그것을 넘어야 하기 때문이다.
+    ///
+    /// ★그것이 캔버스 ack 해제를 조인다.★ 지금 `take_waiting_pipelines` +
+    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내는 곳은
+    /// `Painter::generate_frame_for_script` 하나뿐이고, 그 유일한 해제자를 조이는 것은 이
+    /// 저장소가 이미 실측한 rAF 잠금(divisor=1 실행이 117 초에서 멎음, log_ani_debug 36)의
+    /// 설정 조건이다. coalesce 된 요청은 `try_release_coalesced_wall_frame_requests` 로
+    /// 늦게나마 풀려 나가므로 해제가 ***없어지는*** 것은 아니고 늦어진다.
+    ///
+    /// ★Task 6 이 해제를 생산에서 떼어 틱마다 돌리면 이 상호작용은 사라진다.★ 그때까지만
+    /// 있는 중간 상태이고, Task 5 의 pref 뒤에서만 존재한다.
+    ///
     /// ★`gather_components` 와 마찬가지로 크레이트 밖에 내지 않는다★ — 밖에서 쓰는 문은
     /// `on_wall_tick` 하나다.
     pub(crate) fn produce_wall_frame(&self) -> Option<u64> {
