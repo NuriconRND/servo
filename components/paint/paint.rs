@@ -374,6 +374,10 @@ struct WallFrameCoordinator {
     barriers: HashMap<u64, WallFrameBarrier>,
     active_webview_frames: HashMap<WebViewId, u64>,
     keep_previous_painters: HashMap<PainterId, KeepPreviousFrame>,
+    /// 한 번이라도 프레임을 화면에 낸 painter. ★"직전 프레임 유지" 는 직전 프레임이 있는
+    /// 타일에게만 말이 된다★ -- 없는 타일에게 그러면 검은 타일이 된다
+    /// (`keep_previous_logical_frame` 주석). 기록 지점은 그 함수 하나다.
+    presented_painters: HashSet<PainterId>,
     delay_injection: Option<WallFrameDelayInjection>,
     /// How many keep-previous instructions have been expired by a newer wall frame, for
     /// rate-limiting the log (see `expire_keep_previous_before`).
@@ -1124,18 +1128,54 @@ impl WallFrameCoordinator {
         }
     }
 
+    /// `render_all_tiles` 가 타일마다 패스에 한 번 묻는다. `Some` 이면 그 타일의
+    /// `paint_target` 과 `present` 를 **둘 다** 건너뛴다(`main.rs`).
+    ///
+    /// ★`None` 을 돌려주는 것은 "이 타일이 이번 패스에 표출한다" 와 같은 말이다.★ 그래서
+    /// 여기가 "한 번이라도 표출했는가" 를 기록할 자리다 -- 질의자가 곧 그릴 것이므로 다른
+    /// 신호를 따로 받을 필요가 없다.
     fn keep_previous_logical_frame(&mut self, painter_id: PainterId) -> Option<u64> {
-        let keep_previous_frame = self.keep_previous_painters.get(&painter_id)?;
+        let Some(keep_previous_frame) = self.keep_previous_painters.get(&painter_id) else {
+            self.presented_painters.insert(painter_id);
+            return None;
+        };
         let logical_frame_id = keep_previous_frame.logical_frame_id;
         let remove_after_skip_query = keep_previous_frame.remove_after_skip_query;
         if remove_after_skip_query {
+            // 실패 주입은 **스킵을 관찰하는 것이 목적**이므로 아래 면제보다 앞선다. 그걸
+            // 면제해 버리면 주입이 재현하려던 바로 그 상태를 못 보게 된다.
             self.keep_previous_painters.remove(&painter_id);
             warn!(
                 "Wall frame delay injection: consumed keep-previous skip observation for \
                  painter={:?} logical_frame_id={}",
                 painter_id, logical_frame_id
             );
+            return Some(logical_frame_id);
         }
+
+        // ★유지할 직전 프레임이 없는 타일에게 유지하라고 말하지 않는다.★
+        //
+        // DComp 경로에서 화면에 남아 있는 것은 마지막으로 Commit 된 내용뿐이고(타일 창의
+        // `present()` 는 DComp 가 뜨면 no-op 다 -- `rendering_context.rs`), 아직 한 번도
+        // 커밋하지 않은 타일은 빈 서피스를 보인다. 그 타일을 건너뛰면 "직전 프레임 유지" 가
+        // 아니라 **검은 타일**이다.
+        //
+        // 기동 때만 터지는 이유: 배리어 마감이 16ms(`WALL_FRAME_BARRIER_DEADLINE`)인데 첫
+        // 렌더는 셰이더 컴파일로 46~94ms 다(2026-10-20 실측). 첫 몇 프레임은 마감을 지킬
+        // 수가 없고, 그 사이 벽에는 아무것도 커밋된 적이 없다. 같은 자리의 옛 주석이
+        // "permanently dark tile" 이라 부른 것의 첫 한 조각이 이것이다 --
+        // `expire_keep_previous_before` 가 영구화만 막았고, 첫 발생은 남아 있었다.
+        if !self.presented_painters.contains(&painter_id) {
+            self.keep_previous_painters.remove(&painter_id);
+            self.presented_painters.insert(painter_id);
+            info!(
+                "Wall frame barrier: drawing {painter_id:?} instead of holding \
+                 logical_frame_id={logical_frame_id} -- it has never presented, so there is no \
+                 previous frame to hold policy=draw-first-frame-for-never-presented-target"
+            );
+            return None;
+        }
+
         Some(logical_frame_id)
     }
 }
@@ -3778,5 +3818,80 @@ mod superseded_video_frame_tests {
         let mut messages: Vec<PaintMessage> = Vec::new();
         assert_eq!(Paint::drop_superseded_video_frame_updates(&mut messages), 0);
         assert!(messages.is_empty());
+    }
+}
+
+/// 배리어가 마감을 놓쳤을 때 늦은 타일에 내리는 "직전 프레임 유지" 지시의 경계 조건.
+#[cfg(test)]
+mod wall_frame_keep_previous_tests {
+    use std::time::Instant;
+
+    use servo_base::id::PainterId;
+
+    use super::WallFrameCoordinator;
+
+    fn painter(index: u32) -> PainterId {
+        webrender_api::IdNamespace(index).into()
+    }
+
+    /// 배리어 하나를 열고 마감을 놓치게 한다. `late` 는 준비 신호를 내지 않은 타일이다.
+    fn missed_barrier(
+        coordinator: &mut WallFrameCoordinator,
+        logical_frame_id: u64,
+        all: &[PainterId],
+    ) {
+        let now = Instant::now();
+        coordinator.register_frame(logical_frame_id, Vec::new(), all.to_vec(), now);
+        coordinator.miss_barrier(logical_frame_id, now);
+    }
+
+    /// ★한 번도 표출한 적 없는 타일에게 "직전 프레임을 유지하라" 고 말하면 안 된다.★
+    ///
+    /// 유지할 직전 프레임이 없기 때문이다. `render_all_tiles` 는 그 지시를 보고 그 타일의
+    /// `paint_target` 과 `present` 를 둘 다 건너뛰는데(`main.rs`), DComp 경로에서 화면에
+    /// 남아 있는 것은 마지막으로 **Commit** 된 내용뿐이라 아직 아무것도 커밋하지 않은
+    /// 타일은 빈 서피스를 보인다 -- 검은 타일 한 장이다.
+    ///
+    /// 이것이 기동 때만 터지는 이유: 배리어 마감이 16ms(`WALL_FRAME_BARRIER_DEADLINE`)인데
+    /// 첫 렌더는 셰이더 컴파일로 46~94ms 다(2026-10-20 실측, `log_ani_debug_05\08`).
+    /// 첫 몇 프레임은 마감을 지킬 수가 없다.
+    #[test]
+    fn a_painter_that_never_presented_is_not_told_to_keep_a_frame_it_does_not_have() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let (early, late) = (painter(1), painter(2));
+
+        missed_barrier(&mut coordinator, 1, &[early, late]);
+
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(late),
+            None,
+            "a tile with nothing committed must draw, not hold a frame it never had"
+        );
+    }
+
+    /// 한 번 표출한 뒤로는 원래 정책대로 직전 프레임을 유지한다. 그때는 유지할 것이 있다.
+    #[test]
+    fn a_painter_that_has_presented_keeps_its_previous_frame() {
+        let mut coordinator = WallFrameCoordinator::default();
+        let (early, late) = (painter(1), painter(2));
+
+        // 첫 패스: 늦었지만 보여 줄 것이 없으므로 그린다 -- 이 질의가 "표출했다" 가 된다.
+        missed_barrier(&mut coordinator, 1, &[early, late]);
+        assert_eq!(coordinator.keep_previous_logical_frame(late), None);
+
+        // 두 번째 패스에서 또 늦으면, 이제는 유지할 직전 프레임이 있다.
+        missed_barrier(&mut coordinator, 2, &[early, late]);
+        assert_eq!(
+            coordinator.keep_previous_logical_frame(late),
+            Some(2),
+            "once a frame is on screen, holding it is the right call"
+        );
+    }
+
+    /// 지시를 받지 않은 타일은 전과 같이 그냥 그린다.
+    #[test]
+    fn a_painter_with_no_instruction_just_draws() {
+        let mut coordinator = WallFrameCoordinator::default();
+        assert_eq!(coordinator.keep_previous_logical_frame(painter(1)), None);
     }
 }
