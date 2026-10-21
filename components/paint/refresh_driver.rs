@@ -92,7 +92,9 @@ impl BaseRefreshDriver {
     }
 
     fn observe_next_frame(&self) {
-        self.waiting_for_frame.store(true, Ordering::Relaxed);
+        // ★`Release` 다 -- [`Heartbeat::beat`] 의 `Acquire` 적재와 짝이다.★ 그쪽이 이
+        // 저장을 놓치면 아무도 박동을 다시 걸지 않아 `FrameClock::Timer` 가 얼어붙는다.
+        self.waiting_for_frame.store(true, Ordering::Release);
 
         let waiting_for_frame = self.waiting_for_frame.clone();
         let event_loop_waker = self.event_loop_waker.clone_box();
@@ -453,9 +455,16 @@ impl Heartbeat {
         // ★표시를 먼저 내린다.★ 깨어난 메인이 `observe_next_frame` 으로 다음 것을 걸려고
         // 할 때 "이미 걸려 있다" 로 보이면 그 에지가 통째로 사라진다. 먼저 내려 두면 최악이
         // 메인과 여기가 하나씩 걸려 하나가 `armed` 에 막히는 경우이고, 그때도 하나는 남는다.
+        //
+        // ★그 "최악" 이 성립하는 근거는 두 플래그의 순서다.★ 메인이 `armed` 에 막히는
+        // 경우는 메인의 `swap` 이 이 `store` 보다 먼저인 경우뿐이고(둘 다 `SeqCst` 라 한
+        // 전순서 위에 있다), 그러면 메인이 그보다 앞서 한 `waiting_for_frame` 저장
+        // (`Release`)이 아래 적재(`Acquire`)에 보인다 -- 그래서 여기서 다시 건다.
+        // ★`Relaxed` 로 두면 그 문장이 성립하지 않고, 둘 다 물러나 아무도 안 거는 끼어듦이
+        // 남는다★(x86 에서는 나지 않지만, 주석이 갖지 않은 안전을 주장하게 된다).
         self.armed.store(false, Ordering::SeqCst);
         self.event_loop_waker.wake();
-        if self.waiting_for_frame.load(Ordering::Relaxed) {
+        if self.waiting_for_frame.load(Ordering::Acquire) {
             self.arm();
         }
     }
@@ -589,6 +598,12 @@ mod tests {
     ///
     /// ★깨우기만이다.★ 타이머가 콜백까지 쏘면 발사 주체가 다시 둘이 된다 -- 그것을
     /// `waiting_for_frame` 이 아직 서 있는 것으로 확인한다(콜백이 쏘였다면 내려갔을 값이다).
+    ///
+    /// ★두 번째 박동까지 본다.★ 하나만 보면 [`Heartbeat::beat`] 의 자기 재장전을 통째로
+    /// 지워도 통과하는데, 재장전이 이 메커니즘의 전부다 -- 한 번 깨우고 마는 박동은 그
+    /// 깨우기가 셸의 틱 게이트를 통과하지 못한 바로 그 경우에 사슬을 끊는다. 경과 시간까지
+    /// 보는 것은 ★주기에도 눈을 달기 위해서다★: 두 박동이 걸린 시간을 보지 않으면 1Hz 로
+    /// 걸어도 통과한다.
     #[test]
     fn a_driver_without_a_clock_of_its_own_gets_woken_by_the_paint_timer() {
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -600,20 +615,39 @@ mod tests {
             &timer_refresh_driver,
         );
 
+        let started = Instant::now();
         base.observe_next_frame();
 
-        // 주기는 `paint_timer_period()`. 느린 기계에서도 흔들리지 않도록 넉넉히 기다린다.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while wakes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        // 주기는 `paint_timer_period()`. 느린 기계에서도 흔들리지 않도록 마감은 넉넉히 둔다 --
+        // 아래 단언이 실제 간격을 본다.
+        let deadline = started + Duration::from_secs(5);
+        while wakes.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
         }
+        let elapsed = started.elapsed();
 
         assert!(
-            wakes.load(Ordering::SeqCst) >= 1,
-            "타이머 스레드가 깨우지 않았다 -- 이 구성에는 틱을 낼 사람이 없다"
+            wakes.load(Ordering::SeqCst) >= 2,
+            "타이머 스레드가 두 번 깨우지 않았다 -- 박동이 자기를 다시 걸지 않으면 \
+             틱 게이트가 아직 안 찬 그 한 번에 사슬이 끊긴다 (wakes={}, elapsed={elapsed:?})",
+            wakes.load(Ordering::SeqCst)
         );
         assert!(
-            base.waiting_for_frame.load(Ordering::Relaxed),
+            elapsed >= paint_timer_period(),
+            "두 박동이 한 주기보다 빨리 왔다 -- 절대 격자를 안 쓰고 있다 ({elapsed:?})"
+        );
+        // ★상한은 `paint_timer_period()` 를 쓰고 있는지만 가린다.★ 두 박동이면 두 주기
+        // 남짓인데, Windows 의 기본 타이머 해상도(15.6ms)가 120Hz 주기(8.3ms)보다 굵어
+        // 실측은 서너 주기까지 늘어난다. 여덟 주기면 그 흔들림의 두 배라 안정적이고,
+        // 주기를 잘못 잡은 경우(예: 1Hz)는 그래도 잡힌다.
+        assert!(
+            elapsed < paint_timer_period() * 8,
+            "박동 간격이 `paint_timer_period()` 가 아니다 ({elapsed:?}, \
+             기대 ~2 x {:?})",
+            paint_timer_period()
+        );
+        assert!(
+            base.waiting_for_frame.load(Ordering::Acquire),
             "깨우기만 와야 한다 -- 콜백이 쏘였다면 waiting_for_frame 이 내려갔을 것이다"
         );
         assert_eq!(
