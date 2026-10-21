@@ -3972,7 +3972,7 @@ impl Painter {
         let behind = self.renderer_behind();
         let waiting = self.frame_delayer.waiting_on_canvas_images();
         match tile_may_generate(behind, waiting) {
-            TileOutcome::KeepPrevious => TileOutcome::KeepPrevious,
+            keep_previous @ TileOutcome::KeepPrevious(_) => keep_previous,
             TileOutcome::Generated => {
                 let mut transaction = Transaction::new();
                 // 쌓인 비디오 프레임은 이 안에서 무조건 실린다 -- 생산은 구성 요소를

@@ -2157,6 +2157,26 @@ impl Paint {
     /// 자유 실행 클럭이 있는 구성(`winit_wall`)은 이것이 아니라 `on_wall_tick` 을 매 주기
     /// 부른다. 어느 쪽이든 ★생산은 `on_wall_tick` 하나를 지난다★ -- 이 함수는 그 앞에
     /// 예약 비트 하나를 거는 것뿐이라 생산자가 둘이 되지 않는다.
+    ///
+    /// ## ★알려진 좁은 창: 예약이 소비되고 프레임은 안 날 수 있다★ (2026-10-22 Task 9.5)
+    ///
+    /// 이 함수는 비트를 `swap(false)` 로 ***먼저*** 가져간 다음 생산을 시도한다. 그래서 그
+    /// 주기에 낼 타일이 하나도 없으면(전 타일이 역압·캔버스 대기로 거절, 또는 스크린샷으로
+    /// 생산을 쉬는 틱) ★예약은 사라지고 프레임은 안 난다★. 뒤이어 렌더가 역압을 풀어도
+    /// 다시 예약하는 자리가 없다.
+    ///
+    /// ★증상★: 조용한 페이지에서 ***한 번만*** 일어난 변경(스크립트가 연달아 두 번
+    /// 갱신한 뒤의 두 번째 것 등)이 화면에 안 올라오고, 다음 `GenerateFrame` 이 올 때까지
+    /// 낡은 그림이 남는다. 애니메이션 페이지에서는 다음 rAF 가 곧 다시 예약하므로 안 보인다.
+    ///
+    /// ★재현되지 않았다★ -- 2026-10-22 에 `setTimeout` 으로 1.5s / 3.0s 에 한 번씩만 DOM 을
+    /// 바꾸는 페이지로 6 초를 돌렸고 두 변경이 모두 프레임이 됐다. 조용한 페이지에서는 틱이
+    /// 올 때 painter 가 대개 한가하기 때문이다.
+    ///
+    /// ★고치려면★: "아무 타일도 생성하지 못한 틱은 예약을 되돌린다" 가 필요한데 두 가지가
+    /// 없다 -- (1) `produce_wall_frame` 의 반환값으로는 "대상이 없었다" 와 "전부 거절했다" 가
+    /// 구분되지 않는다, (2) 되돌린 비트를 집어 갈 ***깨우기***가 헤드 모드에서 따로 필요하다
+    /// (렌더가 끝났다고 이벤트 루프가 깨지는 않는다).
     pub fn on_demand_wall_tick(&self) -> Option<u64> {
         if !crate::wall_tick::take_scheduled_edge() {
             return None;
@@ -2310,28 +2330,36 @@ impl Paint {
         // 아니다 -- 유지할 화면 자체가 없다.
         let mut generated_painter_ids = Vec::new();
         let mut kept_previous_painter_ids = Vec::new();
+        // ★거절했다고 다 무장하지는 않는다 -- 사유가 가른다.★ 2026-10-22 Task 9.5.
+        // `RendererBehind` 거절에 무장하면 자기잠금이다(무장이 막는 렌더가 곧 그 사유를 푸는
+        // 자리다). 근거와 실측은 `wall_tick::decline_may_arm_keep_previous`.
+        let mut armable_painter_ids = Vec::new();
         for painter_id in &request.target_painter_ids {
             let outcome = self.with_painter_mut(*painter_id, move |painter| {
                 painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
             });
             match outcome {
                 Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
-                Some(TileOutcome::KeepPrevious) => kept_previous_painter_ids.push(*painter_id),
+                Some(TileOutcome::KeepPrevious(reason)) => {
+                    kept_previous_painter_ids.push(*painter_id);
+                    if crate::wall_tick::decline_may_arm_keep_previous(reason) {
+                        armable_painter_ids.push(*painter_id);
+                    }
+                },
                 None => {},
             }
         }
 
-        // ★무장은 ***벽이 둘 이상일 때만***★ -- 판정과 그 근거는
-        // `wall_tick::wall_frame_arms_keep_previous`(2026-10-22 Task 9.5). 한 타일짜리 벽에서
-        // 무장은 "그 타일의 렌더를 건너뛰라" 이고, 역압 거절의 원인이 바로 그 렌더가 아직
-        // 안 왔다는 것이라 원인을 영구화한다.
+        // ★두 게이트를 다 지난 타일만 무장한다★ -- 사유 게이트는 위에서, 벽 모양 게이트는
+        // 여기서(`wall_tick::wall_frame_arms_keep_previous`, 2026-10-22 Task 9.5). 둘이 막는
+        // 것이 다르다: 앞은 자기잠금인 사유를, 뒤는 섞일 상대가 없는 한 타일짜리 벽을.
         if crate::wall_tick::wall_frame_arms_keep_previous(
             request.target_painter_ids.len(),
-            !kept_previous_painter_ids.is_empty(),
+            !armable_painter_ids.is_empty(),
         ) {
             self.wall_frame_coordinator
                 .borrow_mut()
-                .arm_keep_previous(logical_frame_id, &kept_previous_painter_ids);
+                .arm_keep_previous(logical_frame_id, &armable_painter_ids);
         }
 
         // ★배리어에는 ***생성한*** 타일만 넘긴다.★ 배리어가 기다리는 것은 frame-ready 이고,

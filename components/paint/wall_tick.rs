@@ -20,8 +20,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 ///
 /// ★`KeepPrevious` 는 "아무 일도 안 했다" 가 아니다.★ 그 타일은 **직전 프레임을 그대로
 /// 유지하는 방식으로** 이 논리 프레임에 참여한다 -- 배리어에서 조용히 빠지면 화면에 프레임
-/// N 과 N-1 이 섞인다. 그 유지를 실제로 지시하는 자리는
-/// `WallFrameCoordinator::arm_keep_previous` 다(2026-10-22 Task 8).
+/// N 과 N-1 이 섞인다.
+///
+/// ★유지를 셸에 ***지시***할지는 사유에 달렸다★(2026-10-22 Task 9.5) --
+/// `KeepPreviousReason` 과 `decline_may_arm_keep_previous` 를 볼 것. 지시 자체는
+/// `WallFrameCoordinator::arm_keep_previous` 가 건다(2026-10-22 Task 8).
 ///
 /// ★분류하는 자리는 하나다 -- `issue_wall_frame_request` 의 `match`.★ 2026-10-22 Task 8
 /// 전에는 `generated()` 라는 술어가 그 일을 했는데, 거절한 타일도 갈 곳이 생기면서
@@ -40,7 +43,25 @@ pub(crate) enum TileOutcome {
     /// 이 타일은 이번 논리 프레임에 직전 프레임을 유지한다. ★배리어에 넣으면 안 된다★ --
     /// 트랜잭션을 안 보냈으므로 ***오지 않을 frame-ready 를*** 기다리게 되고, 그 논리
     /// 프레임이 마감까지 안 닫힌다.
-    KeepPrevious,
+    ///
+    /// 사유를 싣는 이유는 하나다: ★사유에 따라 셸에 "렌더를 건너뛰라" 고 지시해도 되는지가
+    /// 갈린다★(`decline_may_arm_keep_previous`).
+    KeepPrevious(KeepPreviousReason),
+}
+
+/// 타일이 이번 논리 프레임을 거절한 ★사유★. 2026-10-22 Task 9.5.
+///
+/// 둘을 가르는 이유는 진단이 아니라 ★판정★ 이다 -- `decline_may_arm_keep_previous` 가
+/// 이것만 보고 무장 여부를 정한다. 그 전에는 둘이 한 변형이었고, 그래서 자기잠금인 쪽까지
+/// 무장했다.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeepPreviousReason {
+    /// ★임베더가 직전에 낸 프레임을 아직 렌더하지 않았다★(`Painter::renderer_behind`).
+    /// 일시적인 상태이고, 푸는 자리는 `Painter::render` 의 끝 하나다.
+    RendererBehind,
+    /// 캔버스 이미지가 아직 WR 에 안 닿았다(`FrameDelayer::waiting_on_canvas_images`).
+    /// ★이쪽은 낸 프레임이 없다★ -- `renderer_behind` 를 먼저 보고 거짓일 때만 여기 온다.
+    WaitingOnCanvasImages,
 }
 
 /// 이 타일이 이번 틱에 합성을 낼 수 있는가.
@@ -55,11 +76,68 @@ pub(crate) enum TileOutcome {
 /// `FrameDelayer::needs_new_frame` 이 스크립트의 빚(`pending_frame`)도 같이 봤고, 틱 생산은
 /// 그 빚과 무관하게 돌아야 하므로(규칙 2) 그쪽을 쓰면 안 됐다. 그 플래그는 세울 사람과 함께
 /// 사라졌다.
+/// ★`renderer_behind` 를 먼저 본다 -- 순서가 사유를 정한다.★ 둘 다 참이면
+/// `RendererBehind` 다. 그쪽이 더 센 조건이기 때문이다: 낸 프레임이 아직 안 그려졌다는 뜻이고,
+/// 그 상태에서는 무장이 자기잠금이 된다(`decline_may_arm_keep_previous`).
 pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) -> TileOutcome {
-    if renderer_behind || waiting_on_canvas {
-        return TileOutcome::KeepPrevious;
+    if renderer_behind {
+        return TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind);
+    }
+    if waiting_on_canvas {
+        return TileOutcome::KeepPrevious(KeepPreviousReason::WaitingOnCanvasImages);
     }
     TileOutcome::Generated
+}
+
+/// 이 거절을 셸에 ★"렌더를 건너뛰라" 로 지시해도 되는가★. 2026-10-22 Task 9.5.
+///
+/// ★무장의 효과는 하나뿐이다 -- 임베더가 그 타일의 `paint_target` 과 `present` 를 둘 다
+/// 건너뛴다★(`WallFrameCoordinator::keep_previous_logical_frame` 의 호출자:
+/// `winit_wall/main.rs` 의 `render_all_tiles`, servoshell `window.rs` 의
+/// `repaint_webviews`). 배리어와는 무관하다 -- `register_frame` 에는 ***생성한 타일만***
+/// 넘어가고(`Paint::issue_wall_frame_request`), keep-previous 타일을 넣으면 오지 않을
+/// frame-ready 를 기다려 그 논리 프레임이 안 닫힌다(`TileOutcome::KeepPrevious` 주석).
+///
+/// ## `RendererBehind` 에 무장하면 ★자기잠금★ 이다
+///
+/// 그 사유의 조건은 `display_composite_in_flight` 이고, 그 깃발을 내리는 자리는
+/// ★`Painter::render` 의 끝 하나★ 다. 무장은 바로 그 렌더를 건너뛰게 하므로 ***무장이
+/// 자기 전제를 영구화한다***:
+///
+/// ```text
+/// 거절(renderer_behind) -> 무장 -> 셸이 렌더를 건너뜀 -> in_flight 가 안 내려감
+///   -> 다음 틱도 같은 사유로 거절 -> 다시 무장 -> ...
+/// ```
+///
+/// 탈출구는 `renderer_behind()` 안의 ★2 초★ 강제 해제뿐이다. 즉 자유 실행 벽에서는 타일
+/// 하나가 ***최대 2 초 멈춘다*** -- 2026-10-22 Task 8 이전에는 거절한 타일도 셸이 그대로
+/// 렌더해 깃발이 그 패스에 풀렸고, 지연은 한 틱이었다. ★무장이 한 틱 딸꾹질을 2 초 정지로
+/// 바꿨다.★
+///
+/// 수요 구동 임베더에서는 2 초 탈출구조차 안 돈다 -- 그 렌더가 곧 다음 깨우기의 출처라서
+/// (렌더 -> `notify_will_paint` -> rAF -> `GenerateFrame` -> 예약) 틱 자체가 영영 오지
+/// 않는다. 실측(2026-10-22, servoshell `-z` + rAF 페이지 8 초): 논리 프레임이 3 에서 멎고
+/// `Wall repaint target skipped ... logical_frame_id=3` 이 초당 63 회, 새 프레임 0.
+///
+/// ## `WaitingOnCanvasImages` 는 자기잠금이 아니다
+///
+/// 그 타일은 ***낸 프레임이 없다***(`renderer_behind` 가 거짓일 때만 이 사유가 된다).
+/// 기다림을 푸는 것은 렌더가 아니라 캔버스 쪽의 `update_images` 도착이라, 렌더를 건너뛰어도
+/// 조건이 바뀌지 않는다. 무장이 아끼는 것은 ★같은 내용의 present 한 번★ 이다
+/// (`WallFrameCoordinator::expire_keep_previous_before` 주석: "the skip only ever saved a
+/// redundant present").
+///
+/// ★다만 공짜는 아니다 -- 적어 둔다.★ 무장은 `Painter::render` 를 막고, 그 함수의 맨 앞이
+/// 캔버스 ack ***복구***(`Painter::flush_owed_canvas_ack`)다. 이미지가 도착해
+/// `pending_canvas_images` 가 0 이 된 뒤에도 무장이 남아 있으면 그 복구가 그 타일에서 안
+/// 돈다. 자유 실행 벽에서는 다음 틱(8.3ms)이 무장을 걷으므로 창이 한 틱이다. 수요 구동
+/// 임베더에서는 더 길 수 있고, 그쪽은 `wall_frame_arms_keep_previous` 가 타일 하나짜리 벽을
+/// 통째로 막아 준다.
+pub(crate) fn decline_may_arm_keep_previous(reason: KeepPreviousReason) -> bool {
+    match reason {
+        KeepPreviousReason::RendererBehind => false,
+        KeepPreviousReason::WaitingOnCanvasImages => true,
+    }
 }
 
 /// 이 타일이 쥔 캔버스 ack 를 지금 풀어도 되는가. ★해제는 생산과 무관하다.★
@@ -80,36 +158,29 @@ pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) 
     holds_debt && pending_canvas_images == 0
 }
 
-/// 거절한 타일을 이번 논리 프레임의 keep-previous 참가자로 ★무장할 것인가★.
-/// 2026-10-22 Task 9.5.
+/// 이 벽 프레임이 keep-previous 무장을 ★걸 수 있는 모양인가★. 2026-10-22 Task 9.5.
 ///
-/// ★keep-previous 는 벽 ***단위*** 장치다 -- 타일이 하나면 지킬 벽이 없다.★ 설계 2-5 가
-/// 무장을 요구하는 이유는 한 가지다: 거절한 타일을 조용히 빼면 "화면에 프레임 N 인 타일과
-/// N-1 인 타일이 섞인다". 타일이 하나뿐이면 섞일 상대가 없고, 남는 효과는 ★임베더가 그
-/// 타일의 렌더를 건너뛴다★ 는 것뿐이다(`WallFrameCoordinator::keep_previous_logical_frame`
-/// 의 호출자).
+/// 게이트는 둘이고 ★서로 다른 것을 막는다★ -- 어느 쪽도 다른 쪽을 포함하지 않는다:
 ///
-/// ★그 건너뛰기가 거절의 원인을 영구화한다.★ 역압 거절의 조건은 `renderer_behind()` =
-/// "직전에 낸 프레임을 임베더가 아직 렌더하지 않았다" 이고, 그 깃발을 내리는 자리는
-/// `Painter::render` 의 끝 하나다. 렌더를 건너뛰라고 지시하면 깃발이 안 내려가고, 다음
-/// 틱도 같은 이유로 거절해 다시 무장한다. 자유 실행 셸은 매 주기 `renderer_behind()` 를
-/// 다시 불러 2 초 강제 해제로 빠져나오지만, ★수요 구동 임베더에서는 그 렌더가 곧 다음
-/// 깨우기의 출처★ 라서(렌더 -> `notify_will_paint` -> rAF -> `GenerateFrame` -> 예약)
-/// 틱 자체가 영영 오지 않는다.
+/// - 사유 게이트(`decline_may_arm_keep_previous`) -- ***어느 타일을*** 무장할 수 있나.
+///   자기잠금인 `RendererBehind` 를 걸러 낸다. ★타일 수와 무관하다.★
+/// - 이 함수 -- ***이 벽에*** 무장이라는 개념이 성립하나. 타일이 하나면 성립하지 않는다.
 ///
-/// 실측(2026-10-22, servoshell `-z` + rAF 페이지 8 초): 논리 프레임이 3 에서 멎고
-/// `Wall repaint target skipped ... logical_frame_id=3 policy=keep-previous-frame` 가
-/// 초당 63 회 반복됐다. 새 논리 프레임은 한 번도 나오지 않았다.
+/// ★keep-previous 는 벽 ***단위*** 장치다.★ 설계 2-5 가 무장을 요구하는 이유는 한 가지다:
+/// 거절한 타일을 조용히 빼면 "화면에 프레임 N 인 타일과 N-1 인 타일이 섞인다". 타일이
+/// 하나뿐이면 섞일 상대가 없고, 남는 효과는 ★임베더가 그 하나뿐인 렌더를 건너뛴다★ 는
+/// 위험뿐이다 -- 그 렌더는 캔버스 ack 복구(`Painter::flush_owed_canvas_ack`)가 사는 자리
+/// 이기도 하다.
 ///
-/// ★타일 하나에서 이 무장은 2026-10-22 Task 8 에 새로 생긴 것이다.★ 다른 무장 지점
-/// (`WallFrameCoordinator::miss_barrier`)은 배리어가 등록된 프레임에서만 돌고, 배리어는
-/// ***생성한 타일이 둘 이상***일 때만 등록된다. 그래서 이 조건은 새 판정이 아니라
-/// Task 8 이전의 단일 타일 동작을 그대로 되돌려 놓는다.
-///
-/// ★타일이 여럿인 수요 구동 구성은 이 조건이 못 덮는다★ -- 전 타일이 같은 주기에 거절하면
-/// 같은 고리가 돌 수 있다. 그 경우는 설계 2-5 와 Task 8 의 소관으로 남긴다.
-pub(crate) fn wall_frame_arms_keep_previous(target_count: usize, any_tile_declined: bool) -> bool {
-    any_tile_declined && target_count > 1
+/// ★새 판정이 아니라 복원이다.★ 다른 무장 지점(`WallFrameCoordinator::miss_barrier`)은
+/// 배리어가 등록된 프레임에서만 돌고, 배리어는 ***생성한 타일이 둘 이상***일 때만 등록된다
+/// (`Paint::issue_wall_frame_request`). 즉 2026-10-22 Task 8 이전에 타일 하나짜리 벽의
+/// painter 는 무장될 방법이 없었다.
+pub(crate) fn wall_frame_arms_keep_previous(
+    target_count: usize,
+    any_armable_decline: bool,
+) -> bool {
+    any_armable_decline && target_count > 1
 }
 
 /// 이번 틱이 벽 프레임을 낼 차례인가. ★"쉰다" 사유는 스크린샷 하나뿐이다.★ 설계 2-8 /
@@ -255,9 +326,9 @@ impl ExternalPresentBudget {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalPresentBudget, TileOutcome, ack_is_releasable, bootstrap_frame_allowed,
-        schedule_production_at_next_edge, take_scheduled_edge, tick_should_produce,
-        tile_may_generate, wall_frame_arms_keep_previous,
+        ExternalPresentBudget, KeepPreviousReason, TileOutcome, ack_is_releasable,
+        bootstrap_frame_allowed, decline_may_arm_keep_previous, schedule_production_at_next_edge,
+        take_scheduled_edge, tick_should_produce, tile_may_generate, wall_frame_arms_keep_previous,
     };
 
     /// ★틱마다 한 번은 반드시 받는다 -- 그것이 비디오의 바닥이다(불변식 4).★
@@ -306,19 +377,63 @@ mod tests {
     /// `renderer_behind()` 를 이미 불렀고, 그 호출이 2 초 강제 해제를 돌린다.
     #[test]
     fn a_tile_that_is_behind_keeps_its_previous_frame() {
-        assert_eq!(tile_may_generate(true, false), TileOutcome::KeepPrevious);
+        assert_eq!(
+            tile_may_generate(true, false),
+            TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind)
+        );
+    }
+
+    /// 둘 다 참이면 ★`RendererBehind` 가 이긴다★ -- 무장 금지 쪽으로 기울어야 안전하다.
+    /// 뒤집히면 낸 프레임이 있는 타일이 무장되어 자기잠금이 돌아온다.
+    #[test]
+    fn a_tile_that_is_both_behind_and_waiting_reports_being_behind() {
+        assert_eq!(
+            tile_may_generate(true, true),
+            TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind)
+        );
     }
 
     /// ★캔버스를 기다려도 liveness 는 물어본 뒤다.★ 순서가 뒤집히면 2 초 강제 해제가
     /// 영영 안 돈다 -- 그것이 "4 개 중 2 개 타일 44 초 사망" 조건이다.
     #[test]
     fn a_tile_waiting_on_canvas_keeps_its_previous_frame() {
-        assert_eq!(tile_may_generate(false, true), TileOutcome::KeepPrevious);
+        assert_eq!(
+            tile_may_generate(false, true),
+            TileOutcome::KeepPrevious(KeepPreviousReason::WaitingOnCanvasImages)
+        );
     }
 
     #[test]
     fn a_free_tile_generates() {
         assert_eq!(tile_may_generate(false, false), TileOutcome::Generated);
+    }
+
+    /// ★역압 거절은 절대 무장하지 않는다 -- 무장이 자기 전제를 영구화한다.★
+    ///
+    /// 무장이 막는 `Painter::render` 의 끝이 `display_composite_in_flight` 를 내리는
+    /// 유일한 자리다. 참으로 뒤집히면 자유 실행 벽에서 타일 하나가 2 초(강제 해제 주기)
+    /// 멈추고, 수요 구동 임베더에서는 그 렌더가 다음 깨우기의 출처라 ***영구 정지***다
+    /// (실측 2026-10-22: 논리 프레임이 3 에서 멈추고 skip 로그가 초당 63 회).
+    #[test]
+    fn a_back_pressure_decline_is_never_armed() {
+        let armable = decline_may_arm_keep_previous(KeepPreviousReason::RendererBehind);
+        assert!(
+            !armable,
+            "역압 거절에 무장하면 무장이 막는 렌더가 곧 그 역압을 푸는 자리다 \
+             (실제 {armable})"
+        );
+    }
+
+    /// 캔버스 대기 거절은 낸 프레임이 없으므로 자기잠금이 아니다 -- 무장해도 된다.
+    /// 기다림을 푸는 것은 렌더가 아니라 `update_images` 도착이다.
+    #[test]
+    fn a_canvas_wait_decline_may_be_armed() {
+        let armable = decline_may_arm_keep_previous(KeepPreviousReason::WaitingOnCanvasImages);
+        assert!(
+            armable,
+            "캔버스 대기는 렌더와 무관하므로 같은 내용의 present 한 번을 아껴도 된다 \
+             (실제 {armable})"
+        );
     }
 
     /// ★타일이 여럿일 때만 무장한다 -- 그때만 섞일 상대가 있다.★ 설계 2-5.
@@ -327,27 +442,24 @@ mod tests {
         let armed = wall_frame_arms_keep_previous(4, true);
         assert!(
             armed,
-            "타일 4 개 중 하나가 거절하면 그 프레임의 keep-previous 참가자로 세워야 한다 \
-             (실제 {armed})"
+            "타일 4 개 중 하나가 무장 가능한 사유로 거절하면 세워야 한다 (실제 {armed})"
         );
     }
 
-    /// ★타일이 하나면 무장이 교착이다.★ 무장은 임베더에게 "렌더를 건너뛰라" 이고, 역압
-    /// 거절의 원인은 ***바로 그 렌더가 아직 안 왔다*** 는 것이다. 건너뛰면 원인이 영구화되고,
-    /// 수요 구동 임베더에서는 그 렌더가 다음 깨우기의 출처라 틱도 같이 멎는다
-    /// (실측 2026-10-22: 논리 프레임이 3 에서 멈추고 skip 로그가 초당 63 회).
+    /// ★타일이 하나면 무장에 뜻이 없고 위험만 남는다.★ 섞일 상대가 없고, 건너뛰는 그
+    /// 렌더가 캔버스 ack 복구(`Painter::flush_owed_canvas_ack`)가 사는 자리다.
     #[test]
     fn a_declining_tile_on_a_single_tile_wall_is_not_armed() {
         let armed = wall_frame_arms_keep_previous(1, true);
         assert!(
             !armed,
-            "타일이 하나면 섞일 상대가 없고 무장은 렌더를 영구히 막는다 (실제 {armed})"
+            "타일이 하나면 섞일 상대가 없고 무장은 하나뿐인 렌더를 막는다 (실제 {armed})"
         );
     }
 
-    /// 거절한 타일이 없으면 타일 수와 무관하게 무장하지 않는다.
+    /// 무장 가능한 거절이 없으면 타일 수와 무관하게 무장하지 않는다.
     #[test]
-    fn a_wall_frame_with_no_declining_tile_arms_nothing() {
+    fn a_wall_frame_with_no_armable_decline_arms_nothing() {
         assert!(!wall_frame_arms_keep_previous(4, false));
         assert!(!wall_frame_arms_keep_previous(1, false));
     }
