@@ -1824,6 +1824,90 @@ impl Paint {
         }
     }
 
+    /// ★전 painter 에 같은 일을 보내고 **한꺼번에** 수거한다 -- 비용이 합이 아니라 최댓값이다.★
+    ///
+    /// `with_painter_mut` 를 루프로 돌면 타일마다 ***보내고 기다리므로*** 네 타일의 일이
+    /// 줄을 서고, 비용이 합이 된다. 여기서는 스레드 타일에 먼저 전부 보내고(채널 send 뿐이라
+    /// 즉시 돌아온다), 인라인 타일을 그 다음에 돌리고, 마지막에 결과를 모은다. 렌더 패스가
+    /// 쓰는 것과 같은 형태이고 근거도 같다 -- [`ThreadedPainter::dispatch`] 의 주석:
+    /// "보내고 바로 다음 타일을 보내면 네 번의 대기가 나란히 흐르고, 패스는 합이 아니라
+    /// 최댓값이 된다".
+    ///
+    /// ★왜 틱 프롤로그에 이것이 필요한가★ -- 2026-10-22. 표출 틱이 단일 생산자가 되면서
+    /// 셸 스레드가 매 틱 painter 를 ***세 번*** 훑게 됐다(`gather_components` /
+    /// `issue_wall_frame_request` / `release_owed_canvas_acks`). 셋 다 블로킹 루프라
+    /// 렌더 앞에 3N 번의 직렬 왕복이 생겼고, 그 각각이 painter 스레드에서 실제 일을 한다
+    /// (DWM 통계 조회를 포함한다 -- `Painter::note_dcomp_frame_statistics`). 10-16 엔진에는
+    /// 이 루프가 하나도 없었고 같은 비용이 타일별 렌더 안에서 ***나란히*** 흘렀다.
+    ///
+    /// ★순서는 보존된다.★ 돌려주는 벡터는 `painter_ids` 순서 그대로다 -- 배리어 등록과
+    /// pacing 키가 실행마다 같아야 한다(`wall_frame_request_for_all_tiles`).
+    ///
+    /// 없는 painter 와 죽은 스레드는 `None` 이다 -- `with_painter_mut` 와 같은 뜻이다.
+    fn with_each_painter_mut<R, C>(
+        &self,
+        painter_ids: &[PainterId],
+        mut make_callback: impl FnMut(PainterId) -> C,
+    ) -> Vec<Option<R>>
+    where
+        R: Send + 'static,
+        C: FnOnce(&mut Painter) -> R + Send + 'static,
+    {
+        enum Slot<R, C> {
+            /// 그런 painter 가 없거나 스레드가 죽었다.
+            Missing,
+            /// 인라인 타일. ★여기서 바로 돌리지 않는다★ -- 스레드 타일을 다 보낸 뒤라야
+            /// 겹침을 깎지 않는다.
+            Inline(Rc<RefCell<Painter>>, C),
+            Waiting(crossbeam_channel::Receiver<R>),
+        }
+
+        // 1) 보내기만 한다. 이 루프 안에서 기다리면 팬아웃이 아니다.
+        let mut slots = Vec::with_capacity(painter_ids.len());
+        for painter_id in painter_ids {
+            let painter_id = *painter_id;
+            let callback = make_callback(painter_id);
+            let Some(host) = self
+                .painters
+                .iter()
+                .find(|host| host.painter_id == painter_id)
+            else {
+                slots.push(Slot::Missing);
+                continue;
+            };
+            slots.push(match &host.kind {
+                PainterHostKind::Inline(painter) => Slot::Inline(painter.clone(), callback),
+                PainterHostKind::Threaded(threaded) if *PAINTER_LOCK_PROF => {
+                    // `with_painter_mut` 와 같은 자리에서 잰다 -- 큐 대기만이고 콜백 실행은 뺀다.
+                    let called_at = Instant::now();
+                    match threaded.dispatch(move |painter| {
+                        record_painter_lock_wait(painter_id, called_at.elapsed());
+                        callback(painter)
+                    }) {
+                        Some(receiver) => Slot::Waiting(receiver),
+                        None => Slot::Missing,
+                    }
+                },
+                PainterHostKind::Threaded(threaded) => match threaded.dispatch(callback) {
+                    Some(receiver) => Slot::Waiting(receiver),
+                    None => Slot::Missing,
+                },
+            });
+        }
+
+        // 2) 인라인 타일을 돌린다. 스레드 타일들은 이미 나란히 돌고 있다.
+        let mut results = Vec::with_capacity(slots.len());
+        for slot in slots {
+            results.push(match slot {
+                Slot::Missing => None,
+                Slot::Inline(painter, callback) => Some(callback(&mut painter.borrow_mut())),
+                // 3) 남은 것을 수거한다. 가장 느린 타일 하나만큼만 기다린다.
+                Slot::Waiting(receiver) => receiver.recv().ok(),
+            });
+        }
+        results
+    }
+
     /// ★스레드 준비가 안 된 경로 전용.★ 스크린샷 기계는 콜백
     /// (`Box<dyn FnOnce(Result<RgbaImage, _>)>`)과 `Rc<FxHashMap<..>>`
     /// (`ScreenshotRequestPhase::WaitingOnPipelineDisplayLists`)를 들고 있어 아직 타일
@@ -2126,11 +2210,13 @@ impl Paint {
     /// ★크레이트 밖으로 내보내지 않는다.★ 유일한 호출자는 `on_wall_tick` 이고, 그래야
     /// 순서를 틀리게 부를 방법이 애초에 없다.
     pub(crate) fn gather_components(&self) {
-        for painter_id in self.painter_ids() {
-            self.with_painter_mut(painter_id, |painter| {
-                painter.pump_paint_animation(PumpSource::Tick)
-            });
-        }
+        // ★팬아웃이다 -- 루프로 돌리지 말 것.★ 이 단계는 타일마다 DWM 통계 조회를 포함하고
+        // (`Painter::note_dcomp_frame_statistics`), 블로킹 루프로 돌리면 그 비용이 네 번
+        // 더해진 채로 렌더 앞을 막는다. 근거는 `with_each_painter_mut`.
+        let painter_ids = self.painter_ids();
+        self.with_each_painter_mut(&painter_ids, |_| {
+            |painter: &mut Painter| painter.pump_paint_animation(PumpSource::Tick)
+        });
     }
 
     /// ★벽 프레임 하나를 낸다 -- 페이싱 틱의 단일 생산 지점.★ 그리고 그 뒤에 빚진 캔버스
@@ -2274,9 +2360,13 @@ impl Paint {
     /// 결과가 필요 없지만 ★`with_painter_mut_detached` 를 쓰지 않는다★: 그쪽은 큐가 차면
     /// 콜백을 ***버리고***, 버려진 해제는 곧 멎은 스크립트다.
     fn release_owed_canvas_acks(&self) {
-        for painter_id in self.painter_ids() {
-            self.with_painter_mut(painter_id, |painter| painter.release_owed_canvas_ack());
-        }
+        // ★팬아웃이되 **버리지는 않는다**.★ `with_painter_mut_detached` 는 큐가 차면 콜백을
+        // 버리고, 버려진 해제는 곧 멎은 스크립트다. `with_each_painter_mut` 는 보내고 모두
+        // 수거하므로 그 보장은 그대로 두고 직렬화만 없앤다.
+        let painter_ids = self.painter_ids();
+        self.with_each_painter_mut(&painter_ids, |_| {
+            |painter: &mut Painter| painter.release_owed_canvas_ack()
+        });
     }
 
     /// ★페이싱 틱이 벽에 들어오는 유일한 문.★ 셸이 표출 주기마다 한 번 부른다.
@@ -2529,10 +2619,16 @@ impl Paint {
         // `RendererBehind` 거절에 무장하면 자기잠금이다(무장이 막는 렌더가 곧 그 사유를 푸는
         // 자리다). 근거와 실측은 `wall_tick::decline_may_arm_keep_previous`.
         let mut armable_painter_ids = Vec::new();
-        for painter_id in &request.target_painter_ids {
-            let outcome = self.with_painter_mut(*painter_id, move |painter| {
-                painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+        // ★생성도 팬아웃이다.★ 타일마다 보내고 기다리면 네 타일의 `generate_frame_for_wall_tick`
+        // 이 줄을 서고, 그 합이 렌더 시작을 뒤로 민다. 순서는 보존되므로 아래 집합들은
+        // 그대로 결정적이다(`with_each_painter_mut`).
+        let outcomes =
+            self.with_each_painter_mut(&request.target_painter_ids, |_| {
+                move |painter: &mut Painter| {
+                    painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+                }
             });
+        for (painter_id, outcome) in request.target_painter_ids.iter().zip(outcomes) {
             match outcome {
                 Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
                 Some(TileOutcome::KeepPrevious(reason)) => {
