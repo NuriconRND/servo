@@ -1,7 +1,21 @@
-# Runs the packaged multi-GPU wall (pref-era: engine knobs are --pref, not env vars).
+﻿# Runs the packaged multi-GPU wall (pref-era: engine knobs are --pref, not env vars).
 #
-# Pure ASCII on purpose -- a Korean launcher failed to parse on a test machine that
-# decodes with a legacy console codepage, swallowing a closing quote.
+# ★이 파일은 UTF-8 **with BOM** 이다 -- BOM 을 떼면 파싱이 깨진다.★
+#
+# 여기에는 "Pure ASCII on purpose -- a Korean launcher failed to parse on a test machine"
+# 라고 적혀 있었다. 그 규칙이 생긴 이유는 실재했다: BOM 이 없으면 PowerShell 5.1 은 이
+# 파일을 ANSI(여기서는 cp949)로 읽고, 그 디코더는 짝이 안 맞는 선행 바이트를 만나면 뒤의
+# 한 바이트를 같이 삼킨다. 한국어로 끝나는 주석 줄에서 그 한 바이트가 ***개행***이라,
+# 다음 줄이 통째로 주석 안으로 끌려 들어가고 파서는 엉뚱한 자리에서 "Unexpected token '}'"
+# 를 낸다(2026-10-22 재현: PAINTERLOCK 절을 넣자마자 터졌다).
+#
+# 그런데 그 규칙은 ***이미 지켜지지 않고 있었다*** -- 아래 주석의 대부분이 한국어다. 지금까지
+# 멀쩡했던 것은 그 줄들이 전부 ASCII 구두점으로 끝나 개행이 살아남았기 때문이고, 그것은
+# 규칙이 아니라 운이다. 그래서 규칙을 다시 적는 대신 ★원인을 없앤다★: BOM 이 있으면
+# PowerShell 이 UTF-8 로 읽고 이 함정 자체가 사라진다.
+#
+# 편집 도구가 BOM 을 떼지 않게 할 것. 확인: `Get-Command .\run_wall_dist.ps1 -Syntax`
+# 가 조용히 끝나면 된다 -- 깨져 있으면 거기서 파스 에러가 쏟아진다.
 #
 # RUST_LOG is set UNCONDITIONALLY. It used to be `if (-not $env:RUST_LOG)` and that
 # silently defeated the diagnostics twice: a value left over in the shell (without
@@ -542,6 +556,24 @@ param(
     # 깨끗했다(2026-10-21) -- 그때 남아 있던 유일한 변수가 이것이다.
     # -AnimStepSeq 를 함께 주면 정렬 전 원시 수열(FRAMETIMESEQ)도 찍는다.
     [switch] $FrameTimeProf,
+    # SERVO_WALL_PAINTER_LOCK_PROF=1: PAINTERLOCK -- `with_painter_mut` 가 타일 스레드의
+    # 큐에서 기다린 시간을 painter 별로 1 초에 한 줄씩 잰다(n, wait_ms p50/p95/max,
+    # over_1ms). 호출한 순간부터 콜백이 그 스레드에서 ***시작***하는 순간까지이고, 콜백
+    # 자신의 실행 시간은 빠진다. 스레드 없는 painter 는 기다릴 것이 없어 줄이 안 난다.
+    #
+    # ★무엇을 가르는가★ -- 표출 틱이 단일 프레임 생산자가 된 뒤로, 틱은 렌더 앞에서
+    # painter 마다 블로킹으로 세 번 닿는다(gather_components / issue_wall_frame_request /
+    # release_owed_canvas_acks). N 타일이면 틱당 3N 번의 왕복이 셸 스레드에서 직렬로 돈다.
+    # 그 왕복이 진행 중인 타일 렌더 뒤에 서면 ***틱과 렌더 패스 시작 사이가 벌어지고***,
+    # -DwmAlign 이 격자에 박아 두는 것은 틱 에지뿐이므로 패스 시작은 그만큼 밀린다.
+    # -CommitAlign 의 마감도 틱 기준이라 그 예산을 같이 깎는다. 설계에서 확인되지 않은
+    # 유일한 항목이 이것이고, 타일이 하나인 개발 장비에서는 3 번, 벽에서는 12 번이다.
+    #
+    # 판정: `p95 < 1ms` 면 블로킹 호출이 맞다. `p95 >= 1ms` 면 틱이 타일 렌더 뒤에 서고
+    # 있다는 뜻이고 비블로킹 포스트로 가야 한다 -- ★어느 쪽이든 생산자는 하나다.★
+    # ★`max` 하나로 읽지 말 것★ -- "3ms 한 번" 과 "3ms 를 60 번" 은 결론이 정반대이고,
+    # 그 둘을 가르는 것이 `over_1ms` 다.
+    [switch] $PainterLockProf,
     # dom_animation_timeline_use_frame_time: 애니메이션의 기준 시각을 "script 가 도달한
     # 순간" 대신 "그 프레임의 시각" 으로 쓴다. 엔진 기본은 켜짐이므로, 이 스위치는 끌 때
     # 쓴다. 왜 필요한지는 설계 문서 50 과 2026-10-15 설계.
@@ -585,17 +617,35 @@ param(
     # "auto" (default) = pin to the NUMA node the display adapters are on, derived at launch.
     # "off" = let Windows pick, the pre-2026-08-26 behaviour. A number forces that node.
     #
-    # ***THE GPUs ARE ON ONE NUMA NODE AND LANDING ON THE OTHER ONE DESTROYS THE WALL.***
-    # This box is two Xeon Gold 6248 sockets (20C/40T each) with four Radeon RX 580 all
-    # reporting NUMA node 1. Measured 2026-08-26 with the node forced, 45 videos, 6/6:
+    # ★★2026-10-22 정정: 이 박스의 GPU 는 더 이상 한 노드에 있지 않다.★★ 2026-10-19 에
+    # 고장으로 ***메인보드를 교체***했고, 교체된 보드는 네 장을 두 노드에 갈라 붙인다
+    # (`tools\probe_machine_topology.ps1`, 2026-10-22):
     #
-    #   node 1 (the GPUs' node): 23-29.5 video fps, 0.65-0.73 ms per Present, dwm 0.09-0.11
-    #   node 0 (the far socket):  6.0     video fps, 2.9-3.0  ms per Present, dwm 0.64-0.66
+    #   RX 580  PCI bus 134 -> NUMA node 1
+    #   RX 580  PCI bus 175 -> NUMA node 1
+    #   RX 580  PCI bus  24 -> NUMA node 0
+    #   RX 580  PCI bus  59 -> NUMA node 0
     #
-    # Every upload and every present crosses the inter-socket link on the far node. It is not
-    # a capacity problem -- the collapsed runs left 31 of 80 cores idle. Before this was found,
-    # the same command landed in either state at random and every A/B that straddled the two
-    # compared nothing.
+    # ★그래서 옳은 `-NumaNode` 값이 존재하지 않는다.★ 어느 노드를 고르든 타일 넷 중 ***둘***이
+    # 먼 노드에 남는다. 실측(2026-10-22, wall_anim_jitter_probe, 120 초, COMPREFRESH 의
+    # 중복 프레임 비율 -- 최악 패널):
+    #
+    #   -NumaNode auto (안 고정)  0.15% / 0.39%        <- 제일 낫다
+    #   -NumaNode 1               1.00% / 1.29%
+    #   -NumaNode 0               0.02% / 2.23%        <- 같은 명령이 양쪽 끝을 냈다
+    #
+    # 고정한 두 arm 은 결함이 ***런 전 구간에 균일***했고(1 초 창의 91% 에 결함), 안 고정한
+    # arm 은 몇 창에만 몰렸다. 즉 기동 시 어디에 앉느냐가 런 전체를 결정한다.
+    #
+    # ★아래 2026-08-26 기록은 **교체 전 보드**의 것이다.★ 그 보드는 네 장이 전부 node 1
+    # 이었고, 그때는 `-NumaNode 1` 이 옳았다. 수치는 그 시절 벽을 해석할 때만 쓸 것:
+    #
+    #   node 1 (그때 GPU 들의 노드): 23-29.5 video fps, 0.65-0.73 ms per Present, dwm 0.09-0.11
+    #   node 0 (먼 소켓)           :  6.0     video fps, 2.9-3.0  ms per Present, dwm 0.64-0.66
+    #
+    # 먼 노드에서는 업로드와 present 가 전부 소켓 간 링크를 건넌다. 용량 문제가 아니다 --
+    # 무너진 런들도 80 코어 중 31 개가 놀고 있었다. 지금 보드에서 이 기전을 없애려면
+    # ***프로세스 전체 고정이 아니라 타일별 스레드 배치***가 필요하고, 그건 아직 없다.
     [string] $NumaNode = "auto",
     # Hard-confine the wall to its processor group, on top of the node PREFERENCE that
     # `start /NODE` gives. Off by default until measured on the wall itself.
@@ -811,6 +861,7 @@ if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 if ($PresentCadence)       { $env:SERVO_LOG_PRESENT_CADENCE = "1" }
 if ($AnimStepSeq)          { $env:SERVO_LOG_ANIM_STEP_SEQ = "1" }
 if ($FrameTimeProf)        { $env:SERVO_FRAME_TIME_PROF = "1" }
+if ($PainterLockProf)      { $env:SERVO_WALL_PAINTER_LOCK_PROF = "1" }
 if ($DcompDebug)           { $env:SERVO_DCOMP_DEBUG = "1" }
 if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
 
@@ -962,7 +1013,7 @@ if ($NumaNode -eq "auto") {
         $numaResolved = [int]$nodes[0]
         Write-Host "  numa=auto -> node $numaResolved (from the display adapters)"
     } elseif ($nodes.Count -gt 1) {
-        Write-Warning "Display adapters report different NUMA nodes ($($nodes -join ', ')). Pinning nothing -- pass -NumaNode <n> to choose."
+        Write-Warning "Display adapters are split across NUMA nodes ($($nodes -join ', ')). Pinning nothing, which is CORRECT here: with the GPUs on different nodes there is no right -NumaNode value -- whichever you pick, the tiles on the other node pay the inter-socket link. Measured 2026-10-22: unpinned 0.15-0.39% duplicated frames, -NumaNode 1 1.00-1.29%, -NumaNode 0 0.02-2.23%. Do not pass -NumaNode <n> to silence this."
     } else {
         Write-Warning "No display adapter reports a NUMA node, so it cannot be derived. Pinning nothing. On a multi-socket box pass -NumaNode <n> explicitly: landing on the far node has been measured to cut 45-video playback from 29 fps to 6."
     }
@@ -2231,6 +2282,229 @@ if ($rc) {
     Write-Warning "-FrameTimeProf was set but no RAFCLOCK line was logged. It emits from Document::resolve_frame_time, which runs on every rendering update -- if FRAMETIME printed and this did not, the ticks are not reaching the script thread at all."
 }
 
+
+# --- COMPREFRESH: 저더를 직접 센 수 (needs -DcompBindProf) ---
+# ★이 저장소에서 저더를 ***직접*** 세는 유일한 계수기다.★ `refresh_d` 는 합성 프레임 하나가
+# 지나는 동안 그 패널의 `refreshCount` 가 몇 올랐나의 분포이고, `[2]` 이상은 그 패널이 한
+# 합성에 리프레시를 둘 이상 썼다는 뜻 -- ***같은 그림을 두 번 보여 줬다***(`output_grid.rs`
+# 의 `CompStats::refresh_delta` 주석). fps 도, 패스 길이도, TICKCOMMIT 도 이것과 따로 논다:
+# 2026-10-22 의 두 실행은 fps 61.6 / t2c p50 15.9 / ANIMSTEP dt p50 16.8 로 ***구분되지
+# 않는데*** 이 수는 4 와 730 이었다.
+#
+# ★비율만 보지 말고 `w/dup` 을 같이 볼 것.★ 같은 총계라도 전 구간에 고르게 퍼진 것과 몇 초에
+# 몰린 것은 원인이 다르다 -- 고르면 기동 시 굳은 상태이고(실측: 10 초 버킷마다 20 건씩
+# 120 초), 몰리면 지나가는 사건이다(실측: 121 창 중 6 창).
+#
+# 실측 기준선(같은 장비·같은 프로브·120 초, 2026-10-22):
+#   engine 2026-10-16  0.010 ~ 0.090%   (5/5 런, 핀 없이 group 0·1 양쪽)
+#   engine 2026-10-22  0.109 ~ 3.50%    (6/7 런)
+$cr = @(Select-String -Path $LogPath -Pattern "COMPREFRESH out=" -EA SilentlyContinue)
+if ($cr.Count -gt 0) {
+    $crRows = @{}
+    $crOrder = @()
+    foreach ($m in $cr) {
+        if ($m.Line -notmatch "COMPREFRESH out=(\S+) luid=(\S+).*? frames=(\d+) refresh_d=\[(\d+),(\d+),(\d+),(\d+)\]") { continue }
+        $key = $Matches[1]
+        if (-not $crRows.ContainsKey($key)) {
+            $crRows[$key] = @{ Luid = $Matches[2]; Frames = 0; Dup = 0; D0 = 0; Windows = 0; WithDup = 0; Worst = 0 }
+            $crOrder += $key
+        }
+        $r = $crRows[$key]
+        # d2 와 d3+ 를 합친다 -- 둘 다 "같은 그림을 두 번 이상" 이고, 가르면 드문 d3+ 가 묻힌다.
+        $dup = [int]$Matches[6] + [int]$Matches[7]
+        $r.Frames  = $r.Frames + [int]$Matches[3]
+        $r.D0      = $r.D0 + [int]$Matches[4]
+        $r.Dup     = $r.Dup + $dup
+        $r.Windows = $r.Windows + 1
+        if ($dup -gt 0) { $r.WithDup = $r.WithDup + 1 }
+        if ($dup -gt $r.Worst) { $r.Worst = $dup }
+    }
+    if ($crOrder.Count -gt 0) {
+        Write-Host ""
+        Write-Host "COMPREFRESH -- the judder counter: a panel that showed the same picture twice"
+        Write-Host ("  {0,-14} {1,-19} {2,8} {3,7} {4,8} {5,7} {6,8} {7,8}" -f "output", "luid", "frames", "dup", "dup%", "worst", "windows", "w/dup")
+        $crWorstPct = 0.0
+        $crTotalDup = 0
+        $crWindows = 0
+        $crWithDup = 0
+        foreach ($key in $crOrder) {
+            $r = $crRows[$key]
+            $pct = 0.0
+            if ($r.Frames -gt 0) { $pct = 100.0 * $r.Dup / $r.Frames }
+            $crWorstPct = [math]::Max($crWorstPct, $pct)
+            $crTotalDup = $crTotalDup + $r.Dup
+            $crWindows  = [math]::Max($crWindows, $r.Windows)
+            $crWithDup  = [math]::Max($crWithDup, $r.WithDup)
+            Write-Host ("  {0,-14} {1,-19} {2,8:N0} {3,7:N0} {4,7:N3}% {5,7:N0} {6,8:N0} {7,8:N0}" -f `
+                $key, $r.Luid, $r.Frames, $r.Dup, $pct, $r.Worst, $r.Windows, $r.WithDup)
+        }
+        # 창 중 몇 %에 결함이 있었나. 고르게 퍼졌는지 몰렸는지를 이 하나로 가른다.
+        $crSpreadPct = 0.0
+        if ($crWindows -gt 0) { $crSpreadPct = 100.0 * $crWithDup / $crWindows }
+        $shape = "episodic"
+        if ($crSpreadPct -ge 50.0) { $shape = "CONTINUOUS" }
+        Write-Host ("  shape: {0} -- the worst panel had a defect in {1:N0} of {2:N0} one-second windows ({3:N0}%)" -f $shape, $crWithDup, $crWindows, $crSpreadPct)
+        if ($crWorstPct -lt 0.10) {
+            Write-Host "  ★Clean.★ This is inside the 2026-10-16 engine's measured band (0.010-0.090%) on the same"
+            Write-Host "  wall. The panels showed one new picture per composition -- whatever else a run shows,"
+            Write-Host "  the wall was not stuttering."
+        } elseif ($crWorstPct -lt 0.50) {
+            Write-Warning ("Marginal: worst panel {0:N3}% ({1:N0} duplicated frames across all panels), above the 0.010-0.090% band the 2026-10-16 engine held on this wall. {2}. Repeat the run before reading anything into it -- the same command has measured 0.02% and 2.23% on consecutive runs, so a single run does not separate arms." -f $crWorstPct, $crTotalDup, $(if ($shape -eq "CONTINUOUS") { "Spread across the whole run, which points at a state fixed when the process started" } else { "Concentrated in a few windows, so look for a passing event rather than a startup state" }))
+        } else {
+            Write-Warning ("Judder: worst panel {0:N3}% ({1:N0} duplicated frames across all panels) -- 5x or more above the 2026-10-16 band on this wall. {2}. fps and pass_ms will look normal; they do not measure this." -f $crWorstPct, $crTotalDup, $(if ($shape -eq "CONTINUOUS") { "It ran the whole 120s, which is the signature of a state fixed at process start -- re-run and see whether it flips, before blaming the last code change" } else { "It came in bursts, so look for what else happened at those moments" }))
+        }
+    }
+} elseif ($DcompBindProf) {
+    Write-Warning "-DcompBindProf was set but no COMPREFRESH line was logged. It comes from the output-grid probe thread beside OUTPHASE; if those printed and this did not, DComp statistics were unavailable for every target."
+}
+
+# --- PAINTERLOCK: 틱이 타일 렌더 뒤에 서는가 (needs -PainterLockProf) ---
+# 표출 틱이 단일 프레임 생산자가 된 뒤로, 틱은 렌더를 시작하기 ***전에*** painter 마다 세 번
+# 블로킹으로 닿는다(gather_components / issue_wall_frame_request / release_owed_canvas_acks).
+# 이 줄은 그 왕복이 타일 스레드의 큐에서 기다린 시간만 재고, 콜백 실행 시간은 빼 둔다.
+#
+# ★이것이 재는 것은 "틱 자신의 클럭" 이다.★ -DwmAlign 은 틱 에지를 DWM 합성 격자에 박지만
+# 패스 시작은 틱 + 이 대기이고, -CommitAlign 의 마감은 틱에서부터 세므로 패스에 남는 예산도
+# 그만큼 줄어든다. 즉 이 값이 크면 두 정렬 플래그는 ***멀쩡한 채로 효과만 사라진다.***
+# 두 블록이 같이 쓰는 중앙값 도우미. ★PAINTERLOCK 이 안 찍힌 실행에서도 TICKCOMMIT 이
+# 돌아야 하므로 블록 밖에 둔다.★
+$medianOf = {
+    param($values)
+    $sorted = @($values | Sort-Object)
+    if ($sorted.Count -eq 0) { return 0.0 }
+    return $sorted[[int]([math]::Floor($sorted.Count / 2))]
+}
+$pl = @(Select-String -Path $LogPath -Pattern "PAINTERLOCK painter=" -EA SilentlyContinue)
+if ($pl.Count -gt 0) {
+    # ★PS 5.1 에서 결과가 하나면 .Count 가 비는 것을 피하려고 전부 @() 로 감싼다.★
+    $plRows = @{}
+    $plOrder = @()
+    foreach ($m in $pl) {
+        if ($m.Line -notmatch "PAINTERLOCK painter=(\S+) n=(\d+) wait_ms p50=([-\d.]+) p95=([-\d.]+) max=([-\d.]+)\s+over_1ms=(\d+)") { continue }
+        $key = $Matches[1]
+        if (-not $plRows.ContainsKey($key)) {
+            $plRows[$key] = @{ Windows = 0; N = 0; P50 = @(); P95 = @(); Max = 0.0; Over = 0 }
+            $plOrder += $key
+        }
+        $r = $plRows[$key]
+        $r.Windows = $r.Windows + 1
+        $r.N       = $r.N + [int]$Matches[2]
+        $r.P50     = $r.P50 + [double]$Matches[3]
+        $r.P95     = $r.P95 + [double]$Matches[4]
+        $r.Max     = [math]::Max($r.Max, [double]$Matches[5])
+        $r.Over    = $r.Over + [int]$Matches[6]
+    }
+    if ($plOrder.Count -gt 0) {
+        Write-Host ""
+        Write-Host "PAINTERLOCK -- how long the tick waited in the painter thread queues:"
+        Write-Host ("  {0,-14} {1,8} {2,9} {3,10} {4,10} {5,12} {6,10} {7,10} {8,9}" -f "painter", "windows", "calls", "p50(med)", "p95(med)", "p95(worst)", "max", "over_1ms/s", "over_1ms%")
+        $plVerdictP95 = 0.0
+        $plOverPerSec = 0.0
+        $plOverPct = 0.0
+        $plWorstMax = 0.0
+        foreach ($key in $plOrder) {
+            $r = $plRows[$key]
+            $p50med = & $medianOf $r.P50
+            $p95med = & $medianOf $r.P95
+            $p95max = 0.0
+            foreach ($v in $r.P95) { $p95max = [math]::Max($p95max, $v) }
+            $overRate = 0.0
+            if ($r.Windows -gt 0) { $overRate = $r.Over / $r.Windows }
+            $overPct = 0.0
+            if ($r.N -gt 0) { $overPct = 100.0 * $r.Over / $r.N }
+            $plVerdictP95 = [math]::Max($plVerdictP95, $p95med)
+            $plOverPerSec = [math]::Max($plOverPerSec, $overRate)
+            $plOverPct    = [math]::Max($plOverPct, $overPct)
+            $plWorstMax   = [math]::Max($plWorstMax, $r.Max)
+            Write-Host ("  {0,-14} {1,8:N0} {2,9:N0} {3,10:N2} {4,10:N2} {5,12:N2} {6,10:N2} {7,10:N1} {8,8:N1}%" -f `
+                $key, $r.Windows, $r.N, $p50med, $p95med, $p95max, $r.Max, $overRate, $overPct)
+        }
+        # 판정선은 설계가 적어 둔 그대로 `p95 < 1ms` 다(`SERVO_WALL_PAINTER_LOCK_PROF` 의 doc).
+        # ★`max` 하나로 판정하지 않는다★ -- "3ms 한 번" 과 "3ms 를 60 번" 은 결론이 정반대이고,
+        # 그 둘을 가르는 것이 over_1ms 다. 그래서 p95 를 1 차 판정으로 쓰고, p95 가 깨끗한데도
+        # 꼬리가 자주 무는 경우만 따로 말한다.
+        #
+        # ★초당 횟수로 판정하지 않는다★ -- 초당 180 회 호출에서 1 회는 0.6% 이고, 그것을
+        # 결함이라고 부르면 깨끗한 실행이 전부 경고로 찍혀 판정이 쓸모없어진다. 그래서 꼬리는
+        # ***호출 수에 대한 비율***로 본다.
+        if ($plVerdictP95 -ge 1.0) {
+            Write-Warning ("The tick is queueing behind tile renders: p95(med) up to {0:N2}ms, with {1:N1}% of calls waiting over 1ms. The tick makes three blocking round trips per painter before the render pass starts, so a 4-tile wall pays twelve of them. -DwmAlign pins only the tick edge, so the pass start slides by that much, and -CommitAlign measures its deadline from the tick, so the pass budget shrinks by the same amount. Move these round trips to a non-blocking post, keeping production single-sourced." -f $plVerdictP95, $plOverPct)
+        } elseif ($plOverPct -ge 5.0) {
+            Write-Warning ("p95(med) is {0:N2}ms, so the typical tick does not wait -- but {1:N1}% of calls ({2:N1}/s) still blocked for over 1ms, worst {3:N2}ms. That tail is a tick that occasionally lands behind a tile render, which shows up as an occasional late pass rather than a steady phase shift. Read it beside TICKCOMMIT spread below: if the spread moves with it, this tail is the judder." -f $plVerdictP95, $plOverPct, $plOverPerSec, $plWorstMax)
+        } else {
+            Write-Host "  ★The blocking call is fine.★ The tick does not wait on the painters, so whatever sits"
+            Write-Host "  between the tick edge and the start of the render pass is not this. If judder remains, read"
+            Write-Host "  TICKCOMMIT below and the WALLPASS lines -- the prologue cost would be in the pass, not here."
+        }
+    }
+} elseif ($PainterLockProf) {
+    Write-Warning "-PainterLockProf was set but no PAINTERLOCK line was logged. It only measures threaded painters -- a run where every tile painter is inline (no tile threads) has nothing to wait on and prints nothing."
+}
+
+# --- TICKCOMMIT: 틱에서 커밋까지 (needs -DcompBindProf) ---
+# ★이 값의 뜻이 2026-10-22 에 바뀌었다★ -- 전에는 "패스 길이" 였지만, 지금은 틱과 렌더
+# 사이에 생산 프롤로그가 들어가므로 ***프롤로그 + 패스***다. p50 이 통째로 올라갔으면 그
+# 프롤로그이고, p95-p05(spread)가 벌어졌으면 그것이 커밋 위상의 지터다.
+#
+# `late` 는 커밋이 반 주기보다 늦게 나간 횟수다 -- 그 프레임은 겨냥한 위상에서 통째로
+# 벗어났다. PAINTERLOCK 과 ★같은 실행에서★ 읽어야 둘의 인과가 갈린다.
+$tc = @(Select-String -Path $LogPath -Pattern "TICKCOMMIT device=" -EA SilentlyContinue)
+if ($tc.Count -gt 0) {
+    $tcRows = @{}
+    $tcOrder = @()
+    foreach ($m in $tc) {
+        if ($m.Line -notmatch "TICKCOMMIT device=(\S+) n=(\d+) t2c_ms p05=([-\d.]+) p50=([-\d.]+) p95=([-\d.]+) max=([-\d.]+) spread=([-\d.]+) late=(-?\d+)") { continue }
+        $key = $Matches[1]
+        if (-not $tcRows.ContainsKey($key)) {
+            $tcRows[$key] = @{ Windows = 0; N = 0; P50 = @(); Spread = @(); Max = 0.0; Late = 0 }
+            $tcOrder += $key
+        }
+        $r = $tcRows[$key]
+        $r.Windows = $r.Windows + 1
+        $r.N       = $r.N + [int]$Matches[2]
+        $r.P50     = $r.P50 + [double]$Matches[4]
+        $r.Spread  = $r.Spread + [double]$Matches[7]
+        $r.Max     = [math]::Max($r.Max, [double]$Matches[6])
+        # late=-1 은 "DWM 주기를 못 구했다" 는 뜻이지 0 건이 아니다. 더하면 거짓말이 된다.
+        if ([int]$Matches[8] -gt 0) { $r.Late = $r.Late + [int]$Matches[8] }
+    }
+    if ($tcOrder.Count -gt 0) {
+        # ★마감이 주기의 어디인지 먼저 적는다.★ 마감은 틱 ***다음***의 첫 CommitAlign% 격자점
+        # 이므로, CommitAlign 이 DwmAlign 보다 앞서면 여유는 거의 한 주기다
+        # (`output_grid::commit_slack_pct`). 8/14 면 94% 라 마감이 다음 틱 1ms 앞이고,
+        # ★그러면 t2c 가 반 주기를 넘는 것이 정상이다.★
+        $tcSlack = 100
+        if ($CommitAlign -ge 0 -and $DwmAlign -ge 0 -and $CommitAlign -ne $DwmAlign) {
+            $tcSlack = ($CommitAlign + 100 - $DwmAlign) % 100
+        }
+        $tcPeriod = 0.0
+        if ($RefreshHz -gt 0) { $tcPeriod = 1000.0 / $RefreshHz }
+        $tcTarget = $tcPeriod * $tcSlack / 100.0
+        Write-Host ""
+        Write-Host "TICKCOMMIT -- tick edge to DComp Commit (production prologue + pass):"
+        Write-Host ("  {0,-16} {1,8} {2,13} {3,13} {4,10}" -f "device", "windows", "t2c p50(med)", "spread(med)", "max")
+        $tcWorstSpread = 0.0
+        foreach ($key in $tcOrder) {
+            $r = $tcRows[$key]
+            $p50med = & $medianOf $r.P50
+            $spmed  = & $medianOf $r.Spread
+            $tcWorstSpread = [math]::Max($tcWorstSpread, $spmed)
+            Write-Host ("  {0,-16} {1,8:N0} {2,13:N2} {3,13:N2} {4,10:N2}" -f $key, $r.Windows, $p50med, $spmed, $r.Max)
+        }
+        if ($tcTarget -gt 0) {
+            Write-Host ("  deadline: -CommitAlign {0} after -DwmAlign {1} is {2}% of a period = {3:N2} ms after the tick." -f $CommitAlign, $DwmAlign, $tcSlack, $tcTarget)
+            Write-Host ("  t2c p50 should sit just under that. The number to watch is spread(med), not p50.")
+        }
+        # ★`late` 를 안 찍는 이유.★ 엔진은 "반 주기보다 늦게 나간 커밋" 을 세는데, 여기처럼
+        # 마감이 94% 에 있으면 ***정렬이 완벽할수록 전부 late 로 찍힌다***. 실측 양쪽 다
+        # late == n 이었다. 그 수를 그대로 보여 주면 읽는 사람이 결함으로 읽는다.
+        Write-Host '  (The engine TICKCOMMIT late counter is omitted: it counts commits past HALF a period,'
+        Write-Host '   which every correctly aligned commit is when the deadline sits at 94%. It read late==n in every run.)'
+        Write-Host "  Do not compare this against a pre-2026-10-21 log: those runs had no prologue in t2c."
+    }
+} elseif ($DcompBindProf) {
+    Write-Warning "-DcompBindProf was set but no TICKCOMMIT line was logged. It is emitted from the output-grid probe thread beside OUTPHASE/SAMPLESLIP; if those printed and this did not, no commit carried a tick stamp (the shell never called servo::note_present_tick)."
+}
 if ($fanout -gt 0) { Write-Warning "GPU fan-out is broken -- tiles share one D3D11 device. See the warning text in the log." }
 if ($egl -gt 0)    { Write-Warning "Some tiles could not wrap video textures ($egl occurrences) -- those tiles show green." }
 exit 0
