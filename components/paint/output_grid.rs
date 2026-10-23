@@ -628,14 +628,18 @@ static COMMIT_GAPS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None);
 /// `note_commit_at` 이 채우고 커밋의 일부만 보지만, 이쪽은 `raw_commit` 이 채워 전부 본다.
 static LAST_COMMIT: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
-/// ★`Commit()` 이 날 때마다 직전 커밋과의 간격을 남긴다.★ `dcomp_compositor::raw_commit`
-/// 에서, 즉 ***모든*** 커밋이 지나는 한 자리에서 부른다.
+/// ★`Commit()` 이 날 때마다 그 시각과 직전 커밋과의 간격을 남긴다.★
+/// `dcomp_compositor::raw_commit` 에서, 즉 ***모든*** 커밋이 지나는 한 자리에서 부른다.
+/// 간격은 `COMMITGAP`(박자), 시각은 `COMMITCYCLE`(위상) 이 읽는다.
 pub(crate) fn note_commit_interval(device: usize) {
     let Some(now) = qpc_now() else { return };
     let previous = match LAST_COMMIT.lock() {
         Ok(mut guard) => guard.get_or_insert_with(HashMap::new).insert(device, now),
         Err(_) => return,
     };
+    if let Ok(mut guard) = COMMIT_STAMPS.lock() {
+        guard.get_or_insert_with(HashMap::new).entry(device).or_default().push(now);
+    }
     let Some(previous) = previous else { return };
     if let Ok(mut guard) = COMMIT_GAPS.lock() {
         guard
@@ -699,6 +703,92 @@ fn emit_commitgap() {
             buckets[1],
             buckets[2],
             buckets[3],
+        );
+    }
+}
+
+/// 디바이스 -> 이번 창의 `Commit()` 시각(QPC). `COMMITCYCLE` 이 초당 비운다.
+///
+/// `COMMIT_GAPS` 와 같은 자리에서 채우지만 담는 것이 다르다 -- 저쪽은 **간격**이고 이쪽은
+/// **절대 시각**이다. 간격만으로는 위상을 복원할 수 없다.
+static COMMIT_STAMPS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None);
+
+/// ★커밋이 DWM 합성 주기마다 정확히 하나씩 들어갔나.★
+///
+/// ★왜 `COMMITGAP` 으로는 안 되는가★(2026-10-23) -- `COMMITGAP` 이 답한 것은 **박자**다:
+/// 정상 구간 7,345/7,356 이 `p1`, 즉 커밋은 한 주기도 거르지 않았다. 그런데 같은 세 런의
+/// `COMPREFRESH` dup 은 50/100/54 로 기준선의 다섯 배였다. 박자가 완벽한데 패널이 같은
+/// 그림을 두 번 보여주는 경우는 하나뿐이다 -- ***두 커밋이 한 합성 주기에 들어가고 다음
+/// 주기가 빈 것***. 그러면 간격은 평균 한 주기로 유지되므로 `COMMITGAP` 은 구조적으로 이것을
+/// 볼 수 없다. 위상 문제라서 그렇다.
+///
+/// 의심할 근거도 있다: `COMMITSITE` 상 커밋의 70%(20,573건)가 스케줄러가 아니라
+/// `before_render` 에서 나간다. 그 갈래는 `CommitAlign` 격자점이 아니라 렌더 패스가
+/// 시작하는 시점에 커밋하므로 두 갈래의 위상이 다르고, gap p50 16.6 에 p95 18.5~19.9 라는
+/// 이중 분포가 그것으로 설명된다.
+///
+/// 읽는 법: 정상이면 `c1` 이 전부다. `c2` 가 있으면 그 주기에 두 번 커밋했다는 뜻이고,
+/// 바로 다음 주기는 `c0` 으로 비어 있을 것이다 -- ***그 합성에서 그 패널은 새 그림을 못
+/// 받았다.*** `c2`+`c0` 쌍의 수가 `COMPREFRESH` 의 dup 과 맞으면 인과가 확정된다. `c1` 만
+/// 나오면 우리 쪽 위상은 결백하고, 남은 구간은 DComp 가 커밋을 쥐고 있는 동안뿐이다.
+///
+/// ★기준 vblank 가 낡아도 된다.★ 창 안의 모든 표본을 같은 스냅샷으로 나누므로, 기준이
+/// 흔들리면 주기 번호가 **통째로** 밀릴 뿐 주기별 개수는 바뀌지 않는다. 흔들리는 것은
+/// `phase_pct` 의 절대값뿐이다.
+fn emit_commitcycle() {
+    let samples: Vec<(usize, Vec<u64>)> = match COMMIT_STAMPS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let Some((vblank, period)) = crate::dcomp_compositor::composition_grid() else {
+        return;
+    };
+    if period == 0 {
+        return;
+    }
+    let period = period as i128;
+    let index = |qpc: u64| (qpc as i128 - vblank as i128).div_euclid(period);
+    for (device, mut stamps) in samples {
+        if stamps.len() < 2 {
+            continue;
+        }
+        stamps.sort_unstable();
+        let first = index(stamps[0]);
+        let span = index(stamps[stamps.len() - 1]) - first + 1;
+        // 1초 창에 60Hz 면 주기는 60 개다. 주기 측정이 틀어지면 여기가 터무니없이 커질 수
+        // 있으므로, 할당하기 전에 거른다(조용히 틀린 줄을 내느니 줄을 안 내는 쪽이 낫다).
+        if span <= 0 || span > 10_000 {
+            continue;
+        }
+        let mut per_cycle = vec![0u32; span as usize];
+        for qpc in &stamps {
+            per_cycle[(index(*qpc) - first) as usize] += 1;
+        }
+        let mut buckets = [0u64; 4];
+        for count in &per_cycle {
+            buckets[(*count as usize).min(3)] += 1;
+        }
+        let mut phases: Vec<f64> = stamps
+            .iter()
+            .map(|qpc| {
+                ((*qpc as i128 - vblank as i128).rem_euclid(period)) as f64 * 100.0 / period as f64
+            })
+            .collect();
+        phases.sort_by(f64::total_cmp);
+        let at = |p: f64| phases[(((phases.len() - 1) as f64) * p).round() as usize];
+        warn!(
+            "COMMITCYCLE device={device:#x} n={} cycles={span} c0={} c1={} c2={} c3plus={}   phase_pct p05={:.1} p50={:.1} p95={:.1}",
+            stamps.len(),
+            buckets[0],
+            buckets[1],
+            buckets[2],
+            buckets[3],
+            at(0.05),
+            at(0.50),
+            at(0.95),
         );
     }
 }
@@ -1538,6 +1628,7 @@ fn probe_loop() {
             emit_sampleslip();
             emit_tickcommit();
             emit_commitgap();
+            emit_commitcycle();
             emit_frameid();
             emit_dcompstat();
         }
