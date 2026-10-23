@@ -68,6 +68,12 @@ use crate::output_grid::{qpc_frequency, qpc_now};
 /// `LazyLock` 으로 굳혀도 안전한 이유: 이 pref 는 기동 시 커맨드라인에서 한 번 정해지고
 /// 실행 중에 바뀌지 않는다(Ruling 9 에서 리뷰어가 `Preferences` 의 모든 쓰기 지점을
 /// 트리에서 감사해 확인했다). 같은 파일의 `PRESENT_SYNC_INTERVAL` 과 같은 이유·같은 방식.
+/// ★이 pref 는 실제로는 커밋 위상을 정하지 못한다★(2026-10-23, log_ani_debug_06/15).
+/// 스케줄러가 내는 커밋은 전체의 24~70% 뿐이고(나머지는 `flush_before_render` 가 선취한다),
+/// 그마저 `slip_us_avg` 가 0.7~3.7ms 라 격자점에 앉지 못한다. 커밋 위상을 실제로 정하는
+/// 것은 `gfx_present_align_dwm_pct` 다 -- `output_grid::commit_slack_pct` 주석의 실측 법칙
+/// 과 `output_grid::emit_commitcycle` 주석의 표 참고.
+///
 pub(crate) static COMMIT_ALIGN_PCT: LazyLock<Option<u64>> = LazyLock::new(|| {
     let raw = servo_config::pref!(gfx_present_align_commit_pct);
     (0..=99).contains(&raw).then_some(raw as u64)
