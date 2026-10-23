@@ -1309,6 +1309,10 @@ struct BoundTile {
     pbuffer: usize,
     /// BeginDraw가 돌려준 텍스처(AddRef됨). WR의 GL draw 동안 살려두고 unbind에서 Release.
     texture: *mut ID3D11Texture2D,
+    /// ★`BeginDraw` 직전의 QPC.★ `SERVO_DCOMP_BIND_PROF` 가 켜졌을 때만 채운다.
+    /// `unbind` 가 `EndDraw` 직후의 QPC 와 짝지어 `output_grid::note_bind_span` 에 넘긴다 --
+    /// 그 구간이 이 디바이스의 `Commit()` 이 거부되는 구간이고, 커밋의 창은 그 여집합이다.
+    begin_qpc: Option<u64>,
     /// Task 6 diagnosis only (cheap ints, always populated). Tile grid coords, the atlas
     /// offset BeginDraw returned, the dirty-rect size, and the returned texture size — the
     /// coordinates the readback needs to sample the drawn sub-region. Unused when
@@ -3979,6 +3983,12 @@ impl Compositor for DCompNativeCompositor {
                 // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
                 // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
                 let begin_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+                // ★`Commit()` 이 거부되기 시작하는 시각.★ 호출 **직전**에 찍는다 -- 돌아온
+                // 뒤에 찍으면 그 호출 자체의 시간(`begin_ns`)만큼 잠금 구간을 짧게 본다.
+                // 창이 얼마나 좁은지를 묻는 계측이므로 보수적인(긴) 쪽으로 잡는다.
+                let begin_qpc = DCOMP_BIND_PROF
+                    .then(crate::output_grid::qpc_now)
+                    .flatten();
                 let (texture, update_offset, desc) = unsafe {
                     let mut tex: *mut ID3D11Texture2D = ptr::null_mut();
                     let mut update_offset = POINT { x: 0, y: 0 };
@@ -4121,6 +4131,7 @@ impl Compositor for DCompNativeCompositor {
                     surface_id: id.surface_id,
                     pbuffer,
                     texture,
+                    begin_qpc,
                     // Task 6 diagnosis: sampling coordinates for the unbind readback.
                     // dirty의 scratch 내 위치 = update_off + (dirty.min - r_min). 비확장 시
                     // r_min==dirty.min이라 update_off 그대로(기존 readback 좌표 불변).
@@ -4233,6 +4244,12 @@ impl Compositor for DCompNativeCompositor {
         };
         // `self.surfaces` 를 빌린 match 안에서 `self.bind_profile` 을 건드리지 않으려고 밖으로 뺀다.
         let mut end_ns: Option<u64> = None;
+        // ★`BINDOPEN` 의 짝.★ 디바이스 포인터도 같은 이유로 여기서 꺼낸다. `begin_qpc` 가
+        // `None`(계측 off)이면 `and` 가 그대로 `None` 을 돌려 아래 기록이 통째로 꺼진다.
+        let bind_device = bound
+            .begin_qpc
+            .and(self.dcomp_device_ptr())
+            .map(|device| device as usize);
         // Task 6 defect-2 diagnosis: read the tile pixels BEFORE EndDraw/destroy while the
         // pbuffer is still current. Gated (env off => no glReadPixels) and frame-limited to
         // <=120 (spec §7.1 stall amplification). Only the Virtual arm sets `bound`, which is
@@ -4252,6 +4269,13 @@ impl Compositor for DCompNativeCompositor {
                         warn!("[dcomp-native] EndDraw failed (hr=0x{:08x})", hr as u32);
                     }
                     end_ns = end_start.map(|start| start.elapsed().as_nanos() as u64);
+                    // ★`EndDraw` 가 돌아온 시각이 잠금이 풀린 시각이다.★ 여기서부터 다음
+                    // `BeginDraw` 까지가 이 디바이스에서 `Commit()` 이 성공할 수 있는 창이다.
+                    if let (Some(dcomp), Some(begin), Some(end)) =
+                        (bind_device, bound.begin_qpc, crate::output_grid::qpc_now())
+                    {
+                        crate::output_grid::note_bind_span(dcomp, begin, end);
+                    }
                 },
                 SurfaceStorage::SwapChain(_) => {
                     // 도달 불가: 스왑체인 bind는 BoundTile을 만들지 않으므로(self.bound=None)

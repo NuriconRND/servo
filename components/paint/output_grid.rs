@@ -825,6 +825,134 @@ fn emit_commitcycle() {
     }
 }
 
+/// 디바이스 -> 이번 창의 `(BeginDraw 직전, EndDraw 직후)` QPC 쌍. `BINDOPEN` 이 초당 비운다.
+///
+/// ★`SERVO_DCOMP_BIND_PROF` 가 켜졌을 때만 쌓인다.★ 꺼져 있으면 `dcomp_compositor::bind`
+/// 가 여는 시각을 찍지 않아 `note_bind_span` 이 아예 불리지 않는다. 비우는 쪽
+/// (`emit_bindopen`)도 같은 플래그 뒤에 있으므로, 수집만 켜지고 방출이 꺼지면 이 맵이
+/// 프로세스 수명 내내 자란다 -- `PHASES` 가 실제로 그렇게 샜다(Fix round 1, Ruling 15).
+static BIND_SPANS: Mutex<Option<HashMap<usize, Vec<(u64, u64)>>>> = Mutex::new(None);
+
+/// ★서피스가 `BeginDraw` 로 열려 있던 구간을 남긴다.★ `dcomp_compositor::unbind` 가
+/// `EndDraw` 직후에 부른다.
+///
+/// ★왜 필요한가★(2026-10-23) -- 그 구간 동안 ***그 디바이스의 `Commit()` 은 전부 거부된다***
+/// (`DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`). 그 배제는 서피스 단위가 아니라 **디바이스
+/// 단위**라, 서피스를 둘 두고 번갈아 써도 창은 넓어지지 않는다. 즉 커밋이 들어갈 수 있는
+/// 창은 구조적으로 `주기 - 이 구간` 이고, `flush_before_render` 가 커밋의 70% 를 가져가는
+/// 것도 스케줄러의 마감이 이 구간 안으로 떨어지기 때문이다.
+///
+/// ★그런데 이 구간의 길이를 잰 적이 한 번도 없다.★ `DCOMPBIND` 의 `begin_ms`/`enddraw_ms`
+/// 는 그 **호출 자체**의 시간(합쳐 호출당 0.1ms 미만)이지 둘 사이의 간격이 아니다. 코드
+/// 주석은 "WR 의 GL draw 동안 살려둔다"(`BoundTile::texture`)고 적고 있어 ms 급으로
+/// 추정될 뿐이고, 추정은 측정이 아니다. ★커밋 마감을 어디에 둘 수 있는지를 이 값이 정한다.★
+///
+/// `bind` 의 실패 경로(pbuffer 생성/current 실패)도 `EndDraw` 를 부르지만 `bound` 를 남기지
+/// 않으므로 여기 오지 않는다 -- 그 구간은 짧고 매번 warn 을 찍으므로 로그로 드러난다.
+pub(crate) fn note_bind_span(device: usize, begin: u64, end: u64) {
+    if end <= begin {
+        return;
+    }
+    if let Ok(mut guard) = BIND_SPANS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(device)
+            .or_default()
+            .push((begin, end));
+    }
+}
+
+/// ★`Commit()` 이 들어갈 수 있는 창이 실제로 얼마나 넓은가.★
+///
+/// 한 합성 주기를 단위로 본다 -- 커밋 마감(`CommitAlign`)도 그 격자 위에 있으므로 같은
+/// 자로 재야 비교가 된다. 주기마다 그 안에서 열린 `BeginDraw` 구간을 모아 합을 내고,
+/// 주기에서 그만큼을 뺀 것이 그 주기에 커밋이 들어갈 수 있었던 시간이다.
+///
+/// 읽는 법:
+/// * `open_ms` -- bind 한 번이 디바이스를 잡고 있는 시간. WR 이 한 프레임에 타일 여럿을
+///   차례로 bind 하므로 주기당 여러 번일 수 있다.
+/// * `locked_ms` -- 주기당 합계. ★`free_ms = 주기 - locked_ms` 가 커밋의 창이다.★
+/// * `open_pct`/`close_pct` -- 그 창이 주기의 **어디에** 있는가. 마감을 둘 자리를 정하려면
+///   길이만으로는 부족하고 위치가 필요하다. 지금 마감은 8% 에 있고 틱은 14% 다.
+///
+/// `cycles` 가 초당 합성 수보다 작으면 그 차이만큼은 bind 가 하나도 없던 주기다(실측 약
+/// 1/3, `COMMITWORK idle`) -- 그 주기에는 열린 서피스가 없어 커밋이 언제든 성공한다.
+///
+/// ★기준 vblank 가 낡아도 된다.★ 창 안의 모든 표본을 같은 스냅샷으로 접으므로 주기 번호가
+/// 통째로 밀릴 뿐 주기별 묶음은 바뀌지 않는다(`emit_commitcycle` 과 같은 근거).
+fn emit_bindopen() {
+    let samples: Vec<(usize, Vec<(u64, u64)>)> = match BIND_SPANS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let Some(freq) = qpc_frequency() else { return };
+    let Some((vblank, period)) = crate::dcomp_compositor::composition_grid() else {
+        return;
+    };
+    if period == 0 {
+        return;
+    }
+    let to_ms = |ticks: u64| ticks as f64 * 1000.0 / freq as f64;
+    let period_i = period as i128;
+    let index = |qpc: u64| (qpc as i128 - vblank as i128).div_euclid(period_i);
+    let phase_pct = |qpc: u64| {
+        ((qpc as i128 - vblank as i128).rem_euclid(period_i)) as f64 * 100.0 / period as f64
+    };
+    let period_ms = to_ms(period);
+    for (device, mut spans) in samples {
+        if spans.is_empty() {
+            continue;
+        }
+        spans.sort_unstable();
+        let mut open: Vec<u64> = spans.iter().map(|(b, e)| e.saturating_sub(*b)).collect();
+        // ★주기별로 묶는다.★ 구간은 `BeginDraw` 가 난 주기에 통째로 넣는다 -- 구간이 주기를
+        // 걸치는 일은 드물고, 걸치더라도 "그 주기의 커밋을 막은 쪽" 은 거기서 열린 그 bind 다.
+        let mut locked: HashMap<i128, u64> = HashMap::new();
+        let mut first_open: HashMap<i128, u64> = HashMap::new();
+        let mut last_close: HashMap<i128, u64> = HashMap::new();
+        for &(begin, end) in &spans {
+            let cycle = index(begin);
+            *locked.entry(cycle).or_insert(0) += end.saturating_sub(begin);
+            first_open.entry(cycle).or_insert(begin);
+            last_close.insert(cycle, end);
+        }
+        let mut per_cycle: Vec<u64> = locked.values().copied().collect();
+        let mut opens: Vec<f64> = first_open.values().map(|qpc| phase_pct(*qpc)).collect();
+        let mut closes: Vec<f64> = last_close.values().map(|qpc| phase_pct(*qpc)).collect();
+        open.sort_unstable();
+        per_cycle.sort_unstable();
+        opens.sort_by(f64::total_cmp);
+        closes.sort_by(f64::total_cmp);
+        let at = |v: &[u64], p: f64| to_ms(v[(((v.len() - 1) as f64) * p).round() as usize]);
+        let atf = |v: &[f64], p: f64| v[(((v.len() - 1) as f64) * p).round() as usize];
+        let locked_p50 = at(&per_cycle, 0.50);
+        warn!(
+            "BINDOPEN device={device:#x} n={} cycles={} period_ms={period_ms:.2} \
+             open_ms p50={:.2} p95={:.2} max={:.2}   \
+             locked_ms p50={:.2} p95={:.2} max={:.2} free_ms_p50={:.2}   \
+             open_pct p05={:.1} p50={:.1} p95={:.1}   close_pct p05={:.1} p50={:.1} p95={:.1}",
+            open.len(),
+            per_cycle.len(),
+            at(&open, 0.50),
+            at(&open, 0.95),
+            at(&open, 1.00),
+            locked_p50,
+            at(&per_cycle, 0.95),
+            at(&per_cycle, 1.00),
+            period_ms - locked_p50,
+            atf(&opens, 0.05),
+            atf(&opens, 0.50),
+            atf(&opens, 0.95),
+            atf(&closes, 0.05),
+            atf(&closes, 0.50),
+            atf(&closes, 0.95),
+        );
+    }
+}
+
 /// ★이 틱이 난 시각(QPC).★ 셸이 `render_all_tiles` 를 부르기 **직전**에 찍는다.
 ///
 /// 커밋 위상이 흔들리는 원인을 가르려고 둔다. 체인은 셋으로 쫪어진다:
@@ -1668,6 +1796,7 @@ fn probe_loop() {
             emit_tickcommit();
             emit_commitgap();
             emit_commitcycle();
+            emit_bindopen();
             emit_frameid();
             emit_dcompstat();
         }
