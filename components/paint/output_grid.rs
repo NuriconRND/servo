@@ -130,6 +130,47 @@ pub(crate) fn grid_for_monitor(monitor: usize) -> Option<OutputGrid> {
     GRID.lock().ok()?.as_ref()?.get(&monitor).copied()
 }
 
+/// 이 출력의 격자를 ***다른 누군가가 지금 재고 있나.***
+///
+/// `OutputGrid::vblank_qpc` 는 관측 시각이기도 하므로(그 필드의 주석) 신선도가 그 하나로
+/// 판정된다. 프로브의 한 바퀴는 약 `5P` ≈ 83ms 인데 페이싱 스레드는 매 vblank 마다 쓰므로,
+/// `3P` 를 경계로 두면 둘이 섞일 여지가 없다.
+fn grid_is_fresh(monitor: usize, now: u64) -> bool {
+    let Some(grid) = grid_for_monitor(monitor) else {
+        return false;
+    };
+    grid.period_qpc > 0 && now.saturating_sub(grid.vblank_qpc) < grid.period_qpc * 3
+}
+
+/// ★페이싱 스레드가 관측한 primary 의 vblank 를 격자에 싣는다.★
+///
+/// 그 스레드는 틱마다 primary 의 vblank 를 **정확히** 기다리므로, 그 관측은 프로브가 같은
+/// 출력에서 떠 올 값과 같은 것이다 -- 다만 ★55 배 더 신선하다★(16.7ms 대 83ms). 그래서
+/// 프로브는 이 출력을 건너뛰고(`grid_is_fresh`), 둘이 같은 vblank 를 두고 겹쳐 기다리는
+/// 일이 없어진다.
+///
+/// ★계측이 꺼져 있으면 아무 일도 하지 않는다.★ `GRID` 의 소비자는 전부 진단이다
+/// (`DCOMPSTAT` 의 두 칸과 `OUTPHASE`) -- B2 는 출력별 vblank 가 아니라 공통 합성 격자를
+/// 쓴다(`painter::paint_animation_sample_at`, B2 1 차가 출력별로 해서 `ANIMSTEP` 을 나쁘게
+/// 만든 것이 그 근거다). 그러니 계측이 꺼진 런에서 이 전역 뮤텍스를 틱 경로에 넣을 이유가
+/// 없다.
+pub(crate) fn note_pacing_vblank(monitor: usize, vblank_qpc: u64, period_qpc: u64) {
+    if !*COLLECT {
+        return;
+    }
+    if let Ok(mut guard) = GRID.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .insert(monitor, OutputGrid {
+                vblank_qpc,
+                period_qpc,
+                // 주기는 디스플레이 모드에서 왔다(`VblankSource::refresh`) -- 믿을 근거가
+                // 있다는 뜻이고, 그것이 이 칸의 의미다.
+                measured: true,
+            });
+    }
+}
+
 
 /// ★주기는 재는 것이 아니라 **정해진 값**이다.★ 디스플레이 모드가 알려 준다.
 ///
@@ -1680,6 +1721,8 @@ struct VblankSource {
     enumeration: Option<Enumeration>,
     /// `enumeration.outputs` 안에서 primary 의 색인.
     primary: usize,
+    /// 그 출력의 `HMONITOR`. 관측을 격자에 실을 때 키가 된다(`note_pacing_vblank`).
+    monitor: usize,
     /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
     period_qpc: Option<u64>,
 }
@@ -1689,6 +1732,7 @@ impl VblankSource {
         Self {
             enumeration: None,
             primary: 0,
+            monitor: 0,
             period_qpc: None,
         }
     }
@@ -1731,6 +1775,10 @@ impl VblankSource {
             .get(primary)
             .zip(qpc_frequency())
             .and_then(|(out, freq)| nominal_period_ticks(&out.name, freq, None));
+        self.monitor = enumeration
+            .outputs
+            .get(primary)
+            .map_or(0, |out| out.monitor);
         self.enumeration = Some(enumeration);
         self.primary = primary;
     }
@@ -1757,6 +1805,9 @@ impl VblankSource {
         let period = self
             .period_qpc
             .or_else(|| qpc_frequency().map(|freq| freq / 60))?;
+        // ★프로브가 이 출력을 또 기다리지 않도록 관측을 싣는다.★ 계측이 꺼져 있으면
+        // 아무 일도 하지 않는다 -- 자세한 것은 `note_pacing_vblank`.
+        note_pacing_vblank(self.monitor, vblank, period);
         Some((vblank, period))
     }
 }
@@ -1964,11 +2015,28 @@ fn probe_loop() {
         // 위상 원을 감는 횟수). 즉 출력별 격자가 그 주기로 갱신된다. 마감은 `vblank + k·P` 로
         // 접으므로 그 정도 신선도면 충분하다.
         let mut sampled = 0usize;
+        // 바퀴에서 실제로 vblank 에 블록한 횟수.
+        let mut blocked = 0usize;
         for out in &current.outputs {
+            // ★이미 누가 재고 있으면 건너뛴다.★ 페이싱 스레드가 vblank 로 도는 구성에서는
+            // primary 가 여기 걸린다(`note_pacing_vblank`) -- 그 출력을 둘이 겹쳐 기다리면
+            // ***측정 장치가 측정 대상과 같은 자원을 두고 경합한다.*** 틱을 내는 쪽이
+            // 밀리면 그만큼 커밋 위상이 밀리고, 위상이 저더를 정하므로 그 경합은 곧
+            // 측정값의 오염이다.
+            //
+            // 조건을 "primary 인가" 가 아니라 "최근에 갱신됐나" 로 둔 것은 ★자가 복구★를
+            // 위해서다 -- 페이싱이 꺼졌거나(`-PacingDwmQuery`), 폴백 중이거나, 스레드가
+            // 죽으면 격자가 묵고 다음 바퀴부터 프로브가 도로 집어 든다. 어느 쪽도 상대의
+            // 구성을 알 필요가 없다.
+            if qpc_now().is_some_and(|now| grid_is_fresh(out.monitor, now)) {
+                sampled += 1;
+                continue;
+            }
             // Safety: 살아 있는 IDXGIOutput.
             let Some((t1, t2)) = (unsafe { wait_two_vblanks(out.output) }) else {
                 continue;
             };
+            blocked += 1;
             let (sampled_period, sane) = period_from_pair(t1, t2, freq, assumed_period);
             // ★주기는 모드에서 온 고정값을 쓴다.★ 실측은 정확값 후보 둘 중 어느 쪽인지
             // 고르는 데만 쓰고(`nominal_period_ticks`), 모드를 못 읽으면 그때만 실측으로
@@ -1999,6 +2067,19 @@ fn probe_loop() {
         if sampled == 0 {
             std::thread::sleep(Duration::from_millis(100));
             continue;
+        }
+
+        // ★격자는 다 있는데 아무 것도 블록하지 않은 바퀴도 코어를 태운다.★ 위의 `sampled`
+        // 검사로는 안 잡힌다 -- 그쪽은 "잰 것이 하나도 없나" 이고 이쪽은 "**내가** 잰 것이
+        // 하나도 없나" 다. 전 출력을 건너뛰면(단일 출력 + 페이싱이 vblank 로 도는 구성에서는
+        // 늘 그렇다) 이 바퀴에는 기다릴 것이 없고, 그러면 루프가 전속력으로 돈다.
+        //
+        // 격자는 이미 페이싱 스레드가 채우고 있으므로 여기서 지켜야 할 것은 방출 주기뿐이다
+        // -- 아래 `emit_*` 는 1 초에 한 번이라 100ms 면 충분히 촘촘하다. `continue` 가
+        // 아니라 `sleep` 인 것이 중요하다: 건너뛰면 `OUTPHASE`·`COMPREFRESH` 가 통째로
+        // 멎고, 그 둘이 이 스레드의 존재 이유다.
+        if blocked == 0 {
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         if *crate::dcomp_compositor::DCOMP_BIND_PROF &&
