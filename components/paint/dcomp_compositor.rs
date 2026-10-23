@@ -2237,6 +2237,13 @@ unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 
         .map(|w| w.take());
     // 이 파일은 `unsafe_op_in_unsafe_fn` 을 끄지 않으므로 `unsafe fn` 안에서도 블록이 필요하다.
     let hr = unsafe { (*device).Commit() };
+    // ★커밋 간격은 ***여기서*** 잰다.★ 2026-10-22. 처음에는 `note_commit_at` 에 달았는데
+    // 그 함수는 커밋의 38% 만 본다(실측: COMMITGAP n 이 디바이스당 23/s 인데 COMMITSITE 는
+    // 60/s -- `before_render` 갈래가 통째로 빠진다). 그러면 "이 디바이스가 커밋을 걸렀나" 를
+    // 물을 수 없고, 스케줄러가 쉰 것과 커밋이 안 난 것이 같은 모양으로 보인다.
+    // `raw_commit` 은 크레이트에서 `Commit()` 을 실제로 부르는 유일한 자리라(이 파일의
+    // `commit_device_ptr` 주석) 여기 달면 빠지는 갈래가 없다.
+    crate::output_grid::note_commit_interval(device as usize);
     if let Some(start) = start {
         let ns = start.elapsed().as_nanos() as u64;
         COMMIT_SITES[site.index()].record(ns, *SLOW_COMMIT_NS);

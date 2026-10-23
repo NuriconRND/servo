@@ -621,6 +621,88 @@ pub(crate) fn note_commit_at(device: usize) {
     note_tick_to_commit(device, now);
 }
 
+/// 디바이스 -> 이번 창의 `커밋 -> 다음 커밋` 간격(QPC 틱). `COMMITGAP` 이 초당 비운다.
+static COMMIT_GAPS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None);
+
+/// 디바이스 -> 마지막 `Commit()` 시각(QPC). ★`COMMITS` 와 따로 둔다★ -- 저쪽은
+/// `note_commit_at` 이 채우고 커밋의 일부만 보지만, 이쪽은 `raw_commit` 이 채워 전부 본다.
+static LAST_COMMIT: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// ★`Commit()` 이 날 때마다 직전 커밋과의 간격을 남긴다.★ `dcomp_compositor::raw_commit`
+/// 에서, 즉 ***모든*** 커밋이 지나는 한 자리에서 부른다.
+pub(crate) fn note_commit_interval(device: usize) {
+    let Some(now) = qpc_now() else { return };
+    let previous = match LAST_COMMIT.lock() {
+        Ok(mut guard) => guard.get_or_insert_with(HashMap::new).insert(device, now),
+        Err(_) => return,
+    };
+    let Some(previous) = previous else { return };
+    if let Ok(mut guard) = COMMIT_GAPS.lock() {
+        guard
+            .get_or_insert_with(HashMap::new)
+            .entry(device)
+            .or_default()
+            .push(now.saturating_sub(previous));
+    }
+}
+
+/// ★`Commit()` 이 실제로 나간 시각의 연속 간격.★ 디바이스마다, 주기 단위로 센다.
+///
+/// ★왜 이것이 따로 필요한가★(2026-10-22) -- 저더가 난 순간을 기존 계수기로 읽으려다 네 번
+/// 틀렸다. `MISSEVENT` 의 `c2s_ms` 는 "커밋이 2~12 주기 안 나갔다" 로 읽히는데 같은 줄의
+/// `commits=4` 는 "그 패스가 네 커밋을 다 냈다" 고 말한다. 둘 중 하나는 읽는 사람이 틀린
+/// 것이고, ***둘 다 간접 지표라 어느 쪽인지 가릴 수가 없다.*** 이 줄은 그 질문 하나만
+/// 직접 답한다: 그 디바이스에 커밋이 나갔는가, 몇 주기를 걸렀는가.
+///
+/// 읽는 법: 정상이면 `p1` 이 전부다(매 주기 한 번). `p0` 가 있으면 한 주기에 두 번 나간
+/// 것이고, `p2`/`p3plus` 가 있으면 ***그 주기에 그 패널은 새 그림을 못 받았다*** --
+/// `COMPREFRESH refresh_d[2]` 와 같은 창에서 같이 움직이는지가 인과를 가른다.
+///
+/// 반올림으로 버킷한다(`(gap / period).round()`). 경계값(1.5 주기)은 2 로 가는데, 그것이
+/// 맞다 -- 한 주기 반이면 그 사이의 합성 하나는 새것을 못 받았다.
+fn emit_commitgap() {
+    let samples: Vec<(usize, Vec<u64>)> = match COMMIT_GAPS.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(map) => map.drain().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let Some(freq) = qpc_frequency() else { return };
+    // ★주기는 측정된 DWM 격자에서 가져온다★ -- 60Hz 를 상수로 박으면 주사율 변경 테스트에서
+    // 조용히 틀린 버킷을 낸다(`emit_tickcommit` 이 같은 함정을 이미 피하고 있다).
+    let Some((_, period)) = crate::dcomp_compositor::composition_grid() else {
+        return;
+    };
+    if period == 0 {
+        return;
+    }
+    for (device, mut gaps) in samples {
+        if gaps.is_empty() {
+            continue;
+        }
+        let mut buckets = [0u64; 4];
+        for gap in &gaps {
+            let periods = (*gap as f64 / period as f64).round() as usize;
+            buckets[periods.min(3)] += 1;
+        }
+        gaps.sort_unstable();
+        let at = |p: f64| gaps[(((gaps.len() - 1) as f64) * p).round() as usize] as f64 * 1000.0 /
+            freq as f64;
+        warn!(
+            "COMMITGAP device={device:#x} n={} gap_ms p50={:.2} p95={:.2} max={:.2}              periods p0={} p1={} p2={} p3plus={}",
+            gaps.len(),
+            at(0.50),
+            at(0.95),
+            at(1.00),
+            buckets[0],
+            buckets[1],
+            buckets[2],
+            buckets[3],
+        );
+    }
+}
+
 /// ★이 틱이 난 시각(QPC).★ 셸이 `render_all_tiles` 를 부르기 **직전**에 찍는다.
 ///
 /// 커밋 위상이 흔들리는 원인을 가르려고 둔다. 체인은 셋으로 쫪어진다:
@@ -1455,6 +1537,7 @@ fn probe_loop() {
             emit_samplelead();
             emit_sampleslip();
             emit_tickcommit();
+            emit_commitgap();
             emit_frameid();
             emit_dcompstat();
         }
