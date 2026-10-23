@@ -1301,6 +1301,27 @@ fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
 ///
 /// 알려진 약점: `send_event` 도 posted message 라 이미 큐에 쌓인 메시지 뒤에 선다
 /// (`WM_PAINT` 보다는 앞이다). 그래도 틱 누락과 "엔진이 알아채는" 것은 사라진다.
+///
+/// ★깨우는 원천이 둘이다(`gfx_wall_pacing_vblank`, 기본 켜짐).★
+///
+///  * ***vblank*** -- `IDXGIOutput::WaitForVBlank` 로 primary 의 vblank 에서 깬다. 조회도
+///    예측도 없고 깨우는 주체가 커널의 디스플레이 인터럽트다.
+///  * ***타이머*** -- 예전 경로. `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
+///    (`snap_to_dwm_grid_at`) 그 지점까지 `thread::sleep` 한다.
+///
+/// ★왜 바꿨나.★ 타이머 경로의 오차는 둘이고 둘 다 그대로 ***틱 위상의 지터***가 된다 --
+/// DWM 으로의 프로세스 간 호출 지연(변동한다)과 대기 타이머의 깨우기 지터다. 그리고 커밋
+/// 위상 하나가 저더를 정한다(`commit_guard` 모듈 주석: 위상 13% -> 63% 에서 dup 6 ->
+/// 2146). 즉 박자의 지터는 그대로 저더의 지터다.
+///
+/// ★`-DwmAlign` 과의 관계가 이 변경의 요점이다.★ `pct` 가 `1..=99` 면 vblank 뒤에 그만큼
+/// **또 자야 하므로** 타이머 지터가 그대로 돌아온다 -- 좋아지는 것은 앵커뿐이고 구조는
+/// 예전 그대로다. ★`pct <= 0` 일 때만 대기가 하나도 없는 순수 신호 경로가 된다★, 그리고
+/// 실측된 최적점이 바로 거기다(6 구성에서 `DwmAlign` 0 이 dup 평균 8, 50 이 2146). 그래서
+/// 이 클럭에서 `pct <= 0` 이 기본이자 권장이고, `1..=99` 는 A/B 를 위해 남겨 둔 것이다.
+///
+/// ★박자는 패널 주사율로 상한이 걸린다.★ 틱이 vblank 마다 나가므로 `-RefreshHz` 를
+/// 패널보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 vblank 를 건너뛰어 맞춘다.
 fn spawn_pacing_thread(
     proxy: winit::event_loop::EventLoopProxy<WakerEvent>,
     period: std::time::Duration,
@@ -1308,8 +1329,44 @@ fn spawn_pacing_thread(
     let spawned = std::thread::Builder::new()
         .name(String::from("WallPacing"))
         .spawn(move || {
+            // ★구성은 기동에 한 번 읽는다.★ `pref!` 는 전역 `RwLock` 을 잡으므로, 틱마다
+            // 치면 그 획득이 박자 경로 안에 들어온다 -- 없애려는 것이 바로 그런 양이다.
+            let vblank_clock = servo_config::pref!(gfx_wall_pacing_vblank);
+            let align_pct = servo_config::pref!(gfx_present_align_dwm_pct);
             let mut next = std::time::Instant::now() + period;
+            // vblank 경로에서 "다음에 틱을 낼 시각". `period` 가 패널 주기보다 길 때만
+            // 실제로 무언가를 거른다.
+            let mut due = std::time::Instant::now();
             loop {
+                if vblank_clock {
+                    match pace_on_vblank(period, align_pct, &mut due) {
+                        // 루프가 끝나면 프록시가 닫힌다. 그때 이 스레드도 끝낸다.
+                        VblankPace::Fire => {
+                            if proxy.send_event(WakerEvent::Tick).is_err() {
+                                return;
+                            }
+                            continue;
+                        },
+                        VblankPace::Skip => continue,
+                        // vblank 를 못 받았다 -- ★이번 회전만★ 타이머로 떨어진다. 아래가 그
+                        // 경로이고, 간격은 거기서 지킨다. 다음 회전은 다시 vblank 를
+                        // 시도하므로 일시적 실패(세션 잠금, 토폴로지 변경)가 영구 폴백이
+                        // 되지 않는다.
+                        VblankPace::Unavailable => {
+                            // ★`next` 를 여기서 당겨 놓는다.★ vblank 경로가 도는 동안
+                            // 아무도 그것을 밀지 않았으므로 한참 과거이고, 아래의
+                            // `while next <= now { next += period }` 는 ***그동안 지나간
+                            // 틱 수만큼*** 돈다 -- 한 시간이면 21 만 번, 하루면 5 백만
+                            // 번이다. 지나간 칸은 어차피 버리는 값이고 위상은 바로 아래
+                            // `snap_to_dwm_grid_at` 이 격자에서 다시 잡으므로, 누적된
+                            // `next` 가 나르는 정보는 없다.
+                            let now = std::time::Instant::now();
+                            if next <= now {
+                                next = now + period;
+                            }
+                        },
+                    }
+                }
                 let now = std::time::Instant::now();
                 // 지나간 틱은 버린다 -- 몰아 치면 이미 지난 순간들을 위한 프레임이 쏟아진다
                 // (`drive_present_clock_timer` 의 같은 규칙).
@@ -1332,6 +1389,81 @@ fn spawn_pacing_thread(
     if let Err(error) = spawned {
         log::warn!("wall: 페이싱 스레드를 띄우지 못했다: {error}; 메인 타이머로 돈다");
     }
+}
+
+/// 페이싱 스레드의 vblank 회전 하나가 어떻게 끝났나.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum VblankPace {
+    /// vblank 가 왔고 이번 것에 틱을 낸다.
+    Fire,
+    /// vblank 는 왔지만 이번 것은 거른다 -- 표출 주기가 패널 주기보다 길다.
+    Skip,
+    /// vblank 를 받지 못했다. 이번 회전은 타이머가 대신한다.
+    Unavailable,
+}
+
+/// primary 의 다음 vblank 를 기다리고, 이번 것에 틱을 낼지 판정한다.
+///
+/// ★여기서 블록한다.★ 깨우는 것은 커널의 디스플레이 인터럽트이므로 이 경로에는 DWM
+/// 조회도 대기 타이머도 없다 -- `align_pct` 가 `1..=99` 일 때만 뒤엣것이 돌아온다.
+fn pace_on_vblank(
+    period: std::time::Duration,
+    align_pct: i64,
+    due: &mut std::time::Instant,
+) -> VblankPace {
+    let Some((vblank_qpc, period_qpc)) = servo::wait_primary_vblank() else {
+        return VblankPace::Unavailable;
+    };
+    let now = std::time::Instant::now();
+    // ★이 vblank 를 거를까.★ `period`(= `-RefreshHz`)가 패널 주기보다 길 때만 걸린다.
+    //
+    // ★반 주기의 여유가 핵심이다.★ 둘이 같을 때(흔한 경우: 60Hz 패널에 `-RefreshHz 60`)
+    // `due` 와 vblank 는 명목상 같은 간격으로 가지만 두 시계가 완전히 같지는 않다. 여유가
+    // 없으면 그 미세한 어긋남이 쌓여 ***언젠가 한 칸을 거른다*** -- 그 한 칸이 곧 30Hz
+    // 프레임 하나이고, 이 작업이 없애려는 저더 그 자체다. 반 주기면 어느 방향으로 떠내려가도
+    // 거르지 않는다.
+    let half = qpc_frequency()
+        .filter(|freq| *freq > 0)
+        .map(|freq| std::time::Duration::from_secs_f64(period_qpc as f64 / freq as f64 / 2.0))
+        .unwrap_or(period / 2);
+    if *due > now + half {
+        return VblankPace::Skip;
+    }
+    *due += period;
+    if *due <= now {
+        // 멎었다 돌아온 경우. 지나간 칸을 몰아 치지 않는다
+        // (`drive_present_clock_timer` 의 같은 규칙).
+        *due = now + period;
+    }
+    align_after_vblank(vblank_qpc, period_qpc, align_pct);
+    VblankPace::Fire
+}
+
+/// `-DwmAlign` 이 `1..=99` 면 vblank 뒤에 그만큼 더 잔다.
+///
+/// ★이 함수에 들어오는 순간 순수 신호 경로가 아니다.★ 대기 타이머의 깨우기 지터가 그대로
+/// 돌아오고, 그 양은 예전 `snap_to_dwm_grid_at` 경로와 같다 -- 좋아진 것은 앵커(기다려서
+/// **관측한** vblank 대 DWM 에 **물어본** 격자)뿐이고 구조는 그대로다. 그래서 `pct <= 0`
+/// 이 이 클럭의 기본이자 권장이고, 실측된 최적점도 거기다(`DwmAlign` 0 에서 dup 평균 8,
+/// 50 에서 2146). 남겨 둔 이유는 ***같은 바이너리에서 A/B 를 하기 위해서***다.
+fn align_after_vblank(vblank_qpc: u64, period_qpc: u64, align_pct: i64) {
+    if !(1..=99).contains(&align_pct) {
+        return;
+    }
+    let Some(freq) = qpc_frequency().filter(|freq| *freq > 0) else {
+        return;
+    };
+    let mut now_qpc: i64 = 0;
+    // Safety: 순수 out-param.
+    if unsafe { QueryPerformanceCounter(&mut now_qpc) } == 0 || now_qpc < 0 {
+        return;
+    }
+    let target = vblank_qpc as i128 + period_qpc as i128 * align_pct as i128 / 100;
+    let ahead = target - now_qpc as i128;
+    if ahead <= 0 {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(ahead as f64 / freq as f64));
 }
 
 impl AppState {

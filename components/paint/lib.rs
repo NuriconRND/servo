@@ -38,6 +38,29 @@ pub use crate::paint::{
 /// thread` 가 그 대응). 이 함수는 조회이고, 호출자는 **타이머의 시각을 옮기는 데만** 쓴다.
 ///
 /// Windows 가 아니거나 DWM 이 답하지 않으면 `None` -- 그때는 호출자가 자유 구동으로 돈다.
+/// ★셸의 페이싱 스레드를 primary 출력의 다음 vblank 까지 블록한다.★ 돌아온 직후의
+/// `(vblank_qpc, period_qpc)` 를 QPC 틱으로 준다.
+///
+/// `dwm_composition_grid` 와 짝이고 ***대체재다***: 저쪽은 격자를 **묻고** 호출자가 그
+/// 지점까지 자고, 이쪽은 그 지점에서 **깨워 준다**. 저쪽 주석의 "대기를 넣지 말 것" 은
+/// 생산 스레드(비디오·스트림·WebGL)에 대한 규칙이고 -- `GstSystemClock` 이 프로세스
+/// 싱글턴이라 45 개 파이프라인 sink 가 같은 객체에 줄 섰던 사건이 그 근거다 -- 이 함수는
+/// ★틱을 내는 것이 유일한 일인 전용 스레드★ 하나만 부른다. 거기서는 블록이 비용이 아니라
+/// 바로 그 스레드가 존재하는 이유다.
+///
+/// Windows 가 아니거나 출력을 열지 못하면 `None` -- 그때는 호출자가 타이머로 떨어진다.
+pub fn wait_primary_vblank() -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        crate::output_grid::wait_primary_vblank()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// (아래 `dwm_composition_grid` 의 doc 주석은 그대로다.)
 pub fn dwm_composition_grid() -> Option<(u64, u64)> {
     #[cfg(windows)]
     {

@@ -1640,6 +1640,137 @@ pub(crate) fn start_probe() {
     });
 }
 
+/// ★페이싱 스레드를 primary 출력의 다음 vblank 까지 블록한다.★ 돌아온 직후의
+/// `(vblank_qpc, period_qpc)` 를 QPC 틱으로 준다.
+///
+/// ★왜 조회가 아니라 대기인가.★ 지금까지 셸의 박자는 `DwmGetCompositionTimingInfo` 로
+/// 격자를 **묻고** 그 지점까지 `thread::sleep` 했다(`winit_wall` 의 `snap_to_dwm_grid_at`).
+/// 그 경로에는 오차가 둘 있다 -- DWM 으로의 **프로세스 간 호출** 지연(변동한다)과 대기
+/// 타이머의 깨우기 지터다. 둘 다 그대로 틱 위상의 지터가 되고, ★커밋 위상 하나가 저더를
+/// 정하는 구조에서★(`commit_guard` 모듈 주석: 위상 13% -> 63% 에서 dup 6 -> 2146) 그것은
+/// 공짜가 아니다. vblank 를 직접 기다리면 깨우는 주체가 커널의 디스플레이 인터럽트이므로
+/// 조회도 예측도 없다.
+///
+/// ★primary 를 기다린다.★ DWM 합성은 primary 의 vblank 에 물려 있다(`is_primary` 주석).
+/// 네 패널의 vblank 는 주기의 0.67 에 흩어져 있지만(`OUTPHASE`) 합성 격자는 하나이고,
+/// 셸이 맞춰야 하는 것은 그 하나다 -- 타일별 정렬은 B2(`-SampleLead`)의 몫이고 이 함수의
+/// 일이 아니다.
+///
+/// ★이 호출은 블록한다 -- 페이싱 스레드 전용이다.★ 핸들을 thread-local 에 두는 것이 그
+/// 계약을 구조로 만든 것이다: COM 포인터가 스레드 경계를 넘지 않고, 다른 스레드가 불러도
+/// 자기 핸들을 따로 열어 `probe_loop` 의 열거와 섞이지 않는다.
+///
+/// `None` 이면 호출자가 타이머로 떨어진다. 세션 잠금·모니터 전원 off·토폴로지 변경 중에는
+/// `WaitForVBlank` 가 즉시 실패 HRESULT 로 돌아오므로 ★그 상태에서 이 함수는 블록하지
+/// 않는다★ -- 되풀이되는 실패의 백오프는 호출자 몫이다.
+pub(crate) fn wait_primary_vblank() -> Option<(u64, u64)> {
+    thread_local! {
+        static SOURCE: std::cell::RefCell<VblankSource> =
+            const { std::cell::RefCell::new(VblankSource::new()) };
+    }
+    SOURCE.with(|source| source.borrow_mut().wait())
+}
+
+/// `wait_primary_vblank` 가 들고 있는 primary 출력 핸들.
+///
+/// thread-local 이므로 만든 스레드에서만 쓰이고 그 스레드에서 해제된다 -- `Output` 의
+/// 포인터에 `Send` 가 필요 없는 것이 `probe_loop` 와 같은 이유다.
+struct VblankSource {
+    /// 살아 있는 열거. 구성이 바뀌거나 대기가 실패하면 버린다.
+    enumeration: Option<Enumeration>,
+    /// `enumeration.outputs` 안에서 primary 의 색인.
+    primary: usize,
+    /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
+    period_qpc: Option<u64>,
+}
+
+impl VblankSource {
+    const fn new() -> Self {
+        Self {
+            enumeration: None,
+            primary: 0,
+            period_qpc: None,
+        }
+    }
+
+    /// 핸들이 없거나 구성이 바뀌었으면 다시 연다.
+    ///
+    /// ★열거가 비어도 다시 연다★ -- `needs_reenumerate` 가 빈 목록을 재열거 사유로 치기
+    /// 때문이다. 그러면 모니터가 없는 동안 호출마다 `CreateDXGIFactory1` 이 한 번 돌지만,
+    /// 그때 `wait` 은 `None` 을 주고 호출자가 타이머로 떨어져 한 주기를 자므로 초당 60 번이
+    /// 상한이다. 대신 모니터가 돌아오면 ★다음 호출에서 바로 복구한다★ -- 한 번만 열거하는
+    /// 구조가 핫플러그 뒤 영구 폴백이 되는 것을 `probe_loop` 가 이미 겪었다.
+    fn refresh(&mut self) {
+        let stale = match self.enumeration.as_ref() {
+            // Safety: 살아 있는 팩토리이거나 NULL.
+            Some(enumeration) => unsafe { enumeration.needs_reenumerate() },
+            None => true,
+        };
+        if !stale {
+            return;
+        }
+        if let Some(mut old) = self.enumeration.take() {
+            // Safety: 이 열거의 포인터는 이 스레드 밖으로 나간 적이 없다.
+            unsafe { old.release() };
+        }
+        // Safety: 위와 같다.
+        let enumeration = unsafe { enumerate_outputs() };
+        // primary 를 못 찾으면 첫 출력을 쓴다. 합성 격자와 어긋날 수 있지만 박자가 아예 없는
+        // 것보다 낫고, 어긋났다면 `OUTPHASE` 의 `primary=` 칸이 그 사실을 보여 준다.
+        let primary = enumeration
+            .outputs
+            .iter()
+            .position(|out| is_primary(out.monitor))
+            .unwrap_or(0);
+        // ★주기는 모드에서 읽는다 -- 실측하지 않는다.★ 실측하려면 vblank 를 두 번 기다려야
+        // 하는데, 이 스레드는 기다린 vblank 마다 틱을 내므로 둘째 대기는 곧 ***틱 하나를
+        // 통째로 거르는 것***이다. `probe_loop` 가 두 번 기다리는 것은 그쪽이 틱을 내지 않기
+        // 때문이고, 여기서 같은 방식을 쓰면 박자가 절반이 된다.
+        self.period_qpc = enumeration
+            .outputs
+            .get(primary)
+            .zip(qpc_frequency())
+            .and_then(|(out, freq)| nominal_period_ticks(&out.name, freq, None));
+        self.enumeration = Some(enumeration);
+        self.primary = primary;
+    }
+
+    fn wait(&mut self) -> Option<(u64, u64)> {
+        self.refresh();
+        let output = self
+            .enumeration
+            .as_ref()
+            .and_then(|enumeration| enumeration.outputs.get(self.primary))?
+            .output;
+        // Safety: 살아 있는 `IDXGIOutput`. ★블록한다★ -- 그래서 페이싱 스레드 전용이다.
+        if unsafe { (*output).WaitForVBlank() } < 0 {
+            // ★여기서 자지 않는다.★ 자면 그만큼 박자가 밀리고, 호출자는 이 실패를 "이번
+            // 회전만 타이머로" 로 다루므로 간격은 그쪽이 지킨다. 대신 핸들을 버려 다음
+            // 호출이 재열거하게 한다 -- 실패의 흔한 원인이 토폴로지 변경이다.
+            if let Some(mut dead) = self.enumeration.take() {
+                // Safety: 위와 같다.
+                unsafe { dead.release() };
+            }
+            return None;
+        }
+        let vblank = qpc_now()?;
+        let period = self
+            .period_qpc
+            .or_else(|| qpc_frequency().map(|freq| freq / 60))?;
+        Some((vblank, period))
+    }
+}
+
+impl Drop for VblankSource {
+    fn drop(&mut self) {
+        if let Some(mut enumeration) = self.enumeration.take() {
+            // Safety: 이 열거의 포인터는 이 스레드 밖으로 나간 적이 없고, thread-local 의
+            // 소멸자는 그 스레드에서 돈다.
+            unsafe { enumeration.release() };
+        }
+    }
+}
+
 /// 열거된 출력 하나.
 struct Output {
     name: String,

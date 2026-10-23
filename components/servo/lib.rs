@@ -47,6 +47,7 @@ pub use net_traits::pub_domains::is_reg_domain;
 pub use paint::{
     PaintTargetsInFlight, RenderingContextFactory, TileRenderTiming, WebRenderDebugOption,
     dwm_composition_grid, note_frame_time, note_present_tick, schedule_wall_production,
+    wait_primary_vblank,
 };
 pub use paint_api::rendering_context::{
     DisplayTopology, OffscreenRenderingContext, RenderingContext, SoftwareRenderingContext,

@@ -228,6 +228,21 @@ param(
     #
     # 판정: WALLCLOCK 의 tick_by pace 가 대부분이고 ticks 가 60 으로 돌아오는가.
     [switch] $PacingThread,
+    # gfx_wall_pacing_vblank=false: 페이싱 스레드를 **예전** 경로로 되돌린다.
+    # -PacingThread 가 없으면 아무 일도 하지 않는다.
+    #
+    # 기본(이 스위치 없음) = WaitForVBlank. primary 의 vblank 에서 커널이 깨우므로 DWM
+    # 조회도 대기 타이머도 경로에 없다.
+    # 이 스위치를 주면 = DwmGetCompositionTimingInfo 로 격자를 묻고 -DwmAlign 지점까지
+    # thread::sleep. 그 둘(프로세스 간 호출 지연 + 타이머 깨우기 지터)이 그대로 틱 위상의
+    # 지터가 되고, 커밋 위상이 저더를 정하므로 공짜가 아니다.
+    #
+    # ★-DwmAlign 과 같이 보라.★ vblank 경로라도 -DwmAlign 1..99 면 vblank 뒤에 그만큼 또
+    # 자므로 타이머 지터가 돌아온다 -- 앵커만 좋아진 예전 구조다. -DwmAlign 0(또는 생략)
+    # 일 때만 대기가 하나도 없는 순수 신호 경로이고, 실측 최적점도 거기다.
+    #
+    # 판정: WALLCLOCK 의 jit_ms 와 gap_ms p95, 그리고 COMPREFRESH 의 refresh_d[2].
+    [switch] $PacingDwmQuery,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -893,6 +908,7 @@ $argList = @(
     "--pref", "gfx_sample_lead_periods=$SampleLead",
     "--pref", "gfx_wall_direct_render=$($DirectRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_pacing_vblank=$((-not $PacingDwmQuery.IsPresent).ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -968,7 +984,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in

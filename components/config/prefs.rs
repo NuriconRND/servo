@@ -569,6 +569,24 @@ pub struct Preferences {
     /// 옮긴다 -- 렌더는 그대로 메인이다(임베더 핸들과 타일 0 컨텍스트가 메인 전용).
     /// 메인의 `WaitUntil` 은 백스톱으로 남는다.
     pub gfx_wall_pacing_thread: bool,
+    /// ★페이싱 스레드의 깨우기를 `IDXGIOutput::WaitForVBlank` 에 묶는다.★ 기본 켜짐.
+    /// `gfx_wall_pacing_thread` 가 꺼져 있으면 아무 일도 하지 않는다.
+    ///
+    /// 끄면 예전 경로다 -- `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
+    /// `gfx_present_align_dwm_pct` 지점까지 `thread::sleep` 한다. 그 경로의 오차는 둘이고
+    /// 둘 다 틱 위상의 지터가 된다: DWM 으로의 프로세스 간 호출 지연(변동한다)과 대기
+    /// 타이머의 깨우기 지터다. 켜면 깨우는 주체가 커널의 디스플레이 인터럽트라 둘 다 없다.
+    ///
+    /// ★`gfx_present_align_dwm_pct` 와의 관계가 이 pref 의 요점이다.★ `pct` 가 `1..=99`
+    /// 면 vblank 뒤에 그만큼 **또 자야 하므로** 타이머 지터가 그대로 돌아온다 -- 앵커만
+    /// 좋아진 예전 구조다. `pct <= 0` 일 때만 대기가 하나도 없는 순수 신호 경로가 되고,
+    /// 실측된 최적점이 바로 거기다(`DwmAlign` 0 에서 dup 평균 8, 50 에서 2146).
+    /// 그래서 이 pref 가 켜져 있으면 `pct <= 0` 이 기본이자 권장이다.
+    ///
+    /// ★박자는 패널 주사율로 상한이 걸린다.★ 틱은 vblank 마다 나가므로
+    /// `gfx_refresh_hz` 를 패널보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 vblank 를
+    /// 건너뛰어 맞춘다(`winit_wall` 의 `spawn_pacing_thread`).
+    pub gfx_wall_pacing_vblank: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1289,6 +1307,7 @@ impl Preferences {
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,
+            gfx_wall_pacing_vblank: true,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
