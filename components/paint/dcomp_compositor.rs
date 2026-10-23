@@ -1695,7 +1695,7 @@ pub fn enabled() -> bool {
 /// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어지는가.★ 조회만 한다 -- 블록하지 않는다.
 ///
 /// ★낡음(2026-09-18 기록, 2026-10-23 이후 무효)★ — 커밋 경로는 넷이다(`enum CommitSite`).
-/// ***왜 전역인가*** -- Commit 은 여러 경로로 나가고 그중 하나(`commit_device_at_tick`)는
+/// ***왜 전역인가*** -- Commit 은 여러 경로로 나가고 그중 하나(`commit_at_tick_locked`)는
 /// 컴포지터 밖의 자유 함수다. 처음에는
 /// `commit_device` 안에만 붙였는데 그 경로는 거의 돌지 않아 **초당 표본이 1 개**였다
 /// (log_ani_debug/45). 위상은 프로세스·데스크톱 단위 양이고(`DwmGetCompositionTimingInfo`
@@ -1877,12 +1877,12 @@ pub(crate) fn note_dwm_phase() {
 ///
 /// 가드 없는 커밋이 이 브랜치에서 세 번 따로 발견됐다 -- `present_external_only`(라운드 1),
 /// `begin_frame` → `flush_deferred_commit` → `commit_device`, 그리고 셸이 틱에서 내는
-/// `commit_device_at_tick`. 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로
+/// `commit_at_tick_locked`. 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로
 /// 모은다. 새 커밋 지점을 만들려면 이 함수를 지나갈 수밖에 없고, 그러면 "가드는?" 이라는
 /// 질문을 그 자리에서 하게 된다. 이 파일 밖에서 `(*device).Commit()` 을 직접 쓰면 그 질문을
 /// 건너뛰는 것이다.
 ///
-/// 가드 밖에서 부르는 정문은 [`commit_device_at_tick`] 하나다. 이미 가드를 쥔 자리
+/// 가드 밖에서 부르는 정문은 [`commit_at_tick_locked`] 하나다. 이미 가드를 쥔 자리
 /// (`end_frame`)는 `raw_commit` 을 직접 쓴다.
 ///
 /// `DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`. 그 디바이스의 서피스가 `BeginDraw` 로
@@ -1960,7 +1960,7 @@ const _: () = {
 
 /// 커밋 지점 하나의 누적기.
 ///
-/// 전역인 이유: `self` 가 없는 커밋 경로가 있다(`commit_device_at_tick` -- 자유 함수이고
+/// 전역인 이유: `self` 가 없는 커밋 경로가 있다(`commit_at_tick_locked` -- 자유 함수이고
 /// 셸 스레드에서 불린다). 그래서 컴포지터 필드에 둘 수 없다. 대신 비우는 쪽을 하나로
 /// 정한다([`COMMITSITE_EMITTER`]).
 struct CommitSlot {
@@ -2243,7 +2243,7 @@ unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 
     // ★커밋 간격은 ***여기서*** 잰다.★ 2026-10-22. 처음에는 `note_commit_at` 에 달았는데
     // 그 함수는 커밋의 일부만 본다. 그러면 "이 디바이스가 커밋을 걸렀나" 를 물을 수 없다.
     // `raw_commit` 은 크레이트에서 `Commit()` 을 실제로 부르는 유일한 자리라(이 파일의
-    // `commit_device_at_tick` 주석) 여기 달면 빠지는 갈래가 없다.
+    // `commit_at_tick_locked` 주석) 여기 달면 빠지는 갈래가 없다.
     crate::output_grid::note_commit_interval(device as usize);
     if let Some(start) = start {
         let ns = start.elapsed().as_nanos() as u64;
@@ -2302,8 +2302,8 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
     );
 }
 
-/// ★정규 커밋.★ 셸이 틱 머리에서 내는 커밋만 이 문을 지난다
-/// (`paint::Paint::commit_deferred_at_tick`).
+/// ★정규 커밋의 임계구역 전부★ -- 디바이스 가드와 `Commit()` 하나. 셸이 틱 머리에서 내는
+/// 커밋만 이 문을 지난다(`commit_guard::commit_all_at_tick`, 상주 워커 스레드에서).
 ///
 /// ★가드를 이 함수가 잡는다.★ 가드 밖에서 커밋하는 자리의 정문이고, 이 함수를 부르는
 /// 것만으로 다른 스레드와의 동시 접근이 막힌다 -- 호출처가 그 사실을 알 필요가 없다는 것이
@@ -2315,18 +2315,22 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
 /// 섞인다. 계측이 빠진 커밋 경로를 만들 수 없게 하는 것이 `CommitSite` 의 목적이고, 그 목적은
 /// ***정규 경로에 제 이름이 붙어 있을 때만*** 성립한다.
 ///
+/// ★부기는 여기 없다.★ 돌려주는 `hr` 은 호출자가 가드를 푼 뒤 [`note_tick_commit`] 으로
+/// **순차** 처리한다 -- `note_dwm_phase` 는 전역 뮤텍스와 DWM 조회를 품고 실패 로그는 파일
+/// I/O 라, 네 워커에서 동시에 돌리면 "가드 안에서 하는 일은 `Commit()` 하나" 가 무너진다.
+///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
-pub fn commit_device_at_tick(device: usize) -> bool {
-    let hr = {
-        let _guard =
-            crate::commit_guard::device_guard(device, crate::commit_guard::GuardRole::Tick);
-        // Safety: 위 계약.
-        unsafe { raw_commit(device as *mut IDCompositionDevice, CommitSite::Tick) }
-    };
+pub(crate) fn commit_at_tick_locked(device: usize) -> i32 {
+    let _guard = crate::commit_guard::device_guard(device, crate::commit_guard::GuardRole::Tick);
+    // Safety: 포인터는 살아 있는 `IDCompositionDevice` 다(호출자 계약).
+    unsafe { raw_commit(device as *mut IDCompositionDevice, CommitSite::Tick) }
+}
+
+/// [`commit_at_tick_locked`] 뒤의 부기. ★가드를 푼 뒤, 순차로★ 부른다.
+pub(crate) fn note_tick_commit(device: usize, hr: i32) {
     crate::output_grid::note_commit_at(device);
     note_commit_failure(hr, device, "tick");
     note_dwm_phase();
-    hr >= 0
 }
 
 pub fn maybe_create(

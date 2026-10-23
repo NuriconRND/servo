@@ -3682,30 +3682,6 @@ impl Paint {
         });
     }
 
-    /// 이 디바이스들을 **지금** 커밋한다. 병렬 커밋 설정을 그대로 따른다 -- 네 디바이스가
-    /// 겹쳐 나가야 네 타일이 같은 DWM 합성에 실린다.
-    ///
-    /// 가드를 여기서 직접 잡지 않는 것에 주의하라: `commit_device_at_tick` 이 정문이고 그 안에서
-    /// 잡는다(`dcomp_compositor::raw_commit` 주석). 커밋 지점마다 가드를 따로 챙기는 방식이
-    /// 세 번 새는 바람에 그 책임을 한 곳으로 옮겼다 -- 이 함수가 할 일은 "지금 낸다" 와
-    /// "병렬 설정을 따른다" 뿐이다.
-    #[cfg(windows)]
-    fn commit_now_guarded(devices: Vec<usize>) {
-        if devices.len() > 1 && servo_config::pref!(gfx_dcomp_parallel_commit) {
-            std::thread::scope(|scope| {
-                for device in devices {
-                    scope.spawn(move || {
-                        crate::dcomp_compositor::commit_device_at_tick(device);
-                    });
-                }
-            });
-            return;
-        }
-        for device in devices {
-            crate::dcomp_compositor::commit_device_at_tick(device);
-        }
-    }
-
     /// ★이 패스가 미뤄 둔 Commit 을 거둬 둔다 -- 내지는 않는다.★
     ///
     /// 셸이 타일 루프를 마친 뒤 부른다. 실제 `Commit()` 은 **다음 틱 머리**에서
@@ -3764,7 +3740,7 @@ impl Paint {
             if devices.is_empty() {
                 return;
             }
-            Self::commit_now_guarded(devices);
+            crate::commit_guard::commit_all_at_tick(devices);
         }
     }
 
