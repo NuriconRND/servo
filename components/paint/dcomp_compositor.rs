@@ -3272,6 +3272,11 @@ impl DCompNativeCompositor {
         #[cfg(windows)]
         if let Some(dcomp_device) = self.dcomp_device_ptr() {
             let early_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
+        // ★반증됨★(2026-10-23, `BINDOPEN`, log_ani_debug_06/14) -- 아래 문단의 "겹침은
+        // 타일에 따라 상시로 일어난다" 는 측정과 맞지 않는다. `BeginDraw`~`EndDraw` 는
+        // 주기당 0.40ms(주기의 2.4%), 위상 28~31% 이고 마감은 위상 8% 다. 세 런 모두
+        // `retried=0`. 이 호출이 커밋의 70% 를 내는 것은 거부를 막아서가 아니라
+        // `flush_before_render` 가 충돌 여부를 보지 않고 선취하기 때문이다(그쪽 주석).
             crate::commit_scheduler::flush_before_render(dcomp_device as usize);
             if let Some(start) = early_start {
                 split.early_ns = start.elapsed().as_nanos() as u64;

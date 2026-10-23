@@ -880,6 +880,25 @@ pub(crate) fn note_bind_span(device: usize, begin: u64, end: u64) {
 ///
 /// ★기준 vblank 가 낡아도 된다.★ 창 안의 모든 표본을 같은 스냅샷으로 접으므로 주기 번호가
 /// 통째로 밀릴 뿐 주기별 묶음은 바뀌지 않는다(`emit_commitcycle` 과 같은 근거).
+///
+/// ★측정 결과 -- 가설은 틀렸다★(log_ani_debug_06/14, 4타일 multigpu, baseline 플래그,
+/// 120s x 3, 정상 구간 약 87,000 bind). `open_ms` p50 **0.40ms**(p95 0.73, max 1.2)이고
+/// `n` 과 `cycles` 가 같다 -- 주기마다 bind 가 정확히 하나다. 따라서 `locked_ms` 도 0.40ms,
+/// ***`free_ms_p50` 는 16.26ms, 즉 주기의 97.6% 다.*** 잠금은 위상 28% 에 열려 31% 에
+/// 닫히는 3 포인트짜리 조각이고, 커밋 마감은 위상 8% 다 -- 겹칠 구조가 아니다.
+///
+/// ★왜 틀렸나★ -- "`BeginDraw` 가 WR 의 GL draw 전체(약 5ms) 동안 열려 있다" 고 봤는데,
+/// 근거로 삼은 것이 `BoundTile::texture` 의 "WR 의 GL draw 동안 살려두고" 라는 주석이었다.
+/// 그것은 ***텍스처 수명*** 얘기지 잠금 구간 얘기가 아니다. GL 호출은 큐에 쌓이는 것이라
+/// bind~unbind 는 커맨드 제출일 뿐이고 GPU 작업은 그 뒤에 난다. 주석을 측정으로 착각했다.
+///
+/// ★그래서 `SURFACE_BEING_RENDERED` 는 이 구성에서 실재하는 위험이 아니다.★ 같은 세 런의
+/// `retried` 가 전부 0 이다. 그 거부를 막으려고 둔 `flush_before_render` 가 커밋의 70% 를
+/// 가져가고 있지만(`early/scheduled` 69.3~70.3%), 그것은 구조가 아니라 무조건 선취다 --
+/// 그 함수는 충돌 여부를 보지 않고 큐에 있으면 가져간다. 상세는 그쪽 주석.
+///
+/// ★이 줄이 닫은 질문★ -- 마감을 어디에 둘 수 있나. 답: ***주기 안 거의 어디에나.*** 렌더
+/// 창이 커밋을 막는다는 전제로 세웠던 "창이 둘뿐이다" 라는 지형도는 폐기한다.
 fn emit_bindopen() {
     let samples: Vec<(usize, Vec<(u64, u64)>)> = match BIND_SPANS.lock() {
         Ok(mut guard) => match guard.as_mut() {
