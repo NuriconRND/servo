@@ -1406,6 +1406,10 @@ enum VblankPace {
 ///
 /// ★여기서 블록한다.★ 깨우는 것은 커널의 디스플레이 인터럽트이므로 이 경로에는 DWM
 /// 조회도 대기 타이머도 없다 -- `align_pct` 가 `1..=99` 일 때만 뒤엣것이 돌아온다.
+///
+/// `due` 는 ***요청한 박자가 패널보다 뚜렷이 느릴 때만*** 쓰인다. 왜 그 경우로 좁혔는지는
+/// 본문의 주석에 있다 -- 시각끼리 비교하면 두 주기의 미세한 차가 누적되어 몇 분에 한 번
+/// 칸을 거르고, 그것이 곧 측정에 섞이는 거짓 dup 이다.
 fn pace_on_vblank(
     period: std::time::Duration,
     align_pct: i64,
@@ -1414,19 +1418,32 @@ fn pace_on_vblank(
     let Some((vblank_qpc, period_qpc)) = servo::wait_primary_vblank() else {
         return VblankPace::Unavailable;
     };
-    let now = std::time::Instant::now();
-    // ★이 vblank 를 거를까.★ `period`(= `-RefreshHz`)가 패널 주기보다 길 때만 걸린다.
+    // ★주기가 패널과 거의 같으면 ***아무것도 재지 않고*** 매 vblank 에 낸다.★
     //
-    // ★반 주기의 여유가 핵심이다.★ 둘이 같을 때(흔한 경우: 60Hz 패널에 `-RefreshHz 60`)
-    // `due` 와 vblank 는 명목상 같은 간격으로 가지만 두 시계가 완전히 같지는 않다. 여유가
-    // 없으면 그 미세한 어긋남이 쌓여 ***언젠가 한 칸을 거른다*** -- 그 한 칸이 곧 30Hz
-    // 프레임 하나이고, 이 작업이 없애려는 저더 그 자체다. 반 주기면 어느 방향으로 떠내려가도
-    // 거르지 않는다.
-    let half = qpc_frequency()
+    // 처음에는 `due` 에 반 주기의 여유를 두어 "둘이 같을 때는 안 거른다" 를 노렸다.
+    // ***그것은 틀렸다 -- 여유는 첫 건너뜀을 늦출 뿐 막지 못한다.*** `due` 는 `period` 씩,
+    // vblank 는 패널 주기씩 가므로 둘이 1ns 라도 다르면 간격이 ***선형으로*** 벌어진다.
+    // 실제 값으로: `-RefreshHz 60` 은 16.6667ms 이고 이 패널은 60.003Hz = 16.6658ms 라
+    // 프레임당 0.9µs 씩 어긋난다. 반 주기(8.33ms)를 다 쓰는 데 9,255 프레임 = ★154 초★ --
+    // 즉 2.5 분마다 한 칸을 거르고, 그 한 칸이 곧 30Hz 프레임 하나다. 120 초 런에서 dup
+    // 0~1 개로 나타날 양이고, ★저더를 dup 으로 세는 측정에 정확히 그만큼의 거짓 신호를
+    // 섞는다.★ 없애려는 것을 스스로 만드는 꼴이다.
+    //
+    // 그래서 비교를 ***시각이 아니라 주기끼리*** 한다. 주기 비교에는 누적이 없다.
+    // 1.5 배를 경계로 둔 것은 1 배 근처의 미세한 차이를 전부 "같다" 로 삼기 위해서다 --
+    // `-RefreshHz` 가 패널보다 높을 때도 여기로 온다(패널보다 빨리 낼 방법은 없다).
+    let vblank_period = qpc_frequency()
         .filter(|freq| *freq > 0)
-        .map(|freq| std::time::Duration::from_secs_f64(period_qpc as f64 / freq as f64 / 2.0))
-        .unwrap_or(period / 2);
-    if *due > now + half {
+        .map(|freq| std::time::Duration::from_secs_f64(period_qpc as f64 / freq as f64))
+        .unwrap_or(period);
+    if period * 2 <= vblank_period * 3 {
+        align_after_vblank(vblank_qpc, period_qpc, align_pct);
+        return VblankPace::Fire;
+    }
+    // 여기부터는 ***요청한 박자가 패널보다 뚜렷이 느리다***(`-RefreshHz 30` 따위). 그때는
+    // 거르는 것이 의도이므로 `due` 로 센다.
+    let now = std::time::Instant::now();
+    if *due > now + vblank_period / 2 {
         return VblankPace::Skip;
     }
     *due += period;
