@@ -618,7 +618,6 @@ pub(crate) fn note_commit_at(device: usize) {
     if let Ok(mut guard) = COMMITS.lock() {
         guard.get_or_insert_with(HashMap::new).insert(device, now);
     }
-    note_tick_to_commit(device, now);
 }
 
 /// 디바이스 -> 이번 창의 `커밋 -> 다음 커밋` 간격(QPC 틱). `COMMITGAP` 이 초당 비운다.
@@ -631,6 +630,19 @@ static LAST_COMMIT: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 /// ★`Commit()` 이 날 때마다 그 시각과 직전 커밋과의 간격을 남긴다.★
 /// `dcomp_compositor::raw_commit` 에서, 즉 ***모든*** 커밋이 지나는 한 자리에서 부른다.
 /// 간격은 `COMMITGAP`(박자), 시각은 `COMMITCYCLE`(위상) 이 읽는다.
+///
+/// ★`note_tick_to_commit` 도 여기서 부른다★(2026-10-23). 원래는 `note_commit_at` 에 달려
+/// 있었고, 그 함수는 다섯 곳에서만 불려 커밋의 38% 만 본다. 그래서 `PASS_RING` 의
+/// `first_commit_qpc`/`last_commit_qpc`/`commits` 가 전부 그 부분집합 위에서 계산됐고, 그
+/// 값으로 짓는 `MISSEVENT` 의 `c2s_ms`/`t2c_ms`/`span_ms`/`commits`/`newcommit` 과
+/// `TICKCOMMIT` 이 다 같은 구멍을 물려받았다.
+///
+/// 피해는 가설적이지 않았다. `pass_before` 는 `last_commit_qpc != 0` 인 마지막 패스를
+/// 찾는데, 네 커밋이 전부 `before_render` 로 나간 패스는 그 값이 0 이라 검색에서 통째로
+/// 빠진다. 그래서 연속한 두 합성이 같은 패스를 가리키고(`newcommit=0`), 합성 시각이
+/// 기록된 커밋보다 여러 주기 뒤가 된다(`c2s_ms` p50 98ms = 6 주기). 둘 다 ***계측의
+/// 구멍이지 화면의 사실이 아니다*** -- log_ani_debug_06/13 에서 110/118 이 `newcommit=0`
+/// 인 것을 "DWM 이 한 프레임에 대고 두 번 합성했다" 로 읽었다가 철회했다.
 pub(crate) fn note_commit_interval(device: usize) {
     let Some(now) = qpc_now() else { return };
     let previous = match LAST_COMMIT.lock() {
@@ -640,6 +652,7 @@ pub(crate) fn note_commit_interval(device: usize) {
     if let Ok(mut guard) = COMMIT_STAMPS.lock() {
         guard.get_or_insert_with(HashMap::new).entry(device).or_default().push(now);
     }
+    note_tick_to_commit(device, now);
     let Some(previous) = previous else { return };
     if let Ok(mut guard) = COMMIT_GAPS.lock() {
         guard
@@ -742,10 +755,14 @@ static COMMIT_STAMPS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None)
 /// 아니었다.*** `CommitAlign 8` 이 방해가 된다는 의심도 이 수치로 함께 꺼진다.
 ///
 /// 그래서 이 줄은 더 볼 것이 없고, 저더는 ***우리가 언제 커밋하는가***로는 설명되지
-/// 않는다. 같은 런에서 다음이 드러났다: `MISSEVENT` 건수가 dup 과 거의 1:1 이고
-/// (23/42/53 대 21/39/51), 그중 ★110/118 이 `newcommit=0`★ -- ***연속한 두 DWM 합성이
-/// 같은 렌더 패스를 뒤에 두고 있었다.*** 즉 우리가 커밋을 거른 것이 아니라 DWM 이 우리
-/// 프레임 하나에 대고 두 번 합성했다. 추적은 그쪽으로 간다.
+/// 않는다. 같은 런에서 `MISSEVENT` 건수가 dup 과 거의 1:1 임이 드러났다(23/42/53 대
+/// 21/39/51). 그 비율은 전 배치에서 1.05 +- 0.03 이고 기준선에서도 같다(4 대 3, 13 대 11).
+/// ★둘은 같은 사건의 두 얼굴이고, 회귀는 그 사건이 10 배로 늘어난 것이다★ -- 새로 생긴
+/// 고장이 아니라 원래 드물던 고장의 빈도가 올랐다.
+///
+/// ★`MISSEVENT` 의 나머지 필드는 이 시점까지 믿을 수 없었다★ -- `newcommit`/`c2s_ms`/
+/// `t2c_ms`/`span_ms`/`commits` 가 전부 `PASS_RING` 에서 나오는데 그것을 채우는
+/// `note_tick_to_commit` 이 커밋의 38% 만 봤다. 상세는 `note_commit_interval` 주석.
 ///
 /// ★기준 vblank 가 낡아도 된다.★ 창 안의 모든 표본을 같은 스냅샷으로 나누므로, 기준이
 /// 흔들리면 주기 번호가 **통째로** 밀릴 뿐 주기별 개수는 바뀌지 않는다. 흔들리는 것은
@@ -1018,6 +1035,13 @@ fn pass_before(start_qpc: u64, freq: u64) -> Option<(PassMark, Vec<f64>)> {
 /// `late` 는 커밋이 반 주기(P/2)보다 늦게 나간 횟수다 -- 그 프레임은 겨냥한 위상에서
 /// 통째로 벗어났다. 이 수가 `COMPREFRESH` 의 `d0-d2` 와 함께 움직이는지가 인과의 방향을
 /// 가른다(관측만으로는 못 가리던 바로 그것이다). DWM 주기를 못 구하면 `late=-1`.
+///
+/// ★2026-10-23 이전 로그의 이 줄은 커밋의 38% 짜리다.★ 표본을 넣던 `note_tick_to_commit`
+/// 이 `note_commit_at` 에 달려 있었고 그 함수는 다섯 곳에서만 불렸다 -- 즉 스케줄러가 낸
+/// 커밋만 보고 `before_render` 로 나간 70% 는 못 봤다. 그 로그로 "t2c p50 이 마감에 정확히
+/// 떨어진다", "p95 가 1.5ms 나빠졌다" 를 읽었는데 둘 다 스케줄러 커밋에 한정된 얘기였다.
+/// 지금은 `note_commit_interval`(= `raw_commit`) 이 넣으므로 전수다. ***옛 로그와 직접
+/// 비교하지 말 것.***
 fn emit_tickcommit() {
     let samples: Vec<(usize, Vec<f64>)> = match TICK_TO_COMMIT.lock() {
         Ok(mut guard) => match guard.as_mut() {
