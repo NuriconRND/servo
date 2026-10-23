@@ -2583,7 +2583,7 @@ impl Painter {
         // 샘플 시각보다 먼저 확인해야 할 사실이다(`output_grid::FRAME_IDS` 주석).
         #[cfg(windows)]
         crate::output_grid::note_frame_id(
-            &format!("{:?}", self.painter_id),
+            self.painter_id,
             self.last_ready_wall_logical_frame_id.get(),
         );
         self.pump_paint_animation(PumpSource::Render);

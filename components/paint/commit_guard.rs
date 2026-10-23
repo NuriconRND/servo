@@ -164,6 +164,10 @@ pub(crate) enum GuardRole {
 /// `_locked` 변형을 이름으로 갈라 둔다.
 pub(crate) fn device_guard(device: usize, role: GuardRole) -> std::sync::MutexGuard<'static, ()> {
     let lock = device_lock(device);
+    // ★계측이 꺼져 있으면 QPC 두 번도 찍지 않는다.★ 이 함수는 커밋마다 불린다.
+    if !*crate::output_grid::COLLECT {
+        return lock.lock().unwrap_or_else(|e| e.into_inner());
+    }
     let start = qpc_now();
     let held = lock.lock().unwrap_or_else(|e| e.into_inner());
     if let (Some(start), Some(now)) = (start, qpc_now()) {
@@ -254,7 +258,7 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     if devices.is_empty() {
         return;
     }
-    let start = qpc_now();
+    let start = (*crate::output_grid::COLLECT).then(qpc_now).flatten();
     let dispatched = if devices.len() > 1 && *PARALLEL_COMMIT {
         let available = ensure_workers(devices.len());
         let n = available.min(devices.len());
@@ -295,11 +299,15 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     if let (Some(start), Some(now)) = (start, qpc_now()) {
         record_fanout(now.saturating_sub(start));
     }
+
     // ★부기는 순차다.★ `note_dwm_phase` 는 전역 뮤텍스와 DWM 조회를 품고 실패 로그는 파일
     // I/O 라, 워커에 흩으면 "임계구역은 `Commit()` 한 줄" 규칙이 무너진다.
     for (device, hr) in done {
         crate::dcomp_compositor::note_tick_commit(device, hr);
     }
+    // ★DWM 격자는 틱당 한 번만 묻는다.★ 프로세스 단위 양이라 디바이스마다 물을 이유가 없고,
+    // 그 조회는 DWM 으로의 프로세스 간 호출이다(`note_tick_commit` 주석).
+    crate::dcomp_compositor::note_dwm_phase();
 }
 
 static FANOUT_N: AtomicU64 = AtomicU64::new(0);
@@ -347,6 +355,9 @@ fn record_lock_wait(role: GuardRole, ticks: u64) {
 /// `Commit()` 하나 수준이어야 한다. 틱마다 스레드를 만들던 구현에서는 여기에 4 x ~80µs 의
 /// 생성 비용이 얹혔다(`WORKERS` 주석).
 pub(crate) fn emit_lockwait() {
+    if !*crate::output_grid::COLLECT {
+        return;
+    }
     let pn = LOCK_PAINTER_N.swap(0, Ordering::Relaxed);
     let ps = LOCK_PAINTER_SUM.swap(0, Ordering::Relaxed);
     let pm = LOCK_PAINTER_MAX.swap(0, Ordering::Relaxed);

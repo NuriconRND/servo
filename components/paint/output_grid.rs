@@ -24,10 +24,31 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use log::warn;
+use servo_base::id::PainterId;
+
+/// ★계측 전체의 주 스위치.★ `SERVO_WALL_NO_PROBE=1` 이면 꺼진다.
+///
+/// 계측 비용을 재려고 계측을 더 붙이는 것은 순환이다. 이 스위치는 그 대신 ***같은
+/// 바이너리에서 계측만 빼는*** A/B 를 가능하게 한다.
+static PROBE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    !servo_config::debug_env::enabled(&servo_config::debug_env::WALL_NO_PROBE)
+});
+
+/// ★수집 게이트. 방출과 **같은** 조건이어야 한다.★
+///
+/// 어긋나면 아무도 비우지 않는 맵에 영원히 쌓인다. 이 코드베이스가 그 함정에 두 번 당했다 --
+/// `PHASES` 가 프로세스 수명 내내 자랐고(Fix round 1, Ruling 15), B1 의 프로브를 진단 플래그
+/// 뒤에 두어 격자가 영영 비었다(설계 문서 C5). ★그래서 수집·방출·프로브 스레드가 이 하나의
+/// 값을 본다★ -- 셋이 갈라질 수 없게 한다.
+///
+/// `note_dcomp_stat` 만 예외다. 그 함수는 B2(`-SampleLead`)가 쓰는 공통 합성 격자를 채우므로
+/// 격자 갱신은 이 게이트 **앞**에 있어야 한다 -- 계측을 껐다고 기능이 죽으면 안 된다.
+pub(crate) static COLLECT: LazyLock<bool> =
+    LazyLock::new(|| *PROBE_ENABLED && *crate::dcomp_compositor::DCOMP_BIND_PROF);
 use winapi::Interface;
 use winapi::shared::dxgi::{
     CreateDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
@@ -307,13 +328,21 @@ static PUMP_FROM_TICK: AtomicU64 = AtomicU64::new(0);
 /// 그건 샘플 시각보다 **먼저** 확인해야 할 사실이다. 네 타일을 같은 프레임에 묶는 배리어가
 /// 그 프레임들에는 걸리지 않는다는 뜻이므로, 지금까지 쫓던 타일 간 어긋남의 원인이 거기일
 /// 수 있다. 숫자로 확정하고 나서 다음을 정한다.
-static FRAME_IDS: Mutex<Option<HashMap<String, (u64, u64, HashSet<u64>)>>> = Mutex::new(None);
+///
+/// ★키는 `PainterId` 다 -- `String` 이 아니다★(2026-10-23). 예전에는 호출처가
+/// `&format!("{:?}", painter_id)` 를 넘기고 이 함수가 다시 `to_owned()` 했다. 프레임마다
+/// 타일마다 힙 할당 둘이고 초당 480 번이다. `PainterId` 는 `Copy + Hash + Eq` 라 할당이
+/// 없고, 사람이 읽을 문자열은 초당 한 번 `emit_frameid` 에서 만들면 된다.
+static FRAME_IDS: Mutex<Option<HashMap<PainterId, (u64, u64, HashSet<u64>)>>> = Mutex::new(None);
 
-pub(crate) fn note_frame_id(painter: &str, frame_id: Option<u64>) {
+pub(crate) fn note_frame_id(painter: PainterId, frame_id: Option<u64>) {
+    if !*COLLECT {
+        return;
+    }
     if let Ok(mut guard) = FRAME_IDS.lock() {
         let slot = guard
             .get_or_insert_with(HashMap::new)
-            .entry(painter.to_owned())
+            .entry(painter)
             .or_insert_with(|| (0, 0, HashSet::new()));
         slot.0 += 1;
         if let Some(id) = frame_id {
@@ -324,7 +353,10 @@ pub(crate) fn note_frame_id(painter: &str, frame_id: Option<u64>) {
 }
 
 fn emit_frameid() {
-    let rows: Vec<(String, (u64, u64, HashSet<u64>))> = match FRAME_IDS.lock() {
+    if !*COLLECT {
+        return;
+    }
+    let rows: Vec<(PainterId, (u64, u64, HashSet<u64>))> = match FRAME_IDS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
             None => Vec::new(),
@@ -336,7 +368,7 @@ fn emit_frameid() {
             continue;
         }
         warn!(
-            "FRAMEID painter={painter} renders={renders} with_id={with_id} distinct_ids={} \
+            "FRAMEID painter={painter:?} renders={renders} with_id={with_id} distinct_ids={} \
              without_id={}",
             ids.len(),
             renders.saturating_sub(with_id),
@@ -345,14 +377,23 @@ fn emit_frameid() {
 }
 
 pub(crate) fn note_pump_from_render() {
+    if !*COLLECT {
+        return;
+    }
     PUMP_FROM_RENDER.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn note_pump_from_idle() {
+    if !*COLLECT {
+        return;
+    }
     PUMP_FROM_IDLE.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn note_pump_from_tick() {
+    if !*COLLECT {
+        return;
+    }
     PUMP_FROM_TICK.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -409,6 +450,9 @@ fn note_sample_slip(
     period_ticks: u64,
     freq: u64,
 ) {
+    if !*COLLECT {
+        return;
+    }
     let Ok(mut guard) = SLIPS.lock() else { return };
     let tally = guard
         .get_or_insert_with(HashMap::new)
@@ -461,6 +505,9 @@ fn period_ms_for_log() -> f64 {
 }
 
 fn emit_sampleslip() {
+    if !*COLLECT {
+        return;
+    }
     let from_render = PUMP_FROM_RENDER.swap(0, Ordering::Relaxed);
     let from_idle = PUMP_FROM_IDLE.swap(0, Ordering::Relaxed);
     let from_tick = PUMP_FROM_TICK.swap(0, Ordering::Relaxed);
@@ -614,6 +661,9 @@ static DCOMP_STAT_FAILED: AtomicU64 = AtomicU64::new(0);
 static COMMITS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
 pub(crate) fn note_commit_at(device: usize) {
+    if !*COLLECT {
+        return;
+    }
     let Some(now) = qpc_now() else { return };
     if let Ok(mut guard) = COMMITS.lock() {
         guard.get_or_insert_with(HashMap::new).insert(device, now);
@@ -643,8 +693,25 @@ static LAST_COMMIT: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 /// 기록된 커밋보다 여러 주기 뒤가 된다(`c2s_ms` p50 98ms = 6 주기). 둘 다 ***계측의
 /// 구멍이지 화면의 사실이 아니다*** -- log_ani_debug_06/13 에서 110/118 이 `newcommit=0`
 /// 인 것을 "DWM 이 한 프레임에 대고 두 번 합성했다" 로 읽었다가 철회했다.
-pub(crate) fn note_commit_interval(device: usize) {
-    let Some(now) = qpc_now() else { return };
+/// `Commit()` 이 돌아온 시각. ★디바이스 가드 안에서 불러도 되는 유일한 계측이다★ --
+/// 락도 할당도 없는 QPC 한 번이다. 적재는 [`note_commit_stamp`] 가 가드 밖에서 한다.
+pub(crate) fn commit_stamp() -> Option<u64> {
+    (*COLLECT).then(qpc_now).flatten()
+}
+
+/// `Commit()` 하나를 계측에 적재한다. ★호출자가 디바이스 가드를 **푼 뒤에** 부른다.★
+///
+/// 2026-10-23 이전에는 이 일이 `raw_commit` 안, 즉 가드 **안**에서 돌았다. 전역 뮤텍스
+/// 다섯 개(`LAST_COMMIT`/`COMMIT_STAMPS`/`TICK_TO_COMMIT`/`PASS_RING`/`COMMIT_GAPS`)가
+/// 임계구역에 들어 있었다는 뜻이고, 네 워커가 그 다섯을 두고 줄을 섰다 -- 팬아웃의 병렬성이
+/// 그만큼 허구였다. 그리고 "가드 안에서 하는 일은 `Commit()` 하나" 라는 이 크레이트의
+/// 불변식을 그 자리가 깨고 있었다(`commit_guard` 모듈 주석). 그 불변식을 감시하라고 둔
+/// `LOCKWAIT painter_us_max` 가 정작 그 위반을 재고 있었다.
+pub(crate) fn note_commit_stamp(device: usize, stamp: Option<u64>) {
+    if !*COLLECT {
+        return;
+    }
+    let Some(now) = stamp else { return };
     let previous = match LAST_COMMIT.lock() {
         Ok(mut guard) => guard.get_or_insert_with(HashMap::new).insert(device, now),
         Err(_) => return,
@@ -678,6 +745,9 @@ pub(crate) fn note_commit_interval(device: usize) {
 /// 반올림으로 버킷한다(`(gap / period).round()`). 경계값(1.5 주기)은 2 로 가는데, 그것이
 /// 맞다 -- 한 주기 반이면 그 사이의 합성 하나는 새것을 못 받았다.
 fn emit_commitgap() {
+    if !*COLLECT {
+        return;
+    }
     let samples: Vec<(usize, Vec<u64>)> = match COMMIT_GAPS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -800,6 +870,9 @@ static COMMIT_STAMPS: Mutex<Option<HashMap<usize, Vec<u64>>>> = Mutex::new(None)
 /// dup 6~2146, 단조. 이 줄(주기 **번호**)로는 여전히 아무것도 안 보인다: 같은 여섯 구성에서
 /// `c1` 은 전부 사실상 100% 이고 `c2` 는 8~20 이다.
 fn emit_commitcycle() {
+    if !*COLLECT {
+        return;
+    }
     let samples: Vec<(usize, Vec<u64>)> = match COMMIT_STAMPS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -882,6 +955,9 @@ static BIND_SPANS: Mutex<Option<HashMap<usize, Vec<(u64, u64)>>>> = Mutex::new(N
 /// `bind` 의 실패 경로(pbuffer 생성/current 실패)도 `EndDraw` 를 부르지만 `bound` 를 남기지
 /// 않으므로 여기 오지 않는다 -- 그 구간은 짧고 매번 warn 을 찍으므로 로그로 드러난다.
 pub(crate) fn note_bind_span(device: usize, begin: u64, end: u64) {
+    if !*COLLECT {
+        return;
+    }
     if end <= begin {
         return;
     }
@@ -932,6 +1008,9 @@ pub(crate) fn note_bind_span(device: usize, begin: u64, end: u64) {
 /// ★이 줄이 닫은 질문★ -- 마감을 어디에 둘 수 있나. 답: ***주기 안 거의 어디에나.*** 렌더
 /// 창이 커밋을 막는다는 전제로 세웠던 "창이 둘뿐이다" 라는 지형도는 폐기한다.
 fn emit_bindopen() {
+    if !*COLLECT {
+        return;
+    }
     let samples: Vec<(usize, Vec<(u64, u64)>)> = match BIND_SPANS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -1051,6 +1130,15 @@ static PASS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 셸이 표출 틱을 낼 때 부른다. ★틱마다 한 번★ -- 타일마다가 아니다.
 pub(crate) fn note_present_tick_now() {
+    if !*COLLECT {
+        return;
+    }
+    // ★프로브 스레드를 여기서 띄운다.★ 예전 유일한 호출처는 `note_dwm_phase` 안이었고 그
+    // 함수는 진단 플래그 뒤에서 시작한다 -- 그러면 방출자가 없는 채로 수집만 도는 구성이
+    // 생기고, 그게 곧 무한 증식이다. 지금은 수집·방출·프로브가 `COLLECT` 하나를 본다.
+    // `start_probe` 는 `Once` 라 틱마다 불려도 원자 적재 하나다.
+    #[cfg(windows)]
+    start_probe();
     let Some(now) = qpc_now() else { return };
     TICK_QPC.store(now, Ordering::Relaxed);
     if let Ok(mut guard) = PASS_RING.lock() {
@@ -1072,6 +1160,9 @@ pub(crate) fn note_present_tick_now() {
 static TICK_TO_COMMIT: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 
 fn note_tick_to_commit(device: usize, commit_qpc: u64) {
+    if !*COLLECT {
+        return;
+    }
     // ★2026-10-23 부터 이 값의 뜻이 바뀌었다 -- 이제 ***커밋 위상 오프셋***이다.★
     //
     // 예전에는 커밋이 패스 끝의 마감에 걸려 나갔으므로 "어느 패스가 건 커밋인가" 를 따로
@@ -1147,6 +1238,9 @@ fn pass_before(start_qpc: u64, freq: u64) -> Option<(PassMark, Vec<f64>)> {
 /// 지금은 `note_commit_interval`(= `raw_commit`) 이 넣으므로 전수다. ***옛 로그와 직접
 /// 비교하지 말 것.***
 fn emit_tickcommit() {
+    if !*COLLECT {
+        return;
+    }
     let samples: Vec<(usize, Vec<f64>)> = match TICK_TO_COMMIT.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -1188,6 +1282,9 @@ fn commit_at(device: usize) -> Option<u64> {
 }
 
 pub(crate) fn note_dcomp_stat_failed() {
+    if !*COLLECT {
+        return;
+    }
     DCOMP_STAT_FAILED.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1237,7 +1334,7 @@ pub(crate) fn note_dcomp_stat(
     if let Ok(mut guard) = COMPOSITION.lock() {
         *guard = Some((last, period_ticks));
     }
-    if !*crate::dcomp_compositor::DCOMP_BIND_PROF {
+    if !*COLLECT {
         return;
     }
     // ★위상차는 `0 에 가까운가` 로 판정하고 싶다.★ `[0, P)` 로 접으면 정렬된 경우가 0 쪽과
@@ -1315,6 +1412,9 @@ pub(crate) fn note_dcomp_stat(
 /// ★네 줄의 `phase_ms` 차이가 곧 타일 간 실제 표시 시점 차이다.★ 이 추적에서 지금까지
 /// 추측으로만 다루던 값이고, 세 번의 잘못된 수정이 전부 이 값을 모르는 상태에서 나왔다.
 fn emit_dcompstat() {
+    if !*COLLECT {
+        return;
+    }
     let stats: Vec<(usize, Vec<DcompSample>)> = match DCOMP_STATS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -1470,6 +1570,9 @@ static LEADS: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 static LEAD_MISSING: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn note_sample_lead(monitor: usize, lead: Duration) {
+    if !*COLLECT {
+        return;
+    }
     if let Ok(mut guard) = LEADS.lock() {
         guard
             .get_or_insert_with(HashMap::new)
@@ -1480,6 +1583,9 @@ pub(crate) fn note_sample_lead(monitor: usize, lead: Duration) {
 }
 
 pub(crate) fn note_sample_lead_missing() {
+    if !*COLLECT {
+        return;
+    }
     LEAD_MISSING.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1487,6 +1593,9 @@ pub(crate) fn note_sample_lead_missing() {
 /// B2 가 걸리지 않은 것이고(모니터 해석 실패 등), 그러면 이 작업은 아무 일도 하지 않는다.
 /// 프로브 스레드가 자기 1 초 창으로 낸다 -- 페인터마다 찍으면 창이 넷으로 쪼개진다.
 fn emit_samplelead() {
+    if !*COLLECT {
+        return;
+    }
     let leads: Vec<(usize, Vec<f64>)> = match LEADS.lock() {
         Ok(mut guard) => match guard.as_mut() {
             Some(map) => map.drain().collect(),
@@ -1860,6 +1969,9 @@ fn bump(slot: &mut [u32; 4], value: i64) {
 /// - `completed_zero` -- `completedStats.time` 이 0 이던 횟수. 창 전체면 그 필드는 이
 ///   프로세스에서 못 쓰는 것이고, 표출 시각은 다른 데서 찾아야 한다.
 fn emit_comp_stats(outputs: &[Output], freq: u64, last_id: &mut Option<u64>) {
+    if !*COLLECT {
+        return;
+    }
     let Some(current) = crate::comp_stats::completed_frame_id() else {
         // ★조용히 건너뛰지 않는다.★ 이 API 는 Windows 10 1803+ 이고 실패가 조용하면
         // "값이 안 나온다" 와 "줄이 아예 없다" 를 구분할 수 없다.
@@ -2056,6 +2168,9 @@ fn emit_missevent(
     pass: Option<&(PassMark, Vec<f64>)>,
     newcommit: i32,
 ) {
+    if !*COLLECT {
+        return;
+    }
     let to_ms = |ticks: i128| ticks as f64 * 1000.0 / freq as f64;
     let out = name.unwrap_or("?");
     let outstanding = target.outstanding_presents;
@@ -2108,6 +2223,9 @@ fn is_primary(monitor: usize) -> bool {
 ///
 /// `rel_ms` 는 열거 첫 출력의 vblank 를 0 으로 둔 상대 위상으로, 주기로 접어 `[0,P)` 다.
 fn emit_outphase(outputs: &[Output], freq: u64) {
+    if !*COLLECT {
+        return;
+    }
     // 기준은 격자가 있는 첫 출력이다. 열거 첫 출력이 아직(또는 영영) 격자를 못 얻었다고
     // 나머지 셋의 확산까지 못 보게 되면, 정작 그 상태에서 가장 보고 싶은 값을 잃는다.
     let base = outputs.iter().find_map(|out| grid_for_monitor(out.monitor));

@@ -262,6 +262,19 @@ pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
     cache_index: 17,
 };
 
+pub const WALL_NO_PROBE: DebugFlag = DebugFlag {
+    name: "SERVO_WALL_NO_PROBE",
+    kind: Kind::Presence,
+    doc: "벽 계측의 **주 스위치**. 켜면 `output_grid`/`commit_guard` 의 모든 `note_*`/`emit_*` 가 \
+          첫 줄에서 돌아오고 프로브 스레드도 뜨지 않는다 — 수집도 방출도 없다. \
+          ★왜 따로 두는가★: 계측 비용을 재려고 계측을 더 붙이면 순환이다. 이 스위치는 그 대신 \
+          ***같은 바이너리에서 계측만 빼는*** A/B 를 가능하게 한다. 커밋 위상이 저더를 정하는 \
+          구조라(`commit_guard` 모듈 주석) 틱 머리에 얹히는 µs 가 그대로 위상이 되므로, \
+          \"계측이 지금 얼마를 먹고 있나\" 는 추정이 아니라 측정으로 답해야 한다. \
+          기본 off(= 계측 켜짐).",
+    cache_index: 24,
+};
+
 pub const DCOMP_BIND_PROF: DebugFlag = DebugFlag {
     name: "SERVO_DCOMP_BIND_PROF",
     kind: Kind::Str,
@@ -376,6 +389,7 @@ pub const ALL: &[&DebugFlag] = &[
     &DCOMP_SLOW_COMMIT_MS,
     &FRAME_TIME_PROF,
     &WALL_PAINTER_LOCK_PROF,
+    &WALL_NO_PROBE,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에
