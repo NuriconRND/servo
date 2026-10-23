@@ -807,6 +807,14 @@ impl WebView {
         self.inner().servo.paint().flush_deferred_dcomp_commits();
     }
 
+    /// ★미뤄 둔 DComp Commit 을 틱 머리에서 낸다.★ 셸이 틱 에지마다, 렌더 **앞에서** 부른다.
+    ///
+    /// 이것이 정규 커밋 시점이다 -- 커밋 위상이 곧 틱의 위상이고, 그것을 `-DwmAlign` 이
+    /// 정한다. 상세는 `paint::Paint::commit_deferred_at_tick`.
+    pub fn commit_deferred_dcomp_at_tick(&self) {
+        self.inner().servo.paint().commit_deferred_at_tick();
+    }
+
     /// Returns the wall logical frame id for which this target should keep its previous frame.
     pub fn paint_target_keep_previous_logical_frame(
         &self,

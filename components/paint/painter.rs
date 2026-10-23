@@ -2499,7 +2499,7 @@ impl Painter {
         // 잡으므로, 스케줄러가 같은 디바이스를 커밋하는 중이면 이 painter 는 ANGLE 락을 쥔 채
         // ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 가 반증)★ — 실측 1~3ms(나쁜 실행 8~10ms), 라이브 평균 2.04ms. ANGLE 락 안전 논증을 다시 세워야 한다.
         // 그 커밋이 끝나기를 기다린다. 그 대기의 상한은 `Commit()` 하나(~0.02ms)로 못 박혀
-        // 있고(`commit_scheduler` 모듈 주석), 실제 값은 OUTCOMMIT total 의
+        // 있고(`commit_guard` 모듈 주석), 실제 값은 LOCKWAIT 의
         // `lock_wait_painter_us_max` 다 -- 반대 방향인 `lock_wait_sched_us_max`(스케줄러가
         // 페인터의 `end_frame` 임계구역을 기다린 시간)와 섞어 읽으면 안 된다.
         let angle_lock_ms;
@@ -4284,7 +4284,7 @@ impl Painter {
         // 격자가 영영 비어 기능이 통째로 무력해진다. B1 에서 프로브를 그렇게 두어 똑같이
         // 당한 적이 있다(설계 문서 C5). 통계 히스토그램 쪽은 여전히 프로파일 뒤에 있다.
         if !*crate::dcomp_compositor::DCOMP_BIND_PROF &&
-            crate::commit_scheduler::SAMPLE_LEAD_PERIODS.is_none()
+            crate::commit_guard::SAMPLE_LEAD_PERIODS.is_none()
         {
             return;
         }
@@ -4316,7 +4316,7 @@ impl Painter {
     fn paint_animation_sample_at(&self) -> Option<Instant> {
         #[cfg(windows)]
         {
-            let lead_periods = (*crate::commit_scheduler::SAMPLE_LEAD_PERIODS)?;
+            let lead_periods = (*crate::commit_guard::SAMPLE_LEAD_PERIODS)?;
             // ★격자는 **공통 합성 격자** 하나다.★ 출력별 vblank 가 아니다 -- 계측으로
             // 확인된 바에 따르면 DWM 은 네 타일을 하나의 합성 패스에서 함께 올리므로
             // (`output_grid::COMPOSITION` 주석), 타일마다 다른 기준에 맞추는 것은 오차만
@@ -4348,11 +4348,6 @@ impl Painter {
         crate::output_grid::monitor_for_hwnd(hwnd)
     }
 
-    pub(crate) fn pending_dcomp_commit_monitor(&self) -> Option<usize> {
-        let hwnd = self.rendering_context.window_hwnd()?;
-        crate::output_grid::monitor_for_hwnd(hwnd)
-    }
-
     /// 미뤄 둔 DComp Commit 의 디바이스를 인계한다(병렬 Commit 용). 인계했으면 이 painter 는
     /// 그 프레임의 Commit 을 더 이상 책임지지 않는다.
     pub(crate) fn take_pending_dcomp_commit(&self) -> Option<usize> {
@@ -4365,16 +4360,6 @@ impl Painter {
         }
         #[cfg(not(windows))]
         None
-    }
-
-    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 는 `gfx_dcomp_commit_in_end_frame`(기본 false = 미룸)이다.
-    /// 미뤄 둔 DComp Commit 을 흘린다(`gfx_dcomp_defer_commit`). WR `render()` 밖에서만
-    /// 불러야 한다 — 안에서 부르면 `dcomp_shared` 이중 대여로 패닉한다(위 fast-path 주석).
-    pub(crate) fn flush_deferred_dcomp_commit(&self) {
-        #[cfg(windows)]
-        if let Some(shared) = self.dcomp_shared.as_ref() {
-            shared.borrow_mut().flush_deferred_commit();
-        }
     }
 
     pub(crate) fn delay_new_frames_for_canvas(

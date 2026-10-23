@@ -1462,6 +1462,16 @@ impl AppState {
         // 재려면 기준점이 거기까지 가야 한다. ★두 발화 경로(타이머 / vsync)가 모두 여기를
         // 지나므로 한 자리면 충분하다.★
         servo::note_present_tick();
+        // ★지난 패스가 미뤄 둔 Commit 을 여기서 낸다 -- 렌더보다 앞이다.★
+        //
+        // 커밋 위상이 곧 이 틱의 위상이 되고, 그것은 `-DwmAlign` 이 정한다. 패스 끝에서 내면
+        // 위상이 패스 길이를 물려받아 주기의 35~62% 에 흩어지는데 그 구간은 DWM 인테이크
+        // 마감 너머라 저더가 수십 배가 된다(log_ani_debug_06/15·16).
+        //
+        // 네 디바이스가 한 호출에 함께 나가므로 네 타일이 같은 합성에 실린다.
+        if let Some(webview) = self.webview.borrow().clone().as_ref() {
+            webview.commit_deferred_dcomp_at_tick();
+        }
         // ★Servo 의 프레임 관찰자를 여기서 깨운다.★ 세 구성(Pacing / Timer / Vsync)
         // 모두 이 자리에서 쏜다 -- `notify_will_paint` 가 등록해 둔 콜백을 부를 사람은
         // 여기뿐이다. 구성마다 다른 것은 ***틱 에지를 누가 내는가*** 뿐이고(페이싱 스레드 /

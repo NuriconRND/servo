@@ -1068,163 +1068,18 @@ pub(crate) fn note_present_tick_now() {
     }
 }
 
-/// 이 패스의 틱 시각(QPC). 아직 틱이 없었으면 `None`.
-///
-/// 0 을 "없음" 으로 쓰는 것이 안전한 이유: QPC 는 부팅부터 단조 증가하고, 0 은 부팅
-/// 순간뿐이다. 그 시각에 벽이 프레임을 내고 있을 수는 없다.
-pub(crate) fn tick_qpc() -> Option<u64> {
-    let tick = TICK_QPC.load(Ordering::Relaxed);
-    (tick != 0).then_some(tick)
-}
-
-/// ★커밋 마감까지 패스에 주는 여유(주기의 %).★ 틱은 `tick_pct%` 에, 커밋은 그 뒤 첫
-/// `commit_pct%` 에 떨어지므로, 여유는 단어진 전방 거리다.
-///
-/// ★부호 없는 차로 재서는 안 된다.★ `commit_pct < tick_pct` 면 마감은 **다음 주기**의 그
-/// 지점이므로 여유가 거의 한 주기다 -- 가장 **많은** 경우다. `commit - tick` 을 포화 뫨산으로
-/// 재면 그것이 0 으로 바닥을 치고, "여유가 없다" 는 정반대의 경고를 내게 된다. 설계
-/// 문서 §3 은 `CommitAlign < DwmAlign` 을 적법이라고 적어 둔다.
-///
-/// 똑같은 위상이면 100 을 돌려준다 -- `next_grid_point` 의 "직후는 엄감하다" 에 맞춰
-/// 한 주기 전지이고, 여유는 최대다.
-///
-/// 두 인자 모두 `0..=99` 를 전제한다(양쪽 pref 가 그 범위로 걸러진다).
-///
-/// ★뒷면도 같이 봐야 한다★(2026-10-23). 이 함수가 주는 것은 틱에서 마감까지의 **전방**
-/// 거리(= 렌더 예산)이고, 그 여집합이 마감에서 다음 틱까지의 간격이다:
-///
-/// ```text
-///   렌더 예산 = (CommitAlign - DwmAlign) % 100      <- 이 함수
-///   간격      = (DwmAlign - CommitAlign) % 100      <- 그 여집합, 아무도 안 본다
-/// ```
-///
-/// 호출처(`paint.rs`)의 경고는 예산이 너무 **작은** 쪽만 본다. 간격이 너무 작은 쪽은 검사가
-/// 없는데, 기준선 8/14 가 바로 그쪽이다 -- 예산 94%, 간격 6%(1.0ms)이고 스케줄러 깨어남
-/// 지연이 1.3ms 라 커밋의 70% 가 `flush_before_render` 로 선취된다.
-///
-/// ★그리고 커밋 위상을 정하는 것은 `CommitAlign` 이 아니라 `DwmAlign` 이다★
-/// (log_ani_debug_06/15). 커밋의 52~76% 가 `before_render` 에서, 즉 **틱 시점**에 나가므로
-/// 실측 법칙은 이렇다:
-///
-/// ```text
-///   커밋 위상 ~= DwmAlign + 13%        (13% ~= begin_frame 오버헤드 2.1ms)
-///   DwmAlign  8 -> 21%    14 -> 27%    30 -> 43%
-/// ```
-///
-/// 네 구성 전부 맞는다. 그 위상이 DWM 인테이크 마감(위상 38~42%)을 넘는 순간 저더가
-/// 터진다 -- `emit_commitcycle` 주석의 표.
-///
-/// ★`CommitAlign == DwmAlign` 은 특수하다.★ 틱이 정확히 목표점 위라 `next_grid_point` 가
-/// `ahead = 한 주기`를 주고, 마감이 곧 다음 틱이 된다. 그러면 렌더 예산은 주기 전체(최대)인
-/// 동시에 커밋은 다음 틱의 `before_render` 에서 나가 위상이 가장 이르다 -- 예산과 위상이
-/// 상충하지 않는 유일한 자리다. 8/8 에서 dup 0 이 나온 것이 그 자리다(1 런, 확인 필요).
-///
-/// ★위상 법칙과 저더 곡선 -- 6 구성 확정★(2026-10-23, log_ani_debug_06/16, 각 120s x 3).
-///
-/// ```text
-///   Dwm/Com   커밋 위상 p50(p95)   dup(런별)            런평균
-///     0 / 0      13.2 (17.3)       2, 18, 4                 8
-///     8 / 8      20.8 (26.6)       2, 15, 2                 6
-///    14 / 8      27   (34.1)       49, 51, 29              43   <- 06/14 기준선
-///    22 / 8      33.9 (40.3)       265, 281, 407          318
-///    22 / 22     34.9 (40.8)       452, 417, 462          444
-///    50 / 50     62.7 (68.4)       1596, 2695            2146
-/// ```
-///
-/// ★위상 13% -> 63% 에서 dup 이 6 -> 2146, 340 배다. 단조이고 예외가 없다.★ 위 법칙
-/// (`위상 ~= DwmAlign + 13%`)의 오차는 다섯 구성 전부 1.1 포인트 이내다.
-///
-/// 문턱은 30% 대 초중반이고 **분포의 꼬리가 중앙값보다 먼저 닿는다** -- 기준선 14/8 은
-/// 중앙값 27% 로 평평해 보이지만 이미 경사 위에 있어서, 8 포인트만 뒤로 가면(22) dup 이
-/// 7 배가 된다. ★그 민감도가 이 추적 내내 "원래 드물던 고장이 10 배로" 보이던 것의 정체다.★
-///
-/// ★`8/8` 이 `0/0` 보다 낫다.★ dup 은 같은데(2/15/2 대 2/18/4) `0/0` 은 위상 p05 가 2.0% 라
-/// 주기 경계에 붙어 있다 -- 흔들리면 직전 주기로 넘어간다. `8/8` 은 p05 10.4% 로 10 포인트
-/// 떨어져 있다.
-///
-/// ★스케줄러는 더 이상 쓸모가 없다★ -- `CommitAlign == DwmAlign` 인 모든 구성에서 스케줄러
-/// 몫이 24~25% 로 고정이고(마감이 곧 다음 틱이라 `before_render` 가 다 한다), 같은 위상에서
-/// 스케줄러를 더 쓴 쪽이 낫지도 않다(22/8 스케줄러 42% dup 318 대 22/22 스케줄러 24% dup
-/// 444 -- 차이는 위상 1 포인트로 설명된다). 06/15 에서 스케줄러 몫을 48%/70% 로 밀었을 때는
-/// 저더가 터졌다. 이유는 시계다: 틱은 고해상도 sleep 을 쓰는 페이싱 스레드가 정확히 찍고,
-/// 스케줄러는 condvar 로 1.0~3.8ms 늦게 깨며 산포가 크다.
-///
-/// ★아직 모르는 것 -- "고쳤다" 가 아니라 "비껴갔다" 일 수 있다.★ `8/8` 의 dup 2/15/2 는 회귀
-/// ***이전*** 기준선(`cba6e697388`)의 3/11 과 같은 범위인데, 그 옛 기준선도 `14/8` 로 돌았고
-/// 거기서 3~11 이었다. 지금 코드의 `14/8` 은 43 이다 -- ***같은 위상에서 6 배 차이가 난다.***
-/// 위상만으로는 회귀가 설명되지 않는다. `8/8` 은 곡선의 평평한 바닥으로 동작점을 옮겨 회귀의
-/// 효과를 안 보이게 만든 것이고, 무엇이 분포를 나쁘게 만들었는지는 여전히 열려 있다. 옛
-/// 엔진에는 `COMMITCYCLE`/`BINDOPEN` 이 없어 그 비교는 로그로 불가능하다.
-///
-/// ★로그 함정★ -- `log_ani_debug_06/16` 의 `dwmalign_92_commitalign_92_01.err.log` 는 이름과
-/// 달리 `gfx_present_align_dwm_pct=50` 으로 돌았다(파일 안의 pref 줄과 `console.txt` 로 확인,
-/// 92 로 돈 런은 없다). 50/50 의 두 번째 런이다. 파일 이름을 믿지 말 것.
-pub(crate) fn commit_slack_pct(commit_pct: u64, tick_pct: u64) -> u64 {
-    if commit_pct == tick_pct {
-        return 100;
-    }
-    (commit_pct + 100 - tick_pct) % 100
-}
-
-/// ★`tick` 직후의 첫 `pct%` 격자점.★ 순수 함수 -- 시계도 COM 도 만지지 않는다.
-///
-/// `vblank`/`period` 는 `DwmGetCompositionTimingInfo` 가 준 **공통** 합성 격자이고, `pct` 는
-/// 주기 안에서 겨냥할 백분율이다. 돌려주는 것은 그 격자점의 절대 QPC 다.
-///
-/// ★"직후" 는 엄격하다.★ `tick` 이 정확히 목표점 위에 있으면 한 주기 뒤를 돌려준다 -- 틱
-/// 시점에는 그 패스가 아직 돌지도 않았으므로, 그 자리에서 커밋하면 **이전 프레임**을
-/// 내보내게 된다.
-///
-/// `vblank` 는 드라이버에 따라 `tick` 보다 과거일 수도 미래일 수도 있다. 나머지 연산을 두 번
-/// 걸어 어느 쪽이든 격자 위의 같은 점으로 접는다(`snap_to_dwm_grid_at` 과 같은 이유).
-///
-/// 돌려주는 값은 `tick` 으로부터 **최대 한 주기** 뒤다. 그보다 멀면 다음 스케줄이 먼저
-/// 도착해 `commit_scheduler::upsert` 가 마감을 계속 뒤로 밀고, 한 번 걸린 타일은 영원히
-/// 걸린다(`log_ani_debug_02/03` 에서 DISPLAY22 가 초당 60 건 중 8 건만 커밋했다).
-pub(crate) fn next_grid_point(tick: u64, vblank: u64, period: u64, pct: u64) -> Option<u64> {
-    if period == 0 {
-        return None;
-    }
-    // `period` 는 한 주기의 QPC 틱 수(10MHz 에서 ~1.7e5)이고 `pct <= 99` 이므로 u64 에서
-    // 넘치지 않는다.
-    let base = vblank.wrapping_add(period * pct / 100);
-    let period_i = period as i128;
-    let delta = tick as i128 - base as i128;
-    let ahead = period_i - (((delta % period_i) + period_i) % period_i);
-    Some(tick.wrapping_add(ahead as u64))
-}
-
-/// 디바이스 -> 그 디바이스의 커밋을 **스케줄한** 패스의 틱(QPC).
-///
-/// ★`TICK_QPC` 하나로는 기준이 뒤집힌다.★ 커밋이 마감에 맞춰 나가는데 그 마감이 다음 틱
-/// 바로 앞이면(`CommitAlign` 이 `DwmAlign` 보다 조금 앞설 때, slack 96% 같은 경우) 커밋이
-/// 다음 틱 직후로 밀리는 일이 상시로 생긴다. 그러면 `TICK_QPC` 는 이미 다음 틱이고, 같은
-/// 사건이 16.6ms(이전 틱 기준) 또는 0.15ms(다음 틱 기준)로 찍힌다 -- 실측에서 `t2c` 가
-/// 정확히 그 두 봉우리였다(log_ani_debug_03/12). 분포가 두 조각으로 갈라져 위상 지표로
-/// 쓸 수 없게 된다.
-///
-/// 그래서 **스케줄한 순간의** 틱을 디바이스마다 남겨 두고 커밋 때 그것을 쓴다. 즉시 커밋
-/// 경로(스케줄러 미사용, 격자 폴백, `flush_before_render`)는 패스 안에서 동기적으로 나가므로
-/// `TICK_QPC` 가 맞다 -- 그쪽은 이 맵에 항목이 없고 예전처럼 동작한다.
-static COMMIT_TICK: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
-
-/// 이 디바이스의 커밋을 이 틱의 패스가 걸었다. 스케줄 직전에 부른다.
-pub(crate) fn note_scheduled_for_tick(device: usize, tick: u64) {
-    if let Ok(mut guard) = COMMIT_TICK.lock() {
-        guard.get_or_insert_with(HashMap::new).insert(device, tick);
-    }
-}
-
 /// 디바이스 -> 이번 창의 `틱 -> 커밋` 표본(ms). `TICKCOMMIT` 이 초당 비운다.
 static TICK_TO_COMMIT: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
 
 fn note_tick_to_commit(device: usize, commit_qpc: u64) {
-    // ★스케줄한 패스의 틱을 쓴다★ -- 없으면(즉시 커밋 경로) 현재 틱이 맞다.
-    let scheduled = COMMIT_TICK
-        .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().and_then(|map| map.get(&device).copied()));
-    let tick = scheduled.unwrap_or_else(|| TICK_QPC.load(Ordering::Relaxed));
+    // ★2026-10-23 부터 이 값의 뜻이 바뀌었다 -- 이제 ***커밋 위상 오프셋***이다.★
+    //
+    // 예전에는 커밋이 패스 끝의 마감에 걸려 나갔으므로 "어느 패스가 건 커밋인가" 를 따로
+    // 들고 다녀야 했다(`COMMIT_TICK` 맵). 지금 커밋은 **틱 머리**에서 나가므로 그 모호함이
+    // 없다 -- 현재 틱이 곧 그 커밋의 기준이고, 둘의 차는 "틱이 난 뒤 커밋이 실제로 나가기까지
+    // 걸린 시간" 이다. ★그것이 곧 커밋이 합성 주기의 어디에 떨어지는지를 정한다★
+    // (`commit_guard` 모듈 주석의 위상 법칙). 작을수록 좋고, 커지면 저더가 따라 온다.
+    let tick = TICK_QPC.load(Ordering::Relaxed);
     // 기동 직후에는 아직 틱이 없다. 그리고 커밋이 틱보다 앞설 수는 없으므로, 그런 표본은
     // 틱을 놓친 것이니 세지 않는다 -- 음수를 0 으로 접으면 분포가 조용히 거짓말을 한다.
     if tick == 0 || commit_qpc <= tick {
@@ -1278,7 +1133,7 @@ fn pass_before(start_qpc: u64, freq: u64) -> Option<(PassMark, Vec<f64>)> {
 ///
 /// 읽는 법: `spread`(p95-p05)를 같은 창의 `DCOMPSTAT commit_lead_ms` 의 산포와 견준다.
 /// 두 값이 같은 크기면 커밋 위상의 흔들림은 **패스 길이**에서 오는 것이고, 그러면 커밋을
-/// 패스 끝에서 떼어낼(= `commit_scheduler` 를 공통 격자에 겨름) 이유가 선다. 훨씬 작으면
+/// 패스 끝에서 떼어낼 이유가 선다. 훨씬 작으면
 /// 원인은 그 앞 구간(페이싱 깨어남)이고, `WALLCLOCK jit_ms` 가 그것을 받는다.
 ///
 /// `late` 는 커밋이 반 주기(P/2)보다 늦게 나간 횟수다 -- 그 프레임은 겨냥한 위상에서
@@ -1918,6 +1773,7 @@ fn probe_loop() {
             emit_commitgap();
             emit_commitcycle();
             emit_bindopen();
+            crate::commit_guard::emit_lockwait();
             emit_frameid();
             emit_dcompstat();
         }
@@ -2246,7 +2102,7 @@ fn is_primary(monitor: usize) -> bool {
 }
 
 /// ★격자에 대한 독립적인 검산이다.★ `OUTCOMMIT` 의 위상은 마감을 정한 격자로 다시 접은
-/// 값이라 격자가 틀려도 목표치를 가리킨다(`commit_scheduler::scheduler_loop` 주석). 이 줄은
+/// 값이라 격자가 틀려도 목표치를 가리킨다(아래 `COMMITCYCLE` 주석). 이 줄은
 /// 커밋과 무관하게 프로브가 직접 잰 값이고, 정렬 pref 가 꺼져 있어도 나오므로 기준선 런에서
 /// 출력 간 vblank 확산 — 이 설계 전체가 딛고 선 그 측정 — 을 볼 수 있는 유일한 곳이다.
 ///
@@ -2403,7 +2259,7 @@ unsafe fn enumerate_outputs() -> Enumeration {
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_slack_pct, compositions_advanced, composition_target, next_grid_point,
+        compositions_advanced, composition_target,
         period_from_pair,
     };
 
@@ -2568,115 +2424,4 @@ mod tests {
         assert!(!measured);
     }
 
-    /// 10MHz QPC 에서 60Hz 한 주기. 실기 값(`COMPWALK period_ms=16.667`)과 같은 규모다.
-    const P: u64 = 166_667;
-    /// 임의의 vblank 기준점. 절대값은 결과에 영향이 없어야 한다.
-    const V: u64 = 1_000_000_000;
-
-    /// 목표점 바로 앞의 틱은 **그** 격자점을 겨냥한다.
-    #[test]
-    fn a_tick_just_before_the_target_aims_at_it() {
-        let base = V + P * 25 / 100;
-        assert_eq!(next_grid_point(base - 1, V, P, 25), Some(base));
-    }
-
-    /// 목표점을 막 지난 틱은 **다음** 격자점을 겨냥한다.
-    #[test]
-    fn a_tick_just_past_the_target_aims_at_the_next_one() {
-        let base = V + P * 25 / 100;
-        assert_eq!(next_grid_point(base + 1, V, P, 25), Some(base + P));
-    }
-
-    /// ★목표점 정확히 위의 틱은 한 주기 뒤다 -- 0 이 아니다.★
-    ///
-    /// 틱 시점에는 그 패스가 아직 돌지도 않았다. 그 자리에서 커밋하면 이전 프레임을 내보낸다.
-    #[test]
-    fn a_tick_exactly_on_the_target_waits_a_full_period() {
-        let base = V + P * 25 / 100;
-        assert_eq!(next_grid_point(base, V, P, 25), Some(base + P));
-    }
-
-    /// 몇 주기가 지났든 바로 다음 격자점 하나만 건너뛴다.
-    #[test]
-    fn many_periods_later_still_lands_on_the_very_next_point() {
-        let base = V + P * 25 / 100;
-        assert_eq!(
-            next_grid_point(base + 3 * P + 5, V, P, 25),
-            Some(base + 4 * P)
-        );
-    }
-
-    /// ★`vblank` 가 틱보다 **미래**일 수 있다.★ (Review Focus 1)
-    ///
-    /// `qpcVBlank` 는 드라이버에 따라 직전일 수도 다음일 수도 된다. 음수 나머지를 접지 않으면
-    /// 마감이 과거로 나오고, 그러면 매 프레임 즉시 커밋이 되어 기능이 켜진 채 아무 일도 안 한다.
-    #[test]
-    fn a_vblank_in_the_future_of_the_tick_still_folds_correctly() {
-        // 틱이 vblank 보다 반 주기 **앞**에 있다. pct=0 이므로 목표점은 vblank 격자 자체다.
-        assert_eq!(next_grid_point(V - P / 2, V, P, 0), Some(V));
-        // 두 주기도 더 앞이어도 같은 격자 위의 다음 점으로 간다.
-        assert_eq!(next_grid_point(V - 2 * P - 7, V, P, 0), Some(V - 2 * P));
-    }
-
-    /// `pct` 경계. (Review Focus 3)
-    #[test]
-    fn pct_boundaries_land_on_the_right_point() {
-        // pct = 0 -> vblank 격자점 자체.
-        assert_eq!(next_grid_point(V - 1, V, P, 0), Some(V));
-        // pct = 99 -> 주기의 99% 지점.
-        let base99 = V + P * 99 / 100;
-        assert_eq!(next_grid_point(base99 - 1, V, P, 99), Some(base99));
-    }
-
-    /// ★`period == 0` 에 패닉하지 않는다.★ (Review Focus 4)
-    #[test]
-    fn a_zero_period_yields_none_instead_of_dividing_by_zero() {
-        assert_eq!(next_grid_point(V, V, 0, 25), None);
-    }
-
-    /// ★주사율이 바뀌면 다음 호출부터 새 주기를 따른다.★ (Review Focus 5)
-    ///
-    /// 격자는 패스마다 다시 조회되므로 이 함수는 상태를 들지 않아야 한다. 같은 틱에 다른
-    /// 주기를 주면 다른 답이 나와야 한다 -- 같으면 어딘가에 옛 주기가 남은 것이다.
-    #[test]
-    fn a_changed_period_is_followed_immediately() {
-        const P75: u64 = 133_333; // 75Hz
-        let tick = V + 1_000;
-        let at60 = next_grid_point(tick, V, P, 50).expect("60Hz");
-        let at75 = next_grid_point(tick, V, P75, 50).expect("75Hz");
-        assert_ne!(at60, at75);
-        assert_eq!(at60, V + P * 50 / 100);
-        assert_eq!(at75, V + P75 * 50 / 100);
-    }
-
-    /// ★커밋이 틱보다 앞에 있는 좌표는 여유가 가장 **많다** -- 가장 적지 않다.★
-    ///
-    /// 부호 없는 차(`commit - tick`)로 재면 이 구간이 0 으로 바닥을 치고, 경고가 진실의
-    /// 반대를 말한다. 설계 문서 §3 은 `CommitAlign < DwmAlign` 을 적법이라고 적어 둔다 --
-    /// 그런 설정에 경고를 내면 운용자는 줄을 무시하게 되고, 정말 위험한 구간에서도 무시한다.
-    #[test]
-    fn a_commit_phase_before_the_tick_has_the_most_slack() {
-        // DwmAlign 8, CommitAlign 0 -> 다음 주기의 0% 지점이므로 여유가 92% 다.
-        assert_eq!(commit_slack_pct(0, 8), 92);
-        // 훨씬 앞에 나더라도 마찬가지.
-        assert_eq!(commit_slack_pct(1, 50), 51);
-    }
-
-    /// ★똑같은 위상이면 한 주기 전지다 -- 0 이 아니다.★
-    ///
-    /// `next_grid_point` 의 "직후는 엄감하다" 와 같은 사심이다. 그러므로 여유는 최대다.
-    #[test]
-    fn the_same_phase_means_a_full_period_of_slack() {
-        assert_eq!(commit_slack_pct(8, 8), 100);
-        assert_eq!(commit_slack_pct(0, 0), 100);
-    }
-
-    /// 정상 사용 구간과 경고 경계(15%).
-    #[test]
-    fn slack_is_the_forward_distance_and_the_warning_edge_is_fifteen() {
-        assert_eq!(commit_slack_pct(25, 8), 17); // 설계 문서의 예
-        assert_eq!(commit_slack_pct(23, 8), 15); // 경계 -- 경고 없음
-        assert_eq!(commit_slack_pct(22, 8), 14); // 경계 아래 -- 경고
-        assert_eq!(commit_slack_pct(99, 0), 99);
-    }
 }

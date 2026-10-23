@@ -114,7 +114,7 @@ mod comp_stats;
 #[cfg(windows)]
 mod output_grid;
 #[cfg(windows)]
-mod commit_scheduler;
+mod commit_guard;
 /// raw D3D11 YUV→RGBA 변환 패스(VideoConvertPass, 비디오 WR 탈출 사이클 Task 4).
 /// dcomp_compositor(Task 5)가 external compositor surface 경로에서 소비한다.
 #[cfg(windows)]

@@ -236,6 +236,13 @@ pub struct Paint {
     /// 읽힌다(둘을 섞어 두면 "이 창에 몇 개를 걷었나" 를 답할 수 없다).
     keep_previous_released_in_window: Cell<u64>,
 
+    /// ★다음 틱에 커밋할 DComp 디바이스.★ 패스 끝에 `flush_deferred_dcomp_commits` 가
+    /// 거두고, 다음 틱 머리에 `commit_deferred_at_tick` 이 비운다.
+    ///
+    /// 셸이 들고 있는 이유는 그쪽 주석에 있다 -- 렌더를 건너뛴 타일(keep-previous)도
+    /// 커밋이 묶이지 않게 하려면 커밋 시점이 `begin_frame` 과 무관해야 한다.
+    deferred_dcomp_commits: RefCell<Vec<usize>>,
+
     /// ★수요 구동 틱의 진입 수와 그중 생산한 수.★ 현재 1 초 창 / 창 시작. 2026-10-22.
     ///
     /// ***왜 재는가*** -- `Paint::on_demand_wall_tick` 은 이벤트 루프 스핀마다 불리므로
@@ -1595,6 +1602,7 @@ impl Paint {
             production_suspended_total: Default::default(),
             production_suspended_last_report: Default::default(),
             keep_previous_released_in_window: Default::default(),
+            deferred_dcomp_commits: RefCell::new(Vec::new()),
             demand_tick_edges_in_window: Default::default(),
             demand_tick_produced_in_window: Default::default(),
             demand_tick_window_start: Default::default(),
@@ -3674,85 +3682,10 @@ impl Paint {
         });
     }
 
-    /// ★이 패스의 커밋이 떨어져야 할 격자점(절대 QPC).★
+    /// 이 디바이스들을 **지금** 커밋한다. 병렬 커밋 설정을 그대로 따른다 -- 네 디바이스가
+    /// 겹쳐 나가야 네 타일이 같은 DWM 합성에 실린다.
     ///
-    /// 커밋은 지금까지 렌더 패스의 **끝**에서 나갔다. `-DwmAlign` 이 고정하는 것은 패스의
-    /// **시작**(틱)이므로 커밋 시각 = `틱 + 패스 길이` 였고, 커밋 위상이 패스 길이를 그대로
-    /// 물려받았다. 그 산포가 저더의 두 증상을 모두 만든다 -- 큰 탈선은 합성 마감을 스치고
-    /// (`MISSEVENT nc=1`), 그 흔들림이 커밋 간격을 흔들어 합성 경계를 넘나든다(`nc=0`).
-    /// 설계 문서 §21~27 과 `2026-10-06-commit-on-composition-grid-design.md` §1.
-    ///
-    /// ★타일과 무관하다 -- 패스당 하나다.★ DWM 은 네 타일을 하나의 합성 패스에서 함께
-    /// 올리므로(네 디바이스의 `lastFrameTime` 이 동일하다) 맞출 격자도 하나다. 예전
-    /// `deadline_for_monitor` 는 출력별 격자에 맞췄고, 그것이 B1 이 효과를 내지 못한 이유다.
-    ///
-    /// 묵은 격자 검사가 없는 것이 맞다. `grid_for_monitor` 는 프로브 스레드의 캐시라 최대
-    /// ~100ms 낡을 수 있어 검사가 필요했지만, `composition_grid()` 는 매번 조회하는 시스템
-    /// 콜이라 묵을 수가 없다. 들고 가면 영원히 거짓인 분기가 남는다.
-    #[cfg(windows)]
-    fn commit_deadline() -> Option<u64> {
-        // 캐시된 값이다 -- `pref!` 는 RwLock 획득이고 이 함수는 패스마다 돌다
-        // (`commit_scheduler::COMMIT_ALIGN_PCT` 주석).
-        let pct = (*crate::commit_scheduler::COMMIT_ALIGN_PCT)?;
-        let (vblank, period) = crate::dcomp_compositor::composition_grid()?;
-        let tick = crate::output_grid::tick_qpc()?;
-        crate::output_grid::next_grid_point(tick, vblank, period, pct)
-    }
-
-    /// 마감을 못 구해 즉시 커밋으로 떨어진 타일 수를 세고, 초당 한 번 알린다.
-    ///
-    /// ★원인이 셋이다.★ 마감은 pref·공통 격자·틱 셋을 모두 갖춰야 나오므로, 폴백은 그중 아무
-    /// 하나가 비었다는 뜻이다 -- (1) `composition_grid()` 실패(DWM 합성 꺼짐 등), (2) `tick_qpc()`
-    /// 가 `None`(셸이 `servo::note_present_tick()` 을 부르지 않는다), (3) 그 타일의 `monitor` 가
-    /// `None`. ★어느 것인지 말하지 않으면 엉뚱한 곳을 보게 된다★ -- 예전 이 줄은 "출력 격자" 를
-    /// 지목하고 `[outgrid]`/`OUTPHASE` 를 보라고 했는데, 지금 마감은 그 프로브 격자를 전혀 읽지
-    /// 않으므로 그 로그는 멀쩡해 보인다.
-    ///
-    /// ★once-warn 이 아니라 지속 카운터다.★ 기동 지후 한두 프레임은 정상이지만, 셸이 틱을 안
-    /// 찍는 구성(원인 (2))이면 **영구**가 된다. 그 둘은 "한 번 났다" 로는 구분되지 않고, 초당
-    /// 카운트가 계속 찍히느냐로만 구분된다. 조용히 폴백하면 정렬이 아무 일도 안 하는 채로 벽이
-    /// 계속 돌고 아무도 모른다.
-    #[cfg(windows)]
-    fn note_grid_fallback(count: u64) {
-        static FALLBACKS: AtomicU64 = AtomicU64::new(0);
-        static LAST_WARN: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-        FALLBACKS.fetch_add(count, Ordering::Relaxed);
-        let Ok(mut last) = LAST_WARN.lock() else {
-            return;
-        };
-        let now = Instant::now();
-        let due = match *last {
-            Some(at) => now.duration_since(at) >= Duration::from_secs(1),
-            None => true,
-        };
-        if !due {
-            return;
-        }
-        *last = Some(now);
-        let taken = FALLBACKS.swap(0, Ordering::Relaxed);
-        // 어느 입력이 비었는지를 줄에 집어 넣는다. 세 원인은 서로 전혀 다른 곳을 가리킨다.
-        let grid = crate::dcomp_compositor::composition_grid().is_some();
-        let tick = crate::output_grid::tick_qpc().is_some();
-        warn!(
-            "[commitsched] 마감을 못 구해 즉시 커밋으로 폴백한 타일 {taken} 건/초 -- \
-             정렬이 이 타일들에는 걸리지 않는다. dwm_grid={grid} tick={tick} -- \
-             grid=false 는 DWM 합성이 꺼졌다는 뜻이고, tick=false 는 셸이 \
-             servo::note_present_tick() 을 부르지 않는다는 뜻이다(그러면 이 기능은 \
-             아무 일도 하지 않는다). 둘 다 true 면 그 타일의 monitor 를 못 구한 것이다"
-        );
-    }
-
-    /// 격자 폴백 타일들을 **지금** 커밋한다. 병렬 커밋 설정을 그대로 따른다 -- 이 경로는
-    /// 정의상 "정렬이 안 걸린 타일" 이므로 정렬이 꺼져 있을 때와 같게 나가야 한다.
-    ///
-    /// ★그래도 디바이스 가드가 걸린다.★ 이 폴백이 나오는 바로 그 상황(핫플러그 직후
-    /// `monitor_for_hwnd` 가 새 HMONITOR 를 주는데 `grid_for_monitor` 가 아직 못 채웠다)에서,
-    /// 옛 모니터를 향해 이전에 건 스케줄이 이 디바이스에 대해 아직 큐에 남아 있을 수 있다
-    /// (최대 두 주기). `schedule()` 은 upsert 라 이 경로가 다시 `schedule()` 을 부르지 않는 한
-    /// 그 옛 항목을 밀어내지 못한다 -- 즉 이 즉시 커밋은 스케줄러 스레드와 이 디바이스를 두고
-    /// 겹칠 수 있다.
-    ///
-    /// 가드를 여기서 직접 잡지 않는 것에 주의하라: `commit_device_ptr` 이 정문이고 그 안에서
+    /// 가드를 여기서 직접 잡지 않는 것에 주의하라: `commit_device_at_tick` 이 정문이고 그 안에서
     /// 잡는다(`dcomp_compositor::raw_commit` 주석). 커밋 지점마다 가드를 따로 챙기는 방식이
     /// 세 번 새는 바람에 그 책임을 한 곳으로 옮겼다 -- 이 함수가 할 일은 "지금 낸다" 와
     /// "병렬 설정을 따른다" 뿐이다.
@@ -3762,149 +3695,39 @@ impl Paint {
             std::thread::scope(|scope| {
                 for device in devices {
                     scope.spawn(move || {
-                        crate::dcomp_compositor::commit_device_ptr(device);
+                        crate::dcomp_compositor::commit_device_at_tick(device);
                     });
                 }
             });
             return;
         }
         for device in devices {
-            crate::dcomp_compositor::commit_device_ptr(device);
+            crate::dcomp_compositor::commit_device_at_tick(device);
         }
     }
 
-    /// ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — pref 는 `gfx_dcomp_commit_in_end_frame`(기본 false = 미룸)이다. 옛 이름으로는 아무것도 안 잡힌다.
-    /// 미뤄 둔 DComp Commit 을 모든 painter 에서 흘린다(`gfx_dcomp_defer_commit`).
+    /// ★이 패스가 미뤄 둔 Commit 을 거둬 둔다 -- 내지는 않는다.★
     ///
-    /// 셸이 타일 루프를 마친 뒤 한 번 부른다. 목적은 render→commit 을 네 번 번갈아 도는
-    /// 대신 렌더 넷을 먼저 몰고 Commit 넷을 몰아, Commit 의 대기가 서로 겹칠 수 있는지를
-    /// 스레드 없이 확인하는 것이다.
+    /// 셸이 타일 루프를 마친 뒤 부른다. 실제 `Commit()` 은 **다음 틱 머리**에서
+    /// [`Self::commit_deferred_at_tick`] 이 낸다.
+    ///
+    /// ★왜 여기서 내지 않는가★(2026-10-23) -- 패스 끝은 틱 + 패스 길이라 커밋 위상이 패스
+    /// 길이를 그대로 물려받는다. 실측 패스는 p50 5.8ms / p95 10.4ms 라 그 위상이 주기의
+    /// 35~62% 에 흩어지고, 그 구간은 ***DWM 인테이크 마감 너머***다 -- 거기서 내면 저더가
+    /// 수십 배가 된다(log_ani_debug_06/15·16, `output_grid::commit_slack_pct` 주석의 표).
+    /// 틱은 페이싱 스레드가 고해상도 타이머로 찍으므로 위상이 흔들리지 않는다.
+    ///
+    /// ★왜 거둬 두는가 -- `begin_frame` 에 맡기면 안 되는 이유★ 커밋을 그 타일의 다음
+    /// `begin_frame` 에서 내면, ***그 패스에 렌더하지 않은 타일***은 커밋을 붙든다.
+    /// keep-previous 는 셸이 그 타일의 렌더를 통째로 건너뛰는 지시이므로(`paint.rs` 의
+    /// `keep_previous_logical_frame`) `begin_frame` 이 오지 않고, 그 타일의 그림은 다음에
+    /// 렌더할 때까지 화면에 닿지 않는다. 셸이 들고 있다가 틱에서 내면 렌더 여부와 무관하다.
+    ///
+    /// 디바이스 포인터를 한 패스 들고 있는 셈인데, painter 는 타일마다 하나씩 기동 때 만들어
+    /// 프로세스 내내 살고 벽은 타일 수가 고정이다. 들고 있는 시간도 한 틱을 넘지 않는다.
     pub fn flush_deferred_dcomp_commits(&self) {
-        // ★네 타일을 **하나의** 공통 합성 격자에 맞춘다.★ DWM 은 네 타일을 한 합성 패스에서
-        // 함께 올린다(네 디바이스의 `lastFrameTime` 이 동일하다). 그러므로 맞출 격자도 하나고,
-        // 마감도 패스당 하나다.
-        //
-        // ★예전에는 여기에 그 반대가 적혀 있었다★ -- "타일마다 자기 출력의 격자에 맞춘다, 네
-        // 모니터의 vblank 가 주기의 0.67 에 흩어져 있으니 교집합이 공집합이다". 그것이 B1 의
-        // 생각이었고, 그렇게 해서 **듣지 않았다**. 출력별 vblank 는 맞출 대상이 아니다 -- 맞출
-        // 것은 DWM 의 합성 시점이고 그것은 하나다. 출력별 위상차는 여전히 있지만 그것은 이
-        // 함수가 아니라 B2(`gfx_sample_lead_periods`)의 일이다.
-        // 설계 문서 §21~27 과 `2026-10-06-commit-on-composition-grid-design.md`.
-        //
-        // 여기서는 **거는 것만** 한다. 실제 Commit 은 스케줄러 스레드가 그 시각에 낸다.
-        // 이 함수는 메인(또는 스레드된 painter 로의 왕복)에서 도므로 여기서 기다리면
-        // 그대로 패스가 길어진다.
         #[cfg(windows)]
-        if crate::commit_scheduler::COMMIT_ALIGN_PCT.is_some() {
-            // ★프로브는 이 기능이 켜지면 뜬다.★ 단, 마감은 이제 프로브의 격자를 전혀 읽지
-            // 않는다(공통 격자만 쓴다). 그래도 띄우는 이유는 `OUTCOMMIT`/`OUTPHASE` 의 위상
-            // 표본이 거기서 나오기 때문이다 -- 그것이 위상 법칙의 계측이다.
-            //
-            // 아래는 그 함수가 전에 다른 이유로 필요했던 사정이다(지금은 해당 없다): 예전에는 유일한 호출처가 `note_dwm_phase`
-            // 안이었고 그 함수는 `SERVO_DCOMP_BIND_PROF` 뒤에서 시작한다 -- 즉 진단 플래그
-            // 없이 정렬 pref 만 준 운영 구성에서는 격자가 영영 비어 전 타일이 매
-            // 프레임 즉시 커밋 폴백을 탔고, 그 사실을 알리는 로그조차 없었다. `start_probe`
-            // 는 `Once` 라 여러 곳에서 불러도 스레드는 하나다.
-            crate::output_grid::start_probe();
-            // ★마감이 패스보다 먼저 오면 기능이 켜진 채 아무 일도 하지 않는다.★ 거의 매
-            // 프레임 즉시 커밋으로 떨어지는데, 로그에는 정렬이 켜진 것으로 보인다.
-            //
-            // 15% 는 프로브의 패스 p95(주기의 13.4%)에 여유를 조금 준 값이다. 패스 p95 는
-            // 기동 시점에 알 수 없으므로 상수로 둔다. 막지는 않는다 -- 스윈에서 일부러 좁게
-            // 주는 경우가 있고, 그때 무슨 일이 생기는지 보는 것이 측정의 일부다.
-            {
-                static WARNED_GAP: std::sync::Once = std::sync::Once::new();
-                WARNED_GAP.call_once(|| {
-                    let Some(commit) = *crate::commit_scheduler::COMMIT_ALIGN_PCT else {
-                        return;
-                    };
-                    let tick = servo_config::pref!(gfx_present_align_dwm_pct);
-                    // `-DwmAlign` 이 꺼지면 틱에 고정 위상이 없으니 보할 것이 없다.
-                    if !(0..=99).contains(&tick) {
-                        return;
-                    }
-                    let slack = crate::output_grid::commit_slack_pct(commit, tick as u64);
-                    if slack < 15 {
-                        warn!(
-                            "[commitsched] gfx_present_align_commit_pct={commit} 은 \
-                             gfx_present_align_dwm_pct={tick} 에서 주기의 {slack}% 뿐 떨어져 \
-                             있다 -- 마감이 패스보다 먼저 와서 거의 매 프레임 즉시 \
-                             커밋으로 떨어질 수 있다(프로브의 패스 p95 가 주기의 13.4%). \
-                             OUTCOMMIT 의 slip_us 로 확인할 것"
-                        );
-                    }
-                });
-            }
-            // ★예전에는 여기서 "무시한다" 고 경고했다.★ B1 때는 커밋 시각이 타일마다
-            // 달라 목적이 겹친다고 봤는데, 지금은 네 타일이 **같은** 마감을 받으므로 겹치지
-            // 않는다 -- 넷을 동시에 내는 것이 바로 이 설계가 원하는 것이다. 그래서 이 pref 는
-            // 이제 스케줄 경로에서도 **적용된다**(`commit_scheduler::PARALLEL_COMMIT`).
-            //
-            // 끄면 커밋이 순차로 나가고, 2·3·4 번째 타일의 slip 에 앞 타일들의 `Commit()`
-            // 시간이 들어간다(실측 상수 ~360µs). A/B 를 재려면 그쪽으로 끄면 된다.
-            if !servo_config::pref!(gfx_dcomp_parallel_commit) {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    warn!(
-                        "[commitsched] gfx_present_align_commit_pct 가 켜졌는데 \
-                         gfx_dcomp_parallel_commit 이 꺼져 있다 -- 네 커밋이 순차로 나가 \
-                         2·3·4 번째 타일이 앞 타일들의 Commit 시간만큼 늦는다(실측 ~360µs). \
-                         OUTCOMMIT 의 slip_us_avg 로 확인할 것"
-                    );
-                });
-            }
-            // 격자를 못 구한 타일들. ★모아서 기존 병렬 경로로 흘린다★ -- 예전에는 여기서
-            // 타일마다 그 자리에서 커밋했는데, 그러면 병렬 커밋이 켜져 있어도 네 커밋이
-            // 호출 스레드에서 순차로 나가 4×2.44 = 9.8ms 를 물었다. 폴백이 기능 off 보다
-            // 나빠지는 셈이고, "폴백 = 오늘 동작" 이라는 전제가 깨진다.
-            let mut fallback: Vec<usize> = Vec::new();
-            // ★마감은 패스당 하나다.★ 공통 격자에서 나오므로 타일마다 다시 셀 것이 없고,
-            // 네 타일이 **같은** 마감을 받아야 한 합성에 함께 실린다. 루프 안에서 재면
-            // 타일마다 조회 시각이 달라 미세하게 다른 답이 나온다.
-            let deadline = Self::commit_deadline();
-            for painter_id in self.painter_ids() {
-                let pending = self
-                    .with_painter(painter_id, |painter| {
-                        painter
-                            .take_pending_dcomp_commit()
-                            .map(|device| (device, painter.pending_dcomp_commit_monitor()))
-                    })
-                    .flatten();
-                let Some((device, monitor)) = pending else {
-                    continue;
-                };
-                // `monitor` 는 이제 마감 계산에 쓰이지 않는다 -- `OUTCOMMIT` 이 "어느 타일이
-                // 죽었나" 를 말할 수 있게 하는 기록용으로만 스케줄러에 넘긴다.
-                match (monitor, deadline) {
-                    (Some(monitor), Some(deadline)) => {
-                        // ★이 커밋이 어느 패스의 것인지 남긴다.★ 마감이 다음 틱 가까이에
-                        // 있으면 커밋이 그 틱을 넘어가고, 그러면 `TICK_QPC` 로는 기준이
-                        // 뒤집힌다(`output_grid::COMMIT_TICK` 주석).
-                        if let Some(tick) = crate::output_grid::tick_qpc() {
-                            crate::output_grid::note_scheduled_for_tick(device, tick);
-                        }
-                        crate::commit_scheduler::schedule(device, monitor, deadline)
-                    },
-                    _ => fallback.push(device),
-                }
-            }
-            if !fallback.is_empty() {
-                Self::note_grid_fallback(fallback.len() as u64);
-                Self::commit_now_guarded(fallback);
-            }
-            return;
-        }
-        // `gfx_dcomp_parallel_commit`: 넷을 동시에 건다.
-        //
-        // 왜: 정상상태 패스 15.4ms 중 Commit 이 4×2.44 = 9.8ms 이고, 60Hz 예산 16.67ms 에
-        // 여유가 1.3ms 뿐이라 한 번 넘기면 되먹임으로 42fps 에 눌러앉는다. Commit 은 대기이고
-        // 그 대기는 겹치므로(배치 실험 24.90→9.83ms) 동시에 걸면 9.8→~2.4ms 가 되어 여유가
-        // 8ms 로 벌어진다. DComp off 가 13.8ms 로 안 빠지는 그 함정을 같은 방식으로 피한다.
-        //
-        // 디바이스는 painter 마다 다르고, `scope` 가 join 을 보장하므로 이 호출이 돌아올 때
-        // 어떤 워커도 남아 있지 않다 — 즉 한 디바이스를 두 스레드가 동시에 만지는 일은 없다.
-        #[cfg(windows)]
-        if servo_config::pref!(gfx_dcomp_parallel_commit) {
+        {
             let pending: Vec<usize> = self
                 .painter_ids()
                 .into_iter()
@@ -3913,24 +3736,38 @@ impl Paint {
                         .flatten()
                 })
                 .collect();
-            if pending.len() > 1 {
-                std::thread::scope(|scope| {
-                    for device in pending {
-                        scope.spawn(move || crate::dcomp_compositor::commit_device_ptr(device));
-                    }
-                });
-                return;
-            }
-            // 하나 이하면 스레드를 띄울 값어치가 없다 — 인계받은 것을 여기서 부른다.
+            let mut deferred = self.deferred_dcomp_commits.borrow_mut();
             for device in pending {
-                crate::dcomp_compositor::commit_device_ptr(device);
+                // ★지난 틱이 내지 못하고 남긴 것이 있으면 같이 들고 간다.★ 버리면 그 타일의
+                // 그림이 영영 화면에 닿지 않는다. 같은 디바이스를 두 번 커밋할 이유는 없으므로
+                // 중복은 접는다 -- 한 번의 `Commit()` 이 그 디바이스의 트리 전체를 낸다.
+                if !deferred.contains(&device) {
+                    deferred.push(device);
+                }
             }
-            return;
-        }
-        for painter_id in self.painter_ids() {
-            self.with_painter(painter_id, |painter| painter.flush_deferred_dcomp_commit());
         }
     }
+
+    /// ★미뤄 둔 Commit 을 **틱 머리**에서 낸다.★ 셸이 틱 에지마다, 렌더 **앞에서** 부른다.
+    ///
+    /// 이것이 이 엔진의 유일한 정규 커밋 시점이다. 네 디바이스가 한 호출에 함께 나가므로 네
+    /// 타일이 같은 DWM 합성에 실린다 -- 그것이 벽의 이음매가 맞는 조건이다.
+    ///
+    /// 커밋 위상은 틱의 위상이고, 그것은 `-DwmAlign` 이 직접 정한다. 실측 법칙과 저더 곡선은
+    /// `output_grid::commit_slack_pct` 주석에 있다 -- ★주기의 30% 대 중반을 넘으면 저더가
+    /// 터진다.★
+    pub fn commit_deferred_at_tick(&self) {
+        #[cfg(windows)]
+        {
+            let devices: Vec<usize> =
+                std::mem::take(&mut *self.deferred_dcomp_commits.borrow_mut());
+            if devices.is_empty() {
+                return;
+            }
+            Self::commit_now_guarded(devices);
+        }
+    }
+
 
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {

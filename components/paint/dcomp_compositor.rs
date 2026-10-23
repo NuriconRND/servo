@@ -1436,7 +1436,7 @@ static PRESENT_SYNC_INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::ne
     raw
 });
 
-// `pub(crate)`: `commit_scheduler` 도 이 플래그로 위상 수집 자체를 게이트한다(한 소스,
+// `pub(crate)`: `commit_guard` 도 이 플래그로 수집 자체를 게이트한다(한 소스,
 // 두 번째 `LazyLock` 으로 같은 env 를 또 읽지 않는다) -- OUTCOMMIT Fix round 1, Ruling 15.
 pub(crate) static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     servo_config::debug_env::string(&servo_config::debug_env::DCOMP_BIND_PROF)
@@ -1509,13 +1509,16 @@ impl Default for SizeSet {
     }
 }
 
-/// `begin_frame` 한 번을 쪼갠 시간. 전체에서 이 셋을 빼고 ★남는 몫을 로그에 남긴다★ --
-/// 셋의 합이 전체에 못 미치면 `close_external_batch` 나 root `SetOffsetX/Y` 처럼 아무도
-/// 의심하지 않은 줄이 범인이고, 계측이 그 몫을 보여주지 않으면 그 가능성은 영영 보이지 않는다.
+/// `begin_frame` 한 번을 쪼갠 시간. 전체에서 이것을 빼고 ★남는 몫을 로그에 남긴다★ --
+/// 합이 전체에 못 미치면 `close_external_batch` 나 root `SetOffsetX/Y` 처럼 아무도 의심하지
+/// 않은 줄이 범인이고, 계측이 그 몫을 보여주지 않으면 그 가능성은 영영 보이지 않는다.
+///
+/// ★`early_ns` 는 2026-10-23 에 사라졌다★ -- `flush_before_render` 를 재던 토막인데 그
+/// 호출이 없어졌다. 남겨 두면 `bf_early_ms` 가 영원히 0.0 으로 찍히고, ***그런 칸은 읽는
+/// 사람을 속인다*** -- 이 추적에서 `DCOMPBIND commit_ms` 가 정확히 그렇게 두 주를 잡아먹었다.
 #[derive(Default)]
 struct BeginFrameSplit {
     deferred_ns: u64,
-    early_ns: u64,
 }
 
 #[derive(Default)]
@@ -1581,15 +1584,13 @@ struct BindProfile {
     /// `tex_changed` 가 `binds` 에 가까우면 재사용만으로는 아무것도 고쳐지지 않는다.
     tex_reused: u64,
     tex_changed: u64,
-    /// `begin_frame` 전체와 그 안의 세 토막(`BeginFrameSplit`). WR 의 `compositor_begin_ms`
+    /// `begin_frame` 전체와 그 안의 토막(`BeginFrameSplit`). WR 의 `compositor_begin_ms`
     /// 가 재는 것이 바로 `bf_total` 이고, 22~24ms 짜리 렌더 정체가 그 값으로 나타났다.
     bf_total_ns: u64,
     bf_total_ns_max: u64,
     bf_deferred_ns: u64,
     bf_deferred_ns_max: u64,
-    bf_early_ns: u64,
-    bf_early_ns_max: u64,
-    /// 전체에서 둘을 뺀 나머지(`close_external_batch`, root 오프셋, 부기). 위 주석 참조.
+    /// 전체에서 위를 뺀 나머지(`close_external_batch`, root 오프셋, 부기). 위 주석 참조.
     bf_rest_ns: u64,
     /// `RemoveAllVisuals`. ★`begin_frame` 이 아니라 `end_frame` 안에 있다★ -- 지우기와 다시
     /// 붙이기 사이에 트리가 비는 구간을 임계구역 안으로 가두려고 옮겼다(그쪽 주석 참고).
@@ -1693,9 +1694,9 @@ pub fn enabled() -> bool {
 ///
 /// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어지는가.★ 조회만 한다 -- 블록하지 않는다.
 ///
-/// ★낡음(2026-09-18 기록, 2026-10-20 `60a8e2b0a98` 이후 무효)★ — 커밋 경로는 둘이 아니라 여섯이다(`enum CommitSite`, :1876).
-/// ***왜 전역인가*** -- Commit 은 두 경로로 나간다. 즉시 커밋은 `commit_device`, 지연
-/// 커밋(기본값)은 `commit_device_ptr` 이고 후자는 컴포지터 밖의 자유 함수다. 처음에는
+/// ★낡음(2026-09-18 기록, 2026-10-23 이후 무효)★ — 커밋 경로는 넷이다(`enum CommitSite`).
+/// ***왜 전역인가*** -- Commit 은 여러 경로로 나가고 그중 하나(`commit_device_at_tick`)는
+/// 컴포지터 밖의 자유 함수다. 처음에는
 /// `commit_device` 안에만 붙였는데 그 경로는 거의 돌지 않아 **초당 표본이 1 개**였다
 /// (log_ani_debug/45). 위상은 프로세스·데스크톱 단위 양이고(`DwmGetCompositionTimingInfo`
 /// 의 hWnd 는 NULL 만 지원된다) 타일 넷이 같은 DWM 을 보므로, 한 곳에 모으는 것이 맞다.
@@ -1777,9 +1778,9 @@ pub(crate) fn dwm_timing() -> Option<(u64, u64, u64)> {
     }
 }
 
-/// `pub(crate)`: 스케줄러가 디바이스 가드를 **푼 뒤에** 이것을 부른다
-/// ([`commit_device_ptr_locked`] 주석). 이 함수 자체가 전역 뮤텍스와 로그 I/O 를 쥐므로
-/// 임계구역 밖이어야 한다.
+/// `pub(crate)`: 호출자는 디바이스 가드를 **푼 뒤에** 이것을 부른다. 이 함수 자체가 전역
+/// 뮤텍스와 로그 I/O 를 쥐므로 임계구역 밖이어야 한다 -- 가드 안에 두면 "가드 안에서 하는
+/// 일은 `Commit()` 하나" 라는 상한이 무너진다(`commit_guard` 모듈 주석).
 pub(crate) fn note_dwm_phase() {
     if !*DCOMP_BIND_PROF {
         return;
@@ -1875,54 +1876,55 @@ pub(crate) fn note_dwm_phase() {
 /// ★이 크레이트에서 `IDCompositionDevice::Commit()` 을 실제로 부르는 **유일한** 자리다.★
 ///
 /// 가드 없는 커밋이 이 브랜치에서 세 번 따로 발견됐다 -- `present_external_only`(라운드 1),
-/// 죽은 스케줄러 폴백, 그리고 `begin_frame` → `flush_deferred_commit` → `commit_device`.
-/// 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로 모은다. 새 커밋 지점을
-/// 만들려면 이 함수를 지나갈 수밖에 없고, 그러면 "가드는?" 이라는 질문을 그 자리에서 하게
-/// 된다. 이 파일 밖에서 `(*device).Commit()` 을 직접 쓰면 그 질문을 건너뛰는 것이다.
+/// `begin_frame` → `flush_deferred_commit` → `commit_device`, 그리고 셸이 틱에서 내는
+/// `commit_device_at_tick`. 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로
+/// 모은다. 새 커밋 지점을 만들려면 이 함수를 지나갈 수밖에 없고, 그러면 "가드는?" 이라는
+/// 질문을 그 자리에서 하게 된다. 이 파일 밖에서 `(*device).Commit()` 을 직접 쓰면 그 질문을
+/// 건너뛰는 것이다.
 ///
-/// 정문은 둘뿐이다: 가드 밖이면 [`commit_device_ptr`](가드를 스스로 잡는다), 이미 쥐고
-/// 있으면 [`commit_device_ptr_locked`].
+/// 가드 밖에서 부르는 정문은 [`commit_device_at_tick`] 하나다. 이미 가드를 쥔 자리
+/// (`end_frame`)는 `raw_commit` 을 직접 쓴다.
 ///
 /// `DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`. 그 디바이스의 서피스가 `BeginDraw` 로
-/// 열려 있는 동안 `Commit()` 이 돌려주는 값이다. ★실패가 아니라 "아직" 으로 다뤄야 한다★ --
-/// 버리면 그 프레임의 시각 변경이 화면에 닿지 않는다(`commit_scheduler` 의 재시도 주석).
+/// 열려 있는 동안 `Commit()` 이 돌려주는 값이다.
+///
+/// ★실측상 이 값은 거의 나오지 않는다★ -- `BINDOPEN` 이 잰 잠금 구간이 주기당 0.40ms
+/// (주기의 2.4%)이고 세 런 모두 `retried=0` 이었다(log_ani_debug_06/14). 한때 있던 재시도
+/// 기계는 스케줄러와 함께 2026-10-23 에 사라졌다 -- 지금 커밋은 틱 머리에서, 즉 그 패스의
+/// `BeginDraw` 가 열리기 전에 나가므로 구조적으로 겹치지 않는다.
 pub(crate) const DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED: i32 = 0x8898_0801_u32 as i32;
 
 /// `Commit()` 을 부른 자리. `COMMITSITE` 한 줄이 이것으로 갈린다.
 ///
-/// ★`BeforeRender` 하나만 계측이 없었고 하필 그것이 전체의 2/3 였다★ -- `OUTCOMMIT` 의
-/// `early/scheduled` 가 0.65~0.81 이다. 그래서 `DCOMPBIND commit_ms` 가 모든 실행에서 0.0 으로
-/// 찍혔고, 22ms 짜리 렌더 정체의 정체가 소거법 추정으로 남았다. 한 번은 그 추정을 `BeginDraw`
-/// 로 잘못 짚기도 했다 -- 실제 BeginDraw 는 `DCOMPBIND begin_ms` 로 이미 재고 있었고 호출당
-/// 0.08~0.31ms 였다.
+/// ★계측이 빠진 커밋 경로를 만들 수 없게 하는 것이 이 enum 의 목적이다.★ 한때
+/// `BeforeRender` 하나만 계측이 없었고 하필 그것이 전체의 2/3 였다 -- 그래서
+/// `DCOMPBIND commit_ms` 가 모든 실행에서 0.0 으로 찍혔고, 22ms 짜리 렌더 정체의 정체가
+/// 소거법 추정으로 남았다. 한 번은 그 추정을 `BeginDraw` 로 잘못 짚기도 했다.
+///
+/// `BeforeRender`/`Scheduler` 는 2026-10-23 에 `Tick` 하나로 합쳐졌다(스케줄러 제거).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CommitSite {
     /// `end_frame` 의 즉시 커밋.
     EndFrame,
     /// 미뤄 둔 커밋 흘리기(`flush_deferred_commit`).
     Deferred,
-    /// `begin_frame` -> `commit_scheduler::flush_before_render`. ★주범 후보★
-    BeforeRender,
-    /// 커밋 워커, 그리고 워커에 못 보내 스케줄러 스레드가 직접 낸 것.
-    Scheduler,
-    /// 셸 즉시 커밋 폴백(`commit_device_ptr`).
-    Direct,
+    /// ★정규 경로★ -- 셸이 틱 머리에서 내는 커밋
+    /// (`paint::Paint::commit_deferred_at_tick` -> `commit_now_guarded`).
+    Tick,
     /// 비디오 fast-path(`present_external_only`).
     External,
 }
 
 impl CommitSite {
-    const COUNT: usize = 6;
+    const COUNT: usize = 4;
 
     /// `COMMIT_SITES` 의 슬롯 번호.
     const fn index(self) -> usize {
         match self {
             CommitSite::EndFrame => 0,
             CommitSite::Deferred => 1,
-            CommitSite::BeforeRender => 2,
-            CommitSite::Scheduler => 3,
-            CommitSite::Direct => 4,
-            CommitSite::External => 5,
+            CommitSite::Tick => 2,
+            CommitSite::External => 3,
         }
     }
 
@@ -1931,9 +1933,7 @@ impl CommitSite {
         match self {
             CommitSite::EndFrame => "ef",
             CommitSite::Deferred => "df",
-            CommitSite::BeforeRender => "br",
-            CommitSite::Scheduler => "sc",
-            CommitSite::Direct => "di",
+            CommitSite::Tick => "tk",
             CommitSite::External => "ex",
         }
     }
@@ -1943,9 +1943,7 @@ impl CommitSite {
 const COMMIT_SITE_ORDER: [CommitSite; CommitSite::COUNT] = [
     CommitSite::EndFrame,
     CommitSite::Deferred,
-    CommitSite::BeforeRender,
-    CommitSite::Scheduler,
-    CommitSite::Direct,
+    CommitSite::Tick,
     CommitSite::External,
 ];
 
@@ -1962,9 +1960,9 @@ const _: () = {
 
 /// 커밋 지점 하나의 누적기.
 ///
-/// 전역인 이유: `self` 가 없는 커밋 경로가 둘 있다(`commit_device_ptr`,
-/// `commit_device_ptr_locked` -- 둘 다 자유 함수이고 스케줄러 스레드에서도 불린다). 그래서
-/// 컴포지터 필드에 둘 수 없다. 대신 비우는 쪽을 하나로 정한다([`COMMITSITE_EMITTER`]).
+/// 전역인 이유: `self` 가 없는 커밋 경로가 있다(`commit_device_at_tick` -- 자유 함수이고
+/// 셸 스레드에서 불린다). 그래서 컴포지터 필드에 둘 수 없다. 대신 비우는 쪽을 하나로
+/// 정한다([`COMMITSITE_EMITTER`]).
 struct CommitSlot {
     n: AtomicU64,
     sum_ns: AtomicU64,
@@ -2025,11 +2023,12 @@ static COMMIT_SITES: [CommitSlot; CommitSite::COUNT] =
 /// 왜 생겼나(T5 실측, 스펙 8-1 절): Commit 시간이 **호출 지점**에만 귀속되고 그 Commit 이
 /// 무엇을 실어 날랐는지에는 귀속되지 않아, 초 단위 상관만 보이고 인과를 못 봤다. 같은 런
 /// 안에서 비싼 창과 싼 창을 가른 유일한 단조 신호가 ★새로 realize 된 텍스처의 수★인데
-/// (재사용 45%->4% 일 때 `bf_early` 7.9->158.9 ms/s), 그것이 정말 **그 Commit** 의 비용인지는
+/// (재사용 45%->4% 일 때 `bf_early` 7.9->158.9 ms/s -- 그 칸은 2026-10-23 에 없앴다,
+/// `BeginFrameSplit` 주석), 그것이 정말 **그 Commit** 의 비용인지는
 /// 커밋 단위로 붙여야만 답이 난다. 창 단위로는 영영 상관으로 남는다.
 struct DeviceWork {
     /// 이 칸의 주인 디바이스. 0 = 빈 칸. 한 번 잡으면 프로세스 수명 동안 유지한다
-    /// (벽은 타일 수가 고정이고 종료는 프로세스 종료다 -- `commit_scheduler` 의 워커와 같다).
+    /// (벽은 타일 수가 고정이고 종료는 프로세스 종료다).
     device: AtomicUsize,
     binds: AtomicU32,
     tex_new: AtomicU32,
@@ -2242,11 +2241,9 @@ unsafe fn raw_commit(device: *mut IDCompositionDevice, site: CommitSite) -> i32 
     // 이 파일은 `unsafe_op_in_unsafe_fn` 을 끄지 않으므로 `unsafe fn` 안에서도 블록이 필요하다.
     let hr = unsafe { (*device).Commit() };
     // ★커밋 간격은 ***여기서*** 잰다.★ 2026-10-22. 처음에는 `note_commit_at` 에 달았는데
-    // 그 함수는 커밋의 38% 만 본다(실측: COMMITGAP n 이 디바이스당 23/s 인데 COMMITSITE 는
-    // 60/s -- `before_render` 갈래가 통째로 빠진다). 그러면 "이 디바이스가 커밋을 걸렀나" 를
-    // 물을 수 없고, 스케줄러가 쉰 것과 커밋이 안 난 것이 같은 모양으로 보인다.
+    // 그 함수는 커밋의 일부만 본다. 그러면 "이 디바이스가 커밋을 걸렀나" 를 물을 수 없다.
     // `raw_commit` 은 크레이트에서 `Commit()` 을 실제로 부르는 유일한 자리라(이 파일의
-    // `commit_device_ptr` 주석) 여기 달면 빠지는 갈래가 없다.
+    // `commit_device_at_tick` 주석) 여기 달면 빠지는 갈래가 없다.
     crate::output_grid::note_commit_interval(device as usize);
     if let Some(start) = start {
         let ns = start.elapsed().as_nanos() as u64;
@@ -2289,52 +2286,47 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
     windows.insert(device, now);
     drop(last);
     // 이름은 찍을 때만 찾는다 -- 실패 경로가 매번 두 번째 뮤텍스를 잡을 이유가 없다.
-    let out = crate::commit_scheduler::monitor_for_device(device)
+    let out = crate::commit_guard::monitor_for_device(device)
         .and_then(crate::output_grid::name_for_monitor)
         .unwrap_or_else(|| String::from("?"));
+    // ★이 하나는 이름으로 부른다.★ 구조상 더는 나지 않아야 하는 값이라(틱 커밋은 그 패스의
+    // `BeginDraw` 가 열리기 전에 나간다), 났다면 그 전제가 깨진 것이고 바로 알아봐야 한다.
+    let named = if hr == DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED {
+        " (SURFACE_BEING_RENDERED -- 틱 커밋이 렌더 창 안으로 들어갔다)"
+    } else {
+        ""
+    };
     warn!(
-        "[dcomp-native] {site}: Commit failed (hr=0x{:08x}) device=0x{device:x} out={out}",
+        "[dcomp-native] {site}: Commit failed (hr=0x{:08x}){named} device=0x{device:x} out={out}",
         hr as u32
     );
 }
 
-/// 가드를 **이 함수가 잡는다.** 가드 밖에서 커밋하는 모든 자리의 정문이다.
+/// ★정규 커밋.★ 셸이 틱 머리에서 내는 커밋만 이 문을 지난다
+/// (`paint::Paint::commit_deferred_at_tick`).
 ///
-/// 정렬 pref 가 꺼져 있으면 가드가 아예 만들어지지 않으므로 off 경로의 동작은 예전과 같다.
-/// 켜져 있으면, 이 함수를 부르는 것만으로 스케줄러와의 동시 접근이 막힌다 -- 호출처가 그
-/// 사실을 알 필요가 없다는 것이 이 구조의 전부다.
+/// ★가드를 이 함수가 잡는다.★ 가드 밖에서 커밋하는 자리의 정문이고, 이 함수를 부르는
+/// 것만으로 다른 스레드와의 동시 접근이 막힌다 -- 호출처가 그 사실을 알 필요가 없다는 것이
+/// 이 구조의 전부다. ★이미 그 디바이스의 가드를 쥐고 있다면 부르면 안 된다★ -- `device_guard`
+/// 는 재진입 불가라 자기 자신과 데드락한다. 그 경우는 `raw_commit` 을 직접 쓴다(`end_frame`).
 ///
-/// ★이미 그 디바이스의 가드를 쥐고 있다면 이것을 부르면 안 된다★ -- `device_guard` 는 재진입
-/// 불가라 자기 자신과 데드락한다. 그 경우는 [`commit_device_ptr_locked`] 를 쓴다.
+/// `CommitSite::Tick` 과 `GuardRole::Tick` 을 붙이는 것이 이 함수의 나머지 절반이다. 그 둘을
+/// 가르지 않으면 `COMMITSITE` 가 "커밋이 어디서 나갔나" 를 답할 수 없고 `LOCKWAIT` 의 두 통이
+/// 섞인다. 계측이 빠진 커밋 경로를 만들 수 없게 하는 것이 `CommitSite` 의 목적이고, 그 목적은
+/// ***정규 경로에 제 이름이 붙어 있을 때만*** 성립한다.
 ///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
-pub fn commit_device_ptr(device: usize) -> bool {
+pub fn commit_device_at_tick(device: usize) -> bool {
     let hr = {
-        let _guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
-            crate::commit_scheduler::device_guard(
-                device,
-                crate::commit_scheduler::GuardRole::Painter,
-            )
-        });
+        let _guard =
+            crate::commit_guard::device_guard(device, crate::commit_guard::GuardRole::Tick);
         // Safety: 위 계약.
-        unsafe { raw_commit(device as *mut IDCompositionDevice, CommitSite::Direct) }
+        unsafe { raw_commit(device as *mut IDCompositionDevice, CommitSite::Tick) }
     };
     crate::output_grid::note_commit_at(device);
-    note_commit_failure(hr, device, "commit_device_ptr");
+    note_commit_failure(hr, device, "tick");
     note_dwm_phase();
     hr >= 0
-}
-
-/// 호출자가 **이미 그 디바이스의 가드를 쥐고 있을 때만** 부른다. 이름의 `_locked` 가 그
-/// 계약이다.
-///
-/// `hr` 을 그대로 돌려주고 아무 로그도 찍지 않는다 -- 호출자가 가드를 푼 뒤
-/// [`note_commit_failure`] 로 찍어야 임계구역이 `Commit()` 하나로 유지된다.
-///
-/// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
-pub fn commit_device_ptr_locked(device: usize, site: CommitSite) -> i32 {
-    // Safety: 위 계약.
-    unsafe { raw_commit(device as *mut IDCompositionDevice, site) }
 }
 
 pub fn maybe_create(
@@ -2582,7 +2574,7 @@ impl DCompNativeCompositor {
             )
         };
         let rate = stats.currentCompositionRate;
-        crate::commit_scheduler::remember_device_monitor(device as usize, monitor);
+        crate::commit_guard::remember_device_monitor(device as usize, monitor);
         crate::output_grid::note_dcomp_stat(
             monitor,
             device as usize,
@@ -3230,12 +3222,10 @@ impl DCompNativeCompositor {
     /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
     fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice, site: CommitSite) {
         let hr = {
-            let _guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
-                crate::commit_scheduler::device_guard(
-                    dcomp_device as usize,
-                    crate::commit_scheduler::GuardRole::Painter,
-                )
-            });
+            let _guard = crate::commit_guard::device_guard(
+                dcomp_device as usize,
+                crate::commit_guard::GuardRole::Painter,
+            );
             self.commit_device_locked(dcomp_device, site)
         };
         crate::output_grid::note_commit_at(dcomp_device as usize);
@@ -3260,28 +3250,13 @@ impl DCompNativeCompositor {
         if let Some(start) = deferred_start {
             split.deferred_ns = start.elapsed().as_nanos() as u64;
         }
-        // ★스케줄러에 걸린 마감도 여기서 먼저 내보낸다.★ 아래부터 이 프레임의 서피스가
-        // `BeginDraw` 로 열리고, 그동안 그 디바이스의 `Commit()` 은 전부 거부된다
-        // (`SURFACE_BEING_RENDERED`). 마감은 최대 한 주기 뒤이고 프레임 간격도 그 정도라
-        // 겹침은 타일에 따라 상시로 일어난다 -- 실기 2 회차에서 저더와 깜박임의 정체가
-        // 이것이었다. 정렬 pref 가 꺼져 있으면 이 함수는 즉시 돌아온다.
-        //
-        // ★이 토막은 `COMMITSITE br_*` 와 같은 호출을 두 겹으로 잰다. 의도한 것이다★ --
-        // 둘이 갈라지면 범인은 `flush_before_render` 의 큐 락이나 `retain` 이고, 같이 크면
-        // `Commit()` 자체다. 한 겹만 재면 그 둘을 영원히 가를 수 없다.
-        #[cfg(windows)]
-        if let Some(dcomp_device) = self.dcomp_device_ptr() {
-            let early_start = DCOMP_BIND_PROF.then(std::time::Instant::now);
-        // ★반증됨★(2026-10-23, `BINDOPEN`, log_ani_debug_06/14) -- 아래 문단의 "겹침은
-        // 타일에 따라 상시로 일어난다" 는 측정과 맞지 않는다. `BeginDraw`~`EndDraw` 는
-        // 주기당 0.40ms(주기의 2.4%), 위상 28~31% 이고 마감은 위상 8% 다. 세 런 모두
-        // `retried=0`. 이 호출이 커밋의 70% 를 내는 것은 거부를 막아서가 아니라
-        // `flush_before_render` 가 충돌 여부를 보지 않고 선취하기 때문이다(그쪽 주석).
-            crate::commit_scheduler::flush_before_render(dcomp_device as usize);
-            if let Some(start) = early_start {
-                split.early_ns = start.elapsed().as_nanos() as u64;
-            }
-        }
+        // ★`flush_before_render` 는 2026-10-23 에 사라졌다.★ 그 자리에서 커밋의 70% 가
+        // 나갔지만, 그것은 `SURFACE_BEING_RENDERED` 를 막은 것이 아니라 스케줄러 큐를 선취한
+        // 것이었다 -- `BINDOPEN` 이 잰 잠금 구간은 주기당 0.40ms(주기의 2.4%)뿐이고 세 런 모두
+        // `retried=0` 이었다(log_ani_debug_06/14). 지금 정규 커밋은 셸이 틱 머리에서 낸다
+        // (`paint::Paint::commit_deferred_at_tick`). 바로 위 `flush_deferred_commit()` 은
+        // 그대로 둔다 -- 셸이 틱 커밋을 부르지 않는 구성(servoshell)에서 화면이 멈추지 않게
+        // 하는 자기복구다.
         let Some(root) = self.root_visual_ptr() else {
             return split;
         };
@@ -3373,7 +3348,6 @@ impl DCompNativeCompositor {
              tex_reused={} tex_changed={} alloc_mb={:.1} \
              begin_frame_ms={:.1} begin_frame_ms_max={:.2} \
              bf_deferred_ms={:.1} bf_deferred_ms_max={:.2} \
-             bf_early_ms={:.1} bf_early_ms_max={:.2} \
              bf_rest_ms={:.1} removeall_ms={:.1} removeall_ms_max={:.2}",
             window.as_secs_f64() * 1000.0,
             profile.begin_frames,
@@ -3417,8 +3391,6 @@ impl DCompNativeCompositor {
             ms(profile.bf_total_ns_max),
             ms(profile.bf_deferred_ns),
             ms(profile.bf_deferred_ns_max),
-            ms(profile.bf_early_ns),
-            ms(profile.bf_early_ns_max),
             ms(profile.bf_rest_ns),
             ms(profile.removeall_ns),
             ms(profile.removeall_ns_max),
@@ -3590,12 +3562,10 @@ impl DCompNativeCompositor {
             // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다. 실패 로그도 가드를 푼 뒤에
             // 찍는다(`note_commit_failure` 주석).
             let hr = {
-                let _commit_guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).map(|_| {
-                    crate::commit_scheduler::device_guard(
-                        dcomp_device as usize,
-                        crate::commit_scheduler::GuardRole::Painter,
-                    )
-                });
+                let _commit_guard = crate::commit_guard::device_guard(
+                    dcomp_device as usize,
+                    crate::commit_guard::GuardRole::Painter,
+                );
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
                 unsafe { raw_commit(dcomp_device, CommitSite::External) }
             };
@@ -4338,7 +4308,7 @@ impl Compositor for DCompNativeCompositor {
             return;
         };
         let total = start.elapsed().as_nanos() as u64;
-        let parts = split.deferred_ns + split.early_ns;
+        let parts = split.deferred_ns;
         // 전체는 토막들을 감싸고 재므로 단조 시계에서 항상 크거나 같다. 어긋났다면 계측
         // 배선이 틀린 것이지 측정값이 아니다.
         debug_assert!(
@@ -4354,8 +4324,6 @@ impl Compositor for DCompNativeCompositor {
         profile.bf_total_ns_max = profile.bf_total_ns_max.max(total);
         profile.bf_deferred_ns += split.deferred_ns;
         profile.bf_deferred_ns_max = profile.bf_deferred_ns_max.max(split.deferred_ns);
-        profile.bf_early_ns += split.early_ns;
-        profile.bf_early_ns_max = profile.bf_early_ns_max.max(split.early_ns);
         profile.bf_rest_ns += total.saturating_sub(parts);
     }
 
@@ -4577,13 +4545,11 @@ impl Compositor for DCompNativeCompositor {
         // 붙이고(`AddVisual`), 마지막에 `commit_device` 한다 -- 셋 다 이 DComp 디바이스를
         // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
         #[cfg(windows)]
-        let commit_guard = (*crate::commit_scheduler::COMMIT_ALIGN_PCT).and_then(|_| {
-            self.dcomp_device_ptr().map(|device| {
-                crate::commit_scheduler::device_guard(
-                    device as usize,
-                    crate::commit_scheduler::GuardRole::Painter,
-                )
-            })
+        let commit_guard = self.dcomp_device_ptr().map(|device| {
+            crate::commit_guard::device_guard(
+                device as usize,
+                crate::commit_guard::GuardRole::Painter,
+            )
         });
 
         let mode = storage_mode();
