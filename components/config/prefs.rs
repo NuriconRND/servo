@@ -587,6 +587,30 @@ pub struct Preferences {
     /// `gfx_refresh_hz` 를 패널보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 vblank 를
     /// 건너뛰어 맞춘다(`winit_wall` 의 `spawn_pacing_thread`).
     pub gfx_wall_pacing_vblank: bool,
+    /// ★페이싱 스레드가 `WaitForVBlank` 를 걸 출력을 이름으로 고정한다.★ 기본 `""`.
+    ///
+    /// `""` = 오늘 동작(primary). `"primary"` 도 같다. 그 외에는 DXGI 출력 이름
+    /// (`\\.\DISPLAY22`)으로 못 박는다. 이름을 못 찾으면 primary 로 떨어지고 매 재열거마다
+    /// 다시 찾는다 -- 모니터가 꺼져 있다 돌아오는 경우에 영구 폴백이 되지 않게 한다.
+    ///
+    /// ★왜 필요한가.★ 코드는 "DWM 합성은 primary 의 vblank 에 물려 있다" 를 전제했는데
+    /// 이 벽에서 그것이 깨진다. 2026-10-26 같은 바이너리·같은 명령으로 돈 네 런에서 DWM
+    /// 격자에 붙어 있던 출력이 런마다 달랐다(`OUTPHASE` 의 `vs_dwmvb_ms`):
+    ///
+    /// ```text
+    ///   런            DISPLAY1(primary)  DISPLAY22   구동 패널 dup
+    ///   spike_off     0.05               7.4          0.902%
+    ///   spike_on_03   8.2~9.3 (119 창)   0.07         4.025%   <- 반 주기 어긋남
+    /// ```
+    ///
+    /// 어긋난 런은 커밋 위상이 내내 52% 였고(`COMMITCYCLE phase_pct`), 그 창들의 dup 296 개
+    /// 중 커밋 결손(`c0`)은 8 개뿐이다 -- 나머지는 전부 위상이다. 즉 어느 출력을 기다리느냐가
+    /// 저더를 4.5 배 가른다.
+    ///
+    /// 자동 선택기를 짓기 전에 이 핀으로 먼저 가른다. 핀은 위상을 **양방향으로** 조종하므로
+    /// 한 세션 안에서 출력마다 한 번씩 돌리면 인과가 증명되고, 자동 선택기를 지을 값어치가
+    /// 있는지도 같이 결정된다. 증명된 뒤에도 A/B 의 대조군과 운용자의 비상구로 남는다.
+    pub gfx_wall_pacing_output: String,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1308,6 +1332,7 @@ impl Preferences {
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,
             gfx_wall_pacing_vblank: true,
+            gfx_wall_pacing_output: String::new(),
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

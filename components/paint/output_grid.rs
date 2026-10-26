@@ -1692,10 +1692,14 @@ pub(crate) fn start_probe() {
 /// 공짜가 아니다. vblank 를 직접 기다리면 깨우는 주체가 커널의 디스플레이 인터럽트이므로
 /// 조회도 예측도 없다.
 ///
-/// ★primary 를 기다린다.★ DWM 합성은 primary 의 vblank 에 물려 있다(`is_primary` 주석).
-/// 네 패널의 vblank 는 주기의 0.67 에 흩어져 있지만(`OUTPHASE`) 합성 격자는 하나이고,
-/// 셸이 맞춰야 하는 것은 그 하나다 -- 타일별 정렬은 B2(`-SampleLead`)의 몫이고 이 함수의
-/// 일이 아니다.
+/// ★기본은 primary, `gfx_wall_pacing_output` 으로 바꿀 수 있다.★ 네 패널의 vblank 는
+/// 주기의 0.67 에 흩어져 있지만(`OUTPHASE`) 합성 격자는 하나이고, 셸이 맞춰야 하는 것은
+/// 그 하나다 -- 타일별 정렬은 B2(`-SampleLead`)의 몫이고 이 함수의 일이 아니다.
+///
+/// ★primary 가 그 하나라는 보장이 없다.★ 오래 그렇게 적혀 있었고 2026-10-26 에 깨졌다 --
+/// 같은 바이너리로 돈 네 런에서 DWM 격자에 붙은 출력이 런마다 달랐다. 어긋난 런은 커밋
+/// 위상이 내내 52% 였고 dup 이 4.025% 로 최악이었다(붙은 런은 0.9%). 그래서 어느 출력을
+/// 기다릴지가 pref 로 나와 있다. 자동 선택기는 아직 없다 -- 핀으로 인과를 먼저 가른다.
 ///
 /// ★이 호출은 블록한다 -- 페이싱 스레드 전용이다.★ 핸들을 thread-local 에 두는 것이 그
 /// 계약을 구조로 만든 것이다: COM 포인터가 스레드 경계를 넘지 않고, 다른 스레드가 불러도
@@ -1716,15 +1720,42 @@ pub(crate) fn wait_primary_vblank() -> Option<(u64, u64)> {
 ///
 /// thread-local 이므로 만든 스레드에서만 쓰이고 그 스레드에서 해제된다 -- `Output` 의
 /// 포인터에 `Send` 가 필요 없는 것이 `probe_loop` 와 같은 이유다.
+/// ★페이싱이 기다릴 출력의 고정 이름.★ 비어 있거나 `primary` 면 오늘 동작이다.
+///
+/// 틱 경로에서 `pref!` 를 치지 않는다 -- 그것이 전역 `RwLock` 을 잡으므로, 페이싱
+/// 스레드에서 없애려던 양이 바로 그런 것이다(`spawn_pacing_thread` 가 구성을 기동에 한 번만
+/// 읽는 것과 같은 이유). 그래서 첫 접근에 한 번만 읽는다.
+static PACING_OUTPUT_PIN: LazyLock<String> =
+    LazyLock::new(|| servo_config::pref!(gfx_wall_pacing_output).trim().to_string());
+
+/// 고정이 걸려 있으면 그 이름의 색인, 아니면 `None`.
+///
+/// ★이름(`DeviceName`)으로 찾는다 -- 색인이나 `HMONITOR` 가 아니다.★ 열거 순서는 토폴로지가
+/// 바뀌면 달라지고 `HMONITOR` 값은 윈도가 재사용한다. 둘 다 조용히 다른 패널을 가리키게
+/// 되는데, 이 pref 의 목적이 바로 "어느 패널인지" 라 그 실패가 치명적이다.
+fn pinned_index(outputs: &[Output]) -> Option<usize> {
+    let pin = PACING_OUTPUT_PIN.as_str();
+    if pin.is_empty() || pin.eq_ignore_ascii_case("primary") {
+        return None;
+    }
+    outputs
+        .iter()
+        .position(|out| out.name.eq_ignore_ascii_case(pin))
+}
+
 struct VblankSource {
     /// 살아 있는 열거. 구성이 바뀌거나 대기가 실패하면 버린다.
     enumeration: Option<Enumeration>,
     /// `enumeration.outputs` 안에서 primary 의 색인.
     primary: usize,
+    /// ★실제로 기다릴 출력의 색인.★ 고정이 없거나 그 이름을 못 찾으면 `primary` 와 같다.
+    wait_idx: usize,
     /// 그 출력의 `HMONITOR`. 관측을 격자에 실을 때 키가 된다(`note_pacing_vblank`).
     monitor: usize,
     /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
     period_qpc: Option<u64>,
+    /// `VBANCHOR` 를 마지막으로 찍은 QPC. 초당 한 줄로 조인다.
+    last_log_qpc: u64,
 }
 
 impl VblankSource {
@@ -1732,8 +1763,10 @@ impl VblankSource {
         Self {
             enumeration: None,
             primary: 0,
+            wait_idx: 0,
             monitor: 0,
             period_qpc: None,
+            last_log_qpc: 0,
         }
     }
 
@@ -1766,21 +1799,60 @@ impl VblankSource {
             .iter()
             .position(|out| is_primary(out.monitor))
             .unwrap_or(0);
+        // ★고정이 있으면 그쪽을 기다린다.★ 이름을 못 찾으면 primary 로 떨어지되 **매
+        // 재열거마다 다시 찾는다** -- 고정 대상이 꺼져 있다 돌아오는 경우에 영구 폴백이
+        // 되면 안 된다. `primary` 는 그대로 계산해 둔다: 폴백이자 로그의 한 칸이다.
+        let wait_idx = pinned_index(&enumeration.outputs).unwrap_or(primary);
         // ★주기는 모드에서 읽는다 -- 실측하지 않는다.★ 실측하려면 vblank 를 두 번 기다려야
         // 하는데, 이 스레드는 기다린 vblank 마다 틱을 내므로 둘째 대기는 곧 ***틱 하나를
         // 통째로 거르는 것***이다. `probe_loop` 가 두 번 기다리는 것은 그쪽이 틱을 내지 않기
         // 때문이고, 여기서 같은 방식을 쓰면 박자가 절반이 된다.
+        // ★주기와 `HMONITOR` 는 **기다릴 출력**의 것이어야 한다.★ 전에는 둘 다 `primary`
+        // 에서 읽었는데, 고정이 다른 출력을 가리키면 다른 패널의 주기로 박자를 재고 남의
+        // 모니터 키로 관측을 싣게 된다.
         self.period_qpc = enumeration
             .outputs
-            .get(primary)
+            .get(wait_idx)
             .zip(qpc_frequency())
             .and_then(|(out, freq)| nominal_period_ticks(&out.name, freq, None));
         self.monitor = enumeration
             .outputs
-            .get(primary)
+            .get(wait_idx)
             .map_or(0, |out| out.monitor);
         self.enumeration = Some(enumeration);
         self.primary = primary;
+        self.wait_idx = wait_idx;
+    }
+
+    /// `VBANCHOR` 한 줄. 초당 하나로 조인다.
+    ///
+    /// ★arm 을 로그로 증명하는 것이 이 줄의 전부다.★ 2026-10-26 에 arm 을 증명할 수 없는
+    /// 배포본으로 A/B 를 두 바퀴 돌렸고 둘 다 버렸다. 위상 자체는 `OUTPHASE` 의
+    /// `vs_dwmvb_ms` 가 출력마다 이미 내므로 여기서 DWM 을 또 묻지 않는다 -- 그 IPC 를
+    /// 없애려고 vblank 클럭을 만든 것이다.
+    fn log_anchor(&mut self, now: u64, freq: u64) {
+        if self.last_log_qpc != 0 && now.saturating_sub(self.last_log_qpc) < freq {
+            return;
+        }
+        self.last_log_qpc = now;
+        let Some(out) = self
+            .enumeration
+            .as_ref()
+            .and_then(|enumeration| enumeration.outputs.get(self.wait_idx))
+        else {
+            return;
+        };
+        let pin = PACING_OUTPUT_PIN.as_str();
+        warn!(
+            "VBANCHOR out={} monitor={:#x} primary={} pin={} honoured={} period_ms={:.4}",
+            out.name,
+            out.monitor,
+            u8::from(self.wait_idx == self.primary),
+            if pin.is_empty() { "-" } else { pin },
+            u8::from(self.wait_idx != self.primary),
+            self.period_qpc
+                .map_or(f64::NAN, |ticks| ticks as f64 * 1000.0 / freq as f64),
+        );
     }
 
     fn wait(&mut self) -> Option<(u64, u64)> {
@@ -1788,7 +1860,7 @@ impl VblankSource {
         let output = self
             .enumeration
             .as_ref()
-            .and_then(|enumeration| enumeration.outputs.get(self.primary))?
+            .and_then(|enumeration| enumeration.outputs.get(self.wait_idx))?
             .output;
         // Safety: 살아 있는 `IDXGIOutput`. ★블록한다★ -- 그래서 페이싱 스레드 전용이다.
         if unsafe { (*output).WaitForVBlank() } < 0 {
@@ -1808,6 +1880,12 @@ impl VblankSource {
         // ★프로브가 이 출력을 또 기다리지 않도록 관측을 싣는다.★ 계측이 꺼져 있으면
         // 아무 일도 하지 않는다 -- 자세한 것은 `note_pacing_vblank`.
         note_pacing_vblank(self.monitor, vblank, period);
+        // ★틱을 보낸 **뒤**가 아니라 여기인 이유★ -- 이 함수는 호출자가 틱을 내기 직전에
+        // 돌아가지만, 초당 한 번 `warn!` 하나가 전부다(포매팅 몇 마이크로초). 틱 경로에
+        // 넣지 말아야 할 것은 잠금과 IPC 이고 둘 다 없다.
+        if let Some(freq) = qpc_frequency() {
+            self.log_anchor(vblank, freq);
+        }
         Some((vblank, period))
     }
 }
@@ -2414,10 +2492,15 @@ fn emit_missevent(
 
 /// 이 출력이 primary 인가.
 ///
-/// ★DWM 합성은 primary 의 vblank 에 물려 있다.★ `DwmGetCompositionTimingInfo(NULL)` 의
-/// `qpcVBlank` 가 곧 그 패널의 vblank 이므로, 넷 중 어느 것이 primary 인지 모르면 "어느
-/// 타일이 합성 클럭과 동기인가" 를 답할 수 없다. 열거 순서(`OUTPHASE` 의 `rel_ms` 기준)는
-/// DXGI 어댑터/출력 번호일 뿐 primary 와 무관하다 -- 그래서 따로 묻는다.
+/// ★낡음(2026-10-26 반증)★ -- 여기 있던 "DWM 합성은 primary 의 vblank 에 물려 있다" 는
+/// 이 벽에서 틀렸다. 같은 바이너리·같은 명령으로 돈 네 런에서 `vs_dwmvb_ms` 가 0 에 붙은
+/// 출력이 런마다 달랐고, 한 런은 `primary=0` 인 DISPLAY22 였다. DWM 격자에 붙은 출력은
+/// **측정해서** 알아내야 하고, 그 측정이 `OUTPHASE` 의 `vs_dwmvb_ms` 다.
+///
+/// 그래도 primary 는 찍을 가치가 있다: 기본 페이싱 대상이고(`gfx_wall_pacing_output` 이
+/// 비어 있을 때), 핀이 걸린 런에서 "무엇에서 벗어났는가" 의 기준점이다. 열거 순서
+/// (`OUTPHASE` 의 `rel_ms` 기준)는 DXGI 어댑터/출력 번호일 뿐 primary 와 무관하다 --
+/// 그래서 따로 묻는다.
 fn is_primary(monitor: usize) -> bool {
     let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
@@ -2465,8 +2548,12 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
     // 1e12 규모라 두 주기가 한 틱만 달라도 나머지는 전혀 다른 값이 나온다. 그래서 절대
     // 위상(`abs_ms`)은 참고로만 두고, 판정은 **차이를 접은** 두 값으로 한다.
     //
-    // `vs_dwmvb_ms` = 이 출력의 vblank 가 DWM(=primary) vblank 뒤 얼마인가. primary 라면
-    // 0 에 붙어야 한다 -- `primary=1` 인 줄과 대조하면 그 자체가 검산이다.
+    // `vs_dwmvb_ms` = 이 출력의 vblank 가 DWM vblank 에서 얼마나 떨어져 있나(`[-P/2,P/2)`).
+    // ★`primary=1` 인 줄이 0 에 붙는다는 보장은 없다.★ 2026-10-26 같은 바이너리로 돈 네
+    // 런에서 0 에 붙은 출력이 런마다 달랐고, 그중 한 런은 `primary=0` 인 DISPLAY22 였다
+    // (그때 primary 는 8.2~9.3ms, 즉 반 주기 떨어져 있었고 그 런의 dup 이 4.025% 로
+    // 최악이었다). 그래서 이 칸은 검산이 아니라 **판정**이다 -- 페이싱이 기다리는 출력이
+    // 0 에 붙은 그 출력인지 `VBANCHOR` 와 대조한다.
     // `vs_comp_ms`  = DComp 가 마지막으로 합성한 시각 뒤 얼마인가 = 합성에서 스캔아웃까지.
     //
     // 두 값이 창마다 **흐르면** 그 격자와 이 출력의 주기가 실제로 다르다는 뜻이고, 그것이
@@ -2494,15 +2581,24 @@ fn emit_outphase(outputs: &[Output], freq: u64) {
         let delta = grid.vblank_qpc as i128 - base.vblank_qpc as i128;
         let rel = (((delta % period) + period) % period) as f64;
         // 이 출력의 vblank 를 남의 원점 기준으로 접는다. 주기가 0 이면 접을 수 없다.
+        // ★`[0,P)` 가 아니라 `[-P/2, P/2)` 로 접는다.★ 앞으로만 접으면 **0 보다 조금 이른**
+        // 값이 주기만큼 커져서 나온다 -- 2026-10-26 에 `+16.64`(주기 16.67)를 "한 주기를
+        // 훑었다" 로 읽었는데 실제로는 `-0.03` 이었다. 그 오독이 설계 한 바퀴를 돌렸다.
+        // 가운데로 접으면 `qpcVBlank` 가 **다음** vblank 일 수 있다는 단서도 같이 흡수된다
+        // (한 주기 앞은 modulo 로 같은 값이다).
         let against = |origin: u64, other_period: u64| -> Option<f64> {
             let other_period = i128::from(other_period);
             if other_period == 0 {
                 return None;
             }
             let diff = grid.vblank_qpc as i128 - origin as i128;
-            Some(to_ms(
-                (((diff % other_period) + other_period) % other_period) as f64,
-            ))
+            let folded = ((diff % other_period) + other_period) % other_period;
+            let centred = if folded >= other_period / 2 {
+                folded - other_period
+            } else {
+                folded
+            };
+            Some(to_ms(centred as f64))
         };
         warn!(
             "OUTPHASE out={} monitor={:#x} primary={} period_ms={:.2} measured={} rel_ms={:+.2} \
