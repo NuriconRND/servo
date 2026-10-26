@@ -384,10 +384,47 @@ impl SceneSpatialTree {
                             // later on, even if it's not actually scrollable.
                             outermost_scroll_root = node_index;
 
+                            // ★스파이크(버릴 것) -- `WR_SPIKE_NO_EXPLICIT_SCROLL_ROOT=1`★
+                            //
+                            // 가르려는 것: 티커의 `overflow:hidden` 띠가 글자가 오른쪽으로
+                            // 넘치는 동안에만 `scrollable_size > 0` 이 되어 여기서 슬라이스
+                            // 루트로 승격되고, 그 결과 picture cache 슬라이스가 1 -> 5 로
+                            // 쪼개지며 DComp 서피스 8 개가 6 초마다 났다 죽는다(실측
+                            // log_fullthrottle_arch/03: `create_surface` 8 개 x 6 초 주기,
+                            // `virtual_offset` 은 내내 고정이라 recentre 경로는 아니다).
+                            //
+                            // 승격을 건너뛰면 아래 반환부가 `outermost_scroll_root`(셸)로
+                            // 떨어져 다섯 띠가 한 슬라이스에 남는다 -- `?clip=all` 과 같은
+                            // 상태다. 그 arm 의 dup 이 0.082% 였으니 여기서도 그 값이 나오면
+                            // 원인이 확정된다.
+                            //
+                            // ***운영값이 아니다.*** 진짜 스크롤러까지 함께 승격을 잃는다.
+                            // 이 프로브 페이지에는 스크롤되는 것이 없어서 쓸 수 있을 뿐이다.
+                            // 확정되면 `ScrollFrameDescriptor` 에 "사용자 스크롤 불가" 를
+                            // 실어 보내고 그 경우만 거르는 쪽으로 바꾼다.
+                            // ★이름이 `SERVO_` 로 시작하면 안 된다.★ `run_wall_dist.ps1:857`
+                            // 이 기동 직전에 `SERVO_*` 를 전부 지운다(옛 env 노브가 startup 을
+                            // 막기 때문이다). 첫 스파이크(2026-10-26 log 05)가 그래서 두 arm
+                            // 모두 OFF 로 돌았다. 같은 파일의 `WR_DISABLE_PICTURE_CACHING` 이
+                            // 살아남는 이름의 선례다.
+                            //
+                            // ★arm 을 로그로 증명한다.★ log 05 는 이 줄이 없어서 "env 가 안
+                            // 닿았다" 와 "가설이 틀렸다" 를 가르지 못했다.
+                            static SPIKE_NO_EXPLICIT_SCROLL_ROOT: std::sync::LazyLock<bool> =
+                                std::sync::LazyLock::new(|| {
+                                    let on = std::env::var("WR_SPIKE_NO_EXPLICIT_SCROLL_ROOT")
+                                        .is_ok_and(|value| value == "1");
+                                    log::warn!(
+                                        "WRSPIKE no_explicit_scroll_root={}",
+                                        u8::from(on)
+                                    );
+                                    on
+                                });
+
                             // If the previously identified scroll root is sticky then we don't
                             // want to choose an ancestor scroll root, as we want the sticky item
                             // to have its own picture cache slice.
-                            if !current_scroll_root_is_sticky {
+                            if !current_scroll_root_is_sticky && !*SPIKE_NO_EXPLICIT_SCROLL_ROOT {
                                 // If the scroll root has no scrollable area, we don't want to
                                 // consider it. This helps pages that have a nested scroll root
                                 // within a redundant scroll root to avoid selecting the wrong
