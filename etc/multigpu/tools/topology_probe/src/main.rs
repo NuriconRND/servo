@@ -327,8 +327,18 @@ fn validate_layout_file(path: &PathBuf, gpu_count: usize, monitor_count: usize) 
         errors.push("tiles must contain at least one tile".to_string());
     }
 
+    // 엔진과 같은 규칙으로 본다: 타일들의 bounding box 의 left-top 이 페이지 (0, 0) 으로
+    // 옮겨진 뒤에 뷰포트 안에 드는지를 검사한다. 권위 있는 구현은
+    // `components/shared/paint/wall_layout.rs` 의 `shift_tiles_to_bounding_box_origin` 이고,
+    // 여기는 그 규칙의 두 번째 사본이다 -- 어긋나면 이 도구가 멀쩡한 레이아웃을 틀렸다고
+    // 보고한다(2026-10-26 에 실제로 그럴 뻔했다).
+    let min_x = layout.tiles.iter().map(|t| t.rect[0]).min().unwrap_or(0);
+    let min_y = layout.tiles.iter().map(|t| t.rect[1]).min().unwrap_or(0);
+
     for (index, tile) in layout.tiles.iter().enumerate() {
-        let [x, y, width, height] = tile.rect;
+        let [raw_x, raw_y, width, height] = tile.rect;
+        let x = raw_x.saturating_sub(min_x);
+        let y = raw_y.saturating_sub(min_y);
 
         if width <= 0 || height <= 0 {
             errors.push(format!("tile {index} rect width and height must be positive"));

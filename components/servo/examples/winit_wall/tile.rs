@@ -14,7 +14,7 @@ use servo::{
     DisplayTopology, RenderingContext, WebViewPaintTarget, WindowRenderingContext,
     dxgi_luid_for_gpu_index,
 };
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition};
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::raw_window_handle::{DisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -270,10 +270,18 @@ fn plan_tile_windows(
                     attributes =
                         attributes.with_position(PhysicalPosition::new(position.x, position.y));
                 } else {
-                    attributes = attributes.with_position(LogicalPosition::new(
-                        tile.rect.origin.x as f64,
-                        tile.rect.origin.y as f64,
-                    ));
+                    // ★`tile.rect.origin` 을 창 위치로 쓰면 안 된다.★ 파싱이 끝난 rect 는
+                    // **페이지 공간**이다 -- `shift_tiles_to_bounding_box_origin` 이 bounding
+                    // box 를 페이지 (0,0) 으로 옮겨 놓으므로 그 값은 데스크톱 좌표가 아니다.
+                    // (음수 좌표 레이아웃에서는 전부터 이미 틀린 값이었다.) 여기는 DXGI
+                    // 토폴로지도 비었고 winit 에도 그 색인의 모니터가 없는 막다른 길이라,
+                    // servoshell 이 같은 자리에서 하는 대로(headed_window.rs) 창 위치를
+                    // 창 관리자에 맡기고 사실만 남긴다.
+                    eprintln!(
+                        "warning: wall tile {tile_index}: no DXGI topology and no winit monitor \
+                         at display index {}; letting the window manager place this window",
+                        tile.display
+                    );
                 }
                 None
             },

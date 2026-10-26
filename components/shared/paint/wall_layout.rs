@@ -252,18 +252,34 @@ fn parse_tiles(
         });
     }
 
-    shift_tiles_to_non_negative_origin(&mut parsed_tiles);
+    shift_tiles_to_bounding_box_origin(&mut parsed_tiles);
     for (index, tile) in parsed_tiles.iter().enumerate() {
         validate_tile_rect(index, tile.rect, virtual_viewport)?;
     }
     Ok(parsed_tiles)
 }
 
-/// Tile rects may be written in Windows desktop coordinates, where a display left of or
-/// above the primary display has a negative origin. Shift every tile by the same amount so
-/// the leftmost/topmost tile edge lands on page 0; an axis that never goes negative is left
-/// alone, so existing non-negative layouts are unchanged.
-fn shift_tiles_to_non_negative_origin(tiles: &mut [WallTile]) {
+/// 타일 rect 는 **데스크톱 좌표로 써도 된다.** 모든 타일을 같은 양만큼 옮겨 ★타일들의
+/// bounding box 의 left-top 이 페이지 `(0, 0)`★ 이 되게 한다. 음수든 양수든 똑같이 옮긴다.
+///
+/// ★`virtualViewport` 는 여기서 유도하지 않는다.★ 그것은 CSS 페이지 크기이고 bounding box
+/// 보다 **커도 된다** -- `wall_layout.bisect_1tile.json` 이 뷰포트 11520x2160 에 타일 하나
+/// 5760x2160 으로 그 관용구를 쓴다. 옮긴 rect 가 뷰포트 안에 드는지는 `validate_tile_rect`
+/// 가 그대로 본다.
+///
+/// ★왜 음수만 옮기던 것을 바꿨나(2026-10-26).★ 전에는 `-min.min(0)` 이라 **최솟값이 양수면
+/// 아무 일도 하지 않았다.** 그래서 벽의 한 GPU 영역만 띄우려고 그 영역의 실제 rect 를 그대로
+/// 쓰면 -- 예를 들어 `{뷰포트 5760x2160, 타일 [5760,0,5760,2160]}` -- `validate_tile_rect`
+/// 가 `max_x() > width` 로 거부해 창이 하나도 뜨기 전에 종료됐다. 그 영역이 (0,0) 에 있는
+/// GPU 0 만 우연히 동작했다.
+///
+/// ★조건부로 하지 않는다.★ "bounding box 가 이미 들어맞으면 옮기지 않는다" 로 하면 레이아웃의
+/// 의미가 산술적 우연에 달린다 -- 타일을 하나 더하는 순간 페이지가 조용히 다시 앵커된다.
+/// 대신 포기하는 것이 하나 있다: "페이지는 11520x4320 로 잡고 이 디스플레이에는 그 **오른쪽**
+/// 절반만 보인다"(큰 뷰포트 + 원점이 0 이 아닌 타일 하나)가 이제 왼쪽 절반이 된다. 커밋된
+/// 레이아웃 23 개 중 그 모양은 하나도 없다. 되살리려면 `virtualViewport` 에 선택적 `x`/`y`
+/// 를 더하면 되고(기본값은 bounding box 원점), 그것도 파싱 시점 빼기라 소비처는 안 바뀐다.
+fn shift_tiles_to_bounding_box_origin(tiles: &mut [WallTile]) {
     let min_x = tiles
         .iter()
         .map(|tile| tile.rect.origin.x)
@@ -274,13 +290,17 @@ fn shift_tiles_to_non_negative_origin(tiles: &mut [WallTile]) {
         .map(|tile| tile.rect.origin.y)
         .min()
         .unwrap_or(0);
-    let shift: Vector2D<i32, DeviceIndependentPixel> = Vector2D::new(-min_x.min(0), -min_y.min(0));
+    // `saturating_neg` 이지 단항 `-` 가 아니다 -- `get_rect` 는 `i32::MIN` 도 받는다.
+    let shift: Vector2D<i32, DeviceIndependentPixel> =
+        Vector2D::new(min_x.saturating_neg(), min_y.saturating_neg());
+    // 이미 (0, 0) 에서 시작하는 레이아웃은 여기서 조용히 빠진다 -- 커밋된 23 개 중 22 개가
+    // 그렇고, 그 22 개의 파싱 결과는 이 변경 전후로 한 바이트도 다르지 않다.
     if shift == Vector2D::zero() {
         return;
     }
     // See the NOTE in `parse_tiles`: logging isn't initialized yet at parse time.
     eprintln!(
-        "wall layout: tile rects extend to negative coordinates; shifting every tile by \
+        "wall layout: tile bounding box starts at ({min_x}, {min_y}); shifting every tile by \
          ({}, {}) so the top-left tile starts at page (0, 0)",
         shift.x, shift.y
     );
@@ -428,17 +448,103 @@ mod tests {
 
     #[test]
     fn rejects_out_of_bounds_tile() {
+        // ★원점이 아니라 **크기**가 넘쳐야 거부된다.★ 예전 본문은 `[90, 0, 20, 20]` 이었는데
+        // 이제 bounding box 가 (90, 0) 에서 (0, 0) 으로 옮겨져 들어맞는다. 그래서 뷰포트보다
+        // 넓은 타일로 바꾼다 -- 옮긴 뒤에도 `max_x() 200 > 100` 이라 여전히 거부되고, 원점
+        // 90 -> 0 이동도 같이 지난다.
         let error = WallLayout::from_json_str(
             r#"{
                 "virtualViewport": { "width": 100, "height": 100 },
                 "tiles": [
-                    { "display": 0, "rect": [90, 0, 20, 20] }
+                    { "display": 0, "rect": [90, 0, 200, 20] }
                 ]
             }"#,
         )
-        .expect_err("out-of-bounds tile should fail");
+        .expect_err("a tile wider than the viewport should fail");
 
         assert!(error.to_string().contains("exceeds virtualViewport"));
+    }
+
+    #[test]
+    fn normalizes_a_lone_tile_at_a_positive_desktop_origin() {
+        // ★운용자가 실제로 막힌 그 케이스다.★ 벽의 GPU 1 영역만 띄우려고 그 영역의 실제
+        // rect 를 그대로 쓴 것이고, 이 변경 전에는
+        // `tile 0 rect [5760, 0, 5760, 2160] exceeds virtualViewport` 로 창이 뜨기도 전에
+        // 종료됐다.
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 5760, "height": 2160 },
+                "tiles": [
+                    { "display": 1, "rect": [5760, 0, 5760, 2160] }
+                ]
+            }"#,
+        )
+        .expect("a lone off-origin tile should parse");
+
+        assert_eq!(layout.tiles[0].rect.origin, Point2D::new(0, 0));
+        assert_eq!(layout.tiles[0].rect.size, Size2D::new(5760, 2160));
+        // ★이 단언이 핵심이다★ -- 옮기는 것은 rect 뿐이고 어느 디스플레이에 붙는지는
+        // 건드리면 안 된다. `display` 는 `rect` 와 독립이다.
+        assert_eq!(layout.tiles[0].display, 1);
+        assert_eq!(layout.virtual_viewport, Size2D::new(5760, 2160));
+    }
+
+    #[test]
+    fn normalizes_a_lone_tile_below_the_desktop_origin() {
+        // y 축. x 만 보는 시험은 축 하나가 하드코딩된 구현을 통과시킨다.
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 5760, "height": 2160 },
+                "tiles": [
+                    { "display": 2, "rect": [0, 2160, 5760, 2160] }
+                ]
+            }"#,
+        )
+        .expect("a lone tile below the origin should parse");
+
+        assert_eq!(layout.tiles[0].rect.origin, Point2D::new(0, 0));
+        assert_eq!(layout.tiles[0].display, 2);
+    }
+
+    #[test]
+    fn shifts_a_positive_minimum_column_to_the_page_origin() {
+        // 타일 여럿에 최솟값이 양수인 경우. x 는 5760 만큼, y 는 0 만큼 옮겨지고 타일 사이
+        // 상대 위치는 보존되어야 한다.
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 5760, "height": 4320 },
+                "tiles": [
+                    { "display": 1, "rect": [5760, 0, 5760, 2160] },
+                    { "display": 3, "rect": [5760, 2160, 5760, 2160] }
+                ]
+            }"#,
+        )
+        .expect("a right-hand column should parse");
+
+        let origins: Vec<_> = layout.tiles.iter().map(|tile| tile.rect.origin).collect();
+        assert_eq!(origins, vec![Point2D::new(0, 0), Point2D::new(0, 2160)]);
+        assert_eq!(layout.tiles[1].rect.size, Size2D::new(5760, 2160));
+    }
+
+    #[test]
+    fn keeps_a_virtual_viewport_larger_than_the_tile_bounding_box() {
+        // `wall_layout.bisect_1tile.json` 의 모양. ★뷰포트 크기는 bounding box 에서 유도하지
+        // 않는다★ -- 이 시험이 없으면 나중의 "정리" 가 bisect 레이아웃 둘을 조용히 깬다.
+        let layout = WallLayout::from_json_str(
+            r#"{
+                "virtualViewport": { "width": 11520, "height": 2160 },
+                "tiles": [
+                    { "display": 0, "rect": [0, 0, 5760, 2160] }
+                ]
+            }"#,
+        )
+        .expect("an oversized viewport should parse");
+
+        assert_eq!(layout.virtual_viewport, Size2D::new(11520, 2160));
+        assert_eq!(
+            layout.tiles[0].rect,
+            Rect::new(Point2D::new(0, 0), Size2D::new(5760, 2160))
+        );
     }
 
     #[test]
@@ -472,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn shifts_only_the_axis_that_goes_negative() {
+    fn shifts_a_negative_minimum_leaving_an_already_zero_axis_alone() {
         let layout = WallLayout::from_json_str(
             r#"{
                 "virtualViewport": { "width": 3840, "height": 1080 },
@@ -502,6 +608,34 @@ mod tests {
         .expect_err("a 3840-wide span does not fit a 1920-wide viewport");
 
         assert!(error.to_string().contains("exceeds virtualViewport"));
+    }
+
+    #[test]
+    fn every_shipped_wall_layout_config_parses() {
+        // ★인수 시험이다.★ `etc/multigpu/config/wall_layout.example_1x1.json` 이
+        // `{뷰포트 1920x1080, monitor 1, rect [1920,0,1920,1080]}` -- 운용자가 막힌 바로 그
+        // 모양이라, 이 변경 전에는 이 시험이 그 파일에서 떨어진다. 배포본에 들어가는 파일이
+        // 전부 로드되는지를 여기서 한 번에 지킨다.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../etc/multigpu/config");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            // 체크아웃에 따라 없을 수 있다. 그때는 할 말이 없으므로 조용히 지나간다.
+            return;
+        };
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_layout = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("wall_layout.") && name.ends_with(".json"));
+            if !is_layout {
+                continue;
+            }
+            WallLayout::from_path(&path)
+                .unwrap_or_else(|error| panic!("{} should parse: {error}", path.display()));
+            checked += 1;
+        }
+        assert!(checked >= 20, "expected the shipped layouts, found {checked}");
     }
 
     #[test]
