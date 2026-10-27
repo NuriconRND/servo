@@ -72,15 +72,10 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
 
 /// ★표출 틱을 냈다고 알린다.★ 셸이 그리는 사람을 부르기 **직전**에 틱마다 한 번 부른다.
 ///
-/// 재려는 것은 `틱 -> 커밋` 이다. 커밋은 렌더 패스의 **끝**에서 나가므로, 패스 길이가
-/// 흔들리면 커밋 위상이 1:1 로 흔들린다. 그 몫을 분리해야 `commit_lead_ms` 의 산포가
-/// 어디서 오는지 가린다 -- 자세한 것은 `output_grid::TICK_QPC`.
-///
 /// ★이것을 부르지 않으면 `gfx_present_align_commit_pct` 가 아무 일도 하지 않는다.★
 /// 마감이 틱에서 세지므로, 틱이 없으면 `commit_deadline()` 이 `None` 이고 전 타일이 즉시 커밋
 /// 폴백을 한다(그러니 초당 한 번 `[commitsched] ... tick=false` 경고가 나온다). 정렬 pref 를
 /// 쓰려는 셸은 반드시 이것을 틱마다 부르고, 쓰지 않는 셸은 그 pref 를 켜지 않는다.
-/// `TICKCOMMIT` 줄도 이것에 달려 있다.
 ///
 /// ★여기가 틱 번호를 올리는 자리이기도 하다.★ 외부 서피스 표출(`present_external_only`)은
 /// WR 프레임을 안 거쳐 `generate_frame` 회계 밖에 있으므로, "틱마다 최대 1 회" 를 세려면
@@ -130,8 +125,6 @@ mod tracing;
 /// WR Native Compositor(DirectComposition) 구현. Windows 전용, painter(Task 5)가 결선한다.
 #[cfg(windows)]
 mod dcomp_compositor;
-#[cfg(windows)]
-mod comp_stats;
 #[cfg(windows)]
 mod output_grid;
 #[cfg(windows)]
