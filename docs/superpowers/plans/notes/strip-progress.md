@@ -10,11 +10,11 @@
 
 | | |
 |---|---|
-| 진행 | **5 / 20 단계** |
-| 누적 제거 | **약 3,845 줄** |
-| 계획서 오류 (발견) | **33 건** (실행 중 5 + 재검증 28) |
-| 조용한 회귀 회피 | **8 건** |
-| 기준선 | `servo-paint --lib` 130/130 → 현재 **113/113** (계측 테스트 17 개 제거분) |
+| 진행 | **7 / 20 단계** |
+| 누적 제거 | **약 5,470 줄** |
+| 계획서 오류 (발견) | **44 건** (실행 중 16 + 재검증 28) |
+| 조용한 회귀 회피 | **11 건** |
+| 기준선 | `servo-paint --lib` 130/130 → 현재 **103/103** (계측 테스트 27 개 제거분) |
 | `config_surface` | 19/20 (기존 RED) → Step 14 에서 **20/20** 이 되어야 함 ★독립 성공 신호★ |
 
 ---
@@ -103,6 +103,76 @@ GPUMEM 190 / 캔버스 ack 래치 115 / IMGUPDINNER 85 / WALLBOOTSTRAP 42 / PAIN
 - `log_gpu_memory` 호출처는 맨 호출이 아니라 `if let Some(device) = ...` 3 줄 래퍼.
 
 하중 심볼 41 종 중 35 불변, 변한 여섯은 전부 로그 인자였음을 백업과 대조. 게이트 **113**.
+
+### Step 6 — 프레임 요청/완료 진단 축약 · `paint.rs` 집계기 `0a5d990a884` (756 줄)
+
+★삭제가 아니라 **축약**인 것 넷★ — 이름에 "diagnostic" 이 붙어 있지만 벽 프레임 barrier 의
+요청→완료 대응을 나르는 하중이다: `record_frame_request`(본문이 push_back 하나로),
+`PendingFrameDiagnostic`, `note_webrender_frame_ready`, `FrameReadyDiagnostic`.
+
+`paint.rs` 에서 제거: `note_demand_tick`, `log_wall_frame_metadata`,
+`log_wall_frame_pacing_summary` 와 `WallFramePacingBlockTally`, PAINTDRAIN 전후,
+IMGUPDRATE 일체, media image fanout summary, WALLSHOTPAUSE 꼬리, barrier 로그 줄.
+`shared/paint/lib.rs` 에서 `impl PaintMessage { kind() }`.
+
+**★피한 함정 — barrier `if/else-if` 체인★** 인벤토리의 "1000-1032 삭제" 는 쓰지 않았다.
+그 범위가 `else if !barrier.presentation_decision_made { complete_before_deadline = true; }`
+를 자르는데 그 팔이 하중이다. 범위대로 지우면 `} else if` 가 매달리고, 중괄호를 "고치려고"
+그 팔을 떨구면 **모든 before-deadline barrier 가 after-deadline 으로 조용히 바뀐다.**
+최종 모양(직접 확인):
+
+```rust
+if barrier.ready_painter_ids.len() == barrier.expected_painter_ids.len() {
+    barrier.completed_at = Some(diagnostic.ready_at);
+    if !barrier.missed_deadline && !barrier.presentation_decision_made {
+        complete_before_deadline = true;
+    }
+}
+```
+
+**계획서 오류 4 건** — ① `PaintMessage::kind()` 의 호출자가 둘(둘째가 살아남는 테스트 안의
+`fn kinds()`). 첫 빌드가 `E0599` 로 죽었고 `strum IntoStaticStr` 로 고쳤다.
+② ★`WALL_FRAME_PACING_INFO_INTERVAL` 은 지우면 안 된다★ — 인벤토리가 적은 두 용처 중 하나가
+실은 "keep-previous expired" warn 의 rate limit 이고 그건 실제 조건 보고다.
+③ `diagnostic.local_frame_id` 독자 목록 불완전(고장 주입 warn 누락, 그건 KEEP).
+④ `WallFrameBarrier.requested_at` 이 고아가 되는데 계획서에 없다.
+
+게이트 113/113(변동 없음).
+
+### Step 7 — paint 나머지: LOCKWAIT·FRAMETIME·ANIMTICK·PAINTERLOCK·WEBGLEXTIMG·TIMELINESTEP `36df08f56fe` (869 줄, 9 파일)
+
+`commit_guard` −153 / `web_content_animation` −287 / `frame_time` −119 /
+`webrender_external_images` −110 / `paint` −84 / `painter` −62 / `refresh_driver` −28 /
+`dcomp_compositor` −14 / `output_grid` −1.
+
+**남긴 것 (전부 직접 확인)**
+- ★`commit_guard` 의 뮤텍스 독 복구 둘★ — `DEVICE_LOCKS.lock().unwrap_or_else(|e| e.into_inner())`
+  와 `device_guard` 의 `lock.lock().unwrap_or_else(|e| e.into_inner())`.
+  `WORKERS`/`DONE`/`CommitWorker`/`ensure_workers` 와 `commit_all_at_tick` 의 디스패치·recv·
+  순차 폴백, `SAMPLE_LEAD_PERIODS` 전부.
+- ★`frame_time.rs` 의 rAF 배관 전부★ — `FRAME_TIME_NANOS`·`note_frame_time`·`stored_frame_time`·
+  `fresh_frame_time`·`frame_time_for_tick`. 페이지가 받는 타임스탬프이므로 기능이다.
+- ★`MAX_DISPLAY_LIST_TRANSIT`★ — `animation_zero` 가 그것으로 클램프하고 그 값이 그려진다.
+
+`output_grid.rs` 는 **한 줄만** 건드렸다(`emit_lockwait()` 호출). 이중 소유권을 이 단계가
+가져가기로 계획서가 정했다. 나머지는 Step 12/13 소유.
+
+**계획서 오류·누락 5 건** — ① 게이트 101 이 아니라 **103**(일곱 번째 집계 오류, 델타 −10 은 맞음).
+② ★`install_paint_animations` 의 doc 이 물리적으로 `note_timeline_step` 에 붙어 있었다★ —
+한 줄 위에서 잘랐으면 **컴파일 에러 없이** 그 doc 이 사라진다(Step 5 의 `last_render_end` 와 같은 부류).
+③ `device_guard` 의 독 복구가 셋이었다(`COLLECT` 조기 반환 팔에 중복).
+④ `frame_time` 의 doc 두 줄이 이미 죽은 `FRAMETIME`·`CommitSite` 를 인용.
+⑤ `dcomp_compositor::commit_at_tick_locked` doc 에 죽은 문단.
+
+**ANIMTICK warn 셋 중 둘은 `if self.animating.get()` 래퍼의 유일한 문장**이라 래퍼를 같이
+지웠다. 바깥 `if`/`return`/`set` 은 전부 유지.
+
+★Step 15 참고★ — 이 단계 뒤 `components/paint` 에 `interval_summary` 사용자가 **0** 이다.
+트리에 남은 소비자는 `script/raf_clock.rs` 뿐이고 Step 10 이 지운다.
+
+게이트 113 → **103**. 지운 테스트 10 개는 전부 계측(LOCKWAIT 히스토그램 1, TIMELINESTEP
+포맷터 4, TRANSITCLAMP 보고기 1, ANIMSTEPSEQ 포맷터 4). 픽셀을 바꾸는 클램프는
+`an_absurd_transit_is_clamped` 가 계속 덮는다.
 
 ---
 
