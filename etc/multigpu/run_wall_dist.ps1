@@ -1131,6 +1131,41 @@ if ($NumaNode -eq "auto") {
     throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
 }
 
+# ★런 하나의 구성을 한 블록으로 못박는다 -- 콘솔에 지금, 로그 파일에 런이 끝난 뒤.★
+# 2026-10-27 에 run 08/10 의 arm 비교가 통째로 무효가 된 원인이 이 블록의 부재다: e 암은
+# -LegacyLogRedirect(파이프, 쓰기당 127 us) 로 돌고 d 암은 cmd 상속 핸들(7.1 us) 로 돌았는데
+# 배너 어디에도 그 차이가 안 찍혀서 "로그 분량" A/B 로 읽혔다. 전송로와 RUST_LOG 가 ***동시에***
+# 바뀐 비교였고, 그 수치가 다섯 세션을 돌아다녔다. 한 줄이면 막혔다.
+#
+# ★전송로 판정은 아래 launch 분기와 같은 조건식이어야 한다.★ 둘이 어긋나면 이 블록은
+# 거짓말이 되고, 그건 블록이 없는 것보다 나쁘다 -- 틀린 라벨이 붙은 수치는 의심조차 안 받는다.
+#
+# ★-NoLog 는 "로깅을 끈다" 가 아니다.★ RUST_LOG 은 그대로라 엔진은 레코드 1,850 개/s 를 여전히
+# 만들고 `format!` 까지 한 다음 두 로거에 돌린다 -- 공짜가 된 것은 write 하나뿐이다. D 암을
+# "로그 없음" 기준선으로 읽으면 포맷 CPU 를 기준선에 포함시킨 채 비교하게 된다. 값에 적어 둔다.
+$stderrTransport = "redirect-pipe"
+if ($NoLog) {
+    $stderrTransport = "nul (RUST_LOG unchanged: records are still built and formatted; only the write is free)"
+} elseif ($numaResolved -ge 0 -or -not $LegacyLogRedirect) {
+    $stderrTransport = "inherited-handle"
+}
+# md5 는 BUILD.txt 가 못 가르는 것을 가른다 -- dirty 빌드는 commit 이 같아도 코드가 다르다.
+# 139 MB 엔진에서 실측 383 ms 다. 60 초 런 옆에서는 공짜고, 해시가 없으면 "어느 빌드였나" 에
+# 답할 방법이 bytes + mtime 뿐이다(그 둘은 서로 다른 빌드에서 같은 값이 나올 수 있다).
+$engineMd5 = "unavailable"
+try { $engineMd5 = (Get-FileHash -Path $exe -Algorithm MD5).Hash.Substring(0, 12) } catch { }
+$runConfig = @(
+    ("stderr       : {0}" -f $stderrTransport),
+    ("rust_log     : {0}" -f $env:RUST_LOG),
+    ("duration_sec : {0}" -f $(if ($DurationSec -gt 0) { $DurationSec } else { "unbounded (no -DurationSec)" })),
+    ("engine_md5   : {0}" -f $engineMd5),
+    ("args         : {0}" -f ($argList -join ' '))
+)
+Write-Host ""
+Write-Host "RUN CONFIG"
+$runConfig | ForEach-Object { Write-Host "  $_" }
+Write-Host ""
+
 # ***래퍼가 기본이다 -- NUMA 핀이 없어도.*** 핀 때문이 아니라 ***stderr 때문***이다:
 # cmd 의 `2>` 는 자식에게 파일 핸들을 그대로 물려주는데, Start-Process -RedirectStandardError
 # 는 파이프를 끼우고 PowerShell 이 퍼낸다. 쓰기당 7.1 us 대 127.4 us, 최악 0.9 ms 대 25.4 ms.
@@ -1308,6 +1343,29 @@ if ($cmdFile -and (Test-Path $cmdFile)) {
 }
 
 if (!(Test-Path $LogPath)) { exit 0 }
+
+# ★같은 블록을 로그 파일에도 남긴다.★ 콘솔 출력은 사람이 console.txt 로 따로 저장해야 남지만
+# .err.log 는 공유 폴더로 그대로 옮겨진다 -- run 10 이 다섯 세션을 돌아다니는 동안 어느 암이
+# 어느 전송로로 돌았는지 ***로그만 봐서는 알 수 없었던*** 것이 그래서다.
+#
+# ★머리가 아니라 꼬리에 붙인다.★ cmd 의 `2>` 도 -RedirectStandardError 도 기동 시 파일을
+# 자르므로 미리 써 둔 머리글은 날아간다. 꼬리는 두 분기에서 똑같이 동작한다.
+#
+# 분석부의 패턴 중 `RUNCONFIG` 로 시작하는 줄을 읽는 것은 없다. -SimpleMatch 카운터 다섯 개
+# ("profile_id=", "direct file playback", "[dcomp-native] engaged", "[wr-tile-size] picture
+# tile size override", "panicked")도 이 블록에는 안 걸린다 -- ***단 -Url 이나 -Pref 에 그
+# 문자열을 넣으면 args 줄을 통해 섞인다.*** 그때는 마커 수가 1 늘고, 그건 눈에 보인다.
+try {
+    Add-Content -Path $LogPath -Encoding utf8 -Value (
+        @("") + ($runConfig | ForEach-Object { "RUNCONFIG $_" })
+    )
+} catch {
+    Write-Warning "could not append RUN CONFIG to ${LogPath}: $($_.Exception.Message)"
+}
+
+Write-Host ""
+Write-Host "RUN CONFIG (this log)"
+$runConfig | ForEach-Object { Write-Host "  $_" }
 
 function CountOf($pattern) {
     (Select-String -Path $LogPath -Pattern $pattern -SimpleMatch -EA SilentlyContinue | Measure-Object).Count
