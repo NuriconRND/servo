@@ -1897,15 +1897,12 @@ impl Renderer {
             }
         }
 
-        // 임계값을 env 로 뺀 것은 개발기에서 이 줄이 실제로 찍히는지 확인하기 위해서다
-        // -- 침묵하는 계측을 테스트 장비로 보내는 실수를 이 작업에서 이미 두 번 했다.
-        static WR_SLOW_MS: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
-            std::env::var("SERVO_WR_SLOW_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(100.0)
-        });
-        if t > *WR_SLOW_MS {
+        // 임계값은 상수다. `SERVO_WR_SLOW_MS` env 노브는 2026-10-27 계측 제거에서 없앴다 --
+        // 등록되지 않은 `SERVO_*` 이름이었고(`config_surface` 의 표류 테스트가 잡는다),
+        // 이 WRSLOW 블록 자체는 vendor_local/webrender 패치를 upstream 으로 되돌릴 때 함께
+        // 사라진다.
+        const WR_SLOW_MS: f64 = 100.0;
+        if t > WR_SLOW_MS {
             let get = |id: usize| self.profile.get(id).unwrap_or(0.0);
             log::warn!(
                 "WRSLOW renderer_ms={:.1} pre_draw_ms={:.1} unlock_ms={:.1} gpu_profiler_ms={:.1} gpu_cache_resolve_ms={:.1} resolves={} resolve_lock_ms={:.1} resolve_reset_state_ms={:.1} draw_frame_ms={:.1} tex_cache_ms={:.1} native_surfaces_ms={:.1} compositor_begin_ms={:.1} debug_overlay_ms={:.1} shader_build_ms={:.1} texture_cache_update_ms={:.1} cpu_texture_alloc_ms={:.1} staging_alloc_ms={:.1} create_cache_texture_ms={:.1} upload_ms={:.1} upload_cpu_copy_ms={:.1} textures_created={:.0} textures_deleted={:.0} rt_mem_mb={:.1} picture_tiles_mb={:.1}",

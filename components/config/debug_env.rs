@@ -2,17 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! ★낡음(2026-08-11 기록, 2026-10-13 `5b88710bc08` 이후 무효)★ — `SERVO_LOG_ANIM_STEP_SEQ` 가 미등록인 채 painter.rs:4861 · raf_clock.rs:127 두 곳에서 이름 리터럴로 읽힌다.
 //! 조사용 환경변수의 단일 등록처.
 //!
 //! 운용 설정은 pref 다(설계 문서 §3 의 판정 기준). 여기 있는 것은 실패 주입·
-//! 프로파일링·이분탐색용이며, 조사가 끝나면 지운다.
+//! 킬 스위치용이며, 쓸 일이 끝나면 지운다. 숫자만 찍던 프로파일링 노브는 2026-10-27
+//! 계측 제거로 전부 사라졌다.
 //!
 //! 호출부가 이름 문자열을 갖지 않는 것이 핵심이다 — 이름이 두 곳에 있으면
-//! 한쪽만 바뀌어 조용히 갈라진다. 실제로 `SERVO_D3D11_PROFILE`은
-//! `servo-media-gstreamer-render-d3d11`과 `servo-media-thread` 두 크레이트에서, `SERVO_MEDIA_
-//! DISABLE_ENOUGHDATA_BACKOFF`는 `servo-media-gstreamer`와 `servo-script` 두 크레이트에서 각자
-//! 읽고 있었다(2026-08-11 조사 결과 두 판정식은 동일했다 — 상세는 task-1-report.md).
+//! 한쪽만 바뀌어 조용히 갈라진다. 실제로 `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF`는
+//! `servo-media-gstreamer`와 `servo-script` 두 크레이트에서 각자 읽고 있었다
+//! (2026-08-11 조사 결과 두 판정식은 동일했다 — 상세는 task-1-report.md).
 //!
 //! ## `Kind`에 대해
 //!
@@ -31,8 +30,8 @@
 //! 바꾸거나 복사-붙여넣기 실수) "A를 물었는데 B가 캐시되는" 조용한 버그가 된다. 이를
 //! 막기 위해 모듈 하단에 `ALL[i].cache_index == i`를 확인하는 const 블록이 있다 — 어긋나면
 //! **컴파일이 실패한다**(런타임에 발견되는 게 아니라). 대안으로 이름 문자열로 매 호출마다
-//! `ALL`을 선형 탐색하는 방법도 있었지만, `dcomp_debug()`처럼 타일당 프레임당(초당
-//! 수천 회) 불리는 게이트가 있어 O(1) 배열 접근을 유지했다.
+//! `ALL`을 선형 탐색하는 방법도 있었지만, `partial_present_disabled()`처럼 프레임마다
+//! 불리는 게이트가 있어 O(1) 배열 접근을 유지했다.
 //!
 //! ## `enabled`/`int`/`string`의 kind 검사에 대해
 //!
@@ -96,68 +95,21 @@ pub const WALL_FRAME_DELAY_COUNT: DebugFlag = DebugFlag {
 };
 
 // ---------------------------------------------------------------------------------------------
-// D3D11 렌더 경로 진단 (components/media/backends/gstreamer/render-d3d11/lib.rs 와
-// components/media/media-thread/lib.rs 두 크레이트가 각자 읽는다 — 판정식은 동일함을 확인함).
-// ---------------------------------------------------------------------------------------------
-
-pub const D3D11_PROFILE: DebugFlag = DebugFlag {
-    name: "SERVO_D3D11_PROFILE",
-    kind: Kind::Str,
-    doc: "D3D11 비디오 렌더 경로의 단계별 타이밍 계측을 켠다. truthy: \"1\"/\"true\"/\"on\" \
-          (대소문자 무시). render-d3d11 크레이트와 media-thread 크레이트 두 곳에서 각자 이 \
-          진단을 게이트한다.",
-    cache_index: 3,
-};
-
-pub const D3D11_PROFILE_MS: DebugFlag = DebugFlag {
-    name: "SERVO_D3D11_PROFILE_MS",
-    kind: Kind::Str,
-    doc: "위 계측의 로그 임계값(ms, f64). build_frame 총시간이 이 값 이상일 때만 로깅. \
-          미설정/파싱 실패 시 기본 8.0. 정수 전용 파서로는 표현 못 하는 f64 값이라 Str로 \
-          등록했다(예 \"8.5\").",
-    cache_index: 4,
-};
-
-// ---------------------------------------------------------------------------------------------
-// DirectComposition 컴포지터 진단 (components/paint/dcomp_compositor.rs). 다섯 다 순수 존재
+// DirectComposition 컴포지터 킬 스위치 (components/paint/dcomp_compositor.rs). 순수 존재
 // 체크(`.is_ok()`)라 Kind::Presence.
 // ---------------------------------------------------------------------------------------------
-
-pub const DCOMP_DEBUG: DebugFlag = DebugFlag {
-    name: "SERVO_DCOMP_DEBUG",
-    kind: Kind::Presence,
-    doc: "DComp bind/add_surface 좌표 진단 로그(Task 5 스모크 디버깅). 타일당 프레임당 불리는 \
-          핫패스라 OnceLock 캐시가 필수.",
-    cache_index: 5,
-};
-
-pub const DCOMP_READBACK: DebugFlag = DebugFlag {
-    name: "SERVO_DCOMP_READBACK",
-    kind: Kind::Presence,
-    doc: "DComp 서피스를 CPU 로 읽어 내려 실제로 그려졌는지 확인한다(Task 6 결함 진단 전용, \
-          glReadPixels로 파이프라인을 멈추므로 느리다, 호출부가 <=120프레임으로 제한).",
-    cache_index: 6,
-};
-
-pub const DCOMP_VALIDPROBE: DebugFlag = DebugFlag {
-    name: "SERVO_DCOMP_VALIDPROBE",
-    kind: Kind::Presence,
-    doc: "Task 9 결함 진단: non-opaque 서피스의 per-Virtual-bind valid_rect/dirty_rect 커버리지 \
-          로그(<=300프레임으로 제한).",
-    cache_index: 7,
-};
 
 pub const DCOMP_NO_PARTIAL_PRESENT: DebugFlag = DebugFlag {
     name: "SERVO_DCOMP_NO_PARTIAL_PRESENT",
     kind: Kind::Presence,
     doc: "진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.",
-    cache_index: 8,
+    cache_index: 3,
 };
 
 // ---------------------------------------------------------------------------------------------
-// ★낡음(2026-08-12 기록, 2026-08-31 `4ff3075ca97` 이후 무효)★ — DISABLE_VIDEO_IMMEDIATE_COMPOSITE 가 pref 로 나가 지금은 셋이다.
-// components/paint/painter.rs 킬 스위치/진단. 넷 다 `"1"`/`"true"` truthy 판정
-// (대소문자 무시, `"on"`/`"yes"`는 포함하지 않음 — D3D11_PROFILE 계열과 다른 변종).
+// components/paint/painter.rs 킬 스위치. 둘 다 `"1"`/`"true"` truthy 판정
+// (대소문자 무시, `"on"`/`"yes"`는 포함하지 않는 변종).
+// (DISABLE_VIDEO_IMMEDIATE_COMPOSITE 는 2026-08-31 `4ff3075ca97` 로 pref 가 됐다.)
 // ---------------------------------------------------------------------------------------------
 
 pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
@@ -166,7 +118,7 @@ pub const DCOMP_DISABLE_RESIZE_REBUILD: DebugFlag = DebugFlag {
     doc: "킬 스위치(기본 = 활성). 런타임 리사이즈(드래그/최대화) 정착 후 picture-cache \
           재구축을 끈다 — Task 12/12b 마스터 스위치, A/B 검증 및 회귀 시 안전 밸브. Windows \
           전용.",
-    cache_index: 9,
+    cache_index: 4,
 };
 
 pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
@@ -174,20 +126,7 @@ pub const DCOMP_DISABLE_RESIZE_VIRTUAL: DebugFlag = DebugFlag {
     kind: Kind::Str,
     doc: "task-12b 전용 킬 스위치(기본 = 활성). \"드래그 중 가상 서피스 모드\"만 끄고 Task 12의 \
           정착 재구축은 유지한다. Windows 전용.",
-    cache_index: 10,
-};
-
-// ---------------------------------------------------------------------------------------------
-// components/paint/dcomp_compositor.rs 의 나머지 하나(순수 존재 체크).
-// ---------------------------------------------------------------------------------------------
-
-pub const VIDEO_ESCAPE_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_VIDEO_ESCAPE_PROF",
-    kind: Kind::Presence,
-    doc: "external 비디오 present 파이프라인 프로파일러 게이트. 켜지면 렌더러 스레드가 초당 \
-          1회 [vesc-prof] 집계 라인(info)을 낸다 — acquire/convert/present 중 어느 단계가 \
-          프레임 예산을 먹는지 판독용.",
-    cache_index: 11,
+    cache_index: 5,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -202,75 +141,7 @@ pub const MEDIA_DISABLE_ENOUGHDATA_BACKOFF: DebugFlag = DebugFlag {
     doc: "킬 스위치: PlayerError::EnoughData 백오프(요청 취소/재탐색)를 끈다. truthy: \
           \"1\"/\"true\"/\"yes\"/\"on\"(대소문자 무시). gstreamer player 백엔드와 \
           HTMLMediaElement 두 곳에서 각자 같은 판정으로 게이트한다.",
-    cache_index: 12,
-};
-
-// ---------------------------------------------------------------------------------------------
-// 비디오 파이프라인 전달률 계측 (components/media/backends/gstreamer/player.rs).
-// ---------------------------------------------------------------------------------------------
-
-pub const MEDIA_VIDEO_RATE: DebugFlag = DebugFlag {
-    name: "SERVO_MEDIA_VIDEO_RATE",
-    kind: Kind::Str,
-    doc: "파이프라인별 VIDEORATE 요약을 1초에 한 줄씩 info로 찍는다. truthy: \
-          \"1\"/\"true\"/\"on\"(대소문자 무시). fps는 appsink가 실제로 받은 프레임 수, \
-          pts_rate는 pts가 벽시계 대비 몇 배로 진행하는지다 — 1.0이면 정상 재생, \
-          2.7이면 디코더가 그만큼 앞질러 돌고 있다는 뜻. 기본 off인 이유는 45타일 \
-          장시간 운용에서 초당 45줄이 쌓이기 때문이다(같은 이유로 기존 sample \
-          summary는 debug에 있다).",
-    cache_index: 13,
-};
-
-// ---------------------------------------------------------------------------------------------
-// 합성 요청 출처 계측 (components/paint/painter.rs).
-// ---------------------------------------------------------------------------------------------
-
-// ★아래 doc 의 "9 곳" 은 낡았다(2026-08-25 기록, 2026-09-09 `9eeb4f911ed` 이후 무효)★ —
-// 지금 `generate_frame` 호출 지점은 11 곳이다. 이 doc 문자열은 configuration.md:281 로
-// 그대로 복제되므로 고칠 때 둘을 같이 고쳐야 표류 테스트가 통과한다.
-pub const FRAME_REASON_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_FRAME_REASON_PROF",
-    kind: Kind::Str,
-    doc: "generate_frame 을 부른 호출 지점과 RenderReasons 를 1초에 한 줄로 집계한다. \
-          truthy: \"1\"/\"true\"/\"on\"(대소문자 무시). 합성 요청 경로가 9 곳이라 \
-          어느 것이 초당 200 회를 만드는지 로그만 보고는 가를 수 없다. 호출 지점은 \
-          #[track_caller] 로 얻으므로 호출부는 손대지 않는다. 프레임마다 불리는 \
-          핫패스라 기본 off 다.",
-    cache_index: 14,
-};
-
-pub const MEDIA_SINK_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_MEDIA_SINK_PROF",
-    kind: Kind::Str,
-    doc: "비디오 appsink 콜백을 단계별로 재서 1초에 한 줄 찍는다(pace/diag/build/render/          notify). truthy: \"1\"/\"true\"/\"on\"(대소문자 무시). ★D3D11PROF 는 build_frame           '안' 만 본다★ - 45 영상 실측에서 그 안은 프레임당 1.56ms(0.047 코어/영상)로           스레드가 쓰는 0.76 코어의 6% 에 불과했다. 나머지 0.35 코어(디코드 천장 0.36 을           빼고도 남는 몫)는 콜백의 '바깥' 어딘가이고, 후보가 넷뿐이라 재면 바로 갈린다           - 특히 notify 는 프레임마다 IpcSender 전송이라 45 영상이면 초당 1350 회다.           프레임마다 불리는 핫패스라 기본 off.",
-    cache_index: 15,
-};
-
-pub const WEBGL_FANOUT_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_WEBGL_FANOUT_PROF",
-    kind: Kind::Str,
-    doc: "WebGL 멀티-GPU 팬아웃의 비용을 1 초에 한 줄씩 집계한다 — 생산자 측 WEBGLFANOUT(논리 명령 수 / 디바이스별 적용 수 / \n          컨텍스트 전환 수 / ANGLE 락 대기 / 전환·적용·직렬화 시간)과 소비자 측 WEBGLEXTIMG(painter 별 lock·unlock \n          횟수와 시간, take_surface / create_texture / destroy_texture 시간, 프런트 버퍼가 없던 횟수). \n          truthy: \"1\" 또는 \"true\"(대소문자 무시). ★재실행 단가 가설은 반증됐다★ - 명령마다 컨텍스트를 갈아타는 것은 \n          사실이지만(적용의 96.7%) 그 비용이 창의 0.4% 라, 재실행 루프를 뒤집는 작업(전환 4N→4)은 아무것도 사주지 않는다. 남은 물음은 \n          소비자 측이다: WebGL 캔버스가 생기는 순간 타일 하나의 렌더가 0.23ms 에서 15ms 로 뛰는데, 그 시간이 전부 \n          renderer.render() 안이면서 그리는 일도(draw_calls=2) 올리는 일도(upload_mb=0.0) 아니다. create_ms \n          가 크면 서피스를 기다리는 것이고, no_front_buffer 가 크면 기다리는 게 아니라 받을 게 없는 것이다. 프레임마다 불리는 핫패스라 \n          기본 off.",
-    cache_index: 16,
-};
-
-pub const WALL_NO_PROBE: DebugFlag = DebugFlag {
-    name: "SERVO_WALL_NO_PROBE",
-    kind: Kind::Presence,
-    doc: "벽 계측의 **주 스위치**. 켜면 `output_grid`/`commit_guard` 의 모든 `note_*`/`emit_*` 가 \
-          첫 줄에서 돌아오고 프로브 스레드도 뜨지 않는다 — 수집도 방출도 없다. \
-          ★왜 따로 두는가★: 계측 비용을 재려고 계측을 더 붙이면 순환이다. 이 스위치는 그 대신 \
-          ***같은 바이너리에서 계측만 빼는*** A/B 를 가능하게 한다. 커밋 위상이 저더를 정하는 \
-          구조라(`commit_guard` 모듈 주석) 틱 머리에 얹히는 µs 가 그대로 위상이 되므로, \
-          \"계측이 지금 얼마를 먹고 있나\" 는 추정이 아니라 측정으로 답해야 한다. \
-          기본 off(= 계측 켜짐).",
-    cache_index: 23,
-};
-
-pub const DCOMP_BIND_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_DCOMP_BIND_PROF",
-    kind: Kind::Str,
-    doc: "DComp Native 컴포지터가 프레임마다 쓰는 시간을 1 초에 한 줄로 쪼갠다 — end_frame 전체와 그 안의 gl().flush() \n          / Commit() / 스왑체인 Present, escape 경로의 external 변환·Present(add_surface 안이라 \n          end_frame 밖이다), 타일 왕복(BeginDraw / pbuffer / EndDraw / teardown), 그리고 \n          begin_frame·end_frame 호출 수. truthy: \"1\" 또는 \"true\"(대소문자 무시). ★차례로 둘이 무죄로 \n          밝혀졌다★: 타일 왕복은 bind 당 0.541ms 에 painter 당 초당 3.2ms 였고(2026-09-01), gl().flush() 는 \n          조건부로 바꾸자 대기가 그대로 Commit 으로 옮겨가 같은 90% 를 차지했다 — 즉 그 flush 는 헛된 호출이 아니라 DWM 동기화 \n          대기를 흡수하고 있었다. 캔버스가 없으면 bind 가 0 이고 Commit 이 프레임당 0.013ms 로 월이 60fps 를 낸다. 캔버스가 \n          생기면 Commit 이 프레임당 12.7ms 가 되고, painter 4 개가 순차 실행이라 월 패스마다 ~51ms 가 된다. ★그 모양이 \n          정확히 타일 병렬화가 겹칠 수 있는 모양이다★(docs/multigpu/parallel_tile_render_design.md). 프레임마다 \n          불리는 핫패스라 기본 off.",
-    cache_index: 17,
+    cache_index: 6,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -290,7 +161,7 @@ pub const WALL_CANVAS_ACK_SKIP: DebugFlag = DebugFlag {
           painter 가 기동 직후 첫 기회에 예산을 날렸고, 보류할 것이 없었으므로 주입이 아무 \
           일도 하지 않았다(2026-09-03). ★2026-10-21 부터 소비 경로가 페이싱 틱 하나다★ — \
           틱이 생산할 때만 예산이 소비된다. 미설정/0 이면 주입 없음. 1 이면 충분하다.",
-    cache_index: 18,
+    cache_index: 7,
 };
 
 pub const WALL_DISABLE_CANVAS_ACK_RECOVERY: DebugFlag = DebugFlag {
@@ -299,58 +170,7 @@ pub const WALL_DISABLE_CANVAS_ACK_RECOVERY: DebugFlag = DebugFlag {
     doc: "`Painter::flush_owed_canvas_ack` 를 끈다(truthy: \"1\" 또는 \"true\"). ★주입이 진짜로 \
           교착을 만드는지 보이는 대조군★ — 이것 없이 주입만 걸면 복구가 즉시 메워서 \
           \"주입이 안 먹은 것\"과 구분되지 않는다. 운영에서 쓸 kill switch 이기도 하다.",
-    cache_index: 19,
-};
-
-// ---------------------------------------------------------------------------------------------
-// DComp 커밋 정체 계측 (components/paint/dcomp_compositor.rs, COMMITSITE).
-// ---------------------------------------------------------------------------------------------
-
-pub const DCOMP_SLOW_COMMIT_MS: DebugFlag = DebugFlag {
-    name: "SERVO_DCOMP_SLOW_COMMIT_MS",
-    kind: Kind::Int,
-    doc: "`COMMITSITE` 의 `over` 를 세는 문턱(ms). 이 값 이상 걸린 Commit() 을 호출 지점별로 \
-          따로 센다. 미설정/파싱 실패 시 기본 8. ★`max` 하나로는 \"22ms 짜리 한 번\" 과 \
-          \"22ms 짜리 60 번\" 이 구분되지 않는다★ — 앞은 정체고 뒤는 구조적 부하라 고칠 \
-          방법이 정반대다. 계측 자체는 `SERVO_DCOMP_BIND_PROF` 가 켜져 있을 때만 돈다.",
-    cache_index: 20,
-};
-
-// ---------------------------------------------------------------------------------------------
-// 스크립트가 받은 프레임 시각의 수열 (components/paint/frame_time.rs, FRAMETIME).
-// ---------------------------------------------------------------------------------------------
-
-pub const FRAME_TIME_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_FRAME_TIME_PROF",
-    kind: Kind::Str,
-    doc: "틱에 실려 나간 프레임 시각의 간격을 painter 별로 1 초에 한 줄씩 집계한다 -- \
-          `FRAMETIME`(dup / one / skip1 / skipN, dt 백분위, 틱 시점과의 지연 lag, 셸 값 대신 \
-          now() 로 떨어진 fallback 수). truthy: \"1\" 또는 \"true\"(대소문자 무시). \
-          ★이 값이 곧 페이지의 `requestAnimationFrame` 타임스탬프다★ -- 프레임이 초당 60 개 \
-          나가도 이 수열이 고르지 않으면 화면의 변위가 고르지 않다. 그래서 `dup` 이 0 이 \
-          아니면 그 자체가 결함이다(연속한 두 틱이 같은 시각을 실어 보냈다는 뜻이고, 페이지는 \
-          같은 위치를 두 번 계산한다). 같은 출력 페이지를 Chrome 은 single tile 에서 60fps 로 \
-          돌리는데 winit_wall 은 떨리고, 우리 지표는 전부 깨끗했다(2026-10-21, \
-          log_ani_debug_05/12) -- 그때 남아 있던 유일한 변수가 이것이라 만들었다. \
-          같은 스위치가 스크립트 쪽의 `RAFCLOCK` 도 켠다 \
-          (`components/script/raf_clock.rs`) -- 이쪽은 ***보낸*** 값이고 저쪽은 페이지가 ***받은*** 값이라, \
-          둘을 나란히 읽어야 어느 구간에서 고르지 않게 됐는지가 갈린다. `RAFCLOCK` 의 `clamped` 는 \
-          `Document::resolve_frame_time` 의 단조 증가 하한에 걸려 페이지가 직전과 같은 시각을 \
-          받은 횟수다. `SERVO_LOG_ANIM_STEP_SEQ` 를 함께 켜면 정렬 전 원시 수열(`FRAMETIMESEQ` / \
-          `RAFCLOCKSEQ`)도 찍는다. \
-          틱마다 불리는 자리라 기본 off.",
-    cache_index: 21,
-};
-
-// ---------------------------------------------------------------------------------------------
-// `with_painter_mut` 의 큐 대기 (components/paint/paint.rs, PAINTERLOCK).
-// ---------------------------------------------------------------------------------------------
-
-pub const WALL_PAINTER_LOCK_PROF: DebugFlag = DebugFlag {
-    name: "SERVO_WALL_PAINTER_LOCK_PROF",
-    kind: Kind::Str,
-    doc: "`with_painter_mut` 가 painter 스레드의 큐에서 기다린 시간을 painter 별로 1 초에 한 줄씩 집계한다 -- `PAINTERLOCK`(n, wait_ms p50 / p95 / max, 1ms 이상 기다린 횟수 over_1ms). 호출한 순간부터 콜백이 painter 스레드에서 시작하는 순간까지를 재며 콜백 자신의 실행 시간은 뺀다. 스레드 없는 painter 는 기다릴 것이 없어 재지 않는다. truthy: \"1\" 또는 \"true\"(대소문자 무시). 왜: 표출 틱이 단일 프레임 생산자가 되면 틱이 각 painter 에 `with_painter_mut` 로 닿는데, 이 호출이 타일 스레드의 진행 중 렌더 뒤에 서서 막히면 틱 자신의 클럭이 흔들린다 -- 그것이 설계에서 확인되지 않은 유일한 항목이었다. ★`max` 하나로는 \"3ms 한 번\" 과 \"3ms 를 60 번\" 이 구분되지 않고 그 둘은 결론이 정반대다★ 그래서 `over_1ms` 를 같이 센다. 판정: `p95 < 1ms` 면 틱이 블로킹 호출로 가고, `p95 >= 1ms` 면 비블로킹 포스트로 간다 -- ★어느 쪽이든 생산자는 하나다★. 호출마다 불리는 자리라 기본 off.",
-    cache_index: 22,
+    cache_index: 8,
 };
 
 /// 등록된 조사용 환경변수 전부. 순서는 각 상수의 `cache_index`와 일치해야 한다(아래 const
@@ -359,27 +179,12 @@ pub const ALL: &[&DebugFlag] = &[
     &WALL_FRAME_DELAY_TARGET_INDEX,
     &WALL_FRAME_DELAY_AFTER,
     &WALL_FRAME_DELAY_COUNT,
-    &D3D11_PROFILE,
-    &D3D11_PROFILE_MS,
-    &DCOMP_DEBUG,
-    &DCOMP_READBACK,
-    &DCOMP_VALIDPROBE,
     &DCOMP_NO_PARTIAL_PRESENT,
     &DCOMP_DISABLE_RESIZE_REBUILD,
     &DCOMP_DISABLE_RESIZE_VIRTUAL,
-    &VIDEO_ESCAPE_PROF,
     &MEDIA_DISABLE_ENOUGHDATA_BACKOFF,
-    &MEDIA_VIDEO_RATE,
-    &FRAME_REASON_PROF,
-    &MEDIA_SINK_PROF,
-    &WEBGL_FANOUT_PROF,
-    &DCOMP_BIND_PROF,
     &WALL_CANVAS_ACK_SKIP,
     &WALL_DISABLE_CANVAS_ACK_RECOVERY,
-    &DCOMP_SLOW_COMMIT_MS,
-    &FRAME_TIME_PROF,
-    &WALL_PAINTER_LOCK_PROF,
-    &WALL_NO_PROBE,
 ];
 
 /// `ALL`의 각 원소가 자신이 선언한 `cache_index`와 실제 배열 위치가 같은지 컴파일 타임에

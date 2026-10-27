@@ -58,7 +58,6 @@ Start-Process -FilePath $servoExe -ArgumentList (@("--window-size",$WindowSize) 
 ```
 servo: config: media_d3d11_enabled=true (default false)
 servo: config: media_sync_group_target=45 (default 0)
-servo: config: debug env: SERVO_LOG_PRESENT_CADENCE
 ```
 
 GUI 실행은 화면에 아무것도 안 보이므로 **stderr 를 파일로 돌려야 읽을 수 있다**:
@@ -300,34 +299,32 @@ servoshell 은 `--wall-layout` 이 없으면 평범한 브라우저 창으로 �
 
 ---
 
-> ★낡음(2026-08-12 기록, 2026-08-25 `749ffde32c8` 이후 무효)★ — `debug_env::ALL` 은 지금 23 개다.
-## 6. 조사용 환경변수 (15 개)
+## 6. 조사용 환경변수 (9 개)
 
-pref 가 아니다. **실패 주입 · 프로파일링 · 이분탐색용**이고 조사가 끝나면 지운다. 그래서
-CLI 가 아니라 환경변수로 남겼다 — 운용 설정과 섞이지 않게 하려는 것이다.
+pref 가 아니다. **실패 주입 · 킬 스위치용**이고 쓸 일이 끝나면 지운다. 그래서 CLI 가 아니라
+환경변수로 남겼다 — 운용 설정과 섞이지 않게 하려는 것이다. 숫자를 찍던 프로파일링 노브는
+2026-10-27 계측 제거로 전부 사라졌다.
 
 ```powershell
-$env:SERVO_LOG_PRESENT_CADENCE = "1"
+$env:SERVO_DCOMP_NO_PARTIAL_PRESENT = "1"
 target\debug\servoshell.exe ... 2> diag.err.log
 ```
 
-기동 덤프가 `servo: config: debug env: ...` 로 **설정된 것만** 찍어 주므로, 로그만 보고
-그때 무엇을 켜고 돌렸는지 알 수 있다.
-
-★**`Presence` 종류는 값을 보지 않는다.** `SERVO_DCOMP_DEBUG=0` 도 **켜진다.** 끄려면 변수
-자체를 지워야 한다.★ 어느 노브가 `Presence` 인지는
+★**`Presence` 종류는 값을 보지 않는다.** `SERVO_DCOMP_NO_PARTIAL_PRESENT=0` 도 **켜진다.**
+끄려면 변수 자체를 지워야 한다.★ 어느 노브가 `Presence` 인지는
 [`configuration.md`](configuration.md) 의 조사용 표에 종류가 적혀 있다.
 
-자주 쓰는 것:
+남아 있는 것:
 
-| 노브 | 무엇을 보나 |
+| 노브 | 무엇을 하나 |
 |---|---|
-| `SERVO_LOG_PRESENT_CADENCE` | 실제 엔진 present 빈도와 프레임 간 최악 간격. 페이지 rAF 카운트나 외부 캡처 도구와 무관한 그라운드트루스 |
-| `SERVO_D3D11_PROFILE` (+ `_MS` 임계값) | D3D11 비디오 렌더 경로 단계별 타이밍 |
-| `SERVO_VIDEO_ESCAPE_PROF` | external 탈출 파이프라인에서 acquire/convert/present 중 어디가 예산을 먹나 |
-| `SERVO_DCOMP_DEBUG` | DComp bind/add_surface 좌표. **타일당 프레임당** 찍히니 오래 켜두지 마라 |
-| `SERVO_DCOMP_READBACK` | 서피스를 CPU 로 읽어 실제로 그려졌는지 확인. `glReadPixels` 로 파이프라인을 멈추니 **느리다** |
 | `SERVO_WALL_FRAME_DELAY_*` 3종 | 배리어 실패 주입 — 느린 렌더러 시뮬레이션 |
+| `SERVO_DCOMP_NO_PARTIAL_PRESENT` | 부분 Present 만 끈다 — 강등 폴백 경로 검증용 |
+| `SERVO_DCOMP_DISABLE_RESIZE_REBUILD` | 리사이즈 정착 후 picture-cache 재구축 킬 스위치 |
+| `SERVO_DCOMP_DISABLE_RESIZE_VIRTUAL` | 드래그 중 가상 서피스 모드 킬 스위치 |
+| `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF` | EnoughData 백오프 킬 스위치 |
+| `SERVO_WALL_CANVAS_ACK_SKIP` | 캔버스 ack 교착 주입 |
+| `SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` | 그 주입의 대조군 — ack 복구를 끈다 |
 
 ---
 
@@ -359,7 +356,7 @@ target\debug\servoshell.exe ... 2> diag.err.log
   `gfx_wall_frame_pacing_enabled`, `gfx_video_escape_stable_swapchain`,
   > ★낡음(2026-08-12 기록, 2026-08-28 `ffb167e2dbf` 이후 무효)★ — 넷이 아니다. `gfx_video_immediate_composite_enabled`·`gfx_paint_side_animations_enabled` 등도 기본 true 다.
   `gfx_video_decouple_enabled`, `media_audio_enabled` 넷이다.
-- `SERVO_DCOMP_DEBUG=0` 으로 껐다고 믿기 (`Presence` 는 값을 안 본다).
+- `SERVO_DCOMP_NO_PARTIAL_PRESENT=0` 으로 껐다고 믿기 (`Presence` 는 값을 안 본다).
 
 **즉시 실패하는 것들** — 시끄럽게 죽으니 오히려 안전하다:
 

@@ -388,7 +388,6 @@ pub struct Preferences {
     ///
     /// 세 값이 각각 다른 것을 판별한다 — `flush` 로 충분하면 문제는 "제출이 안 돼 있었다" 이고,
     /// `finish` 여야 하면 "완료를 기다려야 한다" 이며, 둘 다 소용없으면 가설이 틀린 것이다.
-    /// 비용은 `SERVO_WEBGL_FANOUT_PROF` 의 `swap_sync_ms` 로 보인다.
     pub gfx_webgl_swap_sync: String,
     /// WebGL 캔버스 텍스처를 WR 에 넘기기 전에 **painter 디바이스의 텍스처로 한 번 복사**한다.
     /// 기본 `false`. 진단용이다.
@@ -403,8 +402,7 @@ pub struct Preferences {
     /// `create_isolated_device` 때문에 다른 디바이스이고(6 월 AV 수정), 비싸다. 이 복사가 그
     /// 건너기를 타일 드로우 밖으로 뺀다 — 떨어지면 원인 확정, 그대로면 크로스-디바이스도 아니다.
     ///
-    /// 복사는 WR `render()` 안에서 일어나므로 FBO 바인딩을 저장·복원한다. 비용은
-    /// `SERVO_WEBGL_FANOUT_PROF` 의 `stage_ms` 로 보인다.
+    /// 복사는 WR `render()` 안에서 일어나므로 FBO 바인딩을 저장·복원한다.
     pub gfx_webgl_stage_to_painter_device: bool,
     /// 미뤄 둔 DComp `Commit()` 넷을 **스레드로 동시에** 부른다. 기본 `false`.
     ///

@@ -130,7 +130,7 @@ fn extract_env_names(text: &str) -> BTreeSet<String> {
 ///
 /// ★**왜 문자열이 아니라 식별자를 세는가**★ — Task 1 이 이름 리터럴을 호출부에서 전부
 /// 걷어냈다. 그래서 "이 노브가 실제로 읽히는가" 를 `"SERVO_…"` 리터럴로는 알 수 없다.
-/// 호출부에 남은 유일한 흔적이 `debug_env::DCOMP_READBACK` 같은 상수 참조다.
+/// 호출부에 남은 유일한 흔적이 `debug_env::DCOMP_NO_PARTIAL_PRESENT` 같은 상수 참조다.
 fn extract_debug_env_const_refs(text: &str) -> BTreeSet<String> {
     const MARKER: &str = "debug_env::";
     let mut found = BTreeSet::new();
@@ -232,8 +232,8 @@ fn every_env_name_read_in_sources_is_registered() {
 
 /// `DebugFlag` 의 env 이름에서 대응하는 러스트 상수 식별자를 유도한다.
 ///
-/// 관례는 `SERVO_` 접두사를 뗀 나머지다(`SERVO_DCOMP_READBACK` → `DCOMP_READBACK`). 17 개
-/// 전부가 이 관례를 지킨다(2026-08-12 확인). 새 노브가 이를 어기면
+/// 관례는 `SERVO_` 접두사를 뗀 나머지다(`SERVO_DCOMP_NO_PARTIAL_PRESENT` →
+/// `DCOMP_NO_PARTIAL_PRESENT`). 등록된 전부가 이 관례를 지킨다. 새 노브가 이를 어기면
 /// `every_registered_flag_is_actually_read_somewhere` 가 그 노브를 죽었다고 보고한다 —
 /// 조용히 넘어가지 않으니 그때 이름을 맞추면 된다.
 fn const_ident_for(env_name: &str) -> &str {
@@ -654,11 +654,11 @@ fn the_doc_check_actually_catches_a_missing_entry() {
     // 검사가 느슨해져 통과만 하는 것을 막는다 - wall_view 에서 자체완결성 검사가
     // 두 번 그렇게 무너졌고, 이 저장소에서도 2026-08-12 에 표류 테스트 하나가 무효인
     // 채로 발견됐다(the_dead_knob_check_actually_catches_an_unread_flag 참고).
-    let synthetic = "SERVO_DCOMP_READBACK 만 적힌 문서";
+    let synthetic = "SERVO_DCOMP_NO_PARTIAL_PRESENT 만 적힌 문서";
     let missing = names_missing_from(synthetic, servo_config::debug_env::ALL);
     assert!(!missing.is_empty());
     assert!(
-        !missing.contains(&"SERVO_DCOMP_READBACK"),
+        !missing.contains(&"SERVO_DCOMP_NO_PARTIAL_PRESENT"),
         "적혀 있는 것은 빠진 것으로 세면 안 된다"
     );
     // 정규화가 줄바꿈을 흡수하는지도 함께 고정한다 - 이것이 없으면 문서를 감쌀 때마다
