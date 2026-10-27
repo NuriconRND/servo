@@ -54,7 +54,6 @@ use winapi::um::dcomp::{
     IDCompositionVirtualSurface, IDCompositionVisual,
 };
 use winapi::um::dwmapi::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
-use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use winapi::um::unknwnbase::IUnknown;
 
 /// Gecko DCLayerTree 관례와 동일한 가상 표면 크기. WR은 타일 그리드를 이
@@ -72,14 +71,6 @@ const DEMOTE_AFTER_WITHHOLD: u32 = 30;
 /// 스펙 §6.3: 강등 n회째 재승격 쿨다운 = BASE × 2^(n−1), 상한 CAP (프레임).
 const DEMOTE_COOLDOWN_BASE: u64 = 300;
 const DEMOTE_COOLDOWN_CAP: u64 = 3600;
-
-/// Temporary coordinate diagnostics (env `SERVO_DCOMP_DEBUG`). Task 5 smoke debugging.
-/// Cached inside `debug_env` — this is read from `bind`/`add_surface` per tile per frame
-/// (45-tile wall = thousands of calls/sec), and repeated `std::env::var` there would pollute
-/// the Task 6 performance gate. The diagnostic itself stays available for Task 6.
-fn dcomp_debug() -> bool {
-    debug_env::enabled(&debug_env::DCOMP_DEBUG)
-}
 
 /// external 비디오 스왑체인의 백버퍼 수(`gfx_video_escape_buffer_count` pref, 기본 2).
 /// 범위 밖이면 1 회 경고 후 클램프. `OnceLock` 캐시 근거는 `stable_swapchain()`과 같다
@@ -108,33 +99,6 @@ fn external_buffer_count() -> u32 {
 fn stable_swapchain() -> bool {
     static STABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STABLE.get_or_init(|| pref!(gfx_video_escape_stable_swapchain))
-}
-
-/// Task 6 defect-2 diagnosis (spec 2026-07-15): env-gated per-tile pixel readback in
-/// `unbind` (pbuffer still current). Cached behind a `OnceLock` — read once per unbind
-/// while active; zero overhead when the env var is unset (never does glReadPixels, which
-/// stalls the pipeline). Frame-limited to <=120 by the caller (spec §7.1 stall amplification).
-fn readback_enabled() -> bool {
-    debug_env::enabled(&debug_env::DCOMP_READBACK)
-}
-
-/// Task 9 defect diagnosis (spec 2026-07-15): env-gated (`SERVO_DCOMP_VALIDPROBE`) per-Virtual-bind
-/// coverage log for NON-OPAQUE surfaces only. Logs the raw WR dirty_rect (min AND max), the
-/// valid_rect (min AND max), the computed BeginDraw update RECT (virtual coords), the atlas
-/// update_offset and the returned origin — one line per bind, frame-bounded by the caller (<=300).
-/// Purpose: determine whether WR ever dirties the ticker-bar region below the scrolling text
-/// (tile-local y beyond the text sliver) and what valid_rect WR assigns it — the two candidate
-/// mechanisms for the never-redrawn strip showing uninitialised virtual-surface memory.
-fn valid_probe_enabled() -> bool {
-    debug_env::enabled(&debug_env::DCOMP_VALIDPROBE)
-}
-
-/// external 비디오 present 파이프라인 프로파일러 게이트(env `SERVO_VIDEO_ESCAPE_PROF`,
-/// OnceLock 캐시, dcomp_debug와 별개). 켜지면 렌더러 스레드가 초당 1회 `[vesc-prof]` 집계
-/// 라인(info)을 낸다 — AMD 실기에서 어느 단계(acquire/convert/present)가 프레임 예산을 먹는지
-/// 판독용. 꺼지면 비용 0(단일 bool 체크 — 타이밍/카운터 자체를 만지지 않음).
-fn video_escape_prof() -> bool {
-    debug_env::enabled(&debug_env::VIDEO_ESCAPE_PROF)
 }
 
 /// external 비디오 갱신 분리 킬스위치(`gfx_video_decouple_enabled` pref, 구 env
@@ -183,103 +147,6 @@ pub(crate) fn should_fast_present(
         && escaped_count > 0
         && !resize_active
         && decouple_enabled
-}
-
-/// external present 파이프라인의 초당 집계 카운터(video_escape_prof 게이트에서만 갱신).
-/// 렌더러 스레드 단일 인스턴스(DCompNativeCompositor 소유). end_frame이 매 프레임 frames++
-/// 후 maybe_flush로 1초 경과 시 라인 출력 + 리셋한다. 게이트 off면 전 필드가 0으로 유휴.
-struct EscProf {
-    last_flush: std::time::Instant,
-    frames: u64,
-    converts: u64,
-    presents: u64,
-    srv_creates: u64,
-    acquires: u64,
-    batch_swaps: u64,
-    acquire_dur: std::time::Duration,
-    convert_dur: std::time::Duration,
-    present_dur: std::time::Duration,
-    /// ★Present 1 회 시간의 분포★ — 합계만으로는 "모든 호출이 균일하게 비싸다"와 "대부분
-    /// 공짜인데 몇 개가 크게 막힌다"를 구분할 수 없다. 그 둘은 원인이 완전히 다르다:
-    /// 균일하면 호출당 고정 비용(드라이버/DWM 제출)이고, 이봉이면 주기적인 무언가에
-    /// 막히는 것이라 그 주기가 16.7ms 인지 보면 vsync 인지 바로 갈린다.
-    ///
-    /// 45 영상 실측에서 present 가 초당 828ms(렌더러 스레드의 83%)를 먹는데 CPU 는 0.3 코어도
-    /// 쓰지 않아(= 자고 있다) 이 구분이 다음 표적을 정한다. 백버퍼 수를 2/3/4 로 바꿔도
-    /// 1 회당 0.655/0.647/0.648ms 로 평평했으므로 "백버퍼 반납 대기"는 이미 반증됐다.
-    ///
-    /// 창(1 초)당 최대 4096 개까지만 담는다 — 45 영상 x 30fps = 1284 개라 충분하고, 넘치면
-    /// 그 창의 나머지는 분포 계산에서 빠진다(합계 `present_dur` 는 영향 없음).
-    present_samples: Vec<u32>,
-}
-
-/// `present_samples` 상한. 초과분은 버린다(합계는 present_dur 가 따로 들고 있다).
-const PRESENT_SAMPLE_CAP: usize = 4096;
-
-impl EscProf {
-    fn new() -> Self {
-        EscProf {
-            last_flush: std::time::Instant::now(),
-            frames: 0,
-            converts: 0,
-            presents: 0,
-            srv_creates: 0,
-            acquires: 0,
-            batch_swaps: 0,
-            acquire_dur: std::time::Duration::ZERO,
-            convert_dur: std::time::Duration::ZERO,
-            present_dur: std::time::Duration::ZERO,
-            present_samples: Vec::new(),
-        }
-    }
-
-    /// Present 1 회 시간을 마이크로초로 담는다(상한까지).
-    fn record_present(&mut self, dur: std::time::Duration) {
-        if self.present_samples.len() < PRESENT_SAMPLE_CAP {
-            self.present_samples
-                .push(dur.as_micros().min(u32::MAX as u128) as u32);
-        }
-    }
-
-    /// 1초 경과 시 집계 라인을 info로 출력하고 리셋한다. 시간 필드는 창(1초) 동안 누적된
-    /// 총 ms(단계별 비교용). 호출측(end_frame)이 video_escape_prof 게이트 안에서만 부른다.
-    fn maybe_flush(&mut self) {
-        if self.last_flush.elapsed() < std::time::Duration::from_secs(1) {
-            return;
-        }
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        // Present 1 회 시간 분포. 정렬은 창당 한 번(<=4096 개)이라 무시할 만하고, 게이트가
-        // 꺼져 있으면 샘플이 비어 있어 아무 일도 하지 않는다.
-        self.present_samples.sort_unstable();
-        let pct = |q: f64| -> f64 {
-            if self.present_samples.is_empty() {
-                return 0.0;
-            }
-            let idx = ((self.present_samples.len() - 1) as f64 * q).round() as usize;
-            self.present_samples[idx] as f64 / 1000.0
-        };
-        log::info!(
-            "[vesc-prof] frames={} converts={} presents={} srv_creates={} acquires={} \
-             acquire_ms={:.1} convert_ms={:.1} present_ms={:.1} batch_swaps={} \
-             present_each_ms=[min={:.3} p50={:.3} p90={:.3} p99={:.3} max={:.3}] n={}",
-            self.frames,
-            self.converts,
-            self.presents,
-            self.srv_creates,
-            self.acquires,
-            ms(self.acquire_dur),
-            ms(self.convert_dur),
-            ms(self.present_dur),
-            self.batch_swaps,
-            pct(0.0),
-            pct(0.5),
-            pct(0.9),
-            pct(0.99),
-            pct(1.0),
-            self.present_samples.len(),
-        );
-        *self = EscProf::new();
-    }
 }
 
 /// 타일 (x,y) 그리드 좌표 → 가상 서피스 내 픽셀 rect.
@@ -1228,8 +1095,6 @@ struct ExternalStorage {
     /// 스왑체인 생성/GetBuffer/RTV/Present/SetContent 실패 warn-once(로그 폭주 방지).
     /// 성공적인 스왑체인 재생성 시 재무장(false).
     warned_fail: bool,
-    /// 브링업 계약 로그(서피스당 최초 5프레임)용 카운터(진단 전용, dcomp_debug 게이트).
-    frames_logged: u32,
     /// flip 스왑체인 백버퍼별 RTV 캐시(키 = GetBuffer(0)가 준 백버퍼 텍스처 포인터 usize).
     /// FLIP_SEQUENTIAL 백버퍼가 번갈아 반환되므로 엔트리 ≤ BufferCount
     /// (`gfx_video_escape_buffer_count`, 기본 2). 매 present GetBuffer(0)→조회/생성으로
@@ -1313,111 +1178,6 @@ struct BoundTile {
     /// `unbind` 가 `EndDraw` 직후의 QPC 와 짝지어 `output_grid::note_bind_span` 에 넘긴다 --
     /// 그 구간이 이 디바이스의 `Commit()` 이 거부되는 구간이고, 커밋의 창은 그 여집합이다.
     begin_qpc: Option<u64>,
-    /// Task 6 diagnosis only (cheap ints, always populated). Tile grid coords, the atlas
-    /// offset BeginDraw returned, the dirty-rect size, and the returned texture size — the
-    /// coordinates the readback needs to sample the drawn sub-region. Unused when
-    /// SERVO_DCOMP_READBACK is off (readback_log_bound is called only under the gate).
-    tile: (i32, i32),
-    update_offset: (i32, i32),
-    dirty_size: (i32, i32),
-    tex_size: (i32, i32),
-}
-
-/// Task 6 defect-2 diagnosis: read the just-drawn tile pixels from the pbuffer (still
-/// current at `unbind`, before EndDraw) and log per-tile alpha/RGB statistics. glReadPixels
-/// stalls the pipeline (spec §7.1) so the caller gates this on `readback_enabled()` AND
-/// `frame_counter <= 120`. One whole-texture read per bound tile, then two sample passes:
-///  (a) an 8x8 grid over the drawn dirty sub-region [update_offset .. +dirty_size], reported
-///      as alpha_min/max + rgb_nonzero/64 — the primary "is the video/text black?" signal;
-///  (b) a coarse 32x32 scan over the ENTIRE returned texture — cancels flip/atlas ambiguity
-///      (if content exists anywhere in the allocation the whole-scan catches it even if the
-///      sub-region indexing is mirrored or the tile sits at a non-zero atlas offset).
-/// GL error is sampled before/after the read for the decision tree (draw-layer GL failure).
-fn readback_log_bound(device: &Device, bound: &BoundTile, is_opaque: Option<bool>) {
-    use gleam::gl;
-    let (tw, th) = bound.tex_size;
-    if tw <= 0 || th <= 0 {
-        return;
-    }
-    let g = device.gl();
-    let err_before = g.get_error();
-    // Read the pbuffer's default framebuffer (bind returned fbo_id 0 => WR drew the tile
-    // there). Bind READ_FRAMEBUFFER 0 explicitly so a leftover WR FBO can't be sampled.
-    g.bind_framebuffer(gl::READ_FRAMEBUFFER, 0);
-    let pixels = g.read_pixels(0, 0, tw, th, gl::RGBA, gl::UNSIGNED_BYTE);
-    let err_after = g.get_error();
-    let need = (tw as usize) * (th as usize) * 4;
-    if pixels.len() < need {
-        warn!(
-            "[dcomp-readback] short read {} < {}x{}x4 for surface {:?}",
-            pixels.len(),
-            tw,
-            th,
-            bound.surface_id
-        );
-        return;
-    }
-    let sample = |sx: i32, sy: i32| -> (u8, u8, u8, u8) {
-        let x = sx.clamp(0, tw - 1) as usize;
-        let y = sy.clamp(0, th - 1) as usize;
-        let idx = (y * tw as usize + x) * 4;
-        (
-            pixels[idx],
-            pixels[idx + 1],
-            pixels[idx + 2],
-            pixels[idx + 3],
-        )
-    };
-    // (a) 8x8 grid over the drawn dirty sub-region.
-    let (ox, oy) = bound.update_offset;
-    let dw = bound.dirty_size.0.max(1);
-    let dh = bound.dirty_size.1.max(1);
-    let (mut a_min, mut a_max, mut rgb_nz) = (255u8, 0u8, 0u32);
-    for j in 0..8 {
-        for i in 0..8 {
-            let (r, gc, b, a) = sample(ox + (i * dw) / 8, oy + (j * dh) / 8);
-            a_min = a_min.min(a);
-            a_max = a_max.max(a);
-            if r != 0 || gc != 0 || b != 0 {
-                rgb_nz += 1;
-            }
-        }
-    }
-    // (b) coarse 32x32 whole-texture scan (flip/atlas ambiguity guard).
-    const SCAN: i32 = 32;
-    let (mut whole_nz, mut whole_a_max) = (0u32, 0u8);
-    for j in 0..SCAN {
-        for i in 0..SCAN {
-            let (r, gc, b, a) = sample((i * (tw - 1)) / (SCAN - 1), (j * (th - 1)) / (SCAN - 1));
-            whole_a_max = whole_a_max.max(a);
-            if r != 0 || gc != 0 || b != 0 {
-                whole_nz += 1;
-            }
-        }
-    }
-    log::info!(
-        "[dcomp-readback] surface={:?} tile=({},{}) opaque={:?} tex={}x{} update_off=({},{}) \
-         dirty={}x{} alpha_min={} alpha_max={} rgb_nonzero={}/64 whole_rgb_nonzero={}/{} \
-         whole_alpha_max={} gl_err=0x{:04x}->0x{:04x}",
-        bound.surface_id,
-        bound.tile.0,
-        bound.tile.1,
-        is_opaque,
-        tw,
-        th,
-        ox,
-        oy,
-        bound.dirty_size.0,
-        bound.dirty_size.1,
-        a_min,
-        a_max,
-        rgb_nz,
-        whole_nz,
-        SCAN * SCAN,
-        whole_a_max,
-        err_before,
-        err_after
-    );
 }
 
 /// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
@@ -1662,8 +1422,6 @@ pub struct DCompNativeCompositor {
     /// (WR passes-루프 타일 GL 전 — 아래 close_external_batch/start_compositing 주석의 렌더러 앵커
     /// 참조). begin_frame/end_frame이 방어적으로 닫아 잔류를 막는다.
     external_batch_active: bool,
-    /// external present 파이프라인 초당 프로파일러 누산기(video_escape_prof 게이트에서만 갱신).
-    esc_prof: EscProf,
     /// 마지막으로 root visual에 적용한 가드밴드 오프셋. `None` = 미적용(생성 직후).
     /// root visual 자체는 `maybe_create`에서 1회 생성되고 `release_all`(deinit/Drop =
     /// teardown 전용)에서만 버려진다. 다만 **값은 런타임에 바뀔 수 있다** — DPI 변경 시
@@ -1687,50 +1445,6 @@ pub fn enabled() -> bool {
     paint_api::rendering_context::dcomp_native_compositor_requested()
 }
 
-/// ★낡음(2026-07-13·2026-09-02 기록, 2026-09-18 `c970764fffd` 이후 무효)★ — 설명 대상 함수가 사라져 아래 `struct DwmPhaseWindow`(:1692)에 붙어 있다.
-/// 컴포지터를 생성한다. 실패(HWND/디바이스 없음, HRESULT 실패)면 warn 후 None을 돌려
-/// 호출자(Task 5 painter)가 기본 Draw 경로로 폴백하게 한다. 절대 패닉하지 않는다.
-/// 인계받은 디바이스 포인터로 `Commit()` 만 부른다. 워커 스레드에서 불린다.
-///
-/// ★우리 Commit 이 DWM 합성 클럭의 어느 자리에 떨어지는가.★ 조회만 한다 -- 블록하지 않는다.
-///
-/// ★낡음(2026-09-18 기록, 2026-10-23 이후 무효)★ — 커밋 경로는 넷이다(`enum CommitSite`).
-/// ***왜 전역인가*** -- Commit 은 여러 경로로 나가고 그중 하나(`commit_at_tick_locked`)는
-/// 컴포지터 밖의 자유 함수다. 처음에는
-/// `commit_device` 안에만 붙였는데 그 경로는 거의 돌지 않아 **초당 표본이 1 개**였다
-/// (log_ani_debug/45). 위상은 프로세스·데스크톱 단위 양이고(`DwmGetCompositionTimingInfo`
-/// 의 hWnd 는 NULL 만 지원된다) 타일 넷이 같은 DWM 을 보므로, 한 곳에 모으는 것이 맞다.
-///
-/// `qpcVBlank` 는 호출 시점 기준 **마지막 vblank** 의 QPC 다. Commit 직후에 부르므로
-/// `(지금 - qpcVBlank) / qpcRefreshPeriod` 가 곧 위상이다. 0 에 가까우면 vblank 직후에
-/// 커밋한 것이고(다음 합성까지 여유 최대), 1 에 가까우면 경계에 걸터앉은 것이다 --
-/// 그 자리에서는 작은 지터 하나가 프레임을 한 박자 늦춘다.
-///
-/// ★여기에 대기를 넣지 말 것.★ `DCompositionWaitForCompositorClock` 은 프로세스 범위
-/// 대기이고, 생산 스레드가 공유 객체에 줄 서는 회귀가 이 저장소에 기록돼 있다 --
-/// `GstSystemClock::obtain()` 이 프로세스 싱글턴이라 45 개 파이프라인의 sink 가 매 프레임
-/// 같은 객체를 기다렸고 그 비용이 디코딩과 맞먹었다(`-SinkPacing thread` 가 그 대응).
-/// `gfx_wall_frame_max_pending` 이 1 이라 메인이 한 프레임만 막혀도 생산자가 곧장 뒤에
-/// 선다. 이 함수는 관측이고, 관측으로 끝나야 한다.
-#[derive(Default)]
-struct DwmPhaseWindow {
-    start: Option<std::time::Instant>,
-    phase: Vec<f64>,
-    first: Option<(u64, u64, u64, u64)>,
-    last: (u64, u64, u64, u64),
-    period_ms: f64,
-    skipped: u64,
-}
-
-static DWM_PHASE: std::sync::Mutex<Option<DwmPhaseWindow>> = std::sync::Mutex::new(None);
-
-/// 표본을 뜨지 못한 횟수. ★말없이 버리면 다음 사람이 n=2 를 보고 또 헤맨다.★
-fn note_dwm_phase_skip() {
-    if let Ok(mut guard) = DWM_PHASE.lock() {
-        guard.get_or_insert_with(DwmPhaseWindow::default).skipped += 1;
-    }
-}
-
 /// `(qpcVBlank, qpcRefreshPeriod)`. 조회만 한다 -- `note_dwm_phase` 와 같은 API 를 쓰되
 /// 계측 창을 건드리지 않는다. 자세한 근거는 `crate::dwm_composition_grid`.
 pub(crate) fn composition_grid() -> Option<(u64, u64)> {
@@ -1748,126 +1462,6 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     } else {
         Some((vblank, period))
     }
-}
-
-/// `(qpcVBlank, qpcCompose, qpcRefreshPeriod)`. 조회만 한다.
-///
-/// ★`qpcVBlank` 와 `qpcCompose` 는 다른 것이다.★ 앞은 격자점이고, 뒤는 DWM 이 실제로
-/// 합성 패스를 돈 시각이다. 스캔아웃이 "합성이 끝난 뒤 처음 오는 패널 vblank" 에서
-/// 일어난다면, 판정을 가르는 것은 격자점이 아니라 `qpcCompose` 다 -- 그리고 어떤 패널의
-/// vblank 가 거기에 바짝 붙어 있으면 작은 흔들림 하나로 그 프레임을 잡느냐 다음 것을
-/// 잡느냐가 뒤집힌다.
-///
-/// `composition_grid` 와 따로 두는 이유는 그쪽이 셸의 `-DwmAlign` 격자로 공개돼 있어
-/// 서명을 바꾸면 파급이 크기 때문이다. 한 번의 호출로 셋을 받아 가는 쪽이 싸다.
-pub(crate) fn dwm_timing() -> Option<(u64, u64, u64)> {
-    let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
-    // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
-    if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
-        return None;
-    }
-    // `#[repr(packed)]` 이라 필드를 빌릴 수 없다. 값으로 복사한다.
-    let period = info.qpcRefreshPeriod;
-    let vblank = info.qpcVBlank;
-    let compose = info.qpcCompose;
-    if period == 0 {
-        None
-    } else {
-        Some((vblank, compose, period))
-    }
-}
-
-/// `pub(crate)`: 호출자는 디바이스 가드를 **푼 뒤에** 이것을 부른다. 이 함수 자체가 전역
-/// 뮤텍스와 로그 I/O 를 쥐므로 임계구역 밖이어야 한다 -- 가드 안에 두면 "가드 안에서 하는
-/// 일은 `Commit()` 하나" 라는 상한이 무너진다(`commit_guard` 모듈 주석).
-pub(crate) fn note_dwm_phase() {
-    if !*crate::output_grid::COLLECT {
-        return;
-    }
-    let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
-    info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
-    // Safety: 순수 out-param 조회. hWnd 는 NULL 만 지원된다(Win8+).
-    if unsafe { DwmGetCompositionTimingInfo(ptr::null_mut(), &mut info) } < 0 {
-        note_dwm_phase_skip();
-        return;
-    }
-    // `#[repr(packed)]` 이라 필드를 **빌릴 수 없다**. 값으로 복사해 온다.
-    let period = info.qpcRefreshPeriod;
-    let vblank = info.qpcVBlank;
-    if period == 0 {
-        note_dwm_phase_skip();
-        return;
-    }
-    let mut now: i64 = 0;
-    // Safety: 순수 out-param.
-    if unsafe { QueryPerformanceCounter(&mut now as *mut i64 as *mut _) } == 0 || now < 0 {
-        note_dwm_phase_skip();
-        return;
-    }
-    // ★부호 있게 잰다.★ `qpcVBlank` 를 "마지막 vblank" 로만 가정하면 안 된다 -- 드라이버에
-    // 따라 **다음** vblank(미래)를 돌려주기도 하고, 그러면 무부호 뺄셈이 언더플로해 표본이
-    // 통째로 버려진다. 실제로 그렇게 초당 표본이 2 개로 떨어졌다(log_ani_debug/46).
-    // 나머지 연산을 두 번 걸어 어느 쪽이든 0..period 로 접는다.
-    let period_i = period as i128;
-    let diff = now as i128 - vblank as i128;
-    let since = (((diff % period_i) + period_i) % period_i) as u64;
-
-    let Ok(mut guard) = DWM_PHASE.lock() else {
-        return;
-    };
-    let state = guard.get_or_insert_with(DwmPhaseWindow::default);
-    let now_instant = std::time::Instant::now();
-    let start = *state.start.get_or_insert(now_instant);
-    state.phase.push((since % period) as f64 / period as f64);
-    if state.period_ms == 0.0 {
-        let mut freq: i64 = 0;
-        // Safety: 순수 out-param.
-        if unsafe { QueryPerformanceFrequency(&mut freq as *mut i64 as *mut _) } != 0 && freq > 0 {
-            state.period_ms = period as f64 * 1000.0 / freq as f64;
-        }
-    }
-    let counts = (
-        info.cFramesDisplayed,
-        info.cFramesLate,
-        info.cFramesDropped,
-        info.cFramesMissed,
-    );
-    state.first.get_or_insert(counts);
-    state.last = counts;
-
-    let window = now_instant - start;
-    if window < std::time::Duration::from_secs(1) {
-        return;
-    }
-    let mut phase = std::mem::take(&mut state.phase);
-    let (d0, l0, dr0, m0) = state.first.take().unwrap_or_default();
-    let (d1, l1, dr1, m1) = state.last;
-    let period_ms = state.period_ms;
-    let skipped = std::mem::take(&mut state.skipped);
-    state.start = Some(now_instant);
-    drop(guard);
-
-    phase.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let at = |p: f64| phase[(((phase.len() - 1) as f64) * p).round() as usize];
-    warn!(
-        "DWMPHASE window_ms={:.0} n={} period_ms={:.3} \
-         phase p05={:.3} p25={:.3} p50={:.3} p75={:.3} p95={:.3} \
-         displayed={} late={} dropped={} missed={} skipped={}",
-        window.as_secs_f64() * 1000.0,
-        phase.len(),
-        period_ms,
-        at(0.05),
-        at(0.25),
-        at(0.50),
-        at(0.75),
-        at(0.95),
-        d1.saturating_sub(d0),
-        l1.saturating_sub(l0),
-        dr1.saturating_sub(dr0),
-        m1.saturating_sub(m0),
-        skipped,
-    );
 }
 
 /// ★이 크레이트에서 `IDCompositionDevice::Commit()` 을 실제로 부르는 **유일한** 자리다.★
@@ -2547,7 +2141,6 @@ pub fn maybe_create(
             d3d11_context1,
             warned_no_provider: false,
             external_batch_active: false,
-            esc_prof: EscProf::new(),
             last_root_offset: None,
         })))
     }
@@ -2826,16 +2419,7 @@ impl DCompNativeCompositor {
         };
         // acquire는 링을 잠그고 소비계획을 실행한다 — Some이면 반드시 release로 짝맞춘다.
         // None(대여 실패)이면 아무것도 안 잠겼으므로 release 불필요(브리프 계약).
-        let acq_start = if video_escape_prof() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let maybe_lease = provider.acquire(&*rc, external_id);
-        if let Some(start) = acq_start {
-            self.esc_prof.acquires += 1;
-            self.esc_prof.acquire_dur += start.elapsed();
-        }
         let Some(lease) = maybe_lease else {
             return;
         };
@@ -2867,7 +2451,7 @@ impl DCompNativeCompositor {
         size: DeviceIntSize,
         is_opaque: bool,
         resize_active: bool,
-        transform: CompositorSurfaceTransform,
+        _transform: CompositorSurfaceTransform,
         clip_rect: DeviceIntRect,
     ) {
         // convert_pass 지연 초기화(최초 external present 시). 실패하면 재시도하지 않는다
@@ -2932,14 +2516,6 @@ impl DCompNativeCompositor {
                     ext.content_attached = false;
                     ext.last_presented = None;
                     ext.warned_fail = false; // 재생성 성공 → 실패 warn 재무장
-                    if dcomp_debug() {
-                        log::info!(
-                            "[dcomp-dbg] external swapchain (re)create id={:?} {}x{}",
-                            id,
-                            size.width,
-                            size.height
-                        );
-                    }
                 },
                 None => {
                     // 생성 실패(OOM급): swapchain=None 유지 → 다음 프레임 자연 재시도(스펙 §9).
@@ -2957,30 +2533,6 @@ impl DCompNativeCompositor {
                     }
                 },
             }
-        }
-
-        // Step 4-2: 브링업 계약 로그(서피스당 최초 5프레임, dcomp_debug 게이트). src=Y plane 크기.
-        // 기대(월): scale=(1,1), clip≈타일 rect, src=1920x1080.
-        if dcomp_debug() && ext.frames_logged < 5 {
-            ext.frames_logged += 1;
-            let (sw, sh) = lease.planes[0]
-                .map(|p| (p.width, p.height))
-                .unwrap_or((0, 0));
-            log::info!(
-                "[dcomp-dbg] external add id={:?} scale=({},{}) offset=({},{}) \
-                 clip=({},{})-({},{}) src={}x{}",
-                id,
-                transform.scale.x,
-                transform.scale.y,
-                transform.offset.x,
-                transform.offset.y,
-                clip_rect.min.x,
-                clip_rect.min.y,
-                clip_rect.max.x,
-                clip_rect.max.y,
-                sw,
-                sh
-            );
         }
 
         // Step 4-5: 세대 dedup — 같은 (ring_id, frame_seq)면 재변환/재Present 스킵.
@@ -3017,15 +2569,6 @@ impl DCompNativeCompositor {
         // 조회(FLIP 백버퍼 수만큼만 엔트리가 는다)해 per-present CreateRenderTargetView를 없앤다. 이번 프레임
         // 첫 external convert면 begin_batch로 컨텍스트-상태 배치를 연다(프레임당 스왑 2N→2).
         // Safety: 살아있는 스왑체인/디바이스/컨텍스트/백버퍼.
-        let prof_on = video_escape_prof();
-        let mut d_converts = 0u64;
-        let mut d_convert_dur = std::time::Duration::ZERO;
-        let mut d_srv = 0u64;
-        let mut d_presents = 0u64;
-        let mut d_present_dur = std::time::Duration::ZERO;
-        // ext borrow 안에서는 self.esc_prof 를 만질 수 없다 — 다른 카운터와 같은 사정.
-        let mut d_present_each: Vec<std::time::Duration> = Vec::new();
-        let mut d_batch_swaps = 0u64;
         unsafe {
             let mut back: *mut ID3D11Texture2D = ptr::null_mut();
             let hr = (*swapchain.as_ptr()).GetBuffer(
@@ -3078,14 +2621,8 @@ impl DCompNativeCompositor {
             if !self.external_batch_active {
                 convert_pass.begin_batch(ctx1.as_ptr());
                 self.external_batch_active = true;
-                d_batch_swaps += 1;
             }
             // convert: 배치 활성이면 스왑 없이 per-draw 자원만 바인딩+draw(begin_batch 주석).
-            let c_start = if prof_on {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             let converted = convert_pass.convert(
                 ctx1.as_ptr(),
                 lease,
@@ -3093,25 +2630,9 @@ impl DCompNativeCompositor {
                 dst.width as u32,
                 dst.height as u32,
             );
-            if let Some(s) = c_start {
-                d_convert_dur += s.elapsed();
-                d_converts += 1;
-                d_srv += lease.plane_count.min(3) as u64;
-            }
             // RTV는 캐시가 소유 — 여기서 Release하지 않는다(백버퍼는 아래에서 Release).
             if converted {
-                let p_start = if prof_on {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
                 let hr = (*swapchain.as_ptr()).Present(*PRESENT_SYNC_INTERVAL, 0);
-                if let Some(s) = p_start {
-                    let dur = s.elapsed();
-                    d_present_dur += dur;
-                    d_presents += 1;
-                    d_present_each.push(dur);
-                }
                 if hr < 0 {
                     if !ext.warned_fail {
                         warn!(
@@ -3130,9 +2651,6 @@ impl DCompNativeCompositor {
                             .SetContent(swapchain.as_ptr() as *const IUnknown);
                         if hr >= 0 {
                             ext.content_attached = true;
-                            if dcomp_debug() {
-                                log::info!("[dcomp-dbg] external content-attach id={:?}", id);
-                            }
                         } else if !ext.warned_fail {
                             warn!(
                                 "[dcomp-native] external {:?}: SetContent failed (hr=0x{:08x})",
@@ -3144,20 +2662,6 @@ impl DCompNativeCompositor {
                 }
             }
             (*(back as *mut IUnknown)).Release();
-        }
-
-        // 프로파일 누산(게이트 on일 때만). 여기선 ext/entry/convert_pass/ctx1 borrow가 끝나
-        // self.esc_prof 갱신이 안전하다. batch_swaps의 end 쪽은 close_external_batch에서 카운트.
-        if prof_on {
-            self.esc_prof.converts += d_converts;
-            self.esc_prof.convert_dur += d_convert_dur;
-            self.esc_prof.srv_creates += d_srv;
-            self.esc_prof.presents += d_presents;
-            self.esc_prof.present_dur += d_present_dur;
-            for dur in d_present_each {
-                self.esc_prof.record_present(dur);
-            }
-            self.esc_prof.batch_swaps += d_batch_swaps;
         }
     }
 
@@ -3252,7 +2756,6 @@ impl DCompNativeCompositor {
         crate::output_grid::note_commit_stamp(dcomp_device as usize, outcome.stamp);
         crate::output_grid::note_commit_at(dcomp_device as usize);
         note_commit_failure(outcome.hr, dcomp_device as usize, "flush_deferred_commit");
-        note_dwm_phase();
     }
 
     /// `begin_frame` 의 몸통. 돌려주는 것은 토막별 시간이며, 계측이 꺼져 있으면 전부 0 이다.
@@ -3612,9 +3115,6 @@ impl DCompNativeCompositor {
             unsafe {
                 cp.end_batch(ctx1.as_ptr());
             }
-            if video_escape_prof() {
-                self.esc_prof.batch_swaps += 1;
-            }
         }
         self.external_batch_active = false;
     }
@@ -3747,17 +3247,6 @@ impl Compositor for DCompNativeCompositor {
 
         // ★낡음(2026-07-13 기록, AddVisual 은 2026-07-14 `461ee73dc2c`·RemoveAllVisuals 는 2026-10-21 `25eb69bdf0d` 이후 무효)★ — 지금은 둘 다 `end_frame`(:5105, :5131)이다.
         // 비주얼은 매 프레임 begin_frame(RemoveAllVisuals) 후 add_surface에서 트리에 추가한다.
-        if dcomp_debug() {
-            log::info!(
-                "[dcomp-dbg] create_surface id={:?} virtual_offset=({},{}) tile_size={}x{} opaque={}",
-                id,
-                virtual_offset.x,
-                virtual_offset.y,
-                tile_size.width,
-                tile_size.height,
-                is_opaque
-            );
-        }
         self.surfaces.insert(id, entry);
     }
 
@@ -3905,18 +3394,6 @@ impl Compositor for DCompNativeCompositor {
                     tile_rect.min.x - sc.anchor.x,
                     tile_rect.min.y - sc.anchor.y,
                 );
-                if dcomp_debug() {
-                    log::info!(
-                        "[dcomp-dbg] bind(swapchain) surface={:?} tile=({},{}) anchor=({},{}) -> origin=({},{})",
-                        id.surface_id,
-                        id.x,
-                        id.y,
-                        sc.anchor.x,
-                        sc.anchor.y,
-                        origin.x,
-                        origin.y
-                    );
-                }
                 NativeSurfaceInfo { origin, fbo_id: 0 }
             },
             SurfaceStorage::Virtual { virtual_surface } => {
@@ -4128,19 +3605,6 @@ impl Compositor for DCompNativeCompositor {
                     pbuffer,
                     texture,
                     begin_qpc,
-                    // Task 6 diagnosis: sampling coordinates for the unbind readback.
-                    // dirty의 scratch 내 위치 = update_off + (dirty.min - r_min). 비확장 시
-                    // r_min==dirty.min이라 update_off 그대로(기존 readback 좌표 불변).
-                    tile: (id.x, id.y),
-                    update_offset: (
-                        update_offset.x + dirty_rect.min.x - r_min_x,
-                        update_offset.y + dirty_rect.min.y - r_min_y,
-                    ),
-                    dirty_size: (
-                        dirty_rect.max.x - dirty_rect.min.x,
-                        dirty_rect.max.y - dirty_rect.min.y,
-                    ),
-                    tex_size: (desc.Width as i32, desc.Height as i32),
                 });
 
                 // 승격 판정용 프레임 피복 집계(dirty가 valid 전체를 덮는 전면 타일만).
@@ -4168,56 +3632,6 @@ impl Compositor for DCompNativeCompositor {
                 // client-buffer pbuffer에 EGL_BAD_ATTRIBUTE(0x3004)로 거부.
                 let origin =
                     DeviceIntPoint::new(update_offset.x - r_min_x, update_offset.y - r_min_y);
-                // Task 9 diagnosis: per-bind coverage for non-opaque surfaces (first 300 frames).
-                if valid_probe_enabled() && !entry_is_opaque && self.frame_counter <= 300 {
-                    log::info!(
-                        "[dcomp-validprobe] surface={:?} tile=({},{}) dirty=({},{})-({},{}) \
-                         valid=({},{})-({},{}) update_rect=({},{})-({},{}) update_off=({},{}) \
-                         tex={}x{} origin=({},{})",
-                        id.surface_id,
-                        id.x,
-                        id.y,
-                        dirty_rect.min.x,
-                        dirty_rect.min.y,
-                        dirty_rect.max.x,
-                        dirty_rect.max.y,
-                        valid_rect.min.x,
-                        valid_rect.min.y,
-                        valid_rect.max.x,
-                        valid_rect.max.y,
-                        update.left,
-                        update.top,
-                        update.right,
-                        update.bottom,
-                        update_offset.x,
-                        update_offset.y,
-                        desc.Width,
-                        desc.Height,
-                        origin.x,
-                        origin.y,
-                    );
-                }
-                if dcomp_debug() {
-                    log::info!(
-                        "[dcomp-dbg] bind surface={:?} tile=({},{}) dirty=({},{})-({},{}) tile_virt=({},{}) \
-                         update_off=({},{}) tex={}x{} -> origin=({},{})",
-                        id.surface_id,
-                        id.x,
-                        id.y,
-                        dirty_rect.min.x,
-                        dirty_rect.min.y,
-                        dirty_rect.max.x,
-                        dirty_rect.max.y,
-                        tile_rect.min.x,
-                        tile_rect.min.y,
-                        update_offset.x,
-                        update_offset.y,
-                        desc.Width,
-                        desc.Height,
-                        origin.x,
-                        origin.y
-                    );
-                }
                 NativeSurfaceInfo { origin, fbo_id: 0 }
             },
             SurfaceStorage::External(_) => {
@@ -4234,7 +3648,7 @@ impl Compositor for DCompNativeCompositor {
         }
     }
 
-    fn unbind(&mut self, device: &mut Device) {
+    fn unbind(&mut self, _device: &mut Device) {
         let Some(bound) = self.bound.take() else {
             return;
         };
@@ -4246,14 +3660,6 @@ impl Compositor for DCompNativeCompositor {
             .begin_qpc
             .and(self.dcomp_device_ptr())
             .map(|device| device as usize);
-        // Task 6 defect-2 diagnosis: read the tile pixels BEFORE EndDraw/destroy while the
-        // pbuffer is still current. Gated (env off => no glReadPixels) and frame-limited to
-        // <=120 (spec §7.1 stall amplification). Only the Virtual arm sets `bound`, which is
-        // exactly the alpha-slice path under scrutiny.
-        if readback_enabled() && self.frame_counter <= 120 {
-            let is_opaque = self.surfaces.get(&bound.surface_id).map(|e| e.is_opaque);
-            readback_log_bound(device, &bound, is_opaque);
-        }
         // 현재 bind 중이던 서피스에 EndDraw.
         if let Some(entry) = self.surfaces.get(&bound.surface_id) {
             match &entry.storage {
@@ -4449,30 +3855,7 @@ impl Compositor for DCompNativeCompositor {
         };
         entry.last_placement = Some(placement);
 
-        let (offset_x, offset_y) =
-            apply_visual_placement(&entry.visual, placement, virtual_offset, content_anchor);
-
-        if dcomp_debug() {
-            log::info!(
-                "[dcomp-dbg] add_surface id={:?} transform.offset=({},{}) scale=({},{}) \
-                 clip=({},{})-({},{}) virt_off=({},{}) anchor=({},{}) -> visual_off=({},{})",
-                id,
-                transform.offset.x,
-                transform.offset.y,
-                transform.scale.x,
-                transform.scale.y,
-                clip_rect.min.x,
-                clip_rect.min.y,
-                clip_rect.max.x,
-                clip_rect.max.y,
-                virtual_offset.x,
-                virtual_offset.y,
-                content_anchor.x,
-                content_anchor.y,
-                offset_x,
-                offset_y
-            );
-        }
+        let _ = apply_visual_placement(&entry.visual, placement, virtual_offset, content_anchor);
 
         // AddVisual은 end_frame으로 이연 — 여기서는 z-order(호출 순서 = 아래→위)를 보존한
         // 기록만 남긴다(컬링 없음 — A-1).
@@ -4773,13 +4156,6 @@ impl Compositor for DCompNativeCompositor {
                                     // partial_present를 false로 되돌려 다음 content-swap에서 재프로브.
                                     sc.partial_present = !partial_present_disabled()
                                         && probe_partial_present(&sc.swapchain);
-                                    if dcomp_debug() {
-                                        log::info!(
-                                            "[dcomp-dbg] content-swap id={:?} -> swapchain partial_present={}",
-                                            id,
-                                            sc.partial_present
-                                        );
-                                    }
                                 } else {
                                     // 최종 리뷰 Minor #4: content_attached가 false로 남아 이
                                     // 분기가(coverage 전면인 한) 매 프레임 재진입한다 — warn-once로
@@ -4822,14 +4198,6 @@ impl Compositor for DCompNativeCompositor {
                             sc.coverage.reset();
                             sc.withheld_frames = 0;
                             sc.stale.on_present(&dirty, full);
-                            if dcomp_debug() {
-                                log::info!(
-                                    "[dcomp-dbg] present-partial id={:?} dirty={} catchup={}",
-                                    id,
-                                    dirty.len(),
-                                    catchup.len()
-                                );
-                            }
                         } else {
                             // 스펙 §5.3: 런타임 실패 → 즉시 강등(warn-once는 강등부에서, Task 5).
                             // 최종 리뷰 Minor #3: 위 full-Present 실패 분기와 달리 여기서는 take된
@@ -4858,14 +4226,6 @@ impl Compositor for DCompNativeCompositor {
                                 "[dcomp-native] surface {:?}: swapchain present withheld for {} frames \
                                  (partial dirty accumulating; display update delayed)",
                                 id, sc.withheld_frames
-                            );
-                        }
-                        if dcomp_debug() {
-                            log::info!(
-                                "[dcomp-dbg] withhold id={:?} covered={}/{}",
-                                id,
-                                sc.coverage.covered_tiles.len(),
-                                entry.tiles.len()
                             );
                         }
                     }
@@ -4928,16 +4288,6 @@ impl Compositor for DCompNativeCompositor {
                 }
             }
             entry.promote_streak = 0; // 승격 완료 — Virtual 전용 부기 정리
-            if dcomp_debug() {
-                log::info!(
-                    "[dcomp-dbg] promote id={:?} extent={}x{} anchor=({},{})",
-                    surface_id,
-                    size.width,
-                    size.height,
-                    extent.min.x,
-                    extent.min.y
-                );
-            }
         }
 
         // 지오메트리 변화(리사이즈) 재생성(루프 밖): 스왑체인만 새 extent로 교체.
@@ -4981,16 +4331,6 @@ impl Compositor for DCompNativeCompositor {
                     // 준다(fallback_virtual은 여전히 None일 수 있으므로 즉시 재검출·재차단될
                     // 수 있으나, 그 경우도 새 경고 1건 + 재차단으로 계약을 satisfy한다).
                     sc.demote_blocked = false;
-                    if dcomp_debug() {
-                        log::info!(
-                            "[dcomp-dbg] regen id={:?} extent={}x{} anchor=({},{})",
-                            surface_id,
-                            size.width,
-                            size.height,
-                            extent.min.x,
-                            extent.min.y
-                        );
-                    }
                 }
             }
         }
@@ -5105,24 +4445,10 @@ impl Compositor for DCompNativeCompositor {
                 // 한다. (정착 시 Task 12 재구축이 서피스를 새로 만들면 MIN_AGE는 재적용된다 —
                 // 이는 쿨다운 페널티가 아니라 신규 서피스의 정상 히스테리시스.)
                 entry.promote_blocked_until = 0;
-                if dcomp_debug() {
-                    log::info!(
-                        "[dcomp-dbg] resize-demote id={:?} (no cooldown)",
-                        surface_id
-                    );
-                }
             } else {
                 entry.demote_count = entry.demote_count.saturating_add(1);
                 let cooldown = demote_cooldown(entry.demote_count);
                 entry.promote_blocked_until = self.frame_counter + cooldown;
-                if dcomp_debug() {
-                    log::info!(
-                        "[dcomp-dbg] demote id={:?} count={} cooldown={}",
-                        surface_id,
-                        entry.demote_count,
-                        cooldown
-                    );
-                }
             }
             entry.promote_streak = 0;
             entry.frame_coverage.reset();
@@ -5224,20 +4550,11 @@ impl Compositor for DCompNativeCompositor {
             crate::output_grid::note_commit_stamp(dcomp_device as usize, outcome.stamp);
             crate::output_grid::note_commit_at(dcomp_device as usize);
             note_commit_failure(outcome.hr, dcomp_device as usize, "end_frame");
-            if *DCOMP_BIND_PROF {
-                note_dwm_phase();
-            }
         }
         if let Some(start) = end_frame_start {
             self.bind_profile.end_frames += 1;
             self.bind_profile.end_frame_ns += start.elapsed().as_nanos() as u64;
             self.maybe_emit_bind_profile();
-        }
-
-        // external present 프로파일: 프레임 카운트 후 1초 경과 시 [vesc-prof] 집계 라인 출력.
-        if video_escape_prof() {
-            self.esc_prof.frames += 1;
-            self.esc_prof.maybe_flush();
         }
     }
 
@@ -5298,7 +4615,6 @@ impl Compositor for DCompNativeCompositor {
                     attached_external_id: None,
                     last_presented: None,
                     warned_fail: false,
-                    frames_logged: 0,
                     rtv_cache: FxHashMap::default(),
                 }),
                 visual,
@@ -5317,13 +4633,6 @@ impl Compositor for DCompNativeCompositor {
                 last_begin_texture: FxHashMap::default(),
             }
         };
-        if dcomp_debug() {
-            log::info!(
-                "[dcomp-dbg] create_external_surface id={:?} opaque={}",
-                id,
-                is_opaque
-            );
-        }
         self.surfaces.insert(id, entry);
     }
 
@@ -5347,15 +4656,7 @@ impl Compositor for DCompNativeCompositor {
             );
             return;
         };
-        let first = ext.attached_external_id != Some(external_image.0);
         ext.attached_external_id = Some(external_image.0);
-        if first && dcomp_debug() {
-            log::info!(
-                "[dcomp-dbg] attach_external_image id={:?} external_id={}",
-                id,
-                external_image.0
-            );
-        }
     }
 
     fn create_backdrop_surface(

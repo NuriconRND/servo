@@ -262,29 +262,11 @@ struct DcompSample {
     /// 갔고, `2` 이상이면 ★합성을 한 번 이상 놓쳤다★ -- 그 타일이 직전 프레임을 한 번 더
     /// 보여 줬다는 뜻이다. 음수는 아직 처리 전이다.
     commit_periods: Option<i64>,
-    /// `lastFrameTime` 과 **DWM vblank** 의 위상차. `(-P/2, P/2]` 로 접는다.
-    ///
-    /// ★0 에 붙어 있으면 커밋된 DComp 명령의 수행이 DWM vblank 마다 일어난다는 뜻이다.★
-    /// `phase_ms` 가 답하지 못하는 질문이 이것이다 -- 그쪽은 QPC 0 을 원점으로 접으므로
-    /// 기준이 아무것도 아니고, 접는 주기가 한 틱만 달라져도 값이 주기 안에서 통째로
-    /// 옮겨진다. 여기는 두 절대 시각의 **차이**를 접으니 그 증폭이 없다.
-    last_vs_dwmvb_ms: Option<f64>,
-    /// `qpcCompose - qpcVBlank`, `[0, P)`. DWM 이 실제로 합성 패스를 돈 시각이 격자점에서
-    /// 얼마나 뒤인가. ★격자점과 일한 시각은 다르고, 스캔아웃 판정을 가르는 것은 뒤쪽이다.★
-    compose_after_vblank_ms: Option<f64>,
     /// 합성 **격자점** 뒤로 이 패널의 vblank 가 언제 오나. `[0, P)`.
     ///
     /// 예전 `last_vs_outvb_ms` 를 방향 있는 규약으로 고친 것이다. 가운데로 접으면 음수가
     /// 나오고 그것을 "합성보다 먼저 스캔아웃했다" 로 읽게 되는데, 접힌 위상에는 선후가 없다.
     outvb_after_last_ms: Option<f64>,
-    /// ★`qpcCompose` 뒤로 이 패널의 vblank 가 언제 오나 -- 이것이 여유다.★ `[0, P)`.
-    ///
-    /// 스캔아웃이 "합성이 끝난 뒤 처음 오는 패널 vblank" 라면, 이 값이 0 에 가까운 패널은
-    /// 작은 흔들림 하나로 그 프레임을 잡느냐 다음 것을 잡느냐가 뒤집힌다. 놓치면 한 주기를
-    /// 통째로 기다리므로 그대로 프레임 중복이고, 눈에는 저더로 보인다.
-    ///
-    /// p05 가 0 쪽에 붙어 있는지가 판정이고, `p95 - p05` 가 흔들림의 폭이다.
-    outvb_after_compose_ms: Option<f64>,
 }
 
 /// ★공통 합성 격자 — (마지막 합성 QPC, 주기 QPC).★
@@ -1378,50 +1360,16 @@ pub(crate) fn note_dcomp_stat(
     if !*COLLECT {
         return;
     }
-    // ★위상차는 `0 에 가까운가` 로 판정하고 싶다.★ `[0, P)` 로 접으면 정렬된 경우가 0 쪽과
-    // P 쪽 양끝에 나뉘어 나타나 한눈에 안 보인다. `(-P/2, P/2]` 로 접는다.
-    let fold_centered = |delta: i128, period: i128| -> f64 {
-        let folded = ((delta % period) + period) % period;
-        to_ms_signed(if folded * 2 > period {
-            folded - period
-        } else {
-            folded
-        })
-    };
     // ★"다음에 언제 오나" 는 앞으로의 거리다.★ `(-P/2, P/2]` 로 접으면 음수가 나오고,
     // 그것을 "합성보다 먼저 스캔아웃했다" 로 읽게 된다 -- 접힌 위상에는 선후가 없는데도.
     // 방향이 있는 값은 `[0, P)` 로 접어 항상 양수로 둔다.
     let fold_forward =
         |delta: i128, period: i128| to_ms_signed(((delta % period) + period) % period);
-    let dwm = crate::dcomp_compositor::dwm_timing().filter(|(_, _, period)| *period > 0);
     let out_grid = grid_for_monitor(monitor).filter(|grid| grid.period_qpc > 0);
-    // ★1) `lastFrameTime` 이 DWM vblank 격자에 걸려 있나.★ 0 에 붙어 있으면 커밋된 DComp
-    // 명령의 수행이 DWM vblank 마다 일어난다고 볼 수 있다. `phase_ms` 와 달리 이것은 두
-    // 절대 시각의 **차이**를 접으므로, 접는 주기가 한 틱 틀려도 결과가 그만큼만 움직인다.
-    // 여기는 "0 인가" 를 묻는 값이라 가운데로 접는 것이 맞다.
-    let last_vs_dwmvb_ms =
-        dwm.map(|(vblank, _, period)| fold_centered(last as i128 - vblank as i128, period as i128));
-    // ★2) DWM 이 실제로 합성 패스를 돈 시각이 격자점에서 얼마나 뒤인가.★ `qpcVBlank` 는
-    // 격자이고 `qpcCompose` 는 일한 시각이다. 스캔아웃 판정을 가르는 것은 뒤쪽이다.
-    let compose_after_vblank_ms = dwm.map(|(vblank, compose, period)| {
-        fold_forward(compose as i128 - vblank as i128, period as i128)
-    });
     // ★3) 합성 격자점 뒤로 이 패널의 vblank 가 언제 오나.★
     let outvb_after_last_ms = out_grid.map(|grid| {
         fold_forward(
             grid.vblank_qpc as i128 - last as i128,
-            grid.period_qpc as i128,
-        )
-    });
-    // ★4) **`qpcCompose` 뒤로** 이 패널의 vblank 가 언제 오나 -- 이것이 여유다.★
-    //
-    // 스캔아웃이 "합성이 끝난 뒤 처음 오는 패널 vblank" 라면, 이 값이 0 에 가까운 패널은
-    // 작은 흔들림 하나로 그 프레임을 잡느냐 다음 것을 잡느냐가 뒤집힌다 -- 한 주기를
-    // 통째로 기다리게 되고, 그것이 곧 프레임 중복이다. p05 가 0 쪽에 붙어 있는지가
-    // 판정이고, p95-p05 가 그 흔들림의 폭이다.
-    let outvb_after_compose_ms = dwm.zip(out_grid).map(|((_, compose, _), grid)| {
-        fold_forward(
-            grid.vblank_qpc as i128 - compose as i128,
             grid.period_qpc as i128,
         )
     });
@@ -1436,10 +1384,7 @@ pub(crate) fn note_dcomp_stat(
         commit_lead_ms,
         commit_to_comp_ms,
         commit_periods,
-        last_vs_dwmvb_ms,
-        compose_after_vblank_ms,
         outvb_after_last_ms,
-        outvb_after_compose_ms,
     };
     if let Ok(mut guard) = DCOMP_STATS.lock() {
         guard
@@ -1506,24 +1451,10 @@ fn emit_dcompstat() {
                 )
             }
         };
-        let (dwmvb_p05, dwmvb_p50, dwmvb_p95) =
-            three(samples.iter().filter_map(|s| s.last_vs_dwmvb_ms).collect());
-        let (cav_p05, cav_p50, cav_p95) = three(
-            samples
-                .iter()
-                .filter_map(|s| s.compose_after_vblank_ms)
-                .collect(),
-        );
         let (outvb_p05, outvb_p50, outvb_p95) = three(
             samples
                 .iter()
                 .filter_map(|s| s.outvb_after_last_ms)
-                .collect(),
-        );
-        let (oac_p05, oac_p50, oac_p95) = three(
-            samples
-                .iter()
-                .filter_map(|s| s.outvb_after_compose_ms)
                 .collect(),
         );
         let vs_qpc: Vec<f64> = samples.iter().filter_map(|s| s.current_vs_qpc_ms).collect();
@@ -1567,10 +1498,7 @@ fn emit_dcompstat() {
              next_ms p50={:.2} commit_lead_ms p05={:.2} p50={:.2} \
              commit_to_comp_ms p05={:.2} p50={:.2} p95={:.2} \
              current_vs_qpc_ms p05={:+.2} p50={:+.2} p95={:+.2} \
-             last_vs_dwmvb_ms p05={:+.2} p50={:+.2} p95={:+.2} \
-             compose_after_vblank_ms p05={:.2} p50={:.2} p95={:.2} \
              outvb_after_last_ms p05={:.2} p50={:.2} p95={:.2} \
-             outvb_after_compose_ms p05={:.2} p50={:.2} p95={:.2} \
              periods pending={pending} same={same} next={next_comp} late={late} failed={failed}",
             samples.len(),
             seen.len(),
@@ -1589,18 +1517,9 @@ fn emit_dcompstat() {
             qpc_p05,
             qpc_p50,
             qpc_p95,
-            dwmvb_p05,
-            dwmvb_p50,
-            dwmvb_p95,
-            cav_p05,
-            cav_p50,
-            cav_p95,
             outvb_p05,
             outvb_p50,
             outvb_p95,
-            oac_p05,
-            oac_p50,
-            oac_p95,
         );
     }
 }

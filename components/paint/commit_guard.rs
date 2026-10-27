@@ -284,9 +284,6 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     for (device, hr) in done {
         crate::dcomp_compositor::note_tick_commit(device, hr);
     }
-    // ★DWM 격자는 틱당 한 번만 묻는다.★ 프로세스 단위 양이라 디바이스마다 물을 이유가 없고,
-    // 그 조회는 DWM 으로의 프로세스 간 호출이다(`note_tick_commit` 주석).
-    crate::dcomp_compositor::note_dwm_phase();
 }
 
 static FANOUT_N: AtomicU64 = AtomicU64::new(0);
