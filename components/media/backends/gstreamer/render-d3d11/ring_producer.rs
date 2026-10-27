@@ -18,7 +18,7 @@
 
 use log::warn;
 use servo_media_player::d3d11_ring::{
-    ClaimedSlot, D3D11_TEXTURES_CREATED, MAX_PLANES, PlaneDesc, RingPlaneFormat, SLOT_COUNT,
+    ClaimedSlot, MAX_PLANES, PlaneDesc, RingPlaneFormat, SLOT_COUNT,
 };
 use servo_media_player::video::VideoFrameYuvFormat;
 use winapi::shared::dxgiformat::{
@@ -246,8 +246,6 @@ fn create_dynamic_texture(
             );
             return None;
         }
-        // 만든 수를 센다 — 해제 수(`D3D11_TEXTURES_RELEASED`)와 맞아야 회수가 성립한다.
-        D3D11_TEXTURES_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(ComPtr::from_raw(texture))
     }
 }

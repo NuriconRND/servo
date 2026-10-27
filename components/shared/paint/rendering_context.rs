@@ -9,10 +9,6 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::{Arc, Once, OnceLock};
 
-/// D3D11 텍스처 `Release()` 호출 누계(진단용). 만든 수와 맞아야 '해제했다'가 성립한다.
-pub static D3D11_TEXTURES_RELEASED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 use dpi::PhysicalSize;
 use embedder_traits::RefreshDriver;
 use euclid::default::{Rect, Size2D as UntypedSize2D};
@@ -1130,9 +1126,6 @@ impl SurfmanRenderingContext {
             if texture == 0 {
                 return;
             }
-            // ★해제 호출이 정말 일어나는지 센다.★ GPU 메모리가 안 내려올 때 가장 먼저
-            // 확인할 것은 free 가 불렸는지인데, 지금까지 그것을 세는 곳이 없었다.
-            D3D11_TEXTURES_RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             unsafe {
                 (*(texture as *mut winapi::um::unknwnbase::IUnknown)).Release();
             }

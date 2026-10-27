@@ -22,11 +22,10 @@ mod ring_producer;
 // 이 모듈 자체가 컴파일되지 않아 크레이트가 계속 빈 크레이트로 유지된다.
 #[cfg(windows)]
 mod render_d3d11 {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use gstreamer::prelude::*;
-    use servo_config::{debug_env, pref};
+    use servo_config::pref;
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
     use servo_media_player::d3d11_ring::{D3d11PlaneRings, RING_DEMAND_TTL};
@@ -36,42 +35,6 @@ mod render_d3d11 {
     };
 
     use crate::ring_producer;
-
-    // D3D11PROF: 파이프라인(플레이어) 식별자 발급기 — 로그에서 타일 구분용 (임시 계측).
-    static PROFILE_ID_SEQ: AtomicU32 = AtomicU32::new(0);
-
-    // D3D11PROF: 파이프라인별 하트비트 스로틀. 각 파이프라인의 build_frame은 전용
-    // 스트리밍 스레드에서 불리므로 thread_local이 자연스럽게 파이프라인당 1개다.
-    thread_local! {
-        static LAST_PROF_LOG: std::cell::Cell<Option<std::time::Instant>> =
-            const { std::cell::Cell::new(None) };
-        // D3D11PROF: 직전 로그 이후 이 파이프라인이 완성한 프레임 수 — 로그 라인 끝
-        // fr=N 필드로 실려 프로듀서 도착률(프레임/s) 복원용 (임시 계측).
-        static FRAMES_SINCE_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        // D3D11PROF(§14): 직전 샘플 도착 시각/pts — 도착 갭(>200ms)과 루프 wrap(pts
-        // 역행) 감지용. 스트리밍 스레드=파이프라인 1:1이라 thread_local로 충분.
-        static LAST_ARRIVAL: std::cell::Cell<Option<std::time::Instant>> =
-            const { std::cell::Cell::new(None) };
-        static LAST_PTS_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
-    }
-
-    /// SERVO_D3D11_PROFILE=1 이면 단계별 타이밍을 측정/로깅한다. `servo_config::debug_env`가
-    /// 프로세스 1회 판정을 캐시한다 — 이 판정식은 `servo-media-thread`(media-thread/lib.rs
-    /// 의 `d3d11_profile_enabled`)에도 동일하게 존재하며, 2026-08-11 조사로 두 판정식이
-    /// 문자 그대로 같음을 확인했다("1"/"true"/"on", 대소문자 무시).
-    fn profile_enabled() -> bool {
-        debug_env::string(&debug_env::D3D11_PROFILE).is_some_and(|v| {
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        })
-    }
-
-    /// build_frame 총시간이 이 임계(ms) 이상일 때만 로깅 (로그 폭주 방지).
-    /// SERVO_D3D11_PROFILE_MS 로 조정, 기본 8ms.
-    fn profile_threshold_ms() -> f64 {
-        debug_env::string(&debug_env::D3D11_PROFILE_MS)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8.0)
-    }
 
     /// ★낡음(2026-07-12 기록, 2026-08-25 `6ff890d501b` 이후 무효)★ — 실제 자리는 `render.rs:309-316`.
     /// colorimetry 매핑 (components/media/backends/gstreamer/render.rs:240-246과 동일).
@@ -109,10 +72,6 @@ mod render_d3d11 {
         /// 링이 아직 한 번도 소비되지 않음(전 슬롯 Unmapped, claim이 항상 None).
         /// true인 동안은 드롭 대신 첫 프레임을 스테이징한다.
         ring_never_consumed: bool,
-        /// 현재 링 생성 이후의 재제시 누계 — 배압(Free 슬롯 없음)뿐 아니라 gst
-        /// 버퍼 map 실패로 직전 Presenting 슬롯을 재표시한 횟수도 포함한다(단순
-        /// 드롭이 아니라 재제시; bf70293c4·af522092d 이후).
-        drop_count: u64,
         /// 소비자 디바이스 미발행 경고 1회 래치(파이프라인당).
         warned_no_device: bool,
         /// gst 버퍼 map 실패 경고 1회 래치(파이프라인당) — 로그 폭주 방지.
@@ -123,8 +82,6 @@ mod render_d3d11 {
         // 플레이어당 링 상태. build_frame은 스트리밍 스레드 1개에서만 불리지만
         // Render는 &self라 내부 가변성 필요.
         state: Mutex<PlayerState>,
-        // D3D11PROF: 이 플레이어의 파이프라인 식별자 (임시 계측).
-        profile_id: u32,
     }
 
     impl RenderD3D11 {
@@ -138,18 +95,15 @@ mod render_d3d11 {
                 log::warn!("D3D11 video: 단일 프로세스 전용 — Raw 경로 폴백");
                 return None;
             }
-            let profile_id = PROFILE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-            log::info!("D3D11 video: plane 링 프로듀서 경로 활성 (profile_id={profile_id})");
+            log::info!("D3D11 video: plane 링 프로듀서 경로 활성");
             Some(RenderD3D11 {
                 state: Mutex::new(PlayerState {
                     group_id: None,
                     in_caps: None,
                     ring_never_consumed: true,
-                    drop_count: 0,
                     warned_no_device: false,
                     warned_map_fail: false,
                 }),
-                profile_id,
             })
         }
 
@@ -170,7 +124,6 @@ mod render_d3d11 {
             state.group_id = Some(group_id);
             state.in_caps = Some(caps.to_owned());
             state.ring_never_consumed = true;
-            state.drop_count = 0;
             Some(group_id)
         }
 
@@ -198,53 +151,9 @@ mod render_d3d11 {
             // 함께 남긴다 — 10-bit 협상(I42010le/P01010le vs 8-bit 강등) 확인용.
             // device 를 함께 남겨 어느 GPU 에 올라갔는지 로그로 확인할 수 있게 한다.
             log::info!(
-                "D3D11 video: plane 링 생성 group_id={group_id} ring_id={ring_id}                  {width}x{height} gst={gst_format:?} -> {format:?} (id={}) device=0x{device:x}",
-                self.profile_id
+                "D3D11 video: plane 링 생성 group_id={group_id} ring_id={ring_id}                  {width}x{height} gst={gst_format:?} -> {format:?} device=0x{device:x}"
             );
             Some(ring_id)
-        }
-
-        /// D3D11PROF: claim/copy/publish 타이밍 + 드롭 카운터 하트비트(1초 1줄 +
-        /// 임계 초과 프레임). profile on일 때만 호출.
-        #[allow(clippy::too_many_arguments)]
-        fn prof_log(
-            &self,
-            state: &PlayerState,
-            ring_id: u64,
-            bf_start: std::time::Instant,
-            t_claim: std::time::Duration,
-            t_copy: std::time::Duration,
-            t_publish: std::time::Duration,
-        ) {
-            let total_ms = bf_start.elapsed().as_secs_f64() * 1000.0;
-            let over = total_ms >= profile_threshold_ms();
-            let frames = FRAMES_SINCE_LOG.with(|c| {
-                let n = c.get() + 1;
-                c.set(n);
-                n
-            });
-            let heartbeat = LAST_PROF_LOG.with(|c| match c.get() {
-                Some(t) if t.elapsed() < std::time::Duration::from_secs(1) => false,
-                _ => true,
-            });
-            if over || heartbeat {
-                LAST_PROF_LOG.with(|c| c.set(Some(std::time::Instant::now())));
-                FRAMES_SINCE_LOG.with(|c| c.set(0));
-                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-                log::warn!(
-                    "D3D11PROF id={} over={} total={:.2} claim={:.3} copy={:.2} \
-                     publish={:.3} drops={} regdrops={} fr={}",
-                    self.profile_id,
-                    if over { 1 } else { 0 },
-                    total_ms,
-                    ms(t_claim),
-                    ms(t_copy),
-                    ms(t_publish),
-                    state.drop_count,
-                    D3d11PlaneRings::dropped_frames(ring_id),
-                    frames,
-                );
-            }
         }
     }
 
@@ -276,36 +185,9 @@ mod render_d3d11 {
         }
 
         fn build_frame(&self, sample: gstreamer::Sample) -> Option<VideoFrame> {
-            let prof = profile_enabled(); // D3D11PROF
-            let bf_start = std::time::Instant::now(); // D3D11PROF
             let buffer = sample.buffer()?;
             if buffer.n_memory() == 0 {
                 return None;
-            }
-            // D3D11PROF(§14): 도착 갭(>200ms) + 루프 wrap(pts 역행) 이벤트 로깅 —
-            // 개별 타일 간헐 멈춤과 gapless 되감기의 상관 판정용 (임시 계측).
-            if prof {
-                let pts_ms = buffer
-                    .pts()
-                    .map(|t| t.nseconds() as f64 / 1_000_000.0)
-                    .unwrap_or(-1.0);
-                let prev_pts = LAST_PTS_MS.with(|c| c.replace(pts_ms));
-                if pts_ms >= 0.0 && prev_pts >= 0.0 && pts_ms < prev_pts - 1000.0 {
-                    log::warn!(
-                        "D3D11PROF wrap id={} pts_ms={pts_ms:.0} prev_pts_ms={prev_pts:.0}",
-                        self.profile_id
-                    );
-                }
-                let prev_arrival = LAST_ARRIVAL.with(|c| c.replace(Some(bf_start)));
-                if let Some(prev) = prev_arrival {
-                    let gap_ms = (bf_start - prev).as_secs_f64() * 1000.0;
-                    if gap_ms > 200.0 {
-                        log::warn!(
-                            "D3D11PROF arrgap id={} gap_ms={gap_ms:.0} pts_ms={pts_ms:.0}",
-                            self.profile_id
-                        );
-                    }
-                }
             }
 
             let caps = sample.caps()?;
@@ -345,10 +227,7 @@ mod render_d3d11 {
                 // None 을 돌려주면 appsink 가 FlowError::Error 로 바꿔 파이프라인이
                 // 통째로 정지한다(bf70293c4 계열).
                 if !state.warned_no_device {
-                    log::info!(
-                        "D3D11 video: 아직 이 영상을 합성하는 타일이 없다 — 업로드 보류 (id={})",
-                        self.profile_id
-                    );
+                    log::info!("D3D11 video: 아직 이 영상을 합성하는 타일이 없다 — 업로드 보류");
                     state.warned_no_device = true;
                 }
                 return VideoFrame::new(
@@ -386,20 +265,11 @@ mod render_d3d11 {
                     if state.ring_never_consumed {
                         return None;
                     }
-                    state.drop_count += 1;
                     if !state.warned_map_fail {
                         log::warn!(
-                            "D3D11 video: gst 버퍼 map 실패 — 기존 Presenting 슬롯 재표시로 폴백 (id={})",
-                            self.profile_id
+                            "D3D11 video: gst 버퍼 map 실패 — 기존 Presenting 슬롯 재표시로 폴백"
                         );
                         state.warned_map_fail = true;
-                    }
-                    if prof {
-                        log::warn!(
-                            "D3D11PROF mapfail id={} group={group_id} drops={}",
-                            self.profile_id,
-                            state.drop_count,
-                        );
                     }
                     // 아래와 동일한 메타데이터 프레임을 즉시 반환 — 새 프레임
                     // 복사 없이 재표시로 스트림 유지(배압 arm과 동형).
@@ -432,22 +302,13 @@ mod render_d3d11 {
                     continue;
                 };
 
-                let claim_start = std::time::Instant::now(); // D3D11PROF
                 match D3d11PlaneRings::claim_free_slot(ring_id) {
                     Some(claimed) => {
-                        let t_claim = claim_start.elapsed(); // D3D11PROF
                         let slot = claimed.slot;
-                        let copy_start = std::time::Instant::now(); // D3D11PROF
                         ring_producer::copy_planes(&frame, format, swap_uv, &claimed);
-                        let t_copy = copy_start.elapsed(); // D3D11PROF
-                        let pub_start = std::time::Instant::now(); // D3D11PROF
                         D3d11PlaneRings::publish_slot(ring_id, slot);
-                        let t_publish = pub_start.elapsed(); // D3D11PROF
                         // 첫 성공 claim = 어느 링이든 소비되기 시작했다는 신호.
                         state.ring_never_consumed = false;
-                        if prof {
-                            self.prof_log(state, ring_id, bf_start, t_claim, t_copy, t_publish);
-                        }
                     },
                     None if state.ring_never_consumed => {
                         // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
@@ -472,15 +333,6 @@ mod render_d3d11 {
                         // 않는 이유는 종전과 같다: appsink 가 None 을 치명적
                         // FlowError::Error 로 바꿔 파이프라인 전체를 정지시킨다.
                         // 렌더러는 직전 Presenting 슬롯을 재표시한다(정상적 드롭).
-                        state.drop_count += 1;
-                        if prof {
-                            log::warn!(
-                                "D3D11PROF drop id={} ring={ring_id} dev=0x{device:x} drops={} regdrops={}",
-                                self.profile_id,
-                                state.drop_count,
-                                D3d11PlaneRings::dropped_frames(ring_id),
-                            );
-                        }
                     },
                 }
             }

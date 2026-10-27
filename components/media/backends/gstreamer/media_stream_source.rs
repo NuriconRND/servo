@@ -147,12 +147,6 @@ mod imp {
             if attached.is_empty() {
                 return;
             }
-            // 실제로 끊었는지 다음 실행의 로그로 확인한다 -- 이 줄이 player drop 앞에
-            // 나와야 순서가 맞다.
-            log::warn!(
-                "MEDIATEARDOWN detaching {} proxysink(s) from stream pipelines",
-                attached.len()
-            );
             for (pipeline, sink) in attached {
                 // 먼저 세운다 -- 내리기 전에 링크를 풀면 흐르던 버퍼가 갈 곳을 잃는다.
                 let _ = sink.set_state(gstreamer::State::Null);
