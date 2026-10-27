@@ -243,6 +243,15 @@ param(
     #
     # 판정: WALLCLOCK 의 jit_ms 와 gap_ms p95, 그리고 COMPREFRESH 의 refresh_d[2].
     [switch] $PacingDwmQuery,
+
+    # gfx_wall_pacing_output: 페이싱 스레드가 WaitForVBlank 를 걸 출력을 이름으로 못 박는다.
+    # "" = primary(오늘 동작). "\.\DISPLAY22" 처럼 DXGI 출력 이름을 준다.
+    # ★왜★ 코드가 전제하던 "DWM 합성은 primary 의 vblank 에 물려 있다" 가 이 벽에서 깨졌다.
+    # 2026-10-26 같은 바이너리로 돈 네 런에서 DWM 격자에 붙은 출력이 런마다 달랐고, 어긋난
+    # 런은 커밋 위상 52% 에 dup 4.025%, 붙은 런은 0.902% 였다. 먼저 OUTPHASE 로 그 세션의
+    # vs_dwmvb_ms 가 0 인 출력을 확인한 뒤 출력마다 한 번씩 돌리면 인과가 증명된다.
+    # 로그의 VBANCHOR 줄이 실제로 어느 출력을 기다렸는지 찍는다.
+    [string] $PacingOutput = "",
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -325,6 +334,24 @@ param(
     # `Stop-Process -Name winit_wall -Force`.
     [switch] $NoLog,
     [switch] $KeepRustLog,
+    # 로그 ***분량***만 줄이고 판정 지표는 남긴다. RUST_LOG 을 `error,paint=warn` 으로 세운다.
+    #
+    # judder 판정에 쓰는 줄은 전부 `paint` 크레이트의 warn! 이다 -- COMPREFRESH / OUTPHASE /
+    # VBANCHOR / TICKCOMMIT / COMMITCYCLE 이 paint::output_grid, DWMPHASE 가
+    # paint::dcomp_compositor. 반면 바이트의 92% 는 `paint` 의 INFO 다(Wall render start/end,
+    # [dcomp-dbg] ...). 그래서 paint 를 warn 으로 내리면 ***숫자는 전부 남고 분량만 빠진다.***
+    # 2026-10-27 실측(log_fullthrottle_arch/07, multigpu): 기본 1,940 줄/s · 597 KB/s 에서
+    # 약 150 줄/s 로, 줄 1/13 · 바이트 1/12.
+    #
+    # ***무엇을 가르려고 있는 스위치인가.*** -NoLog 로 돌리면 judder 가 심해진다는 관찰이
+    # 나왔는데, 판정 카운터 자체가 로그 줄이라 -NoLog arm 에는 숫자가 영영 없다. 그래서
+    # "로그 분량" 과 "측정 가능" 이 같이 움직여 버려 원인을 가릴 수가 없었다. 이 스위치가
+    # 그 가운데 점이다: 분량은 1/13 인데 dup% 는 그대로 나온다. 기본 / -QuietLog / -NoLog
+    # 세 점을 같은 processor group 에서 3 회씩 돌면 분량-반응 곡선이 선다.
+    #
+    # 주의: 이걸 주면 paint 의 INFO 를 먹고 사는 분석 절(WALLSPLIT, DCOMPBIND, COMMITWORK,
+    # FRAMEID 등)은 비어서 나온다. 그건 고장이 아니라 이 스위치의 대가다.
+    [switch] $QuietLog,
     # SERVO_D3D11_PROFILE=1: per-pipeline stage timings, one heartbeat line per second per
     # video plus any frame over the threshold. The copy= field is the CPU memcpy of the
     # decoded planes into GPU-mapped memory -- the thing to look at when decode is cheap
@@ -883,7 +910,13 @@ if ($VideoEscapeProf)      { $env:SERVO_VIDEO_ESCAPE_PROF = "1" }
 $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
 $env:PATH = "$engine;$env:PATH"
-if (-not $KeepRustLog) {
+if ($QuietLog -and $KeepRustLog) {
+    throw "-QuietLog and -KeepRustLog contradict each other; pass one or the other"
+}
+if ($QuietLog) {
+    # paint 의 warn! 만 남긴다. 판정 카운터가 전부 거기 있다 -- 위 -QuietLog 주석 참고.
+    $env:RUST_LOG = "error,paint=warn"
+} elseif (-not $KeepRustLog) {
     # ***`winit_wall=info` is not optional decoration.*** The shell's own diagnostics
     # (WALLPASS render-pass timings, devtools port) log from the example crate, and without
     # a target for it they fall under the leading `warn` and never appear -- a switch can
@@ -892,6 +925,30 @@ if (-not $KeepRustLog) {
     $env:RUST_LOG = "warn,paint=info,media=info,winit_wall=info," +
                     "servo_media_gstreamer=info,servo_media_gstreamer_render_d3d11=info"
 }
+# ***RUST_LOG 의 알 수 없는 맨 토큰은 로그를 끄지 않는다 -- 상한을 Trace 로 올린다.***
+# env_filter 는 레벨로 파싱되지 않는 맨 토큰을 `(LevelFilter::Trace, <모듈이름>)` 디렉티브로
+# 바꾸고(parser.rs), Filter::filter() 가 디렉티브 레벨의 ***최대값***을 돌려주며(filter.rs),
+# components/servo/servo.rs 의 setup_logging 이 그 값을 그대로 log::set_max_level 에 넣는다.
+# 그래서 `RUST_LOG=critical` 은 "critical 이상만" 이 아니라 "전부 통과" 가 된다. 출력은
+# (critical 로 시작하는 타깃이 없으니) 0 줄인데, 핫 루프의 trace!/debug! 는 매번 Record 를
+# 만들고 로거 둘로 디스패치된다 -- 조용해지는 게 아니라 일이 늘어난다.
+#
+# 2026-10-27 에 이것으로 A/B 한 바퀴를 날렸다: `$env:RUST_LOG="critical"` + -KeepRustLog 를
+# "로그 최소화" 로 읽었는데 실제로는 max_level 을 Info 에서 Trace 로 올린 구성이었다.
+# 배너에 RUST_LOG=critical 이 그대로 찍혀서 아무도 눈치채지 못했다. 조용히 넘기지 말 것.
+$rustLogLevels = @("off", "error", "warn", "info", "debug", "trace")
+foreach ($directive in ($env:RUST_LOG -split "," | Where-Object { $_.Trim() -ne "" })) {
+    $hasTarget = $directive -match "="
+    $level = if ($hasTarget) { ($directive -split "=", 2)[1] } else { $directive }
+    if ($rustLogLevels -notcontains $level.Trim().ToLower()) {
+        if ($hasTarget) {
+            Write-Warning "RUST_LOG directive '$($directive.Trim())' has an unknown level '$($level.Trim())'. Valid: $($rustLogLevels -join ', ')."
+        } else {
+            Write-Warning "RUST_LOG token '$($directive.Trim())' is NOT a log level, so env_filter reads it as a MODULE NAME at Trace -- it RAISES the global max level to Trace instead of quieting anything, and the hot-loop trace!/debug! calls start building Records every message. Valid levels: $($rustLogLevels -join ', '). To cut the log volume while keeping the judder counters, use -QuietLog."
+        }
+    }
+}
+
 if ($env:RUST_LOG -notmatch "(^|,)media=") {
     Write-Warning "RUST_LOG has no 'media=' target -- the WALLDIAG consumer-device/wrap lines will be MISSING."
 }
@@ -909,6 +966,7 @@ $argList = @(
     "--pref", "gfx_wall_direct_render=$($DirectRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_vblank=$((-not $PacingDwmQuery.IsPresent).ToString().ToLower())",
+    "--pref", "gfx_wall_pacing_output=$PacingOutput",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -984,7 +1042,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  d3d11_profile=$($D3d11Profile.IsPresent) video_rate=$($VideoRate.IsPresent) immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})$(if($PSBoundParameters.ContainsKey('D3d11ProfileMs')){" threshold=${D3d11ProfileMs}ms"}else{" threshold=8ms(default)"})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -2314,6 +2372,20 @@ if ($rc) {
 # 실측 기준선(같은 장비·같은 프로브·120 초, 2026-10-22):
 #   engine 2026-10-16  0.010 ~ 0.090%   (5/5 런, 핀 없이 group 0·1 양쪽)
 #   engine 2026-10-22  0.109 ~ 3.50%    (6/7 런)
+# ★COMPREFRESH 는 이 벽이 ***안 쓰는 출력까지*** 센다.★ 프로브 스레드가 열거된 전 출력을
+# 훑기 때문이다(`output_grid.rs` 의 `emit_comp_stats(&current.outputs, ..)`). 타일 하나짜리
+# 레이아웃에서는 표의 3/4 가 바탕화면만 띄운 유휴 패널이고, ***유휴 출력은 정상적으로***
+# `refresh_d[2]` 가 높다 -- 바뀐 게 없으니 DWM 이 합성을 건너뛰고 그동안 패널은 계속
+# 리프레시한다. 실측(2026-10-22, 1 타일 런): 구동 안 하는 DISPLAY22 가 모든 arm 에서
+# 2.4~2.9% 로 나왔고, 육안으로 저더가 전혀 없던 런에서도 그랬다.
+#
+# 그래서 ★페인터가 찍는 줄로 구동 집합을 뽑아 걸러낸다★ -- `DCOMPSTAT` 는
+# `Painter::note_dcomp_frame_statistics` 가 자기 타일의 모니터로만 부르므로 구동 중인
+# 출력에만 뜬다(`SAMPLELEAD` 도 같지만 그쪽은 -SampleLead 가 켜져야 난다).
+$crDriven = @{}
+foreach ($m in @(Select-String -Path $LogPath -Pattern "DCOMPSTAT out=(\S+)" -EA SilentlyContinue)) {
+    if ($m.Line -match "DCOMPSTAT out=(\S+)") { $crDriven[$Matches[1]] = $true }
+}
 $cr = @(Select-String -Path $LogPath -Pattern "COMPREFRESH out=" -EA SilentlyContinue)
 if ($cr.Count -gt 0) {
     $crRows = @{}
@@ -2343,16 +2415,32 @@ if ($cr.Count -gt 0) {
         $crTotalDup = 0
         $crWindows = 0
         $crWithDup = 0
+        $crIdle = 0
         foreach ($key in $crOrder) {
             $r = $crRows[$key]
             $pct = 0.0
             if ($r.Frames -gt 0) { $pct = 100.0 * $r.Dup / $r.Frames }
-            $crWorstPct = [math]::Max($crWorstPct, $pct)
-            $crTotalDup = $crTotalDup + $r.Dup
-            $crWindows  = [math]::Max($crWindows, $r.Windows)
-            $crWithDup  = [math]::Max($crWithDup, $r.WithDup)
-            Write-Host ("  {0,-14} {1,-19} {2,8:N0} {3,7:N0} {4,7:N3}% {5,7:N0} {6,8:N0} {7,8:N0}" -f `
-                $key, $r.Luid, $r.Frames, $r.Dup, $pct, $r.Worst, $r.Windows, $r.WithDup)
+            # ★구동 집합을 못 구했으면(DCOMPSTAT 없음) 예전처럼 전부 센다★ -- 걸러낼 근거가
+            # 없는데 거르면 조용히 틀린 판정을 내게 된다.
+            $driven = ($crDriven.Count -eq 0) -or $crDriven.ContainsKey($key)
+            $tag = ""
+            if (-not $driven) { $tag = "   <- idle, not driven by this run (excluded)"; $crIdle = $crIdle + 1 }
+            if ($driven) {
+                $crWorstPct = [math]::Max($crWorstPct, $pct)
+                $crTotalDup = $crTotalDup + $r.Dup
+                $crWindows  = [math]::Max($crWindows, $r.Windows)
+                $crWithDup  = [math]::Max($crWithDup, $r.WithDup)
+            }
+            Write-Host ("  {0,-14} {1,-19} {2,8:N0} {3,7:N0} {4,7:N3}% {5,7:N0} {6,8:N0} {7,8:N0}{8}" -f `
+                $key, $r.Luid, $r.Frames, $r.Dup, $pct, $r.Worst, $r.Windows, $r.WithDup, $tag)
+        }
+        if ($crIdle -gt 0) {
+            Write-Host ("  {0} of {1} outputs were not driven by this layout and are excluded from the verdict." -f $crIdle, $crOrder.Count)
+            Write-Host "  An idle panel legitimately shows a high dup%: nothing changed, so DWM skipped compositions"
+            Write-Host "  while the panel kept refreshing. Do not read those rows as judder."
+        } elseif ($crDriven.Count -eq 0) {
+            Write-Host "  (No DCOMPSTAT line, so the driven-output set is unknown -- every output is counted. If this"
+            Write-Host "   layout drives fewer panels than the machine has, the extra rows are idle, not judder.)"
         }
         # 창 중 몇 %에 결함이 있었나. 고르게 퍼졌는지 몰렸는지를 이 하나로 가른다.
         $crSpreadPct = 0.0
