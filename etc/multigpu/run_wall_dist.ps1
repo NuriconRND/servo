@@ -341,7 +341,7 @@ param(
     # paint::dcomp_compositor. 반면 바이트의 92% 는 `paint` 의 INFO 다(Wall render start/end,
     # [dcomp-dbg] ...). 그래서 paint 를 warn 으로 내리면 ***숫자는 전부 남고 분량만 빠진다.***
     # 2026-10-27 실측(log_fullthrottle_arch/07, multigpu): 기본 1,940 줄/s · 597 KB/s 에서
-    # 약 115 줄/s 로, 줄 1/17 · 바이트 1/14 (10/d_* 실측 2.55 MB 대 10/e_* 36.7 MB).
+    # 약 121 줄/s 로, 줄 1/16 · 바이트 1/13 (10/d_* 실측 2.55 MB 대 10/e_* 36.7 MB).
     #
     # ***무엇을 가르려고 있는 스위치인가.*** -NoLog 로 돌리면 judder 가 심해진다는 관찰이
     # 나왔는데, 판정 카운터 자체가 로그 줄이라 -NoLog arm 에는 숫자가 영영 없다. 그래서
@@ -944,7 +944,10 @@ if ($QuietLog) {
     # FRAMETIME = paint::frame_time, ANIMSTEP = paint::painter)는 줄 수까지 같게 남았다.
     # RAFCLOCK 은 "페이지가 같은 위치를 두 번 계산했다" 를 세는 유일한 줄이라 빠지면 안 된다.
     # 비용은 2 줄/s 다.
-    $env:RUST_LOG = "error,paint=warn,script::raf_clock=warn"
+    # `winit_wall` 은 ***info*** 여야 한다. 셸의 패스 분해(WALLSPLIT/WALLQUEUE/MAINBUSY/
+    # WALLPASS/WALLCLOCK)가 전부 INFO 라 warn 으로는 안 돌아온다 -- 10/e_01 에서 프리픽스를
+    # 직접 읽어 확인했다. 분량은 408 줄/60s = 6.8 줄/s, 1.4 KB/s 라 사실상 공짜다.
+    $env:RUST_LOG = "error,paint=warn,script::raf_clock=warn,winit_wall=info"
 } elseif (-not $KeepRustLog) {
     # ***`winit_wall=info` is not optional decoration.*** The shell's own diagnostics
     # (WALLPASS render-pass timings, devtools port) log from the example crate, and without
