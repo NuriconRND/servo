@@ -305,20 +305,21 @@ servoshell / WPT / Android 는 깨우기가 에지를 예약해야 생산하므�
 | 실행 | 기대 | 뜻 |
 |---|---|---|
 | `-CanvasAckSkip 1 -NoCanvasAckRecovery` | **stall 없음, 한 틱만 지연** | ★이것이 이 구조의 요점★ — 한 번 놓쳐도 영구 교착이 아니다 |
-| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **stall + `WALLACKLATCH`** | 1 차와 복구를 다 막으면 교착이 재현된다. ★`WALLACKLATCH` 를 찾을 때 주의★ — 아래 `WALLACKSKIP` 경고 |
+| `-CanvasAckSkip 1000000 -NoCanvasAckRecovery` | **벽이 선다** | 1 차와 복구를 다 막으면 교착이 재현된다. 판정은 ***화면***이다 — 아래 |
 | `-CanvasAckSkip 1` | **stall 없음 + `WALLACKSKIP`** | 주입이 실제로 ack 를 보류했다 |
 
-★마지막 행의 증거 줄은 `WALLACKFLUSH` 가 아니라 `WALLACKSKIP` 이다.★ 1 차
-해제(틱)가 ***매 틱*** 다시 시도하므로, 보류된 빚을 복구(`flush_owed_canvas_ack`)보다
-***다음 틱의 1 차가 먼저 줍는 일이 흔하다***. 그러면 `WALLACKFLUSH` 는 한 줄도 안 찍히는데
-★주입은 분명히 걸린 것★ 이다 — 없는 줄을 찾다가 "주입이 무력하다" 로 오독하기 쉬우므로,
-그 구성에서는 보류 자체의 증거인 `WALLACKSKIP` 을 본다.
+★교착 쪽 증거 줄은 더 이상 없다.★ 교착을 1 초에 한 줄로 찍던 `WALLACKLATCH` 와 복구가
+빚을 메웠음을 찍던 `WALLACKFLUSH` 는 2026-10-27 계측 정리에서 엔진에서 제거됐다. 둘째 행의
+판정은 ***벽이 실제로 서는 것***이고 로그에서 찾을 것은 없다. 없는 줄을 grep 하다가 "주입이
+무력하다" 로 오독하지 말 것.
+
+★남은 증거 줄은 `WALLACKSKIP` 하나다.★ 그것은 보류 ***자체***의 증거이지 교착의 증거가
+아니다 — 주입이 걸렸는지만 말해 준다. 런처 기본 `RUST_LOG=warn` 에서 그대로 나온다.
 
 `WALLACKSKIP` 은 `consume_canvas_ack_skip` 이 예산을 쓸 때마다 찍는 경고다 — "painter N 이
 파이프라인 M 개에 빚진 ack 를 일부러 보류했다(남은 예산 K)". ★rate limit 이 없다.★ 그래서
 `-CanvasAckSkip 1000000` 처럼 예산을 크게 주면 해제 시도마다 한 줄이 나와 ***초당 수십~수백
-줄***이 되고, 1 초에 한 줄인 `WALLACKLATCH` 가 그 안에 묻힌다. 그 조합을 돌 때는 `WALLACKLATCH`
-를 눈으로 찾지 말고 따로 grep 할 것.
+줄***이 된다. 그 조합은 교착 재현용이지 로그를 읽는 구성이 아니다.
 
 ## wall CLI 플래그
 

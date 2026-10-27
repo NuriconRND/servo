@@ -118,21 +118,6 @@ foreach ($n in @('libGLESv2.dll', 'libEGL.dll')) {
     if (Test-Path $src) { Copy-Item $src (Join-Path $engine $n) -Force }
 }
 
-# --- 2b. thread_cpu_probe: attributes the running wall's CPU to named threads ---
-# Its own tiny crate with its own target dir, so it is built on demand rather than
-# assumed present. Without it, run_wall_dist.ps1 -ThreadCpu has nothing to run.
-$probeManifest = Join-Path $repo "etc\multigpu\tools\thread_cpu_probe\Cargo.toml"
-$probeExe = Join-Path $repo "etc\multigpu\tools\thread_cpu_probe\target\release\thread_cpu_probe.exe"
-if (!(Test-Path $probeExe)) {
-    Write-Host "Building thread_cpu_probe..."
-    & cargo build --release --manifest-path $probeManifest
-}
-if (Test-Path $probeExe) {
-    Copy-Item $probeExe $engine -Force
-} else {
-    Write-Warning "thread_cpu_probe.exe could not be built -- run_wall_dist.ps1 -ThreadCpu will not work."
-}
-
 # --- 3. config\ : wall layouts ---
 $cfg = Join-Path $Out "config"
 New-Item -ItemType Directory -Path $cfg -Force | Out-Null
@@ -228,7 +213,6 @@ Copy-Item (Join-Path $PSScriptRoot "tools\measure_decode_only.ps1") $Out -Force
 # ...and the http server -Serve drives. WebGPU pages hang on file:// with no error at all,
 # so without this the dist can only run the file:///-served pages.
 Copy-Item (Join-Path $PSScriptRoot "tools\serve_http.ps1") $Out -Force
-Copy-Item (Join-Path $PSScriptRoot "tools\run_frame_time_ab.ps1") $Out -Force
 # ...and the two GStreamer executables it drives, from the SAME install the wall links against.
 #
 # ***Without these the baseline measured a different GStreamer than the wall runs.*** The test
@@ -242,11 +226,6 @@ foreach ($gstExe in @("gst-launch-1.0.exe", "gst-discoverer-1.0.exe")) {
     if (Test-Path $src) { Copy-Item $src $engine -Force }
     else { Write-Warning "$gstExe not found in $GstRoot; measure_decode_only.ps1 will fall back to another install" }
 }
-# The machine's shape decides how to read every number this dist produces. Processor group
-# placement was measured to be the difference between 29 fps and 6 fps on 45 videos (2026-08-26,
-# forced with -NumaNode, 6/6), so the group/NUMA/GPU-node facts have to be available ON the test
-# machine, not only in the dev worktree.
-Copy-Item (Join-Path $PSScriptRoot "tools\probe_machine_topology.ps1") $Out -Force
 
 $dll = (Get-ChildItem (Join-Path $engine "*.dll") | Measure-Object).Count
 $size = [math]::Round(((Get-ChildItem $Out -Recurse -Force | Measure-Object -Property Length -Sum).Sum / 1GB), 2)
@@ -281,4 +260,3 @@ Write-Host ""
 Write-Host "Copy the folder to the test machine and run:"
 Write-Host "  .\run_wall_dist.ps1 -DurationSec 30"
 Write-Host "  .\run_wall_dist.ps1 -Layout wall_layout.multigpu.reversed.json -DurationSec 30"
-Write-Host "  .\run_wall_dist.ps1 -DurationSec 40 -ThreadCpu      # where the CPU actually goes"
