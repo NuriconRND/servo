@@ -2296,10 +2296,6 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
     }
     windows.insert(device, now);
     drop(last);
-    // 이름은 찍을 때만 찾는다 -- 실패 경로가 매번 두 번째 뮤텍스를 잡을 이유가 없다.
-    let out = crate::commit_guard::monitor_for_device(device)
-        .and_then(crate::output_grid::name_for_monitor)
-        .unwrap_or_else(|| String::from("?"));
     // ★이 하나는 이름으로 부른다.★ 구조상 더는 나지 않아야 하는 값이라(틱 커밋은 그 패스의
     // `BeginDraw` 가 열리기 전에 나간다), 났다면 그 전제가 깨진 것이고 바로 알아봐야 한다.
     let named = if hr == DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED {
@@ -2308,7 +2304,7 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
         ""
     };
     warn!(
-        "[dcomp-native] {site}: Commit failed (hr=0x{:08x}){named} device=0x{device:x} out={out}",
+        "[dcomp-native] {site}: Commit failed (hr=0x{:08x}){named} device=0x{device:x}",
         hr as u32
     );
 }
@@ -2600,7 +2596,6 @@ impl DCompNativeCompositor {
             )
         };
         let rate = stats.currentCompositionRate;
-        crate::commit_guard::remember_device_monitor(device as usize, monitor);
         crate::output_grid::note_dcomp_stat(
             monitor,
             device as usize,

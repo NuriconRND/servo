@@ -101,27 +101,6 @@ pub(crate) static SAMPLE_LEAD_PERIODS: LazyLock<Option<u64>> = LazyLock::new(|| 
     (0..=4).contains(&raw).then_some(raw as u64)
 });
 
-/// 디바이스 -> 그 디바이스가 그리는 모니터.
-///
-/// ★커밋 실패 로그가 "어느 타일이 죽었나" 를 말할 수 있게 하는 유일한 연결이다.★ 커밋
-/// 경로는 디바이스 포인터만 들고 다니므로, 이 맵이 없으면 TDR 로 한 타일이 죽은 것과 넷이
-/// 다 죽은 것이 같은 로그로 보인다.
-static DEVICE_MONITOR: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
-
-pub(crate) fn remember_device_monitor(device: usize, monitor: usize) {
-    if let Ok(mut guard) = DEVICE_MONITOR.lock() {
-        guard
-            .get_or_insert_with(HashMap::new)
-            .insert(device, monitor);
-    }
-}
-
-/// 실패 로그가 디바이스를 출력 이름으로 옮길 때 쓴다.
-pub(crate) fn monitor_for_device(device: usize) -> Option<usize> {
-    let guard = DEVICE_MONITOR.lock().ok()?;
-    guard.as_ref()?.get(&device).copied()
-}
-
 // ★디바이스 뮤텍스는 `Arc` 로 나눠 갖지 않고 프로세스 수명으로 누수시킨다.★ 과거에 제안된
 // `Arc<Mutex<()>> + transmute 로 수명 늘리기` 는 구조체 필드 드롭 순서(선언 순) 때문에
 // unsound 하다: `_inner: Arc<...>` 가 `_held: MutexGuard<'static, ...>` 보다 먼저 드롭되므로,
