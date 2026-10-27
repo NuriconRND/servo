@@ -6,7 +6,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
@@ -46,7 +45,6 @@ use servo_canvas_traits::webgl::{
     WebGLRenderbufferId, WebGLSLVersion, WebGLSamplerId, WebGLShaderId, WebGLSurfaceId,
     WebGLSyncId, WebGLTextureId, WebGLVersion, WebGLVertexArrayId, YAxisTreatment,
 };
-use servo_config::debug_env;
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
 use surfman::{
     self, Context, ContextAttributeFlags, ContextAttributes, Device, GLVersion, SurfaceAccess,
@@ -217,89 +215,6 @@ impl Default for GLState {
     }
 }
 
-/// WebGL 스레드의 진행 표시와 현재 단계. ★워치독이 밖에서 본다.★
-///
-/// 왜 밖에서 봐야 하나: 스톨 실행에서 `WEBGLFANOUT` 이 그냥 끊긴다. 그런데 그것은 스왑
-/// 경계에서만 찍히므로 스레드가 **막힌 것**인지 **할 일이 없어 노는 것**인지 구분되지 않는다.
-/// 안에서 찍는 계측은 막히는 순간 같이 멈추므로 그 질문에 답할 수 없다 — 이 조사에서
-/// 네 번째로 같은 함정이었다(2026-09-02, `log_webgpu/48`: refresh driver 는 60 초 내내 틱을
-/// 요청했는데 — `ANIMTICK stop` 이 없다 — WebGL 스왑은 1 초에 끊겼다).
-static WEBGL_PROGRESS: AtomicU64 = AtomicU64::new(0);
-static WEBGL_PHASE: AtomicUsize = AtomicUsize::new(PHASE_IDLE);
-
-/// 도착한 메시지를 **종류별로** 센다.
-///
-/// ★진행 카운터 하나로는 부족했다★(2026-09-02, `log_webgpu/49`): stall 38 초 동안 워치독이
-/// 한 줄도 안 찍었는데, 그것은 스레드가 건강해서가 아니라 **painter 가 보내는
-/// `FinishedRenderingToContext` 가 루프를 계속 돌렸기** 때문이다(그 실행에서 `Wall render end`
-/// 8,490 줄). 스크립트가 죽어도 이 메시지는 계속 온다. 그래서 "메시지가 온다"가 아니라
-/// **"어떤 메시지가 오는가"** 를 세야 한다:
-///   `cmds` 가 멈춤  = 스크립트가 더 이상 그리라고 하지 않는다(원인이 상류)
-///   `cmds` 는 도는데 `swaps` 가 멈춤 = 그리기는 계속되는데 제출이 막혔다
-static WEBGL_MSG_CMDS: AtomicU64 = AtomicU64::new(0);
-static WEBGL_MSG_SWAPS: AtomicU64 = AtomicU64::new(0);
-static WEBGL_MSG_OTHER: AtomicU64 = AtomicU64::new(0);
-
-const PHASE_IDLE: usize = 0;
-const PHASE_HANDLING: usize = 1;
-const PHASE_SWAP_LOCK: usize = 2;
-const PHASE_SWAP_BUFFERS: usize = 3;
-const PHASE_SWAP_AFTER: usize = 4;
-
-fn phase_name(phase: usize) -> &'static str {
-    match phase {
-        PHASE_IDLE => "waiting for a message",
-        PHASE_HANDLING => "handling a message",
-        PHASE_SWAP_LOCK => "swap: ANGLE lock / make current",
-        PHASE_SWAP_BUFFERS => "swap: swap_buffers",
-        PHASE_SWAP_AFTER => "swap: after swap_buffers",
-        _ => "unknown",
-    }
-}
-
-/// 1 초마다 **무조건** 한 줄 찍는다. `SERVO_WEBGL_FANOUT_PROF` 가 켜져 있을 때만 뜬다.
-///
-/// ★건강할 때도 찍는 것이 핵심이다.★ 이 조사에서 다섯 번 같은 함정에 빠졌다 — 건강한 경로에서만
-/// 찍는 계측(`WEBGLFANOUT` 은 스왑 경계, `WEBGLEXTIMG` 는 lock 경계)은 stall 이 오면 다 같이
-/// 조용해지고, "줄이 없음"은 **막힌 것**과 **할 일이 없는 것**과 **계측이 안 도는 것**을
-/// 구분해 주지 못한다. 그래서 이것은 별도 스레드에서, 아무 일도 없어도 찍는다.
-fn spawn_webgl_watchdog() {
-    let spawned = std::thread::Builder::new()
-        .name(String::from("WebGLWatchdog"))
-        .spawn(|| {
-            let mut last_progress = u64::MAX;
-            let mut ticks_stuck = 0u32;
-            let (mut cmds, mut swaps, mut other) = (0u64, 0u64, 0u64);
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let progress = WEBGL_PROGRESS.load(Ordering::Relaxed);
-                let now_cmds = WEBGL_MSG_CMDS.load(Ordering::Relaxed);
-                let now_swaps = WEBGL_MSG_SWAPS.load(Ordering::Relaxed);
-                let now_other = WEBGL_MSG_OTHER.load(Ordering::Relaxed);
-                if progress == last_progress {
-                    ticks_stuck += 1;
-                } else {
-                    ticks_stuck = 0;
-                    last_progress = progress;
-                }
-                warn!(
-                    "WEBGLWATCHDOG cmds=+{} swaps=+{} other=+{} phase=[{}] stuck_s={}",
-                    now_cmds - cmds,
-                    now_swaps - swaps,
-                    now_other - other,
-                    phase_name(WEBGL_PHASE.load(Ordering::Relaxed)),
-                    ticks_stuck
-                );
-                cmds = now_cmds;
-                swaps = now_swaps;
-                other = now_other;
-            }
-        });
-    if let Err(error) = spawned {
-        warn!("Could not spawn the WebGL watchdog: {error:?}");
-    }
-}
-
 /// `gfx_webgl_swap_sync`: 스왑 직후 이 컨텍스트의 GPU 작업을 어디서 매듭지을지.
 ///
 /// ★가설★: DComp `Commit` 이 비싼 것은 캔버스의 GPU 작업이 아직 안 끝났기 때문이고, painter 가
@@ -331,53 +246,6 @@ static WEBGL_SWAP_SYNC: LazyLock<SwapSync> = LazyLock::new(|| {
         },
     }
 });
-
-/// `SERVO_WEBGL_FANOUT_PROF` 게이트. 명령마다 물어보는 자리라 env 읽기를 캐시한다.
-static WEBGL_FANOUT_PROF: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::WEBGL_FANOUT_PROF)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
-/// `SERVO_WEBGL_FANOUT_PROF` 누적기. 창은 1 초이고 스왑 경계에서 닫힌다.
-///
-/// 재는 목적은 하나다: 멀티-GPU 팬아웃에서 프레임 시간이 **GL 작업** 때문인지 **재실행의
-/// 단가**(컨텍스트 전환 · ANGLE 락 · postcard 왕복) 때문인지 가르는 것. 4K 캔버스를
-/// `?scale=0.5` 로 줄여도 프레임 시간이 그대로였으므로 픽셀 가설은 이미 반증됐고, 남은
-/// 후보가 이 단가다. 루프를 뒤집는 작업(전환 4N → 4)이 크므로 착수 전에 확인한다.
-#[derive(Default)]
-struct FanoutProfile {
-    /// 창의 시작. 첫 스왑에서 채워진다.
-    window_start: Option<Instant>,
-    swaps: u64,
-    /// 스크립트가 보낸 논리 명령 수.
-    commands: u64,
-    /// 디바이스별 적용 횟수. 팬아웃이 없으면 `commands` 와 같다.
-    applies: u64,
-    /// 실제 `make_context_current` 호출 수. ★`applies` 와 같으면 명령마다 컨텍스트를
-    /// 갈아타고 있다는 뜻이다★ — `make_surface_current_if_needed` 의 가드가 한 번도
-    /// 적중하지 않는 상태이고, 그것이 이 계측이 확인하려는 바로 그 가설이다.
-    switches: u64,
-    lock_wait_ns: u64,
-    switch_ns: u64,
-    /// 락 획득 이후 `WebGLImpl::apply` 까지의 총 소요(전환 시간을 포함한다 — 뺄셈은
-    /// 하지 않고 `switch_ns` 와 나란히 찍어 읽는 쪽이 판단한다).
-    apply_ns: u64,
-    serialize_ns: u64,
-    /// `gfx_webgl_swap_sync` 가 스왑 직후 쓴 시간과 횟수. 대기가 정말 이쪽으로 옮겨왔는지,
-    /// 그리고 그 대가가 얼마인지를 한 줄에서 읽기 위한 값이다.
-    swap_sync_ns: u64,
-    swap_syncs: u64,
-    /// ★스왑 경로 자체의 비용.★ 여기까지 재기 전에는 이 스레드의 1 초 중 **95.8%가
-    /// 미계측**이었다(2026-09-03, `log_webgpu/55`: 계측된 것이 42.6ms/s 뿐). 그 미계측분이
-    /// "할 일이 없어 노는 것"인지 "스왑에서 쓰는 것"인지 구분할 수단이 없었고, 그래서
-    /// "삼각형 하나인데 왜 느린가"에 답할 수 없었다.
-    ///
-    /// `swap_ns` = `SwapChain::swap_buffers`(서피스 교체 — 새 버퍼를 만들어야 하면 여기서
-    /// 만든다), `clear_ns` = 스왑 후 `clear_surface`(`preserve_drawing_buffer` 가 거짓일 때).
-    /// 가상 뷰포트 전체 캔버스는 11520x4320 RGBA8 = 199MB 이고 백엔드가 4 개다.
-    swap_ns: u64,
-    clear_ns: u64,
-}
 
 /// A WebGLThread manages the life cycle and message multiplexing of
 /// a set of WebGLContexts living in the same thread.
@@ -424,10 +292,6 @@ pub(crate) struct WebGLThread {
     /// A usage map used to delay the deletion of WebGL contexts until all WebRender
     /// rendering is finished, so that any existing `Surface`s can be properly released.
     busy_webgl_context_map: WebGLContextBusyMap,
-    /// When `log_live_contexts` last emitted, so it stays at one line per second.
-    last_live_log: Option<Instant>,
-    /// 팬아웃 재실행 비용 누적기(`SERVO_WEBGL_FANOUT_PROF`). 꺼져 있으면 갱신되지 않는다.
-    fanout_profile: FanoutProfile,
 
     #[cfg(feature = "webxr")]
     /// The bridge to WebXR
@@ -521,8 +385,6 @@ impl WebGLThread {
             webrender_swap_chains,
             painter_surfman_details_map,
             busy_webgl_context_map,
-            last_live_log: None,
-            fanout_profile: FanoutProfile::default(),
             #[cfg(feature = "webxr")]
             webxr_bridge: Some(WebXRBridge::new(webxr_init)),
         }
@@ -542,12 +404,7 @@ impl WebGLThread {
 
     fn process(&mut self) {
         let webgl_chan = WebGLChan(self.sender.clone());
-        if *WEBGL_FANOUT_PROF {
-            spawn_webgl_watchdog();
-        }
         loop {
-            WEBGL_PHASE.store(PHASE_IDLE, Ordering::Relaxed);
-            WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
             // ★대기에 시한을 둔다★ — 회수 판정이 메시지에만 얹혀 있으면, 정작 회수해야 할
             // 상황(캔버스가 숨어 페이지가 그리지도 않는 때)에는 아무 메시지도 오지 않아
             // 영영 돌지 않는다.
@@ -561,14 +418,6 @@ impl WebGLThread {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             };
             self.maybe_reclaim_idle_contexts();
-            WEBGL_PHASE.store(PHASE_HANDLING, Ordering::Relaxed);
-            WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
-            match &msg {
-                WebGLMsg::WebGLCommand(..) => &WEBGL_MSG_CMDS,
-                WebGLMsg::SwapBuffers(..) => &WEBGL_MSG_SWAPS,
-                _ => &WEBGL_MSG_OTHER,
-            }
-            .fetch_add(1, Ordering::Relaxed);
             let exit = self.handle_msg(msg, &webgl_chan);
             if exit {
                 break;
@@ -579,7 +428,6 @@ impl WebGLThread {
     /// Handles a generic WebGLMsg message
     fn handle_msg(&mut self, msg: WebGLMsg, webgl_chan: &WebGLChan) -> bool {
         trace!("processing {:?}", msg);
-        self.log_live_contexts();
         match msg {
             WebGLMsg::CreateContext(
                 painter_id,
@@ -735,47 +583,6 @@ impl WebGLThread {
     ///
     /// 컨텍스트가 아직/이미 없으면 `None` 이고 락은 전량 배타로 접힌다 — 모르는 채로
     /// 슬롯을 나누는 것보다 안전하다(그 실패 모드가 0xc0000005 다).
-    /// Report what this thread is still holding, once a second, unconditionally.
-    ///
-    /// ***Only WebGL moves these numbers.*** The wall runs video, live streams and
-    /// images alongside WebGL, and the signals they share -- external images,
-    /// surface imports, GPU memory as seen from outside -- cannot be attributed
-    /// to one of them from a log. These counts can: they are this thread's own
-    /// tables.
-    ///
-    /// `pending_delete` is the one to watch. `remove_webgl_context` defers when
-    /// WebRender still has a surface busy, and the deferral only completes when
-    /// the busy count falls back to zero. If it never does, the context and its
-    /// swap chain are never freed -- and that is invisible today, because nothing
-    /// reports it.
-    fn log_live_contexts(&mut self) {
-        let now = Instant::now();
-        let due = self
-            .last_live_log
-            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
-        if !due {
-            return;
-        }
-        self.last_live_log = Some(now);
-        let pending_delete = self
-            .contexts
-            .values()
-            .filter(|data| data.marked_for_deletion)
-            .count();
-        let busy = {
-            let map = self.busy_webgl_context_map.read();
-            map.values().filter(|count| **count > 0).count()
-        };
-        warn!(
-            "WEBGLLIVE contexts={} surfaces={} pending_delete={} busy_surfaces={} images={}",
-            self.context_backends.len(),
-            self.contexts.len(),
-            pending_delete,
-            busy,
-            self.cached_context_info.len(),
-        );
-    }
-
     fn angle_device_key(&self, surface_id: WebGLSurfaceId) -> Option<usize> {
         let _ = surface_id;
         #[cfg(all(target_os = "windows", feature = "no-wgl"))]
@@ -869,9 +676,6 @@ impl WebGLThread {
     ) {
         if self.cached_context_info.get_mut(&context_id).is_none() {
             return;
-        }
-        if *WEBGL_FANOUT_PROF {
-            self.fanout_profile.commands += 1;
         }
         match command {
             WebGLCommand::BufferData(buffer_type, receiver, usage) => {
@@ -1076,12 +880,7 @@ impl WebGLThread {
     /// Copy `command` for one more backend. See [`clone_webgl_command`] for why every
     /// copy serializes again.
     fn clone_command_for_backend(&mut self, command: &WebGLCommand) -> Option<WebGLCommand> {
-        let start = WEBGL_FANOUT_PROF.then(Instant::now);
-        let cloned = clone_webgl_command(command);
-        if let Some(start) = start {
-            self.fanout_profile.serialize_ns += start.elapsed().as_nanos() as u64;
-        }
-        cloned
+        clone_webgl_command(command)
     }
 
     fn apply_webgl_command_to_all_backends(
@@ -1111,13 +910,7 @@ impl WebGLThread {
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
-        let lock_start = WEBGL_FANOUT_PROF.then(Instant::now);
         let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
-        let apply_start = lock_start.map(|start| {
-            let acquired = Instant::now();
-            self.fanout_profile.lock_wait_ns += (acquired - start).as_nanos() as u64;
-            acquired
-        });
         {
             let data = self.make_surface_current_if_needed_mut(surface_id);
             if let Some(data) = data {
@@ -1131,10 +924,6 @@ impl WebGLThread {
                     backtrace,
                 );
             }
-        }
-        if let Some(start) = apply_start {
-            self.fanout_profile.applies += 1;
-            self.fanout_profile.apply_ns += start.elapsed().as_nanos() as u64;
         }
     }
 
@@ -1587,26 +1376,6 @@ impl WebGLThread {
                 busy_webgl_context_map.remove(surface_id);
             }
         }
-        let released = surface_ids.len();
-        // ★해제 직전·직후를 같은 자리에서 잰다.★ 초당 표본으로는 다른 일이 섞여 델타가
-        // 묻힌다. 어댑터별로 재고, 이 컨텍스트의 백엔드가 붙은 디바이스마다 따로 본다 --
-        // "해제했다" 와 "메모리가 돌아왔다" 가 다르다는 것이 실측으로 드러났으므로, 그
-        // 둘을 한 줄에 나란히 놓는다.
-        let before: Vec<(WebGLSurfaceId, u64)> = surface_ids
-            .iter()
-            .filter_map(|surface_id| {
-                let device = self.contexts.get(surface_id)?.device.d3d11_device_ptr() as usize;
-                let used = paint_api::rendering_context::adapter_local_usage_bytes(device)?;
-                Some((*surface_id, used))
-            })
-            .collect();
-        let devices: Vec<(WebGLSurfaceId, usize)> = surface_ids
-            .iter()
-            .filter_map(|surface_id| {
-                let device = self.contexts.get(surface_id)?.device.d3d11_device_ptr() as usize;
-                Some((*surface_id, device))
-            })
-            .collect();
         for surface_id in surface_ids {
             let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id);
@@ -1628,27 +1397,6 @@ impl WebGLThread {
         self.context_backends.remove(&context_id);
         self.bound_context_id = None;
         self.released_contexts.insert(context_id);
-        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        let deltas = before
-            .iter()
-            .map(|(surface_id, used_before)| {
-                let after = devices
-                    .iter()
-                    .find(|(id, _)| id == surface_id)
-                    .and_then(|(_, device)| {
-                        paint_api::rendering_context::adapter_local_usage_bytes(*device)
-                    })
-                    .unwrap_or(*used_before);
-                format!(
-                    "{:?}:{:.0}->{:.0}MB",
-                    surface_id.painter_id,
-                    mb(*used_before),
-                    mb(after)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        warn!("WEBGLRECLAIM released context={context_id:?} backends={released} vram[{deltas}]");
         if let Some(notifier) = self.context_notifiers.get(&context_id) {
             let _ = notifier.send(WebGLContextNotification::Lost(context_id));
         }
@@ -1685,10 +1433,6 @@ impl WebGLThread {
         self.context_backends
             .insert(context_id, recipe.painters.clone());
         self.released_contexts.remove(&context_id);
-        warn!(
-            "WEBGLRECLAIM restored context={context_id:?} backends={}",
-            recipe.painters.len()
-        );
         if let Some(notifier) = self.context_notifiers.get(&context_id) {
             let _ = notifier.send(WebGLContextNotification::Restored(context_id));
         }
@@ -1770,19 +1514,10 @@ impl WebGLThread {
         _sent_time: u64,
     ) {
         debug!("handle_swap_buffers()");
-        if *WEBGL_FANOUT_PROF {
-            self.fanout_profile.swaps += 1;
-        }
-        // 루프가 `self.contexts` 를 빌리는 동안 `self.fanout_profile` 을 만질 수 없어 지역에
-        // 모았다가 루프를 빠져나온 뒤 합친다.
-        let mut sync_ns: u64 = 0;
-        let mut syncs: u64 = 0;
         for context_id in context_ids {
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
             for surface_id in self.backend_surface_ids(context_id) {
-                WEBGL_PHASE.store(PHASE_SWAP_LOCK, Ordering::Relaxed);
-                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
                 self.make_surface_current_if_needed(surface_id)
                     .expect("Where's the GL data?");
@@ -1808,9 +1543,6 @@ impl WebGLThread {
                     .expect("Where's the swap chain?");
 
                 debug!("Swapping {:?}", surface_id);
-                WEBGL_PHASE.store(PHASE_SWAP_BUFFERS, Ordering::Relaxed);
-                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
-                let swap_start = WEBGL_FANOUT_PROF.then(Instant::now);
                 swap_chain
                     .swap_buffers(
                         &data.device,
@@ -1822,11 +1554,6 @@ impl WebGLThread {
                         },
                     )
                     .unwrap();
-                if let Some(start) = swap_start {
-                    self.fanout_profile.swap_ns += start.elapsed().as_nanos() as u64;
-                }
-                WEBGL_PHASE.store(PHASE_SWAP_AFTER, Ordering::Relaxed);
-                WEBGL_PROGRESS.fetch_add(1, Ordering::Relaxed);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
                 if !data.attributes.preserve_drawing_buffer {
@@ -1836,13 +1563,9 @@ impl WebGLThread {
                         .requested_flags
                         .contains(ContextAttributeFlags::ALPHA);
                     let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
-                    let clear_start = WEBGL_FANOUT_PROF.then(Instant::now);
                     swap_chain
                         .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
                         .unwrap();
-                    if let Some(start) = clear_start {
-                        self.fanout_profile.clear_ns += start.elapsed().as_nanos() as u64;
-                    }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
                 }
 
@@ -1857,17 +1580,12 @@ impl WebGLThread {
                 // 서피스를 거쳐 `Commit` 의 대기로 나타나지 않게 하는 것이다.
                 let sync = *WEBGL_SWAP_SYNC;
                 if sync != SwapSync::Off {
-                    let start = WEBGL_FANOUT_PROF.then(Instant::now);
                     unsafe {
                         match sync {
                             SwapSync::Flush => data.gl.flush(),
                             SwapSync::Finish => data.gl.finish(),
                             SwapSync::Off => unreachable!(),
                         }
-                    }
-                    if let Some(start) = start {
-                        sync_ns += start.elapsed().as_nanos() as u64;
-                        syncs += 1;
                     }
                 }
 
@@ -1898,71 +1616,8 @@ impl WebGLThread {
                 self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
             }
         }
-        if *WEBGL_FANOUT_PROF {
-            self.fanout_profile.swap_sync_ns += sync_ns;
-            self.fanout_profile.swap_syncs += syncs;
-        }
-        self.maybe_emit_fanout_profile();
     }
 
-    /// 계측 창(1 초)을 스왑 경계에서 닫고 한 줄 찍는다(`SERVO_WEBGL_FANOUT_PROF`).
-    ///
-    /// `warn!` 인 것은 의도적이다 — 런처의 `RUST_LOG` 에 `webgl` 타겟이 없어서 `info!`
-    /// 로 찍으면 아무것도 보이지 않는다(같은 이유로 이미 두 번 헛돌았다).
-    fn maybe_emit_fanout_profile(&mut self) {
-        if !*WEBGL_FANOUT_PROF {
-            return;
-        }
-        let now = Instant::now();
-        let window = now - *self.fanout_profile.window_start.get_or_insert(now);
-        if window < Duration::from_secs(1) {
-            return;
-        }
-        let devices = self
-            .context_backends
-            .values()
-            .map(|painter_ids| painter_ids.len())
-            .max()
-            .unwrap_or(0);
-        let ms = |ns: u64| ns as f64 / 1_000_000.0;
-        let profile = &self.fanout_profile;
-        // ★이 스레드가 실제로 바쁜 시간.★ 창 길이와 견주는 것이 요점이다 — 낮으면 캔버스가
-        // 느린 것이 아니라 **아무도 더 그리라고 하지 않는 것**이고, 그러면 원인은 rAF 를 모는
-        // 쪽(월의 패스 속도)에 있지 여기가 아니다.
-        let busy_ns = profile.lock_wait_ns
-            + profile.switch_ns
-            + profile.apply_ns
-            + profile.serialize_ns
-            + profile.swap_sync_ns
-            + profile.swap_ns
-            + profile.clear_ns;
-        warn!(
-            "WEBGLFANOUT window_ms={:.0} swaps={} ctx={} dev={} cmds={} applies={} \
-             switches={} lock_wait_ms={:.1} switch_ms={:.1} apply_ms={:.1} \
-             serialize_ms={:.1} swap_sync_ms={:.1} swap_syncs={} swap_ms={:.1} clear_ms={:.1} \
-             busy_ms={:.1}",
-            window.as_secs_f64() * 1000.0,
-            profile.swaps,
-            self.context_backends.len(),
-            devices,
-            profile.commands,
-            profile.applies,
-            profile.switches,
-            ms(profile.lock_wait_ns),
-            ms(profile.switch_ns),
-            ms(profile.apply_ns),
-            ms(profile.serialize_ns),
-            ms(profile.swap_sync_ns),
-            profile.swap_syncs,
-            ms(profile.swap_ns),
-            ms(profile.clear_ns),
-            ms(busy_ns),
-        );
-        self.fanout_profile = FanoutProfile {
-            window_start: Some(now),
-            ..Default::default()
-        };
-    }
 
     /// Which access mode to use
     fn surface_access(&self) -> SurfaceAccess {
@@ -1994,22 +1649,12 @@ impl WebGLThread {
         &mut self,
         surface_id: WebGLSurfaceId,
     ) -> Option<&GLContextData> {
-        // 조건은 아래 실제 전환 조건과 같아야 한다(함께 고칠 것).
-        let switch_start = (*WEBGL_FANOUT_PROF
-            && Some(surface_id) != self.bound_context_id
-            && self.contexts.contains_key(&surface_id))
-        .then(Instant::now);
-
         let data = self.contexts.get(&surface_id);
         if let Some(data) = data
             && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
-        }
-        if let Some(start) = switch_start {
-            self.fanout_profile.switches += 1;
-            self.fanout_profile.switch_ns += start.elapsed().as_nanos() as u64;
         }
 
         data
@@ -2019,23 +1664,12 @@ impl WebGLThread {
         &mut self,
         surface_id: WebGLSurfaceId,
     ) -> Option<&mut GLContextData> {
-        // 계측(`SERVO_WEBGL_FANOUT_PROF`): 전환이 실제로 일어나는 경우만 잰다. 아래
-        // 조건은 뒤의 실제 전환 조건과 같아야 하므로 함께 고칠 것.
-        let switch_start = (*WEBGL_FANOUT_PROF
-            && Some(surface_id) != self.bound_context_id
-            && self.contexts.contains_key(&surface_id))
-        .then(Instant::now);
-
         let data = self.contexts.get_mut(&surface_id);
         if let Some(ref data) = data
             && Some(surface_id) != self.bound_context_id
         {
             data.device.make_context_current(&data.ctx).unwrap();
             self.bound_context_id = Some(surface_id);
-        }
-        if let Some(start) = switch_start {
-            self.fanout_profile.switches += 1;
-            self.fanout_profile.switch_ns += start.elapsed().as_nanos() as u64;
         }
 
         data
