@@ -8,7 +8,7 @@ use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
@@ -69,9 +69,6 @@ const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
 // task-2: SERVO_WALL_FRAME_PACING/_MAX_PENDING/_MIN_INTERVAL_MS 는 pref 로 옮겼다
 // (gfx_wall_frame_pacing_enabled/_max_pending/_min_interval_ms, WallFramePacingConfig::from_prefs).
 const WALL_FRAME_PACING_INFO_INTERVAL: u64 = 120;
-const WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL: u64 = 120;
-
-static WALL_MEDIA_IMAGE_FANOUT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // -------------------------------------------------------------------------------------
 // PAINTERLOCK -- `with_painter_mut` 가 painter 스레드의 큐에서 기다린 시간.
@@ -204,16 +201,6 @@ pub struct Paint {
     /// Next scheduled wake for releasing a wall frame held only by the minimum pacing interval.
     wall_frame_pacing_next_wake_at: Cell<Option<Instant>>,
 
-    /// Total wall frame requests coalesced by the latest-first pacer.
-    wall_frame_pacing_coalesced_count: Cell<u64>,
-
-    /// Total wall frame requests released by the latest-first pacer.
-    wall_frame_pacing_released_count: Cell<u64>,
-
-    /// Which pacing gate blocked each coalesced request. See [`WallFramePacingBlockTally`]
-    /// for why a zero in one of these does not mean that gate never binds.
-    wall_frame_pacing_block_tally: WallFramePacingBlockTally,
-
     /// ★스크린샷 폴링 래치.★ `Paint::request_screenshot` 이 세우고, 전 타일에 요청이
     /// 하나도 안 남은 것을 확인한 틱이 내린다. 2026-10-22 Task 9.
     ///
@@ -227,37 +214,12 @@ pub struct Paint {
     /// 내린다 -- 틀리는 방향이 안전한 쪽이다.
     screenshot_poll_latch: Cell<bool>,
 
-    /// 스크린샷 때문에 생산을 쉰 틱 수. 현재 1 초 창 / 누계 / 창 시작.
-    production_suspended_in_window: Cell<u64>,
-    production_suspended_total: Cell<u64>,
-    production_suspended_last_report: Cell<Option<Instant>>,
-    /// 현재 창에서 걷은 keep-previous 지시의 누계. ★창 단위다 -- 틱 단위가 아니다.★
-    /// 같은 줄의 `ticks_in_window` 와 단위를 맞춰야 설계 8-1 이 지목한 교착 탐지기로
-    /// 읽힌다(둘을 섞어 두면 "이 창에 몇 개를 걷었나" 를 답할 수 없다).
-    keep_previous_released_in_window: Cell<u64>,
-
     /// ★다음 틱에 커밋할 DComp 디바이스.★ 패스 끝에 `flush_deferred_dcomp_commits` 가
     /// 거두고, 다음 틱 머리에 `commit_deferred_at_tick` 이 비운다.
     ///
     /// 셸이 들고 있는 이유는 그쪽 주석에 있다 -- 렌더를 건너뛴 타일(keep-previous)도
     /// 커밋이 묶이지 않게 하려면 커밋 시점이 `begin_frame` 과 무관해야 한다.
     deferred_dcomp_commits: RefCell<Vec<usize>>,
-
-    /// ★수요 구동 틱의 진입 수와 그중 생산한 수.★ 현재 1 초 창 / 창 시작. 2026-10-22.
-    ///
-    /// ***왜 재는가*** -- `Paint::on_demand_wall_tick` 은 이벤트 루프 스핀마다 불리므로
-    /// 진입 수는 표출 주기가 아니라 ***루프의 폴링 속도***다. 그 둘이 벌어져도 WR 프레임은
-    /// `renderer_behind` 거절이 막아 주어 fps 에는 안 나타나고, 메인 스레드 CPU 로만
-    /// 나타난다. 그러면 로그만 보는 사람은 폭주를 영영 못 본다. 실제로 그랬다:
-    /// `gather_components` 안의 깨우기가 다음 에지를 다시 예약해 ★틱 N 이 틱 N+1 을
-    /// 되먹임하는 고리★ 가 있었고(2026-10-22 전수 리뷰 5 번), 아무 지표도 그것을 안 보였다.
-    ///
-    /// ★판정은 `produced` 혼자 한다 -- 비(ratio)가 아니다.★ 건강한 상태에서 `produced` 는
-    /// 표출률(60)이고 `edges` 는 폴링 속도(수만)라, 정상일수록 비는 0 에 가깝다. 비를
-    /// 판정으로 쓰면 고친 상태가 고장으로 읽힌다. 읽는 법은 `Paint::note_demand_tick`.
-    demand_tick_edges_in_window: Cell<u64>,
-    demand_tick_produced_in_window: Cell<u64>,
-    demand_tick_window_start: Cell<Option<Instant>>,
 
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
@@ -527,8 +489,6 @@ struct WallFrameRequest {
 
 struct CoalescedWallFrameRequest {
     request: WallFrameRequest,
-    coalesced_count: u64,
-    max_pending_seen: usize,
 }
 
 /// 어느 페이싱 게이트가 요청을 막았나.
@@ -540,31 +500,6 @@ enum WallFramePacingBlockReason {
     Active,
     Pending,
     TooSoon,
-}
-
-/// How many wall frame requests each pacing gate blocked.
-///
-/// `total_coalesced` alone says the pacer is holding frames back but not WHICH gate is
-/// doing it, and the three gates lead to completely different conclusions: `Pending` means
-/// WebRender is still busy (the pacer is a symptom, not the cause), `TooSoon` means the
-/// `gfx_wall_frame_min_interval_ms` knob is the limit, and `Active` means a previous wall
-/// frame's barrier has not completed.
-///
-/// ***These count the gate that blocked a request, not every gate that would have.***
-/// `wall_frame_request_pacing_block_reason` returns the FIRST match in the order
-/// Active -> Pending -> TooSoon, so an earlier gate masks the later ones: a zero here does
-/// NOT mean that gate never binds. Active and Pending very nearly coincide at the default
-/// `gfx_wall_frame_max_pending=1`, and Active is checked first, so read a low Pending count
-/// as "Active got there first", not as "pending frames are not a constraint".
-///
-/// ★2026-10-21 부터 이 셋은 영구히 0 이다★ -- 세던 자리(`coalesce_wall_frame_request`)가
-/// 요청을 넣어 줄 사람과 함께 사라졌다. 0 이 아닌 값이 나오면 coalesce 큐를 다시 채운
-/// 사람이 생겼다는 뜻이고, 그것이 곧 두 번째 생산자다(설계 8 절).
-#[derive(Default)]
-struct WallFramePacingBlockTally {
-    active: Cell<u64>,
-    pending: Cell<u64>,
-    too_soon: Cell<u64>,
 }
 
 struct KeepPreviousFrame {
@@ -582,7 +517,6 @@ struct WallFrameBarrier {
     webview_ids: Vec<WebViewId>,
     expected_painter_ids: Vec<PainterId>,
     ready_painter_ids: Vec<PainterId>,
-    requested_at: Instant,
     first_ready_at: Option<Instant>,
     completed_at: Option<Instant>,
     missed_deadline: bool,
@@ -689,14 +623,12 @@ impl WallFrameBarrier {
     fn new(
         webview_ids: Vec<WebViewId>,
         expected_painter_ids: Vec<PainterId>,
-        requested_at: Instant,
         injected_delayed_painter_id: Option<PainterId>,
     ) -> Self {
         Self {
             webview_ids,
             expected_painter_ids,
             ready_painter_ids: Vec::new(),
-            requested_at,
             first_ready_at: None,
             completed_at: None,
             missed_deadline: false,
@@ -859,7 +791,6 @@ impl WallFrameCoordinator {
         logical_frame_id: u64,
         webview_ids: Vec<WebViewId>,
         expected_painter_ids: Vec<PainterId>,
-        requested_at: Instant,
     ) {
         if expected_painter_ids.len() <= 1 {
             return;
@@ -883,7 +814,6 @@ impl WallFrameCoordinator {
                 WallFrameBarrier::new(
                     webview_ids.clone(),
                     expected_painter_ids.clone(),
-                    requested_at,
                     injected_delayed_painter_id,
                 ),
             )
@@ -939,11 +869,6 @@ impl WallFrameCoordinator {
         };
 
         if !self.barriers.contains_key(&logical_frame_id) {
-            debug!(
-                "Ignoring wall frame barrier readiness for unregistered logical_frame_id={} \
-                 painter={:?} local_frame_id={}",
-                logical_frame_id, diagnostic.painter_id, diagnostic.local_frame_id
-            );
             return None;
         }
 
@@ -981,9 +906,8 @@ impl WallFrameCoordinator {
                 barrier.injected_ready_suppressed = true;
                 warn!(
                     "Wall frame delay injection: logical_frame_id={} painter={:?} \
-                     local_frame_id={} ready withheld from barrier \
-                     policy=simulate-delayed-renderer",
-                    logical_frame_id, diagnostic.painter_id, diagnostic.local_frame_id
+                     ready withheld from barrier policy=simulate-delayed-renderer",
+                    logical_frame_id, diagnostic.painter_id
                 );
                 return Some(update);
             }
@@ -998,54 +922,9 @@ impl WallFrameCoordinator {
 
             if barrier.ready_painter_ids.len() == barrier.expected_painter_ids.len() {
                 barrier.completed_at = Some(diagnostic.ready_at);
-                if barrier.missed_deadline {
-                    let first_to_all_ready_ms = barrier
-                        .first_ready_at
-                        .map(|first_ready_at| {
-                            diagnostic
-                                .ready_at
-                                .saturating_duration_since(first_ready_at)
-                                .as_secs_f64()
-                                * 1000.0
-                        })
-                        .unwrap_or_default();
-                    let request_to_all_ready_ms = diagnostic
-                        .ready_at
-                        .saturating_duration_since(barrier.requested_at)
-                        .as_secs_f64()
-                        * 1000.0;
-
-                    info!(
-                        "Wall frame barrier complete: logical_frame_id={} \
-                         status=completed_after_deadline ready={}/{} \
-                         first_to_all_ready_ms={:.3} request_to_all_ready_ms={:.3} \
-                         final_painter={:?} final_local_frame_id={} final_wait_ms={:.3} \
-                         need_repaint={} policy=keep-previous-frame-for-delayed-targets",
-                        logical_frame_id,
-                        barrier.ready_painter_ids.len(),
-                        barrier.expected_painter_ids.len(),
-                        first_to_all_ready_ms,
-                        request_to_all_ready_ms,
-                        diagnostic.painter_id,
-                        diagnostic.local_frame_id,
-                        diagnostic.wait_ms,
-                        barrier.need_repaint,
-                    );
-                } else if !barrier.presentation_decision_made {
+                if !barrier.missed_deadline && !barrier.presentation_decision_made {
                     complete_before_deadline = true;
                 }
-            } else if !barrier.presentation_decision_made {
-                debug!(
-                    "Wall frame barrier progress: logical_frame_id={} ready={}/{} \
-                     painter={:?} local_frame_id={} wait_ms={:.3} missing={:?}",
-                    logical_frame_id,
-                    barrier.ready_painter_ids.len(),
-                    barrier.expected_painter_ids.len(),
-                    diagnostic.painter_id,
-                    diagnostic.local_frame_id,
-                    diagnostic.wait_ms,
-                    barrier.missing_painter_ids(),
-                );
             }
         }
 
@@ -1073,24 +952,6 @@ impl WallFrameCoordinator {
         let webview_ids = barrier.webview_ids.clone();
         let painter_ids = barrier.expected_painter_ids.clone();
         let repaint_needed = barrier.need_repaint;
-        let ready_len = barrier.ready_painter_ids.len();
-        let expected_len = barrier.expected_painter_ids.len();
-        let first_to_all_ready_ms = barrier
-            .first_ready_at
-            .map(|first_ready_at| {
-                diagnostic
-                    .ready_at
-                    .saturating_duration_since(first_ready_at)
-                    .as_secs_f64()
-                    * 1000.0
-            })
-            .unwrap_or_default();
-        let request_to_all_ready_ms = diagnostic
-            .ready_at
-            .saturating_duration_since(barrier.requested_at)
-            .as_secs_f64()
-            * 1000.0;
-
         for painter_id in &painter_ids {
             if self
                 .keep_previous_painters
@@ -1101,22 +962,6 @@ impl WallFrameCoordinator {
             }
             self.keep_previous_painters.remove(painter_id);
         }
-
-        info!(
-            "Wall frame barrier complete: logical_frame_id={} status=completed_before_deadline \
-             ready={}/{} first_to_all_ready_ms={:.3} request_to_all_ready_ms={:.3} \
-             final_painter={:?} final_local_frame_id={} final_wait_ms={:.3} \
-             need_repaint={} policy=present-current-frame",
-            logical_frame_id,
-            ready_len,
-            expected_len,
-            first_to_all_ready_ms,
-            request_to_all_ready_ms,
-            diagnostic.painter_id,
-            diagnostic.local_frame_id,
-            diagnostic.wait_ms,
-            repaint_needed,
-        );
 
         let repaint_decisions = painter_ids
             .into_iter()
@@ -1132,7 +977,7 @@ impl WallFrameCoordinator {
         }
     }
 
-    fn miss_barrier(&mut self, logical_frame_id: u64, now: Instant) -> WallFrameCoordinatorUpdate {
+    fn miss_barrier(&mut self, logical_frame_id: u64, _now: Instant) -> WallFrameCoordinatorUpdate {
         let Some(barrier) = self.barriers.get_mut(&logical_frame_id) else {
             return WallFrameCoordinatorUpdate::default();
         };
@@ -1145,15 +990,7 @@ impl WallFrameCoordinator {
         let webview_ids = barrier.webview_ids.clone();
         let ready_painter_ids = barrier.ready_painter_ids.clone();
         let missing_painter_ids = barrier.missing_painter_ids();
-        let ready_len = barrier.ready_painter_ids.len();
-        let expected_len = barrier.expected_painter_ids.len();
         let repaint_needed = barrier.need_repaint;
-        let first_ready_elapsed_ms = barrier
-            .first_ready_at
-            .map(|first_ready_at| {
-                now.saturating_duration_since(first_ready_at).as_secs_f64() * 1000.0
-            })
-            .unwrap_or_default();
 
         for painter_id in &ready_painter_ids {
             self.keep_previous_painters.remove(painter_id);
@@ -1175,19 +1012,6 @@ impl WallFrameCoordinator {
                 );
             }
         }
-
-        warn!(
-            "Wall frame barrier missed: logical_frame_id={} ready={}/{} missing={:?} \
-             first_ready_elapsed_ms={:.3} deadline_ms={:.3} \
-             need_repaint={} policy=keep-previous-frame-for-delayed-targets",
-            logical_frame_id,
-            ready_len,
-            expected_len,
-            missing_painter_ids,
-            first_ready_elapsed_ms,
-            WALL_FRAME_BARRIER_DEADLINE.as_secs_f64() * 1000.0,
-            repaint_needed,
-        );
 
         let repaint_decisions = ready_painter_ids
             .into_iter()
@@ -1512,25 +1336,6 @@ bitflags! {
     }
 }
 
-/// `UpdateImages` 한 건의 시간을 팬아웃 바깥과 페인터 안으로 가른 누계(초당 한 줄).
-///
-/// 드레인이 메시지 77건에 45.7ms 였다 — 건당 0.59ms 다. 건수가 적은데 건당이 비싸면
-/// 줄이는 쪽이 아니라 안을 봐야 하고, 그 안이 어디인지는 재지 않으면 모른다.
-/// 이 드레인은 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
-#[derive(Default)]
-struct ImageUpdateStats {
-    window_start: Option<Instant>,
-    calls: u64,
-    total_ms: f64,
-    inner_ms: f64,
-}
-
-thread_local! {
-    static IMAGE_UPDATE_STATS: RefCell<ImageUpdateStats> = RefCell::new(ImageUpdateStats::default());
-    /// 큐가 깊어 보내지 않은 이미지 갱신 수(초당 한 줄에 실어 낸다).
-    static DETACHED_DROPPED: Cell<u64> = const { Cell::new(0) };
-}
-
 impl Paint {
     pub fn new(state: InitialPaintState) -> Rc<RefCell<Self>> {
         let registration = state.mem_profiler_chan.prepare_memory_reporting(
@@ -1595,18 +1400,8 @@ impl Paint {
             coalesced_wall_frame_requests: Default::default(),
             last_wall_frame_issue_at: Default::default(),
             wall_frame_pacing_next_wake_at: Default::default(),
-            wall_frame_pacing_coalesced_count: Default::default(),
-            wall_frame_pacing_released_count: Default::default(),
             screenshot_poll_latch: Default::default(),
-            production_suspended_in_window: Default::default(),
-            production_suspended_total: Default::default(),
-            production_suspended_last_report: Default::default(),
-            keep_previous_released_in_window: Default::default(),
             deferred_dcomp_commits: RefCell::new(Vec::new()),
-            demand_tick_edges_in_window: Default::default(),
-            demand_tick_produced_in_window: Default::default(),
-            demand_tick_window_start: Default::default(),
-            wall_frame_pacing_block_tally: Default::default(),
         }))
     }
 
@@ -1802,9 +1597,7 @@ impl Paint {
             PainterHostKind::Inline(painter) => callback(&mut painter.borrow_mut()),
             PainterHostKind::Threaded(threaded) => {
                 let limit = servo_config::pref!(gfx_painter_detached_queue_limit).max(0) as usize;
-                if !threaded.dispatch_detached(limit, callback) {
-                    DETACHED_DROPPED.with(|dropped| dropped.set(dropped.get() + 1));
-                }
+                let _ = threaded.dispatch_detached(limit, callback);
             },
         }
     }
@@ -2040,66 +1833,6 @@ impl Paint {
             })
     }
 
-    fn log_wall_frame_metadata(
-        &self,
-        logical_frame_id: u64,
-        wall_webview_targets: &[(WebViewId, Vec<PainterId>)],
-    ) {
-        for (webview_id, target_painter_ids) in wall_webview_targets {
-            let mut snapshots = Vec::new();
-            let mut missing_targets = Vec::new();
-            let webview_id = *webview_id;
-            for painter_id in target_painter_ids {
-                let Some(signature) = self.with_painter(*painter_id, move |painter| {
-                    painter.wall_scroll_offsets_signature(webview_id)
-                }) else {
-                    missing_targets.push(format!("{painter_id:?}:missing-painter"));
-                    continue;
-                };
-                let Some(signature) = signature else {
-                    missing_targets.push(format!("{painter_id:?}:missing-webview"));
-                    continue;
-                };
-                snapshots.push((*painter_id, signature));
-            }
-
-            let mut unique_signatures = Vec::new();
-            for (_, signature) in &snapshots {
-                if !unique_signatures.contains(signature) {
-                    unique_signatures.push(signature.clone());
-                }
-            }
-
-            if missing_targets.is_empty() && unique_signatures.len() <= 1 {
-                let scroll_signature = unique_signatures
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("<no-scroll-tree>");
-                info!(
-                    "Wall frame metadata: logical_frame_id={} webview={:?} target_count={} \
-                     scroll_offsets=matched scroll_signature=\"{}\" targets={:?} \
-                     timestamp_source=single-script-update",
-                    logical_frame_id,
-                    webview_id,
-                    target_painter_ids.len(),
-                    scroll_signature,
-                    target_painter_ids,
-                );
-            } else {
-                warn!(
-                    "Wall frame metadata mismatch: logical_frame_id={} webview={:?} \
-                     target_count={} scroll_offsets=mismatched snapshots={:?} \
-                     missing_targets={:?} timestamp_source=single-script-update",
-                    logical_frame_id,
-                    webview_id,
-                    target_painter_ids.len(),
-                    snapshots,
-                    missing_targets,
-                );
-            }
-        }
-    }
-
     fn for_each_webview_painter_mut(
         &self,
         webview_id: WebViewId,
@@ -2316,7 +2049,7 @@ impl Paint {
     fn hold_the_wall_while_a_screenshot_is_taken(&self) {
         let painter_ids = self.painter_ids();
 
-        let released = self
+        let _ = self
             .wall_frame_coordinator
             .borrow_mut()
             .release_keep_previous_while_production_is_suspended(&painter_ids);
@@ -2324,34 +2057,6 @@ impl Paint {
         for painter_id in &painter_ids {
             let _ = self.with_painter(*painter_id, |painter| painter.run_liveness_probe());
         }
-
-        let in_window = self.production_suspended_in_window.get() + 1;
-        let total = self.production_suspended_total.get() + 1;
-        // ★창 단위로 누적한다★ -- 같은 줄의 `ticks_in_window` 와 단위를 맞춘다. 이 틱의
-        // 값만 싣던 초안은 "1 초 동안 몇 개를 걷었나" 에 답하지 못했다.
-        let released_in_window = self.keep_previous_released_in_window.get() + released as u64;
-        self.production_suspended_in_window.set(in_window);
-        self.production_suspended_total.set(total);
-        self.keep_previous_released_in_window
-            .set(released_in_window);
-        let now = Instant::now();
-        let due = self
-            .production_suspended_last_report
-            .get()
-            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
-        if !due {
-            return;
-        }
-        self.production_suspended_last_report.set(Some(now));
-        self.production_suspended_in_window.set(0);
-        self.keep_previous_released_in_window.set(0);
-        info!(
-            "WALLSHOTPAUSE: wall tick production is suspended while a screenshot waits for \
-             frames to drain; ticks_in_window={in_window} total={total} \
-             keep_previous_released_in_window={released_in_window} targets={}. Canvas ack \
-             release and the display-composite liveness probe keep running every tick.",
-            painter_ids.len(),
-        );
     }
 
     /// ★틱마다, 타일마다 — 그 타일이 이번 틱에 합성했든 안 했든 — 빚이 있고 캔버스가 다
@@ -2419,55 +2124,7 @@ impl Paint {
     /// 구분되지 않는다, (2) 되돌린 비트를 집어 갈 ***깨우기***가 헤드 모드에서 따로 필요하다
     /// (렌더가 끝났다고 이벤트 루프가 깨지는 않는다).
     pub fn on_demand_wall_tick(&self) -> Option<u64> {
-        let produced = self.on_demand_wall_tick_inner();
-        self.note_demand_tick(produced.is_some());
-        produced
-    }
-
-    /// ★진입 수와 생산 수를 초당 한 줄로 남긴다 -- `WALLTICKRATE`.★ 2026-10-22.
-    ///
-    /// 이 셸의 에지는 표출 클럭이 아니라 ***이벤트 루프의 스핀***이라, 진입이 초당 수천
-    /// 번이 되어도 WR 프레임은 `renderer_behind` 거절이 막아 fps 에 안 나타난다. 그러면
-    /// 남는 증상이 메인 스레드 CPU 뿐이고, 로그에는 아무것도 안 보인다. ★그 침묵이
-    /// 2026-10-22 전수 리뷰 5 번을 세 작업에 걸쳐 숨겼다★ -- `gather_components` 안의
-    /// 깨우기가 다음 에지를 되먹여 틱이 폴링 속도로 돌고 있었다.
-    ///
-    /// 읽는 법: ★`produced` 가 판정이고 `edges` 는 배경이다.★
-    ///
-    /// - `produced` 는 표출률이어야 한다 -- 애니메이션 페이지에서 60, 조용한 페이지에서 0
-    ///   (불변식 16). 이 값이 세 자리를 넘으면 ***생산자가 되먹임 고리 안에 있다***.
-    /// - `edges` 는 생산과 무관하다. 이 셸의 에지는 이벤트 루프의 스핀이라
-    ///   `ControlFlow::Poll` 의 속도를 그대로 적는다. 실측(2026-10-22, headed):
-    ///   애니메이션 페이지 ~27,000/s, ★조용한 페이지 ~130,000/s(프로세스 CPU 0.97 코어)★.
-    ///   후자는 틱과 무관한 ***이 셸의 별개 문제***다 -- 조용한데도 `Wait` 로 안 내려간다.
-    ///   틱은 그 스핀마다 `swap` 하나를 하고 돌아선다.
-    ///
-    /// ★줄은 스핀이 도는 한 매초 나간다★ -- 조용한 페이지에서도. 침묵으로 "고쳐졌다" 와
-    /// "이 코드가 안 돈다" 를 구별할 수 없게 만들지 않는다(이 저장소가 같은 함정에 네 번
-    /// 빠진 기록이 `WALLACKFLUSH` 주석에 있다).
-    fn note_demand_tick(&self, produced: bool) {
-        let now = Instant::now();
-        let edges = self.demand_tick_edges_in_window.get() + 1;
-        self.demand_tick_edges_in_window.set(edges);
-        if produced {
-            self.demand_tick_produced_in_window
-                .set(self.demand_tick_produced_in_window.get() + 1);
-        }
-        let Some(started) = self.demand_tick_window_start.get() else {
-            self.demand_tick_window_start.set(Some(now));
-            return;
-        };
-        let elapsed = now.duration_since(started);
-        if elapsed < Duration::from_secs(1) {
-            return;
-        }
-        self.demand_tick_window_start.set(Some(now));
-        self.demand_tick_edges_in_window.set(0);
-        let frames = self.demand_tick_produced_in_window.replace(0);
-        info!(
-            "WALLTICKRATE window_ms={:.0} edges={edges} produced={frames}",
-            elapsed.as_secs_f64() * 1000.0
-        );
+        self.on_demand_wall_tick_inner()
     }
 
     fn on_demand_wall_tick_inner(&self) -> Option<u64> {
@@ -2548,47 +2205,6 @@ impl Paint {
     // 받는 두 번째 문" 이 열리는지 보는 계측이고, 벽 구성에서 `FRAMEREASON` 의
     // `wall_pacer_join` 이 0 이 아니면 생산자가 둘이라는 뜻이다(설계 8 절).
 
-    fn log_wall_frame_pacing_summary(
-        &self,
-        event: &str,
-        webview_id: WebViewId,
-        request: &WallFrameRequest,
-        pending_max: usize,
-        coalesced_for_webview: u64,
-        logical_frame_id: Option<u64>,
-    ) {
-        let total_coalesced = self.wall_frame_pacing_coalesced_count.get();
-        let total_released = self.wall_frame_pacing_released_count.get();
-        let event_total = match event {
-            "released" => total_released,
-            _ => total_coalesced,
-        };
-        if event_total > 3 && event_total % WALL_FRAME_PACING_INFO_INTERVAL != 0 {
-            return;
-        }
-
-        // The tally goes AFTER `policy=`, which is where the log parser's regex stops
-        // (wall_perf_analyzer/analyze_wall_perf.py, `PACING_SUMMARY_RE`). Appending keeps
-        // older parsers matching; inserting in the middle would break them.
-        info!(
-            "Wall frame pacing summary: event={} webview={:?} logical_frame_id={:?} \
-             target_painters={:?} pending_max={} coalesced_for_webview={} \
-             total_coalesced={} total_released={} policy=latest-first \
-             blocked_by_active={} blocked_by_pending={} blocked_by_min_interval={}",
-            event,
-            webview_id,
-            logical_frame_id,
-            request.target_painter_ids,
-            pending_max,
-            coalesced_for_webview,
-            total_coalesced,
-            total_released,
-            self.wall_frame_pacing_block_tally.active.get(),
-            self.wall_frame_pacing_block_tally.pending.get(),
-            self.wall_frame_pacing_block_tally.too_soon.get(),
-        );
-    }
-
     /// ★타일에 닿는 문은 하나다 -- 틱 전용 진입점.★ 2026-10-21 전에는 스크립트 경로
     /// (`Painter::generate_frame_for_script`)와 둘이었고, 어느 문으로 들어가는지를
     /// `TileEntryPoint` 가 골랐다. 그 경로가 값 적재로 격하되면서 고를 것이 없어졌다.
@@ -2608,7 +2224,6 @@ impl Paint {
                  {:?}",
                 request.target_painter_ids
             );
-            self.log_wall_frame_metadata(logical_frame_id, &request.wall_webview_targets);
         } else {
             debug!(
                 "Logical frame {logical_frame_id} routed to paint targets \
@@ -2672,7 +2287,6 @@ impl Paint {
                 logical_frame_id,
                 request.wall_webview_ids(),
                 generated_painter_ids,
-                wall_frame_requested_at,
             );
         } else if request.target_painter_ids.len() > 1 {
             // ★`info!` 다 -- `debug!` 는 릴리스에서 컴파일 단계에 지워진다★(servoshell 의
@@ -2731,29 +2345,7 @@ impl Paint {
                 continue;
             };
 
-            let total_released = self.wall_frame_pacing_released_count.get() + 1;
-            self.wall_frame_pacing_released_count.set(total_released);
-            let logical_frame_id =
-                self.issue_wall_frame_request(coalesced_request.request.clone());
-            debug!(
-                "Wall frame pacing released: webview={:?} logical_frame_id={:?} \
-                 target_painters={:?} pending_max={} coalesced_for_webview={} \
-                 total_released={} policy=latest-first",
-                webview_id,
-                logical_frame_id,
-                coalesced_request.request.target_painter_ids,
-                coalesced_request.max_pending_seen,
-                coalesced_request.coalesced_count,
-                total_released,
-            );
-            self.log_wall_frame_pacing_summary(
-                "released",
-                webview_id,
-                &coalesced_request.request,
-                coalesced_request.max_pending_seen,
-                coalesced_request.coalesced_count,
-                logical_frame_id,
-            );
+            let _ = self.issue_wall_frame_request(coalesced_request.request.clone());
         }
     }
 
@@ -3063,58 +2655,12 @@ impl Paint {
                 self.handle_generate_image_keys_for_pipeline(webview_id, pipeline_id);
             },
             PaintMessage::UpdateImages(painter_id, updates) => {
-                // 이 한 건이 0.59ms 로 측정됐다(드레인 77건에 45.7ms). 그 시간이 팬아웃
-                // 바깥(타겟 찾기·복제)인지 페인터 안(스태시·합성 요청)인지 갈라야 고칠
-                // 곳이 정해진다. 초당 한 줄로 낸다.
-                let arm_started = Instant::now();
                 let target_painter_ids = self.target_painter_ids_for_source_painter(painter_id);
-                if target_painter_ids.len() > 1 {
-                    let mut add_count = 0;
-                    let mut update_count = 0;
-                    let mut delete_count = 0;
-                    let mut animation_update_count = 0;
-                    for update in &updates {
-                        match update {
-                            ImageUpdate::AddImage(..) => add_count += 1,
-                            ImageUpdate::UpdateImage(..) => update_count += 1,
-                            ImageUpdate::DeleteImage(..) => delete_count += 1,
-                            ImageUpdate::UpdateImageForAnimation(..) => animation_update_count += 1,
-                        }
-                    }
-                    // ★요약을 찍기로 정한 뒤에 그 인자를 만든다.★ 예전에는 타겟마다 painter 를 찾아
-                    // `requested_gpus` 를 만드는 일을 **메시지마다** 했는데, 그 값은 걸러지는 `debug!`
-                    // 와 드물게 나가는 아래 `info!` 에서만 쓰인다. 전환 순간 이 자리를 초당 수천 번
-                    // 지나므로, 쓰지도 않을 값을 위해 타일 수만큼 painter 를 찾는 왕복이 그대로 쌓인다.
-                    let fanout_id =
-                        WALL_MEDIA_IMAGE_FANOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    if add_count > 0
-                        || delete_count > 0
-                        || fanout_id <= 3
-                        || fanout_id % WALL_MEDIA_IMAGE_FANOUT_INFO_INTERVAL == 0
-                    {
-                        let requested_gpus: Vec<_> = target_painter_ids
-                            .iter()
-                            .map(|target_painter_id| {
-                                self.with_painter(*target_painter_id, move |painter| {
-                                    painter.rendering_context.requested_gpu_index()
-                                })
-                                .flatten()
-                            })
-                            .collect();
-                        info!(
-                            "Wall media image fanout summary: fanout_id={fanout_id} source_painter={painter_id:?} target_painters={target_painter_ids:?} requested_gpus={requested_gpus:?} updates_total={} adds={add_count} updates={update_count} deletes={delete_count} animation_updates={animation_update_count}",
-                            updates.len(),
-                        );
-                    }
-                }
-                let mut inner_ms = 0.0_f64;
                 for target_painter_id in target_painter_ids {
                     let updates = updates.clone();
-                    let inner_started = Instant::now();
                     self.with_painter_mut_detached(target_painter_id, move |painter| {
                         painter.update_images(updates)
                     });
-                    inner_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
                 }
                 // ★이미지 도착도 깨우기다 -- 다음 틱 에지에 생산 1 회를 예약한다.★
                 // 2026-10-22 Task 9.5 2 차. 규칙 2 를 어기지 않는다: 비트를 세우는 것은
@@ -3149,29 +2695,6 @@ impl Paint {
                 // 비트는 에지당 한 번만 소비되므로 도착이 초당 1,080 번이어도 생산은 틱마다
                 // 한 장이다.
                 crate::wall_tick::schedule_production_at_next_edge();
-                IMAGE_UPDATE_STATS.with(|stats| {
-                    let mut stats = stats.borrow_mut();
-                    stats.calls += 1;
-                    stats.total_ms += arm_started.elapsed().as_secs_f64() * 1000.0;
-                    stats.inner_ms += inner_ms;
-                    let window = stats.window_start.get_or_insert_with(Instant::now);
-                    let elapsed = window.elapsed();
-                    if elapsed >= Duration::from_secs(1) {
-                        warn!(
-                            "IMGUPDRATE window_ms={:.0} calls={} total_ms={:.1} inner_ms={:.1} fanout_ms={:.1} dropped={}",
-                            elapsed.as_secs_f64() * 1000.0,
-                            stats.calls,
-                            stats.total_ms,
-                            stats.inner_ms,
-                            (stats.total_ms - stats.inner_ms).max(0.0),
-                            DETACHED_DROPPED.with(|dropped| dropped.replace(0)),
-                        );
-                        *stats = ImageUpdateStats {
-                            window_start: Some(Instant::now()),
-                            ..Default::default()
-                        };
-                    }
-                });
             },
             PaintMessage::DelayNewFrameForCanvas(
                 webview_id,
@@ -3824,21 +3347,7 @@ impl Paint {
     }
 
     pub fn handle_messages(&self, mut messages: Vec<PaintMessage>) {
-        // ★이 함수는 임베더의 메인 스레드에서 돈다★(`Servo::spin_event_loop`), 그리고 그
-        // 스레드에 표출 클럭이 얹혀 있다. 전환 순간 한 번의 드레인이 698건 469ms 로
-        // 측정되었는데 -- 건당 0.67ms -- 무엇이 쏟아진 것인지는 아무도 세지 않고 있었다.
-        // 세는 비용은 건당 match 하나이므로 건당 0.67ms 옆에서 무시할 수 있다.
-        let drain_start = Instant::now();
-        let messages_seen = messages.len();
-        let mut kinds: Vec<(&'static str, u32)> = Vec::new();
-        for message in &messages {
-            let kind = message.kind();
-            match kinds.iter_mut().find(|(name, _)| *name == kind) {
-                Some((_, count)) => *count += 1,
-                None => kinds.push((kind, 1)),
-            }
-        }
-        let superseded = Self::drop_superseded_video_frame_updates(&mut messages);
+        let _ = Self::drop_superseded_video_frame_updates(&mut messages);
         // Pull out the `NewWebRenderFrameReady` messages from the list of messages and handle them
         // at the end of this function. This prevents overdraw when more than a single message of
         // this type of received. In addition, if any of these frames need a repaint, that reflected
@@ -3899,20 +3408,6 @@ impl Paint {
 
         self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
-
-        // 30ms 는 표출 주기(16.7ms)의 두 배 -- 프레임 두 장을 놓치는 지점부터 관심 대상이다.
-        let drain_ms = drain_start.elapsed().as_secs_f64() * 1000.0;
-        if drain_ms > 30.0 {
-            kinds.sort_by(|left, right| right.1.cmp(&left.1));
-            let breakdown = kinds
-                .iter()
-                .map(|(name, count)| format!("{name}:{count}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            warn!(
-                "PAINTDRAIN drain_ms={drain_ms:.1} msgs={messages_seen} superseded={superseded} [{breakdown}]"
-            );
-        }
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -4235,7 +3730,7 @@ mod superseded_video_frame_tests {
     }
 
     fn kinds(messages: &[PaintMessage]) -> Vec<&'static str> {
-        messages.iter().map(PaintMessage::kind).collect()
+        messages.iter().map(<&'static str>::from).collect()
     }
 
     #[test]
@@ -4397,7 +3892,7 @@ mod wall_frame_keep_previous_tests {
         all: &[PainterId],
     ) {
         let now = Instant::now();
-        coordinator.register_frame(logical_frame_id, Vec::new(), all.to_vec(), now);
+        coordinator.register_frame(logical_frame_id, Vec::new(), all.to_vec());
         coordinator.miss_barrier(logical_frame_id, now);
     }
 
@@ -4588,7 +4083,7 @@ mod wall_frame_keep_previous_tests {
             after_logical_frame_id: 0,
             remaining_frames: 1,
         });
-        coordinator.register_frame(9, Vec::new(), vec![injected, other], Instant::now());
+        coordinator.register_frame(9, Vec::new(), vec![injected, other]);
         coordinator.miss_barrier(9, Instant::now());
 
         let released = coordinator.release_keep_previous_while_production_is_suspended(&[injected]);
