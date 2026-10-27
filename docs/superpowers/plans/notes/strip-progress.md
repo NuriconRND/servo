@@ -10,12 +10,13 @@
 
 | | |
 |---|---|
-| 진행 | **7 / 20 단계** |
-| 누적 제거 | **약 5,470 줄** |
-| 계획서 오류 (발견) | **44 건** (실행 중 16 + 재검증 28) |
-| 조용한 회귀 회피 | **11 건** |
+| 진행 | **10 / 20 단계** |
+| 누적 제거 | **약 7,823 줄** |
+| 계획서 오류 (발견) | **56 건** (실행 중 28 + 재검증 28) |
+| 조용한 회귀 회피 | **17 건** |
 | 기준선 | `servo-paint --lib` 130/130 → 현재 **103/103** (계측 테스트 27 개 제거분) |
 | `config_surface` | 19/20 (기존 RED) → Step 14 에서 **20/20** 이 되어야 함 ★독립 성공 신호★ |
+| 게이트 ★G4 불능★ | `cargo check -p servo-layout -p servo-script` 는 이 장비에서 못 돈다 — `mozjs_sys` 의 `jsapi.cpp` 가 설치된 MSVC 와 안 맞는다. 제거와 무관(손 안 댄 crate 로도 재현). **G2(`winit_wall` check)가 두 crate 를 소스에서 타입체크하므로 대체된다.** |
 
 ---
 
@@ -173,6 +174,86 @@ if barrier.ready_painter_ids.len() == barrier.expected_painter_ids.len() {
 게이트 113 → **103**. 지운 테스트 10 개는 전부 계측(LOCKWAIT 히스토그램 1, TIMELINESTEP
 포맷터 4, TRANSITCLAMP 보고기 1, ANIMSTEPSEQ 포맷터 4). 픽셀을 바꾸는 클램프는
 `an_absurd_transit_is_clamped` 가 계속 덮는다.
+
+### Step 8 — winit_wall 패스 타이밍·MAINBUSY·Present perf · SPINSLOW · TileRenderTiming · LOG_PRESENT_CADENCE `c1bddad8c8b` (559 줄, 8 파일)
+
+`main.rs` 2739 → 2300. 패스 타이밍 250(`note_render_pass` 가 PASSEVENT·LOG_PASS·
+WALLPASS/WALLQUEUE/WALLSPLIT 방출기를 품고 있었다) / MAINBUSY 91 / Present perf 36 /
+`render_all_tiles` 내부 스톱워치 68. `servo.rs` 의 SPINSLOW 27.
+`TileRenderTiming` 과 재수출 둘. `LOG_PRESENT_CADENCE` 삼종.
+
+**★전체에서 가장 위험했던 한 줄 — 살았다★** barrier 분기에서
+`dispatched[index] = true;` 가 계측 `skipped += 1`(위)과 하중 `continue;`(아래) **사이**에
+끼어 있었다. 떨궜으면 barrier 가 건너뛴 타일을 두 번째 루프가 전부 다시 칠하는데
+**컴파일 에러도 실패 테스트도 없다.** `dispatched[` 3/3, `continue;` 7/7 로 대조.
+
+★`cache_index` 15 개 재번호는 파일 순서가 아니라 `ALL` 을 파싱해 유도했다★ —
+`:275` 의 const 가 index 24 인데 17 과 18 사이에 선언돼 있다.
+
+**계획서 오류** — `embedder_messages` 가 세 자리인데 선언만 적혀 있었다(하드 에러);
+`TileRenderTiming` 의 `join()` 반환형을 계획서·인벤토리 **둘 다** 빠뜨렸다(재검증이 잡음);
+`configuration.md` 의 참조가 둘이었다.
+
+**★제거 시작 이후 처음으로 엔진 example 이 컴파일 검증됐다★** —
+`cargo check -p servo --example winit_wall` exit 0, 경고 0. 앞선 7 단계는
+`servo-paint --lib` 만으로 검증했는데 그 게이트는 `winit_wall` 을 컴파일하지 않는다.
+`config_surface` 18/2 — 두 RED 는 예고된 것(Step 14 까지).
+
+### Step 9 — winit_wall WALLCLOCK 과 틱 이슈 감사 `9276feb51be` (354 줄)
+
+`main.rs` 2300 → 1993. `ClockStats`/`TickIssueAudit`/`MAX_CLOCK_GAP_SAMPLES` 100 /
+note·report 메서드 일곱과 32 인자 `WALLCLOCK info!` 170 / 호출처 여덟 / 감사와 그 테스트 둘.
+
+**★래치를 먼저 꺼냈다★** `note_tick_site` 안에 묻혀 있던 `last_pacing_tick_at` 쓰기를
+`note_pacing_tick` 으로 분리. 호출 경로 둘(`pump_vsync`, `drive_present_clock_timer`)과
+독자 둘(`WakerEvent::Engine` 가드, `needs_pacing_backstop`) 불변.
+★이 쓰기를 덮는 테스트가 **없다**★ — 계획서가 가드라고 지목한 테스트는 불리언 둘짜리
+자유 함수만 부른다. 떨구면 **모든 게이트가 초록인 채로** `pacing_is_driving()` 이 영구
+false 가 되고 백스톱이 매 wake 마다 열린다. 그 사실을 테스트 doc 에 네 줄로 박아 넣었다.
+
+**★삭제 후 재측정이 near-miss 를 잡았다★** — 계획서는 `note_present_tick` 을 심볼 하나로
+적었는데 `pump_vsync` 에 둘째 호출이 있었다(래치 호출 한 줄 위). 카운트가 0 이 아니라 1 로
+나와 발견. 방법 3 단계가 선택이 아님을 보여 준다.
+
+낡은 doc 인용 13 곳 정정(재검증 목록 밖이 여섯). 그중 하나는 **사실과 반대**였다 —
+`ClockSite::AboutToWait` 의 doc 이 "더는 구성되지 않는다" 인데 백스톱에서 구성된다.
+
+게이트: G2 exit 0 / example 테스트 **20 → 18** / `servo-paint` 103 불변.
+계획서의 "남는 clock 테스트 다섯" 은 틀렸다(아홉 중 일곱 생존).
+
+### Step 10 — `components/layout` 와 `components/script` `619f93b2494` (1,440 줄, 13 파일)
+
+layout: `paint_animation.rs` 의 `BindTally`/`tally()` 12 곳·엣지 로그·`describe_animations`
+−451, `mod.rs` −12, `stacking_context.rs` −18.
+script: `raf_clock.rs` 파일째 −135, `script_thread.rs` −211,
+`htmlmediaelement.rs` −254, `webglrenderingcontext.rs` −113, `document.rs` −70,
+`window.rs` −50, `animations.rs` −58, `globalscope.rs` −37, `microtask.rs` −31.
+
+**★조용한 회귀 셋 회피 — 재검증이 지목한 것이 전부 실재했다★**
+- `display_list/mod.rs:560` 이 계획서가 "유지" 라고 한 바로 그 `return false;` 였다.
+- `stacking_context.rs:675` 는 `let animated_transform` 바인딩의 닫는 `});` 였다.
+- `animations.rs` 의 ANIMUNBIND/ANIMDROP 는 `if` 래퍼의 유일한 문장이었다 —
+  래퍼를 지우고 `set.cancel_all_animations()` 둘을 남겼다.
+
+`LIVE_CONTEXTS` 의 prune 을 삭제 **전에** `register_for_reporting` 으로 옮겼다
+(Vec 이 자라는 유일한 자리, 이미 `borrow_mut()`).
+
+**★재검증 자체가 같은 off-by-one 을 반복했다★** — `animations.rs` 범위를 196-211 /
+280-296 으로 적었는데 **211 과 296 이 바로 `cancel_all_animations()`** 다. 그대로
+따랐으면 경고하려던 그 회귀를 냈다. 올바른 범위는 196-210 / 280-295.
+
+**★합쳐진 doc 함정 3·4 회차★** — `script_thread.rs:1224-1254` 가 **세 함수의 doc** 이
+붙은 덩어리였다(맨 위 6 줄이 `update_the_rendering` 의 spec doc). 심볼 단위로 지웠으면
+그 문서가 조용히 사라지거나 E0585 가 난다. `webglrenderingcontext.rs:184-213` 도 같은 모양.
+Step 5·7 에 이은 세 번째·네 번째다. **이제 패턴으로 취급한다: 함수를 지우기 전에 위 doc
+블록이 그 함수를 설명하는지 확인한다.**
+
+**★게이트 G4 불능 발견★** — `cargo check -p servo-layout -p servo-script` 가 이 장비에서
+`mozjs_sys` 네이티브 빌드로 죽는다. 손 안 댄 crate 로도 재현되므로 제거와 무관하고,
+Steps 1-9 가 G4 를 쓴 적이 없어 이제 드러났다. G2 가 두 crate 를 소스에서 타입체크한다.
+
+게이트: G2 exit 0(`servo-layout` 경고 0) / G1 103 불변. fmt 드리프트 0.
+★Step 15 인계★: 이 단계 뒤 `shared/base/interval_summary.rs` 사용자가 트리에 **0**.
 
 ---
 
