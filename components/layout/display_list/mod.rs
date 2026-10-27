@@ -329,11 +329,6 @@ impl DisplayListBuilder<'_> {
 
         PaintTraversal::traverse(&stacking_context_tree.root_stacking_context, &mut builder);
         builder.paint_dom_inspector_highlight();
-        paint_animation::log_built(builder.paint_info.paint_animations.len());
-        paint_animation::log_document_animations(
-            builder.animations,
-            builder.animation_timeline_value,
-        );
 
         webrender_display_list_builder.end().1
     }
@@ -550,13 +545,6 @@ impl DisplayListBuilder<'_> {
             && style.get_svg().clip_path == ClipPath::None
             && transform_style == TransformStyle::Flat
         {
-            // Say so when the element that just got skipped is one that is animating:
-            // from outside, "never looked" and "looked and found nothing" are the same
-            // zero. See `paint_animation::note_stacking_context_skipped`.
-            paint_animation::note_stacking_context_skipped(
-                self.animations,
-                fragment.base.tag.map(|tag| tag.node),
-            );
             return false;
         }
 

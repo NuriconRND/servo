@@ -64,7 +64,6 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomOnceCell, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::element::Element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 #[cfg(feature = "webgl_backtrace")]
 use crate::dom::globalscope::GlobalScope;
@@ -97,7 +96,6 @@ use crate::dom::webgl::webglvertexarrayobject::WebGLVertexArrayObject;
 use crate::dom::webgl::webglvertexarrayobjectoes::WebGLVertexArrayObjectOES;
 use crate::dom::window::Window;
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
-use crate::script_thread::ScriptThread;
 
 // From the GLES 2.0.25 spec, page 85:
 //
@@ -181,18 +179,6 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-/// Report how many WebGL contexts are still alive, and whether their canvases are
-/// still in a document.
-///
-/// ***This is the question a forced collection cannot answer.*** Measured on the 4-GPU
-/// wall, 2026-09-07: with `SERVO_SCRIPT_FORCE_GC_SEC=5` running 24 full collections over
-/// two minutes, `WEBGLLIVE contexts=` still climbed 0 -> 8 and never fell once. So the
-/// contexts are not garbage waiting to be collected -- they are reachable, and the only
-/// thing left to learn is from where.
-///
-/// `connected` splits that in two, and the two halves have different owners:
-/// a canvas still in a document is held by the page, and no engine change will free it;
-/// a detached canvas that stays alive is held by something in here.
 /// 헐리는 문서가 쥐고 있던 WebGL 컨텍스트의 GPU 자원을 **그 자리에서** 놓는다.
 ///
 /// ★수집을 기다릴 일이 아니다★
@@ -227,10 +213,6 @@ pub(crate) fn release_contexts_of_destroyed_document(document: &Document) {
     if doomed.is_empty() {
         return;
     }
-    warn!(
-        "WEBGLDOM releasing {} context(s) of a destroyed document",
-        doomed.len()
-    );
     for context in doomed {
         context.release_gpu_resources();
     }
@@ -247,98 +229,6 @@ fn find_live_context(context_id: WebGLContextId) -> Option<DomRoot<WebGLRenderin
             .filter_map(|context| context.root())
             .find(|context| context.context_id() == context_id)
     })
-}
-
-pub(crate) fn report_live_contexts() {
-    LIVE_CONTEXTS.with(|live| {
-        let mut live = live.borrow_mut();
-        // Dropping the dead entries here is also what keeps this list from growing
-        // without bound on a long-running wall.
-        live.retain(|context| context.is_alive());
-        let (mut connected, mut detached, mut offscreen) = (0usize, 0usize, 0usize);
-        // 살아 있는 컨텍스트들이 붙들고 있는 GPU 바이트의 하한. ★컨텍스트 하나는 Rust 로는
-        // 수백 바이트지만 GPU 로는 그리기 버퍼 여러 장이다★ — 그 값을 같이 내지 않으면
-        // "live=4" 가 얼마나 큰 일인지 로그만 보고는 알 수 없다. 팬아웃 벽에서는 타일마다
-        // 서피스가 따로 있으므로 실제 점유는 이 값보다 크다(여기서는 타일 수를 모르므로
-        // 곱하지 않는다 — 하한임을 이름으로 밝힌다).
-        let mut buffer_bytes: u64 = 0;
-        // ★같은 문서에 쌓이는 것과, 문서 자체가 안 헐리는 것은 다른 고장이다★ — 앞은
-        // 페이지가 옛 캔버스를 들고 있는 것이고, 뒤는 옛 문서(파이프라인)가 살아 있는
-        // 것이다. 뒤라면 CPU 메모리도 같이 늘고, 그 안의 것은 무엇을 해도 수집되지 않는다.
-        // `is_connected` 는 "뿌리가 Document 인가" 만 보므로 둘을 구분하지 못한다.
-        // 서로 다른 문서가 몇 개인지, 그 중 아직 **활성**인 것이 몇 개인지를 함께 센다.
-        let mut documents: Vec<usize> = Vec::new();
-        let mut in_inactive_document = 0usize;
-        // ★`is_fully_active` 로는 죽은 문서를 가려낼 수 없다★
-        //
-        // 그 값은 컨스텔레이션이 `set_activity` 로 세우는 플래그인데, 문서 파괴 경로
-        // (`Document::destroy`)는 그것을 건드리지 않는다 -- `discard_browsing_context` 로
-        // 창을 버리고 스크립트 스레드의 문서 맵에서 빠질 뿐이다. 그래서 이미 헐린 문서도
-        // `in_inactive_document` 에 안 잡힌다. 실측(log_webgl_memleak_repraise/00~01)에서
-        // `documents=1→4` 인데 `in_inactive_document=0` 이었고, 그걸 "넷 다 살아 있다"로
-        // 읽었다 -- 그 판정의 근거가 없었다.
-        //
-        // 그래서 파괴가 실제로 남기는 두 흔적을 센다:
-        //   `discarded`   `Window::discard_browsing_context` 가 세우는 플래그
-        //   `orphan`      스크립트 스레드의 문서 맵에 더는 없다(`PipelineExit` 처리 완료)
-        // 둘 중 하나라도 서면 그 문서는 헐렸는데 캔버스가 붙들고 있는 것이다.
-        let mut discarded_documents = 0usize;
-        let mut orphan_documents = 0usize;
-        for context in live.iter() {
-            let Some(context) = context.root() else {
-                continue;
-            };
-            let size = context.size.get().cast::<u64>();
-            buffer_bytes += size.width * size.height * 4;
-            if let HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) = &context.canvas {
-                let document = canvas.owner_document();
-                let identity = &*document as *const Document as usize;
-                if !documents.contains(&identity) {
-                    documents.push(identity);
-                    // ★`window_proxy()` 를 쓰면 안 된다★ — 그 접근자는 브라우징 컨텍스트가
-                    // 버려진 뒤에 부르면 `unwrap` 으로 **패닉한다**(그 함수의 doc 주석이
-                    // 그렇게 적혀 있다). 즉 여기서 찾으려는 바로 그 상태에서 죽는다.
-                    // 실측: 스크립트 스레드가 그 자리에서 죽어 화면이 검게 서고 그 뒤
-                    // 아무 명령도 먹지 않았다(log_webgl_memleak_repraise/02).
-                    //
-                    // 프록시가 아예 없는 것 자체가 "버려졌다"는 신호이므로 그렇게 읽는다.
-                    if document.window().undiscarded_window_proxy().is_none() {
-                        discarded_documents += 1;
-                    }
-                    if ScriptThread::find_document(document.window().pipeline_id()).is_none() {
-                        orphan_documents += 1;
-                    }
-                }
-                if !document.is_fully_active() {
-                    in_inactive_document += 1;
-                }
-            }
-            match &context.canvas {
-                HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
-                    if canvas.upcast::<Element>().is_connected() {
-                        connected += 1;
-                    } else {
-                        detached += 1;
-                    }
-                },
-                HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => offscreen += 1,
-            }
-        }
-        // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
-        // diagnostic nobody can see is a diagnostic that does not exist.
-        warn!(
-            "WEBGLDOM live={} connected={} detached={} offscreen={} documents={}              in_inactive_document={} discarded_documents={} orphan_documents={} buffer_floor_mb={:.0}",
-            live.len(),
-            connected,
-            detached,
-            offscreen,
-            documents.len(),
-            in_inactive_document,
-            discarded_documents,
-            orphan_documents,
-            buffer_bytes as f64 / (1024.0 * 1024.0),
-        );
-    });
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -633,12 +523,21 @@ impl WebGLRenderingContext {
         event.upcast::<Event>().fire(cx, canvas.upcast());
     }
 
-    /// Remember this context weakly, so [`report_live_contexts`] can find it later.
+    /// Remember this context weakly, so `release_contexts_of_destroyed_document` and
+    /// `find_live_context` can find it later.
     ///
     /// A weak reference is the whole point: the registry must not be the reason a
-    /// context stays alive, or it would answer its own question.
+    /// context stays alive.
+    ///
+    /// Dead entries are dropped here because this is the only place the list grows;
+    /// without it `LIVE_CONTEXTS` would keep collected `WeakRef`s for ever on a
+    /// long-running wall.
     pub(crate) fn register_for_reporting(&self) {
-        LIVE_CONTEXTS.with(|live| live.borrow_mut().push(WeakRef::new(self)));
+        LIVE_CONTEXTS.with(|live| {
+            let mut live = live.borrow_mut();
+            live.retain(|context| context.is_alive());
+            live.push(WeakRef::new(self));
+        });
     }
 
     /// Tell the JS engine what this context's drawing buffer costs it.

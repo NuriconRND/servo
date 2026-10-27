@@ -326,35 +326,6 @@ bitflags! {
     }
 }
 
-thread_local! {
-    /// How many times each branch of `needs_rendering_update` said yes, since the last
-    /// report. See [`take_rendering_update_reasons`].
-    static RENDERING_UPDATE_REASONS: RefCell<Vec<(&'static str, u32)>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-pub(crate) fn note_rendering_update_reason(reason: &'static str) {
-    RENDERING_UPDATE_REASONS.with(|counts| {
-        let mut counts = counts.borrow_mut();
-        match counts.iter_mut().find(|(name, _)| *name == reason) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((reason, 1)),
-        }
-    });
-}
-
-/// Take the tally since the last call, most frequent first.
-///
-/// A handful of reasons at most, so a `Vec` beats a map and keeps the report ordered by
-/// what actually drove the work.
-pub(crate) fn take_rendering_update_reasons() -> Vec<(&'static str, u32)> {
-    RENDERING_UPDATE_REASONS.with(|counts| {
-        let mut counts = std::mem::take(&mut *counts.borrow_mut());
-        counts.sort_by(|left, right| right.1.cmp(&left.1));
-        counts
-    })
-}
-
 /// <https://dom.spec.whatwg.org/#document>
 #[dom_struct]
 pub(crate) struct Document {
@@ -2980,64 +2951,34 @@ impl Document {
         if !self.is_fully_active() {
             return false;
         }
-        // ***Which branch says yes is the whole question when this is hot.*** A rendering
-        // update rebuilds this document's display list, and on a wall page that costs
-        // 2 ms in the steady state and 14.5 ms during a content switch. Whether the page
-        // is asking for ~50 of those a second because of restyle, canvas or video content,
-        // observers, or input is not visible from outside, and guessing it wrong sends the
-        // work to the wrong layer -- as it did on 2026-09-08.
         if !self.window().layout_blocked() {
             let restyle_reason = self.restyle_reason();
             if !restyle_reason.is_empty() {
-                // ***Which restyle reason, not just "restyle".*** This page is dirty for
-                // restyle essentially all the time -- measured on the 4-GPU wall,
-                // 2026-09-08 (log_ani_perf/15), with and without an animation running --
-                // and "the document needs a restyle" does not say whether that is the DOM
-                // changing, a stylesheet, or pending element restyles. Those have
-                // different owners and different fixes.
-                note_rendering_update_reason(match restyle_reason {
-                    reason if reason.contains(RestyleReason::StylesheetsChanged) => {
-                        "restyle:stylesheets"
-                    },
-                    reason if reason.contains(RestyleReason::DOMChanged) => "restyle:dom",
-                    reason if reason.contains(RestyleReason::PendingRestyles) => "restyle:pending",
-                    reason if reason.contains(RestyleReason::ViewportChanged) => "restyle:viewport",
-                    reason if reason.contains(RestyleReason::ThemeChanged) => "restyle:theme",
-                    _ => "restyle:other",
-                });
                 return true;
             }
             if self.window().layout().needs_new_display_list() {
-                note_rendering_update_reason("display-list");
                 return true;
             }
             if self.window().layout().needs_accessibility_update() {
-                note_rendering_update_reason("accessibility");
                 return true;
             }
         }
         if !self.rendering_update_reasons.get().is_empty() {
-            note_rendering_update_reason("observer");
             return true;
         }
         if self.event_handler.has_pending_input_events() {
-            note_rendering_update_reason("input");
             return true;
         }
         if self.has_pending_scroll_events() {
-            note_rendering_update_reason("scroll");
             return true;
         }
         if self.window().has_unhandled_resize_event() {
-            note_rendering_update_reason("resize");
             return true;
         }
         if self.has_pending_animated_image_update.get() {
-            note_rendering_update_reason("animated-image");
             return true;
         }
         if !self.dirty_canvases.borrow().is_empty() {
-            note_rendering_update_reason("dirty-canvas");
             return true;
         }
 
@@ -4595,8 +4536,6 @@ impl Document {
     /// 페이지가 재는 `dt` 는 음수가 된다. 어긋남의 크기가 이 기능이 없애려는 지터와 같은
     /// 자릿수라 그냥 두면 이득을 그대로 깎아먹는다. 직전 값으로 하한을 둔다.
     fn resolve_frame_time(&self, frame_time: Option<CrossProcessInstant>) -> CrossProcessInstant {
-        let from_frame_time =
-            frame_time.is_some() && pref!(dom_animation_timeline_use_frame_time);
         let candidate = match frame_time {
             Some(frame_time) if pref!(dom_animation_timeline_use_frame_time) => frame_time,
             _ => CrossProcessInstant::now(),
@@ -4604,20 +4543,12 @@ impl Document {
         // ★이 클램프가 페이지에 보이는 모양.★ 후보가 직전 값보다 과거면 페이지는
         // ***지난 프레임과 똑같은 타임스탬프***를 받고 같은 위치를 두 번 계산한다. 틱을
         // 쓰지 못한 회차가 `now()` 로 떨어지면 시계가 한 번 앞으로 튀고, 뒤이어 오는
-        // (페이싱된, 따라서 더 이른) 진짜 틱들이 줄줄이 여기 걸린다. `RAFCLOCK` 의
-        // `clamped` 가 그 횟수다 -- 자세한 이유는 `crate::raf_clock` 머리 주석.
-        let clamped = matches!(self.last_frame_time.get(), Some(previous) if previous > candidate);
+        // (페이싱된, 따라서 더 이른) 진짜 틱들이 줄줄이 여기 걸린다.
         let resolved = match self.last_frame_time.get() {
             Some(previous) if previous > candidate => previous,
             _ => candidate,
         };
         self.last_frame_time.set(Some(resolved));
-        crate::raf_clock::note_resolved(
-            self.window().pipeline_id(),
-            resolved,
-            from_frame_time,
-            clamped,
-        );
         resolved
     }
 

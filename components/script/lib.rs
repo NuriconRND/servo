@@ -50,7 +50,6 @@ mod mime_multipart;
 mod module_loading;
 mod navigation;
 mod network_listener;
-mod raf_clock;
 mod realms;
 mod routed_promise;
 mod script_module;

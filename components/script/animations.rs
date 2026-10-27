@@ -187,27 +187,8 @@ impl Animations {
         // 정리 경로) 불린다. 여기서 취소된 애니메이션은 `clear_canceled_animations` 에
         // 쓸려 세트가 비고, `sets.retain` 이 세트를 지운다. 그러면 레이아웃은
         // `not_in_set` 으로 떨어져 그 요소를 자기 스타일로 그린다.
-        //
-        // log_ani_debug/06 에서 `ANIMSETDROP node=9888400807024` 가 17번 찍혔는데
-        // `ANIMCANCEL`(스타일 검사) 도 `ANIMDROP`(렌더링 안 됨) 도 그 노드에는 한 번도
-        // 안 찍혔다. 남은 취소 자리가 여기뿐이라 무엇이 여기로 들어오는지를 남긴다.
         let mut cancel_animations_for = |key: AnimationSetKey| {
             if let Some(set) = animations.get_mut(&key) {
-                if !set.animations.is_empty() {
-                    log::warn!(
-                        "ANIMUNBIND node={} pseudo={:?} animations=[{}]",
-                        key.node.0,
-                        key.pseudo_element,
-                        set.animations
-                            .iter()
-                            .map(|animation| format!(
-                                "{}:{:?}/fill={:?}",
-                                animation.name, animation.state, animation.fill_mode
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                }
                 set.cancel_all_animations();
             }
         };
@@ -274,25 +255,6 @@ impl Animations {
                 // `sets.retain` 이 문서에서 지운다. 레이아웃은 그 뒤로 그 노드를
                 // `not_in_set` 으로 보고 요소를 자기 스타일로 그린다 -- `fill-mode:
                 // forwards` 로 붙들고 있어야 할 마지막 키프레임까지 같이 버려진 채로.
-                //
-                // 화면에 보이는 요소가 여기 걸린다면 판정이 틀린 것이므로, 그때 노드가
-                // 문서에 붙어 있었는지와 무엇을 버렸는지를 남긴다.
-                if !set.animations.is_empty() {
-                    log::warn!(
-                        "ANIMDROP node={} pseudo={:?} connected={} animations=[{}]",
-                        key.node.0,
-                        key.pseudo_element,
-                        node.is_connected(),
-                        set.animations
-                            .iter()
-                            .map(|animation| format!(
-                                "{}:{:?}/fill={:?}",
-                                animation.name, animation.state, animation.fill_mode
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                }
                 set.cancel_all_animations();
             }
         }
@@ -360,11 +322,6 @@ impl Animations {
         sets.retain(|key, state| {
             let keep = !state.is_empty();
             if !keep {
-                log::warn!(
-                    "ANIMSETDROP node={} pseudo={:?}",
-                    key.node.0,
-                    key.pseudo_element
-                );
                 if let Some(node) = rooted_nodes.get(&NoTrace(key.node)) {
                     node.dirty(NodeDamage::Style);
                 }
@@ -433,24 +390,9 @@ impl Animations {
             // log_ani_debug/05 의 sd-anim-85 가 9초 동안 그랬고, 그 첫 키프레임이
             // translateX(11520) -- 뷰포트 폭 한 장 -- 이라 그동안 벽이 검었다.
             if animation.started_at > now {
-                log::warn!(
-                    "ANIMPENDING name={} stuck_by_ms={:.1} started_at={:.3} now={:.3} delay={:.3}",
-                    animation.name,
-                    (animation.started_at - now) * 1000.0,
-                    animation.started_at,
-                    now,
-                    animation.delay
-                );
                 continue;
             }
             animation.state = AnimationState::Running;
-            log::warn!(
-                "ANIMSTART name={} node={} started_at={:.3} now={:.3}",
-                animation.name,
-                key.node.0,
-                animation.started_at,
-                now
-            );
             self.add_animation_event(
                 key,
                 animation,

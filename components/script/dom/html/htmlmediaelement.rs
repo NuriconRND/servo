@@ -127,7 +127,6 @@ static MEDIA_CONTROL_JS: &str = include_str!("../../resources/media-controls.js"
 /// requested position (e.g. snapping to the nearest keyframe), so we use a threshold
 /// instead of strict equality. (Unit is second)
 const SEEK_POSITION_THRESHOLD: f64 = 0.5;
-const MEDIA_FRAME_INFO_INTERVAL: u64 = 120;
 
 /// `SERVO_MEDIA_DISABLE_ENOUGHDATA_BACKOFF`(servo_config::debug_env 등록)의 truthy 판정.
 /// gstreamer player 백엔드의 `enoughdata_backoff_disabled()`와 동일한 판정식이다
@@ -385,12 +384,6 @@ pub(crate) struct MediaFrameRenderer {
     current_frame: Option<MediaFrame>,
     old_frame: Option<MediaFrame>,
     very_old_frame: Option<MediaFrame>,
-    rendered_frame_count: u64,
-    #[ignore_malloc_size_of = "Diagnostic timestamp"]
-    last_rendered_frame_at: Option<Instant>,
-    #[ignore_malloc_size_of = "Diagnostic timestamp"]
-    media_frame_summary_at: Instant,
-    media_frame_summary_count: u64,
     current_frame_holder: Option<FrameHolder>,
     #[ignore_malloc_size_of = "WebRender external image identifiers are scalar handles"]
     yuv_external_ids: Option<MediaYuvExternalIds>,
@@ -418,10 +411,6 @@ impl MediaFrameRenderer {
             current_frame: None,
             old_frame: None,
             very_old_frame: None,
-            rendered_frame_count: 0,
-            last_rendered_frame_at: None,
-            media_frame_summary_at: Instant::now(),
-            media_frame_summary_count: 0,
             current_frame_holder: None,
             yuv_external_ids: None,
             d3d11_external_ids: None,
@@ -499,10 +488,6 @@ impl MediaFrameRenderer {
 
     fn reset(&mut self) {
         self.player_id = None;
-        self.rendered_frame_count = 0;
-        self.last_rendered_frame_at = None;
-        self.media_frame_summary_at = Instant::now();
-        self.media_frame_summary_count = 0;
 
         if let Some(glplayer_id) = self.glplayer_id.take() {
             self.player_context
@@ -607,78 +592,6 @@ impl MediaFrameRenderer {
         self.paint_api.generate_image_key_blocking(self.webview_id)
     }
 
-    fn note_media_frame_rendered(&mut self) -> Option<f64> {
-        let now = Instant::now();
-        let elapsed_ms = self.last_rendered_frame_at.map(|last_rendered_frame_at| {
-            now.saturating_duration_since(last_rendered_frame_at)
-                .as_secs_f64()
-                * 1000.0
-        });
-        self.last_rendered_frame_at = Some(now);
-        elapsed_ms
-    }
-
-    fn log_media_frame(
-        &mut self,
-        rendered_frame_count: u64,
-        frame_backend: &'static str,
-        frame_width: i32,
-        frame_height: i32,
-        image_key: Option<ImageKey>,
-        image_update: &'static str,
-        delete_update_count: usize,
-        update_count: usize,
-        inter_frame_ms: Option<f64>,
-    ) {
-        debug!(
-            "Wall media frame: webview={:?} player_id={:?} media_frame_id={} \
-             frame_backend={} size={}x{} image_key={:?} image_update={} \
-             delete_updates={} updates_total={} inter_frame_ms={:?} glplayer_id={:?}",
-            self.webview_id,
-            self.player_id,
-            rendered_frame_count,
-            frame_backend,
-            frame_width,
-            frame_height,
-            image_key,
-            image_update,
-            delete_update_count,
-            update_count,
-            inter_frame_ms,
-            self.glplayer_id,
-        );
-
-        self.media_frame_summary_count = self.media_frame_summary_count.saturating_add(1);
-        if image_update != "update" || rendered_frame_count % MEDIA_FRAME_INFO_INTERVAL == 0 {
-            let now = Instant::now();
-            let summary_elapsed_ms = now
-                .saturating_duration_since(self.media_frame_summary_at)
-                .as_secs_f64()
-                * 1000.0;
-            info!(
-                "Wall media frame summary: webview={:?} player_id={:?} media_frame_id={} \
-                 frame_backend={} size={}x{} image_update={} frames_since_summary={} \
-                 summary_elapsed_ms={:.3} delete_updates={} updates_total={} \
-                 inter_frame_ms={:?} glplayer_id={:?}",
-                self.webview_id,
-                self.player_id,
-                rendered_frame_count,
-                frame_backend,
-                frame_width,
-                frame_height,
-                image_update,
-                self.media_frame_summary_count,
-                summary_elapsed_ms,
-                delete_update_count,
-                update_count,
-                inter_frame_ms,
-                self.glplayer_id,
-            );
-            self.media_frame_summary_count = 0;
-            self.media_frame_summary_at = now;
-        }
-    }
-
     fn media_frame_yuv_image(
         format: VideoFrameYuvFormat,
         color_space: VideoFrameYuvColorSpace,
@@ -702,9 +615,6 @@ impl MediaFrameRenderer {
         &mut self,
         frame: VideoFrame,
         yuv: VideoFrameYuvData,
-        rendered_frame_count: u64,
-        frame_backend: &'static str,
-        inter_frame_ms: Option<f64>,
         mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
     ) {
         let frame_width = frame.get_width();
@@ -725,8 +635,6 @@ impl MediaFrameRenderer {
         }
 
         let yuv_format = media_frame_yuv_format(yuv.format);
-        let image_update_for_log;
-        let image_key_for_log;
 
         let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
             current_frame.width == frame_width
@@ -741,7 +649,6 @@ impl MediaFrameRenderer {
                 .current_frame
                 .as_mut()
                 .expect("Current frame should be present");
-            image_key_for_log = Some(current_frame.image_key);
             if let Some(current_yuv) = current_frame.yuv {
                 current_frame.yuv = Some(Self::media_frame_yuv_image(
                     yuv.format,
@@ -774,7 +681,6 @@ impl MediaFrameRenderer {
                     None,
                 ));
             }
-            image_update_for_log = "update";
 
             self.current_frame_holder
                 .get_or_insert_with(|| FrameHolder::new(frame.clone()))
@@ -817,8 +723,6 @@ impl MediaFrameRenderer {
                 width: frame_width,
                 height: frame_height,
             };
-            image_key_for_log = Some(current_frame.image_key);
-            image_update_for_log = "add";
 
             for (plane_index, (image_key, external_id)) in current_frame
                 .image_keys()
@@ -847,21 +751,6 @@ impl MediaFrameRenderer {
             self.current_frame = Some(current_frame);
         }
 
-        let delete_update_count = updates
-            .iter()
-            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
-            .count();
-        self.log_media_frame(
-            rendered_frame_count,
-            frame_backend,
-            frame_width,
-            frame_height,
-            image_key_for_log,
-            image_update_for_log,
-            delete_update_count,
-            updates.len(),
-            inter_frame_ms,
-        );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
     }
@@ -875,9 +764,6 @@ impl MediaFrameRenderer {
         &mut self,
         frame: VideoFrame,
         d3d11_yuv: VideoFrameD3D11YuvData,
-        rendered_frame_count: u64,
-        frame_backend: &'static str,
-        inter_frame_ms: Option<f64>,
         mut updates: smallvec::SmallVec<[ImageUpdate; 1]>,
     ) {
         let frame_width = frame.get_width();
@@ -942,8 +828,6 @@ impl MediaFrameRenderer {
         }
 
         let yuv_format = media_frame_yuv_format(format);
-        let image_update_for_log;
-        let image_key_for_log;
 
         let current_frame_is_compatible = self.current_frame.is_some_and(|current_frame| {
             current_frame.width == frame_width
@@ -958,7 +842,6 @@ impl MediaFrameRenderer {
                 .current_frame
                 .as_mut()
                 .expect("Current frame should be present");
-            image_key_for_log = Some(current_frame.image_key);
             if let Some(current_yuv) = current_frame.yuv {
                 current_frame.yuv = Some(Self::media_frame_yuv_image(
                     format,
@@ -993,7 +876,6 @@ impl MediaFrameRenderer {
                     None,
                 ));
             }
-            image_update_for_log = "update";
 
             self.current_frame_holder
                 .get_or_insert_with(|| FrameHolder::new(frame.clone()))
@@ -1036,8 +918,6 @@ impl MediaFrameRenderer {
                 width: frame_width,
                 height: frame_height,
             };
-            image_key_for_log = Some(current_frame.image_key);
-            image_update_for_log = "add";
 
             for (plane_index, (image_key, external_id)) in current_frame
                 .image_keys()
@@ -1068,21 +948,6 @@ impl MediaFrameRenderer {
             self.current_frame = Some(current_frame);
         }
 
-        let delete_update_count = updates
-            .iter()
-            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
-            .count();
-        self.log_media_frame(
-            rendered_frame_count,
-            frame_backend,
-            frame_width,
-            frame_height,
-            image_key_for_log,
-            image_update_for_log,
-            delete_update_count,
-            updates.len(),
-            inter_frame_ms,
-        );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
     }
@@ -1100,35 +965,9 @@ impl VideoFrameRenderer for MediaFrameRenderer {
             return;
         }
 
-        self.rendered_frame_count = self.rendered_frame_count.saturating_add(1);
-        let rendered_frame_count = self.rendered_frame_count;
-        let inter_frame_ms = self.note_media_frame_rendered();
         let frame_width = frame.get_width();
         let frame_height = frame.get_height();
         let yuv_frame_data = frame.get_yuv_data().cloned();
-        let frame_backend = if let Some(yuv) = yuv_frame_data.as_ref() {
-            match yuv.format {
-                VideoFrameYuvFormat::I420 => "yuv_i420_external_raw",
-                VideoFrameYuvFormat::NV12 => "yuv_nv12_external_raw",
-                // The raw (CPU) YUV path only emits 8-bit; 10-bit flows through
-                // the D3D11 path ("d3d11_yuv_texture"). Unreachable here but keeps
-                // the match exhaustive.
-                VideoFrameYuvFormat::I420_10 => "yuv_i420_10_external_raw",
-                VideoFrameYuvFormat::P010 => "yuv_p010_external_raw",
-            }
-        } else if frame.is_d3d11_yuv() {
-            "d3d11_yuv_texture"
-        } else if frame.is_gl_texture() {
-            if frame.is_external_oes() {
-                "external_oes"
-            } else {
-                "gl_texture"
-            }
-        } else {
-            "raw"
-        };
-        let mut image_update_for_log = "none";
-        let image_key_for_log;
 
         let mut updates = smallvec::smallvec![];
 
@@ -1138,26 +977,12 @@ impl VideoFrameRenderer for MediaFrameRenderer {
         }
 
         if let Some(yuv) = yuv_frame_data {
-            self.render_yuv_frame(
-                frame,
-                yuv,
-                rendered_frame_count,
-                frame_backend,
-                inter_frame_ms,
-                updates,
-            );
+            self.render_yuv_frame(frame, yuv, updates);
             return;
         }
 
         if let Some(d3d11_yuv) = frame.get_d3d11_yuv_data() {
-            self.render_d3d11_yuv_frame(
-                frame,
-                d3d11_yuv,
-                rendered_frame_count,
-                frame_backend,
-                inter_frame_ms,
-                updates,
-            );
+            self.render_d3d11_yuv_frame(frame, d3d11_yuv, updates);
             return;
         }
 
@@ -1174,7 +999,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     && current_frame.height == frame_height
                     && current_frame.yuv.is_none() =>
             {
-                image_key_for_log = Some(current_frame.image_key);
                 if !frame.is_gl_texture() {
                     updates.push(ImageUpdate::UpdateImage(
                         current_frame.image_key,
@@ -1184,7 +1008,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                         )),
                         None,
                     ));
-                    image_update_for_log = "update";
                 }
 
                 self.current_frame_holder
@@ -1209,8 +1032,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 current_frame.yuv = None;
                 current_frame.width = frame.get_width();
                 current_frame.height = frame.get_height();
-                image_key_for_log = Some(new_image_key);
-                image_update_for_log = "add";
 
                 // FIXME: This code is duplicated below this branch
                 let image_data = self
@@ -1253,8 +1074,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                     return;
                 };
 
-                image_key_for_log = Some(image_key);
-                image_update_for_log = "add";
                 self.current_frame = Some(MediaFrame {
                     image_key,
                     yuv: None,
@@ -1292,21 +1111,6 @@ impl VideoFrameRenderer for MediaFrameRenderer {
                 ));
             },
         }
-        let delete_update_count = updates
-            .iter()
-            .filter(|update| matches!(update, ImageUpdate::DeleteImage(..)))
-            .count();
-        self.log_media_frame(
-            rendered_frame_count,
-            frame_backend,
-            frame_width,
-            frame_height,
-            image_key_for_log,
-            image_update_for_log,
-            delete_update_count,
-            updates.len(),
-            inter_frame_ms,
-        );
         self.paint_api
             .update_images(self.webview_id.into(), updates);
     }
@@ -1496,61 +1300,7 @@ enum PlaybackDirection {
     Backwards,
 }
 
-thread_local! {
-    /// 플레이어를 만든 미디어 요소를 **약하게** 기억한다.
-    ///
-    /// 약한 참조인 것이 핵심이다 — 이 목록이 요소를 살려 두면 스스로 던진 질문에 스스로
-    /// 답하는 꼴이 된다.
-    static LIVE_MEDIA_ELEMENTS: RefCell<Vec<WeakRef<HTMLMediaElement>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// 살아 있는 미디어 요소가 몇이고, 그 중 몇이 아직 문서에 붙어 있는지.
-///
-/// ★`unbind_from_tree` 는 일시정지만 하고 플레이어를 버리지 않는다★(사양대로다). 그래서
-/// 앱이 `<video>` 를 지워도 GStreamer 파이프라인은 요소가 수거될 때까지 살아 있고, GC 는
-/// 그 요소를 수백 바이트로 본다 — WebGL 컨텍스트가 남던 것과 같은 구조다. 실측에서 링
-/// 그룹(영상 하나당 하나)이 24 → 78 → 102 → 156 으로 한 번도 줄지 않았고, 프로세스 커밋
-/// 메모리가 100초에 844MB → 24GB 였다.
-///
-/// 여기서 갈린다: `detached` 가 늘면 요소는 지워졌는데 우리가 파이프라인을 안 버리는
-/// 것이고(엔진 문제), `connected` 가 늘면 페이지가 들고 있는 것이다(그때는 보이지 않는
-/// 것을 디코드하지 않게 하는 쪽이다).
-pub(crate) fn report_live_media_elements() {
-    LIVE_MEDIA_ELEMENTS.with(|live| {
-        let mut live = live.borrow_mut();
-        live.retain(|element| element.is_alive());
-        let (mut connected, mut detached, mut with_player) = (0usize, 0usize, 0usize);
-        for element in live.iter() {
-            let Some(element) = element.root() else {
-                continue;
-            };
-            if element.upcast::<Node>().is_connected() {
-                connected += 1;
-            } else {
-                detached += 1;
-            }
-            if element.player.borrow().is_some() {
-                with_player += 1;
-            }
-        }
-        // `warn!` 인 것은 의도적이다 — 벽 런처의 RUST_LOG 가 warn 으로 시작한다.
-        warn!(
-            "MEDIADOM live={} connected={} detached={} with_player={}",
-            live.len(),
-            connected,
-            detached,
-            with_player
-        );
-    });
-}
-
 impl HTMLMediaElement {
-    /// 이 요소를 [`report_live_media_elements`] 가 찾을 수 있도록 약하게 기억한다.
-    fn register_for_reporting(&self) {
-        LIVE_MEDIA_ELEMENTS.with(|live| live.borrow_mut().push(WeakRef::new(self)));
-    }
-
     pub(crate) fn new_inherited(
         tag_name: LocalName,
         prefix: Option<Prefix>,
@@ -3143,7 +2893,6 @@ impl HTMLMediaElement {
         };
 
         *self.player.borrow_mut() = Some(player);
-        self.register_for_reporting();
 
         let event_handler = Arc::new(Mutex::new(HTMLMediaElementEventHandler::new(self)));
         let weak_event_handler = Arc::downgrade(&event_handler);
@@ -3269,7 +3018,6 @@ impl HTMLMediaElement {
             self.default_playback_start_position.set(position);
         }
 
-        warn!("MEDIATEARDOWN element detached; releasing its player");
         self.reset_media_player();
         self.player_released_while_detached.set(true);
     }

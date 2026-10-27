@@ -131,20 +131,18 @@ use crate::dom::customelementregistry::{
     CallbackReaction, CustomElementDefinition, CustomElementReactionStack,
 };
 use crate::dom::document::focus::FocusableArea;
-use crate::dom::document::{note_rendering_update_reason, take_rendering_update_reasons};
 use crate::dom::document::{
     Document, DocumentSource, HasBrowsingContext, IsHTMLDocument, RenderingUpdateReason,
 };
 use crate::dom::element::Element;
-use crate::dom::globalscope::{GlobalScope, take_port_message_stats};
+use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmliframeelement::{HTMLIFrameElement, IframeContext, ProcessingMode};
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::servoparser::{ParserContext, ServoParser};
 use crate::dom::types::DebuggerGlobalScope;
-use crate::dom::webgl::webglrenderingcontext::report_live_contexts as report_live_webgl_contexts;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
-use crate::dom::window::{Window, take_reflow_stats};
+use crate::dom::window::Window;
 use crate::dom::windowproxy::{CreatorBrowsingContextInfo, WindowProxy};
 use crate::dom::worklet::WorkletThreadPool;
 use crate::dom::workletglobalscope::WorkletGlobalScopeInit;
@@ -153,7 +151,7 @@ use crate::messaging::{
     CommonScriptMsg, MainThreadScriptMsg, MixedMessage, ScriptEventLoopSender,
     ScriptThreadReceivers, ScriptThreadSenders,
 };
-use crate::microtask::{Microtask, MicrotaskQueue, take_microtask_time};
+use crate::microtask::{Microtask, MicrotaskQueue};
 use crate::mime::{APPLICATION, CHARSET, MimeExt, TEXT, XML};
 use crate::navigation::{InProgressLoad, NavigationListener};
 use crate::network_listener::{FetchResponseListener, submit_timing};
@@ -169,58 +167,6 @@ use crate::webdriver_handlers::jsval_to_webdriver;
 use crate::{devtools, webdriver_handlers};
 
 thread_local!(static SCRIPT_THREAD_ROOT: Cell<Option<*const ScriptThread>> = const { Cell::new(None) });
-
-// One-second window for `SCRIPTBUSY`, and the running total for `SCRIPTTASK`. One script
-// thread per OS thread, so a thread-local is the right scope for both.
-thread_local!(static TASK_WINDOW: RefCell<TaskWindow> = RefCell::new(TaskWindow::default()));
-
-/// How much of the last second this script thread spent inside tasks, and which task was
-/// the worst of them.
-#[derive(Default)]
-struct TaskWindow {
-    started: Option<Instant>,
-    tasks: u32,
-    busy: Duration,
-    longest: Duration,
-    longest_category: Option<ScriptThreadEventCategory>,
-    display_reflows: u32,
-    query_reflows: u32,
-    reflow_time: Duration,
-}
-
-/// A task at or above this runs a `SCRIPTTASK` line. `SERVO_SCRIPT_SLOW_TASK_MS` moves it;
-/// 0 turns it off. The default is one frame's worth at 60Hz rounded up -- a task that long
-/// has already cost a frame, so it is worth a line.
-fn slow_task_threshold() -> Option<Duration> {
-    static THRESHOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        let ms = std::env::var("SERVO_SCRIPT_SLOW_TASK_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(20);
-        (ms > 0).then(|| Duration::from_millis(ms))
-    })
-}
-
-// When `maybe_report_live_webgl_contexts` last reported. Same reasoning as below.
-thread_local!(static LAST_WEBGL_DOM_REPORT: Cell<Option<Instant>> = const { Cell::new(None) });
-
-// When `maybe_force_gc` last collected. One script thread per OS thread, so a
-// thread-local is exactly the right scope and needs no field on `ScriptThread`.
-thread_local!(static LAST_FORCED_GC: Cell<Option<Instant>> = const { Cell::new(None) });
-
-/// The interval `SERVO_SCRIPT_FORCE_GC_SEC` asks for, parsed once. Absent,
-/// unparseable, or zero all mean "leave collection alone".
-fn force_gc_interval() -> Option<Duration> {
-    static INTERVAL: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
-    *INTERVAL.get_or_init(|| {
-        std::env::var("SERVO_SCRIPT_FORCE_GC_SEC")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs)
-    })
-}
 
 fn with_optional_script_thread<R>(f: impl FnOnce(Option<&ScriptThread>) -> R) -> R {
     SCRIPT_THREAD_ROOT.with(|root| {
@@ -474,16 +420,6 @@ pub struct ScriptThread {
     /// `None` 이고, 그때는 지금 시각을 쓴다.
     #[no_trace]
     pending_frame_time: Cell<Option<CrossProcessInstant>>,
-
-    /// 위 플래그를 **폴백 타이머**가 세웠는가.
-    ///
-    /// ★진단용.★ `reflow_display` 가 실제 렌더 대비 1.8~2.2 배로 돈다(2026-09-16,
-    /// log_ani_debug/16: 렌더 61 회인 초에 렌더링 갱신 117 회). 플래그를 세우는 자리는
-    /// 렌더러 틱과 이 타이머 둘뿐인데, 어느 쪽이 두 배인지 로그로 갈리지 않아 원인을
-    /// 세 번 잘못 짚었다. 타이머 콜백은 **다른 스레드**에서 돌아
-    /// `note_rendering_update_reason`(thread_local 집계)을 거기서 부를 수 없으므로,
-    /// 표시만 해 두고 스크립트 스레드가 갱신을 실제로 돌릴 때 집계한다.
-    rendering_update_from_timer: Arc<AtomicBool>,
 
     debugger_global: Dom<DebuggerGlobalScope>,
 
@@ -1126,7 +1062,6 @@ impl ScriptThread {
                     scheduled_update_the_rendering: Default::default(),
                     needs_rendering_update: Arc::new(AtomicBool::new(false)),
                     pending_frame_time: Cell::new(None),
-                    rendering_update_from_timer: Arc::new(AtomicBool::new(false)),
                     debugger_global: debugger_global.as_traced(),
                     debugger_paused: Cell::new(false),
                     privileged_urls: state.privileged_urls,
@@ -1209,147 +1144,14 @@ impl ScriptThread {
 
         debug!("Scheduling ScriptThread animation frame.");
         let trigger_script_thread_animation = self.needs_rendering_update.clone();
-        let from_timer = self.rendering_update_from_timer.clone();
         let timer_id = self.schedule_timer(TimerEventRequest {
             callback: Box::new(move || {
-                from_timer.store(true, Ordering::Relaxed);
                 trigger_script_thread_animation.store(true, Ordering::Relaxed);
             }),
             duration: delay,
         });
 
         *self.scheduled_update_the_rendering.borrow_mut() = Some(timer_id);
-    }
-
-    /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
-    ///
-    /// Attempt to update the rendering and then do a microtask checkpoint if rendering was
-    /// actually updated.
-    ///
-    /// Returns true if any reflows produced a new display list.
-    /// Collect on a timer instead of on pressure, when `SERVO_SCRIPT_FORCE_GC_SEC`
-    /// asks for it. Off otherwise, and not a mechanism to ship enabled.
-    ///
-    /// ***This exists to answer one question the logs cannot.*** When DOM objects
-    /// that own GPU memory are never finalized, there are two possible reasons
-    /// and they need opposite fixes: either the objects are garbage and no
-    /// collection ran, or they are still reachable and collecting would not help.
-    /// Forcing the collection separates them -- if the count falls, they were
-    /// garbage; if it does not, something still holds them and that is what to
-    /// go find.
-    /// Report tasks that ran long, and once a second how much of that second this thread
-    /// spent inside tasks at all.
-    ///
-    /// ***A stalled animation and a slow animation look identical in a frame counter.***
-    /// Measured on the 4-GPU wall, 2026-09-08 (log_ani_perf/00): for ten straight seconds
-    /// the painters composited 60 frames a second each while the wall issued ZERO logical
-    /// frames, and the pacer coalesced 21 requests in that whole window -- so nothing was
-    /// being held back, and nothing was being asked for. The stall was on this thread, and
-    /// nothing in the engine said what it was doing.
-    ///
-    /// Read the summary this way: `busy_ms` near 1000 with one huge `longest` is a single
-    /// task that would not end; near 1000 spread over many tasks is thrash; near 0 while
-    /// frames are still missing means this thread was idle and something upstream stopped
-    /// feeding it. Pair it with the launcher's `-ThreadCpu`, which separates a task that is
-    /// computing from one that is blocked waiting.
-    fn note_task_duration(category: ScriptThreadEventCategory, duration: Duration) {
-        let (display_reflows, query_reflows, reflow_time) = take_reflow_stats();
-        let (port_deserialize, port_handler) = take_port_message_stats();
-        let microtask_time = take_microtask_time();
-        if let Some(threshold) = slow_task_threshold()
-            && duration >= threshold
-        {
-            warn!(
-                "SCRIPTTASK slow: category={:?} ms={:.1} reflow_display={} reflow_query={} reflow_ms={:.1} port_clone_ms={:.1} port_handler_ms={:.1} microtask_ms={:.1}",
-                category,
-                duration.as_secs_f64() * 1000.0,
-                display_reflows,
-                query_reflows,
-                reflow_time.as_secs_f64() * 1000.0,
-                port_deserialize.as_secs_f64() * 1000.0,
-                port_handler.as_secs_f64() * 1000.0,
-                microtask_time.as_secs_f64() * 1000.0,
-            );
-        }
-        let now = Instant::now();
-        TASK_WINDOW.with(|window| {
-            let mut window = window.borrow_mut();
-            let started = *window.started.get_or_insert(now);
-            window.tasks += 1;
-            window.busy += duration;
-            window.display_reflows += display_reflows;
-            window.query_reflows += query_reflows;
-            window.reflow_time += reflow_time;
-            if duration > window.longest {
-                window.longest = duration;
-                window.longest_category = Some(category);
-            }
-            if now.duration_since(started) < Duration::from_secs(1) {
-                return;
-            }
-            // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
-            // diagnostic nobody can see is a diagnostic that does not exist.
-            let reasons = take_rendering_update_reasons()
-                .into_iter()
-                .map(|(reason, count)| format!("{reason}:{count}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            warn!(
-                "SCRIPTBUSY window_ms={:.0} tasks={} busy_ms={:.1} longest_ms={:.1} longest={:?} reflow_display={} reflow_query={} reflow_ms={:.1} update_reasons=[{}]",
-                now.duration_since(started).as_secs_f64() * 1000.0,
-                window.tasks,
-                window.busy.as_secs_f64() * 1000.0,
-                window.longest.as_secs_f64() * 1000.0,
-                window.longest_category,
-                window.display_reflows,
-                window.query_reflows,
-                window.reflow_time.as_secs_f64() * 1000.0,
-                reasons,
-            );
-            *window = TaskWindow {
-                started: Some(now),
-                ..Default::default()
-            };
-        });
-    }
-
-    /// One `WEBGLDOM` line a second, unconditionally.
-    ///
-    /// Paired with `WEBGLLIVE` from the WebGL thread: that one counts contexts the
-    /// renderer still holds, this one says whether the page still holds their canvases.
-    /// Neither number can be moved by video, live streams or images.
-    fn maybe_report_live_webgl_contexts(&self) {
-        let now = Instant::now();
-        if !LAST_WEBGL_DOM_REPORT.with(|last| {
-            last.get()
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
-        }) {
-            return;
-        }
-        LAST_WEBGL_DOM_REPORT.with(|last| last.set(Some(now)));
-        report_live_webgl_contexts();
-        crate::dom::html::htmlmediaelement::report_live_media_elements();
-    }
-
-    #[expect(unsafe_code)]
-    fn maybe_force_gc(&self) {
-        let Some(interval) = force_gc_interval() else {
-            return;
-        };
-        let now = Instant::now();
-        if !LAST_FORCED_GC.with(|last| {
-            last.get()
-                .is_none_or(|last| now.duration_since(last) >= interval)
-        }) {
-            return;
-        }
-        LAST_FORCED_GC.with(|last| last.set(Some(now)));
-        // `warn!` deliberately: the launcher's default RUST_LOG leads with `warn`,
-        // and a diagnostic nobody can see is a diagnostic that does not exist.
-        warn!("SCRIPTGC forcing a full collection (SERVO_SCRIPT_FORCE_GC_SEC)");
-        unsafe {
-            JS_GC(*GlobalScope::get_cx(), GCReason::API);
-        }
     }
 
     /// 아무 문서도 쓰지 못한 틱 시각을 `pending_frame_time` 으로 되돌려 놓는다.
@@ -1374,9 +1176,13 @@ impl ScriptThread {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>
+    ///
+    /// Attempt to update the rendering and then do a microtask checkpoint if rendering was
+    /// actually updated.
+    ///
+    /// Returns true if any reflows produced a new display list.
     pub(crate) fn update_the_rendering(&self, cx: &mut js::context::JSContext) -> bool {
-        self.maybe_force_gc();
-        self.maybe_report_live_webgl_contexts();
         self.last_render_opportunity_time.set(Some(Instant::now()));
         // ★소비하며 비운다.★ 한 번 쓴 프레임 시각을 다음 회차가 재사용하면 안 된다
         // -- 그때는 이미 지나간 프레임의 시각이다.
@@ -1393,9 +1199,6 @@ impl ScriptThread {
         let mut frame_time_consumed = false;
         self.cancel_scheduled_update_the_rendering();
         self.needs_rendering_update.store(false, Ordering::Relaxed);
-        if self.rendering_update_from_timer.swap(false, Ordering::Relaxed) {
-            note_rendering_update_reason("fallback-timer");
-        }
 
         if !self.can_continue_running_inner() {
             self.restore_pending_frame_time(frame_time);
@@ -1815,9 +1618,6 @@ impl ScriptThread {
             // https://html.spec.whatwg.org/multipage/#event-loop-processing-model step 6
             // TODO(#32003): A microtask checkpoint is only supposed to be performed after running a task.
             self.perform_a_microtask_checkpoint(cx);
-            // This checkpoint belongs to no task, so it must not be charged to the next
-            // one that happens to finish.
-            let _ = take_microtask_time();
         }
 
         for (_, doc) in self.documents.borrow().iter() {
@@ -2035,7 +1835,6 @@ impl ScriptThread {
             f()
         };
         let task_duration = start.elapsed();
-        Self::note_task_duration(category, task_duration);
         for (doc_id, doc) in self.documents.borrow().iter() {
             if let Some(pipeline_id) = pipeline_id
                 && pipeline_id == doc_id
@@ -2219,7 +2018,6 @@ impl ScriptThread {
                 *self.receivers.webgpu_receiver.borrow_mut() = port.route_preserving_errors();
             },
             ScriptThreadMessage::TickAllAnimations(_webviews, frame_time) => {
-                note_rendering_update_reason("renderer-tick");
                 // 최신이 이긴다. 한 번의 `update_the_rendering` 전에 틱이 여러 번
                 // 도착하면, 지금 만드는 디스플레이 리스트는 가장 최근 프레임을 위한
                 // 것이다. 밀린 프레임은 어차피 표출되지 않는다 -- 디스플레이가 하는 일과
