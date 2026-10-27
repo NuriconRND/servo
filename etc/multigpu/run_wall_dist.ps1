@@ -352,6 +352,28 @@ param(
     # 주의: 이걸 주면 paint 의 INFO 를 먹고 사는 분석 절(WALLSPLIT, DCOMPBIND, COMMITWORK,
     # FRAMEID 등)은 비어서 나온다. 그건 고장이 아니라 이 스위치의 대가다.
     [switch] $QuietLog,
+    # 엔진 stderr 를 `Start-Process -RedirectStandardError` 로 돌리던 옛 경로로 되돌린다.
+    #
+    # ***그 경로는 측정을 망가뜨린다.*** -RedirectStandardError 는 자식의 stderr 를 파이프로
+    # 묶고 PowerShell 이 퍼낸다. 2026-10-27 에 같은 장비에서 120,000 줄 × 299 B 를 직접 재 봤다
+    # (레코드마다 write+flush, env_logger 와 같은 모양, 3 회 반복):
+    #
+    #   Start-Process -RedirectStandardError <파일>   쓰기당 127.4 us   최악 1 회 25.4 ms
+    #   cmd  2> "<파일>"  (상속 핸들)                  쓰기당   7.1 us   최악 1 회  0.9 ms
+    #   Start-Process -RedirectStandardError NUL        쓰기당   1.0 us   최악 1 회  0.05 ms
+    #
+    # 18 배다. 그리고 최악 1 회 25.4 ms 는 프레임 주기 16.67 ms 보다 길다. env_logger 는
+    # 레코드마다 전역 stderr 락 + write_all + flush 를 하므로 그 비용을 로그를 호출한 스레드가
+    # 그대로 문다. 기본 RUST_LOG 의 벽 런은 1,928 줄/s 를 쓰니 옛 경로에서는
+    # ***초당 245 ms*** -- 벽시계의 1/4 -- 을 로그 안에서 멈춰 있었다.
+    #
+    # 그래서 로그를 켜면 judder 가 줄고 끄면 심해졌다(log_fullthrottle_arch/08: 블로킹
+    # A 245 / B 14.5 / C 1.9 ms/s, 육안 judder A < B < C). 계측이 브레이크였다. 이제
+    # NUMA 핀 여부와 무관하게 cmd 래퍼를 쓴다 -- 같은 로그를 남기면서 블로킹이 1/18 이다.
+    # -QuietLog 와 함께 쓰면 0.8 ms/s 로, -NoLog(1.9 ms/s)보다도 낮으면서 판정 카운터는 남는다.
+    #
+    # 이 스위치는 옛 경로와 비교해야 할 때만 쓴다. 평소에 쓸 이유가 없다.
+    [switch] $LegacyLogRedirect,
     # SERVO_D3D11_PROFILE=1: per-pipeline stage timings, one heartbeat line per second per
     # video plus any frame over the threshold. The copy= field is the CPU memcpy of the
     # decoded planes into GPU-mapped memory -- the thing to look at when decode is cheap
@@ -1099,11 +1121,18 @@ if ($NumaNode -eq "auto") {
     throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
 }
 
-if ($numaResolved -ge 0) {
+# ***래퍼가 기본이다 -- NUMA 핀이 없어도.*** 핀 때문이 아니라 ***stderr 때문***이다:
+# cmd 의 `2>` 는 자식에게 파일 핸들을 그대로 물려주는데, Start-Process -RedirectStandardError
+# 는 파이프를 끼우고 PowerShell 이 퍼낸다. 쓰기당 7.1 us 대 127.4 us, 최악 0.9 ms 대 25.4 ms.
+# 자세한 수치와 그것이 무엇을 망쳤는지는 위 -LegacyLogRedirect 주석에 있다.
+if ($numaResolved -ge 0 -or -not $LegacyLogRedirect) {
     # Quote EVERY argument: the page URL carries `?rows=5&cols=9`, and a bare `&` inside a
     # .cmd is a command separator, so an unquoted URL silently truncates the run.
     $argStr = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
     $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $numaResolved)
+    # 핀이 없으면 /NODE 를 아예 빼고, 있으면 그 자리에 둔다. 공백 하나까지 중요하다 --
+    # `start "" /B` 와 `start "" /NODE 1 /B` 가 같은 줄에서 나와야 한다.
+    $nodeArg = if ($numaResolved -ge 0) { "/NODE $numaResolved " } else { "" }
     # ***`start /NODE` has to be the thing that launches winit_wall itself.*** The first cut of
     # this put /NODE on the wrapper cmd.exe and let THAT spawn the exe -- a child inherits no
     # node preference, so the flag did nothing and the run landed wherever Windows felt like.
@@ -1116,9 +1145,13 @@ if ($numaResolved -ge 0) {
     @"
 @echo off
 cd /d "$here"
-start "" /NODE $numaResolved /B /WAIT "$exe" $argStr 2> "$LogPath"
+start "" $nodeArg/B /WAIT "$exe" $argStr 2> "$LogPath"
 "@ | Set-Content -Encoding ascii $cmdFile
-    Write-Host "  launching on NUMA node $numaResolved (via cmd start /NODE)"
+    if ($numaResolved -ge 0) {
+        Write-Host "  launching on NUMA node $numaResolved (via cmd start /NODE)"
+    } else {
+        Write-Host "  launching via cmd (stderr = inherited handle; 18x cheaper per write than -LegacyLogRedirect)"
+    }
     # Just run the wrapper. ***The /NODE lives INSIDE it***, on the line that launches
     # winit_wall itself -- an earlier cut put /NODE on this outer cmd and let it spawn the
     # exe as a child, which inherits no node preference, so the flag did nothing at all
@@ -1133,7 +1166,7 @@ start "" /NODE $numaResolved /B /WAIT "$exe" $argStr 2> "$LogPath"
         Start-Sleep -Milliseconds 100
         $proc = Get-Process winit_wall -ErrorAction SilentlyContinue | Select-Object -First 1
     }
-    if ($null -eq $proc) { throw "winit_wall did not start within 10s under 'start /NODE $numaResolved'" }
+    if ($null -eq $proc) { throw "winit_wall did not start within 10s under the cmd wrapper ($cmdFile)" }
 } else {
     $proc = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $here `
         -RedirectStandardError $LogPath -PassThru
@@ -1260,7 +1293,7 @@ if ($httpServer -and -not $httpServer.HasExited) {
 }
 
 
-if ($numaResolved -ge 0 -and $cmdFile -and (Test-Path $cmdFile)) {
+if ($cmdFile -and (Test-Path $cmdFile)) {
     Remove-Item $cmdFile -Force -ErrorAction SilentlyContinue
 }
 
