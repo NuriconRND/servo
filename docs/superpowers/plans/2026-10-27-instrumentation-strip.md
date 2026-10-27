@@ -1112,3 +1112,65 @@ Cargo.lock 이 바뀌므로 약 11 분 풀빌드가 따른다. ★`Cargo.lock` �
 - 빌드 전 `target` 용량 확인(메모리 `check-target-size-every-build`).
 - 기준선: `servo-paint --lib` 130/130, `config_surface` 19/20(미등록 env 5 개).
   ★Step 14 뒤 `config_surface` 는 20/20 이어야 한다 — 독립 성공 신호다.★
+
+---
+
+## 8. ★재검증 정정 (2026-10-27, Steps 8~11)★ — 실행 전 반드시 읽을 것
+
+Steps 1~5 에서 계획서 집계 오류가 **다섯 단계 연속** 나왔다
+(`[dcomp-dbg]` 17/16, `dwm_timing` 소비자 2/3, 테스트 17/15, `raw_commit` 호출처 4/3,
+게이트 111/113). 그래서 Step 5 실행과 병렬로 Steps 8~11 을 읽기 전용으로 재검증했다.
+결과: **계획서 오류 28 건, 하중 함정 12 건, 누락 계측 14 건.**
+
+전문:
+`docs/superpowers/plans/notes/strip-inventory/revalidate-steps-8-9.md`,
+`.../revalidate-steps-10-11.md`.
+
+### 8.1 ★조용한 회귀를 낳는 것 — 컴파일러가 안 잡는다★
+
+| 위치 | 문제 |
+|---|---|
+| `winit_wall/main.rs:1727` | **이 제거 전체에서 가장 위험한 한 줄.** `dispatched[index] = true;` 가 계측 `skipped += 1;`(1726)과 하중 `continue;`(1728) **사이에** 끼어 있다. 떨구면 barrier 가 건너뛴 타일을 두 번째 루프가 전부 다시 칠한다. 픽셀과 타이밍 회귀인데 컴파일 에러가 없다. |
+| `layout/display_list/mod.rs:560` | 계획서는 "553-560 삭제, `return false;` 는 유지" 라고 적었는데 **560 이 바로 그 `return false;`** 다. 그대로 지우면 건너뛰어야 할 stacking context 가 생성 경로로 떨어진다. 올바른 범위 553-559. |
+| `d3d11_ring.rs` 락 헬퍼 | 계획서의 `lock_registry` 는 **존재하지 않는다.** 셋째는 `fn lock<T>`(:504, 호출 540·545, CONSUMER_DEVICE). 이걸 놓치면 `.unwrap()` 로 바꾸기 쉬운데, 그러면 패닉 스레드 하나가 CONSUMER_DEVICE 를 오염시켜 **모든 타일의 비디오가 영구 정지**한다. 독 복구는 `lock_tracked`(:446)에 있고, 교체 대상은 **28 곳**(lock_at 23 + lock 2 + lock_removed 3). |
+| `winit_wall/main.rs:893` | `last_pacing_tick_at` 래치를 **어느 테스트도 덮지 않는다.** 계획서가 가드라고 지명한 `backstop_only_when_pacing_was_installed_but_is_not_running` 은 `needs_pacing_backstop(bool, bool)` 자유 함수만 부른다. 추출을 망쳐도 게이트는 전부 초록이고 `pacing_is_driving()` 만 영구히 false 가 된다. |
+| `stacking_context.rs:675` | 675 는 `});` — `let animated_transform = ...` 바인딩의 닫는 토큰이다(그 값은 701 에서 읽는다). 올바른 범위 676-693. |
+| `animations.rs:196-211, 280-296` | ANIMUNBIND·ANIMDROP 는 각각 `if !set.animations.is_empty() { ... }` 안의 **유일한 문장**이다. "warn 만 삭제" 하면 빈 if 가 남는다. 래퍼를 같이 지우고 그 아래 `set.cancel_all_animations();` 를 남길 것. |
+
+### 8.2 빌드가 깨지는 것 — 시끄럽지만 단계가 멈춘다
+
+- `note_rendering_update_reason` 호출처는 **9 개가 아니라 11 개** — `script_thread.rs:1397`(fallback-timer)과 `:2222`(renderer-tick)가 계획서에 없다.
+- `rendering_update_from_timer` 는 3 사이트가 아니라 **5** — `:1212` 와 `:1215` 누락.
+- `script_thread.rs` 의 "stranded imports 넷" 은 **다섯 줄이고 셋은 전체 삭제가 아니라 트림** — `:139`·`:147`·`:156` 에서 `GlobalScope`·`Window`·`Microtask`/`MicrotaskQueue` 는 살아야 한다.
+- `servo.rs:308` 의 `embedder_messages += 1;` 이 SPINSLOW 심볼 목록에 없다.
+- `paint.rs:371` 의 `TileRenderTiming`(`PaintTargetsInFlight::join()` 반환형)이 Step 8 범위 밖이다.
+- `main.rs:2277` 은 `\` 문자열 연속으로 2278 까지 이어진다. 2278 만 지우면 문자열이 닫히지 않는다.
+- `d3d11_ring.rs` 인벤토리 게터 범위는 65-85 가 아니라 **59-92**(94 는 `SLOT_COUNT`). 85 에서 자르면 `ring_inventory` 가 반토막 난다.
+- `render-d3d11/lib.rs` 의 `profile_id` 를 읽는 로그가 한 줄이 아니라 **넷**(142, 200-203, 348-352, 391-394). 뒤 셋은 진짜 실패 보고라 지우면 안 된다.
+- `player.rs:3055-3058` 의 MEDIATEARDOWN warn 은 `started`(3047)·`id`·`stream_type`(3044)의 **유일한 독자**다.
+- `microtask.rs:11` 의 `use std::time::{Duration, Instant};` 가 고아가 된다(계획서 미기재).
+- `player.rs:7` 은 `AtomicU64` 만 떼내는 **트림**(AtomicBool·Ordering 생존), `render-d3d11/lib.rs:25` 는 줄 전체 삭제.
+- `debug_env.rs` 의 선언 순서와 `ALL` 순서가 한 군데 어긋난다(`:275` 가 cache_index 24 인데 17 과 18 사이에 선언). 파일 순서로 renumber 하면 `const _: ()`(:398-405)가 터진다.
+
+### 8.3 게이트 기대값 정정
+
+- **Step 9** — 계획서가 "남는 clock 테스트 다섯" 이라 했으나, `main.rs mod tests` 에는 `#[test]` 가 **아홉** 있다(인벤토리가 섬 다섯은 **줄 범위** 수였고 그중 하나에 테스트가 셋 들어 있다). example 타겟 전체: **20 -> 18**.
+- `config_surface.rs` 의 상수 결합은 셋이 아니라 **둘**(`DCOMP_READBACK` :288, `LOG_PRESENT_CADENCE` :289). `:276`·`:277` 은 raw-string 픽스처 안이라 상수 참조가 아니다. 항목 범위도 271-295 가 아닌 **270-294**.
+
+### 8.4 올바른 심볼 경계 (인벤토리 범위가 틀린 곳)
+
+`note_tick_site` 889-901(래치 892-895, 계측 896-900; **903 은 살려야 하는 `pacing_is_driving` 의 doc 머리**) /
+`note_present` 775-799(801-802 는 `maybe_capture` 의 doc) /
+`charge_main` 841-866(839 는 `maybe_capture` 의 닫는 괄호) /
+`PassSplit` 572-585 / `AppState::main_busy` doc 은 376 부터 /
+`note_redraw_suppressed` 930-934 /
+`AppState::pass_stats` 는 **297-303** 만(295-296 은 KEEP 인 `capture_path`/`capture_deadline` 의 설명).
+
+### 8.5 기타 정정
+
+- 계획서의 `MEDILOCKDEFER` 는 오타 — 실제 태그는 **`MEDIALOCKDEFER`**(914-917). 그대로 grep 하면 0 건이 나와 "이미 끝났다" 로 오독한다.
+- `ring_init_deferred` / `wrap_init_deferred` 는 **admission control 이 아니다** — 진짜 예산은 `ring_init_done`·`wrap_init_done` 를 `max_per_frame` 와 비교하는 :923·:952 다. (남겨도 무해하다.)
+- `LIVE_CONTEXTS` prune(`webglrenderingcontext.rs:257`)의 올바른 이사 위치는 `register_for_reporting`(640-642) — Vec 이 커지는 유일한 자리이고 이미 `borrow_mut()` 를 쇥고 있다.
+- `htmlmediaelement.rs` 의 고아 집합이 더 크다 — `image_key_for_log`, `frame_backend`(1109-1128 매치 + 두 함수의 파라미터 여섯 + 호출 인자).
+- `summarize_intervals` 의 남는 소비자는 `painter.rs` 가 아니라 **`frame_time.rs`** 다.
+- `configuration.md` 의 `SERVO_LOG_PRESENT_CADENCE` 참조는 둘(### 항목 249-252, 산문 :328).
