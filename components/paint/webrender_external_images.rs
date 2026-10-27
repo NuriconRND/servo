@@ -5,7 +5,6 @@
 use std::rc::Rc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use euclid::default::Size2D;
 use log::{debug, info, warn};
@@ -14,7 +13,6 @@ use paint_api::{ExternalImageSource, WebRenderExternalImageApi};
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::id::PainterId;
 use servo_canvas_traits::webgl::{WebGLContextId, WebGLSurfaceId, WebGLThreads};
-use servo_config::debug_env;
 use surfman::chains::{SwapChainAPI, SwapChains, SwapChainsAPI};
 use surfman::{Device, SurfaceTexture};
 use webgl::webgl_thread::WebGLContextBusyMap;
@@ -33,45 +31,6 @@ struct StagingTarget {
     size: Size2D<i32>,
 }
 
-/// `SERVO_WEBGL_FANOUT_PROF` 게이트. 프레임마다 물어보는 자리라 env 읽기를 캐시한다.
-static WEBGL_FANOUT_PROF: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::WEBGL_FANOUT_PROF)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
-/// WebGL 팬아웃의 **소비자 측** 비용(`SERVO_WEBGL_FANOUT_PROF`). 창은 1 초.
-///
-/// 재는 이유: WebGL 캔버스가 생기는 순간 타일 하나의 렌더가 0.23ms 에서 15ms 로 뛰는데
-/// (2026-09-01 실측, 캔버스 생성과 1 초 안에 상관), 그 시간이 전부 `renderer.render()`
-/// 안이고 `wr_update_ms=0.01`, `draw_calls=2`, `upload_mb=0.0` 이다. 그리는 일도 올리는
-/// 일도 아니라면 남는 것은 **기다리는 일**이고, 이 콜백이 그 유일한 후보다.
-///
-/// 두 갈래를 갈라야 한다:
-/// * `create_ns` 가 크다 = 서피스를 **기다린다**(크로스-디바이스 keyed mutex 획득).
-///   생산자와 소비자가 서로를 기다리는 모양이고, 캔버스가 13.2fps 인데 WebGL 스레드가
-///   95% 유휴인 것과 맞아떨어진다.
-/// * `no_front_buffer` 가 크다 = 기다리는 게 아니라 **받을 게 없다**. 그러면 원인은
-///   생산 쪽이지 이 경로가 아니다.
-#[derive(Default)]
-struct ExternalImageProfile {
-    window_start: Option<Instant>,
-    locks: u64,
-    lock_ns: u64,
-    /// `swap_chain.take_surface()` — 생산자가 내놓은 프런트 버퍼를 집어오는 시간.
-    take_ns: u64,
-    /// `create_texture()` — 공유 핸들 임포트와 keyed mutex 획득이 여기서 일어난다.
-    create_ns: u64,
-    /// 프런트 버퍼가 없어 그냥 돌아온 횟수(기다린 게 아니라 받을 게 없던 경우).
-    no_front_buffer: u64,
-    unlocks: u64,
-    unlock_ns: u64,
-    /// `destroy_texture()` — keyed mutex 해제와 서피스 반납.
-    destroy_ns: u64,
-    /// 스테이징 복사(`gfx_webgl_stage_to_painter_device`)에 쓴 시간과 횟수.
-    stage_ns: u64,
-    stages: u64,
-}
-
 /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
 pub struct WebGLExternalImages {
     painter_id: PainterId,
@@ -81,8 +40,6 @@ pub struct WebGLExternalImages {
     busy_webgl_context_map: WebGLContextBusyMap,
     locked_front_buffers: FxHashMap<WebGLSurfaceId, Vec<SurfaceTexture>>,
     logged_locked_surfaces: FxHashSet<WebGLSurfaceId>,
-    /// 소비자 측 비용 누적기. 꺼져 있으면 갱신되지 않는다.
-    profile: ExternalImageProfile,
     /// 서피스별 스테이징 대상(`gfx_webgl_stage_to_painter_device`).
     staging: FxHashMap<WebGLSurfaceId, StagingTarget>,
 }
@@ -108,7 +65,6 @@ impl WebGLExternalImages {
             busy_webgl_context_map,
             locked_front_buffers: FxHashMap::default(),
             logged_locked_surfaces: FxHashSet::default(),
-            profile: ExternalImageProfile::default(),
             staging: FxHashMap::default(),
         }
     }
@@ -131,25 +87,14 @@ impl WebGLExternalImages {
             let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
             return None;
         };
-        let take_start = WEBGL_FANOUT_PROF.then(Instant::now);
         let front_buffer = swap_chain.take_surface();
-        if let Some(start) = take_start {
-            self.profile.take_ns += start.elapsed().as_nanos() as u64;
-        }
         let Some(front_buffer) = front_buffer else {
-            if *WEBGL_FANOUT_PROF {
-                self.profile.no_front_buffer += 1;
-            }
             warn!("WebGL external image lock failed: no front buffer for {surface_id:?}");
             self.mark_surface_not_busy(surface_id);
             let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
             return None;
         };
-        let create_start = WEBGL_FANOUT_PROF.then(Instant::now);
         let created = self.rendering_context.create_texture(front_buffer);
-        if let Some(start) = create_start {
-            self.profile.create_ns += start.elapsed().as_nanos() as u64;
-        }
         let (surface_texture, gl_texture, size) = match created {
             Ok(texture) => texture,
             Err(front_buffer) => {
@@ -183,12 +128,7 @@ impl WebGLExternalImages {
         locked_buffers.push(surface_texture);
         // 크로스-디바이스 텍스처 대신 painter 디바이스 사본을 넘긴다(진단용, 기본 off).
         let gl_texture = if *STAGE_TO_PAINTER_DEVICE {
-            let start = WEBGL_FANOUT_PROF.then(Instant::now);
             let staged = self.stage_to_painter_device(surface_id, gl_texture, size);
-            if let Some(start) = start {
-                self.profile.stage_ns += start.elapsed().as_nanos() as u64;
-                self.profile.stages += 1;
-            }
             staged.unwrap_or(gl_texture)
         } else {
             gl_texture
@@ -330,41 +270,6 @@ impl WebGLExternalImages {
         Some(target.texture)
     }
 
-    /// 계측 창(1 초)을 닫고 한 줄 찍는다(`SERVO_WEBGL_FANOUT_PROF`).
-    fn maybe_emit_profile(&mut self) {
-        if !*WEBGL_FANOUT_PROF {
-            return;
-        }
-        let now = Instant::now();
-        let window = now - *self.profile.window_start.get_or_insert(now);
-        if window < Duration::from_secs(1) {
-            return;
-        }
-        let ms = |ns: u64| ns as f64 / 1_000_000.0;
-        let profile = &self.profile;
-        warn!(
-            "WEBGLEXTIMG painter={:?} window_ms={:.0} locks={} lock_ms={:.1} \
-             take_ms={:.1} create_ms={:.1} no_front_buffer={} unlocks={} \
-             unlock_ms={:.1} destroy_ms={:.1} stage_ms={:.1} stages={}",
-            self.painter_id,
-            window.as_secs_f64() * 1000.0,
-            profile.locks,
-            ms(profile.lock_ns),
-            ms(profile.take_ns),
-            ms(profile.create_ns),
-            profile.no_front_buffer,
-            profile.unlocks,
-            ms(profile.unlock_ns),
-            ms(profile.destroy_ns),
-            ms(profile.stage_ns),
-            profile.stages,
-        );
-        self.profile = ExternalImageProfile {
-            window_start: Some(now),
-            ..Default::default()
-        };
-    }
-
     fn mark_surface_not_busy(&self, surface_id: WebGLSurfaceId) {
         let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
         let Some(count) = busy_webgl_context_map.get_mut(&surface_id) else {
@@ -404,11 +309,7 @@ impl WebGLExternalImages {
         // Only release the busy count once an actual locked buffer is being unlocked,
         // keeping lock/unlock balanced.
         self.mark_surface_not_busy(surface_id);
-        let destroy_start = WEBGL_FANOUT_PROF.then(Instant::now);
         let destroyed = self.rendering_context.destroy_texture(locked_front_buffer);
-        if let Some(start) = destroy_start {
-            self.profile.destroy_ns += start.elapsed().as_nanos() as u64;
-        }
         let locked_front_buffer = destroyed?;
 
         match self.swap_chains.get(surface_id) {
@@ -449,12 +350,7 @@ impl WebGLExternalImages {
 
 impl WebRenderExternalImageApi for WebGLExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
-        let start = WEBGL_FANOUT_PROF.then(Instant::now);
         let locked = self.lock_swap_chain(WebGLContextId(id));
-        if let Some(start) = start {
-            self.profile.locks += 1;
-            self.profile.lock_ns += start.elapsed().as_nanos() as u64;
-        }
         match locked {
             Some((texture_id, size)) => (ExternalImageSource::NativeTexture(texture_id), size),
             None => (ExternalImageSource::Invalid, Size2D::zero()),
@@ -462,12 +358,6 @@ impl WebRenderExternalImageApi for WebGLExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
-        let start = WEBGL_FANOUT_PROF.then(Instant::now);
         self.unlock_swap_chain(WebGLContextId(id));
-        if let Some(start) = start {
-            self.profile.unlocks += 1;
-            self.profile.unlock_ns += start.elapsed().as_nanos() as u64;
-        }
-        self.maybe_emit_profile();
     }
 }

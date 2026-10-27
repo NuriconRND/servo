@@ -190,21 +190,10 @@ impl AnimationRefreshDriverObserver {
         if !webview_renderer.animating() {
             // If no other WebView is animating we will officially stop animating once the
             // next frame has been painted.
-            if self.animating.get() {
-                // ★전이만 찍는다★ — 매 프레임이 아니다. 스톨 조사용(2026-09-02): `-DComp on`
-                // 에서 월이 얼어붙는데 컴포지터와 painter 는 멀쩡했고(48 passes/s, 렌더 12,114
-                // 회, external-image lock 균형), 멈춘 것은 콘텐츠 생산 쪽이었다. 여기서 관찰을
-                // 그만두면 rAF 가 안 돌고 캔버스가 영영 멈추므로, 그 순간이 로그에 있어야 한다.
-                warn!(
-                    "ANIMTICK stop-requested: {:?} reports not animating",
-                    webview_renderer.id
-                );
-            }
             return false;
         }
 
         let frame_time = crate::frame_time::frame_time_for_tick(
-            self.painter_id,
             CrossProcessInstant::now(),
             frame_time_max_age(),
         );
@@ -222,14 +211,6 @@ impl AnimationRefreshDriverObserver {
             return false;
         }
 
-        // ★양성 대조★: 실제 전이가 일어나는 자리는 여기다. 처음엔 `frame_started` 에 걸었는데,
-        // 이 함수가 먼저 `animating` 을 세워서 그쪽 가드가 영영 참이 되지 않았다 — 그래서
-        // 로그가 0 줄이었고, 그것이 "stop 이 안 났다" 인지 "로깅이 고장났다" 인지 구분되지
-        // 않았다. 음성 결과를 증명하려면 양성 대조가 먼저 보여야 한다.
-        warn!(
-            "ANIMTICK start: {:?} began animating; refresh driver now observing",
-            webview_renderer.id
-        );
         self.animating.set(true);
         true
     }
@@ -243,14 +224,6 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         // If nothing is animating any longer, update our state and exit early without requesting
         // any new frames.
         if animating_webviews.is_empty() {
-            if self.animating.get() {
-                // ★여기가 틱이 끊기는 자리다.★ `false` 를 돌려주면 `BaseRefreshDriver` 가 이
-                // 관찰자를 목록에서 빼고 다음 프레임을 관찰하지 않는다 — 누군가
-                // `notify_animation_state_changed` 로 다시 깨우지 않는 한 rAF 는 영영 안 돈다.
-                // 스톨 실행에서 이 줄이 찍혔는지가 "아무도 그리라고 시키지 않는 상태" 인지를
-                // 가른다(2026-09-02 조사).
-                warn!("ANIMTICK stop: no animating webviews; refresh driver stops observing");
-            }
             self.animating.set(false);
             return false;
         }
@@ -290,7 +263,6 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
 
         // Request new animation frames from all animating WebViews.
         let frame_time = crate::frame_time::frame_time_for_tick(
-            self.painter_id,
             CrossProcessInstant::now(),
             frame_time_max_age(),
         );

@@ -2091,7 +2091,6 @@ fn probe_loop() {
             emit_commitgap();
             emit_commitcycle();
             emit_bindopen();
-            crate::commit_guard::emit_lockwait();
             emit_frameid();
             emit_dcompstat();
         }

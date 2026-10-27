@@ -168,40 +168,9 @@ impl WebContentAnimator {
 #[derive(Default)]
 pub(crate) struct PipelineAnimations {
     caret: RefCell<Option<CaretAnimation>>,
-    /// 직전 디스플레이 리스트의 `built_at`(초). `TIMELINESTEP` 전용.
-    built_at_previous: Cell<Option<f64>>,
-    /// 이번 창에 모인 `built_at` 간격(ms).
-    built_at_gaps: RefCell<Vec<f64>>,
-    /// 창이 열린 시각.
-    built_at_window_start: Cell<Option<Instant>>,
-    /// `TRANSITCLAMP` 창이 열린 시각. `None` 이면 아직 한 번도 안 찍었다는 뜻이고,
-    /// 그때는 첫 건을 바로 찍는다.
-    transit_clamp_window_start: Cell<Option<Instant>>,
-    /// 이번 창에서 상한에 걸린 애니메이션 수.
-    transit_clamp_count: Cell<u32>,
-    /// 이번 창에서 본 가장 큰 transit(초, 자르기 전).
-    transit_clamp_max: Cell<f64>,
     /// What layout last told us to keep playing, and the clock it is played against.
     /// Replaced wholesale by every display list -- see [`PaintAnimation`].
     paint: RefCell<Vec<ActivePaintAnimation>>,
-    /// ★리베이스 순간의 점프(px). 창마다 모았다가 한 줄로 낸다.★
-    ///
-    /// [`PaintAnimation`] 의 문서가 이 순간을 이렇게 적는다 -- *"This is a
-    /// prediction, and script rebases it. … each new display list replaces the previous
-    /// prediction with the truth … origin and values disagreeing by `d` puts `d` straight
-    /// into the prediction's phase."* 그 `d` 가 바로 여기서 재는 값이다.
-    ///
-    /// 운영자 관측(log_ani_debug 32): divisor 를 15/30/60 으로 두면 저더 간격이
-    /// 0.25/0.5/1 초 -- ***`divisor / 60`, 정확히 스크립트 틱이고 곳 새 디스플레이
-    /// 리스트가 오는 순간이다.*** 모양은 객체가 잠시 앞으로 튀어나갔다 돌아온다.
-    ///
-    /// 샘플값 자체는 결백이다 -- 28 개 레인 전부 `dx max` 가 공칭값을 단 한 번도
-    /// 넘지 않았다(log_ani_debug 33). 그러면 튀는 것은 수열 안이 아니라 ***수열이
-    /// 갈리는 순간***뿐이다. 올 것과 있던 것을 같은 시각에 재서 뺀다.
-    rebase_jumps: RefCell<Vec<f64>>,
-    rebase_window_start: Cell<Option<Instant>>,
-    /// 점프가 한 프레임 이동량을 넘은 횟수. 눈에 보일 만한 것만 센다.
-    rebase_visible: Cell<u64>,
     /// The last value of every paint animation that has stopped playing, kept so that a
     /// later transaction does not erase it. See [`HeldPaintValues`].
     held: RefCell<HeldPaintValues>,
@@ -443,24 +412,6 @@ fn animation_zero(
     }
 }
 
-/// transit 이 [`MAX_DISPLAY_LIST_TRANSIT`] 를 넘었으면 ***자르기 전***의 값(초)을 준다.
-///
-/// ★상한이 죽은 안전망에서 살아 있는 코드 경로가 됐다.★ 예전 `built_at` 은 디스플레이
-/// 리스트를 만든 시각이라 transit 은 리플로 잔여 + 전송 + 씬 빌드, 실측 0.4~2.0ms 였고
-/// 250ms 는 닿을 일이 없었다. 지금 `built_at` 은 페이싱 틱 시각이므로 transit 은
-/// 틱 → 컨스텔레이션 → 스크립트 → 큐 → 리플로 → 전송 → 수신 전체 지연이고, 이 벽에서
-/// 흔히 5~30ms, 콘텐츠 전환 리플로 한 번이 14.5ms 다. 상한에 걸리면 원점이 넘친 만큼
-/// 늦게 놓이는데 지금까지 어디에도 로그가 없었다 -- 게다가 이걸 보여 줬을 `TIMELINESTEP`
-/// 은 이 브랜치가 은퇴시켰다(설계 문서 3.6). A/B 에서 "효과가 없다" 와 "잘려서 없어졌다"
-/// 를 가르려면 이 신호가 있어야 한다.
-fn transit_overflow_seconds(
-    built_at: CrossProcessInstant,
-    now: CrossProcessInstant,
-) -> Option<f64> {
-    let transit = (now - built_at).as_seconds_f64();
-    (transit > MAX_DISPLAY_LIST_TRANSIT.as_secs_f64()).then_some(transit)
-}
-
 impl PipelineAnimations {
     pub(crate) fn update(&self, caret_visible: bool) -> Option<PropertyValue<ColorF>> {
         let mut maybe_caret = self.caret.borrow_mut();
@@ -565,7 +516,6 @@ impl PipelineAnimations {
         !self.paint.borrow().is_empty()
     }
 
-    /// ★낡음(2026-09-08 기록, 2026-10-13 `2021b0a796f` 가 사이에 함수를 끼워 넣어 무효)★ — 설명 대상은 `install_paint_animations`(:660)다.
     /// Replace what this pipeline is playing with what the new display list says.
     ///
     /// ***Wholesale replacement is the correctness argument.*** Layout samples forward
@@ -573,109 +523,13 @@ impl PipelineAnimations {
     /// prediction is overwritten by the truth before it can drift. Only when script stops
     /// producing display lists does the prediction actually get used for long, and that is
     /// exactly when it is worth having.
-    /// ★레이아웃이 애니메이션을 샘플링한 시각의 간격을 모아 1 초마다 찍는다.★
-    ///
-    /// `SERVO_LOG_ANIM_STEP_SEQ=1` 일 때만 돈다 -- `ANIMSTEPSEQ` 와 같은 스위치, 같은 창,
-    /// 같은 포맷이라 두 줄을 나란히 읽으면 된다. ***`ANIMSTEPSEQ` 의 `dt_ms` 는 표출 격자가
-    /// 고른지를 재고, 이 줄은 값의 출처가 고른지를 잰다.*** 실측에서 전자는 고른데
-    /// (이탈의 95%에서 `dt` 정상) 화면은 떨었으므로, 남은 곳이 여기다.
-    ///
-    /// 첫 번째 애니메이션의 `built_at` 만 본다. ***모두 같다고 보장할 수는 없다*** --
-    /// 스태킹 컨텍스트 트리가 디스플레이 리스트 사이에 재사용되면 transform 애니메이션은
-    /// 옛 트리의 값을, opacity 는 새 값을 들고 올 수 있다. 보장되는 것은 "이 리스트가
-    /// 실어 온 어느 애니메이션의 샘플 시각"뿐이고, 어차피 폐기된 진단이라 그 정도면 된다.
-    ///
-    /// ★이 지표는 더 이상 검증에 쓸 수 없다.★ `built_at` 이 프레임 시각(= 페이싱 클럭)이
-    /// 된 뒤로는 그 간격이 정의상 고르게 나오므로, 구조적으로 성공을 보고한다. "값의
-    /// 출처가 떤다" 를 보이기 위한 진단이었고 그 역할은 끝났다. 판정은 `ANIMSTEP` 의
-    /// `dx spread` 로 한다.
-    fn note_timeline_step(&self, paint_animations: &[PaintAnimation], received_at: Instant) {
-        if !*crate::painter::LOG_ANIM_STEP_SEQ {
-            return;
-        }
-        let Some(first) = paint_animations.first() else {
-            return;
-        };
-        // `CrossProcessInstant` 는 뺄셈만 정의돼 있다. 고정 기준과의 차로 초를 만든다.
-        let current = (first.built_at - CrossProcessInstant::epoch()).as_seconds_f64();
-        if let Some(gap) = note_built_at_gap(self.built_at_previous.get(), current) {
-            self.built_at_gaps.borrow_mut().push(gap);
-        }
-        self.built_at_previous.set(Some(current));
-
-        let window_start = match self.built_at_window_start.get() {
-            Some(at) => at,
-            None => {
-                self.built_at_window_start.set(Some(received_at));
-                received_at
-            },
-        };
-        if received_at.duration_since(window_start) < std::time::Duration::from_secs(1) {
-            return;
-        }
-        self.built_at_window_start.set(Some(received_at));
-        let gaps: Vec<f64> = self.built_at_gaps.borrow_mut().drain(..).collect();
-        if gaps.len() < 2 {
-            return;
-        }
-        log::warn!(
-            "TIMELINESTEP n={} built_at_gap_ms=[{}]",
-            gaps.len(),
-            crate::painter::format_step_sequence(&gaps),
-        );
-    }
-
-    /// ★`MAX_DISPLAY_LIST_TRANSIT` 가 물렸음을 알린다.★ 이유는
-    /// [`transit_overflow_seconds`] 주석 참고.
-    ///
-    /// 디스플레이 리스트마다 한 줄이면 이미 수십 MB 인 로그를 덮어 버리므로
-    /// `note_timeline_step` 과 같은 1 초 창으로 묶는다. 다른 점은 둘: 걸린 적이 없으면
-    /// 아무 상태도 건드리지 않고 바로 돌아가고(설치 경로라 비싸면 안 된다), 첫 건은
-    /// 창을 기다리지 않고 바로 찍는다(한 번만 걸린 경우를 놓치지 않으려고).
-    fn note_transit_clamp(&self, received_at: Instant, clamped: u32, max_seconds: f64) {
-        if clamped > 0 {
-            self.transit_clamp_count
-                .set(self.transit_clamp_count.get() + clamped);
-            self.transit_clamp_max
-                .set(self.transit_clamp_max.get().max(max_seconds));
-        }
-        if self.transit_clamp_count.get() == 0 {
-            return;
-        }
-        let due = match self.transit_clamp_window_start.get() {
-            None => true,
-            Some(at) => received_at.duration_since(at) >= std::time::Duration::from_secs(1),
-        };
-        if !due {
-            return;
-        }
-        self.transit_clamp_window_start.set(Some(received_at));
-        let count = self.transit_clamp_count.replace(0);
-        let max_ms = self.transit_clamp_max.replace(0.0) * 1000.0;
-        // `warn!` 은 일부러다. 런처 기본 `RUST_LOG` 가 `warn` 부터 싣는다.
-        log::warn!(
-            "TRANSITCLAMP n={count} max_ms={max_ms:.1} limit_ms={:.0} -- 원점이 넘친 만큼 늦게 놓였다",
-            MAX_DISPLAY_LIST_TRANSIT.as_secs_f64() * 1000.0
-        );
-    }
-
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
         let now = CrossProcessInstant::now();
-        // ★갈아끼우기 전에 옫 예측을 지금 시각으로 샘플해 둔다.★ 아래에서 새
-        // 진실을 같은 시각으로 샘플해 빼면 그 차가 화면에서 보일 점프다.
-        let before = self.sample_transforms_at(received_at);
-        self.note_timeline_step(&paint_animations, received_at);
         self.prune_held(&paint_animations);
-        let mut clamped = 0u32;
-        let mut max_transit = 0.0f64;
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
             .map(|animation| {
-                if let Some(transit) = transit_overflow_seconds(animation.built_at, now) {
-                    clamped += 1;
-                    max_transit = max_transit.max(transit);
-                }
                 let zero = animation_zero(
                     animation.built_at,
                     now,
@@ -689,67 +543,6 @@ impl PipelineAnimations {
                 }
             })
             .collect();
-        self.note_transit_clamp(received_at, clamped, max_transit);
-        let after = self.sample_transforms_at(received_at);
-        self.note_rebase_jump(received_at, &before, &after);
-    }
-
-    /// 현재 설치된 애니메이션을 한 시각에서 샘플해 (키, x) 로 돌려준다.
-    fn sample_transforms_at(&self, now: Instant) -> Vec<(u32, f32)> {
-        let mut floats = Vec::new();
-        let mut transforms = Vec::new();
-        for animation in self.paint.borrow().iter() {
-            animation.sample(now, &mut floats, &mut transforms);
-        }
-        transforms
-            .into_iter()
-            .map(|property| (property.key.id.uid, property.value.to_array()[12]))
-            .collect()
-    }
-
-    /// ★올 것과 있던 것의 차를 레인별로 뺀다.★ `rebase_jumps` 참고.
-    fn note_rebase_jump(&self, now: Instant, before: &[(u32, f32)], after: &[(u32, f32)]) {
-        {
-            let mut jumps = self.rebase_jumps.borrow_mut();
-            for (key, new_x) in after {
-                // 키가 양쪽에 다 있을 때만 의미가 있다. 새로 생긴 것은 갈리는 게 아니다.
-                if let Some((_, old_x)) = before.iter().find(|(k, _)| k == key) {
-                    jumps.push((new_x - old_x) as f64);
-                }
-            }
-        }
-        let start = match self.rebase_window_start.get() {
-            Some(start) => start,
-            None => {
-                self.rebase_window_start.set(Some(now));
-                now
-            },
-        };
-        if now.duration_since(start) < Duration::from_secs(1) {
-            return;
-        }
-        self.rebase_window_start.set(Some(now));
-        let mut jumps: Vec<f64> = self.rebase_jumps.borrow_mut().drain(..).collect();
-        if jumps.is_empty() {
-            return;
-        }
-        // 한 프레임 이동량을 모르므로 1px 를 눈에 보일 만한 것의 하한으로 둔다.
-        let visible = jumps.iter().filter(|value| value.abs() >= 1.0).count() as u64;
-        self.rebase_visible
-            .set(self.rebase_visible.get() + visible);
-        jumps.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let at = |p: f64| -> f64 { jumps[(((jumps.len() - 1) as f64) * p).round() as usize] };
-        let forward = jumps.iter().filter(|value| **value > 0.0).count();
-        log::warn!(
-            "PAINTANIMREBASE n={} jump_px p05={:.2} p50={:.2} p95={:.2} min={:.2} max={:.2} \
-             forward={forward} visible={visible}",
-            jumps.len(),
-            at(0.05),
-            at(0.50),
-            at(0.95),
-            at(0.00),
-            at(1.00),
-        );
     }
 
     pub(crate) fn handle_new_display_list(
@@ -801,57 +594,6 @@ impl CaretAnimation {
             key: self.caret_property_key,
             value,
         })
-    }
-}
-
-/// 직전 디스플레이 리스트의 `built_at` 과 이번 것의 간격(ms). 없거나 뒤로 가면 `None`.
-///
-/// ★`built_at` 은 레이아웃이 애니메이션을 샘플링한 시각이다★ -- `current_time_for_animations`
-/// 와 같은 리플로 안에서 정해진다. 표출 격자는 `ANIMSTEPSEQ` 의 `dt_ms` 로 이미 재고 있고
-/// 그쪽은 고르다. ***둘을 나란히 놓으면 "프레임은 제때 나오는데 값이 떤다" 를 값의 출처에서
-/// 직접 확인할 수 있다.***
-///
-/// 시계가 뒤로 간 표본은 버린다 -- `built_at` 은 레이아웃 스레드가 찍고 이 함수는 페인트
-/// 스레드에서 돈다. 순서가 뒤집힌 표본을 간격으로 세면 음수가 분포에 섞여, 정작 찾는
-/// "한 프레임 밀림" 을 가린다.
-fn note_built_at_gap(previous_seconds: Option<f64>, current_seconds: f64) -> Option<f64> {
-    let previous = previous_seconds?;
-    let gap = current_seconds - previous;
-    if gap < 0.0 {
-        return None;
-    }
-    Some((gap * 1000.0 * 10.0).round() / 10.0)
-}
-
-#[cfg(test)]
-mod timeline_step_tests {
-    use super::note_built_at_gap;
-
-    /// 첫 표본은 비교 대상이 없다 -- 간격이 아니라 기준점이다.
-    #[test]
-    fn first_sample_yields_no_gap() {
-        assert_eq!(note_built_at_gap(None, 1.000), None);
-    }
-
-    /// ★이것이 재려는 값이다.★ 레이아웃이 애니메이션을 샘플링한 시각의 간격. 표출은
-    /// 고른데 이것이 고르지 않다면, 화면이 떠는 이유는 프레임 타이밍이 아니라 값이다.
-    #[test]
-    fn reports_gap_in_milliseconds() {
-        assert_eq!(note_built_at_gap(Some(1.000), 1.0167), Some(16.7));
-    }
-
-    /// ★시계가 뒤로 가면 버린다.★ `built_at` 은 레이아웃 스레드가 찍고 여기는 페인트
-    /// 스레드다. 순서가 뒤집힌 표본을 간격으로 세면 음수가 분포에 섞여, 정작 찾는
-    /// "한 프레임 밀림" 을 가린다.
-    #[test]
-    fn drops_samples_that_go_backwards() {
-        assert_eq!(note_built_at_gap(Some(2.000), 1.990), None);
-    }
-
-    /// 같은 시각이면 간격 0 이다 -- 한 리플로에서 두 번 설치된 경우이고, 그것도 정보다.
-    #[test]
-    fn zero_gap_is_a_real_sample() {
-        assert_eq!(note_built_at_gap(Some(1.000), 1.000), Some(0.0));
     }
 }
 
@@ -1047,35 +789,6 @@ mod tests {
             (behind.as_secs_f64() - 0.5).abs() < 1e-4,
             "0.5초 과거여야 한다: {behind:?}"
         );
-    }
-
-    /// ★상한에 걸렸는지를 말없이 넘기지 않는다.★ `built_at` 이 페이싱 틱 시각이 된 뒤로
-    /// transit 은 틱에서 수신까지의 전체 지연이라 상한이 실제로 물릴 수 있는 값이 됐다.
-    /// 물리면 원점이 그만큼 늦게 놓이는데, 그걸 보여 줬을 `TIMELINESTEP` 은 은퇴했다.
-    /// 그래서 이 함수가 그 사실을 `install_paint_animations` 에 알리고 `TRANSITCLAMP` 이
-    /// 찍힌다 -- A/B 에서 "효과가 없다" 와 "잘려서 없어졌다" 를 가르는 신호다.
-    #[test]
-    fn transit_overflow_is_reported_only_past_the_limit() {
-        let built = CrossProcessInstant::epoch() + time::Duration::seconds_f64(100.0);
-        // 벽에서 흔한 범위(5~30ms)는 상한 안이라 조용해야 한다.
-        for within_ms in [0.4, 2.0, 14.5, 30.0] {
-            let now = built + time::Duration::seconds_f64(within_ms / 1000.0);
-            assert_eq!(
-                transit_overflow_seconds(built, now),
-                None,
-                "{within_ms}ms 는 상한 안이다"
-            );
-        }
-        // 상한을 넘으면 ***자르기 전***의 값이 나와야 한다. 넘친 양이 곧 위상 오차다.
-        let now = built + time::Duration::seconds(10);
-        let overflow = transit_overflow_seconds(built, now).expect("상한을 넘었으면 알려야 한다");
-        assert!(
-            (overflow - 10.0).abs() < 1e-6,
-            "자르기 전 값이어야 한다: {overflow}"
-        );
-        // `built_at` 이 미래로 읽히는 경우(두 시계의 읽기 시점이 달라 생긴다)는 잘림이 아니다.
-        let future = now + time::Duration::milliseconds(2);
-        assert_eq!(transit_overflow_seconds(future, now), None);
     }
 
     /// ★전송 시간이 터무니없으면 자른다.★ 콘텐츠 전환이나 스톨 뒤에 몇 초짜리 transit 이

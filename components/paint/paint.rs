@@ -70,71 +70,6 @@ const WALL_FRAME_BARRIER_RETENTION: Duration = Duration::from_secs(2);
 // (gfx_wall_frame_pacing_enabled/_max_pending/_min_interval_ms, WallFramePacingConfig::from_prefs).
 const WALL_FRAME_PACING_INFO_INTERVAL: u64 = 120;
 
-// -------------------------------------------------------------------------------------
-// PAINTERLOCK -- `with_painter_mut` 가 painter 스레드의 큐에서 기다린 시간.
-//
-// ★왜 재는가.★ 표출 틱이 단일 프레임 생산자가 되면 틱은 각 painter 에 이 호출로 닿는다.
-// 타일 스레드가 렌더 중이면 호출은 그 뒤에 서므로, 얼마나 서는지 모르면 틱 자신의 클럭이
-// 흔들릴 수 있다 -- 설계 6 절에서 확인되지 않은 유일한 항목이었다. 결과는 틱이 painter 에
-// 닿는 ***방식***(블로킹 호출 / 비블로킹 포스트)만 정한다. 생산자의 수는 정하지 않는다.
-//
-// ★재는 구간은 호출 순간부터 콜백이 painter 스레드에서 시작하는 순간까지다.★ 콜백 자신의
-// 실행 시간은 뺀다 -- 그것은 큐 대기가 아니라 일의 크기다. 스레드 없는 painter 는 기다릴
-// 것이 없어 재지 않는다.
-//
-// ★`max` 하나로는 "3ms 한 번" 과 "3ms 를 60 번" 이 구분되지 않고 그 둘은 결론이 정반대다★
-// (`DCOMP_SLOW_COMMIT_MS` 의 doc 이 같은 말을 한다). 그래서 `over_1ms` 를 같이 센다.
-// -------------------------------------------------------------------------------------
-
-/// `SERVO_WALL_PAINTER_LOCK_PROF` 게이트. 호출마다 묻는 자리라 env 읽기를 캐시한다.
-static PAINTER_LOCK_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    servo_config::debug_env::string(&servo_config::debug_env::WALL_PAINTER_LOCK_PROF)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
-/// painter 하나의 한 창.
-struct PainterLockWindow {
-    start: Instant,
-    wait_ms: Vec<f64>,
-}
-
-/// painter 별 창. 콜백은 painter 스레드들에서 불리고 전역을 같이 쓰므로 뮤텍스다 -- 초당
-/// 수백 번이라 경합이 문제되지 않는다. 게이트가 꺼져 있으면 아예 잠그지 않는다.
-static PAINTER_LOCK_WINDOWS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<PainterId, PainterLockWindow>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-fn record_painter_lock_wait(painter_id: PainterId, waited: Duration) {
-    let Ok(mut windows) = PAINTER_LOCK_WINDOWS.lock() else {
-        return;
-    };
-    let now = Instant::now();
-    let window = windows.entry(painter_id).or_insert_with(|| PainterLockWindow {
-        start: now,
-        wait_ms: Vec::new(),
-    });
-    window.wait_ms.push(waited.as_secs_f64() * 1000.0);
-    if now.duration_since(window.start) < Duration::from_secs(1) {
-        return;
-    }
-    window.start = now;
-    let mut wait_ms = std::mem::take(&mut window.wait_ms);
-    // 로그는 락 밖에서 찍는다 -- 다른 painter 의 콜백을 막지 않는다.
-    drop(windows);
-
-    let over_1ms = wait_ms.iter().filter(|wait| **wait >= 1.0).count();
-    let n = wait_ms.len();
-    let Some(wait) = servo_base::interval_summary::percentiles(&mut wait_ms) else {
-        return;
-    };
-    log::warn!(
-        "PAINTERLOCK painter={painter_id:?} n={n} wait_ms p50={:.2} p95={:.2} max={:.2}          over_1ms={over_1ms}",
-        wait.p50,
-        wait.p95,
-        wait.max,
-    );
-}
-
 /// An option to control what kind of WebRender debugging is enabled while Servo is running.
 #[derive(Copy, Clone)]
 pub enum WebRenderDebugOption {
@@ -1613,14 +1548,6 @@ impl Paint {
             .find(|host| host.painter_id == painter_id)?;
         match &host.kind {
             PainterHostKind::Inline(painter) => Some(callback(&mut painter.borrow_mut())),
-            PainterHostKind::Threaded(threaded) if *PAINTER_LOCK_PROF => {
-                // ★콜백이 시작하는 자리에서 잰다★ -- 돌아온 뒤에 재면 콜백 실행 시간이 섞인다.
-                let called_at = Instant::now();
-                threaded.run_blocking(move |painter| {
-                    record_painter_lock_wait(painter_id, called_at.elapsed());
-                    callback(painter)
-                })
-            },
             PainterHostKind::Threaded(threaded) => threaded.run_blocking(callback),
         }
     }
@@ -1678,17 +1605,6 @@ impl Paint {
             };
             slots.push(match &host.kind {
                 PainterHostKind::Inline(painter) => Slot::Inline(painter.clone(), callback),
-                PainterHostKind::Threaded(threaded) if *PAINTER_LOCK_PROF => {
-                    // `with_painter_mut` 와 같은 자리에서 잰다 -- 큐 대기만이고 콜백 실행은 뺀다.
-                    let called_at = Instant::now();
-                    match threaded.dispatch(move |painter| {
-                        record_painter_lock_wait(painter_id, called_at.elapsed());
-                        callback(painter)
-                    }) {
-                        Some(receiver) => Slot::Waiting(receiver),
-                        None => Slot::Missing,
-                    }
-                },
                 PainterHostKind::Threaded(threaded) => match threaded.dispatch(callback) {
                     Some(receiver) => Slot::Waiting(receiver),
                     None => Slot::Missing,

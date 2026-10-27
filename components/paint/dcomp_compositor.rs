@@ -1365,18 +1365,13 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
 /// 이 구조의 전부다. ★이미 그 디바이스의 가드를 쥐고 있다면 부르면 안 된다★ -- `device_guard`
 /// 는 재진입 불가라 자기 자신과 데드락한다. 그 경우는 `raw_commit` 을 직접 쓴다(`end_frame`).
 ///
-/// `CommitSite::Tick` 과 `GuardRole::Tick` 을 붙이는 것이 이 함수의 나머지 절반이다. 그 둘을
-/// 가르지 않으면 `COMMITSITE` 가 "커밋이 어디서 나갔나" 를 답할 수 없고 `LOCKWAIT` 의 두 통이
-/// 섞인다. 계측이 빠진 커밋 경로를 만들 수 없게 하는 것이 `CommitSite` 의 목적이고, 그 목적은
-/// ***정규 경로에 제 이름이 붙어 있을 때만*** 성립한다.
-///
 /// ★부기는 여기 없다.★ 돌려주는 `hr` 은 호출자가 가드를 푼 뒤 [`note_tick_commit`] 으로
 /// **순차** 처리한다 -- `note_dwm_phase` 는 전역 뮤텍스와 DWM 조회를 품고 실패 로그는 파일
 /// I/O 라, 네 워커에서 동시에 돌리면 "가드 안에서 하는 일은 `Commit()` 하나" 가 무너진다.
 ///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
 pub(crate) fn commit_at_tick_locked(device: usize) -> i32 {
-    let _guard = crate::commit_guard::device_guard(device, crate::commit_guard::GuardRole::Tick);
+    let _guard = crate::commit_guard::device_guard(device);
     // Safety: 포인터는 살아 있는 `IDCompositionDevice` 다(호출자 계약).
     unsafe { raw_commit(device as *mut IDCompositionDevice) }
 }
@@ -2181,10 +2176,7 @@ impl DCompNativeCompositor {
     /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
     fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice) {
         let hr = {
-            let _guard = crate::commit_guard::device_guard(
-                dcomp_device as usize,
-                crate::commit_guard::GuardRole::Painter,
-            );
+            let _guard = crate::commit_guard::device_guard(dcomp_device as usize);
             self.commit_device_locked(dcomp_device)
         };
         note_commit_failure(hr, dcomp_device as usize, "flush_deferred_commit");
@@ -2374,10 +2366,7 @@ impl DCompNativeCompositor {
             // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다. 실패 로그도 가드를 푼 뒤에
             // 찍는다(`note_commit_failure` 주석).
             let hr = {
-                let _commit_guard = crate::commit_guard::device_guard(
-                    dcomp_device as usize,
-                    crate::commit_guard::GuardRole::Painter,
-                );
+                let _commit_guard = crate::commit_guard::device_guard(dcomp_device as usize);
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
                 unsafe { raw_commit(dcomp_device) }
             };
@@ -3086,12 +3075,9 @@ impl Compositor for DCompNativeCompositor {
         // 붙이고(`AddVisual`), 마지막에 `commit_device` 한다 -- 셋 다 이 DComp 디바이스를
         // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
         #[cfg(windows)]
-        let commit_guard = self.dcomp_device_ptr().map(|device| {
-            crate::commit_guard::device_guard(
-                device as usize,
-                crate::commit_guard::GuardRole::Painter,
-            )
-        });
+        let commit_guard = self
+            .dcomp_device_ptr()
+            .map(|device| crate::commit_guard::device_guard(device as usize));
 
         let mode = storage_mode();
         let rc = self.rendering_context.clone();
