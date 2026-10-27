@@ -78,20 +78,10 @@ impl RawVideoFrameExternalImages {
         // this global map mutex stalls the renderer thread, which takes the same mutex in
         // `frame_for_plane` for every plane upload (one flushing video would freeze the
         // uploads of ALL videos for the duration of the flush).
-        let lock_start = std::time::Instant::now();
         let mut planes = raw_video_planes().lock().unwrap();
-        let lock_wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
         let old_plane = planes.insert(id.0, RawVideoPlane { frame, plane_index });
         drop(planes);
-        let drop_start = std::time::Instant::now();
         drop(old_plane);
-        let drop_ms = drop_start.elapsed().as_secs_f64() * 1000.0;
-        if lock_wait_ms > 10.0 || drop_ms > 10.0 {
-            warn!(
-                "Slow raw plane update: id={} lock_wait_ms={:.1} old_frame_drop_ms={:.1}",
-                id.0, lock_wait_ms, drop_ms,
-            );
-        }
     }
 
     pub fn remove_plane(id: ExternalImageId) {
@@ -104,15 +94,7 @@ impl RawVideoFrameExternalImages {
     }
 
     fn frame_for_plane(id: u64) -> Option<RawVideoPlane> {
-        let lock_start = std::time::Instant::now();
         let planes = raw_video_planes().lock().unwrap();
-        let lock_wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
-        if lock_wait_ms > 10.0 {
-            warn!(
-                "Slow raw plane read lock: id={} lock_wait_ms={:.1}",
-                id, lock_wait_ms
-            );
-        }
         planes.get(&id).cloned()
     }
 }
@@ -1165,13 +1147,9 @@ impl MediaExternalImages {
             return self.lock_d3d11(id, binding);
         }
 
-        // Diagnostic: this runs on the renderer thread once per plane per upload. Time the
-        // full body (map lookup + gst buffer map via get_yuv_data/get_plane_data) to catch
-        // stalls caused by gst-side locks (e.g. around a flushing loop-restart seek).
-        let lock_body_start = std::time::Instant::now();
         if let Some(raw_plane) = RawVideoFrameExternalImages::frame_for_plane(id) {
-            // Replacing a previously-locked plane drops its VideoFrame here on the renderer
-            // thread; time it together with the rest of the body.
+            // Replacing a previously-locked plane drops its VideoFrame here on the
+            // renderer thread.
             self.locked_raw_planes.insert(id, raw_plane);
             let raw_plane = self
                 .locked_raw_planes
@@ -1186,13 +1164,6 @@ impl MediaExternalImages {
             let Some(data) = raw_plane.frame.get_plane_data(raw_plane.plane_index) else {
                 return (ExternalImageSource::Invalid, Size2D::zero());
             };
-            let lock_body_ms = lock_body_start.elapsed().as_secs_f64() * 1000.0;
-            if lock_body_ms > 10.0 {
-                warn!(
-                    "Slow raw plane lock body: external_id={} plane_index={} ms={:.1}",
-                    id, raw_plane.plane_index, lock_body_ms,
-                );
-            }
             return (
                 ExternalImageSource::RawData(data),
                 Size2D::new(plane.width, plane.height),
