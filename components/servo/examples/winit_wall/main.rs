@@ -357,11 +357,6 @@ struct AppState {
     capture_deadline: Option<std::time::Instant>,
     /// `gfx_wall_rotate_tile_order` 용 패스 카운터 — 시작 타일을 한 칸씩 돌린다.
     pass_counter: Cell<u64>,
-    /// 틱이 낸 논리 프레임 번호 감시. `fire_present_tick` 의 디버그 어서션이 쓴다 --
-    /// `TickIssueAudit` 참고.
-    tick_issue_audit: RefCell<TickIssueAudit>,
-    /// 표출 클럭이 유일한 렌더 권한인지 재는 집계. [`ClockStats`] 참고.
-    clock_stats: RefCell<ClockStats>,
     /// 아직 소비되지 않은 깨우기가 큐에 있는가.
     ///
     /// 엔진은 할 말이 생길 때마다 `EventLoopWaker::wake` 를 부르고, 그것은 winit 큐에
@@ -376,117 +371,20 @@ struct AppState {
     should_exit: Cell<bool>,
 }
 
-/// 표출 클럭이 **유일한** 렌더 권한인지 판정하는 한 창(1초)의 집계.
+/// `drive_present_clock` 을 부른 자리.
 ///
-/// ★셸은 이미 올바르다.★ `request_redraw()` 를 부르는 곳은 클럭 틱과 `--capture`
-/// 둘뿐이고 `RedrawRequested` 는 `render_all_tiles()` 하나로 간다. 이 계수는 그것을
-/// 실기에서 확인하려고 붙였고, 확인됐다 -- log_ani_debug/26 의 103 창 전부에서
-/// `ticks=redraw=renders` 이고 간격은 p95 17.1ms(주기 16.7)에 `off=0%` 였다.
-///
-/// ★WRRATE 61~75 는 과잉 표출이 아니다.★ 이 계수를 붙인 이유가 그 숫자였는데,
-/// WRRATE 는 present 가 아니라 `render_impl` 진입을 센다. 다섯 진입점 중 넷이
-/// `Renderer::update()` 안에서 프레임버퍼에 `None` 을 넘기는 오프스크린 렌더다
-/// (텍스처 캐시 플러시 -- 그 자리 주석이 "this render will not be presented" 라고
-/// 적어 두었다). 실제로 표출되는 프레임은 타일당 60.0/s 로 클럭과 같다.
-/// 근거 수치는 설계 문서 2026-09-17-single-present-clock-design.md §2 판정 절에 있다.
-///
-/// 계수는 남긴다 -- 클럭이 유일한 렌더 권한이라는 것을 다음 회귀 때 다시 재는
-/// ★낡음(2026-09-17 기록, 같은 날 `785cbd01735` 이후 무효)★ — 지금 `ClockStats` 는 열한 필드다.
-/// 비용이 이 일곱 필드보다 크다.
-#[derive(Default)]
-struct ClockStats {
-    window_start: Option<std::time::Instant>,
-    /// `drive_present_clock()` 이 틱을 발화한 횟수.
-    ticks: u32,
-    /// `WindowEvent::RedrawRequested` 진입 횟수. `ticks` 보다 크면 셸 밖에서 온다.
-    redraw: u32,
-    /// `render_all_tiles()` 진입 횟수. `redraw` 하나가 렌더 하나여야 한다.
-    renders: u32,
-    /// 클럭이 허가하지 않아 억제한 횟수. 2단계 전에는 항상 0 이다.
-    suppressed: u32,
-    /// vsync 가 멎어 타이머 백스톱이 대신 민 횟수. ★vsync 로 묶었을 때 이 값이 0 이
-    /// 아니면 실제로 몰고 있는 것이 vsync 가 아니다.★ 자유 구동 경로에서는 늘 0 이다.
-    backstop: u32,
-    /// `render_all_tiles()` 진입 간격(ms).
-    ///
-    /// ***평균이 아니라 분포를 낸다.*** 끊김은 정의상 꼬리에만 있고, 균일한 57fps 와
-    /// "60,60,60,20,60" 은 평균이 같다. 이 표본이 성공 기준 1 그 자체다.
-    gaps_ms: Vec<f64>,
-    /// 틱이 격자점에서 얼마나 늦게 떨어졌나(ms). ★페이싱 스레드의 깨어남 정확도★만
-    /// 재는 값이다 -- 패스 길이는 여기 들어오지 않고 `TICKCOMMIT` 이 받는다. 둘을
-    /// 나눔어야 `commit_lead_ms` 의 산포가 어느 구간에서 왔는지 말할 수 있다.
-    tick_jitter_ms: Vec<f64>,
-    last_render_at: Option<std::time::Instant>,
-    /// `about_to_wait` 진입 횟수. ★루프가 큐를 다 비우고 잠들기 직전에만 도달한다★ --
-    /// 이 값이 작으면 큐가 비지 않는다는 뜻이고, 그러면 `WaitUntil` 타이머가 박자를 쥐고
-    /// 있지 않다.
-    about_to_wait: u32,
-    /// ★낡음(2026-09-28 기록, 같은 날 `b1eb8663b5d` 이후 무효)★ — `[about_to_wait, user_event, window_event, pacing_thread]` 넷이고, 0 번은 `1f3bb467e0a`(2026-09-29) 이후 늘 0 이다.
-    /// 틱을 **누가 알아챘나**. `[about_to_wait, user_event, window_event]`.
-    ///
-    /// ★이것이 "타이머가 박자를 쥐고 있나" 를 가리는 값이다.★ `about_to_wait` 이 대부분이면
-    /// `WaitUntil` 이 제때 깨워 준 것이고, 남은 지터는 타이머 정밀도·스케줄링이다. 반대로
-    /// `user_event`/`window_event` 가 대부분이면 타이머가 깨운 게 아니라 **엔진 wake 가
-    /// 지나가며 우연히 알아챈** 것이고, 그러면 박자가 엔진 활동에 얹혀 있다 -- `about_to_wait`
-    /// 이 굶는다는 이 셸의 알려진 실패(`drive_present_clock` 주석, 실측 정지 3.2 초)와 같은
-    /// 기전이다. 어느 쪽이냐로 다음 할 일이 갈린다.
-    tick_by_site: [u32; 4],
-}
-
-/// 틱이 낸 논리 프레임 번호 감시. ★`debug_assert!` 전용이다.★
-///
-/// ★이것이 증명하는 것:★ 틱마다 `on_wall_tick` 이 부른 `issue_wall_frame_request` 가 한 번이고
-/// 그것이 앞 틱의 번호보다 큰 새 번호를 받았다 -- 같은 틱 안에서 두 번 낸 호출이 있다면
-/// 둘째 번호가 첫째를 넘으므로 ★이 감시는 그것을 못 잡는다★(틱 하나당 한 번 기록할 뿐이다).
-/// 잡는 것은 번호의 되돌림·되풀이, 즉 틱 두 개가 같은 번호를 쓰거나 번호 발급이 틱 사이에서
-/// 후퇴하는 경우다.
-///
-/// ★증명하지 못하는 것:★ (1) 합성이 한 번이었다는 것 -- 돌려주는 값은 ***낸 것(issue)*** 을
-/// 세지, 합성을 세지 않는다(타일이 전부 `KeepPrevious` 여도 `Some`). (2) 틱 사이에 스크립트
-/// 경로가 번호를 쓰지 않았다는 것 -- 번호는 공유 카운터라 건너뛰는 것은 정상이다(그래서
-/// "연속" 이 아니라 "증가" 만 본다). (3) ★릴리스 빌드에서는 아예 돌지 않는다★(`debug_assert!` 가
-/// 인자째 사라진다). "생산 지점이 하나" 라는 판정은 Task 7 이후의 `FRAMEREASON`
-/// 로그가 한다.
-#[derive(Debug, Default)]
-struct TickIssueAudit {
-    last_issued: Option<u64>,
-}
-
-impl TickIssueAudit {
-    /// 이번 틱의 결과를 기록한다. `None`(낼 타일이 없었다)은 번호를 태우지 않았으므로 통과다.
-    fn record_tick(&mut self, issued: Option<u64>) -> Result<(), ()> {
-        let Some(frame) = issued else {
-            return Ok(());
-        };
-        if self.last_issued.is_some_and(|last| frame <= last) {
-            return Err(());
-        }
-        self.last_issued = Some(frame);
-        Ok(())
-    }
-}
-
-/// `drive_present_clock` 을 부른 자리. `ClockStats::tick_by_site` 의 첨자다.
+/// ★`PacingThread` 하나만 하중이다★ -- `note_pacing_tick` 이 그것으로 페이싱 래치를 세우고,
+/// 그 래치가 `pacing_is_driving()` → 엔진 wake 백스톱을 정한다. 나머지 셋은 호출자를
+/// 구분해 두는 자리일 뿐이다.
 #[derive(Clone, Copy)]
 enum ClockSite {
-    /// ★더는 구성되지 않는다★ -- `about_to_wait` 에서 박자를 내던 줄을 뺐다(그 함수의
-    /// 주석 참고). 자리는 남겨 둔다: 첨자를 당기면 `tick_by` 의 열이 밀려 예전 로그와
-    /// 나란히 읽을 수 없게 된다. 이제 이 칸은 항상 0 이고, 0 이 아니면 그 줄이 되살아난
-    /// 것이다.
-    #[allow(dead_code)]
-    AboutToWait = 0,
-    UserEvent = 1,
-    WindowEvent = 2,
-    /// 전용 페이싱 스레드가 올린 틱. ★이 값이 커지는 것이 목표다★ -- `UserEvent` 쪽이
-    /// 크면 박자가 여전히 엔진 활동에 얹혀 있다는 뜻이다.
-    PacingThread = 3,
+    /// `about_to_wait` 의 마지막 보루(`needs_pacing_backstop`)가 돌린 틱.
+    AboutToWait,
+    UserEvent,
+    WindowEvent,
+    /// 전용 페이싱 스레드가 올린 틱.
+    PacingThread,
 }
-
-/// 한 창에 담을 간격 표본의 상한.
-///
-/// 60Hz 에서 한 창은 60 개다. 스톨로 창이 길어져도 메모리가 늘지 않게 막는다 --
-/// 실측된 최악의 정지가 3.2 초이므로(`MAINBUSY window_ms=3239`) 여유를 크게 둔다.
-const MAX_CLOCK_GAP_SAMPLES: usize = 4096;
 
 impl AppState {
     /// If `--capture` is active and its deadline has passed, read the given (primary) tile's
@@ -529,39 +427,18 @@ impl AppState {
         }
     }
 
-    /// 클럭이 틱을 발화했다.
-    fn note_present_tick(&self) {
-        let mut stats = self.clock_stats.borrow_mut();
-        stats
-            .window_start
-            .get_or_insert_with(std::time::Instant::now);
-        stats.ticks += 1;
-    }
-
-    /// 틱이 격자점에서 얼마나 늦었나. 항상 ≥ 0 이다 -- 기한이 찼을 때만 불리므로.
+    /// ★페이싱 래치.★ 틱을 낸 사람이 페이싱 스레드면 그 시각을 남긴다 --
+    /// `pacing_is_driving()` 이 읽는 **유일한** 값이고, 그것이 엔진 wake 백스톱을 막는다.
+    /// 이 쓰기가 사라지면 `pacing_is_driving()` 이 영구히 false 가 되어 백스톱이 매 wake 마다
+    /// 열린다. ★컴파일 에러도, 테스트 실패도 나지 않는다.★
     ///
-    /// 긴 멈춤(디버거, 긴 렌더) 뒤에는 이 값이 크게 나온다. ★그대로 두고 중앙값으로
-    /// 읽는다★ -- 잘라 내면 바로 그 사건을 잃는다. p95 와 max 가 그것을 드러낸다.
-    fn note_tick_jitter(&self, jitter: std::time::Duration) {
-        self.clock_stats
-            .borrow_mut()
-            .tick_jitter_ms
-            .push(jitter.as_secs_f64() * 1000.0);
-    }
-
-    /// winit 이 `RedrawRequested` 를 전달했다.
-    fn note_tick_site(&self, site: ClockSite) {
-        // ★발화한 것만 센다.★ 이 함수는 `drive_present_clock_timer` 의 게이트를 통과한
-        // 뒤에만 불리므로, 여기 찍힌 시각은 "페이싱이 실제로 박자를 냈다" 는 뜻이다.
+    /// ★발화한 것만 센다.★ 이 함수는 `drive_present_clock_timer` 의 게이트를 통과한
+    /// 뒤에만 불리므로, 여기 찍힌 시각은 "페이싱이 실제로 박자를 냈다" 는 뜻이다.
+    fn note_pacing_tick(&self, site: ClockSite) {
         if matches!(site, ClockSite::PacingThread) {
             self.last_pacing_tick_at
                 .set(Some(std::time::Instant::now()));
         }
-        let mut stats = self.clock_stats.borrow_mut();
-        stats
-            .window_start
-            .get_or_insert_with(std::time::Instant::now);
-        stats.tick_by_site[site as usize] += 1;
     }
 
     /// 페이싱 스레드가 박자를 쥐고 있는가.
@@ -575,154 +452,13 @@ impl AppState {
             .is_some_and(|at| at.elapsed() < self.present_period * 4)
     }
 
-    fn note_about_to_wait(&self) {
-        let mut stats = self.clock_stats.borrow_mut();
-        stats
-            .window_start
-            .get_or_insert_with(std::time::Instant::now);
-        stats.about_to_wait += 1;
-    }
-
-    fn note_redraw_requested(&self) {
-        let mut stats = self.clock_stats.borrow_mut();
-        stats
-            .window_start
-            .get_or_insert_with(std::time::Instant::now);
-        stats.redraw += 1;
-    }
-
-    /// 클럭이 허가하지 않아 그리지 않았다. 2단계 전에는 불리지 않는다.
-    #[allow(dead_code, reason = "2단계 분기 1 에서만 쓴다")]
-    fn note_redraw_suppressed(&self) {
-        self.clock_stats.borrow_mut().suppressed += 1;
-    }
-
-    /// 한 패스를 그리기 시작했다. 직전 패스와의 간격을 함께 남긴다.
-    fn note_clock_render_pass(&self) {
-        let now = std::time::Instant::now();
-        let mut stats = self.clock_stats.borrow_mut();
-        stats.window_start.get_or_insert(now);
-        stats.renders += 1;
-        if let Some(last) = stats.last_render_at
-            && stats.gaps_ms.len() < MAX_CLOCK_GAP_SAMPLES
-        {
-            let gap = now.duration_since(last).as_secs_f64() * 1000.0;
-            stats.gaps_ms.push(gap);
-        }
-        stats.last_render_at = Some(now);
-    }
-
-    /// 창이 1 초를 넘으면 `WALLCLOCK` 한 줄을 내고 리셋한다.
-    ///
-    /// `last_render_at` 은 **리셋하지 않는다** -- 창 경계에서 간격 하나가 통째로
-    /// 사라지면 그 자리가 정확히 측정에서 빠진다.
-    fn report_clock_stats(&self) {
-        let mut stats = self.clock_stats.borrow_mut();
-        let Some(start) = stats.window_start else {
-            return;
-        };
-        let window_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if window_ms < 1000.0 {
-            return;
-        }
-
-        let period_ms = self.present_period.as_secs_f64() * 1000.0;
-        let mut sorted = stats.gaps_ms.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let pct = |p: f64| -> f64 {
-            if sorted.is_empty() {
-                return 0.0;
-            }
-            let index = ((sorted.len() as f64) * p) as usize;
-            sorted[index.min(sorted.len() - 1)]
-        };
-        // ±20% 밖. p50/p95 만 보면 "대체로 괜찮은데 가끔 튐" 을 놓친다.
-        // ★한 표시 간격에 렌더 패스가 몇 개 들어갔나.★ off(±20%) 만으로는 "건너뛴"
-        // 것과 "몰린" 것이 구분되지 않는다. 1x 애니메이션에서 하나를 건너뛰면 화면이
-        // 38.4px 이 아니라 76.8px 로 튀고, 둘이 몰리면 그중 하나는 영영 안 보인다.
-        // 눈에 보이는 튐의 크기를 이 세 칸이 직접 설명한다.
-        let inband = |low: f64, high: f64| -> usize {
-            stats
-                .gaps_ms
-                .iter()
-                .filter(|&&v| v >= low * period_ms && v < high * period_ms)
-                .count()
-        };
-        let dup = inband(0.0, 0.5);
-        let one = inband(0.5, 1.5);
-        let skip1 = inband(1.5, 2.5);
-        let skipn = stats
-            .gaps_ms
-            .iter()
-            .filter(|&&v| v >= 2.5 * period_ms)
-            .count();
-        let (low, high) = (period_ms * 0.8, period_ms * 1.2);
-        let off = stats
-            .gaps_ms
-            .iter()
-            .filter(|g| **g < low || **g > high)
-            .count();
-        // 틱 지터. ★비어 있으면 0 이 아니라 정보 없음이다★ -- 그렇게 찍히게 한다(n=0).
-        let mut jit = std::mem::take(&mut stats.tick_jitter_ms);
-        jit.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let jit_at = |p: f64| {
-            if jit.is_empty() {
-                f64::NAN
-            } else {
-                jit[(((jit.len() - 1) as f64) * p).round() as usize]
-            }
-        };
-        let off_pct = if stats.gaps_ms.is_empty() {
-            0.0
-        } else {
-            100.0 * off as f64 / stats.gaps_ms.len() as f64
-        };
-
-        log::info!(
-            "WALLCLOCK window_ms={:.0} ticks={} redraw={} renders={} suppressed={} backstop={} \
-             atw={} tick_by atw={} user={} win={} pace={} \
-             per_interval dup={} one={} skip1={} skipN={} \
-             period_ms={:.1} gap_ms p50={:.1} p95={:.1} max={:.1} off={}({:.0}%) n={}              jit_ms p50={:.3} p95={:.3} max={:.3} jn={}",
-            window_ms,
-            stats.ticks,
-            stats.redraw,
-            stats.renders,
-            stats.suppressed,
-            stats.backstop,
-            stats.about_to_wait,
-            stats.tick_by_site[0],
-            stats.tick_by_site[1],
-            stats.tick_by_site[2],
-            stats.tick_by_site[3],
-            dup,
-            one,
-            skip1,
-            skipn,
-            period_ms,
-            pct(0.50),
-            pct(0.95),
-            sorted.last().copied().unwrap_or(0.0),
-            off,
-            off_pct,
-            stats.gaps_ms.len(),
-            jit_at(0.50),
-            jit_at(0.95),
-            jit_at(1.00),
-            jit.len(),
-        );
-
-        let last_render_at = stats.last_render_at;
-        *stats = ClockStats::default();
-        stats.last_render_at = last_render_at;
-    }
-
     /// 표출 클럭. 한 틱마다 엔진이 지금 들고 있는 것을 그린다 -- 무엇이 바뀌었는지
     /// 따지지 않는 것이 핵심이다. 박자가 내용의 함수가 되면 그것은 균일하지도 않고,
     /// 내용 쪽 신호가 하나 빠졌을 때 스스로 회복하지도 못한다.
     ///
     /// ★`about_to_wait` 에만 두면 안 된다.★ winit 은 이벤트 큐가 **빌 때만** 거기에
     /// 도달한다. 전환 순간 엔진이 초당 수천 번 깨우면 큐가 비지 않고, 그러면 이 클럭이
-    /// 통째로 멈춘다 -- 실측된 최악은 3.2초다(`MAINBUSY window_ms=3239`). 그동안 벽은
+    /// 통째로 멈춘다 -- 2026-09-28 에 실측된 최악은 3.2 초다. 그동안 벽은
     /// 아무것도 새로 표출하지 않으므로, 화면은 애니메이션이 얼어붙은 것으로 보인다.
     /// 그래서 이벤트를 처리하는 쪽에서도 이 클럭을 돌린다.
     ///
@@ -801,8 +537,7 @@ impl AppState {
         {
             self.vsync_tick_pending.set(false);
             self.last_present_tick_at.set(now);
-            self.note_present_tick();
-            self.note_tick_site(site);
+            self.note_pacing_tick(site);
             self.fire_present_tick();
         }
 
@@ -820,7 +555,7 @@ impl AppState {
             self.vsync_stalled.set(true);
             log::warn!(
                 "wall: vsync 신호가 {:.0}ms 동안 없다 -- 타이머 페이싱으로 내려앉는다. \
-                 WALLCLOCK backstop 이 오르는 동안은 표출이 vsync 에 묶여 있지 않다.",
+                 복귀 로그가 뜨기 전까지 표출은 vsync 에 묶여 있지 않다.",
                 self.vsync_stall_after().as_secs_f64() * 1000.0
             );
             // 타이머를 지금부터 다시 센다 -- 밀린 틱을 몰아 내지 않기 위해서다.
@@ -903,10 +638,9 @@ fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
         // (`gfx_present_align_commit_pct`). 틱이 조금 일찍 잡히면 렌더가 그만큼 일찍
         // 시작할 뿐이고, 커밋 위상은 그대로다. 논증이 성립하지 않는다.
         //
-        // 그리고 실측에서 이 가드는 ★한 번도 걸리지 않았다★ -- 걸리면 그 틱 간격이 2 주기가
-        // 되어 `WALLCLOCK per_interval skip1` 에 잡히는데, log_ani_debug_03/12 의 두 실행
-        // 모두 `skip1=0` 이고 `ticks/s=60.0` 이었다. 그러니 이 제거는 동작을 바꾸지 않는다 --
-        // 죽은 근거를 치우는 것이다.
+        // 그리고 실측에서 이 가드는 ★한 번도 걸리지 않았다★ -- 걸렸다면 그 틱 간격이 2 주기로
+        // 벌어졌을 텐데, log_ani_debug_03/12 의 두 실행 모두 건너뛴 간격이 없었고 틱은 초당
+        // 60 이었다. 그러니 이 제거는 동작을 바꾸지 않는다 -- 죽은 근거를 치우는 것이다.
         let ahead = period - (((delta % period) + period) % period);
     let wait_s = ahead as f64 / freq as f64;
     anchor + std::time::Duration::from_secs_f64(wait_s)
@@ -914,11 +648,11 @@ fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
 
 /// ★박자를 이벤트 루프에서 뗀다.★
 ///
-/// 실측(log_ani_debug_02/20, output 페이지): 틱이 초당 60 이 아니라 56.0(최악 41)이고,
-/// `about_to_wait` 진입이 185 -> 132(최악 56)로 굶고, **틱의 37% 를 타이머가 아니라 엔진
-/// wake 가 알아챈다**(프로브에서는 2%). `WaitUntil` 이 깨워서 그리는 게 아니라 엔진이 마침
-/// 깨워서 지나가다 "틱이 지났네" 하고 그리는 것이다. `gap_ms p95` 가 17.23 -> 29.08 로
-/// 벌어지는 것이 그 결과다.
+/// 실측(log_ani_debug_02/20, output 페이지): 틱이 초당 60 이 아니라 56(최악 41)까지
+/// 떨어지고, `about_to_wait` 이 굶고, **틱의 37% 를 타이머가 아니라 엔진 wake 가
+/// 알아챘다**(프로브에서는 2%). `WaitUntil` 이 깨워서 그리는 게 아니라 엔진이 마침
+/// 깨워서 지나가다 "틱이 지났네" 하고 그리는 것이다. 렌더 간격이 그만큼 벌어지는 것이
+/// 그 결과다.
 ///
 /// 원인은 구조적이다: `about_to_wait` 은 winit 이 **이벤트 큐를 다 비운 뒤에만** 도달하는
 /// 자리인데, 표출 클럭의 `WaitUntil` 이 거기 걸려 있다. 애니메이션 다섯 개가 엔진을 계속
@@ -1195,10 +929,6 @@ impl AppState {
             // stall (a long render, a debugger break) `next` can be far in the past, and
             // stepping by one period would fire a burst of catch-up frames for moments that
             // have already gone by. Skipping them is what a display does.
-            // ★이 틱이 맞춰야 했던 격자점★ -- 덮어쓰기 전에 받아 둔다. 지금과의 차가
-            // 페이싱이 얼마나 제때 깨었는가다(`WALLCLOCK jit_ms`). 패스 길이에서 오는
-            // 흔들림(`TICKCOMMIT`)과 분리해야 커밋 위상의 산포를 귀속할 수 있다.
-            let fired_for = next;
             while next <= now {
                 next += self.present_period;
             }
@@ -1206,12 +936,7 @@ impl AppState {
             // 지점으로 옮긴다. 꺼져 있으면 그대로 돌려준다.
             next = self.snap_to_dwm_grid(next);
             self.next_present_tick.set(next);
-            if self.vsync_stalled.get() {
-                self.clock_stats.borrow_mut().backstop += 1;
-            }
-            self.note_present_tick();
-            self.note_tick_jitter(now.saturating_duration_since(fired_for));
-            self.note_tick_site(site);
+            self.note_pacing_tick(site);
             self.fire_present_tick();
         }
         next
@@ -1231,9 +956,6 @@ impl AppState {
     /// 메인 스레드 친화성이다(`render_all_tiles` 가 `Rc<RefCell<..>>` 인 임베더 핸들을
     /// 만지고, 타일 0 의 GL 컨텍스트가 메인에서 current 다). 여기서 바꾸는 것은 **누가 언제
     /// 부르나**뿐이고, 부르는 스레드는 그대로 메인이다.
-    ///
-    /// `redraw` 계수도 같이 올린다 -- `WALLCLOCK` 의 `ticks == redraw == renders` 검산이
-    /// 두 경로에서 같은 뜻을 유지해야 한다.
     fn fire_present_tick(&self) {
         // ★이 순간이 이 프레임의 시각이다.★ 여기서 재야 렌더 준비 비용이 섞이지 않는다 --
         // 섞이면 그만큼이 애니메이션 값의 지터가 된다(설계 문서 3). 엔진은 이 값을
@@ -1281,16 +1003,9 @@ impl AppState {
         // 걸린다). 그래서 예약 비트(`on_demand_wall_tick`)를 보지 않고 에지마다 부른다.
         let webview = self.webview.borrow().clone();
         if let Some(webview) = webview {
-            let issued = webview.on_wall_tick();
-            let mut audit = self.tick_issue_audit.borrow_mut();
-            debug_assert!(
-                audit.record_tick(issued).is_ok(),
-                "틱이 낸 논리 프레임 번호가 거꾸로 가거나 되풀이됐다: issued={issued:?} audit={:?}",
-                audit
-            );
+            let _ = webview.on_wall_tick();
         }
         if self.direct_render {
-            self.note_redraw_requested();
             self.render_all_tiles();
             return;
         }
@@ -1300,7 +1015,6 @@ impl AppState {
     }
 
     fn render_all_tiles(&self) {
-        self.note_clock_render_pass();
         let webview = self.webview.borrow();
         let Some(webview) = webview.as_ref() else {
             return;
@@ -1583,7 +1297,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 // ★낡음(2026-10-13 기록, 2026-10-16 `e96e9f71a06` 이후 줄 표류로 무효)★ — 실제 자리는 `painter.rs:1228`.
                 // `PaintTimerThread` 는 어차피 뜬다(`painter.rs:1088`). 거기 남는 일은
                 // caret 깜빡임뿐이다. 스레드 수를 세어 이 변경을 확인하려 하면 틀린 결론이
-                // 나온다 -- 확인은 `WALLCLOCK` 의 `user`/`pace` 로 한다.
+                // 나온다.
                 eprintln!(
                     "wall: 표출 틱이 프레임 클럭이다 -- Servo 의 PaintTimerThread 가 프레임을 끌지 않는다."
                 )
@@ -1721,7 +1435,6 @@ impl ApplicationHandler<WakerEvent> for App {
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
-            tick_issue_audit: RefCell::new(TickIssueAudit::default()),
             device_auth: Rc::default(),
             device_auth_scope: sdwall_device_auth::PageScope::from_start_url(&config.url),
             device_auth_selftest_next: Rc::default(),
@@ -1773,7 +1486,6 @@ impl ApplicationHandler<WakerEvent> for App {
             capture_path: config.capture.clone(),
             captured: Cell::new(false),
             pass_counter: Cell::new(0),
-            clock_stats: RefCell::new(ClockStats::default()),
             wake_pending: waker.pending.clone(),
             should_exit: Cell::new(false),
         });
@@ -1835,10 +1547,7 @@ impl ApplicationHandler<WakerEvent> for App {
         // ★박자를 이벤트 루프에서 떼는 경로.★ 타일과 webview 가 다 준비된 뒤에 띄운다 --
         // 더 일찍 띄우면 아직 `Running` 이 아닌 상태로 틱이 올라와 버려진다.
         if servo_config::pref!(gfx_wall_pacing_thread) {
-            eprintln!(
-                "wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다 \
-                 (WALLCLOCK 의 tick_by pace 가 대부분이어야 한다)."
-            );
+            eprintln!("wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다.");
             spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);
         }
 
@@ -1870,8 +1579,8 @@ impl ApplicationHandler<WakerEvent> for App {
                 state.on_device_auth_state(auth.clone());
                 return;
             }
-            // 페이싱 스레드가 올린 틱과 엔진 wake 를 구분해 센다 -- 어느 쪽이 박자를 쥐고
-            // 있는지가 `WALLCLOCK tick_by` 로 드러나야 한다.
+            // 페이싱 스레드가 올린 틱과 엔진 wake 를 구분한다 -- `note_pacing_tick` 이
+            // 페이싱 래치를 세울지 말지가 여기서 갈린다.
             let site = match event {
                 WakerEvent::Tick => ClockSite::PacingThread,
                 WakerEvent::Engine => ClockSite::UserEvent,
@@ -1900,12 +1609,12 @@ impl ApplicationHandler<WakerEvent> for App {
             // disjunct 가 같은 주기로 같이 돌면 ***두 시계가 맥놀이한다.***" 셸의 박자에만
             // 그 수정이 빠져 있었다.
             //
-            // 실측(log_ani_debug_04/07_temp, 08_temp): `WALLCLOCK` 의 `user/s` 가
+            // 실측(log_ani_debug_04/07_temp, 08_temp): 엔진 wake 가 끈 틱이 초당
             // 0.02 -> 1.76 -> 3.38 -> 4.18 -> 6.65 로 가는 동안 저더가 재발했고, 같은
-            // 방향으로 `jit_ms p50` 이 0.41 -> 0.47 로, 프레임당 이동 `dx_px` 의 창별
+            // 방향으로 틱 지터의 p50 이 0.41 -> 0.47ms 로, 프레임당 이동 `dx_px` 의 창별
             // max 가 38.4(기대값) 근처에서 41.6 까지 올랐다가 가끔 제자리로 돌아오는
-            // ***드리프트·리셋***을 보였다. 프레임을 놓친 흔적은 없다(`dup=0 skip1=0
-            // renders=60`) -- 늦은 프레임이 아니라 ***고르지 않은 간격***이다.
+            // ***드리프트·리셋***을 보였다. 프레임을 놓친 흔적은 없다(건너뛴 간격 0,
+            // 렌더 초당 60) -- 늦은 프레임이 아니라 ***고르지 않은 간격***이다.
             //
             // 페이싱이 이르게 깨느냐 늦게 깨느냐는 경계에 걸린 양자택일이라 환경 변화로
             // 뒤집힌다. 그래서 상관이 아니라 ***구조***로 막는다.
@@ -1946,8 +1655,6 @@ impl ApplicationHandler<WakerEvent> for App {
             event_loop.exit();
             return;
         }
-        state.note_about_to_wait();
-        state.report_clock_stats();
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
         // fires even on a static page that has otherwise gone idle.
         if state.capture_path.is_some() && !state.captured.get() {
@@ -1983,8 +1690,8 @@ impl ApplicationHandler<WakerEvent> for App {
         // 사람이 하나도 없어 화면이 멈춘다.
         //
         // `Poll` 이라 이 함수는 계속 불리므로 폴백으로 충분하다. 페이싱이 정상이면
-        // `pacing_is_driving()` 이 참이라 끼어들지 않는다 -- ★`WALLCLOCK` 의 `tick_by atw`
-        // 가 0 이 아니면 이 보루가 돌고 있다는 뜻★이고, 그 칸은 그것 말고는 0 이다.
+        // `pacing_is_driving()` 이 참이라 끼어들지 않는다 -- ★그 판정이 읽는 래치를 세우는
+        // 것은 `note_pacing_tick` 하나뿐이다★(`ClockSite::PacingThread` 일 때만).
         if needs_pacing_backstop(
             matches!(state.frame_clock, FrameClock::Pacing),
             state.pacing_is_driving(),
@@ -2010,7 +1717,6 @@ impl ApplicationHandler<WakerEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
-                    state.note_redraw_requested();
                     state.render_all_tiles();
                 }
             },
@@ -2035,8 +1741,8 @@ struct Waker {
 }
 /// 이벤트 루프에 올리는 두 종류.
 ///
-/// ★엔진 wake 와 표출 틱을 구분한다.★ 하나로 묶으면 `tick_by` 계수가 "타이머가 깨웠나
-/// 엔진이 깨웠나" 를 더 이상 가릴 수 없다 -- 그 구분이 9/28 계측의 핵심이었다.
+/// ★엔진 wake 와 표출 틱을 구분한다.★ 하나로 묶으면 "타이머가 깨웠나 엔진이 깨웠나" 를
+/// 더 이상 가릴 수 없고, `user_event` 의 페이싱 우선 판정도 설 자리가 없다.
 #[derive(Debug)]
 enum WakerEvent {
     /// 엔진 스레드가 메인에 처리할 일이 있다고 알린다.
@@ -2182,24 +1888,6 @@ mod tests {
 
     use super::*;
 
-    /// 번호는 틱마다 늘고, 스크립트 경로가 사이에서 번호를 써서 건너뛰는 것은 정상이다.
-    /// 낼 타일이 없는 틱(`None`)은 감시를 건드리지 않는다.
-    #[test]
-    fn tick_issue_audit_accepts_increasing_numbers_and_gaps() {
-        let mut audit = TickIssueAudit::default();
-        assert!(audit.record_tick(Some(3)).is_ok());
-        assert!(audit.record_tick(None).is_ok());
-        assert!(audit.record_tick(Some(7)).is_ok(), "건너뛰는 것은 정상이다");
-    }
-
-    #[test]
-    fn tick_issue_audit_rejects_a_repeated_or_backwards_number() {
-        let mut audit = TickIssueAudit::default();
-        assert!(audit.record_tick(Some(5)).is_ok());
-        assert!(audit.record_tick(Some(5)).is_err(), "되풀이");
-        assert!(audit.record_tick(Some(4)).is_err(), "되돌림");
-    }
-
     /// ★세 구성 모두에서 표출 틱이 refresh-driver 콜백을 쏜다.★ 한 구성이라도 자기
     /// 스레드가 쏘면 "콜백 → 생산 → 렌더" 가 한 틱 안의 순서가 아니라 ***두 시계의
     /// 경합*** 이 된다 -- 설계 문서 불변식 9.
@@ -2286,6 +1974,11 @@ mod tests {
     /// caret 깜빡임에만 쓰이고, 편집 caret 이 없는 벽 콘텐츠에서는 아무것도 걸지 않는다.
     /// 그래서 `spawn_pacing_thread` 가 실패하면 ***아무도 clock 을 돌리지 않아 화면이
     /// 영구히 멈춘다.*** 변경 전에는 그 타이머가 저하된 박자라도 냈다.
+    ///
+    /// ★이 테스트가 덮지 **않는** 것:★ `pacing_is_driving()` 과 그것이 읽는
+    /// `last_pacing_tick_at` 래치다. 여기 있는 것은 불리언 둘을 받는 자유 함수뿐이라
+    /// `AppState` 를 만들지 않는다. `note_pacing_tick` 의 `.set(..)` 을 떨구면 이 테스트는
+    /// 그대로 초록인 채 백스톱이 매 엔진 wake 마다 열린다 -- 그쪽은 눈으로 지켜야 한다.
     #[test]
     fn backstop_only_when_pacing_was_installed_but_is_not_running() {
         // 페이싱이 돌고 있으면 백스톱은 끼어들지 않는다 -- 두 시계로 되돌아간다.
