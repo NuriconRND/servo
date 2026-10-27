@@ -1167,7 +1167,6 @@ struct BoundTile {
 
 /// 창(painter)당 하나. `webrender::Compositor`를 구현해 picture cache 타일을
 /// DComp 가상 서피스에 직접 그리게 한다. 전역 상태 없음.
-/// `SERVO_DCOMP_BIND_PROF` 게이트. 타일마다 물어보는 자리라 env 읽기를 캐시한다.
 /// 타일 스왑체인 `Present` 의 SyncInterval(`gfx_present_sync_interval`). 프레임마다
 /// 묻는 자리라 한 번만 읽는다. 자세한 근거는 pref 주석.
 static PRESENT_SYNC_INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
@@ -1179,13 +1178,6 @@ static PRESENT_SYNC_INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::ne
         );
     }
     raw
-});
-
-// `pub(crate)`: `commit_guard` 도 이 플래그로 수집 자체를 게이트한다(한 소스,
-// 두 번째 `LazyLock` 으로 같은 env 를 또 읽지 않는다) -- OUTCOMMIT Fix round 1, Ruling 15.
-pub(crate) static DCOMP_BIND_PROF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    servo_config::debug_env::string(&servo_config::debug_env::DCOMP_BIND_PROF)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 });
 
 pub struct DCompNativeCompositor {
@@ -1602,44 +1594,25 @@ impl DCompNativeCompositor {
     ///
     /// `GetFrameStatistics` 는 그 답을 컴포지터 자신에게서 직접 받는다. 타일마다 DComp
     /// 디바이스가 따로 있으므로 타일별로 얻어진다.
-    pub(crate) fn note_frame_statistics(&self, monitor: usize) {
+    pub(crate) fn note_frame_statistics(&self, _monitor: usize) {
         let Some(device) = self.dcomp_device_ptr() else {
             return;
         };
         let mut stats: DCOMPOSITION_FRAME_STATISTICS = unsafe { std::mem::zeroed() };
         // Safety: 살아 있는 `IDCompositionDevice`. 순수 out-param 조회다.
         if unsafe { (*device).GetFrameStatistics(&mut stats) } < 0 {
-            crate::output_grid::note_dcomp_stat_failed();
             return;
         }
-        // ★`currentTime` 이 정말 이 호출의 시각인가.★ 로그를 역산해 보면
-        // `lastFrameTime` 이 `currentTime` 보다 14ms 쯤 **미래**인데, 그 해석이 성립하려면
-        // `currentTime` 이 호출 시점이어야 한다. 그 전제만 검증이 안 돼 있었다 -- 여기서
-        // 곧바로 QPC 를 읽어 둔다. 둘의 차가 0 에 가까우면 전제가 맞고, 아니면 `behind_ms`
-        // 와 `next_ms` 의 기준점이 통째로 그만큼 밀려 있는 것이다.
-        let qpc_at_read = crate::output_grid::qpc_now();
         // `LARGE_INTEGER` 는 union 이라 접근자로 읽는다.
         // Safety: 위 호출이 성공했으므로 전부 채워져 있다.
-        let (last, now, next, freq) = unsafe {
+        let (last, freq) = unsafe {
             (
                 *stats.lastFrameTime.QuadPart() as u64,
-                *stats.currentTime.QuadPart() as u64,
-                *stats.nextEstimatedFrameTime.QuadPart() as u64,
                 *stats.timeFrequency.QuadPart() as u64,
             )
         };
         let rate = stats.currentCompositionRate;
-        crate::output_grid::note_dcomp_stat(
-            monitor,
-            device as usize,
-            last,
-            now,
-            next,
-            freq,
-            rate.Numerator,
-            rate.Denominator,
-            qpc_at_read,
-        );
+        crate::output_grid::note_dcomp_stat(last, freq, rate.Numerator, rate.Denominator);
     }
 
     fn root_visual_ptr(&self) -> Option<*mut IDCompositionVisual> {
@@ -2122,10 +2095,6 @@ impl DCompNativeCompositor {
     /// 지연 적용해 둔 값을 그대로 물려받아 무해하다. 단 하나의 예외: DPI 변경으로
     /// `present_inset`이 갱신된 직후 다음 `begin_frame` 전에 이 경로가 먼저 돌면 그 1회는
     /// 갱신 전 오프셋으로 present된다. 후속 프레임이 `begin_frame`에 도달하면 자동 교정된다.
-    /// 계측 창(1 초)을 unbind 경계에서 닫고 한 줄 찍는다(`SERVO_DCOMP_BIND_PROF`).
-    ///
-    /// `warn!` 인 것은 의도적이다 — 이 모듈의 `[dcomp-dbg]` 는 `info!` 라 런처 RUST_LOG 의
-    /// `paint=info` 에 의존하는데, 그 의존이 이미 한 번 무출력으로 시간을 먹였다.
     /// 미뤄 둔 Commit 의 디바이스를 **인계**한다(호출자가 다른 스레드에서 부를 수 있게).
     /// 밀린 게 없으면 `None`. 인계 후에는 이 컴포지터가 그 프레임의 Commit 을 책임지지
     /// 않으므로, 호출자가 반드시 불러야 한다.

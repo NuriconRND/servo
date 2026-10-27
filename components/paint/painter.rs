@@ -2689,24 +2689,21 @@ impl Painter {
     /// 캐시하면 핫플러그 뒤에 조용히 틀린 격자로 스케줄한다. `MonitorFromWindow` 는 API 한
     /// 번이라 프레임당 호출해도 비용이 없다.
     #[cfg(windows)]
-    /// DWM 이 이 타일을 실제로 언제 합성했는지 한 표본 뜬다(`DCOMPSTAT`).
+    /// DWM 이 이 타일을 실제로 언제 합성했는지 묻고 공통 합성 격자를 채운다.
     ///
     /// ★계측이 없어서 세 번 틀렸다.★ 지금까지의 계측은 전부 DWM 에 넘기기 전까지만 봤고,
     /// 관찰된 타일 간 어긋남은 그 앞단으로 설명되는 크기의 20 배였다. 이 줄이 그 구간을
     /// 컴포지터 자신에게서 직접 받는다.
     ///
-    /// 정렬·B2 와 무관하게 `-DcompBindProf` 만으로 켜진다 -- 대조군에서도 재야 비교가 된다.
-    /// 컴포지터를 이미 대여 중일 수 있으므로 `try_borrow` 로 물러난다(빠진 표본은 통계에
-    /// 영향을 주지 않을 만큼 드물고, 실패 횟수는 `failed` 가 센다).
+    /// 컴포지터를 이미 대여 중일 수 있으므로 `try_borrow` 로 물러난다(빠진 표본은 격자
+    /// 갱신에 영향을 주지 않을 만큼 드물다).
     #[cfg(windows)]
     fn note_dcomp_frame_statistics(&self) {
-        // ★B2 가 켜져 있으면 프로파일과 무관하게 떠야 한다.★ 이 호출이 공통 합성 격자를
-        // 채우고 B2 가 그것을 쓴다 -- 진단 플래그 뒤에 두면 `-SampleLead` 만 준 운영 구성에서
+        // ★이 호출은 어떤 진단 게이트 뒤에도 두지 않는다.★ 이 호출이 공통 합성 격자를
+        // 채우고 B2 가 그것을 쓴다 -- 게이트 뒤에 두면 `-SampleLead` 만 준 운영 구성에서
         // 격자가 영영 비어 기능이 통째로 무력해진다. B1 에서 프로브를 그렇게 두어 똑같이
-        // 당한 적이 있다(설계 문서 C5). 통계 히스토그램 쪽은 여전히 프로파일 뒤에 있다.
-        if !*crate::dcomp_compositor::DCOMP_BIND_PROF &&
-            crate::commit_guard::SAMPLE_LEAD_PERIODS.is_none()
-        {
+        // 당한 적이 있다(설계 문서 C5).
+        if crate::commit_guard::SAMPLE_LEAD_PERIODS.is_none() {
             return;
         }
         let Some(monitor) = self.tile_monitor() else {
@@ -2715,17 +2712,15 @@ impl Painter {
         let Some(shared) = self.dcomp_shared.as_ref() else {
             return;
         };
-        match shared.try_borrow() {
-            Ok(compositor) => compositor.note_frame_statistics(monitor),
-            Err(_) => crate::output_grid::note_dcomp_stat_failed(),
+        if let Ok(compositor) = shared.try_borrow() {
+            compositor.note_frame_statistics(monitor);
         }
     }
 
     /// B2 의 샘플 시각 보정. 꺼져 있으면 0 이라 `Instant::now()` 그대로다.
     ///
     /// 격자나 모니터를 못 구하면(프로브 미가동·핫플러그 직후) 0 으로 떨어진다 -- 그 타일만
-    /// 오늘 동작으로 돌아가는 것이고, 화면이 멈추는 쪽보다 낫다. 그 건수는 `SAMPLELEAD` 의
-    /// `nogrid` 가 센다.
+    /// 오늘 동작으로 돌아가는 것이고, 화면이 멈추는 쪽보다 낫다.
     /// 이 프레임의 애니메이션 값을 ★어느 시각으로★ 뽑을까. 꺼져 있으면 `None` -> 호출자가
     /// 지금 시각을 쓴다.
     ///
@@ -2745,17 +2740,8 @@ impl Painter {
             //
             // 그 격자는 `note_dcomp_frame_statistics` 가 매 프레임 채운다. 첫 프레임 전이나
             // 조회가 실패하면 `None` -> 오늘 동작(지금 시각 샘플)으로 떨어진다.
-            let monitor = self.tile_monitor().unwrap_or(0);
-            match crate::output_grid::lead_to_next_composition(monitor, lead_periods) {
-                Some((anchor, lead)) => {
-                    crate::output_grid::note_sample_lead(monitor, lead);
-                    Some(anchor + lead)
-                },
-                None => {
-                    crate::output_grid::note_sample_lead_missing();
-                    None
-                },
-            }
+            crate::output_grid::lead_to_next_composition(lead_periods)
+                .map(|(anchor, lead)| anchor + lead)
         }
         #[cfg(not(windows))]
         None

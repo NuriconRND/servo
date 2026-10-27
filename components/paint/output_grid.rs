@@ -15,33 +15,12 @@
 // (dcomp_compositor.rs/dcomp_video_convert.rs의 `#![allow(unsafe_code)]`와 같은 취지).
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use log::warn;
 
-/// ★계측 전체의 주 스위치.★ `SERVO_WALL_NO_PROBE=1` 이면 꺼진다.
-///
-/// 계측 비용을 재려고 계측을 더 붙이는 것은 순환이다. 이 스위치는 그 대신 ***같은
-/// 바이너리에서 계측만 빼는*** A/B 를 가능하게 한다.
-static PROBE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    !servo_config::debug_env::enabled(&servo_config::debug_env::WALL_NO_PROBE)
-});
-
-/// ★수집 게이트. 방출과 **같은** 조건이어야 한다.★
-///
-/// 어긋나면 아무도 비우지 않는 맵에 영원히 쌓인다. 이 코드베이스가 그 함정에 두 번 당했다 --
-/// `PHASES` 가 프로세스 수명 내내 자랐고(Fix round 1, Ruling 15), B1 의 프로브를 진단 플래그
-/// 뒤에 두어 격자가 영영 비었다(설계 문서 C5). ★그래서 수집·방출·프로브 스레드가 이 하나의
-/// 값을 본다★ -- 셋이 갈라질 수 없게 한다.
-///
-/// `note_dcomp_stat` 만 예외다. 그 함수는 B2(`-SampleLead`)가 쓰는 공통 합성 격자를 채우므로
-/// 격자 갱신은 이 게이트 **앞**에 있어야 한다 -- 계측을 껐다고 기능이 죽으면 안 된다.
-pub(crate) static COLLECT: LazyLock<bool> =
-    LazyLock::new(|| *PROBE_ENABLED && *crate::dcomp_compositor::DCOMP_BIND_PROF);
 use winapi::Interface;
 use winapi::shared::dxgi::{
     CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
@@ -152,140 +131,6 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
     *COMPOSITION.lock().ok()?
 }
 
-/// 한 타일의 샘플 인덱스가 어떻게 움직였나. `SAMPLESLIP` 이 초당 비운다.
-#[derive(Default)]
-struct SlipTally {
-    n: u64,
-    /// 인덱스가 그대로였다 = 이 프레임의 변위가 0 이다.
-    same: u64,
-    /// 두 칸 뛰었다 = 직전 프레임이 건너뛰어졌다.
-    jump2: u64,
-    /// 세 칸 이상.
-    jump_n: u64,
-    /// 슬립이 난 순간, 렌더가 격자의 어디에 있었나(ms).
-    phase_at_slip: Vec<f64>,
-    /// 전체 프레임의 같은 값 -- 위와 비교해야 "경계에 몰렸나" 를 말할 수 있다.
-    phase_all: Vec<f64>,
-    /// ★`last mod period`(ms).★ 인덱스는 `last / period` 이므로, 이 잔차가 0 이나 주기
-    /// 끝에 가까우면 `last` 의 작은 흔들림이 몫을 앞뒤로 뒤집는다 -- 그것이 `same` 과
-    /// `jump2` 가 1:1 로 짝지어 나오는 모양이다. 멀리 있으면 같은 흔들림이 아무 일도
-    /// 하지 않는다. 그래서 ***이 값이 슬립의 순간에 어디 있었나***가 판정이다.
-    residue_at_slip: Vec<f64>,
-    /// 전체 프레임의 같은 값. 위와 나란히 놓아야 "경계에 몰렸나" 를 말할 수 있다.
-    residue_all: Vec<f64>,
-    /// 직전에 본 `last`(합성 격자점의 절대 QPC).
-    last_grid: Option<u64>,
-    /// ★`last` 가 뒤로 갔거나 제자리였던 횟수.★ 인덱스는 `last / period` 이므로 `last` 가
-    /// 단조롭지 않으면 몫이 반복되고, 그 다음 프레임이 밀린 만큼을 한꺼번에 따라잡는다 --
-    /// `same` 바로 뒤에 `jumpN` 이 붙는 모양이 그것이다. `DCOMPSTAT distinct` 는 값이
-    /// 달라지기만 하면 세므로 ***역행을 잡지 못한다.***
-    grid_back: u64,
-    /// 역행했을 때 뒤로 간 양(ms). 한 주기에 못 미치는 흔들림인지 그 이상인지 가른다.
-    grid_back_ms: Vec<f64>,
-    /// 한 주기를 크게 넘겨 앞으로 뛴 횟수(>= 2 주기). 역행의 짝이다.
-    grid_leap: u64,
-}
-
-static SLIPS: Mutex<Option<HashMap<usize, SlipTally>>> = Mutex::new(None);
-
-/// ★슬립이 **언제** 일어나는지 찍는다.★
-///
-/// 정상 창의 프레임당 변위는 38.40px 에 spread 0.004 로 사실상 완벽한데, 창의 28% 에
-/// 결함이 있고 10% 는 spread≈1.0 으로 파탄이다(log_ani_debug_02/14). 그리고 변위 0 프레임
-/// 12 창 중 8 창을 기존 `dup`/`skip1` 계수가 **놓쳤다** -- 그 계수는 렌더 간격을 세지 샘플
-/// 인덱스를 세지 않기 때문이다.
-///
-/// 가설은 "렌더가 격자 경계 근처에 떨어져 올림이 두 칸 사이를 오간다" 이지만, 두 번 추측으로
-/// 고치려다 두 번 회귀를 냈으므로 이번에는 재고 나서 고친다. 슬립 순간의 위상 분포를 전체
-/// 분포와 나란히 내면 경계에 몰렸는지 아닌지가 바로 보인다.
-/// 직전 샘플 이후 합성이 몇 번 지났나. 음수면 격자가 뒤로 간 것이다.
-///
-/// ★증분으로 센다. 절대 몫으로 세면 안 된다.★ 예전에는 `last / period` 를 인덱스로 삼고
-/// 그 차를 봤는데, `last` 는 부팅 이후 QPC(가동 4.2 시간이면 1,518 억 틱)라 ***나눗수가
-/// 몇 틱만 달라져도 몫이 수십 칸 움직인다.*** 그리고 그 나눗수는 고정이 아니다 --
-/// `period_ticks` 는 DWM 이 돌려주는 rate 에서 매번 다시 계산되는데, 이 기계에서 그 rate 가
-/// 60.002 / 60.003 / 60.004Hz 로 흔들렸다(log_ani_debug 24/local_05: 106 / 11 / 1 회).
-/// 세 값의 `period_ticks` 는 166661 / 166658 / 166655 라 한 번 흔들릴 때마다 인덱스가
-/// 16 칸씩 튀었다.
-///
-/// 그 16 칸은 전진하면 `jumpN`, 되돌아오면 -- `saturating_sub` 가 음수를 0 으로 뭉개므로 --
-/// `same` 으로 기록됐다. ★측정된 "슬립 2.2%" 는 그래서 전부 이 둘의 짝이었다★(40 대 40).
-/// 실제 애니메이션은 멀쩡했다. 쓰이는 값은 `target = last + 2 * period` 이고, 주기가 3 틱
-/// 달라져도 그것은 0.6µs 움직일 뿐이다.
-///
-/// 벽에서 이 지표가 0.00% 였던 것도 샘플링이 더 좋아서가 아니라 ***그 기계의 rate 가
-/// 60.000Hz 로 고정이라 나눗수가 안 흔들렸기 때문***이다.
-///
-/// 증분은 한 주기 남짓이라 나눗수의 몇 틱 차이에 무감하다. 반올림으로 센다 -- 실제 합성
-/// 간격은 공칭 주기와 정확히 같지 않으므로 절삭하면 한 칸이 0 으로 떨어진다.
-fn compositions_advanced(previous: u64, last: u64, period: u64) -> i64 {
-    if period == 0 {
-        return 0;
-    }
-    let delta = last as i128 - previous as i128;
-    let period = period as i128;
-    // 반올림 나눗셈. 음수 쪽도 대칭이어야 역행이 -1 로 나온다.
-    let rounded = if delta >= 0 {
-        (delta + period / 2) / period
-    } else {
-        (delta - period / 2) / period
-    };
-    rounded as i64
-}
-
-fn note_sample_slip(
-    monitor: usize,
-    phase_ms: f64,
-    residue_ms: f64,
-    last_grid: u64,
-    period_ticks: u64,
-    freq: u64,
-) {
-    if !*COLLECT {
-        return;
-    }
-    let Ok(mut guard) = SLIPS.lock() else { return };
-    let tally = guard
-        .get_or_insert_with(HashMap::new)
-        .entry(monitor)
-        .or_default();
-    tally.n += 1;
-    tally.phase_all.push(phase_ms);
-    tally.residue_all.push(residue_ms);
-    if let Some(previous) = tally.last_grid {
-        if last_grid <= previous {
-            tally.grid_back += 1;
-            tally
-                .grid_back_ms
-                .push((previous - last_grid) as f64 * 1000.0 / freq as f64);
-        } else if last_grid - previous >= period_ticks.saturating_mul(2) {
-            tally.grid_leap += 1;
-        }
-        // ★분류는 `last` 의 증분으로 한다.★ 왜 절대 몫이면 안 되는지는
-        // `compositions_advanced`.
-        let slipped = match compositions_advanced(previous, last_grid, period_ticks) {
-            1 => false,
-            0 => {
-                tally.same += 1;
-                true
-            },
-            2 => {
-                tally.jump2 += 1;
-                true
-            },
-            _ => {
-                tally.jump_n += 1;
-                true
-            },
-        };
-        if slipped {
-            tally.phase_at_slip.push(phase_ms);
-            tally.residue_at_slip.push(residue_ms);
-        }
-    }
-    tally.last_grid = Some(last_grid);
-}
-
 /// 이 프레임이 실릴 **합성 시각**까지 남은 간격. 네 타일이 같은 값을 받는다.
 ///
 /// ★샘플과 표시가 같은 클럭 위에 있어야 한다.★ 원래는 렌더가 끝난 순간의 벽시계로
@@ -324,7 +169,6 @@ fn composition_target(last: u64, period: u64, lead_periods: u64) -> u64 {
 /// `snap_to_dwm_grid_at` 이 같은 이유로 같은 모양이다 -- 그쪽은 이 수정으로 missed present
 /// 가 3~4 배 줄었다.
 pub(crate) fn lead_to_next_composition(
-    monitor: usize,
     lead_periods: u64,
 ) -> Option<(std::time::Instant, Duration)> {
     let (last, period) = composition_grid()?;
@@ -347,90 +191,27 @@ pub(crate) fn lead_to_next_composition(
     //
     // `now` 는 이제 "그 시각까지 얼마나 남았나" 를 재는 데만 쓴다.
     let target = composition_target(last, period, lead_periods);
-    // 렌더가 격자의 어디에 떨어졌나. 슬립 진단용이고 목표 계산에는 쓰이지 않는다.
-    let phase_ms = ((now.saturating_sub(last % period)) % period) as f64 * 1000.0 / freq as f64;
-    // ★이 잔차는 진단으로만 남는다.★ 한때 인덱스를 `last / period` 로 뽑았고, 그래서
-    // 이 값이 0 이나 주기 끝에 붙으면 몫이 뒤집힌다는 가설을 세웠다. ***측정이 그것을
-    // 반증했다*** -- 슬립은 주기 한가운데(9~11ms)에서 났고 `residue_slip` 이 `residue_all`
-    // 과 구별되지 않았다(log_ani_debug 24/local_04). 진짜 원인은 나눗수 쪽이었고
-    // (`compositions_advanced`), 분류는 이제 증분으로 한다. 분포는 그대로 찍어 둔다 --
-    // 다음에 같은 질문이 오면 다시 재는 대신 이 줄을 보면 된다.
-    let residue_ms = (last % period) as f64 * 1000.0 / freq as f64;
-    note_sample_slip(monitor, phase_ms, residue_ms, last, period, freq);
     Some((
         anchor,
         Duration::from_secs_f64(target.saturating_sub(now) as f64 / freq as f64),
     ))
 }
 
-static DCOMP_STAT_FAILED: AtomicU64 = AtomicU64::new(0);
-
-/// 셸이 표출 틱을 낼 때 부른다. ★틱마다 한 번★ -- 타일마다가 아니다.
-pub(crate) fn note_present_tick_now() {}
-
-pub(crate) fn note_dcomp_stat_failed() {
-    if !*COLLECT {
-        return;
-    }
-    DCOMP_STAT_FAILED.fetch_add(1, Ordering::Relaxed);
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn note_dcomp_stat(
-    _monitor: usize,
-    _device: usize,
-    last: u64,
-    _now: u64,
-    _next: u64,
-    freq: u64,
-    rate_num: u32,
-    rate_den: u32,
-    _qpc_at_read: Option<u64>,
-) {
+pub(crate) fn note_dcomp_stat(last: u64, freq: u64, rate_num: u32, rate_den: u32) {
     if freq == 0 || rate_num == 0 || rate_den == 0 {
-        note_dcomp_stat_failed();
         return;
     }
     // 합성 주기는 DWM 이 유리수로 알려 준다 -- 추정할 필요가 없다.
     let period_ticks = freq.saturating_mul(rate_den as u64) / rate_num as u64;
     if period_ticks == 0 {
-        note_dcomp_stat_failed();
         return;
     }
-    // ★격자 갱신은 계측 게이트 밖이다.★ B2 가 이 격자를 쓰므로, 프로파일이 꺼져 있다고
-    // 격자를 안 채우면 B2 가 통째로 무력해진다 -- B1 에서 프로브를 진단 플래그 뒤에 두어
+    // ★격자 갱신은 어떤 진단 게이트 뒤에도 두지 않는다.★ B2 가 이 격자를 쓰므로, 게이트
+    // 뒤에 두면 B2 가 통째로 무력해진다 -- B1 에서 프로브를 진단 플래그 뒤에 두어
     // 똑같이 당한 적이 있다(설계 문서 C5).
     if let Ok(mut guard) = COMPOSITION.lock() {
         *guard = Some((last, period_ticks));
     }
-    if !*COLLECT {
-        return;
-    }
-}
-
-/// 모니터 -> 이번 창의 샘플 lead 표본(ms). `SAMPLELEAD` 가 초당 비운다.
-static LEADS: Mutex<Option<HashMap<usize, Vec<f64>>>> = Mutex::new(None);
-/// 격자나 모니터를 못 구해 오늘 동작으로 떨어진 횟수.
-static LEAD_MISSING: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn note_sample_lead(monitor: usize, lead: Duration) {
-    if !*COLLECT {
-        return;
-    }
-    if let Ok(mut guard) = LEADS.lock() {
-        guard
-            .get_or_insert_with(HashMap::new)
-            .entry(monitor)
-            .or_default()
-            .push(lead.as_secs_f64() * 1000.0);
-    }
-}
-
-pub(crate) fn note_sample_lead_missing() {
-    if !*COLLECT {
-        return;
-    }
-    LEAD_MISSING.fetch_add(1, Ordering::Relaxed);
 }
 
 /// ★페이싱 스레드를 primary 출력의 다음 vblank 까지 블록한다.★ 돌아온 직후의
@@ -461,6 +242,8 @@ pub(crate) fn note_sample_lead_missing() {
 /// `WaitForVBlank` 가 즉시 실패 HRESULT 로 돌아오므로 ★그 상태에서 이 함수는 블록하지
 /// 않는다★ -- 되풀이되는 실패의 백오프는 호출자 몫이다.
 pub(crate) fn wait_primary_vblank() -> Option<(u64, u64)> {
+    // 이 thread-local 이 primary 출력 핸들을 들고 있다. 만든 스레드에서만 쓰이고 그
+    // 스레드에서 해제되므로 `Output` 의 포인터에 `Send` 가 필요 없다.
     thread_local! {
         static SOURCE: std::cell::RefCell<VblankSource> =
             const { std::cell::RefCell::new(VblankSource::new()) };
@@ -468,10 +251,6 @@ pub(crate) fn wait_primary_vblank() -> Option<(u64, u64)> {
     SOURCE.with(|source| source.borrow_mut().wait())
 }
 
-/// `wait_primary_vblank` 가 들고 있는 primary 출력 핸들.
-///
-/// thread-local 이므로 만든 스레드에서만 쓰이고 그 스레드에서 해제된다 -- 그래서 `Output` 의
-/// 포인터에 `Send` 가 필요 없다.
 /// ★페이싱이 기다릴 출력의 고정 이름.★ 비어 있거나 `primary` 면 오늘 동작이다.
 ///
 /// 틱 경로에서 `pref!` 를 치지 않는다 -- 그것이 전역 `RwLock` 을 잡으므로, 페이싱
@@ -506,8 +285,6 @@ struct VblankSource {
     monitor: usize,
     /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
     period_qpc: Option<u64>,
-    /// `VBANCHOR` 를 마지막으로 찍은 QPC. 초당 한 줄로 조인다.
-    last_log_qpc: u64,
 }
 
 impl VblankSource {
@@ -518,7 +295,6 @@ impl VblankSource {
             wait_idx: 0,
             monitor: 0,
             period_qpc: None,
-            last_log_qpc: 0,
         }
     }
 
@@ -575,37 +351,6 @@ impl VblankSource {
         self.wait_idx = wait_idx;
     }
 
-    /// `VBANCHOR` 한 줄. 초당 하나로 조인다.
-    ///
-    /// ★arm 을 로그로 증명하는 것이 이 줄의 전부다.★ 2026-10-26 에 arm 을 증명할 수 없는
-    /// 배포본으로 A/B 를 두 바퀴 돌렸고 둘 다 버렸다. 위상 자체는 `OUTPHASE` 의
-    /// `vs_dwmvb_ms` 가 출력마다 이미 내므로 여기서 DWM 을 또 묻지 않는다 -- 그 IPC 를
-    /// 없애려고 vblank 클럭을 만든 것이다.
-    fn log_anchor(&mut self, now: u64, freq: u64) {
-        if self.last_log_qpc != 0 && now.saturating_sub(self.last_log_qpc) < freq {
-            return;
-        }
-        self.last_log_qpc = now;
-        let Some(out) = self
-            .enumeration
-            .as_ref()
-            .and_then(|enumeration| enumeration.outputs.get(self.wait_idx))
-        else {
-            return;
-        };
-        let pin = PACING_OUTPUT_PIN.as_str();
-        warn!(
-            "VBANCHOR out={} monitor={:#x} primary={} pin={} honoured={} period_ms={:.4}",
-            out.name,
-            out.monitor,
-            u8::from(self.wait_idx == self.primary),
-            if pin.is_empty() { "-" } else { pin },
-            u8::from(self.wait_idx != self.primary),
-            self.period_qpc
-                .map_or(f64::NAN, |ticks| ticks as f64 * 1000.0 / freq as f64),
-        );
-    }
-
     fn wait(&mut self) -> Option<(u64, u64)> {
         self.refresh();
         let output = self
@@ -628,12 +373,6 @@ impl VblankSource {
         let period = self
             .period_qpc
             .or_else(|| qpc_frequency().map(|freq| freq / 60))?;
-        // ★틱을 보낸 **뒤**가 아니라 여기인 이유★ -- 이 함수는 호출자가 틱을 내기 직전에
-        // 돌아가지만, 초당 한 번 `warn!` 하나가 전부다(포매팅 몇 마이크로초). 틱 경로에
-        // 넣지 말아야 할 것은 잠금과 IPC 이고 둘 다 없다.
-        if let Some(freq) = qpc_frequency() {
-            self.log_anchor(vblank, freq);
-        }
         Some((vblank, period))
     }
 }

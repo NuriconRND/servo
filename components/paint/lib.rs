@@ -89,8 +89,6 @@ pub fn dwm_composition_grid() -> Option<(u64, u64)> {
 /// 셸은 반드시 생산한다.
 pub fn note_present_tick() {
     crate::wall_tick::note_tick_edge();
-    #[cfg(windows)]
-    crate::output_grid::note_present_tick_now();
 }
 
 /// ★다음 틱 에지에 벽 생산 1 회를 예약한다 -- 프레임을 내지 않는다.★ 자유 실행 표출
