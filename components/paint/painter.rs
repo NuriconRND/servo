@@ -4,7 +4,6 @@
 
 use std::cell::{Cell, LazyCell, RefCell};
 use std::collections::{VecDeque, hash_map::Entry};
-use std::panic::Location;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -69,23 +68,6 @@ use wr_malloc_size_of::MallocSizeOfOps;
 // immediate re-composite in `update_images` (falls back to script rendering-opportunity
 // pacing). Read once (cached inside `debug_env`). Default = enabled (current behavior).
 // Values "1"/"true" disable it.
-// Diagnostic: log the ACTUAL engine present cadence (frame-ready rate + worst inter-frame gap)
-// once per second per painter. This is the ground-truth displayed cadence, independent of the
-// page's requestAnimationFrame count and of external capture tools (Bandicam/PresentMon).
-static FRAME_REASON_PROF: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::FRAME_REASON_PROF)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
-
-/// `Paint` 쪽 계수 지점이 꺼져 있을 때 `with_painter`(스레드 왕복)를 아예 안 하도록 묻는 자리.
-pub(crate) fn frame_reason_prof_enabled() -> bool {
-    *FRAME_REASON_PROF
-}
-
-static LOG_PRESENT_CADENCE: LazyLock<bool> = LazyLock::new(|| {
-    debug_env::string(&debug_env::LOG_PRESENT_CADENCE)
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-});
 
 /// 캔버스 ack 교착 실패 주입. painter 마다 처음 N 번의 ack 전송 기회를 건너뛴다.
 static WALL_CANVAS_ACK_SKIP: LazyLock<u64> = LazyLock::new(|| {
@@ -254,9 +236,6 @@ pub(crate) struct Painter {
     /// Count of WebRender frame-ready notifications that arrived without a pending frame.
     unexpected_frame_ready_count: Cell<u64>,
 
-    /// Count of render passes executed for this target.
-    render_count: Cell<u64>,
-
     /// True while a display-paced composite (script rAF composite, per-video-arrival
     /// composite, deferred frame-delayer composite) has been requested but its render pass
     /// has not completed yet. While set, further display-paced composite requests are
@@ -271,19 +250,6 @@ pub(crate) struct Painter {
     /// `renderer_behind` (see [`DISPLAY_COMPOSITE_IN_FLIGHT_TIMEOUT`]).
     display_composite_in_flight_since: Cell<Option<Instant>>,
 
-    /// Diagnostic present-cadence accumulator (env `SERVO_LOG_PRESENT_CADENCE`). Measures the
-    /// ACTUAL engine frame-ready rate and worst inter-frame gap per second, independent of the
-    /// page's requestAnimationFrame count. `_start` is the current 1s window start, `_last` the
-    /// previous frame-ready instant, `_count` frames this window, `_max_gap_ms` worst gap.
-    present_cadence_start: Cell<Option<Instant>>,
-    present_cadence_last: Cell<Option<Instant>>,
-    present_cadence_count: Cell<u32>,
-    present_cadence_max_gap_ms: Cell<f64>,
-
-    /// Diagnostic (env `SERVO_LOG_PRESENT_CADENCE`): end instant of the previous render pass.
-    /// A large gap since this instant at the START of a render means the stall happened
-    /// upstream of the renderer (no render was requested at all), as opposed to a slow render
-    /// pass itself, which is logged separately as "Slow paint frame".
     /// 이 painter 가 **표출까지 책임지는가**.
     ///
     /// 인라인 경로에서는 셸이 `render()` 뒤에 직접 `present()` 한다(winit_wall 의
@@ -297,29 +263,8 @@ pub(crate) struct Painter {
     /// — 예전에는 `Box<dyn WebViewTrait>` 를 직접 들고 불렀다(설계 §3.2).
     paint_proxy: PaintProxy,
 
-    last_render_end: Cell<Option<Instant>>,
-
-    /// 이 painter 가 스크립트의 캔버스 ack 를 붙잡기 시작한 시각, 그리고 마지막 보고 시각.
-    /// ★스톨 진단용★ — [`Painter::check_canvas_ack_latch`] 참고.
-    canvas_ack_held_since: Cell<Option<Instant>>,
-    canvas_ack_last_report: Cell<Option<Instant>>,
-
-    /// [`Painter::flush_owed_canvas_ack`] 가 실제로 보낸 횟수와 그 집계 창의 시작 시각.
-    /// ★양성 대조용★ — 고쳐진 것과 코드가 안 도는 것을 구분하기 위한 것이다.
-    owed_ack_flush_count: Cell<u64>,
-    owed_ack_last_report: Cell<Option<Instant>>,
-
     /// 남은 ack 주입 횟수(`SERVO_WALL_CANVAS_ACK_SKIP`). 0 이면 주입 없음 = 기본값.
     canvas_ack_skips_left: Cell<u64>,
-
-    /// 합성 출처 집계(`SERVO_FRAME_REASON_PROF`). 키는 `(FrameSource, 이유 문자열)` 이다.
-    /// `FrameSource::WebRender` 는 `generate_frame` 을 부른 호출 지점의 줄 번호(2026-10-21
-    /// Task 7 뒤로 둘 -- 틱 생산과 파이프라인 부트스트랩)이고,
-    /// WR 프레임이 아닌 두 경로도 같은 집계에 들어온다 — `ExternalSurface`(`present_external_only`
-    /// 의 DComp 직행 commit)와 `WallPacerJoin`(coalesce 됐다 풀린 벽 요청; total 에는 안 더한다).
-    /// 요청 경로가 여럿이라, 초당 200 회를 누가 만드는지 총합만으로는 가려낼 수 없다.
-    frame_reason_counts: RefCell<FrameReasonCounts>,
-    frame_reason_window_start: Cell<Option<Instant>>,
 
     /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
     refresh_driver: Rc<BaseRefreshDriver>,
@@ -375,146 +320,14 @@ pub(crate) struct Painter {
     /// 내비게이션마다 항목이 쌓이기만 한다.
     bootstrapped_pipelines: RefCell<FxHashSet<PipelineId>>,
 
-    /// 부트스트랩이 실제로 낸 프레임 수와 거절한 횟수. 설계 7 절이 요구하는 계수기다 --
-    /// ★예외가 몇 장을 냈는지 로그에서 셀 수 없으면 "종료 조건이 있다" 를 확인할 방법이
-    /// 없다.★
-    bootstrap_frames_emitted: Cell<u64>,
-    bootstrap_frames_declined: Cell<u64>,
-    /// 거절 로그의 1 초 창 시작. 첫 건은 즉시 찍고 몰아칠 때만 합친다(`WALLACKFLUSH`
-    /// 와 같은 모양) -- iframe 이 많은 페이지는 기동에 거절이 수십 건 날 수 있다.
-    bootstrap_decline_last_report: Cell<Option<Instant>>,
-
     /// A [`FrameRequestDelayer`] which is used to wait for canvas image updates to
     /// arrive before requesting a new frame, as these happen asynchronously with
     /// `ScriptThread` display list construction.
     pub(crate) frame_delayer: FrameDelayer,
 
-    /// 현재 `PAINTANIM` 창이 열린 시각.
-    ///
-    /// ★프레임 계수(`paint_animation_frames`)와 그 속도 제한(`last_paint_animation_frame_at`)
-    /// 은 2026-10-21 에 사라졌다★ -- 페인트측 애니메이션은 더는 프레임을 내지 않는다(설계 2-6).
-    paint_animation_window_start: RefCell<Option<Instant>>,
-    /// 값을 밀어 넣을 때 이 타일이 바빴던 횟수(현재 `PAINTANIM` 창 기준). ★생산 판정이
-    /// 아니라 표본의 사정이다★ -- 값은 바빠도 나간다(불변식 7).
-    paint_animation_skipped_busy: Cell<u64>,
-    /// How often the animation's values rode along on frames somebody else was producing.
-    /// On a wall with video this should be nearly all of them.
-    paint_animation_rode_along: Cell<u64>,
-    /// 한 전송에 도로 얹힌 "끝난 애니메이션" 값의 최대 개수(현재 `PAINTANIM` 창 기준).
-    ///
-    /// ***이 수가 0이 아니었던 창이 곧 화면이 검어질 수 있었던 창이다.*** 이 값들을 얹지
-    /// 않으면 그만큼의 키가 그 전송에서 지워져 시작값으로 되돌아간다 -- 검은 화면의 정체다.
-    /// 그래서 이 수는 성능 지표가 아니라 **가설의 증거**다.
-    paint_animation_held_max: Cell<usize>,
-    /// When any frame was last generated for this painter, by any path.
-    last_frame_generated_at: Cell<Option<Instant>>,
-    /// 비디오 프레임이 마지막으로 **도착한** 시각(페인터에 이미지 갱신으로 들어온 시각).
-    ///
-    /// `last_video_presented_at` 과 짝이다. 둘을 같이 재야 "안 왔다"와 "왔는데 못 내보냈다"가
-    /// 갈린다 — 화면이 멈춘 것만 보고는 그 둘을 구분할 수 없고, 고칠 곳은 정반대다.
-    last_video_arrived_at: Cell<Option<Instant>>,
-
-    /// 비디오 프레임이 마지막으로 **화면에 실려 나간** 시각(합성에 flush 된 시각).
-    ///
-    /// 재생이 매끄러운지는 도착률이 아니라 이 간격이 말해 준다 — 도착은 30/s 인데 표출이
-    /// 한 번 300ms 를 건너뛰면 평균은 멀쩡해 보이고 눈에는 끊긴다.
-    last_video_presented_at: Cell<Option<Instant>>,
-
-    /// 이 페인터에 프레임을 낸 마지막 시각.
-    ///
-    /// "남이 이미 프레임을 내고 있으니 나는 값만 얹으면 된다"를 판정하는 데 쓴다
-    /// (`pump_paint_animation` 의 `someone_else_is_producing`). ★독자가 둘이었는데
-    /// 2026-10-22 에 하나가 됐다★ -- `raf_is_producing_frames` 가 같이 읽고 있었고 그
-    /// 술어가 그날 삭제됐다(설계 4 절).
-    ///
-    /// ★"자기 자신은 빼고" 가 2026-10-21 Task 7 에 사라졌다.★ 스스로 프레임을 내던 세 경로
-    /// (페인트측 애니메이션, 유보 애니메이션 프레임, 비디오 도착)가 자기 프레임을 낸 뒤 이
-    /// 시각을 되돌려 놓았었다. 그 셋이 ★한꺼번에★ 삭제되어 writer 가 이 함수 하나만 남았고,
-    /// 되돌릴 "자기 프레임" 자체가 없다. 하나라도 남겨 두면 안 됐던 이유는 실측에 있다
-    /// (log_presentation/00, 60Hz 벽): 되돌리지 않은 채로 페이드가 도는 1 초 동안 렌더가
-    /// **61 -> 72 프레임**으로 늘었고, 그 초과분이 애니메이션이 스스로 낸 프레임과 정확히
-    /// 맞았다. ★지금 "남" 은 언제나 틱이다★ -- 틱이 주기마다 찍으므로 이 두 판정은
-    /// 사실상 "이번 주기의 틱 프레임이 아직 렌더되지 않았나" 를 묻는다.
-    ///
-    /// ★되살아날 자리가 없다는 것을 2026-10-22 Task 8 이 한 번 더 못박는다.★ 롤백이 있던
-    /// 이유는 "자기가 낸 프레임을 남의 프레임으로 세면 안 된다" 였는데, 역압이 벽 단위
-    /// 결정이 된 지금 타일이 할 수 있는 일은 틱의 요구에 ***생성하거나 직전 프레임을
-    /// 유지하거나*** 둘뿐이다(`generate_frame_for_wall_tick`). 유지는 이 시각을 찍지
-    /// 않으므로, 뺄 "자기 프레임" 이 애초에 생기지 않는다.
-    last_frame_by_other_source_at: Cell<Option<Instant>>,
     /// When the animation values were last pushed. They only matter at frame-build time,
     /// so pushing faster than frames are built is waste.
     last_paint_animation_push_at: Cell<Option<Instant>>,
-    /// `note_animation_step` 의 상태. ★레인마다★ 직전 표본의 (x, 시각).
-    ///
-    /// ★전에는 `transforms.first()` 하나만 봤다.★ 그게 두 번 생각을 빗나가게 했다 --
-    /// 프로브는 레인을 일곱 줄(A / B / B' / C / C' / D / D') 그리고 `PAINTANIM` 은
-    /// animations=28 을 세는데, 지표는 그중 하나만 따라갔다. 그 하나가 균일하다는
-    /// 것은 ***나머지가 균일하다는 뜻이 아니다.*** 운영자가 보는 레인이 추적하는
-    /// 레인이라는 보장도 없다.
-    ///
-    /// 관측(log_ani_debug 32): divisor 를 15/30/60 으로 두자 저더 간격이 각각
-    /// 0.25 / 0.5 / 1 초로 나왔다 -- ***`divisor / 60` 정확히 스크립트 틱 순간***이다.
-    /// 모양은 객체가 잠시 앞으로 튀어나갔다 돌아온다. 그런데 추적 중인 레인은
-    /// div=60 에서도 `dx max=12.80` 으로 ***튀지 않았다.*** 둘 중 하나다: 다른
-    /// 레인이거나, 튀는 것이 샘플값이 아니거나. 앞에거를 먼저 닫는다.
-    anim_step_previous: RefCell<FxHashMap<u32, (f32, Instant)>>,
-    anim_step_window_start: RefCell<Option<Instant>>,
-    anim_step_dt: RefCell<Vec<f64>>,
-    anim_step_dx: RefCell<Vec<f64>>,
-    /// ★`ANIMSTEP` 은 WebRender 에 넘기기 **전** 값이다.★ `transforms_log` 는
-    /// `update_paint_animations` 가 막 채운 `transforms` 를 그대로 복사한 것이라, 그 수열이
-    /// 고르다는 것은 ***샘플링이 고르다*** 는 뜻이지 화면이 고르다는 뜻이 아니다. 그 사이에
-    /// WebRender 자신의 스레드들이 있다 -- `WRRenderBackend` / `WRSceneBuilder` 는 각자
-    /// 큐를 갖고, 우리 페이싱 스레드도 커밋 스케줄러도 그 큐가 언제 프레임을 내놓는지
-    /// 정하지 못한다. 요청은 `generate_frame` 이고 완료는 `notifier.wake_up` 역통지다.
-    ///
-    /// 그래서 ***완료 쪽***에서 한 번 더 센다. 밀어넣은 x 를 그 요청에 달아 두고, 프레임
-    /// 준비 통지가 올 때 꺼내 직전 완료와의 차를 본다. 보낸 쪽 dx 가 12.80 으로 평평한데
-    /// 완료 쪽 dx 가 벌어지면 ***범인은 이 구간***이고, 완료 쪽도 평평하면 이 구간은
-    /// 결백하다. 지금까지 이 구간만 미계측이었다.
-    anim_ready_queue: RefCell<VecDeque<(u64, Option<f32>, Instant)>>,
-    /// 다음 `generate_frame` 에 달아 보낼 x. 밀어넣기 자리가 세우고 요청 자리가 가져간다.
-    anim_ready_pending_x: Cell<Option<f32>>,
-    /// 직전 **완료** 프레임의 (x, 시각).
-    anim_ready_previous: Cell<Option<(f32, Instant)>>,
-    anim_ready_window_start: RefCell<Option<Instant>>,
-    anim_ready_dx: RefCell<Vec<f64>>,
-    anim_ready_dt: RefCell<Vec<f64>>,
-    /// 요청에서 완료까지 걸린 시간(ms). WebRender 큐가 밀리는지를 본다.
-    anim_ready_latency: RefCell<Vec<f64>>,
-    /// 애니메이션 값을 달지 않은 완료의 수. 그 사이 밀어넣은 값은 자기 프레임을 못 얻었다.
-    anim_ready_unmatched: Cell<u64>,
-    /// ★아직 렌더가 집어가지 않은 완료의 꼬리표.★ `true` = 애니메이션 값을 단 프레임.
-    ///
-    /// ★낡음(2026-10-16 `dfb6116e8ef` 기록) — 2026-10-21 Task 7 로 전제가 통째로 사라졌다.★
-    /// 당시 프레임 원천은 둘이었고(ANIMATED_PROPERTY 와 `generate_frame_for_script` 의
-    /// SCENE), div=1 이면 초당 120 개를 요청해 60 개만 화면에 갔다(`WRRATE onscreen`).
-    /// ***둘 중 어느 쪽이 합성 슬롯을 가져가는지***가 화면 위치를 정했는데, 그 둘이 이제
-    /// 하나다. 꼬리표는 남긴다 -- "값을 단 프레임이 렌더에 집히기 전에 덮였나"
-    /// (`anim_win_overwritten`)는 생산자가 하나여도 물을 수 있는 값이다.
-    ///
-    /// 앞섬 가설은 반증됐다 -- `-SampleLead 0/1/2`(lead_ms 28.91/45.57/62.26)로 여섯 번
-    /// ★낡음(2026-10-16 기록, 같은 날 `c515ae4c1df` 이후 무효)★ — 부호가 :2047 과 반대이고, 2026-10-19 실측에서 divisor 1~60 전부 60/60 이다.
-    /// 돌렸는데 저더가 똑같았다. 그런데 divisor 에는 반응한다(d=4 가 더 나쁘다). 그러면
-    /// 어긋남의 크기는 앞섬이 아니라 ***디스플레이 리스트의 나이***로 재야 하고, 그 나이를
-    /// 실어 오는 것이 스크립트 프레임이다. 그 프레임이 슬롯을 가져가면 직전 애니메이션
-    /// 위치는 ***화면에 닿지 못한다.***
-    anim_win_pending_tag: Cell<Option<bool>>,
-    /// 렌더가 집어간 완료를 꼬리표별로 센다.
-    ///
-    /// ★2026-10-21 Task 7 뒤로 `took_script` 는 구조적으로 ~0 이다.★ 꼬리표는
-    /// `anim_ready_pending_x` 가 붙었는지로 갈리는데, 그 부착 조건이 "애니메이션이 자기
-    /// 프레임을 낼 때" 에서 "값을 밀어 넣은 주기마다" 로 바뀌었다(생산자가 틱 하나가 되어
-    /// 앞의 조건이 영영 거짓이기 때문이다). 그래서 값이 도는 동안의 완료는 거의 전부
-    /// `took_anim` 으로 간다. ★둘의 비율을 2026-10-21 이전 로그와 비교하지 말 것.★
-    /// 뜻이 남아 있는 것은 `anim_win_overwritten` 이다.
-    anim_win_took_anim: Cell<u64>,
-    anim_win_took_script: Cell<u64>,
-    /// ★이 추적이 찾는 수.★ 애니메이션 완료가 렌더에 집히기 전에 다음 완료로 덮인
-    /// 횟수 -- 그 위치는 영영 화면에 나오지 않았다.
-    anim_win_overwritten: Cell<u64>,
-    anim_win_window_start: RefCell<Option<Instant>>,
     /// 이 페인터가 마지막으로 **실제 렌더 패스를 시작한** 시각. 애니메이션 값을 밀어넣는
     /// 박자를 여기에 맞춘다 — 자기 타이머로 돌면 벽의 표출 주기와 위상이 어긋나 미끄러진다.
     last_render_started_at: Cell<Option<Instant>>,
@@ -643,57 +456,6 @@ pub(crate) struct PainterInputs {
     pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
 }
 
-/// 이 스레드가 지금까지 쓴 CPU 시간(ms). 커널 + 사용자.
-///
-/// ★벽시계로 320ms 걸린 렌더가 CPU 를 15ms 밖에 쓰지 않았다면 그 스레드는 일한 것이
-/// 아니라 **기다린** 것이다★ — 드라이버 안에서 막혔거나, 기계가 포화라 스케줄을 못 받았거나.
-/// 반대로 CPU 도 300ms 를 썼다면 그건 실제로 한 일이다. 이 둘은 고칠 곳이 완전히 다른데,
-/// `render_ms` 만으로는 구분할 수 없다.
-///
-/// ★분해능은 스케줄러 틱(약 15.6ms)이다★ — `GetThreadTimes` 는 그 단위로만 올라간다.
-/// 그러니 한 자릿수 ms 를 비교하는 데 쓰면 안 되고, 수백 ms 짜리 정체가 일인지 대기인지를
-/// 가르는 데만 쓴다. 20ms 렌더에서 `cpu_ms=0.0` 은 "CPU 를 전혀 안 썼다"가 아니라
-/// "틱 하나를 못 채웠다"는 뜻이다.
-// 크레이트는 `unsafe` 를 금지한다. 여기서 한 번 여는 이유는 Win32 호출 하나뿐이고,
-// 인자가 전부 out 파라미터라 안전 조건이 함수 안에서 닫힌다.
-#[allow(unsafe_code)]
-#[cfg(windows)]
-fn thread_cpu_ms() -> f64 {
-    use std::mem::zeroed;
-
-    use winapi::shared::minwindef::FILETIME;
-    use winapi::um::processthreadsapi::{GetCurrentThread, GetThreadTimes};
-
-    // Safety: 모두 out 파라미터이고, 핸들은 항상 유효한 의사 핸들이다.
-    unsafe {
-        let (mut creation, mut exit, mut kernel, mut user): (
-            FILETIME,
-            FILETIME,
-            FILETIME,
-            FILETIME,
-        ) = (zeroed(), zeroed(), zeroed(), zeroed());
-        if GetThreadTimes(
-            GetCurrentThread(),
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        ) == 0
-        {
-            return 0.0;
-        }
-        let to_ns100 =
-            |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
-        // FILETIME 의 단위는 100ns 다.
-        (to_ns100(kernel) + to_ns100(user)) as f64 / 10_000.0
-    }
-}
-
-#[cfg(not(windows))]
-fn thread_cpu_ms() -> f64 {
-    0.0
-}
-
 // ★`raf_is_driving_composites` / `Painter::raf_is_producing_frames` 는 2026-10-22 에
 // 삭제됐다. 그것이 막던 증상(rAF 가 프레임을 내는 동안 비디오 도착이 두 번째 합성원이 되어
 // 합성이 도착률만큼 늘던 지터)은 생산자가 하나라서 구조적으로 불가능하다 —
@@ -706,143 +468,6 @@ fn thread_cpu_ms() -> f64 {
 // ★이 술어의 "한 주기 반" 창을 어떤 형태로든 되살리지 말 것(설계 4 절).★ 창을 조정하는
 // 한 위상 문제가 남는다는 것이 이 함수가 남긴 교훈이고, 같은 이유로 `pump_paint_animation`
 // 의 `someone_else_is_producing` 도 2026-09-17 에 시간 창을 버리고 렌더 클럭으로 갔다.
-
-/// `update_images` 한 번의 시간을 트랜잭션 전송과 나머지로 가른 누계.
-///
-/// ★`frames` / `frame_ms` 는 2026-10-21 에 빠졌다★ -- 이 함수는 더는 합성을 요청하지
-/// 않으므로 구조적으로 0 이다(설계 2-6). ★`raf_idle_calls` 도 2026-10-22 에 같은 이유로
-/// 빠졌다★ -- 그것이 세던 것은 "rAF 는 도는데 프레임이 안 나와서 비디오가 스스로 합성해야
-/// 했다" 였고, 비디오가 합성하지 않는 지금 그 사건은 일어날 수 없다(설계 4 절).
-///
-/// 이 함수는 임베더 메인 스레드에서만 돌므로 thread_local 로 족하다.
-#[derive(Default)]
-struct UpdateImagesStats {
-    window_start: Option<Instant>,
-    calls: u64,
-    total_ms: f64,
-    send_ms: f64,
-    /// 비디오가 화면에 실려 나간 순간들 사이의 **최대** 간격(ms). 끊김의 길이가 곧 이 값이다.
-    video_gap_max_ms: f64,
-    /// 비디오 프레임이 **도착한** 순간들 사이의 최대 간격(ms). 위 값과 함께 봐야 뜻이 있다:
-    /// 둘 다 크면 프레임이 안 온 것(디코더/파이프라인), 도착은 촘촘한데 표출만 크면 우리가
-    /// 못 내보낸 것(합성)이다.
-    video_arrival_gap_max_ms: f64,
-}
-
-thread_local! {
-    static UPDATE_IMAGES_STATS: RefCell<UpdateImagesStats> =
-        RefCell::new(UpdateImagesStats::default());
-}
-
-/// 이 painter 가 쓰는 어댑터의 GPU 메모리 사용량을 초당 한 줄로 남긴다.
-///
-/// ★전환 순간 드라이버 연산 전부가 25~100배 느려지고 CPU 는 거의 쓰지 않는다★ — D3D11
-/// Map(0.08→2.3ms), 텍스처 파괴(0.2→5.9ms), 렌더(cpu_ms 15.6/270ms). 어느 한 경로가
-/// 잘못된 모양이 아니라 드라이버가 막힌 모양이고, 그때 GPU 메모리가 100% 에 근접한다는
-/// 것이 실측으로 보고됐다. 그런데 이 프로세스가 실제로 얼마를 들고 있는지는 아무도 재지
-/// 않고 있었다 — 작업 관리자의 눈금 말고는.
-///
-/// DXGI 가 어댑터별로 예산과 현재 사용량을 알려 준다. 로컬(VRAM)과 논로컬(공유 시스템
-/// 메모리)을 모두 낸다: 벽은 타일마다 다른 GPU 이므로 어느 어댑터가 차는지가 곧 어느
-/// 타일이 막히는지다.
-#[allow(unsafe_code)]
-#[cfg(windows)]
-fn log_gpu_memory(painter_id: PainterId, device: usize) {
-    use winapi::Interface;
-    use winapi::shared::dxgi::IDXGIDevice;
-    use winapi::shared::dxgi1_4::{
-        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
-        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
-    };
-    use winapi::um::unknwnbase::IUnknown;
-
-    // Safety: `device` 는 이 painter 의 살아 있는 ID3D11Device 포인터다(렌더링 컨텍스트가
-    // 수명을 보장한다). 아래 QueryInterface/GetParent 는 얻은 포인터를 각각 Release 한다.
-    unsafe {
-        let unknown = device as *mut IUnknown;
-        let mut dxgi_device: *mut IDXGIDevice = std::ptr::null_mut();
-        if (*unknown).QueryInterface(
-            &IDXGIDevice::uuidof(),
-            &mut dxgi_device as *mut _ as *mut *mut _,
-        ) < 0
-            || dxgi_device.is_null()
-        {
-            return;
-        }
-        let mut adapter: *mut IDXGIAdapter3 = std::ptr::null_mut();
-        let got_adapter = (*dxgi_device).GetParent(
-            &IDXGIAdapter3::uuidof(),
-            &mut adapter as *mut _ as *mut *mut _,
-        );
-        (*dxgi_device).Release();
-        if got_adapter < 0 || adapter.is_null() {
-            return;
-        }
-        let mut local: DXGI_QUERY_VIDEO_MEMORY_INFO = std::mem::zeroed();
-        let mut non_local: DXGI_QUERY_VIDEO_MEMORY_INFO = std::mem::zeroed();
-        let ok_local =
-            (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) >= 0;
-        let ok_non_local =
-            (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local)
-                >= 0;
-        (*adapter).Release();
-        if !ok_local && !ok_non_local {
-            return;
-        }
-        let mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        let used = mb(local.CurrentUsage);
-        let budget = mb(local.Budget);
-        // CPU 메모리도 같은 줄에 둔다 — 전환마다 순증한다는 보고가 있었는데, GPU 와
-        // 나란히 놓지 않으면 어느 전환에서 무엇이 늘었는지 맞춰 보기 어렵다.
-        let (working_set, private) = process_memory_mb();
-        warn!(
-            "GPUMEM painter={painter_id:?} local_mb={used:.0}/{budget:.0} ({:.0}%) \
-             nonlocal_mb={:.0}/{:.0} reserved_mb={:.0} process_ws_mb={:.0} process_private_mb={:.0}",
-            if budget > 0.0 {
-                used / budget * 100.0
-            } else {
-                0.0
-            },
-            mb(non_local.CurrentUsage),
-            mb(non_local.Budget),
-            mb(local.CurrentReservation),
-            working_set,
-            private,
-        );
-    }
-}
-
-#[cfg(not(windows))]
-fn log_gpu_memory(_painter_id: PainterId, _device: usize) {}
-
-/// 이 프로세스의 워킹셋과 커밋(프라이빗) 바이트, MB 단위.
-#[allow(unsafe_code)]
-#[cfg(windows)]
-fn process_memory_mb() -> (f64, f64) {
-    use winapi::um::processthreadsapi::GetCurrentProcess;
-    use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-
-    // Safety: out 파라미터 하나뿐이고 크기를 정확히 넘긴다.
-    unsafe {
-        let mut counters: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
-        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        if GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            &mut counters as *mut _ as *mut _,
-            counters.cb,
-        ) == 0
-        {
-            return (0.0, 0.0);
-        }
-        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-        (mb(counters.WorkingSetSize), mb(counters.PrivateUsage))
-    }
-}
-
-#[cfg(not(windows))]
-fn process_memory_mb() -> (f64, f64) {
-    (0.0, 0.0)
-}
 
 // ★`deferred_animation_frame_is_due` 는 2026-10-21 에 삭제됐다.★
 //
@@ -1160,29 +785,14 @@ impl Painter {
             last_ready_wall_logical_frame_id: Default::default(),
             overlapping_frame_request_count: Default::default(),
             unexpected_frame_ready_count: Default::default(),
-            render_count: Default::default(),
             display_composite_in_flight: Default::default(),
             display_composite_in_flight_since: Default::default(),
-            present_cadence_start: Default::default(),
-            present_cadence_last: Default::default(),
-            present_cadence_count: Default::default(),
-            present_cadence_max_gap_ms: Default::default(),
             owns_presentation: false,
             paint_proxy: paint.paint_proxy,
-            last_render_end: Default::default(),
-            canvas_ack_held_since: Default::default(),
-            canvas_ack_last_report: Default::default(),
-            owed_ack_flush_count: Default::default(),
-            owed_ack_last_report: Default::default(),
             canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
-            frame_reason_counts: Default::default(),
-            frame_reason_window_start: Default::default(),
             screenshot_taker: Default::default(),
             wall_tick_frames_produced: Default::default(),
             bootstrapped_pipelines: Default::default(),
-            bootstrap_frames_emitted: Default::default(),
-            bootstrap_frames_declined: Default::default(),
-            bootstrap_decline_last_report: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
             webrender_renderer: Some(webrender_renderer),
@@ -1195,32 +805,7 @@ impl Painter {
             webrender_gl,
             last_mouse_move_position: None,
             frame_delayer: Default::default(),
-            paint_animation_window_start: Default::default(),
-            paint_animation_skipped_busy: Default::default(),
-            paint_animation_rode_along: Default::default(),
-            paint_animation_held_max: Default::default(),
-            last_frame_generated_at: Default::default(),
-            last_video_arrived_at: Default::default(),
-            last_video_presented_at: Default::default(),
-            last_frame_by_other_source_at: Default::default(),
             last_paint_animation_push_at: Default::default(),
-            anim_step_previous: Default::default(),
-            anim_step_window_start: Default::default(),
-            anim_step_dt: Default::default(),
-            anim_step_dx: Default::default(),
-            anim_ready_queue: Default::default(),
-            anim_ready_pending_x: Default::default(),
-            anim_ready_previous: Default::default(),
-            anim_ready_window_start: Default::default(),
-            anim_ready_dx: Default::default(),
-            anim_ready_dt: Default::default(),
-            anim_ready_latency: Default::default(),
-            anim_ready_unmatched: Default::default(),
-            anim_win_pending_tag: Default::default(),
-            anim_win_took_anim: Default::default(),
-            anim_win_took_script: Default::default(),
-            anim_win_overwritten: Default::default(),
-            anim_win_window_start: Default::default(),
             last_render_started_at: Default::default(),
             lcp_calculator: LargestContentfulPaintCalculator::new(),
             animation_image_cache: FxHashMap::default(),
@@ -1308,9 +893,6 @@ impl Painter {
     /// 겹쳐 불려도 ***값이 나가는 횟수***는 여전히 렌더당 한 번이다. 겹침이 실제로 문제가
     /// 됐던 것은 값이 아니라 ★맨 아래의 생산 예약★ 이다 -- [`PumpSource::may_schedule`].
     pub(crate) fn pump_paint_animation(&mut self, source: PumpSource) {
-        #[cfg(windows)]
-        source.note();
-
         // ***One transaction carries every dynamic property, because sending resets them
         // all.*** `reset_dynamic_properties` clears colors, floats and transforms
         // together, so sending the caret's color alone would blank whatever a CSS
@@ -1376,25 +958,6 @@ impl Painter {
                 );
             });
         }
-        let floats_log: Vec<f32> = floats.iter().map(|property| property.value).collect();
-        // ***The transform values too.*** The application animates `transform`, and a log
-        // that only prints floats reports `floats=[]` for it -- which reads as "nothing is
-        // animating" when the truth is "the thing that is animating is not being printed".
-        // Cost a diagnostic round on 2026-09-08 (log_ani_perf/11).
-        // ★어느 요소의 값인지 같이 찍는다.★ 값만 늘어놓으면 순서가 어디서 왔는지 알 수
-        // 없어 "어느 컨테이너가 어느 방향으로 움직였나" 를 귀속시킬 수 없다. 전환 때 사용자가
-        // 보는 것이 바로 그 질문이다 -- 들어와야 할 구성이 나가는 쪽으로 움직인다는 보고를
-        // 이 줄로는 확인할 수 없었다(2026-09-17).
-        //
-        // 키는 노드 id 의 해시라 역산은 안 되지만 노드마다 고정이므로, `ANIMSTART node=N` 의
-        // 해시를 같은 식으로 계산하면 맞출 수 있다(`paint_animation_binding_key`).
-        let transforms_log: Vec<(u32, f32, f32, f32)> = transforms
-            .iter()
-            .map(|property| {
-                let matrix = property.value.to_array();
-                (property.key.id.uid, matrix[12], matrix[13], matrix[0])
-            })
-            .collect();
 
         // ***An animation is a value laid onto the frames this wall already produces, not
         // a reason to produce more.*** The painter renders and presents on a clock, and
@@ -1449,58 +1012,10 @@ impl Painter {
         let push_due = rendered_since_push
             || (!renderer_is_running
                 && last_push.is_none_or(|last| now.duration_since(last) >= animation_period));
-        // ★"남"에서 자기를 뺀다★ — 여기서 `last_frame_generated_at`(자기 프레임도 찍힌다)을
-        // 보고 있었던 것이 위 주석의 규칙을 무너뜨렸다. 애니메이션이 프레임을 하나 내면 그
-        // 시각이 찍히고, 다음 밀어넣기가 그것을 "남이 내고 있다"로 읽는다. 두 판정이 서로
-        // 다른 위상의 같은 주기로 도니 맞물렸다 어긋났다 하면서 초당 10~13 개의 여분 프레임이
-        // 샜다(60Hz 벽에서 렌더 61 -> 72, log_presentation/00).
-        //
-        // ★판정을 시간 창에서 렌더 클럭으로 옮긴다(2026-09-17).★ 전에는 "한 주기 반 안에
-        // 남의 프레임이 있었나" 로 봤는데, 그 창이 넓어 **낼 수 있는 프레임을 못 내고 있었다.**
-        //
-        // 실측(log_ani_debug/27, 412 창): 애니메이션 값은 초당 60.2 번 계산되는데 문서로
-        // 발행된 것은 54.0 뿐이었다. 스크립트가 초당 15.2 프레임을 내고 그 하나하나가 1.5
-        // 주기를 막으니 22.8 주기가 막혔고(15.2 x 1.5), 애니메이션 자체 프레임은 37.2 예상 /
-        // 38.6 실측으로 모델이 그대로 맞았다. 잃은 6.2 개는 다음 밀어넣기가 값을 덮어써
-        // 화면에 닿지 못했다. 화면에 도달한 위치는 초당 45.4 개인데 표출은 60.6 번이라,
-        // 표출 넷 중 하나가 직전 위치를 다시 그렸다 -- 등속 운동이 떨려 보이는 것이 이것이다.
-        //
-        // ★창을 한 주기로 좁히는 것은 답이 아니다.★ 60fps 로 도는 남의 프레임은 간격이 한
-        // 주기에 닿을 수 있어 판정이 매번 뒤집히고, 그 뒤집힘이 이 게이트가 애초에 막으려던
-        // 지터다. 창을 조정하는 한 위상 문제는 남는다. 그래서 **위상을 없앤다.**
-        // (이 문단은 `raf_is_driving_composites` 의 주석을 가리키고 있었다. 그 술어는
-        // 2026-10-22 에 삭제됐고 -- 설계 4 절 -- 같은 교훈을 여기 옮겨 적었다. ★한 주기 반이든
-        // 한 주기든, 시간 창을 다시 들이지 말 것.★)
-        //
-        // 물음은 원래 "남이 이번 합성분의 프레임을 이미 냈는가" 이고, 그 경계는 시각이 아니라
-        // **마지막 렌더가 시작된 순간**이다(`Painter::render` 맨 앞에서 매 패스 찍힌다).
-        // 그 뒤에 남이 낸 프레임은 아직 합성되지 않았으니 다음 합성이 실어 간다 -- 애니메이션은
-        // 값만 얹으면 된다. 그 전에 난 프레임은 이미 소비됐으니 이번 주기는 비어 있고,
-        // 애니메이션이 내야 한다.
-        //
-        // `push_due` 가 쓰는 신호와 같은 것이므로 두 판정이 **같은 위상**으로 돈다 -- 위
-        // 문단이 말한 "서로 다른 위상의 같은 주기" 가 구조적으로 불가능해진다.
-        let someone_else_is_producing = match (
-            self.last_frame_by_other_source_at.get(),
-            self.last_render_started_at.get(),
-        ) {
-            (Some(other), Some(rendered)) => other > rendered,
-            // 렌더가 아직 없으면 얹혀 갈 합성도 없다. 남이 낸 적이 없어도 마찬가지다.
-            _ => false,
-        };
-        let painter_busy = self.pending_frames.get() > 0 || self.renderer_behind();
-        // ★두 계수기는 남는다 -- 생산 판정이 아니라 ***표본의 사정***이기 때문이다.★
-        // 값은 생산과 무관하게 매 주기 나가고(불변식 7), 이 둘은 그 주기에 이 타일이 어떤
-        // 상태였는지를 적는다. 여기 있던 생산 판정(`animated_property_frame`)은 2026-10-21
-        // 에 삭제됐다 -- 설계 2-6.
-        if has_values && push_due && painter_busy && !someone_else_is_producing {
-            self.paint_animation_skipped_busy
-                .set(self.paint_animation_skipped_busy.get() + 1);
-        }
-        if has_values && push_due && someone_else_is_producing {
-            self.paint_animation_rode_along
-                .set(self.paint_animation_rode_along.get() + 1);
-        }
+        // ★`renderer_behind()` 는 조회가 아니라 liveness 프로브다★ -- 안에 2 초 강제
+        // 해제가 들어 있다([`Painter::run_liveness_probe`] 주석). 집계는 사라졌지만 호출과
+        // 단락 평가는 그대로 둔다 -- `pending_frames > 0` 이면 원래도 안 불렸다.
+        let _ = self.pending_frames.get() > 0 || self.renderer_behind();
 
         // ***이 전송이 남의 값을 지우지 않게 한다.***
         //
@@ -1513,11 +1028,10 @@ impl Painter {
         // 그러니 끝난 값을 여기서 도로 얹는다. 판정(`has_values`/`push_due`)은 이미 위에서
         // 끝났으므로 이 값들은 전송을 만들지도, 프레임을 만들지도 않는다 -- 나가기로 정해진
         // 전송에 얹혀 갈 뿐이다.
-        let mut held_values = 0usize;
         if colors.is_some() || (has_values && push_due) {
             for renderer in self.webview_renderers.values() {
                 renderer.for_each_connected_pipeline(&mut |pipeline_details| {
-                    held_values += pipeline_details
+                    let _ = pipeline_details
                         .animations
                         .append_held_paint_values(&mut floats, &mut transforms);
                 });
@@ -1538,19 +1052,7 @@ impl Painter {
             // 2026-10-21 에 사라졌다.
             self.send_transaction(transaction);
             if has_values && push_due {
-                // ★표를 붙이는 조건은 "값을 밀어 넣었나" 다.★ 전에는 "애니메이션이 자기
-                // 프레임을 낼 때" 였는데, 생산자가 틱 하나가 된 뒤로 그 조건은 영영 거짓이다.
-                // 안 붙이면 `ANIMREADY` 의 dt/dx 가 통째로 비어 -- 실기 판정의 "dx 공칭값" 이
-                // 사라진다.
-                self.anim_ready_pending_x
-                    .set(transforms_log.first().map(|&(_, x, _, _)| x));
                 self.last_paint_animation_push_at.set(Some(now));
-                // ★간격을 잰다 -- 개수가 아니라.★ 이 자리가 값 표본을 뜨는 시점이고,
-                // 사용자가 보고한 현상("순간마다 이동하는 정도가 다르다")은 정확히
-                // 이 표본들의 간격 문제다. 초당 개수는 60 인데 화면이 매끄럽지 않다면
-                // 남는 설명은 간격뿐이다 -- 60Hz 패널에 60 개를 고르게 넣으면
-                // 매끄러워야 한다(패널 주사율은 실측 확인, log_ani_debug/35).
-                self.note_animation_step(now, &transforms_log);
             }
         }
 
@@ -1591,346 +1093,6 @@ impl Painter {
                 crate::wall_tick::schedule_production_at_next_edge();
             }
         }
-        self.paint_animation_held_max
-            .set(self.paint_animation_held_max.get().max(held_values));
-        self.log_paint_animation_activity(
-            now,
-            still_animating,
-            &floats_log,
-            &transforms_log,
-        );
-    }
-
-    /// ★합성 슬롯을 어느 원천이 가져갔나.★ `anim_win_pending_tag` 참고.
-    fn note_animation_win(&self) {
-        let now = Instant::now();
-        let window_start = *self.anim_win_window_start.borrow_mut().get_or_insert(now);
-        match self.anim_win_pending_tag.take() {
-            Some(true) => self.anim_win_took_anim.set(self.anim_win_took_anim.get() + 1),
-            Some(false) => self
-                .anim_win_took_script
-                .set(self.anim_win_took_script.get() + 1),
-            // 새 완료 없이 도는 렌더. 같은 내용을 다시 그린다.
-            None => {},
-        }
-        if now.duration_since(window_start) < Duration::from_secs(1) {
-            return;
-        }
-        *self.anim_win_window_start.borrow_mut() = Some(now);
-        let anim = self.anim_win_took_anim.replace(0);
-        let script = self.anim_win_took_script.replace(0);
-        let overwritten = self.anim_win_overwritten.replace(0);
-        log::warn!(
-            "ANIMWIN painter={:?} took_anim={anim} took_script={script} \
-             overwritten={overwritten} holding_ack={}",
-            self.painter_id,
-            // ★이것이 참인 채로 머물면 스크립트의 rAF 가 잠긴 것이다.★ 해제가 생산 경로에
-            // 붙어 있던 시절에 그 경로가 ack 를 안 풀어 실제로 멎은 적이 있다
-            // (log_ani_debug 36). 한 줄로 드러내 둔다. `script_rode_painter` 는
-            // 2026-10-21 에 빠졌다 -- 그 게이트가 사라졌다.
-            self.frame_delayer.is_holding_ack(),
-        );
-    }
-
-    /// ★실제로 프레임이 된 값만 센다.★
-    ///
-    /// `note_animation_step` 의 짝이다. 그쪽은 `update_paint_animations` 가 채운 값을
-    /// ***보내는 순간*** 재고, 이쪽은 WebRender 가 그 요청의 프레임을 다 만들었다고 알려 온
-    /// 순간 잰다. 둘 사이에 `WRRenderBackend` / `WRSceneBuilder` 스레드가 있고, 그 큐가 언제
-    /// 비는지는 우리 페이싱 스레드도 커밋 스케줄러도 정하지 않는다.
-    ///
-    /// 요청과 완료는 순서가 보장되므로 줄의 앞에서 꺼내면 된다 -- `pending_frames` 가 이미
-    /// 그 전제로 돌아간다.
-    fn note_animation_ready(&self) {
-        let Some((_, x, requested_at)) = self.anim_ready_queue.borrow_mut().pop_front() else {
-            return;
-        };
-        let now = Instant::now();
-        // ★렌더가 집어가기 전에 덮이면 그 위치는 화면에 못 간다.★
-        if self.anim_win_pending_tag.get() == Some(true) {
-            self.anim_win_overwritten
-                .set(self.anim_win_overwritten.get() + 1);
-        }
-        self.anim_win_pending_tag.set(Some(x.is_some()));
-        let window_start = *self.anim_ready_window_start.borrow_mut().get_or_insert(now);
-        match x {
-            Some(x) => {
-                self.anim_ready_latency
-                    .borrow_mut()
-                    .push(now.duration_since(requested_at).as_secs_f64() * 1000.0);
-                if let Some((previous_x, previous_at)) = self.anim_ready_previous.get() {
-                    self.anim_ready_dt
-                        .borrow_mut()
-                        .push(now.duration_since(previous_at).as_secs_f64() * 1000.0);
-                    self.anim_ready_dx.borrow_mut().push((x - previous_x) as f64);
-                }
-                self.anim_ready_previous.set(Some((x, now)));
-            },
-            None => self
-                .anim_ready_unmatched
-                .set(self.anim_ready_unmatched.get() + 1),
-        }
-
-        if now.duration_since(window_start) < Duration::from_secs(1) {
-            return;
-        }
-        *self.anim_ready_window_start.borrow_mut() = Some(now);
-        let mut dt: Vec<f64> = self.anim_ready_dt.borrow_mut().drain(..).collect();
-        let mut dx: Vec<f64> = self.anim_ready_dx.borrow_mut().drain(..).collect();
-        let mut latency: Vec<f64> = self.anim_ready_latency.borrow_mut().drain(..).collect();
-        let unmatched = self.anim_ready_unmatched.replace(0);
-        if dt.len() < 2 {
-            return;
-        }
-        // ★정렬 전에 찍는다.★ `ANIMSTEPSEQ` 와 같은 이유 -- 아래가 제자리 정렬이다.
-        if *LOG_ANIM_STEP_SEQ {
-            log::warn!(
-                "ANIMREADYSEQ painter={:?} n={} dt_ms=[{}] dx_px=[{}]",
-                self.painter_id,
-                dt.len(),
-                format_step_sequence(&dt),
-                format_step_sequence(&dx),
-            );
-        }
-        dt.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        latency.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let at = |sorted: &[f64], p: f64| -> f64 {
-            sorted[(((sorted.len() - 1) as f64) * p).round() as usize]
-        };
-        let period_ms = crate::refresh_driver::paint_timer_period().as_secs_f64() * 1000.0;
-        let band = |low: f64, high: f64| -> usize {
-            dt.iter()
-                .filter(|&&v| v >= low * period_ms && v < high * period_ms)
-                .count()
-        };
-        let dx_median = at(&dx, 0.50);
-        let spread = if dx_median.abs() > f64::EPSILON {
-            (at(&dx, 0.95) - at(&dx, 0.05)) / dx_median.abs()
-        } else {
-            0.0
-        };
-        log::warn!(
-            "ANIMREADY painter={:?} n={} per_interval dup={} one={} skip1={} skipN={} \
-             dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
-             dx_px p05={:.2} p50={:.2} p95={:.2} max={:.2} spread={:.3} \
-             lat_ms p50={:.2} p95={:.2} max={:.2} unmatched={}",
-            self.painter_id,
-            dt.len(),
-            band(0.0, 0.5),
-            band(0.5, 1.5),
-            band(1.5, 2.5),
-            dt.iter().filter(|&&v| v >= 2.5 * period_ms).count(),
-            at(&dt, 0.05),
-            at(&dt, 0.50),
-            at(&dt, 0.95),
-            at(&dt, 1.00),
-            at(&dx, 0.05),
-            at(&dx, 0.50),
-            at(&dx, 0.95),
-            at(&dx, 1.00),
-            spread,
-            at(&latency, 0.50),
-            at(&latency, 0.95),
-            at(&latency, 1.00),
-            unmatched,
-        );
-    }
-
-    /// ★한 표본과 다음 표본 사이의 **간격**을 잰다.★
-    ///
-    /// ***왜 이것이 없으면 안 되는가*** -- 이 추적은 열 라운드 동안 전부 **초당 개수**만
-    /// 셌다(발행/합성/표출/화면 도달). 그 값들이 전부 60 에 맞았는데도 화면은 매끄럽지
-    /// 않았고, 패널은 실측 60Hz 다(log_ani_debug/35). 60Hz 패널에 초당 60 개의 위치를
-    /// **고르게** 넣으면 매끄러워야 하므로, 남는 설명은 고르지 않다는 것뿐이다.
-    /// 사용자가 처음부터 말한 "순간마다 이동하는 정도가 다르게 보인다" 가 그 말이었다.
-    ///
-    /// 두 분포를 같이 낸다. 등속 애니메이션에서는 둘 다 한 점에 모여야 한다:
-    ///
-    ///   * `dt` -- 표본 시각의 간격. 이것이 흔들리면 **표본을 뜨는 박자**가 문제다.
-    ///   * `dx` -- 그 사이 값의 변화량. `dt` 는 고른데 `dx` 가 흔들리면 **값 함수**가
-    ///     문제다(보간·세그먼트 경계·외삽).
-    ///
-    /// 둘을 갈라 놓는 것이 요점이다. 개수만으로는 이 둘을 구분할 수 없고, 지금까지
-    /// 세운 가설 셋이 전부 `dt` 쪽만 건드렸다.
-    ///
-    /// `dx` 는 첫 번째 변환 키 하나만 따라간다 -- 프로브의 1x 행이면 충분하고, 키가
-    /// 바뀌면(요소가 갈리면) 그 표본은 버린다.
-    fn note_animation_step(&self, now: Instant, transforms: &[(u32, f32, f32, f32)]) {
-        if transforms.is_empty() {
-            return;
-        }
-        let window_start = *self.anim_step_window_start.borrow_mut().get_or_insert(now);
-        // ★레인마다 따로 센다.★ 키는 노드 id 의 해시라 레인을 가른다. 한 레인만 보면
-        // 다른 레인의 튐을 통째로 놓친다 -- `anim_step_previous` 주석.
-        {
-            let mut previous_by_lane = self.anim_step_previous.borrow_mut();
-            let mut dt_out = self.anim_step_dt.borrow_mut();
-            let mut dx_out = self.anim_step_dx.borrow_mut();
-            for &(key, x, _, _) in transforms {
-                if let Some(&(previous_x, previous_at)) = previous_by_lane.get(&key) {
-                    dt_out.push(now.duration_since(previous_at).as_secs_f64() * 1000.0);
-                    dx_out.push((x - previous_x) as f64);
-                }
-                previous_by_lane.insert(key, (x, now));
-            }
-        }
-        let lanes = transforms.len();
-
-        if now.duration_since(window_start) < Duration::from_secs(1) {
-            return;
-        }
-        *self.anim_step_window_start.borrow_mut() = Some(now);
-        let mut dt: Vec<f64> = self.anim_step_dt.borrow_mut().drain(..).collect();
-        let mut dx: Vec<f64> = self.anim_step_dx.borrow_mut().drain(..).collect();
-        if dt.len() < 2 {
-            return;
-        }
-        // ★정렬 전에 찍는다.★ 아래 분위수 계산이 두 벡터를 제자리에서 정렬하므로, 여기를
-        // 지나면 도착 순서가 사라진다 -- 이 계측이 존재하는 이유가 그 순서다.
-        if *LOG_ANIM_STEP_SEQ {
-            log::warn!(
-                "ANIMSTEPSEQ painter={:?} n={} dt_ms=[{}] dx_px=[{}]",
-                self.painter_id,
-                dt.len(),
-                format_step_sequence(&dt),
-                format_step_sequence(&dx),
-            );
-        }
-        dt.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let at = |sorted: &[f64], p: f64| -> f64 {
-            // nearest-rank. 표본이 60 개 남짓이라 보간할 이유가 없다.
-            let index = (((sorted.len() - 1) as f64) * p).round() as usize;
-            sorted[index]
-        };
-        // ★판정은 이 한 값이다.★ 등속 운동에서 프레임당 이동량이 중앙값 대비 얼마나
-        // 흔들리는가. 0 이면 완벽하고, 1.0 이면 어떤 프레임은 제자리이고 어떤 프레임은
-        // 두 배로 튄다는 뜻이다 -- 그것이 화면에서 떨림으로 보인다.
-        // ★한 표시 간격에 표본이 몇 개 들어갔나.★ 이것이 사용자가 물은 것이고,
-        // 1x(2,304px/s)에서 한 스텝은 60Hz 기준 38.4px 다. 하나를 건너뛰면 화면에서
-        // 76.8px 로 튀고, 둘이 한 간격에 몰리면 그중 하나는 영영 안 보인다.
-        // 실기 보고가 "30px 보다 크게 튄다" 이므로 여기가 0 이 아니어야 한다.
-        let period_ms = crate::refresh_driver::paint_timer_period().as_secs_f64() * 1000.0;
-        let band = |low: f64, high: f64| -> usize {
-            dt.iter().filter(|&&v| v >= low * period_ms && v < high * period_ms).count()
-        };
-        let dup = band(0.0, 0.5);
-        let one = band(0.5, 1.5);
-        let skip1 = band(1.5, 2.5);
-        let skipn = dt.iter().filter(|&&v| v >= 2.5 * period_ms).count();
-
-        let dx_median = at(&dx, 0.50);
-        let spread = if dx_median.abs() > f64::EPSILON {
-            (at(&dx, 0.95) - at(&dx, 0.05)) / dx_median.abs()
-        } else {
-            0.0
-        };
-        log::warn!(
-            "ANIMSTEP painter={:?} lanes={lanes} n={} per_interval dup={} one={} skip1={} skipN={} \
-             dt_ms p05={:.2} p50={:.2} p95={:.2} max={:.2} \
-             dx_px p05={:.2} p50={:.2} p95={:.2} max={:.2} spread={:.3}",
-            self.painter_id,
-            dt.len(),
-            dup,
-            one,
-            skip1,
-            skipn,
-            at(&dt, 0.05),
-            at(&dt, 0.50),
-            at(&dt, 0.95),
-            dt[dt.len() - 1],
-            at(&dx, 0.05),
-            dx_median,
-            at(&dx, 0.95),
-            dx[dx.len() - 1],
-            spread,
-        );
-    }
-
-    /// One `PAINTANIM` line a second while anything is playing.
-    ///
-    /// ★`frames` 는 2026-10-21 에 사라졌다.★ 그것은 "페인트 스레드가 디스플레이 리스트 없이
-    /// 스스로 낸 프레임" 의 수였고, 생산자가 틱 하나가 된 뒤로 구조적으로 0 이다. 남는 것은
-    /// `rode_along` -- 값이 틱의 프레임에 얹혀 간 횟수이고, 그것이 건강한 수다.
-    fn log_paint_animation_activity(
-        &self,
-        now: Instant,
-        animating: bool,
-        values: &[f32],
-        transforms: &[(u32, f32, f32, f32)],
-    ) {
-        let started = *self
-            .paint_animation_window_start
-            .borrow_mut()
-            .get_or_insert(now);
-        if now.duration_since(started) < Duration::from_secs(1) {
-            return;
-        }
-        let held = self.paint_animation_held_max.replace(0);
-        *self.paint_animation_window_start.borrow_mut() = Some(now);
-        // ***held 가 0이 아니면 아무것도 안 움직여도 찍는다.*** 화면이 검어지는 구간은 정확히
-        // 아무 애니메이션도 안 도는 구간이라, `animating` 만 보고 입을 다물면 이 진단은 자기가
-        // 설명해야 할 상태에서만 말이 없어진다.
-        if !animating && held == 0 {
-            return;
-        }
-        // `warn!` deliberately: the wall launcher's RUST_LOG leads with `warn`, and a
-        // diagnostic nobody can see is a diagnostic that does not exist.
-        // ***The values, not just the frame count.*** A frame count says the painter did
-        // work; it does not say the work changed anything. Measured on the 4-GPU wall,
-        // 2026-09-08 (log_ani_perf/08): frames flowed at 33-53 a second through every
-        // script block and the picture did not move, and from the log alone there was no
-        // way to tell a frozen value from a value that never reached the screen.
-        let sample = values
-            .iter()
-            .take(3)
-            .map(|value| format!("{value:.3}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let skipped = self.paint_animation_skipped_busy.replace(0);
-        let rode_along = self.paint_animation_rode_along.replace(0);
-        // `rode_along` is the healthy number on a wall that is already drawing: the values
-        // went out and somebody else's frame carried them. `frames` is what this animation
-        // had to produce on its own, and on a page full of video it should be near zero.
-        // Translation x/y and the x scale: enough to see a slide or a zoom move, without
-        // printing sixteen numbers per animation.
-        // `key` 는 노드마다 고정인 해시라, 값이 어느 요소의 것인지 이것으로 갈린다.
-        // 상한을 6 으로 둔다 -- 이 페이지는 애니메이션되는 요소가 두셋이고, 3 에서 잘리면
-        // 정작 궁금한 셋째가 사라진다.
-        let transform_sample = transforms
-            .iter()
-            .take(6)
-            .map(|(key, x, y, scale)| format!("{key:x}:{x:.1}/{y:.1}@{scale:.2}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        // ★값만으로는 타일을 비교할 수 없다 — 값을 만든 시각이 같이 있어야 한다.★
-        //
-        // 이 줄은 painter 마다 자기 1 초 창으로 나가고(`paint_animation_window_start` 가
-        // painter 별이다), 로그 타임스탬프는 초 단위다. 그래서 2026-09-17 에 네 타일의 x 를
-        // 나란히 놓고 "PainterId(1) 이 74px 뒤처진다" 고 읽었는데, 그 차이가 화면상의
-        // 어긋남인지 **네 줄이 서로 다른 순간에 찍힌 것뿐인지 구분할 방법이 없었다.**
-        // painter 1 이 먼저 올라오고 2/3/4 가 거의 동시에 올라오면, 창 위상이 그만큼
-        // 어긋나 똑같은 모양이 나온다.
-        //
-        // 그래서 공유 시계(`CrossProcessInstant`, 프로세스·타일을 가로질러 비교 가능)의
-        // 시각을 값과 함께 낸다. 이 함수는 샘플 직후에 불리고 `now` 가 그 샘플의 시각이므로,
-        // 여기서 읽는 값은 샘플 시각과 1ms 안쪽이다. 이제 (t, x) 를 네 타일에 대해 찍어
-        // 같은 직선 위에 있는지 보면 된다 -- 있으면 어긋남은 없고 로그 위상 차이였을 뿐이며,
-        // 없으면 그때 비로소 실제 어긋남이다.
-        let t_ms =
-            (CrossProcessInstant::now() - CrossProcessInstant::epoch()).as_seconds_f64() * 1000.0;
-        warn!(
-            "PAINTANIM painter={:?} t_ms={:.1} playing={} rode_along={} skipped_busy={} held={}              floats=[{}] transforms=[{}]",
-            self.painter_id,
-            t_ms,
-            animating,
-            rode_along,
-            skipped,
-            held,
-            sample,
-            transform_sample
-        );
     }
 
     #[track_caller]
@@ -2180,52 +1342,6 @@ impl Painter {
         }
 
         self.send_owed_canvas_ack();
-
-        // ★양성 대조★: 고친 뒤에는 스톨이 안 나므로 "아무 줄도 없음"이 남는데, 그것만으로는
-        // **고쳐진 것**과 **이 코드가 아예 안 도는 것**이 구분되지 않는다. 이 조사에서만 네 번
-        // 같은 함정에 빠졌으므로, 실제로 보낸 횟수를 초당 한 줄로 남긴다. 0 이면 안 찍는다.
-        // ★첫 건은 반드시 즉시 찍는다.★ 처음엔 1 초 창으로 합쳐서 찍었는데, 창 시작을 첫
-        // 호출에서 잡고 같은 호출에서 경과를 보므로 **딱 한 번 일어나는 경우가 영영 안 찍혔다**
-        // (2026-09-03, `log_webgpu/54`: painter 마다 1 회씩 복구했는데 `WALLACKFLUSH` 0 줄).
-        // 모호함을 없애려고 만든 양성 대조가 정작 중요한 그 경우에 스스로 침묵한 것이다.
-        // 드문 사건이므로 첫 건은 그대로 내보내고, 몰아칠 때만 1 초로 합친다.
-        //
-        // ★"드물다"가 더는 전부 참이 아니다.★ 1 차 해제(틱)는 보통 먼저 비우지만, 그것이
-        // 못 미친 빚은 전부 여기가 잡는다. 그러면 1 초 합치기 상한까지 = painter 당 초당
-        // 1 줄까지 나온다. 그 양은 병증이 아니라 이 갈래가 메워지고 있다는 뜻이다. 병증은
-        // `WALLACKLATCH` 쪽이다.
-        //
-        // ★1 차가 아예 안 도는 구성이 아직 하나 남아 있다 -- 수요 구동 임베더의 조용한
-        // 페이지다.★ servoshell / WPT / Android 는 깨우기가 에지를 예약해야 생산하므로
-        // (`wall_tick::take_scheduled_edge`, 불변식 16), 깨우기가 없으면 틱이 돌아도
-        // `produce_wall_frame` 이 안 불리고 1 차 해제도 안 돈다. 자유 실행 표출 클럭이 있는
-        // 셸(`winit_wall`)에서만 1 차가 매 주기 닿는다. (2026-10-22 전에는 그 셸에도
-        // `gfx_single_frame_producer` off 라는 ***틱 생산이 통째로 없는 구성***이 있었다.
-        // 그 pref 는 삭제됐다.)
-        //
-        // ★다만 그 고리를 푸는 것은 이 복구가 ***아니다*** -- 2026-10-22 전수 리뷰에서
-        // 바로잡았다.★ 이 함수의 호출자는 `Painter::render` 하나이고, 조용한 수요 구동
-        // 페이지에는 ***그 렌더도 없다***. 그러니 "그때 빚을 푸는 것은 이 복구뿐" 은 거짓
-        // 이었다. 실제로 고리를 끊는 것은 ★`PaintMessage::UpdateImages` 가 거는 예약★ 이다
-        // (`Paint::handle_message`): 이미지가 도착하면 다음 틱 에지가 예약되고, 그 틱의
-        // `release_owed_canvas_acks` 가 빚을 푼다. 그 줄의 주석에 닫힌 고리 전문과 실측
-        // (이 줄이 없으면 10 초 동안 프레임 0)이 있다. 이 복구는 ***렌더가 도는*** 타일의
-        // 2 차 그물이다.
-        let total = self.owed_ack_flush_count.get() + 1;
-        self.owed_ack_flush_count.set(total);
-        let now = Instant::now();
-        let due = self
-            .owed_ack_last_report
-            .get()
-            .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
-        if due {
-            self.owed_ack_last_report.set(Some(now));
-            warn!(
-                "WALLACKFLUSH: painter {:?} sent an owed canvas ack ({} so far). \
-                 Each one is a frame script would otherwise have waited for forever.",
-                self.painter_id, total,
-            );
-        }
     }
 
     /// ★1 차 캔버스 ack 해제.★ 판정은 `ack_is_releasable` 하나다: `renderer_behind()` 도,
@@ -2320,79 +1436,9 @@ impl Painter {
         );
     }
 
-    /// 스크립트가 이 painter 의 캔버스 ack 를 기다리다 잠긴 채로 남아 있는지 본다.
-    ///
-    /// ★여기에 거는 이유★: 스톨이 나면 스크립트도 WebGL 스레드도 논리 프레임도 전부 멈추는데
-    /// **렌더 패스만은 계속 돈다**(winit_wall 의 표출 클럭이 내용과 무관하게 그리므로,
-    /// 2026-09-02 스톨 실행에서 초당 185회). 그래서 살아 있는 유일한 자리가 여기다.
-    ///
-    /// 잠기는 구조: 캔버스를 그린 문서는 `waiting_on_canvas_image_updates` 로 잠기고
-    /// `script_thread.rs:1441` 에서 rAF 가 통째로 건너뛰어진다. 그 잠금은 painter 가
-    /// `NoLongerWaitingOnAsynchronousImageUpdates` 를 보내야만 풀린다.
-    ///
-    /// ★전문을 만드는 자리는 둘이다★(2026-10-21 이전에는 넷이었고, 전부 생산에 붙어
-    /// 있었다): 1 차는 [`Painter::release_owed_canvas_ack`](호출자는 페이싱 틱 하나),
-    /// 복구는 렌더 맨 앞의 [`Painter::flush_owed_canvas_ack`]. 이 줄이 뜬다는 것은 ★둘 다
-    /// 못 돌았다★ 는 뜻이다 — 틱도 렌더도 멎었거나, 복구 킬 스위치
-    /// (`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY`)가 켜져 있다.
-    ///
-    /// 건강할 때는 한 줄도 안 찍는다. 찍혔다면 그 자체가 병증이다.
-    ///
-    /// ★실측 기록과 필드 대 필드로 비교하지 말 것.★ 실측된 ***자연*** 스톨(2026-09-02,
-    /// `log_webgpu/51` `ack_34`)은 `pending_frame=true pending_canvas_images=0
-    /// renderer_behind=false` 였는데, `pending_frame` 은 2026-10-21 에 필드째 사라져 이
-    /// 줄에 더는 안 실린다. ★재현 여부는 영향받지 않는다★ — 잠긴다는 사실과 빚이 남는다는
-    /// 사실은 `is_holding_ack()` 하나로 걸린다.
-    fn check_canvas_ack_latch(&self) {
-        if !self.frame_delayer.is_holding_ack() {
-            self.canvas_ack_held_since.set(None);
-            self.canvas_ack_last_report.set(None);
-            return;
-        }
-        let now = Instant::now();
-        let held_since = match self.canvas_ack_held_since.get() {
-            Some(since) => since,
-            None => {
-                self.canvas_ack_held_since.set(Some(now));
-                return;
-            },
-        };
-        let held_ms = now.duration_since(held_since).as_secs_f64() * 1000.0;
-        if held_ms < 1000.0 {
-            return;
-        }
-        if let Some(last) = self.canvas_ack_last_report.get() {
-            if now.duration_since(last).as_secs_f64() < 1.0 {
-                return;
-            }
-        }
-        self.canvas_ack_last_report.set(Some(now));
-        // 게이트의 값을 그대로 싣는다 — 무엇이 막았는지가 이 줄의 존재 이유다.
-        // `pending_frame` 은 2026-10-21 에 빠졌다 -- 필드 자체가 사라졌다.
-        warn!(
-            "WALLACKLATCH: painter {:?} held the canvas ack for {:.0}ms; \
-             pending_canvas_images={} renderer_behind={} \
-             composite_in_flight={}. Script cannot run another rAF until it is sent.",
-            self.painter_id,
-            held_ms,
-            self.frame_delayer.pending_canvas_image_count(),
-            self.renderer_behind(),
-            self.display_composite_in_flight.get(),
-        );
-    }
-
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
-        // 복구가 먼저, 진단이 나중. 이 순서라면 아래 경고가 찍힌다는 것은 곧 "복구조차 할 수
-        // 없는 상태"라는 뜻이므로, 남겨 두면 회귀 탐지기가 된다.
         self.flush_owed_canvas_ack();
-        self.check_canvas_ack_latch();
-        let render_count = self.render_count.get() + 1;
-        self.render_count.set(render_count);
-        let local_frame_id = self.last_ready_local_frame_id.get();
-        let wall_logical_frame_id = self.last_ready_wall_logical_frame_id.get();
-        // 초당 한 번 GPU 메모리를 남긴다. 전환 구간의 드라이버 정체가 메모리 압박과
-        // 같이 가는지를 보려면 그 눈금이 로그 안에 있어야 한다.
         {
             let now = Instant::now();
             let due = self
@@ -2401,113 +1447,31 @@ impl Painter {
                 .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
             if due {
                 self.last_gpu_memory_log_at.set(Some(now));
-                if let Some(device) = self.rendering_context.media_d3d11_device_handle_borrowed() {
-                    log_gpu_memory(self.painter_id, device);
-                }
                 // 어느 타일에도 보이지 않는 영상의 D3D11 링을 회수한다.
                 //
                 // ★이 청소는 프레임마다 도는 이 자리에 있어야 한다★ — 링 회수는 원래
                 // 그 영상의 프로듀서가 프레임을 만들 때만 돌았는데, 정작 회수해야 할 때는
                 // 그 프로듀서가 멈춘 뒤다(앱이 요소를 남긴 채 재생만 멈추는 경우).
                 // 실측: 그렇게 링이 321개, 3.8GB 까지 쌓였고 바닥값이 내려오지 않았다.
-                let reclaimed =
+                let _ =
                     servo_media::player::d3d11_ring::D3d11PlaneRings::expire_all_stale_demand(
                         servo_media::player::d3d11_ring::RING_DEMAND_TTL,
                     );
-                if reclaimed > 0 {
-                    warn!(
-                        "MEDIARINGRECLAIM painter={:?} rings={reclaimed}",
-                        self.painter_id
-                    );
-                }
             }
         }
 
         // 이 스레드의 렌더 프레임 경계를 알린다. 프레임 **안에서** 하는 일에 상한을
         // 두려는 쪽(새 비디오 링의 최초 소비)이 이 값으로 프레임이 바뀐 것을 안다.
         paint_api::render_frame::begin_render_frame();
-        let render_start = Instant::now();
-        let render_cpu_start = thread_cpu_ms();
-        if self.rendering_context.requested_gpu_index().is_some() {
-            info!(
-                "Wall render start: painter {:?} render_count={} local_frame_id={:?} \
-                 logical_frame_id={:?} pending={} overlapping_request_count={} \
-                 unexpected_ready_count={} requested_gpu={:?} size={:?}",
-                self.painter_id,
-                render_count,
-                local_frame_id,
-                wall_logical_frame_id,
-                self.pending_frames.get(),
-                self.overlapping_frame_request_count.get(),
-                self.unexpected_frame_ready_count.get(),
-                self.rendering_context.requested_gpu_index(),
-                self.rendering_context.size(),
-            );
-        } else {
-            debug!(
-                "Render start: painter {:?} render_count={} local_frame_id={:?} \
-                 logical_frame_id={:?} pending={} size={:?}",
-                self.painter_id,
-                render_count,
-                local_frame_id,
-                wall_logical_frame_id,
-                self.pending_frames.get(),
-                self.rendering_context.size(),
-            );
-        }
-
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
-        self.note_animation_win();
         self.last_render_started_at.set(Some(Instant::now()));
 
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
-        // Diagnostic (SERVO_LOG_PRESENT_CADENCE): a large gap since the END of the previous
-        // render pass means the stall happened upstream of the renderer (no render was
-        // requested during the gap), as opposed to a slow render pass itself ("Slow paint
-        // frame" below).
-        if *LOG_PRESENT_CADENCE {
-            if let Some(last_end) = self.last_render_end.get() {
-                let gap_ms = last_end.elapsed().as_secs_f64() * 1000.0;
-                if gap_ms > 100.0 {
-                    info!(
-                        "Paint gap: painter {:?} gap_since_last_render_end_ms={:.1}",
-                        self.painter_id, gap_ms,
-                    );
-                }
-            }
-        }
-
-        // Diagnostic breakdown (env SERVO_LOG_PRESENT_CADENCE): WebRender update() applies
-        // pending resource updates (notably per-frame video texture uploads); render() draws
-        // and composites the scene. Splitting them tells whether an over-budget frame is
-        // upload-bound or draw/composite-bound.
-        let mut wr_update_ms = 0.0_f64;
-        let mut wr_render_ms = 0.0_f64;
-        let mut wr_stats: Option<webrender::RendererStats> = None;
-        // ANGLE 락을 기다린 시간. 이 락은 타일 렌더 전체를 감싸므로, 타일이 느린 것이
-        // 제 일 때문인지 남을 기다린 것인지는 이 값으로만 갈린다.
-        //
-        // 2026-09-01 이후 락은 ANGLE D3D11 디바이스당 하나다(`paint_api::angle_gl_lock`).
-        // 전역이던 시절 이 값은 WebGL 스레드와의 경합까지 포함했지만, 이제 같은 디바이스를
-        // 쓰는 상대하고만 부딪친다 — 그래서 이 수치가 여전히 크다면 그건 GPU 를 공유하는
-        // 다른 타일이지 WebGL 이 아니다.
-        //
-        // ★정렬 pref(`gfx_present_align_commit_pct`)가 켜져 있으면 스케줄러의 커밋도 이
-        // 값에 들어간다.★ 이 락 안에서 도는 `end_frame` 이 그 디바이스의 커밋 뮤텍스를
-        // 잡으므로, 스케줄러가 같은 디바이스를 커밋하는 중이면 이 painter 는 ANGLE 락을 쥔 채
-        // ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 가 반증)★ — 실측 1~3ms(나쁜 실행 8~10ms), 라이브 평균 2.04ms. ANGLE 락 안전 논증을 다시 세워야 한다.
-        // 그 커밋이 끝나기를 기다린다. 그 대기의 상한은 `Commit()` 하나(~0.02ms)로 못 박혀
-        // 있고(`commit_guard` 모듈 주석), 실제 값은 LOCKWAIT 의
-        // `lock_wait_painter_us_max` 다 -- 반대 방향인 `lock_wait_sched_us_max`(스케줄러가
-        // 페인터의 `end_frame` 임계구역을 기다린 시간)와 섞어 읽으면 안 된다.
-        let angle_lock_ms;
         {
-            let lock_start = Instant::now();
             let _angle_gl_guard =
                 paint_api::angle_gl_lock(self.rendering_context.angle_d3d11_device_ptr());
-            angle_lock_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
 
             if let Err(error) = self.rendering_context.make_current() {
                 error!("Failed to make the rendering context current: {error:?}");
@@ -2522,9 +1486,7 @@ impl Painter {
                 time_profiler_channel.clone(),
                 || {
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
-                        let update_start = Instant::now();
                         renderer.update();
-                        wr_update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
                     }
 
                     // Paint the scene.
@@ -2532,12 +1494,7 @@ impl Painter {
                     self.clear_background();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
-                        let draw_start = Instant::now();
-                        wr_stats = renderer
-                            .render(size, 0 /* buffer_age */)
-                            .ok()
-                            .map(|results| results.stats);
-                        wr_render_ms = draw_start.elapsed().as_secs_f64() * 1000.0;
+                        let _ = renderer.render(size, 0 /* buffer_age */);
                     }
 
                     // The native compositor's `bind` leaves an EGL pbuffer current. Restore the
@@ -2560,8 +1517,6 @@ impl Painter {
         self.screenshot_taker.maybe_take_screenshots(self);
         self.send_pending_paint_metrics_messages_after_composite();
 
-        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
-        let render_cpu_ms = thread_cpu_ms() - render_cpu_start;
         // This render pass consumed every frame published so far (renderer.update() above
         // drained the whole publish queue), so the in-flight display composite is done.
         self.set_display_composite_in_flight(false);
@@ -2578,87 +1533,7 @@ impl Painter {
         // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
         // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
-        // ★이 렌더가 벽 프레임 번호를 달고 왔나.★ 대부분이 안 달고 온다면 이 경로는 벽
-        // 프레임 조정(네 타일을 같은 프레임에 묶는 배리어) 밖에서 도는 것이고, 그것이
-        // 샘플 시각보다 먼저 확인해야 할 사실이다(`output_grid::FRAME_IDS` 주석).
-        #[cfg(windows)]
-        crate::output_grid::note_frame_id(
-            self.painter_id,
-            self.last_ready_wall_logical_frame_id.get(),
-        );
         self.pump_paint_animation(PumpSource::Render);
-        if *LOG_PRESENT_CADENCE {
-            self.last_render_end.set(Some(Instant::now()));
-        }
-        // Diagnostic: surface frames that blew the ~16.7ms vsync budget, with the WebRender
-        // upload-vs-draw split plus renderer stats (video texture upload MB / texture cache
-        // update ms / draw calls), to localize the bottleneck under heavy load (many videos).
-        // A stall frame with normal upload_mb points at a driver/GPU sync or cache
-        // reallocation; one with a big upload_mb spike points at an upload burst.
-        if *LOG_PRESENT_CADENCE && render_ms > 16.0 {
-            // ★`cpu_ms` 가 wall 의 절반을 넘는다는 것이 실측되었다★(340ms 중 140ms,
-            // 280ms 중 219ms) — 이 정체는 GPU 대기가 아니라 이 스레드가 태우는 CPU 다.
-            // 그런데 업로드는 0이고 draw call 은 26개다. 그러면 WebRender 가 이미 재고
-            // 있는 나머지 시계들을 봐야 한다 — 특히 GPU 캐시 갱신은 프레임마다 CPU 로
-            // 데이터를 채우는 자리라, 전환처럼 프리미티브가 통째로 바뀌면 커진다.
-            let (upload_mb, upload_ms, gpu_cache_ms, draw_calls, alpha_targets, color_targets) =
-                wr_stats.as_ref().map_or((0.0, 0.0, 0.0, 0, 0, 0), |stats| {
-                    (
-                        stats.texture_upload_mb,
-                        stats.resource_upload_time,
-                        stats.gpu_cache_upload_time,
-                        stats.total_draw_calls,
-                        stats.alpha_target_count,
-                        stats.color_target_count,
-                    )
-                });
-            info!(
-                "Slow paint frame: painter {:?} total_ms={:.2} angle_lock_ms={:.2} wr_update_ms={:.2} wr_render_ms={:.2} upload_mb={:.1} upload_ms={:.1} draw_calls={} gpu_cache_ms={:.1} alpha_targets={} color_targets={} cpu_ms={:.1} pending_frames={}",
-                self.painter_id,
-                render_ms,
-                angle_lock_ms,
-                wr_update_ms,
-                wr_render_ms,
-                upload_mb,
-                upload_ms,
-                draw_calls,
-                gpu_cache_ms,
-                alpha_targets,
-                color_targets,
-                render_cpu_ms,
-                self.pending_frames.get(),
-            );
-        }
-        if self.rendering_context.requested_gpu_index().is_some() {
-            info!(
-                "Wall render end: painter {:?} render_count={} local_frame_id={:?} \
-                 logical_frame_id={:?} render_ms={:.3} angle_lock_ms={:.3} pending={} \
-                 overlapping_request_count={} unexpected_ready_count={} \
-                 requested_gpu={:?} size={:?}",
-                self.painter_id,
-                render_count,
-                local_frame_id,
-                wall_logical_frame_id,
-                render_ms,
-                angle_lock_ms,
-                self.pending_frames.get(),
-                self.overlapping_frame_request_count.get(),
-                self.unexpected_frame_ready_count.get(),
-                self.rendering_context.requested_gpu_index(),
-                self.rendering_context.size(),
-            );
-        } else {
-            debug!(
-                "Render end: painter {:?} render_count={} local_frame_id={:?} \
-                 logical_frame_id={:?} render_ms={:.3} pending={}",
-                self.painter_id,
-                render_count,
-                local_frame_id,
-                wall_logical_frame_id,
-                render_ms,
-                self.pending_frames.get(),
-            );
-        }
 
         // 타일 스레드에 사는 painter 는 표출까지 자기가 한다 — 셸에는 이 컨텍스트가 없다.
         // 인라인 경로에서는 셸이 present 하므로 여기서는 아무것도 하지 않는다.
@@ -2869,84 +1744,12 @@ impl Painter {
         }
     }
 
-    /// Tally one composite request against the source line that asked for it, and dump the
-    /// tally once a second.
-    ///
-    /// ★왜★ — 20 영상 월에서 단일 painter 가 초당 200 회 이상 합성했는데,
-    /// `gfx_refresh_hz` 는 렌더러 틱(60Hz)만 페이싱하고 script 는 자체 20/30ms 타이머를
-    /// 따로 돌린다. 둘을 합쳐도 상한이 ~110 이라 남은 몫이 어디서 오는지 총합만으로는
-    /// 알 수 없다. 그래서 WR 출처를 줄 번호로 가른다 -- 호출 지점이 11 곳이던 시절에 그
-    /// 가름이 필요했고, ★지금은 그 줄 번호가 "생산 지점이 하나인가" 를 판정하는 눈금이다★
-    /// (설계 8 절: 구별 값이 정확히 둘이어야 한다). WR 을 안 거치는 `present_external_only`
-    /// 는 `note_frame_source` 로 따로 센다.
-    ///
-    /// 기본 off(`SERVO_FRAME_REASON_PROF`). 프레임마다 불리는 자리라 켜져 있을 때만
-    /// 해시맵을 건드린다.
-    fn note_frame_reason(&self, caller: &'static Location<'static>, reason: RenderReasons) {
-        self.note_frame_source(
-            FrameSource::WebRender { line: caller.line() },
-            format!("{reason:?}"),
-        );
-    }
-
-    /// ★`generate_frame` 을 안 거치는 표출 경로의 자리다.★ `note_frame_reason` 과 같은 창·같은
-    /// 줄에 같은 `<source>/<reason>=<n>` 꼴로 들어간다(런처 파서가 그 꼴을 읽는다).
-    fn note_frame_source(&self, source: FrameSource, reason: String) {
-        if !*FRAME_REASON_PROF {
-            return;
-        }
-        let now = Instant::now();
-        let start = match self.frame_reason_window_start.get() {
-            Some(start) => start,
-            None => {
-                self.frame_reason_window_start.set(Some(now));
-                now
-            },
-        };
-        self.frame_reason_counts.borrow_mut().note(source, reason);
-
-        let elapsed = now.duration_since(start);
-        if elapsed < Duration::from_secs(1) {
-            return;
-        }
-        let (total, breakdown) = self.frame_reason_counts.borrow_mut().drain_report();
-        info!(
-            "FRAMEREASON total={total} window_ms={:.0} {breakdown}",
-            elapsed.as_secs_f64() * 1000.0
-        );
-        self.frame_reason_window_start.set(Some(now));
-    }
-
-    /// 벽 페이서가 coalesce 해 두었던 요청을 풀어 낸 것을 센다(`wall_pacer_join`).
-    /// 풀린 요청은 이어서 WR 프레임이 되어 그쪽에서 또 세어지므로, 이 값은 합성 총합
-    /// (`total`)에 더하지 않는다 -- "두 번째 문" 이 열린 횟수만 보인다.
-    ///
-    /// ★2026-10-21 Task 7 뒤로 이 값은 ***영구히 0*** 이다★ — 울릴 수 있어서 0 인 것이
-    /// 아니라, coalesce 큐를 채우던 유일한 자리(`Paint::coalesce_wall_frame_request`, 그
-    /// 호출자는 `PaintMessage::GenerateFrame`)가 같이 사라져 ★채울 경로가 없기 때문★ 이다.
-    /// 지금 이 계수기는 탐지기라기보다 ★걸림쇠의 위치 표시★ 다.
-    ///
-    /// ★언제 다시 울릴 수 있나:★ 누군가 `Paint::coalesced_wall_frame_requests` 에 다시 요청을 넣는
-    /// 경로를 들이면(= 삭제된 `coalesce_wall_frame_request` 의 재추가, 또는
-    /// `PaintMessage::GenerateFrame` 을 다시 생산으로 잇는 변경) 그때부터
-    /// `try_release_coalesced_wall_frame_requests` 가 ★두 번째 문으로 프레임을 낸다★.
-    /// 그 순간 이 값이 0 을 벗어나고, 그것이 설계 8 절의 실패 판정이다 — 생산자가 둘이다.
-    pub(crate) fn note_wall_pacer_join(&self) {
-        self.note_frame_source(FrameSource::WallPacerJoin, "RELEASE".to_string());
-    }
-
     /// Queue a new frame in the transaction and increase the pending frames count.
-    ///
-    /// `#[track_caller]`: so `note_frame_reason` can name the call site without the callers
-    /// having to pass a label. 호출자가 11 곳이던 시절에 생긴 장치이고, 지금은 그 줄 번호가
-    /// "생산 지점이 하나인가" 의 눈금이다(설계 8 절).
-    #[track_caller]
     pub(crate) fn generate_frame(&self, transaction: &mut Transaction, reason: RenderReasons) {
         self.generate_frame_with_diagnostic_id(transaction, reason, None, None);
     }
 
     /// Queue a new frame using a shared logical diagnostic id supplied by `Paint`.
-    #[track_caller]
     pub(crate) fn generate_frame_with_diagnostic_id(
         &self,
         transaction: &mut Transaction,
@@ -2954,15 +1757,6 @@ impl Painter {
         wall_logical_frame_id: Option<u64>,
         wall_requested_at: Option<Instant>,
     ) {
-        self.note_frame_reason(Location::caller(), reason);
-        // Every frame, whatever asked for it. A paint-side animation needs to know whether
-        // anyone else is already producing frames -- see `perform_updates`.
-        self.last_frame_generated_at.set(Some(Instant::now()));
-        // ★이 대입을 되돌리는 자리는 더 없다(2026-10-21 Task 7).★ 셋이 있었고
-        // (`pump_paint_animation` 비디오 분기, `flush_deferred_animation_frame`,
-        // `update_images` 의 비디오 도착 합성) 전부 자기 생산 블록과 함께 사라졌다 --
-        // 필드 주석 참고. writer 는 이제 여기 하나다.
-        self.last_frame_by_other_source_at.set(Some(Instant::now()));
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);
@@ -2978,14 +1772,6 @@ impl Painter {
             pending_frames_before_request,
         );
         self.pending_frames.set(pending_frames_before_request + 1);
-        // ★완료와 짝지으려고 모든 요청을 줄 세운다.★ 애니메이션이 아닌 요청도 넣는다 --
-        // `pending_frames` 가 종류를 가리지 않고 세므로, 줄도 같은 규칙이어야 완료 하나에
-        // 요청 하나가 대응한다. 애니메이션 값이 없는 요청은 `None` 으로 들어간다.
-        self.anim_ready_queue.borrow_mut().push_back((
-            local_frame_id,
-            self.anim_ready_pending_x.take(),
-            Instant::now(),
-        ));
     }
 
     pub(crate) fn pending_frames(&self) -> usize {
@@ -2996,26 +1782,9 @@ impl Painter {
     /// See `pending_video_frame_updates` for the rationale.
     fn flush_pending_video_frame_updates(&self, transaction: &mut Transaction) {
         let mut pending_updates = self.pending_video_frame_updates.borrow_mut();
-        let flushed = !pending_updates.is_empty();
         for (key, (descriptor, data)) in pending_updates.drain() {
             transaction.update_image(key, descriptor, data.into(), &DirtyRect::All);
         }
-        if !flushed {
-            return;
-        }
-        // 실제로 비디오가 실려 나간 순간들 사이의 간격. 최댓값만 남긴다 — 끊김은 평균이
-        // 아니라 최악의 한 번이다.
-        let now = Instant::now();
-        if let Some(last) = self.last_video_presented_at.get() {
-            let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-            UPDATE_IMAGES_STATS.with(|stats| {
-                let mut stats = stats.borrow_mut();
-                if gap_ms > stats.video_gap_max_ms {
-                    stats.video_gap_max_ms = gap_ms;
-                }
-            });
-        }
-        self.last_video_presented_at.set(Some(now));
     }
 
     pub(crate) fn wall_scroll_offsets_signature(&self, webview_id: WebViewId) -> Option<String> {
@@ -3461,38 +2230,6 @@ impl Painter {
         }
 
         self.pending_frames.set(pending_frames - 1);
-        self.note_animation_ready();
-
-        // Diagnostic: accumulate the actual frame-ready cadence and log once per second.
-        if *LOG_PRESENT_CADENCE {
-            let now = Instant::now();
-            if let Some(last) = self.present_cadence_last.get() {
-                let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-                if gap_ms > self.present_cadence_max_gap_ms.get() {
-                    self.present_cadence_max_gap_ms.set(gap_ms);
-                }
-            }
-            self.present_cadence_last.set(Some(now));
-            self.present_cadence_count
-                .set(self.present_cadence_count.get() + 1);
-            let start = self.present_cadence_start.get().unwrap_or_else(|| {
-                self.present_cadence_start.set(Some(now));
-                now
-            });
-            let elapsed = now.duration_since(start).as_secs_f64();
-            if elapsed >= 1.0 {
-                info!(
-                    "Present cadence: painter {:?} presents/s={:.1} max_gap_ms={:.2} pending={}",
-                    self.painter_id,
-                    self.present_cadence_count.get() as f64 / elapsed,
-                    self.present_cadence_max_gap_ms.get(),
-                    self.pending_frames.get(),
-                );
-                self.present_cadence_start.set(Some(now));
-                self.present_cadence_count.set(0);
-                self.present_cadence_max_gap_ms.set(0.0);
-            }
-        }
 
         let frame = self.pending_frame_diagnostics.borrow_mut().pop_front();
         let Some(frame) = frame else {
@@ -3697,39 +2434,6 @@ impl Painter {
         let tick_frames_produced = self.wall_tick_frames_produced.get();
         if bootstrap_frame_allowed(already_bootstrapped, tick_frames_produced) {
             self.generate_frame(&mut txn, RenderReasons::SCENE);
-            let emitted = self.bootstrap_frames_emitted.get() + 1;
-            self.bootstrap_frames_emitted.set(emitted);
-            // 파이프라인당 최대 한 번이라 합치지 않는다 -- 이 줄의 총합이 곧 "예외가 낸
-            // 프레임 수" 이고, 설계 8 절이 세는 값이다.
-            info!(
-                "WALLBOOTSTRAP: painter {:?} emitted the bootstrap frame for {:?} \
-                 (emitted={emitted} declined={} tick_frames_produced={tick_frames_produced}). \
-                 This is the only producer outside the wall tick; it terminates once the tick \
-                 has produced once for this tile.",
-                self.painter_id,
-                servo_pipeline_id,
-                self.bootstrap_frames_declined.get(),
-            );
-        } else {
-            let declined = self.bootstrap_frames_declined.get() + 1;
-            self.bootstrap_frames_declined.set(declined);
-            let now = Instant::now();
-            let due = self
-                .bootstrap_decline_last_report
-                .get()
-                .is_none_or(|last| now.duration_since(last).as_secs_f64() >= 1.0);
-            if due {
-                self.bootstrap_decline_last_report.set(Some(now));
-                info!(
-                    "WALLBOOTSTRAP: painter {:?} declined the bootstrap frame for {:?} \
-                     (declined={declined} emitted={} already_bootstrapped={already_bootstrapped} \
-                     tick_frames_produced={tick_frames_produced}). The display list still went \
-                     out; the wall tick carries it.",
-                    self.painter_id,
-                    servo_pipeline_id,
-                    self.bootstrap_frames_emitted.get(),
-                );
-            }
         }
         self.send_transaction(txn);
     }
@@ -3868,40 +2572,6 @@ impl Painter {
             display_list_info.caret_property_binding,
             &self.web_content_animator,
         );
-        // ★타일마다 같은 애니메이션이 다른 위치에 있는 것을 여기서 가른다.★
-        //
-        // 실측(2026-09-17, log_ani_debug/22): 등속 translateX 하나를 4 타일이 그리는데
-        // PainterId(1) 이 나머지 셋보다 항상 50~74px(약 39ms) 뒤에 있었다. 부호가 한 번도
-        // 바뀌지 않았고, 2/3/4 는 서로 0.4px 안에 들었다. 밀어넣기 주기는 넷이 동일했으므로
-        // (frames=35 rode_along=25 skipped_busy=0) 원인은 박자가 아니라 **앵커**다.
-        //
-        // 앵커는 `created_at = received_at - (now - built_at)` 로 잡히므로 원리상 네 타일이
-        // 같은 절대 시각에 수렴해야 한다. 수렴하지 않는다면 셋 중 하나다: `built_at` 이 타일마다
-        // 다르거나(타일별로 디스플레이 리스트를 따로 만든다), transit 이
-        // `MAX_DISPLAY_LIST_TRANSIT` 에 잘리거나, `offset_from_display_list` 가 다르거나.
-        // 그 셋을 구분하려면 입력값을 그대로 봐야 한다 -- 결과인 좌표만으로는 되짚을 수 없다.
-        if !display_list_info.paint_animations.is_empty() {
-            let now = CrossProcessInstant::now();
-            let detail = display_list_info
-                .paint_animations
-                .iter()
-                .map(|animation| {
-                    format!(
-                        "offset={:.4} transit_ms={:.2}",
-                        animation.offset_from_display_list,
-                        (now - animation.built_at).as_seconds_f64() * 1000.0,
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            warn!(
-                "PAINTANIMANCHOR painter={:?} epoch={:?} count={} {}",
-                self.painter_id,
-                epoch,
-                display_list_info.paint_animations.len(),
-                detail
-            );
-        }
         details
             .animations
             .install_paint_animations(display_list_info.paint_animations);
@@ -4017,11 +2687,6 @@ impl Painter {
     }
 
     pub(crate) fn update_images(&mut self, updates: SmallVec<[ImageUpdate; 1]>) {
-        // 이 함수 한 번이 45µs 로 측정됐고(초당 5,812회 = 메인 스레드의 287ms), 그 시간이
-        // 스태시인지 합성 요청인지 트랜잭션 전송인지는 재지 않으면 모른다. pref 읽기는
-        // 하나뿐이라 이미 배제됐다.
-        let inner_started = Instant::now();
-        let mut send_ms = 0.0_f64;
         let mut txn = Transaction::new();
         // Task 3: track content image updates that arrive WITHOUT a canvas epoch (notably video
         // frames). These are not paced by the script rendering-opportunity, so they otherwise wait
@@ -4060,18 +2725,6 @@ impl Painter {
                         // dropped here instead of piling up in WebRender's queues (which
                         // cannot skip them; see `pending_video_frame_updates`).
                         immediate_image_update = true;
-                        // 도착 간격. 표출 간격(`last_video_presented_at`)과 짝으로 본다.
-                        let now = Instant::now();
-                        if let Some(last) = self.last_video_arrived_at.get() {
-                            let gap_ms = now.duration_since(last).as_secs_f64() * 1000.0;
-                            UPDATE_IMAGES_STATS.with(|stats| {
-                                let mut stats = stats.borrow_mut();
-                                if gap_ms > stats.video_arrival_gap_max_ms {
-                                    stats.video_arrival_gap_max_ms = gap_ms;
-                                }
-                            });
-                        }
-                        self.last_video_arrived_at.set(Some(now));
                         self.pending_video_frame_updates
                             .borrow_mut()
                             .insert(key, (desc, data));
@@ -4178,9 +2831,6 @@ impl Painter {
                     if let Some(shared) = self.dcomp_shared.as_ref() {
                         crate::dcomp_compositor::SharedDComp(shared.clone())
                             .present_external_only();
-                        // ★WR 프레임이 아니라 DComp 직행 commit 이다★ — `generate_frame` 을
-                        // 안 거쳐 FRAMEREASON 에 안 잡히던 경로(2026-10-21).
-                        self.note_frame_source(FrameSource::ExternalSurface, "PRESENT".to_string());
                     }
                 }
             }
@@ -4226,40 +2876,8 @@ impl Painter {
         // transaction (the stash is flushed by the next composite); skip the send to avoid
         // pushing hundreds of no-op transactions per second through the scene builder.
         if !txn.is_empty() {
-            let send_started = Instant::now();
             self.send_transaction(txn);
-            send_ms = send_started.elapsed().as_secs_f64() * 1000.0;
         }
-        UPDATE_IMAGES_STATS.with(|stats| {
-            let mut stats = stats.borrow_mut();
-            stats.calls += 1;
-            stats.total_ms += inner_started.elapsed().as_secs_f64() * 1000.0;
-            stats.send_ms += send_ms;
-            let window = stats.window_start.get_or_insert_with(Instant::now);
-            let elapsed = window.elapsed();
-            if elapsed >= Duration::from_secs(1) {
-                warn!(
-                    // ★`raf_idle=` 필드는 2026-10-22 에 이 줄에서 사라졌다(rAF 게이트
-                    // 삭제, 설계 4 절).★ 세던 사건("rAF 는 도는데 프레임이 안 나와서
-                    // 비디오가 스스로 합성해야 했다")이 구조적으로 0 이라 값이 아니라
-                    // ***필드째*** 뺐다. ★그래서 2026-10-22 이전 로그와는 필드 수가
-                    // 다르다★ -- 옛 로그를 자리로 파싱하는 외부 스크립트는 그 날짜를
-                    // 경계로 갈라서 읽어야 한다.
-                    "IMGUPDINNER window_ms={:.0} calls={} total_ms={:.1} send_ms={:.1} rest_ms={:.1} vidgap_max_ms={:.1} vidarrive_max_ms={:.1}",
-                    elapsed.as_secs_f64() * 1000.0,
-                    stats.calls,
-                    stats.total_ms,
-                    stats.send_ms,
-                    (stats.total_ms - stats.send_ms).max(0.0),
-                    stats.video_gap_max_ms,
-                    stats.video_arrival_gap_max_ms,
-                );
-                *stats = UpdateImagesStats {
-                    window_start: Some(Instant::now()),
-                    ..Default::default()
-                };
-            }
-        });
     }
 
     /// 이 painter 의 창이 올라가 있는 모니터(`HMONITOR`).
@@ -4979,7 +3597,7 @@ pub(crate) static LOG_ANIM_STEP_SEQ: LazyLock<bool> =
 /// 적고 있었다(`pump_paint_animation`, `output_grid::PUMP_FROM_RENDER`).
 ///
 /// 이 enum 이 실제로 가르는 것은 하나다: ★이 pump 가 다음 틱 에지에 생산을 예약해도
-/// 되는가★([`PumpSource::may_schedule`]). 계수기는 덤이다.
+/// 되는가★([`PumpSource::may_schedule`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PumpSource {
     /// `Painter::render` 의 끝. ★렌더가 도는 동안의 정규 박자.★ 렌더당 정확히 한 번이고,
@@ -5039,128 +3657,6 @@ impl PumpSource {
     /// 걷어낸 바로 그 종류의 상수다. 고리를 끊으면 박자는 이미 있는 렌더 클럭이 준다.
     pub(crate) fn may_schedule(self) -> bool {
         !matches!(self, PumpSource::Tick)
-    }
-
-    /// `SAMPLESLIP` 의 `pump_all` 계수기에 한 번 센다.
-    #[cfg(windows)]
-    fn note(self) {
-        match self {
-            PumpSource::Render => crate::output_grid::note_pump_from_render(),
-            PumpSource::Idle => crate::output_grid::note_pump_from_idle(),
-            PumpSource::Tick => crate::output_grid::note_pump_from_tick(),
-        }
-    }
-}
-
-/// 합성 한 번을 만든 출처. `FRAMEREASON` 줄에서 `<source>/<reason>=<n>` 의 `<source>` 자리다.
-///
-/// ★`WebRender` 만 줄 번호를 가진다.★ 나머지는 WR 프레임이 아니거나(`ExternalSurface`: DComp
-/// 직행 commit) 합성이 아니라 합류 자체다(`WallPacerJoin`). 줄 번호로 못 가르는 둘을 이름으로 가른다.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum FrameSource {
-    WebRender { line: u32 },
-    ExternalSurface,
-    WallPacerJoin,
-}
-
-impl FrameSource {
-    /// 런처 파서(`run_wall_dist.ps1`)가 읽는 이름. `painter.rs:<line>` 꼴은 바꾸지 않는다.
-    fn label(&self) -> String {
-        match self {
-            FrameSource::WebRender { line } => format!("painter.rs:{line}"),
-            FrameSource::ExternalSurface => "external_surface".to_string(),
-            FrameSource::WallPacerJoin => "wall_pacer_join".to_string(),
-        }
-    }
-
-    /// 화면에 닿는 합성 하나로 세는가. 합류는 같은 프레임이 WR 쪽에서 또 세어지므로 아니다.
-    fn is_composite(&self) -> bool {
-        !matches!(self, FrameSource::WallPacerJoin)
-    }
-}
-
-/// `(출처, 이유)` 별 횟수. 창 하나(1초) 분량.
-#[derive(Default)]
-pub(crate) struct FrameReasonCounts {
-    counts: FxHashMap<(FrameSource, String), u64>,
-}
-
-impl FrameReasonCounts {
-    pub(crate) fn note(&mut self, source: FrameSource, reason: impl Into<String>) {
-        *self.counts.entry((source, reason.into())).or_insert(0) += 1;
-    }
-
-    /// 서로 다른 출처의 수(이유는 세지 않는다).
-    pub(crate) fn distinct_sources(&self) -> usize {
-        let mut sources: Vec<FrameSource> = self.counts.keys().map(|(s, _)| *s).collect();
-        sources.sort_by_key(|s| s.label());
-        sources.dedup();
-        sources.len()
-    }
-
-    /// 창을 비우며 `(total, "<source>/<reason>=<n> ...")` 를 낸다. 많은 순.
-    /// ★`wall_pacer_join` 은 total 에서 뺀다★ — 목적이 "프레임을 받는 두 번째 문이 실제로 열리는가" 이지
-    /// 합성 수가 아니고, 넣으면 같은 프레임이 WR 쪽에서 또 세어져 "생산 지점이 하나인가" 판정이 망가진다.
-    fn drain_report(&mut self) -> (u64, String) {
-        let mut counts: Vec<((FrameSource, String), u64)> = self.counts.drain().collect();
-        counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.1.cmp(&b.0.1)));
-        let total = counts
-            .iter()
-            .filter(|((s, _), _)| s.is_composite())
-            .map(|(_, n)| n)
-            .sum();
-        let breakdown = counts
-            .iter()
-            .map(|((source, reason), n)| format!("{}/{reason}={n}", source.label()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        (total, breakdown)
-    }
-}
-
-#[cfg(test)]
-mod frame_reason_source_tests {
-    use super::{FrameReasonCounts, FrameSource};
-
-    /// ★자리표일 뿐이다 -- 이 모듈의 어떤 단언도 이 값을 보지 않는다.★
-    ///
-    /// 두 라운드 연속으로 ***실제 생산 지점***의 줄 번호를 적었다가, 그것을 적은 커밋
-    /// 자신의 줄 이동으로 둘 다 낡았다(2026-10-21 / 10-22). 리터럴이 구조적으로 틀렸던
-    /// 것이므로 ★번호 의존을 지웠다★ -- 단언은 `painter.rs:` 접두와 `/SCENE=` 접미만 본다.
-    /// 실제 번호는 `Location::caller()` 가 런타임에 넣고, 그 값이 맞는지는 실기의
-    /// `FRAMEREASON` 구별 값이 판정한다(설계 8 절).
-    const ANY_LINE: u32 = 1;
-
-    /// ★WR 호출 지점과 DComp 직행 표출은 둘로 센다.★ 전에는 후자가 집계에 아예 없어
-    /// "생산 지점이 하나" 가 거짓으로 나왔다.
-    #[test]
-    fn a_non_webrender_present_gets_its_own_reason_key() {
-        let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: ANY_LINE }, "SCENE");
-        counts.note(FrameSource::ExternalSurface, "PRESENT");
-        assert_eq!(counts.distinct_sources(), 2);
-    }
-
-    /// ★런처 파서가 읽는 `<source>/<reason>=<n>` 꼴을 지킨다.★ 합류는 total 에 안 더한다.
-    #[test]
-    fn report_keeps_the_launcher_parsed_shape() {
-        let mut counts = FrameReasonCounts::default();
-        counts.note(FrameSource::WebRender { line: ANY_LINE }, "SCENE");
-        counts.note(FrameSource::ExternalSurface, "PRESENT");
-        counts.note(FrameSource::WallPacerJoin, "RELEASE");
-        let (total, breakdown) = counts.drain_report();
-        assert_eq!(total, 2);
-        // WR 쪽은 줄 번호가 커밋마다 달라지므로 ★꼴만★ 본다.
-        let webrender = breakdown
-            .split(' ')
-            .find(|part| part.starts_with("painter.rs:"));
-        assert!(
-            webrender.is_some_and(|part| part.ends_with("/SCENE=1")),
-            "`painter.rs:<line>/SCENE=1` 꼴이 있어야 한다 (실제 {breakdown})"
-        );
-        for part in ["external_surface/PRESENT=1", "wall_pacer_join/RELEASE=1"] {
-            assert!(breakdown.split(' ').any(|p| p == part), "{part} in {breakdown}");
-        }
     }
 }
 
