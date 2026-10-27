@@ -6,11 +6,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
 
 use dpi::PhysicalSize;
 use euclid::{Scale, Size2D, Vector2D};
-use log::{debug, info, warn};
+use log::{info, warn};
 use servo::{
     AuthenticationRequest, BluetoothDeviceSelectionRequest, ConsoleLogLevel, Cursor,
     DeviceIndependentIntRect, DeviceIndependentPixel, DeviceIntPoint, DeviceIntSize, DevicePixel,
@@ -228,7 +227,6 @@ impl ServoShellWindow {
             .make_current()
             .expect("Could not make PlatformWindow RenderingContext current");
 
-        let render_start = Instant::now();
         if let Some(paint_target) = paint_target {
             webview.paint_target(paint_target);
         } else {
@@ -243,44 +241,8 @@ impl ServoShellWindow {
         // 화면에 안 나타난다(타이핑 한 글자가 다음 페인트까지 안 보이는 식). present 앞이라
         // 순서도 예전과 같다.
         webview.flush_deferred_dcomp_commits();
-        let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
 
-        let present_start = Instant::now();
         rendering_context.present();
-        let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
-
-        if requested_gpu_index.is_some() {
-            info!(
-                "Wall repaint target: window {:?} webview {:?} target={} requested_gpu={:?} \
-                 render_ms={:.3} target_present_ms={:.3} context_size={:?}",
-                self.id(),
-                webview.id(),
-                if paint_target.is_some() {
-                    "secondary"
-                } else {
-                    "primary"
-                },
-                requested_gpu_index,
-                render_ms,
-                present_ms,
-                context_size,
-            );
-        } else {
-            debug!(
-                "Repaint target: window {:?} webview {:?} target={} render_ms={:.3} \
-                 target_present_ms={:.3} context_size={:?}",
-                self.id(),
-                webview.id(),
-                if paint_target.is_some() {
-                    "secondary"
-                } else {
-                    "primary"
-                },
-                render_ms,
-                present_ms,
-                context_size,
-            );
-        }
     }
 
     /// Whether or not this [`ServoShellWindow`] has any [`WebView`]s.

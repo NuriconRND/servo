@@ -19,7 +19,7 @@ use euclid::{
     Vector3D,
 };
 use keyboard_types::ShortcutMatcher;
-use log::{debug, info, warn};
+use log::{debug, info};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use servo::wall_layout::WallLayout;
 use servo::{
@@ -889,43 +889,10 @@ impl HeadedWindow {
         Rect::new(Point2D::new(inset.left, inset.bottom), visible_size)
     }
 
-    fn log_wall_present_timing(&self, present_duration: Duration) {
-        let Some(layout) = &self.wall_layout else {
-            debug!(
-                "Window present: window {:?} present_ms={:.3} requested_gpu={:?} size={:?}",
-                self.winit_window.id(),
-                present_duration.as_secs_f64() * 1000.0,
-                self.window_rendering_context.requested_gpu_index(),
-                self.window_rendering_context.size(),
-            );
-            return;
-        };
-
-        let Some(tile) = layout.tiles.get(self.wall_tile_index) else {
-            warn!(
-                "Wall present diagnostic skipped for missing tile {}.",
-                self.wall_tile_index
-            );
-            return;
-        };
-
-        info!(
-            "Wall window present: window {:?} tile={} display={} requested_gpu={:?} \
-             present_ms={:.3} window_size={:?}",
-            self.winit_window.id(),
-            self.wall_tile_index,
-            tile.display,
-            self.window_rendering_context.requested_gpu_index(),
-            present_duration.as_secs_f64() * 1000.0,
-            self.window_rendering_context.size(),
-        );
-    }
-
     fn paint_for_redraw(&self, state: &RunningAppState, window: &ServoShellWindow) {
         let mut gui = self.gui.borrow_mut();
         gui.update(state, window, self);
-        let present_duration = gui.paint(&self.winit_window);
-        self.log_wall_present_timing(present_duration);
+        gui.paint(&self.winit_window);
     }
 
     fn paint_wall_tile_group_for_redraw(&self, state: &RunningAppState, window: &ServoShellWindow) {

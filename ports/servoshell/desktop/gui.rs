@@ -9,7 +9,6 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use dpi::PhysicalSize;
 use egui::text::{CCursor, CCursorRange};
@@ -679,7 +678,7 @@ impl Gui {
     }
 
     /// Paint the GUI, as of the last update.
-    pub(crate) fn paint(&mut self, window: &Window) -> Duration {
+    pub(crate) fn paint(&mut self, window: &Window) {
         self.rendering_context
             .make_current()
             .expect("Could not make RenderingContext current");
@@ -687,9 +686,7 @@ impl Gui {
             .parent_context()
             .prepare_for_rendering();
         self.context.paint(window);
-        let present_start = Instant::now();
         self.rendering_context.parent_context().present();
-        present_start.elapsed()
     }
 
     /// Updates the location field from the given [`RunningAppState`], unless the user has started
