@@ -10,12 +10,13 @@
 
 | | |
 |---|---|
-| 진행 | **10 / 20 단계** |
-| 누적 제거 | **약 7,823 줄** |
-| 계획서 오류 (발견) | **56 건** (실행 중 28 + 재검증 28) |
-| 조용한 회귀 회피 | **17 건** |
-| 기준선 | `servo-paint --lib` 130/130 → 현재 **103/103** (계측 테스트 27 개 제거분) |
-| `config_surface` | 19/20 (기존 RED) → Step 14 에서 **20/20** 이 되어야 함 ★독립 성공 신호★ |
+| 진행 | **16 / 20 단계** (1~15, 17) |
+| 누적 제거 | **약 12,287 줄** |
+| 계획서 오류 (발견) | **60 건** (실행 중 32 + 재검증 28) |
+| 조용한 회귀 회피 | **22 건** |
+| ★합쳐진 doc 함정★ | **17 회** — doc 주석이 설명 대상이 아닌 다른 항목에 물리적으로 붙어 있는 경우. 이제 패턴으로 취급한다 |
+| 기준선 | `servo-paint --lib` 130/130 → 현재 **93/93** (계측 테스트 37 개 제거분) |
+| `config_surface` | 19/20 (기존 RED) → Step 14 에서 **20/20 달성** ★제거가 완결됐다는 유일한 독립 증거★ |
 | 게이트 ★G4 불능★ | `cargo check -p servo-layout -p servo-script` 는 이 장비에서 못 돈다 — `mozjs_sys` 의 `jsapi.cpp` 가 설치된 MSVC 와 안 맞는다. 제거와 무관(손 안 댄 crate 로도 재현). **G2(`winit_wall` check)가 두 crate 를 소스에서 타입체크하므로 대체된다.** |
 
 ---
@@ -254,6 +255,104 @@ Steps 1-9 가 G4 를 쓴 적이 없어 이제 드러났다. G2 가 두 crate 를
 
 게이트: G2 exit 0(`servo-layout` 경고 0) / G1 103 불변. fmt 드리프트 0.
 ★Step 15 인계★: 이 단계 뒤 `shared/base/interval_summary.rs` 사용자가 트리에 **0**.
+
+### Step 11 — `components/media` `913bd0e0a87` (1,107 줄, 9 파일)
+
+비디오 경로의 초당 통계 일체. `d3d11_ring.rs` 가 가장 컸다.
+
+**★가장 위험했던 것 — 존재하지 않는 이름★** 계획서는 뮤텍스 독 복구 헬퍼를
+`lock_registry` 라고 적었다. 그런 이름은 저장소에 없다. 실제 이름으로 찾아내 살렸다 —
+놓치고 `.unwrap()` 으로 돌아갔으면 한 번의 독(poison) 으로 **모든 타일 비디오가 영구
+정지**하고, 로그가 없으니 원인도 안 보인다. `lock_recover` 로 재배치하고 호출처
+**28 곳** 전부 교체. 옛 이름 여섯은 저장소 전체 0, `unwrap_or_else(|poison|` 총수 8 불변.
+
+**★합쳐진 doc 함정 3 회(누적 8·9·10)★** 그중 하나가 ★독 복구 설명 doc 이 `LockStats`
+(삭제 대상)에 붙어 있던 것★ — 범위로 지웠으면 살아남는 코드의 유일한 설명이 사라진다.
+
+범위 어서션 5 회 발화. 전부 삭제 전에 잡혀 파일 무손상.
+
+### Step 11b — media-thread `Slow raw plane *` warn 셋 `23eb91f394b` (31 줄)
+
+★계획서에 아예 없던 것★. Step 11 을 커밋한 뒤 같은 영역을 다시 훑다가 발견했다.
+프레임마다 경과를 재서 임계 넘으면 `warn!` 하는 셋 — 정확히 제거 대상의 모양인데
+인벤토리 어느 줄에도 없다. 인벤토리는 심볼 이름으로 찾았고 이것들은 이름이 없었다.
+
+### Step 12 — output_grid 프로브 스레드·모든 emit_*·statics·`comp_stats.rs` `7a9c72c306e` (2,236 줄)
+
+**단일 단계 최대.** `output_grid.rs` 2,853 → 851. 1 Hz 프로브 스레드와 그것이 쓰던
+전역 전부, `comp_stats.rs` 파일째.
+
+**★어서션은 범위를 증명하지만 손으로 쓴 대체는 증명하지 못한다★** — 에이전트가
+`use` 블록을 손으로 접다 `IDXGIFactory1` 을 빠뜨렸다. 어서션은 전부 통과했고
+**빌드만이** 잡았다(`E0425`/`E0433`). 이후 규칙: 손으로 쓴 교체가 있으면 반드시 빌드한다.
+
+합쳐진 doc 함정 4 회(누적 11~14).
+
+### Step 13 — output_grid `note_*` 진입점과 `COLLECT`/`PROBE_ENABLED`/`DCOMP_BIND_PROF` `e5033e2f697` (328 줄)
+
+`output_grid.rs` 851 → **570**. 집계로 들어가던 `note_*` 와 게이트 셋.
+
+**★하중이 계측 게이트 뒤에 있었다★** — `note_dcomp_stat` 이 `COMPOSITION` 에 저장하는
+것은 **그리는 값을 정하는 B2 체인**(`GetFrameStatistics` → `lead_to_next_composition`)
+인데, 그 저장이 `PROBE_ENABLED` 뒤에 있었다. 게이트와 함께 지웠으면 프로브가 꺼진
+기본 실행에서 lead 계산이 조용히 틀어진다. 최종형은 **어떤 게이트 뒤에도 없다.**
+
+합쳐진 doc 함정 2 회(누적 15·16). 둘 다 `grep -w` 로는 안 잡히고 죽은 심볼 스캔이 잡았다.
+
+### Step 14 — `debug_env` 레지스트리 `d95df704bd2` (380 줄) ★`config_surface` 20/20★
+
+`debug_env` 플래그 **15 개 제거, 9 개 생존**. 남은 아홉은 전부 사용자가 유지하기로 한
+고장 주입·킬스위치이고 live reader 를 확인했다. **pref 는 하나도 안 지웠다.**
+
+**★계획서 최대 오류 — grep 이 `vendor_local` 을 안 봤다★** `SERVO_WR_SLOW_MS` 가
+"런처 전용, `components` 에 독자 없음" 으로 적혀 있었으나 실제로는
+**`vendor_local/webrender` 에 `LazyLock` 독자**가 있었다. 계획서대로 grep 했으면
+"아무것도 안 남았다" 고 **잘못 확인**했을 것이다. env 노브만 상수로 바꾸고 `WRSLOW`
+로그 블록은 Step 20 소유라 그대로 뒀다 — 여기서 지우면 다른 단계 파일에 지역변수
+아홉이 고아로 남는다.
+
+★이 테스트는 제거 시작 **전부터** 19/20 이었고 빨간 둘이 **모두** 계측 때문이었다★ —
+미등록 env 와 독자 없는 플래그. 둘 다 해소돼 **20/20**. 컴파일이 되는 것과 제거가
+끝난 것은 다른 얘기인데, 이것이 후자를 증명하는 유일한 검사다.
+
+### Step 15 — 엔진 고아: `interval_summary` 와 좌초한 winapi 피처 `3fcbdd421f0` (188 줄)
+
+`components/shared/base/interval_summary.rs` 파일째(185 줄, `#[test]` 8 개) +
+`lib.rs` 의 `pub mod` + `components/paint/Cargo.toml` 의 winapi `psapi`·`dxgi1_4`.
+
+★Step 14 의 교훈을 그대로 적용했다★ — 사용자 0 임을 **`vendor_local/` 을 별도 실행으로
+포함한** 트리 전체 ripgrep 두 번으로 확인했다. glob 재수출 경로도 없음을 확인.
+삭제 후 워크스페이스 어느 `Cargo.toml` 도 `psapi`·`dxgi1_4` 를 켜지 않으므로 피처
+통합이 제거를 가려 줄 여지가 없다 — 초록이 실제 증명이다.
+
+**★`processthreadsapi`·`profileapi` 는 유지★** — 전자는 `painter.rs:508` 의
+`SetThreadPriority`, 후자는 `output_grid.rs:29` 의 QPC/QPF 로 둘 다 하중이다.
+(계획서는 `processthreadsapi` 의 사용처를 셋으로 적었으나 Steps 1-14 뒤 **하나**다.
+KEEP 판정은 유효하고 근거만 낡았다.)
+
+**계획서 오류** — 게이트 기대값 "91/91" 이 틀렸다. `interval_summary` 의 테스트 8 개는
+`servo-base` 에 있어서 `servo-paint` 수치는 **움직일 수가 없다**. 이 단계의 델타는 0 이다.
+게이트 수 오차 **15 연속**.
+
+### Step 17 — 타일 스레드 스파이크 하네스(TILESPIKE) `f8757464f4a` (194 줄, 5 파일)
+
+`tile.rs` 474 → 327, `main.rs` 1993 → 1961, 런처에서 `-TileThreadSpike` 배선.
+★타일 스레딩 자체는 production 코드라 유지★ — `split_plan_for_own_thread`,
+`create_tile_windows`, `bind_context`, `plan_tile_windows` 전부 생존.
+
+**★계획서가 블록 크기 자리에 파일 크기를 적었다★** — 인벤토리 행
+`| tile.rs | 474 | … | only the spike harness |` 의 474 는 **파일** 길이다. 블록은
+`:331-474` 의 **144 줄**이고 파일은 327 줄을 남긴다. 그대로 믿었으면 파일을 통째로
+지워 **타일 창 생성 전부**가 함께 사라진다.
+
+**계획서는 `main.rs` 배선을 두 자리로 적었으나 실제로는 일곱 자리였다** —
+`App::SpikeFinished` variant 와 프로세스 종료 코드 arm 을 포함해 다섯이 목록에 없었다.
+
+**★합쳐진 doc 함정 17 회차 — 처음으로 PowerShell 에서★**
+`run_wall_dist.ps1:472-476` 은 `-CanvasAckSkip` 의 다섯 줄 주석인데 `-TileThreadSpike`
+주석 바로 **위**에 있고, 자기 파라미터는 여덟 줄 **아래**(`:490`)에 있다. "파라미터 위
+주석 블록" 기준으로 지웠으면 **남아야 할 스위치의 문서가 조용히 사라진다.**
+Rust 가 아닌 곳에서 같은 패턴이 처음 나왔다.
 
 ---
 
