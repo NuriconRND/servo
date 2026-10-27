@@ -273,24 +273,24 @@ fn the_dead_knob_check_actually_catches_an_unread_flag() {
     // 스캐너가 debug_env.rs 자체를 훑는 바람에 등록된 이름이 항상 "읽힘" 으로 잡혀
     // 실패할 수가 없었다(Task 9 가 삭제 누락 안전망으로 삼기로 한 테스트다).
     let text = r#"
-        let a = debug_env::enabled(&debug_env::DCOMP_READBACK);
-        let b = debug_env::int(&debug_env::D3D11_PROFILE_MS);
+        let a = debug_env::enabled(&debug_env::DCOMP_NO_PARTIAL_PRESENT);
+        let b = debug_env::string(&debug_env::DCOMP_DISABLE_RESIZE_VIRTUAL);
     "#;
     let referenced = extract_debug_env_const_refs(text);
-    assert!(referenced.contains("DCOMP_READBACK"));
-    assert!(referenced.contains("D3D11_PROFILE_MS"));
+    assert!(referenced.contains("DCOMP_NO_PARTIAL_PRESENT"));
+    assert!(referenced.contains("DCOMP_DISABLE_RESIZE_VIRTUAL"));
     // 소문자로 시작하는 함수는 상수로 세지 않는다.
     assert!(!referenced.contains("enabled"));
 
     // 참조되지 않는 항목이 실제로 걸리는가.
     let dead = dead_flags_among(
         &[
-            &servo_config::debug_env::DCOMP_READBACK,
-            &servo_config::debug_env::LOG_PRESENT_CADENCE,
+            &servo_config::debug_env::DCOMP_NO_PARTIAL_PRESENT,
+            &servo_config::debug_env::DCOMP_DISABLE_RESIZE_REBUILD,
         ],
         &referenced,
     );
-    assert_eq!(dead, vec!["SERVO_LOG_PRESENT_CADENCE"]);
+    assert_eq!(dead, vec!["SERVO_DCOMP_DISABLE_RESIZE_REBUILD"]);
 }
 
 #[test]

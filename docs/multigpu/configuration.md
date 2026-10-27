@@ -246,10 +246,6 @@ Task 9 결함 진단: non-opaque 서피스의 per-Virtual-bind valid_rect/dirty_
 
 진단: 부분 Present만 끄는 스위치(스펙 §3) — 강등 폴백 경로 검증용.
 
-### `SERVO_LOG_PRESENT_CADENCE` — `Str`
-
-진단: 초당 1회, 실제 엔진 present 빈도(frame-ready rate)와 프레임 간 최악 간격을 로깅한다 — 페이지의 requestAnimationFrame 카운트나 외부 캡처 도구와 무관한 그라운드트루스.
-
 ### `SERVO_DCOMP_DISABLE_RESIZE_REBUILD` — `Str`
 
 킬 스위치(기본 = 활성). 런타임 리사이즈(드래그/최대화) 정착 후 picture-cache 재구축을 끈다 — Task 12/12b 마스터 스위치, A/B 검증 및 회귀 시 안전 밸브. Windows 전용.
@@ -324,8 +320,6 @@ WEBGLEXTIMG painter=PainterId(1) window_ms=1000 locks=17 lock_ms=254.3 take_ms=0
 기다리는 결합을 끊는 것이 답이다. 반대로 `no_front_buffer` 가 크면 기다리는 게 아니라
 **받을 게 없는** 것이므로 원인은 생산 쪽이다. 둘 다 작은데 타일 렌더가 여전히 느리면 이
 경로가 아니다.
-
-painter 쪽 `ANGLE_GL_LOCK` 대기는 `SERVO_LOG_PRESENT_CADENCE` 의 `angle_lock_ms` 로 본다.
 
 ### `SERVO_DCOMP_BIND_PROF` — `Str`
 

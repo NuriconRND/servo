@@ -286,21 +286,8 @@ struct AppState {
     /// 자가 시험 판정의 종료 코드. 판정이 나면 채우고, `main` 이 이벤트 루프 뒤에 읽는다.
     device_auth_selftest_exit_code: Cell<Option<i32>>,
     tiles: Vec<TileWindow>,
-    // Present-cost attribution (video-grid perf investigation): isolate the embedder-side
-    // `present()` (surfman swap_buffers) cost from `Painter::render()`, so we can tell
-    // whether a slow oversized present is the cause vs WebRender update/draw. Logged once/sec.
-    present_ms_sum: Cell<f64>,
-    present_count: Cell<u32>,
-    present_window_start: Cell<Option<std::time::Instant>>,
     // `--capture`: read the primary tile's framebuffer to PNG once, at `capture_deadline`,
     // then request exit. Read happens before `present()` so the backbuffer still holds the frame.
-    // ***Is the serial tile loop actually costing us anything?*** `render_all_tiles` paints
-    // and presents each tile one after another on this thread, so a wall frame can never be
-    // faster than the SUM of the tiles. Parallelising would bring that down to the MAX, so
-    // the whole prize is sum/max -- and if the four GPUs already overlap their work, even
-    // that is optimistic. Accumulated per pass and reported once a second so the ratio can be
-    // read off instead of argued about. Enabled by SERVO_LOG_PRESENT_CADENCE.
-    pass_stats: RefCell<PassStats>,
     /// Presentation clock period, from `gfx_refresh_hz`.
     ///
     /// ***The wall draws on a clock, not when content says it is ready.*** Everything that
@@ -373,17 +360,6 @@ struct AppState {
     /// 틱이 낸 논리 프레임 번호 감시. `fire_present_tick` 의 디버그 어서션이 쓴다 --
     /// `TickIssueAudit` 참고.
     tick_issue_audit: RefCell<TickIssueAudit>,
-    /// 메인 스레드의 1초를 어디에 썼는지.
-    ///
-    /// ★기계에 코어가 남아도는데 애니메이션이 죽는다면, 모자란 것은 처리량이 아니라 이
-    /// 한 스레드다.★ 벽의 렌더·표출·엔진 메시지 처리가 전부 여기서 직렬로 돌기 때문에,
-    /// 이 1초를 쪼개지 않으면 전환 구간에 패스가 60회에서 2회로 떨어진 이유가 렌더가
-    /// 길어서인지, `spin_event_loop` 이 붙잡아서인지, 아무도 그리라고 하지 않아서인지
-    /// 구분할 수 없다 -- 셋은 고쳐야 할 곳이 완전히 다르다.
-    ///
-    /// 계측을 pref 뒤에 두지 않는다: 초당 한 줄이고, 이것이 없는 로그는 이 질문에
-    /// 대해서는 다시 재야 하는 로그다.
-    main_busy: RefCell<MainBusy>,
     /// 표출 클럭이 유일한 렌더 권한인지 재는 집계. [`ClockStats`] 참고.
     clock_stats: RefCell<ClockStats>,
     /// 아직 소비되지 않은 깨우기가 큐에 있는가.
@@ -398,18 +374,6 @@ struct AppState {
     wake_pending: Arc<AtomicBool>,
     captured: Cell<bool>,
     should_exit: Cell<bool>,
-}
-
-/// 메인 스레드 한 창(1초)의 시간 배분.
-#[derive(Default)]
-struct MainBusy {
-    window_start: Option<std::time::Instant>,
-    spin_ms: f64,
-    spin_ms_max: f64,
-    spin_calls: u32,
-    render_ms: f64,
-    render_ms_max: f64,
-    render_calls: u32,
 }
 
 /// 표출 클럭이 **유일한** 렌더 권한인지 판정하는 한 창(1초)의 집계.
@@ -524,280 +488,7 @@ enum ClockSite {
 /// 실측된 최악의 정지가 3.2 초이므로(`MAINBUSY window_ms=3239`) 여유를 크게 둔다.
 const MAX_CLOCK_GAP_SAMPLES: usize = 4096;
 
-/// `charge_main` 이 시간을 적립할 칸.
-#[derive(Clone, Copy)]
-enum MainSlot {
-    /// `Servo::spin_event_loop` -- 엔진에서 올라온 메시지 처리.
-    Spin,
-    /// `render_all_tiles` -- 타일 페인트 + 표출.
-    Render,
-}
-
-/// One second of `render_all_tiles` timings.
-#[derive(Default)]
-struct PassStats {
-    window_start: Option<std::time::Instant>,
-    passes: u32,
-    /// Wall clock of the whole loop, i.e. what a wall frame actually costs.
-    pass_ms_sum: f64,
-    pass_ms_max: f64,
-    /// Per tile, so the slowest one is visible: it is the floor a parallel version would hit.
-    tile_ms_sum: Vec<f64>,
-    tile_ms_max: Vec<f64>,
-    /// 발사에서 그 타일 스레드가 요청을 **집기까지** 기다린 시간. ★`tile_ms` 와 나란히
-    /// 읽어야 한다★ — 둘을 더한 것이 셸이 조인에서 보는 대기이고, 어느 쪽이 큰지가 원인을
-    /// 가른다(무거운 렌더 vs. 줄 서 있던 요청).
-    tile_queued_ms_sum: Vec<f64>,
-    tile_queued_ms_max: Vec<f64>,
-    /// Tiles skipped by the keep-previous barrier, which shorten a pass for a different reason.
-    skipped: u32,
-    /// 타일 스텝을 셋으로 쪼갠 것. ★WALLPASS 와 **같은 창·같은 분모**여야 한다★ — 기존에는
-    /// `render_ms`(샘플 평균)와 WALLPASS per-tile(창 평균)을 빼려다 음수가 나왔다. DComp on 이
-    /// 패스당 +6.7ms 인데 그 중 타일 루프 **밖**은 1.5ms 뿐이라, 나머지 5.2ms 가 이 셋 중
-    /// 어디인지가 지금의 질문이다(2026-09-03, `log_webgpu/45` gap_off/gap_on).
-    make_current_ms_sum: f64,
-    paint_ms_sum: f64,
-    present_ms_sum: f64,
-    /// `outside` 를 다시 쪼갠 것. ★이 셋은 타일 루프 **밖**이다★ — 발사(배리어 판정 포함),
-    /// 스레드 타일 조인 대기, 미뤄 둔 Commit 플러시.
-    ///
-    /// 2026-09-28 계측에서 `pass_ms=13.13` 중 `outside=12.88` 이었는데 그 안을 볼 수가
-    /// 없었다(타일 넷의 페인트 합은 2.6ms 뿐이다). 셋을 빼고도 남는 것이 진짜 루프
-    /// 오버헤드이고, 어느 하나가 지배적이면 그것이 박자를 먹는 범인이다.
-    dispatch_ms_sum: f64,
-    join_ms_sum: f64,
-    flush_ms_sum: f64,
-}
-
-/// 한 패스에서 타일 스텝을 셋으로 나눈 합계(타일 전부를 더한 값)와, 루프 밖의 세 구간.
-#[derive(Default)]
-struct PassSplit {
-    make_current_ms: f64,
-    paint_ms: f64,
-    present_ms: f64,
-    /// 스레드 타일을 발사하기까지 — 배리어의 keep-previous 판정이 여기 들어 있다.
-    dispatch_ms: f64,
-    /// 발사해 둔 타일이 끝나기를 기다린 시간. ★타일 자신의 렌더 시간(`tile_ms`)이 아니다★:
-    /// 늦게 시작하거나 스케줄을 못 받아 생긴 대기까지 포함한 벽시계다.
-    join_ms: f64,
-    /// 미뤄 둔 DComp Commit 을 흘리는 데 쓴 시간.
-    flush_ms: f64,
-}
-
 impl AppState {
-    fn note_render_pass(
-        &self,
-        pass_ms: f64,
-        tile_ms: &[f64],
-        tile_queued_ms: &[f64],
-        skipped: u32,
-        split: PassSplit,
-    ) {
-        // ★긴 패스 하나를 그 자리에서 뽑는다.★
-        //
-        // 창 평균으로는 더 갈 수 없다. 실측에서 깨끗한 창과 더러운 창의 평균 패스가
-        // 1.20 대 1.28ms 로 사실상 같은데 **최대**가 4.80 대 12.77ms 였다
-        // (log_ani_debug_03/12 test_55) -- 창당 60 패스 중 하나가 튀고, 평균은 그것을 60 으로
-        // 나눠 지운다. `MISSEVENT` 를 만들 때와 같은 상황이다: 사건이 희박하면 평균이 아니라
-        // 사건을 봐야 한다.
-        //
-        // ★`-PresentCadence` 게이트보다 **앞**에 둔다.★ 그 플래그가 없으면 `WALLSPLIT`/
-        // `WALLPASS` 가 통째로 사라지고(log_ani_debug_03/14 가 그래서 패스 분해가 비었다)
-        // 이 줄까지 같이 없어진다. 꺼져 있을 때의 비용은 float 비교 하나다.
-        //
-        // 문턱 5ms 는 정상 패스(p50 1.2ms)의 네 배이고 한 주기(16.67ms)의 30% 다. 창당 0~2 줄
-        // 나온다. ★`tile_ms` 를 함께 찍는다★ -- 어느 타일이 먹었는지가 `join` 과 묶여야
-        // 읽히고, 그것이 "한 타일만 느리다" 와 "넷이 다 느리다" 를 가른다.
-        const PASS_EVENT_MS: f64 = 5.0;
-        if pass_ms >= PASS_EVENT_MS {
-            let outside = pass_ms
-                - split.make_current_ms
-                - split.paint_ms
-                - split.present_ms
-                - split.dispatch_ms
-                - split.join_ms
-                - split.flush_ms;
-            log::warn!(
-                "PASSEVENT pass_ms={pass_ms:.2} make_current={:.2} paint={:.2} present={:.2} \
-                 dispatch={:.2} join={:.2} flush={:.2} outside={outside:.2} skipped={skipped} \
-                 tile_ms=[{}] tile_queued_ms=[{}]",
-                split.make_current_ms,
-                split.paint_ms,
-                split.present_ms,
-                split.dispatch_ms,
-                split.join_ms,
-                split.flush_ms,
-                tile_ms
-                    .iter()
-                    .map(|ms| format!("{ms:.2}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                tile_queued_ms
-                    .iter()
-                    .map(|ms| format!("{ms:.2}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
-
-        // ***`string`, not `enabled`.*** This flag is `Kind::Str`, and `enabled` asserts the
-        // flag is `Kind::Presence` -- calling it here panicked on startup. Same truthiness
-        // test painter.rs uses for the same flag, and cached because this runs every pass.
-        static LOG_PASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            servo_config::debug_env::string(&servo_config::debug_env::LOG_PRESENT_CADENCE)
-                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        });
-        if !*LOG_PASS {
-            return;
-        }
-        let now = std::time::Instant::now();
-
-        let mut stats = self.pass_stats.borrow_mut();
-        if stats.tile_ms_sum.len() != tile_ms.len() {
-            stats.tile_ms_sum = vec![0.0; tile_ms.len()];
-            stats.tile_ms_max = vec![0.0; tile_ms.len()];
-            stats.tile_queued_ms_sum = vec![0.0; tile_ms.len()];
-            stats.tile_queued_ms_max = vec![0.0; tile_ms.len()];
-        }
-        let start = *stats.window_start.get_or_insert(now);
-        stats.passes += 1;
-        stats.pass_ms_sum += pass_ms;
-        stats.pass_ms_max = stats.pass_ms_max.max(pass_ms);
-        stats.skipped += skipped;
-        stats.make_current_ms_sum += split.make_current_ms;
-        stats.paint_ms_sum += split.paint_ms;
-        stats.present_ms_sum += split.present_ms;
-        stats.dispatch_ms_sum += split.dispatch_ms;
-        stats.join_ms_sum += split.join_ms;
-        stats.flush_ms_sum += split.flush_ms;
-        for (index, ms) in tile_ms.iter().enumerate() {
-            stats.tile_ms_sum[index] += ms;
-            stats.tile_ms_max[index] = stats.tile_ms_max[index].max(*ms);
-        }
-        for (index, ms) in tile_queued_ms.iter().enumerate() {
-            stats.tile_queued_ms_sum[index] += ms;
-            stats.tile_queued_ms_max[index] = stats.tile_queued_ms_max[index].max(*ms);
-        }
-        if now.duration_since(start).as_secs_f64() < 1.0 {
-            return;
-        }
-
-        let passes = stats.passes.max(1) as f64;
-        let avg: Vec<f64> = stats.tile_ms_sum.iter().map(|ms| ms / passes).collect();
-        let serial: f64 = avg.iter().sum();
-        let slowest = avg.iter().cloned().fold(0.0_f64, f64::max);
-        // The ceiling on parallelising this loop, stated so nobody has to guess: with four
-        // tiles the hopeful number is 4x, but one heavy tile caps it far below that.
-        //
-        // ★`gfx_wall_parallel_tiles` 가 켜져 있으면 이 값은 "천장" 이 아니라 **아직 남은
-        // 여지** 다★ — 그때는 `serial_sum` 이 겹쳐서 돈 시간의 합이므로 `pass_ms` 보다 크고,
-        // `serial_sum / pass_ms` 가 **이미 얻은 병렬도**다. 둘의 차이가 남은 몫이다.
-        let ceiling = if slowest > 0.0 { serial / slowest } else { 0.0 };
-        log::info!(
-            "WALLPASS passes/s={:.1} pass_ms avg={:.2} max={:.2} | per-tile avg=[{}]              max=[{}] | serial_sum={:.2} slowest={:.2} parallel_ceiling={:.2}x skipped={}",
-            passes / now.duration_since(start).as_secs_f64(),
-            stats.pass_ms_sum / passes,
-            stats.pass_ms_max,
-            avg.iter()
-                .map(|ms| format!("{ms:.2}"))
-                .collect::<Vec<_>>()
-                .join(","),
-            stats
-                .tile_ms_max
-                .iter()
-                .map(|ms| format!("{ms:.2}"))
-                .collect::<Vec<_>>()
-                .join(","),
-            serial,
-            slowest,
-            ceiling,
-            stats.skipped,
-        );
-        // 발사에서 타일 스레드가 요청을 집기까지의 대기. ★`WALLPASS` 의 per-tile 과 같은 창,
-        // 같은 분모다★ — 그래서 둘을 그대로 더할 수 있고, 그 합이 `WALLSPLIT` 의 `join` 에
-        // 맞아야 한다(가장 늦은 타일이 패스를 붙잡으므로 `max` 쪽이 `join` 에 가깝다).
-        //
-        // 값이 0 이면 스레드가 비어 있다가 곧장 집은 것이다. 크면 요청 채널에 앞선 일이
-        // 있었다는 뜻인데, 그 채널은 이미지 갱신(`dispatch_detached`)과 공유하는 무한 큐다.
-        log::info!(
-            "WALLQUEUE per-tile queued_ms avg=[{}] max=[{}]",
-            stats
-                .tile_queued_ms_sum
-                .iter()
-                .map(|ms| format!("{:.2}", ms / passes))
-                .collect::<Vec<_>>()
-                .join(","),
-            stats
-                .tile_queued_ms_max
-                .iter()
-                .map(|ms| format!("{ms:.2}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        // 같은 창, 같은 분모(패스 수)로 나눈 패스 내역. 앞의 셋은 타일 루프 **안**이고,
-        // `dispatch`·`join`·`flush` 는 루프 **밖**의 세 구간이다. `outside` 는 그 여섯을
-        // 모두 뺀 나머지 = 루프 자체와 `note_clock_render_pass`·`maybe_capture` 등의 비용이다.
-        //
-        // ★`join` 이 지배적이면 스레드 타일이 늦게 끝나는 것이고, `flush` 면 Commit 대기,
-        // `dispatch` 면 배리어 판정, `outside` 가 여전히 크면 아직 못 본 구간이 남은 것이다.★
-        let make_current = stats.make_current_ms_sum / passes;
-        let paint = stats.paint_ms_sum / passes;
-        let present = stats.present_ms_sum / passes;
-        let dispatch = stats.dispatch_ms_sum / passes;
-        let join = stats.join_ms_sum / passes;
-        let flush = stats.flush_ms_sum / passes;
-        log::info!(
-            "WALLSPLIT pass_ms={:.2} = make_current={:.2} + paint={:.2} + present={:.2} \
-             + dispatch={:.2} + join={:.2} + flush={:.2} + outside={:.2} \
-             (all per pass, {} tiles summed)",
-            stats.pass_ms_sum / passes,
-            make_current,
-            paint,
-            present,
-            dispatch,
-            join,
-            flush,
-            stats.pass_ms_sum / passes
-                - make_current
-                - paint
-                - present
-                - dispatch
-                - join
-                - flush,
-            stats.tile_ms_sum.len(),
-        );
-        *stats = PassStats {
-            window_start: Some(now),
-            ..Default::default()
-        };
-    }
-
-    fn note_present(&self, present_ms: f64) {
-        let now = std::time::Instant::now();
-        let start = match self.present_window_start.get() {
-            Some(start) => start,
-            None => {
-                self.present_window_start.set(Some(now));
-                now
-            },
-        };
-        self.present_ms_sum
-            .set(self.present_ms_sum.get() + present_ms);
-        self.present_count.set(self.present_count.get() + 1);
-        let elapsed = now.duration_since(start).as_secs_f64();
-        if elapsed >= 1.0 {
-            let count = self.present_count.get().max(1);
-            eprintln!(
-                "Present perf: presents_per_s={:.1} avg_present_ms={:.2}",
-                self.present_count.get() as f64 / elapsed,
-                self.present_ms_sum.get() / count as f64,
-            );
-            self.present_ms_sum.set(0.0);
-            self.present_count.set(0);
-            self.present_window_start.set(Some(now));
-        }
-    }
-
     /// If `--capture` is active and its deadline has passed, read the given (primary) tile's
     /// framebuffer to a PNG and request exit. Called once, before `present()`.
     fn maybe_capture(&self, tile: &TileWindow) {
@@ -836,33 +527,6 @@ impl AppState {
             },
             None => eprintln!("capture: read_to_image returned None (no framebuffer readback)"),
         }
-    }
-
-    /// 메인 스레드가 `body` 에서 보낸 시간을 한 칸에 적립한다.
-    ///
-    /// `body` 가 끝난 뒤에야 `main_busy` 를 빌린다 -- `body` 안에서 다시 이 함수가
-    /// 불릴 수 있으므로(렌더 안에서 표출이 도는 식), 겹쳐 빌리면 패닉이다.
-    fn charge_main<T>(&self, slot: MainSlot, body: impl FnOnce() -> T) -> T {
-        let start = std::time::Instant::now();
-        let value = body();
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        let mut busy = self.main_busy.borrow_mut();
-        if busy.window_start.is_none() {
-            busy.window_start = Some(start);
-        }
-        match slot {
-            MainSlot::Spin => {
-                busy.spin_ms += ms;
-                busy.spin_ms_max = busy.spin_ms_max.max(ms);
-                busy.spin_calls += 1;
-            },
-            MainSlot::Render => {
-                busy.render_ms += ms;
-                busy.render_ms_max = busy.render_ms_max.max(ms);
-                busy.render_calls += 1;
-            },
-        }
-        value
     }
 
     /// 클럭이 틱을 발화했다.
@@ -1050,36 +714,6 @@ impl AppState {
         let last_render_at = stats.last_render_at;
         *stats = ClockStats::default();
         stats.last_render_at = last_render_at;
-    }
-
-    /// 1초가 찼으면 메인 스레드의 시간 배분을 한 줄로 찍고 창을 비운다.
-    ///
-    /// `idle` 은 창 길이에서 적립분을 뺀 나머지, 즉 **표출 클럭을 기다리며 논 시간**이다.
-    /// 이것이 큰데 패스가 적으면 붙잡힌 게 아니라 아무도 그리라고 하지 않은 것이고,
-    /// 0 에 가까우면 이 스레드가 포화된 것이다. 둘은 고칠 곳이 다르다.
-    fn report_main_busy(&self) {
-        let mut busy = self.main_busy.borrow_mut();
-        let Some(start) = busy.window_start else {
-            return;
-        };
-        let window_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if window_ms < 1000.0 {
-            return;
-        }
-        let accounted = busy.spin_ms + busy.render_ms;
-        log::info!(
-            "MAINBUSY window_ms={:.0} busy={:.1}% spin_ms={:.1} (n={} max={:.1}) render_ms={:.1} (n={} max={:.1}) idle_ms={:.1}",
-            window_ms,
-            100.0 * accounted / window_ms,
-            busy.spin_ms,
-            busy.spin_calls,
-            busy.spin_ms_max,
-            busy.render_ms,
-            busy.render_calls,
-            busy.render_ms_max,
-            (window_ms - accounted).max(0.0),
-        );
-        *busy = MainBusy::default();
     }
 
     /// 표출 클럭. 한 틱마다 엔진이 지금 들고 있는 것을 그린다 -- 무엇이 바뀌었는지
@@ -1657,7 +1291,7 @@ impl AppState {
         }
         if self.direct_render {
             self.note_redraw_requested();
-            self.charge_main(MainSlot::Render, || self.render_all_tiles());
+            self.render_all_tiles();
             return;
         }
         if let Some(tile) = self.tiles.first() {
@@ -1671,22 +1305,12 @@ impl AppState {
         let Some(webview) = webview.as_ref() else {
             return;
         };
-        let pass_start = std::time::Instant::now();
-        let mut tile_ms = vec![0.0f64; self.tiles.len()];
-        // 스레드 타일만 값을 갖는다(메인에서 그린 타일은 줄을 서지 않는다). 0 은 "줄을
-        // 서지 않았다" 는 뜻이고, 그것이 맞는 값이다.
-        let mut tile_queued_ms = vec![0.0f64; self.tiles.len()];
-        let mut split = PassSplit::default();
-        let mut skipped = 0u32;
         // `gfx_wall_rotate_tile_order`: 시작 타일을 패스마다 한 칸 돌린다.
         //
         // 한 타일이 패스 비용을 몰아서 낸다(큰 캔버스 + DComp off 에서 타일 1 이 42.2ms 중
         // 25.1ms, 나머지 셋은 각 5.7ms). GPU 는 30% 대라 처리량이 아니다. 돌려 보면 그 비용이
         // **첫 번째 위치**의 것인지(그러면 타일별 평균이 고르게 퍼진다) 특정 painter 의
         // 것인지(그 타일만 계속 느리다) 갈린다.
-        //
-        // `tile_ms` 는 계속 **타일 번호**로 기록한다 — 위치가 아니라. 그래야 WALLPASS 의
-        // per-tile 평균이 그대로 판별식이 된다.
         let rotate = servo::pref!(gfx_wall_rotate_tile_order);
         let count = self.tiles.len();
         let offset = if rotate && count > 0 {
@@ -1704,14 +1328,6 @@ impl AppState {
         // 배리어는 여기서도 그대로다: keep-previous 로 표시된 타일은 **아예 보내지 않는다**.
         // 판정을 메인에서 미리 하는 것이 설계 §3 의 결론이다(타일이 배리어를 볼 필요가 없다).
         let mut dispatched = vec![false; self.tiles.len()];
-        // 발사한 타일의 인덱스를 순서대로 들고 있어야 조인이 돌려준 시간을 `tile_ms` 의
-        // 제자리에 넣을 수 있다. ★이게 없으면 WALLPASS 의 타일별 값이 0 이 되어 어느 타일이
-        // 패스를 붙잡는지 볼 수 없다.★
-        let mut dispatched_indices = Vec::new();
-        // 발사 구간을 따로 잰다: 배리어의 keep-previous 판정이 타일마다 여기서 일어나고,
-        // `dispatch_paint_targets` 는 **인라인 painter 를 그 자리에서 돌린다**. 둘 중 하나라도
-        // 패스를 붙잡고 있다면 그 값이 여기 나타난다.
-        let dispatch_start = std::time::Instant::now();
         let in_flight = {
             let mut targets = Vec::new();
             for (index, tile) in self.tiles.iter().enumerate() {
@@ -1723,17 +1339,14 @@ impl AppState {
                     .paint_target_keep_previous_logical_frame(target)
                     .is_some()
                 {
-                    skipped += 1;
                     dispatched[index] = true;
                     continue;
                 }
                 targets.push(target);
                 dispatched[index] = true;
-                dispatched_indices.push(index);
             }
             (!targets.is_empty()).then(|| webview.dispatch_paint_targets(&targets))
         };
-        split.dispatch_ms = dispatch_start.elapsed().as_secs_f64() * 1000.0;
 
         for step in 0..count {
             let tile_index = (offset + step) % count;
@@ -1742,7 +1355,6 @@ impl AppState {
                 continue;
             }
             let tile = &self.tiles[tile_index];
-            let tile_start = std::time::Instant::now();
             match tile.paint_target.get() {
                 Some(target) => {
                     // Wall frame barrier: skip if this target already rendered this
@@ -1751,52 +1363,31 @@ impl AppState {
                         .paint_target_keep_previous_logical_frame(target)
                         .is_some()
                     {
-                        skipped += 1;
                         continue;
                     }
                     // ★컨텍스트가 없는 타일은 자기 스레드가 전부 한다★
                     // (`gfx_wall_parallel_tiles`): current 로 삼는 것도, 표출도 그쪽이다.
                     // 셸이 여기서 할 수 있는 것은 "그려라" 뿐이다.
                     let Some(rendering_context) = tile.rendering_context.as_ref() else {
-                        let paint_start = std::time::Instant::now();
                         webview.paint_target(target);
-                        split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
-                        tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
                         continue;
                     };
-                    let current_start = std::time::Instant::now();
                     let _ = rendering_context.make_current();
-                    split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
-                    let paint_start = std::time::Instant::now();
                     webview.paint_target(target);
-                    split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
-                    let present_start = std::time::Instant::now();
                     rendering_context.present();
-                    let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
-                    split.present_ms += present_ms;
-                    self.note_present(present_ms);
                 },
                 None => {
                     let rendering_context = tile
                         .rendering_context
                         .as_ref()
                         .expect("the primary tile always owns its context on the shell side");
-                    let current_start = std::time::Instant::now();
                     let _ = rendering_context.make_current();
-                    split.make_current_ms += current_start.elapsed().as_secs_f64() * 1000.0;
-                    let paint_start = std::time::Instant::now();
                     webview.paint();
-                    split.paint_ms += paint_start.elapsed().as_secs_f64() * 1000.0;
                     // Capture before present (FLIP_DISCARD discards the backbuffer on Present).
                     self.maybe_capture(tile);
-                    let present_start = std::time::Instant::now();
                     rendering_context.present();
-                    let present_ms = present_start.elapsed().as_secs_f64() * 1000.0;
-                    split.present_ms += present_ms;
-                    self.note_present(present_ms);
                 },
             }
-            tile_ms[tile_index] = tile_start.elapsed().as_secs_f64() * 1000.0;
         }
         // ★낡음(2026-09-02 기록, 같은 날 `d3fa6dbd686` 이후 무효)★ — 미루기가 기본이다. 조건은 "`gfx_dcomp_commit_in_end_frame` 이 꺼져 있으면" 이다.
         // `gfx_dcomp_defer_commit` 이 켜져 있으면 각 타일의 `end_frame` 이 DComp Commit 을
@@ -1810,34 +1401,10 @@ impl AppState {
         // ★반드시 Commit 플러시보다 먼저다★: 그 타일들의 `end_frame` 이 아직 안 끝났으면
         // 미뤄 둔 Commit 도 아직 없다.
         if let Some(in_flight) = in_flight {
-            // ★`tile_ms` 에만 넣고 `split.paint_ms` 에는 더하지 않는다.★ 이 타일들은
-            // 서로, 그리고 primary 와 **겹쳐서** 돌았으므로 그 합은 패스가 실제로 쓴
-            // 시간이 아니다. 더하면 `WALLSPLIT` 의 `outside` 가 음수가 된다.
-            //
-            // 겹침은 대신 `WALLPASS` 에서 읽는다: `serial_sum` 이 `pass_ms` 보다 크면
-            // 그 배수가 실제로 얻은 병렬도다(겹치지 않으면 둘이 같다).
-            //
-            // 조인 **대기**는 다르다. 그건 패스가 실제로 여기서 멈춰 있던 시간이므로
-            // `split.join_ms` 에 들어가고, 그만큼 `outside` 에서 빠진다.
-            let join_start = std::time::Instant::now();
-            let tile_times = in_flight.join();
-            split.join_ms = join_start.elapsed().as_secs_f64() * 1000.0;
-            for (index, timing) in dispatched_indices.iter().zip(tile_times) {
-                tile_ms[*index] = timing.render_ms;
-                tile_queued_ms[*index] = timing.queued_ms;
-            }
+            let _ = in_flight.join();
         }
 
-        let flush_start = std::time::Instant::now();
         webview.flush_deferred_dcomp_commits();
-        split.flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
-        self.note_render_pass(
-            pass_start.elapsed().as_secs_f64() * 1000.0,
-            &tile_ms,
-            &tile_queued_ms,
-            skipped,
-            split,
-        );
     }
 }
 
@@ -2165,10 +1732,6 @@ impl ApplicationHandler<WakerEvent> for App {
                 )))
             }),
             tiles,
-            present_ms_sum: Cell::new(0.0),
-            present_count: Cell::new(0),
-            present_window_start: Cell::new(None),
-            pass_stats: RefCell::new(PassStats::default()),
             direct_render: servo_config::pref!(gfx_wall_direct_render),
             present_period: {
                 // Same knob and the same clamp the paint timer uses; one refresh rate for the
@@ -2210,7 +1773,6 @@ impl ApplicationHandler<WakerEvent> for App {
             capture_path: config.capture.clone(),
             captured: Cell::new(false),
             pass_counter: Cell::new(0),
-            main_busy: RefCell::new(MainBusy::default()),
             clock_stats: RefCell::new(ClockStats::default()),
             wake_pending: waker.pending.clone(),
             should_exit: Cell::new(false),
@@ -2323,7 +1885,7 @@ impl ApplicationHandler<WakerEvent> for App {
             if matches!(event, WakerEvent::Engine) {
                 state.wake_pending.store(false, Ordering::SeqCst);
             }
-            state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
+            state.servo.spin_event_loop();
             // ★페이싱이 살아 있으면 페이싱만이 박자를 끈다.★
             //
             // `drive_present_clock_timer` 의 게이트는 `now >= next` 하나이고 ***호출자를
@@ -2385,7 +1947,6 @@ impl ApplicationHandler<WakerEvent> for App {
             return;
         }
         state.note_about_to_wait();
-        state.report_main_busy();
         state.report_clock_stats();
         // While a `--capture` is pending, keep polling + redrawing so the capture deadline
         // fires even on a static page that has otherwise gone idle.
@@ -2441,7 +2002,7 @@ impl ApplicationHandler<WakerEvent> for App {
         event: WindowEvent,
     ) {
         if let Self::Running(state) = self {
-            state.charge_main(MainSlot::Spin, || state.servo.spin_event_loop());
+            state.servo.spin_event_loop();
             state.drive_present_clock(ClockSite::WindowEvent);
         }
 
@@ -2450,7 +2011,7 @@ impl ApplicationHandler<WakerEvent> for App {
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
                     state.note_redraw_requested();
-                    state.charge_main(MainSlot::Render, || state.render_all_tiles());
+                    state.render_all_tiles();
                 }
             },
             _ => (),
