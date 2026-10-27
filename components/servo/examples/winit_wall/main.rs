@@ -92,9 +92,6 @@ struct Config {
     /// 표출 장비에는 누를 사람도 없다. 그래서 servoshell 과 달리 이 셸에서는 이 플래그가
     /// 사실상 유일한 우회로다.
     ignore_certificate_errors: bool,
-    /// `--tile-thread-spike`: 병렬 타일 렌더(A 안) 1 단계의 관문만 시험하고 종료한다.
-    /// 자세한 것은 [`tile::run_tile_thread_spike`].
-    tile_thread_spike: bool,
     /// `--device-auth-selftest` (시험 키 빌드 전용).
     device_auth_selftest: bool,
 }
@@ -110,7 +107,6 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
     let mut capture_sec = 3.0f64;
     let mut preferences = Preferences::default();
     let mut ignore_certificate_errors = false;
-    let mut tile_thread_spike = false;
     let mut device_auth_selftest = false;
 
     let mut args = std::env::args().skip(1);
@@ -139,7 +135,6 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
             "--device-auth-selftest" if sdwall_device_auth::SIGNING_KEY_KIND == "test" => {
                 device_auth_selftest = true
             },
-            "--tile-thread-spike" => tile_thread_spike = true,
             "--capture-sec" => {
                 capture_sec = args
                     .next()
@@ -181,7 +176,6 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
         capture_sec,
         preferences,
         ignore_certificate_errors,
-        tile_thread_spike,
         device_auth_selftest,
     })
 }
@@ -255,10 +249,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("Failed to create EventLoop");
     let mut app = App::Initial(Waker::new(&event_loop), config);
     event_loop.run_app(&mut app)?;
-    // 스파이크는 판정을 종료 코드로도 낸다(FAIL = 1). 일반 실행은 여기 걸리지 않는다.
-    if let App::SpikeFinished { passed: false } = app {
-        std::process::exit(1);
-    }
     // 장비 인증 자가 시험도 판정을 종료 코드로 낸다(FAIL = 1). 엔진은 먼저 평소처럼 내린다.
     let selftest_exit_code = match &app {
         App::Running(state) => state.device_auth_selftest_exit_code.get(),
@@ -1180,11 +1170,6 @@ impl ::servo::WebViewDelegate for AppState {
 enum App {
     Initial(Waker, Config),
     Running(Rc<AppState>),
-    /// `--tile-thread-spike` 가 끝난 상태. 판정을 프로세스 종료 코드로도 내보내기 위해
-    /// 들고 있는다 — 로그를 눈으로 읽는 것 말고도 스크립트가 갈라볼 수 있어야 한다.
-    SpikeFinished {
-        passed: bool,
-    },
 }
 
 impl ApplicationHandler<WakerEvent> for App {
@@ -1332,23 +1317,6 @@ impl ApplicationHandler<WakerEvent> for App {
             // 24 시간 서 있는 것보다 기동에 죽는 편이 낫다.
             panic!("프레임 클럭 {clock:?} 에 틱 손잡이가 없다 -- 아무도 콜백을 쏘지 않는다");
         };
-
-        // ★A 안 1 단계의 관문만 시험하고 끝낸다.★ 본 경로보다 먼저 갈라지는 이유는, 컨텍스트가
-        // 이미 붙은 HWND 에 워커가 두 번째를 만들면 `-DComp on` 에서 HWND 당 DComp 타깃이
-        // 하나뿐이라 실패하고, 그 실패가 "스레드 때문" 으로 오독되기 때문이다.
-        #[cfg(target_os = "windows")]
-        if config.tile_thread_spike {
-            let passed = tile::plan_and_run_tile_thread_spike(
-                event_loop,
-                &config.layout,
-                &tile_indices,
-                &spatial,
-                have_topology,
-            );
-            event_loop.exit();
-            *self = Self::SpikeFinished { passed };
-            return;
-        }
 
         // `gfx_wall_parallel_tiles`: 타일마다 자기 스레드를 준다. ★그 타일들은 셸이
         // 컨텍스트를 만들지 않는다★ — 스레드가 만들고, current 로 삼고, 표출까지 한다.

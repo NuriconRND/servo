@@ -474,12 +474,6 @@ param(
     # WALLACKFLUSH, meaning the recovery never ran and those runs proved nothing.
     # -CanvasAckSkip N makes each painter skip its first N ack sends exactly the way a closed
     # gate would, which reproduces the deadlock on demand.
-    # Plan A step 1: have each tile create its own RenderingContext on its own thread, report,
-    # and exit without rendering. surfman's Device is thread-local, so a context cannot be
-    # handed between threads -- which is why this is a separate run rather than half of the
-    # normal one. If it fails, parallel tile render does not stand as designed
-    # (docs/multigpu/parallel_tile_render_design.md section 6.2 step 1).
-    [switch] $TileThreadSpike,
     # Give each wall tile its own thread so their renders overlap. Off by default: it changes
     # who owns the rendering context, so the serial path stays available for A/B and for
     # falling back if something regresses. Most of a pass is per-tile AcquireSync waiting,
@@ -1058,9 +1052,6 @@ if ($MinIntervalMs -gt 0) { $argList += @("--pref", "gfx_wall_frame_min_interval
 # Passthrough is appended AFTER every pref this launcher sets itself, so `-Pref x=y` wins
 # over the launcher's own value for x. Servo takes the last --pref for a given name.
 foreach ($p in $Pref)     { $argList += @("--pref", $p) }
-# The spike creates its tile contexts on worker threads instead of the main thread, reports,
-# and exits -- it never renders, so nothing else in this script applies to that run.
-if ($TileThreadSpike)     { $argList += "--tile-thread-spike" }
 $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"

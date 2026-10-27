@@ -277,7 +277,7 @@ enum PainterRequest {
 ///
 /// ★메인이 만든 것을 넘길 수 없다★ — surfman `Device` 는 스레드 로컬이라 만든 스레드가
 /// 소멸까지 소유해야 한다(설계 §3-1). 그래서 만들어진 컨텍스트가 아니라 만드는 방법을
-/// 넘긴다. 실제로 이것이 되는지는 스파이크로 확인했다(`log_webgpu/62`, `-TileThreadSpike`).
+/// 넘긴다. 실제로 이것이 되는지는 1 단계 스파이크가 확인했다(`log_webgpu/62`).
 pub type RenderingContextFactory = Box<dyn FnOnce() -> Rc<dyn RenderingContext> + Send>;
 
 impl ThreadedPainter {

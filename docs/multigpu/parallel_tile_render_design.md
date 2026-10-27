@@ -360,9 +360,10 @@ DCOMPBIND 가 직접 말한다: `external video 266.3 ms/s`, 101,445 adds,
    ```
 
    ★생성만 된 것과 구분하려고 GL 에 직접 물었다★ — 각 스레드가
-   `ANGLE (AMD Radeon RX 580 ... D3D11)` 을 응답했다. 재현: `-TileThreadSpike`
-   (`tile::plan_and_run_tile_thread_spike`). 렌더하지 않고 즉시 종료하며 판정을 종료 코드로도
-   낸다.
+   `ANGLE (AMD Radeon RX 580 ... D3D11)` 을 응답했다. ★스파이크 하네스
+   (`-TileThreadSpike` / `tile::plan_and_run_tile_thread_spike`)는 2026-10-27 계측 제거에서
+   걷어냈다★ — 위 판정은 기록이지 다시 돌릴 수 있는 절차가 아니다. 분리된 창/컨텍스트
+   생성은 본 경로에 그대로 남아 있다.
 
    부수 산물: **창 생성과 컨텍스트 생성이 갈렸다**(`plan_tile_windows` → `TilePlan` →
    `bind_context`). A 안이 요구하는 바로 그 분리다 — 창은 메인 스레드 전용, 컨텍스트는 타일
