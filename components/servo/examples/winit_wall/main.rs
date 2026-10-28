@@ -384,6 +384,19 @@ enum ClockSite {
     PacingThread,
 }
 
+impl ClockSite {
+    /// 게이트 카운터의 색인. ★`tick_phase_probe::SITE_LABELS` 와 순서가 맞아야 하고,
+    /// `clock_site_indices_match_the_probe_labels` 가 그것을 못 박는다.★
+    fn index(self) -> usize {
+        match self {
+            Self::AboutToWait => 0,
+            Self::UserEvent => 1,
+            Self::WindowEvent => 2,
+            Self::PacingThread => 3,
+        }
+    }
+}
+
 impl AppState {
     /// If `--capture` is active and its deadline has passed, read the given (primary) tile's
     /// framebuffer to a PNG and request exit. Called once, before `present()`.
@@ -1007,6 +1020,12 @@ impl AppState {
             self.next_present_tick.set(next);
             self.note_pacing_tick(site);
             self.fire_present_tick();
+            tick_phase_probe::note_gate_fired(site.index());
+        } else if matches!(site, ClockSite::PacingThread) {
+            // ★페이싱 틱이 격자점보다 일러서 버려졌다.★ 이 발화는 다음 깨우기로 밀린다.
+            // 다른 자리의 거절은 세지 않는다 -- 엔진 wake 는 초당 수백 번 오고 그 대부분이
+            // 격자점 사이에 떨어지므로 세면 신호가 묻힌다.
+            tick_phase_probe::note_gate_deferred(next.saturating_duration_since(now));
         }
         next
     }
@@ -1999,6 +2018,29 @@ mod tests {
             fire.fire();
             assert_eq!(fired.load(Ordering::SeqCst), 1, "{clock:?}: 틱이 쏴야 한다");
         }
+    }
+
+    #[test]
+    fn clock_site_indices_match_the_probe_labels() {
+        // ★두 모듈이 같은 순서를 전제한다.★ 어느 쪽을 재배열해도 여기서 걸린다 --
+        // 안 걸리면 게이트 카운터가 조용히 엉뚱한 자리를 센다. 기대 이름을 여기 직접
+        // 적는 이유는, 두 쪽 모두에서 이름을 가져오면 둘이 같이 틀렸을 때 통과하기
+        // 때문이다.
+        for (site, expected) in [
+            (ClockSite::AboutToWait, "about_to_wait"),
+            (ClockSite::UserEvent, "user_event"),
+            (ClockSite::WindowEvent, "window_event"),
+            (ClockSite::PacingThread, "pacing"),
+        ] {
+            assert_eq!(
+                tick_phase_probe::site_label(site.index()),
+                expected,
+                "색인 {} 에서 프로브의 이름과 어긋난다",
+                site.index()
+            );
+        }
+        // 페이싱은 마지막 자리여야 한다 -- 보고가 `take(SITES - 1)` 로 나머지를 고른다.
+        assert_eq!(ClockSite::PacingThread.index(), 3);
     }
 
     #[test]

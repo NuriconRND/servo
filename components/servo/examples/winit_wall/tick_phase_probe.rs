@@ -45,7 +45,7 @@
 
 use std::f64::consts::PI;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{QueryPerformanceCounter, qpc_frequency};
@@ -101,6 +101,28 @@ const PERIOD_CHANGE_PERMILLE: u64 = 1;
 /// 리포터가 굶어 백로그가 쌓이면 위 `FOLD_EVERY` 의 오차 논증이 깨진다. 그때는 ***조용히
 /// 번진 히스토그램을 내놓느니 세고 버린다.***
 const SAMPLE_MAX_AGE_DIVISOR: i64 = 1;
+
+/// 거절된 틱이 얼마나 일렀나 -- µs 단위, 1ms 에서 포화.
+const SHORTFALL_BUCKETS: usize = 1000;
+
+/// `ClockSite` 의 자리 수. ★`ClockSite::index` 와 순서가 맞아야 하고,
+/// `clock_site_indices_match_the_probe_labels` 테스트가 그것을 못 박는다.★
+const SITES: usize = 4;
+
+/// 자리 이름. 위와 같은 순서다.
+const SITE_LABELS: [&str; SITES] = ["about_to_wait", "user_event", "window_event", "pacing"];
+
+/// 자리별 발화 수. ★페이싱이 박자를 쥐고 있는데 다른 자리가 발화했다면 그것이 "가로챔"
+/// 이다★ -- `main.rs` 의 `user_event` 주석이 그 구조를 적는다.
+static GATE_FIRED: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+
+/// ★페이싱 틱이 게이트에서 거절된 수.★ 다른 자리의 거절은 세지 않는다 -- 엔진 wake 는
+/// 초당 수백 번 오고 그 대부분이 격자점 사이에 떨어지므로, 세면 신호가 묻힌다.
+static GATE_DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// 거절된 페이싱 틱이 격자점보다 얼마나 일렀나(µs).
+static GATE_SHORTFALL: [AtomicU32; SHORTFALL_BUCKETS] =
+    [const { AtomicU32::new(0) }; SHORTFALL_BUCKETS];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -220,6 +242,42 @@ pub(crate) fn note_tick(from_timer: bool) {
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     }
     push(qpc as u64);
+}
+
+/// 자리 이름. 색인은 `ClockSite::index` 와 같은 순서다.
+pub(crate) fn site_label(index: usize) -> &'static str {
+    SITE_LABELS.get(index).copied().unwrap_or("?")
+}
+
+/// ★메인 스레드가 게이트를 통과해 발화했다.★ 자리별로 센다.
+///
+/// 이 함수와 아래 [`note_gate_deferred`] 는 ***메인(렌더) 스레드***에서 불린다. 치르는 값은
+/// relaxed 원자 연산 둘이고, 같은 자리에서 이미 `Instant::now()` 를 읽으므로 그에 비하면
+/// 없는 값이다.
+pub(crate) fn note_gate_fired(site: usize) {
+    if !is_enabled() {
+        return;
+    }
+    if let Some(slot) = GATE_FIRED.get(site) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// ★페이싱 틱이 왔는데 게이트가 거절했다.★ `shortfall` 은 격자점까지 남은 거리다.
+///
+/// ★이 수가 왜 중요한가.★ `drive_present_clock_timer` 는 `now >= next` 일 때만 발화하고
+/// `next` 는 DWM 격자점이다. 그래서 페이싱 틱이 격자점보다 이르면 그 발화가 ***다음
+/// 깨우기로 밀린다.*** 2026-10-28 실측에서 컴포지터 클럭 틱은 격자점 +0.1%(17µs)에
+/// 떨어지고 퍼짐이 ±0.3 점(±50µs)이었으므로, `-DwmAlign 0` 에서는 여유가 17µs 뿐이다.
+/// 그 산술이 맞는지를 이 카운터가 판정한다 -- ★틱 위상 프로브는 페이싱 스레드를 세고
+/// 메인의 발화는 세지 않아서 이 질문에 답할 수 없었다.★
+pub(crate) fn note_gate_deferred(shortfall: std::time::Duration) {
+    if !is_enabled() {
+        return;
+    }
+    GATE_DEFERRED.fetch_add(1, Ordering::Relaxed);
+    let bucket = (shortfall.as_micros() as usize).min(SHORTFALL_BUCKETS - 1);
+    GATE_SHORTFALL[bucket].fetch_add(1, Ordering::Relaxed);
 }
 
 /// 링에 하나 넣는다. 생산자는 페이싱 스레드 하나뿐이라 `PUSHED` 를 relaxed 로 읽어도 된다.
@@ -446,6 +504,7 @@ fn report(elapsed: Duration) {
         circular.concentration,
         fold.samples,
     );
+    report_gate(secs);
     let gap = |p: u64| percentile(&fold.gap, fold.gaps, p) as f64 / 100.0;
     log::warn!(
         "wall: tick gap   [{secs}s] p05/p50/p95 = {:.2}/{:.2}/{:.2} 주기 (n={}, 1.5주기초과 {}, \
@@ -470,6 +529,60 @@ fn period_span_us(fold: &Fold) -> f64 {
         .map_or(f64::NAN, |((low, high), freq)| {
             (high - low) as f64 * 1_000_000.0 / freq as f64
         })
+}
+
+/// ★게이트 한 줄.★ 페이싱 틱이 메인에서 몇이 발화하고 몇이 거절됐나.
+///
+/// 자물쇠를 잡지 않는다 -- 전부 원자 카운터라 `Fold` 와 무관하다.
+fn report_gate(secs: u64) {
+    let deferred = GATE_DEFERRED.load(Ordering::Relaxed);
+    let fired: Vec<u64> = GATE_FIRED
+        .iter()
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .collect();
+    let pacing_fired = fired.last().copied().unwrap_or(0);
+    let offered = pacing_fired + deferred;
+    if offered == 0 {
+        return;
+    }
+    // 페이싱이 아닌 자리의 발화 -- ★페이싱이 박자를 쥔 런에서 이것이 0 이 아니면
+    // 가로챈 것이다.★
+    let others: Vec<String> = fired
+        .iter()
+        .enumerate()
+        .take(SITES - 1)
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| format!("{} {count}", site_label(index)))
+        .collect();
+    let shortfall = |p: u64| percentile_u32(&GATE_SHORTFALL, deferred, p);
+    log::warn!(
+        "wall: tick gate  [{secs}s] pacing 발화 {pacing_fired} / 거절 {deferred} ({:.2}%), \
+         거절 모자란 양 p50/p95 = {}/{}µs, 다른 자리 발화 [{}]",
+        deferred as f64 * 100.0 / offered as f64,
+        shortfall(50),
+        shortfall(95),
+        if others.is_empty() {
+            String::from("없음")
+        } else {
+            others.join(", ")
+        },
+    );
+}
+
+/// 원자 히스토그램의 백분위. 선형 변수(µs)라 원형 보정이 필요 없다.
+fn percentile_u32(hist: &[AtomicU32], total: u64, pct: u64) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let target = (total * pct / 100).max(1);
+    let mut cumulative = 0u64;
+    for (index, slot) in hist.iter().enumerate() {
+        cumulative += u64::from(slot.load(Ordering::Relaxed));
+        if cumulative >= target {
+            return index;
+        }
+    }
+    hist.len() - 1
 }
 
 /// 이벤트 루프가 정상 종료했을 때 `main` 이 마지막으로 한 번 부른다.
