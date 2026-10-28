@@ -102,7 +102,13 @@ const PERIOD_CHANGE_PERMILLE: u64 = 1;
 /// 번진 히스토그램을 내놓느니 세고 버린다.***
 const SAMPLE_MAX_AGE_DIVISOR: i64 = 1;
 
-/// 거절된 틱이 얼마나 일렀나 -- µs 단위, 1ms 에서 포화.
+/// 거절된 틱이 얼마나 일렀나 -- µs 단위. 이 경계를 넘는 것은 ★다른 모집단★이다.
+///
+/// ★두 모집단을 한 히스토그램에 넣으면 백분위가 망가진다 -- 실제로 망가졌다.★
+/// 2026-10-28 실측(`log_DwmClock/03`)에서 B0·C8 의 p50 이 1000 = 클램프값으로 나왔다.
+/// 1ms 를 넘는 거절은 "지터로 조금 일렀다" 가 아니라 ***다른 자리가 이미 발화해 `next` 가
+/// 한 주기(16.7ms) 전진했다***는 뜻이다. 그래서 그쪽은 히스토그램에 넣지 않고
+/// [`GATE_PREEMPTED`] 로 따로 센다. 남는 히스토그램은 ***게이트 여유***만 말한다.
 const SHORTFALL_BUCKETS: usize = 1000;
 
 /// `ClockSite` 의 자리 수. ★`ClockSite::index` 와 순서가 맞아야 하고,
@@ -120,9 +126,13 @@ static GATE_FIRED: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 /// 초당 수백 번 오고 그 대부분이 격자점 사이에 떨어지므로, 세면 신호가 묻힌다.
 static GATE_DEFERRED: AtomicU64 = AtomicU64::new(0);
 
-/// 거절된 페이싱 틱이 격자점보다 얼마나 일렀나(µs).
+/// 거절된 페이싱 틱이 격자점보다 얼마나 일렀나(µs). ★1ms 미만만 들어온다.★
 static GATE_SHORTFALL: [AtomicU32; SHORTFALL_BUCKETS] =
     [const { AtomicU32::new(0) }; SHORTFALL_BUCKETS];
+
+/// 1ms 이상 일러서 거절된 수 = ★다른 자리가 이미 발화해 `next` 를 전진시킨 뒤에 도착한
+/// 페이싱 틱.★ 이것이 0 이 아니면 박자를 페이싱이 쥐고 있지 않다는 뜻이다.
+static GATE_PREEMPTED: AtomicU64 = AtomicU64::new(0);
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -276,8 +286,15 @@ pub(crate) fn note_gate_deferred(shortfall: std::time::Duration) {
         return;
     }
     GATE_DEFERRED.fetch_add(1, Ordering::Relaxed);
-    let bucket = (shortfall.as_micros() as usize).min(SHORTFALL_BUCKETS - 1);
-    GATE_SHORTFALL[bucket].fetch_add(1, Ordering::Relaxed);
+    match shortfall_slot(shortfall.as_micros() as usize) {
+        Some(bucket) => {
+            GATE_SHORTFALL[bucket].fetch_add(1, Ordering::Relaxed);
+        },
+        // 한 주기 가까이 일렀다 = 다른 자리가 이미 발화했다. 게이트 여유 이야기가 아니다.
+        None => {
+            GATE_PREEMPTED.fetch_add(1, Ordering::Relaxed);
+        },
+    }
 }
 
 /// 링에 하나 넣는다. 생산자는 페이싱 스레드 하나뿐이라 `PUSHED` 를 relaxed 로 읽어도 된다.
@@ -554,10 +571,13 @@ fn report_gate(secs: u64) {
         .filter(|(_, count)| **count > 0)
         .map(|(index, count)| format!("{} {count}", site_label(index)))
         .collect();
-    let shortfall = |p: u64| percentile_u32(&GATE_SHORTFALL, deferred, p);
+    let preempted = GATE_PREEMPTED.load(Ordering::Relaxed);
+    let jitter = deferred.saturating_sub(preempted);
+    let shortfall = |p: u64| percentile_u32(&GATE_SHORTFALL, jitter, p);
     log::warn!(
-        "wall: tick gate  [{secs}s] pacing 발화 {pacing_fired} / 거절 {deferred} ({:.2}%), \
-         거절 모자란 양 p50/p95 = {}/{}µs, 다른 자리 발화 [{}]",
+        "wall: tick gate  [{secs}s] pacing 발화 {pacing_fired} / 거절 {deferred} ({:.2}%) \
+         = 여유부족 {jitter} + 선점 {preempted}, 여유부족 p50/p95 = {}/{}µs, \
+         다른 자리 발화 [{}]",
         deferred as f64 * 100.0 / offered as f64,
         shortfall(50),
         shortfall(95),
@@ -567,6 +587,15 @@ fn report_gate(secs: u64) {
             others.join(", ")
         },
     );
+}
+
+/// 거절 하나를 어디에 셀지. `None` 이면 선점이다.
+///
+/// ★경계를 순수 함수로 뺀 이유.★ 처음에는 전부 한 히스토그램에 `min()` 으로 밀어 넣었고,
+/// 그래서 백분위가 클램프값(999)으로 포화해 쓸 수 없었다(`log_DwmClock/03`). 경계를
+/// 틀리면 조용히 망가지는 종류의 값이라 테스트로 못 박는다.
+fn shortfall_slot(micros: usize) -> Option<usize> {
+    (micros < SHORTFALL_BUCKETS).then_some(micros)
 }
 
 /// 원자 히스토그램의 백분위. 선형 변수(µs)라 원형 보정이 필요 없다.
@@ -697,6 +726,15 @@ mod tests {
         fold_sample(&mut fold, ODD / 2, 0, ODD, ANY_AGE);
         assert_eq!(fold.phase[499], 1);
         assert_eq!(fold.phase[500], 0);
+    }
+
+    #[test]
+    fn a_shortfall_past_a_millisecond_is_preemption_not_margin() {
+        assert_eq!(shortfall_slot(0), Some(0), "정확히 격자점");
+        assert_eq!(shortfall_slot(6), Some(6), "실측된 여유부족 p50");
+        assert_eq!(shortfall_slot(SHORTFALL_BUCKETS - 1), Some(999), "경계 안 마지막");
+        assert_eq!(shortfall_slot(SHORTFALL_BUCKETS), None, "★경계★");
+        assert_eq!(shortfall_slot(16_666), None, "한 주기 = 다른 자리가 이미 발화했다");
     }
 
     #[test]
