@@ -668,36 +668,51 @@ fn snap_to_dwm_grid_at(free_running: std::time::Instant) -> std::time::Instant {
 /// 알려진 약점: `send_event` 도 posted message 라 이미 큐에 쌓인 메시지 뒤에 선다
 /// (`WM_PAINT` 보다는 앞이다). 그래도 틱 누락과 "엔진이 알아채는" 것은 사라진다.
 ///
-/// ★깨우는 원천이 둘이다(`gfx_wall_pacing_vblank`, 기본 켜짐).★
+/// ★깨우는 원천이 셋이다([`PacingClock`], pref `gfx_wall_pacing_clock`).★
 ///
-///  * ***vblank*** -- `IDXGIOutput::WaitForVBlank` 로 primary 의 vblank 에서 깬다. 조회도
-///    예측도 없고 깨우는 주체가 커널의 디스플레이 인터럽트다.
-///  * ***타이머*** -- 예전 경로. `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
-///    (`snap_to_dwm_grid_at`) 그 지점까지 `thread::sleep` 한다.
+///  * ***vblank***(기본) -- `IDXGIOutput::WaitForVBlank`. 깨우는 주체가 커널의 디스플레이
+///    인터럽트라 질의가 없다. ★앵커가 DXGI 출력이라는 것이 약점이다★ -- 어느 출력이 DWM
+///    격자에 붙는지는 런마다 다르다(`gfx_wall_pacing_output` doc 의 2026-10-26 실측).
+///  * ***dwmquery*** -- 예전 경로. `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
+///    (`snap_to_dwm_grid_at`) 그 지점까지 `thread::sleep` 한다. 앵커는 옳지만 질의 지연이
+///    틱 위상의 지터로 들어온다.
+///  * ***compositor*** -- `DCompositionWaitForCompositorClock`. ★DWM 의 클럭 자체가 깨워
+///    주므로 앵커도 옳고 질의도 없다.★ Windows 11 build 22000+ 전용이고, 없으면 그 회전이
+///    `Unavailable` 로 떨어져 타이머가 받는다.
 ///
-/// ★왜 바꿨나.★ 타이머 경로의 오차는 둘이고 둘 다 그대로 ***틱 위상의 지터***가 된다 --
-/// DWM 으로의 프로세스 간 호출 지연(변동한다)과 대기 타이머의 깨우기 지터다. 그리고 커밋
-/// 위상 하나가 저더를 정한다(`commit_guard` 모듈 주석: 위상 13% -> 63% 에서 dup 6 ->
-/// 2146). 즉 박자의 지터는 그대로 저더의 지터다.
+/// ★세 경로의 차이는 두 축이다 -- 앵커가 옳은가, 묻는가.★
 ///
-/// ★`-DwmAlign` 과의 관계가 이 변경의 요점이다.★ `pct` 가 `1..=99` 면 vblank 뒤에 그만큼
-/// **또 자야 하므로** 타이머 지터가 그대로 돌아온다 -- 좋아지는 것은 앵커뿐이고 구조는
-/// 예전 그대로다. ★`pct <= 0` 일 때만 대기가 하나도 없는 순수 신호 경로가 된다★, 그리고
-/// 실측된 최적점이 바로 거기다(6 구성에서 `DwmAlign` 0 이 dup 평균 8, 50 이 2146). 그래서
-/// 이 클럭에서 `pct <= 0` 이 기본이자 권장이고, `1..=99` 는 A/B 를 위해 남겨 둔 것이다.
+/// ```text
+///              앵커            질의        대기 타이머
+///   vblank     DXGI 출력 (?)   없음        DwmAlign>0 일 때만
+///   dwmquery   DWM 격자 ✔      ★매 틱★    ★항상★
+///   compositor DWM 클럭 ✔      없음        DwmAlign>0 일 때만
+/// ```
+///
+/// 개발 장비 실측(2026-10-28, `log_DwmClock/01`, 단일 출력, `-DwmAlign 8`): 틱 위상 p50 은
+/// vblank 9.3% 대 dwmquery 9.5% 로 거의 같았지만(출력이 하나라 앵커가 일치한다) ★폭이
+/// 1.1 점 대 2.7 점★이었다 -- 그 차이가 질의 지연의 지터다. 근거와 계획:
+/// `docs/superpowers/plans/2026-10-28-compositor-clock-pacing.md`.
+///
+/// ★`-DwmAlign` 의 영점이 경로마다 다르다.★ vblank 면 그 출력의 vblank, dwmquery 면 DWM 이
+/// 보고한 격자점, compositor 면 컴포지터 틱이 0 이다. ***따라서 한 경로에서 찾은 최적값이
+/// 다른 경로로 그대로 옮겨오지 않는다 -- 경로를 바꾸면 다시 스윕해야 한다.***
 ///
 /// ★박자는 패널 주사율로 상한이 걸린다.★ 틱이 vblank 마다 나가므로 `-RefreshHz` 를
 /// 패널보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 vblank 를 건너뛰어 맞춘다.
 fn spawn_pacing_thread(
     proxy: winit::event_loop::EventLoopProxy<WakerEvent>,
     period: std::time::Duration,
+    clock: PacingClock,
 ) {
     let spawned = std::thread::Builder::new()
         .name(String::from("WallPacing"))
         .spawn(move || {
             // ★구성은 기동에 한 번 읽는다.★ `pref!` 는 전역 `RwLock` 을 잡으므로, 틱마다
             // 치면 그 획득이 박자 경로 안에 들어온다 -- 없애려는 것이 바로 그런 양이다.
-            let vblank_clock = servo_config::pref!(gfx_wall_pacing_vblank);
+            // ★클럭은 메인이 골라서 넘긴다.★ 여기서 문자열을 파싱하면 알 수 없는 값을
+            // 알릴 방법이 없다 -- 이 스레드의 stderr 는 금지다.
+            let signal = clock.signal();
             let align_pct = servo_config::pref!(gfx_present_align_dwm_pct);
             // ★프로브 여부도 여기서 한 번 읽는다.★ 꺼져 있으면 아래 두 자리의 호출이 아예
             // 일어나지 않으므로 틱 경로가 치르는 값은 정확히 0 이다.
@@ -707,10 +722,10 @@ fn spawn_pacing_thread(
             // 실제로 무언가를 거른다.
             let mut due = std::time::Instant::now();
             loop {
-                if vblank_clock {
-                    match pace_on_vblank(period, align_pct, &mut due) {
+                if let Some(signal) = signal {
+                    match pace_on_signal(signal, period, align_pct, &mut due) {
                         // 루프가 끝나면 프록시가 닫힌다. 그때 이 스레드도 끝낸다.
-                        VblankPace::Fire => {
+                        PaceOutcome::Fire => {
                             if probe {
                                 tick_phase_probe::note_tick(false);
                             }
@@ -719,12 +734,12 @@ fn spawn_pacing_thread(
                             }
                             continue;
                         },
-                        VblankPace::Skip => continue,
+                        PaceOutcome::Skip => continue,
                         // vblank 를 못 받았다 -- ★이번 회전만★ 타이머로 떨어진다. 아래가 그
                         // 경로이고, 간격은 거기서 지킨다. 다음 회전은 다시 vblank 를
                         // 시도하므로 일시적 실패(세션 잠금, 토폴로지 변경)가 영구 폴백이
                         // 되지 않는다.
-                        VblankPace::Unavailable => {
+                        PaceOutcome::Unavailable => {
                             // ★`next` 를 여기서 당겨 놓는다.★ vblank 경로가 도는 동안
                             // 아무도 그것을 밀지 않았으므로 한참 과거이고, 아래의
                             // `while next <= now { next += period }` 는 ***그동안 지나간
@@ -766,32 +781,79 @@ fn spawn_pacing_thread(
     }
 }
 
-/// 페이싱 스레드의 vblank 회전 하나가 어떻게 끝났나.
+/// 페이싱 스레드가 쓸 클럭.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum VblankPace {
-    /// vblank 가 왔고 이번 것에 틱을 낸다.
+enum PacingClock {
+    /// `IDXGIOutput::WaitForVBlank`. 기본값이자 오늘 동작.
+    Vblank,
+    /// `DwmGetCompositionTimingInfo` 로 묻고 그 지점까지 잔다.
+    DwmQuery,
+    /// `DCompositionWaitForCompositorClock`. Windows 11 build 22000+ 전용.
+    Compositor,
+}
+
+impl PacingClock {
+    /// pref 문자열을 읽는다. ★알 수 없는 값은 기본값으로 떨어지고 `None` 을 같이 준다★ --
+    /// 호출자(메인)가 그것을 보고 경고를 낸다. 조용히 떨어지면 오타 하나가 측정 전체를
+    /// 무르게 만든다.
+    fn parse(raw: &str) -> (Self, Option<&str>) {
+        match raw.trim() {
+            "" | "vblank" => (Self::Vblank, None),
+            "dwmquery" => (Self::DwmQuery, None),
+            "compositor" => (Self::Compositor, None),
+            other => (Self::Vblank, Some(other)),
+        }
+    }
+
+    /// 이 클럭의 블로킹 신호원. `None` 이면 타이머 경로로만 돈다.
+    fn signal(self) -> Option<fn() -> Option<(u64, u64)>> {
+        match self {
+            Self::Vblank => Some(servo::wait_primary_vblank),
+            Self::Compositor => Some(servo::wait_compositor_clock),
+            Self::DwmQuery => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vblank => "vblank (IDXGIOutput::WaitForVBlank)",
+            Self::DwmQuery => "dwmquery (DwmGetCompositionTimingInfo + sleep)",
+            Self::Compositor => "compositor (DCompositionWaitForCompositorClock)",
+        }
+    }
+}
+
+/// 페이싱 스레드의 회전 하나가 어떻게 끝났나.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PaceOutcome {
+    /// 신호가 왔고 이번 것에 틱을 낸다.
     Fire,
-    /// vblank 는 왔지만 이번 것은 거른다 -- 표출 주기가 패널 주기보다 길다.
+    /// 신호는 왔지만 이번 것은 거른다 -- 표출 주기가 클럭 주기보다 길다.
     Skip,
-    /// vblank 를 받지 못했다. 이번 회전은 타이머가 대신한다.
+    /// 신호를 받지 못했다. 이번 회전은 타이머가 대신한다.
     Unavailable,
 }
 
-/// primary 의 다음 vblank 를 기다리고, 이번 것에 틱을 낼지 판정한다.
+/// 클럭의 다음 신호를 기다리고, 이번 것에 틱을 낼지 판정한다.
 ///
-/// ★여기서 블록한다.★ 깨우는 것은 커널의 디스플레이 인터럽트이므로 이 경로에는 DWM
-/// 조회도 대기 타이머도 없다 -- `align_pct` 가 `1..=99` 일 때만 뒤엣것이 돌아온다.
+/// ★여기서 블록한다.★ 어느 신호원이든 이 경로에는 DWM 조회도 대기 타이머도 없다 --
+/// `align_pct` 가 `1..=99` 일 때만 뒤엣것이 돌아온다.
 ///
-/// `due` 는 ***요청한 박자가 패널보다 뚜렷이 느릴 때만*** 쓰인다. 왜 그 경우로 좁혔는지는
+/// ★신호원이 무엇인지 이 함수는 모른다.★ `signal` 이 돌려주는 `(앵커 QPC, 주기 QPC)` 의
+/// 의미는 경로마다 다르지만(출력 vblank / 컴포지터 틱) 여기서 하는 판정은 같다. 그래서
+/// 세 경로가 같은 건너뜀 규칙과 같은 `-DwmAlign` 처리를 공유한다.
+///
+/// `due` 는 ***요청한 박자가 클럭보다 뚜렷이 느릴 때만*** 쓰인다. 왜 그 경우로 좁혔는지는
 /// 본문의 주석에 있다 -- 시각끼리 비교하면 두 주기의 미세한 차가 누적되어 몇 분에 한 번
 /// 칸을 거르고, 그것이 곧 측정에 섞이는 거짓 dup 이다.
-fn pace_on_vblank(
+fn pace_on_signal(
+    signal: fn() -> Option<(u64, u64)>,
     period: std::time::Duration,
     align_pct: i64,
     due: &mut std::time::Instant,
-) -> VblankPace {
-    let Some((vblank_qpc, period_qpc)) = servo::wait_primary_vblank() else {
-        return VblankPace::Unavailable;
+) -> PaceOutcome {
+    let Some((vblank_qpc, period_qpc)) = signal() else {
+        return PaceOutcome::Unavailable;
     };
     // ★주기가 패널과 거의 같으면 ***아무것도 재지 않고*** 매 vblank 에 낸다.★
     //
@@ -813,13 +875,13 @@ fn pace_on_vblank(
         .unwrap_or(period);
     if period * 2 <= vblank_period * 3 {
         align_after_vblank(vblank_qpc, period_qpc, align_pct);
-        return VblankPace::Fire;
+        return PaceOutcome::Fire;
     }
     // 여기부터는 ***요청한 박자가 패널보다 뚜렷이 느리다***(`-RefreshHz 30` 따위). 그때는
     // 거르는 것이 의도이므로 `due` 로 센다.
     let now = std::time::Instant::now();
     if *due > now + vblank_period / 2 {
-        return VblankPace::Skip;
+        return PaceOutcome::Skip;
     }
     *due += period;
     if *due <= now {
@@ -828,7 +890,7 @@ fn pace_on_vblank(
         *due = now + period;
     }
     align_after_vblank(vblank_qpc, period_qpc, align_pct);
-    VblankPace::Fire
+    PaceOutcome::Fire
 }
 
 /// `-DwmAlign` 이 `1..=99` 면 vblank 뒤에 그만큼 더 잔다.
@@ -1543,8 +1605,22 @@ impl ApplicationHandler<WakerEvent> for App {
             );
         }
         if servo_config::pref!(gfx_wall_pacing_thread) {
-            eprintln!("wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다.");
-            spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);
+            let raw = servo_config::pref!(gfx_wall_pacing_clock);
+            let (clock, unknown) = PacingClock::parse(&raw);
+            if let Some(unknown) = unknown {
+                // ★조용히 떨어지지 않는다.★ 오타 하나로 A/B 의 한쪽이 대조군과 같아지면
+                // 그 런은 아무것도 말해 주지 않는다.
+                log::warn!(
+                    "wall: ★gfx_wall_pacing_clock=\"{unknown}\" 를 모른다★ -- \
+                     vblank/dwmquery/compositor 중 하나여야 한다. 기본값(vblank)으로 돈다"
+                );
+            }
+            eprintln!(
+                "wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다. \
+                 clock={}",
+                clock.label()
+            );
+            spawn_pacing_thread(waker.proxy.clone(), app_state.present_period, clock);
         }
 
         if sdwall_device_auth::SIGNING_KEY_KIND != "release" {
@@ -1923,6 +1999,33 @@ mod tests {
             fire.fire();
             assert_eq!(fired.load(Ordering::SeqCst), 1, "{clock:?}: 틱이 쏴야 한다");
         }
+    }
+
+    #[test]
+    fn the_pacing_clock_pref_picks_a_signal_source() {
+        assert_eq!(PacingClock::parse("").0, PacingClock::Vblank, "빈 값은 기본값");
+        assert_eq!(PacingClock::parse("vblank").0, PacingClock::Vblank);
+        assert_eq!(PacingClock::parse("dwmquery").0, PacingClock::DwmQuery);
+        assert_eq!(PacingClock::parse("compositor").0, PacingClock::Compositor);
+        assert_eq!(PacingClock::parse("  compositor  ").0, PacingClock::Compositor);
+    }
+
+    #[test]
+    fn an_unknown_pacing_clock_falls_back_but_says_so() {
+        // ★조용히 떨어지면 안 된다.★ 오타 하나로 A/B 의 한쪽이 대조군과 같아지면 그 런은
+        // 아무것도 말해 주지 않는다 -- 그리고 로그만 보면 성공한 런과 구분되지 않는다.
+        let (clock, unknown) = PacingClock::parse("compositer");
+        assert_eq!(clock, PacingClock::Vblank);
+        assert_eq!(unknown, Some("compositer"));
+    }
+
+    #[test]
+    fn only_the_dwm_query_clock_has_no_blocking_signal() {
+        // 타이머 경로로만 도는 것은 dwmquery 하나다. 나머지 둘은 블로킹 신호원을 갖는다 --
+        // 여기서 `None` 이 새로 생기면 그 클럭은 틱을 아예 못 낸다.
+        assert!(PacingClock::Vblank.signal().is_some());
+        assert!(PacingClock::Compositor.signal().is_some());
+        assert!(PacingClock::DwmQuery.signal().is_none());
     }
 
     #[test]

@@ -567,24 +567,45 @@ pub struct Preferences {
     /// 옮긴다 -- 렌더는 그대로 메인이다(임베더 핸들과 타일 0 컨텍스트가 메인 전용).
     /// 메인의 `WaitUntil` 은 백스톱으로 남는다.
     pub gfx_wall_pacing_thread: bool,
-    /// ★페이싱 스레드의 깨우기를 `IDXGIOutput::WaitForVBlank` 에 묶는다.★ 기본 켜짐.
+    /// ★페이싱 스레드를 무엇이 깨우나.★ 기본 `""`(= `"vblank"`, 오늘 동작).
     /// `gfx_wall_pacing_thread` 가 꺼져 있으면 아무 일도 하지 않는다.
     ///
-    /// 끄면 예전 경로다 -- `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
-    /// `gfx_present_align_dwm_pct` 지점까지 `thread::sleep` 한다. 그 경로의 오차는 둘이고
-    /// 둘 다 틱 위상의 지터가 된다: DWM 으로의 프로세스 간 호출 지연(변동한다)과 대기
-    /// 타이머의 깨우기 지터다. 켜면 깨우는 주체가 커널의 디스플레이 인터럽트라 둘 다 없다.
+    /// ```text
+    ///                앵커              질의      대기 타이머
+    ///   vblank       DXGI 출력 (?)     없음      pct>0 일 때만
+    ///   dwmquery     DWM 격자 ✔        ★매 틱★  ★항상★
+    ///   compositor   DWM 클럭 ✔        없음      pct>0 일 때만
+    /// ```
     ///
-    /// ★`gfx_present_align_dwm_pct` 와의 관계가 이 pref 의 요점이다.★ `pct` 가 `1..=99`
-    /// 면 vblank 뒤에 그만큼 **또 자야 하므로** 타이머 지터가 그대로 돌아온다 -- 앵커만
-    /// 좋아진 예전 구조다. `pct <= 0` 일 때만 대기가 하나도 없는 순수 신호 경로가 되고,
-    /// 실측된 최적점이 바로 거기다(`DwmAlign` 0 에서 dup 평균 8, 50 에서 2146).
-    /// 그래서 이 pref 가 켜져 있으면 `pct <= 0` 이 기본이자 권장이다.
+    ///  * `"vblank"` -- `IDXGIOutput::WaitForVBlank`. 깨우는 주체가 커널의 디스플레이
+    ///    인터럽트라 질의가 없다. ★약점은 앵커다★ -- 어느 출력이 DWM 격자에 붙어 있는지가
+    ///    런마다 다르다(`gfx_wall_pacing_output` doc 의 2026-10-26 실측).
+    ///  * `"dwmquery"` -- 예전 경로. `DwmGetCompositionTimingInfo` 로 격자를 **묻고**
+    ///    `gfx_present_align_dwm_pct` 지점까지 `thread::sleep` 한다. 앵커는 옳지만 오차가
+    ///    둘이고 둘 다 틱 위상의 지터가 된다: DWM 으로의 프로세스 간 호출 지연(변동한다)과
+    ///    대기 타이머의 깨우기 지터다.
+    ///  * `"compositor"` -- `DCompositionWaitForCompositorClock`. ★DWM 의 클럭 자체가
+    ///    깨워 주므로 앵커도 옳고 질의도 없다.★ ***Windows 11 build 22000+ 전용***이고,
+    ///    없으면 매 회전이 타이머로 떨어진다(심볼을 런타임에 찾으므로 실행은 된다).
     ///
-    /// ★박자는 패널 주사율로 상한이 걸린다.★ 틱은 vblank 마다 나가므로
-    /// `gfx_refresh_hz` 를 패널보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 vblank 를
-    /// 건너뛰어 맞춘다(`winit_wall` 의 `spawn_pacing_thread`).
-    pub gfx_wall_pacing_vblank: bool,
+    /// 개발 장비 실측(2026-10-28 `log_DwmClock/01`, 단일 출력, `DwmAlign 8`): 틱 위상 p50
+    /// 은 vblank 9.3% 대 dwmquery 9.5% 로 거의 같았지만(출력이 하나라 앵커가 일치한다)
+    /// ★폭이 1.1 점 대 2.7 점★이었다 -- 그 2.5 배가 질의 지연의 지터다. 근거와 계획:
+    /// `docs/superpowers/plans/2026-10-28-compositor-clock-pacing.md`.
+    ///
+    /// ★`gfx_present_align_dwm_pct` 의 영점이 경로마다 다르다.★ vblank 면 그 출력의
+    /// vblank, dwmquery 면 DWM 이 보고한 격자점, compositor 면 컴포지터 틱이 0 이다.
+    /// ***한 경로에서 찾은 최적값이 다른 경로로 옮겨오지 않는다 -- 다시 스윕해야 한다.***
+    /// 그리고 `pct` 가 `1..=99` 면 신호 뒤에 그만큼 **또 자므로** 대기 타이머 지터가
+    /// 돌아온다. `pct <= 0` 일 때만 대기가 하나도 없는 순수 신호 경로다.
+    ///
+    /// ★박자는 클럭 주파수로 상한이 걸린다.★ 틱은 신호마다 나가므로 `gfx_refresh_hz` 를
+    /// 그보다 높게 줘도 그만큼 나오지 않는다. 낮게 주면 건너뛰어 맞춘다
+    /// (`winit_wall` 의 `spawn_pacing_thread`).
+    ///
+    /// 알 수 없는 값은 `vblank` 로 떨어지되 ★경고를 낸다★ -- 오타 하나로 A/B 의 한쪽이
+    /// 대조군과 같아지면 그 런은 아무것도 말해 주지 않는다.
+    pub gfx_wall_pacing_clock: String,
     /// ★페이싱 스레드가 `WaitForVBlank` 를 걸 출력을 이름으로 고정한다.★ 기본 `""`.
     ///
     /// `""` = 오늘 동작(primary). `"primary"` 도 같다. 그 외에는 DXGI 출력 이름
@@ -1344,7 +1365,7 @@ impl Preferences {
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,
-            gfx_wall_pacing_vblank: true,
+            gfx_wall_pacing_clock: String::new(),
             gfx_wall_pacing_output: String::new(),
             gfx_wall_tick_phase_probe: false,
             gfx_vsync_enabled: false,

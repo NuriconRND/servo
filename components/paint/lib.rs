@@ -68,6 +68,27 @@ pub fn wait_primary_vblank() -> Option<(u64, u64)> {
 /// ★왜 이 줄이 필요한가.★ `gfx_wall_pacing_output` 은 이름을 못 찾으면 조용히 primary 로
 /// 떨어진다. 런처는 pref 를 넘겼다는 것밖에 못 찍으므로, 핀이 걸렸는지를 말할 수 있는
 /// 것은 엔진뿐이다.
+/// ★페이싱 스레드를 DWM 합성 클럭의 다음 틱까지 블록한다.★ `(깨어난 QPC, 추정 주기 QPC)`.
+///
+/// [`wait_primary_vblank`] 와 형제이고 ***대체재다.*** 저쪽 앵커는 DXGI 출력의 vblank 인데
+/// 어느 출력이 DWM 격자에 붙는지가 런마다 다르다. 이쪽 앵커는 DWM 의 클럭 그 자체라 그
+/// 어긋남이 구조적으로 0 이고, 질의 경로와 달리 묻지 않고 깨워 주므로 프로세스 간 호출
+/// 지연이 틱 위상에 섞이지 않는다. 검토와 근거:
+/// `docs/superpowers/plans/2026-10-28-compositor-clock-pacing.md`.
+///
+/// ★`Windows 11 build 22000+` 에서만 쓸 수 있다.★ 없으면 `None` 이고 호출자는 기존 경로로
+/// 떨어진다 -- 심볼을 런타임에 찾으므로 구버전에서 로드가 실패하지는 않는다.
+pub fn wait_compositor_clock() -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        crate::output_grid::wait_compositor_clock()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 pub fn take_pacing_vblank_binding() -> Option<String> {
     #[cfg(windows)]
     {

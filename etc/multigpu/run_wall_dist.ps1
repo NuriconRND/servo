@@ -225,7 +225,7 @@ param(
     #
     # 판정: WALLCLOCK 의 tick_by pace 가 대부분이고 ticks 가 60 으로 돌아오는가.
     [switch] $PacingThread,
-    # gfx_wall_pacing_vblank=false: 페이싱 스레드를 **예전** 경로로 되돌린다.
+    # gfx_wall_pacing_clock=dwmquery: 페이싱 스레드를 **예전** 경로로 되돌린다.
     # -PacingThread 가 없으면 아무 일도 하지 않는다.
     #
     # 기본(이 스위치 없음) = WaitForVBlank. primary 의 vblank 에서 커널이 깨우므로 DWM
@@ -240,6 +240,32 @@ param(
     #
     # 판정: WALLCLOCK 의 jit_ms 와 gap_ms p95, 그리고 COMPREFRESH 의 refresh_d[2].
     [switch] $PacingDwmQuery,
+    # gfx_wall_pacing_clock=compositor: DCompositionWaitForCompositorClock 으로 깬다.
+    #
+    # ★세 경로의 차이는 두 축이다 -- 앵커가 옳은가, 묻는가.★
+    #
+    #              앵커            질의        대기 타이머
+    #   vblank     DXGI 출력 (?)   없음        DwmAlign>0 일 때만
+    #   dwmquery   DWM 격자 ok     매 틱       항상
+    #   compositor DWM 클럭 ok     없음        DwmAlign>0 일 때만
+    #
+    # vblank 경로의 약점은 앵커다: 어느 출력이 DWM 격자에 붙는지가 런마다 다르다
+    # (-PacingOutput doc 의 2026-10-26 실측). dwmquery 는 앵커가 옳은 대신 질의 지연이
+    # 틱 위상의 지터로 들어온다. 이 스위치는 ★둘 다 피한다★ -- DWM 의 클럭 자체가 깨운다.
+    #
+    # 개발 장비 실측(2026-10-28 log_DwmClock/01, 단일 출력, -DwmAlign 8): 틱 위상 p50 은
+    # vblank 9.3% 대 dwmquery 9.5% 로 거의 같았지만(출력이 하나라 앵커가 일치한다)
+    # ★폭이 1.1 점 대 2.7 점★이었다. 그 2.5 배가 질의 지연의 지터다.
+    #
+    # ★Windows 11 build 22000+ 전용이다.★ 심볼을 런타임에 찾으므로 구버전에서도 실행은
+    # 되고, 없으면 매 회전이 타이머로 떨어진다. 엔진 로그의 바인딩 줄이 어느 쪽인지 찍는다:
+    #   wall: pacing clock: DComp 컴포지터 클럭 (DWM 전역, 출력 선택 없음) 59.94Hz 측정됨 -- ...
+    #   wall: pacing clock: ★DComp 컴포지터 클럭이 이 Windows 에 없다★ (build 22000+ 필요) -- ...
+    #
+    # ★-DwmAlign 의 영점이 경로마다 다르다.★ 여기서는 컴포지터 틱이 0 이다. 다른 경로에서
+    # 찾은 최적값(8)이 그대로 옮겨오지 않으므로 ***다시 스윕해야 한다.*** -TickPhase 로
+    # 재면 된다.
+    [switch] $PacingCompositorClock,
 
     # gfx_wall_pacing_output: 페이싱 스레드가 WaitForVBlank 를 걸 출력을 이름으로 못 박는다.
     # "" = primary(오늘 동작). "\.\DISPLAY22" 처럼 DXGI 출력 이름을 준다.
@@ -687,6 +713,17 @@ if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
 }
 
+# 페이싱 클럭은 하나만 고른다. 둘을 같이 주면 어느 쪽이 돌았는지 로그로도 가릴 수 없다.
+if ($PacingDwmQuery -and $PacingCompositorClock) {
+    throw "-PacingDwmQuery and -PacingCompositorClock select different pacing clocks; pass at most one."
+}
+if ($PacingCompositorClock -and -not $PacingThread) {
+    Write-Warning "-PacingCompositorClock without -PacingThread: the compositor clock is read only by the pacing thread, and that thread is not running. The switch will do nothing."
+}
+if ($PacingOutput -ne "" -and $PacingCompositorClock) {
+    Write-Warning "-PacingOutput $PacingOutput with -PacingCompositorClock: the compositor clock is a single desktop-wide signal with no output parameter, so the pin selects nothing. Drop -PacingCompositorClock to pin an output."
+}
+
 # -PacingOutput 은 ***vblank 경로에서만*** 읽힌다. 엔진에서 그 pref 를 보는 자리는
 # output_grid.rs 의 VblankSource 하나고, 그 구조체는 WaitForVBlank 경로에만 살아 있다.
 # -PacingThread 가 없으면 스레드 자체가 없고, -PacingDwmQuery 가 있으면 그 스레드가
@@ -830,7 +867,7 @@ $argList = @(
     "--pref", "gfx_sample_lead_periods=$SampleLead",
     "--pref", "gfx_wall_direct_render=$($DirectRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_pacing_vblank=$((-not $PacingDwmQuery.IsPresent).ToString().ToLower())",
+    "--pref", "gfx_wall_pacing_clock=$(if($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'})",
     "--pref", "gfx_wall_pacing_output=$PacingOutput",
     "--pref", "gfx_wall_tick_phase_probe=$($TickPhase.IsPresent.ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
@@ -905,7 +942,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

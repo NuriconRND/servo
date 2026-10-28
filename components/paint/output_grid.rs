@@ -27,8 +27,10 @@ use winapi::shared::dxgi::{
     CreateDXGIFactory1, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
 };
 use winapi::shared::windef::HMONITOR;
+use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryW};
 use winapi::um::profileapi::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use winapi::um::wingdi::DEVMODEW;
+use winapi::um::winnt::HANDLE;
 use winapi::um::winuser::{
     ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
     MONITORINFO, MONITORINFOF_PRIMARY, MonitorFromWindow,
@@ -250,6 +252,148 @@ pub(crate) fn wait_primary_vblank() -> Option<(u64, u64)> {
             const { std::cell::RefCell::new(VblankSource::new()) };
     }
     SOURCE.with(|source| source.borrow_mut().wait())
+}
+
+// ---------------------------------------------------------------- 컴포지터 클럭
+
+/// `DCompositionWaitForCompositorClock(count, handles, timeoutInMs) -> NTSTATUS`.
+type WaitForCompositorClockFn = unsafe extern "system" fn(u32, *const HANDLE, u32) -> u32;
+
+/// 블록 상한.
+///
+/// ★`INFINITE` 를 주면 안 된다.★ 어댑터가 빠지면 이 호출은 ***돌아오지 않는다*** --
+/// Chromium 의 `vsync_thread_win_dcomp.cc` 가 "WILL hang" 이라 적고 같은 이유로 100ms 를
+/// 쓴다. 타임아웃은 "이번 회전만 타이머" 로 떨어지고 다음 회전이 다시 시도하므로, 어댑터가
+/// 돌아오면 저절로 복구된다.
+const COMPOSITOR_CLOCK_TIMEOUT_MS: u32 = 100;
+
+/// 처음 몇 틱은 주기 추정이 수렴하는 중이다. 이 틱에서 한 번 더 알린다.
+const COMPOSITOR_CLOCK_SETTLED_TICK: u64 = 120;
+
+/// ★정적 링크가 아니라 런타임 해석인 이유.★
+///
+/// 이 export 는 ***Windows 11 build 22000+ 에만*** 있다. `#[link]` 로 적으면 로더가 프로세스
+/// 시작에 심볼을 찾고 ***없으면 실행 자체가 실패한다*** -- 이 크레이트는 `servoshell` 도
+/// 쓰므로 그것은 포크 전체의 회귀다. `dcomp.lib` 이 이미 링크 라인에 있다는 것은(winapi 의
+/// `dcomp` 피처가 `cargo:rustc-link-lib=dcomp` 를 낸다) 별개 이야기다 -- 여기 문제는 링크가
+/// 아니라 ★로드 시점 심볼 해석★이다. Chromium·Zed·Uno 가 모두 같은 이유로
+/// `GetProcAddress` 를 쓴다.
+///
+/// ★여기서 로그를 내지 않는다.★ 이 함수는 페이싱 스레드에서 처음 불리고 그 스레드의
+/// stderr 는 금지다. 못 찾았다는 사실은 `publish_pacing_binding` 으로 셸에 넘어간다.
+fn compositor_clock_fn() -> Option<WaitForCompositorClockFn> {
+    static RESOLVED: OnceLock<Option<usize>> = OnceLock::new();
+    let address = (*RESOLVED.get_or_init(|| {
+        let mut name: Vec<u16> = "dcomp.dll".encode_utf16().collect();
+        name.push(0);
+        // Safety: 널 종료된 와이드 문자열.
+        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // Safety: 살아 있는 모듈 핸들과 널 종료된 ASCII 이름.
+        let found =
+            unsafe { GetProcAddress(module, c"DCompositionWaitForCompositorClock".as_ptr()) };
+        if found.is_null() {
+            return None;
+        }
+        Some(found as usize)
+    }))?;
+    // Safety: `GetProcAddress` 가 돌려준 주소이고, 시그니처는 위 타입 별칭대로다.
+    Some(unsafe { std::mem::transmute::<usize, WaitForCompositorClockFn>(address) })
+}
+
+/// ★DWM 합성 클럭에서 깨운다.★ `(깨어난 QPC, 추정 주기 QPC)`.
+///
+/// `wait_primary_vblank` 와 ***형제이고 대체재다.*** 저쪽은 DXGI 출력의 vblank 에 앵커를
+/// 두는데, 어느 출력이 DWM 격자에 붙어 있는지는 런마다 다르다(`gfx_wall_pacing_output` 의
+/// doc 에 적힌 2026-10-26 실측). 이쪽은 ★앵커가 DWM 의 클럭 그 자체★라 그 어긋남
+/// (`vs_dwmvb`)이 구조적으로 0 이다. 그러면서 `DwmGetCompositionTimingInfo` 질의 경로와
+/// 달리 ***묻지 않고 깨워 주므로*** 프로세스 간 호출 지연이 틱 위상에 섞이지 않는다.
+///
+/// 출력도 디바이스도 고르지 않는다 -- 데스크톱에 이 클럭은 하나다. 그래서
+/// `gfx_wall_pacing_output` 핀은 이 경로에서 아무것도 하지 않는다.
+pub(crate) fn wait_compositor_clock() -> Option<(u64, u64)> {
+    thread_local! {
+        static SOURCE: std::cell::RefCell<CompositorClock> =
+            const { std::cell::RefCell::new(CompositorClock::new()) };
+    }
+    SOURCE.with(|source| source.borrow_mut().wait())
+}
+
+struct CompositorClock {
+    /// 추정 주기. ★질의로 씨를 뿌리지 않는다★ -- 이 경로에 DWM 질의가 없다는 것이 요점이다.
+    /// 60Hz 로 시작해 관측 간격으로 수렴시킨다(여덟 틱이면 붙는다).
+    period_qpc: u64,
+    last_wake: Option<u64>,
+    ticks: u64,
+}
+
+impl CompositorClock {
+    const fn new() -> Self {
+        Self {
+            period_qpc: 0,
+            last_wake: None,
+            ticks: 0,
+        }
+    }
+
+    fn wait(&mut self) -> Option<(u64, u64)> {
+        let Some(wait_fn) = compositor_clock_fn() else {
+            if self.ticks == 0 {
+                self.ticks = 1;
+                publish_pacing_binding(String::from(
+                    "pacing clock: ★DComp 컴포지터 클럭이 이 Windows 에 없다★ \
+                     (build 22000+ 필요) -- 기존 클럭으로 떨어진다",
+                ));
+            }
+            return None;
+        };
+        let freq = qpc_frequency().filter(|freq| *freq > 0)?;
+        if self.period_qpc == 0 {
+            self.period_qpc = freq / 60;
+        }
+        // Safety: `GetProcAddress` 로 받은 유효한 함수. ★블록한다★ -- 그래서 페이싱 스레드
+        // 전용이다. 핸들을 넘기지 않으므로(count=0) 성공은 0 이다. MS 문서는 성공을
+        // `STATUS_SUCCESS`(=0) 로 적고 같은 문서의 샘플은 `WAIT_OBJECT_0 + count` 로 적어
+        // ***서로 어긋나는데***, count=0 이면 둘이 같은 값이라 여기서는 문제가 되지 않는다.
+        let status = unsafe { wait_fn(0, ptr::null(), COMPOSITOR_CLOCK_TIMEOUT_MS) };
+        if status != 0 {
+            // 타임아웃, `STATUS_GRAPHICS_PRESENT_OCCLUDED`(디스플레이 꺼짐 -- ★즉시 반환★),
+            // 그 밖의 실패. 호출자가 이번 회전만 타이머로 떨어지고 간격은 거기서 지킨다.
+            // ★여기서 자지 않는다★ -- 자면 그만큼 박자가 밀린다(`VblankSource::wait` 와 같다).
+            self.last_wake = None;
+            return None;
+        }
+        let wake = qpc_now()?;
+        if let Some(previous) = self.last_wake {
+            let interval = wake.saturating_sub(previous);
+            // ★가짜 깨우기 방어.★ 문턱을 추정 주기가 아니라 ***절대값***으로 둔다 --
+            // 추정이 아직 틀린 동안(120Hz 패널을 60Hz 로 씨 뿌린 첫 몇 틱) 진짜 틱을
+            // 버리지 않기 위해서다. 1000Hz 보다 빠른 합성 틱은 없다.
+            if interval < freq / 1000 {
+                self.last_wake = Some(wake);
+                return None;
+            }
+            // 10~1000Hz 안의 간격만 추정에 넣는다. 스톨이 섞인 간격은 밖이라 들어오지 않는다.
+            if interval <= freq / 10 {
+                self.period_qpc = (self.period_qpc * 7 + interval) / 8;
+            }
+        }
+        self.last_wake = Some(wake);
+        self.ticks += 1;
+        // ★알림은 딱 두 번이다.★ 첫 틱(씨값)과 수렴 뒤 한 번. 매 틱 문자열을 만들면 틱
+        // 경로에 할당이 들어온다 -- 없애려는 것이 바로 그런 양이다.
+        if self.ticks == 1 || self.ticks == COMPOSITOR_CLOCK_SETTLED_TICK {
+            let hz = freq as f64 / self.period_qpc as f64;
+            let settled = if self.ticks == 1 { "측정 중" } else { "측정됨" };
+            publish_pacing_binding(format!(
+                "pacing clock: DComp 컴포지터 클럭 (DWM 전역, 출력 선택 없음) {hz:.2}Hz {settled} \
+                 -- gfx_wall_pacing_output 은 이 경로에서 무시된다"
+            ));
+        }
+        Some((wake, self.period_qpc))
+    }
 }
 
 /// ★페이싱이 기다릴 출력의 고정 이름.★ 비어 있거나 `primary` 면 오늘 동작이다.
