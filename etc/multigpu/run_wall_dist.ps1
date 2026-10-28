@@ -393,6 +393,21 @@ param(
     # about 11ms to finish in. There is no added latency -- the commits still land in the same
     # pass, only later in it.
     #
+    # ★2026-10-28: 그 A/B 의 전제가 지금은 없다.★ 위 수치는 painter 넷이 ***메인
+    # 스레드에서 순차 실행***이던 때의 것이고 -- "다른 세 타일이 먼저 렌더하는 동안
+    # 11ms 를 번다" 가 바로 그 구조를 가리킨다 -- `-ParallelTiles` 가 그 전제를 없앴다.
+    # 타일마다 자기 스레드라 end_frame 도 그 스레드에서 돌고, Commit 은 그 타일의 렌더
+    # 직후에 나간다. 로컬(3840x1080 타일 하나)에서 돌린 A/B 에서는 이 스위치를 켜는 쪽이
+    # 이겼다 -- judder 가 "거의 관찰되지 않음"(육안, -DwmAlign 8 -PacingDwmQuery 와 같이).
+    # ★벽에서는 아직 재확인되지 않았다★ -- 거기는 디바이스가 넷이라 위상 이야기가 다르다.
+    #
+    # ★반대 방향의 실측도 있다★(paint.rs 의 `flush_deferred_dcomp_commits` doc, 2026-10-23):
+    # 커밋을 패스 끝에서 내면 위상이 패스 길이를 물려받아 주기의 35~62% 에 흩어지고,
+    # 그 구간은 DWM 인테이크 마감 너머라 저더가 수십 배가 됐다. 타일 스레드에서 렌더
+    # 직후에 내는 것도 위상 성질은 같다 -- 위상이 렌더 시간을 따라다닌다. 틱 머리 커밋은
+    # 그와 달리 위상을 `-DwmAlign` 이 직접 정한다. 둘 중 어느 쪽이 이기는지는 구성별로
+    # 다를 수 있으므로, 기본값을 바꾸기 전에 벽에서 한 번 더 볼 것.
+    #
     # Use this to get the old behaviour back if a run looks wrong.
     [switch] $DcompCommitInFrame,
     # gfx_webgl_swap_sync: settle the canvas's GPU work on the WebGL thread right after its
