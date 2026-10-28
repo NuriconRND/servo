@@ -87,6 +87,15 @@ const GAP_SKIP_BUCKET: usize = 150;
 /// 묻게 된다 — 막으려던 프로세스 간 호출 폭주가 바로 그 모양이다.
 const ANCHOR_QUERY_DIVISOR: i64 = 10;
 
+/// 주기가 이만큼(1/1000 = 버킷 한 칸) 넘게 달라졌을 때만 "바뀌었다" 로 센다.
+///
+/// ★엄격 비교는 거짓 경보였다.★ 첫 실측(log_DwmClock/01)에서 20 초 런에 23 번과 11 번이
+/// 찍혔는데, 두 보고 줄의 주기가 모두 `16.666ms` 로 같았다 — 즉 변동폭이 0.017ms(0.1%)
+/// 아래였다. `qpcRefreshPeriod` 는 DWM 의 ***추정치***라 LSB 가 흔들린다. 그 흔들림을
+/// 모드 변경으로 신고하면, 이 수가 0 이 아닐 때 런을 의심하라는 doc 이 ★늑대 소년★이 된다.
+/// 진짜로 잡아야 할 것(60.00 → 59.94 = 0.1%)은 이 문턱을 넘는다.
+const PERIOD_CHANGE_PERMILLE: u64 = 1;
+
 /// 앵커에서 이만큼(1 초) 넘게 떨어진 표본은 접지 않고 센다.
 ///
 /// 리포터가 굶어 백로그가 쌓이면 위 `FOLD_EVERY` 의 오차 논증이 깨진다. 그때는 ***조용히
@@ -125,7 +134,11 @@ struct Fold {
     /// 마지막으로 DWM 에 **물어본** 시각(QPC). 성공 여부와 무관하다.
     last_query: Option<u64>,
     query_failures: u64,
+    /// ★문턱을 넘은★ 주기 변경만 센다(`PERIOD_CHANGE_PERMILLE`).
     period_changes: u32,
+    /// 본 주기의 최소·최대. 잡음의 크기를 ***수치로*** 보여 준다 -- 카운터 하나보다
+    /// 이쪽이 "믿을 만한 런인가" 를 직접 답한다.
+    period_seen: Option<(u64, u64)>,
     /// 직전에 접은 틱. 간격을 재는 데만 쓰고, 끊기면 `None` 으로 버린다.
     last_tick: Option<u64>,
 }
@@ -145,6 +158,7 @@ impl Fold {
             last_query: None,
             query_failures: 0,
             period_changes: 0,
+            period_seen: None,
             last_tick: None,
         }
     }
@@ -271,12 +285,16 @@ fn refresh_anchor(fold: &mut Fold, newest: u64) {
         return;
     };
     if let Some((_, previous)) = fold.anchor
-        && previous != period_qpc
+        && previous.abs_diff(period_qpc) * 1000 > previous * PERIOD_CHANGE_PERMILLE
     {
-        // 주사율이 런 도중에 바뀌었다(DRR, 모드 변경). 접은 값들이 서로 다른 주기를 기준으로
-        // 하므로 요약에서 이 수가 0 이 아니면 그 런은 믿을 것이 못 된다.
+        // 주사율이 런 도중에 ***실제로*** 바뀌었다(DRR, 모드 변경). 접은 값들이 서로 다른
+        // 주기를 기준으로 하므로, 이 수가 0 이 아니면 그 런은 믿을 것이 못 된다.
         fold.period_changes += 1;
     }
+    fold.period_seen = Some(match fold.period_seen {
+        Some((low, high)) => (low.min(period_qpc), high.max(period_qpc)),
+        None => (period_qpc, period_qpc),
+    });
     fold.anchor = Some((vblank_qpc, period_qpc));
 }
 
@@ -431,7 +449,7 @@ fn report(elapsed: Duration) {
     let gap = |p: u64| percentile(&fold.gap, fold.gaps, p) as f64 / 100.0;
     log::warn!(
         "wall: tick gap   [{secs}s] p05/p50/p95 = {:.2}/{:.2}/{:.2} 주기 (n={}, 1.5주기초과 {}, \
-         유실 {}, 낡음 {}, 질의실패 {}, 주기변경 {})",
+         유실 {}, 낡음 {}, 질의실패 {}, 주기변경 {}, 주기폭 {:.1}µs)",
         gap(5),
         gap(50),
         gap(95),
@@ -441,7 +459,17 @@ fn report(elapsed: Duration) {
         fold.stale,
         fold.query_failures,
         fold.period_changes,
+        period_span_us(&fold),
     );
+}
+
+/// DWM 이 보고한 주기의 최대-최소를 µs 로. 0 에 가까우면 격자가 안정적이라는 뜻이다.
+fn period_span_us(fold: &Fold) -> f64 {
+    fold.period_seen
+        .zip(qpc_frequency())
+        .map_or(f64::NAN, |((low, high), freq)| {
+            (high - low) as f64 * 1_000_000.0 / freq as f64
+        })
 }
 
 /// 이벤트 루프가 정상 종료했을 때 `main` 이 마지막으로 한 번 부른다.
