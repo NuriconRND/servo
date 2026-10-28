@@ -65,6 +65,7 @@ fn qpc_frequency() -> Option<i64> {
 
 mod crash_report;
 mod device_auth_selftest;
+mod tick_phase_probe;
 mod tick_refresh_driver;
 mod tile;
 #[cfg(target_os = "windows")]
@@ -249,6 +250,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("Failed to create EventLoop");
     let mut app = App::Initial(Waker::new(&event_loop), config);
     event_loop.run_app(&mut app)?;
+    // ★이 줄은 덤이다 -- 측정 런은 여기 닿지 않는다.★ 런처가 `-DurationSec` 을
+    // `Stop-Process -Force`(`TerminateProcess`)로 끝내고(`run_wall_dist.ps1:1015-1019`),
+    // 무제한 런도 같은 방법으로 죽이며(`:352-354` "Wall tile windows ignore WM_CLOSE"),
+    // 엔진에는 자체 종료 타이머가 없다. 즉 `run_app` 은 반환하지 않는다. 틱 위상을 실제로
+    // 내놓는 것은 `tick_phase_probe` 의 리포터 스레드이고, 이것은 정상 종료하는 런
+    // (`--capture`, 장비 인증 자가 시험)에서 마지막 한 줄을 더 받으려는 것뿐이다.
+    tick_phase_probe::log_summary();
     // 장비 인증 자가 시험도 판정을 종료 코드로 낸다(FAIL = 1). 엔진은 먼저 평소처럼 내린다.
     let selftest_exit_code = match &app {
         App::Running(state) => state.device_auth_selftest_exit_code.get(),
@@ -691,6 +699,9 @@ fn spawn_pacing_thread(
             // 치면 그 획득이 박자 경로 안에 들어온다 -- 없애려는 것이 바로 그런 양이다.
             let vblank_clock = servo_config::pref!(gfx_wall_pacing_vblank);
             let align_pct = servo_config::pref!(gfx_present_align_dwm_pct);
+            // ★프로브 여부도 여기서 한 번 읽는다.★ 꺼져 있으면 아래 두 자리의 호출이 아예
+            // 일어나지 않으므로 틱 경로가 치르는 값은 정확히 0 이다.
+            let probe = tick_phase_probe::is_enabled();
             let mut next = std::time::Instant::now() + period;
             // vblank 경로에서 "다음에 틱을 낼 시각". `period` 가 패널 주기보다 길 때만
             // 실제로 무언가를 거른다.
@@ -700,6 +711,9 @@ fn spawn_pacing_thread(
                     match pace_on_vblank(period, align_pct, &mut due) {
                         // 루프가 끝나면 프록시가 닫힌다. 그때 이 스레드도 끝낸다.
                         VblankPace::Fire => {
+                            if probe {
+                                tick_phase_probe::note_tick(false);
+                            }
                             if proxy.send_event(WakerEvent::Tick).is_err() {
                                 return;
                             }
@@ -737,6 +751,9 @@ fn spawn_pacing_thread(
                     // Win10 1803+ 에서 `sleep` 은 고해상도 대기 타이머를 쓴다 -- winit 이
                     // 같은 이유로 그것을 쓴다고 자기 주석에 적어 두었다.
                     std::thread::sleep(sleep);
+                }
+                if probe {
+                    tick_phase_probe::note_tick(true);
                 }
                 // 루프가 끝나면 프록시가 닫힌다. 그때 이 스레드도 끝낸다.
                 if proxy.send_event(WakerEvent::Tick).is_err() {
@@ -1514,6 +1531,17 @@ impl ApplicationHandler<WakerEvent> for App {
 
         // ★박자를 이벤트 루프에서 떼는 경로.★ 타일과 webview 가 다 준비된 뒤에 띄운다 --
         // 더 일찍 띄우면 아직 `Running` 이 아닌 상태로 틱이 올라와 버려진다.
+        // ★페이싱 스레드를 띄우기 전에 켠다.★ 그 스레드는 구성을 기동에 한 번만 읽으므로
+        // (`spawn_pacing_thread`), 여기서 늦게 켜면 그 런은 표본을 하나도 못 모은다.
+        if servo_config::pref!(gfx_wall_tick_phase_probe) {
+            tick_phase_probe::start();
+            // 마지막 줄이 그 런의 답이다 -- 측정 런은 강제 종료로 끝나므로 종료 훅이
+            // 없다(`tick_phase_probe` 모듈 doc).
+            eprintln!(
+                "wall: gfx_wall_tick_phase_probe=true: 틱 위상을 센다. \
+                 리포터 스레드가 10 초마다 누적을 찍는다."
+            );
+        }
         if servo_config::pref!(gfx_wall_pacing_thread) {
             eprintln!("wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다.");
             spawn_pacing_thread(waker.proxy.clone(), app_state.present_period);

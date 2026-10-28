@@ -609,6 +609,21 @@ pub struct Preferences {
     /// 한 세션 안에서 출력마다 한 번씩 돌리면 인과가 증명되고, 자동 선택기를 지을 값어치가
     /// 있는지도 같이 결정된다. 증명된 뒤에도 A/B 의 대조군과 운용자의 비상구로 남는다.
     pub gfx_wall_pacing_output: String,
+    /// ★페이싱 틱이 DWM 합성 격자의 어느 위상에 떨어지는지 센다.★ 기본 꺼짐.
+    ///
+    /// 켜면 페이싱 스레드가 틱마다 QPC 하나를 고정 크기 링에 넣고, 메인이 회전마다 접어
+    /// 히스토그램에 쌓고, 종료 시 `wall: tick phase p05/p50/p95 = …` 한 줄을 찍는다
+    /// (`winit_wall` 의 `tick_phase_probe`).
+    ///
+    /// ★왜 필요한가.★ 저더를 정하는 변수는 커밋이 DWM 격자의 어느 위상에 떨어지느냐
+    /// 하나인데(`commit_guard` 모듈 doc: 위상 13% → 63% 에서 dup 6 → 2146), 2026-10-27
+    /// 계측 제거 이후 그 위상을 수치로 말할 수단이 없어졌다. 페이싱 클럭 원천을 비교하려면
+    /// (`docs/superpowers/plans/2026-10-28-compositor-clock-pacing.md`) 그 수치가 있어야
+    /// 한다.
+    ///
+    /// ★틱 경로에 I/O 도 DWM 질의도 넣지 않는다.★ 질의가 없다는 것이 vblank 경로의 존재
+    /// 이유라서, 재려고 질의를 넣으면 재려던 것을 부순다. 꺼진 런의 비용은 0 이다.
+    pub gfx_wall_tick_phase_probe: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1331,6 +1346,7 @@ impl Preferences {
             gfx_wall_pacing_thread: false,
             gfx_wall_pacing_vblank: true,
             gfx_wall_pacing_output: String::new(),
+            gfx_wall_tick_phase_probe: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

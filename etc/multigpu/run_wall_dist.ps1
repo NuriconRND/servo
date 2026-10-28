@@ -254,6 +254,41 @@ param(
     # 찾지 못했으면 그 자리에 "★pin ... 을 찾지 못해 primary 로 떨어졌다★" 가 난다.
     # (예전에 이 일을 하던 VBANCHOR 줄은 2026-10-27 계측 제거에서 없어졌다.)
     [string] $PacingOutput = "",
+    # gfx_wall_tick_phase_probe: 페이싱 틱이 DWM 합성 격자의 어느 위상에 떨어지는지 센다.
+    #
+    # 저더를 정하는 변수는 커밋이 DWM 격자의 어느 위상에 떨어지느냐 하나인데
+    # (components/paint/commit_guard.rs 모듈 doc: 위상 13% -> 63% 에서 dup 6 -> 2146),
+    # 2026-10-27 계측 제거 이후 그것을 수치로 말할 수단이 없어졌다. 이 스위치가 최소한을
+    # 되살린다 -- 틱 위상 하나다.
+    #
+    # 틱 경로에는 아무것도 들어가지 않는다: 페이싱 스레드는 QPC 하나를 고정 크기 링에
+    # 넣기만 하고(stderr 도 DWM 질의도 없다), 접는 일과 찍는 일은 메인이 한다.
+    # 꺼진 런의 비용은 0 이다.
+    #
+    # ★10 초마다 누적 두 줄이 난다 -- 마지막 줄이 그 런의 답이다.★ 이 런은
+    # Stop-Process -Force 로 끝나므로(아래 -DurationSec 처리) 종료 훅으로는 아무것도
+    # 받을 수 없다. env_logger 는 stderr 를 버퍼 없이 쓰므로 강제 종료가 줄을 삼키지 않는다.
+    #
+    #   wall: tick phase [30s] p05/p50/p95 = 8.1/8.4/9.2 % 폭 1.1점 R=0.998 (n=1798, ...)
+    #   wall: tick gap   [30s] p05/p50/p95 = 0.99/1.00/1.01 주기 (n=1797, 1.5주기초과 0, ...)
+    #
+    # 위상은 ***원형 변수***라 백분위를 원형 통계로 뽑는다. '폭' 은 회전한 좌표에서 잰
+    # p95-p05 라 0% 를 걸쳐도 감싸지 않고, R 은 집중도(1 = 한 점, 0 = 고르게 흩어짐)다.
+    # R 이 낮으면 p50 을 믿지 말 것.
+    #
+    # ★자기 검증(타이머 경로 한정).★ -PacingDwmQuery 런은 snap_to_dwm_grid_at 이
+    # DWM 격자의 -DwmAlign % 지점을 겨냥해 자므로, phase p50 은 그 값보다 ***깨기 지연만큼
+    # 큰*** 값이어야 한다(수백µs~1ms = +2~6 점). 즉 -DwmAlign 8 이면 p50 은 10~14 쯤이고
+    # 폭은 좁아야 한다. -DwmAlign 이 0..99 밖이면 snap 이 정렬을 아예 안 하므로 이 검증은
+    # 성립하지 않는다.
+    #
+    # ★vblank 경로에는 '나와야 할 값' 이 없다.★ p50 = (X + DwmAlign) mod 100 이고 X 는
+    # 그 출력의 vblank 와 DWM 격자의 위상차 -- 바로 우리가 재려는 미지수다(vs_dwmvb).
+    # -DwmAlign 0 이면 align_after_vblank 가 즉시 반환하므로 p50 이 곧 X 다.
+    #
+    # 그리고 이 검증은 프로브와 snap 이 같은 DWM 앵커를 쓰므로 ***순환***이다 -- 프로브의
+    # 산술이 맞는지는 말해 주지만 DWM 격자 자체가 합성 마감과 맞는지는 말해 주지 않는다.
+    [switch] $TickPhase,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -661,6 +696,9 @@ if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
 if ($PacingOutput -ne "" -and -not $PacingThread) {
     Write-Warning "-PacingOutput $PacingOutput without -PacingThread: the pin is read only by the pacing thread's vblank source, and that thread is not running. The pin will be ignored."
 }
+if ($TickPhase -and -not $PacingThread) {
+    Write-Warning "-TickPhase without -PacingThread: the probe samples the pacing thread's ticks, and that thread is not running. The summary will report no samples."
+}
 if ($PacingOutput -ne "" -and $PacingDwmQuery) {
     Write-Warning "-PacingOutput $PacingOutput with -PacingDwmQuery: the DWM-query clock asks DwmGetCompositionTimingInfo for the desktop grid and never calls WaitForVBlank, so the pin selects nothing. Drop -PacingDwmQuery to pin an output."
 }
@@ -794,6 +832,7 @@ $argList = @(
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_vblank=$((-not $PacingDwmQuery.IsPresent).ToString().ToLower())",
     "--pref", "gfx_wall_pacing_output=$PacingOutput",
+    "--pref", "gfx_wall_tick_phase_probe=$($TickPhase.IsPresent.ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "media_d3d11_enabled=true",
@@ -866,7 +905,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwm-query+sleep'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
