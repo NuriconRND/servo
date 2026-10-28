@@ -356,6 +356,13 @@ impl Drop for ThreadedPainter {
 
 #[derive(Default)]
 struct WallFrameCoordinator {
+    /// ★배리어를 끄는 스위치. 이름이 반대인 이유가 있다.★
+    ///
+    /// `#[derive(Default)]` 가 `bool` 에 주는 값은 `false` 다. 그래서 "끈다" 로 이름을 두면
+    /// ***기본값이 오늘 동작***이라는 성질이 파생에서 공짜로 나오고, 필드를 하나 더해도
+    /// 수동 `Default` 를 쓸 필요가 없다. pref 쪽은 평범하게 긍정형
+    /// (`gfx_wall_frame_barrier`, 기본 참)이고 `from_environment` 에서 한 번 뒤집는다.
+    barrier_disabled: bool,
     barriers: HashMap<u64, WallFrameBarrier>,
     active_webview_frames: HashMap<WebViewId, u64>,
     /// "이 논리 프레임에는 직전 프레임을 유지하라" 는 타일별 지시. ★무장 지점은 둘이다★ --
@@ -656,6 +663,9 @@ impl WallFrameCoordinator {
     fn from_environment() -> Self {
         Self {
             delay_injection: WallFrameDelayInjection::from_environment(),
+            // 구성에 한 번만 읽는다 -- 배리어 판정은 패스마다 돌므로 거기서 pref 를 치면
+            // 전역 `RwLock` 획득이 그 경로에 들어온다.
+            barrier_disabled: !pref!(gfx_wall_frame_barrier),
             ..Default::default()
         }
     }
@@ -705,6 +715,13 @@ impl WallFrameCoordinator {
         expected_painter_ids: Vec<PainterId>,
     ) {
         if expected_painter_ids.len() <= 1 {
+            return;
+        }
+        // ★배리어를 끄면 ***배리어도 활성 프레임도*** 세우지 않는다.★ 둘을 같이 꺼야
+        // 의미가 선다: 배리어만 빼고 `active_webview_frames` 를 남기면 아무도 그것을
+        // 풀어 주지 않아(`release_active_webviews_for_barrier` 는 배리어 완료 경로다)
+        // 생산이 `WallFramePacingBlockReason::Active` 에서 영구히 막힌다.
+        if self.barrier_disabled {
             return;
         }
 
@@ -3019,6 +3036,9 @@ impl Paint {
         let registered = self.painter_targets_for_webview(webview_id);
         let mut in_flight = Vec::new();
         let mut inline_painter_ids = Vec::new();
+        // 패스마다 한 번 읽는다(타일마다가 아니다).
+        let detached = pref!(gfx_wall_tile_render_detached);
+        let detached_limit = pref!(gfx_painter_detached_queue_limit).max(0) as usize;
 
         for &painter_id in painter_ids {
             if !registered.contains(&painter_id) {
@@ -3037,6 +3057,15 @@ impl Paint {
             match &host.kind {
                 PainterHostKind::Threaded(threaded) => {
                     let time_profiler_chan = self.time_profiler_chan.clone();
+                    if detached {
+                        // ★결과 채널을 만들지 않는다.★ 그러면 아래 `in_flight` 가 비고,
+                        // 셸의 `join()` 이 기다릴 것이 없는 빈 호출이 된다 -- 셸은 그대로다.
+                        // 상한은 기존 detach 경로와 같은 것을 쓴다(무한 큐 방지).
+                        let _ = threaded.dispatch_detached(detached_limit, move |painter| {
+                            painter.render(&time_profiler_chan);
+                        });
+                        continue;
+                    }
                     let dispatched = threaded.dispatch(move |painter| {
                         painter.render(&time_profiler_chan);
                     });
@@ -3833,6 +3862,44 @@ mod wall_frame_keep_previous_tests {
     /// 역압 경로의 증거로 읽혔고, 2026-10-22 에 바로잡았다.
     ///
     /// ★설계 2-5 의 "배리어 참여" 를 이 시험이 보이지는 않는다★ -- 그 요구는 미구현이고,
+    /// ★배리어를 끄면 등록도 무장도 없다.★
+    ///
+    /// 켠 쪽을 대조군으로 같이 둔다 -- 한쪽만 보면 "원래 등록이 안 되는 입력" 을 통과로
+    /// 오해할 수 있다. 그리고 `active_webview_frames` 를 세우지 않는다는 것은 생산 차단
+    /// (`WallFramePacingBlockReason::Active`)이 없어진다는 뜻이고, 그것이 이 스위치의 요점의
+    /// 절반이다.
+    #[test]
+    fn a_disabled_barrier_registers_nothing_and_arms_nothing() {
+        let (a, b) = (painter(1), painter(2));
+
+        let mut on = WallFrameCoordinator::default();
+        on.register_frame(7, Vec::new(), vec![a, b]);
+        assert!(
+            on.barriers.contains_key(&7),
+            "setup: 배리어가 켜져 있으면 등록된다"
+        );
+
+        let mut off = WallFrameCoordinator {
+            barrier_disabled: true,
+            ..Default::default()
+        };
+        off.register_frame(7, Vec::new(), vec![a, b]);
+        assert!(off.barriers.is_empty(), "배리어를 끄면 등록하지 않는다");
+        assert!(
+            off.active_webview_frames.is_empty(),
+            "활성 프레임도 세우지 않아야 생산이 막히지 않는다"
+        );
+
+        // 배리어가 없으므로 마감 놓침이 유지 지시를 걸 수 없다 -- 타일이 건너뛰어지지 않는다.
+        has_presented(&mut off, a);
+        off.miss_barrier(7, std::time::Instant::now());
+        assert_eq!(
+            off.keep_previous_logical_frame(a),
+            None,
+            "배리어가 없으면 유지 지시도 없다"
+        );
+    }
+
     /// 무장이 실제로 바꾸는 것이 무엇인지는
     /// [`WallFrameCoordinator::arm_keep_previous`] 의 주석에 있다(거기 한 벌만 둔다).
     #[test]

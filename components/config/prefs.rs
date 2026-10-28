@@ -760,6 +760,35 @@ pub struct Preferences {
     /// wall frame 코얼레싱이 쌓아 둘 수 있는 최대 보류 프레임 수. 0 이하면 경고 후
     /// 기본값(1)을 쓴다.
     pub gfx_wall_frame_max_pending: i64,
+    /// ★벽 프레임 배리어.★ 기본 켜짐(= 오늘 동작).
+    ///
+    /// 끄면 `WallFrameCoordinator::register_frame` 이 아무것도 등록하지 않는다. 그 결과가
+    /// 둘이다:
+    ///
+    ///  * 어떤 타일도 "직전 프레임을 유지하라" 지시를 받지 않는다 -- `miss_barrier` 가
+    ///    찾을 배리어가 없으므로 `keep_previous_painters` 가 비어 있게 된다.
+    ///  * ***새 벽 프레임이 직전 것의 완료를 기다리지 않는다*** --
+    ///    `WallFramePacingBlockReason::Active` 가 읽는 `active_webview_frames` 도 세우지
+    ///    않기 때문이다. 생산을 막는 것은 `gfx_wall_frame_max_pending` 하나만 남는다.
+    ///
+    /// ★대가가 있다.★ 배리어의 존재 이유가 "한 논리 프레임을 전 타일이 함께 올린다" 이므로,
+    /// 끄면 타일들이 ***서로 다른 논리 프레임을 동시에 보여 줄 수 있다.*** 가로로 흐르는
+    /// 자막이 이음매를 지날 때 그것이 더 나쁘게 보일 수 있다 -- 그래서 기본이 켜짐이고
+    /// 이 pref 는 A/B 용이다.
+    pub gfx_wall_frame_barrier: bool,
+    /// ★타일 렌더를 발사하고 기다리지 않는다.★ 기본 꺼짐.
+    ///
+    /// 켜면 `dispatch_paint_targets` 가 결과 채널을 만들지 않고 기존
+    /// `ThreadedPainter::dispatch_detached` 로 보낸다(큐 상한은
+    /// `gfx_painter_detached_queue_limit`). 그러면 셸의 `PaintTargetsInFlight::join()` 이
+    /// 기다릴 것이 없어 ***빈 호출***이 된다 -- 셸은 손대지 않는다.
+    ///
+    /// ★`gfx_dcomp_commit_in_end_frame` 과 같이 써야 한다.★ 그것이 꺼져 있으면 커밋이
+    /// 미뤄지고, 미뤄진 커밋을 흘리는 `flush_deferred_dcomp_commits` 가 ***타일의
+    /// `end_frame` 보다 먼저 돌아*** 그 패스의 커밋이 통째로 빠진다. 켜져 있으면 각 타일이
+    /// 자기 `end_frame` 에서 커밋하므로 흘릴 것이 없고 순서 요구도 사라진다.
+    /// 런처가 그 조합을 강제한다.
+    pub gfx_wall_tile_render_detached: bool,
     /// wall frame 코얼레싱 간 최소 간격(ms). ***기본 `0` = `gfx_refresh_hz` 한 주기로
     /// 유도***(`paint.rs` `from_prefs`, `refresh_driver::paint_timer_period`).
     ///
@@ -1377,6 +1406,8 @@ impl Preferences {
             gfx_refresh_hz: 120,
             gfx_wall_frame_pacing_enabled: true,
             gfx_wall_frame_max_pending: 1,
+            gfx_wall_frame_barrier: true,
+            gfx_wall_tile_render_detached: false,
             gfx_wall_frame_min_interval_ms: 0, // 0 = gfx_refresh_hz 한 주기(위 doc 참고)
             // 빈 문자열 = 오버라이드 없음(WR 기본). 위 필드 doc 주석 참고.
             gfx_wr_picture_tile_size: String::new(),

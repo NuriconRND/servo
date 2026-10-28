@@ -266,6 +266,27 @@ param(
     # 찾은 최적값(8)이 그대로 옮겨오지 않으므로 ***다시 스윕해야 한다.*** -TickPhase 로
     # 재면 된다.
     [switch] $PacingCompositorClock,
+    # gfx_wall_frame_barrier=false: 벽 프레임 배리어를 끈다.
+    #
+    # 배리어는 "한 논리 프레임을 전 타일이 함께 올린다" 를 지키는 소프트웨어 장치다
+    # (components/paint/paint.rs 의 WallFrameCoordinator). 끄면 둘이 사라진다:
+    #   - 어떤 타일도 "직전 프레임 유지" 지시를 받지 않는다(건너뛰기가 없어진다).
+    #   - 새 벽 프레임이 직전 것의 완료를 기다리지 않는다. 생산을 막는 것은
+    #     gfx_wall_frame_max_pending 하나만 남는다.
+    #
+    # ★대가:★ 타일들이 서로 다른 논리 프레임을 동시에 보여 줄 수 있다. 가로로 흐르는
+    # 자막이 이음매를 지날 때 ***더 나쁘게*** 보일 수 있다. 그래서 A/B 용이다.
+    [switch] $NoFrameBarrier,
+    # gfx_wall_tile_render_detached=true: 타일 렌더를 발사하고 기다리지 않는다.
+    #
+    # 기본은 한 패스에서 타일 넷을 발사한 뒤 PaintTargetsInFlight::join() 으로 전부
+    # 기다린다. 켜면 결과 채널을 만들지 않으므로 그 join 이 빈 호출이 된다(큐 상한은
+    # gfx_painter_detached_queue_limit).
+    #
+    # ★-DcompCommitInFrame 과 같이 써야 한다 -- 아래에서 강제한다.★ 그것이 없으면 커밋이
+    # 미뤄지고, 미뤄진 커밋을 흘리는 flush_deferred_dcomp_commits 가 타일의 end_frame 보다
+    # 먼저 돌아 그 패스의 커밋이 통째로 빠진다.
+    [switch] $DetachTileRender,
 
     # gfx_wall_pacing_output: 페이싱 스레드가 WaitForVBlank 를 걸 출력을 이름으로 못 박는다.
     # "" = primary(오늘 동작). "\.\DISPLAY22" 처럼 DXGI 출력 이름을 준다.
@@ -713,6 +734,15 @@ if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
 }
 
+# -DetachTileRender 는 커밋이 미뤄지지 않을 때만 성립한다. 미뤄지면 flush 가 타일의
+# end_frame 보다 먼저 돌아 그 패스의 커밋이 빠진다 -- 조용히 프레임을 잃는 종류라 throw 한다.
+if ($DetachTileRender -and -not $DcompCommitInFrame) {
+    throw "-DetachTileRender requires -DcompCommitInFrame: without it the deferred-commit flush runs before the tile threads finish end_frame, so that pass's commits are lost."
+}
+if (($NoFrameBarrier -or $DetachTileRender) -and -not $ParallelTiles) {
+    Write-Warning "-NoFrameBarrier/-DetachTileRender without -ParallelTiles: both only change behaviour when tiles render on their own threads. They will do nothing here."
+}
+
 # 페이싱 클럭은 하나만 고른다. 둘을 같이 주면 어느 쪽이 돌았는지 로그로도 가릴 수 없다.
 if ($PacingDwmQuery -and $PacingCompositorClock) {
     throw "-PacingDwmQuery and -PacingCompositorClock select different pacing clocks; pass at most one."
@@ -867,6 +897,8 @@ $argList = @(
     "--pref", "gfx_sample_lead_periods=$SampleLead",
     "--pref", "gfx_wall_direct_render=$($DirectRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_thread=$($PacingThread.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_frame_barrier=$((-not $NoFrameBarrier.IsPresent).ToString().ToLower())",
+    "--pref", "gfx_wall_tile_render_detached=$($DetachTileRender.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_pacing_clock=$(if($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'})",
     "--pref", "gfx_wall_pacing_output=$PacingOutput",
     "--pref", "gfx_wall_tick_phase_probe=$($TickPhase.IsPresent.ToString().ToLower())",
@@ -942,7 +974,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
