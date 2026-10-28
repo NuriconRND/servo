@@ -1,7 +1,10 @@
 # DComp 커밋·BeginDraw 계측과 서피스별 자원 재사용 설계
 
 - 작성: 2026-10-20
-- 근거 분석: `F:\20260609_SDWall_BrowserTest\frontend\ANALYSIS-output-ticker-jitter.md`(이하 분석서)
+- 근거 분석: `ANALYSIS-output-ticker-jitter.md`(이하 분석서) — ★2026-10-28 확인: 커밋되지
+  않은 채 소실됐다.★ 저장소 루트에도 `F:\20260609_SDWall_BrowserTest\frontend\` 에도 없다.
+  아래 0 절이 그 사슬을 그대로 옮겨 적었으므로 이 문서만으로 읽히지만, 본문의
+  "분석서 N 절" 인용은 더는 따라갈 수 없다.
 - 대상 브랜치: `wall-sample-index-slip` cba6e697388
 - 다루는 것: 분석서 7절의 **W13**(정체 위치 계측) 중 커밋·BeginDraw 부분과 **W1**(bind 마다 GPU 자원을 만들고 지우는 구조)
 - 다루지 않는 것: W16(`overflow: hidden` pref), W14(빈 트리 경쟁), W15(페이싱 루프), 프론트 P-clip

@@ -4,7 +4,9 @@
 <!--
   ★무엇을 가르나★
   output 페이지의 자막 jutter가 "두 번째 WebRender 슬라이스(알파 DComp 서피스)"에서 오는지 가른다.
-  분석은 저장소 루트 `ANALYSIS-output-ticker-jitter.md` 3절·8절.
+  근거였던 분석서(`ANALYSIS-output-ticker-jitter.md`)는 커밋되지 않은 채 소실됐다(2026-10-28 확인).
+  요지는 바로 아래에 옮겨져 있고, 그 위에 세운 설계는
+  `docs/superpowers/specs/2026-10-20-dcomp-commit-probe-and-surface-reuse-design.md` 에 있다.
 
     Servo는 `overflow: hidden`을 WebRender 스크롤 프레임으로 만들고(`overflow: clip`만 단순 클립),
     WebRender는 가장 바깥 스크롤 프레임 안쪽을 별도 슬라이스로 자르며, 슬라이스마다 불투명·알파
