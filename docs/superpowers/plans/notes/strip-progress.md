@@ -10,11 +10,11 @@
 
 | | |
 |---|---|
-| 진행 | **16 / 20 단계** (1~15, 17) |
-| 누적 제거 | **약 12,287 줄** |
-| 계획서 오류 (발견) | **60 건** (실행 중 32 + 재검증 28) |
-| 조용한 회귀 회피 | **22 건** |
-| ★합쳐진 doc 함정★ | **17 회** — doc 주석이 설명 대상이 아닌 다른 항목에 물리적으로 붙어 있는 경우. 이제 패턴으로 취급한다 |
+| 진행 | **20 / 20 단계 — 완료** |
+| 누적 제거 | **약 20,489 줄** |
+| 계획서 오류 (발견) | **83 건** (실행 중 55 + 재검증 28) |
+| 조용한 회귀 회피 | **26 건** |
+| ★합쳐진 doc 함정★ | **23 회** — doc 주석이 설명 대상이 아닌 다른 항목에 물리적으로 붙어 있는 경우. 이제 패턴으로 취급한다 |
 | 기준선 | `servo-paint --lib` 130/130 → 현재 **93/93** (계측 테스트 37 개 제거분) |
 | `config_surface` | 19/20 (기존 RED) → Step 14 에서 **20/20 달성** ★제거가 완결됐다는 유일한 독립 증거★ |
 | 게이트 ★G4 불능★ | `cargo check -p servo-layout -p servo-script` 는 이 장비에서 못 돈다 — `mozjs_sys` 의 `jsapi.cpp` 가 설치된 MSVC 와 안 맞는다. 제거와 무관(손 안 댄 crate 로도 재현). **G2(`winit_wall` check)가 두 crate 를 소스에서 타입체크하므로 대체된다.** |
@@ -354,6 +354,101 @@ KEEP 판정은 유효하고 근거만 낡았다.)
 주석 블록" 기준으로 지웠으면 **남아야 할 스위치의 문서가 조용히 사라진다.**
 Rust 가 아닌 곳에서 같은 패턴이 처음 나왔다.
 
+### Step 16 — 런처 분석부·계측 스위치·분석 도구 일체 `a5a9dd81cb0` (5,711 줄, 15 파일)
+
+**단일 단계 최대.** `run_wall_dist.ps1` 2706 → 980, `make_wall_dist.ps1` 284 → 262,
+추적 중인 분석 도구 12 파일 삭제.
+
+**★유지 — 1b 절이 계획서를 이긴다★** `-CanvasAckSkip` 과 `-NoCanvasAckRecovery`.
+계획서 item 6 은 둘 다 제거 목록에 넣었으나, 편집 전 `:915`/`:918` 이
+`SERVO_WALL_CANVAS_ACK_SKIP` 과 `SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` 의 **유일한
+writer** 였고 세 줄 위의 무조건 `SERVO_*` wipe 때문에 런처 스위치가 유일한 도달 경로다.
+지웠으면 유지하기로 한 킬스위치 둘이 못 닿는 것이 된다.
+
+**★계획서가 못 본 것 — `-LegacyLogRedirect` 제거가 launch 분기를 좌초시킨다★**
+`$LegacyLogRedirect` 가 live 조건 두 곳에 있었고 `Set-StrictMode` 가 없으니
+`-not $null` 은 `$true` 다. 스위치만 지웠으면 `else { Start-Process -RedirectStandardError }`
+가 **살아 보이는 죽은 코드**가 된다. if/else 를 걷고 cmd 래퍼 경로만 남겼다.
+
+**범위 오류 다섯, 그중 셋은 살아야 할 코드를 지운다** — 특히 `-ThreadCpu` 샘플링
+범위 `:1292-1318` 의 시작 줄이 `if ($DurationSec -gt 0) {` 다. 그대로 지우면
+duration/stop-process 경로가 통째로 사라진다.
+
+**★합쳐진 doc 함정 5 회(누적 18~22)★** — `-ThreadCpu` 의 doc 이 자기 파라미터보다
+**103 줄 위**에 있다. `[switch] $KeepRustLog,` 에는 **자기 doc 이 없고** 위 블록이
+`-NoLog`(유지) 것이다.
+
+게이트: 두 ps1 AST 파싱 0 errors, BOM `ef bb bf` 보존 / 파라미터 75 → 55 이고
+집합 차이가 의도한 20 개와 정확히 일치 / 제거된 파라미터의 live 참조 0 /
+`config_surface` 20 passed.
+
+### Step 18 — `ports/servoshell` 타이밍 계층 `0e4c94e913e` (78 줄, 3 파일)
+
+`window.rs` 676 → 638, `gui.rs` 851 → 848, `headed_window.rs` 1855 → 1822.
+
+**★계획서가 지시한 `231-284` 는 삭제 범위가 아니라 페인트 본문 전체다★** —
+`webview.paint_target()/paint()`, `flush_deferred_dcomp_commits()`,
+`rendering_context.present()` 가 그 안에 있다. 글자 그대로 따랐으면 셸의 재페인트
+경로에서 페인트·DComp 플러시·present 가 통째로 사라진다.
+
+**★합쳐진 doc 함정 23 회차★** `window.rs:237-244` 의 여덟 줄 주석은 아래 계측이
+아니라 **위** 줄(245)의 `flush_deferred_dcomp_commits()` 를 설명하는, 그 호출의
+저장소 내 유일한 문서다. 함께 지웠으면 **컴파일 에러 없이** 셸에 픽셀 회귀가 남는다.
+
+**★계획서에 `headed_window.rs` 가 아예 없다★** — `Gui::paint` 의 유일한 호출자이자
+그 `Duration` 의 유일한 소비자다. 계획서가 적은 `gui.rs` 조각보다 크고, 그것 없이는
+컴파일되지 않는다. 경로도 틀렸다(`desktop/window.rs` 가 아니라 `window.rs`).
+
+**★`desktop/app.rs:72`·`:345` 는 지우지 않았다★** — `git blame` 상 둘 다 업스트림
+(2024-12-19)이고 업스트림 매크로 `trace_winit_event!` 만 먹인다. 같은 단계가 out of
+scope 로 선언한 `PerfettoLayer` 와 같은 범주다. 1 절이 범위를 "포크가 추가한 수단" 으로
+한정한다.
+
+게이트: `cargo check -p servoshell` exit 0(경고 줄 자체가 안 난다) / winit_wall
+check exit 0 / `servo-paint` 93 / `config_surface` 20.
+
+### Step 19 — `shared/paint` POC 예제 3 개 `854f80351f5` (2,102 줄)
+
+`d3d11_dyn_poc.rs` 618 + `dcomp_native_poc.rs` 584 + `dcomp_partial_present_poc.rs` 846
+= **2,048 — 계획서 수치가 정확히 맞은 드문 경우다.** `Cargo.toml` 108 → 54.
+
+**계획서 정정 둘** — ★`[[example]]` 선언은 애초에 없다★(별표까지 달아 경고한 함정에
+해당 사항이 없었다). `:56-108` 은 winapi 블록이 아니다 — `:62` 가 `env_logger` 다.
+
+**★계획서의 게이트로는 이 제거가 검증되지 않는다★** — resolver = "2" 에서 dev-target 을
+안 지으면 dev-dependency 피처는 통합되지 않는다.
+`cargo check -p servo-paint-api --all-targets --features no-wgl` 를 추가했고 그것이
+exit 0 인 것이 실제 증명이다.
+
+### Step 20 — `vendor_local/webrender` 계측 제거 (패치는 유지)
+
+**★계획서의 전제가 깨졌다 — 사용자 판단으로 방향을 바꿨다★**
+1b 절은 "upstream 으로 되돌린다" 였으나, crates.io 0.68.0 원본과 전수 비교한 결과
+이 사본은 계측 전용이 아니라 **동작 변경 20 줄**을 함께 싣고 있었다:
+
+- `tile_cache.rs` 의 `picture_caching_disabled()` (`WR_DISABLE_PICTURE_CACHING`)
+- `picture.rs` 의 multi-GPU video-wall workaround — picture caching 이 꺼졌을 때
+  O(prim × quadtree) 의존성 비교를 건너뛰고 타일을 통째로 무효화한다
+  (2026-07-13 WR native compositor 설계 §1 의 그 비용)
+
+★이 둘은 **초기 vendoring 커밋이 끌고 들어온 것**이라 이후 커밋 아홉 개를 아무리 읽어도
+안 보인다★ — 계획서가 지시한 "커밋 9 개를 읽어 확인한다" 로는 못 잡는다. 잡은 방법은
+레지스트리 캐시의 `.crate` 를 풀어 **트리 전체를 원본과 대조**한 것이다.
+
+사용자 결정: **계측만 걷고 패치 유지.**
+
+**방법 — 범위 삭제가 아니라 원본 복원.** 세 파일에서 upstream 줄이 바뀐 것은 각각
+1/1/0 개이고 나머지는 전부 추가분임을 먼저 확인한 뒤, `renderer/mod.rs` 와
+`spatial_tree.rs` 는 upstream 원본 그대로 덮고 `tile_cache.rs` 는 원본 + helper 여덟 줄로
+재구성했다. **손편집이 0 이므로 증명이 `diff -r` 한 번으로 끝난다** — 복원 후 트리 전체
+대조에서 차이는 `picture.rs` 와 `tile_cache.rs` 둘뿐이고, 그 둘이 정확히 유지 대상이다.
+
+루트 `Cargo.toml` 의 patch 주석도 고쳤다. "느린 프레임에 한 줄 더한 계측 사본, 원인이
+잡히면 되돌린다" 는 이제 사실이 아니다. ★`Cargo.lock` 은 바뀌지 않는다★ — 패치 경로를
+그대로 두었으므로 스테이징 금지 목록과 충돌할 일도 없다.
+
+게이트: cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webgpu --release ★exit 0, 11m 36s 풀빌드★. webrender 가 vendor_local 에서 컴파일됐고, ★직전까지 모든 빌드 로그에 나오던 wall_prepare_gpu_cache_ms / wall_pre_draw_ms / wall_texture_cache_ms / wall_native_surfaces_ms 의 value
+
 ---
 
 ## Steps 8~11 재검증 `78c392d4fbc`
@@ -387,3 +482,51 @@ Step 5 실행과 **병렬로** 읽기 전용 재검증(파일 집합이 겹치�
 
 **어서션이 실제로 잡은 것**: Step 2 에서 범위 계산이 두 번 어긋났고(끝줄, 빈 줄),
 Step 3 에서 두 번, Step 4 에서 열한 번 터졌다. 전부 삭제 전에 잡혀 파일은 무손상.
+
+
+---
+
+## 남은 것 / 알려진 빚 (2026-10-28, 20/20 완료 시점)
+
+### 사용자가 처리할 것
+
+- ★`Cargo.lock`★ — Step 19 가 dev-dependency 를 지우면서 `env_logger` 줄 하나가
+  빠져야 한다. 스테이징 금지 목록이라 커밋에 넣지 않았다. (같은 파일의 `time` 추가
+  한 줄은 이 작업과 무관한 기존 변경이다.)
+- ★`etc/multigpu/check_freeze_log.ps1`★ — **미추적 파일**이라 지우지 않았다.
+  `WALLTICKRATE`/`FRAMEREASON`/`ANIMSTEP` 을 읽는데 셋 다 없어졌으므로 죽은 도구다.
+- ★`tests/html/ticker_slice_probe.html` 이 미추적인데 `make_wall_dist.ps1:195` 가
+  `-EA SilentlyContinue` 로 복사한다★ — 육안 프로브 넷 중 하나인데, 깨끗한
+  체크아웃에서 패키징하면 **조용히 빠진다.** 추적에 넣든 복사를 빼든 결정이 필요하다.
+
+### 일부러 남긴 것
+
+- `ports/servoshell/desktop/app.rs:72`·`:345` 와 `lib.rs:67` 의 `PerfettoLayer` —
+  업스트림 tracing 통합이다. 지우려면 셋을 함께, 별건으로.
+- `docs/multigpu/` 의 조사 기록 다섯 편이 삭제된 런처 스위치 이름을 인용한다
+  (`multigpu_tile_scaling_diagnosis.md`, `capture_card_shared_connection.md`,
+  `wall_animation_end_black_frame.md`, `wall_output_animation_frontend_handoff.md`).
+  전부 "그때 이렇게 돌렸다" 는 과거 기록이지 지시가 아니라 history 로 둔다.
+- 삭제된 POC 예제를 가리키는 doc 참조 넷(`dcomp_compositor.rs:10`,
+  `shared/paint/rendering_context.rs:132`, `third_party/surfman/.../surface.rs:55`,
+  `config/tests/config_surface.rs:40`). 설계 근거의 출처 표기다.
+- `vendor_local/webrender` 자체 — 20 줄짜리 포크로 남았다. 자세한 것은 Step 20.
+
+### 우리 잔재가 **아닌** 경고 (확인 완료, 고치지 말 것)
+
+릴리스 빌드에 남는 경고는 전부 손 안 댄 것이다.
+
+| 경고 | 왜 우리 것이 아닌가 |
+|---|---|
+| `make_current_if_needed_mut` never used | `webxr.rs:306` 이 쓴다. `webxr` 피처가 꺼져 있을 뿐이다 |
+| `gamepad_task_source` / `GlobalScope` unused | 같은 cfg 블록. gamepad 쪽이 꺼져 있다 |
+| `GenericSender` unused | `servo.rs:1249` 가 쓴다. bluetooth 가 꺼져 있다 |
+| `Trusted` import unused (`webglrenderingcontext.rs:62`) | ★제거 **이전부터** 안 쓰였다★ — `619f93b2494^` 에서도 import 와 주석뿐이다 |
+| `third_party/surfman` 9 건, `AngleGlGuard`, `servo-canvas-traits` | 손 안 댄 코드 |
+
+### 다음 할 일 (제거와 무관, 원래 하던 추적)
+
+★`-PacingOutput` 핀 스윕이 아직 안 돌았다.★ 2026-10-26 커밋 `d3536e6092e` 가
+"핀으로 인과를 먼저 가른다 — 한 세션에 출력마다 한 번씩 돌리면 결판난다" 를 지시해
+두었고 운영자도 `log_fullthrottle_arch/01·06·07` 에 같은 말을 적었는데, run 11 은
+`pacing_output=primary` 로 돌아 그 지시를 실행하지 않았다. 스위치는 유지했다.
