@@ -1613,6 +1613,14 @@ impl ApplicationHandler<WakerEvent> for App {
             event_loop.exit();
             return;
         }
+        // ★페이싱 스레드가 어느 출력에 묶였는지를 여기서 찍는다 -- 그 스레드에서가 아니라.★
+        // stderr 는 틱 경로에 들어가면 안 되므로 저쪽은 문자열만 놓고 간다
+        // (`output_grid` 의 `PACING_BINDING`). 바인딩이 바뀔을 때만 값이 있으므로 보통은
+        // relaxed 로드 하나로 끝난다. `warn!` 인 이유는 방막 런이 `RUST_LOG=warn` 이기
+        // 때문이다 -- info 로 두면 정작 볼 사람에겐 안 보인다.
+        if let Some(binding) = servo::take_pacing_vblank_binding() {
+            log::warn!("wall: {binding}");
+        }
         if let Some(script) = state.device_auth_selftest_next.take() {
             if let Some(webview) = state.webview.borrow().clone() {
                 log::warn!("device-auth selftest: next step");

@@ -58,6 +58,27 @@ pub fn wait_primary_vblank() -> Option<(u64, u64)> {
     }
 }
 
+/// ★페이싱 스레드가 실제로 어느 출력의 vblank 에 묶였는지.★ 바인딩이 바뀔을 때만
+/// `Some` 이고 그 뒤로는 `None` 이다. 쉘이 회전마다 불러 꺼내 찍는 용도다.
+///
+/// ★찍는 일이 왜 쉘 몫인가.★ 이 사실을 아는 것은 페이싱 스레드뿐인데 그 스레드의
+/// stderr 는 금지다(위 `wait_primary_vblank` 의 doc). 그래서 저쪽은 문자열만 놓고 메인이
+/// 꺼낸다. 낼 것이 없을 때의 비용은 relaxed 원자 로드 하나다.
+///
+/// ★왜 이 줄이 필요한가.★ `gfx_wall_pacing_output` 은 이름을 못 찾으면 조용히 primary 로
+/// 떨어진다. 런처는 pref 를 넘겼다는 것밖에 못 찍으므로, 핀이 걸렸는지를 말할 수 있는
+/// 것은 엔진뿐이다.
+pub fn take_pacing_vblank_binding() -> Option<String> {
+    #[cfg(windows)]
+    {
+        crate::output_grid::take_pacing_binding()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// (아래 `dwm_composition_grid` 의 doc 주석은 그대로다.)
 pub fn dwm_composition_grid() -> Option<(u64, u64)> {
     #[cfg(windows)]

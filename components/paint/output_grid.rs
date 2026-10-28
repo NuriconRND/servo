@@ -16,6 +16,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -274,6 +275,43 @@ fn pinned_index(outputs: &[Output]) -> Option<usize> {
         .position(|out| out.name.eq_ignore_ascii_case(pin))
 }
 
+/// ★실제로 바인딩된 출력을 쉘에 한 줄로 넘긴다.★ 바인딩이 **바뀔 때만** 채워진다.
+///
+/// ★왜 여기서 직접 찍지 않는가.★ 이 자리는 페이싱 스레드다. 그 스레드의 stderr 는
+/// 금지다 -- 한 줄이라도 여기서 내면 "틱 경로에 I/O 가 없다" 가 더는 참이 아니게 되고,
+/// 다음 사람이 두 줄째를 넣을 때 기달 선이 사라진다. 그래서 문자열만 놓아두고
+/// 메인 스레드가 꺼내 찍는다(`winit_wall` 의 `about_to_wait`).
+///
+/// ★왜 필요한가.★ `gfx_wall_pacing_output` 이 이름을 못 찾으면 **조용히** primary 로
+/// 떨어진다(`refresh`). 런처는 pref 를 넘겼다는 것만 찍을 수 있으므로, 핀이 실제로
+/// 걸렸는지는 엔진만 말할 수 있다. 그 일을 하던 `VBANCHOR` 는 2026-10-27 계측 제거에서
+/// 없어졌고, 그 뒤로 확인할 방법이 하나도 없었다.
+static PACING_BINDING: Mutex<Option<String>> = Mutex::new(None);
+
+/// 위 자물쇠를 잡기 **전에** 보는 깃발. 메인 루프가 회전마다 보므로 relaxed 로드
+/// 하나보다 비싸면 안 된다.
+static PACING_BINDING_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// 쉘이 꺼내 간다. 낼 것이 없으면 자물쇠를 잡지 않고 `None`.
+///
+/// 깃발을 내린 뒤 자물쇠를 잡기 전에 페이싱 스레드가 새 줄을 넣으면, 이번 호출이
+/// 그 새 줄을 가져가고 깃발은 올라간 채로 남는다 -- 다음 회전이 빈 자물쇠를 한 번 잡고
+/// `None` 을 돌려줄 뿐이다. 잃는 줄은 없다.
+pub(crate) fn take_pacing_binding() -> Option<String> {
+    if !PACING_BINDING_PENDING.swap(false, Ordering::Relaxed) {
+        return None;
+    }
+    PACING_BINDING.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// 페이싱 스레드가 바인딩이 바뀔 때 부른다. ★자물쇠 하나, I/O 없음.★
+fn publish_pacing_binding(line: String) {
+    if let Ok(mut slot) = PACING_BINDING.lock() {
+        *slot = Some(line);
+        PACING_BINDING_PENDING.store(true, Ordering::Relaxed);
+    }
+}
+
 struct VblankSource {
     /// 살아 있는 열거. 구성이 바뀌거나 대기가 실패하면 버린다.
     enumeration: Option<Enumeration>,
@@ -285,6 +323,10 @@ struct VblankSource {
     monitor: usize,
     /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
     period_qpc: Option<u64>,
+    /// 쉘에 마지막으로 넘긴 바인딩 설명. 같은 값이면 다시 넘기지 않는다 --
+    /// 모니터가 없는 동안 `refresh` 는 호출마다 재열거하므로, 이것이 없으면 같은 줄이
+    /// 초당 60 번 올라간다.
+    announced: Option<String>,
 }
 
 impl VblankSource {
@@ -295,6 +337,7 @@ impl VblankSource {
             wait_idx: 0,
             monitor: 0,
             period_qpc: None,
+            announced: None,
         }
     }
 
@@ -349,6 +392,61 @@ impl VblankSource {
         self.enumeration = Some(enumeration);
         self.primary = primary;
         self.wait_idx = wait_idx;
+        // ★바인딩이 바뀔었으면 쉘에 한 줄 넘긴다.★ 여기서 찍지 않는 이유는
+        // `PACING_BINDING` 의 주석에 있다. 정상 구성에서 재열거는 기동과 토폴로지 변경에만
+        // 도므로 줄 수는 그 횟수와 같다. 모니터가 하나도 없으면 호출마다 이 `String` 을
+        // 한 번 만드는데, 그 상태의 같은 호출은 바로 위에서 `CreateDXGIFactory1` 과 전체
+        // 열거를 이미 돌리고 있다 -- 할당 하나는 그 옆에서 보이지 않는 양이다.
+        let line = self.describe_binding();
+        if self.announced.as_deref() != Some(line.as_str()) {
+            publish_pacing_binding(line.clone());
+            self.announced = Some(line);
+        }
+    }
+
+    /// 지금 무엇에 묶여 있나 -- 쉘이 찍을 한 줄.
+    ///
+    /// 읽는 사람이 알아야 하는 것은 셋이다: ① 어느 패널을 기다렸나, ② 그것이
+    /// primary 인가, ③ ★`-PacingOutput` 이 실제로 걸렸나★. 셋째가 이 줄의 존재
+    /// 이유다 -- 이름을 못 찾은 핀은 조용히 primary 로 떨어지고, 그러면 런은 정확히
+    /// 핀을 주지 않은 런과 같아진다.
+    fn describe_binding(&self) -> String {
+        let outputs = self
+            .enumeration
+            .as_ref()
+            .map_or(&[][..], |enumeration| enumeration.outputs.as_slice());
+        let Some(bound) = outputs.get(self.wait_idx) else {
+            return String::from("pacing vblank: 열린 출력이 하나도 없다 -- 페이싱은 타이머로 떨어진다");
+        };
+        let hz = self
+            .period_qpc
+            .filter(|period| *period > 0)
+            .zip(qpc_frequency())
+            .map_or_else(
+                || String::from("Hz 미상"),
+                |(period, freq)| format!("{:.2}Hz", freq as f64 / period as f64),
+            );
+        let pin = PACING_OUTPUT_PIN.as_str();
+        let pin_state = if pin.is_empty() || pin.eq_ignore_ascii_case("primary") {
+            String::from("pin 없음 -> primary")
+        } else if pinned_index(outputs).is_some() {
+            format!("pin \"{pin}\" 적용됨")
+        } else {
+            format!("★pin \"{pin}\" 을 찾지 못해 primary 로 떨어졌다★")
+        };
+        format!(
+            "pacing vblank: {} ({}, 출력 {}/{}) {} -- {}",
+            bound.name,
+            if self.wait_idx == self.primary {
+                "primary"
+            } else {
+                "non-primary"
+            },
+            self.wait_idx + 1,
+            outputs.len(),
+            hz,
+            pin_state,
+        )
     }
 
     fn wait(&mut self) -> Option<(u64, u64)> {

@@ -247,7 +247,12 @@ param(
     # 2026-10-26 같은 바이너리로 돈 네 런에서 DWM 격자에 붙은 출력이 런마다 달랐고, 어긋난
     # 런은 커밋 위상 52% 에 dup 4.025%, 붙은 런은 0.902% 였다. 먼저 OUTPHASE 로 그 세션의
     # vs_dwmvb_ms 가 0 인 출력을 확인한 뒤 출력마다 한 번씩 돌리면 인과가 증명된다.
-    # 로그의 VBANCHOR 줄이 실제로 어느 출력을 기다렸는지 찍는다.
+    # ★핀이 실제로 걸렸는지는 런처가 알 수 없다.★ 이름을 못 찾으면 엔진이 조용히
+    # primary 로 떨어지므로, 아래 배너의 pacing_output= 칸은 "넘겼다" 까지만 말한다.
+    # 판정은 엔진 로그의 한 줄이다(기동에 한 번, 토폴로지가 바뀔 때 다시):
+    #   wall: pacing vblank: \\.\DISPLAY1 (primary, 출력 1/4) 59.95Hz -- pin "\\.\DISPLAY22" 적용됨
+    # 찾지 못했으면 그 자리에 "★pin ... 을 찾지 못해 primary 로 떨어졌다★" 가 난다.
+    # (예전에 이 일을 하던 VBANCHOR 줄은 2026-10-27 계측 제거에서 없어졌다.)
     [string] $PacingOutput = "",
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
@@ -630,6 +635,19 @@ if ($DcompUpdateQuantum -lt -1) {
 # 두지는 않는다.
 if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
+}
+
+# -PacingOutput 은 ***vblank 경로에서만*** 읽힌다. 엔진에서 그 pref 를 보는 자리는
+# output_grid.rs 의 VblankSource 하나고, 그 구조체는 WaitForVBlank 경로에만 살아 있다.
+# -PacingThread 가 없으면 스레드 자체가 없고, -PacingDwmQuery 가 있으면 그 스레드가
+# DwmGetCompositionTimingInfo 를 묻는다 -- 둘 다 핀은 그저 무시된다.
+# throw 하지 않는 이유: 스윕 스크립트가 -PacingOutput 을 고정해 두고 나머지를 토글하는
+# 것은 정당한 사용이고, 이제는 엔진이 어느 출력에 묶였는지를 직접 찍는다(위 참조).
+if ($PacingOutput -ne "" -and -not $PacingThread) {
+    Write-Warning "-PacingOutput $PacingOutput without -PacingThread: the pin is read only by the pacing thread's vblank source, and that thread is not running. The pin will be ignored."
+}
+if ($PacingOutput -ne "" -and $PacingDwmQuery) {
+    Write-Warning "-PacingOutput $PacingOutput with -PacingDwmQuery: the DWM-query clock asks DwmGetCompositionTimingInfo for the desktop grid and never calls WaitForVBlank, so the pin selects nothing. Drop -PacingDwmQuery to pin an output."
 }
 
 if ($CommitAlign -ge 0 -and $CommitAlign -le 99 -and $DcompCommitInFrame) {
