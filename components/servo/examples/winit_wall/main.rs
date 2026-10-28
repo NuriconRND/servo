@@ -443,8 +443,30 @@ impl AppState {
     /// 이 쓰기가 사라지면 `pacing_is_driving()` 이 영구히 false 가 되어 백스톱이 매 wake 마다
     /// 열린다. ★컴파일 에러도, 테스트 실패도 나지 않는다.★
     ///
-    /// ★발화한 것만 센다.★ 이 함수는 `drive_present_clock_timer` 의 게이트를 통과한
-    /// 뒤에만 불리므로, 여기 찍힌 시각은 "페이싱이 실제로 박자를 냈다" 는 뜻이다.
+    /// ★발화가 아니라 ***도착***을 센다 -- 2026-10-28 에 뒤집었다.★
+    ///
+    /// 전에는 `drive_present_clock_timer` 의 게이트를 **통과한 뒤에만** 불렀고, doc 이
+    /// "여기 찍힌 시각은 페이싱이 실제로 박자를 냈다는 뜻" 이라 적었다. ***그것이 자기
+    /// 유지 고장을 만들었다:***
+    ///
+    /// ```text
+    ///   게이트 거절 -> 래치 안 세움 -> 4 주기 뒤 pacing_is_driving()=false
+    ///     -> 백스톱 열림 -> about_to_wait 발화 -> next 가 한 주기 전진
+    ///     -> 다음 페이싱 틱이 또 거절 -> ★처음으로★
+    /// ```
+    ///
+    /// 실측(`log_DwmClock/03`, `-PacingDwmQuery -DwmAlign 0`): 페이싱 틱 1802 개 중
+    /// ★813 개(45%)가 거절★되고 `about_to_wait` 이 ★805 번★ 발화했다 -- 박자의 절반을
+    /// 페이싱이 아닌 자리가 끌고 있었다. `backstop_only_when_pacing_was_installed_but_is_not_running`
+    /// 의 주석이 이 위험을 예고했다("그쪽은 눈으로 지켜야 한다").
+    ///
+    /// ★백스톱이 덮어야 하는 것은 "페이싱 스레드가 죽었다" 이고, 그 질문의 답은 도착이지
+    /// 발화가 아니다.★ 게이트가 거절한 것은 페이싱이 죽은 것이 아니라 ***박자가 이미
+    /// 맞았다***는 뜻이므로, 백스톱을 열 이유가 되지 않는다.
+    ///
+    /// 영구 정지 위험은 없다: `next` 는 `snap_to_dwm_grid_at` 이 `now + ahead`
+    /// (`ahead <= period`)로 잡으므로 한 주기 이상 앞서지 못하고, 매 주기 도착하는 틱은
+    /// 결국 통과한다.
     fn note_pacing_tick(&self, site: ClockSite) {
         if matches!(site, ClockSite::PacingThread) {
             self.last_pacing_tick_at
@@ -1005,6 +1027,11 @@ impl AppState {
     }
 
     fn drive_present_clock_timer(&self, now: std::time::Instant, site: ClockSite) -> std::time::Instant {
+        // ★래치는 게이트 **밖**에서 세운다.★ 페이싱 스레드가 틱을 가져왔다는 사실이
+        // 생존이고, 게이트가 그것을 쓸지 말지는 별개다. 안에 두면 거절이 "페이싱이 죽었다"
+        // 로 읽혀 백스톱이 열리고, 그 백스톱이 `next` 를 전진시켜 다음 틱도 거절되게
+        // 만든다(`note_pacing_tick` 의 doc 에 실측과 함께 적었다).
+        self.note_pacing_tick(site);
         let mut next = self.next_present_tick.get();
         if now >= next {
             // ***Advance to the first future tick rather than adding one period.*** After a
@@ -1018,7 +1045,6 @@ impl AppState {
             // 지점으로 옮긴다. 꺼져 있으면 그대로 돌려준다.
             next = self.snap_to_dwm_grid(next);
             self.next_present_tick.set(next);
-            self.note_pacing_tick(site);
             self.fire_present_tick();
             tick_phase_probe::note_gate_fired(site.index());
         } else if matches!(site, ClockSite::PacingThread) {
