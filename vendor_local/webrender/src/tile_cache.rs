@@ -415,42 +415,6 @@ impl TileCacheBuilder {
         let mut tile_cache_pictures = Vec::new();
         let primary_slices = std::mem::replace(&mut self.primary_slices, Vec::new());
 
-        // ★스파이크 계측(버릴 것) -- `WR_SLICE_LOG=1`★
-        //
-        // 이름이 `SERVO_` 로 시작하면 안 된다 -- `run_wall_dist.ps1:857` 이 기동 직전에
-        // `SERVO_*` 를 전부 지운다. 바로 위 `WR_DISABLE_PICTURE_CACHING` 과 같은 규칙이다.
-        //
-        // 씬 빌드마다 슬라이스가 몇 장 났는지와 각 장의 스크롤 루트를 한 줄로 낸다.
-        // 가르려는 것: 티커 페이지에서 DComp 서피스가 6 초마다 4 -> 12 로 뛰는데, 그것이
-        // 여기서 슬라이스가 1 -> 5 로 쪼개져서인지(그러면 `secondary` 가 그만큼 뛴다),
-        // 아니면 슬라이스 수는 그대로인데 picture.rs 쪽 sub-slice 가 느는 것인지다.
-        // 로그는 씬 빌드마다 나므로 `gfx_paint_side_animation_tick_divisor` 가 15 면
-        // 초당 네 줄이다.
-        static SLICE_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SLICE_LOG.get_or_init(|| std::env::var("WR_SLICE_LOG").is_ok_and(|v| v == "1")) {
-            let shape = primary_slices
-                .iter()
-                .map(|primary| match primary.kind {
-                    SliceKind::Atomic { .. } => "atomic".to_string(),
-                    SliceKind::Default { ref secondary_slices } => format!(
-                        "default(n={},roots=[{}])",
-                        secondary_slices.len(),
-                        secondary_slices
-                            .iter()
-                            .map(|descriptor| descriptor.scroll_root.0.to_string())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    ),
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            log::warn!(
-                "WRSLICE primaries={} {}",
-                primary_slices.len(),
-                shape
-            );
-        }
-
         // TODO: At the moment, culling, clipping and invalidation are always
         // done in the root coordinate space. The plan is to move to doing it
         // (always or mostly) in raster space.
