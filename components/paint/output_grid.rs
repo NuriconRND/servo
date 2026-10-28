@@ -275,11 +275,11 @@ fn pinned_index(outputs: &[Output]) -> Option<usize> {
         .position(|out| out.name.eq_ignore_ascii_case(pin))
 }
 
-/// ★실제로 바인딩된 출력을 쉘에 한 줄로 넘긴다.★ 바인딩이 **바뀔 때만** 채워진다.
+/// ★실제로 바인딩된 출력을 셸에 한 줄로 넘긴다.★ 바인딩이 **바뀔 때만** 채워진다.
 ///
 /// ★왜 여기서 직접 찍지 않는가.★ 이 자리는 페이싱 스레드다. 그 스레드의 stderr 는
 /// 금지다 -- 한 줄이라도 여기서 내면 "틱 경로에 I/O 가 없다" 가 더는 참이 아니게 되고,
-/// 다음 사람이 두 줄째를 넣을 때 기달 선이 사라진다. 그래서 문자열만 놓아두고
+/// 다음 사람이 두 줄째를 넣을 때 기댈 선이 사라진다. 그래서 문자열만 놓아두고
 /// 메인 스레드가 꺼내 찍는다(`winit_wall` 의 `about_to_wait`).
 ///
 /// ★왜 필요한가.★ `gfx_wall_pacing_output` 이 이름을 못 찾으면 **조용히** primary 로
@@ -292,7 +292,7 @@ static PACING_BINDING: Mutex<Option<String>> = Mutex::new(None);
 /// 하나보다 비싸면 안 된다.
 static PACING_BINDING_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// 쉘이 꺼내 간다. 낼 것이 없으면 자물쇠를 잡지 않고 `None`.
+/// 셸이 꺼내 간다. 낼 것이 없으면 자물쇠를 잡지 않고 `None`.
 ///
 /// 깃발을 내린 뒤 자물쇠를 잡기 전에 페이싱 스레드가 새 줄을 넣으면, 이번 호출이
 /// 그 새 줄을 가져가고 깃발은 올라간 채로 남는다 -- 다음 회전이 빈 자물쇠를 한 번 잡고
@@ -323,7 +323,7 @@ struct VblankSource {
     monitor: usize,
     /// 디스플레이 모드에서 읽은 주기. 못 읽으면 `None` 이고 60Hz 가정값으로 떨어진다.
     period_qpc: Option<u64>,
-    /// 쉘에 마지막으로 넘긴 바인딩 설명. 같은 값이면 다시 넘기지 않는다 --
+    /// 셸에 마지막으로 넘긴 바인딩 설명. 같은 값이면 다시 넘기지 않는다 --
     /// 모니터가 없는 동안 `refresh` 는 호출마다 재열거하므로, 이것이 없으면 같은 줄이
     /// 초당 60 번 올라간다.
     announced: Option<String>,
@@ -392,7 +392,7 @@ impl VblankSource {
         self.enumeration = Some(enumeration);
         self.primary = primary;
         self.wait_idx = wait_idx;
-        // ★바인딩이 바뀔었으면 쉘에 한 줄 넘긴다.★ 여기서 찍지 않는 이유는
+        // ★바인딩이 바뀌었으면 셸에 한 줄 넘긴다.★ 여기서 찍지 않는 이유는
         // `PACING_BINDING` 의 주석에 있다. 정상 구성에서 재열거는 기동과 토폴로지 변경에만
         // 도므로 줄 수는 그 횟수와 같다. 모니터가 하나도 없으면 호출마다 이 `String` 을
         // 한 번 만드는데, 그 상태의 같은 호출은 바로 위에서 `CreateDXGIFactory1` 과 전체
@@ -404,7 +404,7 @@ impl VblankSource {
         }
     }
 
-    /// 지금 무엇에 묶여 있나 -- 쉘이 찍을 한 줄.
+    /// 지금 무엇에 묶여 있나 -- 셸이 찍을 한 줄.
     ///
     /// 읽는 사람이 알아야 하는 것은 셋이다: ① 어느 패널을 기다렸나, ② 그것이
     /// primary 인가, ③ ★`-PacingOutput` 이 실제로 걸렸나★. 셋째가 이 줄의 존재
