@@ -122,6 +122,9 @@ const SITE_LABELS: [&str; SITES] = ["about_to_wait", "user_event", "window_event
 /// 이다★ -- `main.rs` 의 `user_event` 주석이 그 구조를 적는다.
 static GATE_FIRED: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
 
+/// 자리별 차단 수 -- 페이싱이 살아 있어서 막은 것(`other_site_is_blocked`).
+static GATE_BLOCKED: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+
 /// ★페이싱 틱이 게이트에서 거절된 수.★ 다른 자리의 거절은 세지 않는다 -- 엔진 wake 는
 /// 초당 수백 번 오고 그 대부분이 격자점 사이에 떨어지므로, 세면 신호가 묻힌다.
 static GATE_DEFERRED: AtomicU64 = AtomicU64::new(0);
@@ -269,6 +272,20 @@ pub(crate) fn note_gate_fired(site: usize) {
         return;
     }
     if let Some(slot) = GATE_FIRED.get(site) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// ★페이싱이 살아 있어서 다른 자리의 발화를 막았다.★
+///
+/// 이 수가 크다는 것은 ***막을 일이 많았다***는 뜻이고, 곧 전에는 그만큼이 통과해
+/// 페이싱의 발화를 가로챘다는 뜻이다. `WindowEvent` 는 지금도 아무 게이트 없이
+/// `drive_present_clock` 을 부른다.
+pub(crate) fn note_gate_blocked(site: usize) {
+    if !is_enabled() {
+        return;
+    }
+    if let Some(slot) = GATE_BLOCKED.get(site) {
         slot.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -564,29 +581,41 @@ fn report_gate(secs: u64) {
     }
     // 페이싱이 아닌 자리의 발화 -- ★페이싱이 박자를 쥔 런에서 이것이 0 이 아니면
     // 가로챈 것이다.★
-    let others: Vec<String> = fired
+    let others = tally(&fired);
+    let blocked: Vec<u64> = GATE_BLOCKED
         .iter()
-        .enumerate()
-        .take(SITES - 1)
-        .filter(|(_, count)| **count > 0)
-        .map(|(index, count)| format!("{} {count}", site_label(index)))
+        .map(|slot| slot.load(Ordering::Relaxed))
         .collect();
     let preempted = GATE_PREEMPTED.load(Ordering::Relaxed);
     let jitter = deferred.saturating_sub(preempted);
     let shortfall = |p: u64| percentile_u32(&GATE_SHORTFALL, jitter, p);
     log::warn!(
         "wall: tick gate  [{secs}s] pacing 발화 {pacing_fired} / 거절 {deferred} ({:.2}%) \
-         = 여유부족 {jitter} + 선점 {preempted}, 여유부족 p50/p95 = {}/{}µs, \
-         다른 자리 발화 [{}]",
+         = 여유부족 {jitter} + 선점 {preempted}, 여유부족 p50/p95 = {}/{}µs",
         deferred as f64 * 100.0 / offered as f64,
         shortfall(50),
         shortfall(95),
-        if others.is_empty() {
-            String::from("없음")
-        } else {
-            others.join(", ")
-        },
     );
+    log::warn!(
+        "wall: tick sites [{secs}s] 다른 자리 발화 [{others}], 차단 [{}]",
+        tally(&blocked),
+    );
+}
+
+/// 자리별 수를 "이름 N" 으로. 0 은 빼고, 전부 0 이면 `없음`.
+fn tally(counts: &[u64]) -> String {
+    let listed: Vec<String> = counts
+        .iter()
+        .enumerate()
+        .take(SITES - 1)
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| format!("{} {count}", site_label(index)))
+        .collect();
+    if listed.is_empty() {
+        String::from("없음")
+    } else {
+        listed.join(", ")
+    }
 }
 
 /// 거절 하나를 어디에 셀지. `None` 이면 선점이다.

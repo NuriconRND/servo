@@ -333,6 +333,16 @@ struct AppState {
     /// 고른 프레임 클럭. ★백스톱 판정에만 쓴다★(`needs_pacing_backstop`) -- 손잡이가
     /// 이제 세 구성 모두에 있으므로 "페이싱 구성인가" 를 그것으로 물을 수 없다.
     frame_clock: FrameClock,
+    /// ★페이싱 틱이 ***신호***에서 오나.★ `vblank`·`compositor` 면 참, `dwmquery` 면 거짓.
+    ///
+    /// 이 구분이 왜 필요한가: 신호 경로는 ***이미 그 순간에 깨어났다.*** 격자를 다시 물어
+    /// `now >= next` 를 따질 이유가 없고, 따지면 ①메인(렌더) 스레드에 매 발화마다
+    /// `DwmGetCompositionTimingInfo` 가 붙고(초당 60 회) ②신호와 질의라는 ***두 앵커를
+    /// 비교***하게 되어 어긋날 수 있다. 그 어긋남이 2026-10-28 에 실측된 45% 고장의
+    /// 기구였다(`log_DwmClock/03`, `note_pacing_tick` 의 doc).
+    ///
+    /// `dwmquery` 는 신호가 없으므로 예측-스냅이 유일한 방법이다 -- 그쪽은 그대로 둔다.
+    pacing_on_signal: bool,
     /// vsync 스레드가 세우고 메인이 내린다.
     vsync_due: Arc<AtomicBool>,
     /// 콜백이 걸려 있는가. 등록은 **메인에서만** 한다 -- 드라이버가 `Rc` 라 스레드를 못 건넌다.
@@ -1032,6 +1042,29 @@ impl AppState {
         // 로 읽혀 백스톱이 열리고, 그 백스톱이 `next` 를 전진시켜 다음 틱도 거절되게
         // 만든다(`note_pacing_tick` 의 doc 에 실측과 함께 적었다).
         self.note_pacing_tick(site);
+        let from_pacing = matches!(site, ClockSite::PacingThread);
+
+        // ★페이싱이 살아 있으면 다른 자리는 완전히 막는다.★ 전에는 게이트가 호출자를 보지
+        // 않아서, 격자점을 조금 지나 도착한 엔진 wake 가 그 자리에서 렌더를 내고 제시간에
+        // 깬 페이싱 틱은 아무것도 하지 못했다 -- 발화 시각이 격자점이 아니라 ***엔진 wake 의
+        // 랜덤 지연***이 됐다(`user_event` 의 주석). `WindowEvent` 는 지금도 아무 게이트
+        // 없이 이 함수를 부른다.
+        if other_site_is_blocked(from_pacing, self.pacing_is_driving()) {
+            tick_phase_probe::note_gate_blocked(site.index());
+            return self.next_present_tick.get();
+        }
+
+        // ★신호 경로는 묻지도 비교하지도 않는다 -- 이미 그 순간에 깨어났다.★
+        // `-DwmAlign` 은 페이싱 스레드의 `align_after_vblank` 한 자리에서만 쓰인다.
+        if fires_on_arrival(from_pacing, self.pacing_on_signal) {
+            self.next_present_tick.set(now + self.present_period);
+            self.fire_present_tick();
+            tick_phase_probe::note_gate_fired(site.index());
+            return self.next_present_tick.get();
+        }
+
+        // 여기부터는 ***예측 경로***다: `dwmquery`, `FrameClock::Timer`, 그리고 페이싱이
+        // 죽었을 때의 백스톱. 신호가 없으므로 격자를 묻고 그 지점을 지났는지 따진다.
         let mut next = self.next_present_tick.get();
         if now >= next {
             // ***Advance to the first future tick rather than adding one period.*** After a
@@ -1524,6 +1557,12 @@ impl ApplicationHandler<WakerEvent> for App {
         let primary_scale = tiles[0].window.scale_factor() as f32;
         let virtual_viewport_css = config.layout.virtual_viewport_css_size();
 
+        // ★페이싱 클럭은 여기서 한 번 읽는다.★ `AppState` 의 `pacing_on_signal` 과
+        // `spawn_pacing_thread` 가 ***같은 값***을 봐야 한다 -- 둘이 갈리면 신호 경로가
+        // 예측 게이트를 지나거나 그 반대가 되고, 어느 쪽도 컴파일러가 잡지 못한다.
+        let pacing_clock_raw = servo_config::pref!(gfx_wall_pacing_clock);
+        let (pacing_clock, pacing_clock_unknown) = PacingClock::parse(&pacing_clock_raw);
+
         let app_state = Rc::new(AppState {
             servo,
             webview: RefCell::new(None),
@@ -1554,6 +1593,8 @@ impl ApplicationHandler<WakerEvent> for App {
             present_vsync: shell_vsync_driver,
             tick_fire,
             frame_clock: clock,
+            pacing_on_signal: matches!(clock, FrameClock::Pacing)
+                && pacing_clock.signal().is_some(),
             vsync_due: Arc::new(AtomicBool::new(false)),
             vsync_armed: Cell::new(false),
             vsync_stalled: Cell::new(false),
@@ -1650,9 +1691,7 @@ impl ApplicationHandler<WakerEvent> for App {
             );
         }
         if servo_config::pref!(gfx_wall_pacing_thread) {
-            let raw = servo_config::pref!(gfx_wall_pacing_clock);
-            let (clock, unknown) = PacingClock::parse(&raw);
-            if let Some(unknown) = unknown {
+            if let Some(unknown) = pacing_clock_unknown {
                 // ★조용히 떨어지지 않는다.★ 오타 하나로 A/B 의 한쪽이 대조군과 같아지면
                 // 그 런은 아무것도 말해 주지 않는다.
                 log::warn!(
@@ -1662,10 +1701,19 @@ impl ApplicationHandler<WakerEvent> for App {
             }
             eprintln!(
                 "wall: gfx_wall_pacing_thread=true: 표출 틱을 전용 스레드가 올린다. \
-                 clock={}",
-                clock.label()
+                 clock={} (발화 {})",
+                pacing_clock.label(),
+                if app_state.pacing_on_signal {
+                    "신호 즉시 -- 격자 질의 없음"
+                } else {
+                    "격자 예측-스냅"
+                }
             );
-            spawn_pacing_thread(waker.proxy.clone(), app_state.present_period, clock);
+            spawn_pacing_thread(
+                waker.proxy.clone(),
+                app_state.present_period,
+                pacing_clock,
+            );
         }
 
         if sdwall_device_auth::SIGNING_KEY_KIND != "release" {
@@ -1965,6 +2013,20 @@ fn needs_pacing_backstop(pacing_clock: bool, pacing_alive: bool) -> bool {
     pacing_clock && !pacing_alive
 }
 
+/// 페이싱이 아닌 자리의 발화를 막아야 하나.
+///
+/// ★`needs_pacing_backstop` 과 짝이다.★ 저쪽은 "페이싱이 죽었으니 누군가 대신 내라",
+/// 이쪽은 "페이싱이 살아 있으니 아무도 끼어들지 말라" 다. 둘이 같은 `pacing_alive` 를
+/// 읽으므로 ***동시에 참이 될 수 없다.***
+fn other_site_is_blocked(from_pacing: bool, pacing_alive: bool) -> bool {
+    !from_pacing && pacing_alive
+}
+
+/// 이 틱이 격자를 묻지 않고 바로 발화하나.
+fn fires_on_arrival(from_pacing: bool, pacing_on_signal: bool) -> bool {
+    from_pacing && pacing_on_signal
+}
+
 /// 이 프레임 클럭에서 Servo 에 설치할 프레임 드라이버와, 표출 틱이 그것을 쏘는 손잡이.
 ///
 /// ★여기서 정하는 것은 "콜백을 누가 쏘나" 뿐이다.★ 세 구성 모두 틱이 쏜다. 틱 에지가
@@ -2044,6 +2106,38 @@ mod tests {
             fire.fire();
             assert_eq!(fired.load(Ordering::SeqCst), 1, "{clock:?}: 틱이 쏴야 한다");
         }
+    }
+
+    #[test]
+    fn a_live_pacing_thread_blocks_every_other_site() {
+        // 페이싱 틱 자신은 막히지 않는다.
+        assert!(!other_site_is_blocked(true, true));
+        assert!(!other_site_is_blocked(true, false));
+        // ★살아 있으면 다른 자리는 전부 막힌다.★
+        assert!(other_site_is_blocked(false, true));
+        // 죽었으면 열어 준다 -- 그때는 백스톱이 유일한 박자다.
+        assert!(!other_site_is_blocked(false, false));
+    }
+
+    #[test]
+    fn blocking_and_the_backstop_are_never_both_open() {
+        // 같은 `pacing_alive` 를 읽는 두 판정이 서로 모순되면 박자가 둘이 되거나 없어진다.
+        for alive in [true, false] {
+            let backstop = needs_pacing_backstop(true, alive);
+            let blocked = other_site_is_blocked(false, alive);
+            assert_ne!(backstop, blocked, "alive={alive} 에서 둘이 같다");
+        }
+    }
+
+    #[test]
+    fn only_a_signal_clock_fires_on_arrival() {
+        // 신호 경로(vblank/compositor)의 페이싱 틱만 바로 발화한다.
+        assert!(fires_on_arrival(true, true));
+        // dwmquery 는 예측 경로로 간다.
+        assert!(!fires_on_arrival(true, false));
+        // 다른 자리는 어느 경우에도 바로 발화하지 않는다.
+        assert!(!fires_on_arrival(false, true));
+        assert!(!fires_on_arrival(false, false));
     }
 
     #[test]
