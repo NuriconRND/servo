@@ -189,9 +189,10 @@ Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-P
 # output page's five nested overflow boxes and lets `?clip=none|all|shell|inner` turn each
 # level from `hidden` into `clip` (a plain clip, no scroll root), so the slice count is the
 # only thing that moves. It is the control group for the DComp commit probe:
-#   .\run_wall_dist.ps1 -Serve -Url "ticker_slice_probe.html?clip=none" -DcompBindProf ...
-# Read `[page] ECLIP` for the configuration that actually ran, then COMMITSITE and the
-# begin_frame split against the same run with `clip=all`.
+#   .\run_wall_dist.ps1 -Serve -Url "ticker_slice_probe.html?clip=none"
+# Read `[page] ECLIP` for the configuration that actually ran, then judge the wall by eye
+# against the same run with `clip=all`. The engine-side counters this used to be paired
+# with (DCOMPBIND, COMMITSITE) went out in the 2026-10-27 instrumentation strip.
 Copy-Item (Join-Path $repo "tests\html\ticker_slice_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
@@ -200,8 +201,9 @@ Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pa
 # winit_wall 은 떤다(2026-10-21). 그 구조가 느린 것이 아니라면 남는 변수는 엔진이 그
 # 콜백에 넘기는 시각값이다. 이 페이지는 같은 구조의 사각형과 Element.animate 로 건
 # 사각형을 나란히 돌리면서 rAF 타임스탬프 간격과 실제 실행 시각 간격을 따로 잰다.
-#   .\run_wall_dist.ps1 -Serve -Url "raf_clock_probe.html" -FrameTimeProf -AnimStepSeq ...
-# 페이지의 `RAFPROBE` 줄과 엔진의 `FRAMETIME`/`RAFCLOCK` 을 같은 창에서 맞춰 읽는다.
+#   .\run_wall_dist.ps1 -Serve -Url "raf_clock_probe.html"
+# 페이지의 `RAFPROBE` 줄을 읽는다. 짝으로 읽던 엔진 쪽 `FRAMETIME`/`RAFCLOCK` 은
+# 2026-10-27 계측 제거에서 없앴다.
 # ★같은 URL 을 Chrome 으로도 열어 둘 것★ -- 대조가 이 프로브의 전부다.
 Copy-Item (Join-Path $repo "tests\html\raf_clock_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 
@@ -225,6 +227,22 @@ foreach ($gstExe in @("gst-launch-1.0.exe", "gst-discoverer-1.0.exe")) {
     $src = Join-Path $GstRoot "bin\$gstExe"
     if (Test-Path $src) { Copy-Item $src $engine -Force }
     else { Write-Warning "$gstExe not found in $GstRoot; measure_decode_only.ps1 will fall back to another install" }
+}
+
+# ★육안 프로브 페이지가 실제로 들어갔는지 확인한다.★ 위의 Copy-Item 은 전부
+# `-EA SilentlyContinue` 라 원본이 없으면 ***아무 소리 없이*** 건너뛴다. 2026-10-28 에
+# `ticker_slice_probe.html` 이 저장소에 추가되지 않은 채 이 목록에만 올라 있는 것을
+# 발견했다 -- 작업 트리에서는 들어가고 깨끗한 체크아웃에서만 빠진다. 프로브 없이
+# 배포하면 테스트 장비에서야 알게 되고, 그제서는 재패키징이다.
+$eyeProbes = @(
+    "wall_anim_jitter_probe.html",
+    "wall_paint_animation_probe.html",
+    "ticker_slice_probe.html",
+    "raf_clock_probe.html"
+)
+$missingProbes = $eyeProbes | Where-Object { -not (Test-Path (Join-Path $pages "html\$_")) }
+if ($missingProbes) {
+    throw ("naked-eye probe page(s) missing from the package: {0}. Each is copied from tests\html\ with -EA SilentlyContinue, so the source is absent or untracked -- check ``git status tests\html``." -f ($missingProbes -join ", "))
 }
 
 $dll = (Get-ChildItem (Join-Path $engine "*.dll") | Measure-Object).Count

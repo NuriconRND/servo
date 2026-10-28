@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>자막 슬라이스 판별 (E-clip)</title>
+<!--
+  ★무엇을 가르나★
+  output 페이지의 자막 jutter가 "두 번째 WebRender 슬라이스(알파 DComp 서피스)"에서 오는지 가른다.
+  분석은 저장소 루트 `ANALYSIS-output-ticker-jitter.md` 3절·8절.
+
+    Servo는 `overflow: hidden`을 WebRender 스크롤 프레임으로 만들고(`overflow: clip`만 단순 클립),
+    WebRender는 가장 바깥 스크롤 프레임 안쪽을 별도 슬라이스로 자르며, 슬라이스마다 불투명·알파
+    가상 서피스를 한 쌍 만든다. output은 셸이 `overflow: hidden`이라 슬라이스가 둘(서피스 4)이고
+    자막은 알파 서피스에 들어간다. 프로브(`wall_anim_jitter_probe.html`)는 슬라이스 하나(서피스 2)다.
+
+  ★무엇을 복제했나★
+  시험 페이지 저장본(SHARE\pages\IPWall.html)의 DOM과 클래스 값을 그대로 옮겼다.
+    셸(fixed, 100dvh x 100vw, 검정) > TV(화면 전체) > 레이어 leaving/current
+      > 채널 상자 5개(가로 전체, 높이 12.5%, top 43.75/0/87.5/18.75/68.75%, z 1~5)
+        > 판 > 영역(opacity 1, z 9) > 띠(자막 상자, 배경 rgba(255,255,255,0))
+          > 글자 span(top 50%, left 0, white-space: pre, 500, line-height 1.25)
+      + 채널마다 빈 이름 덮개(pointer-events: none, z = 채널 z + 1)
+    overflow:hidden은 셸·채널·영역·띠·덮개의 다섯 군데다(자막 하나당 조상 4겹 + 덮개).
+  움직임은 `TickerContent.tsx`의 ScrollingText와 같다:
+    duration = max(1500, round(24000 / speed)), translate(Xpx, -50%), 띠 폭 -> -글자 폭,
+    선형·무한 반복, `Element.animate` 직접 호출(animateEl과 같은 옵션).
+  ★뺀 것★ React, 씬 시계(rAF마다 setT), ResizeObserver 재시작, 첫 표출의 일제 재시작.
+  그래서 clip=none이 output(log_ani_debug_05\01)의 결함을 재현하는지부터 본다(아래 판정 1).
+
+  ★쿼리 토글★ (기본값은 시험 페이지와 같다)
+    clip   = none   전부 hidden (output 그대로)                         [기본]
+             all    전부 clip  (예상: 프로브와 같은 슬라이스 하나)
+             shell  셸만 clip  (예상: 채널 상자마다 슬라이스 -> 더 나빠진다)
+             inner  셸만 hidden, 나머지 clip (예상: none과 같다 -- 가장 바깥이 루트)
+             쉼표 목록도 된다: shell,channel,region,band,caption 중에서
+    bg     = 0..100  띠 배경 불투명도(기본 0). 100 미만이면 채널 상자 배경도 비운다
+             (boardFit.ts usesSeeThroughTicker와 같다). 100이면 채널 상자를 검정으로 칠한다.
+             unset   설정 안 함 -> 띠 rgba(0,0,0,0.6)(bg-output-video/60), 채널 상자 검정
+    bgc    = #RRGGBB 띠 배경색(기본 #ffffff -- 저장본이 rgba(255,255,255,0)이다)
+    fs     = auto | px  글자 크기(기본 auto = 띠 높이 x 0.6, 벽에서 324px)
+    speed  = 1..10  (기본 4 -> 6000ms)
+    phase  = same | spread  same은 다섯이 같은 순간 출발(output과 같다), spread는 음수 delay로 1/5씩
+    fixed  = 1 | 0  셸 position fixed(기본) / absolute
+    raf    = 0..N   빈 rAF 루프 수(기본 0). 씬 시계의 깨어남만 흉내 낸다(DOM은 안 바꾼다)
+    text, font, color  글자(기본 "Nuricon SDWall 테스트중", 맑은 고딕, #ff0000)
+
+  ★예상 구조★ (페인터 하나 기준. 페인터마다 띠 셋을 본다 -- 43.75% 띠가 세로 이음매에 걸친다)
+    arm           슬라이스   DCOMPBIND surfaces=   visuals/frames
+    clip=none     2          4                     2 (그 구역에 글자가 없으면 1)
+    clip=inner    2          4                     2
+    clip=shell    4          8                     최대 4
+    clip=all      1          2                     1
+    bg=100        2          4                     2  (P0는 구조를 못 바꾼다는 예측. 띠 사이 틈 때문)
+  surfaces= 는 살아 있는 서피스 수, visuals= 는 그 1초 동안의 add_surface 횟수다.
+
+  ★판정 순서★ (모두 divisor 4)
+    1. clip=none이 output(01)을 재현하는가 -- 값 결함 약 5/페인터·초, 10ms 넘는 렌더 약 5/페인터·초.
+       재현되지 않으면 React·스크립트나 라이브 번들 쪽 요인이 남아 있다는 뜻이다. 그때는 아래 해석을 보류한다.
+    2. 구조가 위 표와 맞는가(DCOMPBIND). 맞으면 "셸이 두 번째 슬라이스의 루트"가 확정된다.
+    3. clip=all에서 결함이 프로브(02) 수준(값 결함 0.03 이하, present_d0 0.1 이하)으로 내려가는가.
+       내려가면 원인은 슬라이스 구조(알파 서피스 경로)다. 그대로면 부분 갱신 크기 변동(pbuffer, A1)이다.
+       남는 차이: clip=all도 띠 부분만 갱신한다. 프로브는 매 프레임 타일 전체를 갱신한다.
+
+  ★실행★ wall_dist\pages\html\ 에 이 파일을 두고 -Serve로 연다(파일 하나, 외부 자원 없음).
+    .\run_wall_dist.ps1 -Layout wall_layout.multigpu.json -Serve -Url "ticker_slice_probe.html?clip=none" `
+      -IgnoreCertErrors -PageFeatures `
+      -Pref dom_webgl2_enabled=true,dom_webgpu_enabled=true,gfx_precache_shaders=false,gfx_paint_side_animation_tick_divisor=4,media_wrap_init_max_per_frame=2 `
+      -DComp surface -RefreshHz 60 -DwmAlign 14 -CommitAlign 8 -SampleLead 1 -DirectRender `
+      -DcompParallelCommit -PacingThread -ParallelTiles -PipelineMode uridecodebin3 -DecoderThreads 1 `
+      -SinkPacing thread -NumaNode auto -FrameTime on -NoSyncGroup -DurationSec 120 -PresentCadence -DcompBindProf -AnimStepSeq -FrameReason `
+      -LogPath ani_debug_06/01/ticker_slice_none_div4.err.log
+  로그에서 `[page] ECLIP` 줄이 그 실행의 설정이다(시작 1줄 + 10초마다 1줄).
+  -DcompDebug를 붙이면 `[dcomp-dbg] create_surface ... opaque=` 줄로 서피스 쌍이 직접 보인다.
+  다만 add_surface마다 줄을 찍어 성능을 흐리므로, 구조 확인용 짧은 실행(-DurationSec 20)에만 쓴다.
+-->
+<style>
+  /* Tailwind preflight와 앱 기본 규칙 중 레이아웃에 닿는 것만 옮겼다(index-*.css). */
+  *, ::before, ::after { box-sizing: border-box; margin: 0; padding: 0; border: 0 solid; }
+  html, body { height: 100%; margin: 0; padding: 0; }
+  html { line-height: 1.5; font-family: ui-sans-serif, system-ui, sans-serif; }
+  body { background-color: #000; color: #fff; }
+  #root { height: 100%; }
+
+  /* WallOutputPage SHELL: fixed inset-0 h-dvh w-screen (+ overflow, 배경) */
+  .shell { position: fixed; inset: 0; height: 100dvh; width: 100vw; background-color: #000; }
+  .shell.unfixed { position: absolute; }
+  .abs { position: absolute; }
+  .inset0 { inset: 0; }
+  /* 띠: relative h-full w-full */
+  .band { position: relative; width: 100%; height: 100%; }
+  .noev { pointer-events: none; }
+  /* 글자: absolute top-1/2 left-0 whitespace-pre font-medium leading-tight */
+  .text { position: absolute; top: 50%; left: 0; white-space: pre; font-weight: 500; line-height: 1.25; }
+  .ov-hidden { overflow: hidden; }
+  .ov-clip { overflow: clip; }
+</style>
+<div id="root"></div>
+<script>
+'use strict';
+
+const q = new URLSearchParams(location.search);
+
+/** overflow를 가진 상자의 자리. 저장본 DOM에서 overflow-hidden이 붙은 곳이 이 다섯이다. */
+const ROLES = ['shell', 'channel', 'region', 'band', 'caption'];
+const PRESETS = {
+  none: [],
+  all: ROLES,
+  shell: ['shell'],
+  inner: ['channel', 'region', 'band', 'caption'],
+};
+const clipArg = q.get('clip') || 'none';
+const clipRoles = PRESETS[clipArg] || clipArg.split(',').filter((r) => ROLES.includes(r));
+const unknownRoles = PRESETS[clipArg] ? [] : clipArg.split(',').filter((r) => !ROLES.includes(r));
+const ov = (role) => (clipRoles.includes(role) ? 'ov-clip' : 'ov-hidden');
+
+function num(v, lo, hi, dflt) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+}
+
+/** TickerContent.tsx withAlpha와 같다. 형식이 아니면 색을 그대로 돌려준다. */
+function withAlpha(hex, opacity) {
+  const m = /^#([0-9a-f]{6})$/i.exec(hex.trim());
+  const a = Math.min(100, Math.max(0, opacity)) / 100;
+  if (!m) return hex;
+  const v = parseInt(m[1], 16);
+  return 'rgba(' + ((v >> 16) & 255) + ', ' + ((v >> 8) & 255) + ', ' + (v & 255) + ', ' + a + ')';
+}
+
+const bgArg = q.get('bg') ?? '0';
+const bgColor = q.get('bgc') || '#ffffff';
+const bgUnset = bgArg === 'unset';
+const bgOpacity = bgUnset ? undefined : num(bgArg, 0, 100, 0);
+const tickerBg = bgUnset ? 'rgba(0, 0, 0, 0.6)' : withAlpha(bgColor, bgOpacity);
+// boardFit.ts usesSeeThroughTicker: 설정한 불투명도가 100 미만이면 채널 상자 배경을 비운다.
+const seeThrough = !bgUnset && bgOpacity < 100;
+const fsArg = q.get('fs') || 'auto';
+const fsPx = fsArg === 'auto' ? null : num(fsArg, 8, 2000, null);
+const speed = num(q.get('speed') ?? '4', 1, 10, 4);
+const phase = q.get('phase') === 'spread' ? 'spread' : 'same';
+const fixed = q.get('fixed') !== '0';
+const rafLoops = Math.round(num(q.get('raf') ?? '0', 0, 16, 0));
+const text = q.get('text') || 'Nuricon SDWall 테스트중';
+const font = q.get('font') || '맑은 고딕';
+const color = q.get('color') || '#ff0000';
+
+const cfg =
+  'clip=' + clipArg + ' roles=' + (clipRoles.join('+') || '-') +
+  ' bg=' + bgArg + ' bgc=' + bgColor + ' fs=' + fsArg + ' speed=' + speed +
+  ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops;
+document.title = 'ECLIP ' + cfg;
+if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
+
+/** 저장본의 채널 순서 그대로다: [top %, z]. 높이는 모두 12.5%. */
+const BANDS = [[43.75, 1], [0, 2], [87.5, 3], [18.75, 4], [68.75, 5]];
+
+function div(cls, style, parent) {
+  const el = document.createElement('div');
+  if (cls) el.className = cls;
+  if (style) el.setAttribute('style', style);
+  parent.appendChild(el);
+  return el;
+}
+
+// --- DOM. 바깥에서 안쪽 순서이고, 저장본의 인라인 스타일 값을 그대로 쓴다. ---
+const root = document.getElementById('root');
+const shell = div('shell ' + (fixed ? '' : 'unfixed ') + ov('shell'), null, root);
+const tv = div('abs', 'left: 0%; top: 0%; width: 100%; height: 100%;', shell);
+div('abs inset0', 'z-index: 0;', tv);                       // data-layer="leaving" (비어 있다)
+const current = div('abs inset0', 'z-index: 1;', tv);       // data-layer="current"
+
+const spans = [];
+for (const [top, z] of BANDS) {
+  const place = 'left: 0%; top: ' + top + '%; width: 100%; height: 12.5%; ';
+  const channel = div('abs ' + ov('channel'),
+    place + 'z-index: ' + z + ';' + (seeThrough ? '' : ' background-color: #000;'), current);
+  const board = div('abs inset0', null, channel);           // data-board
+  const region = div('abs ' + ov('region'),
+    'left: 0%; top: 0%; width: 100%; height: 100%; opacity: 1; z-index: 9;', board);
+  const band = div('band ' + ov('band'), 'background-color: ' + tickerBg + ';', region);
+  const span = document.createElement('span');
+  span.className = 'text';
+  span.setAttribute('style',
+    'transform: translate(0px, -50%); font-family: ' + font + '; color: ' + color + ';');
+  span.textContent = text;
+  band.appendChild(span);
+  spans.push(span);
+  // OutputTv의 이름 덮개. 내용은 없지만 overflow 상자라서 그대로 둔다.
+  div('noev abs ' + ov('caption'), place + 'z-index: ' + (z + 1) + ';', current);
+}
+
+// --- 움직임. ScrollingText와 같은 계산이다. ---
+const hasWaapi = typeof spans[0].animate === 'function';
+const handles = [];
+
+function startAll() {
+  while (handles.length) handles.pop().cancel();
+  const dur = Math.max(1500, Math.round(24000 / Math.max(1, speed)));
+  let first = '';
+  spans.forEach((span, i) => {
+    const box = span.parentElement;
+    // useFittedFontSize: 띠 높이 x 0.6, 최소 8px.
+    const fs = fsPx ?? Math.max(8, Math.round(box.clientHeight * 0.6));
+    span.style.fontSize = fs + 'px';
+    const from = box.clientWidth;
+    const to = -span.offsetWidth;
+    const at = (v) => 'translate(' + v + 'px, -50%)';
+    const opts = { duration: dur, iterations: Infinity, easing: 'linear' };
+    if (phase === 'spread') opts.delay = -Math.round((dur * i) / BANDS.length);
+    handles.push(span.animate([{ transform: at(from) }, { transform: at(to) }], opts));
+    if (i === 0) {
+      first = 'box=' + box.clientWidth + 'x' + box.clientHeight + ' font=' + fs +
+        ' text_w=' + span.offsetWidth + ' from=' + from + ' to=' + to;
+    }
+  });
+  console.log('ECLIP start ' + cfg + ' dur=' + dur + ' ' + first + ' waapi=1');
+}
+
+window.addEventListener('load', () => {
+  if (!hasWaapi) {
+    console.log('ECLIP start ' + cfg + ' waapi=0 (Element.animate 없음 -- 글자가 멈춰 있다)');
+    return;
+  }
+  // 첫 레이아웃이 끝난 뒤 잰다.
+  requestAnimationFrame(startAll);
+});
+
+// 창 크기가 바뀌면 흐르는 범위가 달라진다(ScrollingText의 ResizeObserver 역할).
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!hasWaapi) return;
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(startAll, 200);
+});
+
+// 씬 시계의 깨어남만 흉내 낸다. DOM은 바꾸지 않는다(정적 씬에서 React도 바꾸지 않는다).
+for (let i = 0; i < rafLoops; i++) {
+  const loop = () => requestAnimationFrame(loop);
+  requestAnimationFrame(loop);
+}
+
+// 설정 줄이 로그 앞부분에서 잘려도 실행을 식별할 수 있게 10초마다 다시 낸다.
+const t0 = performance.now();
+setInterval(() => {
+  console.log('ECLIP alive t=' + Math.round((performance.now() - t0) / 1000) + ' ' + cfg);
+}, 10000);
+</script>
