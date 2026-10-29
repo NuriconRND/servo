@@ -170,6 +170,65 @@ ticker_slice_probe.html?speed=10&text=<50자>     ② 가 사라져야 한다
 
 ---
 
+## 5-A. 구현 기록 ★— 설계에서 둘 바꿨다★
+
+### 검증이 먼저였다
+
+구현 전에 ★수정의 최종 상태를 페이지로 만들어 재 봤다★ — `?pin=1`(띠마다 ***정적*** 가로
+초과분을 넣어 자격을 상시 참으로 고정). ★저더가 사라지고 체감 저하도 없었다.★ 그래서
+"항상 자격 있음" 방향이 논증이 아니라 측정으로 뒷받침된다. 반대 방향(`bh=11`, 항상 자격
+없음)도 깨끗했으므로 둘 다 증상은 없애지만, 대가를 잰 것은 이쪽뿐이다.
+
+### 바꾼 것 1 — 부풀림을 1px 에서 ★0.25 레이아웃 px★ 로
+
+이 값은 `overflow: hidden` 상자에 ***가짜 스크롤 범위***로 남고 스크립트가 `scrollLeft` 로
+볼 수 있다. ★1px 이면 1 까지 스크롤되는 관측 가능한 변화★이고, 0.25px 는 반올림에 묻힌다.
+그러면서 `MIN_SCROLLABLE_AMOUNT`(0.01)의 25 배 여유라 f32 뺄셈 반올림으로 다시 뒤집히지
+않는다.
+
+### 바꾼 것 2 — 두 단계 패치가 ★필요 없었다★
+
+4-2 절은 "스크롤 프레임이 자손보다 먼저 정의되므로 두 단계가 필요하다" 고 적었는데,
+★애니메이션 reference frame 을 만드는 자리가 조상 스크롤 노드 id 를 이미 알고 있다★
+(`stacking_context.rs` 의 `push_reference_frame(..., containing_block.scroll_node_id, ...)`).
+그래서 그 자리에서 한 번에 고친다:
+
+```rust
+if animated_transform.is_some() {
+    let node = stacking_context_tree.paint_info.scroll_tree
+        .get_node_mut(containing_block.scroll_node_id);
+    if let SpatialTreeNodeInfo::Scroll(info) = &mut node.info {
+        info.content_rect = stabilize_animated_scroll_content(info.content_rect, info.clip_rect);
+    }
+}
+```
+
+`animated_transform.is_some()` 이 ★정확히 "paint-side transform 애니메이션이 있다"★ 이고,
+`ScrollTree::get_node_mut` 은 이미 `pub` 이라 ★새 API 가 없다.★ 가장 안쪽 조상 노드 하나로
+충분하다 — `find_scroll_root` 이 자격자 중 가장 안쪽을 고르므로 그것이 항상 자격을 가지면
+선택이 흔들리지 않는다.
+
+★그리고 4-2 절의 (b)(자손 서브트리 걷기)는 조용히 틀렸을 것이다★ — `position: absolute`
+자손은 hoist 되어 원래 자리에 `Fragment::AbsoluteOrFixedPositioned` 자리표시자만 남는다.
+이 페이지의 `.text` 가 정확히 그 경우다.
+
+### 게이트
+
+  cargo test -p servo-paint-api --release --lib scroll_stabilize_tests   6/6
+  cargo test -p servo-paint-api --release --lib wall_layout              21/21
+  cargo build -p servo --example winit_wall --features media-gstreamer,no-wgl,webgpu --release
+                                                                         exit 0, 변경 파일 경고 0
+  git diff --check                                                       clean
+
+★rustfmt:★ `stacking_context.rs` 와 `shared/paint/display_list.rs` 는 ***리포 전체가***
+rustfmt-2024 비준수다(구 Servo 스타일 — 줄 끝 `&&`/`+`/`-`). 지적된 줄은 전부 손대지 않은
+기존 코드이고 ★삽입한 블록에는 지적이 없다.★ 맞추면 수백 줄 무관 diff 가 되므로 그대로 둔다.
+
+시험 여섯은 ★WebRender 가 실제로 재는 식★을 그대로 복제해(`content - clip` 의 max(0,·))
+결과가 문턱을 넘는지 단언한다 — 상수를 바꿔도 계약이 유지되는지 검사한다.
+
+---
+
 ## 6. 범위 밖
 
 - ★4 타일 벽의 저더는 양상이 다르다★(운영자 확인). 이 수정의 대상이 아니다.

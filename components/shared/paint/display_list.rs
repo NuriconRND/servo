@@ -956,6 +956,67 @@ pub fn paint_animation_binding_key<T>(
     PropertyBindingKey::new(((pipeline_id.0 as u64) << 32) | uid as u64)
 }
 
+/// 애니메이션되는 transform 을 담은 스크롤 프레임의 `content_rect` 를 ★슬라이스 루트 자격
+/// 문턱 위로 고정한다.★
+///
+/// ★왜 필요한가★(2026-10-29 실측). `transform` 은 `recalculate_overflow` 리스타일 손상을
+/// 나르고, 변환된 자식의 박스는 부모의 scrollable overflow 로 투영된다
+/// (`components/layout/fragment_tree/box_fragment.rs`). 그래서 애니메이션의 ***순간 위치***가
+/// 조상 스크롤 프레임의 `content_rect` 를 매 디스플레이 리스트마다 바꾼다. 그런데 WebRender 는
+/// 그 값의 ***문턱 판정***으로 picture-cache 슬라이스 루트를 고른다
+/// (`vendor_local/webrender/src/spatial_tree.rs` — `scrollable_size > MIN_SCROLLABLE_AMOUNT`
+/// 그리고 `viewport_rect > MIN_SCROLL_ROOT_SIZE`). 애니메이션이 그 문턱을 지나면 자격이
+/// 뒤집히고, 슬라이스가 가려지는 기준이 바뀌므로 ★사이클당 한 번 구조가 재구성된다.★
+///
+/// 실측(`tests/html/ticker_slice_probe.html?speed=10`, 무한 반복 자막 다섯):
+///   - 개시 지점이 ★글자가 띠에 완전히 들어온 순간★이고, 글자 폭(`text=`)에 따라 사이클
+///     안에서 움직인다 — `scrollable_size` 가 0 을 지나는 지점이다.
+///   - `bh=11`(띠 118.8 CSS px < 128)이면 ★사라진다★ — 자격을 아예 얻을 수 없으니 뒤집힐
+///     것이 없다. `bh=12.5`(135)면 발생한다.
+///   - `clip=band` ***또는*** `clip=shell` 하나만으로도 사라진다 — 스크롤 프레임 후보가
+///     둘 이상이어야 선택이 바뀐다.
+///   - `pin=1`(띠에 ***정적*** 가로 초과분을 넣어 자격을 상시 참으로 만든 것)이면
+///     ★사라지고 체감 저하도 없다★ — 이 함수가 하는 일과 같은 상태다.
+///   - ★Chrome 은 같은 마크업에서 발생하지 않는다★ — 그래서 `overflow: clip` 으로 피하는
+///     것은 해법이 아니다.
+///
+/// ★"항상 자격 있음" 으로 고정한다.★ 반대 방향(`content_rect = clip_rect`, 항상 자격 없음)도
+/// 증상을 없애지만 `scrollable_size` 를 0 으로 만들어 `overflow: hidden` 의 스크립트
+/// 스크롤 가능성과 어긋난다. 그리고 WebRender 가 작은 중첩 스크롤 루트를 건너뛰는 이유는
+/// "no performance benefit ... cheap to rasterize" 인데, ★연속으로 애니메이션되는 자손이
+/// 있으면 그 전제가 성립하지 않는다★ — 분리하는 것이 슬라이스의 존재 이유다.
+///
+/// `viewport_rect > MIN_SCROLL_ROOT_SIZE` 쪽은 건드리지 않는다. 그 문턱을 못 넘는 상자는
+/// 애초에 자격이 없어 뒤집힐 것도 없으므로(위 `bh=11`), 이 함수는 그 경우 무해하다.
+///
+/// 결과는 ★멱등★이고 ★절대 줄어들지 않는다★ — 이미 충분히 큰 `content_rect` 는 그대로 둔다.
+pub fn stabilize_animated_scroll_content(
+    content_rect: LayoutRect,
+    clip_rect: LayoutRect,
+) -> LayoutRect {
+    let mut stabilized = content_rect;
+    let wanted_width = clip_rect.width() + ANIMATED_SCROLL_STABILIZE_PX;
+    if stabilized.width() < wanted_width {
+        stabilized.max.x = stabilized.min.x + wanted_width;
+    }
+    let wanted_height = clip_rect.height() + ANIMATED_SCROLL_STABILIZE_PX;
+    if stabilized.height() < wanted_height {
+        stabilized.max.y = stabilized.min.y + wanted_height;
+    }
+    stabilized
+}
+
+/// [`stabilize_animated_scroll_content`] 가 더하는 여유, 레이아웃 px.
+///
+/// ★서브픽셀이어야 한다.★ 이 값은 `overflow: hidden` 상자에 ***가짜 스크롤 범위***로 남고,
+/// 스크립트가 `scrollLeft`/`scrollTop` 으로 볼 수 있다. 1px 이면 1 까지 스크롤되는 관측
+/// 가능한 변화가 되고, 0.25px 면 반올림에 묻힌다.
+///
+/// 그리고 WebRender 의 `MIN_SCROLLABLE_AMOUNT`(0.01)보다 ★충분히 커야 한다★ — 그 비교는
+/// f32 이고 `content - clip` 뺄셈을 거치므로, 문턱 바로 위에 두면 반올림으로 다시
+/// 뒤집힐 수 있다. 0.25 는 25 배 여유다.
+pub const ANIMATED_SCROLL_STABILIZE_PX: f32 = 0.25;
+
 /// 반복 경계 너머의 애니메이션 질의 시각을 ★현재 반복 안으로 접는다.★
 ///
 /// ★왜 필요한가.★ stylo 의 샘플러는 `progress` 를 현재 반복에 클램프하므로
@@ -1291,6 +1352,102 @@ impl PaintDisplayListInfo {
         self.scroll_tree
             .external_scroll_id_for_scroll_tree_node(id)
             .unwrap_or(ExternalScrollId(0, self.pipeline_id))
+    }
+}
+
+#[cfg(test)]
+mod scroll_stabilize_tests {
+    use super::*;
+
+    /// WebRender 가 실제로 재는 값. `vendor_local/webrender/src/spatial_node.rs` 의
+    /// `scrollable_size = max(0, content_size - frame_size)` 와 같은 식이다.
+    fn scrollable_size(content: LayoutRect, clip: LayoutRect) -> (f32, f32) {
+        (
+            (content.width() - clip.width()).max(0.0),
+            (content.height() - clip.height()).max(0.0),
+        )
+    }
+
+    /// WebRender 의 `MIN_SCROLLABLE_AMOUNT`.
+    const MIN_SCROLLABLE_AMOUNT: f32 = 0.01;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> LayoutRect {
+        LayoutRect::from_origin_and_size(
+            euclid::point2(x, y),
+            euclid::size2(w, h),
+        )
+    }
+
+    /// ★이 함수의 유일한 계약★: 결과가 WebRender 의 문턱을 넘긴다.
+    #[test]
+    fn the_result_always_clears_webrenders_threshold() {
+        let clip = rect(0.0, 0.0, 3840.0, 135.0);
+        // 초과분이 없는 경우(= 자막이 띠 안에 완전히 들어온 순간, 저더가 나던 그 지점).
+        for content in [
+            clip,
+            rect(0.0, 0.0, 3840.0, 135.0),
+            rect(0.0, 0.0, 3839.0, 100.0),
+            rect(0.0, 0.0, 3840.005, 135.005),
+        ] {
+            let out = stabilize_animated_scroll_content(content, clip);
+            let (w, h) = scrollable_size(out, clip);
+            assert!(
+                w > MIN_SCROLLABLE_AMOUNT && h > MIN_SCROLLABLE_AMOUNT,
+                "문턱을 못 넘었다: content={content:?} -> {out:?} (scrollable {w}x{h})"
+            );
+        }
+    }
+
+    /// ★이미 충분히 큰 것은 건드리지 않는다.★ 애니메이션이 띠를 넘어 뻗어 있는 구간에서는
+    /// 값이 그대로여야 한다 -- 그러지 않으면 스크롤 범위를 우리가 바꾸는 것이 된다.
+    #[test]
+    fn an_already_scrollable_content_rect_is_untouched() {
+        let clip = rect(0.0, 0.0, 3840.0, 135.0);
+        let content = rect(0.0, 0.0, 7000.0, 500.0);
+        assert_eq!(stabilize_animated_scroll_content(content, clip), content);
+    }
+
+    /// ★절대 줄어들지 않는다.★
+    #[test]
+    fn the_content_rect_never_shrinks() {
+        let clip = rect(0.0, 0.0, 3840.0, 135.0);
+        for content in [
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(0.0, 0.0, 7000.0, 10.0),
+            rect(0.0, 0.0, 10.0, 7000.0),
+        ] {
+            let out = stabilize_animated_scroll_content(content, clip);
+            assert!(out.width() >= content.width() && out.height() >= content.height());
+        }
+    }
+
+    /// ★멱등★ -- 두 번 적용해도 같다. 같은 노드가 애니메이션되는 자손을 여럿 가지면 이
+    /// 함수가 여러 번 불린다.
+    #[test]
+    fn applying_it_twice_changes_nothing() {
+        let clip = rect(0.0, 0.0, 3840.0, 135.0);
+        let once = stabilize_animated_scroll_content(clip, clip);
+        let twice = stabilize_animated_scroll_content(once, clip);
+        assert_eq!(once, twice);
+    }
+
+    /// 원점은 보존한다 -- 넓히는 것은 오른쪽/아래뿐이다. LTR 에서 왼쪽/위 초과분은
+    /// 엔진이 걷어내므로(`clip_wholly_unreachable_scrollable_overflow`) 왼쪽으로 넓히면
+    /// 효과가 없다.
+    #[test]
+    fn it_grows_right_and_down_only() {
+        let clip = rect(100.0, 50.0, 3840.0, 135.0);
+        let out = stabilize_animated_scroll_content(rect(100.0, 50.0, 10.0, 10.0), clip);
+        assert_eq!(out.min, euclid::point2(100.0, 50.0));
+    }
+
+    /// 크기가 0 인 clip 에도 패닉하지 않고 문턱을 넘긴다.
+    #[test]
+    fn a_degenerate_clip_rect_does_not_panic() {
+        let clip = rect(0.0, 0.0, 0.0, 0.0);
+        let out = stabilize_animated_scroll_content(clip, clip);
+        let (w, h) = scrollable_size(out, clip);
+        assert!(w > MIN_SCROLLABLE_AMOUNT && h > MIN_SCROLLABLE_AMOUNT);
     }
 }
 

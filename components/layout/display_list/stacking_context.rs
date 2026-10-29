@@ -12,7 +12,7 @@ use euclid::{Point2D, Rect, SideOffsets2D, Size2D};
 use malloc_size_of_derive::MallocSizeOf;
 use paint_api::display_list::{
     AxesScrollSensitivity, PaintDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
-    SpatialTreeNodeInfo, StickyNodeInfo,
+    SpatialTreeNodeInfo, StickyNodeInfo, stabilize_animated_scroll_content,
 };
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::ScrollTreeNodeId;
@@ -673,6 +673,26 @@ impl BoxFragment {
                     .push(animation);
                 key
             });
+        // ★애니메이션되는 transform 은 조상의 scrollable overflow 를 매 프레임 흔들고,
+        // WebRender 는 그 값의 문턱 판정으로 picture-cache 슬라이스 루트를 고른다.★ 문턱을
+        // 넘나들면 슬라이스 구조가 사이클당 한 번 재구성되고, 그것이 자막에서 멈칫으로
+        // 보인다. 자격을 ***항상 있음***으로 고정해 뒤집힘을 없앤다 -- 근거와 실측은
+        // `paint_api::display_list::stabilize_animated_scroll_content` 의 doc 과
+        // `docs/superpowers/specs/2026-10-29-animated-overflow-slice-churn-design.md` 에 있다.
+        //
+        // ★가장 안쪽 조상 스크롤 노드 하나로 충분하다★ -- `find_scroll_root` 이 자격을 갖춘
+        // 것 중 가장 안쪽을 고르므로, 그것이 항상 자격을 가지면 선택이 흔들리지 않는다.
+        if animated_transform.is_some() {
+            let node = stacking_context_tree
+                .paint_info
+                .scroll_tree
+                .get_node_mut(containing_block.scroll_node_id);
+            if let SpatialTreeNodeInfo::Scroll(info) = &mut node.info {
+                info.content_rect =
+                    stabilize_animated_scroll_content(info.content_rect, info.clip_rect);
+            }
+        }
+
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
             frame_origin_for_query,
