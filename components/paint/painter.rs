@@ -461,6 +461,41 @@ pub(crate) struct PainterInputs {
 // (`Paint::on_wall_tick`: `gather_components` → `produce_wall_frame`).
 // 설계 2-6 / 4 절: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
 
+/// `gfx_wr_profiler_hud` 를 WebRender profiler UI 문자열로 바꾼다. `None` = 끔.
+///
+/// 값의 뜻은 그 pref 의 doc 주석에 있다. ★`on` 만 여기서 묶음으로 펼치고, 그 외 비어 있지
+/// 않은 값은 그대로 넘긴다★ -- 운용자가 빌드 없이 카운터를 바꿀 수 있어야 한다.
+fn profiler_hud_ui_string() -> Option<String> {
+    let value = pref!(gfx_wr_profiler_hud);
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("on") {
+        // "패스가 한 주기를 넘는가" 를 보도록 고른 묶음. 이름은
+        // `vendor_local/webrender/src/profiler.rs` 의 카운터 표에 있는 것 그대로다.
+        return Some(
+            "FPS,Frame CPU total,Frame building,Renderer,Scene building,#Frame CPU total"
+                .to_owned(),
+        );
+    }
+    Some(value.to_owned())
+}
+
+/// HUD 에 필요한 디버그 플래그. ★GPU 질의는 문자열이 그것을 요구할 때만 켠다★ -- 그 질의는
+/// GPU 동기화를 더해서 재는 대상을 바꾼다.
+fn profiler_hud_flags(ui: Option<&str>) -> webrender::DebugFlags {
+    let Some(ui) = ui else {
+        return webrender::DebugFlags::empty();
+    };
+    let mut flags = webrender::DebugFlags::PROFILER_DBG;
+    if ui.contains("GPU time queries") {
+        flags |=
+            webrender::DebugFlags::GPU_TIME_QUERIES | webrender::DebugFlags::GPU_SAMPLE_QUERIES;
+    }
+    flags
+}
+
 // ★`script_frame_is_redundant` 와 `script_frame_rides_the_painter` 는 2026-10-21 에
 // 삭제됐다.★
 //
@@ -644,6 +679,9 @@ impl Painter {
             webrender::CompositorConfig::Native { .. }
         );
 
+        // ★HUD★ -- 비어 있으면 플래그도 비고 `set_profiler_ui` 도 부르지 않는다(전과 동일).
+        let profiler_hud_ui = profiler_hud_ui_string();
+
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
@@ -655,7 +693,7 @@ impl Painter {
                 // See: https://github.com/servo/servo/issues/31726
                 use_optimized_shaders: true,
                 resource_override_path: opts::get().shaders_path.clone(),
-                debug_flags: webrender::DebugFlags::empty(),
+                debug_flags: profiler_hud_flags(profiler_hud_ui.as_deref()),
                 precache_flags: if pref!(gfx_precache_shaders) {
                     ShaderPrecacheFlags::FULL_COMPILE
                 } else {
@@ -678,6 +716,12 @@ impl Painter {
             None,
         )
         .expect("Unable to initialize WebRender.");
+
+        if let Some(ui) = profiler_hud_ui.as_deref() {
+            // 모르는 이름은 WebRender 가 조용히 무시한다 -- 그래서 여기서 검사하지 않는다.
+            webrender_renderer.set_profiler_ui(ui);
+            log::info!("[hud] WebRender profiler HUD on (painter {painter_id:?}): {ui}");
+        }
 
         webrender_renderer.set_external_image_handler(external_image_handlers);
 

@@ -815,6 +815,27 @@ pub struct Preferences {
     /// 그대로 `desired_tile_size` 로 쓴다). 실질 상한은 GPU 텍스처 크기이고, 넘으면 타일
     /// 텍스처 할당이 실패한다.
     pub gfx_wr_picture_tile_size: String,
+    /// WebRender 온스크린 프로파일러(HUD)를 켠다. ★임의의 페이지에서 fps 를 수치로 본다.★
+    ///
+    /// 인정하는 값:
+    /// - `""`(기본) — 끈다. ***렌더러 생성 플래그가 비는 것까지 포함해 전과 동일하다.***
+    /// - `on` — 벽 조사용 기본 묶음. "패스가 한 주기를 넘는가" 를 보도록 골랐다:
+    ///   `FPS,Frame CPU total,Frame building,Renderer,Scene building,#Frame CPU total`
+    /// - 그 외 — ★WebRender 의 profiler UI 문자열로 그대로 넘긴다★(`set_profiler_ui`).
+    ///   문법은 `vendor_local/webrender/src/profiler.rs` 머리 주석에 있다: 쉼표 목록,
+    ///   `#` 접두=그래프, `*`=변화 표시, `$`=리터럴 글자, `|`=새 열, `_`=새 행, 빈 토큰=여백.
+    ///   `Default`/`Compact` 같은 프리셋 이름도 쓸 수 있다.
+    ///   ★모르는 이름은 조용히 무시된다★ — 오타가 오류가 아니라 빈칸으로 나타난다.
+    ///
+    /// ★`GPU time queries` 를 문자열에 넣으면 그때만 GPU 질의 플래그를 켠다.★ 그 질의는
+    /// GPU 동기화를 더하므로 기본 묶음에서 뺐다 — ***재는 대상을 바꾸는 쪽***이다.
+    ///
+    /// ★HUD 자체가 공짜가 아니다.★ 디버그 렌더러가 매 프레임 글자를 그리므로 표시되는
+    /// 수치에 그 비용이 포함된다. 절대값보다 ★조건 사이의 차이★를 보는 데 쓴다.
+    ///
+    /// 페인터마다 그려지므로 벽에서는 ★타일별★로 나온다. 셸과 무관하게 동작한다
+    /// (servoshell / winit_wall 둘 다 `Painter` 를 지나간다).
+    pub gfx_wr_profiler_hud: String,
     /// 비디오 프레임을 WebRender 콘텐츠 패스에서 분리해 DirectComposition 외부 서피스로
     /// "탈출"시킬지의 게이트 모드. `external` = 탈출 on(스왑체인/가상 서피스 프로모션
     /// 후보), 그 외(빈 문자열 포함) = off. **`off`/`on`/`true` 류 3-상태 truthy 표기가
@@ -1411,6 +1432,8 @@ impl Preferences {
             gfx_wall_frame_min_interval_ms: 0, // 0 = gfx_refresh_hz 한 주기(위 doc 참고)
             // 빈 문자열 = 오버라이드 없음(WR 기본). 위 필드 doc 주석 참고.
             gfx_wr_picture_tile_size: String::new(),
+            // 빈 문자열 = 끔. 위 필드 doc 주석 참고.
+            gfx_wr_profiler_hud: String::new(),
             // 근거는 위 필드 doc 주석 참고 (task-4 브리프의 반례 표: 킬스위치 둘은 기본
             // on, promote_hysteresis 는 옛 unwrap_or(10) 그대로).
             gfx_video_escape_mode: String::new(), // 빈 문자열 = off (external 만 유효)
