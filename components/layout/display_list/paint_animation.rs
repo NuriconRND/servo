@@ -20,14 +20,36 @@
 //! moving.
 //!
 //! Only properties that do not affect layout can work this way. `opacity` is one.
+//!
+//! ★런웨이는 반복 경계를 넘어간다 -- 넘기지 않으면 경계마다 멈춘다.★ stylo 의 샘플러는
+//! `progress` 를 현재 반복에 클램프하므로(`third_party/stylo/style/servo/animation.rs`,
+//! `total_progress >= 1.0` 이면 끝 키프레임을 그대로 적용한다) 미래 시각을 그냥 질의하면
+//! ***다음 반복으로 감기지 않고 끝 값에 평탄해진다***. 그러면 런웨이가 지평이 아니라
+//! 경계에서 끝나고, paint 는 다음 디스플레이 리스트까지 마지막 값을 붙든다.
+//!
+//! 2026-10-29 실측(개발 장비, `tests/html/ticker_slice_probe.html?speed=10`, 무한 반복
+//! 자막 다섯):
+//!   - 사이클당 한 번 멈칫하고 반복해도 완화되지 않는다. 전 띠가 ***같이*** 멈칫하고
+//!     fps 는 60 그대로다 -- 프레임이 늦는 게 아니라 값이 안 변한다.
+//!   - `gfx_paint_side_animations_enabled=false` 로 끄면 사라진다.
+//!   - `gfx_paint_side_animation_tick_divisor` 1 대 15 에서 ***위치 오차***만 비례해
+//!     줄어들고(250ms 분량 -> 17ms 분량) ★1 프레임 정지는 그대로 남는다★ -- 틱을 더
+//!     자주 받는 것으로는 고칠 수 없다는 뜻이다.
+//!   - ★`direction: alternate` 로 경계에서 값이 연속이어도 양 끝 모두에서 같은 증상이
+//!     난다★ -- 위치 불연속이 아니라 ***붙듦***이 원인이라는 증거다.
+//! `-FrameTime off`(위상 정합, `docs/superpowers/specs/2026-10-15-tick-animation-frame-time-design.md`)
+//! 는 무영향이었고, 페이싱 클럭·커밋 모드·프레임 배리어·`overflow` 종류·타일 수도 무영향이다.
 
 use paint_api::display_list::{
     PaintAnimatedProperty, PaintAnimation, PaintAnimationProperty, PaintAnimationSegment,
-    paint_animation_binding_key,
+    fold_animation_sample_time, paint_animation_binding_key,
 };
 use servo_base::cross_process_instant::CrossProcessInstant;
-use style::animation::{AnimationSetKey, DocumentAnimationSet};
+use style::animation::{
+    Animation, AnimationSetKey, DocumentAnimationSet, ElementAnimationSet, KeyframesIterationState,
+};
 use style::dom::OpaqueNode;
+use style::properties::longhands::animation_direction::computed_value::single_value::T as AnimationDirection;
 
 use style::properties::animated_properties::AnimationValue;
 use style::properties::{LonghandId, OwnedPropertyDeclarationId, PropertyDeclarationId};
@@ -61,6 +83,64 @@ const SAMPLE_SECONDS: f64 = 1.0 / 60.0;
 /// Two sampled values closer than this count as the same value.
 const EPSILON: f32 = PaintAnimationSegment::<f32>::EPSILON;
 
+/// 반복 경계 너머의 질의 시각을 ★현재 반복 안으로 접는다.★
+///
+/// 모듈 머리 주석이 왜 필요한지 적는다. 요지는 stylo 가 경계 너머를 끝 키프레임으로
+/// 클램프하고, `started_at` 을 전진시키는 `iterate()` 는 `&mut` 라 스크립트 틱에서만
+/// 불린다는 것이다 -- 샘플링은 `&DocumentAnimationSet` 만 들고 있으므로 iterate 를 일으킬
+/// 수 없다. 그래서 ***질의 시각 쪽을*** 접는다.
+///
+/// ★alternate 를 시간 거울반사로 정확히 다룬다 -- 사본도, 방향 뒤집기도 필요 없다.★
+/// 역방향 반복의 값은 `keyframe(ease(1 - τ/주기))` 이고, 0번째 반복을 `주기 - τ` 에 질의한
+/// 값이 `keyframe(ease((주기-τ)/주기))` 로 ***easing 까지 같다***. Web Animations 가
+/// directed progress 를 뒤집은 뒤 easing 을 적용하기 때문이다. `Alternate` 는 0번째가
+/// 정방향이고 `AlternateReverse` 는 0번째가 역방향이라, 둘 다 ★홀수 번째 반복에서만
+/// 거울반사★하면 맞는다. `Normal`/`Reverse` 는 모든 반복이 같으므로 거울반사가 없다.
+///
+/// ★`Infinite` 에만 접는다.★ `Finite` 는 남은 반복 수와 비정수 마지막 반복
+/// (`current_iteration_end_progress`)을 함께 따져야 하고, 다 끝난 뒤의 클램프는 `fill` 의
+/// 정의된 동작이다. 지금 동작을 그대로 둔다.
+fn folded_sample_time(animation: &Animation, time: f64) -> f64 {
+    if !matches!(
+        animation.iteration_state,
+        KeyframesIterationState::Infinite(_)
+    ) {
+        return time;
+    }
+    let alternating = match animation.direction {
+        AnimationDirection::Alternate | AnimationDirection::AlternateReverse => true,
+        AnimationDirection::Normal | AnimationDirection::Reverse => false,
+    };
+    fold_animation_sample_time(
+        animation.started_at,
+        animation.current_iteration_duration(),
+        alternating,
+        time,
+    )
+}
+
+/// `ElementAnimationSet::get_value_map_for_active_animations` 와 같은 일을 하되,
+/// ★애니메이션마다 질의 시각을 따로 접는다.★
+///
+/// 세트 단위 API 는 모든 애니메이션에 같은 `now` 를 주는데, 한 요소에 주기가 다른
+/// 애니메이션이 여럿 걸릴 수 있으므로 접기는 애니메이션 단위여야 한다. 합성 순서는 세트
+/// 단위 API 와 같다(`animations` 순서대로 맵에 덮어쓴다).
+fn folded_animated_value(
+    set: &ElementAnimationSet,
+    longhand: LonghandId,
+    time: f64,
+) -> Option<AnimationValue> {
+    if !set.has_active_animation() {
+        return None;
+    }
+    let mut map = Default::default();
+    for animation in &set.animations {
+        animation.get_property_declaration_at_time(folded_sample_time(animation, time), &mut map);
+    }
+    map.get(&OwnedPropertyDeclarationId::Longhand(longhand))
+        .cloned()
+}
+
 /// The opacity this element's animations and transitions produce at `time`, if any of them
 /// touch opacity at all.
 ///
@@ -69,11 +149,10 @@ fn animated_opacity(animations: &DocumentAnimationSet, node: OpaqueNode, time: f
     let sets = animations.sets.read();
     let set = sets.get(&AnimationSetKey::new_for_non_pseudo(node))?;
 
-    if let Some(map) = set.get_value_map_for_active_animations(time)
-        && let Some(value) = map.get(&OwnedPropertyDeclarationId::Longhand(LonghandId::Opacity))
-        && let AnimationValue::Opacity(opacity) = value
+    if let Some(AnimationValue::Opacity(opacity)) =
+        folded_animated_value(set, LonghandId::Opacity, time)
     {
-        return Some(*opacity);
+        return Some(opacity);
     }
 
     set.transitions
@@ -182,11 +261,10 @@ pub(crate) fn animated_transform_list(
     let sets = animations.sets.read();
     let set = sets.get(&AnimationSetKey::new_for_non_pseudo(node))?;
 
-    if let Some(map) = set.get_value_map_for_active_animations(time)
-        && let Some(value) = map.get(&OwnedPropertyDeclarationId::Longhand(LonghandId::Transform))
-        && let AnimationValue::Transform(list) = value
+    if let Some(AnimationValue::Transform(list)) =
+        folded_animated_value(set, LonghandId::Transform, time)
     {
-        return Some(list.clone());
+        return Some(list);
     }
 
     set.transitions
@@ -242,8 +320,7 @@ pub(crate) fn transform_binding(
         }
     }
 
-    let segments =
-        PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, SAMPLE_SECONDS);
+    let segments = PaintAnimationSegment::<LayoutTransform>::from_samples(&samples, SAMPLE_SECONDS);
     if segments.is_empty() {
         return None;
     }

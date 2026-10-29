@@ -1,305 +1,196 @@
-# paint-side 애니메이션이 반복 경계에서 멈춘다 — 원인과 구현안
+# paint-side 런웨이가 반복 경계에서 끝난다 — 원인, 수정, 남은 것
 
-> 날짜: 2026-10-29 · 대상: `components/layout/display_list/paint_animation.rs`,
-> `components/shared/paint/display_list.rs`
-> 증상: 무한 반복 자막이 ★사이클당 정확히 한 번★ 멈칫하고, 반복해도 **전혀 완화되지 않는다**.
-
----
-
-## ★상태: 이 문서의 기구는 2026-10-29 에 반증됐다★
-
-`gfx_paint_side_animation_tick_divisor=1`(4 절 Task 0-a)을 개발 장비에서 돌린 결과
-★육안 변화가 전혀 없었다★ — 같은 위치, 같은 타이밍, 사이클당 1 회 그대로다. 기구가
-"경계 이후 값이 얼어붙고 ***다음 스크립트 틱***을 기다린다" 였다면 대기가 250ms → 17ms 로
-줄어 반드시 변화가 있어야 했다.
-
-★그 음성이 사는 제약:★ (b)는 ***디스플레이 리스트를 기다리는 것이 아니다.*** 따라서 "한
-디스플레이 리스트 간격을 기다린다" 류의 후보가 전부 죽는다 — 아래 2 절의 기구, 그리고
-"상수 run 이라 바인딩이 풀려 WebRender 가 마지막 값을 유지한다" 도 같은 이유로 죽는다.
-
-2~4 절은 ★기록으로 남긴다★(반증된 가설과 그 근거, 그리고 3 절의 교훈은 유효하다).
-새 선두 가설은 7 절이다.
+> 2026-10-29 · 대상: `components/layout/display_list/paint_animation.rs`,
+> `components/shared/paint/display_list.rs`, `third_party/stylo/style/servo/animation.rs`
+>
+> ★이 문서는 두 번 뒤집혔다.★ 처음에 기구를 세우고, `divisor=1` 음성으로 기각했다가,
+> 증상이 둘이라는 것을 알고 되살렸다. 그 경위는 5-1 절에 남긴다 — 같은 오독을 반복하지
+> 않기 위해서다.
 
 ---
 
-## 0. 한 줄
+## 1. 한 줄
 
-★paint-side 애니메이션의 샘플 런웨이가 지평(3초)이 아니라 **다음 반복 경계**에서 끝난다.★
-stylo 샘플러가 그 너머를 끝 키프레임으로 **클램프**하기 때문이다. 그래서 경계 이후 값이
-얼어붙고, 스크립트의 다음 애니메이션 틱(`divisor` 프레임마다)이 와서야 풀린다 —
-`divisor 15` 면 ★최대 250ms★ 정지다.
-
----
-
-## 1. 증상 (실측, 운영자 육안)
-
-`tests/html/ticker_slice_probe.html` — 가로 자막 띠 5 개, 각각
-`element.animate([{transform: translate(from)}, {transform: translate(to)}],
-{duration: dur, iterations: Infinity, easing: 'linear'})`,
-`from = box.clientWidth`(뷰포트 우단), `to = -span.offsetWidth`(좌측 완전 이탈),
-`dur = max(1500, 24000/speed)`.
-
-| 관찰 | |
-|---|---|
-| 텍스트가 완전히 빠져나온 직후 멈칫 | ★사이클당 정확히 1 회★ |
-| 빈도 | `1/dur` 를 따라감(`speed=1/4/10` 로 확인) |
-| 반복 수십 회 | ★전혀 완화되지 않음★ |
-| Chrome 같은 페이지·같은 speed | ★주기적 judder 없음★ |
-| 페이싱 클럭 / 커밋 모드 / 프레임 배리어 변경 | 전부 **무영향** |
-
-★이것과 별개의 judder 가 하나 더 있다★(진입 시점, 반복되면 **완화됨**) — 그쪽은 글리프
-캐시 워밍으로 보이고 이 문서의 대상이 아니다. 섞어 보지 말 것.
+★stylo 가 반복 경계 너머를 끝 키프레임으로 클램프하므로, paint-side 샘플 런웨이가
+지평(3초)이 아니라 **다음 반복 경계**에서 끝난다.★ 경계 이후 paint 는 다음 디스플레이
+리스트까지 마지막 값을 붙들고, 그것이 사이클당 한 번의 정지로 보인다.
 
 ---
 
-## 2. 기구 (코드로 확정) — ★2026-10-29 반증됨, 기록으로 남긴다★
+## 2. 증상은 둘이고, 한 기구의 두 얼굴이다
 
-### 2-1. 런웨이는 반복 경계에서 끝난다
+`tests/html/ticker_slice_probe.html` — 무한 반복 자막 띠 5 개, `phase=same` 이라 다섯이
+같은 순간에 경계를 지난다. 재현이 확실한 설정은 `speed=10`(`dur` 2400ms).
 
-`components/layout/display_list/paint_animation.rs` 가 디스플레이 리스트를 만들 때
-스타일 시스템을 `SAMPLE_SECONDS = 1/60` 간격으로 지평(`gfx_paint_side_animation_horizon_ms`,
-기본 3000ms, `MAX_SAMPLES = 256`)까지 질의한다(`:125`, `:225`).
+| | 증상 A "오른쪽에서 갑자기 나타남" | 증상 B 주기적 judder |
+|---|---|---|
+| `divisor=1` | ★사라짐★ | 그대로 |
+| `-FrameTime off` | — | 그대로 |
+| `gfx_paint_side_animations_enabled=false` | 사라짐 | ★사라짐★ |
 
-그런데 `third_party/stylo/style/servo/animation.rs` 의 샘플러:
+★하나의 기구가 둘을 낸다.★ 붙드는 길이는 다음 디스플레이 리스트까지 = `divisor` 프레임:
+
+| `divisor` | 붙듦 | 위치 오차(A) | 동작 정지(B) |
+|---|---|---|---|
+| 15 | ≤250ms | travel 의 약 10% → ★보임★ | ≤15 프레임 |
+| 1 | ≤17ms | 약 0.4% → ★안 보임★ | ★1 프레임 — 그대로★ |
+
+★1 프레임 정지는 틱을 더 자주 받는 것으로 없앨 수 없다.★ 런웨이가 경계를 넘어가야 한다.
+
+---
+
+## 3. 기구 (코드 + 실측)
+
+### 3-1. 런웨이가 경계에서 끝난다
+
+`paint_animation.rs` 가 스타일 시스템을 `SAMPLE_SECONDS = 1/60` 간격으로
+`gfx_paint_side_animation_horizon_ms`(기본 3000ms, `MAX_SAMPLES = 256`)까지 질의한다.
+그런데 `third_party/stylo/style/servo/animation.rs`:
 
 ```rust
 // Progress clamped to the current iteration [0.0, 1.0].
 let total_progress = progress.min(self.current_iteration_end_progress()).max(0.0);
-
-// At/near 1.0 there is nothing left to interpolate. Return end keyframe.
 if (total_progress as f32) >= 1.0 {
-    let keyframe = match self.current_direction {
-        AnimationDirection::Normal => self.computed_steps.last().unwrap(),
-        AnimationDirection::Reverse => self.computed_steps.first().unwrap(),
-        ...
-    };
-    add_declarations_to_map(keyframe);
+    add_declarations_to_map(/* 끝 키프레임 */);
     return;
 }
 ```
 
-`Infinite` 이면 `current_iteration_end_progress()` 가 `1.0`(`:698-704`)이므로 ★미래 시각을
-질의하면 다음 반복으로 **감기지 않고 끝 키프레임에 고정된다.**★
+`Infinite` 이면 `current_iteration_end_progress()` 가 `1.0` 이므로 ★미래 시각 질의가 다음
+반복으로 감기지 않는다.★ 그리고 `started_at` 을 전진시키는 `iterate()` 는 `&mut` 라
+`components/script/animations.rs` 의 스크립트 틱에서만 불리고, 샘플링은
+`&DocumentAnimationSet` 만 들고 있으므로 ***일으킬 수 없다.***
 
-그리고 `started_at` 을 전진시키는 `iterate()`(`:666`, `started_at += duration`)는 `&mut` 가
-필요해 `components/script/animations.rs:166` 의 스크립트 틱에서만 불린다. layout 은
-`&DocumentAnimationSet` 만 읽으므로 ***샘플링이 iterate 를 일으킬 수 없다.***
+결과: 샘플 열이 `선형 → 끝값에 평탄` 이 되고, `running()`(= `elapsed < last.end`)이 거짓이
+되면 paint 는 마지막 값을 낸다.
 
-★결과: 샘플 열은 `선형 하강 → 끝값(좌측 밖)에 평탄` 이다.★
+### 3-2. 실측이 이 기구를 지목한다 (2026-10-29, 개발 장비)
 
-### 2-2. 그래서 화면이 얼어붙는다
+- 전 띠가 ★같이★ 멈칫한다 → 프레임 단위, per-element 값 분기가 아니다.
+- fps 는 60 그대로다 → 프레임이 늦는 게 아니라 ★값이 안 변한다.★
+- ★`dir=alternate` 로 경계에서 값이 **연속**인데도 양 끝 모두에서 같은 증상이 난다.★
+  위치 불연속이 아니라 ***붙듦***이 원인이라는 결정적 증거다.
+- `enabled=false` 가 없애고, `-FrameTime off`(위상 정합,
+  `2026-10-15-tick-animation-frame-time-design.md`)는 무영향이다.
 
-`components/paint/web_content_animation.rs` 는 그 세그먼트를 자기 시계로 보간한다. 평탄
-구간에서는 끝값을 그대로 낸다 — 자막이 **좌측 밖에 주차된 채** 멈춘다.
+무영향으로 확인된 것: 페이싱 클럭 종류, `-DwmAlign`, 커밋 모드(`-DcompCommitInFrame`·
+`-DcompParallelCommit`), 프레임 배리어, `overflow: hidden`→`clip`, 디바이스/타일 수,
+marquee 복제, `clip` 역할 조합.
 
-풀리는 것은 스크립트의 다음 애니메이션 틱이다. `gfx_paint_side_animation_tick_divisor` doc:
+### 3-3. 리포 doc 이 이 정지의 모양을 적었다 (원인은 다르게 짚었다)
 
-> Ask script for an animation tick once every N display frames … ***A tick is a full
-> rendering update, and a rendering update reflows the whole document.*** … ticks are only
-> needed often enough to ***rebase that prediction*** and to fire the animation's own events.
+`gfx_paint_side_animation_horizon_ms` doc: *"Past the end of what was sampled the paint
+thread holds the last value, ★which looks exactly like the freeze this feature exists to
+remove★"*. 같은 정지인데 ***스크립트 블록***의 결과로 보았고, ★반복 경계가 블록 없이도
+런웨이를 자른다는 것은 없다.★ 그리고 `a18686dbd77` 와 `paint_animation.rs` 의 설계 주석이
+"샘플하면 iteration 도 이미 구현한 코드가 처리한다" 고 적는데 ★틀렸다 — 샘플되지도 않고
+클램프된다.★ (이번 변경에서 고쳤다.)
 
-★정지 길이 = 반복 경계부터 다음 스크립트 틱까지 = 최대 `divisor` 프레임.★
-`divisor 15` → 최대 **250ms**. 사이클당 1 회, 캐시 무관, 클럭·커밋·배리어 무관 — ★1 절의
-관찰 여섯 개가 전부 맞는다.★
+### 3-4. Chrome 이 안 그러는 이유
 
-### 2-3. 리포의 doc 이 이미 이 모양을 적었다 (원인은 다르게 짚었다)
-
-`gfx_paint_side_animation_horizon_ms` doc:
-
-> ***This is a bet on how long script might stop producing display lists.*** Past the end of
-> what was sampled the paint thread holds the last value, ★which looks exactly like the
-> freeze this feature exists to remove.★ 실측(4-GPU 벽, 2026-09-08 `log_ani_perf/07`):
-> 1 초 스크립트 블록 대 1 초 지평에서 애니메이션이 매 블록마다 중간에 멈췄다.
-
-같은 정지다. 다만 doc 은 그것을 ***스크립트 블록***의 결과로 보았고, ★반복 경계가 스크립트
-블록 없이도 런웨이를 잘라낸다는 것은 적혀 있지 않다.★
-
-그리고 `a18686dbd77`(2026-09-08, 이 기능 도입)의 메시지와 `paint_animation.rs:55-58` 주석은
-
-> 샘플하고 병합하면 easing·iteration·direction·fill 이 이미 구현한 코드에서 처리된다
-
-고 적는데, ★iteration 은 처리되지 않는다 — 샘플되지도 않고 클램프된다.★ 그 주석을 고쳐야
-한다.
-
-### 2-4. Chrome 이 안 그러는 이유
-
-Chromium 은 compositor 에 ★키프레임과 타이밍(iterations/direction/fill)을 보내고
-compositor 가 시간을 모듈로로 감는다.★ 재샘플하지 않는다.
-
-- `cc/animation/keyframe_model.cc` — `CreateImplInstance()` 가
-  `set_iterations/iteration_start/direction/fill_mode` 를 복제하고 `curve()->Clone()`
-- `ui/gfx/animation/keyframe/keyframe_model.cc` — 무한 반복이면
-  `repeated_duration = TimeDelta::Max()`, `iteration_time = active_time % curve_->Duration()`
-
-즉 Chromium 에서는 반복이 **곡선 평가 자체**에 들어 있어 이 문제가 생길 수 없다.
+Chromium 은 compositor 에 ★키프레임과 타이밍을 보내고 compositor 가 시간을 모듈로로
+감는다★ — 재샘플하지 않는다. `cc/animation/keyframe_model.cc`(`CreateImplInstance` 가
+`iterations`/`direction`/`fill_mode` 를 복제), `ui/gfx/animation/keyframe/keyframe_model.cc`
+(`iteration_time = active_time % curve_->Duration()`).
 
 ---
 
-## 3. ★폐기된 수정안 (내 첫 제안)★
+## 4. 수정 — Task 1 ★구현했다★
 
-제안했던 것: `from_samples` 가 반복 경계에서 만드는 ★1 스텝 브리지 세그먼트★의 easing 을
-`Linear` 대신 `Steps(1, false)` 로 바꿔 "유지 후 점프" 로 만든다.
+### 4-1. 질의 시각을 반복 경계 너머로 접는다
 
-적대적 검토(3 렌즈)가 세 군데에서 꺾었고, 그중 둘은 코드로 직접 확인했다:
+`components/shared/paint/display_list.rs` 에 순수 함수:
 
-| # | 판정 | 근거 |
-|---|---|---|
-| 1 | ★그 브리지 세그먼트가 **존재하지 않는다**★ | 2-1 의 클램프. 샘플에 점프가 없으므로 `from_samples` 는 브리지를 만들지 않는다. 제안은 ***아무것도 바꾸지 못한다.*** |
-| 2 | ★`span == 1` 은 불연속의 판별자가 아니다★ | `display_list.rs:972-1010`·`:1034-1075` 의 탐욕 병합은 straight 실패 시 `start_index = index-1` 로 전진하므로, 허용오차(`f32` 1/2048, transform 0.01px) 밖인 **모든 곡선 구간**이 1 스텝 세그먼트가 된다. transform doc(`:1027-1033`)이 "a rotation simply fails the straightness test and keeps more segments" 라고 적는다. 제안대로면 ★비선형 애니메이션 전체가 60Hz 계단으로 퇴행한다.★ |
-| 3 | `Steps` 가 애초에 필요 없다 | 맞닿은 두 세그먼트로 점프가 **정확히** 표현된다. `find_segment`(`web_content_animation.rs:271-285`)가 `elapsed < segment.end` 로 고르므로 `elapsed < T` → 세그먼트1(값 A), `elapsed == T` → 세그먼트2(progress 0 → 값 B). 유령 위치 없음 |
-
-부수 발견 하나: ★테스트 헬퍼 `replay`(`display_list.rs:1300-1316`)가 `segment.easing.ease` 를
-부르지 않는다★ — 선형 보간만 한다. 그래서 easing 회귀를 기존 테스트가 잡지 못한다.
-
----
-
-## 4. 구현안
-
-### Task 0 — 기구를 실측으로 못 박는다 (선행)
-
-**0-a. ★실행했다 — 음성.★** `gfx_paint_side_animation_tick_divisor=1`, 개발 장비, 육안
-변화 없음(2026-10-29). 이 문서의 기구는 여기서 죽는다. 아래 예측은 ★틀린 예측으로 남긴다★.
-
-정지 길이가 `divisor` 프레임에 비례한다는 예측대로면 ★(b) 가 거의 사라져야 한다★
-(250ms → 17ms). 사라지면 기구 확정이다.
-
-★이것은 확인 수단이고 수정이 아니다★ — `divisor 1` 은 초당 122 리플로를 되돌리고
-(`log_ani_perf/13`), 콘텐츠 전환 때 한 리플로가 14.5ms 라 벽이 2 초간 안 그려진 적이 있다.
-그래서 Task 1 이 필요하다.
-
-**0-b. 클램프를 테스트로 고정.** `Infinite` 애니메이션을 경계 너머 시각에 샘플해 값이 끝
-키프레임에 머무는지 단언한다. 로그가 아니라 ***영구 테스트***다. 이 전제가 깨지면 Task 1·2
-가 무의미해지므로 가장 먼저 고정한다.
-
-### Task 1 — 샘플 시각을 반복 경계 너머로 접는다
-
-`paint_animation.rs` 의 샘플 루프(`:128`, `:228`)가 질의하는 시각을 접는다:
-
-```text
-t_i = now + i * SAMPLE_SECONDS
-경계를 넘으면  t_i' = started_at + ((t_i - started_at) mod current_iteration_duration)
+```rust
+pub fn fold_animation_sample_time(started_at, iteration, alternating, time) -> f64
 ```
 
-`get_value_map_for_active_animations(time)` 는 `started_at` 기준으로 progress 를 계산하므로
-★질의 시각만 접으면 stylo 를 건드리지 않는다.★ 필요한 필드는 전부 `pub` 다:
-`Animation::{started_at, duration, direction, current_direction, iteration_state, fill_mode}`
-와 `current_iteration_duration()`(`animation.rs:707`).
+`paint_animation.rs` 가 애니메이션마다 이것을 거쳐 질의한다. ★접기가 애니메이션
+단위★인 것이 핵심이다 — 한 요소에 주기가 다른 애니메이션이 여럿 걸릴 수 있으므로 세트
+단위 API(`get_value_map_for_active_animations`, 모두에게 같은 `now`)로는 안 된다.
+그래서 stylo 의 `get_property_declaration_at_time` 을 ★`pub` 한 단어★만 열었다(동작 불변).
 
-적용 조건:
-- `KeyframesIterationState::Infinite` — 항상 접는다
-- `Finite(current, max)` — 남은 반복 수만큼만 접고 그 뒤는 지금처럼 클램프(= `fill` 동작)
-- `direction` 이 `Alternate`/`AlternateReverse` — 접을 때 방향을 교대시킨다. ★그 경계는
-  불연속이 아니다★(값이 되돌아온다) → Task 2 의 break 를 기록하지 않는다
-- `gfx_paint_side_animations_enabled` 가 꺼져 있으면 기존 조기 반환 그대로
+★`alternating` 을 시간 거울반사로 정확히 다룬다 — 사본도 방향 뒤집기도 없다.★
+역방향 반복의 값은 `keyframe(ease(1 − τ/주기))` 이고, 0번째 반복을 `주기 − τ` 에 질의한
+값이 `keyframe(ease((주기−τ)/주기))` 로 ***easing 까지 같다***(Web Animations 가 directed
+progress 를 뒤집은 뒤 easing 을 적용한다). `alternate` 는 0번째가 정방향,
+`alternate-reverse` 는 0번째가 역방향이라 ★둘 다 홀수 번째 반복에서만 거울반사★하면 맞는다.
 
-★한 요소에 애니메이션이 여럿 겹칠 수 있다.★ `get_value_map_for_active_animations` 는
-세트 전체를 합성하므로, 접기를 **애니메이션별**로 해야 한다 — 이 지점이 이 Task 의 유일한
-구조적 난점이고, 세트 단위 API 로는 부족하면 애니메이션별 질의 경로를 추가해야 한다.
-★착수 전에 그 API 모양을 먼저 확정할 것.★
+★`Infinite` 에만 접는다.★ `Finite` 는 남은 반복 수와 비정수 마지막 반복
+(`current_iteration_end_progress`)을 함께 따져야 하고, 끝난 뒤의 클램프는 `fill` 의 정의된
+동작이다 — 지금 동작을 그대로 둔다. 보고된 결함은 무한 반복이라 덮인다.
 
-### Task 2 — 불연속을 세그먼트 경계에 정확히 놓는다
+### 4-2. 시험 (`cargo test -p servo-paint-api --release --lib`)
 
-Task 1 이 ***진짜 점프***를 샘플 열에 만든다. 그 위치를 ★우리가 정확히 안다★(접은 인덱스)
-— 휴리스틱이 필요 없다.
+★`cargo test -p servo-layout` 은 이 환경에서 못 돈다★ — 테스트 프로파일이 `aws-lc-sys`
+(NASM 필요)를 끌어오고 NASM 이 없다. 그래서 순수 산수를 `servo-paint-api` 로 뒀다. 리포가
+`wall_layout` 을 같은 이유로 거기 승격한 것과 같은 패턴이다(CLAUDE.md).
 
-`from_samples` 에 `breaks: &[usize]`(새 반복이 시작하는 샘플 인덱스)를 더하고:
-- 병합이 break 를 **넘지 않게** 한다
-- break 에서 맞닿은 두 세그먼트를 낸다: 앞 세그먼트 `end = break*step`(값 A),
-  뒤 세그먼트 `start = break*step`(값 B)
-- `f32` 판과 `LayoutTransform` 판 ★둘 다★(알고리즘이 동일하다)
+여섯 개: 경계 이전 무개입 / normal 한 주기 접기 / ★alternate 홀수만 거울반사★ /
+★alternate 경계 연속 + normal 경계 불연속★ / 주기 0·음수·NaN 무개입 / 시작 앞 시각 무개입.
 
-★`Steps` 도, 크기 임계도 쓰지 않는다.★ 3 절 2·3 항이 그 둘을 각각 기각했다.
+★이 트리는 release 전용이다.★ `debug` 로 검사하면 네이티브 의존성을 처음부터 빌드하려
+들고 그 전제(NASM, `make`)가 없다.
 
-### Task 3 — 테스트
+---
 
-먼저 ★`replay` 가 `segment.easing.ease(raw)` 를 거치게 고친다★(3 절 부수 발견). 그러지
-않으면 아래 (d)가 통과해 버린다.
+## 5. 남은 것 — Task 2, ★경계의 정확한 절단★
 
-| # | 테스트 | 못 박는 것 |
+Task 1 이 `Normal`/`Reverse` 에서 ***진짜 점프***를 샘플 열에 만든다. `from_samples` 의
+탐욕 병합이 그 점프를 ★한 스텝 선형 스윕★으로 바꾸므로 ***한 프레임 동안 잘못된 중간
+위치***가 나온다. 250ms 정지가 한 프레임 위치 오차로 줄어드는 ★엄격한 개선★이고
+`alternate` 에는 점프가 없지만, 정확하지는 않다.
+
+★경계는 샘플 색인으로 자를 수 없다 — 경계 시각이 1/60 격자에 맞지 않는다.★ 그러므로
+`from_samples` 가 받아야 하는 것은 ***경계 시각***(런웨이 기준 초)이고, 각 경계에서:
+
+- 앞 세그먼트: `end = 경계시각`, `to = 그 반복의 끝 값`
+- 뒤 세그먼트: `start = 경계시각`, `from = 다음 반복의 시작 값`
+
+맞닿은 두 세그먼트가 점프를 ★정확히★ 표현한다 — `find_segment` 가 `elapsed < end` 로
+고르므로 경계 직전은 앞, 경계부터는 뒤가 선택된다. ★`Steps` easing 도, 크기 임계도
+쓰지 않는다.★ 경계의 양쪽 값은 스타일 질의 두 번으로 얻는다(경계당, 애니메이션당).
+
+함께 할 것: ★테스트 헬퍼 `replay` 가 `segment.easing.ease` 를 부르지 않는다★
+(`display_list.rs`) — 선형 보간만 해서 easing 회귀를 못 잡는다.
+
+### 5-1. ★폐기된 제안과 그 이유★ (반복 방지)
+
+| # | 제안/기구 | 무엇이 죽였나 |
 |---|---|---|
-| (a) | 경계 너머 샘플이 끝 키프레임에 머문다 | Task 0-b, 전제 |
-| (b) | 접은 샘플 run 이 ★지평 전체★를 덮는다(평탄 꼬리가 없다) | Task 1 |
-| (c) | break 가 있는 run → 점프가 정확히 `break*step` 에 있고 ★중간 값이 하나도 없다★ | Task 2 |
-| (d) | 곡선(smoothstep·회전) run → break 0 개, 세그먼트 수가 지금과 같다 | ★3 절 2 항의 회귀 방지★ |
-| (e) | `alternate` → break 0 개, 값이 연속 | Task 1 의 방향 교대 |
-| (f) | `Finite` 이 끝난 뒤 → 지금처럼 클램프(fill) | 회귀 방지 |
+| 1 | 브리지 세그먼트의 easing 을 `Steps(1,false)` 로 | 그 브리지가 **존재하지 않았다** — 클램프 때문에 샘플에 점프가 없었다 |
+| 2 | `span == 1` 을 불연속 판별자로 | 허용오차(f32 1/2048, transform 0.01px) 밖인 ***모든 곡선 구간***이 1 스텝이다. 그대로면 비선형 애니메이션 전체가 60Hz 계단으로 퇴행한다 |
+| 3 | "무한 반복 패턴 자체의 성질" | Chrome 이 같은 페이지에서 안 그런다 |
+| 4 | 반복 경계 → ★`divisor=1` 음성으로 기각★ | ★오독이었다★ — divisor 는 재기준 빈도만 바꾸고 보간은 켜져 있다. 그 음성이 반증한 것은 "재기준을 기다린다" 하나뿐이고, 증상 A 는 실제로 사라졌다(증상 둘을 구분하지 못했다) |
+| 5 | 커밋 토폴로지(디바이스당 `IDCompositionDevice`) | DWM 합성 격자는 하나이고 규칙적이라, 일정하게 늦은 커밋은 ★오프셋이고 저더가 아니다.★ 분산을 보일 책임이 가설 쪽에 있고 리포 수치가 지지하지 않는다(운용 설정에서 커밋 이상치 런당 9 건) |
+| 6 | `overflow: hidden` 스크롤 프레임 | `clip=all` 음성 |
+| 7 | "띠가 비는 구간의 전이" | `marquee=4` 음성(그 구현은 띠끼리 위상을 그대로 두므로 다섯이 여전히 동시에 wrap 한다 — 변별력이 없었다) |
+| 8 | picture cache 무효화 누락 | `alternate` 가 값 연속인데도 발생시켜, 위치 점프 계열 전체를 배제 |
 
-게이트: `cargo test -p servo-paint-api --lib`, `cargo test -p servo-paint --lib`,
-`cargo check -p servo --example winit_wall --features media-gstreamer,no-wgl,webgpu`.
-
-### Task 4 — 주석 정정
-
-`paint_animation.rs:55-58` 과 `horizon_ms` doc 이 "iteration 은 이미 구현한 코드가
-처리한다" / "스크립트 블록이 런웨이를 자른다" 고 적는다. ★반복 경계가 스크립트 블록 없이도
-런웨이를 자른다★를 적는다. 커밋 메시지에 Task 0-a 의 전후 측정을 남긴다(리포 관례).
+★교훈:★ 4·7 은 기구를 ***증상 하나로 시험하고 전체를 닫은*** 것이다. 증상이 둘 이상일 수
+있다는 것을 먼저 확인해야 한다("전 띠가 같이 멈칫하나?" 가 그 질문이었고, 그것을 묻는 데
+며칠이 걸렸다).
 
 ---
 
-## 5. 장기 대안 (지금 하지 않는다)
+## 6. 장기 대안
 
-Chromium 방식: `PaintAnimationProperty` 에 `period`/`iterations`/`direction` 을 실어 보내고
-paint 가 `elapsed % period` 로 감는다. 재샘플이 사라지므로 Task 1·2 가 통째로 불필요해지고
-런웨이 개념 자체가 없어진다. ★와이어 포맷 확장이라 더 큰 변경★이고, Task 1·2 로 증상이
-해소되는지 먼저 본다.
-
----
-
-## 6. 내가 지어낸 기구 셋, 전부 반증
-
-| # | 기구 | 무엇이 죽였나 |
-|---|---|---|
-| 1 | 브리지 세그먼트의 유령 위치 | stylo 클램프(2-1) — 샘플에 점프가 없다 |
-| 2 | "무한 반복 패턴 자체의 성질" | Chrome 이 같은 페이지에서 안 그런다 |
-| 3 | 런웨이가 경계에서 끊겨 스크립트 틱 대기 | ★`divisor=1` 음성★ |
-
-셋 모두 ★코드 판독으로 기구를 세운 것★이 공통 원인이다. 리포 메모리가 적어 둔 규칙
-(`stop-on-design-overturning-review`, `search-history-before-redesigning`)대로, 다음부터는
-판별 관측이 먼저다.
+Chromium 방식(3-4 절): `PaintAnimationProperty` 에 `period`/`iterations`/`direction` 을
+실어 보내고 paint 가 `elapsed % period` 로 감는다. 재샘플이 사라지므로 Task 1·2 가 통째로
+불필요해지고 런웨이 개념 자체가 없어진다. ★와이어 포맷 확장이라 더 큰 변경★이다.
 
 ---
 
-## 7. 새 선두 가설 — ★리포에 이미 기록되어 있다★
+## 7. 검증
 
-`tests/html/wall_anim_jitter_probe.html` 의 주석(2026-09, `log_ani_debug_03/18`):
+★개발 장비 시험(기본 설정 = divisor 15, FrameTime on, enabled true):★
 
-> 키프레임 안에 불연속(offset w -> w+1e-6)을 박아 위상을 만들었다 — ★CSS 쪽에는 없는
-> 잔상이 WAAPI 객체마다 생겼다.★ ★큰 transform 점프가 떠난 자리의 picture cache 를
-> 무효화하지 않는 것으로 보이고, Edge/Chrome 에서는 나지 않는다.★
+```
+ticker_slice_probe.html?speed=10               A·B 모두 사라져야 한다
+ticker_slice_probe.html?speed=10&dir=alternate 양 끝 모두 깨끗해야 한다
+```
 
-(b)의 성질과 전부 맞는다:
-
-| (b) 의 성질 | 이 기록 |
-|---|---|
-| Chrome 무영향 | ★"Edge/Chrome 에서는 나지 않는다"★ |
-| `divisor` 무관 | WebRender 무효화 문제이고 디스플레이 리스트 빈도와 무관 |
-| 사이클당 1 회 | 큰 점프가 사이클당 한 번이다(`to` → `from`) |
-| 감쇠 없음 | 캐시 워밍이 아니라 무효화 누락 |
-| 클럭·커밋·배리어 무관 | 페이싱보다 아래 층 |
-
-★그리고 2026-10-29 의 두 관측이 이것을 더 좁힌다:★
-
-- `phase=spread` 로 다섯 띠의 경계를 엇갈리면 ★judder 가 사라진다★(첫 실행 제외).
-  즉 경계 작업은 ***애니메이션 단위***이고, `phase=same` 에서 다섯이 한 프레임에 겹친
-  것이다.
-- `spread` 에서 새로 보인 것: 글자가 오른쪽 끝에서부터 들어오지 않고 ★일부가 1 프레임
-  사이에 갑자기 등장★한다. `phase=same` 에서도 간헐적으로 있었다. ★이것은 타이밍 끊김이
-  아니라 "덜 그려졌다" 의 모양이다★ — 위 잔상 기록과 같다.
-
-### 다음 판별
-
-1. ★`?marquee=4`★ — 2026-10-29 에 `ticker_slice_probe.html` 에 넣었다(커밋 `97dacad6294`).
-   같은 글자를 네 벌 겹쳐 음수 delay 로 흩으므로 ★띠가 비는 구간이 사라진다★. 운영자가
-   `wall_anim_jitter_probe.html`(marquee)은 개발 환경에서 judder 가 없다고 확인했다. 같은
-   페이지 안에서 벌 수만 바꾸는 A/B 다.
-2. marquee 에서도 (b)가 남으면 "띠가 비는 전이" 가설이 죽고, 남은 것은 ★점프 자체★다.
-   그때는 `log_ani_debug_03/18` 의 런을 다시 찾아 그때 무엇을 쟀는지부터 읽는다.
-3. 기구가 picture cache 무효화로 좁혀지면 ★범위가 WebRender 쪽★이다 —
-   `vendor_local/webrender` 가 이미 동작 변경 포크이므로 손댈 자리가 있다
-   (`vendored-webrender-is-a-behavior-fork`).
-
----
-
-## 8. 범위 주의
-
-이 결함이 ★4 타일 벽 judder 의 주범인지★는 별개 문제다. 벽에서는 타일이 넷이고 진입
-가장자리 쪽(1·3)에서 관찰됐으므로, (b) 를 고친 뒤 벽을 다시 봐야 한다.
+벽에서는 리플로 비용이 개발 장비보다 무거우므로 따로 확인한다. 참고로
+`gfx_paint_side_animations_enabled=false` 는 ★완화책이지만 공짜가 아니다★ — paint 가
+재생하지 않는 애니메이션은 divisor 와 무관하게 매 프레임 틱하므로(`prefs.rs:535`) 리플로가
+초당 122 로 돌아간다(`log_ani_perf/13`).

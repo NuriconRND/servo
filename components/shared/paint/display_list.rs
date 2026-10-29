@@ -956,6 +956,49 @@ pub fn paint_animation_binding_key<T>(
     PropertyBindingKey::new(((pipeline_id.0 as u64) << 32) | uid as u64)
 }
 
+/// 반복 경계 너머의 애니메이션 질의 시각을 ★현재 반복 안으로 접는다.★
+///
+/// ★왜 필요한가.★ stylo 의 샘플러는 `progress` 를 현재 반복에 클램프하므로
+/// (`third_party/stylo/style/servo/animation.rs`, `total_progress >= 1.0` 이면 끝 키프레임을
+/// 그대로 적용한다) 미래 시각을 그냥 질의하면 ***다음 반복으로 감기지 않고 끝 값에
+/// 평탄해진다***. 그러면 paint-side 런웨이가 지평이 아니라 ***경계에서*** 끝나고, paint 는
+/// 다음 디스플레이 리스트까지 마지막 값을 붙든다. `started_at` 을 전진시키는 `iterate()` 는
+/// `&mut` 라 스크립트 틱에서만 불리고, 샘플링은 `&DocumentAnimationSet` 만 들고 있어
+/// 일으킬 수 없다 -- 그래서 ***질의 시각 쪽을*** 접는다.
+///
+/// ★`alternating` 을 시간 거울반사로 정확히 다룬다 -- 사본도 방향 뒤집기도 필요 없다.★
+/// 역방향 반복의 값은 `keyframe(ease(1 - τ/주기))` 이고, 0번째 반복을 `주기 - τ` 에 질의한
+/// 값이 `keyframe(ease((주기-τ)/주기))` 로 ***easing 까지 같다***. Web Animations 가 directed
+/// progress 를 뒤집은 뒤 easing 을 적용하기 때문이다. `alternate` 는 0번째가 정방향이고
+/// `alternate-reverse` 는 0번째가 역방향이라, 둘 다 ★홀수 번째 반복에서만 거울반사★하면
+/// 맞는다. `normal`/`reverse` 는 모든 반복이 같으므로 거울반사가 없다.
+///
+/// 실측 근거는 호출자(`components/layout/display_list/paint_animation.rs`)의 모듈 주석에 있다.
+pub fn fold_animation_sample_time(
+    started_at: f64,
+    iteration: f64,
+    alternating: bool,
+    time: f64,
+) -> f64 {
+    // 주기가 0 이거나 비정상이면 접을 수 없다. 샘플 시각이 시작보다 앞이면 `elapsed` 가
+    // 음수라 아래 조건에서 걸러지고, 그때는 stylo 가 이미 0 으로 클램프한다.
+    if !(iteration > 0.0) {
+        return time;
+    }
+    let elapsed = time - started_at;
+    if elapsed < iteration {
+        return time;
+    }
+    let index = (elapsed / iteration).floor();
+    let local = elapsed - index * iteration;
+    let folded = if alternating && (index as i64) % 2 != 0 {
+        iteration - local
+    } else {
+        local
+    };
+    started_at + folded
+}
+
 impl PaintAnimationSegment<f32> {
     /// Two sampled values closer than this count as the same value.
     pub const EPSILON: f32 = 1.0 / 2048.0;
@@ -1296,6 +1339,72 @@ mod promote_tests {
 #[cfg(test)]
 mod paint_animation_tests {
     use super::*;
+
+    /// 주기 1 초, 0 에서 시작. 경계 이전은 ★손대지 않는다★ -- 접기는 stylo 가 클램프를
+    /// 시작하는 지점부터만 개입해야 한다.
+    #[test]
+    fn a_time_before_the_first_boundary_is_untouched() {
+        for time in [0.0, 0.25, 0.5, 0.999] {
+            assert_eq!(fold_animation_sample_time(0.0, 1.0, false, time), time);
+            assert_eq!(fold_animation_sample_time(0.0, 1.0, true, time), time);
+        }
+    }
+
+    /// ★normal 은 모든 반복이 같으므로 한 주기로 접는다.★
+    #[test]
+    fn normal_folds_every_iteration_onto_the_first() {
+        assert!((fold_animation_sample_time(0.0, 1.0, false, 2.25) - 0.25).abs() < 1e-9);
+        assert!((fold_animation_sample_time(0.0, 1.0, false, 7.75) - 0.75).abs() < 1e-9);
+        // 시작점이 0 이 아니어도 같다.
+        assert!((fold_animation_sample_time(10.0, 2.0, false, 15.5) - 11.5).abs() < 1e-9);
+    }
+
+    /// ★alternate 는 홀수 번째 반복만 거울반사한다.★
+    #[test]
+    fn alternate_mirrors_odd_iterations_only() {
+        // 1번째 반복(홀수): local 0.25 -> 0.75 로 뒤집힌다.
+        assert!((fold_animation_sample_time(0.0, 1.0, true, 1.25) - 0.75).abs() < 1e-9);
+        // 2번째 반복(짝수): 그대로.
+        assert!((fold_animation_sample_time(0.0, 1.0, true, 2.25) - 0.25).abs() < 1e-9);
+        // 3번째(홀수) 다시.
+        assert!((fold_animation_sample_time(0.0, 1.0, true, 3.1) - 0.9).abs() < 1e-9);
+    }
+
+    /// ★alternate 의 경계는 연속이다 -- 그래서 점프 표현이 필요 없다.★ 반대로 normal 의
+    /// 경계는 ***불연속이고***, 그 한 프레임을 정확히 자르는 것이 남은 작업이다(경계 시각은
+    /// 1/60 격자에 맞지 않으므로 샘플 색인으로는 자를 수 없다).
+    #[test]
+    fn alternate_is_continuous_at_the_boundary_and_normal_is_not() {
+        let eps = 1e-6;
+        let before = fold_animation_sample_time(0.0, 1.0, true, 1.0 - eps);
+        let after = fold_animation_sample_time(0.0, 1.0, true, 1.0 + eps);
+        assert!(
+            (before - after).abs() < 1e-5,
+            "alternate 경계가 연속이어야 한다: {before} 대 {after}"
+        );
+
+        let before = fold_animation_sample_time(0.0, 1.0, false, 1.0 - eps);
+        let after = fold_animation_sample_time(0.0, 1.0, false, 1.0 + eps);
+        assert!(
+            (before - after).abs() > 0.5,
+            "normal 경계는 불연속이어야 한다: {before} 대 {after}"
+        );
+    }
+
+    /// 주기를 모르는 경우(0 이나 음수, NaN)는 ★건드리지 않는다★ -- 나누면 무한이 된다.
+    #[test]
+    fn a_degenerate_iteration_is_left_alone() {
+        assert_eq!(fold_animation_sample_time(0.0, 0.0, false, 5.0), 5.0);
+        assert_eq!(fold_animation_sample_time(0.0, -1.0, true, 5.0), 5.0);
+        assert_eq!(fold_animation_sample_time(0.0, f64::NAN, false, 5.0), 5.0);
+    }
+
+    /// 시작보다 앞선 시각은 그대로 둔다(stylo 가 0 으로 클램프한다).
+    #[test]
+    fn a_time_before_the_start_is_left_alone() {
+        assert_eq!(fold_animation_sample_time(10.0, 1.0, false, 9.5), 9.5);
+        assert_eq!(fold_animation_sample_time(10.0, 1.0, true, 0.0), 0.0);
+    }
 
     fn replay(segments: &[PaintAnimationSegment<f32>], step: f64, count: usize) -> Vec<f32> {
         (0..count)

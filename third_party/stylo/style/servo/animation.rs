@@ -859,7 +859,11 @@ impl Animation {
 
     /// Fill in an `AnimationValueMap` with values calculated from this animation at
     /// the given time value.
-    fn get_property_declaration_at_time(&self, now: f64, map: &mut AnimationValueMap) {
+    /// ★`pub`: layout 의 paint-side 샘플링이 애니메이션마다 질의 시각을 달리 접는다★
+    /// (`components/layout/display_list/paint_animation.rs` 의 `folded_sample_time`).
+    /// 세트 단위 `get_value_map_for_active_animations` 는 모든 애니메이션에 같은 시각을
+    /// 주므로 그 용도에는 쓸 수 없다. 동작은 바뀌지 않았고 가시성만 열었다.
+    pub fn get_property_declaration_at_time(&self, now: f64, map: &mut AnimationValueMap) {
         if self.computed_steps.is_empty() {
             // Nothing to do.
             return;
