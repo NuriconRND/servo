@@ -52,6 +52,22 @@
     fixed  = 1 | 0  셸 position fixed(기본) / absolute
     raf    = 0..N   빈 rAF 루프 수(기본 0). 씬 시계의 깨어남만 흉내 낸다(DOM은 안 바꾼다)
     text, font, color  글자(기본 "Nuricon SDWall 테스트중", 맑은 고딕, #ff0000)
+    variants= 1  ★다섯 띠를 단일 변수 제거 변형으로 만든다★(기본 끔).
+             띠 0 은 대조군(지금 동작 그대로)이고 나머지 넷은 ***차이 하나씩만*** 되돌린다.
+             차이 목록은 wall_anim_jitter_probe.html(★같은 바이너리에서 저더 없음★)과의
+             비교에서 나왔다:
+               1 조상 overflow 상자 4 개 제거 (channel/board/region/caption)
+                 -> jitter probe 의 `.lane`+`.mover` 구조가 된다. ★셸은 남는다★ -- 셸은
+                    다섯 띠가 공유하므로 띠별로 가를 수 없다. 셸까지 빼려면 shellov=0.
+               2 `will-change: transform` 추가 (jitter probe 의 `.mover` 가 가진 것)
+               3 `translateX(x)` + top 을 px 로 고정 -> ★transform 의 퍼센트 y 제거★
+                 (지금은 `translate(x, -50%)` 이고 jitter probe 는 `translateX` 다)
+               4 띠 배경 불투명 (지금 기본은 bg=0 이라 rgba(...,0) = 완전 투명이다)
+             ★한 번의 실행으로 "어느 띠만 깨끗한가" 를 보면 그 변수가 원인이다.★
+             화면 위->아래 순서와 변형 번호의 대응은 우하단 범례에 찍는다.
+    shellov= 0  셸의 overflow 를 ★아예 없앤다★(기본은 clip 역할에 따라 hidden/clip).
+             `clip` 은 hidden<->clip 만 바꾸고 상자를 없애지는 못한다 -- jitter probe 에는
+             그 상자가 없으므로, 구조 차이를 끝까지 좁히려면 이것이 필요하다.
 
   ★예상 구조★ (페인터 하나 기준. 페인터마다 띠 셋을 본다 -- 43.75% 띠가 세로 이음매에 걸친다)
     arm           슬라이스   DCOMPBIND surfaces=   visuals/frames
@@ -150,6 +166,17 @@ const phase = q.get('phase') === 'spread' ? 'spread' : 'same';
 const marqueeRaw = Math.round(num(q.get('marquee') ?? '0', 0, 16, 0));
 /** 한 띠에 겹쳐 놓을 글자 벌 수. 1 이면 지금까지의 동작(한 벌)이다. */
 const copies = marqueeRaw >= 2 ? marqueeRaw : 1;
+const variants = q.get('variants') === '1';
+const shellOverflow = q.get('shellov') !== '0';
+
+/** 띠 i 가 되돌리는 차이 하나. 띠 0 은 대조군이다. */
+const VARIANTS = [
+  { key: 'control', label: '대조군 (지금 그대로)' },
+  { key: 'noboxes', label: '조상 overflow 상자 4개 제거' },
+  { key: 'willchange', label: 'will-change: transform 추가' },
+  { key: 'translatex', label: 'translateX (퍼센트 y 제거)' },
+  { key: 'opaque', label: '띠 배경 불투명' },
+];
 const fixed = q.get('fixed') !== '0';
 const rafLoops = Math.round(num(q.get('raf') ?? '0', 0, 16, 0));
 const text = q.get('text') || 'Nuricon SDWall 테스트중';
@@ -160,7 +187,8 @@ const cfg =
   'clip=' + clipArg + ' roles=' + (clipRoles.join('+') || '-') +
   ' bg=' + bgArg + ' bgc=' + bgColor + ' fs=' + fsArg + ' speed=' + speed +
   ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops +
-  ' marquee=' + (copies > 1 ? copies : 0);
+  ' marquee=' + (copies > 1 ? copies : 0) +
+  ' variants=' + (variants ? 1 : 0) + ' shellov=' + (shellOverflow ? 1 : 0);
 document.title = 'ECLIP ' + cfg;
 if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
 
@@ -177,7 +205,10 @@ function div(cls, style, parent) {
 
 // --- DOM. 바깥에서 안쪽 순서이고, 저장본의 인라인 스타일 값을 그대로 쓴다. ---
 const root = document.getElementById('root');
-const shell = div('shell ' + (fixed ? '' : 'unfixed ') + ov('shell'), null, root);
+// ★shellov=0 이면 셸에 overflow 를 붙이지 않는다★ -- `clip` 은 hidden<->clip 만 바꾸고
+// 상자를 없애지 못한다. jitter probe 에는 이 상자가 없다.
+const shell = div(
+  'shell ' + (fixed ? '' : 'unfixed ') + (shellOverflow ? ov('shell') : ''), null, root);
 const tv = div('abs', 'left: 0%; top: 0%; width: 100%; height: 100%;', shell);
 div('abs inset0', 'z-index: 0;', tv);                       // data-layer="leaving" (비어 있다)
 const current = div('abs inset0', 'z-index: 1;', tv);       // data-layer="current"
@@ -187,14 +218,27 @@ const spans = [];
 const spanBand = [];
 /** `spans[i]` 가 그 띠의 몇 번째 벌인지. marquee 의 위상이 이것으로 센다. */
 const spanCopy = [];
+/** `spans[i]` 가 속한 띠의 변형 key. `variants` 가 꺼져 있으면 전부 'control' 이다. */
+const spanVariant = [];
 BANDS.forEach(([top, z], bandIndex) => {
+  const variant = variants ? VARIANTS[bandIndex % VARIANTS.length].key : 'control';
   const place = 'left: 0%; top: ' + top + '%; width: 100%; height: 12.5%; ';
-  const channel = div('abs ' + ov('channel'),
-    place + 'z-index: ' + z + ';' + (seeThrough ? '' : ' background-color: #000;'), current);
-  const board = div('abs inset0', null, channel);           // data-board
-  const region = div('abs ' + ov('region'),
-    'left: 0%; top: 0%; width: 100%; height: 100%; opacity: 1; z-index: 9;', board);
-  const band = div('band ' + ov('band'), 'background-color: ' + tickerBg + ';', region);
+  let band;
+  if (variant === 'noboxes') {
+    // ★jitter probe 의 `.lane` 과 같은 구조★ -- overflow 상자 없이 자리만 잡는 하나.
+    // channel/board/region/band/caption 다섯 겹이 이 한 겹으로 줄어든다.
+    band = div('abs', place + 'z-index: ' + z + '; background-color: ' + tickerBg + ';',
+      current);
+  } else {
+    const channel = div('abs ' + ov('channel'),
+      place + 'z-index: ' + z + ';' + (seeThrough ? '' : ' background-color: #000;'), current);
+    const board = div('abs inset0', null, channel);           // data-board
+    const region = div('abs ' + ov('region'),
+      'left: 0%; top: 0%; width: 100%; height: 100%; opacity: 1; z-index: 9;', board);
+    // 'opaque' 변형만 띠 배경을 불투명하게 둔다(기본 bg=0 은 완전 투명이다).
+    band = div('band ' + ov('band'),
+      'background-color: ' + (variant === 'opaque' ? bgColor : tickerBg) + ';', region);
+  }
   // ★marquee 면 같은 글자를 `copies` 벌 겹쳐 놓는다.★ 위상은 아래 `startAll` 이 음수
   // delay 로 준다 -- 키프레임에 불연속을 박는 쪽은 wall_anim_jitter_probe.html 에서
   // 잔상이 나서 버린 길이다(그 파일 주석).
@@ -203,15 +247,35 @@ BANDS.forEach(([top, z], bandIndex) => {
     span.className = 'text';
     span.setAttribute('style',
       'transform: translate(0px, -50%); font-family: ' + font + '; color: ' + color + ';');
+    if (variant === 'willchange') {
+      span.style.willChange = 'transform';
+    }
     span.textContent = text;
     band.appendChild(span);
     spans.push(span);
     spanBand.push(bandIndex);
     spanCopy.push(copy);
+    spanVariant.push(variant);
   }
-  // OutputTv의 이름 덮개. 내용은 없지만 overflow 상자라서 그대로 둔다.
-  div('noev abs ' + ov('caption'), place + 'z-index: ' + (z + 1) + ';', current);
+  if (variant !== 'noboxes') {
+    // OutputTv의 이름 덮개. 내용은 없지만 overflow 상자라서 그대로 둔다.
+    div('noev abs ' + ov('caption'), place + 'z-index: ' + (z + 1) + ';', current);
+  }
 });
+
+// ★범례★ -- 화면 위에서 아래 순서로 어느 띠가 어느 변형인지. 띠 구조를 건드리지 않도록
+// 셸 **밖**(root 의 형제)에 둔다.
+if (variants) {
+  const rows = BANDS.map(([top], index) => ({ top, index }))
+    .sort((a, b) => a.top - b.top)
+    .map((entry) => 'top ' + String(entry.top).padStart(5) + '%  ' +
+      entry.index + ' · ' + VARIANTS[entry.index % VARIANTS.length].label);
+  const legend = div('noev',
+    'position: fixed; right: 4px; bottom: 4px; z-index: 99999; white-space: pre; ' +
+    'font: 13px/1.5 Consolas, monospace; color: #9f9; background: rgba(0,0,0,0.8); ' +
+    'padding: 5px 8px;', root);
+  legend.textContent = 'ECLIP variants\n' + rows.join('\n');
+}
 
 // --- 움직임. ScrollingText와 같은 계산이다. ---
 const hasWaapi = typeof spans[0].animate === 'function';
@@ -228,7 +292,15 @@ function startAll() {
     span.style.fontSize = fs + 'px';
     const from = box.clientWidth;
     const to = -span.offsetWidth;
-    const at = (v) => 'translate(' + v + 'px, -50%)';
+    // ★'translatex' 변형은 transform 에서 퍼센트 y 를 없앤다★ -- top 을 px 로 고정하고
+    // translateX 만 움직인다. jitter probe 의 `.mover` 가 그 형태다.
+    let at;
+    if (spanVariant[i] === 'translatex') {
+      span.style.top = Math.round((box.clientHeight - span.offsetHeight) / 2) + 'px';
+      at = (v) => 'translateX(' + v + 'px)';
+    } else {
+      at = (v) => 'translate(' + v + 'px, -50%)';
+    }
     const opts = { duration: dur, iterations: Infinity, easing: 'linear' };
     // ★위상이 둘 더해진다.★ `phase=spread` 는 띠끼리, marquee 는 같은 띠의 벌끼리.
     // ***전에는 `spread` 가 평평한 색인 `i` 를 썼다*** -- 띠마다 한 벌일 때만 맞는 식이라
