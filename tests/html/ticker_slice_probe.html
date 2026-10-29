@@ -75,6 +75,16 @@
     iter   = inf | 1..999  반복 횟수(기본 inf)
              유한하면 경계가 ★딱 그 횟수만큼★ 일어난다. 1 이면 경계가 한 번뿐이므로
              "사이클당 한 번" 이 정말 경계에 묶여 있는지 횟수로 확인된다.
+    bh     = 퍼센트(기본 12.5)  띠/채널/덮개의 높이. ★창 크기를 건드리지 않고
+             WebRender 의 MIN_SCROLL_ROOT_SIZE(128 레이아웃 px) 문턱을 건너기 위한 것이다.★
+             스크롤 프레임이 picture-cache 슬라이스 루트가 되려면 viewport_rect 의 가로와
+             세로가 둘 다 128 을 넘어야 한다(vendor_local/webrender/src/spatial_tree.rs:77).
+             1080 높이에서 12.5% = 135 CSS px(문턱 위), 11% = 118.8(아래)이다.
+             ★타일 세로를 줄여 시험하면 안 된다★ -- 창이 모니터를 덮지 않게 되어 Windows
+             present 경로가 통째로 바뀐다(Independent Flip -> Composed Flip). 그래서 창은
+             그대로 두고 CSS 높이만 바꾼다.
+             ★fs 를 함께 고정할 것★: 글자가 띠보다 높으면 상시 세로 오버플로가 생겨
+             가로와 무관하게 항상 자격을 얻는다(판정이 가로/세로 OR 이다).
     shellov= 0  셸의 overflow 를 ★아예 없앤다★(기본은 clip 역할에 따라 hidden/clip).
              `clip` 은 hidden<->clip 만 바꾸고 상자를 없애지는 못한다 -- jitter probe 에는
              그 상자가 없으므로, 구조 차이를 끝까지 좁히려면 이것이 필요하다.
@@ -182,6 +192,8 @@ const direction = DIRECTIONS.includes(dirArg) ? dirArg : 'normal';
 const iterArg = q.get('iter') || 'inf';
 /** 반복 횟수. `Infinity` 또는 1..999. */
 const iterations = iterArg === 'inf' ? Infinity : num(iterArg, 1, 999, Infinity);
+/** 띠/채널/덮개 높이(%). 기본 12.5 = 저장본 그대로. */
+const bandHeight = num(q.get('bh') ?? '12.5', 0.5, 100, 12.5);
 const variants = q.get('variants') === '1';
 const shellOverflow = q.get('shellov') !== '0';
 
@@ -205,7 +217,8 @@ const cfg =
   ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops +
   ' marquee=' + (copies > 1 ? copies : 0) +
   ' variants=' + (variants ? 1 : 0) + ' shellov=' + (shellOverflow ? 1 : 0) +
-  ' dir=' + direction + ' iter=' + (iterations === Infinity ? 'inf' : iterations);
+  ' dir=' + direction + ' iter=' + (iterations === Infinity ? 'inf' : iterations) +
+  ' bh=' + bandHeight;
 document.title = 'ECLIP ' + cfg;
 if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
 
@@ -239,7 +252,7 @@ const spanCopy = [];
 const spanVariant = [];
 BANDS.forEach(([top, z], bandIndex) => {
   const variant = variants ? VARIANTS[bandIndex % VARIANTS.length].key : 'control';
-  const place = 'left: 0%; top: ' + top + '%; width: 100%; height: 12.5%; ';
+  const place = 'left: 0%; top: ' + top + '%; width: 100%; height: ' + bandHeight + '%; ';
   let band;
   if (variant === 'noboxes') {
     // ★jitter probe 의 `.lane` 과 같은 구조★ -- overflow 상자 없이 자리만 잡는 하나.
