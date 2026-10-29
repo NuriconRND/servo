@@ -85,6 +85,17 @@
              그대로 두고 CSS 높이만 바꾼다.
              ★fs 를 함께 고정할 것★: 글자가 띠보다 높으면 상시 세로 오버플로가 생겨
              가로와 무관하게 항상 자격을 얻는다(판정이 가로/세로 OR 이다).
+    pin    = 1  띠마다 ★정적인 가로 초과분★을 하나 넣는다(기본 끔).
+             ★무엇을 위한 것인가★: 엔진 수정의 "최종 상태" 를 코드 없이 만들어 본다.
+             저더의 원인은 애니메이션되는 transform 이 띠의 scrollable_size 를
+             MIN_SCROLLABLE_AMOUNT(0.01) 문턱 위아래로 ***넘나들게*** 해서 picture-cache
+             슬라이스 루트 자격이 뒤집히는 것이다. 정적 초과분이 있으면 그 값이 ***상시
+             양수***라 자격이 고정된다 -- 설계가 택한 "항상 자격 있음" 방향과 같은 상태다.
+             ★깨끗하면서 느려지지도 않으면 그 방향이 측정으로 뒷받침된다.★
+             구현: 띠 안에 1px 높이 투명 상자를 width 200% 로 둔다. ***오른쪽***으로
+             뻗어야 한다 -- clip_wholly_unreachable_scrollable_overflow 가 LTR 에서
+             왼쪽/위 초과분은 걷어낸다. 글자의 이동거리(box.clientWidth)는 바뀌지 않고,
+             자기 overflow 속성이 없으므로 스크롤 프레임을 새로 만들지도 않는다.
     shellov= 0  셸의 overflow 를 ★아예 없앤다★(기본은 clip 역할에 따라 hidden/clip).
              `clip` 은 hidden<->clip 만 바꾸고 상자를 없애지는 못한다 -- jitter probe 에는
              그 상자가 없으므로, 구조 차이를 끝까지 좁히려면 이것이 필요하다.
@@ -194,6 +205,7 @@ const iterArg = q.get('iter') || 'inf';
 const iterations = iterArg === 'inf' ? Infinity : num(iterArg, 1, 999, Infinity);
 /** 띠/채널/덮개 높이(%). 기본 12.5 = 저장본 그대로. */
 const bandHeight = num(q.get('bh') ?? '12.5', 0.5, 100, 12.5);
+const pinOverflow = q.get('pin') === '1';
 const variants = q.get('variants') === '1';
 const shellOverflow = q.get('shellov') !== '0';
 
@@ -218,7 +230,7 @@ const cfg =
   ' marquee=' + (copies > 1 ? copies : 0) +
   ' variants=' + (variants ? 1 : 0) + ' shellov=' + (shellOverflow ? 1 : 0) +
   ' dir=' + direction + ' iter=' + (iterations === Infinity ? 'inf' : iterations) +
-  ' bh=' + bandHeight;
+  ' bh=' + bandHeight + ' pin=' + (pinOverflow ? 1 : 0);
 document.title = 'ECLIP ' + cfg;
 if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
 
@@ -268,6 +280,12 @@ BANDS.forEach(([top, z], bandIndex) => {
     // 'opaque' 변형만 띠 배경을 불투명하게 둔다(기본 bg=0 은 완전 투명이다).
     band = div('band ' + ov('band'),
       'background-color: ' + (variant === 'opaque' ? bgColor : tickerBg) + ';', region);
+  }
+  if (pinOverflow) {
+    // ★정적 가로 초과분.★ 상시 scrollable_size > 0 을 만들어 슬라이스 루트 자격을
+    // 고정한다. 오른쪽으로만 뻗는다(왼쪽/위 초과분은 엔진이 걷어낸다).
+    div('noev abs', 'left: 0; top: 0; width: 200%; height: 1px; background: transparent;',
+      band);
   }
   // ★marquee 면 같은 글자를 `copies` 벌 겹쳐 놓는다.★ 위상은 아래 `startAll` 이 음수
   // delay 로 준다 -- 키프레임에 불연속을 박는 쪽은 wall_anim_jitter_probe.html 에서
