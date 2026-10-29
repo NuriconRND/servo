@@ -40,6 +40,15 @@
     fs     = auto | px  글자 크기(기본 auto = 띠 높이 x 0.6, 벽에서 324px)
     speed  = 1..10  (기본 4 -> 6000ms)
     phase  = same | spread  same은 다섯이 같은 순간 출발(output과 같다), spread는 음수 delay로 1/5씩
+    marquee= 0 | 2..16  한 띠에 글자를 몇 벌 겹쳐 놓을지(기본 0 = 한 벌, 지금까지의 동작)
+             2 이상이면 ★wall_anim_jitter_probe.html 과 같은 marquee★ -- 같은 글자를 그만큼
+             복제해 음수 delay 로 1/N 위상씩 흩는다. 키프레임은 그대로 단조다.
+             ★무엇을 가르려는 것인가★: 한 벌이면 글자가 완전히 빠져나간 뒤 띠가 ***비는
+             구간***이 생기고, 그 직후 반복 경계에서 사이클당 한 번 judder 가 난다(2026-10-29
+             실측, 개발 장비에서도 speed=10 이면 육안). 여러 벌이면 띠가 비지 않으므로 그
+             전이가 사라진다. wall_anim_jitter_probe.html 의 주석이 같은 자리를 적는다 --
+             "큰 transform 점프가 떠난 자리의 picture cache 를 무효화하지 않는 것으로 보이고,
+             Edge/Chrome 에서는 나지 않는다"(log_ani_debug_03/18).
     fixed  = 1 | 0  셸 position fixed(기본) / absolute
     raf    = 0..N   빈 rAF 루프 수(기본 0). 씬 시계의 깨어남만 흉내 낸다(DOM은 안 바꾼다)
     text, font, color  글자(기본 "Nuricon SDWall 테스트중", 맑은 고딕, #ff0000)
@@ -138,6 +147,9 @@ const fsArg = q.get('fs') || 'auto';
 const fsPx = fsArg === 'auto' ? null : num(fsArg, 8, 2000, null);
 const speed = num(q.get('speed') ?? '4', 1, 10, 4);
 const phase = q.get('phase') === 'spread' ? 'spread' : 'same';
+const marqueeRaw = Math.round(num(q.get('marquee') ?? '0', 0, 16, 0));
+/** 한 띠에 겹쳐 놓을 글자 벌 수. 1 이면 지금까지의 동작(한 벌)이다. */
+const copies = marqueeRaw >= 2 ? marqueeRaw : 1;
 const fixed = q.get('fixed') !== '0';
 const rafLoops = Math.round(num(q.get('raf') ?? '0', 0, 16, 0));
 const text = q.get('text') || 'Nuricon SDWall 테스트중';
@@ -147,7 +159,8 @@ const color = q.get('color') || '#ff0000';
 const cfg =
   'clip=' + clipArg + ' roles=' + (clipRoles.join('+') || '-') +
   ' bg=' + bgArg + ' bgc=' + bgColor + ' fs=' + fsArg + ' speed=' + speed +
-  ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops;
+  ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops +
+  ' marquee=' + (copies > 1 ? copies : 0);
 document.title = 'ECLIP ' + cfg;
 if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
 
@@ -170,7 +183,11 @@ div('abs inset0', 'z-index: 0;', tv);                       // data-layer="leavi
 const current = div('abs inset0', 'z-index: 1;', tv);       // data-layer="current"
 
 const spans = [];
-for (const [top, z] of BANDS) {
+/** `spans[i]` 가 몇 번째 띠인지. `phase=spread` 의 위상이 이것으로 센다. */
+const spanBand = [];
+/** `spans[i]` 가 그 띠의 몇 번째 벌인지. marquee 의 위상이 이것으로 센다. */
+const spanCopy = [];
+BANDS.forEach(([top, z], bandIndex) => {
   const place = 'left: 0%; top: ' + top + '%; width: 100%; height: 12.5%; ';
   const channel = div('abs ' + ov('channel'),
     place + 'z-index: ' + z + ';' + (seeThrough ? '' : ' background-color: #000;'), current);
@@ -178,16 +195,23 @@ for (const [top, z] of BANDS) {
   const region = div('abs ' + ov('region'),
     'left: 0%; top: 0%; width: 100%; height: 100%; opacity: 1; z-index: 9;', board);
   const band = div('band ' + ov('band'), 'background-color: ' + tickerBg + ';', region);
-  const span = document.createElement('span');
-  span.className = 'text';
-  span.setAttribute('style',
-    'transform: translate(0px, -50%); font-family: ' + font + '; color: ' + color + ';');
-  span.textContent = text;
-  band.appendChild(span);
-  spans.push(span);
+  // ★marquee 면 같은 글자를 `copies` 벌 겹쳐 놓는다.★ 위상은 아래 `startAll` 이 음수
+  // delay 로 준다 -- 키프레임에 불연속을 박는 쪽은 wall_anim_jitter_probe.html 에서
+  // 잔상이 나서 버린 길이다(그 파일 주석).
+  for (let copy = 0; copy < copies; copy++) {
+    const span = document.createElement('span');
+    span.className = 'text';
+    span.setAttribute('style',
+      'transform: translate(0px, -50%); font-family: ' + font + '; color: ' + color + ';');
+    span.textContent = text;
+    band.appendChild(span);
+    spans.push(span);
+    spanBand.push(bandIndex);
+    spanCopy.push(copy);
+  }
   // OutputTv의 이름 덮개. 내용은 없지만 overflow 상자라서 그대로 둔다.
   div('noev abs ' + ov('caption'), place + 'z-index: ' + (z + 1) + ';', current);
-}
+});
 
 // --- 움직임. ScrollingText와 같은 계산이다. ---
 const hasWaapi = typeof spans[0].animate === 'function';
@@ -206,7 +230,13 @@ function startAll() {
     const to = -span.offsetWidth;
     const at = (v) => 'translate(' + v + 'px, -50%)';
     const opts = { duration: dur, iterations: Infinity, easing: 'linear' };
-    if (phase === 'spread') opts.delay = -Math.round((dur * i) / BANDS.length);
+    // ★위상이 둘 더해진다.★ `phase=spread` 는 띠끼리, marquee 는 같은 띠의 벌끼리.
+    // ***전에는 `spread` 가 평평한 색인 `i` 를 썼다*** -- 띠마다 한 벌일 때만 맞는 식이라
+    // marquee 와 같이 쓰면 틀린다. 그래서 띠 번호를 따로 들고 있다.
+    let delay = 0;
+    if (phase === 'spread') delay -= Math.round((dur * spanBand[i]) / BANDS.length);
+    if (copies > 1) delay -= Math.round((dur * spanCopy[i]) / copies);
+    if (delay !== 0) opts.delay = delay;
     handles.push(span.animate([{ transform: at(from) }, { transform: at(to) }], opts));
     if (i === 0) {
       first = 'box=' + box.clientWidth + 'x' + box.clientHeight + ' font=' + fs +
