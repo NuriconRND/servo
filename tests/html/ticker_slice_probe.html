@@ -65,6 +65,16 @@
                4 띠 배경 불투명 (지금 기본은 bg=0 이라 rgba(...,0) = 완전 투명이다)
              ★한 번의 실행으로 "어느 띠만 깨끗한가" 를 보면 그 변수가 원인이다.★
              화면 위->아래 순서와 변형 번호의 대응은 우하단 범례에 찍는다.
+    dir    = normal | alternate | reverse | alternate-reverse  (기본 normal)
+             ★왜 있나★: alternate 면 반복 경계는 ***그대로 일어나지만 값은 연속***이다
+             (끝에서 되돌아온다). 그래서 "주기적 judder" 가 ★경계의 기계 때문인지★
+             (complete/held/reset_dynamic_properties) ★위치 불연속 때문인지★ 가른다.
+               B 그대로  -> 경계의 기계
+               B 사라짐  -> 위치 불연속 자체가 방아쇠
+             `direction` 은 이 엔진에 들어가 있다(wall_anim_jitter_probe.html 주석 참고).
+    iter   = inf | 1..999  반복 횟수(기본 inf)
+             유한하면 경계가 ★딱 그 횟수만큼★ 일어난다. 1 이면 경계가 한 번뿐이므로
+             "사이클당 한 번" 이 정말 경계에 묶여 있는지 횟수로 확인된다.
     shellov= 0  셸의 overflow 를 ★아예 없앤다★(기본은 clip 역할에 따라 hidden/clip).
              `clip` 은 hidden<->clip 만 바꾸고 상자를 없애지는 못한다 -- jitter probe 에는
              그 상자가 없으므로, 구조 차이를 끝까지 좁히려면 이것이 필요하다.
@@ -166,6 +176,12 @@ const phase = q.get('phase') === 'spread' ? 'spread' : 'same';
 const marqueeRaw = Math.round(num(q.get('marquee') ?? '0', 0, 16, 0));
 /** 한 띠에 겹쳐 놓을 글자 벌 수. 1 이면 지금까지의 동작(한 벌)이다. */
 const copies = marqueeRaw >= 2 ? marqueeRaw : 1;
+const DIRECTIONS = ['normal', 'alternate', 'reverse', 'alternate-reverse'];
+const dirArg = q.get('dir') || 'normal';
+const direction = DIRECTIONS.includes(dirArg) ? dirArg : 'normal';
+const iterArg = q.get('iter') || 'inf';
+/** 반복 횟수. `Infinity` 또는 1..999. */
+const iterations = iterArg === 'inf' ? Infinity : num(iterArg, 1, 999, Infinity);
 const variants = q.get('variants') === '1';
 const shellOverflow = q.get('shellov') !== '0';
 
@@ -188,7 +204,8 @@ const cfg =
   ' bg=' + bgArg + ' bgc=' + bgColor + ' fs=' + fsArg + ' speed=' + speed +
   ' phase=' + phase + ' fixed=' + (fixed ? 1 : 0) + ' raf=' + rafLoops +
   ' marquee=' + (copies > 1 ? copies : 0) +
-  ' variants=' + (variants ? 1 : 0) + ' shellov=' + (shellOverflow ? 1 : 0);
+  ' variants=' + (variants ? 1 : 0) + ' shellov=' + (shellOverflow ? 1 : 0) +
+  ' dir=' + direction + ' iter=' + (iterations === Infinity ? 'inf' : iterations);
 document.title = 'ECLIP ' + cfg;
 if (unknownRoles.length) console.log('ECLIP warn unknown clip roles: ' + unknownRoles.join(','));
 
@@ -301,7 +318,13 @@ function startAll() {
     } else {
       at = (v) => 'translate(' + v + 'px, -50%)';
     }
-    const opts = { duration: dur, iterations: Infinity, easing: 'linear' };
+    const opts = { duration: dur, iterations: iterations, easing: 'linear' };
+    // ★normal 이 아닐 때만 보낸다★ -- 이 엔진의 `Element.animate` 는 사전에 선언된 옵션만
+    // 읽으므로(wall_anim_jitter_probe.html 주석), 기본값을 굳이 실어 보내서 그 경로를
+    // 시험 대상에 넣을 이유가 없다.
+    if (direction !== 'normal') {
+      opts.direction = direction;
+    }
     // ★위상이 둘 더해진다.★ `phase=spread` 는 띠끼리, marquee 는 같은 띠의 벌끼리.
     // ***전에는 `spread` 가 평평한 색인 `i` 를 썼다*** -- 띠마다 한 벌일 때만 맞는 식이라
     // marquee 와 같이 쓰면 틀린다. 그래서 띠 번호를 따로 들고 있다.
