@@ -17,6 +17,7 @@ use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnima
 use webrender_api::units::LayoutTransform;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
 
+use crate::paint_animation_mesh_probe;
 use crate::refresh_driver::TimerRefreshDriver;
 use crate::webview_renderer::WebViewRenderer;
 
@@ -174,6 +175,10 @@ pub(crate) struct PipelineAnimations {
     /// The last value of every paint animation that has stopped playing, kept so that a
     /// later transaction does not erase it. See [`HeldPaintValues`].
     held: RefCell<HeldPaintValues>,
+
+    /// 맞물림 프로브 전용 재사용 버퍼. ★프로브가 꺼져 있으면 비어 있고 할당도 없다★ --
+    /// 켜진 뒤에는 용량이 유지되므로 설치마다 할당하지 않는다.
+    mesh_buffers: RefCell<MeshBuffers>,
 }
 
 /// ***전송 한 번이 안 실린 키를 전부 지운다.***
@@ -192,6 +197,17 @@ pub(crate) struct PipelineAnimations {
 /// 밀면 페인터마다 초당 한 주기치 프레임이 더 나가고(`ActivePaintAnimation::running` 주석의
 /// 실측), 그건 비디오 표출을 다시 밀어내는 길이다. 대신 마지막 값을 여기 붙들어 두었다가
 /// **이미 나가기로 정해진 전송에만 얹는다** -- 추가 전송도, 추가 프레임도 없다.
+/// [`PipelineAnimations::install_paint_animations`] 가 맞물림을 잴 때 쓰는 버퍼 넷.
+///
+/// ★설치 경로에서 할당하지 않기 위해 들고 있는다.★ `clear` 는 용량을 남긴다.
+#[derive(Default)]
+struct MeshBuffers {
+    before_floats: Vec<PropertyValue<f32>>,
+    before_transforms: Vec<PropertyValue<LayoutTransform>>,
+    after_floats: Vec<PropertyValue<f32>>,
+    after_transforms: Vec<PropertyValue<LayoutTransform>>,
+}
+
 #[derive(Default)]
 struct HeldPaintValues {
     floats: Vec<PropertyValue<f32>>,
@@ -526,6 +542,22 @@ impl PipelineAnimations {
     pub(crate) fn install_paint_animations(&self, paint_animations: Vec<PaintAnimation>) {
         let received_at = Instant::now();
         let now = CrossProcessInstant::now();
+        // ★교체 **전**의 예측이 이 순간 내는 값을 먼저 뜬다.★ 프로브가 꺼져 있으면
+        // 이 블록 전체가 돌지 않는다.
+        let probing = paint_animation_mesh_probe::is_enabled();
+        if probing {
+            let mut buffers = self.mesh_buffers.borrow_mut();
+            buffers.before_floats.clear();
+            buffers.before_transforms.clear();
+            let MeshBuffers {
+                before_floats,
+                before_transforms,
+                ..
+            } = &mut *buffers;
+            for animation in self.paint.borrow().iter() {
+                animation.sample(received_at, before_floats, before_transforms);
+            }
+        }
         self.prune_held(&paint_animations);
         *self.paint.borrow_mut() = paint_animations
             .into_iter()
@@ -543,6 +575,57 @@ impl PipelineAnimations {
                 }
             })
             .collect();
+        if probing {
+            self.measure_mesh(received_at);
+        }
+    }
+
+    /// 교체 전후의 예측이 같은 순간에 내는 값을 비교해서 프로브에 쌓는다.
+    ///
+    /// ★교체 **후**에 불린다★ -- `self.paint` 는 이미 새 예측이고, 교체 전 값은
+    /// `mesh_buffers.before_*` 에 떠 두었다. 키가 양쪽에 다 있는 것만 비교할 수 있고,
+    /// 새로 나타난 키는 비교 대상이 없으므로 따로 센다.
+    fn measure_mesh(&self, received_at: Instant) {
+        let mut buffers = self.mesh_buffers.borrow_mut();
+        buffers.after_floats.clear();
+        buffers.after_transforms.clear();
+        let MeshBuffers {
+            before_floats,
+            before_transforms,
+            after_floats,
+            after_transforms,
+        } = &mut *buffers;
+        for animation in self.paint.borrow().iter() {
+            animation.sample(received_at, after_floats, after_transforms);
+        }
+
+        let mut carried = 0u64;
+        let mut fresh = 0u64;
+        for after in after_floats.iter() {
+            match before_floats.iter().find(|b| b.key.id == after.key.id) {
+                Some(before) => {
+                    carried += 1;
+                    paint_animation_mesh_probe::note_mesh_error((after.value - before.value).abs());
+                },
+                None => fresh += 1,
+            }
+        }
+        for after in after_transforms.iter() {
+            match before_transforms.iter().find(|b| b.key.id == after.key.id) {
+                Some(before) => {
+                    carried += 1;
+                    // ★행렬은 성분별 최대 차로 잰다.★ 한 성분이라도 어긋나면 화면이 어긋난다.
+                    let a = after.value.to_array();
+                    let b = before.value.to_array();
+                    let worst = (0..16)
+                        .map(|index| (a[index] - b[index]).abs())
+                        .fold(0.0f32, f32::max);
+                    paint_animation_mesh_probe::note_mesh_error(worst);
+                },
+                None => fresh += 1,
+            }
+        }
+        paint_animation_mesh_probe::note_install(carried, fresh);
     }
 
     pub(crate) fn handle_new_display_list(

@@ -535,6 +535,22 @@ pub struct Preferences {
     /// 1 restores a tick every frame. Animations the paint thread is not playing always
     /// tick every frame, whatever this says.
     pub gfx_paint_side_animation_tick_divisor: i64,
+    /// paint-side 예측이 ★교체될 때 서로 맞물리는지★ 재는 프로브(기본 꺼짐).
+    ///
+    /// 설계와 `animation_zero` doc 이 "연달아 오는 예측들이 서로 정확히 맞물린다" 를
+    /// 주장한다. 켜면 교체마다 ***직전 예측이 그 순간 내던 값***과 ***새 세그먼트가 그 순간
+    /// 내는 값***의 차를 분포로 쌓고, 10 초마다 `MESHPROBE` 줄로 찍는다. 자세한 설계와
+    /// 성능 규칙은 `components/paint/paint_animation_mesh_probe.rs` 의 머리 주석에 있다.
+    ///
+    /// ★왜 가설이 아니라 측정인가★: 2026-10-30 까지 "구성 전환 중 fps 는 60 인데 움직임이
+    /// 60fps 가 아니다" 에 대해 세운 기구 다섯이 모두 틀렸고, 그중 하나는 ***이미 있던
+    /// 시험***이 반증했다(`even_build_times_give_even_zeros_despite_jittery_transit`).
+    /// 남은 확정 사실은 "divisor 를 낮추면 떨림 주기가 줄고 1 에서 사라진다" = ★튐의 빈도가
+    /// 디스플레이 리스트 속도★ 하나이고, 이 프로브가 그 지점을 직접 본다.
+    ///
+    /// ★꺼진 런의 비용은 `AtomicBool` 로드 하나다.★ 측정에 필요한 추가 샘플링도 그 분기
+    /// 안에 있다.
+    pub gfx_paint_side_animation_mesh_probe: bool,
 
     pub gfx_wall_parallel_tiles: bool,
     /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
@@ -1424,6 +1440,7 @@ impl Preferences {
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
             gfx_paint_side_animation_tick_divisor: 4,
+            gfx_paint_side_animation_mesh_probe: false,
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,

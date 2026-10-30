@@ -176,6 +176,7 @@ mod dcomp_video_convert;
 mod frame_time;
 mod largest_contentful_paint_calculator;
 mod paint;
+mod paint_animation_mesh_probe;
 mod painter;
 mod pinch_zoom;
 mod pipeline_details;

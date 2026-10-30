@@ -698,6 +698,11 @@ impl Painter {
         // ★HUD★ -- 비어 있으면 플래그도 비고 `set_profiler_ui` 도 부르지 않는다(전과 동일).
         let profiler_hud_ui = profiler_hud_ui_string();
 
+        // ★맞물림 프로브★ -- 여러 페인터가 불러도 리포터는 한 번만 뜬다.
+        if pref!(gfx_paint_side_animation_mesh_probe) {
+            crate::paint_animation_mesh_probe::start();
+        }
+
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
