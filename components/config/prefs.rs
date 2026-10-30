@@ -819,8 +819,20 @@ pub struct Preferences {
     ///
     /// 인정하는 값:
     /// - `""`(기본) — 끈다. ***렌더러 생성 플래그가 비는 것까지 포함해 전과 동일하다.***
-    /// - `on` — 벽 조사용 기본 묶음. "패스가 한 주기를 넘는가" 를 보도록 골랐다:
-    ///   `FPS,Frame CPU total,Frame building,Renderer,Scene building,#Frame CPU total`
+    /// - `on` — 벽 조사용 기본 묶음. ★작업량 카운터만★ 고른다(정본은 `painter.rs` 의
+    ///   `profiler_hud_ui_string`): 단계별 시간, WR 이 느린 프레임을 어느 단계에 돌리는지(%),
+    ///   그리고 `Frame building`/`Renderer` 그래프.
+    ///
+    ///   ★`Frame CPU total` 은 일부러 빠졌다 -- 이름과 달리 작업량이 아니다.★
+    ///   `render_api.rs` 가 트랜잭션을 ***보낼 때*** 시작하고 `renderer/mod.rs` 가 프레임을
+    ///   ***그렸을 때*** 끝내므로 큐 대기와 프레임 슬롯 대기를 포함한 ***벽시계 지연***이다.
+    ///   실측(2026-10-30, 4 타일 장비): 안정 60~61fps 에서도 17ms, 움직이는 요소가 없으면
+    ///   0ms. ★파이프라인 깊이가 한 프레임이면 지연이 한 주기인 것이 정상★이다.
+    ///
+    ///   ★예산 초과는 색으로 나타난다.★ 카운터마다 WR 이 기대 범위를 선언해 두었고
+    ///   (`Frame building` 0~6ms, `Renderer` 0~8ms, `Scene building` 0~4ms, `DisplayList`
+    ///   0~5ms), 범위를 벗어나면 다른 색으로 그린다(`profiler.rs` 의
+    ///   `has_unexpected_avg_max` / `is_unexpected_value`). ★수치를 읽기 전에 색을 본다.★
     /// - 그 외 — ★WebRender 의 profiler UI 문자열로 그대로 넘긴다★(`set_profiler_ui`).
     ///   문법은 `vendor_local/webrender/src/profiler.rs` 머리 주석에 있다: 쉼표 목록,
     ///   `#` 접두=그래프, `*`=변화 표시, `$`=리터럴 글자, `|`=새 열, `_`=새 행, 빈 토큰=여백.

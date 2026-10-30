@@ -472,11 +472,27 @@ fn profiler_hud_ui_string() -> Option<String> {
         return None;
     }
     if value.eq_ignore_ascii_case("on") {
-        // "패스가 한 주기를 넘는가" 를 보도록 고른 묶음. 이름은
-        // `vendor_local/webrender/src/profiler.rs` 의 카운터 표에 있는 것 그대로다.
+        // ★작업량 카운터만 고른다.★ 이름은 `vendor_local/webrender/src/profiler.rs` 의
+        // 카운터 표에 있는 것 그대로다(모르는 이름은 조용히 무시되므로 오타가 빈칸이 된다).
+        //
+        // ★`Frame CPU total` 은 일부러 넣지 않았다★ -- 이름과 달리 작업량이 아니다.
+        // `render_api.rs` 가 트랜잭션을 ***보낼 때*** 시작하고 `renderer/mod.rs` 가 프레임을
+        // ***그렸을 때*** 끝내므로, 큐 대기와 프레임 슬롯 대기를 포함한 벽시계 지연이다.
+        // 실측(2026-10-30, 4 타일 테스트 장비): 안정 60~61fps 에서도 17ms 를 찍고, 움직이는
+        // 요소가 없으면 0ms 다. ★파이프라인 깊이가 한 프레임이면 지연이 한 주기인 것이
+        // 정상★이고, 그것을 예산 초과로 읽으면 틀린다(내가 그렇게 읽었다).
+        //
+        // 1 행: 단계별 작업량. 2 행: WR 이 느린 프레임을 어느 단계에 돌리는지(%).
+        // 3 행: 그래프 -- 전환 순간의 스파이크를 본다.
         return Some(
-            "FPS,Frame CPU total,Frame building,Renderer,Scene building,#Frame CPU total"
-                .to_owned(),
+            // `concat!` 이라 줄바꿈이 문자열에 들어가지 않는다 -- `\` 줄 연결은 앞 공백을
+            // 남기고, 그러면 토큰 다듬기에 의존하게 된다.
+            concat!(
+                "FPS,Frame building,Renderer,Scene building,DisplayList,",
+                "_,Total slow frames CPU,Slow: frame build,Slow: render,Slow: upload,",
+                "_,#Frame building,#Renderer",
+            )
+            .to_owned(),
         );
     }
     Some(value.to_owned())
