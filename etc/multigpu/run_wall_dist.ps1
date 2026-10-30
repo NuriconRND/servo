@@ -95,6 +95,19 @@ param(
     # gfx_paint_side_animation_mesh_probe -- paint-side 예측이 교체될 때 맞물리는지 재고
     # 10 초마다 MESHPROBE 줄로 찍는다. 꺼진 런의 비용은 AtomicBool 로드 하나다.
     [switch] $MeshProbe,
+    # 진단 런에서만 RUST_LOG 를 올린다. 비면 기본 "warn" 그대로 -- ★기본 동작은 바뀌지
+    # 않는다.★
+    #
+    # ★`-KeepRustLog` 와 다르다.★ 그것은 ***셸에 세워진 값***을 그대로 썼기 때문에 런마다
+    # 필터가 달라져 로그를 비교할 수 없었고, 그래서 제거됐다. 이것은 ***명령에 적힌 값***
+    # 이므로 console.txt 에 남고 배너에도 찍힌다 -- 어떤 필터로 돈 런인지가 기록된다.
+    #
+    # ★아래 검사기가 그대로 적용된다★ -- 레벨이 아닌 맨 토큰("critical" 등)은 env_filter 가
+    # 모듈 이름으로 읽어 전역 상한을 Trace 로 ***올린다***. 2026-10-27 에 그걸로 A/B 한
+    # 바퀴를 날렸다. 경고가 나오면 조용히 넘기지 말 것.
+    #
+    #   -RustLog "warn,webgl=debug,script::dom::webgl=debug"
+    [string] $RustLog = "",
     [int]    $RefreshHz = 60,
     # gfx_dcomp_mode. ***Defaults to off, which is also the engine's own default*** -- the
     # launcher used to default to "surface" and that disagreement was never revisited after
@@ -867,11 +880,13 @@ $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
 $env:PATH = "$engine;$env:PATH"
 # ***RUST_LOG 은 여기서 고정한다.*** 셸에 무엇이 세워져 있든 런마다 같은 필터로 돌아야
-# 로그가 서로 비교된다. 기본은 `warn` 하나다 -- 더 보려면 이 줄을 고친다.
-$env:RUST_LOG = "warn"
-# 아래 검사기가 보는 것은 바로 위 줄이다. `-KeepRustLog` 가 없어졌으므로
-# 필터를 바꾸는 유일한 경로가 그 손편집이고, 그것이 정확히 아래 사고가
-# 난 자리다.
+# 로그가 서로 비교된다. 기본은 `warn` 하나다.
+#
+# ★진단 런은 `-RustLog` 로 명시한다★ -- 셸 env 는 여전히 쓰지 않는다(그것이
+# `-KeepRustLog` 가 제거된 이유다). 명령에 적힌 값이라 console.txt 와 배너에 남는다.
+$env:RUST_LOG = if ($RustLog.Trim() -ne "") { $RustLog.Trim() } else { "warn" }
+# 아래 검사기가 보는 것은 바로 위 줄이 ***만든 유효 값***이다 -- 손편집이든 `-RustLog` 든
+# 같은 검사를 지난다. 아래 사고가 난 자리가 정확히 이 필터다.
 # ***RUST_LOG 의 알 수 없는 맨 토큰은 로그를 끄지 않는다 -- 상한을 Trace 로 올린다.***
 # env_filter 는 레벨로 파싱되지 않는 맨 토큰을 `(LevelFilter::Trace, <모듈이름>)` 디렉티브로
 # 바꾸고(parser.rs), Filter::filter() 가 디렉티브 레벨의 ***최대값***을 돌려주며(filter.rs),
