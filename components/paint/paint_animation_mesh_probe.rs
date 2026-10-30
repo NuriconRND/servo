@@ -116,6 +116,9 @@ fn bucket_of(error: f32) -> usize {
     ((steps as usize) + 1).min(BUCKETS - 1)
 }
 
+/// ★`warn!` 로 찍는 이유: 벽 런이 `RUST_LOG=warn` 이다.★ `info!` 로 두면 정작 볼 수 없다 --
+/// `tick_phase_probe.rs` 가 같은 이유로 같은 선택을 했고, 이 프로브는 처음에 `info!` 로
+/// 냈다가 ★첫 실기 런에서 한 줄도 남지 않았다★(2026-10-30, log_ani_shift_01/01).
 fn report(elapsed: Duration) {
     let installs = INSTALLS.load(Ordering::Relaxed);
     let carried = CARRIED.load(Ordering::Relaxed);
@@ -124,7 +127,7 @@ fn report(elapsed: Duration) {
     let counts: Vec<u64> = HIST.iter().map(|b| b.load(Ordering::Relaxed)).collect();
     let total: u64 = counts.iter().sum();
     if total == 0 {
-        log::info!(
+        log::warn!(
             "MESHPROBE t={:.0}s installs={installs} carried={carried} fresh={fresh} \
              samples=0 (맞물림을 따질 키가 없었다)",
             elapsed.as_secs_f64(),
@@ -149,7 +152,7 @@ fn report(elapsed: Duration) {
             *count as f64 * 100.0 / total as f64
         ));
     }
-    log::info!(
+    log::warn!(
         "MESHPROBE t={:.0}s installs={installs} carried={carried} fresh={fresh} \
          samples={total} meshed(<={:.4})={meshed_pct:.2}% worst={worst:.6}{spread}",
         elapsed.as_secs_f64(),
