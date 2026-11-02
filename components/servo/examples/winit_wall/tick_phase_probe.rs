@@ -137,6 +137,21 @@ static GATE_SHORTFALL: [AtomicU32; SHORTFALL_BUCKETS] =
 /// 페이싱 틱.★ 이것이 0 이 아니면 박자를 페이싱이 쥐고 있지 않다는 뜻이다.
 static GATE_PREEMPTED: AtomicU64 = AtomicU64::new(0);
 
+/// 렌더 패스가 ★페이싱 틱★에서 시작된 횟수.
+static PASS_FROM_TICK: AtomicU64 = AtomicU64::new(0);
+/// 렌더 패스가 ★`RedrawRequested`★ 에서 시작된 횟수.
+///
+/// ★`-DirectRender` 에서는 이 값이 0 이어야 한다.★ 그 구성에서는 틱이 `render_all_tiles` 를
+/// 직접 부르고 `request_redraw()` 를 하지 않으므로(`main.rs` 의 `direct_render` 분기),
+/// 우리가 요청한 redraw 는 없다. 그런데 OS/winit 은 윈도가 무효화되면 스스로
+/// `RedrawRequested` 를 보내고, 그 핸들러가 ***패스를 한 번 더 돌린다*** -- 그러면 프레임
+/// 생산자가 둘이 되어 규칙 1 을 깬다.
+///
+/// 2026-11-02 관찰: 같은 HUD·빌드·페이싱 클럭에서 다른 콘텐츠는 60~61fps 인데
+/// ★최소 WebGL 삼각형만 65fps★ 였고 저더가 보였다. 이 카운터가 그 5 가 어디서 왔는지
+/// 답한다.
+static PASS_FROM_REDRAW: AtomicU64 = AtomicU64::new(0);
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 페이싱 스레드가 넣은 틱 QPC. 생산자 하나(페이싱), 소비자 하나(리포터).
@@ -267,6 +282,18 @@ pub(crate) fn site_label(index: usize) -> &'static str {
 /// 이 함수와 아래 [`note_gate_deferred`] 는 ***메인(렌더) 스레드***에서 불린다. 치르는 값은
 /// relaxed 원자 연산 둘이고, 같은 자리에서 이미 `Instant::now()` 를 읽으므로 그에 비하면
 /// 없는 값이다.
+/// 렌더 패스 하나의 출처를 센다. ★원자 하나다.★
+pub(crate) fn note_pass(from_redraw: bool) {
+    if !is_enabled() {
+        return;
+    }
+    if from_redraw {
+        PASS_FROM_REDRAW.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PASS_FROM_TICK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn note_gate_fired(site: usize) {
     if !is_enabled() {
         return;
@@ -507,6 +534,18 @@ fn circular_summary(hist: &[u32; PHASE_BUCKETS], total: u64) -> Option<Circular>
 /// `warn!` 인 이유는 방막 런이 `RUST_LOG=warn` 이기 때문이다 — `info` 로 두면 정작 볼
 /// 사람에게 안 보인다(`about_to_wait` 의 바인딩 줄과 같은 이유).
 fn report(elapsed: Duration) {
+    // ★패스 출처★ -- `-DirectRender` 에서 redraw 가 0 이 아니면 생산자가 둘이다.
+    {
+        let from_tick = PASS_FROM_TICK.load(Ordering::Relaxed);
+        let from_redraw = PASS_FROM_REDRAW.load(Ordering::Relaxed);
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        log::warn!(
+            "PASSSOURCE t={:.0}s tick={from_tick} ({:.1}/s) redraw={from_redraw} ({:.1}/s)",
+            secs,
+            from_tick as f64 / secs,
+            from_redraw as f64 / secs,
+        );
+    }
     let fold = fold_lock();
     let secs = elapsed.as_secs();
     if fold.samples == 0 {

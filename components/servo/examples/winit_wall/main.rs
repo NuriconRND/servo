@@ -1153,6 +1153,7 @@ impl AppState {
             let _ = webview.on_wall_tick();
         }
         if self.direct_render {
+            tick_phase_probe::note_pass(false);
             self.render_all_tiles();
             return;
         }
@@ -1890,6 +1891,9 @@ impl ApplicationHandler<WakerEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
                 if let Self::Running(state) = self {
+                    // ★`-DirectRender` 에서는 이 입구가 **두 번째 생산자**다★ -- 틱이 이미
+                    // 패스를 돌렸는데 OS 가 보낸 redraw 로 한 번 더 돈다. 세어서 확인한다.
+                    tick_phase_probe::note_pass(true);
                     state.render_all_tiles();
                 }
             },
