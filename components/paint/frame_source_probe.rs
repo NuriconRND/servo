@@ -98,6 +98,27 @@ static KEEP_BEHIND: AtomicU64 = AtomicU64::new(0);
 /// 걸린 틱은 `behind` 로 센다 -- 그래서 `canvas` 는 ***하한***이다.
 static KEEP_CANVAS: AtomicU64 = AtomicU64::new(0);
 
+/// `animating_webviews` 가 WebView 를 ★paint 측으로 판정★ 한 횟수(깎임 후보).
+static PAINT_SIDE_JUDGED: AtomicU64 = AtomicU64::new(0);
+/// 그중 ★`canvas_is_live()` 가 판정을 되돌린★ 횟수.
+///
+/// ★이 둘이 `gfx_wall_canvas_defeats_paint_side_throttle` 가 바꾸는 바로 그 양이다.★
+/// 2026-11-02 에 그러지 못한 계측을 한 번 설계했다 -- `KEEP_CANVAS` 는 ***거절***을 세는데
+/// `-NoArmOnCanvasWait` 는 ***무장***만 끄므로, 수치가 안 움직인 것이 당연했고 그것으로는
+/// 그 수정의 성패를 말할 수 없었다. ★계측은 수정이 바꾸는 양과 같은 양을 세야 한다.★
+///
+/// 왜 필요한가(log_webgl_perf_01/02): 같은 스위치로 ***프로브 페이지는 캔버스 거절이
+/// 2.0% -> 0.1% 로 떨어지고 저더가 사라졌는데***(run 08), ***실제 output 페이지는 1.5% 로
+/// 남고 저더가 그대로다***(run 11). 즉 그 페이지에서는 판정이 되돌려지지 않는다. 이
+/// 둘이 그 이유를 가른다 -- `judged` 가 양수인데 `defeated` 가 0 이면 ★신호가 안 잡히는
+/// 것★이고, 둘 다 양수인데 거절이 남으면 ★깎임 외의 원인★이다.
+static PAINT_SIDE_DEFEATED: AtomicU64 = AtomicU64::new(0);
+/// `canvas_is_live()` 가 거짓이었을 때, 마지막 캔버스 활동으로부터 지난 최대 시간(ms).
+///
+/// ★창(500ms)이 모자란 것인지 아예 캔버스가 안 오는 것인지 가른다.★ 활동이 한 번도 없으면
+/// 갱신되지 않으므로 0 으로 남는다.
+static CANVAS_STALE_WORST_MS: AtomicU64 = AtomicU64::new(0);
+
 /// 프로브가 켜져 있는가.
 pub(crate) fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -123,6 +144,23 @@ pub(crate) fn start() {
         });
     if let Err(error) = spawned {
         log::warn!("frame-source: 리포터 스레드를 띄우지 못했다: {error}; 요약이 나오지 않는다");
+    }
+}
+
+/// paint 측 판정과, 캔버스 신호가 그것을 되돌렸는지를 센다. ★원자 둘 이하다.★
+///
+/// `stale_for` 는 신호가 거짓일 때 ***마지막 캔버스 활동으로부터 지난 시간***이고,
+/// 활동이 한 번도 없었으면 `None` 이다.
+pub(crate) fn note_paint_side_judgement(defeated: bool, stale_for: Option<Duration>) {
+    if !is_enabled() {
+        return;
+    }
+    PAINT_SIDE_JUDGED.fetch_add(1, Ordering::Relaxed);
+    if defeated {
+        PAINT_SIDE_DEFEATED.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(stale_for) = stale_for {
+        let millis = stale_for.as_millis().min(u128::from(u64::MAX)) as u64;
+        CANVAS_STALE_WORST_MS.fetch_max(millis, Ordering::Relaxed);
     }
 }
 
@@ -231,6 +269,17 @@ fn report(elapsed: Duration) {
         share(behind),
         share(canvas),
     );
+
+    // ★paint 측 판정★ -- 깎임 후보와, 캔버스 신호가 그것을 되돌린 비율.
+    let judged = PAINT_SIDE_JUDGED.load(Ordering::Relaxed);
+    if judged > 0 {
+        let defeated = PAINT_SIDE_DEFEATED.load(Ordering::Relaxed);
+        let stale_worst = CANVAS_STALE_WORST_MS.load(Ordering::Relaxed);
+        log::warn!(
+            "PAINTSIDE t={secs:.0}s judged={judged} defeated={defeated} ({:.1}%)              stale_worst={stale_worst}ms",
+            defeated as f64 * 100.0 / judged as f64,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1342,11 +1342,18 @@ impl Painter {
                     // ★`divisor=1` 을 그냥 쓸 수는 없다★ -- 위 통제 실험이 CSS/paint 측
                     // 페이지에서는 1 이 오히려 저더라고 수치로 남겼다. 15 도 1 도 혼합
                     // 콘텐츠에는 맞지 않고, 엔진이 둘을 구별해야 한다.
-                    if paint_side
-                        && pref!(gfx_wall_canvas_defeats_paint_side_throttle)
-                        && self.frame_delayer.canvas_is_live()
-                    {
-                        paint_side = false;
+                    if paint_side && pref!(gfx_wall_canvas_defeats_paint_side_throttle) {
+                        // ★수정이 바꾸는 바로 그 양을 센다.★ 판정이 되돌려졌는지, 안
+                        // 되돌려졌다면 캔버스가 얼마나 오래 조용했는지 -- 창이 모자란
+                        // 것인지 아예 안 오는 것인지 그 둘이 가른다.
+                        let live = self.frame_delayer.canvas_is_live();
+                        crate::frame_source_probe::note_paint_side_judgement(
+                            live,
+                            self.frame_delayer.canvas_quiet_for(),
+                        );
+                        if live {
+                            paint_side = false;
+                        }
                     }
                     Some((webview_renderer.id, paint_side))
                 } else {
@@ -3530,6 +3537,15 @@ impl FrameDelayer {
     /// `pending_canvas_images` 로는 이것을 물을 수 없다 -- 그 집합은 rAF 사이에 ***비워진다***
     /// (업로드가 도착하면 지워지고, 그래서 "기다리는 중" 만 답한다). 여기서 묻는 것은
     /// "최근에 그려진 적이 있는가" 이므로 시각이 필요하다.
+    /// 마지막 캔버스 활동으로부터 지난 시간. `None` = 이 타일은 캔버스를 본 적이 없다.
+    ///
+    /// ★`None` 과 "오래됐다" 는 다른 진단이다★ -- 전자는 캔버스 메시지가 이 페인터에
+    /// 닿지 않는 것이고, 후자는 [`CANVAS_LIVE_WINDOW`] 가 모자란 것이다.
+    pub(crate) fn canvas_quiet_for(&self) -> Option<Duration> {
+        self.last_canvas_activity_at
+            .map(|at| Instant::now().duration_since(at))
+    }
+
     pub(crate) fn canvas_is_live(&self) -> bool {
         self.last_canvas_activity_at
             .is_some_and(|at| Instant::now().duration_since(at) < CANVAS_LIVE_WINDOW)
