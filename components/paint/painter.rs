@@ -1531,7 +1531,17 @@ impl Painter {
                 time_profiler_channel.clone(),
                 || {
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
-                        renderer.update();
+                        // ★여기서 흘림이 일어난다★ -- `update()` 는 그려지지 않은 채 남은
+                        // 프레임을 그 자리에서 렌더할 수 있고(`device_size = None` 이므로
+                        // 표출은 하지 않는다), 그 비용이 ***이 패스***에 실린다. 프로브가
+                        // 켜져 있을 때만 시계를 읽는다.
+                        if crate::frame_source_probe::is_enabled() {
+                            let started = Instant::now();
+                            renderer.update();
+                            crate::frame_source_probe::note_update_duration(started.elapsed());
+                        } else {
+                            renderer.update();
+                        }
                     }
 
                     // Paint the scene.

@@ -54,6 +54,32 @@ static OTHER_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// `other` 들의 `RenderReasons` 비트를 OR 로 모은 것 -- 어느 자리가 냈는지 남는다.
 static OTHER_REASON_BITS: AtomicU64 = AtomicU64::new(0);
 
+/// `Renderer::update()` 시간 히스토그램의 칸 수. 칸 0 은 "16µs 이하", 그 위는 2 배씩이다.
+///
+/// ★이 자리를 재는 이유★(2026-11-02): `update()` 는 결과 메시지를 비우면서, 그려지지 않은
+/// 채 남은 프레임이 텍스처 캐시 작업을 품고 있으면 그것을 ***그 자리에서 렌더***한다
+/// (`must_be_drawn()`, frame_builder.rs:1379). 그 렌더는 `device_size = None` 으로 들어가므로
+/// ***표출하지 않는다*** -- renderer/mod.rs:1674 의 주석이 "Setting device_size to None is
+/// what ensures compositing/presenting the frame is skipped" 라고 명시한다.
+///
+/// 그래서 그것은 ★프레임을 더 내보내는 것이 아니라 패스 안에서 시간을 더 먹는 것★이다.
+/// `painter.rs` 가 `renderer.render()` ***직전에*** `update()` 를 동기로 부르므로, 흘림이
+/// 일어난 패스는 그만큼 길어지고 16.7ms 예산을 넘으면 틱을 놓친다.
+///
+/// 실측 근거: 최소 WebGL2 삼각형에서 HUD 가 페인터당 61~65, ★타일 0 은 간헐적으로 70~80★
+/// 이었고 ***그 순간에 저더가 심하게 보였다***(log_ani_shift_01/15). HUD 는 `render_impl`
+/// 진입을 세므로 그 초과분이 곧 흘림 횟수다. 대조군(스크롤 텍스트)은 59~63 이고 그런
+/// 치솟음이 없었다.
+const UPDATE_BUCKETS: usize = 12;
+
+/// 칸 0 의 상한, 나노초. 이 아래는 "비용 없음" 으로 센다.
+const UPDATE_FLOOR_NANOS: u64 = 16_000;
+
+/// `Renderer::update()` 소요 시간의 분포.
+static UPDATE_HIST: [AtomicU64; UPDATE_BUCKETS] = [const { AtomicU64::new(0) }; UPDATE_BUCKETS];
+/// 관측된 최대 `update()` 소요 시간, 나노초.
+static UPDATE_WORST_NANOS: AtomicU64 = AtomicU64::new(0);
+
 /// 프로브가 켜져 있는가.
 pub(crate) fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -82,6 +108,26 @@ pub(crate) fn start() {
     }
 }
 
+/// `Renderer::update()` 한 번의 소요 시간을 쌓는다. ★원자 둘이 전부다.★
+pub(crate) fn note_update_duration(elapsed: Duration) {
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    UPDATE_HIST[update_bucket_of(nanos)].fetch_add(1, Ordering::Relaxed);
+    UPDATE_WORST_NANOS.fetch_max(nanos, Ordering::Relaxed);
+}
+
+/// 소요 시간을 칸으로. 칸 0 은 [`UPDATE_FLOOR_NANOS`] 이하, 그 위는 2 배씩이다.
+///
+/// ★경계 관례★: 칸 `k`(k>=1)는 `[FLOOR*2^(k-1), FLOOR*2^k)` 를 담는다 -- ***정확한 2 의
+/// 거듭제곱은 윗칸으로 간다.*** `paint_animation_mesh_probe::bucket_of` 와 같은 관례이고,
+/// 보고의 라벨도 그래서 `<` 다(`<=` 가 아니다).
+fn update_bucket_of(nanos: u64) -> usize {
+    if nanos <= UPDATE_FLOOR_NANOS {
+        return 0;
+    }
+    let steps = (nanos / UPDATE_FLOOR_NANOS).ilog2() as usize;
+    (steps + 1).min(UPDATE_BUCKETS - 1)
+}
+
 /// 프레임 발행 하나를 센다. ★원자 둘이 전부다.★
 pub(crate) fn note_frame(from_wall_tick: bool, reason_bits: u64) {
     if !is_enabled() {
@@ -107,6 +153,34 @@ fn report(elapsed: Duration) {
          other_reasons=0x{bits:x}",
         tick as f64 / secs,
         other as f64 / secs,
+    );
+
+    // ★`update()` 시간★ -- 흘림이 패스를 얼마나 늘리는지. 칸 경계를 값으로 같이 찍는다.
+    let counts: Vec<u64> = UPDATE_HIST
+        .iter()
+        .map(|b| b.load(Ordering::Relaxed))
+        .collect();
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return;
+    }
+    let worst_us = UPDATE_WORST_NANOS.load(Ordering::Relaxed) as f64 / 1000.0;
+    let free_pct = counts[0] as f64 * 100.0 / total as f64;
+    let mut spread = String::new();
+    for (index, count) in counts.iter().enumerate().skip(1) {
+        if *count == 0 {
+            continue;
+        }
+        let edge_us =
+            UPDATE_FLOOR_NANOS as f64 * (1u64 << (index - 1).min(31)) as f64 * 2.0 / 1000.0;
+        spread.push_str(&format!(
+            " <{edge_us:.0}us:{:.1}%",
+            *count as f64 * 100.0 / total as f64
+        ));
+    }
+    log::warn!(
+        "UPDATECOST t={secs:.0}s calls={total} ({:.1}/s) free={free_pct:.1}% worst={worst_us:.0}us{spread}",
+        total as f64 / secs,
     );
 }
 
@@ -135,6 +209,34 @@ mod tests {
             "쌓기 비용 {per_call:.1}ns/call -- 상한 200ns 를 넘었다"
         );
         println!("note_frame: {per_call:.1} ns/call");
+    }
+
+    /// `update()` 칸 경계가 의도대로다. ★보고를 읽는 전제이므로 고정한다.★
+    #[test]
+    fn the_update_buckets_start_at_the_floor_and_double() {
+        assert_eq!(update_bucket_of(0), 0);
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS), 0);
+        // 칸 1 = [FLOOR, FLOOR*2) -- 정확히 두 배인 값은 윗칸이다.
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS + 1), 1);
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS * 2 - 1), 1);
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS * 2), 2);
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS * 3), 2);
+        assert_eq!(update_bucket_of(UPDATE_FLOOR_NANOS * 4), 3);
+        // 한 프레임 예산(16.7ms)은 끝쪽 칸이어야 한다 -- 그 근처가 저더의 경계다.
+        assert!(
+            update_bucket_of(16_700_000) > 8,
+            "{}",
+            update_bucket_of(16_700_000)
+        );
+    }
+
+    /// 어떤 입력도 칸 밖으로 떨어지지 않는다(색인 패닉 금지).
+    #[test]
+    fn no_duration_can_fall_outside_the_update_histogram() {
+        for nanos in [0, 1, UPDATE_FLOOR_NANOS, u64::MAX, u64::MAX / 2] {
+            let bucket = update_bucket_of(nanos);
+            assert!(bucket < UPDATE_BUCKETS, "{nanos} -> {bucket}");
+        }
     }
 
     /// 꺼져 있으면 아무것도 쌓이지 않는다. ★기본 런이 전과 같다는 것이 이 시험이다.★
