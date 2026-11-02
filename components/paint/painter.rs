@@ -2587,7 +2587,12 @@ impl Painter {
         let behind = self.renderer_behind();
         let waiting = self.frame_delayer.waiting_on_canvas_images();
         match tile_may_generate(behind, waiting) {
-            keep_previous @ TileOutcome::KeepPrevious(_) => keep_previous,
+            keep_previous @ TileOutcome::KeepPrevious(_) => {
+                // 이유별로 센다 -- 트리에 이것을 가르는 계수기가 없었다. 근거는
+                // `frame_source_probe::KEEP_CANVAS` 의 doc 주석에 있다.
+                crate::frame_source_probe::note_keep_previous(behind);
+                keep_previous
+            },
             TileOutcome::Generated => {
                 let mut transaction = Transaction::new();
                 // 쌓인 비디오 프레임은 이 안에서 무조건 실린다 -- 생산은 구성 요소를

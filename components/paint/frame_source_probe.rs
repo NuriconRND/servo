@@ -80,6 +80,24 @@ static UPDATE_HIST: [AtomicU64; UPDATE_BUCKETS] = [const { AtomicU64::new(0) }; 
 /// 관측된 최대 `update()` 소요 시간, 나노초.
 static UPDATE_WORST_NANOS: AtomicU64 = AtomicU64::new(0);
 
+/// 틱 생산이 `KeepPrevious(RendererBehind)` 로 거절된 횟수.
+static KEEP_BEHIND: AtomicU64 = AtomicU64::new(0);
+/// 틱 생산이 `KeepPrevious(WaitingOnCanvasImages)` 로 거절된 횟수.
+///
+/// ★이 둘을 가르는 계수기가 트리에 없었다.★ 이유를 찍는 유일한 자리
+/// (`paint.rs:2215`)는 `info!` 이고 ***다중 타일 벽이 한 장 이하를 냈을 때만*** 돌아서
+/// 정상 운영에서는 나오지 않는다(벽 런은 `RUST_LOG=warn` 이라 더 그렇다).
+///
+/// ★왜 갈라야 하는가★(2026-11-02): 발행이 틱의 약 83% 였고 나머지 17% 가 거절이다.
+/// 그 17% 가 캔버스 대기인지 역압인지에 따라 볼 곳이 전혀 다르다. 그리고 운영자 관찰이
+/// 캔버스 쪽을 가리킨다 -- ***ticker 단독·ticker+영상은 멀쩡한데 ticker+WebGL 이면
+/// ticker 가 저더한다***. 코드상 `DelayNewFrameForCanvas` 는 타일 범위 없이 WebView 의
+/// 네 페인터 전부에 뿌려지므로(`paint.rs:2609`), 캔버스 없는 타일도 같이 무장된다.
+///
+/// ★`RendererBehind` 가 먼저 검사되고 더 센 조건이다★(`wall_tick.rs:102-105`). 둘 다
+/// 걸린 틱은 `behind` 로 센다 -- 그래서 `canvas` 는 ***하한***이다.
+static KEEP_CANVAS: AtomicU64 = AtomicU64::new(0);
+
 /// 프로브가 켜져 있는가.
 pub(crate) fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -105,6 +123,18 @@ pub(crate) fn start() {
         });
     if let Err(error) = spawned {
         log::warn!("frame-source: 리포터 스레드를 띄우지 못했다: {error}; 요약이 나오지 않는다");
+    }
+}
+
+/// 틱 생산이 거절된 것을 이유별로 센다. ★원자 하나다.★
+pub(crate) fn note_keep_previous(renderer_behind: bool) {
+    if !is_enabled() {
+        return;
+    }
+    if renderer_behind {
+        KEEP_BEHIND.fetch_add(1, Ordering::Relaxed);
+    } else {
+        KEEP_CANVAS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -181,6 +211,25 @@ fn report(elapsed: Duration) {
     log::warn!(
         "UPDATECOST t={secs:.0}s calls={total} ({:.1}/s) free={free_pct:.1}% worst={worst_us:.0}us{spread}",
         total as f64 / secs,
+    );
+
+    // ★거절 이유★ -- 17% 의 정체. `behind` 가 먼저 검사되므로 `canvas` 는 하한이다.
+    let behind = KEEP_BEHIND.load(Ordering::Relaxed);
+    let canvas = KEEP_CANVAS.load(Ordering::Relaxed);
+    let declined = behind + canvas;
+    let attempts = tick + declined;
+    let share = |value: u64| {
+        if attempts == 0 {
+            0.0
+        } else {
+            value as f64 * 100.0 / attempts as f64
+        }
+    };
+    log::warn!(
+        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%)          behind={behind} ({:.1}%) canvas={canvas} ({:.1}%)",
+        share(tick),
+        share(behind),
+        share(canvas),
     );
 }
 
