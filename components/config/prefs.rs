@@ -661,6 +661,32 @@ pub struct Preferences {
     /// ★틱 경로에 I/O 도 DWM 질의도 넣지 않는다.★ 질의가 없다는 것이 vblank 경로의 존재
     /// 이유라서, 재려고 질의를 넣으면 재려던 것을 부순다. 꺼진 런의 비용은 0 이다.
     pub gfx_wall_tick_phase_probe: bool,
+    /// `Renderer::update()` 가 한 패스에 ★발행 하나만★ 소비하게 묶는다(기본 꺼짐).
+    ///
+    /// ★왜★(2026-11-02 실측, log_ani_shift_01/15~16, 4 타일 테스트 장비). `update()` 는
+    /// 발행 큐를 ***통째로*** 드레인하고(`renderer/mod.rs:1055`), 한 패스에 발행이 둘 몰리면
+    /// 앞의 프레임을 ***오프스크린으로 전부 그린 뒤 버린다***(`:1082`,
+    /// `must_be_drawn() = has_texture_cache_tasks && !has_been_rendered`). 그 렌더는
+    /// `device_size = None` 이라 표출되지 않는다 -- `:1674` 의 주석이 명시한다.
+    ///
+    /// 즉 ★생산된 프레임이 그려진 뒤 폐기된다★. 애니메이션은 한 칸이 아니라 두 칸을 뛴다.
+    /// HUD 의 `Reason cache flush`(그 자리에서만 세워지는 `TEXTURE_CACHE_FLUSH` 비트,
+    /// `expected(0.0..0.01)`)가 ★타일 0 에서 대부분의 순간 0.10 이상, 간헐적으로 0.20 이상★
+    /// 이었고 -- 상한의 10~20 배다 -- HUD fps 가 그 타일에서 70~80(기준선 60)이었던 것과
+    /// 수치가 맞는다. 운영자는 ***그 순간에 저더가 심하게*** 보인다고 기록했다.
+    ///
+    /// WR 에는 이것을 막는 스로틀이 이미 있다(`set_target_frame_publish_id`,
+    /// `renderer/mod.rs:1276`). ★이 리포는 한 번도 세우지 않았다.★ 켜면 페인터가 패스마다
+    /// "다음 하나" 를 목표로 세워서, 남은 발행은 ***버려지는 대신 다음 패스로 밀린다***.
+    ///
+    /// ★백로그 상한이 있다★: 밀린 발행이 `WALL_PUBLISH_BACKLOG_LIMIT`(painter.rs, 2)를 넘으면 목표를
+    /// 세우지 않고 옛 동작(통째 드레인)으로 돌아간다. 소비가 생산을 못 따라가는 구성에서
+    /// 큐가 무한히 자라며 지연이 쌓이는 것을 막는다 -- ***버리는 것이 지연보다 나은 지점이
+    /// 있다***는 뜻이고, 그 지점을 수치로 고정한다.
+    ///
+    /// 기본을 꺼 두는 이유: 프레임 전달 의미를 바꾸므로 ★실기 A/B 가 전제다.★ 로컬
+    /// 개발 장비에는 벽이 없다.
+    pub gfx_wall_single_publish_per_pass: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1447,6 +1473,7 @@ impl Preferences {
             gfx_wall_pacing_clock: String::new(),
             gfx_wall_pacing_output: String::new(),
             gfx_wall_tick_phase_probe: false,
+            gfx_wall_single_publish_per_pass: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

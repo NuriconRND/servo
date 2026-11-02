@@ -360,6 +360,12 @@ param(
     # 그리고 이 검증은 프로브와 snap 이 같은 DWM 앵커를 쓰므로 ***순환***이다 -- 프로브의
     # 산술이 맞는지는 말해 주지만 DWM 격자 자체가 합성 마감과 맞는지는 말해 주지 않는다.
     [switch] $TickPhase,
+    # gfx_wall_single_publish_per_pass -- Renderer::update() 가 한 패스에 발행 하나만
+    # 소비하게 묶는다. 끄면(기본) 큐를 통째로 드레인하면서 앞 프레임을 그려 놓고 버린다
+    # (renderer/mod.rs:1082). 판정은 HUD 의 `Reason cache flush` 가 0 으로 떨어지는지다:
+    #   -ProfilerHud "FPS,Reason cache flush" -SinglePublishPerPass
+    # 프레임 전달 의미를 바꾸므로 실기 A/B 가 전제다.
+    [switch] $SinglePublishPerPass,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -928,6 +934,7 @@ $argList = @(
     "--pref", "gfx_wall_pacing_clock=$(if($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'})",
     "--pref", "gfx_wall_pacing_output=$PacingOutput",
     "--pref", "gfx_wall_tick_phase_probe=$($TickPhase.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_single_publish_per_pass=$($SinglePublishPerPass.IsPresent.ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "gfx_wr_profiler_hud=$ProfilerHud",
@@ -1002,7 +1009,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$($SinglePublishPerPass.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

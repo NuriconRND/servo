@@ -296,6 +296,14 @@ pub(crate) struct Painter {
     /// 이 이 한 필드로 성립한다.
     wall_tick_frames_produced: Cell<u64>,
 
+    /// 이 페인터의 `RenderNotifier` 가 본 가장 큰 발행 id. ★백엔드 스레드가 쓴다.★
+    published_hwm: crate::render_notifier::PublishedFrameHighWaterMark,
+    /// `Renderer::update()` 가 지금까지 소비한 발행 id.
+    ///
+    /// ★`gfx_wall_single_publish_per_pass` 가 켜져 있을 때만 뜻이 있다.★ 꺼져 있으면
+    /// 갱신하지 않는다 -- 켜는 순간 `published_hwm` 에서 다시 잡는다.
+    consumed_publish_id: Cell<u64>,
+
     /// 부트스트랩 프레임을 이미 낸 파이프라인. ★"파이프라인당 정확히 1 회" 의 근거다.★
     ///
     /// 끝난 파이프라인은 `notify_pipeline_exited` 에서 치운다. ★치워도 두 번째 생산
@@ -460,6 +468,17 @@ pub(crate) struct PainterInputs {
 // 자기 자리에 밀어 넣고, 그 값을 실어 가는 프레임은 같은 주기의 틱이 하나만 낸다
 // (`Paint::on_wall_tick`: `gather_components` → `produce_wall_frame`).
 // 설계 2-6 / 4 절: docs/superpowers/specs/2026-10-21-single-frame-producer-design.md
+
+/// `gfx_wall_single_publish_per_pass` 가 켜져 있을 때 밀어 둘 발행의 상한.
+///
+/// ★이 수를 넘으면 목표를 세우지 않고 옛 동작(통째 드레인)으로 돌아간다.★ 소비가 생산을
+/// 못 따라가는 구성에서 큐가 무한히 자라며 지연이 쌓이는 것을 막는다 -- 거기서는
+/// ***버리는 것이 지연보다 낫다***.
+///
+/// 2 로 둔 근거: 정상 구성에서 생산과 소비는 같은 조건(틱당 타일당 한 번, `KeepPrevious`
+/// 면 둘 다 건너뜀)에 묶여 있어 백로그가 1 을 넘을 이유가 없다. 2 는 한 프레임의 흔들림을
+/// 흡수하면서 ***구조적인 뒤처짐은 통과시키지 않는 폭***이다.
+const WALL_PUBLISH_BACKLOG_LIMIT: u64 = 2;
 
 /// `gfx_wr_profiler_hud` 를 WebRender profiler UI 문자열로 바꾼다. `None` = 끔.
 ///
@@ -695,6 +714,10 @@ impl Painter {
             webrender::CompositorConfig::Native { .. }
         );
 
+        // 발행 id 의 고수위를 알림과 나눠 갖는다. ★알림은 백엔드 스레드에서 쓴다.★
+        let published_hwm: crate::render_notifier::PublishedFrameHighWaterMark =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // ★HUD★ -- 비어 있으면 플래그도 비고 `set_profiler_ui` 도 부르지 않는다(전과 동일).
         let profiler_hud_ui = profiler_hud_ui_string();
 
@@ -711,7 +734,11 @@ impl Painter {
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
-            Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
+            Box::new(RenderNotifier::new(
+                painter_id,
+                paint.paint_proxy.clone(),
+                published_hwm.clone(),
+            )),
             webrender::WebRenderOptions {
                 compositor_config,
                 // We force the use of optimized shaders here because rendering is broken
@@ -837,6 +864,8 @@ impl Painter {
             canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
             screenshot_taker: Default::default(),
             wall_tick_frames_produced: Default::default(),
+            published_hwm,
+            consumed_publish_id: Cell::new(0),
             bootstrapped_pipelines: Default::default(),
             refresh_driver,
             animation_refresh_driver_observer,
@@ -1530,7 +1559,14 @@ impl Painter {
                 None,
                 time_profiler_channel.clone(),
                 || {
+                    let publish_target = self.next_publish_target();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
+                        // ★드레인을 발행 하나로 묶는다★(`gfx_wall_single_publish_per_pass`).
+                        // 세우지 않으면 `update()` 가 큐를 통째로 비우면서 앞 프레임을
+                        // 그려 놓고 버린다 -- 그 pref 의 doc 주석에 근거가 있다.
+                        if let Some(target) = publish_target {
+                            renderer.set_target_frame_publish_id(target);
+                        }
                         // ★여기서 흘림이 일어난다★ -- `update()` 는 그려지지 않은 채 남은
                         // 프레임을 그 자리에서 렌더할 수 있고(`device_size = None` 이므로
                         // 표출은 하지 않는다), 그 비용이 ***이 패스***에 실린다. 프로브가
@@ -1542,6 +1578,12 @@ impl Painter {
                         } else {
                             renderer.update();
                         }
+                    }
+                    if let Some(target) = publish_target {
+                        // 목표는 ***이미 채널에 있는*** id 였으므로(알림이 `send` 뒤에 온다)
+                        // `update()` 가 그것을 소비했다. 올려 두지 않으면 같은 프레임을
+                        // 영원히 목표로 삼는다.
+                        self.consumed_publish_id.set(target.0);
                     }
 
                     // Paint the scene.
@@ -1754,6 +1796,37 @@ impl Painter {
         let pending_frames_before_request = self.pending_frames.get();
         self.record_frame_request(wall_logical_frame_id);
         self.pending_frames.set(pending_frames_before_request + 1);
+    }
+
+    /// 이 패스에서 `Renderer::update()` 가 소비할 발행 id. `None` = 묶지 않는다.
+    ///
+    /// ★`None` 을 돌려주는 세 경우★ -- 모두 옛 동작(통째 드레인)이 된다.
+    /// 1. pref 가 꺼져 있다(기본).
+    /// 2. 새 발행이 없다. 묶을 것이 없다.
+    /// 3. 밀린 발행이 [`WALL_PUBLISH_BACKLOG_LIMIT`] 를 넘었다 -- 소비가 생산을 못 따라가고
+    ///    있으므로 ***버리는 쪽이 지연보다 낫다***. 이 갈래가 없으면 큐가 무한히 자란다.
+    ///
+    /// 목표는 ★`consumed + 1`★ 이고, 그것은 ***반드시 존재하는 id*** 다: 살아 있는 발행
+    /// 자리 둘이 모두 `advance()`(+1) 뒤에 보내므로 id 에 빈틈이 없다
+    /// (`render_backend.rs:1705`/`2117`). 그래서 목표가 영영 오지 않아 멈추는 일이 없다.
+    fn next_publish_target(&self) -> Option<webrender_api::FramePublishId> {
+        if !pref!(gfx_wall_single_publish_per_pass) {
+            return None;
+        }
+        let published = self.published_hwm.load(std::sync::atomic::Ordering::Relaxed);
+        let consumed = self.consumed_publish_id.get();
+        // 켜는 순간, 또는 무언가 어긋난 뒤에는 고수위에서 다시 잡는다.
+        if consumed >= published {
+            if consumed > published {
+                self.consumed_publish_id.set(published);
+            }
+            return None;
+        }
+        if published - consumed > WALL_PUBLISH_BACKLOG_LIMIT {
+            self.consumed_publish_id.set(published);
+            return None;
+        }
+        Some(webrender_api::FramePublishId(consumed + 1))
     }
 
     pub(crate) fn pending_frames(&self) -> usize {
