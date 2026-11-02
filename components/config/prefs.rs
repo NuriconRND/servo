@@ -661,7 +661,7 @@ pub struct Preferences {
     /// ★틱 경로에 I/O 도 DWM 질의도 넣지 않는다.★ 질의가 없다는 것이 vblank 경로의 존재
     /// 이유라서, 재려고 질의를 넣으면 재려던 것을 부순다. 꺼진 런의 비용은 0 이다.
     pub gfx_wall_tick_phase_probe: bool,
-    /// `Renderer::update()` 가 한 패스에 ★발행 하나만★ 소비하게 묶는다(기본 꺼짐).
+    /// `Renderer::update()` 가 한 패스에 ★발행 하나만★ 소비하게 묶는다(★기본 켜짐★).
     ///
     /// ★왜★(2026-11-02 실측, log_ani_shift_01/15~16, 4 타일 테스트 장비). `update()` 는
     /// 발행 큐를 ***통째로*** 드레인하고(`renderer/mod.rs:1055`), 한 패스에 발행이 둘 몰리면
@@ -684,8 +684,16 @@ pub struct Preferences {
     /// 큐가 무한히 자라며 지연이 쌓이는 것을 막는다 -- ***버리는 것이 지연보다 나은 지점이
     /// 있다***는 뜻이고, 그 지점을 수치로 고정한다.
     ///
-    /// 기본을 꺼 두는 이유: 프레임 전달 의미를 바꾸므로 ★실기 A/B 가 전제다.★ 로컬
-    /// 개발 장비에는 벽이 없다.
+    /// ★실기 A/B 로 확인하고 2026-11-02 에 기본값을 켰다★(log_ani_shift_01/17,
+    /// `single_publish=True`): ***네 타일 모두 `Reason cache flush` 가 0.00 으로 떨어지고
+    /// 육안 저더가 사라졌다.*** 교차검증도 맞았다 -- `UPDATECOST free=99.9% worst=77us`
+    /// (비싼 오프스크린 그리기가 사라졌다), `UPDATECOST calls` 198.9/s 가 `FRAMESRC` 발행
+    /// 198.9/s 와 같다(***하나도 버리지 않는다***), `FRAMESRC other=4`(생산은 여전히 단일),
+    /// `PASSSOURCE tick=60.0/s`(페이싱 그대로). 패닉·스톨 없음.
+    ///
+    /// 끄려면 런처의 `-NoSinglePublishPerPass`. ★켜고 끄는 스위치를 뒤집은 이유★: 런처가
+    /// pref 를 ***항상 명시적으로*** 넘기므로, `-SinglePublishPerPass` 를 그대로 두면
+    /// 스위치 없는 런이 새 기본값을 덮어써서 꺼 버린다(`-NoFrameBarrier` 와 같은 관례).
     pub gfx_wall_single_publish_per_pass: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
@@ -1473,7 +1481,7 @@ impl Preferences {
             gfx_wall_pacing_clock: String::new(),
             gfx_wall_pacing_output: String::new(),
             gfx_wall_tick_phase_probe: false,
-            gfx_wall_single_publish_per_pass: false,
+            gfx_wall_single_publish_per_pass: true,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
