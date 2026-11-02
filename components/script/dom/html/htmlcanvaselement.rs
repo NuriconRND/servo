@@ -279,7 +279,12 @@ impl HTMLCanvasElement {
         let canvas =
             RootedHTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(DomRoot::from_ref(self));
         let size = self.get_size();
-        let attrs = Self::get_gl_attributes(cx, options)?;
+        // ★요청이 여기까지 왔다는 것을 남긴다.★ 근거는 `log_webgl_decline` 의 doc.
+        warn!("WEBGLREQUEST: webgl1 requested, canvas {}x{}", size.width, size.height);
+        let Some(attrs) = Self::get_gl_attributes(cx, options) else {
+            Self::log_webgl_decline("webgl1", "get_gl_attributes returned None");
+            return None;
+        };
         let context =
             WebGLRenderingContext::new(cx, &window, &canvas, WebGLVersion::WebGL1, size, attrs)?;
         self.set_rendering_context(|| RenderingContext::WebGL(Dom::from_ref(&*context)));
@@ -293,6 +298,7 @@ impl HTMLCanvasElement {
     ) -> Option<DomRoot<WebGL2RenderingContext>> {
         if !WebGL2RenderingContext::is_webgl2_enabled(cx, self.global().reflector().get_jsobject())
         {
+            Self::log_webgl_decline("webgl2", "disabled (dom_webgl2_enabled=false and origin not allowlisted)");
             return None;
         }
         if let Some(ctx) = self.context() {
@@ -305,7 +311,11 @@ impl HTMLCanvasElement {
         let canvas =
             RootedHTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(DomRoot::from_ref(self));
         let size = self.get_size();
-        let attrs = Self::get_gl_attributes(cx, options)?;
+        warn!("WEBGLREQUEST: webgl2 requested, canvas {}x{}", size.width, size.height);
+        let Some(attrs) = Self::get_gl_attributes(cx, options) else {
+            Self::log_webgl_decline("webgl2", "get_gl_attributes returned None");
+            return None;
+        };
         let context = WebGL2RenderingContext::new(cx, &window, &canvas, size, attrs)?;
         self.set_rendering_context(|| RenderingContext::WebGL2(Dom::from_ref(&*context)));
         Some(context)
@@ -367,11 +377,29 @@ impl HTMLCanvasElement {
                     None
                 },
                 _ => {
-                    debug!("Unexpected error on conversion of WebGLContextAttributes");
+                    // ★`debug!` 였다 -- 벽 런은 `RUST_LOG=warn` 이라 보이지 않았다.★
+                    warn!("WEBGLDECLINE: WebGLContextAttributes conversion errored");
                     None
                 },
             }
         }
+    }
+
+    /// WebGL 컨텍스트 요청이 ★`null` 로 끝난 이유★를 한 줄 남긴다.
+    ///
+    /// ★왜 필요한가★(2026-10-30 ~ 11-02). `getContext` 는 명세상 실패를 `null` 로 돌려주고
+    /// 예외를 던지지 않는다. 그런데 이 엔진에서 `null` 이 되는 길이 다섯인데
+    /// (Placeholder, webgl2 비활성, 속성 변환 실패 둘, 컨텍스트 생성 실패) ***그중 둘이
+    /// 아무 기록도 남기지 않았다***. 그래서 "WebGL 이 안 나온다" 는 실기 보고에 대해
+    /// ★페이지가 요청을 안 한 것인지 엔진이 거절한 것인지 구분할 수 없었다★ -- 네 번의 런
+    /// 로그에 `WEBGLTARGETS`(생성 성공)도 `Couldn't create WebGLRenderingContext`(생성
+    /// 실패)도 없어서 `new` 이 아예 불리지 않은 것까지만 알 수 있었다.
+    ///
+    /// ★`warn!` 이다★ -- 벽 런이 `RUST_LOG=warn` 으로 돌기 때문이다. `debug!` 로 두면
+    /// 정작 볼 수 없다(`tick_phase_probe.rs` 와 같은 이유). 컨텍스트 요청은 페이지당 몇
+    /// 번이라 비용이 없다.
+    fn log_webgl_decline(kind: &str, reason: &str) {
+        warn!("WEBGLDECLINE: {kind} context request returned null -- {reason}");
     }
 
     pub(crate) fn is_valid(&self) -> bool {
@@ -500,7 +528,10 @@ impl HTMLCanvasElementMethods<crate::DomTypeHolder> for HTMLCanvasElement {
             "webgpu" => self
                 .get_or_init_webgpu_context(cx)
                 .map(RootedRenderingContext::GPUCanvasContext),
-            _ => None,
+            other => {
+                Self::log_webgl_decline("unknown", &format!("unknown contextId {other:?}"));
+                None
+            },
         })
     }
 
