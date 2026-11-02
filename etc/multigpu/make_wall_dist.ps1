@@ -194,6 +194,10 @@ Copy-Item (Join-Path $repo "tests\html\wall_paint_animation_probe.html") (Join-P
 # against the same run with `clip=all`. The engine-side counters this used to be paired
 # with (DCOMPBIND, COMMITSITE) went out in the 2026-10-27 instrumentation strip.
 Copy-Item (Join-Path $repo "tests\html\ticker_slice_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+# ticker + WebGL 혼합 프로브. 한 캔버스가 벽을 때리는 두 경로(paint 쪽 무장 / script 쪽
+# 문서 잠금)를 ?gl=off|same|iframe 으로 가른다. iframe 모드는 삼각형 페이지를 상대
+# 경로로 참조하므로 ★둘이 함께 들어가야 한다★ -- 그래서 둘 다 $eyeProbes 에 올렸다.
+Copy-Item (Join-Path $repo "tests\html\ticker_webgl_mix_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
 
 # rAF 시계 대조 프로브. 표출 페이지의 영역 회전은 rAF 콜백 안에서 인라인 transform 을 매
@@ -238,7 +242,11 @@ $eyeProbes = @(
     "wall_anim_jitter_probe.html",
     "wall_paint_animation_probe.html",
     "ticker_slice_probe.html",
-    "raf_clock_probe.html"
+    "raf_clock_probe.html",
+    "ticker_webgl_mix_probe.html",
+    # ★`ticker_webgl_mix_probe.html?gl=iframe` 이 이것을 상대 경로로 참조한다.★ 빠지면
+    # 404 가 아니라 ***빈 iframe*** 이 되어, 캔버스가 없는 런을 있는 런으로 착각한다.
+    "wall_webgl2_min_triangle.html"
 )
 $missingProbes = $eyeProbes | Where-Object { -not (Test-Path (Join-Path $pages "html\$_")) }
 if ($missingProbes) {
