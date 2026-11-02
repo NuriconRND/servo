@@ -751,6 +751,25 @@ pub struct Preferences {
     /// 기본을 꺼 둔 이유: 근거가 ★한 번의 실기 런과 코드 읽기★ 다. 되돌림 기록이 있는
     /// 자리이므로 실기 A/B 로 확인한 뒤 뒤집는다.
     pub gfx_wall_canvas_defeats_paint_side_throttle: bool,
+    /// `gfx_wall_canvas_defeats_paint_side_throttle` 가 쓰는 ★"캔버스가 살아 있다" 의 창★,
+    /// 밀리초(기본 500). 0 이면 ***마지막 활동과 같은 순간에만*** 참이라 사실상 꺼진다.
+    ///
+    /// ★왜 pref 인가★(2026-11-02, log_webgl_perf_01/02). 그 수정은 프로브 페이지에서
+    /// 작동했는데(run 08: 캔버스 거절 2.0% -> 0.1%, 육안 저더 소멸) ***실제 output
+    /// 페이지에서는 발동하지 않았다***(run 11: 1.5% 유지). 창이 모자란 것이 유력한 후보이고,
+    /// 스윕마다 재빌드하는 것은 왕복이 너무 길다.
+    ///
+    /// ★왜 500 이 모자랄 수 있는가.★ 깎인 상태의 캔버스 간격은 명목상 250ms 인데
+    /// (`divisor` 15, 60Hz), 그 `divisor` 는 ***벽 틱이 아니라 그 페인터의 렌더***를 세고
+    /// `KeepPrevious` 인 타일은 렌더되지 않아 간격이 더 벌어진다. 캔버스 문서가 렌더링
+    /// 기회 한 번을 놓치면 두 배가 되고, 실제 콘텐츠가 스스로 제한하기도 한다 -- run 11 의
+    /// WebGL 소스 주소가 `?fps=30` 이다.
+    ///
+    /// 늘리는 비용은 ★캔버스가 사라진 뒤 깎임이 돌아오기까지의 지연★ 이고 그것은 이 값
+    /// 그대로다. 전환에 한 번 생기고 눈에 보이지 않으므로 ★넉넉한 쪽이 안전하다.★
+    /// 판정은 `PAINTSIDE` 줄의 `stale_worst` 로 한다 -- 그 값보다 창이 크면 신호가 꺼지지
+    /// 않는다.
+    pub gfx_wall_canvas_live_window_ms: i64,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1540,6 +1559,7 @@ impl Preferences {
             gfx_wall_single_publish_per_pass: true,
             gfx_wall_arm_keep_previous_on_canvas_wait: true,
             gfx_wall_canvas_defeats_paint_side_throttle: false,
+            gfx_wall_canvas_live_window_ms: 500,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

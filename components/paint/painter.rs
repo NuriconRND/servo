@@ -482,13 +482,24 @@ const WALL_PUBLISH_BACKLOG_LIMIT: u64 = 2;
 
 /// [`FrameDelayer::canvas_is_live`] 의 창. 이 시간 안에 캔버스 활동이 있었으면 "살아 있다".
 ///
-/// ★250ms 를 덮어야 한다★ -- `gfx_paint_side_animation_tick_divisor` 의 런처 기본값이 15 라,
-/// 깎인 상태에서 캔버스는 ***초당 네 번***(250ms 간격) 그려진다. 창이 그보다 짧으면 신호가
-/// 그 사이에 꺼져 ***깎임이 스스로를 유지한다***. 500ms 는 그 간격에 두 배의 여유를 준다.
+/// ★값은 `gfx_wall_canvas_live_window_ms` 에서 온다(기본 500).★ 상수였다가 pref 로 뺐다 --
+/// 2026-11-02 실측에서 500ms 가 ***실제 페이지에서는 모자랄 수 있다***는 것이 드러났고,
+/// 스윕마다 재빌드하는 것은 왕복이 너무 길다.
 ///
-/// 반대쪽 비용은 ★캔버스가 사라진 뒤 깎임이 돌아오기까지의 지연★이고, 그것은 0.5 초다 --
-/// 화면에서 캔버스가 빠지는 전환에 한 번 생기고 눈에 보이지 않는다.
-const CANVAS_LIVE_WINDOW: Duration = Duration::from_millis(500);
+/// ★무엇을 덮어야 하는가.★ `gfx_paint_side_animation_tick_divisor` 의 런처 기본값이 15 라
+/// 깎인 상태에서 캔버스는 초당 네 번(250ms 간격) 그려진다 -- 그런데 ***그 15 는 벽 틱이
+/// 아니라 그 페인터의 렌더를 센다***(`refresh_driver::frame_started` 는 `notify_will_paint`,
+/// 즉 `Painter::render` 안에서만 돈다). `KeepPrevious` 인 타일은 렌더되지 않아 계수기가
+/// 올라가지 않으므로 ★간격이 더 벌어질 수 있다.★ 거기에 캔버스 문서가 렌더링 기회 한 번을
+/// 놓치면(`script_thread` 가 ack 를 빚진 문서를 건너뛴다) 간격이 두 배가 된다. 그리고 실제
+/// 콘텐츠가 스스로 프레임률을 제한하기도 한다(run 11 의 WebGL 소스가 `?fps=30` 이다).
+///
+/// 반대쪽 비용은 ★캔버스가 사라진 뒤 깎임이 돌아오기까지의 지연★ 이고, 그것은 이 값 그대로다
+/// -- 화면에서 캔버스가 빠지는 전환에 한 번 생기고 눈에 보이지 않는다. 그래서 넉넉한 쪽이
+/// 안전하다.
+fn canvas_live_window() -> Duration {
+    Duration::from_millis(pref!(gfx_wall_canvas_live_window_ms).max(0) as u64)
+}
 
 /// `gfx_wr_profiler_hud` 를 WebRender profiler UI 문자열로 바꾼다. `None` = 끔.
 ///
@@ -3532,7 +3543,7 @@ impl FrameDelayer {
         !self.pending_canvas_images.is_empty()
     }
 
-    /// 지금 ★캔버스가 살아서 그려지는 중★ 인가. 창은 [`CANVAS_LIVE_WINDOW`] 다.
+    /// 지금 ★캔버스가 살아서 그려지는 중★ 인가. 창은 [`canvas_live_window`] 다(기본 500ms).
     ///
     /// `pending_canvas_images` 로는 이것을 물을 수 없다 -- 그 집합은 rAF 사이에 ***비워진다***
     /// (업로드가 도착하면 지워지고, 그래서 "기다리는 중" 만 답한다). 여기서 묻는 것은
@@ -3540,15 +3551,16 @@ impl FrameDelayer {
     /// 마지막 캔버스 활동으로부터 지난 시간. `None` = 이 타일은 캔버스를 본 적이 없다.
     ///
     /// ★`None` 과 "오래됐다" 는 다른 진단이다★ -- 전자는 캔버스 메시지가 이 페인터에
-    /// 닿지 않는 것이고, 후자는 [`CANVAS_LIVE_WINDOW`] 가 모자란 것이다.
+    /// 닿지 않는 것이고, 후자는 창(`gfx_wall_canvas_live_window_ms`)이 모자란 것이다.
     pub(crate) fn canvas_quiet_for(&self) -> Option<Duration> {
         self.last_canvas_activity_at
             .map(|at| Instant::now().duration_since(at))
     }
 
     pub(crate) fn canvas_is_live(&self) -> bool {
+        let window = canvas_live_window();
         self.last_canvas_activity_at
-            .is_some_and(|at| Instant::now().duration_since(at) < CANVAS_LIVE_WINDOW)
+            .is_some_and(|at| Instant::now().duration_since(at) <= window)
     }
 
     /// 스크립트가 이 painter 의 ack 를 기다리는 중인가. ★스톨 진단용★ — 이 집합이 비지
