@@ -480,6 +480,16 @@ pub(crate) struct PainterInputs {
 /// 흡수하면서 ***구조적인 뒤처짐은 통과시키지 않는 폭***이다.
 const WALL_PUBLISH_BACKLOG_LIMIT: u64 = 2;
 
+/// [`FrameDelayer::canvas_is_live`] 의 창. 이 시간 안에 캔버스 활동이 있었으면 "살아 있다".
+///
+/// ★250ms 를 덮어야 한다★ -- `gfx_paint_side_animation_tick_divisor` 의 런처 기본값이 15 라,
+/// 깎인 상태에서 캔버스는 ***초당 네 번***(250ms 간격) 그려진다. 창이 그보다 짧으면 신호가
+/// 그 사이에 꺼져 ***깎임이 스스로를 유지한다***. 500ms 는 그 간격에 두 배의 여유를 준다.
+///
+/// 반대쪽 비용은 ★캔버스가 사라진 뒤 깎임이 돌아오기까지의 지연★이고, 그것은 0.5 초다 --
+/// 화면에서 캔버스가 빠지는 전환에 한 번 생기고 눈에 보이지 않는다.
+const CANVAS_LIVE_WINDOW: Duration = Duration::from_millis(500);
+
 /// `gfx_wr_profiler_hud` 를 WebRender profiler UI 문자열로 바꾼다. `None` = 끔.
 ///
 /// 값의 뜻은 그 pref 의 doc 주석에 있다. ★`on` 만 여기서 묶음으로 펼치고, 그 외 비어 있지
@@ -1316,6 +1326,28 @@ impl Painter {
                     webview_renderer.for_each_connected_pipeline(&mut |pipeline_details| {
                         paint_side |= pipeline_details.animations.has_paint_animations();
                     });
+                    // ★위 주석이 요구한 신호가 여기 있다.★ 캔버스가 살아서 그려지는 중이면
+                    // 이 WebView 의 rAF 는 ***실제로 프레임을 만든다*** -- 깎으면 그 콘텐츠가
+                    // 그만큼 느려진다. `animation_callbacks_running` 과 달리 캔버스 업로드는
+                    // 양의 증거이고, 장식용 rAF 는 이것을 만들지 않는다.
+                    //
+                    // 실측(2026-11-02, log_webgl_perf_01/01): ticker 와 WebGL 삼각형을 함께
+                    // 표출하면 ***둘 다*** 저더한다. ticker 가 `has_paint_animations` 로 이
+                    // WebView 를 paint 측으로 만들고, 런처 기본값 divisor=15 가 ★WebGL 의 rAF
+                    // 를 초당 네 번으로 깎는다.★ 각각 단독으로는 멀쩡하다 -- WebGL 단독은
+                    // paint 측 애니메이션이 없어 깎이지 않고, ticker 단독은 paint 가 자기
+                    // 시계로 보간한다. `divisor=1` 로 돌리면 둘 다 거의 멀쩡해지고 캔버스
+                    // 대기 거절도 2.7% -> 0.0% 로 떨어진다(run 06).
+                    //
+                    // ★`divisor=1` 을 그냥 쓸 수는 없다★ -- 위 통제 실험이 CSS/paint 측
+                    // 페이지에서는 1 이 오히려 저더라고 수치로 남겼다. 15 도 1 도 혼합
+                    // 콘텐츠에는 맞지 않고, 엔진이 둘을 구별해야 한다.
+                    if paint_side
+                        && pref!(gfx_wall_canvas_defeats_paint_side_throttle)
+                        && self.frame_delayer.canvas_is_live()
+                    {
+                        paint_side = false;
+                    }
                     Some((webview_renderer.id, paint_side))
                 } else {
                     None
@@ -3438,6 +3470,14 @@ pub(crate) struct FrameDelayer {
     /// A list of pipelines that should be notified when we are no longer waiting for
     /// canvas images.
     waiting_pipelines: FxHashSet<PipelineId>,
+    /// 마지막으로 ★캔버스가 그려진 것을 본★ 시각. `None` = 이 타일은 캔버스를 본 적이 없다.
+    ///
+    /// ★이것이 "이 rAF 가 실제로 프레임을 만드는가" 의 신호다★ --
+    /// [`Painter::animating_webviews`] 의 되돌림 주석이 요구한 바로 그것이다. 그 주석은
+    /// `animation_callbacks_running` 이 ***콜백의 존재만*** 말하므로 신호가 아니라고 적었다.
+    /// 캔버스는 다르다: 업로드는 ***그려서 올렸다***는 양의 증거고, 장식용 rAF 는 이것을
+    /// 만들지 않는다.
+    last_canvas_activity_at: Option<Instant>,
 }
 
 impl FrameDelayer {
@@ -3447,6 +3487,7 @@ impl FrameDelayer {
     }
 
     pub(crate) fn update_image(&mut self, image_key: ImageKey, epoch: Epoch) {
+        self.last_canvas_activity_at = Some(Instant::now());
         self.image_epochs.insert(image_key, epoch);
         let Entry::Occupied(entry) = self.pending_canvas_images.entry(image_key) else {
             return;
@@ -3462,6 +3503,7 @@ impl FrameDelayer {
         canvas_epoch: Epoch,
         image_keys: Vec<ImageKey>,
     ) {
+        self.last_canvas_activity_at = Some(Instant::now());
         for image_key in image_keys.into_iter() {
             // If we've already seen the necessary epoch for this image, do not
             // start waiting for it.
@@ -3481,6 +3523,16 @@ impl FrameDelayer {
     /// 올라갔는가". 틱 생산은 ★스크립트의 빚과 무관하게★ 돈다(규칙 2).
     pub(crate) fn waiting_on_canvas_images(&self) -> bool {
         !self.pending_canvas_images.is_empty()
+    }
+
+    /// 지금 ★캔버스가 살아서 그려지는 중★ 인가. 창은 [`CANVAS_LIVE_WINDOW`] 다.
+    ///
+    /// `pending_canvas_images` 로는 이것을 물을 수 없다 -- 그 집합은 rAF 사이에 ***비워진다***
+    /// (업로드가 도착하면 지워지고, 그래서 "기다리는 중" 만 답한다). 여기서 묻는 것은
+    /// "최근에 그려진 적이 있는가" 이므로 시각이 필요하다.
+    pub(crate) fn canvas_is_live(&self) -> bool {
+        self.last_canvas_activity_at
+            .is_some_and(|at| Instant::now().duration_since(at) < CANVAS_LIVE_WINDOW)
     }
 
     /// 스크립트가 이 painter 의 ack 를 기다리는 중인가. ★스톨 진단용★ — 이 집합이 비지

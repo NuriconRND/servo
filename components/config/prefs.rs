@@ -722,6 +722,35 @@ pub struct Preferences {
     /// 기본을 참으로 둔 이유: 근거가 ★코드 읽기뿐이고 실측이 없다.★ 거절 비율을 이유별로
     /// 가르는 `KEEPPREV` 계수기와 함께 실기 A/B 로 확인한 뒤 뒤집는다.
     pub gfx_wall_arm_keep_previous_on_canvas_wait: bool,
+    /// ★캔버스가 살아서 그려지는 중이면 그 WebView 를 paint 측으로 치지 않는다★
+    /// (기본 꺼짐). 그러면 `gfx_paint_side_animation_tick_divisor` 가 그 WebView 의 틱을
+    /// 깎지 않아 rAF 가 전속으로 돈다.
+    ///
+    /// ★왜★(2026-11-02 실측, log_webgl_perf_01/01, 4 타일 테스트 장비). ticker 와 WebGL
+    /// 삼각형을 함께 표출하면 ***둘 다*** 저더한다. 그런데 ***각각 단독으로는 멀쩡하다.***
+    /// `Painter::animating_webviews` 가 `paint_side |= has_paint_animations()` 로 ***OR***
+    /// 판정을 하므로, ticker 하나가 그 WebView 전체를 paint 측으로 만들고, 런처 기본값
+    /// `divisor=15` 가 ★WebGL 의 rAF 를 초당 네 번으로 깎는다.★ WebGL 은 rAF 로 그리므로
+    /// 그만큼 느려진다. `divisor=1` 로 돌리면 둘 다 거의 멀쩡해진다(run 06).
+    ///
+    /// ★`divisor=1` 을 기본으로 쓸 수는 없다.★ 되돌림 기록의 통제 실험(log_ani_debug_04/13,
+    /// 14)이 CSS/paint 측 페이지에서는 `divisor=1` 이 ***오히려 저더***라고 수치로 남겼다
+    /// (`epoch/s` 14.9 대 59.7, `PASSEV/s` 0.21 대 0.71). 15 도 1 도 혼합 콘텐츠에는 맞지
+    /// 않고, ★엔진이 둘을 구별해야 한다.★
+    ///
+    /// ★구별하는 신호가 캔버스다.★ `animating_webviews` 의 되돌림 주석은 다시 손대려면
+    /// ***"이 rAF 가 실제로 프레임을 만드는가"*** 를 판정할 신호를 찾아야 하고
+    /// `animation_callbacks_running` 은 콜백의 존재만 말하므로 그것이 아니라고 적었다.
+    /// 캔버스 업로드는 다르다 -- ***그려서 올렸다***는 양의 증거이고, 그 주석이 예로 든
+    /// 장식용 rAF(HUD 텍스트만 쓰는 것)는 이것을 만들지 않는다. 신호는
+    /// `FrameDelayer::canvas_is_live` 이고 창은 `CANVAS_LIVE_WINDOW`(500ms)다.
+    ///
+    /// ★이 pref 는 `has_paint_animations` 가 참인 WebView 에만 작용한다★ -- 캔버스만 있는
+    /// 페이지는 애초에 깎이지 않으므로 아무것도 바뀌지 않는다.
+    ///
+    /// 기본을 꺼 둔 이유: 근거가 ★한 번의 실기 런과 코드 읽기★ 다. 되돌림 기록이 있는
+    /// 자리이므로 실기 A/B 로 확인한 뒤 뒤집는다.
+    pub gfx_wall_canvas_defeats_paint_side_throttle: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1510,6 +1539,7 @@ impl Preferences {
             gfx_wall_tick_phase_probe: false,
             gfx_wall_single_publish_per_pass: true,
             gfx_wall_arm_keep_previous_on_canvas_wait: true,
+            gfx_wall_canvas_defeats_paint_side_throttle: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
