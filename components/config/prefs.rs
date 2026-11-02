@@ -695,6 +695,33 @@ pub struct Preferences {
     /// pref 를 ***항상 명시적으로*** 넘기므로, `-SinglePublishPerPass` 를 그대로 두면
     /// 스위치 없는 런이 새 기본값을 덮어써서 꺼 버린다(`-NoFrameBarrier` 와 같은 관례).
     pub gfx_wall_single_publish_per_pass: bool,
+    /// 캔버스 대기로 생산을 거절한 타일을 ★무장★ 할지(기본 참 = 옛 동작). 무장하면 셸이
+    /// 그 타일의 ***렌더와 표출을 둘 다 건너뛴다***.
+    ///
+    /// ★끄면(거짓) 어떻게 되는가★: 타일은 여전히 새 프레임을 내지 않지만 셸이 렌더하고
+    /// 표출한다. 그러면 `pump_paint_animation(PumpSource::Render)` 가 돌아
+    /// ***paint 측 애니메이션이 계속 전진한다***. ★단일 페인터 구성과 같은 동작이다.★
+    ///
+    /// ★왜★(2026-11-02, 코드 근거). `wall_tick::decline_may_arm_keep_previous` 의 주석은
+    /// 무장이 아끼는 것을 ***같은 내용의 present 한 번***이라고 적었는데, 그것은 paint 측
+    /// 애니메이션 이전의 셈이다. 지금은 그 pump 가 `Painter::render` 안에 있고
+    /// (`painter.rs:1633`) 다른 호출처는 ***렌더가 네 주기 멈춘 화면*** 전용뿐이다
+    /// (`painter.rs:946-951`). 그래서 무장은 그 타일의 애니메이션을 한 틱 멈춘다.
+    ///
+    /// 운영자 관찰이 그 모양이다: ***ticker 단독·ticker+영상은 멀쩡한데 ticker+WebGL 이면
+    /// ticker 가 저더한다.*** 캔버스 대기는 `DelayNewFrameForCanvas` 가 타일 범위 없이
+    /// WebView 의 네 페인터 전부에 뿌려지고(`paint.rs` 의 `for_each_webview_painter_mut`,
+    /// `FrameDelayer::add_delay` 는 타일 색인도 렌더 사각형도 교차 판정도 받지 않는다),
+    /// 단일 페인터는 `wall_frame_arms_keep_previous` 의 `target_count > 1` 조건에 걸려
+    /// 애초에 무장되지 않는다 -- ★그래서 벽에서만 보인다.★ 영상은 `epoch == None` 으로 와서
+    /// 이 대기를 아예 세우지 않고, CSS 애니메이션은 캔버스를 등록하지 않는다.
+    ///
+    /// ★`RendererBehind` 는 이 pref 와 무관하게 끝까지 무장하지 않는다★ -- 그쪽은 무장이
+    /// 자기잠금이고 근거는 같은 함수의 주석에 있다.
+    ///
+    /// 기본을 참으로 둔 이유: 근거가 ★코드 읽기뿐이고 실측이 없다.★ 거절 비율을 이유별로
+    /// 가르는 `KEEPPREV` 계수기와 함께 실기 A/B 로 확인한 뒤 뒤집는다.
+    pub gfx_wall_arm_keep_previous_on_canvas_wait: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1482,6 +1509,7 @@ impl Preferences {
             gfx_wall_pacing_output: String::new(),
             gfx_wall_tick_phase_probe: false,
             gfx_wall_single_publish_per_pass: true,
+            gfx_wall_arm_keep_previous_on_canvas_wait: true,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

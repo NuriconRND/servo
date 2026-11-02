@@ -158,10 +158,34 @@ pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) 
 /// 돈다. 자유 실행 벽에서는 다음 틱(8.3ms)이 무장을 걷으므로 창이 한 틱이다. 수요 구동
 /// 임베더에서는 더 길 수 있고, 그쪽은 `wall_frame_arms_keep_previous` 가 타일 하나짜리 벽을
 /// 통째로 막아 준다.
-pub(crate) fn decline_may_arm_keep_previous(reason: KeepPreviousReason) -> bool {
+///
+/// ## ★2026-11-02: "같은 내용의 present" 라는 전제가 틀렸다★
+///
+/// 위에서 무장이 아끼는 것을 ***같은 내용의 present 한 번***이라고 적었다. 그것은
+/// ***paint 측 애니메이션 이전의 셈***이다. 지금은 `pump_paint_animation(PumpSource::Render)`
+/// 가 `Painter::render` ***안***에 있고(`painter.rs:1633`), 다른 호출처는
+/// `PumpSource::Idle` 하나뿐인데 그것은 ***렌더가 네 주기 멈춘 화면*** 전용이다
+/// (`painter.rs:946-951`). 그래서 무장이 렌더를 막으면 ★그 타일의 paint 측 애니메이션이
+/// 그 틱에 전진하지 못한다★ -- 그 present 는 같은 내용이 아니라 ***전진한 애니메이션***을
+/// 실어 나른다.
+///
+/// 운영자 관찰이 정확히 그 모양이다(2026-11-02): ***ticker 단독이나 ticker+영상은 멀쩡한데
+/// ticker+WebGL 이면 ticker 가 저더한다.*** 캔버스 대기는 `DelayNewFrameForCanvas` 가
+/// 타일 범위 없이 WebView 의 네 페인터 전부에 뿌려져(`paint.rs:2609`) 캔버스가 없는 타일도
+/// 같이 무장되고, 단일 페인터 구성은 `wall_frame_arms_keep_previous` 의 `target_count > 1`
+/// 조건에 걸려 ***애초에 무장되지 않는다*** -- 그래서 벽에서만 보인다.
+///
+/// `arm_on_canvas_wait` 가 거짓이면 캔버스 대기 거절은 무장하지 않는다. 타일은 여전히 새
+/// 프레임을 내지 않지만 셸이 렌더하고 표출하므로, ★paint 측 애니메이션은 계속 전진한다★ --
+/// 단일 페인터 구성과 같은 동작이다. 값은 `gfx_wall_arm_keep_previous_on_canvas_wait` 에서
+/// 온다(기본 참 = 옛 동작).
+pub(crate) fn decline_may_arm_keep_previous(
+    reason: KeepPreviousReason,
+    arm_on_canvas_wait: bool,
+) -> bool {
     match reason {
         KeepPreviousReason::RendererBehind => false,
-        KeepPreviousReason::WaitingOnCanvasImages => true,
+        KeepPreviousReason::WaitingOnCanvasImages => arm_on_canvas_wait,
     }
 }
 
@@ -471,7 +495,7 @@ mod tests {
     /// (실측 2026-10-22: 논리 프레임이 3 에서 멈추고 skip 로그가 초당 63 회).
     #[test]
     fn a_back_pressure_decline_is_never_armed() {
-        let armable = decline_may_arm_keep_previous(KeepPreviousReason::RendererBehind);
+        let armable = decline_may_arm_keep_previous(KeepPreviousReason::RendererBehind, true);
         assert!(
             !armable,
             "역압 거절에 무장하면 무장이 막는 렌더가 곧 그 역압을 푸는 자리다 \
@@ -483,12 +507,32 @@ mod tests {
     /// 기다림을 푸는 것은 렌더가 아니라 `update_images` 도착이다.
     #[test]
     fn a_canvas_wait_decline_may_be_armed() {
-        let armable = decline_may_arm_keep_previous(KeepPreviousReason::WaitingOnCanvasImages);
+        let armable =
+            decline_may_arm_keep_previous(KeepPreviousReason::WaitingOnCanvasImages, true);
         assert!(
             armable,
             "캔버스 대기는 렌더와 무관하므로 같은 내용의 present 한 번을 아껴도 된다 \
              (실제 {armable})"
         );
+    }
+
+    /// ★캔버스 대기 무장을 끄면 그 사유도 무장하지 않는다★ --
+    /// `gfx_wall_arm_keep_previous_on_canvas_wait=false` 의 뜻이 이것이다. 타일은 여전히
+    /// 새 프레임을 내지 않지만 셸이 렌더하므로 `pump_paint_animation(PumpSource::Render)`
+    /// 가 돌고 paint 측 애니메이션이 전진한다(단일 페인터 구성과 같은 동작).
+    #[test]
+    fn turning_off_canvas_wait_arming_disarms_only_that_reason() {
+        assert!(!decline_may_arm_keep_previous(
+            KeepPreviousReason::WaitingOnCanvasImages,
+            false
+        ));
+        // ★역압은 이 pref 와 무관하다★ -- 어느 쪽이든 무장하지 않는다(자기잠금이므로).
+        for arm_on_canvas_wait in [true, false] {
+            assert!(!decline_may_arm_keep_previous(
+                KeepPreviousReason::RendererBehind,
+                arm_on_canvas_wait
+            ));
+        }
     }
 
     /// ★타일이 여럿일 때만 무장한다 -- 그때만 섞일 상대가 있다.★ 설계 2-5.

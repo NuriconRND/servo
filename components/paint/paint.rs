@@ -2166,7 +2166,10 @@ impl Paint {
                 Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
                 Some(TileOutcome::KeepPrevious(reason)) => {
                     kept_previous_painter_ids.push(*painter_id);
-                    if crate::wall_tick::decline_may_arm_keep_previous(reason) {
+                    if crate::wall_tick::decline_may_arm_keep_previous(
+                        reason,
+                        pref!(gfx_wall_arm_keep_previous_on_canvas_wait),
+                    ) {
                         armable_painter_ids.push(*painter_id);
                     }
                 },
