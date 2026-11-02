@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>ticker + webgl mix probe</title>
+<!--
+  ★왜 이 페이지가 필요한가★(2026-11-02)
+
+  운영자 관찰: ticker 단독이나 ticker+영상은 멀쩡한데 ★WebGL 과 함께 표출하면 ticker 가
+  저더한다.★ 코드를 읽어 보니 한 캔버스가 ***두 경로***로 때린다.
+
+   ① paint 쪽 -- `DelayNewFrameForCanvas` 가 타일 범위 없이 WebView 의 네 페인터 전부에
+      무장한다. 무장은 셸의 `Painter::render` 를 막고, 그 안에 paint 측 애니메이션을
+      전진시키는 `pump_paint_animation(PumpSource::Render)` 가 있다(painter.rs:1633).
+      그래서 ★캔버스가 없는 타일의 ticker 도 그 틱에 멈춘다.★
+   ② script 쪽 -- 대기가 걸린 Document 는 `update_the_rendering` 에서 통째로 건너뛰어져
+      ★같은 문서의 ticker 는 자기 갱신까지 막힌다.★
+
+  ★①과 ②를 가르지 못하면 수정을 평가할 수 없다★ -- `-NoArmOnCanvasWait` 는 ①만 고친다.
+  그래서 WebGL 을 ***같은 문서***에 둘지 ***iframe***(별개 파이프라인)에 둘지 고를 수 있게
+  했다. iframe 이면 문서 잠금이 ticker 를 비껴가므로 ★남는 것은 ① 뿐이다.★
+
+  ★쿼리★
+    ?gl=off     WebGL 없음 -- 대조군. 무장 자체가 일어나지 않아야 한다.
+    ?gl=same    같은 문서에 WebGL 캔버스 -- ①+② 둘 다.
+    ?gl=iframe  iframe 에 WebGL -- ★① 만.★ (기본)
+    &speed=N    ticker 한 바퀴 초. 기본 4. 작을수록 눈에 잘 보인다.
+    &bands=N    ticker 띠 수. 기본 3.
+
+  ★ticker 는 단조 키프레임 마퀴다★ -- 사본 둘을 음수 `delay` 로 이어 붙여 되돌아감이
+  없게 한다(`ticker_slice_probe.html?marquee=N` 과 같은 기법). 되돌아가는 키프레임은
+  반복 경계에서 값이 점프해 ***저더와 구별할 수 없는*** 끊김을 만든다.
+
+  WebGL 은 `wall_webgl2_min_triangle.html` 을 그대로 쓴다 -- 같은 소스를 두 벌 두지
+  않는다. iframe 모드는 그 파일을 참조하므로 ★같은 디렉터리에 함께 있어야 한다.★
+-->
+<style>
+  html,body{margin:0;height:100%;background:#111;overflow:hidden;font-family:system-ui,sans-serif}
+  #wrap{position:absolute;inset:0;display:flex;flex-direction:column}
+  .band{position:relative;flex:1;overflow:hidden;border-bottom:1px solid #333}
+  .run{position:absolute;top:0;left:0;height:100%;display:flex;align-items:center;
+       white-space:nowrap;font-weight:700;color:#eee;will-change:transform}
+  .run.b{}
+  #glbox{position:absolute;right:0;bottom:0;width:38%;height:38%;border:2px solid #444;background:#000}
+  #glbox>*{width:100%;height:100%;border:0;display:block}
+  #hud{position:absolute;left:4px;top:4px;z-index:9;color:#6f6;font:12px monospace;
+       background:#000a;padding:2px 5px;white-space:pre}
+</style>
+</head>
+<body>
+<div id="hud">...</div>
+<div id="wrap"></div>
+<div id="glbox"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const mode   = (q.get('gl') || 'iframe').toLowerCase();
+const speed  = Math.max(0.2, parseFloat(q.get('speed') || '4'));
+const bands  = Math.max(1, Math.min(12, parseInt(q.get('bands') || '3', 10)));
+
+// ── ticker ─────────────────────────────────────────────────────────────────
+// 한 띠는 사본 둘이고, 둘째는 음수 delay 로 반 주기 앞서 출발한다. 키프레임이
+// 0% -> -50% 단조라서 반복 경계에서 값이 점프하지 않는다.
+const style = document.createElement('style');
+style.textContent =
+  '@keyframes march{from{transform:translateX(0)}to{transform:translateX(-50%)}}';
+document.head.appendChild(style);
+
+const wrap = document.getElementById('wrap');
+const TEXT = '█ WALL TICKER — 0123456789 — 가나다라마바사 █ ';
+for (let i = 0; i < bands; i++) {
+  const band = document.createElement('div');
+  band.className = 'band';
+  for (let copy = 0; copy < 2; copy++) {
+    const run = document.createElement('div');
+    run.className = 'run' + (copy ? ' b' : '');
+    // 한 사본이 띠를 두 번 덮을 만큼 길게 -- translateX(-50%) 가 정확히 한 바퀴다.
+    run.textContent = TEXT.repeat(24);
+    run.style.fontSize = (1.4 + i * 0.25).toFixed(2) + 'rem';
+    run.style.animation = 'march ' + speed + 's linear infinite';
+    run.style.animationDelay = (copy ? -speed / 2 : 0) + 's';
+    band.appendChild(run);
+  }
+  wrap.appendChild(band);
+}
+
+// ── WebGL ──────────────────────────────────────────────────────────────────
+const glbox = document.getElementById('glbox');
+if (mode === 'off') {
+  glbox.style.display = 'none';
+} else if (mode === 'iframe') {
+  // ★별개 파이프라인★ -- 문서 잠금이 이 문서의 ticker 를 비껴간다.
+  const f = document.createElement('iframe');
+  f.src = 'wall_webgl2_min_triangle.html';
+  glbox.appendChild(f);
+} else {
+  // ★같은 문서★ -- 문서 잠금까지 ticker 에 걸린다.
+  glbox.appendChild(buildInlineCanvas());
+}
+
+function buildInlineCanvas() {
+  const cv = document.createElement('canvas');
+  const gl = cv.getContext('webgl2');
+  if (!gl) { const d = document.createElement('div');
+    d.style.color = '#f66'; d.textContent = 'no webgl2'; return d; }
+  function resize(){ cv.width = glbox.clientWidth; cv.height = glbox.clientHeight;
+    gl.viewport(0, 0, cv.width, cv.height); }
+  const vs = '#version 300 es\nin vec2 p; uniform float a; out vec3 col;\n' +
+    'void main(){ float c=cos(a),s=sin(a); vec2 q=mat2(c,-s,s,c)*p;' +
+    ' gl_Position=vec4(q,0.,1.); col=vec3(p*0.5+0.5,1.); }';
+  const fs = '#version 300 es\nprecision highp float; in vec3 col; out vec4 o;' +
+    ' void main(){ o=vec4(col,1.); }';
+  function sh(t, src){ const s = gl.createShader(t); gl.shaderSource(s, src);
+    gl.compileShader(s); return s; }
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER,
+    new Float32Array([0, 0.8, -0.8, -0.7, 0.8, -0.7]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(pr, 'p');
+  gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  const ua = gl.getUniformLocation(pr, 'a');
+  let f = 0;
+  requestAnimationFrame(function frame(){
+    if (cv.width !== glbox.clientWidth) resize();
+    f++; gl.clearColor(0.1, 0.1, 0.15, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(pr); gl.bindVertexArray(vao);
+    gl.uniform1f(ua, f * 0.02); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  });
+  resize();
+  return cv;
+}
+
+// ── HUD ────────────────────────────────────────────────────────────────────
+// ★rAF 속도는 저더의 지표가 아니다★ -- 구성을 눈으로 확인하는 용도다. 벽의 판정은
+// 엔진 쪽 KEEPPREV/FRAMESRC 와 육안이다.
+let n = 0, t0 = performance.now();
+const hud = document.getElementById('hud');
+requestAnimationFrame(function tick(){
+  n++;
+  const dt = performance.now() - t0;
+  if (dt >= 1000) {
+    hud.textContent = 'gl=' + mode + ' speed=' + speed + 's bands=' + bands +
+      '\nrAF ' + (n * 1000 / dt).toFixed(1) + '/s';
+    n = 0; t0 = performance.now();
+  }
+  requestAnimationFrame(tick);
+});
+console.log('[MIX] gl=' + mode + ' speed=' + speed + ' bands=' + bands);
+</script>
+</body></html>
