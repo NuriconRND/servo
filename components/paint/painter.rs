@@ -703,6 +703,12 @@ impl Painter {
             crate::paint_animation_mesh_probe::start();
         }
 
+        // ★프레임 발행 출처★ -- `gfx_wall_tick_phase_probe` 와 한 스위치를 쓴다(`-TickPhase`).
+        // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
+        if pref!(gfx_wall_tick_phase_probe) {
+            crate::frame_source_probe::start();
+        }
+
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
             Box::new(RenderNotifier::new(painter_id, paint.paint_proxy.clone())),
@@ -1728,6 +1734,12 @@ impl Painter {
         // Every composite carries the newest coalesced video frames, so held updates wait at
         // most until the next generated frame (see `pending_video_frame_updates`).
         self.flush_pending_video_frame_updates(transaction);
+        // ★프레임 발행의 유일한 깔때기다★ -- 벽 틱만 `wall_logical_frame_id` 를 들고 오므로
+        // 그 하나로 "틱이 낸 것" 과 "그 밖이 낸 것" 이 갈린다(규칙 1 을 발행 지점에서 센다).
+        crate::frame_source_probe::note_frame(
+            wall_logical_frame_id.is_some(),
+            u64::from(reason.bits()),
+        );
         transaction.generate_frame(0, true /* present */, false /* tracked */, reason);
         let pending_frames_before_request = self.pending_frames.get();
         self.record_frame_request(wall_logical_frame_id);
