@@ -480,6 +480,25 @@ pub(crate) struct PainterInputs {
 /// 흡수하면서 ***구조적인 뒤처짐은 통과시키지 않는 폭***이다.
 const WALL_PUBLISH_BACKLOG_LIMIT: u64 = 2;
 
+/// 이 WebView 가 ★어떤 박자로 틱을 받아야 하는가.★
+///
+/// `RefreshDriver` 가 이 값으로 `gfx_paint_side_animation_tick_divisor` 를 적용할지,
+/// ***다른 약수를 쓸지***, 아예 깎지 않을지를 고른다. 전에는 `bool` 이었고 그래서
+/// ★전부 깎기 아니면 전혀 안 깎기★ 뿐이었다 -- 2026-11-02 에 그 둘 다 저더라는 것이
+/// 실측으로 드러나(15 는 캔버스를 굶기고 1 은 리플로를 네 배로 만든다) 사이를 열었다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickCadence {
+    /// 깎지 않는다. 화면의 움직임을 paint 측이 재현할 수 없는 WebView.
+    Full,
+    /// `gfx_paint_side_animation_tick_divisor` 로 깎는다. 움직임이 전부 paint 측 예측에서
+    /// 나오므로 틱을 줄여도 화면은 그대로다.
+    PaintSide,
+    /// paint 측 애니메이션과 ★살아 있는 캔버스가 함께 있다.★
+    /// `gfx_wall_live_canvas_tick_divisor` 로 깎는다 -- 캔버스가 굶지 않을 만큼 자주,
+    /// 리플로가 폭발하지 않을 만큼 드물게.
+    LiveCanvas,
+}
+
 /// [`FrameDelayer::canvas_is_live`] 의 창. 이 시간 안에 캔버스 활동이 있었으면 "살아 있다".
 ///
 /// ★값은 `gfx_wall_canvas_live_window_ms` 에서 온다(기본 500).★ 상수였다가 pref 로 뺐다 --
@@ -1294,7 +1313,7 @@ impl Painter {
     /// The tiles of one wall frame are one tick, and the painter that owns the `WebView`
     /// is the one that speaks for it. Every other painter stays quiet, and a shell with a
     /// single painter is unaffected because it owns everything it paints.
-    pub(crate) fn animating_webviews(&self) -> Vec<(WebViewId, bool)> {
+    pub(crate) fn animating_webviews(&self) -> Vec<(WebViewId, TickCadence)> {
         self.webview_renderers
             .values()
             .filter_map(|webview_renderer| {
@@ -1353,6 +1372,11 @@ impl Painter {
                     // ★`divisor=1` 을 그냥 쓸 수는 없다★ -- 위 통제 실험이 CSS/paint 측
                     // 페이지에서는 1 이 오히려 저더라고 수치로 남겼다. 15 도 1 도 혼합
                     // 콘텐츠에는 맞지 않고, 엔진이 둘을 구별해야 한다.
+                    let mut cadence = if paint_side {
+                        TickCadence::PaintSide
+                    } else {
+                        TickCadence::Full
+                    };
                     if paint_side && pref!(gfx_wall_canvas_defeats_paint_side_throttle) {
                         // ★수정이 바꾸는 바로 그 양을 센다.★ 판정이 되돌려졌는지, 안
                         // 되돌려졌다면 캔버스가 얼마나 오래 조용했는지 -- 창이 모자란
@@ -1363,10 +1387,23 @@ impl Painter {
                             self.frame_delayer.canvas_quiet_for(),
                         );
                         if live {
-                            paint_side = false;
+                            // ★전속이 아니라 캔버스 전용 박자다.★ 2026-11-02 에 여기서
+                            // 깎임을 통째로 풀었더니(= 약수 1) 게이트는 99.9% 발동했는데
+                            // ***저더가 남았다***(log_webgl_perf_01/03 의 run 12·13:
+                            // `defeated=1719/1720 stale_worst=0ms` 인데 육안 차이 없음).
+                            // 깎임이 아끼던 비용이 그대로 돌아온 것이다 -- 되돌림 기록의
+                            // 통제 실험이 약수 1 에서 디스플레이 리스트가 15/s 에서 60/s 로,
+                            // 리플로가 네 배가 되어 저더가 났다고 적었고, 실제 output
+                            // 페이지는 WAAPI ticker 셋에 영역 포즈까지 들고 있어 틱마다
+                            // restyle 한다.
+                            //
+                            // ★캔버스는 전속을 필요로 하지 않는다.★ 실측된 WebGL 소스는
+                            // `?fps=30` 으로 스스로 묶는다(`setTimeout(1000/30)` 뒤에 rAF).
+                            // 그래서 15 와 1 사이가 필요하다.
+                            cadence = TickCadence::LiveCanvas;
                         }
                     }
-                    Some((webview_renderer.id, paint_side))
+                    Some((webview_renderer.id, cadence))
                 } else {
                     None
                 }

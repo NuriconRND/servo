@@ -17,7 +17,7 @@ use servo_base::id::{PainterId, WebViewId};
 use servo_constellation_traits::EmbedderToConstellationMessage;
 use timers::{BoxedTimerCallback, TimerEventRequest, TimerScheduler};
 
-use crate::painter::Painter;
+use crate::painter::{Painter, TickCadence};
 use crate::webview_renderer::WebViewRenderer;
 
 /// The [`BaseRefreshDriver`] is a "base class" for [`RefreshDriver`] trait
@@ -247,12 +247,21 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         // `gfx_refresh_hz`/divisor 다. 예전 측정값과 비교하는 사람이 회귀로 읽지 않도록
         // 여기 적어 둔다(`Timer`/`Vsync` 의 옛 기대값은 자유 구동 페인트 타이머 기준이었다).
         let divisor = servo_config::pref!(gfx_paint_side_animation_tick_divisor).max(1) as u64;
+        // ★살아 있는 캔버스는 다른 약수를 쓴다.★ 근거는 `TickCadence::LiveCanvas` 와
+        // `gfx_wall_live_canvas_tick_divisor` 의 doc 주석에 있다 -- 요점은 15 와 1 둘 다
+        // 저더라는 것이고(하나는 캔버스를 굶기고 하나는 리플로를 네 배로 만든다), 그래서
+        // 사이가 필요하다.
+        let canvas_divisor = servo_config::pref!(gfx_wall_live_canvas_tick_divisor).max(1) as u64;
         let frame = self.frames_observed.get().wrapping_add(1);
         self.frames_observed.set(frame);
-        let due_for_paint_driven = divisor == 1 || frame % divisor == 0;
+        let due = |divisor: u64| divisor == 1 || frame % divisor == 0;
         let webviews_to_tick: Vec<WebViewId> = animating_webviews
             .into_iter()
-            .filter(|(_, paint_driven)| !*paint_driven || due_for_paint_driven)
+            .filter(|(_, cadence)| match cadence {
+                TickCadence::Full => true,
+                TickCadence::PaintSide => due(divisor),
+                TickCadence::LiveCanvas => due(canvas_divisor),
+            })
             .map(|(webview_id, _)| webview_id)
             .collect();
         if webviews_to_tick.is_empty() {

@@ -770,6 +770,25 @@ pub struct Preferences {
     /// 판정은 `PAINTSIDE` 줄의 `stale_worst` 로 한다 -- 그 값보다 창이 크면 신호가 꺼지지
     /// 않는다.
     pub gfx_wall_canvas_live_window_ms: i64,
+    /// paint 측 애니메이션과 ★살아 있는 캔버스가 함께 있을 때★ 쓰는 틱 약수(기본 2).
+    /// `gfx_wall_canvas_defeats_paint_side_throttle` 가 켜져 있을 때만 쓰인다.
+    ///
+    /// ★왜 1 이 아닌가★(2026-11-02 실측, log_webgl_perf_01/03). 처음에는 캔버스가 살아
+    /// 있으면 깎임을 ***완전히*** 풀었다(= 약수 1). 게이트는 ***99.9% 발동했고***
+    /// (`PAINTSIDE defeated=1719/1720 stale_worst=0ms`) 캔버스 거절도 1.5% -> 0.6% 로
+    /// 떨어졌는데, ***육안 저더는 그대로였다.*** 깎임이 아끼던 비용이 그대로 돌아온 것이다
+    /// -- 되돌림 기록 `87f593db7d2` 의 통제 실험이 약수 1 에서 디스플레이 리스트가 15/s
+    /// 에서 60/s 로, 리플로가 네 배가 되어 저더가 났다고 적었고, 실제 output 페이지는
+    /// WAAPI ticker 셋에 영역 포즈까지 들고 있어 틱마다 restyle 한다.
+    ///
+    /// ★캔버스는 전속을 필요로 하지 않는다.★ 실측된 WebGL 소스는 `?fps=30` 으로 스스로
+    /// 묶는다(`setTimeout(1000/30)` 뒤에 rAF). 2 는 60Hz 에서 30/s 이고 그 페이지가 원하는
+    /// 바로 그 속도다 -- 캔버스가 굶지 않고 리플로는 전속의 절반이다.
+    ///
+    /// ★15 와 1 둘 다 저더이고 사이가 비어 있었다★ -- 하나는 캔버스를 초당 네 번으로
+    /// 굶기고 하나는 리플로를 네 배로 만든다. 콘텐츠의 자체 프레임률을 알면 거기 맞추는
+    /// 것이 맞고, 모르면 2 가 안전한 출발점이다.
+    pub gfx_wall_live_canvas_tick_divisor: i64,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1560,6 +1579,7 @@ impl Preferences {
             gfx_wall_arm_keep_previous_on_canvas_wait: true,
             gfx_wall_canvas_defeats_paint_side_throttle: false,
             gfx_wall_canvas_live_window_ms: 500,
+            gfx_wall_live_canvas_tick_divisor: 2,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
