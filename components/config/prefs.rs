@@ -789,7 +789,7 @@ pub struct Preferences {
     /// 굶기고 하나는 리플로를 네 배로 만든다. 콘텐츠의 자체 프레임률을 알면 거기 맞추는
     /// 것이 맞고, 모르면 2 가 안전한 출발점이다.
     pub gfx_wall_live_canvas_tick_divisor: i64,
-    /// 캔버스 이미지 대기가 ★틱 생산을 막는가★(기본 참 = 옛 동작).
+    /// 캔버스 이미지 대기가 ★틱 생산을 막는가★(★기본 거짓★ -- 2026-11-03 실기 A/B 로 뒤집었다).
     ///
     /// ★왜 이 pref 가 있는가.★ 참이면 캔버스 비트맵 한 장이 최신이 아니라는 이유로 그
     /// 페인터가 ***이번 틱 전체를*** 거절하고, 그러면 ***그 프레임에 있는 다른 모든 것***
@@ -806,13 +806,30 @@ pub struct Preferences {
     /// 순환하는 정상 상태에서는 ***직전에 보여준 프레임***이므로(surfman `take_surface`)
     /// 캔버스만 한 프레임 낡는다.
     ///
-    /// ★크기는 작다★: 실측에서 이 거절은 (페인터, 틱) 쌍의 1.2% 였다
-    /// (2026-11-03, log_webgl_perf_01/05, `KEEPPREV canvas=260 (1.2%)`). 그래서 이것만으로
-    /// 육안 저더가 사라질 것으로 보지 않는다 -- ★구조가 거꾸로인 것을 바로잡는 것★이고,
-    /// 판정은 `KEEPPREV` 의 `canvas` 가 0 으로 가는지다.
+    /// ★실기 A/B 로 확정하고 2026-11-03 에 기본값을 뒤집었다★
+    /// (log_webgl_perf_01/08, 4 타일 테스트 장비, ticker + WebGL 구성):
+    ///
+    ///     거절 켬(옛 동작)  KEEPPREV canvas=196 (0.9%)   ***전환 후 저더 발생***
+    ///     거절 끔(지금)     KEEPPREV canvas=0   (0.0%)   ***전환 후 저더 없음***
+    ///
+    /// ★작은 비율이 보이지 않는다는 추정은 틀렸다.★ 거절은 (페인터, 틱) 쌍의 1% 안쪽이고
+    /// 나도 "이것만으로 육안이 바뀔 것으로 보지 않는다" 고 적었는데, ***바뀌었다.*** 전체
+    /// 2.4 회/초, 페인터당 0.6 회/초 -- 즉 ***1.7 초마다 한 프레임이 무작위로 빠진다***.
+    /// 규칙적인 저하가 아니라 불규칙한 결손이라 멈칫으로 보인다. ★비율의 크기로 가시성을
+    /// 추정하지 말 것.★
     ///
     /// `RendererBehind` 거절은 이 pref 와 무관하다 -- 그쪽은 "낸 프레임이 아직 안 그려졌다"
     /// 이므로 더 내면 쌓인다.
+    ///
+    /// 되돌려 비교하려면 런처의 `-CanvasWaitDecline`. ★스위치를 켜는 쪽으로 뒤집은 이유★:
+    /// 런처가 pref 를 ***항상 명시적으로*** 넘기므로, 끄는 쪽 스위치를 그대로 두면 스위치
+    /// 없는 런이 새 기본값을 덮어써서 옛 동작으로 돌아간다(`-NoFrameBarrier` 와 반대 방향의
+    /// 같은 관례, `gfx_wall_single_publish_per_pass` 에서 한 번 걸린 함정이다).
+    ///
+    /// ★남은 별건★: 이 수정이 든 상태에서도 캔버스를 ***네 타일 전체 영역***
+    /// (11520x4320)으로 확대하면 저더가 난다. 그쪽은 모든 WebGL 명령이 4 GPU 의 별도
+    /// 컨텍스트로 복제되는 축이고(`webgl_thread.rs` 의 `apply_webgl_command_to_all_backends`),
+    /// 이 pref 와 무관하다.
     pub gfx_wall_canvas_wait_declines_production: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
@@ -1605,7 +1622,7 @@ impl Preferences {
             gfx_wall_canvas_defeats_paint_side_throttle: false,
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
-            gfx_wall_canvas_wait_declines_production: true,
+            gfx_wall_canvas_wait_declines_production: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
