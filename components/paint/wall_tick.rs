@@ -97,11 +97,35 @@ pub(crate) enum KeepPreviousReason {
 /// 좁히려면 "캔버스 대기 타일도 비디오 flush 만은 한다" 가 필요한데, 그러면 거절 타일이
 /// 트랜잭션을 내게 되어 `TileOutcome` 의 두 갈래 계약이 깨진다 -- 실기 벽에서 재기 전에는
 /// 손대지 않는다.
-pub(crate) fn tile_may_generate(renderer_behind: bool, waiting_on_canvas: bool) -> TileOutcome {
+///
+/// ## ★2026-11-03: `canvas_wait_declines` 로 그 좁힘을 끌 수 있다★
+///
+/// 위 주석이 적은 좁힘은 ***비디오만의 문제가 아니다.*** 캔버스 비트맵 한 장이 최신이
+/// 아니라는 이유로 ***그 프레임에 있는 다른 모든 것***(ticker 애니메이션, 페이지 전체)을
+/// 같이 버린다. ★교환이 반대다★ -- 캔버스가 한 프레임 낡은 것은 눈에 보이지 않고, 벽
+/// 프레임을 한 장 버리는 것은 보인다.
+///
+/// 위 주석의 근거는 ***"지연이지 정지가 아니다 -- 이미지가 닿으면 `UpdateImages` 가 다음
+/// 에지를 예약한다"*** 였다. ★그것은 수요 구동 임베더의 셈이다.★ `winit_wall` 은 자유 실행
+/// 틱이라 다음 에지가 16.7ms 뒤에 ***어차피 온다*** -- 예약이 사 주는 것이 없고, 남는 것은
+/// 버린 프레임 한 장이다.
+///
+/// 거짓이면 캔버스 대기는 생산을 막지 않고, 그 프레임은 ★캔버스가 지금 들고 있는 비트맵★
+/// 으로 짜인다. 그것은 `lock_swap_chain` 이 `take_surface` 로 집는 것이고, 두 장이 순환하는
+/// 정상 상태에서는 ***직전에 보여준 프레임***이다(`third_party/surfman/src/chains.rs:317`).
+/// 즉 캔버스만 한 프레임 낡는다.
+///
+/// ★`renderer_behind` 는 이 값과 무관하게 끝까지 거절한다★ -- 그쪽은 "낸 프레임이 아직 안
+/// 그려졌다" 이므로 더 내면 쌓인다.
+pub(crate) fn tile_may_generate(
+    renderer_behind: bool,
+    waiting_on_canvas: bool,
+    canvas_wait_declines: bool,
+) -> TileOutcome {
     if renderer_behind {
         return TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind);
     }
-    if waiting_on_canvas {
+    if waiting_on_canvas && canvas_wait_declines {
         return TileOutcome::KeepPrevious(KeepPreviousReason::WaitingOnCanvasImages);
     }
     TileOutcome::Generated
@@ -456,7 +480,7 @@ mod tests {
     #[test]
     fn a_tile_that_is_behind_keeps_its_previous_frame() {
         assert_eq!(
-            tile_may_generate(true, false),
+            tile_may_generate(true, false, true),
             TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind)
         );
     }
@@ -466,7 +490,7 @@ mod tests {
     #[test]
     fn a_tile_that_is_both_behind_and_waiting_reports_being_behind() {
         assert_eq!(
-            tile_may_generate(true, true),
+            tile_may_generate(true, true, true),
             TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind)
         );
     }
@@ -476,14 +500,37 @@ mod tests {
     #[test]
     fn a_tile_waiting_on_canvas_keeps_its_previous_frame() {
         assert_eq!(
-            tile_may_generate(false, true),
+            tile_may_generate(false, true, true),
             TileOutcome::KeepPrevious(KeepPreviousReason::WaitingOnCanvasImages)
         );
     }
 
     #[test]
     fn a_free_tile_generates() {
-        assert_eq!(tile_may_generate(false, false), TileOutcome::Generated);
+        assert_eq!(
+            tile_may_generate(false, false, true),
+            TileOutcome::Generated
+        );
+    }
+
+    /// ★거절을 끄면 캔버스 대기가 생산을 막지 않는다★ --
+    /// `gfx_wall_canvas_wait_declines_production=false` 의 뜻이 이것이다. 그 프레임은
+    /// 캔버스가 지금 들고 있는 비트맵으로 짜이고, ***같은 프레임의 다른 모든 것***은
+    /// 제시간에 나간다.
+    #[test]
+    fn turning_the_canvas_wait_decline_off_still_produces() {
+        assert_eq!(
+            tile_may_generate(false, true, false),
+            TileOutcome::Generated,
+            "캔버스 한 장이 낡았다고 그 프레임의 다른 모든 것을 버리는 것이 뒤집으려던 교환이다"
+        );
+        // ★역압은 이 pref 와 무관하다★ -- 낸 프레임이 아직 안 그려졌으면 더 내면 쌓인다.
+        for declines in [true, false] {
+            assert_eq!(
+                tile_may_generate(true, true, declines),
+                TileOutcome::KeepPrevious(KeepPreviousReason::RendererBehind)
+            );
+        }
     }
 
     /// ★역압 거절은 절대 무장하지 않는다 -- 무장이 자기 전제를 영구화한다.★

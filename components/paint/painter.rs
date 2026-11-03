@@ -2685,7 +2685,11 @@ impl Painter {
     ) -> TileOutcome {
         let behind = self.renderer_behind();
         let waiting = self.frame_delayer.waiting_on_canvas_images();
-        match tile_may_generate(behind, waiting) {
+        match tile_may_generate(
+            behind,
+            waiting,
+            pref!(gfx_wall_canvas_wait_declines_production),
+        ) {
             keep_previous @ TileOutcome::KeepPrevious(_) => {
                 // 이유별로 센다 -- 트리에 이것을 가르는 계수기가 없었다. 근거는
                 // `frame_source_probe::KEEP_CANVAS` 의 doc 주석에 있다.

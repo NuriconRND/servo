@@ -789,6 +789,31 @@ pub struct Preferences {
     /// 굶기고 하나는 리플로를 네 배로 만든다. 콘텐츠의 자체 프레임률을 알면 거기 맞추는
     /// 것이 맞고, 모르면 2 가 안전한 출발점이다.
     pub gfx_wall_live_canvas_tick_divisor: i64,
+    /// 캔버스 이미지 대기가 ★틱 생산을 막는가★(기본 참 = 옛 동작).
+    ///
+    /// ★왜 이 pref 가 있는가.★ 참이면 캔버스 비트맵 한 장이 최신이 아니라는 이유로 그
+    /// 페인터가 ***이번 틱 전체를*** 거절하고, 그러면 ***그 프레임에 있는 다른 모든 것***
+    /// (ticker 애니메이션, 페이지 전체, 승격되지 않은 비디오)이 같이 버려진다.
+    /// `wall_tick::tile_may_generate` 의 주석이 이것을 "이 브랜치에서 유일하게 바닥을 좁힌
+    /// 자리" 로 적어 두었고, 비디오가 같이 서는 것까지 기록해 두었다.
+    ///
+    /// ★교환이 반대다★ -- 캔버스가 한 프레임 낡은 것은 눈에 보이지 않고, 벽 프레임을 한 장
+    /// 버리는 것은 보인다. 그리고 그 주석의 근거(***"지연이지 정지가 아니다 -- 이미지가
+    /// 닿으면 다음 에지를 예약한다"***)는 ★수요 구동 임베더의 셈★ 이다. `winit_wall` 은
+    /// 자유 실행 틱이라 다음 에지가 16.7ms 뒤에 어차피 오므로 예약이 사 주는 것이 없다.
+    ///
+    /// 거짓이면 그 프레임은 ★캔버스가 지금 들고 있는 비트맵★ 으로 짜인다 -- 두 장이
+    /// 순환하는 정상 상태에서는 ***직전에 보여준 프레임***이므로(surfman `take_surface`)
+    /// 캔버스만 한 프레임 낡는다.
+    ///
+    /// ★크기는 작다★: 실측에서 이 거절은 (페인터, 틱) 쌍의 1.2% 였다
+    /// (2026-11-03, log_webgl_perf_01/05, `KEEPPREV canvas=260 (1.2%)`). 그래서 이것만으로
+    /// 육안 저더가 사라질 것으로 보지 않는다 -- ★구조가 거꾸로인 것을 바로잡는 것★이고,
+    /// 판정은 `KEEPPREV` 의 `canvas` 가 0 으로 가는지다.
+    ///
+    /// `RendererBehind` 거절은 이 pref 와 무관하다 -- 그쪽은 "낸 프레임이 아직 안 그려졌다"
+    /// 이므로 더 내면 쌓인다.
+    pub gfx_wall_canvas_wait_declines_production: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1580,6 +1605,7 @@ impl Preferences {
             gfx_wall_canvas_defeats_paint_side_throttle: false,
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
+            gfx_wall_canvas_wait_declines_production: true,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
