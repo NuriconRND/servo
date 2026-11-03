@@ -1621,6 +1621,12 @@ impl Painter {
             }
         }
 
+        // ★렌더 전체를 잰다★ -- 외부 이미지(WebGL 캔버스) 비트맵을 가져오는
+        // `lock_swap_chain` 은 WR 의 합성 중에, 즉 ***이 함수 안에서*** 일어난다. 그래서
+        // 그 비용은 캔버스만의 비용이 아니라 ***이 프레임에 실린 모든 것***의 비용이다.
+        let render_started_for_probe =
+            crate::frame_source_probe::is_enabled().then(Instant::now);
+
         // 이 스레드의 렌더 프레임 경계를 알린다. 프레임 **안에서** 하는 일에 상한을
         // 두려는 쪽(새 비디오 링의 최초 소비)이 이 값으로 프레임이 바뀐 것을 안다.
         paint_api::render_frame::begin_render_frame();
@@ -1723,6 +1729,12 @@ impl Painter {
         // 인라인 경로에서는 셸이 present 하므로 여기서는 아무것도 하지 않는다.
         if self.owns_presentation {
             self.rendering_context.present();
+        }
+
+        // ★present 까지 포함해서 잰다.★ 스레드 타일은 자기가 표출하고 셸의 조인이 그것까지
+        // 기다리므로, 그 비용도 ***논리 프레임***의 비용이다.
+        if let Some(started) = render_started_for_probe {
+            crate::frame_source_probe::note_render_duration(started.elapsed());
         }
     }
 

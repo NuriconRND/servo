@@ -113,6 +113,32 @@ static PAINT_SIDE_JUDGED: AtomicU64 = AtomicU64::new(0);
 /// 둘이 그 이유를 가른다 -- `judged` 가 양수인데 `defeated` 가 0 이면 ★신호가 안 잡히는
 /// 것★이고, 둘 다 양수인데 거절이 남으면 ★깎임 외의 원인★이다.
 static PAINT_SIDE_DEFEATED: AtomicU64 = AtomicU64::new(0);
+
+/// `Painter::render` 한 번의 소요 시간 분포. 칸은 [`UPDATE_FLOOR_NANOS`] 를 공유한다.
+///
+/// ★이것이 "관계없는 요소까지 저더하는" 이유를 재는 자리다.★ 벽은 ***하나의 논리
+/// 프레임***이고 셸이 네 타일을 조인하므로(`winit_wall/main.rs` 의 `render_all_tiles`),
+/// 어느 타일이든 렌더가 길어지면 ***그 프레임에 실린 모든 것***이 늦는다. WebGL 캔버스는
+/// 외부 이미지라서 WR 이 합성할 때 비트맵을 가져오고(`lock_swap_chain`), 그 호출은
+/// ***렌더 패스 안에서 동기로*** 일어난다. 그래서 그 비용은 캔버스만의 비용이 아니다.
+///
+/// ★`PASSSOURCE` 가 60.0/s 라는 것은 패스가 제시간에 끝난다는 뜻이 아니다.★ 페이싱
+/// 스레드는 패스가 길어도 그대로 틱하므로 ***횟수는 유지되면서 프레임만 늦는다***. 그
+/// 구분을 못 해서 2026-11-03 에 "패스는 제시간에 돈다" 고 잘못 읽었다.
+static RENDER_HIST: [AtomicU64; UPDATE_BUCKETS] = [const { AtomicU64::new(0) }; UPDATE_BUCKETS];
+/// 관측된 최대 `Painter::render` 소요 시간, 나노초(런 전체).
+static RENDER_WORST_NANOS: AtomicU64 = AtomicU64::new(0);
+/// 직전 보고 구간의 최대값. ★리포터가 읽고 0 으로 돌린다★ -- 누적 최대값은 한 번 튀면
+/// 영원히 남아서 "전반이 심하고 후반에 가라앉는다" 를 가린다. 운영자가 본 그 모양을
+/// 수치로 보려면 구간값이 필요하다.
+static RENDER_WORST_INTERVAL_NANOS: AtomicU64 = AtomicU64::new(0);
+/// 렌더가 한 주기([`FRAME_PERIOD_NANOS`])를 넘은 횟수.
+static RENDER_OVER_PERIOD: AtomicU64 = AtomicU64::new(0);
+/// 직전 보고 구간의 넘김 횟수. 리포터가 읽고 0 으로 돌린다.
+static RENDER_OVER_INTERVAL: AtomicU64 = AtomicU64::new(0);
+
+/// 60Hz 한 주기, 나노초. 넘김 판정의 기준이다.
+const FRAME_PERIOD_NANOS: u64 = 16_667_000;
 /// `canvas_is_live()` 가 거짓이었을 때, 마지막 캔버스 활동으로부터 지난 최대 시간(ms).
 ///
 /// ★창(500ms)이 모자란 것인지 아예 캔버스가 안 오는 것인지 가른다.★ 활동이 한 번도 없으면
@@ -161,6 +187,21 @@ pub(crate) fn note_paint_side_judgement(defeated: bool, stale_for: Option<Durati
     } else if let Some(stale_for) = stale_for {
         let millis = stale_for.as_millis().min(u128::from(u64::MAX)) as u64;
         CANVAS_STALE_WORST_MS.fetch_max(millis, Ordering::Relaxed);
+    }
+}
+
+/// `Painter::render` 한 번의 소요 시간을 쌓는다. ★원자 다섯 이하다.★
+pub(crate) fn note_render_duration(elapsed: Duration) {
+    if !is_enabled() {
+        return;
+    }
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    RENDER_HIST[update_bucket_of(nanos)].fetch_add(1, Ordering::Relaxed);
+    RENDER_WORST_NANOS.fetch_max(nanos, Ordering::Relaxed);
+    RENDER_WORST_INTERVAL_NANOS.fetch_max(nanos, Ordering::Relaxed);
+    if nanos > FRAME_PERIOD_NANOS {
+        RENDER_OVER_PERIOD.fetch_add(1, Ordering::Relaxed);
+        RENDER_OVER_INTERVAL.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -264,7 +305,7 @@ fn report(elapsed: Duration) {
         }
     };
     log::warn!(
-        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%)          behind={behind} ({:.1}%) canvas={canvas} ({:.1}%)",
+        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%) behind={behind} ({:.1}%) canvas={canvas} ({:.1}%)",
         share(tick),
         share(behind),
         share(canvas),
@@ -276,8 +317,41 @@ fn report(elapsed: Duration) {
         let defeated = PAINT_SIDE_DEFEATED.load(Ordering::Relaxed);
         let stale_worst = CANVAS_STALE_WORST_MS.load(Ordering::Relaxed);
         log::warn!(
-            "PAINTSIDE t={secs:.0}s judged={judged} defeated={defeated} ({:.1}%)              stale_worst={stale_worst}ms",
+            "PAINTSIDE t={secs:.0}s judged={judged} defeated={defeated} ({:.1}%) stale_worst={stale_worst}ms",
             defeated as f64 * 100.0 / judged as f64,
+        );
+    }
+    // ★렌더 길이★ -- 이것이 길면 그 프레임에 실린 ***모든 것***이 늦는다. 구간값을 같이
+    // 찍는다: 누적 최대값만으로는 "전반이 심하고 후반에 가라앉는다" 가 보이지 않는다.
+    let render_counts: Vec<u64> = RENDER_HIST
+        .iter()
+        .map(|b| b.load(Ordering::Relaxed))
+        .collect();
+    let render_total: u64 = render_counts.iter().sum();
+    if render_total > 0 {
+        let worst_ms = RENDER_WORST_NANOS.load(Ordering::Relaxed) as f64 / 1e6;
+        let interval_ms = RENDER_WORST_INTERVAL_NANOS.swap(0, Ordering::Relaxed) as f64 / 1e6;
+        let over = RENDER_OVER_PERIOD.load(Ordering::Relaxed);
+        let over_interval = RENDER_OVER_INTERVAL.swap(0, Ordering::Relaxed);
+        let mut spread = String::new();
+        for (index, count) in render_counts.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            let edge_us = if index == 0 {
+                UPDATE_FLOOR_NANOS as f64 / 1000.0
+            } else {
+                UPDATE_FLOOR_NANOS as f64 * (1u64 << (index - 1).min(31)) as f64 * 2.0 / 1000.0
+            };
+            spread.push_str(&format!(
+                " <{edge_us:.0}us:{:.1}%",
+                *count as f64 * 100.0 / render_total as f64
+            ));
+        }
+        log::warn!(
+            "RENDERCOST t={secs:.0}s renders={render_total} ({:.1}/s) over_period={over} ({:.2}%) worst={worst_ms:.1}ms last10s_worst={interval_ms:.1}ms last10s_over={over_interval}{spread}",
+            render_total as f64 / secs,
+            over as f64 * 100.0 / render_total as f64,
         );
     }
 }
