@@ -139,6 +139,23 @@ static RENDER_OVER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 
 /// 60Hz 한 주기, 나노초. 넘김 판정의 기준이다.
 const FRAME_PERIOD_NANOS: u64 = 16_667_000;
+
+/// `Paint::produce_wall_frame` 이 불린 횟수. ★틱당 1 이어야 한다.★
+static PRODUCE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// 그중 ★대상 타일이 없어 아무것도 하지 않은★ 횟수(`target_painter_ids.is_empty()`).
+static PRODUCE_NO_TARGETS: AtomicU64 = AtomicU64::new(0);
+/// 그중 ★스크린샷이 생산을 쉬게 한★ 횟수(`tick_should_produce` 가 거짓).
+static PRODUCE_HELD: AtomicU64 = AtomicU64::new(0);
+/// 요청이 물은 (페인터, 틱) 쌍의 수 -- `target_painter_ids.len()` 의 합.
+///
+/// ★이것이 KEEPPREV 의 `attempts` 가 되어야 했던 값이다.★ 그쪽은 발행+거절로 만든
+/// 유도값이라, 실측에서 199/s 가 나왔을 때 ***240/s 와의 간격을 설명할 수단이 없었다***
+/// (2026-11-03, log_webgl_perf_01/05). 네 페인터가 매 틱 답한다는 것은 코드로 확인했다 --
+/// `with_each_painter_mut` 의 `None` 갈래는 페인터 스레드가 죽었을 때만 나오고 그때
+/// `warn!` 을 찍는데, 로그에 그 경고가 없다. 그러면 240/s 가 나와야 한다.
+static PRODUCE_TARGETS: AtomicU64 = AtomicU64::new(0);
+/// `outcome` 이 `None` 이었던 (페인터, 틱) 쌍. ★0 이어야 한다★ -- 양수면 위 추론이 틀렸다.
+static OUTCOME_NONE: AtomicU64 = AtomicU64::new(0);
 /// `canvas_is_live()` 가 거짓이었을 때, 마지막 캔버스 활동으로부터 지난 최대 시간(ms).
 ///
 /// ★창(500ms)이 모자란 것인지 아예 캔버스가 안 오는 것인지 가른다.★ 활동이 한 번도 없으면
@@ -203,6 +220,30 @@ pub(crate) fn note_render_duration(elapsed: Duration) {
         RENDER_OVER_PERIOD.fetch_add(1, Ordering::Relaxed);
         RENDER_OVER_INTERVAL.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// `produce_wall_frame` 한 번을 센다. `targets` 는 그 틱이 물은 타일 수이고,
+/// `held` 는 스크린샷으로 생산을 쉬었는지다. ★원자 셋 이하다.★
+pub(crate) fn note_produce_wall_frame(targets: usize, held: bool) {
+    if !is_enabled() {
+        return;
+    }
+    PRODUCE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if held {
+        PRODUCE_HELD.fetch_add(1, Ordering::Relaxed);
+    } else if targets == 0 {
+        PRODUCE_NO_TARGETS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRODUCE_TARGETS.fetch_add(targets as u64, Ordering::Relaxed);
+    }
+}
+
+/// `outcome` 이 `None` 이었던 (페인터, 틱) 쌍을 센다. ★원자 하나다.★
+pub(crate) fn note_outcome_none() {
+    if !is_enabled() {
+        return;
+    }
+    OUTCOME_NONE.fetch_add(1, Ordering::Relaxed);
 }
 
 /// 틱 생산이 거절된 것을 이유별로 센다. ★원자 하나다.★
@@ -352,6 +393,21 @@ fn report(elapsed: Duration) {
             "RENDERCOST t={secs:.0}s renders={render_total} ({:.1}/s) over_period={over} ({:.2}%) worst={worst_ms:.1}ms last10s_worst={interval_ms:.1}ms last10s_over={over_interval}{spread}",
             render_total as f64 / secs,
             over as f64 * 100.0 / render_total as f64,
+        );
+    }
+    // ★호출 수를 직접 센다★ -- KEEPPREV 의 attempts 는 유도값이라 199 대 240 을 설명하지
+    // 못했다. 틱당 호출 1, 호출당 타일 4 가 기대값이다.
+    let calls = PRODUCE_CALLS.load(Ordering::Relaxed);
+    if calls > 0 {
+        let targets = PRODUCE_TARGETS.load(Ordering::Relaxed);
+        let no_targets = PRODUCE_NO_TARGETS.load(Ordering::Relaxed);
+        let held = PRODUCE_HELD.load(Ordering::Relaxed);
+        let none = OUTCOME_NONE.load(Ordering::Relaxed);
+        log::warn!(
+            "PRODUCE t={secs:.0}s calls={calls} ({:.1}/s) targets={targets} ({:.1}/s)              per_call={:.2} no_targets={no_targets} held={held} outcome_none={none}",
+            calls as f64 / secs,
+            targets as f64 / secs,
+            targets as f64 / calls as f64,
         );
     }
 }

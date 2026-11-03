@@ -1901,12 +1901,20 @@ impl Paint {
             crate::wall_tick::tick_should_produce(self.a_screenshot_is_waiting_on_a_frame());
         let logical_frame_id = if should_produce {
             let request = self.wall_frame_request_for_all_tiles();
+            // ★호출 수를 직접 센다★ -- 근거는 `frame_source_probe::PRODUCE_TARGETS` 의
+            // doc 주석에 있다. 요점은 타일당 프레임이 기대값 60/s 가 아니라 ~50/s 인데,
+            // 유도값으로는 그 간격을 설명할 수 없었다는 것이다.
+            crate::frame_source_probe::note_produce_wall_frame(
+                request.target_painter_ids.len(),
+                false,
+            );
             if request.target_painter_ids.is_empty() {
                 None
             } else {
                 self.issue_wall_frame_request(request)
             }
         } else {
+            crate::frame_source_probe::note_produce_wall_frame(0, true);
             self.hold_the_wall_while_a_screenshot_is_taken();
             None
         };
@@ -2173,7 +2181,12 @@ impl Paint {
                         armable_painter_ids.push(*painter_id);
                     }
                 },
-                None => {},
+                None => {
+                    // ★0 이어야 한다.★ 양수면 "네 페인터가 매 틱 답한다" 는 추론이 틀렸고,
+                    // 그러면 `with_each_painter_mut` 의 `Slot::Missing` 또는 `recv()` 실패를
+                    // 봐야 한다(둘 다 스레드 사망 시에만 나고 `warn!` 을 찍는다).
+                    crate::frame_source_probe::note_outcome_none();
+                },
             }
         }
 
