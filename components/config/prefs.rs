@@ -996,8 +996,17 @@ pub struct Preferences {
     /// 의 절감이 그대로 남는다. 상한은 빠른 이동에서 사각형이 캔버스 전체로 자라 절감이
     /// 사라지는 것을 막는다.
     ///
-    /// 25 가 기본이다 -- 한 프레임에 타일의 1/4 을 넘게 움직이는 전환은 어차피 눈으로
-    /// 따라갈 수 없다. 깨짐이 남으면 올리고, 절감이 사라지면 내린다.
+    /// ★6 이 실측값이다★(2026-11-10, log_webgl_perf_01/20): 운영자가 스윕해
+    /// `extrapolate_frames 6` + 이 값 `6` 에서 "경계면에서의 깨짐 현상 자체는 거의 사라짐"
+    /// 을 확인했고, 이 값만 기본(25)으로 돌리면 "깨짐 현상 작은 수준에서 재발" 했다.
+    ///
+    /// ★그 결과가 내 설계 전제를 반증한다.★ 나는 "고정 가드 밴드를 추측하지 않는다, 이동량에
+    /// 비례시킨다" 로 짰는데, 5760 의 6% = 345px 이므로 `frames 6` 을 곱해도 대개 이 상한에
+    /// 걸린다 -- 즉 실제로 들은 것은 ***균일한 345px 고정 밴드***다. 상한을 ***낮추는*** 것이
+    /// 효과를 냈다는 사실 자체가 비례식이 답이 아니었다는 뜻이다.
+    ///
+    /// 올리면 비례 성분이 살아나 빠른 전환에서 면적이 커지고, 내리면 밴드가 좁아져 깨짐이
+    /// 돌아온다.
     pub gfx_wall_webgl_tile_scissor_extrapolate_pct: i64,
 
     /// 외삽에서 이동량에 곱할 배수 = ★덮으려는 지연 프레임 수★.
@@ -1007,10 +1016,16 @@ pub struct Preferences {
     /// 관찰은 일관되게 "깨짐의 크기가 ***애니메이션 이동 변화량과 비례***" 였다 -- 부족분이
     /// 이동량에 비례하므로 ***배수가 모자란 것***이다.
     ///
-    /// 실제 경로는 `note`(WR 프레임 N) -> 소비자가 읽어 scissor -> 캔버스가 그림 -> WR
-    /// 프레임 M 에 합성되어 표출이고, `M - N` 을 코드만으로는 세울 수 없다. 1 -> 2 -> 3 으로
-    /// 올려 보며 ★깨짐이 사라지는 값★ 을 찾으면 그것이 그 수다. 올리는 대가는 셰이딩 면적이
-    /// 그만큼 넓어지는 것이고, `gfx_wall_webgl_tile_scissor_extrapolate_pct` 가 상한이다.
+    /// ★6 이 실측값이다★(2026-11-10, log_webgl_perf_01/20): 운영자가 스윕해 이 값 `6` +
+    /// `extrapolate_pct 6` 에서 "경계면에서의 깨짐 현상 자체는 거의 사라짐" 을 확인했다.
+    /// 다만 `pct` 가 6 이면 5760 의 6% = 345px 에서 잘리므로, 실제로 들은 것은 이 배수가
+    /// 아니라 ***그 고정 밴드***일 가능성이 크다 -- `pct` 의 doc 주석에 적어 뒀다.
+    ///
+    /// 남은 것(이 값을 16 까지 올려도 사라지지 않았다): 전환 중 "prev 구성이 tile 경계면과
+    /// 비교적 먼 부분에서 약간 깨지는" 현상, 그리고 전환 애니메이션 중의 judder. 둘은 사각형을
+    /// 넓히는 축이 아니다 -- `gfx_wall_webgl_tile_scissor_clear` 가 타일 밖을 지우지 않아
+    /// 재활용된 서피스에 ***이전 프레임의 그림***이 남는 쪽이 후보다(그 pref 를 끄면 그 영역이
+    /// 찌꺼기 대신 검정으로 바뀌는 것이 log_webgl_perf_01/15 의 38 번 런에서 관찰됐다).
     pub gfx_wall_webgl_tile_scissor_extrapolate_frames: i64,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
@@ -1823,8 +1838,8 @@ impl Preferences {
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
-            gfx_wall_webgl_tile_scissor_extrapolate_pct: 25,
-            gfx_wall_webgl_tile_scissor_extrapolate_frames: 1,
+            gfx_wall_webgl_tile_scissor_extrapolate_pct: 6,
+            gfx_wall_webgl_tile_scissor_extrapolate_frames: 6,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,

@@ -431,8 +431,8 @@ param(
     # gfx_wall_webgl_tile_scissor_extrapolate_frames -- 외삽에서 이동량에 곱할 배수
     # (= 덮으려는 지연 프레임 수). 1 -> 2 -> 3 으로 올려 보며 경계 깨짐이 사라지는 값을
     # 찾는다. 그 값이 실제 지연 프레임 수다. 기본 1.
-    [int] $WebglTileScissorExtrapolateFrames = 1,
-    [int] $WebglTileScissorExtrapolatePct = 25,
+    [int] $WebglTileScissorExtrapolateFrames = 6,
+    [int] $WebglTileScissorExtrapolatePct = 6,
     [switch] $WebglTileScissorFromWebrender,
     [switch] $WebglTileScissorClear,
     [switch] $WebglTileScissorFlipY,
