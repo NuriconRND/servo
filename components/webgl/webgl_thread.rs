@@ -140,6 +140,13 @@ fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
     if state.scissor_gl_logged {
         return;
     }
+    // ★엔진 클립이 세워진 뒤에 찍는다.★ 2026-11-09 에 ***첫*** draw 에서 찍었더니 그 시점은
+    // 캔버스가 아직 300x150 이고 `tile_scissor` 가 세워지기 전이라(그것은
+    // `handle_swap_buffers` 에서 세운다) `engine=None` 만 나왔다 -- 가리려던 것을 하나도
+    // 가리지 못했다. pref 가 켜져 있는데 아직 안 세워졌으면 다음 draw 를 기다린다.
+    if servo_config::pref!(gfx_wall_webgl_tile_scissor) && state.tile_scissor.is_none() {
+        return;
+    }
     state.scissor_gl_logged = true;
     let mut box_ = [0i32; 4];
     let enabled = unsafe {
@@ -148,8 +155,12 @@ fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
     };
     warn!(
         "SCISSORGL at-draw enabled={enabled} gl_box={box_:?} engine={:?} page={:?} \
-         default_fb={}",
-        state.tile_scissor, state.page_scissor, state.drawing_to_default_framebuffer,
+         page_test={} default_fb={}",
+        state.tile_scissor,
+        state.page_scissor,
+        // ★교집합 조건의 입력이다★ -- 이것이 거짓이면 페이지 박스는 무시된다.
+        state.scissor_test_enabled,
+        state.drawing_to_default_framebuffer,
     );
 }
 
@@ -205,11 +216,19 @@ impl GLState {
             .tile_scissor
             .filter(|_| self.drawing_to_default_framebuffer)
         {
-            // 페이지가 자기 박스를 걸어 뒀으면 ★교집합★ 이다 -- 엔진 클립이 페이지의
-            // 의도를 넓혀서는 안 된다.
+            // 페이지가 ★scissor test 를 켜 둔 채★ 자기 박스를 걸어 뒀으면 교집합이다 --
+            // 엔진 클립이 페이지의 의도를 넓혀서는 안 된다.
+            //
+            // ★`scissor_test_enabled` 를 반드시 같이 봐야 한다.★ 2026-11-09 에 그것을
+            // 빼먹어 ***페이지가 쓰지도 않는 박스***와 교집합을 냈다. 실측
+            // (log_webgl_perf_01/11): `SCISSORGL ... enabled=false
+            // page=Some([0,0,300,150])` -- 300x150 은 캔버스 ***초기*** 크기이고 scissor
+            // test 는 꺼져 있었다. 그 박스와 교집합을 내니 타일 하나만 300x150 짜리 조각이
+            // 남고 나머지 셋은 빈 사각형이 되어, 화면이 한 구석의 작은 그림 외에 전부
+            // 비었다. ★test 가 꺼진 박스는 아무 의미가 없다.★
             let [x, y, w, h] = match self.page_scissor {
-                Some(page) => intersect_scissor(page, engine),
-                None => engine,
+                Some(page) if self.scissor_test_enabled => intersect_scissor(page, engine),
+                _ => engine,
             };
             unsafe {
                 gl.scissor(x, y, w, h);
