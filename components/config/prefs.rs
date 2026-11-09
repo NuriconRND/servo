@@ -865,7 +865,7 @@ pub struct Preferences {
     ///
     /// ★왜★(2026-11-09): `SwapChain` 의 뮤텍스가 ***무제한 GPU 대기 위에 걸쳐*** 잡혀
     /// 있다 -- `swap_buffers` 가 `AcquireSync(0, INFINITE)` 와 캔버스 전체 blit 을,
-    /// `clear_surface` 가 전체 clear 를 그 안에서 한다(third_party/surfman/src/chains.rs 의
+    /// `clear_surface` 가 clear 를 그 안에서 한다(third_party/surfman/src/chains.rs 의
     /// `try_take_surface` doc 주석에 자리까지 적어 뒀다). 그래서 캔버스가 느리면
     /// ***관계없는 ticker 까지*** 같이 늦었다.
     ///
@@ -919,6 +919,26 @@ pub struct Preferences {
     /// 다른 사분면을 보여준다(run 29: 콘텐츠 육안 확인 불가).
     ///
     /// ★그래서 이 pref 는 되돌리기용으로만 남긴다.★ 켤 이유가 없다.
+    /// swap 뒤의 clear 도 ★타일 영역만★ 지운다(기본 꺼짐).
+    ///
+    /// `gfx_wall_webgl_tile_scissor` 가 셰이딩을 1/4 로 줄였는데 ***clear 는 그대로***
+    /// 서피스 전체를 지우고 있었다 -- `preserve_drawing_buffer` 가 거짓인 캔버스(속성을
+    /// 주지 않으면 그것이 기본이다)는 프레임마다 거기를 지난다. 벽에서 한 장이
+    /// 11520x4320 RGBA8 = ★199MB★ 이고 백엔드가 ★넷★ 이다.
+    ///
+    /// ★왜 이것이 다음인가★(2026-11-09): WebGL 스레드 병렬화를 먼저 보려 했는데 이미
+    /// 측정이 있었다. `db52a9b280f` 가 "the counters covered command replay, context
+    /// switches, the ANGLE lock and serialisation, and those total ★42.6ms of every 1021ms
+    /// window★" 라고 적어 뒀다 -- 직렬 재생 ***전체***가 4.2% 이고, 그 스레드는 95.8% 가
+    /// 유휴나 swap 대기였다(watchdog 63 표본 중 60 이 "waiting for a message"). 즉
+    /// 병렬화의 천장이 4% 다. 같은 커밋이 가리킨 곳이 ★swap 과 clear★ 이고 이것이 그
+    /// clear 다.
+    ///
+    /// `gfx_wall_webgl_tile_scissor` 와 ★같은 사각형★ 을 쓴다. 그래서 지우는 영역과 그리는
+    /// 영역이 정확히 같고 둘이 어긋날 수 없다 -- 셰이딩 scissor 가 꺼져 있으면 이것도
+    /// 걸리지 않는다. 리사이즈 때의 clear 는 전체를 지운다(타일 밖에 쓰레기가 남으면
+    /// 경계의 필터링이 끌어올 수 있고, 프레임마다가 아니다).
+    pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
     ///
@@ -1727,6 +1747,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_webgl_nonblocking_front_buffer_lock: false,
             gfx_wall_webgl_tile_scissor: false,
+            gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,

@@ -342,6 +342,7 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         context: &mut Device::Context,
         gl: &Gl,
         color: [f32; 4],
+        scissor: Option<[i32; 4]>,
     ) -> Result<(), Error> {
         self.validate_context(device, context)?;
 
@@ -355,6 +356,10 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         let depth_mask;
         let mut stencil_mask = [0];
         let scissor_enabled = unsafe { gl.is_enabled(gl::SCISSOR_TEST) };
+        // ★박스도 저장한다★ -- `scissor` 를 받으면 아래에서 그것을 덮어쓰기 때문이다.
+        // 원래 코드는 활성 여부만 저장·복원했고, 박스를 바꾸지 않았으므로 그걸로 충분했다.
+        let mut scissor_box = [0i32; 4];
+        unsafe { gl.get_parameter_i32_slice(gl::SCISSOR_BOX, &mut scissor_box) };
         let rasterizer_enabled = unsafe { gl.is_enabled(gl::RASTERIZER_DISCARD) };
         unsafe {
             draw_fbo = gl.get_parameter_framebuffer(gl::DRAW_FRAMEBUFFER_BINDING);
@@ -395,7 +400,14 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
             gl.clear_color(color[0], color[1], color[2], color[3]);
             gl.clear_depth(1.);
             gl.clear_stencil(0);
-            gl.disable(gl::SCISSOR_TEST);
+            match scissor {
+                // ★이 영역만 지운다.★ scissor 는 색·깊이·스텐실 clear 에 모두 걸린다.
+                Some([x, y, w, h]) => {
+                    gl.scissor(x, y, w, h);
+                    gl.enable(gl::SCISSOR_TEST);
+                },
+                None => gl.disable(gl::SCISSOR_TEST),
+            }
             gl.disable(gl::RASTERIZER_DISCARD);
             gl.depth_mask(true);
             gl.stencil_mask(0xFFFFFFFF);
@@ -430,8 +442,16 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
             gl.clear_stencil(clear_stencil[0]);
             gl.depth_mask(depth_mask);
             gl.stencil_mask(stencil_mask[0] as _);
+            gl.scissor(
+                scissor_box[0],
+                scissor_box[1],
+                scissor_box[2],
+                scissor_box[3],
+            );
             if scissor_enabled {
                 gl.enable(gl::SCISSOR_TEST);
+            } else {
+                gl.disable(gl::SCISSOR_TEST);
             }
             if rasterizer_enabled {
                 gl.enable(gl::RASTERIZER_DISCARD);
@@ -489,7 +509,7 @@ impl<Device: DeviceAPI> SwapChain<Device> {
     /// ***무제한 GPU 대기***를 한다 -- `device.create_surface`(없으면 새로 만든다),
     /// `replace_surface` -> `bind_surface_to_context` ->
     /// `IDXGIKeyedMutex::AcquireSync(0, ★INFINITE★)`, 그리고 `PreserveBuffer::Yes` 면
-    /// 캔버스 전체 blit. `clear_surface` 도 같은 뮤텍스로 전체 clear 를 한다. 그런데 소비자
+    /// 캔버스 전체 blit. `clear_surface` 도 같은 뮤텍스로 clear 를 한다. 그런데 소비자
     /// (벽의 타일 painter)가 `take_surface` 로 ***같은 뮤텍스***를 잡으러 온다.
     ///
     /// 그래서 캔버스의 스왑이 느리면 ***그 캔버스와 아무 관계 없는 요소까지*** 같이 늦는다 --
@@ -587,14 +607,25 @@ impl<Device: DeviceAPI> SwapChain<Device> {
     /// Clear the current back buffer.
     /// Called by the producer.
     /// Returns an error if `context` is not the producer context for this swap chain.
+    /// `scissor` 가 `Some([x, y, w, h])` 면 ★그 영역만★ 지운다(GL 좌표, 아래-왼쪽 원점).
+    ///
+    /// ★왜★(2026-11-09): 벽에서 이 clear 가 ***프레임마다 서피스 전체***를 지운다 --
+    /// 11520x4320 RGBA8 = 한 장 199MB, 백엔드 네 장. 그런데 백엔드 k 는 자기 타일만
+    /// 쓴다(`gfx_wall_webgl_tile_scissor`). 셰이딩은 1/4 로 줄였는데 clear 가 그대로였다.
+    ///
+    /// 이 비용을 재려고 만든 계측이 있었다 -- `db52a9b280f` 가 `clear_ms` 를 추가하며
+    /// "199MB a buffer across four backend devices, which makes buffer turnover a plausible
+    /// cost rather than a theoretical one" 이라고 적었다.
     pub fn clear_surface(
         &self,
         device: &Device,
         context: &mut Device::Context,
         gl: &Gl,
         color: [f32; 4],
+        scissor: Option<[i32; 4]>,
     ) -> Result<(), Error> {
-        self.lock().clear_surface(device, context, gl, color)
+        self.lock()
+            .clear_surface(device, context, gl, color, scissor)
     }
 
     /// Is this the attached swap chain?

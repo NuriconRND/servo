@@ -119,11 +119,16 @@ pub struct GLState {
     ///
     /// ★왜 필요한가★(2026-11-09): 측정은 `-WebglTileScissor` 가 동작을 바꿨다고 말하는데
     /// (`RENDERCOST over_period` 269/256 대 43/53, 재현됨) ***코드 읽기는 그럴 수 없다고
-    /// 말한다*** -- surfman 의 `clear_surface` 가 `SCISSOR_TEST` 를 끄고 다시 켜지 않으며
-    /// (`chains.rs:398`), 그것이 내 설정 ***뒤***에 돌고, 다시 켜 줄 자리
-    /// (`Enable(SCISSOR_TEST)` / `bind_framebuffer` / `gl.scissor` /
-    /// `InitializeFramebuffer`)를 실측 페이지가 하나도 쓰지 않는다. 둘 중 하나가 틀렸고
-    /// 읽기로는 더 가릴 수 없으므로 ★GL 에게 직접 묻는다.★
+    /// 말한다*** -- surfman 의 `clear_surface` 가 `SCISSOR_TEST` 를 끄고 그것이 내 설정
+    /// ***뒤***에 돈다. 그래서 draw 때는 꺼져 있어야 한다고 봤다.
+    ///
+    /// ★그 읽기가 틀렸다★(2026-11-09 정정): 같은 함수가 들어올 때 활성 여부를 저장하고
+    /// 나올 때 되돌린다. `disable` 만 보고 40 줄 아래의 복원을 못 봤다. 내 scissor 는 살아
+    /// 있었고 절감도 진짜였다 -- 파일을 끝까지 읽으면 나오는 것을, 진단을 만들어서 알았다.
+    ///
+    /// 그래도 이 로그는 남긴다. GL 이 실제로 무엇을 들고 있는지 한 줄로 확인할 수 있고, 그
+    /// 덕에 ***페이지가 쓰지도 않는 박스와 교집합을 내던 버그***를 잡았다(`page_test=false`
+    /// 인데 교집합에 쓰고 있었다, a47204b3335).
     scissor_gl_logged: bool,
     /// 페이지가 `gl.scissor` 로 정한 박스. 엔진 클립과 ★교집합★ 을 내려면 알아야 한다.
     /// 추적하지 않으면 페이지가 부르는 순간 엔진 클립이 사라진다.
@@ -1373,7 +1378,11 @@ impl WebGLThread {
                     .resize(&data.device, &mut data.ctx, size.to_i32())
                     .map_err(|err| format!("Failed to resize swap chain: {:?}", err))?;
                 swap_chain
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    // ★여기는 전체를 지운다.★ 리사이즈 직후의 새 서피스는 타일 밖도
+                    // 초기화돼 있어야 한다 -- 안 그러면 안 쓰는 영역에 쓰레기가 남고,
+                    // 타일 경계의 필터링이 그것을 끌어올 수 있다. 프레임마다가 아니라
+                    // 리사이즈 때 한 번이므로 비용도 문제가 아니다.
+                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color, None)
                     .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
             } else {
                 error!("Failed to find swap chain");
@@ -1806,8 +1815,22 @@ impl WebGLThread {
                         .requested_flags
                         .contains(ContextAttributeFlags::ALPHA);
                     let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
+                    // ★타일 영역만 지운다★(`gfx_wall_webgl_tile_scissor_clear`). 이 백엔드는
+                    // 자기 타일만 쓰므로 나머지를 지울 이유가 없다. 벽에서 그 차이가 크다 --
+                    // 서피스 한 장이 199MB 이고 백엔드가 넷이다.
+                    //
+                    // ★셰이딩 scissor 와 같은 사각형을 쓴다★(`want_tile_scissor`). 그래서
+                    // 지우는 영역과 그리는 영역이 정확히 같고, 둘이 어긋날 수 없다.
+                    let clear_scissor = want_tile_scissor
+                        .filter(|_| servo_config::pref!(gfx_wall_webgl_tile_scissor_clear));
                     swap_chain
-                        .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                        .clear_surface(
+                            &data.device,
+                            &mut data.ctx,
+                            &data.gl,
+                            clear_color,
+                            clear_scissor,
+                        )
                         .unwrap();
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
                 }
