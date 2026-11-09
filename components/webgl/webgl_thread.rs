@@ -1088,14 +1088,52 @@ impl WebGLThread {
         )
     }
 
+    /// 질의 커맨드를 primary 백엔드에 적용한다.
+    ///
+    /// ★백엔드가 없으면 되살린 뒤 다시 시도한다 -- 그냥 반환하면 script 가 죽는다.★
+    ///
+    /// 이 커맨드들은 ***응답 sender 를 품고 있다***. 그대로 반환하면 `command` 가 드롭되고
+    /// sender 도 함께 드롭되어, 스크립트 쪽 `receiver.recv().unwrap()` 이 `Disconnected` 로
+    /// 패닉한다. 실측(2026-11-09/10, log_webgl_perf_01/18·19):
+    ///
+    ///     thread 'Script#2' panicked at components/script/dom/webgl/webglprogram.rs:577:40:
+    ///     called `Result::unwrap()` on an `Err` value: Disconnected
+    ///
+    /// 그 뒤로 script 스레드가 없으므로 ***어떤 명령도 듣지 않는다*** -- 운영자가 본 "WebGL
+    /// 전환중 표출 중단되고 이후 명령이 더 이상 듣지 않는다" 가 이것이다. 18/webgl_perf_42 와
+    /// 19/webgl_perf_43 둘 다에 있고, 19/webgl_perf_43 은 타일 scissor 기능을 끈 런이므로
+    /// ★그 기능과 무관한 기존 결함★ 이다.
+    ///
+    /// 백엔드가 없어지는 경로는 정상 동작이다: 전환으로 캔버스가
+    /// `dom_webgl_idle_context_reclaim_ms`(기본 3000) 넘게 합성되지 않으면
+    /// `maybe_reclaim_idle_contexts` 가 `release_context_backends` 를 불러
+    /// `context_backends` 를 지운다. 그래서 ***전환을 반복하면 반드시 밟힌다***.
+    ///
+    /// `restore_context_backends` 는 `released_contexts` 에 없으면 즉시 반환하므로, 되살릴
+    /// 것이 없을 때의 비용은 조회 하나다.
     fn apply_webgl_command_to_primary(
         &mut self,
         context_id: WebGLContextId,
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
-        let Some(surface_id) = self.primary_surface_id(context_id) else {
-            return;
+        let surface_id = match self.primary_surface_id(context_id) {
+            Some(surface_id) => surface_id,
+            None => {
+                self.restore_context_backends(context_id);
+                match self.primary_surface_id(context_id) {
+                    Some(surface_id) => surface_id,
+                    None => {
+                        // ★여기서 드롭되면 로그로 보인다.★ 되살리기까지 실패했다는 뜻이고,
+                        // script 는 여전히 죽는다 -- 그 경우를 침묵으로 두지 않는다.
+                        warn!(
+                            "WebGL query dropped: no primary backend for {context_id:?} even \
+                             after restore; the script thread will panic on recv"
+                        );
+                        return;
+                    },
+                }
+            },
         };
         self.apply_webgl_command_to_surface(surface_id, command, backtrace);
     }
@@ -1112,7 +1150,14 @@ impl WebGLThread {
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
-        let surface_ids = self.backend_surface_ids(context_id);
+        let mut surface_ids = self.backend_surface_ids(context_id);
+        if surface_ids.is_empty() {
+            // ★여기도 되살린다.★ 비-query 커맨드는 응답 sender 가 없어 script 를 죽이지는
+            // 않지만, 그려야 할 것을 조용히 버린다 -- 전환 뒤 캔버스가 비는 원인이 된다.
+            // 근거는 `apply_webgl_command_to_primary` 의 doc 주석에 있다.
+            self.restore_context_backends(context_id);
+            surface_ids = self.backend_surface_ids(context_id);
+        }
         let Some((last_surface_id, rest)) = surface_ids.split_last() else {
             return;
         };
