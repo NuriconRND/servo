@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
@@ -169,21 +170,52 @@ fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
     );
 }
 
-/// 소비자가 읽은 값의 나이와 외삽량을 1 초에 한 줄 찍는다.
+/// 소비자가 읽은 값의 나이와 외삽량을, ★사각형이 변한 프레임에만★ 찍는다.
 ///
-/// ★이것이 경계 깨짐의 판정이다.★ 근거는 호출처 주석에 있다 -- 요점은 "외삽량이 부족한가"
-/// 와 "지연이 한 프레임이 아닌가" 가 ***재야 갈린다***는 것이다.
-fn note_canvas_rect_lag(noted: &webrender::wall_canvas_rect::CanvasTileRect) {
-    static LAST_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    let Ok(mut last) = LAST_AT.lock() else {
+/// ★1 초에 한 줄은 이 문제를 판정할 수 없었다★(2026-11-09, log_webgl_perf_01/16): 전환은
+/// 짧고 정지 구간이 길어서 93 줄 중 대부분이 정지 상태(`widened_by=[0,0,0,0]`, 그것은 변한
+/// 것이 없으니 올바른 동작)였고, ***전환 중 연속 프레임***을 하나도 보지 못했다. 그리고
+/// slot 이 없어서 ***타일 간 맞물림***을 볼 수 없었는데, "경계 깨짐" 은 바로 그것이다.
+///
+/// 그래서 ★직전과 다른 사각형일 때만★ 찍고 slot 을 싣는다. 정지 구간은 조용하고 전환
+/// 구간만 남으므로, 연속 프레임의 delta 와 외삽 작동이 그대로 보인다. 폭주를 막기 위해
+/// 전체 줄 수에 상한을 둔다 -- 전환 한 번이 60 프레임쯤이고 네 타일이면 240 줄이다.
+fn note_canvas_rect_lag(
+    surface_id: WebGLSurfaceId,
+    noted: &webrender::wall_canvas_rect::CanvasTileRect,
+) {
+    const MAX_LINES: u64 = 4000;
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    static LAST: std::sync::Mutex<Option<([i32; 4], std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+
+    let Ok(mut last) = LAST.lock() else {
         return;
     };
-    if let Some(at) = *last {
-        if at.elapsed().as_millis() < 1000 {
+    // ★변한 것이 없으면 찍지 않는다.★ 단, 2 초 이상 조용했으면 한 줄은 남겨 "살아 있다" 를
+    // 보여 준다 -- 그것이 없으면 "전환이 없었다" 와 "계측이 죽었다" 가 같은 침묵이 된다.
+    let quiet_too_long = last
+        .as_ref()
+        .map(|(_, at)| at.elapsed().as_millis() >= 2000)
+        .unwrap_or(true);
+    if let Some((prev_raw, _)) = last.as_ref() {
+        if *prev_raw == noted.raw && !quiet_too_long {
             return;
         }
     }
-    *last = Some(std::time::Instant::now());
+    if LINES.fetch_add(1, Ordering::Relaxed) >= MAX_LINES {
+        return;
+    }
+    let delta = match last.as_ref() {
+        Some((prev_raw, _)) => [
+            noted.raw[0] - prev_raw[0],
+            noted.raw[1] - prev_raw[1],
+            noted.raw[2] - prev_raw[2],
+            noted.raw[3] - prev_raw[3],
+        ],
+        None => [0; 4],
+    };
+    *last = Some((noted.raw, std::time::Instant::now()));
     let widened = [
         noted.raw[0] - noted.rect[0],
         noted.raw[1] - noted.rect[1],
@@ -191,11 +223,11 @@ fn note_canvas_rect_lag(noted: &webrender::wall_canvas_rect::CanvasTileRect) {
         noted.rect[3] - noted.raw[3],
     ];
     warn!(
-        "CANVASRECTLAG age={}us raw={:?} used={:?} widened_by={widened:?} dest={:?}",
+        "CANVASRECTLAG p={} age={}us raw={:?} used={:?} delta={delta:?} widened_by={widened:?}",
+        webrender_api::IdNamespace::from(surface_id.painter_id).0,
         noted.at.elapsed().as_micros(),
         noted.raw,
         noted.rect,
-        noted.dest_size,
     );
 }
 
@@ -1778,7 +1810,7 @@ impl WebGLThread {
         // 것은 양이다. 두세 주기면 지연 자체가 더 길다. `raw` 대 `rect` 의 차가 외삽이
         // 실제로 넓힌 양이고, 0 이면 외삽이 아예 안 걸린 것이다(`dest_size` 가 프레임마다
         // 바뀌면 그 필터에서 떨어진다).
-        note_canvas_rect_lag(&noted);
+        note_canvas_rect_lag(surface_id, &noted);
         // 목적지 박스와 백킹 크기가 다를 수 있다(CSS 크기 대 백킹). 비율로 환산한다.
         let sx = canvas.width as f32 / noted.dest_size[0] as f32;
         let sy = canvas.height as f32 / noted.dest_size[1] as f32;
