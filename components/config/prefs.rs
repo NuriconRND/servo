@@ -999,6 +999,19 @@ pub struct Preferences {
     /// 25 가 기본이다 -- 한 프레임에 타일의 1/4 을 넘게 움직이는 전환은 어차피 눈으로
     /// 따라갈 수 없다. 깨짐이 남으면 올리고, 절감이 사라지면 내린다.
     pub gfx_wall_webgl_tile_scissor_extrapolate_pct: i64,
+
+    /// 외삽에서 이동량에 곱할 배수 = ★덮으려는 지연 프레임 수★.
+    ///
+    /// ★이 값은 스윕해서 찾는다 -- 내가 추정했고 틀렸다★(2026-11-10). "지연은 한 프레임"
+    /// 으로 가정해 1 로 뒀는데 깨짐이 그대로였고, 양방향으로 바꿔도 그대로였다. 운영자
+    /// 관찰은 일관되게 "깨짐의 크기가 ***애니메이션 이동 변화량과 비례***" 였다 -- 부족분이
+    /// 이동량에 비례하므로 ***배수가 모자란 것***이다.
+    ///
+    /// 실제 경로는 `note`(WR 프레임 N) -> 소비자가 읽어 scissor -> 캔버스가 그림 -> WR
+    /// 프레임 M 에 합성되어 표출이고, `M - N` 을 코드만으로는 세울 수 없다. 1 -> 2 -> 3 으로
+    /// 올려 보며 ★깨짐이 사라지는 값★ 을 찾으면 그것이 그 수다. 올리는 대가는 셰이딩 면적이
+    /// 그만큼 넓어지는 것이고, `gfx_wall_webgl_tile_scissor_extrapolate_pct` 가 상한이다.
+    pub gfx_wall_webgl_tile_scissor_extrapolate_frames: i64,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
     ///
@@ -1811,6 +1824,7 @@ impl Preferences {
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_webgl_tile_scissor_extrapolate_pct: 25,
+            gfx_wall_webgl_tile_scissor_extrapolate_frames: 1,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,

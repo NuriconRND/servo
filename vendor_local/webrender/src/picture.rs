@@ -3229,11 +3229,23 @@ impl TileCacheInstance {
         if dest.width() <= 0.0 || dest.height() <= 0.0 {
             return;
         }
+        // ★바깥쪽으로 맞춘다.★ `round` 였을 때 경계가 깨졌다(2026-11-09,
+        // log_webgl_perf_01/19): 사각형이 픽셀 경계에 안 맞으면 반올림이 ***안쪽으로***
+        // 깎고, 그 1px 대역이 그려지지 않는다. 운영자 관찰과 정확히 맞는다 -- B 를 켠 런은
+        // "대부분의 영역은 깜박이지 않고 tile 간 경계에 한정하여 깨지는 듯한 모양" 이었다.
+        //
+        // scissor 로는 ★필요보다 큰 쪽이 안전하다★ -- 더 셰이딩할 뿐이고, 작으면 빈다.
+        // 소비자 쪽(`webgl_thread::tile_scissor_from_webrender`)도 같은 규약으로 `floor`/
+        // `ceil` 을 쓴다.
+        let x0 = (clipped.min.x - dest.min.x).floor();
+        let y0 = (clipped.min.y - dest.min.y).floor();
+        let x1 = (clipped.max.x - dest.min.x).ceil();
+        let y1 = (clipped.max.y - dest.min.y).ceil();
         let rect = [
-            (clipped.min.x - dest.min.x).round() as i32,
-            (clipped.min.y - dest.min.y).round() as i32,
-            clipped.width().round() as i32,
-            clipped.height().round() as i32,
+            x0 as i32,
+            y0 as i32,
+            (x1 - x0) as i32,
+            (y1 - y0) as i32,
         ];
         let dest_size = [dest.width().round() as i32, dest.height().round() as i32];
         crate::wall_canvas_rect::note(slot, key, rect, dest_size);

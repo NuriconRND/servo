@@ -90,6 +90,18 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// 사각형이 커지면 ★scissor 의 절감이 사라진다★ 는 것이다 -- 극단적으로는 캔버스 전체가 된다.
 static EXTRAPOLATE_PCT: AtomicU32 = AtomicU32::new(0);
 
+/// 이동량에 곱할 배수 = ★덮으려는 지연 프레임 수★. `paint` 가 pref 로 세운다.
+///
+/// ★왜 pref 인가★(2026-11-10): 이 값을 내가 추정했고 틀렸다. 처음에 "지연은 한 프레임"
+/// 으로 가정해 1 배로 뒀는데(86c352b20e5) 깨짐이 그대로였고, 양방향으로 바꿔도
+/// (d5f897756a5) 그대로였다. 운영자 관찰은 일관되게 "깨짐의 크기가 ***애니메이션 이동
+/// 변화량과 비례***" 였다 -- 즉 ***부족분이 이동량에 비례***하므로 배수가 모자란 것이다.
+///
+/// 실제 경로는 `note`(WR 프레임 N) -> 소비자가 읽어 scissor -> 캔버스가 그림 -> ***WR
+/// 프레임 M***에 합성되어 표출이고, `M - N` 이 몇인지 코드만으로는 모른다. 그래서
+/// ***추정하지 않고 스윕한다*** -- 깨짐이 사라지는 배수가 곧 그 수다.
+static EXTRAPOLATE_FRAMES: AtomicU32 = AtomicU32::new(1);
+
 /// 직전 값이 이보다 오래됐으면 외삽하지 않는다. 긴 공백 뒤의 차는 ★이동량이 아니다★ --
 /// 그 사이 여러 프레임이 지났으므로 한 프레임 이동량으로 쓸 수 없다.
 ///
@@ -157,6 +169,11 @@ pub fn set_extrapolate_pct(pct: u32) {
     EXTRAPOLATE_PCT.store(pct, Ordering::Relaxed);
 }
 
+/// 외삽 배수(= 덮으려는 지연 프레임 수)를 세운다. `paint` 가 부른다.
+pub fn set_extrapolate_frames(frames: u32) {
+    EXTRAPOLATE_FRAMES.store(frames.max(1), Ordering::Relaxed);
+}
+
 /// 이번 프레임의 사각형을 적는다. `picture.rs` 의 Image 분기가 부른다.
 pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
     if !is_enabled() {
@@ -221,9 +238,11 @@ fn extrapolate(prev: [i32; 4], now: [i32; 4], dest_size: [i32; 2]) -> [i32; 4] {
     }
     let cap_x = (dest_size[0] as i64 * pct as i64 / 100).max(0);
     let cap_y = (dest_size[1] as i64 * pct as i64 / 100).max(0);
+    // ★덮으려는 지연 프레임 수.★ 근거는 `EXTRAPOLATE_FRAMES` 의 doc 주석에 있다.
+    let frames = EXTRAPOLATE_FRAMES.load(Ordering::Relaxed).max(1) as i64;
 
     // 네 변을 따로 외삽한다 -- 회전이나 크기 변화는 변마다 다른 속도로 움직인다.
-    let clamp = |delta: i64, cap: i64| delta.clamp(-cap, cap);
+    let clamp = |delta: i64, cap: i64| (delta * frames).clamp(-cap, cap);
     let dx0 = clamp(now[0] as i64 - prev[0] as i64, cap_x);
     let dy0 = clamp(now[1] as i64 - prev[1] as i64, cap_y);
     let dx1 = clamp(
