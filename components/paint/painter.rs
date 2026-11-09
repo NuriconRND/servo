@@ -25,7 +25,8 @@ use paint_api::largest_contentful_paint_candidate::LCPCandidate;
 use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
-    ImageUpdate, PaintProxy, PainterSurfmanDetailsMap, PipelineExitSource, SendableFrameTree,
+    ImageUpdate, PaintProxy, PainterSurfmanDetailsMap, PainterTileRectMap, PipelineExitSource,
+    SendableFrameTree,
     SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
     WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
@@ -206,6 +207,10 @@ pub(crate) struct Painter {
 
     /// The ID of this painter.
     pub(crate) painter_id: PainterId,
+
+    /// 이 painter 의 타일 사각형을 WebGL 스레드에 알리는 공유 맵. `Paint` 와 같은 것을
+    /// 가리킨다. 근거와 좌표계는 `paint_api::PainterTileRect` 의 doc 주석에 있다.
+    painter_tile_rect_map: PainterTileRectMap,
 
     /// Our [`WebViewRenderer`]s, one for every `WebView`.
     pub(crate) webview_renderers: FxHashMap<WebViewId, WebViewRenderer>,
@@ -441,6 +446,9 @@ pub(crate) struct PainterInputs {
     /// `Paint::register_rendering_context` 가 채우지만, 스레드 경로는 컨텍스트가 그쪽에서
     /// 만들어지므로 그쪽에서 채울 수밖에 없다.
     pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
+    /// 타일 기하를 WebGL 스레드로 건네는 공유 맵. `Paint` 가 소유하고 모든 painter 가
+    /// 같은 것을 가리킨다.
+    pub(crate) painter_tile_rect_map: PainterTileRectMap,
 }
 
 // ★`raf_is_driving_composites` / `Painter::raf_is_producing_frames` 는 2026-10-22 에
@@ -890,6 +898,7 @@ impl Painter {
 
         let painter = Painter {
             painter_id,
+            painter_tile_rect_map: paint.painter_tile_rect_map.clone(),
             embedder_to_constellation_sender,
             webview_renderers: Default::default(),
             rendering_context,
@@ -3128,12 +3137,41 @@ impl Painter {
             .handle_screenshot_readiness_reply(webview_id, expected_epochs, self);
     }
 
+    /// 이 painter 의 타일 사각형을 공유 맵에 등록/갱신한다.
+    ///
+    /// ★WebGL 스레드가 읽는 유일한 타일 기하다★ -- 근거와 좌표계는
+    /// `paint_api::PainterTileRect` 의 doc 주석에 있다. 두 자리에서 부른다: 최초 등록
+    /// (`add_webview`)과 갱신(`set_viewport_details_and_origin`).
+    ///
+    /// 벽 설계상 ★레이아웃 뷰포트가 곧 가상 뷰포트★ 이므로(DOM/CSS/레이아웃을 큰 가상
+    /// 뷰포트에 대해 한 번 계산한다) `viewport_details` 가 그대로 전체 크기를 준다. 타일의
+    /// 크기는 이 painter 의 렌더링 컨텍스트 크기다.
+    fn publish_tile_rect(
+        &self,
+        viewport_details: ViewportDetails,
+        viewport_origin: DeviceVector2D,
+    ) {
+        let origin = viewport_origin.round().to_i32().to_point();
+        let size = self.rendering_context.size2d().to_i32();
+        let viewport = (viewport_details.size * viewport_details.hidpi_scale_factor)
+            .round()
+            .to_i32();
+        self.painter_tile_rect_map.insert(
+            self.painter_id,
+            paint_api::PainterTileRect {
+                tile: webrender_api::units::DeviceIntRect::from_origin_and_size(origin, size),
+                viewport,
+            },
+        );
+    }
+
     pub(crate) fn add_webview(
         &mut self,
         webview_id: WebViewId,
         viewport_details: ViewportDetails,
         viewport_origin: DeviceVector2D,
     ) {
+        self.publish_tile_rect(viewport_details, viewport_origin);
         self.webview_renderers
             .entry(webview_id)
             .or_insert(WebViewRenderer::new(
@@ -3215,6 +3253,10 @@ impl Painter {
         viewport_details: ViewportDetails,
         viewport_origin: DeviceVector2D,
     ) {
+        // ★조기 반환보다 먼저 등록한다★ -- 아래 두 `changed` 가 둘 다 거짓이어도 맵은
+        // 맞아야 한다.
+        self.publish_tile_rect(viewport_details, viewport_origin);
+
         let Some(webview_renderer) = self.webview_renderers.get_mut(&webview_id) else {
             return;
         };

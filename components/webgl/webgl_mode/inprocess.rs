@@ -3,7 +3,10 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use log::debug;
-use paint_api::{CrossProcessPaintApi, PainterSurfmanDetailsMap, WebRenderExternalImageIdManager};
+use paint_api::{
+    CrossProcessPaintApi, PainterSurfmanDetailsMap, PainterTileRectMap,
+    WebRenderExternalImageIdManager,
+};
 use servo_canvas_traits::webgl::{WebGLMsg, WebGLSurfaceId, WebGLThreads, webgl_channel};
 use surfman::Device;
 use surfman::chains::SwapChains;
@@ -28,6 +31,7 @@ impl WebGLComm {
         paint_api: CrossProcessPaintApi,
         external_image_id_manager: WebRenderExternalImageIdManager,
         painter_surfman_details_map: PainterSurfmanDetailsMap,
+        painter_tile_rect_map: PainterTileRectMap,
     ) -> WebGLComm {
         debug!("WebGLThreads::new()");
         let (sender, receiver) = webgl_channel::<WebGLMsg>().unwrap();
@@ -47,6 +51,7 @@ impl WebGLComm {
             receiver,
             webrender_swap_chains: swap_chains.clone(),
             painter_surfman_details_map,
+            painter_tile_rect_map,
             busy_webgl_context_map: busy_webgl_context_map.clone(),
             #[cfg(feature = "webxr")]
             webxr_init,

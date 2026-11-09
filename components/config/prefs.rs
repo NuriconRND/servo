@@ -831,6 +831,41 @@ pub struct Preferences {
     /// 컨텍스트로 복제되는 축이고(`webgl_thread.rs` 의 `apply_webgl_command_to_all_backends`),
     /// 이 pref 와 무관하다.
     pub gfx_wall_canvas_wait_declines_production: bool,
+    /// 백엔드마다 ★자기 타일 몫만 셰이딩★ 하도록 WebGL 의 default framebuffer 에 scissor 를
+    /// 건다(기본 꺼짐).
+    ///
+    /// ★왜★(2026-11-03/09 실측, log_webgl_perf_01/09, 4 타일 테스트 장비). 이 포크는 WebGL
+    /// 명령을 painter 마다의 별도 GPU 에 복제하고 ***각 백엔드가 캔버스 전체를 셰이딩***
+    /// 하는데, 한 타일은 자기 몫(1/4)만 표출한다. 캔버스를 벽 전체(11520x4320)로 확대하면
+    /// 네 GPU 가 각각 49.8Mpx 를 그리고 12.4Mpx 만 쓴다 -- ★75% 가 버려지고 저더가 난다.★
+    ///
+    ///     원본            RENDERCOST 주기 초과 10 초당 23 회   저더 발생
+    ///     백킹 1/2(면적 1/4)                        0 회        저더 없음
+    ///     백킹 1/4(면적 1/16)                       0 회        저더 없음
+    ///
+    /// 페이지 쪽에서 백킹을 줄이면 해결되지만 ★해상도를 잃는다.★ 이 pref 는 같은 양을
+    /// 아끼면서 해상도를 지킨다 -- 정점 작업은 그대로이고 ***자기 타일 밖의 프래그먼트만***
+    /// 버린다.
+    ///
+    /// ★작동 조건이 좁다.★ 캔버스 백킹 크기가 가상 뷰포트 크기와 같을 때만 건다. 아니면
+    /// 캔버스 좌표와 뷰포트 좌표가 1:1 이 아니므로 타일 사각형을 그대로 쓰면 ***각 타일이
+    /// 엉뚱한 사분면***을 보여준다. 그 검사에 걸리면 아무 일도 하지 않는다.
+    ///
+    /// ★안전한 것들★(코드로 확인): FBO 패스는 `drawing_to_default_framebuffer` 로 제외되고,
+    /// 페이지의 `gl.scissor` 박스와는 교집합을 내며, `bind_framebuffer` 가 이미
+    /// `restore_invariant` 를 불러 FBO 전환마다 자동 적용·해제된다.
+    ///
+    /// ★위험한 것들★: `readPixels`/`toDataURL`/`copyTexImage` 는 primary 백엔드에서 읽는데
+    /// 그 백엔드도 자기 타일 밖은 그리지 않으므로 ***그 바깥이 비어 나온다.*** 실측 대상
+    /// 페이지는 그 셋을 하나도 쓰지 않는다(0 건). 쓰는 페이지에서는 켜지 말 것.
+    pub gfx_wall_webgl_tile_scissor: bool,
+    /// 위 scissor 의 ★y 방향을 뒤집는다★(기본 꺼짐).
+    ///
+    /// GL scissor 는 아래-왼쪽 원점이고 타일 사각형은 위-왼쪽인데, 캔버스 외부 이미지가
+    /// `needs_vertical_flip` 으로 합성되는 것까지 겹쳐 ★방향이 코드만으로 자명하지 않다.★
+    /// 틀리면 각 타일이 ***다른 사분면***을 보여주므로 눈에 즉시 보인다 -- 추론으로 정해
+    /// 재빌드 왕복을 만드는 대신 한 런으로 가른다.
+    pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1623,6 +1658,8 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
+            gfx_wall_webgl_tile_scissor: false,
+            gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

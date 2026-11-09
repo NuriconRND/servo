@@ -42,7 +42,7 @@ use servo_base::generic_channel::{
     self, GenericCallback, GenericReceiver, GenericSender, GenericSharedMemory,
 };
 pub use webrender_api::ExternalImageSource;
-use webrender_api::units::{DevicePixel, LayoutVector2D, TexelRect};
+use webrender_api::units::{DeviceIntRect, DeviceIntSize, DevicePixel, LayoutVector2D, TexelRect};
 use webrender_api::{
     BuiltDisplayList, BuiltDisplayListDescriptor, ExternalImage, ExternalImageData,
     ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceFlags, FontInstanceKey,
@@ -668,6 +668,58 @@ impl CrossProcessPaintApi {
 pub struct PainterSurfmanDetails {
     pub connection: Connection,
     pub adapter: Adapter,
+}
+
+/// 한 painter 의 타일이 ★가상 뷰포트의 어느 사각형인가★, device px.
+///
+/// ★WebGL 스레드가 이것을 필요로 하는 이유.★ 이 포크는 모든 WebGL 명령을 painter 마다의
+/// 별도 GL 컨텍스트(= 별도 GPU)에 복제하고, ***각 백엔드의 드로잉 버퍼는 캔버스 전체
+/// 크기***다. 그런데 한 타일은 그중 자기 몫만 표출한다. 캔버스가 벽 전체를 덮으면 네 GPU
+/// 가 각각 11520x4320 을 셰이딩하고 ★12.4Mpx 만 쓰고 75% 를 버린다.★
+///
+/// 실측(2026-11-03/09, log_webgl_perf_01/09, 4 타일 테스트 장비): 그 조건에서 저더가 나고
+/// `RENDERCOST` 의 주기 초과가 정상 상태에서 10 초당 23 회였다. 페이지 쪽에서 백킹 스토어만
+/// 1/2 로 줄여(면적 1/4) 돌리면 ***초과가 0 이 되고 저더가 사라진다.*** 즉 ★면적 축★ 이고,
+/// 각 백엔드가 자기 타일 몫만 셰이딩하면 같은 양을 아낀다 -- 그쪽은 해상도를 잃지 않는다.
+///
+/// ★좌표계★: `tile` 과 `viewport` 는 둘 다 ***가상 뷰포트의 device px, 위-왼쪽 원점***이다.
+/// GL scissor 는 아래-왼쪽 원점이므로 쓰는 쪽에서 뒤집어야 하고, 외부 이미지가
+/// `needs_vertical_flip` 으로 합성되는 것까지 겹쳐 방향이 자명하지 않다 -- 그래서 뒤집기를
+/// pref 로 두고 실기 한 런으로 가린다(`gfx_wall_webgl_tile_scissor_flip_y`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PainterTileRect {
+    /// 이 painter 의 타일 사각형, 가상 뷰포트 device px.
+    pub tile: DeviceIntRect,
+    /// 가상 뷰포트 전체 크기, device px. ★쓰는 쪽이 "캔버스가 뷰포트를 꽉 채우는가" 를
+    /// 이것으로 검사한다★ -- 아니면 캔버스 좌표와 뷰포트 좌표가 1:1 이 아니므로 scissor 를
+    /// 걸면 ***엉뚱한 사분면***이 보인다.
+    pub viewport: DeviceIntSize,
+}
+
+/// `PainterId` -> [`PainterTileRect`]. ★WebGL 스레드가 읽는 유일한 타일 기하 통로다.★
+///
+/// [`PainterSurfmanDetailsMap`] 과 같은 모양이되 ★`insert` 가 덮어쓰기를 허용한다★ --
+/// `update_webview_paint_target` 이 원점을 언제든 다시 쓸 수 있다. 그쪽은 중복 등록이
+/// 버그라서 `assert` 를 두지만, 여기서는 갱신이 정상이다.
+#[derive(Clone, Default)]
+pub struct PainterTileRectMap(Arc<Mutex<HashMap<PainterId, PainterTileRect>>>);
+
+impl PainterTileRectMap {
+    pub fn get(&self, painter_id: PainterId) -> Option<PainterTileRect> {
+        let map = self.0.lock().expect("poisoned");
+        map.get(&painter_id).copied()
+    }
+
+    /// 등록하거나 갱신한다. ★덮어쓰기가 정상이다★(위 doc 참고).
+    pub fn insert(&self, painter_id: PainterId, rect: PainterTileRect) {
+        let mut map = self.0.lock().expect("poisoned");
+        map.insert(painter_id, rect);
+    }
+
+    pub fn remove(&self, painter_id: PainterId) {
+        let mut map = self.0.lock().expect("poisoned");
+        map.remove(&painter_id);
+    }
 }
 
 #[derive(Clone, Default)]

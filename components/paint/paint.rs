@@ -26,6 +26,7 @@ use paint_api::display_list::PaintDisplayListInfo;
 use paint_api::rendering_context::{RenderingContext, create_adapter_for_requested_gpu};
 use paint_api::{
     ImageUpdate, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
+    PainterTileRectMap,
     SerializableDisplayListPayload, WebRenderExternalImageIdManager, WebViewTrait,
 };
 use profile_traits::mem::{
@@ -180,6 +181,9 @@ pub struct Paint {
     /// A [`HashMap`] of [`PainterId`] to the Surfaman types (`Device`, `Adapter`) that
     /// are specific to a particular [`Painter`].
     pub(crate) painter_surfman_details_map: PainterSurfmanDetailsMap,
+    /// 타일 기하를 WebGL 스레드로 건네는 유일한 통로. 근거는
+    /// `paint_api::PainterTileRect` 의 doc 주석에 있다.
+    pub(crate) painter_tile_rect_map: PainterTileRectMap,
 
     /// A [`HashMap`] of `WebGLContextId` to a usage count. This count indicates when
     /// WebRender is still rendering the context. This is used to ensure properly clean
@@ -1275,6 +1279,7 @@ impl Paint {
 
         let webrender_external_image_id_manager = WebRenderExternalImageIdManager::default();
         let painter_surfman_details_map = PainterSurfmanDetailsMap::default();
+        let painter_tile_rect_map = PainterTileRectMap::default();
         let WebGLComm {
             webgl_threads,
             swap_chains,
@@ -1285,6 +1290,7 @@ impl Paint {
             state.paint_proxy.cross_process_paint_api.clone(),
             webrender_external_image_id_manager.clone(),
             painter_surfman_details_map.clone(),
+            painter_tile_rect_map.clone(),
         );
 
         // Create the WebXR main thread
@@ -1316,6 +1322,7 @@ impl Paint {
             time_profiler_chan: state.time_profiler_chan,
             _mem_profiler_registration: registration,
             painter_surfman_details_map,
+            painter_tile_rect_map,
             busy_webgl_contexts_map: busy_webgl_context_map,
             #[cfg(feature = "webxr")]
             webxr_main_thread: RefCell::new(webxr_main_thread),
@@ -2315,6 +2322,7 @@ impl Paint {
             event_loop_waker: self.event_loop_waker.clone_box(),
             paint_proxy: self.paint_proxy.clone(),
             painter_surfman_details_map: self.painter_surfman_details_map.clone(),
+            painter_tile_rect_map: self.painter_tile_rect_map.clone(),
         }
     }
 

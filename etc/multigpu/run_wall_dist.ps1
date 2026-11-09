@@ -399,6 +399,19 @@ param(
     # (ticker, 비디오)까지 같이 버린다.
     #   -CanvasWaitDecline
     [switch] $CanvasWaitDecline,
+    # gfx_wall_webgl_tile_scissor -- 백엔드마다 자기 타일 몫만 셰이딩하도록 WebGL 의
+    # default framebuffer 에 scissor 를 건다. 기본 꺼짐. 캔버스를 벽 전체로 확대했을 때
+    # 네 GPU 가 각각 전체를 그리고 75% 를 버리는 것을 막는다(log_webgl_perf_01/09).
+    # 캔버스 백킹이 가상 뷰포트 크기와 같을 때만 걸린다 -- 아니면 아무 일도 하지 않는다.
+    # readPixels/toDataURL/copyTexImage 를 쓰는 페이지에서는 켜지 말 것.
+    #   -WebglTileScissor
+    [switch] $WebglTileScissor,
+    # gfx_wall_webgl_tile_scissor_flip_y -- 위 scissor 의 y 방향을 뒤집는다. 기본 꺼짐.
+    # GL 은 아래-왼쪽 원점, 타일 사각형은 위-왼쪽이고 외부 이미지가 vertical flip 으로
+    # 합성되어 방향이 코드만으로 자명하지 않다. 틀리면 각 타일이 다른 사분면을 보여주므로
+    # 눈에 즉시 보인다 -- 두 값을 한 번씩 돌려 가린다.
+    #   -WebglTileScissor -WebglTileScissorFlipY
+    [switch] $WebglTileScissorFlipY,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -973,6 +986,8 @@ $argList = @(
     "--pref", "gfx_wall_canvas_live_window_ms=$CanvasLiveWindowMs",
     "--pref", "gfx_wall_live_canvas_tick_divisor=$LiveCanvasDivisor",
     "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_webgl_tile_scissor=$($WebglTileScissor.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_webgl_tile_scissor_flip_y=$($WebglTileScissorFlipY.IsPresent.ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "gfx_wr_profiler_hud=$ProfilerHud",
@@ -1047,7 +1062,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) webgl_tile_scissor=$($WebglTileScissor.IsPresent) scissor_flip_y=$($WebglTileScissorFlipY.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
