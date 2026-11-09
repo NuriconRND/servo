@@ -3158,20 +3158,38 @@ impl TileCacheInstance {
     /// (`space.rs::set_target_spatial_node` 가 `target -> ref` 변환을 만든다). 여기서는
     /// ref 를 픽처 공간, target 을 prim 공간으로 두고 ★`unmap`★ 을 쓴다.
     ///
-    /// ★`map` 이 아니라 `unmap` 인 이유★(2026-11-09): `map` 의 Transform 분기는
-    /// `project_rect` 를 타는데, 그 함수는 네 꼭짓점의 동차 좌표 중 하나라도 `w <= 0` 이거나
-    /// NaN 이면 ***`bounds` 로 frustum planes 를 만들어*** `plane_split` 의 다각형 클리핑에
-    /// 넘긴다(`util.rs::project_rect`). 그 분기는 ***회전에서만*** 열리고, 처음에 내가
-    /// `bounds` 에 `local_prim_rect`(= prim 자신의 가장 작은 박스)를 넣었다 -- 다른 호출처는
-    /// 모두 보수적으로 큰 영역을 넣는다(`picture.rs:2170` 은 `global_screen_world_rect`,
-    /// `:2181` 은 `surface.culling_rect`, `:2862` 는 `self.local_rect`). 그 구성에서
-    /// `winit_wall` 이 `0xc0000374`(힙 손상)으로 죽었고, 운영자 보고가 그 범위와 정확히
-    /// 겹친다 -- "이미지에 회전 애니메이션을 적용했을 때 발생, 평행이동 및 opacity 는 정상,
-    /// 이미지가 아닌 다른 요소의 애니메이션은 전부 정상"(log_webgl_perf_01/15).
+    /// ★★ref/target 순서를 반대로 넣으면 패닉한다 -- 회전에서만.★★ (2026-11-09)
     ///
-    /// `unmap` 의 Transform 분기는 `inverse_rect_footprint` 하나이고 ★`bounds` 를 전혀 쓰지
-    /// 않는다★ -- frustum/클리핑 경로를 아예 지나지 않는다. 비가역 변환이면 `None` 이고 그때는
-    /// 기존 경로로 떨어진다.
+    /// `set_target_spatial_node` 는 `get_relative_transform_with_face(target, ref)` 를
+    /// 부르고 그 두 인자는 ***(child, parent)*** 다(`space.rs:72-78`). 받는 쪽에
+    /// `assert!(child.coordinate_system_id.0 >= parent.coordinate_system_id.0)` 가 있다
+    /// (`spatial_tree.rs:1038`, `debug_assert` 가 아니라 release 에서도 산다).
+    ///
+    /// 타일 캐시의 `spatial_node_index` 는 ***앵커(조상)***이고 prim 의 노드는
+    /// ***자손***이다. 그런데 회전은 prim 에게 ***새 coordinate system id***를 준다 --
+    /// `ScaleOffset::from_transform` 이 `None` 을 돌려주면 `reset_cs_id` 가 서고
+    /// `coord_systems.push` 로 더 큰 번호를 받는다(`spatial_node.rs:473-516`). 그래서
+    /// 자손의 id 가 조상보다 크고, ref 를 prim 으로 두면 `child=조상, parent=자손` 이 되어
+    /// ***assert 가 깨진다***.
+    ///
+    /// 평행이동과 스케일은 `ScaleOffset::from_transform` 이 `Some` 이라 조상의 id 를 그대로
+    /// 물려받고, `space.rs` 가 `ScaleOffset` 분기로 가서 ***그 함수를 아예 부르지 않는다***.
+    /// opacity 는 공간 노드를 만들지 않는다. 그것이 운영자 보고의 범위와 정확히 겹친다 --
+    /// "이미지에 회전 애니메이션을 적용했을 때 발생, 평행이동 및 opacity 는 정상, 이미지가
+    /// 아닌 다른 요소의 애니메이션은 전부 정상"(log_webgl_perf_01/15). `winit_wall` 이
+    /// `0xc0000374` 로 죽은 것이 그 패닉의 결과다.
+    ///
+    /// ★내가 처음 적은 원인은 틀렸다★: "`project_rect` 가 `bounds` 로 frustum planes 를
+    /// 만들어 `plane_split` 에 넘기는데 `bounds` 를 작게 줬다" 고 썼는데, 그 분기는 네
+    /// 꼭짓점의 동차 `w` 가 `<= 0` 이거나 NaN 일 때만 열리고(`util.rs:1234`) ***2D 회전은
+    /// 네 꼭짓점 모두 `w == 1`*** 이다. 그 분기를 열려면 원근이나 비유한 행렬이 필요하다.
+    /// 즉 `bounds` 는 이 경로에서 읽히지도 않는다. 방향을 뒤집은 수정이 들은 것은 frustum
+    /// 때문이 아니라 ***assert 를 통과하게 됐기 때문***이다.
+    ///
+    /// 그래서 `unmap` 을 쓰는 이유는 둘이다. (1) ref 를 앵커로 둬야 assert 가 서고, 그
+    /// 방향에서 픽처 -> prim 은 `unmap` 이다. (2) `unmap` 의 Transform 분기는
+    /// `inverse_rect_footprint` 하나다. 비가역 변환이면 `None` 이고 그때는 기존 경로로
+    /// 떨어진다.
     ///
     /// 회전이 걸리면 결과가 축정렬 bounds 다 -- scissor 로는 ★안전한 쪽★(필요보다 크다)
     /// 이므로 그대로 쓴다.
@@ -3188,9 +3206,11 @@ impl TileCacheInstance {
         else {
             return;
         };
-        // ref = 픽처 공간, target = prim 공간. `unmap` 이 픽처 -> prim 이다.
-        // `bounds` 는 `T = ref = 픽처` 단위이고, `unmap` 은 그것을 쓰지 않지만 다른 호출처와
-        // 같은 값을 넣어 둔다(`picture.rs:2862` 와 같은 `self.local_rect`).
+        // ref = 픽처 공간(앵커), target = prim 공간. ★이 순서여야 한다★ -- 반대로 넣으면
+        // `spatial_tree.rs:1038` 의 assert 가 회전에서 깨진다(위 doc 주석). `unmap` 이
+        // 픽처 -> prim 이고, `bounds` 는 `T = ref = 픽처` 단위다.
+        //
+        // `picture.rs:2862` 가 같은 ref/target 짝에 같은 `self.local_rect` 를 넣는다.
         let map_prim_to_pic = SpaceMapper::new_with_target(
             self.spatial_node_index,
             prim_spatial_node_index,
