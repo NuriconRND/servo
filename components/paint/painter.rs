@@ -778,6 +778,12 @@ impl Painter {
         // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
         if pref!(gfx_wall_tick_phase_probe) {
             crate::frame_source_probe::start();
+            // ★WR 쪽 기록 게이트.★ `webrender` 는 `servo-config` 에 의존하지 않으므로
+            // (설정 표면 규약) pref 를 읽어 여기서 세워 준다. 꺼져 있으면 WR 쪽 비용은
+            // 원자 로드 하나다.
+            webrender::wall_canvas_rect::set_enabled(servo_config::pref!(
+                gfx_wall_webgl_tile_scissor_from_webrender
+            ));
         }
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
@@ -789,6 +795,12 @@ impl Painter {
             )),
             webrender::WebRenderOptions {
                 compositor_config,
+                // ★이 painter 가 담당하는 타일의 번호.★ WR 이 `wall_canvas_rect` 에 적을 때
+                // 키로 쓴다 -- 캔버스의 `ImageKey` 는 WebGL 컨텍스트당 하나라 네 painter 의
+                // WR 에 같은 키로 들어가고, 키만으로는 서로 덮어쓴다. 근거는 그 모듈의
+                // doc 주석에 있다. `IdNamespace` 는 이 painter 의 WR 자원 이름공간이므로
+                // painter 마다 다르고, 그 변환이 이미 있다(`servo_base::id`).
+                wall_painter_slot: Some(webrender_api::IdNamespace::from(painter_id).0),
                 // We force the use of optimized shaders here because rendering is broken
                 // on Android emulators with unoptimized shaders. This is due to a known
                 // issue in the emulator's OpenGL emulation layer.

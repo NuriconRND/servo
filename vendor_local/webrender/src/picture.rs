@@ -3145,6 +3145,62 @@ impl TileCacheInstance {
         warn!("Surface promotion of prim at {:?} {outcome} with: {}.", rect, result.unwrap_err());
     }
 
+    /// 이 타일이 이 캔버스 이미지의 어느 부분을 표출하는지 `wall_canvas_rect` 에 적는다.
+    ///
+    /// 들어오는 `pic_coverage_rect` 는 ***타일 캐시 픽처 공간***이고(감싼 surface 들의
+    /// inflation 이 이미 반영돼 있다), `screen_rect_in_pic_space` 도 같은 공간이다 -- 이
+    /// 포크에서는 painter 가 문서를 타일 크기로 잡으므로 ★그것이 곧 타일★ 이다. 둘을
+    /// 교집합한 뒤 prim 의 국소 공간으로 되돌려 `local_prim_rect`(= 캔버스 목적지 박스)와
+    /// 다시 교집합하고, 그 비율을 캔버스 백킹 픽셀로 환산한다.
+    ///
+    /// ★`SpaceMapper` 의 방향★: `new_with_target(ref, target, ..)` 는 `F = target 공간`,
+    /// `T = ref 공간` 이고 `map(F) -> T` 다(`space.rs::set_target_spatial_node` 가
+    /// `target -> ref` 변환을 만든다). 그래서 ref 를 prim 공간, target 을 픽처 공간으로
+    /// 두고 `map` 을 쓴다.
+    ///
+    /// 회전/기울기가 걸리면 `map` 이 축정렬 bounds 를 준다 -- scissor 로는 ★안전한 쪽★
+    /// (필요보다 크다)이므로 그대로 쓴다.
+    fn note_canvas_tile_rect(
+        &self,
+        slot: u32,
+        key: api::ImageKey,
+        pic_coverage_rect: PictureRect,
+        prim_spatial_node_index: SpatialNodeIndex,
+        local_prim_rect: LayoutRect,
+        frame_context: &FrameVisibilityContext,
+    ) {
+        let Some(visible_in_tile) = pic_coverage_rect.intersection(&self.screen_rect_in_pic_space)
+        else {
+            return;
+        };
+        let map_pic_to_prim = SpaceMapper::new_with_target(
+            prim_spatial_node_index,
+            self.spatial_node_index,
+            local_prim_rect,
+            frame_context.spatial_tree,
+        );
+        let Some(in_prim) = map_pic_to_prim.map(&visible_in_tile) else {
+            return;
+        };
+        let Some(clipped) = in_prim.intersection(&local_prim_rect) else {
+            return;
+        };
+        // 캔버스 목적지 박스 안에서의 비율로 바꾼다. 소비자가 자기 백킹 크기를 곱한다 --
+        // 백킹 크기를 여기서 알 길이 없고, 알 필요도 없다.
+        let dest = local_prim_rect;
+        if dest.width() <= 0.0 || dest.height() <= 0.0 {
+            return;
+        }
+        let rect = [
+            (clipped.min.x - dest.min.x).round() as i32,
+            (clipped.min.y - dest.min.y).round() as i32,
+            clipped.width().round() as i32,
+            clipped.height().round() as i32,
+        ];
+        let dest_size = [dest.width().round() as i32, dest.height().round() as i32];
+        crate::wall_canvas_rect::note(slot, key, rect, dest_size);
+    }
+
     /// Update the dependencies for each tile for a given primitive instance.
     pub fn update_prim_dependencies(
         &mut self,
@@ -3336,6 +3392,27 @@ impl TileCacheInstance {
             PrimitiveInstanceKind::Image { data_handle, ref mut compositor_surface_kind, .. } => {
                 let image_key = &data_stores.image[data_handle];
                 let image_data = &image_key.kind;
+
+                // ★이 타일이 이 캔버스의 어느 부분을 실제로 표출하는지 적어 둔다.★
+                //
+                // 근거와 좌표계는 `crate::wall_canvas_rect` 의 doc 주석에 있다. 요점은 벽의
+                // WebGL 백엔드가 자기 몫만 셰이딩할 때 쓰는 사각형을 ***타일 기하에서***
+                // 유도하고 있어서, 전환으로 캔버스가 화면상 움직이면 그 사각형이 낡는다는
+                // 것이다. 여기서 적은 값이 그것을 대신한다.
+                //
+                // ★꺼져 있으면 원자 로드 하나다.★
+                if crate::wall_canvas_rect::is_enabled() {
+                    if let Some(slot) = frame_context.config.wall_painter_slot {
+                        self.note_canvas_tile_rect(
+                            slot,
+                            image_data.key,
+                            pic_coverage_rect,
+                            prim_spatial_node_index,
+                            local_prim_rect,
+                            frame_context,
+                        );
+                    }
+                }
 
                 // For now, assume that for compositor surface purposes, any RGBA image may be
                 // translucent. See the comment in `add_prim` in this source file for more

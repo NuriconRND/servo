@@ -119,6 +119,9 @@ pub trait RenderBackendHooks {
 }
 
 pub struct WebRenderOptions {
+    /// 이 `Renderer` 가 담당하는 벽 타일의 번호(`None` = 벽이 아니다).
+    /// 근거는 `crate::wall_canvas_rect` 의 doc 주석에 있다.
+    pub wall_painter_slot: Option<u32>,
     pub resource_override_path: Option<PathBuf>,
     /// Whether to use shaders that have been optimized at build time.
     pub use_optimized_shaders: bool,
@@ -231,6 +234,7 @@ impl WebRenderOptions {
 impl Default for WebRenderOptions {
     fn default() -> Self {
         WebRenderOptions {
+            wall_painter_slot: None,
             resource_override_path: None,
             use_optimized_shaders: false,
             enable_aa: true,
@@ -564,6 +568,7 @@ pub fn create_webrender_instance(
     };
 
     let config = FrameBuilderConfig {
+        wall_painter_slot: options.wall_painter_slot,
         default_font_render_mode,
         dual_source_blending_is_supported: use_dual_source_blending,
         testing: options.testing,

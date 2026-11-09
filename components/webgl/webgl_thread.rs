@@ -169,6 +169,45 @@ fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
     );
 }
 
+/// 두 사각형 출처를 1 초에 한 줄 나란히 찍는다.
+///
+/// ★이것이 매핑 검증이다.★ 정지 상태에서는 WR 이 적은 값과 타일 기하에서 유도한 값이
+/// ***같아야 한다***. 다르면 변환이 틀린 것이고, 전환 중에만 달라지면 그것이 이 기능이
+/// 노리는 바로 그 차이다. 2026-11-09 에 y 뒤집기를 pref 로 ***추측하게*** 만들어 운영자가
+/// 두 런을 헛돌았다 -- 읽을 수 있는 것을 추측하지 않기 위한 장치다.
+fn log_tile_scissor_sources(
+    surface_id: WebGLSurfaceId,
+    from_wr: Option<[i32; 4]>,
+    from_tile: Option<[i32; 4]>,
+) {
+    if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
+        return;
+    }
+    static LAST_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST_AT.lock() else {
+        return;
+    };
+    if let Some(at) = *last {
+        if at.elapsed().as_millis() < 1000 {
+            return;
+        }
+    }
+    *last = Some(std::time::Instant::now());
+    let agree = match (from_wr, from_tile) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                "same"
+            } else {
+                "DIFFER"
+            }
+        },
+        (Some(_), None) => "wr_only",
+        (None, Some(_)) => "tile_only",
+        (None, None) => "neither",
+    };
+    warn!("WALLCANVASRECT {surface_id:?} wr={from_wr:?} tile={from_tile:?} {agree}");
+}
+
 /// 두 scissor 박스의 교집합. 겹치지 않으면 ★너비/높이 0★ 으로 모두 버린다.
 ///
 /// GL 은 음수 너비를 오류로 보므로 `max(0)` 이 필요하다.
@@ -1642,8 +1681,23 @@ impl WebGLThread {
         if !servo_config::pref!(gfx_wall_webgl_tile_scissor) {
             return None;
         }
-        let rect = self.painter_tile_rect_map.get(surface_id.painter_id)?;
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
+        let from_tile = self.tile_scissor_from_tile_geometry(surface_id, canvas);
+        let from_wr = self.tile_scissor_from_webrender(surface_id, canvas);
+        log_tile_scissor_sources(surface_id, from_wr, from_tile);
+        // ★WR 이 적어 둔 값이 있으면 그것을 쓴다.★ 없으면(= 이번 프레임 보고 없음, 또는
+        // 기능이 꺼짐) 기존 경로로 떨어진다 -- 안전한 쪽이다.
+        from_wr.or(from_tile)
+    }
+
+    /// 타일 기하에서 유도한 사각형. ★전환 중에는 낡는다★ -- 그래서
+    /// `tile_scissor_from_webrender` 가 있다.
+    fn tile_scissor_from_tile_geometry(
+        &self,
+        surface_id: WebGLSurfaceId,
+        canvas: Size2D<i32>,
+    ) -> Option<[i32; 4]> {
+        let rect = self.painter_tile_rect_map.get(surface_id.painter_id)?;
         if canvas.width != rect.viewport.width || canvas.height != rect.viewport.height {
             return None;
         }
@@ -1656,6 +1710,50 @@ impl WebGLThread {
             canvas.height - rect.tile.max.y
         };
         Some([x, y, w, h])
+    }
+
+    /// WR 이 이번 프레임에 적어 둔 ★실제 표출 사각형★.
+    ///
+    /// 근거는 `webrender::wall_canvas_rect` 의 doc 주석에 있다. 요점은 전환과 자유 모드
+    /// 편집이 캔버스의 ***백킹 크기를 바꾸지 않고*** 화면상 위치만 옮기므로, 타일 기하에서
+    /// 유도한 사각형이 낡아 ***새로 보게 된 영역이 비거나 깜박인다***는 것이다.
+    ///
+    /// WR 이 적는 값은 ★캔버스 목적지 박스 기준 비율★ 이고 위-왼쪽 원점이다. 여기서 백킹
+    /// 크기로 환산하고 GL 의 아래-왼쪽 원점으로 뒤집는다 -- ★기존 경로와 같은 규약★ 이라
+    /// 두 값을 나란히 비교할 수 있고, 정지 상태에서는 ***같아야 한다***. 그 비교가
+    /// `WALLCANVASRECT` 로그이고, y 방향을 추측으로 정하지 않기 위한 장치다.
+    fn tile_scissor_from_webrender(
+        &self,
+        surface_id: WebGLSurfaceId,
+        canvas: Size2D<i32>,
+    ) -> Option<[i32; 4]> {
+        if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
+            return None;
+        }
+        let key = self
+            .cached_context_info
+            .get(&surface_id.context_id)?
+            .image_key?;
+        let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
+        let max_age = servo_config::pref!(gfx_wall_webgl_tile_scissor_max_age_ms).max(0) as u64;
+        let noted = webrender::wall_canvas_rect::get(slot, key, max_age)?;
+        if noted.dest_size[0] <= 0 || noted.dest_size[1] <= 0 {
+            return None;
+        }
+        // 목적지 박스와 백킹 크기가 다를 수 있다(CSS 크기 대 백킹). 비율로 환산한다.
+        let sx = canvas.width as f32 / noted.dest_size[0] as f32;
+        let sy = canvas.height as f32 / noted.dest_size[1] as f32;
+        // ★바깥쪽으로 맞춘다★ -- scissor 가 필요보다 작으면 그만큼이 빈다. 크면 그만큼
+        // 더 셰이딩할 뿐이다.
+        let x = (noted.rect[0] as f32 * sx).floor() as i32;
+        let top = (noted.rect[1] as f32 * sy).floor() as i32;
+        let w = (noted.rect[2] as f32 * sx).ceil() as i32;
+        let h = (noted.rect[3] as f32 * sy).ceil() as i32;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let y = canvas.height - (top + h);
+        Some([x.max(0), y.max(0), w, h])
     }
 
     /// scissor 판정의 ★입력값★ 을 사람이 읽을 문자열로. ★로그 전용★ 이고 서피스마다 한 번만

@@ -313,6 +313,7 @@ impl BuiltScene {
             clip_tree: ClipTree::new(),
             recycler_tx: None,
             config: FrameBuilderConfig {
+                wall_painter_slot: None,
                 default_font_render_mode: FontRenderMode::Mono,
                 dual_source_blending_is_supported: false,
                 testing: false,

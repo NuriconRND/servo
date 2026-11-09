@@ -939,6 +939,34 @@ pub struct Preferences {
     /// 걸리지 않는다. 리사이즈 때의 clear 는 전체를 지운다(타일 밖에 쓰레기가 남으면
     /// 경계의 필터링이 끌어올 수 있고, 프레임마다가 아니다).
     pub gfx_wall_webgl_tile_scissor_clear: bool,
+
+    /// 타일 scissor 의 사각형을 ★타일 기하가 아니라 WR 이 적어 둔 실제 표출 영역★ 에서
+    /// 가져온다(기본 꺼짐).
+    ///
+    /// ★무엇을 고치는가★: 지금은 사각형을 타일 기하에서 유도하고, 캔버스 백킹 크기가
+    /// 가상 뷰포트와 같은지로만 검사한다. 구성 전환과 자유 모드의 실시간 편집은 백킹 크기를
+    /// ***바꾸지 않고*** CSS transform 으로 화면상 위치만 옮기므로, 검사는 통과하고 사각형은
+    /// ***옮기기 전 것***이 된다. 타일이 새로 보게 된 영역은 그려지지도 지워지지도 않아
+    /// 비거나 깜박인다 -- 운영자 보고(2026-11-09, log_webgl_perf_01/13·14): "구성간 전환
+    /// 애니메이션시 최종적으로 WebGL 표출 영역이 아니게 되는 부분이 비어 보임", "시작시
+    /// 전환 애니메이션 재생할 때 좌하단 WebGL 컨텐츠가 깜박이면서 등장함".
+    ///
+    /// 값의 출처와 좌표계는 `webrender::wall_canvas_rect` 의 doc 주석에 있다. 보고가 없는
+    /// 프레임(컬링, 나이 초과)에는 기존 경로로 떨어진다 -- 안전한 쪽이다.
+    ///
+    /// ★검증은 `WALLCANVASRECT` 로그다.★ 두 출처를 나란히 찍고 `same`/`DIFFER` 를 붙인다.
+    /// 정지 상태에서 `same` 이면 변환이 맞고, 전환 중에만 `DIFFER` 면 그것이 이 기능이
+    /// 노리는 차이다.
+    pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
+
+    /// WR 이 적어 둔 사각형을 몇 ms 까지 쓸지. 그보다 오래됐으면 ★없는 것으로 보고★ 기존
+    /// 경로로 떨어진다.
+    ///
+    /// 두 가지가 "이번 프레임 보고 없음" 을 만든다 -- `PrimitiveVisibility::reset` 이
+    /// `clip_chain` 을 지우지 않아 컬링된 prim 이 지난 프레임 사각형을 들고 있을 수 있고,
+    /// 타일 밖이면 `update_prim_dependencies` 가 조기 반환해 아예 적지 않는다. 60Hz 에서
+    /// 한두 프레임을 허용하는 값이 기본이다.
+    pub gfx_wall_webgl_tile_scissor_max_age_ms: i64,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
     ///
@@ -1748,6 +1776,8 @@ impl Preferences {
             gfx_webgl_nonblocking_front_buffer_lock: false,
             gfx_wall_webgl_tile_scissor: false,
             gfx_wall_webgl_tile_scissor_clear: false,
+            gfx_wall_webgl_tile_scissor_from_webrender: false,
+            gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,

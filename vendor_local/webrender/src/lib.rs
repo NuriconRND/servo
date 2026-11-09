@@ -133,6 +133,7 @@ mod texture_cache;
 mod tile_cache;
 mod util;
 mod visibility;
+pub mod wall_canvas_rect;
 mod api_resources;
 mod image_tiling;
 mod image_source;

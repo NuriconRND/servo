@@ -68,6 +68,12 @@ pub struct FrameBuilderConfig {
     pub is_software: bool,
     pub low_quality_pinch_zoom: bool,
     pub max_shared_surface_size: i32,
+    /// 이 `Renderer` 가 담당하는 벽 타일의 번호. `None` 이면 벽이 아니다.
+    ///
+    /// `wall_canvas_rect` 의 키에 쓴다 -- 캔버스의 `ImageKey` 는 WebGL 컨텍스트당 하나라
+    /// 네 painter 의 WR 에 같은 키로 들어가고, 키만으로는 서로 덮어쓴다. 자세한 것은
+    /// 그 모듈의 doc 주석에 있다. `Copy` 로 흘려보낼 수 있어야 하므로 `u32` 다.
+    pub wall_painter_slot: Option<u32>,
     pub enable_dithering: bool,
     pub precise_linear_gradients: bool,
     pub precise_radial_gradients: bool,

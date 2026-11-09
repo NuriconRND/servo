@@ -37,6 +37,7 @@ servo-base = { workspace = true }
 servo-canvas-traits = { workspace = true }
 servo-config = { workspace = true }
 surfman = { workspace = true }
+webrender = { workspace = true }
 webrender_api = { workspace = true }
 webxr = { workspace = true, optional = true }
 webxr-api = { workspace = true, optional = true }
