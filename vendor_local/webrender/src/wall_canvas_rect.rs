@@ -101,6 +101,21 @@ fn canvas_keys() -> &'static Mutex<HashSet<ImageKey>> {
     KEYS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// 이 `ImageKey` 가 등록된 캔버스인가.
+///
+/// ★계산을 시작하기 전에 묻는다.★ 2026-11-09 에 기록만 걸러서 ***계산은 모든 Image prim
+/// 에서 그대로 돌았고***, 그 계산이 `SpaceMapper::map` 을 지난다. 회전 변환이 걸린 prim 은
+/// `CoordinateSpaceMapping::Transform` 분기로 `project_rect` 를 타는데(평행이동/스케일은
+/// `ScaleOffset`, opacity 는 공간 변환이 아니다), 운영자 보고가 정확히 그 범위다 --
+/// "이미지에 회전 애니메이션을 적용했을 때 발생, 평행이동 및 opacity 는 정상, 이미지가
+/// 아닌 다른 요소의 애니메이션은 전부 정상" (log_webgl_perf_01/15 이후).
+pub fn is_canvas(key: ImageKey) -> bool {
+    match canvas_keys().lock() {
+        Ok(keys) => keys.contains(&key),
+        Err(_) => false,
+    }
+}
+
 /// 이 `ImageKey` 를 캔버스로 등록한다. WebGL 쪽이 키를 받을 때 부른다.
 pub fn register_canvas(key: ImageKey) {
     if let Ok(mut keys) = canvas_keys().lock() {

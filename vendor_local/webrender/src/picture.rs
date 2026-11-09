@@ -3154,12 +3154,27 @@ impl TileCacheInstance {
     /// 다시 교집합하고, 그 비율을 캔버스 백킹 픽셀로 환산한다.
     ///
     /// ★`SpaceMapper` 의 방향★: `new_with_target(ref, target, ..)` 는 `F = target 공간`,
-    /// `T = ref 공간` 이고 `map(F) -> T` 다(`space.rs::set_target_spatial_node` 가
-    /// `target -> ref` 변환을 만든다). 그래서 ref 를 prim 공간, target 을 픽처 공간으로
-    /// 두고 `map` 을 쓴다.
+    /// `T = ref 공간` 이고 `map(F) -> T`, `unmap(T) -> F` 다
+    /// (`space.rs::set_target_spatial_node` 가 `target -> ref` 변환을 만든다). 여기서는
+    /// ref 를 픽처 공간, target 을 prim 공간으로 두고 ★`unmap`★ 을 쓴다.
     ///
-    /// 회전/기울기가 걸리면 `map` 이 축정렬 bounds 를 준다 -- scissor 로는 ★안전한 쪽★
-    /// (필요보다 크다)이므로 그대로 쓴다.
+    /// ★`map` 이 아니라 `unmap` 인 이유★(2026-11-09): `map` 의 Transform 분기는
+    /// `project_rect` 를 타는데, 그 함수는 네 꼭짓점의 동차 좌표 중 하나라도 `w <= 0` 이거나
+    /// NaN 이면 ***`bounds` 로 frustum planes 를 만들어*** `plane_split` 의 다각형 클리핑에
+    /// 넘긴다(`util.rs::project_rect`). 그 분기는 ***회전에서만*** 열리고, 처음에 내가
+    /// `bounds` 에 `local_prim_rect`(= prim 자신의 가장 작은 박스)를 넣었다 -- 다른 호출처는
+    /// 모두 보수적으로 큰 영역을 넣는다(`picture.rs:2170` 은 `global_screen_world_rect`,
+    /// `:2181` 은 `surface.culling_rect`, `:2862` 는 `self.local_rect`). 그 구성에서
+    /// `winit_wall` 이 `0xc0000374`(힙 손상)으로 죽었고, 운영자 보고가 그 범위와 정확히
+    /// 겹친다 -- "이미지에 회전 애니메이션을 적용했을 때 발생, 평행이동 및 opacity 는 정상,
+    /// 이미지가 아닌 다른 요소의 애니메이션은 전부 정상"(log_webgl_perf_01/15).
+    ///
+    /// `unmap` 의 Transform 분기는 `inverse_rect_footprint` 하나이고 ★`bounds` 를 전혀 쓰지
+    /// 않는다★ -- frustum/클리핑 경로를 아예 지나지 않는다. 비가역 변환이면 `None` 이고 그때는
+    /// 기존 경로로 떨어진다.
+    ///
+    /// 회전이 걸리면 결과가 축정렬 bounds 다 -- scissor 로는 ★안전한 쪽★(필요보다 크다)
+    /// 이므로 그대로 쓴다.
     fn note_canvas_tile_rect(
         &self,
         slot: u32,
@@ -3173,13 +3188,16 @@ impl TileCacheInstance {
         else {
             return;
         };
-        let map_pic_to_prim = SpaceMapper::new_with_target(
-            prim_spatial_node_index,
+        // ref = 픽처 공간, target = prim 공간. `unmap` 이 픽처 -> prim 이다.
+        // `bounds` 는 `T = ref = 픽처` 단위이고, `unmap` 은 그것을 쓰지 않지만 다른 호출처와
+        // 같은 값을 넣어 둔다(`picture.rs:2862` 와 같은 `self.local_rect`).
+        let map_prim_to_pic = SpaceMapper::new_with_target(
             self.spatial_node_index,
-            local_prim_rect,
+            prim_spatial_node_index,
+            self.local_rect,
             frame_context.spatial_tree,
         );
-        let Some(in_prim) = map_pic_to_prim.map(&visible_in_tile) else {
+        let Some(in_prim) = map_prim_to_pic.unmap(&visible_in_tile) else {
             return;
         };
         let Some(clipped) = in_prim.intersection(&local_prim_rect) else {
@@ -3401,7 +3419,11 @@ impl TileCacheInstance {
                 // 것이다. 여기서 적은 값이 그것을 대신한다.
                 //
                 // ★꺼져 있으면 원자 로드 하나다.★
-                if crate::wall_canvas_rect::is_enabled() {
+                // ★캔버스가 아니면 계산도 하지 않는다.★ 기록만 걸러서는 부족했다 --
+                // 근거는 `wall_canvas_rect::is_canvas` 의 doc 주석에 있다.
+                if crate::wall_canvas_rect::is_enabled()
+                    && crate::wall_canvas_rect::is_canvas(image_data.key)
+                {
                     if let Some(slot) = frame_context.config.wall_painter_slot {
                         self.note_canvas_tile_rect(
                             slot,
