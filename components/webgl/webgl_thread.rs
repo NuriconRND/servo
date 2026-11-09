@@ -169,6 +169,36 @@ fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
     );
 }
 
+/// 소비자가 읽은 값의 나이와 외삽량을 1 초에 한 줄 찍는다.
+///
+/// ★이것이 경계 깨짐의 판정이다.★ 근거는 호출처 주석에 있다 -- 요점은 "외삽량이 부족한가"
+/// 와 "지연이 한 프레임이 아닌가" 가 ***재야 갈린다***는 것이다.
+fn note_canvas_rect_lag(noted: &webrender::wall_canvas_rect::CanvasTileRect) {
+    static LAST_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST_AT.lock() else {
+        return;
+    };
+    if let Some(at) = *last {
+        if at.elapsed().as_millis() < 1000 {
+            return;
+        }
+    }
+    *last = Some(std::time::Instant::now());
+    let widened = [
+        noted.raw[0] - noted.rect[0],
+        noted.raw[1] - noted.rect[1],
+        noted.rect[2] - noted.raw[2],
+        noted.rect[3] - noted.raw[3],
+    ];
+    warn!(
+        "CANVASRECTLAG age={}us raw={:?} used={:?} widened_by={widened:?} dest={:?}",
+        noted.at.elapsed().as_micros(),
+        noted.raw,
+        noted.rect,
+        noted.dest_size,
+    );
+}
+
 /// 두 사각형 출처를 1 초에 한 줄 나란히 찍는다.
 ///
 /// ★이것이 매핑 검증이다.★ 정지 상태에서는 WR 이 적은 값과 타일 기하에서 유도한 값이
@@ -1742,6 +1772,13 @@ impl WebGLThread {
         if noted.dest_size[0] <= 0 || noted.dest_size[1] <= 0 {
             return None;
         }
+        // ★지연과 외삽량을 기록한다.★ 경계 깨짐이 외삽으로 사라지지 않았고(2026-11-09),
+        // 원인 후보가 둘이다 -- 외삽량이 부족하다, 또는 지연이 한 프레임이 아니다. 둘은
+        // ***재야*** 갈린다: `age_us` 가 한 주기(16.7ms)쯤이면 지연은 한 프레임이고 부족한
+        // 것은 양이다. 두세 주기면 지연 자체가 더 길다. `raw` 대 `rect` 의 차가 외삽이
+        // 실제로 넓힌 양이고, 0 이면 외삽이 아예 안 걸린 것이다(`dest_size` 가 프레임마다
+        // 바뀌면 그 필터에서 떨어진다).
+        note_canvas_rect_lag(&noted);
         // 목적지 박스와 백킹 크기가 다를 수 있다(CSS 크기 대 백킹). 비율로 환산한다.
         let sx = canvas.width as f32 / noted.dest_size[0] as f32;
         let sy = canvas.height as f32 / noted.dest_size[1] as f32;
