@@ -1623,6 +1623,8 @@ impl WebGLThread {
             .remove(&context_id)
             .and_then(|info| info.image_key)
         {
+            // ★WR 쪽 기록과 등록도 같이 지운다★ -- 안 지우면 맵이 자란다.
+            webrender::wall_canvas_rect::forget(image_key);
             self.paint_api.delete_image(image_key);
         }
 
@@ -2099,13 +2101,19 @@ impl WebGLThread {
     }
 
     fn handle_set_image_key(&mut self, context_id: WebGLContextId, image_key: ImageKey) {
+        // ★이 키를 캔버스로 등록한다.★ WR 쪽은 등록된 키만 기록한다 -- 근거는
+        // `webrender::wall_canvas_rect::canvas_keys` 의 doc 주석에 있다.
+        webrender::wall_canvas_rect::register_canvas(image_key);
         let external_image_data = self.external_image_data(context_id);
         let Some(info) = self.cached_context_info.get_mut(&context_id) else {
+            // 방금 등록한 것을 되돌린다 -- 이 키는 쓰이지 않는다.
+            webrender::wall_canvas_rect::forget(image_key);
             self.paint_api.delete_image(image_key);
             return;
         };
 
         if let Some(old_image_key) = info.image_key.replace(image_key) {
+            webrender::wall_canvas_rect::forget(old_image_key);
             self.paint_api.delete_image(old_image_key);
             return;
         }

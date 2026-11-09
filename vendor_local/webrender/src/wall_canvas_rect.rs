@@ -56,7 +56,7 @@
 //! ★없는 것으로 취급★ 하고, 소비자는 기존 경로(타일 기하에서 유도)로 돌아간다 -- 안전한
 //! 쪽이다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -87,6 +87,27 @@ fn map() -> &'static Mutex<Map> {
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// ★기록 대상인 캔버스의 `ImageKey` 집합.★ WebGL 쪽이 등록한다.
+///
+/// ★왜 필요한가★(2026-11-09, log_webgl_perf_01/15): 처음에는 `note` 를 ***모든 Image
+/// prim***에 대해 불렀다. 캔버스만 필요한데 일반 이미지까지 들어오므로 (1) 맵이 페이지의
+/// 이미지 수만큼 커지고, (2) 이미지가 생기고 사라지는 구성(전환 애니메이션)에서 `forget`
+/// 을 부르는 사람이 없어 계속 자랐고, (3) 애초에 ***일반 이미지 경로를 건드릴 이유가
+/// 없다***. 그 구성에서 `winit_wall` 이 `0xc0000374`(힙 손상)로 죽었고, 이 기능을 끄면
+/// 죽지 않았다. 손상의 기구를 코드로 설명하지는 못했지만, ***건드리지 않아야 할 경로를
+/// 건드리고 있던 것***은 그 자체로 고칠 이유다.
+fn canvas_keys() -> &'static Mutex<HashSet<ImageKey>> {
+    static KEYS: OnceLock<Mutex<HashSet<ImageKey>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// 이 `ImageKey` 를 캔버스로 등록한다. WebGL 쪽이 키를 받을 때 부른다.
+pub fn register_canvas(key: ImageKey) {
+    if let Ok(mut keys) = canvas_keys().lock() {
+        keys.insert(key);
+    }
+}
+
 /// 기록을 켜거나 끈다. `paint` 가 부른다.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
@@ -105,6 +126,11 @@ pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
     // 적지 않아야 소비자가 기존 경로로 돌아간다.
     if rect[2] <= 0 || rect[3] <= 0 {
         return;
+    }
+    // ★등록된 캔버스만 기록한다.★ 근거는 `canvas_keys` 의 doc 주석에 있다.
+    match canvas_keys().lock() {
+        Ok(keys) if keys.contains(&key) => {},
+        _ => return,
     }
     let value = CanvasTileRect {
         rect,
@@ -128,8 +154,12 @@ pub fn get(slot: u32, key: ImageKey, max_age_ms: u64) -> Option<CanvasTileRect> 
     Some(value)
 }
 
-/// 이 캔버스의 기록을 모든 slot 에서 지운다. 컨텍스트가 사라질 때 부른다.
+/// 이 캔버스의 기록과 등록을 모든 slot 에서 지운다. ★컨텍스트가 사라질 때 반드시 부른다★
+/// -- 안 부르면 맵이 자란다.
 pub fn forget(key: ImageKey) {
+    if let Ok(mut keys) = canvas_keys().lock() {
+        keys.remove(&key);
+    }
     if let Ok(mut map) = map().lock() {
         map.retain(|(_, k), _| *k != key);
     }
