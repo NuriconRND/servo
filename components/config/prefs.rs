@@ -960,23 +960,27 @@ pub struct Preferences {
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
 
     /// WR 이 적어 둔 사각형을 몇 ms 까지 쓸지. 그보다 오래됐으면 ★없는 것으로 보고★ 기존
-    /// 경로로 떨어진다.
+    /// 경로(타일 기하)로 떨어진다.
     ///
-    /// ★처음에 34(= 두 프레임)로 뒀는데 그것이 잘못이었다★(2026-11-09,
-    /// log_webgl_perf_01/16): `WALLCANVASRECT` 의 `tile_only` 가 58 건으로 가장 많았고,
-    /// `CANVASRECTLAG` 의 `age` 가 ***정지 구간에서 30000~34000us*** 였다. 이유는 단순하다
-    /// -- 정지 상태에서는 WR 이 프레임을 다시 빌드하지 않으므로(`frame_is_valid`) 기록이
-    /// 갱신되지 않고 값이 늙는다. 그래서 ***절반 이상의 시간에 멀쩡한 값을 버리고*** 기존
-    /// 경로로 떨어지고 있었다.
+    /// ★이 값은 안전장치다. 올리지 말 것.★
     ///
-    /// 그런데 ★낡은 값이 틀릴 수 있는 경우가 원칙적으로 없다★: 값이 틀리려면 캔버스의 화면
-    /// 위치가 변해야 하고, 변하면 WR 은 ***반드시*** 프레임을 다시 빌드한다(그것이
-    /// `frame_is_valid = false` 의 정의이고, 이 포크의 페인트측 애니메이션도
-    /// `append_dynamic_properties` -> `flush_pending_updates` 로 그 길을 지난다). 즉 보고가
-    /// 없다는 것은 ***변한 것이 없다***는 뜻이다.
+    /// 2026-11-09 에 34 -> 1000 으로 올렸다가 ***기능을 멈췄다***(log_webgl_perf_01/18):
+    /// "9회 정도 전환했을 때 전환된 컨텐츠의 표출이 사라지더니 이후 다른 구성으로 변환
+    /// 시도하여도 아무것도 표출되지 않음". 올린 근거는 "낡은 값이 틀릴 수 있는 경우가
+    /// 원칙적으로 없다 -- 위치가 변하면 WR 은 반드시 프레임을 다시 빌드한다" 였는데,
+    /// ★그 추론이 빠뜨린 경우가 있다★: 전환으로 캔버스의 ***내용***이 바뀌어도 같은
+    /// 컨텍스트가 재사용되면 `forget` 이 불리지 않는다. 그러면 이전 구성의 사각형이 그
+    /// 시간만큼 새 캔버스를 자르고, 작은 사각형이면 거의 아무것도 그리지 않는다. 전환을
+    /// 반복하면 누적된다.
     ///
-    /// 그래서 이 값은 안전장치로만 남긴다. 캔버스가 타일 밖으로 나가 보고가 끊긴 경우에도
-    /// 낡은 사각형으로 scissor 를 걸지만, 그 타일은 캔버스를 그리지 않으므로 영향이 없다.
+    /// 그래서 짧게 유지한다. `WALLCANVASRECT` 의 `tile_only` 가 많이 찍히는 것은 ***낭비가
+    /// 아니라 안전장치가 일하는 것***이다 -- 보고가 없으면 타일 전체를 그리고, 그것은 언제나
+    /// 안전하다.
+    ///
+    /// 두 가지가 "이번 프레임 보고 없음" 을 만든다 -- `PrimitiveVisibility::reset` 이
+    /// `clip_chain` 을 지우지 않아 컬링된 prim 이 지난 프레임 사각형을 들고 있을 수 있고,
+    /// 타일 밖이면 `update_prim_dependencies` 가 조기 반환해 아예 적지 않는다. 60Hz 에서
+    /// 한두 프레임을 허용하는 값이 기본이다.
     pub gfx_wall_webgl_tile_scissor_max_age_ms: i64,
 
     /// 움직이는 동안 사각형을 ★한 프레임 이동량만큼★ 넓힌다. 목적지 박스 크기의 퍼센트가
@@ -1805,7 +1809,7 @@ impl Preferences {
             gfx_wall_webgl_tile_scissor: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
-            gfx_wall_webgl_tile_scissor_max_age_ms: 1000,
+            gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_webgl_tile_scissor_extrapolate_pct: 25,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
