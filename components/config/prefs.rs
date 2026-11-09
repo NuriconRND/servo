@@ -967,6 +967,23 @@ pub struct Preferences {
     /// 타일 밖이면 `update_prim_dependencies` 가 조기 반환해 아예 적지 않는다. 60Hz 에서
     /// 한두 프레임을 허용하는 값이 기본이다.
     pub gfx_wall_webgl_tile_scissor_max_age_ms: i64,
+
+    /// 움직이는 동안 사각형을 ★한 프레임 이동량만큼★ 넓힌다. 목적지 박스 크기의 퍼센트가
+    /// 상한이고, 0 이면 넓히지 않는다.
+    ///
+    /// ★왜★(2026-11-09, log_webgl_perf_01/15): WR 이 프레임 N 에 적은 사각형을 WebGL
+    /// 백엔드는 프레임 N+1 에 쓴다. 그래서 움직이는 동안 사각형이 한 프레임 뒤처지고 타일
+    /// 경계에 ***안 그려진 띠***가 남는다. 운영자 보고가 그 기구를 그대로 말해 준다 --
+    /// "깨짐 현상은 ★애니메이션 이동량에 비례해서★ 영역이 커지는 것으로 보임".
+    ///
+    /// ★고정 가드 밴드를 추측하지 않는다.★ 직전 프레임과의 차가 곧 한 프레임 이동량이므로,
+    /// 그만큼 앞으로 민 사각형과 합집합한다. 정지 상태에서는 차가 0 이라 넓히지 않고 scissor
+    /// 의 절감이 그대로 남는다. 상한은 빠른 이동에서 사각형이 캔버스 전체로 자라 절감이
+    /// 사라지는 것을 막는다.
+    ///
+    /// 25 가 기본이다 -- 한 프레임에 타일의 1/4 을 넘게 움직이는 전환은 어차피 눈으로
+    /// 따라갈 수 없다. 깨짐이 남으면 올리고, 절감이 사라지면 내린다.
+    pub gfx_wall_webgl_tile_scissor_extrapolate_pct: i64,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
     ///
@@ -1778,6 +1795,7 @@ impl Preferences {
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
+            gfx_wall_webgl_tile_scissor_extrapolate_pct: 25,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,
