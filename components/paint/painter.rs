@@ -778,17 +778,23 @@ impl Painter {
         // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
         if pref!(gfx_wall_tick_phase_probe) {
             crate::frame_source_probe::start();
-            // ★WR 쪽 기록 게이트.★ `webrender` 는 `servo-config` 에 의존하지 않으므로
-            // (설정 표면 규약) pref 를 읽어 여기서 세워 준다. 꺼져 있으면 WR 쪽 비용은
-            // 원자 로드 하나다.
-            webrender::wall_canvas_rect::set_enabled(servo_config::pref!(
-                gfx_wall_webgl_tile_scissor_from_webrender
-            ));
-            webrender::wall_canvas_rect::set_extrapolate_pct(
-                servo_config::pref!(gfx_wall_webgl_tile_scissor_extrapolate_pct).clamp(0, 100)
-                    as u32,
-            );
         }
+
+        // ★WR 쪽 기록 게이트 -- 계측 스위치와 무관하게 세운다.★ `webrender` 는
+        // `servo-config` 에 의존하지 않으므로(설정 표면 규약) pref 를 읽어 여기서 세워
+        // 준다. 꺼져 있으면 WR 쪽 비용은 원자 로드 하나다.
+        //
+        // ★2026-11-09 에 이것을 위 `if` 안에 넣은 것이 버그였다.★
+        // `gfx_wall_webgl_tile_scissor_from_webrender` 를 켜도 `-TickPhase` 를 주지 않으면
+        // ***기능이 조용히 꺼졌다***. 운영자가 `-NoLog` 로 반복 실행하며 육안 확인하던
+        // 구간이 그 상태였을 수 있고, 그러면 "여전히 경계 깨짐" 의 일부가 그것으로 설명된다.
+        // ★기능 게이트를 계측 스위치 안에 두지 않는다.★
+        webrender::wall_canvas_rect::set_enabled(servo_config::pref!(
+            gfx_wall_webgl_tile_scissor_from_webrender
+        ));
+        webrender::wall_canvas_rect::set_extrapolate_pct(
+            servo_config::pref!(gfx_wall_webgl_tile_scissor_extrapolate_pct).clamp(0, 100) as u32,
+        );
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
