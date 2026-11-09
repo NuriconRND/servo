@@ -115,10 +115,42 @@ pub struct GLState {
     /// ★`drawing_to_default_framebuffer` 일 때만 강제한다★ -- 페이지의 FBO 패스는 그 결과가
     /// 최종 그림에 들어가므로 잘라서는 안 된다.
     tile_scissor: Option<[i32; 4]>,
+    /// draw 시점의 실제 GL scissor 상태를 ★한 번만★ 찍기 위한 깃발.
+    ///
+    /// ★왜 필요한가★(2026-11-09): 측정은 `-WebglTileScissor` 가 동작을 바꿨다고 말하는데
+    /// (`RENDERCOST over_period` 269/256 대 43/53, 재현됨) ***코드 읽기는 그럴 수 없다고
+    /// 말한다*** -- surfman 의 `clear_surface` 가 `SCISSOR_TEST` 를 끄고 다시 켜지 않으며
+    /// (`chains.rs:398`), 그것이 내 설정 ***뒤***에 돌고, 다시 켜 줄 자리
+    /// (`Enable(SCISSOR_TEST)` / `bind_framebuffer` / `gl.scissor` /
+    /// `InitializeFramebuffer`)를 실측 페이지가 하나도 쓰지 않는다. 둘 중 하나가 틀렸고
+    /// 읽기로는 더 가릴 수 없으므로 ★GL 에게 직접 묻는다.★
+    scissor_gl_logged: bool,
     /// 페이지가 `gl.scissor` 로 정한 박스. 엔진 클립과 ★교집합★ 을 내려면 알아야 한다.
     /// 추적하지 않으면 페이지가 부르는 순간 엔진 클립이 사라진다.
     page_scissor: Option<[i32; 4]>,
     default_vao: Option<NativeVertexArray>,
+}
+
+/// draw 시점의 ★실제 GL scissor 상태★ 를 한 번만 찍는다.
+///
+/// 엔진이 세운 값(`tile_scissor`)과 GL 이 들고 있는 값을 ***나란히*** 찍는다 -- 다르면
+/// 중간에 누가 껐거나 덮어쓴 것이고, 그게 지금 가려야 하는 것이다. 근거는
+/// `GLState::scissor_gl_logged` 의 doc 주석에 있다.
+fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
+    if state.scissor_gl_logged {
+        return;
+    }
+    state.scissor_gl_logged = true;
+    let mut box_ = [0i32; 4];
+    let enabled = unsafe {
+        gl.get_parameter_i32_slice(gl::SCISSOR_BOX, &mut box_);
+        gl.is_enabled(gl::SCISSOR_TEST)
+    };
+    warn!(
+        "SCISSORGL at-draw enabled={enabled} gl_box={box_:?} engine={:?} page={:?} \
+         default_fb={}",
+        state.tile_scissor, state.page_scissor, state.drawing_to_default_framebuffer,
+    );
 }
 
 /// 두 scissor 박스의 교집합. 겹치지 않으면 ★너비/높이 0★ 으로 모두 버린다.
@@ -256,6 +288,7 @@ impl Default for GLState {
             drawing_to_default_framebuffer: true,
             tile_scissor: None,
             page_scissor: None,
+            scissor_gl_logged: false,
         }
     }
 }
@@ -1689,6 +1722,40 @@ impl WebGLThread {
 
                 // Check to see if any of the current framebuffer bindings are the surface we're
                 // about to swap out. If so, we'll have to reset them after destroying the surface.
+                // ★진단 색칠★(`gfx_wall_webgl_tile_scissor_debug_tint`). 여기는 페이지가
+                // 이 프레임을 다 그린 ***뒤***이고 swap 전이므로, 칠하면 그 결과가 그대로
+                // 표출된다. 어두운 색 = 이 백엔드의 캔버스 전체, 밝은 색 = 이 백엔드의
+                // scissor 영역. ★화면에서 밝은 영역이 어디 나타나는지가 매핑을 직접 보여준다★
+                // -- x/y 뒤집기 조합 넷을 추측으로 돌리지 않기 위한 것이다.
+                if servo_config::pref!(gfx_wall_webgl_tile_scissor_debug_tint) {
+                    // ★색은 사각형의 사분면으로 정한다★ -- painter id 가 아니라. 그러면 색이
+                    // "이 백엔드가 자기 몫이라고 믿는 사분면" 을 인코딩하고, 그 색이 화면
+                    // 어디에 나타나는지가 ***곧 매핑***이다.
+                    //   빨강=좌하(GL 원점쪽)  초록=우하  파랑=좌상  노랑=우상
+                    let (r, g, b) = match data.state.tile_scissor {
+                        Some([x, y, _, _]) => match (x > 0, y > 0) {
+                            (false, false) => (1.0f32, 0.0, 0.0),
+                            (true, false) => (0.0, 1.0, 0.0),
+                            (false, true) => (0.0, 0.0, 1.0),
+                            (true, true) => (1.0, 1.0, 0.0),
+                        },
+                        // scissor 가 없는 백엔드는 흰색으로 표시한다(그 자체가 진단이다).
+                        None => (1.0, 1.0, 1.0),
+                    };
+                    unsafe {
+                        data.gl.disable(gl::SCISSOR_TEST);
+                        data.gl.clear_color(r * 0.15, g * 0.15, b * 0.15, 1.0);
+                        data.gl.clear(gl::COLOR_BUFFER_BIT);
+                        if let Some([x, y, w, h]) = data.state.tile_scissor {
+                            data.gl.scissor(x, y, w, h);
+                            data.gl.enable(gl::SCISSOR_TEST);
+                            data.gl.clear_color(r, g, b, 1.0);
+                            data.gl.clear(gl::COLOR_BUFFER_BIT);
+                            data.gl.disable(gl::SCISSOR_TEST);
+                        }
+                    }
+                }
+
                 let framebuffer_rebinding_info =
                     FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
@@ -2927,8 +2994,9 @@ impl WebGLImpl {
             WebGLCommand::UseProgram(program_id) => unsafe {
                 gl.use_program(program_id.map(|p| p.glow()))
             },
-            WebGLCommand::DrawArrays { mode, first, count } => unsafe {
-                gl.draw_arrays(mode, first, count)
+            WebGLCommand::DrawArrays { mode, first, count } => {
+                log_scissor_gl_state_once(gl, state);
+                unsafe { gl.draw_arrays(mode, first, count) }
             },
             WebGLCommand::DrawArraysInstanced {
                 mode,

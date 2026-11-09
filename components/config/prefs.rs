@@ -866,6 +866,19 @@ pub struct Preferences {
     /// 틀리면 각 타일이 ***다른 사분면***을 보여주므로 눈에 즉시 보인다 -- 추론으로 정해
     /// 재빌드 왕복을 만드는 대신 한 런으로 가른다.
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
+    /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
+    ///
+    /// 어두운 색 = 그 백엔드의 캔버스 전체, 밝은 색 = 그 백엔드의 scissor 영역.
+    /// ★화면에서 밝은 영역이 어디 나타나는지가 "어느 사각형이 어디로 가는가" 를 직접
+    /// 보여준다.★ 페이지 그림은 가려진다 -- 진단 전용이다.
+    ///
+    /// ★왜 필요한가★(2026-11-09, log_webgl_perf_01/10): `gfx_wall_webgl_tile_scissor` 는
+    /// 저더를 없앴지만(`RENDERCOST over_period` 269 -> 43, 페이지 쪽 `scale=2` 와 동일)
+    /// ***그림이 엉뚱하게 나왔다***. scissor 사각형 자체는 로그로 검증됐다 -- 2x2, 겹침
+    /// 없음, 전체 덮음, `canvas == viewport` 검사 통과. 그래서 틀린 것은 ***어느 사각형이
+    /// 화면의 어디로 가는가*** 이고, x/y 뒤집기 조합이 넷이다. 추측으로 네 런을 돌리는
+    /// 대신 한 런에 색 배치를 본다.
+    pub gfx_wall_webgl_tile_scissor_debug_tint: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1660,6 +1673,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_tile_scissor: false,
             gfx_wall_webgl_tile_scissor_flip_y: false,
+            gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
