@@ -186,27 +186,33 @@ fn note_canvas_rect_lag(
 ) {
     const MAX_LINES: u64 = 4000;
     static LINES: AtomicU64 = AtomicU64::new(0);
-    static LAST: std::sync::Mutex<Option<([i32; 4], std::time::Instant)>> =
+    // ★slot 별로 나눈다.★ 2026-11-09 에 전역 하나로 둬서 네 slot 이 ***서로의 값***을 직전
+    // 값으로 썼고, 그래서 `delta[1]` 에 p=1(y=0) 과 p=3(y=2160) 의 차인 ±2160 이 찍혔다.
+    // 실제 외삽은 `map.get(&(slot, key))` 로 slot 별이라 영향이 없었지만, 로그의 `delta` 를
+    // 믿을 수 없게 만들었다 -- ★계측이 자기 때문에 틀린 값을 보여 주면 안 된다.★
+    static LAST: std::sync::Mutex<Option<FxHashMap<u32, ([i32; 4], std::time::Instant)>>> =
         std::sync::Mutex::new(None);
 
-    let Ok(mut last) = LAST.lock() else {
+    let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
+    let Ok(mut guard) = LAST.lock() else {
         return;
     };
+    let last_map = guard.get_or_insert_with(FxHashMap::default);
+    let last = last_map.get(&slot).copied();
     // ★변한 것이 없으면 찍지 않는다.★ 단, 2 초 이상 조용했으면 한 줄은 남겨 "살아 있다" 를
     // 보여 준다 -- 그것이 없으면 "전환이 없었다" 와 "계측이 죽었다" 가 같은 침묵이 된다.
     let quiet_too_long = last
-        .as_ref()
         .map(|(_, at)| at.elapsed().as_millis() >= 2000)
         .unwrap_or(true);
-    if let Some((prev_raw, _)) = last.as_ref() {
-        if *prev_raw == noted.raw && !quiet_too_long {
+    if let Some((prev_raw, _)) = last {
+        if prev_raw == noted.raw && !quiet_too_long {
             return;
         }
     }
     if LINES.fetch_add(1, Ordering::Relaxed) >= MAX_LINES {
         return;
     }
-    let delta = match last.as_ref() {
+    let delta = match last {
         Some((prev_raw, _)) => [
             noted.raw[0] - prev_raw[0],
             noted.raw[1] - prev_raw[1],
@@ -215,7 +221,7 @@ fn note_canvas_rect_lag(
         ],
         None => [0; 4],
     };
-    *last = Some((noted.raw, std::time::Instant::now()));
+    last_map.insert(slot, (noted.raw, std::time::Instant::now()));
     let widened = [
         noted.raw[0] - noted.rect[0],
         noted.raw[1] - noted.rect[1],
@@ -223,8 +229,8 @@ fn note_canvas_rect_lag(
         noted.rect[3] - noted.raw[3],
     ];
     warn!(
-        "CANVASRECTLAG p={} age={}us raw={:?} used={:?} delta={delta:?} widened_by={widened:?}",
-        webrender_api::IdNamespace::from(surface_id.painter_id).0,
+        "CANVASRECTLAG p={slot} age={}us raw={:?} used={:?} delta={delta:?} \
+         widened_by={widened:?}",
         noted.at.elapsed().as_micros(),
         noted.raw,
         noted.rect,
