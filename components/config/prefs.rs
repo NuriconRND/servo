@@ -858,6 +858,25 @@ pub struct Preferences {
     /// ★위험한 것들★: `readPixels`/`toDataURL`/`copyTexImage` 는 primary 백엔드에서 읽는데
     /// 그 백엔드도 자기 타일 밖은 그리지 않으므로 ***그 바깥이 비어 나온다.*** 실측 대상
     /// 페이지는 그 셋을 하나도 쓰지 않는다(0 건). 쓰는 페이지에서는 켜지 말 것.
+    /// painter 가 캔버스 스왑체인 뮤텍스에서 ★기다리지 않는다★(기본 꺼짐).
+    ///
+    /// 켜면 `try_take_surface` 로 집어오고, 생산자가 뮤텍스를 들고 있으면 ★직전 프레임을
+    /// 그대로 다시 보여준다.★ 끄면 지금처럼 기다린다.
+    ///
+    /// ★왜★(2026-11-09): `SwapChain` 의 뮤텍스가 ***무제한 GPU 대기 위에 걸쳐*** 잡혀
+    /// 있다 -- `swap_buffers` 가 `AcquireSync(0, INFINITE)` 와 캔버스 전체 blit 을,
+    /// `clear_surface` 가 전체 clear 를 그 안에서 한다(third_party/surfman/src/chains.rs 의
+    /// `try_take_surface` doc 주석에 자리까지 적어 뒀다). 그래서 캔버스가 느리면
+    /// ***관계없는 ticker 까지*** 같이 늦었다.
+    ///
+    /// 끄면 못 집어온 프레임이 `ExternalImageSource::Invalid` 가 되어 그 캔버스가 ***빈
+    /// 칸***으로 나온다. 켜면 직전 그림이 남는다 -- 낡은 그림이 깜빡임보다 낫다.
+    ///
+    /// 대가는 서피스 ★한 장★ 이다. painter 가 최신 프레임을 계속 들고 있으므로 체인이
+    /// 재활용할 것이 하나 줄고, 없으면 생산자가 한 번 더 만든다(`swap_buffers` 의
+    /// `unwrap_or_else`). 들고 있는 서피스는 `recycled_surfaces` 에 없으니 생산자가 그것을
+    /// 다시 바인드하지 않는다 -- 교착은 생기지 않는다.
+    pub gfx_webgl_nonblocking_front_buffer_lock: bool,
     pub gfx_wall_webgl_tile_scissor: bool,
     /// 위 scissor 의 ★y 방향을 뒤집는다★(기본 꺼짐).
     ///
@@ -1679,6 +1698,7 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
+            gfx_webgl_nonblocking_front_buffer_lock: false,
             gfx_wall_webgl_tile_scissor: false,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
