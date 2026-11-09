@@ -1909,8 +1909,18 @@ impl Paint {
         let logical_frame_id = if should_produce {
             let request = self.wall_frame_request_for_all_tiles();
             // ★호출 수를 직접 센다★ -- 근거는 `frame_source_probe::PRODUCE_TARGETS` 의
-            // doc 주석에 있다. 요점은 타일당 프레임이 기대값 60/s 가 아니라 ~50/s 인데,
-            // 유도값으로는 그 간격을 설명할 수 없었다는 것이다.
+            // doc 주석에 있다.
+            //
+            // ★이 계수기가 답했고, 답은 "간격은 없다" 였다★(2026-11-09,
+            // log_webgl_perf_01/14). 이것을 만든 이유는 "타일당 프레임이 기대값 60/s 가
+            // 아니라 ~50/s" 로 보였기 때문인데, ***그 ~50/s 자체가 오독이었다***.
+            // `PRODUCE` 줄의 `[49.8/s]` 는 ***누적 평균***이고 계측이 t=18.7s 에 시작하는데
+            // 분모가 런 전체다. 구간 차분하면 10 초마다 정확히 600, 즉 ★60.0/s★ 다.
+            // `RENDERCOST renders` 도 구간마다 정확히 2400 = 타일당 60/s 다.
+            //
+            // ★그래서 이 줄들을 읽을 때는 반드시 구간 차분부터 한다.★ 2026-11-09 에 이
+            // 주석의 옛 문장을 내가 다시 읽고 "50/s 결손이 있다" 고 한 번 더 틀렸다 --
+            // 반증된 수치를 주석에 남겨 두면 그것이 다음 사람을 속인다.
             crate::frame_source_probe::note_produce_wall_frame(
                 request.target_painter_ids.len(),
                 false,
