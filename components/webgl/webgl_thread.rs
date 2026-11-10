@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
 
@@ -173,64 +173,75 @@ fn note_swap_failure(surface_id: WebGLSurfaceId, what: &str, error: &str) {
 /// 출력은 10 초마다 그 경로에서 한 줄 -- 구간 차분을 직접 찍으므로 읽는 쪽이 누적을
 /// 나눌 필요가 없다.
 fn note_scissor_gate(outcome: ScissorGate) {
-    static APPLIED: AtomicU64 = AtomicU64::new(0);
-    static NO_KEY: AtomicU64 = AtomicU64::new(0);
-    static MISSING: AtomicU64 = AtomicU64::new(0);
-    static STALE: AtomicU64 = AtomicU64::new(0);
-    static NO_ISECT: AtomicU64 = AtomicU64::new(0);
+    static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
-    static LAST: Mutex<Option<(Instant, [u64; 5])>> = Mutex::new(None);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static PREV: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    /// 직전 리포트 시각, 프로세스 기준점 이후 ms. 0 = 아직 없음.
+    static PREV_AT_MS: AtomicU64 = AtomicU64::new(0);
+    static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-    let slot = match outcome {
-        ScissorGate::Applied => &APPLIED,
-        ScissorGate::NoKey => &NO_KEY,
-        ScissorGate::Missing => &MISSING,
+    /// 몇 번에 한 번 찍나. 60Hz 네 백엔드면 ~240/s 이므로 약 5 초다. ★시간을 재지 않고
+    /// 호출 수로 정한다★ -- 매 호출 `Instant::now()` 를 부르지 않기 위한 것이고, 실제 구간
+    /// 길이는 아래에서 함께 찍으므로 읽는 데 문제가 없다.
+    const REPORT_EVERY: u64 = 1200;
+
+    let index = match outcome {
+        ScissorGate::Applied => 0,
+        ScissorGate::NoKey => 1,
+        ScissorGate::Missing => 2,
         ScissorGate::Stale(age) => {
             STALE_AGE_MAX.fetch_max(age, Ordering::Relaxed);
-            &STALE
+            3
         },
-        ScissorGate::NoIntersection => &NO_ISECT,
+        ScissorGate::NoIntersection => 4,
     };
-    slot.fetch_add(1, Ordering::Relaxed);
 
-    // ★한 스레드만 찍는다.★ 잠금을 못 잡으면 그냥 넘어간다 -- 다음 프레임이 찍는다.
-    let Ok(mut last) = LAST.try_lock() else {
+    // ★여기까지가 타이밍 경로의 전부다 -- 완화된 원자 증가 둘(stale 이면 fetch_max 하나
+    // 더).★ 락도, 시계 읽기도, 할당도, 포맷도 없다. 이 함수의 앞선 판은 매 호출
+    // `Mutex::try_lock` + `Instant::now()` + 원자 5 회 로드를 했는데, 그것은 계측을 전부
+    // 걷어낸 2026-10-27 규칙이 금지하는 형태다(경합하는 락은 확정적 블록이고, 네 백엔드
+    // 스레드가 같은 캐시 라인을 친다). 2026-11-11 에 고쳤다.
+    SLOTS[index].fetch_add(1, Ordering::Relaxed);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % REPORT_EVERY != 0 {
         return;
-    };
-    let now = Instant::now();
-    let totals = [
-        APPLIED.load(Ordering::Relaxed),
-        NO_KEY.load(Ordering::Relaxed),
-        MISSING.load(Ordering::Relaxed),
-        STALE.load(Ordering::Relaxed),
-        NO_ISECT.load(Ordering::Relaxed),
-    ];
-    match *last {
-        Some((at, prev)) if now.duration_since(at).as_secs() < 10 => return,
-        Some((at, prev)) => {
-            let secs = now.duration_since(at).as_secs_f64().max(0.001);
-            let d: Vec<u64> = (0..5).map(|i| totals[i] - prev[i]).collect();
-            let total: u64 = d.iter().sum();
-            let pct = if total == 0 {
-                0.0
-            } else {
-                d[0] as f64 * 100.0 / total as f64
-            };
-            warn!(
-                "SCISSORGATE {secs:.0}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
-                 stale={} (age_max={}ms) no_isect={}",
-                d[0],
-                d[0] as f64 / secs,
-                d[1],
-                d[2],
-                d[3],
-                STALE_AGE_MAX.swap(0, Ordering::Relaxed),
-                d[4],
-            );
-            *last = Some((now, totals));
-        },
-        None => *last = Some((now, totals)),
     }
+
+    // ★여기부터는 REPORT_EVERY 번에 한 번만 돈다.★ 호출 수로 정했으므로 한 스레드만
+    // 들어온다(`fetch_add` 가 그 번호를 하나에게만 준다).
+    let now_ms = ORIGIN.elapsed().as_millis() as u64;
+    let prev_at_ms = PREV_AT_MS.swap(now_ms, Ordering::Relaxed);
+    let secs = if prev_at_ms == 0 {
+        // 첫 구간은 프로세스 시작부터다.
+        now_ms as f64 / 1000.0
+    } else {
+        (now_ms - prev_at_ms) as f64 / 1000.0
+    }
+    .max(0.001);
+
+    let mut d = [0u64; 5];
+    for i in 0..5 {
+        let total = SLOTS[i].load(Ordering::Relaxed);
+        d[i] = total - PREV[i].swap(total, Ordering::Relaxed);
+    }
+    let total: u64 = d.iter().sum();
+    let pct = if total == 0 {
+        0.0
+    } else {
+        d[0] as f64 * 100.0 / total as f64
+    };
+    warn!(
+        "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
+         stale={} (age_max={}ms) no_isect={}",
+        d[0],
+        d[0] as f64 / secs,
+        d[1],
+        d[2],
+        d[3],
+        STALE_AGE_MAX.swap(0, Ordering::Relaxed),
+        d[4],
+    );
 }
 
 /// `note_scissor_gate` 가 세는 결과 다섯.
@@ -1824,7 +1835,10 @@ impl WebGLThread {
         surface_id: WebGLSurfaceId,
         canvas: Size2D<i32>,
     ) -> Option<[i32; 4]> {
-        if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
+        // ★`pref!` 를 여기서 치지 않는다.★ 이 함수는 캔버스 프레임마다 painter 수만큼
+        // 도는 타이밍 경로이고, `pref!` 는 전역 `RwLock` 획득이다 -- 계측을 전부 걷어낸
+        // 2026-10-27 규칙이 금지한다. `painter` 가 틱마다 원자에 실어 두는 것을 읽는다.
+        if !webrender::wall_canvas_rect::is_enabled() {
             return None;
         }
         let key = match self
@@ -1839,7 +1853,7 @@ impl WebGLThread {
             },
         };
         let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
-        let max_age = servo_config::pref!(gfx_wall_webgl_tile_scissor_max_age_ms).max(0) as u64;
+        let max_age = webrender::wall_canvas_rect::max_age_ms();
         let noted = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
             webrender::wall_canvas_rect::Lookup::Hit(noted) => noted,
             webrender::wall_canvas_rect::Lookup::Stale(_, age) => {
@@ -1957,9 +1971,7 @@ impl WebGLThread {
                 }
                 // ★서피스마다 한 번 찍는다.★ 켰는데 안 걸리는 경우가 가장 헷갈리므로,
                 // 걸린 사각형과 걸리지 않은 사유를 둘 다 남긴다.
-                if servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender)
-                    && scissor_needs_log
-                {
+                if scissor_needs_log && webrender::wall_canvas_rect::is_enabled() {
                     match want_tile_scissor {
                         Some([x, y, w, h]) => warn!(
                             "SCISSOR {surface_id:?} applied rect=[{x},{y},{w},{h}] {scissor_debug}"

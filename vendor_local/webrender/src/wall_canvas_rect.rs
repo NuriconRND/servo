@@ -57,7 +57,7 @@
 //! 쪽이다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -126,6 +126,23 @@ pub fn register_canvas(key: ImageKey) {
 /// 기록을 켜거나 끈다. `paint` 가 부른다.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// 쓸 수 있는 기록의 최대 나이, ms. `painter` 가 틱마다 pref 에서 갱신한다.
+///
+/// ★`pref!` 를 소비자 쪽에서 치지 않기 위한 것이다.★ `pref!` 는 전역 `RwLock` 획득이고,
+/// 이 값을 읽는 자리는 ***캔버스 프레임마다 painter 수만큼*** 도는 타이밍 경로다. 계측을
+/// 전부 걷어낸 2026-10-27 의 규칙이 그것을 금지한다. 원자 하나로 바꾼다.
+static MAX_AGE_MS: AtomicU64 = AtomicU64::new(34);
+
+/// 유효기간을 세운다(ms). `paint` 가 부른다.
+pub fn set_max_age_ms(ms: u64) {
+    MAX_AGE_MS.store(ms, Ordering::Relaxed);
+}
+
+/// 지금 유효기간. ★원자 로드 하나다.★
+pub fn max_age_ms() -> u64 {
+    MAX_AGE_MS.load(Ordering::Relaxed)
 }
 
 pub fn is_enabled() -> bool {
