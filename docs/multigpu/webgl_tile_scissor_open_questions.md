@@ -224,3 +224,72 @@ clear 는 거기를 지운다. UV/클립 보정은 "검은 띠" 를 "빈 띠" �
   돌려준다(태스크 4).
 - 전환 중 judder 는 어느 외삽 값에서나 났다. 회전+opacity judder(태스크 2)와 같은
   것일 수 있다.
+
+---
+
+## 6. 27 번 실기 (2026-11-10) -- SCISSORGATE 가 답한 것, 그리고 내가 틀린 것
+
+첫 `SCISSORGATE` 런. 아홉 개의 10 초 구간(구간 차분은 프로브가 직접 찍는다):
+
+    applied=686 (66.2%)  missing=53  stale=297  age_max=1240ms  no_key=0  no_isect=0
+    applied=646 (57.1%)  missing=50  stale=436  age_max=1260ms
+    applied=798 (65.4%)  missing=44  stale=378  age_max=1292ms
+    applied=798 (64.6%)  missing=30  stale=408  age_max=1284ms
+    applied=803 (64.1%)  missing=42  stale=407  age_max=1288ms
+    applied=968 (90.3%)  missing=28  stale=76   age_max=1283ms
+    applied=872 (79.6%)  missing=35  stale=189  age_max=1233ms
+    applied=817 (63.8%)  missing=42  stale=421  age_max=1276ms
+    applied=865 (67.2%)  missing=53  stale=370  age_max=1303ms
+
+### 확정된 것
+
+* **기능은 돈다.** 캔버스 프레임의 57~90%(평균 ~68%)에 scissor 가 걸린다. `no_key=0`,
+  `no_isect=0` 이므로 등록과 기하 환산은 정상이다.
+* **실패는 거의 전부 `stale` 이다.** `missing` 은 구간당 28~53 으로 소수다.
+* **나머지 32% 는 캔버스 전체를 셰이딩한다** -- 11520x4320, 즉 타일 몫의 4 배.
+
+### 반증된 것 (내 가설이었다)
+
+* **"picture cache 가 유효하다고 판단해 prim 을 다시 걷지 않는다"** -- 틀렸다.
+  `note_canvas_tile_rect` 는 `update_prim_dependencies` 안에 있고, 그것은 visibility
+  walk 의 일부로 **타일 유효성 계산보다 먼저** 돈다(`frame_builder.rs` 의 walk ->
+  `post_update` 순서). `TileCacheInstance::pre_update` 의 culling rect 도 dirty/valid
+  입력을 쓰지 않으므로 유효한 타일이 캔버스 prim 을 walk 에서 빼지도 못한다.
+  실제 원인은 **컬링**이다 -- `update_prim_dependencies` 가 prim 이 타일 밖이면
+  `Culled` 로 조기 반환한다. **그리고 이것은 `wall_canvas_rect.rs` 의 모듈 doc 에 이미
+  적혀 있었다.** 코드를 다시 읽는 대신 가설을 세운 것이 실수다.
+* **"age_max 가 1.3 초니 max_age 를 34 에서 올려도 무의미하다"** -- 틀렸다. `age_max`
+  는 **구간 최댓값**이고, stale 이벤트의 약 77% 는 1000ms 안쪽이다. 1.3 초짜리는
+  매 구간에 있는 소수의 사건이다.
+* **`max_age = 34` 의 유래도 내가 적은 것과 다르다.** "전환 끝에서 사각형이 수축하는
+  것에 대비한 값" 이 아니라, 컬링 때문에 보고가 없는 **1~2 프레임(60Hz)을 참는 신선도
+  창**으로 기능과 함께 들어왔다(`1e918037c48`, `prefs.rs` 의 doc).
+* **"벽 생산이 60.0/s 로 정확하다"** -- 틱만 보면 맞지만 그것이 전부가 아니다.
+  페이싱 틱은 구간마다 600~601 로 완벽한데, **메인 스레드의 pass 실행이 그 격자에서
+  미끄러진다**: 구간별 (pass - tick) 이 +1, 0, **-10**, +12, +1, 0, -3, +4, +1 이다.
+* **"applied% 와 렌더 비용은 상관이 없다"** -- 판정 불가다. n=9 로는 Pearson 이
+  해결하지 못하고(|r| > 0.67 이어야 p<0.05), Spearman 은 오히려 -0.650(p=0.067)로
+  반대 방향이다.
+
+### 이 런의 한계
+
+**캔버스 전달이 25.9~32.2/s, 즉 ~30fps 다.** 운영자 보고는 "30fps 에서는 ticker
+judder 없음, 60fps 에서 발생" 이므로 **이 로그는 judder 가 나지 않는 구성이다.**
+60fps 소스로 돈 런이 없으면 그 judder 를 수치로 볼 수 없다. 다음 실기의 조건이다.
+
+주의: `SCISSORGATE` 의 분모(applied+missing+stale)를 4 로 나눈 값은 "캔버스 소스
+프레임률" 이 아니다. 계수기가 프로세스 전역이고 이 런은 레이아웃 전환마다 컨텍스트를
+새로 만들어 92 초에 16 개가 생겼으므로, 전환 중에는 두 캔버스가 동시에 산다. 그 값은
+**엔진이 실제로 전달한 swap 률의 하한**으로만 읽을 것.
+
+### 여기서 나온 수정과 남은 일
+
+* **고쳤다**(`aec4606dfb6`): 엔진 클립이 풀릴 때 `restore_scissor_invariant` 가 GL 의
+  scissor 박스를 되돌리지 않아, scissor test 를 켠 페이지가 **낡은 엔진 타일 박스에
+  영구히 갇혔다**(페이지가 `gl.scissor()` 를 불러도 GL 에 도달하지 못했다). 즉 "stale
+  이면 전체를 셰이딩한다" 는 설계가 그런 페이지에서는 조용히 "낡은 사각형을 그대로
+  쓴다" 로 변질됐다 -- 2 절이 가장 위험하다고 적은 그 동작이다.
+* **남은 구조적 결함:** `Missing`("아직 안 적었다")과 "이 타일엔 안 보인다" 가 **같은
+  신호**다. `note` 는 캔버스가 타일 밖이면 아예 쓰지 않으므로, 소비자는 "안 보이니
+  아무것도 그리지 말라" 를 표현할 수단이 없다. 3 절의 계약을 이 방향으로 좁히면
+  된다 -- **WR 이 프레임마다 "이 캔버스를 봤다/못 봤다" 를 명시**하는 것.
