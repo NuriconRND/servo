@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
 
@@ -154,6 +154,92 @@ fn note_swap_failure(surface_id: WebGLSurfaceId, what: &str, error: &str) {
     } else if n % 100 == 0 {
         warn!("SWAPFAIL total={n} (last: {what} for {surface_id:?})");
     }
+}
+
+/// scissor 가 실제로 걸리는 비율과, 걸리지 않을 때의 사유를 ★구간으로★ 센다.
+///
+/// ★이것이 필요한 이유.★ 앞선 `SCISSOR` 줄은 서피스마다 ***한 번***만 찍었는데, 그 한 번은
+/// 그 서피스의 ***첫 프레임***이다 -- 그 시점에는 WR 이 이 캔버스를 그린 적이 없으니
+/// `Missing` 이 당연하다. 그래서 2026-11-10 의 run 26 은 `applied=0 / skipped=68` 이었고,
+/// 그 수치로는 "정착 상태에서 걸리는가" 를 ***판정할 수 없었다***. 운영자 질문("아직도
+/// scissor 비활성화하는 옵션 존재하는지 확인 필요")에 답하려면 매 프레임을 세야 한다.
+///
+/// ★I/O 는 타이밍 경로에 두지 않는다.★ `handle_swap_buffers` 에서는 원자 증가 하나뿐이고,
+/// 출력은 10 초마다 그 경로에서 한 줄 -- 구간 차분을 직접 찍으므로 읽는 쪽이 누적을
+/// 나눌 필요가 없다.
+fn note_scissor_gate(outcome: ScissorGate) {
+    static APPLIED: AtomicU64 = AtomicU64::new(0);
+    static NO_KEY: AtomicU64 = AtomicU64::new(0);
+    static MISSING: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static NO_ISECT: AtomicU64 = AtomicU64::new(0);
+    static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<(Instant, [u64; 5])>> = Mutex::new(None);
+
+    let slot = match outcome {
+        ScissorGate::Applied => &APPLIED,
+        ScissorGate::NoKey => &NO_KEY,
+        ScissorGate::Missing => &MISSING,
+        ScissorGate::Stale(age) => {
+            STALE_AGE_MAX.fetch_max(age, Ordering::Relaxed);
+            &STALE
+        },
+        ScissorGate::NoIntersection => &NO_ISECT,
+    };
+    slot.fetch_add(1, Ordering::Relaxed);
+
+    // ★한 스레드만 찍는다.★ 잠금을 못 잡으면 그냥 넘어간다 -- 다음 프레임이 찍는다.
+    let Ok(mut last) = LAST.try_lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let totals = [
+        APPLIED.load(Ordering::Relaxed),
+        NO_KEY.load(Ordering::Relaxed),
+        MISSING.load(Ordering::Relaxed),
+        STALE.load(Ordering::Relaxed),
+        NO_ISECT.load(Ordering::Relaxed),
+    ];
+    match *last {
+        Some((at, prev)) if now.duration_since(at).as_secs() < 10 => return,
+        Some((at, prev)) => {
+            let secs = now.duration_since(at).as_secs_f64().max(0.001);
+            let d: Vec<u64> = (0..5).map(|i| totals[i] - prev[i]).collect();
+            let total: u64 = d.iter().sum();
+            let pct = if total == 0 {
+                0.0
+            } else {
+                d[0] as f64 * 100.0 / total as f64
+            };
+            warn!(
+                "SCISSORGATE {secs:.0}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
+                 stale={} (age_max={}ms) no_isect={}",
+                d[0],
+                d[0] as f64 / secs,
+                d[1],
+                d[2],
+                d[3],
+                STALE_AGE_MAX.swap(0, Ordering::Relaxed),
+                d[4],
+            );
+            *last = Some((now, totals));
+        },
+        None => *last = Some((now, totals)),
+    }
+}
+
+/// `note_scissor_gate` 가 세는 결과 다섯.
+enum ScissorGate {
+    /// scissor 를 걸었다.
+    Applied,
+    /// 이 컨텍스트에 `image_key` 가 아직 없다.
+    NoKey,
+    /// WR 이 이 (타일, 캔버스)를 적은 적이 없다.
+    Missing,
+    /// 적힌 것이 `max_age_ms` 보다 낡았다(나이, ms).
+    Stale(u64),
+    /// 사각형이 있지만 교집합이 비었다.
+    NoIntersection,
 }
 
 /// 두 scissor 박스의 교집합. 겹치지 않으면 ★너비/높이 0★ 으로 모두 버린다.
@@ -1715,17 +1801,42 @@ impl WebGLThread {
         if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
             return None;
         }
-        let key = self
+        let key = match self
             .cached_context_info
-            .get(&surface_id.context_id)?
-            .image_key?;
+            .get(&surface_id.context_id)
+            .and_then(|info| info.image_key)
+        {
+            Some(key) => key,
+            None => {
+                note_scissor_gate(ScissorGate::NoKey);
+                return None;
+            },
+        };
         let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
         let max_age = servo_config::pref!(gfx_wall_webgl_tile_scissor_max_age_ms).max(0) as u64;
-        let noted = webrender::wall_canvas_rect::get(slot, key, max_age)?;
+        let noted = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
+            webrender::wall_canvas_rect::Lookup::Hit(noted) => noted,
+            webrender::wall_canvas_rect::Lookup::Stale(_, age) => {
+                note_scissor_gate(ScissorGate::Stale(age));
+                return None;
+            },
+            webrender::wall_canvas_rect::Lookup::Missing => {
+                note_scissor_gate(ScissorGate::Missing);
+                return None;
+            },
+            // 기능이 꺼져 있으면 위에서 이미 돌아갔다.
+            webrender::wall_canvas_rect::Lookup::Disabled => return None,
+        };
         if noted.dest_size[0] <= 0 || noted.dest_size[1] <= 0 {
+            note_scissor_gate(ScissorGate::NoIntersection);
             return None;
         }
-        self.scale_canvas_rect(noted.rect, noted.dest_size, canvas)
+        let scaled = self.scale_canvas_rect(noted.rect, noted.dest_size, canvas);
+        note_scissor_gate(match scaled {
+            Some(_) => ScissorGate::Applied,
+            None => ScissorGate::NoIntersection,
+        });
+        scaled
     }
 
     /// 목적지 박스 기준 사각형을 캔버스 백킹 픽셀의 GL scissor 박스로 바꾼다.

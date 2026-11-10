@@ -132,7 +132,6 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-
 /// 이번 프레임의 사각형을 적는다. `picture.rs` 의 Image 분기가 부른다.
 pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
     if !is_enabled() {
@@ -162,14 +161,42 @@ pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
 
 /// 이 (slot, 캔버스)의 최신 사각형. `max_age_ms` 보다 오래됐으면 `None` 이다.
 pub fn get(slot: u32, key: ImageKey, max_age_ms: u64) -> Option<CanvasTileRect> {
+    match lookup(slot, key, max_age_ms) {
+        Lookup::Hit(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// `lookup` 의 결과. ★`None` 하나로 뭉치지 않는다★ -- "WR 이 아직 적지 않았다" 와 "적었지만
+/// 낡았다" 는 원인이 다르고 고치는 자리도 다르다. 소비자가 이것을 사유별로 센다.
+pub enum Lookup {
+    /// 기능이 꺼져 있다.
+    Disabled,
+    /// 이 (slot, 캔버스)에 대해 WR 이 적은 것이 없다.
+    Missing,
+    /// 적힌 것이 있지만 `max_age_ms` 보다 낡았다. 값과 나이를 함께 준다.
+    Stale(CanvasTileRect, u64),
+    /// 쓸 수 있는 값.
+    Hit(CanvasTileRect),
+}
+
+/// `get` 과 같은 조회지만 ★왜 못 썼는지를 함께 돌려준다.★
+pub fn lookup(slot: u32, key: ImageKey, max_age_ms: u64) -> Lookup {
     if !is_enabled() {
-        return None;
+        return Lookup::Disabled;
     }
-    let value = *map().lock().ok()?.get(&(slot, key))?;
-    if value.at.elapsed().as_millis() as u64 > max_age_ms {
-        return None;
+    let Ok(guard) = map().lock() else {
+        return Lookup::Missing;
+    };
+    let Some(value) = guard.get(&(slot, key)).copied() else {
+        return Lookup::Missing;
+    };
+    drop(guard);
+    let age = value.at.elapsed().as_millis() as u64;
+    if age > max_age_ms {
+        return Lookup::Stale(value, age);
     }
-    Some(value)
+    Lookup::Hit(value)
 }
 
 /// 이 캔버스의 기록과 등록을 모든 slot 에서 지운다. ★컨텍스트가 사라질 때 반드시 부른다★
