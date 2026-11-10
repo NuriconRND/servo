@@ -1793,13 +1793,29 @@ impl WebGLThread {
     /// y 뒤집기는 `gfx_wall_webgl_tile_scissor_flip_y` 가 정한다 -- 근거는 그 pref 의 doc
     /// 주석에 있다(코드만으로 방향이 자명하지 않다).
     fn tile_scissor_for(&self, surface_id: WebGLSurfaceId) -> Option<[i32; 4]> {
+        self.tile_scissor_for_inner(surface_id, false)
+    }
+
+    /// `clear` 가 쓸 사각형. `tile_scissor_for` 와 같지만 외삽을 뺀 쪽을 쓸 수 있다 --
+    /// 근거는 `tile_scissor_from_webrender` 의 `for_clear` 분기 주석에 있다.
+    fn tile_scissor_for_clear(&self, surface_id: WebGLSurfaceId) -> Option<[i32; 4]> {
+        self.tile_scissor_for_inner(surface_id, true)
+    }
+
+    fn tile_scissor_for_inner(
+        &self,
+        surface_id: WebGLSurfaceId,
+        for_clear: bool,
+    ) -> Option<[i32; 4]> {
         if !servo_config::pref!(gfx_wall_webgl_tile_scissor) {
             return None;
         }
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
         let from_tile = self.tile_scissor_from_tile_geometry(surface_id, canvas);
-        let from_wr = self.tile_scissor_from_webrender(surface_id, canvas);
-        log_tile_scissor_sources(surface_id, from_wr, from_tile);
+        let from_wr = self.tile_scissor_from_webrender(surface_id, canvas, for_clear);
+        if !for_clear {
+            log_tile_scissor_sources(surface_id, from_wr, from_tile);
+        }
         // ★WR 이 적어 둔 값이 있으면 그것을 쓴다.★ 없으면(= 이번 프레임 보고 없음, 또는
         // 기능이 꺼짐) 기존 경로로 떨어진다 -- 안전한 쪽이다.
         from_wr.or(from_tile)
@@ -1841,6 +1857,7 @@ impl WebGLThread {
         &self,
         surface_id: WebGLSurfaceId,
         canvas: Size2D<i32>,
+        for_clear: bool,
     ) -> Option<[i32; 4]> {
         if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
             return None;
@@ -1855,6 +1872,21 @@ impl WebGLThread {
         if noted.dest_size[0] <= 0 || noted.dest_size[1] <= 0 {
             return None;
         }
+        if for_clear && servo_config::pref!(gfx_wall_webgl_tile_scissor_clear_uses_raw) {
+            // ★clear 는 외삽하지 않은 영역만 지운다.★
+            //
+            // 외삽은 ***그려야 할 범위***를 넓히는 것이고(값이 한 프레임 늦으므로), clear 가
+            // 같이 넓어지면 ***아직 그려질 내용이 없는 영역까지 배경색으로 지운다***. 운영자가
+            // 그것을 정확히 봤다(2026-11-10, log_webgl_perf_01/21): "next 의 애니메이션으로
+            // 움직이게 될 영역까지가 ★미리★ 깜박이는 것처럼 보였다". 구성 전환이 좌->우로
+            // 빠르게 등장해 화면을 조금 벗어났다 돌아오는 바운스라서, 양방향 외삽이 특히 크게
+            // 작동하는 구간이다.
+            //
+            // 그래서 shading 은 `rect`(외삽 포함), clear 는 `raw`(실제 영역)를 쓴다. 외삽
+            // 영역에는 이전 프레임의 내용이 남지만, 그곳은 ***이번 프레임에 표출되지 않는
+            // 영역***이므로 보이지 않고, 다음 프레임에 표출될 때는 그때의 clear 가 지운다.
+            return self.scale_canvas_rect(noted.raw, noted.dest_size, canvas);
+        }
         // ★지연과 외삽량을 기록한다.★ 경계 깨짐이 외삽으로 사라지지 않았고(2026-11-09),
         // 원인 후보가 둘이다 -- 외삽량이 부족하다, 또는 지연이 한 프레임이 아니다. 둘은
         // ***재야*** 갈린다: `age_us` 가 한 주기(16.7ms)쯤이면 지연은 한 프레임이고 부족한
@@ -1862,15 +1894,26 @@ impl WebGLThread {
         // 실제로 넓힌 양이고, 0 이면 외삽이 아예 안 걸린 것이다(`dest_size` 가 프레임마다
         // 바뀌면 그 필터에서 떨어진다).
         note_canvas_rect_lag(surface_id, &noted);
-        // 목적지 박스와 백킹 크기가 다를 수 있다(CSS 크기 대 백킹). 비율로 환산한다.
-        let sx = canvas.width as f32 / noted.dest_size[0] as f32;
-        let sy = canvas.height as f32 / noted.dest_size[1] as f32;
-        // ★바깥쪽으로 맞춘다★ -- scissor 가 필요보다 작으면 그만큼이 빈다. 크면 그만큼
-        // 더 셰이딩할 뿐이다.
-        let x = (noted.rect[0] as f32 * sx).floor() as i32;
-        let top = (noted.rect[1] as f32 * sy).floor() as i32;
-        let w = (noted.rect[2] as f32 * sx).ceil() as i32;
-        let h = (noted.rect[3] as f32 * sy).ceil() as i32;
+        self.scale_canvas_rect(noted.rect, noted.dest_size, canvas)
+    }
+
+    /// 목적지 박스 기준 사각형을 캔버스 백킹 픽셀의 GL scissor 박스로 바꾼다.
+    ///
+    /// 목적지 박스와 백킹 크기가 다를 수 있으므로(CSS 크기 대 백킹) 비율로 환산하고,
+    /// ★바깥쪽으로 맞춘다★ -- scissor 가 필요보다 작으면 그만큼이 빈다. 그리고 위-왼쪽
+    /// 원점을 GL 의 아래-왼쪽으로 뒤집는다.
+    fn scale_canvas_rect(
+        &self,
+        rect: [i32; 4],
+        dest_size: [i32; 2],
+        canvas: Size2D<i32>,
+    ) -> Option<[i32; 4]> {
+        let sx = canvas.width as f32 / dest_size[0] as f32;
+        let sy = canvas.height as f32 / dest_size[1] as f32;
+        let x = (rect[0] as f32 * sx).floor() as i32;
+        let top = (rect[1] as f32 * sy).floor() as i32;
+        let w = (rect[2] as f32 * sx).ceil() as i32;
+        let h = (rect[3] as f32 * sy).ceil() as i32;
         if w <= 0 || h <= 0 {
             return None;
         }
@@ -1927,6 +1970,7 @@ impl WebGLThread {
                 // ★`data` 를 빌리기 전에 계산한다★ -- `self` 메서드 호출이라 뒤에서는
                 // 빌림 검사가 막는다.
                 let want_tile_scissor = self.tile_scissor_for(surface_id);
+                let want_clear_scissor = self.tile_scissor_for_clear(surface_id);
                 let scissor_needs_log = self.scissor_logged.insert(surface_id);
                 // ★빌림 전에 만든다★ -- 로그 자리에서는 `self` 를 못 쓴다. 서피스마다 한
                 // 번뿐이라 평소에는 만들지 않는다.
@@ -2041,7 +2085,7 @@ impl WebGLThread {
                     //
                     // ★셰이딩 scissor 와 같은 사각형을 쓴다★(`want_tile_scissor`). 그래서
                     // 지우는 영역과 그리는 영역이 정확히 같고, 둘이 어긋날 수 없다.
-                    let clear_scissor = want_tile_scissor
+                    let clear_scissor = want_clear_scissor
                         .filter(|_| servo_config::pref!(gfx_wall_webgl_tile_scissor_clear));
                     swap_chain
                         .clear_surface(

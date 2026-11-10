@@ -1027,6 +1027,22 @@ pub struct Preferences {
     /// 재활용된 서피스에 ***이전 프레임의 그림***이 남는 쪽이 후보다(그 pref 를 끄면 그 영역이
     /// 찌꺼기 대신 검정으로 바뀌는 것이 log_webgl_perf_01/15 의 38 번 런에서 관찰됐다).
     pub gfx_wall_webgl_tile_scissor_extrapolate_frames: i64,
+
+    /// swap 뒤의 clear 가 ★외삽하지 않은★ 사각형을 쓴다(기본 켜짐).
+    ///
+    /// 외삽은 ***그려야 할 범위***를 넓히는 것이고, clear 가 같이 넓어지면 ***아직 그려질
+    /// 내용이 없는 영역까지 배경색으로 지운다***. 운영자가 그것을 정확히 봤다(2026-11-10,
+    /// log_webgl_perf_01/21): `-WebglTileScissorClear` 를 뺀 실행에서 "next 의 애니메이션으로
+    /// 움직이게 될 영역까지가 ★미리★ 깜박이는 것처럼 보였다". 구성 전환이 좌->우로 빠르게
+    /// 등장해 화면을 조금 벗어났다 돌아오는 바운스라, 양방향 외삽이 특히 크게 작동하는
+    /// 구간이다.
+    ///
+    /// 그래서 shading 은 외삽 포함, clear 는 실제 영역만 쓴다. 외삽 영역에는 이전 프레임의
+    /// 내용이 남지만 그곳은 이번 프레임에 표출되지 않으며, 다음 프레임에 표출될 때는 그때의
+    /// clear 가 지운다.
+    ///
+    /// 끄면 둘이 같은 사각형을 쓴다(이전 동작) -- 되돌리기용이다.
+    pub gfx_wall_webgl_tile_scissor_clear_uses_raw: bool,
     pub gfx_wall_webgl_tile_scissor_flip_y: bool,
     /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
     ///
@@ -1840,6 +1856,7 @@ impl Preferences {
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_webgl_tile_scissor_extrapolate_pct: 6,
             gfx_wall_webgl_tile_scissor_extrapolate_frames: 6,
+            gfx_wall_webgl_tile_scissor_clear_uses_raw: true,
             gfx_wall_webgl_tile_scissor_flip_y: false,
             gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,
