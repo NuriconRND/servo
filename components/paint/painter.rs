@@ -792,12 +792,6 @@ impl Painter {
         webrender::wall_canvas_rect::set_enabled(servo_config::pref!(
             gfx_wall_webgl_tile_scissor_from_webrender
         ));
-        webrender::wall_canvas_rect::set_extrapolate_pct(
-            servo_config::pref!(gfx_wall_webgl_tile_scissor_extrapolate_pct).clamp(0, 100) as u32,
-        );
-        webrender::wall_canvas_rect::set_extrapolate_frames(
-            servo_config::pref!(gfx_wall_webgl_tile_scissor_extrapolate_frames).clamp(1, 16) as u32,
-        );
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),

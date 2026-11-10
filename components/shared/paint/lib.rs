@@ -684,8 +684,9 @@ pub struct PainterSurfmanDetails {
 ///
 /// ★좌표계★: `tile` 과 `viewport` 는 둘 다 ***가상 뷰포트의 device px, 위-왼쪽 원점***이다.
 /// GL scissor 는 아래-왼쪽 원점이므로 쓰는 쪽에서 뒤집어야 하고, 외부 이미지가
-/// `needs_vertical_flip` 으로 합성되는 것까지 겹쳐 방향이 자명하지 않다 -- 그래서 뒤집기를
-/// pref 로 두고 실기 한 런으로 가린다(`gfx_wall_webgl_tile_scissor_flip_y`).
+/// `needs_vertical_flip` 으로 합성되는 것까지 겹쳐 방향이 자명하지 않았다. 실기로 확정됐고
+/// (2026-11-09, 진단 색칠로 네 타일의 색 배치를 확인) 뒤집기는 소비자가 고정값으로 한다 --
+/// `webgl_thread::scale_canvas_rect`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PainterTileRect {
     /// 이 painter 의 타일 사각형, 가상 뷰포트 device px.

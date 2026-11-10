@@ -116,125 +116,10 @@ pub struct GLState {
     /// ★`drawing_to_default_framebuffer` 일 때만 강제한다★ -- 페이지의 FBO 패스는 그 결과가
     /// 최종 그림에 들어가므로 잘라서는 안 된다.
     tile_scissor: Option<[i32; 4]>,
-    /// draw 시점의 실제 GL scissor 상태를 ★한 번만★ 찍기 위한 깃발.
-    ///
-    /// ★왜 필요한가★(2026-11-09): 측정은 `-WebglTileScissor` 가 동작을 바꿨다고 말하는데
-    /// (`RENDERCOST over_period` 269/256 대 43/53, 재현됨) ***코드 읽기는 그럴 수 없다고
-    /// 말한다*** -- surfman 의 `clear_surface` 가 `SCISSOR_TEST` 를 끄고 그것이 내 설정
-    /// ***뒤***에 돈다. 그래서 draw 때는 꺼져 있어야 한다고 봤다.
-    ///
-    /// ★그 읽기가 틀렸다★(2026-11-09 정정): 같은 함수가 들어올 때 활성 여부를 저장하고
-    /// 나올 때 되돌린다. `disable` 만 보고 40 줄 아래의 복원을 못 봤다. 내 scissor 는 살아
-    /// 있었고 절감도 진짜였다 -- 파일을 끝까지 읽으면 나오는 것을, 진단을 만들어서 알았다.
-    ///
-    /// 그래도 이 로그는 남긴다. GL 이 실제로 무엇을 들고 있는지 한 줄로 확인할 수 있고, 그
-    /// 덕에 ***페이지가 쓰지도 않는 박스와 교집합을 내던 버그***를 잡았다(`page_test=false`
-    /// 인데 교집합에 쓰고 있었다, a47204b3335).
-    scissor_gl_logged: bool,
     /// 페이지가 `gl.scissor` 로 정한 박스. 엔진 클립과 ★교집합★ 을 내려면 알아야 한다.
     /// 추적하지 않으면 페이지가 부르는 순간 엔진 클립이 사라진다.
     page_scissor: Option<[i32; 4]>,
     default_vao: Option<NativeVertexArray>,
-}
-
-/// draw 시점의 ★실제 GL scissor 상태★ 를 한 번만 찍는다.
-///
-/// 엔진이 세운 값(`tile_scissor`)과 GL 이 들고 있는 값을 ***나란히*** 찍는다 -- 다르면
-/// 중간에 누가 껐거나 덮어쓴 것이고, 그게 지금 가려야 하는 것이다. 근거는
-/// `GLState::scissor_gl_logged` 의 doc 주석에 있다.
-fn log_scissor_gl_state_once(gl: &Gl, state: &mut GLState) {
-    if state.scissor_gl_logged {
-        return;
-    }
-    // ★엔진 클립이 세워진 뒤에 찍는다.★ 2026-11-09 에 ***첫*** draw 에서 찍었더니 그 시점은
-    // 캔버스가 아직 300x150 이고 `tile_scissor` 가 세워지기 전이라(그것은
-    // `handle_swap_buffers` 에서 세운다) `engine=None` 만 나왔다 -- 가리려던 것을 하나도
-    // 가리지 못했다. pref 가 켜져 있는데 아직 안 세워졌으면 다음 draw 를 기다린다.
-    if servo_config::pref!(gfx_wall_webgl_tile_scissor) && state.tile_scissor.is_none() {
-        return;
-    }
-    state.scissor_gl_logged = true;
-    let mut box_ = [0i32; 4];
-    let enabled = unsafe {
-        gl.get_parameter_i32_slice(gl::SCISSOR_BOX, &mut box_);
-        gl.is_enabled(gl::SCISSOR_TEST)
-    };
-    warn!(
-        "SCISSORGL at-draw enabled={enabled} gl_box={box_:?} engine={:?} page={:?} \
-         page_test={} default_fb={}",
-        state.tile_scissor,
-        state.page_scissor,
-        // ★교집합 조건의 입력이다★ -- 이것이 거짓이면 페이지 박스는 무시된다.
-        state.scissor_test_enabled,
-        state.drawing_to_default_framebuffer,
-    );
-}
-
-/// 소비자가 읽은 값의 나이와 외삽량을, ★사각형이 변한 프레임에만★ 찍는다.
-///
-/// ★1 초에 한 줄은 이 문제를 판정할 수 없었다★(2026-11-09, log_webgl_perf_01/16): 전환은
-/// 짧고 정지 구간이 길어서 93 줄 중 대부분이 정지 상태(`widened_by=[0,0,0,0]`, 그것은 변한
-/// 것이 없으니 올바른 동작)였고, ***전환 중 연속 프레임***을 하나도 보지 못했다. 그리고
-/// slot 이 없어서 ***타일 간 맞물림***을 볼 수 없었는데, "경계 깨짐" 은 바로 그것이다.
-///
-/// 그래서 ★직전과 다른 사각형일 때만★ 찍고 slot 을 싣는다. 정지 구간은 조용하고 전환
-/// 구간만 남으므로, 연속 프레임의 delta 와 외삽 작동이 그대로 보인다. 폭주를 막기 위해
-/// 전체 줄 수에 상한을 둔다 -- 전환 한 번이 60 프레임쯤이고 네 타일이면 240 줄이다.
-fn note_canvas_rect_lag(
-    surface_id: WebGLSurfaceId,
-    noted: &webrender::wall_canvas_rect::CanvasTileRect,
-) {
-    const MAX_LINES: u64 = 4000;
-    static LINES: AtomicU64 = AtomicU64::new(0);
-    // ★slot 별로 나눈다.★ 2026-11-09 에 전역 하나로 둬서 네 slot 이 ***서로의 값***을 직전
-    // 값으로 썼고, 그래서 `delta[1]` 에 p=1(y=0) 과 p=3(y=2160) 의 차인 ±2160 이 찍혔다.
-    // 실제 외삽은 `map.get(&(slot, key))` 로 slot 별이라 영향이 없었지만, 로그의 `delta` 를
-    // 믿을 수 없게 만들었다 -- ★계측이 자기 때문에 틀린 값을 보여 주면 안 된다.★
-    static LAST: std::sync::Mutex<Option<FxHashMap<u32, ([i32; 4], std::time::Instant)>>> =
-        std::sync::Mutex::new(None);
-
-    let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
-    let Ok(mut guard) = LAST.lock() else {
-        return;
-    };
-    let last_map = guard.get_or_insert_with(FxHashMap::default);
-    let last = last_map.get(&slot).copied();
-    // ★변한 것이 없으면 찍지 않는다.★ 단, 2 초 이상 조용했으면 한 줄은 남겨 "살아 있다" 를
-    // 보여 준다 -- 그것이 없으면 "전환이 없었다" 와 "계측이 죽었다" 가 같은 침묵이 된다.
-    let quiet_too_long = last
-        .map(|(_, at)| at.elapsed().as_millis() >= 2000)
-        .unwrap_or(true);
-    if let Some((prev_raw, _)) = last {
-        if prev_raw == noted.raw && !quiet_too_long {
-            return;
-        }
-    }
-    if LINES.fetch_add(1, Ordering::Relaxed) >= MAX_LINES {
-        return;
-    }
-    let delta = match last {
-        Some((prev_raw, _)) => [
-            noted.raw[0] - prev_raw[0],
-            noted.raw[1] - prev_raw[1],
-            noted.raw[2] - prev_raw[2],
-            noted.raw[3] - prev_raw[3],
-        ],
-        None => [0; 4],
-    };
-    last_map.insert(slot, (noted.raw, std::time::Instant::now()));
-    let widened = [
-        noted.raw[0] - noted.rect[0],
-        noted.raw[1] - noted.rect[1],
-        noted.rect[2] - noted.raw[2],
-        noted.rect[3] - noted.raw[3],
-    ];
-    warn!(
-        "CANVASRECTLAG p={slot} age={}us raw={:?} used={:?} delta={delta:?} \
-         widened_by={widened:?}",
-        noted.at.elapsed().as_micros(),
-        noted.raw,
-        noted.rect,
-    );
 }
 
 /// 백엔드가 없어 버린 커맨드를 센다. ★처음 몇 번은 전문을, 그 뒤는 누적만 찍는다.★
@@ -269,45 +154,6 @@ fn note_swap_failure(surface_id: WebGLSurfaceId, what: &str, error: &str) {
     } else if n % 100 == 0 {
         warn!("SWAPFAIL total={n} (last: {what} for {surface_id:?})");
     }
-}
-
-/// 두 사각형 출처를 1 초에 한 줄 나란히 찍는다.
-///
-/// ★이것이 매핑 검증이다.★ 정지 상태에서는 WR 이 적은 값과 타일 기하에서 유도한 값이
-/// ***같아야 한다***. 다르면 변환이 틀린 것이고, 전환 중에만 달라지면 그것이 이 기능이
-/// 노리는 바로 그 차이다. 2026-11-09 에 y 뒤집기를 pref 로 ***추측하게*** 만들어 운영자가
-/// 두 런을 헛돌았다 -- 읽을 수 있는 것을 추측하지 않기 위한 장치다.
-fn log_tile_scissor_sources(
-    surface_id: WebGLSurfaceId,
-    from_wr: Option<[i32; 4]>,
-    from_tile: Option<[i32; 4]>,
-) {
-    if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
-        return;
-    }
-    static LAST_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    let Ok(mut last) = LAST_AT.lock() else {
-        return;
-    };
-    if let Some(at) = *last {
-        if at.elapsed().as_millis() < 1000 {
-            return;
-        }
-    }
-    *last = Some(std::time::Instant::now());
-    let agree = match (from_wr, from_tile) {
-        (Some(a), Some(b)) => {
-            if a == b {
-                "same"
-            } else {
-                "DIFFER"
-            }
-        },
-        (Some(_), None) => "wr_only",
-        (None, Some(_)) => "tile_only",
-        (None, None) => "neither",
-    };
-    warn!("WALLCANVASRECT {surface_id:?} wr={from_wr:?} tile={from_tile:?} {agree}");
 }
 
 /// 두 scissor 박스의 교집합. 겹치지 않으면 ★너비/높이 0★ 으로 모두 버린다.
@@ -453,7 +299,6 @@ impl Default for GLState {
             drawing_to_default_framebuffer: true,
             tile_scissor: None,
             page_scissor: None,
-            scissor_gl_logged: false,
         }
     }
 }
@@ -1599,7 +1444,7 @@ impl WebGLThread {
                     // 초기화돼 있어야 한다 -- 안 그러면 안 쓰는 영역에 쓰레기가 남고,
                     // 타일 경계의 필터링이 그것을 끌어올 수 있다. 프레임마다가 아니라
                     // 리사이즈 때 한 번이므로 비용도 문제가 아니다.
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color, None)
+                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
                     .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
             } else {
                 error!("Failed to find swap chain");
@@ -1848,81 +1693,24 @@ impl WebGLThread {
 
     /// 이 백엔드가 걸어야 할 scissor 박스, GL 좌표(아래-왼쪽 원점). `None` = 걸지 않는다.
     ///
-    /// ★조건 셋이 모두 맞아야 건다.★
-    /// 1. pref 가 켜져 있다(기본 꺼짐).
-    /// 2. 이 painter 의 타일 사각형이 공유 맵에 있다.
-    /// 3. ★캔버스 백킹 크기가 가상 뷰포트 크기와 같다.★ 아니면 캔버스 좌표와 뷰포트
-    ///    좌표가 1:1 이 아니므로 타일 사각형을 그대로 쓰면 ***각 타일이 엉뚱한 사분면***을
-    ///    보여준다. 이 검사가 그 사고를 막는 유일한 장치다.
+    /// 값은 ★WR 이 프레임 빌드에서 적어 둔 실제 표출 영역★ 에서만 온다 -- 근거와 좌표계는
+    /// `webrender::wall_canvas_rect` 와 `tile_scissor_from_webrender` 의 doc 주석에 있다.
     ///
-    /// y 뒤집기는 `gfx_wall_webgl_tile_scissor_flip_y` 가 정한다 -- 근거는 그 pref 의 doc
-    /// 주석에 있다(코드만으로 방향이 자명하지 않다).
+    /// ★한때 타일 기하에서 유도하는 두 번째 경로가 있었다. 2026-11-10 에 제거했다.★ 그것은
+    /// "캔버스가 가상 뷰포트를 원점에서 덮는다" 를 가정하고 크기가 ***정확히*** 같은지로만
+    /// 검사했는데, 실측에서 전환으로 만들어지는 캔버스가 `11520x4321`(뷰포트는 `11520x4320`)
+    /// 이어서 ***SCISSOR 60 건 중 56 건이 skipped*** 였다 -- 즉 플래그를 켜도 거의 항상
+    /// 아무 일도 하지 않았고, 그 때문에 정상 상태 저더 해결이 회귀했다
+    /// (log_webgl_perf_01/25). 일반적인 경로 하나만 남기는 것이 맞다.
     fn tile_scissor_for(&self, surface_id: WebGLSurfaceId) -> Option<[i32; 4]> {
-        self.tile_scissor_for_inner(surface_id, false)
-    }
-
-    /// `clear` 가 쓸 사각형. `tile_scissor_for` 와 같지만 외삽을 뺀 쪽을 쓸 수 있다 --
-    /// 근거는 `tile_scissor_from_webrender` 의 `for_clear` 분기 주석에 있다.
-    fn tile_scissor_for_clear(&self, surface_id: WebGLSurfaceId) -> Option<[i32; 4]> {
-        self.tile_scissor_for_inner(surface_id, true)
-    }
-
-    fn tile_scissor_for_inner(
-        &self,
-        surface_id: WebGLSurfaceId,
-        for_clear: bool,
-    ) -> Option<[i32; 4]> {
-        if !servo_config::pref!(gfx_wall_webgl_tile_scissor) {
-            return None;
-        }
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
-        let from_tile = self.tile_scissor_from_tile_geometry(surface_id, canvas);
-        let from_wr = self.tile_scissor_from_webrender(surface_id, canvas, for_clear);
-        if !for_clear {
-            log_tile_scissor_sources(surface_id, from_wr, from_tile);
-        }
-        // ★WR 이 적어 둔 값이 있으면 그것을 쓴다.★ 없으면(= 이번 프레임 보고 없음, 또는
-        // 기능이 꺼짐) 기존 경로로 떨어진다 -- 안전한 쪽이다.
-        from_wr.or(from_tile)
+        self.tile_scissor_from_webrender(surface_id, canvas)
     }
 
-    /// 타일 기하에서 유도한 사각형. ★전환 중에는 낡는다★ -- 그래서
-    /// `tile_scissor_from_webrender` 가 있다.
-    fn tile_scissor_from_tile_geometry(
-        &self,
-        surface_id: WebGLSurfaceId,
-        canvas: Size2D<i32>,
-    ) -> Option<[i32; 4]> {
-        let rect = self.painter_tile_rect_map.get(surface_id.painter_id)?;
-        if canvas.width != rect.viewport.width || canvas.height != rect.viewport.height {
-            return None;
-        }
-        let x = rect.tile.min.x;
-        let w = rect.tile.width();
-        let h = rect.tile.height();
-        let y = if servo_config::pref!(gfx_wall_webgl_tile_scissor_flip_y) {
-            rect.tile.min.y
-        } else {
-            canvas.height - rect.tile.max.y
-        };
-        Some([x, y, w, h])
-    }
-
-    /// WR 이 이번 프레임에 적어 둔 ★실제 표출 사각형★.
-    ///
-    /// 근거는 `webrender::wall_canvas_rect` 의 doc 주석에 있다. 요점은 전환과 자유 모드
-    /// 편집이 캔버스의 ***백킹 크기를 바꾸지 않고*** 화면상 위치만 옮기므로, 타일 기하에서
-    /// 유도한 사각형이 낡아 ***새로 보게 된 영역이 비거나 깜박인다***는 것이다.
-    ///
-    /// WR 이 적는 값은 ★캔버스 목적지 박스 기준 비율★ 이고 위-왼쪽 원점이다. 여기서 백킹
-    /// 크기로 환산하고 GL 의 아래-왼쪽 원점으로 뒤집는다 -- ★기존 경로와 같은 규약★ 이라
-    /// 두 값을 나란히 비교할 수 있고, 정지 상태에서는 ***같아야 한다***. 그 비교가
-    /// `WALLCANVASRECT` 로그이고, y 방향을 추측으로 정하지 않기 위한 장치다.
     fn tile_scissor_from_webrender(
         &self,
         surface_id: WebGLSurfaceId,
         canvas: Size2D<i32>,
-        for_clear: bool,
     ) -> Option<[i32; 4]> {
         if !servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender) {
             return None;
@@ -1937,28 +1725,6 @@ impl WebGLThread {
         if noted.dest_size[0] <= 0 || noted.dest_size[1] <= 0 {
             return None;
         }
-        if for_clear && servo_config::pref!(gfx_wall_webgl_tile_scissor_clear_uses_raw) {
-            // ★clear 는 외삽하지 않은 영역만 지운다.★
-            //
-            // 외삽은 ***그려야 할 범위***를 넓히는 것이고(값이 한 프레임 늦으므로), clear 가
-            // 같이 넓어지면 ***아직 그려질 내용이 없는 영역까지 배경색으로 지운다***. 운영자가
-            // 그것을 정확히 봤다(2026-11-10, log_webgl_perf_01/21): "next 의 애니메이션으로
-            // 움직이게 될 영역까지가 ★미리★ 깜박이는 것처럼 보였다". 구성 전환이 좌->우로
-            // 빠르게 등장해 화면을 조금 벗어났다 돌아오는 바운스라서, 양방향 외삽이 특히 크게
-            // 작동하는 구간이다.
-            //
-            // 그래서 shading 은 `rect`(외삽 포함), clear 는 `raw`(실제 영역)를 쓴다. 외삽
-            // 영역에는 이전 프레임의 내용이 남지만, 그곳은 ***이번 프레임에 표출되지 않는
-            // 영역***이므로 보이지 않고, 다음 프레임에 표출될 때는 그때의 clear 가 지운다.
-            return self.scale_canvas_rect(noted.raw, noted.dest_size, canvas);
-        }
-        // ★지연과 외삽량을 기록한다.★ 경계 깨짐이 외삽으로 사라지지 않았고(2026-11-09),
-        // 원인 후보가 둘이다 -- 외삽량이 부족하다, 또는 지연이 한 프레임이 아니다. 둘은
-        // ***재야*** 갈린다: `age_us` 가 한 주기(16.7ms)쯤이면 지연은 한 프레임이고 부족한
-        // 것은 양이다. 두세 주기면 지연 자체가 더 길다. `raw` 대 `rect` 의 차가 외삽이
-        // 실제로 넓힌 양이고, 0 이면 외삽이 아예 안 걸린 것이다(`dest_size` 가 프레임마다
-        // 바뀌면 그 필터에서 떨어진다).
-        note_canvas_rect_lag(surface_id, &noted);
         self.scale_canvas_rect(noted.rect, noted.dest_size, canvas)
     }
 
@@ -1992,28 +1758,14 @@ impl WebGLThread {
     /// `skipped` 가 나왔을 때 ***얼마나 다른가***를 바로 보게 하는 것이 목적이다. 특히
     /// 캔버스는 페이지가 CSS px 로 잡고(`clientWidth`) 뷰포트는 device px 이므로, hidpi
     /// 배율이 1 이 아니면 둘이 어긋난다 -- 그 경우가 가장 먼저 의심할 자리다.
+    /// `SCISSOR` 로그에 붙이는 진단 문자열. 서피스마다 한 번만 만든다.
     fn tile_scissor_debug(&self, surface_id: WebGLSurfaceId) -> String {
-        let canvas = self
-            .webrender_swap_chains
-            .get(surface_id)
-            .map(|chain| chain.size());
-        let rect = self.painter_tile_rect_map.get(surface_id.painter_id);
-        match (canvas, rect) {
-            (Some(canvas), Some(rect)) => format!(
-                "canvas={}x{} viewport={}x{} tile=[{},{},{},{}]",
-                canvas.width,
-                canvas.height,
-                rect.viewport.width,
-                rect.viewport.height,
-                rect.tile.min.x,
-                rect.tile.min.y,
-                rect.tile.width(),
-                rect.tile.height(),
-            ),
-            (Some(canvas), None) => {
-                format!("canvas={}x{} tile_rect=★없음★", canvas.width, canvas.height)
+        match self.webrender_swap_chains.get(surface_id) {
+            Some(chain) => {
+                let canvas = chain.size();
+                format!("canvas={}x{}", canvas.width, canvas.height)
             },
-            (None, _) => String::from("swap_chain=★없음★"),
+            None => "canvas=?".to_owned(),
         }
     }
 
@@ -2035,7 +1787,6 @@ impl WebGLThread {
                 // ★`data` 를 빌리기 전에 계산한다★ -- `self` 메서드 호출이라 뒤에서는
                 // 빌림 검사가 막는다.
                 let want_tile_scissor = self.tile_scissor_for(surface_id);
-                let want_clear_scissor = self.tile_scissor_for_clear(surface_id);
                 let scissor_needs_log = self.scissor_logged.insert(surface_id);
                 // ★빌림 전에 만든다★ -- 로그 자리에서는 `self` 를 못 쓴다. 서피스마다 한
                 // 번뿐이라 평소에는 만들지 않는다.
@@ -2061,58 +1812,24 @@ impl WebGLThread {
                     data.state.tile_scissor = want_tile_scissor;
                     data.state.restore_scissor_invariant(&data.gl);
                 }
-                if servo_config::pref!(gfx_wall_webgl_tile_scissor) && scissor_needs_log {
+                // ★서피스마다 한 번 찍는다.★ 켰는데 안 걸리는 경우가 가장 헷갈리므로,
+                // 걸린 사각형과 걸리지 않은 사유를 둘 다 남긴다.
+                if servo_config::pref!(gfx_wall_webgl_tile_scissor_from_webrender)
+                    && scissor_needs_log
+                {
                     match want_tile_scissor {
                         Some([x, y, w, h]) => warn!(
-                            "SCISSOR {surface_id:?} applied rect=[{x},{y},{w},{h}] flip_y={} {}",
-                            servo_config::pref!(gfx_wall_webgl_tile_scissor_flip_y),
-                            scissor_debug,
+                            "SCISSOR {surface_id:?} applied rect=[{x},{y},{w},{h}] {scissor_debug}"
                         ),
-                        // ★조용히 넘어가지 않는다★ -- 켰는데 안 걸리는 경우가 가장 헷갈린다.
-                        // 숫자를 함께 찍어 "얼마나 다른가" 를 바로 보게 한다.
                         None => warn!(
-                            "SCISSOR {surface_id:?} skipped (타일 사각형이 없거나 캔버스                              백킹 != 가상 뷰포트; 1:1 이 아니면 엉뚱한 사분면이 나오므로 걸지                              않는다) {}",
-                            scissor_debug,
+                            "SCISSOR {surface_id:?} skipped (WR 이 이 캔버스의 표출 영역을 \
+                             아직 적지 않았거나 그 값이 낡았다) {scissor_debug}"
                         ),
                     }
                 }
 
                 // Check to see if any of the current framebuffer bindings are the surface we're
                 // about to swap out. If so, we'll have to reset them after destroying the surface.
-                // ★진단 색칠★(`gfx_wall_webgl_tile_scissor_debug_tint`). 여기는 페이지가
-                // 이 프레임을 다 그린 ***뒤***이고 swap 전이므로, 칠하면 그 결과가 그대로
-                // 표출된다. 어두운 색 = 이 백엔드의 캔버스 전체, 밝은 색 = 이 백엔드의
-                // scissor 영역. ★화면에서 밝은 영역이 어디 나타나는지가 매핑을 직접 보여준다★
-                // -- x/y 뒤집기 조합 넷을 추측으로 돌리지 않기 위한 것이다.
-                if servo_config::pref!(gfx_wall_webgl_tile_scissor_debug_tint) {
-                    // ★색은 사각형의 사분면으로 정한다★ -- painter id 가 아니라. 그러면 색이
-                    // "이 백엔드가 자기 몫이라고 믿는 사분면" 을 인코딩하고, 그 색이 화면
-                    // 어디에 나타나는지가 ***곧 매핑***이다.
-                    //   빨강=좌하(GL 원점쪽)  초록=우하  파랑=좌상  노랑=우상
-                    let (r, g, b) = match data.state.tile_scissor {
-                        Some([x, y, _, _]) => match (x > 0, y > 0) {
-                            (false, false) => (1.0f32, 0.0, 0.0),
-                            (true, false) => (0.0, 1.0, 0.0),
-                            (false, true) => (0.0, 0.0, 1.0),
-                            (true, true) => (1.0, 1.0, 0.0),
-                        },
-                        // scissor 가 없는 백엔드는 흰색으로 표시한다(그 자체가 진단이다).
-                        None => (1.0, 1.0, 1.0),
-                    };
-                    unsafe {
-                        data.gl.disable(gl::SCISSOR_TEST);
-                        data.gl.clear_color(r * 0.15, g * 0.15, b * 0.15, 1.0);
-                        data.gl.clear(gl::COLOR_BUFFER_BIT);
-                        if let Some([x, y, w, h]) = data.state.tile_scissor {
-                            data.gl.scissor(x, y, w, h);
-                            data.gl.enable(gl::SCISSOR_TEST);
-                            data.gl.clear_color(r, g, b, 1.0);
-                            data.gl.clear(gl::COLOR_BUFFER_BIT);
-                            data.gl.disable(gl::SCISSOR_TEST);
-                        }
-                    }
-                }
-
                 let framebuffer_rebinding_info =
                     FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
@@ -2164,24 +1881,18 @@ impl WebGLThread {
                         .requested_flags
                         .contains(ContextAttributeFlags::ALPHA);
                     let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
-                    // ★타일 영역만 지운다★(`gfx_wall_webgl_tile_scissor_clear`). 이 백엔드는
-                    // 자기 타일만 쓰므로 나머지를 지울 이유가 없다. 벽에서 그 차이가 크다 --
-                    // 서피스 한 장이 199MB 이고 백엔드가 넷이다.
+                    // ★서피스 전체를 지운다.★ 한때 scissor 영역만 지우는 pref 가 있었는데
+                    // (`gfx_wall_webgl_tile_scissor_clear`, 2026-11-10 제거) 운영자 평가가
+                    // 분명했다 -- "scissor 가 제대로 이루어지지 않는 영역이 검은색 혹은 단색이
+                    // 아니면 시각적으로 혼동만 일으킬 뿐이다. 사실 성능 향상이 있는지도 잘
+                    // 모르겠음." 지우지 않은 영역에 묵은 그림이 남아 깨짐처럼 보였다.
                     //
-                    // ★셰이딩 scissor 와 같은 사각형을 쓴다★(`want_tile_scissor`). 그래서
-                    // 지우는 영역과 그리는 영역이 정확히 같고, 둘이 어긋날 수 없다.
-                    let clear_scissor = want_clear_scissor
-                        .filter(|_| servo_config::pref!(gfx_wall_webgl_tile_scissor_clear));
                     // ★clear 실패도 삼키지 않고 넘어간다.★ 근거는 위 `swap_buffers` 의
                     // 주석과 같다 -- 지우지 못한 프레임은 묵은 그림이 남을 뿐이고, 스레드가
                     // 죽는 것과는 비교가 되지 않는다.
-                    if let Err(error) = swap_chain.clear_surface(
-                        &data.device,
-                        &mut data.ctx,
-                        &data.gl,
-                        clear_color,
-                        clear_scissor,
-                    ) {
+                    if let Err(error) =
+                        swap_chain.clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    {
                         note_swap_failure(surface_id, "clear_surface", &format!("{error:?}"));
                     }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
@@ -2235,7 +1946,6 @@ impl WebGLThread {
             }
         }
     }
-
 
     /// Which access mode to use
     fn surface_access(&self) -> SurfaceAccess {
@@ -3394,9 +3104,8 @@ impl WebGLImpl {
             WebGLCommand::UseProgram(program_id) => unsafe {
                 gl.use_program(program_id.map(|p| p.glow()))
             },
-            WebGLCommand::DrawArrays { mode, first, count } => {
-                log_scissor_gl_state_once(gl, state);
-                unsafe { gl.draw_arrays(mode, first, count) }
+            WebGLCommand::DrawArrays { mode, first, count } => unsafe {
+                gl.draw_arrays(mode, first, count)
             },
             WebGLCommand::DrawArraysInstanced {
                 mode,

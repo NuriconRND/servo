@@ -410,43 +410,7 @@ param(
     # 다시 보여주고 넘어간다. 기본 꺼짐.
     #   판정 지표: 로그의 "STALECANVAS ... reused=N" -- 0 이면 뮤텍스 경합이 없다는 뜻이다.
     [switch] $NonblockingFrontBufferLock,
-    [switch] $WebglTileScissor,
-    # gfx_wall_webgl_tile_scissor_flip_y -- 위 scissor 의 y 방향을 뒤집는다. 기본 꺼짐.
-    # GL 은 아래-왼쪽 원점, 타일 사각형은 위-왼쪽이고 외부 이미지가 vertical flip 으로
-    # 합성되어 방향이 코드만으로 자명하지 않다. 틀리면 각 타일이 다른 사분면을 보여주므로
-    # 눈에 즉시 보인다 -- 두 값을 한 번씩 돌려 가린다.
-    #   -WebglTileScissor -WebglTileScissorFlipY
-    # gfx_wall_webgl_tile_scissor_clear -- swap 뒤의 clear 도 타일 영역만 지운다. 셰이딩
-    # scissor 와 같은 사각형을 쓴다(-WebglTileScissor 가 꺼져 있으면 이것도 안 걸린다).
-    # 벽에서 서피스 한 장이 11520x4320 RGBA8 = 199MB 이고 백엔드가 넷이다. 기본 꺼짐.
-    #   -WebglTileScissor -WebglTileScissorClear
-    # gfx_wall_webgl_tile_scissor_from_webrender -- 타일 scissor 의 사각형을 타일 기하가
-    # 아니라 WR 이 적어 둔 실제 표출 영역에서 가져온다. 전환/자유 모드 편집으로 캔버스가
-    # 화면상 움직일 때 생기는 빈 곳과 깜박임을 없애는 것이 목적이다. 기본 꺼짐.
-    #   검증: 로그의 "WALLCANVASRECT ... same|DIFFER" -- 정지 상태에서 same 이어야 한다.
-    # gfx_wall_webgl_tile_scissor_extrapolate_pct -- 움직이는 동안 사각형을 한 프레임
-    # 이동량만큼 넓힌다(목적지 박스 크기의 퍼센트, 0 = 안 넓힘). 타일 경계의 깨짐을 없애는
-    # 것이 목적이다. 정지 상태에서는 이동량이 0 이라 넓히지 않는다. 기본 25.
-    #   깨짐이 남으면 올리고, scissor 절감이 사라지면 내린다.
-    # gfx_wall_webgl_tile_scissor_extrapolate_frames -- 외삽에서 이동량에 곱할 배수
-    # (= 덮으려는 지연 프레임 수). 1 -> 2 -> 3 으로 올려 보며 경계 깨짐이 사라지는 값을
-    # 찾는다. 그 값이 실제 지연 프레임 수다. 기본 1.
-    [int] $WebglTileScissorExtrapolateFrames = 6,
-    [int] $WebglTileScissorExtrapolatePct = 6,
     [switch] $WebglTileScissorFromWebrender,
-    # gfx_wall_webgl_tile_scissor_clear_uses_raw -- clear 가 외삽하지 않은 사각형을 쓴다
-    # (기본 켜짐). 끄면 shading 과 같은 외삽 포함 사각형을 쓴다(이전 동작). 외삽 영역까지
-    # 지우면 아직 그려질 내용이 없는 곳이 배경색으로 깜박인다.
-    [switch] $NoClearUsesRaw,
-    [switch] $WebglTileScissorClear,
-    [switch] $WebglTileScissorFlipY,
-    # gfx_wall_webgl_tile_scissor_debug_tint -- 진단용. 각 백엔드가 자기 캔버스를 색으로
-    # 칠한다(어두운 색 = 캔버스 전체, 밝은 색 = scissor 영역). 색은 사각형의 사분면이다:
-    #   빨강=좌하(GL 원점쪽) 초록=우하 파랑=좌상 노랑=우상 / 흰색=scissor 없음
-    # 화면에서 밝은 색이 어디 나타나는지가 "어느 사각형이 어디로 가는가" 를 보여준다.
-    # 페이지 그림은 가려진다. 기본 꺼짐.
-    #   -WebglTileScissor -WebglTileScissorDebugTint
-    [switch] $WebglTileScissorDebugTint,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
@@ -1022,14 +986,7 @@ $argList = @(
     "--pref", "gfx_wall_live_canvas_tick_divisor=$LiveCanvasDivisor",
     "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",
     "--pref", "gfx_webgl_nonblocking_front_buffer_lock=$($NonblockingFrontBufferLock.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor=$($WebglTileScissor.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor_extrapolate_pct=$WebglTileScissorExtrapolatePct",
-    "--pref", "gfx_wall_webgl_tile_scissor_extrapolate_frames=$WebglTileScissorExtrapolateFrames",
     "--pref", "gfx_wall_webgl_tile_scissor_from_webrender=$($WebglTileScissorFromWebrender.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor_clear_uses_raw=$((-not $NoClearUsesRaw.IsPresent).ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor_clear=$($WebglTileScissorClear.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor_flip_y=$($WebglTileScissorFlipY.IsPresent.ToString().ToLower())",
-    "--pref", "gfx_wall_webgl_tile_scissor_debug_tint=$($WebglTileScissorDebugTint.IsPresent.ToString().ToLower())",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
     "--pref", "gfx_wr_profiler_hud=$ProfilerHud",
@@ -1104,7 +1061,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) webgl_tile_scissor=$($WebglTileScissor.IsPresent) scissor_flip_y=$($WebglTileScissorFlipY.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) clear_uses_raw=$(-not $NoClearUsesRaw.IsPresent) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) extrapolate_pct=$WebglTileScissorExtrapolatePct extrapolate_frames=$WebglTileScissorExtrapolateFrames scissor_tint=$($WebglTileScissorDebugTint.IsPresent) nonblock_lock=$($NonblockingFrontBufferLock.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) webgl_tile_scissor=$($WebglTileScissor.IsPresent) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) nonblock_lock=$($NonblockingFrontBufferLock.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

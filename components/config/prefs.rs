@@ -904,41 +904,6 @@ pub struct Preferences {
     /// 병렬화하면 T 가 되고, GPU k 가 painter k 를 막는 시간도 그만큼 줄어든다. 그쪽이
     /// 다음이다.
     pub gfx_webgl_nonblocking_front_buffer_lock: bool,
-    pub gfx_wall_webgl_tile_scissor: bool,
-    /// 위 scissor 의 ★y 방향을 뒤집는다★(기본 꺼짐).
-    ///
-    /// GL scissor 는 아래-왼쪽 원점이고 타일 사각형은 위-왼쪽인데, 캔버스 외부 이미지가
-    /// `needs_vertical_flip` 으로 합성되는 것까지 겹쳐 방향이 코드만으로 자명하지 않았다.
-    ///
-    /// ★2026-11-09 에 실기로 확정됐다: 기본값(거짓)이 맞다.★ 진단 색칠
-    /// (`gfx_wall_webgl_tile_scissor_debug_tint`)로 네 타일의 색 배치를 보았고
-    /// (log_webgl_perf_01/11) 네 칸 전부 예측과 일치했다 -- 좌상 타일의 사각형은
-    /// `rect=[0,2160,..]`(GL 상단)이고 파랑으로 나왔으며, 좌하 타일은 `rect=[0,0,..]`
-    /// (GL 하단)이고 빨강으로 나왔다. 즉 ***`tile` 과 `rect` 가 일치하지 않는 것이 정상***
-    /// 이고 그 불일치가 바로 y 축 변환이다. 참으로 두면 변환을 하지 않는 것이라 각 타일이
-    /// 다른 사분면을 보여준다(run 29: 콘텐츠 육안 확인 불가).
-    ///
-    /// ★그래서 이 pref 는 되돌리기용으로만 남긴다.★ 켤 이유가 없다.
-    /// swap 뒤의 clear 도 ★타일 영역만★ 지운다(기본 꺼짐).
-    ///
-    /// `gfx_wall_webgl_tile_scissor` 가 셰이딩을 1/4 로 줄였는데 ***clear 는 그대로***
-    /// 서피스 전체를 지우고 있었다 -- `preserve_drawing_buffer` 가 거짓인 캔버스(속성을
-    /// 주지 않으면 그것이 기본이다)는 프레임마다 거기를 지난다. 벽에서 한 장이
-    /// 11520x4320 RGBA8 = ★199MB★ 이고 백엔드가 ★넷★ 이다.
-    ///
-    /// ★왜 이것이 다음인가★(2026-11-09): WebGL 스레드 병렬화를 먼저 보려 했는데 이미
-    /// 측정이 있었다. `db52a9b280f` 가 "the counters covered command replay, context
-    /// switches, the ANGLE lock and serialisation, and those total ★42.6ms of every 1021ms
-    /// window★" 라고 적어 뒀다 -- 직렬 재생 ***전체***가 4.2% 이고, 그 스레드는 95.8% 가
-    /// 유휴나 swap 대기였다(watchdog 63 표본 중 60 이 "waiting for a message"). 즉
-    /// 병렬화의 천장이 4% 다. 같은 커밋이 가리킨 곳이 ★swap 과 clear★ 이고 이것이 그
-    /// clear 다.
-    ///
-    /// `gfx_wall_webgl_tile_scissor` 와 ★같은 사각형★ 을 쓴다. 그래서 지우는 영역과 그리는
-    /// 영역이 정확히 같고 둘이 어긋날 수 없다 -- 셰이딩 scissor 가 꺼져 있으면 이것도
-    /// 걸리지 않는다. 리사이즈 때의 clear 는 전체를 지운다(타일 밖에 쓰레기가 남으면
-    /// 경계의 필터링이 끌어올 수 있고, 프레임마다가 아니다).
-    pub gfx_wall_webgl_tile_scissor_clear: bool,
 
     /// 타일 scissor 의 사각형을 ★타일 기하가 아니라 WR 이 적어 둔 실제 표출 영역★ 에서
     /// 가져온다(기본 꺼짐).
@@ -982,81 +947,6 @@ pub struct Preferences {
     /// 타일 밖이면 `update_prim_dependencies` 가 조기 반환해 아예 적지 않는다. 60Hz 에서
     /// 한두 프레임을 허용하는 값이 기본이다.
     pub gfx_wall_webgl_tile_scissor_max_age_ms: i64,
-
-    /// 움직이는 동안 사각형을 ★한 프레임 이동량만큼★ 넓힌다. 목적지 박스 크기의 퍼센트가
-    /// 상한이고, 0 이면 넓히지 않는다.
-    ///
-    /// ★왜★(2026-11-09, log_webgl_perf_01/15): WR 이 프레임 N 에 적은 사각형을 WebGL
-    /// 백엔드는 프레임 N+1 에 쓴다. 그래서 움직이는 동안 사각형이 한 프레임 뒤처지고 타일
-    /// 경계에 ***안 그려진 띠***가 남는다. 운영자 보고가 그 기구를 그대로 말해 준다 --
-    /// "깨짐 현상은 ★애니메이션 이동량에 비례해서★ 영역이 커지는 것으로 보임".
-    ///
-    /// ★고정 가드 밴드를 추측하지 않는다.★ 직전 프레임과의 차가 곧 한 프레임 이동량이므로,
-    /// 그만큼 앞으로 민 사각형과 합집합한다. 정지 상태에서는 차가 0 이라 넓히지 않고 scissor
-    /// 의 절감이 그대로 남는다. 상한은 빠른 이동에서 사각형이 캔버스 전체로 자라 절감이
-    /// 사라지는 것을 막는다.
-    ///
-    /// ★6 이 실측값이다★(2026-11-10, log_webgl_perf_01/20): 운영자가 스윕해
-    /// `extrapolate_frames 6` + 이 값 `6` 에서 "경계면에서의 깨짐 현상 자체는 거의 사라짐"
-    /// 을 확인했고, 이 값만 기본(25)으로 돌리면 "깨짐 현상 작은 수준에서 재발" 했다.
-    ///
-    /// ★그 결과가 내 설계 전제를 반증한다.★ 나는 "고정 가드 밴드를 추측하지 않는다, 이동량에
-    /// 비례시킨다" 로 짰는데, 5760 의 6% = 345px 이므로 `frames 6` 을 곱해도 대개 이 상한에
-    /// 걸린다 -- 즉 실제로 들은 것은 ***균일한 345px 고정 밴드***다. 상한을 ***낮추는*** 것이
-    /// 효과를 냈다는 사실 자체가 비례식이 답이 아니었다는 뜻이다.
-    ///
-    /// 올리면 비례 성분이 살아나 빠른 전환에서 면적이 커지고, 내리면 밴드가 좁아져 깨짐이
-    /// 돌아온다.
-    pub gfx_wall_webgl_tile_scissor_extrapolate_pct: i64,
-
-    /// 외삽에서 이동량에 곱할 배수 = ★덮으려는 지연 프레임 수★.
-    ///
-    /// ★이 값은 스윕해서 찾는다 -- 내가 추정했고 틀렸다★(2026-11-10). "지연은 한 프레임"
-    /// 으로 가정해 1 로 뒀는데 깨짐이 그대로였고, 양방향으로 바꿔도 그대로였다. 운영자
-    /// 관찰은 일관되게 "깨짐의 크기가 ***애니메이션 이동 변화량과 비례***" 였다 -- 부족분이
-    /// 이동량에 비례하므로 ***배수가 모자란 것***이다.
-    ///
-    /// ★6 이 실측값이다★(2026-11-10, log_webgl_perf_01/20): 운영자가 스윕해 이 값 `6` +
-    /// `extrapolate_pct 6` 에서 "경계면에서의 깨짐 현상 자체는 거의 사라짐" 을 확인했다.
-    /// 다만 `pct` 가 6 이면 5760 의 6% = 345px 에서 잘리므로, 실제로 들은 것은 이 배수가
-    /// 아니라 ***그 고정 밴드***일 가능성이 크다 -- `pct` 의 doc 주석에 적어 뒀다.
-    ///
-    /// 남은 것(이 값을 16 까지 올려도 사라지지 않았다): 전환 중 "prev 구성이 tile 경계면과
-    /// 비교적 먼 부분에서 약간 깨지는" 현상, 그리고 전환 애니메이션 중의 judder. 둘은 사각형을
-    /// 넓히는 축이 아니다 -- `gfx_wall_webgl_tile_scissor_clear` 가 타일 밖을 지우지 않아
-    /// 재활용된 서피스에 ***이전 프레임의 그림***이 남는 쪽이 후보다(그 pref 를 끄면 그 영역이
-    /// 찌꺼기 대신 검정으로 바뀌는 것이 log_webgl_perf_01/15 의 38 번 런에서 관찰됐다).
-    pub gfx_wall_webgl_tile_scissor_extrapolate_frames: i64,
-
-    /// swap 뒤의 clear 가 ★외삽하지 않은★ 사각형을 쓴다(기본 켜짐).
-    ///
-    /// 외삽은 ***그려야 할 범위***를 넓히는 것이고, clear 가 같이 넓어지면 ***아직 그려질
-    /// 내용이 없는 영역까지 배경색으로 지운다***. 운영자가 그것을 정확히 봤다(2026-11-10,
-    /// log_webgl_perf_01/21): `-WebglTileScissorClear` 를 뺀 실행에서 "next 의 애니메이션으로
-    /// 움직이게 될 영역까지가 ★미리★ 깜박이는 것처럼 보였다". 구성 전환이 좌->우로 빠르게
-    /// 등장해 화면을 조금 벗어났다 돌아오는 바운스라, 양방향 외삽이 특히 크게 작동하는
-    /// 구간이다.
-    ///
-    /// 그래서 shading 은 외삽 포함, clear 는 실제 영역만 쓴다. 외삽 영역에는 이전 프레임의
-    /// 내용이 남지만 그곳은 이번 프레임에 표출되지 않으며, 다음 프레임에 표출될 때는 그때의
-    /// clear 가 지운다.
-    ///
-    /// 끄면 둘이 같은 사각형을 쓴다(이전 동작) -- 되돌리기용이다.
-    pub gfx_wall_webgl_tile_scissor_clear_uses_raw: bool,
-    pub gfx_wall_webgl_tile_scissor_flip_y: bool,
-    /// ★진단용★: 각 백엔드가 자기 캔버스를 painter 별 색으로 칠한다(기본 꺼짐).
-    ///
-    /// 어두운 색 = 그 백엔드의 캔버스 전체, 밝은 색 = 그 백엔드의 scissor 영역.
-    /// ★화면에서 밝은 영역이 어디 나타나는지가 "어느 사각형이 어디로 가는가" 를 직접
-    /// 보여준다.★ 페이지 그림은 가려진다 -- 진단 전용이다.
-    ///
-    /// ★왜 필요한가★(2026-11-09, log_webgl_perf_01/10): `gfx_wall_webgl_tile_scissor` 는
-    /// 저더를 없앴지만(`RENDERCOST over_period` 269 -> 43, 페이지 쪽 `scale=2` 와 동일)
-    /// ***그림이 엉뚱하게 나왔다***. scissor 사각형 자체는 로그로 검증됐다 -- 2x2, 겹침
-    /// 없음, 전체 덮음, `canvas == viewport` 검사 통과. 그래서 틀린 것은 ***어느 사각형이
-    /// 화면의 어디로 가는가*** 이고, x/y 뒤집기 조합이 넷이다. 추측으로 네 런을 돌리는
-    /// 대신 한 런에 색 배치를 본다.
-    pub gfx_wall_webgl_tile_scissor_debug_tint: bool,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1850,15 +1740,8 @@ impl Preferences {
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
             gfx_webgl_nonblocking_front_buffer_lock: false,
-            gfx_wall_webgl_tile_scissor: false,
-            gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
-            gfx_wall_webgl_tile_scissor_extrapolate_pct: 6,
-            gfx_wall_webgl_tile_scissor_extrapolate_frames: 6,
-            gfx_wall_webgl_tile_scissor_clear_uses_raw: true,
-            gfx_wall_webgl_tile_scissor_flip_y: false,
-            gfx_wall_webgl_tile_scissor_debug_tint: false,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,

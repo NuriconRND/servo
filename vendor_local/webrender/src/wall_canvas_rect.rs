@@ -57,7 +57,7 @@
 //! 쪽이다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -66,13 +66,9 @@ use api::ImageKey;
 /// 한 (slot, 캔버스) 쌍이 이번 프레임에 표출한 영역.
 #[derive(Clone, Copy, Debug)]
 pub struct CanvasTileRect {
-    /// ★소비자가 쓸 사각형★ -- `raw` 를 다음 프레임 위치로 외삽해 합집합한 것이다.
-    /// 캔버스 백킹 픽셀, ★위-왼쪽 원점★(GL 이 아니다 -- 뒤집기는 소비자가 한다, 기존
-    /// 경로와 같은 규약을 쓰기 위해서다).
+    /// 이 타일이 표출하는 영역, 캔버스 백킹 픽셀, ★위-왼쪽 원점★(GL 이 아니다 --
+    /// 뒤집기는 소비자가 한다).
     pub rect: [i32; 4],
-    /// ★외삽하지 않은 이번 프레임의 실제 영역.★ 다음 프레임의 이동량을 이것으로 낸다 --
-    /// 넓힌 값으로 차를 내면 ***확장이 누적되어 발산한다***.
-    pub raw: [i32; 4],
     /// 그 값을 유도한 캔버스 목적지 박스의 크기, 같은 단위. 소비자가 자기가 아는 백킹
     /// 크기와 비교해 ★배율이 1:1 인지★ 확인할 수 있다.
     pub dest_size: [i32; 2],
@@ -83,34 +79,6 @@ pub struct CanvasTileRect {
 /// 꺼져 있으면 비용이 ★원자 로드 하나★ 다. `paint` 가 pref 를 보고 세운다 -- `webrender` 는
 /// `servo-config` 에 의존하지 않는다(설정 표면 규약).
 static ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// 외삽으로 넓힐 수 있는 최대량, 목적지 박스 크기의 퍼센트. `paint` 가 pref 로 세운다.
-///
-/// 0 이면 외삽하지 않는다(이번 프레임 사각형 그대로). 상한이 필요한 이유는 빠른 이동에서
-/// 사각형이 커지면 ★scissor 의 절감이 사라진다★ 는 것이다 -- 극단적으로는 캔버스 전체가 된다.
-static EXTRAPOLATE_PCT: AtomicU32 = AtomicU32::new(0);
-
-/// 이동량에 곱할 배수 = ★덮으려는 지연 프레임 수★. `paint` 가 pref 로 세운다.
-///
-/// ★왜 pref 인가★(2026-11-10): 이 값을 내가 추정했고 틀렸다. 처음에 "지연은 한 프레임"
-/// 으로 가정해 1 배로 뒀는데(86c352b20e5) 깨짐이 그대로였고, 양방향으로 바꿔도
-/// (d5f897756a5) 그대로였다. 운영자 관찰은 일관되게 "깨짐의 크기가 ***애니메이션 이동
-/// 변화량과 비례***" 였다 -- 즉 ***부족분이 이동량에 비례***하므로 배수가 모자란 것이다.
-///
-/// 실제 경로는 `note`(WR 프레임 N) -> 소비자가 읽어 scissor -> 캔버스가 그림 -> ***WR
-/// 프레임 M***에 합성되어 표출이고, `M - N` 이 몇인지 코드만으로는 모른다. 그래서
-/// ***추정하지 않고 스윕한다*** -- 깨짐이 사라지는 배수가 곧 그 수다.
-static EXTRAPOLATE_FRAMES: AtomicU32 = AtomicU32::new(1);
-
-/// 직전 값이 이보다 오래됐으면 외삽하지 않는다. 긴 공백 뒤의 차는 ★이동량이 아니다★ --
-/// 그 사이 여러 프레임이 지났으므로 한 프레임 이동량으로 쓸 수 없다.
-///
-/// ★34 는 경계선이었다★(2026-11-09, log_webgl_perf_01/16): 호출 간격이 실측 30000~34000us
-/// 라서 통과와 탈락이 섞였다. 그 간격이 정지 구간에서 길어지는 것은 WR 이 프레임을 다시
-/// 빌드하지 않기 때문이고, 정지 구간에서는 차가 0 이므로 외삽할 것도 없다. 반면 ***움직이는
-/// 동안***에는 매 프레임 갱신되므로 간격이 짧다. 그래서 한 주기의 세 배까지 받아 둔다 --
-/// 움직이는 구간을 놓치지 않으면서, 진짜 긴 공백(수백 ms)은 여전히 거른다.
-const EXTRAPOLATE_MAX_AGE_MS: u128 = 50;
 
 type Map = HashMap<(u32, ImageKey), CanvasTileRect>;
 
@@ -164,15 +132,6 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
-/// 외삽 한계를 세운다(목적지 박스 크기의 퍼센트, 0 = 외삽 안 함). `paint` 가 부른다.
-pub fn set_extrapolate_pct(pct: u32) {
-    EXTRAPOLATE_PCT.store(pct, Ordering::Relaxed);
-}
-
-/// 외삽 배수(= 덮으려는 지연 프레임 수)를 세운다. `paint` 가 부른다.
-pub fn set_extrapolate_frames(frames: u32) {
-    EXTRAPOLATE_FRAMES.store(frames.max(1), Ordering::Relaxed);
-}
 
 /// 이번 프레임의 사각형을 적는다. `picture.rs` 의 Image 분기가 부른다.
 pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
@@ -189,91 +148,16 @@ pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
         Ok(keys) if keys.contains(&key) => {},
         _ => return,
     }
-    let now = Instant::now();
     if let Ok(mut map) = map().lock() {
-        // ★직전 값으로 다음 프레임 위치를 외삽한다.★ 근거는 `extrapolate` 의 doc 주석에
-        // 있다 -- 요점은 소비자가 ***한 프레임 늦게*** 이 값을 쓴다는 것이다.
-        let widened = map
-            .get(&(slot, key))
-            .filter(|prev| prev.dest_size == dest_size)
-            .filter(|prev| now.duration_since(prev.at).as_millis() <= EXTRAPOLATE_MAX_AGE_MS)
-            .map(|prev| extrapolate(prev.raw, rect, dest_size))
-            .unwrap_or(rect);
         map.insert(
             (slot, key),
             CanvasTileRect {
-                rect: widened,
-                raw: rect,
+                rect,
                 dest_size,
-                at: now,
+                at: Instant::now(),
             },
         );
     }
-}
-
-/// 이번 프레임 사각형과 ★앞뒤 한 프레임의 예측 위치★ 의 합집합.
-///
-/// ★왜 필요한가★(2026-11-09, log_webgl_perf_01/15·17): 이 모듈의 값은 프레임 빌드에서
-/// 나오고 소비자는 캔버스의 다음 swap 에서 읽으므로, 움직이는 동안 사각형이 한 프레임
-/// 어긋난다. 그만큼 타일 경계에 ***안 그려진 띠***가 남는다. 운영자 보고가 그 기구를 그대로
-/// 말해 준다 -- "깨짐 현상은 ★애니메이션 이동량에 비례해서★ 영역이 커지는 것으로 보임".
-///
-/// ★왜 ***양방향***인가★(log_webgl_perf_01/17 이 보여 준 것): 네 painter 가 ***각자의***
-/// WR 로 독립해 프레임을 빌드하므로, 전환 중 타일마다 ***다른 프레임의*** 사각형을 들고
-/// 있다. 실측에서 p=1 과 p=3 은 세로로 겹친 같은 열인데 x 가 150~180px 어긋났고
-/// (`raw=[9805,0,..]` 대 `[9626,2160,..]`, `[7865,0,..]` 대 `[7696,2160,..]`), 그 크기가
-/// 한 프레임 이동량과 같다. `age` 는 거의 같으니 읽는 시점이 아니라 ***기록된 프레임***이
-/// 다른 것이다. 그래서 한쪽 방향만 넓히면 ***앞선 타일***의 띠가 남는다.
-///
-/// `now - delta` 와 `now + delta` 를 모두 덮으면 어느 타일이 앞서든 뒤처지든 가린다.
-///
-/// ★고정 가드 밴드를 추측하지 않는다.★ 직전 프레임과의 차가 곧 한 프레임 이동량이다. 정지
-/// 상태에서는 차가 0 이므로 ***넓히지 않는다*** -- scissor 의 절감이 그대로 남는다.
-///
-/// 상한(`EXTRAPOLATE_PCT`)은 빠른 이동에서 사각형이 캔버스 전체로 자라는 것을 막는다.
-fn extrapolate(prev: [i32; 4], now: [i32; 4], dest_size: [i32; 2]) -> [i32; 4] {
-    let pct = EXTRAPOLATE_PCT.load(Ordering::Relaxed);
-    if pct == 0 {
-        return now;
-    }
-    let cap_x = (dest_size[0] as i64 * pct as i64 / 100).max(0);
-    let cap_y = (dest_size[1] as i64 * pct as i64 / 100).max(0);
-    // ★덮으려는 지연 프레임 수.★ 근거는 `EXTRAPOLATE_FRAMES` 의 doc 주석에 있다.
-    let frames = EXTRAPOLATE_FRAMES.load(Ordering::Relaxed).max(1) as i64;
-
-    // 네 변을 따로 외삽한다 -- 회전이나 크기 변화는 변마다 다른 속도로 움직인다.
-    let clamp = |delta: i64, cap: i64| (delta * frames).clamp(-cap, cap);
-    let dx0 = clamp(now[0] as i64 - prev[0] as i64, cap_x);
-    let dy0 = clamp(now[1] as i64 - prev[1] as i64, cap_y);
-    let dx1 = clamp(
-        (now[0] as i64 + now[2] as i64) - (prev[0] as i64 + prev[2] as i64),
-        cap_x,
-    );
-    let dy1 = clamp(
-        (now[1] as i64 + now[3] as i64) - (prev[1] as i64 + prev[3] as i64),
-        cap_y,
-    );
-
-    // ★양방향★ -- `now - delta` 와 `now + delta` 를 모두 덮는다. 근거는 이 함수의 doc
-    // 주석에 있다(타일마다 다른 프레임의 사각형을 들고 있다).
-    let nx0 = now[0] as i64;
-    let ny0 = now[1] as i64;
-    let nx1 = nx0 + now[2] as i64;
-    let ny1 = ny0 + now[3] as i64;
-    let x0 = nx0.min(nx0 + dx0).min(nx0 - dx0).max(0);
-    let y0 = ny0.min(ny0 + dy0).min(ny0 - dy0).max(0);
-    let x1 = nx1.max(nx1 + dx1).max(nx1 - dx1);
-    let y1 = ny1.max(ny1 + dy1).max(ny1 - dy1);
-
-    // 목적지 박스를 넘지 않게 자른다 -- 소비자가 백킹 크기로 환산하므로 여기서 잘라야 한다.
-    let x1 = x1.min(dest_size[0] as i64);
-    let y1 = y1.min(dest_size[1] as i64);
-    [
-        x0 as i32,
-        y0 as i32,
-        (x1 - x0).max(0) as i32,
-        (y1 - y0).max(0) as i32,
-    ]
 }
 
 /// 이 (slot, 캔버스)의 최신 사각형. `max_age_ms` 보다 오래됐으면 `None` 이다.

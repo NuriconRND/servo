@@ -9248,6 +9248,7 @@ dependencies = [
  "servo-webxr",
  "servo-webxr-api",
  "surfman",
+ "webrender",
  "webrender_api",
 ]
 
