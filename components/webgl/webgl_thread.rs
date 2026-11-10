@@ -116,6 +116,11 @@ pub struct GLState {
     /// ★`drawing_to_default_framebuffer` 일 때만 강제한다★ -- 페이지의 FBO 패스는 그 결과가
     /// 최종 그림에 들어가므로 잘라서는 안 된다.
     tile_scissor: Option<[i32; 4]>,
+    /// `tile_scissor` 를 유도할 때 쓴 ★서피스(캔버스 백킹) 크기★, 백킹 픽셀.
+    ///
+    /// 엔진 클립이 풀릴 때 GL 의 scissor 박스를 ***기본값(= 서피스 전체)으로*** 되돌리기
+    /// 위해서만 쓴다. 근거는 `restore_scissor_invariant` 의 해당 분기 주석에 있다.
+    tile_scissor_surface: [i32; 4],
     /// 페이지가 `gl.scissor` 로 정한 박스. 엔진 클립과 ★교집합★ 을 내려면 알아야 한다.
     /// 추적하지 않으면 페이지가 부르는 순간 엔진 클립이 사라진다.
     page_scissor: Option<[i32; 4]>,
@@ -314,6 +319,26 @@ impl GLState {
             }
             return;
         }
+        // ★엔진 클립이 풀릴 때 박스를 ***페이지 것으로 되돌려야 한다.***★ 되돌리지 않으면
+        // 마지막으로 프로그램한 ***엔진 타일 박스***가 GL 에 그대로 남는다. 그러면
+        // `tile_scissor` 가 Some -> None 으로 떨어지는 순간(WR 보고가 낡으면 일어난다),
+        // scissor test 를 켜 둔 페이지는 자기 것도 아닌 타일 사각형에 계속 잘린다 -- 그리고
+        // `max_age` 검사는 이미 지나갔으므로 ***나이 제한조차 없다.***
+        //
+        // ★페이지가 스스로 빠져나올 수도 없었다.★ `WebGLCommand::Scissor` 는
+        // `page_scissor` 에 적고 이 함수를 부르는데, 이 자리가 박스를 쓰지 않으면
+        // `gl.scissor()` 호출이 ***GL 에 도달하지 못한다***. 한 번 걸리면 영구적이었다.
+        //
+        // 2026-11-10 에 찾았다. 엔진 박스를 한 번도 걸지 않았으면(`tile_scissor_surface`
+        // 가 0) GL 을 건드린 적이 없으므로 그대로 둔다.
+        match self.page_scissor {
+            Some([x, y, w, h]) => unsafe { gl.scissor(x, y, w, h) },
+            None if self.tile_scissor_surface[2] > 0 => unsafe {
+                let [x, y, w, h] = self.tile_scissor_surface;
+                gl.scissor(x, y, w, h)
+            },
+            None => {},
+        }
         if self.scissor_test_enabled {
             unsafe { gl.enable(gl::SCISSOR_TEST) };
         } else {
@@ -384,6 +409,7 @@ impl Default for GLState {
             default_vao: None,
             drawing_to_default_framebuffer: true,
             tile_scissor: None,
+            tile_scissor_surface: [0, 0, 0, 0],
             page_scissor: None,
         }
     }
@@ -1919,6 +1945,12 @@ impl WebGLThread {
                 // 크기에서 나오고 둘 다 거의 바뀌지 않으므로, 바뀔 때만 GL 에 내려보낸다.
                 // 다음 프레임의 draw 에 적용된다(이 자리가 프레임 ***뒤***다) -- 거의 안
                 // 바뀌는 값이라 한 프레임 지연은 보이지 않는다.
+                // 서피스 전체 박스도 같이 들고 있는다 -- 엔진 클립이 풀릴 때
+                // GL 기본값으로 되돌리는 데 쓴다.
+                if let Some(chain) = self.webrender_swap_chains.get(surface_id) {
+                    let size = chain.size();
+                    data.state.tile_scissor_surface = [0, 0, size.width, size.height];
+                }
                 if data.state.tile_scissor != want_tile_scissor {
                     data.state.tile_scissor = want_tile_scissor;
                     data.state.restore_scissor_invariant(&data.gl);
