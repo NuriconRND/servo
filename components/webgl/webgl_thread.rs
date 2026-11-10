@@ -237,6 +237,25 @@ fn note_canvas_rect_lag(
     );
 }
 
+/// 백엔드가 없어 버린 커맨드를 센다. ★처음 몇 번은 전문을, 그 뒤는 누적만 찍는다.★
+///
+/// 이 줄이 찍히고 그 뒤에 `webglprogram.rs` 쪽 `Disconnected` 패닉이 나면 ★그 커맨드가
+/// 질의였고 sender 가 드롭된 것★ 이다. 반대로 패닉은 나는데 이 줄이 없으면 ***또 다른
+/// 경로***가 있다는 뜻이다 -- 그 구분이 이 계수기의 목적이다. 근거는
+/// `apply_webgl_command_to_surface` 의 doc 주석에 있다.
+fn note_command_dropped(surface_id: WebGLSurfaceId) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 {
+        warn!(
+            "WEBGLCMDDROP #{n} no GL context for {surface_id:?}; a query sender is being \
+             dropped and script may panic on recv"
+        );
+    } else if n % 100 == 0 {
+        warn!("WEBGLCMDDROP total={n} (last: {surface_id:?})");
+    }
+}
+
 /// swap/clear 실패를 센다. ★처음 몇 번은 전문을, 그 뒤는 누적만 찍는다.★
 ///
 /// 예전에는 이 실패가 `.unwrap()` 으로 ***스레드를 죽였다***. 죽는 대신 넘어가게 바꿨으므로
@@ -1187,12 +1206,43 @@ impl WebGLThread {
         self.apply_webgl_command_to_surface(*last_surface_id, command, backtrace);
     }
 
+    /// 한 백엔드에 커맨드를 적용한다.
+    ///
+    /// ★`self.contexts` 에 그 서피스가 없으면 커맨드를 조용히 버리던 자리다.★
+    ///
+    /// 질의 커맨드는 응답 sender 를 품고 있으므로, 버리면 sender 가 드롭되고 스크립트의
+    /// `receiver.recv().unwrap()` 이 `Disconnected` 로 패닉한다 -- 그러면 script 스레드가
+    /// 죽어 ***어떤 명령도 듣지 않는다***. 운영자가 본 "WebGL 컨텐츠 전환 중 표출 소실 및
+    /// 제어 불능" 이 그것이다.
+    ///
+    /// ★왜 여기인가★(2026-11-10, log_webgl_perf_01/23): 앞서 `apply_webgl_command_to_primary`
+    /// 와 `..._to_all_backends` 에 복구와 warn 을 넣었는데(b4b73f6479d) 그 런의 로그에
+    /// `WebGL query dropped` 가 ***0 건***이면서 같은 패닉이 또 났다
+    /// (webglprogram.rs:577, `Disconnected`). 즉 그 두 경로를 지나지 않았다. 이유는 두 맵을
+    /// 보기 때문이다 -- `primary_surface_id` 는 `context_backends` 를, 여기서 부르는
+    /// `make_surface_current_if_needed_mut` 는 `self.contexts` 를 본다. 둘이 어긋나면
+    /// 커맨드가 ***아무 흔적 없이*** 버려진다.
+    ///
+    /// 어긋나는 경로는 `release_context_backends` 쪽에 있다(태스크 5): `self.contexts`
+    /// 엔트리가 없을 때 `continue` 하면서도 뒤에서 `context_backends` 를 지우므로, 반대로
+    /// `context_backends` 는 남고 `contexts` 만 사라진 상태가 가능하다.
+    ///
+    /// 여기서는 복구를 시도하고, 그래도 없으면 ★세어서 보이게 한다★ -- 조용히 버리지 않는다.
     fn apply_webgl_command_to_surface(
         &mut self,
         surface_id: WebGLSurfaceId,
         command: WebGLCommand,
         backtrace: WebGLCommandBacktrace,
     ) {
+        if !self.contexts.contains_key(&surface_id) {
+            // ★두 맵이 어긋났다.★ 되살리기를 시도한다 -- `released_contexts` 에 없으면
+            // 즉시 반환하므로 평상시 비용은 조회 하나다.
+            self.restore_context_backends(surface_id.context_id);
+            if !self.contexts.contains_key(&surface_id) {
+                note_command_dropped(surface_id);
+                return;
+            }
+        }
         let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
         {
             let data = self.make_surface_current_if_needed_mut(surface_id);
