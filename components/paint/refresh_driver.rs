@@ -255,16 +255,33 @@ impl RefreshDriverObserver for AnimationRefreshDriverObserver {
         let frame = self.frames_observed.get().wrapping_add(1);
         self.frames_observed.set(frame);
         let due = |divisor: u64| divisor == 1 || frame % divisor == 0;
+        // ★어느 박자가 실제로 나갔는지 같이 모은다.★ 근거는
+        // `frame_source_probe::note_tick_cadence` 의 doc 주석에 있다 -- 요점은 표출 틱
+        // (60/s)과 애니메이션 틱이 ***다른 박자***이고, 후자를 세는 것이 없었다는 것이다.
+        let mut cadence_hit = [false; 3];
         let webviews_to_tick: Vec<WebViewId> = animating_webviews
             .into_iter()
             .filter(|(_, cadence)| match cadence {
-                TickCadence::Full => true,
-                TickCadence::PaintSide => due(divisor),
-                TickCadence::LiveCanvas => due(canvas_divisor),
+                TickCadence::Full => {
+                    cadence_hit[0] = true;
+                    true
+                },
+                TickCadence::PaintSide => {
+                    let due = due(divisor);
+                    cadence_hit[1] |= due;
+                    due
+                },
+                TickCadence::LiveCanvas => {
+                    let due = due(canvas_divisor);
+                    cadence_hit[2] |= due;
+                    due
+                },
             })
             .map(|(webview_id, _)| webview_id)
             .collect();
+        crate::frame_source_probe::note_tick_cadence(frame, cadence_hit, false);
         if webviews_to_tick.is_empty() {
+            crate::frame_source_probe::note_tick_cadence(frame, [false, false, false], true);
             // Still observing: the next frame may be the one that ticks.
             self.animating.set(true);
             return true;

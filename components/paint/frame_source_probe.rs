@@ -113,6 +113,47 @@ static PAINT_SIDE_JUDGED: AtomicU64 = AtomicU64::new(0);
 /// 둘이 그 이유를 가른다 -- `judged` 가 양수인데 `defeated` 가 0 이면 ★신호가 안 잡히는
 /// 것★이고, 둘 다 양수인데 거절이 남으면 ★깎임 외의 원인★이다.
 static PAINT_SIDE_DEFEATED: AtomicU64 = AtomicU64::new(0);
+/// 애니메이션 틱이 ★어느 박자로 몇 번 실제로 나갔는지★. 박자별로 센다.
+///
+/// ★이것이 없어서 가장 유력한 가설을 로그로 확인할 수 없었다.★ `painter.rs` 의 cadence
+/// 결정 주석이 2026-11-02 실측을 이렇게 적어 뒀다 -- "ticker 와 WebGL 을 함께 표출하면
+/// ***둘 다*** 저더한다. ticker 가 `has_paint_animations` 로 이 WebView 를 paint 측으로
+/// 만들고, 런처 기본값 divisor=15 가 ***WebGL 의 rAF 를 초당 네 번으로 깎는다***." 60Hz
+/// 에서 15 로 나누면 4/s 이고, 운영자는 1/4/15/30/60Hz 를 눈으로 구별한다.
+///
+/// 그런데 ***그 4/s 를 찍는 계수기가 없었다***. 28 번 실기(60fps WebGL + ticker, 육안
+/// judder)에서 `PRODUCE` 는 60.0/s, `KEEPPREV` 는 100%, scissor 는 100% 였고 -- 전부
+/// 표출 틱의 수치다. 애니메이션 틱은 그와 ***다른 박자***이고, 그것을 아무도 세지 않았다.
+///
+/// 칸: 0 = Full, 1 = PaintSide, 2 = LiveCanvas, 3 = 틱할 WebView 가 없어 건너뜀.
+static TICK_CADENCE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// 관측한 프레임 수(= 표출 틱). 위 칸들과의 비율이 실제 약수다.
+static CADENCE_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// 박자 칸 이름. 로그 순서와 같다.
+pub(crate) const CADENCE_FULL: usize = 0;
+pub(crate) const CADENCE_PAINT_SIDE: usize = 1;
+pub(crate) const CADENCE_LIVE_CANVAS: usize = 2;
+pub(crate) const CADENCE_NONE: usize = 3;
+
+/// 이 프레임에 어느 박자의 WebView 가 틱을 받았는지 적는다. ★원자 증가뿐이다.★
+///
+/// 한 프레임에 여러 박자가 함께 나갈 수 있으므로 칸마다 따로 센다 -- 합이 프레임 수를
+/// 넘는 것이 정상이다.
+pub(crate) fn note_tick_cadence(frames: u64, buckets: [bool; 3], skipped: bool) {
+    if !is_enabled() {
+        return;
+    }
+    CADENCE_FRAMES.store(frames, Ordering::Relaxed);
+    for (i, hit) in buckets.iter().enumerate() {
+        if *hit {
+            TICK_CADENCE[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if skipped {
+        TICK_CADENCE[CADENCE_NONE].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// `Painter::render` 한 번의 소요 시간 분포. 칸은 [`UPDATE_FLOOR_NANOS`] 를 공유한다.
 ///
@@ -293,7 +334,64 @@ pub(crate) fn note_frame(from_wall_tick: bool, reason_bits: u64) {
 
 /// ★`warn!` 로 찍는 이유: 벽 런이 `RUST_LOG=warn` 이다.★ `info!` 로 두면 정작 볼 수 없다 --
 /// `paint_animation_mesh_probe` 가 그 함정에 걸려 첫 실기 런에서 한 줄도 남지 않았다.
+/// 박자별 애니메이션 틱을 ★구간 차분으로★ 찍는다.
+///
+/// ★누적이 아니라 구간이다.★ 이 프로젝트는 괄호 안의 `/s` 를 구간값으로 오독해 틀린
+/// 결론을 세 번 냈다. 읽는 쪽이 나눌 일이 없게 여기서 직접 뺀다.
+///
+/// 읽는 법: `frames` 는 그 구간의 표출 틱 수(60Hz 면 ~600/10s)이고, 각 칸은 그 박자의
+/// WebView 가 틱을 ***받은*** 프레임 수다. `paint_side` 가 `frames/15` 쯤이면
+/// `gfx_paint_side_animation_tick_divisor=15` 가 그대로 걸린 것이고, 그 WebView 에 WebGL
+/// 캔버스가 같이 있으면 ***캔버스의 rAF 도 그 박자로 깎인다*** -- 60Hz 에서 4/s 다.
+/// 운영자는 1/4/15/30/60Hz 를 눈으로 구별한다.
+fn report_tick_cadence(elapsed: Duration) {
+    static LAST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+    let frames = CADENCE_FRAMES.load(Ordering::Relaxed);
+    let now = [
+        frames,
+        TICK_CADENCE[CADENCE_FULL].load(Ordering::Relaxed),
+        TICK_CADENCE[CADENCE_PAINT_SIDE].load(Ordering::Relaxed),
+        TICK_CADENCE[CADENCE_LIVE_CANVAS].load(Ordering::Relaxed),
+        TICK_CADENCE[CADENCE_NONE].load(Ordering::Relaxed),
+    ];
+    let mut d = [0u64; 5];
+    for i in 0..5 {
+        d[i] = now[i].saturating_sub(LAST[i].swap(now[i], Ordering::Relaxed));
+    }
+    // 애니메이션이 하나도 없는 런에서는 조용히 넘어간다.
+    if d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0 && d[4] == 0 {
+        return;
+    }
+    let secs = elapsed.as_secs_f64().max(1e-9);
+    let rate = |n: u64| n as f64 / secs;
+    // 실효 약수 -- 기대값과 맞는지 바로 보려는 것이다.
+    let div = |n: u64| {
+        if n == 0 {
+            f64::INFINITY
+        } else {
+            d[0] as f64 / n as f64
+        }
+    };
+    log::warn!(
+        "TICKCADENCE {secs:.0}s frames={} ({:.1}/s) full={} ({:.1}/s) \
+         paint_side={} ({:.1}/s, div={:.1}) live_canvas={} ({:.1}/s, div={:.1}) none={}",
+        d[0],
+        rate(d[0]),
+        d[1],
+        rate(d[1]),
+        d[2],
+        rate(d[2]),
+        div(d[2]),
+        d[3],
+        rate(d[3]),
+        div(d[3]),
+        d[4],
+    );
+}
+
 fn report(elapsed: Duration) {
+    report_tick_cadence(elapsed);
     let tick = TICK_FRAMES.load(Ordering::Relaxed);
     let other = OTHER_FRAMES.load(Ordering::Relaxed);
     let bits = OTHER_REASON_BITS.load(Ordering::Relaxed);
