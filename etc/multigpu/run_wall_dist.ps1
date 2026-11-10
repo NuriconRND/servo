@@ -1,21 +1,22 @@
 ﻿# Runs the packaged multi-GPU wall (pref-era: engine knobs are --pref, not env vars).
 #
-# ★이 파일은 UTF-8 **with BOM** 이다 -- BOM 을 떼면 파싱이 깨진다.★
+# **This file is UTF-8 with a BOM, and pure ASCII in content.**
 #
-# 여기에는 "Pure ASCII on purpose -- a Korean launcher failed to parse on a test machine"
-# 라고 적혀 있었다. 그 규칙이 생긴 이유는 실재했다: BOM 이 없으면 PowerShell 5.1 은 이
-# 파일을 ANSI(여기서는 cp949)로 읽고, 그 디코더는 짝이 안 맞는 선행 바이트를 만나면 뒤의
-# 한 바이트를 같이 삼킨다. 한국어로 끝나는 주석 줄에서 그 한 바이트가 ***개행***이라,
-# 다음 줄이 통째로 주석 안으로 끌려 들어가고 파서는 엉뚱한 자리에서 "Unexpected token '}'"
-# 를 낸다(2026-10-22 재현: PAINTERLOCK 절을 넣자마자 터졌다).
+# Both halves of that matter, and the reason is one decoder bug. Without a BOM, PowerShell
+# 5.1 reads this file as ANSI (cp949 here), and that decoder, on hitting an unpaired lead
+# byte, swallows the following byte as well. On a comment line ending in a non-ASCII
+# character that byte is the ***newline***, so the next line is pulled into the comment and
+# the parser reports "Unexpected token '}'" somewhere unrelated (reproduced 2026-10-22: it
+# broke the moment the PAINTERLOCK section was added).
 #
-# 그런데 그 규칙은 ***이미 지켜지지 않고 있었다*** -- 아래 주석의 대부분이 한국어다. 지금까지
-# 멀쩡했던 것은 그 줄들이 전부 ASCII 구두점으로 끝나 개행이 살아남았기 때문이고, 그것은
-# 규칙이 아니라 운이다. 그래서 규칙을 다시 적는 대신 ★원인을 없앤다★: BOM 이 있으면
-# PowerShell 이 UTF-8 로 읽고 이 함정 자체가 사라진다.
+# The comments were Korean for a long time and survived only because those lines happened
+# to end in ASCII punctuation -- luck, not a rule. On 2026-11-10 they were all translated to
+# English on the operator's instruction, which removes the hazard at the source, and the BOM
+# is kept as the second line of defence.
 #
-# 편집 도구가 BOM 을 떼지 않게 할 것. 확인: `Get-Command .\run_wall_dist.ps1 -Syntax`
-# 가 조용히 끝나면 된다 -- 깨져 있으면 거기서 파스 에러가 쏟아진다.
+# Keep both: do not let an editor strip the BOM, and do not reintroduce non-ASCII text.
+# Check with `Get-Command .\run_wall_dist.ps1 -Syntax` -- it should finish quietly; a broken
+# file spills parse errors there.
 #
 # RUST_LOG is set UNCONDITIONALLY. It used to be `if (-not $env:RUST_LOG)` and that
 # silently defeated the diagnostics twice: a value left over in the shell (without
@@ -23,13 +24,13 @@
 # NOTE that crate logs under the target "media", NOT "servo_media_thread" -- its
 # Cargo.toml sets [lib] name = "media".
 
-# ★[CmdletBinding()] 을 빼지 말 것.★ 이것이 없으면 PowerShell 은 모르는 명명
-# 파라미터를 **조용히 무시하고 그냥 돈다** -- 오류도 경고도 없다. 이 벽의 A/B 는
-# 전부 이 스크립트의 스위치로 설정되므로, 배포본이 오래되면 새 스위치가 말없이
-# 사라지고 런은 완벽하게 정상으로 보인다. 실제로 2026-09-17 에 -VsyncPhase 를
-# 넘긴 네 번의 실기가 통째로 날아갔다(옛 스크립트 + 기본값으로 네 번 같은 런).
-# 엔진 쪽은 시끄럽다 -- 모르는 pref 이름은 set_value 가, 타입 불일치는
-# try_into().unwrap() 이 패닉한다. 조용한 구멍은 여기 하나뿐이었다.
+# **Do not remove [CmdletBinding()].** Without it PowerShell **silently ignores an unknown
+# named parameter and runs anyway** -- no error, no warning. Every A/B on this wall is set
+# through this script's switches, so when a dist goes stale a new switch disappears without
+# a word and the run looks perfectly normal. That really happened on 2026-09-17: four
+# hardware runs passing -VsyncPhase were lost (old script + default value, four identical
+# runs). The engine side is loud -- an unknown pref name panics in set_value and a type
+# mismatch panics in try_into().unwrap(). This was the only silent hole.
 [CmdletBinding()]
 param(
     [string] $Layout = "wall_layout.multigpu.json",
@@ -84,27 +85,30 @@ param(
     [switch] $NoSyncGroup,
     [int]    $DecoderThreads = 1,
     [string] $TileSize = "display",      # gfx_wr_picture_tile_size
-    # gfx_wr_profiler_hud -- WebRender 온스크린 프로파일러(HUD). ★임의의 페이지에서 fps 를
-    # 수치로 본다.★ 빈 문자열 = 끔(기본). `on` = 벽 조사용 기본 묶음. 그 외는 WebRender 의
-    # profiler UI 문자열로 그대로 간다(문법은 pref doc 참고).
+    # gfx_wr_profiler_hud -- WebRender's on-screen profiler (HUD).
+    # **It puts a number on fps for any page.** Empty = off (default). `on` = the default bundle for wall investigation.
+    # Anything else goes straight through as WebRender's profiler UI string (see the pref doc
+    # for the syntax).
     #   -ProfilerHud on
     #   -ProfilerHud "FPS,Renderer"
-    # ★HUD 자체가 매 프레임 글자를 그린다★ -- 절대값보다 조건 사이의 차이를 보는 데 쓴다.
-    # 페인터마다 그려지므로 벽에서는 타일별로 나온다.
+    # **The HUD itself draws text every frame** -- use it for differences between conditions,
+    # not for absolute values. It is drawn per painter, so on the wall you get one per tile.
     [string] $ProfilerHud = "",
-    # gfx_paint_side_animation_mesh_probe -- paint-side 예측이 교체될 때 맞물리는지 재고
-    # 10 초마다 MESHPROBE 줄로 찍는다. 꺼진 런의 비용은 AtomicBool 로드 하나다.
+    # gfx_paint_side_animation_mesh_probe -- measure whether paint-side prediction meshes
+    # when it is swapped, and print a MESHPROBE line every 10 s. A run with it off costs one
+    # AtomicBool load.
     [switch] $MeshProbe,
-    # 진단 런에서만 RUST_LOG 를 올린다. 비면 기본 "warn" 그대로 -- ★기본 동작은 바뀌지
-    # 않는다.★
+    # Raise RUST_LOG for diagnostic runs only. Empty leaves the default "warn" alone --
+    # **the default behaviour does not change.**
     #
-    # ★`-KeepRustLog` 와 다르다.★ 그것은 ***셸에 세워진 값***을 그대로 썼기 때문에 런마다
-    # 필터가 달라져 로그를 비교할 수 없었고, 그래서 제거됐다. 이것은 ***명령에 적힌 값***
-    # 이므로 console.txt 에 남고 배너에도 찍힌다 -- 어떤 필터로 돈 런인지가 기록된다.
+    # **Different from `-KeepRustLog`.** That one used ***whatever the shell had set***, so the
+    # filter varied run to run and the logs could not be compared; it was removed. This value
+    # is ***on the command line***, so it lands in console.txt and in the banner -- which
+    # filter a run used is on the record.
     #
-    # ★아래 검사기가 그대로 적용된다★ -- 레벨이 아닌 맨 토큰("critical" 등)은 env_filter 가
-    # 모듈 이름으로 읽어 전역 상한을 Trace 로 ***올린다***. 2026-10-27 에 그걸로 A/B 한
-    # 바퀴를 날렸다. 경고가 나오면 조용히 넘기지 말 것.
+    # **The checker below applies as usual** -- a bare token that is not a level ("critical" and
+    # friends) is read by env_filter as a module name and ***raises*** the global cap to Trace.
+    # That cost a full A/B round on 2026-10-27. Do not wave the warning away.
     #
     #   -RustLog "warn,webgl=debug,script::dom::webgl=debug"
     [string] $RustLog = "",
@@ -125,291 +129,337 @@ param(
     # ten to one -- and that path REQUIRES it (see the check below).
     [ValidateSet("off", "on", "surface")]
     [string] $DComp = "off",
-    # gfx_vsync_enabled. 기본 off.
+    # gfx_vsync_enabled. Off by default.
     #
-    # ★2026-09-17 부터 이 스위치는 둘을 한다.★ 원래는 DwmVsyncRefreshDriver 를 세워
-    # **콘텐츠 생산**만 DWM 합성에 맞췄고 셸의 표출 클럭은 건드리지 않았다 -- 그래서
-    # 켜도 화면상 변화가 없었고, 그 결과를 "vsync 는 원인이 아니다" 로 읽을 뻔했다.
-    # 이제는 셸의 표출 클럭(drive_present_clock)도 같은 드라이버를 구독한다.
+    # **Since 2026-09-17 this switch does two things.** Originally it installed
+    # DwmVsyncRefreshDriver and aligned **content production** only to DWM composition,
+    # leaving the shell's present clock alone -- so turning it on changed nothing on screen,
+    # and that result was nearly read as "vsync is not the cause". Now the shell's present
+    # clock (drive_present_clock) subscribes to the same driver.
     #
-    # 왜 필요한가: 소프트 타이머는 정확히 60 개를 내도 디스플레이와 다른 발진기라,
-    # 화면에 보이는 위치가 scanout 직전 0~한 주기 사이의 표본이 되어 프레임마다
-    # 흔들린다(초당 2,304px 물체에서 60Hz 면 0~38px). vsync 에 묶으면 그 오차가
-    # 상수(한 vsync 지연)가 되어 사라진다. -RefreshHz 를 올리는 것은 오차를 작게
-    # 만들 뿐이고 프레임 빌드 비용이 배수로 는다.
+    # Why it is needed: a soft timer can emit exactly 60 and still be a different oscillator
+    # from the display, so the on-screen position becomes a sample taken somewhere between 0
+    # and one period before scanout, and it wobbles frame to frame (0-38px at 60Hz for an
+    # object moving 2,304px/s). Binding to vsync turns that error into a constant (one vsync
+    # of latency) and it disappears. Raising -RefreshHz only makes the error smaller, at a
+    # multiplied frame-build cost.
     #
-    # 치르는 값: 이 장비에서 DwmFlush 가 스핀-웨이트라 코어 1 개를 상시 먹는다.
-    # 셸이 매 vsync 재등록하므로 그 스레드는 더 이상 유휴로 잠들지 않는다.
+    # The price: on this box DwmFlush is a spin-wait and eats one core continuously. The
+    # shell re-registers every vsync, so that thread no longer sleeps idle.
     #
-    # 판정: WALLCLOCK 의 backstop 필드. 0 이면 vsync 가 몰고 있는 것이고, 오르면
-    # 신호가 끊겨 자유 구동 타이머로 내려앉은 것이다(로그에 warn 도 같이 나간다).
+    # Verdict: the backstop field on WALLCLOCK. 0 means vsync is driving; if it climbs, the
+    # signal was lost and we fell back to the free-running timer (a warn is logged too).
     [switch] $Vsync,
-    # gfx_vsync_phase_pct: vsync 틱과 실제 표출 사이의 위상 오프셋(vsync 주기의 %).
-    # 기본 0. -Vsync 와 같이 쓸 때만 의미가 있다.
+    # gfx_vsync_phase_pct: phase offset between the vsync tick and actual presentation, as a
+    # percentage of the vsync period. Default 0. Meaningful only together with -Vsync.
     #
-    # ★왜 있나★ -Vsync 로 묶었더니 오히려 나빠졌는데(log_ani_debug/30, 31) 개수
-    # 계수는 전부 정상이었다 -- 떨림은 "값을 뜬 시각과 화면에 나가는 시각의 간격"
-    # 이고 그것을 재는 계수가 없다. 관찰된 모양(자유 구동일 때 나쁜 구간의 상태가
-    # 재생 내내)은 위상이 한 자리에 고정됐는데 그 자리가 scanout 경계라는 뜻이다.
+    # **Why it exists** binding to -Vsync made things worse (log_ani_debug/30, 31) while every
+    # count stayed normal -- the shake is "the gap between when a value was sampled and when
+    # it reaches the screen", and no counter measures that. The observed shape (the state of
+    # a free-running run's bad stretch, now lasting the whole run) means the phase got pinned
+    # to one spot and that spot is a scanout boundary.
     #
-    # 0 / 25 / 50 / 75 를 쓸어 보라. 좋은 자리가 있으면 위상 가설이 확정되고 값도
-    # 같이 나온다. 어느 값도 좋지 않으면 위상이 아니므로 -Vsync 를 접으면 된다.
+    # Sweep 0 / 25 / 50 / 75. If one spot is good, the phase hypothesis is confirmed and the
+    # value comes with it. If none is good, it is not phase, so drop -Vsync.
     [ValidateRange(0, 99)]
     [int]    $VsyncPhase = 0,
-    # gfx_present_sync_interval: 타일 스왑체인 Present 의 SyncInterval. 기본 0.
+    # gfx_present_sync_interval: SyncInterval for the tile swap chain's Present. Default 0.
     #
-    # 0 = 어떤 패널의 vblank 도 기다리지 않는다(현재 동작). 1 = 타일마다 자기 출력의
-    # vblank 에 맞춘다.
+    # 0 = do not wait for any panel's vblank (current behaviour). 1 = each tile aligns to its
+    # own output's vblank.
     #
-    # ★왜★ 값 경로를 다 고친 뒤에도 남은 저더가 있는데, 같은 빌드로 세 번 돌린
-    # 결과가 갈렸고(120초 내내 깨끗 / 타일마다 튐 / 섞임) 세 런의 계수가 전부 같았다
-    # (log_ani_debug/39). present 위쪽으로는 그 차이를 설명할 수 없고, 지금 present 는
-    # 셋 다 SyncInterval 0 이다. 네 패널은 genlock 되지 않은 독립 60Hz 라 -Vsync(DWM
-    # 합성 클럭 하나)로는 못 맞춘다 -- 정렬은 타일마다여야 한다.
+    # **Why** there is judder left even after every value path was fixed, and three runs of the
+    # same build diverged (120s clean / per-tile stutter / mixed) with identical counters in
+    # all three (log_ani_debug/39). Nothing above present explains that difference, and today
+    # all three presents use SyncInterval 0. The four panels are independent, non-genlocked
+    # 60Hz, so -Vsync (one DWM composition clock) cannot align them -- the alignment has to be
+    # per tile.
     #
-    # 1 로 켜면 큐가 찼을 때 호출 스레드가 블록된다. primary 타일의 그 스레드는
-    # 메인이므로, WALLPASS 의 pass_ms 와 WALLCLOCK 의 gap/off 를 반드시 같이 보라.
+    # With 1, the calling thread blocks when the queue is full. For the primary tile that
+    # thread is main, so always read pass_ms on WALLPASS and gap/off on WALLCLOCK alongside it.
     [ValidateRange(0, 4)]
     [int]    $PresentSync = 0,
-    # gfx_present_align_dwm_pct: 표출 클럭을 DWM 합성 격자에 스냅한다.
-    # -1(기본) = 끔, 0..99 = DWM 주기의 그 백분율 지점을 겨냥.
+    # gfx_present_align_dwm_pct: snap the present clock to the DWM composition grid.
+    # -1 (default) = off, 0..99 = aim at that percentage point of the DWM period.
     #
-    # ★이것이 저더의 원인이고 해법이다.★ 실측(log_ani_debug/47): 같은 빌드·같은
-    # 설정인데 깨끗한 런은 커밋이 DWM 주기의 8% 지점에, 저더 런은 60% 지점에
-    # 떨어졌고 둘 다 44창 내내 그 자리를 유지했다. DWM 은 vblank 이전에 미리 합성을
-    # 시작하므로 60% 지점 커밋은 마감에 걸터앉아 프레임마다 되느냐 마느냐가 갈린다.
-    # 어느 자리에 앉을지는 지금 기동 순간의 운이다.
+    # **This is both the cause of the judder and its cure.** Measured (log_ani_debug/47): same
+    # binary, same settings, yet the clean run's commits fell at 8% of the DWM period and the
+    # juddering run's at 60%, and both held that spot for all 44 windows. DWM starts
+    # composing before the vblank, so a commit at 60% sits on the deadline and makes it or
+    # misses it frame by frame. Which spot you get is luck at startup.
     #
-    # 켜면 매 틱 측정된 vblank 로부터 다시 세므로 기동 위상과 무관하게 같은 자리에
-    # 떨어진다. 자유 구동 타이머에 상수를 더하는 것과는 다르다 -- 그건 임의 기준점에
-    # 상수를 더하는 것이라 여전히 임의다.
+    # With it on, every tick counts again from a measured vblank, so it lands in the same
+    # place regardless of startup phase. This is not the same as adding a constant to a
+    # free-running timer -- that adds a constant to an arbitrary origin and stays arbitrary.
     #
-    # 커밋은 틱보다 렌더 시간(약 2ms = 주기의 0.12)만큼 늦으므로 0 이 vblank 직후를
-    # 겨냥한다. DWMPHASE 의 phase p50 으로 확인하라 -- 0.1 근처면 좋은 자리다.
+    # The commit trails the tick by the render time (about 2ms = 0.12 of the period), so 0
+    # aims just after the vblank. Check with phase p50 on DWMPHASE -- near 0.1 is a good spot.
     #
-    # 대기가 아니다. 타이머가 깨어나는 시각만 바뀌므로 생산 스레드가 공유 객체에
-    # 줄 서는 회귀(GstSystemClock 사건)가 구조적으로 생기지 않는다.
+    # It is not a wait. Only the time the timer wakes changes, so the regression where a
+    # production thread queues on a shared object (the GstSystemClock incident) cannot arise
+    # structurally.
     [ValidateRange(-1, 99)]
     [int]    $DwmAlign = -1,
-    # gfx_present_align_commit_pct -- B3. DComp Commit 을 공통 합성 격자 위의 고정된
-    # 위상에 내보낸다. -1 = 꺼짐(기본), 0..99 = 합성 주기의 그 백분율 지점.
+    # gfx_present_align_commit_pct -- B3. Issue the DComp Commit at a fixed phase on the
+    # common composition grid. -1 = off (default), 0..99 = that percentage point of the period.
     #
-    # 커밋은 그동안 렌더 패스의 **끝**에서 나갔고, -DwmAlign 은 패스의 **시작**만
-    # 고정한다. 그래서 커밋 위상이 패스 길이를 그대로 물려받았고, 그 산포가 저더의
-    # 두 증상을 모두 만들었다 -- 큰 탈선은 합성 마감을 스치고(MISSEVENT nc=1), 그
-    # 흔들림이 커밋 간격을 흔들어 합성 경계를 넘나든다(nc=0).
+    # The commit used to go out at the **end** of the render pass, and -DwmAlign only pins the
+    # **start** of the pass. So commit phase inherited the pass length, and that scatter
+    # produced both judder symptoms -- a large excursion grazes the composition deadline
+    # (MISSEVENT nc=1), and the wobble shakes the commit interval across composition
+    # boundaries (nc=0).
     #
-    # ★-DwmAlign 의 바로 앞에 두지 말 것.★ 여유는 틱에서 마감까지의 **전방** 거리라
-    # (CommitAlign - DwmAlign) mod 100 이고, 그것이 15%p 미만이면 마감이 패스보다
-    # 먼저 와서 거의 매 프레임 즉시 커밋으로 떨어진다 -- 기능이 켜진 채 아무 일도
-    # 하지 않는다(프로브의 패스 p95 가 주기의 13.4%). 엔진이 기동 로그에 경고를 한 줄 낸다.
+    # **Do not place it just ahead of -DwmAlign.** The slack is the **forward** distance from
+    # tick to deadline, (CommitAlign - DwmAlign) mod 100, and below 15 points the deadline
+    # arrives before the pass does, so nearly every frame falls through to an immediate commit
+    # -- the feature is on and does nothing (the probe's pass p95 is 13.4% of the period). The
+    # engine prints one warning line at startup.
     #
-    # ★CommitAlign < DwmAlign 은 적법하다★ -- 마감이 다음 주기의 그 지점이 되므로
-    # 여유가 거의 한 주기로 가장 많다. 대신 합성까지의 여유는 가장 적다.
+    # **CommitAlign < DwmAlign is legitimate** -- the deadline becomes that point in the NEXT
+    # period, so the slack is nearly a full period, the most available. The trade is that
+    # slack to composition is then the least.
     #
-    # ★낡음(2026-09-21 기록, 2026-10-06 `1cdfd52cf3d` 이후 거꾸로다)★ — -CommitAlign 을 쓸 때는 -DcompParallelCommit 을 ***같이 줘야*** 하고, 빼면 엔진이 직렬화 경고를 낸다.
-    # 켜면 -DcompParallelCommit 은 무시된다(목적이 겹친다). 기동 로그에 남는다.
-    # ★판정은 TICKCOMMIT 의 spread 다★ -- 0 에 가까워져야 성공이다.
+    # **Stale note (recorded 2026-09-21; reversed after `1cdfd52cf3d` on 2026-10-06)** --
+    # -CommitAlign used to require -DcompParallelCommit alongside it, and the engine warned
+    # about serialisation if it was missing. Now turning this on makes -DcompParallelCommit
+    # ignored (they overlap in purpose), and that is recorded in the startup log.
+    # **The verdict is the spread on TICKCOMMIT** -- success is it approaching 0.
     [ValidateRange(-1, 99)]
     [int]    $CommitAlign = -1,
-    # gfx_sample_lead_periods -- B2. 타일마다 자기 출력이 그 프레임을 표시할 시각에
-    # 애니메이션을 샘플한다. -1 = 꺼짐(기본), 0 = 다음 vblank, 1 = +1 주기 (0..4).
+    # gfx_sample_lead_periods -- B2. Each tile samples the animation at the time its own
+    # output will display that frame. -1 = off (default), 0 = next vblank, 1 = +1 period (0..4).
     #
-    # B1(출력별 vblank 겨냥, 지금은 B3 -CommitAlign 으로 교체)이 커밋 시각만 옮겨 못 고친 것을 고친다. 실기에서 B1 을 완전히
-    # 동작시켜도 저더가 줄지 않았다(설계 문서 `## 실기 결과`).
+    # This fixes what B1 (aiming at per-output vblanks, now replaced by B3 -CommitAlign) could
+    # not, because B1 only moved the commit time. Making B1 fully work on the wall did not
+    # reduce judder (design doc, `## Hardware results`).
     #
-    # ★이음매에 고정 어긋남이 생긴다 -- 그것이 이 거래의 내용이다.★ 속도 × 출력 간 위상차
-    # 이고, 1x 프로브(2,304px/s)에서 최대 26px, 500px/s 에서 5.6px. 판정 기준은 "이음매가
-    # 붙었나" 가 아니라 "타일 안에서 등속으로 매끄럽나" 다. 이음매 기하를 같이 보려면
-    # 느린 객체(1/4x)로 봐야 한다.
+    # **It introduces a fixed offset at the seams -- that is the content of this trade.** The
+    # offset is speed x inter-output phase difference: up to 26px on the 1x probe (2,304px/s),
+    # 5.6px at 500px/s. The verdict is not "do the seams line up" but "is motion smooth and
+    # uniform WITHIN a tile". To judge seam geometry at the same time, use a slow object (1/4x).
     #
-    # ★-DwmAlign 과 같이 써야 한다.★ 이것만 켜면 자유 실행하는 렌더를 합성 격자에 스냅하는
-    # 셈이라, 가끔 두 렌더가 같은 격자점에 걸려 그 프레임의 변위가 0 이 되고 다음이 두 칸을
-    # 뛴다. -DwmAlign 이 렌더 틱 자체를 같은 격자에 잠가 프레임↔합성을 1:1 로 만든다.
+    # **Must be used with -DwmAlign.** On its own it snaps a free-running render onto the
+    # composition grid, so now and then two renders land on the same grid point: that frame's
+    # displacement is zero and the next jumps two steps. -DwmAlign locks the render tick onto
+    # the same grid, making frame-to-composite 1:1.
     [ValidateRange(-1, 4)]
     [int]    $SampleLead = -1,
-    # gfx_wall_direct_render: 표출 클럭 틱에서 request_redraw() 를 거치지 않고 그 자리에서
-    # 바로 타일을 그린다. 기본 꺼짐(= 종전 경로).
+    # gfx_wall_direct_render: draw the tiles right there on the present-clock tick instead of
+    # going through request_redraw(). Off by default (= the previous path).
     #
-    # 화면 표출은 IDCompositionDevice::Commit(순수 COM)이라 메시지 펌프와 무관한데,
-    # request_redraw() 는 Windows 에서 WM_PAINT 를 요청하고 그것은 posted message 큐가 다
-    # 빈 뒤에야 합성되는 최저 우선순위 메시지다. 이 셸은 엔진 wake 를 초당 300 회 받으므로
-    # 렌더가 그 큐 뒤에 선다 -- 틱 간격 p95 17.23ms(주기 16.667ms)의 유력한 후보다.
+    # Presenting is IDCompositionDevice::Commit (pure COM) and has nothing to do with the
+    # message pump, but request_redraw() asks Windows for WM_PAINT -- the lowest-priority
+    # message, synthesised only once the posted-message queue is empty. This shell takes 300
+    # engine wakes a second, so the render queues up behind them: a strong candidate for the
+    # tick interval's p95 of 17.23ms against a 16.667ms period.
     #
-    # 렌더 스레드는 그대로 메인이다. 바뀌는 것은 누가 언제 부르나뿐이다.
+    # The render thread is still main. All that changes is who calls it, and when.
     [switch] $DirectRender,
-    # gfx_wall_pacing_thread: 표출 틱을 전용 스레드가 올린다. 기본 꺼짐.
+    # gfx_wall_pacing_thread: a dedicated thread raises the present tick. Off by default.
     #
-    # ★실제 부하에서 박자가 엔진에 얹힌다.★ 실측(log_ani_debug_02/20, 애니메이션 5 개):
-    # 틱이 초당 56.0(최악 41, 60 이어야 한다), about_to_wait 진입이 185 -> 132(최악 56),
-    # 틱의 37% 를 타이머가 아니라 엔진 wake 가 알아챈다(프로브 2%). gap_ms p95 17.23 -> 29.08.
+    # **Under real load the cadence rides on the engine.** Measured (log_ani_debug_02/20, five
+    # animations): ticks at 56.0/s (worst 41, should be 60), about_to_wait entries 185 -> 132
+    # (worst 56), and 37% of ticks noticed by an engine wake rather than by the timer (2% on
+    # the probe). gap_ms p95 17.23 -> 29.08.
     #
-    # about_to_wait 은 winit 이 이벤트 큐를 다 비운 뒤에만 도달하는 자리인데 표출 클럭의
-    # WaitUntil 이 거기 걸려 있다. 켜면 깨우는 일만 스레드로 옮긴다 -- 렌더는 그대로 메인이다.
+    # about_to_wait is only reached once winit has drained the event queue, and the present
+    # clock's WaitUntil hangs off it. Turning this on moves only the waking to a thread --
+    # the render stays on main.
     #
-    # 판정: WALLCLOCK 의 tick_by pace 가 대부분이고 ticks 가 60 으로 돌아오는가.
+    # Verdict: is tick_by on WALLCLOCK mostly pace, and do ticks come back to 60.
     [switch] $PacingThread,
-    # gfx_wall_pacing_clock=dwmquery: 페이싱 스레드를 **예전** 경로로 되돌린다.
-    # -PacingThread 가 없으면 아무 일도 하지 않는다.
+    # gfx_wall_pacing_clock=dwmquery: put the pacing thread back on the **old** path.
+    # Does nothing without -PacingThread.
     #
-    # 기본(이 스위치 없음) = WaitForVBlank. primary 의 vblank 에서 커널이 깨우므로 DWM
-    # 조회도 대기 타이머도 경로에 없다.
-    # 이 스위치를 주면 = DwmGetCompositionTimingInfo 로 격자를 묻고 -DwmAlign 지점까지
-    # thread::sleep. 그 둘(프로세스 간 호출 지연 + 타이머 깨우기 지터)이 그대로 틱 위상의
-    # 지터가 되고, 커밋 위상이 저더를 정하므로 공짜가 아니다.
+    # Default (switch absent) = WaitForVBlank. The kernel wakes us on the primary's vblank,
+    # so neither a DWM query nor a wait timer is in the path.
+    # With this switch = ask DwmGetCompositionTimingInfo for the grid, then thread::sleep to
+    # the -DwmAlign point. Those two (inter-process call latency + timer wake jitter) become
+    # jitter in the tick phase, and since commit phase decides judder, it is not free.
     #
-    # ★-DwmAlign 과 같이 보라.★ vblank 경로라도 -DwmAlign 1..99 면 vblank 뒤에 그만큼 또
-    # 자므로 타이머 지터가 돌아온다 -- 앵커만 좋아진 예전 구조다. -DwmAlign 0(또는 생략)
-    # 일 때만 대기가 하나도 없는 순수 신호 경로이고, 실측 최적점도 거기다.
+    # **Read it together with -DwmAlign.** Even on the vblank path, -DwmAlign 1..99 sleeps that
+    # much again after the vblank, so the timer jitter is back -- the old structure with only
+    # the anchor improved. Only -DwmAlign 0 (or omitted) is a pure signal path with no wait
+    # at all, and that is also where the measured optimum is.
     #
-    # 판정: WALLCLOCK 의 jit_ms 와 gap_ms p95, 그리고 COMPREFRESH 의 refresh_d[2].
+    # Verdict: jit_ms and gap_ms p95 on WALLCLOCK, plus refresh_d[2] on COMPREFRESH.
     [switch] $PacingDwmQuery,
-    # gfx_wall_pacing_clock=compositor: DCompositionWaitForCompositorClock 으로 깬다.
+    # gfx_wall_pacing_clock=compositor: wake on DCompositionWaitForCompositorClock.
     #
-    # ★세 경로의 차이는 두 축이다 -- 앵커가 옳은가, 묻는가.★
+    # **The three paths differ on two axes -- is the anchor right, and does it query.**
     #
-    #              앵커            질의        대기 타이머
-    #   vblank     DXGI 출력 (?)   없음        DwmAlign>0 일 때만
-    #   dwmquery   DWM 격자 ok     매 틱       항상
-    #   compositor DWM 클럭 ok     없음        DwmAlign>0 일 때만
+    #              anchor          query       wait timer
+    #   vblank     DXGI output (?) none        only when DwmAlign>0
+    #   dwmquery   DWM grid, ok    every tick  always
+    #   compositor DWM clock, ok   none        only when DwmAlign>0
     #
-    # vblank 경로의 약점은 앵커다: 어느 출력이 DWM 격자에 붙는지가 런마다 다르다
-    # (-PacingOutput doc 의 2026-10-26 실측). dwmquery 는 앵커가 옳은 대신 질의 지연이
-    # 틱 위상의 지터로 들어온다. 이 스위치는 ★둘 다 피한다★ -- DWM 의 클럭 자체가 깨운다.
+    # The vblank path's weakness is the anchor: which output attaches to the DWM grid varies
+    # run to run (the 2026-10-26 measurement in the -PacingOutput doc). dwmquery has the
+    # right anchor but the query latency enters as jitter in the tick phase. This switch
+    # **avoids both** -- the DWM clock itself does the waking.
     #
-    # 개발 장비 실측(2026-10-28 log_DwmClock/01, 단일 출력, -DwmAlign 8): 틱 위상 p50 은
-    # vblank 9.3% 대 dwmquery 9.5% 로 거의 같았지만(출력이 하나라 앵커가 일치한다)
-    # ★폭이 1.1 점 대 2.7 점★이었다. 그 2.5 배가 질의 지연의 지터다.
+    # Measured on the dev box (2026-10-28 log_DwmClock/01, single output, -DwmAlign 8): tick
+    # phase p50 was 9.3% for vblank against 9.5% for dwmquery -- nearly identical, since with
+    # one output the anchors agree -- but the **spread was 1.1 points against 2.7**. That 2.5x
+    # is the query latency's jitter.
     #
-    # ★Windows 11 build 22000+ 전용이다.★ 심볼을 런타임에 찾으므로 구버전에서도 실행은
-    # 되고, 없으면 매 회전이 타이머로 떨어진다. 엔진 로그의 바인딩 줄이 어느 쪽인지 찍는다:
-    #   wall: pacing clock: DComp 컴포지터 클럭 (DWM 전역, 출력 선택 없음) 59.94Hz 측정됨 -- ...
-    #   wall: pacing clock: ★DComp 컴포지터 클럭이 이 Windows 에 없다★ (build 22000+ 필요) -- ...
+    # **Windows 11 build 22000+ only.** The symbol is resolved at runtime, so older builds
+    # still run; without it every rotation falls back to the timer. The engine's binding line
+    # says which way it went:
+    #   wall: pacing clock: DComp compositor clock (DWM-global, no output selection) 59.94Hz measured -- ...
+    #   wall: pacing clock: **DComp compositor clock absent on this Windows** (needs build 22000+) -- ...
     #
-    # ★-DwmAlign 의 영점이 경로마다 다르다.★ 여기서는 컴포지터 틱이 0 이다. 다른 경로에서
-    # 찾은 최적값(8)이 그대로 옮겨오지 않으므로 ***다시 스윕해야 한다.*** -TickPhase 로
-    # 재면 된다.
+    # **-DwmAlign's zero point differs per path.** Here the compositor tick is 0. An optimum
+    # found on another path (8) does not carry over, so it ***must be swept again.*** Measure
+    # it with -TickPhase.
     [switch] $PacingCompositorClock,
-    # gfx_wall_frame_barrier=false: 벽 프레임 배리어를 끈다.
+    # gfx_wall_frame_barrier=false: turn the wall frame barrier off.
     #
-    # 배리어는 "한 논리 프레임을 전 타일이 함께 올린다" 를 지키는 소프트웨어 장치다
-    # (components/paint/paint.rs 의 WallFrameCoordinator). 끄면 둘이 사라진다:
-    #   - 어떤 타일도 "직전 프레임 유지" 지시를 받지 않는다(건너뛰기가 없어진다).
-    #   - 새 벽 프레임이 직전 것의 완료를 기다리지 않는다. 생산을 막는 것은
-    #     gfx_wall_frame_max_pending 하나만 남는다.
+    # The barrier is the software device that keeps "all tiles raise one logical frame
+    # together" (WallFrameCoordinator in components/paint/paint.rs). Turning it off removes
+    # two things:
+    #   - no tile is ever told to "keep the previous frame" (skips disappear).
+    #   - a new wall frame does not wait for the previous one to complete. The only brake
+    #     left on production is gfx_wall_frame_max_pending.
     #
-    # ★대가:★ 타일들이 서로 다른 논리 프레임을 동시에 보여 줄 수 있다. 가로로 흐르는
-    # 자막이 이음매를 지날 때 ***더 나쁘게*** 보일 수 있다. 그래서 A/B 용이다.
+    # **The cost:** tiles may show different logical frames at the same time. A caption
+    # scrolling horizontally can look ***worse*** crossing a seam. Hence: A/B only.
     [switch] $NoFrameBarrier,
-    # gfx_wall_tile_render_detached=true: 타일 렌더를 발사하고 기다리지 않는다.
+    # gfx_wall_tile_render_detached=true: fire the tile renders and do not wait.
     #
-    # 기본은 한 패스에서 타일 넷을 발사한 뒤 PaintTargetsInFlight::join() 으로 전부
-    # 기다린다. 켜면 결과 채널을 만들지 않으므로 그 join 이 빈 호출이 된다(큐 상한은
-    # gfx_painter_detached_queue_limit).
+    # By default a pass fires the four tiles and then waits for all of them via
+    # PaintTargetsInFlight::join(). With this on, no result channel is created, so that join
+    # becomes an empty call (the queue bound is gfx_painter_detached_queue_limit).
     #
-    # ★-DcompCommitInFrame 과 같이 써야 한다 -- 아래에서 강제한다.★ 그것이 없으면 커밋이
-    # 미뤄지고, 미뤄진 커밋을 흘리는 flush_deferred_dcomp_commits 가 타일의 end_frame 보다
-    # 먼저 돌아 그 패스의 커밋이 통째로 빠진다.
+    # **Must be used with -DcompCommitInFrame -- enforced below.** Without it the commit is
+    # deferred, and flush_deferred_dcomp_commits runs ahead of the tile's end_frame, so that
+    # pass loses its commit entirely.
     [switch] $DetachTileRender,
 
-    # gfx_wall_pacing_output: 페이싱 스레드가 WaitForVBlank 를 걸 출력을 이름으로 못 박는다.
-    # "" = primary(오늘 동작). "\.\DISPLAY22" 처럼 DXGI 출력 이름을 준다.
-    # ★왜★ 코드가 전제하던 "DWM 합성은 primary 의 vblank 에 물려 있다" 가 이 벽에서 깨졌다.
-    # 2026-10-26 같은 바이너리로 돈 네 런에서 DWM 격자에 붙은 출력이 런마다 달랐고, 어긋난
-    # 런은 커밋 위상 52% 에 dup 4.025%, 붙은 런은 0.902% 였다. 먼저 OUTPHASE 로 그 세션의
-    # vs_dwmvb_ms 가 0 인 출력을 확인한 뒤 출력마다 한 번씩 돌리면 인과가 증명된다.
-    # ★핀이 실제로 걸렸는지는 런처가 알 수 없다.★ 이름을 못 찾으면 엔진이 조용히
-    # primary 로 떨어지므로, 아래 배너의 pacing_output= 칸은 "넘겼다" 까지만 말한다.
-    # 판정은 엔진 로그의 한 줄이다(기동에 한 번, 토폴로지가 바뀔 때 다시):
-    #   wall: pacing vblank: \\.\DISPLAY1 (primary, 출력 1/4) 59.95Hz -- pin "\\.\DISPLAY22" 적용됨
-    # 찾지 못했으면 그 자리에 "★pin ... 을 찾지 못해 primary 로 떨어졌다★" 가 난다.
-    # (예전에 이 일을 하던 VBANCHOR 줄은 2026-10-27 계측 제거에서 없어졌다.)
+    # gfx_wall_pacing_output: name the output the pacing thread puts WaitForVBlank on.
+    # "" = primary (today's behaviour). Give a DXGI output name such as "\\.\DISPLAY22".
+    #
+    # **Why** the code assumed "DWM composition is tied to the primary's vblank", and this wall
+    # broke that. Across four runs of the same binary on 2026-10-26 the output attached to the
+    # DWM grid differed run to run, and a mismatched run sat at commit phase 52% with dup
+    # 4.025% against 0.902% for an attached one. Confirm with OUTPHASE which output has
+    # vs_dwmvb_ms = 0 in that session, then run once per output and the causation is proven.
+    #
+    # **The launcher cannot tell whether the pin actually took.** If the name is not found the
+    # engine falls back to primary silently, so the pacing_output= field in the banner below
+    # only says "it was passed". The verdict is one line in the engine log (once at startup,
+    # again when the topology changes):
+    #   wall: pacing vblank: \\.\DISPLAY1 (primary, output 1/4) 59.95Hz -- pin "\\.\DISPLAY22" applied
+    # If it was not found, that slot reads "**pin ... not found, fell back to primary**".
+    # (The VBANCHOR line that used to do this job went away in the 2026-10-27 strip.)
     [string] $PacingOutput = "",
-    # gfx_wall_tick_phase_probe: 페이싱 틱이 DWM 합성 격자의 어느 위상에 떨어지는지 센다.
+    # gfx_wall_tick_phase_probe: count which phase of the DWM composition grid the pacing
+    # tick lands on.
     #
-    # 저더를 정하는 변수는 커밋이 DWM 격자의 어느 위상에 떨어지느냐 하나인데
-    # (components/paint/commit_guard.rs 모듈 doc: 위상 13% -> 63% 에서 dup 6 -> 2146),
-    # 2026-10-27 계측 제거 이후 그것을 수치로 말할 수단이 없어졌다. 이 스위치가 최소한을
-    # 되살린다 -- 틱 위상 하나다.
+    # The one variable that decides judder is which phase of the DWM grid the COMMIT lands on
+    # (commit_guard.rs module doc: phase 13% -> 63% took dup from 6 to 2146), and since the
+    # 2026-10-27 instrumentation strip there has been no way to put a number on it. This
+    # switch brings back the minimum -- the tick phase alone.
     #
-    # 틱 경로에는 아무것도 들어가지 않는다: 페이싱 스레드는 QPC 하나를 고정 크기 링에
-    # 넣기만 하고(stderr 도 DWM 질의도 없다), 접는 일과 찍는 일은 메인이 한다.
-    # 꺼진 런의 비용은 0 이다.
+    # Nothing enters the tick path: the pacing thread only pushes one QPC value into a
+    # fixed-size ring (no stderr, no DWM query), and the folding and printing happen on main.
+    # A run with it off costs nothing.
     #
-    # ★10 초마다 누적 두 줄이 난다 -- 마지막 줄이 그 런의 답이다.★ 이 런은
-    # Stop-Process -Force 로 끝나므로(아래 -DurationSec 처리) 종료 훅으로는 아무것도
-    # 받을 수 없다. env_logger 는 stderr 를 버퍼 없이 쓰므로 강제 종료가 줄을 삼키지 않는다.
+    # **Two cumulative lines every 10 s -- the last one is that run's answer.** This run ends
+    # via Stop-Process -Force (see -DurationSec below), so an exit hook would receive
+    # nothing. env_logger writes stderr unbuffered, so a forced kill does not swallow a line.
     #
-    #   wall: tick phase [30s] p05/p50/p95 = 8.1/8.4/9.2 % 폭 1.1점 R=0.998 (n=1798, ...)
-    #   wall: tick gap   [30s] p05/p50/p95 = 0.99/1.00/1.01 주기 (n=1797, 1.5주기초과 0, ...)
+    #   wall: tick phase [30s] p05/p50/p95 = 8.1/8.4/9.2 % spread 1.1 pts R=0.998 (n=1798, ...)
+    #   wall: tick gap   [30s] p05/p50/p95 = 0.99/1.00/1.01 periods (n=1797, over 1.5p 0, ...)
     #
-    # 위상은 ***원형 변수***라 백분위를 원형 통계로 뽑는다. '폭' 은 회전한 좌표에서 잰
-    # p95-p05 라 0% 를 걸쳐도 감싸지 않고, R 은 집중도(1 = 한 점, 0 = 고르게 흩어짐)다.
-    # R 이 낮으면 p50 을 믿지 말 것.
+    # Phase is a ***circular*** variable, so the percentiles are circular statistics.
+    # 'spread' is p95-p05 measured in rotated coordinates, so it does not wrap when the data
+    # straddles 0%, and R is concentration (1 = one point, 0 = uniform). When R is low, do
+    # not trust p50.
     #
-    # ★자기 검증(타이머 경로 한정).★ -PacingDwmQuery 런은 snap_to_dwm_grid_at 이
-    # DWM 격자의 -DwmAlign % 지점을 겨냥해 자므로, phase p50 은 그 값보다 ***깨기 지연만큼
-    # 큰*** 값이어야 한다(수백µs~1ms = +2~6 점). 즉 -DwmAlign 8 이면 p50 은 10~14 쯤이고
-    # 폭은 좁아야 한다. -DwmAlign 이 0..99 밖이면 snap 이 정렬을 아예 안 하므로 이 검증은
-    # 성립하지 않는다.
+    # **Self-check (timer paths only).** A -PacingDwmQuery run has snap_to_dwm_grid_at sleeping
+    # toward the -DwmAlign % point of the DWM grid, so phase p50 must come out ***larger than
+    # that value by the wake latency*** (a few hundred us to 1 ms = +2 to +6 points). With
+    # -DwmAlign 8, p50 should be around 10-14 and the spread should be narrow. If -DwmAlign is
+    # outside 0..99 the snap does not align at all and this check does not apply.
     #
-    # ★vblank 경로에는 '나와야 할 값' 이 없다.★ p50 = (X + DwmAlign) mod 100 이고 X 는
-    # 그 출력의 vblank 와 DWM 격자의 위상차 -- 바로 우리가 재려는 미지수다(vs_dwmvb).
-    # -DwmAlign 0 이면 align_after_vblank 가 즉시 반환하므로 p50 이 곧 X 다.
+    # **The vblank path has no expected value.** There p50 = (X + DwmAlign) mod 100, where X is
+    # that output's phase offset between its vblank and the DWM grid -- precisely the unknown
+    # being measured (vs_dwmvb). With -DwmAlign 0, align_after_vblank returns immediately, so
+    # p50 is X itself.
     #
-    # 그리고 이 검증은 프로브와 snap 이 같은 DWM 앵커를 쓰므로 ***순환***이다 -- 프로브의
-    # 산술이 맞는지는 말해 주지만 DWM 격자 자체가 합성 마감과 맞는지는 말해 주지 않는다.
+    # And this check is ***circular***, because the probe and the snap use the same DWM anchor
+    # -- it tells you the probe's arithmetic is right, not that the DWM grid itself agrees
+    # with the composition deadline.
     [switch] $TickPhase,
-    # gfx_wall_single_publish_per_pass -- Renderer::update() 가 한 패스에 발행 하나만
-    # 소비하게 묶는다. 2026-11-02 에 기본 켜짐이 되었다(log_ani_shift_01/17: 네 타일 모두
-    # Reason cache flush 0.00, 육안 저더 소멸). 이 스위치는 끄는 쪽이다 -- 끄면 큐를 통째로
-    # 드레인하면서 앞 프레임을 그려 놓고 버린다(renderer/mod.rs:1082).
-    # 되돌려 비교할 때:
+    # gfx_wall_single_publish_per_pass -- hold Renderer::update() to consuming one publish
+    # per pass. On by default since 2026-11-02 (log_ani_shift_01/17: Reason cache flush 0.00
+    # on all four tiles, visible judder gone). This switch turns it OFF -- off drains the
+    # whole queue, drawing the earlier frames and then throwing them away
+    # (renderer/mod.rs:1082). To compare back:
     #   -ProfilerHud "FPS,Reason cache flush" -NoSinglePublishPerPass
     [switch] $NoSinglePublishPerPass,
-    # gfx_wall_arm_keep_previous_on_canvas_wait -- 캔버스 대기로 생산을 거절한 타일을
-    # 무장할지. 기본 켜짐(옛 동작): 셸이 그 타일의 렌더와 표출을 둘 다 건너뛴다. 끄면
-    # 렌더는 돌아서 paint 측 애니메이션이 전진한다 -- 단일 페인터 구성과 같은 동작이고,
-    # ticker+WebGL 에서 ticker 가 저더하는 현상의 후보 수정이다. KEEPPREV 계수기와 짝지어
-    # 볼 것:
+    # gfx_wall_arm_keep_previous_on_canvas_wait -- whether to arm a tile whose production was
+    # declined by a canvas wait. On by default (the old behaviour): the shell skips both the
+    # render and the present for that tile. Off lets the render run so the paint-side
+    # animation advances -- the same behaviour as a single-painter setup, and a candidate fix
+    # for the ticker juddering under ticker+WebGL. Read it with the KEEPPREV counters:
     #   -ProfilerHud "FPS" -TickPhase -NoArmOnCanvasWait
     [switch] $NoArmOnCanvasWait,
-    # gfx_wall_canvas_defeats_paint_side_throttle -- 캔버스가 살아서 그려지는 중이면 그
-    # WebView 를 paint 측으로 치지 않아, tick divisor 가 그 WebView 의 틱을 깎지 않는다.
-    # ticker + WebGL 을 함께 표출하면 ticker 가 OR 판정으로 WebGL 의 rAF 를 divisor 만큼
-    # 깎아서 둘 다 저더하는데(log_webgl_perf_01/01), 그 자리를 끊는다. 기본 꺼짐.
+    # gfx_wall_canvas_defeats_paint_side_throttle -- while a canvas is live and drawing, stop
+    # counting that WebView as paint-side, so the tick divisor does not cut its ticks.
+    # Showing a ticker and a WebGL canvas together used to make the ticker's OR verdict cut
+    # WebGL's rAF by the divisor, juddering both (log_webgl_perf_01/01); this breaks that
+    # link. Off by default.
     #   -CanvasDefeatsThrottle
-    # divisor 를 1 로 내리는 것과 비교할 것 -- 그쪽은 CSS/paint 측 페이지를 악화시킨다.
+    # Compare against lowering the divisor to 1 -- that makes CSS/paint-side pages worse.
     [switch] $CanvasDefeatsThrottle,
-    # gfx_wall_canvas_live_window_ms -- 위 스위치가 쓰는 "캔버스가 살아 있다" 의 창, ms.
-    # 기본 500. 실제 페이지에서 수정이 발동하지 않으면 이것을 늘려 본다 -- 판정은
-    # PAINTSIDE 줄의 stale_worst 이고, 창이 그 값보다 크면 신호가 꺼지지 않는다.
+    # gfx_wall_canvas_live_window_ms -- the window, in ms, that the switch above uses for
+    # "the canvas is live". Default 500. If the fix does not fire on a real page, try raising
+    # it -- the verdict is stale_worst on the PAINTSIDE line, and the signal stays on as long
+    # as the window is larger than that value.
     #   -CanvasDefeatsThrottle -CanvasLiveWindowMs 2000
     [int] $CanvasLiveWindowMs = 500,
-    # gfx_wall_live_canvas_tick_divisor -- paint 측 애니메이션과 살아 있는 캔버스가 함께
-    # 있을 때 쓰는 틱 약수. 기본 2(60Hz 에서 30/s). 1 은 리플로가 네 배가 되어 저더이고
-    # (log_webgl_perf_01/03) 기본 divisor 15 는 캔버스를 초당 네 번으로 굶는다. 콘텐츠의
-    # 자체 프레임률을 알면 거기 맞춘다 -- 실측된 WebGL 소스는 ?fps=30 이다.
+    # gfx_wall_live_canvas_tick_divisor -- the tick divisor used when a paint-side animation
+    # and a live canvas are on the page together. Default 2 (30/s at 60Hz). 1 quadruples
+    # reflow and judders (log_webgl_perf_01/03); the old default of 15 starves the canvas to
+    # four frames a second. If the content's own frame rate is known, match it -- the WebGL
+    # source measured here is ?fps=30.
     #   -CanvasDefeatsThrottle -LiveCanvasDivisor 2
     [int] $LiveCanvasDivisor = 2,
-    # gfx_wall_canvas_wait_declines_production -- 캔버스 이미지 대기가 틱 생산을 막는가.
-    # 2026-11-03 에 기본 꺼짐이 되었다(log_webgl_perf_01/08: 켜면 전환 후 저더 발생,
-    # 끄면 발생하지 않음. KEEPPREV canvas 196 -> 0). 이 스위치는 옛 동작으로 되돌리는
-    # 쪽이고, 켜면 캔버스 비트맵 한 장이 최신이 아닐 때 그 프레임의 다른 모든 것
-    # (ticker, 비디오)까지 같이 버린다.
+    # gfx_wall_canvas_wait_declines_production -- does waiting on a canvas image block tick
+    # production. Off by default since 2026-11-03 (log_webgl_perf_01/08: on gave judder after
+    # a transition, off did not; KEEPPREV canvas 196 -> 0). This switch restores the old
+    # behaviour, where one stale canvas bitmap also discards everything else in that frame
+    # (ticker, video).
     #   -CanvasWaitDecline
     [switch] $CanvasWaitDecline,
-    # gfx_wall_webgl_tile_scissor -- 백엔드마다 자기 타일 몫만 셰이딩하도록 WebGL 의
-    # default framebuffer 에 scissor 를 건다. 기본 꺼짐. 캔버스를 벽 전체로 확대했을 때
-    # 네 GPU 가 각각 전체를 그리고 75% 를 버리는 것을 막는다(log_webgl_perf_01/09).
-    # 캔버스 백킹이 가상 뷰포트 크기와 같을 때만 걸린다 -- 아니면 아무 일도 하지 않는다.
-    # readPixels/toDataURL/copyTexImage 를 쓰는 페이지에서는 켜지 말 것.
-    #   -WebglTileScissor
-    # gfx_webgl_nonblocking_front_buffer_lock -- painter 가 캔버스 스왑체인 뮤텍스에서
-    # 기다리지 않는다. 생산자가 그 뮤텍스를 들고 있으면(스왑/clear 중) 직전 프레임을 그대로
-    # 다시 보여주고 넘어간다. 기본 꺼짐.
-    #   판정 지표: 로그의 "STALECANVAS ... reused=N" -- 0 이면 뮤텍스 경합이 없다는 뜻이다.
+    # gfx_webgl_nonblocking_front_buffer_lock -- the painter does not wait on the canvas
+    # swap-chain mutex. If the producer holds it (mid swap/clear) the painter re-shows the
+    # previous frame and moves on. Off by default.
+    #   Verdict metric: "STALECANVAS ... reused=N" in the log -- 0 means no mutex contention.
     [switch] $NonblockingFrontBufferLock,
+    # gfx_wall_webgl_tile_scissor_from_webrender -- scissor each WebGL backend's default
+    # framebuffer down to the part of the canvas THAT BACKEND'S TILE ACTUALLY SHOWS, so the
+    # four GPUs stop each shading the whole canvas and discarding 75% of it
+    # (log_webgl_perf_01/09). Off by default.
+    #
+    # The rectangle comes from WebRender: during frame build each painter records the
+    # intersection of the canvas's destination box with its own tile
+    # (webrender::wall_canvas_rect), and the WebGL thread reads that back. So it works for
+    # ANY canvas size and position, including a canvas animating across the wall during a
+    # transition.
+    #
+    # **Seven flags collapsed into this one on 2026-11-10.** The removed ones derived the same
+    # rectangle from tile geometry instead, which required the canvas backing to match the
+    # virtual viewport EXACTLY -- and a transition canvas measured 11520x4321 against a
+    # 11520x4320 viewport, so 56 of 60 surfaces were skipped and the flag did nothing while
+    # appearing to be on (log_webgl_perf_01/25).
+    #
+    # Do not enable on a page using readPixels/toDataURL/copyTexImage: those read back the
+    # whole canvas, and outside the tile rect it was never drawn.
+    #   Verdict metric: the SCISSORGATE line -- applied%, and per-reason counts when it is not
+    #   applied (no_key / missing / stale / no_isect).
     [switch] $WebglTileScissorFromWebrender,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
@@ -492,9 +542,12 @@ param(
     # this switch. Wall tile windows ignore WM_CLOSE, so stop such a run with
     # `Stop-Process -Name winit_wall -Force`.
     [switch] $NoLog,
-    # ★낡음(2026-08-25 기록, 2026-08-31 `4ff3075ca97` 이후 무효)★ — 이 env 는 없다. 설정하면 기동이 막히고, 이 스위치는 `--pref gfx_video_immediate_composite_enabled=false` 를 보낸다.
-    # SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE=1: stop re-compositing the whole scene
-    # every time a video frame arrives.
+    # **Stale note (recorded 2026-08-25, void after `4ff3075ca97` on 2026-08-31)** -- that env
+    # var does not exist. Setting it blocks startup; this switch sends
+    # `--pref gfx_video_immediate_composite_enabled=false` instead.
+    #
+    # Historically SERVO_DISABLE_VIDEO_IMMEDIATE_COMPOSITE=1: stop re-compositing the whole
+    # scene every time a video frame arrives.
     #
     # By default painter.rs::update_images calls generate_frame(SCENE) on each video
     # arrival -- its own comment says it 're-renders the full current display list'
@@ -504,7 +557,7 @@ param(
     # 60Hz wall. With this set, video frames ride the script rendering-opportunity
     # cadence instead.
     #
-    # ★2026-08-31: the engine no longer offers that all-or-nothing choice.★ Video arrivals
+    # **2026-08-31: the engine no longer offers that all-or-nothing choice.** Video arrivals
     # still drive composites, but COALESCED to the gfx_refresh_hz cadence, so the request
     # rate is the paint cadence rather than the SUM of every video's frame rate. Both
     # extremes measured badly on the 4-GPU wall: per-arrival was 39.19 cores vs 22.72 with
@@ -515,11 +568,6 @@ param(
     # No-op: video-driven composites are the engine default again (coalesced). Kept so a
     # script that passes it keeps working and reads correctly.
     [switch] $ImmediateComposite,
-    # Canvas-ack deadlock reproduction. The bug it targets showed up once in 35 runs, so
-    # leaving verification to chance does not work: 12 clean runs after the fix logged zero
-    # WALLACKFLUSH, meaning the recovery never ran and those runs proved nothing.
-    # -CanvasAckSkip N makes each painter skip its first N ack sends exactly the way a closed
-    # gate would, which reproduces the deadlock on demand.
     # Give each wall tile its own thread so their renders overlap. Off by default: it changes
     # who owns the rendering context, so the serial path stays available for A/B and for
     # falling back if something regresses. Most of a pass is per-tile AcquireSync waiting,
@@ -527,6 +575,11 @@ param(
     # parallel_ceiling of 3.0-3.8x. Two paths cannot cross a thread yet (screenshots, the
     # memory report) and say so in the log rather than failing quietly.
     [switch] $ParallelTiles,
+    # Canvas-ack deadlock reproduction. The bug it targets showed up once in 35 runs, so
+    # leaving verification to chance does not work: 12 clean runs after the fix logged zero
+    # WALLACKFLUSH, meaning the recovery never ran and those runs proved nothing.
+    # -CanvasAckSkip N makes each painter skip its first N ack sends exactly the way a closed
+    # gate would, which reproduces the deadlock on demand.
     [int] $CanvasAckSkip = 0,
     # Turns the recovery off. Pair it with -CanvasAckSkip to show the injection really does
     # deadlock the wall -- without this control, a run that stays healthy cannot distinguish
@@ -550,22 +603,23 @@ param(
     # about 11ms to finish in. There is no added latency -- the commits still land in the same
     # pass, only later in it.
     #
-    # ★2026-10-28: 그 A/B 의 전제가 지금은 없다.★ 위 수치는 painter 넷이 ***메인
-    # 스레드에서 순차 실행***이던 때의 것이고 -- "다른 세 타일이 먼저 렌더하는 동안
-    # 11ms 를 번다" 가 바로 그 구조를 가리킨다 -- `-ParallelTiles` 가 그 전제를 없앴다.
-    # 타일마다 자기 스레드라 end_frame 도 그 스레드에서 돌고, Commit 은 그 타일의 렌더
-    # 직후에 나간다. 로컬(3840x1080 타일 하나)에서 돌린 A/B 에서는 이 스위치를 켜는 쪽이
-    # 이겼다 -- judder 가 "거의 관찰되지 않음"(육안, -DwmAlign 8 -PacingDwmQuery 와 같이).
-    # ★벽에서는 아직 재확인되지 않았다★ -- 거기는 디바이스가 넷이라 위상 이야기가 다르다.
+    # **2026-10-28: that A/B's premise no longer holds.** The numbers above date from when the
+    # four painters ran ***sequentially on the main thread*** -- "the other three tiles render
+    # first, which buys about 11ms" names exactly that structure -- and `-ParallelTiles`
+    # removed it. With a thread per tile, end_frame runs on that thread and the Commit goes
+    # out right after that tile's render. In a local A/B (one 3840x1080 tile) turning this
+    # switch ON won: judder "barely observable" by eye, alongside -DwmAlign 8
+    # -PacingDwmQuery. **Not re-confirmed on the wall** -- there are four devices there and the
+    # phase story differs.
     #
-    # ★반대 방향의 실측도 있다★(paint.rs 의 `flush_deferred_dcomp_commits` doc, 2026-10-23):
-    # 커밋을 패스 끝에서 내면 위상이 패스 길이를 물려받아 주기의 35~62% 에 흩어지고,
-    # 그 구간은 DWM 인테이크 마감 너머라 저더가 수십 배가 됐다. 타일 스레드에서 렌더
-    # 직후에 내는 것도 위상 성질은 같다 -- 위상이 렌더 시간을 따라다닌다. 틱 머리 커밋은
-    # 그와 달리 위상을 `-DwmAlign` 이 직접 정한다. 둘 중 어느 쪽이 이기는지는 구성별로
-    # 다를 수 있으므로, 기본값을 바꾸기 전에 벽에서 한 번 더 볼 것.
-    #
-    # Use this to get the old behaviour back if a run looks wrong.
+    # **There is also a measurement pointing the other way** (`flush_deferred_dcomp_commits`
+    # doc in paint.rs, 2026-10-23): issuing the commit at the end of the pass makes its phase
+    # inherit the pass length, scattering it across 35-62% of the period -- past the DWM
+    # intake deadline, where judder grew by tens of times. Issuing it on the tile thread
+    # right after the render has the same phase property: the phase follows render time. A
+    # commit at the head of the tick is different -- there `-DwmAlign` sets the phase
+    # directly. Which of the two wins may depend on the configuration, so look at the wall
+    # once more before changing the default.
     [switch] $DcompCommitInFrame,
     # gfx_webgl_swap_sync: settle the canvas's GPU work on the WebGL thread right after its
     # swap, instead of leaving it for the painter to trip over.
@@ -612,9 +666,11 @@ param(
     # A violation can be silent, so check the wall by eye, not only the numbers.
     [switch] $DcompParallelCommit,
     # gfx_dcomp_update_quantum_px: pin the BeginDraw update rect to a fixed grid so DComp is
-    # ★낡음(2026-10-20 기록, 같은 날 `b24687d184c` 이후 무효)★ — 기본은 `-1` 이다(:504, :510). "(default)" 만 죽었다.
-    # asked for ONE texture size instead of dozens. 0 = off (default), -1 = the whole tile,
+    # asked for ONE texture size instead of dozens. 0 = off, -1 = the whole tile,
     # >0 = round the rect's SIZE up to that many pixels.
+    #
+    # **Stale note (recorded 2026-10-20, void the same day after `b24687d184c`)** -- the
+    # default is `-1` (:504, :510). Only the "(default)" wording died.
     #
     # What this buys, measured 2026-10-20 (log_ani_debug_05\05 and \06): a Commit carrying
     # identical work -- one bind, one newly realized texture -- costs 0.39 ms on a page whose
@@ -646,64 +702,46 @@ param(
     # Timings stay recorded per tile, not per position, which is what makes the per-tile
     # averages in WALLPASS the answer.
     [switch] $RotateTileOrder,
-    # dom_animation_timeline_use_frame_time: 애니메이션의 기준 시각을 "script 가 도달한
-    # 순간" 대신 "그 프레임의 시각" 으로 쓴다. 엔진 기본은 켜짐이므로, 이 스위치는 끌 때
-    # 쓴다. 왜 필요한지는 설계 문서 50 과 2026-10-15 설계.
+    # dom_animation_timeline_use_frame_time: take an animation's reference time from "the
+    # time of that frame" instead of "the moment script got there". The engine default is
+    # ON, so this switch is for turning it OFF. For why it matters see design note 50 and
+    # the 2026-10-15 design.
     [ValidateSet("on", "off", "")]
     [string] $FrameTime = "",
-    # Pin the process to a NUMA node (= processor group) at creation, instead of letting
-    # Windows pick. -1 = let Windows pick (the old behaviour).
-    #
-    # ***THIS IS THE ONLY THING THAT HAS EVER SEPARATED A GOOD RUN FROM A BAD ONE.*** Measured
-    # 2026-08-26 over 22 runs of 45 videos with escape=external, across four different flag
-    # sets (-VideoEscapeProf on/off, -NoSyncGroup, -SinkQos on):
-    #
-    #   group 1 (18 runs): 27.7-28.8 presents/s, 0.64-0.65 ms per Present, decode 0.68-0.83
-    #   group 0 ( 4 runs): 4.2-5.4  presents/s, 2.7-3.3  ms per Present, decode 0.97-0.98
-    #
-    # No exceptions either way, and NOTHING ELSE correlates -- the sync group armed 45/45 in
-    # both, and neither removing the shared base time nor allowing frame drops prevented a
-    # collapse. Windows picks the group at process creation, so the same command lands in
-    # either state at random. Use this to stop rolling dice, and to prove the direction of
-    # causation: if -NumaNode 0 collapses every time and -NumaNode 1 never does, it is the
-    # placement, not the run.
-    #
-    # Launching has to go through `cmd /c start /NODE`, which is the only way to ask for a
-    # node at creation. That in turn needs a temp .cmd wrapper so the stderr redirect belongs
-    # to winit_wall and not to cmd, and the PID has to be found by name afterwards.
-    # "auto" (default) = pin to the NUMA node the display adapters are on, derived at launch.
-    # "off" = let Windows pick, the pre-2026-08-26 behaviour. A number forces that node.
-    #
-    # ★★2026-10-22 정정: 이 박스의 GPU 는 더 이상 한 노드에 있지 않다.★★ 2026-10-19 에
-    # 고장으로 ***메인보드를 교체***했고, 교체된 보드는 네 장을 두 노드에 갈라 붙인다
-    # (2026-10-22 측정. 쓴 도구 `tools\probe_machine_topology.ps1` 은
-    # 2026-10-27 계측 제거에서 함께 삭제했다 -- 아래 표가 그 산출물이다):
+    # ***2026-10-22 correction: the GPUs in this box are no longer on one node.*** The
+    # mainboard was ***replaced*** after a failure on 2026-10-19, and the replacement splits
+    # the four cards across two nodes (measured 2026-10-22; the tool used,
+    # `tools\probe_machine_topology.ps1`, was deleted along with the 2026-10-27
+    # instrumentation strip -- the table below is its output):
     #
     #   RX 580  PCI bus 134 -> NUMA node 1
     #   RX 580  PCI bus 175 -> NUMA node 1
     #   RX 580  PCI bus  24 -> NUMA node 0
     #   RX 580  PCI bus  59 -> NUMA node 0
     #
-    # ★그래서 옳은 `-NumaNode` 값이 존재하지 않는다.★ 어느 노드를 고르든 타일 넷 중 ***둘***이
-    # 먼 노드에 남는다. 실측(2026-10-22, wall_anim_jitter_probe, 120 초, COMPREFRESH 의
-    # 중복 프레임 비율 -- 최악 패널):
+    # **So there is no correct `-NumaNode` value any more.** Whichever node you pick, ***two***
+    # of the four tiles stay on the far one. Measured 2026-10-22 (wall_anim_jitter_probe,
+    # 120 s, duplicate-frame share from COMPREFRESH -- worst panel):
     #
-    #   -NumaNode auto (안 고정)  0.15% / 0.39%        <- 제일 낫다
+    #   -NumaNode auto (no pin)   0.15% / 0.39%        <- best
     #   -NumaNode 1               1.00% / 1.29%
-    #   -NumaNode 0               0.02% / 2.23%        <- 같은 명령이 양쪽 끝을 냈다
+    #   -NumaNode 0               0.02% / 2.23%        <- the same command gave both extremes
     #
-    # 고정한 두 arm 은 결함이 ***런 전 구간에 균일***했고(1 초 창의 91% 에 결함), 안 고정한
-    # arm 은 몇 창에만 몰렸다. 즉 기동 시 어디에 앉느냐가 런 전체를 결정한다.
+    # The two pinned arms were ***uniformly*** defective across the whole run (a defect in
+    # 91% of 1-second windows) while the unpinned arm clustered it into a few windows. In
+    # other words, where it lands at startup decides the entire run.
     #
-    # ★아래 2026-08-26 기록은 **교체 전 보드**의 것이다.★ 그 보드는 네 장이 전부 node 1
-    # 이었고, 그때는 `-NumaNode 1` 이 옳았다. 수치는 그 시절 벽을 해석할 때만 쓸 것:
+    # **The 2026-08-26 record below belongs to the PRE-REPLACEMENT board.** There all four
+    # cards were on node 1 and `-NumaNode 1` was right. Use those numbers only when
+    # interpreting walls from that era:
     #
-    #   node 1 (그때 GPU 들의 노드): 23-29.5 video fps, 0.65-0.73 ms per Present, dwm 0.09-0.11
-    #   node 0 (먼 소켓)           :  6.0     video fps, 2.9-3.0  ms per Present, dwm 0.64-0.66
+    #   node 1 (the GPUs' node then): 23-29.5 video fps, 0.65-0.73 ms per Present, dwm 0.09-0.11
+    #   node 0 (far socket)         :  6.0     video fps, 2.9-3.0  ms per Present, dwm 0.64-0.66
     #
-    # 먼 노드에서는 업로드와 present 가 전부 소켓 간 링크를 건넌다. 용량 문제가 아니다 --
-    # 무너진 런들도 80 코어 중 31 개가 놀고 있었다. 지금 보드에서 이 기전을 없애려면
-    # ***프로세스 전체 고정이 아니라 타일별 스레드 배치***가 필요하고, 그건 아직 없다.
+    # On the far node every upload and present crosses the inter-socket link. It is not a
+    # capacity problem -- even the collapsed runs left 31 of 80 cores idle. Removing the
+    # mechanism on the current board needs ***per-tile thread placement, not whole-process
+    # pinning***, and that does not exist yet.
     [string] $NumaNode = "auto",
     # Hard-confine the wall to its processor group, on top of the node PREFERENCE that
     # `start /NODE` gives. Off by default until measured on the wall itself.
@@ -799,18 +837,20 @@ if ($DcompUpdateQuantum -lt -1) {
 # only value that reaches here with alignment off is -1 -- but spelling the upper bound out keeps
 # this guard honest if that ValidateRange is ever widened, rather than throwing for a combination
 # that is not actually live.
-# -SampleLead 는 애니메이션을 DWM 합성 격자 위에서 샘플한다. 그런데 렌더 틱이 자유 실행이면
-# (=-DwmAlign 없음) 렌더와 격자가 서서히 미끄러져, 가끔 두 렌더가 같은 격자점에 걸린다. 그
-# 프레임은 변위가 0 이고 다음 프레임이 두 칸을 뛴다 -- 고치려던 저더보다 나쁘다. 실측으로
-# 겪은 실패다(출력별 격자로 같은 일을 했을 때 ANIMSTEP p05 가 35.0 에서 29.3 으로 떨어졌다).
-# throw 하지 않는 이유: 둘을 따로 재보는 것 자체가 유효한 실험이다. 다만 조용히 나빠지게
-# 두지는 않는다.
+# -SampleLead samples the animation on the DWM composition grid. But if the render tick
+# free-runs (= no -DwmAlign), render and grid drift against each other and now and then
+# two renders land on the same grid point: that frame has zero displacement and the next
+# one jumps two steps -- worse than the judder being fixed. This was measured, not
+# guessed (doing the same thing on per-output grids took ANIMSTEP p05 from 35.0 to 29.3).
+# Not a throw, because measuring the two separately is itself a valid experiment -- but it
+# will not be allowed to get quietly worse.
 if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
 }
 
-# -DetachTileRender 는 커밋이 미뤄지지 않을 때만 성립한다. 미뤄지면 flush 가 타일의
-# end_frame 보다 먼저 돌아 그 패스의 커밋이 빠진다 -- 조용히 프레임을 잃는 종류라 throw 한다.
+# -DetachTileRender only holds when the Commit is not deferred. If it is, the flush runs
+# ahead of the tile's end_frame and that pass loses its commit -- a silently dropped
+# frame, so this throws.
 if ($DetachTileRender -and -not $DcompCommitInFrame) {
     throw "-DetachTileRender requires -DcompCommitInFrame: without it the deferred-commit flush runs before the tile threads finish end_frame, so that pass's commits are lost."
 }
@@ -818,7 +858,8 @@ if (($NoFrameBarrier -or $DetachTileRender) -and -not $ParallelTiles) {
     Write-Warning "-NoFrameBarrier/-DetachTileRender without -ParallelTiles: both only change behaviour when tiles render on their own threads. They will do nothing here."
 }
 
-# 페이싱 클럭은 하나만 고른다. 둘을 같이 주면 어느 쪽이 돌았는지 로그로도 가릴 수 없다.
+# Pick exactly one pacing clock. Passing both leaves no way, even in the log, to tell
+# which one ran.
 if ($PacingDwmQuery -and $PacingCompositorClock) {
     throw "-PacingDwmQuery and -PacingCompositorClock select different pacing clocks; pass at most one."
 }
@@ -829,12 +870,12 @@ if ($PacingOutput -ne "" -and $PacingCompositorClock) {
     Write-Warning "-PacingOutput $PacingOutput with -PacingCompositorClock: the compositor clock is a single desktop-wide signal with no output parameter, so the pin selects nothing. Drop -PacingCompositorClock to pin an output."
 }
 
-# -PacingOutput 은 ***vblank 경로에서만*** 읽힌다. 엔진에서 그 pref 를 보는 자리는
-# output_grid.rs 의 VblankSource 하나고, 그 구조체는 WaitForVBlank 경로에만 살아 있다.
-# -PacingThread 가 없으면 스레드 자체가 없고, -PacingDwmQuery 가 있으면 그 스레드가
-# DwmGetCompositionTimingInfo 를 묻는다 -- 둘 다 핀은 그저 무시된다.
-# throw 하지 않는 이유: 스윕 스크립트가 -PacingOutput 을 고정해 두고 나머지를 토글하는
-# 것은 정당한 사용이고, 이제는 엔진이 어느 출력에 묶였는지를 직접 찍는다(위 참조).
+# -PacingOutput is read ***only on the vblank path***. The one place the engine reads that
+# pref is VblankSource in output_grid.rs, and that struct only exists on the WaitForVBlank
+# path. Without -PacingThread there is no thread at all, and with -PacingDwmQuery that
+# thread queries DwmGetCompositionTimingInfo instead -- either way the pin is ignored.
+# Not a throw: a sweep script that pins -PacingOutput and toggles the rest is legitimate,
+# and the engine now logs which output it actually bound to (see above).
 if ($PacingOutput -ne "" -and -not $PacingThread) {
     Write-Warning "-PacingOutput $PacingOutput without -PacingThread: the pin is read only by the pacing thread's vblank source, and that thread is not running. The pin will be ignored."
 }
@@ -895,22 +936,23 @@ if ($NoLog -and $LogPath -ne "") {
 if ($NoLog)           { $LogPath = "NUL" }
 elseif ($LogPath -eq "") { $LogPath = Join-Path $here ("wall_{0}.err.log" -f (Get-Date -Format "yyyyMMdd_HHmmss")) }
 
-# ★여기서 절대 경로로 굳힌다.★ 아래에서 이 값을 쓰는 네 곳이 상대 경로를 ***서로 다르게***
-# 푼다:
-#   - `cmd ... 2> "$LogPath"`  -> cmd 의 현재 디렉터리
-#   - `Start-Process -RedirectStandardError` -> ***.NET 프로세스의 CWD***. PowerShell 의
-#     현재 위치가 아니고, 같은 줄의 `-WorkingDirectory` 도 아니다.
-#   - `Test-Path` / `Select-String -Path` -> PowerShell 의 현재 위치
-# 셋이 어긋나면 로그는 엉뚱한 데 쓰이고 분석은 "파일 없음" 으로 조용히 건너뛴다.
+# Freeze this to an absolute path HERE. The four places below that use it resolve a
+# relative path ***differently***:
+#   - `cmd ... 2> "$LogPath"`  -> cmd's current directory
+#   - `Start-Process -RedirectStandardError` -> the ***.NET process CWD***, which is
+#     neither PowerShell's current location nor the `-WorkingDirectory` on the same line.
+#   - `Test-Path` / `Select-String -Path` -> PowerShell's current location
+# When those disagree the log is written somewhere else and the analysis skips with a
+# silent "file not found".
 #
-# 그리고 ***부모 디렉터리를 만들어 준다.*** `2>` 도 `-RedirectStandardError` 도 없는
-# 디렉터리를 만들지 않는다 -- `-LogPath ..\logs\run.err.log` 는 그래서 실패한다.
-# dist 폴더는 `make_wall_dist.ps1 -Force` 가 통째로 다시 만들므로, 로그를 보존하려면
-# ***dist 바깥***에 두어야 한다. 이 두 줄이 그것을 가능하게 한다.
+# It also ***creates the parent directory***, because neither `2>` nor
+# -RedirectStandardError will -- which is why `-LogPath ..\logs\run.err.log` used to
+# fail. `make_wall_dist.ps1 -Force` rebuilds the dist folder wholesale, so logs you want
+# to keep belong ***outside*** it; these two lines are what makes that possible.
 if ($LogPath -ne "NUL") {
-    # `[IO.Path]::GetFullPath` 를 홀로 쓰면 안 된다 -- Windows PowerShell 5.1 에서 그것은
-    # PowerShell 의 현재 위치가 아니라 ***프로세스의 CWD*** 를 기준으로 푼다. 사용자가
-    # 친 상대 경로는 자기가 서 있는 곳 기준이므로 `$PWD` 와 명시적으로 합친다.
+    # Do not use `[IO.Path]::GetFullPath` on its own -- on Windows PowerShell 5.1 it
+    # resolves against the ***process CWD***, not PowerShell's current location. A relative
+    # path the user typed is relative to where they stand, so combine with `$PWD` explicitly.
     $LogPath = [IO.Path]::GetFullPath([IO.Path]::Combine($PWD.Path, $LogPath))
     $logDir = Split-Path -Parent $LogPath
     if ($logDir -and -not (Test-Path $logDir)) {
@@ -930,25 +972,28 @@ if ($NoCanvasAckRecovery)  { $env:SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY = "1" }
 $env:GST_PLUGIN_PATH            = ""
 $env:GST_PLUGIN_SYSTEM_PATH_1_0 = ""
 $env:PATH = "$engine;$env:PATH"
-# ***RUST_LOG 은 여기서 고정한다.*** 셸에 무엇이 세워져 있든 런마다 같은 필터로 돌아야
-# 로그가 서로 비교된다. 기본은 `warn` 하나다.
+# ***RUST_LOG is pinned here.*** Whatever the shell has set, every run must use the same
+# filter or the logs cannot be compared. The default is a bare `warn`.
 #
-# ★진단 런은 `-RustLog` 로 명시한다★ -- 셸 env 는 여전히 쓰지 않는다(그것이
-# `-KeepRustLog` 가 제거된 이유다). 명령에 적힌 값이라 console.txt 와 배너에 남는다.
+# Diagnostic runs state it with `-RustLog` -- the shell env is still never used (that is
+# why `-KeepRustLog` was removed). Being on the command line, the value lands in
+# console.txt and in the banner.
 $env:RUST_LOG = if ($RustLog.Trim() -ne "") { $RustLog.Trim() } else { "warn" }
-# 아래 검사기가 보는 것은 바로 위 줄이 ***만든 유효 값***이다 -- 손편집이든 `-RustLog` 든
-# 같은 검사를 지난다. 아래 사고가 난 자리가 정확히 이 필터다.
-# ***RUST_LOG 의 알 수 없는 맨 토큰은 로그를 끄지 않는다 -- 상한을 Trace 로 올린다.***
-# env_filter 는 레벨로 파싱되지 않는 맨 토큰을 `(LevelFilter::Trace, <모듈이름>)` 디렉티브로
-# 바꾸고(parser.rs), Filter::filter() 가 디렉티브 레벨의 ***최대값***을 돌려주며(filter.rs),
-# components/servo/servo.rs 의 setup_logging 이 그 값을 그대로 log::set_max_level 에 넣는다.
-# 그래서 `RUST_LOG=critical` 은 "critical 이상만" 이 아니라 "전부 통과" 가 된다. 출력은
-# (critical 로 시작하는 타깃이 없으니) 0 줄인데, 핫 루프의 trace!/debug! 는 매번 Record 를
-# 만들고 로거 둘로 디스패치된다 -- 조용해지는 게 아니라 일이 늘어난다.
+# What the checker below sees is the EFFECTIVE value the line above just built -- a
+# hand-edit and a `-RustLog` go through the same check. The accident described next
+# happened in exactly this filter.
+# ***An unknown bare token in RUST_LOG does not quiet the log -- it raises the cap to
+# Trace.*** env_filter turns a bare token that does not parse as a level into a
+# `(LevelFilter::Trace, <module name>)` directive (parser.rs), Filter::filter() returns
+# the MAXIMUM directive level (filter.rs), and setup_logging in components/servo/servo.rs
+# feeds that straight to log::set_max_level. So `RUST_LOG=critical` means "everything
+# passes", not "critical and above". Output is zero lines (no target starts with
+# critical), but trace!/debug! in hot loops now build a Record and dispatch it to two
+# loggers every time -- more work, not less.
 #
-# 2026-10-27 에 이것으로 A/B 한 바퀴를 날렸다: `RUST_LOG=critical` 을 "로그 최소화" 로
-# 읽었는데 실제로는 max_level 을 Info 에서 Trace 로 올린 구성이었다.
-# 배너에 RUST_LOG=critical 이 그대로 찍혀서 아무도 눈치채지 못했다. 조용히 넘기지 말 것.
+# This cost a full A/B round on 2026-10-27: `RUST_LOG=critical` was read as "minimise
+# logging" when it actually raised max_level from Info to Trace, and the banner printed
+# RUST_LOG=critical so nobody caught it. Do not wave the warning away.
 $rustLogLevels = @("off", "error", "warn", "info", "debug", "trace")
 foreach ($directive in ($env:RUST_LOG -split "," | Where-Object { $_.Trim() -ne "" })) {
     $hasTarget = $directive -match "="
@@ -1052,16 +1097,16 @@ $argList += $Url
 
 Write-Host "Wall (pref-era) -- $tiles tiles requested by the page grid"
 Write-Host "  layout=$layout"
-# ★어느 배포본이 돌았는지 로그에 남긴다.★ 이게 없어서 2026-09-17 에 오래된 exe 와
-# 오래된 스크립트로 각각 네 번씩 돌린 것을 나중에야 알았다. console.txt 만 보면
-# 확정되도록 설정 요약 바로 위에 찍는다.
+# Record WHICH dist actually ran. Without this line, four runs on a stale exe and four
+# more on a stale script (2026-09-17) were only noticed afterwards. Printed right above
+# the settings banner so console.txt alone settles it.
 $buildStamp = Join-Path $PSScriptRoot "BUILD.txt"
 if (Test-Path $buildStamp) {
     Write-Host "  build: $((Get-Content $buildStamp) -join ' | ')"
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) webgl_tile_scissor=$($WebglTileScissor.IsPresent) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) nonblock_lock=$($NonblockingFrontBufferLock.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) nonblock_lock=$($NonblockingFrontBufferLock.IsPresent) frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
@@ -1115,16 +1160,15 @@ if ($NumaNode -eq "auto") {
     throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
 }
 
-# ***cmd 래퍼로만 띄운다 -- NUMA 핀이 없어도.*** 핀 때문이 아니라 ***stderr 때문***이다:
-# cmd 의 `2>` 는 자식에게 파일 핸들을 그대로 물려주는데, Start-Process -RedirectStandardError
-# 는 파이프를 끼우고 PowerShell 이 퍼낸다. 쓰기당 7.1 us 대 127.4 us, 최악 0.9 ms 대 25.4 ms.
-# env_logger 는 레코드마다 write+flush 를 하므로 그 차이는 로그를 부른 스레드가 그대로 문다.
-# Quote EVERY argument: the page URL carries `?rows=5&cols=9`, and a bare `&` inside a
-# .cmd is a command separator, so an unquoted URL silently truncates the run.
+# ***Always launch through the cmd wrapper, pin or no pin.*** The reason is stderr, not
+# the pin: cmd's `2>` hands the child a plain file handle, while Start-Process
+# -RedirectStandardError inserts a pipe that PowerShell has to drain. 7.1 us per write
+# against 127.4 us, worst case 0.9 ms against 25.4 ms. env_logger does a write+flush per
+# record, so that difference is paid by whichever thread called the log macro.
 $argStr = ($argList | ForEach-Object { '"' + $_ + '"' }) -join ' '
 $cmdFile = Join-Path $env:TEMP ("wall_numa_{0}_{1}.cmd" -f $PID, $numaResolved)
-# 핀이 없으면 /NODE 를 아예 빼고, 있으면 그 자리에 둔다. 공백 하나까지 중요하다 --
-# `start "" /B` 와 `start "" /NODE 1 /B` 가 같은 줄에서 나와야 한다.
+# With no pin, /NODE is left out entirely; with one, it goes in that slot. Every space
+# matters -- `start "" /B` and `start "" /NODE 1 /B` have to come out of the same line.
 $nodeArg = if ($numaResolved -ge 0) { "/NODE $numaResolved " } else { "" }
 # ***`start /NODE` has to be the thing that launches winit_wall itself.*** The first cut of
 # this put /NODE on the wrapper cmd.exe and let THAT spawn the exe -- a child inherits no
