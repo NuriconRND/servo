@@ -237,6 +237,21 @@ fn note_canvas_rect_lag(
     );
 }
 
+/// swap/clear 실패를 센다. ★처음 몇 번은 전문을, 그 뒤는 누적만 찍는다.★
+///
+/// 예전에는 이 실패가 `.unwrap()` 으로 ***스레드를 죽였다***. 죽는 대신 넘어가게 바꿨으므로
+/// ***실패가 조용해지지 않게*** 세어 둔다 -- 그래야 "표출이 멈췄다" 를 다음에 이 수치로
+/// 설명할 수 있다. 자세한 근거는 호출처 주석에 있다.
+fn note_swap_failure(surface_id: WebGLSurfaceId, what: &str, error: &str) {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 {
+        warn!("SWAPFAIL #{n} {what} failed for {surface_id:?}: {error}");
+    } else if n % 100 == 0 {
+        warn!("SWAPFAIL total={n} (last: {what} for {surface_id:?})");
+    }
+}
+
 /// 두 사각형 출처를 1 초에 한 줄 나란히 찍는다.
 ///
 /// ★이것이 매핑 검증이다.★ 정지 상태에서는 WR 이 적은 값과 타일 기하에서 유도한 값이
@@ -2059,17 +2074,37 @@ impl WebGLThread {
                     .expect("Where's the swap chain?");
 
                 debug!("Swapping {:?}", surface_id);
-                swap_chain
-                    .swap_buffers(
-                        &data.device,
-                        &mut data.ctx,
-                        if data.attributes.preserve_drawing_buffer {
-                            PreserveBuffer::Yes(&data.gl)
-                        } else {
-                            PreserveBuffer::No
-                        },
-                    )
-                    .unwrap();
+                // ★swap 실패가 스레드를 죽이지 않게 한다.★
+                //
+                // 여기는 `.unwrap()` 이었다. `swap_buffers` 안에서 실패할 수 있는 것은
+                // `device.create_surface`(재활용분이 없을 때 새로 만든다, chains.rs:164-180),
+                // `bind_surface_to_context`, `validate_context` 다. 그중 하나라도 Err 이면
+                // ★WebGL 스레드가 패닉으로 죽고, 그 뒤 페이지의 모든 WebGL 질의가 응답을
+                // 받지 못해 script 스레드까지 죽는다★ -- 운영자가 본 "WebGL 컨텐츠 전환 중
+                // 표출 소실 및 제어 불능" 의 한 경로다(2026-11-10, log_webgl_perf_01/22:
+                // "사실 해소 안 됐는데 이전 실행에서 걸리지 않았을 뿐").
+                //
+                // ★서피스 증식 가설은 반증됐다★: 같은 런의 `SURFIMPORT surfaces_live` 는
+                // 16 -> 20 -> 26 -> 27 -> 16 -> 24 -> 27 -> 15 로 14~28 사이에서 안정하고
+                // `created` 141 에 `destroyed` 116 이 따라온다. 즉 VRAM 고갈로 단정할 수
+                // 없다. 그래도 실패가 ***복구 불가***라는 사실은 남으므로, 실패를 삼키지
+                // 않고 ***그 프레임만 건너뛴다***.
+                //
+                // 이 프레임을 건너뛰면 painter 는 직전 front buffer 를 계속 표출한다
+                // (`take_surface` 가 `recycled` 로 떨어진다, chains.rs:317-321) -- 캔버스가
+                // 한 프레임 멈추는 것이고, 스레드가 죽는 것과는 비교가 되지 않는다.
+                if let Err(error) = swap_chain.swap_buffers(
+                    &data.device,
+                    &mut data.ctx,
+                    if data.attributes.preserve_drawing_buffer {
+                        PreserveBuffer::Yes(&data.gl)
+                    } else {
+                        PreserveBuffer::No
+                    },
+                ) {
+                    note_swap_failure(surface_id, "swap_buffers", &format!("{error:?}"));
+                    continue;
+                }
                 debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 
                 if !data.attributes.preserve_drawing_buffer {
@@ -2087,15 +2122,18 @@ impl WebGLThread {
                     // 지우는 영역과 그리는 영역이 정확히 같고, 둘이 어긋날 수 없다.
                     let clear_scissor = want_clear_scissor
                         .filter(|_| servo_config::pref!(gfx_wall_webgl_tile_scissor_clear));
-                    swap_chain
-                        .clear_surface(
-                            &data.device,
-                            &mut data.ctx,
-                            &data.gl,
-                            clear_color,
-                            clear_scissor,
-                        )
-                        .unwrap();
+                    // ★clear 실패도 삼키지 않고 넘어간다.★ 근거는 위 `swap_buffers` 의
+                    // 주석과 같다 -- 지우지 못한 프레임은 묵은 그림이 남을 뿐이고, 스레드가
+                    // 죽는 것과는 비교가 되지 않는다.
+                    if let Err(error) = swap_chain.clear_surface(
+                        &data.device,
+                        &mut data.ctx,
+                        &data.gl,
+                        clear_color,
+                        clear_scissor,
+                    ) {
+                        note_swap_failure(surface_id, "clear_surface", &format!("{error:?}"));
+                    }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
                 }
 
