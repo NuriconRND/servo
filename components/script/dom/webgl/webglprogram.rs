@@ -7,6 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use dom_struct::dom_struct;
+use log::warn;
 use script_bindings::cell::{DomRefCell, Ref};
 use script_bindings::reflector::reflect_dom_object;
 use script_bindings::weakref::WeakRef;
@@ -574,7 +575,17 @@ impl WebGLProgram {
             name.into(),
             sender,
         ));
-        let location = receiver.recv().unwrap();
+        // ★안전망★: 응답이 오지 않으면 패닉 대신 `None` 이다. 표준도 잃은 컨텍스트의
+        // `getUniformLocation` 은 `null` 이므로 그것이 맞는 값이다.
+        //
+        // 이 줄이 운영자가 실제로 겪은 유일한 패닉 자리다(`Disconnected`,
+        // log_webgl_perf_01/18·19·22·23·24). 보내는 쪽은
+        // `WebGLRenderingContext::send_with_fallibility` 에서 고쳤지만, 질의가 응답 없이
+        // 끝나는 길이 또 있을 수 있으므로 ***받는 쪽도 패닉하지 않게*** 둔다.
+        let Ok(location) = receiver.recv() else {
+            warn!("getUniformLocation: no reply (context released); returning null");
+            return Ok(None);
+        };
         let context_id = self.upcast().context_id();
 
         Ok(Some(WebGLUniformLocation::new(

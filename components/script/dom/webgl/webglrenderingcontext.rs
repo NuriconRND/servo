@@ -650,9 +650,27 @@ impl WebGLRenderingContext {
 
     #[inline]
     pub(crate) fn send_with_fallibility(&self, command: WebGLCommand, fallibility: Operation) {
-        // 자원을 놓아 둔 동안의 명령은 보내지 않는다 — 받을 백엔드가 없다. 표준도 잃은
-        // 컨텍스트에서는 호출이 아무 일도 하지 않게 정한다.
-        if self.context_lost.get() {
+        // ★영구 해제된 컨텍스트에만 보내지 않는다.★
+        //
+        // 여기는 `if self.context_lost.get() { return }` 이었다. 그런데 이 포크에서
+        // `context_lost` 는 ***일시적***이다 -- idle reclaim 이 백엔드를 놓으면 `Lost` 를
+        // 통보하고(`:504` 가 `Lost`/`Restored` 로 왕복한다), 페이지가 다시 쓰면 엔진이
+        // 되살린다. 반면 `removed` 는 영구다(`release_gpu_resources`).
+        //
+        // 그 구분을 하지 않아서, ***일시적 Lost 구간에 들어온 질의가 영구히 버려졌다.***
+        // 질의 커맨드는 응답 sender 를 품고 있으므로 버리면 sender 가 드롭되고, 호출자의
+        // `receiver.recv().unwrap()` 이 `Disconnected` 로 패닉한다 -- script 스레드가 죽으면
+        // ***어떤 명령도 듣지 않는다***. 운영자가 본 "WebGL 컨텐츠 전환 중 표출 중단 및
+        // 제어 불가" 가 그것이다(2026-11-10, log_webgl_perf_01/22~24).
+        //
+        // ★엔진 쪽을 세 번 고쳤는데 그 계측이 모두 0 건이었던 이유가 이것이다★ --
+        // b4b73f6479d(primary/all-backends 경로), 293b5a2efcb(swap 실패),
+        // 61c1f98d707(contexts 어긋남). 드롭은 그보다 앞, ***스크립트 안***에서 일어났다.
+        //
+        // 일시적 Lost 중에 보내면 엔진이 `restore_context_backends` 로 되살린다
+        // (`webgl_thread.rs`, 위 세 커밋이 그 복구를 넣었다). 질의가 왔다는 것은 페이지가 그
+        // 캔버스를 쓰고 있다는 뜻이므로 되살리는 것이 맞다.
+        if self.droppable.removed.get() {
             return;
         }
         let result = self
