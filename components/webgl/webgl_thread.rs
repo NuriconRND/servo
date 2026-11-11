@@ -207,25 +207,31 @@ const SWAP_TO_COMPOSITE_MS: u64 = 17;
 /// 가 쓸 샘플을 못 찾아 `rect` 로 폴백하면 그것은 ★`lead 0` 과 같은 상태★ 이고 구조적으로
 /// 한 프레임 부족하다. 그 폴백이 전환 시작에 몰리는지가 이 축의 남은 질문이다.
 ///
-/// 이유가 둘이라 구별한다.
+/// 이유가 셋이라 구별한다.
 ///
-/// * ★`empty`★ -- 표가 비었다. 애니메이션이 막 설치되어 painter 가 아직 그것을 보지 못한
-///   프레임이 후보다.
-/// * ★`drift`★ -- 표는 있는데 구간이 표를 벗어났다. 창이 모자라거나 `age` 가 커진 경우다.
+/// * ★`empty`★ -- 표가 비었다. 41 번 실기에서 ***0*** 이었다 -- "애니메이션이 막 설치되어
+///   painter 가 아직 보지 못한 프레임" 이라는 내 가설은 기각됐다.
+/// * ★`one`★ -- 표에 `offset 0` 한 칸뿐이고 `age > 0` 이라 그 칸이 구간 밖이다. 애니메이션이
+///   없는 ***평상시 동작***이고 폴백도 올바르다(움직이지 않으니 오늘 사각형이 맞다). 41 번의
+///   `drift 661~1184` 가 `applied ~900` 과 비슷했던 것이 이 경우였다 -- 앞 판은 둘을 섞어
+///   ***해석할 수 없는 수치***를 냈다.
+/// * ★`drift`★ -- 표에 여러 칸이 있는데도 구간이 벗어났다. ***이것만이 이상 신호다*** --
+///   창이 모자라거나 `age` 가 커진 경우다.
 ///
 /// ## 비용
 ///
 /// 폴백이 난 프레임에만 ***원자 하나***다. 정상 상태에서는 `used == 0` 이 아니므로 아무
 /// 것도 하지 않는다.
 static TABLE_MISS_EMPTY: AtomicU64 = AtomicU64::new(0);
+static TABLE_MISS_ONE: AtomicU64 = AtomicU64::new(0);
 static TABLE_MISS_DRIFT: AtomicU64 = AtomicU64::new(0);
 
-fn note_table_miss(empty: bool) {
-    if empty {
-        TABLE_MISS_EMPTY.fetch_add(1, Ordering::Relaxed);
-    } else {
-        TABLE_MISS_DRIFT.fetch_add(1, Ordering::Relaxed);
-    }
+fn note_table_miss(sample_count: u8) {
+    match sample_count {
+        0 => TABLE_MISS_EMPTY.fetch_add(1, Ordering::Relaxed),
+        1 => TABLE_MISS_ONE.fetch_add(1, Ordering::Relaxed),
+        _ => TABLE_MISS_DRIFT.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 fn note_hold(ms: u64) {
@@ -299,7 +305,7 @@ fn note_scissor_gate(outcome: ScissorGate) {
     warn!(
         "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
          stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms) \
-         table_miss(empty={} drift={})",
+         table_miss(empty={} one={} drift={})",
         d[0],
         d[0] as f64 / secs,
         d[1],
@@ -315,6 +321,7 @@ fn note_scissor_gate(outcome: ScissorGate) {
         },
         HOLD_MAX_MS.swap(0, Ordering::Relaxed),
         TABLE_MISS_EMPTY.swap(0, Ordering::Relaxed),
+        TABLE_MISS_ONE.swap(0, Ordering::Relaxed),
         TABLE_MISS_DRIFT.swap(0, Ordering::Relaxed),
     );
 }
@@ -607,10 +614,17 @@ pub(crate) struct WebGLThread {
     context_recipes: FxHashMap<WebGLContextId, ContextRecipe>,
     /// 지금 백엔드를 놓아 둔 컨텍스트들.
     released_contexts: FxHashSet<WebGLContextId>,
-    /// 컨텍스트별 마지막 합성 시각. 페인트가 합성을 마칠 때마다 보내는
-    /// `FinishedRenderingToContext` 가 곧 "이 타일에 보였다" 이므로, 그것이 끊긴 지
-    /// 오래된 컨텍스트가 회수 대상이다.
-    last_composited: FxHashMap<WebGLContextId, Instant>,
+    /// 컨텍스트별 ★마지막으로 살아 있던 시각★ -- 회수 판정의 기준이다.
+    ///
+    /// 둘이 이것을 갱신한다.
+    ///
+    /// * 페인트가 합성을 마칠 때 보내는 `FinishedRenderingToContext` -- "이 타일에 보였다".
+    /// * `SwapBuffers` -- "페이지가 프레임을 내놓았다"(2026-11-11 추가).
+    ///
+    /// 두 번째가 필요한 이유는 `mark_context_alive` 의 doc 주석에 있다 -- 요점은 전환 중에
+    /// 캔버스가 타일에서 보이지 않는 구간이 있고, 그동안 페이지는 계속 그리고 있다는 것이다.
+    /// 합성만 기준으로 삼으면 ***그려지고 있는 캔버스를 빼앗는다***.
+    last_alive: FxHashMap<WebGLContextId, Instant>,
     /// 회수 판정을 마지막으로 돌린 시각(초당 한 번으로 묶기 위한 것).
     last_reclaim_sweep: Option<Instant>,
     /// 손실/복구를 스크립트에 알릴 채널(컨텍스트별).
@@ -737,7 +751,7 @@ impl WebGLThread {
             context_backends: Default::default(),
             context_recipes: Default::default(),
             released_contexts: Default::default(),
-            last_composited: Default::default(),
+            last_alive: Default::default(),
             last_reclaim_sweep: None,
             context_notifiers: Default::default(),
             cached_context_info: Default::default(),
@@ -1749,6 +1763,21 @@ impl WebGLThread {
     /// is marked for deletion, it will now be deleted.
     /// 회수 판정: 오래 보이지 않은 컨텍스트의 백엔드를 놓는다. 메시지 처리마다 불리므로
     /// 초당 한 번으로 묶는다.
+    /// 이 컨텍스트가 ★살아 있다★ 고 표시한다 -- 회수 판정의 기준이다.
+    ///
+    /// ★그리기도 증거로 받는다★(2026-11-11, log_webgl_perf_01/41). 앞 판은 ***실제
+    /// 합성***(`FinishedRenderingToContext`)만 기준으로 삼았다. 그런데 전환 중에는 캔버스가
+    /// 타일에서 보이지 않는 구간이 있고(레이아웃이 움직이거나 WR 이 그 타일을 다시 그리지
+    /// 않거나) 그동안 ***페이지는 계속 그리고 있다***. 3 초를 넘기면 회수됐다 -- 그려지고
+    /// 있는 캔버스를 빼앗는 것이다.
+    ///
+    /// swap 은 페이지가 rAF 를 돌며 프레임을 내놓았다는 뜻이므로 합성되지 않더라도 회수
+    /// 대상이 아니다. 회수의 본래 목적(정말로 버려진 캔버스의 GPU 메모리 반납)은 유지된다
+    /// -- 페이지가 그리기를 멈추면 swap 도 멈추므로 유휴 시간이 지나면 회수된다.
+    fn mark_context_alive(&mut self, context_id: WebGLContextId) {
+        self.last_alive.insert(context_id, Instant::now());
+    }
+
     fn maybe_reclaim_idle_contexts(&mut self) {
         let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
         if idle_ms <= 0 {
@@ -1770,10 +1799,10 @@ impl WebGLThread {
             .filter(|context_id| {
                 !self.released_contexts.contains(context_id)
                     && self
-                        .last_composited
+                        .last_alive
                         .get(context_id)
-                        // 한 번도 합성된 적이 없으면 아직 회수 대상이 아니다 — 갓 만들어진
-                        // 컨텍스트를 첫 프레임 전에 빼앗지 않기 위해서다.
+                        // 한 번도 살아 있던 적이 없으면 아직 회수 대상이 아니다 — 갓
+                        // 만들어진 컨텍스트를 첫 프레임 전에 빼앗지 않기 위해서다.
                         .is_some_and(|last| now.duration_since(*last) >= idle)
             })
             .collect();
@@ -1783,7 +1812,7 @@ impl WebGLThread {
     }
 
     fn handle_finished_rendering_to_context(&mut self, surface_id: WebGLSurfaceId) {
-        self.last_composited
+        self.last_alive
             .insert(surface_id.context_id, Instant::now());
         let marked_for_deletion = self
             .contexts
@@ -2142,7 +2171,7 @@ impl WebGLThread {
         let (wanted, used) = noted.union_over(age, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
         // ★폴백을 센다.★ 근거는 `note_table_miss` 의 doc 주석.
         if used == 0 {
-            note_table_miss(noted.sample_count == 0);
+            note_table_miss(noted.sample_count);
         }
         let scaled = self.scale_canvas_rect(wanted, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
@@ -2194,6 +2223,10 @@ impl WebGLThread {
     ) {
         debug!("handle_swap_buffers()");
         for context_id in context_ids {
+            // ★이 컨텍스트는 살아 있다★ -- 페이지가 프레임을 내놓았다. 근거는
+            // `mark_context_alive` 의 doc 주석. 되살리기 ***전***에 표시해, 이 프레임이
+            // 회수 판정에 반영되게 한다.
+            self.mark_context_alive(context_id);
             // ★released 컨텍스트를 되살린다.★ 2026-11-11, log_webgl_perf_01/39.
             //
             // 명령 경로들은 전부 이것을 한다(`apply_webgl_command_to_primary` 와
