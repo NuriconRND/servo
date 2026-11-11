@@ -57,7 +57,7 @@
 //! 쪽이다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -126,6 +126,41 @@ pub fn register_canvas(key: ImageKey) {
 /// 기록을 켜거나 끈다. `paint` 가 부른다.
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// 캔버스가 ★이 프레임이 표출될 시각까지 화면에서 움직일 양★, layout px.
+///
+/// ★무엇을 고치는 값인가.★ WR 이 적는 사각형은 그 프레임의 애니메이션 값으로는 정확하지만,
+/// 캔버스는 비동기다 -- WebGL 스레드가 그 값을 읽어 scissor 를 걸고 그린 비트맵은 ***더
+/// 뒤의 프레임***에서 표출된다. 그 사이에 캔버스가 움직인 만큼(`D = A(M) - A(N)`) 타일
+/// 경계에 ***그려진 적 없는 띠***가 생긴다. 운영자가 "이동 변화량에 비례하는 크기" 로
+/// 관찰한 것이 그것이다.
+///
+/// `paint` 가 틱마다 `sample(now + lead)` 와 `sample(now)` 의 평행이동 성분 차이를 적고,
+/// 소비자가 scissor 박스를 그 방향으로 ***넓힌다***. 설계와 한계(스케일·회전은 근사)는
+/// `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md` 에 있다.
+///
+/// ★넓히는 방향이라 빈 칸을 만들지 않는다.★ 예측이 빗나가도 더 셰이딩할 뿐이다 --
+/// `note_canvas_tile_rect` 의 `floor`/`ceil` 바깥쪽 반올림과 같은 원칙이다.
+///
+/// 단위는 layout px 이고, 소비자가 `dest_size` 비율로 캔버스 백킹 px 로 환산한다.
+/// 둘 다 0 이면 예측이 꺼진 것이거나 애니메이션이 없는 것이다 -- 어느 쪽이든 동작이
+/// 지금과 같다.
+static PREDICTED_SHIFT_X: AtomicI32 = AtomicI32::new(0);
+static PREDICTED_SHIFT_Y: AtomicI32 = AtomicI32::new(0);
+
+/// 예측 이동량을 적는다(layout px). `paint` 가 틱마다 부른다. ★원자 둘이 전부다.★
+pub fn set_predicted_shift(dx: i32, dy: i32) {
+    PREDICTED_SHIFT_X.store(dx, Ordering::Relaxed);
+    PREDICTED_SHIFT_Y.store(dy, Ordering::Relaxed);
+}
+
+/// 지금 예측 이동량(layout px). ★원자 로드 둘이다.★
+pub fn predicted_shift() -> (i32, i32) {
+    (
+        PREDICTED_SHIFT_X.load(Ordering::Relaxed),
+        PREDICTED_SHIFT_Y.load(Ordering::Relaxed),
+    )
 }
 
 /// 쓸 수 있는 기록의 최대 나이, ms. `painter` 가 틱마다 pref 에서 갱신한다.

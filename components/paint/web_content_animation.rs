@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use embedder_traits::{EventLoopWaker, RefreshDriver};
+use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnimationSegment};
 use rustc_hash::FxHashMap;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::WebViewId;
 use servo_config::prefs;
-use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnimationSegment};
 use webrender_api::units::LayoutTransform;
 use webrender_api::{ColorF, PropertyBindingKey, PropertyValue};
 
@@ -100,10 +100,11 @@ impl WebContentAnimator {
         }
         let event_loop_waker = self.event_loop_waker.clone();
         let scheduled = self.paint_animation_wake_scheduled.clone();
-        self.frame_refresh_driver.observe_next_frame(Box::new(move || {
-            scheduled.store(false, Ordering::Relaxed);
-            event_loop_waker.wake();
-        }));
+        self.frame_refresh_driver
+            .observe_next_frame(Box::new(move || {
+                scheduled.store(false, Ordering::Relaxed);
+                event_loop_waker.wake();
+            }));
         self.paint_animation_wake_scheduled
             .store(true, Ordering::Relaxed);
     }
@@ -466,6 +467,28 @@ impl PipelineAnimations {
         !animations.is_empty()
     }
 
+    /// 주어진 시각의 값을 ★상태를 건드리지 않고★ 샘플한다.
+    ///
+    /// `update_paint_animations` 와 다르다 -- 그쪽은 끝난 애니메이션을 `retain` 으로
+    /// 걷어내고 `sample_final` 로 마지막 값을 붙든다. ***미래 시각으로 그것을 부르면
+    /// 아직 돌고 있는 애니메이션을 끝난 것으로 치고 버린다.*** 그래서 예측에는 이 함수를
+    /// 쓴다. `&self` 와 `borrow()` 만 쓰고 아무것도 바꾸지 않는다.
+    ///
+    /// 그 시각에 이미 끝난 애니메이션은 건너뛴다 -- 끝난 것은 더 움직이지 않으므로 예측
+    /// 이동량에 기여하지 않는 것이 맞다.
+    pub(crate) fn sample_paint_animations_at(
+        &self,
+        now: Instant,
+        floats: &mut Vec<PropertyValue<f32>>,
+        transforms: &mut Vec<PropertyValue<LayoutTransform>>,
+    ) {
+        for animation in self.paint.borrow().iter() {
+            if animation.running(now) {
+                animation.sample(now, floats, transforms);
+            }
+        }
+    }
+
     /// Append the values of animations that have stopped, for keys nothing is currently
     /// animating, and say how many were appended.
     ///
@@ -643,8 +666,8 @@ impl PipelineAnimations {
                 Some(CaretAnimation {
                     caret_property_key,
                     original_caret_color,
-                    remaining_blink_count: (CARET_BLINK_TIMEOUT.as_millis() /
-                        caret_blink_time.as_millis())
+                    remaining_blink_count: (CARET_BLINK_TIMEOUT.as_millis()
+                        / caret_blink_time.as_millis())
                         as usize,
                 })
             },

@@ -258,6 +258,57 @@ enum ScissorGate {
     NoIntersection,
 }
 
+/// WR 이 적은 사각형을 캔버스 백킹 좌표의 GL scissor 박스로 환산하고, 애니메이션 예측
+/// 이동량만큼 넓힌다. ★순수 함수다 -- 그래서 테스트할 수 있다.★
+///
+/// `rect`/`dest_size` 는 `wall_canvas_rect` 가 적은 것이다(캔버스 좌표, 위-왼쪽 원점 /
+/// 화면상 목적지 크기). `shift` 는 layout px 단위의 예측 이동량이고, 여기서 같은 비율로
+/// 캔버스 좌표로 환산한다.
+///
+/// ★양쪽으로 넓힌다 -- 부호를 맞추려 애쓰지 않는다.★ 이동 방향을 캔버스 좌표로 옮기는 데
+/// 반전이 ***둘*** 겹친다: 캔버스가 화면에서 오른쪽으로 가면 고정된 타일은 캔버스의
+/// ***왼쪽***을 보게 되고(화면↔캔버스 반전), 아래의 `y` 계산이 GL 원점을 맞추느라 세로를
+/// 한 번 더 뒤집는다. 부호를 틀리면 ***반대쪽으로 넓혀 띠가 그대로 남는다*** -- 고치려던
+/// 것을 못 고치고 셰이딩만 늘린다. 양방향이면 두 배 넓지만 한 프레임 이동량이라 작다
+/// (60Hz 에서 2,304px/s 짜리 물체도 38px).
+///
+/// 반환은 GL 좌표(아래-왼쪽 원점)이고 ★캔버스 경계로 잘려 있다★ -- 넓히면 밖으로 나갈 수
+/// 있고, 그러면 `getParameter(SCISSOR_BOX)` 로 보이는 값이 엉뚱해진다.
+fn scale_canvas_rect_with_pad(
+    rect: [i32; 4],
+    dest_size: [i32; 2],
+    canvas: Size2D<i32>,
+    shift: (i32, i32),
+) -> Option<[i32; 4]> {
+    if dest_size[0] <= 0 || dest_size[1] <= 0 || canvas.width <= 0 || canvas.height <= 0 {
+        return None;
+    }
+    let sx = canvas.width as f32 / dest_size[0] as f32;
+    let sy = canvas.height as f32 / dest_size[1] as f32;
+    let pad_x = ((shift.0.unsigned_abs() as f32) * sx).ceil() as i32;
+    let pad_y = ((shift.1.unsigned_abs() as f32) * sy).ceil() as i32;
+
+    let x = (rect[0] as f32 * sx).floor() as i32 - pad_x;
+    let top = (rect[1] as f32 * sy).floor() as i32 - pad_y;
+    let w = (rect[2] as f32 * sx).ceil() as i32 + 2 * pad_x;
+    let h = (rect[3] as f32 * sy).ceil() as i32 + 2 * pad_y;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+
+    let left = x.max(0);
+    let top = top.max(0);
+    let right = (x + w).min(canvas.width);
+    let bottom = (top + h).min(canvas.height);
+    let w = right - left;
+    let h = bottom - top;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let y = canvas.height - (top + h);
+    Some([left, y.max(0), w, h])
+}
+
 /// 두 scissor 박스의 교집합. 겹치지 않으면 ★너비/높이 0★ 으로 모두 버린다.
 ///
 /// GL 은 음수 너비를 오류로 보므로 `max(0)` 이 필요하다.
@@ -1890,17 +1941,12 @@ impl WebGLThread {
         dest_size: [i32; 2],
         canvas: Size2D<i32>,
     ) -> Option<[i32; 4]> {
-        let sx = canvas.width as f32 / dest_size[0] as f32;
-        let sy = canvas.height as f32 / dest_size[1] as f32;
-        let x = (rect[0] as f32 * sx).floor() as i32;
-        let top = (rect[1] as f32 * sy).floor() as i32;
-        let w = (rect[2] as f32 * sx).ceil() as i32;
-        let h = (rect[3] as f32 * sy).ceil() as i32;
-        if w <= 0 || h <= 0 {
-            return None;
-        }
-        let y = canvas.height - (top + h);
-        Some([x.max(0), y.max(0), w, h])
+        scale_canvas_rect_with_pad(
+            rect,
+            dest_size,
+            canvas,
+            webrender::wall_canvas_rect::predicted_shift(),
+        )
     }
 
     /// scissor 판정의 ★입력값★ 을 사람이 읽을 문자열로. ★로그 전용★ 이고 서피스마다 한 번만
@@ -4665,5 +4711,90 @@ mod fanout_clone_tests {
             unreachable!()
         };
         assert_eq!(&***data, &PIXEL, "the original still owns its pixels");
+    }
+}
+
+#[cfg(test)]
+mod scissor_lead_tests {
+    use euclid::Size2D;
+
+    use super::scale_canvas_rect_with_pad;
+
+    /// 캔버스와 목적지가 1:1 인 흔한 경우. 벽의 한 타일(2880x2160)이 11520x4320 캔버스의
+    /// 왼쪽 위 사분면을 본다.
+    const CANVAS: Size2D<i32, euclid::UnknownUnit> = Size2D::new(11520, 4320);
+    const DEST: [i32; 2] = [11520, 4320];
+    const TILE: [i32; 4] = [0, 0, 2880, 2160];
+
+    #[test]
+    fn no_shift_is_unchanged() {
+        // ★`lead = 0` 이면 지금까지의 동작과 같아야 한다.★ 이 불변식이 깨지면 pref 를 0 으로
+        // 두어도 회귀가 난다.
+        let got = scale_canvas_rect_with_pad(TILE, DEST, CANVAS, (0, 0)).unwrap();
+        // GL 좌표: 위-왼쪽 (0,0,2880,2160) -> 아래-왼쪽 y = 4320 - 2160 = 2160.
+        assert_eq!(got, [0, 2160, 2880, 2160]);
+    }
+
+    #[test]
+    fn shift_widens_both_sides() {
+        // 가로로 10px 움직이면 좌우로 각각 10 씩 넓어진다 -- 폭이 20 늘고 왼쪽 끝이 10
+        // 줄어든다. 여기서는 왼쪽이 0 에 붙어 있으므로 클램프되어 폭만 10 늘어난다.
+        let got =
+            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (10, 0)).unwrap();
+        assert_eq!(got[0], 90, "왼쪽으로 10 넓어진다");
+        assert_eq!(got[2], 2900, "폭이 20 늘어난다");
+        assert_eq!(got[3], 2160, "세로는 그대로다");
+    }
+
+    #[test]
+    fn shift_sign_does_not_matter() {
+        // ★양방향이므로 부호가 결과를 바꾸지 않는다.★ 이것이 이 설계의 안전장치다.
+        let plus = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (10, 7));
+        let minus = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (-10, -7));
+        assert_eq!(plus, minus);
+    }
+
+    #[test]
+    fn widening_is_clamped_to_the_canvas() {
+        // 오른쪽 아래 끝 타일을 크게 넓혀도 캔버스를 넘지 않는다.
+        let bottom_right = [11520 - 2880, 4320 - 2160, 2880, 2160];
+        let got = scale_canvas_rect_with_pad(bottom_right, DEST, CANVAS, (500, 500)).unwrap();
+        assert!(
+            got[0] + got[2] <= CANVAS.width,
+            "가로가 캔버스를 넘지 않는다"
+        );
+        assert!(
+            got[1] + got[3] <= CANVAS.height,
+            "세로가 캔버스를 넘지 않는다"
+        );
+        assert_eq!(got[1], 0, "아래-왼쪽 원점에서 바닥에 붙는다");
+    }
+
+    #[test]
+    fn scale_applies_to_the_shift_too() {
+        // 캔버스가 목적지의 두 배면 이동량도 두 배로 환산된다.
+        let canvas = Size2D::new(23040, 8640);
+        let got =
+            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, canvas, (10, 0)).unwrap();
+        // sx = 2, 그러므로 pad_x = 20. x = 200 - 20 = 180.
+        assert_eq!(got[0], 180);
+        assert_eq!(got[2], 5760 + 40);
+    }
+
+    #[test]
+    fn degenerate_inputs_decline() {
+        assert!(scale_canvas_rect_with_pad(TILE, [0, 0], CANVAS, (0, 0)).is_none());
+        assert!(
+            scale_canvas_rect_with_pad([0, 0, 0, 0], DEST, CANVAS, (0, 0)).is_none(),
+            "빈 사각형은 걸지 않는다"
+        );
+    }
+
+    #[test]
+    fn a_rect_entirely_outside_declines() {
+        // 캔버스 밖의 사각형은 클램프 뒤 빈 것이 되고, 그러면 scissor 를 걸지 않는다 --
+        // 전체 셰이딩으로 떨어지는 것이 빈 화면보다 안전하다.
+        let outside = [20000, 0, 100, 100];
+        assert!(scale_canvas_rect_with_pad(outside, DEST, CANVAS, (0, 0)).is_none());
     }
 }

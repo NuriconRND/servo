@@ -12,8 +12,8 @@ use crossbeam_channel::Sender;
 use dpi::PhysicalSize;
 use embedder_traits::{
     EventLoopWaker, InputEvent, InputEventAndId, InputEventId, InputEventResult,
-    PaintHitTestResult, RefreshDriver, ScreenshotCaptureError, Scroll, ViewportDetails, WebViewPoint,
-    WebViewRect,
+    PaintHitTestResult, RefreshDriver, ScreenshotCaptureError, Scroll, ViewportDetails,
+    WebViewPoint, WebViewRect,
 };
 use euclid::{Point2D, Rect, Scale, Size2D};
 use gleam::gl::RENDERER;
@@ -26,9 +26,8 @@ use paint_api::rendering_context::RenderingContext;
 use paint_api::viewport_description::ViewportDescription;
 use paint_api::{
     ImageUpdate, PaintProxy, PainterSurfmanDetailsMap, PainterTileRectMap, PipelineExitSource,
-    SendableFrameTree,
-    SerializableDisplayListPayload, SerializableImageData, WebRenderExternalImageHandlers,
-    WebRenderExternalImageIdManager, WebRenderImageHandlerType,
+    SendableFrameTree, SerializableDisplayListPayload, SerializableImageData,
+    WebRenderExternalImageHandlers, WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
 use profile_traits::time::{ProfilerCategory, ProfilerChan};
 use profile_traits::time_profile;
@@ -1107,6 +1106,17 @@ impl Painter {
             });
         }
 
+        // ★이 프레임이 표출될 시각까지 캔버스가 움직일 양을 적어 둔다.★
+        //
+        // WR 이 적는 scissor 사각형은 그 프레임의 값으로는 정확한데, 캔버스는 비동기다 --
+        // WebGL 스레드가 그 값을 읽어 scissor 를 걸고 그린 비트맵은 ***더 뒤의 프레임***에서
+        // 표출된다. 그 사이의 이동량이 타일 경계의 검은 띠가 된다. 설계와 한계는
+        // `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md`.
+        //
+        // ★`sample_at` 에 다시 더한다.★ `sample_at` 은 이미 `-SampleLead` 가 민 "이 타일이
+        // 표시할 시각" 이고, 이 `lead` 는 그와 ***별개 축***인 캔버스 파이프라인 지연이다.
+        self.publish_canvas_scissor_lead(sample_at, &transforms);
+
         // ***An animation is a value laid onto the frames this wall already produces, not
         // a reason to produce more.*** The painter renders and presents on a clock, and
         // video sources are composited with whatever frame they happen to have; the
@@ -1648,18 +1658,16 @@ impl Painter {
                 // 그 영상의 프로듀서가 프레임을 만들 때만 돌았는데, 정작 회수해야 할 때는
                 // 그 프로듀서가 멈춘 뒤다(앱이 요소를 남긴 채 재생만 멈추는 경우).
                 // 실측: 그렇게 링이 321개, 3.8GB 까지 쌓였고 바닥값이 내려오지 않았다.
-                let _ =
-                    servo_media::player::d3d11_ring::D3d11PlaneRings::expire_all_stale_demand(
-                        servo_media::player::d3d11_ring::RING_DEMAND_TTL,
-                    );
+                let _ = servo_media::player::d3d11_ring::D3d11PlaneRings::expire_all_stale_demand(
+                    servo_media::player::d3d11_ring::RING_DEMAND_TTL,
+                );
             }
         }
 
         // ★렌더 전체를 잰다★ -- 외부 이미지(WebGL 캔버스) 비트맵을 가져오는
         // `lock_swap_chain` 은 WR 의 합성 중에, 즉 ***이 함수 안에서*** 일어난다. 그래서
         // 그 비용은 캔버스만의 비용이 아니라 ***이 프레임에 실린 모든 것***의 비용이다.
-        let render_started_for_probe =
-            crate::frame_source_probe::is_enabled().then(Instant::now);
+        let render_started_for_probe = crate::frame_source_probe::is_enabled().then(Instant::now);
 
         // 이 스레드의 렌더 프레임 경계를 알린다. 프레임 **안에서** 하는 일에 상한을
         // 두려는 쪽(새 비디오 링의 최초 소비)이 이 값으로 프레임이 바뀐 것을 안다.
@@ -1946,7 +1954,9 @@ impl Painter {
         if !pref!(gfx_wall_single_publish_per_pass) {
             return None;
         }
-        let published = self.published_hwm.load(std::sync::atomic::Ordering::Relaxed);
+        let published = self
+            .published_hwm
+            .load(std::sync::atomic::Ordering::Relaxed);
         let consumed = self.consumed_publish_id.get();
         // 켜는 순간, 또는 무언가 어긋난 뒤에는 고수위에서 다시 잡는다.
         if consumed >= published {
@@ -3031,6 +3041,69 @@ impl Painter {
     /// `lead_to_next_composition` 의 주석이 그 산수를 적고 있다. 호출자가 자기 `now` 를
     /// 더하면 그 사이의 `MonitorFromWindow` + `DwmGetCompositionTimingInfo` 가 그대로
     /// 지터가 된다.
+    /// 캔버스 scissor 를 넓힐 ★예측 이동량★ 을 계산해 공유 슬롯에 싣는다.
+    ///
+    /// `now_transforms` 는 이 틱이 방금 샘플한 현재 변환들이다. 같은 애니메이션을
+    /// `lead` 주기 뒤로 한 번 더 샘플해 ★평행이동 성분의 차이★ 를 구하고, 그 중 가장 큰
+    /// 것을 싣는다. 캔버스가 어느 애니메이션에 붙어 있는지 painter 는 모르므로 큰 쪽으로
+    /// 넓히는 것이 안전한 방향이다(넓히면 더 셰이딩할 뿐, 빈 칸은 생기지 않는다).
+    ///
+    /// ★`lead = 0` 이면 원자 로드 하나로 끝난다.★ 그 경우 예측 샘플을 하지 않는다.
+    ///
+    /// 스케일·회전은 근사다 -- 평행이동 성분만 보므로 크기 변화와 회전으로 생기는 경계
+    /// 이동을 놓친다. 이 리포의 전환은 이동이 지배적이고(운영자가 "이동 변화량에 비례하는
+    /// 크기" 로 띠를 관찰했다), 놓친 만큼은 `lead` 를 올려 덮는다.
+    fn publish_canvas_scissor_lead(
+        &self,
+        sample_at: Instant,
+        now_transforms: &[webrender_api::PropertyValue<webrender_api::units::LayoutTransform>],
+    ) {
+        let lead_periods = pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 4) as u32;
+        if lead_periods == 0 {
+            webrender::wall_canvas_rect::set_predicted_shift(0, 0);
+            return;
+        }
+        if now_transforms.is_empty() {
+            webrender::wall_canvas_rect::set_predicted_shift(0, 0);
+            return;
+        }
+        let period = crate::refresh_driver::paint_timer_period();
+        let predict_at = sample_at + period * lead_periods;
+
+        let mut floats = Vec::new();
+        let mut lead_transforms = Vec::new();
+        for renderer in self.webview_renderers.values() {
+            renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                pipeline_details.animations.sample_paint_animations_at(
+                    predict_at,
+                    &mut floats,
+                    &mut lead_transforms,
+                );
+            });
+        }
+
+        // 같은 키끼리 짝지어 평행이동 차이를 재고, 가장 큰 것을 쓴다.
+        let mut shift_x = 0.0f32;
+        let mut shift_y = 0.0f32;
+        for lead in &lead_transforms {
+            let Some(now) = now_transforms.iter().find(|value| value.key == lead.key) else {
+                continue;
+            };
+            let dx = lead.value.m41 - now.value.m41;
+            let dy = lead.value.m42 - now.value.m42;
+            if dx.abs() > shift_x.abs() {
+                shift_x = dx;
+            }
+            if dy.abs() > shift_y.abs() {
+                shift_y = dy;
+            }
+        }
+        webrender::wall_canvas_rect::set_predicted_shift(
+            shift_x.round() as i32,
+            shift_y.round() as i32,
+        );
+    }
+
     fn paint_animation_sample_at(&self) -> Option<Instant> {
         #[cfg(windows)]
         {
@@ -3810,7 +3883,10 @@ mod frame_delayer_canvas_wait_tests {
     fn a_fresh_delayer_waits_on_nothing() {
         let delayer = FrameDelayer::default();
         let waiting = delayer.waiting_on_canvas_images();
-        assert!(!waiting, "올라올 캔버스가 없으면 기다리지 않는다 (실제 {waiting})");
+        assert!(
+            !waiting,
+            "올라올 캔버스가 없으면 기다리지 않는다 (실제 {waiting})"
+        );
     }
 
     /// 캔버스가 아직 WR 에 안 올라갔으면 기다린다 -- `FrameDelayer` 계약 그대로다.

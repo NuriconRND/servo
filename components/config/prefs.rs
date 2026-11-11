@@ -874,6 +874,21 @@ pub struct Preferences {
     /// 타일 밖이면 `update_prim_dependencies` 가 조기 반환해 아예 적지 않는다. 60Hz 에서
     /// 한두 프레임을 허용하는 값이 기본이다.
     pub gfx_wall_webgl_tile_scissor_max_age_ms: i64,
+    /// 캔버스 scissor 사각형을 ★몇 주기 뒤의 애니메이션 위치까지★ 넓힐지. 기본 1,
+    /// 0 = 끔(지금까지의 동작), 범위 0..=4.
+    ///
+    /// ★고치는 것★: 캔버스가 화면에서 움직이는 동안 타일 경계에 검은 띠가 보인다. WR 이
+    /// 적는 사각형은 그 프레임의 값으로는 정확한데, 캔버스가 비동기라 그 scissor 로 그린
+    /// 비트맵은 ***더 뒤의 프레임***에서 표출된다. 그 사이의 이동량이 띠가 된다.
+    ///
+    /// 이 값은 ★캔버스 파이프라인 지연★ 이고, 지금 그것을 재는 수치가 없다(`SURFIMPORT` 는
+    /// 합과 개수만, `RENDERCOST` 는 포함하지만 귀속 불가). 그래서 pref 로 두고 실기에서
+    /// 0/1/2 를 쓸어 ***띠가 사라지는 최소값***을 찾는다 -- 그 값이 곧 지연의 측정값이다.
+    ///
+    /// 주기는 `gfx_refresh_hz` 에서 온다. 올리면 넓어진 만큼 셰이딩이 늘고, 예측이 빗나가도
+    /// ***큰 쪽으로*** 틀리므로 빈 칸은 생기지 않는다. 설계는
+    /// `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md`.
+    pub gfx_wall_canvas_scissor_lead_periods: i64,
     // ★`gfx_single_frame_producer` 는 2026-10-22 에 삭제됐다(설계 문서
     // `docs/superpowers/specs/2026-10-21-single-frame-producer-design.md`). 그것이 지키던
     // 것(구 생산자 열한 곳이 살아 있는 동안 틱 생산을 꺼 두기)은 그 열한 곳이 2026-10-21
@@ -1668,6 +1683,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
+            gfx_wall_canvas_scissor_lead_periods: 1,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
