@@ -3095,7 +3095,7 @@ impl Painter {
             renderer.for_each_connected_pipeline(&mut |pipeline_details| {
                 pipeline_details
                     .animations
-                    .paint_animation_sample_times(from, to, &mut times);
+                    .paint_animation_sample_times(from, to, period, &mut times);
             });
         }
         if times.is_empty() {

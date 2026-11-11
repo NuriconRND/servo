@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use embedder_traits::{EventLoopWaker, RefreshDriver};
-use paint_api::display_list::{PaintAnimation, PaintAnimationProperty, PaintAnimationSegment};
+use paint_api::display_list::{
+    PaintAnimation, PaintAnimationEasing, PaintAnimationProperty, PaintAnimationSegment,
+};
 use rustc_hash::FxHashMap;
 use servo_base::cross_process_instant::CrossProcessInstant;
 use servo_base::id::WebViewId;
@@ -330,7 +332,7 @@ impl ActivePaintAnimation {
     ///
     /// 창의 양 끝(이 애니메이션의 구간으로 clamp)과, 창 안에 들어오는 ***세그먼트 경계***.
     /// 근거는 `PipelineAnimations::paint_animation_sample_times` 의 doc 주석에 있다.
-    fn sample_times(&self, from: Instant, to: Instant, out: &mut Vec<Instant>) {
+    fn sample_times(&self, from: Instant, to: Instant, step: Duration, out: &mut Vec<Instant>) {
         let push = |out: &mut Vec<Instant>, t: Instant| {
             if !out.contains(&t) {
                 out.push(t);
@@ -345,21 +347,52 @@ impl ActivePaintAnimation {
         push(out, clamp(from));
         push(out, clamp(to));
 
-        // 창 안의 세그먼트 경계.
-        let bounds: Vec<f64> = match &self.property {
-            PaintAnimationProperty::Opacity(_, segments) => {
-                segments.iter().map(|segment| segment.end).collect()
-            },
-            PaintAnimationProperty::Transform(_, segments) => {
-                segments.iter().map(|segment| segment.end).collect()
-            },
+        // 세그먼트 경계와, ★비선형 이징이면 그 내부의 균일 샘플★. 근거는
+        // `PipelineAnimations::paint_animation_sample_times` 의 doc 주석 3 번에 있다.
+        let spans: Vec<(f64, f64, bool)> = match &self.property {
+            PaintAnimationProperty::Opacity(_, segments) => segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.start,
+                        segment.end,
+                        !matches!(segment.easing, PaintAnimationEasing::Linear),
+                    )
+                })
+                .collect(),
+            PaintAnimationProperty::Transform(_, segments) => segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.start,
+                        segment.end,
+                        !matches!(segment.easing, PaintAnimationEasing::Linear),
+                    )
+                })
+                .collect(),
         };
-        for end in bounds {
-            let Some(at) = self.zero.checked_add(Duration::from_secs_f64(end)) else {
+        let at_offset = |offset: f64| self.zero.checked_add(Duration::from_secs_f64(offset));
+        for (start, end, eased) in spans {
+            if let Some(at) = at_offset(end) {
+                if at > from && at < to {
+                    push(out, at);
+                }
+            }
+            if !eased || step.is_zero() {
+                continue;
+            }
+            // 이 세그먼트가 창과 겹치는 부분만 훑는다. 간격은 한 표출 주기다.
+            let Some(seg_from) = at_offset(start) else {
                 continue;
             };
-            if at > from && at < to {
+            let Some(seg_to) = at_offset(end) else {
+                continue;
+            };
+            let mut at = seg_from.max(from);
+            let upper = seg_to.min(to);
+            while at < upper {
                 push(out, at);
+                at += step;
             }
         }
     }
@@ -507,14 +540,30 @@ impl PipelineAnimations {
 
     /// 창 `[from, to]` 안에서 ★샘플해야 할 시각들★. 상태를 건드리지 않는다.
     ///
-    /// ★닫힌 형태다 -- 균일 샘플이 필요 없다.★ layout 이 비선형 이징을 ***행렬에서
-    /// 선형인 세그먼트로 미리 쪼개*** 보내므로(`PaintAnimationProperty` 의 doc), 세그먼트
-    /// 안에서는 변환이 `t` 에 대해 선형이고 그 사각형의 극값은 ***구간 끝에만*** 있다.
-    /// 그래서 필요한 것은 ★창의 양 끝 + 창 안에 들어오는 세그먼트 경계★ 뿐이다.
+    /// 샘플 집합은 셋을 합친 것이다.
     ///
-    /// ★전환점은 항상 세그먼트 경계다★ -- 바운스가 창 안에서 왕복해도 그 꼭대기가 샘플에
-    /// 들어오므로 놓칠 수 없다. 두 끝점의 차이만 보던 1 차 구현이 바로 그것을 놓쳤다
-    /// (왕복하면 차이가 0 에 가깝다).
+    /// 1. ★창의 양 끝★(이 애니메이션의 구간으로 clamp).
+    /// 2. ★창 안에 들어오는 세그먼트 경계★ -- 전환점은 항상 경계이므로, 바운스가 창 안에서
+    ///    왕복해도 그 꼭대기가 샘플에 들어온다. 두 끝점의 차이만 보던 1 차 구현이 바로
+    ///    그것을 놓쳤다(왕복하면 차이가 0 에 가깝다).
+    /// 3. ★비선형 이징 세그먼트의 내부 균일 샘플★ -- 아래가 그 이유다.
+    ///
+    /// ## ★3 번이 왜 필요한가★ (2026-11-11)
+    ///
+    /// 처음에는 1·2 만으로 "닫힌 형태" 라고 적었다. 근거는 "layout 이 비선형 이징을 행렬에서
+    /// 선형인 세그먼트로 미리 쪼개 보낸다" 였는데, ***그것이 틀렸다.***
+    /// `PaintAnimationEasing` 은 `Linear` 외에 `CubicBezier` 와 `Steps` 를 그대로 싣고
+    /// (`display_list.rs:850-856`), `segment_progress` 가 `segment.easing.ease(raw)` 로
+    /// ***세그먼트 안에서 비선형***으로 보간한다. 그러면 극값이 구간 끝에만 있다는 보장이
+    /// 없다.
+    ///
+    /// 특히 IPWall 의 `bounce` 는 첫 구간이 `ease-out` 이라 ***시작이 가장 빠르다***. 경계
+    /// 둘만 샘플하면 그 빠른 구간이 뭉개지고, 그것이 운영자가 본 "전환 애니메이션 시작시
+    /// 순간 검은 영역 넓게"(log_webgl_perf_01/35)다. 재생 중 띠가 `scene` 에서 사라진 것도
+    /// 같은 이유로 설명된다 -- 중간 구간은 이징이 완만해서 경계만으로 충분했다.
+    ///
+    /// 간격은 ★한 표출 주기★ 다. 창이 100ms 안쪽이므로 세그먼트당 최대 몇 개이고, 그보다
+    /// 촘촘히 해도 사각형이 더 커지지 않는다(한 주기 안의 이동은 scissor 한 줄 수준이다).
     ///
     /// 끝난 애니메이션의 시각은 `ends_at()` 로 clamp 한다 -- 그 뒤로는 움직이지 않으므로
     /// 창이 전환 끝을 넘어가도 구멍이 생기지 않는다.
@@ -522,10 +571,11 @@ impl PipelineAnimations {
         &self,
         from: Instant,
         to: Instant,
+        step: Duration,
         out: &mut Vec<Instant>,
     ) {
         for animation in self.paint.borrow().iter() {
-            animation.sample_times(from, to, out);
+            animation.sample_times(from, to, step, out);
         }
     }
 
@@ -795,6 +845,72 @@ mod tests {
             built_at: CrossProcessInstant::now(),
             complete: true,
         }
+    }
+
+    /// 같은 모양인데 이징이 `ease-out` 인 것. `bounce` 의 첫 구간이 이 꼴이다.
+    fn running_eased(id: u64, duration: f64) -> PaintAnimation {
+        let mut animation = running_fade(id, duration);
+        animation.property = PaintAnimationProperty::Opacity(
+            opacity_key(id),
+            vec![PaintAnimationSegment {
+                start: 0.0,
+                end: duration,
+                from: 0.0,
+                to: 1.0,
+                // `ease-out` 의 제어점. 시작이 가장 빠르다.
+                easing: PaintAnimationEasing::CubicBezier(0.0, 0.0, 0.58, 1.0),
+            }],
+        );
+        animation
+    }
+
+    fn times(animations: &PipelineAnimations, window: Duration, step: Duration) -> Vec<Instant> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        animations.paint_animation_sample_times(now, now + window, step, &mut out);
+        out
+    }
+
+    /// ★선형 세그먼트는 내부 샘플이 필요 없다.★ 세그먼트 안에서 변환이 `t` 에 선형이면
+    /// 사각형의 극값이 구간 끝에만 있으므로, 창의 양 끝만으로 정확하다.
+    #[test]
+    fn linear_segments_need_no_interior_samples() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![running_fade(1, 2.0)]);
+        let got = times(
+            &animations,
+            Duration::from_millis(100),
+            Duration::from_millis(16),
+        );
+        assert_eq!(got.len(), 2, "창 양 끝뿐이어야 한다: {got:?}");
+    }
+
+    /// ★비선형 이징은 내부를 훑어야 한다.★ 이것이 2026-11-11 에 고친 결함이다 -- 설계는
+    /// "layout 이 선형 세그먼트로 쪼개 보낸다" 를 전제했는데 `CubicBezier` 가 그대로
+    /// 실려 온다. `bounce` 의 첫 구간이 `ease-out` 이라 시작이 가장 빠르고, 경계 둘만
+    /// 샘플하면 그 구간이 뭉개져 타일 경계에 띠가 남았다(log_webgl_perf_01/35).
+    #[test]
+    fn eased_segments_get_interior_samples() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![running_eased(1, 2.0)]);
+        let step = Duration::from_millis(16);
+        let got = times(&animations, Duration::from_millis(100), step);
+        assert!(
+            got.len() > 2,
+            "창 안을 한 주기 간격으로 훑어야 한다: {got:?}"
+        );
+        // 100ms 창을 16ms 로 훑으면 대략 일곱 개 안쪽이다 -- 너무 많으면 셰이딩이 는다.
+        assert!(got.len() <= 9, "샘플이 과하다: {}", got.len());
+    }
+
+    /// ★간격이 0 이면 내부 샘플을 만들지 않는다.★ `lead = 0` 으로 기능을 끈 구성에서
+    /// 비용이 늘지 않아야 한다.
+    #[test]
+    fn zero_step_disables_interior_samples() {
+        let animations = PipelineAnimations::default();
+        animations.install_paint_animations(vec![running_eased(1, 2.0)]);
+        let got = times(&animations, Duration::from_millis(100), Duration::ZERO);
+        assert_eq!(got.len(), 2, "창 양 끝뿐이어야 한다: {got:?}");
     }
 
     /// A fade-in that is only starting now, so it is still playing.
