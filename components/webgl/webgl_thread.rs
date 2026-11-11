@@ -265,12 +265,22 @@ enum ScissorGate {
 /// 화면상 목적지 크기). `shift` 는 layout px 단위의 예측 이동량이고, 여기서 같은 비율로
 /// 캔버스 좌표로 환산한다.
 ///
-/// ★양쪽으로 넓힌다 -- 부호를 맞추려 애쓰지 않는다.★ 이동 방향을 캔버스 좌표로 옮기는 데
-/// 반전이 ***둘*** 겹친다: 캔버스가 화면에서 오른쪽으로 가면 고정된 타일은 캔버스의
-/// ***왼쪽***을 보게 되고(화면↔캔버스 반전), 아래의 `y` 계산이 GL 원점을 맞추느라 세로를
-/// 한 번 더 뒤집는다. 부호를 틀리면 ***반대쪽으로 넓혀 띠가 그대로 남는다*** -- 고치려던
-/// 것을 못 고치고 셰이딩만 늘린다. 양방향이면 두 배 넓지만 한 프레임 이동량이라 작다
-/// (60Hz 에서 2,304px/s 짜리 물체도 38px).
+/// ★가로는 한쪽으로만, 세로는 양쪽으로 넓힌다.★
+///
+/// 처음(2026-11-11)에는 양쪽으로 넓혔다 -- 이동 방향을 캔버스 좌표로 옮기는 데 반전이
+/// ***둘*** 겹쳐서(화면↔캔버스, 그리고 아래 `y` 계산의 GL 원점 뒤집기) 부호를 틀리면
+/// ***반대쪽으로 넓혀 띠가 그대로 남기*** 때문이다. 틀리는 것보다 두 배 넓은 쪽이 안전했다.
+///
+/// ★실기가 가로 부호를 확정했다★(2026-11-11, log_webgl_perf_01/31). 운영자 관찰: "좌 -> 우
+/// 애니메이션시 ***우측 tile 의 좌측 경계***에 검은 영역". 캔버스가 화면에서 오른쪽으로 가면
+/// 고정된 우측 타일은 캔버스의 ***더 왼쪽***을 보게 되므로, 넓힐 곳은 캔버스 좌표의
+/// ***x 가 작아지는 쪽*** 하나다. 그래서 가로는 단방향으로 바꿨다 -- ***같은 폭을 절반
+/// 비용으로*** 얻는다. 그 비용은 측정된 문제였다: 양방향 `lead 4` 에서 `RENDERCOST` 의
+/// `last10s_over` 가 0(lead 3) -> 109, `last10s_worst` 가 8.6ms -> 79.5ms 로 튀었다.
+///
+/// ★세로는 양방향을 유지한다 -- 실기가 세로 부호를 말해 주지 않았다.★ 이 리포의 전환은
+/// 수평 이동이 지배적이라 세로 pad 는 작고, 추측으로 부호를 정하는 것보다 두 배 넓은 쪽이
+/// 여전히 안전하다. 세로로 움직이는 전환을 관찰하면 그때 같은 방식으로 확정한다.
 ///
 /// 반환은 GL 좌표(아래-왼쪽 원점)이고 ★캔버스 경계로 잘려 있다★ -- 넓히면 밖으로 나갈 수
 /// 있고, 그러면 `getParameter(SCISSOR_BOX)` 로 보이는 값이 엉뚱해진다.
@@ -288,9 +298,11 @@ fn scale_canvas_rect_with_pad(
     let pad_x = ((shift.0.unsigned_abs() as f32) * sx).ceil() as i32;
     let pad_y = ((shift.1.unsigned_abs() as f32) * sy).ceil() as i32;
 
-    let x = (rect[0] as f32 * sx).floor() as i32 - pad_x;
+    // 화면에서 +x 로 가면 타일이 보는 캔버스 부분은 -x 로 옮겨 간다 -- 그쪽만 넓힌다.
+    let (pad_left, pad_right) = if shift.0 >= 0 { (pad_x, 0) } else { (0, pad_x) };
+    let x = (rect[0] as f32 * sx).floor() as i32 - pad_left;
     let top = (rect[1] as f32 * sy).floor() as i32 - pad_y;
-    let w = (rect[2] as f32 * sx).ceil() as i32 + 2 * pad_x;
+    let w = (rect[2] as f32 * sx).ceil() as i32 + pad_left + pad_right;
     let h = (rect[3] as f32 * sy).ceil() as i32 + 2 * pad_y;
     if w <= 0 || h <= 0 {
         return None;
@@ -4738,22 +4750,35 @@ mod scissor_lead_tests {
     }
 
     #[test]
-    fn shift_widens_both_sides() {
-        // 가로로 10px 움직이면 좌우로 각각 10 씩 넓어진다 -- 폭이 20 늘고 왼쪽 끝이 10
-        // 줄어든다. 여기서는 왼쪽이 0 에 붙어 있으므로 클램프되어 폭만 10 늘어난다.
+    fn positive_shift_widens_to_the_left_only() {
+        // ★가로는 단방향이다.★ 캔버스가 화면에서 +x 로 가면 타일이 보는 부분은 -x 로
+        // 옮겨 가므로 그쪽만 넓힌다. 실기가 확정한 부호다(log_webgl_perf_01/31).
         let got =
             scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (10, 0)).unwrap();
         assert_eq!(got[0], 90, "왼쪽으로 10 넓어진다");
-        assert_eq!(got[2], 2900, "폭이 20 늘어난다");
+        assert_eq!(
+            got[2], 2890,
+            "폭은 10 만 늘어난다 -- 양방향이면 2900 이었다"
+        );
         assert_eq!(got[3], 2160, "세로는 그대로다");
     }
 
     #[test]
-    fn shift_sign_does_not_matter() {
-        // ★양방향이므로 부호가 결과를 바꾸지 않는다.★ 이것이 이 설계의 안전장치다.
-        let plus = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (10, 7));
-        let minus = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (-10, -7));
-        assert_eq!(plus, minus);
+    fn negative_shift_widens_to_the_right_only() {
+        let got =
+            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (-10, 0)).unwrap();
+        assert_eq!(got[0], 100, "왼쪽 끝은 그대로다");
+        assert_eq!(got[2], 2890, "오른쪽으로 10 넓어진다");
+    }
+
+    #[test]
+    fn vertical_stays_symmetric() {
+        // ★세로는 양방향을 유지한다★ -- 실기가 세로 부호를 말해 주지 않았다.
+        let up = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (0, 7));
+        let down = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (0, -7));
+        assert_eq!(up, down, "세로 부호는 결과를 바꾸지 않는다");
+        let got = up.unwrap();
+        assert_eq!(got[3], 2160 + 14, "위아래로 각각 7 넓어진다");
     }
 
     #[test]
@@ -4780,7 +4805,8 @@ mod scissor_lead_tests {
             scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, canvas, (10, 0)).unwrap();
         // sx = 2, 그러므로 pad_x = 20. x = 200 - 20 = 180.
         assert_eq!(got[0], 180);
-        assert_eq!(got[2], 5760 + 40);
+        // ★단방향이므로 폭은 pad 한 번만 늘어난다★ -- 양방향이던 때는 +40 이었다.
+        assert_eq!(got[2], 5760 + 20);
     }
 
     #[test]

@@ -881,9 +881,20 @@ pub struct Preferences {
     /// 적는 사각형은 그 프레임의 값으로는 정확한데, 캔버스가 비동기라 그 scissor 로 그린
     /// 비트맵은 ***더 뒤의 프레임***에서 표출된다. 그 사이의 이동량이 띠가 된다.
     ///
-    /// 이 값은 ★캔버스 파이프라인 지연★ 이고, 지금 그것을 재는 수치가 없다(`SURFIMPORT` 는
-    /// 합과 개수만, `RENDERCOST` 는 포함하지만 귀속 불가). 그래서 pref 로 두고 실기에서
-    /// 0/1/2 를 쓸어 ***띠가 사라지는 최소값***을 찾는다 -- 그 값이 곧 지연의 측정값이다.
+    /// 이 값은 ★캔버스 파이프라인 지연★ 이고, 그것을 직접 재는 수치가 없다(`SURFIMPORT` 는
+    /// 합과 개수만, `RENDERCOST` 는 포함하지만 귀속 불가). 그래서 실기로 쓸었다.
+    ///
+    /// ★2026-11-11 실기(log_webgl_perf_01/30·31): 0 -> 4 로 단조 감소하고 4 에서 거의
+    /// 사라진다.★ 그래서 기본값을 4 로 둔다. 조사가 예산을 22~115ms 로 추정했고(기록 나이
+    /// 0~34ms + 캔버스 한 프레임 22~52ms + 재표출 확률), 4 주기 = 66.7ms 가 그 대부분을
+    /// 덮는다.
+    ///
+    /// ★양방향 4 는 렌더를 밀어냈다★ -- `RENDERCOST last10s_over` 가 0(lead 3) -> 109,
+    /// `last10s_worst` 8.6ms -> 79.5ms. 그래서 같은 날 가로를 단방향으로 바꿨고(실기가 부호를
+    /// 확정했다) 같은 폭이 절반 비용이 됐다. 이 기본값 4 는 ★단방향 기준★ 이다.
+    ///
+    /// 남은 현상: ★애니메이션 시작 순간에 넓은 띠가 잠깐★ 보인다(운영자 관찰). 예측이
+    /// 0 에서 4 주기분으로 뛰는 전환이 후보이고, 아직 미해결이다.
     ///
     /// 주기는 `gfx_refresh_hz` 에서 온다. 올리면 넓어진 만큼 셰이딩이 늘고, 예측이 빗나가도
     /// ***큰 쪽으로*** 틀리므로 빈 칸은 생기지 않는다. 설계는
@@ -1683,7 +1694,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
-            gfx_wall_canvas_scissor_lead_periods: 1,
+            gfx_wall_canvas_scissor_lead_periods: 4,
             gfx_vsync_enabled: false,
             gfx_vsync_phase_pct: 0,
             gfx_present_sync_interval: 0,
