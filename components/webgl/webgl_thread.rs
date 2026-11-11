@@ -1635,6 +1635,14 @@ impl WebGLThread {
         context_id: WebGLContextId,
         requested_size: Size2D<u32>,
     ) -> Result<(), String> {
+        // ★released 컨텍스트를 되살린다.★ 2026-11-11, log_webgl_perf_01/39.
+        //
+        // 여기가 released 를 깨우지 못하는 ***유일한 입구***였다 -- 아래 `is_empty` 에서
+        // 그냥 `Err` 로 나갔다. `gear` 데모는 `addEventListener('resize', resize)` 로 이
+        // 입구를 자주 두드리는데(`scene` 에는 그 리스너가 없다), resize 이벤트는 rAF
+        // ***전***에 배달되므로 rAF 콜백이 없는 턴에도 `ResizeContext` 가 온다. 그래서
+        // released 컨텍스트를 되살리지 못한 채 계속 두드리기만 했다.
+        self.restore_context_backends(context_id);
         let surface_ids = self.backend_surface_ids(context_id);
         if surface_ids.is_empty() {
             return Err("Missing WebGL context!".to_string());
@@ -1825,6 +1833,17 @@ impl WebGLThread {
         let Some(recipe) = self.context_recipes.get(&context_id).cloned() else {
             return;
         };
+        // ★부분 실패는 되돌린다.★ 2026-11-11.
+        //
+        // 앞 판은 첫 실패 타일에서 그냥 `return` 했다. 그러면 ***이미 만든 백엔드가
+        // `self.contexts` 에 남고***, `context_backends` 는 갱신되지 않고,
+        // `released_contexts` 에서 제거되지 않고, `Restored` 알림도 가지 않는다 -- 반쪽
+        // 상태다. 그리고 이제 `handle_swap_buffers` 와 `resize_webgl_context` 가 매 프레임
+        // 이 함수를 부르므로(같은 날 커밋) 그 누수가 프레임마다 쌓인다.
+        //
+        // 실패하면 이 시도에서 만든 것만 걷어내고 released 로 남긴다 -- 다음 호출이
+        // 깨끗하게 다시 시도한다.
+        let mut made = Vec::with_capacity(recipe.painters.len());
         for target_painter_id in &recipe.painters {
             let surface_id = WebGLSurfaceId::new(context_id, *target_painter_id);
             match self.create_webgl_backend_context(
@@ -1836,9 +1855,17 @@ impl WebGLThread {
             ) {
                 Ok((context_data, _limits, _size, _has_alpha)) => {
                     self.contexts.insert(surface_id, context_data);
+                    made.push(surface_id);
                 },
                 Err(error) => {
-                    warn!("WebGL reclaim: failed to restore backend for {surface_id:?}: {error}");
+                    warn!(
+                        "WebGL reclaim: failed to restore backend for {surface_id:?}: {error} \
+                         -- rolling back {} already-created backend(s)",
+                        made.len()
+                    );
+                    for created in made {
+                        self.contexts.remove(&created);
+                    }
                     return;
                 },
             }
@@ -2127,6 +2154,15 @@ impl WebGLThread {
     ) {
         debug!("handle_swap_buffers()");
         for context_id in context_ids {
+            // ★released 컨텍스트를 되살린다.★ 2026-11-11, log_webgl_perf_01/39.
+            //
+            // 명령 경로들은 전부 이것을 한다(`apply_webgl_command_to_primary` 와
+            // `apply_webgl_command_to_all_backends`). 여기만 빠져 있었고, 그래서 유휴
+            // 회수로 released 된 컨텍스트는 `backend_surface_ids` 가 비어 아래 루프가 돌지
+            // 않고 ***epoch 이 미지급***됐다. 그러면 script 가
+            // `waiting_on_canvas_image_updates` 에 영구히 걸려 rAF 가 멈추고, rAF 가
+            // 멈추니 WebGL 명령도 없어 되살릴 기회조차 사라진다 -- 자기 잠금 고리다.
+            self.restore_context_backends(context_id);
             let primary_surface_id = self.primary_surface_id(context_id);
             let mut primary_update = None;
             for surface_id in self.backend_surface_ids(context_id) {
@@ -2216,6 +2252,11 @@ impl WebGLThread {
                 // 이 프레임을 건너뛰면 painter 는 직전 front buffer 를 계속 표출한다
                 // (`take_surface` 가 `recycled` 로 떨어진다, chains.rs:317-321) -- 캔버스가
                 // 한 프레임 멈추는 것이고, 스레드가 죽는 것과는 비교가 되지 않는다.
+                //
+                // ★단, 그 "한 프레임" 은 epoch 을 갚아야 성립한다★(2026-11-11,
+                // log_webgl_perf_01/39). 갚지 않으면 script 가
+                // `waiting_on_canvas_image_updates` 에 영구히 걸려 rAF 가 멈춘다 -- 영구
+                // 정지였다. 아래 `primary_update` 의 `None` 분기가 그것을 갚는다.
                 if let Err(error) = swap_chain.swap_buffers(
                     &data.device,
                     &mut data.ctx,
@@ -2297,10 +2338,62 @@ impl WebGLThread {
                     primary_update = Some((size, has_alpha));
                 }
             }
-            if let Some((size, has_alpha)) = primary_update {
-                self.update_webrender_image_for_context(context_id, size, has_alpha, canvas_epoch);
+            match primary_update {
+                Some((size, has_alpha)) => {
+                    self.update_webrender_image_for_context(
+                        context_id,
+                        size,
+                        has_alpha,
+                        canvas_epoch,
+                    );
+                },
+                // ★빚은 반드시 갚는다.★ 2026-11-11, log_webgl_perf_01/39.
+                //
+                // script 가 이 캔버스의 epoch 을 발행했으면 painter 가
+                // `pending_canvas_images` 에 그것을 걸고 ack 을 붙잡는다(네 타일 전부).
+                // 그 빚을 갚는 유일한 길이 epoch 을 실은 `UpdateImage` 이고, 타임아웃은
+                // 아무 데도 없다 -- `FrameDelayer` 에 데드라인 필드가 없고
+                // `ack_is_releasable` 은 `pending == 0` 을 요구한다.
+                //
+                // 그래서 ***갱신할 것이 없어도*** epoch 만은 갚는다. 여기 오는 경로는
+                // 둘이다.
+                //
+                // * released 컨텍스트: 위 `restore_context_backends` 가 실패했거나 레시피가
+                //   없다.
+                // * `swap_buffers` 실패: 아래 `note_swap_failure` 뒤 `continue` 한다.
+                //   그 자리의 옛 주석은 비용이 "캔버스가 한 프레임 멈추는 것" 이라고 했는데,
+                //   ***epoch 을 빚졌을 때는 틀렸다*** -- 영구 정지였다.
+                //
+                // 이미지 내용은 직전 것 그대로이므로 화면은 한 프레임 멈추고, 그것이 의도한
+                // 비용이다.
+                None => {
+                    if let Some(epoch) = canvas_epoch {
+                        self.settle_canvas_epoch(context_id, epoch);
+                    }
+                },
             }
         }
+    }
+
+    /// 갱신할 이미지가 없을 때 ★epoch 만 갚는다.★ 근거는 호출 자리 주석.
+    ///
+    /// `image_key` 가 아직 없으면(컨텍스트가 WR 에 등록되기 전) 갚을 대상도 없다 -- 그
+    /// 경우 script 는 애초에 이 캔버스의 epoch 을 발행하지 않는다.
+    fn settle_canvas_epoch(&mut self, context_id: WebGLContextId, epoch: Epoch) {
+        let Some(info) = self.cached_context_info.get(&context_id) else {
+            return;
+        };
+        let Some(image_key) = info.image_key else {
+            return;
+        };
+        let descriptor = info.image_descriptor();
+        let image_data = self.external_image_data(context_id);
+        warn!(
+            "WebGL: settling canvas epoch {epoch:?} for {context_id:?} with no new frame \
+             (released or swap failed) -- otherwise the paint ack would never be released"
+        );
+        self.paint_api
+            .update_image(image_key, descriptor, image_data, Some(epoch));
     }
 
     /// Which access mode to use
