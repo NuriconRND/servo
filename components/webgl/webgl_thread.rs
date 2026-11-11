@@ -195,6 +195,39 @@ static HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 그 값으로 바꿀 것.
 const SWAP_TO_COMPOSITE_MS: u64 = 17;
 
+/// `union_over` 가 쓸 샘플을 하나도 못 찾은 횟수. `SCISSORGATE` 리포터가 함께 찍는다.
+///
+/// ## 왜 이 수치인가 (2026-11-11, log_webgl_perf_01/40)
+///
+/// `lead 8` 에서 전환 ***중***의 띠는 사라졌는데, 운영자는 "바운스 전환 애니메이션
+/// ***시작시*** 우측 tile 좌측 경계에 비교적 넓은 검은 영역 잠시" 가 남았다고 적었다.
+///
+/// `stale` 과 `missing` 은 scissor 를 걸지 않으므로(전체 셰이딩) 띠를 만들지 않는다. 그러면
+/// 그 띠는 `applied` 상태에서 나온다 -- scissor 가 걸렸는데 영역이 모자란다. `union_over`
+/// 가 쓸 샘플을 못 찾아 `rect` 로 폴백하면 그것은 ★`lead 0` 과 같은 상태★ 이고 구조적으로
+/// 한 프레임 부족하다. 그 폴백이 전환 시작에 몰리는지가 이 축의 남은 질문이다.
+///
+/// 이유가 둘이라 구별한다.
+///
+/// * ★`empty`★ -- 표가 비었다. 애니메이션이 막 설치되어 painter 가 아직 그것을 보지 못한
+///   프레임이 후보다.
+/// * ★`drift`★ -- 표는 있는데 구간이 표를 벗어났다. 창이 모자라거나 `age` 가 커진 경우다.
+///
+/// ## 비용
+///
+/// 폴백이 난 프레임에만 ***원자 하나***다. 정상 상태에서는 `used == 0` 이 아니므로 아무
+/// 것도 하지 않는다.
+static TABLE_MISS_EMPTY: AtomicU64 = AtomicU64::new(0);
+static TABLE_MISS_DRIFT: AtomicU64 = AtomicU64::new(0);
+
+fn note_table_miss(empty: bool) {
+    if empty {
+        TABLE_MISS_EMPTY.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TABLE_MISS_DRIFT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn note_hold(ms: u64) {
     HOLD_SUM_MS.fetch_add(ms, Ordering::Relaxed);
     HOLD_MAX_MS.fetch_max(ms, Ordering::Relaxed);
@@ -265,7 +298,8 @@ fn note_scissor_gate(outcome: ScissorGate) {
     let hold_sum = HOLD_SUM_MS.swap(0, Ordering::Relaxed);
     warn!(
         "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
-         stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms)",
+         stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms) \
+         table_miss(empty={} drift={})",
         d[0],
         d[0] as f64 / secs,
         d[1],
@@ -280,6 +314,8 @@ fn note_scissor_gate(outcome: ScissorGate) {
             0
         },
         HOLD_MAX_MS.swap(0, Ordering::Relaxed),
+        TABLE_MISS_EMPTY.swap(0, Ordering::Relaxed),
+        TABLE_MISS_DRIFT.swap(0, Ordering::Relaxed),
     );
 }
 
@@ -2103,7 +2139,11 @@ impl WebGLThread {
         // ★앞은 그대로, 뒤만 늘린다.★ 근거는 이 함수의 doc 주석 -- 앞 판은 앞도 함께
         // 밀었고, 그러자 띠가 반대쪽 경계로 넘어갔다(log_webgl_perf_01/38).
         let hold_ms = hold.as_millis() as u64;
-        let wanted = noted.union_over(age, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
+        let (wanted, used) = noted.union_over(age, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
+        // ★폴백을 센다.★ 근거는 `note_table_miss` 의 doc 주석.
+        if used == 0 {
+            note_table_miss(noted.sample_count == 0);
+        }
         let scaled = self.scale_canvas_rect(wanted, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
             Some(_) => ScissorGate::Applied,
@@ -4998,7 +5038,7 @@ mod scissor_lead_tests {
             (50, [900, 0, 10, 10]),
         ]);
         // 구간 [0, 33] -> 앞 세 개만. 네 번째(멀리 떨어진 것)는 들어오지 않아야 한다.
-        assert_eq!(noted.union_over(0, 33), [0, 0, 30, 10]);
+        assert_eq!(noted.union_over(0, 33), ([0, 0, 30, 10], 3));
     }
 
     /// ★나이가 구간의 시작이다.★ 기록이 낡은 만큼 앞쪽 샘플은 이미 지나갔으므로 쓰지
@@ -5011,7 +5051,7 @@ mod scissor_lead_tests {
             (33, [20, 0, 10, 10]),
         ]);
         // 나이 16ms, hold 17ms -> [16, 33]: 뒤 두 개만.
-        assert_eq!(noted.union_over(16, 33), [10, 0, 20, 10]);
+        assert_eq!(noted.union_over(16, 33), ([10, 0, 20, 10], 2));
     }
 
     /// ★느린 캔버스는 자동으로 넓은 구간을 본다.★ `hold` 가 측정값이므로 고정 상수가
@@ -5025,8 +5065,8 @@ mod scissor_lead_tests {
             (33, [20, 0, 10, 10]),
             (50, [30, 0, 10, 10]),
         ]);
-        let fast = noted.union_over(0, 17);
-        let slow = noted.union_over(0, 50);
+        let (fast, _) = noted.union_over(0, 17);
+        let (slow, _) = noted.union_over(0, 50);
         assert_eq!(fast, [0, 0, 20, 10]);
         assert_eq!(slow, [0, 0, 40, 10]);
         assert!(slow[2] > fast[2], "느린 쪽이 더 넓어야 한다");
@@ -5048,10 +5088,10 @@ mod scissor_lead_tests {
             (51, [30, 0, 10, 10]),
         ]);
         // age 0, hold 17, delta 17 -> [0, 51]: 네 칸 전부.
-        let got = noted.union_over(0, 2 * 17 + 17);
+        let (got, _) = noted.union_over(0, 2 * 17 + 17);
         assert_eq!(got, [0, 0, 40, 10], "앞뒤를 모두 덮어야 한다: {got:?}");
         // 앞을 밀었던 4 차의 창은 첫 칸을 빠뜨렸다 -- 그것이 반대쪽 띠였다.
-        let pushed = noted.union_over(17, 2 * 17 + 17);
+        let (pushed, _) = noted.union_over(17, 2 * 17 + 17);
         assert!(
             pushed[0] > got[0],
             "4 차 창은 가까운 쪽을 잘랐다: {pushed:?}"
@@ -5080,7 +5120,8 @@ mod scissor_lead_tests {
     #[test]
     fn an_interval_past_the_table_falls_back() {
         let noted = sample_table(&[(0, [0, 0, 10, 10]), (16, [10, 0, 10, 10])]);
-        assert_eq!(noted.union_over(900, 999), [0, 0, 10, 10]);
+        // ★`used == 0` 이 `drift` 폴백의 정의다★ -- 소비자가 그것으로 센다.
+        assert_eq!(noted.union_over(900, 999), ([0, 0, 10, 10], 0));
     }
 
     /// ★표가 비면 오늘 사각형이다.★ `lead = 0` 으로 끈 구성이 이 경로다.
@@ -5088,7 +5129,8 @@ mod scissor_lead_tests {
     fn an_empty_table_is_todays_rect() {
         let mut noted = sample_table(&[(0, [5, 6, 10, 10])]);
         noted.sample_count = 0;
-        assert_eq!(noted.union_over(0, 100), [5, 6, 10, 10]);
+        // ★`sample_count == 0` 과 `used == 0` 이 함께면 `empty` 폴백이다.★
+        assert_eq!(noted.union_over(0, 100), ([5, 6, 10, 10], 0));
     }
 
     use euclid::Size2D;

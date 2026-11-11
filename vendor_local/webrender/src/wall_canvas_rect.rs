@@ -99,19 +99,24 @@ impl CanvasTileRect {
     ///
     /// 구간에 걸리는 것이 없으면(표가 비었거나 구간이 표를 벗어났으면) `rect` 를 준다 --
     /// 그러면 동작이 표를 들이기 전과 같다.
-    pub fn union_over(&self, from_ms: u64, to_ms: u64) -> [i32; 4] {
+    pub fn union_over(&self, from_ms: u64, to_ms: u64) -> ([i32; 4], u8) {
         let mut acc: Option<[i32; 4]> = None;
+        let mut used = 0;
         for &(offset, rect) in &self.samples[..self.sample_count as usize] {
             let offset = offset as u64;
             if offset < from_ms || offset > to_ms {
                 continue;
             }
+            used += 1;
             acc = Some(match acc {
                 None => rect,
                 Some(have) => union_boxes(have, rect),
             });
         }
-        acc.unwrap_or(self.rect)
+        // ★몇 개를 썼는지 함께 준다.★ 0 이면 폴백이고, 그것은 `lead 0` 과 같은 상태라
+        // 구조적으로 한 프레임 부족하다 -- 소비자가 그 횟수를 센다. `rect` 와 같은지로
+        // 판정하면 ***움직이지 않을 때 우연히 같은 경우***를 폴백으로 오판한다.
+        (acc.unwrap_or(self.rect), used)
     }
 }
 
