@@ -234,6 +234,29 @@ fn note_table_miss(sample_count: u8) {
     };
 }
 
+/// 회수 횟수. `RECLAIM` 줄이 몇 번째인지 보이게 한다.
+///
+/// ## 왜 이 로그인가 (2026-11-11, log_webgl_perf_01/42)
+///
+/// 전환 중 WebGL 이 멈추는 증상을 쫓으며 내 가설이 세 번 틀렸다 -- 표가 빈다(`empty=0`
+/// 으로 기각), 창이 모자란다(`drift=8~20` 으로 기각), 회수 판정이 그리기를 보지 않는다
+/// (고쳤는데 재발).
+///
+/// 그리고 손에 있는 것은 ***증상***뿐이었다. `release_context_backends` 와
+/// `restore_context_backends` 는 실패했을 때만 로그를 남기므로 42 번 로그의 reclaim 줄은
+/// ***0 개***였다. 언제·몇 번 회수/복구됐는지를 모르면 "swap 이 왜 3 초간 안 왔나" 를
+/// 물을 수조차 없다.
+///
+/// `since_alive` 가 유휴 기준 근처면 ***rAF 가 진짜 멈춘 것***이고, 작은데도 회수됐으면
+/// `last_alive` 수정에 구멍이 있다. `was released for` 가 아예 안 찍히면 복구 경로가 닿지
+/// 않는 것이고, 찍히는데도 멈춤이 보이면 ***복구 뒤에도 화면이 안 돌아오는*** 다른 축이다.
+///
+/// ## 비용
+///
+/// 회수와 복구는 ***전환당 몇 번***이다 -- 초당 수천이 아니다. 그래서 `warn!` 한 줄이
+/// 허용된다. 2026-10-27 규칙이 금지하는 것은 ***프레임마다 도는 경로***의 I/O 다.
+static RECLAIM_COUNT: AtomicU64 = AtomicU64::new(0);
+
 fn note_hold(ms: u64) {
     HOLD_SUM_MS.fetch_add(ms, Ordering::Relaxed);
     HOLD_MAX_MS.fetch_max(ms, Ordering::Relaxed);
@@ -625,6 +648,8 @@ pub(crate) struct WebGLThread {
     /// 캔버스가 타일에서 보이지 않는 구간이 있고, 그동안 페이지는 계속 그리고 있다는 것이다.
     /// 합성만 기준으로 삼으면 ***그려지고 있는 캔버스를 빼앗는다***.
     last_alive: FxHashMap<WebGLContextId, Instant>,
+    /// 회수한 시각(컨텍스트별). 복구할 때 released 상태가 얼마나 길었는지 찍는 데 쓴다.
+    released_at: FxHashMap<WebGLContextId, Instant>,
     /// 회수 판정을 마지막으로 돌린 시각(초당 한 번으로 묶기 위한 것).
     last_reclaim_sweep: Option<Instant>,
     /// 손실/복구를 스크립트에 알릴 채널(컨텍스트별).
@@ -752,6 +777,7 @@ impl WebGLThread {
             context_recipes: Default::default(),
             released_contexts: Default::default(),
             last_alive: Default::default(),
+            released_at: Default::default(),
             last_reclaim_sweep: None,
             context_notifiers: Default::default(),
             cached_context_info: Default::default(),
@@ -1807,6 +1833,19 @@ impl WebGLThread {
             })
             .collect();
         for context_id in stale {
+            // ★언제·왜 회수했는지 남긴다.★ 근거는 아래 doc 주석. 전환당 몇 번이라 I/O 가
+            // 허용된다.
+            let since_alive = self
+                .last_alive
+                .get(&context_id)
+                .map(|last| now.duration_since(*last).as_millis())
+                .unwrap_or(0);
+            let nth = RECLAIM_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                "RECLAIM #{nth} releasing {context_id:?}: since_alive={since_alive}ms \
+                 (idle threshold {idle_ms}ms)"
+            );
+            self.released_at.insert(context_id, now);
             self.release_context_backends(context_id);
         }
     }
@@ -1895,6 +1934,13 @@ impl WebGLThread {
         if !self.released_contexts.contains(&context_id) {
             return;
         }
+        // ★released 상태가 얼마나 길었나.★ 근거는 `RECLAIM_COUNT` 의 doc 주석.
+        let held_ms = self
+            .released_at
+            .remove(&context_id)
+            .map(|at| at.elapsed().as_millis())
+            .unwrap_or(0);
+        warn!("RECLAIM restoring {context_id:?}: was released for {held_ms}ms");
         let Some(recipe) = self.context_recipes.get(&context_id).cloned() else {
             return;
         };
