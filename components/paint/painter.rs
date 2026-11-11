@@ -797,6 +797,14 @@ impl Painter {
         webrender::wall_canvas_rect::set_max_age_ms(
             servo_config::pref!(gfx_wall_webgl_tile_scissor_max_age_ms).max(0) as u64,
         );
+        // ★2026-11-11: 예측 주기 수도 여기서 원자에 싣는다.★ `publish_canvas_scissor_lead`
+        // 는 벽 틱과 렌더 양쪽에서 불려 painter 마다 120/s 로 도는데, 거기서 `pref!` 를
+        // 치면 네 painter 스레드가 초당 480 번 전역 `RwLock` 을 잡는다 -- 계측을 전부
+        // 걷어낸 2026-10-27 규칙이 금지하는 형태다. 바로 위 `set_max_age_ms` 와 같은 패턴.
+        CANVAS_SCISSOR_LEAD_PERIODS.store(
+            servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 4) as u32,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let (mut webrender_renderer, webrender_api_sender) = webrender::create_webrender_instance(
             webrender_gl.clone(),
@@ -3058,13 +3066,12 @@ impl Painter {
         sample_at: Instant,
         now_transforms: &[webrender_api::PropertyValue<webrender_api::units::LayoutTransform>],
     ) {
-        let lead_periods = pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 4) as u32;
-        if lead_periods == 0 {
-            webrender::wall_canvas_rect::set_predicted_shift(0, 0);
-            return;
-        }
-        if now_transforms.is_empty() {
-            webrender::wall_canvas_rect::set_predicted_shift(0, 0);
+        // ★원자 로드 하나다★ -- `pref!` 는 전역 `RwLock` 이고 이 함수는 painter 마다
+        // 120/s 로 돈다(2026-11-11 조사). 값은 `perform_updates` 가 싣는다.
+        let lead_periods = CANVAS_SCISSOR_LEAD_PERIODS.load(std::sync::atomic::Ordering::Relaxed);
+        let slot = webrender_api::IdNamespace::from(self.painter_id).0;
+        if lead_periods == 0 || now_transforms.is_empty() {
+            webrender::wall_canvas_rect::set_predicted_shift(slot, 0, 0);
             return;
         }
         let period = crate::refresh_driver::paint_timer_period();
@@ -3099,6 +3106,7 @@ impl Painter {
             }
         }
         webrender::wall_canvas_rect::set_predicted_shift(
+            slot,
             shift_x.round() as i32,
             shift_y.round() as i32,
         );
@@ -3792,6 +3800,15 @@ pub(crate) enum PaintMetricState {
     /// The metric has been sent to the constellation and no more work needs to be done.
     Sent,
 }
+
+/// `gfx_wall_canvas_scissor_lead_periods` 의 원자 사본. `perform_updates` 가 싣고
+/// `publish_canvas_scissor_lead` 가 읽는다.
+///
+/// ★2026-11-11: `pref!` 를 타이밍 경로에서 치지 않기 위한 것이다.★ 그 함수는 벽 틱과 렌더
+/// 양쪽에서 불려 painter 마다 120/s 로 돌고, `pref!` 는 전역 `RwLock` 획득이다 -- 네
+/// painter 스레드가 초당 480 번 그것을 잡는다. `wall_canvas_rect::MAX_AGE_MS` 와 같은 패턴.
+static CANVAS_SCISSOR_LEAD_PERIODS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
 
 /// [`Painter::pump_paint_animation`] 을 부른 자리. ★2026-10-22 에 셋이 됐고, 셋은 서로
 /// 배타적이지 않다★ -- 그 전까지 코드 주석 두 곳이 "호출 지점은 둘뿐이고 배타적" 이라고

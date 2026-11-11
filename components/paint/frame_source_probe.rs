@@ -346,6 +346,8 @@ pub(crate) fn note_frame(from_wall_tick: bool, reason_bits: u64) {
 /// 운영자는 1/4/15/30/60Hz 를 눈으로 구별한다.
 fn report_tick_cadence(elapsed: Duration) {
     static LAST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    /// 직전 보고 시각(프로브 시작 이후 ms). ★구간 길이를 여기서 뺀다.★
+    static LAST_AT_MS: AtomicU64 = AtomicU64::new(0);
 
     let frames = CADENCE_FRAMES.load(Ordering::Relaxed);
     let now = [
@@ -363,7 +365,14 @@ fn report_tick_cadence(elapsed: Duration) {
     if d[0] == 0 && d[1] == 0 && d[2] == 0 && d[3] == 0 && d[4] == 0 {
         return;
     }
-    let secs = elapsed.as_secs_f64().max(1e-9);
+    // ★2026-11-11 수정: 분모가 틀려 있었다.★ 칸은 ***구간 차분***인데 `elapsed` 는
+    // ***프로브 시작 이후 총 경과***라, `frames=311 (3.1/s)` 이 실제로는 31.1/s 였다.
+    // 그 10 배 오차로 "`tick` 이 초당 3 번만 돈다" 는 가설을 세웠고, 조사에서 실제
+    // `pump_paint_animation` 은 120/s 로 돈다는 것이 확인되어 가설이 죽었다. 구간 길이를
+    // 여기서 직접 뺀다 -- 누적으로 나누지 않는다.
+    let now_ms = elapsed.as_millis() as u64;
+    let prev_at_ms = LAST_AT_MS.swap(now_ms, Ordering::Relaxed);
+    let secs = ((now_ms.saturating_sub(prev_at_ms)) as f64 / 1000.0).max(1e-9);
     let rate = |n: u64| n as f64 / secs;
     // 실효 약수 -- 기대값과 맞는지 바로 보려는 것이다.
     let div = |n: u64| {

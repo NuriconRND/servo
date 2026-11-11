@@ -1922,7 +1922,7 @@ impl WebGLThread {
             note_scissor_gate(ScissorGate::NoIntersection);
             return None;
         }
-        let scaled = self.scale_canvas_rect(noted.rect, noted.dest_size, canvas);
+        let scaled = self.scale_canvas_rect(surface_id, noted.rect, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
             Some(_) => ScissorGate::Applied,
             None => ScissorGate::NoIntersection,
@@ -1937,15 +1937,17 @@ impl WebGLThread {
     /// 원점을 GL 의 아래-왼쪽으로 뒤집는다.
     fn scale_canvas_rect(
         &self,
+        surface_id: WebGLSurfaceId,
         rect: [i32; 4],
         dest_size: [i32; 2],
         canvas: Size2D<i32>,
     ) -> Option<[i32; 4]> {
+        let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
         scale_canvas_rect_with_pad(
             rect,
             dest_size,
             canvas,
-            webrender::wall_canvas_rect::predicted_shift(),
+            webrender::wall_canvas_rect::predicted_shift(slot),
         )
     }
 

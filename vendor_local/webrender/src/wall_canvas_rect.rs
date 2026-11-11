@@ -146,20 +146,28 @@ pub fn set_enabled(enabled: bool) {
 /// 단위는 layout px 이고, 소비자가 `dest_size` 비율로 캔버스 백킹 px 로 환산한다.
 /// 둘 다 0 이면 예측이 꺼진 것이거나 애니메이션이 없는 것이다 -- 어느 쪽이든 동작이
 /// 지금과 같다.
-static PREDICTED_SHIFT_X: AtomicI32 = AtomicI32::new(0);
-static PREDICTED_SHIFT_Y: AtomicI32 = AtomicI32::new(0);
+/// ★2026-11-11: painter 슬롯마다 따로 둔다.★ 처음에는 전역 둘이었는데, painter 넷이 같은
+/// 칸에 쓰므로 ***마지막 쓴 쪽이 이긴다*** -- 자기 타일에 애니메이션이 없어 `(0, 0)` 을
+/// 적은 painter 가 ***네 타일 전부의 예측을 지웠다***. 기록 자체(`note`/`get`)는 처음부터
+/// 슬롯별이었는데 이동량만 전역이었다. 슬롯 수는 `MAX_SLOTS` 로 고정하고 넘는 슬롯은
+/// 마지막 칸에 모은다(벽은 넷이다).
+const MAX_SLOTS: usize = 8;
+static PREDICTED_SHIFT_X: [AtomicI32; MAX_SLOTS] = [const { AtomicI32::new(0) }; MAX_SLOTS];
+static PREDICTED_SHIFT_Y: [AtomicI32; MAX_SLOTS] = [const { AtomicI32::new(0) }; MAX_SLOTS];
 
-/// 예측 이동량을 적는다(layout px). `paint` 가 틱마다 부른다. ★원자 둘이 전부다.★
-pub fn set_predicted_shift(dx: i32, dy: i32) {
-    PREDICTED_SHIFT_X.store(dx, Ordering::Relaxed);
-    PREDICTED_SHIFT_Y.store(dy, Ordering::Relaxed);
+/// 이 painter 슬롯의 예측 이동량을 적는다(layout px). ★원자 둘이 전부다.★
+pub fn set_predicted_shift(slot: u32, dx: i32, dy: i32) {
+    let index = (slot as usize).min(MAX_SLOTS - 1);
+    PREDICTED_SHIFT_X[index].store(dx, Ordering::Relaxed);
+    PREDICTED_SHIFT_Y[index].store(dy, Ordering::Relaxed);
 }
 
-/// 지금 예측 이동량(layout px). ★원자 로드 둘이다.★
-pub fn predicted_shift() -> (i32, i32) {
+/// 그 슬롯의 예측 이동량(layout px). ★원자 로드 둘이다.★
+pub fn predicted_shift(slot: u32) -> (i32, i32) {
+    let index = (slot as usize).min(MAX_SLOTS - 1);
     (
-        PREDICTED_SHIFT_X.load(Ordering::Relaxed),
-        PREDICTED_SHIFT_Y.load(Ordering::Relaxed),
+        PREDICTED_SHIFT_X[index].load(Ordering::Relaxed),
+        PREDICTED_SHIFT_Y[index].load(Ordering::Relaxed),
     )
 }
 
