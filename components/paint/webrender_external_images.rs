@@ -5,6 +5,7 @@
 use std::rc::Rc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use euclid::default::Size2D;
 use log::{debug, info, warn};
@@ -145,8 +146,11 @@ impl WebGLExternalImages {
         // 즉 이 뮤텍스 대기는 버그가 아니라 ***서피스 순환을 지키는 장치***다.
         //
         // 대기를 없애려면 장이 하나 더 필요하다(트리플 버퍼링, 백엔드마다 +190MB).
-        // 그 전에 이 대기가 실제로 얼마나 긴지를 재야 한다 -- 지금 그 수치가 없다.
+        // 그 전에 이 대기가 실제로 얼마나 긴지를 재야 한다 -- ★`LOCKWAIT` 가 그것을
+        // 잰다★(2026-11-11, `note_lock_wait` 의 doc 주석).
+        let wait_began = Instant::now();
         let front_buffer = swap_chain.take_surface();
+        let took_surface_at = Instant::now();
         let Some(front_buffer) = front_buffer else {
             warn!("WebGL external image lock failed: no front buffer for {surface_id:?}");
             self.mark_surface_not_busy(surface_id);
@@ -154,6 +158,10 @@ impl WebGLExternalImages {
             return None;
         };
         let created = self.rendering_context.create_texture(front_buffer);
+        note_lock_wait(
+            took_surface_at.saturating_duration_since(wait_began),
+            took_surface_at.elapsed(),
+        );
         let (surface_texture, gl_texture, size) = match created {
             Ok(texture) => texture,
             Err(front_buffer) => {
@@ -379,6 +387,62 @@ impl WebGLExternalImages {
 
         Some(())
     }
+}
+
+/// `lock_swap_chain` 의 대기 둘을 잰다. 1200 lock 마다 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-11)
+///
+/// 운영자 관찰(log_webgl_perf_01/39·40): "WebGL 4개 tile 표출 + ticker 애니메이션 조합
+/// 구성시 ticker 애니메이션에서 judder 발생", "전환 애니메이션 중 60fps 보통 유지하나
+/// 유지하는 상태에서도 judder 간헐적 발생".
+///
+/// `lock_swap_chain` 의 주석이 다음 단계를 적어 뒀다 -- "대기를 없애려면 장이 하나 더
+/// 필요하다(트리플 버퍼링, 백엔드마다 +190MB). 그 전에 이 대기가 실제로 얼마나 긴지를
+/// 재야 한다 -- 지금 그 수치가 없다."
+///
+/// 재는 것 둘.
+///
+/// * ★`chain`★ -- `take_surface` 가 스왑체인의 블로킹 Mutex 를 기다린 시간. WebGL 스레드가
+///   그 체인을 만지는 동안이다.
+/// * ★`tex`★ -- `create_texture` 가 걸린 시간. 그 안에서 DXGI keyed mutex 를
+///   `AcquireSync(0, INFINITE)` 로 잡으므로, GPU 가 그 서피스를 쓰고 있으면 기다린다.
+///
+/// 한 주기는 16.7ms 다. 어느 쪽이든 그에 가까우면 트리플 버퍼링이 근거를 얻고, 둘 다 훨씬
+/// 짧으면 judder 는 다른 데 있다.
+///
+/// ## 비용
+///
+/// lock 당 시계 ***세 번***과 원자 다섯이다. `Instant::now()` 가 약 25ns 이므로
+/// 240 lock/s 에서 ***18us/s*** 다. 리포트에 I/O 도 새 스레드도 없다.
+fn note_lock_wait(chain: Duration, tex: Duration) {
+    static CHAIN_SUM_US: AtomicU64 = AtomicU64::new(0);
+    static CHAIN_MAX_US: AtomicU64 = AtomicU64::new(0);
+    static TEX_SUM_US: AtomicU64 = AtomicU64::new(0);
+    static TEX_MAX_US: AtomicU64 = AtomicU64::new(0);
+    static LOCKS: AtomicU64 = AtomicU64::new(0);
+
+    let chain_us = chain.as_micros() as u64;
+    let tex_us = tex.as_micros() as u64;
+    CHAIN_SUM_US.fetch_add(chain_us, Ordering::Relaxed);
+    CHAIN_MAX_US.fetch_max(chain_us, Ordering::Relaxed);
+    TEX_SUM_US.fetch_add(tex_us, Ordering::Relaxed);
+    TEX_MAX_US.fetch_max(tex_us, Ordering::Relaxed);
+
+    // ★호출 수로 리포트 시점을 정한다★ -- 시계를 또 읽지 않는다. 1200 은 네 painter 가
+    // 60Hz 로 돌 때 약 5 초다.
+    let locks = LOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if locks % 1200 != 0 {
+        return;
+    }
+    let n = LOCKS.swap(0, Ordering::Relaxed).max(1);
+    warn!(
+        "LOCKWAIT n={n} chain(avg={}us max={}us) tex(avg={}us max={}us)",
+        CHAIN_SUM_US.swap(0, Ordering::Relaxed) / n,
+        CHAIN_MAX_US.swap(0, Ordering::Relaxed),
+        TEX_SUM_US.swap(0, Ordering::Relaxed) / n,
+        TEX_MAX_US.swap(0, Ordering::Relaxed),
+    );
 }
 
 impl WebRenderExternalImageApi for WebGLExternalImages {
