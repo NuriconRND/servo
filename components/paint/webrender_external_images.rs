@@ -149,8 +149,14 @@ impl WebGLExternalImages {
         // 그 전에 이 대기가 실제로 얼마나 긴지를 재야 한다 -- ★`LOCKWAIT` 가 그것을
         // 잰다★(2026-11-11, `note_lock_wait` 의 doc 주석).
         let wait_began = Instant::now();
-        let front_buffer = swap_chain.take_surface();
+        // ★나이를 함께 받는다★ -- 꼬리의 원인을 가르는 값이다. 근거는 `note_lock_wait` 의
+        // doc 주석.
+        let taken = swap_chain.take_surface_with_age();
         let took_surface_at = Instant::now();
+        let (front_buffer, pending_age) = match taken {
+            Some((surface, age)) => (Some(surface), age),
+            None => (None, None),
+        };
         let Some(front_buffer) = front_buffer else {
             warn!("WebGL external image lock failed: no front buffer for {surface_id:?}");
             self.mark_surface_not_busy(surface_id);
@@ -161,6 +167,7 @@ impl WebGLExternalImages {
         note_lock_wait(
             took_surface_at.saturating_duration_since(wait_began),
             took_surface_at.elapsed(),
+            pending_age,
         );
         let (surface_texture, gl_texture, size) = match created {
             Ok(texture) => texture,
@@ -389,38 +396,55 @@ impl WebGLExternalImages {
     }
 }
 
-/// `lock_swap_chain` 의 대기 둘을 잰다. 1200 lock 마다 한 줄.
+/// `lock_swap_chain` 의 대기 둘을 잰다. 1200 lock 마다 한 줄, ★꼬리는 그때그때 한 줄★.
 ///
-/// ## 왜 이 수치인가 (2026-11-11)
+/// ## 재는 것
 ///
-/// 운영자 관찰(log_webgl_perf_01/39·40): "WebGL 4개 tile 표출 + ticker 애니메이션 조합
-/// 구성시 ticker 애니메이션에서 judder 발생", "전환 애니메이션 중 60fps 보통 유지하나
-/// 유지하는 상태에서도 judder 간헐적 발생".
-///
-/// `lock_swap_chain` 의 주석이 다음 단계를 적어 뒀다 -- "대기를 없애려면 장이 하나 더
-/// 필요하다(트리플 버퍼링, 백엔드마다 +190MB). 그 전에 이 대기가 실제로 얼마나 긴지를
-/// 재야 한다 -- 지금 그 수치가 없다."
-///
-/// 재는 것 둘.
-///
-/// * ★`chain`★ -- `take_surface` 가 스왑체인의 블로킹 Mutex 를 기다린 시간. WebGL 스레드가
-///   그 체인을 만지는 동안이다.
+/// * ★`chain`★ -- `take_surface` 가 스왑체인의 블로킹 Mutex 를 기다린 시간.
 /// * ★`tex`★ -- `create_texture` 가 걸린 시간. 그 안에서 DXGI keyed mutex 를
 ///   `AcquireSync(0, INFINITE)` 로 잡으므로, GPU 가 그 서피스를 쓰고 있으면 기다린다.
+/// * ★`age`★ -- 그 장이 생산된 뒤 지난 시간(`None` = `recycled` 에서 꺼냄).
 ///
-/// 한 주기는 16.7ms 다. 어느 쪽이든 그에 가까우면 트리플 버퍼링이 근거를 얻고, 둘 다 훨씬
-/// 짧으면 judder 는 다른 데 있다.
+/// ## 왜 `age` 가 필요한가 (2026-11-11, log_webgl_perf_01/42)
+///
+/// 첫 실측에서 `tex` 가 평균 73~136us 인데 5 초 구간 최대가 2735~11172us 였다 --
+/// ***꼬리가 평균의 100 배***다. 간헐적 judder 가 바로 이 꼬리일 수 있다.
+///
+/// 내가 "`SURFIMPORT acquire_ms` 의 구간 평균이 79us 이니 트리플 버퍼링은 효용이 없다" 고
+/// 적었는데 ***운영자가 그 논리를 반증했다*** -- 1 초 window 의 누적 합으로 나눈 평균은
+/// 꼬리에 대해 아무것도 말하지 않고, 잡으려는 것이 바로 꼬리다. 그리고 트리플 버퍼링이
+/// 고치는 것은 "평균 대기" 가 아니라 ***대기가 발생하는 조건***이다.
+///
+/// ```text
+///   소비자가 방금 생산된 장을 가져감  ->  GPU 가 아직 그 장에 쓰고 있음  ->  대기
+///   장이 셋이면 한 프레임 묵은 장을 가져갈 수 있음  ->  GPU 가 끝낼 시간이 있음
+/// ```
+///
+/// 그래서 트리플 버퍼링의 효용을 가르는 수치는 하나다.
+///
+/// * `age` 가 짧은데(1~3ms) 꼬리가 난다  ->  GPU 가 아직 쓰고 있다  ->  ★장을 늘리면 고친다★
+/// * `age` 가 긴데도(30ms+) 꼬리가 난다  ->  GPU 가 다른 일로 바쁘다  ->  ★장을 늘려도 무효★
 ///
 /// ## 비용
 ///
-/// lock 당 시계 ***세 번***과 원자 다섯이다. `Instant::now()` 가 약 25ns 이므로
-/// 240 lock/s 에서 ***18us/s*** 다. 리포트에 I/O 도 새 스레드도 없다.
-fn note_lock_wait(chain: Duration, tex: Duration) {
+/// lock 당 시계 셋과 원자 여덟이다(히스토그램 버킷 하나 포함). `Instant::now()` 가 약
+/// 25ns 이므로 240 lock/s 에서 18us/s 다. 꼬리 줄은 8ms 이상일 때만 나오고 실측 빈도가
+/// ***초당 0.2 회***라 I/O 가 문제되지 않는다. `swap_buffers` 쪽에 시계 하나가 더 늘었다
+/// (240/s = 6us/s).
+fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
+    /// 꼬리로 보고 한 줄 찍는 기준. 한 주기(16.7ms)의 절반이다.
+    const TAIL_US: u64 = 8_000;
+
     static CHAIN_SUM_US: AtomicU64 = AtomicU64::new(0);
     static CHAIN_MAX_US: AtomicU64 = AtomicU64::new(0);
     static TEX_SUM_US: AtomicU64 = AtomicU64::new(0);
     static TEX_MAX_US: AtomicU64 = AtomicU64::new(0);
     static LOCKS: AtomicU64 = AtomicU64::new(0);
+    /// `tex` 의 버킷: <0.5ms, <2ms, <8ms, >=8ms. 꼬리가 하나인지 여러 개인지 보인다.
+    static TEX_BUCKETS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    /// `recycled` 에서 꺼낸 횟수(= 직전 프레임 재표출). `age` 가 `None` 인 경우다.
+    static RECYCLED: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
 
     let chain_us = chain.as_micros() as u64;
     let tex_us = tex.as_micros() as u64;
@@ -428,6 +452,35 @@ fn note_lock_wait(chain: Duration, tex: Duration) {
     CHAIN_MAX_US.fetch_max(chain_us, Ordering::Relaxed);
     TEX_SUM_US.fetch_add(tex_us, Ordering::Relaxed);
     TEX_MAX_US.fetch_max(tex_us, Ordering::Relaxed);
+    let bucket = match tex_us {
+        ..500 => 0,
+        500..2_000 => 1,
+        2_000..TAIL_US => 2,
+        _ => 3,
+    };
+    TEX_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+    match age {
+        Some(_) => {},
+        None => {
+            RECYCLED.fetch_add(1, Ordering::Relaxed);
+        },
+    }
+
+    // ★꼬리는 그때그때 한 줄.★ 이 줄이 트리플 버퍼링의 효용을 가른다 -- 근거는 위 doc.
+    if tex_us >= TAIL_US {
+        let nth = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        match age {
+            Some(age) => warn!(
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                 surface_age={}us (fresh from producer)",
+                age.as_micros()
+            ),
+            None => warn!(
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                 surface_age=n/a (recycled, re-present)"
+            ),
+        }
+    }
 
     // ★호출 수로 리포트 시점을 정한다★ -- 시계를 또 읽지 않는다. 1200 은 네 painter 가
     // 60Hz 로 돌 때 약 5 초다.
@@ -437,11 +490,17 @@ fn note_lock_wait(chain: Duration, tex: Duration) {
     }
     let n = LOCKS.swap(0, Ordering::Relaxed).max(1);
     warn!(
-        "LOCKWAIT n={n} chain(avg={}us max={}us) tex(avg={}us max={}us)",
+        "LOCKWAIT n={n} chain(avg={}us max={}us) tex(avg={}us max={}us) \
+         tex_hist(<0.5ms={} <2ms={} <8ms={} >=8ms={}) recycled={}",
         CHAIN_SUM_US.swap(0, Ordering::Relaxed) / n,
         CHAIN_MAX_US.swap(0, Ordering::Relaxed),
         TEX_SUM_US.swap(0, Ordering::Relaxed) / n,
         TEX_MAX_US.swap(0, Ordering::Relaxed),
+        TEX_BUCKETS[0].swap(0, Ordering::Relaxed),
+        TEX_BUCKETS[1].swap(0, Ordering::Relaxed),
+        TEX_BUCKETS[2].swap(0, Ordering::Relaxed),
+        TEX_BUCKETS[3].swap(0, Ordering::Relaxed),
+        RECYCLED.swap(0, Ordering::Relaxed),
     );
 }
 

@@ -35,6 +35,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 // The data stored for each swap chain.
 struct SwapChainData<Device: DeviceAPI> {
@@ -48,6 +49,15 @@ struct SwapChainData<Device: DeviceAPI> {
     back_buffer: BackBuffer<Device>,
     // Some if the producing context has finished drawing a new front buffer, ready to be displayed.
     pending_surface: Option<Device::Surface>,
+    // When `pending_surface` was set. 2026-11-11.
+    //
+    // ★무엇을 가르나★: 소비자가 이 장을 가져갈 때의 경과가 짧으면 GPU 가 아직 그 장에
+    // 쓰고 있을 수 있고, 그것이 `AcquireSync` 대기(= `LOCKWAIT` 의 `tex` 꼬리)의 원인
+    // 후보다. 그 경우라면 장을 하나 더 두는 것(트리플 버퍼링)이 고친다. 경과가 길면
+    // GPU 가 다른 일로 바쁜 것이고 장을 늘려도 소용없다.
+    //
+    // 근거는 `components/paint/webrender_external_images.rs` 의 `note_lock_wait` doc 주석.
+    pending_since: Option<Instant>,
     // All of the surfaces that have already been displayed, ready to be recycled.
     recycled_surfaces: Vec<Device::Surface>,
 }
@@ -221,6 +231,7 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
             self.context_id
         );
         self.pending_surface = Some(new_front_buffer);
+        self.pending_since = Some(Instant::now());
         Ok(())
     }
 
@@ -315,9 +326,22 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
     // Returns the most recent recycled surface if there is no current front buffer.
     // Called by a consumer.
     fn take_surface(&mut self) -> Option<Device::Surface> {
-        self.pending_surface
-            .take()
-            .or_else(|| self.recycled_surfaces.pop())
+        self.take_surface_with_age().map(|(surface, _)| surface)
+    }
+
+    // `take_surface` 와 같지만 ★그 장이 생산된 뒤 얼마나 지났는지★ 를 함께 준다.
+    //
+    // `None` 은 `recycled` 에서 꺼냈다는 뜻이다 -- 직전 프레임을 다시 보여주는 경우이고,
+    // GPU 가 이미 끝낸 장이라 `AcquireSync` 꼬리의 후보가 아니다. 근거는 `pending_since`
+    // 의 주석.
+    fn take_surface_with_age(&mut self) -> Option<(Device::Surface, Option<Duration>)> {
+        match self.pending_surface.take() {
+            Some(surface) => {
+                let age = self.pending_since.take().map(|at| at.elapsed());
+                Some((surface, age))
+            },
+            None => self.recycled_surfaces.pop().map(|surface| (surface, None)),
+        }
     }
 
     // Take the current front buffer.
@@ -531,6 +555,14 @@ impl<Device: DeviceAPI> SwapChain<Device> {
 
     /// Take the current back buffer.
     /// Called by a producer.
+    /// `take_surface` 와 같지만 ★그 장이 생산된 뒤 얼마나 지났는지★ 를 함께 준다.
+    ///
+    /// `None` 은 `recycled` 에서 꺼냈다는 뜻이다. 근거는 `SwapChainData::pending_since`
+    /// 의 주석 -- 요점은 이 값이 `AcquireSync` 꼬리의 원인을 가른다는 것이다.
+    pub fn take_surface_with_age(&self) -> Option<(Device::Surface, Option<Duration>)> {
+        self.lock().take_surface_with_age()
+    }
+
     pub fn take_surface_texture(
         &self,
         device: &Device,
@@ -599,6 +631,7 @@ impl<Device: DeviceAPI> SwapChain<Device> {
             surface_access,
             back_buffer: BackBuffer::Attached,
             pending_surface: None,
+            pending_since: None,
             recycled_surfaces: Vec::new(),
         }))))
     }
@@ -618,6 +651,7 @@ impl<Device: DeviceAPI> SwapChain<Device> {
             surface_access,
             back_buffer: BackBuffer::Detached(surface),
             pending_surface: None,
+            pending_since: None,
             recycled_surfaces: Vec::new(),
         }))))
     }
