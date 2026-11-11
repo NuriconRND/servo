@@ -21,29 +21,6 @@ use webgl::webgl_thread::WebGLContextBusyMap;
 static STAGE_TO_PAINTER_DEVICE: LazyLock<bool> =
     LazyLock::new(|| servo_config::pref!(gfx_webgl_stage_to_painter_device));
 
-/// 스테이징 복사용으로 painter 디바이스에 사는 텍스처와 blit 용 FBO 둘.
-///
-/// 크기가 바뀌면 통째로 다시 만든다. 서피스당 하나다.
-/// painter 가 들고 있는 프론트 버퍼. `unlock` 이 무엇을 돌려줘야 하는지 구분한다.
-enum LockedFrontBuffer {
-    /// 이번 프레임에 새로 집어왔다 -- `unlock` 이 체인에 돌려준다(또는 `last_good` 으로
-    /// 옮기고 그 전 것을 돌려준다).
-    Fresh(SurfaceTexture),
-    /// ★직전 프레임을 다시 보여줬다★ -- 돌려줄 것이 없다. 그 서피스는 `last_good` 이
-    /// 계속 들고 있다.
-    Stale,
-}
-
-/// 마지막으로 성공한 프레임. 생산자가 뮤텍스를 들고 있을 때 이것을 다시 보여준다.
-///
-/// `gl_texture` 는 ★`lock` 이 WR 에게 돌려준 바로 그 값★ 이다(`stage_to_painter_device` 가
-/// 켜져 있으면 그 사본). 그래서 낡은 프레임도 같은 경로로 샘플된다.
-struct LastGoodFrame {
-    texture: SurfaceTexture,
-    gl_texture: gleam::gl::GLuint,
-    size: Size2D<i32>,
-}
-
 struct StagingTarget {
     texture: gleam::gl::GLuint,
     read_fbo: gleam::gl::GLuint,
@@ -52,13 +29,6 @@ struct StagingTarget {
 }
 
 /// Bridge between the webrender::ExternalImage callbacks and the WebGLThreads.
-/// `STALECANVAS` 를 마지막으로 찍은 때(단조 ms). 0 = 아직 안 찍음.
-static STALE_REPORT_AT_MS: AtomicU64 = AtomicU64::new(0);
-
-/// 생산자가 뮤텍스를 들고 있어서 직전 프레임을 다시 보여준 횟수.
-static STALE_REUSED: AtomicU64 = AtomicU64::new(0);
-/// 같은 상황인데 보여줄 직전 프레임이 없어서 빈 칸이 된 횟수(첫 프레임 등).
-static STALE_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
 
 pub struct WebGLExternalImages {
     painter_id: PainterId,
@@ -66,14 +36,7 @@ pub struct WebGLExternalImages {
     rendering_context: Rc<dyn RenderingContext>,
     swap_chains: SwapChains<WebGLSurfaceId, Device>,
     busy_webgl_context_map: WebGLContextBusyMap,
-    locked_front_buffers: FxHashMap<WebGLSurfaceId, Vec<LockedFrontBuffer>>,
-    /// 서피스마다 마지막으로 성공한 프레임. `gfx_webgl_nonblocking_front_buffer_lock` 이
-    /// 켜져 있을 때만 채운다. 한 서피스에 ★한 장★ 이다 -- 새 프레임이 들어오면 그 전 것을
-    /// 체인에 돌려준다.
-    last_good: FxHashMap<WebGLSurfaceId, LastGoodFrame>,
-    /// 이번 프레임에 WR 에게 돌려준 `(gl_texture, size)`. `unlock` 이 서피스를 `last_good`
-    /// 으로 옮길 때 같이 싣는다.
-    pending_last_good: FxHashMap<WebGLSurfaceId, (gleam::gl::GLuint, Size2D<i32>)>,
+    locked_front_buffers: FxHashMap<WebGLSurfaceId, Vec<Option<SurfaceTexture>>>,
     logged_locked_surfaces: FxHashSet<WebGLSurfaceId>,
     /// 서피스별 스테이징 대상(`gfx_webgl_stage_to_painter_device`).
     staging: FxHashMap<WebGLSurfaceId, StagingTarget>,
@@ -99,8 +62,6 @@ impl WebGLExternalImages {
             swap_chains,
             busy_webgl_context_map,
             locked_front_buffers: FxHashMap::default(),
-            last_good: FxHashMap::default(),
-            pending_last_good: FxHashMap::default(),
             logged_locked_surfaces: FxHashSet::default(),
             staging: FxHashMap::default(),
         }
@@ -150,27 +111,6 @@ impl WebGLExternalImages {
         Some(())
     }
 
-    /// 직전 프레임을 다시 보여준다. 생산자가 뮤텍스를 들고 있을 때 쓴다.
-    ///
-    /// ★`Stale` 표를 꼭 밀어 넣는다★ -- `unlock` 이 그것을 꺼내 busy 계수를 내린다. 안
-    /// 넣으면 `lock` 이 올린 계수가 영원히 남는다(기존 실패 경로들이 그 자리에서 직접
-    /// 내리는 것과 같은 이유다).
-    fn reuse_last_good(&mut self, surface_id: WebGLSurfaceId) -> Option<(u32, Size2D<i32>)> {
-        if let Some(last) = self.last_good.get(&surface_id) {
-            STALE_REUSED.fetch_add(1, Ordering::Relaxed);
-            self.locked_front_buffers
-                .entry(surface_id)
-                .or_default()
-                .push(LockedFrontBuffer::Stale);
-            return Some((last.gl_texture, last.size));
-        }
-        // 보여줄 것이 아직 없다(첫 프레임). 빈 칸이 된다 -- 기존 동작과 같다.
-        STALE_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
-        self.mark_surface_not_busy(surface_id);
-        let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
-        None
-    }
-
     fn lock_swap_chain(&mut self, id: WebGLContextId) -> Option<(u32, Size2D<i32>)> {
         let surface_id = WebGLSurfaceId::new(id, self.painter_id);
         debug!("... locking chain {:?} for surface {:?}", id, surface_id);
@@ -189,27 +129,25 @@ impl WebGLExternalImages {
             let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
             return None;
         };
-        // ★생산자를 기다리지 않는다★(`gfx_webgl_nonblocking_front_buffer_lock`). 근거는
-        // 그 pref 와 `SwapChain::try_take_surface` 의 doc 주석에 있다 -- 요지는 이 뮤텍스가
-        // 무제한 GPU 대기 위에 걸쳐 잡혀 있어서, 캔버스가 느리면 ***관계없는 요소까지***
-        // 이 스레드에서 같이 늦는다는 것이다.
-        let nonblocking = servo_config::pref!(gfx_webgl_nonblocking_front_buffer_lock);
-        let front_buffer = if nonblocking {
-            match swap_chain.try_take_surface() {
-                Ok(surface) => surface,
-                Err(()) => {
-                    // 생산자가 스왑/clear 중이다. 이 프레임은 포기하고 직전 것을 보여준다.
-                    return self.reuse_last_good(surface_id);
-                },
-            }
-        } else {
-            swap_chain.take_surface()
-        };
+        // ★여기서 생산자를 기다린다 -- 그것이 올바른 동작이다.★
+        //
+        // 2026-11-09 에 기다리지 않는 경로를 넣었다가 2026-11-11 에 제거했다
+        // (`gfx_webgl_nonblocking_front_buffer_lock`). 실기에서 ***훨씬 나빠졌다***
+        // (log_webgl_perf_01/29): 캔버스 전달이 120/s 에서 30/s 로 떨어지고(painter
+        // 넷으로 나누면 7.5fps -- 운영자 육안 "10fps 에도 못 미치는 것처럼" 과 맞는다),
+        // `surfaces_created` 44 -> 196, `surfaces_live` 16 -> 52,
+        // `pbuffer_ms` 50 -> 1678 이었다.
+        //
+        // ★기구: 직전 프레임을 다시 보여주려면 그 서피스를 들고 있어야 한다.★ 제거한
+        // 코드의 주석이 그것을 그대로 적어 뒀다 -- "painter 가 들고 있는 것은 언제나
+        // 한 장이고". 그러면 두 장짜리 체인이 ***한 장으로*** 돌고, `swap_buffers` 가
+        // `recycled_surfaces` 에서 재활용할 것을 찾지 못해 매번 새 서피스를 만든다.
+        // 즉 이 뮤텍스 대기는 버그가 아니라 ***서피스 순환을 지키는 장치***다.
+        //
+        // 대기를 없애려면 장이 하나 더 필요하다(트리플 버퍼링, 백엔드마다 +190MB).
+        // 그 전에 이 대기가 실제로 얼마나 긴지를 재야 한다 -- 지금 그 수치가 없다.
+        let front_buffer = swap_chain.take_surface();
         let Some(front_buffer) = front_buffer else {
-            // 뮤텍스는 잡았는데 서피스가 없다. 여기서도 낡은 프레임이 빈 칸보다 낫다.
-            if nonblocking {
-                return self.reuse_last_good(surface_id);
-            }
             warn!("WebGL external image lock failed: no front buffer for {surface_id:?}");
             self.mark_surface_not_busy(surface_id);
             let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
@@ -246,7 +184,7 @@ impl WebGLExternalImages {
                 locked_buffers.len(),
             );
         }
-        locked_buffers.push(LockedFrontBuffer::Fresh(surface_texture));
+        locked_buffers.push(Some(surface_texture));
         // 크로스-디바이스 텍스처 대신 painter 디바이스 사본을 넘긴다(진단용, 기본 off).
         let gl_texture = if *STAGE_TO_PAINTER_DEVICE {
             let staged = self.stage_to_painter_device(surface_id, gl_texture, size);
@@ -254,13 +192,6 @@ impl WebGLExternalImages {
         } else {
             gl_texture
         };
-        if nonblocking {
-            report_stale_counters();
-            // ★WR 에게 돌려주는 바로 그 값★ 을 기억한다. 서피스 자체는 `unlock` 에서
-            // `last_good` 으로 옮긴다(여기서 옮기면 이 프레임 중에 소유권이 빠진다).
-            self.pending_last_good
-                .insert(surface_id, (gl_texture, size));
-        }
         if self.logged_locked_surfaces.insert(surface_id) {
             info!(
                 "WebGL external image lock routed: surface={surface_id:?} painter={:?} texture={gl_texture} size={size:?}",
@@ -426,17 +357,7 @@ impl WebGLExternalImages {
             },
             None => None,
         };
-        // ★낡은 프레임을 보여준 턴★ -- 돌려줄 서피스가 없다. busy 계수만 내린다.
-        if let Some(LockedFrontBuffer::Stale) = locked_front_buffer {
-            self.mark_surface_not_busy(surface_id);
-            let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
-            return Some(());
-        }
-        let locked_front_buffer = match locked_front_buffer {
-            Some(LockedFrontBuffer::Fresh(texture)) => Some(texture),
-            // `Stale` 은 위에서 처리했다.
-            Some(LockedFrontBuffer::Stale) | None => None,
-        };
+        let locked_front_buffer = locked_front_buffer.flatten();
         let Some(locked_front_buffer) = locked_front_buffer else {
             // The matching lock did not acquire a front buffer (e.g. none was ready),
             // and it already released the busy count on that failure path. There is
@@ -449,37 +370,6 @@ impl WebGLExternalImages {
         // keeping lock/unlock balanced.
         self.mark_surface_not_busy(surface_id);
 
-        // ★최신 프레임을 `last_good` 으로 옮기고, 그 ***전*** 것을 체인에 돌려준다.★
-        // 그래서 painter 가 들고 있는 것은 언제나 한 장이고, 다음 프레임에 생산자가 뮤텍스를
-        // 들고 있어도 보여줄 그림이 있다. 들고 있는 서피스는 `recycled_surfaces` 에 없으니
-        // 생산자가 그것을 바인드하지 않는다 -- 교착은 생기지 않는다.
-        if let Some((gl_texture, size)) = self.pending_last_good.remove(&surface_id) {
-            let previous = self.last_good.insert(
-                surface_id,
-                LastGoodFrame {
-                    texture: locked_front_buffer,
-                    gl_texture,
-                    size,
-                },
-            );
-            match previous {
-                // 그 전 프레임을 돌려준다 -- 아래 기존 경로를 그대로 탄다.
-                Some(previous) => {
-                    let destroyed = self.rendering_context.destroy_texture(previous.texture);
-                    let Some(previous_surface) = destroyed else {
-                        let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
-                        return Some(());
-                    };
-                    return self.recycle_or_forget(surface_id, previous_surface);
-                },
-                // 첫 프레임이라 돌려줄 것이 없다.
-                None => {
-                    let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
-                    return Some(());
-                },
-            }
-        }
-
         let destroyed = self.rendering_context.destroy_texture(locked_front_buffer);
         let locked_front_buffer = destroyed?;
 
@@ -490,43 +380,6 @@ impl WebGLExternalImages {
         Some(())
     }
 }
-
-/// `STALECANVAS` 를 10 초마다 한 줄 찍는다.
-///
-/// ★이 수치가 이 수정의 판정이다.★ 0 이면 뮤텍스 경합이 없다는 뜻이고, 그러면 저더의
-/// 원인에 대한 내 분석이 틀린 것이다. 크면 painter 가 그만큼 캔버스를 기다리고 있었다는
-/// 뜻이다. 둘 다 알아야 한다.
-///
-/// 타이밍 경로에서 불리므로 ★꺼져 있을 때 비용은 원자 로드 하나★ 이고, 켜져 있어도
-/// 간격 안에서는 로드 하나와 비교 하나다. I/O 는 간격이 지났을 때만 한다.
-fn report_stale_counters() {
-    let reused = STALE_REUSED.load(Ordering::Relaxed);
-    let unavailable = STALE_UNAVAILABLE.load(Ordering::Relaxed);
-    if reused == 0 && unavailable == 0 {
-        return;
-    }
-    let now_ms = std::time::Instant::now()
-        .duration_since(*PROCESS_START)
-        .as_millis() as u64;
-    let last = STALE_REPORT_AT_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last) < 10_000 {
-        return;
-    }
-    if STALE_REPORT_AT_MS
-        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        // 다른 painter 가 방금 찍었다.
-        return;
-    }
-    warn!(
-        "STALECANVAS t={}s reused={reused} unavailable={unavailable}",
-        now_ms / 1000,
-    );
-}
-
-/// `report_stale_counters` 의 기준점. 단조 시계만 쓴다.
-static PROCESS_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 impl WebRenderExternalImageApi for WebGLExternalImages {
     fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {

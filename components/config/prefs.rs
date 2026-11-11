@@ -831,79 +831,6 @@ pub struct Preferences {
     /// 컨텍스트로 복제되는 축이고(`webgl_thread.rs` 의 `apply_webgl_command_to_all_backends`),
     /// 이 pref 와 무관하다.
     pub gfx_wall_canvas_wait_declines_production: bool,
-    /// 백엔드마다 ★자기 타일 몫만 셰이딩★ 하도록 WebGL 의 default framebuffer 에 scissor 를
-    /// 건다(기본 꺼짐).
-    ///
-    /// ★왜★(2026-11-03/09 실측, log_webgl_perf_01/09, 4 타일 테스트 장비). 이 포크는 WebGL
-    /// 명령을 painter 마다의 별도 GPU 에 복제하고 ***각 백엔드가 캔버스 전체를 셰이딩***
-    /// 하는데, 한 타일은 자기 몫(1/4)만 표출한다. 캔버스를 벽 전체(11520x4320)로 확대하면
-    /// 네 GPU 가 각각 49.8Mpx 를 그리고 12.4Mpx 만 쓴다 -- ★75% 가 버려지고 저더가 난다.★
-    ///
-    ///     원본            RENDERCOST 주기 초과 10 초당 23 회   저더 발생
-    ///     백킹 1/2(면적 1/4)                        0 회        저더 없음
-    ///     백킹 1/4(면적 1/16)                       0 회        저더 없음
-    ///
-    /// 페이지 쪽에서 백킹을 줄이면 해결되지만 ★해상도를 잃는다.★ 이 pref 는 같은 양을
-    /// 아끼면서 해상도를 지킨다 -- 정점 작업은 그대로이고 ***자기 타일 밖의 프래그먼트만***
-    /// 버린다.
-    ///
-    /// ★작동 조건이 좁다.★ 캔버스 백킹 크기가 가상 뷰포트 크기와 같을 때만 건다. 아니면
-    /// 캔버스 좌표와 뷰포트 좌표가 1:1 이 아니므로 타일 사각형을 그대로 쓰면 ***각 타일이
-    /// 엉뚱한 사분면***을 보여준다. 그 검사에 걸리면 아무 일도 하지 않는다.
-    ///
-    /// ★안전한 것들★(코드로 확인): FBO 패스는 `drawing_to_default_framebuffer` 로 제외되고,
-    /// 페이지의 `gl.scissor` 박스와는 교집합을 내며, `bind_framebuffer` 가 이미
-    /// `restore_invariant` 를 불러 FBO 전환마다 자동 적용·해제된다.
-    ///
-    /// ★위험한 것들★: `readPixels`/`toDataURL`/`copyTexImage` 는 primary 백엔드에서 읽는데
-    /// 그 백엔드도 자기 타일 밖은 그리지 않으므로 ***그 바깥이 비어 나온다.*** 실측 대상
-    /// 페이지는 그 셋을 하나도 쓰지 않는다(0 건). 쓰는 페이지에서는 켜지 말 것.
-    /// painter 가 캔버스 스왑체인 뮤텍스에서 ★기다리지 않는다★(기본 꺼짐).
-    ///
-    /// 켜면 `try_take_surface` 로 집어오고, 생산자가 뮤텍스를 들고 있으면 ★직전 프레임을
-    /// 그대로 다시 보여준다.★ 끄면 지금처럼 기다린다.
-    ///
-    /// ★왜★(2026-11-09): `SwapChain` 의 뮤텍스가 ***무제한 GPU 대기 위에 걸쳐*** 잡혀
-    /// 있다 -- `swap_buffers` 가 `AcquireSync(0, INFINITE)` 와 캔버스 전체 blit 을,
-    /// `clear_surface` 가 clear 를 그 안에서 한다(third_party/surfman/src/chains.rs 의
-    /// `try_take_surface` doc 주석에 자리까지 적어 뒀다). 그래서 캔버스가 느리면
-    /// ***관계없는 ticker 까지*** 같이 늦었다.
-    ///
-    /// 끄면 못 집어온 프레임이 `ExternalImageSource::Invalid` 가 되어 그 캔버스가 ***빈
-    /// 칸***으로 나온다. 켜면 직전 그림이 남는다 -- 낡은 그림이 깜빡임보다 낫다.
-    ///
-    /// 대가는 서피스 ★한 장★ 이다. painter 가 최신 프레임을 계속 들고 있으므로 체인이
-    /// 재활용할 것이 하나 줄고, 없으면 생산자가 한 번 더 만든다(`swap_buffers` 의
-    /// `unwrap_or_else`). 들고 있는 서피스는 `recycled_surfaces` 에 없으니 생산자가 그것을
-    /// 다시 바인드하지 않는다 -- 교착은 생기지 않는다.
-    ///
-    /// ★★실측 결과: 효과가 없다. 켜지 말 것.★★ (2026-11-09, log_webgl_perf_01/13)
-    ///
-    /// | 런 | 구성 | over_period | last10s_over | last10s_worst | 육안 |
-    /// |----|------|-------------|--------------|---------------|------|
-    /// | 33 | scissor 만 | 71 (0.32%) | 0 | 6.4ms | 저더 없음 |
-    /// | 34 | scissor + 이것 | 72 (0.33%) | 3 | 31.1ms | ticker OK, ★WebGL 저더★ |
-    /// | 35 | 이것만 | 286 (1.30%) | 21 | 37.4ms | 둘 다 저더 |
-    ///
-    /// 세 가지를 배웠다.
-    ///
-    /// 1. ★뮤텍스 경합은 실재한다★ -- `STALECANVAS reused=35~40` / 90초. 0 이 아니다.
-    /// 2. ★그런데 지배적이지 않다.★ 2.6초마다 한 번인데 `over_period` 는 초당 2.6회다 --
-    ///    두 자릿수 차이다. painter 가 멈추는 주된 이유는 이 뮤텍스가 아니다. 35 가 scissor
-    ///    없는 대조군(269)과 같은 수준(286)인 것이 그것을 못 줄였다는 증거다.
-    /// 3. ★오히려 나빠진다.★ 33 -> 34 에서 `last10s_over` 0 -> 3, `last10s_worst`
-    ///    6.4 -> 31.1ms. 이유도 보인다: `last_good` 을 들고 있으면 체인의 재활용분이 하나
-    ///    줄어 생산자가 `device.create_surface` 로 ***새로 만들어야*** 하고, 그것이 같은
-    ///    뮤텍스 안에서 돈다. "없으면 한 번 더 만든다" 고 적었지만 ***매번***이었다.
-    ///
-    /// 그리고 34 의 WebGL 저더는 설계된 교환인데 ★눈에 보인다★ -- 2.6초마다 프레임 하나가
-    /// 반복되는 것이 보인다. `small-percentages-are-visible` 과 같은 교훈이다.
-    ///
-    /// 남는 결론: 지배적 원인은 ★GPU 쪽★ 이다. 지금은 WebGL 스레드 하나가 네 백엔드를
-    /// 직렬 재생하므로 캔버스 한 프레임이 4 x T 이고 GPU 네 장이 순차로 일한다. 그것을
-    /// 병렬화하면 T 가 되고, GPU k 가 painter k 를 막는 시간도 그만큼 줄어든다. 그쪽이
-    /// 다음이다.
-    pub gfx_webgl_nonblocking_front_buffer_lock: bool,
 
     /// 타일 scissor 의 사각형을 ★타일 기하가 아니라 WR 이 적어 둔 실제 표출 영역★ 에서
     /// 가져온다(기본 꺼짐).
@@ -1739,7 +1666,6 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
-            gfx_webgl_nonblocking_front_buffer_lock: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_vsync_enabled: false,

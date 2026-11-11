@@ -109,7 +109,7 @@ impl<Device: DeviceAPI> BackBuffer<Device> {
                     return Err(err);
                 }
                 BackBuffer::Attached
-            }
+            },
             BackBuffer::TakenDetached => BackBuffer::Detached(surface),
             _ => return Err(Error::Failed),
         };
@@ -483,32 +483,6 @@ impl<Device: DeviceAPI> SwapChain<Device> {
         self.0.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    /// `take_surface` 의 ★비블로킹★ 판. `Err(())` = 생산자가 뮤텍스를 들고 있다.
-    ///
-    /// ★왜 필요한가★(2026-11-09): `swap_buffers`(이 impl 아래)는 이 뮤텍스를 잡은 채
-    /// ***무제한 GPU 대기***를 한다 -- `device.create_surface`(없으면 새로 만든다),
-    /// `replace_surface` -> `bind_surface_to_context` ->
-    /// `IDXGIKeyedMutex::AcquireSync(0, ★INFINITE★)`, 그리고 `PreserveBuffer::Yes` 면
-    /// 캔버스 전체 blit. `clear_surface` 도 같은 뮤텍스로 clear 를 한다. 그런데 소비자
-    /// (벽의 타일 painter)가 `take_surface` 로 ***같은 뮤텍스***를 잡으러 온다.
-    ///
-    /// 그래서 캔버스의 스왑이 느리면 ***그 캔버스와 아무 관계 없는 요소까지*** 같이 늦는다 --
-    /// painter 스레드가 거기서 멈추기 때문이다. 운영자가 정확히 그것을 물었다: "극단적으로
-    /// canvas 가 한 자리 fps 가 되더라도 나머지 요소는 영향이 없어야 하는 거 아닌가?"
-    /// 그 기대가 맞고, 이것이 그것을 막던 자리다.
-    ///
-    /// 프레임 생산 ***정책***은 이미 캔버스를 기다리지 않는다
-    /// (`gfx_wall_canvas_wait_declines_production`, 기본 꺼짐). 이것은 같은 원칙을
-    /// ***자원*** 층에 적용하는 짝이다.
-    pub fn try_take_surface(&self) -> Result<Option<Device::Surface>, ()> {
-        match self.0.try_lock() {
-            Ok(mut data) => Ok(data.take_surface()),
-            // 독이 올랐어도 데이터는 쓸 수 있다 -- `lock()` 과 같은 처리다.
-            Err(TryLockError::Poisoned(err)) => Ok(err.into_inner().take_surface()),
-            Err(TryLockError::WouldBlock) => Err(()),
-        }
-    }
-
     /// Swap the back and front buffers.
     /// Called by the producer.
     /// Returns an error if `context` is not the producer context for this swap chain.
@@ -730,7 +704,7 @@ where
             Entry::Occupied(_) => Err(Error::Failed)?,
             Entry::Vacant(entry) => {
                 entry.insert(SwapChain::create_attached(device, context, surface_access)?)
-            }
+            },
         };
         self.ids()
             .entry(device.context_id(context))
