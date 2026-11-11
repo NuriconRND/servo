@@ -802,7 +802,7 @@ impl Painter {
         // 치면 네 painter 스레드가 초당 480 번 전역 `RwLock` 을 잡는다 -- 계측을 전부
         // 걷어낸 2026-10-27 규칙이 금지하는 형태다. 바로 위 `set_max_age_ms` 와 같은 패턴.
         CANVAS_SCISSOR_LEAD_PERIODS.store(
-            servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 4) as u32,
+            servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,
         );
 
@@ -3123,8 +3123,16 @@ impl Painter {
                 });
             }
             let is_now = at == sample_at;
+            // ★표의 키★ -- 기준 시각(`sample_at`)으로부터 몇 ms 뒤인가. 과거 샘플(나이
+            // 흡수용)은 0 이다: 소비자의 구간은 자기 나이에서 시작하므로 과거 쪽은
+            // `offset == 0` 의 오늘 사각형이 대신한다.
+            let offset_ms = at
+                .checked_duration_since(sample_at)
+                .map(|elapsed| elapsed.as_millis().min(u16::MAX as u128) as u16)
+                .unwrap_or(0);
             for value in &transforms {
                 samples.push(webrender::wall_canvas_rect::LeadSample {
+                    offset_ms,
                     binding_id: value.key.id,
                     transform: value.value.to_array(),
                     is_now,

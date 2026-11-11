@@ -562,6 +562,13 @@ pub(crate) struct WebGLThread {
     /// 읽어 틀린 적이 두 번 있었다. 캔버스 프레임마다 찍을 수는 없으니(초당 120 줄)
     /// 서피스마다 한 번으로 묶는다.
     scissor_logged: FxHashSet<WebGLSurfaceId>,
+    /// 서피스별 직전 swap 시각. 다음 swap 에서 차이를 재면 ★이 캔버스의 프레임 간격★
+    /// 이고, 그것이 이 비트맵이 화면에 머무는 기간이다 -- `tile_scissor_for` 가 고를
+    /// 구간의 길이다. 근거는 `tile_scissor_from_webrender` 의 doc 주석.
+    ///
+    /// WebGL 스레드가 혼자 쓰는 필드라 락이 없다. 비용은 swap 당 ★시계 하나와 해시 조회
+    /// 하나★ 다(약 30ns + 20ns, 240 swap/s 에서 12µs/s).
+    last_swap_at: FxHashMap<WebGLSurfaceId, Instant>,
     /// A usage map used to delay the deletion of WebGL contexts until all WebRender
     /// rendering is finished, so that any existing `Surface`s can be properly released.
     busy_webgl_context_map: WebGLContextBusyMap,
@@ -645,6 +652,7 @@ impl WebGLThread {
         WebGLThread {
             device_map: Default::default(),
             scissor_logged: Default::default(),
+            last_swap_at: Default::default(),
             paint_api,
             contexts: Default::default(),
             context_backends: Default::default(),
@@ -1150,8 +1158,13 @@ impl WebGLThread {
     /// sender 도 함께 드롭되어, 스크립트 쪽 `receiver.recv().unwrap()` 이 `Disconnected` 로
     /// 패닉한다. 실측(2026-11-09/10, log_webgl_perf_01/18·19):
     ///
-    ///     thread 'Script#2' panicked at components/script/dom/webgl/webglprogram.rs:577:40:
-    ///     called `Result::unwrap()` on an `Err` value: Disconnected
+    /// ★`text` 를 붙인다★ -- 4 칸 들여쓰기만으로는 rustdoc 이 Rust 코드로 보고 doctest 로
+    /// 실행해서 "prefix 'Script is unknown" 으로 깨진다(2026-11-11 확인).
+    ///
+    /// ```text
+    /// thread 'Script#2' panicked at components/script/dom/webgl/webglprogram.rs:577:40:
+    /// called `Result::unwrap()` on an `Err` value: Disconnected
+    /// ```
     ///
     /// 그 뒤로 script 스레드가 없으므로 ***어떤 명령도 듣지 않는다*** -- 운영자가 본 "WebGL
     /// 전환중 표출 중단되고 이후 명령이 더 이상 듣지 않는다" 가 이것이다. 18/webgl_perf_42 와
@@ -1877,15 +1890,70 @@ impl WebGLThread {
     /// 이어서 ***SCISSOR 60 건 중 56 건이 skipped*** 였다 -- 즉 플래그를 켜도 거의 항상
     /// 아무 일도 하지 않았고, 그 때문에 정상 상태 저더 해결이 회귀했다
     /// (log_webgl_perf_01/25). 일반적인 경로 하나만 남기는 것이 맞다.
-    fn tile_scissor_for(&self, surface_id: WebGLSurfaceId) -> Option<[i32; 4]> {
+    fn tile_scissor_for(&self, surface_id: WebGLSurfaceId, hold: Duration) -> Option<[i32; 4]> {
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
-        self.tile_scissor_from_webrender(surface_id, canvas)
+        self.tile_scissor_from_webrender(surface_id, canvas, hold)
     }
 
+    /// 이 서피스의 ★프레임 간격★ -- 직전 swap 과의 차이. 기록을 갱신한다.
+    ///
+    /// 이 값이 "지금 그리는 비트맵이 화면에 머무는 기간" 의 추정이고, 소비자가 고를 구간의
+    /// 길이다.
+    ///
+    /// ## 첫 swap 은 ★넓게★ 잡는다 (2026-11-11)
+    ///
+    /// 첫 swap 에는 직전이 없다. 처음에는 0 을 주었는데, 그러면 구간이 `[age, age]` 라는
+    /// ***점***이 되어 사실상 오늘 사각형만 쓴다. 그런데 ***전환 시작이 바로 그 경우다***
+    /// -- 새 캔버스가 생기고 그 첫 프레임이 나온다. 그 첫 비트맵은 다음 프레임이 느릴수록
+    /// 오래 표출되므로, 하필 가장 넓은 구간이 필요한 순간에 구간이 가장 좁았다. 운영자가
+    /// 본 "전환 애니메이션 시작시 순간 검은 영역 넓게"(log_webgl_perf_01/35·36)가 이
+    /// 자리와 맞는다.
+    ///
+    /// 모를 때는 넓게가 안전하다 -- 크게 잡아도 합집합이므로 빈 칸은 생기지 않고, 전환
+    /// 시작의 한 프레임뿐이라 비용도 한 번이다. 그래서 `FIRST_SWAP_HOLD` 를 쓴다: 표가
+    /// 덮는 범위(`lead` 최대 12 주기 = 200ms)보다 넉넉해서 표 전체를 합집합한다.
+    ///
+    /// ## 긴 값은 잘라낸다
+    ///
+    /// 탭이 멈췄다 돌아오면 간격이 초 단위가 된다. 그런 값으로 구간을 잡아도 표를 벗어나
+    /// 해롭지는 않지만, 상한을 두는 편이 읽기 쉽다.
+    fn note_swap_interval(&mut self, surface_id: WebGLSurfaceId) -> Duration {
+        /// 첫 swap 에 쓰는 구간 길이. 근거는 이 함수의 doc 주석.
+        const FIRST_SWAP_HOLD: Duration = Duration::from_millis(500);
+
+        let now = Instant::now();
+        match self.last_swap_at.insert(surface_id, now) {
+            Some(previous) => now.saturating_duration_since(previous).min(FIRST_SWAP_HOLD),
+            None => FIRST_SWAP_HOLD,
+        }
+    }
+
+    /// WR 이 적은 표에서 ★이 비트맵이 표출되는 구간★ 의 사각형을 고른다.
+    ///
+    /// ## 구간을 어떻게 정하나 (2026-11-11 2 차)
+    ///
+    /// ```text
+    ///   from = age          `lookup` 이 주는, 그 기록이 낡은 정도
+    ///   to   = age + hold   hold = 이 캔버스의 프레임 간격(측정값)
+    /// ```
+    ///
+    /// 지금 그리는 비트맵은 ***다음 캔버스 프레임이 나올 때까지*** 화면에 있다. 그 기간이
+    /// `hold` 이고, 그 사이 애니메이션이 지나가는 영역을 모두 덮어야 띠가 생기지 않는다.
+    /// 구간의 시작이 `age` 인 것은 그 기록이 적힌 뒤 이미 그만큼 흘렀기 때문이다.
+    ///
+    /// 앞 판은 WR 이 낸 합집합 하나를 그대로 썼고, 그 창은 `lead` 라는 ***고정 상수***로
+    /// 정해졌다. 실제 지연은 캔버스마다 다르므로(무거운 페이지는 한 프레임이 오래 표출
+    /// 된다) 상수가 둘 다 맞을 수 없었다 -- 네 판을 고쳐도 전환 시작의 띠가 남은 이유가
+    /// 그것이다(log_webgl_perf_01/32~36). 지금은 `hold` 가 ***측정값***이라 `gear` 처럼
+    /// 느린 캔버스는 자동으로 넓은 구간을 보고, `scene` 처럼 빠른 캔버스는 좁게 본다.
+    ///
+    /// `lead` 는 이제 "표를 얼마나 멀리까지 적을까" 만 정하고, 고르는 일에는 관여하지
+    /// 않는다.
     fn tile_scissor_from_webrender(
         &self,
         surface_id: WebGLSurfaceId,
         canvas: Size2D<i32>,
+        hold: Duration,
     ) -> Option<[i32; 4]> {
         // ★`pref!` 를 여기서 치지 않는다.★ 이 함수는 캔버스 프레임마다 painter 수만큼
         // 도는 타이밍 경로이고, `pref!` 는 전역 `RwLock` 획득이다 -- 계측을 전부 걷어낸
@@ -1906,8 +1974,8 @@ impl WebGLThread {
         };
         let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
         let max_age = webrender::wall_canvas_rect::max_age_ms();
-        let noted = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
-            webrender::wall_canvas_rect::Lookup::Hit(noted) => noted,
+        let (noted, age) = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
+            webrender::wall_canvas_rect::Lookup::Hit(noted, age) => (noted, age),
             webrender::wall_canvas_rect::Lookup::Stale(_, age) => {
                 note_scissor_gate(ScissorGate::Stale(age));
                 return None;
@@ -1923,7 +1991,9 @@ impl WebGLThread {
             note_scissor_gate(ScissorGate::NoIntersection);
             return None;
         }
-        let scaled = self.scale_canvas_rect(noted.rect, noted.dest_size, canvas);
+        // ★구간을 골라 그 안에서만 합집합한다.★ 근거는 이 함수의 doc 주석.
+        let wanted = noted.union_over(age, age + hold.as_millis() as u64);
+        let scaled = self.scale_canvas_rect(wanted, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
             Some(_) => ScissorGate::Applied,
             None => ScissorGate::NoIntersection,
@@ -1952,11 +2022,18 @@ impl WebGLThread {
     /// 캔버스는 페이지가 CSS px 로 잡고(`clientWidth`) 뷰포트는 device px 이므로, hidpi
     /// 배율이 1 이 아니면 둘이 어긋난다 -- 그 경우가 가장 먼저 의심할 자리다.
     /// `SCISSOR` 로그에 붙이는 진단 문자열. 서피스마다 한 번만 만든다.
-    fn tile_scissor_debug(&self, surface_id: WebGLSurfaceId) -> String {
+    fn tile_scissor_debug(&self, surface_id: WebGLSurfaceId, hold: Duration) -> String {
         match self.webrender_swap_chains.get(surface_id) {
             Some(chain) => {
                 let canvas = chain.size();
-                format!("canvas={}x{}", canvas.width, canvas.height)
+                // hold 는 이 서피스의 프레임 간격 -- scissor 구간의 길이다. 서피스마다
+                // 한 번만 찍으므로 비용이 없다.
+                format!(
+                    "canvas={}x{} hold={}ms",
+                    canvas.width,
+                    canvas.height,
+                    hold.as_millis()
+                )
             },
             None => "canvas=?".to_owned(),
         }
@@ -1979,12 +2056,14 @@ impl WebGLThread {
 
                 // ★`data` 를 빌리기 전에 계산한다★ -- `self` 메서드 호출이라 뒤에서는
                 // 빌림 검사가 막는다.
-                let want_tile_scissor = self.tile_scissor_for(surface_id);
+                // 구간 길이를 재는 것이 먼저다 -- `tile_scissor_for` 가 그 값을 쓴다.
+                let hold = self.note_swap_interval(surface_id);
+                let want_tile_scissor = self.tile_scissor_for(surface_id, hold);
                 let scissor_needs_log = self.scissor_logged.insert(surface_id);
                 // ★빌림 전에 만든다★ -- 로그 자리에서는 `self` 를 못 쓴다. 서피스마다 한
                 // 번뿐이라 평소에는 만들지 않는다.
                 let scissor_debug = if scissor_needs_log {
-                    self.tile_scissor_debug(surface_id)
+                    self.tile_scissor_debug(surface_id, hold)
                 } else {
                     String::new()
                 };
@@ -4712,6 +4791,90 @@ mod fanout_clone_tests {
 
 #[cfg(test)]
 mod scissor_lead_tests {
+    // ---------------------------------------------------------------- union_over
+    //
+    // `union_over` 는 `vendor_local/webrender` 에 있지만 그 크레이트는 워크스페이스
+    // 멤버가 아니라 `cargo test -p webrender` 가 거부된다. 순수 함수이고 필드가 모두
+    // `pub` 이므로 여기서 검사한다 -- 소비자 쪽이 그 계약을 쓰는 자리이기도 하다.
+
+    use std::time::Instant;
+    use webrender::wall_canvas_rect::{CanvasTileRect, MAX_LEAD_SAMPLES};
+
+    fn sample_table(entries: &[(u16, [i32; 4])]) -> CanvasTileRect {
+        let mut samples = [(0u16, [0i32; 4]); MAX_LEAD_SAMPLES];
+        for (slot, entry) in samples.iter_mut().zip(entries) {
+            *slot = *entry;
+        }
+        CanvasTileRect {
+            rect: entries.first().map(|(_, r)| *r).unwrap_or([0, 0, 0, 0]),
+            dest_size: [100, 100],
+            at: Instant::now(),
+            samples,
+            sample_count: entries.len().min(MAX_LEAD_SAMPLES) as u8,
+        }
+    }
+
+    /// ★구간 안의 샘플만 쓴다.★ 이것이 2026-11-11 2 차 구조 변경의 요점이다 -- 표를
+    /// 멀리까지 적어도 소비자가 자기 구간만 고르므로 걸리는 scissor 가 넓어지지 않는다.
+    #[test]
+    fn unions_only_within_the_interval() {
+        let noted = sample_table(&[
+            (0, [0, 0, 10, 10]),
+            (16, [10, 0, 10, 10]),
+            (33, [20, 0, 10, 10]),
+            (50, [900, 0, 10, 10]),
+        ]);
+        // 구간 [0, 33] -> 앞 세 개만. 네 번째(멀리 떨어진 것)는 들어오지 않아야 한다.
+        assert_eq!(noted.union_over(0, 33), [0, 0, 30, 10]);
+    }
+
+    /// ★나이가 구간의 시작이다.★ 기록이 낡은 만큼 앞쪽 샘플은 이미 지나갔으므로 쓰지
+    /// 않는다.
+    #[test]
+    fn the_age_moves_the_interval_forward() {
+        let noted = sample_table(&[
+            (0, [0, 0, 10, 10]),
+            (16, [10, 0, 10, 10]),
+            (33, [20, 0, 10, 10]),
+        ]);
+        // 나이 16ms, hold 17ms -> [16, 33]: 뒤 두 개만.
+        assert_eq!(noted.union_over(16, 33), [10, 0, 20, 10]);
+    }
+
+    /// ★느린 캔버스는 자동으로 넓은 구간을 본다.★ `hold` 가 측정값이므로 고정 상수가
+    /// 필요 없다 -- 이것이 `lead` 를 상수로 두던 1 차가 `gear`/`scene` 양쪽에 맞을 수
+    /// 없었던 이유를 없앤다.
+    #[test]
+    fn a_longer_hold_covers_more_of_the_table() {
+        let noted = sample_table(&[
+            (0, [0, 0, 10, 10]),
+            (16, [10, 0, 10, 10]),
+            (33, [20, 0, 10, 10]),
+            (50, [30, 0, 10, 10]),
+        ]);
+        let fast = noted.union_over(0, 17);
+        let slow = noted.union_over(0, 50);
+        assert_eq!(fast, [0, 0, 20, 10]);
+        assert_eq!(slow, [0, 0, 40, 10]);
+        assert!(slow[2] > fast[2], "느린 쪽이 더 넓어야 한다");
+    }
+
+    /// ★구간이 표를 벗어나면 오늘 사각형으로 돌아간다.★ 그러면 동작이 이 기능을 들이기
+    /// 전과 같다(띠는 남지만 깨지지 않는다).
+    #[test]
+    fn an_interval_past_the_table_falls_back() {
+        let noted = sample_table(&[(0, [0, 0, 10, 10]), (16, [10, 0, 10, 10])]);
+        assert_eq!(noted.union_over(900, 999), [0, 0, 10, 10]);
+    }
+
+    /// ★표가 비면 오늘 사각형이다.★ `lead = 0` 으로 끈 구성이 이 경로다.
+    #[test]
+    fn an_empty_table_is_todays_rect() {
+        let mut noted = sample_table(&[(0, [5, 6, 10, 10])]);
+        noted.sample_count = 0;
+        assert_eq!(noted.union_over(0, 100), [5, 6, 10, 10]);
+    }
+
     use euclid::Size2D;
 
     use super::scale_canvas_rect_to_gl;

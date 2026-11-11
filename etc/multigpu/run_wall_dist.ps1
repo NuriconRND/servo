@@ -336,159 +336,22 @@ param(
     # pass loses its commit entirely.
     [switch] $DetachTileRender,
 
-    # gfx_wall_pacing_output: name the output the pacing thread puts WaitForVBlank on.
-    # "" = primary (today's behaviour). Give a DXGI output name such as "\\.\DISPLAY22".
+    # How far ahead WebRender records the per-time scissor table, in refresh periods
+    # (0 = off, max 12). 2026-11-11.
     #
-    # **Why** the code assumed "DWM composition is tied to the primary's vblank", and this wall
-    # broke that. Across four runs of the same binary on 2026-10-26 the output attached to the
-    # DWM grid differed run to run, and a mismatched run sat at commit phase 52% with dup
-    # 4.025% against 0.902% for an attached one. Confirm with OUTPHASE which output has
-    # vs_dwmvb_ms = 0 in that session, then run once per output and the causation is proven.
+    # WebRender writes a TABLE of (offset, rect) pairs sampled along the animation; the
+    # WebGL thread then picks the interval its own bitmap will actually be on screen --
+    # [age, age + hold], where age is how stale the record is and hold is that canvas's
+    # measured frame interval -- and unions only within it. So raising this does NOT
+    # widen the scissor that gets applied; it only extends how far the table reaches.
     #
-    # **The launcher cannot tell whether the pin actually took.** If the name is not found the
-    # engine falls back to primary silently, so the pacing_output= field in the banner below
-    # only says "it was passed". The verdict is one line in the engine log (once at startup,
-    # again when the topology changes):
-    #   wall: pacing vblank: \\.\DISPLAY1 (primary, output 1/4) 59.95Hz -- pin "\\.\DISPLAY22" applied
-    # If it was not found, that slot reads "**pin ... not found, fell back to primary**".
-    # (The VBANCHOR line that used to do this job went away in the 2026-10-27 strip.)
-    [string] $PacingOutput = "",
-    # gfx_wall_tick_phase_probe: count which phase of the DWM composition grid the pacing
-    # tick lands on.
+    # Default 8 (133ms) covers a canvas as slow as 15fps: the interval ends at
+    # age (<= 34ms, the staleness cutoff) + hold (67ms at 15fps). If the table stops
+    # short, the consumer falls back to today's rect and the band returns.
     #
-    # The one variable that decides judder is which phase of the DWM grid the COMMIT lands on
-    # (commit_guard.rs module doc: phase 13% -> 63% took dup from 6 to 2146), and since the
-    # 2026-10-27 instrumentation strip there has been no way to put a number on it. This
-    # switch brings back the minimum -- the tick phase alone.
-    #
-    # Nothing enters the tick path: the pacing thread only pushes one QPC value into a
-    # fixed-size ring (no stderr, no DWM query), and the folding and printing happen on main.
-    # A run with it off costs nothing.
-    #
-    # **Two cumulative lines every 10 s -- the last one is that run's answer.** This run ends
-    # via Stop-Process -Force (see -DurationSec below), so an exit hook would receive
-    # nothing. env_logger writes stderr unbuffered, so a forced kill does not swallow a line.
-    #
-    #   wall: tick phase [30s] p05/p50/p95 = 8.1/8.4/9.2 % spread 1.1 pts R=0.998 (n=1798, ...)
-    #   wall: tick gap   [30s] p05/p50/p95 = 0.99/1.00/1.01 periods (n=1797, over 1.5p 0, ...)
-    #
-    # Phase is a ***circular*** variable, so the percentiles are circular statistics.
-    # 'spread' is p95-p05 measured in rotated coordinates, so it does not wrap when the data
-    # straddles 0%, and R is concentration (1 = one point, 0 = uniform). When R is low, do
-    # not trust p50.
-    #
-    # **Self-check (timer paths only).** A -PacingDwmQuery run has snap_to_dwm_grid_at sleeping
-    # toward the -DwmAlign % point of the DWM grid, so phase p50 must come out ***larger than
-    # that value by the wake latency*** (a few hundred us to 1 ms = +2 to +6 points). With
-    # -DwmAlign 8, p50 should be around 10-14 and the spread should be narrow. If -DwmAlign is
-    # outside 0..99 the snap does not align at all and this check does not apply.
-    #
-    # **The vblank path has no expected value.** There p50 = (X + DwmAlign) mod 100, where X is
-    # that output's phase offset between its vblank and the DWM grid -- precisely the unknown
-    # being measured (vs_dwmvb). With -DwmAlign 0, align_after_vblank returns immediately, so
-    # p50 is X itself.
-    #
-    # And this check is ***circular***, because the probe and the snap use the same DWM anchor
-    # -- it tells you the probe's arithmetic is right, not that the DWM grid itself agrees
-    # with the composition deadline.
-    [switch] $TickPhase,
-    # gfx_wall_single_publish_per_pass -- hold Renderer::update() to consuming one publish
-    # per pass. On by default since 2026-11-02 (log_ani_shift_01/17: Reason cache flush 0.00
-    # on all four tiles, visible judder gone). This switch turns it OFF -- off drains the
-    # whole queue, drawing the earlier frames and then throwing them away
-    # (renderer/mod.rs:1082). To compare back:
-    #   -ProfilerHud "FPS,Reason cache flush" -NoSinglePublishPerPass
-    [switch] $NoSinglePublishPerPass,
-    # gfx_wall_arm_keep_previous_on_canvas_wait -- whether to arm a tile whose production was
-    # declined by a canvas wait. On by default (the old behaviour): the shell skips both the
-    # render and the present for that tile. Off lets the render run so the paint-side
-    # animation advances -- the same behaviour as a single-painter setup, and a candidate fix
-    # for the ticker juddering under ticker+WebGL. Read it with the KEEPPREV counters:
-    #   -ProfilerHud "FPS" -TickPhase -NoArmOnCanvasWait
-    [switch] $NoArmOnCanvasWait,
-    # gfx_wall_canvas_defeats_paint_side_throttle -- while a canvas is live and drawing, stop
-    # counting that WebView as paint-side, so the tick divisor does not cut its ticks.
-    # Showing a ticker and a WebGL canvas together used to make the ticker's OR verdict cut
-    # WebGL's rAF by the divisor, juddering both (log_webgl_perf_01/01); this breaks that
-    # link. Off by default.
-    #   -CanvasDefeatsThrottle
-    # Compare against lowering the divisor to 1 -- that makes CSS/paint-side pages worse.
-    [switch] $CanvasDefeatsThrottle,
-    # gfx_wall_canvas_live_window_ms -- the window, in ms, that the switch above uses for
-    # "the canvas is live". Default 500. If the fix does not fire on a real page, try raising
-    # it -- the verdict is stale_worst on the PAINTSIDE line, and the signal stays on as long
-    # as the window is larger than that value.
-    #   -CanvasDefeatsThrottle -CanvasLiveWindowMs 2000
-    [int] $CanvasLiveWindowMs = 500,
-    # gfx_wall_live_canvas_tick_divisor -- the tick divisor used when a paint-side animation
-    # and a live canvas are on the page together. Default 2 (30/s at 60Hz). 1 quadruples
-    # reflow and judders (log_webgl_perf_01/03); the old default of 15 starves the canvas to
-    # four frames a second. If the content's own frame rate is known, match it -- the WebGL
-    # source measured here is ?fps=30.
-    #   -CanvasDefeatsThrottle -LiveCanvasDivisor 2
-    [int] $LiveCanvasDivisor = 2,
-    # gfx_wall_canvas_wait_declines_production -- does waiting on a canvas image block tick
-    # production. Off by default since 2026-11-03 (log_webgl_perf_01/08: on gave judder after
-    # a transition, off did not; KEEPPREV canvas 196 -> 0). This switch restores the old
-    # behaviour, where one stale canvas bitmap also discards everything else in that frame
-    # (ticker, video).
-    #   -CanvasWaitDecline
-    [switch] $CanvasWaitDecline,
-    # gfx_wall_webgl_tile_scissor_from_webrender -- scissor each WebGL backend's default
-    # framebuffer down to the part of the canvas THAT BACKEND'S TILE ACTUALLY SHOWS, so the
-    # four GPUs stop each shading the whole canvas and discarding 75% of it
-    # (log_webgl_perf_01/09). Off by default.
-    #
-    # The rectangle comes from WebRender: during frame build each painter records the
-    # intersection of the canvas's destination box with its own tile
-    # (webrender::wall_canvas_rect), and the WebGL thread reads that back. So it works for
-    # ANY canvas size and position, including a canvas animating across the wall during a
-    # transition.
-    #
-    # **Seven flags collapsed into this one on 2026-11-10.** The removed ones derived the same
-    # rectangle from tile geometry instead, which required the canvas backing to match the
-    # virtual viewport EXACTLY -- and a transition canvas measured 11520x4321 against a
-    # 11520x4320 viewport, so 56 of 60 surfaces were skipped and the flag did nothing while
-    # appearing to be on (log_webgl_perf_01/25).
-    #
-    # Do not enable on a page using readPixels/toDataURL/copyTexImage: those read back the
-    # whole canvas, and outside the tile rect it was never drawn.
-    #   Verdict metric: the SCISSORGATE line -- applied%, and per-reason counts when it is not
-    #   applied (no_key / missing / stale / no_isect).
-    [switch] $WebglTileScissorFromWebrender,
-    # gfx_wall_canvas_scissor_lead_periods -- widen the canvas scissor rect to where the
-    # animation will have moved it by the time this frame is PRESENTED. **Default 4
-    # periods** (66.7ms at 60Hz), 0 turns it off, range 0..4.
-    #
-    # ***What it fixes.*** While the canvas moves across the screen (a layout transition) a
-    # black band shows at the tile seams. The rect WebRender records is correct for the
-    # frame it was recorded in, but the canvas is asynchronous: the bitmap drawn under that
-    # scissor is presented in a LATER frame, and the distance the canvas travelled in
-    # between is the band. The operator described it as "a size proportional to the
-    # animation's movement".
-    #
-    # **2026-11-11, measured (log_webgl_perf_01/30 and /31).** Sweeping 0..4 the band
-    # decreases monotonically and at 4 it is nearly gone, so 4 is the default. This value
-    # stands in for the canvas pipeline latency, which nothing measures directly; the
-    # investigation put the budget at 22-115ms (record age 0-34ms + one canvas frame
-    # 22-52ms + a re-present chance), and 4 periods = 66.7ms covers most of it.
-    #
-    # ***This default assumes the one-sided widening.*** The same day the horizontal pad
-    # became one-sided -- the hardware fixed the sign ("on a left-to-right animation, the
-    # black area is on the LEFT edge of the RIGHT tile", so the pad belongs on the
-    # decreasing-x side only) -- which buys the same width for half the shading. That
-    # mattered: with the earlier two-sided pad, lead 4 pushed RENDERCOST's last10s_over
-    # from 0 (at lead 3) to 109 and last10s_worst from 8.6ms to 79.5ms. The vertical pad
-    # is still two-sided because no run has shown the vertical sign.
-    #
-    # Verdict is the band BY EYE. Also watch SCISSORGATE applied% (must not fall) and
-    # RENDERCOST last10s_over (the shading cost).
-    #
-    # Still open: a wide band appears briefly AT THE START of an animation. The prediction
-    # jumping from 0 to four periods' worth is the candidate.
     #   -WebglTileScissorFromWebrender -CanvasScissorLead 0    # the control arm
-    [ValidateRange(0, 4)]
-    [int] $CanvasScissorLead = 4,
+    [ValidateRange(0, 12)]
+    [int] $CanvasScissorLead = 8,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).

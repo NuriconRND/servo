@@ -72,8 +72,56 @@ pub struct CanvasTileRect {
     /// 그 값을 유도한 캔버스 목적지 박스의 크기, 같은 단위. 소비자가 자기가 아는 백킹
     /// 크기와 비교해 ★배율이 1:1 인지★ 확인할 수 있다.
     pub dest_size: [i32; 2],
-    /// 적은 시각. 나이 판정에만 쓴다.
+    /// 적은 시각. 나이 판정과 ★표의 offset 기준★ 이다.
     pub at: Instant,
+    /// ★시각별 사각형 표.★ `(at 로부터의 offset(ms), 그 시각의 사각형)`, 앞
+    /// `sample_count` 개만 유효하고 offset 오름차순이다.
+    ///
+    /// `rect` 는 이 표의 `offset == 0` 항목과 같다(표가 비면 `rect` 만 있다). 소비자는
+    /// `union_over` 로 ★자기 비트맵이 표출되는 구간★ 만 합집합한다 -- 그래서 표를 촘촘히
+    /// 해도 걸리는 scissor 가 넓어지지 않는다.
+    pub samples: [(u16, [i32; 4]); MAX_LEAD_SAMPLES],
+    /// `samples` 중 유효한 개수.
+    pub sample_count: u8,
+}
+
+/// 표의 칸 수. 창이 100ms 안쪽이고 간격이 한 주기(16.67ms)이므로 여유를 두고 열여섯이면
+/// 넘치지 않는다. 고정 배열이라 ★할당이 없고★ `Copy` 가 유지된다(구조체는 320 바이트쯤
+/// 이고 조회마다 한 번 복사된다 -- 캔버스 프레임당 한 번이다).
+pub const MAX_LEAD_SAMPLES: usize = 16;
+
+impl CanvasTileRect {
+    /// `[from_ms, to_ms]` 구간에 걸리는 샘플들의 합집합.
+    ///
+    /// 소비자는 ★자기 비트맵이 표출되는 전 기간★ 을 넘긴다 -- 즉 `from` 은 이 기록의
+    /// 나이, `to` 는 그 나이에 자기 프레임 간격을 더한 값이다. 그 구간 밖의 샘플은 이
+    /// 비트맵이 화면에 있는 동안 해당되지 않으므로 ★쓰지 않는다★.
+    ///
+    /// 구간에 걸리는 것이 없으면(표가 비었거나 구간이 표를 벗어났으면) `rect` 를 준다 --
+    /// 그러면 동작이 표를 들이기 전과 같다.
+    pub fn union_over(&self, from_ms: u64, to_ms: u64) -> [i32; 4] {
+        let mut acc: Option<[i32; 4]> = None;
+        for &(offset, rect) in &self.samples[..self.sample_count as usize] {
+            let offset = offset as u64;
+            if offset < from_ms || offset > to_ms {
+                continue;
+            }
+            acc = Some(match acc {
+                None => rect,
+                Some(have) => union_boxes(have, rect),
+            });
+        }
+        acc.unwrap_or(self.rect)
+    }
+}
+
+/// `[x, y, w, h]` 둘의 합집합.
+fn union_boxes(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
+    let x0 = a[0].min(b[0]);
+    let y0 = a[1].min(b[1]);
+    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+    [x0, y0, x1 - x0, y1 - y0]
 }
 
 /// 꺼져 있으면 비용이 ★원자 로드 하나★ 다. `paint` 가 pref 를 보고 세운다 -- `webrender` 는
@@ -163,6 +211,9 @@ fn lead_map() -> &'static Mutex<HashMap<u32, Vec<LeadSample>>> {
 /// 한 애니메이션 바인딩의 한 시각 샘플.
 #[derive(Clone, Copy, Debug)]
 pub struct LeadSample {
+    /// 이 샘플의 시각, 창 기준 시각(`is_now` 인 샘플)으로부터의 offset(ms). WR 이 표의
+    /// 키로 그대로 쓴다. 과거 샘플(나이 흡수용)은 0 이다.
+    pub offset_ms: u16,
     /// 이 애니메이션의 바인딩 id. 소비자가 `SpatialTree::find_spatial_node_by_anim_id`
     /// 에 그대로 넘기므로 `u64` 가 아니라 그 타입이어야 한다.
     pub binding_id: api::PropertyBindingId,
@@ -214,7 +265,13 @@ pub fn is_enabled() -> bool {
 }
 
 /// 이번 프레임의 사각형을 적는다. `picture.rs` 의 Image 분기가 부른다.
-pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
+pub fn note(
+    slot: u32,
+    key: ImageKey,
+    rect: [i32; 4],
+    dest_size: [i32; 2],
+    samples: &[(u16, [i32; 4])],
+) {
     if !is_enabled() {
         return;
     }
@@ -235,6 +292,14 @@ pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
                 rect,
                 dest_size,
                 at: Instant::now(),
+                samples: {
+                    let mut table = [(0u16, [0i32; 4]); MAX_LEAD_SAMPLES];
+                    for (slot, sample) in table.iter_mut().zip(samples) {
+                        *slot = *sample;
+                    }
+                    table
+                },
+                sample_count: samples.len().min(MAX_LEAD_SAMPLES) as u8,
             },
         );
     }
@@ -243,7 +308,7 @@ pub fn note(slot: u32, key: ImageKey, rect: [i32; 4], dest_size: [i32; 2]) {
 /// 이 (slot, 캔버스)의 최신 사각형. `max_age_ms` 보다 오래됐으면 `None` 이다.
 pub fn get(slot: u32, key: ImageKey, max_age_ms: u64) -> Option<CanvasTileRect> {
     match lookup(slot, key, max_age_ms) {
-        Lookup::Hit(value) => Some(value),
+        Lookup::Hit(value, _) => Some(value),
         _ => None,
     }
 }
@@ -257,8 +322,10 @@ pub enum Lookup {
     Missing,
     /// 적힌 것이 있지만 `max_age_ms` 보다 낡았다. 값과 나이를 함께 준다.
     Stale(CanvasTileRect, u64),
-    /// 쓸 수 있는 값.
-    Hit(CanvasTileRect),
+    /// 쓸 수 있는 값. ★나이를 함께 준다★ -- 소비자가 `union_over` 의 구간 시작으로
+    /// 쓴다. 앞 판은 이 나이를 계산해서 버렸고, 그래서 `lead` 를 고정 상수로 추측해야
+    /// 했다(근거는 `CanvasTileRect::samples` 의 doc 주석).
+    Hit(CanvasTileRect, u64),
 }
 
 /// `get` 과 같은 조회지만 ★왜 못 썼는지를 함께 돌려준다.★
@@ -277,7 +344,7 @@ pub fn lookup(slot: u32, key: ImageKey, max_age_ms: u64) -> Lookup {
     if age > max_age_ms {
         return Lookup::Stale(value, age);
     }
-    Lookup::Hit(value)
+    Lookup::Hit(value, age)
 }
 
 /// 이 캔버스의 기록과 등록을 모든 slot 에서 지운다. ★컨텍스트가 사라질 때 반드시 부른다★
