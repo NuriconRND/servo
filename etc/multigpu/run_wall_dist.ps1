@@ -457,8 +457,8 @@ param(
     #   applied (no_key / missing / stale / no_isect).
     [switch] $WebglTileScissorFromWebrender,
     # gfx_wall_canvas_scissor_lead_periods -- widen the canvas scissor rect to where the
-    # animation will have moved it by the time this frame is PRESENTED. Default 1 period
-    # (16.67ms at 60Hz), 0 turns it off, range 0..4.
+    # animation will have moved it by the time this frame is PRESENTED. **Default 4
+    # periods** (66.7ms at 60Hz), 0 turns it off, range 0..4.
     #
     # ***What it fixes.*** While the canvas moves across the screen (a layout transition) a
     # black band shows at the tile seams. The rect WebRender records is correct for the
@@ -467,12 +467,28 @@ param(
     # between is the band. The operator described it as "a size proportional to the
     # animation's movement".
     #
-    # This value IS the canvas pipeline latency, and nothing measures that today, so sweep
-    # 0/1/2 and take the smallest value at which the band disappears -- that value is the
-    # measurement. Verdict is the band BY EYE; SCISSORGATE applied% should not fall.
-    #   -WebglTileScissorFromWebrender -CanvasScissorLead 1
+    # **2026-11-11, measured (log_webgl_perf_01/30 and /31).** Sweeping 0..4 the band
+    # decreases monotonically and at 4 it is nearly gone, so 4 is the default. This value
+    # stands in for the canvas pipeline latency, which nothing measures directly; the
+    # investigation put the budget at 22-115ms (record age 0-34ms + one canvas frame
+    # 22-52ms + a re-present chance), and 4 periods = 66.7ms covers most of it.
+    #
+    # ***This default assumes the one-sided widening.*** The same day the horizontal pad
+    # became one-sided -- the hardware fixed the sign ("on a left-to-right animation, the
+    # black area is on the LEFT edge of the RIGHT tile", so the pad belongs on the
+    # decreasing-x side only) -- which buys the same width for half the shading. That
+    # mattered: with the earlier two-sided pad, lead 4 pushed RENDERCOST's last10s_over
+    # from 0 (at lead 3) to 109 and last10s_worst from 8.6ms to 79.5ms. The vertical pad
+    # is still two-sided because no run has shown the vertical sign.
+    #
+    # Verdict is the band BY EYE. Also watch SCISSORGATE applied% (must not fall) and
+    # RENDERCOST last10s_over (the shading cost).
+    #
+    # Still open: a wide band appears briefly AT THE START of an animation. The prediction
+    # jumping from 0 to four periods' worth is the candidate.
+    #   -WebglTileScissorFromWebrender -CanvasScissorLead 0    # the control arm
     [ValidateRange(0, 4)]
-    [int] $CanvasScissorLead = 1,
+    [int] $CanvasScissorLead = 4,
     [string] $VideoEscape = "",          # gfx_video_escape_mode; "external" to enable
     # gfx_video_escape_buffer_count: back buffers on each escaped video's flip swap chain.
     # 0 = leave the pref alone (engine default 2 = current behaviour).
