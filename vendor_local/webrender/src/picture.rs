@@ -3285,8 +3285,44 @@ impl TileCacheInstance {
         local_prim_rect: LayoutRect,
         frame_context: &FrameVisibilityContext,
     ) {
-        let Some(visible_in_tile) = pic_coverage_rect.intersection(&self.screen_rect_in_pic_space)
-        else {
+        // ★기준 rect 를 lead 샘플과 같게 둔다.★ 2026-11-11.
+        //
+        // 앞 판은 `pic_coverage_rect` 와 교집합했는데, lead 샘플 쪽
+        // (`lead_sample_boxes`)은 `screen_rect_in_pic_space` 만 쓰고 그 교집합을 하지
+        // 않는다. 그래서 캔버스의 클립된 커버리지가 타일보다 작은 구성(페이지 클립,
+        // overflow, 부분만 덮는 캔버스)에서 ***lead 박스가 offset-0 박스보다 늘 컸다*** --
+        // 조사 평으로는 그것이 "`lead` 0 이 8/12 보다 눈에 띄게 넓은 검은 영역을 낸" 가장
+        // 유력한 이유다(log_webgl_perf_01/37). 즉 예측이 들어서 나아진 것처럼 보인 상당
+        // 부분이 ***기준 rect 불일치의 부작용***이었다.
+        //
+        // 둘을 안전 쪽(넓은 쪽)으로 통일한다. `local_prim_rect` 가 여전히 상한이므로
+        // 캔버스 밖으로 번지지 않는다.
+        //
+        // ★타일 격자로 넓힌다★ -- 샘플러는 `local_tile_rect ∩ ctx.local_rect` 로 클립하고
+        // `screen_rect_in_pic_space` 와는 교집합하지 않는다(:1136-1141, :932, :6133-6141).
+        // 그래서 타일 격자가 이 painter 의 screen rect 에 정렬되지 않으면 WR 이 screen
+        // rect ***밖***의 캔버스 텍셀을 읽는다. `tile_size=display` 이고 레이아웃 원점이
+        // 그 배수인 구성에서는 겹침이 0 이지만(run 37 이 그랬다), 기본값 1024x512 에서는
+        // 0 이 아니다 -- 격자 정렬에 의존하지 않게 둔다.
+        let sampled_rect = {
+            let screen = self.screen_rect_in_pic_space;
+            let tile = self.tile_size;
+            if tile.width > 0.0 && tile.height > 0.0 {
+                PictureRect::new(
+                    PicturePoint::new(
+                        (screen.min.x / tile.width).floor() * tile.width,
+                        (screen.min.y / tile.height).floor() * tile.height,
+                    ),
+                    PicturePoint::new(
+                        (screen.max.x / tile.width).ceil() * tile.width,
+                        (screen.max.y / tile.height).ceil() * tile.height,
+                    ),
+                )
+            } else {
+                screen
+            }
+        };
+        let Some(visible_in_tile) = pic_coverage_rect.intersection(&sampled_rect) else {
             return;
         };
         // ref = 픽처 공간(앵커), target = prim 공간. ★이 순서여야 한다★ -- 반대로 넣으면
@@ -3360,6 +3396,7 @@ impl TileCacheInstance {
             slot,
             prim_spatial_node_index,
             local_prim_rect,
+            sampled_rect,
             &map_prim_to_pic,
             frame_context,
             &to_box,
@@ -3402,6 +3439,7 @@ impl TileCacheInstance {
         slot: u32,
         prim_spatial_node_index: SpatialNodeIndex,
         local_prim_rect: LayoutRect,
+        sampled_rect: PictureRect,
         map_prim_to_pic: &SpaceMapper<LayoutPixel, PicturePixel>,
         frame_context: &FrameVisibilityContext,
         to_box: &dyn Fn(LayoutRect) -> [i32; 4],
@@ -3454,7 +3492,9 @@ impl TileCacheInstance {
             if m_t.has_perspective_component() {
                 continue;
             }
-            let Some(in_prim) = m_t.inverse_rect_footprint(&self.screen_rect_in_pic_space) else {
+            // offset-0 과 ★같은 기준 rect★ 를 쓴다 -- 근거는 `note_canvas_tile_rect` 의
+            // `sampled_rect` 자리 주석.
+            let Some(in_prim) = m_t.inverse_rect_footprint(&sampled_rect) else {
                 continue;
             };
             let Some(clipped) = in_prim.intersection(&local_prim_rect) else {

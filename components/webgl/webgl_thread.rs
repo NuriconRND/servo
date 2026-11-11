@@ -172,6 +172,35 @@ fn note_swap_failure(surface_id: WebGLSurfaceId, what: &str, error: &str) {
 /// ★I/O 는 타이밍 경로에 두지 않는다.★ `handle_swap_buffers` 에서는 원자 증가 하나뿐이고,
 /// 출력은 10 초마다 그 경로에서 한 줄 -- 구간 차분을 직접 찍으므로 읽는 쪽이 누적을
 /// 나눌 필요가 없다.
+/// swap 간격(`hold`)의 합·최댓값·개수. `SCISSORGATE` 리포터가 함께 찍는다.
+///
+/// ★왜 리포터 칸인가★(2026-11-11): 앞 판은 서피스별 디버그 줄에 찍었는데, 그 줄은
+/// 서피스마다 한 번뿐이고 그 한 번이 ***항상 첫 swap*** 이라 전부 첫 swap 전용 값
+/// (500ms)이 나왔다 -- 실제 분포를 하나도 못 봤다(log_webgl_perf_01/37, 96 줄 전부
+/// `hold=500ms`). 구간을 고르는 값이므로 분포를 봐야 판정이 된다.
+///
+/// `n` 과 `applied` 를 비교하면 ★서피스가 매 프레임 새로 생기는지★ 도 보인다 -- 첫 swap 이
+/// 계속 나오면 `max` 가 상한(500)에 붙어 있고 `avg` 가 그쪽으로 끌린다.
+static HOLD_SUM_MS: AtomicU64 = AtomicU64::new(0);
+static HOLD_MAX_MS: AtomicU64 = AtomicU64::new(0);
+static HOLD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// swap 과 그 비트맵이 실제로 합성되는 시각 사이의 지연, ms.
+///
+/// 이것을 재는 수치가 없다. 한 WR 프레임 안쪽이라는 것만 아는데(발행 즉시 다음 합성에
+/// 들어간다), 60Hz 에서 그것은 17ms 이하다. 창을 ***큰 쪽으로*** 틀리게 하는 값이 안전
+/// 하므로(합집합이라 빈 칸이 생기지 않는다) 한 주기를 쓴다.
+///
+/// 2026-11-11. 실측이 가능해지면(예: 합성 쪽에서 비트맵의 발행 시각을 되돌려 받으면)
+/// 그 값으로 바꿀 것.
+const SWAP_TO_COMPOSITE_MS: u64 = 17;
+
+fn note_hold(ms: u64) {
+    HOLD_SUM_MS.fetch_add(ms, Ordering::Relaxed);
+    HOLD_MAX_MS.fetch_max(ms, Ordering::Relaxed);
+    HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 fn note_scissor_gate(outcome: ScissorGate) {
     static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
@@ -231,9 +260,12 @@ fn note_scissor_gate(outcome: ScissorGate) {
     } else {
         d[0] as f64 * 100.0 / total as f64
     };
+    // ★구간 차분이다★ -- 누적값을 그대로 찍으면 평균이 런 전체의 것이 된다.
+    let hold_count = HOLD_COUNT.swap(0, Ordering::Relaxed);
+    let hold_sum = HOLD_SUM_MS.swap(0, Ordering::Relaxed);
     warn!(
         "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
-         stale={} (age_max={}ms) no_isect={}",
+         stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms)",
         d[0],
         d[0] as f64 / secs,
         d[1],
@@ -241,6 +273,13 @@ fn note_scissor_gate(outcome: ScissorGate) {
         d[3],
         STALE_AGE_MAX.swap(0, Ordering::Relaxed),
         d[4],
+        hold_count,
+        if hold_count > 0 {
+            hold_sum / hold_count
+        } else {
+            0
+        },
+        HOLD_MAX_MS.swap(0, Ordering::Relaxed),
     );
 }
 
@@ -287,10 +326,14 @@ fn scale_canvas_rect_to_gl(
     }
     let sx = canvas.width as f32 / dest_size[0] as f32;
     let sy = canvas.height as f32 / dest_size[1] as f32;
+    // ★두 경계를 각각 환산한 뒤 뺀다★ -- origin 과 extent 를 따로 환산하면 오른쪽
+    // 경계가 `floor(a) + ceil(b)` 가 되어 정확한 `a + b` 보다 ***작아질 수 있다***
+    // (예: sx=1.5, [11, 100] -> 정확히 166.5 인데 16+150=166). 그러면 그 한 줄이 그려지지
+    // 않는다. 2026-11-11.
     let x = (rect[0] as f32 * sx).floor() as i32;
     let top = (rect[1] as f32 * sy).floor() as i32;
-    let w = (rect[2] as f32 * sx).ceil() as i32;
-    let h = (rect[3] as f32 * sy).ceil() as i32;
+    let w = ((rect[0] + rect[2]) as f32 * sx).ceil() as i32 - x;
+    let h = ((rect[1] + rect[3]) as f32 * sy).ceil() as i32 - top;
     if w <= 0 || h <= 0 {
         return None;
     }
@@ -1922,33 +1965,47 @@ impl WebGLThread {
         const FIRST_SWAP_HOLD: Duration = Duration::from_millis(500);
 
         let now = Instant::now();
-        match self.last_swap_at.insert(surface_id, now) {
+        let hold = match self.last_swap_at.insert(surface_id, now) {
             Some(previous) => now.saturating_duration_since(previous).min(FIRST_SWAP_HOLD),
             None => FIRST_SWAP_HOLD,
-        }
+        };
+        note_hold(hold.as_millis() as u64);
+        hold
     }
 
     /// WR 이 적은 표에서 ★이 비트맵이 표출되는 구간★ 의 사각형을 고른다.
     ///
-    /// ## 구간을 어떻게 정하나 (2026-11-11 2 차)
+    /// ## 구간을 어떻게 정하나 (2026-11-11 3 차)
     ///
     /// ```text
-    ///   from = age          `lookup` 이 주는, 그 기록이 낡은 정도
-    ///   to   = age + hold   hold = 이 캔버스의 프레임 간격(측정값)
+    ///   from = age + hold
+    ///   to   = age + 2*hold + SWAP_TO_COMPOSITE_MS
     /// ```
     ///
-    /// 지금 그리는 비트맵은 ***다음 캔버스 프레임이 나올 때까지*** 화면에 있다. 그 기간이
-    /// `hold` 이고, 그 사이 애니메이션이 지나가는 영역을 모두 덮어야 띠가 생기지 않는다.
-    /// 구간의 시작이 `age` 인 것은 그 기록이 적힌 뒤 이미 그만큼 흘렀기 때문이다.
+    /// `age` 는 `lookup` 이 주는, 그 기록이 낡은 정도다. `hold` 는 이 캔버스의 프레임
+    /// 간격(측정값)이다.
     ///
-    /// 앞 판은 WR 이 낸 합집합 하나를 그대로 썼고, 그 창은 `lead` 라는 ***고정 상수***로
-    /// 정해졌다. 실제 지연은 캔버스마다 다르므로(무거운 페이지는 한 프레임이 오래 표출
-    /// 된다) 상수가 둘 다 맞을 수 없었다 -- 네 판을 고쳐도 전환 시작의 띠가 남은 이유가
-    /// 그것이다(log_webgl_perf_01/32~36). 지금은 `hold` 가 ***측정값***이라 `gear` 처럼
-    /// 느린 캔버스는 자동으로 넓은 구간을 보고, `scene` 처럼 빠른 캔버스는 좁게 본다.
+    /// ★왜 `hold` 한 번이 더 붙나★ -- 이 박스는 `handle_swap_buffers` 에서 설치되므로,
+    /// 그 프레임이 ***이미 그려진 뒤***다. 그래서 이 박스가 지배하는 것은 ***다음***
+    /// 프레임의 draw 이고, 그 비트맵은 다음 swap(= 지금부터 `hold` 뒤)에 발행되어
+    /// 그다음 swap 까지(= 다시 `hold`) 화면에 있다. 즉 덮어야 할 것은 "지금 화면에 있는
+    /// 비트맵" 이 아니라 ***다음에 그려질 비트맵***의 표출 기간이다.
     ///
-    /// `lead` 는 이제 "표를 얼마나 멀리까지 적을까" 만 정하고, 고르는 일에는 관여하지
-    /// 않는다.
+    /// ## 왜 이 자리를 옮길 수 없나
+    ///
+    /// 설치를 프레임 앞으로 옮기면 될 것 같지만 아니다 -- 이 자리는 그 프레임의 첫 draw
+    /// ***직전***이고, 그보다 더 신선할 수 없다. 고칠 것은 자리가 아니라 ★창의 위상★ 이다.
+    ///
+    /// 기존 주석이 이 위상차를 적어 두고 "거의 안 바뀌는 값이라 한 프레임 지연은 보이지
+    /// 않는다" 고 가정했는데, 전환 중에는 그 가정이 정확히 거짓이다.
+    ///
+    /// ## 앞 판들이 왜 안 먹혔나
+    ///
+    /// 1 차~4 차는 모두 "창을 넓힌다" 는 틀 안이었고, 실기에서 `lead` 0 에서도 띠가 남고
+    /// 8 과 12 가 같았다(log_webgl_perf_01/32~37). 위상이 틀린 창은 넓혀도 다른 데를
+    /// 덮는다. 그리고 `to = age + hold` 는 최대 34+17 = 51ms 이므로 ***3 주기 밖의 샘플은
+    /// 절대 선택되지 않았다*** -- 묶는 것은 표의 범위가 아니라 이 창이었다. 그것이 "8 과
+    /// 12 가 차이 없음" 의 정확한 설명이다.
     fn tile_scissor_from_webrender(
         &self,
         surface_id: WebGLSurfaceId,
@@ -1992,7 +2049,12 @@ impl WebGLThread {
             return None;
         }
         // ★구간을 골라 그 안에서만 합집합한다.★ 근거는 이 함수의 doc 주석.
-        let wanted = noted.union_over(age, age + hold.as_millis() as u64);
+        //
+        // ★한 프레임 뒤부터다★ -- 이 박스는 `handle_swap_buffers` 에서 설치되므로 ***다음***
+        // 프레임의 draw 를 지배한다. 즉 지금 고르는 구간은 "지금 화면에 있는 비트맵" 이
+        // 아니라 "다음에 그려질 비트맵" 의 표출 기간이어야 한다.
+        let hold_ms = hold.as_millis() as u64;
+        let wanted = noted.union_over(age + hold_ms, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
         let scaled = self.scale_canvas_rect(wanted, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
             Some(_) => ScissorGate::Applied,
@@ -2022,18 +2084,14 @@ impl WebGLThread {
     /// 캔버스는 페이지가 CSS px 로 잡고(`clientWidth`) 뷰포트는 device px 이므로, hidpi
     /// 배율이 1 이 아니면 둘이 어긋난다 -- 그 경우가 가장 먼저 의심할 자리다.
     /// `SCISSOR` 로그에 붙이는 진단 문자열. 서피스마다 한 번만 만든다.
-    fn tile_scissor_debug(&self, surface_id: WebGLSurfaceId, hold: Duration) -> String {
+    fn tile_scissor_debug(&self, surface_id: WebGLSurfaceId) -> String {
         match self.webrender_swap_chains.get(surface_id) {
             Some(chain) => {
                 let canvas = chain.size();
-                // hold 는 이 서피스의 프레임 간격 -- scissor 구간의 길이다. 서피스마다
-                // 한 번만 찍으므로 비용이 없다.
-                format!(
-                    "canvas={}x{} hold={}ms",
-                    canvas.width,
-                    canvas.height,
-                    hold.as_millis()
-                )
+                // ★`hold` 를 여기 찍지 않는다★ -- 이 줄은 서피스마다 한 번이고 그 한 번이
+                // 항상 첫 swap 이라 전부 첫 swap 전용 값이 나왔다(log_webgl_perf_01/37).
+                // `SCISSORGATE` 의 `hold(...)` 칸이 분포를 나른다.
+                format!("canvas={}x{}", canvas.width, canvas.height)
             },
             None => "canvas=?".to_owned(),
         }
@@ -2063,7 +2121,7 @@ impl WebGLThread {
                 // ★빌림 전에 만든다★ -- 로그 자리에서는 `self` 를 못 쓴다. 서피스마다 한
                 // 번뿐이라 평소에는 만들지 않는다.
                 let scissor_debug = if scissor_needs_log {
-                    self.tile_scissor_debug(surface_id, hold)
+                    self.tile_scissor_debug(surface_id)
                 } else {
                     String::new()
                 };
@@ -4857,6 +4915,49 @@ mod scissor_lead_tests {
         assert_eq!(fast, [0, 0, 20, 10]);
         assert_eq!(slow, [0, 0, 40, 10]);
         assert!(slow[2] > fast[2], "느린 쪽이 더 넓어야 한다");
+    }
+
+    /// ★창은 한 프레임 뒤에서 시작한다.★ 2026-11-11.
+    ///
+    /// scissor 는 `handle_swap_buffers` 에서 설치되므로 ***다음*** 프레임의 draw 를
+    /// 지배한다. 그래서 덮어야 할 것은 "지금 화면에 있는 비트맵" 이 아니라 "다음에 그려질
+    /// 비트맵" 의 표출 기간이다. 앞 판은 `[age, age+hold]` 를 골라 한 프레임 일찍이었고,
+    /// 그래서 `lead` 0 에서도 띠가 남고 8 과 12 가 같았다(log_webgl_perf_01/37).
+    #[test]
+    fn the_window_starts_one_frame_later() {
+        let noted = sample_table(&[
+            (0, [0, 0, 10, 10]),
+            (17, [10, 0, 10, 10]),
+            (34, [20, 0, 10, 10]),
+            (51, [30, 0, 10, 10]),
+        ]);
+        // age 0, hold 17 -> [17, 51]: 첫 칸(지금 화면에 있는 것)은 빠지고 뒤 셋이 든다.
+        let got = noted.union_over(17, 2 * 17 + 17);
+        assert_eq!(
+            got,
+            [10, 0, 30, 10],
+            "다음 비트맵의 표출 기간이어야 한다: {got:?}"
+        );
+        // 앞 판의 창은 첫 칸을 포함했다 -- 그것이 한 프레임 일찍이었다는 증거.
+        let old = noted.union_over(0, 17);
+        assert!(old[0] < got[0], "앞 판 창은 더 이른 쪽이었다");
+    }
+
+    /// ★먼 쪽 경계를 잘라먹지 않는다.★ 2026-11-11.
+    ///
+    /// origin 과 extent 를 따로 환산하면 오른쪽 경계가 `floor(a) + ceil(b)` 가 되어 정확한
+    /// `a + b` 보다 작아질 수 있고, 그러면 그 한 줄이 그려지지 않는다.
+    #[test]
+    fn the_far_edge_is_not_truncated_by_rounding() {
+        // sx = 150/100 = 1.5. rect 의 오른쪽 경계는 11+50 = 61 -> 정확히 91.5.
+        // ★캔버스(150) 안에 들도록 잡는다★ -- 넘기면 경계 클램프가 먼저 걸려 반올림을
+        // 재는 테스트가 되지 않는다.
+        let got = scale_canvas_rect_to_gl([11, 0, 50, 10], [100, 10], Size2D::new(150, 15))
+            .expect("환산되어야 한다");
+        // x = floor(16.5) = 16, 오른쪽 = ceil(91.5) = 92 -> w = 76.
+        // 앞 판은 w = ceil(50*1.5) = 75 여서 오른쪽이 91 -- ★한 줄이 빠졌다★.
+        assert_eq!(got[0], 16, "왼쪽은 밖으로 내림: {got:?}");
+        assert_eq!(got[0] + got[2], 92, "오른쪽은 밖으로 올림: {got:?}");
     }
 
     /// ★구간이 표를 벗어나면 오늘 사각형으로 돌아간다.★ 그러면 동작이 이 기능을 들이기
