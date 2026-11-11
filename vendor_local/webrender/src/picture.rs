@@ -1941,6 +1941,35 @@ impl Display for SurfacePromotionFailure {
     }
 }
 
+/// `prim` 에서 `anchor` 까지 조상 사슬을 거슬러, `binding_id` 로 변환이 묶여 있는 노드를
+/// 찾는다. ★그 사슬 밖의 노드는 이 prim 의 기하에 영향을 주지 않으므로 쓰지 않는다.★
+///
+/// `SpatialTree::find_spatial_node_by_anim_id` 는 트리 전체를 뒤지므로 여기에 맞지 않다 --
+/// 근거는 `TileCacheInstance::union_lead_samples` 의 해당 자리 주석에 있다.
+///
+/// 사슬은 `SpatialNode.parent` 를 따라간다. `anchor` 에 닿거나 뿌리에 닿으면 멈춘다 --
+/// 앵커보다 위의 변환은 `map_prim_to_pic` 이 이미 포함하고 있고, 그 위에서 애니메이션이
+/// 돌면 타일 자체가 움직이는 것이라 이 함수의 관심 밖이다.
+fn ancestor_animated_node(
+    spatial_tree: &SpatialTree,
+    prim: SpatialNodeIndex,
+    anchor: SpatialNodeIndex,
+    binding_id: api::PropertyBindingId,
+) -> Option<SpatialNodeIndex> {
+    let mut current = Some(prim);
+    while let Some(index) = current {
+        let node = spatial_tree.get_spatial_node(index);
+        if node.is_transform_bound_to_property(binding_id) {
+            return Some(index);
+        }
+        if index == anchor {
+            break;
+        }
+        current = node.parent;
+    }
+    None
+}
+
 impl TileCacheInstance {
     pub fn new(params: TileCacheParams) -> Self {
         // Determine how many sub-slices we need. Clamp to an arbitrary limit to ensure
@@ -3324,10 +3353,20 @@ impl TileCacheInstance {
             else {
                 continue;
             };
-            let Some(node) = frame_context
-                .spatial_tree
-                .find_spatial_node_by_anim_id(sample.binding_id)
-            else {
+            // ★이 prim 의 조상인 애니메이션 노드만 쓴다.★ 2026-11-11.
+            //
+            // 처음에는 `find_spatial_node_by_anim_id` 로 ***트리 전체***에서 찾았다. 그러면
+            // ***다른 요소의 애니메이션***까지 이 prim 에 적용된다 -- 전환 중에는 나가는
+            // 캔버스와 들어오는 캔버스가 각각 애니메이션을 갖고 있으므로, 캔버스 A 의
+            // 사각형에 캔버스 B 의 델타가 곱해져 엉뚱하게 넓어진다. 운영자가 본 "전환
+            // 애니메이션 시작시 비교적 넓은 범위에서 검은 영역 잠깐"(log_webgl_perf_01/33)
+            // 이 바로 그 순간이다 -- 두 캔버스가 동시에 사는 때다.
+            let Some(node) = ancestor_animated_node(
+                frame_context.spatial_tree,
+                prim_spatial_node_index,
+                self.spatial_node_index,
+                sample.binding_id,
+            ) else {
                 continue;
             };
             let l = frame_context
