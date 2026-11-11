@@ -513,8 +513,10 @@ Review Focus #1 을 ***테스트로 고정***하는 태스크다. 아직 동작�
 - [ ] **Step 2: 실패를 확인한다**
 
 ```
-build_wall.cmd test -p servo-paint web_content_animation
+build_wall.cmd test -p servo-paint -p servo-webgl --features servo-webgl/no-wgl,servo-paint/webgpu web_content_animation
 ```
+
+★이 명령 형태를 그대로 쓰라.★ 바로 `-p servo-paint` 만 주면 surfman/webgpu 의 feature 해석 오류가 난다(Task 2 에서 확인). 패키지와 feature 를 함께 줘야 한다.
 
 Expected: ★컴파일 실패★ — `cannot find function 'animation_zero' in this scope`.
 
@@ -573,7 +575,7 @@ fn animation_zero(
 - [ ] **Step 4: 통과를 확인한다**
 
 ```
-build_wall.cmd test -p servo-paint
+build_wall.cmd test -p servo-paint -p servo-webgl --features servo-webgl/no-wgl,servo-paint/webgpu
 ```
 
 Expected: ★75 passed★ (기존 71 + 새 4). 기존 테스트가 하나라도 깨지면 옮기는 과정에서 식을 바꾼 것이다 — 원본과 글자 단위로 대조하라.
@@ -976,7 +978,12 @@ Task 5 에서 `update_the_rendering` 이 `frame_time` 을 받지만, 리플로�
 
 ★`#[no_trace]` 가 필요하다★ — `CrossProcessInstant` 는 `JSTraceable` 이 아니다. 반대로 `f64` 나 `Cell<f64>` 처럼 이미 `JSTraceable` 인 타입에 붙이면 `E0283` 이 난다. 같은 파일의 다른 `#[no_trace]` 필드가 선례다.
 
-생성자에 `last_frame_time: Cell::new(None),` 을 더하고, `update_the_rendering` 머리에서 세운다:
+생성자에 `last_frame_time: Cell::new(None),` 을 더하고, ★`update_animations_and_send_events` 머리에서 세운다★:
+
+> ★계획 본문의 "`update_the_rendering` 머리" 는 틀렸다.★ Task 5 에서 확인됐다 --
+> `Document::update_the_rendering` 은 `frame_time` 을 받지 않는다. 그 값을 받는 것은
+> `update_animations_and_send_events(cx, frame_time)` 이고, 그것은 HTML 11 단계라
+> 리플로(22 단계, `script_thread.rs:1513`)보다 ***앞선다.*** 저장 자리로 맞다.
 
 ```rust
         if frame_time.is_some() {
@@ -1228,6 +1235,8 @@ Write-Host "`nDone. Hand over the six .err.log files." -ForegroundColor Green
 ```
 
 `make_wall_dist.ps1` 의 복사 목록에 한 줄 더한다(`tools\serve_http.ps1` 복사 줄 아래). ★경로의 역슬래시를 Python 으로 쓸 때 `\r` 이 캐리지 리턴이 되지 않게 하라★ — `'tools' + chr(92) + 'run_frame_time_ab.ps1'` 처럼 조립한다.
+
+★줄끝은 있는 그대로 보존하라.★ 이 저장소는 `core.autocrlf=true` 라 작업 트리와 blob 의 줄끝이 달라 보일 수 있다. 단정하지 말고 `open(p, "rb")` 로 읽어 쓰던 대로 쓰고, ***diff 가 소수 줄 변경인지***로 확인하라 -- 통째 재작성이면 틀린 것이다.
 
 - [ ] **Step 5: 바인딩을 실제로 검증한다**
 

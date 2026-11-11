@@ -234,7 +234,7 @@ Expected: FAIL
 
 - [ ] **Step 3: `Timer` 와 `Vsync` 에도 손잡이를 단다**
 
-`PacingRefreshDriver` 가 이미 모델이다(스레드를 띄우지 않고 남이 부르면 발사). 같은 모양의
+`TickRefreshDriver`(2026-10-21 `9b6cd8dfcf3` 에서 `pacing_refresh_driver.rs` 를 개명) 가 이미 모델이다 — 스레드를 띄우지 않고 남이 부르면 발사한다. 같은 모양의
 손잡이를 나머지 둘에 두고, 자기 스레드는 ★손잡이를 부르는 쪽★ 으로 바꾼다 — 콜백을 쏘는
 주체가 언제나 틱이 되도록.
 
@@ -349,7 +349,9 @@ git commit -m "feat(paint): 틱 전용 생산 진입점을 만든다 (아직 부
 - Modify: `components/config/prefs.rs` (`gfx_single_frame_producer`, 기본 `false`)
 
 **Interfaces:**
-- Consumes: `Paint::produce_wall_frame`
+- Consumes: `Paint::on_wall_tick()` — Task 4 가 낸 유일한 `pub` 진입점. 그 안에서
+  `gather_components` -> `produce_wall_frame` 순으로 부르므로 ★밖에서 순서를 틀릴 방법이
+  없다★. `produce_wall_frame` 자체는 `pub(crate)` 이라 셸에서 못 부른다
 - Produces: `gfx_single_frame_producer` pref
 
 ★이 상태는 플래그 뒤에서만 존재하고 Task 9 가 끝나기 전에는 기본값을 켜지 않는다. 이 단계의
@@ -374,7 +376,7 @@ Expected: FAIL — 필드가 없다
 - [ ] **Step 3: pref 와 호출을 넣는다**
 
 `fire_present_tick` 에서 `note_present_tick()` 과 렌더 사이에, pref 가 켜져 있을 때만
-`produce_wall_frame()` 을 부른다. ★"한 `note_present_tick` 당 생산 1 회" 디버그 어서션★ 을
+`on_wall_tick()` 을 부른다. ★"한 `note_present_tick` 당 생산 1 회" 디버그 어서션★ 을
 같이 넣는다(`debug_assert!`).
 
 - [ ] **Step 4: 시험이 통과하는 것을 본다**
@@ -384,8 +386,31 @@ Expected: PASS
 
 - [ ] **Step 5: 배선이 됐는지 실기로 확인한다**
 
-`--pref gfx_single_frame_producer=true` 로 60 초. 보는 것: ★합성이 대략 두 배★ 로 난다.
-그것이 배선이 됐다는 증거다. `FRAMEREASON` 에 `tick` 값이 새로 보인다.
+`--pref gfx_single_frame_producer=true` 로 60 초. 보는 것: ★합성이 는다★ — 그것이 배선이
+됐다는 증거다.
+
+★배수를 해석하지 말 것.★ Task 4 의 `gather_components` 는 `pump_paint_animation` 을 통째로
+부르는데 그 안에 비디오·애니메이션 분기가 아직 살아 있다. 그래서 한 틱이 합성을 ***두 번***
+낼 수 있다(gather 안쪽에서 한 번, `produce_wall_frame` 에서 한 번). 이 구간의 배수는 배선
+여부만 말하고 생산자 수는 말하지 않는다 -- "생산 지점 하나" 판정은 Task 7 이후다.
+
+`FRAMEREASON` 의 `tick` 전용 값도 아직 없다(Task 7 몫) -- 지금은 `painter.rs:<줄>` 로 뜬다.
+
+★그리고 이 실행은 60 초가 아니라 120 초를, `gfx_paint_side_animation_tick_divisor=1` 로
+돌린다.★ 이유는 Task 4 리뷰가 찾은 상호작용이다 -- `produce_wall_frame` 은 페이서 게이트를
+우회하지만 공유 경로가 ***그 게이트가 읽는 상태***(`last_wall_frame_issue_at`,
+`active_webview_frames`)를 쓴다. 그래서 틱이 배선된 이 구간 동안 스크립트의 `GenerateFrame`
+이 더 자주 coalesce 되고, `generate_frame_for_script` 는 ★지금 캔버스 ack 를 푸는 유일한
+코드★ 다. 유일한 해제자를 조이는 것이 실측된 117 초 rAF 잠금의 설정 조건이므로, ***그
+위험이 Task 6 이 아니라 여기서 시작한다***. 60 초로는 못 본다.
+
+보는 것: `WALLACKLATCH` 0, 120 초 끝까지 프레임 생산 지속. 뜨면 Task 6 을 먼저 끝내고
+돌아온다. ★ack 가 늦는 것 자체는 이 구간의 기대값이다 -- `WALLACKLATCH` 가 기대값이 아니다★
+(그건 복구 경로 둘까지 못 돌았다는 뜻이고, Task 6 의 검증이 보려는 상태가 그것이다).
+
+★`SERVO_WALL_DISABLE_CANVAS_ACK_RECOVERY` 를 켜고 돌리지 말 것.★ 그 스위치는
+`flush_owed_canvas_ack` 만 끄는데, 이 구간에서 위험을 좁혀 주는 복구 경로가 바로 그것이다.
+켜면 `update_images` 하나만 남아 캔버스 전용 페이지가 그대로 노출된다.
 
 - [ ] **Step 6: 수요 구동 임베더에서 깨우기가 에지를 예약하게 한다**
 
