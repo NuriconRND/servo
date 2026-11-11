@@ -258,56 +258,45 @@ enum ScissorGate {
     NoIntersection,
 }
 
-/// WR 이 적은 사각형을 캔버스 백킹 좌표의 GL scissor 박스로 환산하고, 애니메이션 예측
-/// 이동량만큼 넓힌다. ★순수 함수다 -- 그래서 테스트할 수 있다.★
+/// WR 이 적은 사각형을 캔버스 백킹 좌표의 GL scissor 박스로 환산한다. ★순수 함수다.★
 ///
 /// `rect`/`dest_size` 는 `wall_canvas_rect` 가 적은 것이다(캔버스 좌표, 위-왼쪽 원점 /
-/// 화면상 목적지 크기). `shift` 는 layout px 단위의 예측 이동량이고, 여기서 같은 비율로
-/// 캔버스 좌표로 환산한다.
+/// 화면상 목적지 크기). 반환은 GL 좌표(아래-왼쪽 원점)이고 캔버스 경계로 잘려 있다.
 ///
-/// ★가로는 한쪽으로만, 세로는 양쪽으로 넓힌다.★
+/// ## ★2026-11-11: 여기서 넓히지 않는다★
 ///
-/// 처음(2026-11-11)에는 양쪽으로 넓혔다 -- 이동 방향을 캔버스 좌표로 옮기는 데 반전이
-/// ***둘*** 겹쳐서(화면↔캔버스, 그리고 아래 `y` 계산의 GL 원점 뒤집기) 부호를 틀리면
-/// ***반대쪽으로 넓혀 띠가 그대로 남기*** 때문이다. 틀리는 것보다 두 배 넓은 쪽이 안전했다.
+/// 1 차 구현은 애니메이션의 평행이동 성분 둘(`m41`/`m42`)을 받아 이 자리에서 박스를
+/// 넓혔다. 그 근사가 "방향" 이라는 개념을 만들었고 -- 넓힐 쪽을 부호로 골라야 했다 --
+/// 양방향으로 덮었다가 비용 때문에 단방향으로 바꿨고 ***회귀했다***
+/// (log_webgl_perf_01/32: "좌측 tile 의 우측 경계에서 나타나는 검은 영역은 오히려 더
+/// 또렷해졌다"). 운영자 지적이 정확했다 -- 좌우 바운스 하나에도 세 구간이 있어서
+/// (좌->우 / 전환 / 우->좌) 단방향으로는 덮을 수 없고, 애초에 ***행렬로 계산하면 방향이
+/// 문제가 되지 않는다.***
 ///
-/// ★실기가 가로 부호를 확정했다★(2026-11-11, log_webgl_perf_01/31). 운영자 관찰: "좌 -> 우
-/// 애니메이션시 ***우측 tile 의 좌측 경계***에 검은 영역". 캔버스가 화면에서 오른쪽으로 가면
-/// 고정된 우측 타일은 캔버스의 ***더 왼쪽***을 보게 되므로, 넓힐 곳은 캔버스 좌표의
-/// ***x 가 작아지는 쪽*** 하나다. 그래서 가로는 단방향으로 바꿨다 -- ***같은 폭을 절반
-/// 비용으로*** 얻는다. 그 비용은 측정된 문제였다: 양방향 `lead 4` 에서 `RENDERCOST` 의
-/// `last10s_over` 가 0(lead 3) -> 109, `last10s_worst` 가 8.6ms -> 79.5ms 로 튀었다.
-///
-/// ★세로는 양방향을 유지한다 -- 실기가 세로 부호를 말해 주지 않았다.★ 이 리포의 전환은
-/// 수평 이동이 지배적이라 세로 pad 는 작고, 추측으로 부호를 정하는 것보다 두 배 넓은 쪽이
-/// 여전히 안전하다. 세로로 움직이는 전환을 관찰하면 그때 같은 방식으로 확정한다.
-///
-/// 반환은 GL 좌표(아래-왼쪽 원점)이고 ★캔버스 경계로 잘려 있다★ -- 넓히면 밖으로 나갈 수
-/// 있고, 그러면 `getParameter(SCISSOR_BOX)` 로 보이는 값이 엉뚱해진다.
-fn scale_canvas_rect_with_pad(
+/// 그래서 넓히는 일은 ***WR 쪽으로 옮겼다*** -- `note_canvas_tile_rect` 가 창 안의 여러
+/// 시각에 대해 각각 전체 행렬로 사각형을 계산하고 ***합집합***을 적는다. 이 함수는 그
+/// 결과를 좌표계만 바꿔 돌려준다. 설계는
+/// `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md`.
+fn scale_canvas_rect_to_gl(
     rect: [i32; 4],
     dest_size: [i32; 2],
     canvas: Size2D<i32>,
-    shift: (i32, i32),
 ) -> Option<[i32; 4]> {
     if dest_size[0] <= 0 || dest_size[1] <= 0 || canvas.width <= 0 || canvas.height <= 0 {
         return None;
     }
     let sx = canvas.width as f32 / dest_size[0] as f32;
     let sy = canvas.height as f32 / dest_size[1] as f32;
-    let pad_x = ((shift.0.unsigned_abs() as f32) * sx).ceil() as i32;
-    let pad_y = ((shift.1.unsigned_abs() as f32) * sy).ceil() as i32;
-
-    // 화면에서 +x 로 가면 타일이 보는 캔버스 부분은 -x 로 옮겨 간다 -- 그쪽만 넓힌다.
-    let (pad_left, pad_right) = if shift.0 >= 0 { (pad_x, 0) } else { (0, pad_x) };
-    let x = (rect[0] as f32 * sx).floor() as i32 - pad_left;
-    let top = (rect[1] as f32 * sy).floor() as i32 - pad_y;
-    let w = (rect[2] as f32 * sx).ceil() as i32 + pad_left + pad_right;
-    let h = (rect[3] as f32 * sy).ceil() as i32 + 2 * pad_y;
+    let x = (rect[0] as f32 * sx).floor() as i32;
+    let top = (rect[1] as f32 * sy).floor() as i32;
+    let w = (rect[2] as f32 * sx).ceil() as i32;
+    let h = (rect[3] as f32 * sy).ceil() as i32;
     if w <= 0 || h <= 0 {
         return None;
     }
-
+    // ★캔버스 경계로 자른다.★ 넓히기가 WR 로 옮겨 갔어도 거기서 나온 사각형이 환산 뒤
+    // 경계를 넘을 수 있고, scissor 박스가 서피스를 넘으면 `getParameter(SCISSOR_BOX)` 로
+    // 보이는 값이 엉뚱해진다.
     let left = x.max(0);
     let top = top.max(0);
     let right = (x + w).min(canvas.width);
@@ -1934,7 +1923,7 @@ impl WebGLThread {
             note_scissor_gate(ScissorGate::NoIntersection);
             return None;
         }
-        let scaled = self.scale_canvas_rect(surface_id, noted.rect, noted.dest_size, canvas);
+        let scaled = self.scale_canvas_rect(noted.rect, noted.dest_size, canvas);
         note_scissor_gate(match scaled {
             Some(_) => ScissorGate::Applied,
             None => ScissorGate::NoIntersection,
@@ -1949,18 +1938,11 @@ impl WebGLThread {
     /// 원점을 GL 의 아래-왼쪽으로 뒤집는다.
     fn scale_canvas_rect(
         &self,
-        surface_id: WebGLSurfaceId,
         rect: [i32; 4],
         dest_size: [i32; 2],
         canvas: Size2D<i32>,
     ) -> Option<[i32; 4]> {
-        let slot = webrender_api::IdNamespace::from(surface_id.painter_id).0;
-        scale_canvas_rect_with_pad(
-            rect,
-            dest_size,
-            canvas,
-            webrender::wall_canvas_rect::predicted_shift(slot),
-        )
+        scale_canvas_rect_to_gl(rect, dest_size, canvas)
     }
 
     /// scissor 판정의 ★입력값★ 을 사람이 읽을 문자열로. ★로그 전용★ 이고 서피스마다 한 번만
@@ -4732,97 +4714,51 @@ mod fanout_clone_tests {
 mod scissor_lead_tests {
     use euclid::Size2D;
 
-    use super::scale_canvas_rect_with_pad;
+    use super::scale_canvas_rect_to_gl;
 
-    /// 캔버스와 목적지가 1:1 인 흔한 경우. 벽의 한 타일(2880x2160)이 11520x4320 캔버스의
-    /// 왼쪽 위 사분면을 본다.
+    /// 벽의 한 타일(2880x2160)이 11520x4320 캔버스의 왼쪽 위 사분면을 본다.
     const CANVAS: Size2D<i32, euclid::UnknownUnit> = Size2D::new(11520, 4320);
     const DEST: [i32; 2] = [11520, 4320];
     const TILE: [i32; 4] = [0, 0, 2880, 2160];
 
     #[test]
-    fn no_shift_is_unchanged() {
-        // ★`lead = 0` 이면 지금까지의 동작과 같아야 한다.★ 이 불변식이 깨지면 pref 를 0 으로
-        // 두어도 회귀가 난다.
-        let got = scale_canvas_rect_with_pad(TILE, DEST, CANVAS, (0, 0)).unwrap();
-        // GL 좌표: 위-왼쪽 (0,0,2880,2160) -> 아래-왼쪽 y = 4320 - 2160 = 2160.
+    fn maps_to_gl_origin() {
+        // 위-왼쪽 (0,0,2880,2160) -> 아래-왼쪽 y = 4320 - 2160 = 2160.
+        let got = scale_canvas_rect_to_gl(TILE, DEST, CANVAS).unwrap();
         assert_eq!(got, [0, 2160, 2880, 2160]);
     }
 
     #[test]
-    fn positive_shift_widens_to_the_left_only() {
-        // ★가로는 단방향이다.★ 캔버스가 화면에서 +x 로 가면 타일이 보는 부분은 -x 로
-        // 옮겨 가므로 그쪽만 넓힌다. 실기가 확정한 부호다(log_webgl_perf_01/31).
-        let got =
-            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (10, 0)).unwrap();
-        assert_eq!(got[0], 90, "왼쪽으로 10 넓어진다");
-        assert_eq!(
-            got[2], 2890,
-            "폭은 10 만 늘어난다 -- 양방향이면 2900 이었다"
-        );
-        assert_eq!(got[3], 2160, "세로는 그대로다");
+    fn scales_when_backing_differs_from_destination() {
+        // 캔버스가 목적지의 두 배면 사각형도 두 배로 환산된다.
+        let canvas = Size2D::new(23040, 8640);
+        let got = scale_canvas_rect_to_gl([100, 100, 2880, 2160], DEST, canvas).unwrap();
+        assert_eq!(got[0], 200);
+        assert_eq!(got[2], 5760);
     }
 
     #[test]
-    fn negative_shift_widens_to_the_right_only() {
-        let got =
-            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (-10, 0)).unwrap();
-        assert_eq!(got[0], 100, "왼쪽 끝은 그대로다");
-        assert_eq!(got[2], 2890, "오른쪽으로 10 넓어진다");
-    }
-
-    #[test]
-    fn vertical_stays_symmetric() {
-        // ★세로는 양방향을 유지한다★ -- 실기가 세로 부호를 말해 주지 않았다.
-        let up = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (0, 7));
-        let down = scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, CANVAS, (0, -7));
-        assert_eq!(up, down, "세로 부호는 결과를 바꾸지 않는다");
-        let got = up.unwrap();
-        assert_eq!(got[3], 2160 + 14, "위아래로 각각 7 넓어진다");
-    }
-
-    #[test]
-    fn widening_is_clamped_to_the_canvas() {
-        // 오른쪽 아래 끝 타일을 크게 넓혀도 캔버스를 넘지 않는다.
+    fn is_clamped_to_the_canvas() {
+        // 오른쪽 아래 끝 타일이 캔버스를 넘지 않는다.
         let bottom_right = [11520 - 2880, 4320 - 2160, 2880, 2160];
-        let got = scale_canvas_rect_with_pad(bottom_right, DEST, CANVAS, (500, 500)).unwrap();
-        assert!(
-            got[0] + got[2] <= CANVAS.width,
-            "가로가 캔버스를 넘지 않는다"
-        );
-        assert!(
-            got[1] + got[3] <= CANVAS.height,
-            "세로가 캔버스를 넘지 않는다"
-        );
+        let got = scale_canvas_rect_to_gl(bottom_right, DEST, CANVAS).unwrap();
+        assert!(got[0] + got[2] <= CANVAS.width);
+        assert!(got[1] + got[3] <= CANVAS.height);
         assert_eq!(got[1], 0, "아래-왼쪽 원점에서 바닥에 붙는다");
     }
 
     #[test]
-    fn scale_applies_to_the_shift_too() {
-        // 캔버스가 목적지의 두 배면 이동량도 두 배로 환산된다.
-        let canvas = Size2D::new(23040, 8640);
-        let got =
-            scale_canvas_rect_with_pad([100, 100, 2880, 2160], DEST, canvas, (10, 0)).unwrap();
-        // sx = 2, 그러므로 pad_x = 20. x = 200 - 20 = 180.
-        assert_eq!(got[0], 180);
-        // ★단방향이므로 폭은 pad 한 번만 늘어난다★ -- 양방향이던 때는 +40 이었다.
-        assert_eq!(got[2], 5760 + 20);
-    }
-
-    #[test]
     fn degenerate_inputs_decline() {
-        assert!(scale_canvas_rect_with_pad(TILE, [0, 0], CANVAS, (0, 0)).is_none());
+        assert!(scale_canvas_rect_to_gl(TILE, [0, 0], CANVAS).is_none());
         assert!(
-            scale_canvas_rect_with_pad([0, 0, 0, 0], DEST, CANVAS, (0, 0)).is_none(),
+            scale_canvas_rect_to_gl([0, 0, 0, 0], DEST, CANVAS).is_none(),
             "빈 사각형은 걸지 않는다"
         );
     }
 
     #[test]
     fn a_rect_entirely_outside_declines() {
-        // 캔버스 밖의 사각형은 클램프 뒤 빈 것이 되고, 그러면 scissor 를 걸지 않는다 --
-        // 전체 셰이딩으로 떨어지는 것이 빈 화면보다 안전하다.
-        let outside = [20000, 0, 100, 100];
-        assert!(scale_canvas_rect_with_pad(outside, DEST, CANVAS, (0, 0)).is_none());
+        // 캔버스 밖이면 scissor 를 걸지 않는다 -- 전체 셰이딩이 빈 화면보다 안전하다.
+        assert!(scale_canvas_rect_to_gl([20000, 0, 100, 100], DEST, CANVAS).is_none());
     }
 }

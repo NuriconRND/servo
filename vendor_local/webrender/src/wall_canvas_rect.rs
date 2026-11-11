@@ -57,7 +57,7 @@
 //! 쪽이다.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -128,47 +128,68 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// 캔버스가 ★이 프레임이 표출될 시각까지 화면에서 움직일 양★, layout px.
+/// 애니메이션이 ★이 프레임이 표출될 창 안에서 지나가는 변환들★. painter 가 틱마다 적고
+/// `note_canvas_tile_rect` 가 프레임 빌드에서 읽는다.
 ///
-/// ★무엇을 고치는 값인가.★ WR 이 적는 사각형은 그 프레임의 애니메이션 값으로는 정확하지만,
-/// 캔버스는 비동기다 -- WebGL 스레드가 그 값을 읽어 scissor 를 걸고 그린 비트맵은 ***더
-/// 뒤의 프레임***에서 표출된다. 그 사이에 캔버스가 움직인 만큼(`D = A(M) - A(N)`) 타일
-/// 경계에 ***그려진 적 없는 띠***가 생긴다. 운영자가 "이동 변화량에 비례하는 크기" 로
-/// 관찰한 것이 그것이다.
+/// ## ★무엇을 고치는 값인가★ (2026-11-11)
 ///
-/// `paint` 가 틱마다 `sample(now + lead)` 와 `sample(now)` 의 평행이동 성분 차이를 적고,
-/// 소비자가 scissor 박스를 그 방향으로 ***넓힌다***. 설계와 한계(스케일·회전은 근사)는
-/// `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md` 에 있다.
+/// WR 이 적는 사각형은 그 프레임의 애니메이션 값으로는 정확하지만, 캔버스는 비동기다 --
+/// WebGL 스레드가 그 값을 읽어 scissor 를 걸고 그린 비트맵은 ***더 뒤의 프레임***에서
+/// 표출된다. 그 사이에 캔버스가 지나간 영역이 타일 경계에 ***그려진 적 없는 띠***가 된다.
 ///
-/// ★넓히는 방향이라 빈 칸을 만들지 않는다.★ 예측이 빗나가도 더 셰이딩할 뿐이다 --
-/// `note_canvas_tile_rect` 의 `floor`/`ceil` 바깥쪽 반올림과 같은 원칙이다.
+/// 그래서 `note_canvas_tile_rect` 가 ***창 안의 여러 시각에 대해 각각 사각형을 계산하고
+/// 합집합***을 적는다. 그 계산에 필요한 것이 "그 시각의 변환" 이고, WR 은 애니메이션
+/// 정의를 모르므로(`DynamicProperties` 로 그 프레임의 값만 받는다) painter 가 여기에
+/// 실어 준다.
 ///
-/// 단위는 layout px 이고, 소비자가 `dest_size` 비율로 캔버스 백킹 px 로 환산한다.
-/// 둘 다 0 이면 예측이 꺼진 것이거나 애니메이션이 없는 것이다 -- 어느 쪽이든 동작이
-/// 지금과 같다.
-/// ★2026-11-11: painter 슬롯마다 따로 둔다.★ 처음에는 전역 둘이었는데, painter 넷이 같은
-/// 칸에 쓰므로 ***마지막 쓴 쪽이 이긴다*** -- 자기 타일에 애니메이션이 없어 `(0, 0)` 을
-/// 적은 painter 가 ***네 타일 전부의 예측을 지웠다***. 기록 자체(`note`/`get`)는 처음부터
-/// 슬롯별이었는데 이동량만 전역이었다. 슬롯 수는 `MAX_SLOTS` 로 고정하고 넘는 슬롯은
-/// 마지막 칸에 모은다(벽은 넷이다).
-const MAX_SLOTS: usize = 8;
-static PREDICTED_SHIFT_X: [AtomicI32; MAX_SLOTS] = [const { AtomicI32::new(0) }; MAX_SLOTS];
-static PREDICTED_SHIFT_Y: [AtomicI32; MAX_SLOTS] = [const { AtomicI32::new(0) }; MAX_SLOTS];
-
-/// 이 painter 슬롯의 예측 이동량을 적는다(layout px). ★원자 둘이 전부다.★
-pub fn set_predicted_shift(slot: u32, dx: i32, dy: i32) {
-    let index = (slot as usize).min(MAX_SLOTS - 1);
-    PREDICTED_SHIFT_X[index].store(dx, Ordering::Relaxed);
-    PREDICTED_SHIFT_Y[index].store(dy, Ordering::Relaxed);
+/// ## ★왜 4x4 전체인가★
+///
+/// 1 차 구현은 평행이동 성분(`m41`/`m42`) 둘만 실었다. 그 근사가 "방향" 이라는 개념을
+/// 만들고, 부호를 틀리기 쉬워 양방향으로 덮었고, 그 비용을 줄이려 단방향으로 바꿨다가
+/// ***회귀했다***(log_webgl_perf_01/32). 운영자 지적이 정확했다 -- "애초에 행렬 변환으로
+/// 계산하면 방향이 무슨 상관인데?" 행렬을 그대로 쓰면 이동·스케일·회전·전환점이 전부
+/// 따라오고 방향 개념이 사라진다.
+///
+/// ## ★왜 Mutex 인가★
+///
+/// `Transform3D` 는 16 float 이라 원자에 들어가지 않는다. painter 는 틱당 ***한 번***
+/// 쓰고(정상 상태에서 경합이 없다) 프레임 빌드가 읽는다. 이 모듈은 이미 같은 모양의
+/// `Mutex` 둘을 그 경로에 갖고 있다. 근거와 한계는 설계 문서 5.1 에 있다.
+fn lead_map() -> &'static Mutex<HashMap<u32, Vec<LeadSample>>> {
+    static LEAD_SAMPLES: OnceLock<Mutex<HashMap<u32, Vec<LeadSample>>>> = OnceLock::new();
+    LEAD_SAMPLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 그 슬롯의 예측 이동량(layout px). ★원자 로드 둘이다.★
-pub fn predicted_shift(slot: u32) -> (i32, i32) {
-    let index = (slot as usize).min(MAX_SLOTS - 1);
-    (
-        PREDICTED_SHIFT_X[index].load(Ordering::Relaxed),
-        PREDICTED_SHIFT_Y[index].load(Ordering::Relaxed),
-    )
+/// 한 애니메이션 바인딩의 한 시각 샘플.
+#[derive(Clone, Copy, Debug)]
+pub struct LeadSample {
+    /// 이 애니메이션의 바인딩 id. 소비자가 `SpatialTree::find_spatial_node_by_anim_id`
+    /// 에 그대로 넘기므로 `u64` 가 아니라 그 타입이어야 한다.
+    pub binding_id: api::PropertyBindingId,
+    /// 그 시각의 변환, 행 우선 16 성분(`LayoutTransform::to_array` 와 같은 순서).
+    pub transform: [f32; 16],
+    /// 이 샘플이 ★현재 시각★ 의 것인가. 켤레 합성의 기준(`A(now)^-1`)이 된다.
+    pub is_now: bool,
+}
+
+/// 이 painter 슬롯의 창 샘플을 바꿔 넣는다. ★틱당 한 번, Mutex 한 번.★
+pub fn set_lead_samples(slot: u32, samples: Vec<LeadSample>) {
+    if let Ok(mut map) = lead_map().lock() {
+        if samples.is_empty() {
+            map.remove(&slot);
+        } else {
+            map.insert(slot, samples);
+        }
+    }
+}
+
+/// 그 슬롯의 창 샘플. 없으면 빈 벡터 -- 그러면 호출자는 오늘 경로만 쓴다.
+pub fn lead_samples(slot: u32) -> Vec<LeadSample> {
+    lead_map()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&slot).cloned())
+        .unwrap_or_default()
 }
 
 /// 쓸 수 있는 기록의 최대 나이, ms. `painter` 가 틱마다 pref 에서 갱신한다.

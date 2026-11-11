@@ -326,6 +326,44 @@ impl ActivePaintAnimation {
     }
 
     /// The instant this animation's own timeline runs out, if it has segments at all.
+    /// 창 `[from, to]` 안에서 이 애니메이션이 요구하는 샘플 시각들을 `out` 에 더한다.
+    ///
+    /// 창의 양 끝(이 애니메이션의 구간으로 clamp)과, 창 안에 들어오는 ***세그먼트 경계***.
+    /// 근거는 `PipelineAnimations::paint_animation_sample_times` 의 doc 주석에 있다.
+    fn sample_times(&self, from: Instant, to: Instant, out: &mut Vec<Instant>) {
+        let push = |out: &mut Vec<Instant>, t: Instant| {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        };
+        // 창 양 끝. 끝난 뒤는 움직이지 않으므로 `ends_at` 로 clamp 한다.
+        let cap = self.ends_at();
+        let clamp = |t: Instant| match cap {
+            Some(end) if t > end => end,
+            _ => t,
+        };
+        push(out, clamp(from));
+        push(out, clamp(to));
+
+        // 창 안의 세그먼트 경계.
+        let bounds: Vec<f64> = match &self.property {
+            PaintAnimationProperty::Opacity(_, segments) => {
+                segments.iter().map(|segment| segment.end).collect()
+            },
+            PaintAnimationProperty::Transform(_, segments) => {
+                segments.iter().map(|segment| segment.end).collect()
+            },
+        };
+        for end in bounds {
+            let Some(at) = self.zero.checked_add(Duration::from_secs_f64(end)) else {
+                continue;
+            };
+            if at > from && at < to {
+                push(out, at);
+            }
+        }
+    }
+
     fn ends_at(&self) -> Option<Instant> {
         let end = match &self.property {
             PaintAnimationProperty::Opacity(_, segments) => segments.last()?.end,
@@ -465,6 +503,30 @@ impl PipelineAnimations {
             animation.sample(now, floats, transforms);
         }
         !animations.is_empty()
+    }
+
+    /// 창 `[from, to]` 안에서 ★샘플해야 할 시각들★. 상태를 건드리지 않는다.
+    ///
+    /// ★닫힌 형태다 -- 균일 샘플이 필요 없다.★ layout 이 비선형 이징을 ***행렬에서
+    /// 선형인 세그먼트로 미리 쪼개*** 보내므로(`PaintAnimationProperty` 의 doc), 세그먼트
+    /// 안에서는 변환이 `t` 에 대해 선형이고 그 사각형의 극값은 ***구간 끝에만*** 있다.
+    /// 그래서 필요한 것은 ★창의 양 끝 + 창 안에 들어오는 세그먼트 경계★ 뿐이다.
+    ///
+    /// ★전환점은 항상 세그먼트 경계다★ -- 바운스가 창 안에서 왕복해도 그 꼭대기가 샘플에
+    /// 들어오므로 놓칠 수 없다. 두 끝점의 차이만 보던 1 차 구현이 바로 그것을 놓쳤다
+    /// (왕복하면 차이가 0 에 가깝다).
+    ///
+    /// 끝난 애니메이션의 시각은 `ends_at()` 로 clamp 한다 -- 그 뒤로는 움직이지 않으므로
+    /// 창이 전환 끝을 넘어가도 구멍이 생기지 않는다.
+    pub(crate) fn paint_animation_sample_times(
+        &self,
+        from: Instant,
+        to: Instant,
+        out: &mut Vec<Instant>,
+    ) {
+        for animation in self.paint.borrow().iter() {
+            animation.sample_times(from, to, out);
+        }
     }
 
     /// 주어진 시각의 값을 ★상태를 건드리지 않고★ 샘플한다.

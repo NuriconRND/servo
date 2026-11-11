@@ -1123,7 +1123,7 @@ impl Painter {
         //
         // ★`sample_at` 에 다시 더한다.★ `sample_at` 은 이미 `-SampleLead` 가 민 "이 타일이
         // 표시할 시각" 이고, 이 `lead` 는 그와 ***별개 축***인 캔버스 파이프라인 지연이다.
-        self.publish_canvas_scissor_lead(sample_at, &transforms);
+        self.publish_canvas_scissor_lead(sample_at);
 
         // ***An animation is a value laid onto the frames this wall already produces, not
         // a reason to produce more.*** The painter renders and presents on a clock, and
@@ -3049,67 +3049,89 @@ impl Painter {
     /// `lead_to_next_composition` 의 주석이 그 산수를 적고 있다. 호출자가 자기 `now` 를
     /// 더하면 그 사이의 `MonitorFromWindow` + `DwmGetCompositionTimingInfo` 가 그대로
     /// 지터가 된다.
-    /// 캔버스 scissor 를 넓힐 ★예측 이동량★ 을 계산해 공유 슬롯에 싣는다.
+    /// 캔버스 scissor 를 넓힐 ★창 안의 변환들★ 을 계산해 공유 슬롯에 싣는다.
     ///
-    /// `now_transforms` 는 이 틱이 방금 샘플한 현재 변환들이다. 같은 애니메이션을
-    /// `lead` 주기 뒤로 한 번 더 샘플해 ★평행이동 성분의 차이★ 를 구하고, 그 중 가장 큰
-    /// 것을 싣는다. 캔버스가 어느 애니메이션에 붙어 있는지 painter 는 모르므로 큰 쪽으로
-    /// 넓히는 것이 안전한 방향이다(넓히면 더 셰이딩할 뿐, 빈 칸은 생기지 않는다).
+    /// ## 창의 모양
     ///
-    /// ★`lead = 0` 이면 원자 로드 하나로 끝난다.★ 그 경우 예측 샘플을 하지 않는다.
+    /// `[sample_at - max_age, sample_at + lead * period]`.
     ///
-    /// 스케일·회전은 근사다 -- 평행이동 성분만 보므로 크기 변화와 회전으로 생기는 경계
-    /// 이동을 놓친다. 이 리포의 전환은 이동이 지배적이고(운영자가 "이동 변화량에 비례하는
-    /// 크기" 로 띠를 관찰했다), 놓친 만큼은 `lead` 를 올려 덮는다.
-    fn publish_canvas_scissor_lead(
-        &self,
-        sample_at: Instant,
-        now_transforms: &[webrender_api::PropertyValue<webrender_api::units::LayoutTransform>],
-    ) {
+    /// 앞쪽 `lead` 는 ★캔버스 파이프라인 지연★ 이다 -- 이 scissor 로 그린 비트맵은 더 뒤의
+    /// 프레임에 표출된다. 뒤쪽 `max_age` 는 ★소비자가 읽는 기록이 낡을 수 있는 양★ 이다
+    /// (`gfx_wall_webgl_tile_scissor_max_age_ms`, 기본 34). 1 차 구현은 앞쪽만 잡았고,
+    /// 그것이 운영자가 본 "애니메이션 시작시에 비교적 넓은 영역이 잠깐" 의 후보다 --
+    /// 시작 순간에는 과거 쪽이 비어 있다.
+    ///
+    /// ## 샘플 집합
+    ///
+    /// ★균일 샘플이 아니다.★ layout 이 비선형 이징을 행렬에서 선형인 세그먼트로 미리
+    /// 쪼개 보내므로, 필요한 것은 창의 양 끝과 창 안의 세그먼트 경계뿐이다 -- 선형
+    /// 슬라이드는 2 개, 이징된 것도 8 개 이하. 근거는
+    /// `PipelineAnimations::paint_animation_sample_times` 의 doc 주석에 있다.
+    ///
+    /// ## 왜 4x4 전체인가
+    ///
+    /// 1 차 구현은 평행이동 성분 둘만 실었다. 그 근사가 "방향" 개념을 만들고 회귀로
+    /// 이어졌다(log_webgl_perf_01/32). 행렬을 그대로 실으면 이동·스케일·회전·전환점이
+    /// 전부 따라온다. 소비자(`note_canvas_tile_rect`)가 그것으로 사각형을 계산해 합집합을
+    /// 적는다.
+    ///
+    /// ★`lead = 0` 이면 원자 로드 하나로 끝난다.★ 그 경우 샘플을 만들지 않는다.
+    fn publish_canvas_scissor_lead(&self, sample_at: Instant) {
+        let slot = webrender_api::IdNamespace::from(self.painter_id).0;
         // ★원자 로드 하나다★ -- `pref!` 는 전역 `RwLock` 이고 이 함수는 painter 마다
         // 120/s 로 돈다(2026-11-11 조사). 값은 `perform_updates` 가 싣는다.
         let lead_periods = CANVAS_SCISSOR_LEAD_PERIODS.load(std::sync::atomic::Ordering::Relaxed);
-        let slot = webrender_api::IdNamespace::from(self.painter_id).0;
-        if lead_periods == 0 || now_transforms.is_empty() {
-            webrender::wall_canvas_rect::set_predicted_shift(slot, 0, 0);
+        if lead_periods == 0 {
+            webrender::wall_canvas_rect::set_lead_samples(slot, Vec::new());
             return;
         }
         let period = crate::refresh_driver::paint_timer_period();
-        let predict_at = sample_at + period * lead_periods;
+        let max_age = Duration::from_millis(webrender::wall_canvas_rect::max_age_ms());
+        let from = sample_at.checked_sub(max_age).unwrap_or(sample_at);
+        let to = sample_at + period * lead_periods;
 
-        let mut floats = Vec::new();
-        let mut lead_transforms = Vec::new();
+        let mut times = Vec::new();
         for renderer in self.webview_renderers.values() {
             renderer.for_each_connected_pipeline(&mut |pipeline_details| {
-                pipeline_details.animations.sample_paint_animations_at(
-                    predict_at,
-                    &mut floats,
-                    &mut lead_transforms,
-                );
+                pipeline_details
+                    .animations
+                    .paint_animation_sample_times(from, to, &mut times);
             });
         }
+        if times.is_empty() {
+            webrender::wall_canvas_rect::set_lead_samples(slot, Vec::new());
+            return;
+        }
+        // ★현재 시각을 반드시 넣는다★ -- 소비자가 켤레 합성의 기준(`A(now)^-1`)으로 쓴다.
+        if !times.contains(&sample_at) {
+            times.push(sample_at);
+        }
 
-        // 같은 키끼리 짝지어 평행이동 차이를 재고, 가장 큰 것을 쓴다.
-        let mut shift_x = 0.0f32;
-        let mut shift_y = 0.0f32;
-        for lead in &lead_transforms {
-            let Some(now) = now_transforms.iter().find(|value| value.key == lead.key) else {
-                continue;
-            };
-            let dx = lead.value.m41 - now.value.m41;
-            let dy = lead.value.m42 - now.value.m42;
-            if dx.abs() > shift_x.abs() {
-                shift_x = dx;
+        let mut samples = Vec::new();
+        let mut floats = Vec::new();
+        let mut transforms = Vec::new();
+        for at in times {
+            floats.clear();
+            transforms.clear();
+            for renderer in self.webview_renderers.values() {
+                renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                    pipeline_details.animations.sample_paint_animations_at(
+                        at,
+                        &mut floats,
+                        &mut transforms,
+                    );
+                });
             }
-            if dy.abs() > shift_y.abs() {
-                shift_y = dy;
+            let is_now = at == sample_at;
+            for value in &transforms {
+                samples.push(webrender::wall_canvas_rect::LeadSample {
+                    binding_id: value.key.id,
+                    transform: value.value.to_array(),
+                    is_now,
+                });
             }
         }
-        webrender::wall_canvas_rect::set_predicted_shift(
-            slot,
-            shift_x.round() as i32,
-            shift_y.round() as i32,
-        );
+        webrender::wall_canvas_rect::set_lead_samples(slot, samples);
     }
 
     fn paint_animation_sample_at(&self) -> Option<Instant> {

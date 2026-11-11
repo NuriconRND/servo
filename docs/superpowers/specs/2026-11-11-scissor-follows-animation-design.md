@@ -77,136 +77,139 @@ components/paint/commit_guard.rs:96   gfx_sample_lead_periods
 
 ---
 
-## 4. 두 가지 방식을 비교했다
+## 4. 2026-11-11 2차 -- 1 차 설계와 그 구현을 폐기한다
 
-### 4.1 기각 — WR 안에서 박스를 두 번 계산하기
+1 차는 "painter 가 미래 값을 보내고 WR 이 박스를 둘 계산해 합집합" 이었는데, 내가 그것을
+***조사 없이*** 기각하고 ***평행이동 성분만*** 쓰는 근사로 갔다. 그 근사가 만든 결함이
+연쇄했다.
 
-처음 설계는 "painter 가 예측 값을 `DynamicProperties` 와 나란히 보내고, WR 이 두 변환으로
-박스를 둘 계산해 합집합을 적는다" 였다. 조사해 보니 침습이 크다:
+### 4.1 무엇이 틀렸나
 
-WebRender 는 애니메이션 정의를 모르고 그 프레임의 **값만** 받는다
-(`painter.rs:1190` → `render_backend.rs:488` `AppendDynamicProperties` →
-`SceneProperties`). 그 값으로 `spatial_tree.update_tree(&dynamic_properties)`
-(`render_backend.rs:645`)가 변환을 세우고, `note_canvas_tile_rect` 는 그
-`spatial_tree` 를 써서 `SpaceMapper` 로 박스를 구한다.
+**기각 사유가 사실이 아니었다.** 4.1(구) 은 "예측 박스를 WR 안에서 얻으려면
+`spatial_tree` 를 두 벌 세우거나 `SpaceMapper` 가 쓰는 변환을 갈아끼워야 한다" 고
+적었는데, `vendor_local/webrender/src/space.rs` 를 읽지 않고 쓴 문장이다. 실제로는:
 
-즉 예측 박스를 WR 안에서 얻으려면 **`spatial_tree` 를 두 벌 세우거나**, `SpaceMapper` 가
-쓰는 변환을 그 자리에서 예측값으로 갈아끼워야 한다. 전자는 비싸고 후자는 WR 내부를 깊게
-건드린다. 이 리포는 `vendor_local/webrender` 를 20 줄 규모의 동작 포크로만 유지하고 있고,
-그 선을 넘을 이유가 없다.
+* `SpaceMapper` 는 `kind: CoordinateSpaceMapping`(`Local`/`ScaleOffset`/`Transform`) 하나만
+  들고, `unmap`(space.rs:101-113)은 그것만 읽는다. `set_target_spatial_node`(:52)가
+  `SpatialTree` 를 보는 것은 ***생성 시 한 번***이다.
+* 게다가 `note_canvas_tile_rect`(picture.rs:3214-3219)는 ***매 호출 mapper 를 새로
+  만든다*** -- 재사용할 mapper 가 애초에 없다. N 개를 더 만들어도 그 프레임용 트리는 이미
+  세워져 있으니 재구축이 아니다.
 
-### 4.2 채택 — 예측 이동량만 싣는다
+**포크 분량 기준도 틀렸다.** "`vendor_local/webrender` 는 20 줄 포크" 를 근거로 삼았는데
+실측은 **+431 줄 / 7 파일**이다. 쓸 수 있는 기준은 분량이 아니라 **"upstream 타입과
+시그니처를 건드리지 않는다"** 다.
 
-캔버스가 화면에서 움직이면 **캔버스 안에서 타일에 보이는 부분이 옮겨 간다.** 그 옮겨 간
-양은 화면상 이동량을 캔버스 좌표로 환산한 것이다. 그러면 WR 이 적은 박스를 **그 양만큼
-넓히는 것으로 충분하다** — 박스를 다시 계산할 필요가 없다.
+**근사가 만든 연쇄.** 평행이동 두 성분만 보니 "방향" 이라는 개념이 생겼고, 부호를 틀리기
+쉬워 양방향으로 덮었고, 그 비용(양방향 `lead 4` 에서 `RENDERCOST last10s_over` 0 -> 109,
+`last10s_worst` 8.6ms -> 79.5ms)을 줄이려 단방향으로 바꿨다가 회귀를 만들었다
+(log_webgl_perf_01/32: "좌측 tile 의 우측 경계에서 나타나는 검은 영역은 오히려 더
+또렷해졌다"). 각 단계가 앞 단계의 잘못을 덮는 또 다른 근사였다.
 
-환산 비율은 이미 소비자가 갖고 있다. `wall_canvas_rect` 는 `rect`(캔버스 좌표)와
-`dest_size`(화면상 목적지 크기)를 함께 적고, `webgl_thread::scale_canvas_rect` 가 그 둘로
-캔버스 백킹 좌표로 환산한다. 예측 이동량도 같은 비율을 탄다.
+**운영자가 짚은 두 가지가 결정적이다.**
+
+> "애초에 행렬 변환으로 계산하면 방향이 무슨 상관인데? 그렇게 계산하고 예측하는 게
+> 아니었어?"
+
+> "좌 -> 우 구간에서는 왼쪽으로, 방향 전환 구간에서는 ***왼쪽 오른쪽 다***, 우 -> 좌
+> 구간에서는 오른쪽으로 확대가 되어야 (...) 단방향으로만 보완할 수 있는 게 좌우 바운스
+> 애니메이션의 성질 자체가 아니라고."
+
+즉 단방향은 ***좌우 바운스 하나 안에서도*** 성립하지 않는다. 그리고 그보다 깊은 오류가
+있다 -- **두 끝점의 차이는 그 사이의 경로를 모른다.** 바운스가 창 안에서 왕복하면
+`sample(now + 4P) - sample(now)` 는 0 에 가까운데 캔버스는 실제로 갔다 왔다. 전체 행렬을
+쓰더라도 ***두 시각만*** 보면 전환점에서 같은 식으로 실패한다.
+
+### 4.2 채택 -- 경로의 합집합, 전체 행렬로
 
 ```
-painter (틱마다, 애니메이션이 있을 때만)
-    now_values  = sample(now)            -- 지금처럼 WR 로 보낸다
-    lead_values = sample(now + lead)     -- 보내지 않는다. 차이만 쓴다
-    shift       = lead_values 와 now_values 의 ★평행이동 성분 차이★ (layout px)
-    wall_canvas_rect::set_predicted_shift(shift)      -- 원자 둘
-
-WebGL 스레드 (캔버스 프레임마다)
-    scissor 박스를 그 shift 방향으로 ★넓힌다★ (합집합)
+R = R(t0) ∪ R(t1) ∪ ... ∪ R(tn)
 ```
 
-**WR 수정은 0 이다.** painter 쪽 샘플 한 번과 원자 쓰기 둘, 소비자 쪽 덧셈 몇 번이 전부다.
+각 `R(t)` 는 **그 시각의 전체 변환**으로 계산한 사각형이고, 계산 방식은 오늘
+`note_canvas_tile_rect` 가 현재 사각형을 내는 것과 같다. 그러면 방향·전환점·스케일·회전·
+세로 이동이 모두 따라온다. "방향" 이라는 개념 자체가 사라진다.
 
-### 4.3 정확도와 그 한계
+### 4.3 샘플 집합에 닫힌 형태가 있다
 
-* **이동(translate)** — 정확하다. 평행이동 성분의 차이가 곧 화면 이동량이다.
-* **스케일·회전** — 근사다. 평행이동 성분만 보므로 크기 변화와 회전으로 생기는 경계 이동을
-  놓친다. 다만 **합집합으로 넓히는 방향이라 빈 칸을 만들지 않는다** — 놓친 만큼 띠가 남을
-  뿐이고, 그때는 실기에서 `lead` 를 올려 덮는다.
-* 전환 애니메이션은 이 리포에서 **이동이 지배적**이다(레이아웃이 슬라이드한다). 운영자가
-  "이동 변화량에 비례하는 크기" 로 띠를 관찰한 것이 그 증거다.
-* 여러 애니메이션이 동시에 돌면 **가장 큰 이동량**을 쓴다. 캔버스가 어느 것에 붙어 있는지
-  painter 는 모르므로, 큰 쪽으로 넓히는 것이 안전한 방향이다.
+layout 이 비선형 이징을 ***행렬에서 선형인 세그먼트로 미리 쪼개*** 보낸다
+(`PaintAnimationProperty` 의 doc, `components/shared/paint/display_list.rs:910-916`;
+세그먼트는 `PaintAnimationSegment { start, end, from, to, easing }`, :903).
 
-### 4.4 전에 제거된 "외삽" 과의 차이
+그러면 **창의 양 끝점 + 창 안에 들어오는 세그먼트 경계**만 보면 된다 -- 선형 슬라이드는
+**2 개**, 이징된 것도 **8 개 이하**. 그 집합은 근사가 아니라 **정확**하다: 세그먼트 안에서
+`ScaleOffset` 의 unmap 은 `t` 의 Mobius 함수라 **단조**이므로 극값이 구간 끝에만 있다.
+그리고 **전환점은 항상 세그먼트 경계**이므로 놓칠 수 없다.
 
-| | 2026-11-10 에 제거된 것 | 이 설계 |
-|---|---|---|
-| 미래를 어떻게 아는가 | 과거 두 점으로 **선형 외삽** | **애니메이션 정의에서 계산** |
-| 곡선·가감속에서 | 틀린다 | 맞는다 |
-| 전환 시작/끝에서 | 틀린다(궤적이 꺾임) | 맞는다(세그먼트를 안다) |
-| 어디서 계산하나 | 소비자(WebGL 스레드)가 과거 값으로 | **생산자(painter)가 정의로** |
-| 운영자 평가 | "tradeoff 가 심하다" → 제거 | — |
+### 4.4 창의 모양 -- 뒤로도 연장한다
 
-운영자 지시의 "애니메이션 예측 영역" 이 가리키는 것이 이 차이다.
+소비자가 읽는 기록은 `gfx_wall_webgl_tile_scissor_max_age_ms`(기본 34) 만큼 **낡을 수
+있다**. 그러므로 창은 `[now - max_age, now + lead*P]` 다. 1 차 구현은 앞으로만 잡았고,
+그것이 운영자가 본 "애니메이션 시작시에 비교적 넓은 영역이 잠깐" 의 후보다 -- 시작 순간엔
+과거 쪽이 비어 있다.
+
+### 4.5 합성은 켤레다
+
+애니메이션 노드 `N` 이 prim 과 앵커 사이에 있으므로 단순 곱이 아니다:
+
+```
+Relative(t) = M(prim->N) · A(t) · A(now)^-1 · M(prim->N)^-1 · Relative(now)
+```
+
+`M(prim->N)` 는 **이미 세워진 트리에서 읽기만** 하면 된다
+(`SpatialTree::get_relative_transform`, spatial_tree.rs:1009) -- 재구축이 아니다. 노드
+`N` 은 `find_spatial_node_by_anim_id(PropertyBindingId)`(spatial_tree.rs:991)로 찾는다.
+
+### 4.6 `floor`/`ceil` 은 합집합 뒤에 한 번만
+
+바깥쪽 반올림(picture.rs:3240-3243)을 샘플마다 걸면 중복 누적된다. `acc` 에 한 번만 건다.
 
 ---
 
-## 5. 설계
-
-### 5.1 `lead` 를 무엇으로 하는가
-
-`lead` 는 **캔버스 파이프라인 지연**이다. 그 값을 지금 아무도 재지 않는다
-(`SURFIMPORT` 는 합과 개수만, `RENDERCOST` 는 포함하지만 귀속 불가). 그래서:
-
-* pref `gfx_wall_canvas_scissor_lead_periods`, 기본 **1**(한 주기 = 16.67ms at 60Hz).
-* `0` = 예측 끄기(= 현재 동작). 범위 `0..=4`.
-* 실기에서 0/1/2 를 쓸어 **경계 띠가 사라지는 최소값**을 찾는다. 그 값이 곧 지연의
-  측정값이기도 하다.
-
-주기는 `gfx_refresh_hz` 에서 온다 -- painter 가 이미 그 값으로 틱을 센다.
-
-### 5.2 넓히는 규약
-
-`shift = (dx, dy)` 를 캔버스 백킹 px 로 환산한 뒤:
+## 5. 구조
 
 ```
-x0 -= max(0, -dx).ceil()      x1 += max(0,  dx).ceil()
-y0 -= max(0, -dy).ceil()      y1 += max(0,  dy).ceil()
+painter (틱마다)
+    샘플 시각 집합 = {now - max_age, 세그먼트 경계들, now + k*P ...}  (4.3, 4.4)
+    각 시각의 ★4x4 전체★ 를 key 별로 발행   -> wall_canvas_rect 의 lead 표
+    각 시각은 min(t, ends_at()) 로 clamp     -> 전환 끝 구멍을 닫는다
+
+WR (프레임 빌드, note_canvas_tile_rect)
+    k=0 (현재) 은 ★오늘 경로 그대로★ -- 합집합이 오늘 rect 의 상위집합임을 구조적으로 보장
+    조상 사슬을 1 회 순회해 애니메이션 노드 N 들을 모은다
+    샘플마다: 켤레 합성 -> 타일 화면 사각형을 pullback -> local 과 교집합 -> 합집합
+    floor/ceil 은 합집합 뒤 한 번
+    2D 가 아니거나 비가역이면 그 샘플을 버리고 k=0 만 쓴다
+
+WebGL 스레드
+    ★pad 로직 전부 삭제★ -- 넓히기는 WR 이 이미 했다
 ```
 
-그 다음 **캔버스 경계로 자른다**(`0..canvas.w`, `0..canvas.h`). 기존
-`note_canvas_tile_rect` 의 `floor`/`ceil` 바깥쪽 반올림과 같은 원칙이다 — **scissor 는
-필요보다 큰 쪽이 안전하다.** 작으면 빈다.
+### 5.1 비용
 
-### 5.3 경계 조건
+* painter: 샘플 2~8 개 x (세그먼트 찾기 + 16 성분 lerp), 그리고 lead 표에 `Mutex` 1 회
+  쓰기(틱당 1 회). 4x4 는 16 float 이라 원자에 들어가지 않는다.
+* WR: 프레임 빌드 경로에 `Mutex` 1 개 추가(기존 2 -> 3). 샘플마다 역행렬 1 +
+  `inverse_rect_footprint` 1. **캔버스 prim 에 대해서만, 프레임당 한 번.**
+* WebGL 스레드: **줄어든다** -- pad 계산이 사라진다.
+* 포크: `picture.rs` +70~90 줄, `wall_canvas_rect.rs` +50~70 줄, **그 외 0 줄**. 새 `pub`
+  API·시그니처·가시성 변경 **0**.
 
-| 조건 | 동작 |
-|---|---|
-| 애니메이션이 없다 | `shift = (0, 0)` → **변화 없음** |
-| 지평(`gfx_paint_side_animation_horizon_ms`, 3000) 밖 | `sample` 이 값을 주지 않음 → `shift = (0,0)` |
-| 캔버스가 멈췄다 | WR 의 `note` 가 끊기므로 기존 `max_age_ms` 경로 그대로 |
-| 전환으로 새 컨텍스트 | 첫 프레임은 `Missing` — 변화 없음 |
-| `lead = 0` | painter 가 예측 샘플을 건너뛴다(원자 로드 하나) |
-| `dest_size` 가 0 | 기존 가드가 먼저 걸러낸다 |
+### 5.2 추가 셰이딩
 
-### 5.4 비용
-
-* **painter**: 틱마다 `sample` 한 번 더. 애니메이션 개수에 비례하고, 보간은 세그먼트 찾기
-  + 선형 보간이다. 그 뒤 원자 둘(`AtomicI32` x2). `lead = 0` 이면 원자 로드 하나로 끝난다.
-* **WR**: **변화 없음.**
-* **WebGL 스레드**: 원자 로드 둘과 덧셈 몇 번. 기존 `scale_canvas_rect` 안이다.
-* 타이밍 경로 규칙(2026-10-27, 계측 20,489 줄을 걷어낸 이유)을 지킨다 — I/O 없음, 새 락
-  없음, 새 할당 없음.
+경로 합집합은 두 점 합집합보다 크다. 양방향 `lead 4` 가 이미 렌더를 밀어냈으므로
+(`last10s_over` 109) 이것은 실제 제약이다. 다만 합집합은 **실제로 필요한 영역**이고
+양방향 pad 는 **필요 없는 쪽까지** 넓혔으므로, 같은 `lead` 에서 더 작을 수 있다. 실기로
+`RENDERCOST` 를 본다.
 
 ---
 
-## 6. 작업 분할
+## 6. 작업 분할 (커밋 하나당 가설 하나)
 
-1. **`wall_canvas_rect` 에 예측 이동량 슬롯** — `set_predicted_shift(dx, dy)` /
-   `predicted_shift()`, `AtomicI32` 둘. 단위는 **layout px**(소비자가 환산한다).
-   (`vendor_local/webrender/src/wall_canvas_rect.rs` — 이 파일은 이미 이 포크의 것이다)
-2. **pref + 런처 스위치** `gfx_wall_canvas_scissor_lead_periods` / `-CanvasScissorLead`.
-3. **painter 가 예측 이동량을 계산해 싣는다** — `sample(now + lead·period)` 와
-   `sample(now)` 의 평행이동 성분 차이, 여러 애니메이션이면 최대값.
-   (`components/paint/painter.rs` 의 값 수집 자리, `web_content_animation.rs`)
-4. **소비자가 박스를 넓힌다** — `webgl_thread::scale_canvas_rect` 에서 `dest_size` 비율로
-   환산해 5.2 의 규약대로. 캔버스 경계로 자른다.
-5. **단위 테스트** — 넓히기 기하(네 방향, 경계 클램프), `lead = 0` 의 무변화, 지평 밖 폴백.
-   `wall_canvas_rect` 와 `scale_canvas_rect` 둘 다 순수 함수로 뽑아 테스트 가능하게.
-6. **실기 검증** — `-CanvasScissorLead 0/1/2`, 전환 구성 고정, 판정은 **경계 띠의 육안
-   유무**와 `SCISSORGATE applied%`.
+1. **painter + wall_canvas_rect** -- 샘플 시각 집합을 만들고 각 시각의 4x4 를 발행한다.
+   소비자가 아직 읽지 않으므로 **동작 변화 0**.
+2. **picture.rs** -- 합집합 + `floor`/`ceil` 이동. 이 켜기/끄기로 실기 짝을 만든다.
+3. **webgl_thread** -- pad 로직(단방향·양방향 모두)과 `predicted_shift` 를 제거한다.
 
 ---
 
