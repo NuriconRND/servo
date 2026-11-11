@@ -3237,6 +3237,31 @@ impl TileCacheInstance {
         // scissor 로는 ★필요보다 큰 쪽이 안전하다★ -- 더 셰이딩할 뿐이고, 작으면 빈다.
         // 소비자 쪽(`webgl_thread::tile_scissor_from_webrender`)도 같은 규약으로 `floor`/
         // `ceil` 을 쓴다.
+        // ★창 안의 다른 시각들도 더해 합집합을 적는다.★ 2026-11-11.
+        //
+        // 위에서 구한 `clipped` 는 ***이 프레임의 애니메이션 값으로는 정확***하지만,
+        // 캔버스는 비동기다 -- WebGL 스레드가 이 사각형을 읽어 scissor 를 걸고 그린
+        // 비트맵은 ***더 뒤의 프레임***에서 표출된다. 그 사이에 캔버스가 지나간 영역이
+        // 타일 경계에 ***그려진 적 없는 띠***가 된다.
+        //
+        // painter 가 실어 준 창 샘플들(`wall_canvas_rect::lead_samples`)로 각 시각의
+        // 사각형을 ***전체 행렬로*** 계산해 합집합을 낸다. 행렬을 쓰므로 이동·스케일·
+        // 회전·방향 전환이 모두 따라오고, "어느 방향으로 넓힐까" 라는 물음 자체가 없다.
+        // 1 차 구현(평행이동 근사)이 왜 틀렸는지는
+        // `docs/superpowers/specs/2026-11-11-scissor-follows-animation-design.md` 4 절.
+        //
+        // ★현재 시각은 위에서 오늘 경로로 이미 구했다★ -- 그래서 합집합은 ***오늘
+        // 사각형의 상위집합***임이 구조적으로 보장된다. 이 블록이 실패하거나 샘플이 없으면
+        // 동작이 오늘과 같다.
+        let clipped = self.union_lead_samples(
+            clipped,
+            slot,
+            prim_spatial_node_index,
+            local_prim_rect,
+            &map_prim_to_pic,
+            frame_context,
+        );
+
         let x0 = (clipped.min.x - dest.min.x).floor();
         let y0 = (clipped.min.y - dest.min.y).floor();
         let x1 = (clipped.max.x - dest.min.x).ceil();
@@ -3249,6 +3274,94 @@ impl TileCacheInstance {
         ];
         let dest_size = [dest.width().round() as i32, dest.height().round() as i32];
         crate::wall_canvas_rect::note(slot, key, rect, dest_size);
+    }
+
+    /// 창 샘플들의 사각형을 `now_rect` 에 합집합한다. 2026-11-11.
+    ///
+    /// ## 왜 켤레인가
+    ///
+    /// 애니메이션 행렬 `A(t)` 는 prim 과 픽처 앵커 사이의 ***사슬 중간***에 있다. 그래서
+    /// 미래 시각의 상대 변환은 단순 곱이 아니다:
+    ///
+    /// ```text
+    /// Relative(t) = L · A(t) · A(now)⁻¹ · L⁻¹ · Relative(now)
+    /// ```
+    ///
+    /// `L = M(prim → N)` 은 prim 에서 애니메이션 노드까지의 상대 변환이고, ***이미 세워진
+    /// 트리에서 읽기만*** 하면 된다(`get_relative_transform`) -- 트리를 다시 세우는 것이
+    /// 아니다. 노드 `N` 은 `find_spatial_node_by_anim_id` 로 찾는다.
+    ///
+    /// ## 사각형을 어떻게 얻나
+    ///
+    /// 타일의 화면 사각형을 미래 매핑으로 ***pullback*** 하고 prim 로컬과 교집합한다.
+    /// 앞쪽 `map` 을 생략하는 것은 ***보수적 상위집합***이다 -- `map` 이 이미 축정렬 bbox 를
+    /// 내므로 그렇고, scissor 에서는 큰 쪽이 안전하다(이 함수의 `floor`/`ceil` 규약과 같은
+    /// 원칙이다).
+    ///
+    /// ## 안전장치
+    ///
+    /// 샘플 하나가 실패하면(비가역, 원근 성분, 교집합 없음) ***그 샘플만 버린다***.
+    /// 전부 실패하면 `now_rect` 를 그대로 돌려주므로 동작이 오늘과 같다.
+    fn union_lead_samples(
+        &self,
+        now_rect: LayoutRect,
+        slot: u32,
+        prim_spatial_node_index: SpatialNodeIndex,
+        local_prim_rect: LayoutRect,
+        map_prim_to_pic: &SpaceMapper<LayoutPixel, PicturePixel>,
+        frame_context: &FrameVisibilityContext,
+    ) -> LayoutRect {
+        let samples = crate::wall_canvas_rect::lead_samples(slot);
+        if samples.is_empty() {
+            return now_rect;
+        }
+        // 현재 시각의 변환들을 바인딩별로 모은다 -- 켤레의 `A(now)⁻¹` 가 그것이다.
+        let mut acc = now_rect;
+        for sample in samples.iter().filter(|sample| !sample.is_now) {
+            let Some(now) = samples
+                .iter()
+                .find(|other| other.is_now && other.binding_id == sample.binding_id)
+            else {
+                continue;
+            };
+            let Some(node) = frame_context
+                .spatial_tree
+                .find_spatial_node_by_anim_id(sample.binding_id)
+            else {
+                continue;
+            };
+            let l = frame_context
+                .spatial_tree
+                .get_relative_transform(prim_spatial_node_index, node)
+                .into_transform();
+            let Some(l_inv) = l.inverse() else {
+                continue;
+            };
+            let a_t = LayoutTransform::from_array(sample.transform);
+            let a_now = LayoutTransform::from_array(now.transform);
+            let Some(a_now_inv) = a_now.inverse() else {
+                continue;
+            };
+            // L · A(t) · A(now)⁻¹ · L⁻¹ -- prim 로컬 공간의 델타.
+            let delta = l
+                .then(&a_t)
+                .then(&a_now_inv)
+                .then(&l_inv)
+                .with_source::<LayoutPixel>()
+                .with_destination::<LayoutPixel>();
+            let m_t = delta.then(&map_prim_to_pic.get_transform());
+            if m_t.has_perspective_component() {
+                continue;
+            }
+            let Some(in_prim) = m_t.inverse_rect_footprint(&self.screen_rect_in_pic_space) else {
+                continue;
+            };
+            let Some(clipped) = in_prim.intersection(&local_prim_rect) else {
+                continue;
+            };
+            acc = acc.union(&clipped);
+        }
+        acc
     }
 
     /// Update the dependencies for each tile for a given primitive instance.
