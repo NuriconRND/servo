@@ -1973,10 +1973,16 @@ impl Painter {
             }
             return None;
         }
-        if published - consumed > WALL_PUBLISH_BACKLOG_LIMIT {
+        let backlog = published - consumed;
+        if backlog > WALL_PUBLISH_BACKLOG_LIMIT {
+            // ★게이트가 풀리는 자리.★ 이 패스의 드레인 루프가 쌓인 것을 전부 비우고,
+            // 그만큼 `render_impl(device_size = None)` 이 불려 HUD fps 가 뛴다. 근거는
+            // `note_publish_backlog` 의 doc 주석.
+            note_publish_backlog(self.painter_id, backlog, true);
             self.consumed_publish_id.set(published);
             return None;
         }
+        note_publish_backlog(self.painter_id, backlog, false);
         Some(webrender_api::FramePublishId(consumed + 1))
     }
 
@@ -3860,6 +3866,74 @@ pub(crate) enum PaintMetricState {
 /// ★2026-11-11: `pref!` 를 타이밍 경로에서 치지 않기 위한 것이다.★ 그 함수는 벽 틱과 렌더
 /// 양쪽에서 불려 painter 마다 120/s 로 돌고, `pref!` 는 전역 `RwLock` 획득이다 -- 네
 /// painter 스레드가 초당 480 번 그것을 잡는다. `wall_canvas_rect::MAX_AGE_MS` 와 같은 패턴.
+/// publish 백로그 깊이와 게이트 해제. painter 별로 600 회마다 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/49)
+///
+/// 운영자 관찰: 전환 중 HUD fps 가 60 아래로 내려갔다가 화면이 안정되면 ***급격히 60 이상
+/// (심하면 세 자리)까지 올라갔다가*** 60 으로 돌아온다. 가설은 "몰려 있던 것을 한꺼번에
+/// 처리하는 것" 이었고, 조사가 기구를 지목했다.
+///
+/// `Renderer::update()` 의 호출자는 한 곳(이 파일 :1719/:1722)이고 루프가 없다. 루프는 그
+/// ***안에*** 있다 -- `while let Some(msg) = self.get_next_result_msg()`
+/// (`vendor_local/webrender/src/renderer/mod.rs:1055`). 그 안에서
+/// `render_impl(device_size = None)`(mod.rs:1082)이 불리고 ★HUD fps 는 그 반복 횟수★ 다
+/// (표출은 건너뛴다 -- mod.rs:1674 의 주석이 그것을 명시한다).
+///
+/// 그 루프를 묶는 게이트가 `next_publish_target` 이고, ★백로그가
+/// `WALL_PUBLISH_BACKLOG_LIMIT`(2)를 넘으면 풀린다★. 그 패스에서 쌓인 것이 전부 비워지는
+/// 것이 세 자리 fps 다.
+///
+/// 셸의 render 호출은 일정하다 -- 49 번 실측 `renders/s = 240.0` 이 여섯 구간 전부
+/// 동일했다(4 painter x 60Hz). 즉 버스트는 호출이 몰린 것이 아니다.
+///
+/// ## 판정
+///
+/// * `depth max` 가 2 를 넘는가 -- `WALL_PUBLISH_BACKLOG_LIMIT` 의 주석은 "정상 구성에서
+///   백로그가 1 을 넘을 이유가 없다" 고 적는데, ★이 수치가 처음으로 확인한다★.
+/// * `released` 가 전환 구간에 몰리는가 -- 운영자 관찰과 맞는지.
+/// * `held` 대 `released` -- 게이트가 평소에 얼마나 일하는가.
+///
+/// ## 비용
+///
+/// `next_publish_target` 은 painter render 당 한 번(240/s)이다. 원자 넷과 600 회마다 한
+/// 줄(약 2.5 초)이고, ★시계를 읽지 않는다★ -- 호출 수로 리포트 시점을 정한다.
+fn note_publish_backlog(painter_id: PainterId, backlog: u64, released: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// painter 슬롯 수의 상한. `note_display_list_arrival` 과 같은 이유로 여유를 둔다.
+    const SLOTS: usize = 8;
+
+    static SUM: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MAX: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static HELD: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static RELEASED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    let slot = (webrender_api::IdNamespace::from(painter_id).0 as usize) % SLOTS;
+    SUM[slot].fetch_add(backlog, Ordering::Relaxed);
+    MAX[slot].fetch_max(backlog, Ordering::Relaxed);
+    if released {
+        RELEASED[slot].fetch_add(1, Ordering::Relaxed);
+    } else {
+        HELD[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    let n = CALLS[slot].fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 600 != 0 {
+        return;
+    }
+    let calls = CALLS[slot].swap(0, Ordering::Relaxed).max(1);
+    warn!(
+        "PUBBACKLOG painter={painter_id:?} n={calls} depth(avg={:.2} max={}) \
+         gate(held={} released={})",
+        SUM[slot].swap(0, Ordering::Relaxed) as f64 / calls as f64,
+        MAX[slot].swap(0, Ordering::Relaxed),
+        HELD[slot].swap(0, Ordering::Relaxed),
+        RELEASED[slot].swap(0, Ordering::Relaxed),
+    );
+}
+
 /// 디스플레이 리스트 도착 간격. 60 회마다 한 줄.
 ///
 /// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/47)
