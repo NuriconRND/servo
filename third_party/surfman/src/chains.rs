@@ -35,6 +35,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 // The data stored for each swap chain.
@@ -48,16 +49,18 @@ struct SwapChainData<Device: DeviceAPI> {
     // The back buffer of the swap chain.
     back_buffer: BackBuffer<Device>,
     // Some if the producing context has finished drawing a new front buffer, ready to be displayed.
-    pending_surface: Option<Device::Surface>,
-    // When `pending_surface` was set. 2026-11-11.
     //
-    // ★무엇을 가르나★: 소비자가 이 장을 가져갈 때의 경과가 짧으면 GPU 가 아직 그 장에
-    // 쓰고 있을 수 있고, 그것이 `AcquireSync` 대기(= `LOCKWAIT` 의 `tex` 꼬리)의 원인
-    // 후보다. 그 경우라면 장을 하나 더 두는 것(트리플 버퍼링)이 고친다. 경과가 길면
-    // GPU 가 다른 일로 바쁜 것이고 장을 늘려도 소용없다.
+    // ★`deferred_front_buffer` 가 켜지면 두 칸까지 들고, 소비자가 앞에서 꺼낸다★
+    // (2026-11-12). 그러면 소비자가 받는 장은 ***한 프레임 전***에 제출된 것이라 그 GPU
+    // 작업이 끝났을 가능성이 높다 -- `AcquireSync` 꼬리를 줄이려는 시도다. 근거는
+    // `set_deferred_front_buffer` 의 doc 주석.
     //
-    // 근거는 `components/paint/webrender_external_images.rs` 의 `note_lock_wait` doc 주석.
-    pending_since: Option<Instant>,
+    // 꺼져 있으면 한 칸만 쓰므로 ***예전 `Option` 과 동작이 같다.***
+    pending_surfaces: VecDeque<(Device::Surface, Instant)>,
+    /// 두 칸을 쓸지. `paint` 가 pref 를 보고 세운다.
+    deferred_front_buffer: bool,
+    // (`pending_since` 는 `pending_surfaces` 가 시각을 함께 들게 되어 2026-11-12 에 사라졌다.
+    //  그 값이 무엇을 가르는지는 `webrender_external_images.rs` 의 `note_lock_wait` doc 에 있다.)
     // All of the surfaces that have already been displayed, ready to be recycled.
     recycled_surfaces: Vec<Device::Surface>,
 }
@@ -162,7 +165,14 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         self.validate_context(device, context)?;
 
         // Recycle the old front buffer
-        if let Some(old_front_buffer) = self.pending_surface.take() {
+        //
+        // ★두 칸을 쓸 때는 앞의 것만 밀어낸다★ -- 뒤의 것은 아직 소비자가 가져가지 않은
+        // 최신 프레임이다. 한 칸이면 예전과 같이 그 하나를 재활용한다.
+        let keep = if self.deferred_front_buffer { 1 } else { 0 };
+        while self.pending_surfaces.len() > keep {
+            let Some((old_front_buffer, _)) = self.pending_surfaces.pop_front() else {
+                break;
+            };
             let SurfaceInfo { id, size, .. } = device.surface_info(&old_front_buffer);
             debug!(
                 "Recycling surface {:?} ({:?}) for context {:?}",
@@ -186,9 +196,6 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
                     self.size, self.context_id
                 );
                 let surface_type = SurfaceType::Generic { size: self.size };
-                crate::platform::windows::angle::surface::note_next_surface_origin(
-                    crate::platform::windows::angle::surface::SurfaceOrigin::Swap,
-                );
                 crate::platform::windows::angle::surface::note_next_surface_origin(
                     crate::platform::windows::angle::surface::SurfaceOrigin::Swap,
                 );
@@ -236,8 +243,8 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
             device.surface_info(&new_front_buffer).id,
             self.context_id
         );
-        self.pending_surface = Some(new_front_buffer);
-        self.pending_since = Some(Instant::now());
+        self.pending_surfaces
+            .push_back((new_front_buffer, Instant::now()));
         Ok(())
     }
 
@@ -303,8 +310,7 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         // ***옛 크기*** 장을 `recycled_surfaces` 로 넣고(:166-173), 그 장은 크기 술어
         // (:176-183)를 영구히 실패시킨다 -- 즉 소비자에게 옛 크기 비트맵이 한 번 가고,
         // 재활용 풀은 쓸 수 없는 장을 안고 있게 된다.
-        if let Some(mut stale_front) = self.pending_surface.take() {
-            self.pending_since = None;
+        while let Some((mut stale_front, _)) = self.pending_surfaces.pop_front() {
             device.destroy_surface(context, &mut stale_front)?;
         }
         // ★다음 swap 이 쓸 장을 미리 넣어 둔다.★ 2026-11-12.
@@ -369,11 +375,10 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
     // GPU 가 이미 끝낸 장이라 `AcquireSync` 꼬리의 후보가 아니다. 근거는 `pending_since`
     // 의 주석.
     fn take_surface_with_age(&mut self) -> Option<(Device::Surface, Option<Duration>)> {
-        match self.pending_surface.take() {
-            Some(surface) => {
-                let age = self.pending_since.take().map(|at| at.elapsed());
-                Some((surface, age))
-            },
+        // ★앞에서 꺼낸다★ -- 두 칸을 쓸 때 그것이 "한 프레임 전" 이다. 한 칸이면 그 하나이고
+        // 예전과 같다.
+        match self.pending_surfaces.pop_front() {
+            Some((surface, at)) => Some((surface, Some(at.elapsed()))),
             None => self.recycled_surfaces.pop().map(|surface| (surface, None)),
         }
     }
@@ -381,8 +386,13 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
     // Take the current front buffer.
     // Returns `None` if there is no current front buffer.
     // Called by a consumer.
+    /// 두 칸을 쓸지 세운다. 근거는 `SwapChain::set_deferred_front_buffer` 의 doc.
+    fn set_deferred_front_buffer(&mut self, enabled: bool) {
+        self.deferred_front_buffer = enabled;
+    }
+
     fn take_pending_surface(&mut self) -> Option<Device::Surface> {
-        self.pending_surface.take()
+        self.pending_surfaces.pop_front().map(|(surface, _)| surface)
     }
 
     // Recycle the current front buffer.
@@ -535,9 +545,9 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
     fn destroy(&mut self, device: &Device, context: &mut Device::Context) -> Result<(), Error> {
         self.validate_context(device, context)?;
         let surfaces = self
-            .pending_surface
-            .take()
-            .into_iter()
+            .pending_surfaces
+            .drain(..)
+            .map(|(surface, _)| surface)
             .chain(self.back_buffer.take_surface(device, context).into_iter())
             .chain(self.recycled_surfaces.drain(..));
         for mut surface in surfaces {
@@ -642,6 +652,32 @@ impl<Device: DeviceAPI> SwapChain<Device> {
     /// Take the current front buffer.
     /// Returns `None` if there is no current front buffer.
     /// Called by a consumer.
+    /// 소비자가 ★한 프레임 묵은★ front buffer 를 가져가게 할지.
+    ///
+    /// ## 왜 (2026-11-12)
+    ///
+    /// 생산자는 그 장이 back buffer 인 ***전체 캔버스 프레임*** 동안 keyed mutex 를 잡는다
+    /// (`bind_surface_to_context` 의 `AcquireSync` -> 다음 swap 의 `unbind` 의
+    /// `ReleaseSync`). 소비자의 `AcquireSync` 는 그 서피스에 쌓인 GPU 작업이 은퇴할 때까지
+    /// 기다리므로, ***가장 최신*** 장을 가져가면 그 작업이 아직 남아 있을 수 있다.
+    ///
+    /// 그리고 `recycled` 장이 기다리는 기구도 보인다 -- `swap_buffers` 가 옛 front 를 풀에
+    /// 넣고(:166-180) 바로 다음 줄에서 크기 맞는 것을 집어 back buffer 로 쓰므로(:181-197),
+    /// ★방금 넣은 그 장을 다시 집을 수 있다★. 소비자가 그것을 `pop` 으로 가져가면 직전
+    /// 프레임의 작업이 남아 있다. 43 번 실측에서 꼬리 412 개 중 180 개가 그 경우였다.
+    ///
+    /// 켜면 큐를 두 칸으로 쓰고 소비자가 앞(= 한 프레임 전)에서 꺼낸다. 그 장의 작업은 한
+    /// 프레임 전에 제출됐으므로 끝났을 가능성이 높다.
+    ///
+    /// ★대가★: 표출 지연 +1 프레임(60Hz 에서 16.7ms), 장 수 2 -> 3 (백엔드당 +199MB).
+    /// 큐가 가득 차면 앞을 버린다(latest-wins) -- 소비자가 느릴 때 오래된 프레임을 쌓지
+    /// 않는다.
+    ///
+    /// 꺼져 있으면(기본) 한 칸만 쓰므로 ***예전 동작과 완전히 같다.***
+    pub fn set_deferred_front_buffer(&self, enabled: bool) {
+        self.lock().set_deferred_front_buffer(enabled);
+    }
+
     pub fn take_pending_surface(&self) -> Option<Device::Surface> {
         self.lock().take_pending_surface()
     }
@@ -699,8 +735,8 @@ impl<Device: DeviceAPI> SwapChain<Device> {
             context_id: device.context_id(context),
             surface_access,
             back_buffer: BackBuffer::Attached,
-            pending_surface: None,
-            pending_since: None,
+            pending_surfaces: VecDeque::new(),
+            deferred_front_buffer: false,
             recycled_surfaces: Vec::new(),
         }))))
     }
@@ -722,8 +758,8 @@ impl<Device: DeviceAPI> SwapChain<Device> {
             context_id: device.context_id(context),
             surface_access,
             back_buffer: BackBuffer::Detached(surface),
-            pending_surface: None,
-            pending_since: None,
+            pending_surfaces: VecDeque::new(),
+            deferred_front_buffer: false,
             recycled_surfaces: Vec::new(),
         }))))
     }

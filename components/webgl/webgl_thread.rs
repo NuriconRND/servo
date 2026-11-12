@@ -1646,6 +1646,12 @@ impl WebGLThread {
             .webrender_swap_chains
             .get(surface_id)
             .expect("Failed to get the swap chain");
+        // ★두 칸 큐를 쓸지 세운다★ -- 근거는 `gfx_wall_webgl_deferred_front_buffer` 의 doc
+        // 주석. 컨텍스트를 만들 때 한 번만 읽으므로 타이밍 경로가 아니고, pref 를 바꾸면
+        // 다음 컨텍스트부터 적용된다(전환마다 새로 만들므로 곧 걸린다).
+        swap_chain.set_deferred_front_buffer(servo_config::pref!(
+            gfx_wall_webgl_deferred_front_buffer
+        ));
 
         debug!(
             "Created webgl backend context {:?} for painter {:?}/{:?}",

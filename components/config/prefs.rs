@@ -875,6 +875,31 @@ pub struct Preferences {
     ///
     /// `gfx_wall_webgl_tile_scissor_from_webrender` 가 꺼져 있으면 이 값도 무효다(걸 사각형
     /// 자체가 없다).
+    /// 소비자가 ★한 프레임 묵은★ front buffer 를 가져가게 한다. 기본 꺼짐.
+    ///
+    /// ## 왜 (2026-11-12)
+    ///
+    /// `LOCKTAIL`(캔버스 서피스 획득 >= 8ms, 최대 71ms)의 원인을 좁히는 중이고 셋이
+    /// 기각됐다 -- 스왑체인 블로킹 Mutex(`chain` avg 0us), 트리플 버퍼링(꼬리의 44% 가
+    /// `recycled` 장), 199MB full-surface clear(51 번 A/B 에서 개수 -17%, ***크기는
+    /// 71.1 -> 72.0ms 로 그대로***; 산술도 0.44ms 다).
+    ///
+    /// 남은 것이 ★생산자의 보유 구간★ 이다. 생산자는 그 장이 back buffer 인 ***전체 캔버스
+    /// 프레임*** 동안 keyed mutex 를 잡고(`bind_surface_to_context` 의 `AcquireSync` ->
+    /// 다음 swap 의 `unbind` 의 `ReleaseSync`), 소비자의 `AcquireSync` 는 그 서피스의 GPU
+    /// 작업이 은퇴할 때까지 기다린다.
+    ///
+    /// 그리고 `recycled` 꼬리의 기구도 코드에 있다 -- `swap_buffers` 가 옛 front 를 풀에
+    /// 넣은 ***바로 다음 줄***에서 크기 맞는 것을 집어 back buffer 로 쓰므로, 방금 넣은 그
+    /// 장을 다시 집을 수 있다. 소비자가 그것을 가져가면 직전 프레임의 작업이 남아 있다.
+    ///
+    /// 켜면 `pending` 을 두 칸 큐로 쓰고 소비자가 앞(= 한 프레임 전)에서 꺼낸다.
+    ///
+    /// ★대가★: 표출 지연 +1 프레임(60Hz 에서 16.7ms), 장 수 2 -> 3(백엔드당 +199MB).
+    ///
+    /// 판정: 꼬리가 크게 줄면 원인 확정이고 대가를 평가한다. 그대로면 이 축도 기각이고
+    /// 생산자 draw 자체가 남는다. 육안 지연이 체감되면 대가가 너무 크다.
+    pub gfx_wall_webgl_deferred_front_buffer: bool,
     pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
 
@@ -1723,6 +1748,7 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
+            gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
