@@ -30,12 +30,12 @@ use glow as gl;
 use glow::Context as Gl;
 use glow::HasContext;
 use log::debug;
+use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 // The data stored for each swap chain.
@@ -392,7 +392,9 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
     }
 
     fn take_pending_surface(&mut self) -> Option<Device::Surface> {
-        self.pending_surfaces.pop_front().map(|(surface, _)| surface)
+        self.pending_surfaces
+            .pop_front()
+            .map(|(surface, _)| surface)
     }
 
     // Recycle the current front buffer.
@@ -890,7 +892,25 @@ where
         device: &Device,
         context: &mut Device::Context,
     ) -> Result<(), Error> {
-        if let Some(swap_chain) = self.table_mut().remove(&id) {
+        // ★테이블 락을 놓고 파괴한다.★ 2026-11-12.
+        //
+        // `if let` 의 scrutinee 가 만든 임시 `RwLockWriteGuard` 는 Rust 2021 의 임시값 수명
+        // 규칙에서 ***블록 끝까지 산다***(이 크레이트는 edition 2021, Cargo.toml:13; 2024 가
+        // 그것을 바꿨다). 그래서 앞 판은 서피스 파괴 전체를 write 락 안에서 했다.
+        //
+        // 소비자는 매 프레임 `lock_swap_chain` 에서 `table()`(read 락)을 잡고, writer 가
+        // 대기 중이면 새 reader 가 막히므로 ★그 동안 네 painter 의 render() 가 전부 멈춘다★.
+        // 벽에서 파괴할 장이 장당 199MB 로 둘셋이다.
+        //
+        // 운영자 관찰과 맞는다 -- "WebGL 구성끼리 전환할 때, 전환 애니메이션 종료 직후
+        // 멈칫하는 현상이 거의 항상 나타나는데, WebGL이 포함되지 않는 구성에서 WebGL
+        // 구성으로 넘어가면 그 현상이 발생하지 않는다." ★나가는 쪽에 WebGL 이 없으면
+        // 파괴할 서피스가 없다.★
+        //
+        // `let` 으로 빼면 임시 guard 가 ***그 문장 끝에서*** 떨어진다. 테이블에서 빼낸 뒤에는
+        // 다른 스레드가 그 체인을 찾을 수 없으므로 락 밖에서 파괴해도 안전하다.
+        let removed = self.table_mut().remove(&id);
+        if let Some(swap_chain) = removed {
             swap_chain.destroy(device, context)?;
         }
         if let Some(ids) = self.ids().get_mut(&device.context_id(context)) {
