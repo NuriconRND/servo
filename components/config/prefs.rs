@@ -900,6 +900,36 @@ pub struct Preferences {
     /// 판정: 꼬리가 크게 줄면 원인 확정이고 대가를 평가한다. 그대로면 이 축도 기각이고
     /// 생산자 draw 자체가 남는다. 육안 지연이 체감되면 대가가 너무 크다.
     pub gfx_wall_webgl_deferred_front_buffer: bool,
+    /// 정지한 캔버스의 낡은 scissor rect 를 버리지 않고 그대로 쓴다. ***기본 켜짐.***
+    ///
+    /// ## 왜 (2026-11-12)
+    ///
+    /// 운영자 지적 -- "scissors가 꺼지는 지점이 있는거야? 전환 애니메이션 중에 꺼질 리는
+    /// 없고, 전환 애니메이션 후에도 각 tile별 영역만 잘라서 그려야 하는 거 아닌가?" 그리고
+    /// "왜 갑자기 WebGL + ticker 애니메이션 조합 구성에서 애니메이션 judder가 발생하는 회귀가
+    /// 일어났나 했더니, 그게 원인이었나보다."
+    ///
+    /// 53 번 실측:
+    ///
+    ///     SCISSORJUMPS  n=6000  from_none=716  to_none=696    변화의 24%
+    ///     SCISSORGATE   applied=1125 (93.8%)  stale=51 (age_max=1263ms)
+    ///
+    /// scissor 가 `None` 이 되면 서피스 전체로 되돌아가고, 네 타일이 모두 캔버스 전체를
+    /// 그린다 -- 평균 8Mpx 대 전체 49.8Mpx 로 6 배다. 결과 픽셀은 같아 눈에 안 보이지만
+    /// 프레임 비용이 24% 의 빈도로 6 배를 왕복하므로 ***judder 가 된다.***
+    ///
+    /// 꺼지는 이유는 `stale` 이다. WR 이 rect 를 적는 것은 DL 을 만들 때인데, 전환이 끝나
+    /// 화면이 정지하면 그 캔버스를 품은 picture 가 다시 래스터되지 않아 `note` 가 불리지
+    /// 않는다. 그런데 ***정지 상태의 rect 는 낡아도 유효하다*** -- 안 움직이니까 값이 안
+    /// 변한다.
+    ///
+    /// 정지의 증거는 데이터 안에 있다: `picture.rs` 가 `table[0] = (0, rect)` 로 시작하고
+    /// 애니메이션 샘플만 뒤에 붙이므로 `sample_count == 1` 은 "이 캔버스에 애니메이션이
+    /// 없다" 는 WR 자신의 보고다. 움직이는 중에는 2 이상이 되어 걸리지 않으므로, 낡은 rect
+    /// 로 그려야 할 영역을 빼먹는 일(= 검은 띠)이 생길 수 없다.
+    ///
+    /// 회귀 수정이므로 기본 켜짐이고, 이 판정이 틀린 구성이 있으면 끌 수 있다.
+    pub gfx_wall_webgl_scissor_hold_when_static: bool,
     pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
 
@@ -1749,6 +1779,7 @@ impl Preferences {
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_deferred_front_buffer: false,
+            gfx_wall_webgl_scissor_hold_when_static: true,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,

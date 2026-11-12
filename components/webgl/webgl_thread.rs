@@ -351,6 +351,12 @@ fn note_scissor_jump(was: Option<[i32; 4]>, now: Option<[i32; 4]>) {
 fn note_scissor_gate(outcome: ScissorGate) {
     static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
+    /// 낡았지만 정지한 캔버스라서 그대로 쓴 횟수와 그때의 최대 나이. 2026-11-12.
+    ///
+    /// `SLOTS` 에 넣지 않는다 -- 이 결과 뒤에 그 호출이 계속 진행해서 `Applied` 도 부르므로
+    /// 같은 칸을 쓰면 한 번의 적용이 두 번 세어지고 `pct` 의 분모가 왜곡된다.
+    static STALE_HELD: AtomicU64 = AtomicU64::new(0);
+    static STALE_HELD_AGE_MAX: AtomicU64 = AtomicU64::new(0);
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static PREV: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     /// 직전 리포트 시각, 프로세스 기준점 이후 ms. 0 = 아직 없음.
@@ -369,6 +375,12 @@ fn note_scissor_gate(outcome: ScissorGate) {
         ScissorGate::Stale(age) => {
             STALE_AGE_MAX.fetch_max(age, Ordering::Relaxed);
             3
+        },
+        // 이 호출은 계속 진행해서 `Applied` 도 부른다. 위 doc 주석이 근거다.
+        ScissorGate::StaleHeld(age) => {
+            STALE_HELD.fetch_add(1, Ordering::Relaxed);
+            STALE_HELD_AGE_MAX.fetch_max(age, Ordering::Relaxed);
+            return;
         },
         ScissorGate::NoIntersection => 4,
     };
@@ -412,14 +424,16 @@ fn note_scissor_gate(outcome: ScissorGate) {
     let hold_sum = HOLD_SUM_MS.swap(0, Ordering::Relaxed);
     warn!(
         "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
-         stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms) \
-         table_miss(empty={} one={} drift={})",
+         stale={} (age_max={}ms) stale_held={} (age_max={}ms) no_isect={} \
+         hold(n={} avg={}ms max={}ms) table_miss(empty={} one={} drift={})",
         d[0],
         d[0] as f64 / secs,
         d[1],
         d[2],
         d[3],
         STALE_AGE_MAX.swap(0, Ordering::Relaxed),
+        STALE_HELD.swap(0, Ordering::Relaxed),
+        STALE_HELD_AGE_MAX.swap(0, Ordering::Relaxed),
         d[4],
         hold_count,
         if hold_count > 0 {
@@ -444,6 +458,8 @@ enum ScissorGate {
     Missing,
     /// 적힌 것이 `max_age_ms` 보다 낡았다(나이, ms).
     Stale(u64),
+    /// 낡았지만 정지한 캔버스라서 그대로 썼다(나이, ms). 2026-11-12.
+    StaleHeld(u64),
     /// 사각형이 있지만 교집합이 비었다.
     NoIntersection,
 }
@@ -2346,6 +2362,17 @@ impl WebGLThread {
         let max_age = webrender::wall_canvas_rect::max_age_ms();
         let (noted, age) = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
             webrender::wall_canvas_rect::Lookup::Hit(noted, age) => (noted, age),
+            // 정지한 캔버스는 낡았다고 버리지 않는다. 근거는
+            // `gfx_wall_webgl_scissor_hold_when_static` 의 doc 주석 -- 요점은
+            // `sample_count == 1` 이 "이 캔버스에 애니메이션이 없다" 는 WR 자신의 보고라서
+            // (`picture.rs` 가 `table[0] = (0, rect)` 로 시작하고 애니메이션 샘플만 뒤에
+            // 붙인다) 소비자 쪽에 아무 상태도 두지 않고 가를 수 있다는 것이다.
+            webrender::wall_canvas_rect::Lookup::Stale(noted, age)
+                if noted.sample_count <= 1 && webrender::wall_canvas_rect::hold_when_static() =>
+            {
+                note_scissor_gate(ScissorGate::StaleHeld(age));
+                (noted, age)
+            },
             webrender::wall_canvas_rect::Lookup::Stale(_, age) => {
                 note_scissor_gate(ScissorGate::Stale(age));
                 return None;

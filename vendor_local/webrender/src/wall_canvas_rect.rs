@@ -142,6 +142,35 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static TILE_CLEAR: AtomicBool = AtomicBool::new(false);
 
 /// `paint` 가 pref 를 보고 세운다. 근거는 `TILE_CLEAR` 의 doc 주석.
+/// 정지한 캔버스의 낡은 rect 를 그대로 쓸지. 기본 켜짐.
+static HOLD_WHEN_STATIC: AtomicBool = AtomicBool::new(true);
+
+/// `gfx_wall_webgl_scissor_hold_when_static` 를 싣는다. `paint` 가 틱마다 부른다.
+pub fn set_hold_when_static(enabled: bool) {
+    HOLD_WHEN_STATIC.store(enabled, Ordering::Relaxed);
+}
+
+/// 정지한 캔버스의 낡은 rect 를 그대로 쓸지.
+///
+/// ## 왜 (2026-11-12)
+///
+/// WR 이 rect 를 적는 것은 DL 을 만들 때인데, 전환이 끝나 화면이 정지하면 그 캔버스를 품은
+/// picture 가 다시 래스터되지 않아 `note` 가 불리지 않는다. 그래서 rect 가 1.26 초까지
+/// 낡고(53 번 `age_max=1263ms`), `max_age_ms` 를 넘기면 버려져 소비자가 scissor 를 끈다.
+///
+/// scissor 가 꺼지면 네 타일이 모두 캔버스 전체를 그린다 -- 53 번에서 평균 8Mpx 대 전체
+/// 49.8Mpx 로 6 배이고, 그것이 변화의 24%(`to_none=696`/6000) 빈도로 왕복한다. 결과 픽셀은
+/// 같으니 눈에 안 보이지만 프레임 비용이 6 배를 오가므로 ***judder 가 된다.***
+///
+/// 그런데 정지 상태의 rect 는 낡아도 유효하다 -- 안 움직이니까 값이 안 변한다. 그리고 정지의
+/// 증거가 데이터 안에 있다: `picture.rs` 가 `table[0] = (0, rect)` 로 시작하고 애니메이션
+/// 샘플만 뒤에 붙이므로 `sample_count == 1` 은 "이 캔버스에 애니메이션이 없다" 는 WR 자신의
+/// 보고다. 움직이는 중에는 2 이상이 되어 걸리지 않으므로, 낡은 rect 로 그려야 할 영역을
+/// 빼먹는 일(= 검은 띠)이 생길 수 없다.
+pub fn hold_when_static() -> bool {
+    HOLD_WHEN_STATIC.load(Ordering::Relaxed)
+}
+
 pub fn set_tile_clear(enabled: bool) {
     TILE_CLEAR.store(enabled, Ordering::Relaxed);
 }

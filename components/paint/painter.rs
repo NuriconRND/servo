@@ -804,6 +804,9 @@ impl Painter {
         webrender::wall_canvas_rect::set_tile_clear(servo_config::pref!(
             gfx_wall_webgl_tile_scissor_clear
         ));
+        webrender::wall_canvas_rect::set_hold_when_static(servo_config::pref!(
+            gfx_wall_webgl_scissor_hold_when_static
+        ));
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,
