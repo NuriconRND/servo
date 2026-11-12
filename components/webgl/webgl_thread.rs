@@ -1600,6 +1600,9 @@ impl WebGLThread {
         let mut ctx = device
             .create_context(&context_descriptor, None)
             .map_err(|err| format!("Failed to create the GL context: {:?}", err))?;
+        surfman::platform::windows::angle::surface::note_next_surface_origin(
+            surfman::platform::windows::angle::surface::SurfaceOrigin::Context,
+        );
         let surface = device
             .create_surface(&ctx, surface_access, surface_type)
             .map_err(|err| format!("Failed to create the initial surface: {:?}", err))?;

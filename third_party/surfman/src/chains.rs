@@ -186,6 +186,12 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
                     self.size, self.context_id
                 );
                 let surface_type = SurfaceType::Generic { size: self.size };
+                crate::platform::windows::angle::surface::note_next_surface_origin(
+                    crate::platform::windows::angle::surface::SurfaceOrigin::Swap,
+                );
+                crate::platform::windows::angle::surface::note_next_surface_origin(
+                    crate::platform::windows::angle::surface::SurfaceOrigin::Swap,
+                );
                 device.create_surface(context, self.surface_access, surface_type)
             })?;
 
@@ -280,6 +286,9 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
             return Err(Error::Failed);
         }
         let surface_type = SurfaceType::Generic { size };
+        crate::platform::windows::angle::surface::note_next_surface_origin(
+            crate::platform::windows::angle::surface::SurfaceOrigin::Resize,
+        );
         let new_back_buffer = device.create_surface(context, self.surface_access, surface_type)?;
         let mut old_back_buffer = self.back_buffer.take_surface(device, context)?;
         self.back_buffer
@@ -307,6 +316,9 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         //
         // 여기서 한 장을 미리 만들면 그 할당이 이 호출 안으로 들어온다. 총 장 수는 같고,
         // 타이밍만 애니메이션 밖으로 옮긴다.
+        crate::platform::windows::angle::surface::note_next_surface_origin(
+            crate::platform::windows::angle::surface::SurfaceOrigin::Resize,
+        );
         let spare =
             device.create_surface(context, self.surface_access, SurfaceType::Generic { size })?;
         self.recycled_surfaces.push(spare);
@@ -666,6 +678,9 @@ impl<Device: DeviceAPI> SwapChain<Device> {
         size: Size2D<i32>,
     ) -> Result<SwapChain<Device>, Error> {
         let surface_type = SurfaceType::Generic { size };
+        crate::platform::windows::angle::surface::note_next_surface_origin(
+            crate::platform::windows::angle::surface::SurfaceOrigin::Detached,
+        );
         let surface = device.create_surface(context, surface_access, surface_type)?;
         Ok(SwapChain(Arc::new(Mutex::new(SwapChainData {
             size,

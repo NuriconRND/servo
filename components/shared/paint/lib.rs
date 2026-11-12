@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Error, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use embedder_traits::{AnimationState, EventLoopWaker};
@@ -92,14 +94,23 @@ use crate::viewport_description::ViewportDescription;
 /// 데드락이 생길 수 없다.
 pub fn angle_gl_lock(d3d11_device: Option<usize>) -> AngleGlGuard {
     let Some(device) = d3d11_device.filter(|pointer| *pointer != 0) else {
+        // ★배타를 기다린 시간과 잡고 있을 시간을 잰다.★ 근거는 `note_paint_gap` 의 doc
+        // 주석. 전환당 몇 번이라 무조건 찍어도 된다.
+        let began = Instant::now();
+        let exclusive = ANGLE_GL_EXCLUSION.write();
+        let waited = began.elapsed();
         return AngleGlGuard {
             device: None,
             shared: None,
-            exclusive: Some(ANGLE_GL_EXCLUSION.write()),
+            exclusive: Some(exclusive),
+            held_since: Some(Instant::now()),
+            exclusive_wait: waited,
         };
     };
 
+    let gap_began = Instant::now();
     let shared = ANGLE_GL_EXCLUSION.read();
+    note_paint_gap(gap_began.elapsed());
     let device_lock = {
         let mut registry = ANGLE_GL_DEVICE_LOCKS.lock().expect("poisoned");
         let known = registry.len();
@@ -122,7 +133,64 @@ pub fn angle_gl_lock(d3d11_device: Option<usize>) -> AngleGlGuard {
         device: Some(device_lock.lock().expect("poisoned")),
         shared: Some(shared),
         exclusive: None,
+        held_since: None,
+        exclusive_wait: Duration::ZERO,
     }
+}
+
+/// painter 가 `render()` 진입을 기다린 시간(= ANGLE 공유 락 획득 대기). 꼬리는 그때그때 한
+/// 줄, 나머지는 1200 획득마다 모아서 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/44)
+///
+/// 운영자 관찰: "전환 애니메이션 ***시작 및 종료***간 멈칫하는 현상 큰 개선 없음".
+///
+/// `create_webgl_backend_context` 는 `angle_gl_lock(None)` = ★전역 배타★ 를 잡고, 그 구간에
+/// 네 painter 가 `render()` 에 들어갈 수 없다. `pump_paint_animation(PumpSource::Render)` 이
+/// `render` 안에 있으므로 ***어느 타일도 전환을 진행하지 못한다***
+/// (`components/paint/wall_tick.rs:186-198`).
+///
+/// 그런데 지금 손에 있는 것은 "시작과 종료에 멈칫한다" 는 육안과 "전역 배타 락이 있다" 는
+/// 코드 읽기뿐이고, ***둘을 잇는 수치가 없다***. `GLEXCL`(배타를 잡고 있던 시간)과
+/// `PAINTGAP`(painter 가 기다린 시간)의 시각이 겹치면 인과가 확정된다.
+///
+/// 리사이즈 할당을 줄인 앞 커밋은 `LOCKTAIL`(= `AcquireSync`)을 ×0.70 으로 줄였지만 육안은
+/// 그대로였다 -- 꼬리는 다른 락을 재고 있었다는 뜻이다.
+///
+/// ## 비용
+///
+/// painter 틱마다(4 x 60Hz = 240/s) 시계 둘과 원자 넷이므로 약 12us/s 다. 꼬리 줄은 8ms
+/// 이상일 때만 나온다.
+fn note_paint_gap(waited: Duration) {
+    /// 꼬리로 보고 한 줄 찍는 기준. 한 주기(16.7ms)의 절반이다.
+    const TAIL_US: u64 = 8_000;
+
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static ACQUIRES: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let us = waited.as_micros() as u64;
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+
+    if us >= TAIL_US {
+        let nth = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        log::warn!("PAINTGAP #{nth} waited={us}us for the shared ANGLE lock");
+    }
+
+    // 호출 수로 리포트 시점을 정한다 -- 시계를 또 읽지 않는다.
+    let n = ACQUIRES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 1200 != 0 {
+        return;
+    }
+    let count = ACQUIRES.swap(0, Ordering::Relaxed).max(1);
+    log::warn!(
+        "PAINTWAIT n={count} gap(avg={}us max={}us) tails={}",
+        SUM_US.swap(0, Ordering::Relaxed) / count,
+        MAX_US.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
 }
 
 /// 키를 모르는 작업(컨텍스트 생성 등)이 디바이스 락 전부를 배제하기 위한 상위 단계.
@@ -132,12 +200,51 @@ static ANGLE_GL_EXCLUSION: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new((
 static ANGLE_GL_DEVICE_LOCKS: LazyLock<Mutex<HashMap<usize, &'static Mutex<()>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// [`angle_gl_lock`] 이 돌려주는 가드. 필드 선언 순서가 곧 해제 순서이므로 디바이스 락이
-/// 상위 단계보다 먼저 풀린다(획득의 역순).
+/// [`angle_gl_lock`] 이 돌려주는 가드.
+///
+/// ★해제 순서는 `Drop` 이 명시한다★(2026-11-12) -- 전에는 필드 선언 순서에 기대고 있었는데,
+/// 계측을 위해 `Drop` 을 구현하면서 그 본문이 필드 해제보다 먼저 돌게 됐다. 그래서 본문이
+/// 획득의 역순(device -> shared -> exclusive)으로 직접 떨어뜨린다. 선언 순서도 그대로
+/// 두었으므로 `Drop` 을 지우면 예전 동작으로 돌아간다.
 pub struct AngleGlGuard {
     device: Option<MutexGuard<'static, ()>>,
     shared: Option<RwLockReadGuard<'static, ()>>,
     exclusive: Option<RwLockWriteGuard<'static, ()>>,
+    /// 배타를 잡은 시각(배타일 때만). `Drop` 에서 보유 시간을 찍는다.
+    held_since: Option<Instant>,
+    /// 배타를 기다린 시간(배타일 때만).
+    exclusive_wait: Duration,
+}
+
+impl Drop for AngleGlGuard {
+    fn drop(&mut self) {
+        // ★배타를 잡고 있던 시간을 찍는다.★ 근거는 `note_paint_gap` 의 doc 주석 -- 요점은
+        // 이 구간에 네 painter 가 `render()` 에 못 들어가고, 그래서 어느 타일도 전환을
+        // 진행하지 못한다는 것이다.
+        //
+        // 배타는 전환당 몇 번(컨텍스트 생성/복구 x 4 백엔드)이라 무조건 찍어도 I/O 가
+        // 문제되지 않는다. 공유 쪽은 `note_paint_gap` 이 따로 센다.
+        let Some(began) = self.held_since else {
+            return;
+        };
+        let held = began.elapsed();
+
+        // ★찍기 전에 락을 놓는다.★ `Drop` 본문은 필드 해제보다 ***먼저*** 돌므로, 그냥
+        // 찍으면 `warn!` 의 I/O 가 배타 구간 안에 들어가 ***측정이 측정 대상을 늘린다***.
+        // 이 구조체의 doc 주석이 "필드 선언 순서가 곧 해제 순서" 라고 적어 둔 것도 같은
+        // 전제다 -- 획득의 역순으로 떨어뜨린다.
+        drop(self.device.take());
+        drop(self.shared.take());
+        drop(self.exclusive.take());
+
+        static EXCL: AtomicU64 = AtomicU64::new(0);
+        let nth = EXCL.fetch_add(1, Ordering::Relaxed) + 1;
+        log::warn!(
+            "GLEXCL #{nth} held={}us (waited={}us) -- all painters were out of render()",
+            held.as_micros(),
+            self.exclusive_wait.as_micros(),
+        );
+    }
 }
 
 /// Sends messages to `Paint`.

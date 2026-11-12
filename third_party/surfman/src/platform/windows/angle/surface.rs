@@ -240,6 +240,47 @@ static IMPORT_LIVE: AtomicU64 = AtomicU64::new(0);
 static SURFACES_CREATED: AtomicU64 = AtomicU64::new(0);
 static SURFACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
 
+/// ★생성이 어느 경로에서 왔는지★ 를 센다. 순서: ctx, resize, swap, detach, 기타.
+///
+/// ## 왜 이 칸인가 (2026-11-12, log_webgl_perf_01/44)
+///
+/// 리사이즈당 190MB 생성을 2 회에서 1 회로 줄인 수정이 정규화 후 ***×0.77*** 밖에 내지
+/// 못했다(초당 3.40 -> 2.62). 절반이 되어야 할 것이 23% 만 줄었으니, 생성의 상당 부분이
+/// 리사이즈가 아닌 경로에서 오거나 동일 크기 가드가 거의 걸리지 않는 것이다. 총합 하나로는
+/// 가릴 수 없다.
+///
+/// * `swap` 이 여전히 크면 -- resize 가 넣어 두는 spare 가 그 경로를 못 막았다.
+/// * `resize` 가 전환 횟수의 몇 배인지 -- 동일 크기 가드의 효과.
+/// * `ctx` 는 컨텍스트 수 x 백엔드 수와 맞아야 한다.
+pub(crate) static SURFACE_ORIGINS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `create_surface` 호출자가 자기를 밝히는 값. 숫자가 `SURFACE_ORIGINS` 의 칸이다.
+#[derive(Clone, Copy)]
+pub enum SurfaceOrigin {
+    Context = 0,
+    Resize = 1,
+    Swap = 2,
+    Detached = 3,
+    Other = 4,
+}
+
+/// 다음 `create_surface` 가 어느 경로인지 알려 둔다. 같은 스레드 안에서 호출 직전에
+/// 세우므로 전역 상태가 필요 없다 -- 스레드 로컬 하나다.
+pub fn note_next_surface_origin(origin: SurfaceOrigin) {
+    NEXT_SURFACE_ORIGIN.set(origin as usize);
+}
+
+thread_local! {
+    static NEXT_SURFACE_ORIGIN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(SurfaceOrigin::Other as usize) };
+}
+
+/// 알려 둔 경로를 집어 쓰고 `Other` 로 되돌린다 -- 밝히지 않은 호출자가 남의 표를 쓰지
+/// 않게 한다.
+fn take_surface_origin() -> usize {
+    NEXT_SURFACE_ORIGIN.replace(SurfaceOrigin::Other as usize)
+}
+
 /// Account for entries dropped in bulk when a device tears its cache down.
 pub(crate) fn note_imports_released(count: usize) {
     IMPORT_LIVE.fetch_sub(count as u64, Ordering::Relaxed);
@@ -299,7 +340,9 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
     // `surfman` 타깃이 없다. `info!` 로 두면 한 줄도 안 나오고, 그 침묵이 "비용이 없다"로
     // 오독된다. 다른 진단선(`WEBGLFANOUT`, `WALLACKFLUSH`)도 같은 이유로 `warn!` 이다.
     warn!(
-        "SURFIMPORT imports={} reused={} ({:.0}%) live={} surfaces_created={} surfaces_destroyed={} surfaces_live={} open_ms={:.1} pbuffer_ms={:.1} \
+        "SURFIMPORT imports={} reused={} ({:.0}%) live={} surfaces_created={} \
+         by(ctx={} resize={} swap={} detach={} other={}) \
+         surfaces_destroyed={} surfaces_live={} open_ms={:.1} pbuffer_ms={:.1} \
          query_ms={:.1} acquire_ms={:.1} rest_ms={:.1} (counters cumulative, live is not)",
         count,
         reused,
@@ -310,6 +353,11 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
         },
         IMPORT_LIVE.load(Ordering::Relaxed),
         SURFACES_CREATED.load(Ordering::Relaxed),
+        SURFACE_ORIGINS[0].load(Ordering::Relaxed),
+        SURFACE_ORIGINS[1].load(Ordering::Relaxed),
+        SURFACE_ORIGINS[2].load(Ordering::Relaxed),
+        SURFACE_ORIGINS[3].load(Ordering::Relaxed),
+        SURFACE_ORIGINS[4].load(Ordering::Relaxed),
         SURFACES_DESTROYED.load(Ordering::Relaxed),
         SURFACES_CREATED
             .load(Ordering::Relaxed)
@@ -334,6 +382,7 @@ impl Device {
         surface_type: SurfaceType<NativeWidget>,
     ) -> Result<Surface, Error> {
         SURFACES_CREATED.fetch_add(1, Ordering::Relaxed);
+        SURFACE_ORIGINS[take_surface_origin()].fetch_add(1, Ordering::Relaxed);
         match surface_type {
             SurfaceType::Generic { ref size } => self.create_pbuffer_surface(context, size, None),
             SurfaceType::Widget { ref native_widget } => {
