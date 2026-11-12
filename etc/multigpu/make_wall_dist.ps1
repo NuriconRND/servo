@@ -199,6 +199,12 @@ Copy-Item (Join-Path $repo "tests\html\ticker_slice_probe.html") (Join-Path $pag
 # 경로로 참조하므로 ★둘이 함께 들어가야 한다★ -- 그래서 둘 다 $eyeProbes 에 올렸다.
 Copy-Item (Join-Path $repo "tests\html\ticker_webgl_mix_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
 Copy-Item (Join-Path $repo "tests\Wildlife_FHD30fps_counter_10Mbitrate.mp4") $pages -Force
+# (2026-11-12) rotate + opacity probe for the "judder only when opacity is added" report
+# (log_webgl_perf_01/16). It copies the output page's RegionBox shape and only toggles
+# ?op=0|1 (rot=0 is the opacity-only control). Pair it with -RenderTargetProbe. Its default
+# image is doge-servo.jpg, referenced relatively, so the two go together.
+Copy-Item (Join-Path $repo "tests\html\wall_rotate_opacity_probe.html") (Join-Path $pages "html") -Force -EA SilentlyContinue
+Copy-Item (Join-Path $repo "tests\html\doge-servo.jpg") (Join-Path $pages "html") -Force -EA SilentlyContinue
 
 # rAF 시계 대조 프로브. 표출 페이지의 영역 회전은 rAF 콜백 안에서 인라인 transform 을 매
 # 프레임 다시 쓰는 구조인데, 같은 페이지를 Chrome 은 single tile 에서 60fps 로 돌리고
@@ -246,7 +252,11 @@ $eyeProbes = @(
     "ticker_webgl_mix_probe.html",
     # ★`ticker_webgl_mix_probe.html?gl=iframe` 이 이것을 상대 경로로 참조한다.★ 빠지면
     # 404 가 아니라 ***빈 iframe*** 이 되어, 캔버스가 없는 런을 있는 런으로 착각한다.
-    "wall_webgl2_min_triangle.html"
+    "wall_webgl2_min_triangle.html",
+    # (2026-11-12) rotate + opacity probe and the image it loads by relative path. A missing
+    # image is not a 404 on screen but an empty box -- the surface the run is about vanishes.
+    "wall_rotate_opacity_probe.html",
+    "doge-servo.jpg"
 )
 $missingProbes = $eyeProbes | Where-Object { -not (Test-Path (Join-Path $pages "html\$_")) }
 if ($missingProbes) {
