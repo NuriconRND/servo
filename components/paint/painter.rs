@@ -2691,7 +2691,7 @@ impl Painter {
             .install_paint_animations(display_list_info.paint_animations);
         // ★DL 도착 간격을 센다.★ 근거는 `note_display_list_arrival` 의 doc 주석 -- 요점은
         // `LOCKTAIL` 의 `phase` 분모가 이 간격이고, 그 값을 세는 곳이 없었다는 것이다.
-        note_display_list_arrival(pipeline_id);
+        note_display_list_arrival(self.painter_id, pipeline_id);
 
         let mut transaction = Transaction::new();
         let is_root_pipeline = Some(pipeline_id.into()) == webview_renderer.root_pipeline_id;
@@ -3887,38 +3887,55 @@ pub(crate) enum PaintMetricState {
 /// 호출당 시계 하나와 원자 넷, 리포트는 60 회마다 한 줄이다.
 /// `handle_new_display_list` 는 이미 트랜잭션을 만들어 WR 로 보내는 무거운 경로이므로,
 /// 여기의 I/O 는 2026-10-27 규칙이 금지하는 "프레임마다 도는 경로" 가 아니다.
-fn note_display_list_arrival(pipeline_id: impl std::fmt::Debug) {
+fn note_display_list_arrival(painter_id: PainterId, pipeline_id: impl std::fmt::Debug) {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static LAST_AT_US: AtomicU64 = AtomicU64::new(0);
-    static SUM_MS: AtomicU64 = AtomicU64::new(0);
-    static MIN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
-    static MAX_MS: AtomicU64 = AtomicU64::new(0);
-    static COUNT: AtomicU64 = AtomicU64::new(0);
+    /// painter 슬롯 수의 상한. 벽은 넷이지만 여유를 둔다.
+    const SLOTS: usize = 8;
+
+    // ★painter 별로 나눈다.★ 앞 판은 전역 원자 하나였고, 그래서 ***fan-out 형제들 사이
+    // 간격***이 섞였다 -- `Paint::handle_new_display_list` 가 한 DL 을 네 painter 에
+    // 브로드캐스트하므로(paint.rs:2826) 간격 넷 중 셋이 구조적으로 sub-ms 이고, `avg` 가
+    // 실제 주기의 ***1/4*** 로 나왔다. 그 값을 보고 "프레임당 2~4 개" 라고 보고했는데
+    // 실제로는 0.6~1.0 개다(2026-11-12, log_webgl_perf_01/48).
+    static LAST_AT_US: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static SUM_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MIN_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(u64::MAX) }; SLOTS];
+    static MAX_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static COUNT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
+    let slot = (webrender_api::IdNamespace::from(painter_id).0 as usize) % SLOTS;
+    let (last_at_us, sum_ms, min_ms, max_ms, count) = (
+        &LAST_AT_US[slot],
+        &SUM_MS[slot],
+        &MIN_MS[slot],
+        &MAX_MS[slot],
+        &COUNT[slot],
+    );
+
     let now_us = ORIGIN.elapsed().as_micros() as u64;
-    let last_us = LAST_AT_US.swap(now_us, Ordering::Relaxed);
+    let last_us = last_at_us.swap(now_us, Ordering::Relaxed);
     if last_us == 0 {
         // 첫 도착은 간격이 없다.
         return;
     }
     let since_ms = (now_us.saturating_sub(last_us)) / 1000;
-    SUM_MS.fetch_add(since_ms, Ordering::Relaxed);
-    MIN_MS.fetch_min(since_ms, Ordering::Relaxed);
-    MAX_MS.fetch_max(since_ms, Ordering::Relaxed);
+    sum_ms.fetch_add(since_ms, Ordering::Relaxed);
+    min_ms.fetch_min(since_ms, Ordering::Relaxed);
+    max_ms.fetch_max(since_ms, Ordering::Relaxed);
 
-    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 60 != 0 {
         return;
     }
-    let count = COUNT.swap(0, Ordering::Relaxed).max(1);
+    let n = count.swap(0, Ordering::Relaxed).max(1);
     warn!(
-        "DLARRIVE n={count} interval(avg={}ms min={}ms max={}ms) since_last={since_ms}ms \
-         pipeline={pipeline_id:?}",
-        SUM_MS.swap(0, Ordering::Relaxed) / count,
-        MIN_MS.swap(u64::MAX, Ordering::Relaxed),
-        MAX_MS.swap(0, Ordering::Relaxed),
+        "DLARRIVE painter={painter_id:?} n={n} interval(avg={}ms min={}ms max={}ms) \
+         since_last={since_ms}ms pipeline={pipeline_id:?}",
+        sum_ms.swap(0, Ordering::Relaxed) / n,
+        min_ms.swap(u64::MAX, Ordering::Relaxed),
+        max_ms.swap(0, Ordering::Relaxed),
     );
 }
 
