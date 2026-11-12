@@ -1557,7 +1557,30 @@ impl WebGLThread {
         // ★키가 없는 유일한 지점★: 디바이스를 지금 만드는 중이라 어느 ANGLE 디바이스를
         // 건드릴지 아직 모른다. `None` 은 전량 배타이므로 예전 전역 락과 같게 동작한다.
         // 캔버스당 한 번뿐이라 비용은 없다.
-        let _angle_gl_guard = paint_api::angle_gl_lock(None);
+        // ★배타는 디바이스를 얻는 동안만.★ 2026-11-12, log_webgl_perf_01/45.
+        //
+        // 앞 판은 이 함수 ***전체***(약 160 줄)를 전량 배타로 덮었고, 거기에는 190MB
+        // 서피스 생성(`swap_chain.resize`)과 190MB `clear_surface` 가 들어 있었다. 실측에서
+        // 그 구간이 ★21~26ms★ 였고, 같은 런의 `PAINTGAP` 네 값이 소수점까지 같았다 --
+        // 네 painter 가 이 락 하나를 동시에 기다렸다는 뜻이다. `render()` 안에
+        // `pump_paint_animation(PumpSource::Render)` 이 있으므로 그 동안 ***어느 타일도
+        // 전환을 진행하지 못한다***. 운영자가 본 "전환 애니메이션 시작간 멈칫" 이 이것이다.
+        //
+        // 전량 배타의 근거는 "무엇을 건드리는지 모르므로" 였다(`paint_api::angle_gl_lock` 의
+        // doc). 그런데 ***디바이스를 손에 들면 알 수 있다*** -- 아래 `device` 의
+        // `native_device().d3d11_device` 가 곧 그 키다.
+        //
+        // 그래서 배타는 `get_or_create_device_for_painter` 를 감싸는 데까지만 쓴다. 그 함수는
+        // `create_isolated_device` 를 부를 수 있고, 새 D3D11 디바이스를 여는 동안 다른
+        // 디바이스가 GL 을 만지면 ANGLE 내부 상태가 깨진다 -- 그 함수 주석의 근거다.
+        // 디바이스가 이미 있으면 맵 조회 하나로 끝난다.
+        let device = {
+            let _exclusive = paint_api::angle_gl_lock(None);
+            self.get_or_create_device_for_painter(painter_id)
+        };
+        // 이제부터는 ★이 디바이스만★ 건드린다 -- 네 백엔드가 서로 다른 디바이스이므로, 한
+        // 백엔드의 190MB 작업이 다른 세 타일의 전환을 멈추지 않는다.
+        let _angle_gl_guard = paint_api::angle_gl_lock(angle_device_key_of(&device));
         let painter_surfman_details = self
             .painter_surfman_details_map
             .get(painter_id)
@@ -1583,7 +1606,6 @@ impl WebGLThread {
             flags,
         };
 
-        let device = self.get_or_create_device_for_painter(painter_id);
         let context_descriptor = device
             .create_context_descriptor(context_attributes)
             .map_err(|err| format!("Failed to create context descriptor: {:?}", err))?;
@@ -4872,6 +4894,24 @@ fn flip_pixels_y(
 }
 
 // Clamp a size to the current GL context's max viewport
+/// 디바이스에서 바로 ANGLE 락 키를 얻는다.
+///
+/// `WebGLThread::angle_device_key` 는 `contexts` 맵을 거치는데, 컨텍스트를 ***만드는
+/// 중***에는 그 맵에 아직 없다. 디바이스를 손에 들고 있으면 같은 값을 직접 물어볼 수 있다.
+///
+/// 다른 플랫폼에서는 `None` 이고, 그러면 `angle_gl_lock` 이 전량 배타를 잡아 예전 동작과
+/// 같아진다(그 함수의 doc 주석이 적어 둔 성질이다). 2026-11-12.
+fn angle_device_key_of(device: &Device) -> Option<usize> {
+    let _ = device;
+    #[cfg(all(target_os = "windows", feature = "no-wgl"))]
+    {
+        let pointer = device.native_device().d3d11_device as usize;
+        (pointer != 0).then_some(pointer)
+    }
+    #[cfg(not(all(target_os = "windows", feature = "no-wgl")))]
+    None
+}
+
 fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
     let mut max_viewport = [i32::MAX, i32::MAX];
     let mut max_renderbuffer = [i32::MAX];
