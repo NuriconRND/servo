@@ -1810,7 +1810,7 @@ impl WebGLThread {
                     // 초기화돼 있어야 한다 -- 안 그러면 안 쓰는 영역에 쓰레기가 남고,
                     // 타일 경계의 필터링이 그것을 끌어올 수 있다. 프레임마다가 아니라
                     // 리사이즈 때 한 번이므로 비용도 문제가 아니다.
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color, None)
                     .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
             } else {
                 error!("Failed to find swap chain");
@@ -2457,9 +2457,24 @@ impl WebGLThread {
                     // ★clear 실패도 삼키지 않고 넘어간다.★ 근거는 위 `swap_buffers` 의
                     // 주석과 같다 -- 지우지 못한 프레임은 묵은 그림이 남을 뿐이고, 스레드가
                     // 죽는 것과는 비교가 되지 않는다.
-                    if let Err(error) =
-                        swap_chain.clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
-                    {
+                    // ★타일 영역만 지울 수 있다★(`gfx_wall_webgl_tile_scissor_clear`,
+                    // 기본 꺼짐). 이 백엔드는 자기 타일만 쓰므로 나머지를 지울 이유가
+                    // 없고, 벽에서 그 차이가 크다 -- 서피스 한 장이 199MB 이고 백엔드가
+                    // 넷이다.
+                    //
+                    // ★셰이딩 scissor 와 같은 사각형을 쓴다★(`want_tile_scissor`). 그래서
+                    // 지우는 영역과 그리는 영역이 정확히 같고 둘이 어긋날 수 없다. 근거는
+                    // 그 pref 의 doc 주석 -- 요점은 2026-11-10 에 제거된 이유(scissor 가
+                    // 틀렸다)가 `lead 8` 실기 확인으로 사라졌다는 것이다.
+                    let clear_scissor = want_tile_scissor
+                        .filter(|_| webrender::wall_canvas_rect::tile_clear());
+                    if let Err(error) = swap_chain.clear_surface(
+                        &data.device,
+                        &mut data.ctx,
+                        &data.gl,
+                        clear_color,
+                        clear_scissor,
+                    ) {
                         note_swap_failure(surface_id, "clear_surface", &format!("{error:?}"));
                     }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);

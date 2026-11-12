@@ -801,6 +801,9 @@ impl Painter {
         // 는 벽 틱과 렌더 양쪽에서 불려 painter 마다 120/s 로 도는데, 거기서 `pref!` 를
         // 치면 네 painter 스레드가 초당 480 번 전역 `RwLock` 을 잡는다 -- 계측을 전부
         // 걷어낸 2026-10-27 규칙이 금지하는 형태다. 바로 위 `set_max_age_ms` 와 같은 패턴.
+        webrender::wall_canvas_rect::set_tile_clear(servo_config::pref!(
+            gfx_wall_webgl_tile_scissor_clear
+        ));
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,

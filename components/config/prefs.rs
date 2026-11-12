@@ -849,6 +849,33 @@ pub struct Preferences {
     /// ★검증은 `WALLCANVASRECT` 로그다.★ 두 출처를 나란히 찍고 `same`/`DIFFER` 를 붙인다.
     /// 정지 상태에서 `same` 이면 변환이 맞고, 전환 중에만 `DIFFER` 면 그것이 이 기능이
     /// 노리는 차이다.
+    /// swap 뒤의 clear 를 ★타일 영역만★ 하게 한다. 기본 꺼짐.
+    ///
+    /// ## 이력 (2026-11-12)
+    ///
+    /// `e9e28284b31` 로 들어왔다가 2026-11-10 에 제거됐다. 제거 근거는 운영자 평가였다 --
+    /// "scissor 가 제대로 이루어지지 않는 영역이 검은색 혹은 단색이 아니면 시각적으로
+    /// 혼동만 일으킬 뿐이다. 사실 성능 향상이 있는지도 잘 모르겠음." 그때는 scissor 자체가
+    /// 틀렸다.
+    ///
+    /// 지금은 다르다 -- `lead 8` 에서 `gear` 전환까지 띠가 사라진 것을 39 번 실기가
+    /// 확인했다. 즉 ★지우는 영역과 그리는 영역이 같다는 전제가 성립한다.★ 셰이딩에 쓰는
+    /// 것과 ***같은 사각형***을 쓰므로 둘이 어긋날 수 없다.
+    ///
+    /// ## 무엇을 재려는 것인가
+    ///
+    /// `LOCKTAIL` 의 꼬리(캔버스 서피스 획득 >= 8ms, 최대 82ms)를 쫓는 중이고, 생산자가
+    /// keyed mutex 를 잡고 있는 구간에 ***프레임마다 199MB clear*** 가 들어 있다
+    /// (`chains.rs::swap_buffers` 의 bind 와 다음 swap 의 unbind 사이).
+    ///
+    /// ★다만 산술은 그 가설에 반한다★: 11520x4320x4 = 199MB 를 448GB/s 대역폭으로 나누면
+    /// 0.44ms 이고, depth+stencil 까지 더해도 1~2ms 다. 수십 ms 가 될 수 없다. 그래서 이
+    /// 플래그는 ★그 가설을 기각하기 위한 것★ 이기도 하다 -- 켜고 끈 차이가 0 이면 clear 가
+    /// 원인이 아님이 확정된다.
+    ///
+    /// `gfx_wall_webgl_tile_scissor_from_webrender` 가 꺼져 있으면 이 값도 무효다(걸 사각형
+    /// 자체가 없다).
+    pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
 
     /// WR 이 적어 둔 사각형을 몇 ms 까지 쓸지. 그보다 오래됐으면 ★없는 것으로 보고★ 기존
@@ -1696,6 +1723,7 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
+            gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_canvas_scissor_lead_periods: 4,

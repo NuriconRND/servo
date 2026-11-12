@@ -133,6 +133,24 @@ fn union_boxes(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
 /// `servo-config` 에 의존하지 않는다(설정 표면 규약).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// swap 뒤 clear 를 타일 영역만 할지(`gfx_wall_webgl_tile_scissor_clear`).
+///
+/// ★원자인 이유★: 이 값을 읽는 자리가 `handle_swap_buffers` 안이고 프레임당 painter 수만큼
+/// 돈다(240/s). 거기서 `pref!` 를 치면 전역 `RwLock` 을 그만큼 잡는다 -- 계측을 전부 걷어낸
+/// 2026-10-27 규칙이 금지하는 형태다. `ENABLED`/`MAX_AGE_MS` 와 같은 축이므로 같은 자리에
+/// 둔다. 2026-11-12.
+static TILE_CLEAR: AtomicBool = AtomicBool::new(false);
+
+/// `paint` 가 pref 를 보고 세운다. 근거는 `TILE_CLEAR` 의 doc 주석.
+pub fn set_tile_clear(enabled: bool) {
+    TILE_CLEAR.store(enabled, Ordering::Relaxed);
+}
+
+/// swap 뒤 clear 를 타일 영역만 할지. 비용은 ★원자 로드 하나★ 다.
+pub fn tile_clear() -> bool {
+    TILE_CLEAR.load(Ordering::Relaxed)
+}
+
 type Map = HashMap<(u32, ImageKey), CanvasTileRect>;
 
 fn map() -> &'static Mutex<Map> {
