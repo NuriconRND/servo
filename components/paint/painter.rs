@@ -802,6 +802,9 @@ impl Painter {
         webrender::wall_rt_reuse::set_enabled(servo_config::pref!(
             gfx_wr_render_target_reuse_larger
         ));
+        webrender::wall_rt_reuse::set_keep_frames(
+            servo_config::pref!(gfx_wr_render_target_keep_frames).max(0) as u64,
+        );
         // ★유효기간도 여기서 원자에 싣는다.★ 소비자(WebGL 스레드)는 캔버스 프레임마다
         // painter 수만큼 이 값을 읽으므로, 거기서 `pref!`(전역 RwLock)을 치면 안 된다 --
         // 계측을 전부 걷어낸 2026-10-27 규칙이다.

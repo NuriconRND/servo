@@ -2029,6 +2029,8 @@ impl ResourceCache {
 
         let mut size = size;
         if let Some(shared) = reuse_larger {
+            // ★2026-11-12★ GC 가 공유 타깃을 포락선 후보에서 빼려면 그 크기를 알아야 한다.
+            crate::wall_rt_reuse::note_shared_size(shared);
             let current_frame_id = self.current_frame_id;
             let view = |target: &RenderTarget| crate::wall_rt_reuse::PoolEntry {
                 width: target.size.width,
@@ -2050,7 +2052,11 @@ impl ResourceCache {
                     crate::wall_rt_probe::note_reuse_larger();
                     return target.texture_id;
                 }
-                crate::wall_rt_reuse::Pick::Allocate { width, height } => {
+                crate::wall_rt_reuse::Pick::Allocate { width, height, cold } => {
+                    if cold {
+                        // ★2026-11-12★ 후보가 하나도 없었다 -- 포락선이 GC 로 사라진 뒤일 수 있다.
+                        crate::wall_rt_probe::note_cold_miss();
+                    }
                     size = DeviceIntSize::new(width, height);
                     // 포락선에 들어가는 쉬는 전용 타깃을 푼다 -- 남기면 GC 가 포락선을
                     // 버리는 구간이 생긴다(`wall_rt_reuse::supersedes`).
@@ -2141,7 +2147,24 @@ impl ResourceCache {
         // We can't just use retain() because `RenderTarget` requires manual cleanup.
         let mut retained_targets = SmallVec::<[RenderTarget; 8]>::new();
 
-        for target in self.render_target_pool.drain(..) {
+        // ★2026-11-12★ 포맷마다 가장 큰 전용 타깃(포락선)은 `keep_frames` 동안 64 MB 임계로는
+        // 버리지 않는다 -- 근거는 `wall_rt_reuse.rs` 의 "포락선을 GC 에서 지킨다". 공유 크기를
+        // 아직 모르거나(전용 요청이 없었다) 재사용이 꺼져 있으면 upstream 그대로다.
+        let keep_frames = crate::wall_rt_reuse::keep_frames();
+        let shared = crate::wall_rt_reuse::shared_size();
+        let keeping = keep_frames > 0 && shared > 0 && crate::wall_rt_reuse::is_enabled();
+        let envelopes = if keeping {
+            crate::wall_rt_reuse::envelopes(
+                self.render_target_pool
+                    .iter()
+                    .map(|t| (t.size.width, t.size.height, t.format as u32)),
+                shared,
+            )
+        } else {
+            crate::wall_rt_reuse::Envelopes::default()
+        };
+
+        for (index, target) in self.render_target_pool.drain(..).enumerate() {
             assert!(!target.is_active);
 
             // Drop oldest textures until we are under the allowed size threshold.
@@ -2152,8 +2175,20 @@ impl ResourceCache {
             let above_threshold = rt_pool_size_in_bytes > total_bytes_threshold;
             let used_recently = target.used_recently(self.current_frame_id, frames_threshold);
             let used_this_frame = target.last_frame_used == self.current_frame_id;
+            let kept_as_envelope = keeping &&
+                crate::wall_rt_reuse::gc_keeps(
+                    envelopes.contains(index),
+                    target.used_recently(self.current_frame_id, keep_frames),
+                    above_red_line,
+                );
+            if kept_as_envelope && above_threshold && !used_recently {
+                // 이 줄이 없었다면 GC 가 버렸을 것이다.
+                crate::wall_rt_probe::note_gc_spared();
+            }
 
-            if !used_this_frame && (above_red_line || (above_threshold && !used_recently)) {
+            if !used_this_frame &&
+                (above_red_line || (above_threshold && !used_recently && !kept_as_envelope))
+            {
                 rt_pool_size_in_bytes -= target.size_in_bytes();
                 // ★2026-11-12 RTPROBE★ -- 버린 것이 다시 필요해지면 새로 만든다.
                 crate::wall_rt_probe::note_gc_free(target.size_in_bytes());

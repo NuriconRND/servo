@@ -67,6 +67,11 @@ static REUSE_LARGER: AtomicU64 = AtomicU64::new(0);
 /// ★2026-11-12★ 포락선을 새로 만들며 대체해 푼 수와 바이트(`wall_rt_reuse.rs` 2 번).
 static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
 static SUPERSEDED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// ★2026-11-12★ 새 할당 중 후보가 하나도 없던 것(`wall_rt_reuse::Pick::Allocate::cold`).
+/// 포락선이 GC 로 사라진 뒤 다시 키우는 사슬의 첫 할당이 이것이다.
+static COLD_MISSES: AtomicU64 = AtomicU64::new(0);
+/// ★2026-11-12★ GC 가 버렸을 것을 포락선이라서 남긴 횟수(GC 가 도는 프레임마다 센다).
+static GC_SPARED: AtomicU64 = AtomicU64::new(0);
 /// 풀 GC 가 버린 수와 바이트.
 static GC_FREES: AtomicU64 = AtomicU64::new(0);
 static GC_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -159,6 +164,24 @@ pub fn note_superseded(bytes: usize) {
     SUPERSEDED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
+/// 후보가 하나도 없는 상태에서 새로 만들었다.
+#[inline]
+pub fn note_cold_miss() {
+    if !is_enabled() {
+        return;
+    }
+    COLD_MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// GC 가 포락선이라서 남겼다.
+#[inline]
+pub fn note_gc_spared() {
+    if !is_enabled() {
+        return;
+    }
+    GC_SPARED.fetch_add(1, Ordering::Relaxed);
+}
+
 /// 풀 GC 가 렌더 타깃 하나를 버렸다.
 #[inline]
 pub fn note_gc_free(bytes: usize) {
@@ -211,6 +234,8 @@ struct Snapshot {
     reuse_larger: u64,
     superseded: u64,
     superseded_bytes: u64,
+    cold: u64,
+    spared: u64,
     gc_frees: u64,
     gc_bytes: u64,
     creates: u64,
@@ -230,6 +255,8 @@ impl Snapshot {
             reuse_larger: REUSE_LARGER.load(Ordering::Relaxed),
             superseded: SUPERSEDED.load(Ordering::Relaxed),
             superseded_bytes: SUPERSEDED_BYTES.load(Ordering::Relaxed),
+            cold: COLD_MISSES.load(Ordering::Relaxed),
+            spared: GC_SPARED.load(Ordering::Relaxed),
             gc_frees: GC_FREES.load(Ordering::Relaxed),
             gc_bytes: GC_FREE_BYTES.load(Ordering::Relaxed),
             creates: RT_CREATES.load(Ordering::Relaxed),
@@ -262,8 +289,8 @@ fn report(elapsed: Duration, now: &Snapshot, previous: &Snapshot) {
         format!("{:.3}", min_milli as f64 / 1000.0)
     };
     warn!(
-        "RTPROBE t={:.0}s w:dedicated={} w:miss={} ({:.0}MB) w:reuse_larger={} \
-         w:superseded={} ({:.0}MB) w:gc_free={} ({:.0}MB) \
+        "RTPROBE t={:.0}s w:dedicated={} w:miss={} ({:.0}MB) w:cold={} w:reuse_larger={} \
+         w:superseded={} ({:.0}MB) w:spared={} w:gc_free={} ({:.0}MB) \
          w:create={} ({:.1}ms) w:delete={} ({:.1}ms) w:limited={} | \
          total shared={} dedicated={} max_dim={} miss={} ({:.0}MB) gc_free={} ({:.0}MB) \
          create={} ({:.1}ms, max {:.2}ms) delete={} ({:.1}ms, max {:.2}ms) \
@@ -272,9 +299,11 @@ fn report(elapsed: Duration, now: &Snapshot, previous: &Snapshot) {
         now.dedicated - previous.dedicated,
         now.misses - previous.misses,
         mib(now.miss_bytes - previous.miss_bytes),
+        now.cold - previous.cold,
         now.reuse_larger - previous.reuse_larger,
         now.superseded - previous.superseded,
         mib(now.superseded_bytes - previous.superseded_bytes),
+        now.spared - previous.spared,
         now.gc_frees - previous.gc_frees,
         mib(now.gc_bytes - previous.gc_bytes),
         now.creates - previous.creates,

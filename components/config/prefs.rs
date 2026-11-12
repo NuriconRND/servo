@@ -570,6 +570,16 @@ pub struct Preferences {
     /// 10 초에 54~56 개, 그 조건에서만 렌더가 한 주기를 넘김). 런처의 되돌리기 스위치는
     /// `-NoRenderTargetReuse`. ★벽에서는 아직 검증 전이다.★
     pub gfx_wr_render_target_reuse_larger: bool,
+    /// ★2026-11-12 추가★ -- 위 재사용이 켜져 있을 때, 포맷마다 가장 큰 전용 렌더 타깃(포락선)을
+    /// 이 프레임 수 동안 안 쓰여도 64 MB 임계 GC 로는 버리지 않는다(320 MB 레드라인에서는
+    /// 버린다). 0 이면 upstream 의 60 프레임 규칙만 남는다. 기본 1800 = 60 Hz 에서 30 초.
+    ///
+    /// 근거: 벽 런(log_rotation_opacity_judder_01/01, `60c1bfd9a5a`)에서 재사용만으로는 10 초
+    /// 창마다 새 할당 19~20 이 남았고 그것이 "GC 해제 4~5 + 대체 해제 15" 와 맞았다 -- 이동하는
+    /// 이미지가 타일을 1 초 넘게 떠나면 포락선을 GC 가 버리고, 돌아올 때 다시 키운다.
+    /// `vendor_local/webrender/src/wall_rt_reuse.rs` 의 "포락선을 GC 에서 지킨다" 참고.
+    /// 런처는 `-RenderTargetKeepFrames <n>`.
+    pub gfx_wr_render_target_keep_frames: i64,
 
     pub gfx_wall_parallel_tiles: bool,
     /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
@@ -1705,6 +1715,7 @@ impl Preferences {
             gfx_paint_side_animation_mesh_probe: false,
             gfx_wr_render_target_probe: false,
             gfx_wr_render_target_reuse_larger: true,
+            gfx_wr_render_target_keep_frames: 1800,
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,

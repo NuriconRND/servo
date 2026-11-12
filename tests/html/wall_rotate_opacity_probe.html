@@ -22,6 +22,16 @@
     ?dur=MS     한 바퀴 시간 (기본 12000)
     ?opmin=F    opacity 의 가장 낮은 값 (기본 0.4)
     ?rot=0      회전을 끈다 -- opacity 만 남기는 대조군
+    ?tx=F       (2026-11-12 추가) 한 바퀴 동안 가로로 F 뷰포트 폭만큼 갔다 온다 (기본 0 = 제자리).
+                벽 런(log_rotation_opacity_judder_01/01)의 실제 구성은 회전+이동+opacity 였고,
+                이동하는 이미지가 타일을 1 초 넘게 떠나면 GC 가 그 painter 의 포락선을 버렸다.
+                개발 장비에서 그 "떠남" 을 만들려면 상자가 화면 밖으로 완전히 나가야 한다 --
+                w=1.6&h=3.2 상자는 tx=2 면 주기의 약 1/3 동안 화면 밖이다.
+    ?companion=1  (2026-11-12 추가) 왼쪽 아래에 자식 둘을 가진 작은 상자를 두고 opacity 를 돌린다.
+                그 중간 surface 는 2048 안이라 ★공유 렌더 타깃(2048x2048 RGBA, 16 MB)★ 을 매
+                프레임 쓴다. 벽 로그에는 공유 타깃이 늘 있었고(total shared=1956) 그래서 풀이
+                64 MB 를 넘어 GC 가 돌았다. 이 페이지만으로는 공유 타깃이 없어(shared=0) 풀이
+                포락선 하나뿐이라 GC 가 돌지 않는다 -- 그 차이를 메운다.
     ?img=URL    이미지 (기본 doge-servo.jpg)
 
   크기를 비율로 받는 이유: 같은 URL 이 개발 장비(3840x1080 타일 하나)와 벽(5760x2160 타일 넷)
@@ -37,13 +47,17 @@
 </style>
 <div id="label"></div>
 <div id="box"><img alt=""></div>
+<div id="companion" style="display: none; position: absolute; left: 40px; bottom: 40px; width: 360px; height: 240px;">
+  <div style="position: absolute; left: 0; top: 0; width: 240px; height: 160px; background: #3a7;"></div>
+  <div style="position: absolute; left: 120px; top: 80px; width: 240px; height: 160px; background: #a53;"></div>
+</div>
 <script>
   const q = new URLSearchParams(location.search);
   const num = (k, d) => { const v = Number(q.get(k)); return q.has(k) && Number.isFinite(v) ? v : d; };
   const op = q.get("op") !== "0";
   const rot = q.get("rot") !== "0";
   const w = num("w", 0.6), h = num("h", 0.9), cx = num("x", 0.5), cy = num("y", 0.5);
-  const dur = num("dur", 12000), opmin = num("opmin", 0.4);
+  const dur = num("dur", 12000), opmin = num("opmin", 0.4), tx = num("tx", 0);
 
   const vw = innerWidth, vh = innerHeight;
   const box = document.getElementById("box");
@@ -55,18 +69,29 @@
   box.querySelector("img").src = q.get("img") || "doge-servo.jpg";
 
   // poseTransform 과 같은 모양. 포즈 = 영역 상자이므로 중심 50%, 배율 1.
-  const tf = (deg) => `translate(50%, 50%) rotate(${deg}deg) scale(1, 1) translate(-50%, -50%)`;
-  box.style.transform = tf(0);
+  // tx 가 있으면 맨 앞에 가로 이동 하나를 더한다 -- 키프레임마다 함수 목록이 같아야 한다.
+  const tf = (deg, dx) => (tx ? `translate(${dx}px, 0px) ` : "") +
+    `translate(50%, 50%) rotate(${deg}deg) scale(1, 1) translate(-50%, -50%)`;
+  box.style.transform = tf(0, 0);
 
-  const frame = (deg, o) => {
+  const frame = (deg, o, dx) => {
     const f = {};
-    if (rot) f.transform = tf(deg);
+    if (rot || tx) f.transform = tf(rot ? deg : 0, dx);
     if (op) f.opacity = o;
     return f;
   };
-  const frames = [frame(0, 1), frame(180, opmin), frame(360, 1)];
+  const far = Math.round(vw * tx);
+  const frames = [frame(0, 1, 0), frame(180, opmin, far), frame(360, 1, 0)];
   box.animate(frames, { duration: dur, iterations: Infinity, easing: "linear", fill: "both" });
 
+  const companion = q.get("companion") === "1";
+  if (companion) {
+    const c = document.getElementById("companion");
+    c.style.display = "block";
+    c.animate([{ opacity: 1 }, { opacity: 0.5 }, { opacity: 1 }],
+      { duration: 2000, iterations: Infinity, easing: "linear" });
+  }
+
   document.getElementById("label").textContent =
-    `rotate+opacity probe  op=${op ? 1 : 0} rot=${rot ? 1 : 0}  box=${bw}x${bh} in ${vw}x${vh}  dur=${dur}ms opmin=${opmin}`;
+    `rotate+opacity probe  op=${op ? 1 : 0} rot=${rot ? 1 : 0}  box=${bw}x${bh} in ${vw}x${vh}  dur=${dur}ms opmin=${opmin} tx=${tx} companion=${companion ? 1 : 0}`;
 </script>
