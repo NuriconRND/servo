@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wall rotate + opacity probe</title>
+<!--
+  2026-11-12 추가. "회전 + opacity 복합 애니메이션의 judder" (작업 #2) 를 엔진만으로 가르는 페이지.
+
+  운영자 관찰(2026-11-09, log_webgl_perf_01/16): 복합채널 이미지에 회전만 걸면 judder 가 없고,
+  같은 애니메이션에 opacity 변화를 더하면 judder 가 난다.
+
+  ★출력 페이지의 영역 상자(`RegionBox.tsx`)를 그대로 흉내 낸다★ -- 절대 위치, overflow: hidden,
+  transform-origin 왼쪽 위, `translate(cx%, cy%) rotate() scale() translate(-50%, -50%)` 네 함수
+  목록, 그리고 ***같은 요소에 WAAPI 하나***. opacity 는 그 키프레임에 실리거나 빠질 뿐이다
+  (`poseTrack.ts` 의 buildMotion 이 그렇게 만든다). 바꾸는 변수는 `op` 하나다.
+
+  ★rAF 도, 움직이는 HUD 도 없다★ -- 둘 다 틱 박자(`gfx_paint_side_animation_tick_divisor`)와
+  얽혀 비교를 흐린다. 왼쪽 위의 글은 정적이다.
+
+  쿼리 파라미터:
+    ?op=1|0     opacity 를 키프레임에 싣는가 (기본 1)
+    ?w=F ?h=F   영역 크기, 뷰포트 비율 (기본 0.6 x 0.9)
+    ?x=F ?y=F   영역 중심, 뷰포트 비율 (기본 0.5, 0.5)
+    ?dur=MS     한 바퀴 시간 (기본 12000)
+    ?opmin=F    opacity 의 가장 낮은 값 (기본 0.4)
+    ?rot=0      회전을 끈다 -- opacity 만 남기는 대조군
+    ?img=URL    이미지 (기본 doge-servo.jpg)
+
+  크기를 비율로 받는 이유: 같은 URL 이 개발 장비(3840x1080 타일 하나)와 벽(5760x2160 타일 넷)
+  에서 다 쓰인다. 기본값 0.6 x 0.9 는 개발 장비에서 2304x972, 벽에서 6912x3888 이다. 전용 렌더
+  타깃은 surface 가 2048 을 넘어야 생기고(공유 타깃 한계), 개발 장비에서는 회전 중 잘린 사각형이
+  그 문턱을 넘나든다.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #101418; overflow: hidden; }
+  #label { position: absolute; left: 16px; top: 12px; color: #9ab; font: 20px/1.3 sans-serif; }
+  #box { position: absolute; overflow: hidden; transform-origin: 0 0; }
+  #box img { display: block; width: 100%; height: 100%; object-fit: cover; }
+</style>
+<div id="label"></div>
+<div id="box"><img alt=""></div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const num = (k, d) => { const v = Number(q.get(k)); return q.has(k) && Number.isFinite(v) ? v : d; };
+  const op = q.get("op") !== "0";
+  const rot = q.get("rot") !== "0";
+  const w = num("w", 0.6), h = num("h", 0.9), cx = num("x", 0.5), cy = num("y", 0.5);
+  const dur = num("dur", 12000), opmin = num("opmin", 0.4);
+
+  const vw = innerWidth, vh = innerHeight;
+  const box = document.getElementById("box");
+  const bw = Math.round(vw * w), bh = Math.round(vh * h);
+  box.style.left = Math.round(vw * cx - bw / 2) + "px";
+  box.style.top = Math.round(vh * cy - bh / 2) + "px";
+  box.style.width = bw + "px";
+  box.style.height = bh + "px";
+  box.querySelector("img").src = q.get("img") || "doge-servo.jpg";
+
+  // poseTransform 과 같은 모양. 포즈 = 영역 상자이므로 중심 50%, 배율 1.
+  const tf = (deg) => `translate(50%, 50%) rotate(${deg}deg) scale(1, 1) translate(-50%, -50%)`;
+  box.style.transform = tf(0);
+
+  const frame = (deg, o) => {
+    const f = {};
+    if (rot) f.transform = tf(deg);
+    if (op) f.opacity = o;
+    return f;
+  };
+  const frames = [frame(0, 1), frame(180, opmin), frame(360, 1)];
+  box.animate(frames, { duration: dur, iterations: Infinity, easing: "linear", fill: "both" });
+
+  document.getElementById("label").textContent =
+    `rotate+opacity probe  op=${op ? 1 : 0} rot=${rot ? 1 : 0}  box=${bw}x${bh} in ${vw}x${vh}  dur=${dur}ms opmin=${opmin}`;
+</script>

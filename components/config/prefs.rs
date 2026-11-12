@@ -551,6 +551,15 @@ pub struct Preferences {
     /// ★꺼진 런의 비용은 `AtomicBool` 로드 하나다.★ 측정에 필요한 추가 샘플링도 그 분기
     /// 안에 있다.
     pub gfx_paint_side_animation_mesh_probe: bool,
+    /// ★2026-11-12 추가★ -- WebRender 렌더 타깃 풀의 전용 타깃 재할당과 중간 surface 의
+    /// `MAX_SURFACE_SIZE` 축소를 세는 프로브(기본 꺼짐). 10 초마다 `RTPROBE` 줄을 찍는다.
+    ///
+    /// 가설과 성능 규칙은 `vendor_local/webrender/src/wall_rt_probe.rs` 머리 주석에 있다.
+    /// 요지는 "회전 + opacity" 가 회전한 로컬 공간의 중간 surface 를 만들고, 그 크기가
+    /// 각도마다 달라 정확 일치 재사용만 하는 풀에서 새 텍스처를 계속 만든다는 것이다
+    /// (log_webgl_perf_01/16 운영자 관찰: 회전만이면 judder 없음, opacity 를 더하면 judder).
+    /// 런처 스위치는 `-RenderTargetProbe`. ★꺼진 런의 비용은 `AtomicBool` 로드 하나다.★
+    pub gfx_wr_render_target_probe: bool,
 
     pub gfx_wall_parallel_tiles: bool,
     /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
@@ -1684,6 +1693,7 @@ impl Preferences {
             gfx_paint_side_animation_horizon_ms: 3000,
             gfx_paint_side_animation_tick_divisor: 4,
             gfx_paint_side_animation_mesh_probe: false,
+            gfx_wr_render_target_probe: false,
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,

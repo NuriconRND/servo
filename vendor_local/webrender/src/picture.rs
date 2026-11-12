@@ -9054,6 +9054,8 @@ fn get_surface_rects(
         surface.raster_spatial_node_index = surface.surface_spatial_node_index;
         surface.device_pixel_scale = Scale::new(max_surface_size / max_dimension);
         surface.local_scale = (1.0, 1.0);
+        // ★2026-11-12 RTPROBE★ -- 회전 중이면 이 배율이 각도마다 다르다. `wall_rt_probe.rs`.
+        crate::wall_rt_probe::note_surface_limited(surface.device_pixel_scale.0);
 
         let add_markers = profiler::thread_is_being_profiled();
         if add_markers {

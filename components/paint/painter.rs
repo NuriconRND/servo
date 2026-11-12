@@ -773,6 +773,11 @@ impl Painter {
             crate::paint_animation_mesh_probe::start();
         }
 
+        // ★2026-11-12 렌더 타깃 풀 프로브★ -- 리포터는 webrender 안에 있고 한 번만 뜬다.
+        if pref!(gfx_wr_render_target_probe) {
+            webrender::wall_rt_probe::start();
+        }
+
         // ★프레임 발행 출처★ -- `gfx_wall_tick_phase_probe` 와 한 스위치를 쓴다(`-TickPhase`).
         // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
         if pref!(gfx_wall_tick_phase_probe) {

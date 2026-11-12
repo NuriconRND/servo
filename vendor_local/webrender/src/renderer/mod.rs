@@ -2071,9 +2071,17 @@ impl Renderer {
             // Now that we've saved as many deletions for reuse as we can, actually delete whatever is left.
             if !pending_deletes.is_empty() {
                 let delete_texture_start = zeitstempel::now();
-                for (texture, _) in pending_deletes {
+                // ★2026-11-12 RTPROBE★ -- 켜졌을 때만 렌더 타깃 삭제를 하나씩 잰다.
+                let rt_probe = crate::wall_rt_probe::is_enabled();
+                for (texture, info) in pending_deletes {
                     add_event_marker("TextureCacheFree");
-                    self.device.delete_texture(texture);
+                    if rt_probe && info.category == TextureCacheCategory::RenderTarget {
+                        let start = zeitstempel::now();
+                        self.device.delete_texture(texture);
+                        crate::wall_rt_probe::note_rt_delete(zeitstempel::now() - start);
+                    } else {
+                        self.device.delete_texture(texture);
+                    }
                 }
                 delete_cache_texture_time += zeitstempel::now() - delete_texture_start;
             }
@@ -2093,7 +2101,10 @@ impl Renderer {
                         //
                         // Ensure no PBO is bound when creating the texture storage,
                         // or GL will attempt to read data from there.
-                        let mut texture = reused_textures.pop_front().unwrap_or(None).unwrap_or_else(|| {
+                        let reused = reused_textures.pop_front().unwrap_or(None);
+                        // ★2026-11-12 RTPROBE★ -- 같은 배치의 삭제분을 재사용하면 새로 만든 것이 아니다.
+                        let created_new = reused.is_none();
+                        let mut texture = reused.unwrap_or_else(|| {
                             self.device.create_texture(
                                 info.target,
                                 info.format,
@@ -2127,7 +2138,11 @@ impl Renderer {
                             }
                         }
 
-                        create_cache_texture_time += zeitstempel::now() - create_cache_texture_start;
+                        let create_elapsed = zeitstempel::now() - create_cache_texture_start;
+                        create_cache_texture_time += create_elapsed;
+                        if created_new && info.category == TextureCacheCategory::RenderTarget {
+                            crate::wall_rt_probe::note_rt_create(create_elapsed);
+                        }
 
                         self.texture_resolver.texture_cache_map.insert(allocation.id, CacheTexture {
                             texture,

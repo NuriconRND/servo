@@ -2024,6 +2024,11 @@ impl ResourceCache {
 
         // Need to create a new render target and add it to the pool
 
+        // ★2026-11-12 RTPROBE★ -- 정확 일치가 없어 새로 만든다. `wall_rt_probe.rs` 참고.
+        crate::wall_rt_probe::note_pool_miss(
+            (size.width * size.height) as usize * format.bytes_per_pixel() as usize,
+        );
+
         let texture_id = self.texture_cache.alloc_render_target(
             size,
             format,
@@ -2104,6 +2109,8 @@ impl ResourceCache {
 
             if !used_this_frame && (above_red_line || (above_threshold && !used_recently)) {
                 rt_pool_size_in_bytes -= target.size_in_bytes();
+                // ★2026-11-12 RTPROBE★ -- 버린 것이 다시 필요해지면 새로 만든다.
+                crate::wall_rt_probe::note_gc_free(target.size_in_bytes());
                 self.texture_cache.free_render_target(target.texture_id);
             } else {
                 retained_targets.push(target);

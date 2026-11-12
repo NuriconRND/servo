@@ -466,6 +466,14 @@ impl RenderTaskGraphBuilder {
                                 RenderTargetKind::Alpha => ImageFormat::R8,
                             };
 
+                            // ★2026-11-12 RTPROBE★ -- 공유/전용 구분은 여기서만 알 수 있다.
+                            // 근거는 `wall_rt_probe.rs` 머리 주석.
+                            crate::wall_rt_probe::note_pool_request(
+                                !can_use_shared_surface,
+                                surface_size.width,
+                                surface_size.height,
+                            );
+
                             // Get render target of appropriate size and format from resource cache
                             let texture_id = resource_cache.get_or_create_render_target_from_pool(
                                 surface_size,
