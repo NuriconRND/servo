@@ -263,6 +263,91 @@ fn note_hold(ms: u64) {
     HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// scissor 사각형이 프레임 사이에 얼마나 급하게 변하는지. 꼬리(면적 >= 2 배 또는 <= 1/2)는
+/// 그때그때 한 줄, 나머지는 1200 변화마다 모아서 한 줄.
+///
+/// ## 왜 (2026-11-12)
+///
+/// 운영자 질문 -- "scissors 영역이 갑자기 급격하게 변경된다거나 텍스처가 새로 할당된다거나
+/// 하는 일이 일어나나?"
+///
+/// 텍스처 쪽은 답이 나왔다(전환당 `resize` 경로로 16 장, 11520x4321x4 = 199MB 씩). scissor
+/// 쪽은 지금 면적이 찍히지 않아 측정값이 없다. `SCISSORGATE` 가 주는 것은 적용률과 낡음
+/// (`stale`, `age_max` 1.2~1.3 초)뿐이다.
+///
+/// 바운스는 오버슈트 뒤 되돌아오므로 그 전환점에서 `union_over` 의 창 안 샘플이 양쪽으로
+/// 퍼진다. 그러면 union 이 급격히 커지고, 넓어지는 것 자체는 안전하지만 ***셰이딩 면적이
+/// 늘어난다.*** 그것이 "후반의 fps 저하" 와 맞는지를 이 계측이 가른다.
+///
+/// ## 비용
+///
+/// 변화가 있을 때만 들어온다(이미 있는 분기 안이다). 원자 셋과 곱셈 둘이다. 꼬리 줄은 면적이
+/// 2 배 이상 벌어질 때만 나온다.
+fn note_scissor_jump(was: Option<[i32; 4]>, now: Option<[i32; 4]>) {
+    static JUMPS: AtomicU64 = AtomicU64::new(0);
+    static GREW_2X: AtomicU64 = AtomicU64::new(0);
+    static SHRANK_2X: AtomicU64 = AtomicU64::new(0);
+    static FROM_NONE: AtomicU64 = AtomicU64::new(0);
+    static TO_NONE: AtomicU64 = AtomicU64::new(0);
+    static AREA_SUM: AtomicU64 = AtomicU64::new(0);
+    static AREA_MAX: AtomicU64 = AtomicU64::new(0);
+
+    let area = |r: [i32; 4]| (r[2].max(0) as u64) * (r[3].max(0) as u64);
+    let (old_area, new_area) = match (was, now) {
+        (Some(a), Some(b)) => (area(a), area(b)),
+        (None, Some(b)) => {
+            FROM_NONE.fetch_add(1, Ordering::Relaxed);
+            (0, area(b))
+        },
+        (Some(a), None) => {
+            TO_NONE.fetch_add(1, Ordering::Relaxed);
+            (area(a), 0)
+        },
+        (None, None) => return,
+    };
+    let nth = JUMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    AREA_SUM.fetch_add(new_area / 1_000_000, Ordering::Relaxed);
+    AREA_MAX.fetch_max(new_area / 1_000_000, Ordering::Relaxed);
+
+    // 2 배 이상 벌어진 경우만 꼬리로 본다. 0 과의 비교는 위에서 따로 세었다.
+    let big =
+        old_area > 0 && new_area > 0 && (new_area >= old_area * 2 || old_area >= new_area * 2);
+    if big {
+        if new_area > old_area {
+            GREW_2X.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SHRANK_2X.fetch_add(1, Ordering::Relaxed);
+        }
+        let t = surfman::platform::windows::angle::surface::transition_elapsed_ms();
+        let at = match t {
+            Some(ms) => format!("t=+{ms}ms"),
+            None => "t=n/a".to_owned(),
+        };
+        let mp = |a: u64| a as f64 / 1_000_000.0;
+        warn!(
+            "SCISSORJUMP #{nth} {at} area {:.1}Mpx -> {:.1}Mpx (x{:.2})",
+            mp(old_area),
+            mp(new_area),
+            new_area as f64 / old_area as f64
+        );
+    }
+
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "SCISSORJUMPS n={} grew2x={} shrank2x={} from_none={} to_none={} \
+         area(avg={}Mpx max={}Mpx)",
+        nth,
+        GREW_2X.load(Ordering::Relaxed),
+        SHRANK_2X.load(Ordering::Relaxed),
+        FROM_NONE.load(Ordering::Relaxed),
+        TO_NONE.load(Ordering::Relaxed),
+        AREA_SUM.load(Ordering::Relaxed) / nth,
+        AREA_MAX.load(Ordering::Relaxed),
+    );
+}
+
 fn note_scissor_gate(outcome: ScissorGate) {
     static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
@@ -1464,6 +1549,17 @@ impl WebGLThread {
             webgl_version, requested_size, attributes, target_painter_ids
         );
 
+        // 전환의 기준 시각을 여기로 옮긴다. 근거는 `surfman` 의 `mark_transition_epoch` doc.
+        //
+        // 운영자 질문(2026-11-12) -- "바운스 애니메이션 후반과(우->좌) 종료 직후에 무슨 일이
+        // 일어나는거지?" -- 에 답하려면 전환 수명 안의 상대 시각이 필요하고, `LOCKTAIL` 의
+        // `phase` 는 그 일을 못 한다(DL 빌드 시각을 0, 3 초 horizon 을 분모로 쓰므로 실측
+        // 130 건이 모두 0.014~0.050 에 갇혔다).
+        //
+        // 전환마다 새 WebGL 컨텍스트가 만들어지므로 여기가 전환의 시작에 가장 가깝다.
+        // 전환당 한 번, 원자 store 하나다.
+        surfman::platform::windows::angle::surface::mark_transition_epoch();
+
         // Creating a new GLContext may make the current bound context_id dirty.
         // Clear it to ensure that  make_current() is called in subsequent commands.
         self.bound_context_id = None;
@@ -1649,9 +1745,8 @@ impl WebGLThread {
         // ★두 칸 큐를 쓸지 세운다★ -- 근거는 `gfx_wall_webgl_deferred_front_buffer` 의 doc
         // 주석. 컨텍스트를 만들 때 한 번만 읽으므로 타이밍 경로가 아니고, pref 를 바꾸면
         // 다음 컨텍스트부터 적용된다(전환마다 새로 만들므로 곧 걸린다).
-        swap_chain.set_deferred_front_buffer(servo_config::pref!(
-            gfx_wall_webgl_deferred_front_buffer
-        ));
+        swap_chain
+            .set_deferred_front_buffer(servo_config::pref!(gfx_wall_webgl_deferred_front_buffer));
 
         debug!(
             "Created webgl backend context {:?} for painter {:?}/{:?}",
@@ -2379,6 +2474,8 @@ impl WebGLThread {
                     data.state.tile_scissor_surface = [0, 0, size.width, size.height];
                 }
                 if data.state.tile_scissor != want_tile_scissor {
+                    // 면적이 얼마나 급하게 변하는지 잰다. 근거는 `note_scissor_jump` 의 doc.
+                    note_scissor_jump(data.state.tile_scissor, want_tile_scissor);
                     data.state.tile_scissor = want_tile_scissor;
                     data.state.restore_scissor_invariant(&data.gl);
                 }
@@ -2472,8 +2569,8 @@ impl WebGLThread {
                     // 지우는 영역과 그리는 영역이 정확히 같고 둘이 어긋날 수 없다. 근거는
                     // 그 pref 의 doc 주석 -- 요점은 2026-11-10 에 제거된 이유(scissor 가
                     // 틀렸다)가 `lead 8` 실기 확인으로 사라졌다는 것이다.
-                    let clear_scissor = want_tile_scissor
-                        .filter(|_| webrender::wall_canvas_rect::tile_clear());
+                    let clear_scissor =
+                        want_tile_scissor.filter(|_| webrender::wall_canvas_rect::tile_clear());
                     if let Err(error) = swap_chain.clear_surface(
                         &data.device,
                         &mut data.ctx,

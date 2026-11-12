@@ -31,7 +31,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winapi::Interface;
 use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::shared::winerror::{self, S_OK};
@@ -237,6 +237,142 @@ static IMPORT_LIVE: AtomicU64 = AtomicU64::new(0);
 /// GPU 메모리가 안 내려올 때 가장 먼저 확인할 것이 free 가 정말 불렸는지이고, 지금까지
 /// 그것을 세는 곳이 없었다. 서피스 하나가 벽 크기면 190MB 라, 몇 개가 남았는지가 곧
 /// 몇 백 MB 인지다.
+/// 전환의 기준 시각. 새 WebGL 컨텍스트가 만들어질 때 옮겨진다.
+///
+/// `Instant` 는 원자에 담을 수 없으므로 프로세스 기준점으로부터의 ms 를 담는다. 0 은
+/// "아직 없음" 이다.
+static TRANSITION_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+/// `TRANSITION_EPOCH_MS` 가 세는 기준점.
+static TRANSITION_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// 전환의 기준 시각을 지금으로 옮긴다. 새 WebGL 컨텍스트를 만들 때 부른다.
+///
+/// ## 왜 컨텍스트인가 (2026-11-12)
+///
+/// 운영자 질문은 "바운스 후반과 종료 직후에 무슨 일이 일어나나" 이고, 그것을 보려면 전환
+/// 수명 안의 상대 시각이 필요하다. `LOCKTAIL` 의 `phase` 는 그 일을 못 한다 -- DL 빌드
+/// 시각을 0 으로, 3 초 horizon 을 분모로 쓰기 때문에 실측 130 건이 모두 0.014~0.050 에
+/// 갇혔다(근거는 `web_content_animation.rs::paint_animation_phase`).
+///
+/// DL 에 전환의 시작도 길이도 실려 있지 않으므로 대신 컨텍스트 수명을 쓴다. 운영자 관찰이
+/// "WebGL 구성끼리 전환할 때만 멈칫한다" 이므로 기준점도 그쪽이 맞다.
+pub fn mark_transition_epoch() {
+    let origin = *TRANSITION_ORIGIN.get_or_init(Instant::now);
+    let now_ms = origin.elapsed().as_millis() as u64;
+    // 0 은 "없음" 이므로 1 로 올린다. 1ms 의 오차는 이 계측의 관심사가 아니다.
+    TRANSITION_EPOCH_MS.store(now_ms.max(1), Ordering::Relaxed);
+}
+
+/// 지금이 전환 기준 시각으로부터 몇 ms 인지. 기준이 없으면 `None`.
+pub fn transition_elapsed_ms() -> Option<u64> {
+    let epoch = TRANSITION_EPOCH_MS.load(Ordering::Relaxed);
+    if epoch == 0 {
+        return None;
+    }
+    let origin = *TRANSITION_ORIGIN.get_or_init(Instant::now);
+    Some(origin.elapsed().as_millis().saturating_sub(epoch as u128) as u64)
+}
+
+/// 전환 수명의 어느 사분면에서 서피스가 만들어지고 파괴됐는지. `[<250, <750, <1500, 그 뒤]`.
+///
+/// 경계는 전환 애니메이션이 1.5 초 내외라는 관찰에 맞춘 고정값이다. 길이를 모르므로 비율이
+/// 아니라 절대 시각으로 가른다 -- 바뀌면 경계를 옮기면 된다.
+static SURF_CREATE_PHASE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SURF_DESTROY_PHASE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 사분면별 누적 소요 ms (할당/파괴). 평균을 내기 위한 것이다.
+static SURF_CREATE_US: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SURF_DESTROY_US: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// `destroy_surface` 는 이른 `return` 이 여러 개라 끝에서 재는 대신 `Drop` 으로 잡는다.
+struct SurfaceLifeGuard {
+    started: Instant,
+    size: Option<(i32, i32)>,
+}
+
+impl Drop for SurfaceLifeGuard {
+    fn drop(&mut self) {
+        note_surface_life(false, self.started.elapsed(), self.size);
+    }
+}
+
+fn transition_quadrant(elapsed_ms: u64) -> usize {
+    match elapsed_ms {
+        0..=249 => 0,
+        250..=749 => 1,
+        750..=1499 => 2,
+        _ => 3,
+    }
+}
+
+/// 서피스 한 건의 할당/파괴를 전환 수명에 자리매김한다.
+///
+/// 꼬리(>= `SURFLIFE_TAIL_MS`)는 그때그때 한 줄, 나머지는 사분면 요약에만 들어간다. 요약은
+/// `SURFIMPORT` 줄에 함께 나간다.
+fn note_surface_life(created: bool, took: Duration, size: Option<(i32, i32)>) {
+    let Some(elapsed_ms) = transition_elapsed_ms() else {
+        return;
+    };
+    let q = transition_quadrant(elapsed_ms);
+    let took_us = took.as_micros() as u64;
+    let (count, accum) = if created {
+        (&SURF_CREATE_PHASE[q], &SURF_CREATE_US[q])
+    } else {
+        (&SURF_DESTROY_PHASE[q], &SURF_DESTROY_US[q])
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    accum.fetch_add(took_us, Ordering::Relaxed);
+    const SURFLIFE_TAIL_MS: u128 = 4;
+    if took.as_millis() >= SURFLIFE_TAIL_MS {
+        let what = if created { "create" } else { "destroy" };
+        match size {
+            Some((w, h)) => {
+                warn!("SURFLIFE {what} t=+{elapsed_ms}ms took={took_us}us size={w}x{h}")
+            },
+            None => warn!("SURFLIFE {what} t=+{elapsed_ms}ms took={took_us}us"),
+        }
+    }
+}
+
+/// 사분면 요약 한 줄. `SURFIMPORT` 와 같은 주기로 나간다.
+fn surface_phase_report() -> String {
+    let mut out = String::with_capacity(160);
+    out.push_str("SURFPHASE");
+    const LABEL: [&str; 4] = ["<250ms", "<750ms", "<1500ms", "after"];
+    for q in 0..4 {
+        let cn = SURF_CREATE_PHASE[q].load(Ordering::Relaxed);
+        let cu = SURF_CREATE_US[q].load(Ordering::Relaxed);
+        let dn = SURF_DESTROY_PHASE[q].load(Ordering::Relaxed);
+        let du = SURF_DESTROY_US[q].load(Ordering::Relaxed);
+        let cavg = if cn > 0 { cu / cn } else { 0 };
+        let davg = if dn > 0 { du / dn } else { 0 };
+        out.push_str(&format!(
+            " {}(create={} avg={}us destroy={} avg={}us)",
+            LABEL[q], cn, cavg, dn, davg
+        ));
+    }
+    out
+}
+
 static SURFACES_CREATED: AtomicU64 = AtomicU64::new(0);
 static SURFACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
 
@@ -368,6 +504,9 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
         ms(IMPORT_ACQUIRE_NS.load(Ordering::Relaxed)),
         ms(IMPORT_REST_NS.load(Ordering::Relaxed)),
     );
+    // 전환 수명의 어느 사분면에서 서피스가 만들어지고 파괴되는지. 근거는
+    // `surface_phase_report` 의 doc.
+    warn!("{}", surface_phase_report());
 }
 
 impl Device {
@@ -383,12 +522,21 @@ impl Device {
     ) -> Result<Surface, Error> {
         SURFACES_CREATED.fetch_add(1, Ordering::Relaxed);
         SURFACE_ORIGINS[take_surface_origin()].fetch_add(1, Ordering::Relaxed);
-        match surface_type {
+        // 전환 수명 안의 자리와 소요 시간을 잰다. 근거는 `mark_transition_epoch` 의 doc.
+        // 이 경로는 벽 크기에서 199MB 를 만지므로 `Instant::now()` 두 번은 무의미하다.
+        let started = Instant::now();
+        let noted_size = match surface_type {
+            SurfaceType::Generic { ref size } => Some((size.width, size.height)),
+            SurfaceType::Widget { .. } => None,
+        };
+        let outcome = match surface_type {
             SurfaceType::Generic { ref size } => self.create_pbuffer_surface(context, size, None),
             SurfaceType::Widget { ref native_widget } => {
                 self.create_window_surface(context, native_widget)
             },
-        }
+        };
+        note_surface_life(true, started.elapsed(), noted_size);
+        outcome
     }
 
     #[allow(non_snake_case)]
@@ -1042,6 +1190,13 @@ impl Device {
             return Err(Error::IncompatibleSurface);
         }
         SURFACES_DESTROYED.fetch_add(1, Ordering::Relaxed);
+        // 파괴도 전환 수명에 자리매김한다 -- 운영자 관찰("종료 직후 멈칫")이 겨냥하는 쪽이다.
+        let destroy_started = Instant::now();
+        let destroy_size = Some((surface.size.width, surface.size.height));
+        let _destroy_guard = SurfaceLifeGuard {
+            started: destroy_started,
+            size: destroy_size,
+        };
 
         // ★서피스가 사라지면 그 핸들로 들여온 것도 죽는다.★ 리사이즈 등으로 스왑체인이
         // 서피스를 버리는데 캐시가 남아 있으면, 다음 프레임이 이미 파괴된 EGL 서피스를

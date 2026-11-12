@@ -475,18 +475,30 @@ fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
         //
         // 판정: 0.7~1.0 에 몰리면 오버슈트 복귀, 1.0 초과면 전환 종료 처리, 고르게
         // 퍼지면 전환 전체다.
+        // `phase` 는 전환 진행도가 아니다 -- 2026-11-12 실측에서 130 건이 모두
+        // 0.014~0.050 이었다. `paint_animation_phase` 가 DL 빌드 시각을 0 으로, 3 초
+        // horizon 을 분모로 쓰기 때문이고(DL 은 초당 36~60 회 갱신된다), 그래서 아래의
+        // "0.7~1.0 이면 오버슈트 복귀" 는 ***그 범위에 값이 갈 수 없으므로 성립하지
+        // 않는다.*** 잘못 만든 계측이다. 남겨 두는 것은 DL 수명의 대리값으로는 읽히기
+        // 때문이고, 전환 진행도는 `t=` 가 준다.
         let phase = match paint_api::animation_phase() {
             Some(phase) => format!("{phase:.3}"),
             None => "idle".to_owned(),
         };
+        // 전환 기준 시각으로부터의 경과. 근거는 `surfman` 의 `mark_transition_epoch` doc.
+        // 원자 load 하나다.
+        let at = match surfman::platform::windows::angle::surface::transition_elapsed_ms() {
+            Some(ms) => format!("+{ms}ms"),
+            None => "n/a".to_owned(),
+        };
         match age {
             Some(age) => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us phase={phase} \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us t={at} phase={phase} \
                  surface_age={}us (fresh from producer)",
                 age.as_micros()
             ),
             None => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us phase={phase} \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us t={at} phase={phase} \
                  surface_age=n/a (recycled, re-present)"
             ),
         }
