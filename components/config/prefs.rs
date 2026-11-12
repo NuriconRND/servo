@@ -568,7 +568,9 @@ pub struct Preferences {
     /// 회전 + opacity 의 중간 surface 가 각도마다 크기가 달라, 정확 일치 재사용만으로는
     /// 회전하는 동안 텍스처를 계속 새로 만들고 버린다는 것이다(개발 장비 6144x3456 상자에서
     /// 10 초에 54~56 개, 그 조건에서만 렌더가 한 주기를 넘김). 런처의 되돌리기 스위치는
-    /// `-NoRenderTargetReuse`. ★벽에서는 아직 검증 전이다.★
+    /// `-NoRenderTargetReuse`. 벽 검증(2026-11-12, log_rotation_opacity_judder_01/02): 끄면
+    /// 10 초에 254~290 개를 새로 만들고 반복 구간에서 거의 항상 judder, 켜면 9~20 개이고
+    /// 운영자 육안으로 등장 뒤 judder 가 거의 없다.
     pub gfx_wr_render_target_reuse_larger: bool,
     /// ★2026-11-12 추가★ -- 위 재사용이 켜져 있을 때, 포맷마다 가장 큰 전용 렌더 타깃(포락선)을
     /// 이 프레임 수 동안 안 쓰여도 64 MB 임계 GC 로는 버리지 않는다(320 MB 레드라인에서는
@@ -578,7 +580,8 @@ pub struct Preferences {
     /// 창마다 새 할당 19~20 이 남았고 그것이 "GC 해제 4~5 + 대체 해제 15" 와 맞았다 -- 이동하는
     /// 이미지가 타일을 1 초 넘게 떠나면 포락선을 GC 가 버리고, 돌아올 때 다시 키운다.
     /// `vendor_local/webrender/src/wall_rt_reuse.rs` 의 "포락선을 GC 에서 지킨다" 참고.
-    /// 런처는 `-RenderTargetKeepFrames <n>`.
+    /// 런처는 `-RenderTargetKeepFrames <n>`. 벽 검증(2026-11-12, log_rotation_opacity_judder_01/02):
+    /// 남은 새 할당이 10 초에 19~20 -> 9~10 으로 줄었지만 운영자 육안 차이는 없었다.
     pub gfx_wr_render_target_keep_frames: i64,
 
     pub gfx_wall_parallel_tiles: bool,

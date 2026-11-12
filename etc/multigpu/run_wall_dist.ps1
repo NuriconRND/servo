@@ -112,7 +112,9 @@ param(
     # Why: rotate + opacity makes a rotated local-space surface whose size changes with the
     # angle; exact-size reuse then allocates and frees textures all through the rotation. Dev
     # box, 6144x3456 box: 54-56 new ~40 MB textures per 10 s and the only renders over one
-    # period. Not yet verified on the wall.
+    # period. Wall (2026-11-12, log_rotation_opacity_judder_01/02): with this switch 254-290 new
+    # textures per 10 s and judder in nearly every repeat of one segment; without it 9-20 and
+    # the operator saw almost no judder after the scene appeared.
     [switch] $NoRenderTargetReuse,
     # (2026-11-12) gfx_wr_render_target_keep_frames -- with the reuse above ON, the largest
     # dedicated render target of each format (the envelope) survives this many frames unused

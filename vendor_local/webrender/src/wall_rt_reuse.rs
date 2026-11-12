@@ -50,9 +50,18 @@
 //! 끄면 upstream 동작 그대로다. pref 는 `gfx_wr_render_target_reuse_larger`(기본 켜짐),
 //! 런처의 되돌리기 스위치는 `-NoRenderTargetReuse`. 3 만 끄려면
 //! `gfx_wr_render_target_keep_frames=0`(런처 `-RenderTargetKeepFrames 0`).
-//! 벽 검증: 1·2 는 log_rotation_opacity_judder_01/01(2026-11-12)에서 재사용이 대부분을
-//! 흡수했고 운영자 육안 judder 가 "등장 순간 + 1 회" 로 줄었다(같은 세션 대조 런은 없다).
-//! 3 은 아직이다.
+//! 벽 검증(2026-11-12, log_rotation_opacity_judder_01/02, `a1f848f3d39`, 실제 IPWall 의
+//! 회전+이동+opacity 이미지, 120 초씩, 30~110 초의 10 초 창):
+//!
+//! | 런 | 조건 | 새 할당 | GC 해제 | 운영자 육안 |
+//! |---|---|---|---|---|
+//! | 04 | upstream (`-NoRenderTargetReuse`) | 254~290 (10 초에 약 5 GB) | 262~293 | 반복 애니메이션 셋 중 마지막 구간에서 거의 항상 judder |
+//! | 03 | 1·2 만 (`-RenderTargetKeepFrames 0`) | 19~20 (cold 7) | 4~6 | 등장 뒤 거의 없음 |
+//! | 02 | 1·2·3 (기본) | 9~10 (cold 2) | 3~5 | 03 과 같음 |
+//!
+//! 1·2 가 이 judder 를 없앤다. 3 은 남은 할당을 절반으로 줄이지만(spared 10 초에 189~282)
+//! 눈에 보이는 차이는 없었다. ★등장 순간의 judder 는 세 조건 모두에 있다★(등장 창의 주기 초과
+//! 62/67/79) -- 페이지 기동·셰이더 컴파일·장면 등장 비용이 몰린 창이고 이 기구와 별건이다.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
