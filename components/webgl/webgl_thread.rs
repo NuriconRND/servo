@@ -1723,6 +1723,32 @@ impl WebGLThread {
         if surface_ids.is_empty() {
             return Err("Missing WebGL context!".to_string());
         }
+        // ★같은 크기면 아무것도 하지 않는다.★ 2026-11-12.
+        //
+        // 이 경로에 동일성 가드가 ***어디에도*** 없었다 -- `element.rs` 의 속성 설정,
+        // `htmlcanvaselement.rs`, `webglrenderingcontext.rs` 의 blocking resize, 이 함수,
+        // `chains.rs::resize` 가 모두 무조건 실행한다. 그래서 `canvas.width = canvas.width`
+        // 도 네 백엔드의 서피스를 전부 다시 만들었다(벽 크기면 한 장 190MB).
+        //
+        // `gear` 데모는 `addEventListener('resize', resize)` 로 대입하고, `scene` 은 rAF
+        // 안에서 매 프레임 확인한다. 둘 다 "값이 변했을 때만" 을 ***자기 쪽에서*** 거르지만,
+        // 거르는 기준이 `canvas.width` 이고 그것은 우리가 clamp 한 값과 다를 수 있다
+        // (`clamp_viewport` 가 `MAX_VIEWPORT_DIMS`/`MAX_RENDERBUFFER_SIZE` 로 줄인다).
+        // 그러면 페이지는 매번 "변했다" 고 보고 매번 대입한다.
+        //
+        // 여기서는 ***clamp 뒤의 값***으로 비교하므로 그 어긋남이 흡수된다.
+        if let Some(primary) = self.primary_surface_id(context_id) {
+            if let Some(data) = self.contexts.get(&primary) {
+                let wanted = clamp_viewport(&data.gl, requested_size).to_i32();
+                let current = self
+                    .webrender_swap_chains
+                    .get(primary)
+                    .map(|chain| chain.size());
+                if current == Some(wanted) {
+                    return Ok(());
+                }
+            }
+        }
         let primary_surface_id = self.primary_surface_id(context_id);
         let mut primary_size = None;
         let mut primary_has_alpha = false;

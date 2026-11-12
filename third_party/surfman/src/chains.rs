@@ -288,6 +288,28 @@ impl<Device: DeviceAPI> SwapChainData<Device> {
         for mut surface in self.recycled_surfaces.drain(..) {
             device.destroy_surface(context, &mut surface)?;
         }
+        // ★옛 크기 front buffer 도 버린다.★ 2026-11-12.
+        //
+        // 앞 판은 `pending_surface` 를 건드리지 않았다. 그러면 다음 `swap_buffers` 가 그
+        // ***옛 크기*** 장을 `recycled_surfaces` 로 넣고(:166-173), 그 장은 크기 술어
+        // (:176-183)를 영구히 실패시킨다 -- 즉 소비자에게 옛 크기 비트맵이 한 번 가고,
+        // 재활용 풀은 쓸 수 없는 장을 안고 있게 된다.
+        if let Some(mut stale_front) = self.pending_surface.take() {
+            self.pending_since = None;
+            device.destroy_surface(context, &mut stale_front)?;
+        }
+        // ★다음 swap 이 쓸 장을 미리 넣어 둔다.★ 2026-11-12.
+        //
+        // 위에서 풀을 비웠으므로 그대로 두면 다음 `swap_buffers` 가 재활용할 것을 찾지
+        // 못해 ***또*** `create_surface` 를 한다(:184-191). 벽 크기면 리사이즈 한 번에
+        // 190MB 를 두 장 만드는 셈이고, 그 두 번째는 페이지의 첫 프레임 -- 즉 전환
+        // 애니메이션이 ***이미 돌고 있을 때*** -- 일어난다.
+        //
+        // 여기서 한 장을 미리 만들면 그 할당이 이 호출 안으로 들어온다. 총 장 수는 같고,
+        // 타이밍만 애니메이션 밖으로 옮긴다.
+        let spare =
+            device.create_surface(context, self.surface_access, SurfaceType::Generic { size })?;
+        self.recycled_surfaces.push(spare);
         self.size = size;
         Ok(())
     }
