@@ -2689,6 +2689,9 @@ impl Painter {
         details
             .animations
             .install_paint_animations(display_list_info.paint_animations);
+        // ★DL 도착 간격을 센다.★ 근거는 `note_display_list_arrival` 의 doc 주석 -- 요점은
+        // `LOCKTAIL` 의 `phase` 분모가 이 간격이고, 그 값을 세는 곳이 없었다는 것이다.
+        note_display_list_arrival(pipeline_id);
 
         let mut transaction = Transaction::new();
         let is_root_pipeline = Some(pipeline_id.into()) == webview_renderer.root_pipeline_id;
@@ -3857,6 +3860,68 @@ pub(crate) enum PaintMetricState {
 /// ★2026-11-11: `pref!` 를 타이밍 경로에서 치지 않기 위한 것이다.★ 그 함수는 벽 틱과 렌더
 /// 양쪽에서 불려 painter 마다 120/s 로 돌고, `pref!` 는 전역 `RwLock` 획득이다 -- 네
 /// painter 스레드가 초당 480 번 그것을 잡는다. `wall_canvas_rect::MAX_AGE_MS` 와 같은 패턴.
+/// 디스플레이 리스트 도착 간격. 60 회마다 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/47)
+///
+/// `LOCKTAIL` 에 붙인 `phase` 가 ***애니메이션 진행률이 아니었다.*** layout 이 세그먼트를
+/// 지금부터 horizon(3000ms)까지로 다시 샘플하므로(`paint_animation.rs`), `zero` 는 그
+/// 디스플레이 리스트를 만든 시각이고 마지막 세그먼트의 `end` 는 그 시점부터 3 초다 --
+/// 전환의 시작도 길이도 들어 있지 않다. 그래서 그 값은 실제로는
+/// ★마지막 DL 이후 경과 / 3 초★ 이고, 실측 0.017~0.040 은 51~120ms 다.
+///
+/// `install_paint_animations` 가 DL 마다 애니메이션을 교체하므로 `zero` 가 매번 갱신되고,
+/// 따라서 `now - zero` 의 상한은 ★DL 도착 간격★ 이다. 그 간격을 세는 곳이 ***하나도
+/// 없었다*** -- 운영자 질문이 그 지점을 짚었다("이미 디스플레이 리스트는 tick divisor
+/// 주기로 갱신되고 있지 않나? 애니메이션 중에만 특별히 더 많이 발생할 이유가 있었어?").
+/// 그리고 내가 "전환 중에는 DL 이 자주 갱신된다" 고 적은 것은 근거 없는 추측이었다.
+///
+/// 이 줄이 동시에 두 가지를 확정한다.
+///
+/// * `gfx_wall_live_canvas_tick_divisor` 의 실제 효과 -- WebGL 구성은
+///   `TickCadence::LiveCanvas` 로 분류되므로 그쪽이 걸린다. 기대 간격과 맞는가.
+/// * `phase` 의 분모 -- `avg` 가 곧 그 상한이어야 한다. 어긋나면 해석이 또 틀린 것이다.
+///
+/// ## 비용
+///
+/// 호출당 시계 하나와 원자 넷, 리포트는 60 회마다 한 줄이다.
+/// `handle_new_display_list` 는 이미 트랜잭션을 만들어 WR 로 보내는 무거운 경로이므로,
+/// 여기의 I/O 는 2026-10-27 규칙이 금지하는 "프레임마다 도는 경로" 가 아니다.
+fn note_display_list_arrival(pipeline_id: impl std::fmt::Debug) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LAST_AT_US: AtomicU64 = AtomicU64::new(0);
+    static SUM_MS: AtomicU64 = AtomicU64::new(0);
+    static MIN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static MAX_MS: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+    let now_us = ORIGIN.elapsed().as_micros() as u64;
+    let last_us = LAST_AT_US.swap(now_us, Ordering::Relaxed);
+    if last_us == 0 {
+        // 첫 도착은 간격이 없다.
+        return;
+    }
+    let since_ms = (now_us.saturating_sub(last_us)) / 1000;
+    SUM_MS.fetch_add(since_ms, Ordering::Relaxed);
+    MIN_MS.fetch_min(since_ms, Ordering::Relaxed);
+    MAX_MS.fetch_max(since_ms, Ordering::Relaxed);
+
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 60 != 0 {
+        return;
+    }
+    let count = COUNT.swap(0, Ordering::Relaxed).max(1);
+    warn!(
+        "DLARRIVE n={count} interval(avg={}ms min={}ms max={}ms) since_last={since_ms}ms \
+         pipeline={pipeline_id:?}",
+        SUM_MS.swap(0, Ordering::Relaxed) / count,
+        MIN_MS.swap(u64::MAX, Ordering::Relaxed),
+        MAX_MS.swap(0, Ordering::Relaxed),
+    );
+}
+
 static CANVAS_SCISSOR_LEAD_PERIODS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 
