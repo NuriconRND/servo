@@ -3078,6 +3078,26 @@ impl Painter {
     /// ★`lead = 0` 이면 원자 로드 하나로 끝난다.★ 그 경우 샘플을 만들지 않는다.
     fn publish_canvas_scissor_lead(&self, sample_at: Instant) {
         let slot = webrender_api::IdNamespace::from(self.painter_id).0;
+        // ★지금 애니메이션의 진행률을 싣는다.★ `LOCKTAIL` 이 이것을 함께 찍으므로 그
+        // 사건이 ***자기 위상을 들고 다닌다*** -- 1 초 타임스탬프로는 "애니메이션 마지막
+        // 0.75 초" 와 "끝난 직후 0.75 초" 를 가를 수 없었다(근거는
+        // `PipelineAnimations::paint_animation_phase` 의 doc).
+        //
+        // 원자 저장 하나다. 돌고 있는 애니메이션이 없으면 `f32::NAN` 을 실어 "없음" 을
+        // 나타낸다 -- 비트 패턴 하나로 끝나므로 분기가 필요 없다.
+        {
+            let mut phase = f32::NAN;
+            for renderer in self.webview_renderers.values() {
+                renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                    if let Some(found) =
+                        pipeline_details.animations.paint_animation_phase(sample_at)
+                    {
+                        phase = found;
+                    }
+                });
+            }
+            paint_api::note_animation_phase(phase);
+        }
         // ★원자 로드 하나다★ -- `pref!` 는 전역 `RwLock` 이고 이 함수는 painter 마다
         // 120/s 로 돈다(2026-11-11 조사). 값은 `perform_updates` 가 싣는다.
         let lead_periods = CANVAS_SCISSOR_LEAD_PERIODS.load(std::sync::atomic::Ordering::Relaxed);

@@ -469,14 +469,24 @@ fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
     // ★꼬리는 그때그때 한 줄.★ 이 줄이 트리플 버퍼링의 효용을 가른다 -- 근거는 위 doc.
     if tex_us >= TAIL_US {
         let nth = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        // ★위상을 함께 찍는다★ -- 이 사건이 전환의 어디에서 났는지를 ***자기가 들고
+        // 다닌다***. 1 초 타임스탬프로는 "애니메이션 마지막 0.75 초" 와 "끝난 직후" 를
+        // 가를 수 없었다(근거는 `paint_api::animation_phase` 의 doc).
+        //
+        // 판정: 0.7~1.0 에 몰리면 오버슈트 복귀, 1.0 초과면 전환 종료 처리, 고르게
+        // 퍼지면 전환 전체다.
+        let phase = match paint_api::animation_phase() {
+            Some(phase) => format!("{phase:.3}"),
+            None => "idle".to_owned(),
+        };
         match age {
             Some(age) => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us phase={phase} \
                  surface_age={}us (fresh from producer)",
                 age.as_micros()
             ),
             None => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us phase={phase} \
                  surface_age=n/a (recycled, re-present)"
             ),
         }

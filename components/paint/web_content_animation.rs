@@ -397,6 +397,15 @@ impl ActivePaintAnimation {
         }
     }
 
+    /// 이 애니메이션의 전체 길이(초). 마지막 세그먼트의 `end` 다.
+    fn total_span(&self) -> Option<f64> {
+        let end = match &self.property {
+            PaintAnimationProperty::Opacity(_, segments) => segments.last()?.end,
+            PaintAnimationProperty::Transform(_, segments) => segments.last()?.end,
+        };
+        (end.is_finite() && end > 0.0).then_some(end)
+    }
+
     fn ends_at(&self) -> Option<Instant> {
         let end = match &self.property {
             PaintAnimationProperty::Opacity(_, segments) => segments.last()?.end,
@@ -567,6 +576,45 @@ impl PipelineAnimations {
     ///
     /// 끝난 애니메이션의 시각은 `ends_at()` 로 clamp 한다 -- 그 뒤로는 움직이지 않으므로
     /// 창이 전환 끝을 넘어가도 구멍이 생기지 않는다.
+    /// 지금 돌고 있는 paint 애니메이션의 ★진행률★ -- 여럿이면 가장 늦게 시작한 것.
+    ///
+    /// `0.0`~`1.0` 이 애니메이션 중이고 `1.0` 을 넘으면 끝난 뒤다. 돌고 있는 것이 없으면
+    /// `None` 이다.
+    ///
+    /// ## 왜 이 값인가 (2026-11-12, log_webgl_perf_01/46)
+    ///
+    /// `LOCKTAIL`(캔버스 서피스 획득이 8ms 이상)이 ***전환에 묶여 몰린다***는 것은 확정됐다
+    /// (유휴 대비 x3.0~3.2, 순환 이동 영점 p = 0.006~0.009, 세 런 모두). 그런데 ***어느
+    /// 구간인지는 1 초 타임스탬프로 가를 수 없다*** -- 최적 적합 창이 [2.05, 2.80)s 로
+    /// 2500ms 경계를 걸치고, "애니메이션 마지막 0.75 초" 와 "끝난 직후 0.75 초" 의 우도
+    /// 차이가 0.06 이다.
+    ///
+    /// 운영자 관찰("바운스 후반부, 표출 영역 약간 밖에서 우->좌로 돌아올 때")이 걸려 있는
+    /// 구분이 바로 그것이다. 시계를 더 잘게 쪼개는 대신 ★사건이 자기 위상을 들고 다니게★
+    /// 하면 시계 맞추기가 필요 없다.
+    ///
+    /// 가장 늦게 시작한 것을 고르는 이유: 전환은 들어오는 레이어와 나가는 레이어에 각각
+    /// 애니메이션을 걸고(실측 `ANIMSCRIPTSTART` 가 `[전환 시작]` 의 두 배), 지금 화면을
+    /// 지배하는 것은 나중 것이다.
+    pub(crate) fn paint_animation_phase(&self, now: Instant) -> Option<f32> {
+        let mut best: Option<(Instant, f32)> = None;
+        for animation in self.paint.borrow().iter() {
+            let Some(span) = animation.total_span() else {
+                continue;
+            };
+            if span <= 0.0 {
+                continue;
+            }
+            let elapsed = now.saturating_duration_since(animation.zero).as_secs_f64();
+            let phase = (elapsed / span) as f32;
+            match best {
+                Some((zero, _)) if zero >= animation.zero => {},
+                _ => best = Some((animation.zero, phase)),
+            }
+        }
+        best.map(|(_, phase)| phase)
+    }
+
     pub(crate) fn paint_animation_sample_times(
         &self,
         from: Instant,

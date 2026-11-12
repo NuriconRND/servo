@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Error, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
@@ -138,6 +138,27 @@ pub fn angle_gl_lock(d3d11_device: Option<usize>) -> AngleGlGuard {
     }
 }
 
+/// 지금 전환 애니메이션의 진행률. `f32` 비트를 그대로 담는다. `NaN` = 돌고 있는 것 없음.
+///
+/// ## 왜 전역인가 (2026-11-12)
+///
+/// 전환은 ***하나***이고 네 타일이 같은 애니메이션을 본다. painter 넷이 같은 값을 쓰므로
+/// 마지막 것이 이기는 것이 문제가 아니다. 그리고 이것은 ***읽기 전용 진단값***이라 동작에
+/// 영향이 없다 -- 2026-11-11 에 전역 `PREDICTED_SHIFT` 가 painter 넷이 공유해 문제가 된
+/// 것은 그 값이 ***scissor 를 결정***했기 때문이다.
+static ANIMATION_PHASE_BITS: AtomicU32 = AtomicU32::new(0x7fc0_0000);
+
+/// painter 가 틱마다 싣는다. 근거는 `PipelineAnimations::paint_animation_phase` 의 doc.
+pub fn note_animation_phase(phase: f32) {
+    ANIMATION_PHASE_BITS.store(phase.to_bits(), Ordering::Relaxed);
+}
+
+/// 진단 로그가 읽는다. 돌고 있는 애니메이션이 없으면 `None`.
+pub fn animation_phase() -> Option<f32> {
+    let phase = f32::from_bits(ANIMATION_PHASE_BITS.load(Ordering::Relaxed));
+    phase.is_finite().then_some(phase)
+}
+
 /// painter 가 `render()` 진입을 기다린 시간(= ANGLE 공유 락 획득 대기). 꼬리는 그때그때 한
 /// 줄, 나머지는 1200 획득마다 모아서 한 줄.
 ///
@@ -176,7 +197,15 @@ fn note_paint_gap(waited: Duration) {
 
     if us >= TAIL_US {
         let nth = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
-        log::warn!("PAINTGAP #{nth} waited={us}us for the shared ANGLE lock");
+        // 위상을 함께 찍는다 -- 근거는 `animation_phase` 의 doc.
+        match animation_phase() {
+            Some(phase) => log::warn!(
+                "PAINTGAP #{nth} waited={us}us phase={phase:.3} for the shared ANGLE lock"
+            ),
+            None => {
+                log::warn!("PAINTGAP #{nth} waited={us}us phase=idle for the shared ANGLE lock")
+            },
+        }
     }
 
     // 호출 수로 리포트 시점을 정한다 -- 시계를 또 읽지 않는다.
