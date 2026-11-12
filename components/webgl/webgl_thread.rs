@@ -348,6 +348,117 @@ fn note_scissor_jump(was: Option<[i32; 4]>, now: Option<[i32; 4]>) {
     );
 }
 
+/// scissor 면적과 lead 샘플이 그것을 넓히는지. 1200 회마다 한 줄, 1.5 배를 넘기면 그때 한 줄.
+///
+/// ## 왜 (2026-11-12)
+///
+/// 운영자 지적 -- "WebGL 4 tile 전체화면 + ticker 애니메이션 구성에서 ticker 애니메이션
+/// judder 해소하려고 WebGL에 scissor를 넣었고, 해소됐잖아? (...) 그럼 적어도 (그) 구성에서
+/// ticker 애니메이션 judder는 발생하지 않아야 하는데, 이게 회귀된 상태로 성능 보는걸로
+/// 마무리한다고?"
+///
+/// 그 구성에서 judder 0 이 조건이다. 그런데 54 번 데이터로는 판단할 수 없다 -- 전환 테스트라
+/// 캔버스가 전체화면인 시간이 적고, `SCISSORJUMPS` 의 `area avg=8Mpx max=15Mpx` 는 전환 중
+/// 작은 값이 섞인 평균이다(타일당 전체화면 기대값은 11520x4320/4 = 12.44Mpx). 정지 상태의
+/// 면적을 ***재는 값이 없다.***
+///
+/// ## 판정
+///
+/// * `base avg` 가 12.44Mpx 근처면 WR 의 보고가 맞다. 많이 작으면 캔버스가 전체화면이 아니다.
+/// * 정지 구성에서 `widened` 가 ★0 이어야 한다.★ 크면 lead 샘플이 캔버스를 넓히고 있다 --
+///   캔버스는 안 움직이는데 ticker 애니메이션이 `ancestor_animated_node`(`picture.rs`)를
+///   통과해 lead 샘플로 붙는 경우이고, 그러면 타일당 1/4 셰이딩이라는 1 단계의 효과가 깨진다.
+///   운영자가 지적한 회귀의 기구가 그것이다.
+/// * `samples`/`used` 분포가 그 판정을 뒷받침한다.
+///
+/// ## 비용
+///
+/// `union_over` 를 부른 직후이고 원자 11 개 증가와 곱셈 둘이다. painter 4 x 60Hz = 240/s
+/// 이므로 약 20us/s 다. 꼬리 줄은 배율 1.5 배 초과일 때만 나온다.
+fn note_scissor_area(base: [i32; 4], union: [i32; 4], sample_count: u8, used: u8) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BASE_SUM: AtomicU64 = AtomicU64::new(0);
+    static BASE_MAX: AtomicU64 = AtomicU64::new(0);
+    static UNION_SUM: AtomicU64 = AtomicU64::new(0);
+    static UNION_MAX: AtomicU64 = AtomicU64::new(0);
+    static WIDENED: AtomicU64 = AtomicU64::new(0);
+    static WIDEN_PCT_SUM: AtomicU64 = AtomicU64::new(0);
+    static WIDEN_PCT_MAX: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_1: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_2: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_3PLUS: AtomicU64 = AtomicU64::new(0);
+    static USED_0: AtomicU64 = AtomicU64::new(0);
+    static USED_1: AtomicU64 = AtomicU64::new(0);
+    static USED_2PLUS: AtomicU64 = AtomicU64::new(0);
+
+    let area = |r: [i32; 4]| (r[2].max(0) as u64) * (r[3].max(0) as u64);
+    let base_area = area(base);
+    let union_area = area(union);
+
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    BASE_SUM.fetch_add(base_area / 1_000, Ordering::Relaxed);
+    BASE_MAX.fetch_max(base_area / 1_000, Ordering::Relaxed);
+    UNION_SUM.fetch_add(union_area / 1_000, Ordering::Relaxed);
+    UNION_MAX.fetch_max(union_area / 1_000, Ordering::Relaxed);
+    match sample_count {
+        0 | 1 => SAMPLES_1.fetch_add(1, Ordering::Relaxed),
+        2 => SAMPLES_2.fetch_add(1, Ordering::Relaxed),
+        _ => SAMPLES_3PLUS.fetch_add(1, Ordering::Relaxed),
+    };
+    match used {
+        0 => USED_0.fetch_add(1, Ordering::Relaxed),
+        1 => USED_1.fetch_add(1, Ordering::Relaxed),
+        _ => USED_2PLUS.fetch_add(1, Ordering::Relaxed),
+    };
+
+    // 배율은 백분율로 담는다(원자가 정수다). 100 이 "넓어지지 않음" 이다.
+    let widen_pct = if base_area > 0 {
+        (union_area * 100 / base_area).max(100)
+    } else {
+        100
+    };
+    if union_area > base_area {
+        WIDENED.fetch_add(1, Ordering::Relaxed);
+        WIDEN_PCT_SUM.fetch_add(widen_pct, Ordering::Relaxed);
+        WIDEN_PCT_MAX.fetch_max(widen_pct, Ordering::Relaxed);
+        if widen_pct > 150 {
+            let mp = |a: u64| a as f64 / 1_000_000.0;
+            warn!(
+                "SCISSORWIDE #{nth} base={:.1}Mpx -> union={:.1}Mpx ({}%) \
+                 samples={sample_count} used={used}",
+                mp(base_area),
+                mp(union_area),
+                widen_pct
+            );
+        }
+    }
+
+    if nth % 1200 != 0 {
+        return;
+    }
+    let widened = WIDENED.swap(0, Ordering::Relaxed);
+    let pct_sum = WIDEN_PCT_SUM.swap(0, Ordering::Relaxed);
+    let kp = |a: u64| a as f64 / 1_000.0;
+    warn!(
+        "SCISSORAREA n={nth} base(avg={:.1}Mpx max={:.1}Mpx) union(avg={:.1}Mpx max={:.1}Mpx) \
+         widened={widened} ({:.1}%, avg={}% max={}%) samples(1={} 2={} 3plus={}) \
+         used(0={} 1={} 2plus={})",
+        kp(BASE_SUM.swap(0, Ordering::Relaxed) / 1200),
+        kp(BASE_MAX.swap(0, Ordering::Relaxed)),
+        kp(UNION_SUM.swap(0, Ordering::Relaxed) / 1200),
+        kp(UNION_MAX.swap(0, Ordering::Relaxed)),
+        widened as f64 * 100.0 / 1200.0,
+        if widened > 0 { pct_sum / widened } else { 100 },
+        WIDEN_PCT_MAX.swap(0, Ordering::Relaxed).max(100),
+        SAMPLES_1.swap(0, Ordering::Relaxed),
+        SAMPLES_2.swap(0, Ordering::Relaxed),
+        SAMPLES_3PLUS.swap(0, Ordering::Relaxed),
+        USED_0.swap(0, Ordering::Relaxed),
+        USED_1.swap(0, Ordering::Relaxed),
+        USED_2PLUS.swap(0, Ordering::Relaxed),
+    );
+}
+
 fn note_scissor_gate(outcome: ScissorGate) {
     static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
@@ -2394,6 +2505,8 @@ impl WebGLThread {
         // 밀었고, 그러자 띠가 반대쪽 경계로 넘어갔다(log_webgl_perf_01/38).
         let hold_ms = hold.as_millis() as u64;
         let (wanted, used) = noted.union_over(age, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
+        // 면적과 lead 샘플의 오염을 센다. 근거는 `note_scissor_area` 의 doc 주석.
+        note_scissor_area(noted.rect, wanted, noted.sample_count, used);
         // ★폴백을 센다.★ 근거는 `note_table_miss` 의 doc 주석.
         if used == 0 {
             note_table_miss(noted.sample_count);
