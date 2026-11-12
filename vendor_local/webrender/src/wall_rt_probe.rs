@@ -62,6 +62,11 @@ static DEDICATED_MAX_DIM: AtomicU64 = AtomicU64::new(0);
 /// 풀에 맞는 것이 없어 새로 할당한 수와 바이트.
 static POOL_MISSES: AtomicU64 = AtomicU64::new(0);
 static POOL_MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+/// ★2026-11-12★ 정확 일치는 없었지만 더 큰 쉬는 타깃을 빌린 수(`wall_rt_reuse.rs` 1 번).
+static REUSE_LARGER: AtomicU64 = AtomicU64::new(0);
+/// ★2026-11-12★ 포락선을 새로 만들며 대체해 푼 수와 바이트(`wall_rt_reuse.rs` 2 번).
+static SUPERSEDED: AtomicU64 = AtomicU64::new(0);
+static SUPERSEDED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 풀 GC 가 버린 수와 바이트.
 static GC_FREES: AtomicU64 = AtomicU64::new(0);
 static GC_FREE_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -135,6 +140,25 @@ pub fn note_pool_miss(bytes: usize) {
     POOL_MISS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
+/// 정확 일치 대신 더 큰 쉬는 타깃을 빌렸다.
+#[inline]
+pub fn note_reuse_larger() {
+    if !is_enabled() {
+        return;
+    }
+    REUSE_LARGER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 포락선을 만들며 쉬는 타깃 하나를 대체해 풀었다.
+#[inline]
+pub fn note_superseded(bytes: usize) {
+    if !is_enabled() {
+        return;
+    }
+    SUPERSEDED.fetch_add(1, Ordering::Relaxed);
+    SUPERSEDED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
 /// 풀 GC 가 렌더 타깃 하나를 버렸다.
 #[inline]
 pub fn note_gc_free(bytes: usize) {
@@ -184,6 +208,9 @@ struct Snapshot {
     dedicated: u64,
     misses: u64,
     miss_bytes: u64,
+    reuse_larger: u64,
+    superseded: u64,
+    superseded_bytes: u64,
     gc_frees: u64,
     gc_bytes: u64,
     creates: u64,
@@ -200,6 +227,9 @@ impl Snapshot {
             dedicated: DEDICATED_REQUESTS.load(Ordering::Relaxed),
             misses: POOL_MISSES.load(Ordering::Relaxed),
             miss_bytes: POOL_MISS_BYTES.load(Ordering::Relaxed),
+            reuse_larger: REUSE_LARGER.load(Ordering::Relaxed),
+            superseded: SUPERSEDED.load(Ordering::Relaxed),
+            superseded_bytes: SUPERSEDED_BYTES.load(Ordering::Relaxed),
             gc_frees: GC_FREES.load(Ordering::Relaxed),
             gc_bytes: GC_FREE_BYTES.load(Ordering::Relaxed),
             creates: RT_CREATES.load(Ordering::Relaxed),
@@ -232,7 +262,8 @@ fn report(elapsed: Duration, now: &Snapshot, previous: &Snapshot) {
         format!("{:.3}", min_milli as f64 / 1000.0)
     };
     warn!(
-        "RTPROBE t={:.0}s w:dedicated={} w:miss={} ({:.0}MB) w:gc_free={} ({:.0}MB) \
+        "RTPROBE t={:.0}s w:dedicated={} w:miss={} ({:.0}MB) w:reuse_larger={} \
+         w:superseded={} ({:.0}MB) w:gc_free={} ({:.0}MB) \
          w:create={} ({:.1}ms) w:delete={} ({:.1}ms) w:limited={} | \
          total shared={} dedicated={} max_dim={} miss={} ({:.0}MB) gc_free={} ({:.0}MB) \
          create={} ({:.1}ms, max {:.2}ms) delete={} ({:.1}ms, max {:.2}ms) \
@@ -241,6 +272,9 @@ fn report(elapsed: Duration, now: &Snapshot, previous: &Snapshot) {
         now.dedicated - previous.dedicated,
         now.misses - previous.misses,
         mib(now.miss_bytes - previous.miss_bytes),
+        now.reuse_larger - previous.reuse_larger,
+        now.superseded - previous.superseded,
+        mib(now.superseded_bytes - previous.superseded_bytes),
         now.gc_frees - previous.gc_frees,
         mib(now.gc_bytes - previous.gc_bytes),
         now.creates - previous.creates,

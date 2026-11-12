@@ -135,6 +135,7 @@ mod util;
 mod visibility;
 pub mod wall_canvas_rect;
 pub mod wall_rt_probe;
+pub mod wall_rt_reuse;
 mod api_resources;
 mod image_tiling;
 mod image_source;

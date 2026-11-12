@@ -474,10 +474,21 @@ impl RenderTaskGraphBuilder {
                                 surface_size.height,
                             );
 
+                            // ★2026-11-12★ 전용 요청이면 더 큰 쉬는 타깃을 빌릴 수 있다
+                            // (`wall_rt_reuse.rs`). 공유 요청은 upstream 그대로 정확 일치만.
+                            let reuse_larger = if !can_use_shared_surface &&
+                                crate::wall_rt_reuse::is_enabled()
+                            {
+                                Some(max_shared_surface_size)
+                            } else {
+                                None
+                            };
+
                             // Get render target of appropriate size and format from resource cache
                             let texture_id = resource_cache.get_or_create_render_target_from_pool(
                                 surface_size,
                                 format,
+                                reuse_larger,
                             );
 
                             // Allocate metadata we need about this surface while it's active

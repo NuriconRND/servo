@@ -2005,10 +2005,15 @@ impl ResourceCache {
 
     /// Get a render target from the pool, or allocate a new one if none are
     /// currently available that match the requested parameters.
+    ///
+    /// ★2026-11-12★ `reuse_larger` 가 `Some(공유 타깃 한 변)` 이면 전용 요청이다 -- 정확
+    /// 일치가 없을 때 쉬는 더 큰 타깃을 빌리고, 그것도 없으면 포락선으로 키워 만든다.
+    /// 규칙과 근거는 `wall_rt_reuse.rs`. `None` 이면 upstream 그대로다.
     pub fn get_or_create_render_target_from_pool(
         &mut self,
         size: DeviceIntSize,
         format: ImageFormat,
+        reuse_larger: Option<i32>,
     ) -> CacheTextureId {
         for target in &mut self.render_target_pool {
             if target.size == size &&
@@ -2019,6 +2024,47 @@ impl ResourceCache {
                 target.is_active = true;
                 target.last_frame_used = self.current_frame_id;
                 return target.texture_id;
+            }
+        }
+
+        let mut size = size;
+        if let Some(shared) = reuse_larger {
+            let current_frame_id = self.current_frame_id;
+            let view = |target: &RenderTarget| crate::wall_rt_reuse::PoolEntry {
+                width: target.size.width,
+                height: target.size.height,
+                same_format: target.format == format,
+                active: target.is_active,
+                used_this_frame: target.last_frame_used == current_frame_id,
+            };
+            match crate::wall_rt_reuse::pick_dedicated(
+                self.render_target_pool.iter().map(view),
+                size.width,
+                size.height,
+                shared,
+            ) {
+                crate::wall_rt_reuse::Pick::Reuse(index) => {
+                    let target = &mut self.render_target_pool[index];
+                    target.is_active = true;
+                    target.last_frame_used = current_frame_id;
+                    crate::wall_rt_probe::note_reuse_larger();
+                    return target.texture_id;
+                }
+                crate::wall_rt_reuse::Pick::Allocate { width, height } => {
+                    size = DeviceIntSize::new(width, height);
+                    // 포락선에 들어가는 쉬는 전용 타깃을 푼다 -- 남기면 GC 가 포락선을
+                    // 버리는 구간이 생긴다(`wall_rt_reuse::supersedes`).
+                    let texture_cache = &mut self.texture_cache;
+                    self.render_target_pool.retain(|target| {
+                        if crate::wall_rt_reuse::supersedes(view(target), width, height, shared) {
+                            crate::wall_rt_probe::note_superseded(target.size_in_bytes());
+                            texture_cache.free_render_target(target.texture_id);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
             }
         }
 

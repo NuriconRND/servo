@@ -796,6 +796,12 @@ impl Painter {
         webrender::wall_canvas_rect::set_enabled(servo_config::pref!(
             gfx_wall_webgl_tile_scissor_from_webrender
         ));
+        // ★2026-11-12: 전용 렌더 타깃의 큰 것 재사용도 같은 이유로 여기서 세운다★ --
+        // 기능 게이트이므로 계측 스위치(`gfx_wr_render_target_probe`)와 무관하다.
+        // 근거는 `vendor_local/webrender/src/wall_rt_reuse.rs`.
+        webrender::wall_rt_reuse::set_enabled(servo_config::pref!(
+            gfx_wr_render_target_reuse_larger
+        ));
         // ★유효기간도 여기서 원자에 싣는다.★ 소비자(WebGL 스레드)는 캔버스 프레임마다
         // painter 수만큼 이 값을 읽으므로, 거기서 `pref!`(전역 RwLock)을 치면 안 된다 --
         // 계측을 전부 걷어낸 2026-10-27 규칙이다.

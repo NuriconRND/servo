@@ -1,0 +1,373 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+//! ★전용 렌더 타깃을 요청보다 큰 풀 텍스처로 재사용한다★ -- 규칙과 그 스위치.
+//!
+//! ## 왜 (2026-11-12 추가)
+//!
+//! upstream 의 `ResourceCache::get_or_create_render_target_from_pool` 은 크기가 ***정확히
+//! 같은*** 타깃만 재사용한다. 2048 을 넘는 태스크(전용 타깃)는 256 올림 크기를 받으므로,
+//! 크기가 프레임마다 조금씩 바뀌는 surface 는 256 경계를 넘을 때마다 새 텍스처를 만들고,
+//! 풀이 64 MB 를 넘으면 60 프레임 안 쓴 것을 버린다. 그것이 반복된다.
+//!
+//! 그런 surface 를 만드는 것이 ***회전 + opacity*** 다. opacity 필터 스태킹 컨텍스트가
+//! 회전한 좌표계 안에 있으면 surface 를 로컬 공간에서 그리고, 크기는 "prim ∩ 타일을 회전
+//! 공간으로 역사상한 bbox" 라 각도마다 다르다. 영역이 타일보다 크면 그 교집합이 실제로
+//! 변한다. 회전만이면 중간 surface 가 없고, opacity 만이면 크기가 일정하다.
+//!
+//! 실측(2026-11-12, 개발 장비 3840x1080 타일 하나, `wall_rotate_opacity_probe.html`
+//! `w=1.6&h=3.2` = 6144x3456 상자, divisor 15, `c697adb4985` RTPROBE, 10~20 초 창):
+//!
+//! | 조건 | 새 할당 | GC 해제 | 렌더 > 1 주기 | 렌더 worst |
+//! |---|---|---|---|---|
+//! | 회전+opacity (두 번) | 54 / 56 (약 2.2 GB) | 55 / 57 | 2 / 3 | 21.6 / 22.5 ms |
+//! | 회전만 (두 번) | 0 / 0 | 0 / 0 | 0 / 0 | 2.1 / 1.7 ms |
+//! | opacity 만 | 0 | 0 | 0 | 2.2 ms |
+//!
+//! opacity 만인 대조군도 매 프레임 같은 크기의 전용 surface 를 그리지만 스파이크가 없다 --
+//! 비용은 그리는 것이 아니라 ***새로 만드는 것***이다. 렌더러의 텍스처 생성 CPU 시간 자체는
+//! 작아서(최대 0.06 ms) 비용은 새 텍스처를 처음 쓰는 GPU 쪽으로 보인다(추정, 미측정).
+//!
+//! ## 무엇을 바꾸는가
+//!
+//! 전용 요청(공유 타깃에 못 넣는 태스크)에만, 정확 일치가 없을 때만 적용한다.
+//!
+//! 1. ★쉬고 있는 같은 포맷 전용 타깃 중 요청을 담는 가장 작은 것★을 빌린다.
+//! 2. 없으면 요청과 그 후보들의 ★가로·세로 각각의 최대값(포락선)★ 으로 새로 만들고, 그
+//!    포락선에 들어가는 쉬는 후보는 바로 해제한다([`supersedes`]).
+//!
+//! 공유 크기(정사각 `max_shared_surface_size`) 타깃은 어디에도 끼지 않는다. 회전 한 바퀴
+//! 안에서 포락선이 최대 크기로 수렴하고, 그 뒤로는 그 하나가 매 프레임 쓰이므로 새 할당도
+//! GC 도 없다.
+//!
+//! 큰 텍스처에 작은 태스크를 그리는 것은 공유 타깃이 매 프레임 하는 일과 같은 경로다 --
+//! 프레임 빌더는 `texture_id` 와 `used_rect` 만 넘기고, 렌더러는 `used_rect` 만 지우고
+//! (scissor), 투영과 샘플링은 실제 텍스처 크기를 쓴다.
+//!
+//! 끄면 upstream 동작 그대로다. pref 는 `gfx_wr_render_target_reuse_larger`(기본 켜짐),
+//! 런처의 되돌리기 스위치는 `-NoRenderTargetReuse`. ★벽에서는 아직 검증 전이다.★
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// painter 가 pref 를 읽어 세운다(`webrender` 는 `servo-config` 에 의존하지 않는다).
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// 풀에 든 렌더 타깃 하나를 [`pick_dedicated`] 와 [`supersedes`] 가 보는 모습.
+///
+/// ★크기를 `i32` 쌍으로 받는 이유★: 이 파일은 의존성이 없어서 `rustc --test` 로 혼자
+/// 시험할 수 있다. webrender 는 Servo 워크스페이스 밖의 `[patch]` 크레이트라
+/// `cargo test -p webrender` 가 안 되고, 단독 매니페스트는 상위 워크스페이스로 잡히며
+/// dev-dependency(mozangle, rand 0.4)도 있다(2026-11-12 확인).
+#[derive(Clone, Copy, Debug)]
+pub struct PoolEntry {
+    pub width: i32,
+    pub height: i32,
+    pub same_format: bool,
+    pub active: bool,
+    /// 이번 프레임에 이미 쓰였는가. ★이번 프레임의 앞 패스가 그린 텍스처일 수 있다★ --
+    /// 그런 것은 해제하지 않는다(`gc_render_targets` 의 `used_this_frame` 과 같은 규칙).
+    pub used_this_frame: bool,
+}
+
+/// [`pick_dedicated`] 의 답.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// 풀의 이 순번 타깃을 그대로 쓴다.
+    Reuse(usize),
+    /// 이 크기로 새로 만든다. 만들기 전에 [`supersedes`] 가 참인 것을 풀에서 해제한다.
+    Allocate { width: i32, height: i32 },
+}
+
+/// 공유 쪽 몫이 아니고, 같은 포맷이며, 지금 쓰이지 않는 타깃인가.
+fn is_candidate(entry: &PoolEntry, shared: i32) -> bool {
+    entry.same_format && !entry.active && !(entry.width == shared && entry.height == shared)
+}
+
+/// 정확 일치가 없는 ★전용★ 요청에 무엇을 줄지 고른다.
+///
+/// 1. 후보 중 요청을 담는 ★가장 작은★ 것을 빌린다 -- 작은 전용 태스크가 큰 텍스처를
+///    차지해 큰 요청이 또 만들게 되는 일을 막는다.
+/// 2. 없으면 요청과 후보들의 ★가로·세로 각각의 최대값(포락선)★ 으로 새로 만든다.
+///
+/// `shared` 는 공유 타깃의 한 변(`max_shared_surface_size`)이다.
+pub fn pick_dedicated<I>(pool: I, width: i32, height: i32, shared: i32) -> Pick
+where
+    I: IntoIterator<Item = PoolEntry>,
+{
+    let mut best: Option<(usize, i64)> = None;
+    let (mut env_w, mut env_h) = (width, height);
+    for (index, entry) in pool.into_iter().enumerate() {
+        if !is_candidate(&entry, shared) {
+            continue;
+        }
+        env_w = env_w.max(entry.width);
+        env_h = env_h.max(entry.height);
+        if entry.width >= width && entry.height >= height {
+            let area = entry.width as i64 * entry.height as i64;
+            if best.map_or(true, |(_, best_area)| area < best_area) {
+                best = Some((index, area));
+            }
+        }
+    }
+    match best {
+        Some((index, _)) => Pick::Reuse(index),
+        None => Pick::Allocate {
+            width: env_w,
+            height: env_h,
+        },
+    }
+}
+
+/// 포락선 `width` x `height` 를 새로 만들 때 이 타깃을 해제하는가.
+///
+/// ★해제하는 이유★: 남겨 두면 1 번(가장 작은 것)이 요청을 옛 타깃들에 나눠 주고, 그러면
+/// 가장 큰 포락선이 60 프레임 동안 안 쓰이는 구간이 생겨 GC 가 버린다 -- 회전 한 바퀴마다
+/// 다시 만든다. 해제하면 그 surface 의 몫이 포락선 하나로 모이고, 매 프레임 쓰이므로 GC 에
+/// 걸리지 않는다. 포락선에 들어가는 쉬는 후보만, 그리고 이번 프레임에 쓰이지 않은 것만 푼다.
+pub fn supersedes(entry: PoolEntry, width: i32, height: i32, shared: i32) -> bool {
+    is_candidate(&entry, shared)
+        && !entry.used_this_frame
+        && entry.width <= width
+        && entry.height <= height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHARED: i32 = 2048;
+
+    fn idle(width: i32, height: i32) -> PoolEntry {
+        PoolEntry {
+            width,
+            height,
+            same_format: true,
+            active: false,
+            used_this_frame: false,
+        }
+    }
+
+    #[test]
+    fn an_empty_pool_allocates_the_request() {
+        assert_eq!(
+            pick_dedicated([], 3840, 1280, SHARED),
+            Pick::Allocate {
+                width: 3840,
+                height: 1280
+            }
+        );
+    }
+
+    #[test]
+    fn a_smaller_request_borrows_an_idle_larger_target() {
+        assert_eq!(
+            pick_dedicated([idle(3840, 1280)], 3584, 1024, SHARED),
+            Pick::Reuse(0)
+        );
+    }
+
+    #[test]
+    fn the_smallest_target_that_holds_the_request_wins() {
+        let pool = [idle(4096, 4096), idle(3840, 1792), idle(4096, 1792)];
+        assert_eq!(pick_dedicated(pool, 3584, 1536, SHARED), Pick::Reuse(1));
+    }
+
+    #[test]
+    fn a_miss_grows_to_the_envelope_of_the_idle_dedicated_targets() {
+        // (4096, 1536) is wider than both idle targets, so neither holds it: grow to the
+        // widest and the tallest seen.
+        let pool = [idle(3840, 1280), idle(3584, 1792)];
+        assert_eq!(
+            pick_dedicated(pool, 4096, 1536, SHARED),
+            Pick::Allocate {
+                width: 4096,
+                height: 1792
+            }
+        );
+    }
+
+    #[test]
+    fn shared_size_targets_are_neither_borrowed_nor_part_of_the_envelope_nor_freed() {
+        let pool = [idle(SHARED, SHARED)];
+        assert_eq!(
+            pick_dedicated(pool, 1024, 512, SHARED),
+            Pick::Allocate {
+                width: 1024,
+                height: 512
+            }
+        );
+        let pool = [idle(SHARED, SHARED), idle(1024, 512)];
+        assert_eq!(
+            pick_dedicated(pool, 2304, 256, SHARED),
+            Pick::Allocate {
+                width: 2304,
+                height: 512
+            }
+        );
+        assert!(!supersedes(idle(SHARED, SHARED), 4096, 4096, SHARED));
+    }
+
+    #[test]
+    fn an_active_target_is_neither_borrowed_nor_part_of_the_envelope_nor_freed() {
+        let busy = PoolEntry {
+            active: true,
+            ..idle(4096, 4096)
+        };
+        assert_eq!(
+            pick_dedicated([busy], 3584, 1024, SHARED),
+            Pick::Allocate {
+                width: 3584,
+                height: 1024
+            }
+        );
+        let busy = PoolEntry {
+            active: true,
+            ..idle(1024, 1024)
+        };
+        assert!(!supersedes(busy, 4096, 4096, SHARED));
+    }
+
+    #[test]
+    fn another_format_is_neither_borrowed_nor_part_of_the_envelope_nor_freed() {
+        let alpha = PoolEntry {
+            same_format: false,
+            ..idle(4096, 4096)
+        };
+        assert_eq!(
+            pick_dedicated([alpha], 3584, 1024, SHARED),
+            Pick::Allocate {
+                width: 3584,
+                height: 1024
+            }
+        );
+        let alpha = PoolEntry {
+            same_format: false,
+            ..idle(1024, 1024)
+        };
+        assert!(!supersedes(alpha, 4096, 4096, SHARED));
+    }
+
+    #[test]
+    fn a_target_used_earlier_in_this_frame_is_not_freed() {
+        let used = PoolEntry {
+            used_this_frame: true,
+            ..idle(3840, 1280)
+        };
+        assert!(!supersedes(used, 4096, 2048, SHARED));
+        assert!(supersedes(idle(3840, 1280), 4096, 2048, SHARED));
+        assert!(
+            !supersedes(idle(4096, 4096), 4096, 2048, SHARED),
+            "not inside the envelope"
+        );
+    }
+
+    /// One pool entry in the simulation below.
+    struct Sim {
+        width: i32,
+        height: i32,
+        last: usize,
+    }
+
+    /// Which pool rule the simulation runs.
+    #[derive(Clone, Copy)]
+    enum Rule {
+        /// Upstream: exact match or allocate the request.
+        ExactOnly,
+        /// This module.
+        ReuseLarger,
+    }
+
+    /// Allocations per lap for a surface that asks for `cycle` once per frame, lap after lap,
+    /// with the pool run the way `ResourceCache` runs it: exact match first, then the rule,
+    /// then (above the 64 MB threshold, which is where the churn was measured) a GC that drops
+    /// whatever was not used in the last `window` frames. `window` is shorter than a lap, as
+    /// 60 frames is shorter than a 12 s rotation.
+    fn allocations_per_lap(
+        rule: Rule,
+        cycle: &[(i32, i32)],
+        laps: usize,
+        window: usize,
+    ) -> Vec<usize> {
+        let mut pool: Vec<Sim> = Vec::new();
+        let mut per_lap = vec![0; laps];
+        let mut frame = 0;
+        for lap in 0..laps {
+            for &(w, h) in cycle {
+                frame += 1;
+                if let Some(entry) = pool.iter_mut().find(|e| e.width == w && e.height == h) {
+                    entry.last = frame;
+                } else {
+                    let view = |e: &Sim| PoolEntry {
+                        width: e.width,
+                        height: e.height,
+                        same_format: true,
+                        active: false,
+                        used_this_frame: e.last == frame,
+                    };
+                    let pick = match rule {
+                        Rule::ExactOnly => Pick::Allocate {
+                            width: w,
+                            height: h,
+                        },
+                        Rule::ReuseLarger => pick_dedicated(pool.iter().map(view), w, h, SHARED),
+                    };
+                    match pick {
+                        Pick::Reuse(index) => pool[index].last = frame,
+                        Pick::Allocate { width, height } => {
+                            per_lap[lap] += 1;
+                            if let Rule::ReuseLarger = rule {
+                                pool.retain(|e| !supersedes(view(e), width, height, SHARED));
+                            }
+                            pool.push(Sim {
+                                width,
+                                height,
+                                last: frame,
+                            });
+                        },
+                    }
+                }
+                pool.retain(|e| frame - e.last < window);
+            }
+        }
+        per_lap
+    }
+
+    /// 256-rounded sizes a rotating surface asked for, in order, over one lap.
+    const ROTATION: [(i32, i32); 6] = [
+        (3840, 1280),
+        (3584, 1792),
+        (4096, 1536),
+        (3328, 2304),
+        (2560, 2816),
+        (3584, 1792),
+    ];
+
+    #[test]
+    fn upstream_reallocates_every_lap_when_the_gc_window_is_shorter_than_a_lap() {
+        // The simulation must reproduce the measured churn, or the next test proves nothing.
+        let per_lap = allocations_per_lap(Rule::ExactOnly, &ROTATION, 4, 3);
+        assert!(per_lap[1..].iter().all(|&n| n > 0), "per lap = {per_lap:?}");
+    }
+
+    #[test]
+    fn a_rotating_surface_stops_allocating_after_the_first_lap() {
+        let per_lap = allocations_per_lap(Rule::ReuseLarger, &ROTATION, 4, 3);
+        assert!(per_lap[0] > 0);
+        assert_eq!(&per_lap[1..], &[0, 0, 0], "per lap = {per_lap:?}");
+    }
+
+    #[test]
+    fn the_switch_defaults_to_on() {
+        assert!(is_enabled());
+    }
+}
