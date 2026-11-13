@@ -475,7 +475,7 @@ fn note_render_split(
         let inside = format!(
             " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us overlay={}us              prof={}us dbg={}us staging={}us pbo={}us devf={}us glerr={}us rest={}us \
              gpu_timers={} \
-             glerr_every={})",
+             glerr_every={} hud_every={})",
             wr.enter_us,
             wr.gpu_us,
             wr.draw_us,
@@ -491,6 +491,7 @@ fn note_render_split(
             parts[3].saturating_sub(wr_sum),
             wr.gpu_timers,
             webrender::wall_render_split::gl_error_check_every(),
+            webrender::wall_render_split::hud_draw_every(),
         );
         log::warn!(
             "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \

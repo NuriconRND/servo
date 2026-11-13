@@ -1066,6 +1066,36 @@ pub struct Preferences {
     ///
     /// 매 프레임 전체 파이프라인을 동기화하면서 `OUT_OF_MEMORY` 하나를 보는 것은 대가가 너무
     /// 크다. 1 초마다면 감지는 유지되고 비용은 1/60 이다.
+    /// HUD(ProfilerHud)를 몇 프레임마다 그릴지. ★기본 15 (60Hz 에서 초당 4 회)★.
+    /// 1 은 매 프레임(2026-11-13 이전 동작), 0 은 `-ProfilerHud` 를 준 채로 그리기를 끈다.
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/67 의 6 실행 A/B)
+    ///
+    ///     런   HUD  every  over  glerr  staging  pbo   ★devf p50★   dbg p50/max
+    ///     142  ON    60    283   0/2    0/2      0/0   ★18314us★    74/★14102★
+    ///     143  ON     1    194   1/47   0/0      0/0   ★18352us★    74/12856
+    ///     144  ON     0    220   0/0    0/0      0/0   ★17028us★    72/14364
+    ///     145  OFF   60     29   0/0    0/0      0/0   ★275us★      4/6
+    ///     146  OFF    1     24   1/1    0/0      0/0   ★322us★      3/35
+    ///     147  OFF    0     20   0/0    0/0      0/0   ★402us★      3/5
+    ///
+    /// 운영자: 142/143/144 는 "judder 가 세 경우 모두 동일한 수준으로 재발", 145/146/147 은
+    /// "judder 관찰되지 않음". 그리고 "각 tile에 표시되는 HUD가 ★매 프레임 갱신되는 것처럼★
+    /// 보였으며".
+    ///
+    /// `glerr_every=0`(144)에서도 재발했으므로 `glGetError` 가 아니다. `device.end_frame`
+    /// (`devf`)의 p50 이 HUD 켜짐 18314us 대 꺼짐 275us 로 ★45 배★ 다. 그 함수는 GL 상태
+    /// 설정뿐이고 flush 가 없으므로(`gl.rs:3757~3782`), 17ms 는 ★드라이버 명령 큐가 꽉 차서
+    /// 자리를 기다리는 것★ 이다. 증거는 `dbg` 다 -- HUD 그리기 자체는 p50 74us 인데 max 가
+    /// 14ms 다. 특정 호출이 느린 게 아니라 GL 호출이 전반적으로 막힌다.
+    ///
+    /// 4 타일 x 매 프레임 x 텍스트 렌더가 큐를 채운다. HUD 의 목적은 fps 확인이고 매 프레임
+    /// 갱신은 필요 없다 -- 15 면 읽기에 충분하고 GL 명령이 1/15 로 줄어든다.
+    ///
+    /// 게이트는 네 곳이다: `bind_debug_overlay`(안 그리는 프레임에는 ***bind 조차 하지
+    /// 않는다*** -- 그래야 DComp 타일의 이전 내용이 유지된다), `profiler.update`,
+    /// `profiler.draw_profile`, `debug_renderer.render`.
+    pub gfx_wall_hud_draw_every: i64,
     pub gfx_wall_gl_error_check_every: i64,
     pub gfx_wall_webgl_busy_map_single_shard: bool,
     pub gfx_wall_animation_zero_snaps_to_tick: bool,
@@ -1923,6 +1953,7 @@ impl Preferences {
             gfx_wall_webgl_scissor_hold_when_static: true,
             gfx_wall_animation_zero_snaps_to_tick: false,
             gfx_wall_gl_error_check_every: 60,
+            gfx_wall_hud_draw_every: 15,
             gfx_wall_webgl_busy_map_single_shard: false,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,

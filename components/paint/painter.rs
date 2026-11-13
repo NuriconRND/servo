@@ -819,6 +819,9 @@ impl Painter {
         webrender::wall_render_split::set_gl_error_check_every(
             servo_config::pref!(gfx_wall_gl_error_check_every).clamp(0, 600) as u32,
         );
+        webrender::wall_render_split::set_hud_draw_every(
+            servo_config::pref!(gfx_wall_hud_draw_every).clamp(0, 600) as u32,
+        );
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,

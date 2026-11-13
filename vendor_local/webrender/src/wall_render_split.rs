@@ -212,6 +212,42 @@ pub fn mark_endf3(_started: Instant) {
     });
 }
 
+/// 이 프레임에 HUD 를 그릴지. 주기는 `set_hud_draw_every` 가 싣는다.
+///
+/// ## 왜 주기인가 (2026-11-13)
+///
+/// 67 번 6 실행 A/B 에서 HUD 를 켜면 `device.end_frame`(`devf`)의 p50 이 ★18314us★, 끄면
+/// ★275us★ 였다(45 배). 그리고 `glerr_every=0` 에서도 재발했으므로 `glGetError` 가 아니다.
+///
+/// `device.end_frame` 은 GL 상태 설정뿐이고 flush 가 없다. 그런 명령이 17ms 걸리는 것은
+/// ★드라이버 명령 큐가 꽉 차서 자리를 기다리는 것★ 이다. 그 증거가 `dbg` 다 -- HUD 그리기
+/// 자체는 p50 74us 인데 max 가 14ms 다. 특정 호출이 느린 게 아니라 GL 호출이 전반적으로 막힌다.
+///
+/// 운영자 관찰 -- "각 tile에 표시되는 HUD가 매 프레임 갱신되는 것처럼 보였으며". 4 타일 x 매
+/// 프레임 x 텍스트 렌더가 큐를 채운다. HUD 의 목적은 fps 확인이고 매 프레임 갱신은 필요 없다.
+/// 기본 15(60Hz 에서 초당 4 회)면 읽기에 충분하고 GL 명령이 1/15 로 줄어든다.
+pub fn should_draw_hud() -> bool {
+    let every = HUD_EVERY.load(Ordering::Relaxed);
+    if every == 0 {
+        return false;
+    }
+    let nth = HUD_SEQ.fetch_add(1, Ordering::Relaxed);
+    nth % u64::from(every) == 0
+}
+
+/// `gfx_wall_hud_draw_every` 를 싣는다. `paint` 가 틱마다 부른다.
+pub fn set_hud_draw_every(every: u32) {
+    HUD_EVERY.store(every, Ordering::Relaxed);
+}
+
+/// 지금 주기. 로그에 함께 찍어 어느 설정으로 측정했는지 남긴다.
+pub fn hud_draw_every() -> u32 {
+    HUD_EVERY.load(Ordering::Relaxed)
+}
+
+static HUD_EVERY: AtomicU32 = AtomicU32::new(15);
+static HUD_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// `check_gl_errors` 를 이 프레임에 할지. 주기는 `set_gl_error_check_every` 가 싣는다.
 ///
 /// ## 왜 주기인가 (2026-11-13)

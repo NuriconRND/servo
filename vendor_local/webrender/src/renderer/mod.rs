@@ -1758,7 +1758,12 @@ impl Renderer {
             self.profile.set(profiler::FRAME_TIME, time);
         }
 
-        let debug_overlay = device_size.and_then(|device_size| {
+        // ★HUD 를 N 프레임마다 그린다.★ 근거는 `wall_render_split::should_draw_hud` 의 doc --
+        // 67 번에서 HUD 를 켜면 `device.end_frame` 의 p50 이 18314us, 끄면 275us 였고, 그것은
+        // 드라이버 명령 큐 포화다. 안 그리는 프레임에는 ***bind 조차 하지 않는다*** -- 그래야
+        // DComp 타일의 이전 내용이 유지된다.
+        let draw_hud = crate::wall_render_split::should_draw_hud();
+        let debug_overlay = device_size.filter(|_| draw_hud).and_then(|device_size| {
             // Bind a surface to draw the debug / profiler information to.
             self.bind_debug_overlay(device_size).map(|draw_target| {
                 self.draw_render_target_debug(&draw_target);
@@ -1862,9 +1867,16 @@ impl Renderer {
         );
 
         // Note: profile counters must be set before this or they will count for next frame.
-        self.profiler.update();
+        if draw_hud {
+            self.profiler.update();
+        }
 
-        if self.debug_flags.intersects(DebugFlags::PROFILER_DBG | DebugFlags::PROFILER_CAPTURE) {
+        // ★HUD 텍스트를 쌓는 자리도 같은 주기로 게이트한다.★ 근거는 `should_draw_hud` 의 doc.
+        if draw_hud
+            && self
+                .debug_flags
+                .intersects(DebugFlags::PROFILER_DBG | DebugFlags::PROFILER_CAPTURE)
+        {
             if let Some(device_size) = device_size {
                 //TODO: take device/pixel ratio into equation?
                 if let Some(debug_renderer) = self.debug.get_mut(&mut self.device) {
@@ -1881,7 +1893,7 @@ impl Renderer {
             self.device.echo_driver_messages();
         }
 
-        if let Some(debug_renderer) = self.debug.try_get_mut() {
+        if let Some(debug_renderer) = self.debug.try_get_mut().filter(|_| draw_hud) {
             let small_screen = self.debug_flags.contains(DebugFlags::SMALL_SCREEN);
             let scale = if small_screen { 1.6 } else { 1.0 };
             // TODO(gw): Tidy this up so that compositor config integrates better
