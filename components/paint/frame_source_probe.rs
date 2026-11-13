@@ -182,6 +182,9 @@ static RENDER_OVER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 const FRAME_PERIOD_NANOS: u64 = 16_667_000;
 
 /// `Paint::produce_wall_frame` 이 불린 횟수. ★틱당 1 이어야 한다.★
+/// 앞 리포트의 틱 에지 수와 생산 호출 수. 구간 차분용이다.
+static PREV_EDGES: AtomicU64 = AtomicU64::new(0);
+static PREV_CALLS: AtomicU64 = AtomicU64::new(0);
 static PRODUCE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// 그중 ★대상 타일이 없어 아무것도 하지 않은★ 횟수(`target_painter_ids.is_empty()`).
 static PRODUCE_NO_TARGETS: AtomicU64 = AtomicU64::new(0);
@@ -510,11 +513,28 @@ fn report(elapsed: Duration) {
         let no_targets = PRODUCE_NO_TARGETS.load(Ordering::Relaxed);
         let held = PRODUCE_HELD.load(Ordering::Relaxed);
         let none = OUTCOME_NONE.load(Ordering::Relaxed);
+        // ★틱 에지 수를 함께 찍는다.★ 근거는 `wall_tick::tick_edge_count` 의 doc 주석 --
+        // 요점은 `pacing 발화`(`tick_phase_probe`)와 이 줄은 기준점이 달라 직접 뺄 수 없고,
+        // 같은 리포트 안에서만 손실 구간을 가를 수 있다는 것이다.
+        //
+        // 구간 차분도 함께 낸다 -- 시작 과도구간이 누적 평균을 가리지 않게 한다.
+        let edges = crate::wall_tick::tick_edge_count();
+        let prev_edges = PREV_EDGES.swap(edges, Ordering::Relaxed);
+        let prev_calls = PREV_CALLS.swap(calls, Ordering::Relaxed);
+        let d_edges = edges.saturating_sub(prev_edges);
+        let d_calls = calls.saturating_sub(prev_calls);
+        let window = REPORT_EVERY.as_secs_f64().max(1e-9);
         log::warn!(
-            "PRODUCE t={secs:.0}s calls={calls} ({:.1}/s) targets={targets} ({:.1}/s)              per_call={:.2} no_targets={no_targets} held={held} outcome_none={none}",
+            "PRODUCE t={secs:.0}s calls={calls} ({:.1}/s) targets={targets} ({:.1}/s) \
+             per_call={:.2} no_targets={no_targets} held={held} outcome_none={none} \
+             edges={edges} ({:.1}/s) window(edges={:.1}/s calls={:.1}/s miss={})",
             calls as f64 / secs,
             targets as f64 / secs,
             targets as f64 / calls as f64,
+            edges as f64 / secs,
+            d_edges as f64 / window,
+            d_calls as f64 / window,
+            d_edges.saturating_sub(d_calls),
         );
     }
 }

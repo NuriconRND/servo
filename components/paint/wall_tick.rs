@@ -376,6 +376,16 @@ pub(crate) fn current_tick_seq() -> u64 {
     TICK_SEQ.load(Ordering::Acquire)
 }
 
+/// 지금까지의 틱 에지 수. `frame_source_probe` 가 `PRODUCE` 줄에 함께 찍는다.
+///
+/// `note_tick_edge` 는 `fire_present_tick` 안의 `note_present_tick` 에서 불리고
+/// (`winit_wall/main.rs:1116`), 그 자리는 세 발화 경로(페이싱 / 타이머 / vsync)가 모두
+/// 지난다. 그래서 이 값이 ★셸이 실제로 낸 틱 에지의 수★ 이고, `PRODUCE calls` 와 같은
+/// 기준점·같은 구간에서 비교되면 48.8/s 의 손실이 셸 안인지 그 앞인지 가른다.
+pub(crate) fn tick_edge_count() -> u64 {
+    TICK_SEQ.load(Ordering::Relaxed)
+}
+
 /// ★타일 하나가 틱 하나에 쓸 수 있는 외부 서피스 표출 예산.★
 ///
 /// `present_external_only` 는 WR 프레임을 안 거치고 DComp 에 바로 commit 하는 경로라
