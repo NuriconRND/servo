@@ -1016,6 +1016,34 @@ pub struct Preferences {
     ///     snap     avg 1017us             -- 추정과 실제 틱의 거리
     ///     clamped  0                      -- 250ms 상한은 걸리지 않는다
     ///     calls    38~47/s 안정            -- 127 에서 62 -> 11 -> 4.3 급감(재생 중단과 동시)
+    /// busy 카운터 맵을 ★샤드 하나★ 로 쓴다(= 2026-11-13 이전 동작). 기본 꺼짐.
+    ///
+    /// ## 왜 이 플래그가 있나 (2026-11-13)
+    ///
+    /// `WebGLContextBusyMap` 은 painter 가 들고 있는 front buffer 수를 서피스마다 세는데, 앞
+    /// 판은 `Arc<RwLock<HashMap<..>>>` 으로 painter 4 개가 ***하나의 `RwLock` 을 공유***했다.
+    /// 캔버스를 WR 프레임에 넣는 경로가 프레임마다 그것을 ★write★ 로 잡는다
+    /// (`webrender_external_images.rs` 의 `lock_swap_chain` 과 `mark_surface_not_busy`).
+    ///
+    ///     프레임마다 painter 4 개 x (lock + unlock) = ★초당 480 회 write★
+    ///     RwLock write 는 ***완전 배타*** -- 다른 painter 셋과 WebGL 스레드를 전부 막는다
+    ///     WebGL 이 없으면 `lock_swap_chain` 이 ★아예 안 불린다★
+    ///
+    /// 마지막 줄이 운영자 관찰("WebGL 만 빼면 ticker 가 깨끗하다")의 조건을 만족한다. 그리고
+    /// `LOCKWAIT` 는 이 락을 ***재지 않는다*** -- 같은 함수 안의 `chain`(스왑체인 Mutex)과
+    /// `tex`(AcquireSync)만 잰다. "획득 대기는 무죄" 라는 앞선 결론이 이 자리를 빼고 있었다.
+    ///
+    /// 이 자리는 2026-11-13 의 전수 열거(운영자 지시)로 찾았다. 앞서 고른 다섯 가설
+    /// (scissor, lead 샘플, 전역 배타 락, 생산 박자, 애니메이션 기준 시각)이 모두 ***"무거운
+    /// 일"*** 이었고, `entry() += 1` 은 가벼워 보여 세지 않았는데, 가벼운 일을 초당 480 회
+    /// 완전 배타로 하면 4-way 경합이 된다.
+    ///
+    /// 지금은 `surface_id` 의 `painter_id` 로 샤딩하므로 쓰기 경합이 없다. ★동작은 같다★ --
+    /// 같은 키에 같은 카운터를 두고 같은 조건으로 읽으며, 샤드만 갈린다.
+    ///
+    /// 이 pref 를 켜면 샤드 0 하나만 쓰므로 앞 판과 완전히 같다. `BUSYLOCK`/`BUSYLOCKS` 가
+    /// 양쪽의 획득 대기를 재므로 ★한 배포본으로 경합의 크기와 수정의 효과를 모두 읽는다.★
+    pub gfx_wall_webgl_busy_map_single_shard: bool,
     pub gfx_wall_animation_zero_snaps_to_tick: bool,
     pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
     pub gfx_wall_webgl_scissor_hold_when_static: bool,
@@ -1870,6 +1898,7 @@ impl Preferences {
             gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_scissor_hold_when_static: true,
             gfx_wall_animation_zero_snaps_to_tick: false,
+            gfx_wall_webgl_busy_map_single_shard: false,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,

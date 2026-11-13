@@ -562,6 +562,28 @@ param(
     # was never implemented), miss counts lists whose tick was not in the 64-slot ring.
     #   -AnimationZeroSnap
     [switch] $AnimationZeroSnap,
+    # gfx_wall_webgl_busy_map_single_shard -- keep the busy-counter map on ONE shard, which
+    # is the behaviour before 2026-11-13. Off by default (sharded); this switch turns the old
+    # single-lock behaviour back on for comparison.
+    #
+    # Why it changed: WebGLContextBusyMap counts how many front buffers each painter holds,
+    # and it used to be one Arc<RwLock<HashMap<..>>> shared by all four painters. The path
+    # that hands a canvas to a WebRender frame takes that lock for WRITE every frame
+    # (lock_swap_chain and mark_surface_not_busy in webrender_external_images.rs), so four
+    # painters x (lock + unlock) = about 480 writes a second on a completely exclusive lock,
+    # blocking the other three painters and the WebGL thread. With no WebGL on the page
+    # lock_swap_chain is never called at all, which matches the report that the ticker is
+    # clean once WebGL is removed. LOCKWAIT never measured this lock -- it only covers the
+    # chain mutex and the AcquireSync in the same function.
+    #
+    # surface_id is (context_id, painter_id) and each painter only touches its own, so
+    # sharding by painter removes the write contention. Behaviour is identical: same keys,
+    # same counters, same read conditions -- only the shard differs.
+    #
+    # Read it with BUSYLOCK (tails >= 1ms) and BUSYLOCKS (every 1200 acquisitions): with the
+    # switch ON those numbers are the size of the old contention; OFF they should be ~0.
+    #   -WebglBusyMapSingleShard
+    [switch] $WebglBusyMapSingleShard,
     # gfx_wall_canvas_scissor_lead_periods -- how far ahead WebRender records the
     # per-time scissor table, in refresh periods. **Default 8** (133ms at 60Hz),
     # 0 turns it off, range 0..12. 2026-11-11.
@@ -1164,7 +1186,7 @@ $argList = @(
     "--pref", "gfx_wall_canvas_defeats_paint_side_throttle=$($CanvasDefeatsThrottle.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_canvas_live_window_ms=$CanvasLiveWindowMs",
     "--pref", "gfx_wall_live_canvas_tick_divisor=$LiveCanvasDivisor",
-    "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_webrender=$($WebglTileScissorFromWebrender.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_clear=$($WebglTileScissorClear.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_deferred_front_buffer=$($WebglDeferredFrontBuffer.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_scissor_hold_when_static=$((-not $NoScissorHoldWhenStatic.IsPresent).ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_tile_geometry=$($WebglTileScissorFromTileGeometry.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_animation_zero_snaps_to_tick=$($AnimationZeroSnap.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_webrender=$($WebglTileScissorFromWebrender.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_clear=$($WebglTileScissorClear.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_deferred_front_buffer=$($WebglDeferredFrontBuffer.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_scissor_hold_when_static=$((-not $NoScissorHoldWhenStatic.IsPresent).ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_tile_geometry=$($WebglTileScissorFromTileGeometry.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_animation_zero_snaps_to_tick=$($AnimationZeroSnap.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_busy_map_single_shard=$($WebglBusyMapSingleShard.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_canvas_scissor_lead_periods=$CanvasScissorLead",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
@@ -1240,7 +1262,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

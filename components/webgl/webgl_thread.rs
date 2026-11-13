@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
@@ -71,7 +71,156 @@ fn native_uniform_location(location: i32) -> Option<NativeUniformLocation> {
 /// currently taken a surface from its [`SwapChain`] for rendering purposes. Contexts will
 /// only be deleted once no WebRender instance is using it for rendering. This ensures
 /// that all Surfman `Surface`s can be released properly on the [`WebGLThread`].
-pub type WebGLContextBusyMap = Arc<RwLock<HashMap<WebGLSurfaceId, usize>>>;
+/// painter 가 들고 있는 front buffer 의 수를 서피스마다 센다. ★painter 로 샤딩한다.★
+///
+/// ## 왜 샤딩인가 (2026-11-13)
+///
+/// 앞 판은 `Arc<RwLock<HashMap<WebGLSurfaceId, usize>>>` 로 painter 4 개가 ***하나의
+/// `RwLock` 을 공유***했고, 캔버스를 WR 프레임에 넣는 경로가 프레임마다 그것을 ★write★ 로
+/// 잡았다(`webrender_external_images.rs` 의 `lock_swap_chain` 과 `mark_surface_not_busy`).
+/// 프레임마다 painter 4 개가 lock + unlock 을 하므로 ★초당 480 회 write★ 이고, `RwLock`
+/// write 는 완전 배타라 다른 painter 셋과 WebGL 스레드를 전부 막는다.
+///
+/// `surface_id` 는 `(context_id, painter_id)` 이고 ***각 painter 는 자기 것만 쓴다.*** 그래서
+/// painter 로 샤딩하면 쓰기 경합이 사라진다. 읽기(`any_busy`)와 teardown 의 `remove_all` 은
+/// 드물므로 전 샤드를 돈다.
+///
+/// WebGL 이 없으면 `lock_swap_chain` 이 아예 안 불리므로 이 비용 자체가 0 이다 -- 운영자
+/// 관찰("WebGL 만 빼면 ticker 가 깨끗하다")의 조건을 만족하는 자리였다.
+///
+/// `LOCKWAIT` 는 이 락을 재지 않는다 -- 같은 함수 안의 `chain`(스왑체인 Mutex)과
+/// `tex`(AcquireSync)만 잰다. 그래서 "획득 대기는 무죄" 라는 앞선 결론이 이 자리를 빼고 있었다.
+#[derive(Clone, Default)]
+pub struct WebGLContextBusyMap(Arc<BusyShards>);
+
+/// 샤드 수. 타일 4 개에 여유를 둔 고정값이고, 2 의 거듭제곱이라 나머지 연산이 싸다.
+const BUSY_SHARDS: usize = 8;
+
+#[derive(Default)]
+struct BusyShards {
+    shards: [RwLock<HashMap<WebGLSurfaceId, usize>>; BUSY_SHARDS],
+}
+
+impl WebGLContextBusyMap {
+    /// 이 서피스를 담당하는 샤드. 같은 painter 의 것은 항상 같은 샤드로 간다.
+    ///
+    /// `single_shard` 가 켜지면 샤드 0 하나만 쓴다 -- 앞 판과 완전히 같은 동작이고, 비교용이다.
+    fn shard(&self, surface_id: WebGLSurfaceId) -> &RwLock<HashMap<WebGLSurfaceId, usize>> {
+        let index = if busy_map_single_shard() {
+            0
+        } else {
+            webrender_api::IdNamespace::from(surface_id.painter_id).0 as usize % BUSY_SHARDS
+        };
+        &self.0.shards[index]
+    }
+
+    /// painter 가 이 서피스의 front buffer 를 잡았다.
+    pub fn mark_busy(&self, surface_id: WebGLSurfaceId) {
+        let shard = self.shard(surface_id);
+        let started = Instant::now();
+        let mut guard = shard.write();
+        note_busy_lock(started.elapsed(), true);
+        *guard.entry(surface_id).or_default() += 1;
+    }
+
+    /// painter 가 놓았다. 카운터가 없거나 0 이면 경고만 하고 넘어간다(앞 판과 같다).
+    pub fn mark_not_busy(&self, surface_id: WebGLSurfaceId) {
+        let shard = self.shard(surface_id);
+        let started = Instant::now();
+        let mut guard = shard.write();
+        note_busy_lock(started.elapsed(), true);
+        let Some(count) = guard.get_mut(&surface_id) else {
+            warn!("WebGL external image busy counter underflow: missing entry for {surface_id:?}");
+            return;
+        };
+        if *count == 0 {
+            warn!("WebGL external image busy counter underflow: zero count for {surface_id:?}");
+        } else {
+            *count -= 1;
+        }
+    }
+
+    /// 이 서피스들 중 하나라도 painter 가 들고 있나. teardown 판정에 쓰므로 드물다.
+    pub fn any_busy(&self, surface_ids: &[WebGLSurfaceId]) -> bool {
+        surface_ids.iter().any(|surface_id| {
+            let started = Instant::now();
+            let guard = self.shard(*surface_id).read();
+            note_busy_lock(started.elapsed(), false);
+            guard
+                .get(surface_id)
+                .is_some_and(|busy_count| *busy_count > 0)
+        })
+    }
+
+    /// 카운터를 지운다. 컨텍스트를 놓거나 없앨 때만 부르므로 드물다.
+    pub fn remove_all(&self, surface_ids: &[WebGLSurfaceId]) {
+        for surface_id in surface_ids {
+            let started = Instant::now();
+            let mut guard = self.shard(*surface_id).write();
+            note_busy_lock(started.elapsed(), true);
+            guard.remove(surface_id);
+        }
+    }
+}
+
+/// 샤드 0 하나만 쓸지(= 앞 판과 같은 동작). `paint` 가 틱마다 싣는다.
+static BUSY_MAP_SINGLE_SHARD: AtomicBool = AtomicBool::new(false);
+
+/// `gfx_wall_webgl_busy_map_single_shard` 를 싣는다.
+pub fn set_busy_map_single_shard(enabled: bool) {
+    BUSY_MAP_SINGLE_SHARD.store(enabled, Ordering::Relaxed);
+}
+
+fn busy_map_single_shard() -> bool {
+    BUSY_MAP_SINGLE_SHARD.load(Ordering::Relaxed)
+}
+
+/// busy 카운터 락의 획득 대기를 잰다. 꼬리(>= 1ms)는 그때그때, 나머지는 1200 획득마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// 이 락이 샤딩 전에는 painter 4 개가 공유하는 하나였고 프레임마다 초당 480 회 write 로
+/// 잡혔다. 그 대기를 재는 계측이 ***없었다*** -- `LOCKWAIT` 는 같은 함수 안의 다른 두 락만
+/// 잰다. 샤딩이 들면 꼬리가 0 이 되어야 하고, `-WebglBusyMapSingleShard` 로 앞 판 동작을
+/// 켜면 그 값이 ★경합의 크기★ 로 나온다.
+///
+/// ## 비용
+///
+/// 획득마다 `Instant::now()` 둘과 원자 셋이다. 480/s 이면 약 25us/s 다.
+fn note_busy_lock(waited: Duration, is_write: bool) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let us = waited.as_micros() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if is_write {
+        WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if waited >= Duration::from_millis(1) {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        let kind = if is_write { "write" } else { "read" };
+        warn!(
+            "BUSYLOCK #{tail} {kind} waited={us}us (shard-single={})",
+            busy_map_single_shard()
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "BUSYLOCKS n={nth} writes={} wait(avg={}us max={}us) tails={} single_shard={}",
+        WRITES.swap(0, Ordering::Relaxed),
+        SUM_US.swap(0, Ordering::Relaxed) / 1200,
+        MAX_US.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+        busy_map_single_shard(),
+    );
+}
 
 pub(crate) struct GLContextData {
     pub(crate) ctx: Context,
@@ -2142,14 +2291,8 @@ impl WebGLThread {
     }
 
     fn context_has_busy_surfaces(&self, context_id: WebGLContextId) -> bool {
-        let busy_webgl_context_map = self.busy_webgl_context_map.read();
-        self.backend_surface_ids(context_id)
-            .iter()
-            .any(|surface_id| {
-                busy_webgl_context_map
-                    .get(surface_id)
-                    .is_some_and(|busy_count| *busy_count > 0)
-            })
+        self.busy_webgl_context_map
+            .any_busy(&self.backend_surface_ids(context_id))
     }
 
     /// Removes a WebGLContext and releases attached resources.
@@ -2174,12 +2317,7 @@ impl WebGLThread {
             // WebRender 가 아직 이 서피스로 그리는 중이다 — 다음 기회에.
             return;
         }
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            for surface_id in &surface_ids {
-                busy_webgl_context_map.remove(surface_id);
-            }
-        }
+        self.busy_webgl_context_map.remove_all(&surface_ids);
         for surface_id in surface_ids {
             let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id);
@@ -2281,12 +2419,7 @@ impl WebGLThread {
             return;
         }
 
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            for surface_id in &surface_ids {
-                busy_webgl_context_map.remove(surface_id);
-            }
-        }
+        self.busy_webgl_context_map.remove_all(&surface_ids);
 
         // Release webrender image keys.
         if let Some(image_key) = self

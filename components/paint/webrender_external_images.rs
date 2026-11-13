@@ -116,10 +116,9 @@ impl WebGLExternalImages {
         let surface_id = WebGLSurfaceId::new(id, self.painter_id);
         debug!("... locking chain {:?} for surface {:?}", id, surface_id);
 
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            *busy_webgl_context_map.entry(surface_id).or_default() += 1;
-        }
+        // ★painter 별 샤드로 간다.★ 근거는 `WebGLContextBusyMap` 의 doc 주석 -- 앞 판은
+        // painter 4 개가 하나의 `RwLock` 을 공유해 프레임마다 초당 480 회 write 로 잡았다.
+        self.busy_webgl_context_map.mark_busy(surface_id);
 
         let Some(swap_chain) = self.swap_chains.get(surface_id) else {
             // ★스왑체인이 없다 = 이 컨텍스트의 백엔드를 놓아 둔 상태★ — 그런데 방금 WR 이
@@ -345,17 +344,7 @@ impl WebGLExternalImages {
     }
 
     fn mark_surface_not_busy(&self, surface_id: WebGLSurfaceId) {
-        let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-        let Some(count) = busy_webgl_context_map.get_mut(&surface_id) else {
-            warn!("WebGL external image busy counter underflow: missing entry for {surface_id:?}");
-            return;
-        };
-
-        if *count == 0 {
-            warn!("WebGL external image busy counter underflow: zero count for {surface_id:?}");
-        } else {
-            *count -= 1;
-        }
+        self.busy_webgl_context_map.mark_not_busy(surface_id);
     }
 
     fn unlock_swap_chain(&mut self, id: WebGLContextId) -> Option<()> {
