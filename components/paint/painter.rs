@@ -778,6 +778,11 @@ impl Painter {
             webrender::wall_rt_probe::start();
         }
 
+        // ★2026-11-13 텍스처 캐시 프로브★ -- 같은 방식(리포터 한 번, 꺼지면 원자 로드 하나).
+        if pref!(gfx_wr_texture_cache_probe) {
+            webrender::wall_tex_probe::start();
+        }
+
         // ★프레임 발행 출처★ -- `gfx_wall_tick_phase_probe` 와 한 스위치를 쓴다(`-TickPhase`).
         // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
         if pref!(gfx_wall_tick_phase_probe) {
@@ -804,6 +809,11 @@ impl Painter {
         ));
         webrender::wall_rt_reuse::set_keep_frames(
             servo_config::pref!(gfx_wr_render_target_keep_frames).max(0) as u64,
+        );
+        // ★2026-11-13: 텍스처 캐시 내보내기 예산의 하한(MB, 0 = upstream).★ 기능 게이트라
+        // 계측 스위치와 무관하게 세운다. 근거는 `vendor_local/webrender/src/wall_tex_cache.rs`.
+        webrender::wall_tex_cache::set_eviction_floor_mb(
+            servo_config::pref!(gfx_wr_texture_cache_evict_budget_mb).max(0) as u64,
         );
         // ★유효기간도 여기서 원자에 싣는다.★ 소비자(WebGL 스레드)는 캔버스 프레임마다
         // painter 수만큼 이 값을 읽으므로, 거기서 `pref!`(전역 RwLock)을 치면 안 된다 --
@@ -859,6 +869,13 @@ impl Painter {
                 // from `FontKey`, `FontInstanceKey`, and `ImageKey` back to `PainterId`.
                 namespace_alloc_by_client: true,
                 shared_font_namespace: Some(painter_id.into()),
+                // ★2026-11-13★ 이 크기를 넘는 이미지는 512 타일로 쪼개져 공유 아틀라스로 가고,
+                // 보이는 타일만 요청돼 회전·이동 중에도 타일 업로드·내보내기가 이어진다. 기본
+                // 4096 = upstream. WR 이 장치 최대 텍스처 크기로 다시 자른다. 근거는
+                // `vendor_local/webrender/src/wall_tex_cache.rs` 머리 주석 4 -- 보통 사진은
+                // `dom_image_max_decoded_pixels` 가 먼저 줄여 여기 닿지 않는다.
+                image_tiling_threshold: pref!(gfx_wr_image_tiling_threshold).clamp(512, 16384)
+                    as i32,
                 ..Default::default()
             },
             None,

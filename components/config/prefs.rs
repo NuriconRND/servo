@@ -583,6 +583,28 @@ pub struct Preferences {
     /// 런처는 `-RenderTargetKeepFrames <n>`. 벽 검증(2026-11-12, log_rotation_opacity_judder_01/02):
     /// 남은 새 할당이 10 초에 19~20 -> 9~10 으로 줄었지만 운영자 육안 차이는 없었다.
     pub gfx_wr_render_target_keep_frames: i64,
+    /// ★2026-11-13 추가★ -- WebRender 텍스처 캐시의 업로드·할당·내보내기를 세는 프로브(기본
+    /// 꺼짐). 10 초마다 `TEXPROBE` 줄, 무거운 업로드 프레임마다 UTC 시각이 찍힌 `TEXHEAVY` 줄을
+    /// 낸다. 이미지와 비디오에 같은 회전 + opacity 를 걸면 이미지 쪽 전환에서 judder 가 더 많다는
+    /// 운영자 보고의 가설(숨긴 prewarm 은 업로드되지 않고, 화면에서 빠지면 작은 예산 때문에 곧
+    /// 내보내져 등장마다 다시 올린다)을 재기 위한 것이다. 근거와 성능 규칙은
+    /// `vendor_local/webrender/src/wall_tex_probe.rs`. 런처는 `-TextureCacheProbe`.
+    pub gfx_wr_texture_cache_probe: bool,
+    /// ★2026-11-13 추가★ -- 이 크기(가로나 세로)를 넘는 이미지를 512 타일로 쪼갠다. 기본 4096 은
+    /// upstream 값이다. 쪼개진 이미지는 공유 아틀라스로 가고 보이는 타일만 요청되므로, 회전·이동
+    /// 중에도 타일 업로드·내보내기가 이어진다(3072x4608 이미지 = 타일 54 장). 8192~16384 로 올리면
+    /// 큰 이미지도 한 장으로 올라간다(D3D11 최대 16384, WR 이 장치 한계로 다시 자른다). 런처는
+    /// `-ImageTilingThreshold <n>`. ★단, `dom_image_max_decoded_pixels`(기본 3840x2160 픽셀)가
+    /// 먼저 줄이므로★ 보통 사진은 여기 닿지 않는다 -- 그 상한 안에서 한 변이 4096 을 넘는
+    /// 이미지에만 해당한다(2026-11-13 확인: 3072x4608 은 2352x3527 로 줄어 한 장으로 올라갔다).
+    pub gfx_wr_image_tiling_threshold: i64,
+    /// ★2026-11-13 추가★ -- WebRender 텍스처 캐시 내보내기 기준의 하한(MB). 0 이면 upstream
+    /// 그대로(standalone 8 MB, 공유 RGBA 아틀라스 약 5.3 MB). 올리면 그 양까지는 화면에서 빠진
+    /// 이미지도 GPU 에 남아, 장면이 다시 나올 때 다시 올리지 않는다. 대가는 painter(GPU)당 그만큼의
+    /// VRAM. 공유 아틀라스가 여러 장이면 기준 아래서도 400 프레임 넘게 안 쓰인 것은 내보낸다
+    /// (upstream 의 조각 모음). 근거는 `vendor_local/webrender/src/wall_tex_cache.rs`. 런처는
+    /// `-TextureCacheBudgetMB <n>`.
+    pub gfx_wr_texture_cache_evict_budget_mb: i64,
 
     pub gfx_wall_parallel_tiles: bool,
     /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
@@ -1719,6 +1741,9 @@ impl Preferences {
             gfx_wr_render_target_probe: false,
             gfx_wr_render_target_reuse_larger: true,
             gfx_wr_render_target_keep_frames: 1800,
+            gfx_wr_texture_cache_probe: false,
+            gfx_wr_image_tiling_threshold: 4096,
+            gfx_wr_texture_cache_evict_budget_mb: 0,
             gfx_wall_parallel_tiles: false,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,

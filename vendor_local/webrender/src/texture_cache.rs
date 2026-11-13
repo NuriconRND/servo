@@ -1111,7 +1111,15 @@ impl TextureCache {
     }
 
     /// Get the eviction threshold, in bytes, for the given budget type.
+    ///
+    /// ★2026-11-13★ upstream 이 고른 값에 `wall_tex_cache` 의 하한을 건다(기본 0 = 그대로).
     fn get_eviction_threshold(&self, budget_type: BudgetType) -> usize {
+        crate::wall_tex_cache::floor_eviction_threshold(
+            self.upstream_eviction_threshold(budget_type),
+        )
+    }
+
+    fn upstream_eviction_threshold(&self, budget_type: BudgetType) -> usize {
         if budget_type == BudgetType::Standalone {
             // For standalone textures, the only reason to evict textures is
             // to save GPU memory. Batching / draw call concerns do not apply
@@ -1241,6 +1249,15 @@ impl TextureCache {
                         youngest_evicted = entry.last_access.frame_id();
                     }
                     let entry = self.lru_cache.pop_oldest(budget as u8).unwrap();
+                    // ★2026-11-13 TEXPROBE★ -- 내보낸 것이 다시 보이면 다시 올린다.
+                    match &entry.details {
+                        EntryDetails::Standalone { size_in_bytes, .. } => {
+                            crate::wall_tex_probe::note_evict(false, *size_in_bytes as u64)
+                        },
+                        EntryDetails::Cache { allocated_size_in_bytes, .. } => {
+                            crate::wall_tex_probe::note_evict(true, *allocated_size_in_bytes as u64)
+                        },
+                    }
                     entry.evict();
                     self.free(&entry);
                     eviction_count += 1;
@@ -1504,6 +1521,13 @@ impl TextureCache {
 
         let details = new_cache_entry.details.clone();
         let texture_id = new_cache_entry.texture_id;
+
+        // ★2026-11-13 TEXPROBE★ -- standalone(큰 이미지 한 장) / 공유 아틀라스(타일·글리프·작은
+        // 이미지)를 나눠 센다. `wall_tex_probe.rs` 참고.
+        crate::wall_tex_probe::note_alloc(use_shared_cache, match &details {
+            EntryDetails::Standalone { size_in_bytes, .. } => *size_in_bytes as u64,
+            EntryDetails::Cache { allocated_size_in_bytes, .. } => *allocated_size_in_bytes as u64,
+        });
 
         // If the handle points to a valid cache entry, we want to replace the
         // cache entry with our newly updated location. We also need to ensure

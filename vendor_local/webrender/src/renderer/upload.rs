@@ -48,10 +48,14 @@ const BATCH_UPLOAD_FORMAT_COUNT: usize = 4;
 ///
 /// This is the main entry point of the texture cache upload code.
 /// See also the module documentation for more information.
+///
+/// ★2026-11-13★ 이 호출이 올린 바이트와 걸린 시간(ns)을 돌려준다 -- 아래에서 원래 재던
+/// `stats.bytes_uploaded` 와 `upload_total` 그대로다. 호출처가 프레임 단위로 합쳐
+/// `wall_tex_probe::note_frame` 에 넘긴다(새로 재지 않는다).
 pub fn upload_to_texture_cache(
     renderer: &mut Renderer,
     update_list: FastHashMap<CacheTextureId, Vec<TextureCacheUpdate>>,
-) {
+) -> (u64, u64) {
 
     let mut stats = UploadStats {
         num_draw_calls: 0,
@@ -345,6 +349,8 @@ pub fn upload_to_texture_cache(
     	let details = format!("{} bytes uploaded, {} items", stats.bytes_uploaded, stats.items_uploaded);
     	profiler::add_text_marker(&"Texture uploads", &details, Duration::from_nanos(upload_total));
     }
+
+    (stats.bytes_uploaded as u64, upload_total)
 }
 
 /// Copy an item into a batched upload staging buffer.

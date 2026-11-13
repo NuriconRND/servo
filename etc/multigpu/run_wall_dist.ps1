@@ -124,6 +124,27 @@ param(
     # 10 s with reuse ON = GC frees 4-5 + supersedes 15: a moving image leaves a tile for over
     # a second, the GC drops that painter's envelope, and it regrows on return.
     [int] $RenderTargetKeepFrames = 1800,
+    # (2026-11-13) gfx_wr_texture_cache_probe -- count WebRender texture-cache uploads (bytes,
+    # time, frames, per-frame max), allocations and evictions (standalone vs shared atlas), and
+    # print a TEXPROBE line every 10 s plus one TEXHEAVY line (UTC time, MB, ms) per frame that
+    # uploads >= 4 MiB or spends >= 4 ms. Match TEXHEAVY times against ANIMSCRIPTSTART to see
+    # which scene entry/exit uploaded what. Why: same rotate+opacity on an image vs a video, the
+    # image judders more on transitions; hypothesis = hidden prewarm (opacity 0) never uploads,
+    # and a small eviction budget throws the image away soon after it leaves the screen, so
+    # every entry re-uploads it on all four painters. Off costs one AtomicBool load per site.
+    [switch] $TextureCacheProbe,
+    # (2026-11-13) gfx_wr_image_tiling_threshold -- images wider or taller than this are split
+    # into 512 px tiles in the shared atlas, and only visible tiles are requested, so rotation
+    # and movement keep uploading/evicting tiles. 4096 = upstream (default, same as the engine).
+    # 8192..16384 keeps such images in one texture (D3D11 max 16384). Ordinary photos never
+    # reach it: dom_image_max_decoded_pixels (3840x2160 px by default) shrinks them first
+    # (3072x4608 -> 2352x3527, one texture), so this only matters for e.g. 1000x8000 panoramas.
+    [int] $ImageTilingThreshold = 4096,
+    # (2026-11-13) gfx_wr_texture_cache_evict_budget_mb -- floor (MB) under every WebRender
+    # texture-cache eviction threshold. 0 = upstream (standalone 8 MB, shared RGBA atlas ~5.3 MB;
+    # default, same as the engine). Raise it (e.g. 1024) to keep images that left the screen
+    # resident so a scene that comes back does not re-upload them. Costs that much VRAM per GPU.
+    [int] $TextureCacheBudgetMB = 0,
     # Raise RUST_LOG for diagnostic runs only. Empty leaves the default "warn" alone --
     # **the default behaviour does not change.**
     #
@@ -1093,6 +1114,9 @@ $argList = @(
     "--pref", "gfx_wr_render_target_probe=$($RenderTargetProbe.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wr_render_target_reuse_larger=$((-not $NoRenderTargetReuse.IsPresent).ToString().ToLower())",
     "--pref", "gfx_wr_render_target_keep_frames=$RenderTargetKeepFrames",
+    "--pref", "gfx_wr_texture_cache_probe=$($TextureCacheProbe.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wr_image_tiling_threshold=$ImageTilingThreshold",
+    "--pref", "gfx_wr_texture_cache_evict_budget_mb=$TextureCacheBudgetMB",
     "--pref", "media_d3d11_enabled=true",
     "--pref", "media_direct_file_enabled=true",
     "--pref", "media_gapless_loop_enabled=true",
@@ -1163,7 +1187,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

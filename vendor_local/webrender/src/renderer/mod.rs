@@ -1981,6 +1981,10 @@ impl Renderer {
 
         let mut create_cache_texture_time = 0;
         let mut delete_cache_texture_time = 0;
+        // ★2026-11-13 TEXPROBE★ -- 이 프레임의 업로드 합. `upload_to_texture_cache` 가 원래
+        // 재던 값을 돌려받아 더하기만 한다.
+        let mut frame_upload_bytes = 0u64;
+        let mut frame_upload_ns = 0u64;
 
         for update_list in pending_texture_updates.drain(..) {
             // Handle copies from one texture to another.
@@ -2153,10 +2157,20 @@ impl Renderer {
                 };
             }
 
-            upload_to_texture_cache(self, update_list.updates);
+            let (bytes, nanos) = upload_to_texture_cache(self, update_list.updates);
+            frame_upload_bytes += bytes;
+            frame_upload_ns += nanos;
 
             self.check_gl_errors();
         }
+
+        // ★2026-11-13 TEXPROBE★ -- 생성 시간은 이 프레임에 새로 만든 텍스처 전부(텍스처 캐시와
+        // 렌더 타깃)다. 렌더 타깃만의 몫은 RTPROBE 의 create 가 따로 센다.
+        crate::wall_tex_probe::note_frame(
+            frame_upload_bytes,
+            frame_upload_ns,
+            create_cache_texture_time,
+        );
 
         if create_cache_texture_time > 0 {
             self.profile.set(
