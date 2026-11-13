@@ -382,7 +382,7 @@ pub(crate) fn note_tick_edge() {
 }
 
 /// 애니메이션 기준 시각을 실제 틱 격자로 스냅할지. 기본 켜짐.
-static ZERO_SNAPS_TO_TICK: AtomicBool = AtomicBool::new(true);
+static ZERO_SNAPS_TO_TICK: AtomicBool = AtomicBool::new(false);
 
 /// `gfx_wall_animation_zero_snaps_to_tick` 를 싣는다. `paint` 가 틱마다 부른다.
 pub fn set_animation_zero_snaps_to_tick(enabled: bool) {

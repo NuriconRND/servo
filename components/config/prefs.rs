@@ -961,7 +961,8 @@ pub struct Preferences {
     /// 없다. 캔버스가 가상 뷰포트를 꽉 채울 때만 작동하고(아니면 `None`), ★전환 중에는 빈
     /// 공간이 생긴다★ -- 그것이 넓히기(`20ee1a167ab` 이후)를 만든 이유였고 이 A/B 에서는
     /// 알려진 대가다.
-    /// paint 측 애니메이션의 기준 시각을 ★실제 틱 격자로 스냅★ 한다. 기본 켜짐.
+    /// paint 측 애니메이션의 기준 시각을 실제 틱 격자로 스냅한다. ★기본 꺼짐 -- 실기에서
+    /// 해로웠다.★
     ///
     /// ## 왜 (2026-11-13)
     ///
@@ -989,8 +990,32 @@ pub struct Preferences {
     /// 가까운 기록을 써서 기준점을 16.67ms 격자에 앉힌다. 한 프레임(8.33ms)보다 먼 기록은
     /// 다른 틱이므로 쓰지 않고 앞 판처럼 추정값을 쓴다.
     ///
-    /// 끄면 앞 판과 완전히 같다. `ANIMZERO` 의 `snap avg/max` 가 ★꺼져 있을 때의 흔들림
-    /// 크기★ 를 그대로 보여주므로, 한 배포본으로 원인과 효과를 모두 읽을 수 있다.
+    /// ## 실기 반증 (2026-11-13, log_webgl_perf_01/59)
+    ///
+    ///     128 (ON)   snap(n=3744 avg=1017us ★max=8308us★)  miss=516 (12%)
+    ///     129 (OFF)  snap(n=0) miss=4188
+    ///
+    /// 운영자: 127/128 은 "가장 매끄러운 구간에서도 등속 이동이 아니라 ★진동하는듯한★
+    /// 이동", 129 는 "수정 이전과 유사 (매끄러운 구간에서 매끄러움)". ***켜면 더 나쁘다.***
+    ///
+    /// 이유가 수치에 있다. `max=8308us` 가 `SNAP_LIMIT`(8333us)에 붙어 있다 -- 추정값이 틱
+    /// 격자의 ***중간쯤***에 자주 놓이고, 그러면 앞 틱과 뒤 틱 중 어느 쪽이 가까운지가 미세한
+    /// 차이로 뒤집혀 기준점이 ★16.7ms 씩 점프★ 한다. 게다가 `miss` 12% 는 추정값을 쓰므로 두
+    /// 종류의 기준점이 섞인다.
+    ///
+    /// 전제가 틀렸다 -- `built_at` 이 틱 시각인 것은 맞지만, 전체 지연(`transit`)이 실측
+    /// avg 8ms, ★max 64ms★ 로 크게 변동하므로 추정값을 격자에 양자화하면 변동이 ***계단으로
+    /// 바뀌어*** 더 나쁘다.
+    ///
+    /// 그래서 기본은 꺼짐이고, 꺼지면 앞 판과 완전히 같다. 플래그와 `ANIMZERO` 는 남긴다 --
+    /// `snap avg/max` 가 추정 오차의 크기를 재 주고, 다른 접근과 비교할 때 비용이 0 이다.
+    ///
+    /// ## 계측이 준 수치 (59 번)
+    ///
+    ///     transit  avg 8ms,  ★max 64ms★   -- `built_at` 의 doc 이 적은 "5-30 ms" 의 두 배
+    ///     snap     avg 1017us             -- 추정과 실제 틱의 거리
+    ///     clamped  0                      -- 250ms 상한은 걸리지 않는다
+    ///     calls    38~47/s 안정            -- 127 에서 62 -> 11 -> 4.3 급감(재생 중단과 동시)
     pub gfx_wall_animation_zero_snaps_to_tick: bool,
     pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
     pub gfx_wall_webgl_scissor_hold_when_static: bool,
@@ -1844,7 +1869,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_scissor_hold_when_static: true,
-            gfx_wall_animation_zero_snaps_to_tick: true,
+            gfx_wall_animation_zero_snaps_to_tick: false,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
