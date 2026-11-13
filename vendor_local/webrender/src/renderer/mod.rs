@@ -1743,10 +1743,11 @@ impl Renderer {
         }
 
         self.unlock_external_images(&frame.deferred_resolves);
-        crate::wall_render_split::mark_exit(split_at);
+        crate::wall_render_split::mark_unlock(split_at);
 
         let _gm = self.gpu_profiler.start_marker("end frame");
         self.gpu_profiler.end_frame();
+        crate::wall_render_split::mark_endf(split_at);
 
         let t = self.profile.end_time(profiler::RENDERER_TIME);
         self.profile.end_time_if_started(profiler::TOTAL_FRAME_CPU_TIME);
@@ -1927,6 +1928,10 @@ impl Renderer {
         self.documents_seen.clear();
         self.shared_texture_cache_cleared = false;
 
+        // ★render_impl 의 끝에서 꼬리 구간을 닫는다.★ `mark_unlock` 뒤로 약 200 줄이 더
+        // 가고 그 안에 `update_gpu_profile` 의 블로킹 GPU 쿼리(`GL_QUERY_RESULT`)가 있다.
+        // 63 번에서 wr 합이 draw 의 20.1% 밖에 설명하지 못한 것이 이 구간이다.
+        crate::wall_render_split::mark_tail(split_at);
         self.check_gl_errors();
 
         if self.renderer_errors.is_empty() {
@@ -1936,6 +1941,9 @@ impl Renderer {
         }
     }
 
+    /// `render_impl` 의 끝에서 꼬리 구간을 닫는다. 근거는 `wall_render_split` 의 모듈 주석 --
+    /// `mark_unlock` 뒤로 약 200 줄이 더 가고 그 안에 `update_gpu_profile` 의 블로킹 GPU
+    /// 쿼리가 있다.
     fn update_gpu_profile(&mut self, device_size: DeviceIntSize) {
         let _gm = self.gpu_profiler.start_marker("build samples");
         // Block CPU waiting for last frame's GPU profiles to arrive.
@@ -5576,6 +5584,9 @@ impl Renderer {
 
     pub fn set_debug_flags(&mut self, flags: DebugFlags) {
         if let Some(enabled) = flag_changed(self.debug_flags, flags, DebugFlags::GPU_TIME_QUERIES) {
+            // ★그 값을 로그에 남긴다.★ 근거는 `wall_render_split::note_gpu_timers` 의 doc --
+            // `tail` 구간의 블로킹 쿼리(`GL_QUERY_RESULT`)는 이 플래그가 켜져 있을 때만 돈다.
+            crate::wall_render_split::note_gpu_timers(enabled);
             if enabled {
                 self.gpu_profiler.enable_timers();
             } else {

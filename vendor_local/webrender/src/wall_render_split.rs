@@ -47,14 +47,31 @@ pub struct Split {
     pub enter_us: u64,
     pub gpu_us: u64,
     pub draw_us: u64,
-    pub exit_us: u64,
+    pub unlock_us: u64,
+    pub endf_us: u64,
+    /// `mark_unlock` 뒤부터 `render_impl` 끝까지. ★`update_gpu_profile` 의 블로킹 GPU
+    /// 쿼리(`GL_QUERY_RESULT`)가 이 안이다★ -- 63 번에서 wr 합이 `draw` 의 20.1% 밖에
+    /// 설명하지 못한 것이 이 구간이었다.
+    pub tail_us: u64,
+    /// GPU 타이머 쿼리가 켜져 있나. `DebugFlags::GPU_TIME_QUERIES` 의 현재 값이다.
+    pub gpu_timers: bool,
 }
 
 thread_local! {
     /// 구간 경계의 시각. `start` 가 세우고 각 `mark_*` 가 옮긴다.
     static AT: Cell<Option<Instant>> = const { Cell::new(None) };
     /// 쌓인 구간. `paint` 가 `take` 로 가져간다.
-    static SPLIT: Cell<Split> = const { Cell::new(Split { enter_us: 0, gpu_us: 0, draw_us: 0, exit_us: 0 }) };
+    static SPLIT: Cell<Split> = const {
+        Cell::new(Split {
+            enter_us: 0,
+            gpu_us: 0,
+            draw_us: 0,
+            unlock_us: 0,
+            endf_us: 0,
+            tail_us: 0,
+            gpu_timers: false,
+        })
+    };
 }
 
 /// 재기 시작한다. 반환값은 `mark_*` 에 그대로 넘긴다(쓰이지는 않고, 호출 순서를 코드에 박기
@@ -101,17 +118,47 @@ pub fn mark_draw(_started: Instant) {
     });
 }
 
-pub fn mark_exit(_started: Instant) {
+pub fn mark_unlock(_started: Instant) {
     let us = lap();
     SPLIT.set(Split {
-        exit_us: us,
+        unlock_us: us,
         ..SPLIT.get()
     });
 }
 
+pub fn mark_endf(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        endf_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// `render_impl` 의 끝. ★이 구간에 `update_gpu_profile` 의 블로킹 GPU 쿼리가 있다.★
+pub fn mark_tail(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        tail_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// GPU 타이머 쿼리가 켜져 있는지 남긴다. `Renderer::set_debug_flags` 가 부른다.
+///
+/// `tail` 이 범인이면 `DebugFlags::GPU_TIME_QUERIES` 를 끄는 것만으로 해결되므로, 그 값이
+/// 로그에 함께 있어야 판정이 된다.
+pub fn note_gpu_timers(enabled: bool) {
+    GPU_TIMERS.set(enabled);
+}
+
+thread_local! {
+    static GPU_TIMERS: Cell<bool> = const { Cell::new(false) };
+}
+
 /// 쌓인 구간을 가져가고 비운다. `paint` 의 `RenderSplit::finish` 가 부른다.
 pub fn take() -> Split {
-    let split = SPLIT.get();
+    let mut split = SPLIT.get();
+    split.gpu_timers = GPU_TIMERS.get();
     SPLIT.set(Split::default());
     AT.set(None);
     split

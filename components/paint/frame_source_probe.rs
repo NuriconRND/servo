@@ -454,10 +454,23 @@ fn note_render_split(
             ),
             None => String::from(" stats=n/a"),
         };
-        // ★WR 안의 네 구간★ -- 작업량이 0 인데 시간이 간 자리를 이것이 가른다.
+        // ★WR 안의 여섯 구간과 경계 밖으로 샌 시간★.
+        //
+        // `rest` 는 `draw` 에서 wr 합을 뺀 값이다 -- 63 번에서 wr 합이 `draw` 의 20.1% 밖에
+        // 설명하지 못했고(꼬리 317 건 중 264 건이 50% 미만), 그 구멍이 `mark_unlock` 뒤
+        // 약 200 줄이었다. 이제 `tail` 이 그것을 덮지만, 이른 반환이나 내가 놓친 경로가
+        // 남아 있어도 `rest` 가 숨기지 않는다.
+        let wr_sum = wr.enter_us + wr.gpu_us + wr.draw_us + wr.unlock_us + wr.endf_us + wr.tail_us;
         let inside = format!(
-            " wr(enter={}us gpu={}us draw={}us exit={}us)",
-            wr.enter_us, wr.gpu_us, wr.draw_us, wr.exit_us
+            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us tail={}us rest={}us              gpu_timers={})",
+            wr.enter_us,
+            wr.gpu_us,
+            wr.draw_us,
+            wr.unlock_us,
+            wr.endf_us,
+            wr.tail_us,
+            parts[3].saturating_sub(wr_sum),
+            wr.gpu_timers,
         );
         log::warn!(
             "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \
