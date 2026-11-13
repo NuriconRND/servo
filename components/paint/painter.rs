@@ -1698,6 +1698,9 @@ impl Painter {
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
         self.last_render_started_at.set(Some(Instant::now()));
 
+        // ★이미 측정된 60ms 를 구간으로 쪼갠다.★ 근거는 `note_render_split` 의 doc 주석.
+        // `RENDERCOST` 와 같은 범위를 그대로 나누므로 합이 그 값과 맞는다.
+        let mut split = crate::frame_source_probe::RenderSplit::start();
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -1711,6 +1714,7 @@ impl Painter {
             self.assert_no_gl_error();
 
             self.rendering_context.prepare_for_rendering();
+            split.mark_lock();
 
             time_profile!(
                 ProfilerCategory::Painting,
@@ -1736,6 +1740,7 @@ impl Painter {
                         } else {
                             renderer.update();
                         }
+                        split.mark_update();
                     }
                     if let Some(target) = publish_target {
                         // 목표는 ***이미 채널에 있는*** id 였으므로(알림이 `send` 뒤에 온다)
@@ -1751,6 +1756,7 @@ impl Painter {
                         let size = self.rendering_context.size2d().to_i32();
                         let _ = renderer.render(size, 0 /* buffer_age */);
                     }
+                    split.mark_draw();
 
                     // The native compositor's `bind` leaves an EGL pbuffer current. Restore the
                     // window surface as current so the next GL user (clear_background, egui
@@ -1788,7 +1794,9 @@ impl Painter {
         // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
         // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
+        split.mark_post();
         self.pump_paint_animation(PumpSource::Render);
+        split.mark_pump();
 
         // 타일 스레드에 사는 painter 는 표출까지 자기가 한다 — 셸에는 이 컨텍스트가 없다.
         // 인라인 경로에서는 셸이 present 하므로 여기서는 아무것도 하지 않는다.
@@ -1798,6 +1806,7 @@ impl Painter {
 
         // ★present 까지 포함해서 잰다.★ 스레드 타일은 자기가 표출하고 셸의 조인이 그것까지
         // 기다리므로, 그 비용도 ***논리 프레임***의 비용이다.
+        split.finish();
         if let Some(started) = render_started_for_probe {
             crate::frame_source_probe::note_render_duration(started.elapsed());
         }
