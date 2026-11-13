@@ -468,9 +468,11 @@ fn note_render_split(
             + wr.overlay_us
             + wr.prof_us
             + wr.dbg_us
+            + wr.endf3_us
             + wr.tail_us;
         let inside = format!(
-            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us overlay={}us              prof={}us dbg={}us tail={}us rest={}us gpu_timers={})",
+            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us overlay={}us              prof={}us dbg={}us endf3={}us glerr={}us rest={}us gpu_timers={} \
+             glerr_every={})",
             wr.enter_us,
             wr.gpu_us,
             wr.draw_us,
@@ -479,9 +481,11 @@ fn note_render_split(
             wr.overlay_us,
             wr.prof_us,
             wr.dbg_us,
+            wr.endf3_us,
             wr.tail_us,
             parts[3].saturating_sub(wr_sum),
             wr.gpu_timers,
+            webrender::wall_render_split::gl_error_check_every(),
         );
         log::warn!(
             "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \

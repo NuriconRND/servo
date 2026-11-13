@@ -39,6 +39,7 @@
 //! 경합이 없고, 꼬리 줄은 `RENDERSPLIT` 이 이미 내는 것에 묻어 가므로 I/O 가 늘지 않는다.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// 이 스레드의 마지막 `render_impl` 구간들. 순서는 enter/gpu/draw/exit 다.
@@ -60,7 +61,11 @@ pub struct Split {
     /// `profiler.set_counters`/`update` + `PROFILER_DBG` 블록 + `debug_renderer` 렌더.
     /// ★HUD 를 실제로 그리는 구간★.
     pub dbg_us: u64,
-    /// `staging/pbo/device end_frame` + `check_gl_errors`. 앞 판의 `tail` 에서 위 셋을 뺀 것.
+    /// `staging/pbo/device end_frame` 셋.
+    pub endf3_us: u64,
+    /// ★`check_gl_errors` = `glGetError`★. 드라이버의 미처리 명령을 flush 하고 동기화하므로,
+    /// HUD 가 추가한 GL 작업을 여기서 전부 기다린다(65 번: HUD 켜짐 p50 17500us 대 꺼짐
+    /// 245us). 주기 게이트가 들어간 뒤로는 검사하는 프레임에만 값이 찍힌다.
     pub tail_us: u64,
     /// GPU 타이머 쿼리가 켜져 있나. `DebugFlags::GPU_TIME_QUERIES` 의 현재 값이다.
     pub gpu_timers: bool,
@@ -80,6 +85,7 @@ thread_local! {
             overlay_us: 0,
             prof_us: 0,
             dbg_us: 0,
+            endf3_us: 0,
             tail_us: 0,
             gpu_timers: false,
         })
@@ -172,6 +178,48 @@ pub fn mark_dbg(_started: Instant) {
         ..SPLIT.get()
     });
 }
+
+/// `end_frame` 셋이 끝났다. 다음이 `check_gl_errors` 다.
+pub fn mark_endf3(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        endf3_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// `check_gl_errors` 를 이 프레임에 할지. 주기는 `set_gl_error_check_every` 가 싣는다.
+///
+/// ## 왜 주기인가 (2026-11-13)
+///
+/// `glGetError` 는 드라이버의 미처리 명령을 flush 하고 ***동기화***한다. 65 번에서 그 자리의
+/// p50 이 HUD 켜짐 17500us, 꺼짐 245us 였다 -- HUD 가 추가한 GL 명령을 이 호출이 전부
+/// 기다렸고, 작업량이 같은 프레임(`draws=3`)이 41ms 가 됐다.
+///
+/// 매 프레임 전체 파이프라인을 동기화하면서 `OUT_OF_MEMORY` 하나를 보는 것은 대가가 너무
+/// 크다. 기본 60(1 초마다)이면 감지는 유지되고 비용은 1/60 이다. 1 은 앞 판 동작(비교용),
+/// 0 은 완전히 끈다.
+pub fn should_check_gl_errors() -> bool {
+    let every = GL_ERROR_EVERY.load(Ordering::Relaxed);
+    if every == 0 {
+        return false;
+    }
+    let nth = GL_ERROR_SEQ.fetch_add(1, Ordering::Relaxed);
+    nth % u64::from(every) == 0
+}
+
+/// `gfx_wall_gl_error_check_every` 를 싣는다. `paint` 가 틱마다 부른다.
+pub fn set_gl_error_check_every(every: u32) {
+    GL_ERROR_EVERY.store(every, Ordering::Relaxed);
+}
+
+/// 지금 주기. 로그에 함께 찍어 어느 설정으로 측정했는지 남긴다.
+pub fn gl_error_check_every() -> u32 {
+    GL_ERROR_EVERY.load(Ordering::Relaxed)
+}
+
+static GL_ERROR_EVERY: AtomicU32 = AtomicU32::new(60);
+static GL_ERROR_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `render_impl` 의 끝.
 pub fn mark_tail(_started: Instant) {

@@ -1043,6 +1043,30 @@ pub struct Preferences {
     ///
     /// 이 pref 를 켜면 샤드 0 하나만 쓰므로 앞 판과 완전히 같다. `BUSYLOCK`/`BUSYLOCKS` 가
     /// 양쪽의 획득 대기를 재므로 ★한 배포본으로 경합의 크기와 수정의 효과를 모두 읽는다.★
+    /// `glGetError` 로 OOM 을 보는 주기(프레임). ★기본 60 -- 1 초마다★. 1 은 매 프레임
+    /// (2026-11-13 이전 동작), 0 은 완전히 끈다.
+    ///
+    /// ## 왜 주기로 바꿨나 (2026-11-13)
+    ///
+    /// `Renderer::check_gl_errors` 가 매 프레임 `glGetError` 를 불렀고, 그것은 드라이버의
+    /// 미처리 명령을 flush 하고 ***동기화***한다.
+    ///
+    /// 65 번(그 구간을 `tail` 로 쪼갠 로그):
+    ///
+    ///     137 (HUD 켜짐)  over=★283★  tail p50 ★17500us★  p90 31510us  max 41664us
+    ///     138 (HUD 꺼짐)  over=★31★   tail p50 ★245us★    p90 9406us   max 22851us
+    ///
+    /// 같은 구간의 다른 후보는 전부 무죄였다 -- `overlay`(DComp bind) p50 325us,
+    /// `prof`(CPU 집계) 0us, `dbg`(HUD 그리기) p50 73us. 즉 ★HUD 는 그리는 비용이 아니라
+    /// 그린 것을 `glGetError` 가 동기화하는 비용★ 이고, 그래서 작업량이 같은 프레임
+    /// (`draws=3 upload=0.00MB`)이 41ms 가 됐다.
+    ///
+    /// 그 앞의 64 번에서 운영자가 `-ProfilerHud "FPS"` 를 빼니 judder 가 사라졌고(육안) 꼬리가
+    /// 305 건에서 19 건으로 줄었다. 이 pref 는 ★HUD 를 켜도 그렇게 되도록★ 하는 것이다.
+    ///
+    /// 매 프레임 전체 파이프라인을 동기화하면서 `OUT_OF_MEMORY` 하나를 보는 것은 대가가 너무
+    /// 크다. 1 초마다면 감지는 유지되고 비용은 1/60 이다.
+    pub gfx_wall_gl_error_check_every: i64,
     pub gfx_wall_webgl_busy_map_single_shard: bool,
     pub gfx_wall_animation_zero_snaps_to_tick: bool,
     pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
@@ -1898,6 +1922,7 @@ impl Preferences {
             gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_scissor_hold_when_static: true,
             gfx_wall_animation_zero_snaps_to_tick: false,
+            gfx_wall_gl_error_check_every: 60,
             gfx_wall_webgl_busy_map_single_shard: false,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,

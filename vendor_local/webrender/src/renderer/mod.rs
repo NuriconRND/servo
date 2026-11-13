@@ -1939,8 +1939,12 @@ impl Renderer {
         // ★render_impl 의 끝에서 꼬리 구간을 닫는다.★ `mark_unlock` 뒤로 약 200 줄이 더
         // 가고 그 안에 `update_gpu_profile` 의 블로킹 GPU 쿼리(`GL_QUERY_RESULT`)가 있다.
         // 63 번에서 wr 합이 draw 의 20.1% 밖에 설명하지 못한 것이 이 구간이다.
-        crate::wall_render_split::mark_tail(split_at);
+        // ★end_frame 셋이 끝났다.★ 아래 `check_gl_errors` 의 `glGetError` 가 드라이버를
+        // 동기화하므로 그 둘을 가른다 -- 65 번에서 `tail` p50 이 HUD 켜짐 17500us 대 꺼짐
+        // 245us 였고, 그 구간에 이 둘뿐이다.
+        crate::wall_render_split::mark_endf3(split_at);
         self.check_gl_errors();
+        crate::wall_render_split::mark_tail(split_at);
 
         if self.renderer_errors.is_empty() {
             Ok(results)
@@ -2191,7 +2195,19 @@ impl Renderer {
         );
     }
 
+    /// `glGetError` 로 `OUT_OF_MEMORY` 를 본다. ★주기를 둔다★ -- 2026-11-13.
+    ///
+    /// `glGetError` 는 드라이버의 미처리 명령을 flush 하고 ***동기화***한다. 65 번에서 HUD 를
+    /// 켜면 이 자리(`tail`)의 p50 이 17500us 였고 끄면 245us 였다 -- HUD 가 추가한 GL 명령을
+    /// 이 호출이 전부 기다린 것이다. 작업량이 같은 프레임(`draws=3`)이 41ms 가 되는 이유다.
+    ///
+    /// 매 프레임 전체 파이프라인을 동기화하면서 OOM 하나를 보는 것은 대가가 너무 크므로 주기로
+    /// 바꿨다. 기본 60(1 초마다)이면 감지는 유지되고 비용은 1/60 이다. 1 은 앞 판 동작이고
+    /// 0 은 완전히 끈다. 근거는 `wall_render_split::gl_error_check_every` 의 doc 주석.
     fn check_gl_errors(&mut self) {
+        if !crate::wall_render_split::should_check_gl_errors() {
+            return;
+        }
         let err = self.device.gl().get_error();
         if err == gl::OUT_OF_MEMORY {
             self.renderer_errors.push(RendererError::OutOfMemory);

@@ -374,12 +374,21 @@ impl WebGLExternalImages {
         // keeping lock/unlock balanced.
         self.mark_surface_not_busy(surface_id);
 
+        // ★세 단계를 가른다.★ 근거는 `note_unlock_cost` 의 doc 주석 -- 65 번에서 HUD 를 끈 뒤
+        // 남은 꼬리를 `unlock` 이 지배했고(p50 6637us, max 55285us) 그 안에 `ReleaseSync` 가
+        // 있다. 어느 단계인지 알아야 고칠 수 있다.
+        let at = Instant::now();
         let destroyed = self.rendering_context.destroy_texture(locked_front_buffer);
+        let destroy_us = at.elapsed().as_micros() as u64;
         let locked_front_buffer = destroyed?;
 
+        let at = Instant::now();
         self.recycle_or_forget(surface_id, locked_front_buffer)?;
+        let recycle_us = at.elapsed().as_micros() as u64;
 
+        let at = Instant::now();
         let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
+        note_unlock_steps(destroy_us, recycle_us, at.elapsed().as_micros() as u64);
 
         Some(())
     }
@@ -438,6 +447,55 @@ impl WebGLExternalImages {
 ///
 /// 이 경로는 이미 `ReleaseSync` 와 GL 호출을 하므로 `Instant::now()` 둘이 무의미하다. 프레임당
 /// 캔버스 수만큼 불린다(실측 240/s 이하).
+/// `unlock_swap_chain` 의 세 단계. 합이 2ms 를 넘으면 그때그때, 나머지는 1200 회마다.
+///
+/// ## 단계 (2026-11-13)
+///
+///     destroy   rendering_context.destroy_texture(locked_front_buffer)
+///     recycle   recycle_or_forget  -- ★여기에 `ReleaseSync` 가 있다★
+///     finish    webgl_threads.finished_rendering_to_context
+///
+/// 65 번에서 HUD 를 끈 뒤 남은 꼬리 31 건을 `unlock` 이 지배했다(p50 6637us, p90 33086us,
+/// max 55285us). 과제 #6 을 11 일 동안 `AcquireSync` 로 겨냥했는데 실제 꼬리는 ***반대편인
+/// `ReleaseSync`*** 다. 어느 단계인지 이 계측이 가른다.
+fn note_unlock_steps(destroy_us: u64, recycle_us: u64, finish_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SUM: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static MAX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let parts = [destroy_us, recycle_us, finish_us];
+    let total: u64 = parts.iter().sum();
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    for (slot, value) in SUM.iter().zip(parts) {
+        slot.fetch_add(value, Ordering::Relaxed);
+    }
+    for (slot, value) in MAX.iter().zip(parts) {
+        slot.fetch_max(value, Ordering::Relaxed);
+    }
+    if total >= 2_000 {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "UNLOCKSTEP #{tail} total={total}us destroy={destroy_us}us \
+             recycle={recycle_us}us finish={finish_us}us"
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "UNLOCKSTEPS n={nth} destroy(avg={}us max={}us) recycle(avg={}us max={}us) \
+         finish(avg={}us max={}us) tails={}",
+        SUM[0].swap(0, Ordering::Relaxed) / 1200,
+        MAX[0].swap(0, Ordering::Relaxed),
+        SUM[1].swap(0, Ordering::Relaxed) / 1200,
+        MAX[1].swap(0, Ordering::Relaxed),
+        SUM[2].swap(0, Ordering::Relaxed) / 1200,
+        MAX[2].swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
 fn note_unlock_cost(took: Duration) {
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static SUM_US: AtomicU64 = AtomicU64::new(0);

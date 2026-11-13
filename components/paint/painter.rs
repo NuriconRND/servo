@@ -816,6 +816,9 @@ impl Painter {
         webgl::webgl_thread::set_busy_map_single_shard(servo_config::pref!(
             gfx_wall_webgl_busy_map_single_shard
         ));
+        webrender::wall_render_split::set_gl_error_check_every(
+            servo_config::pref!(gfx_wall_gl_error_check_every).clamp(0, 600) as u32,
+        );
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,
