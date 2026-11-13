@@ -52,6 +52,15 @@ pub struct Split {
     /// `mark_unlock` 뒤부터 `render_impl` 끝까지. ★`update_gpu_profile` 의 블로킹 GPU
     /// 쿼리(`GL_QUERY_RESULT`)가 이 안이다★ -- 63 번에서 wr 합이 `draw` 의 20.1% 밖에
     /// 설명하지 못한 것이 이 구간이었다.
+    /// `bind_debug_overlay` + `draw_*_debug`. ★DComp `BeginDraw` 가 여기★ -- HUD 가 꺼지면
+    /// `bind_debug_overlay` 가 `None` 을 주므로 0 에 가깝다.
+    pub overlay_us: u64,
+    /// Telemetry/메모리/프로파일 집계 (CPU).
+    pub prof_us: u64,
+    /// `profiler.set_counters`/`update` + `PROFILER_DBG` 블록 + `debug_renderer` 렌더.
+    /// ★HUD 를 실제로 그리는 구간★.
+    pub dbg_us: u64,
+    /// `staging/pbo/device end_frame` + `check_gl_errors`. 앞 판의 `tail` 에서 위 셋을 뺀 것.
     pub tail_us: u64,
     /// GPU 타이머 쿼리가 켜져 있나. `DebugFlags::GPU_TIME_QUERIES` 의 현재 값이다.
     pub gpu_timers: bool,
@@ -68,6 +77,9 @@ thread_local! {
             draw_us: 0,
             unlock_us: 0,
             endf_us: 0,
+            overlay_us: 0,
+            prof_us: 0,
+            dbg_us: 0,
             tail_us: 0,
             gpu_timers: false,
         })
@@ -134,7 +146,34 @@ pub fn mark_endf(_started: Instant) {
     });
 }
 
-/// `render_impl` 의 끝. ★이 구간에 `update_gpu_profile` 의 블로킹 GPU 쿼리가 있다.★
+/// `debug_overlay` 블록이 끝났다. 그 안에 DComp `BeginDraw`(`compositor.bind`)가 있다.
+pub fn mark_overlay(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        overlay_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// CPU 집계가 끝났다. 아래부터 HUD 를 실제로 그린다.
+pub fn mark_prof(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        prof_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// HUD 그리기가 끝났다.
+pub fn mark_dbg(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        dbg_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// `render_impl` 의 끝.
 pub fn mark_tail(_started: Instant) {
     let us = lap();
     SPLIT.set(Split {

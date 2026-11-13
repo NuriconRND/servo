@@ -460,14 +460,25 @@ fn note_render_split(
         // 설명하지 못했고(꼬리 317 건 중 264 건이 50% 미만), 그 구멍이 `mark_unlock` 뒤
         // 약 200 줄이었다. 이제 `tail` 이 그것을 덮지만, 이른 반환이나 내가 놓친 경로가
         // 남아 있어도 `rest` 가 숨기지 않는다.
-        let wr_sum = wr.enter_us + wr.gpu_us + wr.draw_us + wr.unlock_us + wr.endf_us + wr.tail_us;
+        let wr_sum = wr.enter_us
+            + wr.gpu_us
+            + wr.draw_us
+            + wr.unlock_us
+            + wr.endf_us
+            + wr.overlay_us
+            + wr.prof_us
+            + wr.dbg_us
+            + wr.tail_us;
         let inside = format!(
-            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us tail={}us rest={}us              gpu_timers={})",
+            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us overlay={}us              prof={}us dbg={}us tail={}us rest={}us gpu_timers={})",
             wr.enter_us,
             wr.gpu_us,
             wr.draw_us,
             wr.unlock_us,
             wr.endf_us,
+            wr.overlay_us,
+            wr.prof_us,
+            wr.dbg_us,
             wr.tail_us,
             parts[3].saturating_sub(wr_sum),
             wr.gpu_timers,

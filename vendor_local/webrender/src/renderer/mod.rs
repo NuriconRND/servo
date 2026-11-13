@@ -1771,6 +1771,9 @@ impl Renderer {
             })
         });
 
+        // ★debug_overlay 가 끝났다.★ 이 안에 DComp `BeginDraw`(`compositor.bind`)가 있고,
+        // 64 번에서 HUD 를 끄니 `tail` p50 이 17787us -> 253us 로 떨어졌다.
+        crate::wall_render_split::mark_overlay(split_at);
         Telemetry::record_renderer_time(Duration::from_micros((t * 1000.00) as u64));
         if self.profile.get(profiler::SHADER_BUILD_TIME).is_none() {
           Telemetry::record_renderer_time_no_sc(Duration::from_micros((t * 1000.00) as u64));
@@ -1846,6 +1849,8 @@ impl Renderer {
         self.texture_resolver.update_profile(&mut self.profile);
 
         // Note: this clears the values in self.profile.
+        // 여기까지가 CPU 집계. 아래부터 HUD 를 실제로 그린다.
+        crate::wall_render_split::mark_prof(split_at);
         self.profiler.set_counters(&mut self.profile);
 
         // If debugger is enabled, collect any profiler updates before value is overwritten
@@ -1895,6 +1900,9 @@ impl Renderer {
             );
         }
 
+        // ★HUD 그리기가 끝났다.★ `dbg` 가 크면 그리기 자체이고, `overlay` 가 크면 DComp
+        // 경합이다 -- 그 둘이 HUD 수정 방향을 가른다.
+        crate::wall_render_split::mark_dbg(split_at);
         self.staging_texture_pool.end_frame(&mut self.device);
         self.texture_upload_pbo_pool.end_frame(&mut self.device);
         self.device.end_frame();

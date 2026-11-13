@@ -420,6 +420,49 @@ impl WebGLExternalImages {
 /// 25ns 이므로 240 lock/s 에서 18us/s 다. 꼬리 줄은 8ms 이상일 때만 나오고 실측 빈도가
 /// ***초당 0.2 회***라 I/O 가 문제되지 않는다. `swap_buffers` 쪽에 시계 하나가 더 늘었다
 /// (240/s = 6us/s).
+/// `ExternalImageHandler::unlock` 한 번의 비용. 꼬리(>= 2ms)는 그때그때, 나머지는 1200 회마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// `lock` 쪽은 `LOCKWAIT`(요약)와 `LOCKTAIL`(꼬리)이 `chain`/`tex` 를 재는데 ★`unlock` 쪽은
+/// 비어 있었다.★ 64 번에서 `-ProfilerHud "FPS"` 를 빼니 judder 가 사라지고(운영자 육안) 꼬리가
+/// 305 건 -> 19 건으로 줄었는데, ***그 19 건을 `unlock` 이 지배한다***
+/// (p50 12.5ms, p90 56.7ms, max 76.3ms). 그리고 그 프레임들은 `draws=3 upload=0.63MB
+/// full_paint=true` 로 실제 작업이 있는 프레임이다.
+///
+/// `unlock_swap_chain` 안에 `ReleaseSync` 가 있고, 그것은 생산자가 그 서피스를 다시 잡을 수
+/// 있게 keyed mutex 를 놓는 일이다. 거기서 수십 ms 가 가면 ★소비자가 생산자를 기다리는 것★
+/// 이므로, 과제 #6 이 `AcquireSync` 로 잘못 겨냥했던 것의 반대편이다.
+///
+/// ## 비용
+///
+/// 이 경로는 이미 `ReleaseSync` 와 GL 호출을 하므로 `Instant::now()` 둘이 무의미하다. 프레임당
+/// 캔버스 수만큼 불린다(실측 240/s 이하).
+fn note_unlock_cost(took: Duration) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let us = took.as_micros() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if took >= Duration::from_millis(2) {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!("UNLOCKTAIL #{tail} took={us}us");
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "UNLOCKCOST n={nth} took(avg={}us max={}us) tails={}",
+        SUM_US.swap(0, Ordering::Relaxed) / 1200,
+        MAX_US.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
 fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
     /// 꼬리로 보고 한 줄 찍는 기준. 한 주기(16.7ms)의 절반이다.
     const TAIL_US: u64 = 8_000;
@@ -525,6 +568,11 @@ impl WebRenderExternalImageApi for WebGLExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
+        // ★`unlock` 쪽은 한 번도 재지 않았다.★ 근거는 `note_unlock_cost` 의 doc 주석 --
+        // `lock` 쪽은 `LOCKWAIT`/`LOCKTAIL` 이 재는데 이쪽은 비어 있었고, 64 번에서 HUD 를
+        // 끈 뒤 남은 꼬리 19 건을 `unlock` 이 지배했다(p50 12.5ms, max 76.3ms).
+        let started = Instant::now();
         self.unlock_swap_chain(WebGLContextId(id));
+        note_unlock_cost(started.elapsed());
     }
 }
