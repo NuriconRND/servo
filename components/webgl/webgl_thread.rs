@@ -2352,7 +2352,58 @@ impl WebGLThread {
     /// (log_webgl_perf_01/25). 일반적인 경로 하나만 남기는 것이 맞다.
     fn tile_scissor_for(&self, surface_id: WebGLSurfaceId, hold: Duration) -> Option<[i32; 4]> {
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
+        // 구 경로를 쓸지. 근거는 `tile_scissor_from_tile_geometry` 의 doc 주석 -- 요점은
+        // 회귀의 축을 한 번의 A/B 로 가르는 것이다. 원자 하나다.
+        if webrender::wall_canvas_rect::from_tile_geometry() {
+            return self.tile_scissor_from_tile_geometry(surface_id, canvas);
+        }
         self.tile_scissor_from_webrender(surface_id, canvas, hold)
+    }
+
+    /// 타일 기하에서 scissor 를 유도하는 ★구 경로★. 2026-11-13 에 되살렸다.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 운영자 지적 -- "이미 WebglTileScissor 플래그 쓰던 바이너리에서 조합 페이지 재생시
+    /// ticker 애니메이션 judder 사라졌다니까?"
+    ///
+    /// 그 플래그(`gfx_wall_webgl_tile_scissor`)와 이 구현은 `c3450a9364b`(2026-11-10)에서
+    /// 운영자 지시로 제거됐고, 그 뒤 39 커밋이 들어갔고, 지금 그 구성에서 judder 가
+    /// 회귀했다.
+    ///
+    /// 55 번(121)이 말하는 것은 ***사각형 자체는 지금도 정확하다***는 것이다 -- `base`
+    /// 12.4Mpx 가 타일당 1/4 과 일치하고, `widened=0`, `samples(1=전부)`, 실패율 0.40%,
+    /// `AcquireSync` 꼬리 0.07% 다. 그러면 회귀는 그 39 커밋 중 다른 것이고, 이분 탐색은
+    /// 실기 6 회가 든다. ★구 경로를 되살려 한 번 A/B 하면 축이 갈린다.★
+    ///
+    /// ## 구 경로의 성질
+    ///
+    /// `painter_tile_rect_map` 에서 직접 계산하므로 WR lookup 도, 나이도, 창도 없다. 캔버스가
+    /// 가상 뷰포트를 꽉 채울 때만 작동한다 -- 크기가 다르면 캔버스 좌표와 뷰포트 좌표가 1:1
+    /// 이 아니어서 엉뚱한 사분면이 보인다(근거는 `PainterTileRect::viewport` 의 doc).
+    ///
+    /// 그래서 4 타일 전체화면 구성에 정확히 맞고 ★전환 중에는 빈 공간이 생긴다★ -- 그것이
+    /// 넓히기(`20ee1a167ab` 이후)를 만든 이유였고, 이 A/B 에서는 알려진 대가다.
+    fn tile_scissor_from_tile_geometry(
+        &self,
+        surface_id: WebGLSurfaceId,
+        canvas: Size2D<i32>,
+    ) -> Option<[i32; 4]> {
+        let rect = self.painter_tile_rect_map.get(surface_id.painter_id)?;
+        if canvas.width != rect.viewport.width || canvas.height != rect.viewport.height {
+            note_scissor_gate(ScissorGate::NoIntersection);
+            return None;
+        }
+        // `flip_y` pref 도 함께 사라졌으므로 구 기본값을 고정으로 쓴다.
+        let scissor = [
+            rect.tile.min.x,
+            canvas.height - rect.tile.max.y,
+            rect.tile.width(),
+            rect.tile.height(),
+        ];
+        note_scissor_gate(ScissorGate::Applied);
+        note_scissor_area(scissor, scissor, 1, 1);
+        Some(scissor)
     }
 
     /// 이 서피스의 ★프레임 간격★ -- 직전 swap 과의 차이. 기록을 갱신한다.

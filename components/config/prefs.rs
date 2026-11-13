@@ -929,6 +929,39 @@ pub struct Preferences {
     /// 로 그려야 할 영역을 빼먹는 일(= 검은 띠)이 생길 수 없다.
     ///
     /// 회귀 수정이므로 기본 켜짐이고, 이 판정이 틀린 구성이 있으면 끌 수 있다.
+    /// 타일 기하에서 scissor 를 유도하는 ★구 경로★ 를 쓴다. 기본 꺼짐.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 운영자 지적 -- "이미 WebglTileScissor 플래그 쓰던 바이너리에서 조합 페이지 재생시
+    /// ticker 애니메이션 judder 사라졌다니까? 왜 자꾸 해결된 문제를 다시 건드리려고 하지?"
+    ///
+    /// 그 플래그(`gfx_wall_webgl_tile_scissor`)와 구현(`tile_scissor_from_tile_geometry`)은
+    /// `c3450a9364b`(2026-11-10)에서 운영자 지시로 제거됐다. 그 뒤 39 커밋이 들어갔고 지금
+    /// 그 구성에서 ticker judder 가 회귀했다.
+    ///
+    /// 55 번(121, 정지 4 타일 + ticker 3 개, judder 발생)은 ***사각형 자체는 지금도
+    /// 정확하다***고 말한다.
+    ///
+    ///     SCISSORAREA  base 12.4Mpx = 타일당 1/4,  union 12.4Mpx,  widened=0
+    ///                  samples(1=1200 2=0 3plus=0)
+    ///     SCISSORGATE  applied 11952/12000 = 99.60% (안 걸림 0.40%)
+    ///     LOCKWAIT     tex_hist >=8ms 15 / 20,400 = 0.07%
+    ///
+    /// 면적이 기대값과 일치하고, 넓히기는 정지 구성에서 작동하지 않고(`samples` 전부 1),
+    /// 실패율도 `AcquireSync` 꼬리도 낮다. 그러면 회귀는 그 39 커밋 중 ***다른 것***이고,
+    /// 이분 탐색은 실기 6 회가 든다. ★구 경로를 되살려 한 번 A/B 하면 축이 갈린다.★
+    ///
+    ///     구 경로로 judder 가 사라지면  -> scissor 경로가 원인. 그 안에서 좁힌다.
+    ///     사라지지 않으면              -> scissor 가 아니다. 39 커밋 이분 탐색으로 간다.
+    ///
+    /// ## 대가
+    ///
+    /// 구 경로는 `painter_tile_rect_map` 에서 직접 계산하므로 WR lookup 도, 나이도, 창도
+    /// 없다. 캔버스가 가상 뷰포트를 꽉 채울 때만 작동하고(아니면 `None`), ★전환 중에는 빈
+    /// 공간이 생긴다★ -- 그것이 넓히기(`20ee1a167ab` 이후)를 만든 이유였고 이 A/B 에서는
+    /// 알려진 대가다.
+    pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
     pub gfx_wall_webgl_scissor_hold_when_static: bool,
     pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
@@ -1780,6 +1813,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_scissor_hold_when_static: true,
+            gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,

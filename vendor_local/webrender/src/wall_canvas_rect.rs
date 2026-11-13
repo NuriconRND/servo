@@ -58,7 +58,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
 use api::ImageKey;
@@ -142,6 +142,20 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static TILE_CLEAR: AtomicBool = AtomicBool::new(false);
 
 /// `paint` 가 pref 를 보고 세운다. 근거는 `TILE_CLEAR` 의 doc 주석.
+/// 타일 기하에서 scissor 를 유도하는 구 경로를 쓸지. 기본 꺼짐.
+static FROM_TILE_GEOMETRY: AtomicBool = AtomicBool::new(false);
+
+/// `gfx_wall_webgl_tile_scissor_from_tile_geometry` 를 싣는다. `paint` 가 틱마다 부른다.
+pub fn set_from_tile_geometry(enabled: bool) {
+    FROM_TILE_GEOMETRY.store(enabled, Ordering::Relaxed);
+}
+
+/// 타일 기하에서 scissor 를 유도하는 구 경로를 쓸지. 근거는 `webgl_thread` 의
+/// `tile_scissor_from_tile_geometry` 의 doc 주석.
+pub fn from_tile_geometry() -> bool {
+    FROM_TILE_GEOMETRY.load(Ordering::Relaxed)
+}
+
 /// 정지한 캔버스의 낡은 rect 를 그대로 쓸지. 기본 켜짐.
 static HOLD_WHEN_STATIC: AtomicBool = AtomicBool::new(true);
 
@@ -182,9 +196,9 @@ pub fn tile_clear() -> bool {
 
 type Map = HashMap<(u32, ImageKey), CanvasTileRect>;
 
-fn map() -> &'static Mutex<Map> {
-    static MAP: OnceLock<Mutex<Map>> = OnceLock::new();
-    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+fn map() -> &'static RwLock<Map> {
+    static MAP: OnceLock<RwLock<Map>> = OnceLock::new();
+    MAP.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// ★기록 대상인 캔버스의 `ImageKey` 집합.★ WebGL 쪽이 등록한다.
@@ -196,9 +210,9 @@ fn map() -> &'static Mutex<Map> {
 /// 없다***. 그 구성에서 `winit_wall` 이 `0xc0000374`(힙 손상)로 죽었고, 이 기능을 끄면
 /// 죽지 않았다. 손상의 기구를 코드로 설명하지는 못했지만, ***건드리지 않아야 할 경로를
 /// 건드리고 있던 것***은 그 자체로 고칠 이유다.
-fn canvas_keys() -> &'static Mutex<HashSet<ImageKey>> {
-    static KEYS: OnceLock<Mutex<HashSet<ImageKey>>> = OnceLock::new();
-    KEYS.get_or_init(|| Mutex::new(HashSet::new()))
+fn canvas_keys() -> &'static RwLock<HashSet<ImageKey>> {
+    static KEYS: OnceLock<RwLock<HashSet<ImageKey>>> = OnceLock::new();
+    KEYS.get_or_init(|| RwLock::new(HashSet::new()))
 }
 
 /// 이 `ImageKey` 가 등록된 캔버스인가.
@@ -210,7 +224,7 @@ fn canvas_keys() -> &'static Mutex<HashSet<ImageKey>> {
 /// ref/target 순서였다★ -- `picture.rs::note_canvas_tile_rect` 의 doc 주석에 적어 뒀다.
 /// 이 게이트는 불필요한 작업을 없애는 것이고, 크래시 수정은 그쪽이다.
 pub fn is_canvas(key: ImageKey) -> bool {
-    match canvas_keys().lock() {
+    match canvas_keys().read() {
         Ok(keys) => keys.contains(&key),
         Err(_) => false,
     }
@@ -218,7 +232,7 @@ pub fn is_canvas(key: ImageKey) -> bool {
 
 /// 이 `ImageKey` 를 캔버스로 등록한다. WebGL 쪽이 키를 받을 때 부른다.
 pub fn register_canvas(key: ImageKey) {
-    if let Ok(mut keys) = canvas_keys().lock() {
+    if let Ok(mut keys) = canvas_keys().write() {
         keys.insert(key);
     }
 }
@@ -255,9 +269,9 @@ pub fn set_enabled(enabled: bool) {
 /// `Transform3D` 는 16 float 이라 원자에 들어가지 않는다. painter 는 틱당 ***한 번***
 /// 쓰고(정상 상태에서 경합이 없다) 프레임 빌드가 읽는다. 이 모듈은 이미 같은 모양의
 /// `Mutex` 둘을 그 경로에 갖고 있다. 근거와 한계는 설계 문서 5.1 에 있다.
-fn lead_map() -> &'static Mutex<HashMap<u32, Vec<LeadSample>>> {
-    static LEAD_SAMPLES: OnceLock<Mutex<HashMap<u32, Vec<LeadSample>>>> = OnceLock::new();
-    LEAD_SAMPLES.get_or_init(|| Mutex::new(HashMap::new()))
+fn lead_map() -> &'static RwLock<HashMap<u32, Vec<LeadSample>>> {
+    static LEAD_SAMPLES: OnceLock<RwLock<HashMap<u32, Vec<LeadSample>>>> = OnceLock::new();
+    LEAD_SAMPLES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// 한 애니메이션 바인딩의 한 시각 샘플.
@@ -277,7 +291,7 @@ pub struct LeadSample {
 
 /// 이 painter 슬롯의 창 샘플을 바꿔 넣는다. ★틱당 한 번, Mutex 한 번.★
 pub fn set_lead_samples(slot: u32, samples: Vec<LeadSample>) {
-    if let Ok(mut map) = lead_map().lock() {
+    if let Ok(mut map) = lead_map().write() {
         if samples.is_empty() {
             map.remove(&slot);
         } else {
@@ -287,12 +301,22 @@ pub fn set_lead_samples(slot: u32, samples: Vec<LeadSample>) {
 }
 
 /// 그 슬롯의 창 샘플. 없으면 빈 벡터 -- 그러면 호출자는 오늘 경로만 쓴다.
-pub fn lead_samples(slot: u32) -> Vec<LeadSample> {
-    lead_map()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&slot).cloned())
-        .unwrap_or_default()
+pub fn with_lead_samples<R: Default>(slot: u32, f: impl FnOnce(&[LeadSample]) -> R) -> R {
+    // clone 하지 않는다. 앞 판은 `Vec` 를 복사해 돌려줬고, `LeadSample` 이
+    // `transform: [f32;16]` 때문에 80 바이트 가까이라 ticker 3 개 + lead 8 이면 27 개 =
+    // 2.2KB 를 ***DL 빌드마다 힙에서*** 복사했다. "타이밍 경로에 할당 금지"(2026-10-27)를
+    // 어기는 형태다.
+    //
+    // read guard 를 들고 슬라이스를 콜백에 넘긴다. `RwLock` 이므로 painter 4 개가 동시에
+    // 들어와도 직렬화되지 않는다. 콜백은 읽기 전용이고 이 락을 다시 잡지 않으므로 교착이
+    // 없다 -- 유일한 호출자가 `picture.rs` 의 `lead_sample_boxes` 다.
+    let Ok(guard) = lead_map().read() else {
+        return R::default();
+    };
+    match guard.get(&slot) {
+        Some(samples) => f(samples.as_slice()),
+        None => f(&[]),
+    }
 }
 
 /// 쓸 수 있는 기록의 최대 나이, ms. `painter` 가 틱마다 pref 에서 갱신한다.
@@ -333,11 +357,11 @@ pub fn note(
         return;
     }
     // ★등록된 캔버스만 기록한다.★ 근거는 `canvas_keys` 의 doc 주석에 있다.
-    match canvas_keys().lock() {
+    match canvas_keys().read() {
         Ok(keys) if keys.contains(&key) => {},
         _ => return,
     }
-    if let Ok(mut map) = map().lock() {
+    if let Ok(mut map) = map().write() {
         map.insert(
             (slot, key),
             CanvasTileRect {
@@ -385,7 +409,7 @@ pub fn lookup(slot: u32, key: ImageKey, max_age_ms: u64) -> Lookup {
     if !is_enabled() {
         return Lookup::Disabled;
     }
-    let Ok(guard) = map().lock() else {
+    let Ok(guard) = map().read() else {
         return Lookup::Missing;
     };
     let Some(value) = guard.get(&(slot, key)).copied() else {
@@ -402,10 +426,10 @@ pub fn lookup(slot: u32, key: ImageKey, max_age_ms: u64) -> Lookup {
 /// 이 캔버스의 기록과 등록을 모든 slot 에서 지운다. ★컨텍스트가 사라질 때 반드시 부른다★
 /// -- 안 부르면 맵이 자란다.
 pub fn forget(key: ImageKey) {
-    if let Ok(mut keys) = canvas_keys().lock() {
+    if let Ok(mut keys) = canvas_keys().write() {
         keys.remove(&key);
     }
-    if let Ok(mut map) = map().lock() {
+    if let Ok(mut map) = map().write() {
         map.retain(|(_, k), _| *k != key);
     }
 }

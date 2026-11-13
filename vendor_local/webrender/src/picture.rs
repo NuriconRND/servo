@@ -3446,27 +3446,77 @@ impl TileCacheInstance {
         table: &mut [(u16, [i32; 4])],
         count: &mut usize,
     ) {
-        let samples = crate::wall_canvas_rect::lead_samples(slot);
+        crate::wall_canvas_rect::with_lead_samples(slot, |samples| {
+            self.lead_sample_boxes_inner(
+                samples,
+                prim_spatial_node_index,
+                local_prim_rect,
+                sampled_rect,
+                map_prim_to_pic,
+                frame_context,
+                to_box,
+                table,
+                count,
+            )
+        })
+    }
+
+    /// `lead_sample_boxes` 의 본문. read guard 안에서 돌므로 따로 뺐다 -- 근거는
+    /// `wall_canvas_rect::with_lead_samples` 의 doc 주석.
+    #[allow(clippy::too_many_arguments)]
+    fn lead_sample_boxes_inner(
+        &self,
+        samples: &[crate::wall_canvas_rect::LeadSample],
+        prim_spatial_node_index: SpatialNodeIndex,
+        local_prim_rect: LayoutRect,
+        sampled_rect: PictureRect,
+        map_prim_to_pic: &SpaceMapper<LayoutPixel, PicturePixel>,
+        frame_context: &FrameVisibilityContext,
+        to_box: &dyn Fn(LayoutRect) -> [i32; 4],
+        table: &mut [(u16, [i32; 4])],
+        count: &mut usize,
+    ) {
         if samples.is_empty() {
             return;
         }
-        for sample in samples.iter().filter(|s| !s.is_now) {
-            if *count >= table.len() {
-                return;
+        // ★`binding_id` 당 한 번만 해결한다.★ 2026-11-13.
+        //
+        // 앞 판은 `is_now` 짝 찾기(선형 탐색), 조상 사슬 탐색, `L` 과 그 역, `A_now` 의 역을
+        // ***샘플마다*** 했다. 그런데 그 다섯은 `binding_id` 에만 의존한다 -- ticker 3 개에
+        // lead 8 이면 샘플 24 개에 `binding_id` 3 개이므로 8 배 중복이고, 선형 탐색은
+        // 24x27 = 648 비교다.
+        //
+        // 그리고 55 번(121, 정지 4 타일 + ticker 3 개)에서 그 계산은 ***전부 버려졌다***:
+        // `SCISSORAREA samples(1=1200 2=0 3plus=0)` 이고, `ancestor_animated_node` 가 ticker
+        // 애니메이션을 모두 걸러낸다(캔버스의 조상이 아니다). 결과 0 개를 얻기 위해 조상
+        // 탐색 24 회와 역행렬 48 회를 돌렸다.
+        //
+        // 이 경로는 `note_canvas_tile_rect` 안이고 그 호출 가드가 `is_canvas(key)` 이므로
+        // ***WebGL 이 없으면 아예 돌지 않는다.*** painter 가 늦으면
+        // `pump_paint_animation` 도 늦어 ticker 보간이 저더하므로, 운영자가 본 "조합
+        // 구성에서만 저더" 가 이것이다.
+        //
+        // ★결과는 같다★ -- 같은 조건으로 같은 샘플을 같은 순서로 넣는다. 해결을 앞으로
+        // 끌어올렸을 뿐이다. 고정 배열은 스택이므로 할당도 늘지 않는다.
+        let mut live: [Option<(
+            api::PropertyBindingId,
+            LayoutTransform,
+            LayoutTransform,
+            LayoutTransform,
+        )>; crate::wall_canvas_rect::MAX_LEAD_SAMPLES] =
+            [None; crate::wall_canvas_rect::MAX_LEAD_SAMPLES];
+        let mut live_count = 0;
+        for now in samples.iter().filter(|s| s.is_now) {
+            if live_count >= live.len() {
+                break;
             }
-            let Some(now) = samples
-                .iter()
-                .find(|other| other.is_now && other.binding_id == sample.binding_id)
-            else {
-                continue;
-            };
             // 애니메이션 노드는 ★이 prim 의 조상 사슬에서만★ 찾는다 -- 다른 가지의 같은
             // 바인딩을 집으면 사슬 `L` 이 틀린다.
             let Some(node) = ancestor_animated_node(
                 frame_context.spatial_tree,
                 prim_spatial_node_index,
                 self.spatial_node_index,
-                sample.binding_id,
+                now.binding_id,
             ) else {
                 continue;
             };
@@ -3477,15 +3527,32 @@ impl TileCacheInstance {
             let Some(l_inv) = l.inverse() else {
                 continue;
             };
-            let a_t = LayoutTransform::from_array(sample.transform);
-            let a_now = LayoutTransform::from_array(now.transform);
-            let Some(a_now_inv) = a_now.inverse() else {
+            let Some(a_now_inv) = LayoutTransform::from_array(now.transform).inverse() else {
                 continue;
             };
+            live[live_count] = Some((now.binding_id, l, l_inv, a_now_inv));
+            live_count += 1;
+        }
+        // ★통과한 것이 없으면 샘플 루프에 들어가지 않는다.★ 정지 구성이 이 자리로 빠진다.
+        if live_count == 0 {
+            return;
+        }
+        for sample in samples.iter().filter(|s| !s.is_now) {
+            if *count >= table.len() {
+                return;
+            }
+            let Some((_, l, l_inv, a_now_inv)) = live[..live_count]
+                .iter()
+                .flatten()
+                .find(|(id, ..)| *id == sample.binding_id)
+            else {
+                continue;
+            };
+            let a_t = LayoutTransform::from_array(sample.transform);
             let delta = l
                 .then(&a_t)
-                .then(&a_now_inv)
-                .then(&l_inv)
+                .then(a_now_inv)
+                .then(l_inv)
                 .with_source::<LayoutPixel>()
                 .with_destination::<LayoutPixel>();
             let m_t = delta.then(&map_prim_to_pic.get_transform());
