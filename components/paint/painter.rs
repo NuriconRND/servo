@@ -1752,9 +1752,19 @@ impl Painter {
                     // Paint the scene.
                     // TODO(gw): Take notice of any errors the renderer returns!
                     self.clear_background();
+                    split.mark_clear();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
-                        let _ = renderer.render(size, 0 /* buffer_age */);
+                        // ★통계를 버리지 않는다.★ 근거는 `RenderSplit::note_stats` 의 doc --
+                        // 이 값은 이미 만들어져 반환되는데 앞 판이 `let _ =` 로 버렸다.
+                        match renderer.render(size, 0 /* buffer_age */) {
+                            Ok(results) => split.note_stats(&results.stats),
+                            Err(errors) => {
+                                if !errors.is_empty() {
+                                    log::warn!("WebRender render errors: {errors:?}");
+                                }
+                            },
+                        }
                     }
                     split.mark_draw();
 

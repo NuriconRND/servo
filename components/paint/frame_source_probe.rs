@@ -281,13 +281,32 @@ pub(crate) fn note_paint_side_judgement(defeated: bool, stale_for: Option<Durati
 ///
 /// 경계 여섯에 `Instant::now()` 이고 240/s 이면 약 36us/s 다. 꼬리 줄은 주기(16.67ms)를 넘긴
 /// 프레임에만 나오므로 실측 1.18% = 초당 2.8 줄이다. 꺼져 있으면 `None` 하나다.
+/// 구간 수. 순서는 lock/update/clear/draw/post/pump/present 다.
+const PARTS: usize = 7;
+
 pub(crate) struct RenderSplit {
     at: Option<Instant>,
     lock_us: u64,
     update_us: u64,
+    clear_us: u64,
     draw_us: u64,
     post_us: u64,
     pump_us: u64,
+    /// `Renderer::render` 가 돌려준 통계 중 꼬리 분석에 쓰는 것만. 근거는 `note_stats`.
+    stats: Option<DrawStats>,
+}
+
+/// `RendererStats` 에서 뽑아 둔 값. 전부 그 구조체가 이미 채워 돌려주는 것이다.
+#[derive(Clone, Copy)]
+struct DrawStats {
+    draw_calls: usize,
+    color_targets: usize,
+    alpha_targets: usize,
+    upload_mb: f64,
+    resource_upload_ms: f64,
+    cache_upload_ms: f64,
+    frame_build_ms: f64,
+    full_paint: bool,
 }
 
 impl RenderSplit {
@@ -296,9 +315,11 @@ impl RenderSplit {
             at: is_enabled().then(Instant::now),
             lock_us: 0,
             update_us: 0,
+            clear_us: 0,
             draw_us: 0,
             post_us: 0,
             pump_us: 0,
+            stats: None,
         }
     }
 
@@ -321,8 +342,40 @@ impl RenderSplit {
         self.update_us = self.lap();
     }
 
+    pub(crate) fn mark_clear(&mut self) {
+        self.clear_us = self.lap();
+    }
+
     pub(crate) fn mark_draw(&mut self) {
         self.draw_us = self.lap();
+    }
+
+    /// `Renderer::render` 의 통계를 보관한다. 꼬리 프레임의 줄에 함께 찍는다.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 61 번이 60ms 꼬리를 `draw` 로 좁혔고(꼬리 257 건에서 total 의 95.7%, 최악 프레임은
+    /// 60.8ms 중 60785us), `AcquireSync` 는 아니라고 가렸다(LOCKTAIL 10 건, max 12.8ms).
+    /// 그러면 `Renderer::render` 안이고, 그 안을 가르는 값이 ***이미 반환되고 있었다*** --
+    /// `RenderResults::stats` 를 앞 판이 `let _ =` 로 버렸다.
+    ///
+    /// `draw_calls` 와 `upload_mb` 가 크면 작업량이 늘어난 것이고, 둘이 평시와 같은데 시간만
+    /// 60ms 면 ★GPU 가 밀린 것★ 이다 -- 그때는 WebGL 스레드가 같은 GPU 에 넣은 작업과의
+    /// 경합이고 GPU 타이머 쿼리로 넘어간다.
+    pub(crate) fn note_stats(&mut self, stats: &webrender::RendererStats) {
+        if self.at.is_none() {
+            return;
+        }
+        self.stats = Some(DrawStats {
+            draw_calls: stats.total_draw_calls,
+            color_targets: stats.color_target_count,
+            alpha_targets: stats.alpha_target_count,
+            upload_mb: stats.texture_upload_mb,
+            resource_upload_ms: stats.resource_upload_time,
+            cache_upload_ms: stats.gpu_cache_upload_time,
+            frame_build_ms: stats.frame_build_time,
+            full_paint: stats.full_paint,
+        });
     }
 
     pub(crate) fn mark_post(&mut self) {
@@ -340,26 +393,27 @@ impl RenderSplit {
         }
         let present_us = self.lap();
         note_render_split(
-            self.lock_us,
-            self.update_us,
-            self.draw_us,
-            self.post_us,
-            self.pump_us,
-            present_us,
+            [
+                self.lock_us,
+                self.update_us,
+                self.clear_us,
+                self.draw_us,
+                self.post_us,
+                self.pump_us,
+                present_us,
+            ],
+            self.stats,
         );
     }
 }
 
-/// 구간 여섯의 합계·최댓값과, 주기를 넘긴 프레임의 내역. 근거는 `RenderSplit` 의 doc 주석.
-fn note_render_split(lock: u64, update: u64, draw: u64, post: u64, pump: u64, present: u64) {
-    /// 구간 수. 순서는 lock/update/draw/post/pump/present 다.
-    const PARTS: usize = 6;
+/// 구간 일곱의 합계·최댓값과, 주기를 넘긴 프레임의 내역. 근거는 `RenderSplit` 의 doc 주석.
+fn note_render_split(parts: [u64; PARTS], stats: Option<DrawStats>) {
     static SUM: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static MAX: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static OVER: AtomicU64 = AtomicU64::new(0);
 
-    let parts = [lock, update, draw, post, pump, present];
     let total: u64 = parts.iter().sum();
     let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     for (slot, value) in SUM.iter().zip(parts) {
@@ -369,13 +423,31 @@ fn note_render_split(lock: u64, update: u64, draw: u64, post: u64, pump: u64, pr
         slot.fetch_max(value, Ordering::Relaxed);
     }
 
-    // 주기를 넘긴 프레임만 그때그때 찍는다 -- 실측 1.18% 이므로 초당 2.8 줄이다.
+    // 주기를 넘긴 프레임만 그때그때 찍는다 -- 실측 1.07% 이므로 초당 2.6 줄이다.
     const PERIOD_US: u64 = 16_667;
     if total > PERIOD_US {
         let over = OVER.fetch_add(1, Ordering::Relaxed) + 1;
+        let [lock, update, clear, draw, post, pump, present] = parts;
+        // ★통계를 함께 찍는다★ -- `draw` 가 60ms 일 때 작업량이 늘었는지 GPU 가 밀렸는지
+        // 가르는 값이고, `Renderer::render` 가 이미 돌려주던 것이다.
+        let detail = match stats {
+            Some(st) => format!(
+                " draws={} targets={}/{} upload={:.2}MB res_upload={:.2}ms \
+                 cache_upload={:.2}ms build={:.2}ms full_paint={}",
+                st.draw_calls,
+                st.color_targets,
+                st.alpha_targets,
+                st.upload_mb,
+                st.resource_upload_ms,
+                st.cache_upload_ms,
+                st.frame_build_ms,
+                st.full_paint,
+            ),
+            None => String::from(" stats=n/a"),
+        };
         log::warn!(
-            "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us draw={draw}us \
-             post={post}us pump={pump}us present={present}us",
+            "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \
+             draw={draw}us post={post}us pump={pump}us present={present}us{detail}",
             total as f64 / 1000.0,
         );
     }
@@ -383,8 +455,8 @@ fn note_render_split(lock: u64, update: u64, draw: u64, post: u64, pump: u64, pr
     if nth % 1200 != 0 {
         return;
     }
-    const NAMES: [&str; PARTS] = ["lock", "update", "draw", "post", "pump", "present"];
-    let mut line = String::with_capacity(220);
+    const NAMES: [&str; PARTS] = ["lock", "update", "clear", "draw", "post", "pump", "present"];
+    let mut line = String::with_capacity(260);
     line.push_str(&format!(
         "RENDERSPLITS n={nth} over={}",
         OVER.load(Ordering::Relaxed)
