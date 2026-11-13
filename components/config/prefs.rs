@@ -961,6 +961,37 @@ pub struct Preferences {
     /// 없다. 캔버스가 가상 뷰포트를 꽉 채울 때만 작동하고(아니면 `None`), ★전환 중에는 빈
     /// 공간이 생긴다★ -- 그것이 넓히기(`20ee1a167ab` 이후)를 만든 이유였고 이 A/B 에서는
     /// 알려진 대가다.
+    /// paint 측 애니메이션의 기준 시각을 ★실제 틱 격자로 스냅★ 한다. 기본 켜짐.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// `Paint::handle_new_display_list` 가 DL 마다 `install_paint_animations` 를 부르고,
+    /// 그것이 돌고 있는 애니메이션 ***전체를 교체하면서*** `animation_zero` 로 기준 시각을
+    /// 다시 계산한다.
+    ///
+    ///     let transit = (now - built_at).clamp(0, 250ms);   // CrossProcessInstant 차
+    ///     let created_at = received_at - transit;           // 로컬 Instant 로 ★추정★
+    ///
+    /// `built_at` 은 페이싱 틱 시각이고(`PaintDisplayListInfo::built_at` 의 doc), 그 차는
+    /// "scene build 의 sub-millisecond transit" 이 아니라 ★틱부터 도착까지의 전체 지연이고
+    /// 벽에서 5~30ms★ 다. 그래서 환산 오차가 DL 마다 다르게 들어간다.
+    ///
+    /// DL 이 WebGL 때문에 초당 36 회 오면(`DLARRIVE avg 28ms`) 기준점이 초당 36 회 흔들린다.
+    /// WebGL 이 없으면 `paint_side div=15` 로 초당 4 회뿐이라 드물어 보이지 않는다 -- 운영자
+    /// 관찰("WebGL 만 빼면 ticker 가 깨끗하다")과 맞는다. 그리고 생산도 렌더도 60Hz 이므로
+    /// (`PRODUCE window edges=60.0/s calls=60.0/s`) 프레임 수가 아니라 ***기준점이*** 튀는
+    /// 것이다.
+    ///
+    /// 이 코드는 대조군(`a47204b3335`)과 diff 가 비어 있다 -- 58 번에서 그 커밋으로도 저더가
+    /// 재현된 것과 맞는다.
+    ///
+    /// 켜면 틱 시각이 이미 로컬 시계로 지나가므로(`wall_tick::note_tick_edge`) 추정값에 가장
+    /// 가까운 기록을 써서 기준점을 16.67ms 격자에 앉힌다. 한 프레임(8.33ms)보다 먼 기록은
+    /// 다른 틱이므로 쓰지 않고 앞 판처럼 추정값을 쓴다.
+    ///
+    /// 끄면 앞 판과 완전히 같다. `ANIMZERO` 의 `snap avg/max` 가 ★꺼져 있을 때의 흔들림
+    /// 크기★ 를 그대로 보여주므로, 한 배포본으로 원인과 효과를 모두 읽을 수 있다.
+    pub gfx_wall_animation_zero_snaps_to_tick: bool,
     pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
     pub gfx_wall_webgl_scissor_hold_when_static: bool,
     pub gfx_wall_webgl_tile_scissor_clear: bool,
@@ -1813,6 +1844,7 @@ impl Preferences {
             gfx_wall_canvas_wait_declines_production: false,
             gfx_wall_webgl_deferred_front_buffer: false,
             gfx_wall_webgl_scissor_hold_when_static: true,
+            gfx_wall_animation_zero_snaps_to_tick: true,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
             gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,

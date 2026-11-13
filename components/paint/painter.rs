@@ -810,6 +810,9 @@ impl Painter {
         webrender::wall_canvas_rect::set_from_tile_geometry(servo_config::pref!(
             gfx_wall_webgl_tile_scissor_from_tile_geometry
         ));
+        crate::wall_tick::set_animation_zero_snaps_to_tick(servo_config::pref!(
+            gfx_wall_animation_zero_snaps_to_tick
+        ));
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,

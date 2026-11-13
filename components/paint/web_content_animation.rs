@@ -5,7 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use embedder_traits::{EventLoopWaker, RefreshDriver};
@@ -495,18 +495,107 @@ fn animation_zero(
     received_at: Instant,
     offset_from_display_list: f64,
 ) -> Instant {
-    let transit = (now - built_at)
-        .as_seconds_f64()
-        .clamp(0.0, MAX_DISPLAY_LIST_TRANSIT.as_secs_f64());
-    let created_at = received_at
+    let raw = (now - built_at).as_seconds_f64();
+    let limit = MAX_DISPLAY_LIST_TRANSIT.as_secs_f64();
+    let transit = raw.clamp(0.0, limit);
+    let estimate = received_at
         .checked_sub(Duration::from_secs_f64(transit))
         .unwrap_or(received_at);
+
+    // ★추정 대신 실제 틱 시각을 쓴다.★ 2026-11-13.
+    //
+    // `built_at` 은 페이싱 틱 시각이고(`PaintDisplayListInfo::built_at` 의 doc), 위의
+    // `estimate` 는 그것을 두 시계의 차로 ***추정***한 것이다. 그 차는 "scene build 의
+    // sub-millisecond transit" 이 아니라 ★틱부터 도착까지의 전체 지연이고 벽에서 5~30ms★
+    // 다. 그래서 환산 오차가 DL 마다 다르게 들어가고, DL 이 WebGL 때문에 초당 36 회 오면
+    // (`DLARRIVE avg 28ms`) 애니메이션의 기준점이 ***초당 36 회 흔들린다.*** 생산도 렌더도
+    // 60Hz 인데(`PRODUCE window edges=60.0/s calls=60.0/s`) 움직임이 튀는 기구가 이것이다.
+    //
+    // 틱 시각은 이미 로컬 시계로 지나가므로(`wall_tick::note_tick_edge`), 추정값에 가장
+    // 가까운 기록을 쓰면 오차가 사라지고 기준점이 16.67ms 격자에 앉는다.
+    //
+    // ★한 프레임보다 멀면 쓰지 않는다★ -- 그만큼 떨어진 기록은 다른 틱이고, 링에 그 틱이
+    // 없다는 뜻이다(기록이 아직 없는 첫 DL, 또는 1 초보다 묵은 DL). 그 경우 앞 판과 똑같이
+    // 추정값을 쓴다.
+    const SNAP_LIMIT: Duration = Duration::from_micros(8_333);
+    let snapped = if crate::wall_tick::animation_zero_snaps_to_tick() {
+        crate::wall_tick::nearest_tick(estimate).filter(|(_, dist)| *dist <= SNAP_LIMIT)
+    } else {
+        None
+    };
+    note_animation_zero(raw, limit, snapped.map(|(_, dist)| dist));
+    let created_at = snapped.map_or(estimate, |(tick, _)| tick);
+
     let offset = Duration::from_secs_f64(offset_from_display_list.abs());
     if offset_from_display_list <= 0.0 {
         created_at.checked_sub(offset).unwrap_or(created_at)
     } else {
         created_at + offset
     }
+}
+
+/// `animation_zero` 한 번을 센다. 10 초마다 `frame_source_probe` 가 `ANIMZERO` 로 찍는다.
+///
+/// ## 무엇을 가르나 (2026-11-13)
+///
+/// * `transit` -- 틱부터 DL 도착까지의 전체 지연. 주석이 약속한 5~30ms 인지 확인한다.
+/// * `clamped` -- `MAX_DISPLAY_LIST_TRANSIT`(250ms)에 걸린 횟수. 걸리면 기준점이 그만큼
+///   과거로 잘려 애니메이션이 뒤로 끌린다. `display_list.rs:1236` 이 `TRANSITCLAMP` 를
+///   찍겠다고 적어 뒀지만 ***구현되어 있지 않았다.***
+/// * `snap` -- 추정값과 실제 틱 시각의 거리. ★이것이 저더의 크기다★ -- 0 이면 추정이
+///   정확했다는 뜻이고, 수 ms 면 기준점이 그만큼 흔들리고 있었다는 뜻이다.
+/// * `miss` -- 스냅할 틱을 못 찾은 횟수(한 프레임보다 멀다). 크면 링이 짧거나 DL 이 묵었다.
+///
+/// ## 비용
+///
+/// DL 마다 한 번(초당 36 회)이고 원자 일곱이다. 타이밍 경로가 아니다.
+fn note_animation_zero(raw_transit: f64, limit: f64, snap: Option<Duration>) {
+    let us = |v: f64| (v * 1_000_000.0).clamp(0.0, u64::MAX as f64) as u64;
+    ANIM_ZERO_CALLS.fetch_add(1, Ordering::Relaxed);
+    let transit_us = us(raw_transit.max(0.0));
+    ANIM_ZERO_TRANSIT_SUM.fetch_add(transit_us, Ordering::Relaxed);
+    ANIM_ZERO_TRANSIT_MAX.fetch_max(transit_us, Ordering::Relaxed);
+    if raw_transit > limit {
+        ANIM_ZERO_CLAMPED.fetch_add(1, Ordering::Relaxed);
+    }
+    match snap {
+        Some(dist) => {
+            let dist_us = dist.as_micros() as u64;
+            ANIM_ZERO_SNAP_SUM.fetch_add(dist_us, Ordering::Relaxed);
+            ANIM_ZERO_SNAP_MAX.fetch_max(dist_us, Ordering::Relaxed);
+        },
+        None => {
+            ANIM_ZERO_MISS.fetch_add(1, Ordering::Relaxed);
+        },
+    }
+}
+
+static ANIM_ZERO_CALLS: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_TRANSIT_SUM: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_TRANSIT_MAX: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_CLAMPED: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_SNAP_SUM: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_SNAP_MAX: AtomicU64 = AtomicU64::new(0);
+static ANIM_ZERO_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// `ANIMZERO` 한 줄을 만든다. 호출마다 구간 값을 비운다.
+pub(crate) fn animation_zero_report(secs: f64) -> Option<String> {
+    let calls = ANIM_ZERO_CALLS.swap(0, Ordering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    let snapped = calls - ANIM_ZERO_MISS.load(Ordering::Relaxed).min(calls);
+    let miss = ANIM_ZERO_MISS.swap(0, Ordering::Relaxed);
+    let snap_sum = ANIM_ZERO_SNAP_SUM.swap(0, Ordering::Relaxed);
+    Some(format!(
+        "ANIMZERO t={secs:.0}s calls={calls} ({:.1}/s)          transit(avg={}us max={}us) clamped={}          snap(n={snapped} avg={}us max={}us) miss={miss}",
+        calls as f64 / secs.max(1e-9),
+        ANIM_ZERO_TRANSIT_SUM.swap(0, Ordering::Relaxed) / calls,
+        ANIM_ZERO_TRANSIT_MAX.swap(0, Ordering::Relaxed),
+        ANIM_ZERO_CLAMPED.swap(0, Ordering::Relaxed),
+        if snapped > 0 { snap_sum / snapped } else { 0 },
+        ANIM_ZERO_SNAP_MAX.swap(0, Ordering::Relaxed),
+    ))
 }
 
 impl PipelineAnimations {

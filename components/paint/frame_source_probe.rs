@@ -505,6 +505,11 @@ fn report(elapsed: Duration) {
             over as f64 * 100.0 / render_total as f64,
         );
     }
+    // 애니메이션 기준 시각의 흔들림. 근거는 `web_content_animation::note_animation_zero`.
+    // ★`PRODUCE` 와 독립이다★ -- 생산이 없는 구간에도 DL 은 올 수 있다.
+    if let Some(line) = crate::web_content_animation::animation_zero_report(secs) {
+        log::warn!("{line}");
+    }
     // ★호출 수를 직접 센다★ -- KEEPPREV 의 attempts 는 유도값이라 199 대 240 을 설명하지
     // 못했다. 틱당 호출 1, 호출당 타일 4 가 기대값이다.
     let calls = PRODUCE_CALLS.load(Ordering::Relaxed);
