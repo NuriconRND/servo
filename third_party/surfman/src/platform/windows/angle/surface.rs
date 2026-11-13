@@ -328,6 +328,77 @@ fn transition_quadrant(elapsed_ms: u64) -> usize {
 ///
 /// 꼬리(>= `SURFLIFE_TAIL_MS`)는 그때그때 한 줄, 나머지는 사분면 요약에만 들어간다. 요약은
 /// `SURFIMPORT` 줄에 함께 나간다.
+/// `destroy_surface_texture` 의 두 자리. 합이 2ms 를 넘으면 그때그때, 나머지는 1200 회마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// 66 번에서 `unlock` 의 세 단계 중 ★`destroy` 가 전부★ 였다.
+///
+///     꼬리 109 건:  destroy p50 8265us max 42245us
+///                   recycle p50 3us    max 1065us   <- ReleaseSync, 무죄
+///                   finish  p50 0us    max 1us
+///
+/// `destroy_surface_texture` 의 두 자리는 `temporarily_make_context_current`(컨텍스트 전환)와
+/// EGL `ReleaseTexImage`(해제)다. 전환이면 ANGLE 이 `eglMakeCurrent` 에서 동기화하는 것이고,
+/// 해제면 드라이버가 그 텍스처의 GPU 작업을 기다리는 것이다 -- ★고치는 방향이 다르다.★
+///
+/// 세 단계는 이것이다.
+///
+///     make_current      temporarily_make_context_current  ANGLE 컨텍스트 전환
+///     release_teximage  EGL ReleaseTexImage               EGL 해제
+///     ★release_sync★   keyed_mutex.ReleaseSync(0)        ★DXGI keyed mutex 해제★
+///
+/// 마지막이 크면 과제 #6 이 겨냥한 keyed mutex 가 맞지만 ★획득(`AcquireSync`)이 아니라
+/// 해제★ 쪽이다. 내가 앞서 `ReleaseSync` 를 `recycle_or_forget` 에 있다고 본 것은 틀렸고,
+/// 그래서 `UNLOCKSTEPS` 의 `recycle` 이 3us 로 나왔다 -- 거기엔 없었다.
+///
+/// `imported` 는 캐시 적중 경로(`release_imported_surface`)인지다. `SURFIMPORT reused=99%`
+/// 이므로 거의 참이어야 한다.
+fn note_destroy_steps(imported: bool, current_us: u64, release_us: u64, sync_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static IMPORTED: AtomicU64 = AtomicU64::new(0);
+    static CURRENT_SUM: AtomicU64 = AtomicU64::new(0);
+    static CURRENT_MAX: AtomicU64 = AtomicU64::new(0);
+    static RELEASE_SUM: AtomicU64 = AtomicU64::new(0);
+    static RELEASE_MAX: AtomicU64 = AtomicU64::new(0);
+    static SYNC_SUM: AtomicU64 = AtomicU64::new(0);
+    static SYNC_MAX: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if imported {
+        IMPORTED.fetch_add(1, Ordering::Relaxed);
+    }
+    CURRENT_SUM.fetch_add(current_us, Ordering::Relaxed);
+    CURRENT_MAX.fetch_max(current_us, Ordering::Relaxed);
+    RELEASE_SUM.fetch_add(release_us, Ordering::Relaxed);
+    RELEASE_MAX.fetch_max(release_us, Ordering::Relaxed);
+    SYNC_SUM.fetch_add(sync_us, Ordering::Relaxed);
+    SYNC_MAX.fetch_max(sync_us, Ordering::Relaxed);
+    if current_us + release_us + sync_us >= 2_000 {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "DESTROYSTEP #{tail} imported={imported} make_current={current_us}us \
+             release_teximage={release_us}us release_sync={sync_us}us"
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "DESTROYSTEPS n={nth} imported={} make_current(avg={}us max={}us) \
+         release_teximage(avg={}us max={}us) release_sync(avg={}us max={}us) tails={}",
+        IMPORTED.swap(0, Ordering::Relaxed),
+        CURRENT_SUM.swap(0, Ordering::Relaxed) / 1200,
+        CURRENT_MAX.swap(0, Ordering::Relaxed),
+        RELEASE_SUM.swap(0, Ordering::Relaxed) / 1200,
+        RELEASE_MAX.swap(0, Ordering::Relaxed),
+        SYNC_SUM.swap(0, Ordering::Relaxed) / 1200,
+        SYNC_MAX.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
 fn note_surface_life(created: bool, took: Duration, size: Option<(i32, i32)>) {
     let Some(elapsed_ms) = transition_elapsed_ms() else {
         return;
@@ -1247,10 +1318,16 @@ impl Device {
         mut surface_texture: SurfaceTexture,
     ) -> Result<Surface, (Error, SurfaceTexture)> {
         unsafe {
+            // ★두 자리를 각각 잰다.★ 근거는 `note_destroy_steps` 의 doc 주석 -- 66 번에서
+            // `destroy` 가 꼬리 109 건의 p50 8265us, max 42245us 였고 `ReleaseSync` 는 3us
+            // 였다. 컨텍스트 전환인지 EGL 해제인지 가른다.
+            let at = Instant::now();
             let _guard = match self.temporarily_make_context_current(context) {
                 Ok(guard) => guard,
                 Err(error) => return Err((error, surface_texture)),
             };
+            let current_us = at.elapsed().as_micros() as u64;
+            let at = Instant::now();
             let released = EGL_FUNCTIONS.with(|egl| {
                 if egl.ReleaseTexImage(
                     self.egl_display,
@@ -1264,13 +1341,25 @@ impl Device {
                 }
                 Ok(())
             });
+            let release_us = at.elapsed().as_micros() as u64;
             if let Err(error) = released {
+                note_destroy_steps(true, current_us, release_us, 0);
                 return Err((error, surface_texture));
             }
+            // ★`ReleaseSync` 가 여기 있다.★ 내가 앞서 `recycle_or_forget` 에 있다고 한 것은
+            // 틀렸다 -- keyed mutex 해제는 이 경로 안이고, 그래서 `destroy` 단계에 포함된다.
+            // 그것이 `UNLOCKSTEPS` 의 `recycle` 이 3us 로 무죄였던 이유다.
+            let at = Instant::now();
             if let Some(ref keyed_mutex) = surface_texture.local_keyed_mutex {
                 let result = keyed_mutex.ReleaseSync(0);
                 assert_eq!(result, S_OK);
             }
+            note_destroy_steps(
+                true,
+                current_us,
+                release_us,
+                at.elapsed().as_micros() as u64,
+            );
         }
 
         // 이 핸들들은 캐시의 것이다 — `SurfaceTexture` 가 떨어지면서 지우지 않도록 비운다.

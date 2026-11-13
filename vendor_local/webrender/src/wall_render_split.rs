@@ -61,7 +61,11 @@ pub struct Split {
     /// `profiler.set_counters`/`update` + `PROFILER_DBG` 블록 + `debug_renderer` 렌더.
     /// ★HUD 를 실제로 그리는 구간★.
     pub dbg_us: u64,
-    /// `staging/pbo/device end_frame` 셋.
+    /// `staging_texture_pool.end_frame`.
+    pub staging_us: u64,
+    /// `texture_upload_pbo_pool.end_frame`.
+    pub pbo_us: u64,
+    /// `device.end_frame`. 앞 판의 `endf3` 에서 위 둘을 뺀 것.
     pub endf3_us: u64,
     /// ★`check_gl_errors` = `glGetError`★. 드라이버의 미처리 명령을 flush 하고 동기화하므로,
     /// HUD 가 추가한 GL 작업을 여기서 전부 기다린다(65 번: HUD 켜짐 p50 17500us 대 꺼짐
@@ -85,6 +89,8 @@ thread_local! {
             overlay_us: 0,
             prof_us: 0,
             dbg_us: 0,
+            staging_us: 0,
+            pbo_us: 0,
             endf3_us: 0,
             tail_us: 0,
             gpu_timers: false,
@@ -179,7 +185,25 @@ pub fn mark_dbg(_started: Instant) {
     });
 }
 
-/// `end_frame` 셋이 끝났다. 다음이 `check_gl_errors` 다.
+/// `staging_texture_pool.end_frame` 이 끝났다.
+pub fn mark_staging(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        staging_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// `texture_upload_pbo_pool.end_frame` 이 끝났다.
+pub fn mark_pbo(_started: Instant) {
+    let us = lap();
+    SPLIT.set(Split {
+        pbo_us: us,
+        ..SPLIT.get()
+    });
+}
+
+/// `device.end_frame` 이 끝났다. 다음이 `check_gl_errors` 다.
 pub fn mark_endf3(_started: Instant) {
     let us = lap();
     SPLIT.set(Split {

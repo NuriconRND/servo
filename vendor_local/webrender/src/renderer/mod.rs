@@ -1903,8 +1903,11 @@ impl Renderer {
         // ★HUD 그리기가 끝났다.★ `dbg` 가 크면 그리기 자체이고, `overlay` 가 크면 DComp
         // 경합이다 -- 그 둘이 HUD 수정 방향을 가른다.
         crate::wall_render_split::mark_dbg(split_at);
+        // ★셋을 가른다.★ 66 번에서 `endf3` 가 p50 3264us, max 338201us(= 338ms)였다.
         self.staging_texture_pool.end_frame(&mut self.device);
+        crate::wall_render_split::mark_staging(split_at);
         self.texture_upload_pbo_pool.end_frame(&mut self.device);
+        crate::wall_render_split::mark_pbo(split_at);
         self.device.end_frame();
 
         if debug_overlay.is_some() {
