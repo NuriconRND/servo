@@ -134,6 +134,7 @@ mod tile_cache;
 mod util;
 mod visibility;
 pub mod wall_canvas_rect;
+pub mod wall_render_split;
 mod api_resources;
 mod image_tiling;
 mod image_source;

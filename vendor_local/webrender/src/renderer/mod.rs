@@ -1612,6 +1612,10 @@ impl Renderer {
         self.profile.end_time_if_started(profiler::FRAME_SEND_TIME);
         self.profile.start_time(profiler::RENDERER_TIME);
 
+        // ★render_impl 을 네 구간으로 쪼갠다.★ 근거는 `wall_render_split` 의 doc 주석 --
+        // 62 번에서 `draws=0 upload=0.00MB` 인 프레임이 54ms 걸렸고, 작업량이 없는데 시간이
+        // 가는 자리를 찾아야 한다.
+        let split_at = crate::wall_render_split::start();
         self.staging_texture_pool.begin_frame();
 
         let compositor_kind = active_doc.frame.composite_state.compositor_kind;
@@ -1701,18 +1705,21 @@ impl Renderer {
                     "Cleared texture cache without sending new document frame.");
         }
 
+        crate::wall_render_split::mark_enter(split_at);
         match self.prepare_gpu_cache(&frame.deferred_resolves) {
             Ok(..) => {
                 assert!(frame.gpu_cache_frame_id <= self.gpu_cache_frame_id,
                     "Received frame depends on a later GPU cache epoch ({:?}) than one we received last via `UpdateGpuCache` ({:?})",
                     frame.gpu_cache_frame_id, self.gpu_cache_frame_id);
 
+                crate::wall_render_split::mark_gpu(split_at);
                 self.draw_frame(
                     frame,
                     device_size,
                     buffer_age,
                     &mut results,
                 );
+                crate::wall_render_split::mark_draw(split_at);
 
                 // TODO(nical): do this automatically by selecting counters in the wr profiler
                 // Profile marker for the number of invalidated picture cache
@@ -1736,6 +1743,7 @@ impl Renderer {
         }
 
         self.unlock_external_images(&frame.deferred_resolves);
+        crate::wall_render_split::mark_exit(split_at);
 
         let _gm = self.gpu_profiler.start_marker("end frame");
         self.gpu_profiler.end_frame();

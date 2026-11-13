@@ -392,6 +392,10 @@ impl RenderSplit {
             return;
         }
         let present_us = self.lap();
+        // WR 안의 네 구간을 가져온다. 근거는 `webrender::wall_render_split` 의 모듈 주석 --
+        // 62 번에서 `draws=0 upload=0.00MB` 인 프레임이 54ms 걸렸으므로 그 기다림이
+        // `render_impl` 의 어느 자리인지 가른다.
+        let wr = webrender::wall_render_split::take();
         note_render_split(
             [
                 self.lock_us,
@@ -403,12 +407,17 @@ impl RenderSplit {
                 present_us,
             ],
             self.stats,
+            wr,
         );
     }
 }
 
 /// 구간 일곱의 합계·최댓값과, 주기를 넘긴 프레임의 내역. 근거는 `RenderSplit` 의 doc 주석.
-fn note_render_split(parts: [u64; PARTS], stats: Option<DrawStats>) {
+fn note_render_split(
+    parts: [u64; PARTS],
+    stats: Option<DrawStats>,
+    wr: webrender::wall_render_split::Split,
+) {
     static SUM: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static MAX: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
     static CALLS: AtomicU64 = AtomicU64::new(0);
@@ -445,9 +454,14 @@ fn note_render_split(parts: [u64; PARTS], stats: Option<DrawStats>) {
             ),
             None => String::from(" stats=n/a"),
         };
+        // ★WR 안의 네 구간★ -- 작업량이 0 인데 시간이 간 자리를 이것이 가른다.
+        let inside = format!(
+            " wr(enter={}us gpu={}us draw={}us exit={}us)",
+            wr.enter_us, wr.gpu_us, wr.draw_us, wr.exit_us
+        );
         log::warn!(
             "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \
-             draw={draw}us post={post}us pump={pump}us present={present}us{detail}",
+             draw={draw}us post={post}us pump={pump}us present={present}us{inside}{detail}",
             total as f64 / 1000.0,
         );
     }
