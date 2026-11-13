@@ -723,10 +723,11 @@ fn report(elapsed: Duration) {
         }
     };
     log::warn!(
-        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%) behind={behind} ({:.1}%) canvas={canvas} ({:.1}%)",
+        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%) behind={behind} ({:.1}%) canvas={canvas} ({:.1}%) locked_age_max={}ms",
         share(tick),
         share(behind),
         share(canvas),
+        crate::webrender_external_images::LOCKED_IMAGE_AGE_MAX_MS.swap(0, Ordering::Relaxed),
     );
 
     // ★paint 측 판정★ -- 깎임 후보와, 캔버스 신호가 그것을 되돌린 비율.

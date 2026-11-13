@@ -315,11 +315,22 @@ impl Drop for SurfaceLifeGuard {
     }
 }
 
+/// 전환 수명의 사분면. ★경계는 bounce 애니메이션(2500ms)에 맞춰져 있다.★
+///
+/// 2026-11-13 에 고쳤다. 종전 경계는 `0-249 / 250-749 / 750-1499 / 그 뒤` 로 "전환이 1.5 초
+/// 내외" 라는 관찰에 맞춰져 있었는데, 69 번 로그가 전환 효과를 직접 적는다 --
+/// `[handover][전환 시작] {"kind":"swap","효과":"bounce/left/2500ms"}` (19 회 전부). 그래서
+/// 종전 경계로는 ★애니메이션 전체가 마지막 한 칸에 뭉쳐★ 결정적 순간이 보이지 않았다
+/// (151 의 `after(create=17 destroy=179)`).
+///
+/// 새 경계는 ★시작 / 진행 중 / 끝 / 그 뒤★ 다. 꼬리가 끝에 몰린다는 것이 이미 다른
+/// 지표로 나와 있으므로(`LOCKTAIL` 84 건 중 53 건이 t=2500~2749ms), 그 칸을 따로 둔다.
+/// 핸드오버가 66~113ms 걸리므로 실제 종료는 t≈2620ms 다 -- 2400~2799 가 그것을 담는다.
 fn transition_quadrant(elapsed_ms: u64) -> usize {
     match elapsed_ms {
         0..=249 => 0,
-        250..=749 => 1,
-        750..=1499 => 2,
+        250..=2399 => 1,
+        2400..=2799 => 2,
         _ => 3,
     }
 }
@@ -377,9 +388,17 @@ fn note_destroy_steps(imported: bool, current_us: u64, release_us: u64, sync_us:
     SYNC_MAX.fetch_max(sync_us, Ordering::Relaxed);
     if current_us + release_us + sync_us >= 2_000 {
         let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        // ★전환 축에 정렬한다.★ 69 번에서 `LOCKTAIL` 의 `t=` 덕에 꼬리가 bounce 끝
+        // (t≈2620ms)에 몰린다는 것이 드러났는데, `DESTROYSTEP` 에는 그 축이 없어 1 초
+        // 해상도 타임스탬프로 추정해야 했다. 비용은 꼬리 분기 안이라 사실상 0 이다
+        // (relaxed load 1 + OnceLock get 1 + elapsed 1 = 약 30ns).
+        let at = match transition_elapsed_ms() {
+            Some(ms) => format!("+{ms}ms"),
+            None => "n/a".to_string(),
+        };
         warn!(
             "DESTROYSTEP #{tail} imported={imported} make_current={current_us}us \
-             release_teximage={release_us}us release_sync={sync_us}us"
+             release_teximage={release_us}us release_sync={sync_us}us t={at}"
         );
     }
     if nth % 1200 != 0 {

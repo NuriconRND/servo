@@ -2228,15 +2228,57 @@ impl WebGLThread {
     /// swap 은 페이지가 rAF 를 돌며 프레임을 내놓았다는 뜻이므로 합성되지 않더라도 회수
     /// 대상이 아니다. 회수의 본래 목적(정말로 버려진 캔버스의 GPU 메모리 반납)은 유지된다
     /// -- 페이지가 그리기를 멈추면 swap 도 멈추므로 유휴 시간이 지나면 회수된다.
+    /// ★생산이 멎은 컨텍스트를 즉시 이름으로 부른다.★ 1Hz 스윕에 얹혀 추가 비용이 없다.
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/69 의 151)
+    ///
+    /// 운영자가 "중간에 재생 중단" 을 봤는데, 로그에는 ★멎었다고 말하는 줄이 없었다.★
+    /// 생산자 쪽 태그(`SCISSORGATE`, `SCISSORJUMP`, `SCISSORAREA`)가 그냥 ***나오기를
+    /// 멈출 뿐*** 이고, 그것을 알아채려면 41 초 뒤에 "마지막 줄이 언제였나" 를 세어야 한다.
+    /// 소비자 측 fps 로 역산해서야 08:51:12 라는 시각이 나왔다.
+    ///
+    /// 침묵은 ***없는 로그*** 라서 눈에 띄지 않는다. 그래서 ★있는 로그★ 로 바꾼다.
+    ///
+    /// `last_alive` 는 `mark_context_alive` 가 swap 마다 갱신하므로, 그것이 안 움직이는
+    /// 컨텍스트가 곧 "생산이 멎은 컨텍스트" 다. 회수 대상(`released_contexts`)은 뺀다 --
+    /// 그건 의도적으로 재운 것이다.
+    ///
+    /// 비용: 1Hz x 컨텍스트 수. 69 번 기준 18 개이므로 초당 18 회 비교다.
+    fn report_silent_producers(&mut self, now: Instant) {
+        const SILENT_MS: u64 = 2_000;
+
+        let mut worst: Option<(WebGLContextId, u64)> = None;
+        let mut silent = 0usize;
+        for (context_id, last) in self.last_alive.iter() {
+            if self.released_contexts.contains(context_id) {
+                continue;
+            }
+            let ms = now.duration_since(*last).as_millis() as u64;
+            if ms < SILENT_MS {
+                continue;
+            }
+            silent += 1;
+            if worst.is_none_or(|(_, w)| ms > w) {
+                worst = Some((*context_id, ms));
+            }
+        }
+        let Some((context_id, ms)) = worst else {
+            return;
+        };
+        warn!(
+            "SWAPSILENT silent={silent} worst={context_id:?} silent_ms={ms}              live={} released={}",
+            self.last_alive.len(),
+            self.released_contexts.len(),
+        );
+    }
+
     fn mark_context_alive(&mut self, context_id: WebGLContextId) {
         self.last_alive.insert(context_id, Instant::now());
     }
 
     fn maybe_reclaim_idle_contexts(&mut self) {
-        let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
-        if idle_ms <= 0 {
-            return;
-        }
+        // ★1Hz 게이트를 pref 읽기 앞으로 옮겼다.★ 회수가 꺼져 있어도(`idle_ms <= 0`)
+        // 아래 침묵 보고는 돌아야 하기 때문이다. 덤으로 `pref!` 도 초당 한 번만 읽는다.
         let now = Instant::now();
         if self
             .last_reclaim_sweep
@@ -2245,6 +2287,13 @@ impl WebGLThread {
             return;
         }
         self.last_reclaim_sweep = Some(now);
+
+        self.report_silent_producers(now);
+
+        let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
+        if idle_ms <= 0 {
+            return;
+        }
         let idle = Duration::from_millis(idle_ms as u64);
         let stale: Vec<WebGLContextId> = self
             .context_backends

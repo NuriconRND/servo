@@ -1095,6 +1095,38 @@ pub struct Preferences {
     /// 게이트는 네 곳이다: `bind_debug_overlay`(안 그리는 프레임에는 ***bind 조차 하지
     /// 않는다*** -- 그래야 DComp 타일의 이전 내용이 유지된다), `profiler.update`,
     /// `profiler.draw_profile`, `debug_renderer.render`.
+    /// 캔버스 ack 자기잠금을 끊는 데드라인(ms). ★기본 2000★, 0 이면 끔(종전 동작).
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/69 의 151 실행)
+    ///
+    /// 운영자: "중간에 ★재생 중단★ 현상 확인". 수치로는 한 번이고 ★영구적★ 이다.
+    ///
+    ///     151  08:51:12 에 멈춤 -> 로그 끝(08:51:52)까지 ★40 초간 0.1~0.3fps★
+    ///     150  런 내내 29.7~37.1fps 평탄 (전환 없음)
+    ///
+    /// 멈춘 것은 ★생산자★ 다. 소비와 표시는 끝까지 정상이었다 -- `PRODUCE
+    /// window(edges=60.0/s calls=60.0/s miss=0)`, 240 lock/s, `RENDERSPLIT` 이 08:51:51
+    /// 까지. 생산자 태그만 죽는다(`SCISSORGATE` 마지막 08:51:11 이후 ★41 초 무음★).
+    /// 방아쇠는 그 시각의 `getUniformLocation: no reply (context released)` 11 건으로,
+    /// 런 전체에서 이 한 자리에만 나온다.
+    ///
+    /// 고리는 코드로 확인된다.
+    ///
+    ///     wall_tick.rs   ack_is_releasable = holds_debt && pending == 0
+    ///     painter.rs     pending 을 비우는 정상 경로는 `update_image`(epoch 지급) ★하나★
+    ///     script_thread.rs:1244  waiting_on_canvas_image_updates() 면 문서를 통째로 건너뜀
+    ///
+    /// epoch 이 미지급되면 pending 이 영원히 안 비고 -> ack 이 영영 안 가고 -> script 가 그
+    /// 문서를 영영 건너뛰고 -> rAF 와 DL 빌드가 안 돌고 -> WebGL 명령이 없어 ★새 epoch 이
+    /// 생길 기회조차 사라진다.★ `webgl_thread.rs:2752-2759` 가 이 고리를 적어 뒀고
+    /// 2026-11-11 에 `restore_context_backends` 로 ***한 경로*** 를 막았는데, 69 번이
+    /// ★다른 경로가 남아 있다★ 는 것을 보여 준다.
+    ///
+    /// 그래서 경로를 하나씩 막는 대신 데드라인을 둔다. 2 초는 정상 동작에 닿지 않는다 --
+    /// 정상 ack 은 rAF 한 바퀴(ms 단위)다. 끊은 뒤 한 프레임은 낡은 캔버스가 보일 수
+    /// 있지만 ★40 초 정지보다 낫다.★ 끊은 사건은 `ACKSTUCK` 로 찍히고, 그것이 나오면
+    /// ★아직 막지 못한 경로가 있다는 뜻★ 이므로 그 로그를 단서로 삼아야 한다.
+    pub gfx_wall_canvas_ack_deadline_ms: i64,
     pub gfx_wall_hud_draw_every: i64,
     pub gfx_wall_gl_error_check_every: i64,
     pub gfx_wall_webgl_busy_map_single_shard: bool,
@@ -1953,6 +1985,7 @@ impl Preferences {
             gfx_wall_webgl_scissor_hold_when_static: true,
             gfx_wall_animation_zero_snaps_to_tick: false,
             gfx_wall_gl_error_check_every: 60,
+            gfx_wall_canvas_ack_deadline_ms: 2000,
             gfx_wall_hud_draw_every: 15,
             gfx_wall_webgl_busy_map_single_shard: false,
             gfx_wall_webgl_tile_scissor_from_tile_geometry: false,

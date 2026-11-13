@@ -521,7 +521,26 @@ fn note_unlock_cost(took: Duration) {
     );
 }
 
+/// WR 이 집어간 외부 이미지의 ★가장 낡은 나이★(ms). `KEEPPREV` 가 읽고 비운다.
+///
+/// `frame_source_probe::CANVAS_STALE_WORST_MS` 와 ★다른 것★ 이다 -- 그쪽은
+/// "`canvas_is_live()` 가 거짓일 때 마지막 캔버스 ***활동*** 으로부터 지난 시간" 이라
+/// 조건부로만 갱신된다. 이쪽은 lock 마다 무조건 갱신되므로 ★생산이 멎은 순간부터 바로
+/// 자란다.★
+///
+/// ## 왜 (2026-11-13, 69 번)
+///
+/// 151 에서 재생이 40 초 멎었는데 `KEEPPREV` 10 줄이 전부 `canvas=0 (0.0%)` 였다 -- 150 과
+/// 똑같아서 ★두 로그를 가르지 못한다.★ `canvas=` 는 "이 틱이 캔버스를 기다려 거절됐나" 를
+/// 세는데 정지 상태에서는 애초에 기다리지 않는다(낡은 장을 그냥 쓴다). 그래서 0 이다.
+///
+/// 필요한 것은 ★낡음의 나이★ 이고, 그 값은 이미 `note_lock_wait` 로 들어온다.
+pub(crate) static LOCKED_IMAGE_AGE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
 fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
+    if let Some(age) = age {
+        LOCKED_IMAGE_AGE_MAX_MS.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
+    }
     /// 꼬리로 보고 한 줄 찍는 기준. 한 주기(16.7ms)의 절반이다.
     const TAIL_US: u64 = 8_000;
 

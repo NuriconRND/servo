@@ -139,7 +139,8 @@ use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::{ScreenshotTaker, ScreenshotWaitSummary};
 use crate::wall_tick::{
-    TileOutcome, ack_is_releasable, bootstrap_frame_allowed, tile_may_generate,
+    TileOutcome, ack_is_releasable, bootstrap_frame_allowed, canvas_ack_deadline, note_ack_debt,
+    tile_may_generate,
 };
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
@@ -821,6 +822,9 @@ impl Painter {
         );
         webrender::wall_render_split::set_hud_draw_every(
             servo_config::pref!(gfx_wall_hud_draw_every).clamp(0, 600) as u32,
+        );
+        crate::wall_tick::set_canvas_ack_deadline_ms(
+            servo_config::pref!(gfx_wall_canvas_ack_deadline_ms).clamp(0, 60_000) as u64,
         );
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
@@ -1564,14 +1568,60 @@ impl Painter {
     /// `renderer_behind()` 를 더는 부르지 않으므로 그 안의 2 초 강제 해제도 여기서는 안
     /// 돈다. ★그 프로브는 거절 경로의 것이다★ — `generate_frame_for_wall_tick` 이 매 틱
     /// ***무조건 먼저*** 부른다(`wall_tick::tile_may_generate`).
+    /// ★2 차 캔버스 ack 해제 -- 복구 자리.★ 렌더마다 돈다.
+    ///
+    /// ## 데드라인 (2026-11-13, log_webgl_perf_01/69)
+    ///
+    /// 69 번 151 실행에서 재생이 08:51:12 에 멎어 ★로그 끝까지 40 초간 0.1~0.3fps★ 였다.
+    /// 150(전환 없음)은 같은 지표가 29.7~37.1fps 로 평탄했으니 전환 고유다. 멈춘 것은
+    /// ★생산자★ 였다 -- 소비와 표시는 끝까지 정상이었다(`PRODUCE window(edges=60.0/s
+    /// calls=60.0/s miss=0)`, 240 lock/s, `RENDERSPLIT` 이 08:51:51 까지).
+    ///
+    /// 고리는 이렇다.
+    ///
+    ///     wall_tick.rs:232   ack_is_releasable = holds_debt && pending == 0
+    ///     painter.rs         pending 을 비우는 정상 경로는 `update_image`(epoch 지급) 하나
+    ///     script_thread.rs:1244  waiting_on_canvas_image_updates() 면 그 문서를 통째로 건너뜀
+    ///
+    /// epoch 이 미지급되면 pending 이 영원히 안 비고 -> ack 이 영영 안 가고 -> script 가 그
+    /// 문서를 영영 건너뛰고 -> rAF 와 DL 빌드가 안 돌고 -> WebGL 명령이 없어 ★새 epoch 이
+    /// 생길 기회조차 사라진다.★ `webgl_thread.rs:2752-2759` 가 이것을 "자기 잠금 고리" 라고
+    /// 적어 뒀고, 2026-11-11 에 `restore_context_backends` 로 ***한 경로*** 를 막았다.
+    /// 69 번은 ★다른 경로가 남아 있다★ 는 것을 보여 준다.
+    ///
+    /// 그래서 경로를 하나씩 막는 대신 ★데드라인★ 을 둔다. 빚이
+    /// `gfx_wall_canvas_ack_deadline_ms` 를 넘으면 pending 을 버리고 ack 을 보낸다. 버린
+    /// 뒤 한 프레임은 낡은 캔버스가 보일 수 있지만 ★40 초 정지보다 낫다.★ 0 이면 종전
+    /// 동작(데드라인 없음)이다.
+    ///
+    /// ## 비용
+    ///
+    /// 빚이 없는 정상 프레임에는 `Option<Instant>` 비교 ★분기 하나★ 다 --
+    /// `pending_canvas_age()` 가 `Instant::now()` 를 부르지 않는다. 빚이 있을 때만
+    /// `elapsed()` 1 회(약 25ns) x 240 렌더/s = 6us/s.
     fn flush_owed_canvas_ack(&mut self) {
         if *WALL_DISABLE_CANVAS_ACK_RECOVERY {
             return;
         }
-        if !ack_is_releasable(
-            self.frame_delayer.is_holding_ack(),
-            self.frame_delayer.pending_canvas_image_count(),
-        ) {
+        let holds_debt = self.frame_delayer.is_holding_ack();
+        let pending = self.frame_delayer.pending_canvas_image_count();
+        if !ack_is_releasable(holds_debt, pending) {
+            // 여기가 자기잠금이 사는 자리다. 빚이 있는데 pending 이 안 빈다.
+            if holds_debt && pending > 0 {
+                if let Some(age) = self.frame_delayer.pending_canvas_age() {
+                    note_ack_debt(age);
+                    let deadline = canvas_ack_deadline();
+                    if !deadline.is_zero() && age >= deadline {
+                        let dropped = self.frame_delayer.abandon_pending_canvas_images();
+                        log::warn!(
+                            "ACKSTUCK age={}ms dropped={dropped} pipelines={}                              -- 캔버스 ack 자기잠금을 데드라인으로 끊었다",
+                            age.as_millis(),
+                            self.frame_delayer.waiting_pipeline_count(),
+                        );
+                        self.send_owed_canvas_ack();
+                    }
+                }
+            }
             return;
         }
 
@@ -3796,12 +3846,20 @@ pub(crate) struct FrameDelayer {
     /// 캔버스는 다르다: 업로드는 ***그려서 올렸다***는 양의 증거고, 장식용 rAF 는 이것을
     /// 만들지 않는다.
     last_canvas_activity_at: Option<Instant>,
+    /// `pending_canvas_images` 가 ★비어 있지 않게 된 시각★. 비면 `None` 으로 돌아간다.
+    ///
+    /// 이것이 데드라인의 시계다. 근거는 `Painter::flush_owed_canvas_ack` 의 doc --
+    /// 69 번에서 이 집합이 40 초 동안 비지 않아 재생이 영구히 멎었다.
+    oldest_pending_at: Option<Instant>,
 }
 
 impl FrameDelayer {
     pub(crate) fn delete_image(&mut self, image_key: ImageKey) {
         self.image_epochs.remove(&image_key);
         self.pending_canvas_images.remove(&image_key);
+        if self.pending_canvas_images.is_empty() {
+            self.oldest_pending_at = None;
+        }
     }
 
     pub(crate) fn update_image(&mut self, image_key: ImageKey, epoch: Epoch) {
@@ -3812,6 +3870,9 @@ impl FrameDelayer {
         };
         if *entry.get() <= epoch {
             entry.remove();
+        }
+        if self.pending_canvas_images.is_empty() {
+            self.oldest_pending_at = None;
         }
     }
 
@@ -3831,6 +3892,11 @@ impl FrameDelayer {
                 .is_some_and(|epoch_seen| *epoch_seen >= canvas_epoch)
             {
                 continue;
+            }
+            if self.pending_canvas_images.is_empty() {
+                // 빈 집합이 채워지는 순간이 데드라인의 원점이다. 이미 차 있으면 손대지
+                // 않는다 -- ★가장 오래된★ 빚의 나이를 재야 하기 때문이다.
+                self.oldest_pending_at = Some(Instant::now());
             }
             self.pending_canvas_images.insert(image_key, canvas_epoch);
         }
@@ -3873,6 +3939,27 @@ impl FrameDelayer {
 
     pub(crate) fn pending_canvas_image_count(&self) -> usize {
         self.pending_canvas_images.len()
+    }
+
+    /// 가장 오래된 캔버스 빚의 나이. 빚이 없으면 `None`.
+    ///
+    /// ★`Instant::now()` 를 부르지 않는 경로가 있다★ -- `oldest_pending_at` 이 `None`
+    /// 이면(= 정상) 바로 `None` 이다. 그래서 정상 프레임에 드는 비용은 분기 하나다.
+    pub(crate) fn pending_canvas_age(&self) -> Option<Duration> {
+        self.oldest_pending_at.map(|at| at.elapsed())
+    }
+
+    /// ★자기잠금을 끊는다.★ `pending_canvas_images` 를 통째로 버리고 시계를 끈다.
+    ///
+    /// 이것은 ***정상 경로가 아니다***. 부르는 자리는 `Painter::flush_owed_canvas_ack` 의
+    /// 데드라인 하나뿐이고, 거기 doc 에 왜 필요한지가 있다. 버리는 epoch 은 "WR 이 이
+    /// 캔버스의 새 장을 아직 못 받았다" 는 사실 자체이므로, 버린 뒤 한 프레임은 낡은
+    /// 캔버스가 보일 수 있다 -- ★40 초 정지보다 낫다.★
+    pub(crate) fn abandon_pending_canvas_images(&mut self) -> usize {
+        let dropped = self.pending_canvas_images.len();
+        self.pending_canvas_images.clear();
+        self.oldest_pending_at = None;
+        dropped
     }
 
     /// ack 를 기다리는 파이프라인 수. 주입이 **실제로 무엇을 보류했는지** 로그에 싣기 위한 것.

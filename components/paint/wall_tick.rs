@@ -229,6 +229,48 @@ pub(crate) fn decline_may_arm_keep_previous(
 /// 기다리던 캔버스가 화면에 올라갔다" 는 뜻이라, 이미지가 WR 에 닿기 전에 풀면 스크립트가
 /// 합성되지 않은 캔버스 위에서 다음 rAF 를 돈다. ★진입점 무조건 해제는 검토했고 택하지
 /// 않았다.★
+/// 캔버스 ack 자기잠금을 끊는 데드라인. 0 이면 끔(2026-11-13 이전 동작).
+///
+/// `painter` 가 틱마다 싣는다. 읽는 자리는 `Painter::flush_owed_canvas_ack` 하나이고,
+/// 왜 필요한지는 거기 doc 에 있다 -- 69 번에서 재생이 40 초간 영구히 멎었다.
+pub(crate) fn canvas_ack_deadline() -> Duration {
+    Duration::from_millis(ACK_DEADLINE_MS.load(Ordering::Relaxed))
+}
+
+/// `gfx_wall_canvas_ack_deadline_ms` 를 싣는다.
+pub fn set_canvas_ack_deadline_ms(ms: u64) {
+    ACK_DEADLINE_MS.store(ms, Ordering::Relaxed);
+}
+
+static ACK_DEADLINE_MS: AtomicU64 = AtomicU64::new(2_000);
+
+/// 캔버스 빚의 나이를 기록한다. ★최대값이 의미 있는 수치다★ -- 정상이면 rAF 한 바퀴
+/// (ms 단위)이고, 자기잠금이면 끝없이 자란다.
+///
+/// 69 번에는 이 지표가 없어서 "빚이 40 초 묵었다" 를 ★로그에서 직접 읽을 수 없었다.★
+/// 소비자 측 fps(`LOCKWAIT` 의 fresh)로 역산해야 했다. 이제 한 줄로 읽힌다.
+///
+/// 비용: 빚이 있을 때만 불린다. 원자 `fetch_max` 1 + `fetch_add` 1 = 약 20ns.
+pub(crate) fn note_ack_debt(age: Duration) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static MAX_MS: AtomicU64 = AtomicU64::new(0);
+    static SUM_MS: AtomicU64 = AtomicU64::new(0);
+
+    let ms = age.as_millis() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    MAX_MS.fetch_max(ms, Ordering::Relaxed);
+    SUM_MS.fetch_add(ms, Ordering::Relaxed);
+    if nth % 1200 != 0 {
+        return;
+    }
+    log::warn!(
+        "ACKDEBT n={nth} age(avg={}ms max={}ms) deadline={}ms",
+        SUM_MS.swap(0, Ordering::Relaxed) / 1200,
+        MAX_MS.swap(0, Ordering::Relaxed),
+        ACK_DEADLINE_MS.load(Ordering::Relaxed),
+    );
+}
+
 pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) -> bool {
     holds_debt && pending_canvas_images == 0
 }
