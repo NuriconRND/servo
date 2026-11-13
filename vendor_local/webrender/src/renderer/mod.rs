@@ -1564,6 +1564,47 @@ impl Renderer {
     }
 
     /// Unbind the draw target for debug / profiler overlays, if required.
+    /// HUD 를 그리지 않은 프레임에, 이전에 그린 overlay 를 합성 목록에 다시 넣는다.
+    ///
+    /// `unbind_debug_overlay` 에서 ★`compositor.unbind` 를 뺀 것★ 이다 -- bind 를 하지
+    /// 않았으므로 unbind 해서는 안 되고, 필요한 것은 `add_surface` 뿐이다.
+    ///
+    /// ## 왜 (2026-11-13, 68 번)
+    ///
+    /// `gfx_wall_hud_draw_every` 로 HUD 를 15 프레임마다 그리게 하자 judder 는 사라졌지만
+    /// 운영자가 "HUD의 표출이 유지되지 않고 ★심하게 깜박임★" 이라고 보고했다. 내가 걸었던
+    /// 전제 -- "bind 하지 않으면 DComp 타일의 이전 내용이 유지된다" -- 가 틀렸다.
+    ///
+    /// 내용은 유지된다. 빠진 것은 ★합성 참여★ 다. `add_surface` 는 그 프레임에 표시할
+    /// 서피스 목록에 overlay 를 넣는 호출이고, compositor 는 매 프레임 그 목록을 새로
+    /// 만든다. 그리지 않은 14 프레임은 그 호출이 없으니 목록에서 빠져 사라진다.
+    ///
+    /// `Draw` 경로는 할 일이 없다(원래도 `unbind_debug_overlay` 가 아무것도 하지 않는다).
+    /// `Layer` 경로는 `present_layer` 가 bind-present 대칭이므로 bind 없이 부르지 않는다 --
+    /// 이 프로젝트의 벽은 `Native`(DComp) 경로다.
+    fn readd_debug_overlay_surface(&mut self) {
+        if !self.debug_overlay_state.is_enabled {
+            return;
+        }
+        let CompositorKind::Native { .. } = self.current_compositor_kind else {
+            return;
+        };
+        let Some(surface_size) = self.debug_overlay_state.current_size else {
+            return;
+        };
+        let compositor = self.compositor_config.compositor().unwrap();
+        let clip_rect = DeviceIntRect::from_size(surface_size);
+        compositor.add_surface(
+            &mut self.device,
+            NativeSurfaceId::DEBUG_OVERLAY,
+            CompositorSurfaceTransform::identity(),
+            clip_rect,
+            ImageRendering::Auto,
+            clip_rect,
+            ClipRadius::EMPTY,
+        );
+    }
+
     fn unbind_debug_overlay(&mut self) {
         // Debug overlay setup are only required in native compositing mode
         if self.debug_overlay_state.is_enabled {
@@ -1928,6 +1969,13 @@ impl Renderer {
             // Unbind the target for the debug overlay. No debug or profiler drawing
             // can occur afer this point.
             self.unbind_debug_overlay();
+        } else if !draw_hud {
+            // ★그리지 않은 프레임도 합성 목록에는 넣는다.★ 68 번에서 HUD 가 "심하게 깜박임"
+            // 이었던 이유가 이것이다 -- `unbind_debug_overlay` 안의 `add_surface` 가 overlay 를
+            // 그 프레임의 합성 목록에 넣는데, compositor 는 매 프레임 목록을 새로 만들기
+            // 때문에 부르지 않은 프레임에서는 overlay 가 사라진다. 서피스 ***내용은*** 남아
+            // 있으므로, 다시 넣어 주기만 하면 이전에 그린 HUD 가 계속 보인다.
+            self.readd_debug_overlay_surface();
         }
 
         if device_size.is_some() {
