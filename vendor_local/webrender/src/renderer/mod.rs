@@ -1908,9 +1908,15 @@ impl Renderer {
         );
 
         // Note: profile counters must be set before this or they will count for next frame.
-        if draw_hud {
-            self.profiler.update();
-        }
+        // ★fps 카운터는 매 프레임 돌려야 한다.★ `update()` 가
+        // `frame_timestamps_within_last_second.push(now)` 를 하므로, 이것을 HUD 주기로
+        // 게이트하면 fps 가 그 주기로 나뉘어 표시된다 -- 69 번에서 운영자가
+        // "fps가 -HudDrawEvery 15 를 divisor로 한 값을 따라감 (4fps)" 으로 보고했다.
+        //
+        // 비용은 없다 -- 이 구간은 실측 `prof p50 0us, max 1us` 이고 GL 호출이
+        // 없는 CPU 작업뿐이다. judder 는 드라이버 명령 큐 포화였으므로 여기엔
+        // 해당하지 않는다. 게이트는 실제로 GL 을 만지는 세 곳에만 남긴다.
+        self.profiler.update();
 
         // ★HUD 텍스트를 쌓는 자리도 같은 주기로 게이트한다.★ 근거는 `should_draw_hud` 의 doc.
         if draw_hud
