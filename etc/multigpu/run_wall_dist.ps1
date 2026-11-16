@@ -141,7 +141,8 @@ param(
     # (2026-11-16) gfx_wall_event_probe -- stamp rare heavy events with a UTC ms time and how
     # long they took: media player create/release, the real GStreamer teardown on the
     # disposal threads (media.dispose), DComp surface create/destroy, swap chain
-    # promote/demote/regen. Prints WALLEVENT (one line per event) and WALLEVENTS (per-window
+    # promote/demote/regen, and (2026-11-16, run 08) render.over: every painter render over one
+    # period with its ms time and tile origin (RENDERSPLIT has neither). Prints WALLEVENT (one line per event) and WALLEVENTS (per-window
     # counts) every 10 s. Why: in a board-swap transition the renders over one period peak in
     # the last second of the bounce while re-raster drops (log_rotation_opacity_judder_01/07);
     # this shows whether tearing down the outgoing board lands there. Off costs one AtomicBool

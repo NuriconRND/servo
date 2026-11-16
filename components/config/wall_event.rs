@@ -25,6 +25,10 @@
 //! - `dcomp.create_surface` / `dcomp.destroy_surface` -- WebRender 의 picture cache 슬라이스마다
 //!   하나인 합성 surface. 보드 교체 중 painter 당 타일이 두 장까지 늘었다(`TILEPROBE`
 //!   frame_max 24.9 Mpx) -- 슬라이스가 생기고 사라지면 이것이 찍힌다.
+//! - `render.over` (2026-11-16 추가) -- 한 주기(16.667 ms)를 넘긴 painter 렌더. `RENDERSPLIT` 과
+//!   같은 범위(present 포함)를 재지만 ms 시각과 ★타일 원점★(`tile=x,y`, 곧 어느 GPU 인지)을 남긴다.
+//!   08 런에서 바운스 후반 과부하가 +2.15~2.45 초로 좁혀졌는데(나가는 보드 정리 +2.55 초보다 앞),
+//!   `RENDERSPLIT` 은 로그 초 해상도이고 painter 를 남기지 않아 그 이상 가를 수 없었다.
 //! - `dcomp.promote` / `dcomp.demote` / `dcomp.regen` -- 그 surface 를 swap chain 으로 올리고
 //!   내리는 일, 그리고 swap chain 크기가 바뀌어 다시 만드는 일. extra 는 kpx.
 //!
@@ -36,7 +40,7 @@
 //!
 //! ## 성능 규칙
 //!
-//! 모두 드문 일이라 앞뒤로 `Instant` 를 읽고 원자 링(256 칸)에 넣는다. 출력은 painter 가 띄운
+//! 모두 드문 일이라 앞뒤로 `Instant` 를 읽고 원자 링([`RING`] 칸)에 넣는다. `at=` 은 ★끝난 시각★이다. 출력은 painter 가 띄운
 //! 리포터 스레드가 10 초마다 한다(창마다 최대 [`PRINT_MAX`] 줄, 넘친 수는 `more=`).
 //! ★꺼져 있으면 각 자리에 `AtomicBool` 로드 하나다★ -- 시계도 읽지 않는다([`Timer`]).
 
@@ -44,8 +48,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REPORT_EVERY: Duration = Duration::from_secs(10);
-const RING: usize = 256;
-const PRINT_MAX: u64 = 120;
+/// 2026-11-16: `render.over` 가 들어오며 256 -> 1024, 120 -> 400 (전환 하나에 과부하 렌더가 20~30,
+/// 나쁜 창이면 그 몇 배). 출력은 리포터 스레드가 하므로 렌더 경로 비용과 무관하다.
+const RING: usize = 1024;
+const PRINT_MAX: u64 = 400;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -66,10 +72,12 @@ pub enum Kind {
     /// 이미 swap chain 인 surface 의 크기가 바뀌어 다시 만든다.
     DcompRegen = 7,
     MediaDispose = 8,
+    /// extra = 타일 원점 `(x << 16) | y` ([`tile_code`]).
+    RenderOver = 9,
 }
 
 /// 코드 0 은 비워 둔다(빈 칸과 구별). 코드 최댓값 + 1.
-const KINDS: usize = 9;
+const KINDS: usize = 10;
 
 /// `WALLEVENTS` 에 찍는 순서: 미디어(생성 -> 놓기 -> 해체), 그다음 DComp.
 const ORDER: [Kind; KINDS - 1] = [
@@ -81,6 +89,7 @@ const ORDER: [Kind; KINDS - 1] = [
     Kind::DcompPromote,
     Kind::DcompDemote,
     Kind::DcompRegen,
+    Kind::RenderOver,
 ];
 
 impl Kind {
@@ -94,6 +103,7 @@ impl Kind {
             6 => Kind::DcompDemote,
             7 => Kind::DcompRegen,
             8 => Kind::MediaDispose,
+            9 => Kind::RenderOver,
             _ => return None,
         })
     }
@@ -108,6 +118,7 @@ impl Kind {
             Kind::DcompDemote => "dcomp.demote",
             Kind::DcompRegen => "dcomp.regen",
             Kind::MediaDispose => "media.dispose",
+            Kind::RenderOver => "render.over",
         }
     }
 }
@@ -132,6 +143,30 @@ impl Timer {
         if let Some(started) = self.0 {
             record(kind, started.elapsed(), extra);
         }
+    }
+
+    /// `min` 이상 걸렸을 때만 찍는다. `extra` 는 그때만 계산한다(자물쇠를 잡는 값이어도 된다).
+    #[inline]
+    pub fn finish_if_longer(self, kind: Kind, min: Duration, extra: impl FnOnce() -> u32) {
+        if let Some(started) = self.0 {
+            let took = started.elapsed();
+            if took >= min {
+                record(kind, took, extra());
+            }
+        }
+    }
+}
+
+/// 타일 원점을 extra 하나에 담는다(2026-11-16). 벽 가상 뷰포트는 11520x4320 이라 16 비트씩이면 된다.
+pub fn tile_code(x: i32, y: i32) -> u32 {
+    ((x.clamp(0, 0xffff) as u32) << 16) | y.clamp(0, 0xffff) as u32
+}
+
+/// `WALLEVENT` 줄의 꼬리. 대부분 `extra=N`, `render.over` 는 `tile=x,y`.
+fn describe_extra(kind: Kind, extra: u32) -> String {
+    match kind {
+        Kind::RenderOver => format!("tile={},{}", extra >> 16, extra & 0xffff),
+        _ => format!("extra={extra}"),
     }
 }
 
@@ -216,9 +251,10 @@ fn report(elapsed: Duration, seen: u64) -> u64 {
         if printed < PRINT_MAX {
             let (h, m, s, ms) = utc_hms(a);
             log::warn!(
-                "WALLEVENT at={h:02}:{m:02}:{s:02}.{ms:03}Z {} took={:.2}ms extra={extra}",
+                "WALLEVENT at={h:02}:{m:02}:{s:02}.{ms:03}Z {} took={:.2}ms {}",
                 kind.name(),
-                micros as f64 / 1000.0
+                micros as f64 / 1000.0,
+                describe_extra(kind, extra),
             );
             printed += 1;
         }
@@ -307,5 +343,29 @@ mod tests {
     fn a_disabled_timer_reads_no_clock() {
         // 시험 프로세스에서는 start() 를 부르지 않으므로 꺼져 있다.
         assert!(Timer::start().0.is_none());
+    }
+
+    #[test]
+    fn a_disabled_conditional_timer_never_computes_extra() {
+        // 꺼져 있으면 extra 클로저(타일 자물쇠)를 부르지 않아야 한다.
+        Timer::start().finish_if_longer(Kind::RenderOver, Duration::ZERO, || {
+            panic!("extra computed while disabled")
+        });
+    }
+
+    #[test]
+    fn tile_origins_round_trip_for_the_whole_wall() {
+        // 2x2 벽(11520x4320)의 네 원점과, 범위를 벗어난 값의 자르기.
+        for (x, y) in [(0, 0), (5760, 0), (0, 2160), (5760, 2160)] {
+            assert_eq!(
+                describe_extra(Kind::RenderOver, tile_code(x, y)),
+                format!("tile={x},{y}")
+            );
+        }
+        assert_eq!(
+            describe_extra(Kind::RenderOver, tile_code(-5, 70_000)),
+            "tile=0,65535"
+        );
+        assert_eq!(describe_extra(Kind::MediaDispose, 1), "extra=1");
     }
 }

@@ -1795,6 +1795,9 @@ impl Painter {
         // ★이미 측정된 60ms 를 구간으로 쪼갠다.★ 근거는 `note_render_split` 의 doc 주석.
         // `RENDERCOST` 와 같은 범위를 그대로 나누므로 합이 그 값과 맞는다.
         let mut split = crate::frame_source_probe::RenderSplit::start();
+        // ★2026-11-16 WALLEVENT render.over★ -- 같은 범위를 재서 주기를 넘긴 것만 ms 시각과
+        // 타일 원점으로 남긴다. 근거는 `servo_config::wall_event` 의 모듈 주석(08 런).
+        let wall_render_timer = servo_config::wall_event::Timer::start();
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -1908,6 +1911,21 @@ impl Painter {
             self.rendering_context.present();
         }
 
+        // `RENDERSPLIT` 의 `PERIOD_US` 와 같은 문턱. 타일 자물쇠는 넘긴 프레임에서만 잡는다.
+        // ★`split.finish()` 보다 먼저★ -- 그 안에서 넘긴 프레임마다 `RENDERSPLIT` 줄을 찍으므로,
+        // 뒤에 두면 그 I/O 가 이 값에 섞인다. 앞에 두면 두 프로브가 같은 구간을 같은 문턱으로 잰다.
+        wall_render_timer.finish_if_longer(
+            servo_config::wall_event::Kind::RenderOver,
+            Duration::from_micros(16_667),
+            || {
+                self.painter_tile_rect_map
+                    .get(self.painter_id)
+                    .map(|rect| {
+                        servo_config::wall_event::tile_code(rect.tile.min.x, rect.tile.min.y)
+                    })
+                    .unwrap_or(u32::MAX)
+            },
+        );
         // ★present 까지 포함해서 잰다.★ 스레드 타일은 자기가 표출하고 셸의 조인이 그것까지
         // 기다리므로, 그 비용도 ***논리 프레임***의 비용이다.
         split.finish();

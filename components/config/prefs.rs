@@ -595,7 +595,8 @@ pub struct Preferences {
     /// `vendor_local/webrender/src/wall_tex_probe.rs`. 런처는 `-TextureCacheProbe`.
     pub gfx_wr_texture_cache_probe: bool,
     /// ★2026-11-16 추가★ -- 드문 무거운 일(미디어 플레이어 생성·해제·해체, DComp 합성 surface 생성·파괴,
-    /// swap chain 승격·강등·재생성)에 UTC ms 시각과 소요 시간을 찍는 프로브(기본 꺼짐). 10 초마다
+    /// swap chain 승격·강등·재생성, 그리고 2026-11-16 08 런 뒤로 한 주기를 넘긴 painter 렌더와 그 타일)에
+    /// UTC ms 시각과 소요 시간을 찍는 프로브(기본 꺼짐). 10 초마다
     /// `WALLEVENT` 줄(일마다)과 `WALLEVENTS` 요약을 낸다. 보드 교체의 바운스 후반(2~3 초)에 다시
     /// 그리는 양은 줄었는데 16.7 ms 초과 렌더가 가장 많은(log_rotation_opacity_judder_01/07) 까닭이
     /// 나가는 보드를 치우는 일과 겹치는지 가르기 위한 것이다. 근거와 성능 규칙은
