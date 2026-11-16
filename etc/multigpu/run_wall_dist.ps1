@@ -96,7 +96,9 @@ param(
     [string] $ProfilerHud = "",
     # gfx_paint_side_animation_mesh_probe -- measure whether paint-side prediction meshes
     # when it is swapped, and print a MESHPROBE line every 10 s. A run with it off costs one
-    # AtomicBool load.
+    # AtomicBool load. (2026-11-16) Big jumps (translate >= 1 px, rotation/scale part >= 0.01,
+    # opacity >= 0.02) are also printed as MESHJUMPS (per-window counts) and MESHJUMP lines
+    # with a UTC time, to line them up with [handover] transition times.
     [switch] $MeshProbe,
     # (2026-11-12) gfx_wr_render_target_probe -- count WebRender render-target pool churn
     # (dedicated targets allocated / GC-freed / created / deleted by the renderer, with times)

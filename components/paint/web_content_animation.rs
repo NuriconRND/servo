@@ -878,6 +878,12 @@ impl PipelineAnimations {
                 Some(before) => {
                     carried += 1;
                     paint_animation_mesh_probe::note_mesh_error((after.value - before.value).abs());
+                    // ★2026-11-16 MESHJUMP★ -- 큰 튐은 시각과 함께 남긴다.
+                    if let Some(jump) =
+                        paint_animation_mesh_probe::opacity_jump(before.value, after.value)
+                    {
+                        paint_animation_mesh_probe::note_jump(jump);
+                    }
                 },
                 None => fresh += 1,
             }
@@ -893,6 +899,10 @@ impl PipelineAnimations {
                         .map(|index| (a[index] - b[index]).abs())
                         .fold(0.0f32, f32::max);
                     paint_animation_mesh_probe::note_mesh_error(worst);
+                    // ★2026-11-16 MESHJUMP★ -- 이동(px)과 선형부를 나눠 큰 튐만 시각과 함께.
+                    if let Some(jump) = paint_animation_mesh_probe::transform_jump(&b, &a) {
+                        paint_animation_mesh_probe::note_jump(jump);
+                    }
                 },
                 None => fresh += 1,
             }

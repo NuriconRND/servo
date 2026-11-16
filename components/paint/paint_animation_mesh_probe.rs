@@ -77,9 +77,11 @@ pub(crate) fn start() {
         .name(String::from("PaintAnimMesh"))
         .spawn(|| {
             let started = std::time::Instant::now();
+            let mut jumps = JumpReport::default();
             loop {
                 std::thread::sleep(REPORT_EVERY);
                 report(started.elapsed());
+                report_jumps(started.elapsed(), &mut jumps);
             }
         });
     if let Err(error) = spawned {
@@ -160,9 +162,214 @@ fn report(elapsed: Duration) {
     );
 }
 
+// ## 큰 튐의 시각 -- `MESHJUMP` (2026-11-16 추가)
+//
+// 위 히스토그램은 분포만 있고 ★언제★ 튀었는지가 없다. 벽 런
+// log_rotation_opacity_judder_01/03(2026-11-13)에서 운영자는 보드 교체(`bounce/left/2500ms`,
+// 약 9.6 초마다) 전환 중에만 judder 를 봤는데, 같은 런의 MESHPROBE 는 10 초 창마다 설치
+// 560~1300 번 중 맞물림 54~63% 였다 -- 교체의 약 40% 가 튄다. 그 튐이 전환 2.5 초에 몰리는지를
+// `[handover][전환 시작]` 줄과 맞춰 보려면 시각이 필요하다.
+//
+// ★행렬은 이동과 선형부를 나눠 본다.★ 위 `note_mesh_error` 는 16 성분의 최대 차라 px(이동)와
+// 단위 없는 값(회전·배율)이 섞인다. 여기서는 이동(m41, m42)은 px 로, 2x2 선형부(m11, m12, m21,
+// m22)는 그대로 따로 재고, 문턱을 넘은 것만 원자 링에 시각과 함께 넣는다. 출력은 리포터가
+// 10 초마다 몰아서 한다(창마다 최대 [`JUMP_PRINT_MAX`] 줄, 넘친 수는 `more=`).
+//
+// ★꺼져 있으면 비용이 없다★ -- 이 함수들은 `measure_mesh` 안에서만 불리고, 그것은 프로브가
+// 켜졌을 때만 돈다.
+
+/// 이동이 이 px 이상 튀면 큰 튐이다.
+const JUMP_TRANSLATE_PX: f32 = 1.0;
+/// 회전·배율(2x2 선형부)이 이만큼 튀면 큰 튐이다. 5000 px 폭 영역이면 가장자리에서 약 50 px 이다.
+const JUMP_LINEAR: f32 = 0.01;
+/// opacity 가 이만큼 튀면 큰 튐이다.
+const JUMP_OPACITY: f32 = 0.02;
+/// 큰 튐 링의 칸 수.
+const JUMP_RING: usize = 256;
+/// 한 보고 창에 찍는 최대 줄 수.
+const JUMP_PRINT_MAX: u64 = 60;
+
+/// 큰 튐 하나의 종류와 크기.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Jump {
+    /// 이동, px.
+    Translate(f32),
+    /// 2x2 선형부의 성분별 최대 차.
+    Linear(f32),
+    Opacity(f32),
+}
+
+impl Jump {
+    fn code(self) -> u64 {
+        match self {
+            Jump::Translate(_) => 0,
+            Jump::Linear(_) => 1,
+            Jump::Opacity(_) => 2,
+        }
+    }
+
+    fn value(self) -> f32 {
+        match self {
+            Jump::Translate(value) | Jump::Linear(value) | Jump::Opacity(value) => value,
+        }
+    }
+}
+
+/// 교체 전후 행렬(`Transform3D::to_array`, 행 우선 m11..m44)의 차가 큰 튐인가. 이동을 먼저 본다.
+pub(crate) fn transform_jump(before: &[f32; 16], after: &[f32; 16]) -> Option<Jump> {
+    let diff = |index: usize| (after[index] - before[index]).abs();
+    let translate = diff(12).max(diff(13));
+    if translate >= JUMP_TRANSLATE_PX {
+        return Some(Jump::Translate(translate));
+    }
+    let linear = diff(0).max(diff(1)).max(diff(4)).max(diff(5));
+    if linear >= JUMP_LINEAR {
+        return Some(Jump::Linear(linear));
+    }
+    None
+}
+
+/// 교체 전후 opacity 의 차가 큰 튐인가.
+pub(crate) fn opacity_jump(before: f32, after: f32) -> Option<Jump> {
+    let diff = (after - before).abs();
+    (diff >= JUMP_OPACITY).then_some(Jump::Opacity(diff))
+}
+
+static JUMP_A: [AtomicU64; JUMP_RING] = [const { AtomicU64::new(0) }; JUMP_RING];
+static JUMP_B: [AtomicU64; JUMP_RING] = [const { AtomicU64::new(0) }; JUMP_RING];
+static JUMP_NEXT: AtomicU64 = AtomicU64::new(0);
+static JUMP_COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// 큰 튐 하나를 시각과 함께 링에 넣는다. ★원자 연산과 벽시계 한 번★ -- 큰 튐에서만 불린다.
+pub(crate) fn note_jump(jump: Jump) {
+    JUMP_COUNTS[jump.code() as usize].fetch_add(1, Ordering::Relaxed);
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let milli = (jump.value().max(0.0).min(4_000_000.0) * 1000.0) as u64;
+    let slot = (JUMP_NEXT.fetch_add(1, Ordering::AcqRel) as usize) % JUMP_RING;
+    JUMP_B[slot].store((jump.code() << 32) | milli, Ordering::Relaxed);
+    JUMP_A[slot].store(unix_ms, Ordering::Release);
+}
+
+/// 리포터가 들고 다니는 이전 상태.
+#[derive(Default)]
+struct JumpReport {
+    seen: u64,
+    counts: [u64; 3],
+}
+
+/// 직전 창의 큰 튐 수와, 그 시각들을 찍는다.
+fn report_jumps(elapsed: Duration, state: &mut JumpReport) {
+    let counts: [u64; 3] = std::array::from_fn(|i| JUMP_COUNTS[i].load(Ordering::Relaxed));
+    let next = JUMP_NEXT.load(Ordering::Acquire);
+    let window = next - state.seen;
+    if window > 0 {
+        log::warn!(
+            "MESHJUMPS t={:.0}s w:translate={} w:linear={} w:opacity={} | total translate={} \
+             linear={} opacity={} (문턱 {}px / {} / {})",
+            elapsed.as_secs_f64(),
+            counts[0] - state.counts[0],
+            counts[1] - state.counts[1],
+            counts[2] - state.counts[2],
+            counts[0],
+            counts[1],
+            counts[2],
+            JUMP_TRANSLATE_PX,
+            JUMP_LINEAR,
+            JUMP_OPACITY,
+        );
+    }
+    let first = state.seen.max(next.saturating_sub(JUMP_RING as u64));
+    let lost = first - state.seen;
+    let last = next.min(first + JUMP_PRINT_MAX);
+    for index in first..last {
+        let slot = (index as usize) % JUMP_RING;
+        let unix_ms = JUMP_A[slot].load(Ordering::Acquire);
+        let b = JUMP_B[slot].load(Ordering::Relaxed);
+        let (h, m, s, ms) = webrender::wall_tex_cache::utc_hms(unix_ms);
+        let kind = match b >> 32 {
+            0 => "translate(px)",
+            1 => "linear",
+            _ => "opacity",
+        };
+        log::warn!(
+            "MESHJUMP at={h:02}:{m:02}:{s:02}.{ms:03}Z {kind}={:.3}",
+            (b & 0xffff_ffff) as f64 / 1000.0
+        );
+    }
+    if next > last || lost > 0 {
+        log::warn!(
+            "MESHJUMP more={} (창마다 {JUMP_PRINT_MAX} 줄까지 찍는다, 링 {JUMP_RING} 칸에서 덮인 {lost} 포함)",
+            next - last + lost
+        );
+    }
+    state.seen = next;
+    state.counts = counts;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn translate(x: f32, y: f32) -> [f32; 16] {
+        let mut m = [0.0; 16];
+        m[0] = 1.0;
+        m[5] = 1.0;
+        m[10] = 1.0;
+        m[15] = 1.0;
+        m[12] = x;
+        m[13] = y;
+        m
+    }
+
+    #[test]
+    fn a_translation_jump_is_measured_in_pixels_and_comes_first() {
+        let before = translate(100.0, 50.0);
+        let mut after = translate(103.5, 50.2);
+        after[0] = 0.9; // a linear change too -- the translation wins.
+        assert_eq!(transform_jump(&before, &after), Some(Jump::Translate(3.5)));
+    }
+
+    #[test]
+    fn small_moves_are_not_jumps() {
+        let before = translate(100.0, 50.0);
+        let after = translate(100.6, 49.7);
+        assert_eq!(transform_jump(&before, &after), None);
+        assert_eq!(opacity_jump(0.50, 0.51), None);
+    }
+
+    #[test]
+    fn a_rotation_jump_is_caught_by_the_linear_part() {
+        let before = translate(0.0, 0.0);
+        let mut after = translate(0.2, 0.0);
+        let (s, c) = 2.0f32.to_radians().sin_cos(); // 2 degrees
+        after[0] = c;
+        after[1] = s;
+        after[4] = -s;
+        after[5] = c;
+        match transform_jump(&before, &after) {
+            Some(Jump::Linear(value)) => assert!((value - s).abs() < 1e-6, "{value}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_opacity_jump_needs_two_percent() {
+        assert_eq!(
+            opacity_jump(0.40, 0.43).map(|j| (j.value() * 100.0).round()),
+            Some(3.0)
+        );
+    }
+
+    #[test]
+    fn nan_is_never_a_jump() {
+        let before = translate(0.0, 0.0);
+        let after = translate(f32::NAN, 0.0);
+        assert_eq!(transform_jump(&before, &after), None);
+        assert_eq!(opacity_jump(f32::NAN, 0.5), None);
+    }
 
     /// 칸 경계가 의도대로다. ★칸 0 이 "맞물림" 이고 그 위가 2 배씩★이라는 것이 보고를 읽는
     /// 전제이므로 고정한다.
