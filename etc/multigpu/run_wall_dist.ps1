@@ -661,7 +661,8 @@ param(
     # the ticker judder disappear and cut over-period frames from 305 to 19. This pref is
     # what lets the HUD stay on and still behave.
     #
-    # Read it with RENDERSPLIT: glerr is this call, endf3 is the end_frame trio next to it,
+    # Read it with RENDERSPLIT: glerr is this call, endf3 (devf) is the span just before it --
+    # device.end_frame plus the DComp end_frame, see -HudDrawEvery (corrected 2026-11-16) --
     # and glerr_every echoes the setting so a log says which value produced it.
     #   -GlErrorCheckEvery 1    (every frame, for comparison)
     #   -GlErrorCheckEvery 0    (off)
@@ -671,14 +672,20 @@ param(
     # DEFAULT 15, i.e. four times a second at 60Hz. 1 is the pre-2026-11-13 behaviour (every
     # frame), 0 keeps -ProfilerHud parsing but never draws.
     #
-    # Why: run 67 ran six arms. With the HUD on, device.end_frame (devf in RENDERSPLIT) had
-    # a p50 of 18314us; with it off, 275us -- a 45x gap, and it did NOT depend on
-    # -GlErrorCheckEvery (the 0 arm juddered just the same). device.end_frame only sets GL
-    # state and never flushes (gl.rs:3757-3782), so 17ms there means the driver command queue
-    # is full and the call is waiting for room. The giveaway is dbg: drawing the HUD itself
-    # is p50 74us but its max is 14ms -- nothing single is slow, every GL call is stalling.
+    # Why: run 67 ran six arms. With the HUD on, devf in RENDERSPLIT had a p50 of 18314us;
+    # with it off, 275us -- a 45x gap, and it did NOT depend on -GlErrorCheckEvery (the 0 arm
+    # juddered just the same).
     #
-    # Four tiles x every frame x text rendering fills that queue. The HUD exists to show fps,
+    # (2026-11-16 correction) This comment used to say devf is device.end_frame, which only
+    # sets GL state and never flushes (gl.rs:3757-3782), so 17ms there meant the driver
+    # command queue was full. devf is not only device.end_frame: it is the mark_pbo ..
+    # mark_endf3 lap in render_impl. That lap also holds the HUD overlay's DComp EndDraw and
+    # the DComp compositor end_frame, and with -DcompCommitInFrame the
+    # IDCompositionDevice::Commit runs there. Which of these took the 18ms in run 67 was never
+    # measured, so "driver queue full" is unproven. The measurements above and the HUD result
+    # stand, and so does dbg: drawing the HUD itself is p50 74us with a 14ms max.
+    #
+    # Four tiles x every frame x text rendering produced that wait. The HUD exists to show fps,
     # which does not need a 60Hz refresh; 15 reads fine and cuts the GL commands to a
     # fifteenth. Frames that skip the HUD do not even bind the debug overlay, so the DComp
     # tile keeps what it already has.

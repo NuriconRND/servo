@@ -65,7 +65,19 @@ pub struct Split {
     pub staging_us: u64,
     /// `texture_upload_pbo_pool.end_frame`.
     pub pbo_us: u64,
-    /// `device.end_frame`. 앞 판의 `endf3` 에서 위 둘을 뺀 것.
+    /// `mark_pbo` 부터 `mark_endf3` 까지(RENDERSPLIT 의 `devf`). 앞 판의 `endf3` 에서 위 둘을
+    /// 뺀 것.
+    ///
+    /// ★`device.end_frame` 만이 아니다(2026-11-16 정정)★ -- 이 구간에 셋이 함께 든다
+    /// (renderer/mod.rs 의 `mark_pbo` ~ `mark_endf3`):
+    /// - `device.end_frame` -- GL 상태 설정뿐이다.
+    /// - HUD overlay 의 `unbind_debug_overlay`(DComp `EndDraw`) 또는 `readd_debug_overlay_surface`.
+    /// - DComp `compositor.end_frame` -- 비주얼 트리 재구성, 조건부 `gl().flush()`, 그리고
+    ///   `gfx_dcomp_commit_in_end_frame` 이면 `IDCompositionDevice::Commit`.
+    ///
+    /// 그래서 이 값이 크다고 "드라이버 명령 큐가 찼다" 로 읽으면 안 된다. HUD 를 끈
+    /// `-DcompCommitInFrame` 벽 런에서는 막을 수 있는 것이 Commit 뿐이다(log_rotation_opacity_judder_01
+    /// 09·10: 넘친 프레임의 `devf` 17~24 ms).
     pub endf3_us: u64,
     /// ★`check_gl_errors` = `glGetError`★. 드라이버의 미처리 명령을 flush 하고 동기화하므로,
     /// HUD 가 추가한 GL 작업을 여기서 전부 기다린다(65 번: HUD 켜짐 p50 17500us 대 꺼짐
@@ -203,7 +215,9 @@ pub fn mark_pbo(_started: Instant) {
     });
 }
 
-/// `device.end_frame` 이 끝났다. 다음이 `check_gl_errors` 다.
+/// `devf` 구간이 끝났다. `device.end_frame` 에 더해 HUD overlay 의 unbind/readd 와 DComp
+/// `compositor.end_frame`(Commit 포함 가능)까지다(2026-11-16 정정, `Split::endf3_us` 참고).
+/// 다음이 `check_gl_errors` 다.
 pub fn mark_endf3(_started: Instant) {
     let us = lap();
     SPLIT.set(Split {
@@ -216,15 +230,18 @@ pub fn mark_endf3(_started: Instant) {
 ///
 /// ## 왜 주기인가 (2026-11-13)
 ///
-/// 67 번 6 실행 A/B 에서 HUD 를 켜면 `device.end_frame`(`devf`)의 p50 이 ★18314us★, 끄면
-/// ★275us★ 였다(45 배). 그리고 `glerr_every=0` 에서도 재발했으므로 `glGetError` 가 아니다.
+/// 67 번 6 실행 A/B 에서 HUD 를 켜면 `devf` 의 p50 이 ★18314us★, 끄면 ★275us★ 였다(45 배).
+/// 그리고 `glerr_every=0` 에서도 재발했으므로 `glGetError` 가 아니다.
 ///
-/// `device.end_frame` 은 GL 상태 설정뿐이고 flush 가 없다. 그런 명령이 17ms 걸리는 것은
-/// ★드라이버 명령 큐가 꽉 차서 자리를 기다리는 것★ 이다. 그 증거가 `dbg` 다 -- HUD 그리기
-/// 자체는 p50 74us 인데 max 가 14ms 다. 특정 호출이 느린 게 아니라 GL 호출이 전반적으로 막힌다.
+/// ★정정(2026-11-16)★ -- 이 단락은 원래 "`devf` 는 `device.end_frame` 이고 GL 상태 설정뿐이라
+/// flush 가 없으니, 17ms 는 드라이버 명령 큐가 꽉 차서 자리를 기다리는 것" 이라고 적었다.
+/// `devf` 는 `device.end_frame` 만이 아니다(`Split::endf3_us`). HUD 를 켜면 overlay 의 DComp
+/// `EndDraw` 가, `gfx_dcomp_commit_in_end_frame` 이면 DComp `Commit` 이 같은 구간에 든다.
+/// 67 번의 18ms 가 그중 어디였는지는 재지 않았으므로, "드라이버 큐가 찼다" 는 확인된 적이 없다.
+/// 위의 측정, HUD 를 덜 그리면 줄었다는 결과, `dbg`(HUD 그리기 p50 74us, max 14ms)는 그대로다.
 ///
 /// 운영자 관찰 -- "각 tile에 표시되는 HUD가 매 프레임 갱신되는 것처럼 보였으며". 4 타일 x 매
-/// 프레임 x 텍스트 렌더가 큐를 채운다. HUD 의 목적은 fps 확인이고 매 프레임 갱신은 필요 없다.
+/// 프레임 x 텍스트 렌더가 그 대기를 만들었다. HUD 의 목적은 fps 확인이고 매 프레임 갱신은 필요 없다.
 /// 기본 15(60Hz 에서 초당 4 회)면 읽기에 충분하고 GL 명령이 1/15 로 줄어든다.
 pub fn should_draw_hud() -> bool {
     let every = HUD_EVERY.load(Ordering::Relaxed);

@@ -1149,13 +1149,19 @@ pub struct Preferences {
     /// "judder 관찰되지 않음". 그리고 "각 tile에 표시되는 HUD가 ★매 프레임 갱신되는 것처럼★
     /// 보였으며".
     ///
-    /// `glerr_every=0`(144)에서도 재발했으므로 `glGetError` 가 아니다. `device.end_frame`
-    /// (`devf`)의 p50 이 HUD 켜짐 18314us 대 꺼짐 275us 로 ★45 배★ 다. 그 함수는 GL 상태
-    /// 설정뿐이고 flush 가 없으므로(`gl.rs:3757~3782`), 17ms 는 ★드라이버 명령 큐가 꽉 차서
-    /// 자리를 기다리는 것★ 이다. 증거는 `dbg` 다 -- HUD 그리기 자체는 p50 74us 인데 max 가
-    /// 14ms 다. 특정 호출이 느린 게 아니라 GL 호출이 전반적으로 막힌다.
+    /// `glerr_every=0`(144)에서도 재발했으므로 `glGetError` 가 아니다. `devf` 의 p50 이 HUD
+    /// 켜짐 18314us 대 꺼짐 275us 로 ★45 배★ 다.
     ///
-    /// 4 타일 x 매 프레임 x 텍스트 렌더가 큐를 채운다. HUD 의 목적은 fps 확인이고 매 프레임
+    /// ★정정(2026-11-16)★ -- 여기에는 원래 "`devf` 는 `device.end_frame` 이고 GL 상태 설정뿐이라
+    /// flush 가 없으니(`gl.rs:3757~3782`), 17ms 는 드라이버 명령 큐가 꽉 차서 자리를 기다리는
+    /// 것" 이라고 적었다. 그러나 `devf` 는 `mark_pbo` ~ `mark_endf3` 구간이다. 그래서
+    /// `device.end_frame` 뒤의 HUD overlay DComp `EndDraw` 와 DComp `compositor.end_frame`
+    /// (`gfx_dcomp_commit_in_end_frame` 이면 `Commit`)까지 든다(`wall_render_split::Split::endf3_us`).
+    /// 67 번의 18ms 가 그중 어디였는지는 재지 않았으므로, "드라이버 큐가 찼다" 는 확인된 적이
+    /// 없다. 위 표의 측정과 HUD 를 덜 그리면 줄었다는 결과는 그대로다. `dbg` 도 그대로다 --
+    /// HUD 그리기 자체는 p50 74us 인데 max 가 14ms 다.
+    ///
+    /// 4 타일 x 매 프레임 x 텍스트 렌더가 그 대기를 만들었다. HUD 의 목적은 fps 확인이고 매 프레임
     /// 갱신은 필요 없다 -- 15 면 읽기에 충분하고 GL 명령이 1/15 로 줄어든다.
     ///
     /// 게이트는 네 곳이다: `bind_debug_overlay`(안 그리는 프레임에는 ***bind 조차 하지
