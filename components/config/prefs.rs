@@ -561,6 +561,8 @@ pub struct Preferences {
     /// 각도마다 달라 정확 일치 재사용만 하는 풀에서 새 텍스처를 계속 만든다는 것이다
     /// (log_webgl_perf_01/16 운영자 관찰: 회전만이면 judder 없음, opacity 를 더하면 judder).
     /// 런처 스위치는 `-RenderTargetProbe`. ★꺼진 런의 비용은 `AtomicBool` 로드 하나다.★
+    /// 2026-11-16 부터 같은 스위치로 picture cache 타일을 다시 그린 양도 센다 -- `TILEPROBE`
+    /// (10 초 창)와 `TILESEC`(초별, painter 넷 합). 보드 교체 중 GPU 역압의 출처를 가르기 위한 것이다.
     pub gfx_wr_render_target_probe: bool,
     /// ★2026-11-12 추가★ -- WebRender 의 전용 렌더 타깃(2048 을 넘는 태스크)을 요청보다 큰
     /// 쉬는 풀 텍스처로 재사용하고, 못 담으면 쉬는 전용 타깃들과의 가로·세로 최대 크기로 키워

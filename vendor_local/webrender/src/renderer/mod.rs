@@ -1761,6 +1761,8 @@ impl Renderer {
                     &mut results,
                 );
                 crate::wall_render_split::mark_draw(split_at);
+                // ★2026-11-16 TILEPROBE★ -- 이 프레임에 다시 그린 타일 합을 넘긴다.
+                crate::wall_rt_probe::flush_tile_frame();
 
                 // TODO(nical): do this automatically by selecting counters in the wr profiler
                 // Profile marker for the number of invalidated picture cache
@@ -3004,6 +3006,11 @@ impl Renderer {
         profile_scope!("draw_picture_cache_target");
 
         self.profile.inc(profiler::RENDERED_PICTURE_TILES);
+        // ★2026-11-16 TILEPROBE★ -- 다시 그리는 타일과 그 면적. `wall_rt_probe.rs` 참고.
+        crate::wall_rt_probe::note_tile_drawn(
+            target.dirty_rect.width(),
+            target.dirty_rect.height(),
+        );
         let _gm = self.gpu_profiler.start_marker("picture cache target");
         let framebuffer_kind = FramebufferKind::Other;
 

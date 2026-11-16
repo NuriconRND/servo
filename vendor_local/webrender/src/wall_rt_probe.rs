@@ -44,8 +44,9 @@
 //! 켜졌을 때 따로 잰다. 줄은 ***누적과 직전 창의 차분을 함께*** 찍는다 -- 누적값을 창
 //! 값으로 읽는 실수를 여러 번 했다.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 리포터가 줄을 찍는 간격.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
@@ -109,10 +110,12 @@ pub fn start() {
         .spawn(|| {
             let started = std::time::Instant::now();
             let mut previous = Snapshot::default();
+            let mut tiles = TileReport::default();
             loop {
                 std::thread::sleep(REPORT_EVERY);
                 let now = Snapshot::take();
                 report(started.elapsed(), &now, &previous);
+                report_tiles(started.elapsed(), &mut tiles);
                 previous = now;
             }
         });
@@ -223,6 +226,167 @@ pub fn note_surface_limited(scale: f32) {
     SURFACE_LIMITED.fetch_add(1, Ordering::Relaxed);
     let milli = (scale.max(0.0) as f64 * 1000.0).round() as u64;
     SURFACE_LIMITED_MIN_MILLI.fetch_min(milli, Ordering::Relaxed);
+}
+
+// ## picture cache 타일을 얼마나 다시 그리는가 -- `TILEPROBE`, `TILESEC` (2026-11-16 추가)
+//
+// 벽 런 log_rotation_opacity_judder_01/04·05(2026-11-16): 보드 교체(두 보드가 2.5 초 동안 통째로
+// 미끄러진다) 중 16.7 ms 를 넘긴 렌더가 전환 구간에 몰리고(07: 246 중 194, 08: 317 중 210), 그
+// 시간은 거의 전부 `device.end_frame` 대기(중앙 18 ms)다 -- GPU 역압. opacity 를 빼도(08) 그대로였다.
+// 가설: 보드가 움직이면 그 위의 모든 프리미티브가 picture cache 타일 기준으로 움직이므로 ★painter 의
+// 모든 타일을 매 프레임 다시 래스터한다★. 정상 구간에서는 움직이는 영역의 타일만 다시 그린다.
+// 이 계측이 그 양을 직접 센다.
+//
+// `draw_picture_cache_target` 이 다시 그리는 타일마다 한 번 불린다(네이티브 compositor 경로에서는
+// 그 타일의 compositor surface 에 그린다). 그 `dirty_rect` 면적을 렌더러 스레드 지역 값에 더하고,
+// 프레임 그리기가 끝나면(`flush_tile_frame`) 원자 계수기로 넘긴다. painter 마다 렌더러 스레드가
+// 따로라 스레드 지역 누적이 곧 painter 별 프레임 합이다.
+//
+// 초 단위 줄(`TILESEC`)은 각 렌더러 스레드가 벽시계 초가 바뀔 때 직전 초의 합을 원자 링에 넣고,
+// 리포터가 초별로 painter 넷을 합쳐 찍는다 -- 프레임마다 줄을 찍지 않으면서 2.5 초 전환과 맞춰 볼
+// 해상도를 얻는다. 꺼져 있으면 두 자리 모두 `AtomicBool` 로드 하나다.
+
+/// 한 프레임에 이만큼(px) 이상 다시 그리면 큰 래스터 프레임이다. 벽 타일 하나가 5760x2160 =
+/// 12.4 Mpx 이므로 그 절반쯤이다.
+const FULL_RASTER_PX: u64 = 6_000_000;
+
+thread_local! {
+    /// (이 프레임에 다시 그린 타일 수, 면적 px)
+    static TILE_FRAME: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// (현재 초, 그 초의 다시 그린 면적 kpx, 프레임 수, 큰 래스터 프레임 수)
+    static TILE_SECOND: Cell<(u64, u64, u64, u64)> = const { Cell::new((0, 0, 0, 0)) };
+}
+
+static TILE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static TILES: AtomicU64 = AtomicU64::new(0);
+static TILE_PX: AtomicU64 = AtomicU64::new(0);
+static TILE_FULL_FRAMES: AtomicU64 = AtomicU64::new(0);
+/// 직전 보고 이후의 프레임당 최대값. 리포터가 `swap(0)` 으로 창을 끊는다.
+static TILE_FRAME_MAX_TILES: AtomicU64 = AtomicU64::new(0);
+static TILE_FRAME_MAX_PX: AtomicU64 = AtomicU64::new(0);
+
+const SECOND_RING: usize = 256;
+static SECOND_A: [AtomicU64; SECOND_RING] = [const { AtomicU64::new(0) }; SECOND_RING];
+static SECOND_B: [AtomicU64; SECOND_RING] = [const { AtomicU64::new(0) }; SECOND_RING];
+static SECOND_NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// 렌더러가 picture cache 타일 하나를 다시 그린다.
+#[inline]
+pub fn note_tile_drawn(width: i32, height: i32) {
+    if !is_enabled() {
+        return;
+    }
+    let area = width.max(0) as u64 * height.max(0) as u64;
+    TILE_FRAME.with(|cell| {
+        let (n, px) = cell.get();
+        cell.set((n + 1, px + area));
+    });
+}
+
+/// 렌더러가 한 프레임을 다 그렸다. 이 스레드가 이 프레임에 다시 그린 양을 넘긴다.
+pub fn flush_tile_frame() {
+    if !is_enabled() {
+        return;
+    }
+    let (n, px) = TILE_FRAME.with(|cell| cell.replace((0, 0)));
+    let full = px >= FULL_RASTER_PX;
+    if n > 0 {
+        TILE_FRAMES.fetch_add(1, Ordering::Relaxed);
+        TILES.fetch_add(n, Ordering::Relaxed);
+        TILE_PX.fetch_add(px, Ordering::Relaxed);
+        TILE_FRAME_MAX_TILES.fetch_max(n, Ordering::Relaxed);
+        TILE_FRAME_MAX_PX.fetch_max(px, Ordering::Relaxed);
+        if full {
+            TILE_FULL_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    TILE_SECOND.with(|cell| {
+        let (sec, kpx, frames, fulls) = cell.get();
+        if sec != now_sec {
+            if sec != 0 && frames > 0 {
+                push_second(sec, kpx, frames, fulls);
+            }
+            cell.set((now_sec, px / 1000, 1, full as u64));
+        } else {
+            cell.set((sec, kpx + px / 1000, frames + 1, fulls + full as u64));
+        }
+    });
+}
+
+/// 한 렌더러 스레드의 한 초 합을 링에 넣는다: (초, kpx << 32 | 프레임 << 16 | 큰 래스터 프레임).
+fn push_second(sec: u64, kpx: u64, frames: u64, fulls: u64) {
+    let b = (kpx.min(u32::MAX as u64) << 32) | (frames.min(0xffff) << 16) | fulls.min(0xffff);
+    let slot = (SECOND_NEXT.fetch_add(1, Ordering::AcqRel) as usize) % SECOND_RING;
+    SECOND_B[slot].store(b, Ordering::Relaxed);
+    SECOND_A[slot].store(sec, Ordering::Release);
+}
+
+#[derive(Default)]
+struct TileReport {
+    frames: u64,
+    tiles: u64,
+    px: u64,
+    fulls: u64,
+    seen: u64,
+}
+
+/// `TILEPROBE`(창 요약)과 `TILESEC`(초별, painter 넷 합)를 찍는다.
+fn report_tiles(elapsed: Duration, state: &mut TileReport) {
+    let frames = TILE_FRAMES.load(Ordering::Relaxed);
+    let tiles = TILES.load(Ordering::Relaxed);
+    let px = TILE_PX.load(Ordering::Relaxed);
+    let fulls = TILE_FULL_FRAMES.load(Ordering::Relaxed);
+    let max_tiles = TILE_FRAME_MAX_TILES.swap(0, Ordering::Relaxed);
+    let max_px = TILE_FRAME_MAX_PX.swap(0, Ordering::Relaxed);
+    warn!(
+        "TILEPROBE t={:.0}s w:frames_with_tiles={} w:tiles={} w:raster={:.0}Mpx w:full_frames(>={}Mpx)={} \
+         w:frame_max_tiles={} w:frame_max_raster={:.1}Mpx | total raster={:.0}Mpx full_frames={}",
+        elapsed.as_secs_f64(),
+        frames - state.frames,
+        tiles - state.tiles,
+        (px - state.px) as f64 / 1e6,
+        FULL_RASTER_PX / 1_000_000,
+        fulls - state.fulls,
+        max_tiles,
+        max_px as f64 / 1e6,
+        px as f64 / 1e6,
+        fulls,
+    );
+    let next = SECOND_NEXT.load(Ordering::Acquire);
+    let first = state.seen.max(next.saturating_sub(SECOND_RING as u64));
+    let mut by_second: Vec<(u64, u64, u64, u64, u64)> = Vec::new();
+    for index in first..next {
+        let slot = (index as usize) % SECOND_RING;
+        let sec = SECOND_A[slot].load(Ordering::Acquire);
+        let b = SECOND_B[slot].load(Ordering::Relaxed);
+        let (kpx, frames, fulls) = (b >> 32, (b >> 16) & 0xffff, b & 0xffff);
+        match by_second.iter_mut().find(|row| row.0 == sec) {
+            Some(row) => {
+                row.1 += kpx;
+                row.2 += frames;
+                row.3 += fulls;
+                row.4 += 1;
+            },
+            None => by_second.push((sec, kpx, frames, fulls, 1)),
+        }
+    }
+    by_second.sort_by_key(|row| row.0);
+    for (sec, kpx, frames, fulls, threads) in by_second {
+        let (h, m, s, _) = crate::wall_tex_cache::utc_hms(sec * 1000);
+        warn!(
+            "TILESEC at={h:02}:{m:02}:{s:02}Z raster={:.0}Mpx frames={frames} full={fulls} painters={threads}",
+            kpx as f64 / 1000.0
+        );
+    }
+    state.frames = frames;
+    state.tiles = tiles;
+    state.px = px;
+    state.fulls = fulls;
+    state.seen = next;
 }
 
 #[derive(Clone, Copy, Default)]

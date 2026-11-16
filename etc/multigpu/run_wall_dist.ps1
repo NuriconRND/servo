@@ -105,7 +105,10 @@ param(
     # and intermediate surfaces shrunk to MAX_SURFACE_SIZE, and print an RTPROBE line every
     # 10 s. Hypothesis: rotate + opacity puts the region in a rotated local-space surface
     # whose size changes with the angle, and the pool only reuses exact sizes. A run with it
-    # off costs one AtomicBool load per call site.
+    # off costs one AtomicBool load per call site. (2026-11-16) The same switch also counts
+    # picture-cache tiles re-rasterized: TILEPROBE (10 s window: tiles, Mpx, frames >= 6 Mpx,
+    # per-frame max) and TILESEC (one line per UTC second, all painters summed), to see
+    # whether a board-swap slide repaints every tile every frame.
     [switch] $RenderTargetProbe,
     # (2026-11-12) Revert switch for gfx_wr_render_target_reuse_larger (ON by default, here and
     # in the engine). ON: a dedicated WebRender render target (task over 2048 px) may reuse an
