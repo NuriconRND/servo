@@ -139,7 +139,8 @@ use crate::refresh_driver::{AnimationRefreshDriverObserver, BaseRefreshDriver};
 use crate::render_notifier::RenderNotifier;
 use crate::screenshot::{ScreenshotTaker, ScreenshotWaitSummary};
 use crate::wall_tick::{
-    TileOutcome, ack_is_releasable, bootstrap_frame_allowed, tile_may_generate,
+    TileOutcome, ack_is_releasable, bootstrap_frame_allowed, canvas_ack_deadline, note_ack_debt,
+    tile_may_generate,
 };
 use crate::web_content_animation::WebContentAnimator;
 use crate::webrender_external_images::WebGLExternalImages;
@@ -825,6 +826,30 @@ impl Painter {
         // 는 벽 틱과 렌더 양쪽에서 불려 painter 마다 120/s 로 도는데, 거기서 `pref!` 를
         // 치면 네 painter 스레드가 초당 480 번 전역 `RwLock` 을 잡는다 -- 계측을 전부
         // 걷어낸 2026-10-27 규칙이 금지하는 형태다. 바로 위 `set_max_age_ms` 와 같은 패턴.
+        webrender::wall_canvas_rect::set_tile_clear(servo_config::pref!(
+            gfx_wall_webgl_tile_scissor_clear
+        ));
+        webrender::wall_canvas_rect::set_hold_when_static(servo_config::pref!(
+            gfx_wall_webgl_scissor_hold_when_static
+        ));
+        webrender::wall_canvas_rect::set_from_tile_geometry(servo_config::pref!(
+            gfx_wall_webgl_tile_scissor_from_tile_geometry
+        ));
+        crate::wall_tick::set_animation_zero_snaps_to_tick(servo_config::pref!(
+            gfx_wall_animation_zero_snaps_to_tick
+        ));
+        webgl::webgl_thread::set_busy_map_single_shard(servo_config::pref!(
+            gfx_wall_webgl_busy_map_single_shard
+        ));
+        webrender::wall_render_split::set_gl_error_check_every(
+            servo_config::pref!(gfx_wall_gl_error_check_every).clamp(0, 600) as u32,
+        );
+        webrender::wall_render_split::set_hud_draw_every(
+            servo_config::pref!(gfx_wall_hud_draw_every).clamp(0, 600) as u32,
+        );
+        crate::wall_tick::set_canvas_ack_deadline_ms(
+            servo_config::pref!(gfx_wall_canvas_ack_deadline_ms).clamp(0, 60_000) as u64,
+        );
         CANVAS_SCISSOR_LEAD_PERIODS.store(
             servo_config::pref!(gfx_wall_canvas_scissor_lead_periods).clamp(0, 12) as u32,
             std::sync::atomic::Ordering::Relaxed,
@@ -1574,14 +1599,60 @@ impl Painter {
     /// `renderer_behind()` 를 더는 부르지 않으므로 그 안의 2 초 강제 해제도 여기서는 안
     /// 돈다. ★그 프로브는 거절 경로의 것이다★ — `generate_frame_for_wall_tick` 이 매 틱
     /// ***무조건 먼저*** 부른다(`wall_tick::tile_may_generate`).
+    /// ★2 차 캔버스 ack 해제 -- 복구 자리.★ 렌더마다 돈다.
+    ///
+    /// ## 데드라인 (2026-11-13, log_webgl_perf_01/69)
+    ///
+    /// 69 번 151 실행에서 재생이 08:51:12 에 멎어 ★로그 끝까지 40 초간 0.1~0.3fps★ 였다.
+    /// 150(전환 없음)은 같은 지표가 29.7~37.1fps 로 평탄했으니 전환 고유다. 멈춘 것은
+    /// ★생산자★ 였다 -- 소비와 표시는 끝까지 정상이었다(`PRODUCE window(edges=60.0/s
+    /// calls=60.0/s miss=0)`, 240 lock/s, `RENDERSPLIT` 이 08:51:51 까지).
+    ///
+    /// 고리는 이렇다.
+    ///
+    ///     wall_tick.rs:232   ack_is_releasable = holds_debt && pending == 0
+    ///     painter.rs         pending 을 비우는 정상 경로는 `update_image`(epoch 지급) 하나
+    ///     script_thread.rs:1244  waiting_on_canvas_image_updates() 면 그 문서를 통째로 건너뜀
+    ///
+    /// epoch 이 미지급되면 pending 이 영원히 안 비고 -> ack 이 영영 안 가고 -> script 가 그
+    /// 문서를 영영 건너뛰고 -> rAF 와 DL 빌드가 안 돌고 -> WebGL 명령이 없어 ★새 epoch 이
+    /// 생길 기회조차 사라진다.★ `webgl_thread.rs:2752-2759` 가 이것을 "자기 잠금 고리" 라고
+    /// 적어 뒀고, 2026-11-11 에 `restore_context_backends` 로 ***한 경로*** 를 막았다.
+    /// 69 번은 ★다른 경로가 남아 있다★ 는 것을 보여 준다.
+    ///
+    /// 그래서 경로를 하나씩 막는 대신 ★데드라인★ 을 둔다. 빚이
+    /// `gfx_wall_canvas_ack_deadline_ms` 를 넘으면 pending 을 버리고 ack 을 보낸다. 버린
+    /// 뒤 한 프레임은 낡은 캔버스가 보일 수 있지만 ★40 초 정지보다 낫다.★ 0 이면 종전
+    /// 동작(데드라인 없음)이다.
+    ///
+    /// ## 비용
+    ///
+    /// 빚이 없는 정상 프레임에는 `Option<Instant>` 비교 ★분기 하나★ 다 --
+    /// `pending_canvas_age()` 가 `Instant::now()` 를 부르지 않는다. 빚이 있을 때만
+    /// `elapsed()` 1 회(약 25ns) x 240 렌더/s = 6us/s.
     fn flush_owed_canvas_ack(&mut self) {
         if *WALL_DISABLE_CANVAS_ACK_RECOVERY {
             return;
         }
-        if !ack_is_releasable(
-            self.frame_delayer.is_holding_ack(),
-            self.frame_delayer.pending_canvas_image_count(),
-        ) {
+        let holds_debt = self.frame_delayer.is_holding_ack();
+        let pending = self.frame_delayer.pending_canvas_image_count();
+        if !ack_is_releasable(holds_debt, pending) {
+            // 여기가 자기잠금이 사는 자리다. 빚이 있는데 pending 이 안 빈다.
+            if holds_debt && pending > 0 {
+                if let Some(age) = self.frame_delayer.pending_canvas_age() {
+                    note_ack_debt(age);
+                    let deadline = canvas_ack_deadline();
+                    if !deadline.is_zero() && age >= deadline {
+                        let dropped = self.frame_delayer.abandon_pending_canvas_images();
+                        log::warn!(
+                            "ACKSTUCK age={}ms dropped={dropped} pipelines={}                              -- 캔버스 ack 자기잠금을 데드라인으로 끊었다",
+                            age.as_millis(),
+                            self.frame_delayer.waiting_pipeline_count(),
+                        );
+                        self.send_owed_canvas_ack();
+                    }
+                }
+            }
             return;
         }
 
@@ -1714,6 +1785,9 @@ impl Painter {
         // 표출 주기의 실제 박자. 애니메이션 밀어넣기가 이 값을 따라간다(`push_due`).
         self.last_render_started_at.set(Some(Instant::now()));
 
+        // ★이미 측정된 60ms 를 구간으로 쪼갠다.★ 근거는 `note_render_split` 의 doc 주석.
+        // `RENDERCOST` 와 같은 범위를 그대로 나누므로 합이 그 값과 맞는다.
+        let mut split = crate::frame_source_probe::RenderSplit::start();
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -1727,6 +1801,7 @@ impl Painter {
             self.assert_no_gl_error();
 
             self.rendering_context.prepare_for_rendering();
+            split.mark_lock();
 
             time_profile!(
                 ProfilerCategory::Painting,
@@ -1752,6 +1827,7 @@ impl Painter {
                         } else {
                             renderer.update();
                         }
+                        split.mark_update();
                     }
                     if let Some(target) = publish_target {
                         // 목표는 ***이미 채널에 있는*** id 였으므로(알림이 `send` 뒤에 온다)
@@ -1763,10 +1839,21 @@ impl Painter {
                     // Paint the scene.
                     // TODO(gw): Take notice of any errors the renderer returns!
                     self.clear_background();
+                    split.mark_clear();
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
-                        let _ = renderer.render(size, 0 /* buffer_age */);
+                        // ★통계를 버리지 않는다.★ 근거는 `RenderSplit::note_stats` 의 doc --
+                        // 이 값은 이미 만들어져 반환되는데 앞 판이 `let _ =` 로 버렸다.
+                        match renderer.render(size, 0 /* buffer_age */) {
+                            Ok(results) => split.note_stats(&results.stats),
+                            Err(errors) => {
+                                if !errors.is_empty() {
+                                    log::warn!("WebRender render errors: {errors:?}");
+                                }
+                            },
+                        }
                     }
+                    split.mark_draw();
 
                     // The native compositor's `bind` leaves an EGL pbuffer current. Restore the
                     // window surface as current so the next GL user (clear_background, egui
@@ -1804,7 +1891,9 @@ impl Painter {
         // 여기는 렌더가 끝나 발행 큐가 비워진 자리다(바로 위 주석). `pending_frames`
         // 가 0 이므로 프레임이 정상적으로 나고, `last_render_started_at` 은 이 패스의
         // 것이라 `rendered_since_push` 도 참이다 -- 간격은 여전히 렌더당 정확히 하나다.
+        split.mark_post();
         self.pump_paint_animation(PumpSource::Render);
+        split.mark_pump();
 
         // 타일 스레드에 사는 painter 는 표출까지 자기가 한다 — 셸에는 이 컨텍스트가 없다.
         // 인라인 경로에서는 셸이 present 하므로 여기서는 아무것도 하지 않는다.
@@ -1814,6 +1903,7 @@ impl Painter {
 
         // ★present 까지 포함해서 잰다.★ 스레드 타일은 자기가 표출하고 셸의 조인이 그것까지
         // 기다리므로, 그 비용도 ***논리 프레임***의 비용이다.
+        split.finish();
         if let Some(started) = render_started_for_probe {
             crate::frame_source_probe::note_render_duration(started.elapsed());
         }
@@ -2004,10 +2094,16 @@ impl Painter {
             }
             return None;
         }
-        if published - consumed > WALL_PUBLISH_BACKLOG_LIMIT {
+        let backlog = published - consumed;
+        if backlog > WALL_PUBLISH_BACKLOG_LIMIT {
+            // ★게이트가 풀리는 자리.★ 이 패스의 드레인 루프가 쌓인 것을 전부 비우고,
+            // 그만큼 `render_impl(device_size = None)` 이 불려 HUD fps 가 뛴다. 근거는
+            // `note_publish_backlog` 의 doc 주석.
+            note_publish_backlog(self.painter_id, backlog, true);
             self.consumed_publish_id.set(published);
             return None;
         }
+        note_publish_backlog(self.painter_id, backlog, false);
         Some(webrender_api::FramePublishId(consumed + 1))
     }
 
@@ -2720,6 +2816,9 @@ impl Painter {
         details
             .animations
             .install_paint_animations(display_list_info.paint_animations);
+        // ★DL 도착 간격을 센다.★ 근거는 `note_display_list_arrival` 의 doc 주석 -- 요점은
+        // `LOCKTAIL` 의 `phase` 분모가 이 간격이고, 그 값을 세는 곳이 없었다는 것이다.
+        note_display_list_arrival(self.painter_id, pipeline_id);
 
         let mut transaction = Transaction::new();
         let is_root_pipeline = Some(pipeline_id.into()) == webview_renderer.root_pipeline_id;
@@ -3109,6 +3208,26 @@ impl Painter {
     /// ★`lead = 0` 이면 원자 로드 하나로 끝난다.★ 그 경우 샘플을 만들지 않는다.
     fn publish_canvas_scissor_lead(&self, sample_at: Instant) {
         let slot = webrender_api::IdNamespace::from(self.painter_id).0;
+        // ★지금 애니메이션의 진행률을 싣는다.★ `LOCKTAIL` 이 이것을 함께 찍으므로 그
+        // 사건이 ***자기 위상을 들고 다닌다*** -- 1 초 타임스탬프로는 "애니메이션 마지막
+        // 0.75 초" 와 "끝난 직후 0.75 초" 를 가를 수 없었다(근거는
+        // `PipelineAnimations::paint_animation_phase` 의 doc).
+        //
+        // 원자 저장 하나다. 돌고 있는 애니메이션이 없으면 `f32::NAN` 을 실어 "없음" 을
+        // 나타낸다 -- 비트 패턴 하나로 끝나므로 분기가 필요 없다.
+        {
+            let mut phase = f32::NAN;
+            for renderer in self.webview_renderers.values() {
+                renderer.for_each_connected_pipeline(&mut |pipeline_details| {
+                    if let Some(found) =
+                        pipeline_details.animations.paint_animation_phase(sample_at)
+                    {
+                        phase = found;
+                    }
+                });
+            }
+            paint_api::note_animation_phase(phase);
+        }
         // ★원자 로드 하나다★ -- `pref!` 는 전역 `RwLock` 이고 이 함수는 painter 마다
         // 120/s 로 돈다(2026-11-11 조사). 값은 `perform_updates` 가 싣는다.
         let lead_periods = CANVAS_SCISSOR_LEAD_PERIODS.load(std::sync::atomic::Ordering::Relaxed);
@@ -3758,12 +3877,20 @@ pub(crate) struct FrameDelayer {
     /// 캔버스는 다르다: 업로드는 ***그려서 올렸다***는 양의 증거고, 장식용 rAF 는 이것을
     /// 만들지 않는다.
     last_canvas_activity_at: Option<Instant>,
+    /// `pending_canvas_images` 가 ★비어 있지 않게 된 시각★. 비면 `None` 으로 돌아간다.
+    ///
+    /// 이것이 데드라인의 시계다. 근거는 `Painter::flush_owed_canvas_ack` 의 doc --
+    /// 69 번에서 이 집합이 40 초 동안 비지 않아 재생이 영구히 멎었다.
+    oldest_pending_at: Option<Instant>,
 }
 
 impl FrameDelayer {
     pub(crate) fn delete_image(&mut self, image_key: ImageKey) {
         self.image_epochs.remove(&image_key);
         self.pending_canvas_images.remove(&image_key);
+        if self.pending_canvas_images.is_empty() {
+            self.oldest_pending_at = None;
+        }
     }
 
     pub(crate) fn update_image(&mut self, image_key: ImageKey, epoch: Epoch) {
@@ -3774,6 +3901,9 @@ impl FrameDelayer {
         };
         if *entry.get() <= epoch {
             entry.remove();
+        }
+        if self.pending_canvas_images.is_empty() {
+            self.oldest_pending_at = None;
         }
     }
 
@@ -3793,6 +3923,11 @@ impl FrameDelayer {
                 .is_some_and(|epoch_seen| *epoch_seen >= canvas_epoch)
             {
                 continue;
+            }
+            if self.pending_canvas_images.is_empty() {
+                // 빈 집합이 채워지는 순간이 데드라인의 원점이다. 이미 차 있으면 손대지
+                // 않는다 -- ★가장 오래된★ 빚의 나이를 재야 하기 때문이다.
+                self.oldest_pending_at = Some(Instant::now());
             }
             self.pending_canvas_images.insert(image_key, canvas_epoch);
         }
@@ -3837,6 +3972,27 @@ impl FrameDelayer {
         self.pending_canvas_images.len()
     }
 
+    /// 가장 오래된 캔버스 빚의 나이. 빚이 없으면 `None`.
+    ///
+    /// ★`Instant::now()` 를 부르지 않는 경로가 있다★ -- `oldest_pending_at` 이 `None`
+    /// 이면(= 정상) 바로 `None` 이다. 그래서 정상 프레임에 드는 비용은 분기 하나다.
+    pub(crate) fn pending_canvas_age(&self) -> Option<Duration> {
+        self.oldest_pending_at.map(|at| at.elapsed())
+    }
+
+    /// ★자기잠금을 끊는다.★ `pending_canvas_images` 를 통째로 버리고 시계를 끈다.
+    ///
+    /// 이것은 ***정상 경로가 아니다***. 부르는 자리는 `Painter::flush_owed_canvas_ack` 의
+    /// 데드라인 하나뿐이고, 거기 doc 에 왜 필요한지가 있다. 버리는 epoch 은 "WR 이 이
+    /// 캔버스의 새 장을 아직 못 받았다" 는 사실 자체이므로, 버린 뒤 한 프레임은 낡은
+    /// 캔버스가 보일 수 있다 -- ★40 초 정지보다 낫다.★
+    pub(crate) fn abandon_pending_canvas_images(&mut self) -> usize {
+        let dropped = self.pending_canvas_images.len();
+        self.pending_canvas_images.clear();
+        self.oldest_pending_at = None;
+        dropped
+    }
+
     /// ack 를 기다리는 파이프라인 수. 주입이 **실제로 무엇을 보류했는지** 로그에 싣기 위한 것.
     pub(crate) fn waiting_pipeline_count(&self) -> usize {
         self.waiting_pipelines.len()
@@ -3868,6 +4024,153 @@ pub(crate) enum PaintMetricState {
 /// ★2026-11-11: `pref!` 를 타이밍 경로에서 치지 않기 위한 것이다.★ 그 함수는 벽 틱과 렌더
 /// 양쪽에서 불려 painter 마다 120/s 로 돌고, `pref!` 는 전역 `RwLock` 획득이다 -- 네
 /// painter 스레드가 초당 480 번 그것을 잡는다. `wall_canvas_rect::MAX_AGE_MS` 와 같은 패턴.
+/// publish 백로그 깊이와 게이트 해제. painter 별로 600 회마다 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/49)
+///
+/// 운영자 관찰: 전환 중 HUD fps 가 60 아래로 내려갔다가 화면이 안정되면 ***급격히 60 이상
+/// (심하면 세 자리)까지 올라갔다가*** 60 으로 돌아온다. 가설은 "몰려 있던 것을 한꺼번에
+/// 처리하는 것" 이었고, 조사가 기구를 지목했다.
+///
+/// `Renderer::update()` 의 호출자는 한 곳(이 파일 :1719/:1722)이고 루프가 없다. 루프는 그
+/// ***안에*** 있다 -- `while let Some(msg) = self.get_next_result_msg()`
+/// (`vendor_local/webrender/src/renderer/mod.rs:1055`). 그 안에서
+/// `render_impl(device_size = None)`(mod.rs:1082)이 불리고 ★HUD fps 는 그 반복 횟수★ 다
+/// (표출은 건너뛴다 -- mod.rs:1674 의 주석이 그것을 명시한다).
+///
+/// 그 루프를 묶는 게이트가 `next_publish_target` 이고, ★백로그가
+/// `WALL_PUBLISH_BACKLOG_LIMIT`(2)를 넘으면 풀린다★. 그 패스에서 쌓인 것이 전부 비워지는
+/// 것이 세 자리 fps 다.
+///
+/// 셸의 render 호출은 일정하다 -- 49 번 실측 `renders/s = 240.0` 이 여섯 구간 전부
+/// 동일했다(4 painter x 60Hz). 즉 버스트는 호출이 몰린 것이 아니다.
+///
+/// ## 판정
+///
+/// * `depth max` 가 2 를 넘는가 -- `WALL_PUBLISH_BACKLOG_LIMIT` 의 주석은 "정상 구성에서
+///   백로그가 1 을 넘을 이유가 없다" 고 적는데, ★이 수치가 처음으로 확인한다★.
+/// * `released` 가 전환 구간에 몰리는가 -- 운영자 관찰과 맞는지.
+/// * `held` 대 `released` -- 게이트가 평소에 얼마나 일하는가.
+///
+/// ## 비용
+///
+/// `next_publish_target` 은 painter render 당 한 번(240/s)이다. 원자 넷과 600 회마다 한
+/// 줄(약 2.5 초)이고, ★시계를 읽지 않는다★ -- 호출 수로 리포트 시점을 정한다.
+fn note_publish_backlog(painter_id: PainterId, backlog: u64, released: bool) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// painter 슬롯 수의 상한. `note_display_list_arrival` 과 같은 이유로 여유를 둔다.
+    const SLOTS: usize = 8;
+
+    static SUM: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MAX: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static HELD: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static RELEASED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    let slot = (webrender_api::IdNamespace::from(painter_id).0 as usize) % SLOTS;
+    SUM[slot].fetch_add(backlog, Ordering::Relaxed);
+    MAX[slot].fetch_max(backlog, Ordering::Relaxed);
+    if released {
+        RELEASED[slot].fetch_add(1, Ordering::Relaxed);
+    } else {
+        HELD[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    let n = CALLS[slot].fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 600 != 0 {
+        return;
+    }
+    let calls = CALLS[slot].swap(0, Ordering::Relaxed).max(1);
+    warn!(
+        "PUBBACKLOG painter={painter_id:?} n={calls} depth(avg={:.2} max={}) \
+         gate(held={} released={})",
+        SUM[slot].swap(0, Ordering::Relaxed) as f64 / calls as f64,
+        MAX[slot].swap(0, Ordering::Relaxed),
+        HELD[slot].swap(0, Ordering::Relaxed),
+        RELEASED[slot].swap(0, Ordering::Relaxed),
+    );
+}
+
+/// 디스플레이 리스트 도착 간격. 60 회마다 한 줄.
+///
+/// ## 왜 이 수치인가 (2026-11-12, log_webgl_perf_01/47)
+///
+/// `LOCKTAIL` 에 붙인 `phase` 가 ***애니메이션 진행률이 아니었다.*** layout 이 세그먼트를
+/// 지금부터 horizon(3000ms)까지로 다시 샘플하므로(`paint_animation.rs`), `zero` 는 그
+/// 디스플레이 리스트를 만든 시각이고 마지막 세그먼트의 `end` 는 그 시점부터 3 초다 --
+/// 전환의 시작도 길이도 들어 있지 않다. 그래서 그 값은 실제로는
+/// ★마지막 DL 이후 경과 / 3 초★ 이고, 실측 0.017~0.040 은 51~120ms 다.
+///
+/// `install_paint_animations` 가 DL 마다 애니메이션을 교체하므로 `zero` 가 매번 갱신되고,
+/// 따라서 `now - zero` 의 상한은 ★DL 도착 간격★ 이다. 그 간격을 세는 곳이 ***하나도
+/// 없었다*** -- 운영자 질문이 그 지점을 짚었다("이미 디스플레이 리스트는 tick divisor
+/// 주기로 갱신되고 있지 않나? 애니메이션 중에만 특별히 더 많이 발생할 이유가 있었어?").
+/// 그리고 내가 "전환 중에는 DL 이 자주 갱신된다" 고 적은 것은 근거 없는 추측이었다.
+///
+/// 이 줄이 동시에 두 가지를 확정한다.
+///
+/// * `gfx_wall_live_canvas_tick_divisor` 의 실제 효과 -- WebGL 구성은
+///   `TickCadence::LiveCanvas` 로 분류되므로 그쪽이 걸린다. 기대 간격과 맞는가.
+/// * `phase` 의 분모 -- `avg` 가 곧 그 상한이어야 한다. 어긋나면 해석이 또 틀린 것이다.
+///
+/// ## 비용
+///
+/// 호출당 시계 하나와 원자 넷, 리포트는 60 회마다 한 줄이다.
+/// `handle_new_display_list` 는 이미 트랜잭션을 만들어 WR 로 보내는 무거운 경로이므로,
+/// 여기의 I/O 는 2026-10-27 규칙이 금지하는 "프레임마다 도는 경로" 가 아니다.
+fn note_display_list_arrival(painter_id: PainterId, pipeline_id: impl std::fmt::Debug) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// painter 슬롯 수의 상한. 벽은 넷이지만 여유를 둔다.
+    const SLOTS: usize = 8;
+
+    // ★painter 별로 나눈다.★ 앞 판은 전역 원자 하나였고, 그래서 ***fan-out 형제들 사이
+    // 간격***이 섞였다 -- `Paint::handle_new_display_list` 가 한 DL 을 네 painter 에
+    // 브로드캐스트하므로(paint.rs:2826) 간격 넷 중 셋이 구조적으로 sub-ms 이고, `avg` 가
+    // 실제 주기의 ***1/4*** 로 나왔다. 그 값을 보고 "프레임당 2~4 개" 라고 보고했는데
+    // 실제로는 0.6~1.0 개다(2026-11-12, log_webgl_perf_01/48).
+    static LAST_AT_US: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static SUM_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static MIN_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(u64::MAX) }; SLOTS];
+    static MAX_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static COUNT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+    let slot = (webrender_api::IdNamespace::from(painter_id).0 as usize) % SLOTS;
+    let (last_at_us, sum_ms, min_ms, max_ms, count) = (
+        &LAST_AT_US[slot],
+        &SUM_MS[slot],
+        &MIN_MS[slot],
+        &MAX_MS[slot],
+        &COUNT[slot],
+    );
+
+    let now_us = ORIGIN.elapsed().as_micros() as u64;
+    let last_us = last_at_us.swap(now_us, Ordering::Relaxed);
+    if last_us == 0 {
+        // 첫 도착은 간격이 없다.
+        return;
+    }
+    let since_ms = (now_us.saturating_sub(last_us)) / 1000;
+    sum_ms.fetch_add(since_ms, Ordering::Relaxed);
+    min_ms.fetch_min(since_ms, Ordering::Relaxed);
+    max_ms.fetch_max(since_ms, Ordering::Relaxed);
+
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 60 != 0 {
+        return;
+    }
+    let n = count.swap(0, Ordering::Relaxed).max(1);
+    warn!(
+        "DLARRIVE painter={painter_id:?} n={n} interval(avg={}ms min={}ms max={}ms) \
+         since_last={since_ms}ms pipeline={pipeline_id:?}",
+        sum_ms.swap(0, Ordering::Relaxed) / n,
+        min_ms.swap(u64::MAX, Ordering::Relaxed),
+        max_ms.swap(0, Ordering::Relaxed),
+    );
+}
+
 static CANVAS_SCISSOR_LEAD_PERIODS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(1);
 

@@ -903,6 +903,291 @@ pub struct Preferences {
     /// ★검증은 `WALLCANVASRECT` 로그다.★ 두 출처를 나란히 찍고 `same`/`DIFFER` 를 붙인다.
     /// 정지 상태에서 `same` 이면 변환이 맞고, 전환 중에만 `DIFFER` 면 그것이 이 기능이
     /// 노리는 차이다.
+    /// swap 뒤의 clear 를 ★타일 영역만★ 하게 한다. 기본 꺼짐.
+    ///
+    /// ## 이력 (2026-11-12)
+    ///
+    /// `e9e28284b31` 로 들어왔다가 2026-11-10 에 제거됐다. 제거 근거는 운영자 평가였다 --
+    /// "scissor 가 제대로 이루어지지 않는 영역이 검은색 혹은 단색이 아니면 시각적으로
+    /// 혼동만 일으킬 뿐이다. 사실 성능 향상이 있는지도 잘 모르겠음." 그때는 scissor 자체가
+    /// 틀렸다.
+    ///
+    /// 지금은 다르다 -- `lead 8` 에서 `gear` 전환까지 띠가 사라진 것을 39 번 실기가
+    /// 확인했다. 즉 ★지우는 영역과 그리는 영역이 같다는 전제가 성립한다.★ 셰이딩에 쓰는
+    /// 것과 ***같은 사각형***을 쓰므로 둘이 어긋날 수 없다.
+    ///
+    /// ## 무엇을 재려는 것인가
+    ///
+    /// `LOCKTAIL` 의 꼬리(캔버스 서피스 획득 >= 8ms, 최대 82ms)를 쫓는 중이고, 생산자가
+    /// keyed mutex 를 잡고 있는 구간에 ***프레임마다 199MB clear*** 가 들어 있다
+    /// (`chains.rs::swap_buffers` 의 bind 와 다음 swap 의 unbind 사이).
+    ///
+    /// ★다만 산술은 그 가설에 반한다★: 11520x4320x4 = 199MB 를 448GB/s 대역폭으로 나누면
+    /// 0.44ms 이고, depth+stencil 까지 더해도 1~2ms 다. 수십 ms 가 될 수 없다. 그래서 이
+    /// 플래그는 ★그 가설을 기각하기 위한 것★ 이기도 하다 -- 켜고 끈 차이가 0 이면 clear 가
+    /// 원인이 아님이 확정된다.
+    ///
+    /// `gfx_wall_webgl_tile_scissor_from_webrender` 가 꺼져 있으면 이 값도 무효다(걸 사각형
+    /// 자체가 없다).
+    /// 소비자가 ★한 프레임 묵은★ front buffer 를 가져가게 한다. 기본 꺼짐.
+    ///
+    /// ## 왜 (2026-11-12)
+    ///
+    /// `LOCKTAIL`(캔버스 서피스 획득 >= 8ms, 최대 71ms)의 원인을 좁히는 중이고 셋이
+    /// 기각됐다 -- 스왑체인 블로킹 Mutex(`chain` avg 0us), 트리플 버퍼링(꼬리의 44% 가
+    /// `recycled` 장), 199MB full-surface clear(51 번 A/B 에서 개수 -17%, ***크기는
+    /// 71.1 -> 72.0ms 로 그대로***; 산술도 0.44ms 다).
+    ///
+    /// 남은 것이 ★생산자의 보유 구간★ 이다. 생산자는 그 장이 back buffer 인 ***전체 캔버스
+    /// 프레임*** 동안 keyed mutex 를 잡고(`bind_surface_to_context` 의 `AcquireSync` ->
+    /// 다음 swap 의 `unbind` 의 `ReleaseSync`), 소비자의 `AcquireSync` 는 그 서피스의 GPU
+    /// 작업이 은퇴할 때까지 기다린다.
+    ///
+    /// 그리고 `recycled` 꼬리의 기구도 코드에 있다 -- `swap_buffers` 가 옛 front 를 풀에
+    /// 넣은 ***바로 다음 줄***에서 크기 맞는 것을 집어 back buffer 로 쓰므로, 방금 넣은 그
+    /// 장을 다시 집을 수 있다. 소비자가 그것을 가져가면 직전 프레임의 작업이 남아 있다.
+    ///
+    /// 켜면 `pending` 을 두 칸 큐로 쓰고 소비자가 앞(= 한 프레임 전)에서 꺼낸다.
+    ///
+    /// ★대가★: 표출 지연 +1 프레임(60Hz 에서 16.7ms), 장 수 2 -> 3(백엔드당 +199MB).
+    ///
+    /// 판정: 꼬리가 크게 줄면 원인 확정이고 대가를 평가한다. 그대로면 이 축도 기각이고
+    /// 생산자 draw 자체가 남는다. 육안 지연이 체감되면 대가가 너무 크다.
+    pub gfx_wall_webgl_deferred_front_buffer: bool,
+    /// 정지한 캔버스의 낡은 scissor rect 를 버리지 않고 그대로 쓴다. ***기본 켜짐.***
+    ///
+    /// ## 왜 (2026-11-12)
+    ///
+    /// 운영자 지적 -- "scissors가 꺼지는 지점이 있는거야? 전환 애니메이션 중에 꺼질 리는
+    /// 없고, 전환 애니메이션 후에도 각 tile별 영역만 잘라서 그려야 하는 거 아닌가?" 그리고
+    /// "왜 갑자기 WebGL + ticker 애니메이션 조합 구성에서 애니메이션 judder가 발생하는 회귀가
+    /// 일어났나 했더니, 그게 원인이었나보다."
+    ///
+    /// 53 번 실측:
+    ///
+    ///     SCISSORJUMPS  n=6000  from_none=716  to_none=696    변화의 24%
+    ///     SCISSORGATE   applied=1125 (93.8%)  stale=51 (age_max=1263ms)
+    ///
+    /// scissor 가 `None` 이 되면 서피스 전체로 되돌아가고, 네 타일이 모두 캔버스 전체를
+    /// 그린다 -- 평균 8Mpx 대 전체 49.8Mpx 로 6 배다. 결과 픽셀은 같아 눈에 안 보이지만
+    /// 프레임 비용이 24% 의 빈도로 6 배를 왕복하므로 ***judder 가 된다.***
+    ///
+    /// 꺼지는 이유는 `stale` 이다. WR 이 rect 를 적는 것은 DL 을 만들 때인데, 전환이 끝나
+    /// 화면이 정지하면 그 캔버스를 품은 picture 가 다시 래스터되지 않아 `note` 가 불리지
+    /// 않는다. 그런데 ***정지 상태의 rect 는 낡아도 유효하다*** -- 안 움직이니까 값이 안
+    /// 변한다.
+    ///
+    /// 정지의 증거는 데이터 안에 있다: `picture.rs` 가 `table[0] = (0, rect)` 로 시작하고
+    /// 애니메이션 샘플만 뒤에 붙이므로 `sample_count == 1` 은 "이 캔버스에 애니메이션이
+    /// 없다" 는 WR 자신의 보고다. 움직이는 중에는 2 이상이 되어 걸리지 않으므로, 낡은 rect
+    /// 로 그려야 할 영역을 빼먹는 일(= 검은 띠)이 생길 수 없다.
+    ///
+    /// 회귀 수정이므로 기본 켜짐이고, 이 판정이 틀린 구성이 있으면 끌 수 있다.
+    /// 타일 기하에서 scissor 를 유도하는 ★구 경로★ 를 쓴다. 기본 꺼짐.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 운영자 지적 -- "이미 WebglTileScissor 플래그 쓰던 바이너리에서 조합 페이지 재생시
+    /// ticker 애니메이션 judder 사라졌다니까? 왜 자꾸 해결된 문제를 다시 건드리려고 하지?"
+    ///
+    /// 그 플래그(`gfx_wall_webgl_tile_scissor`)와 구현(`tile_scissor_from_tile_geometry`)은
+    /// `c3450a9364b`(2026-11-10)에서 운영자 지시로 제거됐다. 그 뒤 39 커밋이 들어갔고 지금
+    /// 그 구성에서 ticker judder 가 회귀했다.
+    ///
+    /// 55 번(121, 정지 4 타일 + ticker 3 개, judder 발생)은 ***사각형 자체는 지금도
+    /// 정확하다***고 말한다.
+    ///
+    ///     SCISSORAREA  base 12.4Mpx = 타일당 1/4,  union 12.4Mpx,  widened=0
+    ///                  samples(1=1200 2=0 3plus=0)
+    ///     SCISSORGATE  applied 11952/12000 = 99.60% (안 걸림 0.40%)
+    ///     LOCKWAIT     tex_hist >=8ms 15 / 20,400 = 0.07%
+    ///
+    /// 면적이 기대값과 일치하고, 넓히기는 정지 구성에서 작동하지 않고(`samples` 전부 1),
+    /// 실패율도 `AcquireSync` 꼬리도 낮다. 그러면 회귀는 그 39 커밋 중 ***다른 것***이고,
+    /// 이분 탐색은 실기 6 회가 든다. ★구 경로를 되살려 한 번 A/B 하면 축이 갈린다.★
+    ///
+    ///     구 경로로 judder 가 사라지면  -> scissor 경로가 원인. 그 안에서 좁힌다.
+    ///     사라지지 않으면              -> scissor 가 아니다. 39 커밋 이분 탐색으로 간다.
+    ///
+    /// ## 대가
+    ///
+    /// 구 경로는 `painter_tile_rect_map` 에서 직접 계산하므로 WR lookup 도, 나이도, 창도
+    /// 없다. 캔버스가 가상 뷰포트를 꽉 채울 때만 작동하고(아니면 `None`), ★전환 중에는 빈
+    /// 공간이 생긴다★ -- 그것이 넓히기(`20ee1a167ab` 이후)를 만든 이유였고 이 A/B 에서는
+    /// 알려진 대가다.
+    /// paint 측 애니메이션의 기준 시각을 실제 틱 격자로 스냅한다. ★기본 꺼짐 -- 실기에서
+    /// 해로웠다.★
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// `Paint::handle_new_display_list` 가 DL 마다 `install_paint_animations` 를 부르고,
+    /// 그것이 돌고 있는 애니메이션 ***전체를 교체하면서*** `animation_zero` 로 기준 시각을
+    /// 다시 계산한다.
+    ///
+    ///     let transit = (now - built_at).clamp(0, 250ms);   // CrossProcessInstant 차
+    ///     let created_at = received_at - transit;           // 로컬 Instant 로 ★추정★
+    ///
+    /// `built_at` 은 페이싱 틱 시각이고(`PaintDisplayListInfo::built_at` 의 doc), 그 차는
+    /// "scene build 의 sub-millisecond transit" 이 아니라 ★틱부터 도착까지의 전체 지연이고
+    /// 벽에서 5~30ms★ 다. 그래서 환산 오차가 DL 마다 다르게 들어간다.
+    ///
+    /// DL 이 WebGL 때문에 초당 36 회 오면(`DLARRIVE avg 28ms`) 기준점이 초당 36 회 흔들린다.
+    /// WebGL 이 없으면 `paint_side div=15` 로 초당 4 회뿐이라 드물어 보이지 않는다 -- 운영자
+    /// 관찰("WebGL 만 빼면 ticker 가 깨끗하다")과 맞는다. 그리고 생산도 렌더도 60Hz 이므로
+    /// (`PRODUCE window edges=60.0/s calls=60.0/s`) 프레임 수가 아니라 ***기준점이*** 튀는
+    /// 것이다.
+    ///
+    /// 이 코드는 대조군(`a47204b3335`)과 diff 가 비어 있다 -- 58 번에서 그 커밋으로도 저더가
+    /// 재현된 것과 맞는다.
+    ///
+    /// 켜면 틱 시각이 이미 로컬 시계로 지나가므로(`wall_tick::note_tick_edge`) 추정값에 가장
+    /// 가까운 기록을 써서 기준점을 16.67ms 격자에 앉힌다. 한 프레임(8.33ms)보다 먼 기록은
+    /// 다른 틱이므로 쓰지 않고 앞 판처럼 추정값을 쓴다.
+    ///
+    /// ## 실기 반증 (2026-11-13, log_webgl_perf_01/59)
+    ///
+    ///     128 (ON)   snap(n=3744 avg=1017us ★max=8308us★)  miss=516 (12%)
+    ///     129 (OFF)  snap(n=0) miss=4188
+    ///
+    /// 운영자: 127/128 은 "가장 매끄러운 구간에서도 등속 이동이 아니라 ★진동하는듯한★
+    /// 이동", 129 는 "수정 이전과 유사 (매끄러운 구간에서 매끄러움)". ***켜면 더 나쁘다.***
+    ///
+    /// 이유가 수치에 있다. `max=8308us` 가 `SNAP_LIMIT`(8333us)에 붙어 있다 -- 추정값이 틱
+    /// 격자의 ***중간쯤***에 자주 놓이고, 그러면 앞 틱과 뒤 틱 중 어느 쪽이 가까운지가 미세한
+    /// 차이로 뒤집혀 기준점이 ★16.7ms 씩 점프★ 한다. 게다가 `miss` 12% 는 추정값을 쓰므로 두
+    /// 종류의 기준점이 섞인다.
+    ///
+    /// 전제가 틀렸다 -- `built_at` 이 틱 시각인 것은 맞지만, 전체 지연(`transit`)이 실측
+    /// avg 8ms, ★max 64ms★ 로 크게 변동하므로 추정값을 격자에 양자화하면 변동이 ***계단으로
+    /// 바뀌어*** 더 나쁘다.
+    ///
+    /// 그래서 기본은 꺼짐이고, 꺼지면 앞 판과 완전히 같다. 플래그와 `ANIMZERO` 는 남긴다 --
+    /// `snap avg/max` 가 추정 오차의 크기를 재 주고, 다른 접근과 비교할 때 비용이 0 이다.
+    ///
+    /// ## 계측이 준 수치 (59 번)
+    ///
+    ///     transit  avg 8ms,  ★max 64ms★   -- `built_at` 의 doc 이 적은 "5-30 ms" 의 두 배
+    ///     snap     avg 1017us             -- 추정과 실제 틱의 거리
+    ///     clamped  0                      -- 250ms 상한은 걸리지 않는다
+    ///     calls    38~47/s 안정            -- 127 에서 62 -> 11 -> 4.3 급감(재생 중단과 동시)
+    /// busy 카운터 맵을 ★샤드 하나★ 로 쓴다(= 2026-11-13 이전 동작). 기본 꺼짐.
+    ///
+    /// ## 왜 이 플래그가 있나 (2026-11-13)
+    ///
+    /// `WebGLContextBusyMap` 은 painter 가 들고 있는 front buffer 수를 서피스마다 세는데, 앞
+    /// 판은 `Arc<RwLock<HashMap<..>>>` 으로 painter 4 개가 ***하나의 `RwLock` 을 공유***했다.
+    /// 캔버스를 WR 프레임에 넣는 경로가 프레임마다 그것을 ★write★ 로 잡는다
+    /// (`webrender_external_images.rs` 의 `lock_swap_chain` 과 `mark_surface_not_busy`).
+    ///
+    ///     프레임마다 painter 4 개 x (lock + unlock) = ★초당 480 회 write★
+    ///     RwLock write 는 ***완전 배타*** -- 다른 painter 셋과 WebGL 스레드를 전부 막는다
+    ///     WebGL 이 없으면 `lock_swap_chain` 이 ★아예 안 불린다★
+    ///
+    /// 마지막 줄이 운영자 관찰("WebGL 만 빼면 ticker 가 깨끗하다")의 조건을 만족한다. 그리고
+    /// `LOCKWAIT` 는 이 락을 ***재지 않는다*** -- 같은 함수 안의 `chain`(스왑체인 Mutex)과
+    /// `tex`(AcquireSync)만 잰다. "획득 대기는 무죄" 라는 앞선 결론이 이 자리를 빼고 있었다.
+    ///
+    /// 이 자리는 2026-11-13 의 전수 열거(운영자 지시)로 찾았다. 앞서 고른 다섯 가설
+    /// (scissor, lead 샘플, 전역 배타 락, 생산 박자, 애니메이션 기준 시각)이 모두 ***"무거운
+    /// 일"*** 이었고, `entry() += 1` 은 가벼워 보여 세지 않았는데, 가벼운 일을 초당 480 회
+    /// 완전 배타로 하면 4-way 경합이 된다.
+    ///
+    /// 지금은 `surface_id` 의 `painter_id` 로 샤딩하므로 쓰기 경합이 없다. ★동작은 같다★ --
+    /// 같은 키에 같은 카운터를 두고 같은 조건으로 읽으며, 샤드만 갈린다.
+    ///
+    /// 이 pref 를 켜면 샤드 0 하나만 쓰므로 앞 판과 완전히 같다. `BUSYLOCK`/`BUSYLOCKS` 가
+    /// 양쪽의 획득 대기를 재므로 ★한 배포본으로 경합의 크기와 수정의 효과를 모두 읽는다.★
+    /// `glGetError` 로 OOM 을 보는 주기(프레임). ★기본 60 -- 1 초마다★. 1 은 매 프레임
+    /// (2026-11-13 이전 동작), 0 은 완전히 끈다.
+    ///
+    /// ## 왜 주기로 바꿨나 (2026-11-13)
+    ///
+    /// `Renderer::check_gl_errors` 가 매 프레임 `glGetError` 를 불렀고, 그것은 드라이버의
+    /// 미처리 명령을 flush 하고 ***동기화***한다.
+    ///
+    /// 65 번(그 구간을 `tail` 로 쪼갠 로그):
+    ///
+    ///     137 (HUD 켜짐)  over=★283★  tail p50 ★17500us★  p90 31510us  max 41664us
+    ///     138 (HUD 꺼짐)  over=★31★   tail p50 ★245us★    p90 9406us   max 22851us
+    ///
+    /// 같은 구간의 다른 후보는 전부 무죄였다 -- `overlay`(DComp bind) p50 325us,
+    /// `prof`(CPU 집계) 0us, `dbg`(HUD 그리기) p50 73us. 즉 ★HUD 는 그리는 비용이 아니라
+    /// 그린 것을 `glGetError` 가 동기화하는 비용★ 이고, 그래서 작업량이 같은 프레임
+    /// (`draws=3 upload=0.00MB`)이 41ms 가 됐다.
+    ///
+    /// 그 앞의 64 번에서 운영자가 `-ProfilerHud "FPS"` 를 빼니 judder 가 사라졌고(육안) 꼬리가
+    /// 305 건에서 19 건으로 줄었다. 이 pref 는 ★HUD 를 켜도 그렇게 되도록★ 하는 것이다.
+    ///
+    /// 매 프레임 전체 파이프라인을 동기화하면서 `OUT_OF_MEMORY` 하나를 보는 것은 대가가 너무
+    /// 크다. 1 초마다면 감지는 유지되고 비용은 1/60 이다.
+    /// HUD(ProfilerHud)를 몇 프레임마다 그릴지. ★기본 15 (60Hz 에서 초당 4 회)★.
+    /// 1 은 매 프레임(2026-11-13 이전 동작), 0 은 `-ProfilerHud` 를 준 채로 그리기를 끈다.
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/67 의 6 실행 A/B)
+    ///
+    ///     런   HUD  every  over  glerr  staging  pbo   ★devf p50★   dbg p50/max
+    ///     142  ON    60    283   0/2    0/2      0/0   ★18314us★    74/★14102★
+    ///     143  ON     1    194   1/47   0/0      0/0   ★18352us★    74/12856
+    ///     144  ON     0    220   0/0    0/0      0/0   ★17028us★    72/14364
+    ///     145  OFF   60     29   0/0    0/0      0/0   ★275us★      4/6
+    ///     146  OFF    1     24   1/1    0/0      0/0   ★322us★      3/35
+    ///     147  OFF    0     20   0/0    0/0      0/0   ★402us★      3/5
+    ///
+    /// 운영자: 142/143/144 는 "judder 가 세 경우 모두 동일한 수준으로 재발", 145/146/147 은
+    /// "judder 관찰되지 않음". 그리고 "각 tile에 표시되는 HUD가 ★매 프레임 갱신되는 것처럼★
+    /// 보였으며".
+    ///
+    /// `glerr_every=0`(144)에서도 재발했으므로 `glGetError` 가 아니다. `device.end_frame`
+    /// (`devf`)의 p50 이 HUD 켜짐 18314us 대 꺼짐 275us 로 ★45 배★ 다. 그 함수는 GL 상태
+    /// 설정뿐이고 flush 가 없으므로(`gl.rs:3757~3782`), 17ms 는 ★드라이버 명령 큐가 꽉 차서
+    /// 자리를 기다리는 것★ 이다. 증거는 `dbg` 다 -- HUD 그리기 자체는 p50 74us 인데 max 가
+    /// 14ms 다. 특정 호출이 느린 게 아니라 GL 호출이 전반적으로 막힌다.
+    ///
+    /// 4 타일 x 매 프레임 x 텍스트 렌더가 큐를 채운다. HUD 의 목적은 fps 확인이고 매 프레임
+    /// 갱신은 필요 없다 -- 15 면 읽기에 충분하고 GL 명령이 1/15 로 줄어든다.
+    ///
+    /// 게이트는 네 곳이다: `bind_debug_overlay`(안 그리는 프레임에는 ***bind 조차 하지
+    /// 않는다*** -- 그래야 DComp 타일의 이전 내용이 유지된다), `profiler.update`,
+    /// `profiler.draw_profile`, `debug_renderer.render`.
+    /// 캔버스 ack 자기잠금을 끊는 데드라인(ms). ★기본 2000★, 0 이면 끔(종전 동작).
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/69 의 151 실행)
+    ///
+    /// 운영자: "중간에 ★재생 중단★ 현상 확인". 수치로는 한 번이고 ★영구적★ 이다.
+    ///
+    ///     151  08:51:12 에 멈춤 -> 로그 끝(08:51:52)까지 ★40 초간 0.1~0.3fps★
+    ///     150  런 내내 29.7~37.1fps 평탄 (전환 없음)
+    ///
+    /// 멈춘 것은 ★생산자★ 다. 소비와 표시는 끝까지 정상이었다 -- `PRODUCE
+    /// window(edges=60.0/s calls=60.0/s miss=0)`, 240 lock/s, `RENDERSPLIT` 이 08:51:51
+    /// 까지. 생산자 태그만 죽는다(`SCISSORGATE` 마지막 08:51:11 이후 ★41 초 무음★).
+    /// 방아쇠는 그 시각의 `getUniformLocation: no reply (context released)` 11 건으로,
+    /// 런 전체에서 이 한 자리에만 나온다.
+    ///
+    /// 고리는 코드로 확인된다.
+    ///
+    ///     wall_tick.rs   ack_is_releasable = holds_debt && pending == 0
+    ///     painter.rs     pending 을 비우는 정상 경로는 `update_image`(epoch 지급) ★하나★
+    ///     script_thread.rs:1244  waiting_on_canvas_image_updates() 면 문서를 통째로 건너뜀
+    ///
+    /// epoch 이 미지급되면 pending 이 영원히 안 비고 -> ack 이 영영 안 가고 -> script 가 그
+    /// 문서를 영영 건너뛰고 -> rAF 와 DL 빌드가 안 돌고 -> WebGL 명령이 없어 ★새 epoch 이
+    /// 생길 기회조차 사라진다.★ `webgl_thread.rs:2752-2759` 가 이 고리를 적어 뒀고
+    /// 2026-11-11 에 `restore_context_backends` 로 ***한 경로*** 를 막았는데, 69 번이
+    /// ★다른 경로가 남아 있다★ 는 것을 보여 준다.
+    ///
+    /// 그래서 경로를 하나씩 막는 대신 데드라인을 둔다. 2 초는 정상 동작에 닿지 않는다 --
+    /// 정상 ack 은 rAF 한 바퀴(ms 단위)다. 끊은 뒤 한 프레임은 낡은 캔버스가 보일 수
+    /// 있지만 ★40 초 정지보다 낫다.★ 끊은 사건은 `ACKSTUCK` 로 찍히고, 그것이 나오면
+    /// ★아직 막지 못한 경로가 있다는 뜻★ 이므로 그 로그를 단서로 삼아야 한다.
+    pub gfx_wall_canvas_ack_deadline_ms: i64,
+    pub gfx_wall_hud_draw_every: i64,
+    pub gfx_wall_gl_error_check_every: i64,
+    pub gfx_wall_webgl_busy_map_single_shard: bool,
+    pub gfx_wall_animation_zero_snaps_to_tick: bool,
+    pub gfx_wall_webgl_tile_scissor_from_tile_geometry: bool,
+    pub gfx_wall_webgl_scissor_hold_when_static: bool,
+    pub gfx_wall_webgl_tile_scissor_clear: bool,
     pub gfx_wall_webgl_tile_scissor_from_webrender: bool,
 
     /// WR 이 적어 둔 사각형을 몇 ms 까지 쓸지. 그보다 오래됐으면 ★없는 것으로 보고★ 기존
@@ -1756,6 +2041,15 @@ impl Preferences {
             gfx_wall_canvas_live_window_ms: 500,
             gfx_wall_live_canvas_tick_divisor: 2,
             gfx_wall_canvas_wait_declines_production: false,
+            gfx_wall_webgl_deferred_front_buffer: false,
+            gfx_wall_webgl_scissor_hold_when_static: true,
+            gfx_wall_animation_zero_snaps_to_tick: false,
+            gfx_wall_gl_error_check_every: 60,
+            gfx_wall_canvas_ack_deadline_ms: 2000,
+            gfx_wall_hud_draw_every: 15,
+            gfx_wall_webgl_busy_map_single_shard: false,
+            gfx_wall_webgl_tile_scissor_from_tile_geometry: false,
+            gfx_wall_webgl_tile_scissor_clear: false,
             gfx_wall_webgl_tile_scissor_from_webrender: false,
             gfx_wall_webgl_tile_scissor_max_age_ms: 34,
             gfx_wall_canvas_scissor_lead_periods: 4,

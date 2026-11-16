@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use std::{slice, thread};
@@ -71,7 +71,156 @@ fn native_uniform_location(location: i32) -> Option<NativeUniformLocation> {
 /// currently taken a surface from its [`SwapChain`] for rendering purposes. Contexts will
 /// only be deleted once no WebRender instance is using it for rendering. This ensures
 /// that all Surfman `Surface`s can be released properly on the [`WebGLThread`].
-pub type WebGLContextBusyMap = Arc<RwLock<HashMap<WebGLSurfaceId, usize>>>;
+/// painter 가 들고 있는 front buffer 의 수를 서피스마다 센다. ★painter 로 샤딩한다.★
+///
+/// ## 왜 샤딩인가 (2026-11-13)
+///
+/// 앞 판은 `Arc<RwLock<HashMap<WebGLSurfaceId, usize>>>` 로 painter 4 개가 ***하나의
+/// `RwLock` 을 공유***했고, 캔버스를 WR 프레임에 넣는 경로가 프레임마다 그것을 ★write★ 로
+/// 잡았다(`webrender_external_images.rs` 의 `lock_swap_chain` 과 `mark_surface_not_busy`).
+/// 프레임마다 painter 4 개가 lock + unlock 을 하므로 ★초당 480 회 write★ 이고, `RwLock`
+/// write 는 완전 배타라 다른 painter 셋과 WebGL 스레드를 전부 막는다.
+///
+/// `surface_id` 는 `(context_id, painter_id)` 이고 ***각 painter 는 자기 것만 쓴다.*** 그래서
+/// painter 로 샤딩하면 쓰기 경합이 사라진다. 읽기(`any_busy`)와 teardown 의 `remove_all` 은
+/// 드물므로 전 샤드를 돈다.
+///
+/// WebGL 이 없으면 `lock_swap_chain` 이 아예 안 불리므로 이 비용 자체가 0 이다 -- 운영자
+/// 관찰("WebGL 만 빼면 ticker 가 깨끗하다")의 조건을 만족하는 자리였다.
+///
+/// `LOCKWAIT` 는 이 락을 재지 않는다 -- 같은 함수 안의 `chain`(스왑체인 Mutex)과
+/// `tex`(AcquireSync)만 잰다. 그래서 "획득 대기는 무죄" 라는 앞선 결론이 이 자리를 빼고 있었다.
+#[derive(Clone, Default)]
+pub struct WebGLContextBusyMap(Arc<BusyShards>);
+
+/// 샤드 수. 타일 4 개에 여유를 둔 고정값이고, 2 의 거듭제곱이라 나머지 연산이 싸다.
+const BUSY_SHARDS: usize = 8;
+
+#[derive(Default)]
+struct BusyShards {
+    shards: [RwLock<HashMap<WebGLSurfaceId, usize>>; BUSY_SHARDS],
+}
+
+impl WebGLContextBusyMap {
+    /// 이 서피스를 담당하는 샤드. 같은 painter 의 것은 항상 같은 샤드로 간다.
+    ///
+    /// `single_shard` 가 켜지면 샤드 0 하나만 쓴다 -- 앞 판과 완전히 같은 동작이고, 비교용이다.
+    fn shard(&self, surface_id: WebGLSurfaceId) -> &RwLock<HashMap<WebGLSurfaceId, usize>> {
+        let index = if busy_map_single_shard() {
+            0
+        } else {
+            webrender_api::IdNamespace::from(surface_id.painter_id).0 as usize % BUSY_SHARDS
+        };
+        &self.0.shards[index]
+    }
+
+    /// painter 가 이 서피스의 front buffer 를 잡았다.
+    pub fn mark_busy(&self, surface_id: WebGLSurfaceId) {
+        let shard = self.shard(surface_id);
+        let started = Instant::now();
+        let mut guard = shard.write();
+        note_busy_lock(started.elapsed(), true);
+        *guard.entry(surface_id).or_default() += 1;
+    }
+
+    /// painter 가 놓았다. 카운터가 없거나 0 이면 경고만 하고 넘어간다(앞 판과 같다).
+    pub fn mark_not_busy(&self, surface_id: WebGLSurfaceId) {
+        let shard = self.shard(surface_id);
+        let started = Instant::now();
+        let mut guard = shard.write();
+        note_busy_lock(started.elapsed(), true);
+        let Some(count) = guard.get_mut(&surface_id) else {
+            warn!("WebGL external image busy counter underflow: missing entry for {surface_id:?}");
+            return;
+        };
+        if *count == 0 {
+            warn!("WebGL external image busy counter underflow: zero count for {surface_id:?}");
+        } else {
+            *count -= 1;
+        }
+    }
+
+    /// 이 서피스들 중 하나라도 painter 가 들고 있나. teardown 판정에 쓰므로 드물다.
+    pub fn any_busy(&self, surface_ids: &[WebGLSurfaceId]) -> bool {
+        surface_ids.iter().any(|surface_id| {
+            let started = Instant::now();
+            let guard = self.shard(*surface_id).read();
+            note_busy_lock(started.elapsed(), false);
+            guard
+                .get(surface_id)
+                .is_some_and(|busy_count| *busy_count > 0)
+        })
+    }
+
+    /// 카운터를 지운다. 컨텍스트를 놓거나 없앨 때만 부르므로 드물다.
+    pub fn remove_all(&self, surface_ids: &[WebGLSurfaceId]) {
+        for surface_id in surface_ids {
+            let started = Instant::now();
+            let mut guard = self.shard(*surface_id).write();
+            note_busy_lock(started.elapsed(), true);
+            guard.remove(surface_id);
+        }
+    }
+}
+
+/// 샤드 0 하나만 쓸지(= 앞 판과 같은 동작). `paint` 가 틱마다 싣는다.
+static BUSY_MAP_SINGLE_SHARD: AtomicBool = AtomicBool::new(false);
+
+/// `gfx_wall_webgl_busy_map_single_shard` 를 싣는다.
+pub fn set_busy_map_single_shard(enabled: bool) {
+    BUSY_MAP_SINGLE_SHARD.store(enabled, Ordering::Relaxed);
+}
+
+fn busy_map_single_shard() -> bool {
+    BUSY_MAP_SINGLE_SHARD.load(Ordering::Relaxed)
+}
+
+/// busy 카운터 락의 획득 대기를 잰다. 꼬리(>= 1ms)는 그때그때, 나머지는 1200 획득마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// 이 락이 샤딩 전에는 painter 4 개가 공유하는 하나였고 프레임마다 초당 480 회 write 로
+/// 잡혔다. 그 대기를 재는 계측이 ***없었다*** -- `LOCKWAIT` 는 같은 함수 안의 다른 두 락만
+/// 잰다. 샤딩이 들면 꼬리가 0 이 되어야 하고, `-WebglBusyMapSingleShard` 로 앞 판 동작을
+/// 켜면 그 값이 ★경합의 크기★ 로 나온다.
+///
+/// ## 비용
+///
+/// 획득마다 `Instant::now()` 둘과 원자 셋이다. 480/s 이면 약 25us/s 다.
+fn note_busy_lock(waited: Duration, is_write: bool) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let us = waited.as_micros() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if is_write {
+        WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if waited >= Duration::from_millis(1) {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        let kind = if is_write { "write" } else { "read" };
+        warn!(
+            "BUSYLOCK #{tail} {kind} waited={us}us (shard-single={})",
+            busy_map_single_shard()
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "BUSYLOCKS n={nth} writes={} wait(avg={}us max={}us) tails={} single_shard={}",
+        WRITES.swap(0, Ordering::Relaxed),
+        SUM_US.swap(0, Ordering::Relaxed) / 1200,
+        MAX_US.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+        busy_map_single_shard(),
+    );
+}
 
 pub(crate) struct GLContextData {
     pub(crate) ctx: Context,
@@ -263,9 +412,211 @@ fn note_hold(ms: u64) {
     HOLD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// scissor 사각형이 프레임 사이에 얼마나 급하게 변하는지. 꼬리(면적 >= 2 배 또는 <= 1/2)는
+/// 그때그때 한 줄, 나머지는 1200 변화마다 모아서 한 줄.
+///
+/// ## 왜 (2026-11-12)
+///
+/// 운영자 질문 -- "scissors 영역이 갑자기 급격하게 변경된다거나 텍스처가 새로 할당된다거나
+/// 하는 일이 일어나나?"
+///
+/// 텍스처 쪽은 답이 나왔다(전환당 `resize` 경로로 16 장, 11520x4321x4 = 199MB 씩). scissor
+/// 쪽은 지금 면적이 찍히지 않아 측정값이 없다. `SCISSORGATE` 가 주는 것은 적용률과 낡음
+/// (`stale`, `age_max` 1.2~1.3 초)뿐이다.
+///
+/// 바운스는 오버슈트 뒤 되돌아오므로 그 전환점에서 `union_over` 의 창 안 샘플이 양쪽으로
+/// 퍼진다. 그러면 union 이 급격히 커지고, 넓어지는 것 자체는 안전하지만 ***셰이딩 면적이
+/// 늘어난다.*** 그것이 "후반의 fps 저하" 와 맞는지를 이 계측이 가른다.
+///
+/// ## 비용
+///
+/// 변화가 있을 때만 들어온다(이미 있는 분기 안이다). 원자 셋과 곱셈 둘이다. 꼬리 줄은 면적이
+/// 2 배 이상 벌어질 때만 나온다.
+fn note_scissor_jump(was: Option<[i32; 4]>, now: Option<[i32; 4]>) {
+    static JUMPS: AtomicU64 = AtomicU64::new(0);
+    static GREW_2X: AtomicU64 = AtomicU64::new(0);
+    static SHRANK_2X: AtomicU64 = AtomicU64::new(0);
+    static FROM_NONE: AtomicU64 = AtomicU64::new(0);
+    static TO_NONE: AtomicU64 = AtomicU64::new(0);
+    static AREA_SUM: AtomicU64 = AtomicU64::new(0);
+    static AREA_MAX: AtomicU64 = AtomicU64::new(0);
+
+    let area = |r: [i32; 4]| (r[2].max(0) as u64) * (r[3].max(0) as u64);
+    let (old_area, new_area) = match (was, now) {
+        (Some(a), Some(b)) => (area(a), area(b)),
+        (None, Some(b)) => {
+            FROM_NONE.fetch_add(1, Ordering::Relaxed);
+            (0, area(b))
+        },
+        (Some(a), None) => {
+            TO_NONE.fetch_add(1, Ordering::Relaxed);
+            (area(a), 0)
+        },
+        (None, None) => return,
+    };
+    let nth = JUMPS.fetch_add(1, Ordering::Relaxed) + 1;
+    AREA_SUM.fetch_add(new_area / 1_000_000, Ordering::Relaxed);
+    AREA_MAX.fetch_max(new_area / 1_000_000, Ordering::Relaxed);
+
+    // 2 배 이상 벌어진 경우만 꼬리로 본다. 0 과의 비교는 위에서 따로 세었다.
+    let big =
+        old_area > 0 && new_area > 0 && (new_area >= old_area * 2 || old_area >= new_area * 2);
+    if big {
+        if new_area > old_area {
+            GREW_2X.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SHRANK_2X.fetch_add(1, Ordering::Relaxed);
+        }
+        let t = surfman::platform::windows::angle::surface::transition_elapsed_ms();
+        let at = match t {
+            Some(ms) => format!("t=+{ms}ms"),
+            None => "t=n/a".to_owned(),
+        };
+        let mp = |a: u64| a as f64 / 1_000_000.0;
+        warn!(
+            "SCISSORJUMP #{nth} {at} area {:.1}Mpx -> {:.1}Mpx (x{:.2})",
+            mp(old_area),
+            mp(new_area),
+            new_area as f64 / old_area as f64
+        );
+    }
+
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "SCISSORJUMPS n={} grew2x={} shrank2x={} from_none={} to_none={} \
+         area(avg={}Mpx max={}Mpx)",
+        nth,
+        GREW_2X.load(Ordering::Relaxed),
+        SHRANK_2X.load(Ordering::Relaxed),
+        FROM_NONE.load(Ordering::Relaxed),
+        TO_NONE.load(Ordering::Relaxed),
+        AREA_SUM.load(Ordering::Relaxed) / nth,
+        AREA_MAX.load(Ordering::Relaxed),
+    );
+}
+
+/// scissor 면적과 lead 샘플이 그것을 넓히는지. 1200 회마다 한 줄, 1.5 배를 넘기면 그때 한 줄.
+///
+/// ## 왜 (2026-11-12)
+///
+/// 운영자 지적 -- "WebGL 4 tile 전체화면 + ticker 애니메이션 구성에서 ticker 애니메이션
+/// judder 해소하려고 WebGL에 scissor를 넣었고, 해소됐잖아? (...) 그럼 적어도 (그) 구성에서
+/// ticker 애니메이션 judder는 발생하지 않아야 하는데, 이게 회귀된 상태로 성능 보는걸로
+/// 마무리한다고?"
+///
+/// 그 구성에서 judder 0 이 조건이다. 그런데 54 번 데이터로는 판단할 수 없다 -- 전환 테스트라
+/// 캔버스가 전체화면인 시간이 적고, `SCISSORJUMPS` 의 `area avg=8Mpx max=15Mpx` 는 전환 중
+/// 작은 값이 섞인 평균이다(타일당 전체화면 기대값은 11520x4320/4 = 12.44Mpx). 정지 상태의
+/// 면적을 ***재는 값이 없다.***
+///
+/// ## 판정
+///
+/// * `base avg` 가 12.44Mpx 근처면 WR 의 보고가 맞다. 많이 작으면 캔버스가 전체화면이 아니다.
+/// * 정지 구성에서 `widened` 가 ★0 이어야 한다.★ 크면 lead 샘플이 캔버스를 넓히고 있다 --
+///   캔버스는 안 움직이는데 ticker 애니메이션이 `ancestor_animated_node`(`picture.rs`)를
+///   통과해 lead 샘플로 붙는 경우이고, 그러면 타일당 1/4 셰이딩이라는 1 단계의 효과가 깨진다.
+///   운영자가 지적한 회귀의 기구가 그것이다.
+/// * `samples`/`used` 분포가 그 판정을 뒷받침한다.
+///
+/// ## 비용
+///
+/// `union_over` 를 부른 직후이고 원자 11 개 증가와 곱셈 둘이다. painter 4 x 60Hz = 240/s
+/// 이므로 약 20us/s 다. 꼬리 줄은 배율 1.5 배 초과일 때만 나온다.
+fn note_scissor_area(base: [i32; 4], union: [i32; 4], sample_count: u8, used: u8) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BASE_SUM: AtomicU64 = AtomicU64::new(0);
+    static BASE_MAX: AtomicU64 = AtomicU64::new(0);
+    static UNION_SUM: AtomicU64 = AtomicU64::new(0);
+    static UNION_MAX: AtomicU64 = AtomicU64::new(0);
+    static WIDENED: AtomicU64 = AtomicU64::new(0);
+    static WIDEN_PCT_SUM: AtomicU64 = AtomicU64::new(0);
+    static WIDEN_PCT_MAX: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_1: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_2: AtomicU64 = AtomicU64::new(0);
+    static SAMPLES_3PLUS: AtomicU64 = AtomicU64::new(0);
+    static USED_0: AtomicU64 = AtomicU64::new(0);
+    static USED_1: AtomicU64 = AtomicU64::new(0);
+    static USED_2PLUS: AtomicU64 = AtomicU64::new(0);
+
+    let area = |r: [i32; 4]| (r[2].max(0) as u64) * (r[3].max(0) as u64);
+    let base_area = area(base);
+    let union_area = area(union);
+
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    BASE_SUM.fetch_add(base_area / 1_000, Ordering::Relaxed);
+    BASE_MAX.fetch_max(base_area / 1_000, Ordering::Relaxed);
+    UNION_SUM.fetch_add(union_area / 1_000, Ordering::Relaxed);
+    UNION_MAX.fetch_max(union_area / 1_000, Ordering::Relaxed);
+    match sample_count {
+        0 | 1 => SAMPLES_1.fetch_add(1, Ordering::Relaxed),
+        2 => SAMPLES_2.fetch_add(1, Ordering::Relaxed),
+        _ => SAMPLES_3PLUS.fetch_add(1, Ordering::Relaxed),
+    };
+    match used {
+        0 => USED_0.fetch_add(1, Ordering::Relaxed),
+        1 => USED_1.fetch_add(1, Ordering::Relaxed),
+        _ => USED_2PLUS.fetch_add(1, Ordering::Relaxed),
+    };
+
+    // 배율은 백분율로 담는다(원자가 정수다). 100 이 "넓어지지 않음" 이다.
+    let widen_pct = if base_area > 0 {
+        (union_area * 100 / base_area).max(100)
+    } else {
+        100
+    };
+    if union_area > base_area {
+        WIDENED.fetch_add(1, Ordering::Relaxed);
+        WIDEN_PCT_SUM.fetch_add(widen_pct, Ordering::Relaxed);
+        WIDEN_PCT_MAX.fetch_max(widen_pct, Ordering::Relaxed);
+        if widen_pct > 150 {
+            let mp = |a: u64| a as f64 / 1_000_000.0;
+            warn!(
+                "SCISSORWIDE #{nth} base={:.1}Mpx -> union={:.1}Mpx ({}%) \
+                 samples={sample_count} used={used}",
+                mp(base_area),
+                mp(union_area),
+                widen_pct
+            );
+        }
+    }
+
+    if nth % 1200 != 0 {
+        return;
+    }
+    let widened = WIDENED.swap(0, Ordering::Relaxed);
+    let pct_sum = WIDEN_PCT_SUM.swap(0, Ordering::Relaxed);
+    let kp = |a: u64| a as f64 / 1_000.0;
+    warn!(
+        "SCISSORAREA n={nth} base(avg={:.1}Mpx max={:.1}Mpx) union(avg={:.1}Mpx max={:.1}Mpx) \
+         widened={widened} ({:.1}%, avg={}% max={}%) samples(1={} 2={} 3plus={}) \
+         used(0={} 1={} 2plus={})",
+        kp(BASE_SUM.swap(0, Ordering::Relaxed) / 1200),
+        kp(BASE_MAX.swap(0, Ordering::Relaxed)),
+        kp(UNION_SUM.swap(0, Ordering::Relaxed) / 1200),
+        kp(UNION_MAX.swap(0, Ordering::Relaxed)),
+        widened as f64 * 100.0 / 1200.0,
+        if widened > 0 { pct_sum / widened } else { 100 },
+        WIDEN_PCT_MAX.swap(0, Ordering::Relaxed).max(100),
+        SAMPLES_1.swap(0, Ordering::Relaxed),
+        SAMPLES_2.swap(0, Ordering::Relaxed),
+        SAMPLES_3PLUS.swap(0, Ordering::Relaxed),
+        USED_0.swap(0, Ordering::Relaxed),
+        USED_1.swap(0, Ordering::Relaxed),
+        USED_2PLUS.swap(0, Ordering::Relaxed),
+    );
+}
+
 fn note_scissor_gate(outcome: ScissorGate) {
     static SLOTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     static STALE_AGE_MAX: AtomicU64 = AtomicU64::new(0);
+    /// 낡았지만 정지한 캔버스라서 그대로 쓴 횟수와 그때의 최대 나이. 2026-11-12.
+    ///
+    /// `SLOTS` 에 넣지 않는다 -- 이 결과 뒤에 그 호출이 계속 진행해서 `Applied` 도 부르므로
+    /// 같은 칸을 쓰면 한 번의 적용이 두 번 세어지고 `pct` 의 분모가 왜곡된다.
+    static STALE_HELD: AtomicU64 = AtomicU64::new(0);
+    static STALE_HELD_AGE_MAX: AtomicU64 = AtomicU64::new(0);
     static CALLS: AtomicU64 = AtomicU64::new(0);
     static PREV: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
     /// 직전 리포트 시각, 프로세스 기준점 이후 ms. 0 = 아직 없음.
@@ -284,6 +635,12 @@ fn note_scissor_gate(outcome: ScissorGate) {
         ScissorGate::Stale(age) => {
             STALE_AGE_MAX.fetch_max(age, Ordering::Relaxed);
             3
+        },
+        // 이 호출은 계속 진행해서 `Applied` 도 부른다. 위 doc 주석이 근거다.
+        ScissorGate::StaleHeld(age) => {
+            STALE_HELD.fetch_add(1, Ordering::Relaxed);
+            STALE_HELD_AGE_MAX.fetch_max(age, Ordering::Relaxed);
+            return;
         },
         ScissorGate::NoIntersection => 4,
     };
@@ -327,14 +684,16 @@ fn note_scissor_gate(outcome: ScissorGate) {
     let hold_sum = HOLD_SUM_MS.swap(0, Ordering::Relaxed);
     warn!(
         "SCISSORGATE {secs:.1}s applied={} ({pct:.1}%, {:.1}/s) no_key={} missing={} \
-         stale={} (age_max={}ms) no_isect={} hold(n={} avg={}ms max={}ms) \
-         table_miss(empty={} one={} drift={})",
+         stale={} (age_max={}ms) stale_held={} (age_max={}ms) no_isect={} \
+         hold(n={} avg={}ms max={}ms) table_miss(empty={} one={} drift={})",
         d[0],
         d[0] as f64 / secs,
         d[1],
         d[2],
         d[3],
         STALE_AGE_MAX.swap(0, Ordering::Relaxed),
+        STALE_HELD.swap(0, Ordering::Relaxed),
+        STALE_HELD_AGE_MAX.swap(0, Ordering::Relaxed),
         d[4],
         hold_count,
         if hold_count > 0 {
@@ -359,6 +718,8 @@ enum ScissorGate {
     Missing,
     /// 적힌 것이 `max_age_ms` 보다 낡았다(나이, ms).
     Stale(u64),
+    /// 낡았지만 정지한 캔버스라서 그대로 썼다(나이, ms). 2026-11-12.
+    StaleHeld(u64),
     /// 사각형이 있지만 교집합이 비었다.
     NoIntersection,
 }
@@ -1464,6 +1825,17 @@ impl WebGLThread {
             webgl_version, requested_size, attributes, target_painter_ids
         );
 
+        // 전환의 기준 시각을 여기로 옮긴다. 근거는 `surfman` 의 `mark_transition_epoch` doc.
+        //
+        // 운영자 질문(2026-11-12) -- "바운스 애니메이션 후반과(우->좌) 종료 직후에 무슨 일이
+        // 일어나는거지?" -- 에 답하려면 전환 수명 안의 상대 시각이 필요하고, `LOCKTAIL` 의
+        // `phase` 는 그 일을 못 한다(DL 빌드 시각을 0, 3 초 horizon 을 분모로 쓰므로 실측
+        // 130 건이 모두 0.014~0.050 에 갇혔다).
+        //
+        // 전환마다 새 WebGL 컨텍스트가 만들어지므로 여기가 전환의 시작에 가장 가깝다.
+        // 전환당 한 번, 원자 store 하나다.
+        surfman::platform::windows::angle::surface::mark_transition_epoch();
+
         // Creating a new GLContext may make the current bound context_id dirty.
         // Clear it to ensure that  make_current() is called in subsequent commands.
         self.bound_context_id = None;
@@ -1646,6 +2018,11 @@ impl WebGLThread {
             .webrender_swap_chains
             .get(surface_id)
             .expect("Failed to get the swap chain");
+        // ★두 칸 큐를 쓸지 세운다★ -- 근거는 `gfx_wall_webgl_deferred_front_buffer` 의 doc
+        // 주석. 컨텍스트를 만들 때 한 번만 읽으므로 타이밍 경로가 아니고, pref 를 바꾸면
+        // 다음 컨텍스트부터 적용된다(전환마다 새로 만들므로 곧 걸린다).
+        swap_chain
+            .set_deferred_front_buffer(servo_config::pref!(gfx_wall_webgl_deferred_front_buffer));
 
         debug!(
             "Created webgl backend context {:?} for painter {:?}/{:?}",
@@ -1810,7 +2187,7 @@ impl WebGLThread {
                     // 초기화돼 있어야 한다 -- 안 그러면 안 쓰는 영역에 쓰레기가 남고,
                     // 타일 경계의 필터링이 그것을 끌어올 수 있다. 프레임마다가 아니라
                     // 리사이즈 때 한 번이므로 비용도 문제가 아니다.
-                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
+                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color, None)
                     .map_err(|err| format!("Failed to clear resized swap chain: {:?}", err))?;
             } else {
                 error!("Failed to find swap chain");
@@ -1851,15 +2228,57 @@ impl WebGLThread {
     /// swap 은 페이지가 rAF 를 돌며 프레임을 내놓았다는 뜻이므로 합성되지 않더라도 회수
     /// 대상이 아니다. 회수의 본래 목적(정말로 버려진 캔버스의 GPU 메모리 반납)은 유지된다
     /// -- 페이지가 그리기를 멈추면 swap 도 멈추므로 유휴 시간이 지나면 회수된다.
+    /// ★생산이 멎은 컨텍스트를 즉시 이름으로 부른다.★ 1Hz 스윕에 얹혀 추가 비용이 없다.
+    ///
+    /// ## 왜 (2026-11-13, log_webgl_perf_01/69 의 151)
+    ///
+    /// 운영자가 "중간에 재생 중단" 을 봤는데, 로그에는 ★멎었다고 말하는 줄이 없었다.★
+    /// 생산자 쪽 태그(`SCISSORGATE`, `SCISSORJUMP`, `SCISSORAREA`)가 그냥 ***나오기를
+    /// 멈출 뿐*** 이고, 그것을 알아채려면 41 초 뒤에 "마지막 줄이 언제였나" 를 세어야 한다.
+    /// 소비자 측 fps 로 역산해서야 08:51:12 라는 시각이 나왔다.
+    ///
+    /// 침묵은 ***없는 로그*** 라서 눈에 띄지 않는다. 그래서 ★있는 로그★ 로 바꾼다.
+    ///
+    /// `last_alive` 는 `mark_context_alive` 가 swap 마다 갱신하므로, 그것이 안 움직이는
+    /// 컨텍스트가 곧 "생산이 멎은 컨텍스트" 다. 회수 대상(`released_contexts`)은 뺀다 --
+    /// 그건 의도적으로 재운 것이다.
+    ///
+    /// 비용: 1Hz x 컨텍스트 수. 69 번 기준 18 개이므로 초당 18 회 비교다.
+    fn report_silent_producers(&mut self, now: Instant) {
+        const SILENT_MS: u64 = 2_000;
+
+        let mut worst: Option<(WebGLContextId, u64)> = None;
+        let mut silent = 0usize;
+        for (context_id, last) in self.last_alive.iter() {
+            if self.released_contexts.contains(context_id) {
+                continue;
+            }
+            let ms = now.duration_since(*last).as_millis() as u64;
+            if ms < SILENT_MS {
+                continue;
+            }
+            silent += 1;
+            if worst.is_none_or(|(_, w)| ms > w) {
+                worst = Some((*context_id, ms));
+            }
+        }
+        let Some((context_id, ms)) = worst else {
+            return;
+        };
+        warn!(
+            "SWAPSILENT silent={silent} worst={context_id:?} silent_ms={ms}              live={} released={}",
+            self.last_alive.len(),
+            self.released_contexts.len(),
+        );
+    }
+
     fn mark_context_alive(&mut self, context_id: WebGLContextId) {
         self.last_alive.insert(context_id, Instant::now());
     }
 
     fn maybe_reclaim_idle_contexts(&mut self) {
-        let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
-        if idle_ms <= 0 {
-            return;
-        }
+        // ★1Hz 게이트를 pref 읽기 앞으로 옮겼다.★ 회수가 꺼져 있어도(`idle_ms <= 0`)
+        // 아래 침묵 보고는 돌아야 하기 때문이다. 덤으로 `pref!` 도 초당 한 번만 읽는다.
         let now = Instant::now();
         if self
             .last_reclaim_sweep
@@ -1868,6 +2287,13 @@ impl WebGLThread {
             return;
         }
         self.last_reclaim_sweep = Some(now);
+
+        self.report_silent_producers(now);
+
+        let idle_ms = servo_config::pref!(dom_webgl_idle_context_reclaim_ms);
+        if idle_ms <= 0 {
+            return;
+        }
         let idle = Duration::from_millis(idle_ms as u64);
         let stale: Vec<WebGLContextId> = self
             .context_backends
@@ -1914,14 +2340,8 @@ impl WebGLThread {
     }
 
     fn context_has_busy_surfaces(&self, context_id: WebGLContextId) -> bool {
-        let busy_webgl_context_map = self.busy_webgl_context_map.read();
-        self.backend_surface_ids(context_id)
-            .iter()
-            .any(|surface_id| {
-                busy_webgl_context_map
-                    .get(surface_id)
-                    .is_some_and(|busy_count| *busy_count > 0)
-            })
+        self.busy_webgl_context_map
+            .any_busy(&self.backend_surface_ids(context_id))
     }
 
     /// Removes a WebGLContext and releases attached resources.
@@ -1946,12 +2366,7 @@ impl WebGLThread {
             // WebRender 가 아직 이 서피스로 그리는 중이다 — 다음 기회에.
             return;
         }
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            for surface_id in &surface_ids {
-                busy_webgl_context_map.remove(surface_id);
-            }
-        }
+        self.busy_webgl_context_map.remove_all(&surface_ids);
         for surface_id in surface_ids {
             let _angle_gl_guard = paint_api::angle_gl_lock(self.angle_device_key(surface_id));
             self.make_surface_current_if_needed(surface_id);
@@ -2053,12 +2468,7 @@ impl WebGLThread {
             return;
         }
 
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            for surface_id in &surface_ids {
-                busy_webgl_context_map.remove(surface_id);
-            }
-        }
+        self.busy_webgl_context_map.remove_all(&surface_ids);
 
         // Release webrender image keys.
         if let Some(image_key) = self
@@ -2124,7 +2534,58 @@ impl WebGLThread {
     /// (log_webgl_perf_01/25). 일반적인 경로 하나만 남기는 것이 맞다.
     fn tile_scissor_for(&self, surface_id: WebGLSurfaceId, hold: Duration) -> Option<[i32; 4]> {
         let canvas = self.webrender_swap_chains.get(surface_id)?.size();
+        // 구 경로를 쓸지. 근거는 `tile_scissor_from_tile_geometry` 의 doc 주석 -- 요점은
+        // 회귀의 축을 한 번의 A/B 로 가르는 것이다. 원자 하나다.
+        if webrender::wall_canvas_rect::from_tile_geometry() {
+            return self.tile_scissor_from_tile_geometry(surface_id, canvas);
+        }
         self.tile_scissor_from_webrender(surface_id, canvas, hold)
+    }
+
+    /// 타일 기하에서 scissor 를 유도하는 ★구 경로★. 2026-11-13 에 되살렸다.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 운영자 지적 -- "이미 WebglTileScissor 플래그 쓰던 바이너리에서 조합 페이지 재생시
+    /// ticker 애니메이션 judder 사라졌다니까?"
+    ///
+    /// 그 플래그(`gfx_wall_webgl_tile_scissor`)와 이 구현은 `c3450a9364b`(2026-11-10)에서
+    /// 운영자 지시로 제거됐고, 그 뒤 39 커밋이 들어갔고, 지금 그 구성에서 judder 가
+    /// 회귀했다.
+    ///
+    /// 55 번(121)이 말하는 것은 ***사각형 자체는 지금도 정확하다***는 것이다 -- `base`
+    /// 12.4Mpx 가 타일당 1/4 과 일치하고, `widened=0`, `samples(1=전부)`, 실패율 0.40%,
+    /// `AcquireSync` 꼬리 0.07% 다. 그러면 회귀는 그 39 커밋 중 다른 것이고, 이분 탐색은
+    /// 실기 6 회가 든다. ★구 경로를 되살려 한 번 A/B 하면 축이 갈린다.★
+    ///
+    /// ## 구 경로의 성질
+    ///
+    /// `painter_tile_rect_map` 에서 직접 계산하므로 WR lookup 도, 나이도, 창도 없다. 캔버스가
+    /// 가상 뷰포트를 꽉 채울 때만 작동한다 -- 크기가 다르면 캔버스 좌표와 뷰포트 좌표가 1:1
+    /// 이 아니어서 엉뚱한 사분면이 보인다(근거는 `PainterTileRect::viewport` 의 doc).
+    ///
+    /// 그래서 4 타일 전체화면 구성에 정확히 맞고 ★전환 중에는 빈 공간이 생긴다★ -- 그것이
+    /// 넓히기(`20ee1a167ab` 이후)를 만든 이유였고, 이 A/B 에서는 알려진 대가다.
+    fn tile_scissor_from_tile_geometry(
+        &self,
+        surface_id: WebGLSurfaceId,
+        canvas: Size2D<i32>,
+    ) -> Option<[i32; 4]> {
+        let rect = self.painter_tile_rect_map.get(surface_id.painter_id)?;
+        if canvas.width != rect.viewport.width || canvas.height != rect.viewport.height {
+            note_scissor_gate(ScissorGate::NoIntersection);
+            return None;
+        }
+        // `flip_y` pref 도 함께 사라졌으므로 구 기본값을 고정으로 쓴다.
+        let scissor = [
+            rect.tile.min.x,
+            canvas.height - rect.tile.max.y,
+            rect.tile.width(),
+            rect.tile.height(),
+        ];
+        note_scissor_gate(ScissorGate::Applied);
+        note_scissor_area(scissor, scissor, 1, 1);
+        Some(scissor)
     }
 
     /// 이 서피스의 ★프레임 간격★ -- 직전 swap 과의 차이. 기록을 갱신한다.
@@ -2245,6 +2706,17 @@ impl WebGLThread {
         let max_age = webrender::wall_canvas_rect::max_age_ms();
         let (noted, age) = match webrender::wall_canvas_rect::lookup(slot, key, max_age) {
             webrender::wall_canvas_rect::Lookup::Hit(noted, age) => (noted, age),
+            // 정지한 캔버스는 낡았다고 버리지 않는다. 근거는
+            // `gfx_wall_webgl_scissor_hold_when_static` 의 doc 주석 -- 요점은
+            // `sample_count == 1` 이 "이 캔버스에 애니메이션이 없다" 는 WR 자신의 보고라서
+            // (`picture.rs` 가 `table[0] = (0, rect)` 로 시작하고 애니메이션 샘플만 뒤에
+            // 붙인다) 소비자 쪽에 아무 상태도 두지 않고 가를 수 있다는 것이다.
+            webrender::wall_canvas_rect::Lookup::Stale(noted, age)
+                if noted.sample_count <= 1 && webrender::wall_canvas_rect::hold_when_static() =>
+            {
+                note_scissor_gate(ScissorGate::StaleHeld(age));
+                (noted, age)
+            },
             webrender::wall_canvas_rect::Lookup::Stale(_, age) => {
                 note_scissor_gate(ScissorGate::Stale(age));
                 return None;
@@ -2266,6 +2738,8 @@ impl WebGLThread {
         // 밀었고, 그러자 띠가 반대쪽 경계로 넘어갔다(log_webgl_perf_01/38).
         let hold_ms = hold.as_millis() as u64;
         let (wanted, used) = noted.union_over(age, age + 2 * hold_ms + SWAP_TO_COMPOSITE_MS);
+        // 면적과 lead 샘플의 오염을 센다. 근거는 `note_scissor_area` 의 doc 주석.
+        note_scissor_area(noted.rect, wanted, noted.sample_count, used);
         // ★폴백을 센다.★ 근거는 `note_table_miss` 의 doc 주석.
         if used == 0 {
             note_table_miss(noted.sample_count);
@@ -2373,6 +2847,8 @@ impl WebGLThread {
                     data.state.tile_scissor_surface = [0, 0, size.width, size.height];
                 }
                 if data.state.tile_scissor != want_tile_scissor {
+                    // 면적이 얼마나 급하게 변하는지 잰다. 근거는 `note_scissor_jump` 의 doc.
+                    note_scissor_jump(data.state.tile_scissor, want_tile_scissor);
                     data.state.tile_scissor = want_tile_scissor;
                     data.state.restore_scissor_invariant(&data.gl);
                 }
@@ -2457,9 +2933,24 @@ impl WebGLThread {
                     // ★clear 실패도 삼키지 않고 넘어간다.★ 근거는 위 `swap_buffers` 의
                     // 주석과 같다 -- 지우지 못한 프레임은 묵은 그림이 남을 뿐이고, 스레드가
                     // 죽는 것과는 비교가 되지 않는다.
-                    if let Err(error) =
-                        swap_chain.clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
-                    {
+                    // ★타일 영역만 지울 수 있다★(`gfx_wall_webgl_tile_scissor_clear`,
+                    // 기본 꺼짐). 이 백엔드는 자기 타일만 쓰므로 나머지를 지울 이유가
+                    // 없고, 벽에서 그 차이가 크다 -- 서피스 한 장이 199MB 이고 백엔드가
+                    // 넷이다.
+                    //
+                    // ★셰이딩 scissor 와 같은 사각형을 쓴다★(`want_tile_scissor`). 그래서
+                    // 지우는 영역과 그리는 영역이 정확히 같고 둘이 어긋날 수 없다. 근거는
+                    // 그 pref 의 doc 주석 -- 요점은 2026-11-10 에 제거된 이유(scissor 가
+                    // 틀렸다)가 `lead 8` 실기 확인으로 사라졌다는 것이다.
+                    let clear_scissor =
+                        want_tile_scissor.filter(|_| webrender::wall_canvas_rect::tile_clear());
+                    if let Err(error) = swap_chain.clear_surface(
+                        &data.device,
+                        &mut data.ctx,
+                        &data.gl,
+                        clear_color,
+                        clear_scissor,
+                    ) {
                         note_swap_failure(surface_id, "clear_surface", &format!("{error:?}"));
                     }
                     debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);

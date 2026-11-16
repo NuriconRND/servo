@@ -1564,6 +1564,47 @@ impl Renderer {
     }
 
     /// Unbind the draw target for debug / profiler overlays, if required.
+    /// HUD 를 그리지 않은 프레임에, 이전에 그린 overlay 를 합성 목록에 다시 넣는다.
+    ///
+    /// `unbind_debug_overlay` 에서 ★`compositor.unbind` 를 뺀 것★ 이다 -- bind 를 하지
+    /// 않았으므로 unbind 해서는 안 되고, 필요한 것은 `add_surface` 뿐이다.
+    ///
+    /// ## 왜 (2026-11-13, 68 번)
+    ///
+    /// `gfx_wall_hud_draw_every` 로 HUD 를 15 프레임마다 그리게 하자 judder 는 사라졌지만
+    /// 운영자가 "HUD의 표출이 유지되지 않고 ★심하게 깜박임★" 이라고 보고했다. 내가 걸었던
+    /// 전제 -- "bind 하지 않으면 DComp 타일의 이전 내용이 유지된다" -- 가 틀렸다.
+    ///
+    /// 내용은 유지된다. 빠진 것은 ★합성 참여★ 다. `add_surface` 는 그 프레임에 표시할
+    /// 서피스 목록에 overlay 를 넣는 호출이고, compositor 는 매 프레임 그 목록을 새로
+    /// 만든다. 그리지 않은 14 프레임은 그 호출이 없으니 목록에서 빠져 사라진다.
+    ///
+    /// `Draw` 경로는 할 일이 없다(원래도 `unbind_debug_overlay` 가 아무것도 하지 않는다).
+    /// `Layer` 경로는 `present_layer` 가 bind-present 대칭이므로 bind 없이 부르지 않는다 --
+    /// 이 프로젝트의 벽은 `Native`(DComp) 경로다.
+    fn readd_debug_overlay_surface(&mut self) {
+        if !self.debug_overlay_state.is_enabled {
+            return;
+        }
+        let CompositorKind::Native { .. } = self.current_compositor_kind else {
+            return;
+        };
+        let Some(surface_size) = self.debug_overlay_state.current_size else {
+            return;
+        };
+        let compositor = self.compositor_config.compositor().unwrap();
+        let clip_rect = DeviceIntRect::from_size(surface_size);
+        compositor.add_surface(
+            &mut self.device,
+            NativeSurfaceId::DEBUG_OVERLAY,
+            CompositorSurfaceTransform::identity(),
+            clip_rect,
+            ImageRendering::Auto,
+            clip_rect,
+            ClipRadius::EMPTY,
+        );
+    }
+
     fn unbind_debug_overlay(&mut self) {
         // Debug overlay setup are only required in native compositing mode
         if self.debug_overlay_state.is_enabled {
@@ -1612,6 +1653,10 @@ impl Renderer {
         self.profile.end_time_if_started(profiler::FRAME_SEND_TIME);
         self.profile.start_time(profiler::RENDERER_TIME);
 
+        // ★render_impl 을 네 구간으로 쪼갠다.★ 근거는 `wall_render_split` 의 doc 주석 --
+        // 62 번에서 `draws=0 upload=0.00MB` 인 프레임이 54ms 걸렸고, 작업량이 없는데 시간이
+        // 가는 자리를 찾아야 한다.
+        let split_at = crate::wall_render_split::start();
         self.staging_texture_pool.begin_frame();
 
         let compositor_kind = active_doc.frame.composite_state.compositor_kind;
@@ -1701,18 +1746,21 @@ impl Renderer {
                     "Cleared texture cache without sending new document frame.");
         }
 
+        crate::wall_render_split::mark_enter(split_at);
         match self.prepare_gpu_cache(&frame.deferred_resolves) {
             Ok(..) => {
                 assert!(frame.gpu_cache_frame_id <= self.gpu_cache_frame_id,
                     "Received frame depends on a later GPU cache epoch ({:?}) than one we received last via `UpdateGpuCache` ({:?})",
                     frame.gpu_cache_frame_id, self.gpu_cache_frame_id);
 
+                crate::wall_render_split::mark_gpu(split_at);
                 self.draw_frame(
                     frame,
                     device_size,
                     buffer_age,
                     &mut results,
                 );
+                crate::wall_render_split::mark_draw(split_at);
 
                 // TODO(nical): do this automatically by selecting counters in the wr profiler
                 // Profile marker for the number of invalidated picture cache
@@ -1736,9 +1784,11 @@ impl Renderer {
         }
 
         self.unlock_external_images(&frame.deferred_resolves);
+        crate::wall_render_split::mark_unlock(split_at);
 
         let _gm = self.gpu_profiler.start_marker("end frame");
         self.gpu_profiler.end_frame();
+        crate::wall_render_split::mark_endf(split_at);
 
         let t = self.profile.end_time(profiler::RENDERER_TIME);
         self.profile.end_time_if_started(profiler::TOTAL_FRAME_CPU_TIME);
@@ -1749,7 +1799,12 @@ impl Renderer {
             self.profile.set(profiler::FRAME_TIME, time);
         }
 
-        let debug_overlay = device_size.and_then(|device_size| {
+        // ★HUD 를 N 프레임마다 그린다.★ 근거는 `wall_render_split::should_draw_hud` 의 doc --
+        // 67 번에서 HUD 를 켜면 `device.end_frame` 의 p50 이 18314us, 끄면 275us 였고, 그것은
+        // 드라이버 명령 큐 포화다. 안 그리는 프레임에는 ***bind 조차 하지 않는다*** -- 그래야
+        // DComp 타일의 이전 내용이 유지된다.
+        let draw_hud = crate::wall_render_split::should_draw_hud();
+        let debug_overlay = device_size.filter(|_| draw_hud).and_then(|device_size| {
             // Bind a surface to draw the debug / profiler information to.
             self.bind_debug_overlay(device_size).map(|draw_target| {
                 self.draw_render_target_debug(&draw_target);
@@ -1762,6 +1817,9 @@ impl Renderer {
             })
         });
 
+        // ★debug_overlay 가 끝났다.★ 이 안에 DComp `BeginDraw`(`compositor.bind`)가 있고,
+        // 64 번에서 HUD 를 끄니 `tail` p50 이 17787us -> 253us 로 떨어졌다.
+        crate::wall_render_split::mark_overlay(split_at);
         Telemetry::record_renderer_time(Duration::from_micros((t * 1000.00) as u64));
         if self.profile.get(profiler::SHADER_BUILD_TIME).is_none() {
           Telemetry::record_renderer_time_no_sc(Duration::from_micros((t * 1000.00) as u64));
@@ -1837,6 +1895,8 @@ impl Renderer {
         self.texture_resolver.update_profile(&mut self.profile);
 
         // Note: this clears the values in self.profile.
+        // 여기까지가 CPU 집계. 아래부터 HUD 를 실제로 그린다.
+        crate::wall_render_split::mark_prof(split_at);
         self.profiler.set_counters(&mut self.profile);
 
         // If debugger is enabled, collect any profiler updates before value is overwritten
@@ -1848,9 +1908,22 @@ impl Renderer {
         );
 
         // Note: profile counters must be set before this or they will count for next frame.
+        // ★fps 카운터는 매 프레임 돌려야 한다.★ `update()` 가
+        // `frame_timestamps_within_last_second.push(now)` 를 하므로, 이것을 HUD 주기로
+        // 게이트하면 fps 가 그 주기로 나뉘어 표시된다 -- 69 번에서 운영자가
+        // "fps가 -HudDrawEvery 15 를 divisor로 한 값을 따라감 (4fps)" 으로 보고했다.
+        //
+        // 비용은 없다 -- 이 구간은 실측 `prof p50 0us, max 1us` 이고 GL 호출이
+        // 없는 CPU 작업뿐이다. judder 는 드라이버 명령 큐 포화였으므로 여기엔
+        // 해당하지 않는다. 게이트는 실제로 GL 을 만지는 세 곳에만 남긴다.
         self.profiler.update();
 
-        if self.debug_flags.intersects(DebugFlags::PROFILER_DBG | DebugFlags::PROFILER_CAPTURE) {
+        // ★HUD 텍스트를 쌓는 자리도 같은 주기로 게이트한다.★ 근거는 `should_draw_hud` 의 doc.
+        if draw_hud
+            && self
+                .debug_flags
+                .intersects(DebugFlags::PROFILER_DBG | DebugFlags::PROFILER_CAPTURE)
+        {
             if let Some(device_size) = device_size {
                 //TODO: take device/pixel ratio into equation?
                 if let Some(debug_renderer) = self.debug.get_mut(&mut self.device) {
@@ -1867,7 +1940,7 @@ impl Renderer {
             self.device.echo_driver_messages();
         }
 
-        if let Some(debug_renderer) = self.debug.try_get_mut() {
+        if let Some(debug_renderer) = self.debug.try_get_mut().filter(|_| draw_hud) {
             let small_screen = self.debug_flags.contains(DebugFlags::SMALL_SCREEN);
             let scale = if small_screen { 1.6 } else { 1.0 };
             // TODO(gw): Tidy this up so that compositor config integrates better
@@ -1886,8 +1959,14 @@ impl Renderer {
             );
         }
 
+        // ★HUD 그리기가 끝났다.★ `dbg` 가 크면 그리기 자체이고, `overlay` 가 크면 DComp
+        // 경합이다 -- 그 둘이 HUD 수정 방향을 가른다.
+        crate::wall_render_split::mark_dbg(split_at);
+        // ★셋을 가른다.★ 66 번에서 `endf3` 가 p50 3264us, max 338201us(= 338ms)였다.
         self.staging_texture_pool.end_frame(&mut self.device);
+        crate::wall_render_split::mark_staging(split_at);
         self.texture_upload_pbo_pool.end_frame(&mut self.device);
+        crate::wall_render_split::mark_pbo(split_at);
         self.device.end_frame();
 
         if debug_overlay.is_some() {
@@ -1896,6 +1975,13 @@ impl Renderer {
             // Unbind the target for the debug overlay. No debug or profiler drawing
             // can occur afer this point.
             self.unbind_debug_overlay();
+        } else if !draw_hud {
+            // ★그리지 않은 프레임도 합성 목록에는 넣는다.★ 68 번에서 HUD 가 "심하게 깜박임"
+            // 이었던 이유가 이것이다 -- `unbind_debug_overlay` 안의 `add_surface` 가 overlay 를
+            // 그 프레임의 합성 목록에 넣는데, compositor 는 매 프레임 목록을 새로 만들기
+            // 때문에 부르지 않은 프레임에서는 overlay 가 사라진다. 서피스 ***내용은*** 남아
+            // 있으므로, 다시 넣어 주기만 하면 이전에 그린 HUD 가 계속 보인다.
+            self.readd_debug_overlay_surface();
         }
 
         if device_size.is_some() {
@@ -1919,7 +2005,15 @@ impl Renderer {
         self.documents_seen.clear();
         self.shared_texture_cache_cleared = false;
 
+        // ★render_impl 의 끝에서 꼬리 구간을 닫는다.★ `mark_unlock` 뒤로 약 200 줄이 더
+        // 가고 그 안에 `update_gpu_profile` 의 블로킹 GPU 쿼리(`GL_QUERY_RESULT`)가 있다.
+        // 63 번에서 wr 합이 draw 의 20.1% 밖에 설명하지 못한 것이 이 구간이다.
+        // ★end_frame 셋이 끝났다.★ 아래 `check_gl_errors` 의 `glGetError` 가 드라이버를
+        // 동기화하므로 그 둘을 가른다 -- 65 번에서 `tail` p50 이 HUD 켜짐 17500us 대 꺼짐
+        // 245us 였고, 그 구간에 이 둘뿐이다.
+        crate::wall_render_split::mark_endf3(split_at);
         self.check_gl_errors();
+        crate::wall_render_split::mark_tail(split_at);
 
         if self.renderer_errors.is_empty() {
             Ok(results)
@@ -1928,6 +2022,9 @@ impl Renderer {
         }
     }
 
+    /// `render_impl` 의 끝에서 꼬리 구간을 닫는다. 근거는 `wall_render_split` 의 모듈 주석 --
+    /// `mark_unlock` 뒤로 약 200 줄이 더 가고 그 안에 `update_gpu_profile` 의 블로킹 GPU
+    /// 쿼리가 있다.
     fn update_gpu_profile(&mut self, device_size: DeviceIntSize) {
         let _gm = self.gpu_profiler.start_marker("build samples");
         // Block CPU waiting for last frame's GPU profiles to arrive.
@@ -2196,7 +2293,19 @@ impl Renderer {
         );
     }
 
+    /// `glGetError` 로 `OUT_OF_MEMORY` 를 본다. ★주기를 둔다★ -- 2026-11-13.
+    ///
+    /// `glGetError` 는 드라이버의 미처리 명령을 flush 하고 ***동기화***한다. 65 번에서 HUD 를
+    /// 켜면 이 자리(`tail`)의 p50 이 17500us 였고 끄면 245us 였다 -- HUD 가 추가한 GL 명령을
+    /// 이 호출이 전부 기다린 것이다. 작업량이 같은 프레임(`draws=3`)이 41ms 가 되는 이유다.
+    ///
+    /// 매 프레임 전체 파이프라인을 동기화하면서 OOM 하나를 보는 것은 대가가 너무 크므로 주기로
+    /// 바꿨다. 기본 60(1 초마다)이면 감지는 유지되고 비용은 1/60 이다. 1 은 앞 판 동작이고
+    /// 0 은 완전히 끈다. 근거는 `wall_render_split::gl_error_check_every` 의 doc 주석.
     fn check_gl_errors(&mut self) {
+        if !crate::wall_render_split::should_check_gl_errors() {
+            return;
+        }
         let err = self.device.gl().get_error();
         if err == gl::OUT_OF_MEMORY {
             self.renderer_errors.push(RendererError::OutOfMemory);
@@ -5597,6 +5706,9 @@ impl Renderer {
 
     pub fn set_debug_flags(&mut self, flags: DebugFlags) {
         if let Some(enabled) = flag_changed(self.debug_flags, flags, DebugFlags::GPU_TIME_QUERIES) {
+            // ★그 값을 로그에 남긴다.★ 근거는 `wall_render_split::note_gpu_timers` 의 doc --
+            // `tail` 구간의 블로킹 쿼리(`GL_QUERY_RESULT`)는 이 플래그가 켜져 있을 때만 돈다.
+            crate::wall_render_split::note_gpu_timers(enabled);
             if enabled {
                 self.gpu_profiler.enable_timers();
             } else {

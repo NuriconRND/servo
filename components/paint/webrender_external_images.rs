@@ -116,10 +116,9 @@ impl WebGLExternalImages {
         let surface_id = WebGLSurfaceId::new(id, self.painter_id);
         debug!("... locking chain {:?} for surface {:?}", id, surface_id);
 
-        {
-            let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-            *busy_webgl_context_map.entry(surface_id).or_default() += 1;
-        }
+        // ★painter 별 샤드로 간다.★ 근거는 `WebGLContextBusyMap` 의 doc 주석 -- 앞 판은
+        // painter 4 개가 하나의 `RwLock` 을 공유해 프레임마다 초당 480 회 write 로 잡았다.
+        self.busy_webgl_context_map.mark_busy(surface_id);
 
         let Some(swap_chain) = self.swap_chains.get(surface_id) else {
             // ★스왑체인이 없다 = 이 컨텍스트의 백엔드를 놓아 둔 상태★ — 그런데 방금 WR 이
@@ -345,17 +344,7 @@ impl WebGLExternalImages {
     }
 
     fn mark_surface_not_busy(&self, surface_id: WebGLSurfaceId) {
-        let mut busy_webgl_context_map = self.busy_webgl_context_map.write();
-        let Some(count) = busy_webgl_context_map.get_mut(&surface_id) else {
-            warn!("WebGL external image busy counter underflow: missing entry for {surface_id:?}");
-            return;
-        };
-
-        if *count == 0 {
-            warn!("WebGL external image busy counter underflow: zero count for {surface_id:?}");
-        } else {
-            *count -= 1;
-        }
+        self.busy_webgl_context_map.mark_not_busy(surface_id);
     }
 
     fn unlock_swap_chain(&mut self, id: WebGLContextId) -> Option<()> {
@@ -385,12 +374,21 @@ impl WebGLExternalImages {
         // keeping lock/unlock balanced.
         self.mark_surface_not_busy(surface_id);
 
+        // ★세 단계를 가른다.★ 근거는 `note_unlock_cost` 의 doc 주석 -- 65 번에서 HUD 를 끈 뒤
+        // 남은 꼬리를 `unlock` 이 지배했고(p50 6637us, max 55285us) 그 안에 `ReleaseSync` 가
+        // 있다. 어느 단계인지 알아야 고칠 수 있다.
+        let at = Instant::now();
         let destroyed = self.rendering_context.destroy_texture(locked_front_buffer);
+        let destroy_us = at.elapsed().as_micros() as u64;
         let locked_front_buffer = destroyed?;
 
+        let at = Instant::now();
         self.recycle_or_forget(surface_id, locked_front_buffer)?;
+        let recycle_us = at.elapsed().as_micros() as u64;
 
+        let at = Instant::now();
         let _ = self.webgl_threads.finished_rendering_to_context(surface_id);
+        note_unlock_steps(destroy_us, recycle_us, at.elapsed().as_micros() as u64);
 
         Some(())
     }
@@ -431,7 +429,118 @@ impl WebGLExternalImages {
 /// 25ns 이므로 240 lock/s 에서 18us/s 다. 꼬리 줄은 8ms 이상일 때만 나오고 실측 빈도가
 /// ***초당 0.2 회***라 I/O 가 문제되지 않는다. `swap_buffers` 쪽에 시계 하나가 더 늘었다
 /// (240/s = 6us/s).
+/// `ExternalImageHandler::unlock` 한 번의 비용. 꼬리(>= 2ms)는 그때그때, 나머지는 1200 회마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// `lock` 쪽은 `LOCKWAIT`(요약)와 `LOCKTAIL`(꼬리)이 `chain`/`tex` 를 재는데 ★`unlock` 쪽은
+/// 비어 있었다.★ 64 번에서 `-ProfilerHud "FPS"` 를 빼니 judder 가 사라지고(운영자 육안) 꼬리가
+/// 305 건 -> 19 건으로 줄었는데, ***그 19 건을 `unlock` 이 지배한다***
+/// (p50 12.5ms, p90 56.7ms, max 76.3ms). 그리고 그 프레임들은 `draws=3 upload=0.63MB
+/// full_paint=true` 로 실제 작업이 있는 프레임이다.
+///
+/// `unlock_swap_chain` 안에 `ReleaseSync` 가 있고, 그것은 생산자가 그 서피스를 다시 잡을 수
+/// 있게 keyed mutex 를 놓는 일이다. 거기서 수십 ms 가 가면 ★소비자가 생산자를 기다리는 것★
+/// 이므로, 과제 #6 이 `AcquireSync` 로 잘못 겨냥했던 것의 반대편이다.
+///
+/// ## 비용
+///
+/// 이 경로는 이미 `ReleaseSync` 와 GL 호출을 하므로 `Instant::now()` 둘이 무의미하다. 프레임당
+/// 캔버스 수만큼 불린다(실측 240/s 이하).
+/// `unlock_swap_chain` 의 세 단계. 합이 2ms 를 넘으면 그때그때, 나머지는 1200 회마다.
+///
+/// ## 단계 (2026-11-13)
+///
+///     destroy   rendering_context.destroy_texture(locked_front_buffer)
+///     recycle   recycle_or_forget  -- ★여기에 `ReleaseSync` 가 있다★
+///     finish    webgl_threads.finished_rendering_to_context
+///
+/// 65 번에서 HUD 를 끈 뒤 남은 꼬리 31 건을 `unlock` 이 지배했다(p50 6637us, p90 33086us,
+/// max 55285us). 과제 #6 을 11 일 동안 `AcquireSync` 로 겨냥했는데 실제 꼬리는 ***반대편인
+/// `ReleaseSync`*** 다. 어느 단계인지 이 계측이 가른다.
+fn note_unlock_steps(destroy_us: u64, recycle_us: u64, finish_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SUM: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static MAX: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let parts = [destroy_us, recycle_us, finish_us];
+    let total: u64 = parts.iter().sum();
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    for (slot, value) in SUM.iter().zip(parts) {
+        slot.fetch_add(value, Ordering::Relaxed);
+    }
+    for (slot, value) in MAX.iter().zip(parts) {
+        slot.fetch_max(value, Ordering::Relaxed);
+    }
+    if total >= 2_000 {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            "UNLOCKSTEP #{tail} total={total}us destroy={destroy_us}us \
+             recycle={recycle_us}us finish={finish_us}us"
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "UNLOCKSTEPS n={nth} destroy(avg={}us max={}us) recycle(avg={}us max={}us) \
+         finish(avg={}us max={}us) tails={}",
+        SUM[0].swap(0, Ordering::Relaxed) / 1200,
+        MAX[0].swap(0, Ordering::Relaxed),
+        SUM[1].swap(0, Ordering::Relaxed) / 1200,
+        MAX[1].swap(0, Ordering::Relaxed),
+        SUM[2].swap(0, Ordering::Relaxed) / 1200,
+        MAX[2].swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
+fn note_unlock_cost(took: Duration) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SUM_US: AtomicU64 = AtomicU64::new(0);
+    static MAX_US: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let us = took.as_micros() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    SUM_US.fetch_add(us, Ordering::Relaxed);
+    MAX_US.fetch_max(us, Ordering::Relaxed);
+    if took >= Duration::from_millis(2) {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!("UNLOCKTAIL #{tail} took={us}us");
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "UNLOCKCOST n={nth} took(avg={}us max={}us) tails={}",
+        SUM_US.swap(0, Ordering::Relaxed) / 1200,
+        MAX_US.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
+/// WR 이 집어간 외부 이미지의 ★가장 낡은 나이★(ms). `KEEPPREV` 가 읽고 비운다.
+///
+/// `frame_source_probe::CANVAS_STALE_WORST_MS` 와 ★다른 것★ 이다 -- 그쪽은
+/// "`canvas_is_live()` 가 거짓일 때 마지막 캔버스 ***활동*** 으로부터 지난 시간" 이라
+/// 조건부로만 갱신된다. 이쪽은 lock 마다 무조건 갱신되므로 ★생산이 멎은 순간부터 바로
+/// 자란다.★
+///
+/// ## 왜 (2026-11-13, 69 번)
+///
+/// 151 에서 재생이 40 초 멎었는데 `KEEPPREV` 10 줄이 전부 `canvas=0 (0.0%)` 였다 -- 150 과
+/// 똑같아서 ★두 로그를 가르지 못한다.★ `canvas=` 는 "이 틱이 캔버스를 기다려 거절됐나" 를
+/// 세는데 정지 상태에서는 애초에 기다리지 않는다(낡은 장을 그냥 쓴다). 그래서 0 이다.
+///
+/// 필요한 것은 ★낡음의 나이★ 이고, 그 값은 이미 `note_lock_wait` 로 들어온다.
+pub(crate) static LOCKED_IMAGE_AGE_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
 fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
+    if let Some(age) = age {
+        LOCKED_IMAGE_AGE_MAX_MS.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
+    }
     /// 꼬리로 보고 한 줄 찍는 기준. 한 주기(16.7ms)의 절반이다.
     const TAIL_US: u64 = 8_000;
 
@@ -469,14 +578,36 @@ fn note_lock_wait(chain: Duration, tex: Duration, age: Option<Duration>) {
     // ★꼬리는 그때그때 한 줄.★ 이 줄이 트리플 버퍼링의 효용을 가른다 -- 근거는 위 doc.
     if tex_us >= TAIL_US {
         let nth = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        // ★위상을 함께 찍는다★ -- 이 사건이 전환의 어디에서 났는지를 ***자기가 들고
+        // 다닌다***. 1 초 타임스탬프로는 "애니메이션 마지막 0.75 초" 와 "끝난 직후" 를
+        // 가를 수 없었다(근거는 `paint_api::animation_phase` 의 doc).
+        //
+        // 판정: 0.7~1.0 에 몰리면 오버슈트 복귀, 1.0 초과면 전환 종료 처리, 고르게
+        // 퍼지면 전환 전체다.
+        // `phase` 는 전환 진행도가 아니다 -- 2026-11-12 실측에서 130 건이 모두
+        // 0.014~0.050 이었다. `paint_animation_phase` 가 DL 빌드 시각을 0 으로, 3 초
+        // horizon 을 분모로 쓰기 때문이고(DL 은 초당 36~60 회 갱신된다), 그래서 아래의
+        // "0.7~1.0 이면 오버슈트 복귀" 는 ***그 범위에 값이 갈 수 없으므로 성립하지
+        // 않는다.*** 잘못 만든 계측이다. 남겨 두는 것은 DL 수명의 대리값으로는 읽히기
+        // 때문이고, 전환 진행도는 `t=` 가 준다.
+        let phase = match paint_api::animation_phase() {
+            Some(phase) => format!("{phase:.3}"),
+            None => "idle".to_owned(),
+        };
+        // 전환 기준 시각으로부터의 경과. 근거는 `surfman` 의 `mark_transition_epoch` doc.
+        // 원자 load 하나다.
+        let at = match surfman::platform::windows::angle::surface::transition_elapsed_ms() {
+            Some(ms) => format!("+{ms}ms"),
+            None => "n/a".to_owned(),
+        };
         match age {
             Some(age) => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us t={at} phase={phase} \
                  surface_age={}us (fresh from producer)",
                 age.as_micros()
             ),
             None => warn!(
-                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us \
+                "LOCKTAIL #{nth} tex={tex_us}us chain={chain_us}us t={at} phase={phase} \
                  surface_age=n/a (recycled, re-present)"
             ),
         }
@@ -514,6 +645,11 @@ impl WebRenderExternalImageApi for WebGLExternalImages {
     }
 
     fn unlock(&mut self, id: u64) {
+        // ★`unlock` 쪽은 한 번도 재지 않았다.★ 근거는 `note_unlock_cost` 의 doc 주석 --
+        // `lock` 쪽은 `LOCKWAIT`/`LOCKTAIL` 이 재는데 이쪽은 비어 있었고, 64 번에서 HUD 를
+        // 끈 뒤 남은 꼬리 19 건을 `unlock` 이 지배했다(p50 12.5ms, max 76.3ms).
+        let started = Instant::now();
         self.unlock_swap_chain(WebGLContextId(id));
+        note_unlock_cost(started.elapsed());
     }
 }

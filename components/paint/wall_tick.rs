@@ -14,7 +14,9 @@
 //! 이것을 못 찾는다. 위 규칙을 떠받치는 타입끼리 한자리에 모아 두어야 규칙을 깨는 변경이
 //! 리뷰에서 눈에 띈다.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// 한 타일이 이번 틱에 한 일.
 ///
@@ -227,6 +229,48 @@ pub(crate) fn decline_may_arm_keep_previous(
 /// 기다리던 캔버스가 화면에 올라갔다" 는 뜻이라, 이미지가 WR 에 닿기 전에 풀면 스크립트가
 /// 합성되지 않은 캔버스 위에서 다음 rAF 를 돈다. ★진입점 무조건 해제는 검토했고 택하지
 /// 않았다.★
+/// 캔버스 ack 자기잠금을 끊는 데드라인. 0 이면 끔(2026-11-13 이전 동작).
+///
+/// `painter` 가 틱마다 싣는다. 읽는 자리는 `Painter::flush_owed_canvas_ack` 하나이고,
+/// 왜 필요한지는 거기 doc 에 있다 -- 69 번에서 재생이 40 초간 영구히 멎었다.
+pub(crate) fn canvas_ack_deadline() -> Duration {
+    Duration::from_millis(ACK_DEADLINE_MS.load(Ordering::Relaxed))
+}
+
+/// `gfx_wall_canvas_ack_deadline_ms` 를 싣는다.
+pub fn set_canvas_ack_deadline_ms(ms: u64) {
+    ACK_DEADLINE_MS.store(ms, Ordering::Relaxed);
+}
+
+static ACK_DEADLINE_MS: AtomicU64 = AtomicU64::new(2_000);
+
+/// 캔버스 빚의 나이를 기록한다. ★최대값이 의미 있는 수치다★ -- 정상이면 rAF 한 바퀴
+/// (ms 단위)이고, 자기잠금이면 끝없이 자란다.
+///
+/// 69 번에는 이 지표가 없어서 "빚이 40 초 묵었다" 를 ★로그에서 직접 읽을 수 없었다.★
+/// 소비자 측 fps(`LOCKWAIT` 의 fresh)로 역산해야 했다. 이제 한 줄로 읽힌다.
+///
+/// 비용: 빚이 있을 때만 불린다. 원자 `fetch_max` 1 + `fetch_add` 1 = 약 20ns.
+pub(crate) fn note_ack_debt(age: Duration) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static MAX_MS: AtomicU64 = AtomicU64::new(0);
+    static SUM_MS: AtomicU64 = AtomicU64::new(0);
+
+    let ms = age.as_millis() as u64;
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    MAX_MS.fetch_max(ms, Ordering::Relaxed);
+    SUM_MS.fetch_add(ms, Ordering::Relaxed);
+    if nth % 1200 != 0 {
+        return;
+    }
+    log::warn!(
+        "ACKDEBT n={nth} age(avg={}ms max={}ms) deadline={}ms",
+        SUM_MS.swap(0, Ordering::Relaxed) / 1200,
+        MAX_MS.swap(0, Ordering::Relaxed),
+        ACK_DEADLINE_MS.load(Ordering::Relaxed),
+    );
+}
+
 pub(crate) fn ack_is_releasable(holds_debt: bool, pending_canvas_images: usize) -> bool {
     holds_debt && pending_canvas_images == 0
 }
@@ -368,12 +412,83 @@ static TICK_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 틱 에지가 났다. ★틱마다 한 번★ -- 타일마다가 아니다. 부르는 자리는 둘이고 어느
 /// 구성에서 어느 쪽이 도는지는 `TICK_SEQ` 의 주석에 있다.
 pub(crate) fn note_tick_edge() {
-    TICK_SEQ.fetch_add(1, Ordering::Release);
+    let seq = TICK_SEQ.fetch_add(1, Ordering::Release);
+    // ★틱 시각도 남긴다.★ 근거는 `nearest_tick` 의 doc 주석 -- 요점은 DL 의 `built_at` 이
+    // 페이싱 틱 시각이므로 그것을 로컬 시계로 ***추정***하는 대신 실제로 기록된 틱 시각을
+    // 쓰면 환산 오차가 사라진다는 것이다.
+    //
+    // `Instant` 는 원자에 담을 수 없으므로 기준점으로부터의 us 를 담는다. 0 은 "빈 칸" 이다.
+    let origin = *TICK_ORIGIN.get_or_init(Instant::now);
+    let at_us = origin.elapsed().as_micros() as u64;
+    TICK_AT[seq as usize % TICK_HISTORY].store(at_us.max(1), Ordering::Relaxed);
+}
+
+/// 애니메이션 기준 시각을 실제 틱 격자로 스냅할지. 기본 켜짐.
+static ZERO_SNAPS_TO_TICK: AtomicBool = AtomicBool::new(false);
+
+/// `gfx_wall_animation_zero_snaps_to_tick` 를 싣는다. `paint` 가 틱마다 부른다.
+pub fn set_animation_zero_snaps_to_tick(enabled: bool) {
+    ZERO_SNAPS_TO_TICK.store(enabled, Ordering::Relaxed);
+}
+
+/// 애니메이션 기준 시각을 실제 틱 격자로 스냅할지. 근거는 `nearest_tick` 의 doc 주석.
+pub(crate) fn animation_zero_snaps_to_tick() -> bool {
+    ZERO_SNAPS_TO_TICK.load(Ordering::Relaxed)
+}
+
+/// 틱 시각 링의 칸 수. 60Hz 에서 1 초 남짓이고, DL 의 전체 지연이 5~30ms 이므로 충분하다.
+const TICK_HISTORY: usize = 64;
+/// 최근 틱들의 시각(`TICK_ORIGIN` 으로부터 us). 0 은 빈 칸.
+static TICK_AT: [AtomicU64; TICK_HISTORY] = [const { AtomicU64::new(0) }; TICK_HISTORY];
+/// `TICK_AT` 의 기준점.
+static TICK_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// `estimate` 에 가장 가까운 실제 틱 시각과 그 거리. 기록이 없으면 `None`.
+///
+/// ## 왜 (2026-11-13)
+///
+/// DL 의 `built_at` 은 페이싱 틱 시각이고(`PaintDisplayListInfo::built_at` 의 doc),
+/// `animation_zero` 는 그것을 `received_at - (now - built_at)` 로 로컬 시계에 환산한다.
+/// 그 차는 "scene build 의 sub-millisecond transit" 이 아니라 ★틱부터 도착까지의 전체
+/// 지연이고 벽에서 5~30ms★ 다. 환산 오차가 DL 마다 다르게 들어가므로, DL 이 WebGL 때문에
+/// 초당 36 회 오면 애니메이션의 기준점이 초당 36 회 흔들린다.
+///
+/// 틱 시각은 ***이미 로컬 시계로 지나간다***(`note_tick_edge`). 그래서 추정값에 가장 가까운
+/// 기록을 쓰면 그 오차가 사라지고 기준점이 격자에 앉는다.
+pub(crate) fn nearest_tick(estimate: Instant) -> Option<(Instant, Duration)> {
+    let origin = *TICK_ORIGIN.get()?;
+    let want = estimate.checked_duration_since(origin)?.as_micros() as u64;
+    let mut best: Option<(u64, u64)> = None;
+    for slot in &TICK_AT {
+        let at = slot.load(Ordering::Relaxed);
+        if at == 0 {
+            continue;
+        }
+        let dist = at.abs_diff(want);
+        if best.is_none_or(|(_, have)| dist < have) {
+            best = Some((at, dist));
+        }
+    }
+    let (at, dist) = best?;
+    Some((
+        origin + Duration::from_micros(at),
+        Duration::from_micros(dist),
+    ))
 }
 
 /// 지금 틱의 번호.
 pub(crate) fn current_tick_seq() -> u64 {
     TICK_SEQ.load(Ordering::Acquire)
+}
+
+/// 지금까지의 틱 에지 수. `frame_source_probe` 가 `PRODUCE` 줄에 함께 찍는다.
+///
+/// `note_tick_edge` 는 `fire_present_tick` 안의 `note_present_tick` 에서 불리고
+/// (`winit_wall/main.rs:1116`), 그 자리는 세 발화 경로(페이싱 / 타이머 / vsync)가 모두
+/// 지난다. 그래서 이 값이 ★셸이 실제로 낸 틱 에지의 수★ 이고, `PRODUCE calls` 와 같은
+/// 기준점·같은 구간에서 비교되면 48.8/s 의 손실이 셸 안인지 그 앞인지 가른다.
+pub(crate) fn tick_edge_count() -> u64 {
+    TICK_SEQ.load(Ordering::Relaxed)
 }
 
 /// ★타일 하나가 틱 하나에 쓸 수 있는 외부 서피스 표출 예산.★

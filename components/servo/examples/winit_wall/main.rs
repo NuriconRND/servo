@@ -1374,6 +1374,35 @@ impl ApplicationHandler<WakerEvent> for App {
             vec![config.tile_index]
         };
 
+        // ★분모를 로그에 박는다.★ 2026-11-12, 운영자 지시.
+        //
+        // 개발 장비와 테스트 장비가 다른 것이 주로 ***GPU 수와 그에 종속된 값들***이고
+        // (타일 수, painter 수, 레이아웃), 그 값을 기억으로 들고 수치를 해석하면 틀린다.
+        // 이 세션에서 분모를 네 번 틀렸다 -- 누적값 미차분, 런 길이 미보정, `phase` 의
+        // 분모, 그리고 `DLARRIVE` 가 네 painter 에 브로드캐스트되는 배수.
+        //
+        // 그리고 ★어느 divisor 가 걸리는지★ 를 함께 찍는다. WebGL 구성은
+        // `TickCadence::LiveCanvas` 로 분류되므로 `gfx_wall_live_canvas_tick_divisor` 를
+        // 타고, 명령줄로 준 `gfx_paint_side_animation_tick_divisor` 는 적용되지 않는다 --
+        // 2026-11-12 조사에서 드러났고, 운영자가 15 를 주고 있었는데 걸리지 않고 있었다.
+        //
+        // `log` 가 아니라 `eprintln!` 인 이유는 아래 주석과 같다 -- 토폴로지 해석이
+        // `servo.setup_logging()` 보다 앞이다.
+        eprintln!(
+            "WALLSHAPE tiles={} painters={} refresh={}Hz overlap={}px virtual={}x{} \
+             all_tiles={} tile_index={} divisor(paint_side={} live_canvas={})",
+            config.layout.tiles.len(),
+            tile_indices.len(),
+            config.preferences.gfx_refresh_hz,
+            config.layout.overlap_px,
+            config.layout.virtual_viewport.width,
+            config.layout.virtual_viewport.height,
+            config.all_tiles,
+            config.tile_index,
+            config.preferences.gfx_paint_side_animation_tick_divisor,
+            config.preferences.gfx_wall_live_canvas_tick_divisor,
+        );
+
         // 1) Resolve the physical display topology once. Each tile's `display` is a spatial
         //    index (top-left = 0, row-major); the GPU is the adapter that drives that display.
         let spatial = spatial_order(&enumerate_display_topology());

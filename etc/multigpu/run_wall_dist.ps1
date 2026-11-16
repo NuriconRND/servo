@@ -503,6 +503,198 @@ param(
     #   Verdict metric: the SCISSORGATE line -- applied%, and per-reason counts when it is not
     #   applied (no_key / missing / stale / no_isect).
     [switch] $WebglTileScissorFromWebrender,
+    # gfx_wall_webgl_tile_scissor_clear -- make the post-swap clear wipe only the tile rect
+    # instead of the whole surface. Default off. 2026-11-12.
+    #
+    # Requires -WebglTileScissorFromWebrender (without it there is no rect to use).
+    #
+    # What it is for: the surface-acquire tails (LOCKTAIL, >=8ms, max 82ms) are being
+    # chased, and the producer holds the surface's keyed mutex for a whole canvas frame --
+    # from the bind in swap_buffers to the unbind in the next swap -- with a 199MB
+    # full-surface clear inside that window.
+    #
+    # The arithmetic argues AGAINST that being the cause: 11520x4320x4 = 199MB over
+    # ~448GB/s is 0.44ms, 1-2ms with depth and stencil. So this switch is also a way to
+    # RULE THE HYPOTHESIS OUT -- if on and off look the same, the clear is not the cause.
+    #
+    # This was in the tree once (e9e28284b31) and removed on 2026-11-10 because the
+    # scissor rect itself was wrong then; lead 8 fixed that (run 39).
+    [switch] $WebglTileScissorClear,
+    # gfx_wall_webgl_deferred_front_buffer -- hand the consumer a front buffer that is ONE
+    # FRAME OLD instead of the newest one. Default off. 2026-11-12.
+    #
+    # Why: the producer holds a surface's DXGI keyed mutex for a WHOLE canvas frame (the
+    # AcquireSync in bind_surface_to_context through the ReleaseSync in the next swap's
+    # unbind), and the consumer's AcquireSync waits for that surface's GPU work to retire.
+    # Taking the NEWEST surface therefore can mean waiting on work just submitted.
+    #
+    # swap_buffers also puts the old front buffer into the recycle pool and then, on the
+    # next line, picks a size-matching one as the new back buffer -- so it can re-take the
+    # surface it just recycled. 43 of 412 tails... precisely, 180 of 412 were on recycled
+    # surfaces, which this explains.
+    #
+    # Cost: +1 frame of presentation latency (16.7ms at 60Hz) and 2 -> 3 surfaces per
+    # backend (+199MB each on this wall). The queue is latest-wins: if it fills, the front
+    # entry is dropped rather than queueing stale frames.
+    #
+    # Verdict: if the tails shrink a lot the cause is confirmed and the cost gets weighed;
+    # if they do not, this axis is ruled out and the producer's own draw work remains.
+    # Watch for visible latency too -- the bounce would appear one frame late.
+    [switch] $WebglDeferredFrontBuffer,
+    # gfx_wall_webgl_scissor_hold_when_static -- keep a stale scissor rect when the canvas
+    # is NOT animating, instead of dropping it and shading the whole surface. ON by default;
+    # this switch turns it OFF. 2026-11-12.
+    #
+    # Why: WR only records the rect while building a display list, so once a transition ends
+    # and the screen goes still, the picture holding the canvas is not re-rastered and the
+    # rect ages out (run 53: age_max 1263ms). Dropping it turns the scissor off, and then all
+    # four tiles shade the entire canvas -- 8Mpx average against 49.8Mpx full, a 6x swing,
+    # happening on 24% of scissor changes (to_none 696 of 6000). The frame cost oscillates,
+    # which is the judder.
+    #
+    # A stale rect from a still canvas is still correct -- nothing moved, so nothing changed.
+    # The evidence is in the data: picture.rs starts the table with (0, rect) and only appends
+    # animation samples, so sample_count == 1 is WR saying "no animation on this canvas". A
+    # moving canvas has 2 or more and never qualifies, so this cannot shade less than it
+    # should (no black band).
+    [switch] $NoScissorHoldWhenStatic,
+    # gfx_wall_webgl_tile_scissor_from_tile_geometry -- derive the scissor from the TILE
+    # GEOMETRY (the old path) instead of from what WebRender recorded. Off by default.
+    # 2026-11-13.
+    #
+    # Why: the old flag (gfx_wall_webgl_tile_scissor) and this implementation were removed
+    # in c3450a9364b on operator instruction; 39 commits later the ticker judders again in
+    # the 4-tile-fullscreen + ticker configuration that the old flag had fixed.
+    #
+    # Run 55 (121) says the RECTANGLE is still right: base 12.4Mpx matches a quarter tile,
+    # union 12.4Mpx, widened=0, samples all 1, apply rate 99.60%, AcquireSync tails 0.07%.
+    # So the regression is one of those 39 commits, and bisecting costs six field runs.
+    # This flag splits the axis in ONE run:
+    #   judder gone with the old path -> the scissor path is the cause; narrow inside it
+    #   judder stays                  -> not the scissor; bisect the 39 commits
+    #
+    # Cost: the old path reads the tile geometry directly, so there is no lookup, no age and
+    # no window -- and it leaves EMPTY SPACE during transition animations, which is exactly
+    # why the widening work (20ee1a167ab onward) was done. Known trade-off for this A/B.
+    #   -WebglTileScissorFromTileGeometry
+    [switch] $WebglTileScissorFromTileGeometry,
+    # gfx_wall_animation_zero_snaps_to_tick -- snap the paint-side animation origin to the
+    # ACTUAL tick grid instead of estimating it from two clocks. OFF by default -- the field
+    # DISPROVED it (log_webgl_perf_01/59); this switch turns it ON for comparison. 2026-11-13.
+    #
+    # Why: handle_new_display_list replaces every running paint-side animation on EVERY
+    # display list and recomputes the origin as received_at - (now - built_at). built_at is
+    # the pacing tick instant, and that difference is not the sub-millisecond scene-build
+    # transit but the whole tick-to-arrival latency -- routinely 5-30 ms on the wall. The
+    # conversion error therefore lands differently on every list.
+    #
+    # With WebGL on the page the lists arrive ~36 times a second (DLARRIVE avg 28ms), so the
+    # animation origin shakes 36 times a second. Without WebGL the paint-side divisor of 15
+    # means four lists a second, which is too rare to see -- matching the operator report
+    # that the ticker is clean once WebGL is removed. Production and render are both 60Hz
+    # (PRODUCE window edges=60.0/s calls=60.0/s), so it is the ORIGIN that jitters, not the
+    # frame count. This code is identical in the a47204b3335 control, which is why run 58
+    # juddered there too.
+    #
+    # WHY IT IS OFF: run 128 (on) measured snap(avg=1017us max=8308us) with miss=516 of 4260,
+    # and the operator saw "even in the smoothest stretch the motion is not constant-speed but
+    # oscillating", while run 129 (off) was "like before the change". max=8308us sits on the
+    # 8333us snap limit -- the estimate often lands mid-grid, so which neighbouring tick is
+    # nearer flips on a hair and the origin jumps a whole 16.7ms frame; the 12% that miss use
+    # the estimate, so two kinds of origin get mixed. transit itself measures avg 8ms and
+    # max 64ms, so quantising it to the grid turns variation into a staircase.
+    #
+    # Read it with ANIMZERO: snap avg/max is the distance between estimate and real tick,
+    # clamped counts the 250ms cap binding (display_list.rs promised a TRANSITCLAMP log that
+    # was never implemented), miss counts lists whose tick was not in the 64-slot ring.
+    #   -AnimationZeroSnap
+    [switch] $AnimationZeroSnap,
+    # gfx_wall_webgl_busy_map_single_shard -- keep the busy-counter map on ONE shard, which
+    # is the behaviour before 2026-11-13. Off by default (sharded); this switch turns the old
+    # single-lock behaviour back on for comparison.
+    #
+    # Why it changed: WebGLContextBusyMap counts how many front buffers each painter holds,
+    # and it used to be one Arc<RwLock<HashMap<..>>> shared by all four painters. The path
+    # that hands a canvas to a WebRender frame takes that lock for WRITE every frame
+    # (lock_swap_chain and mark_surface_not_busy in webrender_external_images.rs), so four
+    # painters x (lock + unlock) = about 480 writes a second on a completely exclusive lock,
+    # blocking the other three painters and the WebGL thread. With no WebGL on the page
+    # lock_swap_chain is never called at all, which matches the report that the ticker is
+    # clean once WebGL is removed. LOCKWAIT never measured this lock -- it only covers the
+    # chain mutex and the AcquireSync in the same function.
+    #
+    # surface_id is (context_id, painter_id) and each painter only touches its own, so
+    # sharding by painter removes the write contention. Behaviour is identical: same keys,
+    # same counters, same read conditions -- only the shard differs.
+    #
+    # Read it with BUSYLOCK (tails >= 1ms) and BUSYLOCKS (every 1200 acquisitions): with the
+    # switch ON those numbers are the size of the old contention; OFF they should be ~0.
+    #   -WebglBusyMapSingleShard
+    [switch] $WebglBusyMapSingleShard,
+    # gfx_wall_gl_error_check_every -- how often (in frames) Renderer::check_gl_errors calls
+    # glGetError to look for OUT_OF_MEMORY. DEFAULT 60 (once a second). 1 is the pre-
+    # 2026-11-13 behaviour (every frame), 0 turns it off entirely.
+    #
+    # Why: glGetError flushes the driver's pending commands and SYNCHRONISES. Run 65 split
+    # that section out and measured, in the same configuration, tail p50 17500us with the HUD
+    # on against 245us with it off -- while every other candidate in that section was
+    # innocent (overlay/DComp bind p50 325us, CPU profile aggregation 0us, HUD drawing
+    # p50 73us). So the HUD does not cost what it draws; it costs what glGetError then waits
+    # for, which is why frames with identical workload (draws=3, upload=0.00MB) took 41ms.
+    #
+    # Run 64 had already shown the effect from the outside: dropping -ProfilerHud "FPS" made
+    # the ticker judder disappear and cut over-period frames from 305 to 19. This pref is
+    # what lets the HUD stay on and still behave.
+    #
+    # Read it with RENDERSPLIT: glerr is this call, endf3 is the end_frame trio next to it,
+    # and glerr_every echoes the setting so a log says which value produced it.
+    #   -GlErrorCheckEvery 1    (every frame, for comparison)
+    #   -GlErrorCheckEvery 0    (off)
+    [ValidateRange(0, 600)]
+    [int] $GlErrorCheckEvery = 60,
+    # gfx_wall_hud_draw_every -- how many frames between HUD (ProfilerHud) redraws.
+    # DEFAULT 15, i.e. four times a second at 60Hz. 1 is the pre-2026-11-13 behaviour (every
+    # frame), 0 keeps -ProfilerHud parsing but never draws.
+    #
+    # Why: run 67 ran six arms. With the HUD on, device.end_frame (devf in RENDERSPLIT) had
+    # a p50 of 18314us; with it off, 275us -- a 45x gap, and it did NOT depend on
+    # -GlErrorCheckEvery (the 0 arm juddered just the same). device.end_frame only sets GL
+    # state and never flushes (gl.rs:3757-3782), so 17ms there means the driver command queue
+    # is full and the call is waiting for room. The giveaway is dbg: drawing the HUD itself
+    # is p50 74us but its max is 14ms -- nothing single is slow, every GL call is stalling.
+    #
+    # Four tiles x every frame x text rendering fills that queue. The HUD exists to show fps,
+    # which does not need a 60Hz refresh; 15 reads fine and cuts the GL commands to a
+    # fifteenth. Frames that skip the HUD do not even bind the debug overlay, so the DComp
+    # tile keeps what it already has.
+    #
+    # Read it with RENDERSPLIT: devf should drop below 1ms, and hud_every echoes the setting.
+    #   -ProfilerHud "FPS" -HudDrawEvery 1   (every frame, for comparison)
+    [ValidateRange(0, 600)]
+    [int] $HudDrawEvery = 15,
+    # gfx_wall_canvas_ack_deadline_ms -- deadline that breaks the canvas-ack self-lock.
+    # DEFAULT 2000. 0 restores the pre-2026-11-13 behaviour (no deadline at all).
+    #
+    # Why: in run 69 the 151 arm stopped playing WebGL at 08:51:12 and never recovered --
+    # 40 seconds at 0.1-0.3fps to the end of the log, while the 150 arm (no transitions)
+    # held 29.7-37.1fps throughout. What stopped was the PRODUCER: consumption and display
+    # stayed healthy to the last second (PRODUCE window edges=60.0/s calls=60.0/s miss=0,
+    # 240 locks/s, RENDERSPLIT still printing at 08:51:51), while every producer-side tag
+    # went silent (SCISSORGATE last at 08:51:11, then 41 seconds of nothing).
+    #
+    # The loop is in the code: ack_is_releasable needs pending_canvas_images == 0, the only
+    # normal way to empty that set is an epoch arriving via update_image, and while it is
+    # non-empty script_thread skips the whole document -- so no rAF, no display list, no
+    # WebGL commands, and therefore no chance for the epoch that would unblock it. It is a
+    # closed loop with no timeout. A comment in webgl_thread.rs already named it a
+    # self-locking loop and one path into it was closed on 2026-11-11; run 69 shows another
+    # path is still open. Rather than chase paths one at a time, this deadline drops the
+    # pending set and sends the ack. One frame may show a stale canvas -- better than 40s.
+    #
+    # Read it with ACKSTUCK (the deadline actually fired -- if you see it, a path is still
+    # open and that line is your lead) and ACKDEBT (how long debts are living).
+    [ValidateRange(0, 60000)]
+    [int] $CanvasAckDeadlineMs = 2000,
     # gfx_wall_canvas_scissor_lead_periods -- how far ahead WebRender records the
     # per-time scissor table, in refresh periods. **Default 8** (133ms at 60Hz),
     # 0 turns it off, range 0..12. 2026-11-11.
@@ -1105,7 +1297,7 @@ $argList = @(
     "--pref", "gfx_wall_canvas_defeats_paint_side_throttle=$($CanvasDefeatsThrottle.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_canvas_live_window_ms=$CanvasLiveWindowMs",
     "--pref", "gfx_wall_live_canvas_tick_divisor=$LiveCanvasDivisor",
-    "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_webrender=$($WebglTileScissorFromWebrender.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_canvas_wait_declines_production=$($CanvasWaitDecline.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_webrender=$($WebglTileScissorFromWebrender.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_clear=$($WebglTileScissorClear.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_deferred_front_buffer=$($WebglDeferredFrontBuffer.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_scissor_hold_when_static=$((-not $NoScissorHoldWhenStatic.IsPresent).ToString().ToLower())",    "--pref", "gfx_wall_webgl_tile_scissor_from_tile_geometry=$($WebglTileScissorFromTileGeometry.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_animation_zero_snaps_to_tick=$($AnimationZeroSnap.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_webgl_busy_map_single_shard=$($WebglBusyMapSingleShard.IsPresent.ToString().ToLower())",    "--pref", "gfx_wall_gl_error_check_every=$GlErrorCheckEvery",    "--pref", "gfx_wall_hud_draw_every=$HudDrawEvery",    "--pref", "gfx_wall_canvas_ack_deadline_ms=$CanvasAckDeadlineMs",
     "--pref", "gfx_wall_canvas_scissor_lead_periods=$CanvasScissorLead",
     "--pref", "gfx_refresh_hz=$RefreshHz",
     "--pref", "gfx_wr_picture_tile_size=$TileSize",
@@ -1187,7 +1379,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to end of pass (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$($DcompParallelCommit.IsPresent) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) glerr_every=$GlErrorCheckEvery hud_every=$HudDrawEvery ack_deadline=$CanvasAckDeadlineMs scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

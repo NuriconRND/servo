@@ -39,7 +39,7 @@
 //! 쌓기 비용의 상한은 `tests::noting_a_frame_is_cheap_enough` 가 고정한다.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 리포터가 누적을 찍는 간격.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
@@ -182,6 +182,9 @@ static RENDER_OVER_INTERVAL: AtomicU64 = AtomicU64::new(0);
 const FRAME_PERIOD_NANOS: u64 = 16_667_000;
 
 /// `Paint::produce_wall_frame` 이 불린 횟수. ★틱당 1 이어야 한다.★
+/// 앞 리포트의 틱 에지 수와 생산 호출 수. 구간 차분용이다.
+static PREV_EDGES: AtomicU64 = AtomicU64::new(0);
+static PREV_CALLS: AtomicU64 = AtomicU64::new(0);
 static PRODUCE_CALLS: AtomicU64 = AtomicU64::new(0);
 /// 그중 ★대상 타일이 없어 아무것도 하지 않은★ 횟수(`target_painter_ids.is_empty()`).
 static PRODUCE_NO_TARGETS: AtomicU64 = AtomicU64::new(0);
@@ -249,6 +252,273 @@ pub(crate) fn note_paint_side_judgement(defeated: bool, stale_for: Option<Durati
 }
 
 /// `Painter::render` 한 번의 소요 시간을 쌓는다. ★원자 다섯 이하다.★
+/// `render()` 안을 구간으로 쪼개 잰다. `RENDERCOST` 와 ★같은 범위★ 이므로 합이 그 값과 맞는다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// 측정된 "느림" 이 하나뿐인데 분해가 없었다.
+///
+///     RENDERCOST  58: over_period=258 (1.18%)  ★worst=60.3ms★  <2048us:78.2%
+///                 56: over_period=175 (0.80%)  ★worst=62.1ms★  <2048us:82.1%
+///
+/// 82% 가 2ms 안인데 최악이 60ms -- 60Hz 주기의 ★3.6 배★ 이고 초당 2.3 회 난다. 그런데
+/// `RENDERCOST` 는 전체 시간만 재므로 그 60ms 안에서 무엇이 시간을 쓰는지 아무 데이터도 없다.
+///
+/// 전수 열거 12 자리가 전부 기각된 뒤(마지막 `busy map` 은 60 번에서 앞 판 동작으로도 대기
+/// max 54us) 남은 것은 ***이미 측정된 꼬리를 쪼개는 것*** 이다. ticker 단독과 비교하지 않아도
+/// 60ms 렌더는 그 자체로 결함이다.
+///
+/// ## 구간
+///
+///     lock     angle_gl_lock + make_current + prepare_for_rendering
+///     update   Renderer::update()          -- `UPDATECOST` 가 이미 잰다(free=99.9%)
+///     draw     clear_background + Renderer::render()   ★한 번도 측정 안 됨★
+///     post     screenshots + paint metrics + composite_in_flight 해제
+///     pump     pump_paint_animation(Render)  -- ticker 보간이 여기다
+///     present  RenderingContext::present()  ★한 번도 측정 안 됨★
+///
+/// ## 비용
+///
+/// 경계 여섯에 `Instant::now()` 이고 240/s 이면 약 36us/s 다. 꼬리 줄은 주기(16.67ms)를 넘긴
+/// 프레임에만 나오므로 실측 1.18% = 초당 2.8 줄이다. 꺼져 있으면 `None` 하나다.
+/// 구간 수. 순서는 lock/update/clear/draw/post/pump/present 다.
+const PARTS: usize = 7;
+
+pub(crate) struct RenderSplit {
+    at: Option<Instant>,
+    lock_us: u64,
+    update_us: u64,
+    clear_us: u64,
+    draw_us: u64,
+    post_us: u64,
+    pump_us: u64,
+    /// `Renderer::render` 가 돌려준 통계 중 꼬리 분석에 쓰는 것만. 근거는 `note_stats`.
+    stats: Option<DrawStats>,
+}
+
+/// `RendererStats` 에서 뽑아 둔 값. 전부 그 구조체가 이미 채워 돌려주는 것이다.
+#[derive(Clone, Copy)]
+struct DrawStats {
+    draw_calls: usize,
+    color_targets: usize,
+    alpha_targets: usize,
+    upload_mb: f64,
+    resource_upload_ms: f64,
+    cache_upload_ms: f64,
+    frame_build_ms: f64,
+    full_paint: bool,
+}
+
+impl RenderSplit {
+    pub(crate) fn start() -> Self {
+        Self {
+            at: is_enabled().then(Instant::now),
+            lock_us: 0,
+            update_us: 0,
+            clear_us: 0,
+            draw_us: 0,
+            post_us: 0,
+            pump_us: 0,
+            stats: None,
+        }
+    }
+
+    /// 앞 경계로부터의 경과를 us 로 돌려주고 경계를 지금으로 옮긴다.
+    fn lap(&mut self) -> u64 {
+        let Some(at) = self.at else {
+            return 0;
+        };
+        let now = Instant::now();
+        let us = now.duration_since(at).as_micros() as u64;
+        self.at = Some(now);
+        us
+    }
+
+    pub(crate) fn mark_lock(&mut self) {
+        self.lock_us = self.lap();
+    }
+
+    pub(crate) fn mark_update(&mut self) {
+        self.update_us = self.lap();
+    }
+
+    pub(crate) fn mark_clear(&mut self) {
+        self.clear_us = self.lap();
+    }
+
+    pub(crate) fn mark_draw(&mut self) {
+        self.draw_us = self.lap();
+    }
+
+    /// `Renderer::render` 의 통계를 보관한다. 꼬리 프레임의 줄에 함께 찍는다.
+    ///
+    /// ## 왜 (2026-11-13)
+    ///
+    /// 61 번이 60ms 꼬리를 `draw` 로 좁혔고(꼬리 257 건에서 total 의 95.7%, 최악 프레임은
+    /// 60.8ms 중 60785us), `AcquireSync` 는 아니라고 가렸다(LOCKTAIL 10 건, max 12.8ms).
+    /// 그러면 `Renderer::render` 안이고, 그 안을 가르는 값이 ***이미 반환되고 있었다*** --
+    /// `RenderResults::stats` 를 앞 판이 `let _ =` 로 버렸다.
+    ///
+    /// `draw_calls` 와 `upload_mb` 가 크면 작업량이 늘어난 것이고, 둘이 평시와 같은데 시간만
+    /// 60ms 면 ★GPU 가 밀린 것★ 이다 -- 그때는 WebGL 스레드가 같은 GPU 에 넣은 작업과의
+    /// 경합이고 GPU 타이머 쿼리로 넘어간다.
+    pub(crate) fn note_stats(&mut self, stats: &webrender::RendererStats) {
+        if self.at.is_none() {
+            return;
+        }
+        self.stats = Some(DrawStats {
+            draw_calls: stats.total_draw_calls,
+            color_targets: stats.color_target_count,
+            alpha_targets: stats.alpha_target_count,
+            upload_mb: stats.texture_upload_mb,
+            resource_upload_ms: stats.resource_upload_time,
+            cache_upload_ms: stats.gpu_cache_upload_time,
+            frame_build_ms: stats.frame_build_time,
+            full_paint: stats.full_paint,
+        });
+    }
+
+    pub(crate) fn mark_post(&mut self) {
+        self.post_us = self.lap();
+    }
+
+    pub(crate) fn mark_pump(&mut self) {
+        self.pump_us = self.lap();
+    }
+
+    /// 마지막 구간(`present`)을 닫고 쌓는다.
+    pub(crate) fn finish(&mut self) {
+        if self.at.is_none() {
+            return;
+        }
+        let present_us = self.lap();
+        // WR 안의 네 구간을 가져온다. 근거는 `webrender::wall_render_split` 의 모듈 주석 --
+        // 62 번에서 `draws=0 upload=0.00MB` 인 프레임이 54ms 걸렸으므로 그 기다림이
+        // `render_impl` 의 어느 자리인지 가른다.
+        let wr = webrender::wall_render_split::take();
+        note_render_split(
+            [
+                self.lock_us,
+                self.update_us,
+                self.clear_us,
+                self.draw_us,
+                self.post_us,
+                self.pump_us,
+                present_us,
+            ],
+            self.stats,
+            wr,
+        );
+    }
+}
+
+/// 구간 일곱의 합계·최댓값과, 주기를 넘긴 프레임의 내역. 근거는 `RenderSplit` 의 doc 주석.
+fn note_render_split(
+    parts: [u64; PARTS],
+    stats: Option<DrawStats>,
+    wr: webrender::wall_render_split::Split,
+) {
+    static SUM: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+    static MAX: [AtomicU64; PARTS] = [const { AtomicU64::new(0) }; PARTS];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static OVER: AtomicU64 = AtomicU64::new(0);
+
+    let total: u64 = parts.iter().sum();
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    for (slot, value) in SUM.iter().zip(parts) {
+        slot.fetch_add(value, Ordering::Relaxed);
+    }
+    for (slot, value) in MAX.iter().zip(parts) {
+        slot.fetch_max(value, Ordering::Relaxed);
+    }
+
+    // 주기를 넘긴 프레임만 그때그때 찍는다 -- 실측 1.07% 이므로 초당 2.6 줄이다.
+    const PERIOD_US: u64 = 16_667;
+    if total > PERIOD_US {
+        let over = OVER.fetch_add(1, Ordering::Relaxed) + 1;
+        let [lock, update, clear, draw, post, pump, present] = parts;
+        // ★통계를 함께 찍는다★ -- `draw` 가 60ms 일 때 작업량이 늘었는지 GPU 가 밀렸는지
+        // 가르는 값이고, `Renderer::render` 가 이미 돌려주던 것이다.
+        let detail = match stats {
+            Some(st) => format!(
+                " draws={} targets={}/{} upload={:.2}MB res_upload={:.2}ms \
+                 cache_upload={:.2}ms build={:.2}ms full_paint={}",
+                st.draw_calls,
+                st.color_targets,
+                st.alpha_targets,
+                st.upload_mb,
+                st.resource_upload_ms,
+                st.cache_upload_ms,
+                st.frame_build_ms,
+                st.full_paint,
+            ),
+            None => String::from(" stats=n/a"),
+        };
+        // ★WR 안의 여섯 구간과 경계 밖으로 샌 시간★.
+        //
+        // `rest` 는 `draw` 에서 wr 합을 뺀 값이다 -- 63 번에서 wr 합이 `draw` 의 20.1% 밖에
+        // 설명하지 못했고(꼬리 317 건 중 264 건이 50% 미만), 그 구멍이 `mark_unlock` 뒤
+        // 약 200 줄이었다. 이제 `tail` 이 그것을 덮지만, 이른 반환이나 내가 놓친 경로가
+        // 남아 있어도 `rest` 가 숨기지 않는다.
+        let wr_sum = wr.enter_us
+            + wr.gpu_us
+            + wr.draw_us
+            + wr.unlock_us
+            + wr.endf_us
+            + wr.overlay_us
+            + wr.prof_us
+            + wr.dbg_us
+            + wr.staging_us
+            + wr.pbo_us
+            + wr.endf3_us
+            + wr.tail_us;
+        let inside = format!(
+            " wr(enter={}us gpu={}us draw={}us unlock={}us endf={}us overlay={}us              prof={}us dbg={}us staging={}us pbo={}us devf={}us glerr={}us rest={}us \
+             gpu_timers={} \
+             glerr_every={} hud_every={})",
+            wr.enter_us,
+            wr.gpu_us,
+            wr.draw_us,
+            wr.unlock_us,
+            wr.endf_us,
+            wr.overlay_us,
+            wr.prof_us,
+            wr.dbg_us,
+            wr.staging_us,
+            wr.pbo_us,
+            wr.endf3_us,
+            wr.tail_us,
+            parts[3].saturating_sub(wr_sum),
+            wr.gpu_timers,
+            webrender::wall_render_split::gl_error_check_every(),
+            webrender::wall_render_split::hud_draw_every(),
+        );
+        log::warn!(
+            "RENDERSPLIT #{over} total={:.1}ms lock={lock}us update={update}us clear={clear}us \
+             draw={draw}us post={post}us pump={pump}us present={present}us{inside}{detail}",
+            total as f64 / 1000.0,
+        );
+    }
+
+    if nth % 1200 != 0 {
+        return;
+    }
+    const NAMES: [&str; PARTS] = ["lock", "update", "clear", "draw", "post", "pump", "present"];
+    let mut line = String::with_capacity(260);
+    line.push_str(&format!(
+        "RENDERSPLITS n={nth} over={}",
+        OVER.load(Ordering::Relaxed)
+    ));
+    for ((name, sum), max) in NAMES.iter().zip(&SUM).zip(&MAX) {
+        line.push_str(&format!(
+            " {name}(avg={}us max={}us)",
+            sum.swap(0, Ordering::Relaxed) / 1200,
+            max.swap(0, Ordering::Relaxed),
+        ));
+    }
+    log::warn!("{line}");
+}
+
 pub(crate) fn note_render_duration(elapsed: Duration) {
     if !is_enabled() {
         return;
@@ -453,10 +723,11 @@ fn report(elapsed: Duration) {
         }
     };
     log::warn!(
-        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%) behind={behind} ({:.1}%) canvas={canvas} ({:.1}%)",
+        "KEEPPREV t={secs:.0}s attempts={attempts} generated={tick} ({:.1}%) behind={behind} ({:.1}%) canvas={canvas} ({:.1}%) locked_age_max={}ms",
         share(tick),
         share(behind),
         share(canvas),
+        crate::webrender_external_images::LOCKED_IMAGE_AGE_MAX_MS.swap(0, Ordering::Relaxed),
     );
 
     // ★paint 측 판정★ -- 깎임 후보와, 캔버스 신호가 그것을 되돌린 비율.
@@ -502,6 +773,11 @@ fn report(elapsed: Duration) {
             over as f64 * 100.0 / render_total as f64,
         );
     }
+    // 애니메이션 기준 시각의 흔들림. 근거는 `web_content_animation::note_animation_zero`.
+    // ★`PRODUCE` 와 독립이다★ -- 생산이 없는 구간에도 DL 은 올 수 있다.
+    if let Some(line) = crate::web_content_animation::animation_zero_report(secs) {
+        log::warn!("{line}");
+    }
     // ★호출 수를 직접 센다★ -- KEEPPREV 의 attempts 는 유도값이라 199 대 240 을 설명하지
     // 못했다. 틱당 호출 1, 호출당 타일 4 가 기대값이다.
     let calls = PRODUCE_CALLS.load(Ordering::Relaxed);
@@ -510,11 +786,28 @@ fn report(elapsed: Duration) {
         let no_targets = PRODUCE_NO_TARGETS.load(Ordering::Relaxed);
         let held = PRODUCE_HELD.load(Ordering::Relaxed);
         let none = OUTCOME_NONE.load(Ordering::Relaxed);
+        // ★틱 에지 수를 함께 찍는다.★ 근거는 `wall_tick::tick_edge_count` 의 doc 주석 --
+        // 요점은 `pacing 발화`(`tick_phase_probe`)와 이 줄은 기준점이 달라 직접 뺄 수 없고,
+        // 같은 리포트 안에서만 손실 구간을 가를 수 있다는 것이다.
+        //
+        // 구간 차분도 함께 낸다 -- 시작 과도구간이 누적 평균을 가리지 않게 한다.
+        let edges = crate::wall_tick::tick_edge_count();
+        let prev_edges = PREV_EDGES.swap(edges, Ordering::Relaxed);
+        let prev_calls = PREV_CALLS.swap(calls, Ordering::Relaxed);
+        let d_edges = edges.saturating_sub(prev_edges);
+        let d_calls = calls.saturating_sub(prev_calls);
+        let window = REPORT_EVERY.as_secs_f64().max(1e-9);
         log::warn!(
-            "PRODUCE t={secs:.0}s calls={calls} ({:.1}/s) targets={targets} ({:.1}/s)              per_call={:.2} no_targets={no_targets} held={held} outcome_none={none}",
+            "PRODUCE t={secs:.0}s calls={calls} ({:.1}/s) targets={targets} ({:.1}/s) \
+             per_call={:.2} no_targets={no_targets} held={held} outcome_none={none} \
+             edges={edges} ({:.1}/s) window(edges={:.1}/s calls={:.1}/s miss={})",
             calls as f64 / secs,
             targets as f64 / secs,
             targets as f64 / calls as f64,
+            edges as f64 / secs,
+            d_edges as f64 / window,
+            d_calls as f64 / window,
+            d_edges.saturating_sub(d_calls),
         );
     }
 }

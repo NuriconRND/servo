@@ -31,7 +31,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winapi::Interface;
 use winapi::shared::dxgi::IDXGIKeyedMutex;
 use winapi::shared::winerror::{self, S_OK};
@@ -237,6 +237,232 @@ static IMPORT_LIVE: AtomicU64 = AtomicU64::new(0);
 /// GPU 메모리가 안 내려올 때 가장 먼저 확인할 것이 free 가 정말 불렸는지이고, 지금까지
 /// 그것을 세는 곳이 없었다. 서피스 하나가 벽 크기면 190MB 라, 몇 개가 남았는지가 곧
 /// 몇 백 MB 인지다.
+/// 전환의 기준 시각. 새 WebGL 컨텍스트가 만들어질 때 옮겨진다.
+///
+/// `Instant` 는 원자에 담을 수 없으므로 프로세스 기준점으로부터의 ms 를 담는다. 0 은
+/// "아직 없음" 이다.
+static TRANSITION_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+/// `TRANSITION_EPOCH_MS` 가 세는 기준점.
+static TRANSITION_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+/// 전환의 기준 시각을 지금으로 옮긴다. 새 WebGL 컨텍스트를 만들 때 부른다.
+///
+/// ## 왜 컨텍스트인가 (2026-11-12)
+///
+/// 운영자 질문은 "바운스 후반과 종료 직후에 무슨 일이 일어나나" 이고, 그것을 보려면 전환
+/// 수명 안의 상대 시각이 필요하다. `LOCKTAIL` 의 `phase` 는 그 일을 못 한다 -- DL 빌드
+/// 시각을 0 으로, 3 초 horizon 을 분모로 쓰기 때문에 실측 130 건이 모두 0.014~0.050 에
+/// 갇혔다(근거는 `web_content_animation.rs::paint_animation_phase`).
+///
+/// DL 에 전환의 시작도 길이도 실려 있지 않으므로 대신 컨텍스트 수명을 쓴다. 운영자 관찰이
+/// "WebGL 구성끼리 전환할 때만 멈칫한다" 이므로 기준점도 그쪽이 맞다.
+pub fn mark_transition_epoch() {
+    let origin = *TRANSITION_ORIGIN.get_or_init(Instant::now);
+    let now_ms = origin.elapsed().as_millis() as u64;
+    // 0 은 "없음" 이므로 1 로 올린다. 1ms 의 오차는 이 계측의 관심사가 아니다.
+    TRANSITION_EPOCH_MS.store(now_ms.max(1), Ordering::Relaxed);
+}
+
+/// 지금이 전환 기준 시각으로부터 몇 ms 인지. 기준이 없으면 `None`.
+pub fn transition_elapsed_ms() -> Option<u64> {
+    let epoch = TRANSITION_EPOCH_MS.load(Ordering::Relaxed);
+    if epoch == 0 {
+        return None;
+    }
+    let origin = *TRANSITION_ORIGIN.get_or_init(Instant::now);
+    Some(origin.elapsed().as_millis().saturating_sub(epoch as u128) as u64)
+}
+
+/// 전환 수명의 어느 사분면에서 서피스가 만들어지고 파괴됐는지. `[<250, <750, <1500, 그 뒤]`.
+///
+/// 경계는 전환 애니메이션이 1.5 초 내외라는 관찰에 맞춘 고정값이다. 길이를 모르므로 비율이
+/// 아니라 절대 시각으로 가른다 -- 바뀌면 경계를 옮기면 된다.
+static SURF_CREATE_PHASE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SURF_DESTROY_PHASE: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+/// 사분면별 누적 소요 ms (할당/파괴). 평균을 내기 위한 것이다.
+static SURF_CREATE_US: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SURF_DESTROY_US: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// `destroy_surface` 는 이른 `return` 이 여러 개라 끝에서 재는 대신 `Drop` 으로 잡는다.
+struct SurfaceLifeGuard {
+    started: Instant,
+    size: Option<(i32, i32)>,
+}
+
+impl Drop for SurfaceLifeGuard {
+    fn drop(&mut self) {
+        note_surface_life(false, self.started.elapsed(), self.size);
+    }
+}
+
+/// 전환 수명의 사분면. ★경계는 bounce 애니메이션(2500ms)에 맞춰져 있다.★
+///
+/// 2026-11-13 에 고쳤다. 종전 경계는 `0-249 / 250-749 / 750-1499 / 그 뒤` 로 "전환이 1.5 초
+/// 내외" 라는 관찰에 맞춰져 있었는데, 69 번 로그가 전환 효과를 직접 적는다 --
+/// `[handover][전환 시작] {"kind":"swap","효과":"bounce/left/2500ms"}` (19 회 전부). 그래서
+/// 종전 경계로는 ★애니메이션 전체가 마지막 한 칸에 뭉쳐★ 결정적 순간이 보이지 않았다
+/// (151 의 `after(create=17 destroy=179)`).
+///
+/// 새 경계는 ★시작 / 진행 중 / 끝 / 그 뒤★ 다. 꼬리가 끝에 몰린다는 것이 이미 다른
+/// 지표로 나와 있으므로(`LOCKTAIL` 84 건 중 53 건이 t=2500~2749ms), 그 칸을 따로 둔다.
+/// 핸드오버가 66~113ms 걸리므로 실제 종료는 t≈2620ms 다 -- 2400~2799 가 그것을 담는다.
+fn transition_quadrant(elapsed_ms: u64) -> usize {
+    match elapsed_ms {
+        0..=249 => 0,
+        250..=2399 => 1,
+        2400..=2799 => 2,
+        _ => 3,
+    }
+}
+
+/// 서피스 한 건의 할당/파괴를 전환 수명에 자리매김한다.
+///
+/// 꼬리(>= `SURFLIFE_TAIL_MS`)는 그때그때 한 줄, 나머지는 사분면 요약에만 들어간다. 요약은
+/// `SURFIMPORT` 줄에 함께 나간다.
+/// `destroy_surface_texture` 의 두 자리. 합이 2ms 를 넘으면 그때그때, 나머지는 1200 회마다.
+///
+/// ## 왜 (2026-11-13)
+///
+/// 66 번에서 `unlock` 의 세 단계 중 ★`destroy` 가 전부★ 였다.
+///
+///     꼬리 109 건:  destroy p50 8265us max 42245us
+///                   recycle p50 3us    max 1065us   <- ReleaseSync, 무죄
+///                   finish  p50 0us    max 1us
+///
+/// `destroy_surface_texture` 의 두 자리는 `temporarily_make_context_current`(컨텍스트 전환)와
+/// EGL `ReleaseTexImage`(해제)다. 전환이면 ANGLE 이 `eglMakeCurrent` 에서 동기화하는 것이고,
+/// 해제면 드라이버가 그 텍스처의 GPU 작업을 기다리는 것이다 -- ★고치는 방향이 다르다.★
+///
+/// 세 단계는 이것이다.
+///
+///     make_current      temporarily_make_context_current  ANGLE 컨텍스트 전환
+///     release_teximage  EGL ReleaseTexImage               EGL 해제
+///     ★release_sync★   keyed_mutex.ReleaseSync(0)        ★DXGI keyed mutex 해제★
+///
+/// 마지막이 크면 과제 #6 이 겨냥한 keyed mutex 가 맞지만 ★획득(`AcquireSync`)이 아니라
+/// 해제★ 쪽이다. 내가 앞서 `ReleaseSync` 를 `recycle_or_forget` 에 있다고 본 것은 틀렸고,
+/// 그래서 `UNLOCKSTEPS` 의 `recycle` 이 3us 로 나왔다 -- 거기엔 없었다.
+///
+/// `imported` 는 캐시 적중 경로(`release_imported_surface`)인지다. `SURFIMPORT reused=99%`
+/// 이므로 거의 참이어야 한다.
+fn note_destroy_steps(imported: bool, current_us: u64, release_us: u64, sync_us: u64) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static IMPORTED: AtomicU64 = AtomicU64::new(0);
+    static CURRENT_SUM: AtomicU64 = AtomicU64::new(0);
+    static CURRENT_MAX: AtomicU64 = AtomicU64::new(0);
+    static RELEASE_SUM: AtomicU64 = AtomicU64::new(0);
+    static RELEASE_MAX: AtomicU64 = AtomicU64::new(0);
+    static SYNC_SUM: AtomicU64 = AtomicU64::new(0);
+    static SYNC_MAX: AtomicU64 = AtomicU64::new(0);
+    static TAILS: AtomicU64 = AtomicU64::new(0);
+
+    let nth = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if imported {
+        IMPORTED.fetch_add(1, Ordering::Relaxed);
+    }
+    CURRENT_SUM.fetch_add(current_us, Ordering::Relaxed);
+    CURRENT_MAX.fetch_max(current_us, Ordering::Relaxed);
+    RELEASE_SUM.fetch_add(release_us, Ordering::Relaxed);
+    RELEASE_MAX.fetch_max(release_us, Ordering::Relaxed);
+    SYNC_SUM.fetch_add(sync_us, Ordering::Relaxed);
+    SYNC_MAX.fetch_max(sync_us, Ordering::Relaxed);
+    if current_us + release_us + sync_us >= 2_000 {
+        let tail = TAILS.fetch_add(1, Ordering::Relaxed) + 1;
+        // ★전환 축에 정렬한다.★ 69 번에서 `LOCKTAIL` 의 `t=` 덕에 꼬리가 bounce 끝
+        // (t≈2620ms)에 몰린다는 것이 드러났는데, `DESTROYSTEP` 에는 그 축이 없어 1 초
+        // 해상도 타임스탬프로 추정해야 했다. 비용은 꼬리 분기 안이라 사실상 0 이다
+        // (relaxed load 1 + OnceLock get 1 + elapsed 1 = 약 30ns).
+        let at = match transition_elapsed_ms() {
+            Some(ms) => format!("+{ms}ms"),
+            None => "n/a".to_string(),
+        };
+        warn!(
+            "DESTROYSTEP #{tail} imported={imported} make_current={current_us}us \
+             release_teximage={release_us}us release_sync={sync_us}us t={at}"
+        );
+    }
+    if nth % 1200 != 0 {
+        return;
+    }
+    warn!(
+        "DESTROYSTEPS n={nth} imported={} make_current(avg={}us max={}us) \
+         release_teximage(avg={}us max={}us) release_sync(avg={}us max={}us) tails={}",
+        IMPORTED.swap(0, Ordering::Relaxed),
+        CURRENT_SUM.swap(0, Ordering::Relaxed) / 1200,
+        CURRENT_MAX.swap(0, Ordering::Relaxed),
+        RELEASE_SUM.swap(0, Ordering::Relaxed) / 1200,
+        RELEASE_MAX.swap(0, Ordering::Relaxed),
+        SYNC_SUM.swap(0, Ordering::Relaxed) / 1200,
+        SYNC_MAX.swap(0, Ordering::Relaxed),
+        TAILS.load(Ordering::Relaxed),
+    );
+}
+
+fn note_surface_life(created: bool, took: Duration, size: Option<(i32, i32)>) {
+    let Some(elapsed_ms) = transition_elapsed_ms() else {
+        return;
+    };
+    let q = transition_quadrant(elapsed_ms);
+    let took_us = took.as_micros() as u64;
+    let (count, accum) = if created {
+        (&SURF_CREATE_PHASE[q], &SURF_CREATE_US[q])
+    } else {
+        (&SURF_DESTROY_PHASE[q], &SURF_DESTROY_US[q])
+    };
+    count.fetch_add(1, Ordering::Relaxed);
+    accum.fetch_add(took_us, Ordering::Relaxed);
+    const SURFLIFE_TAIL_MS: u128 = 4;
+    if took.as_millis() >= SURFLIFE_TAIL_MS {
+        let what = if created { "create" } else { "destroy" };
+        match size {
+            Some((w, h)) => {
+                warn!("SURFLIFE {what} t=+{elapsed_ms}ms took={took_us}us size={w}x{h}")
+            },
+            None => warn!("SURFLIFE {what} t=+{elapsed_ms}ms took={took_us}us"),
+        }
+    }
+}
+
+/// 사분면 요약 한 줄. `SURFIMPORT` 와 같은 주기로 나간다.
+fn surface_phase_report() -> String {
+    let mut out = String::with_capacity(160);
+    out.push_str("SURFPHASE");
+    const LABEL: [&str; 4] = ["<250ms", "<750ms", "<1500ms", "after"];
+    for q in 0..4 {
+        let cn = SURF_CREATE_PHASE[q].load(Ordering::Relaxed);
+        let cu = SURF_CREATE_US[q].load(Ordering::Relaxed);
+        let dn = SURF_DESTROY_PHASE[q].load(Ordering::Relaxed);
+        let du = SURF_DESTROY_US[q].load(Ordering::Relaxed);
+        let cavg = if cn > 0 { cu / cn } else { 0 };
+        let davg = if dn > 0 { du / dn } else { 0 };
+        out.push_str(&format!(
+            " {}(create={} avg={}us destroy={} avg={}us)",
+            LABEL[q], cn, cavg, dn, davg
+        ));
+    }
+    out
+}
+
 static SURFACES_CREATED: AtomicU64 = AtomicU64::new(0);
 static SURFACES_DESTROYED: AtomicU64 = AtomicU64::new(0);
 
@@ -368,6 +594,9 @@ fn note_import_timing(open_ns: u64, pbuffer_ns: u64, query_ns: u64, acquire_ns: 
         ms(IMPORT_ACQUIRE_NS.load(Ordering::Relaxed)),
         ms(IMPORT_REST_NS.load(Ordering::Relaxed)),
     );
+    // 전환 수명의 어느 사분면에서 서피스가 만들어지고 파괴되는지. 근거는
+    // `surface_phase_report` 의 doc.
+    warn!("{}", surface_phase_report());
 }
 
 impl Device {
@@ -383,12 +612,21 @@ impl Device {
     ) -> Result<Surface, Error> {
         SURFACES_CREATED.fetch_add(1, Ordering::Relaxed);
         SURFACE_ORIGINS[take_surface_origin()].fetch_add(1, Ordering::Relaxed);
-        match surface_type {
+        // 전환 수명 안의 자리와 소요 시간을 잰다. 근거는 `mark_transition_epoch` 의 doc.
+        // 이 경로는 벽 크기에서 199MB 를 만지므로 `Instant::now()` 두 번은 무의미하다.
+        let started = Instant::now();
+        let noted_size = match surface_type {
+            SurfaceType::Generic { ref size } => Some((size.width, size.height)),
+            SurfaceType::Widget { .. } => None,
+        };
+        let outcome = match surface_type {
             SurfaceType::Generic { ref size } => self.create_pbuffer_surface(context, size, None),
             SurfaceType::Widget { ref native_widget } => {
                 self.create_window_surface(context, native_widget)
             },
-        }
+        };
+        note_surface_life(true, started.elapsed(), noted_size);
+        outcome
     }
 
     #[allow(non_snake_case)]
@@ -1042,6 +1280,13 @@ impl Device {
             return Err(Error::IncompatibleSurface);
         }
         SURFACES_DESTROYED.fetch_add(1, Ordering::Relaxed);
+        // 파괴도 전환 수명에 자리매김한다 -- 운영자 관찰("종료 직후 멈칫")이 겨냥하는 쪽이다.
+        let destroy_started = Instant::now();
+        let destroy_size = Some((surface.size.width, surface.size.height));
+        let _destroy_guard = SurfaceLifeGuard {
+            started: destroy_started,
+            size: destroy_size,
+        };
 
         // ★서피스가 사라지면 그 핸들로 들여온 것도 죽는다.★ 리사이즈 등으로 스왑체인이
         // 서피스를 버리는데 캐시가 남아 있으면, 다음 프레임이 이미 파괴된 EGL 서피스를
@@ -1092,10 +1337,16 @@ impl Device {
         mut surface_texture: SurfaceTexture,
     ) -> Result<Surface, (Error, SurfaceTexture)> {
         unsafe {
+            // ★두 자리를 각각 잰다.★ 근거는 `note_destroy_steps` 의 doc 주석 -- 66 번에서
+            // `destroy` 가 꼬리 109 건의 p50 8265us, max 42245us 였고 `ReleaseSync` 는 3us
+            // 였다. 컨텍스트 전환인지 EGL 해제인지 가른다.
+            let at = Instant::now();
             let _guard = match self.temporarily_make_context_current(context) {
                 Ok(guard) => guard,
                 Err(error) => return Err((error, surface_texture)),
             };
+            let current_us = at.elapsed().as_micros() as u64;
+            let at = Instant::now();
             let released = EGL_FUNCTIONS.with(|egl| {
                 if egl.ReleaseTexImage(
                     self.egl_display,
@@ -1109,13 +1360,25 @@ impl Device {
                 }
                 Ok(())
             });
+            let release_us = at.elapsed().as_micros() as u64;
             if let Err(error) = released {
+                note_destroy_steps(true, current_us, release_us, 0);
                 return Err((error, surface_texture));
             }
+            // ★`ReleaseSync` 가 여기 있다.★ 내가 앞서 `recycle_or_forget` 에 있다고 한 것은
+            // 틀렸다 -- keyed mutex 해제는 이 경로 안이고, 그래서 `destroy` 단계에 포함된다.
+            // 그것이 `UNLOCKSTEPS` 의 `recycle` 이 3us 로 무죄였던 이유다.
+            let at = Instant::now();
             if let Some(ref keyed_mutex) = surface_texture.local_keyed_mutex {
                 let result = keyed_mutex.ReleaseSync(0);
                 assert_eq!(result, S_OK);
             }
+            note_destroy_steps(
+                true,
+                current_us,
+                release_us,
+                at.elapsed().as_micros() as u64,
+            );
         }
 
         // 이 핸들들은 캐시의 것이다 — `SurfaceTexture` 가 떨어지면서 지우지 않도록 비운다.
