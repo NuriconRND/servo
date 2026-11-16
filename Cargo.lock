@@ -7943,6 +7943,7 @@ dependencies = [
 name = "servo-config"
 version = "0.3.0"
 dependencies = [
+ "log",
  "serde",
  "serde_json",
  "servo-config-macro",

@@ -2416,6 +2416,8 @@ impl Compositor for DCompNativeCompositor {
         tile_size: DeviceIntSize,
         is_opaque: bool,
     ) {
+        // ★2026-11-16 WALLEVENT★ -- 슬라이스가 생길 때의 시각과 비용(성공 경로만 찍는다).
+        let wall_timer = servo_config::wall_event::Timer::start();
         let Some(dcomp_device) = self.dcomp_device_ptr() else {
             return;
         };
@@ -2487,6 +2489,11 @@ impl Compositor for DCompNativeCompositor {
         // ★낡음(2026-07-13 기록, AddVisual 은 2026-07-14 `461ee73dc2c`·RemoveAllVisuals 는 2026-10-21 `25eb69bdf0d` 이후 무효)★ — 지금은 둘 다 `end_frame`(:5105, :5131)이다.
         // 비주얼은 매 프레임 begin_frame(RemoveAllVisuals) 후 add_surface에서 트리에 추가한다.
         self.surfaces.insert(id, entry);
+        // extra = 이 슬라이스의 picture cache 타일 크기(kpx).
+        wall_timer.finish(
+            servo_config::wall_event::Kind::DcompCreateSurface,
+            (tile_size.width.max(0) as u32).saturating_mul(tile_size.height.max(0) as u32) / 1000,
+        );
     }
 
     fn create_tile(&mut self, _device: &mut Device, id: NativeTileId) {
@@ -3327,11 +3334,17 @@ impl Compositor for DCompNativeCompositor {
                 None => continue,
             };
             let size = extent.size();
+            // ★2026-11-16 WALLEVENT★ -- 승격(swap chain 생성)의 시각과 비용, extra = kpx.
+            let wall_timer = servo_config::wall_event::Timer::start();
             let Some(swapchain) = self.create_composition_swapchain(size, is_opaque, 2) else {
                 // 생성 실패 → 이후 승격 영구 중단(Virtual 유지). helper가 warn 1회를 남긴다.
                 self.warned_promote_fail = true;
                 continue;
             };
+            wall_timer.finish(
+                servo_config::wall_event::Kind::DcompPromote,
+                (size.width.max(0) as u32).saturating_mul(size.height.max(0) as u32) / 1000,
+            );
             let Some(entry) = self.surfaces.get_mut(&surface_id) else {
                 continue;
             };
@@ -3379,6 +3392,8 @@ impl Compositor for DCompNativeCompositor {
                 None => continue,
             };
             let size = extent.size();
+            // ★2026-11-16 WALLEVENT★ -- swap chain 재생성(크기 변경)의 시각과 비용, extra = kpx.
+            let wall_timer = servo_config::wall_event::Timer::start();
             let Some(swapchain) = self.create_composition_swapchain(size, is_opaque, 2) else {
                 // 재생성 실패 → 이후 regen 영구 중단(옛 콘텐츠 동결 표시). warn 1회.
                 warn!(
@@ -3388,6 +3403,10 @@ impl Compositor for DCompNativeCompositor {
                 self.warned_regen_fail = true;
                 continue;
             };
+            wall_timer.finish(
+                servo_config::wall_event::Kind::DcompRegen,
+                (size.width.max(0) as u32).saturating_mul(size.height.max(0) as u32) / 1000,
+            );
             if let Some(entry) = self.surfaces.get_mut(&surface_id) {
                 if let SurfaceStorage::SwapChain(sc) = &mut entry.storage {
                     release_frame_pbuffer(&rc, sc);
@@ -3479,6 +3498,8 @@ impl Compositor for DCompNativeCompositor {
                 continue;
             };
 
+            // ★2026-11-16 WALLEVENT★ -- 강등(가상 서피스로 되돌리며 buffer 0 복사)의 시각과 비용.
+            let wall_timer = servo_config::wall_event::Timer::start();
             let seeded = if !sc.content_attached && sc.fallback_virtual.is_some() {
                 // §6.2-1: fallback_virtual 생존 — 누적 더티 영역(타일 단위, 과대 안전)만
                 // buffer 0에서 복사해 최신화. visual은 계속 fallback을 표시하므로 끊김 없음.
@@ -3497,6 +3518,7 @@ impl Compositor for DCompNativeCompositor {
                     virtual_offset,
                 )
             };
+            wall_timer.finish(servo_config::wall_event::Kind::DcompDemote, 0);
             let Some(new_virtual) = seeded else {
                 if !sc.warned_demote_seed_fail {
                     warn!(
@@ -3616,6 +3638,8 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn destroy_surface(&mut self, _device: &mut Device, id: NativeSurfaceId) {
+        // ★2026-11-16 WALLEVENT★ -- 슬라이스가 사라질 때의 시각과 비용(Release 포함).
+        let wall_timer = servo_config::wall_event::Timer::start();
         // 방어적: 이 서피스가 mid-bind면(정상 흐름에선 없음) EndDraw 없이 bound 상태를 정리.
         if self
             .bound
@@ -3637,6 +3661,7 @@ impl Compositor for DCompNativeCompositor {
         }
         // remove → ComOwned Drop이 visual + storage(virtual_surface 또는 swapchain/fallback)를 Release.
         self.surfaces.remove(&id);
+        wall_timer.finish(servo_config::wall_event::Kind::DcompDestroySurface, 0);
     }
 
     fn create_external_surface(

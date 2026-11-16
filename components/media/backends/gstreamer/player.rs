@@ -2706,14 +2706,21 @@ static PLAYER_DISPOSAL: LazyLock<Sender<(usize, StreamType, Arc<Mutex<PlayerInne
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner())
                             .recv();
-                        let Ok((_id, _stream_type, inner)) = next else {
+                        let Ok((_id, stream_type, inner)) = next else {
                             return;
                         };
+                        // ★2026-11-16 WALLEVENT★ -- 실제 해체(shut_down + 마지막 참조 놓기)의
+                        // 시각과 비용. 보드 교체의 바운스 후반과 겹치는지 보기 위한 것이다.
+                        let wall_timer = servo_config::wall_event::Timer::start();
                         inner
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner())
                             .shut_down();
                         drop(inner);
+                        wall_timer.finish(
+                            servo_config::wall_event::Kind::MediaDispose,
+                            wall_event_stream_code(stream_type),
+                        );
                     }
                 });
         }
@@ -2728,11 +2735,26 @@ fn dispose_player_inner_off_thread(
     inner: Arc<Mutex<PlayerInner>>,
 ) {
     if let Err(returned) = PLAYER_DISPOSAL.send((id, stream_type, inner)) {
-        let (_, _, inner) = returned.0;
+        let (_, stream_type, inner) = returned.0;
+        let wall_timer = servo_config::wall_event::Timer::start();
         inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .shut_down();
+        drop(inner);
+        wall_timer.finish(
+            servo_config::wall_event::Kind::MediaDispose,
+            wall_event_stream_code(stream_type),
+        );
+    }
+}
+
+/// `WALLEVENT media.dispose` 의 extra (2026-11-16): 0 Stream, 1 Seekable, 2 NetworkUri.
+fn wall_event_stream_code(stream_type: StreamType) -> u32 {
+    match stream_type {
+        StreamType::Stream => 0,
+        StreamType::Seekable => 1,
+        StreamType::NetworkUri => 2,
     }
 }
 

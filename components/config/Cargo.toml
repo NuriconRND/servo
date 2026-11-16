@@ -14,6 +14,7 @@ name = "servo_config"
 path = "lib.rs"
 
 [dependencies]
+log = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 servo-config-macro = { workspace = true }

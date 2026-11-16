@@ -784,6 +784,13 @@ impl Painter {
             webrender::wall_tex_probe::start();
         }
 
+        // ★2026-11-16 이벤트 시각 프로브★ -- 미디어·DComp 의 드문 무거운 일에 시각을 찍는다.
+        // 링은 servo_config 에 있어 script(미디어)·paint(DComp)·미디어 백엔드(해체)가 함께 쓴다.
+        // 리포터는 한 번만 뜬다.
+        if pref!(gfx_wall_event_probe) {
+            servo_config::wall_event::start();
+        }
+
         // ★프레임 발행 출처★ -- `gfx_wall_tick_phase_probe` 와 한 스위치를 쓴다(`-TickPhase`).
         // 둘 다 "프레임 생산이 단일한가" 를 보는 계측이라 따로 켤 이유가 없다.
         if pref!(gfx_wall_tick_phase_probe) {

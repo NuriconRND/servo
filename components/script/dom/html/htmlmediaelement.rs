@@ -2856,6 +2856,8 @@ impl HTMLMediaElement {
         let pipeline_id = window.pipeline_id();
         let client_context_id =
             ClientContextId::build(pipeline_id.namespace_id.0, pipeline_id.index.0.get());
+        // ★2026-11-16 WALLEVENT★ -- 보드 교체 시각과 맞춰 볼 플레이어 생성 시각과 비용.
+        let wall_timer = servo_config::wall_event::Timer::start();
         let player = ServoMedia::get().create_player(
             &client_context_id,
             stream_type,
@@ -2867,6 +2869,7 @@ impl HTMLMediaElement {
             // `NetworkUri` player; `None` for the AppSrc-fed Seekable/Stream path.
             network_uri,
         );
+        wall_timer.finish(servo_config::wall_event::Kind::MediaCreate, 0);
         let player_id = {
             let player_guard = player.lock().unwrap();
 
@@ -3045,9 +3048,13 @@ impl HTMLMediaElement {
         // 다음 줄에서 그 객체를 놓으면 그 스레드가 이미 해제된 데이터를 만진다(실측 스택
         // 두 개, log_presentation/07·08). 놓기만 하면 백엔드가 `Drop` 에서 큐를 쓰지 않는
         // 방식으로 정리한다(`PlayerInner::shut_down`).
+        // ★2026-11-16 WALLEVENT★ -- 스크립트 스레드에서 플레이어를 놓는 데 드는 시각과 비용.
+        // 나가는 보드의 비디오가 문서에서 빠질 때(`release_player_while_detached`)도 여기다.
+        let wall_timer = servo_config::wall_event::Timer::start();
         *self.player.borrow_mut() = None;
         self.video_renderer.lock().unwrap().reset();
         *self.event_handler.borrow_mut() = None;
+        wall_timer.finish(servo_config::wall_event::Kind::MediaRelease, 0);
 
         if let Some(video_element) = self.downcast::<HTMLVideoElement>() {
             video_element.set_natural_dimensions(None, None);
