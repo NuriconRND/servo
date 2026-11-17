@@ -1743,6 +1743,37 @@ impl Painter {
         self.send_owed_canvas_ack();
     }
 
+    /// [`Self::release_owed_canvas_ack`] 와 같고, 풀었으면 알린 파이프라인을 돌려준다(2026-11-17,
+    /// 분리 모드 전용). 메인이 그것을 모아 바쁜 타일에 "이미 풀린 대기" 로 넘긴다
+    /// (`Paint::release_owed_canvas_acks`). 결합 모드는 이 함수를 부르지 않는다 -- 목록을 복제하는
+    /// 할당이 틱 경로에 생기지 않게 하려는 것이다.
+    pub(crate) fn release_owed_canvas_ack_pipelines(&mut self) -> Vec<PipelineId> {
+        if !ack_is_releasable(
+            self.frame_delayer.is_holding_ack(),
+            self.frame_delayer.pending_canvas_image_count(),
+        ) {
+            return Vec::new();
+        }
+        if self.consume_canvas_ack_skip() {
+            return Vec::new();
+        }
+        let waiting_pipelines = self.frame_delayer.take_waiting_pipelines();
+        self.send_to_constellation(
+            EmbedderToConstellationMessage::NoLongerWaitingOnAsynchronousImageUpdates(
+                waiting_pipelines.clone(),
+            ),
+        );
+        waiting_pipelines
+    }
+
+    /// ★다른 타일이 이미 풀어 준 대기를 이 타일의 빚에서 지운다 -- 보내지 않는다★(2026-11-17, 분리
+    /// 모드). 해제 메시지에 epoch 가 없어서, 그것을 늦게 보내면 스크립트의 다음 대기를 풀어 버린다.
+    /// 이 타일의 대기 이미지(`pending_canvas_images`)는 그대로 둔다 -- 그것은 이 타일 자신의 프레임
+    /// 지연이다.
+    pub(crate) fn forget_released_canvas_waits(&mut self, released: &[PipelineId]) {
+        self.frame_delayer.forget_waiting_pipelines(released);
+    }
+
     /// ★스크린샷 상태 기계를 한 칸 민다 -- 반드시 ***생산 뒤***에.★ 설계 2-8 / 불변식 16.
     ///
     /// 호출자는 하나다: `generate_frame_for_wall_tick` 의 `Generated` 갈래, 그 타일의
@@ -4174,6 +4205,13 @@ impl FrameDelayer {
     /// ack 를 기다리는 파이프라인 수. 주입이 **실제로 무엇을 보류했는지** 로그에 싣기 위한 것.
     pub(crate) fn waiting_pipeline_count(&self) -> usize {
         self.waiting_pipelines.len()
+    }
+
+    /// 이미 다른 타일이 풀어 준 파이프라인을 대기 목록에서 뺀다(2026-11-17, 분리 모드).
+    pub(crate) fn forget_waiting_pipelines(&mut self, released: &[PipelineId]) {
+        for pipeline in released {
+            self.waiting_pipelines.remove(pipeline);
+        }
     }
 
     pub(crate) fn take_waiting_pipelines(&mut self) -> Vec<PipelineId> {

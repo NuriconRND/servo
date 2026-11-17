@@ -394,16 +394,16 @@ impl ThreadedPainter {
             }
         }
         self.render_busy.store(true, Ordering::Release);
-        let busy = self.render_busy.clone();
+        // ★가드를 클로저 밖에서 만들어 안에 옮긴다★(2026-11-17 리뷰 #7) -- 클로저가 돌지 못하고 버려져도
+        // (앞선 일이 패닉해 스레드가 풀리면 큐에 남은 클로저가 실행 없이 떨어진다) 가드의 drop 이
+        // `render_busy` 를 내린다. 안에서 만들면 그 경우 영영 바쁜 타일로 남아 매 틱 건너뛰어진다.
+        // 보내기에 실패해도 클로저와 함께 가드가 떨어지므로 따로 내릴 필요가 없다.
+        let clear = ClearOnDrop(self.render_busy.clone());
         let request = PainterRequest::Run(Box::new(move |painter| {
-            let _clear = ClearOnDrop(busy);
+            let _clear = clear;
             callback(painter);
         }));
-        if self.requests.send(request).is_err() {
-            self.render_busy.store(false, Ordering::Release);
-            return false;
-        }
-        true
+        self.requests.send(request).is_ok()
     }
 
     /// ★기다리지 않고, 버리지도 않는다★(2026-11-17). 상한이 없고 FIFO 라 같은 painter 에 보낸 일의
@@ -1631,10 +1631,14 @@ impl Paint {
                 // ★분리 모드에서 바쁜 painter 에 결과 없는 일은 기다리지 않는다★(2026-11-17).
                 if *TILE_RENDER_DETACHED && threaded.is_render_busy() {
                     if let Some(unit) = unit_result::<R>() {
-                        threaded.dispatch_ordered(move |painter| {
+                        if threaded.dispatch_ordered(move |painter| {
                             let _ = callback(painter);
-                        });
-                        return Some(unit);
+                        }) {
+                            return Some(unit);
+                        }
+                        // 스레드가 죽었다 -- 블로킹 경로와 같은 뜻(`None`)이어야 한다(리뷰 #7).
+                        warn!("Painter thread is gone; dropping a request for it");
+                        return None;
                     }
                 }
                 threaded.run_blocking(move |painter| callback(painter))
@@ -1667,6 +1671,16 @@ impl Paint {
             // 스레드가 없으면 기다릴 것도 없다 — 예전과 같이 그 자리에서 돈다.
             PainterHostKind::Inline(painter) => callback(&mut painter.borrow_mut()),
             PainterHostKind::Threaded(threaded) => {
+                // ★분리 모드에서 바쁜 painter 에는 상한 없이, 버리지 않고 보낸다★(2026-11-17 리뷰 #1).
+                // 결합 모드에서는 렌더가 패스 끝에서 기다려지므로 이 큐가 차는 일이 드물다. 분리하면
+                // 메인이 그 타일의 렌더(수십 ms) 동안 계속 메시지를 비우므로, 비디오 프레임이 상한 8 을
+                // 몇 ms 만에 채우고 그 뒤의 갱신 -- 캔버스 epoch, AddImage, DeleteImage 까지 -- 이
+                // 조용히 버려진다. 그러면 캔버스 빚을 갚을 갱신이 오지 않아 그 타일이 ACKSTUCK 까지
+                // 멎는다. 큐 길이는 렌더 시간 x 도착률로 묶이고, painter 쪽 스태시가 키별 최신만 남긴다.
+                if *TILE_RENDER_DETACHED && threaded.is_render_busy() {
+                    let _ = threaded.dispatch_ordered(callback);
+                    return;
+                }
                 let limit = servo_config::pref!(gfx_painter_detached_queue_limit).max(0) as usize;
                 let _ = threaded.dispatch_detached(limit, callback);
             },
@@ -1694,10 +1708,13 @@ impl Paint {
                 // 호출자는 원래대로 기다린다.
                 if *TILE_RENDER_DETACHED && threaded.is_render_busy() {
                     if let Some(unit) = unit_result::<R>() {
-                        threaded.dispatch_ordered(move |painter| {
+                        if threaded.dispatch_ordered(move |painter| {
                             let _ = callback(painter);
-                        });
-                        return Some(unit);
+                        }) {
+                            return Some(unit);
+                        }
+                        warn!("Painter thread is gone; dropping a request for it");
+                        return None;
                     }
                 }
                 threaded.run_blocking(callback)
@@ -2024,11 +2041,10 @@ impl Paint {
         // (`Painter::note_dcomp_frame_statistics`), 블로킹 루프로 돌리면 그 비용이 네 번
         // 더해진 채로 렌더 앞을 막는다. 근거는 `with_each_painter_mut`.
         // 분리 모드에서 바쁜 painter 는 이번 틱에 빠진다(생산·렌더도 빠진다). 결합 모드는 그대로다.
-        let painter_ids: Vec<PainterId> = self
-            .painter_ids()
-            .into_iter()
-            .filter(|painter_id| !self.painter_is_render_busy(*painter_id))
-            .collect();
+        let mut painter_ids = self.painter_ids();
+        if *TILE_RENDER_DETACHED {
+            painter_ids.retain(|painter_id| !self.painter_is_render_busy(*painter_id));
+        }
         self.with_each_painter_mut(&painter_ids, |_| {
             |painter: &mut Painter| painter.pump_paint_animation(PumpSource::Tick)
         });
@@ -2177,17 +2193,44 @@ impl Paint {
         // ★분리 모드에서 바쁜 painter 에는 기다리지 않고 버리지도 않는 전송을 쓴다★(2026-11-17).
         // FIFO 라 그 painter 의 지금 렌더 뒤에, 즉 그 렌더의 합성 뒤에 풀린다 -- "생산 뒤" 라는
         // 순서 요구가 그대로 선다. 해제 판정(`ack_is_releasable`)은 painter 쪽에 있다.
+        //
+        // ★2026-11-17 리뷰 #2: 바쁜 타일에 해제를 그대로 보내면 낡은 해제가 된다.★ 해제 메시지
+        // (`NoLongerWaitingOnAsynchronousImageUpdates`)에는 epoch 가 없다. 그래서 놀던 타일들이 이번
+        // 틱에 epoch E 를 이미 풀었고 스크립트가 E+1 을 기다리는 중이면, 바쁜 타일이 렌더를 마친 뒤
+        // 보내는 E 의 해제가 E+1 대기를 풀어 버린다(아무도 E+1 을 합성하기 전에). 그래서 이번 틱에
+        // 놀던 타일들이 푼 파이프라인이 있으면, 바쁜 타일에는 해제 대신 ***그 대기를 자기 빚에서
+        // 지우라***고 보낸다(보내지 않는다). 놀던 타일이 아무것도 풀지 않았으면 예전처럼 해제를 보낸다 --
+        // 그때 바쁜 타일의 해제는 그 epoch 의 첫 해제이고, 결합 모드의 "먼저 푼 타일이 푼다" 와 같다.
+        if !*TILE_RENDER_DETACHED {
+            let painter_ids = self.painter_ids();
+            self.with_each_painter_mut(&painter_ids, |_| {
+                |painter: &mut Painter| painter.release_owed_canvas_ack()
+            });
+            return;
+        }
         let (busy, idle): (Vec<PainterId>, Vec<PainterId>) = self
             .painter_ids()
             .into_iter()
             .partition(|painter_id| self.painter_is_render_busy(*painter_id));
-        self.with_each_painter_mut(&idle, |_| {
-            |painter: &mut Painter| painter.release_owed_canvas_ack()
-        });
+        let mut released: Vec<PipelineId> = self
+            .with_each_painter_mut(&idle, |_| {
+                |painter: &mut Painter| painter.release_owed_canvas_ack_pipelines()
+            })
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        released.sort_unstable();
+        released.dedup();
         for painter_id in busy {
-            self.send_to_busy_painter(painter_id, |painter| {
-                let _ = painter.release_owed_canvas_ack();
-            });
+            if released.is_empty() {
+                self.send_to_busy_painter(painter_id, |painter| painter.release_owed_canvas_ack());
+            } else {
+                let released = released.clone();
+                self.send_to_busy_painter(painter_id, move |painter| {
+                    painter.forget_released_canvas_waits(&released)
+                });
+            }
         }
     }
 
@@ -2203,6 +2246,9 @@ impl Paint {
     pub fn on_wall_tick(&self) -> Option<u64> {
         // ★2026-11-17 `wall_span`★ -- 틱 번호를 올리고, 이번 틱에 보내는 렌더가 그 번호를 싣는다.
         crate::wall_span::begin_tick();
+        // 분리 모드의 "이번 틱에 건너뛴 타일" 은 이 틱에만 뜻이 있다. 생산하지 않는 틱(스크린샷 대기,
+        // 대상 없음)에도 남지 않게 틱 문에서 비운다(2026-11-17 리뷰 #8).
+        self.busy_skipped_this_tick.borrow_mut().clear();
         let span = crate::wall_span::now();
         self.gather_components();
         crate::wall_span::record_main(crate::wall_span::MainSpan::Gather, span);
@@ -2364,30 +2410,42 @@ impl Paint {
         // `RendererBehind` 와 같은 이유다(무장이 막는 렌더가 곧 그 사유를 푸는 자리다). 같은 틱의
         // 렌더 발사도 이 목록을 보고 그 타일을 건너뛴다. 결합 모드에서는 바쁜 painter 가 없으므로
         // 아래는 예전과 같다.
-        let busy: Vec<bool> = request
-            .target_painter_ids
-            .iter()
-            .map(|painter_id| self.painter_is_render_busy(*painter_id))
-            .collect();
-        let idle_painter_ids: Vec<PainterId> = request
-            .target_painter_ids
-            .iter()
-            .zip(&busy)
-            .filter(|(_, busy)| !**busy)
-            .map(|(painter_id, _)| *painter_id)
-            .collect();
+        //
+        // 결합 모드에서는 벡터를 새로 만들지 않는다(2026-11-17 리뷰 #11) -- 이 자리는 틱 경로다.
+        let detached = *TILE_RENDER_DETACHED;
+        let busy: Vec<bool> = if detached {
+            request
+                .target_painter_ids
+                .iter()
+                .map(|painter_id| self.painter_is_render_busy(*painter_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let idle_painter_ids: Vec<PainterId>;
+        let fan_out: &[PainterId] = if detached {
+            idle_painter_ids = request
+                .target_painter_ids
+                .iter()
+                .zip(&busy)
+                .filter(|(_, busy)| !**busy)
+                .map(|(painter_id, _)| *painter_id)
+                .collect();
+            &idle_painter_ids
+        } else {
+            &request.target_painter_ids
+        };
         let mut idle_outcomes = self
-            .with_each_painter_mut(&idle_painter_ids, |_| {
+            .with_each_painter_mut(fan_out, |_| {
                 move |painter: &mut Painter| {
                     painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
                 }
             })
             .into_iter();
         let mut busy_skipped = self.busy_skipped_this_tick.borrow_mut();
-        busy_skipped.clear();
         let tick = crate::wall_span::current_tick();
-        for (painter_id, is_busy) in request.target_painter_ids.iter().zip(busy) {
-            if is_busy {
+        for (index, painter_id) in request.target_painter_ids.iter().enumerate() {
+            if detached && busy[index] {
                 kept_previous_painter_ids.push(*painter_id);
                 busy_skipped.push(*painter_id);
                 crate::wall_span::record(
@@ -3387,7 +3445,10 @@ impl Paint {
         }
 
         let time_profiler_chan = self.time_profiler_chan.clone();
+        // `wall_span` 이 이 렌더를 보낸 틱으로 묶도록 싣는다(2026-11-17 리뷰 #16).
+        let pass = crate::wall_span::current_tick();
         self.with_painter_mut(painter_id, move |painter| {
+            painter.set_span_pass(pass);
             painter.render(&time_profiler_chan)
         });
     }
