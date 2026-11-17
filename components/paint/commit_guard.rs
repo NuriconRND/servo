@@ -156,10 +156,15 @@ pub(crate) static DEVICE_GATED: LazyLock<bool> = LazyLock::new(|| {
         && !servo_config::pref!(gfx_dcomp_commit_in_end_frame)
 });
 
-/// 관문의 시한. 이보다 오래 기다리면 그냥 진행하고 `wall_span` 에 시한 초과로 남긴다(그 뒤 v1 거부가
-/// 나면 `SURFACE_BEING_RENDERED` 경고가 이름 붙여 찍힌다). 벽에서 관측된 가장 긴 Commit 대기는
-/// 수십 ms 대라(log_rotation_opacity_judder_01/09: 넘친 렌더 17~43 ms) 그 위로 둔다.
+/// 관문이 한 번에 기다리는 길이. ★넘겨도 진행하지 않고 다시 기다린다★(2026-11-17 리뷰 #6) -- 진행하면
+/// 같은 디바이스의 Commit 이 도는 동안 `BeginDraw` 가 열려, 결합 경로와 순차 경로가 한 번도 허용한 적
+/// 없는 겹침이 생긴다. 넘길 때마다 `wall_span` 에 남긴다(Gate flag 1). 벽에서 관측된 가장 긴 Commit
+/// 대기는 수십 ms 대다(log_rotation_opacity_judder_01/09: 넘친 렌더 17~43 ms).
 pub(crate) const GATE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// 관문이 기다리는 전체 상한. 워커가 죽어 비행 수가 영영 안 내려가는 병적인 경우에만 닿는다 --
+/// 그때는 멈추는 것보다 진행해 이름 붙은 경고(`SURFACE_BEING_RENDERED`)를 보는 편이 낫다.
+pub(crate) const GATE_GIVE_UP: Duration = Duration::from_secs(2);
 
 /// ★디바이스 하나의 비행 중인 틱 Commit 수와 그것을 기다리는 자리★(2026-11-17). 디바이스 가드와
 /// 같은 이유로 프로세스 수명으로 누수시킨다(디바이스는 넷이고 프로세스 내내 산다).
@@ -209,7 +214,8 @@ impl DeviceCommitState {
 
 static DEVICE_STATES: Mutex<Option<HashMap<usize, &'static DeviceCommitState>>> = Mutex::new(None);
 
-/// 디바이스의 Commit 상태. painter 는 한 번 찾아 들고 있고, 메인은 틱마다 찾는다(메인만 잡는 자물쇠다).
+/// 디바이스의 Commit 상태. painter 는 한 번 찾아 들고 있고, 메인은 틱마다 찾는다. 워커는 메인이 실어 준
+/// 것을 쓰므로 이 자물쇠를 잡지 않는다(painter 의 첫 조회와 메인만 잡는다).
 pub(crate) fn device_commit_state(device: usize) -> &'static DeviceCommitState {
     let mut guard = DEVICE_STATES.lock().unwrap_or_else(|e| e.into_inner());
     guard
@@ -240,8 +246,9 @@ struct CommitJob {
     device: usize,
     issued: u64,
     tick: u64,
-    /// 디바이스 관문 경로인가. 참이면 워커가 Commit 뒤에 그 디바이스의 비행 수를 내린다.
-    gated: bool,
+    /// 디바이스 관문 경로면 그 디바이스의 상태. 워커가 Commit 뒤에 비행 수를 내린다. 메인이 이미 찾아
+    /// 둔 것을 실어 보내므로 워커는 전역 자물쇠(`DEVICE_STATES`)를 잡지 않는다(2026-11-17 리뷰 #10).
+    state: Option<&'static DeviceCommitState>,
 }
 
 /// 틱 Commit 하나를 내고 `wall_span` 에 남긴다. ★기록은 가드를 푼 뒤다★ --
@@ -291,8 +298,8 @@ fn worker_loop(
 ) {
     for job in jobs {
         let hr = commit_and_record(job);
-        if job.gated {
-            device_commit_state(job.device).finish();
+        if let Some(state) = job.state {
+            state.finish();
         }
         if done.send((job.device, hr)).is_err() {
             return;
@@ -341,7 +348,7 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
         device,
         issued: crate::wall_span::now().unwrap_or(0),
         tick,
-        gated: false,
+        state: None,
     };
     if devices.len() > 1 && *DEVICE_GATED {
         commit_all_at_tick_gated(devices, tick);
@@ -406,15 +413,22 @@ fn commit_all_at_tick_gated(devices: Vec<usize>, tick: u64) {
             crate::dcomp_compositor::note_tick_commit(device, hr);
         }
     }
-    let available = ensure_workers(devices.len());
     let mut serial = Vec::new();
     {
-        let workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        // ★배정을 먼저 다 하고 그 수만큼 워커를 맞춘다★(2026-11-17 리뷰 #9). 틱마다 디바이스 수로
+        // 맞추면, 첫 틱에 디바이스 둘만 왔을 때 나중의 둘이 받은 번호 2·3 이 풀 크기를 넘어 메인에서
+        // 순차로 나간다 -- 이 경로가 없애려던 결합이 그대로 돌아온다. 자물쇠 순서는
+        // DEVICE_WORKER -> WORKERS 로 고정이다(메인만 잡는다).
         let mut assignment = DEVICE_WORKER.lock().unwrap_or_else(|e| e.into_inner());
         let assignment = assignment.get_or_insert_with(HashMap::new);
-        for device in devices {
+        for &device in &devices {
             let next = assignment.len();
-            let index = *assignment.entry(device).or_insert(next);
+            assignment.entry(device).or_insert(next);
+        }
+        let available = ensure_workers(assignment.len());
+        let workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        for device in devices {
+            let index = assignment[&device];
             if index >= available.min(workers.len()) {
                 serial.push(device);
                 continue;
@@ -425,7 +439,7 @@ fn commit_all_at_tick_gated(devices: Vec<usize>, tick: u64) {
                 device,
                 issued: crate::wall_span::now().unwrap_or(0),
                 tick,
-                gated: true,
+                state: Some(state),
             };
             if workers[index].jobs.send(job).is_err() {
                 state.finish();
@@ -438,7 +452,7 @@ fn commit_all_at_tick_gated(devices: Vec<usize>, tick: u64) {
             device,
             issued: crate::wall_span::now().unwrap_or(0),
             tick,
-            gated: false,
+            state: None,
         });
         crate::dcomp_compositor::note_tick_commit(device, hr);
     }

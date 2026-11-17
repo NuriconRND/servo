@@ -2058,7 +2058,16 @@ impl Painter {
             return;
         }
         let start = crate::wall_span::now();
-        let timed_out = state.wait_idle(crate::commit_guard::GATE_TIMEOUT);
+        // 시한을 넘겨도 진행하지 않고 다시 기다린다(2026-11-17 리뷰 #6). 전체 상한은 워커가 죽은 병적인
+        // 경우에만 닿는다(`GATE_GIVE_UP`).
+        let began = Instant::now();
+        let mut timed_out = false;
+        while state.wait_idle(crate::commit_guard::GATE_TIMEOUT) {
+            timed_out = true;
+            if began.elapsed() >= crate::commit_guard::GATE_GIVE_UP {
+                break;
+            }
+        }
         crate::wall_span::record_span(
             crate::wall_span::Kind::Gate,
             self.span_slot,

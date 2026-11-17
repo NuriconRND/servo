@@ -2409,6 +2409,17 @@ impl DCompNativeCompositor {
     /// §3-q UAF 교훈: 자식(pbuffer→서피스)부터 디바이스 순으로 해제한다. WR renderer
     /// deinit이 egl.Terminate보다 먼저 이 경로를 호출하므로 EGL 자원이 아직 살아있다.
     fn release_all(&mut self) {
+        // ★디바이스를 놓기 전에 비행 중인 틱 Commit 을 기다리고 가드를 잡는다★(2026-11-17 리뷰 #3).
+        // 디바이스 관문 경로(`-DcompParallelCommit`)에서는 메인이 Commit 을 기다리지 않으므로, 정상 종료
+        // 때 이 painter 가 사라지는 동안 워커가 아직 그 디바이스로 Commit 중일 수 있다 -- 그러면 해제된
+        // COM 객체로 Commit 하는 것이다. 다른 경로에서는 비행 수가 언제나 0 이라 바로 돌아온다. 이 함수를
+        // 부르는 자리(`Drop`, `deinit`)는 가드를 쥐고 있지 않다.
+        let _device_guard = self.dcomp_device_ptr().map(|device| {
+            let device = device as usize;
+            crate::commit_guard::device_commit_state(device)
+                .wait_idle(std::time::Duration::from_secs(2));
+            crate::commit_guard::device_guard(device)
+        });
         self.drop_bound_without_enddraw();
         // SwapChain storage의 frame_pbuffer는 RAII가 아니므로 clear 전에 명시 정리한다.
         let rc = self.rendering_context.clone();
