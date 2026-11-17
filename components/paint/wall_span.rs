@@ -99,6 +99,13 @@ pub(crate) enum Kind {
     GpuSignal = 14,
     /// 완료 프로브의 깨움. id = 디바이스 슬롯, seq = 끝난 값, a = 깨어난 시각, b = 걸어 둔 시각.
     GpuDone = 15,
+    /// DComp bind/unbind 의 한 단계(2026-11-17, `wall_gpu_probe`). id = 디바이스 슬롯, flag = 단계
+    /// (`wall_gpu_probe::BIND_STEPS`), seq = 틱, a/b = 앞뒤, c = 단계별 값(BeginDraw: 텍스처 크기와
+    /// 직전 bind 와 같은 텍스처인가, 투명 지우기: 면적).
+    BindStep = 16,
+    /// `end_frame` 의 glFlush(2026-11-17, `-DcompAlwaysFlush` 나 External 서피스일 때만). id = 디바이스
+    /// 슬롯, seq = 틱, a/b = 앞뒤.
+    Flush = 17,
 }
 
 impl Kind {
@@ -119,6 +126,8 @@ impl Kind {
             13 => Kind::GpuLabel,
             14 => Kind::GpuSignal,
             15 => Kind::GpuDone,
+            16 => Kind::BindStep,
+            17 => Kind::Flush,
             _ => return None,
         })
     }
@@ -478,6 +487,18 @@ fn reporter(mode: String) {
         for event in window.iter().filter(|e| e.kind == Kind::SlotMap) {
             known_map.insert(event.id, *event);
         }
+        // 2026-11-17 GPU 프로브 보강: VRAM 표본은 비울 때마다(250 ms) 리포터 스레드에서 읽는다.
+        #[cfg(windows)]
+        {
+            if !gpu_seen {
+                gpu_seen = window
+                    .iter()
+                    .any(|e| matches!(e.kind, Kind::GpuFrame | Kind::GpuSignal | Kind::GpuDone));
+            }
+            if gpu_seen {
+                crate::wall_gpu_probe::sample_vram(&mut gpu_state, qpc().unwrap_or(0));
+            }
+        }
         #[cfg(windows)]
         if let Some(fresh) = crate::dcomp_compositor::composition_grid() {
             grid = Some(fresh);
@@ -510,9 +531,6 @@ fn reporter(mode: String) {
         // 잡는다(리뷰) -- 창 안의 기록은 10 초 안쪽이라 시계 조정의 영향이 1 ms 아래로 묶인다.
         #[cfg(windows)]
         {
-            gpu_seen |= window
-                .iter()
-                .any(|e| matches!(e.kind, Kind::GpuFrame | Kind::GpuSignal | Kind::GpuDone));
             if gpu_seen {
                 let clock = WallClock::now();
                 for line in crate::wall_gpu_probe::report(

@@ -88,6 +88,9 @@ winapi = { workspace = true, features = [
     "dwrite",
     "dxgi",
     "dxgi1_2",
+    # 2026-11-17 wall_gpu_probe: IDXGIAdapter3::QueryVideoMemoryInfo (WALLVRAM).
+    "dxgi1_3",
+    "dxgi1_4",
     "dxgiformat",
     "dxgitype",
     "excpt",

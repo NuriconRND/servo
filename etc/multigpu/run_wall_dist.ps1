@@ -169,6 +169,12 @@ param(
     # heavy frame with a ms time) every 10 s and WALLGPUSEC once a second. Why: in
     # log_rotation_opacity_judder_01/12 long Commits happened per device, only in transitions.
     # Starts the span reporter by itself (no -SpanProbe needed, but use both).
+    # (2026-11-17, after run 13) Either GPU probe also prints WALLBIND (DComp BeginDraw, pbuffer
+    # create, make current, transparent clear, EndDraw, pbuffer destroy CPU times per device, and
+    # whether BeginDraw returned the same texture as last time), WALLFLUSH (the end_frame glFlush,
+    # i.e. the -DcompAlwaysFlush arm), WALLVRAM (adapter local usage/budget once a second) and
+    # WALLGPUFRAME (one row per late frame: render, GPU span, bind steps, flush, Signal and the
+    # frames still pending on the GPU at that moment, completion after Signal, Commit).
     [switch] $GpuTimeProbe,
     # (2026-11-17) gfx_wall_gpu_fence_probe -- does Commit wait for GPU completion. Signals an
     # ID3D11Fence right before the Commit critical section in DComp end_frame; a WallGpuFence
@@ -176,6 +182,8 @@ param(
     # device's Commit start/end (long_done_during = the GPU finished while Commit was blocked).
     # Read it with -DcompCommitInFrame: with the tick-head Commit the Signal may submit the
     # frame one period earlier than normal. sig_call_us shows whether Signal itself blocks.
+    # (2026-11-17) The fence is also read right before each Signal, so WALLGPUQUEUE splits Signal
+    # blocking by how many earlier frames were still unfinished on the GPU at that moment.
     [switch] $GpuFenceProbe,
     # (2026-11-13) gfx_wr_image_tiling_threshold -- images wider or taller than this are split
     # into 512 px tiles in the shared atlas, and only visible tiles are requested, so rotation

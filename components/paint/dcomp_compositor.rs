@@ -1148,6 +1148,10 @@ struct SurfaceEntry {
     promote_blocked_until: u64,
     /// Virtual bind 프레임에서 부분 더티는 frame_coverage 집계에 미등록 — 별도 플래그로 "그려짐" 추적.
     frame_drawn_partial: bool,
+    /// 2026-11-17 GPU 프로브(WALLBIND): 이 서피스의 직전 bind 가 받은 BeginDraw 텍스처와 그 타일.
+    /// pbuffer 를 텍스처별로 재사용할 수 있는지를 본다.
+    last_bind_texture: usize,
+    last_bind_tile: Option<(i32, i32)>,
     /// Task 10: 이 서피스가 실제로 bind한 타일 valid 영역(device 좌표)의 바운딩 유니온(누적).
     /// 불투명 phantom 서피스의 그려지지 않은 영역 합성을 억제하기 위한 clip 좁힘 근거
     /// (add_surface의 refine_opaque_clip). None=아직 미집계. destroy_tile(지오메트리 변경)에서 리셋.
@@ -1252,6 +1256,10 @@ pub struct DCompNativeCompositor {
     gpu_fence: Option<crate::wall_gpu_probe::GpuFence>,
     /// 펜스를 만들어 봤나(실패해도 다시 시도하지 않는다).
     gpu_fence_tried: bool,
+    /// bind 단계 기록의 디바이스 슬롯(처음 쓸 때 정한다).
+    span_device_slot: Option<u8>,
+    /// 어댑터를 VRAM 표본에 등록했나.
+    gpu_vram_registered: bool,
 }
 
 /// `gfx_dcomp_mode`(구 `SERVO_COMPOSITOR_DCOMP`)가 truthy면 네이티브 컴포지터 사용 요청.
@@ -1590,11 +1598,27 @@ pub fn maybe_create(
             #[cfg(windows)]
             gpu_fence: None,
             gpu_fence_tried: false,
+            span_device_slot: None,
+            gpu_vram_registered: false,
         })))
     }
 }
 
 impl DCompNativeCompositor {
+    /// 2026-11-17 bind 단계·flush 기록의 디바이스 슬롯. GPU 프로브가 꺼져 있으면 `None` 이라 기록도
+    /// 시각 읽기도 하지 않는다(LazyLock 로드 하나).
+    fn step_slot(&mut self) -> Option<u8> {
+        if !*crate::wall_gpu_probe::ANY_PROBE || !crate::wall_span::is_enabled() {
+            return None;
+        }
+        if self.span_device_slot.is_none() {
+            self.span_device_slot = self
+                .dcomp_device_ptr()
+                .map(|device| crate::wall_span::device_slot(device as usize));
+        }
+        self.span_device_slot
+    }
+
     fn dcomp_device_ptr(&self) -> Option<*mut IDCompositionDevice> {
         self.dcomp_device.as_ref().map(ComOwned::as_ptr)
     }
@@ -2551,6 +2575,8 @@ impl Compositor for DCompNativeCompositor {
                 demote_count: 0,
                 promote_blocked_until: 0,
                 frame_drawn_partial: false,
+                last_bind_texture: 0,
+                last_bind_tile: None,
                 content_valid_union: None,
             }
         };
@@ -2596,6 +2622,8 @@ impl Compositor for DCompNativeCompositor {
         // rendering_context 호출을 엔트리 borrow와 분리(같은 self의 다른 필드지만 명시
         // clone으로 borrow 충돌 여지를 없앤다 — 엔트리는 get_mut로 지속 borrow된다).
         let rc = self.rendering_context.clone();
+        // 2026-11-17 bind 단계 기록의 슬롯(엔트리를 빌리기 전에).
+        let step_slot = self.step_slot();
 
         let Some(entry) = self.surfaces.get_mut(&id.surface_id) else {
             warn!("[dcomp-native] bind: unknown surface {:?}", id.surface_id);
@@ -2760,6 +2788,8 @@ impl Compositor for DCompNativeCompositor {
                     bottom: update_rect_v.max.y,
                 };
 
+                // 2026-11-17 bind 단계 기록(`wall_gpu_probe`, WALLBIND). 꺼져 있으면 None.
+                let step_start = step_slot.and_then(|_| crate::wall_span::now());
                 // Safety: vsurf는 위 서피스의 살아있는 IDCompositionVirtualSurface. BeginDraw는
                 // AddRef된 텍스처와 아틀라스 오프셋을 돌려준다(PoC G2).
                 let (texture, update_offset, desc) = unsafe {
@@ -2783,6 +2813,26 @@ impl Compositor for DCompNativeCompositor {
                     (*tex).GetDesc(&mut desc);
                     (tex, update_offset, desc)
                 };
+                let after_begin = step_start.and_then(|_| crate::wall_span::now());
+                if let (Some(slot), Some(a), Some(b)) = (step_slot, step_start, after_begin) {
+                    // 같은 서피스·같은 타일의 직전 bind 와 견준다(서피스가 번갈아 bind 되므로).
+                    let reuse = if entry.last_bind_tile != Some((id.x, id.y)) {
+                        crate::wall_gpu_probe::REUSE_UNKNOWN
+                    } else if entry.last_bind_texture == texture as usize {
+                        crate::wall_gpu_probe::REUSE_SAME
+                    } else {
+                        crate::wall_gpu_probe::REUSE_CHANGED
+                    };
+                    crate::wall_gpu_probe::record_bind_step(
+                        slot,
+                        crate::wall_gpu_probe::STEP_BEGIN_DRAW,
+                        a,
+                        b,
+                        crate::wall_gpu_probe::pack_texture(desc.Width, desc.Height, reuse),
+                    );
+                    entry.last_bind_texture = texture as usize;
+                    entry.last_bind_tile = Some((id.x, id.y));
+                }
 
                 let pbuffer = match rc.create_render_pbuffer_from_d3d_texture(
                     texture as usize,
@@ -2800,6 +2850,17 @@ impl Compositor for DCompNativeCompositor {
                     },
                 };
 
+                let after_pbuffer = after_begin.and_then(|_| crate::wall_span::now());
+                if let (Some(slot), Some(a), Some(b)) = (step_slot, after_begin, after_pbuffer) {
+                    crate::wall_gpu_probe::record_bind_step(
+                        slot,
+                        crate::wall_gpu_probe::STEP_PBUFFER_CREATE,
+                        a,
+                        b,
+                        0,
+                    );
+                }
+
                 if !rc.make_render_pbuffer_current(pbuffer) {
                     warn!("[dcomp-native] make_render_pbuffer_current failed; giving up tile");
                     rc.destroy_render_pbuffer(pbuffer);
@@ -2809,6 +2870,16 @@ impl Compositor for DCompNativeCompositor {
                         let _ = (*vsurf).EndDraw();
                     }
                     return fail;
+                }
+                let after_current = after_pbuffer.and_then(|_| crate::wall_span::now());
+                if let (Some(slot), Some(a), Some(b)) = (step_slot, after_pbuffer, after_current) {
+                    crate::wall_gpu_probe::record_bind_step(
+                        slot,
+                        crate::wall_gpu_probe::STEP_MAKE_CURRENT,
+                        a,
+                        b,
+                        0,
+                    );
                 }
 
                 // Task 9 수정: 확장 모드면 WR draw 전에 pbuffer(BeginDraw scratch 영역)를
@@ -2841,6 +2912,19 @@ impl Compositor for DCompNativeCompositor {
                     g.clear_color(0.0, 0.0, 0.0, 0.0);
                     g.clear(gl::COLOR_BUFFER_BIT);
                     g.disable(gl::SCISSOR_TEST);
+                    if let (Some(slot), Some(a), Some(b)) = (
+                        step_slot,
+                        after_current,
+                        after_current.and_then(|_| crate::wall_span::now()),
+                    ) {
+                        crate::wall_gpu_probe::record_bind_step(
+                            slot,
+                            crate::wall_gpu_probe::STEP_EXPAND_CLEAR,
+                            a,
+                            b,
+                            (sw.max(0) as u64) * (sh.max(0) as u64),
+                        );
+                    }
                 }
 
                 // 업데이트 렉트의 타일-로컬 top-left(확장 시 클립이 타일 좌상단을 잘라내면 >0).
@@ -2900,6 +2984,9 @@ impl Compositor for DCompNativeCompositor {
         let Some(bound) = self.bound.take() else {
             return;
         };
+        // 2026-11-17 unbind 단계 기록(WALLBIND). 꺼져 있으면 None.
+        let step_slot = self.step_slot();
+        let step_start = step_slot.and_then(|_| crate::wall_span::now());
         // 현재 bind 중이던 서피스에 EndDraw.
         if let Some(entry) = self.surfaces.get(&bound.surface_id) {
             match &entry.storage {
@@ -2932,12 +3019,31 @@ impl Compositor for DCompNativeCompositor {
                 bound.surface_id
             );
         }
+        let after_end = step_start.and_then(|_| crate::wall_span::now());
         // EGL은 현재 서피스 파괴를 유예하므로 unbind 직후 destroy가 안전(Task 1 주석).
         self.rendering_context.destroy_render_pbuffer(bound.pbuffer);
         if !bound.texture.is_null() {
             // Safety: BeginDraw가 돌려준 AddRef된 텍스처를 EndDraw 이후 한 번 Release.
             unsafe {
                 (*(bound.texture as *mut IUnknown)).Release();
+            }
+        }
+        if let (Some(slot), Some(a), Some(b)) = (step_slot, step_start, after_end) {
+            crate::wall_gpu_probe::record_bind_step(
+                slot,
+                crate::wall_gpu_probe::STEP_END_DRAW,
+                a,
+                b,
+                0,
+            );
+            if let Some(c) = crate::wall_span::now() {
+                crate::wall_gpu_probe::record_bind_step(
+                    slot,
+                    crate::wall_gpu_probe::STEP_PBUFFER_DESTROY,
+                    b,
+                    c,
+                    0,
+                );
             }
         }
     }
@@ -3113,7 +3219,39 @@ impl Compositor for DCompNativeCompositor {
                 .values()
                 .any(|entry| matches!(entry.storage, SurfaceStorage::External(_)));
         if needs_flush {
+            // 2026-11-17 flush 시간(WALLFLUSH) -- 런 13 의 G1/G3 에서 긴 Commit 의 비용이 여기로
+            // 옮겨 왔다고 추정만 했다. 꺼져 있으면 None.
+            let flush_slot = self.step_slot();
+            let flush_start = flush_slot.and_then(|_| crate::wall_span::now());
             device.gl().flush();
+            if let (Some(slot), Some(a), Some(b)) = (
+                flush_slot,
+                flush_start,
+                flush_start.and_then(|_| crate::wall_span::now()),
+            ) {
+                crate::wall_span::record(
+                    crate::wall_span::Kind::Flush,
+                    slot,
+                    0,
+                    crate::wall_span::current_tick(),
+                    a,
+                    b,
+                    0,
+                );
+            }
+        }
+
+        // 2026-11-17 GPU 프로브: 어댑터를 VRAM 표본(WALLVRAM)에 한 번 등록한다(타이밍 경로 밖에서
+        // 리포터가 읽는다).
+        #[cfg(windows)]
+        if *crate::wall_gpu_probe::ANY_PROBE && !self.gpu_vram_registered {
+            self.gpu_vram_registered = true;
+            if let Some(dcomp) = self.dcomp_device_ptr() {
+                // Safety: 살아 있는 ANGLE 디바이스.
+                unsafe {
+                    crate::wall_gpu_probe::register_adapter(self.d3d11_device, dcomp as usize)
+                };
+            }
         }
 
         // 2026-11-17 벽 GPU 완료 프로브(`wall_gpu_probe`): 펜스는 첫 프레임에 한 번 만든다. Signal 은
@@ -3838,6 +3976,8 @@ impl Compositor for DCompNativeCompositor {
                 demote_count: 0,
                 promote_blocked_until: 0,
                 frame_drawn_partial: false,
+                last_bind_texture: 0,
+                last_bind_tile: None,
                 content_valid_union: None,
             }
         };

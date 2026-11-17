@@ -72,6 +72,21 @@
 //! - `WALLGPUHEAVY` -- 무거운 프레임 하나하나(ms 시각, 이름표 상위 다섯), 창당 상한
 //!
 //! 초마다: `WALLGPUSEC` -- painter 별 그 초의 GPU 합과 상위 이름표(전환 타임라인용).
+//!
+//! ## 2026-11-17 보강 (런 13 뒤, 사용자 지시 "1번 계측 보강")
+//!
+//! 런 13 에서 긴 Commit 은 그 프레임 GPU 일의 첫 제출(flush)이었고, 제출을 앞당겨도 늦은 렌더와
+//! 육안은 같았다. Signal 뒤 GPU 완료는 p95 약 10 ms 로 우리 일(p95 약 3 ms)보다 약 7 ms 늦었다.
+//! 남은 질문은 셋이다: 제출이 무엇에 막히나, 그 7 ms 는 무엇인가, bind 마다 새로 만드는 pbuffer
+//! (DEPTH|STENCIL 구성)가 비용을 만드나. 그래서 더한 것:
+//! - Signal 직전 펜스 완료 값(사용자 모드 읽기 하나) -- 그 순간 GPU 에서 아직 안 끝난 이전 프레임 수.
+//!   `WALLGPUQUEUE` 가 그 수별로 Signal 막힘을 가른다. 이전 프레임이 밀려 있을 때만 막히면 큐 한도다.
+//! - DComp bind/unbind 단계별 CPU 시간(`WALLBIND`): BeginDraw, pbuffer 생성, make current, 투명
+//!   지우기, EndDraw, pbuffer 파괴. BeginDraw 텍스처 크기와 "직전 bind 와 같은 텍스처인가".
+//! - `end_frame` 의 glFlush 시간(`WALLFLUSH`, `-DcompAlwaysFlush` 갈래).
+//! - 어댑터 VRAM 사용량·예산(`WALLVRAM`, 리포터 스레드가 250 ms 마다 `QueryVideoMemoryInfo`).
+//! - 늦은 프레임마다 한 줄(`WALLGPUFRAME`): 렌더, 우리 GPU 구간, bind 단계, flush, Signal 과 그
+//!   순간의 밀린 프레임 수, Signal 뒤 GPU 완료, Commit, 상위 이름표. 리포터가 링 기록을 잇는다.
 
 // D3D11 query·펜스 FFI 가 있어 unsafe 를 허용한다(dcomp_compositor.rs 와 같은 취지).
 #![allow(unsafe_code)]
@@ -170,6 +185,53 @@ const MARKS: usize = 160;
 /// 완료 프로브가 켜져 있나. `end_frame` 이 매 프레임 보므로 pref 를 한 번만 읽는다.
 pub(crate) static FENCE_PROBE: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| servo_config::pref!(gfx_wall_gpu_fence_probe));
+
+/// GPU 프로브 중 하나라도 켜져 있나(2026-11-17). bind 단계·flush·VRAM 기록이 이것을 본다.
+pub(crate) static ANY_PROBE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    servo_config::pref!(gfx_wall_gpu_fence_probe) || servo_config::pref!(gfx_wall_gpu_time_probe)
+});
+
+/// bind/unbind 단계(`Kind::BindStep` 의 flag). 순서는 실제 순서다.
+pub(crate) const STEP_BEGIN_DRAW: u8 = 0;
+pub(crate) const STEP_PBUFFER_CREATE: u8 = 1;
+pub(crate) const STEP_MAKE_CURRENT: u8 = 2;
+pub(crate) const STEP_EXPAND_CLEAR: u8 = 3;
+pub(crate) const STEP_END_DRAW: u8 = 4;
+pub(crate) const STEP_PBUFFER_DESTROY: u8 = 5;
+const BIND_STEPS: [&str; 6] = [
+    "begin_draw",
+    "pbuffer_create",
+    "make_current",
+    "expand_clear",
+    "end_draw",
+    "pbuffer_destroy",
+];
+
+/// bind 단계 하나를 링에 쓴다. 원자 저장뿐이다.
+#[inline]
+pub(crate) fn record_bind_step(slot: u8, step: u8, a: u64, b: u64, c: u64) {
+    wall_span::record(
+        Kind::BindStep,
+        slot,
+        step,
+        wall_span::current_tick(),
+        a,
+        b,
+        c,
+    );
+}
+
+/// BeginDraw 텍스처가 같은 서피스·같은 타일의 직전 bind 와 같은가(2026-11-17 리뷰: 서피스별로 본다 --
+/// 슬라이스 둘이 번갈아 bind 되면 컴포지터 전체의 직전 값과 견주는 것은 늘 "다름" 이다).
+pub(crate) const REUSE_UNKNOWN: u64 = 0;
+pub(crate) const REUSE_SAME: u64 = 1;
+pub(crate) const REUSE_CHANGED: u64 = 2;
+
+/// BeginDraw 텍스처: 비트 40~41 = 재사용(`REUSE_*`), 20~39 = 폭, 0~19 = 높이. 같음은 포인터
+/// 비교라, DComp 가 놓은 뒤 같은 주소에 새로 만들면 같음으로 셀 수 있다(과대).
+pub(crate) fn pack_texture(width: u32, height: u32, reuse: u64) -> u64 {
+    ((reuse & 3) << 40) | (((width as u64) & 0xf_ffff) << 20) | ((height as u64) & 0xf_ffff)
+}
 
 struct FrameSlot {
     disjoint: *mut ID3D11Query,
@@ -694,6 +756,9 @@ impl GpuFence {
         let Some(before) = wall_span::now() else {
             return;
         };
+        // 2026-11-17 보강: Signal 직전의 완료 값 -- 그 순간 GPU 에서 아직 안 끝난 이전 프레임 수를
+        // 리포터가 구한다(`WALLGPUQUEUE`). 모니터드 펜스라 사용자 모드 읽기다.
+        let completed_before = self.completed();
         self.next += 1;
         // Safety: context4 와 fence 는 이 객체가 쥔 참조.
         let hr = unsafe {
@@ -708,7 +773,9 @@ impl GpuFence {
             self.next,
             before,
             after,
-            wall_span::current_tick(),
+            // (Signal 직전 완료 값 + 1) << 32 | 틱 하위 32 비트. 0 = 모름.
+            ((completed_before.wrapping_add(1) & 0xffff_ffff) << 32)
+                | (wall_span::current_tick() & 0xffff_ffff),
         );
     }
 }
@@ -860,6 +927,124 @@ fn waiter() {
 // ---------------------------------------------------------------------------------------------
 // 리포트
 // ---------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------
+// VRAM 표본 (2026-11-17 보강)
+// ---------------------------------------------------------------------------------------------
+
+/// 디바이스 슬롯마다 IDXGIAdapter3(AddRef 해 둔 것, 프로세스 수명).
+static ADAPTERS: [AtomicUsize; MAX_SLOTS] = [const { AtomicUsize::new(0) }; MAX_SLOTS];
+
+/// 그 디바이스의 어댑터를 VRAM 표본에 등록한다(첫 `end_frame` 에서 한 번, 타이밍 경로 밖).
+///
+/// # Safety
+/// `device` 는 살아 있는 ANGLE D3D11 디바이스.
+pub(crate) unsafe fn register_adapter(device: *mut ID3D11Device, dcomp_device: usize) {
+    use winapi::Interface;
+    use winapi::shared::dxgi::{IDXGIAdapter, IDXGIDevice};
+    use winapi::shared::dxgi1_4::IDXGIAdapter3;
+    if device.is_null() {
+        return;
+    }
+    let slot = wall_span::device_slot(dcomp_device) as usize;
+    unsafe {
+        let mut dxgi: *mut IDXGIDevice = std::ptr::null_mut();
+        if (*device).QueryInterface(&IDXGIDevice::uuidof(), &mut dxgi as *mut _ as *mut _) < 0
+            || dxgi.is_null()
+        {
+            return;
+        }
+        let mut adapter: *mut IDXGIAdapter = std::ptr::null_mut();
+        let hr = (*dxgi).GetAdapter(&mut adapter);
+        (*dxgi).Release();
+        if hr < 0 || adapter.is_null() {
+            return;
+        }
+        let mut adapter3: *mut IDXGIAdapter3 = std::ptr::null_mut();
+        let hr =
+            (*adapter).QueryInterface(&IDXGIAdapter3::uuidof(), &mut adapter3 as *mut _ as *mut _);
+        (*adapter).Release();
+        if hr < 0 || adapter3.is_null() {
+            warn!("WALLGPU: dev{slot} IDXGIAdapter3 없음 -- VRAM 표본 끔");
+            return;
+        }
+        if ADAPTERS[slot]
+            .compare_exchange(0, adapter3 as usize, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            (*adapter3).Release();
+        }
+    }
+}
+
+/// 표본 하나: (QPC, 슬롯, 로컬 사용, 로컬 예산, 비로컬 사용) 바이트.
+type VramSample = (u64, u8, u64, u64, u64);
+
+/// 리포터가 링을 비울 때마다(250 ms) 부른다. 커널 호출이지만 리포터 스레드다.
+pub(crate) fn sample_vram(state: &mut ReportState, now_qpc: u64) {
+    use winapi::shared::dxgi1_4::{
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3,
+    };
+    for (slot, adapter) in ADAPTERS.iter().enumerate() {
+        let adapter = adapter.load(Ordering::Acquire) as *mut IDXGIAdapter3;
+        if adapter.is_null() {
+            continue;
+        }
+        let mut local: DXGI_QUERY_VIDEO_MEMORY_INFO = unsafe { std::mem::zeroed() };
+        let mut nonlocal: DXGI_QUERY_VIDEO_MEMORY_INFO = unsafe { std::mem::zeroed() };
+        // Safety: 프로세스 수명 동안 쥔 어댑터.
+        let ok = unsafe {
+            (*adapter).QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local) >= 0
+                && (*adapter).QueryVideoMemoryInfo(
+                    0,
+                    DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                    &mut nonlocal,
+                ) >= 0
+        };
+        if ok {
+            state.vram.push((
+                now_qpc,
+                slot as u8,
+                local.CurrentUsage,
+                local.Budget,
+                nonlocal.CurrentUsage,
+            ));
+        }
+    }
+}
+
+/// 초마다 디바이스별 VRAM 줄. 표본은 실시간으로 쌓였으므로 이번 창의 것을 모두 낸다.
+fn vram_lines(
+    samples: &[VramSample],
+    wall_second: impl Fn(u64) -> String,
+    second_of: impl Fn(u64) -> u64,
+) -> Vec<String> {
+    let mut by: std::collections::BTreeMap<(u64, u8), (u64, u64, u64, u64, u64)> =
+        Default::default();
+    for &(qpc, slot, usage, budget, nonlocal) in samples {
+        let e = by
+            .entry((second_of(qpc), slot))
+            .or_insert((qpc, u64::MAX, 0, budget, 0));
+        e.1 = e.1.min(usage);
+        e.2 = e.2.max(usage);
+        e.3 = e.3.min(budget);
+        e.4 = e.4.max(nonlocal);
+    }
+    const MB: u64 = 1 << 20;
+    by.into_iter()
+        .map(|((_, slot), (first, min, max, budget, nonlocal))| {
+            format!(
+                "WALLVRAM at={} dev={slot} local_mb={}..{} budget_mb={} nonlocal_max_mb={}",
+                wall_second(first),
+                min / MB,
+                max / MB,
+                budget / MB,
+                nonlocal / MB
+            )
+        })
+        .collect()
+}
 
 /// 무거운 프레임 문턱과 창당 상한.
 const HEAVY_SPAN_US: u64 = 8_000;
@@ -1088,6 +1273,8 @@ pub(crate) struct ReportState {
     carry: Vec<Event>,
     lookback: Vec<Event>,
     seconds: std::collections::BTreeMap<(u64, u8), SecAcc>,
+    /// 2026-11-17 보강: 이번 창의 VRAM 표본.
+    vram: Vec<VramSample>,
 }
 
 /// 리포터가 10 초마다 부른다. `window` 는 이번 창의 모든 기록, `now_qpc` 는 지금.
@@ -1109,6 +1296,7 @@ pub(crate) fn report(
             .filter(|e| {
                 is_frame_kind(e.kind)
                     || is_commit_kind(e.kind)
+                    || is_side_kind(e.kind)
                     || matches!(e.kind, Kind::GpuSignal | Kind::GpuDone)
             })
             .copied(),
@@ -1116,7 +1304,30 @@ pub(crate) fn report(
     let defer_after = now_qpc.saturating_sub(ticks_for_us(to_us, DEFER_US));
     let stale_before = now_qpc.saturating_sub(ticks_for_us(to_us, STALE_US));
     let (analyze, carry) = split_carry(gathered, defer_after, stale_before);
-    let mut lines = report_lines(t_secs, &analyze, &state.lookback, slot_map, to_us, wall);
+    let mut lines = report_lines(t_secs, &analyze, &state.lookback, slot_map, to_us, &wall);
+    // 2026-11-17 보강: 짝을 찾을 때는 되돌아보기 + 이번 창 + 다음 창으로 넘긴 것까지 본다(세지는
+    // 이번 창 것만).
+    let lookup: Vec<Event> = state
+        .lookback
+        .iter()
+        .chain(analyze.iter())
+        .chain(carry.iter())
+        .copied()
+        .collect();
+    lines.extend(bind_lines(t_secs, &analyze, to_us));
+    lines.extend(flush_lines(t_secs, &analyze, to_us));
+    lines.extend(queue_lines(t_secs, &analyze, &lookup, to_us));
+    lines.extend(frame_lines(
+        t_secs, &analyze, &lookup, slot_map, to_us, &wall,
+    ));
+    // VRAM: 진행 중인 초는 다음 창으로 넘긴다(2026-11-17 리뷰 -- 창 경계의 초가 둘로 나뉘었다).
+    let current = second_of(now_qpc);
+    let (done_samples, open_samples): (Vec<VramSample>, Vec<VramSample>) = state
+        .vram
+        .iter()
+        .partition(|sample| second_of(sample.0) < current);
+    lines.extend(vram_lines(&done_samples, &wall_second, &second_of));
+    state.vram = open_samples;
 
     // 초 단위: 누적하고, 충분히 지난 초만 낸다.
     for frame in frames_of(&analyze).iter().filter(|f| f.timed()) {
@@ -1151,10 +1362,343 @@ pub(crate) fn report(
 
     state.lookback = analyze
         .iter()
-        .filter(|e| is_commit_kind(e.kind) || e.kind == Kind::GpuDone)
+        // 2026-11-17 리뷰: Signal 도 남긴다(한 창 늦게 분석되는 프레임의 짝). 세는 것은 이번 창 것만이다.
+        .filter(|e| {
+            is_commit_kind(e.kind)
+                || is_side_kind(e.kind)
+                || matches!(e.kind, Kind::GpuDone | Kind::GpuSignal)
+        })
         .copied()
         .collect();
     state.carry = carry;
+    lines
+}
+
+/// 짝짓기에만 쓰는 곁 기록(2026-11-17 보강): 렌더 구간, bind 단계, flush.
+fn is_side_kind(kind: Kind) -> bool {
+    matches!(kind, Kind::Render | Kind::BindStep | Kind::Flush)
+}
+
+fn us_set(values: Vec<u64>) -> String {
+    p50_p95_max(values)
+}
+
+/// 디바이스별 bind/unbind 단계(`WALLBIND`).
+fn bind_lines(t_secs: u64, events: &[Event], to_us: impl Fn(u64) -> u64 + Copy) -> Vec<String> {
+    let mut lines = Vec::new();
+    for device in 0..MAX_SLOTS as u8 {
+        let mine: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == Kind::BindStep && e.id == device)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let begins: Vec<&&Event> = mine.iter().filter(|e| e.flag == STEP_BEGIN_DRAW).collect();
+        let reuse = |kind: u64| begins.iter().filter(|e| (e.c >> 40) & 3 == kind).count();
+        let (same, changed, unknown) = (
+            reuse(REUSE_SAME),
+            reuse(REUSE_CHANGED),
+            reuse(REUSE_UNKNOWN),
+        );
+        let mut sizes: Vec<(u64, u64)> = begins
+            .iter()
+            .map(|e| ((e.c >> 20) & 0xf_ffff, e.c & 0xf_ffff))
+            .collect();
+        sizes.sort_unstable();
+        // 가장 흔한 크기.
+        let mut mode = (0, 0, 0usize);
+        let mut i = 0;
+        while i < sizes.len() {
+            let j = sizes[i..].iter().take_while(|s| **s == sizes[i]).count();
+            if j > mode.2 {
+                mode = (sizes[i].0, sizes[i].1, j);
+            }
+            i += j;
+        }
+        let mut line = format!(
+            "WALLBIND t={t_secs}s w=10s dev={device} binds={} texture_same/changed/unknown={same}/{changed}/{unknown} tex={}x{}({})",
+            begins.len(),
+            mode.0,
+            mode.1,
+            mode.2
+        );
+        for (step, name) in BIND_STEPS.iter().enumerate() {
+            let values: Vec<u64> = mine
+                .iter()
+                .filter(|e| e.flag == step as u8)
+                .map(|e| to_us(e.b.saturating_sub(e.a)))
+                .collect();
+            if values.is_empty() {
+                continue;
+            }
+            line.push_str(&format!(" {name}_us={}:{}", values.len(), us_set(values)));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// 디바이스별 glFlush(`WALLFLUSH`).
+fn flush_lines(t_secs: u64, events: &[Event], to_us: impl Fn(u64) -> u64 + Copy) -> Vec<String> {
+    let mut lines = Vec::new();
+    for device in 0..MAX_SLOTS as u8 {
+        let values: Vec<u64> = events
+            .iter()
+            .filter(|e| e.kind == Kind::Flush && e.id == device)
+            .map(|e| to_us(e.b.saturating_sub(e.a)))
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        let long = values.iter().filter(|v| **v >= LONG_COMMIT_US).count();
+        lines.push(format!(
+            "WALLFLUSH t={t_secs}s w=10s dev={device} n={} dur_us={} long={long}",
+            values.len(),
+            us_set(values)
+        ));
+    }
+    lines
+}
+
+/// Signal 순간 GPU 에서 아직 안 끝난 이전 프레임 수. 모르면 None.
+fn pending_at_signal(signal: &Event) -> Option<u64> {
+    let packed = signal.c >> 32;
+    (packed != 0).then(|| {
+        (signal.seq & 0xffff_ffff)
+            .saturating_sub(1)
+            .saturating_sub(packed - 1)
+    })
+}
+
+/// 디바이스별: Signal 순간의 밀린 프레임 수와 Signal 막힘(`WALLGPUQUEUE`).
+fn queue_lines(
+    t_secs: u64,
+    events: &[Event],
+    lookup: &[Event],
+    to_us: impl Fn(u64) -> u64 + Copy,
+) -> Vec<String> {
+    let _ = lookup;
+    let mut lines = Vec::new();
+    for device in 0..MAX_SLOTS as u8 {
+        let signals: Vec<&Event> = events
+            .iter()
+            .filter(|e| e.kind == Kind::GpuSignal && e.id == device)
+            .collect();
+        if signals.is_empty() {
+            continue;
+        }
+        // 밀린 수 0/1/2/3+ 마다 (전체, 막힘 4 ms 이상, Signal 시간들)
+        let mut buckets: [(u64, u64, Vec<u64>); 4] = Default::default();
+        let mut unknown = 0;
+        for signal in &signals {
+            let call = to_us(signal.b.saturating_sub(signal.a));
+            let Some(pending) = pending_at_signal(signal) else {
+                unknown += 1;
+                continue;
+            };
+            let bucket = &mut buckets[(pending as usize).min(3)];
+            bucket.0 += 1;
+            bucket.1 += (call >= LONG_COMMIT_US) as u64;
+            bucket.2.push(call);
+        }
+        let mut line = format!("WALLGPUQUEUE t={t_secs}s w=10s dev={device} unknown={unknown}");
+        for (pending, (all, blocked, calls)) in buckets.into_iter().enumerate() {
+            line.push_str(&format!(
+                " pending{}{}={all}(blocked={blocked},sig_us={})",
+                pending,
+                if pending == 3 { "+" } else { "" },
+                us_set(calls)
+            ));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// 늦은 프레임 문턱(`WALLGPUFRAME`).
+const FRAME_RENDER_LATE_US: u64 = 16_667;
+const FRAME_AFTER_LATE_US: u64 = 12_000;
+const FRAME_LINES_MAX: usize = 200;
+
+/// 늦은 프레임마다 한 줄(`WALLGPUFRAME`). 프레임은 이번 창 것만, 짝은 `lookup` 에서 찾는다.
+///
+/// 2026-11-17 리뷰: 짝은 (종류, id) 별로 시각순 색인을 한 번 만들어 이분 탐색으로 찾는다(프레임마다
+/// 전체를 훑지 않는다). flush 와 Signal 은 그 프레임의 렌더 구간 안(렌더가 없으면 같은 painter 의
+/// 다음 프레임 끝 전)에서만 찾는다 -- 이 프레임이 flush 하지 않았을 때 다음 프레임 것을 잡지 않게.
+fn frame_lines(
+    t_secs: u64,
+    events: &[Event],
+    lookup: &[Event],
+    slot_map: &[Event],
+    to_us: impl Fn(u64) -> u64 + Copy,
+    wall: impl Fn(u64) -> String,
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let device_of = |painter: u8| {
+        slot_map
+            .iter()
+            .find(|e| e.kind == Kind::SlotMap && e.id == painter)
+            .map(|e| e.a as u8)
+    };
+    let within = |from: u64, at: u64| at >= from && to_us(at - from) <= COMMIT_PAIR_MAX_US;
+    let mut index: HashMap<(u8, u8), Vec<&Event>> = HashMap::new();
+    for e in lookup.iter().filter(|e| {
+        matches!(
+            e.kind,
+            Kind::Render | Kind::GpuSignal | Kind::Flush | Kind::GpuDone | Kind::BindStep
+        )
+    }) {
+        index.entry((e.kind as u8, e.id)).or_default().push(e);
+    }
+    for list in index.values_mut() {
+        list.sort_by_key(|e| e.a);
+    }
+    let empty: Vec<&Event> = Vec::new();
+    let list = |kind: Kind, id: u8| index.get(&(kind as u8, id)).unwrap_or(&empty);
+    let mut commits: HashMap<u8, Vec<Commit>> = HashMap::new();
+    for c in commits_of(lookup.iter()) {
+        commits.entry(c.device).or_default().push(c);
+    }
+    let no_commits: Vec<Commit> = Vec::new();
+
+    let frames = frames_of(events);
+    // 같은 painter 의 다음 프레임 끝(렌더가 없을 때 짝의 상한).
+    let mut ends: HashMap<u8, Vec<u64>> = HashMap::new();
+    for f in frames.iter().filter(|f| f.timed() && f.presented()) {
+        ends.entry(f.painter).or_default().push(f.cpu_end);
+    }
+    for v in ends.values_mut() {
+        v.sort_unstable();
+    }
+
+    let mut rows: Vec<(u64, u64, String)> = Vec::new();
+    for frame in frames.iter().filter(|f| f.timed() && f.presented()) {
+        let Some(device) = device_of(frame.painter) else {
+            continue;
+        };
+        let renders = list(Kind::Render, frame.painter);
+        let at = renders.partition_point(|e| e.a <= frame.cpu_end);
+        let render = (at > 0)
+            .then(|| renders[at - 1])
+            .filter(|r| r.b >= frame.cpu_end);
+        let render_us = render.map(|r| to_us(r.b.saturating_sub(r.a)));
+        let upper = match render {
+            Some(r) => r.b,
+            None => ends
+                .get(&frame.painter)
+                .and_then(|v| v.iter().find(|end| **end > frame.cpu_end).copied())
+                .unwrap_or(u64::MAX),
+        };
+        let first_after = |kind: Kind| {
+            let v = list(kind, device);
+            let i = v.partition_point(|e| e.a < frame.cpu_end);
+            v.get(i)
+                .copied()
+                .filter(|e| within(frame.cpu_end, e.a) && e.a <= upper)
+        };
+        let signal = first_after(Kind::GpuSignal);
+        let flush = first_after(Kind::Flush);
+        let done = signal.and_then(|s| {
+            let v = list(Kind::GpuDone, device);
+            let i = v.partition_point(|d| d.a < s.a);
+            v[i..].iter().copied().find(|d| d.seq >= s.seq)
+        });
+        let commit_from = signal
+            .map(|s| s.b)
+            .or(flush.map(|f| f.b))
+            .unwrap_or(frame.cpu_end);
+        let device_commits = commits.get(&device).unwrap_or(&no_commits);
+        let i = device_commits.partition_point(|c| c.start < commit_from);
+        let commit = device_commits
+            .get(i)
+            .filter(|c| within(commit_from, c.start));
+        let sig_us = signal.map(|s| to_us(s.b.saturating_sub(s.a)));
+        let after_us = match (signal, done) {
+            (Some(s), Some(d)) => Some(to_us(d.a.saturating_sub(s.b))),
+            _ => None,
+        };
+        let flush_us = flush.map(|f| to_us(f.b.saturating_sub(f.a)));
+        let commit_us = commit.map(|c| to_us(c.end.saturating_sub(c.start)));
+        let late = render_us.unwrap_or(0) > FRAME_RENDER_LATE_US
+            || sig_us.unwrap_or(0) >= LONG_COMMIT_US
+            || flush_us.unwrap_or(0) >= LONG_COMMIT_US
+            || commit_us.unwrap_or(0) >= LONG_COMMIT_US
+            || after_us.unwrap_or(0) >= FRAME_AFTER_LATE_US;
+        if !late {
+            continue;
+        }
+        // 그 렌더 안의 bind 단계 합.
+        let mut steps = [0u64; BIND_STEPS.len()];
+        let mut binds = 0;
+        if let Some(r) = render {
+            let v = list(Kind::BindStep, device);
+            let i = v.partition_point(|e| e.a < r.a);
+            for e in v[i..]
+                .iter()
+                .take_while(|e| e.a <= r.b)
+                .filter(|e| e.b <= r.b)
+            {
+                steps[(e.flag as usize).min(BIND_STEPS.len() - 1)] +=
+                    to_us(e.b.saturating_sub(e.a));
+                binds += (e.flag == STEP_BEGIN_DRAW) as u64;
+            }
+        }
+        let mut labels = frame.labels.clone();
+        labels.sort_by_key(|(_, g, _)| std::cmp::Reverse(*g));
+        let top: Vec<String> = labels
+            .iter()
+            .take(3)
+            .map(|(l, g, _)| format!("{}:{}", LABELS[*l as usize].replace(' ', "_"), g / 1000))
+            .collect();
+        let opt = |v: Option<u64>| v.map_or(String::from("-"), |v| v.to_string());
+        let row = format!(
+            "WALLGPUFRAME at={} p{} dev={device} pass={} render_us={} gpu_span_us={} between_us={} \
+             cpu_us={} binds={binds} bind_us={}/{}/{}/{} unbind_us={}/{} flush_us={} sig_us={} \
+             pending_at_sig={} gpu_after_sig_us={} after_minus_span_us={} commit_us={} top_gpu_us={}",
+            wall(frame.cpu_end),
+            frame.painter,
+            frame.pass,
+            opt(render_us),
+            frame.span_ns / 1000,
+            frame
+                .between_ns
+                .map_or(String::from("-"), |v| (v / 1000).to_string()),
+            frame.cpu_ns / 1000,
+            steps[STEP_BEGIN_DRAW as usize],
+            steps[STEP_PBUFFER_CREATE as usize],
+            steps[STEP_MAKE_CURRENT as usize],
+            steps[STEP_EXPAND_CLEAR as usize],
+            steps[STEP_END_DRAW as usize],
+            steps[STEP_PBUFFER_DESTROY as usize],
+            opt(flush_us),
+            opt(sig_us),
+            opt(signal.and_then(pending_at_signal)),
+            opt(after_us),
+            after_us.map_or(String::from("-"), |a| {
+                (a as i64 - (frame.span_ns / 1000) as i64).to_string()
+            }),
+            opt(commit_us),
+            if top.is_empty() {
+                String::from("-")
+            } else {
+                top.join(",")
+            },
+        );
+        rows.push((frame.cpu_end, render_us.unwrap_or(0), row));
+    }
+    let dropped = rows.len().saturating_sub(FRAME_LINES_MAX);
+    if dropped > 0 {
+        rows.sort_by_key(|(_, render, _)| std::cmp::Reverse(*render));
+        rows.truncate(FRAME_LINES_MAX);
+    }
+    rows.sort_by_key(|(at, _, _)| *at);
+    let mut lines: Vec<String> = rows.into_iter().map(|(_, _, row)| row).collect();
+    if dropped > 0 {
+        lines.push(format!(
+            "WALLGPUFRAME t={t_secs}s dropped={dropped} (창당 상한 {FRAME_LINES_MAX}, 렌더가 긴 것만 남겼다)"
+        ));
+    }
     lines
 }
 
@@ -1696,6 +2240,135 @@ mod tests {
             analyze.iter().filter(|e| e.kind == Kind::GpuSignal).count(),
             1
         );
+    }
+
+    #[test]
+    fn pending_frames_at_signal_come_from_the_read_before_signal() {
+        // 값 10 을 신호하기 직전에 7 까지 끝났다 -> 8, 9 가 밀려 있다.
+        let signal = ev(Kind::GpuSignal, 0, 0, 10, 0, 0, ((7u64 + 1) << 32) | 5);
+        assert_eq!(pending_at_signal(&signal), Some(2));
+        let unknown = ev(Kind::GpuSignal, 0, 0, 10, 0, 0, 5);
+        assert_eq!(pending_at_signal(&unknown), None);
+        let to_us = |t: u64| t;
+        let events = vec![
+            ev(Kind::GpuSignal, 1, 0, 10, 0, 9000, ((7u64 + 1) << 32) | 1),
+            ev(
+                Kind::GpuSignal,
+                1,
+                0,
+                11,
+                20_000,
+                20_100,
+                ((10u64 + 1) << 32) | 2,
+            ),
+        ];
+        let lines = queue_lines(10, &events, &[], to_us);
+        assert!(lines[0].contains("pending0=1(blocked=0"), "{}", lines[0]);
+        assert!(lines[0].contains("pending2=1(blocked=1"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn bind_steps_report_texture_reuse_and_step_times() {
+        let to_us = |t: u64| t;
+        let events = vec![
+            ev(
+                Kind::BindStep,
+                2,
+                STEP_BEGIN_DRAW,
+                1,
+                0,
+                300,
+                pack_texture(5760, 2160, REUSE_UNKNOWN),
+            ),
+            ev(Kind::BindStep, 2, STEP_PBUFFER_CREATE, 1, 300, 1300, 0),
+            ev(
+                Kind::BindStep,
+                2,
+                STEP_BEGIN_DRAW,
+                2,
+                2000,
+                2200,
+                pack_texture(5760, 2160, REUSE_SAME),
+            ),
+            ev(
+                Kind::BindStep,
+                2,
+                STEP_BEGIN_DRAW,
+                3,
+                4000,
+                4200,
+                pack_texture(5760, 2160, REUSE_CHANGED),
+            ),
+        ];
+        let line = &bind_lines(10, &events, to_us)[0];
+        assert!(
+            line.contains("binds=3 texture_same/changed/unknown=1/1/1 tex=5760x2160(3)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("pbuffer_create_us=1:1000/1000/1000"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_late_frame_row_joins_render_bind_signal_done_and_commit() {
+        let to_us = |t: u64| t;
+        let map = [ev(Kind::SlotMap, 1, 0, 0, 3, 5760, 0)];
+        let mut events = frame(1, 7, 3_000_000, 10_000, &[("W_Bind", 1_000_000)]);
+        let lookup = vec![
+            ev(Kind::Render, 1, 0, 7, 1_000, 30_000, 0),
+            ev(
+                Kind::BindStep,
+                3,
+                STEP_BEGIN_DRAW,
+                7,
+                2_000,
+                2_500,
+                pack_texture(1, 1, REUSE_UNKNOWN),
+            ),
+            ev(Kind::BindStep, 3, STEP_PBUFFER_CREATE, 7, 2_500, 4_500, 0),
+            ev(
+                Kind::GpuSignal,
+                3,
+                0,
+                5,
+                12_000,
+                22_000,
+                ((3u64 + 1) << 32) | 7,
+            ),
+            ev(Kind::InframeCommit, 3, 0, 7, 22_010, 22_300, 0),
+            ev(Kind::GpuDone, 3, 0, 5, 30_000, 0, 0),
+        ];
+        events.extend(lookup.iter().copied());
+        let lines = frame_lines(10, &events, &lookup, &map, to_us, |_| String::from("T"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let row = &lines[0];
+        for want in [
+            "p1 dev=3 pass=7 render_us=29000",
+            "binds=1 bind_us=500/2000/0/0",
+            "sig_us=10000 pending_at_sig=1 gpu_after_sig_us=8000 after_minus_span_us=5000",
+            "commit_us=290",
+        ] {
+            assert!(row.contains(want), "{want} not in {row}");
+        }
+    }
+
+    #[test]
+    fn a_frame_does_not_borrow_the_next_frames_flush() {
+        let to_us = |t: u64| t;
+        let map = [ev(Kind::SlotMap, 0, 0, 0, 0, 0, 0)];
+        // 프레임 1 은 렌더가 30 ms(늦음)인데 flush 하지 않았다. 다음 렌더(40 ms~)의 flush 를 잡으면 안 된다.
+        let mut events = frame(0, 1, 1_000_000, 20_000, &[("B_Image", 1_000_000)]);
+        let lookup = vec![
+            ev(Kind::Render, 0, 1, 1, 0, 30_000, 0),
+            ev(Kind::Render, 0, 1, 2, 40_000, 45_000, 0),
+            ev(Kind::Flush, 0, 0, 2, 44_000, 44_500, 0),
+        ];
+        events.extend(lookup.iter().copied());
+        let lines = frame_lines(10, &events, &lookup, &map, to_us, |_| String::from("T"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("flush_us=- "), "{}", lines[0]);
     }
 
     #[test]
