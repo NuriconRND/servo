@@ -398,15 +398,27 @@ param(
     # **The cost:** tiles may show different logical frames at the same time. A caption
     # scrolling horizontally can look ***worse*** crossing a seam. Hence: A/B only.
     [switch] $NoFrameBarrier,
-    # gfx_wall_tile_render_detached=true: fire the tile renders and do not wait.
+    # gfx_wall_tile_render_detached=true: fire the tile renders and do not wait for them.
     #
     # By default a pass fires the four tiles and then waits for all of them via
-    # PaintTargetsInFlight::join(). With this on, no result channel is created, so that join
-    # becomes an empty call (the queue bound is gfx_painter_detached_queue_limit).
+    # PaintTargetsInFlight::join(), so one slow GPU delays the next frame on every display.
+    # (2026-11-17) With this on, a tile that is still rendering when the next tick comes is
+    # left out of that tick -- no gather, no new frame, no render; it keeps showing its
+    # previous frame and is never armed -- while the other tiles go ahead. Calls to a busy tile
+    # whose result is not needed (display lists, canvas acks, frame-ready, updates) are queued
+    # to it without waiting and are never dropped.
     #
-    # **Must be used with -DcompCommitInFrame -- enforced below.** Without it the commit is
-    # deferred, and flush_deferred_dcomp_commits runs ahead of the tile's end_frame, so that
-    # pass loses its commit entirely.
+    # Until 2026-11-17 this switch did nothing at all: the post-pass commit flush made a
+    # blocking round trip to every painter and so waited for every render anyway
+    # (log_rotation_opacity_judder_01/11: 0 of 351 overruns started while another tile's
+    # overrun was still running). Check it with -SpanProbe: WALLDETACH xpass must be > 0.
+    #
+    # **Must be used with -DcompCommitInFrame -- enforced below.** With deferred commits a
+    # tile's commit is collected after its end_frame and issued at the next tick head; a
+    # detached tile may still be rendering then, and a v1 DComp device rejects Commit (and
+    # drops the whole batch) while one of its surfaces is open in BeginDraw. With the commit
+    # inside end_frame each tile commits its own device on its own thread, so nothing races.
+    # Tile 0 still renders on the shell thread, so a slow tile 0 still delays everyone.
     [switch] $DetachTileRender,
 
     # gfx_wall_pacing_output: name the output the pacing thread puts WaitForVBlank on.
@@ -1149,11 +1161,16 @@ if ($SampleLead -ge 0 -and -not ($DwmAlign -ge 0 -and $DwmAlign -le 99)) {
     Write-Warning "-SampleLead $SampleLead without -DwmAlign: the render tick free-runs while the animation samples on the composition grid, so the two will slide against each other and produce zero-displacement frames. Pass -DwmAlign (8 is the measured-good phase) unless you are deliberately measuring them apart."
 }
 
-# -DetachTileRender only holds when the Commit is not deferred. If it is, the flush runs
-# ahead of the tile's end_frame and that pass loses its commit -- a silently dropped
-# frame, so this throws.
+# -DetachTileRender only holds when the Commit is not deferred (2026-11-17 corrected reason):
+# a deferred commit goes out at the next tick head, and a detached tile may still be inside
+# BeginDraw then -- a v1 DComp device rejects that Commit and drops the whole batch.
 if ($DetachTileRender -and -not $DcompCommitInFrame) {
-    throw "-DetachTileRender requires -DcompCommitInFrame: without it the deferred-commit flush runs before the tile threads finish end_frame, so that pass's commits are lost."
+    throw "-DetachTileRender requires -DcompCommitInFrame: with deferred commits the tick-head Commit can land while a detached tile still has a surface open in BeginDraw, and a v1 DComp device then rejects the whole batch."
+}
+# The frame barrier needs every tile's frame-ready answer before it decides, so a busy tile
+# is still waited for there. Detaching works, but only partly, with the barrier on.
+if ($DetachTileRender -and -not $NoFrameBarrier) {
+    Write-Warning "-DetachTileRender with the frame barrier on: frame-ready for a busy tile still waits for that tile (the barrier needs the answer), so tiles stay partly coupled. Pass -NoFrameBarrier."
 }
 # (2026-11-17 correction) This used to warn about -NoFrameBarrier too, but the barrier is
 # switched off in Paint::register_frame whether or not tiles have their own threads, so

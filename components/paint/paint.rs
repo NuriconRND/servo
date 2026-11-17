@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::create_dir_all;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitflags::bitflags;
@@ -157,6 +157,11 @@ pub struct Paint {
     /// 커밋이 묶이지 않게 하려면 커밋 시점이 `begin_frame` 과 무관해야 한다.
     deferred_dcomp_commits: RefCell<Vec<usize>>,
 
+    /// ★분리 모드에서 이번 틱에 바빠서 건너뛴 painter★(2026-11-17). 생산(`issue_wall_frame_request`)이
+    /// 채우고 렌더 발사(`dispatch_paint_targets`)가 읽는다 -- 생산에서 빠진 타일은 같은 틱에 렌더도
+    /// 하지 않는다(그 사이에 렌더를 마쳤더라도). 결합 모드에서는 언제나 비어 있다.
+    busy_skipped_this_tick: RefCell<Vec<PainterId>>,
+
     /// A [`PaintProxy`] which can be used to allow other parts of Servo to communicate
     /// with this [`Paint`].
     pub(crate) paint_proxy: PaintProxy,
@@ -262,6 +267,21 @@ impl PaintTargetsInFlight {
     }
 }
 
+/// `gfx_wall_tile_render_detached` 를 ★한 번만★ 읽는다(2026-11-17). 틱마다·메시지마다 묻는 자리라
+/// `pref!`(RwLock 획득)를 매번 치지 않는다 -- 이 pref 는 기동 때 정해지고 바뀌지 않는다
+/// (`commit_guard::SAMPLE_LEAD_PERIODS` 와 같은 근거).
+static TILE_RENDER_DETACHED: LazyLock<bool> =
+    LazyLock::new(|| pref!(gfx_wall_tile_render_detached));
+/// `gfx_dcomp_commit_in_end_frame` 을 한 번만 읽는다(같은 이유).
+static COMMIT_IN_END_FRAME: LazyLock<bool> = LazyLock::new(|| pref!(gfx_dcomp_commit_in_end_frame));
+
+/// `R` 이 `()` 이면 그 값을, 아니면 `None` 을 돌려준다(2026-11-17). 바쁜 painter 에 결과 없는 일을
+/// 기다리지 않고 보낼 수 있는지 가르는 데 쓴다. `Box<()>` 는 할당하지 않는다(크기 0).
+fn unit_result<R: 'static>() -> Option<R> {
+    let unit: Box<dyn std::any::Any> = Box::new(());
+    unit.downcast::<R>().ok().map(|boxed| *boxed)
+}
+
 /// `PainterId` 의 `wall_span` 슬롯(2026-11-17). 없는 painter 는 마지막 슬롯이다.
 fn host_slot(painters: &[PainterHost], painter_id: PainterId) -> u8 {
     painters
@@ -283,6 +303,12 @@ struct ThreadedPainter {
     /// 쌓이고 그 안의 프레임이 메모리를 잡는다. 기다리는 것으로 되돌리면 그 개선이 통째로
     /// 사라지므로, 기다리지 않되 **길이만 막는다**.
     detached_in_flight: Arc<AtomicUsize>,
+    /// ★분리 모드에서 이 painter 의 렌더가 아직 도는가★(2026-11-17, `-DetachTileRender`).
+    ///
+    /// 메인이 렌더를 보내기 직전에 세우고, painter 스레드가 렌더 클로저를 마칠 때(패닉해도) 내린다.
+    /// 세우는 쪽이 메인 하나뿐이라, 메인이 본 "유휴" 는 그 틱이 끝날 때까지 유휴다 -- 메인이 보낸
+    /// 렌더가 아직 없으니까. 결합 모드에서는 세우는 자리가 없어 언제나 `false` 다.
+    render_busy: Arc<AtomicBool>,
 }
 
 enum PainterRequest {
@@ -345,6 +371,48 @@ impl ThreadedPainter {
             return false;
         }
         true
+    }
+
+    /// 분리 모드에서 이 painter 의 렌더가 아직 도는가(2026-11-17).
+    fn is_render_busy(&self) -> bool {
+        self.render_busy.load(Ordering::Acquire)
+    }
+
+    /// ★분리 모드의 렌더 발사★(2026-11-17). 결과 채널이 없고 버리지도 않는다 -- 공유 상한에서
+    /// 조용히 빠지던 `dispatch_detached` 를 쓰지 않는 이유다(그 상한은 이미지 갱신의 합침용이다).
+    ///
+    /// `render_busy` 를 세우고 보내며, painter 스레드가 렌더를 마치면 내린다. 메인이 바쁜 painter 에는
+    /// 다음 렌더를 보내지 않으므로 painter 마다 비행 중인 렌더는 하나 이하다.
+    fn dispatch_render_detached(
+        &self,
+        callback: impl FnOnce(&mut Painter) + Send + 'static,
+    ) -> bool {
+        struct ClearOnDrop(Arc<AtomicBool>);
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        self.render_busy.store(true, Ordering::Release);
+        let busy = self.render_busy.clone();
+        let request = PainterRequest::Run(Box::new(move |painter| {
+            let _clear = ClearOnDrop(busy);
+            callback(painter);
+        }));
+        if self.requests.send(request).is_err() {
+            self.render_busy.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// ★기다리지 않고, 버리지도 않는다★(2026-11-17). 상한이 없고 FIFO 라 같은 painter 에 보낸 일의
+    /// 순서는 그대로다. 분리 모드에서 ***바쁜*** painter 에 결과가 필요 없는 일을 보낼 때만 쓴다 --
+    /// 메인이 그 painter 의 렌더 뒤에 줄을 서지 않게 하려는 것이다.
+    fn dispatch_ordered(&self, callback: impl FnOnce(&mut Painter) + Send + 'static) -> bool {
+        self.requests
+            .send(PainterRequest::Run(Box::new(callback)))
+            .is_ok()
     }
 
     fn dispatch<R: Send + 'static>(
@@ -1354,6 +1422,7 @@ impl Paint {
             wall_frame_pacing_next_wake_at: Default::default(),
             screenshot_poll_latch: Default::default(),
             deferred_dcomp_commits: RefCell::new(Vec::new()),
+            busy_skipped_this_tick: RefCell::new(Vec::new()),
         }))
     }
 
@@ -1486,6 +1555,7 @@ impl Paint {
             rendering_context: None,
             kind: PainterHostKind::Threaded(ThreadedPainter {
                 detached_in_flight: Arc::new(AtomicUsize::new(0)),
+                render_busy: Arc::new(AtomicBool::new(false)),
                 requests,
                 join_handle: Some(join_handle),
             }),
@@ -1497,6 +1567,40 @@ impl Paint {
     /// `with_painter*` 로 하나씩 들어가는 형태여야 스레드 변형에서도 성립한다.
     fn painter_ids(&self) -> Vec<PainterId> {
         self.painters.iter().map(|host| host.painter_id).collect()
+    }
+
+    /// ★분리 모드에서 아직 렌더 중인 스레드 painter 인가★(2026-11-17). 분리 모드가 아니면 언제나
+    /// `false` 다 -- 결합 모드의 동작은 한 줄도 바뀌지 않는다.
+    fn painter_is_render_busy(&self, painter_id: PainterId) -> bool {
+        *TILE_RENDER_DETACHED &&
+            self.painters.iter().any(|host| {
+                host.painter_id == painter_id &&
+                    matches!(&host.kind, PainterHostKind::Threaded(threaded) if threaded.is_render_busy())
+            })
+    }
+
+    /// 바쁜 painter 에 결과 없는 일을 보낸다 -- 기다리지 않고 버리지도 않는다(2026-11-17). 스레드가
+    /// 아니면(인라인) 그 자리에서 돈다.
+    fn send_to_busy_painter(
+        &self,
+        painter_id: PainterId,
+        callback: impl FnOnce(&mut Painter) + Send + 'static,
+    ) {
+        let Some(host) = self
+            .painters
+            .iter()
+            .find(|host| host.painter_id == painter_id)
+        else {
+            return;
+        };
+        match &host.kind {
+            PainterHostKind::Inline(painter) => callback(&mut painter.borrow_mut()),
+            PainterHostKind::Threaded(threaded) => {
+                if !threaded.dispatch_ordered(callback) {
+                    warn!("Painter thread is gone; dropping a request for it");
+                }
+            },
+        }
     }
 
     fn remove_painter(&mut self, painter_id: PainterId) {
@@ -1524,6 +1628,15 @@ impl Paint {
         match &host.kind {
             PainterHostKind::Inline(painter) => Some(callback(&painter.borrow())),
             PainterHostKind::Threaded(threaded) => {
+                // ★분리 모드에서 바쁜 painter 에 결과 없는 일은 기다리지 않는다★(2026-11-17).
+                if *TILE_RENDER_DETACHED && threaded.is_render_busy() {
+                    if let Some(unit) = unit_result::<R>() {
+                        threaded.dispatch_ordered(move |painter| {
+                            let _ = callback(painter);
+                        });
+                        return Some(unit);
+                    }
+                }
                 threaded.run_blocking(move |painter| callback(painter))
             },
         }
@@ -1571,7 +1684,24 @@ impl Paint {
             .find(|host| host.painter_id == painter_id)?;
         match &host.kind {
             PainterHostKind::Inline(painter) => Some(callback(&mut painter.borrow_mut())),
-            PainterHostKind::Threaded(threaded) => threaded.run_blocking(callback),
+            PainterHostKind::Threaded(threaded) => {
+                // ★분리 모드에서 바쁜 painter 에 결과 없는 일은 기다리지 않는다★(2026-11-17).
+                //
+                // 메인은 페이싱 틱의 소비자이기도 해서, 바쁜 painter 하나에 블로킹 왕복을 하면 그
+                // painter 의 렌더 끝까지 다음 틱이 밀린다 -- 분리가 무효였던 이유 하나가 이것이다
+                // (`perform_updates`, 표시 목록, `for_each_*` 가 전부 이 함수를 지난다). 결과가 `()` 인
+                // 일만 이렇게 보낸다: FIFO 라 그 painter 에서의 순서는 그대로이고, 결과를 쓰는
+                // 호출자는 원래대로 기다린다.
+                if *TILE_RENDER_DETACHED && threaded.is_render_busy() {
+                    if let Some(unit) = unit_result::<R>() {
+                        threaded.dispatch_ordered(move |painter| {
+                            let _ = callback(painter);
+                        });
+                        return Some(unit);
+                    }
+                }
+                threaded.run_blocking(callback)
+            },
         }
     }
 
@@ -1893,7 +2023,12 @@ impl Paint {
         // ★팬아웃이다 -- 루프로 돌리지 말 것.★ 이 단계는 타일마다 DWM 통계 조회를 포함하고
         // (`Painter::note_dcomp_frame_statistics`), 블로킹 루프로 돌리면 그 비용이 네 번
         // 더해진 채로 렌더 앞을 막는다. 근거는 `with_each_painter_mut`.
-        let painter_ids = self.painter_ids();
+        // 분리 모드에서 바쁜 painter 는 이번 틱에 빠진다(생산·렌더도 빠진다). 결합 모드는 그대로다.
+        let painter_ids: Vec<PainterId> = self
+            .painter_ids()
+            .into_iter()
+            .filter(|painter_id| !self.painter_is_render_busy(*painter_id))
+            .collect();
         self.with_each_painter_mut(&painter_ids, |_| {
             |painter: &mut Painter| painter.pump_paint_animation(PumpSource::Tick)
         });
@@ -2038,10 +2173,22 @@ impl Paint {
         // ★팬아웃이되 **버리지는 않는다**.★ `with_painter_mut_detached` 는 큐가 차면 콜백을
         // 버리고, 버려진 해제는 곧 멎은 스크립트다. `with_each_painter_mut` 는 보내고 모두
         // 수거하므로 그 보장은 그대로 두고 직렬화만 없앤다.
-        let painter_ids = self.painter_ids();
-        self.with_each_painter_mut(&painter_ids, |_| {
+        //
+        // ★분리 모드에서 바쁜 painter 에는 기다리지 않고 버리지도 않는 전송을 쓴다★(2026-11-17).
+        // FIFO 라 그 painter 의 지금 렌더 뒤에, 즉 그 렌더의 합성 뒤에 풀린다 -- "생산 뒤" 라는
+        // 순서 요구가 그대로 선다. 해제 판정(`ack_is_releasable`)은 painter 쪽에 있다.
+        let (busy, idle): (Vec<PainterId>, Vec<PainterId>) = self
+            .painter_ids()
+            .into_iter()
+            .partition(|painter_id| self.painter_is_render_busy(*painter_id));
+        self.with_each_painter_mut(&idle, |_| {
             |painter: &mut Painter| painter.release_owed_canvas_ack()
         });
+        for painter_id in busy {
+            self.send_to_busy_painter(painter_id, |painter| {
+                let _ = painter.release_owed_canvas_ack();
+            });
+        }
     }
 
     /// ★페이싱 틱이 벽에 들어오는 유일한 문.★ 셸이 표출 주기마다 한 번 부른다.
@@ -2211,12 +2358,50 @@ impl Paint {
         // ★생성도 팬아웃이다.★ 타일마다 보내고 기다리면 네 타일의 `generate_frame_for_wall_tick`
         // 이 줄을 서고, 그 합이 렌더 시작을 뒤로 민다. 순서는 보존되므로 아래 집합들은
         // 그대로 결정적이다(`with_each_painter_mut`).
-        let outcomes = self.with_each_painter_mut(&request.target_painter_ids, |_| {
-            move |painter: &mut Painter| {
-                painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+        //
+        // ★분리 모드: 아직 렌더 중인 painter 는 이번 틱에 빠진다★(2026-11-17, 사용자 결정 "건너뛰고
+        // 이전 프레임 유지"). 그 타일은 keep-previous 로 참여하고 ***무장하지 않는다*** --
+        // `RendererBehind` 와 같은 이유다(무장이 막는 렌더가 곧 그 사유를 푸는 자리다). 같은 틱의
+        // 렌더 발사도 이 목록을 보고 그 타일을 건너뛴다. 결합 모드에서는 바쁜 painter 가 없으므로
+        // 아래는 예전과 같다.
+        let busy: Vec<bool> = request
+            .target_painter_ids
+            .iter()
+            .map(|painter_id| self.painter_is_render_busy(*painter_id))
+            .collect();
+        let idle_painter_ids: Vec<PainterId> = request
+            .target_painter_ids
+            .iter()
+            .zip(&busy)
+            .filter(|(_, busy)| !**busy)
+            .map(|(painter_id, _)| *painter_id)
+            .collect();
+        let mut idle_outcomes = self
+            .with_each_painter_mut(&idle_painter_ids, |_| {
+                move |painter: &mut Painter| {
+                    painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+                }
+            })
+            .into_iter();
+        let mut busy_skipped = self.busy_skipped_this_tick.borrow_mut();
+        busy_skipped.clear();
+        let tick = crate::wall_span::current_tick();
+        for (painter_id, is_busy) in request.target_painter_ids.iter().zip(busy) {
+            if is_busy {
+                kept_previous_painter_ids.push(*painter_id);
+                busy_skipped.push(*painter_id);
+                crate::wall_span::record(
+                    crate::wall_span::Kind::BusySkip,
+                    host_slot(&self.painters, *painter_id),
+                    0,
+                    tick,
+                    0,
+                    0,
+                    0,
+                );
+                continue;
             }
-        });
-        for (painter_id, outcome) in request.target_painter_ids.iter().zip(outcomes) {
+            let outcome = idle_outcomes.next().flatten();
             match outcome {
                 Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
                 Some(TileOutcome::KeepPrevious(reason)) => {
@@ -2236,6 +2421,7 @@ impl Paint {
                 },
             }
         }
+        drop(busy_skipped);
 
         // ★두 게이트를 다 지난 타일만 무장한다★ -- 사유 게이트는 위에서, 벽 모양 게이트는
         // 여기서(`wall_tick::wall_frame_arms_keep_previous`, 2026-10-22 Task 9.5). 둘이 막는
@@ -2396,8 +2582,11 @@ impl Paint {
     }
 
     pub fn webviews_needing_repaint(&self) -> Vec<WebViewId> {
+        // 분리 모드에서 바쁜 painter 는 묻지 않는다(2026-11-17) -- 묻는 것 자체가 그 렌더 뒤에 줄을 서는
+        // 블로킹 왕복이다. 바쁜 painter 는 어차피 렌더 중이다.
         self.painter_ids()
             .into_iter()
+            .filter(|painter_id| !self.painter_is_render_busy(*painter_id))
             .flat_map(|painter_id| {
                 self.with_painter(painter_id, |painter| painter.webviews_needing_repaint())
                     .unwrap_or_default()
@@ -3103,8 +3292,7 @@ impl Paint {
         let mut in_flight = Vec::new();
         let mut inline_painter_ids = Vec::new();
         // 패스마다 한 번 읽는다(타일마다가 아니다).
-        let detached = pref!(gfx_wall_tile_render_detached);
-        let detached_limit = pref!(gfx_painter_detached_queue_limit).max(0) as usize;
+        let detached = *TILE_RENDER_DETACHED;
         // ★2026-11-17 `wall_span`★ -- 렌더가 보낸 틱을 싣는다(분리 모드에서는 늦게 시작할 수 있다).
         let pass = crate::wall_span::current_tick();
 
@@ -3127,12 +3315,31 @@ impl Paint {
                     let time_profiler_chan = self.time_profiler_chan.clone();
                     if detached {
                         // ★결과 채널을 만들지 않는다.★ 그러면 아래 `in_flight` 가 비고,
-                        // 셸의 `join()` 이 기다릴 것이 없는 빈 호출이 된다 -- 셸은 그대로다.
-                        // 상한은 기존 detach 경로와 같은 것을 쓴다(무한 큐 방지).
-                        let _ = threaded.dispatch_detached(detached_limit, move |painter| {
+                        // 셸의 `join()` 이 기다릴 것이 없는 빈 호출이 된다.
+                        //
+                        // ★2026-11-17: 바쁜 타일은 이번 틱에 보내지 않는다★ -- 생산에서 빠진 타일도
+                        // 같다(`busy_skipped_this_tick`). 그래서 painter 마다 비행 중인 렌더는 하나
+                        // 이하이고, 공유 상한에서 조용히 빠지던 `dispatch_detached` 를 쓰지 않는다.
+                        if threaded.is_render_busy()
+                            || self.busy_skipped_this_tick.borrow().contains(&painter_id)
+                        {
+                            continue;
+                        }
+                        let sent = threaded.dispatch_render_detached(move |painter| {
                             painter.set_span_pass(pass);
                             painter.render(&time_profiler_chan);
                         });
+                        if !sent {
+                            crate::wall_span::record(
+                                crate::wall_span::Kind::RenderRefused,
+                                host_slot(&self.painters, painter_id),
+                                0,
+                                pass,
+                                0,
+                                0,
+                                0,
+                            );
+                        }
                         continue;
                     }
                     let dispatched = threaded.dispatch(move |painter| {
@@ -3212,6 +3419,15 @@ impl Paint {
     }
 
     fn flush_deferred_dcomp_commits_inner(&self) {
+        // ★분리 모드에서는 거둘 것이 없다★(2026-11-17). 분리는 `-DcompCommitInFrame` 과만 쓰이고(런처가
+        // 강제한다) 그때 각 타일은 자기 `end_frame` 에서 커밋하므로 `take_pending_dcomp_commit` 은
+        // 언제나 `None` 이다. 그런데 이 왕복이 painter 마다 블로킹이라, 분리된 렌더가 끝나기를
+        // 패스 끝에서 기다리게 만들었다 -- 분리가 처음부터 무효였던 이유가 이것이다(f98d32355f5 이후,
+        // log_rotation_opacity_judder_01/11: 다른 타일의 과부하 도중 시작한 과부하 0/351). 남은 것이
+        // 있으면 `begin_frame` 의 자기복구가 낸다(`WALLCOMMIT site=recover` 로 보인다).
+        if *TILE_RENDER_DETACHED && *COMMIT_IN_END_FRAME {
+            return;
+        }
         #[cfg(windows)]
         {
             let pending: Vec<usize> = self
@@ -3358,7 +3574,24 @@ impl Paint {
         // when calling `handle_new_webrender_frame_ready`.
         let mut frame_ready_for_painter = HashMap::new();
         let mut frame_ready_diagnostics = Vec::new();
+        // ★분리 모드 + 배리어 꺼짐: 바쁜 painter 의 frame-ready 는 그 painter 스레드에서 처리한다★
+        // (2026-11-17). 배리어가 꺼져 있으면 진단은 코디네이터에서 아무 일도 하지 않고 결국
+        // `handle_new_webrender_frame_ready(need)` 로 끝나므로(`note_frame_ready` 는 등록된 배리어가
+        // 없으면 `None`), 그 둘을 painter 쪽에서 차례로 부르면 같다. 배리어가 켜져 있으면 진단이
+        // 필요하므로 예전처럼 기다린다.
+        let busy_frame_ready =
+            *TILE_RENDER_DETACHED && self.wall_frame_coordinator.borrow().barrier_disabled;
+        let mut busy_ready: HashMap<PainterId, Vec<bool>> = HashMap::new();
         messages.retain(|message| match message {
+            PaintMessage::NewWebRenderFrameReady(painter_id, _document_id, need_repaint)
+                if busy_frame_ready && self.painter_is_render_busy(*painter_id) =>
+            {
+                busy_ready
+                    .entry(*painter_id)
+                    .or_default()
+                    .push(*need_repaint);
+                false
+            },
             PaintMessage::NewWebRenderFrameReady(painter_id, _document_id, need_repaint) => {
                 let need_repaint = *need_repaint;
                 let diagnostic = self.with_painter(*painter_id, move |painter| {
@@ -3412,6 +3645,16 @@ impl Paint {
 
         self.try_release_coalesced_wall_frame_requests();
         self.handle_painters_ready_for_repaint(frame_ready_for_painter);
+        for (painter_id, needs) in busy_ready {
+            // 메시지마다 `pending_frames` 를 하나씩 내리고, 다시 그릴지는 합쳐서 한 번 정한다 --
+            // 위의 기다리는 경로가 하는 것과 같다.
+            self.send_to_busy_painter(painter_id, move |painter| {
+                for need in &needs {
+                    let _ = painter.note_webrender_frame_ready(*need);
+                }
+                painter.handle_new_webrender_frame_ready(needs.iter().any(|need| *need));
+            });
+        }
     }
 
     #[servo_tracing::instrument(skip_all)]
@@ -4143,5 +4386,20 @@ mod wall_frame_keep_previous_tests {
             Some(9),
             "consuming it here would defeat the very test that arms it (실제 {held:?})"
         );
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    // 2026-11-17: 분리 모드에서 바쁜 painter 에 기다리지 않고 보낼 수 있는 일은 결과가 `()` 인
+    // 것뿐이다. 그 판정이 다른 타입을 `()` 로 잘못 보면 호출자가 받을 결과를 지어내게 된다.
+    use super::unit_result;
+
+    #[test]
+    fn only_unit_results_are_fabricated() {
+        assert_eq!(unit_result::<()>(), Some(()));
+        assert_eq!(unit_result::<bool>(), None);
+        assert_eq!(unit_result::<Option<()>>(), None);
+        assert_eq!(unit_result::<Vec<u8>>(), None);
     }
 }

@@ -1402,16 +1402,18 @@ pub struct Preferences {
     pub gfx_wall_frame_barrier: bool,
     /// ★타일 렌더를 발사하고 기다리지 않는다.★ 기본 꺼짐.
     ///
-    /// 켜면 `dispatch_paint_targets` 가 결과 채널을 만들지 않고 기존
-    /// `ThreadedPainter::dispatch_detached` 로 보낸다(큐 상한은
-    /// `gfx_painter_detached_queue_limit`). 그러면 셸의 `PaintTargetsInFlight::join()` 이
-    /// 기다릴 것이 없어 ***빈 호출***이 된다 -- 셸은 손대지 않는다.
+    /// ★2026-11-17 다시 구현★ -- 다음 틱이 왔을 때 아직 렌더 중인 타일은 그 틱에서 빠진다
+    /// (gather·생산·렌더 없음, 이전 프레임 유지, 무장 안 함). 나머지 타일은 기다리지 않고 나아간다.
+    /// 바쁜 타일에 결과가 필요 없는 일(표시 목록, 캔버스 ack, frame-ready, 갱신)은 기다리지 않고
+    /// 버리지도 않게 보낸다. 그 전까지 이 pref 는 아무것도 하지 않았다 -- 패스 끝 flush 가 painter
+    /// 마다 블로킹 왕복이라 모든 렌더를 기다렸다(log_rotation_opacity_judder_01/11: 다른 타일의
+    /// 과부하 도중 시작한 과부하 0/351). `gfx_wall_span_probe` 의 `WALLDETACH xpass` 로 확인한다.
     ///
-    /// ★`gfx_dcomp_commit_in_end_frame` 과 같이 써야 한다.★ 그것이 꺼져 있으면 커밋이
-    /// 미뤄지고, 미뤄진 커밋을 흘리는 `flush_deferred_dcomp_commits` 가 ***타일의
-    /// `end_frame` 보다 먼저 돌아*** 그 패스의 커밋이 통째로 빠진다. 켜져 있으면 각 타일이
-    /// 자기 `end_frame` 에서 커밋하므로 흘릴 것이 없고 순서 요구도 사라진다.
-    /// 런처가 그 조합을 강제한다.
+    /// ★`gfx_dcomp_commit_in_end_frame` 과 같이 써야 한다(2026-11-17 이유 정정).★ 미뤄진 커밋은
+    /// 다음 틱 머리에 나가는데, 그때 분리된 타일이 아직 `BeginDraw` 안에 있을 수 있고, v1 DComp
+    /// 디바이스는 그 Commit 을 거부하며 batch 를 통째로 버린다. 커밋이 `end_frame` 안에 있으면 각
+    /// 타일이 자기 스레드에서 자기 디바이스를 커밋하므로 겹칠 일이 없다. 런처가 그 조합을 강제한다.
+    /// 타일 0 은 여전히 셸 스레드에서 그리므로 타일 0 이 느리면 모두가 늦는다.
     pub gfx_wall_tile_render_detached: bool,
     /// wall frame 코얼레싱 간 최소 간격(ms). ***기본 `0` = `gfx_refresh_hz` 한 주기로
     /// 유도***(`paint.rs` `from_prefs`, `refresh_driver::paint_timer_period`).
