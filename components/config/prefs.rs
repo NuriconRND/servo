@@ -618,6 +618,19 @@ pub struct Preferences {
     /// 것이다(log_rotation_opacity_judder_01/11 에서 둘 다 결합을 못 풀었고 Commit 은 잰 적이 없다).
     /// 근거와 기록 비용 규칙은 `components/paint/wall_span.rs`. 런처는 `-SpanProbe`.
     pub gfx_wall_span_probe: bool,
+    /// 2026-11-17 추가 -- 벽 GPU 시간 프로브(기본 꺼짐). WebRender 가 GPU 일을 나누는 자리마다
+    /// (배치 종류: `B_Image` 이미지, `B_YuvImage` 비디오, `B_Solid` 검은 상자, `W_TileSetup` 타일
+    /// 지우기, `W_Bind`/`W_Unbind` DComp BeginDraw/EndDraw 와 pbuffer, `W_TextureUpload` ...) 미리
+    /// 만든 D3D11 TIMESTAMP query 를 flush 없이 꽂고 몇 프레임 뒤에 기다리지 않고 거둔다.
+    /// `WALLGPU`, `WALLGPUTAG`, `WALLGPULONG`, `WALLGPUHEAVY`, `WALLGPUSEC` 줄. 벽 런 12 에서 긴
+    /// Commit 이 디바이스마다 따로 전환 때만 났고, 어느 페이지 요소가 GPU 를 늦추는지 보려는
+    /// 것이다. 근거와 교란은 `components/paint/wall_gpu_probe.rs`. 런처는 `-GpuTimeProbe`.
+    pub gfx_wall_gpu_time_probe: bool,
+    /// 2026-11-17 추가 -- 벽 GPU 완료 프로브(기본 꺼짐). DComp `end_frame` 의 Commit 임계구역
+    /// 직전에 `ID3D11Fence` 를 Signal 하고, 전용 스레드가 그 값이 끝난 순간을 찍어 같은 디바이스의
+    /// Commit 시작·끝과 비교한다(`WALLGPUDONE`). Commit 이 GPU 완료를 기다리는지 가른다.
+    /// `Signal` 이 제출을 앞당길 수 있어 in-frame Commit 구성에서 읽는다. 런처는 `-GpuFenceProbe`.
+    pub gfx_wall_gpu_fence_probe: bool,
     /// ★2026-11-13 추가★ -- 이 크기(가로나 세로)를 넘는 이미지를 512 타일로 쪼갠다. 기본 4096 은
     /// upstream 값이다. 쪼개진 이미지는 공유 아틀라스로 가고 보이는 타일만 요청되므로, 회전·이동
     /// 중에도 타일 업로드·내보내기가 이어진다(3072x4608 이미지 = 타일 54 장). 8192~16384 로 올리면
@@ -2066,6 +2079,8 @@ impl Preferences {
             gfx_wr_texture_cache_probe: false,
             gfx_wall_event_probe: false,
             gfx_wall_span_probe: false,
+            gfx_wall_gpu_time_probe: false,
+            gfx_wall_gpu_fence_probe: false,
             gfx_wr_image_tiling_threshold: 4096,
             gfx_wr_texture_cache_evict_budget_mb: 0,
             gfx_wall_parallel_tiles: false,

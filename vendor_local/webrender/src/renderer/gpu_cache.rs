@@ -505,9 +505,13 @@ impl super::Renderer {
             self.pending_gpu_cache_clear = false;
         }
 
+        // 2026-11-17 벽 GPU 시간 프로브(리뷰): 외부 이미지 잠금(비디오 링 consume = 프레임마다의
+        // NV12 업로드, EGLImage 감싸기, WebGL keyed mutex)을 GPU 캐시와 가른다.
+        self.gpu_profiler.wall_mark("W_ExtLock");
         let deferred_update_list = self.update_deferred_resolves(deferred_resolves);
         self.pending_gpu_cache_updates.extend(deferred_update_list);
 
+        self.gpu_profiler.wall_mark("W_GpuCache");
         self.update_gpu_cache();
 
         // Note: the texture might have changed during the `update`,

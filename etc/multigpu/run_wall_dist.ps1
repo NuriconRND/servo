@@ -160,6 +160,23 @@ param(
     # two QPC reads and five atomic stores on the recording thread; rec_ns reports the stores
     # plus one QPC read. Commit sites: tick, in-frame, recovery and the video fast path.
     [switch] $SpanProbe,
+    # (2026-11-17) gfx_wall_gpu_time_probe -- which page element slows the GPU. At every point
+    # where WebRender splits GPU work (batch kinds: B_Image = the image, B_YuvImage = the video,
+    # B_Solid = black boxes; W_TileSetup = tile clears; W_Bind/W_Unbind = DComp BeginDraw/EndDraw
+    # and pbuffers; W_TextureUpload ...) it ends a pre-created D3D11 TIMESTAMP query (no flush)
+    # and reads the results a few frames later without waiting. Prints WALLGPU, WALLGPUTAG,
+    # WALLGPULONG (frames followed by a Commit >= 4 ms vs the rest), WALLGPUHEAVY (one line per
+    # heavy frame with a ms time) every 10 s and WALLGPUSEC once a second. Why: in
+    # log_rotation_opacity_judder_01/12 long Commits happened per device, only in transitions.
+    # Starts the span reporter by itself (no -SpanProbe needed, but use both).
+    [switch] $GpuTimeProbe,
+    # (2026-11-17) gfx_wall_gpu_fence_probe -- does Commit wait for GPU completion. Signals an
+    # ID3D11Fence right before the Commit critical section in DComp end_frame; a WallGpuFence
+    # thread stamps the moment each value completes. WALLGPUDONE compares it with the same
+    # device's Commit start/end (long_done_during = the GPU finished while Commit was blocked).
+    # Read it with -DcompCommitInFrame: with the tick-head Commit the Signal may submit the
+    # frame one period earlier than normal. sig_call_us shows whether Signal itself blocks.
+    [switch] $GpuFenceProbe,
     # (2026-11-13) gfx_wr_image_tiling_threshold -- images wider or taller than this are split
     # into 512 px tiles in the shared atlas, and only visible tiles are requested, so rotation
     # and movement keep uploading/evicting tiles. 4096 = upstream (default, same as the engine).
@@ -1188,6 +1205,12 @@ if ($DetachTileRender -and -not $NoFrameBarrier) {
 # switched off in Paint::register_frame whether or not tiles have their own threads, so
 # -NoFrameBarrier does change behaviour without -ParallelTiles. Only the detach switch needs
 # tile threads: inline painters always render synchronously on the shell thread.
+# (2026-11-17) review: the fence Signal may submit the frame earlier than the tick-head Commit
+# would, so in that mode WALLGPUDONE and WALLCOMMIT are not valid for judgment. A warning, not a
+# throw: a fence on/off A/B in tick mode is the only way to measure that perturbation.
+if ($GpuFenceProbe -and -not $DcompCommitInFrame) {
+    Write-Warning "-GpuFenceProbe without -DcompCommitInFrame: with the tick-head Commit the fence Signal may submit this frame up to one period earlier than normal, so long Commits can shrink because of the probe. Do not judge WALLGPUDONE/WALLCOMMIT from this run; compare with a run without -GpuFenceProbe in the same configuration."
+}
 if ($DetachTileRender -and -not $ParallelTiles) {
     Write-Warning "-DetachTileRender without -ParallelTiles: detaching only changes behaviour when tiles render on their own threads. It will do nothing here."
 }
@@ -1375,6 +1398,8 @@ $argList = @(
     "--pref", "gfx_wr_texture_cache_probe=$($TextureCacheProbe.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_event_probe=$($EventProbe.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wall_span_probe=$($SpanProbe.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_gpu_time_probe=$($GpuTimeProbe.IsPresent.ToString().ToLower())",
+    "--pref", "gfx_wall_gpu_fence_probe=$($GpuFenceProbe.IsPresent.ToString().ToLower())",
     "--pref", "gfx_wr_image_tiling_threshold=$ImageTilingThreshold",
     "--pref", "gfx_wr_texture_cache_evict_budget_mb=$TextureCacheBudgetMB",
     "--pref", "media_d3d11_enabled=true",
@@ -1448,7 +1473,7 @@ if (Test-Path $buildStamp) {
 } else {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
-Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to next tick head (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$(if(-not $DcompParallelCommit){'off'}elseif($ParallelCommitWaitAll){'wait-all'}else{'per-device'}) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) event_probe=$($EventProbe.IsPresent) span_probe=$($SpanProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) glerr_every=$GlErrorCheckEvery hud_every=$HudDrawEvery ack_deadline=$CanvasAckDeadlineMs scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
+Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to next tick head (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$(if(-not $DcompParallelCommit){'off'}elseif($ParallelCommitWaitAll){'wait-all'}else{'per-device'}) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) event_probe=$($EventProbe.IsPresent) span_probe=$($SpanProbe.IsPresent) gpu_time_probe=$($GpuTimeProbe.IsPresent) gpu_fence_probe=$($GpuFenceProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) glerr_every=$GlErrorCheckEvery hud_every=$HudDrawEvery ack_deadline=$CanvasAckDeadlineMs scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
 Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in

@@ -1246,6 +1246,12 @@ pub struct DCompNativeCompositor {
     /// `SetOffsetX_1`/`SetOffsetY_1` 호출 시점에만 한다(`clippy::float_cmp` 회피, 눈으로
     /// 봐도 안전함이 보장되도록).
     last_root_offset: Option<(i32, i32)>,
+    /// 2026-11-17 벽 GPU 완료 프로브의 펜스(`wall_gpu_probe::GpuFence`). 켜져 있고 D3D11.4 가 될
+    /// 때만 있다. `release_all` 이 디바이스보다 먼저 놓는다.
+    #[cfg(windows)]
+    gpu_fence: Option<crate::wall_gpu_probe::GpuFence>,
+    /// 펜스를 만들어 봤나(실패해도 다시 시도하지 않는다).
+    gpu_fence_tried: bool,
 }
 
 /// `gfx_dcomp_mode`(구 `SERVO_COMPOSITOR_DCOMP`)가 truthy면 네이티브 컴포지터 사용 요청.
@@ -1581,6 +1587,9 @@ pub fn maybe_create(
             warned_no_provider: false,
             external_batch_active: false,
             last_root_offset: None,
+            #[cfg(windows)]
+            gpu_fence: None,
+            gpu_fence_tried: false,
         })))
     }
 }
@@ -2425,6 +2434,11 @@ impl DCompNativeCompositor {
     /// §3-q UAF 교훈: 자식(pbuffer→서피스)부터 디바이스 순으로 해제한다. WR renderer
     /// deinit이 egl.Terminate보다 먼저 이 경로를 호출하므로 EGL 자원이 아직 살아있다.
     fn release_all(&mut self) {
+        // 2026-11-17: GPU 완료 프로브의 펜스를 디바이스보다 먼저 놓는다(waiter 칸도 비운다).
+        #[cfg(windows)]
+        {
+            self.gpu_fence = None;
+        }
         // ★디바이스를 놓기 전에 비행 중인 틱 Commit 을 기다리고 가드를 잡는다★(2026-11-17 리뷰 #3).
         // 디바이스 관문 경로(`-DcompParallelCommit`)에서는 메인이 Commit 을 기다리지 않으므로, 정상 종료
         // 때 이 painter 가 사라지는 동안 워커가 아직 그 디바이스로 Commit 중일 수 있다 -- 그러면 해제된
@@ -3102,6 +3116,28 @@ impl Compositor for DCompNativeCompositor {
             device.gl().flush();
         }
 
+        // 2026-11-17 벽 GPU 완료 프로브(`wall_gpu_probe`): 펜스는 첫 프레임에 한 번 만든다. Signal 은
+        // 아래 서피스 루프(Hybrid 의 Present, 부분 표출 복사, 강등 시딩) 뒤, Commit 바로 앞이다.
+        // 꺼져 있으면 LazyLock 로드 하나다.
+        #[cfg(windows)]
+        if *crate::wall_gpu_probe::FENCE_PROBE {
+            if !self.gpu_fence_tried {
+                self.gpu_fence_tried = true;
+                if let (Some(context), Some(dcomp)) =
+                    (self.d3d11_context.as_ref(), self.dcomp_device_ptr())
+                {
+                    // Safety: 살아 있는 ANGLE 디바이스와 그 즉시 컨텍스트.
+                    self.gpu_fence = unsafe {
+                        crate::wall_gpu_probe::GpuFence::new(
+                            self.d3d11_device,
+                            context.as_ptr(),
+                            dcomp as usize,
+                        )
+                    };
+                }
+            }
+        }
+
         // ★여기서부터가 임계구역이다.★ 아래 루프가 서피스를 만들고(`SetContent`), 비주얼을
         // 붙이고(`AddVisual`), 마지막에 `commit_device` 한다 -- 셋 다 이 DComp 디바이스를
         // 만지므로 전부 bind 와 drop 사이에 있어야 한다(Ruling 18). 위 게이트 주석 참고.
@@ -3675,6 +3711,15 @@ impl Compositor for DCompNativeCompositor {
         // 특히 실패 로그는 TDR 뒤에 매 프레임 찍히므로 가드 안에 두면 안 된다.
         // ★2026-11-17 `wall_span`★ -- in-frame Commit 의 앞뒤 시각. 가드 안에서는 QPC 를 지역
         // 변수에 담기만 하고, 링에 쓰는 것은 가드를 푼 뒤다(가드 안에는 `Commit()` 하나뿐).
+        // 2026-11-17 벽 GPU 완료 프로브(리뷰): Signal 은 이 프레임의 마지막 GPU 명령 뒤(위 서피스
+        // 루프 포함), Commit 바로 앞이다. 가드 안이라 Signal 호출 시간(로컬 약 90 us)만큼 가드가
+        // 길어진다 -- in-frame Commit 구성에서는 이 가드를 겨룰 상대가 없다. Commit 앞뒤의 완료 값을
+        // 직접 읽어(사용자 모드 읽기) waiter 의 깨움 지연과 무관하게 판정한다.
+        #[cfg(windows)]
+        let fence_before = self.gpu_fence.as_mut().map(|fence| {
+            fence.signal();
+            fence.completed()
+        });
         let commit_span_start = crate::wall_span::now();
         let commit_hr = if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
             Some(self.commit_device_locked(dcomp_device))
@@ -3683,6 +3728,17 @@ impl Compositor for DCompNativeCompositor {
             None
         };
         let commit_span_end = crate::wall_span::now();
+        // (Commit 끝의 완료 값, Commit 시작 전의 완료 값) -- 둘 다 +1 해서 0 = 모름.
+        #[cfg(windows)]
+        let fence_values = match (fence_before, self.gpu_fence.as_ref()) {
+            (Some(before), Some(fence)) => {
+                ((before.wrapping_add(1) & 0xffff_ffff) << 32)
+                    | (fence.completed().wrapping_add(1) & 0xffff_ffff)
+            },
+            _ => 0,
+        };
+        #[cfg(not(windows))]
+        let fence_values = 0;
         // ★가드는 여기서 끝난다.★ 이 디바이스의 서피스 작업과 Commit 은 바로 위에서 끝났다 --
         // 여기부터 함수 끝까지는 BindProfile/esc_prof 카운터 갱신과 로그뿐이고 DComp 디바이스나
         // 서피스를 다시 만지지 않는다(검증됨: dcomp_device_ptr/commit_device/BeginDraw/EndDraw/
@@ -3700,7 +3756,7 @@ impl Compositor for DCompNativeCompositor {
                 crate::wall_span::current_tick(),
                 start,
                 end,
-                0,
+                fence_values,
             );
         }
         if let Some(hr) = commit_hr {

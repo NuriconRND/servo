@@ -256,6 +256,10 @@ pub(crate) struct Painter {
     span_pass: Cell<u64>,
     /// 슬롯 대응(`wall_span::Kind::SlotMap`)을 이미 찍었나. 한 번만 찍는다.
     span_mapped: Cell<bool>,
+    /// GPU 시간 프로브의 프레임 꼬리표(2026-11-17, `wall_gpu_probe`). 켜져 있을 때만 있다.
+    /// `update()`/`render()` 직전에 패스를 싣는다.
+    #[cfg(windows)]
+    gpu_frame_tag: Option<crate::wall_gpu_probe::GpuFrameTag>,
 
     /// 이 painter 의 디바이스 Commit 상태(2026-11-17, 디바이스 관문). 처음 쓸 때 찾아 들고 있는다 --
     /// 렌더마다 전역 자물쇠를 잡지 않으려는 것이다.
@@ -604,14 +608,41 @@ fn wall_span_mode() -> String {
     } else {
         "tick-serial"
     };
+    let on_off = |on: bool| if on { "on" } else { "off" };
     format!(
-        "detach={} commit={commit}",
-        if pref!(gfx_wall_tile_render_detached) {
-            "on"
-        } else {
-            "off"
-        },
+        "detach={} commit={commit} gpu_time={} gpu_fence={}",
+        on_off(pref!(gfx_wall_tile_render_detached)),
+        on_off(pref!(gfx_wall_gpu_time_probe)),
+        on_off(pref!(gfx_wall_gpu_fence_probe)),
     )
+}
+
+/// 2026-11-17 벽 GPU 시간 프로브를 이 painter 의 WR 렌더러에 건다(`wall_gpu_probe`). 꺼져 있거나
+/// query 를 못 만들면 `None` -- 그때 WR 은 훅 없이 전과 같다.
+#[cfg(windows)]
+fn install_gpu_time_probe(
+    renderer: &mut webrender::Renderer,
+    rendering_context: &Rc<dyn RenderingContext>,
+    span_slot: u8,
+) -> Option<crate::wall_gpu_probe::GpuFrameTag> {
+    if !pref!(gfx_wall_gpu_time_probe) {
+        return None;
+    }
+    let device = rendering_context.angle_d3d11_device_ptr()?;
+    let tag: crate::wall_gpu_probe::GpuFrameTag = Rc::new(Cell::new(0));
+    // Safety: ANGLE 이 가진 살아 있는 D3D11 디바이스. 프로브는 렌더러와 함께 사라지고,
+    // 렌더러는 EGL terminate 전에 deinit 된다.
+    #[allow(unsafe_code)]
+    let probe = unsafe {
+        crate::wall_gpu_probe::GpuTimeProbe::new(
+            device as *mut winapi::um::d3d11::ID3D11Device,
+            span_slot,
+            tag.clone(),
+        )
+    }?;
+    renderer.set_wall_gpu_hook(Some(Box::new(probe)));
+    log::info!("WALLGPU: p{span_slot} 시간 프로브 켬 (D3D11 TIMESTAMP, 슬롯 32 x 표지 160)");
+    Some(tag)
 }
 
 // ★`script_frame_is_redundant` 와 `script_frame_rides_the_painter` 는 2026-10-21 에
@@ -828,7 +859,11 @@ impl Painter {
 
         // ★2026-11-17 벽 패스 구간 프로브★ -- 렌더·메인 대기·Commit 을 스레드별 링에 쌓는다.
         // 근거와 기록 규칙은 `wall_span` 모듈 주석. 리포터는 한 번만 뜬다.
-        if pref!(gfx_wall_span_probe) {
+        // 2026-11-17: GPU 프로브(`wall_gpu_probe`)도 이 링과 리포터를 쓴다.
+        if pref!(gfx_wall_span_probe)
+            || pref!(gfx_wall_gpu_time_probe)
+            || pref!(gfx_wall_gpu_fence_probe)
+        {
             crate::wall_span::start(wall_span_mode());
         }
 
@@ -963,6 +998,12 @@ impl Painter {
 
         webrender_renderer.set_external_image_handler(external_image_handlers);
 
+        // `wall_span` 슬롯은 만든 순서다(painter 마다 한 번). GPU 시간 프로브가 같은 번호를 쓴다.
+        let span_slot = crate::wall_span::next_painter_slot();
+        #[cfg(windows)]
+        let gpu_frame_tag =
+            install_gpu_time_probe(&mut webrender_renderer, &rendering_context, span_slot);
+
         let webrender_api = webrender_api_sender.create_api_by_client(painter_id.into());
         let surface_size = rendering_context.size2d().to_i32();
         let webrender_document = webrender_api.add_document(surface_size);
@@ -1045,9 +1086,11 @@ impl Painter {
             display_composite_in_flight: Default::default(),
             display_composite_in_flight_since: Default::default(),
             owns_presentation: false,
-            span_slot: crate::wall_span::next_painter_slot(),
+            span_slot,
             span_pass: Cell::new(0),
             span_mapped: Cell::new(false),
+            #[cfg(windows)]
+            gpu_frame_tag,
             #[cfg(windows)]
             commit_state: std::cell::OnceCell::new(),
             paint_proxy: paint.paint_proxy,
@@ -1910,6 +1953,11 @@ impl Painter {
                         if let Some(target) = publish_target {
                             renderer.set_target_frame_publish_id(target);
                         }
+                        // 2026-11-17 GPU 시간 프로브: `update()` 안의 렌더는 표출하지 않는 프레임이다.
+                        #[cfg(windows)]
+                        if let Some(tag) = &self.gpu_frame_tag {
+                            tag.set(self.span_pass.get() | crate::wall_gpu_probe::TAG_UPDATE);
+                        }
                         // ★여기서 흘림이 일어난다★ -- `update()` 는 그려지지 않은 채 남은
                         // 프레임을 그 자리에서 렌더할 수 있고(`device_size = None` 이므로
                         // 표출은 하지 않는다), 그 비용이 ***이 패스***에 실린다. 프로브가
@@ -1934,6 +1982,10 @@ impl Painter {
                     // TODO(gw): Take notice of any errors the renderer returns!
                     self.clear_background();
                     split.mark_clear();
+                    #[cfg(windows)]
+                    if let Some(tag) = &self.gpu_frame_tag {
+                        tag.set(self.span_pass.get());
+                    }
                     if let Some(renderer) = self.webrender_renderer.as_mut() {
                         let size = self.rendering_context.size2d().to_i32();
                         // ★통계를 버리지 않는다.★ 근거는 `RenderSplit::note_stats` 의 doc --

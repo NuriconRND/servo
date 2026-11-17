@@ -106,6 +106,8 @@ winapi = { workspace = true, features = [
     "profileapi",
     "propidl",
     "rpcndr",
+    # 2026-11-17 wall_gpu_probe: CreateEventW / WaitForMultipleObjects.
+    "synchapi",
     "unknwnbase",
     "vadefs",
     "vcruntime",

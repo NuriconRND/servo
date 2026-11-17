@@ -185,11 +185,28 @@ impl Drop for GpuFrameProfile {
 
 const NUM_PROFILE_FRAMES: usize = 4;
 
+/// 2026-11-17 벽 GPU 시간 프로브의 훅 (servo `components/paint/wall_gpu_probe.rs`).
+///
+/// WR 의 GPU 타이머 자리(`start_timer`)와 프레임 앞뒤에서 불린다. WR 자체 타이머는 ANGLE 에서
+/// 타이머마다 D3D11 query 셋을 새로 만들고 flush 하며 결과를 spin 으로 기다려서(이 파일의
+/// `build_samples`, ANGLE `Query11::pause`) 재려는 것을 바꾼다. 훅은 그 경로를 타지 않는다 --
+/// 받는 쪽이 미리 만든 D3D11 타임스탬프 query 를 flush 없이 꽂고 몇 프레임 뒤에 거둔다.
+/// 훅이 없으면 자리마다 `Option` 검사 하나다. WR 자체 타이머와 디버그 마커는 그대로다.
+pub trait WallGpuHook {
+    /// `GpuProfiler::begin_frame` 안(그 프레임의 첫 GPU 명령 전).
+    fn frame_begin(&mut self);
+    /// 구간 하나의 시작. 이전 구간은 여기서 끝난다(WR 타이머와 같은 평평한 의미).
+    fn mark(&mut self, label: &'static str);
+    /// `GpuProfiler::end_frame` 안.
+    fn frame_end(&mut self);
+}
+
 pub struct GpuProfiler {
     gl: Rc<dyn gl::Gl>,
     frames: [GpuFrameProfile; NUM_PROFILE_FRAMES],
     next_frame: usize,
-    debug_method: GpuDebugMethod
+    debug_method: GpuDebugMethod,
+    wall_hook: Option<Box<dyn WallGpuHook>>,
 }
 
 impl GpuProfiler {
@@ -201,7 +218,22 @@ impl GpuProfiler {
             gl,
             next_frame: 0,
             frames,
-            debug_method
+            debug_method,
+            wall_hook: None,
+        }
+    }
+
+    /// 벽 GPU 시간 프로브의 훅을 건다(2026-11-17). `None` 이면 뗀다.
+    pub fn set_wall_hook(&mut self, hook: Option<Box<dyn WallGpuHook>>) {
+        self.wall_hook = hook;
+    }
+
+    /// WR 타이머가 없는 자리의 구간 표지(2026-11-17). 훅에만 간다 -- WR 자체 타이머와 마커는
+    /// 건드리지 않는다.
+    #[inline]
+    pub fn wall_mark(&mut self, label: &'static str) {
+        if let Some(hook) = self.wall_hook.as_mut() {
+            hook.mark(label);
         }
     }
 
@@ -242,14 +274,23 @@ impl GpuProfiler {
 
     pub fn begin_frame(&mut self, frame_id: GpuFrameId) {
         self.frames[self.next_frame].begin_frame(frame_id);
+        if let Some(hook) = self.wall_hook.as_mut() {
+            hook.frame_begin();
+        }
     }
 
     pub fn end_frame(&mut self) {
+        if let Some(hook) = self.wall_hook.as_mut() {
+            hook.frame_end();
+        }
         self.frames[self.next_frame].end_frame();
         self.next_frame = (self.next_frame + 1) % self.frames.len();
     }
 
     pub fn start_timer(&mut self, tag: GpuProfileTag) -> GpuTimeQuery {
+        if let Some(hook) = self.wall_hook.as_mut() {
+            hook.mark(tag.label);
+        }
         self.frames[self.next_frame].start_timer(tag)
     }
 

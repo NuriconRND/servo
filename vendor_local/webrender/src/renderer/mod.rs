@@ -1711,7 +1711,11 @@ impl Renderer {
             self.set_blend(false, FramebufferKind::Main);
             //self.update_shaders();
 
+            // 2026-11-17 벽 GPU 시간 프로브의 구간 표지(`WallGpuHook`). WR 타이머가 없는 자리라
+            // 이 일은 지금까지 어느 이름표에도 잡히지 않았다. 훅이 없으면 `Option` 검사 하나다.
+            self.gpu_profiler.wall_mark("W_TextureUpload");
             self.update_texture_cache();
+            self.gpu_profiler.wall_mark("W_NativeSurfaces");
             self.update_native_surfaces();
 
             frame_id
@@ -1728,6 +1732,8 @@ impl Renderer {
             // compositing is enabled. This needs to be done early in the frame, so that
             // we can create debug overlays after drawing the main surfaces.
             if let CompositorKind::Native { .. } = self.current_compositor_kind {
+                // 2026-11-17 벽 GPU 시간 프로브: DComp begin_frame(밀린 Commit 복구 포함).
+                self.gpu_profiler.wall_mark("W_BeginFrame");
                 let compositor = self.compositor_config.compositor().unwrap();
                 compositor.begin_frame(&mut self.device);
             }
@@ -1747,6 +1753,8 @@ impl Renderer {
         }
 
         crate::wall_render_split::mark_enter(split_at);
+        // 2026-11-17: 여기서부터 외부 이미지 잠금 전까지는 GPU 캐시 재생성(드묾)뿐이다.
+        self.gpu_profiler.wall_mark("W_GpuCacheClear");
         match self.prepare_gpu_cache(&frame.deferred_resolves) {
             Ok(..) => {
                 assert!(frame.gpu_cache_frame_id <= self.gpu_cache_frame_id,
@@ -1785,6 +1793,9 @@ impl Renderer {
             }
         }
 
+        // 2026-11-17 벽 GPU 시간 프로브: 외부 이미지 풀기(WebGL ReleaseSync 등)를 마지막 배치에
+        // 얹지 않는다.
+        self.gpu_profiler.wall_mark("W_ExtUnlock");
         self.unlock_external_images(&frame.deferred_resolves);
         crate::wall_render_split::mark_unlock(split_at);
 
@@ -3016,6 +3027,9 @@ impl Renderer {
 
         {
             let _timer = self.gpu_profiler.start_timer(GPU_TAG_SETUP_TARGET);
+            // 2026-11-17 벽 GPU 시간 프로브: picture-cache 타일의 setup(지우기 포함)을 오프스크린
+            // 타깃의 "target init" 과 가른다.
+            self.gpu_profiler.wall_mark("W_TileSetup");
             self.device.bind_draw_target(draw_target);
 
             if self.device.get_capabilities().supports_qcom_tiled_rendering {
@@ -3174,6 +3188,9 @@ impl Renderer {
                         continue;
                     }
 
+                    // 2026-11-17 벽 GPU 시간 프로브(리뷰): 타이머를 셰이더 bind 앞으로 -- alpha 루프와
+                    // 같은 순서. 첫 사용 셰이더의 지연 컴파일이 앞 구간(W_TileSetup 등)에 실리지 않게.
+                    let _timer = self.gpu_profiler.start_timer(batch.key.kind.sampler_tag());
                     self.shaders.borrow_mut()
                         .get(&batch.key, batch.features, self.debug_flags, &self.device)
                         .bind(
@@ -3182,7 +3199,6 @@ impl Renderer {
                             &mut self.profile,
                         );
 
-                    let _timer = self.gpu_profiler.start_timer(batch.key.kind.sampler_tag());
                     self.draw_instanced_batch(
                         &batch.instances,
                         VertexArrayKind::Primitive,
@@ -5471,6 +5487,8 @@ impl Renderer {
             // the native render compositor can keep track of when to actually schedule
             // composition as surfaces are updated.
             if device_size.is_some() {
+                // 2026-11-17 벽 GPU 시간 프로브: 네이티브 합성 목록(외부 서피스 변환 포함).
+                self.gpu_profiler.wall_mark("W_CompositeNative");
                 frame.composite_state.composite_native(
                     self.clear_color,
                     &results.dirty_rects,
@@ -5521,6 +5539,8 @@ impl Renderer {
                         ResolvedSurfaceTexture::Native { id, size } => {
                             let surface_info = match self.current_compositor_kind {
                                 CompositorKind::Native { .. } => {
+                                    // 2026-11-17 벽 GPU 시간 프로브: DComp BeginDraw + pbuffer.
+                                    self.gpu_profiler.wall_mark("W_Bind");
                                     let compositor = self.compositor_config.compositor().unwrap();
                                     compositor.bind(
                                         &mut self.device,
@@ -5563,6 +5583,8 @@ impl Renderer {
                     if let ResolvedSurfaceTexture::Native { .. } = picture_target.surface {
                         match self.current_compositor_kind {
                             CompositorKind::Native { .. } => {
+                                // 2026-11-17 벽 GPU 시간 프로브: DComp EndDraw + pbuffer 해제.
+                                self.gpu_profiler.wall_mark("W_Unbind");
                                 let compositor = self.compositor_config.compositor().unwrap();
                                 compositor.unbind(&mut self.device);
                             }
@@ -5677,6 +5699,7 @@ impl Renderer {
                     // We have already queued surfaces for early native composition by this point.
                     // All that is left is to finally update any external native surfaces that were
                     // invalidated so that composition can complete.
+                    self.gpu_profiler.wall_mark("W_ExtSurfaces");
                     self.update_external_native_surfaces(
                         &frame.composite_state.external_surfaces,
                         results,
@@ -5709,6 +5732,12 @@ impl Renderer {
 
     pub fn get_debug_flags(&self) -> DebugFlags {
         self.debug_flags
+    }
+
+    /// 벽 GPU 시간 프로브의 훅을 건다(2026-11-17, servo `wall_gpu_probe.rs`). 훅은 이
+    /// 렌더러의 스레드에서만 불린다.
+    pub fn set_wall_gpu_hook(&mut self, hook: Option<Box<dyn crate::device::query::WallGpuHook>>) {
+        self.gpu_profiler.set_wall_hook(hook);
     }
 
     pub fn set_debug_flags(&mut self, flags: DebugFlags) {

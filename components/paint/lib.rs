@@ -189,6 +189,9 @@ mod touch;
 mod wall_tick;
 /// 벽 패스 구간 계측(2026-11-17). 스레드별 링 + 리포터. 근거는 모듈 주석.
 mod wall_span;
+// 2026-11-17 벽 GPU 시간·완료 프로브(`WALLGPU*`).
+#[cfg(windows)]
+mod wall_gpu_probe;
 mod web_content_animation;
 mod webrender_external_images;
 mod webview_renderer;

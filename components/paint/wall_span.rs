@@ -86,6 +86,19 @@ pub(crate) enum Kind {
     /// 비디오 fast-path(`present_external_only`)의 Commit(2026-11-17 리뷰 #4). a = 가드 전,
     /// b = 가드 후, c = Commit 뒤. flag 1 = hr < 0.
     ExternalCommit = 10,
+    /// GPU 시간 프로브의 프레임 하나(2026-11-17, `wall_gpu_probe`). id = painter 슬롯, seq = 패스,
+    /// a = GPU 구간 ns, b = 직전 프레임 끝부터 ns(모르면 u64::MAX), c = 프레임 끝 QPC.
+    /// flag: 1 = disjoint, 2 = 표지 상한, 4 = `update()` 안의 렌더, 8 = 재지 못함(슬롯 밀림).
+    GpuFrame = 11,
+    /// 같은 프레임의 CPU 쪽. a = CPU 구간 ns, b = 거두기 비용 ns, c = 표지 수.
+    GpuFrameMeta = 12,
+    /// 같은 프레임의 이름표 하나. a = GPU ns, b = CPU ns, c = (이름표 << 32) | 구간 수.
+    GpuLabel = 13,
+    /// 완료 프로브의 Signal. id = 디바이스 슬롯, seq = 펜스 값, a/b = 호출 앞뒤, c = 틱.
+    /// flag 1 = hr < 0.
+    GpuSignal = 14,
+    /// 완료 프로브의 깨움. id = 디바이스 슬롯, seq = 끝난 값, a = 깨어난 시각, b = 걸어 둔 시각.
+    GpuDone = 15,
 }
 
 impl Kind {
@@ -101,6 +114,11 @@ impl Kind {
             8 => Kind::Main,
             9 => Kind::SlotMap,
             10 => Kind::ExternalCommit,
+            11 => Kind::GpuFrame,
+            12 => Kind::GpuFrameMeta,
+            13 => Kind::GpuLabel,
+            14 => Kind::GpuSignal,
+            15 => Kind::GpuDone,
             _ => return None,
         })
     }
@@ -324,6 +342,51 @@ fn qpc_to_us(ticks: u64) -> u64 {
     qpc_to_ns(ticks) / 1000
 }
 
+/// QPC 틱을 ns 로(2026-11-17, `wall_gpu_probe` 가 링에 ns 로 싣는다).
+pub(crate) fn ticks_to_ns(ticks: u64) -> u64 {
+    qpc_to_ns(ticks)
+}
+
+/// QPC 를 UTC 벽시계 ms 로 바꾸는 기준점(리포터가 리포트마다 잡는다).
+#[derive(Clone, Copy)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct WallClock {
+    qpc: u64,
+    unix_ms: u64,
+}
+
+impl WallClock {
+    fn now() -> WallClock {
+        WallClock {
+            qpc: qpc().unwrap_or(0),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        }
+    }
+
+    fn unix_ms(&self, qpc: u64) -> u64 {
+        if qpc >= self.qpc {
+            self.unix_ms + qpc_to_us(qpc - self.qpc) / 1000
+        } else {
+            self.unix_ms
+                .saturating_sub(qpc_to_us(self.qpc - qpc) / 1000)
+        }
+    }
+
+    /// `HH:MM:SS.mmmZ` (WALLEVENT 와 같은 꼴).
+    fn format(&self, qpc: u64, with_ms: bool) -> String {
+        let ms = self.unix_ms(qpc);
+        let day = (ms / 1000) % 86_400;
+        let (h, m, s) = (day / 3600, (day / 60) % 60, day % 60);
+        if with_ms {
+            format!("{h:02}:{m:02}:{s:02}.{:03}Z", ms % 1000)
+        } else {
+            format!("{h:02}:{m:02}:{s:02}Z")
+        }
+    }
+}
+
 /// 리포터가 링에서 꺼낸 한 건.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Event {
@@ -398,6 +461,11 @@ fn totals() -> (u64, u64, u64, u64) {
 
 fn reporter(mode: String) {
     let started = std::time::Instant::now();
+    // 2026-11-17 GPU 프로브의 창 사이 상태(넘김, 되돌아보기, 초 누적). 기록을 한 번이라도 보면 켠다.
+    #[cfg(windows)]
+    let mut gpu_state = crate::wall_gpu_probe::ReportState::default();
+    #[cfg(windows)]
+    let mut gpu_seen = false;
     let mut window: Vec<Event> = Vec::with_capacity(16 * 1024);
     let mut grid: Option<(u64, u64)> = None;
     let (mut last_lost, mut last_n, mut last_sum) = (0, 0, 0);
@@ -437,6 +505,30 @@ fn reporter(mode: String) {
             qpc_to_us,
         ) {
             log::warn!("{line}");
+        }
+        // 2026-11-17 벽 GPU 프로브의 줄(켜져 있을 때만 기록이 있다). 벽시계 기준점은 리포트마다 다시
+        // 잡는다(리뷰) -- 창 안의 기록은 10 초 안쪽이라 시계 조정의 영향이 1 ms 아래로 묶인다.
+        #[cfg(windows)]
+        {
+            gpu_seen |= window
+                .iter()
+                .any(|e| matches!(e.kind, Kind::GpuFrame | Kind::GpuSignal | Kind::GpuDone));
+            if gpu_seen {
+                let clock = WallClock::now();
+                for line in crate::wall_gpu_probe::report(
+                    &mut gpu_state,
+                    started.elapsed().as_secs(),
+                    &window,
+                    &map,
+                    clock.qpc,
+                    qpc_to_us,
+                    |qpc| clock.format(qpc, true),
+                    |qpc| clock.format(qpc, false),
+                    |qpc| clock.unix_ms(qpc) / 1000,
+                ) {
+                    log::warn!("{line}");
+                }
+            }
         }
         window.clear();
     }

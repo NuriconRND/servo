@@ -184,6 +184,8 @@ pub use crate::composite::{MappableCompositor, MappedTileInfo, SWGLCompositeSurf
 pub use crate::device::{UploadMethod, VertexUsageHint, get_gl_target, get_unoptimized_shader_source};
 pub use crate::device::{ProgramBinary, ProgramCache, ProgramCacheObserver, FormatDesc, ShaderError};
 pub use crate::device::Device;
+// 2026-11-17: 벽 GPU 시간 프로브의 훅(servo components/paint/wall_gpu_probe.rs).
+pub use crate::device::query::WallGpuHook;
 pub use crate::profiler::{ProfilerHooks, set_profiler_hooks};
 pub use crate::renderer::{
     CpuProfile, DebugFlags, GpuProfile, GraphicsApi,
