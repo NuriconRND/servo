@@ -493,9 +493,22 @@ pub struct Preferences {
     /// 면적이다: 정지 비디오가 비디오 영역 대신 타일 전체를 다시 그린다. 런 13/14 에서 GPU 일은
     /// 프레임당 1~3 ms 였다.
     pub gfx_dcomp_full_tile_updates: bool,
-    /// 2026-11-17 추가 -- 불투명 서피스의 BeginDraw 갱신 영역도 타일 전체로 고정한다(A/B, 기본 0).
+    /// 2026-11-17 추가 -- 불투명 서피스의 BeginDraw 갱신 영역도 타일 전체로 고정한다. ★기본 2(noclear)★.
     /// `0` = 끔, `1` = 고정 + 유효 영역 밖 투명 지우기, `2` = 고정만(지우기 생략). 런처는
-    /// `-DcompOpaqueFullTile off|clear|noclear`.
+    /// `-DcompOpaqueFullTile off|clear|noclear`(기본 noclear).
+    ///
+    /// ★A/B 로 정한 기본값이고, 되돌아가면 보드 전환 judder 가 돌아온다★(2026-11-17 벽 런 16,
+    /// log_rotation_opacity_judder_01/16, 4284116d4c7, off/noclear/clear 교대 2+2+2).
+    /// - 운영자: noclear·clear 네 런 모두 "모든 전환 애니메이션에서 육안 judder 없음".
+    ///   off 는 예전대로 judder 가 있었다.
+    /// - 전환당 늦은 렌더(16.7 ms 초과): off 27.5, noclear 0.07, clear 0.21.
+    /// - 막힌 제출(4 ms 이상): 151 대 2.9 대 3.3.
+    /// - 기전(bind 별 계측): off 에서 갱신 크기가 바뀐 bind 의 BeginDraw 는 90.1% 가 느렸고(120 us 초과),
+    ///   크기가 같으면 4.4% 였다. 켜면 불투명 bind 29,372 개가 모두 5760x2160 하나로 고정됐다.
+    /// - noclear 를 고른 이유: GPU 가 bind 당 약 +0.1 ms 다. clear 는 약 +1.0 ms 이고, 정지 비디오
+    ///   프레임 5.4% 가 GPU 완료 12 ms 이상 늦었다(noclear 0.66%).
+    /// - 운영자 확인(2026-11-17): noclear 에서 눈에 띄는 잔상이 없고, 정지 비디오 두 경우 모두 이상이
+    ///   없었다.
     ///
     /// 왜: 벽 런 15(log_rotation_opacity_judder_01/15)에서 `gfx_dcomp_full_tile_updates` 는
     /// 구조상 효과가 없었다. 보드가 움직이면 유효 영역이 바뀌어 WR 이 타일을 통째로 무효화하고,
@@ -2110,7 +2123,7 @@ impl Preferences {
             gfx_dcomp_parallel_commit_wait_all: false,
             gfx_dcomp_update_quantum_px: -1, // 타일 전체. 근거는 필드 doc 주석
             gfx_dcomp_full_tile_updates: false,
-            gfx_dcomp_opaque_full_tile: 0,
+            gfx_dcomp_opaque_full_tile: 2, // noclear. 근거는 필드 doc 주석(벽 런 16)
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
@@ -2413,6 +2426,17 @@ mod tests {
     /// 2,668 -> 9 회였다(스펙 `docs/superpowers/specs/2026-10-20-dcomp-commit-probe-and-
     /// surface-reuse-design.md` 8-4 절). 숫자가 로그에만 남아 있으면 다음 사람이 "기본은
     /// 끄는 게 안전하지" 로 되돌리기 쉽다.
+    /// 2026-11-17: 불투명 서피스의 BeginDraw 고정(noclear)이 기본이다. 벽 런 16 에서 이 값 하나로
+    /// 전환당 늦은 렌더가 27.5 에서 0.07 로 줄었다 -- 근거는 필드 doc 주석.
+    #[test]
+    fn the_opaque_full_tile_lever_defaults_to_noclear() {
+        assert_eq!(
+            Preferences::const_default().gfx_dcomp_opaque_full_tile,
+            2,
+            "0 (off) gave 27.5 late renders per board-swap transition on the wall against 0.07 for 2"
+        );
+    }
+
     #[test]
     fn the_dcomp_update_quantum_defaults_to_the_whole_tile() {
         assert_eq!(
