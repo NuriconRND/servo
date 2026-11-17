@@ -2362,11 +2362,27 @@ impl DCompNativeCompositor {
             // 가드는 `Commit()` 한 줄만 감싼다. 위의 external 배치 작업은 DComp 디바이스가
             // 아니라 D3D11 컨텍스트를 만지므로 가드 밖이 맞다. 실패 로그도 가드를 푼 뒤에
             // 찍는다(`note_commit_failure` 주석).
-            let hr = {
+            // ★2026-11-17 `wall_span`★(리뷰 #4) -- 넷째 Commit 자리. 시각은 지역 변수에만 담고, 링에
+            // 쓰는 것은 가드를 푼 뒤다.
+            let before_guard = crate::wall_span::now();
+            let (hr, guard_at, end_at) = {
                 let _commit_guard = crate::commit_guard::device_guard(dcomp_device as usize);
+                let guard_at = crate::wall_span::now();
                 // Safety: dcomp_device는 rendering_context가 수명을 보장하는 살아있는 COM 포인터.
-                unsafe { raw_commit(dcomp_device) }
+                let hr = unsafe { raw_commit(dcomp_device) };
+                (hr, guard_at, crate::wall_span::now())
             };
+            if let (Some(a), Some(b), Some(c)) = (before_guard, guard_at, end_at) {
+                crate::wall_span::record(
+                    crate::wall_span::Kind::ExternalCommit,
+                    crate::wall_span::device_slot(dcomp_device as usize),
+                    u8::from(hr < 0),
+                    crate::wall_span::current_tick(),
+                    a,
+                    b,
+                    c,
+                );
+            }
             note_commit_failure(hr, dcomp_device as usize, "present_external_only");
         }
     }

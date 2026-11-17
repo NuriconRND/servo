@@ -19,14 +19,18 @@
 //! ## 기록 규칙 (no-io-on-timing-critical-threads)
 //!
 //! - 기록하는 스레드(메인, painter, 커밋 워커)는 ★자기 링에만★ 쓴다. 링은 스레드가 처음 기록할 때
-//!   한 번 차지하고(원자 증가 하나) 그 뒤로는 그 스레드 혼자 쓴다. 기록 한 번은 QPC 읽기와 원자
-//!   저장 넷이고 락·할당·syscall 이 없다(QPC 는 사용자 모드 `rdtsc` 계열이다).
+//!   한 번 차지하고(원자 증가 하나) 그 뒤로는 그 스레드 혼자 쓴다. 구간 하나(`record_span`)는 QPC
+//!   읽기 둘(시작은 호출자가 [`now`] 로)과 원자 저장 다섯(칸 넷 + 머리)이고 락·할당·syscall 이 없다
+//!   (QPC 는 사용자 모드 `rdtsc` 계열이다, 2026-11-17 리뷰 #14 로 수를 바로잡았다).
+//! - 링 메모리(정적 약 2 MiB)는 켤 때 페이지마다 한 번 건드려 둔다 -- 기록 스레드가 처음 닿는 페이지에서
+//!   소프트 페이지 폴트를 맞지 않게 하려는 것이다(리뷰 #12).
 //! - 링이 차면 ★새 기록을 버리고★ `lost` 를 올린다. 덮어쓰지 않는다. `lost > 0` 인 창은 판정에
 //!   쓰지 않는다.
 //! - 리포터(`WallSpan` 스레드)가 250 ms 마다 링을 비우고 10 초마다 창 값을 `warn!` 한 줄씩 찍는다.
 //!   DWM 합성 격자(`DwmGetCompositionTimingInfo`)도 리포터만 묻는다.
 //! - 기록 비용 자체를 잰다: 링마다 1024 번째 기록을 QPC 로 감싸 그 시간을 쌓고, 리포터가 창마다
-//!   평균과 최댓값을 찍는다(`rec_ns`).
+//!   평균과 최댓값을 찍는다(`rec_ns`). ★그 값은 원자 저장들 + QPC 한 번이다★ -- 구간 하나의 비용은
+//!   거기에 QPC 한 번(약 20~40 ns)이 더해진다.
 //! - 꺼져 있으면 각 자리에서 `AtomicBool` 로드 하나다(`now()` 가 `None`).
 //!
 //! ## 줄 읽는 법
@@ -79,6 +83,9 @@ pub(crate) enum Kind {
     /// painter 슬롯과 디바이스·타일의 대응. id = painter 슬롯, a = 디바이스 슬롯,
     /// b = 타일 x, c = 타일 y. 처음 렌더할 때 한 번.
     SlotMap = 9,
+    /// 비디오 fast-path(`present_external_only`)의 Commit(2026-11-17 리뷰 #4). a = 가드 전,
+    /// b = 가드 후, c = Commit 뒤. flag 1 = hr < 0.
+    ExternalCommit = 10,
 }
 
 impl Kind {
@@ -93,6 +100,7 @@ impl Kind {
             7 => Kind::RecoverCommit,
             8 => Kind::Main,
             9 => Kind::SlotMap,
+            10 => Kind::ExternalCommit,
             _ => return None,
         })
     }
@@ -337,6 +345,12 @@ pub(crate) fn start(mode: String) {
     {
         return;
     }
+    // 링 페이지를 한 번씩 건드려 둔다(리뷰 #12). 칸 하나가 32 바이트라 128 칸이 4 KiB 한 쪽이다.
+    for ring in RING.iter() {
+        for index in (0..CAP).step_by(128) {
+            ring.slots[index][0].store(0, Ordering::Relaxed);
+        }
+    }
     ENABLED.store(true, Ordering::Relaxed);
     let spawned = std::thread::Builder::new()
         .name(String::from("WallSpan"))
@@ -444,12 +458,45 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 fn p50_p95_max(mut values: Vec<u64>) -> String {
+    // 빈 것은 0 이 아니라 `-` 다(리뷰 #15) -- "잰 값이 0" 과 "잰 것이 없다" 를 갈라야 한다.
+    if values.is_empty() {
+        return String::from("-");
+    }
     values.sort_unstable();
     format!(
         "{}/{}/{}",
         percentile(&values, 0.5),
         percentile(&values, 0.95),
         values.last().copied().unwrap_or(0)
+    )
+}
+
+/// ★위상은 원형 변수다★(2026-11-17 리뷰 #5) -- `-DwmAlign 0` 이면 위상이 99/0 근처에 모이는데, 선형
+/// 백분위는 그것을 "p50 1, p95 99" 처럼 찍어 판정을 뒤집는다(`tick_phase_probe::circular_summary` 의
+/// 같은 함정). 원형 평균 방향의 반대편을 원점으로 돌려 백분위를 뽑고 원래 좌표로 되돌린다.
+/// `p50/p05~p95/R` 로 내고, `R`(0~1)이 작으면 백분위를 믿지 말 것. 비었으면 `-`.
+pub(crate) fn circular_phase(values: &[u64]) -> String {
+    if values.is_empty() {
+        return String::from("-");
+    }
+    let (mut sx, mut sy) = (0.0f64, 0.0f64);
+    for v in values {
+        let angle = 2.0 * std::f64::consts::PI * (*v as f64 + 0.5) / 100.0;
+        sx += angle.cos();
+        sy += angle.sin();
+    }
+    let concentration = sx.hypot(sy) / values.len() as f64;
+    let mean = (sy.atan2(sx) / (2.0 * std::f64::consts::PI) * 100.0).rem_euclid(100.0) as u64 % 100;
+    let origin = (mean + 50) % 100;
+    let mut rotated: Vec<u64> = values.iter().map(|v| (v + 100 - origin) % 100).collect();
+    rotated.sort_unstable();
+    let back = |p: f64| (percentile(&rotated, p) + origin) % 100;
+    format!(
+        "{}/{}~{}/R{:.2}",
+        back(0.5),
+        back(0.05),
+        back(0.95),
+        concentration
     )
 }
 
@@ -526,7 +573,8 @@ pub(crate) fn report_lines(
         map.push(format!("p{}=d{}@{},{}", e.id, e.a, e.b, e.c));
     }
     lines.push(format!(
-        "WALLSPAN t={t_secs}s w=10s {mode} records={} lost={} rec_ns={}/{} map={}",
+        "WALLSPAN t={t_secs}s w=10s {mode} grid={} records={} lost={} rec_ns={}/{} map={}",
+        if grid.is_some() { "ok" } else { "none" },
         events.len(),
         cost.lost,
         cost.mean_ns,
@@ -567,24 +615,11 @@ pub(crate) fn report_lines(
     }
     let (xpass, over_xpass) = cross_pass_overlaps(&renders, to_us);
     // 같은 틱 안에서 가장 늦은 painter 와 가장 이른 painter 의 틱 차(렌더 시작 순서로).
-    let lag_max = {
-        let mut latest = [0u64; MAX_SLOTS];
-        let mut lag = 0;
-        let mut sorted = renders.clone();
-        sorted.sort_by_key(|r| r.a);
-        for r in &sorted {
-            let slot = (r.id as usize).min(MAX_SLOTS - 1);
-            latest[slot] = r.seq;
-            let seen: Vec<u64> = latest[..slots].iter().copied().filter(|&s| s > 0).collect();
-            if let (Some(min), Some(max)) = (seen.iter().min(), seen.iter().max()) {
-                lag = lag.max(max - min);
-            }
-        }
-        lag
-    };
+    // `lag_max` 는 뺐다(2026-11-17 리뷰 #13) -- 결합 모드에서도 틱 경계마다 1 이상이 나와 분리와
+    // 비교할 수 없었다. 분리 판정은 `xpass` 로 한다.
     lines.push(format!(
         "WALLDETACH t={t_secs}s w=10s renders={} over={} inline={} xpass={} over_xpass={} \
-         busy_skip={} refused={} lag_max={lag_max}",
+         busy_skip={} refused={}",
         per_slot(&count, slots),
         per_slot(&over, slots),
         if inline.is_empty() {
@@ -625,19 +660,20 @@ pub(crate) fn report_lines(
         .filter(|e| {
             matches!(
                 e.kind,
-                Kind::TickCommit | Kind::InframeCommit | Kind::RecoverCommit
+                Kind::TickCommit | Kind::InframeCommit | Kind::RecoverCommit | Kind::ExternalCommit
             )
         })
         .collect();
     // (시작, 끝) -- 동시성 판정용. 틱 Commit 은 가드를 잡은 뒤부터다.
     let span_of = |e: &Event| match e.kind {
-        Kind::TickCommit | Kind::RecoverCommit => (e.b, e.c),
+        Kind::TickCommit | Kind::RecoverCommit | Kind::ExternalCommit => (e.b, e.c),
         _ => (e.a, e.b),
     };
     for (site, kind) in [
         ("tick", Kind::TickCommit),
         ("inframe", Kind::InframeCommit),
         ("recover", Kind::RecoverCommit),
+        ("external", Kind::ExternalCommit),
     ] {
         for device in 0..MAX_SLOTS as u8 {
             let mine: Vec<&&Event> = commits
@@ -677,25 +713,18 @@ pub(crate) fn report_lines(
                 }
             }
             let n = mine.len();
-            let mut issue_sorted = issue.clone();
-            issue_sorted.sort_unstable();
-            start_phase.sort_unstable();
-            end_phase.sort_unstable();
             lines.push(format!(
                 "WALLCOMMIT t={t_secs}s w=10s site={site} dev={device} n={n} dur_us={} \
-                 issue_us={}/{} conc={}/{}/{}/{} long={long} start_phase={}/{} \
-                 end_phase={}/{} rej={rejected}",
+                 issue_us={} conc={}/{}/{}/{} long={long} start_phase={} end_phase={} \
+                 rej={rejected}",
                 p50_p95_max(durations),
-                percentile(&issue_sorted, 0.5),
-                issue_sorted.last().copied().unwrap_or(0),
+                p50_p95_max(issue),
                 conc[0],
                 conc[1],
                 conc[2],
                 conc[3],
-                percentile(&start_phase, 0.5),
-                percentile(&start_phase, 0.95),
-                percentile(&end_phase, 0.5),
-                percentile(&end_phase, 0.95),
+                circular_phase(&start_phase),
+                circular_phase(&end_phase),
             ));
         }
     }
@@ -876,6 +905,14 @@ mod tests {
             .find(|l| l.starts_with("WALLMAINWAIT"))
             .unwrap();
         assert!(main.contains("join_us=1:20000/20000/20000"), "{main}");
+    }
+
+    #[test]
+    fn phases_around_the_grid_point_are_summarised_on_the_circle() {
+        // 99/0 근처에 모인 위상. 선형이면 p50 이 0 이나 99 로 뒤집히고 p95 가 99 가 된다.
+        let summary = circular_phase(&[98, 99, 99, 0, 0, 1, 2]);
+        assert!(summary.starts_with("0/98~2/R"), "{summary}");
+        assert_eq!(circular_phase(&[]), "-");
     }
 
     #[test]

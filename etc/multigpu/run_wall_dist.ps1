@@ -156,8 +156,9 @@ param(
     # -DcompParallelCommit did not decouple the painters in log_rotation_opacity_judder_01/11 and
     # no Commit had ever been timed; these lines show whether a tile really starts its next render
     # while another is still rendering (xpass), whether Commits overlap (conc) and where they
-    # end on the DWM grid (end_phase). Recording is two QPC reads and four atomic stores on the
-    # recording thread; rec_ns reports what that costs.
+    # end on the DWM grid (end_phase, a circular p50/p05~p95/R summary). Recording one span is
+    # two QPC reads and five atomic stores on the recording thread; rec_ns reports the stores
+    # plus one QPC read. Commit sites: tick, in-frame, recovery and the video fast path.
     [switch] $SpanProbe,
     # (2026-11-13) gfx_wr_image_tiling_threshold -- images wider or taller than this are split
     # into 512 px tiles in the shared atlas, and only visible tiles are requested, so rotation
