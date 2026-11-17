@@ -77,7 +77,9 @@
 //! DWM 조회)와 실패 로그와 위상 기록은 전부 가드 밖으로 뺀다.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use log::warn;
 
@@ -131,6 +133,101 @@ pub(crate) fn device_guard(device: usize) -> std::sync::MutexGuard<'static, ()> 
 static PARALLEL_COMMIT: LazyLock<bool> =
     LazyLock::new(|| servo_config::pref!(gfx_dcomp_parallel_commit));
 
+/// `-DcompParallelCommit` 의 2026-10-23 동작(메인이 Commit 넷을 다 기다림)으로 되돌리는 스위치
+/// (2026-11-17, `gfx_dcomp_parallel_commit_wait_all`). 같은 dist 로 A/B 하려고 남긴다.
+static PARALLEL_COMMIT_WAIT_ALL: LazyLock<bool> =
+    LazyLock::new(|| servo_config::pref!(gfx_dcomp_parallel_commit_wait_all));
+
+/// ★디바이스 관문이 켜져 있나★(2026-11-17). 병렬 Commit 이고, 옛 동작이 아니고, 커밋이 틱 머리에서
+/// 나갈 때(`gfx_dcomp_commit_in_end_frame` 꺼짐)다. 켜져 있으면 메인은 틱 머리 Commit 을 내고
+/// 기다리지 않으며, 각 painter 가 렌더 직전에 ***자기 디바이스의*** Commit 만 기다린다
+/// ([`DeviceCommitState::wait_idle`]).
+///
+/// ★왜 디바이스 단위면 충분한가★ -- 기다림이 지키던 것은 셋이었다(2026-10-23 `cdc94797fda`,
+/// `aa266d2c421`): (1) 네 Commit 이 같은 DWM 합성에 실린다, (2) 틱 Commit 이 그 패스의 `BeginDraw`
+/// 보다 먼저 나간다, (3) 한 디바이스를 두 스레드가 동시에 만지지 않는다. (1) 은 넷을 ***동시에
+/// 내는 것***으로 서고 끝날 때까지 기다리는 것과 무관하다(추론, 계측 `WALLCOMMITTICK spread_end` 로
+/// 확인한다). (2) 와 (3) 은 디바이스마다의 순서다 -- v1 디바이스는 ***같은 디바이스***의 서피스가
+/// `BeginDraw` 로 열려 있을 때만 Commit 을 거부한다(메모리 `dcomp-v1-commit-rejects-open-surface`).
+/// 그래서 painter k 가 자기 디바이스 k 의 Commit 만 기다리면 셋이 다 선다.
+pub(crate) static DEVICE_GATED: LazyLock<bool> = LazyLock::new(|| {
+    *PARALLEL_COMMIT
+        && !*PARALLEL_COMMIT_WAIT_ALL
+        && !servo_config::pref!(gfx_dcomp_commit_in_end_frame)
+});
+
+/// 관문의 시한. 이보다 오래 기다리면 그냥 진행하고 `wall_span` 에 시한 초과로 남긴다(그 뒤 v1 거부가
+/// 나면 `SURFACE_BEING_RENDERED` 경고가 이름 붙여 찍힌다). 벽에서 관측된 가장 긴 Commit 대기는
+/// 수십 ms 대라(log_rotation_opacity_judder_01/09: 넘친 렌더 17~43 ms) 그 위로 둔다.
+pub(crate) const GATE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// ★디바이스 하나의 비행 중인 틱 Commit 수와 그것을 기다리는 자리★(2026-11-17). 디바이스 가드와
+/// 같은 이유로 프로세스 수명으로 누수시킨다(디바이스는 넷이고 프로세스 내내 산다).
+pub(crate) struct DeviceCommitState {
+    outstanding: AtomicU32,
+    lock: Mutex<()>,
+    done: Condvar,
+}
+
+impl DeviceCommitState {
+    fn begin(&self) {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finish(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // 기다리는 쪽은 자물쇠를 쥔 채 확인하고 잠들므로, 자물쇠를 잡고 알리면 놓치지 않는다.
+            let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.done.notify_all();
+        }
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.outstanding.load(Ordering::Acquire) == 0
+    }
+
+    /// 이 디바이스의 틱 Commit 이 다 끝나기를 기다린다. 돌려주는 값은 시한을 넘겼는가다.
+    pub(crate) fn wait_idle(&self, timeout: Duration) -> bool {
+        if self.is_idle() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !self.is_idle() {
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            held = match self.done.wait_timeout(held, deadline - now) {
+                Ok((held, _)) => held,
+                Err(poison) => poison.into_inner().0,
+            };
+        }
+        false
+    }
+}
+
+static DEVICE_STATES: Mutex<Option<HashMap<usize, &'static DeviceCommitState>>> = Mutex::new(None);
+
+/// 디바이스의 Commit 상태. painter 는 한 번 찾아 들고 있고, 메인은 틱마다 찾는다(메인만 잡는 자물쇠다).
+pub(crate) fn device_commit_state(device: usize) -> &'static DeviceCommitState {
+    let mut guard = DEVICE_STATES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .entry(device)
+        .or_insert_with(|| {
+            &*Box::leak(Box::new(DeviceCommitState {
+                outstanding: AtomicU32::new(0),
+                lock: Mutex::new(()),
+                done: Condvar::new(),
+            }))
+        })
+}
+
+/// 디바이스 -> 그 디바이스를 맡는 워커(2026-11-17). 위치가 아니라 디바이스로 고정해야 한 디바이스의
+/// Commit 이 늘 같은 워커에서 순서대로 나간다. 메인만 만진다.
+static DEVICE_WORKER: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
 /// 커밋 하나를 맡는 상주 워커의 손잡이.
 struct CommitWorker {
     jobs: std::sync::mpsc::Sender<CommitJob>,
@@ -143,6 +240,8 @@ struct CommitJob {
     device: usize,
     issued: u64,
     tick: u64,
+    /// 디바이스 관문 경로인가. 참이면 워커가 Commit 뒤에 그 디바이스의 비행 수를 내린다.
+    gated: bool,
 }
 
 /// 틱 Commit 하나를 내고 `wall_span` 에 남긴다. ★기록은 가드를 푼 뒤다★ --
@@ -192,6 +291,9 @@ fn worker_loop(
 ) {
     for job in jobs {
         let hr = commit_and_record(job);
+        if job.gated {
+            device_commit_state(job.device).finish();
+        }
         if done.send((job.device, hr)).is_err() {
             return;
         }
@@ -239,7 +341,12 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
         device,
         issued: crate::wall_span::now().unwrap_or(0),
         tick,
+        gated: false,
     };
+    if devices.len() > 1 && *DEVICE_GATED {
+        commit_all_at_tick_gated(devices, tick);
+        return;
+    }
     let dispatched = if devices.len() > 1 && *PARALLEL_COMMIT {
         let available = ensure_workers(devices.len());
         let n = available.min(devices.len());
@@ -282,5 +389,126 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     // I/O 라, 워커에 흩으면 "임계구역은 `Commit()` 한 줄" 규칙이 무너진다.
     for (device, hr) in done {
         crate::dcomp_compositor::note_tick_commit(device, hr);
+    }
+}
+
+/// ★디바이스 관문 경로★(2026-11-17, [`DEVICE_GATED`]). Commit 넷을 디바이스마다 정해진 워커에 동시에
+/// 내고 ***기다리지 않는다.*** 각 디바이스의 비행 수를 올려 두면, 그 디바이스의 painter 가 다음 렌더
+/// 직전에 그것이 0 이 되기를 기다린다(`Painter::wait_for_own_device_commits`).
+///
+/// 지난 틱의 결과(실패 로그)는 여기서 기다리지 않고 거둔다 -- 메인이 기다리지 않으므로 결과는 한 틱
+/// 늦게 부기된다. 워커를 못 쓰는 디바이스는 예전처럼 이 스레드에서 직접 낸다.
+fn commit_all_at_tick_gated(devices: Vec<usize>, tick: u64) {
+    if let Some((_, rx)) = DONE.get()
+        && let Ok(rx) = rx.lock()
+    {
+        while let Ok((device, hr)) = rx.try_recv() {
+            crate::dcomp_compositor::note_tick_commit(device, hr);
+        }
+    }
+    let available = ensure_workers(devices.len());
+    let mut serial = Vec::new();
+    {
+        let workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut assignment = DEVICE_WORKER.lock().unwrap_or_else(|e| e.into_inner());
+        let assignment = assignment.get_or_insert_with(HashMap::new);
+        for device in devices {
+            let next = assignment.len();
+            let index = *assignment.entry(device).or_insert(next);
+            if index >= available.min(workers.len()) {
+                serial.push(device);
+                continue;
+            }
+            let state = device_commit_state(device);
+            state.begin();
+            let job = CommitJob {
+                device,
+                issued: crate::wall_span::now().unwrap_or(0),
+                tick,
+                gated: true,
+            };
+            if workers[index].jobs.send(job).is_err() {
+                state.finish();
+                serial.push(device);
+            }
+        }
+    }
+    for device in serial {
+        let hr = commit_and_record(CommitJob {
+            device,
+            issued: crate::wall_span::now().unwrap_or(0),
+            tick,
+            gated: false,
+        });
+        crate::dcomp_compositor::note_tick_commit(device, hr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // 2026-11-17: 디바이스 관문. 놓친 깨우기가 있으면 painter 가 시한까지 멈추고, 시한이 없으면
+    // 워커가 죽었을 때 영원히 멈춘다 -- 둘 다 여기서 본다.
+    use super::*;
+
+    fn state() -> &'static DeviceCommitState {
+        &*Box::leak(Box::new(DeviceCommitState {
+            outstanding: AtomicU32::new(0),
+            lock: Mutex::new(()),
+            done: Condvar::new(),
+        }))
+    }
+
+    #[test]
+    fn an_idle_device_does_not_wait() {
+        let state = state();
+        let start = Instant::now();
+        assert!(!state.wait_idle(Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_painter_wakes_when_its_device_commit_finishes() {
+        let state = state();
+        state.begin();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            state.finish();
+        });
+        let start = Instant::now();
+        let timed_out = state.wait_idle(Duration::from_secs(5));
+        worker.join().unwrap();
+        assert!(!timed_out);
+        assert!(
+            start.elapsed() >= Duration::from_millis(20),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(state.is_idle());
+    }
+
+    #[test]
+    fn a_stuck_commit_times_out_instead_of_hanging() {
+        let state = state();
+        state.begin();
+        let start = Instant::now();
+        assert!(state.wait_idle(Duration::from_millis(40)));
+        assert!(start.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[test]
+    fn two_outstanding_commits_both_have_to_finish() {
+        let state = state();
+        state.begin();
+        state.begin();
+        state.finish();
+        assert!(!state.is_idle());
+        assert!(state.wait_idle(Duration::from_millis(20)));
+        state.finish();
+        assert!(!state.wait_idle(Duration::from_millis(20)));
     }
 }

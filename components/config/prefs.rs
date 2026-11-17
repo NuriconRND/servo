@@ -429,6 +429,14 @@ pub struct Preferences {
     /// painter 에서 **왕복**이 되므로 남는 것은 패스마다 OS 스레드 넷을 새로 만드는
     /// 비용뿐이다. 켜지 않으면 Commit 은 이미 존재하는 그 페인터 스레드 안에서 돈다.
     pub gfx_dcomp_parallel_commit: bool,
+    /// ★`gfx_dcomp_parallel_commit` 의 2026-10-23 동작으로 되돌린다★(2026-11-17 추가, 기본 꺼짐).
+    ///
+    /// 2026-11-17 부터 병렬 Commit 은 메인이 Commit 넷을 내고 ***기다리지 않으며***, 각 painter 가
+    /// 렌더 직전에 자기 디바이스의 Commit 만 기다린다(`commit_guard::DEVICE_GATED`). 그 전에는 메인이
+    /// 넷이 다 끝나기를 기다린 뒤 렌더를 시작했다 -- 한 디바이스의 긴 Commit 이 네 화면의 렌더를 모두
+    /// 늦추는 결합이었다(log_rotation_opacity_judder_01/11 16 런). 이 pref 를 켜면 그 옛 동작이다.
+    /// 같은 dist 로 A/B 하려고 남긴다. 런처는 `-ParallelCommitWaitAll`.
+    pub gfx_dcomp_parallel_commit_wait_all: bool,
     /// ★낡음(2026-10-20 기록, 같은 날 `b24687d184c` 이후 무효)★ — 기본값은 `-1`(:1273)이고 `0` 은 A/B 의 off 팔이다. 435 행도 같이 낡았다(449 행이 현재 값).
     /// `expand_transparent` 경로의 `BeginDraw` 갱신 렉트를 고정 격자로 키운다. 기본 `0`(끔).
     ///
@@ -2045,6 +2053,7 @@ impl Preferences {
             gfx_webgl_swap_sync: String::new(), // 빈 문자열 = off
             gfx_webgl_stage_to_painter_device: false,
             gfx_dcomp_parallel_commit: false,
+            gfx_dcomp_parallel_commit_wait_all: false,
             gfx_dcomp_update_quantum_px: -1, // 타일 전체. 근거는 필드 doc 주석
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,

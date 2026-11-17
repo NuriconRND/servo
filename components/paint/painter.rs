@@ -257,6 +257,11 @@ pub(crate) struct Painter {
     /// 슬롯 대응(`wall_span::Kind::SlotMap`)을 이미 찍었나. 한 번만 찍는다.
     span_mapped: Cell<bool>,
 
+    /// 이 painter 의 디바이스 Commit 상태(2026-11-17, 디바이스 관문). 처음 쓸 때 찾아 들고 있는다 --
+    /// 렌더마다 전역 자물쇠를 잡지 않으려는 것이다.
+    #[cfg(windows)]
+    commit_state: std::cell::OnceCell<Option<&'static crate::commit_guard::DeviceCommitState>>,
+
     /// `Paint` 로 되돌아가는 통로. `WebViewRenderer` 가 애니메이션 상태 통보를 여기로 보낸다
     /// — 예전에는 `Box<dyn WebViewTrait>` 를 직접 들고 불렀다(설계 §3.2).
     paint_proxy: PaintProxy,
@@ -592,8 +597,10 @@ fn profiler_hud_flags(ui: Option<&str>) -> webrender::DebugFlags {
 fn wall_span_mode() -> String {
     let commit = if pref!(gfx_dcomp_commit_in_end_frame) {
         "inframe"
+    } else if pref!(gfx_dcomp_parallel_commit) && pref!(gfx_dcomp_parallel_commit_wait_all) {
+        "tick-parallel-waitall"
     } else if pref!(gfx_dcomp_parallel_commit) {
-        "tick-parallel"
+        "tick-parallel-device"
     } else {
         "tick-serial"
     };
@@ -1041,6 +1048,8 @@ impl Painter {
             span_slot: crate::wall_span::next_painter_slot(),
             span_pass: Cell::new(0),
             span_mapped: Cell::new(false),
+            #[cfg(windows)]
+            commit_state: std::cell::OnceCell::new(),
             paint_proxy: paint.paint_proxy,
             canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
             screenshot_taker: Default::default(),
@@ -1797,6 +1806,11 @@ impl Painter {
 
     #[servo_tracing::instrument(skip_all)]
     pub(crate) fn render(&mut self, time_profiler_channel: &ProfilerChan) {
+        // ★2026-11-17 디바이스 관문★ -- 이 디바이스의 틱 Commit 이 아직 돌면 끝나기를 기다린다
+        // (`-DcompParallelCommit`, 옛 동작이 아닐 때만). ★ANGLE 락을 잡기 전★이다 -- 쥔 채 기다리면
+        // 같은 디바이스의 WebGL 스레드가 그 뒤에 줄을 서는 회귀 부류가 된다(`commit_guard` 모듈 주석).
+        #[cfg(windows)]
+        self.wait_for_own_device_commits();
         self.flush_owed_canvas_ack();
         {
             let now = Instant::now();
@@ -1988,6 +2002,39 @@ impl Painter {
     /// 이 painter 가 `render()` 끝에서 스스로 present 하게 한다. 타일 스레드 경로 전용이다.
     pub(crate) fn take_over_presentation(&mut self) {
         self.owns_presentation = true;
+    }
+
+    /// 이 painter 디바이스의 Commit 상태(없으면 `None`). 처음 한 번만 찾는다.
+    #[cfg(windows)]
+    fn own_commit_state(&self) -> Option<&'static crate::commit_guard::DeviceCommitState> {
+        *self.commit_state.get_or_init(|| {
+            self.dcomp_device()
+                .map(crate::commit_guard::device_commit_state)
+        })
+    }
+
+    /// 디바이스 관문(2026-11-17). 켜져 있지 않으면 아무것도 하지 않고, 기다릴 것이 없으면 원자 로드
+    /// 하나다. 기다렸으면 `wall_span` 에 `Gate` 로 남긴다(시한 초과는 flag 1).
+    #[cfg(windows)]
+    fn wait_for_own_device_commits(&self) {
+        if !*crate::commit_guard::DEVICE_GATED {
+            return;
+        }
+        let Some(state) = self.own_commit_state() else {
+            return;
+        };
+        if state.is_idle() {
+            return;
+        }
+        let start = crate::wall_span::now();
+        let timed_out = state.wait_idle(crate::commit_guard::GATE_TIMEOUT);
+        crate::wall_span::record_span(
+            crate::wall_span::Kind::Gate,
+            self.span_slot,
+            u8::from(timed_out),
+            self.span_pass.get(),
+            start,
+        );
     }
 
     /// 다음 렌더를 보낸 틱을 싣는다(`wall_span`, 2026-11-17).
@@ -3275,6 +3322,16 @@ impl Painter {
         // 격자가 영영 비어 기능이 통째로 무력해진다. B1 에서 프로브를 그렇게 두어 똑같이
         // 당한 적이 있다(설계 문서 C5).
         if crate::commit_guard::SAMPLE_LEAD_PERIODS.is_none() {
+            return;
+        }
+        // ★2026-11-17 디바이스 관문★ -- 이 디바이스의 틱 Commit 이 아직 돌면 이번 조회는 건너뛴다.
+        // 기다리면 gather 팬아웃을 통해 메인이 다시 그 Commit 을 기다리게 되고, 조회 하나 빠지는 것은
+        // 다음 틱 값으로 메워진다.
+        if *crate::commit_guard::DEVICE_GATED
+            && self
+                .own_commit_state()
+                .is_some_and(|state| !state.is_idle())
+        {
             return;
         }
         let Some(monitor) = self.tile_monitor() else {
