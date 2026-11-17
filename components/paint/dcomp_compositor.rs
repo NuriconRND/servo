@@ -1282,12 +1282,12 @@ pub(crate) fn composition_grid() -> Option<(u64, u64)> {
 ///
 /// 가드 없는 커밋이 이 브랜치에서 세 번 따로 발견됐다 -- `present_external_only`(라운드 1),
 /// `begin_frame` → `flush_deferred_commit` → `commit_device`, 그리고 셸이 틱에서 내는
-/// `commit_at_tick_locked`. 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로
+/// `commit_at_tick_timed`. 하나씩 찾아 고치는 방식이 세 번 실패했으므로 호출 자체를 한 점으로
 /// 모은다. 새 커밋 지점을 만들려면 이 함수를 지나갈 수밖에 없고, 그러면 "가드는?" 이라는
 /// 질문을 그 자리에서 하게 된다. 이 파일 밖에서 `(*device).Commit()` 을 직접 쓰면 그 질문을
 /// 건너뛰는 것이다.
 ///
-/// 가드 밖에서 부르는 정문은 [`commit_at_tick_locked`] 하나다. 이미 가드를 쥔 자리
+/// 가드 밖에서 부르는 정문은 [`commit_at_tick_timed`] 하나다. 이미 가드를 쥔 자리
 /// (`end_frame`)는 `raw_commit` 을 직접 쓴다.
 ///
 /// `DCOMPOSITION_ERROR_SURFACE_BEING_RENDERED`. 그 디바이스의 서피스가 `BeginDraw` 로
@@ -1362,13 +1362,20 @@ pub(crate) fn note_commit_failure(hr: i32, device: usize, site: &str) {
 /// I/O 라, 네 워커에서 동시에 돌리면 "가드 안에서 하는 일은 `Commit()` 하나" 가 무너진다.
 ///
 /// Safety 계약: 포인터는 살아 있는 `IDCompositionDevice` 다.
-pub(crate) fn commit_at_tick_locked(device: usize) -> i32 {
+///
+/// ★2026-11-17: 가드를 잡은 시각과 `Commit()` 이 돌아온 시각을 함께 돌려준다★(`wall_span`).
+/// 계측이 꺼져 있으면 둘 다 0 이다. 기록은 호출자가 가드를 푼 뒤에 한다 -- 가드 안에서는 QPC 를
+/// 읽기만 한다. (이름이 `commit_at_tick_locked` 였다.)
+pub(crate) fn commit_at_tick_timed(device: usize) -> (i32, u64, u64) {
     let _guard = crate::commit_guard::device_guard(device);
+    let guard_at = crate::wall_span::now().unwrap_or(0);
     // Safety: 포인터는 살아 있는 `IDCompositionDevice` 다(호출자 계약).
-    unsafe { raw_commit(device as *mut IDCompositionDevice) }
+    let hr = unsafe { raw_commit(device as *mut IDCompositionDevice) };
+    let end_at = crate::wall_span::now().unwrap_or(0);
+    (hr, guard_at, end_at)
 }
 
-/// [`commit_at_tick_locked`] 뒤의 부기. ★가드를 푼 뒤, 순차로★ 부른다.
+/// [`commit_at_tick_timed`] 뒤의 부기. ★가드를 푼 뒤, 순차로★ 부른다.
 /// ★`note_dwm_phase` 는 여기 없다.★ 그것은 `DwmGetCompositionTimingInfo` 를 부르는데, 그건
 /// DWM 으로의 **프로세스 간 호출**이다. 디바이스마다 부르면 틱 머리에서 초당 240 회가 되고,
 /// 그 시간만큼 렌더 시작이 밀리고 커밋 위상이 뒤로 간다. 위상이 저더를 정하는 구조에서 그것은
@@ -1581,6 +1588,12 @@ pub fn maybe_create(
 impl DCompNativeCompositor {
     fn dcomp_device_ptr(&self) -> Option<*mut IDCompositionDevice> {
         self.dcomp_device.as_ref().map(ComOwned::as_ptr)
+    }
+
+    /// 디바이스 포인터를 값으로(2026-11-17). `wall_span` 슬롯과 디바이스 관문의 키로 쓴다 --
+    /// 둘 다 포인터를 비교만 하고 역참조하지 않는다.
+    pub(crate) fn device_ptr_usize(&self) -> Option<usize> {
+        self.dcomp_device_ptr().map(|device| device as usize)
     }
 
     /// ★이 추적 내내 없던 측정이다.★ DWM 이 **이 타일을** 실제로 언제 합성했는가.
@@ -2144,10 +2157,25 @@ impl DCompNativeCompositor {
     /// 주거나 한 패스에서 그 페인터가 두 번 렌더하면) 다음 프레임의 이 호출이 스케줄러가 바로
     /// 그 디바이스를 커밋하는 순간과 겹칠 수 있다.
     fn commit_device_guarded(&mut self, dcomp_device: *mut IDCompositionDevice) {
-        let hr = {
+        // ★2026-11-17 `wall_span`★ -- 자기복구 Commit. 분리 모드에서는 0 이어야 한다.
+        let before_guard = crate::wall_span::now();
+        let (hr, guard_at, end_at) = {
             let _guard = crate::commit_guard::device_guard(dcomp_device as usize);
-            self.commit_device_locked(dcomp_device)
+            let guard_at = crate::wall_span::now();
+            let hr = self.commit_device_locked(dcomp_device);
+            (hr, guard_at, crate::wall_span::now())
         };
+        if let (Some(a), Some(b), Some(c)) = (before_guard, guard_at, end_at) {
+            crate::wall_span::record(
+                crate::wall_span::Kind::RecoverCommit,
+                crate::wall_span::device_slot(dcomp_device as usize),
+                u8::from(hr < 0),
+                crate::wall_span::current_tick(),
+                a,
+                b,
+                c,
+            );
+        }
         note_commit_failure(hr, dcomp_device as usize, "flush_deferred_commit");
     }
 
@@ -3618,12 +3646,16 @@ impl Compositor for DCompNativeCompositor {
         // 커밋 자체는 가드 안에서 하고, **로그와 DWM 위상 채집은 가드를 푼 뒤에** 한다.
         // 임계구역에 남는 것은 `Commit()` 하나뿐이어야 한다는 원칙(C3, R5)을 여기서도 지킨다 --
         // 특히 실패 로그는 TDR 뒤에 매 프레임 찍히므로 가드 안에 두면 안 된다.
+        // ★2026-11-17 `wall_span`★ -- in-frame Commit 의 앞뒤 시각. 가드 안에서는 QPC 를 지역
+        // 변수에 담기만 하고, 링에 쓰는 것은 가드를 푼 뒤다(가드 안에는 `Commit()` 하나뿐).
+        let commit_span_start = crate::wall_span::now();
         let commit_hr = if servo_config::pref!(gfx_dcomp_commit_in_end_frame) {
             Some(self.commit_device_locked(dcomp_device))
         } else {
             self.commit_pending = true;
             None
         };
+        let commit_span_end = crate::wall_span::now();
         // ★가드는 여기서 끝난다.★ 이 디바이스의 서피스 작업과 Commit 은 바로 위에서 끝났다 --
         // 여기부터 함수 끝까지는 BindProfile/esc_prof 카운터 갱신과 로그뿐이고 DComp 디바이스나
         // 서피스를 다시 만지지 않는다(검증됨: dcomp_device_ptr/commit_device/BeginDraw/EndDraw/
@@ -3632,6 +3664,18 @@ impl Compositor for DCompNativeCompositor {
         // `lock_wait_sched_us_max` 가 실제 커밋 경합이 아니라 로그 I/O 시간을 재게 된다.
         #[cfg(windows)]
         drop(commit_guard);
+        if let (Some(hr), Some(start), Some(end)) = (commit_hr, commit_span_start, commit_span_end)
+        {
+            crate::wall_span::record(
+                crate::wall_span::Kind::InframeCommit,
+                crate::wall_span::device_slot(dcomp_device as usize),
+                u8::from(hr < 0),
+                crate::wall_span::current_tick(),
+                start,
+                end,
+                0,
+            );
+        }
         if let Some(hr) = commit_hr {
             note_commit_failure(hr, dcomp_device as usize, "end_frame");
         }

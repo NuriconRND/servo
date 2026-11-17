@@ -602,6 +602,14 @@ pub struct Preferences {
     /// 나가는 보드를 치우는 일과 겹치는지 가르기 위한 것이다. 근거와 성능 규칙은
     /// `components/config/wall_event.rs`. 런처는 `-EventProbe`.
     pub gfx_wall_event_probe: bool,
+    /// ★2026-11-17 추가★ -- 벽 패스 구간 프로브(기본 꺼짐). painter 렌더, 메인 스레드가 painter 를
+    /// 기다린 구간(틱 머리 Commit, gather, produce, ack, join, flush, 메시지 처리), Commit 마다의
+    /// 발행·가드·완료 시각을 스레드별 링에 쌓고 리포터가 10 초마다 `WALLSPAN`, `WALLDETACH`,
+    /// `WALLMAINWAIT`, `WALLCOMMIT`, `WALLCOMMITTICK` 줄로 낸다. `-DetachTileRender` 와
+    /// `-DcompParallelCommit` 가 정말 painter 를 떼어 놓는지, Commit 이 무엇을 기다리는지를 가르려는
+    /// 것이다(log_rotation_opacity_judder_01/11 에서 둘 다 결합을 못 풀었고 Commit 은 잰 적이 없다).
+    /// 근거와 기록 비용 규칙은 `components/paint/wall_span.rs`. 런처는 `-SpanProbe`.
+    pub gfx_wall_span_probe: bool,
     /// ★2026-11-13 추가★ -- 이 크기(가로나 세로)를 넘는 이미지를 512 타일로 쪼갠다. 기본 4096 은
     /// upstream 값이다. 쪼개진 이미지는 공유 아틀라스로 가고 보이는 타일만 요청되므로, 회전·이동
     /// 중에도 타일 업로드·내보내기가 이어진다(3072x4608 이미지 = 타일 54 장). 8192~16384 로 올리면
@@ -2046,6 +2054,7 @@ impl Preferences {
             gfx_wr_render_target_keep_frames: 1800,
             gfx_wr_texture_cache_probe: false,
             gfx_wall_event_probe: false,
+            gfx_wall_span_probe: false,
             gfx_wr_image_tiling_threshold: 4096,
             gfx_wr_texture_cache_evict_budget_mb: 0,
             gfx_wall_parallel_tiles: false,

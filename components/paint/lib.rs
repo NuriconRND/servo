@@ -187,6 +187,8 @@ mod screenshot;
 mod touch;
 /// 벽 프레임 생산 틱의 순수 판정. 생산자가 하나라는 규칙을 떠받치는 타입들이 여기 모인다.
 mod wall_tick;
+/// 벽 패스 구간 계측(2026-11-17). 스레드별 링 + 리포터. 근거는 모듈 주석.
+mod wall_span;
 mod web_content_animation;
 mod webrender_external_images;
 mod webview_renderer;

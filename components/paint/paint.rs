@@ -26,8 +26,8 @@ use paint_api::display_list::PaintDisplayListInfo;
 use paint_api::rendering_context::{RenderingContext, create_adapter_for_requested_gpu};
 use paint_api::{
     ImageUpdate, PaintMessage, PaintProxy, PainterSurfmanDetails, PainterSurfmanDetailsMap,
-    PainterTileRectMap,
-    SerializableDisplayListPayload, WebRenderExternalImageIdManager, WebViewTrait,
+    PainterTileRectMap, SerializableDisplayListPayload, WebRenderExternalImageIdManager,
+    WebViewTrait,
 };
 use profile_traits::mem::{
     ProcessReports, ProfilerRegistration, Report, ReportKind, perform_memory_report,
@@ -223,6 +223,9 @@ pub struct Paint {
 /// 끝나야 한다.
 struct PainterHost {
     painter_id: PainterId,
+    /// `wall_span` 의 painter 슬롯(2026-11-17). painter 를 건드리지 않고 메인에서 기록하려고
+    /// 밖에 들고 있는다(`painter_id` 와 같은 이유).
+    span_slot: u8,
     /// 컨텍스트 동일성 판정 전용(`register_rendering_context`). ★스레드 변형에는 `None` 이다★
     /// — 컨텍스트가 타일 스레드에서 만들어지므로 메인에 사본이 없고, 등록 경로도 다르다.
     rendering_context: Option<Rc<dyn RenderingContext>>,
@@ -248,12 +251,25 @@ pub struct PaintTargetsInFlight {
 impl PaintTargetsInFlight {
     /// 발사해 둔 타일들이 전부 끝나기를 기다린다.
     pub fn join(self) {
+        // ★2026-11-17 `wall_span`★ -- 메인이 스레드 타일을 기다린 시간.
+        let span = crate::wall_span::now();
         for done in self.in_flight {
             // 스레드가 죽었으면 `Err` 다. 그때는 기다릴 것이 없다 — 그 사실은 요청을 보낼 때
             // 이미 경고했다.
             let _ = done.recv();
         }
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Join, span);
     }
+}
+
+/// `PainterId` 의 `wall_span` 슬롯(2026-11-17). 없는 painter 는 마지막 슬롯이다.
+fn host_slot(painters: &[PainterHost], painter_id: PainterId) -> u8 {
+    painters
+        .iter()
+        .find(|host| host.painter_id == painter_id)
+        .map_or((crate::wall_span::MAX_SLOTS - 1) as u8, |host| {
+            host.span_slot
+        })
 }
 
 /// 타일 스레드로 일을 보내는 손잡이.
@@ -1380,8 +1396,10 @@ impl Paint {
             .insert(painter.painter_id, painter_surfman_details);
 
         let painter_id = painter.painter_id;
+        let span_slot = painter.span_slot();
         self.painters.push(PainterHost {
             painter_id,
+            span_slot,
             rendering_context: Some(rendering_context),
             kind: PainterHostKind::Inline(Rc::new(RefCell::new(painter))),
         });
@@ -1430,7 +1448,10 @@ impl Paint {
                 );
                 // 셸은 이 컨텍스트를 갖고 있지 않으므로 표출도 이 스레드가 한다.
                 painter.take_over_presentation();
-                if id_sender.send(painter.painter_id).is_err() {
+                if id_sender
+                    .send((painter.painter_id, painter.span_slot()))
+                    .is_err()
+                {
                     // 아무도 안 기다린다 = 등록이 취소됐다. 컨텍스트를 이 스레드에서
                     // 소멸시키고 조용히 끝낸다(스레드 로컬 계약).
                     return;
@@ -1450,8 +1471,8 @@ impl Paint {
                 return None;
             },
         };
-        let painter_id = match id_receiver.recv() {
-            Ok(painter_id) => painter_id,
+        let (painter_id, span_slot) = match id_receiver.recv() {
+            Ok(received) => received,
             Err(_) => {
                 warn!("Tile painter thread died before it could build its painter");
                 let _ = join_handle.join();
@@ -1461,6 +1482,7 @@ impl Paint {
 
         self.painters.push(PainterHost {
             painter_id,
+            span_slot,
             rendering_context: None,
             kind: PainterHostKind::Threaded(ThreadedPainter {
                 detached_in_flight: Arc::new(AtomicUsize::new(0)),
@@ -1928,14 +1950,19 @@ impl Paint {
             if request.target_painter_ids.is_empty() {
                 None
             } else {
-                self.issue_wall_frame_request(request)
+                let span = crate::wall_span::now();
+                let issued = self.issue_wall_frame_request(request);
+                crate::wall_span::record_main(crate::wall_span::MainSpan::Produce, span);
+                issued
             }
         } else {
             crate::frame_source_probe::note_produce_wall_frame(0, true);
             self.hold_the_wall_while_a_screenshot_is_taken();
             None
         };
+        let span = crate::wall_span::now();
         self.release_owed_canvas_acks();
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Ack, span);
         logical_frame_id
     }
 
@@ -2027,7 +2054,11 @@ impl Paint {
     ///
     /// 돌려주는 값은 이번 주기의 논리 프레임 번호다(낼 타일이 없으면 `None`).
     pub fn on_wall_tick(&self) -> Option<u64> {
+        // ★2026-11-17 `wall_span`★ -- 틱 번호를 올리고, 이번 틱에 보내는 렌더가 그 번호를 싣는다.
+        crate::wall_span::begin_tick();
+        let span = crate::wall_span::now();
         self.gather_components();
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Gather, span);
         self.produce_wall_frame()
     }
 
@@ -2180,12 +2211,11 @@ impl Paint {
         // ★생성도 팬아웃이다.★ 타일마다 보내고 기다리면 네 타일의 `generate_frame_for_wall_tick`
         // 이 줄을 서고, 그 합이 렌더 시작을 뒤로 민다. 순서는 보존되므로 아래 집합들은
         // 그대로 결정적이다(`with_each_painter_mut`).
-        let outcomes =
-            self.with_each_painter_mut(&request.target_painter_ids, |_| {
-                move |painter: &mut Painter| {
-                    painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
-                }
-            });
+        let outcomes = self.with_each_painter_mut(&request.target_painter_ids, |_| {
+            move |painter: &mut Painter| {
+                painter.generate_frame_for_wall_tick(logical_frame_id, wall_frame_requested_at)
+            }
+        });
         for (painter_id, outcome) in request.target_painter_ids.iter().zip(outcomes) {
             match outcome {
                 Some(TileOutcome::Generated) => generated_painter_ids.push(*painter_id),
@@ -3046,7 +3076,9 @@ impl Paint {
         // `&self` 를 통째로 캡처하지 않도록 채널만 떼어 온다 — `Paint` 는 `Cell`/`RefCell`
         // 투성이라 스레드로 건널 수 없다.
         let time_profiler_chan = self.time_profiler_chan.clone();
+        let pass = crate::wall_span::current_tick();
         self.with_primary_painter_mut(webview_id, move |painter| {
+            painter.set_span_pass(pass);
             painter.render(&time_profiler_chan)
         })
         .expect("painter_id not found");
@@ -3073,6 +3105,8 @@ impl Paint {
         // 패스마다 한 번 읽는다(타일마다가 아니다).
         let detached = pref!(gfx_wall_tile_render_detached);
         let detached_limit = pref!(gfx_painter_detached_queue_limit).max(0) as usize;
+        // ★2026-11-17 `wall_span`★ -- 렌더가 보낸 틱을 싣는다(분리 모드에서는 늦게 시작할 수 있다).
+        let pass = crate::wall_span::current_tick();
 
         for &painter_id in painter_ids {
             if !registered.contains(&painter_id) {
@@ -3096,15 +3130,26 @@ impl Paint {
                         // 셸의 `join()` 이 기다릴 것이 없는 빈 호출이 된다 -- 셸은 그대로다.
                         // 상한은 기존 detach 경로와 같은 것을 쓴다(무한 큐 방지).
                         let _ = threaded.dispatch_detached(detached_limit, move |painter| {
+                            painter.set_span_pass(pass);
                             painter.render(&time_profiler_chan);
                         });
                         continue;
                     }
                     let dispatched = threaded.dispatch(move |painter| {
+                        painter.set_span_pass(pass);
                         painter.render(&time_profiler_chan);
                     });
-                    if let Some(done) = dispatched {
-                        in_flight.push(done);
+                    match dispatched {
+                        Some(done) => in_flight.push(done),
+                        None => crate::wall_span::record(
+                            crate::wall_span::Kind::RenderRefused,
+                            host_slot(&self.painters, painter_id),
+                            0,
+                            pass,
+                            0,
+                            0,
+                            0,
+                        ),
                     }
                 },
                 // 메인에 있는 타일은 발사할 곳이 없다. 스레드들이 이미 돌기 시작한 뒤에
@@ -3116,6 +3161,7 @@ impl Paint {
         for painter_id in inline_painter_ids {
             let time_profiler_chan = self.time_profiler_chan.clone();
             self.with_painter_mut(painter_id, move |painter| {
+                painter.set_span_pass(pass);
                 painter.render(&time_profiler_chan)
             });
         }
@@ -3159,6 +3205,13 @@ impl Paint {
     /// 디바이스 포인터를 한 패스 들고 있는 셈인데, painter 는 타일마다 하나씩 기동 때 만들어
     /// 프로세스 내내 살고 벽은 타일 수가 고정이다. 들고 있는 시간도 한 틱을 넘지 않는다.
     pub fn flush_deferred_dcomp_commits(&self) {
+        // ★2026-11-17 `wall_span`★ -- 패스 끝에서 메인이 painter 마다 왕복한 시간.
+        let span = crate::wall_span::now();
+        self.flush_deferred_dcomp_commits_inner();
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Flush, span);
+    }
+
+    fn flush_deferred_dcomp_commits_inner(&self) {
         #[cfg(windows)]
         {
             let pending: Vec<usize> = self
@@ -3197,10 +3250,13 @@ impl Paint {
             if devices.is_empty() {
                 return;
             }
+            // ★2026-11-17 `wall_span`★ -- 메인이 틱 머리 Commit 에 쓴 시간. 디바이스별 Commit
+            // 자체는 그것을 낸 스레드가 따로 기록한다(`commit_guard`).
+            let span = crate::wall_span::now();
             crate::commit_guard::commit_all_at_tick(devices);
+            crate::wall_span::record_main(crate::wall_span::MainSpan::TickCommit, span);
         }
     }
-
 
     /// Get the message receiver for this [`Paint`].
     pub fn receiver(&self) -> &RoutedReceiver<PaintMessage> {
@@ -3287,7 +3343,14 @@ impl Paint {
         dropped
     }
 
-    pub fn handle_messages(&self, mut messages: Vec<PaintMessage>) {
+    pub fn handle_messages(&self, messages: Vec<PaintMessage>) {
+        // ★2026-11-17 `wall_span`★ -- 메시지 처리 전체. painter 왕복이 여기서 난다.
+        let span = crate::wall_span::now();
+        self.handle_messages_inner(messages);
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Messages, span);
+    }
+
+    fn handle_messages_inner(&self, mut messages: Vec<PaintMessage>) {
         let _ = Self::drop_superseded_video_frame_updates(&mut messages);
         // Pull out the `NewWebRenderFrameReady` messages from the list of messages and handle them
         // at the end of this function. This prevents overdraw when more than a single message of
@@ -3361,9 +3424,12 @@ impl Paint {
         #[cfg(feature = "webxr")]
         self.webxr_main_thread.borrow_mut().run_one_frame();
 
+        // ★2026-11-17 `wall_span`★ -- painter 마다의 블로킹 왕복.
+        let span = crate::wall_span::now();
         for painter_id in self.painter_ids() {
             self.with_painter_mut(painter_id, |painter| painter.perform_updates());
         }
+        crate::wall_span::record_main(crate::wall_span::MainSpan::Updates, span);
 
         let wall_frame_repaint_decisions = self
             .wall_frame_coordinator

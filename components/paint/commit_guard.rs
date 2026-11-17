@@ -66,7 +66,7 @@
 //! 비디오 fast-path `present_external_only` 가, 셸 스레드가 틱에서 내는 커밋이, 그리고
 //! `begin_frame` 의 자기복구 커밋이 전부 같은 디바이스를 만진다.
 //!
-//! ★가드를 잡는 책임은 커밋의 정문(`dcomp_compositor::commit_at_tick_locked`)에 있고, `Commit()`
+//! ★가드를 잡는 책임은 커밋의 정문(`dcomp_compositor::commit_at_tick_timed`)에 있고, `Commit()`
 //! 을 실제로 부르는 자리는 크레이트 전체에서 `dcomp_compositor::raw_commit` 하나뿐이다.★
 //! 새 커밋 지점은 그 함수를 지나갈 수밖에 없다 -- 가드를 다섯 자리에서 하나씩 챙기던 방식은
 //! 이미 세 번 실패했다(2·3·5 의 누락이 따로따로 발견됐다).
@@ -119,7 +119,7 @@ fn device_lock(device: usize) -> &'static Mutex<()> {
 /// ★디바이스를 만지기 직전에 부른다.★ 반환값을 그 작업이 끝날 때까지 들고 있는다.
 ///
 /// ★재진입 불가다.★ 이미 이 디바이스의 가드를 쥔 채로 다시 부르면 자기 자신과 데드락한다 --
-/// 그래서 커밋 경로는 가드를 잡는 정문(`commit_at_tick_locked`)과 이미 쥐고 있을 때만 쓰는
+/// 그래서 커밋 경로는 가드를 잡는 정문(`commit_at_tick_timed`)과 이미 쥐고 있을 때만 쓰는
 /// `_locked` 변형을 이름으로 갈라 둔다.
 pub(crate) fn device_guard(device: usize) -> std::sync::MutexGuard<'static, ()> {
     let lock = device_lock(device);
@@ -133,7 +133,34 @@ static PARALLEL_COMMIT: LazyLock<bool> =
 
 /// 커밋 하나를 맡는 상주 워커의 손잡이.
 struct CommitWorker {
-    jobs: std::sync::mpsc::Sender<usize>,
+    jobs: std::sync::mpsc::Sender<CommitJob>,
+}
+
+/// 워커에 보내는 일 하나(2026-11-17). `issued` 는 메인이 보낸 시각(QPC, 계측이 꺼져 있으면 0)이고
+/// `tick` 은 그 틱의 번호다 -- 둘 다 `wall_span` 기록용이다.
+#[derive(Clone, Copy)]
+struct CommitJob {
+    device: usize,
+    issued: u64,
+    tick: u64,
+}
+
+/// 틱 Commit 하나를 내고 `wall_span` 에 남긴다. ★기록은 가드를 푼 뒤다★ --
+/// `commit_at_tick_timed` 는 가드 안에서 QPC 를 읽기만 한다.
+fn commit_and_record(job: CommitJob) -> i32 {
+    let (hr, guard_at, end_at) = crate::dcomp_compositor::commit_at_tick_timed(job.device);
+    if job.issued != 0 && guard_at != 0 && end_at != 0 {
+        crate::wall_span::record(
+            crate::wall_span::Kind::TickCommit,
+            crate::wall_span::device_slot(job.device),
+            u8::from(hr < 0),
+            job.tick,
+            job.issued,
+            guard_at,
+            end_at,
+        );
+    }
+    hr
 }
 
 /// ★상주 워커 풀. 틱마다 스레드를 만들지 않는다.★
@@ -160,12 +187,12 @@ static DONE: OnceLock<(
 /// 워커 하나가 도는 몸통. ★여기서 하는 일은 가드와 `Commit()` 뿐이다★ -- 부기는 호출자가
 /// 결과를 모아 순차로 한다(`dcomp_compositor::note_tick_commit`).
 fn worker_loop(
-    jobs: std::sync::mpsc::Receiver<usize>,
+    jobs: std::sync::mpsc::Receiver<CommitJob>,
     done: std::sync::mpsc::Sender<(usize, i32)>,
 ) {
-    for device in jobs {
-        let hr = crate::dcomp_compositor::commit_at_tick_locked(device);
-        if done.send((device, hr)).is_err() {
+    for job in jobs {
+        let hr = commit_and_record(job);
+        if done.send((job.device, hr)).is_err() {
             return;
         }
     }
@@ -207,6 +234,12 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     if devices.is_empty() {
         return;
     }
+    let tick = crate::wall_span::current_tick();
+    let job = |device: usize| CommitJob {
+        device,
+        issued: crate::wall_span::now().unwrap_or(0),
+        tick,
+    };
     let dispatched = if devices.len() > 1 && *PARALLEL_COMMIT {
         let available = ensure_workers(devices.len());
         let n = available.min(devices.len());
@@ -214,7 +247,7 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
             Ok(workers) => {
                 let mut sent = 0;
                 for (index, &device) in devices.iter().take(n).enumerate() {
-                    if workers[index].jobs.send(device).is_ok() {
+                    if workers[index].jobs.send(job(device)).is_ok() {
                         sent += 1;
                     }
                 }
@@ -241,7 +274,7 @@ pub(crate) fn commit_all_at_tick(devices: Vec<usize>) {
     }
     // 워커에 못 보낸 것(병렬 off, 생성 실패, 채널 닫힘)은 여기서 직접 낸다.
     for &device in devices.iter().skip(done.len().max(dispatched)) {
-        let hr = crate::dcomp_compositor::commit_at_tick_locked(device);
+        let hr = commit_and_record(job(device));
         done.push((device, hr));
     }
 

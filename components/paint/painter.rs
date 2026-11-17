@@ -249,6 +249,14 @@ pub(crate) struct Painter {
     /// ★기본값은 `false` 다★ — 켜져 있는데 셸도 present 하면 한 프레임을 두 번 내보낸다.
     owns_presentation: bool,
 
+    /// `wall_span` 의 painter 슬롯(2026-11-17). 만든 순서이고 리포터가 `p<n>` 으로 찍는다.
+    span_slot: u8,
+    /// 이 렌더를 보낸 틱(`wall_span`). 보내는 쪽이 [`Painter::set_span_pass`] 로 싣는다 --
+    /// 분리 모드에서는 렌더가 보낸 틱보다 늦게 시작할 수 있어서, 렌더가 스스로 읽으면 안 된다.
+    span_pass: Cell<u64>,
+    /// 슬롯 대응(`wall_span::Kind::SlotMap`)을 이미 찍었나. 한 번만 찍는다.
+    span_mapped: Cell<bool>,
+
     /// `Paint` 로 되돌아가는 통로. `WebViewRenderer` 가 애니메이션 상태 통보를 여기로 보낸다
     /// — 예전에는 `Box<dyn WebViewTrait>` 를 직접 들고 불렀다(설계 §3.2).
     paint_proxy: PaintProxy,
@@ -579,6 +587,26 @@ fn profiler_hud_flags(ui: Option<&str>) -> webrender::DebugFlags {
     flags
 }
 
+/// `WALLSPAN` 줄마다 붙일 구성(2026-11-17). 판정할 때 어느 갈래의 로그인지 로그만 보고 알 수
+/// 있어야 한다. 리포터를 띄울 때 한 번 읽는다(타이밍 경로가 아니다).
+fn wall_span_mode() -> String {
+    let commit = if pref!(gfx_dcomp_commit_in_end_frame) {
+        "inframe"
+    } else if pref!(gfx_dcomp_parallel_commit) {
+        "tick-parallel"
+    } else {
+        "tick-serial"
+    };
+    format!(
+        "detach={} commit={commit}",
+        if pref!(gfx_wall_tile_render_detached) {
+            "on"
+        } else {
+            "off"
+        },
+    )
+}
+
 // ★`script_frame_is_redundant` 와 `script_frame_rides_the_painter` 는 2026-10-21 에
 // 삭제됐다.★
 //
@@ -789,6 +817,12 @@ impl Painter {
         // 리포터는 한 번만 뜬다.
         if pref!(gfx_wall_event_probe) {
             servo_config::wall_event::start();
+        }
+
+        // ★2026-11-17 벽 패스 구간 프로브★ -- 렌더·메인 대기·Commit 을 스레드별 링에 쌓는다.
+        // 근거와 기록 규칙은 `wall_span` 모듈 주석. 리포터는 한 번만 뜬다.
+        if pref!(gfx_wall_span_probe) {
+            crate::wall_span::start(wall_span_mode());
         }
 
         // ★프레임 발행 출처★ -- `gfx_wall_tick_phase_probe` 와 한 스위치를 쓴다(`-TickPhase`).
@@ -1004,6 +1038,9 @@ impl Painter {
             display_composite_in_flight: Default::default(),
             display_composite_in_flight_since: Default::default(),
             owns_presentation: false,
+            span_slot: crate::wall_span::next_painter_slot(),
+            span_pass: Cell::new(0),
+            span_mapped: Cell::new(false),
             paint_proxy: paint.paint_proxy,
             canvas_ack_skips_left: Cell::new(*WALL_CANVAS_ACK_SKIP),
             screenshot_taker: Default::default(),
@@ -1798,6 +1835,8 @@ impl Painter {
         // ★2026-11-16 WALLEVENT render.over★ -- 같은 범위를 재서 주기를 넘긴 것만 ms 시각과
         // 타일 원점으로 남긴다. 근거는 `servo_config::wall_event` 의 모듈 주석(08 런).
         let wall_render_timer = servo_config::wall_event::Timer::start();
+        // ★2026-11-17 `wall_span` 렌더 구간★ -- 같은 범위(present 포함). 꺼져 있으면 원자 로드 하나.
+        let span_start = crate::wall_span::now();
         let refresh_driver = self.refresh_driver.clone();
         refresh_driver.notify_will_paint(self);
 
@@ -1926,6 +1965,18 @@ impl Painter {
                     .unwrap_or(u32::MAX)
             },
         );
+        // 인라인 타일(메인 스레드)은 셸이 이 뒤에 present 하므로 그 구간에 present 가 빠진다.
+        crate::wall_span::record_span(
+            crate::wall_span::Kind::Render,
+            self.span_slot,
+            u8::from(!self.owns_presentation),
+            self.span_pass.get(),
+            span_start,
+        );
+        if span_start.is_some() && !self.span_mapped.get() {
+            self.span_mapped.set(true);
+            self.record_span_slot_map();
+        }
         // ★present 까지 포함해서 잰다.★ 스레드 타일은 자기가 표출하고 셸의 조인이 그것까지
         // 기다리므로, 그 비용도 ***논리 프레임***의 비용이다.
         split.finish();
@@ -1937,6 +1988,51 @@ impl Painter {
     /// 이 painter 가 `render()` 끝에서 스스로 present 하게 한다. 타일 스레드 경로 전용이다.
     pub(crate) fn take_over_presentation(&mut self) {
         self.owns_presentation = true;
+    }
+
+    /// 다음 렌더를 보낸 틱을 싣는다(`wall_span`, 2026-11-17).
+    pub(crate) fn set_span_pass(&self, pass: u64) {
+        self.span_pass.set(pass);
+    }
+
+    /// `wall_span` 의 painter 슬롯.
+    pub(crate) fn span_slot(&self) -> u8 {
+        self.span_slot
+    }
+
+    /// 이 painter 의 DComp 디바이스 포인터(없으면 `None`).
+    #[cfg(windows)]
+    pub(crate) fn dcomp_device(&self) -> Option<usize> {
+        self.dcomp_shared
+            .as_ref()
+            .and_then(|shared| shared.try_borrow().ok()?.device_ptr_usize())
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn dcomp_device(&self) -> Option<usize> {
+        None
+    }
+
+    /// painter 슬롯 -> 디바이스 슬롯·타일 원점을 한 번 찍는다(리포터가 `map=` 으로 낸다).
+    fn record_span_slot_map(&self) {
+        let device = self.dcomp_device().map_or(u64::MAX, |device| {
+            crate::wall_span::device_slot(device) as u64
+        });
+        let (x, y) = self
+            .painter_tile_rect_map
+            .get(self.painter_id)
+            .map_or((0, 0), |rect| {
+                (rect.tile.min.x.max(0) as u64, rect.tile.min.y.max(0) as u64)
+            });
+        crate::wall_span::record(
+            crate::wall_span::Kind::SlotMap,
+            self.span_slot,
+            0,
+            0,
+            device,
+            x,
+            y,
+        );
     }
 
     fn clear_background(&self) {
