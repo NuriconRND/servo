@@ -4028,9 +4028,18 @@ impl Compositor for DCompNativeCompositor {
     }
 
     fn get_capabilities(&self, _device: &mut Device) -> CompositorCapabilities {
+        // 2026-11-17 `gfx_dcomp_full_tile_updates`(A/B): 0 이면 WR 이 무효화된 타일을 통째로 다시
+        // 그려 BeginDraw 크기가 하나가 된다. 근거는 그 pref 의 doc 주석(벽 런 14). WR 은 이 값을
+        // 렌더러를 만들 때 한 번만 읽는다(renderer/init.rs).
+        let max_update_rects = if servo_config::pref!(gfx_dcomp_full_tile_updates) {
+            0
+        } else {
+            1
+        };
         CompositorCapabilities {
             virtual_surface_size: VIRTUAL_SURFACE_SIZE,
-            // max_update_rects=1 등 나머지는 플랫폼 기본값 유지.
+            max_update_rects,
+            // 나머지는 플랫폼 기본값 유지.
             ..CompositorCapabilities::default()
         }
     }

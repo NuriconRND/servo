@@ -473,6 +473,26 @@ pub struct Preferences {
     /// 폭 자체가 글자를 따라 변하므로 그 변동을 그대로 물려받는다 -- `256` 으로도 크기가
     /// 21 가지 남았고 저더가 그대로였다. 내용과 무관하게 하나인 값은 타일 전체뿐이다.
     pub gfx_dcomp_update_quantum_px: i64,
+    /// 2026-11-17 추가 -- DComp 컴포지터가 부분 갱신을 받지 않는다고 WebRender 에 알린다
+    /// (`CompositorCapabilities::max_update_rects = 0`). 기본 꺼짐. 런처는 `-DcompFullTileUpdates`.
+    ///
+    /// 켜면 WR 은 무효화된 picture-cache 타일을 통째로 다시 그린다(picture.rs `!supports_dirty_rects`
+    /// 가지). dirty 가 유효 영역 전체가 되므로 `bind` 는 늘 같은 크기로 BeginDraw 한다.
+    ///
+    /// 왜: `gfx_dcomp_update_quantum_px = -1` 은 비용이 DComp 텍스처 크기의 가짓수를 따른다는
+    /// 측정(2026-10-20 T7/T8)으로 ticker 를 고쳤다. 그런데 `expand_transparent`(불투명 아님 &&
+    /// dirty == valid) 가지에만 걸린다. 부분 갱신 가지는 WR 의 dirty rect 그대로다 -- 그보다 키우면
+    /// WR 이 안 그린 기존 내용이 지워지기 때문이다.
+    ///
+    /// 보드 전환에서는 보드 가장자리가 타일을 지나가는 동안 dirty < valid 다. 그래서 BeginDraw
+    /// 폭이 매 프레임 바뀐다(3840/3872/4544/5760 x 2176). 벽 런 14
+    /// (log_rotation_opacity_judder_01/14)에서 막힌 제출의 97~99% 가 그 느린 BeginDraw 프레임이었다.
+    /// 그 bind 는 27~47% 가 막혔고, 타일 전체 크기로 일정한 확장 bind 는 1.3~7.1% 였다.
+    ///
+    /// 이 pref 는 WR 이 직접 전체를 그리게 해서 보존 문제 없이 크기를 하나로 만든다. 대가는 재래스터
+    /// 면적이다: 정지 비디오가 비디오 영역 대신 타일 전체를 다시 그린다. 런 13/14 에서 GPU 일은
+    /// 프레임당 1~3 ms 였다.
+    pub gfx_dcomp_full_tile_updates: bool,
     /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
     ///
     /// ★가르려는 것★: 패스 비용을 한 타일이 몰아서 낸다. 큰 캔버스 + DComp off 실측에서
@@ -2068,6 +2088,7 @@ impl Preferences {
             gfx_dcomp_parallel_commit: false,
             gfx_dcomp_parallel_commit_wait_all: false,
             gfx_dcomp_update_quantum_px: -1, // 타일 전체. 근거는 필드 doc 주석
+            gfx_dcomp_full_tile_updates: false,
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
