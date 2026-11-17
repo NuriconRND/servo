@@ -174,6 +174,11 @@ fn tile_virtual_rect(
 static UPDATE_QUANTUM_PX: std::sync::LazyLock<i64> =
     std::sync::LazyLock::new(|| pref!(gfx_dcomp_update_quantum_px));
 
+/// 2026-11-17 `gfx_dcomp_opaque_full_tile`(A/B): 0 끔, 1 고정 + 지우기, 2 고정만. bind 가 매번
+/// 보므로 한 번만 읽는다. 근거는 그 pref 의 doc 주석(벽 런 15).
+static OPAQUE_FULL_TILE: std::sync::LazyLock<i64> =
+    std::sync::LazyLock::new(|| pref!(gfx_dcomp_opaque_full_tile).clamp(0, 2));
+
 /// `expand_transparent` 갱신 렉트를 고정 격자에 붙인다. pref 주석이 왜인지를 들고 있다.
 ///
 /// ★격자의 원점은 타일 좌상단이다.★ 가상 좌표 원점을 쓰면 타일마다 격자가 어긋나 크기가
@@ -2751,19 +2756,50 @@ impl Compositor for DCompNativeCompositor {
                 // 투명 클리어 후 EndDraw가 확장 렉트를 커밋하면, 텍스트 밖 밴드가 투명이 되어 뒤
                 // 서피스(불투명 바 배경)가 비친다. valid==dirty 가드로 지속(valid−dirty) 콘텐츠는
                 // 절대 지우지 않는다(전체 재도색 슬라이스에만 적용). 불투명/스왑체인 경로 무영향.
-                let expand_transparent = !entry_is_opaque && dirty_rect == valid_rect;
-                let update_rect_v = if expand_transparent {
+                let dirty_is_valid = dirty_rect == valid_rect;
+                let expand_transparent = !entry_is_opaque && dirty_is_valid;
+                // 2026-11-17 `gfx_dcomp_opaque_full_tile`(A/B): 불투명 서피스도 dirty == valid 이고
+                // 그 타일의 표시 클립이 유효 영역 안이면 같은 고정 가지를 탄다. 클립 밖은 합성되지
+                // 않고 WR 이 유효 영역 전체를 다시 그리므로 지워질 내용이 없다. 근거는 그 pref 의
+                // doc 주석(벽 런 15: 바뀌는 것은 dirty 가 아니라 유효 영역 = 타일 안의 보드 범위).
+                //
+                // 리뷰(2026-11-17)로 더한 조건 둘:
+                // - 서피스의 타일이 하나일 때만. 타일이 여럿이면 visual 클립은 모든 타일 유효 영역의
+                //   바운딩 박스라, 다시 bind 되지 않는 이 타일의 유효 영역 밖(확장으로 커밋한 픽셀)이
+                //   나중에 다른 타일 때문에 넓어진 클립 안으로 들어올 수 있다. 벽(`display` 타일)은
+                //   슬라이스당 타일 하나다.
+                // - 격자에 붙이는 입력은 표시 영역이 아니라 유효 영역(= dirty)이다. 표시 영역은 Task 10
+                //   유니온이 한 프레임 늦어 유효 영역보다 작을 수 있고, quantum 이 0 이나 양수면 갱신
+                //   영역이 dirty 보다 작아져 WR 이 BeginDraw 밖에 그리게 된다.
+                let valid_v = valid_rect.translate(tile_rect.min.to_vector());
+                let expand_opaque = entry_is_opaque
+                    && dirty_is_valid
+                    && *OPAQUE_FULL_TILE != 0
+                    && entry.tiles.len() == 1
+                    && entry_clip.is_some()
+                    && valid_v.contains_box(&tile_visible_virtual_rect(
+                        tile_rect,
+                        entry_clip,
+                        entry_transform_offset,
+                        entry_virtual_offset,
+                    ));
+                let expand = expand_transparent || expand_opaque;
+                let update_rect_v = if expand {
                     // 확장 렉트를 격자에 붙인다(`gfx_dcomp_update_quantum_px`,
                     // 기본 -1 = 타일 전체).
                     // 투명 클리어는 이미 `update_rect_v` 크기로 시저링되어 있고(아래),
                     // `origin` 산식도 확장 렉트를 전제로 쓰여 있어 둘 다 그대로 따라온다.
                     quantize_update_rect(
-                        tile_visible_virtual_rect(
-                            tile_rect,
-                            entry_clip,
-                            entry_transform_offset,
-                            entry_virtual_offset,
-                        ),
+                        if expand_opaque {
+                            valid_v
+                        } else {
+                            tile_visible_virtual_rect(
+                                tile_rect,
+                                entry_clip,
+                                entry_transform_offset,
+                                entry_virtual_offset,
+                            )
+                        },
                         tile_rect,
                         *UPDATE_QUANTUM_PX,
                     )
@@ -2829,6 +2865,22 @@ impl Compositor for DCompNativeCompositor {
                         a,
                         b,
                         crate::wall_gpu_probe::pack_texture(desc.Width, desc.Height, reuse),
+                    );
+                    // 2026-11-17 bind 하나의 갱신 영역과 판정(WALLBINDINFO, WALLGPUFRAME upd=).
+                    crate::wall_gpu_probe::record_bind_info(
+                        slot,
+                        crate::wall_gpu_probe::BindFlags {
+                            opaque: entry_is_opaque,
+                            dirty_is_valid,
+                            expand_transparent,
+                            expand_opaque,
+                        },
+                        id.surface_id.0,
+                        (update_rect_v.width(), update_rect_v.height()),
+                        (valid_rect.width(), valid_rect.height()),
+                        a,
+                        b,
+                        texture as usize,
                     );
                     entry.last_bind_texture = texture as usize;
                     entry.last_bind_tile = Some((id.x, id.y));
@@ -2896,7 +2948,9 @@ impl Compositor for DCompNativeCompositor {
                 // 보존한다. 텍스처는 wrap 1:1이라 update_offset을 시저 y에 그대로 써도
                 // top-left 규약과 정합한다(unbind readback도 update_offset을 텍스처 좌표로
                 // 그대로 샘플링 — 위 주석 참조).
-                if expand_transparent {
+                // 불투명 확장은 `gfx_dcomp_opaque_full_tile = 1` 일 때만 지운다(2 = 생략: 유효 영역 밖은
+                // 합성되지 않는다).
+                if expand_transparent || (expand_opaque && *OPAQUE_FULL_TILE == 1) {
                     use gleam::gl;
                     let g = device.gl();
                     // 리뷰 하드닝(2) — 잔류 FBO 바인딩 함정: make_render_pbuffer_current는

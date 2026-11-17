@@ -106,6 +106,11 @@ pub(crate) enum Kind {
     /// `end_frame` 의 glFlush(2026-11-17, `-DcompAlwaysFlush` 나 External 서피스일 때만). id = 디바이스
     /// 슬롯, seq = 틱, a/b = 앞뒤.
     Flush = 17,
+    /// bind 하나의 갱신 영역과 판정(2026-11-17, `wall_gpu_probe::record_bind_info`). id = 디바이스 슬롯,
+    /// flag = 1 불투명 | 2 dirty == valid | 4 투명 확장 | 8 불투명 확장, seq = (서피스 하위 20 비트 << 24)
+    /// | BeginDraw 틱(24 비트 상한), a = (유효 W<<16|H) << 32 | (갱신 W<<16|H), b = BeginDraw 시작
+    /// QPC, c = 텍스처 포인터.
+    BindInfo = 18,
 }
 
 impl Kind {
@@ -128,6 +133,7 @@ impl Kind {
             15 => Kind::GpuDone,
             16 => Kind::BindStep,
             17 => Kind::Flush,
+            18 => Kind::BindInfo,
             _ => return None,
         })
     }

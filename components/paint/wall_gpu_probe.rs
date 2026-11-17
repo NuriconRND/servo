@@ -227,6 +227,188 @@ pub(crate) const REUSE_UNKNOWN: u64 = 0;
 pub(crate) const REUSE_SAME: u64 = 1;
 pub(crate) const REUSE_CHANGED: u64 = 2;
 
+/// bind 하나의 판정(2026-11-17, `Kind::BindInfo` 의 flag).
+#[derive(Clone, Copy)]
+pub(crate) struct BindFlags {
+    pub opaque: bool,
+    pub dirty_is_valid: bool,
+    pub expand_transparent: bool,
+    pub expand_opaque: bool,
+}
+
+const BIND_OPAQUE: u8 = 1;
+const BIND_DIRTY_IS_VALID: u8 = 2;
+const BIND_EXPAND_TRANSPARENT: u8 = 4;
+const BIND_EXPAND_OPAQUE: u8 = 8;
+
+/// bind 하나의 갱신 영역과 판정을 링에 쓴다(2026-11-17). 원자 저장뿐이다. 근거는 벽 런 15:
+/// 매 프레임 바뀌는 것은 유효 영역(타일 안의 보드 범위)이고, 그 크기가 막힘과 함께 간다 --
+/// 그것을 bind 마다 직접 본다.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn record_bind_info(
+    slot: u8,
+    flags: BindFlags,
+    surface: u64,
+    update: (i32, i32),
+    valid: (i32, i32),
+    begin_start: u64,
+    begin_end: u64,
+    texture: usize,
+) {
+    let bits = (flags.opaque as u8 * BIND_OPAQUE)
+        | (flags.dirty_is_valid as u8 * BIND_DIRTY_IS_VALID)
+        | (flags.expand_transparent as u8 * BIND_EXPAND_TRANSPARENT)
+        | (flags.expand_opaque as u8 * BIND_EXPAND_OPAQUE);
+    let wh = |(w, h): (i32, i32)| ((w.max(0) as u64 & 0xffff) << 16) | (h.max(0) as u64 & 0xffff);
+    let ticks = begin_end.saturating_sub(begin_start).min(0xff_ffff);
+    wall_span::record(
+        Kind::BindInfo,
+        slot,
+        bits,
+        ((surface & 0xf_ffff) << 24) | ticks,
+        (wh(valid) << 32) | wh(update),
+        begin_start,
+        texture as u64,
+    );
+}
+
+/// `BindInfo` 를 푼 것.
+#[derive(Clone, Copy, Debug)]
+struct BindInfo {
+    device: u8,
+    flags: u8,
+    surface: u64,
+    begin_ticks: u64,
+    update: (u64, u64),
+    valid: (u64, u64),
+    start: u64,
+    texture: u64,
+}
+
+fn bind_info(e: &Event) -> BindInfo {
+    let wh = |v: u64| ((v >> 16) & 0xffff, v & 0xffff);
+    BindInfo {
+        device: e.id,
+        flags: e.flag,
+        surface: e.seq >> 24,
+        begin_ticks: e.seq & 0xff_ffff,
+        update: wh(e.a & 0xffff_ffff),
+        valid: wh(e.a >> 32),
+        start: e.b,
+        texture: e.c,
+    }
+}
+
+/// (디바이스, BeginDraw 시작) -> (같은 서피스 직전 bind 와 갱신 크기가 다른가 -- 직전이 없으면(첫 bind)
+/// `None`, 최근 8 개 안에서 본 텍스처인가). 이력은 `history`(되돌아보기 + 이번 창) 순서대로 쌓는다.
+fn bind_history(history: &[Event]) -> std::collections::HashMap<(u8, u64), (Option<bool>, bool)> {
+    use std::collections::HashMap;
+    let mut infos: Vec<BindInfo> = history
+        .iter()
+        .filter(|e| e.kind == Kind::BindInfo)
+        .map(bind_info)
+        .collect();
+    infos.sort_by_key(|b| b.start);
+    let mut last: HashMap<(u8, u64), ((u64, u64), Vec<u64>)> = HashMap::new();
+    let mut out = HashMap::new();
+    for b in infos {
+        let entry = last
+            .entry((b.device, b.surface))
+            .or_insert(((0, 0), Vec::new()));
+        let changed = (entry.0 != (0, 0)).then_some(entry.0 != b.update);
+        let seen = entry.1.contains(&b.texture);
+        entry.0 = b.update;
+        entry.1.push(b.texture);
+        if entry.1.len() > 8 {
+            entry.1.remove(0);
+        }
+        out.insert((b.device, b.start), (changed, seen));
+    }
+    out
+}
+
+/// 디바이스별 bind 판정과 갱신 크기(`WALLBINDINFO`).
+fn bind_info_lines(
+    t_secs: u64,
+    events: &[Event],
+    history: &[Event],
+    to_us: impl Fn(u64) -> u64 + Copy,
+) -> Vec<String> {
+    let marks = bind_history(history);
+    let mut lines = Vec::new();
+    for device in 0..MAX_SLOTS as u8 {
+        let mine: Vec<BindInfo> = events
+            .iter()
+            .filter(|e| e.kind == Kind::BindInfo && e.id == device)
+            .map(bind_info)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let count = |bit: u8| mine.iter().filter(|b| b.flags & bit != 0).count();
+        let mut sizes: Vec<(u64, u64)> = mine.iter().map(|b| b.update).collect();
+        sizes.sort_unstable();
+        let mut runs: Vec<((u64, u64), usize)> = Vec::new();
+        for size in sizes {
+            match runs.last_mut() {
+                Some((s, n)) if *s == size => *n += 1,
+                _ => runs.push((size, 1)),
+            }
+        }
+        let distinct = runs.len();
+        runs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        let top: Vec<String> = runs
+            .iter()
+            .take(3)
+            .map(|((w, h), n)| format!("{w}x{h}:{n}"))
+            .collect();
+        let (mut changed, mut seen) = (0, 0);
+        let (mut slow_changed, mut n_changed, mut slow_same, mut n_same) = (0, 0, 0, 0);
+        let (mut slow_first, mut n_first) = (0, 0);
+        for b in &mine {
+            let (c, s) = marks
+                .get(&(b.device, b.start))
+                .copied()
+                .unwrap_or((None, false));
+            seen += s as u64;
+            let slow = (to_us(b.begin_ticks) > 120) as u64;
+            match c {
+                Some(true) => {
+                    changed += 1;
+                    n_changed += 1;
+                    slow_changed += slow;
+                },
+                Some(false) => {
+                    n_same += 1;
+                    slow_same += slow;
+                },
+                None => {
+                    n_first += 1;
+                    slow_first += slow;
+                },
+            }
+        }
+        lines.push(format!(
+            "WALLBINDINFO t={t_secs}s w=10s dev={device} binds={} opaque={} dirty_is_valid={} \
+             expand_transparent={} expand_opaque={} sizes={distinct} top={} size_changed={changed} \
+             tex_seen_in_last8={seen} slow_begin_changed={slow_changed}/{n_changed} \
+             slow_begin_same={slow_same}/{n_same} slow_begin_first={slow_first}/{n_first}",
+            mine.len(),
+            count(BIND_OPAQUE),
+            count(BIND_DIRTY_IS_VALID),
+            count(BIND_EXPAND_TRANSPARENT),
+            count(BIND_EXPAND_OPAQUE),
+            if top.is_empty() {
+                String::from("-")
+            } else {
+                top.join(",")
+            },
+        ));
+    }
+    lines
+}
+
 /// BeginDraw 텍스처: 비트 40~41 = 재사용(`REUSE_*`), 20~39 = 폭, 0~19 = 높이. 같음은 포인터
 /// 비교라, DComp 가 놓은 뒤 같은 주소에 새로 만들면 같음으로 셀 수 있다(과대).
 pub(crate) fn pack_texture(width: u32, height: u32, reuse: u64) -> u64 {
@@ -1315,6 +1497,7 @@ pub(crate) fn report(
         .copied()
         .collect();
     lines.extend(bind_lines(t_secs, &analyze, to_us));
+    lines.extend(bind_info_lines(t_secs, &analyze, &lookup, to_us));
     lines.extend(flush_lines(t_secs, &analyze, to_us));
     lines.extend(queue_lines(t_secs, &analyze, &lookup, to_us));
     lines.extend(frame_lines(
@@ -1376,7 +1559,10 @@ pub(crate) fn report(
 
 /// 짝짓기에만 쓰는 곁 기록(2026-11-17 보강): 렌더 구간, bind 단계, flush.
 fn is_side_kind(kind: Kind) -> bool {
-    matches!(kind, Kind::Render | Kind::BindStep | Kind::Flush)
+    matches!(
+        kind,
+        Kind::Render | Kind::BindStep | Kind::Flush | Kind::BindInfo
+    )
 }
 
 fn us_set(values: Vec<u64>) -> String {
@@ -1546,16 +1732,23 @@ fn frame_lines(
     for e in lookup.iter().filter(|e| {
         matches!(
             e.kind,
-            Kind::Render | Kind::GpuSignal | Kind::Flush | Kind::GpuDone | Kind::BindStep
+            Kind::Render
+                | Kind::GpuSignal
+                | Kind::Flush
+                | Kind::GpuDone
+                | Kind::BindStep
+                | Kind::BindInfo
         )
     }) {
         index.entry((e.kind as u8, e.id)).or_default().push(e);
     }
+    // BindInfo 는 시각이 b(BeginDraw 시작)에 있다(a 는 크기 묶음) -- 리뷰 2026-11-17.
     for list in index.values_mut() {
-        list.sort_by_key(|e| e.a);
+        list.sort_by_key(|e| if e.kind == Kind::BindInfo { e.b } else { e.a });
     }
     let empty: Vec<&Event> = Vec::new();
     let list = |kind: Kind, id: u8| index.get(&(kind as u8, id)).unwrap_or(&empty);
+    let marks = bind_history(lookup);
     let mut commits: HashMap<u8, Vec<Commit>> = HashMap::new();
     for c in commits_of(lookup.iter()) {
         commits.entry(c.device).or_default().push(c);
@@ -1631,6 +1824,43 @@ fn frame_lines(
         // 그 렌더 안의 bind 단계 합.
         let mut steps = [0u64; BIND_STEPS.len()];
         let mut binds = 0;
+        // 2026-11-17: 그 렌더 안의 bind 마다 갱신 크기와 판정(o 불투명, d dirty==valid, t 투명 확장,
+        // x 불투명 확장, c 같은 서피스 직전과 크기 다름).
+        let mut upd: Vec<String> = Vec::new();
+        if let Some(r) = render {
+            let v = list(Kind::BindInfo, device);
+            let i = v.partition_point(|e| e.b < r.a);
+            for e in v[i..].iter().take_while(|e| e.b <= r.b) {
+                let b = bind_info(e);
+                let history = marks.get(&(b.device, b.start)).and_then(|m| m.0);
+                let mut f = String::new();
+                for (bit, ch) in [
+                    (BIND_OPAQUE, 'o'),
+                    (BIND_DIRTY_IS_VALID, 'd'),
+                    (BIND_EXPAND_TRANSPARENT, 't'),
+                    (BIND_EXPAND_OPAQUE, 'x'),
+                ] {
+                    if b.flags & bit != 0 {
+                        f.push(ch);
+                    }
+                }
+                // c = 같은 서피스 직전과 크기 다름, n = 이 이력 안에서 그 서피스의 첫 bind.
+                match history {
+                    Some(true) => f.push('c'),
+                    None => f.push('n'),
+                    Some(false) => {},
+                }
+                // 갱신 영역이 유효 영역보다 크면(확장) 유효 크기를 함께 적는다.
+                if b.update == b.valid {
+                    upd.push(format!("{}x{}:{f}", b.update.0, b.update.1));
+                } else {
+                    upd.push(format!(
+                        "{}x{}(v{}x{}):{f}",
+                        b.update.0, b.update.1, b.valid.0, b.valid.1
+                    ));
+                }
+            }
+        }
         if let Some(r) = render {
             let v = list(Kind::BindStep, device);
             let i = v.partition_point(|e| e.a < r.a);
@@ -1655,7 +1885,8 @@ fn frame_lines(
         let row = format!(
             "WALLGPUFRAME at={} p{} dev={device} pass={} render_us={} gpu_span_us={} between_us={} \
              cpu_us={} binds={binds} bind_us={}/{}/{}/{} unbind_us={}/{} flush_us={} sig_us={} \
-             pending_at_sig={} gpu_after_sig_us={} after_minus_span_us={} commit_us={} top_gpu_us={}",
+             pending_at_sig={} gpu_after_sig_us={} after_minus_span_us={} commit_us={} upd={} \
+             top_gpu_us={}",
             wall(frame.cpu_end),
             frame.painter,
             frame.pass,
@@ -1679,6 +1910,11 @@ fn frame_lines(
                 (a as i64 - (frame.span_ns / 1000) as i64).to_string()
             }),
             opt(commit_us),
+            if upd.is_empty() {
+                String::from("-")
+            } else {
+                upd.join(",")
+            },
             if top.is_empty() {
                 String::from("-")
             } else {
@@ -2369,6 +2605,81 @@ mod tests {
         let lines = frame_lines(10, &events, &lookup, &map, to_us, |_| String::from("T"));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("flush_us=- "), "{}", lines[0]);
+    }
+
+    #[test]
+    fn bind_info_round_trips_and_marks_size_changes() {
+        let to_us = |t: u64| t;
+        let flags = |opaque, dv, et, eo| BindFlags {
+            opaque,
+            dirty_is_valid: dv,
+            expand_transparent: et,
+            expand_opaque: eo,
+        };
+        let rec = |f: BindFlags, surface: u64, w: i32, start: u64, ticks: u64, tex: u64| {
+            let bits = (f.opaque as u8 * BIND_OPAQUE)
+                | (f.dirty_is_valid as u8 * BIND_DIRTY_IS_VALID)
+                | (f.expand_transparent as u8 * BIND_EXPAND_TRANSPARENT)
+                | (f.expand_opaque as u8 * BIND_EXPAND_OPAQUE);
+            ev(
+                Kind::BindInfo,
+                1,
+                bits,
+                (surface << 24) | ticks,
+                ((5760u64 << 16 | 2160) << 32) | ((w as u64) << 16) | 2160,
+                start,
+                tex,
+            )
+        };
+        let events = vec![
+            rec(flags(true, true, false, false), 7, 3872, 100, 200, 0xa),
+            rec(flags(true, true, false, false), 7, 4544, 200, 190, 0xb),
+            rec(flags(true, true, false, true), 7, 4544, 300, 10, 0xa),
+            rec(flags(false, true, true, false), 9, 5760, 400, 8, 0xc),
+        ];
+        let b = bind_info(&events[2]);
+        assert_eq!(
+            (b.surface, b.begin_ticks, b.update, b.valid),
+            (7, 10, (4544, 2160), (5760, 2160))
+        );
+        let line = &bind_info_lines(10, &events, &events, to_us)[0];
+        for want in [
+            "binds=4 opaque=3 dirty_is_valid=4 expand_transparent=1 expand_opaque=1 sizes=3",
+            "size_changed=1 tex_seen_in_last8=1",
+            "slow_begin_changed=1/1 slow_begin_same=0/1 slow_begin_first=1/2",
+        ] {
+            assert!(line.contains(want), "{want} not in {line}");
+        }
+    }
+
+    #[test]
+    fn upd_lists_only_the_binds_inside_the_render_span() {
+        // 크기 순서와 시각 순서를 거꾸로 둔다: 시각으로 찾아야 렌더 안의 bind 하나만 나온다.
+        let to_us = |t: u64| t;
+        let map = [ev(Kind::SlotMap, 0, 0, 0, 0, 0, 0)];
+        let info = |start: u64, w: u64| {
+            ev(
+                Kind::BindInfo,
+                0,
+                BIND_OPAQUE | BIND_DIRTY_IS_VALID,
+                (1 << 24) | 5,
+                ((w << 16 | 2160) << 32) | (w << 16) | 2160,
+                start,
+                start,
+            )
+        };
+        let mut events = frame(0, 3, 1_000_000, 20_000, &[("B_Image", 1_000_000)]);
+        let lookup = vec![
+            ev(Kind::Render, 0, 0, 3, 1_000, 30_000, 0),
+            info(500, 5760),
+            info(2_000, 3840),
+            info(50_000, 1000),
+        ];
+        events.extend(lookup.iter().copied());
+        let lines = frame_lines(10, &events, &lookup, &map, to_us, |_| String::from("T"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        // 렌더 안의 bind 하나(3840), 직전(5760)과 크기가 다르므로 c.
+        assert!(lines[0].contains("upd=3840x2160:odc "), "{}", lines[0]);
     }
 
     #[test]

@@ -493,6 +493,27 @@ pub struct Preferences {
     /// 면적이다: 정지 비디오가 비디오 영역 대신 타일 전체를 다시 그린다. 런 13/14 에서 GPU 일은
     /// 프레임당 1~3 ms 였다.
     pub gfx_dcomp_full_tile_updates: bool,
+    /// 2026-11-17 추가 -- 불투명 서피스의 BeginDraw 갱신 영역도 타일 전체로 고정한다(A/B, 기본 0).
+    /// `0` = 끔, `1` = 고정 + 유효 영역 밖 투명 지우기, `2` = 고정만(지우기 생략). 런처는
+    /// `-DcompOpaqueFullTile off|clear|noclear`.
+    ///
+    /// 왜: 벽 런 15(log_rotation_opacity_judder_01/15)에서 `gfx_dcomp_full_tile_updates` 는
+    /// 구조상 효과가 없었다. 보드가 움직이면 유효 영역이 바뀌어 WR 이 타일을 통째로 무효화하고,
+    /// dirty 를 유효 영역과 교차하므로 dirty 는 이미 valid 와 같다. 매 프레임 바뀌는 것은 유효 영역
+    /// 자체(타일 안의 보드 범위)다. 그 서피스는 불투명이라 크기를 고정하는 확장 가지
+    /// (`!불투명 && dirty == valid`, `gfx_dcomp_update_quantum_px`)를 타지 않는다.
+    /// 6 런에서 막힘 확률은 폭이 매 프레임 바뀌는 불투명 bind 34~61%, 폭이 일정한 bind 4~6%,
+    /// 확장 bind 1.5~4.4% 였다.
+    ///
+    /// 조건: 불투명 && dirty == valid && 그 타일의 표시 클립이 유효 영역 안. 그러면 갱신 영역 중
+    /// 유효 영역 밖 픽셀은 합성되지 않는다(WR 클립 = 장치 클립 ∩ 타일 유효 영역 합, 타일이 하나면
+    /// 그 유효 영역). WR 이 유효 영역 전체를 다시 그리므로 보존할 내용도 없다. 조건이 안 맞으면
+    /// 예전대로다.
+    ///
+    /// 비용: 런 15 의 확장 bind 는 GPU 가 bind 당 약 +0.83 ms 였다. 대부분 투명 지우기였고,
+    /// 위 이유로 생략할 수 있다(`2`). 단 같은 크기여도 서피스가 바뀐 직후에는 막혔으므로
+    /// 효과는 완전하지 않을 수 있다.
+    pub gfx_dcomp_opaque_full_tile: i64,
     /// 월 타일 루프의 **시작 타일을 패스마다 한 칸씩 돌린다**. 기본 `false`. 진단용이다.
     ///
     /// ★가르려는 것★: 패스 비용을 한 타일이 몰아서 낸다. 큰 캔버스 + DComp off 실측에서
@@ -2089,6 +2110,7 @@ impl Preferences {
             gfx_dcomp_parallel_commit_wait_all: false,
             gfx_dcomp_update_quantum_px: -1, // 타일 전체. 근거는 필드 doc 주석
             gfx_dcomp_full_tile_updates: false,
+            gfx_dcomp_opaque_full_tile: 0,
             gfx_wall_rotate_tile_order: false,
             gfx_paint_side_animations_enabled: true,
             gfx_paint_side_animation_horizon_ms: 3000,
