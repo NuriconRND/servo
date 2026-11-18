@@ -254,6 +254,35 @@ pub struct Preferences {
     /// Let the STANDARD `<video>` element play direct-URI network streams
     /// (`rtsp://`/`rtsps://`) by routing to a GStreamer `NetworkUri` player
     /// instead of the AppSrc fetch path. Off by default.
+    /// 준비 판정(`readyState`)을 ★파이프라인 상태가 아니라 디코딩된 프레임★ 에서 몰아줄지.
+    /// 기본 ★꺼짐★ (종전 동작).
+    ///
+    /// ## 왜 (2026-11-18)
+    ///
+    /// 운영자: "전환 애니메이션 재생시에 RTSP stream 및 video 의 표출 영역에 아직 프레임이
+    /// 준비되지 않아 ★빈 화면인 채로 애니메이션이 동작하는 경우★ 가 있다."
+    ///
+    /// IPWall 출력 페이지는 이미 이 엔진을 우회하고 있다 --
+    /// `widgets/output-render/sync/readySignal.ts` 에 "이 엔진의 미디어 이벤트는 믿을 수
+    /// 없어서 값으로 판정한다. `playing` 이 프레임 한 장 없이 온다(실측: `readyState=4`·
+    /// `videoWidth=0` 인 채 `playing`)" 고 적혀 있다. 그래서 `videoWidth > 0` 과 1 초 폴링으로
+    /// 판정하고, 준비가 안 오면 `wait` 상한까지 기다리다 ***그냥 드러낸다.***
+    ///
+    /// 엔진 결함 셋(상세는 `htmlmediaelement.rs` 의 `ready_state_follows_frames` doc):
+    ///
+    /// 1. `playback_state_changed` 가 GStreamer 의 `Playing`/`Paused` 만으로 `HaveMetadata`
+    ///    -> `HaveEnoughData` 로 두 단계를 뛴다 -> ★프레임 0 장에 `loadeddata`·`canplay`·
+    ///    `canplaythrough` 가 전부 나간다.★
+    /// 2. `videoWidth` 가 caps 메타데이터에서 온다(`gstreamer/player.rs` 의
+    ///    `first_video_stream.width()`) -> 파일 비디오는 ★오탐★, RTSP 는 첫 키프레임 전까지
+    ///    0 이라 ★`wait` 시한 소진★. 증상 하나에 원인이 둘이다.
+    /// 3. preroll 첫 프레임이 `HaveNothing` 조기 반환으로 ★버려진다.★
+    ///
+    /// 켜면 `loadeddata` 가 프레임 존재를 뜻하게 되어 페이지의 기존 이벤트 경로가 그대로
+    /// 정확해진다. 대가는 ★전환이 진짜 준비까지 늦어지는 것★ 이다 -- RTSP 는 연결 + 키프레임에
+    /// 수 초가 걸릴 수 있다. 그 상한을 고르려면 `MEDIAFIRSTFRAME` 의 `since_load` 를 먼저
+    /// 봐야 하고, 그 계측은 ★이 레버와 무관하게★ 돈다.
+    pub dom_media_ready_state_follows_frames: bool,
     pub dom_video_network_uri_enabled: bool,
     // feature: Sanitizer API | #43948 | Web/API/HTML_Sanitizer_API
     pub dom_sanitizer_enabled: bool,
@@ -2046,6 +2075,7 @@ impl Preferences {
             dom_image_extended_formats_enabled: false,
             dom_image_max_decoded_pixels: 3840 * 2160,
             dom_video_extended_containers_enabled: false,
+            dom_media_ready_state_follows_frames: false,
             dom_video_network_uri_enabled: false,
             dom_sanitizer_enabled: false,
             dom_screen_capture_enabled: false,

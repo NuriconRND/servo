@@ -1186,6 +1186,17 @@ pub(crate) struct HTMLMediaElement {
     ///
     /// Reset to false every time the load algorithm is invoked.
     fired_loadeddata_event: Cell<bool>,
+    /// 이 자원의 로드가 시작된 시각(`resource_selection_algorithm_sync` 7 단계).
+    /// `MEDIAFIRSTFRAME` 의 분모다. 자원이 바뀌면 다시 세운다.
+    load_started_at: Cell<Option<Instant>>,
+    /// 메타데이터가 도착한 시각. caps 가 온 시점과 ★그릴 수 있게 된 시점★ 의 간격을 본다.
+    metadata_at: Cell<Option<Instant>>,
+    /// ★디코딩된 첫 프레임이 도착한 시각.★ `None` 이면 아직 그릴 그림이 없다.
+    ///
+    /// 이 플래그가 필요한 이유는 `video_renderer.current_frame` 이 ***지금*** 프레임이
+    /// 있는지만 말하고, `playback_video_frame_updated` 가 `HaveNothing` 에서 일찍 돌아가
+    /// preroll 프레임이 왔다는 사실이 ***유실되기*** 때문이다(2026-11-18 결함 3).
+    first_frame_at: Cell<Option<Instant>>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-error>
     error: MutNullableDom<MediaError>,
     /// <https://html.spec.whatwg.org/multipage/#dom-media-paused>
@@ -1314,6 +1325,9 @@ impl HTMLMediaElement {
             current_src: DomRefCell::new("".to_owned()),
             generation_id: Cell::new(0),
             fired_loadeddata_event: Cell::new(false),
+            load_started_at: Cell::new(None),
+            metadata_at: Cell::new(None),
+            first_frame_at: Cell::new(None),
             error: Default::default(),
             paused: Cell::new(true),
             default_playback_rate: Cell::new(1.0),
@@ -1830,6 +1844,13 @@ impl HTMLMediaElement {
 
         // Step 7. Set the media element's networkState to NETWORK_LOADING.
         self.network_state.set(NetworkState::Loading);
+
+        // ★`MEDIAFIRSTFRAME` 의 시계를 여기서 센다.★ 새 자원이므로 앞 자원의 측정은 버린다.
+        // 2026-11-18 -- 운영자가 본 "전환 애니메이션이 빈 화면인 채로 도는" 증상의 분모가
+        // 이것이다: 페이지가 src 를 붙인 순간부터 그릴 수 있게 되기까지.
+        self.load_started_at.set(Some(Instant::now()));
+        self.metadata_at.set(None);
+        self.first_frame_at.set(None);
 
         // Step 8. Queue a media element task given the media element to fire an event named
         // loadstart at the media element.
@@ -3401,8 +3422,21 @@ impl HTMLMediaElement {
             self.queue_media_element_task_to_fire_event(atom!("resize"));
         }
 
+        self.metadata_at.set(Some(Instant::now()));
+
         // Step 6. Set the readyState attribute to HAVE_METADATA.
         self.change_ready_state(ReadyState::HaveMetadata);
+
+        // ★preroll 프레임을 받는다.★ 근거는 `ready_state_follows_frames` 의 doc 결함 3 --
+        // 프레임이 메타데이터보다 먼저 오면 `playback_video_frame_updated` 가
+        // `HaveNothing` 에서 일찍 돌아가 그 사실이 유실되고, 그 뒤로 그 프레임을 다시 보는
+        // 자리가 없었다. 여기서 한 번 본다.
+        if ready_state_follows_frames()
+            && self.first_frame_at.get().is_some()
+            && self.ready_state.get() == ReadyState::HaveMetadata
+        {
+            self.change_ready_state(ReadyState::HaveCurrentData);
+        }
 
         // Step 7. Let jumped be false.
         let mut jumped = false;
@@ -3480,6 +3514,64 @@ impl HTMLMediaElement {
         }
     }
 
+    /// 파이프라인 상태 변화로 `HaveEnoughData` 까지 올려도 되는가.
+    ///
+    /// 레버가 꺼져 있으면 ★종전 동작 그대로★ 참이다. 켜져 있으면 디코딩된 프레임이 한 장이라도
+    /// 와 있어야 한다 -- 근거는 [`ready_state_follows_frames`] 의 doc 결함 1.
+    fn may_advance_on_playback_state(&self) -> bool {
+        !ready_state_follows_frames() || self.first_frame_at.get().is_some()
+    }
+
+    /// 첫 프레임이 ★그릴 수 있게 된 시각★ 을 요소당 한 번 찍는다.
+    ///
+    /// ## 왜 (2026-11-18)
+    ///
+    /// 이 값이 없으면 RTSP 의 첫 프레임이 실제로 몇 ms 걸리는지 알 수 없고, 그러면
+    /// [`ready_state_follows_frames`] 를 켠 뒤 페이지의 `wait` 상한(`handoverConfig.ts`)이
+    /// 맞는지 ***판단할 수 없다.*** 그래서 레버와 무관하게 돈다.
+    ///
+    /// 읽는 법:
+    /// - `since_load` 페이지가 src 를 붙인 뒤 그릴 수 있게 되기까지. ★이것이 `wait` 과
+    ///   견줄 값이다.★
+    /// - `since_meta` caps 가 온 뒤 프레임까지. 음수로 나올 수 없고, `preroll=true` 면
+    ///   프레임이 ***메타데이터보다 먼저*** 온 것이다(결함 3 이 버리던 경우).
+    /// - `meta` 와 `frame` 의 크기가 다르면 caps 가 틀렸다는 뜻이다.
+    ///
+    /// ★URL 은 찍지 않는다★ -- RTSP URL 에 자격증명이 들어 있다(프런트엔드의
+    /// `rtspUrlWithCredentials`). 스킴만 남긴다.
+    ///
+    /// 비용: 요소당 한 번. 프레임마다 도는 자리에 느는 것은 `Cell` 읽기 하나뿐이다.
+    fn note_first_frame(&self, video_element: &HTMLVideoElement) {
+        let now = Instant::now();
+        let since_load = self
+            .load_started_at
+            .get()
+            .map_or(u128::MAX, |at| now.duration_since(at).as_millis());
+        let (since_meta, preroll) = match self.metadata_at.get() {
+            Some(at) => (now.duration_since(at).as_millis(), false),
+            None => (0, true),
+        };
+        let frame = self.video_renderer.lock().unwrap().current_frame;
+        let scheme = self
+            .resource_url
+            .borrow()
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |url| url.scheme().to_owned());
+        warn!(
+            "MEDIAFIRSTFRAME since_load={}ms since_meta={since_meta}ms preroll={preroll}              ready={:?} frame={}x{} meta={}x{} scheme={scheme}",
+            if since_load == u128::MAX {
+                "n/a".to_owned()
+            } else {
+                since_load.to_string()
+            },
+            self.ready_state.get(),
+            frame.map_or(0, |f| f.width),
+            frame.map_or(0, |f| f.height),
+            video_element.get_video_width().unwrap_or(0),
+            video_element.get_video_height().unwrap_or(0),
+        );
+    }
+
     fn playback_video_frame_updated(&self) {
         let Some(video_element) = self.downcast::<HTMLVideoElement>() else {
             return;
@@ -3491,13 +3583,33 @@ impl HTMLMediaElement {
         // the media element to fire an event named resize at the media element.
         // <https://html.spec.whatwg.org/multipage/#concept-video-intrinsic-width>
 
+        // ★첫 프레임을 먼저 적는다 -- readyState 가 아직 `HaveNothing` 이어도.★
+        //
+        // 2026-11-18. 아래 일찍 돌아가는 분기가 preroll 프레임이 왔다는 ***사실 자체를***
+        // 버리고 있었다(결함 3). 그 사실은 메타데이터 전이와
+        // `playback_state_changed` 가 쓴다.
+        let current_frame = self.video_renderer.lock().unwrap().current_frame;
+        if current_frame.is_some() && self.first_frame_at.get().is_none() {
+            self.first_frame_at.set(Some(Instant::now()));
+            self.note_first_frame(video_element);
+        }
+
         // The event for the prerolled frame from media engine could reached us before the media
         // element HAVE_METADATA ready state so subsequent steps will be cancelled.
         if self.ready_state.get() == ReadyState::HaveNothing {
             return;
         }
 
-        if let Some(frame) = self.video_renderer.lock().unwrap().current_frame {
+        // ★준비 판정을 프레임에서 몰아준다.★ 근거는 `ready_state_follows_frames` 의 doc.
+        // `HaveMetadata` 인 짧은 창에서만 불리므로 `pref!` 가 프레임마다 돌지 않는다.
+        if self.ready_state.get() == ReadyState::HaveMetadata
+            && self.first_frame_at.get().is_some()
+            && ready_state_follows_frames()
+        {
+            self.change_ready_state(ReadyState::HaveCurrentData);
+        }
+
+        if let Some(frame) = current_frame {
             if video_element
                 .set_natural_dimensions(Some(frame.width as u32), Some(frame.height as u32))
             {
@@ -3622,13 +3734,17 @@ impl HTMLMediaElement {
         match *state {
             PlaybackState::Paused => {
                 media_session_playback_state = MediaSessionPlaybackState::Paused;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if self.ready_state.get() == ReadyState::HaveMetadata
+                    && self.may_advance_on_playback_state()
+                {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
             PlaybackState::Playing => {
                 media_session_playback_state = MediaSessionPlaybackState::Playing;
-                if self.ready_state.get() == ReadyState::HaveMetadata {
+                if self.ready_state.get() == ReadyState::HaveMetadata
+                    && self.may_advance_on_playback_state()
+                {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
@@ -4493,6 +4609,53 @@ fn extended_container_allowed(type_: &str) -> bool {
 /// Returns true if `url` uses a scheme that must be handed directly to a
 /// GStreamer `NetworkUri` player (the engine pulls it itself) rather than fetched
 /// through Servo's network stack and pushed via AppSrc.
+/// 준비 판정(`readyState`)을 ★파이프라인 상태가 아니라 디코딩된 프레임★ 에서 몰아줄지.
+/// `dom_media_ready_state_follows_frames`, 기본 꺼짐.
+///
+/// ## 왜 (2026-11-18)
+///
+/// 운영자: "전환 애니메이션 재생시에 RTSP stream 및 video 의 표출 영역에 아직 프레임이
+/// 준비되지 않아 ★빈 화면인 채로 애니메이션이 동작하는 경우★ 가 있다."
+///
+/// IPWall 출력 페이지는 이미 이 엔진을 우회하고 있다 --
+/// `widgets/output-render/sync/readySignal.ts` 에 "이 엔진의 미디어 이벤트는 믿을 수 없어서
+/// ★값으로 판정한다★. `playing` 이 프레임 한 장 없이 온다(실측: `readyState=4`·
+/// `videoWidth=0` 인 채 `playing`)" 고 적혀 있고, `videoWidth > 0` 과 1 초 폴링으로 판정한다.
+/// 준비가 안 오면 `wait` 상한까지 기다리고 ***그냥 드러낸다*** -- 그것이 빈 화면이다.
+///
+/// 결함은 셋이고 전부 이 파일에 있다.
+///
+/// 1. ★readyState 가 프레임이 아니라 파이프라인 상태로 올라간다.★
+///    `playback_state_changed` 가 GStreamer 의 `Playing`(심지어 `Paused`)만으로
+///    `HaveMetadata` -> `HaveEnoughData` 로 두 단계를 뛴다. `change_ready_state` 가 그
+///    전이에서 `loadeddata`·`canplay`·`canplaythrough` 를 내므로 ***디코딩된 프레임 0 장에
+///    준비 이벤트가 전부 나간다.*** 스펙의 `HAVE_CURRENT_DATA` 는 "현재 프레임을 그릴
+///    데이터가 있음" 이고 파이프라인 상태는 그 진술이 아니다.
+///
+/// 2. ★`videoWidth` 는 caps 메타데이터에서 온다.★ `playback_metadata_updated` 가
+///    `metadata.width` 로 세우고, 그 값은 `gstreamer/player.rs` 의
+///    `first_video_stream.width()` -- caps 협상 값이고 프레임이 아니다. 그래서 파일 비디오는
+///    프레임 전에 `videoWidth > 0` 이 되어 ***오탐*** 이고, RTSP 는 첫 키프레임 전까지 0 이라
+///    페이지가 `wait` 시한을 소진한다. ***증상 하나에 원인이 둘이고 둘 다 같은 빈 화면을
+///    만든다.***
+///
+/// 3. ★preroll 첫 프레임이 버려진다.★ `playback_video_frame_updated` 가 `HaveNothing` 에서
+///    일찍 돌아가고, 그 뒤로 그 프레임을 다시 보는 자리가 없었다.
+///
+/// 엔진은 정답을 이미 갖고 있었다 -- `playback_video_frame_updated` 가 `current_frame` 이
+/// Some 인 것을 아는 자리인데 readyState 를 건드리지 않았다.
+///
+/// 켜면 `loadeddata` 가 ★프레임 존재를 뜻하게★ 되어 프런트엔드의 기존 이벤트 경로가 그대로
+/// 정확해지고, 1 초 폴링 지연도 사라진다. 대가는 ★전환이 진짜 준비까지 늦어지는 것★ 이다 --
+/// RTSP 는 연결 + 키프레임에 수 초가 걸릴 수 있어 페이지의 `wait` 상한이 비로소 의미를
+/// 갖는다(지금은 우회되고 있다). 그 값을 고르려면 `MEDIAFIRSTFRAME` 이 먼저 필요하다.
+///
+/// 비용: `LazyLock` 이라 `pref!` 는 ★프로세스당 한 번★ 이고 이후는 원자 읽기 하나다.
+fn ready_state_follows_frames() -> bool {
+    static CACHED: LazyLock<bool> = LazyLock::new(|| pref!(dom_media_ready_state_follows_frames));
+    *CACHED
+}
+
 fn is_direct_uri_scheme(url: &ServoUrl) -> bool {
     matches!(url.scheme(), "rtsp" | "rtsps")
 }
