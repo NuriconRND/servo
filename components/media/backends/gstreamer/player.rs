@@ -1356,6 +1356,10 @@ pub struct GStreamerPlayer {
     network_uri: Option<String>,
     /// Decorator used to setup the video sink and process the produced frames.
     render: Arc<Mutex<GStreamerRender>>,
+    /// 2026-11-18: this video's NUMA placement (`media_numa_pin_policy=tile`), shared by the
+    /// D3D11 render (which knows the tiles displaying it) and the bus `stream-status` hook (which
+    /// sees every streaming thread start and stop). `None` = the old round-robin pin.
+    placement: Option<Arc<servo_config::wall_numa::VideoPlacement>>,
     /// Media resource URL hint (see `Player::set_resource_url`), captured before `setup()`
     /// so the direct local-file path (see `media_direct_file_enabled`) can be chosen. `None`
     /// unless the element hinted a URL.
@@ -1385,6 +1389,14 @@ impl GStreamerPlayer {
             Some("Servo player"),
         );
 
+        // 2026-11-18: only players that show video get a placement; audio-only players keep their
+        // threads unpinned, as before.
+        let placement = video_renderer
+            .as_ref()
+            .and_then(|_| servo_config::wall_numa::VideoPlacement::for_new_video());
+        let render = GStreamerRender::new(gl_context);
+        render.set_video_placement(placement.clone());
+
         Self {
             id,
             context_id: *context_id,
@@ -1396,7 +1408,8 @@ impl GStreamerPlayer {
             is_ready: Arc::new(Once::new()),
             stream_type,
             network_uri,
-            render: Arc::new(Mutex::new(GStreamerRender::new(gl_context))),
+            render: Arc::new(Mutex::new(render)),
+            placement,
             resource_url: RefCell::new(None),
             force_direct_file: Cell::new(false),
         }
@@ -1507,6 +1520,7 @@ impl GStreamerPlayer {
         self.install_video_sink_callbacks(&video_sink);
         self.install_gapless_and_sync(&inner);
         self.install_direct_bus_watch(&inner, &pipeline);
+        self.install_placement_bus_hook(&pipeline);
         self.install_direct_position_ticker(&inner, &pipeline);
 
         // PAUSED 로 올려 preroll 시킨다. 메타데이터는 preroll 이 끝나야 알 수 있다
@@ -1952,10 +1966,38 @@ impl GStreamerPlayer {
         }
     }
 
+    /// 2026-11-18: register every streaming thread of this pipeline with the video's NUMA
+    /// placement. `STREAM_STATUS` ENTER/LEAVE is posted by the streaming thread itself, so the
+    /// sync handler runs on that thread and can pin it right there -- before it touches its
+    /// buffers. Under playbin3 the decoder is not the appsink thread, so pinning only the appsink
+    /// callback thread would leave decode where it was. Must be installed before the pipeline
+    /// leaves NULL (threads start at PAUSED). Captures only the placement (no `PlayerInner`), so
+    /// it closes no reference cycle.
+    fn install_placement_bus_hook(&self, pipeline: &gstreamer::Element) {
+        let Some(placement) = self.placement.clone() else {
+            return;
+        };
+        let Some(bus) = pipeline.bus() else {
+            return;
+        };
+        bus.enable_sync_message_emission();
+        bus.connect_sync_message(Some("stream-status"), move |_, message| {
+            if let gstreamer::MessageView::StreamStatus(status) = message.view() {
+                match status.get().0 {
+                    gstreamer::StreamStatusType::Enter => placement.enter_current_thread(),
+                    gstreamer::StreamStatusType::Leave => placement.leave_current_thread(),
+                    _ => {},
+                }
+            }
+        });
+    }
+
     fn install_video_sink_callbacks(&self, video_sink: &gstreamer_app::AppSink) {
         let Some(video_renderer) = self.video_renderer.clone() else {
             return;
         };
+        // 2026-11-18: with a `tile` placement the round-robin pin is off (see `thread_name`).
+        let round_robin_pin = self.placement.is_none();
         // `media_video_sink_pacing=thread` 에서만 쓴다. 모드는 한 번만 읽는다 —
         // 프레임마다 pref 를 읽으면 이 경로가 줄이려는 비용에 자기 자신이 섞인다.
         let sink_pacing = crate::render::VideoSinkPacing::from_pref();
@@ -1971,7 +2013,7 @@ impl GStreamerPlayer {
             move |sample: gstreamer::Sample| {
                 // This closure runs on the video sink's streaming thread --
                 // a GLib thread with no OS name of its own. Latched inside.
-                crate::thread_name::tag_video_streaming_thread();
+                crate::thread_name::tag_video_streaming_thread(round_robin_pin);
 
                 // 싱크가 클럭을 기다리지 않으므로 재생 속도를 여기서 지킨다.
                 // 잠은 락 밖에서 잔다.
@@ -2072,6 +2114,7 @@ impl GStreamerPlayer {
         let player = gstreamer_play::Play::default();
         let signal_adapter = gstreamer_play::PlaySignalAdapter::new_sync_emit(&player);
         let pipeline = player.pipeline();
+        self.install_placement_bus_hook(&pipeline);
         pipeline.connect("deep-element-added", false, move |args| {
             if let Ok(element) = args[2].get::<gstreamer::Element>() {
                 log_pipeline_element_added(&element);

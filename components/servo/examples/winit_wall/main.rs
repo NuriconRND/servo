@@ -65,6 +65,7 @@ fn qpc_frequency() -> Option<i64> {
 
 mod crash_report;
 mod device_auth_selftest;
+mod numa;
 mod tick_phase_probe;
 mod tick_refresh_driver;
 mod tile;
@@ -150,7 +151,18 @@ fn parse_args() -> Result<Config, Box<dyn Error>> {
                 let mut parts = spec.splitn(2, '=');
                 let name = parts.next().unwrap_or_default();
                 let value = parts.next().unwrap_or("true");
-                preferences.set_value(name, PrefValue::from_booleanish_str(value));
+                // 2026-11-18 (리뷰): 선언 타입이 String 인 pref 는 글자 그대로 넣는다.
+                // booleanish 해석은 "1" 을 Int 로 바꾸고, String 필드의 set_value 가 그것을
+                // unwrap 하다 기동 중에 panic 했다(`--pref gfx_wall_numa_tile_nodes=1`). 모르는
+                // 이름은 예전처럼 set_value 가 panic 한다.
+                let value = if Preferences::exists(name)
+                    && Preferences::type_of(name) == std::any::type_name::<String>()
+                {
+                    PrefValue::Str(value.to_owned())
+                } else {
+                    PrefValue::from_booleanish_str(value)
+                };
+                preferences.set_value(name, value);
             },
             other if !other.starts_with("--") => url = Some(other.to_string()),
             other => return Err(format!("unknown argument: {other}").into()),
@@ -1511,15 +1523,39 @@ impl ApplicationHandler<WakerEvent> for App {
         let parallel_tiles = servo::pref!(gfx_wall_parallel_tiles);
         let mut tile_factories: Vec<Option<servo::RenderingContextFactory>> = Vec::new();
 
-        // Create one window (and, unless the tile gets its own thread, a rendering context).
+        // Create one window per tile first (and decide its GPU), without any rendering context yet.
+        let plans = tile::plan_tile_windows_pub(
+            event_loop,
+            &config.layout,
+            &tile_indices,
+            &spatial,
+            have_topology,
+        );
+
+        // ★NUMA 표와 렌더 스레드 핀(2026-11-18).★ 창 계획이 끝나 타일마다 최종 GPU(레이아웃의 `gpu`
+        // 덮어쓰기 반영)가 정해졌고, 아직 어느 디바이스도 만들지 않은 자리다. 핀은 디바이스를 만들기
+        // ★전에★ 해야 드라이버 할당과 ANGLE/드라이버 스레드가 그 노드를 따른다. 근거와 규칙은
+        // `numa.rs` 와 `servo_config::wall_numa` 의 doc 주석에 있다.
+        let numa_tiles: Vec<(usize, Option<usize>)> = plans
+            .iter()
+            .map(|plan| (plan.tile_index, plan.gpu_index))
+            .collect();
+        let numa_topology = numa::build(&numa_tiles);
+        let render_pin = numa::render_pin_plan(numa_topology, parallel_tiles, &tile_indices);
+        eprintln!("WALLNUMA render pin: {render_pin:?} (parallel_tiles={parallel_tiles})");
+        match &render_pin {
+            numa::RenderPin::PerTile => {
+                if let Some(node) = numa::tile_node(tile_indices[0]) {
+                    numa::pin_and_report(node, &format!("main (tile {})", tile_indices[0]));
+                }
+            },
+            numa::RenderPin::Main(node) => numa::pin_and_report(*node, "main (all tiles)"),
+            numa::RenderPin::Off(_) => {},
+        }
+        let pin_tile_threads = render_pin == numa::RenderPin::PerTile;
+
+        // Bind each tile's rendering context (or, for a tile with its own thread, its factory).
         let tiles = if parallel_tiles {
-            let plans = tile::plan_tile_windows_pub(
-                event_loop,
-                &config.layout,
-                &tile_indices,
-                &spatial,
-                have_topology,
-            );
             let mut tiles = Vec::with_capacity(plans.len());
             for (slot, plan) in plans.into_iter().enumerate() {
                 if slot == 0 {
@@ -1531,21 +1567,13 @@ impl ApplicationHandler<WakerEvent> for App {
                     tile_factories.push(None);
                     continue;
                 }
-                let (tile, factory) = tile::split_plan_for_own_thread(plan);
+                let (tile, factory) = tile::split_plan_for_own_thread(plan, pin_tile_threads);
                 tiles.push(tile);
                 tile_factories.push(Some(factory));
             }
             tiles
         } else {
-            tile::create_tile_windows(
-                event_loop,
-                display_handle,
-                &config.layout,
-                &tile_indices,
-                &spatial,
-                have_topology,
-                frame_driver,
-            )
+            tile::create_tile_windows(plans, display_handle, frame_driver)
         };
 
         // 2) Build the shared Servo instance against tile 0's (primary) context.
@@ -1564,11 +1592,16 @@ impl ApplicationHandler<WakerEvent> for App {
             ..Default::default()
         };
         let ignore_certificate_errors = opts.ignore_certificate_errors;
-        let servo = ServoBuilder::default()
-            .opts(opts)
-            .event_loop_waker(Box::new(waker.clone()))
-            .preferences(std::mem::take(&mut config.preferences))
-            .build();
+        // 2026-11-18 (리뷰): 메인 스레드가 NUMA 노드에 핀되어 있으면 build 동안만 푼다. build 가 메인에서
+        // 엔진 스레드를 띄우는데, 새 스레드는 만든 스레드의 group 을 물려받는다(Windows 문서). 풀지 않으면
+        // 그 스레드 전부가 타일 0 의 노드로 간다. 근거는 `servo_config::wall_numa::suspend_pin`.
+        let servo = servo_config::wall_numa::suspend_pin(|| {
+            ServoBuilder::default()
+                .opts(opts)
+                .event_loop_waker(Box::new(waker.clone()))
+                .preferences(std::mem::take(&mut config.preferences))
+                .build()
+        });
         servo.setup_logging();
         // ***After `setup_logging()`, not before.*** This used to sit above the builder,
         // where env_logger does not exist yet, so the line was swallowed and a run that
@@ -1663,6 +1696,12 @@ impl ApplicationHandler<WakerEvent> for App {
         //
         // 직렬 경로에서도 같은 경합이 있었고 창이 좁아 안 걸렸을 뿐이다. 타일을 전부
         // 세운 뒤에 로드를 시작하면 두 경로 모두에서 사라진다.
+        // 2026-11-18: 타일 0 의 painter 는 아래 `build()` 안에서 이 스레드(메인)에 만들어진다. 그
+        // painter 가 자기 타일의 노드를 알게 한다(WebRender 스레드 핀, 미디어 디바이스 -> 노드).
+        servo_config::wall_numa::set_tile_hint(Some(servo_config::wall_numa::TileHint {
+            tile_index: tile_indices[0],
+            node: numa::tile_node(tile_indices[0]),
+        }));
         let webview = WebViewBuilder::new(&app_state.servo, primary_context)
             .hidpi_scale_factor(Scale::new(primary_scale))
             .viewport_size_override(virtual_viewport_css)
@@ -1696,11 +1735,19 @@ impl ApplicationHandler<WakerEvent> for App {
                         .rendering_context
                         .clone()
                         .expect("inline tiles own their context on the shell side");
+                    // 2026-11-18: 인라인 painter 도 이 스레드(메인)에 만들어진다 -- 위 타일 0 과 같다.
+                    servo_config::wall_numa::set_tile_hint(Some(
+                        servo_config::wall_numa::TileHint {
+                            tile_index,
+                            node: numa::tile_node(tile_index),
+                        },
+                    ));
                     webview.add_paint_target(rendering_context, viewport_details, origin)
                 },
             };
             tile.paint_target.set(Some(target));
         }
+        servo_config::wall_numa::set_tile_hint(None);
 
         // 모든 타일이 등록된 뒤에 로드를 시작한다(위 주석 참고).
         webview.load(config.url.clone());

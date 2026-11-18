@@ -1124,6 +1124,11 @@ param(
     # capacity problem -- even the collapsed runs left 31 of 80 cores idle. Removing the
     # mechanism on the current board needs ***per-tile thread placement, not whole-process
     # pinning***, and that does not exist yet.
+    #
+    # (2026-11-18) It exists now, in the engine: -NoNumaRenderPin / -NumaTileNodes /
+    # -NumaPinPolicy below, and the WALLNUMA lines in the log. -NumaNode still decides the
+    # processor group of every thread the engine does NOT pin (script, layout, constellation,
+    # driver threads) and of allocations made before the pins.
     [string] $NumaNode = "auto",
     # Hard-confine the wall to its processor group, on top of the node PREFERENCE that
     # `start /NODE` gives. Off by default until measured on the wall itself.
@@ -1159,6 +1164,37 @@ param(
     # Turn the pin off (media_numa_pin_streaming_threads=false). Wins over -NumaPin if both
     # are passed -- an explicit "off" should never be silently overridden.
     [switch] $NoNumaPin,
+    # (2026-11-18) gfx_wall_numa_render_pin=false. The ENGINE pins each tile's render thread,
+    # and that painter's WebRender threads (RenderBackend, SceneBuilder, WRWorker), to the NUMA
+    # node of the tile's GPU BEFORE the device is created. winit_wall resolves the nodes at
+    # startup: adapter LUID -> D3DKMT -> PnP -> DEVPKEY_Device_Numa_Node (WALLNUMA lines).
+    # Engine default ON; a no-op on a one-node box or when no adapter reports a node. It needs
+    # one thread per GPU: every tile with -ParallelTiles, otherwise only when all tiles' GPUs
+    # share one node (the main thread renders them all). Not measured on the wall yet -- this
+    # switch is the OFF arm of that A/B.
+    [switch] $NoNumaRenderPin,
+    # (2026-11-18) gfx_wall_numa_tile_nodes: override the detected tile -> node table, by layout
+    # tile index ("0,1,0,1"; '-' or an empty field keeps the detected node). For a near/far
+    # A/B on the 2:2 board, or with -NumaFakeSplit to run the code path on a one-node box.
+    [string] $NumaTileNodes = "",
+    # (2026-11-18) gfx_wall_numa_fake_split: DIAGNOSTIC. Split every real node into N fake
+    # nodes by physical cores, so the pin code path and its readback can run on a one-node dev
+    # box. Memory locality does not change. 0 = off.
+    [ValidateRange(0, 8)]
+    [int] $NumaFakeSplit = 0,
+    # (2026-11-18) media_numa_pin_policy: where the video streaming threads go (only while the
+    # streaming-thread pin is on, i.e. not with -NoNumaPin).
+    #   tile       = the node of the tile(s) displaying the video right now (the D3D11 path's
+    #                per-frame "devices that demanded this video"), staying put while it shows
+    #                on several, and spilling to the least-loaded node once one node has
+    #                max(2, cores/4) more videos -- so an all-GPUs-on-one-node box degenerates to
+    #                today's spread (0.53 cores/video, 733085450e3). ALL streaming threads of the
+    #                pipeline are placed (bus STREAM_STATUS ENTER), because under playbin3 the
+    #                decoder is not the appsink thread.
+    #   roundrobin = the 2026-08-27 behaviour: the appsink thread only, index % nodes.
+    # Empty = engine default (tile; it falls back to roundrobin without a multi-node table).
+    [ValidateSet("", "tile", "roundrobin")]
+    [string] $NumaPinPolicy = "",
     # Extra `--pref name=value` pairs passed straight through, for knobs this launcher does
     # not wrap. WebGL2 and WebGPU are both OFF by default in this engine, so anything using a
     # canvas 3D context needs one of these:
@@ -1268,6 +1304,37 @@ if ($GpuFenceProbe -and -not $DcompCommitInFrame) {
 }
 if ($DetachTileRender -and -not $ParallelTiles) {
     Write-Warning "-DetachTileRender without -ParallelTiles: detaching only changes behaviour when tiles render on their own threads. It will do nothing here."
+}
+# (2026-11-18) -Confine hard-confines the whole process to ONE processor group
+# (SetProcessAffinityMask after launch). The engine pins render threads and video streaming
+# threads per NUMA node, which on the wall means both groups. The two cannot both hold: the
+# affinity call fails once threads span groups, or the later pins escape it, and the run is not
+# what its command line says. The streaming-thread pin already conflicted ("must not be
+# combined", -NumaPin comment); this enforces it.
+if ($Confine -and (-not $NoNumaRenderPin -or -not $NoNumaPin)) {
+    throw "-Confine confines the whole process to one processor group, but the engine pins render threads (turn off with -NoNumaRenderPin) and video streaming threads (turn off with -NoNumaPin) per NUMA node. Pass -NoNumaRenderPin -NoNumaPin with -Confine, or drop -Confine."
+}
+if ($NumaTileNodes -ne "" -and $NumaTileNodes -notmatch '^\s*(\d+|-)?\s*(,\s*(\d+|-)?\s*)*$') {
+    throw "-NumaTileNodes must be a comma list of node numbers by layout tile index, with '-' or an empty field for 'detected' (got '$NumaTileNodes')"
+}
+if ($NumaTileNodes -ne "" -and $NoNumaRenderPin -and $NoNumaPin) {
+    Write-Warning "-NumaTileNodes with -NoNumaRenderPin -NoNumaPin: nothing is placed, so the override changes nothing."
+}
+if ($NumaPinPolicy -ne "" -and $NoNumaPin) {
+    Write-Warning "-NumaPinPolicy $NumaPinPolicy with -NoNumaPin: the streaming-thread pin is off, so the policy does nothing."
+}
+# (2026-11-18 review) Name only the threads the engine can actually place in this configuration.
+if ($NumaNode -match '^\d+$' -and (-not $NoNumaRenderPin -or -not $NoNumaPin)) {
+    $placed = @()
+    if (-not $NoNumaRenderPin) {
+        if ($ParallelTiles) { $placed += "each tile's render thread and its WebRender threads" }
+        else { $placed += "the render thread only if every tile's GPU is on one node (serial tiles; on the 2:2 wall 'WALLNUMA render pin:' says Off and the main and WebRender threads stay under /NODE $NumaNode)" }
+    }
+    if (-not $NoNumaPin) {
+        if ($NumaPinPolicy -eq 'roundrobin') { $placed += "video appsink threads (round-robin across nodes, not by tile)" }
+        else { $placed += "video streaming threads (by the tile showing the video)" }
+    }
+    Write-Warning "-NumaNode ${NumaNode}: /NODE picks the processor group of every thread the engine does not pin (and of allocations made before the pins). On a multi-node box the engine places: $($placed -join '; '). Check the WALLNUMA lines in the log."
 }
 
 # Pick exactly one pacing clock. Passing both leaves no way, even in the log, to tell
@@ -1510,6 +1577,11 @@ if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$Si
 if ($NoAudio)             { $argList += @("--pref", "media_audio_enabled=false") }
 if ($NoNumaPin)           { $argList += @("--pref", "media_numa_pin_streaming_threads=false") }
 elseif ($NumaPin)         { $argList += @("--pref", "media_numa_pin_streaming_threads=true") }
+# (2026-11-18) Sent only when given, so this launcher still runs an engine without these prefs.
+if ($NoNumaRenderPin)     { $argList += @("--pref", "gfx_wall_numa_render_pin=false") }
+if ($NumaTileNodes -ne "") { $argList += @("--pref", "gfx_wall_numa_tile_nodes=$NumaTileNodes") }
+if ($NumaFakeSplit -gt 0) { $argList += @("--pref", "gfx_wall_numa_fake_split=$NumaFakeSplit") }
+if ($NumaPinPolicy -ne "") { $argList += @("--pref", "media_numa_pin_policy=$NumaPinPolicy") }
 if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($ParallelTiles)       { $argList += @("--pref", "gfx_wall_parallel_tiles=true") }
@@ -1531,7 +1603,7 @@ if (Test-Path $buildStamp) {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
 Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to next tick head (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$(if(-not $DcompParallelCommit){'off'}elseif($ParallelCommitWaitAll){'wait-all'}else{'per-device'}) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) full_tile_updates=$($DcompFullTileUpdates.IsPresent) opaque_full_tile=$(if($DcompOpaqueFullTile -eq 'noclear'){'noclear (default)'}else{$DcompOpaqueFullTile}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) event_probe=$($EventProbe.IsPresent) span_probe=$($SpanProbe.IsPresent) gpu_time_probe=$($GpuTimeProbe.IsPresent) gpu_fence_probe=$($GpuFenceProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) glerr_every=$GlErrorCheckEvery hud_every=$HudDrawEvery ack_deadline=$CanvasAckDeadlineMs scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) numa_pin_policy=$(if($NoNumaPin){'n/a'}elseif($NumaPinPolicy -eq ''){'tile(default)'}else{$NumaPinPolicy}) numa_render_pin=$(if($NoNumaRenderPin){'off'}else{'on(default)'}) numa_tile_nodes=$(if($NumaTileNodes -eq ''){'auto'}else{$NumaTileNodes}) numa_fake_split=$NumaFakeSplit audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
 # its own log, not only in the command someone typed.

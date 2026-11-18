@@ -17,3 +17,4 @@ pub mod pref_util;
 pub mod prefs;
 pub mod removed_env;
 pub mod wall_event;
+pub mod wall_numa;

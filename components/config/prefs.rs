@@ -702,6 +702,37 @@ pub struct Preferences {
     pub gfx_wr_texture_cache_evict_budget_mb: i64,
 
     pub gfx_wall_parallel_tiles: bool,
+    /// 2026-11-18 추가 -- 각 타일의 렌더 스레드를 그 타일 GPU 의 NUMA 노드에 핀한다. ★기본 true★.
+    ///
+    /// winit_wall 이 기동할 때 CPU 노드(processor group 과 마스크, 물리 코어 수)와 타일마다 GPU 의
+    /// 노드(어댑터 LUID -> D3DKMT -> PnP -> `DEVPKEY_Device_Numa_Node`)를 알아내
+    /// [`crate::wall_numa`] 표에 둔다(`WALLNUMA` 줄). 그 뒤 렌더 스레드를 디바이스를 만들기 ★전에★
+    /// 그 노드에 하드 핀(`SetThreadGroupAffinity`)한다. 그 painter 의 WebRender 스레드(RenderBackend,
+    /// SceneBuilder, WRWorker)도 같은 노드에 핀한다.
+    ///
+    /// 렌더 스레드가 GPU 하나만 그릴 때만 맞출 수 있다:
+    /// - `gfx_wall_parallel_tiles=true` 이면 타일 1~3 은 WallTilePainter 스레드, 타일 0 은 메인 스레드다.
+    /// - 직렬(기본)이면 메인 스레드가 모든 타일을 그리므로, 모든 타일 GPU 가 한 노드에 있을 때만 핀한다.
+    ///
+    /// 노드가 하나인 장비, 또는 GPU 노드를 알 수 없으면 아무것도 하지 않는다.
+    ///
+    /// 근거: 옛 보드(GPU 넷이 모두 노드 1)에서 프로세스 전체를 먼 노드에 두면 45 영상이 23~29.5 ->
+    /// 6 fps, Present 0.65 -> 2.9 ms 였다(`73d3aeddff0`). 지금 보드는 GPU 가 2:2 라 프로세스 단위로는
+    /// 맞출 수 없다(`30504828a5a`, 런처 `-NumaNode` 주석). 타일 단위 배치는 이 pref 가 처음이고
+    /// 벽에서 측정된 적이 없다. 끄려면 런처 `-NoNumaRenderPin`.
+    pub gfx_wall_numa_render_pin: bool,
+    /// 2026-11-18 추가 -- 감지한 타일 -> NUMA 노드를 덮어쓴다. 레이아웃의 타일 순서대로 쉼표로
+    /// 나열한다(`"0,1,0,1"`). 빈 칸이나 `-` 는 감지값을 쓴다. 기본 `""`(감지값). 가까운 노드와 먼
+    /// 노드를 일부러 바꿔 보는 A/B, 그리고 개발 장비(노드 하나)에서 아래 가짜 분할과 함께 코드 경로를
+    /// 돌려 보는 데 쓴다. 런처 `-NumaTileNodes`. 한계: 같은 GPU 의 타일들은 D3D11 디바이스를 공유하므로,
+    /// 그 타일들에 서로 다른 노드를 주면 렌더 스레드는 갈리지만 영상 배치는 그 디바이스를 쓰지 않는다
+    /// (영상의 요구 신호가 디바이스 단위다).
+    pub gfx_wall_numa_tile_nodes: String,
+    /// 2026-11-18 추가 -- ★진단 전용★. 0 이 아니면 실제 노드마다 물리 코어를 N 묶음으로 나눠
+    /// 가짜 노드로 삼는다(노드 r 의 k 번째 묶음 = 가짜 노드 `r*N+k`). 노드가 하나인 개발 장비에서
+    /// 핀 코드 경로와 되읽기를 시험하려는 것이다. 메모리 지역성은 바뀌지 않는다. 기본 0. 런처
+    /// `-NumaFakeSplit <n>`.
+    pub gfx_wall_numa_fake_split: i64,
     /// 표출 클럭 틱에서 `request_redraw()` 를 거치지 않고 **그 자리에서 바로** 타일을
     /// 그릴지. 기본 꺼짐(= 종전 경로).
     ///
@@ -1833,6 +1864,23 @@ pub struct Preferences {
     /// 그리고 영상의 절반은 GPU 가 붙지 않은 노드에서 업로드하게 되는데, 업로드는 영상당
     /// 0.047 코어라 디코드 전체가 원격인 것보다 싸다 — 실측으로 확인됐다.
     pub media_numa_pin_streaming_threads: bool,
+    /// 2026-11-18 추가 -- 비디오 스트리밍 스레드를 어느 노드에 둘지. `media_numa_pin_streaming_threads`
+    /// 가 켜져 있을 때만 본다(그것이 끄는 스위치다). 기본 `""` = `tile`.
+    ///
+    /// - `tile`: 그 영상을 지금 그리는 타일 GPU 의 노드를 우선한다. 신호는 D3D11 경로가 이미 매
+    ///   프레임 쓰는 "이 영상을 요구한 디바이스" 집합이다(`demanded_devices`, 2 초 TTL). 그 집합이
+    ///   바뀔 때만 노드를 다시 고른다. 원래 노드가 요구 노드 안에 있으면 그대로 둔다. 한 노드의 영상
+    ///   수가 가장 적은 노드보다 `max(2, 물리 코어/4)` 이상 많으면 가장 적은 노드로 넘긴다. GPU 가
+    ///   한 노드에 몰린 장비(옛 보드)에서는 결과가 지금의 분산과 같아진다. 2026-08-27 실측으로 프로세스를
+    ///   한 노드에 가두면 0.74 코어/영상, 두 노드에 나누면 0.53 이었다(`733085450e3`).
+    ///   핀하는 것은 그 파이프라인의 ★모든 스트리밍 스레드★다(버스 `STREAM_STATUS` ENTER 에서
+    ///   등록). playbin3 에서는 디코더가 appsink 스레드가 아니기 때문이다. 아직 어느 타일도 그
+    ///   영상을 그리지 않았으면 영상 수가 가장 적은 노드에 둔다.
+    /// - `roundrobin`: 2026-08-27 의 동작. 첫 appsink 콜백 순번 % 노드 수로 appsink 스레드 하나만 핀한다.
+    ///
+    /// `tile` 은 winit_wall 의 NUMA 표(노드 둘 이상)가 있을 때만 돈다. 없으면(servoshell, 노드 하나)
+    /// `roundrobin` 으로 떨어진다. 런처 `-NumaPinPolicy tile|roundrobin`.
+    pub media_numa_pin_policy: String,
     /// `rtspsrc` 지터버퍼 크기(ms). `-1` = 미설정 — GStreamer 기본값 **2000ms** 를 그대로
     /// 둔다(현행 동작).
     ///
@@ -2140,6 +2188,9 @@ impl Preferences {
             gfx_wr_image_tiling_threshold: 4096,
             gfx_wr_texture_cache_evict_budget_mb: 0,
             gfx_wall_parallel_tiles: false,
+            gfx_wall_numa_render_pin: true,
+            gfx_wall_numa_tile_nodes: String::new(),
+            gfx_wall_numa_fake_split: 0,
             gfx_wall_direct_render: false,
             gfx_wall_pacing_thread: false,
             gfx_wall_pacing_clock: String::new(),
@@ -2252,6 +2303,7 @@ impl Preferences {
             media_direct_file_enabled: false,
             media_avdec_max_threads: -1,
             media_numa_pin_streaming_threads: true,
+            media_numa_pin_policy: String::new(),
             media_rtsp_latency_ms: -1,
             media_rtsp_wait_for_keyframe: false,
             media_audio_enabled: true,
