@@ -1191,6 +1191,8 @@ pub(crate) struct HTMLMediaElement {
     load_started_at: Cell<Option<Instant>>,
     /// 메타데이터가 도착한 시각. caps 가 온 시점과 ★그릴 수 있게 된 시점★ 의 간격을 본다.
     metadata_at: Cell<Option<Instant>>,
+    /// `MEDIAREADY` 를 요소당 한 번만 찍기 위한 깃발.
+    notified_ready: Cell<bool>,
     /// ★디코딩된 첫 프레임이 도착한 시각.★ `None` 이면 아직 그릴 그림이 없다.
     ///
     /// 이 플래그가 필요한 이유는 `video_renderer.current_frame` 이 ***지금*** 프레임이
@@ -1328,6 +1330,7 @@ impl HTMLMediaElement {
             load_started_at: Cell::new(None),
             metadata_at: Cell::new(None),
             first_frame_at: Cell::new(None),
+            notified_ready: Cell::new(false),
             error: Default::default(),
             paused: Cell::new(true),
             default_playback_rate: Cell::new(1.0),
@@ -1717,6 +1720,7 @@ impl HTMLMediaElement {
         {
             // The user agent must queue a media element task given the media element to fire an
             // event named canplay at the element.
+            self.note_ready_notified(ready_state);
             self.queue_media_element_task_to_fire_event(atom!("canplay"));
 
             // If the element's paused attribute is false, the user agent must notify about playing
@@ -1851,6 +1855,7 @@ impl HTMLMediaElement {
         self.load_started_at.set(Some(Instant::now()));
         self.metadata_at.set(None);
         self.first_frame_at.set(None);
+        self.notified_ready.set(false);
 
         // Step 8. Queue a media element task given the media element to fire an event named
         // loadstart at the media element.
@@ -3427,15 +3432,29 @@ impl HTMLMediaElement {
         // Step 6. Set the readyState attribute to HAVE_METADATA.
         self.change_ready_state(ReadyState::HaveMetadata);
 
-        // ★preroll 프레임을 받는다.★ 근거는 `ready_state_follows_frames` 의 doc 결함 3 --
-        // 프레임이 메타데이터보다 먼저 오면 `playback_video_frame_updated` 가
-        // `HaveNothing` 에서 일찍 돌아가 그 사실이 유실되고, 그 뒤로 그 프레임을 다시 보는
-        // 자리가 없었다. 여기서 한 번 본다.
+        // ★이미 온 프레임이 있으면 그 치수로 덮고 그려지게 한다.★
+        //
+        // 2026-11-18, log_media_ready/01: `MEDIAFIRSTFRAME` 216 건이 ***전부***
+        // `preroll=true ready=HaveNothing meta=0x0` 이었다 -- 디코딩된 프레임이 항상
+        // 메타데이터보다 먼저 온다. 그런데 `playback_video_frame_updated` 의 조기 반환이
+        // 치수 설정과 ***dirty 표시를 함께*** 건너뛰므로, 그 첫 프레임은 화면에 그려지지도
+        // 않고 다음 프레임 갱신까지 기다렸다.
+        //
+        // 여기서 프레임 치수를 쓰는 이유는 ★프레임이 근거★ 이기 때문이다 -- caps 는 틀릴 수
+        // 있고(`MEDIAFIRSTFRAME` 의 `meta` 와 `frame` 이 다르면 그 경우다) 위 5 단계는 caps
+        // 값을 넣었다.
         if ready_state_follows_frames()
             && self.first_frame_at.get().is_some()
-            && self.ready_state.get() == ReadyState::HaveMetadata
+            && let Some(video_element) = self.downcast::<HTMLVideoElement>()
+            && let Some(frame) = self.video_renderer.lock().unwrap().current_frame
         {
-            self.change_ready_state(ReadyState::HaveCurrentData);
+            if video_element
+                .set_natural_dimensions(Some(frame.width as u32), Some(frame.height as u32))
+            {
+                self.queue_media_element_task_to_fire_event(atom!("resize"));
+            } else {
+                self.upcast::<Node>().dirty(NodeDamage::Style);
+            }
         }
 
         // Step 7. Let jumped be false.
@@ -3514,12 +3533,46 @@ impl HTMLMediaElement {
         }
     }
 
-    /// 파이프라인 상태 변화로 `HaveEnoughData` 까지 올려도 되는가.
+    /// DOM `videoWidth`/`videoHeight` 가 ★값을 내도 되는가.★
     ///
-    /// 레버가 꺼져 있으면 ★종전 동작 그대로★ 참이다. 켜져 있으면 디코딩된 프레임이 한 장이라도
-    /// 와 있어야 한다 -- 근거는 [`ready_state_follows_frames`] 의 doc 결함 1.
-    fn may_advance_on_playback_state(&self) -> bool {
+    /// 레버가 꺼져 있으면 ***종전 동작 그대로*** 참이다. 켜져 있으면 디코딩된 프레임이 한
+    /// 장이라도 와 있어야 한다 -- 근거는 [`HTMLVideoElement::VideoWidth`] 의 doc.
+    pub(crate) fn frames_may_be_reported(&self) -> bool {
         !ready_state_follows_frames() || self.first_frame_at.get().is_some()
+    }
+
+    /// 준비 통보(`canplay`/`playing` 이 나가는 전이)가 ★첫 프레임보다 몇 ms 이른가.★
+    ///
+    /// ## 왜 이 줄이 필요한가 (2026-11-18)
+    ///
+    /// `MEDIAFIRSTFRAME` 만으로는 ★간격을 볼 수 없었다.★ 216 건이 전부
+    /// `ready=HaveNothing preroll=true` 였으니 "프레임이 메타데이터보다 먼저 온다" 는 알았지만,
+    /// 페이지가 ***언제*** 준비됐다고 통보받는지는 그 줄에 없다. 빈 화면의 길이는
+    /// ***그 간격*** 이므로 그것을 재야 한다.
+    ///
+    /// `ahead` 가 양수면 ★프레임보다 먼저 통보했다★ 는 뜻이고 그만큼이 빈 화면이다.
+    /// 음수면(= `frame_first=true`) 프레임이 먼저 와 있었으니 그 통보는 정직하다.
+    ///
+    /// 비용: 요소당 한 번(첫 `>= HaveFutureData` 전이에서만).
+    fn note_ready_notified(&self, ready_state: ReadyState) {
+        if self.notified_ready.get() {
+            return;
+        }
+        self.notified_ready.set(true);
+        let now = Instant::now();
+        let since_load = self
+            .load_started_at
+            .get()
+            .map(|at| now.duration_since(at).as_millis());
+        let (ahead, frame_first) = match self.first_frame_at.get() {
+            Some(at) => (now.duration_since(at).as_millis(), true),
+            None => (0, false),
+        };
+        warn!(
+            "MEDIAREADY ready={ready_state:?} frame_first={frame_first}              since_frame={ahead}ms since_load={}ms lever={}",
+            since_load.map_or("n/a".to_owned(), |ms| ms.to_string()),
+            ready_state_follows_frames(),
+        );
     }
 
     /// 첫 프레임이 ★그릴 수 있게 된 시각★ 을 요소당 한 번 찍는다.
@@ -3598,15 +3651,6 @@ impl HTMLMediaElement {
         // element HAVE_METADATA ready state so subsequent steps will be cancelled.
         if self.ready_state.get() == ReadyState::HaveNothing {
             return;
-        }
-
-        // ★준비 판정을 프레임에서 몰아준다.★ 근거는 `ready_state_follows_frames` 의 doc.
-        // `HaveMetadata` 인 짧은 창에서만 불리므로 `pref!` 가 프레임마다 돌지 않는다.
-        if self.ready_state.get() == ReadyState::HaveMetadata
-            && self.first_frame_at.get().is_some()
-            && ready_state_follows_frames()
-        {
-            self.change_ready_state(ReadyState::HaveCurrentData);
         }
 
         if let Some(frame) = current_frame {
@@ -3734,17 +3778,13 @@ impl HTMLMediaElement {
         match *state {
             PlaybackState::Paused => {
                 media_session_playback_state = MediaSessionPlaybackState::Paused;
-                if self.ready_state.get() == ReadyState::HaveMetadata
-                    && self.may_advance_on_playback_state()
-                {
+                if self.ready_state.get() == ReadyState::HaveMetadata {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },
             PlaybackState::Playing => {
                 media_session_playback_state = MediaSessionPlaybackState::Playing;
-                if self.ready_state.get() == ReadyState::HaveMetadata
-                    && self.may_advance_on_playback_state()
-                {
+                if self.ready_state.get() == ReadyState::HaveMetadata {
                     self.change_ready_state(ReadyState::HaveEnoughData);
                 }
             },

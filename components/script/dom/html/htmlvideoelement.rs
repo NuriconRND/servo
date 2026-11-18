@@ -332,16 +332,46 @@ impl HTMLVideoElementMethods<crate::DomTypeHolder> for HTMLVideoElement {
     make_dimension_uint_setter!(SetHeight, "height");
 
     /// <https://html.spec.whatwg.org/multipage/#dom-video-videowidth>
+    ///
+    /// ## `dom_media_ready_state_follows_frames` 가 켜지면 프레임을 기다린다 (2026-11-18)
+    ///
+    /// IPWall 출력 페이지는 ★이 값으로 "그릴 프레임이 있는가" 를 판정한다★
+    /// (`widgets/output-render/sync/readySignal.ts` 의 `hasFrame`). 그 주석이 이유를 적어
+    /// 뒀다 -- "이 엔진의 미디어 이벤트는 믿을 수 없어서 값으로 판정한다. `playing` 이
+    /// 프레임 한 장 없이 온다(실측: `readyState=4`·`videoWidth=0` 인 채 `playing`)" 그리고
+    /// "`videoWidth` 는 ***디코딩된 프레임이 있어야 채워지므로*** 거짓이 없다".
+    ///
+    /// ★그 계약이 이 엔진에서는 참이 아니었다.★ 값은 `playback_metadata_updated` 가 caps
+    /// 메타데이터로 채우므로(`media/backends/gstreamer/player.rs` 의
+    /// `first_video_stream.width()`) 프레임과 무관하게 올라갈 수 있다. 그래서 페이지가
+    /// 준비됐다고 보고 전환 애니메이션을 ***빈 화면인 채로*** 돌린다.
+    ///
+    /// 레버가 켜지면 디코딩된 프레임이 올 때까지 0 을 낸다 -- 페이지의 가정을 참으로 만든다.
+    ///
+    /// ★readyState 를 건드리지 않는다.★ 그것이 중요하다: `is_blocked_media_element()` 가
+    /// `ready_state <= HaveCurrentData` 이고 `is_potentially_playing()` 이 그것을 보며, 거짓
+    /// 이면 `player.play()` 가 아예 불리지 않아 ***파이프라인이 시작조차 못 한다.*** 앞서
+    /// readyState 를 붙들어 본 결과가 그것이었다(log_media_ready/01 의 02: "비디오가 전혀
+    /// 재생되지 않는다. CPU 점유율도 올라가지 않는다"). 레이아웃도 안전하다 -- 그쪽은
+    /// `get_video_width()` 를 쓰고 이 DOM 게터는 엔진 내부에서 쓰이지 않는다.
     fn VideoWidth(&self) -> u32 {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
+            return 0;
+        }
+        if !self.htmlmediaelement.frames_may_be_reported() {
             return 0;
         }
         self.video_width.get().unwrap_or(0)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-video-videoheight>
+    ///
+    /// 레버 동작은 [`HTMLVideoElement::VideoWidth`] 와 같다 -- 근거는 그쪽 doc.
     fn VideoHeight(&self) -> u32 {
         if self.htmlmediaelement.get_ready_state() == ReadyState::HaveNothing {
+            return 0;
+        }
+        if !self.htmlmediaelement.frames_may_be_reported() {
             return 0;
         }
         self.video_height.get().unwrap_or(0)
