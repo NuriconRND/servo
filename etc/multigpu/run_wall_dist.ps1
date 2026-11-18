@@ -881,6 +881,26 @@ param(
     # this switch. Wall tile windows ignore WM_CLOSE, so stop such a run with
     # `Stop-Process -Name winit_wall -Force`.
     [switch] $NoLog,
+    # (2026-11-18) Run the external CPU probe, engine\wall_cpu_probe.exe, beside the engine.
+    # It is a separate, hidden process that reads everything from outside; the engine does no
+    # I/O for it. Every -CpuProbeIntervalMs it logs per-LP busy for EVERY processor group (all
+    # 80 LPs on the wall), per physical core and NUMA node, every process on the machine
+    # (protected ones too) plus DPC/ISR, and winit_wall per thread family (cycles, kernel share,
+    # context switches, thread churn). Files next to the run log, same stem:
+    #   <stem>.cpu.log  <stem>.cpu.threads.tsv  <stem>.cpu.summary.txt
+    # (stem = -LogPath without .err.log; with -NoLog a timestamped stem in this folder). The
+    # summary covers the run after an 8 s warmup, in the old thread_cpu_probe table format, so
+    # it reads next to the 2026-08/09 .threads.txt files. It ends by itself when winit_wall
+    # exits. Why: this build has had no CPU readout since the 2026-10-27/28 instrumentation
+    # strip, and on 2026-11-18 the operator saw all 80 LPs near 100% with only -NumaNode auto.
+    [switch] $CpuProbe,
+    # (2026-11-18) -CpuProbe sample period. Dev box cost (16 LPs, ~4,400 threads machine-wide):
+    # 2.3-3.4 ms and <= 0.006 cores per sample, -CpuProbePdh included.
+    [ValidateRange(100, 60000)]
+    [int]    $CpuProbeIntervalMs = 1000,
+    # (2026-11-18) -CpuProbe also logs PDH % Processor Utility / Time / Performance per LP
+    # (CPUUTIL lines), to tell which one Task Manager / Resource Monitor is showing.
+    [switch] $CpuProbePdh,
     # **Stale note (recorded 2026-08-25, void after `4ff3075ca97` on 2026-08-31)** -- that env
     # var does not exist. Setting it blocks startup; this switch sends
     # `--pref gfx_video_immediate_composite_enabled=false` instead.
@@ -1375,6 +1395,13 @@ if ($CommitAlign -ne -1 -and ($CommitAlign -lt 0 -or $CommitAlign -gt 99)) {
     Write-Warning "-CommitAlign $CommitAlign is outside 0..99, so the engine treats commit alignment as OFF. Pass a value in 0..99 to enable it, or -1 to say off deliberately."
 }
 
+# (2026-11-18) -CpuProbe options only configure the probe; alone they would look set and do nothing.
+# A pure parameter check, so it sits up here with the others: below, -Serve starts the http
+# server, and a throw after that would leave python holding the port for the next -Serve run.
+if (($CpuProbePdh -or $PSBoundParameters.ContainsKey('CpuProbeIntervalMs')) -and -not $CpuProbe) {
+    throw "-CpuProbePdh / -CpuProbeIntervalMs only configure -CpuProbe. Pass -CpuProbe too."
+}
+
 $serveRoot = Join-Path $here "pages\html"
 $httpServer = $null
 if ($Serve) {
@@ -1436,6 +1463,21 @@ if ($LogPath -ne "NUL") {
     $logDir = Split-Path -Parent $LogPath
     if ($logDir -and -not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+}
+
+# (2026-11-18) Where -CpuProbe writes: the run log's own stem, made absolute above, so the
+# .cpu.* files sit next to the .err.log they belong to. -NoLog has no log to sit next to, so
+# it gets a timestamped stem here; the probe is outside the engine, so -NoLog's promise (no
+# engine stderr I/O) still holds.
+$cpuStem = ""
+if ($CpuProbe) {
+    if ($NoLog) {
+        $cpuStem = Join-Path $here ("wall_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    } elseif ($LogPath -match '\.err\.log$') {
+        $cpuStem = $LogPath -replace '\.err\.log$', ''
+    } else {
+        $cpuStem = Join-Path (Split-Path -Parent $LogPath) ([IO.Path]::GetFileNameWithoutExtension($LogPath))
     }
 }
 
@@ -1611,6 +1653,11 @@ if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS err
 Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$(if($NoLog){'off (-NoLog)'}else{$LogPath})"
+# (2026-11-18) So console.txt alone says whether a set of .cpu.* files belongs to this run.
+# "requested", not "on": the probe starts only once the engine runs, and whether it did is the
+# "cpu_probe   :" line printed then (or a warning).
+$cpuProbeBanner = if (-not $CpuProbe) { "off" } else { "requested (every $CpuProbeIntervalMs ms, pdh=$($CpuProbePdh.IsPresent), warmup 8 s) -> $cpuStem.cpu.log / .cpu.threads.tsv / .cpu.summary.txt" }
+Write-Host "  cpu_probe=$cpuProbeBanner"
 
 # ***The two flags that decide whether a video grid is CPU-bound.*** Both default OFF, both
 # have measured cores/video attached to them above, and together they are the difference
@@ -1701,6 +1748,77 @@ for ($i = 0; $i -lt 100 -and $null -eq $proc; $i++) {
 }
 if ($null -eq $proc) { throw "winit_wall did not start within 10s under the cmd wrapper ($cmdFile)" }
 
+# (2026-11-18) -CpuProbe starts the moment the engine PID is known and before -Confine, so its
+# baseline predates any pinning. Hidden, its own process, its own files, no /NODE and no pipe.
+# It ends by itself when winit_wall exits (its wait between samples is a wait on the engine's
+# process handle) -- the force-kill below and a Ctrl+C on an unlimited run included; after a
+# Ctrl+C this script prints nothing more, but the probe still writes its summary.
+$cpuProbeProc = $null
+# (2026-11-18) What became of the probe, for the end-of-run text: "missing" (no exe), "nostart"
+# (Start-Process threw), "early" (exited within 1.5 s: a startup refusal), "running".
+$cpuProbeState = ""
+$cpuProbeStart = $null
+$cpuSummary = "$cpuStem.cpu.summary.txt"
+$cpuLog = "$cpuStem.cpu.log"
+# (2026-11-18) Why the probe stopped, from its own log: its CPUERROR line(s), or the fact that it
+# never got as far as creating the log (it exits before that when it cannot create its files).
+function Write-CpuProbeError([string] $LogFile) {
+    if (!(Test-Path -LiteralPath $LogFile)) {
+        Write-Warning "  wall_cpu_probe wrote no $LogFile at all: it could not create its files (folder missing or not writable?)."
+        return
+    }
+    $cpuErr = @(Select-String -LiteralPath $LogFile -Pattern '^CPUERROR ' | ForEach-Object { $_.Line })
+    if ($cpuErr.Count -gt 0) {
+        $cpuErr | ForEach-Object { Write-Warning "  $_" }
+    } else {
+        Write-Warning "  $LogFile has no CPUERROR line (killed from outside, or it crashed)."
+    }
+}
+if ($CpuProbe) {
+    $cpuProbeExe = Join-Path $engine "wall_cpu_probe.exe"
+    if (!(Test-Path $cpuProbeExe)) {
+        $cpuProbeState = "missing"
+        Write-Warning "-CpuProbe: $cpuProbeExe not found (a dist packaged before the probe existed, or its build failed in make_wall_dist.ps1). Running WITHOUT the CPU probe."
+    } else {
+        $buildCommit = "?"
+        if (Test-Path $buildStamp) {
+            $commitMatch = Select-String -Path $buildStamp -Pattern 'commit\s*:\s*(\S+)' | Select-Object -First 1
+            if ($commitMatch) { $buildCommit = $commitMatch.Matches[0].Groups[1].Value }
+        }
+        # The banner essentials, so the summary alone says what was measured.
+        $cpuNote = "build=$buildCommit layout=$Layout tiles=$tiles url=$Url dcomp=$DComp parallel_tiles=$($ParallelTiles.IsPresent) " +
+            "pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) " +
+            "decoder_threads=$DecoderThreads numa_node=$NumaNode numa_pin=$(if($NoNumaPin){'off'}else{'on'}) " +
+            "numa_render_pin=$(if($NoNumaRenderPin){'off'}else{'on'}) confine=$($Confine.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
+        # ONE quoted argument string, not an array: Start-Process on PowerShell 5.1 joins an
+        # array with spaces WITHOUT quoting, so a path or note containing a space would split.
+        # The note loses double quotes and trailing backslashes (either would end the quoting).
+        $cpuNote = ($cpuNote -replace '"', "'") -replace '\\+$', ''
+        $cpuArgs = "--pid $($proc.Id) --out `"$cpuStem`" --interval-ms $CpuProbeIntervalMs --warmup-sec 8"
+        if ($CpuProbePdh) { $cpuArgs += " --pdh" }
+        $cpuArgs += " --note `"$cpuNote`""
+        # (2026-11-18) An earlier run's summary under the same stem would be printed as this
+        # run's if this probe died before writing one. The probe deletes it too, first thing,
+        # but only if it gets to run at all.
+        if (Test-Path -LiteralPath $cpuSummary) {
+            try {
+                Remove-Item -LiteralPath $cpuSummary -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "-CpuProbe: cannot delete the previous $cpuSummary ($($_.Exception.Message)); it will not be shown as this run's."
+            }
+        }
+        try {
+            $cpuProbeStart = Get-Date
+            $cpuProbeProc = Start-Process -FilePath $cpuProbeExe -ArgumentList $cpuArgs -WindowStyle Hidden -PassThru
+            # PS 5.1: without touching .Handle now, ExitCode can read empty once it has exited.
+            $null = $cpuProbeProc.Handle
+        } catch {
+            $cpuProbeState = "nostart"
+            Write-Warning "-CpuProbe could not start ${cpuProbeExe}: $($_.Exception.Message). Running WITHOUT the CPU probe."
+        }
+    }
+}
+
 # Hard confinement, applied after launch and then read back. ***Never report a run as pinned
 # without asking the OS whether it actually is.*** The measurement tool spent three rounds on a
 # `start /AFFINITY` that was refused in silence, producing unpinned numbers that looked like
@@ -1725,8 +1843,32 @@ if ($Confine) {
     }
 }
 
+# (2026-11-18) The probe's startup refusals (layout self-check, identical per-group LP times,
+# CreateTime mismatch, cannot open the engine, cannot create its files) all exit within ~0.1 s.
+# Say so NOW, not after a long run that turns out to carry no CPU data. (Review) This check sits
+# AFTER -Confine and its wait is taken out of the -DurationSec sleep below, so a -CpuProbe run
+# confines and lasts exactly like the same command without it. And if the ENGINE is what died,
+# say that -- the probe ends with its target, which is not the probe's failure.
+$cpuProbeWaitSec = 0.0
+if ($cpuProbeProc) {
+    $cpuWaitStart = Get-Date
+    $cpuProbeExited = $cpuProbeProc.WaitForExit(1500)
+    $cpuProbeWaitSec = ((Get-Date) - $cpuWaitStart).TotalSeconds
+    if ($cpuProbeExited -and $proc.HasExited) {
+        $cpuProbeState = "engine-exited"
+        Write-Warning "winit_wall exited within $([int]($cpuProbeWaitSec * 1000)) ms of the CPU probe starting, and the probe ended with it (exit code $($cpuProbeProc.ExitCode)). Look at the engine log, not the probe."
+    } elseif ($cpuProbeExited) {
+        $cpuProbeState = "early"
+        Write-Warning "-CpuProbe: wall_cpu_probe exited at startup (exit code $($cpuProbeProc.ExitCode)). This run has NO CPU data:"
+        Write-CpuProbeError $cpuLog
+    } else {
+        $cpuProbeState = "running"
+        Write-Host "  cpu_probe   : running, pid $($cpuProbeProc.Id) watching winit_wall pid $($proc.Id) -> $cpuStem.cpu.*"
+    }
+}
+
 if ($DurationSec -gt 0) {
-    Start-Sleep -Seconds $DurationSec
+    Start-Sleep -Milliseconds ([int][Math]::Max(0, $DurationSec * 1000 - $cpuProbeWaitSec * 1000))
     # Wall tile windows ignore WM_CLOSE. env_logger writes stderr unbuffered, so a
     # force-kill does not lose log output.
     if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force }
@@ -1734,6 +1876,37 @@ if ($DurationSec -gt 0) {
 } else {
     Write-Host "Running. To stop: Ctrl+C then  Stop-Process -Name winit_wall -Force"
     Wait-Process -Id $proc.Id
+}
+
+# (2026-11-18) The probe has already seen the engine exit. Give it up to 5 s to write its
+# summary, then say where it is and print the machine and target lines. The 5 s start once the
+# engine is really gone: after the -DurationSec force-kill its teardown can outlast the 2 s
+# sleep above, and the probe only finishes after that. Only a summary written by THIS probe
+# (newer than its start) is shown, and the warning says what actually happened.
+if ($cpuProbeProc) {
+    try { $null = $proc.WaitForExit(15000) } catch { }
+    $cpuKilled = $false
+    if (-not $cpuProbeProc.WaitForExit(5000)) {
+        $cpuKilled = $true
+        Write-Warning "wall_cpu_probe (pid $($cpuProbeProc.Id)) was still running 5 s after the engine exited; stopping it."
+        Stop-Process -Id $cpuProbeProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    $cpuSummaryFresh = (Test-Path -LiteralPath $cpuSummary) -and
+        ((Get-Item -LiteralPath $cpuSummary).LastWriteTime -ge $cpuProbeStart)
+    if ($cpuSummaryFresh) {
+        Write-Host "--- CPU probe summary: $cpuSummary"
+        Select-String -LiteralPath $cpuSummary -Pattern 'TOTAL \(sum of threads\)|process total|ALL PROCESSES, ALL GROUPS|per-LP busy, all groups|NO STEADY-STATE SAMPLES' |
+            ForEach-Object { Write-Host $_.Line }
+    } elseif ($cpuProbeState -eq "early") {
+        Write-Warning "-CpuProbe: no CPU summary for this run; the probe exited at startup (see the warning when it started)."
+    } elseif ($cpuProbeState -eq "engine-exited") {
+        Write-Warning "-CpuProbe: no CPU summary worth reading; winit_wall exited right after launch (see the warning above)."
+    } elseif ($cpuKilled) {
+        Write-Warning "-CpuProbe: no CPU summary for this run; the probe had not finished 5 s after the engine exited and was stopped before writing one. Its per-interval lines up to then are in $cpuLog."
+    } else {
+        Write-Warning "-CpuProbe: wall_cpu_probe exited (exit code $($cpuProbeProc.ExitCode)) without writing $cpuSummary."
+        Write-CpuProbeError $cpuLog
+    }
 }
 
 # The engine is done, so the server has nothing left to answer. Kill it rather than leaving a
