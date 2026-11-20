@@ -843,7 +843,10 @@ impl D3d11PlaneRings {
     /// 비용: 비우는 경로에서만 원자 둘. 정상 경로는 건드리지 않는다.
     fn note_blank(ring_id: u64) {
         static CALLS: AtomicU64 = AtomicU64::new(0);
-        static RINGS: Mutex<Option<(Instant, std::collections::HashSet<u64>)>> = Mutex::new(None);
+        // ★링마다 세어야 판정이 된다.★ 평균(calls/rings)은 한 링이 길게 비는 경우를 지운다 --
+        // 2026-11-20 에 평균만 보고 "33ms 니 범인이 아니다" 로 기울었는데, 그 판단을 하려면
+        // ***분포*** 가 필요하다. 최악 링이 60 회(= 1 초)에 가까우면 내내 비어 있었다는 뜻이다.
+        static RINGS: Mutex<Option<(Instant, HashMap<u64, u32>)>> = Mutex::new(None);
 
         CALLS.fetch_add(1, Ordering::Relaxed);
         let Ok(mut guard) = RINGS.lock() else {
@@ -851,16 +854,19 @@ impl D3d11PlaneRings {
         };
         let now = Instant::now();
         let (started, rings) = guard.get_or_insert_with(|| (now, Default::default()));
-        rings.insert(ring_id);
+        *rings.entry(ring_id).or_insert(0) += 1;
         let elapsed = now.duration_since(*started);
         if elapsed < Duration::from_secs(1) {
             return;
         }
         let calls = CALLS.swap(0, Ordering::Relaxed);
         let ring_count = rings.len();
+        let worst = rings.values().copied().max().unwrap_or(0);
+        // 많이 빈 링이 몇 개인가 -- 경계를 걸친 영상만 길게 빈다면 이 수가 그 영상 수다.
+        let long = rings.values().filter(|&&c| c >= 10).count();
         *guard = None;
         warn!(
-            "MEDIABLANK calls={calls} rings={ring_count} window_ms={}",
+            "MEDIABLANK calls={calls} rings={ring_count} worst_ring={worst}              rings_over_10={long} window_ms={}",
             elapsed.as_millis(),
         );
     }
