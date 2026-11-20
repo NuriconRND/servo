@@ -706,6 +706,51 @@ fn note_budgets_once() {
     );
 }
 
+/// 영상 프레임 드롭을 1 초 창으로 찍는다. ★드롭이 늘어난 창에서만.★
+///
+/// ## 왜 (2026-11-20, log_media_ready/13)
+///
+/// `-RingSeedNewRings` 가 목표 지표를 결정적으로 고쳤다(`map_to_publish` 32ms -> 0,
+/// `MEDIABLANK` calls 457 -> 31). 그런데 운영자가 "★영상이 끊기는 느낌 났음★" 이라고
+/// 보고했고, ***그것을 측정할 수단이 없었다*** -- `LOCKWAIT` 는 플래그가 필요하고 `drops` 는
+/// `MEDIADENY` 가 찍힐 때만 딸려 나와 비교가 안 된다(누적값, 시점 다름).
+///
+/// 끊김의 직접적인 사건은 ★프로듀서가 빈 슬롯을 못 찾아 직전 Presenting 을 재제시한 것★
+/// 이고 그것이 `dropped_frames` 다. 레버를 켜면 소비자 쪽 3MB 복사가 늘어
+/// (`create_to_map` p50 10 -> 20~24ms, max 52 -> 98ms) 프레임이 길어지므로, 깊이 2 의
+/// 더블 버퍼링에서 프로듀서가 슬롯을 못 찾는 일이 늘 수 있다 -- ★그 가설을 이 줄이 재야
+/// 한다.★
+///
+/// 비용: 이미 1 초마다 도는 자리에서 레지스트리 합산 한 번(링 수만큼의 덧셈).
+fn note_drops_window() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static WINDOW: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+    let Ok(mut window) = WINDOW.lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let started = *window.get_or_insert(now);
+    let elapsed = now.duration_since(started);
+    if elapsed < std::time::Duration::from_secs(1) {
+        return;
+    }
+    *window = Some(now);
+    drop(window);
+
+    let total = D3d11PlaneRings::total_dropped_frames();
+    let last = LAST.swap(total, Ordering::Relaxed);
+    let delta = total.saturating_sub(last);
+    if delta == 0 {
+        return;
+    }
+    warn!(
+        "MEDIADROPS delta={delta} total={total} window_ms={}",
+        elapsed.as_millis(),
+    );
+}
+
 /// 예산 거부를 1 초 창으로 모아 한 줄 낸다. ★거부가 있었던 창에서만 찍는다.★
 ///
 /// ## 왜 (2026-11-20, log_media_ready/03)
@@ -1061,6 +1106,7 @@ impl MediaExternalImages {
             return;
         }
         note_budgets_once();
+        note_drops_window();
         // ★프레임이 실제로 바뀔 때만 돈다.★ 지난 프레임의 거부를 창에 쌓고 1 초마다 한 줄
         // 낸다 -- 근거는 `note_deny_window` 의 doc.
         note_deny_window(
