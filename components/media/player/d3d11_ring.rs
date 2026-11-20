@@ -806,10 +806,63 @@ impl D3d11PlaneRings {
         let reg = lock_recover(registry());
         let ring = reg.rings.get(&ring_id)?;
         if !ring.presenting_has_content {
+            // ★비움을 센다.★ 근거는 `note_blank` 의 doc -- 이것이 운영자가 보는
+            // "tile 경계에서 비디오 등장시 프레임 비어보이는" 현상의 ***직접적인*** 사건이다.
+            drop(reg);
+            Self::note_blank(ring_id);
             return None;
         }
         let idx = ring.presenting_slot?;
         ring.slots[idx].planes.get(plane).copied().flatten()
+    }
+
+    /// 내용 없는 링 때문에 비운 횟수. 비움이 있었던 1 초 창에서만 한 줄.
+    ///
+    /// ## 왜 (2026-11-20, log_media_ready/08)
+    ///
+    /// 운영자: "tile 경계에서 비디오 등장시 프레임 비어보이는 현상 크게 줄지 않음".
+    ///
+    /// 밀리초 로그가 ***프레임 준비 문제가 아니라는 것*** 을 잘라 줬다 -- 전환 시작 기준으로
+    /// 54 개 첫 프레임이 +482~569ms 에 모이고 ★전환 끝이 그 마지막보다 1ms 뒤★ 다. 즉 판이
+    /// bounce 로 들어오기 ***전에*** 프레임이 다 있었다. `MEDIADENY` 도 `rings_max=2` 로
+    /// 거의 없으니 예산 거부도 아니다.
+    ///
+    /// 남는 것은 ★링이 (영상, 디바이스) 쌍★ 이라는 사실이다. `demand` 는 "소비자가 그
+    /// 디바이스에서 이 영상을 합성하려 했다" 는 기록이고, 새로 생긴 링은
+    /// `presenting_has_content = false` 로 시작해 `presenting_plane` 이 `None` 을 돌려
+    /// ***그 영상을 비운다.*** `media_ring_stage_first_frame`(기본 꺼짐)의 doc 이 그 대가를
+    /// 직접 적어 뒀다 -- "프로듀서가 채울 때까지(대개 한두 프레임) 그 영상만 비워 두고".
+    ///
+    /// bounce 로 판이 밀려 들어오는 동안 영상은 자기 최종 타일이 아닌 타일 위를 지나가므로,
+    /// 그 디바이스의 링이 없거나 갓 생겨 내용이 없다 -- 운영자가 말한 "tile 경계" 다.
+    ///
+    /// 읽는 법: 이 값이 bounce 구간에 몰리면 그 가설이 확정된다. 그리고
+    /// `-RingStageFirstFrame` 을 켜면 ★줄어야 한다★ -- 그것이 판정 기준이다. 그 설정의
+    /// 실효값은 `MEDIABUDGET` 이 기동 때 찍는다(이 크레이트는 servo_config 의존이 없다).
+    ///
+    /// 비용: 비우는 경로에서만 원자 둘. 정상 경로는 건드리지 않는다.
+    fn note_blank(ring_id: u64) {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static RINGS: Mutex<Option<(Instant, std::collections::HashSet<u64>)>> = Mutex::new(None);
+
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut guard) = RINGS.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        let (started, rings) = guard.get_or_insert_with(|| (now, Default::default()));
+        rings.insert(ring_id);
+        let elapsed = now.duration_since(*started);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let calls = CALLS.swap(0, Ordering::Relaxed);
+        let ring_count = rings.len();
+        *guard = None;
+        warn!(
+            "MEDIABLANK calls={calls} rings={ring_count} window_ms={}",
+            elapsed.as_millis(),
+        );
     }
 
     /// 링당 plane 개수(생성 시 고정, `create_ring`의 `planes_per_slot` 그대로).
