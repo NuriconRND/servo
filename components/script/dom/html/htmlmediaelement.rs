@@ -3443,8 +3443,15 @@ impl HTMLMediaElement {
         // 여기서 프레임 치수를 쓰는 이유는 ★프레임이 근거★ 이기 때문이다 -- caps 는 틀릴 수
         // 있고(`MEDIAFIRSTFRAME` 의 `meta` 와 `frame` 이 다르면 그 경우다) 위 5 단계는 caps
         // 값을 넣었다.
-        if ready_state_follows_frames()
-            && self.first_frame_at.get().is_some()
+        // ★레버와 무관하게 돈다.★ 2026-11-20 -- 이것은 readyState 를 건드리지 않는 순수
+        // 수정이고, 끄는 것이 이득일 이유가 없다. 데드락 위험은 readyState 를 붙드는 데서
+        // 왔고(log_media_ready/01 의 02: "비디오가 전혀 재생되지 않는다") 여기엔 없다.
+        //
+        // 실측(log_media_ready/07, 2500ms bounce 등장 구성): 페이지가 563ms 기다려 54 개
+        // 전부의 준비를 받고 드러냈고 `MEDIADENY` 는 0 건이었다 -- 즉 프레임은 있었고 예산
+        // 거부도 없었다. 그런데도 영역이 비어 보였다. 남는 설명은 ***디코딩된 프레임을
+        // 아무도 그리지 않는다*** 뿐이고, 그것이 위 조기 반환이 하는 일이다.
+        if self.first_frame_at.get().is_some()
             && let Some(video_element) = self.downcast::<HTMLVideoElement>()
             && let Some(frame) = self.video_renderer.lock().unwrap().current_frame
         {
