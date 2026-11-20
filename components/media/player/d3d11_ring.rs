@@ -225,6 +225,12 @@ struct RingState {
     /// 현재 Presenting 슬롯. 최초 소비(InitialMapAll) 전에는 None.
     presenting_slot: Option<usize>,
     /// 이번 합성에서 lock된 plane 개수(0→1 전이에서만 계획 발급).
+    /// 링이 만들어진 시각. [`MEDIARINGFILL`](Self::note_ring_fill) 의 분모다.
+    created_at: Instant,
+    /// 첫 `InitialMapAll` 커밋 시각(소비자 쪽이 끝난 시점).
+    mapped_at: Option<Instant>,
+    /// `MEDIARINGFILL` 을 링당 한 번만 찍기 위한 깃발.
+    fill_logged: bool,
     /// 실제로 쓰는 슬롯 수(`1..=SLOT_COUNT`). 초과 슬롯은 ★`Unmapped` 로 남아 claim 되지
     /// 않는다★ -- 그래서 Map 하지 않아도 쓰인 적 없는 텍스처가 제시될 일이 없다.
     ///
@@ -396,6 +402,9 @@ impl D3d11PlaneRings {
             reg_len + 1,
         );
         let ring = RingState {
+            created_at: Instant::now(),
+            mapped_at: None,
+            fill_logged: false,
             active_slots,
             planes_per_slot,
             slots: ring_slots,
@@ -625,6 +634,23 @@ impl D3d11PlaneRings {
         ring.presenting_slot = Some(filled_slot);
         // Filled 슬롯은 프로듀서가 쓴 것이므로 여기서부터는 볼 것이 있다.
         ring.presenting_has_content = true;
+        if !ring.fill_logged {
+            ring.fill_logged = true;
+            let now = Instant::now();
+            let to_map = ring
+                .mapped_at
+                .map(|m| m.duration_since(ring.created_at).as_millis());
+            let map_to_pub = ring.mapped_at.map(|m| now.duration_since(m).as_millis());
+            let total = now.duration_since(ring.created_at).as_millis();
+            // ★링당 한 번.★ 근거는 이 커밋 메시지 -- 50~85ms 가 소비자(InitialMapAll)
+            // 쪽인지 프로듀서(업로드) 쪽인지에 따라 고칠 자리가 다르고, 지금 데이터로는
+            // 가릴 수 없었다.
+            warn!(
+                "MEDIARINGFILL ring={ring_id} create_to_map={}ms map_to_publish={}ms                  total={total}ms",
+                to_map.map_or("n/a".to_owned(), |v| v.to_string()),
+                map_to_pub.map_or("n/a".to_owned(), |v| v.to_string()),
+            );
+        }
 
         Some(ConsumePlan::Advance {
             unmap,
@@ -717,6 +743,9 @@ impl D3d11PlaneRings {
                 } in mapped
                 {
                     apply_mapped(ring, texture, data_ptr, row_pitch);
+                }
+                if ring.mapped_at.is_none() {
+                    ring.mapped_at = Some(Instant::now());
                 }
                 let active = ring.active_slots;
                 for i in 0..SLOT_COUNT {
