@@ -1899,6 +1899,40 @@ pub struct Preferences {
     /// 그 영상만 비워 두고, 벽은 계속 60fps 로 표출한다. 이 경로에는 같은 선례가 있다
     /// (링이 아직 없으면 그 프레임을 비운다). 프로듀서가 소비 전까지 **매 프레임** 3MB 를
     /// 복사해 두던 일도 함께 사라진다.
+    /// ★갓 만든 링★ 에 그 프레임을 바로 스테이징할지. 기본 ★꺼짐★.
+    ///
+    /// ## 왜 (2026-11-20, log_media_ready/12)
+    ///
+    /// 운영자: 영상이 타일 바깥에서 들어올 때 "프레임이 채워지지 않은 영역이 얼마간
+    /// 애니메이션이 진행된 후 ★갑자기 나타나는 것처럼★ 보인다".
+    ///
+    /// `MEDIARINGFILL` 이 그 공백을 쪼갰다 -- 링 생성에서 내용까지 p50 46~52ms(max 79~98ms)
+    /// 이고 그중 ★`map_to_publish` 32~42ms★ 가 ***프로듀서의 다음 디코드 프레임을 기다리는
+    /// 시간*** 이다(30fps 의 한 간격). 프로듀서 루프는 프레임이 올 때만 돌기 때문이다.
+    ///
+    /// 그 간격을 줄이려고 존재하는 스테이징 분기가 ★늦게 생긴 링에는 걸리지 않았다★ --
+    /// 조건이 `PlayerState::ring_never_consumed`(그룹 단위)인데 그것이 ***디바이스 루프
+    /// 안에서*** 쓰인다. 디바이스 A 가 한 번 발행하면 꺼지므로 이후 디바이스 B 의 새 링은
+    /// 스테이징을 못 받는다. `media_ring_stage_first_frame` 를 켜도 절반만 들었던 이유가
+    /// 이것이다(실측: `MEDIABLANK` calls 421 -> 235, rings 69 -> 31).
+    ///
+    /// 켜면 ***갓 만든 링*** 에는 그룹 상태와 무관하게 스테이징한다. 소비자의
+    /// `InitialMapAll { staged: Some(..) }` 가 기존 경로 그대로 슬롯 0 을 채우므로
+    /// `presenting_has_content` 가 매핑 시점에 켜지고, 위 32~42ms 가 사라진다.
+    ///
+    /// ★링을 만드는 주체는 프로듀서다★(`ensure_device_ring`, 프레임 콜백 안). 소비자의
+    /// `note_demand_and_ring` 은 수요만 기록하고 조회만 한다. 그래서 프레임 바이트를 따로
+    /// 보유할 필요가 없다 -- 링을 만든 그 프레임에서 바로 스테이징한다.
+    ///
+    /// ★대가★: 새 링마다 `planes_to_vecs` 한 번(FHD I420 약 3MB CPU 복사)과 슬롯 0 복사
+    /// 한 번. `media_ring_stage_first_frame` 의 doc 이 잰 값이 최초 소비 6.5~10.9ms ->
+    /// 12.6~23.9ms 다 -- 단 ★링당 한 번★ 이고 `media_ring_init_max_per_frame` 예산이
+    /// 속도를 조절한다. 매 프레임이 아니다.
+    ///
+    /// 판정: `MEDIARINGFILL` 의 `map_to_publish` 가 0 에 가까워지고 `MEDIABLANK` 의
+    /// `calls`/`worst_ring` 이 줄어야 한다. 그리고 `WALLEVENT render.over` 가 돌아오지
+    /// 않아야 한다.
+    pub media_ring_seed_new_rings: bool,
     pub media_ring_stage_first_frame: bool,
     /// 문서에서 빠진 `<video>`/`<audio>` 요소의 미디어 파이프라인을 놓는다.
     ///
@@ -2420,6 +2454,7 @@ impl Preferences {
             media_ring_init_max_per_frame: 8,
             media_wrap_init_max_per_frame: 4,
             media_player_disposal_threads: 4,
+            media_ring_seed_new_rings: false,
             media_ring_stage_first_frame: false,
             media_release_detached_player: true,
             dom_webgl_idle_context_reclaim_ms: 3000,

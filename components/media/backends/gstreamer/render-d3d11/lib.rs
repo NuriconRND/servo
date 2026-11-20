@@ -159,10 +159,14 @@ mod render_d3d11 {
             gst_format: gstreamer_video::VideoFormat,
             width: i32,
             height: i32,
+            // ★이 호출이 링을 새로 만들었는지 알린다.★ 호출자가 그 프레임에서 바로
+            // 스테이징할지 정하는 데 쓴다 -- 근거는 `media_ring_seed_new_rings` 의 doc.
+            created: &mut bool,
         ) -> Option<u64> {
             if let Some(ring_id) = D3d11PlaneRings::ring_for(group_id, device) {
                 return Some(ring_id);
             }
+            *created = true;
             // ★링 깊이는 pref 가 정한다★ -- 0 이면 전 슬롯(종전). 근거는
             // `media_ring_initial_map_slots` 의 doc: 최초 소비 Map 12 회(중앙값 8.8ms)가
             // 렌더 프레임 안이라서 프레임당 받아들이는 링 수가 1 로 묶였고, 그 대가가
@@ -338,9 +342,16 @@ mod render_d3d11 {
             // 보이므로 **총 업로드 횟수는 단일 GPU 때와 같다**(타일 경계에 걸친
             // 영상만 두 번 올라간다).
             for device in target_devices {
-                let Some(ring_id) =
-                    self.ensure_device_ring(group_id, device, format, info.format(), width, height)
-                else {
+                let mut ring_created = false;
+                let Some(ring_id) = self.ensure_device_ring(
+                    group_id,
+                    device,
+                    format,
+                    info.format(),
+                    width,
+                    height,
+                    &mut ring_created,
+                ) else {
                     // 텍스처 생성 실패(디바이스 상실 등) — 이 디바이스만 건너뛴다.
                     // 다른 타일은 계속 정상 재생돼야 한다.
                     continue;
@@ -354,7 +365,15 @@ mod render_d3d11 {
                         // 첫 성공 claim = 어느 링이든 소비되기 시작했다는 신호.
                         state.ring_never_consumed = false;
                     },
-                    None if state.ring_never_consumed => {
+                    // ★갓 만든 링에도 스테이징한다(레버).★ 2026-11-20 -- 종전 조건인
+                    // `state.ring_never_consumed` 는 `PlayerState`(그룹 단위) 필드인데
+                    // ***디바이스 루프 안에서*** 쓰인다. 디바이스 A 가 한 번 발행하면
+                    // 꺼지므로 이후 디바이스 B 의 새 링은 스테이징을 못 받았다 --
+                    // `-RingStageFirstFrame` 이 절반만 든 이유다. 근거와 실측은
+                    // `media_ring_seed_new_rings` 의 doc 에 있다.
+                    None if state.ring_never_consumed
+                        || (ring_created && servo_config::pref!(media_ring_seed_new_rings)) =>
+                    {
                         // 초기 구간(전 슬롯 Unmapped): 첫 프레임을 CPU에 스테이징해 두면
                         // 렌더러의 InitialMapAll이 표시한다. 첫 성공 claim 전까지 매
                         // 프레임 덮어쓴다. 스테이징은 링별이므로 디바이스마다 따로 둔다.
@@ -363,7 +382,9 @@ mod render_d3d11 {
                         // 소비의 절반이 그 복사다(12.6~23.9ms 대 6.5~10.9ms). 프레임
                         // 예산이 16.6ms 이므로 그 한 번이 프레임을 넘긴다. 여기서 매
                         // 프레임 3MB 를 복사해 두는 일도 함께 사라진다.
-                        if servo_config::pref!(media_ring_stage_first_frame) {
+                        if servo_config::pref!(media_ring_stage_first_frame)
+                            || (ring_created && servo_config::pref!(media_ring_seed_new_rings))
+                        {
                             let vecs = ring_producer::planes_to_vecs(&frame, format, swap_uv);
                             // 밀려난 이전 버퍼는 **여기서** 떨어진다 — 자물쇠 밖, 이
                             // 스레드에서. 안에서 떨구면 레지스트리가 그만큼 잠긴다.
