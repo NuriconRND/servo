@@ -810,12 +810,24 @@ param(
     # Read MEDIADENY to judge any of this: one line per second in which anything was denied,
     # with the per-frame deferral counts and the worst number of blacked-out places. Before
     # 2026-11-20 these denials were never logged at all.
+    #
+    # DEFAULTS MOVED 2026-11-20 on hardware evidence (log_media_ready/04 and /05): slots 0 -> 2
+    # and ring 1 -> 8. Mapping two slots instead of four halves the admission cost, and once it
+    # is halved a bigger budget is CHEAPER overall -- render.over fell from 117 events (max
+    # 85ms) to 36 (max 43ms), and the wall went from 71 frame transitions in a second to
+    # 180-275 out of a possible 240. Depth 3 was worse than depth 2 in every column and the
+    # operator saw heavy black flicker on it, because a ring then holds nine textures against a
+    # wrap budget of two. Double buffering cost nothing measurable: MEDIADENY drops came out
+    # the same at depth 2 and depth 3. Pass 0 and 1 to get the old behaviour back.
+    #
+    # What now limits how fast videos appear is -WrapInitMaxPerFrame, not these two: ring
+    # deferrals are zero while wrap deferrals remain. Sweeping that is the next measurement.
     [ValidateRange(0, 64)]
-    [int] $RingInitMaxPerFrame = 1,
+    [int] $RingInitMaxPerFrame = 8,
     [ValidateRange(0, 64)]
     [int] $WrapInitMaxPerFrame = 2,
     [ValidateRange(0, 64)]
-    [int] $RingInitialMapSlots = 0,
+    [int] $RingInitialMapSlots = 2,
     # Stage the first frame so a new video appears one frame earlier, paid for on the render
     # thread: admission goes from 6.5-10.9ms to 12.6-23.9ms, which overruns the 16.6ms frame
     # budget on its own. Off by default; the slot then stays empty for a frame or two while
