@@ -411,7 +411,15 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
             let mut mapped: Vec<RemappedPlane> = Vec::new();
             let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] =
                 [None; MAX_PLANES];
+            // ★앞 N 슬롯만 Map 한다(0 = 전부).★ 근거는 `initial_map_slot_limit` 의 doc --
+            // 최초 소비 12 회 Map(중앙값 8.8ms)이 렌더 프레임 안이라서 예산이 1 로 묶여
+            // 있고, 그 대가가 검은 사각형이다. 슬롯 0 은 스테이징 복사 대상이라 언제나
+            // 포함된다. 빠진 슬롯은 Map 실패와 ***같은 모양*** 으로 커밋된다.
+            let slot_limit = initial_map_slot_limit();
             for (slot_idx, slot) in slots.iter().enumerate() {
+                if slot_limit > 0 && slot_idx >= slot_limit.max(1) {
+                    break;
+                }
                 for (plane_idx, plane) in slot.iter().enumerate() {
                     let Some(desc) = plane else {
                         continue;
@@ -668,6 +676,95 @@ static MEDIA_D3D11_DEVICE_OWNERS: Mutex<Vec<(usize, Option<usize>)>> = Mutex::ne
 /// 넣어서야 잡혔다. 조용한 실패를 시끄러운 실패로 바꾸는 것이 이 함수의 목적이다.
 ///
 /// 단일 GPU 월(모든 타일이 같은 `requested_gpu`)에서는 디바이스 공유가 정상이므로 조용하다.
+/// 예산 거부를 1 초 창으로 모아 한 줄 낸다. ★거부가 있었던 창에서만 찍는다.★
+///
+/// ## 왜 (2026-11-20, log_media_ready/03)
+///
+/// 운영자가 "비디오 자리에 프레임 없이 검은 영역이 깜박이는 현상" 을 봤는데, 그 검정은
+/// ***의도된 것*** 이다 -- 예산에 걸린 링은 `dummy_planes` 를 묶어 검은 사각형을 칠한다
+/// (`wrap_denied_rings` 의 doc 참고. `Invalid` 는 초록이라 쓸 수 없다).
+///
+/// 그런데 `ring_init_deferred` / `wrap_init_deferred` 는 ***증가·리셋만 되고 한 번도
+/// 보고되지 않았다.*** 그래서 54 개 구성의 로그에도 이 현상이 ★한 줄도 나타나지 않았고★,
+/// 삭제된 이미지 키를 먼저 의심하는 우회를 했다(그쪽 경고는 두 로그 모두 0 건이었다).
+///
+/// 읽는 법: `ring.deferred` 가 크면 링 초기화가 밀린 것이고, `wrap.rings_max` 가 한 프레임에
+/// ★검게 칠해진 자리의 최대 수★ 다. 54 개가 한번에 뜨면 예산 1/2 로는 ~54 프레임 동안 이
+/// 값이 0 이 아니어야 한다 -- 그 길이가 운영자가 본 깜박임의 길이다.
+///
+/// 비용: 프레임이 실제로 바뀔 때만(`roll_wrap_budget_frame` 의 조기 반환 뒤) 원자 몇 개와
+/// `Instant` 비교 하나. 240 프레임/s x 약 25ns = 6us/s.
+fn note_deny_window(ring_deferred: u32, wrap_deferred: u32, denied_rings: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static FRAMES: AtomicU32 = AtomicU32::new(0);
+    static RING_SUM: AtomicU32 = AtomicU32::new(0);
+    static RING_MAX: AtomicU32 = AtomicU32::new(0);
+    static WRAP_SUM: AtomicU32 = AtomicU32::new(0);
+    static WRAP_MAX: AtomicU32 = AtomicU32::new(0);
+    static RINGS_MAX: AtomicU32 = AtomicU32::new(0);
+    static WINDOW: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+    RING_SUM.fetch_add(ring_deferred, Ordering::Relaxed);
+    RING_MAX.fetch_max(ring_deferred, Ordering::Relaxed);
+    WRAP_SUM.fetch_add(wrap_deferred, Ordering::Relaxed);
+    WRAP_MAX.fetch_max(wrap_deferred, Ordering::Relaxed);
+    RINGS_MAX.fetch_max(denied_rings, Ordering::Relaxed);
+
+    let Ok(mut window) = WINDOW.lock() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let started = *window.get_or_insert(now);
+    let elapsed = now.duration_since(started);
+    if elapsed < std::time::Duration::from_secs(1) {
+        return;
+    }
+    *window = Some(now);
+
+    let frames = FRAMES.swap(0, Ordering::Relaxed);
+    let ring_sum = RING_SUM.swap(0, Ordering::Relaxed);
+    let ring_max = RING_MAX.swap(0, Ordering::Relaxed);
+    let wrap_sum = WRAP_SUM.swap(0, Ordering::Relaxed);
+    let wrap_max = WRAP_MAX.swap(0, Ordering::Relaxed);
+    let rings_max = RINGS_MAX.swap(0, Ordering::Relaxed);
+    if ring_sum == 0 && wrap_sum == 0 && rings_max == 0 {
+        return;
+    }
+    warn!(
+        "MEDIADENY ring(deferred={ring_sum} max={ring_max}) \
+         wrap(deferred={wrap_sum} max={wrap_max} rings_max={rings_max}) \
+         frames={frames} window_ms={} ring_budget={} wrap_budget={} initial_map_slots={}",
+        elapsed.as_millis(),
+        pref!(media_ring_init_max_per_frame),
+        pref!(media_wrap_init_max_per_frame),
+        pref!(media_ring_initial_map_slots),
+    );
+}
+
+/// `InitialMapAll` 이 Map 할 슬롯 수. `0` 이면 전 슬롯(종전 동작).
+///
+/// ## 왜 (2026-11-20)
+///
+/// 링의 최초 소비는 슬롯 4 x 면 3 = ★Map 12 회★ 이고 실측 중앙값 8.8ms, 최대 87ms 다
+/// (`media_ring_init_max_per_frame` 의 doc). 그것이 렌더 스레드의 프레임 안이라서 예산을
+/// 1 로 묶었고, 그 대가가 ★아직 차례가 안 온 영상의 검은 사각형★ 이다. 예산을 올리면 그
+/// 정지가 돌아오므로 ***비용을 줄여야 예산을 올릴 수 있다.***
+///
+/// `2` 면 슬롯 0+1 만 Map 해서 6 회 -- 절반이다. 슬롯 0 은 스테이징 복사 대상이라 언제나
+/// 포함한다.
+///
+/// ★대가★: Map 하지 않은 슬롯은 `mapped` 에서 빠지고 Free 로 커밋된다. 프로듀서는 포인터가
+/// 없는 면을 건너뛰고 `Advance` 는 ***직전 Presenting 슬롯만*** 다시 Map 하므로, 그 슬롯들은
+/// 사실상 영구히 빠진다 -- ★링이 4 에서 N 으로 줄어든다★(`2` 면 더블 버퍼링).
+/// `player/d3d11_ring.rs` 가 그 손실을 이미 경고해 두었다.
+///
+/// 불변식은 깨지 않는다 -- Map 실패한 면을 빼고 커밋하는 것과 ***같은 모양*** 이고, 커밋은
+/// 계획당 정확히 한 번 그대로다.
+fn initial_map_slot_limit() -> usize {
+    pref!(media_ring_initial_map_slots).clamp(0, 64) as usize
+}
+
 fn note_media_d3d11_device(device: usize, requested_gpu: Option<usize>) {
     let mut owners = match MEDIA_D3D11_DEVICE_OWNERS.lock() {
         Ok(owners) => owners,
@@ -954,6 +1051,13 @@ impl MediaExternalImages {
         if frame == self.wrap_init_frame {
             return;
         }
+        // ★프레임이 실제로 바뀔 때만 돈다.★ 지난 프레임의 거부를 창에 쌓고 1 초마다 한 줄
+        // 낸다 -- 근거는 `note_deny_window` 의 doc.
+        note_deny_window(
+            self.ring_init_deferred,
+            self.wrap_init_deferred,
+            self.wrap_denied_rings.len() as u32,
+        );
         self.wrap_init_frame = frame;
         self.wrap_init_done = 0;
         self.wrap_init_deferred = 0;
