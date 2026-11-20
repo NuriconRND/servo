@@ -364,6 +364,12 @@ impl D3d11PlaneRings {
         active_slots: usize,
     ) -> u64 {
         let active_slots = active_slots.clamp(1, SLOT_COUNT);
+        // ★자물쇠를 명시적으로 끊는다.★ 이 함수는 아래에서 레지스트리를 다시 잠그므로,
+        // 임시값 수명에 기대면 재진입 데드락을 추측에 맡기는 셈이 된다.
+        let reg_len = {
+            let reg = lock_recover(registry());
+            reg.rings.len()
+        };
         let ring_id = NEXT_RING_ID.fetch_add(1, Ordering::Relaxed);
         let ring_slots = std::array::from_fn(|i| SlotInfo {
             state: SlotState::Unmapped,
@@ -371,6 +377,24 @@ impl D3d11PlaneRings {
             mapped: [None; MAX_PLANES],
             filled_seq: 0,
         });
+        // ★링 생성 시각을 남긴다 -- 그 시각이 곧 팝인 시각이다.★
+        //
+        // 2026-11-20 운영자 정정: 영역이 타일 바깥에서 들어올 때 "프레임이 채워지지 않은
+        // 영역이 얼마간 애니메이션이 진행된 후 ***갑자기*** 나타나는 것처럼 보인다". 점진적
+        // 드러남이 아니라 ★팝인★ 이고, 팝인은 이진 조건이 뒤늦게 뒤집힌다는 뜻이다. 이
+        // 경로에서 그런 조건은 ***그 디바이스에 링이 있는가*** 하나다 -- 링이 없으면
+        // `presenting_plane` 이 아무것도 못 주고, 첫 lock 의 `note_demand_and_ring` 이
+        // 링을 만든 뒤부터 내용이 나온다.
+        //
+        // `MEDIABLANK` 로는 이것을 볼 수 없다 -- 그쪽은 "링은 있는데 내용이 없다" 를 세고
+        // ***링이 아예 없는 구간은 세지 않는다.*** 그래서 `worst_ring` 이 작게 나온다.
+        //
+        // 로그가 밀리초이므로 페이지의 `[handover][전환 시작]` 과 맞춰 "얼마간" 이 몇 ms
+        // 인지 바로 읽힌다. 비용: 링 하나당 한 줄(런당 수십 줄).
+        warn!(
+            "MEDIARINGNEW ring={ring_id} device=0x{device:x} planes={planes_per_slot}              active_slots={active_slots} rings_now={}",
+            reg_len + 1,
+        );
         let ring = RingState {
             active_slots,
             planes_per_slot,
