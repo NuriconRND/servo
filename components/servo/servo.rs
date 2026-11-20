@@ -1103,7 +1103,13 @@ impl Servo {
     pub fn setup_logging(&self) {
         let constellation_chan = self.0.constellation_proxy.sender();
         let env = env_logger::Env::default();
-        let env_logger = EnvLoggerBuilder::from_env(env).build();
+        // ★시각은 밀리초로 찍는다.★ 2026-11-20 -- 초 해상도가 분석을 막았다:
+        // log_media_ready/07 에서 전환 시작과 54 개 첫 프레임이 전부 같은 초(07:38:59) 안에
+        // 있어서 그 사이 간격을 읽을 수 없었고, 운영자가 보는 공백이 바로 그 간격이다.
+        // `DESTROYSTEP` 에 전환 상대 시각(`t=+Nms`)을 따로 실어야 했던 것도 같은 이유였다.
+        let env_logger = EnvLoggerBuilder::from_env(env)
+            .format_timestamp_millis()
+            .build();
         let con_logger = FromEmbedderLogger::new(constellation_chan);
 
         let filter = max(env_logger.filter(), con_logger.filter());
@@ -1325,7 +1331,10 @@ where
 fn set_logger(script_to_constellation_sender: ScriptToConstellationSender) {
     let con_logger = FromScriptLogger::new(script_to_constellation_sender);
     let env = env_logger::Env::default();
-    let env_logger = EnvLoggerBuilder::from_env(env).build();
+    // 밀리초. 근거는 `Servo::setup_logging` 쪽 주석.
+    let env_logger = EnvLoggerBuilder::from_env(env)
+        .format_timestamp_millis()
+        .build();
 
     let filter = max(env_logger.filter(), con_logger.filter());
     let logger = BothLogger(env_logger, con_logger);
