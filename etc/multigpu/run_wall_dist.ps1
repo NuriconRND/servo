@@ -901,6 +901,19 @@ param(
     # (2026-11-18) -CpuProbe also logs PDH % Processor Utility / Time / Performance per LP
     # (CPUUTIL lines), to tell which one Task Manager / Resource Monitor is showing.
     [switch] $CpuProbePdh,
+    # (2026-11-20) Do not record the DWM state. By default every run records the current
+    # session's DWM once right before the engine starts and once after it has exited (3 s after
+    # the exit, so DWM has let go of what the engine held): pid, start time and age, handles,
+    # threads, working set, private bytes, CPU seconds, its GPU memory per adapter, and each
+    # adapter's GPU memory over all processes. Files next to the run log: <stem>.dwm.txt (both
+    # records and their difference) and dwm_history.tsv in the same folder (one line per record,
+    # appended, so runs can be compared over days). A DWM restart during the run is flagged.
+    # Read only and outside the engine: the first GPU memory query takes ~1.3 s and happens
+    # before the engine starts. A run stopped with Ctrl+C gets no post record.
+    # Why: the same 54-video command ran badly under a DWM that had been up since the 10-29 boot
+    # (20.6 days, log_numa_pins/03) and well after DWM restarted on 11-19 (04, 05). Whether
+    # DWM accumulates something across wall runs is the open question this records.
+    [switch] $NoDwmState,
     # **Stale note (recorded 2026-08-25, void after `4ff3075ca97` on 2026-08-31)** -- that env
     # var does not exist. Setting it blocks startup; this switch sends
     # `--pref gfx_video_immediate_composite_enabled=false` instead.
@@ -1470,15 +1483,23 @@ if ($LogPath -ne "NUL") {
 # .cpu.* files sit next to the .err.log they belong to. -NoLog has no log to sit next to, so
 # it gets a timestamped stem here; the probe is outside the engine, so -NoLog's promise (no
 # engine stderr I/O) still holds.
+# (2026-11-20) The same stem also names the DWM state record (<stem>.dwm.txt), so it is
+# computed once for both.
+$runStem = ""
+if ($NoLog) {
+    $runStem = Join-Path $here ("wall_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+} elseif ($LogPath -match '\.err\.log$') {
+    $runStem = $LogPath -replace '\.err\.log$', ''
+} else {
+    $runStem = Join-Path (Split-Path -Parent $LogPath) ([IO.Path]::GetFileNameWithoutExtension($LogPath))
+}
 $cpuStem = ""
-if ($CpuProbe) {
-    if ($NoLog) {
-        $cpuStem = Join-Path $here ("wall_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-    } elseif ($LogPath -match '\.err\.log$') {
-        $cpuStem = $LogPath -replace '\.err\.log$', ''
-    } else {
-        $cpuStem = Join-Path (Split-Path -Parent $LogPath) ([IO.Path]::GetFileNameWithoutExtension($LogPath))
-    }
+if ($CpuProbe) { $cpuStem = $runStem }
+$dwmFile = ""
+$dwmHistory = ""
+if (-not $NoDwmState) {
+    $dwmFile = "$runStem.dwm.txt"
+    $dwmHistory = Join-Path (Split-Path -Parent $runStem) "dwm_history.tsv"
 }
 
 # Old env knobs block startup in this build (servo_config::removed_env). Clear any that
@@ -1703,6 +1724,155 @@ if ($NumaNode -eq "auto") {
     throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
 }
 
+# (2026-11-20) DWM state record (-NoDwmState turns it off). Everything here reads system state
+# from outside the engine and runs only before the launch and after the exit.
+function ConvertTo-LuidKey([string] $Name) {
+    # 'pid_1876_luid_0x00000000_0x0002E396_phys_0' -> '00000000:0002e396', the engine's format
+    # ("tile N: display ... luid 00000000:0002e396").
+    $m = [regex]::Match($Name, 'luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)')
+    if (-not $m.Success) { return $Name }
+    return ('{0:x8}:{1:x8}' -f [Convert]::ToUInt32($m.Groups[1].Value, 16), [Convert]::ToUInt32($m.Groups[2].Value, 16))
+}
+function ConvertTo-GpuMemRows($Rows) {
+    return @($Rows | Sort-Object Name | ForEach-Object {
+        [pscustomobject]@{
+            Luid  = (ConvertTo-LuidKey $_.Name)
+            DedMB = [Math]::Round($_.DedicatedUsage / 1MB, 1)
+            ShMB  = [Math]::Round($_.SharedUsage / 1MB, 1)
+            ComMB = [Math]::Round($_.TotalCommitted / 1MB, 1)
+        }
+    })
+}
+function Get-DwmState {
+    # The DWM of THIS session (an RDP session would have its own).
+    $session = (Get-Process -Id $PID).SessionId
+    $st = [ordered]@{ Utc = (Get-Date).ToUniversalTime(); Boot = $null; DwmPid = 0; Start = $null;
+        Handles = 0; Threads = 0; WsMB = 0.0; PrivMB = 0.0; CpuSec = 0.0; Gpu = @(); Adapters = @(); Note = '' }
+    try { $st.Boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { }
+    $d = Get-Process dwm -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session } | Select-Object -First 1
+    if ($null -eq $d) { $st.Note = 'no dwm.exe in this session'; return [pscustomobject]$st }
+    $st.DwmPid = $d.Id
+    try { $st.Start = $d.StartTime.ToUniversalTime() } catch { }
+    $st.Handles = $d.HandleCount
+    $st.Threads = $d.Threads.Count
+    $st.WsMB = [Math]::Round($d.WorkingSet64 / 1MB, 1)
+    $st.PrivMB = [Math]::Round($d.PrivateMemorySize64 / 1MB, 1)
+    try { $st.CpuSec = [Math]::Round($d.TotalProcessorTime.TotalSeconds, 1) } catch { }
+    try {
+        $pfx = 'pid_' + $d.Id + '_'
+        $st.Gpu = ConvertTo-GpuMemRows (Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -ErrorAction Stop |
+            Where-Object { $_.Name -like ($pfx + '*') })
+        $st.Adapters = ConvertTo-GpuMemRows (Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory -ErrorAction Stop)
+    } catch {
+        $st.Note = 'GPU memory counters unavailable: ' + $_.Exception.Message
+    }
+    return [pscustomobject]$st
+}
+function Format-UtcStamp($T) {
+    if ($null -eq $T) { return '?' }
+    return $T.ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
+}
+function Get-TileLabel([hashtable] $Tiles, [string] $Luid) {
+    if ($Tiles -and $Tiles.ContainsKey($Luid)) { return $Tiles[$Luid] }
+    return ''
+}
+function Get-DwmSummary($S) {
+    if ($S.DwmPid -eq 0) { return $S.Note }
+    $age = '?'
+    if ($S.Start) { $age = ('{0:0.00} d' -f ($S.Utc - $S.Start).TotalDays) }
+    $ded = [double](($S.Gpu | Measure-Object -Property DedMB -Sum).Sum)
+    return ("pid {0}, started {1} (age {2}, boot {3}), handles {4}, private {5} MB, GPU dedicated {6} MB on {7} adapter(s)" -f
+        $S.DwmPid, (Format-UtcStamp $S.Start), $age, (Format-UtcStamp $S.Boot), $S.Handles, $S.PrivMB, $ded, @($S.Gpu).Count)
+}
+function Format-DwmState($S, [string] $Tag, [hashtable] $Tiles) {
+    $out = @()
+    $out += "===== dwm_state $Tag utc=$(Format-UtcStamp $S.Utc) boot=$(Format-UtcStamp $S.Boot)"
+    if ($S.DwmPid -eq 0) { $out += "  $($S.Note)"; return $out }
+    $age = '?'
+    if ($S.Start) { $age = ('{0:0.00}d' -f ($S.Utc - $S.Start).TotalDays) }
+    $out += ("  dwm pid={0} start={1} age={2} handles={3} threads={4} ws={5}MB priv={6}MB cpu={7}s" -f
+        $S.DwmPid, (Format-UtcStamp $S.Start), $age, $S.Handles, $S.Threads, $S.WsMB, $S.PrivMB, $S.CpuSec)
+    foreach ($g in $S.Gpu) {
+        $out += ("  dwm gpu  {0} {1,-6} dedicated={2}MB shared={3}MB committed={4}MB" -f $g.Luid, (Get-TileLabel $Tiles $g.Luid), $g.DedMB, $g.ShMB, $g.ComMB)
+    }
+    foreach ($a in $S.Adapters) {
+        $out += ("  adapter  {0} {1,-6} dedicated={2}MB shared={3}MB committed={4}MB (all processes)" -f $a.Luid, (Get-TileLabel $Tiles $a.Luid), $a.DedMB, $a.ShMB, $a.ComMB)
+    }
+    if ($S.Note) { $out += "  note: $($S.Note)" }
+    return $out
+}
+function Format-DwmDelta($Pre, $Post, [hashtable] $Tiles) {
+    $out = @()
+    if ($Pre.DwmPid -eq 0 -or $Post.DwmPid -eq 0) {
+        $out += '----- delta: not available (a record found no dwm.exe)'
+        return $out
+    }
+    if ($Pre.DwmPid -ne $Post.DwmPid) {
+        $out += ("----- DWM RESTARTED during this run: pid {0} -> {1} (new one started {2}). The records are different processes, so there is no delta." -f
+            $Pre.DwmPid, $Post.DwmPid, (Format-UtcStamp $Post.Start))
+        return $out
+    }
+    $out += ("----- delta post-pre, same dwm pid {0}: handles {1:+0;-0;0} threads {2:+0;-0;0} ws {3:+0.0;-0.0;0}MB priv {4:+0.0;-0.0;0}MB cpu {5:+0.0;-0.0;0}s" -f
+        $Post.DwmPid, ($Post.Handles - $Pre.Handles), ($Post.Threads - $Pre.Threads), ($Post.WsMB - $Pre.WsMB), ($Post.PrivMB - $Pre.PrivMB), ($Post.CpuSec - $Pre.CpuSec))
+    foreach ($pair in @(@('dwm gpu', $Pre.Gpu, $Post.Gpu), @('adapter', $Pre.Adapters, $Post.Adapters))) {
+        $keys = @(@($pair[1]) + @($pair[2]) | ForEach-Object { $_.Luid } | Sort-Object -Unique)
+        foreach ($k in $keys) {
+            $a = @($pair[1]) | Where-Object { $_.Luid -eq $k } | Select-Object -First 1
+            $b = @($pair[2]) | Where-Object { $_.Luid -eq $k } | Select-Object -First 1
+            $ad = 0.0; $as = 0.0; $bd = 0.0; $bs = 0.0
+            if ($a) { $ad = $a.DedMB; $as = $a.ShMB }
+            if ($b) { $bd = $b.DedMB; $bs = $b.ShMB }
+            $out += ("  {0,-8} {1} {2,-6} dedicated {3:+0.0;-0.0;0}MB shared {4:+0.0;-0.0;0}MB" -f $pair[0], $k, (Get-TileLabel $Tiles $k), ($bd - $ad), ($bs - $as))
+        }
+    }
+    return $out
+}
+function ConvertTo-DwmTsv($S, [string] $Tag, [string] $Run) {
+    $ageH = ''
+    if ($S.Start) { $ageH = ('{0:0.00}' -f ($S.Utc - $S.Start).TotalHours) }
+    $ded = [double](($S.Gpu | Measure-Object -Property DedMB -Sum).Sum)
+    $sh = [double](($S.Gpu | Measure-Object -Property ShMB -Sum).Sum)
+    $byAd = (@($S.Gpu) | ForEach-Object { $_.Luid + '=' + $_.DedMB }) -join ';'
+    $adAll = (@($S.Adapters) | ForEach-Object { $_.Luid + '=' + $_.DedMB }) -join ';'
+    return (@((Format-UtcStamp $S.Utc), $Run, $Tag, $S.DwmPid, (Format-UtcStamp $S.Start), $ageH, (Format-UtcStamp $S.Boot),
+        $S.Handles, $S.Threads, $S.WsMB, $S.PrivMB, $S.CpuSec, $ded, $sh, $byAd, $adAll, $S.Note) -join "`t")
+}
+$dwmTsvHeader = (@('utc', 'run', 'tag', 'dwm_pid', 'dwm_start_utc', 'dwm_age_h', 'boot_utc', 'handles', 'threads', 'ws_mb',
+    'priv_mb', 'cpu_s', 'dwm_gpu_dedicated_mb', 'dwm_gpu_shared_mb', 'dwm_gpu_dedicated_mb_by_adapter',
+    'adapter_dedicated_mb_all_processes', 'note') -join "`t")
+function Write-DwmStatePre([string] $File, [string] $History, [string] $Run) {
+    $s = Get-DwmState
+    Format-DwmState $s 'pre (right before the engine starts)' @{} | Out-File -LiteralPath $File -Encoding utf8
+    if (-not (Test-Path -LiteralPath $History)) { $dwmTsvHeader | Out-File -LiteralPath $History -Encoding utf8 }
+    ConvertTo-DwmTsv $s 'pre' $Run | Out-File -LiteralPath $History -Encoding utf8 -Append
+    return $s
+}
+function Write-DwmStatePost($Pre, [string] $File, [string] $History, [string] $Run, [string] $EngineLog) {
+    # Tile names for the adapters, from the engine's own "tile N: display ... luid" lines.
+    $tiles = @{}
+    if ($EngineLog -ne '' -and $EngineLog -ne 'NUL' -and (Test-Path -LiteralPath $EngineLog)) {
+        Select-String -LiteralPath $EngineLog -Pattern '^tile (\d+): display .* luid ([0-9a-f]{8}:[0-9a-f]{8})' |
+            Select-Object -First 16 | ForEach-Object { $tiles[$_.Matches[0].Groups[2].Value.ToLower()] = 'tile' + $_.Matches[0].Groups[1].Value }
+    }
+    $s = Get-DwmState
+    $delta = Format-DwmDelta $Pre $s $tiles
+    (@(Format-DwmState $s 'post (3 s after the engine exited)' $tiles) + $delta) | Out-File -LiteralPath $File -Encoding utf8 -Append
+    ConvertTo-DwmTsv $s 'post' $Run | Out-File -LiteralPath $History -Encoding utf8 -Append
+    return @($s, $delta)
+}
+$dwmPre = $null
+if ($NoDwmState) {
+    Write-Host "  dwm_state   : off (-NoDwmState)"
+} else {
+    try {
+        $dwmPre = Write-DwmStatePre $dwmFile $dwmHistory (Split-Path -Leaf $runStem)
+        Write-Host "  dwm_state   : $(Get-DwmSummary $dwmPre) -> $dwmFile"
+    } catch {
+        $dwmPre = $null
+        Write-Warning "DWM state record (before the run) failed: $($_.Exception.Message). The run goes on without it."
+    }
+}
+
 # ***Always launch through the cmd wrapper, pin or no pin.*** The reason is stderr, not
 # the pin: cmd's `2>` hands the child a plain file handle, while Start-Process
 # -RedirectStandardError inserts a pipe that PowerShell has to drain. 7.1 us per write
@@ -1906,6 +2076,25 @@ if ($cpuProbeProc) {
     } else {
         Write-Warning "-CpuProbe: wall_cpu_probe exited (exit code $($cpuProbeProc.ExitCode)) without writing $cpuSummary."
         Write-CpuProbeError $cpuLog
+    }
+}
+
+# (2026-11-20) DWM state after the run: wait until the engine is really gone (after the
+# -DurationSec force-kill its teardown can outlast the 2 s sleep), give DWM 3 s to release what
+# the engine held, then record and print the difference.
+if ($dwmPre) {
+    try {
+        try { $null = $proc.WaitForExit(15000) } catch { }
+        Start-Sleep -Seconds 3
+        $dwmPostResult = Write-DwmStatePost $dwmPre $dwmFile $dwmHistory (Split-Path -Leaf $runStem) $LogPath
+        Write-Host "--- DWM state: $dwmFile  (history: $dwmHistory)"
+        Write-Host "  after : $(Get-DwmSummary $dwmPostResult[0])"
+        $dwmPostResult[1] | ForEach-Object { Write-Host $_ }
+        if ($dwmPostResult[0].DwmPid -ne 0 -and $dwmPostResult[0].DwmPid -ne $dwmPre.DwmPid) {
+            Write-Warning "DWM restarted during this run (pid $($dwmPre.DwmPid) -> $($dwmPostResult[0].DwmPid)). The Application log (provider Dwminit) says why; the wall output went black while it did."
+        }
+    } catch {
+        Write-Warning "DWM state record (after the run) failed: $($_.Exception.Message)."
     }
 }
 
