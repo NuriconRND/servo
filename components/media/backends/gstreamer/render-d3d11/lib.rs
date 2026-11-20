@@ -28,7 +28,7 @@ mod render_d3d11 {
     use servo_config::pref;
     use servo_media_gstreamer_render::Render;
     use servo_media_player::PlayerError;
-    use servo_media_player::d3d11_ring::{D3d11PlaneRings, RING_DEMAND_TTL};
+    use servo_media_player::d3d11_ring::{D3d11PlaneRings, RING_DEMAND_TTL, SLOT_COUNT};
     use servo_media_player::video::{
         Buffer, VideoFrame, VideoFrameD3D11YuvData, VideoFrameData, VideoFrameYuvColorRange,
         VideoFrameYuvColorSpace, VideoFrameYuvFormat,
@@ -164,7 +164,16 @@ mod render_d3d11 {
                 return Some(ring_id);
             }
             let slots = ring_producer::create_plane_textures(device, format, width, height)?;
-            let ring_id = D3d11PlaneRings::create_ring(device, format.plane_count(), slots);
+            // ★링 깊이는 pref 가 정한다★ -- 0 이면 전 슬롯(종전). 근거는
+            // `media_ring_initial_map_slots` 의 doc: 최초 소비 Map 12 회(중앙값 8.8ms)가
+            // 렌더 프레임 안이라서 프레임당 받아들이는 링 수가 1 로 묶였고, 그 대가가
+            // 검은 사각형이었다.
+            let depth = match pref!(media_ring_initial_map_slots) {
+                0 => SLOT_COUNT,
+                n => (n.clamp(1, SLOT_COUNT as i64)) as usize,
+            };
+            let ring_id =
+                D3d11PlaneRings::create_ring_with_depth(device, format.plane_count(), slots, depth);
             D3d11PlaneRings::attach_ring(group_id, device, ring_id);
             // 협상된 실제 gst VideoFormat(gst_format)과 매핑된 표시 포맷(format)을
             // 함께 남긴다 — 10-bit 협상(I42010le/P01010le vs 8-bit 강등) 확인용.

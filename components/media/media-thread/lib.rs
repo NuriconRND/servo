@@ -411,15 +411,12 @@ fn consume_plan(rc: &dyn RenderingContext, ring_id: u64, plan: ConsumePlan) {
             let mut mapped: Vec<RemappedPlane> = Vec::new();
             let mut slot0_mapped: [Option<(usize, u32, PlaneDesc)>; MAX_PLANES] =
                 [None; MAX_PLANES];
-            // ★앞 N 슬롯만 Map 한다(0 = 전부).★ 근거는 `initial_map_slot_limit` 의 doc --
-            // 최초 소비 12 회 Map(중앙값 8.8ms)이 렌더 프레임 안이라서 예산이 1 로 묶여
-            // 있고, 그 대가가 검은 사각형이다. 슬롯 0 은 스테이징 복사 대상이라 언제나
-            // 포함된다. 빠진 슬롯은 Map 실패와 ***같은 모양*** 으로 커밋된다.
-            let slot_limit = initial_map_slot_limit();
+            // 계획이 실어 온 슬롯만 Map 한다. 깊이 제한은 ★링 쪽에서★ 한다 --
+            // `media_ring_initial_map_slots` 가 켜지면 계획 생성부가 초과 슬롯의 plane 을
+            // `None` 으로 내보내므로 아래 `continue` 가 그것을 걸러낸다. 소비자가 임의로
+            // 건너뛰면 그 슬롯이 Free-미매핑으로 남아 ***쓰인 적 없는 텍스처가 제시된다***
+            // (2026-11-20 실기에서 전체 영역 깜박임으로 나왔다).
             for (slot_idx, slot) in slots.iter().enumerate() {
-                if slot_limit > 0 && slot_idx >= slot_limit.max(1) {
-                    break;
-                }
                 for (plane_idx, plane) in slot.iter().enumerate() {
                     let Some(desc) = plane else {
                         continue;
@@ -734,35 +731,14 @@ fn note_deny_window(ring_deferred: u32, wrap_deferred: u32, denied_rings: u32) {
     warn!(
         "MEDIADENY ring(deferred={ring_sum} max={ring_max}) \
          wrap(deferred={wrap_sum} max={wrap_max} rings_max={rings_max}) \
-         frames={frames} window_ms={} ring_budget={} wrap_budget={} initial_map_slots={}",
+         frames={frames} window_ms={} drops={} ring_budget={} wrap_budget={} \
+         initial_map_slots={}",
         elapsed.as_millis(),
+        D3d11PlaneRings::total_dropped_frames(),
         pref!(media_ring_init_max_per_frame),
         pref!(media_wrap_init_max_per_frame),
         pref!(media_ring_initial_map_slots),
     );
-}
-
-/// `InitialMapAll` 이 Map 할 슬롯 수. `0` 이면 전 슬롯(종전 동작).
-///
-/// ## 왜 (2026-11-20)
-///
-/// 링의 최초 소비는 슬롯 4 x 면 3 = ★Map 12 회★ 이고 실측 중앙값 8.8ms, 최대 87ms 다
-/// (`media_ring_init_max_per_frame` 의 doc). 그것이 렌더 스레드의 프레임 안이라서 예산을
-/// 1 로 묶었고, 그 대가가 ★아직 차례가 안 온 영상의 검은 사각형★ 이다. 예산을 올리면 그
-/// 정지가 돌아오므로 ***비용을 줄여야 예산을 올릴 수 있다.***
-///
-/// `2` 면 슬롯 0+1 만 Map 해서 6 회 -- 절반이다. 슬롯 0 은 스테이징 복사 대상이라 언제나
-/// 포함한다.
-///
-/// ★대가★: Map 하지 않은 슬롯은 `mapped` 에서 빠지고 Free 로 커밋된다. 프로듀서는 포인터가
-/// 없는 면을 건너뛰고 `Advance` 는 ***직전 Presenting 슬롯만*** 다시 Map 하므로, 그 슬롯들은
-/// 사실상 영구히 빠진다 -- ★링이 4 에서 N 으로 줄어든다★(`2` 면 더블 버퍼링).
-/// `player/d3d11_ring.rs` 가 그 손실을 이미 경고해 두었다.
-///
-/// 불변식은 깨지 않는다 -- Map 실패한 면을 빼고 커밋하는 것과 ***같은 모양*** 이고, 커밋은
-/// 계획당 정확히 한 번 그대로다.
-fn initial_map_slot_limit() -> usize {
-    pref!(media_ring_initial_map_slots).clamp(0, 64) as usize
 }
 
 fn note_media_d3d11_device(device: usize, requested_gpu: Option<usize>) {

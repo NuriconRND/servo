@@ -225,6 +225,18 @@ struct RingState {
     /// 현재 Presenting 슬롯. 최초 소비(InitialMapAll) 전에는 None.
     presenting_slot: Option<usize>,
     /// 이번 합성에서 lock된 plane 개수(0→1 전이에서만 계획 발급).
+    /// 실제로 쓰는 슬롯 수(`1..=SLOT_COUNT`). 초과 슬롯은 ★`Unmapped` 로 남아 claim 되지
+    /// 않는다★ -- 그래서 Map 하지 않아도 쓰인 적 없는 텍스처가 제시될 일이 없다.
+    ///
+    /// 왜 얕게 쓰나: 최초 소비는 슬롯 4 x 면 3 = Map 12 회(중앙값 8.8ms, 최대 87ms)이고
+    /// 렌더 스레드의 프레임 안이다. 그래서 프레임당 받아들이는 링 수가 1 로 묶였고, 그
+    /// 대가로 아직 차례가 안 온 영상이 ★검은 사각형★ 으로 나왔다(2026-11-20 실기).
+    /// 깊이를 줄이면 그 비용이 줄어 예산을 올릴 수 있다 -- 실측으로 깊이 2 + 예산 8 이
+    /// 깜박임을 거의 없애면서 `render.over` 를 117 건에서 24 건으로 줄였다.
+    ///
+    /// 대가는 버퍼링 여유다. `2` 면 더블 버퍼링이고, 쓸 Free 슬롯이 없으면
+    /// `dropped_frames` 가 오르며 프로듀서가 직전 Presenting 을 재제시한다.
+    active_slots: usize,
     lock_count: u64,
     dropped_frames: u64,
     next_filled_seq: u64,
@@ -334,11 +346,24 @@ impl D3d11PlaneRings {
     /// 생성(epoch=1)을 뜻하며, 프로듀서가 크기 변경 등으로 링을 다시 만들
     /// 때는 새 ring_id를 받게 되므로 세대 추적(ring_epoch)은 프로듀서
     /// 쪽(`VideoFrameD3D11YuvData::ring_epoch`)의 책임이다.
+    /// 전 슬롯을 쓰는 링. 기존 호출자와 테스트가 쓰는 모양이다.
     pub fn create_ring(
         device: usize,
         planes_per_slot: usize,
         slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT],
     ) -> u64 {
+        Self::create_ring_with_depth(device, planes_per_slot, slots, SLOT_COUNT)
+    }
+
+    /// 깊이를 정해 링을 만든다. `active_slots` 는 `1..=SLOT_COUNT` 로 조여진다.
+    /// 근거는 [`RingState::active_slots`] 의 doc.
+    pub fn create_ring_with_depth(
+        device: usize,
+        planes_per_slot: usize,
+        slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT],
+        active_slots: usize,
+    ) -> u64 {
+        let active_slots = active_slots.clamp(1, SLOT_COUNT);
         let ring_id = NEXT_RING_ID.fetch_add(1, Ordering::Relaxed);
         let ring_slots = std::array::from_fn(|i| SlotInfo {
             state: SlotState::Unmapped,
@@ -347,6 +372,7 @@ impl D3d11PlaneRings {
             filled_seq: 0,
         });
         let ring = RingState {
+            active_slots,
             planes_per_slot,
             slots: ring_slots,
             presenting_slot: None,
@@ -409,6 +435,14 @@ impl D3d11PlaneRings {
     pub fn claim_free_slot(ring_id: u64) -> Option<ClaimedSlot> {
         let mut reg = lock_recover(registry());
         let ring = reg.rings.get_mut(&ring_id)?;
+        // ★여기에 매핑 조건을 걸어서는 안 된다.★ 2026-11-20 에 걸어 봤고
+        // `an_unwritten_presenting_slot_is_not_handed_out` 가 반증했다 -- 전부 실패한
+        // `InitialMapAll` 뒤에도 claim 이 성공해야 하고, 그 claim -> publish 로 슬롯이
+        // 회전해 `Advance` 가 다시 Map 하면서 링이 회복된다. 조건을 걸면 그 회복이 막혀
+        // 링이 영구히 빈다.
+        //
+        // 얕은 링(`active_slots`)의 초과 슬롯은 `Free` 가 아니라 `Unmapped` 로 남으므로
+        // 애초에 이 탐색에 걸리지 않는다 -- 그래서 여기는 손대지 않는다.
         let Some(idx) = ring.slots.iter().position(|s| s.state == SlotState::Free) else {
             ring.dropped_frames += 1;
             return None;
@@ -480,6 +514,21 @@ impl D3d11PlaneRings {
     }
 
     /// FREE 슬롯이 없어 memcpy 전에 드롭된 프레임 누적 개수.
+    /// 모든 링의 드롭 합. ★`MEDIADENY` 가 1 초에 한 번 읽는다.★
+    ///
+    /// 드롭은 "쓸 수 있는 Free 슬롯이 없어 프로듀서가 직전 Presenting 을 재제시했다" 는
+    /// 뜻이고, `media_ring_initial_map_slots` 로 링을 얕게 만들면 오르는 값이다 --
+    /// ★그 설정의 대가를 재는 유일한 수치★ 다. 2026-11-20 까지 로그에 나간 적이 없었다.
+    ///
+    /// 1 초에 한 번만 불리므로 링 수만큼의 덧셈이면 충분하다.
+    pub fn total_dropped_frames() -> u64 {
+        lock_recover(registry())
+            .rings
+            .values()
+            .map(|r| r.dropped_frames)
+            .sum()
+    }
+
     pub fn dropped_frames(ring_id: u64) -> u64 {
         let reg = lock_recover(registry());
         reg.rings
@@ -510,8 +559,17 @@ impl D3d11PlaneRings {
         }
 
         if ring.presenting_slot.is_none() {
-            let slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT] =
-                std::array::from_fn(|i| ring.slots[i].planes);
+            // ★초과 슬롯은 plane 을 내보내지 않는다★ -- 소비자가 Map 하지 않고, 아래
+            // `commit_consume` 이 그 슬롯을 `Unmapped` 로 남긴다. 근거는
+            // [`RingState::active_slots`] 의 doc.
+            let active = ring.active_slots;
+            let slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT] = std::array::from_fn(|i| {
+                if i < active {
+                    ring.slots[i].planes
+                } else {
+                    [None; MAX_PLANES]
+                }
+            });
             let staged = ring.staged_first_frame.take();
             // 스테이징이 없으면 슬롯 0 은 한 번도 쓰인 적이 없다 — 첫 Advance 까지 비운다.
             ring.presenting_has_content = staged.is_some();
@@ -636,8 +694,17 @@ impl D3d11PlaneRings {
                 {
                     apply_mapped(ring, texture, data_ptr, row_pitch);
                 }
+                let active = ring.active_slots;
                 for i in 0..SLOT_COUNT {
                     if writing.contains(&i) {
+                        continue;
+                    }
+                    // ★초과 슬롯은 `Unmapped` 로 남긴다.★ `Free` 로 두면
+                    // `claim_free_slot` 이 그것을 집어 가고, 매핑이 없으니 프로듀서가
+                    // 아무것도 쓰지 않은 채 발행해 ***쓰인 적 없는 텍스처가 제시된다***
+                    // (2026-11-20 실기: "전환 완료 후 정체불명의 전체 영역 깜박임").
+                    if i >= active {
+                        ring.slots[i].state = SlotState::Unmapped;
                         continue;
                     }
                     ring.slots[i].state = if i == 0 {
@@ -1041,6 +1108,53 @@ mod tests {
         assert!(matches!(plan, Some(ConsumePlan::Advance { .. })));
         assert!(D3d11PlaneRings::presenting_plane(ring, 0).is_some());
         D3d11PlaneRings::note_plane_unlock(ring);
+
+        D3d11PlaneRings::remove_ring(ring);
+        let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
+    }
+
+    /// ★얕은 링의 초과 슬롯은 claim 되지 않는다.★ 2026-11-20.
+    ///
+    /// 깊이를 줄이는 목적은 최초 소비의 Map 수를 줄이는 것인데(슬롯 4 x 면 3 = 12 회,
+    /// 중앙값 8.8ms), 초과 슬롯을 `Free` 로 남기면 `claim_free_slot` 이 그것을 집어 가고
+    /// 매핑이 없으니 프로듀서가 아무것도 쓰지 않은 채 발행해 ***쓰인 적 없는 텍스처가
+    /// 제시된다*** -- 실기에서 "전환 완료 후 정체불명의 전체 영역 깜박임" 으로 나왔다.
+    /// 그래서 `Unmapped` 로 남겨야 한다.
+    #[test]
+    fn a_shallow_ring_does_not_hand_out_slots_beyond_its_depth() {
+        const DEV: usize = 0x5E_0000;
+        let ring = D3d11PlaneRings::create_ring_with_depth(DEV, 2, slots_of(0x55_0000), 2);
+
+        // 계획은 활성 슬롯의 plane 만 실어 온다.
+        let (plan, _) = D3d11PlaneRings::plan_or_presenting_plane(ring, 0);
+        let Some(ConsumePlan::InitialMapAll { slots, .. }) = plan else {
+            panic!("최초 소비 계획이어야 한다");
+        };
+        assert!(slots[0][0].is_some(), "슬롯 0 은 실려 온다");
+        assert!(slots[1][0].is_some(), "슬롯 1 은 실려 온다");
+        for i in 2..SLOT_COUNT {
+            assert!(slots[i][0].is_none(), "슬롯 {i} 는 실려 오지 않는다");
+        }
+
+        // 활성 슬롯만 Map 했다고 커밋한다.
+        let mapped: Vec<RemappedPlane> = (0..2)
+            .filter_map(|p| slots[1][p])
+            .map(|desc| RemappedPlane {
+                texture: desc.texture,
+                data_ptr: 0x1000 + desc.texture,
+                row_pitch: 64,
+            })
+            .collect();
+        D3d11PlaneRings::commit_consume(ring, ConsumeCommit::InitialMapAll { mapped });
+        D3d11PlaneRings::note_plane_unlock(ring);
+
+        // ★claim 은 활성 슬롯 하나만 내준다 -- 초과 슬롯은 Unmapped 라 걸리지 않는다.★
+        let first = D3d11PlaneRings::claim_free_slot(ring).expect("슬롯 1 은 내준다");
+        assert_eq!(first.slot, 1);
+        assert!(
+            D3d11PlaneRings::claim_free_slot(ring).is_none(),
+            "초과 슬롯을 내주면 쓰인 적 없는 텍스처가 제시된다"
+        );
 
         D3d11PlaneRings::remove_ring(ring);
         let _ = D3d11PlaneRings::take_removed_rings_for_device(DEV);
