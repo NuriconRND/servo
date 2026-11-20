@@ -1855,12 +1855,25 @@ pub struct Preferences {
     ///     깊이 2 + 예산 4    wrap deferred 16 -> 7    rings_max 1 -> 1
     ///     깊이 3 + 예산 4    wrap deferred 96 -> 51   rings_max ★12 -> 4★
     ///
-    /// `rings_max` 가 ★한 프레임에 검게 칠해진 자리의 수★ 다. 깊이 2 에서 이미 1~2 로
-    /// 내려왔지만 0 은 아니므로, 0 으로 밀려면 이 값을 올려야 한다. ★다만 올리는 대가가
-    /// 위에 적힌 그대로다★ -- 영상 하나의 래핑이 3~12ms 이므로 `3` 이면 최악 36ms, `4` 면
-    /// 48ms 가 한 프레임에 들어온다. 그래서 기본값은 그대로 두고 ***측정 후*** 옮긴다:
-    /// `-WrapInitMaxPerFrame 3` 과 `4` 를 깊이 2 와 함께 돌려 `rings_max` 가 0 이 되는지와
-    /// `render.over` 가 돌아오는지를 함께 본다.
+    /// `rings_max` 가 ★한 프레임에 검게 칠해진 자리의 수★ 다.
+    ///
+    /// ## 2026-11-20: 측정했고 기본값을 ★4★ 로 옮겼다 (log_media_ready/06)
+    ///
+    ///              MEDIADENY   rings_max   render.over           GPU
+    ///     wrap=3    1건/1건      3 / 2      n=78/78 p50 28.7/29.0  gpu_ms 113.7~114.0
+    ///     wrap=4   ★0건/0건★     --        n=68/42 p50 23.3/25.2  gpu_ms 115.3~116.4
+    ///
+    /// ★4 에서 거부가 0 이 된다.★ 그리고 걱정했던 "최악 48ms" 는 회귀로 나타나지 않았다 --
+    /// `render.over` 가 오히려 78 건에서 42~68 건으로, p50 이 29ms 에서 23~25ms 로 줄었다.
+    /// GPU 부하는 네 판이 사실상 같으므로(113~116ms) 이 값은 GPU 일을 늘리는 게 아니라
+    /// ***래핑을 언제 하는지*** 만 바꾼다. 운영자 육안으로도 "4 를 인가했을 때가 전환
+    /// 애니메이션이 좀 더 부드러워진 것 같은 느낌" 이었다.
+    ///
+    /// 되돌리려면 `2`.
+    ///
+    /// ★주의★: 이 값을 `-Pref` 로 덮어쓰면 런처 배너의 `wrap_budget=` 은 ***런처 값을***
+    /// 찍으므로 실효값과 다르다(2026-11-20 실기에서 배너 2, 엔진 3). 실효값은 기동 때
+    /// 한 번 찍히는 `MEDIABUDGET` 을 본다.
     pub media_wrap_init_max_per_frame: i64,
     /// 플레이어 해체를 맡는 전용 스레드 수. `1` 이면 예전 동작(직렬).
     ///
@@ -2405,7 +2418,7 @@ impl Preferences {
             media_d3d11_enabled: false,
             media_ring_initial_map_slots: 2,
             media_ring_init_max_per_frame: 8,
-            media_wrap_init_max_per_frame: 2,
+            media_wrap_init_max_per_frame: 4,
             media_player_disposal_threads: 4,
             media_ring_stage_first_frame: false,
             media_release_detached_player: true,

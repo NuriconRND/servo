@@ -171,12 +171,26 @@ pub fn copy_rows(
 /// texture fails, the `ComPtr`s created so far in this batch drop and release
 /// their textures before returning `None` (the renderer must never observe a
 /// partially-created ring).
+/// 링의 plane 텍스처를 만든다. ★`depth` 슬롯만 만든다★ -- 나머지는 `None` 으로 남는다.
+///
+/// ## 왜 깊이를 받나 (2026-11-20)
+///
+/// 링은 `media_ring_initial_map_slots`(기본 2)만큼만 쓰고 나머지 슬롯은 `Unmapped` 로 남아
+/// claim 되지 않는다(`d3d11_ring.rs` 의 `RingState::active_slots`). 그런데 여기서는 ***전
+/// 슬롯의 텍스처를 만들고 있었다*** -- 쓰이지 않는 VRAM 이 남고(FHD I420 기준 슬롯당 약 3MB,
+/// 54 영상 x 2 슬롯 = 약 324MB) 만드는 시간도 그만큼 든다.
+///
+/// `depth` 는 `1..=SLOT_COUNT` 로 조여진다. 초과 슬롯의 plane 이 `None` 이어도 아래 경로가
+/// 전부 `Option` 을 거르므로 안전하다 -- 계획 생성부는 활성 슬롯만 싣고, `commit_consume` 은
+/// 초과 슬롯을 `Unmapped` 로 남기고, `claim_free_slot` 은 `Free` 만 집는다.
 pub fn create_plane_textures(
     device: usize,
     format: VideoFrameYuvFormat,
     width: i32,
     height: i32,
+    depth: usize,
 ) -> Option<[[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT]> {
+    let depth = depth.clamp(1, SLOT_COUNT);
     let device = device as *mut ID3D11Device;
     if device.is_null() {
         return None;
@@ -185,9 +199,9 @@ pub fn create_plane_textures(
     let mut slots: [[Option<PlaneDesc>; MAX_PLANES]; SLOT_COUNT] = [[None; MAX_PLANES]; SLOT_COUNT];
     // Hold owning ComPtrs until the whole batch succeeds — on early return they
     // drop and Release (RAII cleanup of the partial batch).
-    let mut created: Vec<ComPtr<ID3D11Texture2D>> = Vec::with_capacity(SLOT_COUNT * geoms.len());
+    let mut created: Vec<ComPtr<ID3D11Texture2D>> = Vec::with_capacity(depth * geoms.len());
 
-    for slot in slots.iter_mut() {
+    for slot in slots.iter_mut().take(depth) {
         for (p, g) in geoms.iter().enumerate() {
             // `None` returns immediately; `created` drops and Releases the batch.
             let texture = create_dynamic_texture(device, g)?;

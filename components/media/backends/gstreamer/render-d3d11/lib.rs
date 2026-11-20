@@ -163,15 +163,18 @@ mod render_d3d11 {
             if let Some(ring_id) = D3d11PlaneRings::ring_for(group_id, device) {
                 return Some(ring_id);
             }
-            let slots = ring_producer::create_plane_textures(device, format, width, height)?;
             // ★링 깊이는 pref 가 정한다★ -- 0 이면 전 슬롯(종전). 근거는
             // `media_ring_initial_map_slots` 의 doc: 최초 소비 Map 12 회(중앙값 8.8ms)가
             // 렌더 프레임 안이라서 프레임당 받아들이는 링 수가 1 로 묶였고, 그 대가가
             // 검은 사각형이었다.
+            //
+            // ★텍스처 생성에도 같은 깊이를 넘긴다★(2026-11-20) -- 쓰지 않을 슬롯의
+            // VRAM 과 생성 시간을 아낀다.
             let depth = match pref!(media_ring_initial_map_slots) {
                 0 => SLOT_COUNT,
                 n => (n.clamp(1, SLOT_COUNT as i64)) as usize,
             };
+            let slots = ring_producer::create_plane_textures(device, format, width, height, depth)?;
             let ring_id =
                 D3d11PlaneRings::create_ring_with_depth(device, format.plane_count(), slots, depth);
             D3d11PlaneRings::attach_ring(group_id, device, ring_id);

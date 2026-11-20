@@ -673,6 +673,39 @@ static MEDIA_D3D11_DEVICE_OWNERS: Mutex<Vec<(usize, Option<usize>)>> = Mutex::ne
 /// 넣어서야 잡혔다. 조용한 실패를 시끄러운 실패로 바꾸는 것이 이 함수의 목적이다.
 ///
 /// 단일 GPU 월(모든 타일이 같은 `requested_gpu`)에서는 디바이스 공유가 정상이므로 조용하다.
+/// 미디어 예산의 ★실효값★ 을 기동 때 한 번 찍는다.
+///
+/// ## 왜 (2026-11-20, log_media_ready/06)
+///
+/// 운영자가 `-WrapInitMaxPerFrame` 대신 `-Pref media_wrap_init_max_per_frame=3` 으로 넣고
+/// "잘 적용되었는지 확인 바람" 이라고 물었다. 확인은 됐지만 ★두 가지가 드러났다.★
+///
+/// 1. 런처 배너의 `wrap_budget=` 은 ***런처 파라미터 값*** 이다. `-Pref` 로 덮으면 배너와
+///    실효값이 어긋난다 -- 실제로 배너는 2, 엔진은 3 이었다.
+/// 2. `MEDIADENY` 는 ***거부가 있을 때만*** 찍히므로, 예산이 충분해서 거부가 0 이면
+///    ★로그에 예산이 한 줄도 남지 않는다★ -- wrap=4 판이 그래서 확인 불가였다.
+///
+/// 그래서 실효값을 ***무조건*** 한 번 남긴다. 거부가 있든 없든, 그 런이 무슨 값으로 돌았는지
+/// 로그 하나로 끝난다.
+///
+/// 비용: 프로세스당 한 번.
+fn note_budgets_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    warn!(
+        "MEDIABUDGET ring_init_max_per_frame={} wrap_init_max_per_frame={} \
+         ring_initial_map_slots={} ring_stage_first_frame={} \
+         (실효값 -- 런처 배너가 아니라 이것을 본다)",
+        pref!(media_ring_init_max_per_frame),
+        pref!(media_wrap_init_max_per_frame),
+        pref!(media_ring_initial_map_slots),
+        pref!(media_ring_stage_first_frame),
+    );
+}
+
 /// 예산 거부를 1 초 창으로 모아 한 줄 낸다. ★거부가 있었던 창에서만 찍는다.★
 ///
 /// ## 왜 (2026-11-20, log_media_ready/03)
@@ -1027,6 +1060,7 @@ impl MediaExternalImages {
         if frame == self.wrap_init_frame {
             return;
         }
+        note_budgets_once();
         // ★프레임이 실제로 바뀔 때만 돈다.★ 지난 프레임의 거부를 창에 쌓고 1 초마다 한 줄
         // 낸다 -- 근거는 `note_deny_window` 의 doc.
         note_deny_window(
