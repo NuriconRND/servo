@@ -7949,6 +7949,7 @@ dependencies = [
  "servo-config-macro",
  "strum",
  "stylo_static_prefs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

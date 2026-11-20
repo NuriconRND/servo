@@ -50,16 +50,14 @@ pub(crate) struct TileWindow {
 /// `overlapPx`). Supporting the guard band here needs the offscreen-expansion + render-rect
 /// origin + visible-rect blit equivalent of servoshell's `gui.rs`; that's tracked as
 /// follow-up work, not done in this shell. Layouts with `overlapPx: 0` are unaffected.
+///
+/// 2026-11-18: 창 계획(`plan_tile_windows_pub`)은 호출자가 먼저 한다 -- 계획과 컨텍스트 생성 사이에
+/// NUMA 표를 만들고 렌더 스레드를 핀해야 하기 때문이다(`main.rs`, `numa.rs`).
 pub(crate) fn create_tile_windows(
-    event_loop: &winit::event_loop::ActiveEventLoop,
+    plans: Vec<TilePlan>,
     display_handle: DisplayHandle,
-    layout: &WallLayout,
-    tile_indices: &[usize],
-    spatial: &[DisplayTopology],
-    have_topology: bool,
     vsync_driver: Option<Rc<dyn servo::RefreshDriver>>,
 ) -> Vec<TileWindow> {
-    let plans = plan_tile_windows(event_loop, layout, tile_indices, spatial, have_topology);
     plans
         .into_iter()
         .map(|plan| bind_context(plan, display_handle, vsync_driver.clone()))
@@ -117,9 +115,14 @@ fn bind_context(
 /// factory 로 건너가는 것은 HWND 와 hinstance 정수, 창 크기, GPU 인덱스뿐이다 — winit
 /// `Window` 자체는 메인 스레드에 남는다(설계 §6.1). 이것이 실제로 되는지는 1 단계
 /// 스파이크가 확인했다(`log_webgpu/62`).
+///
+/// 2026-11-18: `pin_to_numa_node` 이면 factory 가 ★디바이스를 만들기 전에★ 그 스레드(WallTilePainter)를
+/// 이 타일 GPU 의 NUMA 노드에 핀한다. 그리고 핀 여부와 상관없이 이 스레드에서 만들어질 painter 에게
+/// 타일의 노드를 알린다(`servo_config::wall_numa::set_tile_hint`).
 #[cfg(target_os = "windows")]
 pub(crate) fn split_plan_for_own_thread(
     plan: TilePlan,
+    pin_to_numa_node: bool,
 ) -> (TileWindow, servo::RenderingContextFactory) {
     use std::num::NonZeroIsize;
 
@@ -141,8 +144,17 @@ pub(crate) fn split_plan_for_own_thread(
     let hinstance = win32.hinstance.map(|value| value.get());
     let size = plan.window.inner_size();
     let gpu_index = plan.gpu_index;
+    let tile_index = plan.tile_index;
 
     let factory: servo::RenderingContextFactory = Box::new(move || {
+        let numa_node = crate::numa::tile_node(tile_index);
+        if pin_to_numa_node && let Some(node) = numa_node {
+            crate::numa::pin_and_report(node, &format!("WallTilePainter (tile {tile_index})"));
+        }
+        servo_config::wall_numa::set_tile_hint(Some(servo_config::wall_numa::TileHint {
+            tile_index,
+            node: numa_node,
+        }));
         let mut win32 =
             Win32WindowHandle::new(NonZeroIsize::new(hwnd).expect("HWND must be non-zero"));
         win32.hinstance = hinstance.and_then(NonZeroIsize::new);

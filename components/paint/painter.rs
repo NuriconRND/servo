@@ -699,6 +699,13 @@ impl Painter {
             }
         }
 
+        // 2026-11-18: 이 painter 의 렌더 스레드(지금 이 스레드)가 NUMA 노드에 핀되어 있으면 -- winit_wall 이
+        // 디바이스를 만들기 전에 핀한다 -- 이 painter 의 WebRender 스레드(RenderBackend, SceneBuilder,
+        // WRWorker)도 같은 노드에 둔다. 상속에 맡기지 않는다: 핀한 마스크는 자식 스레드로 넘어가지 않고,
+        // Windows 11 에서 새 스레드의 group 이 어디서 오는지도 문서가 모호하다. 근거는
+        // `servo_config::wall_numa`.
+        let numa_node = servo_config::wall_numa::current_thread_pin();
+
         let painter_id = PainterId::next();
         let id_manager = paint.webrender_external_image_id_manager;
         let mut external_image_handlers = Box::new(WebRenderExternalImageHandlers::new(id_manager));
@@ -781,6 +788,15 @@ impl Painter {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_threads)
                 .thread_name(|idx| format!("WRWorker#{}", idx))
+                // 2026-11-18: 위 `numa_node` 주석. 일거리를 받기 전에 그 스레드 위에서 돈다.
+                .start_handler(move |index| {
+                    if let Some(node) = numa_node {
+                        servo_config::wall_numa::pin_current_thread_logged(
+                            node,
+                            &format!("WRWorker#{index}"),
+                        );
+                    }
+                })
                 .build()
                 .expect("Unable to initialize WebRender worker pool."),
         ));
@@ -953,6 +969,13 @@ impl Painter {
                 // doc 주석에 있다. `IdNamespace` 는 이 painter 의 WR 자원 이름공간이므로
                 // painter 마다 다르고, 그 변환이 이미 있다(`servo_base::id`).
                 wall_painter_slot: Some(webrender_api::IdNamespace::from(painter_id).0),
+                // 2026-11-18: 위 `numa_node` 주석. WR 스레드 이름은 painter 마다 같다(`#0`) -- 줄의 node=
+                // 와 앞서 찍힌 그 painter 의 렌더 스레드 핀 줄로 가른다.
+                wall_thread_init: numa_node.map(|node| -> Arc<dyn Fn(&str) + Send + Sync> {
+                    Arc::new(move |name: &str| {
+                        servo_config::wall_numa::pin_current_thread_logged(node, name)
+                    })
+                }),
                 // We force the use of optimized shaders here because rendering is broken
                 // on Android emulators with unoptimized shaders. This is due to a known
                 // issue in the emulator's OpenGL emulation layer.

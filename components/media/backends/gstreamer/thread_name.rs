@@ -41,11 +41,17 @@ mod imp {
     static VIDEO_THREADS: AtomicUsize = AtomicUsize::new(0);
     static AUDIO_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-    pub fn tag_video_streaming_thread() {
+    /// `round_robin_pin` (2026-11-18): false when the video has a `tile` placement
+    /// (`servo_config::wall_numa::VideoPlacement`), which places every streaming thread of the
+    /// pipeline itself -- this round-robin pin would only fight it.
+    pub fn tag_video_streaming_thread(round_robin_pin: bool) {
         let index = tag("ServoGstVideo", &VIDEO_THREADS);
         // `tag` returns usize::MAX when this thread was already tagged; pinning is a
         // once-per-thread action, so skip that case.
-        if index != usize::MAX && servo_config::pref!(media_numa_pin_streaming_threads) {
+        if round_robin_pin
+            && index != usize::MAX
+            && servo_config::pref!(media_numa_pin_streaming_threads)
+        {
             pin_to_node(index);
         }
     }
@@ -121,7 +127,7 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
-    pub fn tag_video_streaming_thread() {}
+    pub fn tag_video_streaming_thread(_round_robin_pin: bool) {}
     pub fn tag_audio_streaming_thread() {}
 }
 

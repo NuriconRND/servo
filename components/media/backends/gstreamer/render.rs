@@ -338,6 +338,21 @@ impl GStreamerRender {
         }
     }
 
+    /// 2026-11-18: 영상의 NUMA 배치(`servo_config::wall_numa::VideoPlacement`)를 D3D11 렌더에 건넨다.
+    /// 그 렌더가 매 프레임 "이 영상을 요구한 디바이스" 를 알기 때문이다. 다른 렌더나 Raw 경로에서는
+    /// 아무것도 하지 않는다 -- 그때는 ENTER 때 정한 노드에 머문다.
+    pub fn set_video_placement(
+        &self,
+        placement: Option<Arc<servo_config::wall_numa::VideoPlacement>>,
+    ) {
+        #[cfg(target_os = "windows")]
+        if let Some(render) = self.render.as_ref() {
+            render.set_video_placement(placement);
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = placement;
+    }
+
     pub fn get_frame_from_sample(&self, sample: gstreamer::Sample) -> Option<VideoFrame> {
         if let Some(render) = self.render.as_ref() {
             render.build_frame(sample)

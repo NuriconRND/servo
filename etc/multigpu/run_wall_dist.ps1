@@ -904,6 +904,39 @@ param(
     # this switch. Wall tile windows ignore WM_CLOSE, so stop such a run with
     # `Stop-Process -Name winit_wall -Force`.
     [switch] $NoLog,
+    # (2026-11-18) Run the external CPU probe, engine\wall_cpu_probe.exe, beside the engine.
+    # It is a separate, hidden process that reads everything from outside; the engine does no
+    # I/O for it. Every -CpuProbeIntervalMs it logs per-LP busy for EVERY processor group (all
+    # 80 LPs on the wall), per physical core and NUMA node, every process on the machine
+    # (protected ones too) plus DPC/ISR, and winit_wall per thread family (cycles, kernel share,
+    # context switches, thread churn). Files next to the run log, same stem:
+    #   <stem>.cpu.log  <stem>.cpu.threads.tsv  <stem>.cpu.summary.txt
+    # (stem = -LogPath without .err.log; with -NoLog a timestamped stem in this folder). The
+    # summary covers the run after an 8 s warmup, in the old thread_cpu_probe table format, so
+    # it reads next to the 2026-08/09 .threads.txt files. It ends by itself when winit_wall
+    # exits. Why: this build has had no CPU readout since the 2026-10-27/28 instrumentation
+    # strip, and on 2026-11-18 the operator saw all 80 LPs near 100% with only -NumaNode auto.
+    [switch] $CpuProbe,
+    # (2026-11-18) -CpuProbe sample period. Dev box cost (16 LPs, ~4,400 threads machine-wide):
+    # 2.3-3.4 ms and <= 0.006 cores per sample, -CpuProbePdh included.
+    [ValidateRange(100, 60000)]
+    [int]    $CpuProbeIntervalMs = 1000,
+    # (2026-11-18) -CpuProbe also logs PDH % Processor Utility / Time / Performance per LP
+    # (CPUUTIL lines), to tell which one Task Manager / Resource Monitor is showing.
+    [switch] $CpuProbePdh,
+    # (2026-11-20) Do not record the DWM state. By default every run records the current
+    # session's DWM once right before the engine starts and once after it has exited (3 s after
+    # the exit, so DWM has let go of what the engine held): pid, start time and age, handles,
+    # threads, working set, private bytes, CPU seconds, its GPU memory per adapter, and each
+    # adapter's GPU memory over all processes. Files next to the run log: <stem>.dwm.txt (both
+    # records and their difference) and dwm_history.tsv in the same folder (one line per record,
+    # appended, so runs can be compared over days). A DWM restart during the run is flagged.
+    # Read only and outside the engine: the first GPU memory query takes ~1.3 s and happens
+    # before the engine starts. A run stopped with Ctrl+C gets no post record.
+    # Why: the same 54-video command ran badly under a DWM that had been up since the 10-29 boot
+    # (20.6 days, log_numa_pins/03) and well after DWM restarted on 11-19 (04, 05). Whether
+    # DWM accumulates something across wall runs is the open question this records.
+    [switch] $NoDwmState,
     # **Stale note (recorded 2026-08-25, void after `4ff3075ca97` on 2026-08-31)** -- that env
     # var does not exist. Setting it blocks startup; this switch sends
     # `--pref gfx_video_immediate_composite_enabled=false` instead.
@@ -1147,6 +1180,11 @@ param(
     # capacity problem -- even the collapsed runs left 31 of 80 cores idle. Removing the
     # mechanism on the current board needs ***per-tile thread placement, not whole-process
     # pinning***, and that does not exist yet.
+    #
+    # (2026-11-18) It exists now, in the engine: -NoNumaRenderPin / -NumaTileNodes /
+    # -NumaPinPolicy below, and the WALLNUMA lines in the log. -NumaNode still decides the
+    # processor group of every thread the engine does NOT pin (script, layout, constellation,
+    # driver threads) and of allocations made before the pins.
     [string] $NumaNode = "auto",
     # Hard-confine the wall to its processor group, on top of the node PREFERENCE that
     # `start /NODE` gives. Off by default until measured on the wall itself.
@@ -1182,6 +1220,37 @@ param(
     # Turn the pin off (media_numa_pin_streaming_threads=false). Wins over -NumaPin if both
     # are passed -- an explicit "off" should never be silently overridden.
     [switch] $NoNumaPin,
+    # (2026-11-18) gfx_wall_numa_render_pin=false. The ENGINE pins each tile's render thread,
+    # and that painter's WebRender threads (RenderBackend, SceneBuilder, WRWorker), to the NUMA
+    # node of the tile's GPU BEFORE the device is created. winit_wall resolves the nodes at
+    # startup: adapter LUID -> D3DKMT -> PnP -> DEVPKEY_Device_Numa_Node (WALLNUMA lines).
+    # Engine default ON; a no-op on a one-node box or when no adapter reports a node. It needs
+    # one thread per GPU: every tile with -ParallelTiles, otherwise only when all tiles' GPUs
+    # share one node (the main thread renders them all). Not measured on the wall yet -- this
+    # switch is the OFF arm of that A/B.
+    [switch] $NoNumaRenderPin,
+    # (2026-11-18) gfx_wall_numa_tile_nodes: override the detected tile -> node table, by layout
+    # tile index ("0,1,0,1"; '-' or an empty field keeps the detected node). For a near/far
+    # A/B on the 2:2 board, or with -NumaFakeSplit to run the code path on a one-node box.
+    [string] $NumaTileNodes = "",
+    # (2026-11-18) gfx_wall_numa_fake_split: DIAGNOSTIC. Split every real node into N fake
+    # nodes by physical cores, so the pin code path and its readback can run on a one-node dev
+    # box. Memory locality does not change. 0 = off.
+    [ValidateRange(0, 8)]
+    [int] $NumaFakeSplit = 0,
+    # (2026-11-18) media_numa_pin_policy: where the video streaming threads go (only while the
+    # streaming-thread pin is on, i.e. not with -NoNumaPin).
+    #   tile       = the node of the tile(s) displaying the video right now (the D3D11 path's
+    #                per-frame "devices that demanded this video"), staying put while it shows
+    #                on several, and spilling to the least-loaded node once one node has
+    #                max(2, cores/4) more videos -- so an all-GPUs-on-one-node box degenerates to
+    #                today's spread (0.53 cores/video, 733085450e3). ALL streaming threads of the
+    #                pipeline are placed (bus STREAM_STATUS ENTER), because under playbin3 the
+    #                decoder is not the appsink thread.
+    #   roundrobin = the 2026-08-27 behaviour: the appsink thread only, index % nodes.
+    # Empty = engine default (tile; it falls back to roundrobin without a multi-node table).
+    [ValidateSet("", "tile", "roundrobin")]
+    [string] $NumaPinPolicy = "",
     # Extra `--pref name=value` pairs passed straight through, for knobs this launcher does
     # not wrap. WebGL2 and WebGPU are both OFF by default in this engine, so anything using a
     # canvas 3D context needs one of these:
@@ -1292,6 +1361,37 @@ if ($GpuFenceProbe -and -not $DcompCommitInFrame) {
 if ($DetachTileRender -and -not $ParallelTiles) {
     Write-Warning "-DetachTileRender without -ParallelTiles: detaching only changes behaviour when tiles render on their own threads. It will do nothing here."
 }
+# (2026-11-18) -Confine hard-confines the whole process to ONE processor group
+# (SetProcessAffinityMask after launch). The engine pins render threads and video streaming
+# threads per NUMA node, which on the wall means both groups. The two cannot both hold: the
+# affinity call fails once threads span groups, or the later pins escape it, and the run is not
+# what its command line says. The streaming-thread pin already conflicted ("must not be
+# combined", -NumaPin comment); this enforces it.
+if ($Confine -and (-not $NoNumaRenderPin -or -not $NoNumaPin)) {
+    throw "-Confine confines the whole process to one processor group, but the engine pins render threads (turn off with -NoNumaRenderPin) and video streaming threads (turn off with -NoNumaPin) per NUMA node. Pass -NoNumaRenderPin -NoNumaPin with -Confine, or drop -Confine."
+}
+if ($NumaTileNodes -ne "" -and $NumaTileNodes -notmatch '^\s*(\d+|-)?\s*(,\s*(\d+|-)?\s*)*$') {
+    throw "-NumaTileNodes must be a comma list of node numbers by layout tile index, with '-' or an empty field for 'detected' (got '$NumaTileNodes')"
+}
+if ($NumaTileNodes -ne "" -and $NoNumaRenderPin -and $NoNumaPin) {
+    Write-Warning "-NumaTileNodes with -NoNumaRenderPin -NoNumaPin: nothing is placed, so the override changes nothing."
+}
+if ($NumaPinPolicy -ne "" -and $NoNumaPin) {
+    Write-Warning "-NumaPinPolicy $NumaPinPolicy with -NoNumaPin: the streaming-thread pin is off, so the policy does nothing."
+}
+# (2026-11-18 review) Name only the threads the engine can actually place in this configuration.
+if ($NumaNode -match '^\d+$' -and (-not $NoNumaRenderPin -or -not $NoNumaPin)) {
+    $placed = @()
+    if (-not $NoNumaRenderPin) {
+        if ($ParallelTiles) { $placed += "each tile's render thread and its WebRender threads" }
+        else { $placed += "the render thread only if every tile's GPU is on one node (serial tiles; on the 2:2 wall 'WALLNUMA render pin:' says Off and the main and WebRender threads stay under /NODE $NumaNode)" }
+    }
+    if (-not $NoNumaPin) {
+        if ($NumaPinPolicy -eq 'roundrobin') { $placed += "video appsink threads (round-robin across nodes, not by tile)" }
+        else { $placed += "video streaming threads (by the tile showing the video)" }
+    }
+    Write-Warning "-NumaNode ${NumaNode}: /NODE picks the processor group of every thread the engine does not pin (and of allocations made before the pins). On a multi-node box the engine places: $($placed -join '; '). Check the WALLNUMA lines in the log."
+}
 
 # Pick exactly one pacing clock. Passing both leaves no way, even in the log, to tell
 # which one ran.
@@ -1329,6 +1429,13 @@ if ($CommitAlign -ge 0 -and $CommitAlign -le 99 -and $DcompCommitInFrame) {
 # it, and that has to be visible on the console rather than only in a phase log that never appears.
 if ($CommitAlign -ne -1 -and ($CommitAlign -lt 0 -or $CommitAlign -gt 99)) {
     Write-Warning "-CommitAlign $CommitAlign is outside 0..99, so the engine treats commit alignment as OFF. Pass a value in 0..99 to enable it, or -1 to say off deliberately."
+}
+
+# (2026-11-18) -CpuProbe options only configure the probe; alone they would look set and do nothing.
+# A pure parameter check, so it sits up here with the others: below, -Serve starts the http
+# server, and a throw after that would leave python holding the port for the next -Serve run.
+if (($CpuProbePdh -or $PSBoundParameters.ContainsKey('CpuProbeIntervalMs')) -and -not $CpuProbe) {
+    throw "-CpuProbePdh / -CpuProbeIntervalMs only configure -CpuProbe. Pass -CpuProbe too."
 }
 
 $serveRoot = Join-Path $here "pages\html"
@@ -1393,6 +1500,29 @@ if ($LogPath -ne "NUL") {
     if ($logDir -and -not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
+}
+
+# (2026-11-18) Where -CpuProbe writes: the run log's own stem, made absolute above, so the
+# .cpu.* files sit next to the .err.log they belong to. -NoLog has no log to sit next to, so
+# it gets a timestamped stem here; the probe is outside the engine, so -NoLog's promise (no
+# engine stderr I/O) still holds.
+# (2026-11-20) The same stem also names the DWM state record (<stem>.dwm.txt), so it is
+# computed once for both.
+$runStem = ""
+if ($NoLog) {
+    $runStem = Join-Path $here ("wall_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+} elseif ($LogPath -match '\.err\.log$') {
+    $runStem = $LogPath -replace '\.err\.log$', ''
+} else {
+    $runStem = Join-Path (Split-Path -Parent $LogPath) ([IO.Path]::GetFileNameWithoutExtension($LogPath))
+}
+$cpuStem = ""
+if ($CpuProbe) { $cpuStem = $runStem }
+$dwmFile = ""
+$dwmHistory = ""
+if (-not $NoDwmState) {
+    $dwmFile = "$runStem.dwm.txt"
+    $dwmHistory = Join-Path (Split-Path -Parent $runStem) "dwm_history.tsv"
 }
 
 # Old env knobs block startup in this build (servo_config::removed_env). Clear any that
@@ -1533,6 +1663,11 @@ if ($SinkPacing -ne "")   { $argList += @("--pref", "media_video_sink_pacing=$Si
 if ($NoAudio)             { $argList += @("--pref", "media_audio_enabled=false") }
 if ($NoNumaPin)           { $argList += @("--pref", "media_numa_pin_streaming_threads=false") }
 elseif ($NumaPin)         { $argList += @("--pref", "media_numa_pin_streaming_threads=true") }
+# (2026-11-18) Sent only when given, so this launcher still runs an engine without these prefs.
+if ($NoNumaRenderPin)     { $argList += @("--pref", "gfx_wall_numa_render_pin=false") }
+if ($NumaTileNodes -ne "") { $argList += @("--pref", "gfx_wall_numa_tile_nodes=$NumaTileNodes") }
+if ($NumaFakeSplit -gt 0) { $argList += @("--pref", "gfx_wall_numa_fake_split=$NumaFakeSplit") }
+if ($NumaPinPolicy -ne "") { $argList += @("--pref", "media_numa_pin_policy=$NumaPinPolicy") }
 if ($PipelineMode -ne "") { $argList += @("--pref", "media_pipeline_mode=$PipelineMode") }
 if ($MaxPending -gt 0)    { $argList += @("--pref", "gfx_wall_frame_max_pending=$MaxPending") }
 if ($ParallelTiles)       { $argList += @("--pref", "gfx_wall_parallel_tiles=true") }
@@ -1554,7 +1689,7 @@ if (Test-Path $buildStamp) {
     Write-Warning "BUILD.txt missing -- this dist was not produced by make_wall_dist.ps1, or the copy was incomplete. Cannot tell which build is running."
 }
 Write-Host "  dcomp=$DComp dcomp_flush=$(if($DcompAlwaysFlush){'always'}else{'conditional (default)'}) dcomp_commit=$(if($DcompCommitInFrame){'in end_frame'}else{'deferred to next tick head (default)'}) webgl_swap_sync=$WebglSwapSync webgl_stage_copy=$($WebglStageCopy.IsPresent) dcomp_parallel_commit=$(if(-not $DcompParallelCommit){'off'}elseif($ParallelCommitWaitAll){'wait-all'}else{'per-device'}) update_quantum=$(if($DcompUpdateQuantum -eq 0){'off'}elseif($DcompUpdateQuantum -eq -1){'whole tile'}else{"${DcompUpdateQuantum}px"}) full_tile_updates=$($DcompFullTileUpdates.IsPresent) opaque_full_tile=$(if($DcompOpaqueFullTile -eq 'noclear'){'noclear (default)'}else{$DcompOpaqueFullTile}) rotate_tiles=$($RotateTileOrder.IsPresent) tile_size=$TileSize hud=$(if($ProfilerHud -eq ''){'off'}else{$ProfilerHud}) mesh_probe=$($MeshProbe.IsPresent) rt_probe=$($RenderTargetProbe.IsPresent) rt_reuse=$(if($NoRenderTargetReuse){'off'}else{'on (default)'}) rt_keep=$RenderTargetKeepFrames tex_probe=$($TextureCacheProbe.IsPresent) event_probe=$($EventProbe.IsPresent) span_probe=$($SpanProbe.IsPresent) gpu_time_probe=$($GpuTimeProbe.IsPresent) gpu_fence_probe=$($GpuFenceProbe.IsPresent) tiling=$ImageTilingThreshold tex_budget=${TextureCacheBudgetMB}MB refresh=${RefreshHz}Hz vsync=$($Vsync.IsPresent) vsync_phase=$VsyncPhase present_sync=$PresentSync dwm_align=$DwmAlign commit_align=$CommitAlign sample_lead=$SampleLead direct_render=$($DirectRender.IsPresent) pacing_thread=$($PacingThread.IsPresent) pacing_clock=$(if(-not $PacingThread.IsPresent){'n/a'}elseif($PacingDwmQuery){'dwmquery'}elseif($PacingCompositorClock){'compositor'}else{'vblank'}) pacing_output=$(if($PacingOutput -eq ''){'primary (default)'}else{$PacingOutput}) tick_phase=$($TickPhase.IsPresent) single_publish=$(if($NoSinglePublishPerPass){'off'}else{'on (default)'}) arm_on_canvas_wait=$(if($NoArmOnCanvasWait){'off'}else{'on (default)'}) canvas_defeats_throttle=$($CanvasDefeatsThrottle.IsPresent) canvas_live_window=${CanvasLiveWindowMs}ms live_canvas_divisor=$LiveCanvasDivisor canvas_wait_decline=$(if($CanvasWaitDecline){'on'}else{'off (default)'}) scissor_from_wr=$($WebglTileScissorFromWebrender.IsPresent) scissor_clear=$($WebglTileScissorClear.IsPresent) deferred_front=$($WebglDeferredFrontBuffer.IsPresent) scissor_hold=$((-not $NoScissorHoldWhenStatic.IsPresent)) scissor_from_geom=$($WebglTileScissorFromTileGeometry.IsPresent) anim_zero_snap=$($AnimationZeroSnap.IsPresent) busy_single_shard=$($WebglBusyMapSingleShard.IsPresent) glerr_every=$GlErrorCheckEvery hud_every=$HudDrawEvery ack_deadline=$CanvasAckDeadlineMs media_ready_frames=$MediaReadyFollowsFrames scissor_lead=$CanvasScissorLead frame_barrier=$(if($NoFrameBarrier){'off'}else{'on (default)'}) tile_render=$(if($DetachTileRender){'detached'}else{'joined (default)'}) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape}) escape_buffers=$(if($VideoEscapeBuffers -eq 0){'default(2)'}else{$VideoEscapeBuffers})"
-Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
+Write-Host "  sync_group=$(if($SyncGroup -le 0){'off'}else{$SyncGroup}) decoder_threads=$DecoderThreads sink_qos=$(if($SinkQos -eq ''){'policy'}else{$SinkQos}) sink_policy=$(if($SinkPolicy -eq ''){'default'}else{$SinkPolicy}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) numa_pin=$(if($NoNumaPin){'off'}else{'on(default)'}) numa_pin_policy=$(if($NoNumaPin){'n/a'}elseif($NumaPinPolicy -eq ''){'tile(default)'}else{$NumaPinPolicy}) numa_render_pin=$(if($NoNumaRenderPin){'off'}else{'on(default)'}) numa_tile_nodes=$(if($NumaTileNodes -eq ''){'auto'}else{$NumaTileNodes}) numa_fake_split=$NumaFakeSplit audio=$(if($NoAudio){'off'}else{'on'}) pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode})"
 Write-Host "  immediate_composite=$(if($NoImmediateComposite){'OFF ENTIRELY (A/B arm)'}else{'coalesced (default)'})"
 # Record it in the transcript. A run that trusted every certificate should say so in
 # its own log, not only in the command someone typed.
@@ -1562,6 +1697,11 @@ if ($IgnoreCertErrors) { Write-Host "  ignore_certificate_errors=ON (all TLS err
 Write-Host "  page_features=$(if($PageFeatures){'ON (rtsp/containers/images/webrtc/screen-capture/webgpu)'}else{'off -- rtsp:// video will NOT play'}) devtools=$(if($Devtools -eq ''){'off'}else{$Devtools})"
 Write-Host "  RUST_LOG=$env:RUST_LOG"
 Write-Host "  log=$(if($NoLog){'off (-NoLog)'}else{$LogPath})"
+# (2026-11-18) So console.txt alone says whether a set of .cpu.* files belongs to this run.
+# "requested", not "on": the probe starts only once the engine runs, and whether it did is the
+# "cpu_probe   :" line printed then (or a warning).
+$cpuProbeBanner = if (-not $CpuProbe) { "off" } else { "requested (every $CpuProbeIntervalMs ms, pdh=$($CpuProbePdh.IsPresent), warmup 8 s) -> $cpuStem.cpu.log / .cpu.threads.tsv / .cpu.summary.txt" }
+Write-Host "  cpu_probe=$cpuProbeBanner"
 
 # ***The two flags that decide whether a video grid is CPU-bound.*** Both default OFF, both
 # have measured cores/video attached to them above, and together they are the difference
@@ -1605,6 +1745,155 @@ if ($NumaNode -eq "auto") {
     $numaResolved = [int]$NumaNode
 } else {
     throw "-NumaNode must be 'auto', 'off', or a node number (got '$NumaNode')"
+}
+
+# (2026-11-20) DWM state record (-NoDwmState turns it off). Everything here reads system state
+# from outside the engine and runs only before the launch and after the exit.
+function ConvertTo-LuidKey([string] $Name) {
+    # 'pid_1876_luid_0x00000000_0x0002E396_phys_0' -> '00000000:0002e396', the engine's format
+    # ("tile N: display ... luid 00000000:0002e396").
+    $m = [regex]::Match($Name, 'luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+)')
+    if (-not $m.Success) { return $Name }
+    return ('{0:x8}:{1:x8}' -f [Convert]::ToUInt32($m.Groups[1].Value, 16), [Convert]::ToUInt32($m.Groups[2].Value, 16))
+}
+function ConvertTo-GpuMemRows($Rows) {
+    return @($Rows | Sort-Object Name | ForEach-Object {
+        [pscustomobject]@{
+            Luid  = (ConvertTo-LuidKey $_.Name)
+            DedMB = [Math]::Round($_.DedicatedUsage / 1MB, 1)
+            ShMB  = [Math]::Round($_.SharedUsage / 1MB, 1)
+            ComMB = [Math]::Round($_.TotalCommitted / 1MB, 1)
+        }
+    })
+}
+function Get-DwmState {
+    # The DWM of THIS session (an RDP session would have its own).
+    $session = (Get-Process -Id $PID).SessionId
+    $st = [ordered]@{ Utc = (Get-Date).ToUniversalTime(); Boot = $null; DwmPid = 0; Start = $null;
+        Handles = 0; Threads = 0; WsMB = 0.0; PrivMB = 0.0; CpuSec = 0.0; Gpu = @(); Adapters = @(); Note = '' }
+    try { $st.Boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime() } catch { }
+    $d = Get-Process dwm -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session } | Select-Object -First 1
+    if ($null -eq $d) { $st.Note = 'no dwm.exe in this session'; return [pscustomobject]$st }
+    $st.DwmPid = $d.Id
+    try { $st.Start = $d.StartTime.ToUniversalTime() } catch { }
+    $st.Handles = $d.HandleCount
+    $st.Threads = $d.Threads.Count
+    $st.WsMB = [Math]::Round($d.WorkingSet64 / 1MB, 1)
+    $st.PrivMB = [Math]::Round($d.PrivateMemorySize64 / 1MB, 1)
+    try { $st.CpuSec = [Math]::Round($d.TotalProcessorTime.TotalSeconds, 1) } catch { }
+    try {
+        $pfx = 'pid_' + $d.Id + '_'
+        $st.Gpu = ConvertTo-GpuMemRows (Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory -ErrorAction Stop |
+            Where-Object { $_.Name -like ($pfx + '*') })
+        $st.Adapters = ConvertTo-GpuMemRows (Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory -ErrorAction Stop)
+    } catch {
+        $st.Note = 'GPU memory counters unavailable: ' + $_.Exception.Message
+    }
+    return [pscustomobject]$st
+}
+function Format-UtcStamp($T) {
+    if ($null -eq $T) { return '?' }
+    return $T.ToString('yyyy-MM-dd HH:mm:ss') + 'Z'
+}
+function Get-TileLabel([hashtable] $Tiles, [string] $Luid) {
+    if ($Tiles -and $Tiles.ContainsKey($Luid)) { return $Tiles[$Luid] }
+    return ''
+}
+function Get-DwmSummary($S) {
+    if ($S.DwmPid -eq 0) { return $S.Note }
+    $age = '?'
+    if ($S.Start) { $age = ('{0:0.00} d' -f ($S.Utc - $S.Start).TotalDays) }
+    $ded = [double](($S.Gpu | Measure-Object -Property DedMB -Sum).Sum)
+    return ("pid {0}, started {1} (age {2}, boot {3}), handles {4}, private {5} MB, GPU dedicated {6} MB on {7} adapter(s)" -f
+        $S.DwmPid, (Format-UtcStamp $S.Start), $age, (Format-UtcStamp $S.Boot), $S.Handles, $S.PrivMB, $ded, @($S.Gpu).Count)
+}
+function Format-DwmState($S, [string] $Tag, [hashtable] $Tiles) {
+    $out = @()
+    $out += "===== dwm_state $Tag utc=$(Format-UtcStamp $S.Utc) boot=$(Format-UtcStamp $S.Boot)"
+    if ($S.DwmPid -eq 0) { $out += "  $($S.Note)"; return $out }
+    $age = '?'
+    if ($S.Start) { $age = ('{0:0.00}d' -f ($S.Utc - $S.Start).TotalDays) }
+    $out += ("  dwm pid={0} start={1} age={2} handles={3} threads={4} ws={5}MB priv={6}MB cpu={7}s" -f
+        $S.DwmPid, (Format-UtcStamp $S.Start), $age, $S.Handles, $S.Threads, $S.WsMB, $S.PrivMB, $S.CpuSec)
+    foreach ($g in $S.Gpu) {
+        $out += ("  dwm gpu  {0} {1,-6} dedicated={2}MB shared={3}MB committed={4}MB" -f $g.Luid, (Get-TileLabel $Tiles $g.Luid), $g.DedMB, $g.ShMB, $g.ComMB)
+    }
+    foreach ($a in $S.Adapters) {
+        $out += ("  adapter  {0} {1,-6} dedicated={2}MB shared={3}MB committed={4}MB (all processes)" -f $a.Luid, (Get-TileLabel $Tiles $a.Luid), $a.DedMB, $a.ShMB, $a.ComMB)
+    }
+    if ($S.Note) { $out += "  note: $($S.Note)" }
+    return $out
+}
+function Format-DwmDelta($Pre, $Post, [hashtable] $Tiles) {
+    $out = @()
+    if ($Pre.DwmPid -eq 0 -or $Post.DwmPid -eq 0) {
+        $out += '----- delta: not available (a record found no dwm.exe)'
+        return $out
+    }
+    if ($Pre.DwmPid -ne $Post.DwmPid) {
+        $out += ("----- DWM RESTARTED during this run: pid {0} -> {1} (new one started {2}). The records are different processes, so there is no delta." -f
+            $Pre.DwmPid, $Post.DwmPid, (Format-UtcStamp $Post.Start))
+        return $out
+    }
+    $out += ("----- delta post-pre, same dwm pid {0}: handles {1:+0;-0;0} threads {2:+0;-0;0} ws {3:+0.0;-0.0;0}MB priv {4:+0.0;-0.0;0}MB cpu {5:+0.0;-0.0;0}s" -f
+        $Post.DwmPid, ($Post.Handles - $Pre.Handles), ($Post.Threads - $Pre.Threads), ($Post.WsMB - $Pre.WsMB), ($Post.PrivMB - $Pre.PrivMB), ($Post.CpuSec - $Pre.CpuSec))
+    foreach ($pair in @(@('dwm gpu', $Pre.Gpu, $Post.Gpu), @('adapter', $Pre.Adapters, $Post.Adapters))) {
+        $keys = @(@($pair[1]) + @($pair[2]) | ForEach-Object { $_.Luid } | Sort-Object -Unique)
+        foreach ($k in $keys) {
+            $a = @($pair[1]) | Where-Object { $_.Luid -eq $k } | Select-Object -First 1
+            $b = @($pair[2]) | Where-Object { $_.Luid -eq $k } | Select-Object -First 1
+            $ad = 0.0; $as = 0.0; $bd = 0.0; $bs = 0.0
+            if ($a) { $ad = $a.DedMB; $as = $a.ShMB }
+            if ($b) { $bd = $b.DedMB; $bs = $b.ShMB }
+            $out += ("  {0,-8} {1} {2,-6} dedicated {3:+0.0;-0.0;0}MB shared {4:+0.0;-0.0;0}MB" -f $pair[0], $k, (Get-TileLabel $Tiles $k), ($bd - $ad), ($bs - $as))
+        }
+    }
+    return $out
+}
+function ConvertTo-DwmTsv($S, [string] $Tag, [string] $Run) {
+    $ageH = ''
+    if ($S.Start) { $ageH = ('{0:0.00}' -f ($S.Utc - $S.Start).TotalHours) }
+    $ded = [double](($S.Gpu | Measure-Object -Property DedMB -Sum).Sum)
+    $sh = [double](($S.Gpu | Measure-Object -Property ShMB -Sum).Sum)
+    $byAd = (@($S.Gpu) | ForEach-Object { $_.Luid + '=' + $_.DedMB }) -join ';'
+    $adAll = (@($S.Adapters) | ForEach-Object { $_.Luid + '=' + $_.DedMB }) -join ';'
+    return (@((Format-UtcStamp $S.Utc), $Run, $Tag, $S.DwmPid, (Format-UtcStamp $S.Start), $ageH, (Format-UtcStamp $S.Boot),
+        $S.Handles, $S.Threads, $S.WsMB, $S.PrivMB, $S.CpuSec, $ded, $sh, $byAd, $adAll, $S.Note) -join "`t")
+}
+$dwmTsvHeader = (@('utc', 'run', 'tag', 'dwm_pid', 'dwm_start_utc', 'dwm_age_h', 'boot_utc', 'handles', 'threads', 'ws_mb',
+    'priv_mb', 'cpu_s', 'dwm_gpu_dedicated_mb', 'dwm_gpu_shared_mb', 'dwm_gpu_dedicated_mb_by_adapter',
+    'adapter_dedicated_mb_all_processes', 'note') -join "`t")
+function Write-DwmStatePre([string] $File, [string] $History, [string] $Run) {
+    $s = Get-DwmState
+    Format-DwmState $s 'pre (right before the engine starts)' @{} | Out-File -LiteralPath $File -Encoding utf8
+    if (-not (Test-Path -LiteralPath $History)) { $dwmTsvHeader | Out-File -LiteralPath $History -Encoding utf8 }
+    ConvertTo-DwmTsv $s 'pre' $Run | Out-File -LiteralPath $History -Encoding utf8 -Append
+    return $s
+}
+function Write-DwmStatePost($Pre, [string] $File, [string] $History, [string] $Run, [string] $EngineLog) {
+    # Tile names for the adapters, from the engine's own "tile N: display ... luid" lines.
+    $tiles = @{}
+    if ($EngineLog -ne '' -and $EngineLog -ne 'NUL' -and (Test-Path -LiteralPath $EngineLog)) {
+        Select-String -LiteralPath $EngineLog -Pattern '^tile (\d+): display .* luid ([0-9a-f]{8}:[0-9a-f]{8})' |
+            Select-Object -First 16 | ForEach-Object { $tiles[$_.Matches[0].Groups[2].Value.ToLower()] = 'tile' + $_.Matches[0].Groups[1].Value }
+    }
+    $s = Get-DwmState
+    $delta = Format-DwmDelta $Pre $s $tiles
+    (@(Format-DwmState $s 'post (3 s after the engine exited)' $tiles) + $delta) | Out-File -LiteralPath $File -Encoding utf8 -Append
+    ConvertTo-DwmTsv $s 'post' $Run | Out-File -LiteralPath $History -Encoding utf8 -Append
+    return @($s, $delta)
+}
+$dwmPre = $null
+if ($NoDwmState) {
+    Write-Host "  dwm_state   : off (-NoDwmState)"
+} else {
+    try {
+        $dwmPre = Write-DwmStatePre $dwmFile $dwmHistory (Split-Path -Leaf $runStem)
+        Write-Host "  dwm_state   : $(Get-DwmSummary $dwmPre) -> $dwmFile"
+    } catch {
+        $dwmPre = $null
+        Write-Warning "DWM state record (before the run) failed: $($_.Exception.Message). The run goes on without it."
+    }
 }
 
 # ***Always launch through the cmd wrapper, pin or no pin.*** The reason is stderr, not
@@ -1652,6 +1941,77 @@ for ($i = 0; $i -lt 100 -and $null -eq $proc; $i++) {
 }
 if ($null -eq $proc) { throw "winit_wall did not start within 10s under the cmd wrapper ($cmdFile)" }
 
+# (2026-11-18) -CpuProbe starts the moment the engine PID is known and before -Confine, so its
+# baseline predates any pinning. Hidden, its own process, its own files, no /NODE and no pipe.
+# It ends by itself when winit_wall exits (its wait between samples is a wait on the engine's
+# process handle) -- the force-kill below and a Ctrl+C on an unlimited run included; after a
+# Ctrl+C this script prints nothing more, but the probe still writes its summary.
+$cpuProbeProc = $null
+# (2026-11-18) What became of the probe, for the end-of-run text: "missing" (no exe), "nostart"
+# (Start-Process threw), "early" (exited within 1.5 s: a startup refusal), "running".
+$cpuProbeState = ""
+$cpuProbeStart = $null
+$cpuSummary = "$cpuStem.cpu.summary.txt"
+$cpuLog = "$cpuStem.cpu.log"
+# (2026-11-18) Why the probe stopped, from its own log: its CPUERROR line(s), or the fact that it
+# never got as far as creating the log (it exits before that when it cannot create its files).
+function Write-CpuProbeError([string] $LogFile) {
+    if (!(Test-Path -LiteralPath $LogFile)) {
+        Write-Warning "  wall_cpu_probe wrote no $LogFile at all: it could not create its files (folder missing or not writable?)."
+        return
+    }
+    $cpuErr = @(Select-String -LiteralPath $LogFile -Pattern '^CPUERROR ' | ForEach-Object { $_.Line })
+    if ($cpuErr.Count -gt 0) {
+        $cpuErr | ForEach-Object { Write-Warning "  $_" }
+    } else {
+        Write-Warning "  $LogFile has no CPUERROR line (killed from outside, or it crashed)."
+    }
+}
+if ($CpuProbe) {
+    $cpuProbeExe = Join-Path $engine "wall_cpu_probe.exe"
+    if (!(Test-Path $cpuProbeExe)) {
+        $cpuProbeState = "missing"
+        Write-Warning "-CpuProbe: $cpuProbeExe not found (a dist packaged before the probe existed, or its build failed in make_wall_dist.ps1). Running WITHOUT the CPU probe."
+    } else {
+        $buildCommit = "?"
+        if (Test-Path $buildStamp) {
+            $commitMatch = Select-String -Path $buildStamp -Pattern 'commit\s*:\s*(\S+)' | Select-Object -First 1
+            if ($commitMatch) { $buildCommit = $commitMatch.Matches[0].Groups[1].Value }
+        }
+        # The banner essentials, so the summary alone says what was measured.
+        $cpuNote = "build=$buildCommit layout=$Layout tiles=$tiles url=$Url dcomp=$DComp parallel_tiles=$($ParallelTiles.IsPresent) " +
+            "pipeline=$(if($PipelineMode -eq ''){'playbin3'}else{$PipelineMode}) sink_pacing=$(if($SinkPacing -eq ''){'clock'}else{$SinkPacing}) " +
+            "decoder_threads=$DecoderThreads numa_node=$NumaNode numa_pin=$(if($NoNumaPin){'off'}else{'on'}) " +
+            "numa_render_pin=$(if($NoNumaRenderPin){'off'}else{'on'}) confine=$($Confine.IsPresent) escape=$(if($VideoEscape -eq ''){'off'}else{$VideoEscape})"
+        # ONE quoted argument string, not an array: Start-Process on PowerShell 5.1 joins an
+        # array with spaces WITHOUT quoting, so a path or note containing a space would split.
+        # The note loses double quotes and trailing backslashes (either would end the quoting).
+        $cpuNote = ($cpuNote -replace '"', "'") -replace '\\+$', ''
+        $cpuArgs = "--pid $($proc.Id) --out `"$cpuStem`" --interval-ms $CpuProbeIntervalMs --warmup-sec 8"
+        if ($CpuProbePdh) { $cpuArgs += " --pdh" }
+        $cpuArgs += " --note `"$cpuNote`""
+        # (2026-11-18) An earlier run's summary under the same stem would be printed as this
+        # run's if this probe died before writing one. The probe deletes it too, first thing,
+        # but only if it gets to run at all.
+        if (Test-Path -LiteralPath $cpuSummary) {
+            try {
+                Remove-Item -LiteralPath $cpuSummary -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "-CpuProbe: cannot delete the previous $cpuSummary ($($_.Exception.Message)); it will not be shown as this run's."
+            }
+        }
+        try {
+            $cpuProbeStart = Get-Date
+            $cpuProbeProc = Start-Process -FilePath $cpuProbeExe -ArgumentList $cpuArgs -WindowStyle Hidden -PassThru
+            # PS 5.1: without touching .Handle now, ExitCode can read empty once it has exited.
+            $null = $cpuProbeProc.Handle
+        } catch {
+            $cpuProbeState = "nostart"
+            Write-Warning "-CpuProbe could not start ${cpuProbeExe}: $($_.Exception.Message). Running WITHOUT the CPU probe."
+        }
+    }
+}
+
 # Hard confinement, applied after launch and then read back. ***Never report a run as pinned
 # without asking the OS whether it actually is.*** The measurement tool spent three rounds on a
 # `start /AFFINITY` that was refused in silence, producing unpinned numbers that looked like
@@ -1676,8 +2036,32 @@ if ($Confine) {
     }
 }
 
+# (2026-11-18) The probe's startup refusals (layout self-check, identical per-group LP times,
+# CreateTime mismatch, cannot open the engine, cannot create its files) all exit within ~0.1 s.
+# Say so NOW, not after a long run that turns out to carry no CPU data. (Review) This check sits
+# AFTER -Confine and its wait is taken out of the -DurationSec sleep below, so a -CpuProbe run
+# confines and lasts exactly like the same command without it. And if the ENGINE is what died,
+# say that -- the probe ends with its target, which is not the probe's failure.
+$cpuProbeWaitSec = 0.0
+if ($cpuProbeProc) {
+    $cpuWaitStart = Get-Date
+    $cpuProbeExited = $cpuProbeProc.WaitForExit(1500)
+    $cpuProbeWaitSec = ((Get-Date) - $cpuWaitStart).TotalSeconds
+    if ($cpuProbeExited -and $proc.HasExited) {
+        $cpuProbeState = "engine-exited"
+        Write-Warning "winit_wall exited within $([int]($cpuProbeWaitSec * 1000)) ms of the CPU probe starting, and the probe ended with it (exit code $($cpuProbeProc.ExitCode)). Look at the engine log, not the probe."
+    } elseif ($cpuProbeExited) {
+        $cpuProbeState = "early"
+        Write-Warning "-CpuProbe: wall_cpu_probe exited at startup (exit code $($cpuProbeProc.ExitCode)). This run has NO CPU data:"
+        Write-CpuProbeError $cpuLog
+    } else {
+        $cpuProbeState = "running"
+        Write-Host "  cpu_probe   : running, pid $($cpuProbeProc.Id) watching winit_wall pid $($proc.Id) -> $cpuStem.cpu.*"
+    }
+}
+
 if ($DurationSec -gt 0) {
-    Start-Sleep -Seconds $DurationSec
+    Start-Sleep -Milliseconds ([int][Math]::Max(0, $DurationSec * 1000 - $cpuProbeWaitSec * 1000))
     # Wall tile windows ignore WM_CLOSE. env_logger writes stderr unbuffered, so a
     # force-kill does not lose log output.
     if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force }
@@ -1685,6 +2069,56 @@ if ($DurationSec -gt 0) {
 } else {
     Write-Host "Running. To stop: Ctrl+C then  Stop-Process -Name winit_wall -Force"
     Wait-Process -Id $proc.Id
+}
+
+# (2026-11-18) The probe has already seen the engine exit. Give it up to 5 s to write its
+# summary, then say where it is and print the machine and target lines. The 5 s start once the
+# engine is really gone: after the -DurationSec force-kill its teardown can outlast the 2 s
+# sleep above, and the probe only finishes after that. Only a summary written by THIS probe
+# (newer than its start) is shown, and the warning says what actually happened.
+if ($cpuProbeProc) {
+    try { $null = $proc.WaitForExit(15000) } catch { }
+    $cpuKilled = $false
+    if (-not $cpuProbeProc.WaitForExit(5000)) {
+        $cpuKilled = $true
+        Write-Warning "wall_cpu_probe (pid $($cpuProbeProc.Id)) was still running 5 s after the engine exited; stopping it."
+        Stop-Process -Id $cpuProbeProc.Id -Force -ErrorAction SilentlyContinue
+    }
+    $cpuSummaryFresh = (Test-Path -LiteralPath $cpuSummary) -and
+        ((Get-Item -LiteralPath $cpuSummary).LastWriteTime -ge $cpuProbeStart)
+    if ($cpuSummaryFresh) {
+        Write-Host "--- CPU probe summary: $cpuSummary"
+        Select-String -LiteralPath $cpuSummary -Pattern 'TOTAL \(sum of threads\)|process total|ALL PROCESSES, ALL GROUPS|per-LP busy, all groups|NO STEADY-STATE SAMPLES' |
+            ForEach-Object { Write-Host $_.Line }
+    } elseif ($cpuProbeState -eq "early") {
+        Write-Warning "-CpuProbe: no CPU summary for this run; the probe exited at startup (see the warning when it started)."
+    } elseif ($cpuProbeState -eq "engine-exited") {
+        Write-Warning "-CpuProbe: no CPU summary worth reading; winit_wall exited right after launch (see the warning above)."
+    } elseif ($cpuKilled) {
+        Write-Warning "-CpuProbe: no CPU summary for this run; the probe had not finished 5 s after the engine exited and was stopped before writing one. Its per-interval lines up to then are in $cpuLog."
+    } else {
+        Write-Warning "-CpuProbe: wall_cpu_probe exited (exit code $($cpuProbeProc.ExitCode)) without writing $cpuSummary."
+        Write-CpuProbeError $cpuLog
+    }
+}
+
+# (2026-11-20) DWM state after the run: wait until the engine is really gone (after the
+# -DurationSec force-kill its teardown can outlast the 2 s sleep), give DWM 3 s to release what
+# the engine held, then record and print the difference.
+if ($dwmPre) {
+    try {
+        try { $null = $proc.WaitForExit(15000) } catch { }
+        Start-Sleep -Seconds 3
+        $dwmPostResult = Write-DwmStatePost $dwmPre $dwmFile $dwmHistory (Split-Path -Leaf $runStem) $LogPath
+        Write-Host "--- DWM state: $dwmFile  (history: $dwmHistory)"
+        Write-Host "  after : $(Get-DwmSummary $dwmPostResult[0])"
+        $dwmPostResult[1] | ForEach-Object { Write-Host $_ }
+        if ($dwmPostResult[0].DwmPid -ne 0 -and $dwmPostResult[0].DwmPid -ne $dwmPre.DwmPid) {
+            Write-Warning "DWM restarted during this run (pid $($dwmPre.DwmPid) -> $($dwmPostResult[0].DwmPid)). The Application log (provider Dwminit) says why; the wall output went black while it did."
+        }
+    } catch {
+        Write-Warning "DWM state record (after the run) failed: $($_.Exception.Message)."
+    }
 }
 
 # The engine is done, so the server has nothing left to answer. Kill it rather than leaving a

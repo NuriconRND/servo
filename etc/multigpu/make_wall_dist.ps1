@@ -118,6 +118,25 @@ foreach ($n in @('libGLESv2.dll', 'libEGL.dll')) {
     if (Test-Path $src) { Copy-Item $src (Join-Path $engine $n) -Force }
 }
 
+# --- 2b. wall_cpu_probe: the external CPU probe that run_wall_dist.ps1 -CpuProbe starts ---
+# (2026-11-18) Its own tiny crate (windows-sys only) with its own target dir and Cargo.lock,
+# built here rather than assumed present -- the arrangement the deleted thread_cpu_probe had
+# (section 2b before a5a9dd81cb0). Built every time: cargo is a no-op when nothing changed,
+# and a stale probe would write an older log format. A failed build only WARNS: the dist is
+# still a good dist, and run_wall_dist.ps1 -CpuProbe warns and runs without the probe.
+# cargo runs under `cmd /c ... 2>&1` so its stderr progress never reaches PowerShell 5.1 as
+# NativeCommandError records, which "Stop" would turn into a failed packaging.
+$cpuProbeManifest = Join-Path $repo "etc\multigpu\tools\wall_cpu_probe\Cargo.toml"
+$cpuProbeExe = Join-Path $repo "etc\multigpu\tools\wall_cpu_probe\target\release\wall_cpu_probe.exe"
+Write-Host "Building wall_cpu_probe..."
+cmd /c "cargo build --release --locked --manifest-path `"$cpuProbeManifest`" 2>&1"
+$cpuProbeBuildExit = $LASTEXITCODE
+if ($cpuProbeBuildExit -eq 0 -and (Test-Path $cpuProbeExe)) {
+    Copy-Item $cpuProbeExe $engine -Force
+} else {
+    Write-Warning "wall_cpu_probe.exe was NOT built (cargo exit $cpuProbeBuildExit) and is not in this dist -- run_wall_dist.ps1 -CpuProbe will warn and run without it."
+}
+
 # --- 3. config\ : wall layouts ---
 $cfg = Join-Path $Out "config"
 New-Item -ItemType Directory -Path $cfg -Force | Out-Null

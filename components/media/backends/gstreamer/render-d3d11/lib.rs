@@ -76,6 +76,10 @@ mod render_d3d11 {
         warned_no_device: bool,
         /// gst 버퍼 map 실패 경고 1회 래치(파이프라인당) — 로그 폭주 방지.
         warned_map_fail: bool,
+        /// 2026-11-18: 영상의 NUMA 배치(`media_numa_pin_policy=tile`). `None` 이면 하지 않는다.
+        placement: Option<Arc<servo_config::wall_numa::VideoPlacement>>,
+        /// 마지막으로 배치에 알린 요구 디바이스(정렬). 이것이 바뀔 때만 노드를 다시 고른다.
+        placed_devices: Vec<usize>,
     }
 
     pub struct RenderD3D11 {
@@ -103,8 +107,23 @@ mod render_d3d11 {
                     ring_never_consumed: true,
                     warned_no_device: false,
                     warned_map_fail: false,
+                    placement: None,
+                    placed_devices: Vec::new(),
                 }),
             })
+        }
+
+        /// 2026-11-18: 영상의 NUMA 배치를 받는다(`GStreamerRender::set_video_placement`).
+        pub fn set_video_placement(
+            &self,
+            placement: Option<Arc<servo_config::wall_numa::VideoPlacement>>,
+        ) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            state.placement = placement;
+            state.placed_devices.clear();
         }
 
         /// 현재 caps 에 맞는 **그룹**을 보장한다(필요 시 (재)생성). 그룹은
@@ -221,6 +240,19 @@ mod render_d3d11 {
             // 대상이 된다 — 이것이 "타일에 보이는 것만 그 GPU 로" 의 실체다.
             D3d11PlaneRings::expire_stale_demand(group_id, RING_DEMAND_TTL);
             let target_devices = D3d11PlaneRings::demanded_devices(group_id, RING_DEMAND_TTL);
+            // 2026-11-18: ★스트리밍 스레드가 이 영상을 그리는 타일의 노드를 따른다.★ 요구 디바이스
+            // 집합이 바뀔 때만 노드를 다시 고르고(정렬해 비교, 최대 4 개), 바뀌면 그 파이프라인의
+            // 스트리밍 스레드를 모두 옮긴다. 매 프레임 하는 일은 이 비교와 스레드 로컬 읽기 하나다.
+            // 규칙은 `servo_config::wall_numa::choose_video_node`.
+            if let Some(placement) = state.placement.clone() {
+                let mut devices = target_devices.clone();
+                devices.sort_unstable();
+                if devices != state.placed_devices {
+                    placement.on_devices_changed(&devices);
+                    state.placed_devices = devices;
+                }
+                placement.follow_current_thread();
+            }
             if target_devices.is_empty() {
                 // 아직 아무 타일도 이 영상을 합성하지 않았다(렌더러 준비 전이거나
                 // 화면 밖). 업로드는 건너뛰되 프레임은 정상 반환해야 한다 — 여기서

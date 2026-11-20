@@ -773,6 +773,20 @@ impl MediaExternalImages {
                 note_media_d3d11_device(device, requested_gpu);
                 D3d11PlaneRings::set_consumer_device(device);
                 own_device = Some(device);
+                // 2026-11-18: 이 디바이스(곧 이 painter 의 타일 GPU)의 NUMA 노드를 등록한다. 영상
+                // 스트리밍 스레드가 "이 영상을 요구한 디바이스" 를 노드로 바꿀 때 읽는다
+                // (`servo_config::wall_numa::VideoPlacement`). 노드는 winit_wall 이 painter 를 만들기
+                // 직전에 이 스레드에 적어 둔 타일의 노드다. 이 함수는 `Painter::new` 안에서, 그
+                // painter 를 만드는 스레드에서 불린다.
+                if let Some(hint) = servo_config::wall_numa::tile_hint()
+                    && let Some(node) = hint.node
+                {
+                    servo_config::wall_numa::register_device_node(device, node);
+                    warn!(
+                        "WALLNUMA media device 0x{device:x} -> node {node} (tile {}, gpu {requested_gpu:?})",
+                        hint.tile_index
+                    );
+                }
             }
         }
         Self {

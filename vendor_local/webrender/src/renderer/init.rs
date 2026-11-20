@@ -122,6 +122,12 @@ pub struct WebRenderOptions {
     /// 이 `Renderer` 가 담당하는 벽 타일의 번호(`None` = 벽이 아니다).
     /// 근거는 `crate::wall_canvas_rect` 의 doc 주석에 있다.
     pub wall_painter_slot: Option<u32>,
+    /// 2026-11-18 (벽 NUMA 배치): WR 이 띄우는 스레드(RenderBackend, SceneBuilder, SceneBuilderLP)의
+    /// ★첫 줄★에서 그 스레드 이름으로 부른다. Servo 의 painter 가 이 스레드들을 자기 렌더 스레드와
+    /// 같은 NUMA 노드에 핀하는 데 쓴다. `RenderBackendHooks` 가 아니라 이것을 둔 이유는
+    /// SceneBuilder 에 부작용 없는 훅이 없어서다 -- `SceneBuilderHooks` 를 주면 장면 교체가 동기
+    /// 핸드셰이크로 바뀐다. `None`(기본) = 아무것도 하지 않는다.
+    pub wall_thread_init: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     pub resource_override_path: Option<PathBuf>,
     /// Whether to use shaders that have been optimized at build time.
     pub use_optimized_shaders: bool,
@@ -235,6 +241,7 @@ impl Default for WebRenderOptions {
     fn default() -> Self {
         WebRenderOptions {
             wall_painter_slot: None,
+            wall_thread_init: None,
             resource_override_path: None,
             use_optimized_shaders: false,
             enable_aa: true,
@@ -644,8 +651,12 @@ pub fn create_webrender_instance(
         SceneBuilderThreadChannels::new(api_tx.clone());
 
     let sb_fonts = fonts.clone();
+    let sb_thread_init = options.wall_thread_init.clone();
 
     thread::Builder::new().name(scene_thread_name.clone()).spawn(move || {
+        if let Some(init) = sb_thread_init {
+            init(&scene_thread_name);
+        }
         register_thread_with_profiler(scene_thread_name.clone());
         profiler::register_thread(&scene_thread_name);
 
@@ -669,7 +680,11 @@ pub fn create_webrender_instance(
             tile_pool: api::BlobTilePool::new(),
         };
 
+        let lp_thread_init = options.wall_thread_init.clone();
         thread::Builder::new().name(lp_scene_thread_name.clone()).spawn(move || {
+            if let Some(init) = lp_thread_init {
+                init(&lp_scene_thread_name);
+            }
             register_thread_with_profiler(lp_scene_thread_name.clone());
             profiler::register_thread(&lp_scene_thread_name);
 
@@ -709,7 +724,11 @@ pub fn create_webrender_instance(
     let rb_scene_tx = scene_tx.clone();
     let rb_fonts = fonts.clone();
     let enable_multithreading = options.enable_multithreading;
+    let rb_thread_init = options.wall_thread_init.clone();
     thread::Builder::new().name(rb_thread_name.clone()).spawn(move || {
+        if let Some(init) = rb_thread_init {
+            init(&rb_thread_name);
+        }
         if let Some(hooks) = render_backend_hooks {
             hooks.init_thread();
         }
