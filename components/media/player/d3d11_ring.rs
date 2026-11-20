@@ -227,10 +227,11 @@ struct RingState {
     /// 이번 합성에서 lock된 plane 개수(0→1 전이에서만 계획 발급).
     /// 링이 만들어진 시각. [`MEDIARINGFILL`](Self::note_ring_fill) 의 분모다.
     created_at: Instant,
+    /// `MEDIARINGFILL` 을 링당 한 번만 찍기 위한 깃발. ★레지스트리 락 안에서만 만진다★ --
+    /// `presenting_plane` 은 lock 마다 plane 마다 도는 자리라 별도 락을 둘 수 없다.
+    fill_logged: bool,
     /// 첫 `InitialMapAll` 커밋 시각(소비자 쪽이 끝난 시점).
     mapped_at: Option<Instant>,
-    /// `MEDIARINGFILL` 을 링당 한 번만 찍기 위한 깃발.
-    fill_logged: bool,
     /// 실제로 쓰는 슬롯 수(`1..=SLOT_COUNT`). 초과 슬롯은 ★`Unmapped` 로 남아 claim 되지
     /// 않는다★ -- 그래서 Map 하지 않아도 쓰인 적 없는 텍스처가 제시될 일이 없다.
     ///
@@ -634,23 +635,6 @@ impl D3d11PlaneRings {
         ring.presenting_slot = Some(filled_slot);
         // Filled 슬롯은 프로듀서가 쓴 것이므로 여기서부터는 볼 것이 있다.
         ring.presenting_has_content = true;
-        if !ring.fill_logged {
-            ring.fill_logged = true;
-            let now = Instant::now();
-            let to_map = ring
-                .mapped_at
-                .map(|m| m.duration_since(ring.created_at).as_millis());
-            let map_to_pub = ring.mapped_at.map(|m| now.duration_since(m).as_millis());
-            let total = now.duration_since(ring.created_at).as_millis();
-            // ★링당 한 번.★ 근거는 이 커밋 메시지 -- 50~85ms 가 소비자(InitialMapAll)
-            // 쪽인지 프로듀서(업로드) 쪽인지에 따라 고칠 자리가 다르고, 지금 데이터로는
-            // 가릴 수 없었다.
-            warn!(
-                "MEDIARINGFILL ring={ring_id} create_to_map={}ms map_to_publish={}ms                  total={total}ms",
-                to_map.map_or("n/a".to_owned(), |v| v.to_string()),
-                map_to_pub.map_or("n/a".to_owned(), |v| v.to_string()),
-            );
-        }
 
         Some(ConsumePlan::Advance {
             unmap,
@@ -856,8 +840,11 @@ impl D3d11PlaneRings {
     /// 실행되지 않았을 수도 있는 시점)이라도 이 함수는 이미 새
     /// Presenting 슬롯의 plane 기술자를 반환할 수 있다.
     pub fn presenting_plane(ring_id: u64, plane: usize) -> Option<PlaneDesc> {
-        let reg = lock_recover(registry());
-        let ring = reg.rings.get(&ring_id)?;
+        // ★가변으로 잡는다.★ `MEDIARINGFILL` 의 깃발을 세우려면 가변이 필요한데, 이 함수는
+        // lock 마다 plane 마다 도는 자리라(실측 240 lock/s x 3 면) ***별도 락을 둘 수 없다.***
+        // 이미 잡는 레지스트리 락을 쓰면 추가 비용이 0 이다.
+        let mut reg = lock_recover(registry());
+        let ring = reg.rings.get_mut(&ring_id)?;
         if !ring.presenting_has_content {
             // ★비움을 센다.★ 근거는 `note_blank` 의 doc -- 이것이 운영자가 보는
             // "tile 경계에서 비디오 등장시 프레임 비어보이는" 현상의 ***직접적인*** 사건이다.
@@ -866,7 +853,54 @@ impl D3d11PlaneRings {
             return None;
         }
         let idx = ring.presenting_slot?;
-        ring.slots[idx].planes.get(plane).copied().flatten()
+        let desc = ring.slots[idx].planes.get(plane).copied().flatten();
+        // ★내용이 처음 나가는 순간.★ `MEDIABLANK`(못 줄 때)과 같은 함수에 두어 둘이 한 쌍이
+        // 되게 했다 -- 2026-11-20 에 `plan_locked` 쪽에 두었더니 그 대입이 두 자리여서
+        // 0 건이 나왔다. 자리가 하나임을 확인하지 않은 것이 원인이었다.
+        let fill = (desc.is_some() && !ring.fill_logged).then(|| {
+            ring.fill_logged = true;
+            (ring.created_at, ring.mapped_at)
+        });
+        drop(reg);
+        if let Some((created_at, mapped_at)) = fill {
+            Self::note_ring_fill(ring_id, created_at, mapped_at);
+        }
+        desc
+    }
+
+    /// 링이 ★처음 내용을 내보낸★ 시점까지를 소비자/프로듀서로 쪼개 한 번 찍는다.
+    ///
+    /// ## 왜 (2026-11-20, log_media_ready/10)
+    ///
+    ///     링 생성      전환 시작 +629 ~ +2289ms (p50 +1315ms, 등장 순서 그대로)
+    ///     MEDIABLANK   worst_ring=9~15 = 3~5 lock ≈ ★50~85ms★
+    ///
+    /// 링 생성 ***전*** 은 `MEDIABLANK` 이 세지 않는데, 그 구간에는 WR 이 애초에 그리려 하지
+    /// 않았다(링이 첫 lock 에 생기므로). 즉 ★수요 타이밍은 맞다★ -- 문제는 ***링을 만들어도
+    /// 내용이 바로 안 나오는 50~85ms*** 다. 그것이 각 영상의 등장 순간마다 반복되어 bounce
+    /// 전체에 흩어진다.
+    ///
+    /// 그 구간이 누구 것인지에 따라 고칠 자리가 다르다:
+    ///
+    ///     create_to_map    ★소비자★ -- 다음 lock 까지 대기 + `InitialMapAll` 의 Map 비용
+    ///     map_to_publish   ★프로듀서★ -- claim -> memcpy -> publish
+    ///
+    /// 비용: ★링당 한 번★. 중복은 `RingState::fill_logged` 로 가리고 그 깃발은 이미 잡은
+    /// 레지스트리 락 안에서 세운다 -- 이 경로에 별도 락을 두지 않는다.
+    fn note_ring_fill(ring_id: u64, created_at: Instant, mapped_at: Option<Instant>) {
+        let now = Instant::now();
+        warn!(
+            "MEDIARINGFILL ring={ring_id} create_to_map={}ms map_to_publish={}ms total={}ms",
+            mapped_at.map_or("n/a".to_owned(), |m| m
+                .duration_since(created_at)
+                .as_millis()
+                .to_string()),
+            mapped_at.map_or("n/a".to_owned(), |m| now
+                .duration_since(m)
+                .as_millis()
+                .to_string()),
+            now.duration_since(created_at).as_millis(),
+        );
     }
 
     /// 내용 없는 링 때문에 비운 횟수. 비움이 있었던 1 초 창에서만 한 줄.
